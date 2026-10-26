@@ -839,9 +839,13 @@ bool Engine::run_here(StringView source, String* error, String* result, Value* o
 }
 
 uint32_t Engine::call_guarded(const Value& fn, const Value* args, uint32_t argc, String* error) {
+  vm_.reset_instruction_count();
+  vm_.set_extra_root(fn);   // (recover() may collect, and a timer that has run is no longer in the list: nothing else holds the function)
   vm_.recover();
   Value ignored;
-  if (vm_.call(fn, Value::make_object(vm_.global()), args, argc, &ignored)) return 0;
+  const bool ok = vm_.call(fn, Value::make_object(vm_.global()), args, argc, &ignored);
+  vm_.set_extra_root(Value());
+  if (ok) return 0;
   String text(allocator_);
   vm_.take_exception(&text);
   if (error && error->empty()) error->assign(text.view());

@@ -12006,6 +12006,1266 @@ const char kSvgPrelude[] = R"JSPRELUDE((function (g) {
 }(globalThis));
 )JSPRELUDE";
 
+// Web Audio: AudioContext / OfflineAudioContext, AudioBuffer, AudioParam with its automation, the node classes (oscillator, gain, buffer source, biquad, delay,
+// panner, analyser, convolver, compressor, wave shaper, script processor, worklet ...) and a graph that is rendered 128 frames at a time. Written in script; the
+// native help is __decode_audio. Without an output device the sound is rendered and dropped unless the page environment defines __audio_sink.
+const char kWebAudioPrelude[] = R"JSPRELUDE((function (g) {
+  var def = function (o, k, v) { Object.defineProperty(o, k, { value: v, writable: true, configurable: true }); };
+  var hide = function (o, k, v) { Object.defineProperty(o, k, { value: v, writable: true, configurable: true, enumerable: false }); };
+  var accessor = function (proto, name, get, set) { Object.defineProperty(proto, name, { get: get, set: set, enumerable: true, configurable: true }); };
+  var domex = function (message, name) { return new g.DOMException(message, name); };
+  var QUANTUM = 128, TWO_PI = 2 * Math.PI;
+  var ET = g.EventTarget;
+  var cls = function (name, parent, init) {
+    var C = function () {
+      if (!init) throw new TypeError('Illegal constructor');
+      if (!(this instanceof C)) throw new TypeError("Failed to construct '" + name + "': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+      return init.apply(this, arguments);
+    };
+    Object.defineProperty(C, 'name', { value: name });
+    C.prototype = Object.create(parent ? parent.prototype : Object.prototype);
+    def(C.prototype, 'constructor', C);
+    Object.defineProperty(C.prototype, Symbol.toStringTag, { value: name, configurable: true });
+    if (parent) Object.setPrototypeOf(C, parent);
+    def(g, name, C);
+    return C;
+  };
+  var handler = function (proto, type) {   // onended = fn
+    accessor(proto, 'on' + type, function () { return this.__on && this.__on[type] || null; }, function (fn) {
+      if (!this.__on) hide(this, '__on', {});
+      var had = !!this.__on[type];
+      this.__on[type] = typeof fn === 'function' ? fn : null;
+      if (!had && this.__on[type]) { var self = this; this.addEventListener(type, function (e) { var f = self.__on[type]; if (f) f.call(self, e); }); }
+    });
+  };
+  var fire = function (target, event) { try { target.dispatchEvent(event); } catch (e) { } };
+  var finite = function (v, what) { v = Number(v); if (!(v - v === 0)) throw new TypeError("Failed to execute: The provided float value is non-finite."); return v; };
+
+  // ------------------------------------------------------------------------------------------------------------------------------ AudioBuffer
+  var AudioBuffer = cls('AudioBuffer', null, function (options) {
+    if (options === null || typeof options !== 'object') throw new TypeError("Failed to construct 'AudioBuffer': 1 argument required, but only 0 present.");
+    var ch = options.numberOfChannels === undefined ? 1 : options.numberOfChannels, len = options.length, rate = options.sampleRate;
+    if (len === undefined || rate === undefined) throw new TypeError("Failed to construct 'AudioBuffer': required member " + (len === undefined ? 'length' : 'sampleRate') + ' is undefined.');
+    setup(this, ch, len, rate);
+  });
+  function setup(buf, ch, len, rate) {
+    if (!(ch >= 1 && ch <= 32)) throw domex("Failed to construct 'AudioBuffer': The number of channels provided (" + ch + ') is outside the range [1, 32].', 'NotSupportedError');
+    if (!(len >= 1)) throw domex("Failed to construct 'AudioBuffer': The number of frames provided (" + len + ') is less than or equal to the minimum bound (0).', 'NotSupportedError');
+    if (!(rate >= 3000 && rate <= 768000)) throw domex("Failed to construct 'AudioBuffer': The sample rate provided (" + rate + ') is outside the range [3000, 768000].', 'NotSupportedError');
+    var channels = [];
+    for (var i = 0; i < ch; i++) channels.push(new Float32Array(len));
+    hide(buf, '__c', channels); hide(buf, '__rate', Number(rate)); hide(buf, '__len', len >>> 0);
+  }
+  function makeBuffer(ch, len, rate) { var b = Object.create(AudioBuffer.prototype); setup(b, ch, len, rate); return b; }
+  accessor(AudioBuffer.prototype, 'sampleRate', function () { return this.__rate; });
+  accessor(AudioBuffer.prototype, 'length', function () { return this.__len; });
+  accessor(AudioBuffer.prototype, 'duration', function () { return this.__len / this.__rate; });
+  accessor(AudioBuffer.prototype, 'numberOfChannels', function () { return this.__c.length; });
+  def(AudioBuffer.prototype, 'getChannelData', function (i) { i = i >>> 0; if (i >= this.__c.length) throw domex("Failed to execute 'getChannelData' on 'AudioBuffer': channel index (" + i + ') exceeds number of channels (' + this.__c.length + ')', 'IndexSizeError'); return this.__c[i]; });
+  def(AudioBuffer.prototype, 'copyFromChannel', function (dest, ch, start) {
+    ch = ch >>> 0; start = start === undefined ? 0 : start >>> 0;
+    if (ch >= this.__c.length) throw domex('The channelNumber provided (' + ch + ') is outside the range [0, ' + (this.__c.length - 1) + '].', 'IndexSizeError');
+    if (start > this.__len) throw domex('The startInChannel provided (' + start + ') is outside the range [0, ' + this.__len + '].', 'IndexSizeError');
+    var src = this.__c[ch], n = Math.min(dest.length, this.__len - start);
+    for (var i = 0; i < n; i++) dest[i] = src[start + i];
+  });
+  def(AudioBuffer.prototype, 'copyToChannel', function (src, ch, start) {
+    ch = ch >>> 0; start = start === undefined ? 0 : start >>> 0;
+    if (ch >= this.__c.length) throw domex('The channelNumber provided (' + ch + ') is outside the range [0, ' + (this.__c.length - 1) + '].', 'IndexSizeError');
+    if (start > this.__len) throw domex('The startInChannel provided (' + start + ') is outside the range [0, ' + this.__len + '].', 'IndexSizeError');
+    var dst = this.__c[ch], n = Math.min(src.length, this.__len - start);
+    for (var i = 0; i < n; i++) dst[start + i] = src[i];
+  });
+
+  // ------------------------------------------------------------------------------------------------------------------------------ AudioParam
+  var AudioParam = cls('AudioParam', null);
+  function makeParam(node, name, def0, min, max, rate, fixedRate) {
+    var p = Object.create(AudioParam.prototype);
+    hide(p, '__p', { node: node, name: name, def: def0, min: min, max: max, value: def0, rate: rate || 'a-rate', fixedRate: !!fixedRate, events: [], inputs: [], current: def0, initial: def0 });
+    return p;
+  }
+  function paramTime(p, t, what) { t = Number(t); if (!(t === t) || t < 0 || t === Infinity) throw new RangeError("Failed to execute '" + what + "' on 'AudioParam': The time provided (" + t + ') is negative.'); return t; }
+  function insertEvent(p, e) {
+    var ev = p.__p.events, i = ev.length;
+    while (i > 0 && ev[i - 1].t > e.t) i--;
+    // an event of the same type and time replaces the earlier one (setValueAtTime twice, ...); ramps may share the time with a set
+    for (var k = i - 1; k >= 0 && ev[k].t === e.t; k--) if (ev[k].type === e.type && e.type !== 'setValueCurveAtTime') { ev.splice(k, 1); i--; break; }
+    ev.splice(i, 0, e);
+  }
+  accessor(AudioParam.prototype, 'value', function () { var s = this.__p; return s.events.length || s.inputs.length ? s.current : s.value; }, function (v) {
+    var s = this.__p; v = finite(v); s.value = v; s.current = v;
+    if (s.events.length) this.setValueAtTime(v, s.node.context.currentTime);
+  });
+  accessor(AudioParam.prototype, 'defaultValue', function () { return this.__p.def; });
+  accessor(AudioParam.prototype, 'minValue', function () { return this.__p.min; });
+  accessor(AudioParam.prototype, 'maxValue', function () { return this.__p.max; });
+  accessor(AudioParam.prototype, 'automationRate', function () { return this.__p.rate; }, function (r) {
+    r = String(r); if (r !== 'a-rate' && r !== 'k-rate') return;
+    if (this.__p.fixedRate) throw domex("Failed to set the 'automationRate' property on 'AudioParam': automationRate cannot be changed for this AudioParam.", 'InvalidStateError');
+    this.__p.rate = r;
+  });
+  def(AudioParam.prototype, 'setValueAtTime', function (v, t) { v = finite(v); t = paramTime(this, t, 'setValueAtTime'); var e = { type: 'set', t: t, v: v }; insertEvent(this, e); return this; });
+  def(AudioParam.prototype, 'linearRampToValueAtTime', function (v, t) { v = finite(v); t = paramTime(this, t, 'linearRampToValueAtTime'); insertEvent(this, { type: 'linear', t: t, v: v }); return this; });
+  def(AudioParam.prototype, 'exponentialRampToValueAtTime', function (v, t) {
+    v = finite(v); t = paramTime(this, t, 'exponentialRampToValueAtTime');
+    if (v === 0) throw new RangeError("Failed to execute 'exponentialRampToValueAtTime' on 'AudioParam': The float target value provided (0) should not be in the range (" + (-1e-45) + ', ' + 1e-45 + ').');
+    insertEvent(this, { type: 'exp', t: t, v: v }); return this;
+  });
+  def(AudioParam.prototype, 'setTargetAtTime', function (target, t, tc) {
+    target = finite(target); t = paramTime(this, t, 'setTargetAtTime'); tc = finite(tc);
+    if (tc < 0) throw new RangeError("Failed to execute 'setTargetAtTime' on 'AudioParam': The time constant provided (" + tc + ') is negative.');
+    insertEvent(this, { type: 'target', t: t, v: target, tc: tc }); return this;
+  });
+  def(AudioParam.prototype, 'setValueCurveAtTime', function (curve, t, dur) {
+    t = paramTime(this, t, 'setValueCurveAtTime'); dur = Number(dur);
+    var values = Array.prototype.slice.call(curve).map(Number);
+    if (values.length < 2) throw domex("Failed to execute 'setValueCurveAtTime' on 'AudioParam': The curve length provided (" + values.length + ') is less than the minimum bound (2).', 'InvalidStateError');
+    if (!(dur > 0)) throw new RangeError("Failed to execute 'setValueCurveAtTime' on 'AudioParam': The duration provided (" + dur + ') should be greater than 0.');
+    values.forEach(function (x) { if (!(x - x === 0)) throw new TypeError("Failed to execute 'setValueCurveAtTime' on 'AudioParam': The curve contains a non-finite value."); });
+    var ev = this.__p.events;
+    for (var i = 0; i < ev.length; i++) {   // the curve may not overlap another event
+      var e = ev[i], end = e.type === 'curve' ? e.t + e.dur : e.t;
+      if ((e.t >= t && e.t < t + dur) || (e.type === 'curve' && t >= e.t && t < end)) throw domex("Failed to execute 'setValueCurveAtTime' on 'AudioParam': setValueCurveAtTime(" + t + ', ' + dur + ') overlaps an existing event.', 'NotSupportedError');
+    }
+    insertEvent(this, { type: 'curve', t: t, v: values[values.length - 1], values: values, dur: dur }); return this;
+  });
+  def(AudioParam.prototype, 'cancelScheduledValues', function (t) { t = paramTime(this, t, 'cancelScheduledValues'); var ev = this.__p.events; this.__p.events = ev.filter(function (e) { return e.t < t && !(e.type === 'curve' && e.t + e.dur > t && false); }); return this; });
+  def(AudioParam.prototype, 'cancelAndHoldAtTime', function (t) {
+    t = paramTime(this, t, 'cancelAndHoldAtTime');
+    var s = this.__p, held = evaluate(s, t);
+    s.events = s.events.filter(function (e) { return e.t <= t; });
+    // a ramp or curve still under way is stopped where it is
+    var last = s.events[s.events.length - 1];
+    if (last && (last.type === 'curve' && last.t + last.dur > t)) s.events.pop();
+    insertEvent(this, { type: 'set', t: t, v: held });
+    return this;
+  });
+  // the value of the automation at time t
+  function evaluate(s, t) {
+    var ev = s.events, v = s.value, st = 0, mode = null, i, n = null;
+    for (i = 0; i < ev.length; i++) {
+      var e = ev[i];
+      if (e.t > t) { n = e; break; }
+      switch (e.type) {
+        case 'set': v = e.v; st = e.t; mode = null; break;
+        case 'linear': case 'exp': v = e.v; st = e.t; mode = null; break;
+        case 'target': { var cur = mode && mode.type === 'target' ? targetValue(mode, e.t) : mode && mode.type === 'curve' ? v : v; mode = { type: 'target', t0: e.t, v0: cur, target: e.v, tc: e.tc }; st = e.t; break; }
+        case 'curve': mode = { type: 'curve', t0: e.t, values: e.values, dur: e.dur }; st = e.t; break;
+      }
+      if (mode && mode.type === 'curve' && t >= e.t + e.dur && i + 1 < ev.length + 1 && e.type === 'curve') { v = e.values[e.values.length - 1]; mode = null; st = e.t + e.dur; }
+    }
+    // an upcoming ramp runs from where the timeline stood after the last event
+    if (n && (n.type === 'linear' || n.type === 'exp')) {
+      var from = mode && mode.type === 'target' ? targetValue(mode, t) : mode && mode.type === 'curve' ? curveValue(mode, t) : v;
+      var span = n.t - st;
+      if (span <= 0) return n.v;
+      var f = (t - st) / span;
+      if (n.type === 'linear') return from + (n.v - from) * f;
+      if (from === 0 || (from < 0) !== (n.v < 0)) return from;
+      return from * Math.pow(n.v / from, f);
+    }
+    if (mode) return mode.type === 'target' ? targetValue(mode, t) : curveValue(mode, t);
+    return v;
+  }
+  function targetValue(m, t) { return m.tc === 0 ? m.target : m.target + (m.v0 - m.target) * Math.exp(-(t - m.t0) / m.tc); }
+  function curveValue(m, t) {
+    if (t >= m.t0 + m.dur) return m.values[m.values.length - 1];
+    var n = m.values.length, pos = (t - m.t0) * (n - 1) / m.dur, k = Math.floor(pos), f = pos - k;
+    return k + 1 < n ? m.values[k] * (1 - f) + m.values[k + 1] * f : m.values[n - 1];
+  }
+  // the 128 values of a parameter for the quantum that starts at frame `start`
+  function paramBlock(p, ctx, start, kRate) {
+    var s = p.__p, out = ctx.__scratch(s), n = kRate || s.rate === 'k-rate' ? 1 : QUANTUM, rate = ctx.sampleRate, i;
+    var base = out;
+    if (s.events.length) { for (i = 0; i < n; i++) base[i] = evaluate(s, (start + i) / rate); }
+    else for (i = 0; i < n; i++) base[i] = s.value;
+    if (s.inputs.length) {
+      var sum = ctx.__pullInputs(s.inputs, 1);
+      var ch = sum[0];
+      if (n === 1) base[0] += ch[0]; else for (i = 0; i < QUANTUM; i++) base[i] += ch[i];
+    }
+    var lo = s.min, hi = s.max;
+    for (i = 0; i < n; i++) { var x = base[i]; base[i] = x < lo ? lo : x > hi ? hi : x; }
+    s.current = base[0];
+    if (n === 1) { for (i = 1; i < QUANTUM; i++) base[i] = base[0]; }
+    return base;
+  }
+
+  // ------------------------------------------------------------------------------------------------------------------------------ mixing
+  var SQRT_HALF = Math.SQRT1_2;
+  function silence(n) { var out = []; for (var i = 0; i < n; i++) out.push(new Float32Array(QUANTUM)); return out; }
+  function mixChannels(src, n, speakers) {
+    var m = src.length, i, k, out;
+    if (m === n) return src;
+    out = silence(n);
+    if (!speakers || !((m === 1 || m === 2 || m === 4 || m === 6) && (n === 1 || n === 2 || n === 4 || n === 6))) { for (i = 0; i < Math.min(m, n); i++) out[i].set(src[i]); return out; }
+    if (m === 1) { if (n === 2 || n === 4) { out[0].set(src[0]); out[1].set(src[0]); } else out[2].set(src[0]); return out; }
+    for (k = 0; k < QUANTUM; k++) {
+      if (m === 2) {
+        if (n === 1) out[0][k] = 0.5 * (src[0][k] + src[1][k]); else { out[0][k] = src[0][k]; out[1][k] = src[1][k]; }
+      } else if (m === 4) {
+        if (n === 1) out[0][k] = 0.25 * (src[0][k] + src[1][k] + src[2][k] + src[3][k]);
+        else if (n === 2) { out[0][k] = 0.5 * (src[0][k] + src[2][k]); out[1][k] = 0.5 * (src[1][k] + src[3][k]); }
+        else { out[0][k] = src[0][k]; out[1][k] = src[1][k]; out[4][k] = src[2][k]; out[5][k] = src[3][k]; }
+      } else {   // 6
+        if (n === 1) out[0][k] = SQRT_HALF * (src[0][k] + src[1][k]) + src[2][k] + 0.5 * (src[4][k] + src[5][k]);
+        else if (n === 2) { out[0][k] = src[0][k] + SQRT_HALF * (src[2][k] + src[4][k]); out[1][k] = src[1][k] + SQRT_HALF * (src[2][k] + src[5][k]); }
+        else { out[0][k] = src[0][k] + SQRT_HALF * src[2][k]; out[1][k] = src[1][k] + SQRT_HALF * src[2][k]; out[2][k] = src[4][k]; out[3][k] = src[5][k]; }
+      }
+    }
+    return out;
+  }
+
+  // ------------------------------------------------------------------------------------------------------------------------------ contexts
+  var BaseAudioContext = cls('BaseAudioContext', ET);
+  var AudioContext = cls('AudioContext', BaseAudioContext, function (options) { return initContext(this, options, false); });
+  var OfflineAudioContext = cls('OfflineAudioContext', BaseAudioContext, function (a, b, c) { return initOffline(this, a, b, c); });
+  handler(BaseAudioContext.prototype, 'statechange');
+  handler(OfflineAudioContext.prototype, 'complete');
+  var defaultRate = 48000;
+  function newState(ctx, rate, offline) {
+    var s = { rate: rate, frame: 0, state: offline ? 'suspended' : 'suspended', offline: offline, nodes: [], timer: null, closed: false, startedAt: 0, startedFrame: 0, sink: null };
+    hide(ctx, '__s', s);
+    return s;
+  }
+  function initContext(ctx, options, offline) {
+    var rate = defaultRate;
+    if (options !== undefined && options !== null && typeof options === 'object' && options.sampleRate !== undefined) {
+      rate = Number(options.sampleRate);
+      if (!(rate >= 3000 && rate <= 768000)) throw domex("Failed to construct 'AudioContext': The sampleRate provided (" + rate + ') is outside the range [3000, 768000].', 'NotSupportedError');
+    }
+    var s = newState(ctx, rate, false);
+    s.latencyHint = options && options.latencyHint !== undefined ? options.latencyHint : 'interactive';
+    s.destination = makeDestination(ctx, 2, 32);
+    s.listener = makeListener(ctx);
+    return ctx;
+  }
+  function initOffline(ctx, a, b, c) {
+    var ch, len, rate;
+    if (a !== null && typeof a === 'object') { ch = a.numberOfChannels === undefined ? 1 : a.numberOfChannels; len = a.length; rate = a.sampleRate; }
+    else { if (arguments.length < 4) throw new TypeError("Failed to construct 'OfflineAudioContext': 3 arguments required, but only " + (arguments.length - 1) + ' present.'); ch = a; len = b; rate = c; }
+    if (len === undefined || rate === undefined) throw new TypeError("Failed to construct 'OfflineAudioContext': required member is undefined.");
+    if (!(ch >= 1 && ch <= 32)) throw domex("Failed to construct 'OfflineAudioContext': The number of channels provided (" + ch + ') is outside the range [1, 32].', 'NotSupportedError');
+    if (!(len >= 1)) throw domex("Failed to construct 'OfflineAudioContext': The number of frames provided (" + len + ') is less than or equal to the minimum bound (0).', 'NotSupportedError');
+    if (!(rate >= 3000 && rate <= 768000)) throw domex("Failed to construct 'OfflineAudioContext': The sampleRate provided (" + rate + ') is outside the range [3000, 768000].', 'NotSupportedError');
+    var s = newState(ctx, Number(rate), true);
+    s.length = len >>> 0; s.channels = ch >>> 0; s.suspends = []; s.started = false; s.rendered = null;
+    s.destination = makeDestination(ctx, ch, ch, true);
+    s.listener = makeListener(ctx);
+    return ctx;
+  }
+  accessor(BaseAudioContext.prototype, 'sampleRate', function () { return this.__s.rate; });
+  accessor(BaseAudioContext.prototype, 'currentTime', function () { return this.__s.frame / this.__s.rate; });
+  accessor(BaseAudioContext.prototype, 'destination', function () { return this.__s.destination; });
+  accessor(BaseAudioContext.prototype, 'listener', function () { return this.__s.listener; });
+  accessor(BaseAudioContext.prototype, 'state', function () { return this.__s.state; });
+  accessor(BaseAudioContext.prototype, 'audioWorklet', function () { var s = this.__s; return s.worklet || (s.worklet = makeWorklet(this)); });
+  accessor(AudioContext.prototype, 'baseLatency', function () { return 128 / this.__s.rate; });
+  accessor(AudioContext.prototype, 'outputLatency', function () { return 0; });
+  accessor(AudioContext.prototype, 'sinkId', function () { return this.__s.sinkId || ''; });
+  handler(AudioContext.prototype, 'sinkchange');
+  def(AudioContext.prototype, 'setSinkId', function (id) { this.__s.sinkId = typeof id === 'object' && id ? id.type || '' : String(id); return Promise.resolve(); });
+  def(AudioContext.prototype, 'getOutputTimestamp', function () { return { contextTime: this.currentTime, performanceTime: g.performance ? g.performance.now() : 0 }; });
+  function setState(ctx, state) {
+    var s = ctx.__s;
+    if (s.state === state) return;
+    s.state = state;
+    setTimeout(function () { fire(ctx, new g.Event('statechange')); }, 0);
+  }
+  accessor(OfflineAudioContext.prototype, 'length', function () { return this.__s.length; });
+
+  // the graph: pulling a node's output for the quantum that starts at ctx.__s.frame
+  def(BaseAudioContext.prototype, '__scratch', function () { return new Float64Array(QUANTUM); });
+  def(BaseAudioContext.prototype, '__mixInput', function (node, index) {
+    var list = node.__in[index], n, speakers = node.__interp === 'speakers', i, k, srcs = [];
+    for (i = 0; i < list.length; i++) srcs.push(pullOutput(list[i].src, this, list[i].out));
+    var maxCh = 1;
+    for (i = 0; i < srcs.length; i++) maxCh = Math.max(maxCh, srcs[i].length);
+    var mode = node.__mode;
+    n = mode === 'explicit' ? node.__channels : mode === 'clamped-max' ? Math.min(maxCh, node.__channels) : maxCh;
+    if (!srcs.length) return silence(mode === 'max' ? 1 : n);
+    var out = silence(n);
+    for (i = 0; i < srcs.length; i++) {
+      var mixed = mixChannels(srcs[i], n, speakers);
+      for (k = 0; k < n; k++) { var d = out[k], s = mixed[k]; for (var j = 0; j < QUANTUM; j++) d[j] += s[j]; }
+    }
+    return out;
+  });
+  def(BaseAudioContext.prototype, '__pullInputs', function (connections, channels) {   // a parameter's audio inputs, summed down to mono
+    var sum = silence(1), i;
+    for (i = 0; i < connections.length; i++) {
+      var o = mixChannels(pullOutput(connections[i].src, this, connections[i].out), 1, true)[0], d = sum[0];
+      for (var j = 0; j < QUANTUM; j++) d[j] += o[j];
+    }
+    return sum;
+  });
+  function pullOutput(node, ctx, index) {
+    var s = ctx.__s;
+    if (node.__frame !== s.frame) {
+      if (node.__busy) return silence(1);   // a cycle without a delay is silent
+      node.__busy = true;
+      var inputs = [];
+      for (var i = 0; i < node.__in.length; i++) inputs.push(ctx.__mixInput(node, i));
+      var outs = node.__process(inputs, ctx, s.frame);
+      node.__busy = false;
+      node.__frame = s.frame;
+      node.__out = outs;
+    }
+    return node.__out[index] || silence(1);
+  }
+  function renderQuantum(ctx) {   // the destination's input for the next 128 frames
+    var s = ctx.__s, dest = s.destination;
+    var inputs = [ctx.__mixInput(dest, 0)];
+    // every node with a process that must run whether or not anything listens (sources that end, analysers, script processors) is pulled too
+    var live = s.nodes;
+    for (var i = 0; i < live.length; i++) { var nd = live[i]; if (nd.__always && nd.__frame !== s.frame) pullOutput(nd, ctx, 0); }
+    dest.__frame = s.frame;
+    return inputs[0];
+  }
+
+  // ------------------------------------------------------------------------------------------------------------------------------ AudioNode
+  var AudioNode = cls('AudioNode', ET);
+  function isContext(c) { return c instanceof BaseAudioContext; }
+  function setupNode(n, ctx, cfg) {
+    hide(n, '__ctx', ctx);
+    hide(n, '__in', []); for (var i = 0; i < cfg.inputs; i++) n.__in.push([]);
+    hide(n, '__nout', cfg.outputs); hide(n, '__outs', []);
+    hide(n, '__channels', cfg.channels === undefined ? 2 : cfg.channels); hide(n, '__mode', cfg.mode || 'max'); hide(n, '__interp', cfg.interp || 'speakers');
+    hide(n, '__cfg', cfg); hide(n, '__d', {});
+    hide(n, '__frame', -1); hide(n, '__out', null); hide(n, '__busy', false); hide(n, '__always', !!cfg.always);
+    if (cfg.always) ctx.__s.nodes.push(n);
+  }
+  accessor(AudioNode.prototype, 'context', function () { return this.__ctx; });
+  accessor(AudioNode.prototype, 'numberOfInputs', function () { return this.__in.length; });
+  accessor(AudioNode.prototype, 'numberOfOutputs', function () { return this.__nout; });
+  accessor(AudioNode.prototype, 'channelCount', function () { return this.__channels; }, function (v) {
+    v = Number(v) >>> 0;
+    if (this.__cfg.fixedChannels !== undefined && v !== this.__cfg.fixedChannels) throw domex("Failed to set the 'channelCount' property on 'AudioNode': The channel count cannot be changed from " + this.__cfg.fixedChannels + ' for this node.', 'InvalidStateError');
+    if (this.__cfg.maxChannels !== undefined && v > this.__cfg.maxChannels) throw domex("Failed to set the 'channelCount' property on 'AudioNode': The channel count provided (" + v + ') is greater than the maximum (' + this.__cfg.maxChannels + ').', 'NotSupportedError');
+    if (v < 1 || v > 32) throw domex("Failed to set the 'channelCount' property on 'AudioNode': The channel count provided (" + v + ') is outside the range [1, 32].', 'NotSupportedError');
+    this.__channels = v;
+  });
+  accessor(AudioNode.prototype, 'channelCountMode', function () { return this.__mode; }, function (v) {
+    v = String(v); if (v !== 'max' && v !== 'clamped-max' && v !== 'explicit') return;
+    if (this.__cfg.fixedMode !== undefined && v !== this.__cfg.fixedMode) throw domex("Failed to set the 'channelCountMode' property on 'AudioNode': The channel count mode cannot be changed for this node.", 'InvalidStateError');
+    if (this.__cfg.noMax && v === 'max') throw domex("Failed to set the 'channelCountMode' property on 'AudioNode': The channel count mode cannot be 'max' for this node.", 'NotSupportedError');
+    this.__mode = v;
+  });
+  accessor(AudioNode.prototype, 'channelInterpretation', function () { return this.__interp; }, function (v) { v = String(v); if (v === 'speakers' || v === 'discrete') this.__interp = v; });
+  function sameContext(a, b, what) { if (a.__ctx !== b.__ctx && !(b.__p && b.__p.node.__ctx === a.__ctx)) throw domex("Failed to execute '" + what + "' on 'AudioNode': cannot connect to a destination belonging to a different audio context.", 'InvalidAccessError'); }
+  def(AudioNode.prototype, 'connect', function (dest, output, input) {
+    output = output === undefined ? 0 : output >>> 0; input = input === undefined ? 0 : input >>> 0;
+    if (dest instanceof AudioNode) {
+      sameContext(this, dest, 'connect');
+      if (output >= this.__nout) throw domex("Failed to execute 'connect' on 'AudioNode': output index (" + output + ') exceeds number of outputs (' + this.__nout + ').', 'IndexSizeError');
+      if (input >= dest.__in.length) throw domex("Failed to execute 'connect' on 'AudioNode': input index (" + input + ') exceeds number of inputs (' + dest.__in.length + ').', 'IndexSizeError');
+      var list = dest.__in[input];
+      for (var i = 0; i < list.length; i++) if (list[i].src === this && list[i].out === output) return dest;
+      list.push({ src: this, out: output });
+      this.__outs.push({ dest: dest, out: output, input: input });
+      return dest;
+    }
+    if (dest instanceof AudioParam) {
+      sameContext(this, { __ctx: dest.__p.node.__ctx }, 'connect');
+      if (output >= this.__nout) throw domex("Failed to execute 'connect' on 'AudioNode': output index (" + output + ') exceeds number of outputs (' + this.__nout + ').', 'IndexSizeError');
+      var inputs = dest.__p.inputs;
+      for (var k = 0; k < inputs.length; k++) if (inputs[k].src === this && inputs[k].out === output) return undefined;
+      inputs.push({ src: this, out: output });
+      this.__outs.push({ param: dest, out: output });
+      return undefined;
+    }
+    throw new TypeError("Failed to execute 'connect' on 'AudioNode': Overload resolution failed.");
+  });
+  def(AudioNode.prototype, 'disconnect', function (a, b, c) {
+    var self = this, removed = 0, keep = [];
+    var matches = function (o) {
+      if (a === undefined) return true;
+      if (typeof a === 'number') return o.out === a;
+      if (a instanceof AudioNode) return o.dest === a && (b === undefined || o.out === b) && (c === undefined || o.input === c);
+      if (a instanceof AudioParam) return o.param === a && (b === undefined || o.out === b);
+      return false;
+    };
+    if (typeof a === 'number' && a >= this.__nout) throw domex("Failed to execute 'disconnect' on 'AudioNode': The output index provided (" + a + ') is out of range.', 'IndexSizeError');
+    this.__outs.forEach(function (o) {
+      if (!matches(o)) { keep.push(o); return; }
+      removed++;
+      if (o.dest) o.dest.__in[o.input] = o.dest.__in[o.input].filter(function (x) { return !(x.src === self && x.out === o.out); });
+      else o.param.__p.inputs = o.param.__p.inputs.filter(function (x) { return !(x.src === self && x.out === o.out); });
+    });
+    this.__outs = keep;
+    if (!removed && a !== undefined) throw domex("Failed to execute 'disconnect' on 'AudioNode': the given destination is not connected.", 'InvalidAccessError');
+  });
+  function chanOptions(n, o, name) {
+    if (o.channelCount !== undefined) n.channelCount = o.channelCount;
+    if (o.channelCountMode !== undefined) n.channelCountMode = o.channelCountMode;
+    if (o.channelInterpretation !== undefined) n.channelInterpretation = o.channelInterpretation;
+  }
+  // a node class: cfg = { parent, inputs, outputs, channels, mode, interp, always, init(node, ctx, options), process(node, inputs, ctx, start) }
+  function nodeClass(name, cfg) {
+    var C = cls(name, cfg.parent || AudioNode, function (ctx, options) {
+      if (!isContext(ctx)) throw new TypeError("Failed to construct '" + name + "': parameter 1 is not of type 'BaseAudioContext'.");
+      if (options !== undefined && options !== null && typeof options !== 'object') throw new TypeError("Failed to construct '" + name + "': The provided value is not of type '" + name + "Options'.");
+      options = options || {};
+      setupNode(this, ctx, cfg);
+      if (cfg.pre) cfg.pre(this, ctx, options);
+      chanOptions(this, options, name);
+      if (cfg.init) cfg.init(this, ctx, options);
+      return this;
+    });
+    Object.defineProperty(C, '__cfg', { value: cfg });
+    return C;
+  }
+  AudioNode.prototype.__process = function (inputs, ctx, start) {
+    var cfg = this.__cfg, outs = cfg.process ? cfg.process(this, inputs, ctx, start) : [silence(1)];
+    return outs;
+  };
+  function param(node, name, def0, min, max, rate, fixed) { var p = makeParam(node, name, def0, min, max, rate, fixed); return p; }
+  var NEG = -3.4028234663852886e38, POS = 3.4028234663852886e38;
+  function paramOption(node, p, options, key) { if (options[key] !== undefined) { var v = finite(options[key]); p.__p.value = v; p.__p.current = v; } }
+  function exposeParam(C, name) { accessor(C.prototype, name, function () { return this.__d[name]; }); }
+
+  // ------------------------------------------------------------------------------------------------------------------------------ destination and listener
+  var AudioDestinationNode = nodeClass('AudioDestinationNode', { inputs: 1, outputs: 0, channels: 2, mode: 'explicit', process: function () { return []; } });
+  accessor(AudioDestinationNode.prototype, 'maxChannelCount', function () { return this.__d.max; });
+  function makeDestination(ctx, channels, max, offline) {
+    var d = Object.create(AudioDestinationNode.prototype);
+    setupNode(d, ctx, { inputs: 1, outputs: 0, channels: channels, mode: 'explicit', process: AudioDestinationNode.__cfg.process, fixedChannels: offline ? channels : undefined, maxChannels: max, fixedMode: 'explicit' });
+    d.__d.max = max;
+    return d;
+  }
+  var AudioListener = cls('AudioListener', null);
+  function makeListener(ctx) {
+    var l = Object.create(AudioListener.prototype), d = { };
+    var fake = { context: ctx, __ctx: ctx };
+    [['positionX', 0], ['positionY', 0], ['positionZ', 0], ['forwardX', 0], ['forwardY', 0], ['forwardZ', -1], ['upX', 0], ['upY', 1], ['upZ', 0]].forEach(function (p) { d[p[0]] = param(fake, p[0], p[1], NEG, POS); });
+    hide(l, '__d', d);
+    return l;
+  }
+  ['positionX', 'positionY', 'positionZ', 'forwardX', 'forwardY', 'forwardZ', 'upX', 'upY', 'upZ'].forEach(function (n) { exposeParam(AudioListener, n); });
+  def(AudioListener.prototype, 'setPosition', function (x, y, z) { this.__d.positionX.value = x; this.__d.positionY.value = y; this.__d.positionZ.value = z; });
+  def(AudioListener.prototype, 'setOrientation', function (x, y, z, ux, uy, uz) { var d = this.__d; d.forwardX.value = x; d.forwardY.value = y; d.forwardZ.value = z; d.upX.value = ux; d.upY.value = uy; d.upZ.value = uz; });
+
+  // ------------------------------------------------------------------------------------------------------------------------------ scheduled sources
+  var AudioScheduledSourceNode = nodeClass('AudioScheduledSourceNode', { inputs: 0, outputs: 1, channels: 2, always: true });
+  handler(AudioScheduledSourceNode.prototype, 'ended');
+  function checkWhen(t, what) { t = t === undefined ? 0 : Number(t); if (!(t >= 0) || t === Infinity) throw new RangeError("Failed to execute '" + what + "' on 'AudioScheduledSourceNode': The " + what + ' time provided (' + t + ') is negative.'); return t; }
+  def(AudioScheduledSourceNode.prototype, 'start', function (when) {
+    var d = this.__d; when = checkWhen(when, 'start');
+    if (d.started) throw domex("Failed to execute 'start' on 'AudioScheduledSourceNode': cannot call start more than once.", 'InvalidStateError');
+    d.started = true; d.startT = when;
+  });
+  def(AudioScheduledSourceNode.prototype, 'stop', function (when) {
+    var d = this.__d; when = checkWhen(when, 'stop');
+    if (!d.started) throw domex("Failed to execute 'stop' on 'AudioScheduledSourceNode': cannot call stop without calling start first.", 'InvalidStateError');
+    d.stopT = when;
+  });
+  // the frames of this quantum in which the source plays: [from, to)
+  function activeRange(n, ctx, start) {
+    var d = n.__d, rate = ctx.__s.rate;
+    if (!d.started || d.ended) return null;
+    var from = Math.max(0, Math.ceil(d.startT * rate - 1e-9) - start), to = QUANTUM;
+    if (d.stopT !== undefined && d.stopT !== null) to = Math.min(QUANTUM, Math.ceil(d.stopT * rate - 1e-9) - start);
+    if (from >= QUANTUM) return null;
+    if (to <= from) { if (to <= 0 || (d.stopT !== undefined && d.stopT !== null && Math.ceil(d.stopT * rate - 1e-9) <= start + from)) { finish(n, ctx); } return null; }
+    return [from, to];
+  }
+  function finish(n, ctx) {
+    var d = n.__d;
+    if (d.ended) return;
+    d.ended = true;
+    var s = ctx.__s, i = s.nodes.indexOf(n);
+    if (i >= 0) s.nodes.splice(i, 1);
+    setTimeout(function () { fire(n, new g.Event('ended')); }, 0);
+  }
+  function stopReached(n, ctx, start) { var d = n.__d; if (d.stopT !== undefined && d.stopT !== null && Math.ceil(d.stopT * ctx.__s.rate - 1e-9) <= start + QUANTUM) finish(n, ctx); }
+
+  var OscillatorNode = nodeClass('OscillatorNode', {
+    parent: AudioScheduledSourceNode, inputs: 0, outputs: 1, channels: 2, mode: 'max', always: true,
+    init: function (n, ctx, o) {
+      var d = n.__d; d.type = 'sine'; d.phase = 0; d.wave = null;
+      d.frequency = param(n, 'frequency', 440, -ctx.sampleRate / 2, ctx.sampleRate / 2); d.detune = param(n, 'detune', 0, -153600, 153600);
+      paramOption(n, d.frequency, o, 'frequency'); paramOption(n, d.detune, o, 'detune');
+      if (o.periodicWave !== undefined) n.setPeriodicWave(o.periodicWave);
+      else if (o.type !== undefined) n.type = o.type;
+    },
+    process: function (n, inputs, ctx, start) {
+      var d = n.__d, out = new Float32Array(QUANTUM), r = activeRange(n, ctx, start);
+      if (r) {
+        var fr = paramBlock(d.frequency, ctx, start), dt = paramBlock(d.detune, ctx, start), rate = ctx.sampleRate, ph = d.phase, type = d.type, table = d.wave && d.wave.table;
+        for (var i = r[0]; i < r[1]; i++) {
+          var f = dt[i] === 0 ? fr[i] : fr[i] * Math.pow(2, dt[i] / 1200), inc = f / rate, v;
+          if (type === 'sine') v = Math.sin(TWO_PI * ph);
+          else if (type === 'square') { v = ph < 0.5 ? 1 : -1; var a = Math.abs(inc); v += blep(ph, a) - blep((ph + 0.5) % 1, a); }
+          else if (type === 'sawtooth') { var q = (ph + 0.5) % 1; v = 2 * q - 1; v -= blep(q, Math.abs(inc)); }
+          else if (type === 'triangle') v = ph < 0.25 ? 4 * ph : ph < 0.75 ? 2 - 4 * ph : 4 * ph - 4;
+          else { var pos = ph * table.length, k = Math.floor(pos), fr2 = pos - k; v = table[k % table.length] * (1 - fr2) + table[(k + 1) % table.length] * fr2; }
+          out[i] = v;
+          ph += inc; ph -= Math.floor(ph);
+        }
+        d.phase = ph;
+        stopReached(n, ctx, start);
+      }
+      return [[out]];
+    }
+  });
+  function blep(t, dt) {   // polyBLEP residual around a step at phase 0
+    if (dt <= 0) return 0;
+    if (t < dt) { t /= dt; return t + t - t * t - 1; }
+    if (t > 1 - dt) { t = (t - 1) / dt; return t * t + t + t + 1; }
+    return 0;
+  }
+  exposeParam(OscillatorNode, 'frequency'); exposeParam(OscillatorNode, 'detune');
+  accessor(OscillatorNode.prototype, 'type', function () { return this.__d.type; }, function (v) {
+    v = String(v);
+    if (v === 'custom') throw domex("Failed to set the 'type' property on 'OscillatorNode': 'type' cannot be set directly to 'custom'.  The PeriodicWave must be set explicitly.", 'InvalidStateError');
+    if (['sine', 'square', 'sawtooth', 'triangle'].indexOf(v) < 0) return;
+    this.__d.type = v; this.__d.wave = null;
+  });
+  def(OscillatorNode.prototype, 'setPeriodicWave', function (w) {
+    if (!(w instanceof PeriodicWave)) throw new TypeError("Failed to execute 'setPeriodicWave' on 'OscillatorNode': parameter 1 is not of type 'PeriodicWave'.");
+    this.__d.type = 'custom'; this.__d.wave = w.__w;
+  });
+
+  var PeriodicWave = cls('PeriodicWave', null, function (ctx, options) {
+    if (!isContext(ctx)) throw new TypeError("Failed to construct 'PeriodicWave': parameter 1 is not of type 'BaseAudioContext'.");
+    options = options || {};
+    var real = options.real ? Array.prototype.slice.call(options.real).map(Number) : null, imag = options.imag ? Array.prototype.slice.call(options.imag).map(Number) : null;
+    if (!real && !imag) { real = [0, 0]; imag = [0, 1]; }
+    else if (!real) real = imag.map(function () { return 0; }); else if (!imag) imag = real.map(function () { return 0; });
+    if (real.length !== imag.length) throw domex("Failed to construct 'PeriodicWave': The real array length (" + real.length + ') does not match the imag array length (' + imag.length + ').', 'IndexSizeError');
+    if (real.length < 2) throw domex("Failed to construct 'PeriodicWave': The length of the real array (" + real.length + ') is less than the minimum bound (2).', 'IndexSizeError');
+    var size = 2048, table = new Float32Array(size), max = 0, i, k;
+    for (i = 0; i < size; i++) { var s = 0, p = i / size; for (k = 1; k < real.length; k++) s += real[k] * Math.cos(TWO_PI * k * p) + imag[k] * Math.sin(TWO_PI * k * p); table[i] = s; max = Math.max(max, Math.abs(s)); }
+    if (!options.disableNormalization && max > 0) for (i = 0; i < size; i++) table[i] /= max;
+    hide(this, '__w', { table: table });
+  });
+  def(AudioContext.prototype, 'createPeriodicWave', function (real, imag, c) { return new PeriodicWave(this, { real: real, imag: imag, disableNormalization: c && c.disableNormalization }); });
+
+  var ConstantSourceNode = nodeClass('ConstantSourceNode', {
+    parent: AudioScheduledSourceNode, inputs: 0, outputs: 1, channels: 2, always: true,
+    init: function (n, ctx, o) { n.__d.offset = param(n, 'offset', 1, NEG, POS); paramOption(n, n.__d.offset, o, 'offset'); },
+    process: function (n, inputs, ctx, start) {
+      var out = new Float32Array(QUANTUM), r = activeRange(n, ctx, start);
+      if (r) { var off = paramBlock(n.__d.offset, ctx, start); for (var i = r[0]; i < r[1]; i++) out[i] = off[i]; stopReached(n, ctx, start); }
+      return [[out]];
+    }
+  });
+  exposeParam(ConstantSourceNode, 'offset');
+
+  var AudioBufferSourceNode = nodeClass('AudioBufferSourceNode', {
+    parent: AudioScheduledSourceNode, inputs: 0, outputs: 1, channels: 2, always: true,
+    init: function (n, ctx, o) {
+      var d = n.__d; d.buffer = null; d.loop = false; d.loopStart = 0; d.loopEnd = 0; d.pos = 0; d.playing = false;
+      d.playbackRate = param(n, 'playbackRate', 1, NEG, POS); d.detune = param(n, 'detune', 0, NEG, POS);
+      paramOption(n, d.playbackRate, o, 'playbackRate'); paramOption(n, d.detune, o, 'detune');
+      if (o.buffer !== undefined && o.buffer !== null) n.buffer = o.buffer;
+      if (o.loop !== undefined) d.loop = !!o.loop; if (o.loopStart !== undefined) d.loopStart = Number(o.loopStart); if (o.loopEnd !== undefined) d.loopEnd = Number(o.loopEnd);
+    },
+    process: function (n, inputs, ctx, start) {
+      var d = n.__d, buf = d.buffer, nch = buf ? buf.numberOfChannels : 1, outs = silence(nch), r = activeRange(n, ctx, start);
+      if (!r || !buf) { if (r && !buf) { stopReached(n, ctx, start); } return [outs]; }
+      var rate = ctx.sampleRate, ratio = buf.sampleRate / rate, pr = paramBlock(d.playbackRate, ctx, start), dt = paramBlock(d.detune, ctx, start), len = buf.length;
+      var ls = d.loopStart * buf.sampleRate, le = d.loopEnd > 0 ? Math.min(d.loopEnd * buf.sampleRate, len) : len;
+      var loop = d.loop && le > ls;
+      if (!d.playing) { d.playing = true; d.pos = d.offset * buf.sampleRate; if (loop && d.pos >= le) d.pos = ls + (d.pos - ls) % (le - ls); d.limit = d.duration === undefined ? Infinity : d.pos + d.duration * buf.sampleRate; d.first = d.pos; }
+      var pos = d.pos, data = buf.__c, done = false;
+      for (var i = r[0]; i < r[1]; i++) {
+        if (loop && pos >= le) pos = ls + (pos - ls) % (le - ls);
+        if (pos >= len || pos < 0 || pos >= d.limit) { done = true; break; }
+        var k = Math.floor(pos), f = pos - k, k2 = k + 1;
+        if (k2 >= len) k2 = loop ? Math.floor(ls) : k;
+        for (var c = 0; c < nch; c++) { var ch = data[c]; outs[c][i] = ch[k] * (1 - f) + ch[k2] * f; }
+        var step = pr[i] * (dt[i] === 0 ? 1 : Math.pow(2, dt[i] / 1200)) * ratio;
+        pos += step;
+      }
+      d.pos = pos;
+      if (done || (!loop && (pos >= len || pos >= d.limit))) finish(n, ctx); else stopReached(n, ctx, start);
+      return [outs];
+    }
+  });
+  exposeParam(AudioBufferSourceNode, 'playbackRate'); exposeParam(AudioBufferSourceNode, 'detune');
+  accessor(AudioBufferSourceNode.prototype, 'buffer', function () { return this.__d.buffer; }, function (b) {
+    if (b !== null && !(b instanceof AudioBuffer)) throw new TypeError("Failed to set the 'buffer' property on 'AudioBufferSourceNode': The provided value is not of type 'AudioBuffer'.");
+    if (b !== null && this.__d.bufferSet) throw domex("Failed to set the 'buffer' property on 'AudioBufferSourceNode': Cannot set buffer to non-null after it has been already been set to a non-null buffer", 'InvalidStateError');
+    this.__d.buffer = b; if (b) this.__d.bufferSet = true;
+  });
+  ['loop', 'loopStart', 'loopEnd'].forEach(function (k) { accessor(AudioBufferSourceNode.prototype, k, function () { return this.__d[k]; }, function (v) { this.__d[k] = k === 'loop' ? !!v : Number(v); }); });
+  def(AudioBufferSourceNode.prototype, 'start', function (when, offset, duration) {
+    var d = this.__d; when = checkWhen(when, 'start');
+    if (d.started) throw domex("Failed to execute 'start' on 'AudioBufferSourceNode': cannot call start more than once.", 'InvalidStateError');
+    if (offset !== undefined && !(Number(offset) >= 0)) throw new RangeError("Failed to execute 'start' on 'AudioBufferSourceNode': The offset provided (" + offset + ') is negative.');
+    if (duration !== undefined && !(Number(duration) >= 0)) throw new RangeError("Failed to execute 'start' on 'AudioBufferSourceNode': The duration provided (" + duration + ') is negative.');
+    d.started = true; d.startT = when; d.offset = offset === undefined ? 0 : Number(offset); d.duration = duration === undefined ? undefined : Number(duration);
+  });
+
+  // ------------------------------------------------------------------------------------------------------------------------------ processing nodes
+  var GainNode = nodeClass('GainNode', {
+    inputs: 1, outputs: 1, channels: 2, mode: 'max',
+    init: function (n, ctx, o) { n.__d.gain = param(n, 'gain', 1, NEG, POS); paramOption(n, n.__d.gain, o, 'gain'); },
+    process: function (n, inputs, ctx, start) {
+      var gain = paramBlock(n.__d.gain, ctx, start), inp = inputs[0], out = [];
+      for (var c = 0; c < inp.length; c++) { var o = new Float32Array(QUANTUM), s = inp[c]; for (var i = 0; i < QUANTUM; i++) o[i] = s[i] * gain[i]; out.push(o); }
+      return [out];
+    }
+  });
+  exposeParam(GainNode, 'gain');
+
+  var DelayNode = nodeClass('DelayNode', {
+    inputs: 1, outputs: 1, channels: 2, mode: 'max',
+    pre: function (n, ctx, o) {
+      var max = o.maxDelayTime === undefined ? 1 : Number(o.maxDelayTime);
+      if (!(max > 0 && max < 180)) throw domex("Failed to construct 'DelayNode': The max delay time provided (" + max + ') is outside the range (0, 180).', 'NotSupportedError');
+      n.__d.max = max;
+    },
+    init: function (n, ctx, o) { var d = n.__d; d.delayTime = param(n, 'delayTime', 0, 0, d.max); paramOption(n, d.delayTime, o, 'delayTime'); d.buf = null; d.w = 0; },
+    process: function (n, inputs, ctx, start) {
+      var d = n.__d, inp = inputs[0], nch = inp.length, rate = ctx.sampleRate, size = Math.ceil(d.max * rate) + QUANTUM + 2;
+      if (!d.buf || d.buf.length !== nch) { var old = d.buf; d.buf = []; for (var c0 = 0; c0 < nch; c0++) d.buf.push(old && old[c0] ? old[c0] : new Float32Array(size)); }
+      var dt = paramBlock(d.delayTime, ctx, start), out = silence(nch), w = d.w, i, c;
+      for (i = 0; i < QUANTUM; i++) {
+        for (c = 0; c < nch; c++) d.buf[c][(w + i) % size] = inp[c][i];
+        var delay = Math.min(dt[i], d.max) * rate, rp = w + i - delay, k = Math.floor(rp), f = rp - k;
+        for (c = 0; c < nch; c++) { var b = d.buf[c]; out[c][i] = b[((k % size) + size) % size] * (1 - f) + b[(((k + 1) % size) + size) % size] * f; }
+      }
+      d.w = (w + QUANTUM) % size;
+      return [out];
+    }
+  });
+  exposeParam(DelayNode, 'delayTime');
+
+  var StereoPannerNode = nodeClass('StereoPannerNode', {
+    inputs: 1, outputs: 1, channels: 2, mode: 'clamped-max', maxChannels: 2, noMax: true,
+    init: function (n, ctx, o) { n.__d.pan = param(n, 'pan', 0, -1, 1); paramOption(n, n.__d.pan, o, 'pan'); },
+    process: function (n, inputs, ctx, start) {
+      var pan = paramBlock(n.__d.pan, ctx, start), inp = inputs[0], L = new Float32Array(QUANTUM), R = new Float32Array(QUANTUM), mono = inp.length === 1;
+      for (var i = 0; i < QUANTUM; i++) {
+        var p = Math.max(-1, Math.min(1, pan[i])), x = mono ? (p + 1) / 2 : (p <= 0 ? p + 1 : p), gl = Math.cos(x * Math.PI / 2), gr = Math.sin(x * Math.PI / 2);
+        if (mono) { L[i] = inp[0][i] * gl; R[i] = inp[0][i] * gr; }
+        else if (p <= 0) { L[i] = inp[0][i] + inp[1][i] * gl; R[i] = inp[1][i] * gr; }
+        else { L[i] = inp[0][i] * gl; R[i] = inp[1][i] + inp[0][i] * gr; }
+      }
+      return [[L, R]];
+    }
+  });
+  exposeParam(StereoPannerNode, 'pan');
+
+  var WaveShaperNode = nodeClass('WaveShaperNode', {
+    inputs: 1, outputs: 1, channels: 2, mode: 'max',
+    init: function (n, ctx, o) { n.__d.curve = null; n.__d.oversample = 'none'; if (o.curve !== undefined && o.curve !== null) n.curve = o.curve; if (o.oversample !== undefined) n.oversample = o.oversample; },
+    process: function (n, inputs) {
+      var curve = n.__d.curve, inp = inputs[0], out = [];
+      for (var c = 0; c < inp.length; c++) {
+        var o = new Float32Array(QUANTUM), s = inp[c];
+        for (var i = 0; i < QUANTUM; i++) {
+          if (!curve) { o[i] = s[i]; continue; }
+          var m = curve.length, pos = (m - 1) / 2 * (s[i] + 1);
+          if (pos <= 0) o[i] = curve[0]; else if (pos >= m - 1) o[i] = curve[m - 1]; else { var k = Math.floor(pos), f = pos - k; o[i] = curve[k] * (1 - f) + curve[k + 1] * f; }
+        }
+        out.push(o);
+      }
+      return [out];
+    }
+  });
+  accessor(WaveShaperNode.prototype, 'curve', function () { return this.__d.curveSource || null; }, function (v) {
+    if (v === null) { this.__d.curve = null; this.__d.curveSource = null; return; }
+    if (!(v instanceof Float32Array)) throw new TypeError("Failed to set the 'curve' property on 'WaveShaperNode': The provided value is not of type 'Float32Array'.");
+    if (v.length < 2) throw domex("Failed to set the 'curve' property on 'WaveShaperNode': The curve length provided (" + v.length + ') is less than the minimum bound (2).', 'InvalidStateError');
+    if (this.__d.curveSource) throw domex("Failed to set the 'curve' property on 'WaveShaperNode': The curve has already been set.", 'InvalidStateError');
+    this.__d.curveSource = v; this.__d.curve = new Float32Array(v);
+  });
+  accessor(WaveShaperNode.prototype, 'oversample', function () { return this.__d.oversample; }, function (v) { v = String(v); if (v === 'none' || v === '2x' || v === '4x') this.__d.oversample = v; });
+
+  // biquad coefficients (the cookbook formulas, as the standard gives them)
+  function biquadCoefficients(type, freq, q, gainDb, rate) {
+    var nyq = rate / 2, f = Math.max(0, Math.min(1, freq / nyq)), b0, b1, b2, a0 = 1, a1, a2;
+    if (f >= 1) { return type === 'lowpass' || type === 'allpass' || type === 'lowshelf' || type === 'peaking' ? [1, 0, 0, 0, 0] : [0, 0, 0, 0, 0]; }
+    var A = Math.pow(10, gainDb / 40), w0 = Math.PI * f, cw = Math.cos(w0), sw = Math.sin(w0);
+    switch (type) {
+      case 'lowpass': {
+        if (f <= 0) return [0, 0, 0, 0, 0];
+        var g = Math.pow(10, q / 20), al = sw / (2 * g);
+        b0 = (1 - cw) / 2; b1 = 1 - cw; b2 = b0; a0 = 1 + al; a1 = -2 * cw; a2 = 1 - al; break;
+      }
+      case 'highpass': {
+        if (f <= 0) return [1, 0, 0, 0, 0];
+        var g2 = Math.pow(10, q / 20), al2 = sw / (2 * g2);
+        b0 = (1 + cw) / 2; b1 = -(1 + cw); b2 = b0; a0 = 1 + al2; a1 = -2 * cw; a2 = 1 - al2; break;
+      }
+      case 'bandpass': {
+        if (f <= 0 || q <= 0) return [0, 0, 0, 0, 0];
+        var al3 = sw / (2 * q); b0 = al3; b1 = 0; b2 = -al3; a0 = 1 + al3; a1 = -2 * cw; a2 = 1 - al3; break;
+      }
+      case 'notch': {
+        if (f <= 0) return [1, 0, 0, 0, 0];
+        var al4 = sw / (2 * q); b0 = 1; b1 = -2 * cw; b2 = 1; a0 = 1 + al4; a1 = -2 * cw; a2 = 1 - al4; break;
+      }
+      case 'allpass': {
+        if (f <= 0) return [1, 0, 0, 0, 0];
+        var al5 = sw / (2 * q); b0 = 1 - al5; b1 = -2 * cw; b2 = 1 + al5; a0 = 1 + al5; a1 = -2 * cw; a2 = 1 - al5; break;
+      }
+      case 'peaking': {
+        if (f <= 0) return [1, 0, 0, 0, 0];
+        var al6 = sw / (2 * q); b0 = 1 + al6 * A; b1 = -2 * cw; b2 = 1 - al6 * A; a0 = 1 + al6 / A; a1 = -2 * cw; a2 = 1 - al6 / A; break;
+      }
+      case 'lowshelf': {
+        if (f <= 0) return [A * A, 0, 0, 0, 0];
+        var s2 = 2 * Math.sqrt(A) * sw / 2 * Math.sqrt((A + 1 / A) * (1 / 1 - 1) + 2);
+        var beta = 2 * Math.sqrt(A) * sw / 2 * Math.SQRT2;
+        b0 = A * ((A + 1) - (A - 1) * cw + beta); b1 = 2 * A * ((A - 1) - (A + 1) * cw); b2 = A * ((A + 1) - (A - 1) * cw - beta);
+        a0 = (A + 1) + (A - 1) * cw + beta; a1 = -2 * ((A - 1) + (A + 1) * cw); a2 = (A + 1) + (A - 1) * cw - beta; break;
+      }
+      case 'highshelf': {
+        if (f <= 0) return [1, 0, 0, 0, 0];
+        var beta2 = 2 * Math.sqrt(A) * sw / 2 * Math.SQRT2;
+        b0 = A * ((A + 1) + (A - 1) * cw + beta2); b1 = -2 * A * ((A - 1) + (A + 1) * cw); b2 = A * ((A + 1) + (A - 1) * cw - beta2);
+        a0 = (A + 1) - (A - 1) * cw + beta2; a1 = 2 * ((A - 1) - (A + 1) * cw); a2 = (A + 1) - (A - 1) * cw - beta2; break;
+      }
+      default: return [1, 0, 0, 0, 0];
+    }
+    return [b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0];
+  }
+  var BiquadFilterNode = nodeClass('BiquadFilterNode', {
+    inputs: 1, outputs: 1, channels: 2, mode: 'max',
+    init: function (n, ctx, o) {
+      var d = n.__d, nyq = ctx.sampleRate / 2; d.type = 'lowpass'; d.z = [];
+      d.frequency = param(n, 'frequency', 350, 0, nyq); d.detune = param(n, 'detune', 0, -153600, 153600); d.Q = param(n, 'Q', 1, NEG, POS); d.gain = param(n, 'gain', 0, NEG, 1541);
+      ['frequency', 'detune', 'Q', 'gain'].forEach(function (k) { paramOption(n, d[k], o, k); });
+      if (o.type !== undefined) n.type = o.type;
+    },
+    process: function (n, inputs, ctx, start) {
+      var d = n.__d, inp = inputs[0], nch = inp.length, fr = paramBlock(d.frequency, ctx, start, true), dt = paramBlock(d.detune, ctx, start, true), q = paramBlock(d.Q, ctx, start, true), gn = paramBlock(d.gain, ctx, start, true);
+      var freq = fr[0] * Math.pow(2, dt[0] / 1200), cf = biquadCoefficients(d.type, freq, q[0], gn[0], ctx.sampleRate), out = [];
+      while (d.z.length < nch) d.z.push([0, 0, 0, 0]);
+      for (var c = 0; c < nch; c++) {
+        var s = inp[c], o = new Float32Array(QUANTUM), z = d.z[c], x1 = z[0], x2 = z[1], y1 = z[2], y2 = z[3];
+        for (var i = 0; i < QUANTUM; i++) { var x = s[i], y = cf[0] * x + cf[1] * x1 + cf[2] * x2 - cf[3] * y1 - cf[4] * y2; o[i] = y; x2 = x1; x1 = x; y2 = y1; y1 = y; }
+        z[0] = x1; z[1] = x2; z[2] = y1; z[3] = y2; out.push(o);
+      }
+      return [out];
+    }
+  });
+  ['frequency', 'detune', 'Q', 'gain'].forEach(function (k) { exposeParam(BiquadFilterNode, k); });
+  accessor(BiquadFilterNode.prototype, 'type', function () { return this.__d.type; }, function (v) { v = String(v); if (['lowpass', 'highpass', 'bandpass', 'lowshelf', 'highshelf', 'peaking', 'notch', 'allpass'].indexOf(v) >= 0) this.__d.type = v; });
+  def(BiquadFilterNode.prototype, 'getFrequencyResponse', function (freqs, mag, phase) {
+    if (!(freqs instanceof Float32Array) || !(mag instanceof Float32Array) || !(phase instanceof Float32Array)) throw new TypeError("Failed to execute 'getFrequencyResponse' on 'BiquadFilterNode': parameter is not of type 'Float32Array'.");
+    if (freqs.length !== mag.length || freqs.length !== phase.length) throw domex("Failed to execute 'getFrequencyResponse' on 'BiquadFilterNode': The magResponse length (" + mag.length + ') does not match the frequencyHz length (' + freqs.length + ').', 'InvalidAccessError');
+    var d = this.__d, rate = this.__ctx.sampleRate, cf = biquadCoefficients(d.type, d.frequency.value * Math.pow(2, d.detune.value / 1200), d.Q.value, d.gain.value, rate);
+    responseOf([cf[0], cf[1], cf[2]], [1, cf[3], cf[4]], freqs, mag, phase, rate);
+  });
+  function responseOf(b, a, freqs, mag, phase, rate) {
+    for (var i = 0; i < freqs.length; i++) {
+      var f = freqs[i];
+      if (!(f >= 0 && f <= rate / 2)) { mag[i] = NaN; phase[i] = NaN; continue; }
+      var w = Math.PI * f / (rate / 2), nr = 0, ni = 0, dr = 0, di = 0, k;
+      for (k = 0; k < b.length; k++) { nr += b[k] * Math.cos(-w * k); ni += b[k] * Math.sin(-w * k); }
+      for (k = 0; k < a.length; k++) { dr += a[k] * Math.cos(-w * k); di += a[k] * Math.sin(-w * k); }
+      var den = dr * dr + di * di, re = (nr * dr + ni * di) / den, im = (ni * dr - nr * di) / den;
+      mag[i] = Math.hypot(re, im); phase[i] = Math.atan2(im, re);
+    }
+  }
+
+  var IIRFilterNode = nodeClass('IIRFilterNode', {
+    inputs: 1, outputs: 1, channels: 2, mode: 'max',
+    pre: function (n, ctx, o) {
+      var ff = o.feedforward, fb = o.feedback;
+      if (!ff || !fb) throw new TypeError("Failed to construct 'IIRFilterNode': required member " + (!ff ? 'feedforward' : 'feedback') + ' is undefined.');
+      ff = Array.prototype.slice.call(ff).map(Number); fb = Array.prototype.slice.call(fb).map(Number);
+      if (!ff.length || ff.length > 20) throw domex("Failed to construct 'IIRFilterNode': The feedforward array length (" + ff.length + ') is outside the range [1, 20].', 'NotSupportedError');
+      if (!fb.length || fb.length > 20) throw domex("Failed to construct 'IIRFilterNode': The feedback array length (" + fb.length + ') is outside the range [1, 20].', 'NotSupportedError');
+      if (fb[0] === 0) throw domex("Failed to construct 'IIRFilterNode': First feedback coefficient cannot be zero.", 'InvalidStateError');
+      if (ff.every(function (x) { return x === 0; })) throw domex("Failed to construct 'IIRFilterNode': feedforward coefficients cannot all be zero.", 'InvalidStateError');
+      var a0 = fb[0]; n.__d.b = ff.map(function (x) { return x / a0; }); n.__d.a = fb.map(function (x) { return x / a0; }); n.__d.x = []; n.__d.y = [];
+    },
+    process: function (n, inputs) {
+      var d = n.__d, inp = inputs[0], out = [];
+      for (var c = 0; c < inp.length; c++) {
+        if (!d.x[c]) { d.x[c] = new Float64Array(d.b.length); d.y[c] = new Float64Array(d.a.length); }
+        var xs = d.x[c], ys = d.y[c], o = new Float32Array(QUANTUM), s = inp[c];
+        for (var i = 0; i < QUANTUM; i++) {
+          var k, acc = 0;
+          for (k = xs.length - 1; k > 0; k--) xs[k] = xs[k - 1];
+          xs[0] = s[i];
+          for (k = 0; k < d.b.length; k++) acc += d.b[k] * xs[k];
+          for (k = 1; k < d.a.length; k++) acc -= d.a[k] * ys[k - 1];
+          for (k = ys.length - 1; k > 0; k--) ys[k] = ys[k - 1];
+          ys[0] = acc; o[i] = acc;
+        }
+        out.push(o);
+      }
+      return [out];
+    }
+  });
+  def(IIRFilterNode.prototype, 'getFrequencyResponse', function (freqs, mag, phase) {
+    if (freqs.length !== mag.length || freqs.length !== phase.length) throw domex("Failed to execute 'getFrequencyResponse' on 'IIRFilterNode': array lengths differ.", 'InvalidAccessError');
+    responseOf(this.__d.b, this.__d.a, freqs, mag, phase, this.__ctx.sampleRate);
+  });
+
+  var ChannelSplitterNode = nodeClass('ChannelSplitterNode', {
+    inputs: 1, outputs: 6, channels: 6, mode: 'explicit', interp: 'discrete', fixedMode: 'explicit', fixedChannels: undefined,
+    pre: function (n, ctx, o) {
+      var k = o.numberOfOutputs === undefined ? 6 : o.numberOfOutputs >>> 0;
+      if (k < 1 || k > 32) throw domex("Failed to construct 'ChannelSplitterNode': Number of outputs (" + k + ') must be between 1 and 32.', 'IndexSizeError');
+      n.__nout = k; n.__channels = k;
+    },
+    process: function (n, inputs) { var inp = inputs[0], out = []; for (var k = 0; k < n.__nout; k++) out.push([inp[k] || new Float32Array(QUANTUM)]); return out; }
+  });
+  var ChannelMergerNode = nodeClass('ChannelMergerNode', {
+    inputs: 6, outputs: 1, channels: 1, mode: 'explicit', fixedMode: 'explicit', fixedChannels: 1,
+    pre: function (n, ctx, o) {
+      var k = o.numberOfInputs === undefined ? 6 : o.numberOfInputs >>> 0;
+      if (k < 1 || k > 32) throw domex("Failed to construct 'ChannelMergerNode': Number of inputs (" + k + ') must be between 1 and 32.', 'IndexSizeError');
+      n.__in.length = 0; for (var i = 0; i < k; i++) n.__in.push([]);
+    },
+    process: function (n, inputs) { var out = []; for (var k = 0; k < inputs.length; k++) out.push(inputs[k][0]); return [out]; }
+  });
+
+  var DynamicsCompressorNode = nodeClass('DynamicsCompressorNode', {
+    inputs: 1, outputs: 1, channels: 2, mode: 'clamped-max', maxChannels: 2, noMax: true,
+    init: function (n, ctx, o) {
+      var d = n.__d; d.threshold = param(n, 'threshold', -24, -100, 0, 'k-rate', true); d.knee = param(n, 'knee', 30, 0, 40, 'k-rate', true); d.ratio = param(n, 'ratio', 12, 1, 20, 'k-rate', true);
+      d.attack = param(n, 'attack', 0.003, 0, 1, 'k-rate', true); d.release = param(n, 'release', 0.25, 0, 1, 'k-rate', true); d.gr = 0; d.env = 0;
+      ['threshold', 'knee', 'ratio', 'attack', 'release'].forEach(function (k) { paramOption(n, d[k], o, k); });
+    },
+    process: function (n, inputs, ctx, start) {
+      var d = n.__d, inp = inputs[0], th = paramBlock(d.threshold, ctx, start, true)[0], knee = paramBlock(d.knee, ctx, start, true)[0], ratio = paramBlock(d.ratio, ctx, start, true)[0];
+      var att = paramBlock(d.attack, ctx, start, true)[0], rel = paramBlock(d.release, ctx, start, true)[0], rate = ctx.sampleRate, out = silence(inp.length);
+      var ac = Math.exp(-1 / Math.max(1, att * rate)), rc = Math.exp(-1 / Math.max(1, rel * rate)), env = d.env, i, c, peak;
+      for (i = 0; i < QUANTUM; i++) {
+        peak = 0; for (c = 0; c < inp.length; c++) peak = Math.max(peak, Math.abs(inp[c][i]));
+        env = peak > env ? ac * env + (1 - ac) * peak : rc * env + (1 - rc) * peak;
+        var db = 20 * Math.log10(Math.max(env, 1e-9)), over = db - th, gainDb;
+        if (over <= -knee / 2) gainDb = 0; else if (over >= knee / 2 || knee === 0) gainDb = (th + over / ratio) - db; else { var t = over + knee / 2; gainDb = (1 / ratio - 1) * t * t / (2 * knee); }
+        var gain = Math.pow(10, Math.min(0, gainDb) / 20);
+        for (c = 0; c < inp.length; c++) out[c][i] = inp[c][i] * gain;
+        d.gr = Math.min(0, gainDb);
+      }
+      d.env = env;
+      return [out];
+    }
+  });
+  ['threshold', 'knee', 'ratio', 'attack', 'release'].forEach(function (k) { exposeParam(DynamicsCompressorNode, k); });
+  accessor(DynamicsCompressorNode.prototype, 'reduction', function () { return this.__d.gr; });
+
+  var ConvolverNode = nodeClass('ConvolverNode', {
+    inputs: 1, outputs: 1, channels: 2, mode: 'clamped-max', maxChannels: 2, noMax: true,
+    init: function (n, ctx, o) { n.__d.buffer = null; n.__d.normalize = o.disableNormalization ? false : true; n.__d.hist = []; if (o.buffer) n.buffer = o.buffer; },
+    process: function (n, inputs) {
+      var d = n.__d, inp = inputs[0], buf = d.buffer;
+      if (!buf) return [silence(inp.length)];
+      var hl = buf.length, nch = inp.length, out = silence(nch), c, i, k;
+      for (c = 0; c < nch; c++) {
+        var ir = buf.__c[Math.min(c, buf.numberOfChannels - 1)], x = inp[c], plen = hl - 1, prev = d.hist[c] || new Float32Array(plen), scale = d.scale;
+        for (i = 0; i < QUANTUM; i++) {
+          var acc = 0, top = Math.min(hl - 1, i + plen);
+          for (k = 0; k <= top; k++) acc += ir[k] * (i - k >= 0 ? x[i - k] : prev[plen + i - k]);
+          out[c][i] = acc * scale;
+        }
+        var next = new Float32Array(plen);
+        for (k = 0; k < plen; k++) { var j = QUANTUM - plen + k; next[k] = j >= 0 ? x[j] : prev[plen + j]; }
+        d.hist[c] = next;
+      }
+      return [out];
+    }
+  });
+  accessor(ConvolverNode.prototype, 'buffer', function () { return this.__d.buffer; }, function (b) {
+    if (b === null) { this.__d.buffer = null; return; }
+    if (!(b instanceof AudioBuffer)) throw new TypeError("Failed to set the 'buffer' property on 'ConvolverNode': The provided value is not of type 'AudioBuffer'.");
+    if (b.sampleRate !== this.__ctx.sampleRate) throw domex("Failed to set the 'buffer' property on 'ConvolverNode': The buffer sample rate of " + b.sampleRate + " does not match the context rate of " + this.__ctx.sampleRate + ' Hz.', 'NotSupportedError');
+    if ([1, 2, 4].indexOf(b.numberOfChannels) < 0) throw domex("Failed to set the 'buffer' property on 'ConvolverNode': The buffer must have 1, 2, or 4 channels.", 'NotSupportedError');
+    this.__d.buffer = b; this.__d.hist = [];
+    var sum = 0, c, i; for (c = 0; c < b.numberOfChannels; c++) for (i = 0; i < b.length; i++) sum += b.__c[c][i] * b.__c[c][i];
+    this.__d.scale = this.__d.normalize && sum > 0 ? Math.min(1, 1 / Math.sqrt(sum / b.numberOfChannels)) : 1;
+  });
+  accessor(ConvolverNode.prototype, 'normalize', function () { return this.__d.normalize; }, function (v) { this.__d.normalize = !!v; if (this.__d.buffer) { var b = this.__d.buffer; this.buffer = null; this.buffer = b; } });
+
+  // ------------------------------------------------------------------------------------------------------------------------------ analyser
+  function fft(re, im) {   // in place, radix 2
+    var n = re.length, i, j = 0, k;
+    for (i = 1; i < n; i++) { var bit = n >> 1; for (; j & bit; bit >>= 1) j ^= bit; j ^= bit; if (i < j) { var t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; } }
+    for (var len = 2; len <= n; len <<= 1) {
+      var ang = -TWO_PI / len, wr = Math.cos(ang), wi = Math.sin(ang);
+      for (i = 0; i < n; i += len) {
+        var cr = 1, ci = 0;
+        for (k = 0; k < len / 2; k++) {
+          var ur = re[i + k], ui = im[i + k], vr = re[i + k + len / 2] * cr - im[i + k + len / 2] * ci, vi = re[i + k + len / 2] * ci + im[i + k + len / 2] * cr;
+          re[i + k] = ur + vr; im[i + k] = ui + vi; re[i + k + len / 2] = ur - vr; im[i + k + len / 2] = ui - vi;
+          var nr = cr * wr - ci * wi; ci = cr * wi + ci * wr; cr = nr;
+        }
+      }
+    }
+  }
+  var AnalyserNode = nodeClass('AnalyserNode', {
+    inputs: 1, outputs: 1, channels: 2, mode: 'max', always: true,
+    init: function (n, ctx, o) {
+      var d = n.__d; d.fftSize = 2048; d.min = -100; d.max = -30; d.smooth = 0.8; d.ring = new Float32Array(32768); d.w = 0; d.prev = null; d.lastFrame = -1;
+      if (o.fftSize !== undefined) n.fftSize = o.fftSize; if (o.minDecibels !== undefined) n.minDecibels = o.minDecibels; if (o.maxDecibels !== undefined) n.maxDecibels = o.maxDecibels; if (o.smoothingTimeConstant !== undefined) n.smoothingTimeConstant = o.smoothingTimeConstant;
+    },
+    process: function (n, inputs) {
+      var d = n.__d, inp = inputs[0], i;
+      for (i = 0; i < QUANTUM; i++) { var s = 0; for (var c = 0; c < inp.length; c++) s += inp[c][i]; d.ring[(d.w + i) % d.ring.length] = s / inp.length; }
+      d.w = (d.w + QUANTUM) % d.ring.length; d.fresh = true;
+      return [inp];
+    }
+  });
+  function recent(a, count) { var d = a.__d, out = new Float32Array(count), len = d.ring.length; for (var i = 0; i < count; i++) out[i] = d.ring[((d.w - count + i) % len + len) % len]; return out; }
+  accessor(AnalyserNode.prototype, 'fftSize', function () { return this.__d.fftSize; }, function (v) {
+    v = Number(v);
+    if (!(v >= 32 && v <= 32768) || (v & (v - 1)) !== 0) throw domex("Failed to set the 'fftSize' property on 'AnalyserNode': The FFT size provided (" + v + ') is not a power of two in the range 32 to 32768.', 'IndexSizeError');
+    this.__d.fftSize = v; this.__d.prev = null;
+  });
+  accessor(AnalyserNode.prototype, 'frequencyBinCount', function () { return this.__d.fftSize / 2; });
+  accessor(AnalyserNode.prototype, 'minDecibels', function () { return this.__d.min; }, function (v) { v = Number(v); if (!(v < this.__d.max)) throw domex("Failed to set the 'minDecibels' property on 'AnalyserNode': The minDecibels provided (" + v + ') is greater than or equal to the maxDecibels.', 'IndexSizeError'); this.__d.min = v; });
+  accessor(AnalyserNode.prototype, 'maxDecibels', function () { return this.__d.max; }, function (v) { v = Number(v); if (!(v > this.__d.min)) throw domex("Failed to set the 'maxDecibels' property on 'AnalyserNode': The maxDecibels provided (" + v + ') is less than or equal to the minDecibels.', 'IndexSizeError'); this.__d.max = v; });
+  accessor(AnalyserNode.prototype, 'smoothingTimeConstant', function () { return this.__d.smooth; }, function (v) { v = Number(v); if (!(v >= 0 && v <= 1)) throw domex("Failed to set the 'smoothingTimeConstant' property on 'AnalyserNode': The smoothing value provided (" + v + ') is outside the range [0, 1].', 'IndexSizeError'); this.__d.smooth = v; });
+  def(AnalyserNode.prototype, 'getFloatTimeDomainData', function (arr) { var data = recent(this, this.__d.fftSize), n = Math.min(arr.length, data.length); for (var i = 0; i < n; i++) arr[i] = data[i]; });
+  def(AnalyserNode.prototype, 'getByteTimeDomainData', function (arr) { var data = recent(this, this.__d.fftSize), n = Math.min(arr.length, data.length); for (var i = 0; i < n; i++) arr[i] = Math.max(0, Math.min(255, Math.floor(128 * (1 + data[i])))); });
+  function spectrum(a) {
+    var d = a.__d, size = d.fftSize, x = recent(a, size), re = new Float64Array(size), im = new Float64Array(size), i;
+    for (i = 0; i < size; i++) { var w = 0.42 - 0.5 * Math.cos(TWO_PI * i / size) + 0.08 * Math.cos(2 * TWO_PI * i / size); re[i] = x[i] * w; }
+    fft(re, im);
+    var bins = size / 2, mag = new Float64Array(bins);
+    if (!d.prev || d.prev.length !== bins) d.prev = new Float64Array(bins);
+    for (i = 0; i < bins; i++) { var m = Math.hypot(re[i], im[i]) / size; d.prev[i] = d.smooth * d.prev[i] + (1 - d.smooth) * m; mag[i] = d.prev[i]; }
+    return mag;
+  }
+  def(AnalyserNode.prototype, 'getFloatFrequencyData', function (arr) { var mag = spectrum(this), n = Math.min(arr.length, mag.length); for (var i = 0; i < n; i++) arr[i] = mag[i] > 0 ? 20 * Math.log10(mag[i]) : -Infinity; });
+  def(AnalyserNode.prototype, 'getByteFrequencyData', function (arr) {
+    var mag = spectrum(this), n = Math.min(arr.length, mag.length), lo = this.__d.min, hi = this.__d.max;
+    for (var i = 0; i < n; i++) { var db = mag[i] > 0 ? 20 * Math.log10(mag[i]) : -Infinity, v = Math.floor(255 / (hi - lo) * (db - lo)); arr[i] = Math.max(0, Math.min(255, v === v ? v : 0)); }
+  });
+
+  // ------------------------------------------------------------------------------------------------------------------------------ panner
+  var PannerNode = nodeClass('PannerNode', {
+    inputs: 1, outputs: 1, channels: 2, mode: 'clamped-max', maxChannels: 2, noMax: true,
+    init: function (n, ctx, o) {
+      var d = n.__d; d.panningModel = 'equalpower'; d.distanceModel = 'inverse'; d.refDistance = 1; d.maxDistance = 10000; d.rolloffFactor = 1; d.coneInnerAngle = 360; d.coneOuterAngle = 360; d.coneOuterGain = 0;
+      [['positionX', 0], ['positionY', 0], ['positionZ', 0], ['orientationX', 1], ['orientationY', 0], ['orientationZ', 0]].forEach(function (p) { d[p[0]] = param(n, p[0], p[1], NEG, POS); paramOption(n, d[p[0]], o, p[0]); });
+      ['panningModel', 'distanceModel', 'refDistance', 'maxDistance', 'rolloffFactor', 'coneInnerAngle', 'coneOuterAngle', 'coneOuterGain'].forEach(function (k) { if (o[k] !== undefined) n[k] = o[k]; });
+    },
+    process: function (n, inputs, ctx, start) {
+      var d = n.__d, L = ctx.listener.__d, inp = inputs[0], px = paramBlock(d.positionX, ctx, start, true)[0], py = paramBlock(d.positionY, ctx, start, true)[0], pz = paramBlock(d.positionZ, ctx, start, true)[0];
+      var lx = paramBlock(L.positionX, ctx, start, true)[0], ly = paramBlock(L.positionY, ctx, start, true)[0], lz = paramBlock(L.positionZ, ctx, start, true)[0];
+      var fx = paramBlock(L.forwardX, ctx, start, true)[0], fy = paramBlock(L.forwardY, ctx, start, true)[0], fz = paramBlock(L.forwardZ, ctx, start, true)[0];
+      var ux = paramBlock(L.upX, ctx, start, true)[0], uy = paramBlock(L.upY, ctx, start, true)[0], uz = paramBlock(L.upZ, ctx, start, true)[0];
+      var dx = px - lx, dy = py - ly, dz = pz - lz, dist = Math.hypot(dx, dy, dz);
+      // azimuth in the listener's horizontal plane
+      var rx = fy * uz - fz * uy, ry = fz * ux - fx * uz, rz = fx * uy - fy * ux, rl = Math.hypot(rx, ry, rz) || 1; rx /= rl; ry /= rl; rz /= rl;
+      var az = 0;
+      if (dist > 0) { var side = (dx * rx + dy * ry + dz * rz) / dist, front = (dx * fx + dy * fy + dz * fz) / (dist * (Math.hypot(fx, fy, fz) || 1)); az = Math.atan2(side, front) * 180 / Math.PI; }
+      if (az < -90) az = -180 - az; else if (az > 90) az = 180 - az;
+      var x = (az + 90) / 180, mono = inp.length === 1;
+      if (!mono) x = az <= 0 ? (az + 90) / 90 : az / 90;
+      var gl = Math.cos(x * Math.PI / 2), gr = Math.sin(x * Math.PI / 2);
+      var gain, r = Math.max(0, Math.min(dist, d.maxDistance));
+      if (d.distanceModel === 'linear') gain = 1 - d.rolloffFactor * (Math.min(Math.max(dist, d.refDistance), d.maxDistance) - d.refDistance) / (d.maxDistance - d.refDistance || 1);
+      else if (d.distanceModel === 'exponential') gain = Math.pow(Math.max(dist, d.refDistance) / d.refDistance, -d.rolloffFactor);
+      else gain = d.refDistance / (d.refDistance + d.rolloffFactor * (Math.max(dist, d.refDistance) - d.refDistance));
+      var out = [new Float32Array(QUANTUM), new Float32Array(QUANTUM)];
+      for (var i = 0; i < QUANTUM; i++) {
+        if (mono) { out[0][i] = inp[0][i] * gl * gain; out[1][i] = inp[0][i] * gr * gain; }
+        else if (az <= 0) { out[0][i] = (inp[0][i] + inp[1][i] * gl) * gain; out[1][i] = inp[1][i] * gr * gain; }
+        else { out[0][i] = inp[0][i] * gl * gain; out[1][i] = (inp[1][i] + inp[0][i] * gr) * gain; }
+      }
+      return [out];
+    }
+  });
+  ['positionX', 'positionY', 'positionZ', 'orientationX', 'orientationY', 'orientationZ'].forEach(function (k) { exposeParam(PannerNode, k); });
+  [['panningModel', ['equalpower', 'HRTF']], ['distanceModel', ['linear', 'inverse', 'exponential']]].forEach(function (p) { accessor(PannerNode.prototype, p[0], function () { return this.__d[p[0]]; }, function (v) { v = String(v); if (p[1].indexOf(v) >= 0) this.__d[p[0]] = v; }); });
+  [['refDistance', 0], ['maxDistance', 1e-9], ['rolloffFactor', 0], ['coneInnerAngle', -Infinity], ['coneOuterAngle', -Infinity], ['coneOuterGain', 0]].forEach(function (p) {
+    accessor(PannerNode.prototype, p[0], function () { return this.__d[p[0]]; }, function (v) {
+      v = Number(v);
+      if (p[0] === 'coneOuterGain' && !(v >= 0 && v <= 1)) throw domex("Failed to set the 'coneOuterGain' property on 'PannerNode': The cone gain provided (" + v + ') is outside the range [0, 1].', 'InvalidStateError');
+      if ((p[0] === 'refDistance' || p[0] === 'rolloffFactor') && v < 0) throw new RangeError("Failed to set the '" + p[0] + "' property on 'PannerNode': The value provided (" + v + ') should be non-negative.');
+      if (p[0] === 'maxDistance' && !(v > 0)) throw new RangeError("Failed to set the 'maxDistance' property on 'PannerNode': The value provided (" + v + ') should be positive.');
+      this.__d[p[0]] = v;
+    });
+  });
+  def(PannerNode.prototype, 'setPosition', function (x, y, z) { this.__d.positionX.value = x; this.__d.positionY.value = y; this.__d.positionZ.value = z; });
+  def(PannerNode.prototype, 'setOrientation', function (x, y, z) { this.__d.orientationX.value = x; this.__d.orientationY.value = y; this.__d.orientationZ.value = z; });
+
+  // ------------------------------------------------------------------------------------------------------------------------------ script processor, media nodes
+  var AudioProcessingEvent = cls('AudioProcessingEvent', g.Event, function (type, init) { init = init || {}; var e = new g.Event(type); Object.setPrototypeOf(e, AudioProcessingEvent.prototype); hide(e, '__e', { playbackTime: init.playbackTime, inputBuffer: init.inputBuffer, outputBuffer: init.outputBuffer }); return e; });
+  ['playbackTime', 'inputBuffer', 'outputBuffer'].forEach(function (k) { accessor(AudioProcessingEvent.prototype, k, function () { return this.__e[k]; }); });
+  var OfflineAudioCompletionEvent = cls('OfflineAudioCompletionEvent', g.Event, function (type, init) { var e = new g.Event(type); Object.setPrototypeOf(e, OfflineAudioCompletionEvent.prototype); hide(e, '__e', { renderedBuffer: init && init.renderedBuffer }); return e; });
+  accessor(OfflineAudioCompletionEvent.prototype, 'renderedBuffer', function () { return this.__e.renderedBuffer; });
+  var ScriptProcessorNode = nodeClass('ScriptProcessorNode', {
+    inputs: 1, outputs: 1, channels: 2, mode: 'explicit', fixedMode: 'explicit', always: true,
+    process: function (n, inputs, ctx, start) {
+      var d = n.__d, inp = inputs[0], i, c;
+      if (!d.inBuf) { d.inBuf = silence(0); for (c = 0; c < d.inCh; c++) d.inBuf.push(new Float32Array(d.size)); d.outBuf = []; for (c = 0; c < d.outCh; c++) d.outBuf.push(new Float32Array(d.size)); d.fill = 0; d.emit = null; }
+      var out = silence(d.outCh);
+      for (c = 0; c < d.outCh; c++) if (d.emit) for (i = 0; i < QUANTUM; i++) out[c][i] = d.emit[c][d.fill + i];
+      for (c = 0; c < d.inCh; c++) { var s = inp[c] || inp[0]; for (i = 0; i < QUANTUM; i++) d.inBuf[c][d.fill + i] = s ? s[i] : 0; }
+      d.fill += QUANTUM;
+      if (d.fill >= d.size) {
+        var ib = makeBuffer(d.inCh, d.size, ctx.sampleRate), ob = makeBuffer(d.outCh, d.size, ctx.sampleRate);
+        for (c = 0; c < d.inCh; c++) ib.__c[c].set(d.inBuf[c]);
+        fire(n, new AudioProcessingEvent('audioprocess', { playbackTime: (start + QUANTUM + d.size) / ctx.sampleRate, inputBuffer: ib, outputBuffer: ob }));
+        d.emit = ob.__c; d.fill = 0;
+      }
+      return [out];
+    }
+  });
+  handler(ScriptProcessorNode.prototype, 'audioprocess');
+  accessor(ScriptProcessorNode.prototype, 'bufferSize', function () { return this.__d.size; });
+  def(AudioContext.prototype, 'createScriptProcessor', function (size, inCh, outCh) {
+    size = size === undefined ? 4096 : Number(size); inCh = inCh === undefined ? 2 : inCh >>> 0; outCh = outCh === undefined ? 2 : outCh >>> 0;
+    if ([0, 256, 512, 1024, 2048, 4096, 8192, 16384].indexOf(size) < 0) throw domex("Failed to execute 'createScriptProcessor' on 'BaseAudioContext': buffer size (" + size + ') must be a power of two between 256 and 16384.', 'IndexSizeError');
+    if (inCh === 0 && outCh === 0 || inCh > 32 || outCh > 32) throw domex("Failed to execute 'createScriptProcessor' on 'BaseAudioContext': number of input channels and output channels cannot both be zero.", 'IndexSizeError');
+    var node = new ScriptProcessorNode(this); node.__d.size = size || 4096; node.__d.inCh = inCh; node.__d.outCh = outCh; node.__channels = inCh || 1;
+    return node;
+  });
+  def(OfflineAudioContext.prototype, 'createScriptProcessor', AudioContext.prototype.createScriptProcessor);
+  var MediaElementAudioSourceNode = nodeClass('MediaElementAudioSourceNode', {
+    inputs: 0, outputs: 1, channels: 2, always: false, pre: function (n, ctx, o) { if (!o || !o.mediaElement) throw new TypeError("Failed to construct 'MediaElementAudioSourceNode': required member mediaElement is undefined."); n.__d.el = o.mediaElement; },
+    process: function () { return [silence(2)]; }
+  });
+  accessor(MediaElementAudioSourceNode.prototype, 'mediaElement', function () { return this.__d.el; });
+  var MediaStreamAudioSourceNode = nodeClass('MediaStreamAudioSourceNode', {
+    inputs: 0, outputs: 1, channels: 2, pre: function (n, ctx, o) { if (!o || !o.mediaStream) throw new TypeError("Failed to construct 'MediaStreamAudioSourceNode': required member mediaStream is undefined."); n.__d.stream = o.mediaStream; },
+    process: function () { return [silence(2)]; }
+  });
+  accessor(MediaStreamAudioSourceNode.prototype, 'mediaStream', function () { return this.__d.stream; });
+  var MediaStreamAudioDestinationNode = nodeClass('MediaStreamAudioDestinationNode', {
+    inputs: 1, outputs: 0, channels: 2, mode: 'explicit', fixedMode: 'explicit', init: function (n) { n.__d.stream = typeof g.MediaStream === 'function' ? new g.MediaStream() : {}; }, process: function () { return []; }
+  });
+  accessor(MediaStreamAudioDestinationNode.prototype, 'stream', function () { return this.__d.stream; });
+  var MediaStreamTrackAudioSourceNode = nodeClass('MediaStreamTrackAudioSourceNode', { inputs: 0, outputs: 1, channels: 2, process: function () { return [silence(2)]; } });
+
+  // ------------------------------------------------------------------------------------------------------------------------------ audio worklet
+  var AudioWorklet = cls('AudioWorklet', null), AudioWorkletProcessor = cls('AudioWorkletProcessor', null, function () {
+    var pending = AudioWorkletProcessor.__pending;
+    if (!pending) throw new TypeError('Illegal constructor');
+    hide(this, '__port', pending.port); AudioWorkletProcessor.__pending = null;
+  });
+  accessor(AudioWorkletProcessor.prototype, 'port', function () { return this.__port; });
+  function makeWorklet(ctx) {
+    var w = Object.create(AudioWorklet.prototype);
+    hide(w, '__w', { ctx: ctx, processors: {} });
+    return w;
+  }
+  def(AudioWorklet.prototype, 'addModule', function (url) {
+    var self = this, w = this.__w;
+    return Promise.resolve().then(function () { return g.fetch(String(url)); }).then(function (r) { if (!r.ok) throw domex('Unable to load a worklet\'s module.', 'AbortError'); return r.text(); }).then(function (code) {
+      var scope = {
+        registerProcessor: function (name, ctor) {
+          name = String(name);
+          if (!name) throw domex("Failed to execute 'registerProcessor' on 'AudioWorkletGlobalScope': The processor name is empty.", 'NotSupportedError');
+          if (w.processors[name]) throw domex("Failed to execute 'registerProcessor' on 'AudioWorkletGlobalScope': A processor with name '" + name + "' has already been registered in this scope.", 'NotSupportedError');
+          if (typeof ctor !== 'function') throw new TypeError("Failed to execute 'registerProcessor' on 'AudioWorkletGlobalScope': The processor constructor is not a function.");
+          w.processors[name] = ctor;
+        }
+      };
+      var fn = new Function('registerProcessor', 'AudioWorkletProcessor', 'sampleRate', 'currentTime', 'currentFrame', 'globalThis', '"use strict";\n' + code);
+      fn.call(scope, scope.registerProcessor, AudioWorkletProcessor, w.ctx.sampleRate, 0, 0, scope);
+    });
+  });
+  var AudioParamMap = cls('AudioParamMap', null);
+  ['get', 'has', 'forEach', 'keys', 'values', 'entries'].forEach(function (k) { def(AudioParamMap.prototype, k, function () { var m = this.__map; return m[k].apply(m, arguments); }); });
+  accessor(AudioParamMap.prototype, 'size', function () { return this.__map.size; });
+  var AudioWorkletNode = nodeClass('AudioWorkletNode', {
+    inputs: 1, outputs: 1, channels: 2, mode: 'max', always: true,
+    pre: function (n, ctx, o) {
+      var worklet = ctx.audioWorklet.__w, name = String(arguments[3] === undefined ? n.__name : n.__name), ctor = worklet.processors[n.__name];
+      if (!ctor) throw domex("Failed to construct 'AudioWorkletNode': The node name '" + n.__name + "' is not defined in AudioWorkletGlobalScope.", 'InvalidStateError');
+      var ins = o.numberOfInputs === undefined ? 1 : o.numberOfInputs >>> 0, outs = o.numberOfOutputs === undefined ? 1 : o.numberOfOutputs >>> 0;
+      if (ins === 0 && outs === 0) throw domex("Failed to construct 'AudioWorkletNode': Number of inputs and number of outputs cannot be both zero.", 'NotSupportedError');
+      var counts = o.outputChannelCount;
+      if (counts && counts.length !== outs) throw domex("Failed to construct 'AudioWorkletNode': Length of specified outputChannelCount (" + counts.length + ') does not match the given number of outputs (' + outs + ').', 'IndexSizeError');
+      n.__in.length = 0; for (var i = 0; i < ins; i++) n.__in.push([]);
+      n.__nout = outs; n.__d.counts = counts ? Array.prototype.slice.call(counts) : null;
+      if (ins === 1 && outs === 1 && !counts) { n.__d.follow = true; }
+      var channel = new g.MessageChannel(), d = n.__d;
+      d.port = channel.port1; d.params = {}; d.map = new Map();
+      var descriptors = ctor.parameterDescriptors ? Array.prototype.slice.call(ctor.parameterDescriptors) : [];
+      descriptors.forEach(function (p) {
+        var ap = param(n, p.name, p.defaultValue === undefined ? 0 : p.defaultValue, p.minValue === undefined ? NEG : p.minValue, p.maxValue === undefined ? POS : p.maxValue, p.automationRate === 'k-rate' ? 'k-rate' : 'a-rate');
+        if (o.parameterData && o.parameterData[p.name] !== undefined) { ap.__p.value = Number(o.parameterData[p.name]); ap.__p.current = ap.__p.value; }
+        d.params[p.name] = ap; d.map.set(p.name, ap);
+      });
+      AudioWorkletProcessor.__pending = { port: channel.port2 };
+      try { d.proc = new ctor(o.processorOptions === undefined ? {} : { processorOptions: o.processorOptions, numberOfInputs: ins, numberOfOutputs: outs }); }
+      catch (e) { AudioWorkletProcessor.__pending = null; throw e; }
+      AudioWorkletProcessor.__pending = null;
+      d.alive = true;
+    },
+    process: function (n, inputs, ctx, start) {
+      var d = n.__d, outCounts = [], o, c, outs = [];
+      for (o = 0; o < n.__nout; o++) outCounts.push(d.counts ? d.counts[o] : d.follow ? Math.max(1, inputs[0].length) : 1);
+      for (o = 0; o < n.__nout; o++) outs.push(silence(outCounts[o]));
+      if (!d.alive) return outs;
+      var params = {}, keys = Object.keys(d.params);
+      keys.forEach(function (k) { var ap = d.params[k], block = paramBlock(ap, ctx, start); params[k] = ap.__p.rate === 'k-rate' ? new Float32Array([block[0]]) : block; });
+      var inArr = inputs.map(function (ch) { return ch.map(function (x) { return x; }); });
+      var ok;
+      try { ok = d.proc.process(inArr, outs, params); } catch (e) { d.alive = false; setTimeout(function () { fire(n, new g.Event('processorerror')); }, 0); return outs; }
+      if (!ok) d.alive = false;
+      return outs;
+    }
+  });
+  handler(AudioWorkletNode.prototype, 'processorerror');
+  accessor(AudioWorkletNode.prototype, 'port', function () { return this.__d.port; });
+  accessor(AudioWorkletNode.prototype, 'parameters', function () { var d = this.__d; if (!d.pmap) { d.pmap = Object.create(AudioParamMap.prototype); hide(d.pmap, '__map', d.map); } return d.pmap; });
+  var realWorkletCtor = AudioWorkletNode;
+  AudioWorkletNode = cls('AudioWorkletNode', AudioNode, function (ctx, name, options) {
+    if (!isContext(ctx)) throw new TypeError("Failed to construct 'AudioWorkletNode': parameter 1 is not of type 'BaseAudioContext'.");
+    var node = Object.create(AudioWorkletNode.prototype), cfg = realWorkletCtor.__cfg;
+    options = options || {};
+    node.__name = String(name);
+    hide(node, '__name', String(name));
+    setupNode(node, ctx, cfg);
+    cfg.pre(node, ctx, options);
+    chanOptions(node, options, 'AudioWorkletNode');
+    return node;
+  });
+  handler(AudioWorkletNode.prototype, 'processorerror');
+  accessor(AudioWorkletNode.prototype, 'port', function () { return this.__d.port; });
+  accessor(AudioWorkletNode.prototype, 'parameters', function () { var d = this.__d; if (!d.pmap) { d.pmap = Object.create(AudioParamMap.prototype); hide(d.pmap, '__map', d.map); } return d.pmap; });
+  AudioWorkletNode.prototype.__process = function (inputs, ctx, start) { return realWorkletCtor.__cfg.process(this, inputs, ctx, start); };
+
+  // ------------------------------------------------------------------------------------------------------------------------------ create* methods
+  var factories = {
+    createGain: GainNode, createDelay: DelayNode, createBiquadFilter: BiquadFilterNode, createStereoPanner: StereoPannerNode, createWaveShaper: WaveShaperNode, createDynamicsCompressor: DynamicsCompressorNode,
+    createConvolver: ConvolverNode, createAnalyser: AnalyserNode, createPanner: PannerNode, createOscillator: OscillatorNode, createBufferSource: AudioBufferSourceNode, createConstantSource: ConstantSourceNode,
+    createChannelSplitter: ChannelSplitterNode, createChannelMerger: ChannelMergerNode
+  };
+  Object.keys(factories).forEach(function (name) {
+    var C = factories[name];
+    def(BaseAudioContext.prototype, name, function (a) {
+      if (name === 'createDelay') return new C(this, a === undefined ? {} : { maxDelayTime: a });
+      if (name === 'createChannelSplitter') return new C(this, a === undefined ? {} : { numberOfOutputs: a });
+      if (name === 'createChannelMerger') return new C(this, a === undefined ? {} : { numberOfInputs: a });
+      return new C(this);
+    });
+  });
+  def(BaseAudioContext.prototype, 'createBuffer', function (ch, len, rate) {
+    if (arguments.length < 3) throw new TypeError("Failed to execute 'createBuffer' on 'BaseAudioContext': 3 arguments required, but only " + arguments.length + ' present.');
+    return new AudioBuffer({ numberOfChannels: ch, length: len, sampleRate: rate });
+  });
+  def(BaseAudioContext.prototype, 'createIIRFilter', function (ff, fb) { return new IIRFilterNode(this, { feedforward: ff, feedback: fb }); });
+  def(BaseAudioContext.prototype, 'createPeriodicWave', function (real, imag, c) { return new PeriodicWave(this, { real: real, imag: imag, disableNormalization: c && c.disableNormalization }); });
+  def(AudioContext.prototype, 'createMediaElementSource', function (el) { return new MediaElementAudioSourceNode(this, { mediaElement: el }); });
+  def(AudioContext.prototype, 'createMediaStreamSource', function (s) { return new MediaStreamAudioSourceNode(this, { mediaStream: s }); });
+  def(AudioContext.prototype, 'createMediaStreamDestination', function () { return new MediaStreamAudioDestinationNode(this); });
+  def(AudioContext.prototype, 'createMediaStreamTrackSource', function (t) { return new MediaStreamTrackAudioSourceNode(this); });
+  def(BaseAudioContext.prototype, 'decodeAudioData', function (data, success, failure) {
+    var self = this;
+    var promise = new Promise(function (resolve, reject) {
+      if (!(data instanceof ArrayBuffer)) { reject(new TypeError("Failed to execute 'decodeAudioData' on 'BaseAudioContext': parameter 1 is not of type 'ArrayBuffer'.")); return; }
+      if (self.__s.closed) { reject(domex("Failed to execute 'decodeAudioData' on 'BaseAudioContext': Cannot decode audio data: The AudioContext has been closed.", 'InvalidStateError')); return; }
+      if (data.byteLength === 0) { reject(domex("Failed to execute 'decodeAudioData' on 'BaseAudioContext': Unable to decode audio data", 'EncodingError')); return; }
+      var bytes = data.slice(0);
+      setTimeout(function () {
+        var decoded = typeof g.__decode_audio === 'function' ? g.__decode_audio(g.__bytes_to_string(new Uint8Array(bytes))) : null;
+        if (!decoded) { reject(domex('Unable to decode audio data', 'EncodingError')); return; }
+        resolve(resample(decoded, self.sampleRate));
+      }, 0);
+    });
+    if (typeof success === 'function' || typeof failure === 'function') promise.then(function (b) { if (typeof success === 'function') success(b); }, function (e) { if (typeof failure === 'function') failure(e); });
+    return promise;
+  });
+  function resample(decoded, rate) {
+    var ch = decoded.channels, frames = decoded.frames, src = decoded.samples, from = decoded.sampleRate, i, c;
+    var len = from === rate ? frames : Math.max(1, Math.round(frames * rate / from)), buf = makeBuffer(ch, len, rate);
+    for (c = 0; c < ch; c++) {
+      var out = buf.__c[c];
+      if (from === rate) for (i = 0; i < frames; i++) out[i] = src[i * ch + c] / 32768;
+      else for (i = 0; i < len; i++) { var pos = i * from / rate, k = Math.floor(pos), f = pos - k, k2 = Math.min(k + 1, frames - 1); k = Math.min(k, frames - 1); out[i] = (src[k * ch + c] * (1 - f) + src[k2 * ch + c] * f) / 32768; }
+    }
+    return buf;
+  }
+
+  // ------------------------------------------------------------------------------------------------------------------------------ running
+  function collect(ctx) {   // one quantum from the destination
+    return renderQuantum(ctx);
+  }
+  function sinkOut(ctx, blocks) {
+    var sink = g.__audio_sink;
+    if (typeof sink !== 'function' || !blocks.length) return;
+    var ch = blocks[0].length, data = new Float32Array(blocks.length * QUANTUM * ch);
+    for (var b = 0; b < blocks.length; b++) for (var i = 0; i < QUANTUM; i++) for (var c = 0; c < ch; c++) data[(b * QUANTUM + i) * ch + c] = blocks[b][c][i];
+    sink(data, ch, ctx.sampleRate);
+  }
+  function tick(ctx) {
+    var s = ctx.__s;
+    if (s.state !== 'running') return;
+    var elapsed = (Date.now() - s.startedAt) / 1000, target = s.startedFrame + Math.floor(elapsed * s.rate), blocks = [], guard = 0;
+    while (s.frame + QUANTUM <= target + QUANTUM && guard++ < 64) { blocks.push(collect(ctx)); s.frame += QUANTUM; }
+    sinkOut(ctx, blocks);
+  }
+  def(AudioContext.prototype, 'resume', function () {
+    var ctx = this, s = this.__s;
+    if (s.closed) return Promise.reject(domex("Failed to execute 'resume' on 'AudioContext': Cannot resume a closed AudioContext", 'InvalidStateError'));
+    if (s.state !== 'running') {
+      s.startedAt = Date.now(); s.startedFrame = s.frame; setState(ctx, 'running');
+      if (!s.timer) s.timer = setInterval(function () { tick(ctx); }, 10);
+    }
+    return Promise.resolve();
+  });
+  def(AudioContext.prototype, 'suspend', function () {
+    var s = this.__s;
+    if (s.closed) return Promise.reject(domex("Failed to execute 'suspend' on 'AudioContext': Cannot suspend a closed AudioContext", 'InvalidStateError'));
+    if (s.timer) { clearInterval(s.timer); s.timer = null; }
+    setState(this, 'suspended'); return Promise.resolve();
+  });
+  def(AudioContext.prototype, 'close', function () {
+    var s = this.__s;
+    if (s.closed) return Promise.reject(domex("Failed to execute 'close' on 'AudioContext': Cannot close a closed AudioContext.", 'InvalidStateError'));
+    s.closed = true; if (s.timer) { clearInterval(s.timer); s.timer = null; }
+    setState(this, 'closed'); return Promise.resolve();
+  });
+  def(OfflineAudioContext.prototype, 'resume', function () {
+    var s = this.__s;
+    if (!s.started) return Promise.reject(domex("Failed to execute 'resume' on 'OfflineAudioContext': cannot resume a context that has not started", 'InvalidStateError'));
+    if (s.state === 'closed') return Promise.reject(domex("Failed to execute 'resume' on 'OfflineAudioContext': cannot resume a closed context", 'InvalidStateError'));
+    if (s.state === 'suspended' && s.paused) { var go = s.paused; s.paused = null; setState(this, 'running'); go(); }
+    return Promise.resolve();
+  });
+  def(OfflineAudioContext.prototype, 'suspend', function (time) {
+    var s = this.__s, ctx = this;
+    time = Number(time);
+    if (!(time >= 0)) return Promise.reject(new RangeError("Failed to execute 'suspend' on 'OfflineAudioContext': The suspend time (" + time + ') is negative.'));
+    var frame = Math.ceil(time * s.rate / QUANTUM) * QUANTUM;
+    if (time > s.length / s.rate || frame >= s.length) return Promise.reject(new RangeError("Failed to execute 'suspend' on 'OfflineAudioContext': The suspend time (" + time + ') is beyond the length of the context.'));
+    if (frame < s.frame || (s.started && frame <= s.frame && s.state === 'running')) return Promise.reject(domex("Failed to execute 'suspend' on 'OfflineAudioContext': cannot schedule a suspend at frame " + frame + ' because it is earlier than the current frame.', 'InvalidStateError'));
+    if (s.suspends.some(function (x) { return x.frame === frame; })) return Promise.reject(domex("Failed to execute 'suspend' on 'OfflineAudioContext': cannot schedule more than one suspend at frame " + frame + '.', 'InvalidStateError'));
+    return new Promise(function (resolve) { s.suspends.push({ frame: frame, resolve: resolve }); s.suspends.sort(function (a, b) { return a.frame - b.frame; }); });
+  });
+  def(OfflineAudioContext.prototype, 'startRendering', function () {
+    var ctx = this, s = this.__s;
+    if (s.started) return Promise.reject(domex("Failed to execute 'startRendering' on 'OfflineAudioContext': cannot call startRendering more than once", 'InvalidStateError'));
+    s.started = true;
+    return new Promise(function (resolve) {
+      var out = makeBuffer(s.channels, s.length, s.rate);
+      setState(ctx, 'running');
+      var step = function () {
+        var budget = 512;
+        while (s.frame < s.length && budget > 0) {
+          if (s.suspends.length && s.suspends[0].frame <= s.frame) {
+            var sp = s.suspends.shift(); setState(ctx, 'suspended');
+            s.paused = function () { setTimeout(step, 0); };
+            sp.resolve();
+            return;
+          }
+          var blocks = collect(ctx), n = Math.min(QUANTUM, s.length - s.frame);
+          for (var c = 0; c < s.channels; c++) { var src = blocks[c] || blocks[0]; if (blocks.length <= c) src = new Float32Array(QUANTUM); out.__c[c].set(n === QUANTUM ? src : src.subarray(0, n), s.frame); }
+          s.frame += QUANTUM; budget -= QUANTUM;
+        }
+        if (s.frame < s.length) { setTimeout(step, 0); return; }
+        s.frame = s.length; setState(ctx, 'closed');
+        resolve(out);
+        setTimeout(function () { fire(ctx, new OfflineAudioCompletionEvent('complete', { renderedBuffer: out })); }, 0);
+      };
+      setTimeout(step, 0);
+    });
+  });
+  def(g, 'webkitAudioContext', AudioContext); def(g, 'webkitOfflineAudioContext', OfflineAudioContext);
+  def(g, 'AudioSinkInfo', cls('AudioSinkInfo', null));
+}(globalThis));
+)JSPRELUDE";
+
+const char* web_audio_prelude() { return kWebAudioPrelude; }
+
 const char* svg_prelude() { return kSvgPrelude; }
 
 const char* finish_prelude() { return kFinishPrelude; }
