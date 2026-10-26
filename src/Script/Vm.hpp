@@ -82,6 +82,11 @@ class Vm {
   // Calls a function value.
   bool call(const Value& function, const Value& this_value, const Value* args, uint32_t argc, Value* result);
   bool construct(const Value& function, const Value* args, uint32_t argc, Value* result);
+  // A sloppy function's arguments object shares its first parameters' variables: the elements are read from the function's environment. This copies them into
+  // the items, for code that reads the items directly (slice.call(arguments), apply, spread).
+  void refresh_arguments(JsObject* o) {
+    if (o->env && o->okind == ObjKind::Array && o->position == kArgumentsMark) sync_arguments(o);
+  }
   // Reflect.construct: `new function(...args)` whose new.target (and so the prototype of the object it makes) is `new_target`.
   bool construct_with(const Value& function, const Value* args, uint32_t argc, const Value& new_target, Value* result);
   // The pending exception as text ("TypeError: x is not a function"), and it is cleared.
@@ -338,6 +343,8 @@ class Vm {
   int64_t find_prop(JsObject* o, JsString* key) const;
   void push_property_keys(JsObject* names, JsObject* o, bool enumerable);
   uint32_t symbol_counter_ = 0;
+  void sync_arguments(JsObject* o);
+  Env* mapped_env(JsObject* o, uint32_t index) const;   // the environment whose slot `index` of arguments object `o` is, or null
   JsObject* function_kind_protos_[3] = {};
   Value new_target_override_;   // for the next construct call (see construct_with)
   Value pending_frame_new_target_;   // ... on its way to the frame

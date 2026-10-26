@@ -79,6 +79,7 @@ bool this_string(Vm& vm, const Value& self, JsString** out) {
 bool this_array(Vm& vm, const Value& self, JsObject** out) {
   if (self.is_object() && self.as_object()->okind == ObjKind::Array) {
     *out = self.as_object();
+    vm.refresh_arguments(*out);
     return true;
   }
   Value length_value;
@@ -703,6 +704,7 @@ NATIVE(function_call) {
 NATIVE(function_apply) {
   if (!need_function(vm, self)) return false;
   const Value list = arg_at(args, argc, 1);
+  if (list.is_object() && list.as_object()->okind == ObjKind::Array) vm.refresh_arguments(list.as_object());
   if (list.is_object() && list.as_object()->okind == ObjKind::Array) return vm.call(self, arg_at(args, argc, 0), list.as_object()->items, list.as_object()->length, result);
   return vm.call(self, arg_at(args, argc, 0), nullptr, 0, result);
 }
