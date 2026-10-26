@@ -100,7 +100,7 @@ LoadStatus build_windows_startup(AddressSpace& space, const exe::PeFile& pe, con
 
   // --- one region: PEB | TEB | parameters and strings | TLS array and block
   uint64_t strings_at = kParametersHeader;
-  const uint64_t strings_bytes = path_bytes + command_bytes + directory_bytes + environment_bytes + 16;
+  const uint64_t strings_bytes = path_bytes + command_bytes + directory_bytes + environment_bytes + 16;      // (the three strings are followed by a NUL each: 6 of the 16)
   uint64_t parameters_bytes = 0, tls_bytes = 0, total = 0;
   if (strings_bytes > kMaxStartupBytes || !AddressSpace::round_up(strings_at + strings_bytes, &parameters_bytes)) return LoadStatus::Malformed;
   if (!AddressSpace::round_up(tls_size ? 16 + tls_size : 0, &tls_bytes)) return LoadStatus::Malformed;
@@ -118,7 +118,7 @@ LoadStatus build_windows_startup(AddressSpace& space, const exe::PeFile& pe, con
   Writer w(space);
   // --- the parameters (RTL_USER_PROCESS_PARAMETERS, pointers absolute: flag NORMALIZED)
   uint64_t cursor = parameters + strings_at;
-  const uint64_t path_at = cursor, command_at = path_at + path_bytes, directory_at = command_at + command_bytes, environment_at = directory_at + directory_bytes;
+  const uint64_t path_at = cursor, command_at = path_at + path_bytes + 2, directory_at = command_at + command_bytes + 2, environment_at = directory_at + directory_bytes + 2;      // (zeroed memory: each string ends in a NUL, as Windows has it)
   w.bytes(path_at, image_path.view());
   w.bytes(command_at, command_line.view());
   w.bytes(directory_at, directory.view());
@@ -129,9 +129,9 @@ LoadStatus build_windows_startup(AddressSpace& space, const exe::PeFile& pe, con
   w.u64(parameters + 0x20, kStdInputHandle);
   w.u64(parameters + 0x28, kStdOutputHandle);
   w.u64(parameters + 0x30, kStdErrorHandle);
-  w.unicode_string(parameters + 0x38, directory_at, directory_bytes, directory_bytes);      // CurrentDirectory.DosPath
-  w.unicode_string(parameters + 0x60, path_at, path_bytes, path_bytes);                     // ImagePathName
-  w.unicode_string(parameters + 0x70, command_at, command_bytes, command_bytes);            // CommandLine
+  w.unicode_string(parameters + 0x38, directory_at, directory_bytes, directory_bytes + 2);      // CurrentDirectory.DosPath
+  w.unicode_string(parameters + 0x60, path_at, path_bytes, path_bytes + 2);                    // ImagePathName
+  w.unicode_string(parameters + 0x70, command_at, command_bytes, command_bytes + 2);            // CommandLine
   w.u64(parameters + 0x80, environment_at);                                                 // Environment
   w.u64(parameters + 0x3F0, environment_bytes);                                             // EnvironmentSize
 

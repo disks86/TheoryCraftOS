@@ -722,13 +722,20 @@ if(TCOS_ARCH STREQUAL "x86_64")
             ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.c ${WINDOWS_DIR}/libntdll.a
     DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.c ${WINDOWS_DIR}/libntdll.a ${WINDOWS_HEADERS}
     COMMENT "Building kernel32.dll")
+  add_custom_command(OUTPUT ${WINDOWS_DIR}/msvcrt.dll
+    COMMAND ${CMAKE_C_COMPILER} ${WINDOWS_DLL_FLAGS} -Wno-unused-value -Wl,--image-base=0x180400000 -o ${WINDOWS_DIR}/msvcrt.dll
+            ${CMAKE_SOURCE_DIR}/src/Windows/msvcrt/msvcrt.c ${WINDOWS_DIR}/libntdll.a ${WINDOWS_DIR}/kernel32.dll
+    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/msvcrt/msvcrt.c ${CMAKE_SOURCE_DIR}/src/Windows/msvcrt/format.inc ${CMAKE_SOURCE_DIR}/src/Windows/libc_string.inc
+            ${WINDOWS_DIR}/libntdll.a ${WINDOWS_DIR}/kernel32.dll ${WINDOWS_HEADERS}
+    COMMENT "Building msvcrt.dll")
   file(WRITE ${WINDOWS_DIR}/libraries.S
     ".section .rdata,\"dr\"\n.balign 16\n"
     ".global tcos_ntdll_dll\ntcos_ntdll_dll:\n.incbin \"${WINDOWS_DIR}/ntdll.dll\"\n.global tcos_ntdll_dll_end\ntcos_ntdll_dll_end:\n.balign 16\n"
-    ".global tcos_kernel32_dll\ntcos_kernel32_dll:\n.incbin \"${WINDOWS_DIR}/kernel32.dll\"\n.global tcos_kernel32_dll_end\ntcos_kernel32_dll_end:\n")
+    ".global tcos_kernel32_dll\ntcos_kernel32_dll:\n.incbin \"${WINDOWS_DIR}/kernel32.dll\"\n.global tcos_kernel32_dll_end\ntcos_kernel32_dll_end:\n.balign 16\n"
+    ".global tcos_msvcrt_dll\ntcos_msvcrt_dll:\n.incbin \"${WINDOWS_DIR}/msvcrt.dll\"\n.global tcos_msvcrt_dll_end\ntcos_msvcrt_dll_end:\n")
   target_sources(BOOTX64 PRIVATE ${WINDOWS_DIR}/libraries.S src/Windows/BuiltinLibraries.cpp)
-  set_source_files_properties(${WINDOWS_DIR}/libraries.S PROPERTIES OBJECT_DEPENDS "${WINDOWS_DIR}/ntdll.dll;${WINDOWS_DIR}/kernel32.dll")
-  add_custom_target(windows_dlls DEPENDS ${WINDOWS_DIR}/ntdll.dll ${WINDOWS_DIR}/kernel32.dll)
+  set_source_files_properties(${WINDOWS_DIR}/libraries.S PROPERTIES OBJECT_DEPENDS "${WINDOWS_DIR}/ntdll.dll;${WINDOWS_DIR}/kernel32.dll;${WINDOWS_DIR}/msvcrt.dll")
+  add_custom_target(windows_dlls DEPENDS ${WINDOWS_DIR}/ntdll.dll ${WINDOWS_DIR}/kernel32.dll ${WINDOWS_DIR}/msvcrt.dll)
 endif()
 
 # An extra program for the demo to run (a static Linux x86-64 ELF, say a C program built with `gcc -static -no-pie`); its output and exit code are logged.

@@ -18,7 +18,7 @@
 #include "Windows/BuiltinLibraries.hpp"
 
 extern "C" {
-extern const uint8_t tcos_ntdll_dll[], tcos_ntdll_dll_end[], tcos_kernel32_dll[], tcos_kernel32_dll_end[];
+extern const uint8_t tcos_ntdll_dll[], tcos_ntdll_dll_end[], tcos_kernel32_dll[], tcos_kernel32_dll_end[], tcos_msvcrt_dll[], tcos_msvcrt_dll_end[];
 }
 
 namespace windows {
@@ -30,6 +30,10 @@ bool BuiltinLibraries::find(StringView canonical_name, ConstByteView* image) {
   }
   if (canonical_name.equals("kernel32.dll")) {
     *image = ConstByteView(tcos_kernel32_dll, static_cast<uint64_t>(tcos_kernel32_dll_end - tcos_kernel32_dll));
+    return true;
+  }
+  if (canonical_name.equals("msvcrt.dll")) {
+    *image = ConstByteView(tcos_msvcrt_dll, static_cast<uint64_t>(tcos_msvcrt_dll_end - tcos_msvcrt_dll));
     return true;
   }
   return false;
