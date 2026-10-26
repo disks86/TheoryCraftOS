@@ -47,18 +47,49 @@ uint32_t Forcewake::ack_register(ForcewakeDomain domain) {
   return 0;
 }
 
+namespace {
+class StateLock {
+ public:
+  explicit StateLock(ForcewakeState& s) : state_(s) { while (__atomic_exchange_n(&state_.lock, 1u, __ATOMIC_ACQUIRE)) __builtin_ia32_pause(); }
+  ~StateLock() { __atomic_store_n(&state_.lock, 0u, __ATOMIC_RELEASE); }
+  StateLock(const StateLock&) = delete;
+  StateLock& operator=(const StateLock&) = delete;
+
+ private:
+  ForcewakeState& state_;
+};
+}  // namespace
+
+// Each caller adds one to the well's count; the one that makes it 1 wakes the well and waits (under the lock, so the next caller finds the well awake), and the one that
+// brings it back to 0 lets the well sleep.
 bool Forcewake::acquire(IRegisterBank& registers, ForcewakeDomain domain, uint32_t attempts) {
   const uint32_t request = request_register(domain), ack = ack_register(domain);
+  ForcewakeState& state = registers.forcewake_state();
+  StateLock lock(state);
+  uint32_t& count = state.counts[static_cast<uint32_t>(domain)];
+  if (count != 0) {
+    ++count;
+    return true;
+  }
   registers.write32(request, kMaskedEnable);
   for (uint32_t i = 0; i < attempts; ++i) {
     const uint32_t v = registers.read32(ack);
-    if (v != 0xFFFFFFFFu && (v & kKernelBit)) return true;  // all ones means the register is not reachable at all
+    if (v != 0xFFFFFFFFu && (v & kKernelBit)) {  // all ones means the register is not reachable at all
+      count = 1;
+      return true;
+    }
   }
   registers.write32(request, kMaskedDisable);
   return false;
 }
 
-void Forcewake::release(IRegisterBank& registers, ForcewakeDomain domain) { registers.write32(request_register(domain), kMaskedDisable); }
+void Forcewake::release(IRegisterBank& registers, ForcewakeDomain domain) {
+  ForcewakeState& state = registers.forcewake_state();
+  StateLock lock(state);
+  uint32_t& count = state.counts[static_cast<uint32_t>(domain)];
+  if (count == 0) return;   // (not held: nothing to give back)
+  if (--count == 0) registers.write32(request_register(domain), kMaskedDisable);
+}
 
 }  // namespace intel_gt
 }  // namespace hardware

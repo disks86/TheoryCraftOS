@@ -45,7 +45,7 @@ struct ProgramStart {
 //   address space to the process.
 // Linux programs get arguments and environment on their stack; Windows programs get them in the PEB's process parameters (the command line is the
 // arguments joined by spaces). The first argument is also the program's path.
-class UserProgram {
+class UserProgram final : public IModuleHost {
  public:
   UserProgram(allocators::IAllocator& allocator, uint64_t id, IProcessHost& host, uint64_t memory_limit = 256ull << 20)
       : allocator_(allocator), id_(id), host_(host), space_(allocator, memory_limit), detail_(allocator), working_directory_(allocator), command_line_(allocator) {}
@@ -66,6 +66,18 @@ class UserProgram {
   filesystem::IFileSystem* file_system() const { return files_; }
   ILibraryProvider* library_provider() const { return libraries_; }
   IProcessHost& host() const { return host_; }
+
+  // How many processors the program is told the machine has (PEB, shared data). Set before load().
+  void set_processor_count(uint32_t count) { processor_count_ = count ? count : 1; }
+
+  // IModuleHost: LoadLibrary and FreeLibrary of a Windows program.
+  uint32_t load_module(ConstByteView file, StringView canonical_name, LoadedModule* out, uint32_t capacity, uint32_t* count) override;
+  bool reference_module(StringView canonical_name, uint64_t* base) override;
+  uint32_t release_module(uint64_t base, LoadedModule* out, uint32_t capacity, uint32_t* count) override;
+  uint32_t unload_module(uint64_t base) override;
+
+  // The child's standard handles (RTL_USER_PROCESS_PARAMETERS): after load(), before it runs. 0 or -1 leaves the value as it was.
+  bool set_standard_handles(const uint64_t handles[3]);
 
   // Why load() failed, when it can say more than the status ("kernel32.dll is not a 64-bit x86 DLL"); empty otherwise.
   StringView load_detail() const { return detail_.view(); }
@@ -91,6 +103,7 @@ class UserProgram {
   ILibraryProvider* libraries_ = nullptr;
   UniquePointer<ModuleSet> modules_;
   String detail_, working_directory_, command_line_;
+  uint32_t processor_count_ = 1;
   UniquePointer<Process> process_;
   ProgramStart start_;
   LoadedImage image_;

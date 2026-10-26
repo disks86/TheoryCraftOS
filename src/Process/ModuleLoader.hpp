@@ -81,6 +81,10 @@ struct Module {
   uint64_t entry = 0;                   // address of the entry point (DllMain for a DLL); 0 if none
   bool main = false;
   uint32_t visit = 0;                   // (scratch for the ordering)
+  // Library lifetime: how many times it was asked for (LoadLibrary) plus how many loaded libraries import it. Libraries loaded when the program started are pinned.
+  uint32_t refs = 0;
+  bool pinned = false, doomed = false;
+  int32_t tls_index = -1;               // the slot of its thread-local data in every thread's array (a library loaded after start-up), or -1
 };
 
 // Everything loaded into one process, with the stubs that stand in for imports that nothing provides.
@@ -91,6 +95,9 @@ class ModuleSet {
   ModuleSet& operator=(const ModuleSet&) = delete;
 
   Module* find(StringView canonical_name) const;
+  Module* find_base(uint64_t base) const;
+  // Takes the modules from index `first` on out of the set (and out of the start-up order), unmapping them.
+  void drop_from(AddressSpace& space, uint64_t first);
   // In the order they were loaded: the program first.
   uint64_t count() const { return modules_.count(); }
   const Module& at(uint64_t index) const { return *modules_[index]; }
@@ -119,6 +126,18 @@ class ModuleSet {
 // base is taken. `detail` gets a text for the user on failure.
 LoadStatus load_windows_modules(AddressSpace& space, allocators::IAllocator& allocator, const exe::PeFile& program, ConstByteView program_file, StringView program_name,
                                 ILibraryProvider& provider, ModuleSet* out, String* detail);
+
+// After start-up: loads one more library (the file `provider` has for `canonical_name`) and the libraries it imports that are not loaded yet, into the process that `set` describes,
+// and binds their imports. What was loaded is appended to `set` (modules_ and, in the order their entry points must run, order_): the caller reads set->count() and set->init_count()
+// from before the call. On failure nothing stays loaded. (A library's thread-local data is the caller's business: see UserProgram::load_module().)
+LoadStatus load_additional_library(AddressSpace& space, allocators::IAllocator& allocator, ILibraryProvider& provider, ModuleSet* set, StringView canonical_name, String* detail);
+// LoadLibrary of a library that is loaded already: counts one more use. False if no such library is there (or it is on its way out).
+bool reference_library(ModuleSet* set, StringView canonical_name, uint64_t* base);
+// FreeLibrary: counts one use less. The libraries nobody uses any more (the one at `base`, then what only it kept alive) are marked and appended to `out` in the order their
+// entry points must be called with DLL_PROCESS_DETACH; they stay mapped until unload_library(). Nothing is appended while uses remain, or for a pinned library.
+bool release_library(ModuleSet* set, allocators::IAllocator& allocator, uint64_t base, List<Module*>* out);
+// Removes the library at `base` from the process (its pages are unmapped). False if there is no such library or it is the program.
+bool unload_library(AddressSpace& space, ModuleSet* set, uint64_t base);
 
 // Applies the base relocations of a mapped image that was loaded `delta` (a wrapping difference) away from its preferred base.
 bool apply_relocations(AddressSpace& space, const exe::PeFile& pe, uint64_t base, uint64_t delta);

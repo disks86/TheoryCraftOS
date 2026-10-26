@@ -282,6 +282,7 @@ void poke_idle_core(const Thread* t) {
     const Core& c = g.cores[i];
     if (!c.online || &c == self || !c.current || !c.current->is_idle) continue;
     if (t->affinity >= 0 && static_cast<uint32_t>(t->affinity) != i) continue;
+    if (i < 64 && !((t->core_mask >> i) & 1)) continue;
     send_wakeup(c.apic_id);
     return;
   }
@@ -304,6 +305,7 @@ void make_ready_locked(Thread* t) {
 
 bool eligible(const Thread* t, const Core* c, bool match_kind) {
   if (t->affinity >= 0 && static_cast<uint32_t>(t->affinity) != c->index) return false;
+  if (c->index < 64 && !((t->core_mask >> c->index) & 1)) return false;
   if (match_kind && t->preferred_kind >= 0 && t->preferred_kind != static_cast<int8_t>(c->kind)) return false;
   return true;
 }
@@ -322,8 +324,8 @@ Frame* reschedule_locked(Frame* frame, Core* c, bool voluntary) {
   Thread* prev = c->current;
   if (!voluntary && prev->state == ThreadState::Running) {
     Thread* wanted = find_eligible(c);
-    if (!wanted) return frame;                                      // nobody else wants the core
-    if (!prev->is_idle && c->slice > 0) return frame;               // keeps running until its slice ends
+    if (!wanted && eligible(prev, c, false)) return frame;          // nobody else wants the core
+    if (!prev->is_idle && c->slice > 0 && eligible(prev, c, false)) return frame;      // keeps running until its slice ends (or its core is taken away)
   }
   prev->saved = frame;
   prev->on_cpu = false;
@@ -707,6 +709,22 @@ void set_current_user_context(uint64_t cr3, void* context) {
   irq_restore(flags);
 }
 #endif
+
+uint64_t online_core_mask() {
+  uint64_t mask = 0;
+  for (uint32_t i = 0; i < g.core_count && i < 64; ++i) if (!g.running || g.cores[i].online) mask |= uint64_t{1} << i;
+  return g.running ? mask : 1;
+}
+
+bool set_thread_core_mask(Thread* t, uint64_t mask) {
+  const uint64_t online = online_core_mask();
+  bool beyond = g.core_count > 64;
+  if (!(mask & online) && !beyond) return false;
+  const uint64_t flags = lock_irq();
+  t->core_mask = mask;
+  unlock_irq(flags);
+  return true;
+}
 
 void set_thread_affinity(Thread* t, int32_t core) {
   const uint64_t flags = lock_irq();

@@ -54,6 +54,17 @@ viewport and a scissor, near-plane clipping, triangles behind the eye, 800 trian
 and the model of the pipeline; mutating the winding test or the Y flip makes it fail. Resources, address reuse, the single engine lease, present, and a hang (everything the
 engine might write to is kept) are covered too.
 
-Not done: the engine workarounds i915 applies on Gen9 (`intel_workarounds.c`) and MOCS programming, depth/stencil, perspective-correct colour, textured triangles, tiling,
-interrupts (the driver polls), a render node for a non-display Intel GPU, serialising the render and video drivers' forcewake use when both run at once, and every check on
-real hardware. The device is not used by the 2D renderer. Treat the first run on a 9575 as a bring-up, not as a working driver.
+## Start-up state: MOCS, workarounds, shared power wells
+
+| File | Job |
+| --- | --- |
+| `IntelGen9Setup` | The Gen9.5 memory object control tables (`skl_mocs_table`: the render engine's 64 control registers at `0xC800` and the 32 L3 registers at `0xB020`), the global GT workarounds (read-modify-write, `gen9/kbl/cfl_gt_workarounds_init`) and the render engine's context workarounds (masked writes, `gen9/kbl/cfl_ctx_workarounds_init`, 13 to 14 of them). Register offsets and bits were taken from i915 `intel_gt_regs.h`, the Kaby Lake / Coffee Lake branch chosen by device ID (Kaby Lake is `0x5900`-`0x593F`) and, for the two stepping-dependent ones, by the PCI revision (Kaby Lake C0 is revision 2 and up). |
+| `VcsDriver` | In render mode, applies the above after the power wells are up and before the engine starts (`Config::device_id` / `revision`, from `IntelGpu::render_hardware()`). The video engine path is unchanged. |
+| `IntelForcewake` | The wells are now reference counted per GPU (`IRegisterBank::forcewake_state()`; `MmioRegisterBank` finds the counts by the register window's address), so the render and video drivers, each with its own bank, no longer let a well sleep under each other. Tested with four threads. |
+| `IntelRenderBatch` | Surface states use MOCS entry 1 (the page table's), as the intel-gpu-tools test does. |
+
+The context workarounds are written to the registers directly instead of being loaded into every context with `MI_LOAD_REGISTER_IMM`, which is enough because the driver has one context (the engine saves them with it). The MCR steering
+selector (needed for reads of slice-specific registers) is not set; nothing here reads them.
+
+Not done: depth/stencil, perspective-correct colour, textured triangles, tiling, interrupts (the driver polls), a render node for a non-display Intel GPU, the other engines' workarounds, and every check
+on real hardware. The device is not used by the 2D renderer. Treat the first run on a 9575 as a bring-up, not as a working driver.

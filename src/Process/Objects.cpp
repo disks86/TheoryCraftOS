@@ -17,6 +17,8 @@
  */
 #include "Process/Objects.hpp"
 
+#include <new>
+
 namespace process {
 
 namespace {
@@ -109,6 +111,22 @@ ObjectManager::Created ObjectManager::create_process(uint64_t pid) {
   return result;
 }
 
+ObjectManager::Created ObjectManager::open_process(uint64_t pid, bool create) {
+  {
+    Locked hold(sync_);
+    for (uint32_t i = 0; i < kCapacity; ++i) {
+      Object& o = objects_[i];
+      if (o.kind != ObjectKind::Process || o.owner != pid) continue;
+      ++o.references;
+      Created found;
+      found.id = i + 1;
+      return found;
+    }
+  }
+  if (!create) { Created none; none.status = kNotFound; return none; }
+  return create_process(pid);
+}
+
 void ObjectManager::process_exited(uint64_t pid, uint32_t code) {
   Locked hold(sync_);
   for (Object& o : objects_) {
@@ -127,6 +145,576 @@ bool ObjectManager::query_process(uint32_t id, bool* exited, uint32_t* code, uin
   *code = static_cast<uint32_t>(o->count);
   *pid = o->owner;
   return true;
+}
+
+class ObjectManager::SectionRef final : public SharedMemory {
+ public:
+  void attach(ObjectManager* manager, uint32_t index) { manager_ = manager; index_ = index; }
+  void retain() override { manager_->section_count(index_, 1); }
+  void release() override { manager_->section_count(index_, -1); }
+  void flush() override { manager_->flush_section_at(index_); }
+
+ private:
+  ObjectManager* manager_ = nullptr;
+  uint32_t index_ = 0;
+};
+
+struct ObjectManager::Section {
+  bool used = false, writable = false, file_backed = false;
+  uint8_t* storage = nullptr;
+  uint64_t size = 0, rounded = 0;
+  int32_t mappings = 0;
+  uint32_t object = 0;                      // its slot in objects_
+  filesystem::IFileSystem* fs = nullptr;
+  char path[512] = {};
+  uint32_t path_size = 0;
+  SectionRef ref;
+};
+
+// ---- pipes
+
+struct ObjectManager::Pipe {
+  bool used = false;
+  uint8_t* data[2] = {};            // data[d]: what end d wrote and the other end has not read yet
+  uint32_t capacity[2] = {}, head[2] = {}, count[2] = {};
+  uint32_t end_refs[2] = {};
+  bool anonymous = false, connected = false, listening = false, client_seen = false;
+  uint32_t access = 0, max_instances = 0, generation = 0;
+  // The end an end_code names; false for a client end of an earlier connection.
+  bool end_of(uint32_t code, uint32_t* end) const {
+    *end = code & 1;
+    return *end == 0 || (code >> 1) == generation;
+  }
+};
+
+namespace {
+constexpr uint32_t kPipeBusy = 0xC00000AEu;
+constexpr uint32_t kDefaultPipeBuffer = 4096, kMaxPipeBuffer = 1u << 20;
+}  // namespace
+
+ObjectManager::~ObjectManager() {
+  if (pipes_) {
+    for (uint32_t i = 0; i < kMaxPipes; ++i) {
+      for (uint8_t* d : pipes_[i].data) if (d && allocator_) allocator_->deallocate(d);
+    }
+    if (allocator_) allocator_->deallocate(pipes_);      // (Pipe is plain data: nothing to destroy)
+  }
+  if (locks_ && allocator_) allocator_->deallocate(locks_);
+  if (sections_) {
+    for (uint32_t i = 0; i < kMaxSections; ++i) if (sections_[i].storage && allocator_) allocator_->deallocate(sections_[i].storage);
+    if (allocator_) allocator_->deallocate(sections_);
+  }
+}
+
+ObjectManager::Pipe* ObjectManager::pipe_of(uint32_t id) {
+  Object* o = at(id);
+  return o && o->kind == ObjectKind::Pipe && o->pipe >= 0 && pipes_ ? &pipes_[o->pipe] : nullptr;
+}
+
+void ObjectManager::free_pipe_locked(Object& o) {
+  if (o.pipe < 0 || !pipes_) return;
+  Pipe& p = pipes_[o.pipe];
+  for (uint8_t*& d : p.data) {
+    if (d && allocator_) allocator_->deallocate(d);
+    d = nullptr;
+  }
+  p = Pipe();
+}
+
+ObjectManager::Created ObjectManager::create_pipe(StringView name, uint32_t out_size, uint32_t in_size, uint32_t max_instances, uint32_t access) {
+  Created result;
+  if (!allocator_ || name.size() >= kNameBytes || access < kPipeInbound || access > kPipeDuplex) { result.status = !allocator_ ? 0xC0000002u : kInvalid; return result; }
+  Locked hold(sync_);
+  if (!pipes_) {
+    void* memory = allocator_->allocate(sizeof(Pipe) * kMaxPipes);
+    if (!memory) { result.status = 0xC0000017u; return result; }
+    pipes_ = static_cast<Pipe*>(memory);
+    for (uint32_t i = 0; i < kMaxPipes; ++i) new (&pipes_[i]) Pipe();
+  }
+  uint32_t instances = 0;
+  if (!name.empty()) {
+    for (Object& o : objects_) {
+      if (o.kind != ObjectKind::Pipe || o.name_size == 0 || !same_name(o.name, o.name_size, name)) continue;
+      ++instances;
+      const Pipe& other = pipes_[o.pipe];
+      if (other.max_instances != 0 && instances >= other.max_instances) { result.status = kPipeBusy; return result; }
+    }
+    if (max_instances != 0 && instances >= max_instances) { result.status = kPipeBusy; return result; }
+  }
+  int32_t pipe_index = -1;
+  for (uint32_t i = 0; i < kMaxPipes && pipe_index < 0; ++i) if (!pipes_[i].used) pipe_index = static_cast<int32_t>(i);
+  if (pipe_index < 0) { result.status = kNoResources; return result; }
+  for (uint32_t i = 0; i < kCapacity; ++i) {
+    Object& o = objects_[i];
+    if (o.kind != ObjectKind::None) continue;
+    Pipe& p = pipes_[pipe_index];
+    p = Pipe();
+    const uint32_t sizes[2] = {out_size ? out_size : kDefaultPipeBuffer, in_size ? in_size : kDefaultPipeBuffer};
+    for (uint32_t d = 0; d < 2; ++d) {
+      p.capacity[d] = sizes[d] > kMaxPipeBuffer ? kMaxPipeBuffer : sizes[d];
+      if (name.empty() && d == 1) { p.capacity[1] = 0; break; }      // (an anonymous pipe goes one way)
+      p.data[d] = static_cast<uint8_t*>(allocator_->allocate(p.capacity[d]));
+      if (!p.data[d]) {
+        for (uint8_t*& freed : p.data) { if (freed) allocator_->deallocate(freed); freed = nullptr; }
+        p = Pipe();
+        result.status = 0xC0000017u;
+        return result;
+      }
+    }
+    p.used = true;
+    p.anonymous = name.empty();
+    p.connected = p.anonymous;
+    p.access = p.anonymous ? kPipeOutbound : access;
+    p.max_instances = max_instances;
+    p.end_refs[0] = 1;
+    if (p.anonymous) p.end_refs[1] = 0;
+    o = Object();
+    o.kind = ObjectKind::Pipe;
+    o.references = 1;
+    for (uint32_t k = 0; k < name.size(); ++k) o.name[k] = name[k];
+    o.name_size = static_cast<uint32_t>(name.size());
+    o.pipe = pipe_index;
+    result.id = i + 1;
+    return result;
+  }
+  result.status = kNoResources;
+  return result;
+}
+
+ObjectManager::Created ObjectManager::connect_pipe(StringView name, bool want_read, bool want_write) {
+  Created result;
+  Locked hold(sync_);
+  bool found = false;
+  for (uint32_t i = 0; i < kCapacity; ++i) {
+    Object& o = objects_[i];
+    if (o.kind != ObjectKind::Pipe || o.name_size == 0 || !same_name(o.name, o.name_size, name)) continue;
+    found = true;
+    Pipe& p = pipes_[o.pipe];
+    if (p.connected || p.end_refs[0] == 0) continue;
+    if ((want_read && !(p.access & kPipeOutbound)) || (want_write && !(p.access & kPipeInbound))) { result.status = 0xC0000022u; return result; }
+    p.connected = true;
+    p.client_seen = true;
+    p.end_refs[1] = 1;
+    ++p.generation;
+    ++o.references;
+    sync_.notify_all();
+    result.id = i + 1;
+    result.end_code = 1 | (p.generation << 1);
+    return result;
+  }
+  result.status = found ? kPipeBusy : kNotFound;
+  return result;
+}
+
+void ObjectManager::add_pipe_end(uint32_t id, uint32_t end_code) {
+  Locked hold(sync_);
+  Object* o = at(id);
+  Pipe* p = pipe_of(id);
+  uint32_t end = 0;
+  if (!o || !p || !p->end_of(end_code, &end)) return;
+  ++o->references;
+  ++p->end_refs[end];
+}
+
+void ObjectManager::release_pipe_end(uint32_t id, uint32_t end_code) {
+  Locked hold(sync_);
+  Object* o = at(id);
+  Pipe* p = pipe_of(id);
+  uint32_t end = 0;
+  if (!o || !p || !p->end_of(end_code, &end) || p->end_refs[end] == 0) return;
+  --p->end_refs[end];
+  sync_.notify_all();      // the other end sees the end of the data
+  if (o->references > 0 && --o->references == 0) {
+    free_pipe_locked(*o);
+    *o = Object();
+  }
+}
+
+ObjectManager::PipeResult ObjectManager::pipe_read_locked(uint32_t id, uint32_t end_code, uint8_t* out, uint32_t capacity, uint32_t* got, bool peek, uint32_t* available) {
+  *got = 0;
+  Pipe* p = pipe_of(id);
+  uint32_t end = 0;
+  if (!p || !p->end_of(end_code, &end)) return PipeResult::Broken;
+  if (end == 1 && !p->connected) return PipeResult::Broken;
+  const uint32_t q = 1 - end;      // the queue the other end writes
+  if (available) *available = p->count[q];
+  if (end == 0 && !p->connected) return p->client_seen ? PipeResult::Broken : PipeResult::NotConnected;
+  if (p->count[q] == 0) return p->end_refs[1 - end] == 0 || (end == 0 && !p->connected) ? PipeResult::Broken : PipeResult::WouldBlock;
+  uint32_t n = p->count[q] < capacity ? p->count[q] : capacity;
+  for (uint32_t i = 0; i < n; ++i) out[i] = p->data[q][(p->head[q] + i) % p->capacity[q]];
+  if (!peek) {
+    p->head[q] = (p->head[q] + n) % p->capacity[q];
+    p->count[q] -= n;
+    sync_.notify_all();      // room for the writer
+  }
+  *got = n;
+  return PipeResult::Ok;
+}
+
+ObjectManager::PipeResult ObjectManager::pipe_write_locked(uint32_t id, uint32_t end_code, const uint8_t* data, uint32_t count, uint32_t* done) {
+  *done = 0;
+  Pipe* p = pipe_of(id);
+  uint32_t end = 0;
+  if (!p || !p->end_of(end_code, &end)) return PipeResult::Closing;
+  if (!p->connected) return end == 0 ? (p->client_seen ? PipeResult::Closing : PipeResult::NotConnected) : PipeResult::Closing;
+  if (p->end_refs[1 - end] == 0) return PipeResult::Closing;
+  const uint32_t q = end;
+  if (!p->data[q] || p->capacity[q] == 0) return PipeResult::Broken;
+  const uint32_t room = p->capacity[q] - p->count[q];
+  if (room == 0) return PipeResult::WouldBlock;
+  const uint32_t n = room < count ? room : count;
+  for (uint32_t i = 0; i < n; ++i) p->data[q][(p->head[q] + p->count[q] + i) % p->capacity[q]] = data[i];
+  p->count[q] += n;
+  *done = n;
+  sync_.notify_all();      // data for the reader
+  return PipeResult::Ok;
+}
+
+ObjectManager::PipeResult ObjectManager::pipe_listen_locked(uint32_t id) {
+  Pipe* p = pipe_of(id);
+  if (!p) return PipeResult::Broken;
+  if (p->connected) return PipeResult::Ok;
+  p->listening = true;
+  return PipeResult::WouldBlock;
+}
+
+void ObjectManager::pipe_disconnect(uint32_t id) {
+  Locked hold(sync_);
+  Object* o = at(id);
+  Pipe* p = pipe_of(id);
+  if (!o || !p || p->anonymous) return;
+  if (p->connected) {
+    p->connected = false;
+    o->references = o->references > p->end_refs[1] ? o->references - p->end_refs[1] : 0;
+    p->end_refs[1] = 0;      // (the client's handles stay in its table, but see a broken pipe: their end no longer counts)
+  }
+  p->listening = false;
+  p->client_seen = false;
+  p->count[0] = p->count[1] = 0;
+  p->head[0] = p->head[1] = 0;
+  sync_.notify_all();
+}
+
+uint32_t ObjectManager::pipe_pending_locked(uint32_t id, uint32_t end_code) {
+  Pipe* p = pipe_of(id);
+  uint32_t end = 0;
+  if (!p || !p->end_of(end_code, &end) || p->end_refs[1 - end] == 0 || !p->connected) return 0;
+  return p->count[end];
+}
+
+bool ObjectManager::pipe_name_available_locked(StringView name) {
+  for (Object& o : objects_) {
+    if (o.kind != ObjectKind::Pipe || o.name_size == 0 || !same_name(o.name, o.name_size, name)) continue;
+    const Pipe& p = pipes_[o.pipe];
+    if (!p.connected && p.end_refs[0] != 0) return true;
+  }
+  return false;
+}
+
+bool ObjectManager::pipe_info(uint32_t id, PipeInfo* out) {
+  Locked hold(sync_);
+  Object* o = at(id);
+  Pipe* p = pipe_of(id);
+  if (!o || !p) return false;
+  out->anonymous = p->anonymous;
+  out->connected = p->connected;
+  out->access = p->access;
+  out->out_size = p->capacity[0];
+  out->in_size = p->capacity[1];
+  out->max_instances = p->max_instances;
+  out->instances = 0;
+  for (const Object& other : objects_) if (other.kind == ObjectKind::Pipe && o->name_size != 0 && other.name_size == o->name_size && same_name(other.name, other.name_size, StringView(o->name, o->name_size))) ++out->instances;
+  if (p->anonymous) out->instances = 1;
+  return true;
+}
+
+// ---- byte-range locks
+
+struct ObjectManager::RangeLock {
+  bool used = false, exclusive = false;
+  const void* owner = nullptr;
+  uint64_t offset = 0, length = 0;
+  char path[260] = {};
+  uint32_t path_size = 0;
+};
+
+namespace {
+bool ranges_overlap(uint64_t a, uint64_t alen, uint64_t b, uint64_t blen) {
+  const uint64_t aend = a + alen < a ? ~uint64_t{0} : a + alen, bend = b + blen < b ? ~uint64_t{0} : b + blen;
+  return a < bend && b < aend;
+}
+}  // namespace
+
+ObjectManager::LockResult ObjectManager::lock_range_locked(StringView path, const void* owner, uint64_t offset, uint64_t length, bool exclusive) {
+  if (!allocator_ || path.size() >= 260) return LockResult::Full;
+  if (!locks_) {
+    void* memory = allocator_->allocate(sizeof(RangeLock) * kMaxLocks);
+    if (!memory) return LockResult::Full;
+    locks_ = static_cast<RangeLock*>(memory);
+    for (uint32_t i = 0; i < kMaxLocks; ++i) new (&locks_[i]) RangeLock();
+  }
+  for (uint32_t i = 0; i < kMaxLocks; ++i) {
+    const RangeLock& l = locks_[i];
+    if (!l.used || !same_name(l.path, l.path_size, path) || !ranges_overlap(l.offset, l.length, offset, length)) continue;
+    if (l.exclusive || exclusive) return LockResult::Conflict;      // (two shared locks may overlap, even of one file; anything with an exclusive one may not)
+  }
+  for (uint32_t i = 0; i < kMaxLocks; ++i) {
+    RangeLock& l = locks_[i];
+    if (l.used) continue;
+    l = RangeLock();
+    l.used = true;
+    l.exclusive = exclusive;
+    l.owner = owner;
+    l.offset = offset;
+    l.length = length;
+    for (uint32_t k = 0; k < path.size(); ++k) l.path[k] = path[k];
+    l.path_size = static_cast<uint32_t>(path.size());
+    return LockResult::Granted;
+  }
+  return LockResult::Full;
+}
+
+bool ObjectManager::unlock_range(StringView path, const void* owner, uint64_t offset, uint64_t length) {
+  Locked hold(sync_);
+  if (!locks_) return false;
+  for (uint32_t i = 0; i < kMaxLocks; ++i) {
+    RangeLock& l = locks_[i];
+    if (!l.used || l.owner != owner || l.offset != offset || l.length != length || !same_name(l.path, l.path_size, path)) continue;
+    l.used = false;
+    sync_.notify_all();      // whoever waits for the range looks again
+    return true;
+  }
+  return false;
+}
+
+void ObjectManager::unlock_all(const void* owner) {
+  Locked hold(sync_);
+  if (!locks_) return;
+  bool any = false;
+  for (uint32_t i = 0; i < kMaxLocks; ++i) if (locks_[i].used && locks_[i].owner == owner) { locks_[i].used = false; any = true; }
+  if (any) sync_.notify_all();
+}
+
+// ---- sections
+
+void ObjectManager::write_section_locked(Section& s) {
+  if (!s.file_backed || !s.writable || !s.fs || !s.storage) return;
+  UniquePointer<filesystem::IFile> file;
+  if (s.fs->open_file(StringView(s.path, s.path_size), filesystem::OpenMode::CreateOrOpen, &file) != filesystem::Status::Ok) return;
+  uint64_t done = 0;
+  while (done < s.size) {
+    uint64_t wrote = 0;
+    const uint64_t n = s.size - done < (1u << 20) ? s.size - done : (1u << 20);
+    if (file->write(done, ConstByteView(s.storage + done, n), &wrote) != filesystem::Status::Ok || wrote == 0) break;
+    done += wrote;
+  }
+  file->flush();
+}
+
+void ObjectManager::free_section_locked(Object& o) {
+  if (o.section < 0 || !sections_) return;
+  Section& s = sections_[o.section];
+  write_section_locked(s);
+  if (s.storage && allocator_) allocator_->deallocate(s.storage);
+  s.storage = nullptr;
+  s.used = false;
+  s.file_backed = false;
+  o.section = -1;
+}
+
+void ObjectManager::section_count(uint32_t index, int32_t delta) {
+  Locked hold(sync_);
+  if (!sections_ || index >= kMaxSections || !sections_[index].used) return;
+  Section& s = sections_[index];
+  s.mappings += delta;
+  if (s.mappings > 0) return;
+  s.mappings = 0;
+  write_section_locked(s);      // (the last view went away)
+  Object& o = objects_[s.object];
+  if (o.kind == ObjectKind::Section && o.references == 0) {      // no handle either: the section is gone
+    free_section_locked(o);
+    o = Object();
+  }
+}
+
+ObjectManager::Created ObjectManager::create_section(StringView name, uint64_t size, bool writable, filesystem::IFileSystem* fs, StringView host_path) {
+  Created result;
+  if (!allocator_ || name.size() >= kNameBytes || host_path.size() >= 512) { result.status = !allocator_ ? 0xC0000002u : kInvalid; return result; }
+  Locked hold(sync_);
+  if (Object* existing = find_locked(name)) {
+    if (existing->kind != ObjectKind::Section) { result.status = kTypeMismatch; return result; }
+    ++existing->references;
+    result.id = static_cast<uint32_t>(existing - objects_) + 1;
+    result.status = kNameExists;
+    return result;
+  }
+  if (!sections_) {
+    void* memory = allocator_->allocate(sizeof(Section) * kMaxSections);
+    if (!memory) { result.status = 0xC0000017u; return result; }
+    sections_ = static_cast<Section*>(memory);
+    for (uint32_t i = 0; i < kMaxSections; ++i) new (&sections_[i]) Section();
+  }
+  int32_t index = -1;
+  for (uint32_t i = 0; i < kMaxSections && index < 0; ++i) if (!sections_[i].used) index = static_cast<int32_t>(i);
+  if (index < 0) { result.status = kNoResources; return result; }
+  uint64_t file_size = 0;
+  UniquePointer<filesystem::IFile> file;
+  if (fs) {
+    if (fs->open_file(host_path, filesystem::OpenMode::Read, &file) != filesystem::Status::Ok) { result.status = kNotFound; return result; }
+    file_size = file->size();
+  }
+  const uint64_t bytes = size > file_size ? size : file_size;
+  if (bytes == 0 || bytes > (64ull << 20)) { result.status = bytes == 0 ? kInvalid : kNoResources; return result; }
+  const uint64_t rounded = (bytes + 4095) & ~uint64_t{4095};
+  uint8_t* storage = static_cast<uint8_t*>(allocator_->allocate_aligned(rounded, 4096));
+  if (!storage) { result.status = 0xC0000017u; return result; }
+  for (uint64_t i = 0; i < rounded; ++i) storage[i] = 0;
+  for (uint64_t done = 0; fs && done < file_size;) {
+    uint64_t got = 0;
+    const uint64_t n = file_size - done < (1u << 20) ? file_size - done : (1u << 20);
+    if (file->read(done, ByteView(storage + done, n), &got) != filesystem::Status::Ok || got == 0) break;
+    done += got;
+  }
+  file.reset();
+  for (uint32_t i = 0; i < kCapacity; ++i) {
+    Object& o = objects_[i];
+    if (o.kind != ObjectKind::None) continue;
+    o = Object();
+    o.kind = ObjectKind::Section;
+    o.references = 1;
+    for (uint32_t k = 0; k < name.size(); ++k) o.name[k] = name[k];
+    o.name_size = static_cast<uint32_t>(name.size());
+    o.section = index;
+    Section& s = sections_[index];
+    s = Section();
+    s.used = true;
+    s.writable = writable;
+    s.file_backed = fs != nullptr;
+    s.storage = storage;
+    s.size = bytes;
+    s.rounded = rounded;
+    s.object = i;
+    s.fs = fs;
+    for (uint32_t k = 0; k < host_path.size(); ++k) s.path[k] = host_path[k];
+    s.path_size = static_cast<uint32_t>(host_path.size());
+    s.ref.attach(this, static_cast<uint32_t>(index));
+    result.id = i + 1;
+    return result;
+  }
+  allocator_->deallocate(storage);
+  result.status = kNoResources;
+  return result;
+}
+
+bool ObjectManager::section_memory(uint32_t id, uint8_t** storage, uint64_t* size, SharedMemory** owner) {
+  Locked hold(sync_);
+  Object* o = at(id);
+  if (!o || o->kind != ObjectKind::Section || o->section < 0 || !sections_) return false;
+  Section& s = sections_[o->section];
+  *storage = s.storage;
+  *size = s.rounded;
+  *owner = &s.ref;
+  return true;
+}
+
+bool ObjectManager::section_info(uint32_t id, SectionInfo* out) {
+  Locked hold(sync_);
+  Object* o = at(id);
+  if (!o || o->kind != ObjectKind::Section || o->section < 0 || !sections_) return false;
+  const Section& s = sections_[o->section];
+  out->size = s.size;
+  out->writable = s.writable;
+  out->file_backed = s.file_backed;
+  return true;
+}
+
+void ObjectManager::flush_section_at(uint32_t index) {
+  Locked hold(sync_);
+  if (sections_ && index < kMaxSections && sections_[index].used) write_section_locked(sections_[index]);
+}
+
+void ObjectManager::flush_section(uint32_t id) {
+  Locked hold(sync_);
+  Object* o = at(id);
+  if (o && o->kind == ObjectKind::Section && o->section >= 0 && sections_) write_section_locked(sections_[o->section]);
+}
+
+// ---- timers
+
+void ObjectManager::fire_timer_locked(Object& o, uint64_t now) {
+  if (o.kind != ObjectKind::Timer || !o.armed || now < o.due_ns) return;
+  o.signaled = true;
+  o.fired_at = o.due_ns;
+  if (o.apc_routine != 0) o.apc_pending = true;
+  if (o.period_ns != 0) {
+    const uint64_t missed = (now - o.due_ns) / o.period_ns + 1;
+    o.due_ns += missed * o.period_ns;
+  } else {
+    o.armed = false;
+  }
+}
+
+uint32_t ObjectManager::set_timer(uint32_t id, uint64_t due_ns, uint64_t period_ns, uint64_t thread, uint64_t routine, uint64_t context, bool* was_signaled) {
+  Locked hold(sync_);
+  Object* o = at(id);
+  if (!o || o->kind != ObjectKind::Timer) return kInvalidHandle;
+  fire_timer_locked(*o, sync_.now_ns());
+  if (was_signaled) *was_signaled = o->signaled;
+  o->signaled = false;      // (setting a timer makes it unsignalled again)
+  o->armed = true;
+  o->due_ns = due_ns;
+  o->period_ns = period_ns;
+  o->apc_thread = routine ? thread : 0;
+  o->apc_routine = routine;
+  o->apc_context = context;
+  o->apc_pending = false;
+  sync_.notify_all();      // whoever waits for it looks at the new time
+  return kSuccess;
+}
+
+uint32_t ObjectManager::cancel_timer(uint32_t id, bool* was_signaled) {
+  Locked hold(sync_);
+  Object* o = at(id);
+  if (!o || o->kind != ObjectKind::Timer) return kInvalidHandle;
+  fire_timer_locked(*o, sync_.now_ns());
+  if (was_signaled) *was_signaled = o->signaled;
+  o->armed = false;
+  o->apc_pending = false;
+  return kSuccess;
+}
+
+uint32_t ObjectManager::query_timer(uint32_t id, uint64_t* remaining_ns, bool* signaled) {
+  Locked hold(sync_);
+  Object* o = at(id);
+  if (!o || o->kind != ObjectKind::Timer) return kInvalidHandle;
+  const uint64_t now = sync_.now_ns();
+  fire_timer_locked(*o, now);
+  *signaled = o->signaled;
+  *remaining_ns = o->armed && o->due_ns > now ? o->due_ns - now : 0;
+  return kSuccess;
+}
+
+void ObjectManager::take_timer_apcs_locked(uint64_t thread, TimerApc* out, uint32_t capacity, uint32_t* count) {
+  *count = 0;
+  const uint64_t now = sync_.now_ns();
+  for (Object& o : objects_) {
+    if (o.kind != ObjectKind::Timer || o.apc_thread != thread) continue;
+    fire_timer_locked(o, now);
+    if (!o.apc_pending || *count >= capacity) continue;
+    o.apc_pending = false;
+    out[(*count)++] = TimerApc{o.apc_routine, o.apc_context, o.fired_at};
+  }
+}
+
+uint64_t ObjectManager::thread_timer_deadline_locked(uint64_t thread) {
+  uint64_t soonest = ~uint64_t{0};
+  for (const Object& o : objects_) if (o.kind == ObjectKind::Timer && o.apc_thread == thread && o.armed && o.due_ns < soonest) soonest = o.due_ns;
+  return soonest;
+}
+
+uint64_t ObjectManager::timer_deadline_locked(uint32_t id) {
+  Object* o = at(id);
+  return o && o->kind == ObjectKind::Timer && o->armed ? o->due_ns : ~uint64_t{0};
 }
 
 ObjectManager::Created ObjectManager::open(ObjectKind kind, StringView name) {
@@ -149,7 +737,15 @@ void ObjectManager::release(uint32_t id) {
   Locked hold(sync_);
   Object* o = at(id);
   if (!o || o->references == 0) return;
-  if (--o->references == 0) *o = Object();
+  if (--o->references == 0) {
+    if (o->kind == ObjectKind::Section && o->section >= 0 && sections_ && sections_[o->section].mappings > 0) {      // views keep the memory; its name goes
+      o->name_size = 0;
+      return;
+    }
+    free_pipe_locked(*o);
+    free_section_locked(*o);
+    *o = Object();
+  }
 }
 
 ObjectKind ObjectManager::kind(uint32_t id) {
@@ -245,6 +841,7 @@ bool ObjectManager::ready_locked(uint32_t id, uint64_t waiter) {
   switch (o->kind) {
     case ObjectKind::Event: return o->signaled || o->pulses > 0;
     case ObjectKind::Process: return o->signaled;
+    case ObjectKind::Timer: fire_timer_locked(*o, sync_.now_ns()); return o->signaled;
     case ObjectKind::Mutex: return o->owner == 0 || o->owner == waiter;
     case ObjectKind::Semaphore: return o->count > 0;
     default: return true;
@@ -259,6 +856,9 @@ void ObjectManager::acquire_locked(uint32_t id, uint64_t waiter, bool* abandoned
     case ObjectKind::Event:
       if (o->signaled) { if (!o->manual_reset) o->signaled = false; }
       else if (o->pulses > 0) --o->pulses;
+      break;
+    case ObjectKind::Timer:
+      if (!o->manual_reset) o->signaled = false;      // (a synchronization timer lets one waiter through per firing)
       break;
     case ObjectKind::Mutex:
       if (o->owner == waiter) { ++o->recursion; }

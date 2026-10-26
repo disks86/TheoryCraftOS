@@ -87,6 +87,7 @@ uint32_t nt_create_thread_ex(Process& p, const SyscallRequest& r) {
     return slot < 0 ? kInsufficientResources : kAccessViolation;
   }
   record->teb = thread.teb;
+  record->start_address = start;
   record->region_base = thread.region_base;
   record->region_size = thread.region_size;
   ThreadStart ts;
@@ -116,6 +117,11 @@ void end_thread(Process& p, Process::ThreadRecord& record, uint32_t code) {
   if (record.region_size && p.address_space()) {
     p.address_space()->unmap(record.region_base, record.region_size);
     record.region_size = 0;
+  }
+  for (uint32_t i = 0; i < kMaxTlsModules; ++i) {      // thread-local blocks of libraries loaded after the thread began
+    if (record.extra_tls[i] != 0 && p.address_space()) p.address_space()->unmap(record.extra_tls[i], record.extra_tls_size[i]);
+    record.extra_tls[i] = 0;
+    record.extra_tls_size[i] = 0;
   }
   if (ObjectManager* objects = system_objects()) objects->abandon_thread(record.id);
   if (p.live_threads() == 0) p.terminate(code);
@@ -210,24 +216,134 @@ uint32_t context_call(Process& p, const SyscallRequest& r, bool set) {
 uint32_t nt_get_context_thread(Process& p, const SyscallRequest& r) { return context_call(p, r, false); }
 uint32_t nt_set_context_thread(Process& p, const SyscallRequest& r) { return context_call(p, r, true); }
 
-// NtQueryInformationThread(Thread, Class, Buffer, Length, ReturnLength): ThreadBasicInformation (0) only.
+// NtQueueApcThread(Thread, ApcRoutine, Arg1, Arg2, Arg3): the routine will be called with the arguments in that thread when it waits alertably (SleepEx, WaitForSingleObjectEx, ...)
+// or tests for it (NtTestAlert); an alertable wait that is going on ends at once.
+uint32_t nt_queue_apc_thread(Process& p, const SyscallRequest& r) {
+  uint64_t arg3 = 0;
+  if (!windowsabi::argument(p, r, 4, &arg3)) return kAccessViolation;
+  Process::ThreadRecord* record = thread_of(p, r.args[0]);
+  if (!record) return kInvalidHandle;
+  if (record->finished) return 0xC000004Bu;      // STATUS_THREAD_IS_TERMINATING
+  if (r.args[1] == 0) return kInvalidParameter;
+  if (!Process::queue_apc(*record, Process::ThreadRecord::Apc{r.args[1], r.args[2], r.args[3], arg3})) return kInsufficientResources;
+  if (p.runtime()) p.runtime()->notify();
+  if (ObjectManager* objects = system_objects()) objects->notify();
+  return kSuccess;
+}
+
+// NtDequeueApc(PVOID Out): takes the oldest APC queued for the calling thread: four 64-bit numbers (routine, argument 1, 2, 3). STATUS_NO_MORE_ENTRIES if there is none. ntdll
+// builds NtTestAlert and the delivery after an alertable wait on it.
+uint32_t nt_dequeue_apc(Process& p, const SyscallRequest& r) {
+  Process::ThreadRecord* record = thread_of(p, kCurrentThread);
+  if (!record) return kInvalidHandle;
+  Process::ThreadRecord::Apc apc;
+  if (!Process::take_apc(*record, &apc)) return 0x8000001Au;
+  uint8_t out[32];
+  const uint64_t values[4] = {apc.routine, apc.a1, apc.a2, apc.a3};
+  for (uint32_t v = 0; v < 4; ++v) for (uint32_t b = 0; b < 8; ++b) out[v * 8 + b] = uint8_t(values[v] >> (8 * b));
+  if (!p.write_user(r.args[0], ConstByteView(out, 32))) {
+    Process::queue_apc(*record, apc);      // (it stays queued)
+    return kAccessViolation;
+  }
+  return kSuccess;
+}
+
+// NtOpenThread(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PCLIENT_ID): a thread of this process by its id.
+uint32_t nt_open_thread(Process& p, const SyscallRequest& r) {
+  uint8_t id[16];
+  if (r.args[3] == 0 || !p.read_user(r.args[3], ByteView(id, 16))) return kAccessViolation;
+  uint64_t process_id = 0, thread_id = 0;
+  for (uint32_t i = 0; i < 8; ++i) { process_id |= uint64_t{id[i]} << (8 * i); thread_id |= uint64_t{id[8 + i]} << (8 * i); }
+  if (process_id != 0 && process_id != p.id()) return kInvalidHandle;      // (threads of other processes are not reachable)
+  Process::ThreadRecord* record = p.find_thread(thread_id);
+  if (!record || record->finished) return 0xC000000Bu;      // STATUS_INVALID_CID
+  const int64_t slot = p.files().open_token(DescriptorKind::Thread, thread_id);
+  if (slot < 0) return kInsufficientResources;
+  uint8_t attributes[4] = {};
+  if (r.args[2] != 0) p.read_user(r.args[2] + 24, ByteView(attributes, 4));
+  p.files().set_handle_flags(uint64_t(slot), (attributes[0] & 2) != 0, false);
+  if (!p.write_user_u64(r.args[0], (uint64_t(slot) + 1) * 4)) { p.files().close(uint64_t(slot)); return kAccessViolation; }
+  return kSuccess;
+}
+
+// NtQueryInformationThread(Thread, Class, Buffer, Length, ReturnLength): basic information (0), times (1), the start address (9), whether it is the last thread (12),
+// and the suspend count (35).
 uint32_t nt_query_information_thread(Process& p, const SyscallRequest& r) {
   uint64_t returned = 0;
   if (!windowsabi::argument(p, r, 4, &returned)) return kAccessViolation;
   Process::ThreadRecord* record = thread_of(p, r.args[0]);
   if (!record) return kInvalidHandle;
-  if (uint32_t(r.args[1]) != 0) return kInvalidInfoClass;
-  if (uint32_t(r.args[3]) < 48) return kInfoLengthMismatch;
+  const uint32_t info_class = uint32_t(r.args[1]), length = uint32_t(r.args[3]);
   uint8_t out[48] = {};
-  auto put64 = [&](uint32_t at, uint64_t v) { for (uint32_t i = 0; i < 8; ++i) out[at + i] = uint8_t(v >> (8 * i)); };
-  put64(0, record->finished ? record->exit_code : kStillActive);      // ExitStatus
-  put64(8, record->teb);                                               // TebBaseAddress
-  put64(16, p.id());                                                   // ClientId.UniqueProcess
-  put64(24, record->id);                                               // ClientId.UniqueThread
-  put64(32, 1);                                                        // AffinityMask
-  if (!p.write_user(r.args[2], ConstByteView(out, 48))) return kAccessViolation;
-  if (returned != 0 && !put32(p, returned, 48)) return kAccessViolation;
-  return kSuccess;
+  auto put = [&](uint32_t at, uint64_t v, uint32_t size) { for (uint32_t i = 0; i < size; ++i) out[at + i] = uint8_t(v >> (8 * i)); };
+  uint32_t size = 0;
+  switch (info_class) {
+    case 0: {      // THREAD_BASIC_INFORMATION
+      IProcessRuntime* runtime = p.runtime();
+      put(0, record->finished ? record->exit_code : kStillActive, 4);      // ExitStatus
+      put(8, record->teb, 8);                                               // TebBaseAddress
+      put(16, p.id(), 8);                                                   // ClientId.UniqueProcess
+      put(24, record->id, 8);                                               // ClientId.UniqueThread
+      put(32, runtime ? runtime->affinity(record->id) : 1, 8);              // AffinityMask
+      put(40, uint32_t(record->priority), 4);                               // Priority
+      put(44, uint32_t(record->priority), 4);                               // BasePriority
+      size = 48;
+      break;
+    }
+    case 1: {      // KERNEL_USER_TIMES
+      uint64_t used = 0;
+      if (p.runtime()) p.runtime()->cpu_time(record->id, &used);
+      put(24, used, 8);      // UserTime (the time is not split into kernel and user)
+      size = 32;
+      break;
+    }
+    case 9: put(0, record->start_address, 8); size = 8; break;      // ThreadQuerySetWin32StartAddress
+    case 12: put(0, p.live_threads() <= 1 ? 1 : 0, 4); size = 4; break;      // ThreadAmILastThread
+    case 35: put(0, uint32_t(record->suspend_count), 4); size = 4; break;      // ThreadSuspendCount
+    default: return kInvalidInfoClass;
+  }
+  if (returned != 0 && !put32(p, returned, size)) return kAccessViolation;
+  if (length < size) return kInfoLengthMismatch;
+  return p.write_user(r.args[2], ConstByteView(out, size)) ? kSuccess : kAccessViolation;
+}
+
+// NtSetInformationThread(Thread, Class, Buffer, Length): priority (2, 3: the value is kept for the program to read back), affinity (4), ideal processor (13, which
+// only has to name a core that exists), and hiding from a debugger (17: nothing to hide from).
+uint32_t nt_set_information_thread(Process& p, const SyscallRequest& r) {
+  Process::ThreadRecord* record = thread_of(p, r.args[0]);
+  if (!record) return kInvalidHandle;
+  const uint32_t info_class = uint32_t(r.args[1]), length = uint32_t(r.args[3]);
+  uint8_t in[8] = {};
+  auto need = [&](uint32_t bytes) -> uint32_t {
+    if (length != bytes) return kInfoLengthMismatch;
+    return p.read_user(r.args[2], ByteView(in, bytes)) ? kSuccess : kAccessViolation;
+  };
+  switch (info_class) {
+    case 2:
+    case 3: {      // ThreadPriority, ThreadBasePriority
+      const uint32_t status = need(4);
+      if (status != kSuccess) return status;
+      const int32_t value = int32_t(in[0] | (uint32_t{in[1]} << 8) | (uint32_t{in[2]} << 16) | (uint32_t{in[3]} << 24));
+      if (value < -16 || value > 16) return kInvalidParameter;
+      record->priority = value;
+      return kSuccess;
+    }
+    case 4: {      // ThreadAffinityMask
+      const uint32_t status = need(8);
+      if (status != kSuccess) return status;
+      uint64_t mask = 0;
+      for (uint32_t i = 0; i < 8; ++i) mask |= uint64_t{in[i]} << (8 * i);
+      return p.runtime() && p.runtime()->set_affinity(record->id, mask) ? kSuccess : kInvalidParameter;
+    }
+    case 13: {     // ThreadIdealProcessor
+      const uint32_t status = need(4);
+      if (status != kSuccess) return status;
+      const uint32_t core = in[0] | (uint32_t{in[1]} << 8) | (uint32_t{in[2]} << 16) | (uint32_t{in[3]} << 24);
+      return p.runtime() && core < p.runtime()->processor_count() ? kSuccess : kInvalidParameter;
+    }
+    case 17: return length == 0 ? kSuccess : kInfoLengthMismatch;
+    default: return kInvalidInfoClass;
+  }
 }
 
 }  // namespace process::windowsabi

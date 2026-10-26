@@ -521,7 +521,14 @@ static void test_windows_files() {
     NtRig::Opened disk = rig.create("\\??\\C:\\hello.txt", 0x80000000u | 0x100000, 1, 0x60);
     CHECK(disk.status == 0 && rig.call(WindowsSyscallNumber::NtQueryVolumeInformationFile, disk.handle, status_block, device, 8, {4}) == 0 && rig.bytes(device, 1)[0] == 7);
     CHECK(rig.call(WindowsSyscallNumber::NtQueryVolumeInformationFile, disk.handle, status_block, device, 4, {4}) == 0xC0000004u);
-    CHECK(rig.call(WindowsSyscallNumber::NtQueryVolumeInformationFile, disk.handle, status_block, device, 8, {5}) == 0xC0000003u);
+    CHECK(rig.call(WindowsSyscallNumber::NtQueryVolumeInformationFile, disk.handle, status_block, device, 8, {99}) == 0xC0000003u);
+    {      // the size, attribute and full size information come from the file system underneath
+      const uint64_t size = rig.alloc(32), attributes = rig.alloc(64), full = rig.alloc(32);
+      CHECK(rig.call(WindowsSyscallNumber::NtQueryVolumeInformationFile, disk.handle, status_block, size, 24, {3}) == 0 && rig.bytes(size, 24)[16] == 8 && rig.bytes(size, 24)[20] == 0);      // 8 sectors of 512 bytes per unit
+      CHECK(rig.call(WindowsSyscallNumber::NtQueryVolumeInformationFile, disk.handle, status_block, attributes, 64, {5}) == 0 && uint8_t(rig.bytes(attributes, 12)[4]) == 255);      // names up to 255 characters
+      CHECK(rig.call(WindowsSyscallNumber::NtQueryVolumeInformationFile, disk.handle, status_block, full, 32, {7}) == 0 && rig.bytes(full, 32)[24] == 8);
+      CHECK(rig.call(WindowsSyscallNumber::NtQueryVolumeInformationFile, disk.handle, status_block, size, 8, {3}) == 0xC0000004u);
+    }
     CHECK(rig.call(WindowsSyscallNumber::NtQueryVolumeInformationFile, 400, status_block, device, 8, {4}) == 0xC0000008u);
     rig.call(WindowsSyscallNumber::NtClose, disk.handle);
   }

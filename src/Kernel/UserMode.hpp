@@ -38,6 +38,9 @@ namespace usermode {
 // the per-core tables on every core. False if the machine or the memory does not allow it (nothing is changed then, except memory already allocated).
 bool init(allocators::IAllocator& allocator);
 bool ready();
+// Where the amount of memory the machine has and has left comes from (the allocator; set once by the code that owns it). Without it programs are told 0.
+using MemorySource = void (*)(void* context, uint64_t* total_bytes, uint64_t* free_bytes);
+void set_memory_source(MemorySource source, void* context);
 // Addresses a user address space must stay away from (pages the CPU needs on the user page tables): hand them to AddressSpace::set_reserved().
 ArrayView<const process::AddressRange> reserved_ranges();
 
@@ -55,6 +58,7 @@ struct UserThread {
   bool suspend_requested = false, terminate_requested = false;
   uint32_t terminate_code = 0;
   bool parked = false, redirected = false, context_dirty = false;
+  uint64_t core_mask = ~uint64_t{0};      // the cores it may run on (SetThreadAffinityMask)
   uint64_t saved_rip = 0;
   process::X86Context saved;      // its registers while it is parked
   volatile bool finished = false;      // it has reached the end of its life (set just before the CPU thread ends; only then may the CPU thread be joined)
@@ -84,6 +88,8 @@ struct Task final : process::IProcessRuntime {
   uint64_t retired_ticks = 0;     // CPU ticks of the threads that have ended (under `mutex`)
   Task* all_next = nullptr;       // every running program (see process_snapshot()); under the registry's lock
   bool registered = false;
+  uint32_t running_threads = 0;      // threads that have been started and have not reached their end (atomic): when the last one does, the process lets go of its handles
+  uint64_t process_mask = ~uint64_t{0};      // the cores new threads may run on (SetProcessAffinityMask)
   UserThread* first_thread = nullptr;      // the program's first thread, when it was created but not started (CreateProcess with CREATE_SUSPENDED)
 
   // The programs this one started with CreateProcess (they end with it: usermode::wait() stops them).
@@ -105,6 +111,13 @@ struct Task final : process::IProcessRuntime {
   bool get_context(uint64_t id, process::X86Context* out) override;
   bool set_context(uint64_t id, const process::X86Context& context) override;
   void request_terminate(uint64_t id, uint32_t code) override;
+  uint32_t processor_count() override;
+  void memory_status(uint64_t* total_bytes, uint64_t* free_bytes) override;
+  bool set_affinity(uint64_t thread_id, uint64_t mask) override;
+  uint64_t affinity(uint64_t thread_id) override;
+  bool cpu_time(uint64_t thread_id, uint64_t* hundred_ns) override;
+  uint32_t current_processor() override;
+  bool process_exists(uint64_t pid) override;
   uint64_t allocate_process_id() override;
   uint32_t spawn_process(const process::ChildSpec& spec) override;
   bool terminate_process(uint64_t pid, uint32_t code) override;

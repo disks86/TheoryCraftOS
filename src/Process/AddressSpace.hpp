@@ -37,6 +37,18 @@ constexpr uint8_t kProtRead = 1, kProtWrite = 2, kProtExecute = 4;
 //
 // Regions never overlap and the whole space is below kUserTop. A request that does not fit (overlap, beyond the top, over the byte budget, out of memory)
 // fails and changes nothing.
+// Memory that several address spaces map at once (a section: CreateFileMapping). The owner counts the mappings and frees the memory when the last is gone.
+class SharedMemory {
+ public:
+  virtual void retain() = 0;
+  virtual void release() = 0;
+  virtual void flush() {}      // write what is in the memory back to where it came from (FlushViewOfFile)
+
+ protected:
+  SharedMemory() = default;
+  ~SharedMemory() = default;
+};
+
 class AddressSpace final : public IUserMemory {
  public:
   static constexpr uint64_t kPageSize = 4096;
@@ -61,6 +73,12 @@ class AddressSpace final : public IUserMemory {
 
   // Maps [address, address + size) with `protection` (size rounded up to whole pages), zero-filled. `address` must be page-aligned and size non-zero.
   bool map(uint64_t address, uint64_t size, uint8_t protection);
+  // Maps memory that is not the address space's own: `storage` (page-aligned, `size` bytes, rounded up to pages) stays as it is and is shared with whoever else maps it.
+  // `owner` is told (retain) once for the mapping and again for every piece it is cut into, and (release) when a piece is unmapped, which with deferred freeing is when the
+  // CPUs can no longer see it.
+  bool map_shared(uint64_t address, uint64_t size, uint8_t protection, uint8_t* storage, SharedMemory* owner);
+  bool is_shared(uint64_t address) const;
+  SharedMemory* shared_at(uint64_t address) const;
   // Unmaps whatever is mapped inside [address, address + size) (size rounded up); regions that stick out are cut. Gaps are fine. False for a bad range
   // or if cutting a region ran out of memory (nothing is unmapped then).
   bool unmap(uint64_t address, uint64_t size);
@@ -112,9 +130,13 @@ class AddressSpace final : public IUserMemory {
 
  private:
   // Memory of regions that went away while deferred_free is on.
+  struct RetiredPiece {
+    uint8_t* storage = nullptr;
+    SharedMemory* shared = nullptr;      // set: a mapping to let go of instead of memory to free
+  };
   struct Retired {
     explicit Retired(allocators::IAllocator& allocator) : storages(allocator) {}
-    List<uint8_t*> storages;
+    List<RetiredPiece> storages;
     bool deferred = false;
   };
   // One run of pages and the page-aligned memory behind it (`capacity` may exceed `size` after a cut or a shrink).
@@ -131,6 +153,7 @@ class AddressSpace final : public IUserMemory {
     uint8_t protection = 0;
     uint8_t* storage = nullptr;
     uint64_t capacity = 0;
+    SharedMemory* shared = nullptr;      // not ours: a section's memory, which we only map
 
    private:
     allocators::IAllocator& allocator_;

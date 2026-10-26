@@ -53,6 +53,8 @@ bool IntelGpu::render_hardware(IntelRenderHardware* out) {
   if (!registers_mapped_ || info_.architecture != IntelGpuArchitecture::Gen9_5 || info_.discrete || !ggtt_table_.valid()) return false;
   out->registers = &bank_;
   out->ggtt_table = ggtt_table_;
+  out->device_id = context_.device.device_id;
+  out->revision = static_cast<uint8_t>(context_.pci ? context_.pci->read32(context_.device.address, 0x08) & 0xFF : 0);   // config offset 8: revision ID
   return true;
 }
 

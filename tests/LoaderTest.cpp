@@ -846,11 +846,12 @@ static void test_windows_startup() {
   CHECK(s.read(0x100000000ull + 0x10D0, ByteView(b4, 4)) && b4[0] == 0 && b4[1] == 0);      // the index variable was set to 0
   CHECK(s.write(block, ConstByteView(tls + 8, 1)));                          // the block is writable
 
-  // No TLS directory: no TLS pointer.
+  // No TLS directory: the pointer array is there (libraries loaded later put their blocks in it) and holds nothing.
   UserProgram plain(A, 34, host);
   Bytes pe2 = make_pe();
   CHECK(plain.load(view(pe2), ArrayView<const StringView>(), ArrayView<const StringView>(), ConstByteView(nullptr, 0)) == LoadStatus::Ok);
-  CHECK(plain.process()->read_user_u64(plain.start().gs_base + 0x58, &v) && v == 0);
+  uint64_t first_block = 1;
+  CHECK(plain.process()->read_user_u64(plain.start().gs_base + 0x58, &v) && v != 0 && plain.process()->read_user_u64(v, &first_block) && first_block == 0);
   // Damaged TLS directories are refused, not followed.
   Bytes bad = make_pe(1, true); put(bad, 0x288, 0x100000000ull + 0x10C0 - 8, 8);        // end before start
   UserProgram u1(A, 35, host);

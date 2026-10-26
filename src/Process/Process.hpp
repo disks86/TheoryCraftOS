@@ -53,6 +53,29 @@ struct ThreadStart {
   uint64_t id = 0;
 };
 
+// One library that LoadLibrary brought into the process.
+struct LoadedModule {
+  uint64_t base = 0, size = 0, entry = 0;      // entry: DllMain (0 if none)
+  char name[40] = {};                           // canonical ("msvcrt.dll"), NUL-terminated
+};
+// What loads and unloads libraries in a Windows process after it has started (the user-program layer implements it; the process does not know how libraries are found).
+class IModuleHost {
+ public:
+  // Loads the library in `file` under `canonical_name` and the libraries it imports that are missing, and says in `out` (at most `capacity`) which libraries are new, in the
+  // order their entry points must run. Returns an NTSTATUS; nothing stays loaded on failure.
+  virtual uint32_t load_module(ConstByteView file, StringView canonical_name, LoadedModule* out, uint32_t capacity, uint32_t* count) = 0;
+  // LoadLibrary of a library that is loaded already (by this canonical name): one more use. False if there is none.
+  virtual bool reference_module(StringView canonical_name, uint64_t* base) = 0;
+  // FreeLibrary: one use less. The libraries that nobody uses any more are listed in `out` (at most `capacity`) in the order their entry points have to be called with
+  // DLL_PROCESS_DETACH; they stay mapped until unload_module(). Returns an NTSTATUS.
+  virtual uint32_t release_module(uint64_t base, LoadedModule* out, uint32_t capacity, uint32_t* count) = 0;
+  virtual uint32_t unload_module(uint64_t base) = 0;
+
+ protected:
+  IModuleHost() = default;
+  ~IModuleHost() = default;
+};
+
 // A program for CreateProcess: the file's bytes and the strings the new process starts with (all valid for the length of the call).
 struct ChildSpec {
   uint64_t pid = 0;                      // chosen beforehand (IProcessRuntime::allocate_process_id)
@@ -62,6 +85,9 @@ struct ChildSpec {
   StringView working_directory;          // in the program's world ("/dir" is C:\\dir)
   ArrayView<const StringView> environment;      // "NAME=value" each
   bool suspended = false;                // it does not run until resume_process()
+  bool inherit_handles = false;          // the child gets the parent's inheritable handles, at the same numbers
+  bool use_std_handles = false;          // the child's standard input, output and error are these handles of the parent (which are inherited too)
+  uint64_t std_handles[3] = {};
 };
 
 // What a process needs to run more than one thread: supplied by whoever runs the program (the kernel). Without one a process has a single thread. The process has
@@ -92,6 +118,18 @@ class IProcessRuntime {
   virtual uint32_t spawn_process(const ChildSpec& spec) { (void)spec; return 0xC0000002u; }
   virtual bool terminate_process(uint64_t pid, uint32_t code) { (void)pid; (void)code; return false; }
   virtual bool resume_process(uint64_t pid) { (void)pid; return false; }
+  // The machine: how many cores threads can run on, and the memory.
+  virtual uint32_t processor_count() { return 1; }
+  virtual void memory_status(uint64_t* total_bytes, uint64_t* free_bytes) { *total_bytes = *free_bytes = 0; }
+  // Which cores a thread (id 0: every thread of the process, and the ones made later) may run on: bit n is core n. False if the mask names no core that exists.
+  virtual bool set_affinity(uint64_t thread_id, uint64_t mask) { (void)thread_id; (void)mask; return mask == 1; }
+  virtual uint64_t affinity(uint64_t thread_id) { (void)thread_id; return 1; }
+  // CPU time used, in units of 100 ns (thread_id 0: the whole process, including threads that ended). False if the thread is unknown.
+  virtual bool cpu_time(uint64_t thread_id, uint64_t* hundred_ns) { (void)thread_id; *hundred_ns = 0; return true; }
+  // The core the calling thread runs on right now.
+  virtual uint32_t current_processor() { return 0; }
+  // Is there a running program with this process id (OpenProcess)?
+  virtual bool process_exists(uint64_t pid) { (void)pid; return false; }
 
  protected:
   IProcessRuntime() = default;
@@ -147,6 +185,7 @@ class Process {
   bool write_user(uint64_t address, ConstByteView data) { return memory_.write(address, data); }
   bool read_user_u64(uint64_t address, uint64_t* out);
   bool write_user_u64(uint64_t address, uint64_t value);
+  bool write_user_u32(uint64_t address, uint32_t value);
 
   // The address space the process runs in, when the kernel manages it (memory system calls need it; without one they fail). `heap_start` is where the
   // Linux program break begins (page-aligned, just past the image).
@@ -185,8 +224,22 @@ class Process {
     bool used = false, started = false, finished = false;
     int32_t suspend_count = 0;                        // SuspendThread calls not yet undone (a thread created suspended starts at 1)
     uint32_t exit_code = 259;                         // STILL_ACTIVE
+    uint64_t extra_tls[kMaxTlsModules] = {};          // blocks of libraries loaded after the thread began: [index] = base (each is one region of extra_tls_size[index] bytes)
+    uint64_t extra_tls_size[kMaxTlsModules] = {};
+    struct Apc { uint64_t routine = 0, a1 = 0, a2 = 0, a3 = 0; };      // an asynchronous procedure call waiting for the thread (QueueUserAPC, a timer, ReadFileEx)
+    static constexpr uint32_t kMaxApcs = 32;
+    Apc apcs[kMaxApcs];
+    uint32_t apc_count = 0;
+    uint64_t start_address = 0;                       // where the thread began (the start routine), 0 if not known
+    int32_t priority = 0;                             // THREAD_PRIORITY_NORMAL; kept for the program to read back
     uint64_t teb = 0, region_base = 0, region_size = 0;      // the thread's TEB and the one region that holds its stack, TEB and TLS block
   };
+  // What the program can set and read back about itself.
+  uint32_t priority_class = 0x20;                     // NORMAL_PRIORITY_CLASS
+  uint32_t error_mode = 0;
+  uint64_t create_time = 0;                           // 100 ns units since 1601 (0: not known)
+  void set_module_host(IModuleHost* host) { module_host_ = host; }
+  IModuleHost* module_host() { return module_host_; }
   void attach_runtime(IProcessRuntime* runtime) { runtime_ = runtime; }
   IProcessRuntime* runtime() { return runtime_; }
   // The thread the process started with.
@@ -196,11 +249,26 @@ class Process {
     uint64_t peb = 0, start_thunk = 0;
     TlsTemplate tls[kMaxTlsModules];      // module index -> its template
     uint32_t tls_count = 0;
+    bool tls_taken[kMaxTlsModules] = {};              // slots in use (the start-up modules' and those of libraries loaded since); a library's slot is free again when it is unloaded
     uint64_t stack_bytes = 1ull << 20;                // the default size of a new thread's stack
   };
   void set_thread_support(const ThreadSupport& support) { thread_support_ = support; }
   const ThreadSupport& thread_support() const { return thread_support_; }
   ThreadRecord* find_thread(uint64_t id);
+  static bool queue_apc(ThreadRecord& t, const ThreadRecord::Apc& apc) {
+    if (t.apc_count >= ThreadRecord::kMaxApcs) return false;
+    t.apcs[t.apc_count++] = apc;
+    return true;
+  }
+  static bool take_apc(ThreadRecord& t, ThreadRecord::Apc* out) {
+    if (t.apc_count == 0) return false;
+    *out = t.apcs[0];
+    for (uint32_t i = 1; i < t.apc_count; ++i) t.apcs[i - 1] = t.apcs[i];
+    --t.apc_count;
+    return true;
+  }
+  ThreadRecord* thread_at(uint32_t index) { return index < kMaxThreads ? &threads_[index] : nullptr; }
+  ThreadSupport& thread_support_mutable() { return thread_support_; }
   ThreadRecord* add_thread(uint64_t id);
   uint32_t live_threads() const;
   uint64_t next_thread_id() { return (uint64_t{++thread_counter_} << 20) | id_; }
@@ -222,6 +290,8 @@ class Process {
   DescriptorKind descriptor(uint64_t slot) const { return files_.kind(slot); }
   // Closes a descriptor; a handle to a synchronization object lets go of the object.
   bool close_descriptor(uint64_t slot);
+  // Lets go of every handle (what a process's end does to its table): the other side of a pipe sees the end, a mutex it owned is free. Only for when no thread of it runs.
+  void release_handles();
 
  private:
   uint64_t id_;
@@ -235,6 +305,7 @@ class Process {
   ThreadSupport thread_support_;
   uint32_t thread_counter_ = 0, thread_exit_code_ = 0;
   bool thread_exit_pending_ = false;
+  IModuleHost* module_host_ = nullptr;
   uint64_t fs_base_ = 0, gs_base_ = 0;
   bool fs_changed_ = false, gs_changed_ = false;
   uint64_t exception_dispatcher_ = 0, context_restore_ = 0;

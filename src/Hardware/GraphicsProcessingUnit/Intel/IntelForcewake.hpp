@@ -34,7 +34,8 @@ class Forcewake {
  public:
   static constexpr uint32_t kAckAttempts = 50000;  // reads of the acknowledge register, about a microsecond each (the driver waits up to 50 ms)
 
-  // Asks for power and waits for the acknowledge. On failure the request is withdrawn again.
+  // Asks for power and waits for the acknowledge. On failure the request is withdrawn again. Calls are counted per well (IRegisterBank::forcewake_state): while
+  // someone else holds the well, acquire returns at once and release does not let go, so independent drivers of one GPU can share its wells.
   static bool acquire(IRegisterBank& registers, ForcewakeDomain domain, uint32_t attempts = kAckAttempts);
   static void release(IRegisterBank& registers, ForcewakeDomain domain);
 

@@ -416,6 +416,7 @@ add_executable(BOOTX64
   src/Hardware/GraphicsProcessingUnit/Intel/IntelForcewake.cpp
   src/Hardware/GraphicsProcessingUnit/Intel/IntelVcsDriver.cpp
   src/Hardware/GraphicsProcessingUnit/Intel/IntelRenderCommands.cpp
+  src/Hardware/GraphicsProcessingUnit/Intel/IntelGen9Setup.cpp
   src/Hardware/GraphicsProcessingUnit/Intel/IntelRenderBatch.cpp
   src/Graphics/Graphics3D/IntelGen9/Gen9GraphicsDevice.cpp
   src/Graphics/Graphics3D/IntelGen9/IntelRenderStack.cpp
@@ -588,6 +589,10 @@ add_executable(BOOTX64
   src/Process/WindowsThreads.cpp
   src/Process/WindowsObjects.cpp
   src/Process/WindowsProcess.cpp
+  src/Process/WindowsSystem.cpp
+  src/Process/WindowsModules.cpp
+  src/Process/WindowsPipes.cpp
+  src/Process/WindowsLocks.cpp
   src/Process/Objects.cpp
   src/Process/ModuleLoader.cpp
   src/Process/LinuxSyscalls.cpp
@@ -754,7 +759,7 @@ if(TCOS_ARCH STREQUAL "x86_64")
   add_custom_command(OUTPUT ${WINDOWS_DIR}/kernel32.dll
     COMMAND ${CMAKE_C_COMPILER} ${WINDOWS_DLL_FLAGS} -Wl,--image-base=0x180200000 -o ${WINDOWS_DIR}/kernel32.dll
             ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.c ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.def ${WINDOWS_DIR}/libntdll.a
-    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.c ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.def ${WINDOWS_DIR}/libntdll.a ${WINDOWS_HEADERS}
+    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.c ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra2.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.def ${WINDOWS_DIR}/libntdll.a ${WINDOWS_HEADERS}
     COMMENT "Building kernel32.dll")
   add_custom_command(OUTPUT ${WINDOWS_DIR}/msvcrt.dll
     COMMAND ${CMAKE_C_COMPILER} ${WINDOWS_DLL_FLAGS} -Wno-unused-value -Wl,--image-base=0x180400000 -o ${WINDOWS_DIR}/msvcrt.dll

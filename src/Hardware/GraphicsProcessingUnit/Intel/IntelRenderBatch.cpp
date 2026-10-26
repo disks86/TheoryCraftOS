@@ -56,6 +56,7 @@ constexpr uint32_t kGouraudKernel[] = {
 };
 
 constexpr uint32_t kSurfaceState2d = 1;
+constexpr uint32_t kMocsPageTable = 1;   // gen9::kMocsPageTable (the tables are programmed by IntelGen9Setup)
 constexpr uint32_t kBlendFactorOne = 0x01, kBlendFactorSrcAlpha = 0x03, kBlendFactorZero = 0x11, kBlendFactorInvSrcAlpha = 0x13;
 constexpr uint32_t kCullNone = 1u << 16, kFrontWindingCcw = 1u << 21;
 constexpr uint32_t kVeValid = 1u << 25;
@@ -122,6 +123,7 @@ uint32_t surface_state(Image& img, const Surface& s) {
   // RENDER_SURFACE_STATE of Gen9 (genxml): type, format, 4x4 alignment, render cache read/write; sizes less one; the mip tail start LOD the hardware wants set; the
   // channels selected as they are; the base address.
   img.state(at, 0, (kSurfaceState2d << 29) | (static_cast<uint32_t>(s.format) << 18) | (1u << 16) | (1u << 14) | (1u << 8));
+  img.state(at, 1, kMocsPageTable << 25);   // memory object control: the table entry that follows the page table entry (the field is the index shifted left by one)
   img.state(at, 2, ((s.height - 1) << 16) | (s.width - 1));
   img.state(at, 3, s.pitch - 1);
   img.state(at, 5, 1u << 8);

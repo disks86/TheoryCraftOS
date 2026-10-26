@@ -29,6 +29,8 @@ namespace hardware {
 struct IntelRenderHardware {
   intel_gt::IRegisterBank* registers = nullptr;
   MmioRegion ggtt_table;
+  uint16_t device_id = 0;
+  uint8_t revision = 0;
 };
 
 // Intel display controller (PCI vendor 0x8086), identified by device ID down to its architecture (UHD 6xx, Iris Xe, Arc,

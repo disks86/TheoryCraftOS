@@ -23,6 +23,25 @@ echo "built $out/tlscbtest.exe (TLS callbacks)"
 $cc -O1 -Wall -Wextra -o "$out/procchild.exe" tests/windows/procchild.c
 $cc -O1 -Wall -Wextra -o "$out/processtest.exe" tests/windows/processtest.c
 echo "built $out/processtest.exe and procchild.exe (CreateProcess; put procchild.exe in System32: -DTCOS_USERMODE_DEMO_FILES=...)"
+$cc -O1 -Wall -Wextra -o "$out/systest.exe" tests/windows/systest.c
+echo "built $out/systest.exe (processors, memory, affinity, priorities, times)"
+$cc -O1 -Wall -Wextra -shared -o "$out/loadme.dll" tests/windows/loadme.c -Wl,--out-implib,"$out/libloadme.a"
+$cc -O1 -Wall -Wextra -shared -o "$out/loaddep.dll" tests/windows/loaddep.c "$out/libloadme.a"
+$cc -O1 -Wall -Wextra -shared -o "$out/failinit.dll" tests/windows/failinit.c
+$cc -O1 -Wall -Wextra -o "$out/loadtest.exe" tests/windows/loadtest.c
+echo "built $out/loadtest.exe (LoadLibrary/FreeLibrary; put loadme.dll loaddep.dll failinit.dll tlsdll.dll in System32: -DTCOS_USERMODE_DEMO_FILES=...)"
+$cc -O1 -Wall -Wextra -o "$out/metatest.exe" tests/windows/metatest.c
+echo "built $out/metatest.exe (file attributes and times)"
+$cc -O1 -Wall -Wextra -o "$out/pipetest.exe" tests/windows/pipetest.c
+echo "built $out/pipetest.exe (pipes, handle inheritance, redirected standard handles; procchild.exe in System32)"
+$cc -O1 -Wall -Wextra -o "$out/apctest.exe" tests/windows/apctest.c
+echo "built $out/apctest.exe (APCs, alertable waits, waitable timers, OpenProcess; procchild.exe in System32)"
+$cc -O1 -Wall -Wextra -o "$out/mmaptest.exe" tests/windows/mmaptest.c
+echo "built $out/mmaptest.exe (file mappings; procchild.exe in System32)"
+$cc -O1 -Wall -Wextra -o "$out/extratest.exe" tests/windows/extratest.c
+echo "built $out/extratest.exe (fibers, thread pool, timer queues, volumes, ini files, small things)"
+$cc -O1 -Wall -Wextra -o "$out/locktest.exe" tests/windows/locktest.c
+echo "built $out/locktest.exe (byte-range locks; procchild.exe in System32)"
 $cc -O0 -Wall -Wextra -o "$out/suspendtest.exe" tests/windows/suspendtest.c
 echo "built $out/suspendtest.exe (SuspendThread, thread contexts, TerminateThread)"
 if command -v clang >/dev/null; then

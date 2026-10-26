@@ -49,6 +49,7 @@ struct Thread {
   bool timed_out = false;   // the last wait ended by timeout
   bool in_sleepers = false;
   int32_t affinity = -1;    // the only core allowed to run it, or -1
+  uint64_t core_mask = ~uint64_t{0};      // the cores (bit n: core n, for the first 64) it may run on
   int8_t preferred_kind = -1;  // CoreKind it likes, or -1
   uint64_t wake_tsc = 0;
   Thread* prev = nullptr;   // run queue / wait list links
@@ -83,6 +84,10 @@ bool running();
 
 // Restricts the thread to one core (-1: any). Takes effect the next time it is scheduled.
 void set_thread_affinity(Thread* thread, int32_t core);
+// Restricts the thread to the cores whose bit is set (cores past the 64th are always allowed). False for a mask that allows no online core. Takes effect when the thread is next
+// scheduled (within a time slice if it runs on a core that is now excluded).
+bool set_thread_core_mask(Thread* thread, uint64_t mask);
+uint64_t online_core_mask();      // bit n: core n is online (the first 64)
 Thread* spawn(ThreadFunction fn, void* argument, const char* name = "thread", int32_t core = -1,
               int8_t preferred_kind = -1, uint32_t stack_bytes = kDefaultStackBytes);
 // Gives up the core until the scheduler picks this thread again.

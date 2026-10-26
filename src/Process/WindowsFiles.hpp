@@ -26,6 +26,9 @@ namespace process::windowsabi {
 // The Nth argument (0-based) of a service: registers up to the fourth, the stack after that. False if the stack cannot be read.
 bool argument(Process& p, const SyscallRequest& r, uint32_t index, uint64_t* out);
 
+// Reads a UNICODE_STRING (Length, MaximumLength, Buffer) from the program into UTF-8. NTSTATUS.
+uint32_t read_unicode_string_argument(Process& p, uint64_t address, String* out);
+
 uint32_t nt_create_file(Process& p, const SyscallRequest& r);
 uint32_t nt_open_file(Process& p, const SyscallRequest& r);
 uint32_t nt_read_file(Process& p, const SyscallRequest& r);
