@@ -44,7 +44,7 @@ class ISystemSync {
   ~ISystemSync() = default;
 };
 
-enum class ObjectKind : uint8_t { None, Event, Mutex, Semaphore, Process, Pipe, Timer, Section };
+enum class ObjectKind : uint8_t { None, Event, Mutex, Semaphore, Process, Pipe, Timer, Section, Job };
 
 class ObjectManager {
  public:
@@ -141,6 +141,27 @@ class ObjectManager {
   bool unlock_range(StringView path, const void* owner, uint64_t offset, uint64_t length);
   void unlock_all(const void* owner);      // the open file is gone
 
+  // --- job objects (kind Job: create() and open() make and find them). A job groups processes: its limits (active process count, kill on close, breakaway) are enforced and
+  // its members can be ended together. A process belongs to at most one job; the processes it starts join the same job. Members are ended by a flag that they see themselves
+  // at their next system call or timer tick (job_kill_for(), which takes no lock). All these take the lock themselves.
+  static constexpr uint32_t kJobMaxMembers = 64, kJobMaxJobs = 32;
+  static constexpr uint32_t kJobLimitActiveProcess = 0x8, kJobLimitAffinity = 0x10, kJobLimitPriorityClass = 0x20, kJobLimitBreakawayOk = 0x800, kJobLimitSilentBreakawayOk = 0x1000,
+                            kJobLimitKillOnClose = 0x2000, kJobLimitAll = 0x3FFFu;
+  struct JobInfo {
+    uint64_t per_process_time = 0, per_job_time = 0, min_working_set = 0, max_working_set = 0, affinity = 0, process_memory_limit = 0, job_memory_limit = 0;
+    uint32_t limit_flags = 0, active_limit = 0, priority_class = 0, scheduling_class = 0, ui_flags = 0;
+    uint32_t total_processes = 0, active_processes = 0, terminated_processes = 0;
+  };
+  uint32_t job_assign(uint32_t job, uint64_t pid);                  // NTSTATUS: 0, access denied (already in a job), quota exceeded
+  uint32_t job_of_process(uint64_t pid);                            // the job object's id, 0 if none
+  // A process starts another: the child joins the parent's job unless it breaks away (`breakaway`: asked to; allowed only if the job says so). NTSTATUS.
+  uint32_t job_inherit(uint64_t parent, uint64_t child, bool breakaway);
+  void job_forget(uint64_t pid);                                    // the process is not a member any more (it ended, or it could not be started)
+  uint32_t job_terminate(uint32_t job, uint32_t code);              // flags every member to end with `code`
+  bool job_info(uint32_t job, JobInfo* out, uint64_t* pids, uint32_t capacity, uint32_t* pid_count);
+  uint32_t job_set(uint32_t job, const JobInfo& in, bool extended);       // NTSTATUS
+  bool job_kill_for(uint64_t pid, uint32_t* code);                  // lock-free: has this process been flagged to end?
+
   // --- timers (kind Timer: create() and open() make and find them; a notification timer stays signalled once it fired, a synchronization timer wakes one waiter)
   struct TimerApc { uint64_t routine = 0, context = 0, time = 0; };
   // Arms the timer: due at `due_ns` on the clock of sync().now_ns() (periodic every `period_ns`, 0: once). With a `routine`, `thread` gets it as an APC each time it fires.
@@ -172,6 +193,7 @@ class ObjectManager {
     int32_t waiters = 0, pulses = 0;       // PulseEvent lets through the threads that are waiting now
     int32_t pipe = -1;                     // pipe: its index in pipes_
     int32_t section = -1;                  // section: its index in sections_
+    int32_t job = -1;                      // job: its index in jobs_
     uint64_t due_ns = 0, period_ns = 0;    // timer: when it fires next, how often
     uint64_t apc_thread = 0, apc_routine = 0, apc_context = 0;      // timer: the APC it queues
     bool armed = false, apc_pending = false;
@@ -186,6 +208,17 @@ class ObjectManager {
   class SectionRef;
   void write_section_locked(Section& s);
   void free_section_locked(Object& o);
+  struct JobMember { uint64_t pid = 0; uint32_t kill = 0, code = 0; };
+  struct Job {
+    bool used = false;
+    uint32_t object = 0;
+    JobInfo info;
+    JobMember members[kJobMaxMembers];
+  };
+  void free_job_locked(Object& o);
+  void job_forget_locked(uint64_t pid);
+  Job* job_of(uint32_t id);      // (locked)
+  void job_flag_all_locked(Job& j, uint32_t code);
   Pipe* pipe_of(uint32_t id);      // (locked)
   void free_pipe_locked(Object& o);
   static constexpr uint32_t kMaxPipes = 128, kMaxSections = 64, kMaxLocks = 256;
@@ -197,6 +230,8 @@ class ObjectManager {
   struct RangeLock;
   RangeLock* locks_ = nullptr;      // kMaxLocks of them, made with the first
   Section* sections_ = nullptr;      // kMaxSections, made with the first section
+  Job* jobs_ = nullptr;              // kJobMaxJobs, made with the first job (never moved: job_kill_for() reads it without the lock)
+  uint32_t pending_kills_ = 0;       // members flagged to end that have not ended yet (atomic)
 };
 
 // The objects of the system (null until whoever runs it has made them: the kernel, at start-up; host tests set their own).

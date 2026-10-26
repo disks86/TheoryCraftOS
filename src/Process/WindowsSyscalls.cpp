@@ -20,6 +20,7 @@
 #include "Process/WindowsObjects.hpp"
 #include "Process/WindowsThreads.hpp"
 #include "Process/WindowsLocks.hpp"
+#include "Process/WindowsJobs.hpp"
 #include "Process/WindowsModules.hpp"
 #include "Process/WindowsPipes.hpp"
 #include "Process/WindowsProcess.hpp"
@@ -319,6 +320,13 @@ class WindowsSyscalls final : public ISyscallInterface {
       case WindowsSyscallNumber::NtFlushVirtualMemory: return windowsabi::nt_flush_virtual_memory(process, r);
       case WindowsSyscallNumber::NtLockFile: return windowsabi::nt_lock_file(process, r);
       case WindowsSyscallNumber::NtUnlockFile: return windowsabi::nt_unlock_file(process, r);
+      case WindowsSyscallNumber::NtCreateJobObject: return windowsabi::nt_create_job_object(process, r);
+      case WindowsSyscallNumber::NtOpenJobObject: return windowsabi::nt_open_job_object(process, r);
+      case WindowsSyscallNumber::NtAssignProcessToJobObject: return windowsabi::nt_assign_process_to_job_object(process, r);
+      case WindowsSyscallNumber::NtTerminateJobObject: return windowsabi::nt_terminate_job_object(process, r);
+      case WindowsSyscallNumber::NtQueryInformationJobObject: return windowsabi::nt_query_information_job_object(process, r);
+      case WindowsSyscallNumber::NtSetInformationJobObject: return windowsabi::nt_set_information_job_object(process, r);
+      case WindowsSyscallNumber::NtIsProcessInJob: return windowsabi::nt_is_process_in_job(process, r);
       case WindowsSyscallNumber::NtCreatePipe: return windowsabi::nt_create_pipe(process, r);
       case WindowsSyscallNumber::NtCreateNamedPipeFile: return windowsabi::nt_create_named_pipe_file(process, r);
       case WindowsSyscallNumber::NtFsControlFile: return windowsabi::nt_fs_control_file(process, r);

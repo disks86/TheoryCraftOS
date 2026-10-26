@@ -84,6 +84,19 @@ ObjectManager::Created ObjectManager::create(ObjectKind kind, StringView name, b
     if (kind == ObjectKind::Event) o.signaled = initial_state;
     if (kind == ObjectKind::Mutex && initial_state) { o.owner = owner; o.recursion = 1; }
     if (kind == ObjectKind::Semaphore) { o.count = initial; o.maximum = maximum; }
+    if (kind == ObjectKind::Job) {
+      if (!jobs_ && allocator_) {
+        void* memory = allocator_->allocate(sizeof(Job) * kJobMaxJobs);
+        if (memory) { Job* made = new (memory) Job[kJobMaxJobs]; __atomic_store_n(&jobs_, made, __ATOMIC_RELEASE); }
+      }
+      int32_t slot = -1;
+      for (uint32_t j = 0; jobs_ && j < kJobMaxJobs && slot < 0; ++j) if (!jobs_[j].used) slot = int32_t(j);
+      if (slot < 0) { o = Object(); result.status = kNoResources; return result; }
+      jobs_[slot] = Job();
+      jobs_[slot].used = true;
+      jobs_[slot].object = i + 1;
+      o.job = slot;
+    }
     result.id = i + 1;
     result.status = kSuccess;
     return result;
@@ -129,6 +142,7 @@ ObjectManager::Created ObjectManager::open_process(uint64_t pid, bool create) {
 
 void ObjectManager::process_exited(uint64_t pid, uint32_t code) {
   Locked hold(sync_);
+  job_forget_locked(pid);
   for (Object& o : objects_) {
     if (o.kind != ObjectKind::Process || o.owner != pid || o.signaled) continue;
     o.signaled = true;
@@ -199,6 +213,7 @@ ObjectManager::~ObjectManager() {
     }
     if (allocator_) allocator_->deallocate(pipes_);      // (Pipe is plain data: nothing to destroy)
   }
+  if (jobs_ && allocator_) allocator_->deallocate(jobs_);
   if (locks_ && allocator_) allocator_->deallocate(locks_);
   if (sections_) {
     for (uint32_t i = 0; i < kMaxSections; ++i) if (sections_[i].storage && allocator_) allocator_->deallocate(sections_[i].storage);
@@ -744,6 +759,7 @@ void ObjectManager::release(uint32_t id) {
     }
     free_pipe_locked(*o);
     free_section_locked(*o);
+    free_job_locked(*o);
     *o = Object();
   }
 }
@@ -844,6 +860,7 @@ bool ObjectManager::ready_locked(uint32_t id, uint64_t waiter) {
     case ObjectKind::Timer: fire_timer_locked(*o, sync_.now_ns()); return o->signaled;
     case ObjectKind::Mutex: return o->owner == 0 || o->owner == waiter;
     case ObjectKind::Semaphore: return o->count > 0;
+    case ObjectKind::Job: return false;      // (it is signalled when a time limit runs out, which is not kept here)
     default: return true;
   }
 }
@@ -878,6 +895,179 @@ void ObjectManager::acquire_locked(uint32_t id, uint64_t waiter, bool* abandoned
 
 void ObjectManager::waiting_locked(uint32_t id, int32_t delta) {
   if (Object* o = at(id)) o->waiters += delta;
+}
+
+
+// ---- job objects
+
+namespace {
+constexpr uint32_t kAccessDenied = 0xC0000022u, kQuotaExceeded = 0xC0000044u;
+}
+
+ObjectManager::Job* ObjectManager::job_of(uint32_t id) {
+  Object* o = at(id);
+  return o && o->kind == ObjectKind::Job && o->job >= 0 && jobs_ ? &jobs_[o->job] : nullptr;
+}
+
+void ObjectManager::job_flag_all_locked(Job& j, uint32_t code) {
+  for (JobMember& m : j.members) {
+    if (m.pid == 0 || m.kill) continue;
+    m.code = code;
+    __atomic_store_n(&m.kill, 1u, __ATOMIC_RELEASE);
+    __atomic_add_fetch(&pending_kills_, 1u, __ATOMIC_ACQ_REL);
+  }
+  sync_.notify_all();
+}
+
+void ObjectManager::free_job_locked(Object& o) {
+  if (o.kind != ObjectKind::Job || o.job < 0 || !jobs_) return;
+  Job& j = jobs_[o.job];
+  if (j.info.limit_flags & kJobLimitKillOnClose) job_flag_all_locked(j, 1);
+  for (JobMember& m : j.members) {      // the members stay members of nothing; those flagged keep their flag (it is found by their process id)
+    if (m.pid == 0) continue;
+    if (m.kill) { /* leave the entry so that the flagged process still finds it, until it ends */ continue; }
+    m.pid = 0;
+  }
+  bool keep = false;
+  for (const JobMember& m : j.members) if (m.pid != 0) keep = true;
+  if (!keep) j.used = false;
+  else j.object = 0;      // (the slot is freed when the last flagged member ends)
+  o.job = -1;
+}
+
+uint32_t ObjectManager::job_assign(uint32_t job, uint64_t pid) {
+  Locked hold(sync_);
+  Job* j = job_of(job);
+  if (!j) return kInvalidHandle;
+  for (uint32_t k = 0; k < kJobMaxJobs; ++k) if (jobs_[k].used) for (const JobMember& m : jobs_[k].members) if (m.pid == pid) return kAccessDenied;
+  if ((j->info.limit_flags & kJobLimitActiveProcess) && j->info.active_processes >= j->info.active_limit) return kQuotaExceeded;
+  for (JobMember& m : j->members) {
+    if (m.pid != 0) continue;
+    m.kill = 0; m.code = 0;
+    __atomic_store_n(&m.pid, pid, __ATOMIC_RELEASE);
+    ++j->info.active_processes;
+    ++j->info.total_processes;
+    return kSuccess;
+  }
+  return kQuotaExceeded;
+}
+
+uint32_t ObjectManager::job_of_process(uint64_t pid) {
+  Locked hold(sync_);
+  if (!jobs_) return 0;
+  for (uint32_t k = 0; k < kJobMaxJobs; ++k) {
+    if (!jobs_[k].used || jobs_[k].object == 0) continue;
+    for (const JobMember& m : jobs_[k].members) if (m.pid == pid) return jobs_[k].object;
+  }
+  return 0;
+}
+
+uint32_t ObjectManager::job_inherit(uint64_t parent, uint64_t child, bool breakaway) {
+  Locked hold(sync_);
+  if (!jobs_) return kSuccess;
+  for (uint32_t k = 0; k < kJobMaxJobs; ++k) {
+    Job& j = jobs_[k];
+    if (!j.used || j.object == 0) continue;
+    for (const JobMember& pm : j.members) {
+      if (pm.pid != parent) continue;
+      if (breakaway) return (j.info.limit_flags & kJobLimitBreakawayOk) ? kSuccess : kAccessDenied;
+      if (j.info.limit_flags & kJobLimitSilentBreakawayOk) return kSuccess;
+      if ((j.info.limit_flags & kJobLimitActiveProcess) && j.info.active_processes >= j.info.active_limit) return kQuotaExceeded;
+      for (JobMember& m : j.members) {
+        if (m.pid != 0) continue;
+        m.kill = 0; m.code = 0;
+        if (pm.kill) { m.code = pm.code; m.kill = 1; __atomic_add_fetch(&pending_kills_, 1u, __ATOMIC_ACQ_REL); }      // (a child of a process being ended is ended too)
+        __atomic_store_n(&m.pid, child, __ATOMIC_RELEASE);
+        ++j.info.active_processes;
+        ++j.info.total_processes;
+        return kSuccess;
+      }
+      return kQuotaExceeded;
+    }
+  }
+  return kSuccess;
+}
+
+void ObjectManager::job_forget_locked(uint64_t pid) {
+  if (!jobs_) return;
+  for (uint32_t k = 0; k < kJobMaxJobs; ++k) {
+    Job& j = jobs_[k];
+    if (!j.used) continue;
+    for (JobMember& m : j.members) {
+      if (m.pid != pid) continue;
+      if (m.kill) {
+        __atomic_sub_fetch(&pending_kills_, 1u, __ATOMIC_ACQ_REL);
+        ++j.info.terminated_processes;
+      }
+      __atomic_store_n(&m.kill, 0u, __ATOMIC_RELEASE);
+      __atomic_store_n(&m.pid, uint64_t{0}, __ATOMIC_RELEASE);
+      if (j.info.active_processes > 0) --j.info.active_processes;
+      if (j.object == 0) {      // the job object is gone; this was one of the members still to end
+        bool any = false;
+        for (const JobMember& other : j.members) if (other.pid != 0) any = true;
+        if (!any) j.used = false;
+      }
+      return;
+    }
+  }
+}
+
+void ObjectManager::job_forget(uint64_t pid) {
+  Locked hold(sync_);
+  job_forget_locked(pid);
+}
+
+uint32_t ObjectManager::job_terminate(uint32_t job, uint32_t code) {
+  Locked hold(sync_);
+  Job* j = job_of(job);
+  if (!j) return kInvalidHandle;
+  job_flag_all_locked(*j, code);
+  return kSuccess;
+}
+
+bool ObjectManager::job_info(uint32_t job, JobInfo* out, uint64_t* pids, uint32_t capacity, uint32_t* pid_count) {
+  Locked hold(sync_);
+  Job* j = job_of(job);
+  if (!j) return false;
+  *out = j->info;
+  uint32_t n = 0;
+  for (const JobMember& m : j->members) if (m.pid != 0) { if (pids && n < capacity) pids[n] = m.pid; ++n; }
+  if (pid_count) *pid_count = n;
+  return true;
+}
+
+uint32_t ObjectManager::job_set(uint32_t job, const JobInfo& in, bool extended) {
+  Locked hold(sync_);
+  Job* j = job_of(job);
+  if (!j) return kInvalidHandle;
+  if (in.limit_flags & ~kJobLimitAll) return kInvalid;
+  if ((in.limit_flags & kJobLimitKillOnClose) && !extended) return kInvalid;      // (only the extended structure can ask for it)
+  if ((in.limit_flags & kJobLimitBreakawayOk) && (in.limit_flags & kJobLimitSilentBreakawayOk)) { /* both are allowed */ }
+  if ((in.limit_flags & kJobLimitActiveProcess) && in.active_limit == 0) return kInvalid;
+  if ((in.limit_flags & kJobLimitAffinity) && in.affinity == 0) return kInvalid;
+  if ((in.limit_flags & kJobLimitPriorityClass) && (in.priority_class < 1 || in.priority_class > 6) && in.priority_class != 0x20 && in.priority_class != 0x40 && in.priority_class != 0x80 && in.priority_class != 0x100 && in.priority_class != 0x4000 && in.priority_class != 0x8000) return kInvalid;
+  JobInfo& d = j->info;
+  d.per_process_time = in.per_process_time; d.per_job_time = in.per_job_time;
+  d.min_working_set = in.min_working_set; d.max_working_set = in.max_working_set;
+  d.affinity = in.affinity; d.priority_class = in.priority_class; d.scheduling_class = in.scheduling_class;
+  d.limit_flags = in.limit_flags; d.active_limit = in.active_limit;
+  if (extended) { d.process_memory_limit = in.process_memory_limit; d.job_memory_limit = in.job_memory_limit; }
+  return kSuccess;
+}
+
+bool ObjectManager::job_kill_for(uint64_t pid, uint32_t* code) {
+  if (__atomic_load_n(&pending_kills_, __ATOMIC_ACQUIRE) == 0) return false;
+  Job* jobs = __atomic_load_n(&jobs_, __ATOMIC_ACQUIRE);
+  if (!jobs) return false;
+  for (uint32_t k = 0; k < kJobMaxJobs; ++k) {
+    for (const JobMember& m : jobs[k].members) {
+      if (__atomic_load_n(&m.pid, __ATOMIC_ACQUIRE) != pid) continue;
+      if (!__atomic_load_n(&m.kill, __ATOMIC_ACQUIRE)) return false;
+      *code = m.code;
+      return true;
+    }
+  }
+  return false;
 }
 
 }  // namespace process

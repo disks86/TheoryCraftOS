@@ -71,6 +71,16 @@ int main(int argc, char **argv) {
     if (LockFileEx(f, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 10, 0, &o) || GetLastError() != ERROR_LOCK_VIOLATION) return 6;      /* exclusive over a shared one */
     return 0;
   }
+  if (!strcmp(what, "grandchild")) {      /* starts a process that spins (the parent's job, if there is one, takes it too, unless asked to break away) and ends */
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    memset(&si, 0, sizeof(si));
+    si.cb = sizeof(si);
+    char command[] = "procchild.exe spin";
+    DWORD flags = argc > 2 && !strcmp(argv[2], "breakaway") ? CREATE_BREAKAWAY_FROM_JOB : 0;
+    if (!CreateProcessA(NULL, command, NULL, NULL, FALSE, flags, NULL, NULL, &si, &pi)) return GetLastError() == ERROR_ACCESS_DENIED ? 20 : GetLastError() == ERROR_NOT_ENOUGH_QUOTA ? 21 : 22;
+    return 0;
+  }
   if (!strcmp(what, "pid")) return (int)(GetCurrentProcessId() & 0x7F);
   if (!strcmp(what, "spin")) { volatile unsigned long n = 0; for (;;) n = n + 1; }
   if (!strcmp(what, "waitevent")) {

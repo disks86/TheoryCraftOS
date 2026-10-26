@@ -34,6 +34,12 @@
 
 using namespace process;
 
+struct TestAllocator final : allocators::IAllocator {
+  void* allocate(uint64_t size) override { return malloc(size); }
+  void* allocate_aligned(uint64_t size, uint64_t align) override { return aligned_alloc(align, (size + align - 1) / align * align); }
+  void deallocate(void* p) override { free(p); }
+};
+
 static std::atomic<int> g_failed{0};
 #define CHECK(...) do { if (!(__VA_ARGS__)) { printf("FAILED line %d: %s\n", __LINE__, #__VA_ARGS__); ++g_failed; } } while (0)
 
@@ -344,7 +350,96 @@ static void test_many_objects() {
   set_system_objects(nullptr);
 }
 
+static void put32(FakeMemory& m, uint64_t at, uint32_t v) { for (int i = 0; i < 4; ++i) m.bytes[at - kBase + i] = uint8_t(v >> (8 * i)); }
+static uint32_t get32(FakeMemory& m, uint64_t at) { uint32_t v = 0; for (int i = 0; i < 4; ++i) v |= uint32_t{m.bytes[at - kBase + i]} << (8 * i); return v; }
+
+static void test_jobs() {
+  TestAllocator allocator;
+  SystemSync sync;
+  ObjectManager objects(sync);
+  objects.set_allocator(&allocator);
+  set_system_objects(&objects);
+  {
+    Prog p(1);
+    const uint64_t buffer = kBase + 0x1400, returned = kBase + 0x1380;
+    const uint64_t self = ~uint64_t{0};
+    CHECK(p.call(WindowsSyscallNumber::NtCreateJobObject, kBase + 0x100, 0x1F001F, p.attributes("Job1")) == 0);
+    const uint64_t job = p.out();
+    CHECK(p.call(WindowsSyscallNumber::NtIsProcessInJob, self, 0) == 0x123);      // in no job yet
+    CHECK(p.call(WindowsSyscallNumber::NtAssignProcessToJobObject, job, self) == 0);
+    CHECK(p.call(WindowsSyscallNumber::NtAssignProcessToJobObject, job, self) == 0xC0000022u);      // a process is in one job only
+    CHECK(p.call(WindowsSyscallNumber::NtIsProcessInJob, self, 0) == 0x124 && p.call(WindowsSyscallNumber::NtIsProcessInJob, self, job) == 0x124);
+    CHECK(p.call(WindowsSyscallNumber::NtAssignProcessToJobObject, 0x7777, self) == 0xC0000008u);
+    // accounting and the list of processes
+    CHECK(p.call(WindowsSyscallNumber::NtQueryInformationJobObject, job, 1, buffer, 48, returned) == 0 && get32(p.memory, returned) == 48);
+    CHECK(get32(p.memory, buffer + 36) == 1 && get32(p.memory, buffer + 40) == 1 && get32(p.memory, buffer + 44) == 0);      // total, active, terminated
+    CHECK(p.call(WindowsSyscallNumber::NtQueryInformationJobObject, job, 3, buffer, 64, returned) == 0 && get32(p.memory, buffer) == 1 && get32(p.memory, buffer + 4) == 1 && p.memory.get64(buffer + 8) == 1);
+    CHECK(p.call(WindowsSyscallNumber::NtQueryInformationJobObject, job, 3, buffer, 8, returned) == 0x80000005u);      // the list does not fit
+    CHECK(p.call(WindowsSyscallNumber::NtQueryInformationJobObject, job, 2, buffer, 10, returned) == 0xC0000004u);
+    CHECK(p.call(WindowsSyscallNumber::NtQueryInformationJobObject, 0, 2, buffer, 64, returned) == 0);      // no handle: the job of this process
+    CHECK(p.call(WindowsSyscallNumber::NtQueryInformationJobObject, job, 7, buffer, 16, returned) == 0xC00000BBu);      // completion ports are not supported
+    CHECK(p.call(WindowsSyscallNumber::NtQueryInformationJobObject, job, 99, buffer, 16, returned) == 0xC0000003u);
+    // limits
+    for (int i = 0; i < 144; ++i) p.memory.bytes[buffer - kBase + i] = 0;
+    put32(p.memory, buffer + 16, 0x8);      // JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+    put32(p.memory, buffer + 40, 1);
+    CHECK(p.call(WindowsSyscallNumber::NtSetInformationJobObject, job, 9, buffer, 144) == 0);
+    CHECK(p.call(WindowsSyscallNumber::NtQueryInformationJobObject, job, 9, buffer + 0x100, 144, returned) == 0 && get32(p.memory, buffer + 0x100 + 16) == 0x8 && get32(p.memory, buffer + 0x100 + 40) == 1);
+    CHECK(p.call(WindowsSyscallNumber::NtSetInformationJobObject, job, 2, buffer, 10) == 0xC0000004u);
+    put32(p.memory, buffer + 16, 0x2000);      // kill on close is only in the extended structure
+    CHECK(p.call(WindowsSyscallNumber::NtSetInformationJobObject, job, 2, buffer, 64) == 0xC000000Du);
+    put32(p.memory, buffer + 16, 0x8);
+    put32(p.memory, buffer + 40, 0);
+    CHECK(p.call(WindowsSyscallNumber::NtSetInformationJobObject, job, 2, buffer, 64) == 0xC000000Du);      // an active process limit of 0
+    // what the manager does with children
+    const uint32_t id = objects.job_of_process(1);
+    CHECK(id != 0 && objects.job_assign(id, 2) == 0xC0000044u);      // the limit is one
+    CHECK(objects.job_inherit(1, 5, false) == 0xC0000044u);
+    put32(p.memory, buffer + 40, 3);
+    CHECK(p.call(WindowsSyscallNumber::NtSetInformationJobObject, job, 2, buffer, 64) == 0);
+    CHECK(objects.job_inherit(1, 5, false) == 0 && objects.job_of_process(5) == id);      // a child joins the job
+    CHECK(objects.job_inherit(1, 6, true) == 0xC0000022u);      // breaking away is not allowed
+    put32(p.memory, buffer + 16, 0x8 | 0x800);      // JOB_OBJECT_LIMIT_BREAKAWAY_OK
+    CHECK(p.call(WindowsSyscallNumber::NtSetInformationJobObject, job, 2, buffer, 64) == 0);
+    CHECK(objects.job_inherit(1, 6, true) == 0 && objects.job_of_process(6) == 0);      // outside the job
+    CHECK(objects.job_inherit(77, 8, false) == 0 && objects.job_of_process(8) == 0);      // a process in no job starts one that is in none
+    // ending the job
+    uint32_t code = 0;
+    CHECK(!objects.job_kill_for(1, &code));
+    CHECK(p.call(WindowsSyscallNumber::NtTerminateJobObject, job, 7) == 0);
+    CHECK(objects.job_kill_for(1, &code) && code == 7 && objects.job_kill_for(5, &code) && code == 7 && !objects.job_kill_for(6, &code));
+    objects.process_exited(5, 7);
+    CHECK(!objects.job_kill_for(5, &code) && objects.job_of_process(5) == 0);
+    CHECK(p.call(WindowsSyscallNumber::NtQueryInformationJobObject, job, 1, buffer, 48, returned) == 0 && get32(p.memory, buffer + 40) == 1 && get32(p.memory, buffer + 44) == 1);
+    objects.process_exited(1, 7);
+    CHECK(!objects.job_kill_for(1, &code));
+    CHECK(p.call(WindowsSyscallNumber::NtQueryInformationJobObject, job, 1, buffer, 48, returned) == 0 && get32(p.memory, buffer + 40) == 0 && get32(p.memory, buffer + 44) == 2 && get32(p.memory, buffer + 36) == 2);
+    // a named job is found again; kill on close
+    CHECK(p.call(WindowsSyscallNumber::NtOpenJobObject, kBase + 0x100, 0x1F001F, p.attributes("job1")) == 0);
+    const uint64_t again = p.out();
+    CHECK(again != job && p.call(WindowsSyscallNumber::NtOpenJobObject, kBase + 0x100, 0x1F001F, p.attributes("nojob")) == 0xC0000034u);
+    CHECK(p.call(WindowsSyscallNumber::NtClose, job) == 0 && p.call(WindowsSyscallNumber::NtClose, again) == 0);
+    CHECK(p.call(WindowsSyscallNumber::NtCreateJobObject, kBase + 0x100, 0x1F001F, 0) == 0);
+    const uint64_t closing = p.out();
+    for (int i = 0; i < 144; ++i) p.memory.bytes[buffer - kBase + i] = 0;
+    put32(p.memory, buffer + 16, 0x2000);
+    CHECK(p.call(WindowsSyscallNumber::NtSetInformationJobObject, closing, 9, buffer, 144) == 0);
+    const uint32_t closing_id = uint32_t(p.process.files().token(closing / 4 - 1));
+    CHECK(objects.job_assign(closing_id, 9) == 0 && objects.job_assign(closing_id, 10) == 0);
+    CHECK(!objects.job_kill_for(9, &code));
+    CHECK(p.call(WindowsSyscallNumber::NtClose, closing) == 0);      // the last handle: the members end
+    CHECK(objects.job_kill_for(9, &code) && code == 1 && objects.job_kill_for(10, &code));
+    objects.process_exited(9, 1);
+    objects.process_exited(10, 1);
+    CHECK(!objects.job_kill_for(9, &code) && objects.job_of_process(9) == 0);
+    // a job, then a new one in its place
+    CHECK(p.call(WindowsSyscallNumber::NtCreateJobObject, kBase + 0x100, 0x1F001F, 0) == 0 && p.call(WindowsSyscallNumber::NtAssignProcessToJobObject, p.out(), self) == 0);
+  }
+  set_system_objects(nullptr);
+}
+
 int main() {
+  test_jobs();
   test_events();
   test_names_between_processes();
   test_blocking_between_processes();

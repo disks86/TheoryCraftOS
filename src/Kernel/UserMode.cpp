@@ -194,7 +194,19 @@ Task* current_task() {
   return u ? u->task : nullptr;
 }
 
-bool kill_pending(const Task* task) { return __atomic_load_n(&task->kill_requested, __ATOMIC_ACQUIRE); }
+// Has the program been asked to end: by request_kill(), or because the job it belongs to was ended (the flag in the job is read without a lock: this runs from the timer tick).
+bool kill_pending(Task* task) {
+  if (__atomic_load_n(&task->kill_requested, __ATOMIC_ACQUIRE)) return true;
+  uint32_t code = 0;
+  process::ObjectManager* objects = process::system_objects();
+  if (objects && objects->job_kill_for(task->program.process()->id(), &code)) {
+    task->kill_code = code;
+    __atomic_store_n(&task->kill_requested, true, __ATOMIC_RELEASE);
+    task->killed = true;
+    return true;
+  }
+  return false;
+}
 
 // The thread was asked to stop (SuspendThread) or to end (TerminateThread by another thread). With the program's lock held and interrupts on: a thread told to end ends (its
 // stack goes, and the process with its last thread); one told to stop keeps its registers, says it is parked, and waits to be resumed (it may find other registers in the
@@ -495,7 +507,7 @@ bool Task::wait(uint64_t timeout_ns) {
 }
 
 bool Task::interrupted() {
-  if (kill_pending(this) || program.process()->exited()) return true;
+  if (kill_pending(this) || program.process()->exited()) return true;      // (also true when the job was ended)
   UserThread* u = current_user_thread();
   return u && __atomic_load_n(&u->terminate_requested, __ATOMIC_ACQUIRE);      // (a thread told to end stops waiting)
 }
@@ -777,7 +789,7 @@ uint32_t Task::spawn_process(const process::ChildSpec& spec) {
     auto count_use = [](process::DescriptorKind kind, uint64_t token) {      // the child's table holds one more use of what the parent's does
       if (process::ObjectManager* objects = process::system_objects()) {
         if (kind == process::DescriptorKind::Pipe) process::windowsabi::pipe_token_add(token);
-        else if (kind == process::DescriptorKind::Event || kind == process::DescriptorKind::Mutex || kind == process::DescriptorKind::Semaphore || kind == process::DescriptorKind::Process || kind == process::DescriptorKind::Timer || kind == process::DescriptorKind::Section) objects->add_ref(uint32_t(token));
+        else if (kind == process::DescriptorKind::Event || kind == process::DescriptorKind::Mutex || kind == process::DescriptorKind::Semaphore || kind == process::DescriptorKind::Process || kind == process::DescriptorKind::Timer || kind == process::DescriptorKind::Section || kind == process::DescriptorKind::Job) objects->add_ref(uint32_t(token));
       }
     };
     p.process()->files().inherit_from(program.process()->files(), count_use);

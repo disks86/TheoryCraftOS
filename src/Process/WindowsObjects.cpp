@@ -31,7 +31,7 @@ constexpr uint64_t kUnixToNt = 11644473600ull * 10000000ull;
 constexpr uint64_t kCurrentProcess = ~uint64_t{0};
 constexpr uint32_t kMaxWait = 64;
 
-bool is_object_kind(DescriptorKind k) { return k == DescriptorKind::Event || k == DescriptorKind::Mutex || k == DescriptorKind::Semaphore || k == DescriptorKind::Process || k == DescriptorKind::Timer || k == DescriptorKind::Section; }
+bool is_object_kind(DescriptorKind k) { return k == DescriptorKind::Event || k == DescriptorKind::Mutex || k == DescriptorKind::Semaphore || k == DescriptorKind::Process || k == DescriptorKind::Timer || k == DescriptorKind::Section || k == DescriptorKind::Job; }
 DescriptorKind descriptor_kind_of(ObjectKind k) {
   switch (k) {
     case ObjectKind::Event: return DescriptorKind::Event;
@@ -39,6 +39,7 @@ DescriptorKind descriptor_kind_of(ObjectKind k) {
     case ObjectKind::Process: return DescriptorKind::Process;
     case ObjectKind::Timer: return DescriptorKind::Timer;
     case ObjectKind::Section: return DescriptorKind::Section;
+    case ObjectKind::Job: return DescriptorKind::Job;
     default: return DescriptorKind::Semaphore;
   }
 }
@@ -534,6 +535,8 @@ uint32_t nt_create_section(Process& p, const SyscallRequest& r) {
   return give_handle(p, *objects, ObjectKind::Section, c.id, r.args[0], c.status, wants_inherit(p, r.args[2]));
 }
 uint32_t nt_open_section(Process& p, const SyscallRequest& r) { return open_object(p, r, ObjectKind::Section); }
+uint32_t nt_create_job_object(Process& p, const SyscallRequest& r) { return create_object(p, r, ObjectKind::Job, false, false, 0, 0); }
+uint32_t nt_open_job_object(Process& p, const SyscallRequest& r) { return open_object(p, r, ObjectKind::Job); }
 
 // NtMapViewOfSection(Section, Process, PVOID* BaseAddress, ULONG_PTR ZeroBits, SIZE_T CommitSize, PLARGE_INTEGER SectionOffset, PSIZE_T ViewSize, SECTION_INHERIT, ULONG AllocationType,
 // ULONG Protect)
@@ -628,6 +631,7 @@ uint32_t nt_query_object(Process& p, const SyscallRequest& r) {
         case DescriptorKind::Semaphore: type = "Semaphore"; break;
         case DescriptorKind::Timer: type = "Timer"; break;
         case DescriptorKind::Section: type = "Section"; break;
+        case DescriptorKind::Job: type = "Job"; break;
         default: break;
       }
       uint32_t n = 0;

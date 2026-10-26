@@ -81,6 +81,13 @@ NT_SERVICE(NtUnmapViewOfSection);
 NT_SERVICE(NtFlushVirtualMemory);
 NT_SERVICE(NtLockFile);
 NT_SERVICE(NtUnlockFile);
+NT_SERVICE(NtCreateJobObject);
+NT_SERVICE(NtOpenJobObject);
+NT_SERVICE(NtAssignProcessToJobObject);
+NT_SERVICE(NtTerminateJobObject);
+NT_SERVICE(NtQueryInformationJobObject);
+NT_SERVICE(NtSetInformationJobObject);
+NT_SERVICE(NtIsProcessInJob);
 NT_SERVICE(NtQuerySystemInformation);
 NT_SERVICE(NtSetInformationThread);
 NT_SERVICE(NtSetInformationProcess);
@@ -263,6 +270,7 @@ EXPORT ULONG NTAPI RtlNtStatusToDosError(NTSTATUS status) {
     case 0xC00000B0u: return 233;                       /* ERROR_PIPE_NOT_CONNECTED */
     case 0xC00000B1u: return 232;                       /* ERROR_NO_DATA (the pipe is being closed) */
     case 0xC00000B5u: return 121;                       /* ERROR_SEM_TIMEOUT */
+    case 0xC0000044u: return 1816;                      /* ERROR_NOT_ENOUGH_QUOTA */
     case 0xC00000BBu: return 50;                        /* ERROR_NOT_SUPPORTED */
     case 0xC00000D9u: return 232;                       /* ERROR_NO_DATA (a non-blocking read finds nothing) */
     case 0xC0000120u: return 1223;                      /* ERROR_CANCELLED */

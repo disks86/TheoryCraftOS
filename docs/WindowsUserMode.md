@@ -115,6 +115,18 @@ renumbers its services in nearly every build, which is why programs call ntdll);
 | `NtReleaseModule` | 52 |
 | `NtUnloadModule` | 51 |
 
+## Job objects
+
+| Service | Number |
+| --- | --- |
+| `NtCreateJobObject` | 77 |
+| `NtOpenJobObject` | 78 |
+| `NtAssignProcessToJobObject` | 79 |
+| `NtTerminateJobObject` | 80 |
+| `NtQueryInformationJobObject` | 81 |
+| `NtSetInformationJobObject` | 82 |
+| `NtIsProcessInJob` | 83 |
+
 ## Exceptions and the machine
 
 | Service | Number |
@@ -150,6 +162,12 @@ renumbers its services in nearly every build, which is why programs call ntdll);
   `GetNumberOfConsoleInputEvents`, `WriteConsoleInput`, waiting on the input handle) are made from the typed text, a key down and a key up per character; no mouse, focus or resize events.
   `NtQueryInformationFile` class 24 on the console input says how many bytes could be read without waiting. `GenerateConsoleCtrlEvent` runs the program's own control handlers;
   Ctrl+C typed at the terminal still ends the program without running them.
-- **Not provided**: job objects, debugging APIs, memory of
+- **Job objects** (`CreateJobObject`, `OpenJobObject`, `AssignProcessToJobObject`, `TerminateJobObject`, `IsProcessInJob`, `QueryInformationJobObject`,
+  `SetInformationJobObject`; services 77–83): a process is in one job; the processes it starts join it (not with `CREATE_BREAKAWAY_FROM_JOB`, which needs
+  `JOB_OBJECT_LIMIT_BREAKAWAY_OK`; `SILENT_BREAKAWAY_OK` lets children start outside). Enforced: the active process limit (`ERROR_NOT_ENOUGH_QUOTA`, also for a child), kill on
+  close and `TerminateJobObject` (members see a flag at their next system call or timer tick, so a member blocked reading the console ends when the read returns).
+  Kept and read back but not enforced: CPU time, working set, memory, affinity, priority and UI limits. Accounting has the process counts only (CPU times are 0). Completion
+  port notifications (class 7) are refused with `ERROR_NOT_SUPPORTED`; there are no nested jobs.
+- **Not provided**: debugging APIs, memory of
   other processes, remote threads, Toolhelp lists of threads, modules and heaps, mailslots, change notifications, hard and symbolic links, and the many exports of the real kernel32 and msvcrt that no program here has needed.
   A call to an import that nothing provides stops the program with a message saying which one.
