@@ -22,6 +22,18 @@
 namespace dom {
 
 namespace {
+// Is the element editable through contenteditable (its own attribute, or the nearest ancestor that has one)?
+bool editing_host(const Node* node) {
+  for (const Node* e = node; e && e->is_element(); e = e->parent) {
+    StringView v;
+    if (!get_attribute(e, "contenteditable", &v)) continue;
+    return v.empty() || v.equals_ignore_case("true") || v.equals_ignore_case("plaintext-only");
+  }
+  return false;
+}
+}  // namespace
+
+namespace {
 
 char lower(char c) { return c >= 'A' && c <= 'Z' ? static_cast<char>(c + 32) : c; }
 bool is_space(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f'; }
@@ -385,7 +397,13 @@ class SelectorSet::Reader {
     skip_space();
     String s(set_.alloc_);
     while (!end() && cur() != ')') {
-      if (!is_space(cur())) s.push_back(lower(cur()));
+      if (is_space(cur())) {   // "of S" ends the An+B
+        uint64_t k = pos_;
+        while (k < text_.size() && is_space(text_[k])) ++k;
+        if (k + 2 < text_.size() && lower(text_[k]) == 'o' && lower(text_[k + 1]) == 'f' && is_space(text_[k + 2])) break;
+      } else {
+        s.push_back(lower(cur()));
+      }
       ++pos_;
     }
     if (s.view().equals("odd")) {
@@ -474,6 +492,21 @@ class SelectorSet::Reader {
         t->of_type = n.equals("nth-of-type") || n.equals("nth-last-of-type");
         if (!nth(&t->a, &t->b)) return false;
         skip_space();
+        if (cur() != ')' && !t->of_type) {   // :nth-child(2n+1 of S): counted among the siblings that match S
+          if (!ident() || !scratch_.view().equals_ignore_case("of")) return false;
+          skip_space();
+          uint32_t first, count;
+          if (!list(true, false, true, &first, &count)) return false;
+          skip_space();
+          t->first_ref = first;
+          t->ref_count = count;
+          uint32_t best = 0;
+          for (uint32_t i = 0; i < count; ++i) {
+            const uint32_t sp = set_.selectors_[set_.refs_[first + i]].specificity;
+            if (sp > best) best = sp;
+          }
+          *specificity += best;
+        }
         if (cur() != ')') return false;
         ++pos_;
         return true;
@@ -533,7 +566,19 @@ class SelectorSet::Reader {
         t->value_length = static_cast<uint32_t>(ranges.size());
         return true;
       }
-      // :dir(), :state(), :host-context() and the other functional states that need a page's own state: never match
+      if (n.equals("dir")) {   // :dir(ltr) and :dir(rtl)
+        skip_space();
+        if (!ident()) return false;
+        const bool rtl = scratch_.view().equals_ignore_case("rtl");
+        if (!rtl && !scratch_.view().equals_ignore_case("ltr")) return false;
+        skip_space();
+        if (cur() != ')') return false;
+        ++pos_;
+        t->kind = TestKind::Dir;
+        t->a = rtl ? 1 : 0;
+        return true;
+      }
+      // :state(), :host-context() and the other functional states that need a page's own state: never match
       if (!(n.equals("dir") || n.equals("state") || n.equals("host-context") || n.equals("current") || n.equals("past") || n.equals("future") || n.equals("nth-col") || n.equals("nth-last-col"))) unknown_pseudo_ = true;
       skip_parens_body();
       *applies = false;
@@ -750,12 +795,17 @@ bool SelectorSet::match_test(const Test& t, const Node* node, const Node* scope)
     }
     case TestKind::Nth: {
       int64_t position = 1;
+      if (t.ref_count > 0 && !match_inner(t, node, scope)) return false;   // (of S: the element must match S itself)
+      auto counts = [&](const Node* p) {
+        if (t.ref_count > 0) return match_inner(t, p, scope);
+        return !t.of_type || p->name.view().equals(node->name.view());
+      };
       if (t.from_end) {
         for (const Node* p = next_element_sibling(node); p; p = next_element_sibling(p))
-          if (!t.of_type || p->name.view().equals(node->name.view())) ++position;
+          if (counts(p)) ++position;
       } else {
         for (const Node* p = previous_element_sibling(node); p; p = previous_element_sibling(p))
-          if (!t.of_type || p->name.view().equals(node->name.view())) ++position;
+          if (counts(p)) ++position;
       }
       if (t.a == 0) return position == t.b;
       const int64_t d = position - t.b;
@@ -787,9 +837,19 @@ bool SelectorSet::match_test(const Test& t, const Node* node, const Node* scope)
     case TestKind::Always: return true;
     case TestKind::Required: return is_submittable(node) && has_attribute(node, "required");
     case TestKind::Optional: return is_submittable(node) && !has_attribute(node, "required");
-    case TestKind::ReadOnly: return !((node->is_tag("textarea") || node->is_tag("input")) && is_text_field(node->is_tag("input") ? input_type(node) : InputType::Text) &&
+    case TestKind::Dir: {   // the dir attribute of the element or the nearest ancestor that has one (auto and nothing: left to right)
+      bool rtl = false;
+      for (const Node* e = node; e && e->is_element(); e = e->parent) {
+        StringView d;
+        if (!get_attribute(e, "dir", &d)) continue;
+        if (d.equals_ignore_case("rtl")) { rtl = true; break; }
+        if (d.equals_ignore_case("ltr")) break;
+      }
+      return rtl == (t.a == 1);
+    }
+    case TestKind::ReadOnly: return !(editing_host(node) || (node->is_tag("textarea") || node->is_tag("input")) && is_text_field(node->is_tag("input") ? input_type(node) : InputType::Text) &&
                                      !is_read_only(node) && !is_disabled(node));
-    case TestKind::ReadWrite: return (node->is_tag("textarea") || node->is_tag("input")) && is_text_field(node->is_tag("input") ? input_type(node) : InputType::Text) && !is_read_only(node) && !is_disabled(node);
+    case TestKind::ReadWrite: return editing_host(node) || (node->is_tag("textarea") || node->is_tag("input")) && is_text_field(node->is_tag("input") ? input_type(node) : InputType::Text) && !is_read_only(node) && !is_disabled(node);
     case TestKind::Valid: return will_validate(node) && validity(node) == 0;
     case TestKind::Invalid: return will_validate(node) && validity(node) != 0;
     case TestKind::PlaceholderShown: {
