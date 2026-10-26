@@ -222,6 +222,10 @@ static void test_objects() {
   CHECK(is("var o = { a: { b: null } }; o?.a?.b?.c", "undefined"));
   CHECK(is("var o = null; o?.x", "undefined"));
   CHECK(is("var o = { f() { return 1; } }; o.g?.()", "undefined"));
+  CHECK(is("var o = null; o?.f(1)", "undefined"));
+  CHECK(is("var o = { f(x) { return x + 1; } }; o?.f(1)", "2"));
+  CHECK(is("var o = null; o?.[\"f\"](1)", "undefined"));
+  CHECK(is("var o = { n: 3, f() { return this.n; } }; o?.f?.()", "3"));
   CHECK(is("var o = { a: 1 }; o.a += 5; o.a", "6"));
   CHECK(is("var o = { n: 1 }; o.n++; ++o.n; o.n", "3"));
   CHECK(is("var a = [1]; a[0] += 2; a[0]++; a[0]", "4"));

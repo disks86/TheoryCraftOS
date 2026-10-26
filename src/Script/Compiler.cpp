@@ -1073,6 +1073,7 @@ class Compiler {
   void call(Node* n, bool is_new) {
     Node* callee = n->a;
     const bool optional_call = !is_new && (n->flags & kFlagOptional);
+    uint32_t guard_skip = kNoJump;
     if (is_new) {
       expression(callee);
       emit(Opc::PushUndef);
@@ -1081,13 +1082,13 @@ class Compiler {
       emit(Opc::PushThis);
     } else if (callee->kind == NodeKind::Member) {
       expression(callee->a);
-      if (callee->flags & kFlagOptional) {
-        fail("Optional chaining before a call is not supported", n->line);
-        return;
+      if (callee->flags & kFlagOptional) {   // `a?.b(...)`: a nullish `a` skips the whole call
+        guard_skip = optional_call_guard();
       }
       emit(Opc::GetMethod, static_cast<int32_t>(constant_string(callee->text)), 0, n->line);
     } else if (callee->kind == NodeKind::Index) {
       expression(callee->a);
+      if (callee->flags & kFlagOptional) guard_skip = optional_call_guard();
       expression(callee->b);
       emit(Opc::GetMethodElem, 0, 0, n->line);
     } else {
@@ -1115,6 +1116,23 @@ class Compiler {
       emit(Opc::PushUndef);
       patch(to_end);
     }
+    if (guard_skip != kNoJump) {   // the object was nullish: [obj] -> [undefined]
+      const uint32_t to_end = emit(Opc::Jump);
+      patch(guard_skip);
+      emit(Opc::Pop);
+      emit(Opc::PushUndef);
+      patch(to_end);
+    }
+  }
+
+  static constexpr uint32_t kNoJump = 0xFFFFFFFFu;
+
+  // With the object on the stack, jumps (to be patched) when it is nullish; the object stays on the stack.
+  uint32_t optional_call_guard() {
+    emit(Opc::Dup);
+    emit(Opc::PushNull);
+    emit(Opc::Ne);
+    return emit(Opc::JumpIfFalse);
   }
 
   Vm& vm_;
