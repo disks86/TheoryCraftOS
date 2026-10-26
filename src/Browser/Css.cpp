@@ -6349,6 +6349,15 @@ bool StyleSheet::keyframe_declaration(uint32_t rule, uint32_t index, uint32_t k,
   return false;
 }
 
+bool StyleSheet::uses_motion() const {
+  if (keyframes_.count() > 0) return true;
+  for (uint64_t i = 0; i < declarations_.count(); ++i) {
+    const uint16_t p = declarations_[i].property;
+    if (p == pTransition || p == pAnimation || (p >= pTransitionProperty && p <= pTransitionBehavior) || (p >= pAnimationName && p <= pAnimationPlayState)) return true;
+  }
+  return false;
+}
+
 void StyleSheet::apply_keyframe(uint32_t rule, uint32_t index, const Style& parent, Style* style) const {
   if (rule >= keyframes_.count() || index >= keyframes_[rule].stop_count) return;
   const KeyframeStop& stop = stops_[keyframes_[rule].first_stop + index];

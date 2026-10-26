@@ -3549,6 +3549,10 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
         seen.push(v);
         return { $: 'p', i: v.__id };
       }
+      if (v.__wasm_kind !== undefined) {
+        if (v.__wasm_kind === 'module' && typeof __wasm_module_bytes === 'function') { seen.push(v); return { $: 'wm', b: btoa(__bytes_to_string(__wasm_module_bytes(v))) }; }
+        throw dataCloneError('#<' + (v.constructor && v.constructor.name ? v.constructor.name : 'Object') + '> could not be cloned.');
+      }
       if (v instanceof Node || v === g || v instanceof Event || v instanceof Headers || v instanceof Request || v instanceof Response || v instanceof XMLHttpRequest ||
           v instanceof AbortSignal || v instanceof URL || v instanceof URLSearchParams) throw dataCloneError('#<' + (v.constructor && v.constructor.name ? v.constructor.name : 'Object') + '> could not be cloned.');
       seen.push(v);
@@ -3599,6 +3603,7 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
         case 'b': out = new Blob([atob(e.b)], { type: e.t }); objs.push(out); return out;
         case 'f': out = new File([atob(e.b)], e.n, { type: e.t, lastModified: e.m }); objs.push(out); return out;
         case 'u8': out = __string_to_bytes(atob(e.b)); objs.push(out); return out;
+        case 'wm': out = new g.WebAssembly.Module(__string_to_bytes(atob(e.b))); objs.push(out); return out;
         case 'ab': out = __string_to_bytes(atob(e.b)).buffer; objs.push(out); return out;
         case 'ta': out = new g[e.k](__string_to_bytes(atob(e.b)).buffer); objs.push(out); return out;
         case 'dv': out = new DataView(__string_to_bytes(atob(e.b)).buffer); objs.push(out); return out;
@@ -5317,14 +5322,6 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     hide(g, 'crypto', Object.create(Crypto.prototype));
   }
   var resolved = function (v) { return Promise.resolve(v); };
-  method(EP, 'animate', function (keyframes, options) {
-    var anim = { currentTime: 0, playState: 'finished', pending: false, finished: resolved(null), ready: resolved(null), onfinish: null, oncancel: null,
-                 play: function () {}, pause: function () {}, cancel: function () { if (typeof anim.oncancel === 'function') anim.oncancel(); }, finish: function () {}, reverse: function () {},
-                 addEventListener: function () {}, removeEventListener: function () {} };
-    setTimeout(function () { if (typeof anim.onfinish === 'function') anim.onfinish({ type: 'finish', target: anim }); }, 0);
-    return anim;
-  });
-  method(EP, 'getAnimations', function () { return []; });
   method(EP, 'setPointerCapture', function () {});
   method(EP, 'releasePointerCapture', function () {});
   method(EP, 'hasPointerCapture', function () { return false; });
@@ -5456,12 +5453,248 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     var done = Promise.resolve().then(function () { return typeof callback === 'function' ? callback() : undefined; });
     return { ready: done, finished: done, updateCallbackDone: done, skipTransition: function () {} };
   });
-  if (doc.fonts === undefined) {
-    hide(doc, 'fonts', { ready: resolved(null), status: 'loaded', size: 0, check: function () { return true; }, load: function () { return resolved([]); },
-                         add: function () {}, delete: function () { return false; }, clear: function () {}, forEach: function () {}, has: function () { return false; },
-                         addEventListener: function () {}, removeEventListener: function () {} });
+  // --- CSS Font Loading: FontFace, FontFaceSet (document.fonts), FontFaceSetLoadEvent. Loading checks that the data is there and looks like a font; the renderer reads @font-face itself.
+  var ffDom = function (message, name) { return new DOMException(message, name); };
+  var FF_DESCRIPTORS = ['style', 'weight', 'stretch', 'unicodeRange', 'variant', 'featureSettings', 'variationSettings', 'display', 'ascentOverride', 'descentOverride', 'lineGapOverride'];
+  var FF_DEFAULTS = { style: 'normal', weight: 'normal', stretch: 'normal', unicodeRange: 'U+0-10FFFF', variant: 'normal', featureSettings: 'normal', variationSettings: 'normal', display: 'auto', ascentOverride: 'normal', descentOverride: 'normal', lineGapOverride: 'normal' };
+  var FF_CSSNAME = { style: 'font-style', weight: 'font-weight', stretch: 'font-stretch', unicodeRange: 'unicode-range', variant: 'font-variant', featureSettings: 'font-feature-settings', variationSettings: 'font-variation-settings', display: 'font-display', ascentOverride: 'ascent-override', descentOverride: 'descent-override', lineGapOverride: 'line-gap-override' };
+  var ffNumber = '[-+]?(?:\\d+\\.?\\d*|\\.\\d+)';
+  var FF_VALID = {
+    style: new RegExp('^(?:normal|italic|oblique(?:\\s+' + ffNumber + 'deg(?:\\s+' + ffNumber + 'deg)?)?)$'),
+    weight: new RegExp('^(?:auto|normal|bold|(?:' + ffNumber + ')(?:\\s+' + ffNumber + ')?)$'),
+    stretch: new RegExp('^(?:auto|normal|(?:ultra|extra|semi)-(?:condensed|expanded)|condensed|expanded|' + ffNumber + '%(?:\\s+' + ffNumber + '%)?)$'),
+    unicodeRange: /^U\+(?:[0-9a-f]{1,6}(?:-[0-9a-f]{1,6})?|[0-9a-f?]{1,6})(?:\s*,\s*U\+(?:[0-9a-f]{1,6}(?:-[0-9a-f]{1,6})?|[0-9a-f?]{1,6}))*$/i,
+    variant: /^[a-z0-9\-\s(),"']+$/i, featureSettings: /^(?:normal|"[^"]{4}"(?:\s+(?:on|off|\d+))?(?:\s*,\s*"[^"]{4}"(?:\s+(?:on|off|\d+))?)*)$/,
+    variationSettings: /^(?:normal|"[^"]{4}"\s+[-+]?[\d.]+(?:\s*,\s*"[^"]{4}"\s+[-+]?[\d.]+)*)$/, display: /^(?:auto|block|swap|fallback|optional)$/,
+    ascentOverride: new RegExp('^(?:normal|' + ffNumber + '%)$'), descentOverride: new RegExp('^(?:normal|' + ffNumber + '%)$'), lineGapOverride: new RegExp('^(?:normal|' + ffNumber + '%)$')
+  };
+  var ffRanges = function (text) {
+    var out = [];
+    String(text).split(',').forEach(function (part) {
+      var m = /^U\+([0-9a-f?]+)(?:-([0-9a-f]+))?$/i.exec(part.trim()); if (!m) return;
+      if (m[1].indexOf('?') >= 0) out.push([parseInt(m[1].replace(/\?/g, '0'), 16), parseInt(m[1].replace(/\?/g, 'f'), 16)]);
+      else out.push([parseInt(m[1], 16), m[2] ? parseInt(m[2], 16) : parseInt(m[1], 16)]);
+    });
+    return out;
+  };
+  var ffCovers = function (face, text) {
+    var ranges = ffRanges(face.unicodeRange);
+    for (var ch of String(text)) { var cp = ch.codePointAt(0), hit = false; for (var i = 0; i < ranges.length; i++) if (cp >= ranges[i][0] && cp <= ranges[i][1]) { hit = true; break; } if (!hit) return false; }
+    return true;
+  };
+  var ffSetDescriptor = function (face, name, value) {
+    var v = String(value).trim();
+    if (!FF_VALID[name].test(v)) throw ffDom("Failed to set '" + name + "' on 'FontFace': '" + v + "' is not a valid value.", 'SyntaxError');
+    face.__d[name] = v;
+  };
+  var ffSplitSources = function (text) {
+    var out = [], depth = 0, quote = '', cur = '';
+    for (var i = 0; i < text.length; i++) {
+      var c = text[i];
+      if (quote) { if (c === quote) quote = ''; cur += c; continue; }
+      if (c === '"' || c === "'") quote = c; else if (c === '(') depth++; else if (c === ')') depth--;
+      if (c === ',' && depth === 0) { out.push(cur.trim()); cur = ''; } else cur += c;
+    }
+    out.push(cur.trim()); return out;
+  };
+  var ffParseSource = function (text) {
+    var parts = ffSplitSources(String(text)), out = [];
+    for (var i = 0; i < parts.length; i++) {
+      var m = /^(url|local)\(\s*(?:"([^"]*)"|'([^']*)'|([^)\s]*))\s*\)(?:\s+format\(\s*(?:"[^"]*"|'[^']*'|[^)]*)\))?(?:\s+tech\([^)]*\))?$/i.exec(parts[i]);
+      if (!m) return null;
+      out.push({ kind: m[1].toLowerCase(), value: m[2] !== undefined ? m[2] : m[3] !== undefined ? m[3] : m[4] });
+    }
+    return out;
+  };
+  var ffLooksLikeFont = function (bytes) {
+    if (bytes.length < 4) return false;
+    var tag = String.fromCharCode(bytes[0], bytes[1], bytes[2], bytes[3]);
+    return tag === 'OTTO' || tag === 'true' || tag === 'wOFF' || tag === 'wOF2' || tag === 'ttcf' || tag === 'typ1' || (bytes[0] === 0 && bytes[1] === 1 && bytes[2] === 0 && bytes[3] === 0);
+  };
+  var ffInit = function (face, family, source, descriptors) {
+    var d = {}; FF_DESCRIPTORS.forEach(function (n) { d[n] = FF_DEFAULTS[n]; });
+    hide(face, '__d', d); hide(face, '__family', String(family)); hide(face, '__status', 'unloaded'); hide(face, '__sets', []); hide(face, '__src', null); hide(face, '__bytes', null); hide(face, '__error', null);
+    var resolve, reject, p = new Promise(function (a, b) { resolve = a; reject = b; }); p.catch(function () {});
+    hide(face, '__loaded', p); hide(face, '__resolve', resolve); hide(face, '__reject', reject);
+    var failure = null;
+    if (!/^\s*(?:"[^"]*"|'[^']*'|[^\s"']+(?:\s+[^\s"']+)*)\s*$/.test(String(family))) failure = 'The family name is not valid.';
+    if (!failure) {
+      try { Object.keys(descriptors || {}).forEach(function (n) { if (FF_DESCRIPTORS.indexOf(n) >= 0) ffSetDescriptor(face, n, descriptors[n]); }); } catch (e) { failure = e.message; }
+    }
+    if (!failure) {
+      if (typeof source === 'string') { var list = ffParseSource(source); if (!list) failure = 'The source is not valid.'; else face.__src = list; }
+      else if (source instanceof ArrayBuffer) face.__bytes = new Uint8Array(source.slice(0));
+      else if (ArrayBuffer.isView(source)) face.__bytes = new Uint8Array(source.buffer.slice(source.byteOffset, source.byteOffset + source.byteLength));
+      else failure = 'The source is not valid.';
+    }
+    if (failure) ffFail(face, ffDom(failure, 'SyntaxError'), true);
+    else if (face.__bytes) { ffBegin(face); Promise.resolve().then(function () { if (ffLooksLikeFont(face.__bytes)) ffSucceed(face); else ffFail(face, ffDom('The font data could not be decoded.', 'SyntaxError')); }); }
+  };
+  var ffNotify = function (face, from, to) { face.__sets.slice().forEach(function (s) { ffSetChanged(s, face, from, to); }); };
+  var ffBegin = function (face) { var was = face.__status; face.__status = 'loading'; ffNotify(face, was, 'loading'); };
+  var ffSucceed = function (face) { var was = face.__status; face.__status = 'loaded'; face.__resolve(face); ffNotify(face, was, 'loaded'); };
+  var ffFail = function (face, error, quiet) { var was = face.__status; face.__status = 'error'; face.__error = error; face.__reject(error); if (!quiet) ffNotify(face, was, 'error'); };
+  function FontFace(family, source, descriptors) {
+    if (!(this instanceof FontFace)) throw new TypeError("Failed to construct 'FontFace': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+    if (arguments.length < 2) throw new TypeError("Failed to construct 'FontFace': 2 arguments required, but only " + arguments.length + ' present.');
+    ffInit(this, family, source, descriptors);
   }
-  if (doc.timeline === undefined) hide(doc, 'timeline', { currentTime: 0 });
+  Object.defineProperty(FontFace.prototype, 'family', { get: function () { return this.__family; }, set: function (v) { this.__family = String(v); }, enumerable: true, configurable: true });
+  FF_DESCRIPTORS.forEach(function (n) {
+    Object.defineProperty(FontFace.prototype, n, { get: function () { return this.__d[n]; }, set: function (v) { ffSetDescriptor(this, n, v); }, enumerable: true, configurable: true });
+  });
+  Object.defineProperty(FontFace.prototype, 'status', { get: function () { return this.__status; }, enumerable: true, configurable: true });
+  Object.defineProperty(FontFace.prototype, 'loaded', { get: function () { return this.__loaded; }, enumerable: true, configurable: true });
+  method(FontFace.prototype, 'load', function () {
+    var face = this;
+    if (face.__status === 'unloaded') {
+      ffBegin(face);
+      var sources = (face.__src || []).filter(function (s) { return s.kind === 'url' || s.kind === 'local'; }), index = 0;
+      var attempt = function () {
+        if (index >= sources.length) { ffFail(face, ffDom('A network error occurred.', 'NetworkError')); return; }
+        var s = sources[index++];
+        if (s.kind === 'local') { ffSucceed(face); return; }
+        if (typeof g.fetch !== 'function') { attempt(); return; }
+        g.fetch(new URL(s.value, document.baseURI).href).then(function (r) { if (!r.ok) throw 0; return r.arrayBuffer(); }).then(function (buf) {
+          var bytes = new Uint8Array(buf);
+          if (!ffLooksLikeFont(bytes)) { ffFail(face, ffDom('The font data could not be decoded.', 'SyntaxError')); return; }
+          face.__bytes = bytes; ffSucceed(face);
+        }, function () { attempt(); });
+      };
+      Promise.resolve().then(attempt);
+    }
+    return face.__loaded;
+  });
+  Object.defineProperty(FontFace.prototype, Symbol.toStringTag, { value: 'FontFace', configurable: true });
+
+  function FontFaceSetLoadEvent(type, init) {
+    if (arguments.length < 1) throw new TypeError("Failed to construct 'FontFaceSetLoadEvent': 1 argument required, but only 0 present.");
+    var event = new Event(type, init);
+    Object.setPrototypeOf(event, FontFaceSetLoadEvent.prototype);
+    var faces = init && init.fontfaces !== undefined ? Array.prototype.slice.call(init.fontfaces) : [];
+    Object.defineProperty(event, 'fontfaces', { value: Object.freeze(faces), enumerable: true });
+    return event;
+  }
+  FontFaceSetLoadEvent.prototype = Object.create(Event.prototype);
+  method(FontFaceSetLoadEvent.prototype, 'constructor', FontFaceSetLoadEvent);
+
+  // The CSS font shorthand, reduced to what matching needs: the families and the text of the rest.
+  var ffParseFont = function (text, what) {
+    var bad = function () { return ffDom("Failed to execute '" + what + "' on 'FontFaceSet': Could not resolve '" + text + "' as a font.", 'SyntaxError'); };
+    var s = String(text).trim(); if (s === '') throw bad();
+    var m = /^((?:(?:normal|italic|oblique|small-caps|bold|bolder|lighter|\d+|(?:ultra|extra|semi)-(?:condensed|expanded)|condensed|expanded)\s+)*)((?:\d*\.?\d+(?:px|pt|em|rem|%|ex|ch|cm|mm|in|pc|vw|vh)|xx-small|x-small|small|medium|large|x-large|xx-large|smaller|larger))(?:\s*\/\s*[^\s,]+)?\s+(.+)$/i.exec(s);
+    if (!m) throw bad();
+    var families = ffSplitSources(m[3]).map(function (f) { var q = /^(["'])(.*)\1$/.exec(f); return q ? q[2] : f; });
+    if (families.some(function (f) { return f === ''; })) throw bad();
+    return { families: families.map(function (f) { return f.toLowerCase(); }), prefix: m[1] };
+  };
+  function FontFaceSet() { throw new TypeError('Illegal constructor'); }
+  FontFaceSet.prototype = Object.create(EventTarget.prototype);
+  method(FontFaceSet.prototype, 'constructor', FontFaceSet);
+  var ffNewSet = function () {
+    var set = Object.create(FontFaceSet.prototype);
+    hide(set, '__faces', []); hide(set, '__css', new Map()); hide(set, '__status', 'loaded'); hide(set, '__pending', []); hide(set, '__errors', []); hide(set, '__done', []);
+    hide(set, '__ready', Promise.resolve(set)); hide(set, '__readyResolve', null);
+    return set;
+  };
+  var ffCssFaces = function (set) {
+    var out = [], seen = new Set();
+    try {
+      var sheets = document.styleSheets;
+      var walk = function (rules, depth) {
+        if (!rules || depth > 4) return;
+        for (var i = 0; i < rules.length; i++) {
+          var r = rules[i];
+          if (r.type === 5) {
+            seen.add(r);
+            var face = set.__css.get(r);
+            if (!face) {
+              var st = r.style, family = st.getPropertyValue('font-family').replace(/^["']|["']$/g, ''), src = st.getPropertyValue('src'), desc = {};
+              FF_DESCRIPTORS.forEach(function (n) { var v = st.getPropertyValue(FF_CSSNAME[n]); if (v) desc[n] = v; });
+              face = new FontFace(family, src || 'local("")', desc); face.__sets.push(set); set.__css.set(r, face);
+            }
+            out.push(face);
+          } else if (r.cssRules && r.type !== 7) walk(r.cssRules, depth + 1);
+        }
+      };
+      for (var i = 0; i < sheets.length; i++) { try { walk(sheets[i].cssRules, 0); } catch (e) { } }
+    } catch (e) { }
+    set.__css.forEach(function (f, r) { if (!seen.has(r)) set.__css.delete(r); });
+    return out;
+  };
+  var ffAll = function (set) { return ffCssFaces(set).concat(set.__faces); };
+  var ffFire = function (set, type, faces) { set.dispatchEvent(new FontFaceSetLoadEvent(type, { fontfaces: faces })); };
+  var ffSetChanged = function (set, face, from, to) {
+    if (to === 'loading') {
+      if (set.__pending.indexOf(face) < 0) set.__pending.push(face);
+      if (set.__status !== 'loading') {
+        set.__status = 'loading'; set.__errors = []; set.__done = [];
+        set.__ready = new Promise(function (r) { set.__readyResolve = r; });
+        ffFire(set, 'loading', []);
+      }
+    } else if (to === 'loaded' || to === 'error') {
+      var i = set.__pending.indexOf(face); if (i < 0) return;
+      set.__pending.splice(i, 1); (to === 'loaded' ? set.__done : set.__errors).push(face);
+      if (!set.__pending.length) {
+        var okay = set.__done, bad = set.__errors; set.__status = 'loaded'; set.__done = []; set.__errors = [];
+        Promise.resolve().then(function () {
+          ffFire(set, 'loadingdone', okay); if (bad.length) ffFire(set, 'loadingerror', bad);
+          var r = set.__readyResolve; set.__readyResolve = null; if (r) r(set);
+        });
+      }
+    }
+  };
+  var ffMatch = function (set, font, text, what) {
+    var parsed = ffParseFont(font, what), t = text === undefined ? ' ' : String(text);
+    return ffAll(set).filter(function (f) { return parsed.families.indexOf(f.family.replace(/^["']|["']$/g, '').toLowerCase()) >= 0 && ffCovers(f, t); });
+  };
+  method(FontFaceSet.prototype, 'add', function (face) {
+    if (!(face instanceof FontFace)) throw new TypeError("Failed to execute 'add' on 'FontFaceSet': parameter 1 is not of type 'FontFace'.");
+    if (this.__faces.indexOf(face) >= 0) return this;
+    if (face.__status === 'error' && face.__error) throw ffDom("Failed to execute 'add' on 'FontFaceSet': Cannot add a FontFace that has failed to parse.", 'InvalidModificationError');
+    this.__faces.push(face); face.__sets.push(this);
+    if (face.__status === 'loading') ffSetChanged(this, face, 'unloaded', 'loading');
+    return this;
+  });
+  method(FontFaceSet.prototype, 'delete', function (face) {
+    var i = this.__faces.indexOf(face); if (i < 0) return false;
+    this.__faces.splice(i, 1); var j = face.__sets.indexOf(this); if (j >= 0) face.__sets.splice(j, 1); return true;
+  });
+  method(FontFaceSet.prototype, 'clear', function () { var set = this; this.__faces.slice().forEach(function (f) { set.delete(f); }); });
+  method(FontFaceSet.prototype, 'has', function (face) { return ffAll(this).indexOf(face) >= 0; });
+  method(FontFaceSet.prototype, 'forEach', function (cb, thisArg) {
+    if (typeof cb !== 'function') throw new TypeError("Failed to execute 'forEach' on 'FontFaceSet': The callback provided as parameter 1 is not a function.");
+    var set = this; ffAll(this).forEach(function (f) { cb.call(thisArg, f, f, set); });
+  });
+  method(FontFaceSet.prototype, 'values', function () { return ffAll(this)[Symbol.iterator](); });
+  method(FontFaceSet.prototype, 'keys', FontFaceSet.prototype.values);
+  method(FontFaceSet.prototype, 'entries', function () { return ffAll(this).map(function (f) { return [f, f]; })[Symbol.iterator](); });
+  Object.defineProperty(FontFaceSet.prototype, Symbol.iterator, { value: FontFaceSet.prototype.values, writable: true, configurable: true });
+  Object.defineProperty(FontFaceSet.prototype, 'size', { get: function () { return ffAll(this).length; }, enumerable: true, configurable: true });
+  Object.defineProperty(FontFaceSet.prototype, 'status', { get: function () { return this.__status; }, enumerable: true, configurable: true });
+  Object.defineProperty(FontFaceSet.prototype, 'ready', { get: function () { return this.__ready; }, enumerable: true, configurable: true });
+  method(FontFaceSet.prototype, 'load', function (font, text) {
+    try { var faces = ffMatch(this, font, text, 'load'); } catch (e) { return Promise.reject(e); }
+    return Promise.all(faces.map(function (f) { return f.load(); }));
+  });
+  method(FontFaceSet.prototype, 'check', function (font, text) {
+    var faces = ffMatch(this, font, text, 'check');
+    return faces.every(function (f) { return f.__status === 'loaded'; });
+  });
+  ['loading', 'loadingdone', 'loadingerror'].forEach(function (n) {
+    Object.defineProperty(FontFaceSet.prototype, 'on' + n, {
+      get: function () { return this['__on' + n] || null; },
+      set: function (v) {
+        var key = '__on' + n, old = this[key];
+        if (old && old.__wrap) this.removeEventListener(n, old.__wrap);
+        if (typeof v === 'function') { var w = function (e) { v.call(this, e); }; Object.defineProperty(this, key, { value: v, writable: true, configurable: true }); Object.defineProperty(v, '__wrap', { value: w, configurable: true, writable: true }); this.addEventListener(n, w); }
+        else Object.defineProperty(this, key, { value: null, writable: true, configurable: true });
+      }, enumerable: true, configurable: true
+    });
+  });
+  Object.defineProperty(FontFaceSet.prototype, Symbol.toStringTag, { value: 'FontFaceSet', configurable: true });
+  hide(g, 'FontFace', FontFace); hide(g, 'FontFaceSet', FontFaceSet); hide(g, 'FontFaceSetLoadEvent', FontFaceSetLoadEvent);
+  hide(doc, 'fonts', ffNewSet());
   if (doc.designMode === undefined) doc.designMode = 'off';
   if (doc.dir === undefined) doc.dir = '';
 
@@ -5555,7 +5788,7 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     if (!def || el.__ce !== undefined) return;
     Object.defineProperty(el, '__ce', { value: 1, writable: true });
     Object.setPrototypeOf(el, def.ctor.prototype);
-    try { def.ctor.call(el); } catch (e) { reportError(e); }
+    try { __super_init(def.ctor, el); } catch (e) { reportError(e); }   // (new.target of a class constructor is def.ctor, as when super() runs it)
     for (var i = 0; i < def.observed.length; i++) {
       var a = def.observed[i];
       if (el.hasAttribute(a)) callback(el, 'attributeChangedCallback', [a, null, el.getAttribute(a)]);
@@ -10434,7 +10667,13 @@ const char kWebAssemblyPrelude[] = R"JSPRELUDE((function (g) {
       if (!(this instanceof Module)) throw new TypeError("WebAssembly.Module must be invoked with 'new'");
       if (arguments.length < 1) throw new TypeError('WebAssembly.Module(): Argument 0 must be a buffer source');
       waNew(this, Module, 'module', __wasm_compile(bytes, 'WebAssembly.Module()'), 'Module');
+      waKeep(this, bytes);
     }
+    var waKeep = function (m, src) {
+      var u = src instanceof ArrayBuffer ? new Uint8Array(src.slice(0)) : new Uint8Array(src.buffer.slice(src.byteOffset, src.byteOffset + src.byteLength));
+      Object.defineProperty(m, '__wasm_src', { value: u });
+    };
+    hide(g, '__wasm_module_bytes', function (v) { return waIs(v, 'module') ? v.__wasm_src : null; });
     var needModule = function (m, api) { if (!waIs(m, 'module')) throw new TypeError(api + ': Argument 0 must be a WebAssembly.Module'); };
     Module.imports = function (m) {
       needModule(m, 'WebAssembly.Module.imports()');
@@ -10457,7 +10696,7 @@ const char kWebAssemblyPrelude[] = R"JSPRELUDE((function (g) {
       if (!(this instanceof Instance)) throw new TypeError("WebAssembly.Instance must be invoked with 'new'");
       var id = waInstantiate(module, importObject, 'WebAssembly.Instance()');
       waNew(this, Instance, 'instance', id, 'Instance');
-      Object.defineProperty(this, 'exports', { value: waExports(id), enumerable: true, configurable: true });
+      Object.defineProperty(this, '__wasm_exports', { value: waExports(id) });
     }
     var waInstantiate = function (module, importObject, api) {
       if (!waIs(module, 'module')) throw new TypeError(api + ': Argument 0 must be a WebAssembly.Module');
@@ -10484,6 +10723,7 @@ const char kWebAssemblyPrelude[] = R"JSPRELUDE((function (g) {
       });
       return Object.freeze(out);
     };
+    Object.defineProperty(Instance.prototype, 'exports', { get: function () { if (!waIs(this, 'instance')) throw new TypeError('Receiver is not a WebAssembly.Instance'); return this.__wasm_exports; }, enumerable: true, configurable: true });
     waTag(Instance, 'WebAssembly.Instance');
     waDefine('Instance', Instance);
 
@@ -10603,6 +10843,7 @@ const char kWebAssemblyPrelude[] = R"JSPRELUDE((function (g) {
         var m = Object.create(Module.prototype);
         Object.defineProperty(m, '__wasm_kind', { value: 'module' });
         Object.defineProperty(m, '__wasm_id', { value: __wasm_compile(bytes, 'WebAssembly.compile()') });
+        waKeep(m, bytes);
         return m;
       });
     });
@@ -10611,15 +10852,16 @@ const char kWebAssemblyPrelude[] = R"JSPRELUDE((function (g) {
         if (waIs(source, 'module')) {
           var id = waInstantiate(source, importObject, 'WebAssembly.instantiate()');
           var inst = waWrap(Instance.prototype, 'instance', id);
-          Object.defineProperty(inst, 'exports', { value: waExports(id), enumerable: true, configurable: true });
+          Object.defineProperty(inst, '__wasm_exports', { value: waExports(id) });
           return inst;
         }
         var module = Object.create(Module.prototype);
         Object.defineProperty(module, '__wasm_kind', { value: 'module' });
         Object.defineProperty(module, '__wasm_id', { value: __wasm_compile(source, 'WebAssembly.instantiate()') });
+        waKeep(module, source);
         var iid = waInstantiate(module, importObject, 'WebAssembly.instantiate()');
         var instance = waWrap(Instance.prototype, 'instance', iid);
-        Object.defineProperty(instance, 'exports', { value: waExports(iid), enumerable: true, configurable: true });
+        Object.defineProperty(instance, '__wasm_exports', { value: waExports(iid) });
         return { module: module, instance: instance };
       });
     });
@@ -10638,6 +10880,12 @@ const char kWebAssemblyPrelude[] = R"JSPRELUDE((function (g) {
     waDefine('instantiateStreaming', function instantiateStreaming(source, importObject) {
       return streamed(source, 'WebAssembly.instantiateStreaming()').then(function (bytes) { return WA.instantiate(bytes, importObject); });
     });
+    // the shapes the IDL gives the interfaces: errors derive from the Error constructor, prototypes are read-only, the lengths are the required arguments
+    ['CompileError', 'LinkError', 'RuntimeError'].forEach(function (n) { Object.setPrototypeOf(WA[n], Error); });
+    ['Module', 'Instance', 'Memory', 'Table', 'Global', 'Tag', 'Exception'].forEach(function (n) { Object.defineProperty(WA[n], 'prototype', { writable: false }); });
+    var waLength = function (f, n) { Object.defineProperty(f, 'length', { value: n, configurable: true }); };
+    waLength(WA.Instance, 1); waLength(WA.Table, 1); waLength(WA.Global, 1); waLength(WA.instantiate, 1); waLength(WA.Table.prototype.set, 1); waLength(WA.Table.prototype.grow, 1);
+    ['validate', 'compile', 'instantiate', 'compileStreaming', 'instantiateStreaming'].forEach(function (n) { Object.defineProperty(WA, n, { enumerable: true }); });
     waTag(WA, 'WebAssembly');
     hide(g, 'WebAssembly', WA);
   }
@@ -11478,6 +11726,2856 @@ const char* worker_prelude() { return kWorkerPrelude; }
 const char* dom_prelude() { return kDomPrelude; }
 const char* web_assembly_prelude() { return kWebAssemblyPrelude; }
 const char* module_prelude() { return kModulePrelude; }
+// The SVG DOM: SVGElement and its subclasses (one for each element), the animated attributes (x, width, viewBox, transform ...), lengths, lists, getBBox(),
+// getTotalLength() and the rest. Written in script on top of the native SVGElement (the elements in the SVG namespace get their prototype from __register_svg_tag).
+const char kSvgPrelude[] = R"JSPRELUDE((function (g) {
+  var SVGNS = 'http://www.w3.org/2000/svg';
+  var def = function (o, k, v) { Object.defineProperty(o, k, { value: v, writable: true, configurable: true }); };
+  var hide = function (o, k, v) { Object.defineProperty(o, k, { value: v, writable: true, configurable: true, enumerable: false }); };
+  var accessor = function (proto, name, get, set) { Object.defineProperty(proto, name, { get: get, set: set, enumerable: true, configurable: true }); };
+  var iface = function (name, parent, init) {
+    var C = function () { if (!init) throw new TypeError('Illegal constructor'); if (!(this instanceof C)) throw new TypeError("Failed to construct '" + name + "': Please use the 'new' operator, this DOM object constructor cannot be called as a function."); init.apply(this, arguments); };
+    Object.defineProperty(C, 'name', { value: name });
+    C.prototype = Object.create(parent ? parent.prototype : Object.prototype);
+    def(C.prototype, 'constructor', C);
+    Object.defineProperty(C.prototype, Symbol.toStringTag, { value: name, configurable: true });
+    if (parent) Object.setPrototypeOf(C, parent);
+    def(g, name, C);
+    return C;
+  };
+  var constants = function (C, table) { Object.keys(table).forEach(function (k) { Object.defineProperty(C, k, { value: table[k], enumerable: true }); Object.defineProperty(C.prototype, k, { value: table[k], enumerable: true }); }); };
+  var num = function (v) { v = Number(v); return v === v ? v : 0; };
+  var indexSize = function (what) { return new DOMException('The index provided is out of range.', 'IndexSizeError'); };
+  // a per-element store (the animated values must be the same object each time they are read)
+  var store = function (el) { if (!el.__svg) hide(el, '__svg', {}); return el.__svg; };
+
+  // ---------------------------------------------------------------------------------------------------------------------------- numbers, strings, lengths
+  var SVGNumber = iface('SVGNumber', null, function () { hide(this, '__n', { v: 0 }); });
+  accessor(SVGNumber.prototype, 'value', function () { var n = this.__n; return n.el ? num(n.el.getAttribute(n.name)) : n.v; }, function (v) { var n = this.__n; n.v = Number(v); if (n.el) n.el.setAttribute(n.name, String(Number(v))); });
+  var LT = { SVG_LENGTHTYPE_UNKNOWN: 0, SVG_LENGTHTYPE_NUMBER: 1, SVG_LENGTHTYPE_PERCENTAGE: 2, SVG_LENGTHTYPE_EMS: 3, SVG_LENGTHTYPE_EXS: 4, SVG_LENGTHTYPE_PX: 5, SVG_LENGTHTYPE_CM: 6, SVG_LENGTHTYPE_MM: 7, SVG_LENGTHTYPE_IN: 8, SVG_LENGTHTYPE_PT: 9, SVG_LENGTHTYPE_PC: 10 };
+  var UNIT = [null, '', '%', 'em', 'ex', 'px', 'cm', 'mm', 'in', 'pt', 'pc'], PX = { 5: 1, 6: 96 / 2.54, 7: 96 / 25.4, 8: 96, 9: 4 / 3, 10: 16 };
+  function parseLength(text) {
+    var m = /^\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)\s*(%|[a-zA-Z]*)\s*$/.exec(String(text));
+    if (!m) return { v: 0, u: 1 };
+    var u = UNIT.indexOf(m[2].toLowerCase());
+    return { v: parseFloat(m[1]), u: u < 0 ? 0 : u };
+  }
+  var SVGLength = iface('SVGLength', null, function () { hide(this, '__l', { v: 0, u: 1 }); });
+  constants(SVGLength, LT);
+  function lengthState(l) { var s = l.__l; if (s.el) { var t = s.el.getAttribute(s.name); if (t !== null) { var p = parseLength(t); s.v = p.v; s.u = p.u; } else { s.v = s.d || 0; s.u = 1; } } return s; }
+  function lengthWrite(l) { var s = l.__l; if (s.el) s.el.setAttribute(s.name, s.v + (UNIT[s.u] || '')); }
+  function reference(el, name) {   // what a percentage is of: the size of the viewport (or of the viewBox)
+    var svg = el, vb;
+    while (svg && !(svg.localName === 'svg' && svg.namespaceURI === SVGNS)) svg = svg.parentNode;
+    if (!svg) return 0;
+    vb = svg.getAttribute('viewBox');
+    var horizontal = /^(x|cx|dx|x1|x2|width|rx|refX|fx|markerWidth)$/.test(name), vertical = /^(y|cy|dy|y1|y2|height|ry|refY|fy|markerHeight)$/.test(name);
+    var box = vb ? vb.trim().split(/[\s,]+/).map(Number) : null;
+    var w = box ? box[2] : parseLength(svg.getAttribute('width') || '0').v, h = box ? box[3] : parseLength(svg.getAttribute('height') || '0').v;
+    return horizontal ? w : vertical ? h : Math.sqrt((w * w + h * h) / 2);
+  }
+  function lengthValue(l) {
+    var s = lengthState(l), f = PX[s.u];
+    if (s.u === 2) return s.v / 100 * (s.el ? reference(s.el, s.name) : 0);
+    if (s.u === 3) return s.v * 16;
+    if (s.u === 4) return s.v * 8;
+    return f ? s.v * f : s.v;
+  }
+  accessor(SVGLength.prototype, 'value', function () { return lengthValue(this); }, function (v) { var s = lengthState(this); v = Number(v); if (v !== v || v === Infinity || v === -Infinity) throw new TypeError("Failed to set the 'value' property on 'SVGLength': The provided float value is non-finite."); if (s.u === 2 || s.u === 3 || s.u === 4) { s.v = v; s.u = 1; } else s.v = s.u === 1 ? v : v / (PX[s.u] || 1); lengthWrite(this); });
+  accessor(SVGLength.prototype, 'valueInSpecifiedUnits', function () { return lengthState(this).v; }, function (v) { lengthState(this).v = Number(v); lengthWrite(this); });
+  accessor(SVGLength.prototype, 'unitType', function () { return lengthState(this).u; });
+  accessor(SVGLength.prototype, 'valueAsString', function () { var s = lengthState(this); return s.v + (UNIT[s.u] || ''); }, function (v) { var p = parseLength(v); if (!/^\s*[+-]?[\d.]/.test(String(v))) throw new DOMException("Failed to set the 'valueAsString' property on 'SVGLength': The value provided ('" + v + "') is invalid.", 'SyntaxError'); var s = lengthState(this); s.v = p.v; s.u = p.u; lengthWrite(this); });
+  def(SVGLength.prototype, 'newValueSpecifiedUnits', function (type, v) { var s = lengthState(this); s.u = type; s.v = Number(v); lengthWrite(this); });
+  def(SVGLength.prototype, 'convertToSpecifiedUnits', function (type) { var s = lengthState(this), px = lengthValue(this); s.u = type; s.v = type === 1 ? px : px / (PX[type] || 1); lengthWrite(this); });
+  var SVGAnimatedLength = iface('SVGAnimatedLength'), SVGAnimatedNumber = iface('SVGAnimatedNumber'), SVGAnimatedString = iface('SVGAnimatedString'), SVGAnimatedBoolean = iface('SVGAnimatedBoolean'), SVGAnimatedEnumeration = iface('SVGAnimatedEnumeration'), SVGAnimatedInteger = iface('SVGAnimatedInteger');
+  [SVGAnimatedLength, SVGAnimatedNumber, SVGAnimatedString, SVGAnimatedBoolean, SVGAnimatedEnumeration, SVGAnimatedInteger].forEach(function (C) { accessor(C.prototype, 'baseVal', function () { return this.__b; }, C === SVGAnimatedLength ? undefined : function (v) { this.__set(v); }); accessor(C.prototype, 'animVal', function () { return this.__a; }); });
+  function animatedLength(el, name, fallback) {
+    var st = store(el), key = 'L:' + name;
+    if (st[key]) return st[key];
+    var a = Object.create(SVGAnimatedLength.prototype), b = Object.create(SVGLength.prototype), v = Object.create(SVGLength.prototype);
+    hide(b, '__l', { v: fallback || 0, d: fallback || 0, u: 1, el: el, name: name });
+    hide(v, '__l', { v: fallback || 0, d: fallback || 0, u: 1, el: el, name: name });
+    hide(a, '__b', b); hide(a, '__a', v);
+    return (st[key] = a);
+  }
+  function animatedNumber(el, name, fallback) {
+    var st = store(el), key = 'N:' + name;
+    if (st[key]) return st[key];
+    var a = Object.create(SVGAnimatedNumber.prototype), read = function () { var t = el.getAttribute(name); return t === null ? (fallback || 0) : num(t); };
+    accessor(a, 'baseVal', read, function (v) { el.setAttribute(name, String(Number(v))); });
+    accessor(a, 'animVal', read);
+    return (st[key] = a);
+  }
+  function animatedString(el, name, attrNames) {
+    var st = store(el), key = 'S:' + name;
+    if (st[key]) return st[key];
+    var a = Object.create(SVGAnimatedString.prototype), names = attrNames || [name];
+    var read = function () { for (var i = 0; i < names.length; i++) { var t = el.getAttribute(names[i]); if (t !== null) return t; } return ''; };
+    hide(a, '__b', undefined); hide(a, '__a', undefined);
+    Object.defineProperty(a, '__b', { get: read }); Object.defineProperty(a, '__a', { get: read });
+    hide(a, '__set', function (v) { el.setAttribute(names[0], String(v)); });
+    // baseVal is a string: reading it gives the text, setting it (through the animated object) writes the attribute
+    accessor(a, 'baseVal', read, function (v) { el.setAttribute(names[0], String(v)); });
+    return (st[key] = a);
+  }
+  function animatedEnum(el, name, table, fallback) {
+    var st = store(el), key = 'E:' + name;
+    if (st[key]) return st[key];
+    var a = Object.create(SVGAnimatedEnumeration.prototype), read = function () { var t = el.getAttribute(name); var i = table.indexOf(t); return i < 0 ? fallback : i + 1; };
+    Object.defineProperty(a, '__b', { get: read }); Object.defineProperty(a, '__a', { get: read });
+    hide(a, '__set', function (v) { v = Number(v); if (v >= 1 && v <= table.length) el.setAttribute(name, table[v - 1]); else throw new TypeError("Failed to set the value: The enumeration value provided (" + v + ") is not valid."); });
+    return (st[key] = a);
+  }
+  function animatedBoolean(el, name) {
+    var st = store(el), key = 'B:' + name;
+    if (st[key]) return st[key];
+    var a = Object.create(SVGAnimatedBoolean.prototype), read = function () { return el.getAttribute(name) === 'true'; };
+    Object.defineProperty(a, '__b', { get: read }); Object.defineProperty(a, '__a', { get: read });
+    hide(a, '__set', function (v) { el.setAttribute(name, v ? 'true' : 'false'); });
+    return (st[key] = a);
+  }
+
+  // ---------------------------------------------------------------------------------------------------------------------------- lists
+  var SVGLengthList = iface('SVGLengthList'), SVGNumberList = iface('SVGNumberList'), SVGStringList = iface('SVGStringList'), SVGPointList = iface('SVGPointList');
+  var SVGAnimatedLengthList = iface('SVGAnimatedLengthList'), SVGAnimatedNumberList = iface('SVGAnimatedNumberList');
+  function listProto(C, make) {
+    var P = C.prototype;
+    accessor(P, 'numberOfItems', function () { return this.__items().length; });
+    accessor(P, 'length', function () { return this.__items().length; });
+    def(P, 'getItem', function (i) { var a = this.__items(); i = i >>> 0; if (i >= a.length) throw indexSize(); return a[i]; });
+    def(P, 'initialize', function (v) { this.__write([v]); return v; });
+    def(P, 'clear', function () { this.__write([]); });
+    def(P, 'appendItem', function (v) { var a = this.__items().slice(); a.push(v); this.__write(a); return v; });
+    def(P, 'insertItemBefore', function (v, i) { var a = this.__items().slice(); a.splice(Math.min(i >>> 0, a.length), 0, v); this.__write(a); return v; });
+    def(P, 'replaceItem', function (v, i) { var a = this.__items().slice(); i = i >>> 0; if (i >= a.length) throw indexSize(); a[i] = v; this.__write(a); return v; });
+    def(P, 'removeItem', function (i) { var a = this.__items().slice(); i = i >>> 0; if (i >= a.length) throw indexSize(); var r = a.splice(i, 1)[0]; this.__write(a); return r; });
+  }
+  [SVGLengthList, SVGNumberList, SVGStringList, SVGPointList].forEach(function (C) { listProto(C); });
+  function lengthList(el, name) {
+    var st = store(el), key = 'LL:' + name;
+    if (st[key]) return st[key];
+    var list = Object.create(SVGLengthList.prototype), animated = Object.create(SVGAnimatedLengthList.prototype);
+    hide(list, '__items', function () { var t = el.getAttribute(name); if (!t) return []; return t.trim().split(/[\s,]+/).filter(Boolean).map(function (s, i) { var l = Object.create(SVGLength.prototype); var p = parseLength(s); hide(l, '__l', { v: p.v, u: p.u }); return l; }); });
+    hide(list, '__write', function (items) { el.setAttribute(name, items.map(function (l) { return l.valueAsString; }).join(' ')); });
+    hide(animated, '__b', list); hide(animated, '__a', list);
+    accessor(SVGAnimatedLengthList.prototype, 'baseVal', function () { return this.__b; }); accessor(SVGAnimatedLengthList.prototype, 'animVal', function () { return this.__a; });
+    return (st[key] = animated);
+  }
+  function numberList(el, name) {
+    var st = store(el), key = 'NL:' + name;
+    if (st[key]) return st[key];
+    var list = Object.create(SVGNumberList.prototype), animated = Object.create(SVGAnimatedNumberList.prototype);
+    hide(list, '__items', function () { var t = el.getAttribute(name); if (!t) return []; return t.trim().split(/[\s,]+/).filter(Boolean).map(function (s) { var n = Object.create(SVGNumber.prototype); hide(n, '__n', { v: num(s) }); return n; }); });
+    hide(list, '__write', function (items) { el.setAttribute(name, items.map(function (n) { return n.value; }).join(' ')); });
+    hide(animated, '__b', list); hide(animated, '__a', list);
+    accessor(SVGAnimatedNumberList.prototype, 'baseVal', function () { return this.__b; }); accessor(SVGAnimatedNumberList.prototype, 'animVal', function () { return this.__a; });
+    return (st[key] = animated);
+  }
+  function emptyStringList() { var l = Object.create(SVGStringList.prototype); hide(l, '__items', function () { return []; }); hide(l, '__write', function () { }); return l; }
+
+  // ---------------------------------------------------------------------------------------------------------------------------- matrices, transforms
+  if (!g.DOMPointReadOnly.prototype.matrixTransform) def(g.DOMPointReadOnly.prototype, 'matrixTransform', function (m) {
+    m = m && m.__m ? m.__m : new g.DOMMatrix(m).__m;
+    var x = this.x, y = this.y, z = this.z, w = this.w;
+    return new g.DOMPoint(m[0] * x + m[4] * y + m[8] * z + m[12] * w, m[1] * x + m[5] * y + m[9] * z + m[13] * w, m[2] * x + m[6] * y + m[10] * z + m[14] * w, m[3] * x + m[7] * y + m[11] * z + m[15] * w);
+  });
+  def(g, 'SVGPoint', g.DOMPoint); def(g, 'SVGMatrix', g.DOMMatrix); def(g, 'SVGRect', g.DOMRect);
+  var TT = { SVG_TRANSFORM_UNKNOWN: 0, SVG_TRANSFORM_MATRIX: 1, SVG_TRANSFORM_TRANSLATE: 2, SVG_TRANSFORM_SCALE: 3, SVG_TRANSFORM_ROTATE: 4, SVG_TRANSFORM_SKEWX: 5, SVG_TRANSFORM_SKEWY: 6 };
+  var SVGTransform = iface('SVGTransform', null, function () { hide(this, '__t', { type: 1, m: new g.DOMMatrix(), angle: 0 }); });
+  constants(SVGTransform, TT);
+  accessor(SVGTransform.prototype, 'type', function () { return this.__t.type; });
+  accessor(SVGTransform.prototype, 'matrix', function () { return this.__t.m; });
+  accessor(SVGTransform.prototype, 'angle', function () { return this.__t.angle; });
+  function changed(t) { if (t.__owner) t.__owner(); }
+  def(SVGTransform.prototype, 'setMatrix', function (m) { var t = this.__t; t.type = 1; t.m = new g.DOMMatrix([m.a, m.b, m.c, m.d, m.e, m.f]); t.angle = 0; changed(this); });
+  def(SVGTransform.prototype, 'setTranslate', function (x, y) { var t = this.__t; t.type = 2; t.m = new g.DOMMatrix().translate(num(x), num(y)); t.angle = 0; t.args = [num(x), num(y)]; changed(this); });
+  def(SVGTransform.prototype, 'setScale', function (x, y) { var t = this.__t; t.type = 3; t.m = new g.DOMMatrix().scale(num(x), num(y)); t.angle = 0; t.args = [num(x), num(y)]; changed(this); });
+  def(SVGTransform.prototype, 'setRotate', function (a, cx, cy) { var t = this.__t; t.type = 4; a = num(a); cx = num(cx); cy = num(cy); t.m = new g.DOMMatrix().translate(cx, cy).rotate(a).translate(-cx, -cy); t.angle = a; t.args = [a, cx, cy]; changed(this); });
+  def(SVGTransform.prototype, 'setSkewX', function (a) { var t = this.__t; t.type = 5; a = num(a); t.m = new g.DOMMatrix().skewX(a); t.angle = a; t.args = [a]; changed(this); });
+  def(SVGTransform.prototype, 'setSkewY', function (a) { var t = this.__t; t.type = 6; a = num(a); t.m = new g.DOMMatrix().skewY(a); t.angle = a; t.args = [a]; changed(this); });
+  function transformText(t) {
+    var x = t.args || [];
+    switch (t.type) {
+      case 2: return 'translate(' + x[0] + ' ' + x[1] + ')';
+      case 3: return 'scale(' + x[0] + ' ' + x[1] + ')';
+      case 4: return x[1] || x[2] ? 'rotate(' + x[0] + ' ' + x[1] + ' ' + x[2] + ')' : 'rotate(' + x[0] + ')';
+      case 5: return 'skewX(' + x[0] + ')';
+      case 6: return 'skewY(' + x[0] + ')';
+      default: var m = t.m; return 'matrix(' + [m.a, m.b, m.c, m.d, m.e, m.f].join(' ') + ')';
+    }
+  }
+  function parseTransforms(text) {
+    var out = [], re = /([a-zA-Z]+)\s*\(([^)]*)\)/g, f;
+    while ((f = re.exec(text || ''))) {
+      var a = f[2].trim().split(/[\s,]+/).filter(Boolean).map(Number), t = Object.create(SVGTransform.prototype);
+      hide(t, '__t', { type: 1, m: new g.DOMMatrix(), angle: 0 });
+      switch (f[1]) {
+        case 'translate': t.setTranslate(a[0], a.length > 1 ? a[1] : 0); break;
+        case 'scale': t.setScale(a[0], a.length > 1 ? a[1] : a[0]); break;
+        case 'rotate': t.setRotate(a[0], a[1], a[2]); break;
+        case 'skewX': t.setSkewX(a[0]); break;
+        case 'skewY': t.setSkewY(a[0]); break;
+        case 'matrix': if (a.length === 6) t.setMatrix({ a: a[0], b: a[1], c: a[2], d: a[3], e: a[4], f: a[5] }); break;
+      }
+      out.push(t);
+    }
+    return out;
+  }
+  var SVGTransformList = iface('SVGTransformList'), SVGAnimatedTransformList = iface('SVGAnimatedTransformList');
+  listProto(SVGTransformList);
+  def(SVGTransformList.prototype, 'createSVGTransformFromMatrix', function (m) { var t = new SVGTransform(); t.setMatrix(m); return t; });
+  def(SVGTransformList.prototype, 'consolidate', function () {
+    var a = this.__items(); if (!a.length) return null;
+    var m = new g.DOMMatrix(); a.forEach(function (t) { m = m.multiply(t.matrix); });
+    var t = new SVGTransform(); t.setMatrix(m); this.__write([t]); return t;
+  });
+  accessor(SVGAnimatedTransformList.prototype, 'baseVal', function () { return this.__b; }); accessor(SVGAnimatedTransformList.prototype, 'animVal', function () { return this.__a; });
+  function transformList(el) {
+    var st = store(el);
+    if (st.T) return st.T;
+    var list = Object.create(SVGTransformList.prototype), animated = Object.create(SVGAnimatedTransformList.prototype), cache = null, cached = null;
+    hide(list, '__items', function () {
+      var text = el.getAttribute('transform') || '';
+      if (cached !== text) { cache = parseTransforms(text); cached = text; cache.forEach(function (t) { hide(t, '__owner', function () { write(cache); }); }); }
+      return cache;
+    });
+    var write = function (items) { var text = items.map(function (t) { return transformText(t.__t); }).join(' '); cached = text; cache = items; el.setAttribute('transform', text); items.forEach(function (t) { hide(t, '__owner', function () { write(cache); }); }); };
+    hide(list, '__write', write);
+    hide(animated, '__b', list); hide(animated, '__a', list);
+    return (st.T = animated);
+  }
+  function transformOf(el) {
+    var m = new g.DOMMatrix(), a = el.getAttribute && el.getAttribute('transform');
+    if (a) parseTransforms(a).forEach(function (t) { m = m.multiply(t.matrix); });
+    return m;
+  }
+
+  // ---------------------------------------------------------------------------------------------------------------------------- viewBox
+  var SVGAnimatedRect = iface('SVGAnimatedRect');
+  accessor(SVGAnimatedRect.prototype, 'baseVal', function () { return this.__b; }); accessor(SVGAnimatedRect.prototype, 'animVal', function () { return this.__a; });
+  function viewBox(el) {
+    var st = store(el);
+    if (st.VB) return st.VB;
+    var a = Object.create(SVGAnimatedRect.prototype), rect = Object.create(g.DOMRect.prototype);
+    var read = function () { var t = el.getAttribute('viewBox'); if (!t) return [0, 0, 0, 0]; var v = t.trim().split(/[\s,]+/).map(Number); return v.length === 4 && v.every(function (n) { return n === n; }) ? v : [0, 0, 0, 0]; };
+    var write = function (i, v) { var r = read(); r[i] = Number(v); el.setAttribute('viewBox', r.join(' ')); };
+    hide(rect, '__r', [0, 0, 0, 0]);
+    [['x', 0], ['y', 1], ['width', 2], ['height', 3]].forEach(function (f) { accessor(rect, f[0], function () { return read()[f[1]]; }, function (v) { write(f[1], v); }); });
+    hide(a, '__b', rect); hide(a, '__a', rect);
+    return (st.VB = a);
+  }
+  var SVGPreserveAspectRatio = iface('SVGPreserveAspectRatio'), SVGAnimatedPreserveAspectRatio = iface('SVGAnimatedPreserveAspectRatio');
+  constants(SVGPreserveAspectRatio, { SVG_PRESERVEASPECTRATIO_UNKNOWN: 0, SVG_PRESERVEASPECTRATIO_NONE: 1, SVG_PRESERVEASPECTRATIO_XMINYMIN: 2, SVG_PRESERVEASPECTRATIO_XMAXYMAX: 10, SVG_MEETORSLICE_MEET: 1, SVG_MEETORSLICE_SLICE: 2 });
+  var ALIGNS = ['none', 'xMinYMin', 'xMidYMin', 'xMaxYMin', 'xMinYMid', 'xMidYMid', 'xMaxYMid', 'xMinYMax', 'xMidYMax', 'xMaxYMax'];
+  function preserveAspectRatio(el) {
+    var st = store(el);
+    if (st.PAR) return st.PAR;
+    var a = Object.create(SVGAnimatedPreserveAspectRatio.prototype), p = Object.create(SVGPreserveAspectRatio.prototype);
+    var read = function () { var w = (el.getAttribute('preserveAspectRatio') || 'xMidYMid meet').trim().split(/\s+/); if (w[0] === 'defer') w.shift(); return { align: Math.max(ALIGNS.indexOf(w[0]), 0) + 1 || 6, slice: w[1] === 'slice' }; };
+    var write = function (align, slice) { el.setAttribute('preserveAspectRatio', ALIGNS[align - 1] + (slice ? ' slice' : ' meet')); };
+    accessor(p, 'align', function () { return read().align; }, function (v) { write(Number(v), read().slice); });
+    accessor(p, 'meetOrSlice', function () { return read().slice ? 2 : 1; }, function (v) { write(read().align, Number(v) === 2); });
+    accessor(SVGAnimatedPreserveAspectRatio.prototype, 'baseVal', function () { return this.__b; }); accessor(SVGAnimatedPreserveAspectRatio.prototype, 'animVal', function () { return this.__a; });
+    hide(a, '__b', p); hide(a, '__a', p);
+    return (st.PAR = a);
+  }
+
+  // ---------------------------------------------------------------------------------------------------------------------------- geometry of shapes
+  function parseNumbers(t) { return (t || '').trim().split(/[\s,]+/).filter(Boolean).map(Number); }
+  function lengthAttr(el, name, fallback) { var t = el.getAttribute(name); if (t === null) return fallback || 0; var p = parseLength(t), l = Object.create(SVGLength.prototype); hide(l, '__l', { v: p.v, u: p.u, el: el, name: name }); return lengthValue(l); }
+  function arcPoints(x1, y1, rx, ry, rot, large, sweep, x2, y2, out) {
+    if (rx === 0 || ry === 0) { out.push([x2, y2]); return; }
+    rx = Math.abs(rx); ry = Math.abs(ry);
+    var phi = rot * Math.PI / 180, c = Math.cos(phi), s = Math.sin(phi);
+    var dx = (x1 - x2) / 2, dy = (y1 - y2) / 2, x1p = c * dx + s * dy, y1p = -s * dx + c * dy;
+    var lam = x1p * x1p / (rx * rx) + y1p * y1p / (ry * ry);
+    if (lam > 1) { var sq = Math.sqrt(lam); rx *= sq; ry *= sq; }
+    var num2 = rx * rx * ry * ry - rx * rx * y1p * y1p - ry * ry * x1p * x1p, den = rx * rx * y1p * y1p + ry * ry * x1p * x1p;
+    var co = (large === sweep ? -1 : 1) * Math.sqrt(Math.max(0, num2 / den));
+    var cxp = co * rx * y1p / ry, cyp = -co * ry * x1p / rx;
+    var cx = c * cxp - s * cyp + (x1 + x2) / 2, cy = s * cxp + c * cyp + (y1 + y2) / 2;
+    var ang = function (ux, uy, vx, vy) { var a = Math.atan2(ux * vy - uy * vx, ux * vx + uy * vy); return a; };
+    var th1 = ang(1, 0, (x1p - cxp) / rx, (y1p - cyp) / ry), dth = ang((x1p - cxp) / rx, (y1p - cyp) / ry, (-x1p - cxp) / rx, (-y1p - cyp) / ry);
+    if (!sweep && dth > 0) dth -= 2 * Math.PI; else if (sweep && dth < 0) dth += 2 * Math.PI;
+    var n = Math.max(8, Math.ceil(Math.abs(dth) / (Math.PI / 24)));
+    for (var i = 1; i <= n; i++) { var t = th1 + dth * i / n, ex = rx * Math.cos(t), ey = ry * Math.sin(t); out.push([c * ex - s * ey + cx, s * ex + c * ey + cy]); }
+  }
+  // the points along a path (curves cut into short lines): an array of subpaths, each an array of [x, y] and a closed flag
+  function flattenPath(d) {
+    var re = /([MmLlHhVvCcSsQqTtAaZz])|([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)/g, tokens = [], m;
+    while ((m = re.exec(d || ''))) tokens.push(m[1] || Number(m[2]));
+    var subs = [], cur = null, x = 0, y = 0, sx = 0, sy = 0, i = 0, cmd = '', lastC = null, lastQ = null;
+    var take = function (n) { var a = []; for (var k = 0; k < n; k++) { if (typeof tokens[i] !== 'number') return null; a.push(tokens[i++]); } return a; };
+    var start = function (px, py) { cur = { pts: [[px, py]], closed: false }; subs.push(cur); };
+    while (i < tokens.length) {
+      if (typeof tokens[i] === 'string') cmd = tokens[i++];
+      else if (cmd === 'M') cmd = 'L'; else if (cmd === 'm') cmd = 'l';
+      if (!cmd) break;
+      var rel = cmd === cmd.toLowerCase(), C = cmd.toUpperCase(), a;
+      if (C === 'Z') { if (cur) { if (x !== sx || y !== sy) cur.pts.push([sx, sy]); cur.closed = true; x = sx; y = sy; start(x, y); cur.pts.length = 1; } lastC = lastQ = null; continue; }
+      var n = { M: 2, L: 2, H: 1, V: 1, C: 6, S: 4, Q: 4, T: 2, A: 7 }[C];
+      a = take(n); if (!a) break;
+      var ox = rel ? x : 0, oy = rel ? y : 0;
+      if (!cur && C !== 'M') start(x, y);
+      switch (C) {
+        case 'M': x = a[0] + ox; y = a[1] + oy; sx = x; sy = y; start(x, y); lastC = lastQ = null; break;
+        case 'L': x = a[0] + ox; y = a[1] + oy; cur.pts.push([x, y]); lastC = lastQ = null; break;
+        case 'H': x = a[0] + (rel ? x : 0); cur.pts.push([x, y]); lastC = lastQ = null; break;
+        case 'V': y = a[0] + (rel ? y : 0); cur.pts.push([x, y]); lastC = lastQ = null; break;
+        case 'C': case 'S': {
+          var x1, y1, x2, y2, ex, ey;
+          if (C === 'C') { x1 = a[0] + ox; y1 = a[1] + oy; x2 = a[2] + ox; y2 = a[3] + oy; ex = a[4] + ox; ey = a[5] + oy; }
+          else { x1 = lastC ? 2 * x - lastC[0] : x; y1 = lastC ? 2 * y - lastC[1] : y; x2 = a[0] + ox; y2 = a[1] + oy; ex = a[2] + ox; ey = a[3] + oy; }
+          for (var k = 1; k <= 24; k++) { var t = k / 24, u = 1 - t; cur.pts.push([u * u * u * x + 3 * u * u * t * x1 + 3 * u * t * t * x2 + t * t * t * ex, u * u * u * y + 3 * u * u * t * y1 + 3 * u * t * t * y2 + t * t * t * ey]); }
+          lastC = [x2, y2]; lastQ = null; x = ex; y = ey; break;
+        }
+        case 'Q': case 'T': {
+          var qx, qy, qex, qey;
+          if (C === 'Q') { qx = a[0] + ox; qy = a[1] + oy; qex = a[2] + ox; qey = a[3] + oy; }
+          else { qx = lastQ ? 2 * x - lastQ[0] : x; qy = lastQ ? 2 * y - lastQ[1] : y; qex = a[0] + ox; qey = a[1] + oy; }
+          for (var q = 1; q <= 20; q++) { var tq = q / 20, uq = 1 - tq; cur.pts.push([uq * uq * x + 2 * uq * tq * qx + tq * tq * qex, uq * uq * y + 2 * uq * tq * qy + tq * tq * qey]); }
+          lastQ = [qx, qy]; lastC = null; x = qex; y = qey; break;
+        }
+        case 'A': { var ax = a[5] + ox, ay = a[6] + oy; arcPoints(x, y, a[0], a[1], a[2], !!a[3], !!a[4], ax, ay, cur.pts); x = ax; y = ay; lastC = lastQ = null; break; }
+      }
+    }
+    return subs.filter(function (s) { return s.pts.length > 1 || s.closed; });
+  }
+  function pointsOf(el) {   // the outline of a basic shape or path as subpaths
+    var n = el.localName;
+    if (n === 'rect') {
+      var x = lengthAttr(el, 'x'), y = lengthAttr(el, 'y'), w = lengthAttr(el, 'width'), h = lengthAttr(el, 'height'), rx = lengthAttr(el, 'rx', -1), ry = lengthAttr(el, 'ry', -1);
+      if (rx < 0 && ry < 0) rx = ry = 0; else if (rx < 0) rx = ry; else if (ry < 0) ry = rx;
+      rx = Math.min(rx, w / 2); ry = Math.min(ry, h / 2);
+      if (!rx || !ry) return [{ pts: [[x, y], [x + w, y], [x + w, y + h], [x, y + h], [x, y]], closed: true }];
+      var d = 'M' + (x + rx) + ' ' + y + 'H' + (x + w - rx) + 'A' + rx + ' ' + ry + ' 0 0 1 ' + (x + w) + ' ' + (y + ry) + 'V' + (y + h - ry) + 'A' + rx + ' ' + ry + ' 0 0 1 ' + (x + w - rx) + ' ' + (y + h) + 'H' + (x + rx) + 'A' + rx + ' ' + ry + ' 0 0 1 ' + x + ' ' + (y + h - ry) + 'V' + (y + ry) + 'A' + rx + ' ' + ry + ' 0 0 1 ' + (x + rx) + ' ' + y + 'Z';
+      return flattenPath(d);
+    }
+    if (n === 'circle' || n === 'ellipse') {
+      var cx = lengthAttr(el, 'cx'), cy = lengthAttr(el, 'cy'), rx2 = n === 'circle' ? lengthAttr(el, 'r') : lengthAttr(el, 'rx'), ry2 = n === 'circle' ? rx2 : lengthAttr(el, 'ry');
+      var pts = [];
+      for (var k = 0; k <= 64; k++) { var t = k / 64 * 2 * Math.PI; pts.push([cx + rx2 * Math.cos(t), cy + ry2 * Math.sin(t)]); }
+      return [{ pts: pts, closed: true }];
+    }
+    if (n === 'line') return [{ pts: [[lengthAttr(el, 'x1'), lengthAttr(el, 'y1')], [lengthAttr(el, 'x2'), lengthAttr(el, 'y2')]], closed: false }];
+    if (n === 'polyline' || n === 'polygon') {
+      var v = parseNumbers(el.getAttribute('points')), ps = [];
+      for (var j = 0; j + 1 < v.length; j += 2) ps.push([v[j], v[j + 1]]);
+      if (n === 'polygon' && ps.length) ps.push(ps[0]);
+      return ps.length ? [{ pts: ps, closed: n === 'polygon' }] : [];
+    }
+    if (n === 'path') return flattenPath(el.getAttribute('d'));
+    return [];
+  }
+  function polylineLength(subs) { var total = 0; subs.forEach(function (s) { for (var i = 1; i < s.pts.length; i++) total += Math.hypot(s.pts[i][0] - s.pts[i - 1][0], s.pts[i][1] - s.pts[i - 1][1]); }); return total; }
+  function boxOfPoints(subs) {
+    var x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    subs.forEach(function (s) { s.pts.forEach(function (p) { x0 = Math.min(x0, p[0]); y0 = Math.min(y0, p[1]); x1 = Math.max(x1, p[0]); y1 = Math.max(y1, p[1]); }); });
+    return x0 === Infinity ? new g.DOMRect(0, 0, 0, 0) : new g.DOMRect(x0, y0, x1 - x0, y1 - y0);
+  }
+  function transformBox(box, m) {
+    var xs = [], ys = [];
+    [[box.x, box.y], [box.x + box.width, box.y], [box.x, box.y + box.height], [box.x + box.width, box.y + box.height]].forEach(function (p) { var q = new g.DOMPoint(p[0], p[1]).matrixTransform(m); xs.push(q.x); ys.push(q.y); });
+    var x0 = Math.min.apply(null, xs), y0 = Math.min.apply(null, ys);
+    return new g.DOMRect(x0, y0, Math.max.apply(null, xs) - x0, Math.max.apply(null, ys) - y0);
+  }
+  var SHAPES = { rect: 1, circle: 1, ellipse: 1, line: 1, polyline: 1, polygon: 1, path: 1 };
+  function bboxOf(el) {
+    var n = el.localName;
+    if (SHAPES[n]) return boxOfPoints(pointsOf(el));
+    if (n === 'text' || n === 'tspan') { var len = (el.textContent || '').length; return new g.DOMRect(lengthAttr(el, 'x'), lengthAttr(el, 'y') - 12, len * 8, 16); }
+    if (n === 'image' || n === 'foreignObject' || n === 'use') return new g.DOMRect(lengthAttr(el, 'x'), lengthAttr(el, 'y'), lengthAttr(el, 'width'), lengthAttr(el, 'height'));
+    var x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity, any = false;
+    for (var c = el.firstElementChild; c; c = c.nextElementSibling) {
+      if (c.namespaceURI !== SVGNS || !/^(g|svg|a|switch|rect|circle|ellipse|line|polyline|polygon|path|text|tspan|image|use|foreignObject)$/.test(c.localName)) continue;
+      var b = transformBox(bboxOf(c), transformOf(c));
+      x0 = Math.min(x0, b.x); y0 = Math.min(y0, b.y); x1 = Math.max(x1, b.x + b.width); y1 = Math.max(y1, b.y + b.height); any = true;
+    }
+    return any ? new g.DOMRect(x0, y0, x1 - x0, y1 - y0) : new g.DOMRect(0, 0, 0, 0);
+  }
+  function totalLength(el) {
+    var n = el.localName;
+    if (n === 'circle') return 2 * Math.PI * lengthAttr(el, 'r');
+    if (n === 'ellipse') { var a = lengthAttr(el, 'rx'), b = lengthAttr(el, 'ry'), h = (a - b) * (a - b) / ((a + b) * (a + b) || 1); return Math.PI * (a + b) * (1 + 3 * h / (10 + Math.sqrt(4 - 3 * h))); }
+    return polylineLength(pointsOf(el));
+  }
+
+  // ---------------------------------------------------------------------------------------------------------------------------- interfaces
+  var SVGElement = g.SVGElement;
+  var SVGGraphicsElement = iface('SVGGraphicsElement', SVGElement), SVGGeometryElement = iface('SVGGeometryElement', SVGGraphicsElement), SVGSVGElement = iface('SVGSVGElement', SVGGraphicsElement);
+  var SVGTextContentElement = iface('SVGTextContentElement', SVGGraphicsElement), SVGTextPositioningElement = iface('SVGTextPositioningElement', SVGTextContentElement);
+  var SVGGradientElement = iface('SVGGradientElement', SVGElement);
+  var table = [
+    ['SVGGElement', 'g', SVGGraphicsElement], ['SVGDefsElement', 'defs', SVGGraphicsElement], ['SVGSwitchElement', 'switch', SVGGraphicsElement], ['SVGUseElement', 'use', SVGGraphicsElement],
+    ['SVGImageElement', 'image', SVGGraphicsElement], ['SVGForeignObjectElement', 'foreignObject', SVGGraphicsElement], ['SVGAElement', 'a', SVGGraphicsElement],
+    ['SVGRectElement', 'rect', SVGGeometryElement], ['SVGCircleElement', 'circle', SVGGeometryElement], ['SVGEllipseElement', 'ellipse', SVGGeometryElement], ['SVGLineElement', 'line', SVGGeometryElement],
+    ['SVGPolylineElement', 'polyline', SVGGeometryElement], ['SVGPolygonElement', 'polygon', SVGGeometryElement], ['SVGPathElement', 'path', SVGGeometryElement],
+    ['SVGTextElement', 'text', SVGTextPositioningElement], ['SVGTSpanElement', 'tspan', SVGTextPositioningElement], ['SVGTextPathElement', 'textPath', SVGTextContentElement],
+    ['SVGLinearGradientElement', 'linearGradient', SVGGradientElement], ['SVGRadialGradientElement', 'radialGradient', SVGGradientElement], ['SVGStopElement', 'stop', SVGElement],
+    ['SVGClipPathElement', 'clipPath', SVGElement], ['SVGMaskElement', 'mask', SVGElement], ['SVGPatternElement', 'pattern', SVGElement], ['SVGMarkerElement', 'marker', SVGElement],
+    ['SVGSymbolElement', 'symbol', SVGElement], ['SVGFilterElement', 'filter', SVGElement], ['SVGTitleElement', 'title', SVGElement], ['SVGDescElement', 'desc', SVGElement],
+    ['SVGMetadataElement', 'metadata', SVGElement], ['SVGStyleElement', 'style', SVGElement], ['SVGScriptElement', 'script', SVGElement], ['SVGViewElement', 'view', SVGElement]
+  ];
+  var protos = { svg: SVGSVGElement.prototype, g: null };
+  table.forEach(function (row) { var C = iface(row[0], row[2]); protos[row[1]] = C.prototype; });
+  Object.keys(protos).forEach(function (name) { if (protos[name]) g.__register_svg_tag(name, protos[name]); });
+  g.__register_svg_tag('svg', SVGSVGElement.prototype);
+  function lengthsFor(proto, names, defaults) { names.forEach(function (n) { accessor(proto, n, function () { return animatedLength(this, n, defaults && defaults[n]); }); }); }
+  lengthsFor(SVGSVGElement.prototype, ['x', 'y', 'width', 'height']);
+  lengthsFor(protos.rect, ['x', 'y', 'width', 'height', 'rx', 'ry']);
+  lengthsFor(protos.circle, ['cx', 'cy', 'r']);
+  lengthsFor(protos.ellipse, ['cx', 'cy', 'rx', 'ry']);
+  lengthsFor(protos.line, ['x1', 'y1', 'x2', 'y2']);
+  ['image', 'foreignObject', 'use', 'mask', 'pattern', 'filter'].forEach(function (n) { lengthsFor(protos[n], ['x', 'y', 'width', 'height']); });
+  lengthsFor(protos.marker, ['refX', 'refY', 'markerWidth', 'markerHeight'], { markerWidth: 3, markerHeight: 3 });
+  lengthsFor(protos.linearGradient, ['x1', 'y1', 'x2', 'y2']);
+  lengthsFor(protos.radialGradient, ['cx', 'cy', 'r', 'fx', 'fy', 'fr']);
+  [SVGTextPositioningElement.prototype].forEach(function (p) { ['x', 'y', 'dx', 'dy'].forEach(function (n) { accessor(p, n, function () { return lengthList(this, n); }); }); accessor(p, 'rotate', function () { return numberList(this, 'rotate'); }); });
+  accessor(SVGGeometryElement.prototype, 'pathLength', function () { return animatedNumber(this, 'pathLength'); });
+  accessor(protos.stop, 'offset', function () { return animatedNumber(this, 'offset'); });
+  accessor(SVGElement.prototype, 'className', function () { return animatedString(this, 'class'); });
+  accessor(SVGElement.prototype, 'ownerSVGElement', function () { for (var p = this.parentNode; p; p = p.parentNode) if (p.localName === 'svg' && p.namespaceURI === SVGNS) return p; return null; });
+  accessor(SVGElement.prototype, 'viewportElement', function () { return this.ownerSVGElement; });
+  accessor(SVGGraphicsElement.prototype, 'transform', function () { return transformList(this); });
+  accessor(SVGGraphicsElement.prototype, 'nearestViewportElement', function () { return this.ownerSVGElement; });
+  accessor(SVGGraphicsElement.prototype, 'farthestViewportElement', function () { var r = null; for (var p = this.parentNode; p; p = p.parentNode) if (p.localName === 'svg' && p.namespaceURI === SVGNS) r = p; return r; });
+  ['requiredExtensions', 'systemLanguage'].forEach(function (n) { accessor(SVGGraphicsElement.prototype, n, function () { return emptyStringList(); }); });
+  ['use', 'image', 'a', 'pattern', 'linearGradient', 'radialGradient', 'textPath', 'script', 'view'].forEach(function (n) { if (protos[n]) accessor(protos[n], 'href', function () { return animatedString(this, 'href', ['href', 'xlink:href']); }); });
+  accessor(protos.a, 'target', function () { return animatedString(this, 'target'); });
+  accessor(protos.a, 'download', function () { return this.getAttribute('download') || ''; }, function (v) { this.setAttribute('download', v); });
+  accessor(protos.a, 'rel', function () { return this.getAttribute('rel') || ''; }, function (v) { this.setAttribute('rel', v); });
+  accessor(SVGSVGElement.prototype, 'viewBox', function () { return viewBox(this); });
+  [SVGSVGElement.prototype, protos.image, protos.pattern, protos.marker, protos.symbol, protos.view].forEach(function (p) { if (p) accessor(p, 'preserveAspectRatio', function () { return preserveAspectRatio(this); }); });
+  [protos.pattern, protos.marker, protos.symbol, protos.view].forEach(function (p) { if (p) accessor(p, 'viewBox', function () { return viewBox(this); }); });
+  var UNITS = ['userSpaceOnUse', 'objectBoundingBox'];
+  accessor(SVGGradientElement.prototype, 'gradientUnits', function () { return animatedEnum(this, 'gradientUnits', UNITS, 2); });
+  accessor(SVGGradientElement.prototype, 'spreadMethod', function () { return animatedEnum(this, 'spreadMethod', ['pad', 'reflect', 'repeat'], 1); });
+  accessor(SVGGradientElement.prototype, 'gradientTransform', function () { var st = store(this); return st.GT || (st.GT = transformListFor(this, 'gradientTransform')); });
+  function transformListFor(el, name) { var a = Object.create(SVGAnimatedTransformList.prototype), real = transformList({ getAttribute: function () { return el.getAttribute(name); }, setAttribute: function (n, v) { el.setAttribute(name, v); }, __svg: {} }); return real; }
+  accessor(protos.pattern, 'patternUnits', function () { return animatedEnum(this, 'patternUnits', UNITS, 2); });
+  accessor(protos.pattern, 'patternContentUnits', function () { return animatedEnum(this, 'patternContentUnits', UNITS, 1); });
+  accessor(protos.mask, 'maskUnits', function () { return animatedEnum(this, 'maskUnits', UNITS, 2); });
+  accessor(protos.mask, 'maskContentUnits', function () { return animatedEnum(this, 'maskContentUnits', UNITS, 1); });
+  accessor(protos.clipPath, 'clipPathUnits', function () { return animatedEnum(this, 'clipPathUnits', UNITS, 1); });
+  accessor(protos.marker, 'markerUnits', function () { return animatedEnum(this, 'markerUnits', ['userSpaceOnUse', 'strokeWidth'], 2); });
+  accessor(SVGTextContentElement.prototype, 'textLength', function () { return animatedLength(this, 'textLength'); });
+  accessor(SVGTextContentElement.prototype, 'lengthAdjust', function () { return animatedEnum(this, 'lengthAdjust', ['spacing', 'spacingAndGlyphs'], 1); });
+  constants(SVGGradientElement, { SVG_SPREADMETHOD_UNKNOWN: 0, SVG_SPREADMETHOD_PAD: 1, SVG_SPREADMETHOD_REFLECT: 2, SVG_SPREADMETHOD_REPEAT: 3 });
+  constants(SVGTextContentElement, { LENGTHADJUST_UNKNOWN: 0, LENGTHADJUST_SPACING: 1, LENGTHADJUST_SPACINGANDGLYPHS: 2 });
+  constants(g.SVGMarkerElement, { SVG_MARKERUNITS_UNKNOWN: 0, SVG_MARKERUNITS_USERSPACEONUSE: 1, SVG_MARKERUNITS_STROKEWIDTH: 2, SVG_MARKER_ORIENT_UNKNOWN: 0, SVG_MARKER_ORIENT_AUTO: 1, SVG_MARKER_ORIENT_ANGLE: 2 });
+
+  // methods
+  def(SVGGraphicsElement.prototype, 'getBBox', function () { return bboxOf(this); });
+  def(SVGGraphicsElement.prototype, 'getCTM', function () {
+    var chain = [];
+    for (var e = this; e && e.namespaceURI === SVGNS; e = e.parentNode) { if (e.localName === 'svg' && !(e.parentNode && e.parentNode.namespaceURI === SVGNS)) { chain.push(e); break; } chain.push(e); }
+    var m = new g.DOMMatrix();
+    for (var i = chain.length - 1; i >= 0; i--) {
+      var e2 = chain[i];
+      if (e2.localName === 'svg' && i !== chain.length - 1 || (e2.localName === 'svg' && e2 === chain[chain.length - 1] && false)) m = m.translate(lengthAttr(e2, 'x'), lengthAttr(e2, 'y'));
+      m = m.multiply(transformOf(e2));
+    }
+    return m;
+  });
+  def(SVGGraphicsElement.prototype, 'getScreenCTM', function () { return this.getCTM(); });
+  def(SVGGeometryElement.prototype, 'getTotalLength', function () { return totalLength(this); });
+  def(SVGGeometryElement.prototype, 'getPointAtLength', function (distance) {
+    var n = this.localName, total = totalLength(this);
+    distance = Math.max(0, Math.min(Number(distance) || 0, total));
+    if (n === 'circle' || n === 'ellipse') {
+      var cx = lengthAttr(this, 'cx'), cy = lengthAttr(this, 'cy'), rx = n === 'circle' ? lengthAttr(this, 'r') : lengthAttr(this, 'rx'), ry = n === 'circle' ? rx : lengthAttr(this, 'ry'), t = total ? distance / total * 2 * Math.PI : 0;
+      return new g.DOMPoint(cx + rx * Math.cos(t), cy + ry * Math.sin(t));
+    }
+    var subs = pointsOf(this), left = distance, last = null;
+    for (var s = 0; s < subs.length; s++) {
+      var pts = subs[s].pts;
+      for (var i = 1; i < pts.length; i++) {
+        var seg = Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]);
+        last = pts[i];
+        if (left <= seg) { var f = seg ? left / seg : 0; return new g.DOMPoint(pts[i - 1][0] + (pts[i][0] - pts[i - 1][0]) * f, pts[i - 1][1] + (pts[i][1] - pts[i - 1][1]) * f); }
+        left -= seg;
+      }
+    }
+    return last ? new g.DOMPoint(last[0], last[1]) : new g.DOMPoint(0, 0);
+  });
+  function inside(subs, x, y) {   // non-zero winding of the outline (open subpaths are closed)
+    var wn = 0;
+    subs.forEach(function (s) {
+      var p = s.pts;
+      for (var i = 0; i < p.length; i++) {
+        var a = p[i], b = p[(i + 1) % p.length];
+        if (a[1] <= y) { if (b[1] > y && (b[0] - a[0]) * (y - a[1]) - (x - a[0]) * (b[1] - a[1]) > 0) wn++; }
+        else if (b[1] <= y && (b[0] - a[0]) * (y - a[1]) - (x - a[0]) * (b[1] - a[1]) < 0) wn--;
+      }
+    });
+    return wn !== 0;
+  }
+  def(SVGGeometryElement.prototype, 'isPointInFill', function (pt) { return inside(pointsOf(this), pt.x, pt.y); });
+  def(SVGGeometryElement.prototype, 'isPointInStroke', function (pt) {
+    var width = num(parseFloat(this.getAttribute('stroke-width') || '1')) / 2, found = false;
+    pointsOf(this).forEach(function (s) { for (var i = 1; i < s.pts.length && !found; i++) { var a = s.pts[i - 1], b = s.pts[i], dx = b[0] - a[0], dy = b[1] - a[1], l2 = dx * dx + dy * dy, t = l2 ? Math.max(0, Math.min(1, ((pt.x - a[0]) * dx + (pt.y - a[1]) * dy) / l2)) : 0; if (Math.hypot(pt.x - a[0] - t * dx, pt.y - a[1] - t * dy) <= width) found = true; } });
+    return found;
+  });
+  def(SVGSVGElement.prototype, 'createSVGNumber', function () { return new SVGNumber(); });
+  def(SVGSVGElement.prototype, 'createSVGLength', function () { return new SVGLength(); });
+  def(SVGSVGElement.prototype, 'createSVGPoint', function () { return new g.DOMPoint(); });
+  def(SVGSVGElement.prototype, 'createSVGMatrix', function () { return new g.DOMMatrix(); });
+  def(SVGSVGElement.prototype, 'createSVGRect', function () { return new g.DOMRect(); });
+  def(SVGSVGElement.prototype, 'createSVGTransform', function () { return new SVGTransform(); });
+  def(SVGSVGElement.prototype, 'createSVGTransformFromMatrix', function (m) { var t = new SVGTransform(); t.setMatrix(m); return t; });
+  def(SVGSVGElement.prototype, 'getElementById', function (id) { id = String(id); var all = this.querySelectorAll('*'); for (var i = 0; i < all.length; i++) if (all[i].getAttribute('id') === id) return all[i]; return null; });
+  def(SVGSVGElement.prototype, 'getCurrentTime', function () { return 0; });
+  def(SVGSVGElement.prototype, 'setCurrentTime', function () { });
+  def(SVGSVGElement.prototype, 'suspendRedraw', function () { return 1; });
+  def(SVGSVGElement.prototype, 'unsuspendRedraw', function () { });
+  def(SVGSVGElement.prototype, 'unsuspendRedrawAll', function () { });
+  def(SVGSVGElement.prototype, 'forceRedraw', function () { });
+  def(SVGSVGElement.prototype, 'pauseAnimations', function () { });
+  def(SVGSVGElement.prototype, 'unpauseAnimations', function () { });
+  def(SVGSVGElement.prototype, 'animationsPaused', function () { return false; });
+  def(SVGSVGElement.prototype, 'deselectAll', function () { });
+  accessor(SVGSVGElement.prototype, 'currentScale', function () { var s = store(this); return s.scale === undefined ? 1 : s.scale; }, function (v) { store(this).scale = Number(v); });
+  accessor(SVGSVGElement.prototype, 'currentTranslate', function () { var s = store(this); return s.translate || (s.translate = new g.DOMPoint()); });
+  accessor(SVGSVGElement.prototype, 'pixelUnitToMillimeterX', function () { return 0.2645833333; });
+  accessor(SVGSVGElement.prototype, 'pixelUnitToMillimeterY', function () { return 0.2645833333; });
+  accessor(SVGSVGElement.prototype, 'screenPixelToMillimeterX', function () { return 0.2645833333; });
+  accessor(SVGSVGElement.prototype, 'screenPixelToMillimeterY', function () { return 0.2645833333; });
+  accessor(SVGSVGElement.prototype, 'useCurrentView', function () { return false; });
+  var textLen = function (el) { return (el.textContent || '').length; };
+  def(SVGTextContentElement.prototype, 'getNumberOfChars', function () { return textLen(this); });
+  def(SVGTextContentElement.prototype, 'getComputedTextLength', function () { return textLen(this) * 8; });
+  def(SVGTextContentElement.prototype, 'getSubStringLength', function (offset, count) { var n = textLen(this); offset = offset >>> 0; if (offset > n) throw indexSize(); return Math.max(0, Math.min(count >>> 0, n - offset)) * 8; });
+  def(SVGTextContentElement.prototype, 'getStartPositionOfChar', function (i) { i = i >>> 0; if (i >= textLen(this)) throw indexSize(); return new g.DOMPoint(lengthAttr(this, 'x') + i * 8, lengthAttr(this, 'y')); });
+  def(SVGTextContentElement.prototype, 'getEndPositionOfChar', function (i) { i = i >>> 0; if (i >= textLen(this)) throw indexSize(); return new g.DOMPoint(lengthAttr(this, 'x') + (i + 1) * 8, lengthAttr(this, 'y')); });
+  def(SVGTextContentElement.prototype, 'getExtentOfChar', function (i) { i = i >>> 0; if (i >= textLen(this)) throw indexSize(); return new g.DOMRect(lengthAttr(this, 'x') + i * 8, lengthAttr(this, 'y') - 12, 8, 16); });
+  def(SVGTextContentElement.prototype, 'getRotationOfChar', function (i) { i = i >>> 0; if (i >= textLen(this)) throw indexSize(); return 0; });
+  def(SVGTextContentElement.prototype, 'getCharNumAtPosition', function (pt) { var i = Math.floor((pt.x - lengthAttr(this, 'x')) / 8); return i >= 0 && i < textLen(this) ? i : -1; });
+  def(SVGTextContentElement.prototype, 'selectSubString', function () { });
+}(globalThis));
+)JSPRELUDE";
+
+// Web Audio: AudioContext / OfflineAudioContext, AudioBuffer, AudioParam with its automation, the node classes (oscillator, gain, buffer source, biquad, delay,
+// panner, analyser, convolver, compressor, wave shaper, script processor, worklet ...) and a graph that is rendered 128 frames at a time. Written in script; the
+// native help is __decode_audio. Without an output device the sound is rendered and dropped unless the page environment defines __audio_sink.
+const char kWebAudioPrelude[] = R"JSPRELUDE((function (g) {
+  var def = function (o, k, v) { Object.defineProperty(o, k, { value: v, writable: true, configurable: true }); };
+  var hide = function (o, k, v) { Object.defineProperty(o, k, { value: v, writable: true, configurable: true, enumerable: false }); };
+  var accessor = function (proto, name, get, set) { Object.defineProperty(proto, name, { get: get, set: set, enumerable: true, configurable: true }); };
+  var domex = function (message, name) { return new g.DOMException(message, name); };
+  var QUANTUM = 128, TWO_PI = 2 * Math.PI;
+  var ET = g.EventTarget;
+  var cls = function (name, parent, init) {
+    var C = function () {
+      if (!init) throw new TypeError('Illegal constructor');
+      if (!(this instanceof C)) throw new TypeError("Failed to construct '" + name + "': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+      return init.apply(this, arguments);
+    };
+    Object.defineProperty(C, 'name', { value: name });
+    C.prototype = Object.create(parent ? parent.prototype : Object.prototype);
+    def(C.prototype, 'constructor', C);
+    Object.defineProperty(C.prototype, Symbol.toStringTag, { value: name, configurable: true });
+    if (parent) Object.setPrototypeOf(C, parent);
+    def(g, name, C);
+    return C;
+  };
+  var handler = function (proto, type) {   // onended = fn
+    accessor(proto, 'on' + type, function () { return this.__on && this.__on[type] || null; }, function (fn) {
+      if (!this.__on) hide(this, '__on', {});
+      var had = !!this.__on[type];
+      this.__on[type] = typeof fn === 'function' ? fn : null;
+      if (!had && this.__on[type]) { var self = this; this.addEventListener(type, function (e) { var f = self.__on[type]; if (f) f.call(self, e); }); }
+    });
+  };
+  var fire = function (target, event) { try { target.dispatchEvent(event); } catch (e) { } };
+  var finite = function (v, what) { v = Number(v); if (!(v - v === 0)) throw new TypeError("Failed to execute: The provided float value is non-finite."); return v; };
+
+  // ------------------------------------------------------------------------------------------------------------------------------ AudioBuffer
+  var AudioBuffer = cls('AudioBuffer', null, function (options) {
+    if (options === null || typeof options !== 'object') throw new TypeError("Failed to construct 'AudioBuffer': 1 argument required, but only 0 present.");
+    var ch = options.numberOfChannels === undefined ? 1 : options.numberOfChannels, len = options.length, rate = options.sampleRate;
+    if (len === undefined || rate === undefined) throw new TypeError("Failed to construct 'AudioBuffer': required member " + (len === undefined ? 'length' : 'sampleRate') + ' is undefined.');
+    setup(this, ch, len, rate);
+  });
+  function setup(buf, ch, len, rate) {
+    if (!(ch >= 1 && ch <= 32)) throw domex("Failed to construct 'AudioBuffer': The number of channels provided (" + ch + ') is outside the range [1, 32].', 'NotSupportedError');
+    if (!(len >= 1)) throw domex("Failed to construct 'AudioBuffer': The number of frames provided (" + len + ') is less than or equal to the minimum bound (0).', 'NotSupportedError');
+    if (!(rate >= 3000 && rate <= 768000)) throw domex("Failed to construct 'AudioBuffer': The sample rate provided (" + rate + ') is outside the range [3000, 768000].', 'NotSupportedError');
+    var channels = [];
+    for (var i = 0; i < ch; i++) channels.push(new Float32Array(len));
+    hide(buf, '__c', channels); hide(buf, '__rate', Number(rate)); hide(buf, '__len', len >>> 0);
+  }
+  function makeBuffer(ch, len, rate) { var b = Object.create(AudioBuffer.prototype); setup(b, ch, len, rate); return b; }
+  accessor(AudioBuffer.prototype, 'sampleRate', function () { return this.__rate; });
+  accessor(AudioBuffer.prototype, 'length', function () { return this.__len; });
+  accessor(AudioBuffer.prototype, 'duration', function () { return this.__len / this.__rate; });
+  accessor(AudioBuffer.prototype, 'numberOfChannels', function () { return this.__c.length; });
+  def(AudioBuffer.prototype, 'getChannelData', function (i) { i = i >>> 0; if (i >= this.__c.length) throw domex("Failed to execute 'getChannelData' on 'AudioBuffer': channel index (" + i + ') exceeds number of channels (' + this.__c.length + ')', 'IndexSizeError'); return this.__c[i]; });
+  def(AudioBuffer.prototype, 'copyFromChannel', function (dest, ch, start) {
+    ch = ch >>> 0; start = start === undefined ? 0 : start >>> 0;
+    if (ch >= this.__c.length) throw domex('The channelNumber provided (' + ch + ') is outside the range [0, ' + (this.__c.length - 1) + '].', 'IndexSizeError');
+    if (start > this.__len) throw domex('The startInChannel provided (' + start + ') is outside the range [0, ' + this.__len + '].', 'IndexSizeError');
+    var src = this.__c[ch], n = Math.min(dest.length, this.__len - start);
+    for (var i = 0; i < n; i++) dest[i] = src[start + i];
+  });
+  def(AudioBuffer.prototype, 'copyToChannel', function (src, ch, start) {
+    ch = ch >>> 0; start = start === undefined ? 0 : start >>> 0;
+    if (ch >= this.__c.length) throw domex('The channelNumber provided (' + ch + ') is outside the range [0, ' + (this.__c.length - 1) + '].', 'IndexSizeError');
+    if (start > this.__len) throw domex('The startInChannel provided (' + start + ') is outside the range [0, ' + this.__len + '].', 'IndexSizeError');
+    var dst = this.__c[ch], n = Math.min(src.length, this.__len - start);
+    for (var i = 0; i < n; i++) dst[start + i] = src[i];
+  });
+
+  // ------------------------------------------------------------------------------------------------------------------------------ AudioParam
+  var AudioParam = cls('AudioParam', null);
+  function makeParam(node, name, def0, min, max, rate, fixedRate) {
+    var p = Object.create(AudioParam.prototype);
+    hide(p, '__p', { node: node, name: name, def: def0, min: min, max: max, value: def0, rate: rate || 'a-rate', fixedRate: !!fixedRate, events: [], inputs: [], current: def0, initial: def0 });
+    return p;
+  }
+  function paramTime(p, t, what) { t = Number(t); if (!(t === t) || t < 0 || t === Infinity) throw new RangeError("Failed to execute '" + what + "' on 'AudioParam': The time provided (" + t + ') is negative.'); return t; }
+  function insertEvent(p, e) {
+    var ev = p.__p.events, i = ev.length;
+    while (i > 0 && ev[i - 1].t > e.t) i--;
+    // an event of the same type and time replaces the earlier one (setValueAtTime twice, ...); ramps may share the time with a set
+    for (var k = i - 1; k >= 0 && ev[k].t === e.t; k--) if (ev[k].type === e.type && e.type !== 'setValueCurveAtTime') { ev.splice(k, 1); i--; break; }
+    ev.splice(i, 0, e);
+  }
+  accessor(AudioParam.prototype, 'value', function () { var s = this.__p; return s.events.length || s.inputs.length ? s.current : s.value; }, function (v) {
+    var s = this.__p; v = finite(v); s.value = v; s.current = v;
+    if (s.events.length) this.setValueAtTime(v, s.node.context.currentTime);
+  });
+  accessor(AudioParam.prototype, 'defaultValue', function () { return this.__p.def; });
+  accessor(AudioParam.prototype, 'minValue', function () { return this.__p.min; });
+  accessor(AudioParam.prototype, 'maxValue', function () { return this.__p.max; });
+  accessor(AudioParam.prototype, 'automationRate', function () { return this.__p.rate; }, function (r) {
+    r = String(r); if (r !== 'a-rate' && r !== 'k-rate') return;
+    if (this.__p.fixedRate) throw domex("Failed to set the 'automationRate' property on 'AudioParam': automationRate cannot be changed for this AudioParam.", 'InvalidStateError');
+    this.__p.rate = r;
+  });
+  def(AudioParam.prototype, 'setValueAtTime', function (v, t) { v = finite(v); t = paramTime(this, t, 'setValueAtTime'); var e = { type: 'set', t: t, v: v }; insertEvent(this, e); return this; });
+  def(AudioParam.prototype, 'linearRampToValueAtTime', function (v, t) { v = finite(v); t = paramTime(this, t, 'linearRampToValueAtTime'); insertEvent(this, { type: 'linear', t: t, v: v }); return this; });
+  def(AudioParam.prototype, 'exponentialRampToValueAtTime', function (v, t) {
+    v = finite(v); t = paramTime(this, t, 'exponentialRampToValueAtTime');
+    if (v === 0) throw new RangeError("Failed to execute 'exponentialRampToValueAtTime' on 'AudioParam': The float target value provided (0) should not be in the range (" + (-1e-45) + ', ' + 1e-45 + ').');
+    insertEvent(this, { type: 'exp', t: t, v: v }); return this;
+  });
+  def(AudioParam.prototype, 'setTargetAtTime', function (target, t, tc) {
+    target = finite(target); t = paramTime(this, t, 'setTargetAtTime'); tc = finite(tc);
+    if (tc < 0) throw new RangeError("Failed to execute 'setTargetAtTime' on 'AudioParam': The time constant provided (" + tc + ') is negative.');
+    insertEvent(this, { type: 'target', t: t, v: target, tc: tc }); return this;
+  });
+  def(AudioParam.prototype, 'setValueCurveAtTime', function (curve, t, dur) {
+    t = paramTime(this, t, 'setValueCurveAtTime'); dur = Number(dur);
+    var values = Array.prototype.slice.call(curve).map(Number);
+    if (values.length < 2) throw domex("Failed to execute 'setValueCurveAtTime' on 'AudioParam': The curve length provided (" + values.length + ') is less than the minimum bound (2).', 'InvalidStateError');
+    if (!(dur > 0)) throw new RangeError("Failed to execute 'setValueCurveAtTime' on 'AudioParam': The duration provided (" + dur + ') should be greater than 0.');
+    values.forEach(function (x) { if (!(x - x === 0)) throw new TypeError("Failed to execute 'setValueCurveAtTime' on 'AudioParam': The curve contains a non-finite value."); });
+    var ev = this.__p.events;
+    for (var i = 0; i < ev.length; i++) {   // the curve may not overlap another event
+      var e = ev[i], end = e.type === 'curve' ? e.t + e.dur : e.t;
+      if ((e.t >= t && e.t < t + dur) || (e.type === 'curve' && t >= e.t && t < end)) throw domex("Failed to execute 'setValueCurveAtTime' on 'AudioParam': setValueCurveAtTime(" + t + ', ' + dur + ') overlaps an existing event.', 'NotSupportedError');
+    }
+    insertEvent(this, { type: 'curve', t: t, v: values[values.length - 1], values: values, dur: dur }); return this;
+  });
+  def(AudioParam.prototype, 'cancelScheduledValues', function (t) { t = paramTime(this, t, 'cancelScheduledValues'); var ev = this.__p.events; this.__p.events = ev.filter(function (e) { return e.t < t && !(e.type === 'curve' && e.t + e.dur > t && false); }); return this; });
+  def(AudioParam.prototype, 'cancelAndHoldAtTime', function (t) {
+    t = paramTime(this, t, 'cancelAndHoldAtTime');
+    var s = this.__p, held = evaluate(s, t);
+    s.events = s.events.filter(function (e) { return e.t <= t; });
+    // a ramp or curve still under way is stopped where it is
+    var last = s.events[s.events.length - 1];
+    if (last && (last.type === 'curve' && last.t + last.dur > t)) s.events.pop();
+    insertEvent(this, { type: 'set', t: t, v: held });
+    return this;
+  });
+  // the value of the automation at time t
+  function evaluate(s, t) {
+    var ev = s.events, v = s.value, st = 0, mode = null, i, n = null;
+    for (i = 0; i < ev.length; i++) {
+      var e = ev[i];
+      if (e.t > t) { n = e; break; }
+      switch (e.type) {
+        case 'set': v = e.v; st = e.t; mode = null; break;
+        case 'linear': case 'exp': v = e.v; st = e.t; mode = null; break;
+        case 'target': { var cur = mode && mode.type === 'target' ? targetValue(mode, e.t) : mode && mode.type === 'curve' ? v : v; mode = { type: 'target', t0: e.t, v0: cur, target: e.v, tc: e.tc }; st = e.t; break; }
+        case 'curve': mode = { type: 'curve', t0: e.t, values: e.values, dur: e.dur }; st = e.t; break;
+      }
+      if (mode && mode.type === 'curve' && t >= e.t + e.dur && i + 1 < ev.length + 1 && e.type === 'curve') { v = e.values[e.values.length - 1]; mode = null; st = e.t + e.dur; }
+    }
+    // an upcoming ramp runs from where the timeline stood after the last event
+    if (n && (n.type === 'linear' || n.type === 'exp')) {
+      var from = mode && mode.type === 'target' ? targetValue(mode, t) : mode && mode.type === 'curve' ? curveValue(mode, t) : v;
+      var span = n.t - st;
+      if (span <= 0) return n.v;
+      var f = (t - st) / span;
+      if (n.type === 'linear') return from + (n.v - from) * f;
+      if (from === 0 || (from < 0) !== (n.v < 0)) return from;
+      return from * Math.pow(n.v / from, f);
+    }
+    if (mode) return mode.type === 'target' ? targetValue(mode, t) : curveValue(mode, t);
+    return v;
+  }
+  function targetValue(m, t) { return m.tc === 0 ? m.target : m.target + (m.v0 - m.target) * Math.exp(-(t - m.t0) / m.tc); }
+  function curveValue(m, t) {
+    if (t >= m.t0 + m.dur) return m.values[m.values.length - 1];
+    var n = m.values.length, pos = (t - m.t0) * (n - 1) / m.dur, k = Math.floor(pos), f = pos - k;
+    return k + 1 < n ? m.values[k] * (1 - f) + m.values[k + 1] * f : m.values[n - 1];
+  }
+  // the 128 values of a parameter for the quantum that starts at frame `start`
+  function paramBlock(p, ctx, start, kRate) {
+    var s = p.__p, out = ctx.__scratch(s), n = kRate || s.rate === 'k-rate' ? 1 : QUANTUM, rate = ctx.sampleRate, i;
+    var base = out;
+    if (s.events.length) { for (i = 0; i < n; i++) base[i] = evaluate(s, (start + i) / rate); }
+    else for (i = 0; i < n; i++) base[i] = s.value;
+    if (s.inputs.length) {
+      var sum = ctx.__pullInputs(s.inputs, 1);
+      var ch = sum[0];
+      if (n === 1) base[0] += ch[0]; else for (i = 0; i < QUANTUM; i++) base[i] += ch[i];
+    }
+    var lo = s.min, hi = s.max;
+    for (i = 0; i < n; i++) { var x = base[i]; base[i] = x < lo ? lo : x > hi ? hi : x; }
+    s.current = base[0];
+    if (n === 1) { for (i = 1; i < QUANTUM; i++) base[i] = base[0]; }
+    return base;
+  }
+
+  // ------------------------------------------------------------------------------------------------------------------------------ mixing
+  var SQRT_HALF = Math.SQRT1_2;
+  function silence(n) { var out = []; for (var i = 0; i < n; i++) out.push(new Float32Array(QUANTUM)); return out; }
+  function mixChannels(src, n, speakers) {
+    var m = src.length, i, k, out;
+    if (m === n) return src;
+    out = silence(n);
+    if (!speakers || !((m === 1 || m === 2 || m === 4 || m === 6) && (n === 1 || n === 2 || n === 4 || n === 6))) { for (i = 0; i < Math.min(m, n); i++) out[i].set(src[i]); return out; }
+    if (m === 1) { if (n === 2 || n === 4) { out[0].set(src[0]); out[1].set(src[0]); } else out[2].set(src[0]); return out; }
+    for (k = 0; k < QUANTUM; k++) {
+      if (m === 2) {
+        if (n === 1) out[0][k] = 0.5 * (src[0][k] + src[1][k]); else { out[0][k] = src[0][k]; out[1][k] = src[1][k]; }
+      } else if (m === 4) {
+        if (n === 1) out[0][k] = 0.25 * (src[0][k] + src[1][k] + src[2][k] + src[3][k]);
+        else if (n === 2) { out[0][k] = 0.5 * (src[0][k] + src[2][k]); out[1][k] = 0.5 * (src[1][k] + src[3][k]); }
+        else { out[0][k] = src[0][k]; out[1][k] = src[1][k]; out[4][k] = src[2][k]; out[5][k] = src[3][k]; }
+      } else {   // 6
+        if (n === 1) out[0][k] = SQRT_HALF * (src[0][k] + src[1][k]) + src[2][k] + 0.5 * (src[4][k] + src[5][k]);
+        else if (n === 2) { out[0][k] = src[0][k] + SQRT_HALF * (src[2][k] + src[4][k]); out[1][k] = src[1][k] + SQRT_HALF * (src[2][k] + src[5][k]); }
+        else { out[0][k] = src[0][k] + SQRT_HALF * src[2][k]; out[1][k] = src[1][k] + SQRT_HALF * src[2][k]; out[2][k] = src[4][k]; out[3][k] = src[5][k]; }
+      }
+    }
+    return out;
+  }
+
+  // ------------------------------------------------------------------------------------------------------------------------------ contexts
+  var BaseAudioContext = cls('BaseAudioContext', ET);
+  var AudioContext = cls('AudioContext', BaseAudioContext, function (options) { return initContext(this, options, false); });
+  var OfflineAudioContext = cls('OfflineAudioContext', BaseAudioContext, function (a, b, c) { return initOffline(this, a, b, c); });
+  handler(BaseAudioContext.prototype, 'statechange');
+  handler(OfflineAudioContext.prototype, 'complete');
+  var defaultRate = 48000;
+  function newState(ctx, rate, offline) {
+    var s = { rate: rate, frame: 0, state: offline ? 'suspended' : 'suspended', offline: offline, nodes: [], timer: null, closed: false, startedAt: 0, startedFrame: 0, sink: null };
+    hide(ctx, '__s', s);
+    return s;
+  }
+  function initContext(ctx, options, offline) {
+    var rate = defaultRate;
+    if (options !== undefined && options !== null && typeof options === 'object' && options.sampleRate !== undefined) {
+      rate = Number(options.sampleRate);
+      if (!(rate >= 3000 && rate <= 768000)) throw domex("Failed to construct 'AudioContext': The sampleRate provided (" + rate + ') is outside the range [3000, 768000].', 'NotSupportedError');
+    }
+    var s = newState(ctx, rate, false);
+    s.latencyHint = options && options.latencyHint !== undefined ? options.latencyHint : 'interactive';
+    s.destination = makeDestination(ctx, 2, 32);
+    s.listener = makeListener(ctx);
+    return ctx;
+  }
+  function initOffline(ctx, a, b, c) {
+    var ch, len, rate;
+    if (a !== null && typeof a === 'object') { ch = a.numberOfChannels === undefined ? 1 : a.numberOfChannels; len = a.length; rate = a.sampleRate; }
+    else { if (arguments.length < 4) throw new TypeError("Failed to construct 'OfflineAudioContext': 3 arguments required, but only " + (arguments.length - 1) + ' present.'); ch = a; len = b; rate = c; }
+    if (len === undefined || rate === undefined) throw new TypeError("Failed to construct 'OfflineAudioContext': required member is undefined.");
+    if (!(ch >= 1 && ch <= 32)) throw domex("Failed to construct 'OfflineAudioContext': The number of channels provided (" + ch + ') is outside the range [1, 32].', 'NotSupportedError');
+    if (!(len >= 1)) throw domex("Failed to construct 'OfflineAudioContext': The number of frames provided (" + len + ') is less than or equal to the minimum bound (0).', 'NotSupportedError');
+    if (!(rate >= 3000 && rate <= 768000)) throw domex("Failed to construct 'OfflineAudioContext': The sampleRate provided (" + rate + ') is outside the range [3000, 768000].', 'NotSupportedError');
+    var s = newState(ctx, Number(rate), true);
+    s.length = len >>> 0; s.channels = ch >>> 0; s.suspends = []; s.started = false; s.rendered = null;
+    s.destination = makeDestination(ctx, ch, ch, true);
+    s.listener = makeListener(ctx);
+    return ctx;
+  }
+  accessor(BaseAudioContext.prototype, 'sampleRate', function () { return this.__s.rate; });
+  accessor(BaseAudioContext.prototype, 'currentTime', function () { return this.__s.frame / this.__s.rate; });
+  accessor(BaseAudioContext.prototype, 'destination', function () { return this.__s.destination; });
+  accessor(BaseAudioContext.prototype, 'listener', function () { return this.__s.listener; });
+  accessor(BaseAudioContext.prototype, 'state', function () { return this.__s.state; });
+  accessor(BaseAudioContext.prototype, 'audioWorklet', function () { var s = this.__s; return s.worklet || (s.worklet = makeWorklet(this)); });
+  accessor(AudioContext.prototype, 'baseLatency', function () { return 128 / this.__s.rate; });
+  accessor(AudioContext.prototype, 'outputLatency', function () { return 0; });
+  accessor(AudioContext.prototype, 'sinkId', function () { return this.__s.sinkId || ''; });
+  handler(AudioContext.prototype, 'sinkchange');
+  def(AudioContext.prototype, 'setSinkId', function (id) { this.__s.sinkId = typeof id === 'object' && id ? id.type || '' : String(id); return Promise.resolve(); });
+  def(AudioContext.prototype, 'getOutputTimestamp', function () { return { contextTime: this.currentTime, performanceTime: g.performance ? g.performance.now() : 0 }; });
+  function setState(ctx, state) {
+    var s = ctx.__s;
+    if (s.state === state) return;
+    s.state = state;
+    setTimeout(function () { fire(ctx, new g.Event('statechange')); }, 0);
+  }
+  accessor(OfflineAudioContext.prototype, 'length', function () { return this.__s.length; });
+
+  // the graph: pulling a node's output for the quantum that starts at ctx.__s.frame
+  def(BaseAudioContext.prototype, '__scratch', function () { return new Float64Array(QUANTUM); });
+  def(BaseAudioContext.prototype, '__mixInput', function (node, index) {
+    var list = node.__in[index], n, speakers = node.__interp === 'speakers', i, k, srcs = [];
+    for (i = 0; i < list.length; i++) srcs.push(pullOutput(list[i].src, this, list[i].out));
+    var maxCh = 1;
+    for (i = 0; i < srcs.length; i++) maxCh = Math.max(maxCh, srcs[i].length);
+    var mode = node.__mode;
+    n = mode === 'explicit' ? node.__channels : mode === 'clamped-max' ? Math.min(maxCh, node.__channels) : maxCh;
+    if (!srcs.length) return silence(mode === 'max' ? 1 : n);
+    var out = silence(n);
+    for (i = 0; i < srcs.length; i++) {
+      var mixed = mixChannels(srcs[i], n, speakers);
+      for (k = 0; k < n; k++) { var d = out[k], s = mixed[k]; for (var j = 0; j < QUANTUM; j++) d[j] += s[j]; }
+    }
+    return out;
+  });
+  def(BaseAudioContext.prototype, '__pullInputs', function (connections, channels) {   // a parameter's audio inputs, summed down to mono
+    var sum = silence(1), i;
+    for (i = 0; i < connections.length; i++) {
+      var o = mixChannels(pullOutput(connections[i].src, this, connections[i].out), 1, true)[0], d = sum[0];
+      for (var j = 0; j < QUANTUM; j++) d[j] += o[j];
+    }
+    return sum;
+  });
+  function pullOutput(node, ctx, index) {
+    var s = ctx.__s;
+    if (node.__frame !== s.frame) {
+      if (node.__busy) return silence(1);   // a cycle without a delay is silent
+      node.__busy = true;
+      var inputs = [];
+      for (var i = 0; i < node.__in.length; i++) inputs.push(ctx.__mixInput(node, i));
+      var outs = node.__process(inputs, ctx, s.frame);
+      node.__busy = false;
+      node.__frame = s.frame;
+      node.__out = outs;
+    }
+    return node.__out[index] || silence(1);
+  }
+  function renderQuantum(ctx) {   // the destination's input for the next 128 frames
+    var s = ctx.__s, dest = s.destination;
+    var inputs = [ctx.__mixInput(dest, 0)];
+    // every node with a process that must run whether or not anything listens (sources that end, analysers, script processors) is pulled too
+    var live = s.nodes;
+    for (var i = 0; i < live.length; i++) { var nd = live[i]; if (nd.__always && nd.__frame !== s.frame) pullOutput(nd, ctx, 0); }
+    dest.__frame = s.frame;
+    return inputs[0];
+  }
+
+  // ------------------------------------------------------------------------------------------------------------------------------ AudioNode
+  var AudioNode = cls('AudioNode', ET);
+  function isContext(c) { return c instanceof BaseAudioContext; }
+  function setupNode(n, ctx, cfg) {
+    hide(n, '__ctx', ctx);
+    hide(n, '__in', []); for (var i = 0; i < cfg.inputs; i++) n.__in.push([]);
+    hide(n, '__nout', cfg.outputs); hide(n, '__outs', []);
+    hide(n, '__channels', cfg.channels === undefined ? 2 : cfg.channels); hide(n, '__mode', cfg.mode || 'max'); hide(n, '__interp', cfg.interp || 'speakers');
+    hide(n, '__cfg', cfg); hide(n, '__d', {});
+    hide(n, '__frame', -1); hide(n, '__out', null); hide(n, '__busy', false); hide(n, '__always', !!cfg.always);
+    if (cfg.always) ctx.__s.nodes.push(n);
+  }
+  accessor(AudioNode.prototype, 'context', function () { return this.__ctx; });
+  accessor(AudioNode.prototype, 'numberOfInputs', function () { return this.__in.length; });
+  accessor(AudioNode.prototype, 'numberOfOutputs', function () { return this.__nout; });
+  accessor(AudioNode.prototype, 'channelCount', function () { return this.__channels; }, function (v) {
+    v = Number(v) >>> 0;
+    if (this.__cfg.fixedChannels !== undefined && v !== this.__cfg.fixedChannels) throw domex("Failed to set the 'channelCount' property on 'AudioNode': The channel count cannot be changed from " + this.__cfg.fixedChannels + ' for this node.', 'InvalidStateError');
+    if (this.__cfg.maxChannels !== undefined && v > this.__cfg.maxChannels) throw domex("Failed to set the 'channelCount' property on 'AudioNode': The channel count provided (" + v + ') is greater than the maximum (' + this.__cfg.maxChannels + ').', 'NotSupportedError');
+    if (v < 1 || v > 32) throw domex("Failed to set the 'channelCount' property on 'AudioNode': The channel count provided (" + v + ') is outside the range [1, 32].', 'NotSupportedError');
+    this.__channels = v;
+  });
+  accessor(AudioNode.prototype, 'channelCountMode', function () { return this.__mode; }, function (v) {
+    v = String(v); if (v !== 'max' && v !== 'clamped-max' && v !== 'explicit') return;
+    if (this.__cfg.fixedMode !== undefined && v !== this.__cfg.fixedMode) throw domex("Failed to set the 'channelCountMode' property on 'AudioNode': The channel count mode cannot be changed for this node.", 'InvalidStateError');
+    if (this.__cfg.noMax && v === 'max') throw domex("Failed to set the 'channelCountMode' property on 'AudioNode': The channel count mode cannot be 'max' for this node.", 'NotSupportedError');
+    this.__mode = v;
+  });
+  accessor(AudioNode.prototype, 'channelInterpretation', function () { return this.__interp; }, function (v) { v = String(v); if (v === 'speakers' || v === 'discrete') this.__interp = v; });
+  function sameContext(a, b, what) { if (a.__ctx !== b.__ctx && !(b.__p && b.__p.node.__ctx === a.__ctx)) throw domex("Failed to execute '" + what + "' on 'AudioNode': cannot connect to a destination belonging to a different audio context.", 'InvalidAccessError'); }
+  def(AudioNode.prototype, 'connect', function (dest, output, input) {
+    output = output === undefined ? 0 : output >>> 0; input = input === undefined ? 0 : input >>> 0;
+    if (dest instanceof AudioNode) {
+      sameContext(this, dest, 'connect');
+      if (output >= this.__nout) throw domex("Failed to execute 'connect' on 'AudioNode': output index (" + output + ') exceeds number of outputs (' + this.__nout + ').', 'IndexSizeError');
+      if (input >= dest.__in.length) throw domex("Failed to execute 'connect' on 'AudioNode': input index (" + input + ') exceeds number of inputs (' + dest.__in.length + ').', 'IndexSizeError');
+      var list = dest.__in[input];
+      for (var i = 0; i < list.length; i++) if (list[i].src === this && list[i].out === output) return dest;
+      list.push({ src: this, out: output });
+      this.__outs.push({ dest: dest, out: output, input: input });
+      return dest;
+    }
+    if (dest instanceof AudioParam) {
+      sameContext(this, { __ctx: dest.__p.node.__ctx }, 'connect');
+      if (output >= this.__nout) throw domex("Failed to execute 'connect' on 'AudioNode': output index (" + output + ') exceeds number of outputs (' + this.__nout + ').', 'IndexSizeError');
+      var inputs = dest.__p.inputs;
+      for (var k = 0; k < inputs.length; k++) if (inputs[k].src === this && inputs[k].out === output) return undefined;
+      inputs.push({ src: this, out: output });
+      this.__outs.push({ param: dest, out: output });
+      return undefined;
+    }
+    throw new TypeError("Failed to execute 'connect' on 'AudioNode': Overload resolution failed.");
+  });
+  def(AudioNode.prototype, 'disconnect', function (a, b, c) {
+    var self = this, removed = 0, keep = [];
+    var matches = function (o) {
+      if (a === undefined) return true;
+      if (typeof a === 'number') return o.out === a;
+      if (a instanceof AudioNode) return o.dest === a && (b === undefined || o.out === b) && (c === undefined || o.input === c);
+      if (a instanceof AudioParam) return o.param === a && (b === undefined || o.out === b);
+      return false;
+    };
+    if (typeof a === 'number' && a >= this.__nout) throw domex("Failed to execute 'disconnect' on 'AudioNode': The output index provided (" + a + ') is out of range.', 'IndexSizeError');
+    this.__outs.forEach(function (o) {
+      if (!matches(o)) { keep.push(o); return; }
+      removed++;
+      if (o.dest) o.dest.__in[o.input] = o.dest.__in[o.input].filter(function (x) { return !(x.src === self && x.out === o.out); });
+      else o.param.__p.inputs = o.param.__p.inputs.filter(function (x) { return !(x.src === self && x.out === o.out); });
+    });
+    this.__outs = keep;
+    if (!removed && a !== undefined) throw domex("Failed to execute 'disconnect' on 'AudioNode': the given destination is not connected.", 'InvalidAccessError');
+  });
+  function chanOptions(n, o, name) {
+    if (o.channelCount !== undefined) n.channelCount = o.channelCount;
+    if (o.channelCountMode !== undefined) n.channelCountMode = o.channelCountMode;
+    if (o.channelInterpretation !== undefined) n.channelInterpretation = o.channelInterpretation;
+  }
+  // a node class: cfg = { parent, inputs, outputs, channels, mode, interp, always, init(node, ctx, options), process(node, inputs, ctx, start) }
+  function nodeClass(name, cfg) {
+    var C = cls(name, cfg.parent || AudioNode, function (ctx, options) {
+      if (!isContext(ctx)) throw new TypeError("Failed to construct '" + name + "': parameter 1 is not of type 'BaseAudioContext'.");
+      if (options !== undefined && options !== null && typeof options !== 'object') throw new TypeError("Failed to construct '" + name + "': The provided value is not of type '" + name + "Options'.");
+      options = options || {};
+      setupNode(this, ctx, cfg);
+      if (cfg.pre) cfg.pre(this, ctx, options);
+      chanOptions(this, options, name);
+      if (cfg.init) cfg.init(this, ctx, options);
+      return this;
+    });
+    Object.defineProperty(C, '__cfg', { value: cfg });
+    return C;
+  }
+  AudioNode.prototype.__process = function (inputs, ctx, start) {
+    var cfg = this.__cfg, outs = cfg.process ? cfg.process(this, inputs, ctx, start) : [silence(1)];
+    return outs;
+  };
+  function param(node, name, def0, min, max, rate, fixed) { var p = makeParam(node, name, def0, min, max, rate, fixed); return p; }
+  var NEG = -3.4028234663852886e38, POS = 3.4028234663852886e38;
+  function paramOption(node, p, options, key) { if (options[key] !== undefined) { var v = finite(options[key]); p.__p.value = v; p.__p.current = v; } }
+  function exposeParam(C, name) { accessor(C.prototype, name, function () { return this.__d[name]; }); }
+
+  // ------------------------------------------------------------------------------------------------------------------------------ destination and listener
+  var AudioDestinationNode = nodeClass('AudioDestinationNode', { inputs: 1, outputs: 0, channels: 2, mode: 'explicit', process: function () { return []; } });
+  accessor(AudioDestinationNode.prototype, 'maxChannelCount', function () { return this.__d.max; });
+  function makeDestination(ctx, channels, max, offline) {
+    var d = Object.create(AudioDestinationNode.prototype);
+    setupNode(d, ctx, { inputs: 1, outputs: 0, channels: channels, mode: 'explicit', process: AudioDestinationNode.__cfg.process, fixedChannels: offline ? channels : undefined, maxChannels: max, fixedMode: 'explicit' });
+    d.__d.max = max;
+    return d;
+  }
+  var AudioListener = cls('AudioListener', null);
+  function makeListener(ctx) {
+    var l = Object.create(AudioListener.prototype), d = { };
+    var fake = { context: ctx, __ctx: ctx };
+    [['positionX', 0], ['positionY', 0], ['positionZ', 0], ['forwardX', 0], ['forwardY', 0], ['forwardZ', -1], ['upX', 0], ['upY', 1], ['upZ', 0]].forEach(function (p) { d[p[0]] = param(fake, p[0], p[1], NEG, POS); });
+    hide(l, '__d', d);
+    return l;
+  }
+  ['positionX', 'positionY', 'positionZ', 'forwardX', 'forwardY', 'forwardZ', 'upX', 'upY', 'upZ'].forEach(function (n) { exposeParam(AudioListener, n); });
+  def(AudioListener.prototype, 'setPosition', function (x, y, z) { this.__d.positionX.value = x; this.__d.positionY.value = y; this.__d.positionZ.value = z; });
+  def(AudioListener.prototype, 'setOrientation', function (x, y, z, ux, uy, uz) { var d = this.__d; d.forwardX.value = x; d.forwardY.value = y; d.forwardZ.value = z; d.upX.value = ux; d.upY.value = uy; d.upZ.value = uz; });
+
+  // ------------------------------------------------------------------------------------------------------------------------------ scheduled sources
+  var AudioScheduledSourceNode = nodeClass('AudioScheduledSourceNode', { inputs: 0, outputs: 1, channels: 2, always: true });
+  handler(AudioScheduledSourceNode.prototype, 'ended');
+  function checkWhen(t, what) { t = t === undefined ? 0 : Number(t); if (!(t >= 0) || t === Infinity) throw new RangeError("Failed to execute '" + what + "' on 'AudioScheduledSourceNode': The " + what + ' time provided (' + t + ') is negative.'); return t; }
+  def(AudioScheduledSourceNode.prototype, 'start', function (when) {
+    var d = this.__d; when = checkWhen(when, 'start');
+    if (d.started) throw domex("Failed to execute 'start' on 'AudioScheduledSourceNode': cannot call start more than once.", 'InvalidStateError');
+    d.started = true; d.startT = when;
+  });
+  def(AudioScheduledSourceNode.prototype, 'stop', function (when) {
+    var d = this.__d; when = checkWhen(when, 'stop');
+    if (!d.started) throw domex("Failed to execute 'stop' on 'AudioScheduledSourceNode': cannot call stop without calling start first.", 'InvalidStateError');
+    d.stopT = when;
+  });
+  // the frames of this quantum in which the source plays: [from, to)
+  function activeRange(n, ctx, start) {
+    var d = n.__d, rate = ctx.__s.rate;
+    if (!d.started || d.ended) return null;
+    var from = Math.max(0, Math.ceil(d.startT * rate - 1e-9) - start), to = QUANTUM;
+    if (d.stopT !== undefined && d.stopT !== null) to = Math.min(QUANTUM, Math.ceil(d.stopT * rate - 1e-9) - start);
+    if (from >= QUANTUM) return null;
+    if (to <= from) { if (to <= 0 || (d.stopT !== undefined && d.stopT !== null && Math.ceil(d.stopT * rate - 1e-9) <= start + from)) { finish(n, ctx); } return null; }
+    return [from, to];
+  }
+  function finish(n, ctx) {
+    var d = n.__d;
+    if (d.ended) return;
+    d.ended = true;
+    var s = ctx.__s, i = s.nodes.indexOf(n);
+    if (i >= 0) s.nodes.splice(i, 1);
+    setTimeout(function () { fire(n, new g.Event('ended')); }, 0);
+  }
+  function stopReached(n, ctx, start) { var d = n.__d; if (d.stopT !== undefined && d.stopT !== null && Math.ceil(d.stopT * ctx.__s.rate - 1e-9) <= start + QUANTUM) finish(n, ctx); }
+
+  var OscillatorNode = nodeClass('OscillatorNode', {
+    parent: AudioScheduledSourceNode, inputs: 0, outputs: 1, channels: 2, mode: 'max', always: true,
+    init: function (n, ctx, o) {
+      var d = n.__d; d.type = 'sine'; d.phase = 0; d.wave = null;
+      d.frequency = param(n, 'frequency', 440, -ctx.sampleRate / 2, ctx.sampleRate / 2); d.detune = param(n, 'detune', 0, -153600, 153600);
+      paramOption(n, d.frequency, o, 'frequency'); paramOption(n, d.detune, o, 'detune');
+      if (o.periodicWave !== undefined) n.setPeriodicWave(o.periodicWave);
+      else if (o.type !== undefined) n.type = o.type;
+    },
+    process: function (n, inputs, ctx, start) {
+      var d = n.__d, out = new Float32Array(QUANTUM), r = activeRange(n, ctx, start);
+      if (r) {
+        var fr = paramBlock(d.frequency, ctx, start), dt = paramBlock(d.detune, ctx, start), rate = ctx.sampleRate, ph = d.phase, type = d.type, table = d.wave && d.wave.table;
+        for (var i = r[0]; i < r[1]; i++) {
+          var f = dt[i] === 0 ? fr[i] : fr[i] * Math.pow(2, dt[i] / 1200), inc = f / rate, v;
+          if (type === 'sine') v = Math.sin(TWO_PI * ph);
+          else if (type === 'square') { v = ph < 0.5 ? 1 : -1; var a = Math.abs(inc); v += blep(ph, a) - blep((ph + 0.5) % 1, a); }
+          else if (type === 'sawtooth') { var q = (ph + 0.5) % 1; v = 2 * q - 1; v -= blep(q, Math.abs(inc)); }
+          else if (type === 'triangle') v = ph < 0.25 ? 4 * ph : ph < 0.75 ? 2 - 4 * ph : 4 * ph - 4;
+          else { var pos = ph * table.length, k = Math.floor(pos), fr2 = pos - k; v = table[k % table.length] * (1 - fr2) + table[(k + 1) % table.length] * fr2; }
+          out[i] = v;
+          ph += inc; ph -= Math.floor(ph);
+        }
+        d.phase = ph;
+        stopReached(n, ctx, start);
+      }
+      return [[out]];
+    }
+  });
+  function blep(t, dt) {   // polyBLEP residual around a step at phase 0
+    if (dt <= 0) return 0;
+    if (t < dt) { t /= dt; return t + t - t * t - 1; }
+    if (t > 1 - dt) { t = (t - 1) / dt; return t * t + t + t + 1; }
+    return 0;
+  }
+  exposeParam(OscillatorNode, 'frequency'); exposeParam(OscillatorNode, 'detune');
+  accessor(OscillatorNode.prototype, 'type', function () { return this.__d.type; }, function (v) {
+    v = String(v);
+    if (v === 'custom') throw domex("Failed to set the 'type' property on 'OscillatorNode': 'type' cannot be set directly to 'custom'.  The PeriodicWave must be set explicitly.", 'InvalidStateError');
+    if (['sine', 'square', 'sawtooth', 'triangle'].indexOf(v) < 0) return;
+    this.__d.type = v; this.__d.wave = null;
+  });
+  def(OscillatorNode.prototype, 'setPeriodicWave', function (w) {
+    if (!(w instanceof PeriodicWave)) throw new TypeError("Failed to execute 'setPeriodicWave' on 'OscillatorNode': parameter 1 is not of type 'PeriodicWave'.");
+    this.__d.type = 'custom'; this.__d.wave = w.__w;
+  });
+
+  var PeriodicWave = cls('PeriodicWave', null, function (ctx, options) {
+    if (!isContext(ctx)) throw new TypeError("Failed to construct 'PeriodicWave': parameter 1 is not of type 'BaseAudioContext'.");
+    options = options || {};
+    var real = options.real ? Array.prototype.slice.call(options.real).map(Number) : null, imag = options.imag ? Array.prototype.slice.call(options.imag).map(Number) : null;
+    if (!real && !imag) { real = [0, 0]; imag = [0, 1]; }
+    else if (!real) real = imag.map(function () { return 0; }); else if (!imag) imag = real.map(function () { return 0; });
+    if (real.length !== imag.length) throw domex("Failed to construct 'PeriodicWave': The real array length (" + real.length + ') does not match the imag array length (' + imag.length + ').', 'IndexSizeError');
+    if (real.length < 2) throw domex("Failed to construct 'PeriodicWave': The length of the real array (" + real.length + ') is less than the minimum bound (2).', 'IndexSizeError');
+    var size = 2048, table = new Float32Array(size), max = 0, i, k;
+    for (i = 0; i < size; i++) { var s = 0, p = i / size; for (k = 1; k < real.length; k++) s += real[k] * Math.cos(TWO_PI * k * p) + imag[k] * Math.sin(TWO_PI * k * p); table[i] = s; max = Math.max(max, Math.abs(s)); }
+    if (!options.disableNormalization && max > 0) for (i = 0; i < size; i++) table[i] /= max;
+    hide(this, '__w', { table: table });
+  });
+  def(AudioContext.prototype, 'createPeriodicWave', function (real, imag, c) { return new PeriodicWave(this, { real: real, imag: imag, disableNormalization: c && c.disableNormalization }); });
+
+  var ConstantSourceNode = nodeClass('ConstantSourceNode', {
+    parent: AudioScheduledSourceNode, inputs: 0, outputs: 1, channels: 2, always: true,
+    init: function (n, ctx, o) { n.__d.offset = param(n, 'offset', 1, NEG, POS); paramOption(n, n.__d.offset, o, 'offset'); },
+    process: function (n, inputs, ctx, start) {
+      var out = new Float32Array(QUANTUM), r = activeRange(n, ctx, start);
+      if (r) { var off = paramBlock(n.__d.offset, ctx, start); for (var i = r[0]; i < r[1]; i++) out[i] = off[i]; stopReached(n, ctx, start); }
+      return [[out]];
+    }
+  });
+  exposeParam(ConstantSourceNode, 'offset');
+
+  var AudioBufferSourceNode = nodeClass('AudioBufferSourceNode', {
+    parent: AudioScheduledSourceNode, inputs: 0, outputs: 1, channels: 2, always: true,
+    init: function (n, ctx, o) {
+      var d = n.__d; d.buffer = null; d.loop = false; d.loopStart = 0; d.loopEnd = 0; d.pos = 0; d.playing = false;
+      d.playbackRate = param(n, 'playbackRate', 1, NEG, POS); d.detune = param(n, 'detune', 0, NEG, POS);
+      paramOption(n, d.playbackRate, o, 'playbackRate'); paramOption(n, d.detune, o, 'detune');
+      if (o.buffer !== undefined && o.buffer !== null) n.buffer = o.buffer;
+      if (o.loop !== undefined) d.loop = !!o.loop; if (o.loopStart !== undefined) d.loopStart = Number(o.loopStart); if (o.loopEnd !== undefined) d.loopEnd = Number(o.loopEnd);
+    },
+    process: function (n, inputs, ctx, start) {
+      var d = n.__d, buf = d.buffer, nch = buf ? buf.numberOfChannels : 1, outs = silence(nch), r = activeRange(n, ctx, start);
+      if (!r || !buf) { if (r && !buf) { stopReached(n, ctx, start); } return [outs]; }
+      var rate = ctx.sampleRate, ratio = buf.sampleRate / rate, pr = paramBlock(d.playbackRate, ctx, start), dt = paramBlock(d.detune, ctx, start), len = buf.length;
+      var ls = d.loopStart * buf.sampleRate, le = d.loopEnd > 0 ? Math.min(d.loopEnd * buf.sampleRate, len) : len;
+      var loop = d.loop && le > ls;
+      if (!d.playing) { d.playing = true; d.pos = d.offset * buf.sampleRate; if (loop && d.pos >= le) d.pos = ls + (d.pos - ls) % (le - ls); d.limit = d.duration === undefined ? Infinity : d.pos + d.duration * buf.sampleRate; d.first = d.pos; }
+      var pos = d.pos, data = buf.__c, done = false;
+      for (var i = r[0]; i < r[1]; i++) {
+        if (loop && pos >= le) pos = ls + (pos - ls) % (le - ls);
+        if (pos >= len || pos < 0 || pos >= d.limit) { done = true; break; }
+        var k = Math.floor(pos), f = pos - k, k2 = k + 1;
+        if (k2 >= len) k2 = loop ? Math.floor(ls) : k;
+        for (var c = 0; c < nch; c++) { var ch = data[c]; outs[c][i] = ch[k] * (1 - f) + ch[k2] * f; }
+        var step = pr[i] * (dt[i] === 0 ? 1 : Math.pow(2, dt[i] / 1200)) * ratio;
+        pos += step;
+      }
+      d.pos = pos;
+      if (done || (!loop && (pos >= len || pos >= d.limit))) finish(n, ctx); else stopReached(n, ctx, start);
+      return [outs];
+    }
+  });
+  exposeParam(AudioBufferSourceNode, 'playbackRate'); exposeParam(AudioBufferSourceNode, 'detune');
+  accessor(AudioBufferSourceNode.prototype, 'buffer', function () { return this.__d.buffer; }, function (b) {
+    if (b !== null && !(b instanceof AudioBuffer)) throw new TypeError("Failed to set the 'buffer' property on 'AudioBufferSourceNode': The provided value is not of type 'AudioBuffer'.");
+    if (b !== null && this.__d.bufferSet) throw domex("Failed to set the 'buffer' property on 'AudioBufferSourceNode': Cannot set buffer to non-null after it has been already been set to a non-null buffer", 'InvalidStateError');
+    this.__d.buffer = b; if (b) this.__d.bufferSet = true;
+  });
+  ['loop', 'loopStart', 'loopEnd'].forEach(function (k) { accessor(AudioBufferSourceNode.prototype, k, function () { return this.__d[k]; }, function (v) { this.__d[k] = k === 'loop' ? !!v : Number(v); }); });
+  def(AudioBufferSourceNode.prototype, 'start', function (when, offset, duration) {
+    var d = this.__d; when = checkWhen(when, 'start');
+    if (d.started) throw domex("Failed to execute 'start' on 'AudioBufferSourceNode': cannot call start more than once.", 'InvalidStateError');
+    if (offset !== undefined && !(Number(offset) >= 0)) throw new RangeError("Failed to execute 'start' on 'AudioBufferSourceNode': The offset provided (" + offset + ') is negative.');
+    if (duration !== undefined && !(Number(duration) >= 0)) throw new RangeError("Failed to execute 'start' on 'AudioBufferSourceNode': The duration provided (" + duration + ') is negative.');
+    d.started = true; d.startT = when; d.offset = offset === undefined ? 0 : Number(offset); d.duration = duration === undefined ? undefined : Number(duration);
+  });
+
+  // ------------------------------------------------------------------------------------------------------------------------------ processing nodes
+  var GainNode = nodeClass('GainNode', {
+    inputs: 1, outputs: 1, channels: 2, mode: 'max',
+    init: function (n, ctx, o) { n.__d.gain = param(n, 'gain', 1, NEG, POS); paramOption(n, n.__d.gain, o, 'gain'); },
+    process: function (n, inputs, ctx, start) {
+      var gain = paramBlock(n.__d.gain, ctx, start), inp = inputs[0], out = [];
+      for (var c = 0; c < inp.length; c++) { var o = new Float32Array(QUANTUM), s = inp[c]; for (var i = 0; i < QUANTUM; i++) o[i] = s[i] * gain[i]; out.push(o); }
+      return [out];
+    }
+  });
+  exposeParam(GainNode, 'gain');
+
+  var DelayNode = nodeClass('DelayNode', {
+    inputs: 1, outputs: 1, channels: 2, mode: 'max',
+    pre: function (n, ctx, o) {
+      var max = o.maxDelayTime === undefined ? 1 : Number(o.maxDelayTime);
+      if (!(max > 0 && max < 180)) throw domex("Failed to construct 'DelayNode': The max delay time provided (" + max + ') is outside the range (0, 180).', 'NotSupportedError');
+      n.__d.max = max;
+    },
+    init: function (n, ctx, o) { var d = n.__d; d.delayTime = param(n, 'delayTime', 0, 0, d.max); paramOption(n, d.delayTime, o, 'delayTime'); d.buf = null; d.w = 0; },
+    process: function (n, inputs, ctx, start) {
+      var d = n.__d, inp = inputs[0], nch = inp.length, rate = ctx.sampleRate, size = Math.ceil(d.max * rate) + QUANTUM + 2;
+      if (!d.buf || d.buf.length !== nch) { var old = d.buf; d.buf = []; for (var c0 = 0; c0 < nch; c0++) d.buf.push(old && old[c0] ? old[c0] : new Float32Array(size)); }
+      var dt = paramBlock(d.delayTime, ctx, start), out = silence(nch), w = d.w, i, c;
+      for (i = 0; i < QUANTUM; i++) {
+        for (c = 0; c < nch; c++) d.buf[c][(w + i) % size] = inp[c][i];
+        var delay = Math.min(dt[i], d.max) * rate, rp = w + i - delay, k = Math.floor(rp), f = rp - k;
+        for (c = 0; c < nch; c++) { var b = d.buf[c]; out[c][i] = b[((k % size) + size) % size] * (1 - f) + b[(((k + 1) % size) + size) % size] * f; }
+      }
+      d.w = (w + QUANTUM) % size;
+      return [out];
+    }
+  });
+  exposeParam(DelayNode, 'delayTime');
+
+  var StereoPannerNode = nodeClass('StereoPannerNode', {
+    inputs: 1, outputs: 1, channels: 2, mode: 'clamped-max', maxChannels: 2, noMax: true,
+    init: function (n, ctx, o) { n.__d.pan = param(n, 'pan', 0, -1, 1); paramOption(n, n.__d.pan, o, 'pan'); },
+    process: function (n, inputs, ctx, start) {
+      var pan = paramBlock(n.__d.pan, ctx, start), inp = inputs[0], L = new Float32Array(QUANTUM), R = new Float32Array(QUANTUM), mono = inp.length === 1;
+      for (var i = 0; i < QUANTUM; i++) {
+        var p = Math.max(-1, Math.min(1, pan[i])), x = mono ? (p + 1) / 2 : (p <= 0 ? p + 1 : p), gl = Math.cos(x * Math.PI / 2), gr = Math.sin(x * Math.PI / 2);
+        if (mono) { L[i] = inp[0][i] * gl; R[i] = inp[0][i] * gr; }
+        else if (p <= 0) { L[i] = inp[0][i] + inp[1][i] * gl; R[i] = inp[1][i] * gr; }
+        else { L[i] = inp[0][i] * gl; R[i] = inp[1][i] + inp[0][i] * gr; }
+      }
+      return [[L, R]];
+    }
+  });
+  exposeParam(StereoPannerNode, 'pan');
+
+  var WaveShaperNode = nodeClass('WaveShaperNode', {
+    inputs: 1, outputs: 1, channels: 2, mode: 'max',
+    init: function (n, ctx, o) { n.__d.curve = null; n.__d.oversample = 'none'; if (o.curve !== undefined && o.curve !== null) n.curve = o.curve; if (o.oversample !== undefined) n.oversample = o.oversample; },
+    process: function (n, inputs) {
+      var curve = n.__d.curve, inp = inputs[0], out = [];
+      for (var c = 0; c < inp.length; c++) {
+        var o = new Float32Array(QUANTUM), s = inp[c];
+        for (var i = 0; i < QUANTUM; i++) {
+          if (!curve) { o[i] = s[i]; continue; }
+          var m = curve.length, pos = (m - 1) / 2 * (s[i] + 1);
+          if (pos <= 0) o[i] = curve[0]; else if (pos >= m - 1) o[i] = curve[m - 1]; else { var k = Math.floor(pos), f = pos - k; o[i] = curve[k] * (1 - f) + curve[k + 1] * f; }
+        }
+        out.push(o);
+      }
+      return [out];
+    }
+  });
+  accessor(WaveShaperNode.prototype, 'curve', function () { return this.__d.curveSource || null; }, function (v) {
+    if (v === null) { this.__d.curve = null; this.__d.curveSource = null; return; }
+    if (!(v instanceof Float32Array)) throw new TypeError("Failed to set the 'curve' property on 'WaveShaperNode': The provided value is not of type 'Float32Array'.");
+    if (v.length < 2) throw domex("Failed to set the 'curve' property on 'WaveShaperNode': The curve length provided (" + v.length + ') is less than the minimum bound (2).', 'InvalidStateError');
+    if (this.__d.curveSource) throw domex("Failed to set the 'curve' property on 'WaveShaperNode': The curve has already been set.", 'InvalidStateError');
+    this.__d.curveSource = v; this.__d.curve = new Float32Array(v);
+  });
+  accessor(WaveShaperNode.prototype, 'oversample', function () { return this.__d.oversample; }, function (v) { v = String(v); if (v === 'none' || v === '2x' || v === '4x') this.__d.oversample = v; });
+
+  // biquad coefficients (the cookbook formulas, as the standard gives them)
+  function biquadCoefficients(type, freq, q, gainDb, rate) {
+    var nyq = rate / 2, f = Math.max(0, Math.min(1, freq / nyq)), b0, b1, b2, a0 = 1, a1, a2;
+    if (f >= 1) { return type === 'lowpass' || type === 'allpass' || type === 'lowshelf' || type === 'peaking' ? [1, 0, 0, 0, 0] : [0, 0, 0, 0, 0]; }
+    var A = Math.pow(10, gainDb / 40), w0 = Math.PI * f, cw = Math.cos(w0), sw = Math.sin(w0);
+    switch (type) {
+      case 'lowpass': {
+        if (f <= 0) return [0, 0, 0, 0, 0];
+        var g = Math.pow(10, q / 20), al = sw / (2 * g);
+        b0 = (1 - cw) / 2; b1 = 1 - cw; b2 = b0; a0 = 1 + al; a1 = -2 * cw; a2 = 1 - al; break;
+      }
+      case 'highpass': {
+        if (f <= 0) return [1, 0, 0, 0, 0];
+        var g2 = Math.pow(10, q / 20), al2 = sw / (2 * g2);
+        b0 = (1 + cw) / 2; b1 = -(1 + cw); b2 = b0; a0 = 1 + al2; a1 = -2 * cw; a2 = 1 - al2; break;
+      }
+      case 'bandpass': {
+        if (f <= 0 || q <= 0) return [0, 0, 0, 0, 0];
+        var al3 = sw / (2 * q); b0 = al3; b1 = 0; b2 = -al3; a0 = 1 + al3; a1 = -2 * cw; a2 = 1 - al3; break;
+      }
+      case 'notch': {
+        if (f <= 0) return [1, 0, 0, 0, 0];
+        var al4 = sw / (2 * q); b0 = 1; b1 = -2 * cw; b2 = 1; a0 = 1 + al4; a1 = -2 * cw; a2 = 1 - al4; break;
+      }
+      case 'allpass': {
+        if (f <= 0) return [1, 0, 0, 0, 0];
+        var al5 = sw / (2 * q); b0 = 1 - al5; b1 = -2 * cw; b2 = 1 + al5; a0 = 1 + al5; a1 = -2 * cw; a2 = 1 - al5; break;
+      }
+      case 'peaking': {
+        if (f <= 0) return [1, 0, 0, 0, 0];
+        var al6 = sw / (2 * q); b0 = 1 + al6 * A; b1 = -2 * cw; b2 = 1 - al6 * A; a0 = 1 + al6 / A; a1 = -2 * cw; a2 = 1 - al6 / A; break;
+      }
+      case 'lowshelf': {
+        if (f <= 0) return [A * A, 0, 0, 0, 0];
+        var s2 = 2 * Math.sqrt(A) * sw / 2 * Math.sqrt((A + 1 / A) * (1 / 1 - 1) + 2);
+        var beta = 2 * Math.sqrt(A) * sw / 2 * Math.SQRT2;
+        b0 = A * ((A + 1) - (A - 1) * cw + beta); b1 = 2 * A * ((A - 1) - (A + 1) * cw); b2 = A * ((A + 1) - (A - 1) * cw - beta);
+        a0 = (A + 1) + (A - 1) * cw + beta; a1 = -2 * ((A - 1) + (A + 1) * cw); a2 = (A + 1) + (A - 1) * cw - beta; break;
+      }
+      case 'highshelf': {
+        if (f <= 0) return [1, 0, 0, 0, 0];
+        var beta2 = 2 * Math.sqrt(A) * sw / 2 * Math.SQRT2;
+        b0 = A * ((A + 1) + (A - 1) * cw + beta2); b1 = -2 * A * ((A - 1) + (A + 1) * cw); b2 = A * ((A + 1) + (A - 1) * cw - beta2);
+        a0 = (A + 1) - (A - 1) * cw + beta2; a1 = 2 * ((A - 1) - (A + 1) * cw); a2 = (A + 1) - (A - 1) * cw - beta2; break;
+      }
+      default: return [1, 0, 0, 0, 0];
+    }
+    return [b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0];
+  }
+  var BiquadFilterNode = nodeClass('BiquadFilterNode', {
+    inputs: 1, outputs: 1, channels: 2, mode: 'max',
+    init: function (n, ctx, o) {
+      var d = n.__d, nyq = ctx.sampleRate / 2; d.type = 'lowpass'; d.z = [];
+      d.frequency = param(n, 'frequency', 350, 0, nyq); d.detune = param(n, 'detune', 0, -153600, 153600); d.Q = param(n, 'Q', 1, NEG, POS); d.gain = param(n, 'gain', 0, NEG, 1541);
+      ['frequency', 'detune', 'Q', 'gain'].forEach(function (k) { paramOption(n, d[k], o, k); });
+      if (o.type !== undefined) n.type = o.type;
+    },
+    process: function (n, inputs, ctx, start) {
+      var d = n.__d, inp = inputs[0], nch = inp.length, fr = paramBlock(d.frequency, ctx, start, true), dt = paramBlock(d.detune, ctx, start, true), q = paramBlock(d.Q, ctx, start, true), gn = paramBlock(d.gain, ctx, start, true);
+      var freq = fr[0] * Math.pow(2, dt[0] / 1200), cf = biquadCoefficients(d.type, freq, q[0], gn[0], ctx.sampleRate), out = [];
+      while (d.z.length < nch) d.z.push([0, 0, 0, 0]);
+      for (var c = 0; c < nch; c++) {
+        var s = inp[c], o = new Float32Array(QUANTUM), z = d.z[c], x1 = z[0], x2 = z[1], y1 = z[2], y2 = z[3];
+        for (var i = 0; i < QUANTUM; i++) { var x = s[i], y = cf[0] * x + cf[1] * x1 + cf[2] * x2 - cf[3] * y1 - cf[4] * y2; o[i] = y; x2 = x1; x1 = x; y2 = y1; y1 = y; }
+        z[0] = x1; z[1] = x2; z[2] = y1; z[3] = y2; out.push(o);
+      }
+      return [out];
+    }
+  });
+  ['frequency', 'detune', 'Q', 'gain'].forEach(function (k) { exposeParam(BiquadFilterNode, k); });
+  accessor(BiquadFilterNode.prototype, 'type', function () { return this.__d.type; }, function (v) { v = String(v); if (['lowpass', 'highpass', 'bandpass', 'lowshelf', 'highshelf', 'peaking', 'notch', 'allpass'].indexOf(v) >= 0) this.__d.type = v; });
+  def(BiquadFilterNode.prototype, 'getFrequencyResponse', function (freqs, mag, phase) {
+    if (!(freqs instanceof Float32Array) || !(mag instanceof Float32Array) || !(phase instanceof Float32Array)) throw new TypeError("Failed to execute 'getFrequencyResponse' on 'BiquadFilterNode': parameter is not of type 'Float32Array'.");
+    if (freqs.length !== mag.length || freqs.length !== phase.length) throw domex("Failed to execute 'getFrequencyResponse' on 'BiquadFilterNode': The magResponse length (" + mag.length + ') does not match the frequencyHz length (' + freqs.length + ').', 'InvalidAccessError');
+    var d = this.__d, rate = this.__ctx.sampleRate, cf = biquadCoefficients(d.type, d.frequency.value * Math.pow(2, d.detune.value / 1200), d.Q.value, d.gain.value, rate);
+    responseOf([cf[0], cf[1], cf[2]], [1, cf[3], cf[4]], freqs, mag, phase, rate);
+  });
+  function responseOf(b, a, freqs, mag, phase, rate) {
+    for (var i = 0; i < freqs.length; i++) {
+      var f = freqs[i];
+      if (!(f >= 0 && f <= rate / 2)) { mag[i] = NaN; phase[i] = NaN; continue; }
+      var w = Math.PI * f / (rate / 2), nr = 0, ni = 0, dr = 0, di = 0, k;
+      for (k = 0; k < b.length; k++) { nr += b[k] * Math.cos(-w * k); ni += b[k] * Math.sin(-w * k); }
+      for (k = 0; k < a.length; k++) { dr += a[k] * Math.cos(-w * k); di += a[k] * Math.sin(-w * k); }
+      var den = dr * dr + di * di, re = (nr * dr + ni * di) / den, im = (ni * dr - nr * di) / den;
+      mag[i] = Math.hypot(re, im); phase[i] = Math.atan2(im, re);
+    }
+  }
+
+  var IIRFilterNode = nodeClass('IIRFilterNode', {
+    inputs: 1, outputs: 1, channels: 2, mode: 'max',
+    pre: function (n, ctx, o) {
+      var ff = o.feedforward, fb = o.feedback;
+      if (!ff || !fb) throw new TypeError("Failed to construct 'IIRFilterNode': required member " + (!ff ? 'feedforward' : 'feedback') + ' is undefined.');
+      ff = Array.prototype.slice.call(ff).map(Number); fb = Array.prototype.slice.call(fb).map(Number);
+      if (!ff.length || ff.length > 20) throw domex("Failed to construct 'IIRFilterNode': The feedforward array length (" + ff.length + ') is outside the range [1, 20].', 'NotSupportedError');
+      if (!fb.length || fb.length > 20) throw domex("Failed to construct 'IIRFilterNode': The feedback array length (" + fb.length + ') is outside the range [1, 20].', 'NotSupportedError');
+      if (fb[0] === 0) throw domex("Failed to construct 'IIRFilterNode': First feedback coefficient cannot be zero.", 'InvalidStateError');
+      if (ff.every(function (x) { return x === 0; })) throw domex("Failed to construct 'IIRFilterNode': feedforward coefficients cannot all be zero.", 'InvalidStateError');
+      var a0 = fb[0]; n.__d.b = ff.map(function (x) { return x / a0; }); n.__d.a = fb.map(function (x) { return x / a0; }); n.__d.x = []; n.__d.y = [];
+    },
+    process: function (n, inputs) {
+      var d = n.__d, inp = inputs[0], out = [];
+      for (var c = 0; c < inp.length; c++) {
+        if (!d.x[c]) { d.x[c] = new Float64Array(d.b.length); d.y[c] = new Float64Array(d.a.length); }
+        var xs = d.x[c], ys = d.y[c], o = new Float32Array(QUANTUM), s = inp[c];
+        for (var i = 0; i < QUANTUM; i++) {
+          var k, acc = 0;
+          for (k = xs.length - 1; k > 0; k--) xs[k] = xs[k - 1];
+          xs[0] = s[i];
+          for (k = 0; k < d.b.length; k++) acc += d.b[k] * xs[k];
+          for (k = 1; k < d.a.length; k++) acc -= d.a[k] * ys[k - 1];
+          for (k = ys.length - 1; k > 0; k--) ys[k] = ys[k - 1];
+          ys[0] = acc; o[i] = acc;
+        }
+        out.push(o);
+      }
+      return [out];
+    }
+  });
+  def(IIRFilterNode.prototype, 'getFrequencyResponse', function (freqs, mag, phase) {
+    if (freqs.length !== mag.length || freqs.length !== phase.length) throw domex("Failed to execute 'getFrequencyResponse' on 'IIRFilterNode': array lengths differ.", 'InvalidAccessError');
+    responseOf(this.__d.b, this.__d.a, freqs, mag, phase, this.__ctx.sampleRate);
+  });
+
+  var ChannelSplitterNode = nodeClass('ChannelSplitterNode', {
+    inputs: 1, outputs: 6, channels: 6, mode: 'explicit', interp: 'discrete', fixedMode: 'explicit', fixedChannels: undefined,
+    pre: function (n, ctx, o) {
+      var k = o.numberOfOutputs === undefined ? 6 : o.numberOfOutputs >>> 0;
+      if (k < 1 || k > 32) throw domex("Failed to construct 'ChannelSplitterNode': Number of outputs (" + k + ') must be between 1 and 32.', 'IndexSizeError');
+      n.__nout = k; n.__channels = k;
+    },
+    process: function (n, inputs) { var inp = inputs[0], out = []; for (var k = 0; k < n.__nout; k++) out.push([inp[k] || new Float32Array(QUANTUM)]); return out; }
+  });
+  var ChannelMergerNode = nodeClass('ChannelMergerNode', {
+    inputs: 6, outputs: 1, channels: 1, mode: 'explicit', fixedMode: 'explicit', fixedChannels: 1,
+    pre: function (n, ctx, o) {
+      var k = o.numberOfInputs === undefined ? 6 : o.numberOfInputs >>> 0;
+      if (k < 1 || k > 32) throw domex("Failed to construct 'ChannelMergerNode': Number of inputs (" + k + ') must be between 1 and 32.', 'IndexSizeError');
+      n.__in.length = 0; for (var i = 0; i < k; i++) n.__in.push([]);
+    },
+    process: function (n, inputs) { var out = []; for (var k = 0; k < inputs.length; k++) out.push(inputs[k][0]); return [out]; }
+  });
+
+  var DynamicsCompressorNode = nodeClass('DynamicsCompressorNode', {
+    inputs: 1, outputs: 1, channels: 2, mode: 'clamped-max', maxChannels: 2, noMax: true,
+    init: function (n, ctx, o) {
+      var d = n.__d; d.threshold = param(n, 'threshold', -24, -100, 0, 'k-rate', true); d.knee = param(n, 'knee', 30, 0, 40, 'k-rate', true); d.ratio = param(n, 'ratio', 12, 1, 20, 'k-rate', true);
+      d.attack = param(n, 'attack', 0.003, 0, 1, 'k-rate', true); d.release = param(n, 'release', 0.25, 0, 1, 'k-rate', true); d.gr = 0; d.env = 0;
+      ['threshold', 'knee', 'ratio', 'attack', 'release'].forEach(function (k) { paramOption(n, d[k], o, k); });
+    },
+    process: function (n, inputs, ctx, start) {
+      var d = n.__d, inp = inputs[0], th = paramBlock(d.threshold, ctx, start, true)[0], knee = paramBlock(d.knee, ctx, start, true)[0], ratio = paramBlock(d.ratio, ctx, start, true)[0];
+      var att = paramBlock(d.attack, ctx, start, true)[0], rel = paramBlock(d.release, ctx, start, true)[0], rate = ctx.sampleRate, out = silence(inp.length);
+      var ac = Math.exp(-1 / Math.max(1, att * rate)), rc = Math.exp(-1 / Math.max(1, rel * rate)), env = d.env, i, c, peak;
+      for (i = 0; i < QUANTUM; i++) {
+        peak = 0; for (c = 0; c < inp.length; c++) peak = Math.max(peak, Math.abs(inp[c][i]));
+        env = peak > env ? ac * env + (1 - ac) * peak : rc * env + (1 - rc) * peak;
+        var db = 20 * Math.log10(Math.max(env, 1e-9)), over = db - th, gainDb;
+        if (over <= -knee / 2) gainDb = 0; else if (over >= knee / 2 || knee === 0) gainDb = (th + over / ratio) - db; else { var t = over + knee / 2; gainDb = (1 / ratio - 1) * t * t / (2 * knee); }
+        var gain = Math.pow(10, Math.min(0, gainDb) / 20);
+        for (c = 0; c < inp.length; c++) out[c][i] = inp[c][i] * gain;
+        d.gr = Math.min(0, gainDb);
+      }
+      d.env = env;
+      return [out];
+    }
+  });
+  ['threshold', 'knee', 'ratio', 'attack', 'release'].forEach(function (k) { exposeParam(DynamicsCompressorNode, k); });
+  accessor(DynamicsCompressorNode.prototype, 'reduction', function () { return this.__d.gr; });
+
+  var ConvolverNode = nodeClass('ConvolverNode', {
+    inputs: 1, outputs: 1, channels: 2, mode: 'clamped-max', maxChannels: 2, noMax: true,
+    init: function (n, ctx, o) { n.__d.buffer = null; n.__d.normalize = o.disableNormalization ? false : true; n.__d.hist = []; if (o.buffer) n.buffer = o.buffer; },
+    process: function (n, inputs) {
+      var d = n.__d, inp = inputs[0], buf = d.buffer;
+      if (!buf) return [silence(inp.length)];
+      var hl = buf.length, nch = inp.length, out = silence(nch), c, i, k;
+      for (c = 0; c < nch; c++) {
+        var ir = buf.__c[Math.min(c, buf.numberOfChannels - 1)], x = inp[c], plen = hl - 1, prev = d.hist[c] || new Float32Array(plen), scale = d.scale;
+        for (i = 0; i < QUANTUM; i++) {
+          var acc = 0, top = Math.min(hl - 1, i + plen);
+          for (k = 0; k <= top; k++) acc += ir[k] * (i - k >= 0 ? x[i - k] : prev[plen + i - k]);
+          out[c][i] = acc * scale;
+        }
+        var next = new Float32Array(plen);
+        for (k = 0; k < plen; k++) { var j = QUANTUM - plen + k; next[k] = j >= 0 ? x[j] : prev[plen + j]; }
+        d.hist[c] = next;
+      }
+      return [out];
+    }
+  });
+  accessor(ConvolverNode.prototype, 'buffer', function () { return this.__d.buffer; }, function (b) {
+    if (b === null) { this.__d.buffer = null; return; }
+    if (!(b instanceof AudioBuffer)) throw new TypeError("Failed to set the 'buffer' property on 'ConvolverNode': The provided value is not of type 'AudioBuffer'.");
+    if (b.sampleRate !== this.__ctx.sampleRate) throw domex("Failed to set the 'buffer' property on 'ConvolverNode': The buffer sample rate of " + b.sampleRate + " does not match the context rate of " + this.__ctx.sampleRate + ' Hz.', 'NotSupportedError');
+    if ([1, 2, 4].indexOf(b.numberOfChannels) < 0) throw domex("Failed to set the 'buffer' property on 'ConvolverNode': The buffer must have 1, 2, or 4 channels.", 'NotSupportedError');
+    this.__d.buffer = b; this.__d.hist = [];
+    var sum = 0, c, i; for (c = 0; c < b.numberOfChannels; c++) for (i = 0; i < b.length; i++) sum += b.__c[c][i] * b.__c[c][i];
+    this.__d.scale = this.__d.normalize && sum > 0 ? Math.min(1, 1 / Math.sqrt(sum / b.numberOfChannels)) : 1;
+  });
+  accessor(ConvolverNode.prototype, 'normalize', function () { return this.__d.normalize; }, function (v) { this.__d.normalize = !!v; if (this.__d.buffer) { var b = this.__d.buffer; this.buffer = null; this.buffer = b; } });
+
+  // ------------------------------------------------------------------------------------------------------------------------------ analyser
+  function fft(re, im) {   // in place, radix 2
+    var n = re.length, i, j = 0, k;
+    for (i = 1; i < n; i++) { var bit = n >> 1; for (; j & bit; bit >>= 1) j ^= bit; j ^= bit; if (i < j) { var t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; } }
+    for (var len = 2; len <= n; len <<= 1) {
+      var ang = -TWO_PI / len, wr = Math.cos(ang), wi = Math.sin(ang);
+      for (i = 0; i < n; i += len) {
+        var cr = 1, ci = 0;
+        for (k = 0; k < len / 2; k++) {
+          var ur = re[i + k], ui = im[i + k], vr = re[i + k + len / 2] * cr - im[i + k + len / 2] * ci, vi = re[i + k + len / 2] * ci + im[i + k + len / 2] * cr;
+          re[i + k] = ur + vr; im[i + k] = ui + vi; re[i + k + len / 2] = ur - vr; im[i + k + len / 2] = ui - vi;
+          var nr = cr * wr - ci * wi; ci = cr * wi + ci * wr; cr = nr;
+        }
+      }
+    }
+  }
+  var AnalyserNode = nodeClass('AnalyserNode', {
+    inputs: 1, outputs: 1, channels: 2, mode: 'max', always: true,
+    init: function (n, ctx, o) {
+      var d = n.__d; d.fftSize = 2048; d.min = -100; d.max = -30; d.smooth = 0.8; d.ring = new Float32Array(32768); d.w = 0; d.prev = null; d.lastFrame = -1;
+      if (o.fftSize !== undefined) n.fftSize = o.fftSize; if (o.minDecibels !== undefined) n.minDecibels = o.minDecibels; if (o.maxDecibels !== undefined) n.maxDecibels = o.maxDecibels; if (o.smoothingTimeConstant !== undefined) n.smoothingTimeConstant = o.smoothingTimeConstant;
+    },
+    process: function (n, inputs) {
+      var d = n.__d, inp = inputs[0], i;
+      for (i = 0; i < QUANTUM; i++) { var s = 0; for (var c = 0; c < inp.length; c++) s += inp[c][i]; d.ring[(d.w + i) % d.ring.length] = s / inp.length; }
+      d.w = (d.w + QUANTUM) % d.ring.length; d.fresh = true;
+      return [inp];
+    }
+  });
+  function recent(a, count) { var d = a.__d, out = new Float32Array(count), len = d.ring.length; for (var i = 0; i < count; i++) out[i] = d.ring[((d.w - count + i) % len + len) % len]; return out; }
+  accessor(AnalyserNode.prototype, 'fftSize', function () { return this.__d.fftSize; }, function (v) {
+    v = Number(v);
+    if (!(v >= 32 && v <= 32768) || (v & (v - 1)) !== 0) throw domex("Failed to set the 'fftSize' property on 'AnalyserNode': The FFT size provided (" + v + ') is not a power of two in the range 32 to 32768.', 'IndexSizeError');
+    this.__d.fftSize = v; this.__d.prev = null;
+  });
+  accessor(AnalyserNode.prototype, 'frequencyBinCount', function () { return this.__d.fftSize / 2; });
+  accessor(AnalyserNode.prototype, 'minDecibels', function () { return this.__d.min; }, function (v) { v = Number(v); if (!(v < this.__d.max)) throw domex("Failed to set the 'minDecibels' property on 'AnalyserNode': The minDecibels provided (" + v + ') is greater than or equal to the maxDecibels.', 'IndexSizeError'); this.__d.min = v; });
+  accessor(AnalyserNode.prototype, 'maxDecibels', function () { return this.__d.max; }, function (v) { v = Number(v); if (!(v > this.__d.min)) throw domex("Failed to set the 'maxDecibels' property on 'AnalyserNode': The maxDecibels provided (" + v + ') is less than or equal to the minDecibels.', 'IndexSizeError'); this.__d.max = v; });
+  accessor(AnalyserNode.prototype, 'smoothingTimeConstant', function () { return this.__d.smooth; }, function (v) { v = Number(v); if (!(v >= 0 && v <= 1)) throw domex("Failed to set the 'smoothingTimeConstant' property on 'AnalyserNode': The smoothing value provided (" + v + ') is outside the range [0, 1].', 'IndexSizeError'); this.__d.smooth = v; });
+  def(AnalyserNode.prototype, 'getFloatTimeDomainData', function (arr) { var data = recent(this, this.__d.fftSize), n = Math.min(arr.length, data.length); for (var i = 0; i < n; i++) arr[i] = data[i]; });
+  def(AnalyserNode.prototype, 'getByteTimeDomainData', function (arr) { var data = recent(this, this.__d.fftSize), n = Math.min(arr.length, data.length); for (var i = 0; i < n; i++) arr[i] = Math.max(0, Math.min(255, Math.floor(128 * (1 + data[i])))); });
+  function spectrum(a) {
+    var d = a.__d, size = d.fftSize, x = recent(a, size), re = new Float64Array(size), im = new Float64Array(size), i;
+    for (i = 0; i < size; i++) { var w = 0.42 - 0.5 * Math.cos(TWO_PI * i / size) + 0.08 * Math.cos(2 * TWO_PI * i / size); re[i] = x[i] * w; }
+    fft(re, im);
+    var bins = size / 2, mag = new Float64Array(bins);
+    if (!d.prev || d.prev.length !== bins) d.prev = new Float64Array(bins);
+    for (i = 0; i < bins; i++) { var m = Math.hypot(re[i], im[i]) / size; d.prev[i] = d.smooth * d.prev[i] + (1 - d.smooth) * m; mag[i] = d.prev[i]; }
+    return mag;
+  }
+  def(AnalyserNode.prototype, 'getFloatFrequencyData', function (arr) { var mag = spectrum(this), n = Math.min(arr.length, mag.length); for (var i = 0; i < n; i++) arr[i] = mag[i] > 0 ? 20 * Math.log10(mag[i]) : -Infinity; });
+  def(AnalyserNode.prototype, 'getByteFrequencyData', function (arr) {
+    var mag = spectrum(this), n = Math.min(arr.length, mag.length), lo = this.__d.min, hi = this.__d.max;
+    for (var i = 0; i < n; i++) { var db = mag[i] > 0 ? 20 * Math.log10(mag[i]) : -Infinity, v = Math.floor(255 / (hi - lo) * (db - lo)); arr[i] = Math.max(0, Math.min(255, v === v ? v : 0)); }
+  });
+
+  // ------------------------------------------------------------------------------------------------------------------------------ panner
+  var PannerNode = nodeClass('PannerNode', {
+    inputs: 1, outputs: 1, channels: 2, mode: 'clamped-max', maxChannels: 2, noMax: true,
+    init: function (n, ctx, o) {
+      var d = n.__d; d.panningModel = 'equalpower'; d.distanceModel = 'inverse'; d.refDistance = 1; d.maxDistance = 10000; d.rolloffFactor = 1; d.coneInnerAngle = 360; d.coneOuterAngle = 360; d.coneOuterGain = 0;
+      [['positionX', 0], ['positionY', 0], ['positionZ', 0], ['orientationX', 1], ['orientationY', 0], ['orientationZ', 0]].forEach(function (p) { d[p[0]] = param(n, p[0], p[1], NEG, POS); paramOption(n, d[p[0]], o, p[0]); });
+      ['panningModel', 'distanceModel', 'refDistance', 'maxDistance', 'rolloffFactor', 'coneInnerAngle', 'coneOuterAngle', 'coneOuterGain'].forEach(function (k) { if (o[k] !== undefined) n[k] = o[k]; });
+    },
+    process: function (n, inputs, ctx, start) {
+      var d = n.__d, L = ctx.listener.__d, inp = inputs[0], px = paramBlock(d.positionX, ctx, start, true)[0], py = paramBlock(d.positionY, ctx, start, true)[0], pz = paramBlock(d.positionZ, ctx, start, true)[0];
+      var lx = paramBlock(L.positionX, ctx, start, true)[0], ly = paramBlock(L.positionY, ctx, start, true)[0], lz = paramBlock(L.positionZ, ctx, start, true)[0];
+      var fx = paramBlock(L.forwardX, ctx, start, true)[0], fy = paramBlock(L.forwardY, ctx, start, true)[0], fz = paramBlock(L.forwardZ, ctx, start, true)[0];
+      var ux = paramBlock(L.upX, ctx, start, true)[0], uy = paramBlock(L.upY, ctx, start, true)[0], uz = paramBlock(L.upZ, ctx, start, true)[0];
+      var dx = px - lx, dy = py - ly, dz = pz - lz, dist = Math.hypot(dx, dy, dz);
+      // azimuth in the listener's horizontal plane
+      var rx = fy * uz - fz * uy, ry = fz * ux - fx * uz, rz = fx * uy - fy * ux, rl = Math.hypot(rx, ry, rz) || 1; rx /= rl; ry /= rl; rz /= rl;
+      var az = 0;
+      if (dist > 0) { var side = (dx * rx + dy * ry + dz * rz) / dist, front = (dx * fx + dy * fy + dz * fz) / (dist * (Math.hypot(fx, fy, fz) || 1)); az = Math.atan2(side, front) * 180 / Math.PI; }
+      if (az < -90) az = -180 - az; else if (az > 90) az = 180 - az;
+      var x = (az + 90) / 180, mono = inp.length === 1;
+      if (!mono) x = az <= 0 ? (az + 90) / 90 : az / 90;
+      var gl = Math.cos(x * Math.PI / 2), gr = Math.sin(x * Math.PI / 2);
+      var gain, r = Math.max(0, Math.min(dist, d.maxDistance));
+      if (d.distanceModel === 'linear') gain = 1 - d.rolloffFactor * (Math.min(Math.max(dist, d.refDistance), d.maxDistance) - d.refDistance) / (d.maxDistance - d.refDistance || 1);
+      else if (d.distanceModel === 'exponential') gain = Math.pow(Math.max(dist, d.refDistance) / d.refDistance, -d.rolloffFactor);
+      else gain = d.refDistance / (d.refDistance + d.rolloffFactor * (Math.max(dist, d.refDistance) - d.refDistance));
+      var out = [new Float32Array(QUANTUM), new Float32Array(QUANTUM)];
+      for (var i = 0; i < QUANTUM; i++) {
+        if (mono) { out[0][i] = inp[0][i] * gl * gain; out[1][i] = inp[0][i] * gr * gain; }
+        else if (az <= 0) { out[0][i] = (inp[0][i] + inp[1][i] * gl) * gain; out[1][i] = inp[1][i] * gr * gain; }
+        else { out[0][i] = inp[0][i] * gl * gain; out[1][i] = (inp[1][i] + inp[0][i] * gr) * gain; }
+      }
+      return [out];
+    }
+  });
+  ['positionX', 'positionY', 'positionZ', 'orientationX', 'orientationY', 'orientationZ'].forEach(function (k) { exposeParam(PannerNode, k); });
+  [['panningModel', ['equalpower', 'HRTF']], ['distanceModel', ['linear', 'inverse', 'exponential']]].forEach(function (p) { accessor(PannerNode.prototype, p[0], function () { return this.__d[p[0]]; }, function (v) { v = String(v); if (p[1].indexOf(v) >= 0) this.__d[p[0]] = v; }); });
+  [['refDistance', 0], ['maxDistance', 1e-9], ['rolloffFactor', 0], ['coneInnerAngle', -Infinity], ['coneOuterAngle', -Infinity], ['coneOuterGain', 0]].forEach(function (p) {
+    accessor(PannerNode.prototype, p[0], function () { return this.__d[p[0]]; }, function (v) {
+      v = Number(v);
+      if (p[0] === 'coneOuterGain' && !(v >= 0 && v <= 1)) throw domex("Failed to set the 'coneOuterGain' property on 'PannerNode': The cone gain provided (" + v + ') is outside the range [0, 1].', 'InvalidStateError');
+      if ((p[0] === 'refDistance' || p[0] === 'rolloffFactor') && v < 0) throw new RangeError("Failed to set the '" + p[0] + "' property on 'PannerNode': The value provided (" + v + ') should be non-negative.');
+      if (p[0] === 'maxDistance' && !(v > 0)) throw new RangeError("Failed to set the 'maxDistance' property on 'PannerNode': The value provided (" + v + ') should be positive.');
+      this.__d[p[0]] = v;
+    });
+  });
+  def(PannerNode.prototype, 'setPosition', function (x, y, z) { this.__d.positionX.value = x; this.__d.positionY.value = y; this.__d.positionZ.value = z; });
+  def(PannerNode.prototype, 'setOrientation', function (x, y, z) { this.__d.orientationX.value = x; this.__d.orientationY.value = y; this.__d.orientationZ.value = z; });
+
+  // ------------------------------------------------------------------------------------------------------------------------------ script processor, media nodes
+  var AudioProcessingEvent = cls('AudioProcessingEvent', g.Event, function (type, init) { init = init || {}; var e = new g.Event(type); Object.setPrototypeOf(e, AudioProcessingEvent.prototype); hide(e, '__e', { playbackTime: init.playbackTime, inputBuffer: init.inputBuffer, outputBuffer: init.outputBuffer }); return e; });
+  ['playbackTime', 'inputBuffer', 'outputBuffer'].forEach(function (k) { accessor(AudioProcessingEvent.prototype, k, function () { return this.__e[k]; }); });
+  var OfflineAudioCompletionEvent = cls('OfflineAudioCompletionEvent', g.Event, function (type, init) { var e = new g.Event(type); Object.setPrototypeOf(e, OfflineAudioCompletionEvent.prototype); hide(e, '__e', { renderedBuffer: init && init.renderedBuffer }); return e; });
+  accessor(OfflineAudioCompletionEvent.prototype, 'renderedBuffer', function () { return this.__e.renderedBuffer; });
+  var ScriptProcessorNode = nodeClass('ScriptProcessorNode', {
+    inputs: 1, outputs: 1, channels: 2, mode: 'explicit', fixedMode: 'explicit', always: true,
+    process: function (n, inputs, ctx, start) {
+      var d = n.__d, inp = inputs[0], i, c;
+      if (!d.inBuf) { d.inBuf = silence(0); for (c = 0; c < d.inCh; c++) d.inBuf.push(new Float32Array(d.size)); d.outBuf = []; for (c = 0; c < d.outCh; c++) d.outBuf.push(new Float32Array(d.size)); d.fill = 0; d.emit = null; }
+      var out = silence(d.outCh);
+      for (c = 0; c < d.outCh; c++) if (d.emit) for (i = 0; i < QUANTUM; i++) out[c][i] = d.emit[c][d.fill + i];
+      for (c = 0; c < d.inCh; c++) { var s = inp[c] || inp[0]; for (i = 0; i < QUANTUM; i++) d.inBuf[c][d.fill + i] = s ? s[i] : 0; }
+      d.fill += QUANTUM;
+      if (d.fill >= d.size) {
+        var ib = makeBuffer(d.inCh, d.size, ctx.sampleRate), ob = makeBuffer(d.outCh, d.size, ctx.sampleRate);
+        for (c = 0; c < d.inCh; c++) ib.__c[c].set(d.inBuf[c]);
+        fire(n, new AudioProcessingEvent('audioprocess', { playbackTime: (start + QUANTUM + d.size) / ctx.sampleRate, inputBuffer: ib, outputBuffer: ob }));
+        d.emit = ob.__c; d.fill = 0;
+      }
+      return [out];
+    }
+  });
+  handler(ScriptProcessorNode.prototype, 'audioprocess');
+  accessor(ScriptProcessorNode.prototype, 'bufferSize', function () { return this.__d.size; });
+  def(AudioContext.prototype, 'createScriptProcessor', function (size, inCh, outCh) {
+    size = size === undefined ? 4096 : Number(size); inCh = inCh === undefined ? 2 : inCh >>> 0; outCh = outCh === undefined ? 2 : outCh >>> 0;
+    if ([0, 256, 512, 1024, 2048, 4096, 8192, 16384].indexOf(size) < 0) throw domex("Failed to execute 'createScriptProcessor' on 'BaseAudioContext': buffer size (" + size + ') must be a power of two between 256 and 16384.', 'IndexSizeError');
+    if (inCh === 0 && outCh === 0 || inCh > 32 || outCh > 32) throw domex("Failed to execute 'createScriptProcessor' on 'BaseAudioContext': number of input channels and output channels cannot both be zero.", 'IndexSizeError');
+    var node = new ScriptProcessorNode(this); node.__d.size = size || 4096; node.__d.inCh = inCh; node.__d.outCh = outCh; node.__channels = inCh || 1;
+    return node;
+  });
+  def(OfflineAudioContext.prototype, 'createScriptProcessor', AudioContext.prototype.createScriptProcessor);
+  var MediaElementAudioSourceNode = nodeClass('MediaElementAudioSourceNode', {
+    inputs: 0, outputs: 1, channels: 2, always: false, pre: function (n, ctx, o) { if (!o || !o.mediaElement) throw new TypeError("Failed to construct 'MediaElementAudioSourceNode': required member mediaElement is undefined."); n.__d.el = o.mediaElement; },
+    process: function () { return [silence(2)]; }
+  });
+  accessor(MediaElementAudioSourceNode.prototype, 'mediaElement', function () { return this.__d.el; });
+  var MediaStreamAudioSourceNode = nodeClass('MediaStreamAudioSourceNode', {
+    inputs: 0, outputs: 1, channels: 2, pre: function (n, ctx, o) { if (!o || !o.mediaStream) throw new TypeError("Failed to construct 'MediaStreamAudioSourceNode': required member mediaStream is undefined."); n.__d.stream = o.mediaStream; },
+    process: function () { return [silence(2)]; }
+  });
+  accessor(MediaStreamAudioSourceNode.prototype, 'mediaStream', function () { return this.__d.stream; });
+  var MediaStreamAudioDestinationNode = nodeClass('MediaStreamAudioDestinationNode', {
+    inputs: 1, outputs: 0, channels: 2, mode: 'explicit', fixedMode: 'explicit', init: function (n) { n.__d.stream = typeof g.MediaStream === 'function' ? new g.MediaStream() : {}; }, process: function () { return []; }
+  });
+  accessor(MediaStreamAudioDestinationNode.prototype, 'stream', function () { return this.__d.stream; });
+  var MediaStreamTrackAudioSourceNode = nodeClass('MediaStreamTrackAudioSourceNode', { inputs: 0, outputs: 1, channels: 2, process: function () { return [silence(2)]; } });
+
+  // ------------------------------------------------------------------------------------------------------------------------------ audio worklet
+  var AudioWorklet = cls('AudioWorklet', null), AudioWorkletProcessor = cls('AudioWorkletProcessor', null, function () {
+    var pending = AudioWorkletProcessor.__pending;
+    if (!pending) throw new TypeError('Illegal constructor');
+    hide(this, '__port', pending.port); AudioWorkletProcessor.__pending = null;
+  });
+  accessor(AudioWorkletProcessor.prototype, 'port', function () { return this.__port; });
+  function makeWorklet(ctx) {
+    var w = Object.create(AudioWorklet.prototype);
+    hide(w, '__w', { ctx: ctx, processors: {} });
+    return w;
+  }
+  def(AudioWorklet.prototype, 'addModule', function (url) {
+    var self = this, w = this.__w;
+    return Promise.resolve().then(function () { return g.fetch(String(url)); }).then(function (r) { if (!r.ok) throw domex('Unable to load a worklet\'s module.', 'AbortError'); return r.text(); }).then(function (code) {
+      var scope = {
+        registerProcessor: function (name, ctor) {
+          name = String(name);
+          if (!name) throw domex("Failed to execute 'registerProcessor' on 'AudioWorkletGlobalScope': The processor name is empty.", 'NotSupportedError');
+          if (w.processors[name]) throw domex("Failed to execute 'registerProcessor' on 'AudioWorkletGlobalScope': A processor with name '" + name + "' has already been registered in this scope.", 'NotSupportedError');
+          if (typeof ctor !== 'function') throw new TypeError("Failed to execute 'registerProcessor' on 'AudioWorkletGlobalScope': The processor constructor is not a function.");
+          w.processors[name] = ctor;
+        }
+      };
+      var fn = new Function('registerProcessor', 'AudioWorkletProcessor', 'sampleRate', 'currentTime', 'currentFrame', 'globalThis', '"use strict";\n' + code);
+      fn.call(scope, scope.registerProcessor, AudioWorkletProcessor, w.ctx.sampleRate, 0, 0, scope);
+    });
+  });
+  var AudioParamMap = cls('AudioParamMap', null);
+  ['get', 'has', 'forEach', 'keys', 'values', 'entries'].forEach(function (k) { def(AudioParamMap.prototype, k, function () { var m = this.__map; return m[k].apply(m, arguments); }); });
+  accessor(AudioParamMap.prototype, 'size', function () { return this.__map.size; });
+  var AudioWorkletNode = nodeClass('AudioWorkletNode', {
+    inputs: 1, outputs: 1, channels: 2, mode: 'max', always: true,
+    pre: function (n, ctx, o) {
+      var worklet = ctx.audioWorklet.__w, name = String(arguments[3] === undefined ? n.__name : n.__name), ctor = worklet.processors[n.__name];
+      if (!ctor) throw domex("Failed to construct 'AudioWorkletNode': The node name '" + n.__name + "' is not defined in AudioWorkletGlobalScope.", 'InvalidStateError');
+      var ins = o.numberOfInputs === undefined ? 1 : o.numberOfInputs >>> 0, outs = o.numberOfOutputs === undefined ? 1 : o.numberOfOutputs >>> 0;
+      if (ins === 0 && outs === 0) throw domex("Failed to construct 'AudioWorkletNode': Number of inputs and number of outputs cannot be both zero.", 'NotSupportedError');
+      var counts = o.outputChannelCount;
+      if (counts && counts.length !== outs) throw domex("Failed to construct 'AudioWorkletNode': Length of specified outputChannelCount (" + counts.length + ') does not match the given number of outputs (' + outs + ').', 'IndexSizeError');
+      n.__in.length = 0; for (var i = 0; i < ins; i++) n.__in.push([]);
+      n.__nout = outs; n.__d.counts = counts ? Array.prototype.slice.call(counts) : null;
+      if (ins === 1 && outs === 1 && !counts) { n.__d.follow = true; }
+      var channel = new g.MessageChannel(), d = n.__d;
+      d.port = channel.port1; d.params = {}; d.map = new Map();
+      var descriptors = ctor.parameterDescriptors ? Array.prototype.slice.call(ctor.parameterDescriptors) : [];
+      descriptors.forEach(function (p) {
+        var ap = param(n, p.name, p.defaultValue === undefined ? 0 : p.defaultValue, p.minValue === undefined ? NEG : p.minValue, p.maxValue === undefined ? POS : p.maxValue, p.automationRate === 'k-rate' ? 'k-rate' : 'a-rate');
+        if (o.parameterData && o.parameterData[p.name] !== undefined) { ap.__p.value = Number(o.parameterData[p.name]); ap.__p.current = ap.__p.value; }
+        d.params[p.name] = ap; d.map.set(p.name, ap);
+      });
+      AudioWorkletProcessor.__pending = { port: channel.port2 };
+      try { d.proc = new ctor(o.processorOptions === undefined ? {} : { processorOptions: o.processorOptions, numberOfInputs: ins, numberOfOutputs: outs }); }
+      catch (e) { AudioWorkletProcessor.__pending = null; throw e; }
+      AudioWorkletProcessor.__pending = null;
+      d.alive = true;
+    },
+    process: function (n, inputs, ctx, start) {
+      var d = n.__d, outCounts = [], o, c, outs = [];
+      for (o = 0; o < n.__nout; o++) outCounts.push(d.counts ? d.counts[o] : d.follow ? Math.max(1, inputs[0].length) : 1);
+      for (o = 0; o < n.__nout; o++) outs.push(silence(outCounts[o]));
+      if (!d.alive) return outs;
+      var params = {}, keys = Object.keys(d.params);
+      keys.forEach(function (k) { var ap = d.params[k], block = paramBlock(ap, ctx, start); params[k] = ap.__p.rate === 'k-rate' ? new Float32Array([block[0]]) : block; });
+      var inArr = inputs.map(function (ch) { return ch.map(function (x) { return x; }); });
+      var ok;
+      try { ok = d.proc.process(inArr, outs, params); } catch (e) { d.alive = false; setTimeout(function () { fire(n, new g.Event('processorerror')); }, 0); return outs; }
+      if (!ok) d.alive = false;
+      return outs;
+    }
+  });
+  handler(AudioWorkletNode.prototype, 'processorerror');
+  accessor(AudioWorkletNode.prototype, 'port', function () { return this.__d.port; });
+  accessor(AudioWorkletNode.prototype, 'parameters', function () { var d = this.__d; if (!d.pmap) { d.pmap = Object.create(AudioParamMap.prototype); hide(d.pmap, '__map', d.map); } return d.pmap; });
+  var realWorkletCtor = AudioWorkletNode;
+  AudioWorkletNode = cls('AudioWorkletNode', AudioNode, function (ctx, name, options) {
+    if (!isContext(ctx)) throw new TypeError("Failed to construct 'AudioWorkletNode': parameter 1 is not of type 'BaseAudioContext'.");
+    var node = Object.create(AudioWorkletNode.prototype), cfg = realWorkletCtor.__cfg;
+    options = options || {};
+    node.__name = String(name);
+    hide(node, '__name', String(name));
+    setupNode(node, ctx, cfg);
+    cfg.pre(node, ctx, options);
+    chanOptions(node, options, 'AudioWorkletNode');
+    return node;
+  });
+  handler(AudioWorkletNode.prototype, 'processorerror');
+  accessor(AudioWorkletNode.prototype, 'port', function () { return this.__d.port; });
+  accessor(AudioWorkletNode.prototype, 'parameters', function () { var d = this.__d; if (!d.pmap) { d.pmap = Object.create(AudioParamMap.prototype); hide(d.pmap, '__map', d.map); } return d.pmap; });
+  AudioWorkletNode.prototype.__process = function (inputs, ctx, start) { return realWorkletCtor.__cfg.process(this, inputs, ctx, start); };
+
+  // ------------------------------------------------------------------------------------------------------------------------------ create* methods
+  var factories = {
+    createGain: GainNode, createDelay: DelayNode, createBiquadFilter: BiquadFilterNode, createStereoPanner: StereoPannerNode, createWaveShaper: WaveShaperNode, createDynamicsCompressor: DynamicsCompressorNode,
+    createConvolver: ConvolverNode, createAnalyser: AnalyserNode, createPanner: PannerNode, createOscillator: OscillatorNode, createBufferSource: AudioBufferSourceNode, createConstantSource: ConstantSourceNode,
+    createChannelSplitter: ChannelSplitterNode, createChannelMerger: ChannelMergerNode
+  };
+  Object.keys(factories).forEach(function (name) {
+    var C = factories[name];
+    def(BaseAudioContext.prototype, name, function (a) {
+      if (name === 'createDelay') return new C(this, a === undefined ? {} : { maxDelayTime: a });
+      if (name === 'createChannelSplitter') return new C(this, a === undefined ? {} : { numberOfOutputs: a });
+      if (name === 'createChannelMerger') return new C(this, a === undefined ? {} : { numberOfInputs: a });
+      return new C(this);
+    });
+  });
+  def(BaseAudioContext.prototype, 'createBuffer', function (ch, len, rate) {
+    if (arguments.length < 3) throw new TypeError("Failed to execute 'createBuffer' on 'BaseAudioContext': 3 arguments required, but only " + arguments.length + ' present.');
+    return new AudioBuffer({ numberOfChannels: ch, length: len, sampleRate: rate });
+  });
+  def(BaseAudioContext.prototype, 'createIIRFilter', function (ff, fb) { return new IIRFilterNode(this, { feedforward: ff, feedback: fb }); });
+  def(BaseAudioContext.prototype, 'createPeriodicWave', function (real, imag, c) { return new PeriodicWave(this, { real: real, imag: imag, disableNormalization: c && c.disableNormalization }); });
+  def(AudioContext.prototype, 'createMediaElementSource', function (el) { return new MediaElementAudioSourceNode(this, { mediaElement: el }); });
+  def(AudioContext.prototype, 'createMediaStreamSource', function (s) { return new MediaStreamAudioSourceNode(this, { mediaStream: s }); });
+  def(AudioContext.prototype, 'createMediaStreamDestination', function () { return new MediaStreamAudioDestinationNode(this); });
+  def(AudioContext.prototype, 'createMediaStreamTrackSource', function (t) { return new MediaStreamTrackAudioSourceNode(this); });
+  def(BaseAudioContext.prototype, 'decodeAudioData', function (data, success, failure) {
+    var self = this;
+    var promise = new Promise(function (resolve, reject) {
+      if (!(data instanceof ArrayBuffer)) { reject(new TypeError("Failed to execute 'decodeAudioData' on 'BaseAudioContext': parameter 1 is not of type 'ArrayBuffer'.")); return; }
+      if (self.__s.closed) { reject(domex("Failed to execute 'decodeAudioData' on 'BaseAudioContext': Cannot decode audio data: The AudioContext has been closed.", 'InvalidStateError')); return; }
+      if (data.byteLength === 0) { reject(domex("Failed to execute 'decodeAudioData' on 'BaseAudioContext': Unable to decode audio data", 'EncodingError')); return; }
+      var bytes = data.slice(0);
+      setTimeout(function () {
+        var decoded = typeof g.__decode_audio === 'function' ? g.__decode_audio(g.__bytes_to_string(new Uint8Array(bytes))) : null;
+        if (!decoded) { reject(domex('Unable to decode audio data', 'EncodingError')); return; }
+        resolve(resample(decoded, self.sampleRate));
+      }, 0);
+    });
+    if (typeof success === 'function' || typeof failure === 'function') promise.then(function (b) { if (typeof success === 'function') success(b); }, function (e) { if (typeof failure === 'function') failure(e); });
+    return promise;
+  });
+  function resample(decoded, rate) {
+    var ch = decoded.channels, frames = decoded.frames, src = decoded.samples, from = decoded.sampleRate, i, c;
+    var len = from === rate ? frames : Math.max(1, Math.round(frames * rate / from)), buf = makeBuffer(ch, len, rate);
+    for (c = 0; c < ch; c++) {
+      var out = buf.__c[c];
+      if (from === rate) for (i = 0; i < frames; i++) out[i] = src[i * ch + c] / 32768;
+      else for (i = 0; i < len; i++) { var pos = i * from / rate, k = Math.floor(pos), f = pos - k, k2 = Math.min(k + 1, frames - 1); k = Math.min(k, frames - 1); out[i] = (src[k * ch + c] * (1 - f) + src[k2 * ch + c] * f) / 32768; }
+    }
+    return buf;
+  }
+
+  // ------------------------------------------------------------------------------------------------------------------------------ running
+  function collect(ctx) {   // one quantum from the destination
+    return renderQuantum(ctx);
+  }
+  function sinkOut(ctx, blocks) {
+    var sink = g.__audio_sink;
+    if (typeof sink !== 'function' || !blocks.length) return;
+    var ch = blocks[0].length, data = new Float32Array(blocks.length * QUANTUM * ch);
+    for (var b = 0; b < blocks.length; b++) for (var i = 0; i < QUANTUM; i++) for (var c = 0; c < ch; c++) data[(b * QUANTUM + i) * ch + c] = blocks[b][c][i];
+    sink(data, ch, ctx.sampleRate);
+  }
+  function tick(ctx) {
+    var s = ctx.__s;
+    if (s.state !== 'running') return;
+    var elapsed = (Date.now() - s.startedAt) / 1000, target = s.startedFrame + Math.floor(elapsed * s.rate), blocks = [], guard = 0;
+    while (s.frame + QUANTUM <= target + QUANTUM && guard++ < 64) { blocks.push(collect(ctx)); s.frame += QUANTUM; }
+    sinkOut(ctx, blocks);
+  }
+  def(AudioContext.prototype, 'resume', function () {
+    var ctx = this, s = this.__s;
+    if (s.closed) return Promise.reject(domex("Failed to execute 'resume' on 'AudioContext': Cannot resume a closed AudioContext", 'InvalidStateError'));
+    if (s.state !== 'running') {
+      s.startedAt = Date.now(); s.startedFrame = s.frame; setState(ctx, 'running');
+      if (!s.timer) s.timer = setInterval(function () { tick(ctx); }, 10);
+    }
+    return Promise.resolve();
+  });
+  def(AudioContext.prototype, 'suspend', function () {
+    var s = this.__s;
+    if (s.closed) return Promise.reject(domex("Failed to execute 'suspend' on 'AudioContext': Cannot suspend a closed AudioContext", 'InvalidStateError'));
+    if (s.timer) { clearInterval(s.timer); s.timer = null; }
+    setState(this, 'suspended'); return Promise.resolve();
+  });
+  def(AudioContext.prototype, 'close', function () {
+    var s = this.__s;
+    if (s.closed) return Promise.reject(domex("Failed to execute 'close' on 'AudioContext': Cannot close a closed AudioContext.", 'InvalidStateError'));
+    s.closed = true; if (s.timer) { clearInterval(s.timer); s.timer = null; }
+    setState(this, 'closed'); return Promise.resolve();
+  });
+  def(OfflineAudioContext.prototype, 'resume', function () {
+    var s = this.__s;
+    if (!s.started) return Promise.reject(domex("Failed to execute 'resume' on 'OfflineAudioContext': cannot resume a context that has not started", 'InvalidStateError'));
+    if (s.state === 'closed') return Promise.reject(domex("Failed to execute 'resume' on 'OfflineAudioContext': cannot resume a closed context", 'InvalidStateError'));
+    if (s.state === 'suspended' && s.paused) { var go = s.paused; s.paused = null; setState(this, 'running'); go(); }
+    return Promise.resolve();
+  });
+  def(OfflineAudioContext.prototype, 'suspend', function (time) {
+    var s = this.__s, ctx = this;
+    time = Number(time);
+    if (!(time >= 0)) return Promise.reject(new RangeError("Failed to execute 'suspend' on 'OfflineAudioContext': The suspend time (" + time + ') is negative.'));
+    var frame = Math.ceil(time * s.rate / QUANTUM) * QUANTUM;
+    if (time > s.length / s.rate || frame >= s.length) return Promise.reject(new RangeError("Failed to execute 'suspend' on 'OfflineAudioContext': The suspend time (" + time + ') is beyond the length of the context.'));
+    if (frame < s.frame || (s.started && frame <= s.frame && s.state === 'running')) return Promise.reject(domex("Failed to execute 'suspend' on 'OfflineAudioContext': cannot schedule a suspend at frame " + frame + ' because it is earlier than the current frame.', 'InvalidStateError'));
+    if (s.suspends.some(function (x) { return x.frame === frame; })) return Promise.reject(domex("Failed to execute 'suspend' on 'OfflineAudioContext': cannot schedule more than one suspend at frame " + frame + '.', 'InvalidStateError'));
+    return new Promise(function (resolve) { s.suspends.push({ frame: frame, resolve: resolve }); s.suspends.sort(function (a, b) { return a.frame - b.frame; }); });
+  });
+  def(OfflineAudioContext.prototype, 'startRendering', function () {
+    var ctx = this, s = this.__s;
+    if (s.started) return Promise.reject(domex("Failed to execute 'startRendering' on 'OfflineAudioContext': cannot call startRendering more than once", 'InvalidStateError'));
+    s.started = true;
+    return new Promise(function (resolve) {
+      var out = makeBuffer(s.channels, s.length, s.rate);
+      setState(ctx, 'running');
+      var step = function () {
+        var budget = 512;
+        while (s.frame < s.length && budget > 0) {
+          if (s.suspends.length && s.suspends[0].frame <= s.frame) {
+            var sp = s.suspends.shift(); setState(ctx, 'suspended');
+            s.paused = function () { setTimeout(step, 0); };
+            sp.resolve();
+            return;
+          }
+          var blocks = collect(ctx), n = Math.min(QUANTUM, s.length - s.frame);
+          for (var c = 0; c < s.channels; c++) { var src = blocks[c] || blocks[0]; if (blocks.length <= c) src = new Float32Array(QUANTUM); out.__c[c].set(n === QUANTUM ? src : src.subarray(0, n), s.frame); }
+          s.frame += QUANTUM; budget -= QUANTUM;
+        }
+        if (s.frame < s.length) { setTimeout(step, 0); return; }
+        s.frame = s.length; setState(ctx, 'closed');
+        resolve(out);
+        setTimeout(function () { fire(ctx, new OfflineAudioCompletionEvent('complete', { renderedBuffer: out })); }, 0);
+      };
+      setTimeout(step, 0);
+    });
+  });
+  def(g, 'webkitAudioContext', AudioContext); def(g, 'webkitOfflineAudioContext', OfflineAudioContext);
+  def(g, 'AudioSinkInfo', cls('AudioSinkInfo', null));
+}(globalThis));
+)JSPRELUDE";
+
+// Web Animations: Animation, KeyframeEffect, DocumentTimeline, element.animate(), getAnimations(); the timing model, keyframes, easing and interpolation are in
+// script, and the animated values reach the style through __set_animated_style (a layer on top of the cascade).
+const char kAnimationPrelude[] = R"JSPRELUDE((function (g) {
+  var def = function (o, k, v) { Object.defineProperty(o, k, { value: v, writable: true, configurable: true }); };
+  var hide = function (o, k, v) { Object.defineProperty(o, k, { value: v, writable: true, configurable: true, enumerable: false }); };
+  var accessor = function (proto, name, get, set) { Object.defineProperty(proto, name, { get: get, set: set, enumerable: true, configurable: true }); };
+  var domex = function (message, name) { return new g.DOMException(message, name); };
+  var ET = g.EventTarget;
+  var cls = function (name, parent, init) {
+    var C = function () {
+      if (!init) throw new TypeError('Illegal constructor');
+      if (!(this instanceof C)) throw new TypeError("Failed to construct '" + name + "': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+      return init.apply(this, arguments);
+    };
+    Object.defineProperty(C, 'name', { value: name });
+    C.prototype = Object.create(parent ? parent.prototype : Object.prototype);
+    def(C.prototype, 'constructor', C);
+    Object.defineProperty(C.prototype, Symbol.toStringTag, { value: name, configurable: true });
+    if (parent) Object.setPrototypeOf(C, parent);
+    def(g, name, C);
+    return C;
+  };
+  var handler = function (proto, type) {
+    accessor(proto, 'on' + type, function () { return this.__on && this.__on[type] || null; }, function (fn) {
+      if (!this.__on) hide(this, '__on', {});
+      var had = !!this.__on[type];
+      this.__on[type] = typeof fn === 'function' ? fn : null;
+      if (!had && this.__on[type]) { var self = this; this.addEventListener(type, function (e) { var f = self.__on[type]; if (f) f.call(self, e); }); }
+    });
+  };
+  var now = function () { return g.performance && g.performance.now ? g.performance.now() : Date.now(); };
+  var hasNative = typeof g.__set_animated_style === 'function';
+  var origGCS = g.getComputedStyle;   // (the wrapper below flushes CSS transitions and animations first: this does not)
+
+  // ------------------------------------------------------------------------------------------------------------------------------ easing
+  function bezier(x1, y1, x2, y2) {
+    var cx = 3 * x1, bx = 3 * (x2 - x1) - cx, ax = 1 - cx - bx, cy = 3 * y1, by = 3 * (y2 - y1) - cy, ay = 1 - cy - by;
+    var sx = function (t) { return ((ax * t + bx) * t + cx) * t; }, sy = function (t) { return ((ay * t + by) * t + cy) * t; }, dx = function (t) { return (3 * ax * t + 2 * bx) * t + cx; };
+    return function (x) {
+      if (x <= 0 && x1 > 0) { return y1 > 0 && x1 > 0 ? x * y1 / x1 : 0; }
+      if (x >= 1 && x2 < 1) return x2 < 1 && y2 !== 1 ? 1 + (x - 1) * (1 - y2) / (1 - x2) : 1;
+      var t = x, i, d;
+      for (i = 0; i < 8; i++) { var e = sx(t) - x; if (Math.abs(e) < 1e-7) return sy(t); d = dx(t); if (Math.abs(d) < 1e-6) break; t -= e / d; }
+      var lo = 0, hi = 1; t = x;
+      if (t < lo) return sy(lo); if (t > hi) return sy(hi);
+      while (lo < hi) { var v = sx(t); if (Math.abs(v - x) < 1e-7) return sy(t); if (x > v) lo = t; else hi = t; t = (hi - lo) / 2 + lo; if (hi - lo < 1e-9) break; }
+      return sy(t);
+    };
+  }
+  var KEYWORDS = { linear: [null], ease: [0.25, 0.1, 0.25, 1], 'ease-in': [0.42, 0, 1, 1], 'ease-out': [0, 0, 0.58, 1], 'ease-in-out': [0.42, 0, 0.58, 1] };
+  var easingCache = {};
+  function parseEasing(text, what) {
+    text = String(text).trim();
+    if (easingCache[text]) return easingCache[text];
+    var fn = null, m, bad = function () { return new TypeError("Failed to execute '" + (what || 'animate') + "' on 'Element': '" + text + "' is not a valid value for easing"); };
+    if (text === 'linear') fn = function (x) { return x; };
+    else if (KEYWORDS[text]) { var k = KEYWORDS[text]; fn = bezier(k[0], k[1], k[2], k[3]); }
+    else if (text === 'step-start') fn = steps(1, 'jump-start');
+    else if (text === 'step-end') fn = steps(1, 'jump-end');
+    else if ((m = /^cubic-bezier\(\s*([^,]+),\s*([^,]+),\s*([^,]+),\s*([^)]+)\)$/.exec(text))) {
+      var v = [m[1], m[2], m[3], m[4]].map(Number);
+      if (v.some(function (n) { return n !== n; }) || v[0] < 0 || v[0] > 1 || v[2] < 0 || v[2] > 1) throw bad();
+      fn = bezier(v[0], v[1], v[2], v[3]);
+    } else if ((m = /^steps\(\s*(\d+)\s*(?:,\s*(jump-start|jump-end|jump-none|jump-both|start|end)\s*)?\)$/.exec(text))) {
+      var n = parseInt(m[1], 10), jump = m[2] || 'jump-end';
+      if (jump === 'start') jump = 'jump-start'; else if (jump === 'end') jump = 'jump-end';
+      if (n < 1 || (jump === 'jump-none' && n < 2)) throw bad();
+      fn = steps(n, jump);
+    } else if ((m = /^linear\((.*)\)$/.exec(text))) {
+      var stops = m[1].split(',').map(function (s) { var p = s.trim().split(/\s+/), r = { v: Number(p[0]), p: null, q: null }; if (p.length > 1) r.p = parseFloat(p[1]) / 100; if (p.length > 2) r.q = parseFloat(p[2]) / 100; return r; });
+      if (!stops.length || stops.some(function (s) { return s.v !== s.v; })) throw bad();
+      fn = linearEasing(stops);
+    } else throw bad();
+    fn.__text = text;
+    return (easingCache[text] = fn);
+  }
+  function steps(n, jump) {
+    return function (x, before) {
+      var steps = n + (jump === 'jump-both' ? 1 : jump === 'jump-none' ? -1 : 0), cur = Math.floor(x * n);
+      if (jump === 'jump-start' || jump === 'jump-both') cur += 1;
+      if (x * n === Math.floor(x * n) && before) cur -= 1;
+      if (x >= 0 && cur < 0) cur = 0;
+      if (cur > steps) cur = steps;
+      return steps === 0 ? 0 : cur / steps;
+    };
+  }
+  function linearEasing(stops) {
+    var pts = [], i;
+    if (stops[0].p === null) stops[0].p = 0; if (stops[stops.length - 1].p === null) stops[stops.length - 1].p = 1;
+    var last = -Infinity;
+    for (i = 0; i < stops.length; i++) { if (stops[i].p !== null) { stops[i].p = Math.max(stops[i].p, last); last = stops[i].p; } }
+    for (i = 0; i < stops.length; i++) {
+      if (stops[i].p === null) { var a = i - 1, b = i + 1; while (stops[b].p === null) b++; for (var k = i; k < b; k++) stops[k].p = stops[a].p + (stops[b].p - stops[a].p) * (k - a) / (b - a); i = b - 1; }
+    }
+    return function (x) {
+      if (x <= stops[0].p) return stops[0].v;
+      for (var j = 1; j < stops.length; j++) { if (x <= stops[j].p) { var span = stops[j].p - stops[j - 1].p; return span === 0 ? stops[j].v : stops[j - 1].v + (stops[j].v - stops[j - 1].v) * (x - stops[j - 1].p) / span; } }
+      return stops[stops.length - 1].v;
+    };
+  }
+  function easingText(fn) {
+    var t = fn.__text, m;
+    if ((m = /^cubic-bezier\((.*)\)$/.exec(t))) return 'cubic-bezier(' + m[1].split(',').map(function (s) { return String(Number(s)); }).join(', ') + ')';
+    return t;
+  }
+
+  // ------------------------------------------------------------------------------------------------------------------------------ timing
+  var FILLS = ['none', 'forwards', 'backwards', 'both', 'auto'], DIRECTIONS = ['normal', 'reverse', 'alternate', 'alternate-reverse'], COMPOSITES = ['replace', 'add', 'accumulate'];
+  function toNumber(v, what) { var n = Number(v); if (n !== n && !(typeof v === 'number')) n = NaN; return n; }
+  function readTiming(opts, target, update) {
+    // opts: number | dictionary | undefined; returns the effect timing (validated)
+    var t = target || { delay: 0, endDelay: 0, fill: 'auto', iterationStart: 0, iterations: 1, duration: 'auto', direction: 'normal', easing: parseEasing('linear') };
+    if (opts === undefined || opts === null) return t;
+    if (typeof opts === 'number') { if (opts !== opts || opts < 0) throw new TypeError("Failed to construct 'KeyframeEffect': duration must be non-negative or auto."); t.duration = opts; return t; }
+    if (typeof opts !== 'object') { if (typeof opts === 'string' || typeof opts === 'boolean') opts = {}; else throw new TypeError('The provided value is not an object.'); }
+    var read = function (k) { return opts[k]; }, v;
+    if ((v = read('delay')) !== undefined) { v = Number(v); if (v !== v || v === Infinity || v === -Infinity) throw new TypeError("Failed to execute: The provided double value is non-finite."); t.delay = v; }
+    if ((v = read('endDelay')) !== undefined) { v = Number(v); if (v !== v || v === Infinity || v === -Infinity) throw new TypeError("Failed to execute: The provided double value is non-finite."); t.endDelay = v; }
+    if ((v = read('fill')) !== undefined) { v = String(v); if (FILLS.indexOf(v) < 0) throw new TypeError("Failed to execute: '" + v + "' is not a valid value for fill."); t.fill = v; }
+    if ((v = read('iterationStart')) !== undefined) { v = Number(v); if (v !== v || v < 0) throw new TypeError("Failed to execute: iterationStart must be non-negative."); t.iterationStart = v; }
+    if ((v = read('iterations')) !== undefined) { v = Number(v); if (v !== v || v < 0) throw new TypeError("Failed to execute: iterations must be non-negative."); t.iterations = v; }
+    if ((v = read('duration')) !== undefined) {
+      if (typeof v === 'string') { if (v !== 'auto') throw new TypeError("Failed to execute: duration must be non-negative or auto."); t.duration = 'auto'; }
+      else { v = Number(v); if (v !== v || v < 0) throw new TypeError("Failed to execute: duration must be non-negative or auto."); t.duration = v; }
+    }
+    if ((v = read('direction')) !== undefined) { v = String(v); if (DIRECTIONS.indexOf(v) < 0) throw new TypeError("Failed to execute: '" + v + "' is not a valid value for direction."); t.direction = v; }
+    if ((v = read('easing')) !== undefined) t.easing = parseEasing(v);
+    return t;
+  }
+  function activeDurationOf(t) {
+    var d = t.duration === 'auto' ? 0 : t.duration;
+    if (d === 0 || t.iterations === 0) return 0;
+    return d * t.iterations;
+  }
+  function endTimeOf(t) { return Math.max(t.delay + activeDurationOf(t) + t.endDelay, 0); }
+  // the computed timing for a local time (null: none) and the direction the animation plays in ('forwards' | 'backwards', for the phase boundaries)
+  function computeTiming(t, local, backwards) {
+    var out = { delay: t.delay, endDelay: t.endDelay, fill: t.fill, iterationStart: t.iterationStart, iterations: t.iterations, duration: t.duration === 'auto' ? 0 : t.duration, direction: t.direction, easing: easingText(t.easing) };
+    var ad = activeDurationOf(t), end = endTimeOf(t);
+    out.activeDuration = ad; out.endTime = end; out.localTime = local; out.progress = null; out.currentIteration = null;
+    var phase = 'idle', activeTime = null;
+    if (local !== null) {
+      var beforeB = Math.max(Math.min(t.delay, end), 0), afterB = Math.max(Math.min(t.delay + ad, end), 0);
+      if (local < beforeB || (backwards && local === beforeB)) phase = 'before';
+      else if (local > afterB || (!backwards && local === afterB)) phase = 'after';
+      else phase = 'active';
+      var fill = t.fill === 'auto' ? 'none' : t.fill;
+      if (phase === 'before') activeTime = fill === 'backwards' || fill === 'both' ? Math.max(local - t.delay, 0) : null;
+      else if (phase === 'active') activeTime = local - t.delay;
+      else activeTime = fill === 'forwards' || fill === 'both' ? Math.max(Math.min(local - t.delay, ad), 0) : null;
+    }
+    out.phase = phase;
+    if (activeTime !== null) {
+      var d = out.duration, overall;
+      if (d === 0) overall = phase === 'before' ? 0 : t.iterations; else overall = activeTime / d;
+      overall += t.iterationStart;
+      var simple = overall === Infinity ? t.iterationStart % 1 : overall % 1;
+      if (simple === 0 && (phase === 'active' || phase === 'after') && activeTime === ad && t.iterations !== 0) simple = 1;
+      var iter;
+      if (overall === Infinity) iter = Math.floor(t.iterationStart);
+      else if (simple === 1 && t.iterations !== 0 && activeTime === ad && overall % 1 === 0) iter = Math.max(Math.ceil(overall) - 1, 0);
+      else iter = Math.floor(overall);
+      var dir = t.direction, reversed = dir === 'reverse' || (dir === 'alternate' && iter % 2 === 1) || (dir === 'alternate-reverse' && iter % 2 === 0);
+      if (dir === 'alternate-reverse') reversed = iter % 2 === 0; else if (dir === 'alternate') reversed = iter % 2 === 1;
+      var directed = reversed ? 1 - simple : simple;
+      out.currentIteration = iter;
+      out.progress = t.easing(directed, phase === 'before');
+    }
+    return out;
+  }
+
+  // ------------------------------------------------------------------------------------------------------------------------------ keyframes
+  var propNameCache = {};
+  function cssName(js) {
+    if (js === 'cssFloat') return 'float'; if (js === 'cssOffset') return 'offset';
+    if (js.indexOf('--') === 0) return js;
+    return propNameCache[js] || (propNameCache[js] = js.replace(/[A-Z]/g, function (c) { return '-' + c.toLowerCase(); }));
+  }
+  function jsName(css) {
+    if (css === 'float') return 'cssFloat'; if (css === 'offset') return 'cssOffset';
+    if (css.indexOf('--') === 0) return css;
+    return css.replace(/-([a-z])/g, function (m, c) { return c.toUpperCase(); });
+  }
+  var probe = null;
+  function knownProperty(css) {
+    if (css.indexOf('--') === 0) return true;
+    if (g.CSS && typeof g.CSS.supports === 'function') { try { return g.CSS.supports(css, 'inherit'); } catch (e) { return true; } }
+    if (typeof document === 'undefined') return true;
+    if (!probe) probe = document.createElement('div');
+    return (jsName(css) in probe.style) || (css in probe.style);
+  }
+  var SPECIAL = { offset: 1, easing: 1, composite: 1, computedOffset: 1 };
+  function processKeyframes(input, what) {
+    var frames = [], k, i;
+    if (input === null || input === undefined) return [];
+    if (typeof input !== 'object' && typeof input !== 'function') throw new TypeError("Failed to execute '" + what + "' on 'Element': Keyframes must be an array or an object.");
+    var iterable = typeof input[Symbol.iterator] === 'function';
+    var checkOffset = function (v) {
+      if (v === null || v === undefined) return null;
+      v = Number(v);
+      if (v !== v || v < 0 || v > 1) throw new TypeError("Failed to execute '" + what + "' on 'Element': Offsets must be null or in the range [0,1].");
+      return v;
+    };
+    var readFrame = function (obj) {
+      if (obj === null || (typeof obj !== 'object' && typeof obj !== 'function')) throw new TypeError("Failed to execute '" + what + "' on 'Element': Keyframes must be objects.");
+      var f = { offset: checkOffset(obj.offset), easing: obj.easing === undefined ? parseEasing('linear') : parseEasing(obj.easing), composite: 'auto', props: [] }, key;
+      if (obj.composite !== undefined && obj.composite !== null) { var c = String(obj.composite); if (c !== 'auto' && COMPOSITES.indexOf(c) < 0) throw new TypeError("Failed to execute '" + what + "' on 'Element': '" + c + "' is not a valid value for composite."); f.composite = c; }
+      var keys = Object.keys(obj).sort(function (a, b) { return a < b ? -1 : a > b ? 1 : 0; });
+      for (var n = 0; n < keys.length; n++) {
+        key = keys[n]; if (SPECIAL[key]) continue;
+        var css = cssName(key);
+        if (!knownProperty(css)) continue;
+        var val = obj[key];
+        if (val === null || val === undefined) continue;
+        f.props.push([css, String(val)]);
+      }
+      return f;
+    };
+    if (iterable) {
+      var list = Array.prototype.slice.call(input);
+      for (i = 0; i < list.length; i++) frames.push(readFrame(list[i]));
+    } else {
+      // property-indexed: { opacity: [0, 1], offset: [0, 1], easing: ..., composite: ... }
+      var keys = Object.keys(input), easing = input.easing === undefined ? 'linear' : input.easing, comp = input.composite === undefined ? 'auto' : String(input.composite), offs = input.offset;
+      var columns = [], len = 0;
+      keys.forEach(function (key) {
+        if (SPECIAL[key]) return;
+        var css = cssName(key); if (!knownProperty(css)) return;
+        var v = input[key], arr = (v !== null && typeof v === 'object' && typeof v[Symbol.iterator] === 'function' && typeof v !== 'string') ? Array.prototype.slice.call(v) : [v];
+        columns.push([css, arr.map(function (x) { return String(x); })]); len = Math.max(len, arr.length);
+      });
+      if (offs !== undefined && offs !== null) offs = (typeof offs === 'object' && typeof offs[Symbol.iterator] === 'function') ? Array.prototype.slice.call(offs) : [offs];
+      for (i = 0; i < len; i++) {
+        var fr = { offset: null, easing: parseEasing(easing), composite: comp, props: [] };
+        columns.forEach(function (c) { if (c[1].length === 1 && len > 1) fr.props.push([c[0], c[1][0]]); else if (i < c[1].length) fr.props.push([c[0], c[1][i]]); });
+        if (offs && i < offs.length) fr.offset = checkOffset(offs[i]);
+        frames.push(fr);
+      }
+      if (len === 1 && frames.length === 1 && false) { }
+    }
+    // offsets must be in order, among the keyframes that have them
+    var last = -Infinity;
+    frames.forEach(function (f) { if (f.offset !== null) { if (f.offset < last) throw new TypeError("Failed to execute '" + what + "' on 'Element': Offsets must be monotonically non-decreasing."); last = f.offset; } });
+    // computed offsets: the ends default to 0 and 1, the rest are spread evenly between the neighbours that have one
+    if (frames.length) {
+      var co = frames.map(function (f) { return f.offset; });
+      if (co[0] === null) co[0] = 0;
+      if (co[co.length - 1] === null) co[co.length - 1] = 1;
+      for (i = 1; i < co.length - 1; i++) {
+        if (co[i] !== null) continue;
+        var a = i - 1, b = i + 1; while (co[b] === null) b++;
+        for (k = i; k < b; k++) co[k] = co[a] + (co[b] - co[a]) * (k - a) / (b - a);
+        i = b - 1;
+      }
+      frames.forEach(function (f, n) { f.computed = co[n]; });
+    }
+    return frames;
+  }
+  function framesOutput(frames) {
+    return frames.map(function (f) {
+      var o = { offset: f.offset, computedOffset: f.computed, easing: easingText(f.easing), composite: f.composite };
+      f.props.forEach(function (p) { o[jsName(p[0])] = p[1]; });
+      return o;
+    });
+  }
+
+  // ------------------------------------------------------------------------------------------------------------------------------ values
+  var NUM = /^([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)([a-zA-Z%]*)$/;
+  var fmt = function (n) { if (n !== n) return '0'; var s = String(Math.round(n * 1e6) / 1e6); return s === '-0' ? '0' : s; };
+  var colorCache = {}, colorProbe = null;
+  var NAMED_PROBE_LIMIT = 400, namedCount = 0;
+  function parseColor(text) {
+    text = text.trim().toLowerCase();
+    var m;
+    if (colorCache[text] !== undefined) return colorCache[text];
+    var out = null;
+    if ((m = /^#([0-9a-f]{3,8})$/.exec(text)) && (m[1].length === 3 || m[1].length === 4 || m[1].length === 6 || m[1].length === 8)) {
+      var h = m[1]; if (h.length <= 4) h = h.split('').map(function (c) { return c + c; }).join('');
+      out = [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16), h.length === 8 ? parseInt(h.slice(6, 8), 16) / 255 : 1];
+    } else if ((m = /^rgba?\(\s*([^)]*)\)$/.exec(text))) {
+      var p = m[1].split(/[\s,\/]+/).filter(Boolean);
+      if (p.length >= 3) { var v = p.slice(0, 3).map(function (x) { return x.slice(-1) === '%' ? parseFloat(x) * 2.55 : parseFloat(x); }); var a = p.length > 3 ? (p[3].slice(-1) === '%' ? parseFloat(p[3]) / 100 : parseFloat(p[3])) : 1; if (v.every(function (x) { return x === x; }) && a === a) out = [v[0], v[1], v[2], a]; }
+    } else if (text === 'transparent') out = [0, 0, 0, 0];
+    else if (/^[a-z]+$/.test(text) && text !== 'currentcolor' && text !== 'inherit' && text !== 'initial' && text !== 'unset' && text !== 'none' && text !== 'auto' && typeof document !== 'undefined' && namedCount < NAMED_PROBE_LIMIT) {
+      namedCount++;
+      if (!colorProbe) colorProbe = document.createElement('span');
+      colorProbe.style.color = ''; colorProbe.style.color = text;
+      if (colorProbe.style.color !== '' && document.documentElement) { try { document.documentElement.appendChild(colorProbe); var c = origGCS.call(g, colorProbe).color; colorProbe.remove(); var mm = /^rgba?\(([^)]*)\)$/.exec(c); if (mm) { var q = mm[1].split(',').map(parseFloat); out = [q[0], q[1], q[2], q.length > 3 ? q[3] : 1]; } } catch (e) { } }
+    } else if ((m = /^hsla?\(\s*([^)]*)\)$/.exec(text))) {
+      var hp = m[1].split(/[\s,\/]+/).filter(Boolean);
+      if (hp.length >= 3) {
+        var hh = (parseFloat(hp[0]) % 360 + 360) % 360, ss = parseFloat(hp[1]) / 100, ll = parseFloat(hp[2]) / 100, aa = hp.length > 3 ? parseFloat(hp[3]) : 1, kk = function (n) { return (n + hh / 30) % 12; }, am = ss * Math.min(ll, 1 - ll), f = function (n) { return ll - am * Math.max(-1, Math.min(kk(n) - 3, Math.min(9 - kk(n), 1))); };
+        out = [f(0) * 255, f(8) * 255, f(4) * 255, aa];
+      }
+    }
+    colorCache[text] = out;
+    return out;
+  }
+  function colorText(c) {
+    var a = Math.max(0, Math.min(1, c[3]));
+    var r = Math.round(Math.max(0, Math.min(255, c[0]))), gg = Math.round(Math.max(0, Math.min(255, c[1]))), b = Math.round(Math.max(0, Math.min(255, c[2])));
+    return a >= 1 ? 'rgb(' + r + ', ' + gg + ', ' + b + ')' : 'rgba(' + r + ', ' + gg + ', ' + b + ', ' + fmt(a) + ')';
+  }
+  function splitTop(text, sep) {
+    var out = [], depth = 0, cur = '', q = '';
+    for (var i = 0; i < text.length; i++) {
+      var ch = text[i];
+      if (q) { cur += ch; if (ch === q) q = ''; continue; }
+      if (ch === '"' || ch === "'") { q = ch; cur += ch; continue; }
+      if (ch === '(') depth++; else if (ch === ')') depth--;
+      if (depth === 0 && (sep === ' ' ? /\s/.test(ch) : ch === sep)) { if (cur !== '') out.push(cur); cur = ''; continue; }
+      cur += ch;
+    }
+    if (cur !== '') out.push(cur);
+    return out;
+  }
+  var ABS = { px: 1, cm: 96 / 2.54, mm: 96 / 25.4, in: 96, pt: 4 / 3, pc: 16, q: 96 / 101.6 };
+  function mixNumberUnit(ma, mb, t) {
+    var x = parseFloat(ma[1]), y = parseFloat(mb[1]), ua = ma[2].toLowerCase(), ub = mb[2].toLowerCase();
+    if (ua === ub) return fmt(x + (y - x) * t) + ma[2];
+    if (ABS[ua] && ABS[ub]) return fmt(x * ABS[ua] + (y * ABS[ub] - x * ABS[ua]) * t) + 'px';
+    if (x === 0 && ma[2] === '' && ub) return fmt(y * t) + mb[2];
+    if (y === 0 && mb[2] === '' && ua) return fmt(x * (1 - t)) + ma[2];
+    if (ua === '' || ub === '') return null;
+    return 'calc(' + fmt(x) + ua + ' * ' + fmt(1 - t) + ' + ' + fmt(y) + ub + ' * ' + fmt(t) + ')';
+  }
+  function parseFunctions(text) {
+    var parts = splitTop(text, ' '), out = [];
+    for (var i = 0; i < parts.length; i++) { var m = /^([a-zA-Z0-9-]+)\((.*)\)$/.exec(parts[i]); if (!m) return null; out.push({ name: m[1], args: splitTop(m[2], ',').map(function (x) { return x.trim(); }) }); }
+    return out;
+  }
+  function decompose2d(m) {
+    var a = m.a, b = m.b, c = m.c, d = m.d, e = m.e, f = m.f, sx = Math.hypot(a, b);
+    if (sx) { a /= sx; b /= sx; }
+    var shear = a * c + b * d; c -= a * shear; d -= b * shear;
+    var sy = Math.hypot(c, d); if (sy) { c /= sy; d /= sy; shear /= sy; }
+    if (a * d < b * c) { a = -a; b = -b; shear = -shear; sx = -sx; }
+    return { tx: e, ty: f, angle: Math.atan2(b, a), sx: sx, sy: sy, shear: shear };
+  }
+  function matrixOf(text) { try { return new g.DOMMatrix(text); } catch (e) { return null; } }
+  function mixTransform(a, b, t) {
+    if (a === 'none') a = ''; if (b === 'none') b = '';
+    var fa = a ? parseFunctions(a) : [], fb = b ? parseFunctions(b) : [];
+    if (fa && fb) {
+      if (!fa.length && fb.length) fa = fb.map(function (f) { return { name: f.name, args: f.args.map(function (x) { var mm = NUM.exec(x); return /^scale/i.test(f.name) ? '1' : mm ? '0' + mm[2] : x; }) }; });
+      if (!fb.length && fa.length) fb = fa.map(function (f) { return { name: f.name, args: f.args.map(function (x) { var mm = NUM.exec(x); return /^scale/i.test(f.name) ? '1' : mm ? '0' + mm[2] : x; }) }; });
+      if (fa.length === fb.length && fa.every(function (f, i) { return f.name.toLowerCase() === fb[i].name.toLowerCase() && f.args.length === fb[i].args.length; })) {
+        var parts = [];
+        for (var i = 0; i < fa.length; i++) {
+          var args = [];
+          for (var k = 0; k < fa[i].args.length; k++) {
+            var ma = NUM.exec(fa[i].args[k]), mb = NUM.exec(fb[i].args[k]);
+            var v = ma && mb ? mixNumberUnit(ma, mb, t) : null;
+            if (v === null) { args = null; break; }
+            args.push(v);
+          }
+          if (args === null) { parts = null; break; }
+          parts.push(fa[i].name + '(' + args.join(', ') + ')');
+        }
+        if (parts) return parts.join(' ');
+      }
+    }
+    var ma2 = matrixOf(a || 'none'), mb2 = matrixOf(b || 'none');
+    if (!ma2 || !mb2) return t < 0.5 ? (a || 'none') : (b || 'none');
+    var da = decompose2d(ma2), db = decompose2d(mb2), dang = db.angle - da.angle;
+    if (dang > Math.PI) dang -= 2 * Math.PI; else if (dang < -Math.PI) dang += 2 * Math.PI;
+    var x = function (p, q) { return p + (q - p) * t; };
+    var ang = da.angle + dang * t, sx = x(da.sx, db.sx), sy = x(da.sy, db.sy), sh = x(da.shear, db.shear), tx = x(da.tx, db.tx), ty = x(da.ty, db.ty);
+    var ca = Math.cos(ang), sa = Math.sin(ang);
+    // M = T * R * K * S
+    var A = ca * sx, B = sa * sx, C = (ca * sh - sa) * sy, D = (sa * sh + ca) * sy;
+    return 'matrix(' + [A, B, C, D, tx, ty].map(fmt).join(', ') + ')';
+  }
+  var TRANSFORMLIKE = { transform: 1, '-webkit-transform': 1, translate: 0, rotate: 0, scale: 0 };
+  function mixValue(prop, a, b, t) {
+    a = String(a).trim(); b = String(b).trim();
+    if (a === b) return a;
+    if (TRANSFORMLIKE[prop] === 1) return mixTransform(a, b, t);
+    var ma = NUM.exec(a), mb = NUM.exec(b);
+    if (ma && mb) { var r = mixNumberUnit(ma, mb, t); if (r !== null) return r; }
+    var ca = parseColor(a), cb = parseColor(b);
+    if (ca && cb) {
+      var al = ca[3] + (cb[3] - ca[3]) * t;
+      if (al <= 0) return 'rgba(0, 0, 0, 0)';
+      var pm = function (i) { return (ca[i] * ca[3] + (cb[i] * cb[3] - ca[i] * ca[3]) * t) / al; };
+      return colorText([pm(0), pm(1), pm(2), al]);
+    }
+    var ta = splitTop(a, ' '), tb = splitTop(b, ' ');
+    if (ta.length > 1 && ta.length === tb.length && !/[(]/.test(a + b)) {
+      var out = [];
+      for (var i = 0; i < ta.length; i++) { var v = mixValue(prop, ta[i], tb[i], t); out.push(v); }
+      return out.join(' ');
+    }
+    var fa = parseFunctions(a), fb = parseFunctions(b);
+    if (fa && fb && fa.length === fb.length && fa.every(function (f, i) { return f.name === fb[i].name && f.args.length === fb[i].args.length; })) {
+      return fa.map(function (f, i) { return f.name + '(' + f.args.map(function (x, k) { return mixValue(prop, x, fb[i].args[k], t); }).join(', ') + ')'; }).join(' ');
+    }
+    if (prop === 'visibility') return t > 0 && t < 1 ? 'visible' : (t <= 0 ? a : b);
+    return t < 0.5 ? a : b;
+  }
+  function addValue(prop, under, v, accumulate) {
+    var mu = NUM.exec(under), mv = NUM.exec(v);
+    if (mu && mv) { if (mu[2].toLowerCase() === mv[2].toLowerCase()) return fmt(parseFloat(mu[1]) + parseFloat(mv[1])) + mv[2]; return 'calc(' + under + ' + ' + v + ')'; }
+    if (TRANSFORMLIKE[prop] === 1) return (under === 'none' ? '' : under + ' ') + (v === 'none' ? '' : v);
+    var cu = parseColor(under), cv = parseColor(v);
+    if (cu && cv) return colorText([cu[0] + cv[0], cu[1] + cv[1], cu[2] + cv[2], Math.min(1, cu[3] + cv[3])]);
+    return v;
+  }
+
+  // ------------------------------------------------------------------------------------------------------------------------------ effects
+  var AnimationEffect = cls('AnimationEffect', null, null);
+  var KeyframeEffect = cls('KeyframeEffect', AnimationEffect, function (target, keyframes, options) {
+    var e;
+    if (target instanceof KeyframeEffect) {   // a copy
+      e = { timing: copyTiming(target.__e.timing), target: target.__e.target, pseudo: target.__e.pseudo, frames: target.__e.frames.map(copyFrame), composite: target.__e.composite, animation: null };
+    } else {
+      if (arguments.length < 2) throw new TypeError("Failed to construct 'KeyframeEffect': 2 arguments required, but only " + arguments.length + ' present.');
+      if (target !== null && !(g.Element && target instanceof g.Element)) throw new TypeError("Failed to construct 'KeyframeEffect': Failed to convert value to 'Element'.");
+      e = { timing: readTiming(options), target: target, pseudo: null, frames: processKeyframes(keyframes, 'KeyframeEffect'), composite: 'replace', animation: null };
+      if (options !== null && typeof options === 'object') {
+        if (options.composite !== undefined) { var c = String(options.composite); if (COMPOSITES.indexOf(c) < 0) throw new TypeError("Failed to construct 'KeyframeEffect': '" + c + "' is not a valid value for composite."); e.composite = c; }
+        if (options.pseudoElement !== undefined && options.pseudoElement !== null) e.pseudo = String(options.pseudoElement);
+      }
+    }
+    hide(this, '__e', e);
+    return this;
+  });
+  function copyTiming(t) { return { delay: t.delay, endDelay: t.endDelay, fill: t.fill, iterationStart: t.iterationStart, iterations: t.iterations, duration: t.duration, direction: t.direction, easing: t.easing }; }
+  function copyFrame(f) { return { offset: f.offset, computed: f.computed, easing: f.easing, composite: f.composite, props: f.props.map(function (p) { return p.slice(); }) }; }
+  def(AnimationEffect.prototype, 'getTiming', function () {
+    var t = this.__e.timing;
+    return { delay: t.delay, endDelay: t.endDelay, fill: t.fill, iterationStart: t.iterationStart, iterations: t.iterations, duration: t.duration, direction: t.direction, easing: easingText(t.easing) };
+  });
+  def(AnimationEffect.prototype, 'getComputedTiming', function () { return computeTiming(this.__e.timing, effectLocalTime(this), animationBackwards(this)); });
+  def(AnimationEffect.prototype, 'updateTiming', function (opts) {
+    var copy = copyTiming(this.__e.timing);
+    readTiming(opts, copy);
+    this.__e.timing = copy;
+    if (this.__e.animation) changed(this.__e.animation);
+  });
+  accessor(AnimationEffect.prototype, 'parent', function () { return null; });
+  accessor(AnimationEffect.prototype, 'previousSibling', function () { return null; });
+  accessor(AnimationEffect.prototype, 'nextSibling', function () { return null; });
+  accessor(KeyframeEffect.prototype, 'target', function () { return this.__e.target; }, function (t) {
+    if (t !== null && !(g.Element && t instanceof g.Element)) throw new TypeError("Failed to set the 'target' property on 'KeyframeEffect': The provided value is not of type 'Element'.");
+    var old = this.__e.target; this.__e.target = t; if (old && old !== t) clearElement(old); if (this.__e.animation) changed(this.__e.animation);
+  });
+  accessor(KeyframeEffect.prototype, 'pseudoElement', function () { return this.__e.pseudo; }, function (v) { this.__e.pseudo = v === null || v === undefined ? null : String(v); });
+  accessor(KeyframeEffect.prototype, 'composite', function () { return this.__e.composite; }, function (v) { v = String(v); if (COMPOSITES.indexOf(v) >= 0) { this.__e.composite = v; if (this.__e.animation) changed(this.__e.animation); } });
+  accessor(KeyframeEffect.prototype, 'iterationComposite', function () { return 'replace'; });
+  def(KeyframeEffect.prototype, 'getKeyframes', function () { return framesOutput(this.__e.frames); });
+  def(KeyframeEffect.prototype, 'setKeyframes', function (kf) { this.__e.frames = processKeyframes(kf, 'setKeyframes'); if (this.__e.animation) changed(this.__e.animation); });
+  function effectLocalTime(effect) { var a = effect.__e.animation; return a ? currentTimeOf(a) : null; }
+  function animationBackwards(effect) { var a = effect.__e.animation; return !!a && a.__a.rate < 0; }
+
+  // ------------------------------------------------------------------------------------------------------------------------------ timelines
+  var AnimationTimeline = cls('AnimationTimeline', null, null);
+  var tickTime = null, cachedNow = null;
+  function liveNow() {
+    if (tickTime !== null) return tickTime;
+    if (cachedNow === null) { cachedNow = now(); Promise.resolve().then(function () { cachedNow = null; }); }
+    return cachedNow;
+  }
+  var DocumentTimeline = cls('DocumentTimeline', AnimationTimeline, function (options) {
+    var origin = 0;
+    if (options !== undefined && options !== null && options.originTime !== undefined) { origin = Number(options.originTime); if (origin !== origin) throw new TypeError("Failed to construct 'DocumentTimeline': The provided double value is non-finite."); }
+    hide(this, '__t', { origin: origin });
+    return this;
+  });
+  accessor(AnimationTimeline.prototype, 'currentTime', function () { return this.__t ? liveNow() - this.__t.origin : null; });
+  accessor(AnimationTimeline.prototype, 'duration', function () { return null; });
+  def(DocumentTimeline.prototype, 'play', function (effect) { var a = new Animation(effect, this); a.play(); return a; });
+  var defaultTimeline = Object.create(DocumentTimeline.prototype); hide(defaultTimeline, '__t', { origin: 0 });
+
+  // ------------------------------------------------------------------------------------------------------------------------------ animations
+  var sequence = 0, live = [], frameRequested = false, queuedEvents = [];
+  var AnimationPlaybackEvent = cls('AnimationPlaybackEvent', g.Event, function (type, init) {
+    var e = new g.Event(type, init); Object.setPrototypeOf(e, AnimationPlaybackEvent.prototype);
+    init = init || {};
+    hide(e, '__p', { currentTime: init.currentTime === undefined ? null : init.currentTime, timelineTime: init.timelineTime === undefined ? null : init.timelineTime });
+    return e;
+  });
+  accessor(AnimationPlaybackEvent.prototype, 'currentTime', function () { return this.__p.currentTime; });
+  accessor(AnimationPlaybackEvent.prototype, 'timelineTime', function () { return this.__p.timelineTime; });
+  function deferred() { var d = {}; d.promise = new Promise(function (res, rej) { d.resolve = res; d.reject = rej; }); d.promise.catch(function () { }); d.done = false; return d; }
+  var Animation = cls('Animation', ET, function (effect, timeline) {
+    if (effect !== undefined && effect !== null && !(effect instanceof AnimationEffect)) throw new TypeError("Failed to construct 'Animation': Failed to convert value to 'AnimationEffect'.");
+    var tl = timeline === undefined ? defaultTimeline : timeline;
+    if (tl !== null && !(tl instanceof AnimationTimeline)) throw new TypeError("Failed to construct 'Animation': Failed to convert value to 'AnimationTimeline'.");
+    var s = { effect: null, timeline: tl, startTime: null, holdTime: null, rate: 1, pendingRate: null, pending: null, ready: deferred(), finished: deferred(), finishNotified: false, replace: 'active', id: '', seq: ++sequence, rank: 2, previous: null, flushed: false };
+    s.ready.resolve(null); s.ready.done = true;
+    hide(this, '__a', s);
+    if (effect) { if (effect.__e.animation) effect.__e.animation.__a.effect = null; s.effect = effect; effect.__e.animation = this; }
+    return this;
+  });
+  var END_MS = function (a) { return a.__a.effect ? endTimeOf(a.__a.effect.__e.timing) : 0; };
+  function timelineTime(a) { var tl = a.__a.timeline; return tl ? tl.currentTime : null; }
+  function currentTimeOf(a) {
+    var s = a.__a;
+    if (s.holdTime !== null) return s.holdTime + 0;
+    var tt = timelineTime(a);
+    if (s.startTime === null || tt === null) return null;
+    return (tt - s.startTime) * s.rate + 0;
+  }
+  function playStateOf(a) {
+    var s = a.__a, c = currentTimeOf(a);
+    if (c === null && s.pending === null) return 'idle';
+    if (s.pending === 'pause' || (s.startTime === null && s.pending !== 'play')) return 'paused';
+    if (c !== null && ((s.rate > 0 && c >= END_MS(a)) || (s.rate < 0 && c <= 0))) return 'finished';
+    return 'running';
+  }
+  function schedule() {
+    if (frameRequested || typeof g.requestAnimationFrame !== 'function') return;
+    frameRequested = true;
+    g.requestAnimationFrame(function (ts) { frameRequested = false; tick(); });
+  }
+  function track(a) { if (live.indexOf(a) < 0) live.push(a); schedule(); }
+  function changed(a) { track(a); }
+  function resolveReady(a) { var s = a.__a; s.pending = null; if (!s.ready.done) { s.ready.done = true; s.ready.resolve(a); } }
+  function newReady(a) { var s = a.__a; if (s.ready.done) { s.ready = deferred(); s.ready.promise.catch(function () { }); } }
+  function updateFinished(a, didSeek, sync) {
+    var s = a.__a, c = currentTimeOf(a), end = END_MS(a), tt = timelineTime(a);
+    if (c !== null && s.startTime !== null && s.pending === null) {
+      if (s.rate > 0 && c >= end) s.holdTime = didSeek ? c : (s.previous !== null && s.previous > end ? s.previous : end);
+      else if (s.rate < 0 && c <= 0) s.holdTime = didSeek ? c : (s.previous !== null && s.previous < 0 ? s.previous : 0);
+      else if (s.rate !== 0 && tt !== null) { if (didSeek && s.holdTime !== null) s.startTime = tt - s.holdTime / s.rate; s.holdTime = null; }
+    }
+    s.previous = currentTimeOf(a);
+    var finished = playStateOf(a) === 'finished';
+    if (finished && !s.finishNotified) {
+      s.finishNotified = true;
+      var notify = function () {
+        if (playStateOf(a) !== 'finished') { s.finishNotified = false; return; }
+        if (!s.finished.done) { s.finished.done = true; s.finished.resolve(a); }
+        queueEvent(a, 'finish', currentTimeOf(a));
+      };
+      if (sync) notify(); else Promise.resolve().then(notify);
+    } else if (!finished) {
+      if (s.finishNotified || s.finished.done) { if (s.finished.done) { s.finished = deferred(); s.finished.promise.catch(function () { }); } s.finishNotified = false; }
+    }
+    track(a);
+  }
+  function queueEvent(a, type, ct) { queuedEvents.push({ target: a, type: type, currentTime: ct, timelineTime: timelineTime(a) }); schedule(); }
+  function seek(a, v) {
+    var s = a.__a, tt = timelineTime(a);
+    if (s.pending === 'pause') { s.holdTime = v; s.startTime = null; if (s.pendingRate !== null) { s.rate = s.pendingRate; s.pendingRate = null; } resolveReady(a); }
+    else if (s.holdTime !== null || s.startTime === null || tt === null || s.rate === 0) s.holdTime = v;
+    else s.startTime = tt - v / s.rate;
+    if (tt === null) s.startTime = null;
+    s.previous = null;
+  }
+  accessor(Animation.prototype, 'id', function () { return this.__a.id; }, function (v) { this.__a.id = String(v); });
+  accessor(Animation.prototype, 'effect', function () { return this.__a.effect; }, function (e) {
+    var s = this.__a;
+    if (e !== null && !(e instanceof AnimationEffect)) throw new TypeError("Failed to set the 'effect' property on 'Animation': The provided value is not of type 'AnimationEffect'.");
+    if (e === s.effect) return;
+    if (e && e.__e.animation && e.__e.animation !== this) e.__e.animation.__a.effect = null;
+    if (s.effect) { var t = s.effect.__e.target; s.effect.__e.animation = null; if (t) clearElement(t); }
+    s.effect = e; if (e) e.__e.animation = this;
+    updateFinished(this, false, false);
+  });
+  accessor(Animation.prototype, 'timeline', function () { return this.__a.timeline; }, function (tl) {
+    if (tl !== null && !(tl instanceof AnimationTimeline)) throw new TypeError("Failed to set the 'timeline' property on 'Animation': The provided value is not of type 'AnimationTimeline'.");
+    this.__a.timeline = tl; updateFinished(this, false, false);
+  });
+  accessor(Animation.prototype, 'startTime', function () { return this.__a.startTime; }, function (v) {
+    var s = this.__a;
+    if (v !== null) { v = Number(v); if (v !== v) throw new TypeError("Failed to set the 'startTime' property on 'Animation': The provided double value is non-finite."); }
+    var tt = timelineTime(this);
+    if (tt === null && v !== null) { s.startTime = v; return; }
+    var prev = currentTimeOf(this);
+    if (s.pendingRate !== null) { s.rate = s.pendingRate; s.pendingRate = null; }
+    s.startTime = v;
+    if (v !== null) { if (s.rate !== 0) s.holdTime = null; } else s.holdTime = prev;
+    if (s.pending) { s.pending = null; resolveReady(this); }
+    updateFinished(this, true, false);
+  });
+  accessor(Animation.prototype, 'currentTime', function () { return currentTimeOf(this); }, function (v) {
+    var s = this.__a;
+    if (v === null || v === undefined) { if (currentTimeOf(this) !== null) throw new TypeError("Failed to set the 'currentTime' property on 'Animation': The provided double value is non-finite."); return; }
+    v = Number(v); if (v !== v) throw new TypeError("Failed to set the 'currentTime' property on 'Animation': The provided double value is non-finite.");
+    seek(this, v);
+    if (s.pending === 'play') { /* the hold time stays until the animation is ready */ }
+    updateFinished(this, true, false);
+  });
+  accessor(Animation.prototype, 'playbackRate', function () { return this.__a.rate; }, function (v) {
+    v = Number(v); if (v !== v || v === Infinity || v === -Infinity) throw new TypeError("Failed to set the 'playbackRate' property on 'Animation': The provided double value is non-finite.");
+    var s = this.__a, prev = currentTimeOf(this);
+    s.pendingRate = null; s.rate = v;
+    if (prev !== null) { seek(this, prev); updateFinished(this, true, false); }
+  });
+  accessor(Animation.prototype, 'playState', function () { return playStateOf(this); });
+  accessor(Animation.prototype, 'replaceState', function () { return this.__a.replace; });
+  accessor(Animation.prototype, 'pending', function () { return this.__a.pending !== null; });
+  accessor(Animation.prototype, 'ready', function () { return this.__a.ready.promise; });
+  accessor(Animation.prototype, 'finished', function () { return this.__a.finished.promise; });
+  accessor(Animation.prototype, 'rangeStart', function () { return null; }); accessor(Animation.prototype, 'rangeEnd', function () { return null; });
+  handler(Animation.prototype, 'finish'); handler(Animation.prototype, 'cancel'); handler(Animation.prototype, 'remove');
+  function playInternal(a, autoRewind) {
+    var s = a.__a, end = END_MS(a), c = currentTimeOf(a), abortedPause = s.pending === 'pause', hadReady = s.pending !== null;
+    if (s.rate > 0 && autoRewind && (c === null || c < 0 || c >= end)) s.holdTime = 0;
+    else if (s.rate < 0 && autoRewind && (c === null || c <= 0 || c > end)) {
+      if (end === Infinity) throw domex("Failed to execute 'play' on 'Animation': Cannot play reversed Animation with infinite target effect end.", 'InvalidStateError');
+      s.holdTime = end;
+    } else if (s.rate === 0 && c === null) s.holdTime = 0;
+    if (s.holdTime === null && s.startTime !== null && !abortedPause && s.pending === null && s.pendingRate === null) { track(a); return; }
+    if (s.holdTime === null && s.startTime !== null) s.holdTime = c;   // resume from where it was
+    if (s.holdTime === null && s.startTime === null) s.holdTime = c === null ? 0 : c;
+    if (!hadReady) newReady(a);
+    s.startTime = s.holdTime !== null ? null : s.startTime;
+    s.pending = 'play';
+    s.finishNotified = false;
+    if (s.finished.done && playStateOf(a) !== 'finished') { s.finished = deferred(); s.finished.promise.catch(function () { }); }
+    s.replace = s.replace === 'removed' ? 'active' : s.replace;
+    updateFinished(a, false, false);
+  }
+  def(Animation.prototype, 'play', function () { playInternal(this, true); });
+  def(Animation.prototype, 'pause', function () {
+    var s = this.__a;
+    if (s.pending === 'pause' || (playStateOf(this) === 'paused' && s.pending !== 'play')) return;
+    var c = currentTimeOf(this);
+    if (c === null) { if (s.rate >= 0) s.holdTime = 0; else { var end = END_MS(this); if (end === Infinity) throw domex("Failed to execute 'pause' on 'Animation': Cannot pause reversed Animation with infinite target effect end.", 'InvalidStateError'); s.holdTime = end; } }
+    if (s.pending === null) newReady(this);
+    s.pending = 'pause';
+    updateFinished(this, false, false);
+  });
+  def(Animation.prototype, 'finish', function () {
+    var s = this.__a, end = END_MS(this);
+    if (s.rate === 0) throw domex("Failed to execute 'finish' on 'Animation': Cannot finish Animation with a playbackRate of 0.", 'InvalidStateError');
+    if (s.rate > 0 && end === Infinity) throw domex("Failed to execute 'finish' on 'Animation': Cannot finish Animation with an infinite target effect end.", 'InvalidStateError');
+    var limit = s.rate > 0 ? end : 0, tt = timelineTime(this);
+    seek(this, limit);
+    if (s.startTime === null && tt !== null) s.startTime = tt - limit / s.rate;
+    if (s.pending) { s.pending = null; resolveReady(this); }
+    updateFinished(this, true, true);
+  });
+  def(Animation.prototype, 'cancel', function () {
+    var s = this.__a, was = playStateOf(this);
+    if (was !== 'idle') {
+      if (s.pending) { s.pending = null; if (!s.ready.done) { s.ready.done = true; s.ready.reject(domex('The animation was aborted.', 'AbortError')); } }
+      if (!s.finished.done) { s.finished.done = true; s.finished.reject(domex('The animation was aborted.', 'AbortError')); }
+      s.finished = deferred(); s.finished.promise.catch(function () { });
+      queueEvent(this, 'cancel', null);
+    }
+    s.holdTime = null; s.startTime = null; s.finishNotified = false; s.previous = null;
+    s.ready = deferred(); s.ready.resolve(this); s.ready.done = true;
+    if (s.effect && s.effect.__e.target) clearElement(s.effect.__e.target);
+    var i = live.indexOf(this); if (i >= 0) live.splice(i, 1);
+    s.replace = s.replace === 'removed' ? 'active' : s.replace;
+  });
+  def(Animation.prototype, 'reverse', function () {
+    var s = this.__a;
+    if (s.timeline === null) throw domex("Failed to execute 'reverse' on 'Animation': Cannot reverse an animation with no active timeline", 'InvalidStateError');
+    var orig = s.rate, origPending = s.pendingRate;
+    s.rate = -s.rate; s.pendingRate = null;
+    try { playInternal(this, true); } catch (e) { s.rate = orig; s.pendingRate = origPending; throw e; }
+  });
+  def(Animation.prototype, 'updatePlaybackRate', function (r) {
+    r = Number(r); if (r !== r || r === Infinity || r === -Infinity) throw new TypeError("Failed to execute 'updatePlaybackRate' on 'Animation': The provided double value is non-finite.");
+    var s = this.__a, st = playStateOf(this);
+    s.pendingRate = r;
+    if (st === 'idle' || st === 'paused') { s.rate = r; s.pendingRate = null; return; }
+    if (st === 'finished') {
+      var c = currentTimeOf(this), tt = timelineTime(this);
+      if (s.rate > 0 && r < 0 || true) { s.rate = r; s.pendingRate = null; if (tt !== null && c !== null) { s.holdTime = null; s.startTime = r === 0 ? tt : tt - c / r; } updateFinished(this, true, false); }
+      return;
+    }
+    if (s.pending === null) newReady(this);
+    s.holdTime = currentTimeOf(this); s.startTime = null; s.pending = 'play';
+    updateFinished(this, false, false);
+  });
+  def(Animation.prototype, 'persist', function () { this.__a.replace = 'persisted'; });
+  def(Animation.prototype, 'commitStyles', function () {
+    var e = this.__a.effect, t = e && e.__e.target;
+    if (!t || !(t instanceof g.Element) || !t.isConnected) throw domex("Failed to execute 'commitStyles' on 'Animation': Target element is not rendered.", 'InvalidStateError');
+    var props = valuesFor(this, effectProgress(this));
+    for (var p in props) t.style.setProperty(p, props[p].value);
+  });
+  var CSSAnimation = cls('CSSAnimation', Animation, null), CSSTransition = cls('CSSTransition', Animation, null);
+  accessor(CSSAnimation.prototype, 'animationName', function () { return this.__css ? this.__css.name : ''; }); accessor(CSSTransition.prototype, 'transitionProperty', function () { return this.__css ? this.__css.prop : ''; });
+
+  // ------------------------------------------------------------------------------------------------------------------------------ applying to elements
+  function effectProgress(a) {
+    var e = a.__a.effect; if (!e) return null;
+    return computeTiming(e.__e.timing, currentTimeOf(a), a.__a.rate < 0);
+  }
+  function underlying(el, prop) {
+    var v = '';
+    try { v = origGCS.call(g, el).getPropertyValue(prop); } catch (err) { }
+    return v;
+  }
+  function valuesFor(a, ct, under) {
+    var e = a.__a.effect.__e, out = {};
+    if (!ct || ct.progress === null || !e.frames.length) return out;
+    var byProp = {};
+    e.frames.forEach(function (f) { f.props.forEach(function (p) { (byProp[p[0]] || (byProp[p[0]] = [])).push({ offset: f.computed, value: p[1], easing: f.easing, composite: f.composite === 'auto' ? e.composite : f.composite }); }); });
+    Object.keys(byProp).forEach(function (prop) {
+      var list = byProp[prop], p = ct.progress, u = under ? under[prop] : '';
+      if (list[0].offset > 0) list.unshift({ offset: 0, value: null, easing: e.frames[0].easing, composite: 'replace' });
+      if (list[list.length - 1].offset < 1) list.push({ offset: 1, value: null, easing: parseEasing('linear'), composite: 'replace' });
+      var val = null, comp = 'replace', i;
+      for (i = 0; i < list.length - 1; i++) {
+        var a0 = list[i], b0 = list[i + 1];
+        if (p < b0.offset || i === list.length - 2) {
+          if (p < a0.offset && i > 0) continue;
+          var span = b0.offset - a0.offset, local = span === 0 ? (p >= b0.offset ? 1 : 0) : (p - a0.offset) / span;
+          local = a0.easing(Math.max(0, Math.min(1, local)));
+          var va = a0.value === null ? u : a0.value, vb = b0.value === null ? u : b0.value;
+          val = mixValue(prop, va, vb, local);
+          comp = a0.composite;
+          break;
+        }
+      }
+      if (val !== null) out[prop] = { value: val, composite: comp };
+    });
+    return out;
+  }
+  var applied = [];   // elements that carry animated declarations
+  function clearElement(el) { if (hasNative) g.__set_animated_style(el, ''); var i = applied.indexOf(el); if (i >= 0) applied.splice(i, 1); }
+  function applyAll() {
+    var byEl = [], elements = [];
+    live.forEach(function (a) {
+      var e = a.__a.effect, el = e && e.__e.target;
+      if (!el || e.__e.pseudo) return;
+      var i = elements.indexOf(el); if (i < 0) { elements.push(el); byEl.push([]); i = elements.length - 1; }
+      byEl[i].push(a);
+    });
+    // elements that had animations and have none now
+    applied.slice().forEach(function (el) { if (elements.indexOf(el) < 0) clearElement(el); });
+    elements.forEach(function (el, k) {
+      var list = byEl[k].sort(function (x, y) { return (x.__a.rank - y.__a.rank) || (x.__a.seq - y.__a.seq); }), need = [], timings = [];
+      list.forEach(function (a) { var ct = effectProgress(a); timings.push(ct); if (ct && ct.progress !== null) a.__a.effect.__e.frames.forEach(function (f) { f.props.forEach(function (p) { if (need.indexOf(p[0]) < 0) need.push(p[0]); }); }); });
+      if (!need.length) { clearElement(el); return; }
+      var under = {};
+      if (hasNative) { g.__set_animated_style(el, ''); need.forEach(function (p) { under[p] = underlying(el, p); }); }
+      var final = {};
+      list.forEach(function (a, i) {
+        if (!timings[i] || timings[i].progress === null) return;
+        var vals = valuesFor(a, timings[i], under);
+        Object.keys(vals).forEach(function (p) {
+          var v = vals[p];
+          if (v.composite === 'replace') final[p] = v.value;
+          else final[p] = addValue(p, final[p] !== undefined ? final[p] : under[p], v.value);
+        });
+      });
+      var text = Object.keys(final).map(function (p) { return p + ':' + final[p]; }).join(';');
+      if (hasNative) { g.__set_animated_style(el, text); if (applied.indexOf(el) < 0) applied.push(el); }
+    });
+  }
+  function relevant(a) {
+    var s = a.__a;
+    if (!s.effect || s.replace === 'removed') return false;
+    var st = playStateOf(a); if (st === 'idle') return false;
+    var ct = effectProgress(a);
+    return ct.phase === 'before' || ct.phase === 'active' || ct.progress !== null;
+  }
+  function tick() {
+    var ts = now(); tickTime = ts;
+    try {
+      var copy = live.slice();
+      copy.forEach(function (a) {
+        var s = a.__a;
+        if (s.pending) {
+          var tt = timelineTime(a);
+          if (tt !== null) {
+            var pend = s.pending;
+            if (s.pendingRate !== null) { var keep = pend === 'play' && s.holdTime !== null ? s.holdTime : currentTimeOf(a); s.rate = s.pendingRate; s.pendingRate = null; if (pend === 'play') s.holdTime = keep; }
+            if (pend === 'play') {
+              if (s.holdTime !== null) { s.startTime = s.rate === 0 ? tt : tt - s.holdTime / s.rate; if (s.rate !== 0) s.holdTime = null; }
+            } else {
+              if (s.startTime !== null && s.holdTime === null) s.holdTime = (tt - s.startTime) * s.rate;
+              s.startTime = null;
+            }
+            resolveReady(a);
+            updateFinished(a, false, true);
+          }
+        } else updateFinished(a, false, true);
+      });
+      removeReplaced(copy);
+      processCssEvents();
+      applyAll();
+    } finally { tickTime = null; }
+    // events and the animations that are still going
+    var events = queuedEvents; queuedEvents = [];
+    events.forEach(function (ev) { try { ev.target.dispatchEvent(new AnimationPlaybackEvent(ev.type, { currentTime: ev.currentTime, timelineTime: ev.timelineTime })); } catch (e) { } });
+    var more = false;
+    live = live.filter(function (a) {
+      var st = playStateOf(a);
+      if (st === 'idle' || a.__a.replace === 'removed') return false;
+      if (st === 'running' || a.__a.pending) more = true;
+      if (st === 'finished' && !(a.__a.effect && effectProgress(a).progress !== null)) return false;
+      return true;
+    });
+    if (more || queuedEvents.length) schedule();
+  }
+  function removeReplaced(list) {
+    list.forEach(function (a) {
+      var s = a.__a, e = s.effect;
+      if (!e || s.rank < 2 || s.replace !== 'active' || playStateOf(a) !== 'finished' || !e.__e.target || e.__e.pseudo) return;
+      var ct = effectProgress(a); if (!ct || ct.progress === null) return;
+      var props = []; e.__e.frames.forEach(function (f) { f.props.forEach(function (p) { if (props.indexOf(p[0]) < 0) props.push(p[0]); }); });
+      if (!props.length) return;
+      var covered = props.filter(function (p) {
+        return list.some(function (b) {
+          if (b === a || b.__a.seq < s.seq || !b.__a.effect || b.__a.effect.__e.target !== e.__e.target || b.__a.effect.__e.composite !== 'replace' || b.__a.replace === 'removed') return false;
+          var bc = effectProgress(b); if (!bc || bc.progress === null || playStateOf(b) === 'idle') return false;
+          return b.__a.effect.__e.frames.some(function (f) { return f.props.some(function (q) { return q[0] === p; }); });
+        });
+      });
+      if (covered.length === props.length) { s.replace = 'removed'; queueEvent(a, 'remove', currentTimeOf(a)); }
+    });
+  }
+
+  // ------------------------------------------------------------------------------------------------------------------------------ the document and elements
+  var EP = g.Element.prototype, DP = g.Document.prototype;
+  var animateElement = function (keyframes, options) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'animate' on 'Element': 1 argument required, but only 0 present.");
+    var tl = defaultTimeline, id = '';
+    if (options !== null && typeof options === 'object') { if (options.timeline !== undefined) tl = options.timeline; if (options.id !== undefined) id = String(options.id); }
+    var effect = new KeyframeEffect(this, keyframes, options === undefined ? undefined : options);
+    var a = new Animation(effect, tl);
+    a.id = id;
+    a.play();
+    return a;
+  };
+  def(EP, 'animate', animateElement);
+  def(EP, 'getAnimations', function (options) {
+    var self = this, subtree = !!(options && options.subtree);
+    return allAnimations().filter(function (a) {
+      var t = a.__a.effect && a.__a.effect.__e.target;
+      return t && (t === self || (subtree && self.contains(t))) && relevant(a);
+    });
+  });
+  function allAnimations() { return live.slice().sort(function (x, y) { return (x.__a.rank - y.__a.rank) || (x.__a.seq - y.__a.seq); }); }
+  def(DP, 'getAnimations', function () { return allAnimations().filter(function (a) { var t = a.__a.effect && a.__a.effect.__e.target; return t && t.isConnected && relevant(a); }); });
+  accessor(DP, 'timeline', function () { return defaultTimeline; });
+  def(g, 'AnimationEvent', g.AnimationEvent || cls('AnimationEvent', g.Event, function (type, init) { var e = new g.Event(type, init); Object.setPrototypeOf(e, g.AnimationEvent.prototype); init = init || {}; hide(e, '__x', { animationName: init.animationName || '', elapsedTime: init.elapsedTime || 0, pseudoElement: init.pseudoElement || '' }); return e; }));
+  if (!('animationName' in g.AnimationEvent.prototype)) ['animationName', 'elapsedTime', 'pseudoElement'].forEach(function (k) { accessor(g.AnimationEvent.prototype, k, function () { return this.__x ? this.__x[k] : k === 'elapsedTime' ? 0 : ''; }); });
+  if (!g.TransitionEvent) cls('TransitionEvent', g.Event, function (type, init) { var e = new g.Event(type, init); Object.setPrototypeOf(e, g.TransitionEvent.prototype); init = init || {}; hide(e, '__x', { propertyName: init.propertyName || '', elapsedTime: init.elapsedTime || 0, pseudoElement: init.pseudoElement || '' }); return e; });
+  if (g.TransitionEvent && !('propertyName' in g.TransitionEvent.prototype)) ['propertyName', 'elapsedTime', 'pseudoElement'].forEach(function (k) { accessor(g.TransitionEvent.prototype, k, function () { return this.__x ? this.__x[k] : k === 'elapsedTime' ? 0 : ''; }); });
+
+  // ------------------------------------------------------------------------------------------------------------------------------ CSS animations and transitions
+  // They are Animation objects (CSSAnimation, CSSTransition) that the style makes: after the page changed, every element is looked at once, and animations are
+  // started, updated or cancelled to match animation-* and transition-*. A transition starts when the value a property would have without animations differs from
+  // the value it had the last time (so the first style of an element never transitions).
+  var states = new Map(), cssTracked = [], cssQueue = [], lastStyleVersion = -1, updating = false, motionScheduled = false;
+  var ALLPROPS = ['width', 'height', 'min-width', 'min-height', 'max-width', 'max-height', 'margin-top', 'margin-right', 'margin-bottom', 'margin-left', 'padding-top', 'padding-right', 'padding-bottom', 'padding-left',
+    'top', 'right', 'bottom', 'left', 'opacity', 'color', 'background-color', 'border-top-color', 'border-right-color', 'border-bottom-color', 'border-left-color', 'border-top-width', 'border-right-width',
+    'border-bottom-width', 'border-left-width', 'border-top-left-radius', 'border-top-right-radius', 'border-bottom-right-radius', 'border-bottom-left-radius', 'font-size', 'font-weight', 'line-height',
+    'letter-spacing', 'word-spacing', 'text-indent', 'transform', 'translate', 'rotate', 'scale', 'transform-origin', 'flex-grow', 'flex-shrink', 'flex-basis', 'outline-color', 'outline-width', 'outline-offset',
+    'box-shadow', 'text-shadow', 'filter', 'visibility', 'row-gap', 'column-gap', 'vertical-align', 'background-position', 'z-index'];
+  var SHORTHANDS = { margin: ['margin-top', 'margin-right', 'margin-bottom', 'margin-left'], padding: ['padding-top', 'padding-right', 'padding-bottom', 'padding-left'], 'border-width': ['border-top-width', 'border-right-width', 'border-bottom-width', 'border-left-width'],
+    'border-color': ['border-top-color', 'border-right-color', 'border-bottom-color', 'border-left-color'], 'border-radius': ['border-top-left-radius', 'border-top-right-radius', 'border-bottom-right-radius', 'border-bottom-left-radius'],
+    border: ['border-top-color', 'border-right-color', 'border-bottom-color', 'border-left-color', 'border-top-width', 'border-right-width', 'border-bottom-width', 'border-left-width'], gap: ['row-gap', 'column-gap'], inset: ['top', 'right', 'bottom', 'left'], outline: ['outline-color', 'outline-width', 'outline-offset'],
+    background: ['background-color', 'background-position'], flex: ['flex-grow', 'flex-shrink', 'flex-basis'] };
+  var listOf = function (text) { return splitTop(String(text || ''), ',').map(function (x) { return x.trim(); }).filter(function (x) { return x !== ''; }); };
+  var millis = function (t) { var m = /^(-?[\d.]+(?:e-?\d+)?)(m?s)$/.exec(String(t).trim()); if (!m) return 0; return m[2] === 'ms' ? parseFloat(m[1]) : parseFloat(m[1]) * 1000; };
+  var pick = function (list, i) { return list.length ? list[i % list.length] : ''; };
+  function motionState(el) { var st = states.get(el); if (!st) { st = { anims: {}, trans: {}, before: {} }; states.set(el, st); } return st; }
+  function queueCss(el, kind, type, name, elapsed) { cssQueue.push({ el: el, kind: kind, type: type, name: name, elapsed: elapsed }); schedule(); }
+  function findKeyframes(name) {
+    var found = null, sheets;
+    try { sheets = document.styleSheets; } catch (e) { return null; }
+    var walk = function (rules, depth) {
+      if (!rules || depth > 4) return;
+      for (var i = 0; i < rules.length; i++) {
+        var r = rules[i];
+        if (r.type === 7 && r.name === name) found = r;
+        else if (r.cssRules && r.type !== 7) walk(r.cssRules, depth + 1);
+      }
+    };
+    for (var i = 0; i < sheets.length; i++) { try { walk(sheets[i].cssRules, 0); } catch (e) { } }
+    return found;
+  }
+  function keyframesSignature(rule) { var out = []; for (var i = 0; i < rule.cssRules.length; i++) out.push(rule.cssRules[i].cssText); return out.join('|'); }
+  function framesOf(rule, easing) {
+    var frames = [];
+    for (var i = 0; i < rule.cssRules.length; i++) {
+      var kr = rule.cssRules[i], props = [], fe = easing, comp = 'auto', st = kr.style;
+      for (var k = 0; k < st.length; k++) {
+        var n = st.item(k), v = st.getPropertyValue(n);
+        if (n === 'animation-timing-function') { try { fe = parseEasing(v); } catch (e) { } }
+        else if (n === 'animation-composition') comp = v === 'add' || v === 'accumulate' ? v : 'auto';
+        else if (/^animation-|^transition-/.test(n)) continue;
+        else props.push([n, v]);
+      }
+      kr.keyText.split(',').forEach(function (t) {
+        t = t.trim(); var off = t === 'from' ? 0 : t === 'to' ? 1 : parseFloat(t) / 100;
+        if (off === off && off >= 0 && off <= 1) frames.push({ offset: off, computed: off, easing: fe, composite: comp, props: props });
+      });
+    }
+    frames.sort(function (a, b) { return a.offset - b.offset; });
+    return frames;
+  }
+  function animationParams(cs, i) {
+    var iter = pick(listOf(cs.animationIterationCount), i), dir = pick(listOf(cs.animationDirection), i), fill = pick(listOf(cs.animationFillMode), i);
+    return {
+      duration: millis(pick(listOf(cs.animationDuration), i) || '0s'), delay: millis(pick(listOf(cs.animationDelay), i) || '0s'), iterations: iter === 'infinite' ? Infinity : (parseFloat(iter) >= 0 ? parseFloat(iter) : 1),
+      direction: DIRECTIONS.indexOf(dir) >= 0 ? dir : 'normal', fill: fill === 'forwards' || fill === 'backwards' || fill === 'both' ? fill : 'none', easing: pick(listOf(cs.animationTimingFunction), i) || 'ease',
+      paused: pick(listOf(cs.animationPlayState), i) === 'paused'
+    };
+  }
+  function cssAnimation(el, name, rule, p) {
+    var easing; try { easing = parseEasing(p.easing); } catch (e) { easing = parseEasing('ease'); }
+    var effect = new KeyframeEffect(el, [], { duration: p.duration, delay: p.delay, iterations: p.iterations, direction: p.direction, fill: p.fill, easing: 'linear' });
+    effect.__e.frames = framesOf(rule, easing);
+    var a = new Animation(effect, defaultTimeline); Object.setPrototypeOf(a, CSSAnimation.prototype); a.__a.rank = 1;
+    hide(a, '__css', { kind: 'animation', name: name, el: el, phase: 'idle', iter: null, signature: keyframesSignature(rule), cancelled: false });
+    cssTracked.push(a); a.play(); if (p.paused) a.pause();
+    return a;
+  }
+  function cancelCss(a, quiet) {
+    var c = a.__css; if (c.cancelled) return;
+    c.cancelled = true;
+    var i = cssTracked.indexOf(a); if (i >= 0) cssTracked.splice(i, 1);
+    if (!quiet) { var ct = effectProgress(a); queueCss(c.el, c.kind, c.kind === 'animation' ? 'animationcancel' : 'transitioncancel', c.kind === 'animation' ? c.name : c.prop, ct && ct.localTime !== null ? Math.max(0, ct.localTime - (ct.delay || 0)) / 1000 : 0); }
+    a.cancel();
+  }
+  function currentValueOf(a, prop) {
+    var ct = effectProgress(a);
+    if (!ct || ct.progress === null) return a.__css.from;
+    var vals = valuesFor(a, ct, {}); return vals[prop] ? vals[prop].value : a.__css.to;
+  }
+  function updateAnimations(el, st, cs) {
+    var names = listOf(cs.animationName), want = {}, i;
+    names.forEach(function (n, k) { if (n !== 'none') want[n] = k; });
+    Object.keys(st.anims).forEach(function (n) {
+      var a = st.anims[n], rule = want[n] !== undefined ? findKeyframes(n) : null;
+      if (want[n] === undefined || !rule || keyframesSignature(rule) !== a.__css.signature) { cancelCss(a, false); delete st.anims[n]; }
+    });
+    Object.keys(want).forEach(function (n) {
+      var rule = findKeyframes(n); if (!rule) return;
+      var p = animationParams(cs, want[n]), a = st.anims[n];
+      if (!a) { st.anims[n] = cssAnimation(el, n, rule, p); return; }
+      var t = a.effect.__e.timing;
+      if (t.duration !== p.duration || t.delay !== p.delay || t.iterations !== p.iterations || t.direction !== p.direction || t.fill !== p.fill) a.effect.updateTiming({ duration: p.duration, delay: p.delay, iterations: p.iterations, direction: p.direction, fill: p.fill });
+      var fe; try { fe = parseEasing(p.easing); } catch (e) { fe = parseEasing('ease'); }
+      a.effect.__e.frames.forEach(function (f) { if (f.easing.__text === a.__css.easing) f.easing = fe; }); a.__css.easing = fe.__text;
+      var st2 = playStateOf(a);
+      if (p.paused && st2 !== 'paused') a.pause(); else if (!p.paused && st2 === 'paused') a.play();
+    });
+  }
+  function transitionParams(cs) {
+    var tp = listOf(cs.transitionProperty), td = listOf(cs.transitionDuration), tdl = listOf(cs.transitionDelay), tf = listOf(cs.transitionTimingFunction), tb = listOf(cs.transitionBehavior), map = {};
+    tp.forEach(function (p, i) {
+      if (p === 'none') return;
+      var one = { dur: millis(pick(td, i) || '0s'), delay: millis(pick(tdl, i) || '0s'), ease: pick(tf, i) || 'ease', discrete: pick(tb, i) === 'allow-discrete' };
+      var names = p === 'all' ? ALLPROPS : SHORTHANDS[p] || [p];
+      names.forEach(function (n) { map[n] = one; });
+    });
+    return map;
+  }
+  function updateTransitions(el, st, cs) {
+    var params = transitionParams(cs), tracked = Object.keys(params);
+    Object.keys(st.trans).forEach(function (p) { if (tracked.indexOf(p) < 0) tracked.push(p); });
+    if (!tracked.length) { st.before = {}; return; }
+    var cur = {};
+    if (hasNative) g.__set_animated_style(el, '');
+    var fresh = origGCS.call(g, el);
+    tracked.forEach(function (p) { cur[p] = fresh.getPropertyValue(p); });
+    tracked.forEach(function (p) {
+      var now = cur[p], old = st.before[p], run = st.trans[p], par = params[p];
+      if (run && (!par || par.dur + par.delay <= 0)) { cancelCss(run, false); delete st.trans[p]; run = null; }
+      if (par && old !== undefined && old !== now && par.dur + par.delay > 0) {
+        if (run && run.__css.to === now) { st.before[p] = now; return; }
+        var from = run ? currentValueOf(run, p) : old;
+        if (from === now) { if (run) { cancelCss(run, false); delete st.trans[p]; } st.before[p] = now; return; }
+        var discrete = mixValue(p, from, now, 0.25) === from && mixValue(p, from, now, 0.75) === now;
+        if (discrete && !par.discrete) { st.before[p] = now; return; }
+        if (run) { cancelCss(run, false); delete st.trans[p]; }
+        var ease; try { ease = parseEasing(par.ease); } catch (e) { ease = parseEasing('ease'); }
+        var effect = new KeyframeEffect(el, [], { duration: par.dur, delay: par.delay, easing: 'linear', fill: 'backwards' });
+        effect.__e.timing.easing = ease;
+        effect.__e.frames = [{ offset: 0, computed: 0, easing: parseEasing('linear'), composite: 'auto', props: [[p, from]] }, { offset: 1, computed: 1, easing: parseEasing('linear'), composite: 'auto', props: [[p, now]] }];
+        var a = new Animation(effect, defaultTimeline); Object.setPrototypeOf(a, CSSTransition.prototype); a.__a.rank = 0;
+        hide(a, '__css', { kind: 'transition', prop: p, el: el, from: from, to: now, phase: 'idle', cancelled: false, started: false });
+        cssTracked.push(a); a.play(); st.trans[p] = a;
+        queueCss(el, 'transition', 'transitionrun', p, Math.max(Math.min(-par.delay, par.dur), 0) / 1000);
+      }
+      st.before[p] = now;
+    });
+    // a property that is no longer tracked forgets its value
+    Object.keys(st.before).forEach(function (p) { if (!params[p] && !st.trans[p]) delete st.before[p]; });
+  }
+  function updateMotion() {
+    var all = document.querySelectorAll('*'), seen = [];
+    for (var i = 0; i < all.length; i++) {
+      var el = all[i], cs = origGCS.call(g, el), st = states.get(el);
+      var hasAnim = cs.animationName !== 'none' && cs.animationName !== '', hasTrans = cs.transitionProperty !== 'none' && cs.transitionProperty !== '' && !(cs.transitionProperty === 'all' && /^0s(,\s*0s)*$/.test(cs.transitionDuration) && /^0s(,\s*0s)*$/.test(cs.transitionDelay));
+      if (!st && !hasAnim && !hasTrans) continue;
+      st = motionState(el);
+      updateAnimations(el, st, cs);
+      updateTransitions(el, st, cs);
+    }
+    states.forEach(function (st, el) {
+      if (el.isConnected) return;
+      Object.keys(st.anims).forEach(function (n) { cancelCss(st.anims[n], true); }); Object.keys(st.trans).forEach(function (n) { cancelCss(st.trans[n], true); });
+      states.delete(el);
+    });
+  }
+  function flushMotion() {
+    if (updating || !hasNative || typeof g.__style_version !== 'function') return;
+    var v = g.__style_version();
+    if (v === lastStyleVersion) return;
+    lastStyleVersion = v;
+    if (!g.__motion_in_use()) {
+      if (states.size) { states.forEach(function (st) { Object.keys(st.anims).forEach(function (n) { cancelCss(st.anims[n], false); }); Object.keys(st.trans).forEach(function (n) { cancelCss(st.trans[n], false); }); }); states.clear(); }
+      return;
+    }
+    updating = true;
+    try { updateMotion(); } finally { updating = false; }
+    if (live.length) { applyAll(); schedule(); }
+  }
+  g.__style_dirty = function () {
+    if (motionScheduled || typeof g.requestAnimationFrame !== 'function' || !hasNative || typeof g.__motion_in_use !== 'function' || !(g.__motion_in_use() || states.size)) return;
+    motionScheduled = true;
+    g.requestAnimationFrame(function () { motionScheduled = false; flushMotion(); });
+  };
+  var wrappedGCS = function (el, pseudo) { flushMotion(); return origGCS.apply(this, arguments); };
+  Object.defineProperty(wrappedGCS, 'name', { value: 'getComputedStyle' });
+  def(g, 'getComputedStyle', wrappedGCS);
+  var origElGet = EP.getAnimations, origDocGet = DP.getAnimations;
+  def(EP, 'getAnimations', function (o) { flushMotion(); return origElGet.call(this, o); });
+  def(DP, 'getAnimations', function (o) { flushMotion(); return origDocGet.call(this, o); });
+  function processCssEvents() {
+    cssTracked.slice().forEach(function (a) {
+      var c = a.__css; if (c.cancelled) return;
+      var ct = effectProgress(a); if (!ct) return;
+      var phase = ct.phase, t = a.__a.effect.__e.timing;
+      if (c.kind === 'animation') {
+        var startElapsed = Math.max(Math.min(-t.delay, ct.activeDuration), 0) / 1000;
+        if ((c.phase === 'idle' || c.phase === 'before') && (phase === 'active' || phase === 'after') && !c.started) { c.started = true; queueCss(c.el, 'animation', 'animationstart', c.name, startElapsed); }
+        if (phase === 'active' && c.iter !== null && ct.currentIteration !== null && ct.currentIteration > c.iter) queueCss(c.el, 'animation', 'animationiteration', c.name, ct.duration * (ct.currentIteration - t.iterationStart) / 1000);
+        if (phase === 'after' && c.phase !== 'after') queueCss(c.el, 'animation', 'animationend', c.name, ct.activeDuration / 1000);
+        if (phase === 'active') c.iter = ct.currentIteration; else if (phase === 'before') c.iter = null;
+      } else {
+        if ((c.phase === 'idle' || c.phase === 'before') && (phase === 'active' || phase === 'after') && !c.started) { c.started = true; queueCss(c.el, 'transition', 'transitionstart', c.prop, Math.max(Math.min(-t.delay, ct.duration), 0) / 1000); }
+        if (phase === 'after' && c.phase !== 'after') {
+          queueCss(c.el, 'transition', 'transitionend', c.prop, ct.duration / 1000);
+          var st = states.get(c.el); if (st && st.trans[c.prop] === a) delete st.trans[c.prop];
+          c.cancelled = true; var k = cssTracked.indexOf(a); if (k >= 0) cssTracked.splice(k, 1); a.cancel();
+        }
+      }
+      c.phase = phase;
+    });
+    var events = cssQueue; cssQueue = [];
+    events.forEach(function (ev) {
+      try {
+        var init = { bubbles: true, cancelable: false, elapsedTime: ev.elapsed, pseudoElement: '' };
+        if (ev.kind === 'animation') { init.animationName = ev.name; ev.el.dispatchEvent(new g.AnimationEvent(ev.type, init)); }
+        else { init.propertyName = ev.name; ev.el.dispatchEvent(new g.TransitionEvent(ev.type, init)); }
+      } catch (e) { }
+    });
+  }
+  if (typeof g.addEventListener === 'function') { g.addEventListener('DOMContentLoaded', function () { g.__style_dirty(); }); g.addEventListener('load', function () { g.__style_dirty(); }); }
+}(globalThis));
+)JSPRELUDE";
+
+const char* animation_prelude() { return kAnimationPrelude; }
+
+const char* web_audio_prelude() { return kWebAudioPrelude; }
+
+const char* svg_prelude() { return kSvgPrelude; }
+
 const char* finish_prelude() { return kFinishPrelude; }
 
 }  // namespace browser

@@ -82,6 +82,10 @@ const ReflectedAttribute kReflected[] = {
     {"noValidate", "novalidate", Reflect::Bool}, {"srcdoc", "srcdoc", Reflect::Str}, {"sandbox", "sandbox", Reflect::Str}, {"allow", "allow", Reflect::Str}, {"useMap", "usemap", Reflect::Str}, {"loading", "loading", Reflect::Str}, {"crossOrigin", "crossorigin", Reflect::Str},
 };
 
+// An element in the SVG namespace: some names are not the reflected attributes of HTML (className is an SVGAnimatedString there), the script's accessors answer.
+bool in_svg_namespace(const dom::Node* n) { return n->is_element() && n->ns_set && n->ns.view().equals("http://www.w3.org/2000/svg"); }
+bool svg_own_name(StringView js) { return js.equals("className") || js.equals("href") || js.equals("target") || js.equals("type") || js.equals("media") || js.equals("name") || js.equals("content") || js.equals("width") || js.equals("height") || js.equals("max") || js.equals("min") || js.equals("rel") || js.equals("download"); }
+
 const ReflectedAttribute* find_reflected(StringView js) {
   for (const ReflectedAttribute& r : kReflected)
     if (js.equals(r.js)) return &r;
@@ -608,6 +612,7 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
     if (n->is_tag("button")) { *out = str_value(vm, "submit"); return true; }
   }
   if ((IS("htmlFor") && n->is_tag("output")) || (IS("sandbox") && n->is_tag("iframe"))) return false;   // (token lists: the script's accessors)
+  if (in_svg_namespace(n) && svg_own_name(k)) return false;
   if (const ReflectedAttribute* r = find_reflected(k)) {
     StringView v;
     const bool present = dom::get_attribute(n, r->attribute, &v);
@@ -741,6 +746,7 @@ HostClass::Set node_set(Vm& vm, JsObject* o, JsString* key, const Value& value) 
     return done(dom::set_text_content(n, text.view()));
   }
   if ((IS("htmlFor") && n->is_tag("output")) || (IS("sandbox") && n->is_tag("iframe"))) return HostClass::Set::NotHandled;
+  if (in_svg_namespace(n) && svg_own_name(k)) return HostClass::Set::NotHandled;
   if (const ReflectedAttribute* r = find_reflected(k)) {
     switch (r->kind) {
       case Reflect::Bool:
@@ -1562,6 +1568,10 @@ void mutation_epilogue(void* context) {
   DomBindings::Impl& c = *static_cast<DomBindings::Impl*>(context);
   Value fn;
   Value ignored;
+  if (c.style_dirty) {
+    c.style_dirty = false;
+    if (c.vm.get_named(Value::make_object(c.vm.global()), "__style_dirty", &fn) && Vm::is_callable(fn)) c.vm.call(fn, Value(), nullptr, 0, &ignored);
+  }
   while (c.pending_scripts.count() > 0) {
     const uint32_t serial = c.pending_scripts[0];
     c.pending_scripts.remove_at(0);
@@ -1647,6 +1657,68 @@ NATIVE(register_tag) {
   return true;
 }
 
+// __register_svg_tag(name, prototype): SVG elements with that local name get this prototype
+NATIVE(register_svg_tag) {
+  (void)self;
+  DomBindings::Impl& c = impl(vm);
+  JsString* name;
+  if (!vm.to_string(arg_at(args, argc, 0), &name) || !arg_at(args, argc, 1).is_object()) return false;
+  String key(vm.allocator());   // (the local name in lower case: the parser may have folded it)
+  for (uint64_t i = 0; i < name->length; ++i) key.push_back(name->data()[i] >= 'A' && name->data()[i] <= 'Z' ? static_cast<char>(name->data()[i] + 32) : name->data()[i]);
+  vm.define(c.svg_tag_protos, vm.intern(key.view()), args[1], 0);
+  *result = Value();
+  return true;
+}
+
+// __set_animated_style(element, declarations): what running animations put on an element ("" removes it); the page is styled again
+NATIVE(set_animated_style) {
+  (void)self;
+  dom::Node* n = node_of(arg_at(args, argc, 0));
+  String text(vm.allocator());
+  if (!n || !n->is_element() || !arg_text(vm, arg_at(args, argc, 1), &text)) return vm.throw_error(ErrorKind::TypeError, "__set_animated_style: not an element");
+  if (n->animated.view().equals(text.view())) {
+    *result = Value();
+    return true;
+  }
+  n->animated.assign(text.view());
+  n->owner->touch_animated();
+  *result = Value();
+  return true;
+}
+
+// __style_version(): a number that changes when the page changes in a way that can change the style (not when animations only move their values)
+NATIVE(style_version) {
+  (void)self;
+  (void)args;
+  (void)argc;
+  *result = Value::make_number(static_cast<double>(impl(vm).doc.style_version()));
+  return true;
+}
+
+// __motion_in_use(): does a style sheet or a style attribute declare a transition or an animation?
+NATIVE(motion_in_use) {
+  (void)self;
+  (void)args;
+  (void)argc;
+  DomBindings::Impl& c = impl(vm);
+  bool used = false;
+  if (const StyleSheet* sheet = c.host.computed_style_sheet()) used = sheet->uses_motion();
+  for (const dom::Node* n = c.doc.root(); n && !used; n = dom::next_in_tree(n, c.doc.root())) {
+    StringView style;
+    if (n->is_element() && dom::get_attribute(n, "style", &style)) used = style.contains("transition") || style.contains("animation");
+  }
+  *result = Value::make_bool(used);
+  return true;
+}
+
+// The page changed: a script that follows the style (CSS transitions and animations) is told at the end of the call that did it.
+void style_change_hook(void* context) {
+  DomBindings::Impl& c = *static_cast<DomBindings::Impl*>(context);
+  if (c.style_dirty) return;
+  c.style_dirty = true;
+  c.vm.request_epilogue();
+}
+
 // `new MyElement()` for a class that extends HTMLElement: a document node whose tag was registered for a prototype in the chain
 JsObject* construct_element(void* user, JsObject* proto) {
   DomBindings::Impl& c = *static_cast<DomBindings::Impl*>(user);
@@ -1676,6 +1748,11 @@ bool install_nodes(DomBindings::Impl& c) {
   vm.define_native(g, "__watch_node", watch_node, 1);
   vm.define_native(g, "__take_mutations", take_mutations, 0);
   vm.define_native(g, "__register_tag", register_tag, 2);
+  vm.define_native(g, "__register_svg_tag", register_svg_tag, 2);
+  vm.define_native(g, "__set_animated_style", set_animated_style, 2);
+  vm.define_native(g, "__style_version", style_version, 0);
+  vm.define_native(g, "__motion_in_use", motion_in_use, 0);
+  c.doc.set_change_hook(style_change_hook, &c);
   vm.set_construct_hook(construct_element, &c);
   c.doc.set_insert_hook(script_inserted_hook, &c);
   vm.set_epilogue(mutation_epilogue, &c);
@@ -1782,7 +1859,10 @@ bool install_nodes(DomBindings::Impl& c) {
   make_class(c, "EventTarget", event_target_constructor, event_target);
   vm.define_native(ep, "attachShadow", el_attach_shadow, 1);
   make_class(c, "Element", illegal_constructor, ep);
-  make_class(c, "SVGElement", illegal_constructor, vm.new_object(ep));
+  c.svg_proto = vm.new_object(ep);
+  make_class(c, "SVGElement", illegal_constructor, c.svg_proto);
+  c.svg_tag_protos = vm.new_plain();
+  vm.define_named(g, "__svg_tag_protos", Value::make_object(c.svg_tag_protos), 0);
   make_class(c, "HTMLUnknownElement", illegal_constructor, vm.new_object(c.html_proto));
   {   // `window` is a Window, which is an EventTarget: addEventListener and the rest are inherited, as pages that patch Window.prototype expect
     JsObject* window_proto = vm.new_object(event_target);

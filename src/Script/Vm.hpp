@@ -62,6 +62,7 @@ class Vm {
   void set_instruction_budget(uint64_t instructions) { budget_ = instructions; }
   void set_memory_limit(uint64_t bytes) { memory_limit_ = bytes; }
   uint64_t instructions_run() const { return instructions_; }
+  void reset_instruction_count() { instructions_ = 0; }   // (each timer or event callback gets the whole budget)
   // Counts instructions run by native code (a WebAssembly interpreter) against the budget. False, with the script stopped, when it is spent.
   bool charge(uint64_t instructions) {
     if (!budget_) return true;
@@ -228,6 +229,7 @@ class Vm {
   JsObject* promise_resolved(const Value& value);
   // The `resolve` / `reject` function of a promise; `shared` is a plain object that the pair of them share (once one has been called, the other does nothing).
   JsObject* resolving_function(JsObject* promise, JsObject* shared, bool reject);
+  void set_extra_root(const Value& v) { extra_root_ = v; }
   // Takes the pending exception as a value (and clears it).
   void take_exception_value(Value* out) {
     *out = exception_;
@@ -316,6 +318,7 @@ class Vm {
   void grow_props(JsObject* o);
   void index_rebuild(JsObject* o);
   int64_t find_prop(JsObject* o, JsString* key) const;
+  void push_property_keys(JsObject* names, JsObject* o, bool enumerable);
   bool array_index(const Value& key, uint32_t* index) const;
   static bool canonical_index(StringView s, uint32_t* index);
   bool ensure_items(JsObject* o, uint32_t capacity);
@@ -398,6 +401,7 @@ class Vm {
   bool has_exception_ = false;
   uint32_t throw_line_ = 0;   // the source line an exception was thrown from (kept for debugging builds: TCOS_ERROR_LINES prints it)
   Value last_result_;
+  Value extra_root_;    // a value the collector must keep while native code that is not in a frame holds it (see Engine::call_guarded)
   Value iter_return_;   // the value an iterator finished with (done: true, value: ...): what `yield*` evaluates to
   JsObject *global_ = nullptr, *object_proto_ = nullptr, *array_proto_ = nullptr, *function_proto_ = nullptr, *string_proto_ = nullptr, *number_proto_ = nullptr,
            *boolean_proto_ = nullptr, *error_proto_ = nullptr, *iterator_proto_ = nullptr, *sentinel_ = nullptr;

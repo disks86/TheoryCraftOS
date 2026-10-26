@@ -45,7 +45,7 @@ struct Attribute {
 enum UiState : uint8_t { kUiHover = 1, kUiActive = 2 };
 
 struct Node {
-  Node(allocators::IAllocator& allocator, NodeType t, Document* d) : type(t), owner(d), name(allocator), data(allocator), attrs(allocator), ns(allocator), qname(allocator) {}
+  Node(allocators::IAllocator& allocator, NodeType t, Document* d) : type(t), owner(d), name(allocator), data(allocator), attrs(allocator), ns(allocator), qname(allocator), animated(allocator) {}
 
   NodeType type;
   Node *parent = nullptr, *first_child = nullptr, *last_child = nullptr, *prev = nullptr, *next = nullptr;
@@ -56,6 +56,7 @@ struct Node {
   List<Attribute> attrs;     // elements
   // elements: the namespace and the qualified name as the page wrote them. An element of HTML has neither (ns_set is false: its namespace is XHTML, its name `name`).
   String ns, qname;
+  String animated;           // elements: declarations ("opacity:0.5;transform:...") that running animations put on top of the cascade (see __set_animated_style)
   bool ns_set = false;
   uint8_t dom_type = 0;      // a comment or text node that stands for a node of another type: 7 a processing instruction (name is its target), 4 a CDATA section
   void* script = nullptr;    // the script engine's object for this node
@@ -123,7 +124,21 @@ class Document {
 
   // Changes through the functions below bump this.
   uint64_t version() const { return version_; }
-  void touch() { ++version_; }
+  void touch() {
+    ++version_;
+    if (change_hook_) change_hook_(change_context_);
+  }
+  // A change that running animations made to the style (they do not count as a change of the page for what starts new animations and transitions).
+  void touch_animated() {
+    ++version_;
+    ++animation_touches_;
+  }
+  uint64_t style_version() const { return version_ - animation_touches_; }
+  // Called by touch(): the page changed (a script sees it as "the style may have changed").
+  void set_change_hook(void (*hook)(void*), void* context) {
+    change_hook_ = hook;
+    change_context_ = context;
+  }
 
   // While recording, every change to the tree is also written to a log (at most kMaxLog entries; later ones are lost). `hook` is called when the log goes
   // from empty to not empty. take_log() moves the log out.
@@ -158,6 +173,9 @@ class Document {
   Node* root_ = nullptr;
   List<Node*> nodes_;
   uint64_t version_ = 1;
+  uint64_t animation_touches_ = 0;
+  void (*change_hook_)(void*) = nullptr;
+  void* change_context_ = nullptr;
   List<Mutation> log_;
   List<Node*> watched_;
   bool recording_ = false;

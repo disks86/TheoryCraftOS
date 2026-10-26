@@ -759,6 +759,7 @@ NATIVE(wasm_instance_exports) {
 bool pages_arg(Vm& vm, const Value& v, uint32_t* out) {
   double d;
   if (!vm.to_number(v, &d)) return false;
+  if (d > 65536 && d <= 4294967295.0) return vm.throw_error(ErrorKind::RangeError, "WebAssembly.Memory(): Property 'initial': value is above the upper bound");
   if (!(d >= 0) || d > 65536 || d != static_cast<double>(static_cast<uint32_t>(d))) return vm.throw_error(ErrorKind::TypeError, "WebAssembly.Memory(): Property 'initial': value is out of range");
   *out = static_cast<uint32_t>(d);
   return true;
@@ -858,7 +859,8 @@ NATIVE(wasm_table_length) {
 bool index_arg(Vm& vm, const Value& v, wasm::Table& t, uint32_t* out, const char* api) {
   double d;
   if (!vm.to_number(v, &d)) return false;
-  if (!(d >= 0) || d != static_cast<double>(static_cast<uint32_t>(d)) || d >= static_cast<double>(t.items.count())) {
+  if (!(d >= 0) || d > 4294967295.0 || d != static_cast<double>(static_cast<uint32_t>(d))) return vm.throw_error(ErrorKind::TypeError, "invalid table index");
+  if (d >= static_cast<double>(t.items.count())) {
     String m(vm.allocator());
     m.append(api);
     m.append(": invalid address ");

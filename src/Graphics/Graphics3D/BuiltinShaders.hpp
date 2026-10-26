@@ -24,7 +24,7 @@ ShaderModuleDesc colored_fragment_shader();
 void describe_colored_pipeline(GraphicsPipelineDesc* desc);
 
 // The textured pair: the vertex shader transforms a float3 position (location 0) by the matrix in the push constants (the same first 64 bytes as the coloured one) and
-// passes a float2 texture coordinate (location 1) on; the fragment shader writes the texel of texture unit 0 at that coordinate. Only the software device has them so far.
+// passes a float2 texture coordinate (location 1) on; the fragment shader writes the texel of texture unit 0 at that coordinate. The software, Intel Gen9 and virgl devices have them.
 struct TexturedVertex {
   float position[3];
   float uv[2];

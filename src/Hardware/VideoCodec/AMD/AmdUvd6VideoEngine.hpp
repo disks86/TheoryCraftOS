@@ -27,6 +27,7 @@
 #include "Hardware/VideoCodec/AMD/AmdUvd6Mpeg2Decoder.hpp"
 #include "Hardware/VideoCodec/AMD/AmdUvd6Vc1Decoder.hpp"
 #include "Hardware/VideoCodec/AMD/AmdUvd6Ring.hpp"
+#include "Hardware/VideoCodec/AMD/AmdVce3VideoEngine.hpp"
 #include "Hardware/VideoCodec/AMD/AmdVcnFirmware.hpp"
 #include "Hardware/VideoCodec/AMD/AmdVcnSelfTest.hpp"
 #include "Hardware/VideoCodec/AMD/AmdVcnWorkMemory.hpp"
@@ -43,6 +44,10 @@ namespace hardware {
 // test and the same rule. Anything else, and every session while
 // the engine is not up or failed a test, runs on the CPU through the software codecs. info().accelerated says false (the device as a whole is not accelerated);
 // info().accelerated_decode_codecs lists what the engine really does.
+//
+// The card's H.264 encoder (VCE 3.4, AmdVce3VideoEngine) is the opt-in part of the same device (enable_encode()): its microcode is loaded with the decoder's, its block of video
+// memory is carved from the end of the decode work area (so the two never share memory), it is started after the decoders and serves H.264 encode sessions when its own
+// self-test passed. A VCE that does not come up leaves the decoders as they are and encoding on the CPU.
 //
 // Nothing here has run on a real card. What the start does not do is power the engine (the driver asks the card's SMC; a card that was not left with the engine powered
 // makes the VCPU never answer, which the start reports and undoes), so it is only started when the memory plan is whole and the graphics block reports a plausible
@@ -74,9 +79,25 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
   }
   uint64_t gpu_memory_bytes() const override { return memory_map_.video_memory_bytes; }
 
+  // Brings the VCE encoder up with the rest (the microcode, a block of video memory, the start and a self-test). Off by default: it has not run on a real card.
+  void enable_encode(bool enable) {
+    if (!enable) {
+      vce_.reset();
+      return;
+    }
+    if (!vce_) vce_ = UniquePointer<AmdVce3VideoEngine>::make(allocator_, allocator_, device_id_);
+  }
+  // The decoder's clock level asked of the SMC at the next start (the default is the top level only: the driver's stable-pstate case).
+  void set_clock_level(AmdSmu7::UvdLevel level) { clock_level_ = level; }
+  bool encode_enabled() const { return vce_ != nullptr; }
+  bool encode_ready() const { return vce_ && vce_->ready(); }
+  const char* encode_status() const { return vce_ ? vce_->status() : ""; }
+  AmdVce3VideoEngine* encoder_engine() { return vce_.get(); }
+
   bool load_firmware(filesystem::IFileSystem& file_system) override {
     const char* name = amd_uvd6_firmware_name(device_id_);
     if (!name) return false;
+    if (vce_) vce_->load_firmware(file_system);   // (its own status says what became of it; the decoder does not depend on it)
     firmware_name_ = name;
     firmware_state_ = firmware_.load(file_system, name);
     note_ = "engine not started";
@@ -102,6 +123,19 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
       plan_text_.append(amd_uvd6_plan_result_name(plan_.result));
       return false;
     }
+    // The encoder's memory is the end of the work area.
+    bool carve_vce = false;
+    AmdVce3VideoEngine::Region vce_region;
+    if (vce_ && vce_->firmware_usable()) {
+      const uint64_t reserve = AmdVce3VideoEngine::reserve_bytes();
+      if (plan_.work_bytes >= reserve + kAmdUvd6MinWorkBytes) {
+        plan_.work_bytes -= reserve;
+        vce_region.gpu_address = plan_.work_gpu_address + plan_.work_bytes;
+        vce_region.physical = aperture_physical_ + plan_.work_offset + plan_.work_bytes;
+        vce_region.bytes = reserve;
+        carve_vce = true;
+      }
+    }
     if (!amd_map_uvd6_plan(plan_, *environment.mapper, aperture_physical_, &memory_)) {
       plan_text_.append("the card's memory cannot be mapped (the OS owns it, or the mapper refuses)");
       return false;
@@ -117,6 +151,15 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
     plan_text_.append_uint(plan_.work_bytes >> 20);
     plan_text_.append(" MiB; gb_addr_config 0x");
     append_hex(plan_text_, config_.gb_addr_config);
+    if (vce_) {
+      plan_text_.append("; encoder: ");
+      if (carve_vce && vce_->plan(*registers_, *environment.mapper, vce_region)) {
+        plan_text_.append_uint(vce_region.bytes >> 20);
+        plan_text_.append(" MiB");
+      } else {
+        plan_text_.append("no memory");
+      }
+    }
     planned_ = true;
     return true;
   }
@@ -127,6 +170,21 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
   // Starts the engine and brings up decoding, when the plan is whole and the graphics block's address configuration reads as a configured chip (not zero, not all ones,
   // which is what a block that was never set up, or a card that does not answer, reads as). Three tries for the VCPU to answer, not the driver's ten.
   bool start_hardware(const IClock& clock) override {
+    const bool decoding = start_decode_hardware(clock);
+    start_encode_hardware(clock);
+    return decoding;
+  }
+
+  // The encoder, after the decoders (whatever became of them): its own start and self-test. True when H.264 encode sessions run on the engine.
+  bool start_encode_hardware(const IClock& clock) {
+    if (!vce_ || !vce_->planned()) return false;
+    const bool ready = vce_->start(clock);
+    info_.accelerated_encode_codecs = ready ? codec_mask(VideoCodec::H264) : 0;
+    rebuild_status();
+    return ready;
+  }
+
+  bool start_decode_hardware(const IClock& clock) {
     if (engine_running()) return true;
     clock_ = &clock;
     if (!planned_) return false;
@@ -158,7 +216,14 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
     return engine_running();
   }
 
-  void shutdown() override { stop_engine(); }
+  void shutdown() override {
+    stop_encode();
+    stop_engine();
+  }
+  void stop_encode() {
+    info_.accelerated_encode_codecs = 0;
+    if (vce_) vce_->stop();
+  }
   void stop_engine() {
     decode_ready_ = false;
     hevc_ready_ = false;
@@ -413,6 +478,15 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
     return SoftwareVideoCodec::create_decoder(config);
   }
 
+  // H.264 goes to the VCE when it passed its self-test and is free (one session at a time); anything else, and every session while it is not up, runs on the CPU.
+  UniquePointer<IVideoEncoder> create_encoder(const EncoderConfig& config) override {
+    if (config.codec == VideoCodec::H264 && vce_ && vce_->ready()) {
+      UniquePointer<IVideoEncoder> session = vce_->create_encoder(config);
+      if (session) return session;
+    }
+    return SoftwareVideoCodec::create_encoder(config);
+  }
+
   const char* name() const override { return "AMD video engine (UVD 6) (software path)"; }
   const char* engine_summary() const override { return summary_.c_str(); }
   const AmdVcnFirmware& firmware() const { return firmware_; }
@@ -446,15 +520,32 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
   void request_power(const IClock& clock) {
     AmdSmu7 smc(*registers_, clock);
     switch (smc.uvd_power(true)) {
-      case AmdSmu7::Result::Ok: smc_powered_ = true; power_note_ = "SMC powered the engine"; break;
-      case AmdSmu7::Result::NotAnswering: power_note_ = "SMC did not answer, engine assumed powered"; break;
-      case AmdSmu7::Result::Unsupported: power_note_ = "SMC does not know the power-on message, engine assumed powered"; break;
-      case AmdSmu7::Result::Failed: power_note_ = "SMC refused to power the engine"; break;
+      case AmdSmu7::Result::Ok: smc_powered_ = true; power_note_.assign("SMC powered the engine"); break;
+      case AmdSmu7::Result::NotAnswering: power_note_.assign("SMC did not answer, engine assumed powered"); return;
+      case AmdSmu7::Result::Unsupported: power_note_.assign("SMC does not know the power-on message, engine assumed powered"); break;
+      case AmdSmu7::Result::Failed: power_note_.assign("SMC refused to power the engine"); break;
+    }
+    // The clock, once the SMC is there to ask (smu7_powergate_uvd(false): power, then the DPM table's boot level and DPM on).
+    uint32_t level = 0;
+    switch (smc.uvd_dpm_enable(clock_level_, &level)) {
+      case AmdSmu7::DpmResult::Ok:
+        dpm_enabled_ = true;
+        power_note_.append(", level ");
+        power_note_.append_uint(level);
+        break;
+      case AmdSmu7::DpmResult::NoDpmTable:
+      case AmdSmu7::DpmResult::BadDpmTable: power_note_.append(", no DPM"); break;
+      case AmdSmu7::DpmResult::NotAnswering:
+      case AmdSmu7::DpmResult::Unsupported:
+      case AmdSmu7::DpmResult::Failed: power_note_.append(", DPM refused"); break;
     }
   }
   void release_power(const IClock& clock) {
-    if (!smc_powered_ || !registers_) return;
-    AmdSmu7(*registers_, clock).uvd_power(false);
+    if (!registers_) return;
+    AmdSmu7 smc(*registers_, clock);
+    if (dpm_enabled_) smc.uvd_dpm_disable();   // (before the power goes, as smu7_powergate_uvd(true) does)
+    dpm_enabled_ = false;
+    if (smc_powered_) smc.uvd_power(false);
     smc_powered_ = false;
   }
   static constexpr uint32_t kGbAddrConfig = 0x263e;   // mmGB_ADDR_CONFIG (gca/gfx_8_0_d.h)
@@ -476,9 +567,9 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
       firmware_text_.append_uint(firmware_.ucode().size());
       firmware_text_.append(" bytes of microcode loaded, ");
       firmware_text_.append(note_);
-      if (power_note_[0]) {
+      if (power_note_.size() != 0) {
         firmware_text_.append("; ");
-        firmware_text_.append(power_note_);
+        firmware_text_.append(power_note_.view());
       }
     } else {
       firmware_text_.append(amd_firmware_status_name(firmware_state_));
@@ -497,7 +588,9 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
   const char* firmware_name_ = nullptr;
   FixedString<255> firmware_text_, summary_;
   FixedString<255> decode_text_, diag_text_;
-  const char* power_note_ = "";
+  FixedString<127> power_note_;
+  AmdSmu7::UvdLevel clock_level_ = AmdSmu7::UvdLevel::Highest;
+  bool dpm_enabled_ = false;      // the SMC acknowledged the request for a clock level, so we ask it to switch DPM off again
   bool smc_powered_ = false;   // the SMC acknowledged our request to power the engine, so we ask it to power it down again
   const char* note_ = "engine not started";
   IVcnRegisters* registers_ = nullptr;
@@ -512,6 +605,7 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
   AmdUvd6::Config config_;
   bool planned_ = false;
   FixedString<255> plan_text_;
+  UniquePointer<AmdVce3VideoEngine> vce_;   // the encoder, when enabled
   UniquePointer<AmdUvd6> uvd_;
   UniquePointer<AmdUvd6Ring> ring_;
   AmdVcnWorkMemory work_;

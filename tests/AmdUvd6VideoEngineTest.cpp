@@ -273,6 +273,11 @@ struct Card final : IVcnRegisters {
   bool smc_running = true;
   uint32_t smc_result = 1;
   std::vector<std::pair<uint32_t, size_t>> smc_log;   // (message, index of the write in ring.writes)
+  // The SMC's memory with a DPM table the way the Vega M's has it: the header at 0x20000 names the table at 0x30000, UvdLevelCount is byte 212 of it (bits 31:24 of its dword,
+  // the SMC being big-endian) and UvdBootLevel byte 1648 (bits 31:24 of the dword at 0x30670).
+  static constexpr uint32_t kCountWord = 0x30000 + 212, kBootWord = 0x30000 + 1648;
+  std::map<uint32_t, uint32_t> sram;
+  uint32_t uvd_boot_level() const { auto it = sram.find(kBootWord); return it == sram.end() ? 0 : it->second >> 24; }
   bool boots = true, write_pictures = true, write_hevc = true, hang_hevc = false, write_mpeg2 = true, hang_mpeg2 = false, write_vc1 = true, hang_vc1 = false;
   int boot_attempts = 0, creates = 0, hevc_creates = 0, mpeg2_creates = 0, vc1_creates = 0, destroys = 0, decodes = 0, hevc_decodes = 0, mpeg2_decodes = 0, vc1_decodes = 0, problems = 0;
 
@@ -287,10 +292,17 @@ struct Card final : IVcnRegisters {
     ring.write(reg::kFbLocation, ((0xF4u + 255) << 16) | 0xF4u);
     ring.write(reg::kGbAddrConfig, 0x22011003);
     ring.write(0x95, 1);   // SMC_RESP_0: idle, the last message was done
+    sram[0x20000 + 52] = 0x30000;
+    sram[kCountWord] = (3u << 24) | (4u << 16);   // three UVD levels (and four VCE ones)
+    sram[kBootWord] = 0xAA220000u;
     ring.write(0x38c4, 0xBEEF00);   // UVD_POWER_STATUS: something recognisable for the failure messages
   }
-  uint32_t read(uint32_t r) override { return ring.read(r); }
+  uint32_t read(uint32_t r) override {
+    if (r == 0x1AD) { auto it = sram.find(ring.read(0x1AC)); return it == sram.end() ? 0 : it->second; }   // SMC_IND_DATA_11
+    return ring.read(r);
+  }
   void write(uint32_t r, uint32_t v) override {
+    if (r == 0x1AD) { sram[ring.read(0x1AC)] = v; return; }
     const uint32_t old = ring.read(r);
     ring.write(r, v);
     if (r == 0x94) {   // SMC_MESSAGE_0
@@ -636,7 +648,7 @@ static bool run_vc1_stream(IVideoDecoder& session, ConstByteView stream, const u
   return same && count == kVc1SelfTestPictures;
 }
 
-enum class Fault { None, NoFirmware, NoRegisters, SmallAperture, MapperRefuses, NoBoot, NoGbConfig, DeadRing, WrongPictures, Hang, HevcWrong, HevcHang, SmcNotRunning, SmcRefuses, Mpeg2Wrong, Mpeg2Hang, Vc1Wrong, Vc1Hang };
+enum class Fault { None, NoFirmware, NoRegisters, SmallAperture, MapperRefuses, NoBoot, NoGbConfig, DeadRing, WrongPictures, Hang, HevcWrong, HevcHang, SmcNotRunning, SmcRefuses, Mpeg2Wrong, Mpeg2Hang, Vc1Wrong, Vc1Hang, NoDpmTable };
 
 static void run_case(Fault fault) {
   TestAllocator a;
@@ -664,6 +676,7 @@ static void run_case(Fault fault) {
     card.hang_vc1 = fault == Fault::Vc1Hang;
     if (fault == Fault::SmcNotRunning) card.ring.write(0x95, 0), card.smc_running = false;
     if (fault == Fault::SmcRefuses) card.smc_result = 0xFF;
+    if (fault == Fault::NoDpmTable) card.sram[0x20000 + 52] = 0;   // the SMC's firmware is not running: the header names no table
     card.boots = fault != Fault::NoBoot;
     card.write_pictures = fault != Fault::WrongPictures;
     card.ring.stall_fence = fault == Fault::Hang;
@@ -700,7 +713,7 @@ static void run_case(Fault fault) {
     card.place(engine.plan(), engine.firmware().ucode());
     const size_t writes_before = card.ring.writes.size();
     const bool started = engine.start_hardware(card.clock);
-    const bool engine_up = fault == Fault::None || fault == Fault::HevcWrong || fault == Fault::SmcNotRunning || fault == Fault::SmcRefuses || fault == Fault::Mpeg2Wrong || fault == Fault::Vc1Wrong;
+    const bool engine_up = fault == Fault::None || fault == Fault::HevcWrong || fault == Fault::SmcNotRunning || fault == Fault::SmcRefuses || fault == Fault::Mpeg2Wrong || fault == Fault::Vc1Wrong || fault == Fault::NoDpmTable;
     CHECK(started == engine_up);
     CHECK(card.problems == 0 || fault == Fault::WrongPictures);
     if (engine_up) {
@@ -794,16 +807,25 @@ static void run_case(Fault fault) {
       size_t first_engine_write = 0;
       while (first_engine_write < card.ring.writes.size() && card.ring.writes[first_engine_write].first != reg::kSoftReset) ++first_engine_write;
       if (fault == Fault::SmcNotRunning || fault == Fault::SmcRefuses) {
-        CHECK(card.smc_log.size() == (fault == Fault::SmcRefuses ? 1u : 0u));
+        CHECK(card.smc_log.size() == (fault == Fault::SmcRefuses ? 2u : 0u));   // (a refused power-on is followed by the clock request, which the SMC refuses too)
         CHECK(strstr(engine.firmware_status(), fault == Fault::SmcRefuses ? "refused to power" : "did not answer") != nullptr);
       } else {
         CHECK(!card.smc_log.empty() && card.smc_log[0].first == 0x61 && card.smc_log[0].second < first_engine_write);
         CHECK(strstr(engine.firmware_status(), "SMC powered the engine") != nullptr);
+        // The clock follows the power: the top of the three levels is the boot level and the only one enabled, then DPM is on - all before the engine is touched.
+      }
+      if (fault == Fault::NoDpmTable) {
+        // No table to write: the power is asked for and nothing about the clock; the engine runs at the clock the card had.
+        CHECK(card.smc_log.size() == 1 && card.smc_log[0].first == 0x61 && strstr(engine.firmware_status(), "SMC powered the engine, no DPM") != nullptr && card.uvd_boot_level() == 0xAA);
+      } else if (fault != Fault::SmcNotRunning && fault != Fault::SmcRefuses) {
+        CHECK(card.smc_log.size() == 3 && card.smc_log[1].first == 0x12D && card.smc_log[2].first == 0x154 && card.smc_log[2].second < first_engine_write);
+        CHECK(card.uvd_boot_level() == 2 && card.sram[Card::kBootWord] == 0x02220000u && strstr(engine.firmware_status(), ", level 2") != nullptr);
       }
       const size_t smc_before_shutdown = card.smc_log.size();
       engine.shutdown();
       if (fault == Fault::SmcNotRunning || fault == Fault::SmcRefuses) CHECK(card.smc_log.size() == smc_before_shutdown);
-      else CHECK(card.smc_log.size() == smc_before_shutdown + 1 && card.smc_log.back().first == 0x60);
+      else if (fault == Fault::NoDpmTable) CHECK(card.smc_log.size() == smc_before_shutdown + 1 && card.smc_log.back().first == 0x60);
+      else CHECK(card.smc_log.size() == smc_before_shutdown + 2 && card.smc_log[smc_before_shutdown].first == 0x155 && card.smc_log.back().first == 0x60);   // DPM off, then the power
       CHECK(!engine.engine_running() && !engine.decode_ready() && engine.info().accelerated_decode_codecs == 0);
       CHECK(card.ring.writes.size() > writes_before);
     } else {
@@ -818,7 +840,7 @@ static void run_case(Fault fault) {
       CHECK(static_cast<bool>(software) && run_stream(a, *software, expected) && card.decodes == before);
       // Whatever stopped the engine, the power the SMC gave it is given back.
       if (fault == Fault::NoBoot || fault == Fault::DeadRing || fault == Fault::WrongPictures || fault == Fault::Hang || fault == Fault::HevcHang || fault == Fault::Mpeg2Hang || fault == Fault::Vc1Hang)
-        CHECK(card.smc_log.size() == 2 && card.smc_log[0].first == 0x61 && card.smc_log[1].first == 0x60);
+        CHECK(card.smc_log.size() == 5 && card.smc_log[0].first == 0x61 && card.smc_log[1].first == 0x12D && card.smc_log[2].first == 0x154 && card.smc_log[3].first == 0x155 && card.smc_log[4].first == 0x60);
       if (fault == Fault::NoGbConfig) CHECK(card.smc_log.empty());   // (refused before anything is asked of the card)
       // The failure messages carry the engine's registers (for the first run on a real card): at the moment the start gave up, not after the stop sequence.
       if (fault == Fault::NoBoot) CHECK(strstr(engine.firmware_status(), "st=0x0 pw=0xBEEF00 rst=0x0 cn=0x") != nullptr);
@@ -831,7 +853,7 @@ static void run_case(Fault fault) {
 }
 
 int main() {
-  for (Fault f : {Fault::None, Fault::NoFirmware, Fault::NoRegisters, Fault::SmallAperture, Fault::MapperRefuses, Fault::NoBoot, Fault::NoGbConfig, Fault::DeadRing, Fault::WrongPictures, Fault::Hang, Fault::HevcWrong, Fault::HevcHang, Fault::SmcNotRunning, Fault::SmcRefuses, Fault::Mpeg2Wrong, Fault::Mpeg2Hang, Fault::Vc1Wrong, Fault::Vc1Hang}) {
+  for (Fault f : {Fault::None, Fault::NoFirmware, Fault::NoRegisters, Fault::SmallAperture, Fault::MapperRefuses, Fault::NoBoot, Fault::NoGbConfig, Fault::DeadRing, Fault::WrongPictures, Fault::Hang, Fault::HevcWrong, Fault::HevcHang, Fault::SmcNotRunning, Fault::SmcRefuses, Fault::Mpeg2Wrong, Fault::Mpeg2Hang, Fault::Vc1Wrong, Fault::Vc1Hang, Fault::NoDpmTable}) {
     printf("case %d\n", static_cast<int>(f));
     run_case(f);
   }

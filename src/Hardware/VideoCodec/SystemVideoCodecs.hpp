@@ -58,6 +58,8 @@ class SystemVideoCodecs {
   // The UVD 6 video engine of the Radeon RX Vega M (Kaby Lake-G): with this on, the card gets an AmdUvd6VideoEngine that can be planned and started; off (the default),
   // it is only named like any other Radeon. Opt-in because the start has never run on a real card (it does not power the engine itself).
   void set_amd_uvd6(bool enable) { amd_uvd6_ = enable; }
+  // The Vega M's H.264 encoder (VCE 3.4) along with its decoder; only with set_amd_uvd6(). Opt-in: it has not run on a real card.
+  void set_amd_vce3(bool enable) { amd_vce3_ = enable; }
   // The memory the engine driver takes buffers from; by default the OS allocator's DMA pool. (For tests, which have no memory at device addresses.)
   void set_intel_gpu_memory(intel_gt::IGpuMemory* memory) { gpu_memory_override_ = memory; }
 
@@ -93,6 +95,7 @@ class SystemVideoCodecs {
   IBarSizer* bar_sizer_ = nullptr;
   bool intel_hardware_ = true;
   bool amd_uvd6_ = false;
+  bool amd_vce3_ = false;
   intel_gt::AllocatorGpuMemory gpu_memory_{allocator_};
   intel_gt::IGpuMemory* gpu_memory_override_ = nullptr;
   UniquePointer<intel_gt::MmioRegisterBank> intel_registers_bank_;  // lives as long as the device that uses it

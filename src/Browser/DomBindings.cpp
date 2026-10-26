@@ -184,7 +184,13 @@ JsObject* DomBindings::wrap(dom::Node* node) {
     case dom::NodeType::Document: proto = c.document_proto; break;
     case dom::NodeType::Fragment: proto = node->shadow_host && c.shadow_root_proto ? c.shadow_root_proto : c.fragment_proto; break;
     default:
-      if (node->is_element() && c.tag_protos) {
+      if (node->is_element() && node->ns_set && c.svg_proto && node->ns.view().equals("http://www.w3.org/2000/svg")) {   // an SVG element: its own interface
+        proto = c.svg_proto;
+        Value svg_tagged;
+        String key(vm_.allocator());
+        for (uint64_t i = 0; i < node->name.size(); ++i) key.push_back(node->name[i] >= 'A' && node->name[i] <= 'Z' ? static_cast<char>(node->name[i] + 32) : node->name[i]);
+        if (c.svg_tag_protos && vm_.get_plain(c.svg_tag_protos, vm_.intern(key.view()), &svg_tagged) && svg_tagged.is_object()) proto = svg_tagged.as_object();
+      } else if (node->is_element() && c.tag_protos) {
         Value tagged;
         if (vm_.get_plain(c.tag_protos, vm_.intern(node->name.view()), &tagged) && tagged.is_object()) proto = tagged.as_object();
       }
@@ -210,7 +216,7 @@ bool DomBindings::install() {
   // The prototypes and objects that only this code holds are kept alive by a hidden global: a collection before the page first used one would free them.
   if (ok) {
     JsObject* kept = vm_.new_array();
-    for (JsObject* o : {c.node_proto, c.element_proto, c.html_proto, c.character_data_proto, c.text_proto, c.comment_proto, c.document_proto, c.fragment_proto, c.event_proto,
+    for (JsObject* o : {c.svg_proto, c.svg_tag_protos, c.node_proto, c.element_proto, c.html_proto, c.character_data_proto, c.text_proto, c.comment_proto, c.document_proto, c.fragment_proto, c.event_proto,
                         c.token_list_proto, c.style_proto, c.computed_proto, c.storage_proto, c.location_proto, c.history_proto, c.media_query_proto, c.exception_proto,
                         c.canvas_context_proto, c.gradient_proto, c.pattern_proto, c.path2d_proto, c.typed_array_proto, c.image_data_proto, c.text_metrics_proto,
                         c.thenable_proto, c.time_ranges_proto, c.media_error_proto, c.shadow_root_proto, c.tag_protos, c.window_listeners, c.location, c.local_storage, c.session_storage})
