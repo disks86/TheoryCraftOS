@@ -39,6 +39,8 @@ const char* finish_prelude();
 const char* svg_prelude();
 // The Web Audio API (AudioContext, OfflineAudioContext, AudioBuffer, AudioParam and the nodes), written in JavaScript; run before finish_prelude().
 const char* web_audio_prelude();
+// Web Animations (Animation, KeyframeEffect, DocumentTimeline, element.animate()), written in JavaScript; run before finish_prelude().
+const char* animation_prelude();
 // WebGLRenderingContext and WebGL2RenderingContext over the natives of DomBindingsGl.cpp. Run by a page's engine.
 const char* webgl_prelude();
 // navigator.gpu and the WebGPU interfaces over the natives of DomBindingsGpu.cpp. Run by a page's engine.

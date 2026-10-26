@@ -101,7 +101,15 @@ void ua_defaults(const dom::Node* n, Style* s) {
 Style derive_style(const Style& parent, const dom::Node* n, const StyleSheet& sheet) {
   Style s = parent.inherit();
   ua_defaults(n, &s);
-  sheet.apply(n, attr(n, "style"), parent, &s);
+  if (n->animated.empty()) {
+    sheet.apply(n, attr(n, "style"), parent, &s);
+  } else {   // the style attribute, then what running animations set (they win over it, and lose to !important declarations of the sheets)
+    String inline_and_animated(n->owner->allocator());
+    inline_and_animated.append(attr(n, "style"));
+    if (inline_and_animated.size() && inline_and_animated[inline_and_animated.size() - 1] != ';') inline_and_animated.push_back(';');
+    inline_and_animated.append(n->animated.view());
+    sheet.apply(n, inline_and_animated.view(), parent, &s);
+  }
   const uint32_t indent = static_cast<uint32_t>(parent.indent) + s.margin_left + s.padding_left;
   s.indent = static_cast<uint8_t>(indent < kMaxIndent ? indent : kMaxIndent);
   return s;
