@@ -338,6 +338,7 @@ IBuffer* V3dGraphicsDevice::create_buffer(uint64_t size, uint32_t usage) {
 void V3dGraphicsDevice::destroy_buffer(IBuffer* buffer) { destroy(allocator_, static_cast<V3dBuffer*>(buffer)); }
 
 IImage* V3dGraphicsDevice::create_image(const ImageDesc& desc) {
+  if (desc.stencil) return nullptr;   // (no stencil plane on this device)
   V3dImage* image = make<V3dImage>(allocator_, memory_, desc);
   if (image && !image->valid()) {
     destroy(allocator_, image);
@@ -356,6 +357,7 @@ void V3dGraphicsDevice::destroy_shader_module(IShaderModule* module) { destroy(a
 
 IPipeline* V3dGraphicsDevice::create_graphics_pipeline(const GraphicsPipelineDesc& desc) {
   if (desc.texture_count != 0 || desc.fragment_shader == nullptr) return nullptr;   // (no textures on this device)
+  if (desc.stencil.enable) return nullptr;   // (no stencil test on this device)
   const V3dShaderModule* vs = static_cast<const V3dShaderModule*>(desc.vertex_shader);
   const V3dShaderModule* fs = static_cast<const V3dShaderModule*>(desc.fragment_shader);
   if (!vs || !fs || vs->program() != QpuProgram::ColoredVertex || fs->program() != QpuProgram::ColoredFragment) return nullptr;
