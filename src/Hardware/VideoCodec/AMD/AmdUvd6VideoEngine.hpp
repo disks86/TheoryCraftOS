@@ -24,6 +24,7 @@
 #include "Hardware/VideoCodec/AMD/AmdUvd6.hpp"
 #include "Hardware/VideoCodec/AMD/AmdUvd6AvcDecoder.hpp"
 #include "Hardware/VideoCodec/AMD/AmdUvd6HevcDecoder.hpp"
+#include "Hardware/VideoCodec/AMD/AmdUvd6Mpeg2Decoder.hpp"
 #include "Hardware/VideoCodec/AMD/AmdUvd6Ring.hpp"
 #include "Hardware/VideoCodec/AMD/AmdVcnFirmware.hpp"
 #include "Hardware/VideoCodec/AMD/AmdVcnSelfTest.hpp"
@@ -150,6 +151,7 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
     rebuild_status();
     if (!enable_decode(*registers_, clock, memory_.engine.ring, *mapper_, plan_.work_gpu_address, aperture_physical_ + plan_.work_offset, plan_.work_bytes)) return false;
     enable_hevc_decode();   // (H.264 works either way)
+    if (engine_running()) enable_mpeg2_decode();
     return engine_running();
   }
 
@@ -157,6 +159,7 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
   void stop_engine() {
     decode_ready_ = false;
     hevc_ready_ = false;
+    mpeg2_ready_ = false;
     info_.accelerated_decode_codecs = 0;
     ring_.reset();
     if (uvd_) {
@@ -175,6 +178,7 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
                      uint64_t work_bytes) {
     decode_ready_ = false;
     hevc_ready_ = false;
+    mpeg2_ready_ = false;
     info_.accelerated_decode_codecs = 0;
     ring_.reset();
     const char* why = nullptr;
@@ -270,12 +274,60 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
     rebuild_status();
     return true;
   }
+  // After enable_decode(): the same for MPEG-2 (AmdVcnSelfTest::run_mpeg2_session: an ffmpeg stream with B pictures). The engine's inverse transform is not the CPU decoder's, so
+  // its pictures must be close (a level or two apart), not identical. A failed test leaves the others as they were - unless the engine stopped answering.
+  bool enable_mpeg2_decode() {
+    mpeg2_ready_ = false;
+    if (!ring_) return false;
+    AmdVcnSelfTest::Result result = AmdVcnSelfTest::Result::SessionRefused;
+    {
+      DecoderConfig config;
+      config.codec = VideoCodec::Mpeg2;
+      config.output = PixelFormat::I420;
+      AmdUvd6Mpeg2Decoder session(allocator_, engine_, config);
+      if (session.prepare())
+        result = AmdVcnSelfTest::run_mpeg2_session(
+            allocator_, session, [](const void* ring) { return static_cast<const AmdUvd6Ring*>(ring)->wedged(); }, ring_.get(),
+            [](const void* decoder) { return static_cast<const AmdUvd6Mpeg2Decoder*>(decoder)->pictures_decoded(); }, &session);
+    }
+    if (result != AmdVcnSelfTest::Result::Passed) {
+      if (ring_->wedged()) {
+        decode_ready_ = false;
+        hevc_ready_ = false;
+        info_.accelerated_decode_codecs = 0;
+        decode_text_.assign("MPEG-2 self-test failed (");
+        decode_text_.append(AmdVcnSelfTest::result_name(result));
+        decode_text_.append("); engine stopped");
+        stop_engine();
+      } else {
+        decode_text_.assign(note_);
+        decode_text_.append("; MPEG-2 self-test failed (");
+        decode_text_.append(AmdVcnSelfTest::result_name(result));
+        decode_text_.append("), MPEG-2 stays on the CPU");
+      }
+      note_ = decode_text_.c_str();
+      rebuild_status();
+      return false;
+    }
+    mpeg2_ready_ = true;
+    info_.accelerated_decode_codecs |= codec_mask(VideoCodec::Mpeg2);
+    if (hevc_ready_) note_ = "engine started; H.264, H.265 and MPEG-2 decode run on it (self-tests passed)";   // (else the note says why H.265 stays on the CPU)
+    rebuild_status();
+    return true;
+  }
   bool decode_ready() const { return decode_ready_; }
+  bool mpeg2_ready() const { return mpeg2_ready_; }
   bool hevc_ready() const { return hevc_ready_; }
   const char* engine_note() const { return note_; }
 
-  // H.264 and H.265 go to the engine when they passed their tests and it is free (it runs one session at a time); anything else goes to the CPU.
+  // H.264, H.265 and MPEG-2 go to the engine when they passed their tests and it is free (it runs one session at a time); anything else goes to the CPU.
   UniquePointer<IVideoDecoder> create_decoder(const DecoderConfig& config) override {
+    if (config.codec == VideoCodec::Mpeg2 && mpeg2_ready_ && ring_ && !ring_->wedged()) {
+      AmdUvd6AvcDecoder::Engine engine = engine_;
+      engine.stream_handle = ++next_stream_handle_;
+      UniquePointer<AmdUvd6Mpeg2Decoder> session = UniquePointer<AmdUvd6Mpeg2Decoder>::make(allocator_, allocator_, engine, config);
+      if (session && session->prepare()) return UniquePointer<IVideoDecoder>(util::move(session));
+    }
     if (config.codec == VideoCodec::Hevc && hevc_ready_ && ring_ && !ring_->wedged()) {
       AmdUvd6AvcDecoder::Engine engine = engine_;
       engine.stream_handle = ++next_stream_handle_;
@@ -375,6 +427,7 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
   const IClock* clock_ = nullptr;
   bool decode_ready_ = false;
   bool hevc_ready_ = false;
+  bool mpeg2_ready_ = false;
   uint32_t next_stream_handle_ = 1;
 };
 
