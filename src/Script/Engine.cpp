@@ -435,14 +435,26 @@ const char kCollections[] = R"JSLIB((function (g) {
         default: return new F(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]);
       }
     },
-    defineProperty: function (o, k, d) { try { Object.defineProperty(o, k, d); return true; } catch (e) { return false; } },
+    defineProperty: function (o, k, d) {
+      if (o === null || (typeof o !== 'object' && typeof o !== 'function')) throw new TypeError('Reflect.defineProperty called on non-object');
+      try {
+        if (d !== null && typeof d === 'object' && !('configurable' in d)) { var c = {}; for (var p in d) c[p] = d[p]; c.configurable = false; d = c; }   // (a property made here is not configurable unless the descriptor says so)
+        Object.defineProperty(o, k, d);
+        return true;
+      } catch (e) { if (e instanceof TypeError && /Invalid property descriptor|non-object|Getter must/.test(e.message)) throw e; return false; }
+    },
     deleteProperty: function (o, k) { return delete o[k]; },
     get: function (o, k) { return o[k]; },
-    set: function (o, k, v) { o[k] = v; return true; },
+    set: function (o, k, v) {
+      'use strict';
+      try { o[k] = v; return true; } catch (e) { if (e instanceof TypeError && /^Cannot (assign|add|set|create)/.test(e.message)) return false; throw e; }   // (a write the object refuses)
+    },
     has: function (o, k) { return k in o; },
     getPrototypeOf: function (o) { return Object.getPrototypeOf(o); },
     ownKeys: function (o) { return Object.keys(o); },
-    isExtensible: function (o) { return !Object.isFrozen(o); }
+    isExtensible: function (o) { return Object.isExtensible(o); },
+    preventExtensions: function (o) { Object.preventExtensions(o); return true; },
+    setPrototypeOf: function (o, p) { try { Object.setPrototypeOf(o, p); return true; } catch (e) { return false; } }
   };
   def(g, 'Reflect', Reflect);
 }(this));
@@ -455,9 +467,9 @@ Engine::Engine(allocators::IAllocator& allocator, IHost* host) : allocator_(allo
   vm_.set_instruction_budget(budget_);
   String error(allocator_);
   on_big_stack([&] {
-    run_here(kPrelude, &error, nullptr, nullptr, false);
-    run_here(kCollections, &error, nullptr, nullptr, false);
-    run_here(stdlib_source(), &error, nullptr, nullptr, false);
+    run_here(kPrelude, &error, nullptr, nullptr, false, true);
+    run_here(kCollections, &error, nullptr, nullptr, false, true);
+    run_here(stdlib_source(), &error, nullptr, nullptr, false, true);
     if (!error.empty() && host_) host_->console(3, error.view());
   });
 }
@@ -485,7 +497,7 @@ bool Engine::run(StringView source, String* error, String* result) {
 
 bool Engine::run_library(StringView source, String* error) {
   bool ok = false;
-  on_big_stack([&] { ok = run_here(source, error, nullptr, nullptr, false); });
+  on_big_stack([&] { ok = run_here(source, error, nullptr, nullptr, false, true); });
   return ok;
 }
 
@@ -495,7 +507,7 @@ bool Engine::evaluate(StringView source, String* error, Value* value) {
   return ok;
 }
 
-bool Engine::run_here(StringView source, String* error, String* result, Value* out_value, bool sync) {
+bool Engine::run_here(StringView source, String* error, String* result, Value* out_value, bool sync, bool library) {
   if (!vm_.ok()) {
     error->assign("Error: the script engine could not start");
     return false;
@@ -510,7 +522,7 @@ bool Engine::run_here(StringView source, String* error, String* result, Value* o
     return false;
   }
   FunctionCode* code = nullptr;
-  if (!compile_program(vm_, program, &code, &message)) {
+  if (!compile_program(vm_, program, &code, &message, library)) {
     error->assign("SyntaxError: ");
     error->append(message.view());
     return false;

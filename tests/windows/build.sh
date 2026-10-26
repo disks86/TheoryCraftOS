@@ -40,6 +40,8 @@ $cc -O1 -Wall -Wextra -o "$out/mmaptest.exe" tests/windows/mmaptest.c
 echo "built $out/mmaptest.exe (file mappings; procchild.exe in System32)"
 $cc -O1 -Wall -Wextra -o "$out/extratest.exe" tests/windows/extratest.c
 echo "built $out/extratest.exe (fibers, thread pool, timer queues, volumes, ini files, small things)"
+$cc -O1 -Wall -Wextra -o "$out/nlstest.exe" tests/windows/nlstest.c
+echo "built $out/nlstest.exe (locale, string functions, atoms, completion ports, versions)"
 $cc -O1 -Wall -Wextra -o "$out/locktest.exe" tests/windows/locktest.c
 echo "built $out/locktest.exe (byte-range locks; procchild.exe in System32)"
 $cc -O0 -Wall -Wextra -o "$out/suspendtest.exe" tests/windows/suspendtest.c

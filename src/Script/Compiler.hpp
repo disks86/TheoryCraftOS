@@ -27,6 +27,6 @@ namespace script {
 
 // Compiles `program` (a Block node from parse_program). The code returns the value of the last expression statement. False with *error set when
 // the program cannot be compiled (too many nested functions, ...).
-bool compile_program(Vm& vm, Node* program, FunctionCode** out, String* error);
+bool compile_program(Vm& vm, Node* program, FunctionCode** out, String* error, bool library = false);
 
 }  // namespace script

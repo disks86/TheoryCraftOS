@@ -148,7 +148,7 @@ class Parser {
     body->list = head;
     Node* fn = make(NodeKind::Function);
     if (!fn) return nullptr;
-    fn->flags = kFlagAsync;
+    fn->flags = kFlagAsync | kFlagStrict;   // (module code is strict)
     fn->a = body;
     Node** params = &fn->list;
     for (const char* name : {"__deps", "__exports", "import.meta"}) {
@@ -448,8 +448,16 @@ class Parser {
   Node* make(NodeKind kind) {
     Node* n = arena_.make(kind, cur_.line);
     if (!n) fail("Out of memory");
+    else if (kind == NodeKind::Function && strict_parse_) n->flags |= kFlagStrict;
     return n;
   }
+  // While one is alive the functions made are strict mode code (class bodies are).
+  struct StrictScope {
+    explicit StrictScope(bool& flag) : flag_(flag), saved_(flag) { flag_ = true; }
+    ~StrictScope() { flag_ = saved_; }
+    bool& flag_;
+    bool saved_;
+  };
 
   // Saves and restores the lexer, for the few places that look ahead.
   struct Mark {
@@ -1952,6 +1960,7 @@ class Parser {
 
   // At the class name (or at `extends` / `{` for a class without one).
   Node* class_body(StringView name) {
+    StrictScope strict(strict_parse_);
     if (!name.empty()) next();
     Node* parent = nullptr;
     if (is_word("extends")) {
@@ -2422,6 +2431,7 @@ class Parser {
         next();
         Node* e = expression(false);
         if (!e || !expect(T::RParen, "Unexpected token")) return nullptr;
+        if (e->kind == NodeKind::String) e->flags |= kFlagParenthesized;
         return e;
       }
       case T::LBracket: return array_literal();
@@ -2687,6 +2697,7 @@ class Parser {
   uint32_t depth_ = 0;
   // modules
   bool module_ = false;
+  bool strict_parse_ = false;
   ModuleRequests* requests_ = nullptr;
   List<ExportEntry> exports_{arena_.allocator()};
 };

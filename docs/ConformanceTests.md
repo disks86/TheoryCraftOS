@@ -11,6 +11,7 @@ PageTest binary (`PAGETEST=path`); the console log of a page is capped at 16 KB,
 | File | Modelled on | Covers |
 | --- | --- | --- |
 | `js_language.js` | test262 `language/` and `built-ins/` | destructuring, classes, generators, async, Proxy/Reflect, Symbol, BigInt, RegExp, Date, JSON, typed arrays, Array/String/Object builtins, Promise, iterator helpers, Intl, global object shape |
+| `js_strict.js` | test262 strict mode, `built-ins/Object` integrity levels and `defineProperty` | strict mode semantics, property attributes, `preventExtensions`/`seal`/`freeze`, `Reflect` |
 | `js_modules.js` | test262 `language/module-code`, WPT `the-script-element/module` | `import()`, namespace objects, live bindings, `export … from`, top-level await, `import.meta`, `<script type=module>`, `nomodule`, import maps |
 | `wasm_jsapi.js` | WPT `wasm/jsapi` | the `WebAssembly` namespace, Module/Instance/Memory/Table/Global/Tag/Exception, error classes, compile/instantiate, imports and linking, conversions, traps |
 | `html_parser.js` | html5lib-tests tree construction, WPT `html/syntax` | tokenizer states, character references, insertion modes, adoption agency, foster parenting, foreign content, templates, quirks mode, serialisation |
@@ -28,13 +29,14 @@ run reports `XPASS name` and fails, so the entry gets deleted and the gap is clo
 gaps: `grep -c xfail tests/data/wpt/*.js`. The largest ones today:
 
 - **JavaScript**: ES modules work (`import`/`export`, `import()`, `import.meta`, top-level await, `<script type=module>`, `nomodule`, import maps; the
-  loader is `module_prelude()` in `WebPrelude.cpp` over `__compile_module`), but the namespace object is not frozen (no non-extensible objects or
-  non-configurable properties in the engine), there is no strict mode (module code is sloppy), and an anonymous `export default class` is not named
-  "default". Also missing: `BigInt64Array`, `SharedArrayBuffer`/`Atomics`, resizable/transferable `ArrayBuffer`, iterator helpers, `Intl` beyond basic
-  formatting, RegExp lookbehind / property escapes / `v` flag / `d` flag / duplicate named groups, `Object.prototype.toString` tags for Date, Map, Set and
-  arguments, TDZ, per-iteration `let` bindings in `for`, sloppy `arguments` mapping, `Symbol.match/split/unscopables`,
-  `String.prototype.normalize`/special casing, lone-surrogate handling, `new.target`/`Reflect.construct`, tagged template caching, `for…in` integer key
-  order, and a call depth of 500.
+  loader is `module_prelude()` in `WebPrelude.cpp` over `__compile_module`). Strict mode (`"use strict"`, modules, class bodies), non-extensible and sealed
+  objects and non-configurable properties are implemented (`js_strict.js`); the host's own scripts keep configurable-by-default properties
+  (`FunctionCode::library`). Left: the `prototype` of built-in constructors is configurable, module namespace properties are accessors
+  (not writable data properties), no strict-only early errors (octal literals, duplicate parameters, `eval`/`arguments` assignment). Also missing:
+  `BigInt64Array`, `SharedArrayBuffer`/`Atomics`, resizable/transferable `ArrayBuffer`, iterator helpers, `Intl` beyond basic formatting, RegExp
+  lookbehind / property escapes / `v` flag / `d` flag / duplicate named groups, `Object.prototype.toString` tags for Date, Map, Set and arguments,
+  TDZ, per-iteration `let` bindings in `for`, sloppy `arguments` mapping, `Symbol.match/split/unscopables`, `String.prototype.normalize`/special
+  casing, lone-surrogate handling, `new.target`/`Reflect.construct`, tagged template caching, `for…in` integer key order, and a call depth of 500.
 - **HTML**: the parser follows the standard (`src/Dom/HtmlBuilder.cpp`: tokenizer states, insertion modes, adoption agency, foster parenting, foreign
   content, templates, quirks mode). Left: the doctype is not a node (`document.doctype`, `publicId`/`systemId`), `DOMParser` with XML, character
   references that stand for two code points, `innerHTML` scripts must not run.

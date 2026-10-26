@@ -60,7 +60,7 @@ class Engine {
   uint32_t fire_event(StringView type, String* error);
 
  private:
-  bool run_here(StringView source, String* error, String* result, Value* value = nullptr, bool sync = true);
+  bool run_here(StringView source, String* error, String* result, Value* value = nullptr, bool sync = true, bool library = false);
   uint32_t run_timers_here(double now_ms, bool ahead, uint32_t max, String* error);
   uint32_t fire_event_here(StringView type, String* error);
   void sync_document();

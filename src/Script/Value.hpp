@@ -120,7 +120,7 @@ enum class ObjKind : uint8_t { Plain, Array, Function, Native, Bound, Error, Ite
 
 enum PromiseBits : uint32_t { kPromisePending = 0, kPromiseFulfilled = 1, kPromiseRejected = 2, kPromiseState = 3, kPromiseHandled = 4 };
 
-enum PropFlag : uint8_t { kEnumerable = 1, kWritable = 2, kDefaultFlags = 3, kAccessor = 4 };   // (an accessor's value is a two element array: getter, setter)
+enum PropFlag : uint8_t { kEnumerable = 1, kWritable = 2, kDefaultFlags = 3, kAccessor = 4, kNonConfigurable = 8 };   // (an accessor's value is a two element array: getter, setter)
 
 struct Prop {
   JsString* key;
@@ -148,7 +148,9 @@ struct HostClass {
 
 struct JsObject : Cell {
   ObjKind okind = ObjKind::Plain;
-  bool frozen = false;
+  bool frozen = false;         // Object.freeze (also set on an iterator object whose next() is called: see Vm.cpp)
+  bool non_extensible = false; // Object.preventExtensions: no property can be added
+  bool sealed = false;         // Object.seal: ... and none can be deleted or reconfigured
   JsObject* proto = nullptr;
   Prop* props = nullptr;
   uint32_t prop_count = 0, prop_cap = 0;

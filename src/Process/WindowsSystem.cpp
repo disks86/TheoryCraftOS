@@ -79,6 +79,33 @@ uint32_t nt_query_system_information(Process& p, const SyscallRequest& r) {
       size = 48;
       break;
     }
+    case 5: {    // SYSTEM_PROCESS_INFORMATION for each program, one after the other (the threads' entries are left out); each is 0x100 bytes and the image name's characters
+      IProcessRuntime::ProcessEntry entries[32];
+      const uint32_t count = runtime ? runtime->list_processes(entries, 32) : 0;
+      constexpr uint32_t kEntry = 0x100, kName = 24 * 2 + 8;
+      const uint32_t total_size = count * (kEntry + kName);
+      if (returned != 0 && !p.write_user_u32(returned, total_size)) return kAccessViolation;
+      if (length < total_size) return kInfoLengthMismatch;
+      for (uint32_t i = 0; i < count; ++i) {
+        uint8_t entry[kEntry + kName] = {};
+        auto put = [&](uint32_t at, uint64_t value, uint32_t size) { for (uint32_t k = 0; k < size; ++k) entry[at + k] = uint8_t(value >> (8 * k)); };
+        const IProcessRuntime::ProcessEntry& e = entries[i];
+        uint32_t name_length = 0;
+        while (name_length < sizeof e.name && e.name[name_length]) ++name_length;
+        const uint64_t at = buffer + uint64_t(i) * (kEntry + kName);
+        put(0, i + 1 < count ? kEntry + kName : 0, 4);        // NextEntryOffset
+        put(4, e.threads, 4);                                    // NumberOfThreads
+        put(0x38, name_length * 2, 2);                           // ImageName.Length
+        put(0x3A, kName, 2);                                     // .MaximumLength
+        put(0x40, at + kEntry, 8);                               // .Buffer: the characters follow the entry
+        put(0x48, 8, 4);                                         // BasePriority
+        put(0x50, e.pid, 8);                                     // UniqueProcessId
+        put(0x58, e.parent, 8);                                  // InheritedFromUniqueProcessId
+        for (uint32_t k = 0; k < name_length; ++k) put(kEntry + k * 2, uint8_t(e.name[k]), 2);
+        if (!p.write_user(at, ConstByteView(entry, sizeof entry))) return kAccessViolation;
+      }
+      return kSuccess;
+    }
     default: return kInvalidInfoClass;
   }
   if (returned != 0 && !p.write_user_u32(returned, size)) return kAccessViolation;
