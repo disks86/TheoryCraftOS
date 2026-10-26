@@ -1054,10 +1054,7 @@ bool Vm::get_member(const Value& base, const Value& key, Value* out) {
       *out = i < o->length ? o->items[i] : Value();
       return true;
     }
-    if (o->okind == ObjKind::TypedArray) {
-      typed_array_get(o, i, out);
-      return true;
-    }
+    if (o->okind == ObjKind::TypedArray) return typed_array_get_value(*this, o, i, out);
   } else if (base.is_string() && key.is_number() && array_index(key, &i)) {
     JsString* s = base.as_string();
     *out = i < s->length ? Value::make_string(new_string(StringView(s->data() + i, 1))) : Value();
@@ -2453,6 +2450,9 @@ reload:
       case Opc::JumpIfTrue:
         if (to_boolean(stack_[--sp_])) pc = static_cast<uint32_t>(in.a);
         break;
+      case Opc::CheckReturn:
+        if (is_generator_return(stack_[sp_ - 1])) pc = static_cast<uint32_t>(in.a);
+        break;
       case Opc::JumpIfFalseKeep:
         if (!to_boolean(stack_[sp_ - 1])) pc = static_cast<uint32_t>(in.a);
         else --sp_;
@@ -2994,6 +2994,12 @@ bool Vm::run_generator(JsObject* co, bool start, int mode, const Value& input, V
   if (!start && mode == 1) {
     throw_value(input);
     ok = unwind(entry) && execute(entry);
+  } else if (!start && mode == 2) {   // return(value): finally blocks run, catch clauses do not
+    JsObject* completion = new_plain();
+    define_named(completion, "__generator_return", Value::make_bool(true), 0);
+    define_named(completion, "value", input, 0);
+    throw_value(Value::make_object(completion));
+    ok = unwind(entry) && execute(entry);
   } else {
     ok = execute(entry);
   }
@@ -3017,6 +3023,11 @@ bool Vm::run_generator(JsObject* co, bool start, int mode, const Value& input, V
   return false;   // (it threw: the exception is pending)
 }
 
+bool Vm::is_generator_return(const Value& v) {
+  Value flag;
+  return v.is_object() && v.as_object()->okind == ObjKind::Plain && get_plain(v.as_object(), intern("__generator_return"), &flag) && flag.is_bool();
+}
+
 bool Vm::generator_resume(const Value& generator, int mode, const Value& input, Value* result) {
   if (!is_generator_object(generator)) return throw_error(ErrorKind::TypeError, "next method called on incompatible receiver");
   JsObject* co = generator.as_object();
@@ -3024,7 +3035,8 @@ bool Vm::generator_resume(const Value& generator, int mode, const Value& input, 
   Value value;
   bool done = false;
   if (s->running) return throw_error(ErrorKind::TypeError, "Generator is already running");
-  if (s->done || mode == 2) {
+  const bool started = s->code != nullptr && !s->done;
+  if (s->done || (mode == 2 && !started)) {
     s->done = true;
     if (mode == 1) {
       throw_value(input);
@@ -3033,7 +3045,16 @@ bool Vm::generator_resume(const Value& generator, int mode, const Value& input, 
     value = mode == 2 ? input : Value();
     done = true;
   } else if (!run_generator(co, false, mode, input, &value, &done)) {
-    return false;
+    if (mode == 2 && has_exception_ && is_generator_return(exception_)) {   // the return() went all the way out
+      Value returned;
+      get_plain(exception_.as_object(), intern("value"), &returned);
+      has_exception_ = false;
+      exception_ = Value();
+      value = returned;
+      done = true;
+    } else {
+      return false;
+    }
   }
   JsObject* r = new_plain();
   define_named(r, "value", value);

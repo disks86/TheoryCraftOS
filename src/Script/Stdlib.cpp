@@ -59,10 +59,12 @@ const char kStdlib[] = R"JSLIB((function (g) {
     if (index < 0 || index >= copy.length) throw new RangeError('Invalid index : ' + index);
     copy[index] = value; return copy;
   });
-  function* arrayWalk(a, kind) { for (var i = 0; i < a.length; i++) yield kind === 0 ? i : kind === 1 ? a[i] : [i, a[i]]; }
+  function arrayWalk(a, kind) { return __array_iterator(a, kind); }
   def(AP, 'keys', function () { return arrayWalk(this, 0); });
   def(AP, 'values', function () { return arrayWalk(this, 1); });
   def(AP, 'entries', function () { return arrayWalk(this, 2); });
+  def(AP, ITER, AP.values);
+  def(String.prototype, ITER, function () { return arrayWalk([...String(this)], 1); });
   def(AP, 'toLocaleString', function () { return this.map(function (v) { return v === null || v === undefined ? '' : v.toLocaleString(); }).join(','); });
 
   // ------------------------------------------------------------------------------------------------------------------ String

@@ -12,6 +12,7 @@ PageTest binary (`PAGETEST=path`); the console log of a page is capped at 16 KB,
 | --- | --- | --- |
 | `js_language.js` | test262 `language/` and `built-ins/` | destructuring, classes, generators, async, Proxy/Reflect, Symbol, BigInt, RegExp, Date, JSON, typed arrays, Array/String/Object builtins, Promise, iterator helpers, Intl, global object shape |
 | `js_strict.js` | test262 strict mode, `built-ins/Object` integrity levels and `defineProperty` | strict mode semantics, property attributes, `preventExtensions`/`seal`/`freeze`, `Reflect` |
+| `js_builtins.js` | test262 `built-ins/TypedArrayConstructors`, `built-ins/Iterator`, `built-ins/RegExp` | BigInt64Array/BigUint64Array and DataView BigInt accessors, array/string iterators and the iterator helpers, RegExp lookbehind and `\p{…}` |
 | `js_modules.js` | test262 `language/module-code`, WPT `the-script-element/module` | `import()`, namespace objects, live bindings, `export … from`, top-level await, `import.meta`, `<script type=module>`, `nomodule`, import maps |
 | `wasm_jsapi.js` | WPT `wasm/jsapi` | the `WebAssembly` namespace, Module/Instance/Memory/Table/Global/Tag/Exception, error classes, compile/instantiate, imports and linking, conversions, traps |
 | `html_parser.js` | html5lib-tests tree construction, WPT `html/syntax` | tokenizer states, character references, insertion modes, adoption agency, foster parenting, foreign content, templates, quirks mode, serialisation |
@@ -33,8 +34,8 @@ gaps: `grep -c xfail tests/data/wpt/*.js`. The largest ones today:
   objects and non-configurable properties are implemented (`js_strict.js`); the host's own scripts keep configurable-by-default properties
   (`FunctionCode::library`). Left: the `prototype` of built-in constructors is configurable, module namespace properties are accessors
   (not writable data properties), no strict-only early errors (octal literals, duplicate parameters, `eval`/`arguments` assignment). Also missing:
-  `BigInt64Array`, `SharedArrayBuffer`/`Atomics`, resizable/transferable `ArrayBuffer`, iterator helpers, `Intl` beyond basic formatting, RegExp
-  lookbehind / property escapes / `v` flag / `d` flag / duplicate named groups, `Object.prototype.toString` tags for Date, Map, Set and arguments,
+  `SharedArrayBuffer`/`Atomics`, resizable/transferable `ArrayBuffer`, `Intl` beyond basic formatting, RegExp `v` flag (set notation) / `d` flag /
+  duplicate named groups / case folding beyond ASCII (and `\p` covers the general categories, the main scripts and some binary properties only), `Object.prototype.toString` tags for Date, Map, Set and arguments,
   TDZ, per-iteration `let` bindings in `for`, sloppy `arguments` mapping, `Symbol.match/split/unscopables`, `String.prototype.normalize`/special
   casing, lone-surrogate handling, `new.target`/`Reflect.construct`, tagged template caching, `for…in` integer key order, and a call depth of 500.
 - **HTML**: the parser follows the standard (`src/Dom/HtmlBuilder.cpp`: tokenizer states, insertion modes, adoption agency, foster parenting, foreign

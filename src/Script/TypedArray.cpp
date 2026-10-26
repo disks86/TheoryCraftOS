@@ -31,8 +31,8 @@ constexpr uint64_t kMaxBytes = 128u << 20;
 Value arg_at(const Value* args, uint32_t argc, uint32_t i) { return i < argc ? args[i] : Value(); }
 Value num_value(double d) { return Value::make_number(d); }
 
-constexpr uint32_t kSizes[] = {1, 1, 1, 2, 2, 4, 4, 4, 8};
-const char* const kNames[] = {"Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array", "Uint16Array", "Int32Array", "Uint32Array", "Float32Array", "Float64Array"};
+constexpr uint32_t kSizes[] = {1, 1, 1, 2, 2, 4, 4, 4, 8, 8, 8};
+const char* const kNames[] = {"Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array", "Uint16Array", "Int32Array", "Uint32Array", "Float32Array", "Float64Array", "BigInt64Array", "BigUint64Array"};
 
 uint32_t size_of(ArrayKind k) { return kSizes[static_cast<uint32_t>(k)]; }
 
@@ -72,6 +72,41 @@ void write_bits(uint8_t* p, uint32_t size, uint64_t bits, bool little) {
   for (uint32_t i = 0; i < size; ++i) p[little ? i : size - 1 - i] = static_cast<uint8_t>(bits >> (8 * i));
 }
 
+bool is_big(ArrayKind kind) { return kind == ArrayKind::BigInt64 || kind == ArrayKind::BigUint64; }
+
+// A BigInt as 64 bits (modulo 2^64), and 64 bits as a BigInt. The digits of a BigInt are decimal.
+bool bigint_bits(Vm& vm, const Value& v, uint64_t* bits) {
+  bool negative;
+  StringView digits;
+  if (!vm.bigint_parts(v, &negative, &digits)) {
+    String message(vm.allocator());
+    message.append("Cannot convert a value to a BigInt");
+    return vm.throw_error(ErrorKind::TypeError, message.view());
+  }
+  uint64_t acc = 0;
+  for (uint64_t i = 0; i < digits.size(); ++i) acc = acc * 10 + static_cast<uint64_t>(digits[i] - '0');   // (wraps: the value modulo 2^64)
+  *bits = negative ? ~acc + 1 : acc;
+  return true;
+}
+
+Value bigint_value(Vm& vm, uint64_t bits, bool is_signed) {
+  bool negative = false;
+  if (is_signed && (bits >> 63)) {
+    negative = true;
+    bits = ~bits + 1;
+  }
+  char digits[24];
+  int n = 0;
+  if (bits == 0) digits[n++] = '0';
+  while (bits > 0) {
+    digits[n++] = static_cast<char>('0' + bits % 10);
+    bits /= 10;
+  }
+  char text[24];
+  for (int i = 0; i < n; ++i) text[i] = digits[n - 1 - i];
+  return Value::make_object(vm.new_bigint(negative, StringView(text, static_cast<uint64_t>(n))));
+}
+
 double load(ArrayKind kind, const uint8_t* p, bool little = true) {
   const uint64_t raw = read_bits(p, size_of(kind), little);
   switch (kind) {
@@ -84,6 +119,8 @@ double load(ArrayKind kind, const uint8_t* p, bool little = true) {
     case ArrayKind::Uint32: return static_cast<double>(raw);
     case ArrayKind::Float32: return static_cast<double>(__builtin_bit_cast(float, static_cast<uint32_t>(raw)));
     case ArrayKind::Float64: return __builtin_bit_cast(double, raw);
+    case ArrayKind::BigInt64:
+    case ArrayKind::BigUint64: return 0;   // (read as BigInts: see load_value)
   }
   return 0;
 }
@@ -97,6 +134,26 @@ void store(ArrayKind kind, uint8_t* p, double d, bool little = true) {
     default: bits = wrap_integer(d, size_of(kind) * 8); break;
   }
   write_bits(p, size_of(kind), bits, little);
+}
+
+// An element as the script sees it: a number, or a BigInt for the 64-bit integer kinds.
+Value load_value(Vm& vm, ArrayKind kind, const uint8_t* p, bool little = true) {
+  if (is_big(kind)) return bigint_value(vm, read_bits(p, 8, little), kind == ArrayKind::BigInt64);
+  return num_value(load(kind, p, little));
+}
+
+// Converts `v` (ToNumber, or ToBigInt for the 64-bit integer kinds) and writes it. False with the exception pending.
+bool store_value(Vm& vm, ArrayKind kind, uint8_t* p, const Value& v, bool little = true) {
+  if (is_big(kind)) {
+    uint64_t bits;
+    if (!bigint_bits(vm, v, &bits)) return false;
+    write_bits(p, 8, bits, little);
+    return true;
+  }
+  double d;
+  if (!vm.to_number(v, &d)) return false;
+  store(kind, p, d, little);
+  return true;
 }
 
 // --- Objects ---------------------------------------------------------------------------------------------------------------
@@ -136,11 +193,10 @@ bool buffer_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
 const HostClass kBufferClass = {"ArrayBuffer", buffer_get, nullptr, nullptr, nullptr};
 
 bool typed_hook_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
-  (void)vm;
   const StringView k = key->view();
   uint32_t i;
   if (parse_index(k, &i)) {
-    if (i < o->length) typed_array_get(o, i, out);
+    if (i < o->length) typed_array_get_value(vm, o, i, out);
     else *out = Value();
     return true;
   }
@@ -289,15 +345,13 @@ bool construct(Vm& vm, ArrayKind kind, const Value* args, uint32_t argc, Value* 
     JsObject* view = new_view(vm, kind, buffer, 0, static_cast<uint32_t>(n));
     *result = Value::make_object(view);
     for (uint32_t i = 0; i < static_cast<uint32_t>(n); ++i) {
-      double d;
+      Value v;
       if (source->okind == ObjKind::TypedArray) {
-        Value v;
-        typed_array_get(source, i, &v);
-        d = v.u.number;
-      } else if (!element_of(vm, Value::make_object(items ? items : source), i, &d)) {
+        if (!typed_array_get_value(vm, source, i, &v)) return false;
+      } else if (!vm.get_member(Value::make_object(items ? items : source), num_value(i), &v)) {
         return false;
       }
-      store(kind, data_of(cell_of(buffer)) + static_cast<uint64_t>(i) * size, d);
+      if (!store_value(vm, kind, data_of(cell_of(buffer)) + static_cast<uint64_t>(i) * size, v)) return false;
     }
     return true;
   }
@@ -324,6 +378,8 @@ TYPED_CONSTRUCTOR(ctor_int32, Int32)
 TYPED_CONSTRUCTOR(ctor_uint32, Uint32)
 TYPED_CONSTRUCTOR(ctor_float32, Float32)
 TYPED_CONSTRUCTOR(ctor_float64, Float64)
+TYPED_CONSTRUCTOR(ctor_bigint64, BigInt64)
+TYPED_CONSTRUCTOR(ctor_biguint64, BigUint64)
 #undef TYPED_CONSTRUCTOR
 
 NATIVE(array_buffer_constructor) {
@@ -396,18 +452,19 @@ NATIVE(typed_set) {
   if (offset + n > o->length) return vm.throw_error(ErrorKind::RangeError, "offset is out of bounds");
   const uint32_t start = static_cast<uint32_t>(offset), count = static_cast<uint32_t>(n);
   if (is_typed_array(source)) {   // (the source may overlap: it is read first)
-    List<double> values(vm.allocator());
+    List<Value> values(vm.allocator());
     for (uint32_t i = 0; i < count; ++i) {
       Value v;
-      typed_array_get(source.as_object(), i, &v);
-      values.push_back(v.u.number);
+      if (!typed_array_get_value(vm, source.as_object(), i, &v)) return false;
+      values.push_back(v);
     }
-    for (uint32_t i = 0; i < count; ++i) store(kind_of(o), element_ptr(o, start + i), values[i]);
+    for (uint32_t i = 0; i < count; ++i)
+      if (!store_value(vm, kind_of(o), element_ptr(o, start + i), values[i])) return false;
   } else {
     for (uint32_t i = 0; i < count; ++i) {
-      double d;
-      if (!element_of(vm, source, i, &d)) return false;
-      store(kind_of(o), element_ptr(o, start + i), d);
+      Value v;
+      if (!vm.get_member(source, num_value(i), &v)) return false;
+      if (!store_value(vm, kind_of(o), element_ptr(o, start + i), v)) return false;
     }
   }
   *result = Value();
@@ -463,13 +520,12 @@ NATIVE(typed_slice) {
 NATIVE(typed_fill) {
   JsObject* o;
   if (!typed_self(vm, self, &o)) return false;
-  double v = 0;
-  if (argc > 0 && !vm.to_number(args[0], &v)) return false;
   uint32_t from, to;
   bool ok;
   clamp_range(argc > 1 ? args + 1 : nullptr, argc > 1 ? argc - 1 : 0, vm, o->length, &from, &to, &ok);
   if (!ok) return false;
-  for (uint32_t i = from; i < to; ++i) store(kind_of(o), element_ptr(o, i), v);
+  for (uint32_t i = from; i < to; ++i)
+    if (!store_value(vm, kind_of(o), element_ptr(o, i), argc > 0 ? args[0] : Value())) return false;
   *result = self;
   return true;
 }
@@ -517,18 +573,17 @@ NATIVE(data_view_constructor) {
 bool data_view_access(Vm& vm, const Value& self, const Value* args, uint32_t argc, Value* result, ArrayKind kind, bool writing) {
   ViewParts parts;
   if (!view_parts(vm, self, &parts)) return false;
-  double at = 0, value = 0;
+  double at = 0;
   if (!vm.to_number(arg_at(args, argc, 0), &at)) return false;
   if (at != at) at = 0;
   const uint32_t size = size_of(kind);
   if (!(at >= 0) || at + size > static_cast<double>(parts.length)) return vm.throw_error(ErrorKind::RangeError, "Offset is outside the bounds of the DataView");
   uint8_t* p = data_of(parts.cell) + parts.offset + static_cast<uint64_t>(at);
   if (writing) {
-    if (!vm.to_number(arg_at(args, argc, 1), &value)) return false;
-    store(kind, p, value, Vm::to_boolean(arg_at(args, argc, 2)));
+    if (!store_value(vm, kind, p, arg_at(args, argc, 1), Vm::to_boolean(arg_at(args, argc, 2)))) return false;
     *result = Value();
   } else {
-    *result = num_value(load(kind, p, Vm::to_boolean(arg_at(args, argc, 1))));
+    *result = load_value(vm, kind, p, Vm::to_boolean(arg_at(args, argc, 1)));
   }
   return true;
 }
@@ -544,6 +599,8 @@ DATA_VIEW_ACCESSORS(int32, Int32)
 DATA_VIEW_ACCESSORS(uint32, Uint32)
 DATA_VIEW_ACCESSORS(float32, Float32)
 DATA_VIEW_ACCESSORS(float64, Float64)
+DATA_VIEW_ACCESSORS(bigint64, BigInt64)
+DATA_VIEW_ACCESSORS(biguint64, BigUint64)
 #undef DATA_VIEW_ACCESSORS
 
 }  // namespace
@@ -577,11 +634,27 @@ bool typed_array_get(JsObject* array, uint32_t index, Value* out) {
     *out = Value();
     return false;
   }
+  if (is_big(kind_of(array))) return false;   // (a BigInt needs the Vm: see typed_array_get_value; the interpreter asks that way)
   *out = num_value(load(kind_of(array), element_ptr(array, index)));
   return true;
 }
 
+bool typed_array_get_value(Vm& vm, JsObject* array, uint32_t index, Value* out) {
+  if (index >= array->length || live_length(array) == 0) {
+    *out = Value();
+    return true;
+  }
+  *out = load_value(vm, kind_of(array), element_ptr(array, index));
+  return true;
+}
+
 bool typed_array_put(Vm& vm, JsObject* array, uint32_t index, const Value& value) {
+  if (is_big(kind_of(array))) {   // (converted whether or not the index is in range)
+    uint64_t bits;
+    if (!bigint_bits(vm, value, &bits)) return false;
+    if (index < array->length && live_length(array) != 0) write_bits(element_ptr(array, index), 8, bits, true);
+    return true;
+  }
   double d;
   if (!vm.to_number(value, &d)) return false;
   if (index < array->length && live_length(array) != 0) store(kind_of(array), element_ptr(array, index), d);
@@ -597,7 +670,7 @@ void typed_array_describe(Vm& vm, JsObject* array, String* out, uint32_t depth) 
   for (uint32_t i = 0; i < array->length && i < 100; ++i) {
     if (i) out->append(", ");
     Value v;
-    typed_array_get(array, i, &v);
+    typed_array_get_value(vm, array, i, &v);
     vm.describe(v, out, 1);
   }
   if (array->length > 100) out->append(", ...");
@@ -635,8 +708,8 @@ bool install_typed_arrays(Vm& vm) {
   vm.define_named(g, "__typed_array_proto", Value::make_object(shared), 0);
   JsObject* protos = vm.new_plain();
   vm.define_named(g, "__typed_protos", Value::make_object(protos), 0);
-  static const NativeFn kConstructors[] = {ctor_int8, ctor_uint8, ctor_uint8_clamped, ctor_int16, ctor_uint16, ctor_int32, ctor_uint32, ctor_float32, ctor_float64};
-  for (uint32_t k = 0; k < 9; ++k) {
+  static const NativeFn kConstructors[] = {ctor_int8, ctor_uint8, ctor_uint8_clamped, ctor_int16, ctor_uint16, ctor_int32, ctor_uint32, ctor_float32, ctor_float64, ctor_bigint64, ctor_biguint64};
+  for (uint32_t k = 0; k < 11; ++k) {
     JsObject* proto = vm.new_object(shared);
     JsObject* ctor = vm.new_native(kConstructors[k], kNames[k], 3);
     vm.define(ctor, vm.prototype_name(), Value::make_object(proto), 0);
@@ -654,7 +727,8 @@ bool install_typed_arrays(Vm& vm) {
   };
   static const Access kAccess[] = {{"Int8", get_int8, set_int8},       {"Uint8", get_uint8, set_uint8},     {"Int16", get_int16, set_int16},
                                    {"Uint16", get_uint16, set_uint16}, {"Int32", get_int32, set_int32},     {"Uint32", get_uint32, set_uint32},
-                                   {"Float32", get_float32, set_float32}, {"Float64", get_float64, set_float64}};
+                                   {"Float32", get_float32, set_float32}, {"Float64", get_float64, set_float64}, {"BigInt64", get_bigint64, set_bigint64},
+                                   {"BigUint64", get_biguint64, set_biguint64}};
   for (const Access& a : kAccess) {
     String get_name(vm.allocator()), set_name(vm.allocator());
     get_name.append("get");

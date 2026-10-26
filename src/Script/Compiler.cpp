@@ -674,10 +674,11 @@ class Compiler {
     emit(Opc::TryEnd);
     if (has_finally) statement(n->d);
     const uint32_t to_end = emit(Opc::Jump);
-    uint32_t to_end2 = 0;
+    uint32_t to_end2 = 0, skip_catch = 0;
     bool second = false;
     if (has_catch) {
       patch(begin);   // the exception is on the stack here
+      skip_catch = emit(Opc::CheckReturn);   // (a generator's return() is not caught: only the finally block runs)
       push_scope();
       if (n->b) {
         const uint32_t slot = declare(n->b->text);
@@ -706,6 +707,11 @@ class Compiler {
     } else {
       patch(begin);
       finally_rethrow(n->d);
+    }
+    if (has_catch) {
+      patch(skip_catch);
+      if (has_finally) finally_rethrow(n->d);
+      else emit(Opc::Throw);
     }
     patch(to_end);
     if (second) patch(to_end2);

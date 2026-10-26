@@ -267,6 +267,8 @@ class Vm {
   // generator.next(value) / .throw(error) / .return(value): the object { value, done }. False if the generator threw.
   bool generator_resume(const Value& generator, int mode, const Value& input, Value* result);
   static bool is_generator_object(const Value& v);
+  // The exception that carries a generator's return() out through its finally blocks.
+  bool is_generator_return(const Value& v);
   bool halted() const { return halted_; }
 
  private:
