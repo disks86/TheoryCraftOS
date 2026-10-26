@@ -41,7 +41,7 @@ constexpr uint64_t kMaxPath = 4096;
 PathResult resolve_path(PathStyle style, StringView cwd, StringView path, String* out);
 
 // What a descriptor (Linux file descriptor, Windows handle) refers to.
-enum class DescriptorKind : uint8_t { Closed, ConsoleInput, ConsoleOutput, ConsoleError, File, Directory, Null, Zero, Random, Thread, Event, Mutex, Semaphore, Process };
+enum class DescriptorKind : uint8_t { Closed, ConsoleInput, ConsoleOutput, ConsoleError, File, Directory, Null, Zero, Random, Thread, Event, Mutex, Semaphore, Process, Pipe, Timer, Section };
 
 // How open() treats the path. (The Linux O_* and Windows dispositions both reduce to these.)
 struct OpenFlags {
@@ -99,10 +99,17 @@ class ProcessFiles {
   bool duplicate_to(uint64_t slot, uint64_t target);
   bool close_on_exec(uint64_t slot) const { return slot < kMaxDescriptors && slots_[slot].close_on_exec; }
   void set_close_on_exec(uint64_t slot, bool value) { if (slot < kMaxDescriptors) slots_[slot].close_on_exec = value; }
+  bool inheritable(uint64_t slot) const { return slot < kMaxDescriptors && slots_[slot].inherit; }
+  bool protected_from_close(uint64_t slot) const { return slot < kMaxDescriptors && slots_[slot].protect; }
+  void set_handle_flags(uint64_t slot, bool inherit, bool protect) { if (slot < kMaxDescriptors) { slots_[slot].inherit = inherit; slots_[slot].protect = protect; } }
+  // A new process's table gets the handles of `parent` that are inheritable, at the same numbers (what a Windows child receives). Console descriptors stay as they are.
+  // `copy_token` is called for each token-carrying kind so the owner can count the extra use; returns how many were copied.
+  uint32_t inherit_from(const ProcessFiles& parent, void (*copy_token)(DescriptorKind kind, uint64_t token));
   // Opens a device node as a descriptor (the Null/Zero/Random kinds).
   int64_t open_device(DescriptorKind kind);
   // A descriptor for something the process keeps track of itself (a thread): `token` says which one. -1 if the table is full.
   int64_t open_token(DescriptorKind kind, uint64_t token);
+  void set_token(uint64_t slot, uint64_t value) { if (slot < kMaxDescriptors) slots_[slot].token = value; }
   uint64_t token(uint64_t slot) const { return slot < kMaxDescriptors ? slots_[slot].token : 0; }
   // The lowest free descriptor at or above `minimum`; -1 if none.
   int64_t free_slot(uint64_t minimum) const;
@@ -118,6 +125,7 @@ class ProcessFiles {
   filesystem::Status open(StringView virtual_path, const OpenFlags& flags, uint32_t* slot, bool* created = nullptr);
   filesystem::Status stat(StringView virtual_path, filesystem::DirectoryEntry* entry);
   filesystem::Status make_directory(StringView virtual_path);
+  filesystem::Status set_metadata(StringView virtual_path, const filesystem::MetadataChange& change);
   filesystem::Status remove(StringView virtual_path);
   filesystem::Status rename(StringView from, StringView to);
   filesystem::Status change_directory(StringView virtual_path);
@@ -140,9 +148,15 @@ class ProcessFiles {
     SharedPointer<OpenObject> object;
     uint64_t token = 0;
     bool close_on_exec = false;
+    bool inherit = false, protect = false;      // Windows handle flags: a child process gets the handle (CreateProcess with bInheritHandles); it cannot be closed
   };
   bool host_path(StringView virtual_path, String* out) const;
 
+ public:
+  // The path in the OS file system of a path inside this process's tree (what the file system underneath is asked for).
+  bool host_path_of(StringView virtual_path, String* out) const { return host_path(virtual_path, out); }
+
+ private:
   PathStyle style_;
   Slot slots_[kMaxDescriptors];
   allocators::IAllocator* allocator_ = nullptr;

@@ -106,8 +106,26 @@ bool FileLibraryProvider::find(StringView canonical_name, ConstByteView* image) 
   return true;
 }
 
+Module* ModuleSet::find_base(uint64_t base) const {
+  for (const UniquePointer<Module>& m : modules_.view()) if (m->base == base) return m.get();
+  return nullptr;
+}
+
+void ModuleSet::drop_from(AddressSpace& space, uint64_t first) {
+  for (uint64_t i = order_.count(); i > 0; --i) {
+    for (uint64_t k = first; k < modules_.count(); ++k) {
+      if (order_[i - 1] == modules_[k].get()) { order_.remove_at(i - 1); break; }
+    }
+  }
+  while (modules_.count() > first) {
+    const Module& m = *modules_[modules_.count() - 1];
+    space.unmap(m.base, m.size);
+    modules_.remove_at(modules_.count() - 1);
+  }
+}
+
 Module* ModuleSet::find(StringView canonical_name) const {
-  for (const UniquePointer<Module>& m : modules_.view()) if (m->name.view().equals(canonical_name)) return m.get();
+  for (const UniquePointer<Module>& m : modules_.view()) if (!m->doomed && m->name.view().equals(canonical_name)) return m.get();
   return nullptr;
 }
 
@@ -320,6 +338,87 @@ void order(Context& c, Module& module, uint32_t depth) {
 
 }  // namespace
 
+namespace {
+// The loaded libraries a module imports or forwards to.
+void dependencies_of(const ModuleSet& set, const Module& module, allocators::IAllocator& allocator, List<Module*>* out) {
+  String name(allocator);
+  for (const exe::PeImport& imp : module.pe->imports().view()) {
+    if (!canonical_library_name(imp.dll.view(), &name)) continue;
+    if (Module* d = set.find(name.view())) out->push_back(d);
+  }
+  for (const exe::PeExport& e : module.pe->exports().view()) {
+    if (e.forwarder.empty()) continue;
+    const uint64_t dot = e.forwarder.view().find('.');
+    if (dot == StringView::npos || !canonical_library_name(e.forwarder.view().first(dot), &name)) continue;
+    if (Module* d = set.find(name.view())) out->push_back(d);
+  }
+}
+
+void doom(const ModuleSet& set, allocators::IAllocator& allocator, Module& module, List<Module*>* out) {
+  module.doomed = true;
+  out->push_back(&module);
+  List<Module*> dependencies(allocator);
+  dependencies_of(set, module, allocator, &dependencies);
+  for (Module* d : dependencies.view()) {
+    if (d->pinned || d->doomed || d->refs == 0) continue;
+    if (--d->refs == 0) doom(set, allocator, *d, out);
+  }
+}
+}  // namespace
+
+LoadStatus load_additional_library(AddressSpace& space, allocators::IAllocator& allocator, ILibraryProvider& provider, ModuleSet* set, StringView canonical_name, String* detail) {
+  Context c{space, allocator, provider, *set, detail};
+  const uint64_t first = set->count();
+  const uint64_t init_first = set->init_count();
+  (void)init_first;
+  for (uint64_t i = 0; i < first; ++i) set->modules_[i]->visit = 1;      // (what was there is ordered already)
+  Module* requested = nullptr;
+  LoadStatus status = ensure_loaded(c, canonical_name, 1, &requested);
+  if (status == LoadStatus::Ok && !requested) { say(c, canonical_name, " was not found"); status = LoadStatus::NeedsLibraries; }
+  for (uint64_t i = first; i < set->count() && status == LoadStatus::Ok; ++i) status = bind_imports(c, *set->modules_[i]);
+  if (status == LoadStatus::Ok) order(c, *requested, 0);
+  if (status == LoadStatus::Ok) {      // the uses: one for the caller, one for each import of a new library
+    ++requested->refs;
+    for (uint64_t i = first; i < set->count(); ++i) {
+      List<Module*> dependencies(allocator);
+      dependencies_of(*set, *set->modules_[i], allocator, &dependencies);
+      for (Module* d : dependencies.view()) if (!d->pinned) ++d->refs;
+    }
+  }
+  if (status != LoadStatus::Ok) set->drop_from(space, first);
+  return status;
+}
+
+bool reference_library(ModuleSet* set, StringView canonical_name, uint64_t* base) {
+  Module* m = set->find(canonical_name);
+  if (!m || m->main) return false;
+  if (!m->pinned) ++m->refs;
+  *base = m->base;
+  return true;
+}
+
+bool release_library(ModuleSet* set, allocators::IAllocator& allocator, uint64_t base, List<Module*>* out) {
+  Module* m = set->find_base(base);
+  if (!m || m->main || m->doomed) return false;
+  if (m->pinned) return true;
+  if (m->refs == 0) return false;
+  if (--m->refs == 0) doom(*set, allocator, *m, out);
+  return true;
+}
+
+bool unload_library(AddressSpace& space, ModuleSet* set, uint64_t base) {
+  for (uint64_t i = 0; i < set->modules_.count(); ++i) {
+    Module& m = *set->modules_[i];
+    if (m.base != base) continue;
+    if (m.main) return false;
+    for (uint64_t k = set->order_.count(); k > 0; --k) if (set->order_[k - 1] == &m) { set->order_.remove_at(k - 1); break; }
+    space.unmap(m.base, m.size);
+    set->modules_.remove_at(i);
+    return true;
+  }
+  return false;
+}
+
 uint64_t ModuleSet::export_address(StringView module, StringView function) const {
   String name(allocator_);
   if (!canonical_library_name(module, &name)) return 0;
@@ -356,6 +455,7 @@ LoadStatus load_windows_modules(AddressSpace& space, allocators::IAllocator& all
   }
   // Phase 3: the order the DLLs start in.
   order(c, *main_raw, 0);
+  for (UniquePointer<Module>& m : out->modules_.view()) m->pinned = true;      // (these stay as long as the process does)
   main_raw->pe = nullptr;      // (the program's headers belong to the caller and may go away)
   return LoadStatus::Ok;
 }

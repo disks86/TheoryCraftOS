@@ -38,6 +38,191 @@ bool join_command_line(ArrayView<const StringView> arguments, String* out) {
 }
 }  // namespace
 
+namespace {
+// The library file LoadLibrary found (under its name), then the usual places.
+class SingleFileProvider final : public ILibraryProvider {
+ public:
+  SingleFileProvider(StringView name, ConstByteView file, ILibraryProvider* fallback) : name_(name), file_(file), fallback_(fallback) {}
+  bool find(StringView canonical_name, ConstByteView* image) override {
+    if (canonical_name.equals(name_)) { *image = file_; return true; }
+    return fallback_ && fallback_->find(canonical_name, image);
+  }
+
+ private:
+  StringView name_;
+  ConstByteView file_;
+  ILibraryProvider* fallback_;
+};
+}  // namespace
+
+namespace {
+
+uint64_t read_u64(AddressSpace& space, uint64_t address, bool* ok) {
+  uint8_t raw[8] = {};
+  if (!space.read_privileged(address, ByteView(raw, 8))) { *ok = false; return 0; }
+  uint64_t v = 0;
+  for (uint32_t i = 0; i < 8; ++i) v |= uint64_t{raw[i]} << (8 * i);
+  return v;
+}
+bool write_u64(AddressSpace& space, uint64_t address, uint64_t v) {
+  uint8_t raw[8];
+  for (uint32_t i = 0; i < 8; ++i) raw[i] = uint8_t(v >> (8 * i));
+  return space.write_privileged(address, ConstByteView(raw, 8));
+}
+
+// The thread-local data a library brought in has: a slot in every thread's array and a block for every thread that exists (threads made later get theirs from the process's
+// templates). False (nothing changed) if there is no room.
+bool give_tls(AddressSpace& space, Process& process, Module& module) {
+  uint32_t rva = 0, size = 0;
+  if (!module.pe->directory(9, &rva, &size) || size < 0x28) return true;
+  bool ok = true;
+  const uint64_t directory = module.base + rva;
+  const uint64_t start = read_u64(space, directory, &ok), end = read_u64(space, directory + 8, &ok), index_at = read_u64(space, directory + 0x10, &ok);
+  uint64_t zero_fill = read_u64(space, directory + 0x20, &ok) & 0xFFFFFFFFu;
+  if (!ok) return false;
+  if (end <= start && zero_fill == 0) return true;      // (only callbacks)
+  const uint64_t bytes = end - start;
+  Process::ThreadSupport& support = process.thread_support_mutable();
+  uint32_t index = 0;
+  while (index < kMaxTlsModules && support.tls_taken[index]) ++index;      // (the lowest free slot)
+  if (index >= kMaxTlsModules || bytes > (1u << 20) || zero_fill > (1u << 20)) return false;
+  uint64_t block_size = 0;
+  if (!AddressSpace::round_up(bytes + zero_fill, &block_size)) return false;
+  // a block for every thread
+  uint32_t done = 0;
+  bool failed = false;
+  for (uint32_t t = 0; t < Process::kMaxThreads && !failed; ++t) {
+    Process::ThreadRecord* thread = process.thread_at(t);
+    if (!thread->used || thread->finished || thread->teb == 0) continue;
+    uint64_t array = read_u64(space, thread->teb + 0x58, &ok), at = 0;
+    if (!ok || array == 0 || !space.find_free(block_size, 0x00007FF000000000ull, &at) || !space.map(at, block_size, kProtRead | kProtWrite)) { failed = true; break; }
+    uint8_t chunk[256];
+    for (uint64_t copied = 0; copied < bytes && !failed;) {
+      const uint64_t k = bytes - copied < sizeof(chunk) ? bytes - copied : sizeof(chunk);
+      if (!space.read_privileged(start + copied, ByteView(chunk, k)) || !space.write_privileged(at + copied, ConstByteView(chunk, k))) failed = true;
+      copied += k;
+    }
+    if (failed || !write_u64(space, array + 8 * uint64_t{index}, at)) { space.unmap(at, block_size); failed = true; break; }
+    thread->extra_tls[index] = at;
+    thread->extra_tls_size[index] = block_size;
+    ++done;
+  }
+  if (!failed) {
+    uint8_t raw[4] = {uint8_t(index), uint8_t(index >> 8), uint8_t(index >> 16), uint8_t(index >> 24)};
+    if (index_at != 0 && !space.write_privileged(index_at, ConstByteView(raw, 4))) failed = true;
+  }
+  if (failed) {
+    for (uint32_t t = 0; t < Process::kMaxThreads; ++t) {
+      Process::ThreadRecord* thread = process.thread_at(t);
+      if (thread->extra_tls[index] != 0) { space.unmap(thread->extra_tls[index], thread->extra_tls_size[index]); thread->extra_tls[index] = 0; }
+    }
+    return false;
+  }
+  support.tls[index] = TlsTemplate{start, bytes, zero_fill};
+  support.tls_taken[index] = true;
+  if (index + 1 > support.tls_count) support.tls_count = index + 1;
+  module.tls_index = static_cast<int32_t>(index);
+  (void)done;
+  return true;
+}
+
+// The library goes: its blocks are freed, and threads made from now on get an empty one in its slot.
+void take_tls(AddressSpace& space, Process& process, const Module& module) {
+  if (module.tls_index < 0) return;
+  const uint32_t index = static_cast<uint32_t>(module.tls_index);
+  for (uint32_t t = 0; t < Process::kMaxThreads; ++t) {
+    Process::ThreadRecord* thread = process.thread_at(t);
+    if (thread->extra_tls[index] == 0) continue;
+    space.unmap(thread->extra_tls[index], thread->extra_tls_size[index]);
+    thread->extra_tls[index] = 0;
+    thread->extra_tls_size[index] = 0;
+  }
+  process.thread_support_mutable().tls[index] = TlsTemplate{};
+  process.thread_support_mutable().tls_taken[index] = false;
+}
+
+}  // namespace
+
+uint32_t UserProgram::load_module(ConstByteView file, StringView canonical_name, LoadedModule* out, uint32_t capacity, uint32_t* count) {
+  constexpr uint32_t kNoMemory = 0xC0000017u, kDllNotFound = 0xC0000135u, kBadImage = 0xC000007Bu, kNotSupported = 0xC00000BBu, kBufferTooSmall = 0xC0000023u, kInvalidParameter = 0xC000000Du;
+  *count = 0;
+  if (!modules_ || !process_) return kNotSupported;
+  if (modules_->find(canonical_name)) return kInvalidParameter;      // (the caller looks first)
+  const uint64_t first = modules_->count(), init_first = modules_->init_count();
+  SingleFileProvider provider(canonical_name, file, libraries_);
+  String detail(allocator_);
+  switch (load_additional_library(space_, allocator_, provider, modules_.get(), canonical_name, &detail)) {
+    case LoadStatus::Ok: break;
+    case LoadStatus::OutOfMemory: return kNoMemory;
+    case LoadStatus::Unsupported: return kNotSupported;
+    case LoadStatus::Malformed: return kBadImage;
+    default: return kDllNotFound;
+  }
+  const uint64_t fresh = modules_->init_count() - init_first;
+  if (fresh > capacity) {
+    modules_->drop_from(space_, first);
+    return kBufferTooSmall;
+  }
+  for (uint64_t i = first; i < modules_->count(); ++i) {      // thread-local data of their own
+    if (!give_tls(space_, *process_, *modules_->modules_[i])) {
+      for (uint64_t k = first; k < i; ++k) take_tls(space_, *process_, *modules_->modules_[k]);
+      modules_->drop_from(space_, first);
+      return kNotSupported;
+    }
+  }
+  for (uint64_t i = 0; i < fresh; ++i) {
+    const Module& m = modules_->init_at(init_first + i);
+    LoadedModule& o = out[i];
+    o = LoadedModule();
+    o.base = m.base;
+    o.size = m.size;
+    o.entry = m.entry == m.base ? 0 : m.entry;
+    for (uint64_t k = 0; k + 1 < sizeof(o.name) && k < m.name.size(); ++k) o.name[k] = m.name.view()[k];
+  }
+  *count = static_cast<uint32_t>(fresh);
+  return 0;
+}
+
+bool UserProgram::set_standard_handles(const uint64_t handles[3]) {
+  if (!process_ || process_->abi() != SyscallAbi::Windows) return false;
+  bool ok = true;
+  const uint64_t peb = read_u64(space_, process_->gs_base() + 0x60, &ok);
+  const uint64_t parameters = ok ? read_u64(space_, peb + 0x20, &ok) : 0;
+  if (!ok || parameters == 0) return false;
+  for (uint32_t i = 0; i < 3; ++i) {
+    if (handles[i] == 0 || handles[i] == ~uint64_t{0}) continue;
+    if (!write_u64(space_, parameters + 0x20 + 8 * i, handles[i])) return false;
+  }
+  return true;
+}
+
+bool UserProgram::reference_module(StringView canonical_name, uint64_t* base) { return modules_ && reference_library(modules_.get(), canonical_name, base); }
+
+uint32_t UserProgram::release_module(uint64_t base, LoadedModule* out, uint32_t capacity, uint32_t* count) {
+  *count = 0;
+  if (!modules_) return 0xC00000BBu;
+  List<Module*> doomed(allocator_);
+  if (!release_library(modules_.get(), allocator_, base, &doomed)) return 0xC0000008u;
+  uint32_t n = 0;
+  for (Module* m : doomed.view()) {
+    if (n >= capacity) break;      // (more than the caller has room for stays marked; the caller asks for few at a time)
+    LoadedModule& o = out[n++];
+    o = LoadedModule();
+    o.base = m->base;
+    o.size = m->size;
+    o.entry = m->entry == m->base ? 0 : m->entry;
+    for (uint64_t k = 0; k + 1 < sizeof(o.name) && k < m->name.size(); ++k) o.name[k] = m->name.view()[k];
+  }
+  *count = n;
+  return 0;
+}
+
+uint32_t UserProgram::unload_module(uint64_t base) {
+  if (!modules_) return 0xC00000BBu;
+  if (Module* m = modules_->find_base(base); m && process_) take_tls(space_, *process_, *m);
+  return unload_library(space_, modules_.get(), base) ? 0 : 0xC0000008u;
+}
+
 LoadStatus UserProgram::load(ConstByteView file, ArrayView<const StringView> arguments, ArrayView<const StringView> environment, ConstByteView random) {
   if (process_) return LoadStatus::Malformed;      // already loaded
   const exe::ExecutableKind kind = exe::identify_executable(file.at_most(exe::kIdentifyBytes));
@@ -85,7 +270,7 @@ LoadStatus UserProgram::load(ConstByteView file, ArrayView<const StringView> arg
     input.image_path = path.empty() ? StringView("C:\\program.exe") : path;
     input.command_line = command_line.view();
     input.environment = environment;
-    input.processor_count = 1;
+    input.processor_count = processor_count_;
     input.current_directory = working_directory_.empty() ? StringView("/") : working_directory_.view();
     // The module lists for PEB.Ldr: the program, then the libraries in load order; the initialization order as indexes.
     WindowsModule listed[64];
@@ -123,6 +308,7 @@ LoadStatus UserProgram::load(ConstByteView file, ArrayView<const StringView> arg
     thread_support.peb = startup.peb;
     for (uint32_t i = 0; i < startup.tls_count; ++i) thread_support.tls[i] = startup.tls[i];
     thread_support.tls_count = startup.tls_count;
+    for (uint32_t i = 0; i < startup.tls_count; ++i) thread_support.tls_taken[i] = true;
     thread_support.start_thunk = thread_thunk;
     thread_teb = startup.teb;
     loaded_modules = static_cast<UniquePointer<ModuleSet>&&>(modules);
@@ -131,9 +317,11 @@ LoadStatus UserProgram::load(ConstByteView file, ArrayView<const StringView> arg
   }
   UniquePointer<Process> process = UniquePointer<Process>::make(allocator_, id_, binding, space_, host_);
   if (!process) return LoadStatus::OutOfMemory;
+  process->create_time = host_.realtime_ns() / 100 + 11644473600ull * 10000000ull;      // (FILETIME)
   process->attach_address_space(space_, heap_start);
   process->set_initial_thread_pointers(fs_base, gs_base);
   process->set_exception_dispatcher(dispatcher);
+  if (loaded_modules) process->set_module_host(this);
   if (binding.abi == SyscallAbi::Windows) {
     process->set_thread_support(thread_support);
     process->register_main_thread(id_, thread_teb);

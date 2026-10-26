@@ -110,6 +110,15 @@ struct DirectoryEntry {
   uint64_t created = 0;                  // the same for creation; 0 when unknown
 };
 
+// What SetFileAttributes / SetFileTime change besides the contents; a field is only looked at when its `set_` flag is.
+struct MetadataChange {
+  bool set_read_only = false, read_only = false;
+  bool set_modified = false;
+  uint64_t modified = 0;                 // seconds since 1970-01-01 UTC
+  bool set_created = false;
+  uint64_t created = 0;
+};
+
 struct FileSystemInfo {
   FixedString<16> type_name;  // "ramfs", "FAT32", ...
   FixedString<32> label;      // volume label; may be empty

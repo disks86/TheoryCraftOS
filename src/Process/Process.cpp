@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Process/Process.hpp"
+#include "Process/WindowsPipes.hpp"
 #include "Process/Objects.hpp"
 
 namespace process {
@@ -35,12 +36,15 @@ uint64_t Process::syscall(const SyscallRequest& request) {
 }
 
 namespace {
-bool is_object_kind(DescriptorKind k) { return k == DescriptorKind::Event || k == DescriptorKind::Mutex || k == DescriptorKind::Semaphore || k == DescriptorKind::Process; }
+bool is_object_kind(DescriptorKind k) { return k == DescriptorKind::Event || k == DescriptorKind::Mutex || k == DescriptorKind::Semaphore || k == DescriptorKind::Process || k == DescriptorKind::Timer || k == DescriptorKind::Section; }
 }  // namespace
 
 Process::~Process() {
   if (ObjectManager* objects = system_objects()) {
-    for (uint64_t slot = 0; slot < kMaxDescriptors; ++slot) if (is_object_kind(files_.kind(slot))) objects->release(uint32_t(files_.token(slot)));
+    for (uint64_t slot = 0; slot < kMaxDescriptors; ++slot) {
+      if (is_object_kind(files_.kind(slot))) objects->release(uint32_t(files_.token(slot)));
+      else if (files_.kind(slot) == DescriptorKind::Pipe) windowsabi::pipe_token_release(files_.token(slot));
+    }
   }
 }
 
@@ -49,7 +53,12 @@ bool Process::close_descriptor(uint64_t slot) {
   const uint64_t token = files_.token(slot);
   if (!files_.close(slot)) return false;
   if (is_object_kind(kind)) if (ObjectManager* objects = system_objects()) objects->release(uint32_t(token));
+  if (kind == DescriptorKind::Pipe) windowsabi::pipe_token_release(token);
   return true;
+}
+
+void Process::release_handles() {
+  for (uint64_t slot = 0; slot < kMaxDescriptors; ++slot) if (files_.kind(slot) != DescriptorKind::Closed) close_descriptor(slot);
 }
 
 void Process::terminate(uint32_t code) {
@@ -158,6 +167,12 @@ bool Process::write_user_u64(uint64_t address, uint64_t value) {
   uint8_t raw[8];
   for (uint32_t i = 0; i < 8; ++i) raw[i] = uint8_t(value >> (8 * i));
   return write_user(address, ConstByteView(raw, 8));
+}
+
+bool Process::write_user_u32(uint64_t address, uint32_t value) {
+  uint8_t raw[4];
+  for (uint32_t i = 0; i < 4; ++i) raw[i] = uint8_t(value >> (8 * i));
+  return write_user(address, ConstByteView(raw, 4));
 }
 
 uint64_t copy_user_to_console(Process& process, uint32_t stream, uint64_t address, uint64_t count, bool* faulted) {

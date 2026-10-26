@@ -49,6 +49,7 @@ struct RamFileSystem::Node {
   uint64_t capacity = 0;
   uint32_t open_count = 0;
   uint64_t created = 0, modified = 0;  // seconds since 1970 UTC (0: no clock when it was made)
+  bool read_only = false;
 };
 
 class RamFileSystem::File final : public IFile {
@@ -153,7 +154,7 @@ void RamFileSystem::describe(const Node& node, DirectoryEntry* entry) {
   entry->name = node.name;
   entry->type = node.type;
   entry->size = node.type == NodeType::File ? node.size : 0;
-  entry->read_only = false;
+  entry->read_only = node.read_only;
   entry->modified = node.modified;
   entry->created = node.created;
 }
@@ -227,6 +228,7 @@ Status RamFileSystem::open_file(StringView path, OpenMode mode, UniquePointer<IF
     const Status found = resolve(path, &node);
     if (found != Status::Ok) return found;
     if (node->type == NodeType::Directory) return Status::IsADirectory;
+    if (mode == OpenMode::ReadWrite && node->read_only) return Status::ReadOnly;
   } else {
     Node* parent = nullptr;
     StringView leaf;
@@ -239,6 +241,7 @@ Status RamFileSystem::open_file(StringView path, OpenMode mode, UniquePointer<IF
     } else {
       node = parent->children[at].get();
       if (node->type == NodeType::Directory) return Status::IsADirectory;
+      if (node->read_only) return Status::ReadOnly;
       if (mode == OpenMode::CreateTruncate) {
         if (node->open_count) return Status::Busy;
         set_size(*node, 0);
@@ -269,6 +272,17 @@ Status RamFileSystem::stat(StringView path, DirectoryEntry* entry) {
   const Status found = resolve(path, &node);
   if (found != Status::Ok) return found;
   describe(*node, entry);
+  return Status::Ok;
+}
+
+Status RamFileSystem::set_metadata(StringView path, const MetadataChange& change) {
+  kernel::ScopedRecursiveMutex lock(mutex_);
+  Node* node = nullptr;
+  const Status found = resolve(path, &node);
+  if (found != Status::Ok) return found;
+  if (change.set_read_only) node->read_only = change.read_only;
+  if (change.set_modified) node->modified = change.modified;
+  if (change.set_created) node->created = change.created;
   return Status::Ok;
 }
 

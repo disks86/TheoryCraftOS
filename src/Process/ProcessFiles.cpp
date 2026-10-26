@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Process/ProcessFiles.hpp"
+#include "Process/Objects.hpp"
 
 namespace process {
 
@@ -161,6 +162,7 @@ bool ProcessFiles::close(uint64_t slot) {
   closing.kind = slots_[slot].kind;
   closing.object = static_cast<SharedPointer<OpenObject>&&>(slots_[slot].object);
   slots_[slot] = Slot();
+  if (closing.object && closing.object.use_count() == 1) if (ObjectManager* objects = system_objects()) objects->unlock_all(closing.object.get());      // (its byte-range locks go with it)
   if (closing.object && closing.object.use_count() == 1 && closing.object->delete_on_close) {
     String path(*allocator_), virtual_path(*allocator_);
     virtual_path.assign(closing.object->path.view());
@@ -178,6 +180,7 @@ int64_t ProcessFiles::duplicate(uint64_t slot, uint64_t minimum) {
   slots_[target].object = slots_[slot].object;
   slots_[target].token = slots_[slot].token;
   slots_[target].close_on_exec = false;
+  slots_[target].inherit = slots_[target].protect = false;
   return target;
 }
 
@@ -189,7 +192,24 @@ bool ProcessFiles::duplicate_to(uint64_t slot, uint64_t target) {
   slots_[target].object = slots_[slot].object;
   slots_[target].token = slots_[slot].token;
   slots_[target].close_on_exec = false;
+  slots_[target].inherit = slots_[target].protect = false;
   return true;
+}
+
+uint32_t ProcessFiles::inherit_from(const ProcessFiles& parent, void (*copy_token)(DescriptorKind kind, uint64_t token)) {
+  uint32_t copied = 0;
+  for (uint64_t slot = 0; slot < kMaxDescriptors; ++slot) {
+    const Slot& s = parent.slots_[slot];
+    if (s.kind == DescriptorKind::Closed || !s.inherit || s.kind == DescriptorKind::Thread) continue;      // (a thread of the parent means nothing to the child)
+    close(slot);
+    slots_[slot].kind = s.kind;
+    slots_[slot].object = s.object;
+    slots_[slot].token = s.token;
+    slots_[slot].inherit = true;
+    if (copy_token && s.token != 0) copy_token(s.kind, s.token);
+    ++copied;
+  }
+  return copied;
 }
 
 int64_t ProcessFiles::open_token(DescriptorKind kind, uint64_t token) {
@@ -198,6 +218,7 @@ int64_t ProcessFiles::open_token(DescriptorKind kind, uint64_t token) {
   slots_[target].kind = kind;
   slots_[target].token = token;
   slots_[target].close_on_exec = false;
+  slots_[target].inherit = slots_[target].protect = false;
   return target;
 }
 
@@ -206,6 +227,7 @@ int64_t ProcessFiles::open_device(DescriptorKind device) {
   if (target < 0) return -1;
   slots_[target].kind = device;
   slots_[target].close_on_exec = false;
+  slots_[target].inherit = slots_[target].protect = false;
   return target;
 }
 
@@ -274,6 +296,7 @@ Status ProcessFiles::open(StringView virtual_path, const OpenFlags& flags, uint3
   }
   slots_[target].object = object;
   slots_[target].close_on_exec = false;
+  slots_[target].inherit = slots_[target].protect = false;
   *slot = static_cast<uint32_t>(target);
   return Status::Ok;
 }
@@ -283,6 +306,13 @@ Status ProcessFiles::make_directory(StringView virtual_path) {
   String path(*allocator_);
   if (!host_path(virtual_path, &path)) return Status::NotFound;
   return fs_->create_directory(path.view());
+}
+
+Status ProcessFiles::set_metadata(StringView virtual_path, const filesystem::MetadataChange& change) {
+  if (!fs_) return Status::NotFound;
+  String path(*allocator_);
+  if (!host_path(virtual_path, &path)) return Status::NotFound;
+  return fs_->set_metadata(path.view(), change);
 }
 
 Status ProcessFiles::remove(StringView virtual_path) {

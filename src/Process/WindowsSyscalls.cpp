@@ -19,7 +19,11 @@
 #include "Process/WindowsFiles.hpp"
 #include "Process/WindowsObjects.hpp"
 #include "Process/WindowsThreads.hpp"
+#include "Process/WindowsLocks.hpp"
+#include "Process/WindowsModules.hpp"
+#include "Process/WindowsPipes.hpp"
 #include "Process/WindowsProcess.hpp"
+#include "Process/WindowsSystem.hpp"
 #include "Process/Process.hpp"
 #include "Process/Syscall.hpp"
 #include "Process/WindowsSyscalls.hpp"
@@ -76,7 +80,9 @@ uint32_t nt_delay_execution(Process& process, const SyscallRequest& r) {
     const uint64_t now = nt_time_now(process);
     units = raw > now ? raw - now : 0;
   }
-  process.block_sleep(units > ~uint64_t{0} / 100 ? ~uint64_t{0} : units * 100);
+  const uint64_t nanoseconds = units > ~uint64_t{0} / 100 ? ~uint64_t{0} : units * 100;
+  if ((r.args[0] & 0xFF) != 0 && process.runtime()) return windowsabi::alertable_delay(process, nanoseconds);      // an APC may end it
+  process.block_sleep(nanoseconds);
   return kStatusSuccess;
 }
 
@@ -201,6 +207,22 @@ uint32_t nt_protect_virtual_memory(Process& process, const SyscallRequest& r) {
   return process.write_user_u64(r.args[1], base) && process.write_user_u64(r.args[2], rounded) ? kStatusSuccess : kStatusAccessViolation;
 }
 
+// NtQueryTimerResolution(PULONG Minimum, PULONG Maximum, PULONG Current) and NtSetTimerResolution(ULONG Desired, BOOLEAN Set, PULONG Current): the system's clock ticks
+// are a 10 ms scheduler tick with a finer clock; asking for a finer period is accepted and changes nothing.
+uint32_t nt_query_timer_resolution(Process& process, const SyscallRequest& r) {
+  const uint32_t values[3] = {156250, 10000, 10000};
+  for (uint32_t i = 0; i < 3; ++i) {
+    if (r.args[i] == 0) continue;
+    uint8_t raw[4] = {uint8_t(values[i]), uint8_t(values[i] >> 8), uint8_t(values[i] >> 16), uint8_t(values[i] >> 24)};
+    if (!process.write_user(r.args[i], ConstByteView(raw, 4))) return kStatusAccessViolation;
+  }
+  return kStatusSuccess;
+}
+uint32_t nt_set_timer_resolution(Process& process, const SyscallRequest& r) {
+  if (r.args[2] != 0 && !process.write_user_u32(r.args[2], 10000)) return kStatusAccessViolation;
+  return kStatusSuccess;
+}
+
 // NtQueryPerformanceCounter(PLARGE_INTEGER Counter, PLARGE_INTEGER Frequency): 100 ns ticks, so the frequency is 10 MHz.
 uint32_t nt_query_performance_counter(Process& process, const SyscallRequest& r) {
   if (r.args[0] == 0 || !process.write_user_u64(r.args[0], process.host().monotonic_ns() / 100)) return kStatusAccessViolation;
@@ -251,41 +273,6 @@ uint32_t nt_query_virtual_memory(Process& process, const SyscallRequest& r) {
   return kStatusSuccess;
 }
 
-// NtQueryInformationProcess(Process, Class, Buffer, Length, ReturnLength): ProcessBasicInformation (0) and ProcessWow64Information (26).
-uint32_t nt_query_information_process(Process& process, const SyscallRequest& r) {
-  uint64_t returned = 0;
-  if (!argument(process, r, 4, &returned)) return kStatusAccessViolation;
-  bool child_exited = false;
-  uint32_t child_code = 0;
-  uint64_t child_pid = 0;
-  const bool child = !current_process_handle(r.args[0]);
-  if (child && !windowsabi::process_handle_info(process, r.args[0], &child_exited, &child_code, &child_pid)) return kStatusInvalidHandle;
-  uint64_t size = 0;
-  uint8_t out[48] = {};
-  auto put64 = [&](uint32_t at, uint64_t v) { for (uint32_t i = 0; i < 8; ++i) out[at + i] = uint8_t(v >> (8 * i)); };
-  const uint32_t info_class = uint32_t(r.args[1]);
-  const uint32_t buffer_length = uint32_t(r.args[3]);      // (ULONGs: the upper halves of the arguments are not defined)
-  if (info_class == 0) {
-    uint64_t peb = 0;
-    process.read_user_u64(process.gs_base() + 0x60, &peb);
-    if (child) peb = 0;       // (another address space)
-    put64(0, child ? (child_exited ? child_code : 259u) : 0u);      // ExitStatus (STILL_ACTIVE)
-    put64(8, peb);            // PebBaseAddress
-    put64(16, 1);             // AffinityMask
-    put64(24, 8);             // BasePriority
-    put64(32, child ? child_pid : process.id());  // UniqueProcessId
-    size = 48;
-  } else if (info_class == 26) {
-    size = 8;                 // not a 32-bit process on a 64-bit system
-  } else {
-    return 0xC0000003u;       // STATUS_INVALID_INFO_CLASS
-  }
-  if (buffer_length < size) return 0xC0000004u;
-  if (!process.write_user(r.args[2], ConstByteView(out, size))) return kStatusAccessViolation;
-  if (returned != 0 && !process.write_user_u64(returned, size)) return kStatusAccessViolation;
-  return kStatusSuccess;
-}
-
 }  // namespace
 
 class WindowsSyscalls final : public ISyscallInterface {
@@ -310,7 +297,38 @@ class WindowsSyscalls final : public ISyscallInterface {
       case WindowsSyscallNumber::NtQueryVolumeInformationFile: return windowsabi::nt_query_volume_information_file(process, r);
       case WindowsSyscallNumber::NtQueryPerformanceCounter: return nt_query_performance_counter(process, r);
       case WindowsSyscallNumber::NtQueryVirtualMemory: return nt_query_virtual_memory(process, r);
-      case WindowsSyscallNumber::NtQueryInformationProcess: return nt_query_information_process(process, r);
+      case WindowsSyscallNumber::NtQueryInformationProcess: return windowsabi::nt_query_information_process(process, r);
+      case WindowsSyscallNumber::NtGetCurrentProcessorNumber: return process.runtime() ? process.runtime()->current_processor() : 0;
+      case WindowsSyscallNumber::NtLoadModule: return windowsabi::nt_load_module(process, r);
+      case WindowsSyscallNumber::NtQueueApcThread: return windowsabi::nt_queue_apc_thread(process, r);
+      case WindowsSyscallNumber::NtDequeueApc: return windowsabi::nt_dequeue_apc(process, r);
+      case WindowsSyscallNumber::NtSignalAndWaitForSingleObject: return windowsabi::nt_signal_and_wait(process, r);
+      case WindowsSyscallNumber::NtCreateTimer: return windowsabi::nt_create_timer(process, r);
+      case WindowsSyscallNumber::NtOpenTimer: return windowsabi::nt_open_timer(process, r);
+      case WindowsSyscallNumber::NtSetTimer: return windowsabi::nt_set_timer(process, r);
+      case WindowsSyscallNumber::NtCancelTimer: return windowsabi::nt_cancel_timer(process, r);
+      case WindowsSyscallNumber::NtQueryTimer: return windowsabi::nt_query_timer(process, r);
+      case WindowsSyscallNumber::NtQueryTimerResolution: return nt_query_timer_resolution(process, r);
+      case WindowsSyscallNumber::NtSetTimerResolution: return nt_set_timer_resolution(process, r);
+      case WindowsSyscallNumber::NtOpenThread: return windowsabi::nt_open_thread(process, r);
+      case WindowsSyscallNumber::NtOpenProcess: return windowsabi::nt_open_process(process, r);
+      case WindowsSyscallNumber::NtCreateSection: return windowsabi::nt_create_section(process, r);
+      case WindowsSyscallNumber::NtOpenSection: return windowsabi::nt_open_section(process, r);
+      case WindowsSyscallNumber::NtMapViewOfSection: return windowsabi::nt_map_view_of_section(process, r);
+      case WindowsSyscallNumber::NtUnmapViewOfSection: return windowsabi::nt_unmap_view_of_section(process, r);
+      case WindowsSyscallNumber::NtFlushVirtualMemory: return windowsabi::nt_flush_virtual_memory(process, r);
+      case WindowsSyscallNumber::NtLockFile: return windowsabi::nt_lock_file(process, r);
+      case WindowsSyscallNumber::NtUnlockFile: return windowsabi::nt_unlock_file(process, r);
+      case WindowsSyscallNumber::NtCreatePipe: return windowsabi::nt_create_pipe(process, r);
+      case WindowsSyscallNumber::NtCreateNamedPipeFile: return windowsabi::nt_create_named_pipe_file(process, r);
+      case WindowsSyscallNumber::NtFsControlFile: return windowsabi::nt_fs_control_file(process, r);
+      case WindowsSyscallNumber::NtQueryObject: return windowsabi::nt_query_object(process, r);
+      case WindowsSyscallNumber::NtSetInformationObject: return windowsabi::nt_set_information_object(process, r);
+      case WindowsSyscallNumber::NtReleaseModule: return windowsabi::nt_release_module(process, r);
+      case WindowsSyscallNumber::NtUnloadModule: return windowsabi::nt_unload_module(process, r);
+      case WindowsSyscallNumber::NtSetInformationProcess: return windowsabi::nt_set_information_process(process, r);
+      case WindowsSyscallNumber::NtSetInformationThread: return windowsabi::nt_set_information_thread(process, r);
+      case WindowsSyscallNumber::NtQuerySystemInformation: return windowsabi::nt_query_system_information(process, r);
       case WindowsSyscallNumber::NtContinue: return nt_continue(process, r);
       case WindowsSyscallNumber::NtCreateThreadEx: return windowsabi::nt_create_thread_ex(process, r);
       case WindowsSyscallNumber::NtTerminateThread: return windowsabi::nt_terminate_thread(process, r);

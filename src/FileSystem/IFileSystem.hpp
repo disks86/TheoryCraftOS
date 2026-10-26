@@ -61,6 +61,8 @@ class IFileSystem {
 
   // Pushes everything to the medium.
   virtual Status flush() = 0;
+  // Changes the read-only flag and the times of a file or folder. Unsupported by a file system that keeps none of that; ReadOnly if the volume is read-only.
+  virtual Status set_metadata(StringView path, const MetadataChange& change) { (void)path; (void)change; return Status::Unsupported; }
 
  protected:
   constexpr IFileSystem() = default;

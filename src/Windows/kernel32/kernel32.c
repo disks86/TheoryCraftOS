@@ -50,6 +50,12 @@ IMPORT size_t_ wcslen(const WCHAR *);
 
 static void set_error(DWORD error) { TEB_LAST_ERROR(NtCurrentTeb()) = error; }
 /* Records the Win32 error of a failed NT call and returns FALSE. */
+static void complete_overlapped(LPOVERLAPPED overlapped, NTSTATUS status, ULONG_PTR bytes);
+static DWORD wait_result(NTSTATUS status);
+EXPORT BOOL WINAPI ReadFile(HANDLE h, LPVOID buffer, DWORD length, LPDWORD read, LPOVERLAPPED overlapped);
+EXPORT BOOL WINAPI WriteFile(HANDLE h, LPCVOID buffer, DWORD length, LPDWORD written, LPOVERLAPPED overlapped);
+static BOOL pipe_nt_name(LPCWSTR name, WCHAR *buffer, UNICODE_STRING *us, OBJECT_ATTRIBUTES *attributes, BOOL inherit);
+EXPORT HANDLE WINAPI CreateFileW(LPCWSTR path, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD disposition, DWORD flags, HANDLE template_file);
 static BOOL fail_nt(NTSTATUS status) { set_error(RtlNtStatusToDosError(status)); return FALSE; }
 static PVOID heap(void) { return RtlProcessHeap(); }
 static WCHAR upper(WCHAR c) { return c >= 'a' && c <= 'z' ? (WCHAR)(c - 32) : c; }
@@ -290,7 +296,18 @@ EXPORT BOOL WINAPI CheckRemoteDebuggerPresent(HANDLE h, LPBOOL present) { (void)
 EXPORT void WINAPI DebugBreak(void) { __asm__ volatile("int3"); }
 EXPORT void WINAPI OutputDebugStringA(LPCSTR s) { (void)s; }
 EXPORT void WINAPI OutputDebugStringW(LPCWSTR s) { (void)s; }
-EXPORT UINT WINAPI SetErrorMode(UINT mode) { (void)mode; return 0; }
+EXPORT UINT WINAPI SetErrorMode(UINT mode) {
+  ULONG old = 0;
+  NtQueryInformationProcess(NtCurrentProcess(), 12, &old, sizeof(old), NULL);
+  ULONG value = mode;
+  NtSetInformationProcess(NtCurrentProcess(), 12, &value, sizeof(value));
+  return old;
+}
+EXPORT UINT WINAPI GetErrorMode(void) {
+  ULONG mode = 0;
+  NtQueryInformationProcess(NtCurrentProcess(), 12, &mode, sizeof(mode), NULL);
+  return mode;
+}
 EXPORT BOOL WINAPI SetProcessShutdownParameters(DWORD level, DWORD flags) { (void)level; (void)flags; return TRUE; }
 EXPORT BOOL WINAPI DisableThreadLibraryCalls(HMODULE m) {
   PEB_LDR_DATA *ldr = NtCurrentPeb()->Ldr;
@@ -468,8 +485,12 @@ EXPORT BOOL WINAPI GetVersionExA(LPOSVERSIONINFOA v) {
   v->dwMajorVersion = 10; v->dwMinorVersion = 0; v->dwBuildNumber = 19045; v->dwPlatformId = 2; v->szCSDVersion[0] = 0;
   return TRUE;
 }
+static ULONGLONG get64(const BYTE *p) { ULONGLONG v; memcpy(&v, p, 8); return v; }
+static DWORD get32(const BYTE *p) { DWORD v; memcpy(&v, p, 4); return v; }
+static WORD get16(const BYTE *p) { WORD v; memcpy(&v, p, 2); return v; }
 EXPORT void WINAPI GetSystemInfo(LPSYSTEM_INFO info) {
   memset(info, 0, sizeof(*info));
+  BYTE basic[64] = {}, processor[16] = {};
   info->wProcessorArchitecture = 9;      /* PROCESSOR_ARCHITECTURE_AMD64 */
   info->dwPageSize = 4096;
   info->lpMinimumApplicationAddress = (LPVOID)0x10000;
@@ -479,8 +500,57 @@ EXPORT void WINAPI GetSystemInfo(LPSYSTEM_INFO info) {
   info->dwProcessorType = 8664;
   info->dwAllocationGranularity = 0x10000;
   info->wProcessorLevel = 6;
+  if (NT_SUCCESS(NtQuerySystemInformation(0, basic, sizeof(basic), NULL))) {      /* SystemBasicInformation */
+    info->dwPageSize = get32(basic + 8);
+    info->dwAllocationGranularity = get32(basic + 24);
+    info->lpMinimumApplicationAddress = (LPVOID)get64(basic + 32);
+    info->lpMaximumApplicationAddress = (LPVOID)get64(basic + 40);
+    info->dwActiveProcessorMask = get64(basic + 48);
+    info->dwNumberOfProcessors = basic[56];
+  }
+  if (NT_SUCCESS(NtQuerySystemInformation(1, processor, sizeof(processor), NULL))) {      /* SystemProcessorInformation */
+    info->wProcessorArchitecture = get16(processor);
+    info->wProcessorLevel = get16(processor + 2);
+    info->wProcessorRevision = get16(processor + 4);
+  }
 }
 EXPORT void WINAPI GetNativeSystemInfo(LPSYSTEM_INFO info) { GetSystemInfo(info); }
+EXPORT BOOL WINAPI GlobalMemoryStatusEx(LPMEMORYSTATUSEX m) {
+  if (m->dwLength < sizeof(MEMORYSTATUSEX)) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  BYTE basic[64] = {}, performance[312] = {};
+  if (!NT_SUCCESS(NtQuerySystemInformation(0, basic, sizeof(basic), NULL)) || !NT_SUCCESS(NtQuerySystemInformation(2, performance, sizeof(performance), NULL))) { set_error(ERROR_INVALID_FUNCTION); return FALSE; }
+  const ULONGLONG page = get32(basic + 8), total = (ULONGLONG)get32(basic + 12) * page, available = (ULONGLONG)get32(performance + 44) * page;
+  m->dwMemoryLoad = total ? (DWORD)((total - available) * 100 / total) : 0;
+  m->ullTotalPhys = total;
+  m->ullAvailPhys = available;
+  m->ullTotalPageFile = total;
+  m->ullAvailPageFile = available;
+  m->ullTotalVirtual = get64(basic + 40) - get64(basic + 32) + 1;
+  m->ullAvailVirtual = m->ullTotalVirtual;      /* (the address space is not tracked in bytes left) */
+  m->ullAvailExtendedVirtual = 0;
+  return TRUE;
+}
+EXPORT void WINAPI GlobalMemoryStatus(LPMEMORYSTATUS m) {
+  MEMORYSTATUSEX x;
+  x.dwLength = sizeof(x);
+  memset(m, 0, sizeof(*m));
+  m->dwLength = sizeof(*m);
+  if (!GlobalMemoryStatusEx(&x)) return;
+  m->dwMemoryLoad = x.dwMemoryLoad;
+  m->dwTotalPhys = x.ullTotalPhys;
+  m->dwAvailPhys = x.ullAvailPhys;
+  m->dwTotalPageFile = x.ullTotalPageFile;
+  m->dwAvailPageFile = x.ullAvailPageFile;
+  m->dwTotalVirtual = x.ullTotalVirtual;
+  m->dwAvailVirtual = x.ullAvailVirtual;
+}
+EXPORT BOOL WINAPI GetPhysicallyInstalledSystemMemory(ULONGLONG *kilobytes) {
+  MEMORYSTATUSEX x;
+  x.dwLength = sizeof(x);
+  if (!GlobalMemoryStatusEx(&x)) return FALSE;
+  *kilobytes = x.ullTotalPhys / 1024;
+  return TRUE;
+}
 EXPORT BOOL WINAPI IsProcessorFeaturePresent(DWORD feature) { return feature == 6 || feature == 10; }
 EXPORT BOOL WINAPI GetComputerNameW(LPWSTR name, LPDWORD size) {
   static const WCHAR kName[] = {'T', 'C', 'O', 'S', 0};
@@ -542,17 +612,48 @@ EXPORT HMODULE WINAPI GetModuleHandleA(LPCSTR name) {
   free_wide(w);
   return m;
 }
+/* GET_MODULE_HANDLE_EX_FLAG_*: PIN 1 (never unload), UNCHANGED_REFCOUNT 2, FROM_ADDRESS 4. Without UNCHANGED_REFCOUNT the library has one more use, which FreeLibrary ends. */
+static LDR_DATA_TABLE_ENTRY *module_containing(PVOID address) {
+  PEB_LDR_DATA *ldr = NtCurrentPeb()->Ldr;
+  if (!ldr) return NULL;
+  for (LIST_ENTRY *e = ldr->InLoadOrderModuleList.Flink; e != &ldr->InLoadOrderModuleList; e = e->Flink) {
+    LDR_DATA_TABLE_ENTRY *m = (LDR_DATA_TABLE_ENTRY *)e;
+    if ((BYTE *)address >= (BYTE *)m->DllBase && (BYTE *)address < (BYTE *)m->DllBase + m->SizeOfImage) return m;
+  }
+  return NULL;
+}
+static DWORD dos_error_of_load(NTSTATUS status) {
+  switch ((ULONG)status) {
+    case 0xC0000135u: return ERROR_MOD_NOT_FOUND;
+    case 0xC000007Bu: return ERROR_BAD_EXE_FORMAT;
+    case 0xC0000142u: return 1114;      /* ERROR_DLL_INIT_FAILED */
+    case 0xC00000BBu: return ERROR_NOT_SUPPORTED;
+    case 0xC0000017u: return ERROR_NOT_ENOUGH_MEMORY;
+    default: return RtlNtStatusToDosError(status);
+  }
+}
 EXPORT BOOL WINAPI GetModuleHandleExW(DWORD flags, LPCWSTR name, HMODULE *module) {
-  (void)flags;
-  HMODULE m = GetModuleHandleW(name);
-  if (module) *module = m;
-  return m != NULL;
+  LDR_DATA_TABLE_ENTRY *m = (flags & 4) ? module_containing((PVOID)name) : (name ? module_by_name(name) : module_by_base(NtCurrentPeb()->ImageBaseAddress));
+  if (module) *module = NULL;
+  if (!m) { set_error(ERROR_MOD_NOT_FOUND); return FALSE; }
+  if (!(flags & 2) || (flags & 1)) {      /* another use (a pin is a use that is never given back) */
+    UNICODE_STRING base_name = m->BaseDllName;
+    PVOID handle = NULL;
+    if (m->LoadCount != 0xFFFF) {
+      const NTSTATUS status = LdrLoadDll(NULL, NULL, &base_name, &handle);
+      if (!NT_SUCCESS(status)) { set_error(dos_error_of_load(status)); return FALSE; }
+    }
+  }
+  if (module) *module = m->DllBase;
+  return TRUE;
 }
 EXPORT BOOL WINAPI GetModuleHandleExA(DWORD flags, LPCSTR name, HMODULE *module) {
-  (void)flags;
-  HMODULE m = GetModuleHandleA(name);
-  if (module) *module = m;
-  return m != NULL;
+  if (flags & 4) return GetModuleHandleExW(flags, (LPCWSTR)name, module);
+  WCHAR *w = name ? to_wide(name) : NULL;
+  if (name && !w) return FALSE;
+  const BOOL ok = GetModuleHandleExW(flags, w, module);
+  free_wide(w);
+  return ok;
 }
 EXPORT DWORD WINAPI GetModuleFileNameW(HMODULE module, LPWSTR buffer, DWORD capacity) {
   LDR_DATA_TABLE_ENTRY *m = module_by_base(module ? module : NtCurrentPeb()->ImageBaseAddress);
@@ -625,13 +726,73 @@ EXPORT FARPROC WINAPI GetProcAddress(HMODULE module, LPCSTR name) {
   if (!p) set_error(ERROR_PROC_NOT_FOUND);
   return p;
 }
-/* Only libraries the process already has can be loaded: the kernel loaded everything the program imports. */
-EXPORT HMODULE WINAPI LoadLibraryW(LPCWSTR name) { return GetModuleHandleW(name); }
-EXPORT HMODULE WINAPI LoadLibraryA(LPCSTR name) { return GetModuleHandleA(name); }
-EXPORT HMODULE WINAPI LoadLibraryExW(LPCWSTR name, HANDLE file, DWORD flags) { (void)file; (void)flags; return GetModuleHandleW(name); }
-EXPORT HMODULE WINAPI LoadLibraryExA(LPCSTR name, HANDLE file, DWORD flags) { (void)file; (void)flags; return GetModuleHandleA(name); }
-EXPORT BOOL WINAPI FreeLibrary(HMODULE module) { (void)module; return TRUE; }
-EXPORT void WINAPI FreeLibraryAndExitThread(HMODULE module, DWORD code) { (void)module; ExitThread(code); }
+static BOOL find_file(LPCWSTR name, LPCWSTR extension, LPCWSTR extra, WCHAR *out);
+static void unicode_string(UNICODE_STRING *s, LPCWSTR text);
+static WCHAR g_dll_directory[PATH_CHARS];      /* SetDllDirectory */
+
+EXPORT BOOL WINAPI SetDllDirectoryW(LPCWSTR directory) {
+  if (directory && wcslen(directory) >= PATH_CHARS) { set_error(ERROR_FILENAME_EXCED_RANGE); return FALSE; }
+  if (directory) lstrcpyW(g_dll_directory, directory); else g_dll_directory[0] = 0;
+  return TRUE;
+}
+EXPORT BOOL WINAPI SetDllDirectoryA(LPCSTR directory) {
+  WCHAR *w = directory ? to_wide(directory) : NULL;
+  if (directory && !w) return FALSE;
+  const BOOL ok = SetDllDirectoryW(w);
+  free_wide(w);
+  return ok;
+}
+EXPORT DWORD WINAPI GetDllDirectoryW(DWORD capacity, LPWSTR buffer) {
+  const DWORD n = (DWORD)wcslen(g_dll_directory);
+  if (n + 1 > capacity) return n + 1;
+  memcpy(buffer, g_dll_directory, (n + 1) * 2);
+  return n;
+}
+EXPORT DWORD WINAPI GetDllDirectoryA(DWORD capacity, LPSTR buffer) {
+  const DWORD n = (DWORD)wcslen(g_dll_directory);
+  if (n + 1 > capacity) return n + 1;
+  return wide_result_to_ansi(g_dll_directory, n, buffer, capacity);
+}
+
+/* LoadLibrary: a library the process has already (by its name) gets one more use; otherwise the file is looked for and ntdll maps it, with the libraries it imports, and
+   calls their entry points. Libraries with thread-local data of their own (__declspec(thread) in a DLL) and the data-file modes are refused. */
+EXPORT HMODULE WINAPI LoadLibraryExW(LPCWSTR name, HANDLE file, DWORD flags) {
+  (void)file;
+  if (!name || !name[0]) { set_error(ERROR_INVALID_PARAMETER); return NULL; }
+  if (flags & 0x32) { set_error(ERROR_NOT_SUPPORTED); return NULL; }      /* AS_DATAFILE 2, AS_DATAFILE_EXCLUSIVE 0x10, AS_IMAGE_RESOURCE 0x20 */
+  WCHAR path[PATH_CHARS];
+  UNICODE_STRING us;
+  /* The file, if there is one; otherwise the bare name (a library the process has already may be known by an alias, "api-ms-win-crt-runtime-l1-1-0.dll"): the kernel knows
+     which libraries are loaded, and decides under the loader lock. */
+  static const WCHAR dll[] = {'.', 'd', 'l', 'l', 0};
+  if (find_file(name, dll, g_dll_directory, path)) unicode_string(&us, path);
+  else unicode_string(&us, name);
+  PVOID handle = NULL;
+  const NTSTATUS status = LdrLoadDll(NULL, NULL, &us, &handle);
+  if (!NT_SUCCESS(status)) { set_error(dos_error_of_load(status)); return NULL; }
+  return (HMODULE)handle;
+}
+EXPORT HMODULE WINAPI LoadLibraryW(LPCWSTR name) { return LoadLibraryExW(name, NULL, 0); }
+EXPORT HMODULE WINAPI LoadLibraryA(LPCSTR name) {
+  WCHAR *w = name ? to_wide(name) : NULL;
+  if (name && !w) return NULL;
+  HMODULE m = LoadLibraryExW(w, NULL, 0);
+  free_wide(w);
+  return m;
+}
+EXPORT HMODULE WINAPI LoadLibraryExA(LPCSTR name, HANDLE file, DWORD flags) {
+  WCHAR *w = name ? to_wide(name) : NULL;
+  if (name && !w) return NULL;
+  HMODULE m = LoadLibraryExW(w, file, flags);
+  free_wide(w);
+  return m;
+}
+EXPORT BOOL WINAPI FreeLibrary(HMODULE module) {
+  if (!module_by_base(module)) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
+  const NTSTATUS status = LdrUnloadDll(module);
+  return NT_SUCCESS(status) ? TRUE : (set_error(dos_error_of_load(status)), FALSE);
+}
+EXPORT void WINAPI FreeLibraryAndExitThread(HMODULE module, DWORD code) { FreeLibrary(module); ExitThread(code); }
 
 /* ---- thread-local storage, fiber-local storage --------------------------------------------------------------------------------------------------------- */
 
@@ -716,7 +877,7 @@ EXPORT void WINAPI InitializeCriticalSection(LPCRITICAL_SECTION cs) { RtlInitial
 EXPORT BOOL WINAPI InitializeCriticalSectionAndSpinCount(LPCRITICAL_SECTION cs, DWORD spin) { (void)spin; RtlInitializeCriticalSection(cs); return TRUE; }
 EXPORT BOOL WINAPI InitializeCriticalSectionEx(LPCRITICAL_SECTION cs, DWORD spin, DWORD flags) { (void)spin; (void)flags; RtlInitializeCriticalSection(cs); return TRUE; }
 EXPORT void WINAPI EnterCriticalSection(LPCRITICAL_SECTION cs) { RtlEnterCriticalSection(cs); }
-EXPORT BOOL WINAPI TryEnterCriticalSection(LPCRITICAL_SECTION cs) { RtlEnterCriticalSection(cs); return TRUE; }
+EXPORT BOOL WINAPI TryEnterCriticalSection(LPCRITICAL_SECTION cs) { return RtlTryEnterCriticalSection(cs); }
 EXPORT void WINAPI LeaveCriticalSection(LPCRITICAL_SECTION cs) { RtlLeaveCriticalSection(cs); }
 EXPORT void WINAPI DeleteCriticalSection(LPCRITICAL_SECTION cs) { RtlDeleteCriticalSection(cs); }
 EXPORT DWORD WINAPI SetCriticalSectionSpinCount(LPCRITICAL_SECTION cs, DWORD spin) { (void)cs; (void)spin; return 0; }
@@ -821,23 +982,24 @@ EXPORT ULONGLONG WINAPI GetTickCount64(void);
 
 /* Builds the OBJECT_ATTRIBUTES of a name (or none). `buffer` holds the wide name: 3 + 17 + name characters. */
 typedef struct { OBJECT_ATTRIBUTES attributes; UNICODE_STRING string; WCHAR text[300]; } NamedAttributes;
-static POBJECT_ATTRIBUTES named_attributes(NamedAttributes *n, LPCWSTR name) {
-  if (!name || !*name) return NULL;
+static POBJECT_ATTRIBUTES named_attributes(NamedAttributes *n, LPCWSTR name, BOOL inherit) {
+  if ((!name || !*name) && !inherit) return NULL;
   static const WCHAR prefix[] = L"\\BaseNamedObjects\\";
   unsigned length = 0;
   for (; prefix[length]; ++length) n->text[length] = prefix[length];
   const WCHAR *skip = name;
   if ((name[0] == 'L' || name[0] == 'l') && (name[1] == 'o' || name[1] == 'O') && (name[2] == 'c' || name[2] == 'C') && (name[3] == 'a' || name[3] == 'A') && (name[4] == 'l' || name[4] == 'L') && name[5] == '\\') skip = name + 6;
   else if ((name[0] == 'G' || name[0] == 'g') && (name[1] == 'l' || name[1] == 'L') && (name[2] == 'o' || name[2] == 'O') && (name[3] == 'b' || name[3] == 'B') && (name[4] == 'a' || name[4] == 'A') && (name[5] == 'l' || name[5] == 'L') && name[6] == '\\') skip = name + 7;
-  for (; *skip && length < 299; ++skip) n->text[length++] = *skip;
+  if (!name || !*name) length = 0;      /* (only the inherit flag was asked for) */
+  else for (; *skip && length < 299; ++skip) n->text[length++] = *skip;
   n->text[length] = 0;
   n->string.Buffer = n->text;
   n->string.Length = (USHORT)(length * 2);
   n->string.MaximumLength = (USHORT)(length * 2 + 2);
   n->attributes.Length = sizeof(OBJECT_ATTRIBUTES);
   n->attributes.RootDirectory = NULL;
-  n->attributes.ObjectName = &n->string;
-  n->attributes.Attributes = 0x40;      /* OBJ_CASE_INSENSITIVE */
+  n->attributes.ObjectName = length ? &n->string : NULL;
+  n->attributes.Attributes = 0x40 | (inherit ? 2 : 0);      /* OBJ_CASE_INSENSITIVE, OBJ_INHERIT */
   n->attributes.SecurityDescriptor = NULL;
   n->attributes.SecurityQualityOfService = NULL;
   return &n->attributes;
@@ -854,10 +1016,10 @@ static HANDLE opened(NTSTATUS status, HANDLE h) {
 }
 
 EXPORT HANDLE WINAPI CreateEventW(LPSECURITY_ATTRIBUTES sa, BOOL manual, BOOL initial, LPCWSTR name) {
-  (void)sa;
   NamedAttributes n;
+  const BOOL inherit_handle = sa && sa->bInheritHandle;
   HANDLE h = NULL;
-  { const NTSTATUS status = NtCreateEvent(&h, 0x1F0003, named_attributes(&n, name), manual ? 0 : 1, initial != 0); return created(status, h); }
+  { const NTSTATUS status = NtCreateEvent(&h, 0x1F0003, named_attributes(&n, name, inherit_handle), manual ? 0 : 1, initial != 0); return created(status, h); }
 }
 EXPORT HANDLE WINAPI CreateEventA(LPSECURITY_ATTRIBUTES sa, BOOL manual, BOOL initial, LPCSTR name) {
   WCHAR *w = name ? to_wide(name) : NULL;
@@ -868,10 +1030,11 @@ EXPORT HANDLE WINAPI CreateEventA(LPSECURITY_ATTRIBUTES sa, BOOL manual, BOOL in
 EXPORT HANDLE WINAPI CreateEventExW(LPSECURITY_ATTRIBUTES sa, LPCWSTR name, DWORD flags, DWORD access) { (void)access; return CreateEventW(sa, (flags & 1) ? TRUE : FALSE, (flags & 2) ? TRUE : FALSE, name); }
 EXPORT HANDLE WINAPI CreateEventExA(LPSECURITY_ATTRIBUTES sa, LPCSTR name, DWORD flags, DWORD access) { (void)access; return CreateEventA(sa, (flags & 1) ? TRUE : FALSE, (flags & 2) ? TRUE : FALSE, name); }
 EXPORT HANDLE WINAPI OpenEventW(DWORD access, BOOL inherit, LPCWSTR name) {
-  (void)access; (void)inherit;
+  (void)access;
   NamedAttributes n;
+  const BOOL inherit_handle = inherit;
   HANDLE h = NULL;
-  { const NTSTATUS status = NtOpenEvent(&h, 0x1F0003, named_attributes(&n, name)); return opened(status, h); }
+  { const NTSTATUS status = NtOpenEvent(&h, 0x1F0003, named_attributes(&n, name, inherit_handle)); return opened(status, h); }
 }
 EXPORT HANDLE WINAPI OpenEventA(DWORD access, BOOL inherit, LPCSTR name) {
   WCHAR *w = name ? to_wide(name) : NULL;
@@ -884,10 +1047,10 @@ EXPORT BOOL WINAPI ResetEvent(HANDLE h) { const NTSTATUS s = NtResetEvent(h, NUL
 EXPORT BOOL WINAPI PulseEvent(HANDLE h) { const NTSTATUS s = NtPulseEvent(h, NULL); return NT_SUCCESS(s) ? TRUE : fail_nt(s); }
 
 EXPORT HANDLE WINAPI CreateMutexW(LPSECURITY_ATTRIBUTES sa, BOOL owned, LPCWSTR name) {
-  (void)sa;
   NamedAttributes n;
+  const BOOL inherit_handle = sa && sa->bInheritHandle;
   HANDLE h = NULL;
-  { const NTSTATUS status = NtCreateMutant(&h, 0x1F0001, named_attributes(&n, name), owned != 0); return created(status, h); }
+  { const NTSTATUS status = NtCreateMutant(&h, 0x1F0001, named_attributes(&n, name, inherit_handle), owned != 0); return created(status, h); }
 }
 EXPORT HANDLE WINAPI CreateMutexA(LPSECURITY_ATTRIBUTES sa, BOOL owned, LPCSTR name) {
   WCHAR *w = name ? to_wide(name) : NULL;
@@ -898,10 +1061,11 @@ EXPORT HANDLE WINAPI CreateMutexA(LPSECURITY_ATTRIBUTES sa, BOOL owned, LPCSTR n
 EXPORT HANDLE WINAPI CreateMutexExW(LPSECURITY_ATTRIBUTES sa, LPCWSTR name, DWORD flags, DWORD access) { (void)access; return CreateMutexW(sa, (flags & 1) ? TRUE : FALSE, name); }
 EXPORT HANDLE WINAPI CreateMutexExA(LPSECURITY_ATTRIBUTES sa, LPCSTR name, DWORD flags, DWORD access) { (void)access; return CreateMutexA(sa, (flags & 1) ? TRUE : FALSE, name); }
 EXPORT HANDLE WINAPI OpenMutexW(DWORD access, BOOL inherit, LPCWSTR name) {
-  (void)access; (void)inherit;
+  (void)access;
   NamedAttributes n;
+  const BOOL inherit_handle = inherit;
   HANDLE h = NULL;
-  { const NTSTATUS status = NtOpenMutant(&h, 0x1F0001, named_attributes(&n, name)); return opened(status, h); }
+  { const NTSTATUS status = NtOpenMutant(&h, 0x1F0001, named_attributes(&n, name, inherit_handle)); return opened(status, h); }
 }
 EXPORT HANDLE WINAPI OpenMutexA(DWORD access, BOOL inherit, LPCSTR name) {
   WCHAR *w = name ? to_wide(name) : NULL;
@@ -912,10 +1076,10 @@ EXPORT HANDLE WINAPI OpenMutexA(DWORD access, BOOL inherit, LPCSTR name) {
 EXPORT BOOL WINAPI ReleaseMutex(HANDLE h) { const NTSTATUS s = NtReleaseMutant(h, NULL); return NT_SUCCESS(s) ? TRUE : fail_nt(s); }
 
 EXPORT HANDLE WINAPI CreateSemaphoreW(LPSECURITY_ATTRIBUTES sa, LONG initial, LONG maximum, LPCWSTR name) {
-  (void)sa;
   NamedAttributes n;
+  const BOOL inherit_handle = sa && sa->bInheritHandle;
   HANDLE h = NULL;
-  { const NTSTATUS status = NtCreateSemaphore(&h, 0x1F0003, named_attributes(&n, name), initial, maximum); return created(status, h); }
+  { const NTSTATUS status = NtCreateSemaphore(&h, 0x1F0003, named_attributes(&n, name, inherit_handle), initial, maximum); return created(status, h); }
 }
 EXPORT HANDLE WINAPI CreateSemaphoreA(LPSECURITY_ATTRIBUTES sa, LONG initial, LONG maximum, LPCSTR name) {
   WCHAR *w = name ? to_wide(name) : NULL;
@@ -925,10 +1089,11 @@ EXPORT HANDLE WINAPI CreateSemaphoreA(LPSECURITY_ATTRIBUTES sa, LONG initial, LO
 }
 EXPORT HANDLE WINAPI CreateSemaphoreExW(LPSECURITY_ATTRIBUTES sa, LONG initial, LONG maximum, LPCWSTR name, DWORD flags, DWORD access) { (void)flags; (void)access; return CreateSemaphoreW(sa, initial, maximum, name); }
 EXPORT HANDLE WINAPI OpenSemaphoreW(DWORD access, BOOL inherit, LPCWSTR name) {
-  (void)access; (void)inherit;
+  (void)access;
   NamedAttributes n;
+  const BOOL inherit_handle = inherit;
   HANDLE h = NULL;
-  { const NTSTATUS status = NtOpenSemaphore(&h, 0x1F0003, named_attributes(&n, name)); return opened(status, h); }
+  { const NTSTATUS status = NtOpenSemaphore(&h, 0x1F0003, named_attributes(&n, name, inherit_handle)); return opened(status, h); }
 }
 EXPORT HANDLE WINAPI OpenSemaphoreA(DWORD access, BOOL inherit, LPCSTR name) {
   WCHAR *w = name ? to_wide(name) : NULL;
@@ -947,7 +1112,221 @@ EXPORT void WINAPI Sleep(DWORD ms) {
   t.QuadPart = -(LONGLONG)ms * 10000;
   if (ms == 0) NtYieldExecution(); else NtDelayExecution(FALSE, &t);
 }
-EXPORT DWORD WINAPI SleepEx(DWORD ms, BOOL alertable) { (void)alertable; Sleep(ms); return 0; }
+EXPORT DWORD WINAPI SleepEx(DWORD ms, BOOL alertable) {
+  if (!alertable) { Sleep(ms); return 0; }
+  LARGE_INTEGER t;
+  t.QuadPart = ms == INFINITE ? (LONGLONG)0x8000000000000000ull : -(LONGLONG)ms * 10000;
+  const NTSTATUS status = NtDelayExecution(TRUE, &t);
+  return status == STATUS_USER_APC || status == STATUS_ALERTED ? WAIT_IO_COMPLETION : 0;      /* an APC ended the sleep */
+}
+EXPORT DWORD WINAPI SignalObjectAndWait(HANDLE signal, HANDLE wait, DWORD timeout_ms, BOOL alertable) {
+  LARGE_INTEGER t;
+  t.QuadPart = -(LONGLONG)timeout_ms * 10000;
+  return wait_result(NtSignalAndWaitForSingleObject(signal, wait, alertable != 0, timeout_ms == INFINITE ? NULL : &t));
+}
+
+/* ---- asynchronous procedure calls --------------------------------------------------------------------------------------------------------------------- */
+
+/* The routine that runs in the target thread: a PAPCFUNC takes one argument. */
+static void NTAPI apc_function(ULONG_PTR function, ULONG_PTR parameter, ULONG_PTR unused) { (void)unused; ((void (WINAPI *)(ULONG_PTR))function)(parameter); }
+EXPORT DWORD WINAPI QueueUserAPC(void (WINAPI *function)(ULONG_PTR), HANDLE thread, ULONG_PTR parameter) {
+  if (!function) { set_error(ERROR_INVALID_PARAMETER); return 0; }
+  const NTSTATUS status = NtQueueApcThread(thread, (PVOID)apc_function, (ULONG_PTR)function, parameter, 0);
+  if (!NT_SUCCESS(status)) { fail_nt(status); return 0; }
+  return 1;
+}
+/* ReadFileEx / WriteFileEx: the operation is done at once; the completion routine is an APC for this thread, called when it next waits alertably. */
+typedef void (WINAPI *LPOVERLAPPED_COMPLETION_ROUTINE_)(DWORD, DWORD, LPOVERLAPPED);
+static void NTAPI completion_apc(ULONG_PTR routine, ULONG_PTR overlapped, ULONG_PTR unused) {
+  (void)unused;
+  LPOVERLAPPED o = (LPOVERLAPPED)overlapped;
+  ((LPOVERLAPPED_COMPLETION_ROUTINE_)routine)(NT_SUCCESS((NTSTATUS)(ULONG)o->Internal) ? 0 : RtlNtStatusToDosError((NTSTATUS)(ULONG)o->Internal), (DWORD)o->InternalHigh, o);
+}
+EXPORT BOOL WINAPI ReadFileEx(HANDLE h, LPVOID buffer, DWORD length, LPOVERLAPPED overlapped, LPOVERLAPPED_COMPLETION_ROUTINE_ routine) {
+  if (!overlapped || !routine) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  DWORD got = 0;
+  const BOOL ok = ReadFile(h, buffer, length, &got, overlapped);
+  if (!ok && GetLastError() != ERROR_HANDLE_EOF) return FALSE;
+  NtQueueApcThread(NtCurrentThread(), (PVOID)completion_apc, (ULONG_PTR)routine, (ULONG_PTR)overlapped, 0);
+  return TRUE;
+}
+EXPORT BOOL WINAPI WriteFileEx(HANDLE h, LPCVOID buffer, DWORD length, LPOVERLAPPED overlapped, LPOVERLAPPED_COMPLETION_ROUTINE_ routine) {
+  if (!overlapped || !routine) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  DWORD done = 0;
+  if (!WriteFile(h, buffer, length, &done, overlapped)) return FALSE;
+  NtQueueApcThread(NtCurrentThread(), (PVOID)completion_apc, (ULONG_PTR)routine, (ULONG_PTR)overlapped, 0);
+  return TRUE;
+}
+
+/* ---- waitable timers ---------------------------------------------------------------------------------------------------------------------------------- */
+
+EXPORT HANDLE WINAPI CreateWaitableTimerExW(LPSECURITY_ATTRIBUTES sa, LPCWSTR name, DWORD flags, DWORD access) {
+  (void)access;
+  NamedAttributes n;
+  HANDLE h = NULL;
+  const NTSTATUS status = NtCreateTimer(&h, 0x1F0003, named_attributes(&n, name, sa && sa->bInheritHandle), (flags & 1) ? 0 : 1);      /* CREATE_WAITABLE_TIMER_MANUAL_RESET */
+  if (!NT_SUCCESS(status)) { fail_nt(status); return NULL; }
+  set_error(status == 0x40000000 ? ERROR_ALREADY_EXISTS : ERROR_SUCCESS);
+  return h;
+}
+EXPORT HANDLE WINAPI CreateWaitableTimerW(LPSECURITY_ATTRIBUTES sa, BOOL manual_reset, LPCWSTR name) { return CreateWaitableTimerExW(sa, name, manual_reset ? 1 : 0, 0x1F0003); }
+EXPORT HANDLE WINAPI CreateWaitableTimerA(LPSECURITY_ATTRIBUTES sa, BOOL manual_reset, LPCSTR name) {
+  WCHAR *w = name ? to_wide(name) : NULL;
+  if (name && !w) return NULL;
+  HANDLE h = CreateWaitableTimerW(sa, manual_reset, w);
+  free_wide(w);
+  return h;
+}
+EXPORT HANDLE WINAPI CreateWaitableTimerExA(LPSECURITY_ATTRIBUTES sa, LPCSTR name, DWORD flags, DWORD access) {
+  WCHAR *w = name ? to_wide(name) : NULL;
+  if (name && !w) return NULL;
+  HANDLE h = CreateWaitableTimerExW(sa, w, flags, access);
+  free_wide(w);
+  return h;
+}
+EXPORT HANDLE WINAPI OpenWaitableTimerW(DWORD access, BOOL inherit, LPCWSTR name) {
+  (void)access;
+  NamedAttributes n;
+  HANDLE h = NULL;
+  const NTSTATUS status = NtOpenTimer(&h, 0x1F0003, named_attributes(&n, name, inherit));
+  if (!NT_SUCCESS(status)) { fail_nt(status); return NULL; }
+  return h;
+}
+EXPORT HANDLE WINAPI OpenWaitableTimerA(DWORD access, BOOL inherit, LPCSTR name) {
+  WCHAR *w = name ? to_wide(name) : NULL;
+  if (!w) { set_error(ERROR_INVALID_PARAMETER); return NULL; }
+  HANDLE h = OpenWaitableTimerW(access, inherit, w);
+  free_wide(w);
+  return h;
+}
+typedef void (WINAPI *PTIMERAPCROUTINE_)(LPVOID, DWORD, DWORD);
+EXPORT BOOL WINAPI SetWaitableTimer(HANDLE h, const LARGE_INTEGER *due, LONG period_ms, PTIMERAPCROUTINE_ routine, LPVOID context, BOOL resume) {
+  if (!due || period_ms < 0) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  LARGE_INTEGER t = *due;      /* negative: relative; positive: a FILETIME */
+  const NTSTATUS status = NtSetTimer(h, &t, (PVOID)routine, context, resume != 0, period_ms, NULL);
+  return NT_SUCCESS(status) ? TRUE : fail_nt(status);
+}
+EXPORT BOOL WINAPI SetWaitableTimerEx(HANDLE h, const LARGE_INTEGER *due, LONG period_ms, PTIMERAPCROUTINE_ routine, LPVOID context, PVOID reason, ULONG tolerance) {
+  (void)reason; (void)tolerance;
+  return SetWaitableTimer(h, due, period_ms, routine, context, FALSE);
+}
+EXPORT BOOL WINAPI CancelWaitableTimer(HANDLE h) {
+  const NTSTATUS status = NtCancelTimer(h, NULL);
+  return NT_SUCCESS(status) ? TRUE : fail_nt(status);
+}
+
+/* ---- other processes and threads by id ---------------------------------------------------------------------------------------------------------------- */
+
+/* ---- file mappings ------------------------------------------------------------------------------------------------------------------------------------ */
+
+#define FILE_MAP_COPY_ 1
+#define FILE_MAP_WRITE_ 2
+#define FILE_MAP_READ_ 4
+#define FILE_MAP_EXECUTE_ 0x20
+#define SECTION_ALL_ 0xF001F
+
+EXPORT HANDLE WINAPI CreateFileMappingW(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect, DWORD size_high, DWORD size_low, LPCWSTR name) {
+  const DWORD page = protect & 0xFF;      /* (SEC_COMMIT and the like are in the upper bits) */
+  LARGE_INTEGER size;
+  size.LowPart = size_low;
+  size.HighPart = (LONG)size_high;
+  PLARGE_INTEGER size_pointer = (size_low || size_high) ? &size : NULL;
+  if (file == INVALID_HANDLE_VALUE) {
+    file = NULL;
+    if (!size_pointer) { set_error(ERROR_INVALID_PARAMETER); return NULL; }
+  }
+  NamedAttributes n;
+  HANDLE h = NULL;
+  const NTSTATUS status = NtCreateSection(&h, SECTION_ALL_, named_attributes(&n, name, sa && sa->bInheritHandle), size_pointer, page, 0x8000000 /* SEC_COMMIT */, file);
+  if (!NT_SUCCESS(status)) { fail_nt(status); return NULL; }
+  set_error(status == 0x40000000 ? ERROR_ALREADY_EXISTS : ERROR_SUCCESS);
+  return h;
+}
+EXPORT HANDLE WINAPI CreateFileMappingA(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect, DWORD size_high, DWORD size_low, LPCSTR name) {
+  WCHAR *w = name ? to_wide(name) : NULL;
+  if (name && !w) return NULL;
+  HANDLE h = CreateFileMappingW(file, sa, protect, size_high, size_low, w);
+  const DWORD error = GetLastError();
+  free_wide(w);
+  set_error(error);
+  return h;
+}
+EXPORT HANDLE WINAPI OpenFileMappingW(DWORD access, BOOL inherit, LPCWSTR name) {
+  (void)access;
+  NamedAttributes n;
+  HANDLE h = NULL;
+  const NTSTATUS status = NtOpenSection(&h, SECTION_ALL_, named_attributes(&n, name, inherit));
+  if (!NT_SUCCESS(status)) { fail_nt(status); return NULL; }
+  return h;
+}
+EXPORT HANDLE WINAPI OpenFileMappingA(DWORD access, BOOL inherit, LPCSTR name) {
+  WCHAR *w = name ? to_wide(name) : NULL;
+  if (!w) { set_error(ERROR_INVALID_PARAMETER); return NULL; }
+  HANDLE h = OpenFileMappingW(access, inherit, w);
+  free_wide(w);
+  return h;
+}
+EXPORT LPVOID WINAPI MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offset_high, DWORD offset_low, SIZE_T bytes, LPVOID base_address) {
+  ULONG page = (access & FILE_MAP_WRITE_) ? PAGE_READWRITE : (access & FILE_MAP_COPY_) ? 0x08 /* PAGE_WRITECOPY */ : 0x02 /* PAGE_READONLY */;
+  if (access & FILE_MAP_EXECUTE_) page = page == PAGE_READWRITE ? 0x40 : page == 0x08 ? 0x80 : 0x20;
+  LARGE_INTEGER offset;
+  offset.LowPart = offset_low;
+  offset.HighPart = (LONG)offset_high;
+  PVOID base = base_address;
+  SIZE_T size = bytes;
+  const NTSTATUS status = NtMapViewOfSection(mapping, NtCurrentProcess(), &base, 0, 0, &offset, &size, 1 /* ViewShare */, 0, page);
+  if (!NT_SUCCESS(status)) { fail_nt(status); return NULL; }
+  return base;
+}
+EXPORT LPVOID WINAPI MapViewOfFile(HANDLE mapping, DWORD access, DWORD offset_high, DWORD offset_low, SIZE_T bytes) { return MapViewOfFileEx(mapping, access, offset_high, offset_low, bytes, NULL); }
+EXPORT BOOL WINAPI UnmapViewOfFile(LPCVOID base) {
+  const NTSTATUS status = NtUnmapViewOfSection(NtCurrentProcess(), (PVOID)base);
+  return NT_SUCCESS(status) ? TRUE : fail_nt(status);
+}
+EXPORT BOOL WINAPI FlushViewOfFile(LPCVOID base, SIZE_T bytes) {
+  IO_STATUS_BLOCK iosb;
+  PVOID address = (PVOID)base;
+  SIZE_T size = bytes;
+  const NTSTATUS status = NtFlushVirtualMemory(NtCurrentProcess(), &address, &size, &iosb);
+  return NT_SUCCESS(status) ? TRUE : fail_nt(status);
+}
+
+/* The memory functions with a process handle: only this process is in reach. */
+static BOOL is_this_process(HANDLE process) {
+  if (process == NtCurrentProcess()) return TRUE;
+  ULONGLONG info[6];
+  if (!NT_SUCCESS(NtQueryInformationProcess(process, 0, info, sizeof(info), NULL))) return FALSE;
+  return (DWORD)info[4] == GetCurrentProcessId();
+}
+EXPORT LPVOID WINAPI VirtualAllocEx(HANDLE process, LPVOID address, SIZE_T size, DWORD type, DWORD protect) {
+  if (!is_this_process(process)) { set_error(ERROR_NOT_SUPPORTED); return NULL; }
+  return VirtualAlloc(address, size, type, protect);
+}
+EXPORT BOOL WINAPI VirtualFreeEx(HANDLE process, LPVOID address, SIZE_T size, DWORD type) {
+  if (!is_this_process(process)) { set_error(ERROR_NOT_SUPPORTED); return FALSE; }
+  return VirtualFree(address, size, type);
+}
+EXPORT BOOL WINAPI VirtualProtectEx(HANDLE process, LPVOID address, SIZE_T size, DWORD protect, PDWORD old) {
+  if (!is_this_process(process)) { set_error(ERROR_NOT_SUPPORTED); return FALSE; }
+  return VirtualProtect(address, size, protect, old);
+}
+EXPORT SIZE_T WINAPI VirtualQueryEx(HANDLE process, LPCVOID address, PMEMORY_BASIC_INFORMATION info, SIZE_T length) {
+  if (!is_this_process(process)) { set_error(ERROR_NOT_SUPPORTED); return 0; }
+  return VirtualQuery(address, info, length);
+}
+
+EXPORT HANDLE WINAPI OpenThread(DWORD access, BOOL inherit, DWORD id) {
+  (void)access;
+  OBJECT_ATTRIBUTES attributes;
+  memset(&attributes, 0, sizeof(attributes));
+  attributes.Length = sizeof(attributes);
+  attributes.Attributes = inherit ? 2 : 0;
+  ULONG64 client[2] = {GetCurrentProcessId(), id};
+  HANDLE h = NULL;
+  const NTSTATUS status = NtOpenThread(&h, 0x1F03FF, &attributes, client);
+  if (!NT_SUCCESS(status)) { fail_nt(status); return NULL; }
+  return h;
+}
 EXPORT BOOL WINAPI SwitchToThread(void) { NtYieldExecution(); return TRUE; }
 
 /* The Win32 result of a wait: the index (WAIT_OBJECT_0 + i), WAIT_ABANDONED_0 + i, WAIT_TIMEOUT, WAIT_IO_COMPLETION. */
@@ -955,7 +1334,7 @@ static DWORD wait_result(NTSTATUS status) {
   if (status >= 0 && status < 64) return WAIT_OBJECT_0 + (DWORD)status;
   if (status >= 0x80 && status < 0x80 + 64) return WAIT_ABANDONED + ((DWORD)status - 0x80);
   if (status == 0x102) return WAIT_TIMEOUT;
-  if (status == 0x101) return WAIT_IO_COMPLETION;
+  if (status == 0x101 || status == 0xC0) return WAIT_IO_COMPLETION;      /* STATUS_ALERTED, STATUS_USER_APC: the APCs have run */
   fail_nt(status);
   return WAIT_FAILED;
 }
@@ -971,10 +1350,6 @@ EXPORT DWORD WINAPI WaitForMultipleObjectsEx(DWORD count, const HANDLE *handles,
   return wait_result(NtWaitForMultipleObjects(count, handles, all ? 0 : 1, alertable != 0, timeout_ms == INFINITE ? NULL : &t));
 }
 EXPORT DWORD WINAPI WaitForMultipleObjects(DWORD count, const HANDLE *handles, BOOL all, DWORD timeout_ms) { return WaitForMultipleObjectsEx(count, handles, all, timeout_ms, FALSE); }
-EXPORT DWORD WINAPI SignalObjectAndWait(HANDLE signal, HANDLE wait, DWORD timeout_ms, BOOL alertable) {
-  SetEvent(signal);      /* (an event; a mutex or semaphore signalled this way is released by its own function) */
-  return WaitForSingleObjectEx(wait, timeout_ms, alertable);
-}
 
 /* ---- threads ------------------------------------------------------------------------------------------------------------------------------------------------- */
 
@@ -1014,15 +1389,135 @@ EXPORT DWORD WINAPI SuspendThread(HANDLE h) {
   return previous;
 }
 EXPORT BOOL WINAPI TerminateThread(HANDLE h, DWORD code) { const NTSTATUS status = NtTerminateThread(h, (NTSTATUS)code); return NT_SUCCESS(status) ? TRUE : fail_nt(status); }
-EXPORT BOOL WINAPI SetThreadPriority(HANDLE h, int priority) { (void)h; (void)priority; return TRUE; }
-EXPORT int WINAPI GetThreadPriority(HANDLE h) { (void)h; return 0; }
-EXPORT BOOL WINAPI SetProcessAffinityMask(HANDLE h, DWORD_PTR mask) { (void)h; (void)mask; return TRUE; }
-EXPORT BOOL WINAPI GetProcessAffinityMask(HANDLE h, DWORD_PTR *process, DWORD_PTR *system) { (void)h; if (process) *process = 1; if (system) *system = 1; return TRUE; }
-EXPORT HANDLE WINAPI OpenProcess(DWORD access, BOOL inherit, DWORD id) { (void)access; (void)inherit; set_error(id == GetCurrentProcessId() ? ERROR_NOT_SUPPORTED : ERROR_INVALID_PARAMETER); return NULL; }
+EXPORT BOOL WINAPI SetThreadPriority(HANDLE h, int priority) {
+  LONG value = priority;
+  const NTSTATUS status = NtSetInformationThread(h, 3, &value, sizeof(value));      /* ThreadBasePriority */
+  return NT_SUCCESS(status) ? TRUE : fail_nt(status);
+}
+EXPORT int WINAPI GetThreadPriority(HANDLE h) {
+  BYTE info[48];
+  const NTSTATUS status = NtQueryInformationThread(h, 0, info, sizeof(info), NULL);
+  if (!NT_SUCCESS(status)) { fail_nt(status); return THREAD_PRIORITY_ERROR_RETURN; }
+  return (LONG)get32(info + 44);      /* BasePriority */
+}
+EXPORT DWORD_PTR WINAPI SetThreadAffinityMask(HANDLE h, DWORD_PTR mask) {
+  BYTE info[48];
+  NTSTATUS status = NtQueryInformationThread(h, 0, info, sizeof(info), NULL);
+  if (!NT_SUCCESS(status)) { fail_nt(status); return 0; }
+  const DWORD_PTR old = get64(info + 32);
+  ULONGLONG value = mask;
+  status = NtSetInformationThread(h, 4, &value, sizeof(value));      /* ThreadAffinityMask */
+  if (!NT_SUCCESS(status)) { fail_nt(status); return 0; }
+  return old;
+}
+EXPORT DWORD WINAPI SetThreadIdealProcessor(HANDLE h, DWORD processor) {
+  ULONG value = processor;
+  const NTSTATUS status = NtSetInformationThread(h, 13, &value, sizeof(value));
+  if (!NT_SUCCESS(status)) { fail_nt(status); return (DWORD)-1; }
+  return 0;
+}
+EXPORT BOOL WINAPI SetProcessAffinityMask(HANDLE h, DWORD_PTR mask) {
+  ULONGLONG value = mask;
+  const NTSTATUS status = NtSetInformationProcess(h, 21, &value, sizeof(value));      /* ProcessAffinityMask */
+  return NT_SUCCESS(status) ? TRUE : fail_nt(status);
+}
+EXPORT BOOL WINAPI GetProcessAffinityMask(HANDLE h, DWORD_PTR *process, DWORD_PTR *system) {
+  ULONGLONG mask = 0;
+  BYTE basic[64] = {};
+  NTSTATUS status = NtQueryInformationProcess(h, 21, &mask, sizeof(mask), NULL);
+  if (!NT_SUCCESS(status)) return fail_nt(status);
+  status = NtQuerySystemInformation(0, basic, sizeof(basic), NULL);
+  if (!NT_SUCCESS(status)) return fail_nt(status);
+  if (process) *process = mask;
+  if (system) *system = get64(basic + 48);
+  return TRUE;
+}
+EXPORT DWORD WINAPI GetCurrentProcessorNumber(void) { return NtGetCurrentProcessorNumber(); }
+EXPORT DWORD WINAPI GetPriorityClass(HANDLE h) {
+  BYTE info[2];
+  const NTSTATUS status = NtQueryInformationProcess(h, 18, info, sizeof(info), NULL);
+  if (!NT_SUCCESS(status)) { fail_nt(status); return 0; }
+  switch (info[1]) {
+    case 1: return IDLE_PRIORITY_CLASS;
+    case 3: return HIGH_PRIORITY_CLASS;
+    case 4: return REALTIME_PRIORITY_CLASS;
+    case 5: return BELOW_NORMAL_PRIORITY_CLASS;
+    case 6: return ABOVE_NORMAL_PRIORITY_CLASS;
+    default: return NORMAL_PRIORITY_CLASS;
+  }
+}
+EXPORT BOOL WINAPI SetPriorityClass(HANDLE h, DWORD class_) {
+  BYTE info[2] = {0, 2};
+  switch (class_) {
+    case IDLE_PRIORITY_CLASS: info[1] = 1; break;
+    case HIGH_PRIORITY_CLASS: info[1] = 3; break;
+    case REALTIME_PRIORITY_CLASS: info[1] = 4; break;
+    case BELOW_NORMAL_PRIORITY_CLASS: info[1] = 5; break;
+    case ABOVE_NORMAL_PRIORITY_CLASS: info[1] = 6; break;
+    case NORMAL_PRIORITY_CLASS: break;
+    default: set_error(ERROR_INVALID_PARAMETER); return FALSE;
+  }
+  const NTSTATUS status = NtSetInformationProcess(h, 18, info, sizeof(info));
+  return NT_SUCCESS(status) ? TRUE : fail_nt(status);
+}
+EXPORT BOOL WINAPI GetProcessTimes(HANDLE h, LPFILETIME creation, LPFILETIME exit_time, LPFILETIME kernel, LPFILETIME user) {
+  ULONGLONG t[4];
+  const NTSTATUS status = NtQueryInformationProcess(h, 4, t, sizeof(t), NULL);
+  if (!NT_SUCCESS(status)) return fail_nt(status);
+  FILETIME *out[4] = {creation, exit_time, kernel, user};
+  for (int i = 0; i < 4; ++i) if (out[i]) { out[i]->dwLowDateTime = (DWORD)t[i]; out[i]->dwHighDateTime = (DWORD)(t[i] >> 32); }
+  return TRUE;
+}
+EXPORT BOOL WINAPI GetThreadTimes(HANDLE h, LPFILETIME creation, LPFILETIME exit_time, LPFILETIME kernel, LPFILETIME user) {
+  ULONGLONG t[4];
+  const NTSTATUS status = NtQueryInformationThread(h, 1, t, sizeof(t), NULL);
+  if (!NT_SUCCESS(status)) return fail_nt(status);
+  FILETIME *out[4] = {creation, exit_time, kernel, user};
+  for (int i = 0; i < 4; ++i) if (out[i]) { out[i]->dwLowDateTime = (DWORD)t[i]; out[i]->dwHighDateTime = (DWORD)(t[i] >> 32); }
+  return TRUE;
+}
+EXPORT BOOL WINAPI GetProcessHandleCount(HANDLE h, PDWORD count) {
+  ULONG n = 0;
+  const NTSTATUS status = NtQueryInformationProcess(h, 20, &n, sizeof(n), NULL);
+  if (!NT_SUCCESS(status)) return fail_nt(status);
+  *count = n;
+  return TRUE;
+}
+EXPORT BOOL WINAPI QueryFullProcessImageNameW(HANDLE h, DWORD flags, LPWSTR name, PDWORD size) {
+  (void)flags;
+  BYTE info[16 + 2 * (MAX_PATH * 2 + 1)];
+  const NTSTATUS status = NtQueryInformationProcess(h, 27, info, sizeof(info), NULL);
+  if (!NT_SUCCESS(status)) return fail_nt(status);
+  const DWORD n = get16(info) / 2;
+  if (n + 1 > *size) { set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+  memcpy(name, (WCHAR *)(ULONG_PTR)get64(info + 8), (n + 1) * 2);
+  *size = n;
+  return TRUE;
+}
+EXPORT BOOL WINAPI QueryFullProcessImageNameA(HANDLE h, DWORD flags, LPSTR name, PDWORD size) {
+  WCHAR wide[MAX_PATH * 2];
+  DWORD n = MAX_PATH * 2;
+  if (!QueryFullProcessImageNameW(h, flags, wide, &n)) return FALSE;
+  const DWORD got = (DWORD)WideCharToMultiByte(CP_UTF8, 0, wide, (int)n + 1, name, (int)*size, NULL, NULL);
+  if (got == 0) { set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+  *size = got - 1;
+  return TRUE;
+}
+EXPORT HANDLE WINAPI OpenProcess(DWORD access, BOOL inherit, DWORD id) {
+  (void)access;
+  OBJECT_ATTRIBUTES attributes;
+  memset(&attributes, 0, sizeof(attributes));
+  attributes.Length = sizeof(attributes);
+  attributes.Attributes = inherit ? 2 : 0;
+  ULONG64 client[2] = {id, 0};
+  HANDLE h = NULL;
+  const NTSTATUS status = NtOpenProcess(&h, 0x1FFFFF, &attributes, client);
+  if (!NT_SUCCESS(status)) { if (status == (NTSTATUS)0xC000000B) set_error(ERROR_INVALID_PARAMETER); else fail_nt(status); return NULL; }
+  return h;
+}
 /* ---- CreateProcess ----------------------------------------------------------------------------------------------------------------------------------------- */
 
 static DWORD full_path_w(LPCWSTR in, WCHAR *out, DWORD capacity);
-#define PATH_CHARS (MAX_PATH * 4)
 
 EXPORT DWORD WINAPI GetFileAttributesW(LPCWSTR path);
 EXPORT DWORD WINAPI GetCurrentDirectoryW(DWORD capacity, LPWSTR buffer);
@@ -1032,45 +1527,59 @@ static BOOL is_program_file(LPCWSTR path) {
   return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
 }
 
-/* Finds the program file for a name as CreateProcess takes it: a path as it is (".exe" added if it has no extension), a bare name in the folder of this program, the
-   current folder, C:\Windows\System32 and C:\Windows. */
-static BOOL find_program(LPCWSTR name, WCHAR *out) {
+/* Looks for a file the way CreateProcess and LoadLibrary do: a name with a path as it is; a bare name in the folder of this program, `extra` (SetDllDirectory), the folders
+   C:\Windows\System32 and C:\Windows, the current folder and then those of PATH. `extension` (".exe", ".dll") is added to a name that has none. */
+static BOOL try_candidate(LPCWSTR directory, size_t_ directory_length, LPCWSTR file, WCHAR *out) {
+  WCHAR candidate[PATH_CHARS];
+  const size_t_ f = wcslen(file);
+  if (directory_length + 1 + f + 1 > PATH_CHARS) return FALSE;
+  memcpy(candidate, directory, directory_length * 2);
+  candidate[directory_length] = '\\';
+  memcpy(candidate + directory_length + 1, file, (f + 1) * 2);
+  if (!is_program_file(candidate)) return FALSE;
+  lstrcpyW(out, candidate);
+  return TRUE;
+}
+static BOOL find_file(LPCWSTR name, LPCWSTR extension, LPCWSTR extra, WCHAR *out) {
   BOOL path_given = FALSE, has_extension = FALSE;
   for (LPCWSTR c = name; *c; ++c) {
     if (*c == '\\' || *c == '/' || *c == ':') { path_given = TRUE; has_extension = FALSE; }
     else if (*c == '.') has_extension = TRUE;
   }
   WCHAR file[MAX_PATH];
-  const size_t_ length = wcslen(name);
-  if (length == 0 || length + 5 > MAX_PATH) return FALSE;
+  const size_t_ length = wcslen(name), extension_length = wcslen(extension);
+  if (length == 0 || length + extension_length + 1 > MAX_PATH) return FALSE;
   memcpy(file, name, (length + 1) * 2);
-  if (!has_extension) { static const WCHAR exe[] = {'.', 'e', 'x', 'e', 0}; memcpy(file + length, exe, sizeof(exe)); }
+  if (!has_extension) memcpy(file + length, extension, (extension_length + 1) * 2);
   if (path_given) {
     if (full_path_w(file, out, PATH_CHARS) == 0) return FALSE;
     return is_program_file(out);
   }
   static const WCHAR system32[] = {'C', ':', '\\', 'W', 'i', 'n', 'd', 'o', 'w', 's', '\\', 'S', 'y', 's', 't', 'e', 'm', '3', '2', 0};
   static const WCHAR windows[] = {'C', ':', '\\', 'W', 'i', 'n', 'd', 'o', 'w', 's', 0};
-  WCHAR directory[PATH_CHARS], candidate[PATH_CHARS];
-  for (int where = 0; where < 4; ++where) {
-    if (where == 0) {
-      DWORD n = GetModuleFileNameW(NULL, directory, PATH_CHARS);
-      while (n > 0 && directory[n - 1] != '\\') --n;
-      if (n == 0) continue;
-      directory[n - 1] = 0;
-    } else if (where == 1) {
-      if (GetCurrentDirectoryW(PATH_CHARS, directory) == 0) continue;
-    } else {
-      lstrcpyW(directory, where == 2 ? system32 : windows);
-    }
-    const size_t_ d = wcslen(directory);
-    if (d + 1 + wcslen(file) + 1 > PATH_CHARS) continue;
-    memcpy(candidate, directory, d * 2);
-    candidate[d] = '\\';
-    memcpy(candidate + d + 1, file, (wcslen(file) + 1) * 2);
-    if (is_program_file(candidate)) { lstrcpyW(out, candidate); return TRUE; }
+  WCHAR directory[PATH_CHARS];
+  DWORD n = GetModuleFileNameW(NULL, directory, PATH_CHARS);      /* the folder of the program */
+  while (n > 0 && directory[n - 1] != '\\') --n;
+  if (n > 0 && try_candidate(directory, n - 1, file, out)) return TRUE;
+  if (extra && extra[0] && try_candidate(extra, wcslen(extra), file, out)) return TRUE;
+  if (try_candidate(system32, wcslen(system32), file, out) || try_candidate(windows, wcslen(windows), file, out)) return TRUE;
+  n = GetCurrentDirectoryW(PATH_CHARS, directory);
+  if (n > 0 && n < PATH_CHARS && try_candidate(directory, n, file, out)) return TRUE;
+  WCHAR path[8192];
+  static const WCHAR variable[] = {'P', 'A', 'T', 'H', 0};
+  n = GetEnvironmentVariableW(variable, path, 8192);
+  if (n == 0 || n >= 8192) return FALSE;
+  for (WCHAR *start = path; *start;) {
+    WCHAR *end = start;
+    while (*end && *end != ';') ++end;
+    if (end > start && (size_t_)(end - start) < PATH_CHARS && try_candidate(start, (size_t_)(end - start), file, out)) return TRUE;
+    start = *end ? end + 1 : end;
   }
   return FALSE;
+}
+static BOOL find_program(LPCWSTR name, WCHAR *out) {
+  static const WCHAR exe[] = {'.', 'e', 'x', 'e', 0};
+  return find_file(name, exe, NULL, out);
 }
 
 static void unicode_string(UNICODE_STRING *s, LPCWSTR text) {
@@ -1082,7 +1591,7 @@ static void unicode_string(UNICODE_STRING *s, LPCWSTR text) {
 
 EXPORT BOOL WINAPI CreateProcessW(LPCWSTR application, LPWSTR command_line, LPSECURITY_ATTRIBUTES process_attributes, LPSECURITY_ATTRIBUTES thread_attributes,
                                   BOOL inherit_handles, DWORD flags, LPVOID environment, LPCWSTR directory, LPSTARTUPINFOW startup, LPPROCESS_INFORMATION information) {
-  (void)process_attributes; (void)thread_attributes; (void)inherit_handles; (void)startup;
+  (void)process_attributes; (void)thread_attributes;
   if (!application && !command_line) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
   WCHAR name[MAX_PATH], image[PATH_CHARS];
   if (application) {
@@ -1110,8 +1619,17 @@ EXPORT BOOL WINAPI CreateProcessW(LPCWSTR application, LPWSTR command_line, LPSE
   }
   HANDLE process = NULL, thread = NULL;
   ULONG process_id = 0, thread_id = 0;
-  const NTSTATUS status = NtCreateUserProcess(&process, &thread, &image_name, &command, cwd_pointer, environment ? environment : GetEnvironmentStringsW(),
-                                              (flags & CREATE_SUSPENDED) ? 1 : 0, &process_id, &thread_id);
+  /* STARTF_USESTDHANDLES (0x100): the child's standard handles are the ones in the startup information (inheritable handles of this process, or the console's). */
+  ULONG nt_flags = ((flags & CREATE_SUSPENDED) ? 1 : 0) | (inherit_handles ? 2 : 0);
+  HANDLE std_in = NULL, std_out = NULL, std_err = NULL;
+  if (startup && (startup->dwFlags & 0x100)) {
+    nt_flags |= 4;
+    std_in = startup->hStdInput;
+    std_out = startup->hStdOutput;
+    std_err = startup->hStdError;
+  }
+  const NTSTATUS status = NtCreateUserProcess(&process, &thread, &image_name, &command, cwd_pointer, environment ? environment : GetEnvironmentStringsW(), nt_flags, &process_id,
+                                              &thread_id, std_in, std_out, std_err);
   if (!NT_SUCCESS(status)) {
     if (status == (NTSTATUS)0xC000007B) set_error(ERROR_BAD_EXE_FORMAT);
     else fail_nt(status);
@@ -1162,8 +1680,22 @@ EXPORT BOOL WINAPI CloseHandle(HANDLE h) {
   const NTSTATUS status = NtClose(h);
   return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
-EXPORT BOOL WINAPI GetHandleInformation(HANDLE h, LPDWORD flags) { (void)h; *flags = 0; return TRUE; }
-EXPORT BOOL WINAPI SetHandleInformation(HANDLE h, DWORD mask, DWORD flags) { (void)h; (void)mask; (void)flags; return TRUE; }
+EXPORT BOOL WINAPI GetHandleInformation(HANDLE h, LPDWORD flags) {
+  BYTE info[2];
+  const NTSTATUS status = NtQueryObject(h, 4, info, sizeof(info), NULL);      /* ObjectHandleFlagInformation */
+  if (!NT_SUCCESS(status)) return fail_nt(status);
+  *flags = (info[0] ? 1 : 0) | (info[1] ? 2 : 0);      /* HANDLE_FLAG_INHERIT, HANDLE_FLAG_PROTECT_FROM_CLOSE */
+  return TRUE;
+}
+EXPORT BOOL WINAPI SetHandleInformation(HANDLE h, DWORD mask, DWORD flags) {
+  BYTE info[2];
+  NTSTATUS status = NtQueryObject(h, 4, info, sizeof(info), NULL);
+  if (!NT_SUCCESS(status)) return fail_nt(status);
+  if (mask & 1) info[0] = (flags & 1) ? 1 : 0;
+  if (mask & 2) info[1] = (flags & 2) ? 1 : 0;
+  status = NtSetInformationObject(h, 4, info, sizeof(info));
+  return NT_SUCCESS(status) ? TRUE : fail_nt(status);
+}
 
 EXPORT BOOL WINAPI QueryPerformanceCounter(LARGE_INTEGER *counter) { LARGE_INTEGER f; return NT_SUCCESS(NtQueryPerformanceCounter(counter, &f)); }
 EXPORT BOOL WINAPI QueryPerformanceFrequency(LARGE_INTEGER *frequency) { LARGE_INTEGER c; return NT_SUCCESS(NtQueryPerformanceCounter(&c, frequency)); }
@@ -1266,7 +1798,7 @@ EXPORT DWORD WINAPI GetFileType(HANDLE h) {
   const int type = device_type(h);
   if (type < 0) { set_error(ERROR_INVALID_HANDLE); return FILE_TYPE_UNKNOWN; }
   set_error(ERROR_SUCCESS);
-  return type == 0x50 ? FILE_TYPE_CHAR : FILE_TYPE_DISK;
+  return type == 0x50 ? FILE_TYPE_CHAR : type == 0x11 ? FILE_TYPE_PIPE : FILE_TYPE_DISK;
 }
 
 EXPORT BOOL WINAPI WriteFile(HANDLE h, LPCVOID buffer, DWORD length, LPDWORD written, LPOVERLAPPED overlapped) {
@@ -1279,10 +1811,236 @@ EXPORT BOOL WINAPI WriteFile(HANDLE h, LPCVOID buffer, DWORD length, LPDWORD wri
     pointer = &offset;
   }
   if (written) *written = 0;
+  iosb.Information = 0;
   const NTSTATUS status = NtWriteFile(h, NULL, NULL, NULL, &iosb, (PVOID)buffer, length, pointer, NULL);
-  if (!NT_SUCCESS(status)) return fail_nt(status);
+  if (!NT_SUCCESS(status)) { complete_overlapped(overlapped, status, 0); return fail_nt(status); }
   if (written) *written = (DWORD)iosb.Information;
+  complete_overlapped(overlapped, status, iosb.Information);
   return TRUE;
+}
+EXPORT BOOL WINAPI GetOverlappedResult(HANDLE h, LPOVERLAPPED overlapped, LPDWORD transferred, BOOL wait) {
+  (void)h; (void)wait;      /* (the operation is finished by the time the call that started it returned) */
+  if (!overlapped) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (transferred) *transferred = (DWORD)overlapped->InternalHigh;
+  const NTSTATUS status = (NTSTATUS)(ULONG)overlapped->Internal;
+  return NT_SUCCESS(status) ? TRUE : fail_nt(status);
+}
+EXPORT BOOL WINAPI GetOverlappedResultEx(HANDLE h, LPOVERLAPPED overlapped, LPDWORD transferred, DWORD ms, BOOL alertable) { (void)ms; (void)alertable; return GetOverlappedResult(h, overlapped, transferred, TRUE); }
+
+/* ---- pipes ------------------------------------------------------------------------------------------------------------------------------------------- */
+
+EXPORT BOOL WINAPI CreatePipe(PHANDLE read, PHANDLE write, LPSECURITY_ATTRIBUTES sa, DWORD size) {
+  OBJECT_ATTRIBUTES attributes;
+  POBJECT_ATTRIBUTES pointer = NULL;
+  if (sa && sa->bInheritHandle) {
+    memset(&attributes, 0, sizeof(attributes));
+    attributes.Length = sizeof(attributes);
+    attributes.Attributes = 2;      /* OBJ_INHERIT */
+    pointer = &attributes;
+  }
+  const NTSTATUS status = NtCreatePipe(read, write, pointer, size);
+  return NT_SUCCESS(status) ? TRUE : fail_nt(status);
+}
+
+/* "\\.\pipe\name" as the NT name "\??\pipe\name". */
+static BOOL pipe_nt_name(LPCWSTR name, WCHAR *buffer, UNICODE_STRING *us, OBJECT_ATTRIBUTES *attributes, BOOL inherit) {
+  static const WCHAR prefix[] = {'\\', '\\', '.', '\\', 'p', 'i', 'p', 'e', '\\', 0};
+  static const WCHAR nt_prefix[] = {'\\', '?', '?', '\\', 'p', 'i', 'p', 'e', '\\', 0};
+  size_t_ i = 0;
+  while (prefix[i] && (name[i] == prefix[i] || (name[i] | 0x20) == (prefix[i] | 0x20))) ++i;
+  if (prefix[i]) { set_error(ERROR_INVALID_NAME); return FALSE; }
+  const size_t_ rest = wcslen(name + i);
+  if (rest > 250) { set_error(ERROR_FILENAME_EXCED_RANGE); return FALSE; }
+  memcpy(buffer, nt_prefix, 9 * 2);
+  memcpy(buffer + 9, name + i, (rest + 1) * 2);
+  us->Buffer = buffer;
+  us->Length = (USHORT)((9 + rest) * 2);
+  us->MaximumLength = (USHORT)(us->Length + 2);
+  attributes->Length = sizeof(OBJECT_ATTRIBUTES);
+  attributes->RootDirectory = NULL;
+  attributes->ObjectName = us;
+  attributes->Attributes = 0x40 | (inherit ? 2 : 0);
+  attributes->SecurityDescriptor = attributes->SecurityQualityOfService = NULL;
+  return TRUE;
+}
+
+EXPORT HANDLE WINAPI CreateNamedPipeW(LPCWSTR name, DWORD open_mode, DWORD pipe_mode, DWORD max_instances, DWORD out_size, DWORD in_size, DWORD timeout_ms, LPSECURITY_ATTRIBUTES sa) {
+  WCHAR buffer[300];
+  UNICODE_STRING us;
+  OBJECT_ATTRIBUTES attributes;
+  if (!name || !pipe_nt_name(name, buffer, &us, &attributes, sa && sa->bInheritHandle)) return INVALID_HANDLE_VALUE;
+  /* PIPE_ACCESS_INBOUND 1 (the server reads: clients may write), OUTBOUND 2, DUPLEX 3; the NT share access says what clients may do */
+  const ULONG share = (open_mode & 3) == 1 ? 2 : (open_mode & 3) == 2 ? 1 : (open_mode & 3) == 3 ? 3 : 0;
+  if (share == 0) { set_error(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE; }
+  LARGE_INTEGER timeout;
+  timeout.QuadPart = -10000ll * (timeout_ms ? timeout_ms : 50);
+  HANDLE h = NULL;
+  IO_STATUS_BLOCK iosb;
+  const NTSTATUS status = NtCreateNamedPipeFile(&h, 0xC0100000u /* GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE */, &attributes, &iosb, share, 3 /* FILE_OPEN_IF */, 0x20,
+                                                (pipe_mode & 4) ? 1 : 0, (pipe_mode & 2) ? 1 : 0, (pipe_mode & 1) ? 1 : 0, max_instances == 255 ? 0xFFFFFFFFu : max_instances,
+                                                in_size, out_size, &timeout);
+  if (!NT_SUCCESS(status)) { fail_nt(status); return INVALID_HANDLE_VALUE; }
+  return h;
+}
+EXPORT HANDLE WINAPI CreateNamedPipeA(LPCSTR name, DWORD open_mode, DWORD pipe_mode, DWORD max_instances, DWORD out_size, DWORD in_size, DWORD timeout_ms, LPSECURITY_ATTRIBUTES sa) {
+  WCHAR *w = name ? to_wide(name) : NULL;
+  if (!w) { if (name) return INVALID_HANDLE_VALUE; set_error(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE; }
+  HANDLE h = CreateNamedPipeW(w, open_mode, pipe_mode, max_instances, out_size, in_size, timeout_ms, sa);
+  free_wide(w);
+  return h;
+}
+
+#define FSCTL_PIPE_DISCONNECT_ 0x110004
+#define FSCTL_PIPE_LISTEN_ 0x110008
+#define FSCTL_PIPE_PEEK_ 0x11400C
+#define FSCTL_PIPE_WAIT_ 0x110018
+#define FSCTL_PIPE_TRANSCEIVE_ 0x11C017
+
+EXPORT BOOL WINAPI ConnectNamedPipe(HANDLE h, LPOVERLAPPED overlapped) {
+  IO_STATUS_BLOCK iosb;
+  const NTSTATUS status = NtFsControlFile(h, NULL, NULL, NULL, &iosb, FSCTL_PIPE_LISTEN_, NULL, 0, NULL, 0);
+  complete_overlapped(overlapped, status, 0);
+  return NT_SUCCESS(status) ? TRUE : fail_nt(status);
+}
+EXPORT BOOL WINAPI DisconnectNamedPipe(HANDLE h) {
+  IO_STATUS_BLOCK iosb;
+  const NTSTATUS status = NtFsControlFile(h, NULL, NULL, NULL, &iosb, FSCTL_PIPE_DISCONNECT_, NULL, 0, NULL, 0);
+  return NT_SUCCESS(status) ? TRUE : fail_nt(status);
+}
+EXPORT BOOL WINAPI PeekNamedPipe(HANDLE h, LPVOID buffer, DWORD size, LPDWORD read, LPDWORD available, LPDWORD left) {
+  IO_STATUS_BLOCK iosb;
+  BYTE stack[16 + 512];
+  BYTE *out = size <= 512 ? stack : NULL;
+  if (!out) out = RtlAllocateHeap(heap(), 0, 16 + size);
+  if (!out) { set_error(ERROR_NOT_ENOUGH_MEMORY); return FALSE; }
+  const NTSTATUS status = NtFsControlFile(h, NULL, NULL, NULL, &iosb, FSCTL_PIPE_PEEK_, NULL, 0, out, 16 + size);
+  BOOL ok = NT_SUCCESS(status);
+  if (ok) {
+    const DWORD got = (DWORD)iosb.Information > 16 ? (DWORD)iosb.Information - 16 : 0;
+    if (buffer && got) memcpy(buffer, out + 16, got);
+    if (read) *read = got;
+    if (available) *available = get32(out + 4);
+    if (left) *left = 0;
+  } else {
+    fail_nt(status);
+  }
+  if (out != stack) RtlFreeHeap(heap(), 0, out);
+  return ok;
+}
+EXPORT BOOL WINAPI TransactNamedPipe(HANDLE h, LPVOID in, DWORD in_size, LPVOID out, DWORD out_size, LPDWORD read, LPOVERLAPPED overlapped) {
+  IO_STATUS_BLOCK iosb;
+  iosb.Information = 0;
+  const NTSTATUS status = NtFsControlFile(h, NULL, NULL, NULL, &iosb, FSCTL_PIPE_TRANSCEIVE_, in, in_size, out, out_size);
+  complete_overlapped(overlapped, status, iosb.Information);
+  if (!NT_SUCCESS(status)) return fail_nt(status);
+  if (read) *read = (DWORD)iosb.Information;
+  return TRUE;
+}
+EXPORT BOOL WINAPI WaitNamedPipeW(LPCWSTR name, DWORD timeout_ms) {
+  WCHAR buffer[300];
+  UNICODE_STRING us;
+  OBJECT_ATTRIBUTES attributes;
+  if (!pipe_nt_name(name, buffer, &us, &attributes, FALSE)) return FALSE;
+  const WCHAR *leaf = buffer + 9;
+  const size_t_ n = wcslen(leaf);
+  /* the pipe folder: \??\pipe\ */
+  UNICODE_STRING folder;
+  OBJECT_ATTRIBUTES folder_attributes = attributes;
+  folder.Buffer = buffer;
+  folder.Length = 9 * 2;
+  folder.MaximumLength = 9 * 2 + 2;
+  folder_attributes.ObjectName = &folder;
+  HANDLE h = NULL;
+  IO_STATUS_BLOCK iosb;
+  NTSTATUS status = NtOpenFile(&h, 0x80100000u, &folder_attributes, &iosb, 3, 0x20);
+  if (!NT_SUCCESS(status)) return fail_nt(status);
+  BYTE request[20 + 2 * 256];
+  memset(request, 0, 20);
+  LARGE_INTEGER timeout;
+  /* NMPWAIT_USE_DEFAULT_WAIT 0 (the pipe's own), NMPWAIT_WAIT_FOREVER 0xFFFFFFFF */
+  timeout.QuadPart = timeout_ms == 0xFFFFFFFFu ? (LONGLONG)0x8000000000000000ull : -10000ll * timeout_ms;
+  memcpy(request, &timeout, 8);
+  const DWORD name_bytes = (DWORD)(n * 2);
+  memcpy(request + 8, &name_bytes, 4);
+  request[12] = timeout_ms != 0;      /* TimeoutSpecified */
+  memcpy(request + 20, leaf, n * 2);
+  status = NtFsControlFile(h, NULL, NULL, NULL, &iosb, FSCTL_PIPE_WAIT_, request, 20 + name_bytes, NULL, 0);
+  NtClose(h);
+  return NT_SUCCESS(status) ? TRUE : fail_nt(status);
+}
+EXPORT BOOL WINAPI WaitNamedPipeA(LPCSTR name, DWORD timeout_ms) {
+  WCHAR *w = name ? to_wide(name) : NULL;
+  if (!w) { if (!name) set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  const BOOL ok = WaitNamedPipeW(w, timeout_ms);
+  free_wide(w);
+  return ok;
+}
+EXPORT BOOL WINAPI CallNamedPipeW(LPCWSTR name, LPVOID in, DWORD in_size, LPVOID out, DWORD out_size, LPDWORD read, DWORD timeout_ms) {
+  HANDLE h;
+  for (;;) {
+    h = CreateFileW(name, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+    if (h != INVALID_HANDLE_VALUE) break;
+    if (GetLastError() != ERROR_PIPE_BUSY || !WaitNamedPipeW(name, timeout_ms)) return FALSE;
+  }
+  const BOOL ok = TransactNamedPipe(h, in, in_size, out, out_size, read, NULL);
+  const DWORD error = GetLastError();
+  CloseHandle(h);
+  if (!ok) set_error(error);
+  return ok;
+}
+EXPORT BOOL WINAPI CallNamedPipeA(LPCSTR name, LPVOID in, DWORD in_size, LPVOID out, DWORD out_size, LPDWORD read, DWORD timeout_ms) {
+  WCHAR *w = name ? to_wide(name) : NULL;
+  if (!w) { if (!name) set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  const BOOL ok = CallNamedPipeW(w, in, in_size, out, out_size, read, timeout_ms);
+  free_wide(w);
+  return ok;
+}
+EXPORT BOOL WINAPI GetNamedPipeInfo(HANDLE h, LPDWORD flags, LPDWORD out_size, LPDWORD in_size, LPDWORD max_instances) {
+  IO_STATUS_BLOCK iosb;
+  BYTE info[40];
+  const NTSTATUS status = NtQueryInformationFile(h, &iosb, info, sizeof(info), 24);      /* FilePipeLocalInformation */
+  if (!NT_SUCCESS(status)) return fail_nt(status);
+  if (flags) *flags = (get32(info + 36) ? 1 : 0);      /* PIPE_SERVER_END 1 (client 0); byte type */
+  if (out_size) *out_size = get32(info + 24);
+  if (in_size) *in_size = get32(info + 16);
+  if (max_instances) *max_instances = get32(info + 8) >= 255 ? 255 : get32(info + 8);
+  return TRUE;
+}
+EXPORT BOOL WINAPI GetNamedPipeHandleStateW(HANDLE h, LPDWORD state, LPDWORD instances, LPDWORD collect, LPDWORD timeout, LPWSTR user, DWORD user_size) {
+  IO_STATUS_BLOCK iosb;
+  BYTE mode[8], info[40];
+  NTSTATUS status = NtQueryInformationFile(h, &iosb, mode, sizeof(mode), 23);      /* FilePipeInformation */
+  if (!NT_SUCCESS(status)) return fail_nt(status);
+  status = NtQueryInformationFile(h, &iosb, info, sizeof(info), 24);
+  if (!NT_SUCCESS(status)) return fail_nt(status);
+  if (state) *state = get32(mode + 4) ? 1 : 0;      /* PIPE_NOWAIT */
+  if (instances) *instances = get32(info + 12);
+  if (collect) *collect = 0;
+  if (timeout) *timeout = 0;
+  if (user && user_size) user[0] = 0;
+  return TRUE;
+}
+EXPORT BOOL WINAPI GetNamedPipeHandleStateA(HANDLE h, LPDWORD state, LPDWORD instances, LPDWORD collect, LPDWORD timeout, LPSTR user, DWORD user_size) {
+  if (user && user_size) user[0] = 0;
+  return GetNamedPipeHandleStateW(h, state, instances, collect, timeout, NULL, 0);
+}
+EXPORT BOOL WINAPI SetNamedPipeHandleState(HANDLE h, LPDWORD mode, LPDWORD collect, LPDWORD timeout) {
+  (void)collect; (void)timeout;
+  if (!mode) return TRUE;
+  IO_STATUS_BLOCK iosb;
+  BYTE info[8] = {0};
+  const DWORD completion = (*mode & 1) ? 1 : 0;      /* PIPE_NOWAIT: reads and writes fail instead of waiting */
+  memcpy(info + 4, &completion, 4);
+  const NTSTATUS status = NtSetInformationFile(h, &iosb, info, sizeof(info), 23);
+  return NT_SUCCESS(status) ? TRUE : fail_nt(status);
+}
+/* Overlapped I/O is done at once here: the OVERLAPPED is filled in as the system would, the event is set, and the call returns the result (a program that handles
+   ERROR_IO_PENDING never sees it; one that waits on the event finds it set). */
+static void complete_overlapped(LPOVERLAPPED overlapped, NTSTATUS status, ULONG_PTR bytes) {
+  if (!overlapped) return;
+  overlapped->Internal = (ULONG_PTR)(ULONG)status;
+  overlapped->InternalHigh = bytes;
+  if (overlapped->hEvent) NtSetEvent((HANDLE)((ULONG_PTR)overlapped->hEvent & ~(ULONG_PTR)1), NULL);
 }
 EXPORT BOOL WINAPI ReadFile(HANDLE h, LPVOID buffer, DWORD length, LPDWORD read, LPOVERLAPPED overlapped) {
   IO_STATUS_BLOCK iosb;
@@ -1294,10 +2052,12 @@ EXPORT BOOL WINAPI ReadFile(HANDLE h, LPVOID buffer, DWORD length, LPDWORD read,
     pointer = &offset;
   }
   if (read) *read = 0;
+  iosb.Information = 0;
   const NTSTATUS status = NtReadFile(h, NULL, NULL, NULL, &iosb, buffer, length, pointer, NULL);
-  if (status == STATUS_END_OF_FILE) return TRUE;      /* nothing more to read is not an error here */
-  if (!NT_SUCCESS(status)) return fail_nt(status);
+  if (status == STATUS_END_OF_FILE) { complete_overlapped(overlapped, status, 0); return overlapped ? (set_error(ERROR_HANDLE_EOF), FALSE) : TRUE; }      /* (an overlapped read says so) */
+  if (!NT_SUCCESS(status)) { complete_overlapped(overlapped, status, 0); return fail_nt(status); }
   if (read) *read = (DWORD)iosb.Information;
+  complete_overlapped(overlapped, status, iosb.Information);
   return TRUE;
 }
 EXPORT BOOL WINAPI WriteConsoleA(HANDLE h, LPCVOID buffer, DWORD length, LPDWORD written, LPVOID reserved) { (void)reserved; return WriteFile(h, buffer, length, written, NULL); }
@@ -1512,8 +2272,29 @@ EXPORT DWORD WINAPI GetFileAttributesA(LPCSTR path) {
   free_wide(w);
   return a;
 }
-EXPORT BOOL WINAPI SetFileAttributesW(LPCWSTR path, DWORD attributes) { (void)attributes; return GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES; }
-EXPORT BOOL WINAPI SetFileAttributesA(LPCSTR path, DWORD attributes) { (void)attributes; return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES; }
+/* The read-only attribute is the one a file system here keeps; the others (hidden, system, archive) are accepted and not stored. */
+EXPORT BOOL WINAPI SetFileAttributesW(LPCWSTR path, DWORD attributes) {
+  WCHAR buffer[PATH_CHARS + 8];
+  UNICODE_STRING name;
+  OBJECT_ATTRIBUTES object;
+  if (!nt_name(path, buffer, &name, &object)) return FALSE;
+  HANDLE h = NULL;
+  IO_STATUS_BLOCK iosb;
+  NTSTATUS status = NtOpenFile(&h, 0x100 | 0x00100000 /* FILE_WRITE_ATTRIBUTES | SYNCHRONIZE */, &object, &iosb, 7, 0x20 /* FILE_SYNCHRONOUS_IO_NONALERT */);
+  if (!NT_SUCCESS(status)) return fail_nt(status);
+  BYTE basic[40] = {0};
+  DWORD value = (attributes & (FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_DIRECTORY)) ? attributes & FILE_ATTRIBUTE_READONLY : 0x80;      /* (0 would mean no change: NORMAL clears) */
+  memcpy(basic + 32, &value, 4);
+  status = NtSetInformationFile(h, &iosb, basic, sizeof(basic), 4);
+  NtClose(h);
+  return NT_SUCCESS(status) ? TRUE : fail_nt(status);
+}
+EXPORT BOOL WINAPI SetFileAttributesA(LPCSTR path, DWORD attributes) {
+  WCHAR *w = to_wide(path);
+  const BOOL ok = w ? SetFileAttributesW(w, attributes) : FALSE;
+  free_wide(w);
+  return ok;
+}
 
 EXPORT BOOL WINAPI SetCurrentDirectoryW(LPCWSTR path) {
   WCHAR full[PATH_CHARS];
@@ -1592,7 +2373,7 @@ EXPORT DWORD WINAPI GetTempPathA(DWORD capacity, LPSTR buffer) {
 #define FILE_LIST_DIRECTORY_ 1
 
 EXPORT HANDLE WINAPI CreateFileW(LPCWSTR path, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD disposition, DWORD flags, HANDLE template_file) {
-  (void)sa; (void)template_file;
+  (void)template_file;
   if (!path) { set_error(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE; }
   /* The console by its device names. */
   if (equals_ignore_case(path, (const WCHAR *)L"CONOUT$")) return GetStdHandle(STD_OUTPUT_HANDLE);
@@ -1600,7 +2381,18 @@ EXPORT HANDLE WINAPI CreateFileW(LPCWSTR path, DWORD access, DWORD share, LPSECU
   WCHAR buffer[PATH_CHARS + 8];
   UNICODE_STRING name;
   OBJECT_ATTRIBUTES attributes;
-  if (!nt_name(path, buffer, &name, &attributes)) return INVALID_HANDLE_VALUE;
+  const BOOL is_pipe = (path[0] == '\\' || path[0] == '/') && (path[1] == '\\' || path[1] == '/') && path[2] == '.' && (path[3] == '\\' || path[3] == '/') && (path[4] | 0x20) == 'p' &&
+                       (path[5] | 0x20) == 'i' && (path[6] | 0x20) == 'p' && (path[7] | 0x20) == 'e' && (path[8] == '\\' || path[8] == '/' || path[8] == 0);      /* \\.\pipe\ */
+  if (is_pipe) {
+    WCHAR normal[300];
+    size_t_ i = 0;
+    for (; path[i] && i < 299; ++i) normal[i] = path[i] == '/' ? '\\' : path[i];
+    normal[i] = 0;
+    if (!pipe_nt_name(normal, buffer, &name, &attributes, FALSE)) return INVALID_HANDLE_VALUE;
+  } else if (!nt_name(path, buffer, &name, &attributes)) {
+    return INVALID_HANDLE_VALUE;
+  }
+  if (sa && sa->bInheritHandle) attributes.Attributes |= 2;      /* OBJ_INHERIT */
   ULONG nt_disposition;
   switch (disposition) {
     case CREATE_NEW: nt_disposition = FILE_CREATE_; break;
@@ -1719,7 +2511,15 @@ EXPORT BOOL WINAPI GetFileTime(HANDLE h, LPFILETIME created, LPFILETIME accessed
   if (written) memcpy(written, basic + 16, 8);
   return TRUE;
 }
-EXPORT BOOL WINAPI SetFileTime(HANDLE h, const FILETIME *c, const FILETIME *a, const FILETIME *w) { (void)h; (void)c; (void)a; (void)w; return TRUE; }
+EXPORT BOOL WINAPI SetFileTime(HANDLE h, const FILETIME *c, const FILETIME *a, const FILETIME *w) {
+  IO_STATUS_BLOCK iosb;
+  BYTE basic[40] = {0};
+  if (c) memcpy(basic, c, 8);
+  if (a) memcpy(basic + 8, a, 8);      /* (no file system here keeps an access time: ignored) */
+  if (w) memcpy(basic + 16, w, 8);
+  const NTSTATUS status = NtSetInformationFile(h, &iosb, basic, sizeof(basic), 4);
+  return NT_SUCCESS(status) ? TRUE : fail_nt(status);
+}
 EXPORT BOOL WINAPI GetFileAttributesExW(LPCWSTR path, int level, LPVOID data) {
   if (level != 0) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
   WCHAR buffer[PATH_CHARS + 8];
@@ -1742,6 +2542,12 @@ EXPORT BOOL WINAPI GetFileAttributesExW(LPCWSTR path, int level, LPVOID data) {
   out->nFileSizeLow = *(DWORD *)(info + 40);
   out->nFileSizeHigh = *(DWORD *)(info + 44);
   return TRUE;
+}
+EXPORT BOOL WINAPI GetFileAttributesExA(LPCSTR path, int level, LPVOID data) {
+  WCHAR *w = to_wide(path);
+  const BOOL ok = w ? GetFileAttributesExW(w, level, data) : FALSE;
+  free_wide(w);
+  return ok;
 }
 EXPORT DWORD WINAPI GetFinalPathNameByHandleW(HANDLE h, LPWSTR buffer, DWORD capacity, DWORD flags) {
   (void)flags;
@@ -2108,3 +2914,6 @@ EXPORT BOOL WINAPI DllMain(HANDLE module, DWORD reason, PVOID reserved) {
   (void)module; (void)reserved; (void)reason;
   return TRUE;
 }
+
+#include "extra.inc"
+#include "extra2.inc"

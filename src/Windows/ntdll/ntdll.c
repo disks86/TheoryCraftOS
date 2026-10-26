@@ -33,13 +33,16 @@ __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");
 /* The service stubs: "mov r10, rcx; mov eax, number; syscall; ret". Arguments past the fourth stay on the stack where the caller put them. */
 #define NT_SERVICE(name)                                                                                                                                      \
   __asm__(".text\n.globl " #name "\n" #name ":\n mov %rcx, %r10\n mov $" _STR(NT_SERVICE_##name) ", %eax\n syscall\n ret\n.section .drectve\n.ascii \" -export:" #name "\"\n.text\n")
+/* The services that can end with STATUS_USER_APC are called through wrappers below that run the queued APCs first; these are the bare stubs. */
+#define NT_SERVICE_RAW(name)                                                                                                                                  \
+  __asm__(".text\n.globl Raw" #name "\nRaw" #name ":\n mov %rcx, %r10\n mov $" _STR(NT_SERVICE_##name) ", %eax\n syscall\n ret\n.text\n")
 #define _STR(x) _STR2(x)
 #define _STR2(x) #x
 NT_SERVICE(NtReadFile);
 NT_SERVICE(NtWriteFile);
 NT_SERVICE(NtCreateThreadEx);
 NT_SERVICE(NtTerminateThread);
-NT_SERVICE(NtWaitForSingleObject);
+NT_SERVICE_RAW(NtWaitForSingleObject);
 NT_SERVICE(NtResumeThread);
 NT_SERVICE(NtQueryInformationThread);
 NT_SERVICE(NtCreateEvent);
@@ -53,16 +56,47 @@ NT_SERVICE(NtReleaseMutant);
 NT_SERVICE(NtCreateSemaphore);
 NT_SERVICE(NtOpenSemaphore);
 NT_SERVICE(NtReleaseSemaphore);
-NT_SERVICE(NtWaitForMultipleObjects);
+NT_SERVICE_RAW(NtWaitForMultipleObjects);
 NT_SERVICE(NtDuplicateObject);
 NT_SERVICE(NtSuspendThread);
 NT_SERVICE(NtGetContextThread);
 NT_SERVICE(NtSetContextThread);
 NT_SERVICE(NtCreateUserProcess);
+NT_SERVICE(NtQueueApcThread);
+NT_SERVICE(NtDequeueApc);
+NT_SERVICE_RAW(NtSignalAndWaitForSingleObject);
+NT_SERVICE(NtCreateTimer);
+NT_SERVICE(NtOpenTimer);
+NT_SERVICE(NtSetTimer);
+NT_SERVICE(NtCancelTimer);
+NT_SERVICE(NtQueryTimer);
+NT_SERVICE(NtQueryTimerResolution);
+NT_SERVICE(NtSetTimerResolution);
+NT_SERVICE(NtOpenThread);
+NT_SERVICE(NtOpenProcess);
+NT_SERVICE(NtCreateSection);
+NT_SERVICE(NtOpenSection);
+NT_SERVICE(NtMapViewOfSection);
+NT_SERVICE(NtUnmapViewOfSection);
+NT_SERVICE(NtFlushVirtualMemory);
+NT_SERVICE(NtLockFile);
+NT_SERVICE(NtUnlockFile);
+NT_SERVICE(NtQuerySystemInformation);
+NT_SERVICE(NtSetInformationThread);
+NT_SERVICE(NtSetInformationProcess);
+NT_SERVICE(NtGetCurrentProcessorNumber);
+NT_SERVICE(NtLoadModule);
+NT_SERVICE(NtUnloadModule);
+NT_SERVICE(NtReleaseModule);
+NT_SERVICE(NtQueryObject);
+NT_SERVICE(NtSetInformationObject);
+NT_SERVICE(NtCreatePipe);
+NT_SERVICE(NtCreateNamedPipeFile);
+NT_SERVICE(NtFsControlFile);
 NT_SERVICE(NtClose);
 NT_SERVICE(NtTerminateProcess);
 NT_SERVICE(NtYieldExecution);
-NT_SERVICE(NtDelayExecution);
+NT_SERVICE_RAW(NtDelayExecution);
 NT_SERVICE(NtQuerySystemTime);
 NT_SERVICE(NtAllocateVirtualMemory);
 NT_SERVICE(NtFreeVirtualMemory);
@@ -213,6 +247,30 @@ EXPORT ULONG NTAPI RtlNtStatusToDosError(NTSTATUS status) {
     case 0xC0000103u: return ERROR_DIRECTORY;
     case 0xC000011Fu: return ERROR_TOO_MANY_OPEN_FILES;
     case 0xC0000185u: return ERROR_IO_DEVICE;
+    case 0xC0000001u: return 31;                        /* ERROR_GEN_FAILURE */
+    case 0xC0000055u: return 33;                        /* ERROR_LOCK_VIOLATION */
+    case 0xC000007Eu: return 158;                       /* ERROR_NOT_LOCKED */
+    case 0xC0000019u: return 487;                       /* ERROR_INVALID_ADDRESS (not the start of a mapped view) */
+    case 0xC000004Eu: return ERROR_ACCESS_DENIED;       /* a view with more rights than the mapping has */
+    case 0xC000000Bu: return ERROR_INVALID_PARAMETER;   /* an id that is no process or thread */
+    case 0xC0000023u: return 122;                       /* ERROR_INSUFFICIENT_BUFFER */
+    case 0xC000004Bu: return ERROR_ACCESS_DENIED;       /* the thread is terminating */
+    case 0xC000004Cu: return 156;                       /* ERROR_SIGNAL_REFUSED (suspend count exceeded) */
+    case 0xC0000056u: return 303;                       /* ERROR_DELETE_PENDING */
+    case 0xC000007Bu: return 193;                       /* ERROR_BAD_EXE_FORMAT */
+    case 0xC00000AEu: return 231;                       /* ERROR_PIPE_BUSY */
+    case 0xC00000AFu: return 535;                       /* ERROR_PIPE_CONNECTED */
+    case 0xC00000B0u: return 233;                       /* ERROR_PIPE_NOT_CONNECTED */
+    case 0xC00000B1u: return 232;                       /* ERROR_NO_DATA (the pipe is being closed) */
+    case 0xC00000B5u: return 121;                       /* ERROR_SEM_TIMEOUT */
+    case 0xC00000BBu: return 50;                        /* ERROR_NOT_SUPPORTED */
+    case 0xC00000D9u: return 232;                       /* ERROR_NO_DATA (a non-blocking read finds nothing) */
+    case 0xC0000120u: return 1223;                      /* ERROR_CANCELLED */
+    case 0xC0000135u: return ERROR_MOD_NOT_FOUND;       /* a DLL was not found */
+    case 0xC0000139u: return ERROR_PROC_NOT_FOUND;
+    case 0xC000014Bu: return 109;                       /* ERROR_BROKEN_PIPE */
+    case 0xC0000142u: return 1114;                      /* ERROR_DLL_INIT_FAILED */
+    case 0xC0000235u: return ERROR_INVALID_HANDLE;      /* a protected handle */
     default: return (ULONG)status >= 0xC0000000u ? ERROR_MR_MID_NOT_FOUND : ERROR_INVALID_PARAMETER;
   }
 }
@@ -246,11 +304,11 @@ static void loader_unlock(void) { if (--g_loader_depth == 0) __sync_lock_release
 
 static int is_program(const LDR_DATA_TABLE_ENTRY *m) { return NtCurrentPeb()->ImageBaseAddress == m->DllBase; }
 
-static void notify_module(LDR_DATA_TABLE_ENTRY *m, DWORD reason, PVOID reserved) {
+static BOOL notify_module(LDR_DATA_TABLE_ENTRY *m, DWORD reason, PVOID reserved) {
   const int about_threads = reason == DLL_THREAD_ATTACH || reason == DLL_THREAD_DETACH;
-  if (about_threads && !is_program(m) && (m->Flags & LDRP_DONT_CALL_FOR_THREADS)) return;
+  if (about_threads && !is_program(m) && (m->Flags & LDRP_DONT_CALL_FOR_THREADS)) return TRUE;
   const BYTE *image = (const BYTE *)m->DllBase;
-  if (!image) return;
+  if (!image) return TRUE;
   const ULONG nt = *(const ULONG *)(image + 0x3C);
   const ULONG rva = *(const ULONG *)(image + nt + 24 + 0x70 + 9 * 8);      /* IMAGE_DIRECTORY_ENTRY_TLS */
   const ULONG size = *(const ULONG *)(image + nt + 24 + 0x70 + 9 * 8 + 4);
@@ -258,7 +316,8 @@ static void notify_module(LDR_DATA_TABLE_ENTRY *m, DWORD reason, PVOID reserved)
     const TlsCallback *callbacks = (const TlsCallback *)*(const ULONG64 *)(image + rva + 0x18);
     if (callbacks) for (; *callbacks; ++callbacks) (*callbacks)(m->DllBase, reason, reserved);
   }
-  if (!is_program(m) && m->EntryPoint) ((BOOL (WINAPI *)(PVOID, DWORD, PVOID))m->EntryPoint)(m->DllBase, reason, reserved);
+  if (!is_program(m) && m->EntryPoint) return ((BOOL (WINAPI *)(PVOID, DWORD, PVOID))m->EntryPoint)(m->DllBase, reason, reserved);
+  return TRUE;
 }
 
 static LDR_DATA_TABLE_ENTRY *entry_of(LIST_ENTRY *link) { return (LDR_DATA_TABLE_ENTRY *)link; }      /* (InLoadOrderLinks is the first member) */
@@ -294,6 +353,45 @@ EXPORT void NTAPI RtlExitUserThread(NTSTATUS status) {
 EXPORT void NTAPI TcosThreadStart(LPTHREAD_START_ROUTINE start, PVOID parameter) {
   notify_all_modules(DLL_THREAD_ATTACH, NULL, 1);
   RtlExitUserThread((NTSTATUS)start(parameter));
+}
+
+/* ---- APCs ------------------------------------------------------------------------------------------------------------------------------------------------ */
+
+extern NTSTATUS NTAPI RawNtWaitForSingleObject(HANDLE, BOOLEAN, PLARGE_INTEGER);
+extern NTSTATUS NTAPI RawNtWaitForMultipleObjects(ULONG, const HANDLE *, ULONG, BOOLEAN, PLARGE_INTEGER);
+extern NTSTATUS NTAPI RawNtDelayExecution(BOOLEAN, PLARGE_INTEGER);
+extern NTSTATUS NTAPI RawNtSignalAndWaitForSingleObject(HANDLE, HANDLE, BOOLEAN, PLARGE_INTEGER);
+
+/* Calls the APCs queued for this thread, oldest first; how many there were. An APC may queue more or wait alertably itself. */
+static ULONG run_apcs(void) {
+  ULONG count = 0;
+  ULONG64 apc[4];
+  while (NtDequeueApc(apc) == STATUS_SUCCESS) {
+    ((void (NTAPI *)(ULONG_PTR, ULONG_PTR, ULONG_PTR))apc[0])((ULONG_PTR)apc[1], (ULONG_PTR)apc[2], (ULONG_PTR)apc[3]);
+    ++count;
+  }
+  return count;
+}
+EXPORT NTSTATUS NTAPI NtTestAlert(void) { return run_apcs() ? STATUS_ALERTED : STATUS_SUCCESS; }
+EXPORT NTSTATUS NTAPI NtWaitForSingleObject(HANDLE h, BOOLEAN alertable, PLARGE_INTEGER timeout) {
+  const NTSTATUS status = RawNtWaitForSingleObject(h, alertable, timeout);
+  if (status == STATUS_USER_APC) run_apcs();
+  return status;
+}
+EXPORT NTSTATUS NTAPI NtWaitForMultipleObjects(ULONG count, const HANDLE *handles, ULONG type, BOOLEAN alertable, PLARGE_INTEGER timeout) {
+  const NTSTATUS status = RawNtWaitForMultipleObjects(count, handles, type, alertable, timeout);
+  if (status == STATUS_USER_APC) run_apcs();
+  return status;
+}
+EXPORT NTSTATUS NTAPI NtDelayExecution(BOOLEAN alertable, PLARGE_INTEGER interval) {
+  const NTSTATUS status = RawNtDelayExecution(alertable, interval);
+  if (status == STATUS_USER_APC) run_apcs();
+  return status;
+}
+EXPORT NTSTATUS NTAPI NtSignalAndWaitForSingleObject(HANDLE signal, HANDLE wait, BOOLEAN alertable, PLARGE_INTEGER timeout) {
+  const NTSTATUS status = RawNtSignalAndWaitForSingleObject(signal, wait, alertable, timeout);
+  if (status == STATUS_USER_APC) run_apcs();
+  return status;
 }
 
 /* ---- strings ------------------------------------------------------------------------------------------------------------------------------------------- */
@@ -652,6 +750,138 @@ EXPORT void NTAPI RtlUserThreadStart(ProgramEntry entry, PVOID parameter) {
     loader_unlock();
   }
   RtlExitUserProcess((NTSTATUS)entry(parameter));
+}
+
+/* ---- libraries loaded after start-up (LoadLibrary, FreeLibrary) ------------------------------------------------------------------------------------- */
+
+typedef struct { ULONG64 base, size, entry; char name[40]; } LoadRecord;      /* what NtLoadModule and NtReleaseModule report */
+#define LDR_STATIC 0xFFFF
+#define MAX_LOAD_RECORDS 32
+#define STATUS_DLL_NOT_FOUND ((NTSTATUS)0xC0000135)
+#define STATUS_DLL_INIT_FAILED ((NTSTATUS)0xC0000142)
+
+static LDR_DATA_TABLE_ENTRY *ldr_find_base(PVOID base) {
+  PEB_LDR_DATA *ldr = NtCurrentPeb()->Ldr;
+  for (LIST_ENTRY *e = ldr->InLoadOrderModuleList.Flink; e != &ldr->InLoadOrderModuleList; e = e->Flink) if (entry_of(e)->DllBase == base) return entry_of(e);
+  return NULL;
+}
+static void ldr_append(LIST_ENTRY *head, LIST_ENTRY *e) {
+  e->Flink = head;
+  e->Blink = head->Blink;
+  head->Blink->Flink = e;
+  head->Blink = e;
+}
+static void ldr_remove(LIST_ENTRY *e) {
+  e->Blink->Flink = e->Flink;
+  e->Flink->Blink = e->Blink;
+}
+
+/* A loader entry for a library the kernel mapped: listed in the three module lists. `path` (a UNICODE_STRING) is the file the program asked for; a library that came in
+ * because another imports it is in C:\Windows\System32. */
+static LDR_DATA_TABLE_ENTRY *ldr_add(const LoadRecord *record, const UNICODE_STRING *path) {
+  static const WCHAR system32[] = {'C', ':', '\\', 'W', 'i', 'n', 'd', 'o', 'w', 's', '\\', 'S', 'y', 's', 't', 'e', 'm', '3', '2', '\\', 0};
+  size_t_ base_length = strlen(record->name);
+  size_t_ full_length = path ? path->Length / 2 : 20 + base_length;
+  if (path) {      /* the file name at the end of the path is the library's name */
+    size_t_ i = full_length;
+    while (i > 0 && path->Buffer[i - 1] != '\\' && path->Buffer[i - 1] != '/') --i;
+    base_length = full_length - i;
+  }
+  const SIZE_T bytes = sizeof(LDR_DATA_TABLE_ENTRY) + (full_length + 1) * 2;
+  LDR_DATA_TABLE_ENTRY *e = RtlAllocateHeap(process_heap(), HEAP_ZERO_MEMORY, bytes);
+  if (!e) return NULL;
+  WCHAR *full = (WCHAR *)(e + 1);
+  if (path) {
+    memcpy(full, path->Buffer, full_length * 2);
+  } else {
+    memcpy(full, system32, 20 * 2);
+    for (size_t_ i = 0; i < base_length; ++i) full[20 + i] = (WCHAR)(BYTE)record->name[i];
+  }
+  full[full_length] = 0;
+  e->DllBase = (PVOID)(ULONG_PTR)record->base;
+  e->EntryPoint = (PVOID)(ULONG_PTR)record->entry;
+  e->SizeOfImage = (ULONG)record->size;
+  e->FullDllName.Buffer = full;
+  e->FullDllName.Length = (USHORT)(full_length * 2);
+  e->FullDllName.MaximumLength = (USHORT)(full_length * 2 + 2);
+  e->BaseDllName.Buffer = full + (full_length - base_length);
+  e->BaseDllName.Length = (USHORT)(base_length * 2);
+  e->BaseDllName.MaximumLength = (USHORT)(base_length * 2 + 2);
+  e->Flags = 0x4;      /* LDRP_IMAGE_DLL */
+  e->LoadCount = 1;
+  PEB_LDR_DATA *ldr = NtCurrentPeb()->Ldr;
+  ldr_append(&ldr->InLoadOrderModuleList, &e->InLoadOrderLinks);
+  ldr_append(&ldr->InMemoryOrderModuleList, &e->InMemoryOrderLinks);
+  ldr_append(&ldr->InInitializationOrderModuleList, &e->InInitializationOrderLinks);
+  return e;
+}
+static void ldr_forget(LDR_DATA_TABLE_ENTRY *e) {
+  ldr_remove(&e->InLoadOrderLinks);
+  ldr_remove(&e->InMemoryOrderLinks);
+  ldr_remove(&e->InInitializationOrderLinks);
+  RtlFreeHeap(process_heap(), 0, e);
+}
+
+/* One use less of the library at `base`; what nobody uses any more is told about it (`detach`), taken out of the lists and unmapped. Loader lock held. */
+static void ldr_release(PVOID base, int detach) {
+  LoadRecord doomed[MAX_LOAD_RECORDS];
+  ULONG count = 0;
+  if (!NT_SUCCESS(NtReleaseModule(base, doomed, MAX_LOAD_RECORDS, &count))) return;
+  for (ULONG i = 0; detach && i < count; ++i) {
+    LDR_DATA_TABLE_ENTRY *e = ldr_find_base((PVOID)(ULONG_PTR)doomed[i].base);
+    if (e) notify_module(e, DLL_PROCESS_DETACH, NULL);
+  }
+  for (ULONG i = 0; i < count; ++i) {
+    LDR_DATA_TABLE_ENTRY *e = ldr_find_base((PVOID)(ULONG_PTR)doomed[i].base);
+    if (e) ldr_forget(e);
+  }
+  for (ULONG i = 0; i < count; ++i) NtUnloadModule((PVOID)(ULONG_PTR)doomed[i].base);
+}
+
+/* Loads the DLL file at `name` (a Win32 path; or just a library's name when it is loaded already) and what it imports; calls the entry points. */
+EXPORT NTSTATUS NTAPI LdrLoadDll(PWSTR search_path, PULONG flags, PUNICODE_STRING name, PVOID *handle) {
+  (void)search_path; (void)flags;
+  LoadRecord records[MAX_LOAD_RECORDS];
+  ULONG count = 0;
+  PVOID base = NULL;
+  loader_lock();
+  NTSTATUS status = NtLoadModule(name, &base, records, MAX_LOAD_RECORDS, &count);
+  if (!NT_SUCCESS(status)) { loader_unlock(); return status; }
+  if (count == 0) {      /* it was there: one more use (or a library the process started with) */
+    *handle = base;
+    loader_unlock();
+    return STATUS_SUCCESS;
+  }
+  LDR_DATA_TABLE_ENTRY *added[MAX_LOAD_RECORDS];
+  ULONG listed = 0;
+  for (; listed < count; ++listed) {
+    added[listed] = ldr_add(&records[listed], records[listed].base == (ULONG64)(ULONG_PTR)base ? name : NULL);
+    if (!added[listed]) break;
+  }
+  ULONG attached = 0;
+  if (listed == count) {
+    for (; attached < count; ++attached) if (!notify_module(added[attached], DLL_PROCESS_ATTACH, NULL)) break;
+  }
+  if (listed == count && attached == count) {
+    *handle = base;
+    loader_unlock();
+    return STATUS_SUCCESS;
+  }
+  /* it did not start: the libraries that did are told, then everything goes again */
+  for (ULONG i = attached; i > 0; --i) notify_module(added[i - 1], DLL_PROCESS_DETACH, NULL);
+  ldr_release(base, 0);
+  loader_unlock();
+  return listed == count ? STATUS_DLL_INIT_FAILED : STATUS_NO_MEMORY;
+}
+
+EXPORT NTSTATUS NTAPI LdrUnloadDll(PVOID base) {
+  loader_lock();
+  LDR_DATA_TABLE_ENTRY *e = ldr_find_base(base);
+  NTSTATUS status = STATUS_SUCCESS;
+  if (!e) status = STATUS_DLL_NOT_FOUND;
+  else if (e->LoadCount != LDR_STATIC) ldr_release(base, 1);
+  loader_unlock();
+  return status;
 }
 
 /* ntdll's own entry point: nothing to set up (the heap is made when first used). */

@@ -56,6 +56,9 @@
 #include "Network/Smb/SmbVolume.hpp"
 #include "Crypto/Random.hpp"
 #include "Kernel/Thread.hpp"
+#if defined(__x86_64__)
+#include "Kernel/UserMode.hpp"
+#endif
 #include "Audio/AudioCaptureHub.hpp"
 #include "Audio/AudioMixer.hpp"
 #include "Audio/AudioRouter.hpp"
@@ -362,6 +365,15 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     return efi::kBufferTooSmall;
   }
   allocators::Allocator allocator(ram);
+#if defined(__x86_64__)
+  kernel::usermode::set_memory_source(
+      [](void* context, uint64_t* total_bytes, uint64_t* free_bytes) {      // (what Windows programs are told about the machine's memory)
+        const allocators::Allocator& heap = *static_cast<const allocators::Allocator*>(context);
+        *total_bytes = heap.total_bytes();
+        *free_bytes = heap.free_bytes();
+      },
+      &allocator);
+#endif
   if (!allocator.initialize()) {
     Entry(Level::Fault, "Allocator").text("initialization failed");
     return efi::kBufferTooSmall;
