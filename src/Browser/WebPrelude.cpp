@@ -3549,6 +3549,10 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
         seen.push(v);
         return { $: 'p', i: v.__id };
       }
+      if (v.__wasm_kind !== undefined) {
+        if (v.__wasm_kind === 'module' && typeof __wasm_module_bytes === 'function') { seen.push(v); return { $: 'wm', b: btoa(__bytes_to_string(__wasm_module_bytes(v))) }; }
+        throw dataCloneError('#<' + (v.constructor && v.constructor.name ? v.constructor.name : 'Object') + '> could not be cloned.');
+      }
       if (v instanceof Node || v === g || v instanceof Event || v instanceof Headers || v instanceof Request || v instanceof Response || v instanceof XMLHttpRequest ||
           v instanceof AbortSignal || v instanceof URL || v instanceof URLSearchParams) throw dataCloneError('#<' + (v.constructor && v.constructor.name ? v.constructor.name : 'Object') + '> could not be cloned.');
       seen.push(v);
@@ -3599,6 +3603,7 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
         case 'b': out = new Blob([atob(e.b)], { type: e.t }); objs.push(out); return out;
         case 'f': out = new File([atob(e.b)], e.n, { type: e.t, lastModified: e.m }); objs.push(out); return out;
         case 'u8': out = __string_to_bytes(atob(e.b)); objs.push(out); return out;
+        case 'wm': out = new g.WebAssembly.Module(__string_to_bytes(atob(e.b))); objs.push(out); return out;
         case 'ab': out = __string_to_bytes(atob(e.b)).buffer; objs.push(out); return out;
         case 'ta': out = new g[e.k](__string_to_bytes(atob(e.b)).buffer); objs.push(out); return out;
         case 'dv': out = new DataView(__string_to_bytes(atob(e.b)).buffer); objs.push(out); return out;
@@ -10662,7 +10667,13 @@ const char kWebAssemblyPrelude[] = R"JSPRELUDE((function (g) {
       if (!(this instanceof Module)) throw new TypeError("WebAssembly.Module must be invoked with 'new'");
       if (arguments.length < 1) throw new TypeError('WebAssembly.Module(): Argument 0 must be a buffer source');
       waNew(this, Module, 'module', __wasm_compile(bytes, 'WebAssembly.Module()'), 'Module');
+      waKeep(this, bytes);
     }
+    var waKeep = function (m, src) {
+      var u = src instanceof ArrayBuffer ? new Uint8Array(src.slice(0)) : new Uint8Array(src.buffer.slice(src.byteOffset, src.byteOffset + src.byteLength));
+      Object.defineProperty(m, '__wasm_src', { value: u });
+    };
+    hide(g, '__wasm_module_bytes', function (v) { return waIs(v, 'module') ? v.__wasm_src : null; });
     var needModule = function (m, api) { if (!waIs(m, 'module')) throw new TypeError(api + ': Argument 0 must be a WebAssembly.Module'); };
     Module.imports = function (m) {
       needModule(m, 'WebAssembly.Module.imports()');
@@ -10685,7 +10696,7 @@ const char kWebAssemblyPrelude[] = R"JSPRELUDE((function (g) {
       if (!(this instanceof Instance)) throw new TypeError("WebAssembly.Instance must be invoked with 'new'");
       var id = waInstantiate(module, importObject, 'WebAssembly.Instance()');
       waNew(this, Instance, 'instance', id, 'Instance');
-      Object.defineProperty(this, 'exports', { value: waExports(id), enumerable: true, configurable: true });
+      Object.defineProperty(this, '__wasm_exports', { value: waExports(id) });
     }
     var waInstantiate = function (module, importObject, api) {
       if (!waIs(module, 'module')) throw new TypeError(api + ': Argument 0 must be a WebAssembly.Module');
@@ -10712,6 +10723,7 @@ const char kWebAssemblyPrelude[] = R"JSPRELUDE((function (g) {
       });
       return Object.freeze(out);
     };
+    Object.defineProperty(Instance.prototype, 'exports', { get: function () { if (!waIs(this, 'instance')) throw new TypeError('Receiver is not a WebAssembly.Instance'); return this.__wasm_exports; }, enumerable: true, configurable: true });
     waTag(Instance, 'WebAssembly.Instance');
     waDefine('Instance', Instance);
 
@@ -10831,6 +10843,7 @@ const char kWebAssemblyPrelude[] = R"JSPRELUDE((function (g) {
         var m = Object.create(Module.prototype);
         Object.defineProperty(m, '__wasm_kind', { value: 'module' });
         Object.defineProperty(m, '__wasm_id', { value: __wasm_compile(bytes, 'WebAssembly.compile()') });
+        waKeep(m, bytes);
         return m;
       });
     });
@@ -10839,15 +10852,16 @@ const char kWebAssemblyPrelude[] = R"JSPRELUDE((function (g) {
         if (waIs(source, 'module')) {
           var id = waInstantiate(source, importObject, 'WebAssembly.instantiate()');
           var inst = waWrap(Instance.prototype, 'instance', id);
-          Object.defineProperty(inst, 'exports', { value: waExports(id), enumerable: true, configurable: true });
+          Object.defineProperty(inst, '__wasm_exports', { value: waExports(id) });
           return inst;
         }
         var module = Object.create(Module.prototype);
         Object.defineProperty(module, '__wasm_kind', { value: 'module' });
         Object.defineProperty(module, '__wasm_id', { value: __wasm_compile(source, 'WebAssembly.instantiate()') });
+        waKeep(module, source);
         var iid = waInstantiate(module, importObject, 'WebAssembly.instantiate()');
         var instance = waWrap(Instance.prototype, 'instance', iid);
-        Object.defineProperty(instance, 'exports', { value: waExports(iid), enumerable: true, configurable: true });
+        Object.defineProperty(instance, '__wasm_exports', { value: waExports(iid) });
         return { module: module, instance: instance };
       });
     });
@@ -10866,6 +10880,12 @@ const char kWebAssemblyPrelude[] = R"JSPRELUDE((function (g) {
     waDefine('instantiateStreaming', function instantiateStreaming(source, importObject) {
       return streamed(source, 'WebAssembly.instantiateStreaming()').then(function (bytes) { return WA.instantiate(bytes, importObject); });
     });
+    // the shapes the IDL gives the interfaces: errors derive from the Error constructor, prototypes are read-only, the lengths are the required arguments
+    ['CompileError', 'LinkError', 'RuntimeError'].forEach(function (n) { Object.setPrototypeOf(WA[n], Error); });
+    ['Module', 'Instance', 'Memory', 'Table', 'Global', 'Tag', 'Exception'].forEach(function (n) { Object.defineProperty(WA[n], 'prototype', { writable: false }); });
+    var waLength = function (f, n) { Object.defineProperty(f, 'length', { value: n, configurable: true }); };
+    waLength(WA.Instance, 1); waLength(WA.Table, 1); waLength(WA.Global, 1); waLength(WA.instantiate, 1); waLength(WA.Table.prototype.set, 1); waLength(WA.Table.prototype.grow, 1);
+    ['validate', 'compile', 'instantiate', 'compileStreaming', 'instantiateStreaming'].forEach(function (n) { Object.defineProperty(WA, n, { enumerable: true }); });
     waTag(WA, 'WebAssembly');
     hide(g, 'WebAssembly', WA);
   }
