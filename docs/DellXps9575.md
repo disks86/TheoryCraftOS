@@ -90,9 +90,20 @@ restarted. The host data path is flushed before the write pointer is published. 
 a stalled engine, a dead one, every bad argument, and the order of the flush and the pointer; moving the fence words, dropping the padding, using the wrong ring's registers or flushing after the pointer each fails it) and
 `check_vce3_port.py vce_v3_0.c amdgpu_vce.c` confirms the job's commands, the ring test and the pointer registers against the driver.
 
-Not there, and needed before a Vega M encodes anything: the encode messages (Mesa's `radeon_vce.c` and `radeon_vce_52.c`: session, create, rate control, picture control, the feedback), an `IVideoEncoder` session on
-top, a self-test (the engine's bitstream has to decode with the CPU decoder to something close to the picture that went in), the memory planning and the PCI plumbing (as `AmdGmc8Memory` and `AmdUvd6VideoEngine` do for
-the UVD), and the SMC's power and clock requests. Not run on a Vega M.
+The task commands: `AmdVce3Messages` builds what the firmware reads from the indirect buffer (the command set of Mesa's `radeon_vce_52.c`, for firmware 52 and later): blocks of dwords - size in bytes, command id, fields -
+for the session, the task info, create, destroy, the configuration (rate control, motion estimation, rdo, picture control, config extension) and, for one picture, the coded picture buffer, the bitstream buffer, the encode block
+(98 dwords: input addresses and pitches, picture type, reference lists, the group-of-pictures counters) and the feedback buffer, with 64-bit addresses high dword first and the offset that chains several encode tasks. The values
+are those Mesa uses for a card like the Vega M (not "dual pipe", one instance), with a linear NV12 input and a coded picture buffer laid out as `si_vce_frame_offset` does before Vega 10 (`picture_layout`,
+`cpb_slot_count`, `cpb_bytes`). Not built: the VUI block, B pictures' own picture-structure variants, intra refresh and adaptive quantisation. `tests/AmdVce3MessagesTest.cpp` has every block's size, id and fields at the dwords they
+must be at (counted from Mesa's source, apart from the code), P and B pictures, the chain of tasks, the buffer arithmetic, the feedback and the writer's bounds; swapping the input addresses, inverting the header insertion, or
+changing the chain offset or the height in quad words each fails it. `scripts/check_vce3_messages.py radeon_vce.h radeon_vce_52.c` confirms that the five field blocks have Mesa's fields in Mesa's order, both as declared and as
+written.
+
+The encode session: `AmdVce3Encoder` is an `IVideoEncoder` (H.264 Baseline, I420/NV12/BGRA input) on top of the ring and the messages. `prepare()` validates the configuration, leases the work memory (one session at a time) and lays out the input picture, the coded picture buffer, the bitstream and feedback buffers; the first picture opens the session (session, create, configuration, feedback). Each picture is converted to limited-range NV12 at the layout's pitch, an IDR at every keyframe interval and a P picture (reference: the previous picture, in the next CPB slot) otherwise, with `frame_num` restarting at each IDR and the order count 2 * `frame_num` (the POC field is made wide, 8 bits, for long groups). One picture is held until `receive()`. A job that never finishes wedges the ring and every later picture is refused; a missing bitstream refuses only that picture. The destructor destroys the engine's session. `tests/AmdVce3EncoderTest.cpp` runs it against a ring controller plus a firmware stand-in that checks the task blocks and encodes with the CPU H.264 encoder; the packets decode with the CPU decoder to within 28 dB of the source. Assumptions not checkable without hardware: the POC field width, the meaning of the intra/P remaining counters, the QP mapping, and that the firmware writes the access unit at offset 0 of the bitstream buffer.
+
+Not there, and needed before a Vega M encodes anything: an `IVideoEncoder` session on top (memory for the buffers, the input picture upload, one task per picture through the ring, the feedback read back), a self-test (the
+engine's bitstream has to decode with the CPU decoder to something close to the picture that went in), the memory planning and the PCI plumbing (as `AmdGmc8Memory` and `AmdUvd6VideoEngine` do for the UVD), and the SMC's power and
+clock requests. Not run on a Vega M.
 
 ## Textures in the graphics device API
 
