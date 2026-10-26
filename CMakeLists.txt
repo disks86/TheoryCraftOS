@@ -622,6 +622,9 @@ add_executable(BOOTX64
   src/Hardware/VideoCodec/AMD/AmdIpDiscovery.cpp
   src/Hardware/VideoCodec/AMD/AmdVcnFirmware.cpp
   src/Hardware/VideoCodec/AMD/AmdVcn1.cpp
+  src/Hardware/VideoCodec/AMD/AmdUvd6.cpp
+  src/Hardware/VideoCodec/AMD/AmdUvd6Ring.cpp
+  src/Hardware/VideoCodec/AMD/AmdGmc8Memory.cpp
   src/Hardware/VideoCodec/AMD/AmdRavenMemory.cpp
   src/Hardware/VideoCodec/AMD/AmdVcn1Ring.cpp
   src/Hardware/VideoCodec/AMD/AmdVcnAvcDecoder.cpp
@@ -759,7 +762,7 @@ if(TCOS_ARCH STREQUAL "x86_64")
   add_custom_command(OUTPUT ${WINDOWS_DIR}/kernel32.dll
     COMMAND ${CMAKE_C_COMPILER} ${WINDOWS_DLL_FLAGS} -Wl,--image-base=0x180200000 -o ${WINDOWS_DIR}/kernel32.dll
             ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.c ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.def ${WINDOWS_DIR}/libntdll.a
-    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.c ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra2.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra3.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.def ${WINDOWS_DIR}/libntdll.a ${WINDOWS_HEADERS}
+    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.c ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra2.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra3.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/console.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.def ${WINDOWS_DIR}/libntdll.a ${WINDOWS_HEADERS}
     COMMENT "Building kernel32.dll")
   add_custom_command(OUTPUT ${WINDOWS_DIR}/msvcrt.dll
     COMMAND ${CMAKE_C_COMPILER} ${WINDOWS_DLL_FLAGS} -Wno-unused-value -Wl,--image-base=0x180400000 -o ${WINDOWS_DIR}/msvcrt.dll

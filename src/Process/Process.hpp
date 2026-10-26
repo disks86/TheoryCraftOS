@@ -152,6 +152,8 @@ class IProcessHost {
   virtual bool random_bytes(ByteView out) { (void)out; return false; }
   // Optional: a program made a system call this OS does not have (for finding out what a program needs).
   virtual void unhandled_syscall(SyscallAbi abi, uint64_t number) { (void)abi; (void)number; }
+  // Optional: how many bytes of standard input could be read without waiting (a read would also return at once at the end of input or after Ctrl+C: *at_end).
+  virtual uint64_t console_input_available(bool* at_end) { *at_end = false; return 0; }
   // Optional: the process ended while one of its threads may be blocked in read_console() or sleep_ns(): make that return.
   virtual void wake_blocked() {}
 

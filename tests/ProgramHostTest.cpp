@@ -83,7 +83,10 @@ static std::string read_text(ProgramHost& host, uint64_t room, bool* ok = nullpt
 
 static void test_input() {
   ProgramHost host(A);
+  bool at_end = true;
+  CHECK(host.console_input_available(&at_end) == 0 && !at_end);          // nothing typed yet: a read would wait
   host.push_input("a\nbc\n");
+  CHECK(host.console_input_available(&at_end) == 5 && !at_end);
   CHECK(read_text(host, 64) == "a\n");                       // one line per read, like a terminal
   CHECK(read_text(host, 64) == "bc\n");
   host.push_input("xyz\n");
@@ -93,6 +96,7 @@ static void test_input() {
   host.push_input("ignored\n");
   CHECK(read_text(host, 64) == "last\n");
   bool ok = false;
+  CHECK(host.console_input_available(&at_end) == 0 && at_end);              // closed and empty: a read returns at once
   CHECK(read_text(host, 64, &ok).empty() && ok);                           // then end of file, again and again
   CHECK(read_text(host, 64).empty());
   ProgramHost second(A);

@@ -54,6 +54,11 @@ static void complete_overlapped(LPOVERLAPPED overlapped, NTSTATUS status, ULONG_
 static DWORD wait_result(NTSTATUS status);
 EXPORT BOOL WINAPI ReadFile(HANDLE h, LPVOID buffer, DWORD length, LPDWORD read, LPOVERLAPPED overlapped);
 EXPORT BOOL WINAPI WriteFile(HANDLE h, LPCVOID buffer, DWORD length, LPDWORD written, LPOVERLAPPED overlapped);
+EXPORT DWORD WINAPI GetTickCount(void);
+static BOOL console_write_hook(HANDLE h, LPCVOID buffer, DWORD length, LPDWORD written, BOOL *handled);
+static BOOL console_read_hook(HANDLE h, LPVOID buffer, DWORD length, LPDWORD read, BOOL *handled);
+static BOOL con_input_ready(void);
+static BOOL con_is_input(HANDLE h);
 static BOOL pipe_nt_name(LPCWSTR name, WCHAR *buffer, UNICODE_STRING *us, OBJECT_ATTRIBUTES *attributes, BOOL inherit);
 EXPORT HANDLE WINAPI CreateFileW(LPCWSTR path, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD disposition, DWORD flags, HANDLE template_file);
 static BOOL fail_nt(NTSTATUS status) { set_error(RtlNtStatusToDosError(status)); return FALSE; }
@@ -1339,12 +1344,33 @@ static DWORD wait_result(NTSTATUS status) {
   return WAIT_FAILED;
 }
 EXPORT DWORD WINAPI WaitForSingleObjectEx(HANDLE h, DWORD timeout_ms, BOOL alertable) {
+  if (con_is_input(h)) {      /* the console input is ready when a key event is waiting: asked again until it is */
+    const DWORD start = GetTickCount();
+    while (!con_input_ready()) {
+      if (timeout_ms != INFINITE && GetTickCount() - start >= timeout_ms) return WAIT_TIMEOUT;
+      SleepEx(5, alertable);
+    }
+    return WAIT_OBJECT_0;
+  }
   LARGE_INTEGER t;
   t.QuadPart = -(LONGLONG)timeout_ms * 10000;
   return wait_result(NtWaitForSingleObject(h, alertable != 0, timeout_ms == INFINITE ? NULL : &t));
 }
 EXPORT DWORD WINAPI WaitForMultipleObjectsEx(DWORD count, const HANDLE *handles, BOOL all, DWORD timeout_ms, BOOL alertable) {
   if (count == 0 || count > 64 || !handles) { set_error(ERROR_INVALID_PARAMETER); return WAIT_FAILED; }
+  for (DWORD i = 0; i < count && !all; ++i) {
+    if (!con_is_input(handles[i])) continue;
+    HANDLE others[64];      /* a console input among the handles: the others are asked without waiting, in turns with it */
+    DWORD index[64], n = 0;
+    for (DWORD k = 0; k < count; ++k) if (!con_is_input(handles[k])) { others[n] = handles[k]; index[n++] = k; }
+    const DWORD start = GetTickCount();
+    for (;;) {
+      if (con_input_ready()) return WAIT_OBJECT_0 + i;
+      if (n > 0) { const DWORD r = WaitForMultipleObjectsEx(n, others, FALSE, 0, FALSE); if (r < n) return WAIT_OBJECT_0 + index[r]; if (r != WAIT_TIMEOUT) return r; }
+      if (timeout_ms != INFINITE && GetTickCount() - start >= timeout_ms) return WAIT_TIMEOUT;
+      SleepEx(5, alertable);
+    }
+  }
   LARGE_INTEGER t;
   t.QuadPart = -(LONGLONG)timeout_ms * 10000;
   return wait_result(NtWaitForMultipleObjects(count, handles, all ? 0 : 1, alertable != 0, timeout_ms == INFINITE ? NULL : &t));
@@ -1802,6 +1828,7 @@ EXPORT DWORD WINAPI GetFileType(HANDLE h) {
 }
 
 EXPORT BOOL WINAPI WriteFile(HANDLE h, LPCVOID buffer, DWORD length, LPDWORD written, LPOVERLAPPED overlapped) {
+  if (!overlapped) { BOOL handled; const BOOL result = console_write_hook(h, buffer, length, written, &handled); if (handled) return result; }
   IO_STATUS_BLOCK iosb;
   LARGE_INTEGER offset;
   PLARGE_INTEGER pointer = NULL;
@@ -2043,6 +2070,7 @@ static void complete_overlapped(LPOVERLAPPED overlapped, NTSTATUS status, ULONG_
   if (overlapped->hEvent) NtSetEvent((HANDLE)((ULONG_PTR)overlapped->hEvent & ~(ULONG_PTR)1), NULL);
 }
 EXPORT BOOL WINAPI ReadFile(HANDLE h, LPVOID buffer, DWORD length, LPDWORD read, LPOVERLAPPED overlapped) {
+  if (!overlapped) { BOOL handled; const BOOL result = console_read_hook(h, buffer, length, read, &handled); if (handled) return result; }
   IO_STATUS_BLOCK iosb;
   LARGE_INTEGER offset;
   PLARGE_INTEGER pointer = NULL;
@@ -2060,65 +2088,7 @@ EXPORT BOOL WINAPI ReadFile(HANDLE h, LPVOID buffer, DWORD length, LPDWORD read,
   complete_overlapped(overlapped, status, iosb.Information);
   return TRUE;
 }
-EXPORT BOOL WINAPI WriteConsoleA(HANDLE h, LPCVOID buffer, DWORD length, LPDWORD written, LPVOID reserved) { (void)reserved; return WriteFile(h, buffer, length, written, NULL); }
-EXPORT BOOL WINAPI WriteConsoleW(HANDLE h, LPCVOID buffer, DWORD length, LPDWORD written, LPVOID reserved) {
-  (void)reserved;
-  if (written) *written = 0;
-  char utf8[1024];
-  const WCHAR *w = buffer;
-  DWORD done = 0;
-  while (done < length) {
-    DWORD chunk = length - done < 300 ? length - done : 300;
-    if (chunk > 1 && w[done + chunk - 1] >= 0xD800 && w[done + chunk - 1] < 0xDC00) --chunk;      /* do not split a surrogate pair */
-    const int bytes = WideCharToMultiByte(CP_UTF8, 0, w + done, (int)chunk, utf8, sizeof(utf8), NULL, NULL);
-    DWORD out = 0;
-    if (bytes > 0 && !WriteFile(h, utf8, (DWORD)bytes, &out, NULL)) return FALSE;
-    done += chunk;
-  }
-  if (written) *written = length;
-  return TRUE;
-}
-/* A console read gives the line with "\r\n" at its end, as the Windows console does (the terminal here ends lines with "\n"). */
-EXPORT BOOL WINAPI ReadConsoleA(HANDLE h, LPVOID buffer, DWORD length, LPDWORD read, LPVOID control) {
-  (void)control;
-  DWORD got = 0;
-  if (!ReadFile(h, buffer, length, &got, NULL)) return FALSE;
-  char *text = buffer;
-  if (got > 0 && text[got - 1] == '\n' && (got < 2 || text[got - 2] != '\r') && got < length) { text[got - 1] = '\r'; text[got] = '\n'; ++got; }
-  if (read) *read = got;
-  return TRUE;
-}
-EXPORT BOOL WINAPI ReadConsoleW(HANDLE h, LPVOID buffer, DWORD length, LPDWORD read, LPVOID control) {
-  char utf8[512];
-  DWORD got = 0;
-  if (read) *read = 0;
-  if (!ReadConsoleA(h, utf8, length < 500 ? length : 500, &got, control)) return FALSE;
-  const int units = MultiByteToWideChar(CP_UTF8, 0, utf8, (int)got, buffer, (int)length);
-  if (read) *read = units > 0 ? (DWORD)units : 0;
-  return TRUE;
-}
-EXPORT BOOL WINAPI GetConsoleMode(HANDLE h, LPDWORD mode) {
-  if (device_type(h) != 0x50) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
-  *mode = (h == parameters()->StandardInput) ? (ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT) : (ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL_OUTPUT);
-  return TRUE;
-}
-EXPORT BOOL WINAPI SetConsoleMode(HANDLE h, DWORD mode) { (void)mode; return device_type(h) == 0x50 ? TRUE : (set_error(ERROR_INVALID_HANDLE), FALSE); }
-EXPORT BOOL WINAPI GetConsoleScreenBufferInfo(HANDLE h, PCONSOLE_SCREEN_BUFFER_INFO info) {
-  if (device_type(h) != 0x50) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
-  memset(info, 0, sizeof(*info));
-  info->dwSize.X = 80; info->dwSize.Y = 25;
-  info->wAttributes = 7;
-  info->srWindow.Right = 79; info->srWindow.Bottom = 24;
-  info->dwMaximumWindowSize.X = 80; info->dwMaximumWindowSize.Y = 25;
-  return TRUE;
-}
-EXPORT BOOL WINAPI SetConsoleCtrlHandler(PHANDLER_ROUTINE handler, BOOL add) { (void)handler; (void)add; return TRUE; }      /* Ctrl+C ends the program, whatever it asked */
-EXPORT BOOL WINAPI SetConsoleTitleA(LPCSTR title) { (void)title; return TRUE; }
-EXPORT BOOL WINAPI SetConsoleTitleW(LPCWSTR title) { (void)title; return TRUE; }
-EXPORT BOOL WINAPI FlushConsoleInputBuffer(HANDLE h) { (void)h; return TRUE; }
-EXPORT BOOL WINAPI AllocConsole(void) { return TRUE; }
-EXPORT BOOL WINAPI FreeConsole(void) { return TRUE; }
-EXPORT HANDLE WINAPI GetConsoleWindow(void) { return NULL; }
+#include "console.inc"
 
 /* ---- paths ---------------------------------------------------------------------------------------------------------------------------------------------- */
 

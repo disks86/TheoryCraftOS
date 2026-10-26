@@ -1,13 +1,13 @@
 # Dell XPS 15 2-in-1 9575 (Core i7-8705G / i5-8305G, Kaby Lake-G)
 
-Two GPUs on one package: Intel HD Graphics 630 (Gen9.5, PCI `0x591B`) and a Radeon RX Vega M GL (Polaris 22 with HBM2, PCI `0x694E`; GH is `0x694C`).
+Two GPUs on one package: Intel HD Graphics 630 (Gen9.5, PCI `0x591B`) and a Radeon RX Vega M GL (a Polaris-family chip with HBM2, which amdgpu calls VEGAM; PCI `0x694E`, GH is `0x694C`).
 The internal panel is wired to the Intel GPU, so the Intel GPU is the boot display and the Vega M is a discrete adapter that `GpuManager` puts to sleep.
 
 | Piece | Intel HD 630 | Radeon RX Vega M |
 | --- | --- | --- |
 | Identified (`*_gpu_identify`) | yes | yes |
 | Boot display / mode setting | `IntelGpu` native path (Gen9.5, unvalidated on hardware) | UEFI GOP only (no Polaris display driver) |
-| Video decode | `VideoCodec/Intel` (AVC, HEVC, VP9, MPEG-2, VC-1 via the VCS ring, simulated tests only) | none: needs a UVD 6.3 driver (the AMD code is VCN, Raven) |
+| Video decode | `VideoCodec/Intel` (AVC, HEVC, VP9, MPEG-2, VC-1 via the VCS ring, simulated tests only) | engine start/stop ported (`AmdUvd6`, below); no ring commands or decode messages yet |
 | 3D acceleration | `Gen9GraphicsDevice` on the render engine, opt-in (`TCOS_INTEL_RENDER`), tested in simulation, **not run on hardware** (below) | none (CPU renderer) |
 
 ## Not done
@@ -72,3 +72,27 @@ selector (needed for reads of slice-specific registers) is not set; nothing here
 
 Not done: stencil, textured triangles, tiling, interrupts (the driver polls), a render node for a non-display Intel GPU, the other engines' workarounds, and every check
 on real hardware. The device is not used by the 2D renderer. Treat the first run on a 9575 as a bring-up, not as a working driver.
+
+## Radeon RX Vega M: UVD 6.3
+
+`src/Hardware/VideoCodec/AMD/AmdUvd6.*` is the start/stop of the Unified Video Decoder 6.3, ported from amdgpu (`uvd_v6_0.c`: `mc_resume`, `start`, `stop`, the clock-gating "ungate" path; `amdgpu_uvd.c`: the memory layout
+and the microcode copy), in the way `AmdVcn1` was ported from `vcn_v1_0.c`: the registers are the card's register BAR numbered by dword, the constants are generated from AMD's own headers
+(`scripts/gen_vcn1_regs.py --vi` -> `AmdUvd6Registers.inc`), and `scripts/check_uvd6_port.py <path to uvd_v6_0.c>` confirms that every ported function touches the same registers in the same order as the driver.
+The firmware is `/firmware/vegam_uvd.bin` (linux-firmware, UVD 6.3, version 1.130, 40 sessions), found with `amd_uvd6_firmware_name()`. `tests/AmdUvd6Test.cpp` runs the sequence against a simulated engine
+(including the real firmware file) and covers the layout, the register values, the reset order, boot retries and failure, stop and restart, and every refused argument.
+
+What it does not do, and what is needed before a Vega M decodes anything:
+- **Power and clocks.** amdgpu asks the card's SMC to power the engine and set its clocks (`PPSMC_MSG_UVDPowerON`, `amdgpu_asic_set_uvd_clocks`); here the engine is assumed powered and clocked (usually so on a card the system firmware set up).
+- **Memory: planned, not wired.** `AmdGmc8Memory` reads the memory controller the way amdgpu does (`CONFIG_MEMSIZE`, `MC_VM_FB_LOCATION`; both set by the card's firmware, nothing is written), places the engine's block, ring and
+  a work area (96 MiB if there is room, 8 MiB at least) at the end of the part of video memory the CPU can reach through BAR 0 (the first 256 MiB without Resizable BAR), clear of the firmware's start of memory
+  (25 MiB) and a 16 MiB tail guard, and maps them (`amd_map_uvd6_plan`). `AmdUvd6::start` flushes the host data path (`HDP_MEM_COHERENCY_FLUSH_CNTL`) after writing the microcode. What is missing is the plumbing:
+  finding the card's register BAR (BAR 5) and memory BAR (BAR 0, with its size) from PCI and creating the objects at boot, and the video device on top (`IVideoDecoder` for H.264 and HEVC). That the memory controller lets
+  the engine reach these addresses unchanged (VMID 0, inside the system aperture the firmware set) is the driver's behaviour and has not been seen on the card.
+- **The ring: done in simulation.** `AmdUvd6Ring` ports the ring side (`uvd_v6_0_ring_emit_ib`, `_emit_fence`, `_insert_nop`, `_set_wptr`, `_ring_test_ring`) and builds the indirect buffer Mesa builds
+  (`radeon_uvd.c`: each buffer's address through the GPCOM registers and its command, then the engine start); the command numbers are the same as the VCN ones. It flushes the host data path before it
+  publishes the write pointer, and wedges on a missed fence. `tests/AmdUvd6RingTest.cpp` runs it against a simulated ring controller (wrap-around, fence, stall, bad arguments, the ring test), and
+  `check_uvd6_port.py` confirms the ring test and the ring commands touch the same registers in the same order as the driver.
+- **The messages.** Nothing builds the session create/decode/destroy messages yet. UVD 6 uses the older `ruvd_*` layouts (Mesa `radeon_uvd.c`/`ac_uvd_dec.h`), not the VCN ones the existing decoders build,
+  and `IVideoDecoder` for H.264 and HEVC on top of the ring and messages does not exist.
+- Encode rings, medium-grain clock gating, and the 3D side of the card (CP/RLC/SDMA microcode, memory controller and GART, display) are all untouched.
+- Not run on a Vega M.

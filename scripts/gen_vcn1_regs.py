@@ -2,7 +2,11 @@
 """Generates a register constants file (AmdVcn1Registers.inc, AmdRavenMemoryRegisters.inc): the register numbers, base indexes and field masks a driver
 source file uses, taken from AMD's own headers in the Linux kernel tree so none is typed in by hand.
 
-  gen_vcn1_regs.py out.inc source.cpp header.h [header.h ...]
+  gen_vcn1_regs.py [--vi] out.inc source.cpp header.h [header.h ...]
+
+  --vi: the headers are the older (GFX8 / "VI") ones, whose registers have no *_BASE_IDX and whose indirect registers are named ix...; the output has no
+        base indexes. AmdUvd6.cpp:  uvd_6_0_d.h uvd_6_0_sh_mask.h oss_3_0_d.h oss_3_0_sh_mask.h bif_5_0_d.h
+        AmdGmc8Memory.cpp:  gmc_8_1_d.h gmc_8_1_sh_mask.h bif_5_0_d.h
 
   AmdVcn1.cpp:         vcn_1_0_offset.h vcn_1_0_sh_mask.h
   AmdVcn1Ring.cpp:     vcn_1_0_offset.h vcn_1_0_sh_mask.h
@@ -18,9 +22,13 @@ import sys
 
 
 def main():
-    if len(sys.argv) < 4:
+    args = sys.argv[1:]
+    vi = bool(args) and args[0] == '--vi'
+    if vi:
+        args = args[1:]
+    if len(args) < 3:
         sys.exit(__doc__)
-    out, source, headers = sys.argv[1], sys.argv[2], sys.argv[3:]
+    out, source, headers = args[0], args[1], args[2:]
     text = open(source).read()
     code = '\n'.join(l for l in text.split('\n') if not l.lstrip().startswith('#define'))   # the macro definitions are not uses
     marker = re.search(r'#include "[^"]*Registers\.inc"', text)
@@ -46,7 +54,7 @@ def main():
             ambiguous.append((name, by_header))
 
     used = set()
-    for name in re.findall(r'\b(mm[A-Z][A-Z0-9_]*)\b', code):
+    for name in re.findall(r'\b((?:mm|ix)[A-Z][A-Z0-9_]*)\b', code):
         if name.endswith('_BASE_IDX'):
             name = name[:-len('_BASE_IDX')]
         used.add(name)
@@ -54,6 +62,14 @@ def main():
         used.add(name)
     # REG_SET_FIELD(orig, REG, FIELD, v) pastes REG__FIELD__SHIFT / REG__FIELD_MASK itself
     for reg, field in re.findall(r'REG_SET_FIELD\([^,]+,\s*(\w+),\s*(\w+),', code):
+        used.add(f'{reg}__{field}__SHIFT')
+        used.add(f'{reg}__{field}_MASK')
+    # WREG32_FIELD(REG, FIELD, v) and REG_FIELD_SHIFT / REG_FIELD_MASK(REG, FIELD) paste mmREG, REG__FIELD_MASK and REG__FIELD__SHIFT
+    for reg, field in re.findall(r'WREG32_FIELD\(\s*(\w+),\s*(\w+),', code):
+        used.add(f'mm{reg}')
+        used.add(f'{reg}__{field}__SHIFT')
+        used.add(f'{reg}__{field}_MASK')
+    for reg, field in re.findall(r'REG_FIELD_(?:SHIFT|MASK)\(\s*(\w+),\s*(\w+)\)', code):
         used.add(f'{reg}__{field}__SHIFT')
         used.add(f'{reg}__{field}_MASK')
 
@@ -66,12 +82,13 @@ def main():
     for name in sorted(used):
         if name in local:
             continue
-        if name.startswith('mm'):
-            if name not in values or name + '_BASE_IDX' not in values:
+        if name.startswith(('mm', 'ix')) and name[2:3].isupper():
+            if name not in values or (not vi and name + '_BASE_IDX' not in values):
                 missing.append(name)
                 continue
             lines.append(f'constexpr uint32_t {name} = 0x{values[name]:08X};')
-            lines.append(f'constexpr uint32_t {name}_BASE_IDX = {values[name + "_BASE_IDX"]};')
+            if not vi:
+                lines.append(f'constexpr uint32_t {name}_BASE_IDX = {values[name + "_BASE_IDX"]};')
         else:
             if name not in values:
                 missing.append(name)
