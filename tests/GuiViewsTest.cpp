@@ -1620,6 +1620,20 @@ struct FakeMonitor final : desktop::ISystemMonitor {
     if (second_thread) put(7, "worker", desktop::TaskState::Running, false, 1, worker_ticks);
     return n;
   }
+  uint64_t program_ticks = 0;
+  bool program_running = true;
+  uint32_t processes(desktop::TaskProcess* out, uint32_t capacity) override {
+    if (!program_running || capacity == 0) return 0;
+    out[0] = desktop::TaskProcess();
+    out[0].id = 100;
+    strncpy(out[0].name, "hello.exe", sizeof out[0].name - 1);
+    out[0].windows = true;
+    out[0].state = desktop::TaskState::Running;
+    out[0].threads = 2;
+    out[0].cpu_ticks = program_ticks;
+    out[0].memory_bytes = 3ull << 20;
+    return 1;
+  }
   desktop::TaskMemory memory() override { return {1ull << 30, free_bytes}; }
   int32_t cpu_temp = 62500;
   desktop::TaskGpu gpu_info;
@@ -1667,6 +1681,32 @@ static void test_computer_manager_npu() {
   CHECK(a.live == 0);
 }
 
+// The Usermode tab: one row per program with its type, threads, share of the processor since the last update, and memory.
+static void test_computer_manager_usermode() {
+  TestAllocator a;
+  {
+    FakeMonitor mon;
+    desktop::ComputerManager tm(a);
+    tm.set_monitor(&mon);
+    String cell(a);
+    tm.update(1000000);
+    CHECK(tm.process_grid().row_count() == 1 && tm.process_load_tenths(100) == 0 && tm.process_load_tenths(7) == -1);
+    CHECK(tm.process_cell(0, 0, &cell) && cell.view().equals("100"));
+    CHECK(tm.process_cell(0, 1, &cell) && cell.view().equals("hello.exe"));
+    CHECK(tm.process_cell(0, 2, &cell) && cell.view().equals("Windows"));
+    CHECK(tm.process_cell(0, 3, &cell) && cell.view().equals("Running"));
+    CHECK(tm.process_cell(0, 4, &cell) && cell.view().equals("2"));
+    CHECK(tm.process_cell(0, 6, &cell) && cell.view().equals("3.0 MB"));
+    mon.program_ticks = 500;
+    tm.update(2000000);            // 500 of the 1000 ticks one core counts in a second
+    CHECK(tm.process_load_tenths(100) == 500 && tm.process_cell(0, 5, &cell) && cell.view().equals("50.0"));
+    mon.program_running = false;   // the program ended
+    tm.update(3000000);
+    CHECK(tm.process_grid().row_count() == 0 && tm.process_load_tenths(100) == -1);
+  }
+  CHECK(a.live == 0);
+}
+
 static void test_computer_manager() {
   TestAllocator a;
   {
@@ -1689,7 +1729,7 @@ static void test_computer_manager() {
     CHECK(tm.memory_label().text().equals("512.0 MB / 1.0 GB") && tm.memory_meter().level() == 50);
     CHECK(tm.info_label().text().equals("Threads: 3   Cores: 2   Uptime: 00:00:01"));
     CHECK(tm.core_meter(0) && tm.core_meter(1) && !tm.core_meter(2) && tm.core_label(0)->text().equals("0%"));
-    CHECK(tm.tabs().page_count() == 3 && tm.tabs().page_title(0).equals("Processes") && tm.tabs().page_title(1).equals("Performance") && tm.tabs().page_title(2).equals("Hardware") && tm.tabs().selected_page() == 0);
+    CHECK(tm.tabs().page_count() == 4 && tm.tabs().page_title(0).equals("Processes") && tm.tabs().page_title(1).equals("Performance") && tm.tabs().page_title(2).equals("Hardware") && tm.tabs().page_title(3).equals("Usermode") && tm.tabs().selected_page() == 0);
 
     // The GPU, its memory and the temperatures: unknown figures read n/a, known ones fill their meters.
     CHECK(tm.gpu_label().text().equals("n/a") && tm.vram_label().text().equals("n/a") && tm.gpu_temp_label().text().equals("n/a"));
@@ -7749,6 +7789,7 @@ int main() {
   test_notepad();
   test_calculator();
   test_computer_manager_npu();
+  test_computer_manager_usermode();
   test_explorer_copy_paste_properties();
   test_calculator_session();
   test_media_player();

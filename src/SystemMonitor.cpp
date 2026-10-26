@@ -19,6 +19,7 @@
 #include "SystemMonitor.hpp"
 #include "Hardware/CentralProcessingUnit/CpuTemperature.hpp"
 #include "Kernel/Thread.hpp"
+#include "Kernel/UserMode.hpp"
 #include "Utility/AllocatedView.hpp"
 
 uint32_t SystemMonitor::ticks_per_second() const { return kernel::tick_rate(); }
@@ -48,6 +49,27 @@ uint32_t SystemMonitor::threads(desktop::TaskThread* out, uint32_t capacity) {
     t.idle = info[i].idle;
     t.core = info[i].core;
     t.cpu_ticks = info[i].cpu_ticks;
+  }
+  release_view(shared_, info);
+  return n;
+}
+
+uint32_t SystemMonitor::processes(desktop::TaskProcess* out, uint32_t capacity) {
+  ArrayView<kernel::usermode::ProcessInfo> info = allocate_view<kernel::usermode::ProcessInfo>(shared_, capacity);
+  if (info.empty()) return 0;
+  const uint32_t n = kernel::usermode::process_snapshot(info.data(), static_cast<uint32_t>(info.size()));
+  for (uint32_t i = 0; i < n; ++i) {
+    desktop::TaskProcess& p = out[i];
+    p = desktop::TaskProcess();
+    p.id = info[i].id;
+    __builtin_memcpy(p.name, info[i].name, sizeof p.name);
+    p.windows = info[i].windows;
+    p.threads = info[i].threads;
+    p.state = info[i].state == kernel::ThreadState::Running ? desktop::TaskState::Running
+              : info[i].state == kernel::ThreadState::Blocked ? desktop::TaskState::Blocked
+                                                              : desktop::TaskState::Ready;
+    p.cpu_ticks = info[i].cpu_ticks;
+    p.memory_bytes = info[i].memory_bytes;
   }
   release_view(shared_, info);
   return n;

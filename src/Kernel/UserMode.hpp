@@ -27,6 +27,7 @@
 #include "Process/UserProgram.hpp"
 #include "Utility/UniquePointer.hpp"
 #include "Utility/ArrayView.hpp"
+#include "Utility/StringView.hpp"
 
 namespace kernel {
 
@@ -71,6 +72,10 @@ struct Task final : process::IProcessRuntime {
   Mutex mutex;
   ConditionVariable changed;
   int32_t home_core = -1;
+  char name[24] = {};             // what the process manager calls the program (see set_name())
+  uint64_t retired_ticks = 0;     // CPU ticks of the threads that have ended (under `mutex`)
+  Task* all_next = nullptr;       // every running program (see process_snapshot()); under the registry's lock
+  bool registered = false;
 
   // process::IProcessRuntime
   void lock() override { mutex.lock(); }
@@ -82,6 +87,7 @@ struct Task final : process::IProcessRuntime {
   bool resume_thread(uint64_t id) override;
   uint64_t current_thread_id() override;
 
+  void set_name(StringView text);
   UserThread* add_thread(const process::ThreadStart& start);
   bool launch(UserThread* thread, uint32_t stack_bytes);
   // Rebuilds the page tables if the address space changed and gives them to all the threads. False if memory ran out.
@@ -94,6 +100,19 @@ struct Task final : process::IProcessRuntime {
 // Starts the program's first thread in ring 3. `program` must be loaded (with the reserved ranges set on its address space before loading) and must stay
 // alive until the task is gone. Null if there is no memory or user mode is not ready.
 UniquePointer<Task> spawn(process::UserProgram& program, allocators::IAllocator& allocator, const char* name);
+// --- Monitoring (the computer manager). Cumulative CPU counters; a tick is 1 / tick_rate() seconds on one core.
+struct ProcessInfo {
+  uint64_t id = 0;
+  char name[24] = {};
+  bool windows = false;        // otherwise Linux
+  uint32_t threads = 0;        // live threads
+  ThreadState state = ThreadState::Blocked;   // Running if any thread runs, else Ready if any is ready, else Blocked
+  uint64_t cpu_ticks = 0;      // all its threads together, including those that have ended
+  uint64_t memory_bytes = 0;   // mapped in its address space
+};
+// Copies up to `capacity` running programs; returns how many were written. Safe from any thread.
+uint32_t process_snapshot(ProcessInfo* out, uint32_t capacity);
+
 // Ends the program as soon as it can: at its next system call or timer tick, whichever comes first (a blocked wait must be woken by the caller, for
 // instance by the host's interrupt()). The exit code is 130. Safe from any thread.
 void request_kill(Task& task);

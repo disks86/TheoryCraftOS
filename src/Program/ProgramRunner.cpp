@@ -173,6 +173,7 @@ RunResult run_program(const ProgramRun& run, uint32_t* exit_code, String* messag
     fail(message, "could not start the program (out of memory)");
     return RunResult::CouldNotRun;
   }
+  task->set_name(name.view());      // (what the computer manager lists)
   uint32_t code = 0;
   bool kill_sent = false;
   host.set_interrupt_callback([](void* t) { kernel::usermode::request_kill(*static_cast<kernel::usermode::Task*>(t)); }, task.get());

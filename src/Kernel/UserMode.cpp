@@ -399,7 +399,27 @@ bool init(allocators::IAllocator& allocator) {
   return g.ready;
 }
 
+namespace {
+// The running programs. A task joins the list when it has started and leaves it in its destructor, so a snapshot (which holds the lock) never sees a destroyed one.
+Mutex g_tasks_mutex;
+Task* g_tasks = nullptr;
+}  // namespace
+
+void Task::set_name(StringView text) {
+  uint32_t i = 0;
+  for (; i + 1 < sizeof name && i < text.size(); ++i) name[i] = text[i];
+  name[i] = 0;
+}
+
 Task::~Task() {
+  if (registered) {
+    ScopedMutex hold(g_tasks_mutex);
+    for (Task** link = &g_tasks; *link; link = &(*link)->all_next)
+      if (*link == this) {
+        *link = all_next;
+        break;
+      }
+  }
   while (threads) {
     UserThread* next = threads->next;
     threads->~UserThread();
@@ -501,7 +521,40 @@ UniquePointer<Task> spawn(process::UserProgram& program, allocators::IAllocator&
   t->thread = kernel::spawn(user_main, t, name);
   t->spawned = t->thread != nullptr;
   if (!t->spawned) return UniquePointer<Task>();
+  task->set_name(StringView(name));
+  {
+    ScopedMutex hold(g_tasks_mutex);
+    task->all_next = g_tasks;
+    g_tasks = task.get();
+    task->registered = true;
+  }
   return task;
+}
+
+uint32_t process_snapshot(ProcessInfo* out, uint32_t capacity) {
+  uint32_t n = 0;
+  ScopedMutex registry(g_tasks_mutex);
+  for (Task* task = g_tasks; task && n < capacity; task = task->all_next) {
+    if (!task->program.loaded()) continue;
+    ProcessInfo& info = out[n++];
+    info = ProcessInfo();
+    info.id = task->program.process()->id();
+    __builtin_memcpy(info.name, task->name, sizeof info.name);
+    info.windows = task->program.process()->abi() == process::SyscallAbi::Windows;
+    info.memory_bytes = task->program.address_space().mapped_bytes();
+    ScopedMutex hold(task->mutex);
+    info.cpu_ticks = task->retired_ticks;
+    bool ready = false;
+    for (const UserThread* t = task->threads; t; t = t->next) {
+      if (!t->spawned || t->joined || !t->thread) continue;    // (a joined thread's memory is gone)
+      ++info.threads;
+      info.cpu_ticks += t->thread->cpu_ticks;
+      if (t->thread->state == ThreadState::Running) info.state = ThreadState::Running;
+      else if (t->thread->state == ThreadState::Ready) ready = true;
+    }
+    if (info.state != ThreadState::Running && ready) info.state = ThreadState::Ready;
+  }
+  return n;
 }
 
 void request_kill(Task& task) {
@@ -522,6 +575,7 @@ bool wait(Task& task, uint32_t* exit_code, uint64_t timeout_us) {
         if (!t->spawned || t->joined || !t->thread) continue;
         if (t->finished) {      // it is leaving: from here on nothing touches its CPU thread but this call
           to_join = t->thread;
+          task.retired_ticks += t->thread->cpu_ticks;
           t->thread = nullptr;
           t->joined = true;
           break;
@@ -546,6 +600,14 @@ bool wait(Task& task, uint32_t* exit_code, uint64_t timeout_us) {
   return true;
 }
 
+}  // namespace usermode
+}  // namespace kernel
+
+#else
+
+namespace kernel {
+namespace usermode {
+uint32_t process_snapshot(ProcessInfo*, uint32_t) { return 0; }      // (programs only run on x86-64 so far)
 }  // namespace usermode
 }  // namespace kernel
 

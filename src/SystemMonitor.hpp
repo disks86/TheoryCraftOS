@@ -35,6 +35,7 @@ class SystemMonitor final : public desktop::ISystemMonitor {
   uint32_t core_count() const override;
   bool core(uint32_t index, desktop::TaskCore* out) override;
   uint32_t threads(desktop::TaskThread* out, uint32_t capacity) override;
+  uint32_t processes(desktop::TaskProcess* out, uint32_t capacity) override;
   desktop::TaskMemory memory() override;
   int32_t cpu_temperature_millicelsius() override;
   desktop::TaskGpu gpu() override;

@@ -49,6 +49,26 @@ bool ComputerManager::Model::cell_text(uint32_t row, uint32_t column, String* ou
   }
 }
 
+bool ComputerManager::ProcessModel::cell_text(uint32_t row, uint32_t column, String* out) const {
+  out->clear();
+  if (row >= rows.count()) return true;
+  const ProcessRow& r = rows[row];
+  switch (column) {
+    case 0: return out->append_uint(r.id);
+    case 1: {
+      uint64_t length = 0;
+      while (length < sizeof r.name && r.name[length]) ++length;
+      return out->assign(StringView(r.name, length));
+    }
+    case 2: return out->assign(r.windows ? "Windows" : "Linux");
+    case 3: return out->assign(r.state == TaskState::Running ? "Running" : r.state == TaskState::Blocked ? "Blocked" : "Ready");
+    case 4: return out->append_uint(r.threads);
+    case 5: return append_tenths(out, r.tenths);
+    case 6: return format_size(r.memory, out);
+    default: return true;
+  }
+}
+
 ComputerManager::ComputerManager(allocators::IAllocator& allocator)
     : Frame(allocator),
       menu_(allocator),
@@ -58,6 +78,7 @@ ComputerManager::ComputerManager(allocators::IAllocator& allocator)
       processes_page_(allocator),
       performance_page_(allocator),
       hardware_page_(allocator),
+      usermode_page_(allocator),
       cpu_row_(allocator),
       memory_row_(allocator),
       cpu_title_(allocator),
@@ -73,6 +94,7 @@ ComputerManager::ComputerManager(allocators::IAllocator& allocator)
       cpu_meter_(allocator),
       memory_meter_(allocator),
       grid_(allocator),
+      process_grid_(allocator),
       gpu_row_(allocator),
       npu_row_(allocator),
       vram_row_(allocator),
@@ -81,9 +103,12 @@ ComputerManager::ComputerManager(allocators::IAllocator& allocator)
       battery_row_(allocator),
       core_rows_(allocator),
       model_(allocator),
+      process_model_(allocator),
       previous_cores_(allocator),
-      previous_threads_(allocator) {
+      previous_threads_(allocator),
+      previous_processes_(allocator) {
   buffer_ = allocate_view<TaskThread>(allocator, kMaxThreads);
+  process_buffer_ = allocate_view<TaskProcess>(allocator, kMaxProcesses);
   for (int32_t& node : group_nodes_) node = -1;
   set_title("Computer Manager");
   set_bounds({90, 40, 480, 544});
@@ -97,6 +122,7 @@ ComputerManager::ComputerManager(allocators::IAllocator& allocator)
     processes_item_ = view->add_item("Processes", {&ComputerManager::on_show_processes, this});
     performance_item_ = view->add_item("Performance", {&ComputerManager::on_show_performance, this});
     hardware_item_ = view->add_item("Hardware", {&ComputerManager::on_show_hardware, this});
+    usermode_item_ = view->add_item("Usermode", {&ComputerManager::on_show_usermode, this});
   }
   copy_row_item_ = grid_menu_.add_item("Copy Row", {&ComputerManager::on_copy_row, this}, "Ctrl+C");
   grid_menu_.on_opening(Handler::immediate(&ComputerManager::on_grid_menu_opening, this));
@@ -106,6 +132,8 @@ ComputerManager::ComputerManager(allocators::IAllocator& allocator)
   processes_page_.set_padding(Insets::all(4));
   performance_page_.set_style(PanelStyle::Transparent);
   performance_page_.set_padding(Insets::all(6));
+  usermode_page_.set_style(PanelStyle::Transparent);
+  usermode_page_.set_padding(Insets::all(4));
 
   struct RowParts {
     Panel& row;
@@ -158,6 +186,17 @@ ComputerManager::ComputerManager(allocators::IAllocator& allocator)
   grid_.set_dock(DockStyle::Fill);
   grid_.set_context_menu(&grid_menu_);
 
+  process_grid_.add_column("PID", 40, Align::Right);
+  process_grid_.add_column("Program", 106);
+  process_grid_.add_column("Type", 54);
+  process_grid_.add_column("State", 62);
+  process_grid_.add_column("Thr", 32, Align::Right);
+  process_grid_.add_column("CPU %", 48, Align::Right);
+  process_grid_.add_column("Memory", 70, Align::Right);
+  process_grid_.set_model(&process_model_);
+  process_grid_.set_dock(DockStyle::Fill);
+  usermode_page_.add(&process_grid_);
+
   // The Hardware tab: the tree, and a line about the selected device under it. The Displays group has a menu of its own.
   hardware_page_.set_style(PanelStyle::Transparent);
   hardware_page_.set_padding(Insets::all(4));
@@ -177,6 +216,7 @@ ComputerManager::ComputerManager(allocators::IAllocator& allocator)
   tabs_.add_page("Processes", &processes_page_);
   tabs_.add_page("Performance", &performance_page_);
   tabs_.add_page("Hardware", &hardware_page_);
+  tabs_.add_page("Usermode", &usermode_page_);
   add(&menu_);
   add(&tabs_);
   on_tab_changed(this, tabs_);
@@ -195,6 +235,7 @@ void ComputerManager::on_tab_changed(void* self, Control&) {  // the View menu s
   if (t->processes_item_) t->processes_item_->set_checked(t->tabs_.selected_page() == 0);
   if (t->performance_item_) t->performance_item_->set_checked(t->tabs_.selected_page() == 1);
   if (t->hardware_item_) t->hardware_item_->set_checked(t->tabs_.selected_page() == 2);
+  if (t->usermode_item_) t->usermode_item_->set_checked(t->tabs_.selected_page() == 3);
 }
 void ComputerManager::on_show_processes(void* self, Control&) { static_cast<ComputerManager*>(self)->tabs_.select_page(0); }
 void ComputerManager::setup_stat_row(CoreRow& r, const char* title) {
@@ -217,6 +258,7 @@ void ComputerManager::setup_stat_row(CoreRow& r, const char* title) {
 
 void ComputerManager::on_show_performance(void* self, Control&) { static_cast<ComputerManager*>(self)->tabs_.select_page(1); }
 void ComputerManager::on_show_hardware(void* self, Control&) { static_cast<ComputerManager*>(self)->tabs_.select_page(2); }
+void ComputerManager::on_show_usermode(void* self, Control&) { static_cast<ComputerManager*>(self)->tabs_.select_page(3); }
 void ComputerManager::on_display_settings_item(void* self, Control&) {
   auto* t = static_cast<ComputerManager*>(self);
   t->fire(t->open_display_settings_);
@@ -331,19 +373,29 @@ void ComputerManager::on_hardware_selection(void* self, Control&) {
   t->hardware_info_.set_text(text.view());
 }
 
-ComputerManager::~ComputerManager() { release_view(allocator(), buffer_); }
+ComputerManager::~ComputerManager() {
+  release_view(allocator(), buffer_);
+  release_view(allocator(), process_buffer_);
+}
 
 void ComputerManager::set_monitor(ISystemMonitor* monitor) {
   monitor_ = monitor;
   have_previous_ = false;
   previous_cores_.clear();
   previous_threads_.clear();
+  previous_processes_.clear();
   model_.ticks_per_second = monitor ? monitor->ticks_per_second() : 1000;
 }
 
 int32_t ComputerManager::thread_load_tenths(uint64_t id) const {
   for (const Row& r : model_.rows)
     if (r.id == id && !r.idle) return static_cast<int32_t>(r.tenths);
+  return -1;
+}
+
+int32_t ComputerManager::process_load_tenths(uint64_t id) const {
+  for (const ProcessRow& r : process_model_.rows)
+    if (r.id == id) return static_cast<int32_t>(r.tenths);
   return -1;
 }
 
@@ -547,6 +599,40 @@ void ComputerManager::update(uint64_t now_us) {
   }
   previous_threads_.clear();
   for (const Previous& p : next_previous) previous_threads_.push_back(p);
+
+  // --- User-mode programs: the same, for all the threads of a program together.
+  const uint32_t program_count = process_buffer_.empty() ? 0 : monitor_->processes(process_buffer_.data(), kMaxProcesses);
+  const int32_t selected_program = process_grid_.selected_row();
+  const uint64_t selected_pid = selected_program >= 0 && static_cast<uint32_t>(selected_program) < process_model_.rows.count()
+                                    ? process_model_.rows[static_cast<uint32_t>(selected_program)].id
+                                    : ~0ull;
+  process_model_.rows.clear();
+  List<Previous> next_processes(allocator());
+  int32_t reselect_program = -1;
+  for (uint32_t i = 0; i < program_count && i < kMaxProcesses; ++i) {
+    const TaskProcess& p = process_buffer_[i];
+    ProcessRow row;
+    row.id = p.id;
+    __builtin_memcpy(row.name, p.name, sizeof row.name);
+    row.name[sizeof row.name - 1] = 0;
+    row.windows = p.windows;
+    row.state = p.state;
+    row.threads = p.threads;
+    row.memory = p.memory_bytes;
+    if (have_previous_ && period_ticks)
+      for (const Previous& before : previous_processes_)
+        if (before.id == p.id) {
+          row.tenths = static_cast<uint32_t>((p.cpu_ticks > before.ticks ? p.cpu_ticks - before.ticks : 0) * 1000 / period_ticks);
+          break;
+        }
+    next_processes.push_back(Previous{p.id, p.cpu_ticks});
+    if (p.id == selected_pid) reselect_program = static_cast<int32_t>(process_model_.rows.count());
+    process_model_.rows.push_back(row);
+  }
+  previous_processes_.clear();
+  for (const Previous& p : next_processes) previous_processes_.push_back(p);
+  process_grid_.model_changed();
+  process_grid_.select_row(reselect_program);
   previous_cores_.clear();
   for (const TaskCore& c : current) previous_cores_.push_back(c);
   last_us_ = now_us;

@@ -16,8 +16,8 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// The computer manager: a window with three tabs. "Processes" is a table of the running kernel threads with their state,
-// core and share of the processor; "Performance" shows the processor load (overall and per core) and memory use; "Hardware" is a tree of the
+// The computer manager: a window with four tabs. "Processes" is a table of the running kernel threads with their state,
+// core and share of the processor; "Usermode" is the same for the user-mode programs (state, threads, share of the processor, memory); "Performance" shows the processor load (overall and per core) and memory use; "Hardware" is a tree of the
 // devices of the machine grouped by kind (processors, memory, display adapters, displays, disk drives, ...), with a line of detail for the selected one.
 // It reads the machine through an ISystemMonitor and an IHardwareInventory and refreshes itself when update() is called (the desktop does so once
 // a second while the window is open). Right-clicking the Displays group of the hardware tree offers Display Settings, and right-clicking a network
@@ -48,6 +48,17 @@ struct TaskThread {
   bool idle = false;       // a core's idle thread
   int32_t core = -1;       // the core it runs on right now, or -1
   uint64_t cpu_ticks = 0;  // cumulative
+};
+
+// One user-mode program (a process, with all its threads).
+struct TaskProcess {
+  uint64_t id = 0;
+  char name[24] = {};
+  bool windows = false;        // otherwise Linux
+  TaskState state = TaskState::Blocked;
+  uint32_t threads = 0;
+  uint64_t cpu_ticks = 0;      // cumulative, all threads
+  uint64_t memory_bytes = 0;
 };
 
 struct TaskCore {
@@ -91,6 +102,8 @@ class ISystemMonitor {
   virtual bool core(uint32_t index, TaskCore* out) = 0;
   // Writes up to `capacity` threads; returns how many.
   virtual uint32_t threads(TaskThread* out, uint32_t capacity) = 0;
+  // Writes up to `capacity` user-mode programs; returns how many.
+  virtual uint32_t processes(TaskProcess* out, uint32_t capacity) { (void)out; (void)capacity; return 0; }
   virtual TaskMemory memory() = 0;
   // The processor's temperature in thousandths of a degree Celsius, or -1 if the machine cannot tell.
   virtual int32_t cpu_temperature_millicelsius() { return -1; }
@@ -106,6 +119,7 @@ class ISystemMonitor {
 class ComputerManager : public gui::Frame {
  public:
   static constexpr uint32_t kMaxThreads = 256;
+  static constexpr uint32_t kMaxProcesses = 128;
   static constexpr uint32_t kMaxCoresShown = 256;
 
   explicit ComputerManager(allocators::IAllocator& allocator);
@@ -128,6 +142,12 @@ class ComputerManager : public gui::Frame {
   void update(uint64_t now_us);
 
   gui::DataGrid& grid() { return grid_; }
+  // The table of the Usermode tab.
+  gui::DataGrid& process_grid() { return process_grid_; }
+  // The CPU share (tenths of a percent of one core) of the program with this id, or -1 if it is not listed.
+  int32_t process_load_tenths(uint64_t id) const;
+  // The text of a cell of the Usermode table (PID, Program, Type, State, Thr, CPU %, Memory).
+  bool process_cell(uint32_t row, uint32_t column, String* out) const { return process_model_.cell_text(row, column, out); }
   gui::LevelMeter& cpu_meter() { return cpu_meter_; }
   gui::LevelMeter& memory_meter() { return memory_meter_; }
   gui::Label& cpu_label() { return cpu_value_; }
@@ -192,6 +212,24 @@ class ComputerManager : public gui::Frame {
     uint32_t ticks_per_second = 1000;
   };
 
+  struct ProcessRow {
+    uint64_t id = 0;
+    char name[24] = {};
+    bool windows = false;
+    TaskState state = TaskState::Blocked;
+    uint32_t threads = 0;
+    uint32_t tenths = 0;
+    uint64_t memory = 0;
+  };
+
+  class ProcessModel final : public gui::IGridModel {
+   public:
+    explicit ProcessModel(allocators::IAllocator& allocator) : rows(allocator) {}
+    uint32_t row_count() const override { return static_cast<uint32_t>(rows.count()); }
+    bool cell_text(uint32_t row, uint32_t column, String* out) const override;
+    List<ProcessRow> rows;
+  };
+
   // The row of one core on the Performance tab.
   struct CoreRow {
     explicit CoreRow(allocators::IAllocator& allocator) : row(allocator), title(allocator), value(allocator), meter(allocator) {}
@@ -210,6 +248,7 @@ class ComputerManager : public gui::Frame {
   static void on_grid_menu_opening(void* self, gui::Control&);
   static void on_tab_changed(void* self, gui::Control&);
   static void on_show_hardware(void* self, gui::Control&);
+  static void on_show_usermode(void* self, gui::Control&);
   static void on_hardware_selection(void* self, gui::Control&);
   static void on_display_settings_item(void* self, gui::Control&);
   static void on_properties_item(void* self, gui::Control&);
@@ -220,10 +259,10 @@ class ComputerManager : public gui::Frame {
   gui::MenuBar menu_;
   gui::ContextMenu grid_menu_;
   gui::MenuItem* copy_row_item_ = nullptr;
-  gui::MenuItem *processes_item_ = nullptr, *performance_item_ = nullptr, *hardware_item_ = nullptr;
+  gui::MenuItem *processes_item_ = nullptr, *performance_item_ = nullptr, *hardware_item_ = nullptr, *usermode_item_ = nullptr;
   gui::TabControl tabs_;
   gui::ScrollPanel core_scroll_;
-  gui::Panel processes_page_, performance_page_, hardware_page_, cpu_row_, memory_row_;
+  gui::Panel processes_page_, performance_page_, hardware_page_, usermode_page_, cpu_row_, memory_row_;
   gui::TreeView tree_;
   gui::ContextMenu display_menu_, adapter_menu_, wireless_menu_;
   gui::MenuItem *display_settings_item_ = nullptr, *properties_item_ = nullptr, *wireless_properties_item_ = nullptr, *wireless_adapter_item_ = nullptr;
@@ -234,14 +273,16 @@ class ComputerManager : public gui::Frame {
   int32_t group_nodes_[kHardwareGroupCount] = {};
   gui::Label cpu_title_, cpu_value_, memory_title_, memory_value_, info_;
   gui::LevelMeter cpu_meter_, memory_meter_;
-  gui::DataGrid grid_;
+  gui::DataGrid grid_, process_grid_;
   CoreRow gpu_row_, npu_row_, vram_row_, cpu_temp_row_, gpu_temp_row_, battery_row_;
   List<UniquePointer<CoreRow>> core_rows_;
   Model model_;
+  ProcessModel process_model_;
   ISystemMonitor* monitor_ = nullptr;
   List<TaskCore> previous_cores_;
-  List<Previous> previous_threads_;
+  List<Previous> previous_threads_, previous_processes_;
   ArrayView<TaskThread> buffer_;
+  ArrayView<TaskProcess> process_buffer_;
   uint64_t last_us_ = 0;
   uint64_t previous_npu_busy_us_ = 0;
   bool had_npu_ = false;
