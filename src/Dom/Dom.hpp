@@ -62,6 +62,7 @@ struct Node {
   Node* content = nullptr;   // <template>: the fragment that holds what is inside it (it is not part of the page)
   Node* shadow = nullptr;    // elements: the shadow root (a fragment) that is drawn in place of the children
   Node* shadow_host = nullptr;   // a shadow root: the element it belongs to
+  bool template_content = false;   // a fragment: it is the content of a <template> (its nodes belong to a document of their own as far as scripts can tell)
   bool shadow_closed = false;    // a shadow root made with mode "closed
   uint16_t caret = 0xFFFF, anchor = 0xFFFF;   // a text control: where the caret is and the other end of the selection (0xFFFF: at the end)
   uint8_t form_state = 0;    // elements: what the user (or a script) changed in a form control, and whether it is focused (FormState bits, Form.hpp)
@@ -166,6 +167,10 @@ DomError replace_child(Node* parent, Node* child, Node* old_child);
 void detach(Node* node);
 // A copy (with the children too if `deep`) that is in no tree. nullptr if memory ran out.
 Node* clone_node(Node* node, bool deep);
+// The same, made in `doc` (importNode).
+Node* clone_into(Document& doc, Node* node, bool deep);
+// Moves a node and what is under it into another document (adoptNode): a copy made there, `moved(old, new)` called for every pair. nullptr if memory ran out.
+Node* adopt_into(Document& target, Node* node, void (*moved)(Node* from, Node* to, void* user), void* user);
 
 // Is `node` `ancestor` or inside it?
 bool contains(const Node* ancestor, const Node* node);

@@ -330,7 +330,17 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
     }
     return true;
   }
-  if (IS("ownerDocument")) { *out = document ? Value::make_null() : node_value(c, n->owner->root()); return true; }
+  if (IS("ownerDocument")) {
+    if (document) { *out = Value::make_null(); return true; }
+    const dom::Node* top = n;
+    while (top->parent) top = top->parent;
+    if (top->type == dom::NodeType::Fragment && top->template_content) {   // what is inside a template belongs to a document of its own
+      if (!c.inert_document) c.inert_document = c.host.parse_document(StringView());
+      if (c.inert_document) { *out = node_value(c, c.inert_document->root()); return true; }
+    }
+    *out = node_value(c, n->owner->root());
+    return true;
+  }
   if (IS("isConnected")) { *out = bool_value(dom::is_connected(n)); return true; }
   if (IS("baseURI")) { *out = str_value(vm, c.host.address()); return true; }
   if (container) {
@@ -754,10 +764,34 @@ HostClass::Set node_set(Vm& vm, JsObject* o, JsString* key, const Value& value) 
 
 // --- Methods: nodes ------------------------------------------------------------------------------------------------------
 
+// A node from another document brought into this one (appendChild, adoptNode ...): it is made again in the document's own memory, and the script's object for
+// it (and for what is under it) is pointed at the new nodes, so that what a script holds on to stays the same node.
+void adopt_moved(dom::Node* from, dom::Node* to, void* user) {
+  Vm& vm = *static_cast<Vm*>(user);
+  if (!from->script) return;
+  JsObject* w = static_cast<JsObject*>(from->script);
+  w->host_data = to;
+  to->script = w;
+  from->script = nullptr;
+  for (const char* cached : {"__classList", "__style", "__dataset", "__childNodes", "__children", "__attributes"}) vm.delete_property(w, vm.intern(cached));   // (they point at the old node)
+}
+
+bool adopt_node(Vm& vm, dom::Node** node, dom::Document& target) {
+  dom::Node* n = *node;
+  if (n->owner == &target) return true;
+  if (n->type == dom::NodeType::Document) return throw_dom(vm, "NotSupportedError", "A document cannot be adopted.");
+  if (n->shadow_host) return throw_dom(vm, "HierarchyRequestError", "A shadow root cannot be adopted.");
+  dom::detach(n);
+  dom::Node* copy = dom::adopt_into(target, n, adopt_moved, &vm);
+  if (!copy) return throw_dom_error(vm, dom::DomError::OutOfMemory);
+  *node = copy;
+  return true;
+}
+
 NATIVE(node_append_child) {
   dom::Node* parent = this_node(vm, self);
   dom::Node* child = arg_node(vm, args, argc, 0);
-  if (!parent || !child) return false;
+  if (!parent || !child || !adopt_node(vm, &child, *parent->owner)) return false;
   const dom::DomError e = dom::append_child(parent, child);
   if (e != dom::DomError::None) return throw_dom_error(vm, e);
   *result = args[0];
@@ -773,6 +807,7 @@ NATIVE(node_insert_before) {
     ref = node_of(args[1]);
     if (!ref) return vm.throw_error(ErrorKind::TypeError, "parameter 2 is not of type 'Node'.");
   }
+  if (!adopt_node(vm, &child, *parent->owner)) return false;
   const dom::DomError e = dom::insert_before(parent, child, ref);
   if (e != dom::DomError::None) return throw_dom_error(vm, e);
   *result = args[0];
@@ -793,7 +828,7 @@ NATIVE(node_replace_child) {
   dom::Node* parent = this_node(vm, self);
   dom::Node* child = arg_node(vm, args, argc, 0);
   dom::Node* old_child = arg_node(vm, args, argc, 1);
-  if (!parent || !child || !old_child) return false;
+  if (!parent || !child || !old_child || !adopt_node(vm, &child, *parent->owner)) return false;
   const dom::DomError e = dom::replace_child(parent, child, old_child);
   if (e != dom::DomError::None) return throw_dom_error(vm, e);
   *result = args[1];
@@ -1328,7 +1363,9 @@ NATIVE(doc_import_node) {
   dom::Node* n = arg_node(vm, args, argc, 0);
   if (!n) return false;
   if (n->type == dom::NodeType::Document) return throw_dom(vm, "NotSupportedError", "A document cannot be imported.");
-  dom::Node* copy = dom::clone_node(n, Vm::to_boolean(arg_at(args, argc, 1)));
+  dom::Node* target = this_node(vm, self);
+  if (!target) return false;
+  dom::Node* copy = dom::clone_into(*target->owner, n, Vm::to_boolean(arg_at(args, argc, 1)));
   if (!copy) return throw_dom_error(vm, dom::DomError::OutOfMemory);
   *result = node_value(impl(vm), copy);
   return true;
@@ -1336,8 +1373,11 @@ NATIVE(doc_import_node) {
 
 NATIVE(doc_adopt_node) {
   dom::Node* n = arg_node(vm, args, argc, 0);
-  if (!n) return false;
-  dom::detach(n);
+  dom::Node* target = this_node(vm, self);
+  if (!n || !target) return false;
+  if (n->type == dom::NodeType::Document) return throw_dom(vm, "NotSupportedError", "A document cannot be adopted.");
+  if (n->owner == target->owner) dom::detach(n);
+  else if (!adopt_node(vm, &n, *target->owner)) return false;
   *result = args[0];
   return true;
 }

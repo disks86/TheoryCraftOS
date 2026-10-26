@@ -566,6 +566,7 @@ Node* template_content(Node* tmpl) {
   if (!tmpl->content) {
     tmpl->content = tmpl->owner->create_fragment();
     if (!tmpl->content) return nullptr;
+    tmpl->content->template_content = true;
   }
   move_into_content(tmpl);   // (what has been read into the template so far, when a script asks while the page is being read)
   return tmpl->content;

@@ -250,8 +250,7 @@ DomError replace_child(Node* parent, Node* child, Node* old_child) {
   return DomError::None;
 }
 
-Node* clone_node(Node* node, bool deep) {
-  Document& doc = *node->owner;
+Node* clone_into(Document& doc, Node* node, bool deep) {
   Node* copy = nullptr;
   switch (node->type) {
     case NodeType::Element:
@@ -266,8 +265,9 @@ Node* clone_node(Node* node, bool deep) {
         }
       }
       if (copy && node->is_tag("template")) {
-        copy->content = node->content ? clone_node(node->content, deep) : doc.create_fragment();
+        copy->content = node->content ? clone_into(doc, node->content, deep) : doc.create_fragment();
         if (!copy->content) return nullptr;
+        copy->content->template_content = true;
       }
       if (copy) {   // (a copy of a control keeps what was typed into it, not the focus)
         copy->form_state = node->form_state & ~0x08;
@@ -282,11 +282,43 @@ Node* clone_node(Node* node, bool deep) {
   if (!copy) return nullptr;
   if (deep) {
     for (Node* c = node->first_child; c; c = c->next) {
-      Node* cc = clone_node(c, true);
+      Node* cc = clone_into(doc, c, true);
       if (!cc) return nullptr;
       link_before(copy, cc, nullptr);
     }
   }
+  return copy;
+}
+
+Node* clone_node(Node* node, bool deep) { return clone_into(*node->owner, node, deep); }
+
+// The node and what is under it moved into another document: made again there (the nodes of a document live in its own memory), `moved(old, new)` told for each
+// pair so that whatever points at the old node can be pointed at the new one. The old nodes are left alone (a node that is no longer used).
+Node* adopt_into(Document& target, Node* node, void (*moved)(Node* from, Node* to, void* user), void* user) {
+  if (node->type == NodeType::Document) return nullptr;
+  Node* copy = clone_into(target, node, false);
+  if (!copy) return nullptr;
+  if (node->is_tag("template") && node->content) {   // (the shallow copy made an empty content: the real one comes over)
+    Node* content = adopt_into(target, node->content, moved, user);
+    if (!content) return nullptr;
+    content->template_content = true;
+    copy->content = content;
+  }
+  if (node->shadow) {
+    Node* shadow = adopt_into(target, node->shadow, moved, user);
+    if (!shadow) return nullptr;
+    shadow->shadow_host = copy;
+    shadow->shadow_closed = node->shadow->shadow_closed;
+    copy->shadow = shadow;
+  }
+  for (Node* c = node->first_child; c; c = c->next) {
+    Node* cc = adopt_into(target, c, moved, user);
+    if (!cc) return nullptr;
+    link_before(copy, cc, nullptr);
+  }
+  copy->caret = node->caret;
+  copy->anchor = node->anchor;
+  if (moved) moved(node, copy, user);
   return copy;
 }
 
