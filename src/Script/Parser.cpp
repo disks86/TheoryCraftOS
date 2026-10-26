@@ -1057,33 +1057,6 @@ class Parser {
     }
   }
 
-  // A copy of a simple expression (names, members, literals) - the target of a logical assignment is evaluated twice.
-  Node* clone_target(const Node* n, uint32_t depth) {
-    if (!n || depth > 16) return nullptr;
-    Node* c = nullptr;
-    switch (n->kind) {
-      case NodeKind::Ident:
-      case NodeKind::This:
-      case NodeKind::Number:
-      case NodeKind::String:
-        c = make(n->kind);
-        if (!c) return nullptr;
-        c->text = n->text;
-        c->number = n->number;
-        return c;
-      case NodeKind::Member:
-      case NodeKind::Index:
-        c = make(n->kind);
-        if (!c) return nullptr;
-        c->text = n->text;
-        c->flags = n->flags;
-        c->a = clone_target(n->a, depth + 1);
-        if (n->kind == NodeKind::Index) c->b = clone_target(n->b, depth + 1);
-        return c->a && (n->kind == NodeKind::Member || c->b) ? c : nullptr;
-      default: return nullptr;
-    }
-  }
-
   Node* assignment(bool no_in) {
     Depth guard(*this);
     return guard.ok ? assignment_inner(no_in) : nullptr;
@@ -1141,20 +1114,14 @@ class Parser {
     if (cur_.kind == T::AmpAmpAssign || cur_.kind == T::PipePipeAssign || cur_.kind == T::QQAssign) {   // a ||= b  is  a || (a = b)
       const Op logical = cur_.kind == T::AmpAmpAssign ? Op::And : cur_.kind == T::PipePipeAssign ? Op::Or : Op::Nullish;
       if (left->kind != NodeKind::Ident && left->kind != NodeKind::Member && left->kind != NodeKind::Index) return null_fail("Invalid left-hand side in assignment");
-      Node* target = clone_target(left, 0);
-      if (!target) return null_fail("Unsupported left-hand side of a logical assignment");
       Node* node = make(NodeKind::Logical);
-      Node* assign = make(NodeKind::Assign);
-      if (!node || !assign) return nullptr;
+      if (!node) return nullptr;
       next();
-      assign->op = Op::Assign;
-      assign->a = target;
-      assign->b = assignment(no_in);
-      if (!assign->b) return nullptr;
+      node->flags |= kFlagLogicalAssign;
       node->op = logical;
       node->a = left;
-      node->b = assign;
-      return node;
+      node->b = assignment(no_in);
+      return node->b ? node : nullptr;
     }
     Op op;
     if (assign_op(cur_.kind, &op)) {

@@ -839,6 +839,8 @@ static void test_modern_syntax() {
   CHECK(is("var a = null; a ?\?= 5; var b = 0; b ||= 9; var c = 1; c &&= 7; var d = 2; d ?\?= 8; [a, b, c, d].join()", "5,9,7,2"));
   CHECK(is("var o = { x: null, y: 'k' }; o.x ?\?= 'set'; o.y ?\?= 'no'; o['z'] ||= 'new'; [o.x, o.y, o.z].join()", "set,k,new"));
   CHECK(is("var n = 0; var o = { get v() { n++; return 1; }, set v(x) { n += 10; } }; o.v ||= 2; n", "1"));
+  CHECK(is("var n = 0; function k() { n++; return 'a'; } function g() { n += 10; return o; } var o = { a: 0 }; g()[k()] ||= 5; g()[k()] ||= 6; g().b ?\?= 1; var r = [o.a, o.b, n]; r.join()", "5,1,32"));
+  CHECK(is("var o = { a: [1, 2] }; var i = 0; o.a[i + 1] &&= 9; var r = o.a[1] + ',' + (o.a[i + 5] ||= 3); r", "9,3"));
   CHECK(is("[1_000_000, 0xFF_FF, 1_0.5_0, 0b1010_1010, 1e1_0].join()", "1000000,65535,10.5,170,10000000000"));
   CHECK(is("function F() { return new.target === F; } function G() { return new.target; } [new F() instanceof F, F(), G() === undefined].join()", "true,false,true"));
   CHECK(is("class P { constructor() { this.t = new.target.name; } } class C extends P {} [new P().t, new C().t].join()", "P,C"));

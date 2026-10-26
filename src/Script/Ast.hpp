@@ -60,6 +60,7 @@ enum NodeFlag : uint8_t {
   kFlagDelegate = 1,     // Unary Yield: yield* (the same bit as kFlagPrefix)
   kFlagGetter = 32,      // Property: get name() { ... }
   kFlagSetter = 64,      // Property: set name(v) { ... }
+  kFlagLogicalAssign = 1,   // Logical: a ||= b - a is the target (evaluated once), b the value
   kFlagSuper = 128,      // Member / Index: super.name (the object the method is looked up on is the prototype of the parent class; `this` stays the receiver)
 };
 

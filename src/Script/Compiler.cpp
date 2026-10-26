@@ -805,6 +805,10 @@ class Compiler {
         emit(binary_opcode(n->op), 0, 0, n->line);
         return;
       case NodeKind::Logical: {
+        if (n->flags & kFlagLogicalAssign) {
+          logical_assignment(n);
+          return;
+        }
         expression(n->a);
         const Opc jump = n->op == Op::And ? Opc::JumpIfFalseKeep : n->op == Op::Or ? Opc::JumpIfTrueKeep : Opc::JumpIfNotNullishKeep;
         const uint32_t at = emit(jump);
@@ -1009,6 +1013,43 @@ class Compiler {
         emit(Opc::Pop);
       }
     }
+  }
+
+  // a ||= b, a &&= b, a ??= b: the target's object and key are evaluated once, and the store happens only when the value is not short-circuited.
+  void logical_assignment(Node* n) {
+    Node* t = n->a;
+    const Opc jump = n->op == Op::And ? Opc::JumpIfFalseKeep : n->op == Op::Or ? Opc::JumpIfTrueKeep : Opc::JumpIfNotNullishKeep;
+    if (t->kind == NodeKind::Ident) {
+      load_name(t->text, n->line);
+      const uint32_t at = emit(jump);
+      expression(n->b);
+      store_name(t->text, n->line);
+      patch(at);
+      return;
+    }
+    const bool member = t->kind == NodeKind::Member;
+    expression(t->a);
+    if (member) {
+      emit(Opc::Dup);
+      emit(Opc::GetProp, static_cast<int32_t>(constant_string(t->text)), 0, n->line);
+    } else {
+      expression(t->b);
+      emit(Opc::Dup2);
+      emit(Opc::GetElem, 0, 0, n->line);
+    }
+    const uint32_t at = emit(jump);
+    expression(n->b);
+    if (member) emit(Opc::SetProp, static_cast<int32_t>(constant_string(t->text)), 0, n->line);
+    else emit(Opc::SetElem, 0, 0, n->line);
+    const uint32_t to_end = emit(Opc::Jump);
+    patch(at);   // short-circuited: [object, (key,) value] -> [value]
+    if (!member) {
+      emit(Opc::Swap);
+      emit(Opc::Pop);
+    }
+    emit(Opc::Swap);
+    emit(Opc::Pop);
+    patch(to_end);
   }
 
   void assignment(Node* n) {
