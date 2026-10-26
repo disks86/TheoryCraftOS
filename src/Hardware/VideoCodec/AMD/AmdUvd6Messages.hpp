@@ -22,6 +22,7 @@
 #include "Hardware/VideoCodec/AMD/AmdVcnDecodeMessages.hpp"
 #include "Hardware/VideoCodec/Software/H265Core.hpp"
 #include "Hardware/VideoCodec/Software/Mpeg2Core.hpp"
+#include "Hardware/VideoCodec/Software/Mpeg4Headers.hpp"
 #include "Hardware/VideoCodec/Software/Vc1Core.hpp"
 #include "Utility/ArrayView.hpp"
 
@@ -40,7 +41,7 @@ namespace hardware {
 namespace amd_uvd6 {
 
 constexpr uint32_t kMsgCreate = 0, kMsgDecode = 1, kMsgDestroy = 2;      // msg_type
-constexpr uint32_t kStreamTypeVc1 = 1, kStreamTypeMpeg2 = 3, kStreamTypeH264Perf = 7, kStreamTypeH265 = 0x10;   // RUVD_CODEC_VC1, _MPEG2, _H264_PERF, _H265
+constexpr uint32_t kStreamTypeVc1 = 1, kStreamTypeMpeg2 = 3, kStreamTypeMpeg4 = 4, kStreamTypeH264Perf = 7, kStreamTypeH265 = 0x10;   // RUVD_CODEC_VC1, _MPEG2, _H264_PERF, _H265
 
 constexpr uint32_t kMessagePageBytes = 0x1000;       // the message structure's page; the feedback area starts behind it
 constexpr uint32_t kFeedbackOffset = 0x1000;         // FB_BUFFER_OFFSET
@@ -120,6 +121,21 @@ bool build_mpeg2_decode_message(ByteView out, uint32_t stream_handle, uint32_t f
 // The feedback area's first word (its size) in a buffer of at least kMessageFeedbackItBytes at the message page; the rest of the area is cleared.
 bool prepare_mpeg2_feedback(ByteView message_buffer);
 
+// MPEG-4 Part 2 (RUVD_CODEC_MPEG4, Simple and Advanced Simple profile): the references are named by decode job numbers like MPEG-2's (get_ref_pic_idx is the same
+// function), there is no context buffer and no scaling table, and the firmware reads the plane header out of the bitstream itself - the message carries the layer's
+// parameters (what Mesa's get_mpeg4_msg takes from the VA-API picture parameters) and the quantiser matrices, not the plane's coding type or time stamps.
+struct Mpeg4BufferSizes {
+  uint64_t dpb = 0;
+  uint32_t references = 0;   // the two anchors and the picture being decoded
+};
+// Mesa's calc_dpb_size for MPEG-4: three pictures, the coding-mode (64 bytes a macroblock) and intra-transform (32 bytes a macroblock) surfaces, and not under 30 MiB.
+// `width` and `height` are the layer's; they are aligned to macroblocks here. 0 when the picture is too big.
+Mpeg4BufferSizes mpeg4_buffer_sizes(uint32_t width, uint32_t height);
+// Builds the decode message of one plane. `pictures` are the job numbers (this plane's, and the anchors it predicts from; an intra plane names the latest job, as Mesa does).
+// False when `out` is too small, the layer is not within the limits, or a reference is not one of the last six jobs.
+bool build_mpeg4_decode_message(ByteView out, uint32_t stream_handle, uint32_t feedback_number, const mpeg4::Vol& vol, const Mpeg2Pictures& pictures, const DecodeBuffers& buffers);
+bool prepare_mpeg4_feedback(ByteView message_buffer);   // as prepare_mpeg2_feedback
+
 // VC-1 (RUVD_CODEC_VC1, progressive Simple, Main and Advanced profile): the message holds only the sequence and entry point flags (struct ruvd_vc1 has no picture indexes);
 // the firmware keeps the decoded pictures in the picture buffer itself and finds the anchors by decoding order, and parses the picture header, bit planes and
 // macroblocks out of the frame data. The job is the MPEG-2 one (no context buffer, no scaling table).
@@ -153,6 +169,8 @@ uint32_t decode_job_buffers(const JobAddresses& addresses, ArrayView<AmdUvd6Ring
 constexpr uint32_t kMpeg2JobBuffers = 6;
 uint32_t mpeg2_job_buffers(const JobAddresses& addresses, ArrayView<AmdUvd6Ring::Buffer> out);
 constexpr uint32_t kVc1JobBuffers = kMpeg2JobBuffers;   // the same list for a VC-1 job
+constexpr uint32_t kMpeg4JobBuffers = kMpeg2JobBuffers;   // and for an MPEG-4 one
+uint32_t mpeg4_job_buffers(const JobAddresses& addresses, ArrayView<AmdUvd6Ring::Buffer> out);
 uint32_t vc1_job_buffers(const JobAddresses& addresses, ArrayView<AmdUvd6Ring::Buffer> out);
 // The buffers of a create or destroy job: the session context and the message.
 constexpr uint32_t kSessionJobBuffers = 2;
