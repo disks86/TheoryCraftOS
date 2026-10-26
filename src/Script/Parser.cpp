@@ -269,6 +269,14 @@ class Parser {
             ++pos_;
           }
         }
+        if (cp >= 0xDC00 && cp <= 0xDFFF && out->size() >= 3) {   // "\uD83D\uDE00": a surrogate pair is one character
+          const StringView tail = out->view().substr(out->size() - 3);
+          if (static_cast<uint8_t>(tail[0]) == 0xED && static_cast<uint8_t>(tail[1]) >= 0xA0 && static_cast<uint8_t>(tail[1]) <= 0xAF) {
+            const uint32_t high = 0xD000u + ((static_cast<uint8_t>(tail[1]) & 0x3Fu) << 6) + (static_cast<uint8_t>(tail[2]) & 0x3Fu);
+            out->truncate(out->size() - 3);
+            cp = 0x10000 + ((high - 0xD800) << 10) + (cp - 0xDC00);
+          }
+        }
         append_utf8(cp, out);
         break;
       }

@@ -568,7 +568,17 @@ const char kBase64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123
 
 NATIVE(win_btoa) {
   String text(vm.allocator()), out(vm.allocator());
-  if (!arg_text(vm, arg_at(args, argc, 0), &text)) return false;
+  JsString* source;
+  if (!vm.to_string(arg_at(args, argc, 0), &source)) return false;
+  if (vm.string_kind(source) == 2) {   // text: each character is a byte (Latin-1); anything above 255 is an error
+    const uint16_t* wide = vm.string_wide(source);
+    for (uint32_t i = 0; wide && i < source->units; ++i) {
+      if (wide[i] > 255) return throw_dom(vm, "InvalidCharacterError", "The string to be encoded contains characters outside of the Latin1 range.");
+      text.push_back(static_cast<char>(wide[i]));
+    }
+  } else {
+    text.assign(source->view());
+  }
   const StringView s = text.view();
   for (uint64_t i = 0; i < s.size(); i += 3) {
     const uint32_t b0 = static_cast<uint8_t>(s[i]), b1 = i + 1 < s.size() ? static_cast<uint8_t>(s[i + 1]) : 0, b2 = i + 2 < s.size() ? static_cast<uint8_t>(s[i + 2]) : 0;
@@ -610,7 +620,7 @@ NATIVE(win_atob) {
       out.push_back(static_cast<char>((buffer >> bits) & 0xFF));
     }
   }
-  *result = str_value(vm, out.view());
+  *result = Value::make_string(vm.new_binary_string(out.view()));   // (bytes: every character is 0..255)
   return true;
 }
 

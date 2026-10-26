@@ -109,6 +109,28 @@ extern const HostClass kNodeHostClass;
 inline DomBindings::Impl& impl(Vm& vm) { return *static_cast<DomBindings::Impl*>(vm.user()); }
 
 inline Value arg_at(const Value* args, uint32_t argc, uint32_t i) { return i < argc ? args[i] : Value(); }
+
+// Text offsets: the DOM keeps text as UTF-8 and counts bytes; scripts count UTF-16 code units. (A byte that continues a character adds nothing; a four-byte
+// character is two units.)
+inline uint64_t utf16_length(StringView s) {
+  uint64_t units = 0;
+  for (uint64_t i = 0; i < s.size(); ++i) {
+    const uint8_t c = static_cast<uint8_t>(s[i]);
+    if ((c & 0xC0) != 0x80) units += c >= 0xF0 ? 2 : 1;
+  }
+  return units;
+}
+inline uint64_t utf16_to_byte(StringView s, uint64_t unit) {
+  uint64_t units = 0, i = 0;
+  while (i < s.size() && units < unit) {
+    const uint8_t c = static_cast<uint8_t>(s[i]);
+    units += c >= 0xF0 ? 2 : 1;
+    ++i;
+    while (i < s.size() && (static_cast<uint8_t>(s[i]) & 0xC0) == 0x80) ++i;
+  }
+  return i;
+}
+inline uint64_t byte_to_utf16(StringView s, uint64_t byte) { return utf16_length(s.first(byte < s.size() ? byte : s.size())); }
 inline Value str_value(Vm& vm, StringView text) { return Value::make_string(vm.new_string(text)); }
 inline Value num_value(double d) { return Value::make_number(d); }
 inline Value bool_value(bool b) { return Value::make_bool(b); }

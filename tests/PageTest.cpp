@@ -3185,7 +3185,7 @@ static void stock(FakeEnvironment& env) {
 static void test_fetch() {
   CHECK(async_is("fetch('/api/user').then(function (r) { console.log(r.status, r.ok, r.statusText, r.url, r.type, r.redirected, r.headers.get('content-type'), r.headers.get('x-custom'), r.headers.get('set-cookie'), r.bodyUsed); return r.json() }).then(function (d) { console.log(d.name, d.langs.join('+')) });",
                  "200 true OK https://app.example/api/user basic false application/json yes null false | Ada en+fr", stock));
-  CHECK(async_is("fetch('/text').then(function (r) { return r.text() }).then(function (t) { console.log(t, t.length) });", "plain text \xC3\xA9 13", stock));
+  CHECK(async_is("fetch('/text').then(function (r) { return r.text() }).then(function (t) { console.log(t, t.length) });", "plain text \xC3\xA9 12", stock));
   CHECK(async_is("fetch('/bad').then(function (r) { console.log(r.status, r.ok); return r.text() }).then(function (t) { console.log(t) }); fetch('/missing').then(function (r) { console.log(r.status, r.ok) }); fetch('/empty').then(function (r) { console.log(r.status, r.body); return r.text() }).then(function (t) { console.log('[' + t + ']') });",
                  "500 false | oops | 404 false | 204 null | []", stock));
   CHECK(async_is("fetch('/old').then(function (r) { console.log(r.redirected, r.url); return r.text() }).then(function (t) { console.log(t) }); fetch('/old', { redirect: 'manual' }).then(function (r) { console.log(r.status, r.headers.get('location')) }); fetch('/old', { redirect: 'error' }).catch(function (e) { console.log(e.name) });",
@@ -3234,7 +3234,7 @@ static void test_fetch() {
 
 static void test_xhr() {
   CHECK(async_is("var x = new XMLHttpRequest(); var log = []; log.push(x.readyState); x.onreadystatechange = function () { log.push('rs' + x.readyState) }; x.onload = function () { log.push('load ' + x.status + ' ' + x.statusText + ' ' + x.responseText.length) }; x.onloadend = function () { log.push('end'); console.log(log.join()) };"
-                 "x.open('GET', '/text'); x.send(); log.push('sent');", "0,rs1,sent,rs2,rs3,rs4,load 200 OK 13,end", stock));
+                 "x.open('GET', '/text'); x.send(); log.push('sent');", "0,rs1,sent,rs2,rs3,rs4,load 200 OK 12,end", stock));
   CHECK(async_is("var x = new XMLHttpRequest(); x.open('GET', '/api/user'); x.responseType = 'json'; x.onload = function () { console.log(x.response.name, typeof x.response, x.getResponseHeader('Content-Type'), x.getResponseHeader('x-nothing'), x.getAllResponseHeaders().split('\\r\\n').sort().join('|'), x.responseURL) }; x.send();",
                  "Ada object application/json null |content-type: application/json|x-custom: yes https://app.example/api/user", stock));
   CHECK(async_is("var x = new XMLHttpRequest(); x.open('POST', '/api/echo'); x.setRequestHeader('Content-Type', 'text/plain'); x.setRequestHeader('X-A', '1'); x.setRequestHeader('X-A', '2'); x.setRequestHeader('Cookie', 'evil=1'); x.onload = function () { console.log(x.status, x.responseText) }; x.send('payload');", "201 created", stock));

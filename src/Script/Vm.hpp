@@ -93,6 +93,16 @@ class Vm {
 
   // --- Strings and objects
   JsString* new_string(StringView text);
+  // Strings as scripts see them: text in UTF-16 code units, raw bytes as bytes (see JsString::kind).
+  uint8_t string_kind(JsString* s);
+  uint32_t string_length(JsString* s) { return string_kind(s) ? s->units : 0; }
+  const uint16_t* string_wide(JsString* s);   // the code units of a text string (null for ascii and binary, where the bytes are the characters)
+  JsString* string_from_units(const uint16_t* units, uint32_t count);
+  JsString* string_part(JsString* s, uint32_t from, uint32_t to);   // the characters from..to (clamped) as a string
+  uint32_t string_unit_at(JsString* s, uint32_t index);
+  uint64_t string_byte_of_unit(JsString* s, uint64_t unit);       // the byte offset of a character offset (for ascii and binary strings the same number)
+  uint64_t string_unit_of_byte(JsString* s, uint64_t byte);       // and the other way round             // the character at index (< length)
+  JsString* new_binary_string(StringView bytes);                    // raw bytes that scripts see as characters 0..255
   // A string of `length` zero bytes (the storage of an ArrayBuffer).
   JsString* new_bytes(uint32_t length);
   JsString* intern(StringView text);

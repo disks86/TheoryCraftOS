@@ -172,7 +172,7 @@ void write_last_index(Vm& vm, JsObject* re, double v) { vm.define_named(re, "las
 Value match_array(Vm& vm, Compiled* c, JsString* s, const regex::Match& m) {
   JsObject* a = vm.new_array(m.count);
   for (uint32_t g = 0; g < m.count; ++g) vm.array_push(a, m.has(g) ? str_value(vm, m.text(s->view(), g)) : Value());
-  vm.define_named(a, "index", Value::make_number(static_cast<double>(m.begin())));
+  vm.define_named(a, "index", Value::make_number(static_cast<double>(vm.string_unit_of_byte(s, m.begin()))));
   vm.define_named(a, "input", Value::make_string(s));
   const regex::Program p = c->regex.program();
   if (p.names.size() == 0) {
@@ -194,13 +194,13 @@ bool exec_once(Vm& vm, JsObject* re, JsString* s, regex::Match* m, bool* found) 
   const bool uses_last = c->global || c->sticky;
   double last = 0;
   if (uses_last && !read_last_index(vm, re, &last)) return false;
-  if (last > static_cast<double>(s->length)) {
+  if (last > static_cast<double>(vm.string_length(s))) {
     write_last_index(vm, re, 0);
     *found = false;
     return true;
   }
-  if (!search_from(vm, c, s->view(), static_cast<uint64_t>(last), c->sticky, m, found)) return false;
-  if (uses_last) write_last_index(vm, re, *found ? static_cast<double>(m->end()) : 0);
+  if (!search_from(vm, c, s->view(), vm.string_byte_of_unit(s, static_cast<uint64_t>(last)), c->sticky, m, found)) return false;
+  if (uses_last) write_last_index(vm, re, *found ? static_cast<double>(vm.string_unit_of_byte(s, m->end())) : 0);
   return true;
 }
 
@@ -392,7 +392,7 @@ bool regexp_search(Vm& vm, JsString* s, const Value& regexp, Value* result) {
   regex::Match m;
   bool found;
   if (!search_from(vm, c, s->view(), 0, c->sticky, &m, &found)) return false;
-  *result = Value::make_number(found ? static_cast<double>(m.begin()) : -1.0);
+  *result = Value::make_number(found ? static_cast<double>(vm.string_unit_of_byte(s, m.begin())) : -1.0);
   return true;
 }
 
@@ -417,7 +417,7 @@ bool regexp_replace(Vm& vm, JsString* s, const Value& regexp, const Value& repla
     if (function) {
       List<Value> call_args(vm.allocator());
       for (uint32_t g = 0; g < m.count; ++g) call_args.push_back(m.has(g) ? str_value(vm, m.text(subject, g)) : Value());
-      call_args.push_back(Value::make_number(static_cast<double>(m.begin())));
+      call_args.push_back(Value::make_number(static_cast<double>(vm.string_unit_of_byte(s, m.begin()))));
       call_args.push_back(Value::make_string(s));
       if (p.names.size() > 0) {
         JsObject* groups = vm.new_plain();

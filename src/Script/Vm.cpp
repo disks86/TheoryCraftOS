@@ -168,7 +168,11 @@ void Vm::link(Cell* cell, uint64_t size) {
 
 void Vm::free_cell(Cell* cell) {
   switch (cell->kind) {
-    case CellKind::String: allocator_.deallocate(cell); break;
+    case CellKind::String: {
+      allocator_.deallocate(static_cast<JsString*>(cell)->wide);
+      allocator_.deallocate(cell);
+      break;
+    }
     case CellKind::Env: allocator_.deallocate(cell); break;
     case CellKind::Object: {
       JsObject* o = static_cast<JsObject*>(cell);
@@ -185,6 +189,183 @@ void Vm::free_cell(Cell* cell) {
       break;
     }
   }
+}
+
+uint8_t Vm::string_kind(JsString* s) {
+  if (s->kind) return s->kind;
+  const uint8_t* p = reinterpret_cast<const uint8_t*>(s->data());
+  const uint32_t n = s->length;
+  if (s->binary) {
+    s->kind = 3;
+    s->units = n;
+    return 3;
+  }
+  bool ascii = true;
+  uint32_t i = 0, units = 0;
+  bool valid = true;
+  while (i < n && valid) {
+    const uint8_t c = p[i];
+    if (c < 0x80) {
+      ++i;
+      ++units;
+      continue;
+    }
+    ascii = false;
+    uint32_t extra;
+    if (c >= 0xC2 && c <= 0xDF) extra = 1;
+    else if (c >= 0xE0 && c <= 0xEF) extra = 2;
+    else if (c >= 0xF0 && c <= 0xF4) extra = 3;
+    else { valid = false; break; }
+    if (i + extra >= n) { valid = false; break; }
+    for (uint32_t k = 1; k <= extra; ++k)
+      if ((p[i + k] & 0xC0) != 0x80) valid = false;
+    if (!valid) break;
+    if (c == 0xE0 && p[i + 1] < 0xA0) valid = false;   // (overlong)
+    if (c == 0xF0 && p[i + 1] < 0x90) valid = false;
+    if (c == 0xF4 && p[i + 1] > 0x8F) valid = false;
+    if (!valid) break;
+    i += extra + 1;
+    units += extra == 3 ? 2 : 1;
+  }
+  if (!valid) {
+    s->kind = 3;
+    s->units = n;
+  } else if (ascii) {
+    s->kind = 1;
+    s->units = n;
+  } else {
+    s->kind = 2;
+    s->units = units;
+  }
+  return s->kind;
+}
+
+namespace {
+// A code point (a lone surrogate included) as UTF-8 bytes appended to `out`.
+void append_wtf8(String* out, uint32_t cp) {
+  if (cp < 0x80) {
+    out->push_back(static_cast<char>(cp));
+  } else if (cp < 0x800) {
+    out->push_back(static_cast<char>(0xC0 | (cp >> 6)));
+    out->push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+  } else if (cp < 0x10000) {
+    out->push_back(static_cast<char>(0xE0 | (cp >> 12)));
+    out->push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+    out->push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+  } else {
+    out->push_back(static_cast<char>(0xF0 | (cp >> 18)));
+    out->push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+    out->push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+    out->push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+  }
+}
+}  // namespace
+
+const uint16_t* Vm::string_wide(JsString* s) {
+  if (string_kind(s) != 2) return nullptr;
+  if (s->wide) return s->wide;
+  uint16_t* w = static_cast<uint16_t*>(allocator_.allocate(sizeof(uint16_t) * (uint64_t{s->units} + 1)));
+  if (!w) {
+    halt("out of memory");
+    return nullptr;
+  }
+  const uint8_t* p = reinterpret_cast<const uint8_t*>(s->data());
+  uint32_t i = 0, k = 0;
+  while (i < s->length && k < s->units) {
+    const uint8_t c = p[i];
+    uint32_t cp, step;
+    if (c < 0x80) { cp = c; step = 1; }
+    else if (c < 0xE0) { cp = ((c & 0x1Fu) << 6) | (p[i + 1] & 0x3Fu); step = 2; }
+    else if (c < 0xF0) { cp = ((c & 0x0Fu) << 12) | ((p[i + 1] & 0x3Fu) << 6) | (p[i + 2] & 0x3Fu); step = 3; }
+    else { cp = ((c & 0x07u) << 18) | ((p[i + 1] & 0x3Fu) << 12) | ((p[i + 2] & 0x3Fu) << 6) | (p[i + 3] & 0x3Fu); step = 4; }
+    i += step;
+    if (cp >= 0x10000) {
+      cp -= 0x10000;
+      w[k++] = static_cast<uint16_t>(0xD800 + (cp >> 10));
+      if (k < s->units) w[k++] = static_cast<uint16_t>(0xDC00 + (cp & 0x3FF));
+    } else {
+      w[k++] = static_cast<uint16_t>(cp);
+    }
+  }
+  s->wide = w;
+  heap_bytes_ += sizeof(uint16_t) * (uint64_t{s->units} + 1);
+  return w;
+}
+
+JsString* Vm::string_from_units(const uint16_t* units, uint32_t count) {
+  String out(allocator_);
+  for (uint32_t i = 0; i < count; ++i) {
+    uint32_t u = units[i];
+    if (u >= 0xD800 && u <= 0xDBFF && i + 1 < count && units[i + 1] >= 0xDC00 && units[i + 1] <= 0xDFFF) {   // (a pair is one character)
+      u = 0x10000 + ((u - 0xD800) << 10) + (units[i + 1] - 0xDC00);
+      ++i;
+    }
+    append_wtf8(&out, u);
+  }
+  return new_string(out.view());
+}
+
+uint64_t Vm::string_byte_of_unit(JsString* s, uint64_t unit) {
+  if (string_kind(s) != 2) return unit;
+  if (unit >= s->units) return s->length;
+  uint32_t u = 0, b = 0;
+  if (s->map_unit <= unit) { u = s->map_unit; b = s->map_byte; }
+  const uint8_t* p = reinterpret_cast<const uint8_t*>(s->data());
+  while (u < unit && b < s->length) {
+    const uint8_t c = p[b];
+    const uint32_t step = c < 0x80 ? 1 : c < 0xE0 ? 2 : c < 0xF0 ? 3 : 4;
+    u += c >= 0xF0 ? 2 : 1;
+    b += step;
+  }
+  s->map_unit = u;   // (u may be one past `unit` when it fell inside a surrogate pair: the pair's end)
+  s->map_byte = b;
+  return b;
+}
+
+uint64_t Vm::string_unit_of_byte(JsString* s, uint64_t byte) {
+  if (string_kind(s) != 2) return byte;
+  if (byte >= s->length) return s->units;
+  uint32_t u = 0, b = 0;
+  if (s->map_byte <= byte) { u = s->map_unit; b = s->map_byte; }
+  const uint8_t* p = reinterpret_cast<const uint8_t*>(s->data());
+  while (b < byte && b < s->length) {
+    const uint8_t c = p[b];
+    const uint32_t step = c < 0x80 ? 1 : c < 0xE0 ? 2 : c < 0xF0 ? 3 : 4;
+    u += c >= 0xF0 ? 2 : 1;
+    b += step;
+  }
+  s->map_unit = u;
+  s->map_byte = b;
+  return u;
+}
+
+JsString* Vm::new_binary_string(StringView bytes) {
+  JsString* s = new_string(bytes);
+  if (s != empty_ && !s->interned) s->binary = true;
+  return s;
+}
+
+JsString* Vm::string_part(JsString* s, uint32_t from, uint32_t to) {
+  const uint8_t kind = string_kind(s);
+  if (to > s->units) to = s->units;
+  if (from >= to) return empty_;
+  if (kind == 2) {
+    const uint16_t* w = string_wide(s);
+    if (!w) return empty_;
+    return string_from_units(w + from, to - from);
+  }
+  if (from == 0 && to == s->length) return s;
+  JsString* part = new_string(StringView(s->data() + from, to - from));
+  if (kind == 3 && part != empty_ && !part->interned) part->binary = true;
+  return part;
+}
+
+uint32_t Vm::string_unit_at(JsString* s, uint32_t index) {
+  if (string_kind(s) == 2) {
+    const uint16_t* w = string_wide(s);
+    return w && index < s->units ? w[index] : 0;
+  }
+  return index < s->length ? static_cast<uint8_t>(s->data()[index]) : 0;
 }
 
 JsString* Vm::new_string(StringView text) {
@@ -223,6 +404,19 @@ JsString* Vm::new_bytes(uint32_t length) {
 JsString* Vm::concat(JsString* a, JsString* b) {
   if (a->length == 0) return b;
   if (b->length == 0) return a;
+  if (a->length >= 3 && b->length >= 3) {   // a lone high surrogate followed by a lone low one is one character (4 bytes, not 2 x 3)
+    const uint8_t* ae = reinterpret_cast<const uint8_t*>(a->data()) + a->length - 3;
+    const uint8_t* bs = reinterpret_cast<const uint8_t*>(b->data());
+    if (ae[0] == 0xED && ae[1] >= 0xA0 && ae[1] <= 0xAF && bs[0] == 0xED && bs[1] >= 0xB0 && bs[1] <= 0xBF) {
+      const uint32_t high = 0xD000u + ((ae[1] & 0x3Fu) << 6) + (ae[2] & 0x3Fu), low = 0xD000u + ((bs[1] & 0x3Fu) << 6) + (bs[2] & 0x3Fu);
+      const uint32_t cp = 0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00);
+      String merged(allocator_);
+      merged.append(StringView(a->data(), a->length - 3));
+      append_wtf8(&merged, cp);
+      merged.append(StringView(b->data() + 3, b->length - 3));
+      return new_string(merged.view());
+    }
+  }
   const uint64_t total = uint64_t{a->length} + b->length;
   if (total > (64u << 20)) {
     halt("string too long");
@@ -240,6 +434,7 @@ JsString* Vm::concat(JsString* a, JsString* b) {
   for (uint32_t i = 0; i < b->length; ++i) d[a->length + i] = b->data()[i];
   d[total] = 0;
   s->hash = hash_text(StringView(d, total));
+  s->binary = a->binary || b->binary;   // (raw bytes stay raw)
   link(s, sizeof(JsString) + total + 1);
   return s;
 }
@@ -998,12 +1193,12 @@ bool Vm::get(const Value& base, JsString* key, Value* out) {
     case Tag::String: {
       JsString* s = base.as_string();
       if (key == length_) {
-        *out = Value::make_number(s->length);
+        *out = Value::make_number(string_length(s));
         return true;
       }
       uint32_t i;
       if (canonical_index(key->view(), &i)) {
-        *out = i < s->length ? Value::make_string(new_string(StringView(s->data() + i, 1))) : Value();
+        *out = i < string_length(s) ? Value::make_string(string_part(s, i, i + 1)) : Value();
         return true;
       }
       o = string_proto_;
@@ -1072,7 +1267,7 @@ bool Vm::get_member(const Value& base, const Value& key, Value* out) {
     if (o->okind == ObjKind::TypedArray) return typed_array_get_value(*this, o, i, out);
   } else if (base.is_string() && key.is_number() && array_index(key, &i)) {
     JsString* s = base.as_string();
-    *out = i < s->length ? Value::make_string(new_string(StringView(s->data() + i, 1))) : Value();
+    *out = i < string_length(s) ? Value::make_string(string_part(s, i, i + 1)) : Value();
     return true;
   }
   if (base.is_nullish()) {
@@ -1811,8 +2006,8 @@ bool Vm::make_iterator(const Value& v, bool for_in, Value* out) {
       }
       it->target = keys;   // (the list of keys to visit; kept alive through the iterator)
     } else if (v.is_string()) {
-      JsObject* keys = new_array(v.as_string()->length);
-      for (uint32_t i = 0; i < v.as_string()->length; ++i) {
+      JsObject* keys = new_array(string_length(v.as_string()));
+      for (uint32_t i = 0; i < string_length(v.as_string()); ++i) {
         String n(allocator_);
         n.append_uint(i);
         array_push(keys, Value::make_string(new_string(n.view())));
@@ -1884,9 +2079,15 @@ bool Vm::iterator_next(JsObject* it, Value* out) {
   }
   if (src.is_string()) {
     JsString* s = src.as_string();
-    if (it->position < s->length) {
-      *out = Value::make_string(new_string(StringView(s->data() + it->position, 1)));
-      ++it->position;
+    const uint32_t length = string_length(s);
+    if (it->position < length) {   // (a character at a time: a surrogate pair is one)
+      uint32_t step = 1;
+      if (string_kind(s) == 2) {
+        const uint16_t* w = string_wide(s);
+        if (w && w[it->position] >= 0xD800 && w[it->position] <= 0xDBFF && it->position + 1 < length && w[it->position + 1] >= 0xDC00 && w[it->position + 1] <= 0xDFFF) step = 2;
+      }
+      *out = Value::make_string(string_part(s, it->position, it->position + step));
+      it->position += step;
       return true;
     }
     return false;

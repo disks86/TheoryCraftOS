@@ -352,13 +352,15 @@ bool form_get(DomBindings::Impl& c, dom::Node* n, StringView k, Value* out) {
   if (IS("textLength") && (input || textarea)) {
     String v(a);
     dom::get_value(n, &v);
-    *out = num_value(static_cast<double>(v.size()));
+    *out = num_value(static_cast<double>(utf16_length(v.view())));
     return true;
   }
   if ((IS("selectionStart") || IS("selectionEnd")) && (input || textarea)) {
     uint32_t s, e, caret;
     dom::get_selection(n, &s, &e, &caret);
-    *out = num_value(IS("selectionStart") ? s : e);
+    String v(a);
+    dom::get_value(n, &v);
+    *out = num_value(static_cast<double>(byte_to_utf16(v.view(), IS("selectionStart") ? s : e)));
     return true;
   }
   if (IS("selectionDirection") && (input || textarea)) { *out = str_value(vm, "none"); return true; }
@@ -555,7 +557,9 @@ HostClass::Set form_set(DomBindings::Impl& c, dom::Node* n, StringView k, const 
     if (!vm.to_number(value, &d)) return HostClass::Set::Threw;
     uint32_t s, e, caret;
     dom::get_selection(n, &s, &e, &caret);
-    const uint32_t v = d > 0 ? static_cast<uint32_t>(d) : 0;
+    String text(vm.allocator());
+    dom::get_value(n, &text);
+    const uint32_t v = d > 0 ? static_cast<uint32_t>(utf16_to_byte(text.view(), static_cast<uint64_t>(d))) : 0;
     if (IS("selectionStart")) dom::set_selection(n, v, e < v ? v : e);
     else dom::set_selection(n, s > v ? v : s, v);
     return HostClass::Set::Handled;
@@ -750,7 +754,11 @@ NATIVE(el_set_selection_range) {
   double a = 0, b = 0;
   if (argc > 0 && !vm.to_number(args[0], &a)) return false;
   if (argc > 1 && !vm.to_number(args[1], &b)) return false;
-  if (n->is_tag("input") || n->is_tag("textarea")) dom::set_selection(n, a > 0 ? static_cast<uint32_t>(a) : 0, b > 0 ? static_cast<uint32_t>(b) : 0);
+  if (n->is_tag("input") || n->is_tag("textarea")) {
+    String text(vm.allocator());
+    dom::get_value(n, &text);
+    dom::set_selection(n, a > 0 ? static_cast<uint32_t>(utf16_to_byte(text.view(), static_cast<uint64_t>(a))) : 0, b > 0 ? static_cast<uint32_t>(utf16_to_byte(text.view(), static_cast<uint64_t>(b))) : 0);
+  }
   return true;
 }
 
@@ -764,7 +772,9 @@ NATIVE(el_set_range_text) {
   if (argc >= 3) {
     double a = 0, b = 0;
     if (!vm.to_number(args[1], &a) || !vm.to_number(args[2], &b)) return false;
-    dom::set_selection(n, a > 0 ? static_cast<uint32_t>(a) : 0, b > 0 ? static_cast<uint32_t>(b) : 0);
+    String current(vm.allocator());
+    dom::get_value(n, &current);
+    dom::set_selection(n, a > 0 ? static_cast<uint32_t>(utf16_to_byte(current.view(), static_cast<uint64_t>(a))) : 0, b > 0 ? static_cast<uint32_t>(utf16_to_byte(current.view(), static_cast<uint64_t>(b))) : 0);
   }
   dom::replace_selection(n, text.view(), false);
   return true;

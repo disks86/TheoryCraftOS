@@ -35,9 +35,8 @@ gaps: `grep -c xfail tests/data/wpt/*.js`. The largest ones today:
   (`FunctionCode::library`). Left: the `prototype` of built-in constructors is configurable, module namespace properties are accessors
   (not writable data properties), no strict-only early errors (octal literals, duplicate parameters, `eval`/`arguments` assignment). Also missing:
   `SharedArrayBuffer`/`Atomics` are single-threaded stand-ins (no `wait`/`notify` blocking, `instanceof ArrayBuffer` is true); missing: `Intl` beyond basic formatting, RegExp `v` flag (set notation) / `d` flag /
-  duplicate named groups / case folding beyond ASCII (and `\p` covers the general categories, the main scripts and some binary properties only), `Object.prototype.toString` tag for Date,
-  TDZ and `const` only inside functions and blocks (top-level `let`/`const` are globals), duplicate `let` at top level, array destructuring does not close its iterator, sloppy `arguments` mapping, `Symbol.match/split/unscopables`, `String.prototype.normalize`/special
-  casing, lone-surrogate handling, `new.target`/`Reflect.construct`, tagged template caching, `for…in` integer key order, and a call depth of 500.
+  duplicate named groups / case folding beyond ASCII (and a non-`u` `.` matches a whole code point, not a code unit) (and `\p` covers the general categories, the main scripts and some binary properties only), `Object.prototype.toString` tag for Date,
+  TDZ and `const` only inside functions and blocks (top-level `let`/`const` are globals), duplicate `let` at top level, array destructuring does not close its iterator, sloppy `arguments` mapping, `Symbol.match/split/unscopables`, locale-specific case mapping (`toLocaleUpperCase('tr')`), `new.target`/`Reflect.construct`, tagged template caching, `for…in` integer key order, and a call depth of 500.
 - **HTML**: the parser follows the standard (`src/Dom/HtmlBuilder.cpp`: tokenizer states, insertion modes, adoption agency, foster parenting, foreign
   content, templates, quirks mode). Left: the doctype is not a node (`document.doctype`, `publicId`/`systemId`), `DOMParser` with XML, character
   references that stand for two code points, `innerHTML` scripts must not run.
@@ -70,3 +69,12 @@ one test per row for that reason.
 Tests that need no DOM can be checked against a reference engine before they are trusted: concatenate `harness.js` and the file and run it with
 `node` (the JavaScript, module and WebAssembly files were verified that way; for modules use `data:` URLs in place of `mod_url`). Every `xfail`
 should then report `XPASS` in node.
+
+## Strings
+
+The engine stores strings as UTF-8 (a lone surrogate is kept as its three bytes), and scripts see UTF-16 code units: `length`, indexing, `charCodeAt`, `slice`,
+`indexOf`, padding, regular expression positions (`index`, `lastIndex`, `search`, replace offsets), DOM text offsets (`CharacterData`, `splitText`, the
+selection of an input) and iteration by code point all work on them. `toUpperCase` / `toLowerCase` (with the special casing and the final sigma rule) and
+`normalize` use the tables of `src/Script/UnicodeTables.hpp`, made by `scripts/gen_unicode_text_tables.py`.
+A string that is not valid UTF-8 is a *byte string*: every byte is a character 0..255 (the internal convention of `Blob`, `TextDecoder`, `atob` ...; `__bytes_to_string`
+and `atob` mark theirs). A byte string that happens to be valid UTF-8 and is not marked is read as text. Use `__text_bytes(str)` for the UTF-8 bytes of a string.

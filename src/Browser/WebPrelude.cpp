@@ -391,7 +391,7 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
   function bytesOf(part) {
     if (part instanceof Blob) return part.__bytes;
     if (isObject(part) && typeof part.length === 'number' && typeof part.byteLength === 'number') return __bytes_to_string(part);
-    return String(part);
+    return __text_bytes(String(part));
   }
   function Blob(parts, options) {
     if (!(this instanceof Blob)) throw typeError("construct 'Blob'", "Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
