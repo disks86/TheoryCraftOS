@@ -397,6 +397,13 @@ class Compiler {
   }
 
   // --- Functions
+  // expression() of a value that is stored under a name: an anonymous function or arrow gets that name
+  void named_expression(Node* value, StringView name) {
+    if (value && value->kind == NodeKind::Function && value->text.empty() && !name.empty()) infer_name_ = name;
+    expression(value);
+    infer_name_ = StringView();
+  }
+
   void function_value(Node* fn) {
     FunctionCode* child = compile_function(fn);
     if (!child || failed_) return;
@@ -411,6 +418,8 @@ class Compiler {
       fail("Out of memory", fn->line);
       return nullptr;
     }
+    const StringView inferred = infer_name_;
+    infer_name_ = StringView();
     fs.parent = cur_;
     fs.code->library = library_;
     fs.code->strict = (cur_ && cur_->code->strict) || (fn->flags & kFlagStrict) != 0 || (!(fn->flags & kFlagExprBody) && has_use_strict(fn->a->list));
@@ -421,12 +430,15 @@ class Compiler {
     fs.code->is_arrow = (fn->flags & kFlagArrow) != 0;
     fs.code->is_async = (fn->flags & kFlagAsync) != 0;
     fs.code->is_generator = (fn->flags & kFlagGenerator) != 0 && !(fn->flags & kFlagArrow);
-    fs.code->name = fn->text.empty() ? nullptr : vm_.intern(fn->text);
+    fs.code->name = !fn->text.empty() ? vm_.intern(fn->text) : !inferred.empty() ? vm_.intern(inferred) : nullptr;
     uint32_t params = 0;
+    bool counting = true;
     for (Node* p = fn->list; p; p = p->next) {
       const uint32_t slot = new_slot();   // (a parameter is slot `params`: they come first)
       fs.bindings.push_back(Binding{p->text, slot});
       ++params;
+      if (p->a || (!p->next && (fn->flags & kFlagRest))) counting = false;   // (length: the parameters before the first default or the rest)
+      if (counting) fs.code->expected_args = params;
     }
     function_level_count_ = static_cast<uint32_t>(fs.bindings.count());
     fs.code->param_count = params;
@@ -450,7 +462,7 @@ class Compiler {
       emit(Opc::PushUndef);
       emit(Opc::StrictEq);
       const uint32_t skip = emit(Opc::JumpIfFalse);
-      expression(p->a);
+      named_expression(p->a, p->text);
       emit(Opc::SetVar, static_cast<int32_t>(index), fn_hops(), p->line);
       emit(Opc::Pop);
       patch(skip);
@@ -676,7 +688,7 @@ class Compiler {
     for (Node* d = n->list; d && !failed_; d = d->next) {
       line_ = d->line;
       if (d->a) {
-        expression(d->a);
+        named_expression(d->a, d->text);
       } else if (n->var_kind == VarKind::Var) {
         continue;   // `var x;` does nothing more than the declaration
       } else {
@@ -973,8 +985,11 @@ class Compiler {
             expression(p->b);
             expression(p->a);
             emit(Opc::DefineElem);
-          } else {
+          } else if (p->text.equals("__proto__") && !(p->flags & kFlagShorthand)) {   // { __proto__: x } sets the prototype
             expression(p->a);
+            emit(Opc::SetLiteralProto);
+          } else {
+            named_expression(p->a, p->text);
             emit(Opc::DefineProp, static_cast<int32_t>(constant_string(p->text)));
           }
         }
@@ -1278,7 +1293,7 @@ class Compiler {
     const bool plain = n->op == Op::Assign;
     if (t->kind == NodeKind::Ident) {
       if (!plain) load_name(t->text, n->line);
-      expression(n->b);
+      if (plain) named_expression(n->b, t->text); else expression(n->b);
       if (!plain) emit(binary_opcode(n->op), 0, 0, n->line);
       store_name(t->text, n->line);
     } else if (t->kind == NodeKind::Member) {
@@ -1417,6 +1432,7 @@ class Compiler {
   uint32_t line_ = 0;
   uint32_t function_level_count_ = 0;   // how many of the current function's bindings are function-level (parameters, var, functions)
   StringView pending_label_;
+  StringView infer_name_;   // the name an anonymous function expression takes from where it is stored (var f = function () {}), taken by the next compile_function
   List<uint32_t>* dummy_ = nullptr;
   List<uint32_t> optional_jumps_{vm_.allocator()};
   List<uint32_t> chain_jumps_{vm_.allocator()};   // the nullish exits of the optional chains being compiled (where each chain's begin in chain_marks_)

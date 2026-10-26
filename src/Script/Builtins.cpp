@@ -183,11 +183,32 @@ NATIVE(object_assign) {
   return true;
 }
 
+NATIVE(object_define_properties);
+
 NATIVE(object_create) {
   const Value proto = arg_at(args, argc, 0);
   if (!proto.is_object() && !proto.is_null()) return vm.throw_error(ErrorKind::TypeError, "Object prototype may only be an Object or null");
   *result = Value::make_object(vm.new_object(proto.is_object() ? proto.as_object() : nullptr));
+  if (argc > 1 && !args[1].is_undefined()) {   // Object.create(proto, descriptors)
+    const Value call_args[2] = {*result, args[1]};
+    Value ignored;
+    if (!object_define_properties(vm, Value(), call_args, 2, &ignored)) return false;
+  }
   return true;
+}
+
+// __class_check(new.target, name): the constructor of a class called without new.
+NATIVE(class_check) {
+  (void)self;
+  (void)result;
+  if (!arg_at(args, argc, 0).is_undefined()) return true;
+  String message(vm.allocator());
+  message.append("Class constructor ");
+  JsString* name;
+  if (!vm.to_string(arg_at(args, argc, 1), &name)) return false;
+  message.append(name->view());
+  message.append(" cannot be invoked without 'new'");
+  return vm.throw_error(ErrorKind::TypeError, message.view());
 }
 
 // SameValue: like === but NaN is NaN and +0 is not -0.
@@ -2761,6 +2782,7 @@ bool install_builtins(Vm& vm) {
   vm.define_native(g, "__req_object", destructure_require_object, 1);
   vm.define_native(g, "__rest", destructure_rest, 2);
   vm.define_native(g, "__class", class_setup, 2);
+  vm.define_native(g, "__class_check", class_check, 2);
   vm.define_native(g, "__def", class_define, 4);
   vm.define_native(g, "__super_init", class_super_init, 2);
   vm.define_native(vm.object_proto(), "toString", object_to_string, 0);
@@ -3010,6 +3032,7 @@ bool install_builtins(Vm& vm) {
   if (!install_regexp(vm) || !install_typed_arrays(vm)) return false;
   {
     JsObject* proxy = vm.new_native(proxy_constructor, "Proxy", 2);
+    proxy->constructs = true;
     vm.define_native(proxy, "revocable", proxy_revocable, 2);
     vm.define_named(vm.global(), "Proxy", Value::make_object(proxy), kWritable);
   }

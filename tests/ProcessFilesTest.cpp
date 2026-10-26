@@ -21,6 +21,7 @@
 #include <vector>
 #include "FileSystem/Ram/RamFileSystem.hpp"
 #include "Process/AddressSpace.hpp"
+#include "Process/Objects.hpp"
 #include "Process/Process.hpp"
 #include "Process/ProcessFiles.hpp"
 #include "Process/Syscall.hpp"
@@ -554,6 +555,77 @@ static void test_windows_files() {
   CHECK(rig.call(WindowsSyscallNumber::NtQueryDirectoryFile, 8, 0, 0, 0, {iosb, list, 4096, 3, 0, 0, 1}) == 0xC0000103u);
 }
 
+// A trivial ISystemSync for change-notification tests: every wait here is a zero-timeout poll (is it signalled right now?), never a real block, so there is nothing
+// for lock/unlock/wait/notify_all to actually do.
+struct NoWaitSync final : ISystemSync {
+  void lock() override {}
+  void unlock() override {}
+  bool wait(uint64_t) override { return false; }
+  void notify_all() override {}
+};
+
+static void test_change_notifications() {
+  filesystem::RamFileSystem fs(A);
+  populate(fs);
+  NoWaitSync sync;
+  ObjectManager objects(sync);
+  objects.set_allocator(&A);
+  set_system_objects(&objects);
+  NtRig rig(fs);
+  const uint32_t kGenericRead = 0x80000000u, kSync = 0x100000, kOptions = 0x60;
+
+  CHECK(rig.call(WindowsSyscallNumber::NtCreateFile, rig.alloc(8), kGenericRead | kSync, rig.attributes("\\??\\C:\\watched"), rig.alloc(16), {0, 0x80, 7, 2, 1, 0, 0}) == 0);
+  const uint64_t handle_at = rig.alloc(8);
+  CHECK(rig.call(WindowsSyscallNumber::NtCreateChangeNotification, rig.attributes("\\??\\C:\\watched"), 0, 0, handle_at) == 0);
+  const uint64_t handle = rig.u64(handle_at);
+  CHECK(handle != 0);
+  auto signalled = [&] { return rig.call(WindowsSyscallNumber::NtWaitForSingleObject, handle, 0, rig.offset(0)) == 0; };
+  auto reset = [&] { return rig.call(WindowsSyscallNumber::NtResetEvent, handle, 0) == 0; };
+
+  CHECK(!signalled());      // nothing has happened yet
+  NtRig::Opened new_file = rig.create("\\??\\C:\\watched\\new.txt", kGenericRead, 2, kOptions);      // FILE_CREATE directly under it
+  CHECK(new_file.status == 0);
+  rig.call(WindowsSyscallNumber::NtClose, new_file.handle);      // closed, so NtDeleteFile below is not refused as busy
+  CHECK(signalled());
+  CHECK(reset() && !signalled());      // FindNextChangeNotification re-arms it
+
+  // a change in an unrelated, sibling directory does not fire a non-subtree watch
+  CHECK(rig.call(WindowsSyscallNumber::NtCreateFile, rig.alloc(8), kGenericRead | kSync, rig.attributes("\\??\\C:\\elsewhere"), rig.alloc(16), {0, 0x80, 7, 2, 1, 0, 0}) == 0);
+  CHECK(rig.create("\\??\\C:\\elsewhere\\x.txt", kGenericRead, 2, kOptions).status == 0);
+  CHECK(!signalled());
+
+  // deleting a file fires it too
+  CHECK(rig.call(WindowsSyscallNumber::NtDeleteFile, rig.attributes("\\??\\C:\\watched\\new.txt")) == 0);
+  CHECK(signalled() && reset());
+
+  // a subtree watch fires for a change arbitrarily deep underneath, a plain (non-subtree) one does not
+  CHECK(rig.call(WindowsSyscallNumber::NtCreateFile, rig.alloc(8), kGenericRead | kSync, rig.attributes("\\??\\C:\\watched\\deep"), rig.alloc(16), {0, 0x80, 7, 2, 1, 0, 0}) == 0);
+  CHECK(signalled() && reset());      // the "deep" subdirectory's own creation already counts, directly under \watched
+  const uint64_t subtree_handle_at = rig.alloc(8);
+  CHECK(rig.call(WindowsSyscallNumber::NtCreateChangeNotification, rig.attributes("\\??\\C:\\watched"), 1, 0, subtree_handle_at) == 0);
+  const uint64_t subtree_handle = rig.u64(subtree_handle_at);
+  auto subtree_signalled = [&] { return rig.call(WindowsSyscallNumber::NtWaitForSingleObject, subtree_handle, 0, rig.offset(0)) == 0; };
+  CHECK(rig.create("\\??\\C:\\watched\\deep\\inside.txt", kGenericRead, 2, kOptions).status == 0);
+  CHECK(subtree_signalled() && !signalled());      // the plain watch on \watched itself does not see into \watched\deep
+
+  // a symbolic link is a new directory entry too
+  CHECK(!signalled());
+  const uint64_t target = rig.unicode("new.txt");
+  CHECK(rig.call(WindowsSyscallNumber::NtCreateSymbolicLink, rig.attributes("\\??\\C:\\watched\\link.txt"), target, 0) == 0);
+  CHECK(signalled() && reset());
+
+  // errors: not a directory, and a nonexistent path
+  const uint64_t bad1 = rig.alloc(8), bad2 = rig.alloc(8);
+  CHECK(rig.call(WindowsSyscallNumber::NtCreateFile, rig.alloc(8), kGenericRead | kSync, rig.attributes("\\??\\C:\\hello.txt"), rig.alloc(16), {0, 0x80, 7, 1, kOptions | 0x40, 0, 0}) == 0);
+  CHECK(rig.call(WindowsSyscallNumber::NtCreateChangeNotification, rig.attributes("\\??\\C:\\hello.txt"), 0, 0, bad1) == 0xC0000103u);      // STATUS_NOT_A_DIRECTORY
+  CHECK(rig.call(WindowsSyscallNumber::NtCreateChangeNotification, rig.attributes("\\??\\C:\\nosuchdir"), 0, 0, bad2) == 0xC0000034u);      // STATUS_OBJECT_NAME_NOT_FOUND
+  CHECK(rig.call(WindowsSyscallNumber::NtCreateChangeNotification, rig.attributes("\\??\\C:\\nosuchdir\\sub"), 0, 0, bad2) == 0xC000003Au);      // STATUS_OBJECT_PATH_NOT_FOUND
+
+  rig.call(WindowsSyscallNumber::NtClose, handle);
+  rig.call(WindowsSyscallNumber::NtClose, subtree_handle);
+  set_system_objects(nullptr);
+}
+
 // Garbage in the program's memory and wild pointers in the arguments must only ever produce errors.
 static void test_hostile_arguments() {
   filesystem::RamFileSystem fs(A);
@@ -591,6 +663,7 @@ int main() {
   test_prepare();
   test_linux_files();
   test_windows_files();
+  test_change_notifications();
   test_hostile_arguments();
   CHECK(A.live == 0);
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }

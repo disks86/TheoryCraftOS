@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Process/WindowsFiles.hpp"
+#include "Process/Objects.hpp"
 #include "Process/WindowsPipes.hpp"
 #include "Utility/ByteBuffer.hpp"
 #include "Utility/Utf16.hpp"
@@ -33,7 +34,8 @@ constexpr uint32_t kSuccess = 0, kBufferOverflow = 0x80000005u, kNoMoreFiles = 0
                    kNoMemory = 0xC0000017u, kAccessDenied = 0xC0000022u, kObjectNameInvalid = 0xC0000033u, kObjectNameNotFound = 0xC0000034u,
                    kObjectNameCollision = 0xC0000035u, kObjectPathNotFound = 0xC000003Au, kSharingViolation = 0xC0000043u, kDiskFull = 0xC000007Fu,
                    kFileIsADirectory = 0xC00000BAu, kMediaWriteProtected = 0xC00000A2u, kDirectoryNotEmpty = 0xC0000101u, kNotADirectory = 0xC0000103u,
-                   kIoDeviceError = 0xC0000185u, kNotImplemented = 0xC0000002u, kInvalidDeviceRequest = 0xC0000010u, kTooManyOpenedFiles = 0xC000011Fu, kTooManyLinks = 0xC0000112u;
+                   kIoDeviceError = 0xC0000185u, kNotImplemented = 0xC0000002u, kInvalidDeviceRequest = 0xC0000010u, kTooManyOpenedFiles = 0xC000011Fu, kTooManyLinks = 0xC0000112u,
+                   kNoResources = 0xC000009Au;
 constexpr uint64_t kMaxIoBytes = 0x7FFFF000u, kChunk = 4096;
 constexpr uint64_t kUnixToNtSeconds = 11644473600ull;
 constexpr uint64_t kUseFilePointer = 0xFFFFFFFFFFFFFFFEull, kWriteToEnd = 0xFFFFFFFFFFFFFFFFull;
@@ -76,6 +78,20 @@ bool handle_slot(uint64_t handle, uint64_t* slot) {
   if (handle == 0 || handle % 4 != 0 || handle / 4 > Process::kMaxDescriptors) return false;
   *slot = handle / 4 - 1;
   return true;
+}
+
+// The directory part of a virtual path that files.resolve() already produced (so it has no "." or ".." components): "/Windows/sub/x.txt" -> "/Windows/sub", "/x.txt" -> "/".
+StringView virtual_directory_of(StringView virtual_path) {
+  uint64_t at = virtual_path.size();
+  while (at > 0 && virtual_path[at - 1] != '/') --at;
+  return at <= 1 ? StringView("/") : virtual_path.first(at - 1);
+}
+
+// After any successful change to a directory's contents (a file or subdirectory created, deleted, renamed or linked): wakes any FindFirstChangeNotification/
+// ReadDirectoryChangesW handle watching `affected_directory` or an ancestor of it (see ObjectManager::notify_path_changed). A no-op if there is no ObjectManager yet
+// (a host test that never made one; the real kernel always has).
+void notify_directory_changed(StringView affected_directory) {
+  if (ObjectManager* objects = system_objects()) objects->notify_path_changed(affected_directory);
 }
 
 // IO_STATUS_BLOCK { NTSTATUS Status (8 bytes with padding); ULONG_PTR Information; }
@@ -195,6 +211,7 @@ uint32_t open_by_attributes(Process& p, uint64_t object_attributes, uint32_t acc
   const Status status = files.open(virtual_path.view(), f, &slot, &created);
   if (status == Status::OutOfMemory && files.free_slot(0) < 0) return kTooManyOpenedFiles;
   if (status != Status::Ok) return status_for(files, status, virtual_path.view());
+  if (created) notify_directory_changed(virtual_directory_of(virtual_path.view()));
   if (options & kDeleteOnClose) files.object(slot)->delete_on_close = true;
   uint32_t object_flags = 0;
   uint8_t flag_bytes[4];
@@ -591,8 +608,14 @@ uint32_t nt_set_information_file(Process& p, const SyscallRequest& r) {
         status = nt_status(files.remove(target.view()));
       }
       if (status == kSuccess) {
+        String old_directory(files.allocator());
+        old_directory.assign(virtual_directory_of(object->path.view()));
         status = nt_status(files.rename(object->path.view(), target.view()));
-        if (status == kSuccess) object->path.assign(target.view());
+        if (status == kSuccess) {
+          notify_directory_changed(old_directory.view());
+          notify_directory_changed(virtual_directory_of(target.view()));
+          object->path.assign(target.view());
+        }
       }
       break;
     }
@@ -612,7 +635,10 @@ uint32_t nt_set_information_file(Process& p, const SyscallRequest& r) {
         if (!header[0]) return kObjectNameCollision;
         status = nt_status(files.remove(target.view()));
       }
-      if (status == kSuccess) status = nt_status(files.create_hard_link(object->path.view(), target.view()));
+      if (status == kSuccess) {
+        status = nt_status(files.create_hard_link(object->path.view(), target.view()));
+        if (status == kSuccess) notify_directory_changed(virtual_directory_of(target.view()));
+      }
       break;
     }
     default: return kInvalidInfoClass;
@@ -694,13 +720,6 @@ uint32_t nt_query_attributes_file(Process& p, const SyscallRequest& r) {
   return write_basic(p, r.args[1], e) ? kSuccess : kAccessViolation;
 }
 
-// The directory part of a virtual path that files.resolve() already produced (so it has no "." or ".." components): "/Windows/sub/x.txt" -> "/Windows/sub", "/x.txt" -> "/".
-StringView virtual_directory_of(StringView virtual_path) {
-  uint64_t at = virtual_path.size();
-  while (at > 0 && virtual_path[at - 1] != '/') --at;
-  return at <= 1 ? StringView("/") : virtual_path.first(at - 1);
-}
-
 uint32_t nt_create_symbolic_link(Process& p, const SyscallRequest& r) {
   ProcessFiles& files = p.files();
   if (!files.attached()) return kObjectPathNotFound;
@@ -717,6 +736,7 @@ uint32_t nt_create_symbolic_link(Process& p, const SyscallRequest& r) {
   if (files.resolve_from(virtual_directory_of(link_virtual.view()), raw_target.view(), &target_virtual) != PathResult::Ok) return kObjectNameInvalid;
   const bool target_is_directory = (r.args[2] & 0xFF) != 0;
   const Status status = files.create_symbolic_link(link_virtual.view(), target_virtual.view(), target_is_directory);
+  if (status == Status::Ok) notify_directory_changed(virtual_directory_of(link_virtual.view()));
   return status_for(files, status, link_virtual.view());
 }
 
@@ -728,7 +748,31 @@ uint32_t nt_delete_file(Process& p, const SyscallRequest& r) {
   if (named != kSuccess) return named;
   if (virtual_path.view() == StringView("/")) return kAccessDenied;
   const Status status = files.remove(virtual_path.view());
+  if (status == Status::Ok) notify_directory_changed(virtual_directory_of(virtual_path.view()));
   return status_for(files, status, virtual_path.view());
+}
+
+uint32_t nt_create_change_notification(Process& p, const SyscallRequest& r) {
+  // NtCreateChangeNotification(POBJECT_ATTRIBUTES DirectoryAttributes, ULONG WatchTree, ULONG NotifyFilter, PHANDLE Result)
+  ProcessFiles& files = p.files();
+  if (!files.attached()) return kObjectPathNotFound;
+  String virtual_path(files.allocator());
+  const uint32_t named = object_path(p, r.args[0], &virtual_path);
+  if (named != kSuccess) return named;
+  DirectoryEntry e;
+  const Status status = files.stat(virtual_path.view(), &e);
+  if (status != Status::Ok) return status_for(files, status, virtual_path.view());
+  if (e.type != NodeType::Directory) return kNotADirectory;
+  if (r.args[3] == 0) return kAccessViolation;
+  ObjectManager* objects = system_objects();
+  if (!objects) return kNotImplemented;
+  const ObjectManager::Created c = objects->create_change_notification(virtual_path.view(), (r.args[1] & 0xFF) != 0, static_cast<uint32_t>(r.args[2]));
+  if (c.id == 0) return c.status;
+  const int64_t slot = files.open_token(DescriptorKind::ChangeNotification, c.id);
+  if (slot < 0) { objects->release(c.id); return kNoResources; }
+  files.set_handle_flags(static_cast<uint64_t>(slot), false, false);
+  if (!p.write_user_u64(r.args[3], (static_cast<uint64_t>(slot) + 1) * 4)) { p.close_descriptor(static_cast<uint64_t>(slot)); return kAccessViolation; }
+  return kSuccess;
 }
 
 uint32_t nt_flush_buffers_file(Process& p, const SyscallRequest& r) {

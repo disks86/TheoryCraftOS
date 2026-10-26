@@ -2086,6 +2086,15 @@ class Parser {
     }
     ctor->text = cname;
     ctor->flags |= kFlagExpression;
+    {   // a class constructor cannot be called without new
+      Node* target = make(NodeKind::Ident);
+      if (!target) return nullptr;
+      target->text = "new.target";
+      Node* check = new_statement(new_call(new_ident("__class_check"), {target, new_string(cname)}));
+      if (!check) return nullptr;
+      check->next = ctor->a->list;
+      ctor->a->list = check;
+    }
     // the instance fields go in first (after super(...) in a derived class)
     Node* fields = nullptr;
     Node** field_tail = &fields;

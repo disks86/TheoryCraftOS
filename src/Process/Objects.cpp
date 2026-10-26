@@ -221,6 +221,7 @@ ObjectManager::~ObjectManager() {
     for (uint32_t i = 0; i < kMaxSections; ++i) if (sections_[i].storage && allocator_) allocator_->deallocate(sections_[i].storage);
     if (allocator_) allocator_->deallocate(sections_);
   }
+  if (watches_ && allocator_) allocator_->deallocate(watches_);
 }
 
 ObjectManager::Pipe* ObjectManager::pipe_of(uint32_t id) {
@@ -762,6 +763,7 @@ void ObjectManager::release(uint32_t id) {
     free_pipe_locked(*o);
     free_section_locked(*o);
     free_job_locked(*o);
+    free_watch_locked(*o);
     *o = Object();
   }
 }
@@ -785,7 +787,8 @@ uint32_t ObjectManager::set_event(uint32_t id, int32_t* previous) {
 uint32_t ObjectManager::reset_event(uint32_t id, int32_t* previous) {
   Locked hold(sync_);
   Object* o = at(id);
-  if (!o || o->kind != ObjectKind::Event) return kInvalidHandle;
+  // A change notification handle (FindNextChangeNotification) is reset the same way: both are "stays signalled until told otherwise" handles with nothing else to it.
+  if (!o || (o->kind != ObjectKind::Event && o->kind != ObjectKind::ChangeNotification)) return kInvalidHandle;
   if (previous) *previous = o->signaled ? 1 : 0;
   o->signaled = false;
   return kSuccess;
@@ -858,6 +861,7 @@ bool ObjectManager::ready_locked(uint32_t id, uint64_t waiter) {
   if (!o) return true;      // gone: nothing to wait for
   switch (o->kind) {
     case ObjectKind::Event: return o->signaled || o->pulses > 0;
+    case ObjectKind::ChangeNotification: return o->signaled;
     case ObjectKind::Process: return o->signaled;
     case ObjectKind::Timer: fire_timer_locked(*o, sync_.now_ns()); return o->signaled;
     case ObjectKind::Mutex: return o->owner == 0 || o->owner == waiter;
@@ -1070,6 +1074,69 @@ bool ObjectManager::job_kill_for(uint64_t pid, uint32_t* code) {
     }
   }
   return false;
+}
+
+// ---- change notifications
+
+void ObjectManager::free_watch_locked(Object& o) {
+  if (o.kind != ObjectKind::ChangeNotification || o.watch < 0 || !watches_) return;
+  watches_[o.watch].used = false;
+  o.watch = -1;
+}
+
+ObjectManager::Created ObjectManager::create_change_notification(StringView path, bool watch_subtree, uint32_t filter) {
+  Created result;
+  if (path.size() >= kWatchPathBytes) { result.status = kNameTooLong; return result; }
+  Locked hold(sync_);
+  if (!watches_ && allocator_) {
+    void* memory = allocator_->allocate(sizeof(Watch) * kMaxWatches);
+    if (memory) watches_ = new (memory) Watch[kMaxWatches];
+  }
+  int32_t slot = -1;
+  for (uint32_t i = 0; watches_ && i < kMaxWatches && slot < 0; ++i) if (!watches_[i].used) slot = int32_t(i);
+  if (slot < 0) { result.status = kNoResources; return result; }
+  for (uint32_t i = 0; i < kCapacity; ++i) {
+    Object& o = objects_[i];
+    if (o.kind != ObjectKind::None) continue;
+    Watch& w = watches_[slot];
+    w = Watch();
+    w.used = true;
+    for (uint64_t k = 0; k < path.size(); ++k) w.path[k] = path[k];
+    w.path_size = static_cast<uint32_t>(path.size());
+    w.subtree = watch_subtree;
+    w.filter = filter;
+    o = Object();
+    o.kind = ObjectKind::ChangeNotification;
+    o.references = 1;
+    o.manual_reset = true;      // left signalled until FindNextChangeNotification (reset_event) explicitly resets it
+    o.watch = slot;
+    result.id = i + 1;
+    result.status = kSuccess;
+    return result;
+  }
+  watches_[slot].used = false;
+  result.status = kNoResources;
+  return result;
+}
+
+void ObjectManager::notify_path_changed(StringView affected_directory) {
+  Locked hold(sync_);
+  if (!watches_) return;
+  bool any = false;
+  for (Object& o : objects_) {
+    if (o.kind != ObjectKind::ChangeNotification || o.watch < 0) continue;
+    const Watch& w = watches_[o.watch];
+    const StringView watched(w.path, w.path_size);
+    bool matches = affected_directory == watched;
+    if (!matches && w.subtree) {
+      matches = watched.size() <= 1 ||      // the root ("/"): every directory is under it
+                (affected_directory.size() > watched.size() && affected_directory[watched.size()] == '/' && affected_directory.first(watched.size()) == watched);
+    }
+    if (!matches) continue;
+    o.signaled = true;
+    any = true;
+  }
+  if (any) sync_.notify_all();
 }
 
 }  // namespace process

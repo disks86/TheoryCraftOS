@@ -49,6 +49,7 @@
 #include "Hardware/StorageDevice/SystemStorageDevices.hpp"
 #include "Hardware/SystemHardware.hpp"
 #include "Network/NetworkStackSet.hpp"
+#include "Process/Sockets.hpp"
 #include "Network/Ftp/FtpFileSystem.hpp"
 #include "Network/NetworkVolume.hpp"
 #include "Network/Nfs/NfsVolume.hpp"
@@ -596,6 +597,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   // network interface, timed by a clock calibrated against the firmware's timer.
   hardware::TscClock clock(cpu, st);
   network::NetworkStackSet stacks(clock, shared_allocator);
+  process::SocketManager sockets(stacks);  // Windows sockets (ws2_32.dll) over the stacks above; wired in once at least one interface exists, below
   const bool clock_ok = clock.initialize();
   if (!clock_ok) Entry(Level::Warning, "Clock").text("could not calibrate the timer; networking is off");
 
@@ -744,6 +746,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       if (!stacks.add(*network.at(i))) Entry(Level::Warning, "Network").text("could not start a network stack on interface ").dec(i);
     if (stacks.count() > 0) {
       stacks.start_service();  // one thread keeps every stack polled
+      network::set_system_network_stacks(&stacks);
+      process::set_system_sockets(&sockets);  // Windows sockets (ws2_32.dll): see src/Process/Sockets.hpp
 #ifndef TCOS_SELFTESTS
       stacks.start_dhcp();     // (the network self-check does this itself)
 #endif
@@ -1165,6 +1169,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   hyperv.stop_service();
   vmware_tools.stop();
   printers.stop_service();   // (its thread ends before the threads do: joining it afterwards would wait for ever)
+  process::set_system_sockets(nullptr);
+  network::set_system_network_stacks(nullptr);
   stacks.clear();  // the stacks go before the NICs underneath them
 #ifdef TCOS_SELFTESTS
   stack_demo.reset();

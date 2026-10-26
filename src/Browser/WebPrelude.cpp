@@ -5788,7 +5788,7 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     if (!def || el.__ce !== undefined) return;
     Object.defineProperty(el, '__ce', { value: 1, writable: true });
     Object.setPrototypeOf(el, def.ctor.prototype);
-    try { def.ctor.call(el); } catch (e) { reportError(e); }
+    try { __super_init(def.ctor, el); } catch (e) { reportError(e); }   // (new.target of a class constructor is def.ctor, as when super() runs it)
     for (var i = 0; i < def.observed.length; i++) {
       var a = def.observed[i];
       if (el.hasAttribute(a)) callback(el, 'attributeChangedCallback', [a, null, el.getAttribute(a)]);

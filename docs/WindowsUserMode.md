@@ -1,11 +1,12 @@
 # Windows programs: libraries and system services
 
 
-Windows (PE) programs run in ring 3 on `ntdll.dll`, `kernel32.dll`, `msvcrt.dll` and `advapi32.dll`, freestanding DLLs built from `src/Windows/` and put on the primary disk
-image in `C:\Windows\System32` (see [FileSystemLayout.md](FileSystemLayout.md)). ntdll turns the NT services into `SYSCALL`s. The service numbers are this OS's own (real
-Windows renumbers its services in nearly every build, which is why programs call ntdll); `src/Windows/tcos_syscalls.h` and `src/Process/WindowsSyscalls.hpp` hold the numbers
-and `tests/SyscallTest.cpp` checks that they agree. The services behind the system calls are in `src/Process/Windows*.cpp`; the kernel side is `src/Kernel/UserMode.cpp`.
-advapi32.dll is the one library here with no NT services of its own: it is written entirely over kernel32.dll, the way a real one is layered over kernel32 for the registry.
+Windows (PE) programs run in ring 3 on `ntdll.dll`, `kernel32.dll`, `msvcrt.dll`, `advapi32.dll` and `ws2_32.dll`, freestanding DLLs built from `src/Windows/` and put on
+the primary disk image in `C:\Windows\System32` (see [FileSystemLayout.md](FileSystemLayout.md)). ntdll turns the NT services into `SYSCALL`s. The service numbers are this
+OS's own (real Windows renumbers its services in nearly every build, which is why programs call ntdll); `src/Windows/tcos_syscalls.h` and `src/Process/WindowsSyscalls.hpp`
+hold the numbers and `tests/SyscallTest.cpp` checks that they agree. The services behind the system calls are in `src/Process/Windows*.cpp`; the kernel side is
+`src/Kernel/UserMode.cpp`. advapi32.dll is the one library here with no NT services of its own: it is written entirely over kernel32.dll, the way a real one is layered over
+kernel32 for the registry.
 
 ## Files and directories
 
@@ -146,6 +147,45 @@ like any other, as far as the mounted file system does), remote registries, and 
 | `NtReadVirtualMemory` | 84 |
 | `NtWriteVirtualMemory` | 85 |
 | `NtCreateSymbolicLink` | 86 |
+| `NtCreateSocket` | 87 |
+| `NtBindSocket` | 88 |
+| `NtConnectSocket` | 89 |
+| `NtListenSocket` | 90 |
+| `NtAcceptSocket` | 91 |
+| `NtSendSocket` | 92 |
+| `NtReceiveSocket` | 93 |
+| `NtSocketControl` | 94 |
+| `NtSelectSockets` | 95 |
+| `NtCreateChangeNotification` | 96 |
+
+## Sockets
+
+`ws2_32.dll` (`src/Windows/ws2_32/ws2_32.c`) is Winsock over `src/Process/Sockets.{hpp,cpp}` and the NT services above - this OS's own, unlike real Windows, where Winsock
+talks to a device driver (`afd.sys`) through its own ioctl protocol rather than NT services. IPv4 only: `AF_INET`/`SOCK_STREAM`/`SOCK_DGRAM`, over whatever network
+interfaces `src/Network/NetworkStackSet` has (set as the system's sockets at boot once at least one interface exists, right after its service thread starts). A `SOCKET`
+is the same kernel `HANDLE` a program's other descriptors are (`DescriptorKind::Socket`), closed and duplicated/inherited exactly like a pipe handle. `WSAStartup`/
+`WSACleanup`, `socket`, `bind`, `connect` (blocking retries the handshake itself; non-blocking returns `WSAEWOULDBLOCK` until `select()`'s except/write sets or
+`getpeername` show how it resolved), `listen`, `accept`, `send`/`recv`, `sendto`/`recvfrom`, `shutdown`, `ioctlsocket` (`FIONBIO`, `FIONREAD`), `select` (up to 64 sockets
+per set), `getsockname`/`getpeername`, `closesocket`, `WSAGetLastError`/`WSASetLastError`, `htons`/`htonl`/`ntohs`/`ntohl`, `inet_addr`/`inet_ntoa` all work. A failing NT
+status is mapped to its own WSA error (`WSAECONNREFUSED`, `WSAEWOULDBLOCK` and so on), not a plain Win32 one - `WSAGetLastError` still reads the same per-thread slot as
+`GetLastError`, matching the real one. Not done: IPv6, `getaddrinfo`/`gethostbyname` (no DNS from a Windows program yet, though the kernel's own network stack resolves
+names for itself), `WSAAsyncSelect`/`WSAEventSelect`, overlapped socket I/O, `SO_RCVTIMEO`/`SO_SNDTIMEO` and other `setsockopt` options, multicast, raw sockets, and a
+loopback interface (a program's own address is whichever one network interface it is bound to; nothing short-circuits traffic addressed back to that same address).
+
+## Directory change notifications
+
+`FindFirstChangeNotification`/`FindNextChangeNotification`/`FindCloseChangeNotification` are backed by a single new service, `NtCreateChangeNotification`, this OS's own
+(real Windows has none of its own either: both that family and `ReadDirectoryChangesW` go through `NtNotifyChangeDirectoryFile`, one IRP-based service that completes
+asynchronously - not a fit for a kernel with no real asynchronous I/O, so this is a smaller, synchronous design instead). A change notification handle is an ordinary
+`ObjectManager` object (kind `ChangeNotification`) that behaves exactly like a manual-reset event: `WaitForSingleObject`/`WaitForMultipleObjects` work on it unmodified,
+and `FindNextChangeNotification` is literally `NtResetEvent` on the same handle (it is not a separate service). It becomes signalled when a file or subdirectory is
+created, deleted, renamed, hard-linked or symbolically linked directly under the watched directory, or anywhere under it with `bWatchSubtree` true; the directory
+itself must exist when the handle is made. The `dwNotifyFilter` bits are accepted and kept but not matched against - any of those changes signals every watch of its
+directory, regardless of which `FILE_NOTIFY_CHANGE_*` bits were asked for (the same kind of permissive simplification as the registry's access checks). Only the RAM
+file system fires these (the one backing `C:\` in the demo and the primary image); a change made through FAT/Ext/NTFS/BeFS is invisible to a watcher, since those are
+not reachable from a Windows program's `C:\` anyway. Not done: `ReadDirectoryChangesW` itself (the buffered `FILE_NOTIFY_INFORMATION` form that reports *what* changed
+and its name, as opposed to just *that* something did), a file deleted via `FILE_DISPOSITION_INFORMATION`/delete-on-close firing at the point the handle actually
+closes (only `NtDeleteFile` and an overwriting `CreateFile` do), and watching anything outside the RAM file system.
 
 ## Exceptions and the machine
 
@@ -213,5 +253,5 @@ like any other, as far as the mounted file system does), remote registries, and 
   threads on every core. Reads and writes stop at the first page that is not committed (`ERROR_PARTIAL_COPY`, with the count); writes ignore page protection, as debuggers need.
   A remote thread's handle can be waited for, `GetExitCodeThread`, `GetThreadId`, `ResumeThread` (if created suspended) and `TerminateThread` work on it; other thread calls
   (contexts, priorities, APCs) do not. Code can be injected: write it into memory allocated with `VirtualAllocEx` and start a thread on it. There is no access check beyond having a handle.
-- **Not provided**: debugging APIs, mailslots, change notifications (`FindFirstChangeNotification`, `ReadDirectoryChangesW`), and the many exports of the real kernel32 and msvcrt that no program here has needed.
+- **Not provided**: debugging APIs, mailslots, `ReadDirectoryChangesW` (`FindFirstChangeNotification` is done - see "Directory change notifications"), and the many exports of the real kernel32 and msvcrt that no program here has needed.
   A call to an import that nothing provides stops the program with a message saying which one.
