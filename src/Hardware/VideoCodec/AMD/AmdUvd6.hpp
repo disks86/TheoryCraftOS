@@ -70,6 +70,15 @@ class AmdUvd6 {
   };
   enum class Status : uint8_t { Ok, BadFirmware, BadMemory, TimedOut };
 
+  // What the engine's registers say, for the first run on a card that does not do what the driver's does: UVD_STATUS (bit 1: the VCPU answered), UVD_POWER_STATUS, UVD_SOFT_RESET,
+  // UVD_VCPU_CNTL, UVD_LMI_CTRL2, and the ring's read and write pointers. Reads only. `failure_snapshot()` is the state at the moment a start gave up, before the stop sequence
+  // changed it.
+  struct Diagnostics {
+    uint32_t status = 0, power_status = 0, soft_reset = 0, vcpu_cntl = 0, lmi_ctrl2 = 0, rb_rptr = 0, rb_wptr = 0;
+  };
+  static Diagnostics read_diagnostics(IVcnRegisters& registers);
+  const Diagnostics& failure_snapshot() const { return failure_; }
+
   AmdUvd6(IVcnRegisters& registers, const IClock& clock) : registers_(registers), clock_(clock) {}
 
   // The number of decode sessions a firmware supports: 40 from version 1.80 on (the driver's rule), else 10.
@@ -90,6 +99,7 @@ class AmdUvd6 {
   IVcnRegisters& registers_;
   const IClock& clock_;
   Config config_;
+  Diagnostics failure_;
   bool started_ = false;
 
   uint32_t rd(uint32_t dword) { return registers_.read(dword); }

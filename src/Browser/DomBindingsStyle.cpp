@@ -495,6 +495,148 @@ void px_text(uint32_t px, String* out) {
   out->append("px");
 }
 
+// The parts of `text` separated by `sep` outside brackets and quotes (trimmed).
+bool next_top_level(StringView text, uint64_t* at, char sep, StringView* part) {
+  if (*at > text.size()) return false;
+  int depth = 0;
+  char quote = 0;
+  const uint64_t start = *at;
+  uint64_t i = start;
+  for (; i < text.size(); ++i) {
+    const char c = text[i];
+    if (quote) {
+      if (c == '\\') ++i;
+      else if (c == quote) quote = 0;
+    } else if (c == '"' || c == '\'') {
+      quote = c;
+    } else if (c == '(') {
+      ++depth;
+    } else if (c == ')') {
+      --depth;
+    } else if (c == sep && depth == 0) {
+      break;
+    }
+  }
+  *part = text.substr(start, i - start).trimmed();
+  *at = i + 1;
+  return true;
+}
+
+// A colour written any way, as the computed value shows it.
+bool colour_serialized(StringView text, String* out) {
+  uint32_t argb;
+  if (!parse_css_color_alpha(text, &argb)) return false;
+  rgba_text(argb, out);
+  return true;
+}
+
+// A list of images (background-image): url() quoted, the colours of gradients as rgb().
+void image_list_text(StringView value, String* out) {
+  uint64_t at = 0;
+  StringView item;
+  bool first = true;
+  while (next_top_level(value, &at, ',', &item)) {
+    if (!first) out->append(", ");
+    first = false;
+    const uint64_t open = item.find('(');
+    const uint64_t close = item.rfind(')');
+    if (open == StringView::npos || close == StringView::npos || close < open) {
+      out->append(item);
+      continue;
+    }
+    const StringView name = item.first(open);
+    StringView inner = item.substr(open + 1, close - open - 1).trimmed();
+    if (name.equals_ignore_case("url")) {
+      if (inner.size() >= 2 && (inner[0] == '"' || inner[0] == '\'') && inner[inner.size() - 1] == inner[0]) inner = inner.substr(1, inner.size() - 2);
+      out->append("url(\"");
+      for (uint64_t i = 0; i < inner.size(); ++i) {
+        if (inner[i] == '"' || inner[i] == '\\') out->push_back('\\');
+        out->push_back(inner[i]);
+      }
+      out->append("\")");
+      continue;
+    }
+    if (!name.contains("gradient")) {
+      out->append(item);
+      continue;
+    }
+    out->append(name);
+    out->push_back('(');
+    uint64_t k = 0;
+    StringView arg;
+    bool first_arg = true;
+    while (next_top_level(inner, &k, ',', &arg)) {
+      if (!first_arg) out->append(", ");
+      first_arg = false;
+      uint64_t m = 0;
+      next_top_level(arg, &m, ' ', &item);   // (the colour comes first in a colour stop)
+      String colour(out->allocator());
+      if (!item.empty() && colour_serialized(item, &colour)) {
+        out->append(colour.view());
+        if (m <= arg.size()) {
+          out->push_back(' ');
+          out->append(arg.substr(m).trimmed());
+        }
+      } else {
+        out->append(arg);
+      }
+    }
+    out->push_back(')');
+  }
+}
+
+// background-position: keywords become percentages ("right bottom" is "100% 100%").
+void position_list_text(StringView value, String* out) {
+  uint64_t at = 0;
+  StringView item;
+  bool first = true;
+  while (next_top_level(value, &at, ',', &item)) {
+    if (!first) out->append(", ");
+    first = false;
+    StringView words[4];
+    uint32_t n = 0;
+    uint64_t k = 0;
+    StringView w;
+    while (n < 4 && next_top_level(item, &k, ' ', &w)) {
+      if (!w.empty()) words[n++] = w;
+    }
+    auto percent_of = [](StringView word, int* percent) {
+      if (word.equals_ignore_case("left") || word.equals_ignore_case("top")) *percent = 0;
+      else if (word.equals_ignore_case("center")) *percent = 50;
+      else if (word.equals_ignore_case("right") || word.equals_ignore_case("bottom")) *percent = 100;
+      else return false;
+      return true;
+    };
+    bool simple = n >= 1 && n <= 2;
+    int x = 50, y = 50;
+    if (simple) {
+      const bool a_vertical = words[0].equals_ignore_case("top") || words[0].equals_ignore_case("bottom");
+      const bool b_horizontal = n == 2 && (words[1].equals_ignore_case("left") || words[1].equals_ignore_case("right"));
+      int pa = 0, pb = 50;
+      const bool a_key = percent_of(words[0], &pa);
+      const bool b_key = n == 2 ? percent_of(words[1], &pb) : true;
+      if (n == 1) {
+        if (a_vertical) { x = 50; y = pa; }
+        else if (a_key) { x = pa; y = 50; }
+        else simple = false;
+      } else if (a_key && b_key) {
+        if (a_vertical || b_horizontal) { y = pa; x = pb; }
+        else { x = pa; y = pb; }
+      } else {
+        simple = false;
+      }
+    }
+    if (!simple) {
+      out->append(item);
+      continue;
+    }
+    out->append_uint(static_cast<uint32_t>(x));
+    out->append("% ");
+    out->append_uint(static_cast<uint32_t>(y));
+    out->push_back('%');
+  }
+}
+
 NATIVE(computed_get_property_value) {
   String name(vm.allocator());
   if (!self.is_object() || !arg_text(vm, arg_at(args, argc, 0), &name)) return false;
@@ -705,11 +847,13 @@ Value make_computed_style(DomBindings::Impl& c, dom::Node* element) {
     return Value::make_object(o);
   }
   const bool dark = c.host.media().dark;
+  const StyleSheet* sheet_for_color = c.host.computed_style_sheet();
   const uint32_t text_color = s.color ? s.color : (dark ? 0xE8E8E8 : 0x000000);
   if (s.color_argb_set && (s.color_argb >> 24) != 0xFF) rgba_text(s.color_argb, &t);
   else rgb_text(text_color, &t);
   if (element->is_tag("a") && dom::has_attribute(element, "href") && !s.color && !s.color_argb_set) t.assign("rgb(0, 0, 238)");
-  set("color", t.view());
+  if (sheet_for_color && !s.color_text.empty()) set("color", sheet_for_color->text(s.color_text));
+  else set("color", t.view());
   t.clear();
   if (s.background_argb != 0 && (s.background_argb >> 24) != 0xFF) rgba_text(s.background_argb, &t);
   else if (s.background) rgb_text(s.background, &t);
@@ -726,7 +870,7 @@ Value make_computed_style(DomBindings::Impl& c, dom::Node* element) {
       case Layout::TableRow: display = "table-row"; break;
       case Layout::TableCell: display = "table-cell"; break;
       case Layout::TableCaption: display = "table-caption"; break;
-      default: display = s.display == Display::ListItem ? "list-item" : s.display == Display::Block ? (s.inline_box ? "inline-block" : "block") : "inline"; break;
+      default: display = s.display == Display::ListItem ? "list-item" : s.display == Display::Block ? (s.inline_box ? "inline-block" : "block") : s.inline_box ? "inline-block" : "inline"; break;
     }
   }
   // controls are inline-blocks; a floated or absolutely positioned box is blockified
@@ -745,8 +889,19 @@ Value make_computed_style(DomBindings::Impl& c, dom::Node* element) {
   t.clear();
   t.append_uint(s.font_weight);
   set("fontWeight", t.view());
-  set("fontStyle", s.italic ? "italic" : "normal");
-  set("textAlign", s.justify ? "justify" : s.align == 1 ? "center" : s.align == 2 ? "right" : "left");
+  if (s.oblique_x10 >= 0) {
+    t.clear();
+    t.append("oblique");
+    if (s.oblique_x10 != 140) {
+      t.push_back(' ');
+      number_text(s.oblique_x10 / 10.0, &t);
+      t.append("deg");
+    }
+    set("fontStyle", t.view());
+  } else {
+    set("fontStyle", s.italic ? "italic" : "normal");
+  }
+  set("textAlign", s.text_align_kw == 1 ? "start" : s.text_align_kw == 2 ? "end" : s.text_align_kw == 3 ? "match-parent" : s.justify ? "justify" : s.align == 1 ? "center" : s.align == 2 ? "right" : s.text_align_kw == 4 ? "left" : "start");
   const char* decoration = s.underline && s.strike ? "underline line-through" : s.underline ? "underline" : s.strike ? "line-through" : "none";
   set("textDecoration", decoration);
   set("textDecorationLine", decoration);
@@ -759,7 +914,8 @@ Value make_computed_style(DomBindings::Impl& c, dom::Node* element) {
   fixed_px(static_cast<int32_t>(s.font_px) * 100, &t);
   set("fontSize", t.view());
   t.clear();
-  fixed_px(s.line_height_px100 >= 0 ? s.line_height_px100 : 1600, &t);
+  if (s.line_height_px100 >= 0) fixed_px(s.line_height_px100, &t);
+  else t.append("normal");
   set("lineHeight", t.view());
   const StyleSheet* sheet = c.host.computed_style_sheet();
   {
@@ -802,6 +958,7 @@ Value make_computed_style(DomBindings::Impl& c, dom::Node* element) {
     t.clear();
     length_text(*z.length, &t);
     if (t.view().equals("auto") && (z.name[0] == 'r' || z.name[0] == 'c')) t.assign("normal");
+    if (z.length == &s.flex_basis && s.flex_basis_zero_percent && s.flex_basis.kind == Length::Px && s.flex_basis.px100 == 0) t.assign("0%");
     set(z.name, t.view());
   }
   set("boxSizing", s.sizing == BoxSizing::BorderBox ? "border-box" : "content-box");
@@ -811,9 +968,15 @@ Value make_computed_style(DomBindings::Impl& c, dom::Node* element) {
   set("float", side);
   set("cssFloat", side);
   set("clear", s.clear == Clear::Left ? "left" : s.clear == Clear::Right ? "right" : s.clear == Clear::Both ? "both" : "none");
-  set("overflowX", overflow_text(s.overflow_x));
-  set("overflowY", overflow_text(s.overflow_y));
-  set("overflow", s.overflow_x == s.overflow_y ? overflow_text(s.overflow_x) : "visible");
+  {
+    // one axis that scrolls or clips makes a visible other axis auto
+    Overflow ox = s.overflow_x, oy = s.overflow_y;
+    if (ox == Overflow::Visible && oy != Overflow::Visible) ox = Overflow::Auto;
+    else if (oy == Overflow::Visible && ox != Overflow::Visible) oy = Overflow::Auto;
+    set("overflowX", overflow_text(ox));
+    set("overflowY", overflow_text(oy));
+    set("overflow", ox == oy ? overflow_text(ox) : "visible");
+  }
   t.clear();
   number_text(s.opacity_x1000 / 1000.0, &t);
   set("opacity", t.view());
@@ -915,9 +1078,18 @@ Value make_computed_style(DomBindings::Impl& c, dom::Node* element) {
     set("boxShadow", "none");
     set("textShadow", "none");
   }
-  set("backgroundImage", text_of(s.background_image, "none"));
+  {
+    t.clear();
+    const StringView image = text_of(s.background_image, "none");
+    image_list_text(image, &t);
+    set("backgroundImage", t.view());
+  }
   set("backgroundSize", text_of(s.background_size, "auto"));
-  set("backgroundPosition", text_of(s.background_position, "0% 0%"));
+  {
+    t.clear();
+    position_list_text(text_of(s.background_position, "0% 0%"), &t);
+    set("backgroundPosition", t.view());
+  }
   set("backgroundRepeat", text_of(s.background_repeat, "repeat"));
   set("backgroundClip", text_of(s.background_clip, "border-box"));
   set("backgroundOrigin", text_of(s.background_origin, "padding-box"));
@@ -944,9 +1116,10 @@ Value make_computed_style(DomBindings::Impl& c, dom::Node* element) {
   set("rotate", text_of(s.rotate, "none"));
   set("scale", text_of(s.scale, "none"));
   t.clear();
-  axis_text(s.transform_origin_x, &t);
+  // (a percentage is of the box, which has no size until the page is rendered: like a browser that has not laid the element out, the result is in pixels)
+  fixed_px(s.transform_origin_x.px100, &t);
   t.push_back(' ');
-  axis_text(s.transform_origin_y, &t);
+  fixed_px(s.transform_origin_y.px100, &t);
   if (s.transform_origin_z_px100) {
     t.push_back(' ');
     fixed_px(s.transform_origin_z_px100, &t);
@@ -972,8 +1145,14 @@ Value make_computed_style(DomBindings::Impl& c, dom::Node* element) {
   if (s.aspect_auto) t.append("auto");
   if (s.aspect_ratio_x1000) {
     if (!t.empty()) t.push_back(' ');
-    number_text(s.aspect_ratio_x1000 / 1000.0, &t);
-    t.append(" / 1");
+    if (s.aspect_w_x1000 && s.aspect_h_x1000) {   // as written: "16 / 9"
+      number_text(s.aspect_w_x1000 / 1000.0, &t);
+      t.append(" / ");
+      number_text(s.aspect_h_x1000 / 1000.0, &t);
+    } else {
+      number_text(s.aspect_ratio_x1000 / 1000.0, &t);
+      t.append(" / 1");
+    }
   } else if (!s.aspect_auto) {
     t.append("auto");
   }
@@ -1026,6 +1205,55 @@ Value make_computed_style(DomBindings::Impl& c, dom::Node* element) {
   set("scrollBehavior", s.scroll_smooth ? "smooth" : "auto");
   set("containerType", s.container_type == 1 ? "inline-size" : s.container_type == 2 ? "size" : "normal");
   set("containerName", text_of(s.container_name, "none"));
+  t.clear();
+  if (s.text_indent.kind == Length::Px) fixed_px(s.text_indent.px100 ? s.text_indent.px100 : s.text_indent_px100, &t);
+  else fixed_px(s.text_indent_px100, &t);
+  set("textIndent", t.view());
+  {
+    const uint8_t w = s.white_space;   // 0 normal, 1 nowrap, 2 pre, 3 pre-wrap, 4 pre-line, 5 break-spaces
+    set("textWrapMode", w == 1 || w == 2 ? "nowrap" : "wrap");
+    set("whiteSpaceCollapse", w == 2 || w == 3 ? "preserve" : w == 4 ? "preserve-breaks" : w == 5 ? "break-spaces" : "collapse");
+  }
+  set("wordBreak", s.word_break_kind == 1 ? "break-all" : s.word_break_kind == 2 ? "keep-all" : s.word_break_kind == 3 ? "break-word" : "normal");
+  set("overflowWrap", s.overflow_wrap_kind == 1 ? "anywhere" : s.overflow_wrap_kind == 2 ? "break-word" : "normal");
+  set("wordWrap", s.overflow_wrap_kind == 1 ? "anywhere" : s.overflow_wrap_kind == 2 ? "break-word" : "normal");
+  set("textOverflow", s.text_ellipsis ? "ellipsis" : "clip");
+  set("quotes", text_of(s.quotes, "auto"));
+  set("tabSize", text_of(s.tab_size, "8"));
+  set("listStylePosition", s.list_inside ? "inside" : "outside");
+  set("counterReset", text_of(s.counter_reset, "none"));
+  set("counterIncrement", text_of(s.counter_increment, "none"));
+  set("content", s.has_content ? text_of(s.content, "normal") : StringView(s.content_kind == 1 ? "none" : "normal"));
+  set("gridColumnStart", text_of(s.grid_column_start, "auto"));
+  set("gridColumnEnd", text_of(s.grid_column_end, "auto"));
+  set("gridRowStart", text_of(s.grid_row_start, "auto"));
+  set("gridRowEnd", text_of(s.grid_row_end, "auto"));
+  if (s.column_count) {
+    t.clear();
+    t.append_uint(s.column_count);
+    set("columnCount", t.view());
+  } else {
+    set("columnCount", "auto");
+  }
+  set("mixBlendMode", text_of(s.mix_blend_mode, "normal"));
+  set("contain", text_of(s.contain, "none"));
+  set("appearance", text_of(s.appearance, "none"));
+  set("willChange", text_of(s.will_change, "auto"));
+  if (s.accent_color_argb) {
+    t.clear();
+    if ((s.accent_color_argb >> 24) != 0xFF && (s.accent_color_argb >> 24) != 0) rgba_text(s.accent_color_argb, &t);
+    else rgb_text(s.accent_color_argb & 0xFFFFFF, &t);
+    set("accentColor", t.view());
+  } else {
+    set("accentColor", "auto");
+  }
+  set("borderCollapse", s.border_collapse ? "collapse" : "separate");
+  t.clear();
+  if (s.border_spacing.kind == Length::Px) fixed_px(s.border_spacing.px100, &t);
+  else t.append("0px");
+  set("borderSpacing", t.view());
+  set("tableLayout", s.table_fixed ? "fixed" : "auto");
+  set("captionSide", s.caption_bottom ? "bottom" : "top");
   if (sheet) {   // the custom properties that apply (the nearest declaration of a name wins)
     StringView cname, cvalue;
     uint32_t at = s.custom_scope;

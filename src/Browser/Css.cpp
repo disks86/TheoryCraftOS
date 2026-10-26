@@ -103,8 +103,9 @@ uint32_t read_numbers(StringView text, int64_t* values, bool* percent) {
 }
 
 uint32_t channel(int64_t value_x100, bool percent) {
-  int64_t v = percent ? value_x100 * 255 / 10000 : value_x100 / 100;
-  return static_cast<uint32_t>(v < 0 ? 0 : v > 255 ? 255 : v);
+  if (value_x100 < 0) return 0;
+  const int64_t v = percent ? (value_x100 * 255 + 5000) / 10000 : (value_x100 + 50) / 100;   // (rounded to the nearest)
+  return static_cast<uint32_t>(v > 255 ? 255 : v);
 }
 
 uint32_t hsl_to_rgb(int64_t h_x100, int64_t s_x100, int64_t l_x100) {
@@ -264,7 +265,7 @@ double math_atan2(double y, double x) {
 
 // --- Numbers, units and arithmetic ---------------------------------------------------------------------
 
-enum class U : uint8_t { None, Px, Em, Rem, Percent, Vw, Vh, Vmin, Vmax, Ch, Ex, Pt, Pc, In, Cm, Mm, Q, Deg, Rad, Grad, Turn, S, Ms, Fr, Other };
+enum class U : uint8_t { None, Px, Em, Rem, Percent, Vw, Vh, Vmin, Vmax, Ch, Ex, Pt, Pc, In, Cm, Mm, Q, Deg, Rad, Grad, Turn, S, Ms, Fr, Lh, Other };
 
 // [+-]digits[.digits][e[+-]digits] at *at.
 bool read_double(StringView text, uint64_t* at, double* out) {
@@ -315,7 +316,7 @@ U unit_of(StringView s) {
   } static const kUnits[] = {{"px", U::Px}, {"em", U::Em}, {"rem", U::Rem}, {"vw", U::Vw}, {"vh", U::Vh}, {"vmin", U::Vmin}, {"vmax", U::Vmax}, {"ch", U::Ch},
                              {"ex", U::Ex}, {"pt", U::Pt}, {"pc", U::Pc}, {"in", U::In}, {"cm", U::Cm}, {"mm", U::Mm}, {"q", U::Q}, {"deg", U::Deg}, {"rad", U::Rad},
                              {"grad", U::Grad}, {"turn", U::Turn}, {"s", U::S}, {"ms", U::Ms}, {"fr", U::Fr}, {"svw", U::Vw}, {"dvw", U::Vw}, {"lvw", U::Vw},
-                             {"svh", U::Vh}, {"dvh", U::Vh}, {"lvh", U::Vh}, {"cqw", U::Vw}, {"cqh", U::Vh}};
+                             {"svh", U::Vh}, {"dvh", U::Vh}, {"lvh", U::Vh}, {"cqw", U::Vw}, {"cqh", U::Vh}, {"lh", U::Lh}, {"rlh", U::Lh}};
   for (const auto& u : kUnits)
     if (s.equals_ignore_case(u.name)) return u.unit;
   return U::Other;
@@ -333,6 +334,7 @@ bool parse_dimension(StringView text, double* v, U* unit) {
 // What the arithmetic needs to know to turn units into pixels.
 struct EvalContext {
   double font_px = 16, root_px = 16, viewport_w = 640, viewport_h = 480;
+  double line_px = 19.2;     // the line height (lh)
   double percent_px = 0;     // what 100% is
   bool has_percent = false;
 };
@@ -384,6 +386,7 @@ class Arithmetic {
       if (pos_ >= text_.size() || (text_[pos_] != '+' && text_[pos_] != '-')) return true;
       const bool add = text_[pos_] == '+';
       ++pos_;
+      if (pos_ < 2 || !is_space(text_[pos_ - 2]) || pos_ >= text_.size() || !is_space(text_[pos_])) return false;   // (+ and - need white space on both sides)
       Quantity rhs;
       if (!product(&rhs, depth)) return false;
       if (!unify(out, &rhs)) return false;
@@ -467,6 +470,7 @@ class Arithmetic {
       case U::Px: out->kind = Quantity::Length; return true;
       case U::Em: out->kind = Quantity::Length; out->v = v * ctx_.font_px; return true;
       case U::Rem: out->kind = Quantity::Length; out->v = v * ctx_.root_px; return true;
+      case U::Lh: out->kind = Quantity::Length; out->v = v * ctx_.line_px; return true;
       case U::Percent: out->kind = Quantity::Percent; return true;
       case U::Vw: out->kind = Quantity::Length; out->v = v * ctx_.viewport_w / 100; return true;
       case U::Vh: out->kind = Quantity::Length; out->v = v * ctx_.viewport_h / 100; return true;
@@ -828,6 +832,7 @@ bool next_slash_part(StringView text, uint64_t* at, StringView* part) {
 struct ColorContext {
   bool dark = false;                // light-dark() takes its second colour
   uint32_t current = 0xFF000000;    // what currentcolor is
+  allocators::IAllocator* alloc = nullptr;   // for the text relative colours are rebuilt in (without it they are not understood)
 };
 
 bool color_value(StringView text, const ColorContext& ctx, int depth, uint32_t* argb);
@@ -1085,8 +1090,16 @@ uint32_t from_space(Vec3 c, Space space, double alpha) {
   return 0;
 }
 
+// What a mix came to before it was made into 8-bit sRGB (for serializing it in its own space).
+struct MixDetail {
+  Vec3 v = {{0, 0, 0}};
+  Space space = Space::Srgb;
+  double alpha = 1;
+  bool set = false;
+};
+
 // color-mix(in <space> [<hue> hue], <color> [<p>%], <color> [<p>%])
-bool color_mix(StringView inner, const ColorContext& ctx, int depth, uint32_t* out) {
+bool color_mix(StringView inner, const ColorContext& ctx, int depth, uint32_t* out, MixDetail* detail = nullptr) {
   uint64_t at = 0;
   StringView head, c1, c2, extra;
   if (!next_comma_part(inner, &at, &head) || !next_comma_part(inner, &at, &c1) || !next_comma_part(inner, &at, &c2)) return false;
@@ -1160,6 +1173,12 @@ bool color_mix(StringView inner, const ColorContext& ctx, int depth, uint32_t* o
     else { if (h1 < h2) h1 += 360; }
     mixed.v[hi] = wrap_hue(h1 * w1 + h2 * w2);
   }
+  if (detail) {
+    detail->v = mixed;
+    detail->space = space;
+    detail->alpha = alpha * alpha_scale;
+    detail->set = true;
+  }
   *out = from_space(mixed, space, alpha * alpha_scale);
   return true;
 }
@@ -1168,6 +1187,8 @@ bool is_modern_color_function(StringView text) {
   const uint64_t open = text.find('(');
   if (open == StringView::npos) return false;
   const StringView f = text.first(open).trimmed();
+  if (text.substr(open + 1).trimmed().starts_with("from ") && (f.equals_ignore_case("rgb") || f.equals_ignore_case("rgba") || f.equals_ignore_case("hsl") || f.equals_ignore_case("hsla") || f.equals_ignore_case("hwb")))
+    return true;   // (relative colours)
   return f.equals_ignore_case("lab") || f.equals_ignore_case("lch") || f.equals_ignore_case("oklab") || f.equals_ignore_case("oklch") || f.equals_ignore_case("color") ||
          f.equals_ignore_case("color-mix") || f.equals_ignore_case("light-dark");
 }
@@ -1250,9 +1271,188 @@ bool modern_color(StringView text, const ColorContext& ctx, int depth, uint32_t*
   return true;
 }
 
+// A number as a computed colour shows it: up to six decimals, no trailing zeros.
+void append_color_number(String* out, double v) {
+  if (v != v) v = 0;
+  if (v < 0 && v > -0.0000005) v = 0;
+  if (v < 0) {
+    out->push_back('-');
+    v = -v;
+  }
+  if (v > 1e9) v = 1e9;
+  const uint64_t scaled = static_cast<uint64_t>(v * 1000000 + 0.5);
+  out->append_uint(static_cast<uint32_t>(scaled / 1000000));
+  uint32_t fraction = static_cast<uint32_t>(scaled % 1000000);
+  if (fraction == 0) return;
+  char digits[6];
+  for (int i = 5; i >= 0; --i) {
+    digits[i] = static_cast<char>('0' + fraction % 10);
+    fraction /= 10;
+  }
+  int n = 6;
+  while (n > 0 && digits[n - 1] == '0') --n;
+  out->push_back('.');
+  for (int i = 0; i < n; ++i) out->push_back(digits[i]);
+}
+
+void append_color_function(String* out, const char* name, const char* space, double a, double b, double c, double alpha) {
+  out->append(name);
+  out->push_back('(');
+  if (space) {
+    out->append(space);
+    out->push_back(' ');
+  }
+  append_color_number(out, a);
+  out->push_back(' ');
+  append_color_number(out, b);
+  out->push_back(' ');
+  append_color_number(out, c);
+  if (alpha < 0.9999995) {
+    out->append(" / ");
+    append_color_number(out, alpha);
+  }
+  out->push_back(')');
+}
+
+// lab(), lch(), oklab(), oklch(), color() and color-mix() keep their colour space when scripts read them: the text of the computed value, or false for any other colour.
+bool serialize_modern_color(StringView text, const ColorContext& ctx, String* out) {
+  text = text.trimmed();
+  const uint64_t open = text.find('(');
+  if (open == StringView::npos || !text.ends_with(')')) return false;
+  const StringView f = text.first(open).trimmed();
+  const StringView inner = text.substr(open + 1, text.size() - open - 2);
+  if (inner.trimmed().starts_with("from ")) return false;   // (relative colours are worked out to rgb)
+  StringView comps[3];
+  double alpha, c[3];
+  if (f.equals_ignore_case("color-mix")) {
+    uint32_t packed;
+    MixDetail m;
+    if (!color_mix(inner, ctx, 0, &packed, &m) || !m.set) return false;
+    switch (m.space) {
+      case Space::Srgb: append_color_function(out, "color", "srgb", m.v.v[0], m.v.v[1], m.v.v[2], m.alpha); return true;
+      case Space::SrgbLinear: append_color_function(out, "color", "srgb-linear", m.v.v[0], m.v.v[1], m.v.v[2], m.alpha); return true;
+      case Space::Xyz65: append_color_function(out, "color", "xyz-d65", m.v.v[0], m.v.v[1], m.v.v[2], m.alpha); return true;
+      case Space::Xyz50: append_color_function(out, "color", "xyz-d50", m.v.v[0], m.v.v[1], m.v.v[2], m.alpha); return true;
+      case Space::Lab: append_color_function(out, "lab", nullptr, m.v.v[0], m.v.v[1], m.v.v[2], m.alpha); return true;
+      case Space::Lch: append_color_function(out, "lch", nullptr, m.v.v[0], m.v.v[1], m.v.v[2], m.alpha); return true;
+      case Space::Oklab: append_color_function(out, "oklab", nullptr, m.v.v[0], m.v.v[1], m.v.v[2], m.alpha); return true;
+      case Space::Oklch: append_color_function(out, "oklch", nullptr, m.v.v[0], m.v.v[1], m.v.v[2], m.alpha); return true;
+      default: return false;
+    }
+  }
+  if (f.equals_ignore_case("color")) {
+    uint64_t k = 0;
+    StringView space_name;
+    if (!next_part(inner, &k, &space_name) || !split_components(inner.substr(k), comps, &alpha)) return false;
+    for (int i = 0; i < 3; ++i)
+      if (!color_component(comps[i], 1, &c[i])) return false;
+    static const char* const kNames[] = {"srgb", "srgb-linear", "display-p3", "a98-rgb", "prophoto-rgb", "rec2020", "xyz-d50", "xyz-d65"};
+    const char* canonical = nullptr;
+    for (const char* n : kNames)
+      if (space_name.equals_ignore_case(n)) canonical = n;
+    if (space_name.equals_ignore_case("xyz")) canonical = "xyz-d65";
+    if (!canonical) return false;
+    append_color_function(out, "color", canonical, c[0], c[1], c[2], alpha);
+    return true;
+  }
+  const bool lab = f.equals_ignore_case("lab"), lch = f.equals_ignore_case("lch"), oklab = f.equals_ignore_case("oklab"), oklch = f.equals_ignore_case("oklch");
+  if (!lab && !lch && !oklab && !oklch) return false;
+  if (!split_components(inner, comps, &alpha)) return false;
+  const double scales[4][3] = {{100, 125, 125}, {100, 150, 360}, {1, 0.4, 0.4}, {1, 0.4, 360}};
+  const int which = lab ? 0 : lch ? 1 : oklab ? 2 : 3;
+  for (int i = 0; i < 3; ++i)
+    if (!color_component(comps[i], scales[which][i], &c[i])) return false;
+  const double top = which < 2 ? 100 : 1;
+  c[0] = c[0] < 0 ? 0 : c[0] > top ? top : c[0];
+  if (which == 1 || which == 3) c[1] = c[1] < 0 ? 0 : c[1];
+  append_color_function(out, lab ? "lab" : lch ? "lch" : oklab ? "oklab" : "oklch", nullptr, c[0], c[1], c[2], alpha);
+  return true;
+}
+
+// rgb(from <color> r g b / alpha) and the like: the origin colour's channels replace the keywords, and the result is worked out as the plain function.
+bool relative_color(StringView text, const ColorContext& ctx, int depth, uint32_t* out) {
+  const uint64_t open = text.find('(');
+  if (open == StringView::npos || !text.ends_with(')') || depth > 8 || !ctx.alloc) return false;
+  const StringView f = text.first(open).trimmed();
+  StringView inner = text.substr(open + 1, text.size() - open - 2).trimmed();
+  if (!inner.starts_with("from ")) return false;
+  inner = inner.substr(5).trimmed();
+  uint64_t at = 0;
+  StringView origin_text;
+  if (!next_part(inner, &at, &origin_text)) return false;
+  uint32_t origin;
+  if (!color_value(origin_text, ctx, depth + 1, &origin)) return false;
+  Space space;
+  const char* keys[3];
+  double scale[3] = {1, 1, 1};
+  bool percent_suffix[3] = {false, false, false};
+  const char* name;
+  if (f.equals_ignore_case("rgb") || f.equals_ignore_case("rgba")) { space = Space::Srgb; name = "rgb"; keys[0] = "r"; keys[1] = "g"; keys[2] = "b"; scale[0] = scale[1] = scale[2] = 255; }
+  else if (f.equals_ignore_case("hsl") || f.equals_ignore_case("hsla")) { space = Space::Hsl; name = "hsl"; keys[0] = "h"; keys[1] = "s"; keys[2] = "l"; scale[1] = scale[2] = 100; percent_suffix[1] = percent_suffix[2] = true; }
+  else if (f.equals_ignore_case("hwb")) { space = Space::Hwb; name = "hwb"; keys[0] = "h"; keys[1] = "w"; keys[2] = "b"; scale[1] = scale[2] = 100; percent_suffix[1] = percent_suffix[2] = true; }
+  else if (f.equals_ignore_case("lab")) { space = Space::Lab; name = "lab"; keys[0] = "l"; keys[1] = "a"; keys[2] = "b"; }
+  else if (f.equals_ignore_case("lch")) { space = Space::Lch; name = "lch"; keys[0] = "l"; keys[1] = "c"; keys[2] = "h"; }
+  else if (f.equals_ignore_case("oklab")) { space = Space::Oklab; name = "oklab"; keys[0] = "l"; keys[1] = "a"; keys[2] = "b"; }
+  else if (f.equals_ignore_case("oklch")) { space = Space::Oklch; name = "oklch"; keys[0] = "l"; keys[1] = "c"; keys[2] = "h"; }
+  else return false;
+  bool achromatic;
+  const Vec3 channels = to_space(origin, space, &achromatic);
+  const double origin_alpha = (origin >> 24) / 255.0;
+  // the rest: three components and an optional "/ alpha", each a number, a percentage, a channel keyword or a calc() using them
+  const StringView rest = inner.substr(at <= inner.size() ? at : inner.size());
+  String rebuilt(*ctx.alloc);
+  rebuilt.append(name);
+  rebuilt.push_back('(');
+  bool in_alpha = false;
+  uint64_t k = 0;
+  StringView part;
+  uint32_t index = 0;
+  while (next_part(rest, &k, &part)) {
+    if (part.equals("/")) { in_alpha = true; rebuilt.append("/ "); continue; }
+    const int slot = in_alpha ? 3 : static_cast<int>(index < 3 ? index : 2);
+    if (!in_alpha) ++index;
+    // replace the keywords inside the component by the channels
+    String piece(*ctx.alloc);
+    uint64_t i = 0;
+    while (i < part.size()) {
+      if (is_ident_start(part[i]) && (i == 0 || !is_ident_char(part[i - 1]))) {
+        uint64_t j = i;
+        while (j < part.size() && is_ident_char(part[j])) ++j;
+        const StringView word = part.substr(i, j - i);
+        bool replaced = false;
+        if (word.equals_ignore_case("alpha")) {
+          append_color_number(&piece, origin_alpha);
+          replaced = true;
+        } else {
+          for (int c = 0; c < 3 && !replaced; ++c) {
+            if (word.equals_ignore_case(keys[c])) {
+              append_color_number(&piece, channels.v[c] * scale[c]);
+              replaced = true;
+            }
+          }
+        }
+        if (!replaced) piece.append(word);
+        i = j;
+      } else {
+        piece.push_back(part[i]);
+        ++i;
+      }
+    }
+    rebuilt.append(piece.view());
+    // (a bare keyword that stands for a percentage in the plain function)
+    if (!in_alpha && slot < 3 && percent_suffix[slot] && part.size() <= 1) rebuilt.push_back('%');
+    rebuilt.push_back(' ');
+  }
+  rebuilt.push_back(')');
+  return color_value(rebuilt.view(), ctx, depth + 1, out);
+}
+
 bool color_value(StringView text, const ColorContext& ctx, int depth, uint32_t* argb) {
   text = text.trimmed();
   if (text.equals_ignore_case("currentcolor")) { *argb = ctx.current; return true; }
+  if (text.contains(" from ") || text.find("(from ") != StringView::npos) {
+    if (relative_color(text, ctx, depth, argb)) return true;
+  }
   if (is_modern_color_function(text)) return modern_color(text, ctx, depth, argb);
   return parse_css_color_alpha(text, argb);
 }
@@ -1280,12 +1480,15 @@ enum Prop : uint16_t {
   pTransitionProperty, pTransitionDuration, pTransitionTimingFunction, pTransitionDelay, pTransitionBehavior,
   pAnimationName, pAnimationDuration, pAnimationTimingFunction, pAnimationDelay, pAnimationIterationCount, pAnimationDirection, pAnimationFillMode, pAnimationPlayState,
   pFilter, pBackdropFilter, pClipPath, pWritingMode, pDirection, pColorScheme, pScrollSnapType, pScrollSnapAlign, pScrollSnapStop, pOverscrollBehaviorX, pOverscrollBehaviorY,
-  pScrollBehavior, pContainerType, pContainerName,
+  pScrollBehavior, pContainerType, pContainerName, pQuotes, pTabSize, pMixBlendMode, pContain, pAccentColor, pAppearance, pWillChange,
+  // logical longhands: they mean a physical side given the direction and the writing mode (see physical_of)
+  pMarginBlockStart, pMarginBlockEnd, pMarginInlineStart, pMarginInlineEnd, pPaddingBlockStart, pPaddingBlockEnd, pPaddingInlineStart, pPaddingInlineEnd,
+  pInsetBlockStart, pInsetBlockEnd, pInsetInlineStart, pInsetInlineEnd, pInlineSize, pBlockSize, pMinInlineSize, pMinBlockSize, pMaxInlineSize, pMaxBlockSize,
   pLastLonghand,
   // shorthands
   pBackground, pFont, pTextDecoration, pListStyle, pMargin, pPadding, pBorder, pBorderTop, pBorderRight, pBorderBottom, pBorderLeft, pBorderWidthAll, pBorderStyleAll,
   pBorderColorAll, pOverflow, pInset, pFlex, pFlexFlow, pGap, pGridColumn, pGridRow, pGridArea, pGridTemplate, pGrid, pPlaceContent, pPlaceItems, pPlaceSelf, pColumns,
-  pBorderRadius, pOutline, pColumnRule, pTransition, pAnimation, pOverscrollBehavior, pFontVariant, pContainer,
+  pBorderRadius, pOutline, pColumnRule, pTransition, pAnimation, pOverscrollBehavior, pFontVariant, pContainer, pAll,
 };
 
 struct PropertyName {
@@ -1299,14 +1502,14 @@ const PropertyName kProperties[] = {
     {"word-break", pWordBreak}, {"overflow-wrap", pOverflowWrap}, {"word-wrap", pOverflowWrap}, {"text-overflow", pTextOverflow}, {"vertical-align", pVerticalAlign},
     {"list-style", pListStyle}, {"list-style-type", pListStyleType}, {"list-style-position", pListStylePosition}, {"visibility", pVisibility}, {"opacity", pOpacity},
     {"display", pDisplay}, {"position", pPosition}, {"top", pTop}, {"right", pRight}, {"bottom", pBottom}, {"left", pLeft}, {"inset", pInset},
-    {"inset-block-start", pTop}, {"inset-block-end", pBottom}, {"inset-inline-start", pLeft}, {"inset-inline-end", pRight}, {"z-index", pZIndex}, {"float", pFloat},
-    {"clear", pClear}, {"overflow", pOverflow}, {"overflow-x", pOverflowX}, {"overflow-y", pOverflowY}, {"width", pWidth}, {"inline-size", pWidth}, {"height", pHeight},
-    {"block-size", pHeight}, {"min-width", pMinWidth}, {"min-inline-size", pMinWidth}, {"min-height", pMinHeight}, {"min-block-size", pMinHeight}, {"max-width", pMaxWidth},
-    {"max-inline-size", pMaxWidth}, {"max-height", pMaxHeight}, {"max-block-size", pMaxHeight}, {"box-sizing", pBoxSizing}, {"margin", pMargin},
-    {"margin-top", pMarginTop}, {"margin-right", pMarginRight}, {"margin-bottom", pMarginBottom}, {"margin-left", pMarginLeft}, {"margin-block-start", pMarginTop},
-    {"margin-block-end", pMarginBottom}, {"margin-inline-start", pMarginLeft}, {"margin-inline-end", pMarginRight}, {"padding", pPadding}, {"padding-top", pPaddingTop},
-    {"padding-right", pPaddingRight}, {"padding-bottom", pPaddingBottom}, {"padding-left", pPaddingLeft}, {"padding-block-start", pPaddingTop},
-    {"padding-block-end", pPaddingBottom}, {"padding-inline-start", pPaddingLeft}, {"padding-inline-end", pPaddingRight}, {"border", pBorder}, {"border-top", pBorderTop},
+    {"inset-block-start", pInsetBlockStart}, {"inset-block-end", pInsetBlockEnd}, {"inset-inline-start", pInsetInlineStart}, {"inset-inline-end", pInsetInlineEnd}, {"z-index", pZIndex}, {"float", pFloat},
+    {"clear", pClear}, {"overflow", pOverflow}, {"overflow-x", pOverflowX}, {"overflow-y", pOverflowY}, {"width", pWidth}, {"inline-size", pInlineSize}, {"height", pHeight},
+    {"block-size", pBlockSize}, {"min-width", pMinWidth}, {"min-inline-size", pMinInlineSize}, {"min-height", pMinHeight}, {"min-block-size", pMinBlockSize}, {"max-width", pMaxWidth},
+    {"max-inline-size", pMaxInlineSize}, {"max-height", pMaxHeight}, {"max-block-size", pMaxBlockSize}, {"box-sizing", pBoxSizing}, {"margin", pMargin},
+    {"margin-top", pMarginTop}, {"margin-right", pMarginRight}, {"margin-bottom", pMarginBottom}, {"margin-left", pMarginLeft}, {"margin-block-start", pMarginBlockStart},
+    {"margin-block-end", pMarginBlockEnd}, {"margin-inline-start", pMarginInlineStart}, {"margin-inline-end", pMarginInlineEnd}, {"padding", pPadding}, {"padding-top", pPaddingTop},
+    {"padding-right", pPaddingRight}, {"padding-bottom", pPaddingBottom}, {"padding-left", pPaddingLeft}, {"padding-block-start", pPaddingBlockStart},
+    {"padding-block-end", pPaddingBlockEnd}, {"padding-inline-start", pPaddingInlineStart}, {"padding-inline-end", pPaddingInlineEnd}, {"border", pBorder}, {"border-top", pBorderTop},
     {"border-right", pBorderRight}, {"border-bottom", pBorderBottom}, {"border-left", pBorderLeft}, {"border-block-start", pBorderTop}, {"border-block-end", pBorderBottom},
     {"border-inline-start", pBorderLeft}, {"border-inline-end", pBorderRight}, {"border-width", pBorderWidthAll}, {"border-style", pBorderStyleAll},
     {"border-color", pBorderColorAll}, {"border-top-width", pBorderTopWidth}, {"border-right-width", pBorderRightWidth}, {"border-bottom-width", pBorderBottomWidth},
@@ -1344,7 +1547,8 @@ const PropertyName kProperties[] = {
     {"filter", pFilter}, {"-webkit-filter", pFilter}, {"backdrop-filter", pBackdropFilter}, {"-webkit-backdrop-filter", pBackdropFilter}, {"clip-path", pClipPath},
     {"-webkit-clip-path", pClipPath}, {"writing-mode", pWritingMode}, {"direction", pDirection}, {"color-scheme", pColorScheme}, {"scroll-snap-type", pScrollSnapType},
     {"scroll-snap-align", pScrollSnapAlign}, {"scroll-snap-stop", pScrollSnapStop}, {"overscroll-behavior", pOverscrollBehavior}, {"overscroll-behavior-x", pOverscrollBehaviorX},
-    {"overscroll-behavior-y", pOverscrollBehaviorY}, {"scroll-behavior", pScrollBehavior}, {"container", pContainer}, {"container-type", pContainerType}, {"container-name", pContainerName},
+    {"overscroll-behavior-y", pOverscrollBehaviorY}, {"scroll-behavior", pScrollBehavior}, {"container", pContainer}, {"container-type", pContainerType}, {"container-name", pContainerName}, {"all", pAll}, {"quotes", pQuotes}, {"tab-size", pTabSize}, {"-moz-tab-size", pTabSize}, {"mix-blend-mode", pMixBlendMode},
+    {"contain", pContain}, {"accent-color", pAccentColor}, {"appearance", pAppearance}, {"-webkit-appearance", pAppearance}, {"will-change", pWillChange},
 };
 
 Prop property_from_name(StringView name) {
@@ -1410,18 +1614,19 @@ uint32_t longhands_of(Prop p, Prop* out) {
 // Copies one longhand from another style: what inherit (from the parent) and initial (from a style with the defaults) do.
 void copy_property(Prop p, const Style& from, Style* to) {
   switch (p) {
-    case pColor: to->color = from.color; to->color_argb = from.color_argb; to->color_argb_set = from.color_argb_set; break;
+    case pColor: to->color = from.color; to->color_argb = from.color_argb; to->color_argb_set = from.color_argb_set; to->color_text = from.color_text; break;
     case pBackgroundColor: to->own_background = from.own_background; to->own_background_color = from.own_background_color; to->background_argb = from.background_argb; break;
     case pFontSize: to->font_px = from.font_px; break;
     case pFontWeight: to->bold = from.bold; to->font_weight = from.font_weight; break;
-    case pFontStyle: to->italic = from.italic; break;
-    case pLineHeight: to->line_height_px100 = from.line_height_px100; break;
-    case pTextAlign: to->align = from.align; to->justify = from.justify; break;
+    case pFontStyle: to->italic = from.italic; to->oblique_x10 = from.oblique_x10; break;
+    case pLineHeight: to->line_height_px100 = from.line_height_px100; to->line_height_num_x1000 = from.line_height_num_x1000; break;
+    case pTextAlign: to->align = from.align; to->justify = from.justify; to->text_align_kw = from.text_align_kw; break;
     case pTextIndent: to->text_indent_px100 = from.text_indent_px100; to->text_indent = from.text_indent; break;
     case pTextTransform: to->transform = from.transform; break;
     case pTextDecorationLine: to->underline = from.underline; to->strike = from.strike; break;
     case pWhiteSpace: to->white_space = from.white_space; to->pre = from.pre; break;
-    case pWordBreak: case pOverflowWrap: to->word_break = from.word_break; break;
+    case pWordBreak: to->word_break = from.word_break; to->word_break_kind = from.word_break_kind; break;
+    case pOverflowWrap: to->word_break = from.word_break; to->overflow_wrap_kind = from.overflow_wrap_kind; break;
     case pTextOverflow: to->text_ellipsis = from.text_ellipsis; break;
     case pVerticalAlign: to->vertical_align = from.vertical_align; break;
     case pListStyleType: to->list_type = from.list_type; to->list_none = from.list_none; break;
@@ -1453,7 +1658,7 @@ void copy_property(Prop p, const Style& from, Style* to) {
     case pBorderTopColor: case pBorderRightColor: case pBorderBottomColor: case pBorderLeftColor: to->border_color[p - pBorderTopColor] = from.border_color[p - pBorderTopColor]; break;
     case pFlexGrow: to->flex_grow_x100 = from.flex_grow_x100; break;
     case pFlexShrink: to->flex_shrink_x100 = from.flex_shrink_x100; break;
-    case pFlexBasis: to->flex_basis = from.flex_basis; break;
+    case pFlexBasis: to->flex_basis = from.flex_basis; to->flex_basis_zero_percent = from.flex_basis_zero_percent; break;
     case pFlexDirection: to->flex_direction = from.flex_direction; break;
     case pFlexWrap: to->flex_wrap = from.flex_wrap; break;
     case pJustifyContent: to->justify_content = from.justify_content; break;
@@ -1475,7 +1680,7 @@ void copy_property(Prop p, const Style& from, Style* to) {
     case pGridColumnEnd: to->grid_column_end = from.grid_column_end; break;
     case pGridRowStart: to->grid_row_start = from.grid_row_start; break;
     case pGridRowEnd: to->grid_row_end = from.grid_row_end; break;
-    case pContent: to->content = from.content; to->has_content = from.has_content; break;
+    case pContent: to->content = from.content; to->has_content = from.has_content; to->content_kind = from.content_kind; break;
     case pCounterReset: to->counter_reset = from.counter_reset; break;
     case pCounterIncrement: to->counter_increment = from.counter_increment; break;
     case pColumnCount: to->column_count = from.column_count; break;
@@ -1515,7 +1720,14 @@ void copy_property(Prop p, const Style& from, Style* to) {
     case pCursor: to->cursor = from.cursor; break;
     case pPointerEvents: to->pointer_events = from.pointer_events; break;
     case pUserSelect: to->user_select = from.user_select; break;
-    case pAspectRatio: to->aspect_ratio_x1000 = from.aspect_ratio_x1000; to->aspect_auto = from.aspect_auto; break;
+    case pAspectRatio: to->aspect_ratio_x1000 = from.aspect_ratio_x1000; to->aspect_auto = from.aspect_auto; to->aspect_w_x1000 = from.aspect_w_x1000; to->aspect_h_x1000 = from.aspect_h_x1000; break;
+    case pQuotes: to->quotes = from.quotes; break;
+    case pTabSize: to->tab_size = from.tab_size; break;
+    case pMixBlendMode: to->mix_blend_mode = from.mix_blend_mode; break;
+    case pContain: to->contain = from.contain; break;
+    case pAccentColor: to->accent_color_argb = from.accent_color_argb; break;
+    case pAppearance: to->appearance = from.appearance; break;
+    case pWillChange: to->will_change = from.will_change; break;
     case pObjectFit: to->object_fit = from.object_fit; break;
     case pObjectPosition: to->object_position_x = from.object_position_x; to->object_position_y = from.object_position_y; break;
     case pListStyleImage: to->list_style_image = from.list_style_image; break;
@@ -1553,12 +1765,43 @@ void copy_property(Prop p, const Style& from, Style* to) {
   }
 }
 
+// The physical property a logical one stands for, given the direction and writing mode of the element (the others are themselves).
+Prop physical_of(Prop p, Direction direction, WritingMode mode) {
+  const bool vertical = mode != WritingMode::HorizontalTb;
+  const bool block_right = mode == WritingMode::VerticalRl || mode == WritingMode::SidewaysRl;
+  // sides: 0 top, 1 right, 2 bottom, 3 left
+  const int inline_start = !vertical ? (direction == Direction::Ltr ? 3 : 1) : (direction == Direction::Ltr ? 0 : 2);
+  const int block_start = !vertical ? 0 : (block_right ? 1 : 3);
+  auto opposite = [](int side) { return (side + 2) & 3; };
+  switch (p) {
+    case pMarginBlockStart: return static_cast<Prop>(pMarginTop + block_start);
+    case pMarginBlockEnd: return static_cast<Prop>(pMarginTop + opposite(block_start));
+    case pMarginInlineStart: return static_cast<Prop>(pMarginTop + inline_start);
+    case pMarginInlineEnd: return static_cast<Prop>(pMarginTop + opposite(inline_start));
+    case pPaddingBlockStart: return static_cast<Prop>(pPaddingTop + block_start);
+    case pPaddingBlockEnd: return static_cast<Prop>(pPaddingTop + opposite(block_start));
+    case pPaddingInlineStart: return static_cast<Prop>(pPaddingTop + inline_start);
+    case pPaddingInlineEnd: return static_cast<Prop>(pPaddingTop + opposite(inline_start));
+    case pInsetBlockStart: return static_cast<Prop>(pTop + block_start);
+    case pInsetBlockEnd: return static_cast<Prop>(pTop + opposite(block_start));
+    case pInsetInlineStart: return static_cast<Prop>(pTop + inline_start);
+    case pInsetInlineEnd: return static_cast<Prop>(pTop + opposite(inline_start));
+    case pInlineSize: return vertical ? pHeight : pWidth;
+    case pBlockSize: return vertical ? pWidth : pHeight;
+    case pMinInlineSize: return vertical ? pMinHeight : pMinWidth;
+    case pMinBlockSize: return vertical ? pMinWidth : pMinHeight;
+    case pMaxInlineSize: return vertical ? pMaxHeight : pMaxWidth;
+    case pMaxBlockSize: return vertical ? pMaxWidth : pMaxHeight;
+    default: return p;
+  }
+}
+
 bool inherited_property(Prop p) {
   switch (p) {
     case pColor: case pFontSize: case pFontWeight: case pFontStyle: case pLineHeight: case pTextAlign: case pTextIndent: case pTextTransform: case pTextDecorationLine:
     case pWhiteSpace: case pWordBreak: case pOverflowWrap: case pListStyleType: case pListStylePosition: case pVisibility: case pBorderCollapse: case pBorderSpacing:
     case pCaptionSide: case pFontFamily: case pFontStretch: case pFontVariantCaps: case pFontVariantNumeric: case pFontVariantLigatures: case pLetterSpacing:
-    case pWordSpacing: case pTextShadow: case pCursor: case pPointerEvents: case pUserSelect: case pWritingMode: case pDirection: case pColorScheme: case pListStyleImage:
+    case pQuotes: case pTabSize: case pAccentColor: case pWordSpacing: case pTextShadow: case pCursor: case pPointerEvents: case pUserSelect: case pWritingMode: case pDirection: case pColorScheme: case pListStyleImage:
       return true;
     default: return false;
   }
@@ -2607,12 +2850,14 @@ struct CssApply {
   const dom::Node* element;
   EvalContext eval;
   const Style initial;   // the style with every property at its initial value
+  const Style ua_start;  // the style the cascade began with (what the browser's own style sheet gave): what `revert` goes back to
   uint32_t inherited_scope;   // the custom property scope the style started with (what the parent passed on)
 
-  CssApply(const StyleSheet& s, const Style& p, Style* st, const dom::Node* el) : sheet(s), parent(p), style(st), element(el), inherited_scope(st->custom_scope) { refresh(); }
+  CssApply(const StyleSheet& s, const Style& p, Style* st, const dom::Node* el) : sheet(s), parent(p), style(st), element(el), ua_start(*st), inherited_scope(st->custom_scope) { refresh(); }
 
   void refresh() {
     eval.font_px = style->font_px;
+    eval.line_px = style->line_height_px100 >= 0 ? style->line_height_px100 / 100.0 : style->font_px * 1.2;
     eval.root_px = style->root_font_px;
     eval.viewport_w = sheet.viewport_w_;
     eval.viewport_h = sheet.viewport_h_;
@@ -2787,10 +3032,16 @@ struct CssApply {
         }();
         const StringView name = (comma == StringView::npos ? body : body.first(comma)).trimmed();
         StringView value;
+        bool substituted = false;
         if (lookup(name, &value)) {
           String inner(sheet.allocator_);
-          if (!substitute(value, &inner, depth + 1, functions)) return false;
-          out->append(inner.view());
+          if (substitute(value, &inner, depth + 1, functions)) {   // (a value that cannot be worked out - a cycle - is no value: the fallback is used)
+            out->append(inner.view());
+            substituted = true;
+          }
+        }
+        if (substituted) {
+          // done
         } else if (comma != StringView::npos) {
           if (!substitute(body.substr(comma + 1).trimmed(), out, depth + 1, functions)) return false;
         } else {
@@ -2887,6 +3138,7 @@ struct CssApply {
     ColorContext ctx;
     ctx.dark = style->color_scheme == ColorScheme::Dark ? true : style->color_scheme == ColorScheme::Light ? false : sheet.dark_;
     ctx.current = style->color ? style->color : 0xFF000000u;
+    ctx.alloc = &sheet.allocator_;
     return ctx;
   }
 
@@ -2931,6 +3183,7 @@ struct CssApply {
   void declare(Prop p, StringView value) {
     value = value.trimmed();
     if (value.empty() || p == pNone) return;
+    p = physical_of(p, style->direction, style->writing_mode);
     String substituted(sheet.allocator_);
     if (has_function(value, p != pContent)) {
       if (!substitute(value, &substituted, 0, p != pContent)) {   // a variable without a value: the property is unset
@@ -2940,12 +3193,20 @@ struct CssApply {
       value = substituted.view().trimmed();
       if (value.empty()) { apply_wide(p, 2); return; }
     }
+    if (p == pAll) {   // all: every property but the custom ones takes the keyword
+      const int which = eq(value, "inherit") ? 0 : eq(value, "initial") ? 1 : eq(value, "unset") ? 2 : eq(value, "revert") ? 3 : -1;
+      if (which >= 0)
+        for (uint32_t q = pCustom + 1; q < pLastLonghand; ++q)
+          if (q != pDirection && q != pWritingMode) apply_wide(static_cast<Prop>(q), which);
+      return;
+    }
     if (eq(value, "inherit")) apply_wide(p, 0);
     else if (eq(value, "initial")) apply_wide(p, 1);
     else if (eq(value, "unset")) apply_wide(p, 2);
-    else if (eq(value, "revert") || eq(value, "revert-layer")) apply_wide(p, 2);
+    else if (eq(value, "revert")) apply_wide(p, 3);
+    else if (eq(value, "revert-layer")) apply_wide(p, 2);
     else apply_value(p, value);
-    if (p == pFontSize || p == pFont || p == pDisplay) refresh();
+    if (p == pFontSize || p == pFont || p == pDisplay || p == pLineHeight) refresh();
   }
 
   // inherit (0), initial (1) and unset (2) for a property or all the longhands of a shorthand.
@@ -2954,9 +3215,10 @@ struct CssApply {
     const uint32_t n = longhands_of(p, list);
     for (uint32_t i = 0; i < n; ++i) {
       const bool from_parent = which == 0 || (which == 2 && inherited_property(list[i]));
-      copy_property(list[i], from_parent ? parent : initial, style);
+      copy_property(list[i], which == 3 ? ua_start : from_parent ? parent : initial, style);
       if (list[i] == pFontSize) {
-        if (from_parent) style->font_px = parent.font_px;
+        if (which == 3) style->font_px = ua_start.font_px;
+        else if (from_parent) style->font_px = parent.font_px;
         else style->font_px = 16;
       }
     }
@@ -3099,12 +3361,19 @@ struct CssApply {
 
   void set_line_height(StringView v) {
     double n;
-    if (eq(v, "normal")) { style->line_height_px100 = -1; return; }
-    if (evaluate_number(v, eval, &n) && n >= 0) { style->line_height_px100 = to_px100(n * style->font_px); return; }
+    if (eq(v, "normal")) { style->line_height_px100 = -1; style->line_height_num_x1000 = -1; return; }
+    if (evaluate_number(v, eval, &n) && n >= 0) {
+      style->line_height_px100 = to_px100(n * style->font_px);
+      style->line_height_num_x1000 = static_cast<int32_t>(n * 1000 + 0.5);   // (the pixels are worked out again once the font size is known)
+      return;
+    }
     EvalContext c = eval;
     c.percent_px = style->font_px;
     double px;
-    if (evaluate_length(v, c, false, &px) && px >= 0) style->line_height_px100 = to_px100(px);
+    if (evaluate_length(v, c, false, &px) && px >= 0) {
+      style->line_height_px100 = to_px100(px);
+      style->line_height_num_x1000 = -1;
+    }
   }
 
   void set_text_decoration(StringView v) {
@@ -3214,6 +3483,9 @@ void CssApply::apply_value(Prop p, StringView value) {
           style->color_argb = argb;
           style->color_argb_set = true;
         }
+        style->color_text = TextRef();
+        String text(sheet.allocator_);
+        if (serialize_modern_color(value, color_context(), &text) && !text.empty()) keep_text(text.view(), &style->color_text);
       }
       break;
     case pBackgroundColor:
@@ -3262,7 +3534,21 @@ void CssApply::apply_value(Prop p, StringView value) {
       }
       break;
     }
-    case pFontStyle: style->italic = eq(value, "italic") || eq(value, "oblique") || value.starts_with("oblique "); break;
+    case pFontStyle: {
+      style->italic = eq(value, "italic") || eq(value, "oblique") || value.starts_with("oblique ");
+      style->oblique_x10 = -1;
+      if (eq(value, "oblique")) {
+        style->oblique_x10 = 140;
+      } else if (value.starts_with("oblique ")) {
+        double angle = 14;
+        StringView rest = value.substr(8).trimmed();
+        U unit;
+        double number;
+        if (parse_dimension(rest, &number, &unit) && unit == U::Deg) angle = number;
+        style->oblique_x10 = static_cast<int16_t>(angle * 10 + (angle < 0 ? -0.5 : 0.5));
+      }
+      break;
+    }
     case pFont: {
       // [style] [variant] [weight] [stretch] size[/line-height] family
       uint64_t at = 0;
@@ -3294,6 +3580,7 @@ void CssApply::apply_value(Prop p, StringView value) {
       }
       if (size_part.empty()) break;   // (not a font shorthand: a system font name)
       style->italic = italic;
+      style->oblique_x10 = -1;
       style->font_weight = weight_set ? weight : 400;
       style->bold = style->font_weight >= 600;
       style->font_stretch_x10 = stretch;
@@ -3307,6 +3594,7 @@ void CssApply::apply_value(Prop p, StringView value) {
     }
     case pLineHeight: set_line_height(value); break;
     case pTextAlign: {
+      style->text_align_kw = eq(value, "start") ? 1 : eq(value, "end") ? 2 : eq(value, "match-parent") ? 3 : (eq(value, "left") || eq(value, "-webkit-left")) ? 4 : 0;
       if (eq(value, "center") || eq(value, "-webkit-center") || eq(value, "-moz-center")) { style->align = 1; style->justify = false; }
       else if (eq(value, "right") || eq(value, "end") || eq(value, "-webkit-right")) { style->align = 2; style->justify = false; }
       else if (eq(value, "left") || eq(value, "start") || eq(value, "-webkit-left") || eq(value, "match-parent")) { style->align = 0; style->justify = false; }
@@ -3333,8 +3621,26 @@ void CssApply::apply_value(Prop p, StringView value) {
       }
       break;
     }
-    case pWordBreak: style->word_break = eq(value, "break-all") || eq(value, "break-word"); break;
-    case pOverflowWrap: style->word_break = eq(value, "anywhere") || eq(value, "break-word"); break;
+    case pWordBreak:
+      style->word_break = eq(value, "break-all") || eq(value, "break-word");
+      style->word_break_kind = eq(value, "break-all") ? 1 : eq(value, "keep-all") ? 2 : eq(value, "break-word") ? 3 : 0;
+      break;
+    case pOverflowWrap:
+      style->word_break = eq(value, "anywhere") || eq(value, "break-word");
+      style->overflow_wrap_kind = eq(value, "anywhere") ? 1 : eq(value, "break-word") ? 2 : 0;
+      break;
+    case pQuotes: if (!value.trimmed().empty()) keep_text(value.trimmed(), &style->quotes); break;
+    case pTabSize: if (!value.trimmed().empty()) keep_text(value.trimmed(), &style->tab_size); break;
+    case pMixBlendMode: if (!value.trimmed().empty()) keep_text(value.trimmed(), &style->mix_blend_mode); break;
+    case pContain: if (!value.trimmed().empty()) keep_text(value.trimmed(), &style->contain); break;
+    case pAppearance: if (!value.trimmed().empty()) keep_text(value.trimmed(), &style->appearance); break;
+    case pWillChange: if (!value.trimmed().empty()) keep_text(value.trimmed(), &style->will_change); break;
+    case pAccentColor: {
+      uint32_t argb;
+      if (eq(value, "auto")) style->accent_color_argb = 0;
+      else if (parse_color_alpha(value, &argb)) style->accent_color_argb = argb ? argb : 0x00000001u;
+      break;
+    }
     case pTextOverflow: style->text_ellipsis = eq(value, "ellipsis") || value.starts_with("ellipsis ") || value.contains("ellipsis"); break;
     case pVerticalAlign:
       style->vertical_align = eq(value, "top") || eq(value, "text-top") ? 1 : eq(value, "middle") ? 2 : eq(value, "bottom") || eq(value, "text-bottom") ? 3 : 0;
@@ -3472,6 +3778,7 @@ void CssApply::apply_value(Prop p, StringView value) {
       style->flex_grow_x100 = to_px100(count >= 1 ? numbers[0] : 1.0);
       style->flex_shrink_x100 = to_px100(count >= 2 ? numbers[1] : 1.0);
       style->flex_basis = basis;
+      style->flex_basis_zero_percent = !have_basis;   // (a bare number as the shorthand gives the basis 0%)
       break;
     }
     case pFlexGrow: case pFlexShrink: {
@@ -3480,7 +3787,10 @@ void CssApply::apply_value(Prop p, StringView value) {
       break;
     }
     case pFlexBasis:
-      if (parse_length(value, false, &l) && l.kind != Length::None) style->flex_basis = l;
+      if (parse_length(value, false, &l) && l.kind != Length::None) {
+        style->flex_basis = l;
+        style->flex_basis_zero_percent = value.trimmed().equals("0%");
+      }
       break;
     case pFlexDirection: {
       static const KeywordValue kDirs[] = {{"row", 0}, {"row-reverse", 1}, {"column", 2}, {"column-reverse", 3}};
@@ -3657,7 +3967,9 @@ void CssApply::apply_value(Prop p, StringView value) {
       if (eq(value, "none") || eq(value, "normal")) {
         style->has_content = false;
         style->content = TextRef();
+        style->content_kind = eq(value, "none") ? 1 : 2;
       } else {
+        style->content_kind = 0;
         style->has_content = true;
         keep_text(value, &style->content);
       }
@@ -4169,6 +4481,17 @@ void CssApply::set_aspect_ratio(StringView value) {
     return;
   }
   style->aspect_auto = is_auto;
+  style->aspect_w_x1000 = style->aspect_h_x1000 = 0;
+  if (have_ratio && ratio > 0 && !ratio_text.empty()) {   // (kept as the two numbers that were written)
+    uint64_t k2 = 0;
+    StringView w2, h2;
+    double wn2 = 0, hn2 = 1;
+    next_slash_part(ratio_text.view(), &k2, &w2);
+    evaluate_number(w2, eval, &wn2);
+    if (k2 <= ratio_text.size() && next_slash_part(ratio_text.view(), &k2, &h2) && !h2.empty()) evaluate_number(h2, eval, &hn2);
+    style->aspect_w_x1000 = static_cast<uint32_t>(wn2 * 1000 + 0.5);
+    style->aspect_h_x1000 = static_cast<uint32_t>(hn2 * 1000 + 0.5);
+  }
   style->aspect_ratio_x1000 = have_ratio ? static_cast<uint32_t>(ratio > 1e6 ? 1e9 : ratio * 1000 + 0.5) : 0;
 }
 
@@ -4590,7 +4913,7 @@ void for_each_declaration(StringView text, F each) {
       important = true;
       value = value.first(bang).trimmed();
     }
-    if (name.empty() || value.empty()) continue;
+    if (name.empty() || (value.empty() && !name.starts_with("--"))) continue;   // (an empty custom property is a value)
     each(name, value, important);
   }
 }
@@ -5373,7 +5696,63 @@ bool StyleSheet::parse_block(StringView css, uint64_t* at, bool nested) {
   return true;
 }
 
-bool StyleSheet::parse_rule(StringView prelude, StringView body) {
+bool StyleSheet::parse_rule(StringView prelude, StringView body) { return parse_rule_nested(prelude, body, 0); }
+
+// The selector of a nested rule: `&` is the parent's selector; without one the parent is an ancestor (a leading > + ~ combinator applies to it).
+static bool nested_selector(allocators::IAllocator& alloc, StringView parent, StringView nested, String* out) {
+  uint64_t at = 0;
+  StringView selector;
+  String is_parent(alloc);
+  is_parent.append(":is(");
+  is_parent.append(parent.trimmed());
+  is_parent.push_back(')');
+  while (next_comma_part(nested, &at, &selector)) {
+    selector = selector.trimmed();
+    if (selector.empty()) continue;
+    if (!out->empty()) out->push_back(',');
+    if (selector.contains('&')) {
+      for (uint64_t i = 0; i < selector.size(); ++i) {
+        if (selector[i] == '&') out->append(is_parent.view());
+        else out->push_back(selector[i]);
+      }
+    } else {
+      out->append(is_parent.view());
+      out->push_back(' ');
+      out->append(selector);
+    }
+  }
+  return !out->empty();
+}
+
+bool StyleSheet::parse_rule_nested(StringView prelude, StringView body, uint32_t depth) {
+  if (depth >= 8 || !body.contains('{')) return parse_rule_flat(prelude, body);
+  String declarations(allocator_);
+  List<uint64_t> nested(allocator_);   // four numbers for each nested rule: where its selector begins and its length, where its block begins and its length
+  uint64_t i = 0;
+  while (i < body.size()) {
+    const uint64_t start = i;
+    const StringView piece = scan_until(body, &i, ';', '{');
+    if (i < body.size() && body[i] == '{') {
+      const uint64_t block_at = i + 1;
+      const StringView inner = take_block(body, &i);
+      if (!nested.push_back(start) || !nested.push_back(piece.size()) || !nested.push_back(block_at) || !nested.push_back(inner.size())) return false;
+    } else {
+      if (!declarations.append(piece) || !declarations.push_back(';')) return false;
+      if (i < body.size()) ++i;
+    }
+  }
+  if (!parse_rule_flat(prelude, declarations.view())) return false;
+  for (uint64_t n = 0; n + 3 < nested.count(); n += 4) {
+    const StringView selector = body.substr(nested[n], nested[n + 1]).trimmed();
+    if (selector.empty() || selector[0] == '@') continue;   // (nested @media and the like are not handled)
+    String resolved(allocator_);
+    if (!nested_selector(allocator_, prelude, selector, &resolved)) continue;
+    if (!parse_rule_nested(resolved.view(), body.substr(nested[n + 2], nested[n + 3]), depth + 1)) return false;
+  }
+  return true;
+}
+
+bool StyleSheet::parse_rule_flat(StringView prelude, StringView body) {
   if (prelude.contains(":hover") || prelude.contains(":active") || prelude.contains(":focus-within")) pointer_state_ = true;
   const uint32_t rule = static_cast<uint32_t>(rules_.count());
   if (!add_declarations(body, rule)) return false;
@@ -5485,6 +5864,7 @@ void finish_style(Style* s) {
   s->width_px = static_cast<uint16_t>(w > 8192 ? 8192 : w);
   s->height_px = static_cast<uint16_t>(h > 8192 ? 8192 : h);
   s->width_pct = 0;
+  if (s->line_height_num_x1000 >= 0) s->line_height_px100 = static_cast<int32_t>(static_cast<int64_t>(s->font_px) * s->line_height_num_x1000 / 10);   // (a number is a factor of the element's own font size)
   s->list_none = s->list_type == 8;
   if ((s->font_weight >= 600) != s->bold) s->font_weight = s->bold ? 700 : 400;   // (the defaults of the old renderer set only `bold`)
 }
@@ -6084,8 +6464,8 @@ void StyleSheet::apply(const dom::Node* element, StringView inline_style, const 
               style->custom_scope = add_scope(scope, style->custom_scope);
             }
           } else if (round == 1) {
-            if (p == pFontSize || p == pColorScheme) a.declare(p, value);
-          } else if (p != pCustom && p != pFontSize && p != pColorScheme) {
+            if (p == pFontSize || p == pColorScheme || p == pDirection || p == pWritingMode) a.declare(p, value);
+          } else if (p != pCustom && p != pFontSize && p != pColorScheme && p != pDirection && p != pWritingMode) {
             a.declare(p, value);
           }
         }
@@ -6107,8 +6487,8 @@ void StyleSheet::apply(const dom::Node* element, StringView inline_style, const 
             style->custom_scope = add_scope(scope, style->custom_scope);
           }
         } else if (round == 1) {
-          if (p == pFontSize || p == pColorScheme) a.declare(p, value);
-        } else if (p != pCustom && p != pFontSize && p != pColorScheme) {
+          if (p == pFontSize || p == pColorScheme || p == pDirection || p == pWritingMode) a.declare(p, value);
+        } else if (p != pCustom && p != pFontSize && p != pColorScheme && p != pDirection && p != pWritingMode) {
           a.declare(p, value);
         }
       });

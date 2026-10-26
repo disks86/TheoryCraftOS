@@ -240,6 +240,15 @@ struct Style {
   ColorScheme color_scheme = ColorScheme::Normal;
   TextRef list_style_image;         // list-style-image (url() or a gradient; empty: none)
   uint16_t root_font_px = 16;       // the font size of the root element: what rem means
+  // stored for scripts (computed style); the layout does not use them (inherited)
+  TextRef quotes, tab_size;
+  TextRef color_text;               // `color` as scripts see it when it is lab(), oklch(), color() or color-mix() (else empty: rgb of color_argb)
+  uint32_t accent_color_argb = 0;   // accent-color (0: auto)
+  int32_t line_height_num_x1000 = -1;   // line-height given as a number: the factor (the pixels follow the font size), else -1
+  uint8_t text_align_kw = 0;        // text-align as written when it is start, end, match-parent or left (0: otherwise, and the initial value start)
+  int16_t oblique_x10 = -1;         // font-style: oblique [angle]: the angle x10 (140 when none is given), -1: not oblique
+  uint8_t word_break_kind = 0;      // 0 normal, 1 break-all, 2 keep-all, 3 break-word
+  uint8_t overflow_wrap_kind = 0;   // 0 normal, 1 anywhere, 2 break-word
 
   // --- not inherited
   Display display = Display::Inline;
@@ -275,6 +284,9 @@ struct Style {
   bool scroll_smooth = false;                  // scroll-behavior: smooth (stored only)
   TextRef container_name;                      // container-name
   uint8_t container_type = 0;                  // container-type: 0 normal, 1 inline-size, 2 size
+  TextRef mix_blend_mode, contain, appearance, will_change;   // stored only
+  uint8_t content_kind = 0;                    // content as written: 0 not given, 1 none, 2 normal
+  uint32_t aspect_w_x1000 = 0, aspect_h_x1000 = 0;   // aspect-ratio as written (the two numbers)
 
   uint8_t margin_top = 0, margin_bottom = 0, padding_top = 0, padding_bottom = 0;   // blank lines (what the flow layout uses)
   uint8_t margin_left = 0, padding_left = 0;                                        // columns (what the flow layout uses)
@@ -310,6 +322,7 @@ struct Style {
   int32_t order = 0;
   int32_t flex_grow_x100 = 0, flex_shrink_x100 = 100;
   Length flex_basis;                           // auto
+  bool flex_basis_zero_percent = false;        // flex-basis: 0% (a Length cannot be a percentage of 0)
   Length row_gap, column_gap;                  // normal -> auto
   bool grid_dense = false, grid_column_flow = false;
   TextRef grid_template_columns, grid_template_rows, grid_template_areas, grid_auto_columns, grid_auto_rows;
@@ -408,6 +421,10 @@ struct Style {
     s.scroll_smooth = false;
     s.container_name = TextRef();
     s.container_type = 0;
+    s.flex_basis_zero_percent = false;
+    s.mix_blend_mode = s.contain = s.appearance = s.will_change = TextRef();
+    s.content_kind = 0;
+    s.aspect_w_x1000 = s.aspect_h_x1000 = 0;
     return s;
   }
 
@@ -744,6 +761,8 @@ class StyleSheet {
 
   bool parse_block(StringView css, uint64_t* at, bool nested);
   bool parse_rule(StringView prelude, StringView body);
+  bool parse_rule_nested(StringView prelude, StringView body, uint32_t depth);   // a rule whose block may hold rules of its own (CSS nesting)
+  bool parse_rule_flat(StringView prelude, StringView body);
   bool add_declarations(StringView body, uint32_t rule);
   bool add_declaration_run(StringView body, uint32_t* first, uint32_t* count);
   bool parse_at_rule(StringView name, StringView prelude, StringView body, bool has_body, bool* recurse);

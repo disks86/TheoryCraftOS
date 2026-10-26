@@ -226,6 +226,14 @@ static void test_boot_retries_and_failure() {
     CHECK(rig.uvd.attempts == 1 + rig.config.boot_attempts);   // (the release that starts the VCPU, then one reset and release per try)
     CHECK(at(rig.uvd, reg::kRbCntl) == 0x11010101 && at(rig.uvd, reg::kVcpuCntl) == 0 && at(rig.uvd, reg::kStatus) == 0 && at(rig.uvd, reg::kSoftReset) == 8);
     CHECK(!(at(rig.uvd, reg::kLmiCtrl2) & 0x100));   // the memory path is unstalled again
+    // The snapshot is of the engine when it gave up, not of what the stop sequence left: the VCPU was clocked and out of reset, the status register never showed the answer.
+    const AmdUvd6::Diagnostics d = engine.failure_snapshot();
+    CHECK((d.vcpu_cntl & 0x200) != 0 && d.soft_reset == 0 && (d.status & 2) == 0);
+    CHECK(d.lmi_ctrl2 == at(rig.uvd, reg::kLmiCtrl2) || (d.lmi_ctrl2 & 0x100) == 0);
+    // read_diagnostics reads the seven registers (and nothing else), by the numbers in uvd_6_0_d.h.
+    rig.uvd.regs[0x38c4] = 0x11; rig.uvd.regs[0x3da4] = 0x22; rig.uvd.regs[0x3da5] = 0x33;
+    const AmdUvd6::Diagnostics live = AmdUvd6::read_diagnostics(rig.uvd);
+    CHECK(live.power_status == 0x11 && live.rb_rptr == 0x22 && live.rb_wptr == 0x33 && live.soft_reset == 8 && live.status == 0 && live.vcpu_cntl == 0);
   }
   {  // A microcode the engine's checks do not accept is the same as no answer.
     Rig rig;

@@ -83,6 +83,12 @@ class SoftwareImage final : public IImage {
     for (uint32_t i = 0; i < color_.size(); ++i) out[i] = s.decode(color_[i]);
     return true;
   }
+  bool write_pixels(ArrayView<const uint32_t> pixels) override {
+    if (color_.empty() || pixels.size() != color_.size()) return false;
+    const Surface s = surface();
+    for (uint32_t i = 0; i < color_.size(); ++i) color_[i] = s.encode(pixels[i]);
+    return true;
+  }
   Surface surface() const {
     Surface s;
     s.pixels = color_;
@@ -113,16 +119,78 @@ class SoftwareShaderModule final : public IShaderModule {
 
 class SoftwarePipeline final : public IPipeline {
  public:
-  SoftwarePipeline(const GraphicsPipelineDesc& desc, VertexShaderFn vs, FragmentShaderFn fs)
-      : desc_(desc), vertex_(vs), fragment_(fs) {}
+  SoftwarePipeline(const GraphicsPipelineDesc& desc, VertexShaderFn vs, FragmentShaderFn fs, TexturedFragmentShaderFn textured)
+      : desc_(desc), vertex_(vs), fragment_(fs), textured_(textured) {}
   const GraphicsPipelineDesc& desc() const { return desc_; }
   VertexShaderFn vertex() const { return vertex_; }
   FragmentShaderFn fragment() const { return fragment_; }
+  TexturedFragmentShaderFn textured() const { return textured_; }
 
  private:
   GraphicsPipelineDesc desc_;
   VertexShaderFn vertex_;
   FragmentShaderFn fragment_;
+  TexturedFragmentShaderFn textured_;
+};
+
+// The textures bound for the draws being made, and the sampling itself (see SamplerDesc for what the coordinates mean).
+class TextureSet final : public ITextureSet {
+ public:
+  void bind(uint32_t unit, const SoftwareImage* image, const SamplerDesc& sampler) {
+    images_[unit] = image;
+    samplers_[unit] = sampler;
+  }
+  const SoftwareImage* image(uint32_t unit) const { return unit < kMaxTextureUnits ? images_[unit] : nullptr; }
+
+  Vec4 sample(uint32_t unit, float u, float v) const override {
+    const SoftwareImage* image = image_for(unit);
+    if (!image) return {0, 0, 0, 1};
+    const SamplerDesc& sampler = samplers_[unit];
+    const Surface surface = image->surface();
+    const int64_t w = surface.width, h = surface.height;
+    if (sampler.filter == Filter::Nearest) {
+      return texel(surface, index(floor_to(unit_coordinate(u) * static_cast<float>(w)), w, sampler.address_u), index(floor_to(unit_coordinate(v) * static_cast<float>(h)), h, sampler.address_v));
+    }
+    // Linear: the four texels around the point, whose centres are half a texel in.
+    const float fx = unit_coordinate(u) * static_cast<float>(w) - 0.5f, fy = unit_coordinate(v) * static_cast<float>(h) - 0.5f;
+    const int64_t x0 = floor_to(fx), y0 = floor_to(fy);
+    const float tx = fx - static_cast<float>(x0), ty = fy - static_cast<float>(y0);
+    const int64_t xs[2] = {index(x0, w, sampler.address_u), index(x0 + 1, w, sampler.address_u)};
+    const int64_t ys[2] = {index(y0, h, sampler.address_v), index(y0 + 1, h, sampler.address_v)};
+    const Vec4 a = texel(surface, xs[0], ys[0]), b = texel(surface, xs[1], ys[0]), c = texel(surface, xs[0], ys[1]), d = texel(surface, xs[1], ys[1]);
+    const Vec4 top = a * (1 - tx) + b * tx, bottom = c * (1 - tx) + d * tx;
+    return top * (1 - ty) + bottom * ty;
+  }
+
+ private:
+  const SoftwareImage* image_for(uint32_t unit) const { return unit < kMaxTextureUnits ? images_[unit] : nullptr; }
+  // A coordinate a NaN or a very large value cannot turn into an index outside the image: both are brought into a range the integer conversion can take.
+  static float unit_coordinate(float c) {
+    if (!(c == c)) return 0.0f;
+    if (c > 1e6f) return 1e6f;
+    if (c < -1e6f) return -1e6f;
+    return c;
+  }
+  static int64_t floor_to(float f) {
+    const int64_t i = static_cast<int64_t>(f);
+    return static_cast<float>(i) > f ? i - 1 : i;
+  }
+  // The texel column or row an integer coordinate means, for an image `size` texels wide or high.
+  static int64_t index(int64_t i, int64_t size, AddressMode mode) {
+    if (mode == AddressMode::Repeat) {
+      i %= size;
+      return i < 0 ? i + size : i;
+    }
+    return i < 0 ? 0 : (i >= size ? size - 1 : i);
+  }
+  static Vec4 texel(const Surface& surface, int64_t x, int64_t y) {
+    const uint32_t argb = surface.decode(surface.row(static_cast<uint32_t>(y))[x]);
+    constexpr float k = 1.0f / 255.0f;
+    return {static_cast<float>((argb >> 16) & 0xFF) * k, static_cast<float>((argb >> 8) & 0xFF) * k, static_cast<float>(argb & 0xFF) * k, static_cast<float>(argb >> 24) * k};
+  }
+
+  const SoftwareImage* images_[kMaxTextureUnits] = {};
+  SamplerDesc samplers_[kMaxTextureUnits];
 };
 
 // --- Rasterization -------------------------------------------------------------
@@ -156,6 +224,7 @@ struct DrawState {
   SoftwareImage* depth = nullptr;
   Viewport viewport;
   Rect2D scissor;  // already clamped to the target
+  TextureSet textures;
   const uint8_t* constants = nullptr;
   uint8_t constants_storage[kMaxPushConstantBytes] = {};
 };
@@ -250,7 +319,7 @@ void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVert
                       (v0->varying[i].w * p0 + v1->varying[i].w * p1 + v2->varying[i].w * p2) * norm};
       }
       Vec4 color;
-      if (!s.pipeline->fragment()(varying, s.constants, &color)) continue;
+      if (s.pipeline->textured() ? !s.pipeline->textured()(varying, s.constants, s.textures, &color) : !s.pipeline->fragment()(varying, s.constants, &color)) continue;
 
       uint32_t out = pack_color(color);
       uint32_t* pixel = target.row(static_cast<uint32_t>(y)) + x;
@@ -341,7 +410,7 @@ IImage* SoftwareDevice::create_image(const ImageDesc& desc) {
 void SoftwareDevice::destroy_image(IImage* image) { destroy(allocator_, static_cast<SoftwareImage*>(image)); }
 
 IShaderModule* SoftwareDevice::create_shader_module(const ShaderModuleDesc& desc) {
-  if (desc.stage == ShaderStage::Vertex ? !desc.vertex_function : !desc.fragment_function) return nullptr;
+  if (desc.stage == ShaderStage::Vertex ? !desc.vertex_function : (!desc.fragment_function) == (!desc.textured_fragment_function)) return nullptr;   // (a fragment shader is one or the other)
   return make<SoftwareShaderModule>(allocator_, desc);
 }
 void SoftwareDevice::destroy_shader_module(IShaderModule* module) {
@@ -355,7 +424,10 @@ IPipeline* SoftwareDevice::create_graphics_pipeline(const GraphicsPipelineDesc& 
   const auto* vs = static_cast<const SoftwareShaderModule*>(desc.vertex_shader);
   const auto* fs = static_cast<const SoftwareShaderModule*>(desc.fragment_shader);
   if (vs->stage() != ShaderStage::Vertex || fs->stage() != ShaderStage::Fragment) return nullptr;
-  return make<SoftwarePipeline>(allocator_, desc, vs->desc().vertex_function, fs->desc().fragment_function);
+  // A shader that samples textures needs the pipeline to say how many, and the other way round.
+  const bool textured = fs->desc().textured_fragment_function != nullptr;
+  if (desc.texture_count > kMaxTextureUnits || (desc.texture_count != 0) != textured) return nullptr;
+  return make<SoftwarePipeline>(allocator_, desc, vs->desc().vertex_function, fs->desc().fragment_function, fs->desc().textured_fragment_function);
 }
 void SoftwareDevice::destroy_pipeline(IPipeline* pipeline) {
   destroy(allocator_, static_cast<SoftwarePipeline*>(pipeline));
@@ -425,6 +497,12 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
         for (uint32_t k = 0; k < block.size(); ++k) s.constants_storage[k] = block[k];
         break;
       }
+      case RecordedCommand::Type::BindTexture: {
+        const auto* image = static_cast<const SoftwareImage*>(cmd.image);
+        if (cmd.unit >= kMaxTextureUnits || !image || !(image->usage() & kImageSampled) || image->format() == Format::D32Float) return false;
+        s.textures.bind(cmd.unit, image, cmd.sampler);
+        break;
+      }
       case RecordedCommand::Type::SetViewport:
         s.viewport = cmd.viewport;
         break;
@@ -445,6 +523,11 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
         const bool indexed = cmd.type == RecordedCommand::Type::DrawIndexed;
         if (indexed && !index_buffer) return false;
         const GraphicsPipelineDesc& pd = s.pipeline->desc();
+        // Every texture the pipeline samples is bound, and none of them is the image being drawn into.
+        for (uint32_t unit = 0; unit < pd.texture_count; ++unit) {
+          const SoftwareImage* bound = s.textures.image(unit);
+          if (!bound || bound == s.color || bound == s.depth) return false;
+        }
         const ConstByteView vertices = ConstByteView(vertex_buffer->map());
         const ConstByteView indices = indexed ? ConstByteView(index_buffer->map()) : ConstByteView();
         const uint32_t index_size = index_type == IndexType::Uint16 ? 2 : 4;

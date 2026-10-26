@@ -41,12 +41,15 @@ gaps: `grep -c xfail tests/data/wpt/*.js`. The largest ones today:
 - **HTML**: the parser follows the standard (`src/Dom/HtmlBuilder.cpp`: tokenizer states, insertion modes, adoption agency, foster parenting, foreign
   content, templates, quirks mode). Left: the doctype is not a node (`document.doctype`, `publicId`/`systemId`), `DOMParser` with XML, character
   references that stand for two code points, `innerHTML` scripts must not run.
-- **CSS**: closed: `getComputedStyle` reports table parts (`td`, `tr`, `table` ... with `cellpadding`), controls (`inline-block`), closed `dialog` (`none`),
-  blockified `display` under `float` and absolute positioning, `em`/`i` italic, `pre` white-space, `ol` decimal, link colour, `sub`/`sup`, `mark`.
-  Still open: heading sizes, `ul` padding (40px), `blockquote` margin and `small` size (the UA metrics are terminal cells on purpose), `hr` border,
-  newer colour spaces (`lab`, `oklch`, `color-mix`, relative colours), `lh`, nesting, `revert-layer`, `@container` failure, `:dir()`,
-  `:nth-child(… of S)`, `aspect-ratio`, `flow-root` floats, many properties return `""`
-  (`text-indent`, `word-break`, `quotes`, `counter-*`, `contain`, `will-change`, …).
+- **CSS**: closed: `getComputedStyle` reports table parts (with `cellpadding`), controls, closed `dialog`, blockified `display`, `em`/`i`, `pre`, `ol`, link colour,
+  `sub`/`sup`, `mark`; the properties that used to read `""` (`text-indent`, `white-space` longhands, `word-break`, `overflow-wrap`, `text-overflow`, `quotes`,
+  `tab-size`, `list-style-position`, counters, `content`, `grid-*-start/end`, `column-count`, `mix-blend-mode`, `contain`, `accent-color`, `appearance`, `will-change`,
+  `border-collapse`); `line-height: normal` and numbers that follow the font size; `text-align: start`; `font-style: oblique <angle>`; `aspect-ratio` as written;
+  `transform-origin` and `background-position` keywords; `url()` and gradient colours serialized; `lh`; `all`; `revert`; CSS nesting; logical properties with
+  `direction` / `writing-mode`; `:nth-child(… of S)`, `:dir()`, `:read-write` on `contenteditable`; `calc()` needs spaces around `+` and `-`; an empty custom property;
+  a `var()` cycle uses its fallback; `rgb()` rounds; `color` keeps `lab()`, `lch()`, `oklab()`, `oklch()`, `color()` and `color-mix()` in their own space and `rgb()`/`hsl()`/`hwb()`/`lab()`… relative colours (`from`) work for plain channel keywords (a `calc()` of them does not).
+  Still open: heading sizes, `ul` padding (40px), `blockquote` margin and `small` size (the UA metrics are terminal cells on purpose), `hr` border, other properties than `color` (`background-color`, borders) still read newer colour spaces as sRGB, `revert-layer`, `flow-root` (reads `block`), `@container` conditions (container sizes are
+  unknown without layout, so they match), unitless non-zero lengths (accepted as pixels, as in quirks mode)
 - **Web APIs**: the constructor of an interface inherits from the constructor of its parent, `AbstractRange`/`StaticRange`, `EventSource`,
   `IDBVersionChangeEvent`, the device events, `DOMImplementation`, `NodeFilter` as an interface object, the legacy element interfaces and the
   constants of `WheelEvent`/`KeyboardEvent`/`DOMException` exist (`finish_prelude()` in `WebPrelude.cpp`, run last). The attributes the engine keeps on the

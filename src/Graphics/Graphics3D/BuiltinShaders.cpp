@@ -32,6 +32,17 @@ bool colored_fragment(const Vec4* varyings, const uint8_t*, Vec4* color) {
   return true;
 }
 
+void textured_vertex(const Vec4* attributes, const uint8_t* constants, ShaderIo* out) {
+  const Mat4& mvp = *reinterpret_cast<const Mat4*>(constants);
+  out->position = mvp * Vec4{attributes[0].x, attributes[0].y, attributes[0].z, 1.0f};
+  out->varying[0] = attributes[1];
+}
+
+bool textured_fragment(const Vec4* varyings, const uint8_t*, const ITextureSet& textures, Vec4* color) {
+  *color = textures.sample(0, varyings[0].x, varyings[0].y);
+  return true;
+}
+
 // Push constants are CONST[0..3], the columns of the matrix.
 constexpr const char kColoredVertexTgsi[] =
     "VERT\n"
@@ -99,6 +110,31 @@ ShaderModuleDesc colored_fragment_shader() {
   d.qpu_program = QpuProgram::ColoredFragment;
   d.eu_program = EuProgram::ColoredFragment;
   return d;
+}
+
+ShaderModuleDesc textured_vertex_shader() {
+  ShaderModuleDesc d;
+  d.stage = ShaderStage::Vertex;
+  d.vertex_function = textured_vertex;
+  d.eu_program = EuProgram::TexturedVertex;
+  return d;
+}
+
+ShaderModuleDesc textured_fragment_shader() {
+  ShaderModuleDesc d;
+  d.stage = ShaderStage::Fragment;
+  d.textured_fragment_function = textured_fragment;
+  d.eu_program = EuProgram::TexturedFragment;
+  return d;
+}
+
+void describe_textured_pipeline(GraphicsPipelineDesc* desc) {
+  desc->vertex_stride = sizeof(TexturedVertex);
+  desc->attribute_count = 2;
+  desc->attributes[0] = {0, VertexFormat::Float3, 0};
+  desc->attributes[1] = {1, VertexFormat::Float2, 12};
+  desc->varying_count = 1;
+  desc->texture_count = 1;
 }
 
 void describe_colored_pipeline(GraphicsPipelineDesc* desc) {

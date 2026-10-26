@@ -22,7 +22,8 @@
 //
 // What differs from Vulkan, on purpose: no instance/queue-family/descriptor-set/
 // synchronization machinery (submit() is synchronous), memory is always
-// host-visible, shader state is limited to push constants, and shaders are not
+// host-visible, shader state is limited to push constants and a few bound textures
+// (a sampled image with its sampler state, no mipmaps), and shaders are not
 // SPIR-V (there is no compiler in the OS yet): a ShaderModule carries a native
 // C++ function for the software device and/or TGSI text for the GPU device. The
 // built-in shaders (BuiltinShaders.hpp) come with both, so the same program
@@ -38,6 +39,7 @@ namespace graphics {
 constexpr uint32_t kMaxVertexAttributes = 4;
 constexpr uint32_t kMaxVaryings = 4;
 constexpr uint32_t kMaxPushConstantBytes = 128;
+constexpr uint32_t kMaxTextureUnits = 2;
 
 // --- Resources ---------------------------------------------------------------
 
@@ -62,6 +64,7 @@ enum ImageUsage : uint32_t {
   kImageColorAttachment = 1u << 0,
   kImageDepthAttachment = 1u << 1,
   kImagePresent = 1u << 2,  // may be shown with present()
+  kImageSampled = 1u << 3,  // may be bound as a texture with bind_texture() and filled with write_pixels()
 };
 
 struct ImageDesc {
@@ -77,6 +80,12 @@ class IImage {
   // Copies a color image to `out` (extent.width * extent.height values, 0xAARRGGBB).
   // The GPU device reads it back from the host, so this is slow: for tests and screenshots.
   virtual bool read_pixels(ArrayView<uint32_t> out) = 0;
+  // Replaces the contents of a color image (extent.width * extent.height values, 0xAARRGGBB, rows top to bottom) - how a texture is filled. False if the device cannot (the
+  // default), the image is not a color image or `pixels` is the wrong size. Not synchronised with a submit() that uses the image: an image belongs to one user at a time.
+  virtual bool write_pixels(ArrayView<const uint32_t> pixels) {
+    (void)pixels;
+    return false;
+  }
 
  protected:
   constexpr IImage() = default;
@@ -86,6 +95,31 @@ class IImage {
 // --- Shaders -----------------------------------------------------------------
 
 enum class ShaderStage : uint8_t { Vertex, Fragment };
+
+// --- Textures ----------------------------------------------------------------
+
+// How a texture is read. Coordinates are normalised: (0, 0) is the top left corner of the top left texel and (1, 1) the bottom right corner of the bottom right one,
+// +v down the picture. Nearest takes the texel the point lies in; Linear blends the four texels around it (their centres are half a texel in). There are no mipmaps.
+enum class Filter : uint8_t { Nearest, Linear };
+// What a coordinate outside 0..1 means: wrap around, or take the edge texel.
+enum class AddressMode : uint8_t { Repeat, ClampToEdge };
+struct SamplerDesc {
+  Filter filter = Filter::Nearest;
+  AddressMode address_u = AddressMode::Repeat;
+  AddressMode address_v = AddressMode::Repeat;
+};
+
+// The bound textures as a fragment shader sees them: sample(unit, u, v) gives the colour (0..1 per component, straight alpha) of the image bound to `unit` with the sampler
+// it was bound with. A unit with nothing bound gives opaque black (a draw that uses a pipeline's textures without binding them is refused at submit, so a shader only
+// sees this for a unit beyond the pipeline's texture_count).
+class ITextureSet {
+ public:
+  virtual Vec4 sample(uint32_t unit, float u, float v) const = 0;
+
+ protected:
+  constexpr ITextureSet() = default;
+  ~ITextureSet() = default;
+};
 
 // What a vertex shader produces and a fragment shader receives (interpolated).
 struct ShaderIo {
@@ -98,18 +132,23 @@ struct ShaderIo {
 // returns false to discard the pixel.
 using VertexShaderFn = void (*)(const Vec4* attributes, const uint8_t* constants, ShaderIo* out);
 using FragmentShaderFn = bool (*)(const Vec4* varyings, const uint8_t* constants, Vec4* color);
+// The same for a fragment shader that reads the pipeline's textures.
+using TexturedFragmentShaderFn = bool (*)(const Vec4* varyings, const uint8_t* constants, const ITextureSet& textures, Vec4* color);
 
 // The QPU programs the Raspberry Pi's V3D device has for the built-in shaders (there is no shader compiler for the QPUs, so a module names a program it ships
 // with instead of carrying code): the coloured-vertex pipeline of BuiltinShaders.
 enum class QpuProgram : uint8_t { None, ColoredVertex, ColoredFragment };
 
 // The pixel kernels the Intel Gen9 device has for the built-in shaders (there is no shader compiler for the EUs either).
-enum class EuProgram : uint8_t { None, ColoredVertex, ColoredFragment };
+enum class EuProgram : uint8_t { None, ColoredVertex, ColoredFragment, TexturedVertex, TexturedFragment };
 
 struct ShaderModuleDesc {
   ShaderStage stage = ShaderStage::Vertex;
   VertexShaderFn vertex_function = nullptr;      // used by the software device
   FragmentShaderFn fragment_function = nullptr;  // used by the software device
+  // A fragment shader that samples textures (instead of fragment_function; the pipeline then says how many in texture_count). Only the software device runs these so far: the other
+  // devices refuse a pipeline with textures.
+  TexturedFragmentShaderFn textured_fragment_function = nullptr;
   // TGSI text for the GPU device. Inputs are the vertex attributes (vertex stage) or the
   // varyings as GENERIC[n] (fragment stage); push constants are CONST[0..7] (vec4 each).
   // Clip-space z is 0..1 and the first color output is the pixel.
@@ -153,6 +192,7 @@ struct GraphicsPipelineDesc {
   VertexAttribute attributes[kMaxVertexAttributes] = {};
   uint32_t attribute_count = 0;
   uint32_t varying_count = 0;  // values passed from the vertex to the fragment shader
+  uint32_t texture_count = 0;  // texture units 0 .. n-1 the fragment shader samples (at most kMaxTextureUnits); every one must be bound before a draw
   CullMode cull_mode = CullMode::Back;
   FrontFace front_face = FrontFace::CounterClockwise;
   bool depth_test = false;  // pass if closer or equal (LEQUAL)
@@ -194,6 +234,8 @@ class ICommandBuffer {
   virtual void bind_index_buffer(IBuffer* buffer, IndexType type, uint64_t offset = 0) = 0;
   // Sets the shader constants (at most kMaxPushConstantBytes, a multiple of 16).
   virtual void push_constants(const void* data, uint32_t size) = 0;
+  // Binds a sampled image (created with kImageSampled) to a texture unit with a sampler, for the draws that follow. A render pass may not draw into an image it samples.
+  virtual void bind_texture(uint32_t unit, IImage* image, const SamplerDesc& sampler) = 0;
   // Defaults to the whole render target.
   virtual void set_viewport(const Viewport& viewport) = 0;
   virtual void set_scissor(const Rect2D& scissor) = 0;

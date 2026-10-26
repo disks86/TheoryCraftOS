@@ -553,6 +553,12 @@ bool Page::computed_style(const dom::Node* element, Style* out) {
     const Style parent = s;
     s = derive_style(parent, n, sheet);
     if (s.display != Display::None) layout::apply_table_presentation(n, parent, sheet, &s);
+    // computed values that depend on the neighbours: an absolutely positioned box does not float, and a flex or grid item is blockified
+    if (s.position == Position::Absolute || s.position == Position::Fixed) s.float_side = Float::None;
+    if ((parent.layout == Layout::Flex || parent.layout == Layout::Grid) && parent.display != Display::None && s.display == Display::Inline && !s.contents) {
+      s.display = Display::Block;
+      s.inline_box = false;
+    }
     if (s.own_background) {
       s.background = s.own_background_color;
       s.background_block = s.display != Display::Inline;

@@ -1045,7 +1045,245 @@ static void test_renderers_agree() {
   release_view(a, cs.pixels);
 }
 
+// --- Textures -------------------------------------------------------------------
+
+struct TextureScene {
+  TestAllocator a;
+  SoftwareDevice device{a, nullptr};
+  IShaderModule* vs = nullptr;
+  IShaderModule* fs = nullptr;
+  IBuffer* vb = nullptr;
+  GraphicsPipelineDesc desc;
+  IPipeline* pipeline = nullptr;
+  IImage* color = nullptr;
+  ArrayView<uint32_t> out;
+  TextureScene() {
+    vs = device.create_shader_module(textured_vertex_shader());
+    fs = device.create_shader_module(textured_fragment_shader());
+    vb = device.create_buffer(4096, kBufferVertex);
+    describe_textured_pipeline(&desc);
+    desc.vertex_shader = vs;
+    desc.fragment_shader = fs;
+    desc.cull_mode = CullMode::None;
+    pipeline = device.create_graphics_pipeline(desc);
+    color = device.create_image({{64, 64}, Format::B8G8R8A8Unorm, kImageColorAttachment});
+    out = allocate_view<uint32_t>(a, 64 * 64);
+  }
+  ~TextureScene() {
+    device.destroy_pipeline(pipeline);
+    device.destroy_buffer(vb);
+    device.destroy_image(color);
+    device.destroy_shader_module(vs);
+    device.destroy_shader_module(fs);
+    release_view(a, out);
+  }
+  // The whole target as a quad whose texture coordinates run from (u0, v0) at the top left to (u1, v1) at the bottom right.
+  void quad(float u0, float v0, float u1, float v1) {
+    const TexturedVertex v[6] = {{{-1, -1, 0.5f}, {u0, v0}}, {{-1, 1, 0.5f}, {u0, v1}}, {{1, 1, 0.5f}, {u1, v1}},
+                                 {{-1, -1, 0.5f}, {u0, v0}}, {{1, 1, 0.5f}, {u1, v1}}, {{1, -1, 0.5f}, {u1, v0}}};
+    ByteView m = vb->map();
+    for (uint32_t i = 0; i < sizeof v; ++i) m[i] = reinterpret_cast<const uint8_t*>(v)[i];
+    vb->unmap();
+  }
+  IImage* texture(uint32_t w, uint32_t h, const uint32_t* texels, Format format = Format::B8G8R8A8Unorm) {
+    IImage* t = device.create_image({{w, h}, format, kImageSampled});
+    if (t && !t->write_pixels(ArrayView<const uint32_t>(texels, uint64_t{w} * h))) {
+      device.destroy_image(t);
+      return nullptr;
+    }
+    return t;
+  }
+  // Draws the quad with `image` bound to unit 0; false if the recording or the submit failed.
+  bool draw(IImage* image, const SamplerDesc& sampler, IImage* target = nullptr, bool bind = true) {
+    ICommandBuffer* cb = device.create_command_buffer();
+    cb->begin();
+    RenderPassBegin pass;
+    pass.color = target ? target : color;
+    pass.clear_color_value = {0, 0, 0, 1};
+    cb->begin_render_pass(pass);
+    cb->bind_pipeline(pipeline);
+    cb->bind_vertex_buffer(vb);
+    const Mat4 id;
+    cb->push_constants(&id, sizeof id);
+    if (bind) cb->bind_texture(0, image, sampler);
+    cb->draw(6);
+    cb->end_render_pass();
+    const bool ok = cb->end() && device.submit(cb);
+    device.destroy_command_buffer(cb);
+    return ok;
+  }
+};
+
+static void test_textures() {
+  TextureScene t;
+  CHECK(t.vs && t.fs && t.vb && t.pipeline && t.color);
+  CHECK(t.desc.texture_count == 1);
+
+  // A 4 x 4 texture whose texels are all different: red grows to the right, green down the picture, blue is fixed.
+  uint32_t texels[16];
+  for (uint32_t y = 0; y < 4; ++y)
+    for (uint32_t x = 0; x < 4; ++x) texels[y * 4 + x] = 0xFF000000u | ((x * 80) << 16) | ((y * 80) << 8) | 0x40;
+  IImage* tex = t.texture(4, 4, texels);
+  CHECK(tex);
+  t.quad(0, 0, 1, 1);
+  CHECK(t.draw(tex, SamplerDesc()));
+  CHECK(t.color->read_pixels(t.out));
+  // Nearest: each texel fills a 16 x 16 block, (0, 0) at the top left, v down.
+  for (uint32_t y = 0; y < 4; ++y)
+    for (uint32_t x = 0; x < 4; ++x) CHECK(at(t.out, 64, x * 16 + 8, y * 16 + 8) == texels[y * 4 + x]);
+  CHECK(at(t.out, 64, 0, 0) == texels[0] && at(t.out, 64, 63, 63) == texels[15] && at(t.out, 64, 63, 0) == texels[3] && at(t.out, 64, 0, 63) == texels[12]);
+
+  // Repeat: coordinates 0..2 show the picture twice; ClampToEdge with -1..2 shows the edge texels outside.
+  t.quad(0, 0, 2, 2);
+  CHECK(t.draw(tex, SamplerDesc()) && t.color->read_pixels(t.out));
+  for (uint32_t y = 0; y < 4; ++y)
+    for (uint32_t x = 0; x < 4; ++x) CHECK(at(t.out, 64, x * 8 + 4, y * 8 + 4) == texels[y * 4 + x] && at(t.out, 64, 32 + x * 8 + 4, 32 + y * 8 + 4) == texels[y * 4 + x]);
+  SamplerDesc clamp;
+  clamp.address_u = clamp.address_v = AddressMode::ClampToEdge;
+  t.quad(-1, -1, 2, 2);   // the picture covers the middle third; the rest is its edge texels stretched
+  CHECK(t.draw(tex, clamp) && t.color->read_pixels(t.out));
+  CHECK(at(t.out, 64, 2, 2) == texels[0] && at(t.out, 64, 61, 2) == texels[3] && at(t.out, 64, 2, 61) == texels[12] && at(t.out, 64, 61, 61) == texels[15]);
+  CHECK(at(t.out, 64, 32, 32) == texels[1 * 4 + 1] || at(t.out, 64, 32, 32) == texels[2 * 4 + 2]);   // (the middle of the picture, near its centre)
+
+  // Linear: a two-texel black and white texture. Between the texel centres the colour runs from black to white, in the middle it is grey.
+  const uint32_t bw[2] = {0xFF000000u, 0xFFFFFFFFu};
+  IImage* ramp = t.texture(2, 1, bw);
+  CHECK(ramp);
+  SamplerDesc linear;
+  linear.filter = Filter::Linear;
+  linear.address_u = linear.address_v = AddressMode::ClampToEdge;
+  t.quad(0, 0, 1, 1);
+  CHECK(t.draw(ramp, linear) && t.color->read_pixels(t.out));
+  auto grey = [&](uint32_t x) { return at(t.out, 64, x, 10) & 0xFF; };
+  CHECK(grey(2) == 0 && grey(61) == 255);          // beyond the centres: the edge texel
+  CHECK(grey(31) > 110 && grey(31) < 145 && grey(32) > 110 && grey(32) < 145);   // the middle
+  CHECK(grey(24) < grey(32) && grey(32) < grey(40));   // and monotonic between the centres (16 and 48)
+  // The same texture repeating: the left edge blends with the right edge's white, so it is not black.
+  linear.address_u = AddressMode::Repeat;
+  CHECK(t.draw(ramp, linear) && t.color->read_pixels(t.out));
+  CHECK(grey(0) > 80 && grey(63) > 80 && grey(0) < 200);
+  // Nearest on the same texture: a hard edge in the middle.
+  CHECK(t.draw(ramp, SamplerDesc()) && t.color->read_pixels(t.out));
+  CHECK(grey(31) == 0 && grey(32) == 255);
+
+  // The byte order of the image does not matter: an R8G8B8A8 texture reads back the colours written to it, and the target can be R8G8B8A8 too.
+  const uint32_t one[1] = {0xFF2060A0u};
+  IImage* rgba = t.texture(1, 1, one, Format::R8G8B8A8Unorm);
+  CHECK(rgba);
+  t.quad(0, 0, 1, 1);
+  IImage* rgba_target = t.device.create_image({{64, 64}, Format::R8G8B8A8Unorm, kImageColorAttachment});
+  CHECK(t.draw(rgba, SamplerDesc(), rgba_target) && rgba_target->read_pixels(t.out) && at(t.out, 64, 30, 30) == 0xFF2060A0u);
+  t.device.destroy_image(rgba_target);
+
+  // Alpha comes through, and a pipeline with alpha blending lays the texture over what is there.
+  const uint32_t half[1] = {0x80FF0000u};
+  IImage* translucent = t.texture(1, 1, half);
+  GraphicsPipelineDesc blended = t.desc;
+  blended.alpha_blend = true;
+  IPipeline* blend_pipeline = t.device.create_graphics_pipeline(blended);
+  IPipeline* plain = t.pipeline;
+  t.pipeline = blend_pipeline;
+  CHECK(translucent && blend_pipeline && t.draw(translucent, SamplerDesc()) && t.color->read_pixels(t.out));
+  const uint32_t mixed = at(t.out, 64, 30, 30);
+  CHECK(((mixed >> 16) & 0xFF) > 110 && ((mixed >> 16) & 0xFF) < 145 && (mixed & 0xFF) == 0);   // half red over the black clear
+  t.pipeline = plain;
+  t.device.destroy_pipeline(blend_pipeline);
+
+  // Perspective: a quad receding from the viewer. Texture coordinates are interpolated with the 1/w of the vertices, so the checker squares near the far edge are
+  // smaller on screen than the near ones; the centre row of the target has the near half wider than the far half.
+  uint32_t checker[4] = {0xFFFFFFFFu, 0xFF000000u, 0xFF000000u, 0xFFFFFFFFu};
+  IImage* chk = t.texture(2, 2, checker);
+  CHECK(chk);
+  {
+    const Mat4 mvp = Mat4::perspective(1.2f, 1.0f, 0.1f, 100.0f) * Mat4::translation(0, -0.5f, -2.5f) * Mat4::rotation_x(-1.1f);
+    const TexturedVertex v[6] = {{{-1, -1, 0}, {0, 0}}, {{-1, 1, 0}, {0, 8}}, {{1, 1, 0}, {8, 8}}, {{-1, -1, 0}, {0, 0}}, {{1, 1, 0}, {8, 8}}, {{1, -1, 0}, {8, 0}}};
+    ByteView m = t.vb->map();
+    for (uint32_t i = 0; i < sizeof v; ++i) m[i] = reinterpret_cast<const uint8_t*>(v)[i];
+    t.vb->unmap();
+    ICommandBuffer* cb = t.device.create_command_buffer();
+    cb->begin();
+    RenderPassBegin pass;
+    pass.color = t.color;
+    pass.clear_color_value = {0, 0, 1, 1};
+    cb->begin_render_pass(pass);
+    cb->bind_pipeline(t.pipeline);
+    cb->bind_vertex_buffer(t.vb);
+    cb->push_constants(&mvp, sizeof mvp);
+    cb->bind_texture(0, chk, SamplerDesc());
+    cb->draw(6);
+    cb->end_render_pass();
+    CHECK(cb->end() && t.device.submit(cb));
+    t.device.destroy_command_buffer(cb);
+    CHECK(t.color->read_pixels(t.out));
+    // Down the middle column the checker squares get smaller towards the far end of the quad, so that half of the quad has more colour changes than the near half
+    // (in affine interpolation the two halves would have the same number).
+    uint32_t top = 64, bottom = 0;   // the first and last rows that have any quad pixel
+    for (uint32_t y = 0; y < 64; ++y)
+      for (uint32_t x = 0; x < 64; ++x)
+        if (at(t.out, 64, x, y) != 0xFF0000FFu) { if (y < top) top = y; bottom = y; }
+    CHECK(top + 12 < bottom);
+    const uint32_t middle = (top + bottom) / 2;
+    auto changes = [&](uint32_t y0, uint32_t y1) {
+      uint32_t n = 0;
+      for (uint32_t y = y0 + 1; y <= y1; ++y) {
+        const uint32_t a0 = at(t.out, 64, 32, y - 1), a1 = at(t.out, 64, 32, y);
+        if ((a0 == 0xFFFFFFFFu || a0 == 0xFF000000u) && (a1 == 0xFFFFFFFFu || a1 == 0xFF000000u) && a0 != a1) ++n;
+      }
+      return n;
+    };
+    const uint32_t upper = changes(top, middle), lower = changes(middle, bottom);
+    CHECK(upper > lower + 1 || lower > upper + 1);
+  }
+  t.device.destroy_image(chk);
+  t.device.destroy_image(translucent);
+
+  // What is refused. A draw whose pipeline samples a texture needs it bound, and not to the image being drawn into; an image has to be made for sampling.
+  CHECK(!t.draw(nullptr, SamplerDesc(), nullptr, /*bind=*/false));
+  IImage* target_as_texture = t.device.create_image({{64, 64}, Format::B8G8R8A8Unorm, kImageColorAttachment | kImageSampled});
+  CHECK(target_as_texture && !t.draw(target_as_texture, SamplerDesc(), target_as_texture));
+  IImage* not_sampled = t.device.create_image({{4, 4}, Format::B8G8R8A8Unorm, kImageColorAttachment});
+  CHECK(not_sampled && !t.draw(not_sampled, SamplerDesc()));
+  IImage* depth_image = t.device.create_image({{4, 4}, Format::D32Float, kImageDepthAttachment | kImageSampled});
+  CHECK(depth_image && !t.draw(depth_image, SamplerDesc()) && !depth_image->write_pixels(ArrayView<const uint32_t>(texels, 16)));
+  CHECK(!tex->write_pixels(ArrayView<const uint32_t>(texels, 15)));   // the wrong size
+  {
+    ICommandBuffer* cb = t.device.create_command_buffer();
+    cb->begin();
+    cb->bind_texture(kMaxTextureUnits, tex, SamplerDesc());   // a unit that does not exist
+    CHECK(!cb->end());
+    cb->begin();
+    cb->bind_texture(0, nullptr, SamplerDesc());
+    CHECK(!cb->end());
+    t.device.destroy_command_buffer(cb);
+  }
+  // Pipelines: a textured shader needs texture_count, the other shaders do not take one, and there are only kMaxTextureUnits.
+  GraphicsPipelineDesc bad = t.desc;
+  bad.texture_count = 0;
+  CHECK(t.device.create_graphics_pipeline(bad) == nullptr);
+  bad.texture_count = kMaxTextureUnits + 1;
+  CHECK(t.device.create_graphics_pipeline(bad) == nullptr);
+  IShaderModule* colored_fs = t.device.create_shader_module(colored_fragment_shader());
+  bad = t.desc;
+  bad.fragment_shader = colored_fs;
+  CHECK(t.device.create_graphics_pipeline(bad) == nullptr);   // (a flat-colour shader with a texture count)
+  t.device.destroy_shader_module(colored_fs);
+  ShaderModuleDesc both = textured_fragment_shader();
+  both.fragment_function = colored_fragment_shader().fragment_function;
+  CHECK(t.device.create_shader_module(both) == nullptr);      // (a fragment shader is one or the other)
+  ShaderModuleDesc neither;
+  neither.stage = ShaderStage::Fragment;
+  CHECK(t.device.create_shader_module(neither) == nullptr);
+
+  t.device.destroy_image(depth_image);
+  t.device.destroy_image(not_sampled);
+  t.device.destroy_image(target_as_texture);
+  t.device.destroy_image(rgba);
+  t.device.destroy_image(ramp);
+  t.device.destroy_image(tex);
+}
+
 int main() {
+  test_textures();
   test_math();
   test_2d();
   test_3d();

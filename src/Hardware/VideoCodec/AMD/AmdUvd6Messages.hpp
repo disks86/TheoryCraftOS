@@ -22,6 +22,7 @@
 #include "Hardware/VideoCodec/AMD/AmdVcnDecodeMessages.hpp"
 #include "Hardware/VideoCodec/Software/H265Core.hpp"
 #include "Hardware/VideoCodec/Software/Mpeg2Core.hpp"
+#include "Hardware/VideoCodec/Software/Vc1Core.hpp"
 #include "Utility/ArrayView.hpp"
 
 namespace hardware {
@@ -39,7 +40,7 @@ namespace hardware {
 namespace amd_uvd6 {
 
 constexpr uint32_t kMsgCreate = 0, kMsgDecode = 1, kMsgDestroy = 2;      // msg_type
-constexpr uint32_t kStreamTypeMpeg2 = 3, kStreamTypeH264Perf = 7, kStreamTypeH265 = 0x10;   // RUVD_CODEC_MPEG2, _H264_PERF, _H265
+constexpr uint32_t kStreamTypeVc1 = 1, kStreamTypeMpeg2 = 3, kStreamTypeH264Perf = 7, kStreamTypeH265 = 0x10;   // RUVD_CODEC_VC1, _MPEG2, _H264_PERF, _H265
 
 constexpr uint32_t kMessagePageBytes = 0x1000;       // the message structure's page; the feedback area starts behind it
 constexpr uint32_t kFeedbackOffset = 0x1000;         // FB_BUFFER_OFFSET
@@ -118,6 +119,22 @@ bool build_mpeg2_decode_message(ByteView out, uint32_t stream_handle, uint32_t f
 // The feedback area's first word (its size) in a buffer of at least kMessageFeedbackItBytes at the message page; the rest of the area is cleared.
 bool prepare_mpeg2_feedback(ByteView message_buffer);
 
+// VC-1 (RUVD_CODEC_VC1, progressive Simple, Main and Advanced profile): the message holds only the sequence and entry point flags (struct ruvd_vc1 has no picture indexes);
+// the firmware keeps the decoded pictures in the picture buffer itself and finds the anchors by decoding order, and parses the picture header, bit planes and
+// macroblocks out of the frame data. The job is the MPEG-2 one (no context buffer, no scaling table).
+struct Vc1BufferSizes {
+  uint64_t dpb = 0;
+  uint32_t references = 0;
+};
+// Mesa's calc_dpb_size for VC-1: five pictures at least, the firmware's context area (128 bytes a macroblock), the intra transform line, the deblocking line and the bit plane
+// line. 0 when the picture is too big or not whole macroblocks.
+constexpr uint32_t kVc1References = 5;   // NUM_VC1_REFS
+Vc1BufferSizes vc1_buffer_sizes(uint32_t width, uint32_t height);
+// Builds the decode message of one picture. The picture size is in macroblocks for the Simple and Main profiles and in samples for the Advanced one. False when `out` is too
+// small, the sequence is interlaced or not within the limits, or a size does not fit the message.
+bool build_vc1_decode_message(ByteView out, uint32_t stream_handle, uint32_t feedback_number, const vc1::OffloadPicture& picture, const DecodeBuffers& buffers);
+bool prepare_vc1_feedback(ByteView message_buffer);   // as prepare_mpeg2_feedback
+
 // Where the buffers of a job are, as the GPU addresses them (the message buffer holds the message page, the feedback area and the scaling table).
 struct JobAddresses {
   uint64_t session_context = 0;
@@ -134,6 +151,8 @@ uint32_t decode_job_buffers(const JobAddresses& addresses, ArrayView<AmdUvd6Ring
 // The buffers of an MPEG-2 job: session context, message, picture buffer, bitstream, decoding target, feedback (no context, no scaling table).
 constexpr uint32_t kMpeg2JobBuffers = 6;
 uint32_t mpeg2_job_buffers(const JobAddresses& addresses, ArrayView<AmdUvd6Ring::Buffer> out);
+constexpr uint32_t kVc1JobBuffers = kMpeg2JobBuffers;   // the same list for a VC-1 job
+uint32_t vc1_job_buffers(const JobAddresses& addresses, ArrayView<AmdUvd6Ring::Buffer> out);
 // The buffers of a create or destroy job: the session context and the message.
 constexpr uint32_t kSessionJobBuffers = 2;
 uint32_t session_job_buffers(const JobAddresses& addresses, ArrayView<AmdUvd6Ring::Buffer> out);
