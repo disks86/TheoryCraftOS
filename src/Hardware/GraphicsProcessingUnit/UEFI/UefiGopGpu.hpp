@@ -60,9 +60,11 @@ class UefiGopGpu : public FramebufferGpu, public IMonitorSource {
   uint32_t device_modes(uint32_t connector, MonitorMode* out, uint32_t capacity) const override;
   bool set_display_mode(uint32_t connector, uint32_t width, uint32_t height) override;
 
- private:
+ protected:
+  // Points the drawing code at the framebuffer of the firmware's current mode (again, after a driver that took the screen over gives it back).
   bool apply_current_mode();
 
+ private:
   efi::SystemTable* st_;
   PciDeviceInfo device_;
   efi::GraphicsOutput* gop_ = nullptr;

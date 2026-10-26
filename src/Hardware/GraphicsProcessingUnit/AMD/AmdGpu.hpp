@@ -23,9 +23,9 @@
 namespace hardware {
 
 // AMD display controller (PCI vendor 0x1002), identified by device ID down to its architecture (Vega APUs, RDNA 1 to 4, Polaris;
-// see AmdGpuGenerations.hpp). Modes and the framebuffer still
-// come from the firmware (UEFI GOP); native mode setting for these parts is
-// future work, and this class is where it will go.
+// see AmdGpuGenerations.hpp). Modes and the framebuffer still come from the firmware (UEFI GOP). Native mode setting is not done: the display engine (DCE/DCN)
+// is brought up through the PSP and the SMU with firmware blobs this OS does not load, and without them its registers are not safe to program. This class is
+// where it will go; Intel's (IntelGpu, IntelDisplay) shows how the firmware path stays the fallback.
 class AmdGpu final : public UefiGopGpu {
  public:
   static constexpr uint16_t kPciVendor = 0x1002;

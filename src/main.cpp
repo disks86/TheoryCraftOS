@@ -413,7 +413,13 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     const uint32_t mapped_bars = hardware::pci_map_all_bars(pci, mmio);
     if (mapped_bars) Entry(Level::Info, "MMIO").dec(mapped_bars).text(" BAR(s) mapped that the firmware had not mapped");
   }
-  hardware::SystemGpu system_gpu(st, pci, shared_allocator);
+  struct MmioRegisterMapper final : hardware::IRegisterMapper {
+    hardware::MmioMapper& mapper;
+    explicit MmioRegisterMapper(hardware::MmioMapper& m) : mapper(m) {}
+    bool map_registers(uint64_t physical, uint64_t length, hardware::MmioRegion* region) override { return mapper.ensure_mapped(physical, length, region); }
+  } register_mapper(mmio);
+  // Intel integrated GPUs get native mode setting through their registers; the others use the framebuffer the firmware set up.
+  hardware::SystemGpu system_gpu(st, pci, shared_allocator, paging_ok ? &register_mapper : nullptr);
   hardware::IGraphicsProcessingUnit* gpu = system_gpu.gpu();
   if (gpu) {
     // Switch to 1024x768 if the GPU offers it. The screen is cleared by a mode change, so
@@ -426,6 +432,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     console::puts("TheoryCraftOS: initializing hardware\n");
     bootlog::replay();  // the mode change cleared what was logged so far
     Entry(Level::Ok, "GPU").text(gpu->name()).text(", ").dec(gpu->width()).text("x").dec(gpu->height()).text(", ").dec(gpu->mode_count()).text(" modes");
+    if (hardware::IntelGpu* intel = system_gpu.intel_gpu())
+      Entry(intel->native_available() ? Level::Ok : Level::Info, "GPU").text(intel->native_available() ? "native mode setting (Intel display engine)" : "firmware framebuffer (native mode setting needs a supported Intel GPU)");
   } else {
     Entry(Level::Warning, "GPU").text("no usable display; using the firmware text console, the desktop needs a graphics display");
   }
@@ -574,11 +582,6 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
 
   // Video codecs: a device per GPU video engine found (not driven yet: its sessions run on the CPU) and the software codec.
   hardware::SystemVideoCodecs video_codecs(pci, shared_allocator);
-  struct MmioRegisterMapper final : hardware::IRegisterMapper {
-    hardware::MmioMapper& mapper;
-    explicit MmioRegisterMapper(hardware::MmioMapper& m) : mapper(m) {}
-    bool map_registers(uint64_t physical, uint64_t length, hardware::MmioRegion* region) override { return mapper.ensure_mapped(physical, length, region); }
-  } register_mapper(mmio);
   struct PciBarSizer final : hardware::IBarSizer {
     hardware::IPciBus& bus;
     explicit PciBarSizer(hardware::IPciBus& b) : bus(b) {}
