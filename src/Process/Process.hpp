@@ -17,6 +17,7 @@
  */
 #pragma once
 #include <stdint.h>
+#include "Process/ProcessFiles.hpp"
 #include "Process/Syscall.hpp"
 #include "Utility/ArrayView.hpp"
 
@@ -55,14 +56,11 @@ class IProcessHost {
   ~IProcessHost() = default;
 };
 
-// What a descriptor (Linux file descriptor, Windows handle) refers to.
-enum class DescriptorKind : uint8_t { Closed, ConsoleInput, ConsoleOutput, ConsoleError };
-
 // One user-mode process as far as system calls go: its ABI, its descriptors, its exit state. Both interfaces share the descriptor table; Linux
 // uses the slot number as the file descriptor, Windows uses (slot + 1) * 4 as the handle value.
 class Process {
  public:
-  static constexpr uint32_t kMaxDescriptors = 16;
+  static constexpr uint32_t kMaxDescriptors = ProcessFiles::kMaxDescriptors;
 
   Process(uint64_t id, const ProcessBinding& binding, IUserMemory& memory, IProcessHost& host);
   Process(const Process&) = delete;
@@ -108,8 +106,14 @@ class Process {
   bool take_fs_change(uint64_t* value) { *value = fs_base_; const bool c = fs_changed_; fs_changed_ = false; return c; }
   bool take_gs_change(uint64_t* value) { *value = gs_base_; const bool c = gs_changed_; gs_changed_ = false; return c; }
 
-  DescriptorKind descriptor(uint64_t slot) const { return slot < kMaxDescriptors ? slots_[slot] : DescriptorKind::Closed; }
-  bool close_descriptor(uint64_t slot);
+  // The process's files and descriptors. Without a file system attached only the console descriptors work.
+  ProcessFiles& files() { return files_; }
+  // Gives the process its tree: "/Linux" is the root of a Linux process, "/Windows" is C:\\ of a Windows one, both in `fs`.
+  void attach_file_system(allocators::IAllocator& allocator, filesystem::IFileSystem& fs) {
+    files_.attach(allocator, fs, binding_.abi == SyscallAbi::Windows ? StringView("/Windows") : StringView("/Linux"));
+  }
+  DescriptorKind descriptor(uint64_t slot) const { return files_.kind(slot); }
+  bool close_descriptor(uint64_t slot) { return files_.close(slot); }
 
  private:
   uint64_t id_;
@@ -122,7 +126,7 @@ class Process {
   bool fs_changed_ = false, gs_changed_ = false;
   AddressSpace* space_ = nullptr;
   uint64_t heap_start_ = 0, heap_break_ = 0, mmap_cursor_ = 0x00007F0000000000ull;
-  DescriptorKind slots_[kMaxDescriptors] = {DescriptorKind::ConsoleInput, DescriptorKind::ConsoleOutput, DescriptorKind::ConsoleError};
+  ProcessFiles files_;
 };
 
 // Moves bytes between the program and the console in small pieces, so a huge or half-mapped buffer cannot make the kernel allocate or fault. Return

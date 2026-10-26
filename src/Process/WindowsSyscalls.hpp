@@ -33,6 +33,14 @@ enum class WindowsSyscallNumber : uint32_t {
   NtAllocateVirtualMemory = 7,
   NtFreeVirtualMemory = 8,
   NtProtectVirtualMemory = 9,
+  NtCreateFile = 10,
+  NtOpenFile = 11,
+  NtQueryInformationFile = 12,
+  NtSetInformationFile = 13,
+  NtQueryDirectoryFile = 14,
+  NtQueryAttributesFile = 15,
+  NtDeleteFile = 16,
+  NtFlushBuffersFile = 17,
 };
 
 constexpr uint32_t kStatusInvalidSystemService = 0xC000001Cu;      // the answer for a number that is no service

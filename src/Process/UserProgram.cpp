@@ -86,6 +86,7 @@ LoadStatus UserProgram::load(ConstByteView file, ArrayView<const StringView> arg
   if (!process) return LoadStatus::OutOfMemory;
   process->attach_address_space(space_, heap_start);
   process->set_initial_thread_pointers(fs_base, gs_base);
+  if (files_) process->attach_file_system(allocator_, *files_);
   start_ = ProgramStart{binding.arch, image.entry, stack_pointer, argument, fs_base, gs_base};
   image_ = image;
   process_ = static_cast<UniquePointer<Process>&&>(process);
