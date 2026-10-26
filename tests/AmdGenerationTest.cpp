@@ -70,7 +70,7 @@ static void test_cpu() {
 static void test_gpu() {
   using A = AmdGpuArchitecture;
   CHECK(amd_gpu_identify(0x67DF).architecture == A::Polaris && amd_gpu_identify(0x699F).architecture == A::Polaris);
-  // Radeon RX Vega M GH/GL (Kaby Lake-G, Dell XPS 15 9575): Polaris 22 with its own HBM2, UVD 6.3 so HEVC but no VP9.
+  // Radeon RX Vega M GH/GL (Kaby Lake-G, Dell XPS 15 9575): a Polaris-family chip (amdgpu: VEGAM) with its own HBM2, UVD 6.3 so HEVC but no VP9.
   CHECK(amd_gpu_identify(0x694C).architecture == A::Polaris && amd_gpu_identify(0x694E).architecture == A::Polaris && amd_gpu_identify(0x694F).discrete);
   CHECK(amd_gpu_identify(0x694C).media_hevc && !amd_gpu_identify(0x694C).media_vp9 && amd_gpu_identify(0x694B).architecture == A::Unknown && amd_gpu_identify(0x6950).architecture == A::Unknown);
   CHECK(amd_gpu_identify(0x687F).architecture == A::Vega && amd_gpu_identify(0x66AF).architecture == A::Vega && amd_gpu_identify(0x687F).discrete);
