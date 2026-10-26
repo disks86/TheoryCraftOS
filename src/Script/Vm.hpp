@@ -318,6 +318,7 @@ class Vm {
   void grow_props(JsObject* o);
   void index_rebuild(JsObject* o);
   int64_t find_prop(JsObject* o, JsString* key) const;
+  void push_property_keys(JsObject* names, JsObject* o, bool enumerable);
   bool array_index(const Value& key, uint32_t* index) const;
   static bool canonical_index(StringView s, uint32_t* index);
   bool ensure_items(JsObject* o, uint32_t capacity);

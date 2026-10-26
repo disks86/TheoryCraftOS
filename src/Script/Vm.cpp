@@ -1111,7 +1111,7 @@ bool Vm::get_own(JsObject* o, JsString* key, Value* out) {
       return true;
     }
     if (key == length_) {
-      *out = Value::make_number(o->okind == ObjKind::Function ? o->code->param_count - (o->code->has_rest ? 1 : 0) : o->okind == ObjKind::Native ? o->position : 0);
+      *out = Value::make_number(o->okind == ObjKind::Function ? o->code->expected_args : o->okind == ObjKind::Native ? o->position : 0);
       return true;
     }
     if (key == prototype_ && o->okind == ObjKind::Function && !o->code->is_arrow) {   // made when first looked at
@@ -1439,17 +1439,42 @@ JsObject* Vm::own_keys(JsObject* o) {
     }
   }
   if (o->host && o->host->keys) o->host->keys(*this, o, keys);
-  for (uint32_t i = 0; i < o->prop_count; ++i)
-    if (o->props[i].flags & kEnumerable) array_push(keys, Value::make_string(o->props[i].key));
+  push_property_keys(keys, o, true);
   return keys;
+}
+
+// The own property names of an ordinary object, in the order the language gives: integer indices ascending, then the rest as they were added.
+void Vm::push_property_keys(JsObject* names, JsObject* o, bool enumerable) {
+  List<uint32_t> indexed(allocator_);
+  for (uint32_t i = 0; i < o->prop_count; ++i) {
+    uint32_t n;
+    if (((o->props[i].flags & kEnumerable) != 0) == enumerable && canonical_index(o->props[i].key->view(), &n)) indexed.push_back(i);
+  }
+  for (uint64_t a = 1; a < indexed.count(); ++a) {   // (insertion sort by the index: objects with many integer keys are arrays, which do not come here)
+    const uint32_t item = indexed[a];
+    uint32_t item_index = 0, other_index = 0;
+    canonical_index(o->props[item].key->view(), &item_index);
+    uint64_t b = a;
+    while (b > 0) {
+      canonical_index(o->props[indexed[b - 1]].key->view(), &other_index);
+      if (other_index <= item_index) break;
+      indexed[b] = indexed[b - 1];
+      --b;
+    }
+    indexed[b] = item;
+  }
+  for (uint64_t a = 0; a < indexed.count(); ++a) array_push(names, Value::make_string(o->props[indexed[a]].key));
+  for (uint32_t i = 0; i < o->prop_count; ++i) {
+    uint32_t n;
+    if (((o->props[i].flags & kEnumerable) != 0) == enumerable && !canonical_index(o->props[i].key->view(), &n)) array_push(names, Value::make_string(o->props[i].key));
+  }
 }
 
 JsObject* Vm::own_names(JsObject* o) {
   if (o->okind == ObjKind::Proxy) return proxy_keys(o, true);
   JsObject* names = own_keys(o);
   if (o->okind == ObjKind::Array) array_push(names, Value::make_string(length_));
-  for (uint32_t i = 0; i < o->prop_count; ++i)
-    if (!(o->props[i].flags & kEnumerable)) array_push(names, Value::make_string(o->props[i].key));
+  push_property_keys(names, o, false);
   return names;
 }
 
@@ -2828,6 +2853,13 @@ reload:
       case Opc::NewObject: PUSH(Value::make_object(new_plain())); break;
       case Opc::DefineProp: {   // [obj, value] -> [obj]
         define(stack_[sp_ - 2].as_object(), code->constants[static_cast<uint32_t>(in.a)].as_string(), stack_[sp_ - 1]);
+        --sp_;
+        break;
+      }
+      case Opc::SetLiteralProto: {   // [obj, value] -> [obj]   (an object or null; anything else is ignored)
+        const Value& v = stack_[sp_ - 1];
+        if (v.is_object()) stack_[sp_ - 2].as_object()->proto = v.as_object();
+        else if (v.is_null()) stack_[sp_ - 2].as_object()->proto = nullptr;
         --sp_;
         break;
       }
