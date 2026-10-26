@@ -194,7 +194,19 @@ Task* current_task() {
   return u ? u->task : nullptr;
 }
 
-bool kill_pending(const Task* task) { return __atomic_load_n(&task->kill_requested, __ATOMIC_ACQUIRE); }
+// Has the program been asked to end: by request_kill(), or because the job it belongs to was ended (the flag in the job is read without a lock: this runs from the timer tick).
+bool kill_pending(Task* task) {
+  if (__atomic_load_n(&task->kill_requested, __ATOMIC_ACQUIRE)) return true;
+  uint32_t code = 0;
+  process::ObjectManager* objects = process::system_objects();
+  if (objects && objects->job_kill_for(task->program.process()->id(), &code)) {
+    task->kill_code = code;
+    __atomic_store_n(&task->kill_requested, true, __ATOMIC_RELEASE);
+    task->killed = true;
+    return true;
+  }
+  return false;
+}
 
 // The thread was asked to stop (SuspendThread) or to end (TerminateThread by another thread). With the program's lock held and interrupts on: a thread told to end ends (its
 // stack goes, and the process with its last thread); one told to stop keeps its registers, says it is parked, and waits to be resumed (it may find other registers in the
@@ -495,7 +507,7 @@ bool Task::wait(uint64_t timeout_ns) {
 }
 
 bool Task::interrupted() {
-  if (kill_pending(this) || program.process()->exited()) return true;
+  if (kill_pending(this) || program.process()->exited()) return true;      // (also true when the job was ended)
   UserThread* u = current_user_thread();
   return u && __atomic_load_n(&u->terminate_requested, __ATOMIC_ACQUIRE);      // (a thread told to end stops waiting)
 }
@@ -665,8 +677,24 @@ uint32_t Task::list_processes(ProcessEntry* out, uint32_t capacity) {
     out[i].pid = info[i].id;
     out[i].parent = info[i].parent_id;
     out[i].threads = info[i].threads;
+    out[i].memory_bytes = info[i].memory_bytes;
+    out[i].create_time = info[i].create_time;
     __builtin_memcpy(out[i].name, info[i].name, sizeof out[i].name);
   }
+  return n;
+}
+
+uint32_t Task::list_threads(uint64_t pid, ThreadEntry* out, uint32_t capacity) {
+  mutex.unlock();      // (see list_processes)
+  const uint32_t n = usermode::thread_snapshot(pid, out, capacity);
+  mutex.lock();
+  return n;
+}
+
+uint32_t Task::list_modules(uint64_t pid, ModuleEntry* out, uint32_t capacity) {
+  mutex.unlock();
+  const uint32_t n = usermode::module_snapshot(pid, out, capacity);
+  mutex.lock();
   return n;
 }
 
@@ -777,7 +805,7 @@ uint32_t Task::spawn_process(const process::ChildSpec& spec) {
     auto count_use = [](process::DescriptorKind kind, uint64_t token) {      // the child's table holds one more use of what the parent's does
       if (process::ObjectManager* objects = process::system_objects()) {
         if (kind == process::DescriptorKind::Pipe) process::windowsabi::pipe_token_add(token);
-        else if (kind == process::DescriptorKind::Event || kind == process::DescriptorKind::Mutex || kind == process::DescriptorKind::Semaphore || kind == process::DescriptorKind::Process || kind == process::DescriptorKind::Timer || kind == process::DescriptorKind::Section) objects->add_ref(uint32_t(token));
+        else if (kind == process::DescriptorKind::Event || kind == process::DescriptorKind::Mutex || kind == process::DescriptorKind::Semaphore || kind == process::DescriptorKind::Process || kind == process::DescriptorKind::Timer || kind == process::DescriptorKind::Section || kind == process::DescriptorKind::Job) objects->add_ref(uint32_t(token));
       }
     };
     p.process()->files().inherit_from(program.process()->files(), count_use);
@@ -891,6 +919,47 @@ UniquePointer<Task> spawn(process::UserProgram& program, allocators::IAllocator&
   return task;
 }
 
+uint32_t thread_snapshot(uint64_t pid, process::IProcessRuntime::ThreadEntry* out, uint32_t capacity) {
+  uint64_t ids[process::Process::kMaxThreads], starts[process::Process::kMaxThreads];
+  int32_t priorities[process::Process::kMaxThreads];
+  uint32_t n = 0;
+  ScopedMutex registry(g_tasks_mutex);
+  for (Task* task = g_tasks; task; task = task->all_next) {
+    if (!task->program.loaded() || task->program.process()->id() != pid) continue;
+    ScopedMutex hold(task->mutex);
+    n = task->program.process()->thread_snapshot(ids, starts, priorities, process::Process::kMaxThreads);
+    break;
+  }
+  if (n > capacity) n = capacity;
+  for (uint32_t i = 0; i < n; ++i) {
+    out[i] = process::IProcessRuntime::ThreadEntry();
+    out[i].id = ids[i]; out[i].start_address = starts[i]; out[i].priority = priorities[i];
+  }
+  return n;
+}
+
+uint32_t module_snapshot(uint64_t pid, process::IProcessRuntime::ModuleEntry* out, uint32_t capacity) {
+  uint32_t n = 0;
+  ScopedMutex registry(g_tasks_mutex);
+  for (Task* task = g_tasks; task; task = task->all_next) {
+    if (!task->program.loaded() || task->program.process()->id() != pid) continue;
+    ScopedMutex hold(task->mutex);
+    const process::ModuleSet* modules = task->program.modules();
+    if (!modules) break;
+    for (uint64_t i = 0; i < modules->count() && n < capacity; ++i) {
+      const process::Module& m = modules->at(i);
+      process::IProcessRuntime::ModuleEntry& e = out[n++];
+      e = process::IProcessRuntime::ModuleEntry();
+      e.base = m.base; e.size = m.size; e.entry = m.entry; e.program = m.main;
+      uint32_t k = 0;
+      for (; k + 1 < sizeof e.name && k < m.name.size(); ++k) e.name[k] = m.name.view()[k];
+      e.name[k] = 0;
+    }
+    break;
+  }
+  return n;
+}
+
 uint32_t process_snapshot(ProcessInfo* out, uint32_t capacity) {
   uint32_t n = 0;
   ScopedMutex registry(g_tasks_mutex);
@@ -900,6 +969,7 @@ uint32_t process_snapshot(ProcessInfo* out, uint32_t capacity) {
     info = ProcessInfo();
     info.id = task->program.process()->id();
     info.parent_id = task->parent_id;
+    info.create_time = task->program.process()->create_time;
     __builtin_memcpy(info.name, task->name, sizeof info.name);
     info.windows = task->program.process()->abi() == process::SyscallAbi::Windows;
     info.memory_bytes = task->program.address_space().mapped_bytes();
@@ -984,6 +1054,8 @@ bool wait(Task& task, uint32_t* exit_code, uint64_t timeout_us) {
 namespace kernel {
 namespace usermode {
 uint32_t process_snapshot(ProcessInfo*, uint32_t) { return 0; }      // (programs only run on x86-64 so far)
+uint32_t thread_snapshot(uint64_t, process::IProcessRuntime::ThreadEntry*, uint32_t) { return 0; }
+uint32_t module_snapshot(uint64_t, process::IProcessRuntime::ModuleEntry*, uint32_t) { return 0; }
 }  // namespace usermode
 }  // namespace kernel
 

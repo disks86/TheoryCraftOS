@@ -115,6 +115,18 @@ renumbers its services in nearly every build, which is why programs call ntdll);
 | `NtReleaseModule` | 52 |
 | `NtUnloadModule` | 51 |
 
+## Job objects
+
+| Service | Number |
+| --- | --- |
+| `NtCreateJobObject` | 77 |
+| `NtOpenJobObject` | 78 |
+| `NtAssignProcessToJobObject` | 79 |
+| `NtTerminateJobObject` | 80 |
+| `NtQueryInformationJobObject` | 81 |
+| `NtSetInformationJobObject` | 82 |
+| `NtIsProcessInJob` | 83 |
+
 ## Exceptions and the machine
 
 | Service | Number |
@@ -140,7 +152,7 @@ renumbers its services in nearly every build, which is why programs call ntdll);
   `LCMapString`, `GetStringType`, `CompareStringOrdinal`, `FindStringOrdinal`, `FoldString` and the enumerations work for it (Latin, Greek and Cyrillic letters have case).
 - **Atoms** (local and global) share one table of 256 names in the program. **Completion ports** are queues programs post to (`PostQueuedCompletionStatus`, `GetQueuedCompletionStatus[Ex]`):
   no file I/O is asynchronous, so files associated with a port never post packets. **Process lists**: `CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS)`, `Process32First/Next` and
-  `K32EnumProcesses` read `NtQuerySystemInformation` class 5 (one entry per running program, without thread entries). `ReadProcessMemory`/`WriteProcessMemory` work on the
+  `K32EnumProcesses` read `NtQuerySystemInformation` class 5 (one entry per running program, followed by its `SYSTEM_THREAD_INFORMATION` entries). `ReadProcessMemory`/`WriteProcessMemory` work on the
   program itself only; thread descriptions are kept per thread.
 - **The console**: the terminal gives a program lines of text and takes text; on top of that kernel32 keeps what a Windows console has (`console.inc`): screen buffers
   of character/colour cells (`CreateConsoleScreenBuffer`, `SetConsoleActiveScreenBuffer`, the `Read/Write/Fill/ScrollConsoleOutput*` family), cursor, window, text
@@ -150,6 +162,17 @@ renumbers its services in nearly every build, which is why programs call ntdll);
   `GetNumberOfConsoleInputEvents`, `WriteConsoleInput`, waiting on the input handle) are made from the typed text, a key down and a key up per character; no mouse, focus or resize events.
   `NtQueryInformationFile` class 24 on the console input says how many bytes could be read without waiting. `GenerateConsoleCtrlEvent` runs the program's own control handlers;
   Ctrl+C typed at the terminal still ends the program without running them.
-- **Not provided**: job objects, debugging APIs, memory of
-  other processes, remote threads, Toolhelp lists of threads, modules and heaps, mailslots, change notifications, hard and symbolic links, and the many exports of the real kernel32 and msvcrt that no program here has needed.
+- **Job objects** (`CreateJobObject`, `OpenJobObject`, `AssignProcessToJobObject`, `TerminateJobObject`, `IsProcessInJob`, `QueryInformationJobObject`,
+  `SetInformationJobObject`; services 77–83): a process is in one job; the processes it starts join it (not with `CREATE_BREAKAWAY_FROM_JOB`, which needs
+  `JOB_OBJECT_LIMIT_BREAKAWAY_OK`; `SILENT_BREAKAWAY_OK` lets children start outside). Enforced: the active process limit (`ERROR_NOT_ENOUGH_QUOTA`, also for a child), kill on
+  close and `TerminateJobObject` (members see a flag at their next system call or timer tick, so a member blocked reading the console ends when the read returns).
+  Kept and read back but not enforced: CPU time, working set, memory, affinity, priority and UI limits. Accounting has the process counts only (CPU times are 0). Completion
+  port notifications (class 7) are refused with `ERROR_NOT_SUPPORTED`; there are no nested jobs.
+- **Toolhelp and psapi**: `CreateToolhelp32Snapshot` takes processes, threads (`Thread32First/Next`), modules (`Module32First/Next`, for any running process, from this OS's
+  `NtQuerySystemInformation` class 0x80: the process id in the first 8 bytes of the buffer) and, for this process only, heaps (`Heap32ListFirst/Next`, `Heap32First/Next`;
+  `HeapWalk` walks the blocks of a heap). psapi: `EnumProcessModules`, `GetModuleBaseName`, `GetModuleFileNameEx`, `GetModuleInformation`, `GetProcessMemoryInfo`,
+  `GetProcessImageFileName` (the `K32` names and the plain ones). Module paths of other processes are guessed: DLLs are `C:\Windows\System32\name`, and only the program's name
+  is known. Memory counters are the mapped size of the address space; thread priorities and start addresses are as the thread was created.
+- **Not provided**: debugging APIs, memory of
+  other processes, remote threads, mailslots, change notifications, hard and symbolic links, and the many exports of the real kernel32 and msvcrt that no program here has needed.
   A call to an import that nothing provides stops the program with a message saying which one.

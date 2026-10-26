@@ -811,6 +811,12 @@ EXPORT HANDLE WINAPI CreateConsoleScreenBuffer(DWORD access, DWORD share, LPSECU
   if (!main || !sb) set_error(ERROR_NOT_ENOUGH_MEMORY);
   else {
     handle = CreateEventW(NULL, TRUE, FALSE, NULL);      /* the buffer's handle: closing it is what the program does when it is done */
+    for (int i = 1; handle && i < CON_MAX_BUFFERS; ++i) {      /* (an entry for a closed buffer whose handle value is used again is dropped) */
+      if (!g_screens[i].used || g_screens[i].handle != handle) continue;
+      if (g_active_screen == &g_screens[i]) g_active_screen = &g_screens[0];
+      RtlFreeHeap(heap(), 0, g_screens[i].cells);
+      memset(&g_screens[i], 0, sizeof(g_screens[i]));
+    }
     if (handle) {
       memset(sb, 0, sizeof(*sb));
       sb->used = TRUE; sb->handle = handle; sb->attr = CON_DEFAULT_ATTR; sb->out_mode = main->out_mode;

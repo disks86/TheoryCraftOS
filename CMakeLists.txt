@@ -593,6 +593,7 @@ add_executable(BOOTX64
   src/Process/WindowsModules.cpp
   src/Process/WindowsPipes.cpp
   src/Process/WindowsLocks.cpp
+  src/Process/WindowsJobs.cpp
   src/Process/Objects.cpp
   src/Process/ModuleLoader.cpp
   src/Process/LinuxSyscalls.cpp
@@ -624,6 +625,8 @@ add_executable(BOOTX64
   src/Hardware/VideoCodec/AMD/AmdVcn1.cpp
   src/Hardware/VideoCodec/AMD/AmdUvd6.cpp
   src/Hardware/VideoCodec/AMD/AmdUvd6Ring.cpp
+  src/Hardware/VideoCodec/AMD/AmdUvd6Messages.cpp
+  src/Hardware/VideoCodec/AMD/AmdUvd6AvcDecoder.cpp
   src/Hardware/VideoCodec/AMD/AmdGmc8Memory.cpp
   src/Hardware/VideoCodec/AMD/AmdRavenMemory.cpp
   src/Hardware/VideoCodec/AMD/AmdVcn1Ring.cpp

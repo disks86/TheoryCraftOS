@@ -97,4 +97,11 @@
 #define NT_SERVICE_NtFlushVirtualMemory 74
 #define NT_SERVICE_NtLockFile 75
 #define NT_SERVICE_NtUnlockFile 76
+#define NT_SERVICE_NtCreateJobObject 77
+#define NT_SERVICE_NtOpenJobObject 78
+#define NT_SERVICE_NtAssignProcessToJobObject 79
+#define NT_SERVICE_NtTerminateJobObject 80
+#define NT_SERVICE_NtQueryInformationJobObject 81
+#define NT_SERVICE_NtSetInformationJobObject 82
+#define NT_SERVICE_NtIsProcessInJob 83
 #endif

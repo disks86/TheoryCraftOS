@@ -814,6 +814,7 @@ EXPORT HANDLE WINAPI CreateIoCompletionPort(HANDLE file, HANDLE existing, ULONG_
   if (!p->semaphore) { RtlFreeHeap(heap(), 0, p); return NULL; }
   atom_lock();
   int slot = -1;
+  for (int i = 0; i < PORT_MAX; ++i) if (g_ports[i] && g_ports[i]->semaphore == p->semaphore) { RtlFreeHeap(heap(), 0, g_ports[i]); g_ports[i] = NULL; }      /* (a closed port's handle value, used again) */
   for (int i = 0; i < PORT_MAX; ++i) if (!g_ports[i]) { slot = i; break; }
   if (slot >= 0) g_ports[slot] = p;
   LeaveCriticalSection(&g_atom_lock);
@@ -863,66 +864,187 @@ EXPORT BOOL WINAPI GetQueuedCompletionStatusEx(HANDLE port, OVERLAPPED_ENTRY_ *e
   return TRUE;
 }
 
-/* ---- process lists: Toolhelp32 and EnumProcesses -------------------------------------------------------------------------------------------------------------- */
+/* ---- process lists: Toolhelp32, EnumProcesses and the psapi functions ---------------------------------------------------------------------------------------- */
 
 typedef struct { DWORD dwSize, cntUsage, th32ProcessID; ULONG_PTR th32DefaultHeapID; DWORD th32ModuleID, cntThreads, th32ParentProcessID; LONG pcPriClassBase; DWORD dwFlags; WCHAR szExeFile[260]; } PROCESSENTRY32W_;
 typedef struct { DWORD dwSize, cntUsage, th32ProcessID; ULONG_PTR th32DefaultHeapID; DWORD th32ModuleID, cntThreads, th32ParentProcessID; LONG pcPriClassBase; DWORD dwFlags; CHAR szExeFile[260]; } PROCESSENTRY32A_;
+typedef struct { DWORD dwSize, cntUsage, th32ThreadID, th32OwnerProcessID; LONG tpBasePri, tpDeltaPri; DWORD dwFlags; } THREADENTRY32_;
+typedef struct { DWORD dwSize, th32ModuleID, th32ProcessID, GlblcntUsage, ProccntUsage; BYTE *modBaseAddr; DWORD modBaseSize; HMODULE hModule; WCHAR szModule[256]; WCHAR szExePath[260]; } MODULEENTRY32W_;
+typedef struct { DWORD dwSize, th32ModuleID, th32ProcessID, GlblcntUsage, ProccntUsage; BYTE *modBaseAddr; DWORD modBaseSize; HMODULE hModule; CHAR szModule[256]; CHAR szExePath[260]; } MODULEENTRY32A_;
+typedef struct { SIZE_T dwSize; DWORD th32ProcessID; ULONG_PTR th32HeapID; DWORD dwFlags; } HEAPLIST32_;
+typedef struct { SIZE_T dwSize; HANDLE hHandle; ULONG_PTR dwAddress; SIZE_T dwBlockSize; DWORD dwFlags, dwLockCount, dwResvd, th32ProcessID; ULONG_PTR th32HeapID; } HEAPENTRY32_;
+typedef struct { ULONG_PTR lpData; DWORD cbData; BYTE cbOverhead, iRegionIndex; WORD wFlags; ULONGLONG region[3]; } HEAPWALK_;
+#define TH32CS_SNAPHEAPLIST_ 1
 #define TH32CS_SNAPPROCESS_ 2
+#define TH32CS_SNAPTHREAD_ 4
+#define TH32CS_SNAPMODULE_ 8
+#define TH32CS_SNAPMODULE32_ 0x10
 #define SNAP_MAX 8
-#define SNAP_PROCESSES 64
 static BOOL IsHandleValid_(HANDLE h) { return SetEvent(h) || GetLastError() != ERROR_INVALID_HANDLE; }      /* (a snapshot's handle is an event) */
-typedef struct { HANDLE handle; DWORD count, next; PROCESSENTRY32W_ entries[SNAP_PROCESSES]; } Snapshot;
+typedef struct {
+  HANDLE handle;
+  DWORD process_count, process_next, thread_count, thread_next, module_count, module_next, heap_count, heap_next;
+  PROCESSENTRY32W_ *processes;
+  THREADENTRY32_ *threads;
+  MODULEENTRY32W_ *modules;
+  ULONG_PTR *heaps;
+  DWORD pid;
+} Snapshot;
 static Snapshot *g_snaps[SNAP_MAX];
 
-/* The running programs as the kernel lists them (SystemProcessInformation); returns how many were put in `out` (up to `max`). */
-static DWORD list_all_processes(PROCESSENTRY32W_ *out, DWORD max) {
+/* The whole of SystemProcessInformation (a heap block; the size of the data in *length), or NULL. */
+static BYTE *query_process_information(ULONG *length) {
   ULONG need = 0;
   NtQuerySystemInformation(5, NULL, 0, &need);
-  if (need == 0) return 0;
+  if (need == 0) return NULL;
   BYTE *buffer = RtlAllocateHeap(heap(), 0, need + 4096);
+  if (!buffer) return NULL;
+  if (!NT_SUCCESS(NtQuerySystemInformation(5, buffer, need + 4096, length))) { RtlFreeHeap(heap(), 0, buffer); return NULL; }
+  return buffer;
+}
+static void fill_process_entry(PROCESSENTRY32W_ *o, const BYTE *e) {
+  memset(o, 0, sizeof(*o));
+  o->dwSize = sizeof(*o);
+  o->cntThreads = *(const DWORD *)(e + 4);
+  o->th32ProcessID = (DWORD)*(const ULONG_PTR *)(e + 0x50);
+  o->th32ParentProcessID = (DWORD)*(const ULONG_PTR *)(e + 0x58);
+  o->pcPriClassBase = 8;
+  const WORD length = *(const WORD *)(e + 0x38) / 2;
+  const WCHAR *name = *(WCHAR *const *)(e + 0x40);
+  for (WORD i = 0; i < length && i < 259; ++i) o->szExeFile[i] = name[i];
+}
+static DWORD list_all_processes(PROCESSENTRY32W_ *out, DWORD max) {
+  ULONG length = 0;
+  BYTE *buffer = query_process_information(&length);
   if (!buffer) return 0;
   DWORD n = 0;
-  if (NT_SUCCESS(NtQuerySystemInformation(5, buffer, need + 4096, NULL))) {
-    const BYTE *e = buffer;
-    for (;;) {
-      if (n < max) {
-        PROCESSENTRY32W_ *o = &out[n];
-        memset(o, 0, sizeof(*o));
-        o->dwSize = sizeof(*o);
-        o->cntThreads = *(const DWORD *)(e + 4);
-        o->th32ProcessID = (DWORD)*(const ULONG_PTR *)(e + 0x50);
-        o->th32ParentProcessID = (DWORD)*(const ULONG_PTR *)(e + 0x58);
-        o->pcPriClassBase = 8;
-        const WORD length = *(const WORD *)(e + 0x38) / 2;
-        const WCHAR *name = *(WCHAR *const *)(e + 0x40);
-        for (WORD i = 0; i < length && i < 259; ++i) o->szExeFile[i] = name[i];
-        ++n;
-      }
-      const DWORD next = *(const DWORD *)e;
-      if (next == 0) break;
-      e += next;
-    }
+  for (const BYTE *e = buffer;;) {
+    if (n < max) fill_process_entry(&out[n++], e);
+    const DWORD next = *(const DWORD *)e;
+    if (next == 0) break;
+    e += next;
   }
   RtlFreeHeap(heap(), 0, buffer);
   return n;
 }
+/* The threads of every process (SYSTEM_THREAD_INFORMATION follows each process entry). */
+static DWORD list_all_threads(THREADENTRY32_ *out, DWORD max) {
+  ULONG length = 0;
+  BYTE *buffer = query_process_information(&length);
+  if (!buffer) return 0;
+  DWORD n = 0;
+  for (const BYTE *e = buffer;;) {
+    const DWORD threads = *(const DWORD *)(e + 4);
+    for (DWORD k = 0; k < threads; ++k) {
+      const BYTE *t = e + 0x100 + (size_t_)k * 0x50;
+      if (n >= max) break;
+      memset(&out[n], 0, sizeof(out[n]));
+      out[n].dwSize = sizeof(THREADENTRY32_);
+      out[n].th32OwnerProcessID = (DWORD)*(const ULONG_PTR *)(t + 0x28);
+      out[n].th32ThreadID = (DWORD)*(const ULONG_PTR *)(t + 0x30);
+      out[n].tpBasePri = *(const LONG *)(t + 0x3C);
+      ++n;
+    }
+    const DWORD next = *(const DWORD *)e;
+    if (next == 0) break;
+    e += next;
+  }
+  RtlFreeHeap(heap(), 0, buffer);
+  return n;
+}
+/* The modules of a process, as the kernel lists them. Returns how many (the buffer is a heap block in *raw, to free). */
+typedef struct { ULONG_PTR base, size, entry; DWORD flags, name_length; WCHAR name[40]; } ModuleRecord_;
+static DWORD query_modules(DWORD pid, ModuleRecord_ **records, BYTE **raw) {
+  *records = NULL; *raw = NULL;
+  BYTE *buffer = RtlAllocateHeap(heap(), 0, 8 + 112 * 64);
+  if (!buffer) return 0;
+  *(ULONGLONG *)buffer = pid;
+  if (!NT_SUCCESS(NtQuerySystemInformation(0x80, buffer, 8 + 112 * 64, NULL)) || *(DWORD *)buffer == 0) { RtlFreeHeap(heap(), 0, buffer); return 0; }
+  *raw = buffer;
+  *records = (ModuleRecord_ *)(buffer + 8);
+  return *(DWORD *)buffer;
+}
+static void fill_module_entry(MODULEENTRY32W_ *o, const ModuleRecord_ *m, DWORD pid) {
+  memset(o, 0, sizeof(*o));
+  o->dwSize = sizeof(*o);
+  o->th32ModuleID = 1; o->th32ProcessID = pid; o->GlblcntUsage = 0xFFFF; o->ProccntUsage = 0xFFFF;
+  o->modBaseAddr = (BYTE *)m->base; o->modBaseSize = (DWORD)m->size; o->hModule = (HMODULE)m->base;
+  DWORD i = 0;
+  for (; i < m->name_length && i < 40 && i < 255; ++i) o->szModule[i] = m->name[i];
+  o->szModule[i] = 0;
+  if ((m->flags & 1) && pid == GetCurrentProcessId()) GetModuleFileNameW(NULL, o->szExePath, 260);
+  else if (m->flags & 1) memcpy(o->szExePath, o->szModule, ((size_t_)i + 1) * 2);
+  else {
+    static const WCHAR dir[] = {'C', ':', '\\', 'W', 'i', 'n', 'd', 'o', 'w', 's', '\\', 'S', 'y', 's', 't', 'e', 'm', '3', '2', '\\', 0};
+    DWORD k = 0;
+    for (; dir[k]; ++k) o->szExePath[k] = dir[k];
+    for (DWORD j = 0; j <= i; ++j) o->szExePath[k + j] = o->szModule[j];
+  }
+}
+static DWORD list_modules_of(DWORD pid, MODULEENTRY32W_ *out, DWORD max) {
+  ModuleRecord_ *records;
+  BYTE *raw;
+  const DWORD count = query_modules(pid, &records, &raw);
+  DWORD n = 0;
+  for (; n < count && n < max; ++n) fill_module_entry(&out[n], &records[n], pid);
+  if (raw) RtlFreeHeap(heap(), 0, raw);
+  return n;
+}
+#define HEAP_LIST_MAX 128
+static DWORD list_heaps(ULONG_PTR *out, DWORD max) {
+  PVOID heaps[HEAP_LIST_MAX];
+  const ULONG n = RtlGetProcessHeaps(HEAP_LIST_MAX, heaps);
+  DWORD k = 0;
+  for (ULONG i = 0; i < n && i < HEAP_LIST_MAX && k < max; ++i) out[k++] = (ULONG_PTR)heaps[i];
+  return k;
+}
+
+static void snapshot_free(Snapshot *s) {
+  if (s->processes) RtlFreeHeap(heap(), 0, s->processes);
+  if (s->threads) RtlFreeHeap(heap(), 0, s->threads);
+  if (s->modules) RtlFreeHeap(heap(), 0, s->modules);
+  if (s->heaps) RtlFreeHeap(heap(), 0, s->heaps);
+  RtlFreeHeap(heap(), 0, s);
+}
 EXPORT HANDLE WINAPI CreateToolhelp32Snapshot(DWORD flags, DWORD pid) {
-  (void)pid;
-  if (!(flags & TH32CS_SNAPPROCESS_)) { set_error(ERROR_NOT_SUPPORTED); return INVALID_HANDLE_VALUE; }      /* (only the list of processes) */
+  const DWORD kinds = TH32CS_SNAPHEAPLIST_ | TH32CS_SNAPPROCESS_ | TH32CS_SNAPTHREAD_ | TH32CS_SNAPMODULE_ | TH32CS_SNAPMODULE32_;
+  if (!(flags & kinds)) { set_error(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE; }
+  if (pid == 0) pid = GetCurrentProcessId();
+  if ((flags & TH32CS_SNAPHEAPLIST_) && pid != GetCurrentProcessId()) { set_error(299 /* ERROR_PARTIAL_COPY */); return INVALID_HANDLE_VALUE; }      /* (only this process's heaps can be listed) */
   Snapshot *s = RtlAllocateHeap(heap(), HEAP_ZERO_MEMORY, sizeof(Snapshot));
   if (!s) { set_error(ERROR_NOT_ENOUGH_MEMORY); return INVALID_HANDLE_VALUE; }
+  s->pid = pid;
+  BOOL ok = TRUE;
+  if (flags & TH32CS_SNAPPROCESS_) {
+    s->processes = RtlAllocateHeap(heap(), 0, sizeof(PROCESSENTRY32W_) * 64);
+    if (s->processes) s->process_count = list_all_processes(s->processes, 64); else ok = FALSE;
+  }
+  if (ok && (flags & TH32CS_SNAPTHREAD_)) {
+    s->threads = RtlAllocateHeap(heap(), 0, sizeof(THREADENTRY32_) * 1024);
+    if (s->threads) s->thread_count = list_all_threads(s->threads, 1024); else ok = FALSE;
+  }
+  if (ok && (flags & (TH32CS_SNAPMODULE_ | TH32CS_SNAPMODULE32_))) {
+    s->modules = RtlAllocateHeap(heap(), 0, sizeof(MODULEENTRY32W_) * 64);
+    if (s->modules) s->module_count = list_modules_of(pid, s->modules, 64); else ok = FALSE;
+    if (ok && s->module_count == 0) { set_error(ERROR_INVALID_PARAMETER); ok = FALSE; }      /* (no such process) */
+  }
+  if (ok && (flags & TH32CS_SNAPHEAPLIST_)) {
+    s->heaps = RtlAllocateHeap(heap(), 0, sizeof(ULONG_PTR) * HEAP_LIST_MAX);
+    if (s->heaps) s->heap_count = list_heaps(s->heaps, HEAP_LIST_MAX); else ok = FALSE;
+  }
+  if (!ok) { if (GetLastError() == ERROR_SUCCESS) set_error(ERROR_NOT_ENOUGH_MEMORY); snapshot_free(s); return INVALID_HANDLE_VALUE; }
   s->handle = CreateEventW(NULL, TRUE, FALSE, NULL);      /* the snapshot's handle: closing it is what the program does when it is done */
-  if (!s->handle) { RtlFreeHeap(heap(), 0, s); return INVALID_HANDLE_VALUE; }
-  s->count = list_all_processes(s->entries, SNAP_PROCESSES);
+  if (!s->handle) { snapshot_free(s); return INVALID_HANDLE_VALUE; }
   atom_lock();
   int slot = -1;
   for (int i = 0; i < SNAP_MAX; ++i) {
-    if (g_snaps[i] && !IsHandleValid_(g_snaps[i]->handle)) { RtlFreeHeap(heap(), 0, g_snaps[i]); g_snaps[i] = NULL; }      /* (one whose handle was closed) */
+    if (g_snaps[i] && g_snaps[i]->handle == s->handle) { snapshot_free(g_snaps[i]); g_snaps[i] = NULL; }      /* (a closed snapshot's handle value, used again) */
+    if (g_snaps[i] && !IsHandleValid_(g_snaps[i]->handle)) { snapshot_free(g_snaps[i]); g_snaps[i] = NULL; }      /* (one whose handle was closed) */
     if (!g_snaps[i] && slot < 0) slot = i;
   }
   if (slot >= 0) g_snaps[slot] = s;
   LeaveCriticalSection(&g_atom_lock);
-  if (slot < 0) { CloseHandle(s->handle); RtlFreeHeap(heap(), 0, s); set_error(ERROR_NOT_ENOUGH_MEMORY); return INVALID_HANDLE_VALUE; }
+  if (slot < 0) { CloseHandle(s->handle); snapshot_free(s); set_error(ERROR_NOT_ENOUGH_MEMORY); return INVALID_HANDLE_VALUE; }
   return s->handle;
 }
 static Snapshot *snapshot_of(HANDLE h) {
@@ -932,22 +1054,33 @@ static Snapshot *snapshot_of(HANDLE h) {
   LeaveCriticalSection(&g_atom_lock);
   return s;
 }
-static BOOL snapshot_step(HANDLE h, BOOL first, PROCESSENTRY32W_ *out) {
+/* The next entry of one list of a snapshot. */
+static BOOL snapshot_step(HANDLE h, BOOL first, int kind, void *out, DWORD out_size) {
   Snapshot *s = snapshot_of(h);
   if (!s) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
-  if (!out || out->dwSize < sizeof(*out)) { set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
-  if (first) s->next = 0;
-  if (s->next >= s->count) { set_error(ERROR_NO_MORE_FILES); return FALSE; }
-  *out = s->entries[s->next++];
+  if (!out || *(DWORD *)out < out_size) { set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+  DWORD *next = kind == 0 ? &s->process_next : kind == 1 ? &s->thread_next : &s->module_next;
+  const DWORD count = kind == 0 ? s->process_count : kind == 1 ? s->thread_count : s->module_count;
+  if ((kind == 0 && !s->processes) || (kind == 1 && !s->threads) || (kind == 2 && !s->modules)) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (first) *next = 0;
+  /* the threads of a snapshot taken for one process are that process's (Thread32First lists them all, as the original does) */
+  if (*next >= count) { set_error(ERROR_NO_MORE_FILES); return FALSE; }
+  if (kind == 0) *(PROCESSENTRY32W_ *)out = s->processes[(*next)++];
+  else if (kind == 1) *(THREADENTRY32_ *)out = s->threads[(*next)++];
+  else *(MODULEENTRY32W_ *)out = s->modules[(*next)++];
   return TRUE;
 }
-EXPORT BOOL WINAPI Process32FirstW(HANDLE h, PROCESSENTRY32W_ *e) { return snapshot_step(h, TRUE, e); }
-EXPORT BOOL WINAPI Process32NextW(HANDLE h, PROCESSENTRY32W_ *e) { return snapshot_step(h, FALSE, e); }
+EXPORT BOOL WINAPI Process32FirstW(HANDLE h, PROCESSENTRY32W_ *e) { return snapshot_step(h, TRUE, 0, e, sizeof(*e)); }
+EXPORT BOOL WINAPI Process32NextW(HANDLE h, PROCESSENTRY32W_ *e) { return snapshot_step(h, FALSE, 0, e, sizeof(*e)); }
+EXPORT BOOL WINAPI Thread32First(HANDLE h, THREADENTRY32_ *e) { return snapshot_step(h, TRUE, 1, e, sizeof(*e)); }
+EXPORT BOOL WINAPI Thread32Next(HANDLE h, THREADENTRY32_ *e) { return snapshot_step(h, FALSE, 1, e, sizeof(*e)); }
+EXPORT BOOL WINAPI Module32FirstW(HANDLE h, MODULEENTRY32W_ *e) { return snapshot_step(h, TRUE, 2, e, sizeof(*e)); }
+EXPORT BOOL WINAPI Module32NextW(HANDLE h, MODULEENTRY32W_ *e) { return snapshot_step(h, FALSE, 2, e, sizeof(*e)); }
 static BOOL snapshot_step_a(HANDLE h, BOOL first, PROCESSENTRY32A_ *out) {
   PROCESSENTRY32W_ w;
   if (!out || out->dwSize < sizeof(*out)) { set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
   w.dwSize = sizeof(w);
-  if (!snapshot_step(h, first, &w)) return FALSE;
+  if (!snapshot_step(h, first, 0, &w, sizeof(w))) return FALSE;
   out->cntUsage = w.cntUsage; out->th32ProcessID = w.th32ProcessID; out->th32DefaultHeapID = w.th32DefaultHeapID; out->th32ModuleID = w.th32ModuleID;
   out->cntThreads = w.cntThreads; out->th32ParentProcessID = w.th32ParentProcessID; out->pcPriClassBase = w.pcPriClassBase; out->dwFlags = w.dwFlags;
   int i = 0;
@@ -957,13 +1090,245 @@ static BOOL snapshot_step_a(HANDLE h, BOOL first, PROCESSENTRY32A_ *out) {
 }
 EXPORT BOOL WINAPI Process32First(HANDLE h, PROCESSENTRY32A_ *e) { return snapshot_step_a(h, TRUE, e); }
 EXPORT BOOL WINAPI Process32Next(HANDLE h, PROCESSENTRY32A_ *e) { return snapshot_step_a(h, FALSE, e); }
+static BOOL module_step_a(HANDLE h, BOOL first, MODULEENTRY32A_ *out) {
+  MODULEENTRY32W_ *w = RtlAllocateHeap(heap(), 0, sizeof(*w));
+  if (!out || out->dwSize < sizeof(*out)) { if (w) RtlFreeHeap(heap(), 0, w); set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+  if (!w) { set_error(ERROR_NOT_ENOUGH_MEMORY); return FALSE; }
+  w->dwSize = sizeof(*w);
+  BOOL ok = snapshot_step(h, first, 2, w, sizeof(*w));
+  if (ok) {
+    out->th32ModuleID = w->th32ModuleID; out->th32ProcessID = w->th32ProcessID; out->GlblcntUsage = w->GlblcntUsage; out->ProccntUsage = w->ProccntUsage;
+    out->modBaseAddr = w->modBaseAddr; out->modBaseSize = w->modBaseSize; out->hModule = w->hModule;
+    int i = 0;
+    for (; w->szModule[i] && i < 255; ++i) out->szModule[i] = (char)w->szModule[i];
+    out->szModule[i] = 0;
+    for (i = 0; w->szExePath[i] && i < 259; ++i) out->szExePath[i] = (char)w->szExePath[i];
+    out->szExePath[i] = 0;
+  }
+  RtlFreeHeap(heap(), 0, w);
+  return ok;
+}
+EXPORT BOOL WINAPI Module32First(HANDLE h, MODULEENTRY32A_ *e) { return module_step_a(h, TRUE, e); }
+EXPORT BOOL WINAPI Module32Next(HANDLE h, MODULEENTRY32A_ *e) { return module_step_a(h, FALSE, e); }
+
+/* heaps: the list is the process's heaps; the blocks are walked with RtlWalkHeap */
+static BOOL heap_list_step(HANDLE h, BOOL first, HEAPLIST32_ *out) {
+  Snapshot *s = snapshot_of(h);
+  if (!s) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
+  if (!out || out->dwSize < sizeof(*out)) { set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+  if (!s->heaps) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (first) s->heap_next = 0;
+  if (s->heap_next >= s->heap_count) { set_error(ERROR_NO_MORE_FILES); return FALSE; }
+  const ULONG_PTR id = s->heaps[s->heap_next];
+  out->th32ProcessID = s->pid;
+  out->th32HeapID = id;
+  out->dwFlags = s->heap_next == 0 ? 1 /* HF32_DEFAULT */ : 0;
+  ++s->heap_next;
+  return TRUE;
+}
+EXPORT BOOL WINAPI Heap32ListFirst(HANDLE h, HEAPLIST32_ *e) { return heap_list_step(h, TRUE, e); }
+EXPORT BOOL WINAPI Heap32ListNext(HANDLE h, HEAPLIST32_ *e) { return heap_list_step(h, FALSE, e); }
+static BOOL heap_entry_step(HEAPENTRY32_ *e, DWORD pid, ULONG_PTR heap_id, BOOL first) {
+  if (!e || e->dwSize < sizeof(*e)) { set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+  if (pid != 0 && pid != GetCurrentProcessId()) { set_error(299); return FALSE; }
+  HEAPWALK_ w;
+  memset(&w, 0, sizeof(w));
+  if (!first) { w.lpData = e->dwAddress; w.iRegionIndex = (BYTE)e->dwResvd; }
+  if (!NT_SUCCESS(RtlWalkHeap((PVOID)heap_id, &w))) { set_error(ERROR_NO_MORE_FILES); return FALSE; }
+  e->hHandle = (HANDLE)w.lpData; e->dwAddress = w.lpData; e->dwBlockSize = w.cbData;
+  e->dwFlags = (w.wFlags & 4) ? 1 /* LF32_FIXED */ : 2 /* LF32_FREE */;
+  e->dwLockCount = 0; e->dwResvd = w.iRegionIndex; e->th32ProcessID = GetCurrentProcessId(); e->th32HeapID = heap_id;
+  return TRUE;
+}
+EXPORT BOOL WINAPI Heap32First(HEAPENTRY32_ *e, DWORD pid, ULONG_PTR heap_id) { return heap_entry_step(e, pid, heap_id, TRUE); }
+EXPORT BOOL WINAPI Heap32Next(HEAPENTRY32_ *e) { return e ? heap_entry_step(e, 0, e->th32HeapID, FALSE) : (set_error(ERROR_INVALID_PARAMETER), FALSE); }
+EXPORT BOOL WINAPI Toolhelp32ReadProcessMemory(DWORD pid, LPCVOID base, LPVOID buffer, SIZE_T size, SIZE_T *done) {
+  if (pid != 0 && pid != GetCurrentProcessId()) { set_error(ERROR_ACCESS_DENIED); return FALSE; }
+  return ReadProcessMemory(GetCurrentProcess(), base, buffer, size, done);
+}
+/* HeapWalk over the same walker (HeapLock and HeapUnlock are no-ops here: one lock covers the heaps). */
+EXPORT BOOL WINAPI HeapWalk(HANDLE h, HEAPWALK_ *entry) {
+  if (!entry) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  const NTSTATUS s = RtlWalkHeap(h, entry);
+  if (s == 0) return TRUE;
+  set_error(s == (NTSTATUS)0x8000001A ? 259 /* ERROR_NO_MORE_ITEMS */ : ERROR_INVALID_HANDLE);
+  return FALSE;
+}
+
 EXPORT BOOL WINAPI K32EnumProcesses(DWORD *ids, DWORD size, DWORD *needed) {
-  PROCESSENTRY32W_ *list = RtlAllocateHeap(heap(), 0, sizeof(PROCESSENTRY32W_) * SNAP_PROCESSES);
+  PROCESSENTRY32W_ *list = RtlAllocateHeap(heap(), 0, sizeof(PROCESSENTRY32W_) * 64);
   if (!list) { set_error(ERROR_NOT_ENOUGH_MEMORY); return FALSE; }
-  const DWORD n = list_all_processes(list, SNAP_PROCESSES);
+  const DWORD n = list_all_processes(list, 64);
   DWORD written = 0;
   for (DWORD i = 0; i < n && (written + 1) * 4 <= size; ++i) ids[written++] = list[i].th32ProcessID;
   RtlFreeHeap(heap(), 0, list);
   if (needed) *needed = written * 4;
   return TRUE;
+}
+EXPORT BOOL WINAPI EnumProcesses(DWORD *ids, DWORD size, DWORD *needed) { return K32EnumProcesses(ids, size, needed); }
+
+/* psapi: modules, names and memory counters of a process */
+static DWORD process_id_of(HANDLE process) { return process == GetCurrentProcess() ? GetCurrentProcessId() : GetProcessId(process); }
+EXPORT BOOL WINAPI K32EnumProcessModules(HANDLE process, HMODULE *modules, DWORD cb, LPDWORD needed) {
+  ModuleRecord_ *records;
+  BYTE *raw;
+  const DWORD pid = process_id_of(process), count = pid ? query_modules(pid, &records, &raw) : 0;
+  if (count == 0) { set_error(pid ? 299 : ERROR_INVALID_HANDLE); return FALSE; }
+  for (DWORD i = 0; i < count && (i + 1) * sizeof(HMODULE) <= cb; ++i) modules[i] = (HMODULE)records[i].base;
+  if (needed) *needed = count * (DWORD)sizeof(HMODULE);
+  RtlFreeHeap(heap(), 0, raw);
+  return TRUE;
+}
+EXPORT BOOL WINAPI K32EnumProcessModulesEx(HANDLE process, HMODULE *modules, DWORD cb, LPDWORD needed, DWORD filter) { (void)filter; return K32EnumProcessModules(process, modules, cb, needed); }
+/* The record of `module` (NULL: the program) of a process, copied to *out. */
+static BOOL find_module_record(HANDLE process, HMODULE module, ModuleRecord_ *out, DWORD *pid_out) {
+  ModuleRecord_ *records;
+  BYTE *raw;
+  const DWORD pid = process_id_of(process), count = pid ? query_modules(pid, &records, &raw) : 0;
+  BOOL found = FALSE;
+  for (DWORD i = 0; i < count; ++i) if (module ? records[i].base == (ULONG_PTR)module : (records[i].flags & 1)) { *out = records[i]; found = TRUE; break; }
+  if (count != 0) RtlFreeHeap(heap(), 0, raw);
+  if (!found) set_error(ERROR_INVALID_HANDLE);
+  if (pid_out) *pid_out = pid;
+  return found;
+}
+EXPORT DWORD WINAPI K32GetModuleBaseNameW(HANDLE process, HMODULE module, LPWSTR name, DWORD size) {
+  ModuleRecord_ m;
+  if (!find_module_record(process, module, &m, NULL)) return 0;
+  DWORD n = m.name_length < size ? m.name_length : (size ? size - 1 : 0);
+  for (DWORD i = 0; i < n; ++i) name[i] = m.name[i];
+  if (size) name[n] = 0;
+  return n;
+}
+EXPORT DWORD WINAPI K32GetModuleBaseNameA(HANDLE process, HMODULE module, LPSTR name, DWORD size) {
+  WCHAR wide[64];
+  const DWORD n = K32GetModuleBaseNameW(process, module, wide, 64);
+  const DWORD k = n < size ? n : (size ? size - 1 : 0);
+  for (DWORD i = 0; i < k; ++i) name[i] = (char)wide[i];
+  if (size) name[k] = 0;
+  return k;
+}
+EXPORT DWORD WINAPI K32GetModuleFileNameExW(HANDLE process, HMODULE module, LPWSTR name, DWORD size) {
+  ModuleRecord_ m;
+  DWORD pid = 0;
+  if (!find_module_record(process, module, &m, &pid)) return 0;
+  MODULEENTRY32W_ *e = RtlAllocateHeap(heap(), 0, sizeof(*e));
+  if (!e) { set_error(ERROR_NOT_ENOUGH_MEMORY); return 0; }
+  fill_module_entry(e, &m, pid);
+  const DWORD length = (DWORD)wcslen(e->szExePath), n = length < size ? length : (size ? size - 1 : 0);
+  for (DWORD i = 0; i < n; ++i) name[i] = e->szExePath[i];
+  if (size) name[n] = 0;
+  RtlFreeHeap(heap(), 0, e);
+  return n;
+}
+EXPORT DWORD WINAPI K32GetModuleFileNameExA(HANDLE process, HMODULE module, LPSTR name, DWORD size) {
+  WCHAR wide[MAX_PATH];
+  const DWORD n = K32GetModuleFileNameExW(process, module, wide, MAX_PATH);
+  const DWORD k = n < size ? n : (size ? size - 1 : 0);
+  for (DWORD i = 0; i < k; ++i) name[i] = (char)wide[i];
+  if (size) name[k] = 0;
+  return k;
+}
+typedef struct { LPVOID lpBaseOfDll; DWORD SizeOfImage; LPVOID EntryPoint; } MODULEINFO_;
+EXPORT BOOL WINAPI K32GetModuleInformation(HANDLE process, HMODULE module, MODULEINFO_ *info, DWORD cb) {
+  ModuleRecord_ m;
+  if (!info || cb < sizeof(*info)) { set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+  if (!find_module_record(process, module, &m, NULL)) return FALSE;
+  info->lpBaseOfDll = (LPVOID)m.base; info->SizeOfImage = (DWORD)m.size; info->EntryPoint = (LPVOID)m.entry;
+  return TRUE;
+}
+typedef struct { DWORD cb, PageFaultCount; SIZE_T PeakWorkingSetSize, WorkingSetSize, QuotaPeakPagedPoolUsage, QuotaPagedPoolUsage, QuotaPeakNonPagedPoolUsage, QuotaNonPagedPoolUsage, PagefileUsage, PeakPagefileUsage, PrivateUsage; } PROCESS_MEMORY_COUNTERS_EX_;
+EXPORT BOOL WINAPI K32GetProcessMemoryInfo(HANDLE process, PROCESS_MEMORY_COUNTERS_EX_ *counters, DWORD cb) {
+  if (!counters || cb < 40) { set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+  const DWORD pid = process_id_of(process);
+  ULONG length = 0;
+  BYTE *buffer = query_process_information(&length);
+  BOOL found = FALSE;
+  if (buffer) {
+    for (const BYTE *e = buffer;;) {
+      if ((DWORD)*(const ULONG_PTR *)(e + 0x50) == pid) {
+        memset(counters, 0, cb < sizeof(*counters) ? cb : sizeof(*counters));
+        counters->cb = cb;
+        counters->PeakWorkingSetSize = counters->WorkingSetSize = *(const ULONG_PTR *)(e + 0x90);
+        counters->PagefileUsage = counters->PeakPagefileUsage = *(const ULONG_PTR *)(e + 0xB8);
+        if (cb >= sizeof(*counters)) counters->PrivateUsage = *(const ULONG_PTR *)(e + 0xC8);
+        found = TRUE;
+        break;
+      }
+      const DWORD next = *(const DWORD *)e;
+      if (next == 0) break;
+      e += next;
+    }
+    RtlFreeHeap(heap(), 0, buffer);
+  }
+  if (!found) set_error(ERROR_INVALID_HANDLE);
+  return found;
+}
+EXPORT DWORD WINAPI K32GetProcessImageFileNameW(HANDLE process, LPWSTR name, DWORD size) {
+  ModuleRecord_ m;
+  DWORD pid = 0;
+  if (!find_module_record(process, NULL, &m, &pid)) return 0;
+  MODULEENTRY32W_ *e = RtlAllocateHeap(heap(), 0, sizeof(*e));
+  if (!e) { set_error(ERROR_NOT_ENOUGH_MEMORY); return 0; }
+  fill_module_entry(e, &m, pid);
+  const DWORD length = (DWORD)wcslen(e->szExePath), n = length < size ? length : (size ? size - 1 : 0);
+  for (DWORD i = 0; i < n; ++i) name[i] = e->szExePath[i];
+  if (size) name[n] = 0;
+  RtlFreeHeap(heap(), 0, e);
+  return n;
+}
+EXPORT DWORD WINAPI K32GetProcessImageFileNameA(HANDLE process, LPSTR name, DWORD size) {
+  WCHAR wide[MAX_PATH];
+  const DWORD n = K32GetProcessImageFileNameW(process, wide, MAX_PATH);
+  const DWORD k = n < size ? n : (size ? size - 1 : 0);
+  for (DWORD i = 0; i < k; ++i) name[i] = (char)wide[i];
+  if (size) name[k] = 0;
+  return k;
+}
+EXPORT BOOL WINAPI K32EmptyWorkingSet(HANDLE process) { (void)process; return TRUE; }
+EXPORT BOOL WINAPI EnumProcessModules(HANDLE p, HMODULE *m, DWORD cb, LPDWORD n) { return K32EnumProcessModules(p, m, cb, n); }
+EXPORT BOOL WINAPI GetProcessMemoryInfo(HANDLE p, PROCESS_MEMORY_COUNTERS_EX_ *c, DWORD cb) { return K32GetProcessMemoryInfo(p, c, cb); }
+EXPORT BOOL WINAPI GetModuleInformation(HANDLE p, HMODULE m, MODULEINFO_ *i, DWORD cb) { return K32GetModuleInformation(p, m, i, cb); }
+EXPORT DWORD WINAPI GetModuleBaseNameW(HANDLE p, HMODULE m, LPWSTR n, DWORD s) { return K32GetModuleBaseNameW(p, m, n, s); }
+EXPORT DWORD WINAPI GetModuleBaseNameA(HANDLE p, HMODULE m, LPSTR n, DWORD s) { return K32GetModuleBaseNameA(p, m, n, s); }
+EXPORT DWORD WINAPI GetModuleFileNameExW(HANDLE p, HMODULE m, LPWSTR n, DWORD s) { return K32GetModuleFileNameExW(p, m, n, s); }
+EXPORT DWORD WINAPI GetModuleFileNameExA(HANDLE p, HMODULE m, LPSTR n, DWORD s) { return K32GetModuleFileNameExA(p, m, n, s); }
+EXPORT DWORD WINAPI GetProcessImageFileNameW(HANDLE p, LPWSTR n, DWORD s) { return K32GetProcessImageFileNameW(p, n, s); }
+EXPORT DWORD WINAPI GetProcessImageFileNameA(HANDLE p, LPSTR n, DWORD s) { return K32GetProcessImageFileNameA(p, n, s); }
+
+/* ---- job objects ----------------------------------------------------------------------------------------------------------------------------------------- */
+
+typedef struct { LARGE_INTEGER PerProcessUserTimeLimit, PerJobUserTimeLimit; DWORD LimitFlags; SIZE_T MinimumWorkingSetSize, MaximumWorkingSetSize; DWORD ActiveProcessLimit; ULONG_PTR Affinity; DWORD PriorityClass, SchedulingClass; } JOBOBJECT_BASIC_LIMIT_INFORMATION_;
+EXPORT HANDLE WINAPI CreateJobObjectW(LPSECURITY_ATTRIBUTES sa, LPCWSTR name) {
+  NamedAttributes n;
+  HANDLE h = NULL;
+  const NTSTATUS status = NtCreateJobObject(&h, 0x1F001F, named_attributes(&n, name, sa && sa->bInheritHandle));
+  return created(status, h);
+}
+EXPORT HANDLE WINAPI CreateJobObjectA(LPSECURITY_ATTRIBUTES sa, LPCSTR name) { WCHAR *w = name ? to_wide(name) : NULL; HANDLE h = CreateJobObjectW(sa, w); free_wide(w); return h; }
+EXPORT HANDLE WINAPI OpenJobObjectW(DWORD access, BOOL inherit, LPCWSTR name) {
+  (void)access;
+  NamedAttributes n;
+  HANDLE h = NULL;
+  const NTSTATUS status = NtOpenJobObject(&h, 0x1F001F, named_attributes(&n, name, inherit));
+  return opened(status, h);
+}
+EXPORT HANDLE WINAPI OpenJobObjectA(DWORD access, BOOL inherit, LPCSTR name) { WCHAR *w = name ? to_wide(name) : NULL; HANDLE h = OpenJobObjectW(access, inherit, w); free_wide(w); return h; }
+EXPORT BOOL WINAPI AssignProcessToJobObject(HANDLE job, HANDLE process) { const NTSTATUS s = NtAssignProcessToJobObject(job, process); return NT_SUCCESS(s) ? TRUE : fail_nt(s); }
+EXPORT BOOL WINAPI TerminateJobObject(HANDLE job, UINT code) { const NTSTATUS s = NtTerminateJobObject(job, (NTSTATUS)code); return NT_SUCCESS(s) ? TRUE : fail_nt(s); }
+EXPORT BOOL WINAPI IsProcessInJob(HANDLE process, HANDLE job, PBOOL result) {
+  const NTSTATUS s = NtIsProcessInJob(process, job);
+  if (!NT_SUCCESS(s)) return fail_nt(s);
+  if (result) *result = s == 0x124;      /* STATUS_PROCESS_IN_JOB */
+  return TRUE;
+}
+EXPORT BOOL WINAPI QueryInformationJobObject(HANDLE job, int info_class, LPVOID info, DWORD length, LPDWORD returned) {
+  ULONG got = 0;
+  const NTSTATUS s = NtQueryInformationJobObject(job, (ULONG)info_class, info, length, &got);
+  if (returned) *returned = got;
+  return NT_SUCCESS(s) && s != (NTSTATUS)0x80000005 ? TRUE : fail_nt(s);
+}
+EXPORT BOOL WINAPI SetInformationJobObject(HANDLE job, int info_class, LPVOID info, DWORD length) {
+  const NTSTATUS s = NtSetInformationJobObject(job, (ULONG)info_class, info, length);
+  return NT_SUCCESS(s) ? TRUE : fail_nt(s);
 }
