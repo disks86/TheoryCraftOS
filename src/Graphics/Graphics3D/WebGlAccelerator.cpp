@@ -23,11 +23,13 @@
 namespace graphics {
 
 WebGlAccelerator::WebGlAccelerator(IGraphicsDevice& device, allocators::IAllocator& allocator)
-    : device_(device), allocator_(allocator), programs_(allocator), targets_(allocator) {}
+    : device_(device), allocator_(allocator), programs_(allocator), targets_(allocator), textures_(allocator) {}
 
 WebGlAccelerator::~WebGlAccelerator() {
   for (auto& p : programs_)
     if (p) destroy_program_locked(*p);
+  for (auto& t : textures_)
+    if (t && t->image) device_.destroy_image(t->image);
   for (auto& t : targets_) {
     if (!t) continue;
     if (t->color) device_.destroy_image(t->color);
@@ -45,8 +47,8 @@ void WebGlAccelerator::destroy_program_locked(Program& p) {
   p = Program();
 }
 
-uint32_t WebGlAccelerator::create_program(const char* vs_tgsi, const char* fs_tgsi, uint32_t attributes, uint32_t varyings) {
-  if (attributes == 0 || attributes > kMaxVertexAttributes || varyings > kMaxVaryings) return 0;
+uint32_t WebGlAccelerator::create_program(const char* vs_tgsi, const char* fs_tgsi, uint32_t attributes, uint32_t varyings, uint32_t textures) {
+  if (attributes == 0 || attributes > kMaxVertexAttributes || varyings > kMaxVaryings || textures > webgl::kAccelMaxTextures) return 0;
   kernel::ScopedMutex guard(lock_);
   UniquePointer<Program> p = UniquePointer<Program>::make(allocator_);
   if (!p) return 0;
@@ -64,6 +66,11 @@ uint32_t WebGlAccelerator::create_program(const char* vs_tgsi, const char* fs_tg
   }
   p->attributes = attributes;
   p->varyings = varyings;
+  p->textures = textures;
+  if (textures && !pipeline_for(*p, webgl::AccelState())) {   // a device without textures (or this many) refuses here, and the draw stays on the CPU
+    destroy_program_locked(*p);
+    return 0;
+  }
   for (uint64_t i = 0; i < programs_.count(); ++i)
     if (!programs_[i]) {
       programs_[i] = static_cast<UniquePointer<Program>&&>(p);
@@ -79,6 +86,47 @@ void WebGlAccelerator::destroy_program(uint32_t handle) {
   if (!p) return;
   destroy_program_locked(*p);
   programs_[handle - 1].reset();
+}
+
+uint32_t WebGlAccelerator::create_texture(uint32_t w, uint32_t h) {
+  if (w == 0 || h == 0) return 0;
+  kernel::ScopedMutex guard(lock_);
+  UniquePointer<Texture> t = UniquePointer<Texture>::make(allocator_);
+  if (!t) return 0;
+  t->width = w;
+  t->height = h;
+  t->image = device_.create_image({{w, h}, Format::B8G8R8A8Unorm, kImageSampled});
+  if (!t->image) return 0;
+  for (uint64_t i = 0; i < textures_.count(); ++i)
+    if (!textures_[i]) {
+      textures_[i] = static_cast<UniquePointer<Texture>&&>(t);
+      return static_cast<uint32_t>(i + 1);
+    }
+  if (!textures_.push_back(static_cast<UniquePointer<Texture>&&>(t))) return 0;
+  return static_cast<uint32_t>(textures_.count());
+}
+
+void WebGlAccelerator::destroy_texture(uint32_t handle) {
+  kernel::ScopedMutex guard(lock_);
+  Texture* t = texture_at(handle);
+  if (!t) return;
+  if (t->image) device_.destroy_image(t->image);
+  textures_[handle - 1].reset();
+}
+
+bool WebGlAccelerator::write_texture(uint32_t handle, ConstByteView rgba) {
+  kernel::ScopedMutex guard(lock_);
+  Texture* t = texture_at(handle);
+  if (!t) return false;
+  const uint64_t texels = uint64_t{t->width} * t->height;
+  if (rgba.size() != texels * 4) return false;
+  ArrayView<uint32_t> scratch = allocate_view<uint32_t>(allocator_, texels);
+  if (scratch.empty()) return false;
+  for (uint64_t i = 0; i < texels; ++i)   // 0xAARRGGBB
+    scratch[i] = (uint32_t{rgba[i * 4 + 3]} << 24) | (uint32_t{rgba[i * 4]} << 16) | (uint32_t{rgba[i * 4 + 1]} << 8) | rgba[i * 4 + 2];
+  const bool ok = t->image->write_pixels(scratch);
+  release_view(allocator_, scratch);
+  return ok;
 }
 
 uint32_t WebGlAccelerator::create_target(uint32_t w, uint32_t h) {
@@ -126,6 +174,7 @@ IPipeline* WebGlAccelerator::pipeline_for(Program& p, const webgl::AccelState& s
   d.attribute_count = p.attributes;
   for (uint32_t i = 0; i < p.attributes; ++i) d.attributes[i] = {i, VertexFormat::Float4, i * 16};
   d.varying_count = p.varyings;
+  d.texture_count = p.textures;
   d.cull_mode = cull == 0 ? CullMode::None : (cull == 1 ? CullMode::Front : CullMode::Back);
   d.front_face = s.front_ccw ? FrontFace::Clockwise : FrontFace::CounterClockwise;
   d.depth_test = s.depth_test;
@@ -144,6 +193,9 @@ bool WebGlAccelerator::run_pass(Target& t, bool clear_color, const Vec4& color, 
   if (program) {
     pipeline = pipeline_for(*program, *state);
     if (!pipeline) return false;
+    if (state->texture_count != program->textures) return false;
+    for (uint32_t i = 0; i < program->textures; ++i)
+      if (!texture_at(state->textures[i])) return false;
     if (vertices.size() > vertex_capacity_) {
       if (vertex_buffer_) device_.destroy_buffer(vertex_buffer_);
       vertex_buffer_ = nullptr;
@@ -174,6 +226,14 @@ bool WebGlAccelerator::run_pass(Target& t, bool clear_color, const Vec4& color, 
   if (program) {
     commands_->bind_pipeline(pipeline);
     commands_->bind_vertex_buffer(vertex_buffer_);
+    for (uint32_t i = 0; i < program->textures; ++i) {
+      const webgl::AccelSampler& as = state->samplers[i];
+      SamplerDesc sampler;
+      sampler.filter = as.linear ? Filter::Linear : Filter::Nearest;
+      sampler.address_u = as.repeat_s ? AddressMode::Repeat : AddressMode::ClampToEdge;
+      sampler.address_v = as.repeat_t ? AddressMode::Repeat : AddressMode::ClampToEdge;
+      commands_->bind_texture(i, texture_at(state->textures[i])->image, sampler);
+    }
     if (!constants.empty()) commands_->push_constants(constants.data(), static_cast<uint32_t>(constants.size()));
     Viewport vp;
     vp.x = state->vp_x;

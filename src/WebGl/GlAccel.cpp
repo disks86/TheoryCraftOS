@@ -35,7 +35,47 @@ inline uint32_t f2u(float f) { return __builtin_bit_cast(uint32_t, f); }
 constexpr uint32_t kMaxAccelVertices = 3u << 20;   // vertices of one draw the accelerated path assembles (more run on the CPU)
 }  // namespace
 
+void GlContext::hw_forget_texture(uint32_t name) {
+  if (hw_owner_) hw_textures_.forget(*hw_owner_, name);
+}
+
+// The texture bound to `unit` as the device can read it: a 2D texture of 8-bit RGBA texels with no mipmapping in use and a filter and wrap mode the device has.
+// Its texels are on the device when this returns true. False: the CPU samples it.
+bool GlContext::hw_texture(uint32_t unit, uint32_t* handle, AccelSampler* sampler) {
+  constexpr uint32_t kMaxSide = 1024;
+  if (unit >= kMaxTextureUnits) return false;
+  const TextureUnit& u = units_[unit];
+  const Texture* t = texture_at(u.tex2d);
+  if (!t || t->target != 0x0DE1 || t->base_level != 0) return false;
+  SamplerObj so;
+  if (u.sampler && u.sampler <= samplers_.count() && samplers_[u.sampler - 1]) so = *samplers_[u.sampler - 1];
+  else {
+    so.min_filter = t->min_filter;
+    so.mag_filter = t->mag_filter;
+    so.wrap_s = t->wrap_s;
+    so.wrap_t = t->wrap_t;
+    so.compare_mode = t->compare_mode;
+  }
+  const bool nearest = so.min_filter == 0x2600 && so.mag_filter == 0x2600, linear = so.min_filter == 0x2601 && so.mag_filter == 0x2601;
+  if (!nearest && !linear) return false;   // (a mipmapped minification filter, or different filters for the two)
+  auto wrap = [](uint32_t mode, bool* repeat) {
+    *repeat = mode == 0x2901;
+    return mode == 0x2901 || mode == 0x812F;
+  };
+  if (!wrap(so.wrap_s, &sampler->repeat_s) || !wrap(so.wrap_t, &sampler->repeat_t) || so.compare_mode != 0) return false;
+  sampler->linear = linear;
+  bool cube;
+  if (!texture_complete(*t, so, &cube) || t->images.count() == 0 || !t->images[0] || !t->images[0]->defined()) return false;
+  const Image& im = *t->images[0];
+  if (im.info->store != Store::U8x4 || im.info->srgb || im.info->is_signed || im.w > kMaxSide || im.h > kMaxSide || im.d != 1 || im.ss != 1) return false;
+  IAccelerator* acc = hw_owner_;
+  if (!acc) return false;
+  *handle = hw_textures_.get(*acc, u.tex2d, im.w, im.h, im.px.view());
+  return *handle != 0;
+}
+
 void GlContext::hw_drop() {
+  if (hw_owner_) hw_textures_.release(*hw_owner_);
   if (hw_owner_ && hw_target_) hw_owner_->destroy_target(hw_target_);
   hw_owner_ = nullptr;
   hw_target_ = 0;
@@ -100,7 +140,7 @@ bool GlContext::hw_program(ProgramObj& p, IAccelerator& acc) {
   }
   UniquePointer<TgsiProgram> t = UniquePointer<TgsiProgram>::make(a_, a_);
   if (!t || !translate_to_tgsi(a_, *p.vsm, *p.fsm, links.view(), t.get())) return false;
-  p.accel_program = acc.create_program(t->vs.c_str(), t->fs.c_str(), static_cast<uint32_t>(t->attributes.count()), t->varyings);
+  p.accel_program = acc.create_program(t->vs.c_str(), t->fs.c_str(), static_cast<uint32_t>(t->attributes.count()), t->varyings, static_cast<uint32_t>(t->samplers.count()));
   if (p.accel_program) p.tgsi = static_cast<UniquePointer<TgsiProgram>&&>(t);
   return p.accel_program != 0;
 }
@@ -210,6 +250,12 @@ bool GlContext::hw_draw(ProgramObj& p, const Target& target, uint32_t mode, int3
 
   const float ss = static_cast<float>(target.ss);
   AccelState st;
+  // the textures: each sampler uniform holds a texture unit
+  st.texture_count = static_cast<uint32_t>(t.samplers.count());
+  if (st.texture_count > kAccelMaxTextures) return false;
+  for (uint32_t k = 0; k < st.texture_count; ++k) {
+    if (t.samplers[k].slot >= p.fs_shared.count() || !hw_texture(p.fs_shared[t.samplers[k].slot], &st.textures[k], &st.samplers[k])) return false;
+  }
   st.vp_x = static_cast<float>(vp_[0]) * ss;
   st.vp_y = static_cast<float>(vp_[1]) * ss;
   st.vp_w = static_cast<float>(vp_[2]) * ss;

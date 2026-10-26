@@ -39,6 +39,7 @@ enum Command : uint32_t {
   kSetStencilRef,
   kSetBlendColor,
   kSetScissorState,
+  kBindSamplerStates = 18,
   kBindShader = 31,
 };
 
@@ -84,6 +85,11 @@ constexpr uint32_t kFuncLess = 1, kFuncLequal = 3, kFuncAlways = 7;
 constexpr uint32_t kBlendAdd = 0;
 constexpr uint32_t kBlendFactorOne = 1, kBlendFactorSrcAlpha = 3, kBlendFactorInvSrcAlpha = 0x13;
 constexpr uint32_t kClearDepth = 1u << 0, kClearColor0 = 1u << 2;
+// Sampler state (the S0 dword of a sampler state object) and sampler view swizzle.
+constexpr uint32_t kWrapRepeat = 0, kWrapClampToEdge = 2;
+constexpr uint32_t kFilterNearest = 0, kFilterLinear = 1;
+constexpr uint32_t kMipFilterNone = 2;
+constexpr uint32_t kSwizzleRgba = 0 | (1u << 3) | (2u << 6) | (3u << 9);
 constexpr uint32_t kFaceNone = 0, kFaceFront = 1, kFaceBack = 2;
 
 }  // namespace graphics::virgl

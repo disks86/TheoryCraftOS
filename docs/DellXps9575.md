@@ -115,9 +115,20 @@ clock requests. Not run on a Vega M.
 (`GraphicsPipelineDesc::texture_count`) and its fragment shader is a `textured_fragment_function` (a shader is that or a plain `fragment_function`, never both). `BuiltinShaders` has the textured pair
 (`textured_vertex_shader`, `textured_fragment_shader`, `describe_textured_pipeline`: a float3 position, a float2 coordinate, the matrix in the push constants, texture unit 0).
 
-The software device and the Intel Gen9 device run textures. The other devices (V3d, VMware SVGA, virgl) refuse a pipeline with a texture count (`nullptr`) and fail a submit that binds a texture, so a caller falls back
+The software device, the Intel Gen9 device and the virgl device (QEMU's virtio-gpu) run textures. On virgl a texture is a host resource without the Y_0_TOP flag (so row 0 of `write_pixels` is the row v = 0 reads),
+filled through a guest backing and TRANSFER_TO_HOST_3D, with a sampler view per image and a sampler state per filter/address combination (made on first use, kept by the device); the built-in textured pair has TGSI
+(`TEX OUT[0], IN[0], SAMP[0], 2D`). virgl refuses an image that is both sampled and drawn into (the two are stored in opposite row order) and, as everywhere, a draw whose texture is unbound or is the render target.
+This is **not validated against a running virgl host**: the wire format follows virglrenderer's protocol, and the row order of a texture is the thing to look at first on a real QEMU. The other devices (V3d, VMware SVGA) refuse a pipeline with a texture count (`nullptr`) and fail a submit that binds a texture, so a caller falls back
 to the software device the same way it does for any pipeline they cannot take. Both devices refuse a draw whose texture is not bound, is the image being drawn into, or was not made for sampling. `tests/GraphicsTest.cpp`
 covers nearest and linear filtering, both address modes, both byte orders, alpha and blending, perspective-correct coordinates (the test fails with affine interpolation) and every refusal.
+
+WebGL uses these textures through `webgl::IAccelerator` (`WebGl/Accelerator.hpp`): `create_texture`/`write_texture`/`destroy_texture` (RGBA8, first row first, no mipmaps), `AccelState::textures`/`samplers`
+(at most `kAccelMaxTextures` = 2) and a `textures` count on `create_program`. `TgsiTranslator` turns `texture2D`/`texture` of a `uniform sampler2D` in a fragment shader into `TEX ... SAMP[i], 2D`
+(`TgsiProgram::samplers` says which uniform slot holds each sampler's unit); vertex-shader lookups, explicit levels, cube/3D/array/shadow samplers and a third sampler still refuse. `GlContext::hw_texture`
+(`GlAccel.cpp`) takes a draw only when each sampled texture is a 2D RGBA8 (non-sRGB) texture up to 1024 x 1024 with level 0 as base, a NEAREST or LINEAR filter (the same for minification and
+magnification), and REPEAT or CLAMP_TO_EDGE wrap; the texels go to the device again when a hash of them changed. WebGPU does the same for `textureSample(texture_2d<f32>, sampler, uv)` in a fragment shader (`wgpu::Device::hw_texture`, `GpuAccel.cpp`): the bind group's view must be one mip level of a
+single-layer 2D RGBA8 (not sRGB) texture other than the pass's own colour attachment, and the sampler a non-comparison one with no anisotropy, the same nearest/linear filter both ways, and
+repeat or clamp addressing. Device copies are cached per texture and mip (`webgl::AccelTextureCache`) and freed with the texture. Not validated on a running virgl host.
 
 On the Gen9 device a textured draw is what `RenderBatch::textured_triangles` builds: the same job as the other triangle draws, but the pixel kernel is the intel-gpu-tools render copy kernel (it interpolates attribute 0's x and y
 as u and v and samples the surface bound after the target), the vertex's colour slot carries (u, v), the binding table has the target and the texture, and the sampler state selects nearest or linear filtering (bits 16:14 and

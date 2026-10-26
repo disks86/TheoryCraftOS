@@ -30,6 +30,7 @@ namespace graphics {
 class VirglDevice final : public IGraphicsDevice {
  public:
   explicit VirglDevice(hardware::VirtioGpu& gpu) : gpu_(gpu) {}
+  ~VirglDevice();
 
   DeviceInfo info() const override { return {"virgl (virtio-gpu)", DeviceKind::VirtualGpu, true}; }
 
@@ -52,10 +53,13 @@ class VirglDevice final : public IGraphicsDevice {
   bool send_commands(const uint32_t* dwords, uint32_t count);  // SUBMIT_3D
   uint32_t new_handle() { return next_handle_++; }
   bool destroy_object(uint32_t handle);
+  // The host-side sampler state object for `sampler`, made on first use (0 if the host refuses it).
+  uint32_t sampler_state(const SamplerDesc& sampler);
 
  private:
   hardware::VirtioGpu& gpu_;
   uint32_t next_handle_ = 1;  // object handles share one namespace per context
+  uint32_t sampler_states_[8] = {};   // by filter and address modes (3 bits), 0 until made
 };
 
 }  // namespace graphics

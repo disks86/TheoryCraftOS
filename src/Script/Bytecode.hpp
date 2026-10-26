@@ -41,7 +41,7 @@ enum class Opc : uint8_t {
   // jumps (a = target); the Keep forms leave the value when they jump and drop it when they do not
   Jump, JumpIfFalse, JumpIfTrue, JumpIfFalseKeep, JumpIfTrueKeep, JumpIfNotNullishKeep,
   // functions and objects
-  Closure, Return, Throw, NewObject, DefineProp, DefineElem, DefineAccessor, DefineAccessorElem, NewArray, ArrayPush, ArraySpread, ObjectSpread,
+  Closure, Return, Throw, NewObject, DefineProp, SetLiteralProto, DefineElem, DefineAccessor, DefineAccessorElem, NewArray, ArrayPush, ArraySpread, ObjectSpread,
   // loops over keys / values: Start turns [value] into [iterator]; IterNext (a = where to go at the end) takes [iterator] and gives [value]
   ForInStart, ForOfStart, IterNext,
   // exceptions: TryBegin (a = the handler) starts catching; TryEnd stops; the handler is entered with the exception on the stack
@@ -82,6 +82,7 @@ struct FunctionCode {
   List<FunctionCode*> children;         // the functions made inside this one
   uint32_t slot_count = 0;              // variables (parameters first)
   uint32_t param_count = 0;
+  uint32_t expected_args = 0;           // the function's length: the parameters before the first default value or rest parameter
   int32_t arguments_slot = -1;          // where `arguments` goes, if the function uses it
   int32_t self_slot = -1;               // where a named function expression finds itself
   bool is_arrow = false, has_rest = false, is_async = false, is_generator = false;

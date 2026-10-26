@@ -38,8 +38,11 @@ class WebGlAccelerator final : public webgl::IAccelerator {
   ~WebGlAccelerator();
 
   const char* name() const override { return device_.info().name; }
-  uint32_t create_program(const char* vs_tgsi, const char* fs_tgsi, uint32_t attributes, uint32_t varyings) override;
+  uint32_t create_program(const char* vs_tgsi, const char* fs_tgsi, uint32_t attributes, uint32_t varyings, uint32_t textures) override;
   void destroy_program(uint32_t program) override;
+  uint32_t create_texture(uint32_t w, uint32_t h) override;
+  void destroy_texture(uint32_t texture) override;
+  bool write_texture(uint32_t texture, ConstByteView rgba) override;
   uint32_t create_target(uint32_t w, uint32_t h) override;
   void destroy_target(uint32_t target) override;
   bool clear(uint32_t target, bool color, const float rgba[4], bool depth, float depth_value) override;
@@ -53,7 +56,11 @@ class WebGlAccelerator final : public webgl::IAccelerator {
     IShaderModule* vs = nullptr;
     IShaderModule* fs = nullptr;
     IPipeline* pipelines[kVariants] = {};
-    uint32_t attributes = 0, varyings = 0;
+    uint32_t attributes = 0, varyings = 0, textures = 0;
+  };
+  struct Texture {
+    IImage* image = nullptr;
+    uint32_t width = 0, height = 0;
   };
   struct Target {
     IImage* color = nullptr;
@@ -66,6 +73,7 @@ class WebGlAccelerator final : public webgl::IAccelerator {
   bool run_pass(Target& t, bool clear_color, const Vec4& color, bool clear_depth, float depth, Program* program, const webgl::AccelState* state, ConstByteView vertices,
                 uint32_t vertex_count, ConstByteView constants);
   Program* program_at(uint32_t handle) { return handle && handle <= programs_.count() ? programs_[handle - 1].get() : nullptr; }
+  Texture* texture_at(uint32_t handle) { return handle && handle <= textures_.count() ? textures_[handle - 1].get() : nullptr; }
   Target* target_at(uint32_t handle) { return handle && handle <= targets_.count() ? targets_[handle - 1].get() : nullptr; }
 
   IGraphicsDevice& device_;
@@ -73,6 +81,7 @@ class WebGlAccelerator final : public webgl::IAccelerator {
   kernel::Mutex lock_;
   List<UniquePointer<Program>> programs_;
   List<UniquePointer<Target>> targets_;
+  List<UniquePointer<Texture>> textures_;
   ICommandBuffer* commands_ = nullptr;
   IBuffer* vertex_buffer_ = nullptr;
   uint64_t vertex_capacity_ = 0;

@@ -2405,6 +2405,34 @@ EXPORT HANDLE WINAPI CreateFileA(LPCSTR path, DWORD access, DWORD share, LPSECUR
   return h;
 }
 
+/* FindFirstChangeNotification/FindNextChangeNotification/FindCloseChangeNotification: the handle is an ordinary ChangeNotification object (NtCreateChangeNotification),
+ * signalled like a manual-reset event when something changes under the watched directory - WaitForSingleObject/WaitForMultipleObjects already work on it unmodified.
+ * FindNextChangeNotification re-arms it the same way ResetEvent does (it is reset(), not a separate NT service); FindCloseChangeNotification is just CloseHandle. */
+EXPORT HANDLE WINAPI FindFirstChangeNotificationW(LPCWSTR path, BOOL watch_subtree, DWORD notify_filter) {
+  if (!path) { set_error(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE; }
+  WCHAR buffer[PATH_CHARS + 8];
+  UNICODE_STRING name;
+  OBJECT_ATTRIBUTES attributes;
+  if (!nt_name(path, buffer, &name, &attributes)) return INVALID_HANDLE_VALUE;
+  HANDLE handle = NULL;
+  const NTSTATUS status = NtCreateChangeNotification(&attributes, watch_subtree ? 1 : 0, notify_filter, &handle);
+  if (!NT_SUCCESS(status)) {
+    set_error(status == STATUS_OBJECT_PATH_NOT_FOUND || status == STATUS_OBJECT_NAME_NOT_FOUND ? ERROR_PATH_NOT_FOUND :
+              status == STATUS_NOT_A_DIRECTORY ? ERROR_DIRECTORY : RtlNtStatusToDosError(status));
+    return INVALID_HANDLE_VALUE;
+  }
+  return handle;
+}
+EXPORT HANDLE WINAPI FindFirstChangeNotificationA(LPCSTR path, BOOL watch_subtree, DWORD notify_filter) {
+  WCHAR *w = to_wide(path);
+  if (!w) return INVALID_HANDLE_VALUE;
+  HANDLE h = FindFirstChangeNotificationW(w, watch_subtree, notify_filter);
+  free_wide(w);
+  return h;
+}
+EXPORT BOOL WINAPI FindNextChangeNotification(HANDLE h) { const NTSTATUS s = NtResetEvent(h, NULL); return NT_SUCCESS(s) ? TRUE : fail_nt(s); }
+EXPORT BOOL WINAPI FindCloseChangeNotification(HANDLE h) { return CloseHandle(h); }
+
 /* The two 64-bit queries on an open file. */
 static BOOL query_position(HANDLE h, LONGLONG *position) {
   IO_STATUS_BLOCK iosb;

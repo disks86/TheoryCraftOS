@@ -1111,7 +1111,7 @@ bool Vm::get_own(JsObject* o, JsString* key, Value* out) {
       return true;
     }
     if (key == length_) {
-      *out = Value::make_number(o->okind == ObjKind::Function ? o->code->param_count - (o->code->has_rest ? 1 : 0) : o->okind == ObjKind::Native ? o->position : 0);
+      *out = Value::make_number(o->okind == ObjKind::Function ? o->code->expected_args : o->okind == ObjKind::Native ? o->position : 0);
       return true;
     }
     if (key == prototype_ && o->okind == ObjKind::Function && !o->code->is_arrow) {   // made when first looked at
@@ -1325,6 +1325,8 @@ bool Vm::put_ex(const Value& base, JsString* key, const Value& value, bool stric
   }
   if (o->frozen) return refuse("Cannot assign to read only property '", "' of object");
   const int64_t at = find_prop(o, key);
+  if (at < 0 && (key == name_ || key == length_) && (o->okind == ObjKind::Function || o->okind == ObjKind::Native || o->okind == ObjKind::Bound))
+    return refuse("Cannot assign to read only property '", "' of function");
   if (at >= 0) {
     if (o->props[at].flags & kAccessor) {
       const Value pair = o->props[at].value;
@@ -1437,17 +1439,42 @@ JsObject* Vm::own_keys(JsObject* o) {
     }
   }
   if (o->host && o->host->keys) o->host->keys(*this, o, keys);
-  for (uint32_t i = 0; i < o->prop_count; ++i)
-    if (o->props[i].flags & kEnumerable) array_push(keys, Value::make_string(o->props[i].key));
+  push_property_keys(keys, o, true);
   return keys;
+}
+
+// The own property names of an ordinary object, in the order the language gives: integer indices ascending, then the rest as they were added.
+void Vm::push_property_keys(JsObject* names, JsObject* o, bool enumerable) {
+  List<uint32_t> indexed(allocator_);
+  for (uint32_t i = 0; i < o->prop_count; ++i) {
+    uint32_t n;
+    if (((o->props[i].flags & kEnumerable) != 0) == enumerable && canonical_index(o->props[i].key->view(), &n)) indexed.push_back(i);
+  }
+  for (uint64_t a = 1; a < indexed.count(); ++a) {   // (insertion sort by the index: objects with many integer keys are arrays, which do not come here)
+    const uint32_t item = indexed[a];
+    uint32_t item_index = 0, other_index = 0;
+    canonical_index(o->props[item].key->view(), &item_index);
+    uint64_t b = a;
+    while (b > 0) {
+      canonical_index(o->props[indexed[b - 1]].key->view(), &other_index);
+      if (other_index <= item_index) break;
+      indexed[b] = indexed[b - 1];
+      --b;
+    }
+    indexed[b] = item;
+  }
+  for (uint64_t a = 0; a < indexed.count(); ++a) array_push(names, Value::make_string(o->props[indexed[a]].key));
+  for (uint32_t i = 0; i < o->prop_count; ++i) {
+    uint32_t n;
+    if (((o->props[i].flags & kEnumerable) != 0) == enumerable && !canonical_index(o->props[i].key->view(), &n)) array_push(names, Value::make_string(o->props[i].key));
+  }
 }
 
 JsObject* Vm::own_names(JsObject* o) {
   if (o->okind == ObjKind::Proxy) return proxy_keys(o, true);
   JsObject* names = own_keys(o);
   if (o->okind == ObjKind::Array) array_push(names, Value::make_string(length_));
-  for (uint32_t i = 0; i < o->prop_count; ++i)
-    if (!(o->props[i].flags & kEnumerable)) array_push(names, Value::make_string(o->props[i].key));
+  push_property_keys(names, o, false);
   return names;
 }
 
@@ -1462,7 +1489,8 @@ bool Vm::own_property(JsObject* o, JsString* key, Value* value, uint8_t* flags) 
   has_receiver_ = false;
   const bool found = get_own(o, key, value);
   has_receiver_ = saved;
-  *flags = key == length_ ? kWritable : kDefaultFlags;
+  const bool is_function = o->okind == ObjKind::Function || o->okind == ObjKind::Native || o->okind == ObjKind::Bound;
+  *flags = is_function && (key == name_ || key == length_) ? 0 : key == length_ ? kWritable : kDefaultFlags;   // (a function's name and length: read-only, hidden)
   return found;
 }
 
@@ -1548,6 +1576,14 @@ bool Vm::to_string(const Value& v, JsString** out) {
   }
 }
 
+// A symbol is a string "@@<description>#<number>" (see symbol_function): the number at the end is what tells one from a string that happens to start with @@.
+static bool is_symbol_text(StringView s) {
+  if (s.size() < 4 || s[0] != '@' || s[1] != '@') return false;
+  uint64_t i = s.size();
+  while (i > 2 && s[i - 1] >= '0' && s[i - 1] <= '9') --i;
+  return i < s.size() && i > 2 && s[i - 1] == '#';
+}
+
 bool Vm::to_number(const Value& v, double* out) {
   switch (v.tag) {
     case Tag::Undefined: *out = __builtin_nan(""); return true;
@@ -1556,6 +1592,7 @@ bool Vm::to_number(const Value& v, double* out) {
     case Tag::Number: *out = v.u.number; return true;
     case Tag::String: {
       double d;
+      if (is_symbol_text(v.as_string()->view())) return throw_error(ErrorKind::TypeError, "Cannot convert a Symbol value to a number");
       if (!string_to_number(v.as_string()->view(), &d)) d = __builtin_nan("");
       *out = d;
       return true;
@@ -2301,6 +2338,10 @@ bool Vm::call_value(const Value& function, const Value& this_value, const Value*
   const Value* a = &stack_[base + 2];
   Value this_for_call = self;
   Value created;
+  if (construct && f->okind == ObjKind::Native && !f->constructs && find_prop(f, prototype_) < 0) {   // a built-in method (Math.abs, an exported WebAssembly function) is not a constructor
+    sp_ = base;
+    return throw_error(ErrorKind::TypeError, "function is not a constructor");
+  }
   if (construct) {
     Value proto;
     if (!get(fn, prototype_, &proto)) {
@@ -2663,6 +2704,10 @@ reload:
           Value this_for_call = self;
           Value created;
           if (is_new) {
+            if (!callee.as_object()->constructs && find_prop(callee.as_object(), prototype_) < 0) {   // a built-in method is not a constructor
+              throw_error(ErrorKind::TypeError, "function is not a constructor");
+              THROW_PENDING();
+            }
             Value proto;
             CHECK(get(callee, prototype_, &proto));
             created = Value::make_object(new_instance(proto.is_object() ? proto.as_object() : object_proto_));
@@ -2808,6 +2853,13 @@ reload:
       case Opc::NewObject: PUSH(Value::make_object(new_plain())); break;
       case Opc::DefineProp: {   // [obj, value] -> [obj]
         define(stack_[sp_ - 2].as_object(), code->constants[static_cast<uint32_t>(in.a)].as_string(), stack_[sp_ - 1]);
+        --sp_;
+        break;
+      }
+      case Opc::SetLiteralProto: {   // [obj, value] -> [obj]   (an object or null; anything else is ignored)
+        const Value& v = stack_[sp_ - 1];
+        if (v.is_object()) stack_[sp_ - 2].as_object()->proto = v.as_object();
+        else if (v.is_null()) stack_[sp_ - 2].as_object()->proto = nullptr;
         --sp_;
         break;
       }
