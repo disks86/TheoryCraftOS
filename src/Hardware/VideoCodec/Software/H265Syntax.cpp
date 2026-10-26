@@ -272,7 +272,8 @@ bool Core::parse_sps(BitReader& br) {
   }
   s.bit_depth_luma = static_cast<int>(br.ue()) + 8;
   s.bit_depth_chroma = static_cast<int>(br.ue()) + 8;
-  if (s.bit_depth_luma != 8 || s.bit_depth_chroma != 8) return H265_FALSE;
+  // Up to ten bits (Main 10). Pictures deeper than eight bits are only decoded by an offload (IOffload): the Core itself has eight-bit pixel paths only.
+  if (s.bit_depth_luma > 10 || s.bit_depth_chroma > 10) return H265_FALSE;
   const uint32_t poc_bits = br.ue() + 4;
   if (poc_bits > 16) return H265_FALSE;
   s.log2_max_poc_lsb = static_cast<int>(poc_bits);
@@ -312,7 +313,7 @@ bool Core::parse_sps(BitReader& br) {
     s.log2_min_pcm = static_cast<int>(br.ue()) + 3;
     s.log2_max_pcm = s.log2_min_pcm + static_cast<int>(br.ue());
     s.pcm_loop_filter_disabled = br.u(1) != 0;
-    if (s.pcm_bit_depth_luma > 8 || s.pcm_bit_depth_chroma > 8 || s.log2_max_pcm > 5) return H265_FALSE;
+    if (s.pcm_bit_depth_luma > s.bit_depth_luma || s.pcm_bit_depth_chroma > s.bit_depth_chroma || s.log2_max_pcm > 5) return H265_FALSE;
   }
   const uint32_t num_rps = br.ue();
   if (num_rps > 64) return H265_FALSE;
@@ -642,18 +643,21 @@ void Core::verify_picture_hash() {
   pending_hash_.present = false;
   bool match = true;
   for (int c = 0; c < 3; ++c) {
+    // A picture deeper than eight bits holds 16-bit little-endian words: the hashes (8.? / D.3.19) run over those words as two bytes each, the low byte first, which is
+    // what hashing the plane's bytes does; `w` counts bytes in the MD5 and CRC, samples in the checksum.
+    const int bytes = cur_->deep ? 2 : 1;
     const int w = c ? cur_->width / 2 : cur_->width, hh = c ? cur_->height / 2 : cur_->height;
     const uint8_t* plane = cur_->plane[c].data();
     const int stride = cur_->stride[c];
     if (h.type == 0) {
       if (!hasher_) return;   // nothing to check it with
       uint8_t digest[16];
-      hasher_->md5(plane, static_cast<uint32_t>(w), static_cast<uint32_t>(hh), static_cast<uint32_t>(stride), digest);
+      hasher_->md5(plane, static_cast<uint32_t>(w * bytes), static_cast<uint32_t>(hh), static_cast<uint32_t>(stride), digest);
       for (int i = 0; i < 16; ++i) match = match && digest[i] == h.md5[c][i];
     } else if (h.type == 1) {
       uint32_t crc = 0xFFFF;
       for (int y = 0; y < hh; ++y)
-        for (int x = 0; x < w; ++x) {
+        for (int x = 0; x < w * bytes; ++x) {
           const uint32_t byte = plane[static_cast<uint64_t>(y) * stride + x];
           for (int bit = 0; bit < 8; ++bit) {
             const uint32_t msb = (crc >> 15) & 1, v = (byte >> (7 - bit)) & 1;
@@ -670,7 +674,9 @@ void Core::verify_picture_hash() {
       for (int y = 0; y < hh; ++y)
         for (int x = 0; x < w; ++x) {
           const uint32_t mask = (static_cast<uint32_t>(x) & 0xFF) ^ (static_cast<uint32_t>(y) & 0xFF) ^ (static_cast<uint32_t>(x) >> 8) ^ (static_cast<uint32_t>(y) >> 8);
-          sum += (plane[static_cast<uint64_t>(y) * stride + x] & 0xFFu) ^ mask;
+          const uint8_t* sample = plane + static_cast<uint64_t>(y) * stride + static_cast<uint64_t>(x) * bytes;
+          sum += (sample[0] & 0xFFu) ^ mask;
+          if (cur_->deep) sum += (sample[1] & 0xFFu) ^ mask;
         }
       match = match && sum == h.value[c];
     }
