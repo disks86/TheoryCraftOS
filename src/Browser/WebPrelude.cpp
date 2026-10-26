@@ -5448,11 +5448,248 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     var done = Promise.resolve().then(function () { return typeof callback === 'function' ? callback() : undefined; });
     return { ready: done, finished: done, updateCallbackDone: done, skipTransition: function () {} };
   });
-  if (doc.fonts === undefined) {
-    hide(doc, 'fonts', { ready: resolved(null), status: 'loaded', size: 0, check: function () { return true; }, load: function () { return resolved([]); },
-                         add: function () {}, delete: function () { return false; }, clear: function () {}, forEach: function () {}, has: function () { return false; },
-                         addEventListener: function () {}, removeEventListener: function () {} });
+  // --- CSS Font Loading: FontFace, FontFaceSet (document.fonts), FontFaceSetLoadEvent. Loading checks that the data is there and looks like a font; the renderer reads @font-face itself.
+  var ffDom = function (message, name) { return new DOMException(message, name); };
+  var FF_DESCRIPTORS = ['style', 'weight', 'stretch', 'unicodeRange', 'variant', 'featureSettings', 'variationSettings', 'display', 'ascentOverride', 'descentOverride', 'lineGapOverride'];
+  var FF_DEFAULTS = { style: 'normal', weight: 'normal', stretch: 'normal', unicodeRange: 'U+0-10FFFF', variant: 'normal', featureSettings: 'normal', variationSettings: 'normal', display: 'auto', ascentOverride: 'normal', descentOverride: 'normal', lineGapOverride: 'normal' };
+  var FF_CSSNAME = { style: 'font-style', weight: 'font-weight', stretch: 'font-stretch', unicodeRange: 'unicode-range', variant: 'font-variant', featureSettings: 'font-feature-settings', variationSettings: 'font-variation-settings', display: 'font-display', ascentOverride: 'ascent-override', descentOverride: 'descent-override', lineGapOverride: 'line-gap-override' };
+  var ffNumber = '[-+]?(?:\\d+\\.?\\d*|\\.\\d+)';
+  var FF_VALID = {
+    style: new RegExp('^(?:normal|italic|oblique(?:\\s+' + ffNumber + 'deg(?:\\s+' + ffNumber + 'deg)?)?)$'),
+    weight: new RegExp('^(?:auto|normal|bold|(?:' + ffNumber + ')(?:\\s+' + ffNumber + ')?)$'),
+    stretch: new RegExp('^(?:auto|normal|(?:ultra|extra|semi)-(?:condensed|expanded)|condensed|expanded|' + ffNumber + '%(?:\\s+' + ffNumber + '%)?)$'),
+    unicodeRange: /^U\+(?:[0-9a-f]{1,6}(?:-[0-9a-f]{1,6})?|[0-9a-f?]{1,6})(?:\s*,\s*U\+(?:[0-9a-f]{1,6}(?:-[0-9a-f]{1,6})?|[0-9a-f?]{1,6}))*$/i,
+    variant: /^[a-z0-9\-\s(),"']+$/i, featureSettings: /^(?:normal|"[^"]{4}"(?:\s+(?:on|off|\d+))?(?:\s*,\s*"[^"]{4}"(?:\s+(?:on|off|\d+))?)*)$/,
+    variationSettings: /^(?:normal|"[^"]{4}"\s+[-+]?[\d.]+(?:\s*,\s*"[^"]{4}"\s+[-+]?[\d.]+)*)$/, display: /^(?:auto|block|swap|fallback|optional)$/,
+    ascentOverride: new RegExp('^(?:normal|' + ffNumber + '%)$'), descentOverride: new RegExp('^(?:normal|' + ffNumber + '%)$'), lineGapOverride: new RegExp('^(?:normal|' + ffNumber + '%)$')
+  };
+  var ffRanges = function (text) {
+    var out = [];
+    String(text).split(',').forEach(function (part) {
+      var m = /^U\+([0-9a-f?]+)(?:-([0-9a-f]+))?$/i.exec(part.trim()); if (!m) return;
+      if (m[1].indexOf('?') >= 0) out.push([parseInt(m[1].replace(/\?/g, '0'), 16), parseInt(m[1].replace(/\?/g, 'f'), 16)]);
+      else out.push([parseInt(m[1], 16), m[2] ? parseInt(m[2], 16) : parseInt(m[1], 16)]);
+    });
+    return out;
+  };
+  var ffCovers = function (face, text) {
+    var ranges = ffRanges(face.unicodeRange);
+    for (var ch of String(text)) { var cp = ch.codePointAt(0), hit = false; for (var i = 0; i < ranges.length; i++) if (cp >= ranges[i][0] && cp <= ranges[i][1]) { hit = true; break; } if (!hit) return false; }
+    return true;
+  };
+  var ffSetDescriptor = function (face, name, value) {
+    var v = String(value).trim();
+    if (!FF_VALID[name].test(v)) throw ffDom("Failed to set '" + name + "' on 'FontFace': '" + v + "' is not a valid value.", 'SyntaxError');
+    face.__d[name] = v;
+  };
+  var ffSplitSources = function (text) {
+    var out = [], depth = 0, quote = '', cur = '';
+    for (var i = 0; i < text.length; i++) {
+      var c = text[i];
+      if (quote) { if (c === quote) quote = ''; cur += c; continue; }
+      if (c === '"' || c === "'") quote = c; else if (c === '(') depth++; else if (c === ')') depth--;
+      if (c === ',' && depth === 0) { out.push(cur.trim()); cur = ''; } else cur += c;
+    }
+    out.push(cur.trim()); return out;
+  };
+  var ffParseSource = function (text) {
+    var parts = ffSplitSources(String(text)), out = [];
+    for (var i = 0; i < parts.length; i++) {
+      var m = /^(url|local)\(\s*(?:"([^"]*)"|'([^']*)'|([^)\s]*))\s*\)(?:\s+format\(\s*(?:"[^"]*"|'[^']*'|[^)]*)\))?(?:\s+tech\([^)]*\))?$/i.exec(parts[i]);
+      if (!m) return null;
+      out.push({ kind: m[1].toLowerCase(), value: m[2] !== undefined ? m[2] : m[3] !== undefined ? m[3] : m[4] });
+    }
+    return out;
+  };
+  var ffLooksLikeFont = function (bytes) {
+    if (bytes.length < 4) return false;
+    var tag = String.fromCharCode(bytes[0], bytes[1], bytes[2], bytes[3]);
+    return tag === 'OTTO' || tag === 'true' || tag === 'wOFF' || tag === 'wOF2' || tag === 'ttcf' || tag === 'typ1' || (bytes[0] === 0 && bytes[1] === 1 && bytes[2] === 0 && bytes[3] === 0);
+  };
+  var ffInit = function (face, family, source, descriptors) {
+    var d = {}; FF_DESCRIPTORS.forEach(function (n) { d[n] = FF_DEFAULTS[n]; });
+    hide(face, '__d', d); hide(face, '__family', String(family)); hide(face, '__status', 'unloaded'); hide(face, '__sets', []); hide(face, '__src', null); hide(face, '__bytes', null); hide(face, '__error', null);
+    var resolve, reject, p = new Promise(function (a, b) { resolve = a; reject = b; }); p.catch(function () {});
+    hide(face, '__loaded', p); hide(face, '__resolve', resolve); hide(face, '__reject', reject);
+    var failure = null;
+    if (!/^\s*(?:"[^"]*"|'[^']*'|[^\s"']+(?:\s+[^\s"']+)*)\s*$/.test(String(family))) failure = 'The family name is not valid.';
+    if (!failure) {
+      try { Object.keys(descriptors || {}).forEach(function (n) { if (FF_DESCRIPTORS.indexOf(n) >= 0) ffSetDescriptor(face, n, descriptors[n]); }); } catch (e) { failure = e.message; }
+    }
+    if (!failure) {
+      if (typeof source === 'string') { var list = ffParseSource(source); if (!list) failure = 'The source is not valid.'; else face.__src = list; }
+      else if (source instanceof ArrayBuffer) face.__bytes = new Uint8Array(source.slice(0));
+      else if (ArrayBuffer.isView(source)) face.__bytes = new Uint8Array(source.buffer.slice(source.byteOffset, source.byteOffset + source.byteLength));
+      else failure = 'The source is not valid.';
+    }
+    if (failure) ffFail(face, ffDom(failure, 'SyntaxError'), true);
+    else if (face.__bytes) { ffBegin(face); Promise.resolve().then(function () { if (ffLooksLikeFont(face.__bytes)) ffSucceed(face); else ffFail(face, ffDom('The font data could not be decoded.', 'SyntaxError')); }); }
+  };
+  var ffNotify = function (face, from, to) { face.__sets.slice().forEach(function (s) { ffSetChanged(s, face, from, to); }); };
+  var ffBegin = function (face) { var was = face.__status; face.__status = 'loading'; ffNotify(face, was, 'loading'); };
+  var ffSucceed = function (face) { var was = face.__status; face.__status = 'loaded'; face.__resolve(face); ffNotify(face, was, 'loaded'); };
+  var ffFail = function (face, error, quiet) { var was = face.__status; face.__status = 'error'; face.__error = error; face.__reject(error); if (!quiet) ffNotify(face, was, 'error'); };
+  function FontFace(family, source, descriptors) {
+    if (!(this instanceof FontFace)) throw new TypeError("Failed to construct 'FontFace': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+    if (arguments.length < 2) throw new TypeError("Failed to construct 'FontFace': 2 arguments required, but only " + arguments.length + ' present.');
+    ffInit(this, family, source, descriptors);
   }
+  Object.defineProperty(FontFace.prototype, 'family', { get: function () { return this.__family; }, set: function (v) { this.__family = String(v); }, enumerable: true, configurable: true });
+  FF_DESCRIPTORS.forEach(function (n) {
+    Object.defineProperty(FontFace.prototype, n, { get: function () { return this.__d[n]; }, set: function (v) { ffSetDescriptor(this, n, v); }, enumerable: true, configurable: true });
+  });
+  Object.defineProperty(FontFace.prototype, 'status', { get: function () { return this.__status; }, enumerable: true, configurable: true });
+  Object.defineProperty(FontFace.prototype, 'loaded', { get: function () { return this.__loaded; }, enumerable: true, configurable: true });
+  method(FontFace.prototype, 'load', function () {
+    var face = this;
+    if (face.__status === 'unloaded') {
+      ffBegin(face);
+      var sources = (face.__src || []).filter(function (s) { return s.kind === 'url' || s.kind === 'local'; }), index = 0;
+      var attempt = function () {
+        if (index >= sources.length) { ffFail(face, ffDom('A network error occurred.', 'NetworkError')); return; }
+        var s = sources[index++];
+        if (s.kind === 'local') { ffSucceed(face); return; }
+        if (typeof g.fetch !== 'function') { attempt(); return; }
+        g.fetch(new URL(s.value, document.baseURI).href).then(function (r) { if (!r.ok) throw 0; return r.arrayBuffer(); }).then(function (buf) {
+          var bytes = new Uint8Array(buf);
+          if (!ffLooksLikeFont(bytes)) { ffFail(face, ffDom('The font data could not be decoded.', 'SyntaxError')); return; }
+          face.__bytes = bytes; ffSucceed(face);
+        }, function () { attempt(); });
+      };
+      Promise.resolve().then(attempt);
+    }
+    return face.__loaded;
+  });
+  Object.defineProperty(FontFace.prototype, Symbol.toStringTag, { value: 'FontFace', configurable: true });
+
+  function FontFaceSetLoadEvent(type, init) {
+    if (arguments.length < 1) throw new TypeError("Failed to construct 'FontFaceSetLoadEvent': 1 argument required, but only 0 present.");
+    var event = new Event(type, init);
+    Object.setPrototypeOf(event, FontFaceSetLoadEvent.prototype);
+    var faces = init && init.fontfaces !== undefined ? Array.prototype.slice.call(init.fontfaces) : [];
+    Object.defineProperty(event, 'fontfaces', { value: Object.freeze(faces), enumerable: true });
+    return event;
+  }
+  FontFaceSetLoadEvent.prototype = Object.create(Event.prototype);
+  method(FontFaceSetLoadEvent.prototype, 'constructor', FontFaceSetLoadEvent);
+
+  // The CSS font shorthand, reduced to what matching needs: the families and the text of the rest.
+  var ffParseFont = function (text, what) {
+    var bad = function () { return ffDom("Failed to execute '" + what + "' on 'FontFaceSet': Could not resolve '" + text + "' as a font.", 'SyntaxError'); };
+    var s = String(text).trim(); if (s === '') throw bad();
+    var m = /^((?:(?:normal|italic|oblique|small-caps|bold|bolder|lighter|\d+|(?:ultra|extra|semi)-(?:condensed|expanded)|condensed|expanded)\s+)*)((?:\d*\.?\d+(?:px|pt|em|rem|%|ex|ch|cm|mm|in|pc|vw|vh)|xx-small|x-small|small|medium|large|x-large|xx-large|smaller|larger))(?:\s*\/\s*[^\s,]+)?\s+(.+)$/i.exec(s);
+    if (!m) throw bad();
+    var families = ffSplitSources(m[3]).map(function (f) { var q = /^(["'])(.*)\1$/.exec(f); return q ? q[2] : f; });
+    if (families.some(function (f) { return f === ''; })) throw bad();
+    return { families: families.map(function (f) { return f.toLowerCase(); }), prefix: m[1] };
+  };
+  function FontFaceSet() { throw new TypeError('Illegal constructor'); }
+  FontFaceSet.prototype = Object.create(EventTarget.prototype);
+  method(FontFaceSet.prototype, 'constructor', FontFaceSet);
+  var ffNewSet = function () {
+    var set = Object.create(FontFaceSet.prototype);
+    hide(set, '__faces', []); hide(set, '__css', new Map()); hide(set, '__status', 'loaded'); hide(set, '__pending', []); hide(set, '__errors', []); hide(set, '__done', []);
+    hide(set, '__ready', Promise.resolve(set)); hide(set, '__readyResolve', null);
+    return set;
+  };
+  var ffCssFaces = function (set) {
+    var out = [], seen = new Set();
+    try {
+      var sheets = document.styleSheets;
+      var walk = function (rules, depth) {
+        if (!rules || depth > 4) return;
+        for (var i = 0; i < rules.length; i++) {
+          var r = rules[i];
+          if (r.type === 5) {
+            seen.add(r);
+            var face = set.__css.get(r);
+            if (!face) {
+              var st = r.style, family = st.getPropertyValue('font-family').replace(/^["']|["']$/g, ''), src = st.getPropertyValue('src'), desc = {};
+              FF_DESCRIPTORS.forEach(function (n) { var v = st.getPropertyValue(FF_CSSNAME[n]); if (v) desc[n] = v; });
+              face = new FontFace(family, src || 'local("")', desc); face.__sets.push(set); set.__css.set(r, face);
+            }
+            out.push(face);
+          } else if (r.cssRules && r.type !== 7) walk(r.cssRules, depth + 1);
+        }
+      };
+      for (var i = 0; i < sheets.length; i++) { try { walk(sheets[i].cssRules, 0); } catch (e) { } }
+    } catch (e) { }
+    set.__css.forEach(function (f, r) { if (!seen.has(r)) set.__css.delete(r); });
+    return out;
+  };
+  var ffAll = function (set) { return ffCssFaces(set).concat(set.__faces); };
+  var ffFire = function (set, type, faces) { set.dispatchEvent(new FontFaceSetLoadEvent(type, { fontfaces: faces })); };
+  var ffSetChanged = function (set, face, from, to) {
+    if (to === 'loading') {
+      if (set.__pending.indexOf(face) < 0) set.__pending.push(face);
+      if (set.__status !== 'loading') {
+        set.__status = 'loading'; set.__errors = []; set.__done = [];
+        set.__ready = new Promise(function (r) { set.__readyResolve = r; });
+        ffFire(set, 'loading', []);
+      }
+    } else if (to === 'loaded' || to === 'error') {
+      var i = set.__pending.indexOf(face); if (i < 0) return;
+      set.__pending.splice(i, 1); (to === 'loaded' ? set.__done : set.__errors).push(face);
+      if (!set.__pending.length) {
+        var okay = set.__done, bad = set.__errors; set.__status = 'loaded'; set.__done = []; set.__errors = [];
+        Promise.resolve().then(function () {
+          ffFire(set, 'loadingdone', okay); if (bad.length) ffFire(set, 'loadingerror', bad);
+          var r = set.__readyResolve; set.__readyResolve = null; if (r) r(set);
+        });
+      }
+    }
+  };
+  var ffMatch = function (set, font, text, what) {
+    var parsed = ffParseFont(font, what), t = text === undefined ? ' ' : String(text);
+    return ffAll(set).filter(function (f) { return parsed.families.indexOf(f.family.replace(/^["']|["']$/g, '').toLowerCase()) >= 0 && ffCovers(f, t); });
+  };
+  method(FontFaceSet.prototype, 'add', function (face) {
+    if (!(face instanceof FontFace)) throw new TypeError("Failed to execute 'add' on 'FontFaceSet': parameter 1 is not of type 'FontFace'.");
+    if (this.__faces.indexOf(face) >= 0) return this;
+    if (face.__status === 'error' && face.__error) throw ffDom("Failed to execute 'add' on 'FontFaceSet': Cannot add a FontFace that has failed to parse.", 'InvalidModificationError');
+    this.__faces.push(face); face.__sets.push(this);
+    if (face.__status === 'loading') ffSetChanged(this, face, 'unloaded', 'loading');
+    return this;
+  });
+  method(FontFaceSet.prototype, 'delete', function (face) {
+    var i = this.__faces.indexOf(face); if (i < 0) return false;
+    this.__faces.splice(i, 1); var j = face.__sets.indexOf(this); if (j >= 0) face.__sets.splice(j, 1); return true;
+  });
+  method(FontFaceSet.prototype, 'clear', function () { var set = this; this.__faces.slice().forEach(function (f) { set.delete(f); }); });
+  method(FontFaceSet.prototype, 'has', function (face) { return ffAll(this).indexOf(face) >= 0; });
+  method(FontFaceSet.prototype, 'forEach', function (cb, thisArg) {
+    if (typeof cb !== 'function') throw new TypeError("Failed to execute 'forEach' on 'FontFaceSet': The callback provided as parameter 1 is not a function.");
+    var set = this; ffAll(this).forEach(function (f) { cb.call(thisArg, f, f, set); });
+  });
+  method(FontFaceSet.prototype, 'values', function () { return ffAll(this)[Symbol.iterator](); });
+  method(FontFaceSet.prototype, 'keys', FontFaceSet.prototype.values);
+  method(FontFaceSet.prototype, 'entries', function () { return ffAll(this).map(function (f) { return [f, f]; })[Symbol.iterator](); });
+  Object.defineProperty(FontFaceSet.prototype, Symbol.iterator, { value: FontFaceSet.prototype.values, writable: true, configurable: true });
+  Object.defineProperty(FontFaceSet.prototype, 'size', { get: function () { return ffAll(this).length; }, enumerable: true, configurable: true });
+  Object.defineProperty(FontFaceSet.prototype, 'status', { get: function () { return this.__status; }, enumerable: true, configurable: true });
+  Object.defineProperty(FontFaceSet.prototype, 'ready', { get: function () { return this.__ready; }, enumerable: true, configurable: true });
+  method(FontFaceSet.prototype, 'load', function (font, text) {
+    try { var faces = ffMatch(this, font, text, 'load'); } catch (e) { return Promise.reject(e); }
+    return Promise.all(faces.map(function (f) { return f.load(); }));
+  });
+  method(FontFaceSet.prototype, 'check', function (font, text) {
+    var faces = ffMatch(this, font, text, 'check');
+    return faces.every(function (f) { return f.__status === 'loaded'; });
+  });
+  ['loading', 'loadingdone', 'loadingerror'].forEach(function (n) {
+    Object.defineProperty(FontFaceSet.prototype, 'on' + n, {
+      get: function () { return this['__on' + n] || null; },
+      set: function (v) {
+        var key = '__on' + n, old = this[key];
+        if (old && old.__wrap) this.removeEventListener(n, old.__wrap);
+        if (typeof v === 'function') { var w = function (e) { v.call(this, e); }; Object.defineProperty(this, key, { value: v, writable: true, configurable: true }); Object.defineProperty(v, '__wrap', { value: w, configurable: true, writable: true }); this.addEventListener(n, w); }
+        else Object.defineProperty(this, key, { value: null, writable: true, configurable: true });
+      }, enumerable: true, configurable: true
+    });
+  });
+  Object.defineProperty(FontFaceSet.prototype, Symbol.toStringTag, { value: 'FontFaceSet', configurable: true });
+  hide(g, 'FontFace', FontFace); hide(g, 'FontFaceSet', FontFaceSet); hide(g, 'FontFaceSetLoadEvent', FontFaceSetLoadEvent);
+  hide(doc, 'fonts', ffNewSet());
   if (doc.designMode === undefined) doc.designMode = 'off';
   if (doc.dir === undefined) doc.dir = '';
 
