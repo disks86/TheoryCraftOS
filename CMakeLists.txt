@@ -623,6 +623,7 @@ add_executable(BOOTX64
   src/Hardware/VideoCodec/AMD/AmdVcnFirmware.cpp
   src/Hardware/VideoCodec/AMD/AmdVcn1.cpp
   src/Hardware/VideoCodec/AMD/AmdUvd6.cpp
+  src/Hardware/VideoCodec/AMD/AmdGmc8Memory.cpp
   src/Hardware/VideoCodec/AMD/AmdRavenMemory.cpp
   src/Hardware/VideoCodec/AMD/AmdVcn1Ring.cpp
   src/Hardware/VideoCodec/AMD/AmdVcnAvcDecoder.cpp

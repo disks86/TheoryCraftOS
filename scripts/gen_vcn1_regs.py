@@ -5,7 +5,8 @@ source file uses, taken from AMD's own headers in the Linux kernel tree so none 
   gen_vcn1_regs.py [--vi] out.inc source.cpp header.h [header.h ...]
 
   --vi: the headers are the older (GFX8 / "VI") ones, whose registers have no *_BASE_IDX and whose indirect registers are named ix...; the output has no
-        base indexes. AmdUvd6.cpp:  uvd_6_0_d.h uvd_6_0_sh_mask.h oss_3_0_d.h oss_3_0_sh_mask.h
+        base indexes. AmdUvd6.cpp:  uvd_6_0_d.h uvd_6_0_sh_mask.h oss_3_0_d.h oss_3_0_sh_mask.h bif_5_0_d.h
+        AmdGmc8Memory.cpp:  gmc_8_1_d.h gmc_8_1_sh_mask.h bif_5_0_d.h
 
   AmdVcn1.cpp:         vcn_1_0_offset.h vcn_1_0_sh_mask.h
   AmdVcn1Ring.cpp:     vcn_1_0_offset.h vcn_1_0_sh_mask.h
