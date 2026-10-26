@@ -422,6 +422,7 @@ static void test_service_numbers_agree() {
       {"NtReceiveSocket", WindowsSyscallNumber::NtReceiveSocket},
       {"NtSocketControl", WindowsSyscallNumber::NtSocketControl},
       {"NtSelectSockets", WindowsSyscallNumber::NtSelectSockets},
+      {"NtCreateChangeNotification", WindowsSyscallNumber::NtCreateChangeNotification},
       {"NtSetInformationThread", WindowsSyscallNumber::NtSetInformationThread},
       {"NtSetInformationProcess", WindowsSyscallNumber::NtSetInformationProcess},
       {"NtGetCurrentProcessorNumber", WindowsSyscallNumber::NtGetCurrentProcessorNumber},

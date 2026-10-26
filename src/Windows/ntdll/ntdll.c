@@ -100,6 +100,7 @@ NT_SERVICE(NtSendSocket);
 NT_SERVICE(NtReceiveSocket);
 NT_SERVICE(NtSocketControl);
 NT_SERVICE(NtSelectSockets);
+NT_SERVICE(NtCreateChangeNotification);
 NT_SERVICE(NtQuerySystemInformation);
 NT_SERVICE(NtSetInformationThread);
 NT_SERVICE(NtSetInformationProcess);

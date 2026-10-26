@@ -156,6 +156,7 @@ like any other, as far as the mounted file system does), remote registries, and 
 | `NtReceiveSocket` | 93 |
 | `NtSocketControl` | 94 |
 | `NtSelectSockets` | 95 |
+| `NtCreateChangeNotification` | 96 |
 
 ## Sockets
 
@@ -170,6 +171,21 @@ status is mapped to its own WSA error (`WSAECONNREFUSED`, `WSAEWOULDBLOCK` and s
 `GetLastError`, matching the real one. Not done: IPv6, `getaddrinfo`/`gethostbyname` (no DNS from a Windows program yet, though the kernel's own network stack resolves
 names for itself), `WSAAsyncSelect`/`WSAEventSelect`, overlapped socket I/O, `SO_RCVTIMEO`/`SO_SNDTIMEO` and other `setsockopt` options, multicast, raw sockets, and a
 loopback interface (a program's own address is whichever one network interface it is bound to; nothing short-circuits traffic addressed back to that same address).
+
+## Directory change notifications
+
+`FindFirstChangeNotification`/`FindNextChangeNotification`/`FindCloseChangeNotification` are backed by a single new service, `NtCreateChangeNotification`, this OS's own
+(real Windows has none of its own either: both that family and `ReadDirectoryChangesW` go through `NtNotifyChangeDirectoryFile`, one IRP-based service that completes
+asynchronously - not a fit for a kernel with no real asynchronous I/O, so this is a smaller, synchronous design instead). A change notification handle is an ordinary
+`ObjectManager` object (kind `ChangeNotification`) that behaves exactly like a manual-reset event: `WaitForSingleObject`/`WaitForMultipleObjects` work on it unmodified,
+and `FindNextChangeNotification` is literally `NtResetEvent` on the same handle (it is not a separate service). It becomes signalled when a file or subdirectory is
+created, deleted, renamed, hard-linked or symbolically linked directly under the watched directory, or anywhere under it with `bWatchSubtree` true; the directory
+itself must exist when the handle is made. The `dwNotifyFilter` bits are accepted and kept but not matched against - any of those changes signals every watch of its
+directory, regardless of which `FILE_NOTIFY_CHANGE_*` bits were asked for (the same kind of permissive simplification as the registry's access checks). Only the RAM
+file system fires these (the one backing `C:\` in the demo and the primary image); a change made through FAT/Ext/NTFS/BeFS is invisible to a watcher, since those are
+not reachable from a Windows program's `C:\` anyway. Not done: `ReadDirectoryChangesW` itself (the buffered `FILE_NOTIFY_INFORMATION` form that reports *what* changed
+and its name, as opposed to just *that* something did), a file deleted via `FILE_DISPOSITION_INFORMATION`/delete-on-close firing at the point the handle actually
+closes (only `NtDeleteFile` and an overwriting `CreateFile` do), and watching anything outside the RAM file system.
 
 ## Exceptions and the machine
 
@@ -237,5 +253,5 @@ loopback interface (a program's own address is whichever one network interface i
   threads on every core. Reads and writes stop at the first page that is not committed (`ERROR_PARTIAL_COPY`, with the count); writes ignore page protection, as debuggers need.
   A remote thread's handle can be waited for, `GetExitCodeThread`, `GetThreadId`, `ResumeThread` (if created suspended) and `TerminateThread` work on it; other thread calls
   (contexts, priorities, APCs) do not. Code can be injected: write it into memory allocated with `VirtualAllocEx` and start a thread on it. There is no access check beyond having a handle.
-- **Not provided**: debugging APIs, mailslots, change notifications (`FindFirstChangeNotification`, `ReadDirectoryChangesW`), and the many exports of the real kernel32 and msvcrt that no program here has needed.
+- **Not provided**: debugging APIs, mailslots, `ReadDirectoryChangesW` (`FindFirstChangeNotification` is done - see "Directory change notifications"), and the many exports of the real kernel32 and msvcrt that no program here has needed.
   A call to an import that nothing provides stops the program with a message saying which one.

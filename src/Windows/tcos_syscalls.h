@@ -116,4 +116,5 @@
 #define NT_SERVICE_NtReceiveSocket 93
 #define NT_SERVICE_NtSocketControl 94
 #define NT_SERVICE_NtSelectSockets 95
+#define NT_SERVICE_NtCreateChangeNotification 96
 #endif

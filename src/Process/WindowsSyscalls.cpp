@@ -223,6 +223,7 @@ class WindowsSyscalls final : public ISyscallInterface {
       case WindowsSyscallNumber::NtReceiveSocket: return windowsabi::nt_receive_socket(process, r);
       case WindowsSyscallNumber::NtSocketControl: return windowsabi::nt_socket_control(process, r);
       case WindowsSyscallNumber::NtSelectSockets: return windowsabi::nt_select_sockets(process, r);
+      case WindowsSyscallNumber::NtCreateChangeNotification: return windowsabi::nt_create_change_notification(process, r);
       default: process.host().unhandled_syscall(SyscallAbi::Windows, r.number); return kStatusInvalidSystemService;
     }
   }
