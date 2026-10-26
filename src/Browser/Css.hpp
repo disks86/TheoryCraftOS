@@ -682,6 +682,8 @@ class StyleSheet {
   bool import_at(uint32_t index, ImportRule* out) const;
   uint32_t font_face_count() const { return static_cast<uint32_t>(font_faces_.count()); }
   bool font_face(uint32_t index, FontFace* out) const;
+  // Does any rule declare a transition or an animation (or is there an @keyframes)?
+  bool uses_motion() const;
   uint32_t keyframes_count() const { return static_cast<uint32_t>(keyframes_.count()); }
   StringView keyframes_name(uint32_t rule) const;
   bool find_keyframes(StringView name, uint32_t* rule) const;   // the last @keyframes of that name

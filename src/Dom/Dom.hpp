@@ -124,7 +124,21 @@ class Document {
 
   // Changes through the functions below bump this.
   uint64_t version() const { return version_; }
-  void touch() { ++version_; }
+  void touch() {
+    ++version_;
+    if (change_hook_) change_hook_(change_context_);
+  }
+  // A change that running animations made to the style (they do not count as a change of the page for what starts new animations and transitions).
+  void touch_animated() {
+    ++version_;
+    ++animation_touches_;
+  }
+  uint64_t style_version() const { return version_ - animation_touches_; }
+  // Called by touch(): the page changed (a script sees it as "the style may have changed").
+  void set_change_hook(void (*hook)(void*), void* context) {
+    change_hook_ = hook;
+    change_context_ = context;
+  }
 
   // While recording, every change to the tree is also written to a log (at most kMaxLog entries; later ones are lost). `hook` is called when the log goes
   // from empty to not empty. take_log() moves the log out.
@@ -159,6 +173,9 @@ class Document {
   Node* root_ = nullptr;
   List<Node*> nodes_;
   uint64_t version_ = 1;
+  uint64_t animation_touches_ = 0;
+  void (*change_hook_)(void*) = nullptr;
+  void* change_context_ = nullptr;
   List<Mutation> log_;
   List<Node*> watched_;
   bool recording_ = false;

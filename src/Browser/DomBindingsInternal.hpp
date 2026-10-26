@@ -71,6 +71,7 @@ struct DomBindings::Impl {
                    *storage_proto = nullptr, *location_proto = nullptr, *history_proto = nullptr, *media_query_proto = nullptr, *exception_proto = nullptr,
                    *canvas_context_proto = nullptr, *gradient_proto = nullptr, *pattern_proto = nullptr, *path2d_proto = nullptr, *typed_array_proto = nullptr,
                    *image_data_proto = nullptr, *text_metrics_proto = nullptr, *thenable_proto = nullptr, *time_ranges_proto = nullptr, *media_error_proto = nullptr, *shadow_root_proto = nullptr;
+  bool style_dirty = false;                   // the page changed since a script was last told (see style_change_hook)
   script::JsObject *svg_proto = nullptr, *svg_tag_protos = nullptr;   // SVGElement.prototype, and local name -> the prototype of its interface (SVGRectElement.prototype ...)
   script::JsObject* tag_protos = nullptr;     // tag name -> the prototype of its interface (HTMLInputElement.prototype ...)
   script::JsObject* wrappers = nullptr;       // every wrapper made (kept alive)
