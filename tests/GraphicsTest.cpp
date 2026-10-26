@@ -1462,9 +1462,154 @@ static void test_stencil() {
   CHECK(t.s.device.create_image(bad) == nullptr);
 }
 
+// --- Mipmaps ---------------------------------------------------------------------
+
+// A level's colour: every level of the test textures is one solid colour, so what a lookup read shows which level (or which two) it came from.
+static uint32_t level_color(uint32_t level) { return 0xFF000000u | ((20 + level * 30) << 16) | ((200 - level * 20) << 8) | 0x40; }
+
+static IImage* mip_texture(TextureScene& t, uint32_t w, uint32_t h, uint32_t levels) {
+  IImage* image = t.device.create_image({{w, h}, Format::B8G8R8A8Unorm, kImageSampled, false, levels});
+  if (!image) return nullptr;
+  for (uint32_t level = 0; level < levels; ++level) {
+    const uint32_t lw = mip_extent(w, level), lh = mip_extent(h, level);
+    uint32_t* pixels = static_cast<uint32_t*>(__builtin_alloca(uint64_t{lw} * lh * 4));
+    for (uint32_t i = 0; i < lw * lh; ++i) pixels[i] = level_color(level);
+    if (!image->write_mip_pixels(level, ArrayView<const uint32_t>(pixels, uint64_t{lw} * lh))) return nullptr;
+  }
+  return image;
+}
+
+static bool near_color(uint32_t a, uint32_t b, int tolerance) {
+  for (int shift = 0; shift < 32; shift += 8) {
+    const int d = static_cast<int>((a >> shift) & 0xFF) - static_cast<int>((b >> shift) & 0xFF);
+    if (d > tolerance || d < -tolerance) return false;
+  }
+  return true;
+}
+
+static void test_mipmaps() {
+  // The shared helpers: level sizes, how many levels fit, the box filter, the logarithm.
+  CHECK(mip_extent(64, 0) == 64 && mip_extent(64, 3) == 8 && mip_extent(64, 6) == 1 && mip_extent(64, 9) == 1 && mip_extent(5, 1) == 2 && mip_extent(3, 1) == 1);
+  CHECK(mip_level_limit({64, 64}) == 7 && mip_level_limit({5, 3}) == 3 && mip_level_limit({1, 1}) == 1 && mip_level_limit({1, 16}) == 5 && mip_level_limit({4096, 4096}) == 13);
+  {
+    const uint32_t src[4] = {0xFF000000u, 0xFF0000FFu, 0xFF00FF00u, 0x00FF0000u};   // per channel: (a: ff ff ff 00) (r: 0 0 0 ff) (g: 0 0 ff 0) (b: 0 ff 0 0)
+    uint32_t dst = 0;
+    mip_box_downsample(ArrayView<const uint32_t>(src, 4), 2, 2, ArrayView<uint32_t>(&dst, 1), 1, 1);
+    CHECK(dst == 0xBF404040u);   // alpha (3 * 255 + 2) / 4 = 191; each colour (255 + 2) / 4 = 64
+    // An odd source repeats its last column and row.
+    const uint32_t odd[3] = {0xFF000000u, 0xFFFFFFFFu, 0xFF000000u};   // 3 x 1: the pair (0, 1) averaged, then (2, 2)
+    uint32_t two[2] = {};
+    mip_box_downsample(ArrayView<const uint32_t>(odd, 3), 3, 1, ArrayView<uint32_t>(two, 2), 1, 1);
+    CHECK(two[0] == 0xFF808080u);
+  }
+  CHECK(mip_log2(1.0f) < 0.001f && mip_log2(1.0f) > -0.001f && mip_log2(8.0f) > 2.999f && mip_log2(8.0f) < 3.001f && mip_log2(0.25f) < -1.999f && mip_log2(0.25f) > -2.001f);
+  CHECK(mip_log2(3.0f) > 1.5848f && mip_log2(3.0f) < 1.5852f && mip_log2(0.0f) < -50.0f && mip_log2(-1.0f) < -50.0f);
+
+  TextureScene t;
+  CHECK(t.pipeline);
+  // What an image may be made with: levels up to what the extent has, a sampled colour image.
+  CHECK(!t.device.create_image({{64, 64}, Format::B8G8R8A8Unorm, kImageSampled, false, 0}));
+  CHECK(!t.device.create_image({{64, 64}, Format::B8G8R8A8Unorm, kImageSampled, false, 8}));
+  CHECK(!t.device.create_image({{64, 64}, Format::B8G8R8A8Unorm, kImageColorAttachment, false, 2}));
+  CHECK(!t.device.create_image({{64, 64}, Format::D32Float, kImageDepthAttachment | kImageSampled, false, 2}));
+  IImage* tex = mip_texture(t, 64, 64, 7);
+  CHECK(tex && tex->mip_levels() == 7);
+  CHECK(!tex->write_mip_pixels(7, ArrayView<const uint32_t>(nullptr, 0)));
+  uint32_t one = 0;
+  CHECK(!tex->write_mip_pixels(6, ArrayView<const uint32_t>(&one, 0)) && tex->write_mip_pixels(6, ArrayView<const uint32_t>(&one, 1)));
+  CHECK(!tex->write_pixels(ArrayView<const uint32_t>(&one, 1)));   // (level 0 is 64 x 64)
+  one = level_color(6);
+  CHECK(tex->write_mip_pixels(6, ArrayView<const uint32_t>(&one, 1)));
+
+  // 1:1 (64 texels over 64 pixels): lambda 0, the base level, whatever the mip filter says.
+  SamplerDesc nearest_mips, linear_mips, none;
+  nearest_mips.mip_filter = MipFilter::Nearest;
+  linear_mips.mip_filter = MipFilter::Linear;
+  t.quad(0, 0, 1, 1);
+  CHECK(t.draw(tex, nearest_mips) && t.color->read_pixels(t.out) && at(t.out, 64, 10, 10) == level_color(0) && at(t.out, 64, 50, 40) == level_color(0));
+  // Minified 2x (coordinates 0..2 over the quad: 128 texels over 64 pixels): lambda 1. Nearest: level 1. Linear: level 1 exactly (a whole level, no fraction). None: level 0.
+  t.quad(0, 0, 2, 2);
+  CHECK(t.draw(tex, nearest_mips) && t.color->read_pixels(t.out) && at(t.out, 64, 10, 10) == level_color(1) && at(t.out, 64, 33, 20) == level_color(1));
+  CHECK(t.draw(tex, linear_mips) && t.color->read_pixels(t.out) && near_color(at(t.out, 64, 10, 10), level_color(1), 1));
+  CHECK(t.draw(tex, none) && t.color->read_pixels(t.out) && at(t.out, 64, 10, 10) == level_color(0));
+  // 4x: level 2; 8x: level 3; far beyond the last level: the last level (1 x 1).
+  t.quad(0, 0, 4, 4);
+  CHECK(t.draw(tex, nearest_mips) && t.color->read_pixels(t.out) && at(t.out, 64, 5, 5) == level_color(2));
+  t.quad(0, 0, 8, 8);
+  CHECK(t.draw(tex, nearest_mips) && t.color->read_pixels(t.out) && at(t.out, 64, 5, 5) == level_color(3));
+  t.quad(0, 0, 500, 500);
+  CHECK(t.draw(tex, nearest_mips) && t.color->read_pixels(t.out) && at(t.out, 64, 5, 5) == level_color(6) && at(t.out, 64, 60, 60) == level_color(6));
+  // 3x (lambda 1.585): nearest takes level 2 (floor(2.085)); linear blends level 1 and 2 by 0.585.
+  t.quad(0, 0, 3, 3);
+  CHECK(t.draw(tex, nearest_mips) && t.color->read_pixels(t.out) && at(t.out, 64, 5, 5) == level_color(2));
+  CHECK(t.draw(tex, linear_mips) && t.color->read_pixels(t.out));
+  {
+    const uint32_t c1 = level_color(1), c2 = level_color(2);
+    uint32_t want = 0xFF000000u;
+    for (int shift = 0; shift < 24; shift += 8) {
+      const float a = static_cast<float>((c1 >> shift) & 0xFF), b = static_cast<float>((c2 >> shift) & 0xFF);
+      want |= static_cast<uint32_t>(a + (b - a) * 0.585f + 0.5f) << shift;
+    }
+    CHECK(near_color(at(t.out, 64, 5, 5), want, 2) && near_color(at(t.out, 64, 40, 50), want, 2));
+  }
+  // The bias adds to lambda: 2x with a bias of 1 is lambda 2. min_lod and max_lod clamp it, and clamping up turns a magnified lookup into a minified one.
+  SamplerDesc biased = nearest_mips;
+  biased.lod_bias = 1.0f;
+  t.quad(0, 0, 2, 2);
+  CHECK(t.draw(tex, biased) && t.color->read_pixels(t.out) && at(t.out, 64, 5, 5) == level_color(2));
+  SamplerDesc capped = nearest_mips;
+  capped.max_lod = 1.0f;
+  t.quad(0, 0, 8, 8);
+  CHECK(t.draw(tex, capped) && t.color->read_pixels(t.out) && at(t.out, 64, 5, 5) == level_color(1));
+  SamplerDesc floored = nearest_mips;
+  floored.min_lod = 3.0f;
+  t.quad(0, 0, 1, 1);
+  CHECK(t.draw(tex, floored) && t.color->read_pixels(t.out) && at(t.out, 64, 5, 5) == level_color(3));
+  // Magnified (a quarter of the texture over the quad): lambda below 0, level 0 with the filter.
+  t.quad(0, 0, 0.25f, 0.25f);
+  CHECK(t.draw(tex, nearest_mips) && t.color->read_pixels(t.out) && at(t.out, 64, 5, 5) == level_color(0));
+  // Anisotropy: stretched 4x along x only (u 0..4, v 0..1): rho is the longer vector, so lambda 2 for both axes.
+  t.quad(0, 0, 4, 1);
+  CHECK(t.draw(tex, nearest_mips) && t.color->read_pixels(t.out) && at(t.out, 64, 5, 5) == level_color(2));
+  t.device.destroy_image(tex);
+
+  // generate_mipmaps: a 4 x 4 texture of alternating columns black and white: level 1 is grey (the pairs average), level 2 the average of that; read through min_lod = max_lod.
+  uint32_t stripes[16];
+  for (uint32_t i = 0; i < 16; ++i) stripes[i] = (i % 2) ? 0xFFFFFFFFu : 0xFF000000u;
+  IImage* g = t.device.create_image({{4, 4}, Format::B8G8R8A8Unorm, kImageSampled, false, 3});
+  CHECK(g && g->write_pixels(ArrayView<const uint32_t>(stripes, 16)) && g->generate_mipmaps());
+  SamplerDesc only1 = nearest_mips;
+  only1.min_lod = only1.max_lod = 1.0f;
+  t.quad(0, 0, 1, 1);
+  CHECK(t.draw(g, only1) && t.color->read_pixels(t.out) && at(t.out, 64, 5, 5) == 0xFF808080u && at(t.out, 64, 60, 60) == 0xFF808080u);
+  SamplerDesc only2 = only1;
+  only2.min_lod = only2.max_lod = 2.0f;
+  CHECK(t.draw(g, only2) && t.color->read_pixels(t.out) && at(t.out, 64, 5, 5) == 0xFF808080u);
+  // The base level is untouched by generate_mipmaps, and a one-level image cannot generate.
+  CHECK(t.draw(g, SamplerDesc()) && t.color->read_pixels(t.out) && at(t.out, 64, 5, 5) == 0xFF000000u && at(t.out, 64, 20, 5) == 0xFFFFFFFFu);
+  t.device.destroy_image(g);
+  IImage* flat = t.texture(2, 2, stripes);
+  CHECK(flat && flat->mip_levels() == 1 && !flat->generate_mipmaps());
+  t.device.destroy_image(flat);
+  // Sizes that are not powers of two: 5 x 3 has levels 5 x 3, 2 x 1 and 1 x 1; a level is written with its own pixel count.
+  IImage* odd = t.device.create_image({{5, 3}, Format::B8G8R8A8Unorm, kImageSampled, false, 3});
+  CHECK(odd && !t.device.create_image({{5, 3}, Format::B8G8R8A8Unorm, kImageSampled, false, 4}));
+  uint32_t lvl[15] = {};
+  CHECK(odd->write_mip_pixels(0, ArrayView<const uint32_t>(lvl, 15)) && odd->write_mip_pixels(1, ArrayView<const uint32_t>(lvl, 2)) && odd->write_mip_pixels(2, ArrayView<const uint32_t>(lvl, 1)));
+  CHECK(!odd->write_mip_pixels(1, ArrayView<const uint32_t>(lvl, 3)) && !odd->write_mip_pixels(2, ArrayView<const uint32_t>(lvl, 2)));
+  t.device.destroy_image(odd);
+  // A different byte order stores the same colours.
+  IImage* rgba = t.device.create_image({{4, 4}, Format::R8G8B8A8Unorm, kImageSampled, false, 3});
+  CHECK(rgba && rgba->write_pixels(ArrayView<const uint32_t>(stripes, 16)) && rgba->generate_mipmaps());
+  t.quad(0, 0, 1, 1);
+  CHECK(t.draw(rgba, only1) && t.color->read_pixels(t.out) && at(t.out, 64, 5, 5) == 0xFF808080u);
+  t.device.destroy_image(rgba);
+}
+
 int main() {
   test_stencil();
   test_textures();
+  test_mipmaps();
   test_math();
   test_2d();
   test_3d();

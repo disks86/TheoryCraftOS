@@ -339,6 +339,7 @@ void V3dGraphicsDevice::destroy_buffer(IBuffer* buffer) { destroy(allocator_, st
 
 IImage* V3dGraphicsDevice::create_image(const ImageDesc& desc) {
   if (desc.stencil) return nullptr;   // (no stencil plane on this device)
+  if (desc.mip_levels != 1) return nullptr;   // (no mipmaps either)
   V3dImage* image = make<V3dImage>(allocator_, memory_, desc);
   if (image && !image->valid()) {
     destroy(allocator_, image);
