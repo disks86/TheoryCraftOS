@@ -103,6 +103,7 @@ void SystemVideoCodecs::add_amd_uvd6(const PciDeviceInfo& d) {
   UniquePointer<AmdUvd6VideoEngine> device = UniquePointer<AmdUvd6VideoEngine>::make(allocator_, allocator_, d.device_id);
   if (!device) return;
   device->set_pci_address(d.address);
+  device->enable_encode(amd_vce3_);
   uint64_t aperture = 0;
   const uint64_t base = pci_.memory_bar(d.address, 0);
   if (mmio_ && bar_sizer_ && (pci_.read32(d.address, kPciCommand) & kMemorySpace) && base != 0 && bar_sizer_->bar_size(d.address, 0, &aperture)) {
