@@ -63,4 +63,6 @@ AmdSmu7::Result AmdSmu7::uvd_power(bool on, bool dynamic_power_gating) {
   return on ? send_with_parameter(kMsgUvdPowerOn, dynamic_power_gating ? 1 : 0) : send(kMsgUvdPowerOff);
 }
 
+AmdSmu7::Result AmdSmu7::vce_power(bool on) { return send(on ? kMsgVcePowerOn : kMsgVcePowerOff); }
+
 }  // namespace hardware

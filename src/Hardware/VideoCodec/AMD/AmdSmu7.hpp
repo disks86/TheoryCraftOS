@@ -41,6 +41,7 @@ class AmdSmu7 {
     Failed,         // any other result word
   };
   static constexpr uint16_t kMsgUvdPowerOff = 0x60, kMsgUvdPowerOn = 0x61;   // PPSMC_MSG_UVDPowerOFF / ON
+  static constexpr uint16_t kMsgVcePowerOff = 0x10e, kMsgVcePowerOn = 0x10f;   // PPSMC_MSG_VCEPowerOFF / ON (no argument)
   static constexpr uint16_t kResultOk = 0x01, kResultUnknownCommand = 0xFE;
   static constexpr uint32_t kDefaultTimeoutUs = 100000;                        // adev->usec_timeout
 
@@ -52,6 +53,8 @@ class AmdSmu7 {
   Result send_with_parameter(uint16_t message, uint32_t argument, uint32_t* response = nullptr, uint32_t timeout_us = kDefaultTimeoutUs);
   // smu7_powerup_uvd / smu7_powerdown_uvd. `dynamic_power_gating` is the platform capability the driver passes as the argument of the power-on message.
   Result uvd_power(bool on, bool dynamic_power_gating = false);
+  // smu7_powerup_vce / smu7_powerdown_vce: the same for the Video Coding Engine.
+  Result vce_power(bool on);
 
  private:
   // Waits until the result register is not zero (the SMC has finished what it was doing); false on timeout. A register that reads all ones is not an SMC.
