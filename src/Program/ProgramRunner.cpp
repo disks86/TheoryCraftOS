@@ -23,7 +23,6 @@
 #include "Process/ProcessFiles.hpp"
 #include "Process/UserProgram.hpp"
 #include "Utility/ByteBuffer.hpp"
-#include "Windows/BuiltinLibraries.hpp"
 
 #if defined(__x86_64__)
 #include "Kernel/UserMode.hpp"
@@ -151,9 +150,7 @@ RunResult run_program(const ProgramRun& run, uint32_t* exit_code, String* messag
   process::UserProgram program(allocator, id, host);
   program.address_space().set_reserved(kernel::usermode::reserved_ranges());
   program.set_file_system(run.files);
-  windows::BuiltinLibraries builtin;      // ntdll.dll and kernel32.dll; further DLLs come from C:\Windows\System32
-  process::FileLibraryProvider on_disk(allocator, run.files);
-  process::ChainedLibraryProvider libraries(&builtin, &on_disk);
+  process::FileLibraryProvider libraries(allocator, run.files);      // every DLL, ntdll.dll and kernel32.dll included, comes from C:\Windows\System32
   if (abi == process::SyscallAbi::Windows) program.set_library_provider(&libraries);
   String directory(allocator);
   if (process::world_directory(abi, run.working_directory, &directory)) program.set_working_directory(directory.view());

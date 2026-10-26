@@ -13,7 +13,7 @@ named in [`src/FileSystem/SystemLayout.hpp`](../src/FileSystem/SystemLayout.hpp)
 | `/Desktop/Pictures` | Default location for image files. |
 | `/Desktop/Video` | Default location for video files. |
 | `/Desktop/Audio` | Default location for audio files such as music. |
-| `/Windows` | Root for Windows user-mode processes: they see its contents as `C:\`. |
+| `/Windows` | Root for Windows user-mode processes: they see its contents as `C:\`. `/Windows/Windows/System32` (`C:\Windows\System32`) holds the system libraries `ntdll.dll`, `kernel32.dll` and `msvcrt.dll`, which the loader reads from there (the kernel does not carry them); any other DLL or program put there is found the same way. |
 | `/Linux` | Root for Linux processes: they see its contents as `/`. |
 | `/AppStore` | Where applications keep the files they need. Each application has its own sub-folder, e.g. the browser's cache is `/AppStore/Browser/Cache`. |
 
@@ -41,3 +41,11 @@ Other volumes (USB sticks, network shares) are folders of `/` named by their lab
 With no primary partition (a machine with only the EFI partition, or no usable storage) the root is read-only and lists the volumes. On a
 machine with no storage at all the in-memory fallback volume `Memory` holds the same folders itself (`/Memory/Desktop/...`); its contents
 are lost at power-off.
+
+## The primary disk image
+
+The build makes `primary.img` (the `primary` target, part of the default build): a FAT32 volume that already holds the files an installed system has on its root volume, today the
+three libraries in `/Windows/Windows/System32`. `tools/PrimaryImage.cpp` fills it with the OS's own FAT driver (`scripts/make-primary-image.sh` creates the volume with `mkfs.fat`
+the first time). An existing image keeps its files, so the disk the OS writes to survives rebuilds; the build only puts the libraries on it again. The run targets and
+`scripts/qemu-debug.sh` attach it as the primary disk. The size is `TCOS_PRIMARY_IMAGE_SIZE` (256M). A system without this disk has no Windows libraries, and Windows programs
+that need them report that they cannot load them. The boot-time user-mode demo (`TCOS_USERMODE_DEMO`) has no disk and writes copies of the libraries into its RAM file system.
