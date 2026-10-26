@@ -67,6 +67,18 @@ constexpr const char kColoredFragmentTgsi[] =
     "  0: MOV OUT[0], IN[0]\n"
     "  1: END\n";
 
+// The textured pair: the vertex shader is the coloured one (the second attribute is a float2 texture coordinate, which arrives as (u, v, 0, 1)); the fragment shader
+// writes the texel of the sampler at that coordinate.
+constexpr const char kTexturedFragmentTgsi[] =
+    "FRAG\n"
+    "PROPERTY FS_COLOR0_WRITES_ALL_CBUFS 1\n"
+    "DCL IN[0], GENERIC[0], PERSPECTIVE\n"
+    "DCL OUT[0], COLOR\n"
+    "DCL SAMP[0]\n"
+    "DCL SVIEW[0], 2D, FLOAT\n"
+    "  0: TEX OUT[0], IN[0], SAMP[0], 2D\n"
+    "  1: END\n";
+
 // The same two shaders as Direct3D 9 bytecode (vs_2_0, ps_2_0). Position comes in as v0, color as v1; the matrix columns are c0..c3, and c31 is
 // the device's (1, -1, 1, 1) that turns Direct3D's +Y up into Vulkan's +Y down.
 constexpr uint32_t kColoredVertexD3d9[] = {
@@ -116,6 +128,7 @@ ShaderModuleDesc textured_vertex_shader() {
   ShaderModuleDesc d;
   d.stage = ShaderStage::Vertex;
   d.vertex_function = textured_vertex;
+  d.tgsi = kColoredVertexTgsi;
   d.eu_program = EuProgram::TexturedVertex;
   return d;
 }
@@ -124,6 +137,7 @@ ShaderModuleDesc textured_fragment_shader() {
   ShaderModuleDesc d;
   d.stage = ShaderStage::Fragment;
   d.textured_fragment_function = textured_fragment;
+  d.tgsi = kTexturedFragmentTgsi;
   d.eu_program = EuProgram::TexturedFragment;
   return d;
 }

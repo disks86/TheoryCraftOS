@@ -148,8 +148,8 @@ struct ShaderModuleDesc {
   ShaderStage stage = ShaderStage::Vertex;
   VertexShaderFn vertex_function = nullptr;      // used by the software device
   FragmentShaderFn fragment_function = nullptr;  // used by the software device
-  // A fragment shader that samples textures (instead of fragment_function; the pipeline then says how many in texture_count). Only the software device runs these so far: the other
-  // devices refuse a pipeline with textures.
+  // A fragment shader that samples textures (instead of fragment_function; the pipeline then says how many in texture_count). The software, Intel Gen9 and virgl devices run these: the
+  // others refuse a pipeline with textures.
   TexturedFragmentShaderFn textured_fragment_function = nullptr;
   // TGSI text for the GPU device. Inputs are the vertex attributes (vertex stage) or the
   // varyings as GENERIC[n] (fragment stage); push constants are CONST[0..7] (vec4 each).

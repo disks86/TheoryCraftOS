@@ -115,7 +115,10 @@ clock requests. Not run on a Vega M.
 (`GraphicsPipelineDesc::texture_count`) and its fragment shader is a `textured_fragment_function` (a shader is that or a plain `fragment_function`, never both). `BuiltinShaders` has the textured pair
 (`textured_vertex_shader`, `textured_fragment_shader`, `describe_textured_pipeline`: a float3 position, a float2 coordinate, the matrix in the push constants, texture unit 0).
 
-The software device and the Intel Gen9 device run textures. The other devices (V3d, VMware SVGA, virgl) refuse a pipeline with a texture count (`nullptr`) and fail a submit that binds a texture, so a caller falls back
+The software device, the Intel Gen9 device and the virgl device (QEMU's virtio-gpu) run textures. On virgl a texture is a host resource without the Y_0_TOP flag (so row 0 of `write_pixels` is the row v = 0 reads),
+filled through a guest backing and TRANSFER_TO_HOST_3D, with a sampler view per image and a sampler state per filter/address combination (made on first use, kept by the device); the built-in textured pair has TGSI
+(`TEX OUT[0], IN[0], SAMP[0], 2D`). virgl refuses an image that is both sampled and drawn into (the two are stored in opposite row order) and, as everywhere, a draw whose texture is unbound or is the render target.
+This is **not validated against a running virgl host**: the wire format follows virglrenderer's protocol, and the row order of a texture is the thing to look at first on a real QEMU. The other devices (V3d, VMware SVGA) refuse a pipeline with a texture count (`nullptr`) and fail a submit that binds a texture, so a caller falls back
 to the software device the same way it does for any pipeline they cannot take. Both devices refuse a draw whose texture is not bound, is the image being drawn into, or was not made for sampling. `tests/GraphicsTest.cpp`
 covers nearest and linear filtering, both address modes, both byte orders, alpha and blending, perspective-correct coordinates (the test fails with affine interpolation) and every refusal.
 
