@@ -871,6 +871,7 @@ void Vm::collect() {
   mark_value(exception_);
   mark_value(last_result_);
   mark_value(iter_return_);
+  mark_value(extra_root_);
   mark_value(await_value_);
   mark(promise_proto_);
   mark(micro_);

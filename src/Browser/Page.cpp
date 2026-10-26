@@ -200,6 +200,11 @@ bool Page::start_engine() {
         env_.console(3, prelude_error.view());
       }
       prelude_error.clear();
+      if (!engine_->run_library(web_audio_prelude(), &prelude_error)) {
+        prelude_error.insert(0, "The Web Audio script failed: ");
+        env_.console(3, prelude_error.view());
+      }
+      prelude_error.clear();
       if (!engine_->run_library(svg_prelude(), &prelude_error)) {
         prelude_error.insert(0, "The SVG script failed: ");
         env_.console(3, prelude_error.view());

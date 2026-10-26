@@ -19,6 +19,7 @@
 // The network and text natives of the DOM bindings: URL (a host object over WebUrl), the requests behind fetch() and XMLHttpRequest (the page's JavaScript side is
 // in WebPrelude.cpp), and the helpers for bytes and UTF-8 text that Blob, TextEncoder, TextDecoder and URLSearchParams use.
 #include "Browser/DomBindingsInternal.hpp"
+#include "Media/AudioCodecs.hpp"
 #include "Media/Zlib.hpp"
 #include "Utility/Crc32.hpp"
 #include "Crypto/Crypto.hpp"
@@ -90,6 +91,26 @@ NATIVE(net_bytes_to_string) {
   }
   if (!byte_array_bytes(a, &bytes)) return vm.throw_error(ErrorKind::TypeError, "The provided value is not a byte array.");
   *result = Value::make_string(vm.new_binary_string(bytes));   // (bytes: scripts see every byte as a character 0..255)
+  return true;
+}
+
+// __decode_audio(bytes): the sound of a WAV, AIFF, AU, FLAC, Ogg Vorbis / Opus, MP3, AAC, MP4 or WebM file as { sampleRate, channels, frames, samples } where
+// samples is an Int16Array of the interleaved frames; null if the data is not a sound this browser can decode.
+NATIVE(net_decode_audio) {
+  String text(vm.allocator());
+  if (!arg_text(vm, arg_at(args, argc, 0), &text)) return false;
+  media::AudioData audio(vm.allocator());
+  if (!media::decode_audio(text.view().bytes(), &audio) || audio.empty()) {
+    *result = Value::make_null();
+    return true;
+  }
+  JsObject* o = vm.new_plain();
+  vm.define_named(o, "sampleRate", num_value(audio.format().sample_rate));
+  vm.define_named(o, "channels", num_value(audio.format().channels));
+  vm.define_named(o, "frames", num_value(static_cast<double>(audio.frame_count())));
+  const ConstByteView raw = audio.bytes();
+  vm.define_named(o, "samples", Value::make_object(script::new_typed_array(vm, script::ArrayKind::Int16, StringView(reinterpret_cast<const char*>(raw.data()), raw.size()))));
+  *result = Value::make_object(o);
   return true;
 }
 
@@ -775,6 +796,7 @@ bool install_net(DomBindings::Impl& c) {
   vm.define_native(g, "__utf8_clean", net_utf8_clean, 1);
   vm.define_native(g, "__bytes_to_string", net_bytes_to_string, 1);
   vm.define_native(g, "__text_bytes", net_text_bytes, 1);
+  vm.define_native(g, "__decode_audio", net_decode_audio, 1);
   vm.define_native(g, "__string_to_bytes", net_string_to_bytes, 1);
   vm.define_native(g, "__form_encode", net_form_encode, 1);
   vm.define_native(g, "__form_decode", net_form_decode, 1);

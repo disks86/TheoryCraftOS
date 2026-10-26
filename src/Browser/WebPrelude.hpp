@@ -37,6 +37,8 @@ const char* module_prelude();
 const char* finish_prelude();
 // The SVG DOM interfaces (SVGSVGElement, SVGRectElement, SVGLength ... getBBox(), getTotalLength()), written in JavaScript; run before finish_prelude().
 const char* svg_prelude();
+// The Web Audio API (AudioContext, OfflineAudioContext, AudioBuffer, AudioParam and the nodes), written in JavaScript; run before finish_prelude().
+const char* web_audio_prelude();
 // WebGLRenderingContext and WebGL2RenderingContext over the natives of DomBindingsGl.cpp. Run by a page's engine.
 const char* webgl_prelude();
 // navigator.gpu and the WebGPU interfaces over the natives of DomBindingsGpu.cpp. Run by a page's engine.
