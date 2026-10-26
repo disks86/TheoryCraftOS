@@ -122,6 +122,14 @@ This is **not validated against a running virgl host**: the wire format follows 
 to the software device the same way it does for any pipeline they cannot take. Both devices refuse a draw whose texture is not bound, is the image being drawn into, or was not made for sampling. `tests/GraphicsTest.cpp`
 covers nearest and linear filtering, both address modes, both byte orders, alpha and blending, perspective-correct coordinates (the test fails with affine interpolation) and every refusal.
 
+WebGL uses these textures through `webgl::IAccelerator` (`WebGl/Accelerator.hpp`): `create_texture`/`write_texture`/`destroy_texture` (RGBA8, first row first, no mipmaps), `AccelState::textures`/`samplers`
+(at most `kAccelMaxTextures` = 2) and a `textures` count on `create_program`. `TgsiTranslator` turns `texture2D`/`texture` of a `uniform sampler2D` in a fragment shader into `TEX ... SAMP[i], 2D`
+(`TgsiProgram::samplers` says which uniform slot holds each sampler's unit); vertex-shader lookups, explicit levels, cube/3D/array/shadow samplers and a third sampler still refuse. `GlContext::hw_texture`
+(`GlAccel.cpp`) takes a draw only when each sampled texture is a 2D RGBA8 (non-sRGB) texture up to 1024 x 1024 with level 0 as base, a NEAREST or LINEAR filter (the same for minification and
+magnification), and REPEAT or CLAMP_TO_EDGE wrap; the texels go to the device again when a hash of them changed. WebGPU does the same for `textureSample(texture_2d<f32>, sampler, uv)` in a fragment shader (`wgpu::Device::hw_texture`, `GpuAccel.cpp`): the bind group's view must be one mip level of a
+single-layer 2D RGBA8 (not sRGB) texture other than the pass's own colour attachment, and the sampler a non-comparison one with no anisotropy, the same nearest/linear filter both ways, and
+repeat or clamp addressing. Device copies are cached per texture and mip (`webgl::AccelTextureCache`) and freed with the texture. Not validated on a running virgl host.
+
 On the Gen9 device a textured draw is what `RenderBatch::textured_triangles` builds: the same job as the other triangle draws, but the pixel kernel is the intel-gpu-tools render copy kernel (it interpolates attribute 0's x and y
 as u and v and samples the surface bound after the target), the vertex's colour slot carries (u, v), the binding table has the target and the texture, and the sampler state selects nearest or linear filtering (bits 16:14 and
 19:17 of its first dword) and wrap or clamp per axis (the address control modes in the fourth). The CPU still transforms and clips the vertices, and clipping interpolates the coordinate like a colour, so the

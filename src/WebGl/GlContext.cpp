@@ -33,7 +33,7 @@ bool is_cube_face(uint32_t t) { return t >= 0x8515 && t <= 0x851A; }
 
 GlContext::GlContext(allocators::IAllocator& a, bool es3, uint32_t width, uint32_t height, const Attributes& attrs)
     : a_(a), es3_(es3), attrs_(attrs), width_(width), height_(height), buffers_(a), textures_(a), fbos_(a), rbos_(a), shaders_(a), programs_(a), vaos_(a), samplers_(a),
-      queries_(a), tfs_(a), def_color_(a), def_depth_(a) {
+      queries_(a), tfs_(a), def_color_(a), def_depth_(a), hw_textures_(a) {
   resize(width, height);
   vp_[0] = vp_[1] = 0;
   vp_[2] = static_cast<int32_t>(width_);
@@ -170,6 +170,7 @@ void GlContext::delete_object(uint32_t kind, uint32_t id) {
       break;
     case 't':
       if (id <= textures_.count()) {
+        hw_forget_texture(id);
         textures_[id - 1].reset();
         for (auto& u : units_) {
           if (u.tex2d == id) u.tex2d = 0;

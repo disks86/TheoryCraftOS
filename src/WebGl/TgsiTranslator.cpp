@@ -317,6 +317,7 @@ class Gen {
   bool pieces_to_vec(const Oper* comps, uint32_t count, uint32_t rows, Val* out);
   bool construct(const Node& n, Val* out);
   bool builtin(const Node& n, Val* out);
+  bool tex_call(const Node& n, Val* out);
   bool call_args(const Node& n, Val* args, uint32_t max, uint32_t* count);
 
   // --- statements
@@ -1230,8 +1231,59 @@ bool Gen::eval(int32_t id, Val* out) {
       return fail("a conversion the device cannot take");
     }
     case NodeKind::Builtin: return builtin(n, out);
+    case NodeKind::TexCall: return tex_call(n, out);
     default: return fail("an expression the device cannot take");
   }
+}
+
+// texture2D(sampler, coord) / texture(sampler, coord) in a fragment shader: a 2D float sampler uniform and a vec2 coordinate. The device has no mipmaps, so the
+// implicit level of detail does not matter (the context only takes the draw when the bound textures have none).
+bool Gen::tex_call(const Node& n, Val* out) {
+  if (!fs_) return fail("a texture lookup in a vertex shader");
+  const bool wgsl = n.flags == 1;
+  if (n.flags > 1 || n.op != static_cast<Op>(TexOp::Sample) || static_cast<uint64_t>(n.first) + 3 > m_.kids.count()) return fail("a texture lookup the device cannot take");
+  const int32_t sampler_id = m_.kids[static_cast<uint64_t>(n.first)], coord_id = m_.kids[static_cast<uint64_t>(n.first) + 2];
+  auto global_of = [&](int32_t id, const Global** out) {
+    if (id < 0 || m_.nodes[static_cast<uint64_t>(id)].kind != NodeKind::Global) return fail("a sampler that is not a global");
+    const int32_t gi = m_.nodes[static_cast<uint64_t>(id)].ival;
+    if (gi < 0 || static_cast<uint64_t>(gi) >= m_.globals.count()) return fail("bad global");
+    *out = m_.globals[static_cast<uint64_t>(gi)].get();
+    return true;
+  };
+  const Global* g = nullptr;
+  const Global* s = nullptr;   // WGSL: the sampler binding
+  if (!global_of(sampler_id, &g)) return false;
+  if (wgsl) {
+    // textureSample(texture, sampler, coords): both are bindings, whose handles the draw reads from the bound groups
+    if (!global_of(m_.kids[static_cast<uint64_t>(n.first) + 1], &s)) return false;
+    if (g->kind != GlobalKind::Handle || g->type.base != Base::Texture || g->type.array || g->type.dim != kDim2D || g->type.shadow || g->type.texel != Base::Float ||
+        s->kind != GlobalKind::Handle || s->type.base != Base::SamplerState || s->type.array)
+      return fail("a texture the device cannot take");
+  } else if (g->kind != GlobalKind::Uniform || g->type.base != Base::Sampler || g->type.array || g->type.dim != kDim2D || g->type.shadow || g->type.texel != Base::Float) {
+    return fail("a sampler the device cannot take");
+  }
+  TgsiProgram& p = *sh_.out;
+  const uint32_t sampler_slot = wgsl ? s->slot : 0;
+  uint32_t index = 0;
+  while (index < p.samplers.count() && !(p.samplers[index].slot == g->slot && p.samplers[index].sampler_slot == sampler_slot && p.samplers[index].wgsl == wgsl)) ++index;
+  if (index == p.samplers.count()) {
+    if (index >= kTgsiMaxSamplers) return fail("too many samplers");
+    if (!p.samplers.push_back(TgsiSampler{g->slot, sampler_slot, wgsl})) return fail("out of memory");
+  }
+  Val coord;
+  if (!eval(coord_id, &coord)) return false;
+  if (coord.is_int || coord.cols != 1 || coord.rows != 2) return fail("a texture coordinate that is not a vec2");
+  if (!new_val(4, 1, out)) return false;
+  begin_inst("TEX");
+  body.append(" TEMP[");
+  body.append_uint(out->c[0].idx);
+  body.append("].xyzw, ");
+  put_oper(coord.c[0]);
+  body.append(", SAMP[");
+  body.append_uint(index);
+  body.append("], 2D");
+  end_inst();
+  return true;
 }
 
 // --- statements ----------------------------------------------------------------------------------------------------------------------------------------------
@@ -1421,12 +1473,12 @@ bool Gen::run_entry() {
 
 bool Gen::run() {
   if (entry_ >= 0) {
-    if (m_.uses_derivatives || m_.uses_implicit_lod || m_.writes_frag_depth) return fail("derivatives, texture lookups or gl_FragDepth");
+    if (m_.uses_derivatives || m_.writes_frag_depth) return fail("derivatives or gl_FragDepth");
     return run_entry();
   }
   if (m_.main_function < 0 || static_cast<uint64_t>(m_.main_function) >= m_.functions.count()) return fail("no main function");
   const Function& f = *m_.functions[static_cast<uint64_t>(m_.main_function)];
-  if (m_.uses_derivatives || m_.uses_implicit_lod || m_.writes_frag_depth) return fail("derivatives, texture lookups or gl_FragDepth");
+  if (m_.uses_derivatives || m_.writes_frag_depth) return fail("derivatives or gl_FragDepth");
   for (uint32_t i = 0; i < f.locals; ++i)
     if (!locals_.push_back(Var())) return fail("out of memory");
   for (uint64_t i = 0; i < m_.globals.count(); ++i)
@@ -1497,7 +1549,7 @@ void write_header_decl(String& s, const char* kind, uint32_t count) {
   s.append("]\n");
 }
 
-bool assemble(String& out, const Gen& g, bool fragment, uint32_t attributes, uint32_t varyings, uint32_t const_rows) {
+bool assemble(String& out, const Gen& g, bool fragment, uint32_t attributes, uint32_t varyings, uint32_t const_rows, uint32_t samplers) {
   out.clear();
   if (fragment) {
     out.append("FRAG\nPROPERTY FS_COLOR0_WRITES_ALL_CBUFS 1\n");
@@ -1525,6 +1577,14 @@ bool assemble(String& out, const Gen& g, bool fragment, uint32_t attributes, uin
       out.append("]\n");
     }
   }
+  if (fragment)
+    for (uint32_t i = 0; i < samplers; ++i) {
+      out.append("DCL SAMP[");
+      out.append_uint(i);
+      out.append("]\nDCL SVIEW[");
+      out.append_uint(i);
+      out.append("], 2D, FLOAT\n");
+    }
   write_header_decl(out, "CONST", const_rows);
   write_header_decl(out, "TEMP", g.ntemp());
   for (uint64_t i = 0; i < g.imms().count(); ++i) {
@@ -1551,6 +1611,7 @@ bool translate_wgsl_to_tgsi(allocators::IAllocator& a, const Module& vs, int32_t
   out->fs.clear();
   out->constants.clear();
   out->attributes.clear();
+  out->samplers.clear();
   out->const_rows = 0;
   out->varyings = 0;
   Shared sh(out, ArrayView<const TgsiLink>());
@@ -1565,8 +1626,8 @@ bool translate_wgsl_to_tgsi(allocators::IAllocator& a, const Module& vs, int32_t
   }
   if (ok) {
     out->varyings = sh.var_count;
-    ok = assemble(out->vs, vg, false, static_cast<uint32_t>(out->attributes.count()), out->varyings, out->const_rows) &&
-         assemble(out->fs, fg, true, static_cast<uint32_t>(out->attributes.count()), out->varyings, out->const_rows);
+    ok = assemble(out->vs, vg, false, static_cast<uint32_t>(out->attributes.count()), out->varyings, out->const_rows, 0) &&
+         assemble(out->fs, fg, true, static_cast<uint32_t>(out->attributes.count()), out->varyings, out->const_rows, static_cast<uint32_t>(out->samplers.count()));
     if (!ok) sh.why = "out of memory";
   }
   if (why) *why = ok ? nullptr : (sh.why ? sh.why : "unsupported shader");
@@ -1579,6 +1640,7 @@ bool translate_to_tgsi(allocators::IAllocator& a, const Module& vs, const Module
   out->fs.clear();
   out->constants.clear();
   out->attributes.clear();
+  out->samplers.clear();
   out->const_rows = 0;
   out->varyings = 0;
   Shared sh(out, links);
@@ -1593,8 +1655,8 @@ bool translate_to_tgsi(allocators::IAllocator& a, const Module& vs, const Module
   }
   if (ok) {
     out->varyings = static_cast<uint32_t>(links.size());
-    ok = assemble(out->vs, vg, false, static_cast<uint32_t>(out->attributes.count()), out->varyings, out->const_rows) &&
-         assemble(out->fs, fg, true, static_cast<uint32_t>(out->attributes.count()), out->varyings, out->const_rows);
+    ok = assemble(out->vs, vg, false, static_cast<uint32_t>(out->attributes.count()), out->varyings, out->const_rows, 0) &&
+         assemble(out->fs, fg, true, static_cast<uint32_t>(out->attributes.count()), out->varyings, out->const_rows, static_cast<uint32_t>(out->samplers.count()));
     if (!ok) sh.why = "out of memory";
   }
   if (why) *why = ok ? nullptr : (sh.why ? sh.why : "unsupported shader");

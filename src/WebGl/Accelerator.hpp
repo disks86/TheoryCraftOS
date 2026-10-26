@@ -28,9 +28,18 @@
 // Calls come from whichever thread runs the page's script; an implementation serialises them.
 #pragma once
 #include <stdint.h>
+#include "Allocators/IAllocator.hpp"
+#include "ObjectContainer/List.hpp"
 #include "Utility/ArrayView.hpp"
 
 namespace webgl {
+
+// How a texture is read: nearest or linear filtering (there are no mipmaps), and for each axis wrap around or take the edge texel.
+struct AccelSampler {
+  bool linear = false;
+  bool repeat_s = true, repeat_t = true;
+};
+constexpr uint32_t kAccelMaxTextures = 2;
 
 struct AccelState {
   // Window coordinates as in GL: origin at the bottom left, rows counted from there (the device image is stored the same way, see GlAccel.cpp).
@@ -44,15 +53,35 @@ struct AccelState {
   bool depth_test = false;   // passes if closer or equal
   bool depth_write = false;
   bool blend = false;        // source alpha over one minus source alpha
+  // The textures the program samples, by sampler index (SAMP[i] of its TGSI): texture handles from create_texture() and how each is read. texture_count is what the
+  // program was created with.
+  uint32_t texture_count = 0;
+  uint32_t textures[kAccelMaxTextures] = {};
+  AccelSampler samplers[kAccelMaxTextures] = {};
 };
 
 class IAccelerator {
  public:
   virtual const char* name() const = 0;
 
-  // Compiles a TGSI vertex/fragment pair: `attributes` float4 inputs (IN[0..]), `varyings` float4 outputs. 0: the device cannot run it.
-  virtual uint32_t create_program(const char* vs_tgsi, const char* fs_tgsi, uint32_t attributes, uint32_t varyings) = 0;
+  // Compiles a TGSI vertex/fragment pair: `attributes` float4 inputs (IN[0..]), `varyings` float4 outputs, and `textures` 2D samplers (SAMP[0..] of the fragment
+  // shader, at most kAccelMaxTextures). 0: the device cannot run it.
+  virtual uint32_t create_program(const char* vs_tgsi, const char* fs_tgsi, uint32_t attributes, uint32_t varyings, uint32_t textures) = 0;
   virtual void destroy_program(uint32_t program) = 0;
+
+  // A texture of w x h texels (RGBA8, straight alpha, no mipmaps). 0: the device cannot have one (the default: programs with samplers are then refused).
+  virtual uint32_t create_texture(uint32_t w, uint32_t h) {
+    (void)w;
+    (void)h;
+    return 0;
+  }
+  virtual void destroy_texture(uint32_t texture) { (void)texture; }
+  // Replaces the contents: w * h * 4 bytes, R, G, B, A of each texel, the first row (t = 0) first.
+  virtual bool write_texture(uint32_t texture, ConstByteView rgba) {
+    (void)texture;
+    (void)rgba;
+    return false;
+  }
 
   // A render target of w x h pixels (RGBA8 color, float depth). 0 on failure.
   virtual uint32_t create_target(uint32_t w, uint32_t h) = 0;
@@ -66,6 +95,25 @@ class IAccelerator {
 
  protected:
   ~IAccelerator() = default;
+};
+
+// The device copies of the textures a context (or a WebGPU device) sampled. A texture is named by a key of the caller's; its texels go to the device when it is first
+// used and again when they changed (a texture changes in too many places for each to say so, so a hash of the texels is read at each use).
+class AccelTextureCache {
+ public:
+  explicit AccelTextureCache(allocators::IAllocator& a) : entries_(a) {}
+  // The device texture holding `rgba` (w * h * 4 bytes) as texture `key`. 0: the device cannot.
+  uint32_t get(IAccelerator& acc, uint64_t key, uint32_t w, uint32_t h, ConstByteView rgba);
+  void forget(IAccelerator& acc, uint64_t key);
+  void release(IAccelerator& acc);   // every texture goes
+
+ private:
+  struct Entry {
+    uint64_t key, hash;
+    uint32_t handle, w, h;
+  };
+  static constexpr uint64_t kMaxEntries = 64;   // more and the oldest goes
+  List<Entry> entries_;
 };
 
 // The accelerator all canvas contexts use (nullptr: software only). It must outlive every context.
