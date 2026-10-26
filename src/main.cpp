@@ -30,7 +30,7 @@
 #include "Hardware/Bus/SystemPciBus.hpp"
 #include "Hardware/Bus/Usb/UsbBus.hpp"
 #include "Hardware/Printer/SystemPrinters.hpp"
-#include "Hardware/GraphicsProcessingUnit/Multi/GpuManager.hpp"
+#include "Hardware/GraphicsProcessingUnit/Multi/GpuPool.hpp"
 #include "Hardware/GraphicsProcessingUnit/SystemGpu.hpp"
 #include "Hardware/Monitor/MonitorDisplay.hpp"
 #include "Hardware/Monitor/SystemMonitors.hpp"
@@ -40,6 +40,7 @@
 #include "BootLog.hpp"
 #include "Desktop/Desktop.hpp"
 #include "Graphics/Graphics3D/WebGlAccelerator.hpp"
+#include "Graphics/GraphicsPool.hpp"
 #include "Graphics/SystemGraphics.hpp"
 #include "WebGl/Accelerator.hpp"
 #include "Hardware/ImageSignalProcessor/SystemImageSignalProcessor.hpp"
@@ -430,13 +431,17 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   }
   Entry(Level::Ok, pci.name()).dec(pci.device_count()).text(" devices");
 
-  // Every display controller, not only the one on screen: a discrete GPU beside the CPU's graphics sleeps until something needs it.
-  hardware::GpuManager gpu_manager(pci);
-  gpu_manager.initialize();
-  if (gpu_manager.is_hybrid()) {
-    for (uint32_t i = 0; i < gpu_manager.count(); ++i) {
-      const hardware::GpuAdapter& a = gpu_manager.topology().adapter(i);
-      Entry(Level::Info, "GPU").text(a.name).text(" (").text(hardware::gpu_kind_name(a.kind)).text(static_cast<int32_t>(i) == gpu_manager.display_index() ? ", display" : gpu_manager.asleep(i) ? ", asleep" : "").text(")");
+  // Every display controller, not only the one on screen: the driver of each that has a native one is built beside the boot display's, and a discrete
+  // GPU beside the CPU's graphics sleeps until something needs it.
+  hardware::GpuPool gpu_pool(pci, shared_allocator);
+  gpu_pool.initialize();
+  gpu_pool.bind(st, pci, system_gpu);
+  if (gpu_pool.count() > 1) {
+    for (uint32_t i = 0; i < gpu_pool.count(); ++i) {
+      const hardware::GpuNode& n = *gpu_pool.node(i);
+      Entry(Level::Info, "GPU").text(n.adapter.name).text(" (").text(hardware::gpu_kind_name(n.adapter.kind))
+          .text(static_cast<int32_t>(i) == gpu_pool.manager().display_index() ? ", display" : gpu_pool.manager().asleep(i) ? ", asleep" : "")
+          .text(n.gpu ? "" : ", no driver").text(")");
     }
   }
 
@@ -484,6 +489,10 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
 
   // 2D and 3D rendering: the GPU's 3D engine where we can drive it, the software renderer otherwise.
   graphics::SystemGraphics system_graphics(system_gpu, shared_allocator);
+  // Rendering and presenting on any GPU of the machine (see Graphics/GraphicsPool.hpp); the display GPU's graphics are the ones above.
+  graphics::GraphicsPool graphics_pool(gpu_pool, system_graphics, shared_allocator);
+  if (graphics_pool.count() > 1)
+    Entry(Level::Info, "Graphics").dec(graphics_pool.count()).text(" GPUs, ").dec(graphics_pool.accelerated_count()).text(" with a 3D engine");
   // WebGL and WebGPU draw on the 3D hardware when there is some (and on the CPU rasterizer in src/WebGl when there is not, or for a draw the hardware cannot do).
   graphics::WebGlAccelerator web_accelerator(system_graphics.device(), shared_allocator);
   if (system_graphics.accelerated()) webgl::set_accelerator(&web_accelerator);

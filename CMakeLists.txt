@@ -398,6 +398,8 @@ add_executable(BOOTX64
   src/Hardware/GraphicsProcessingUnit/Multi/GpuTopology.cpp
   src/Hardware/GraphicsProcessingUnit/Multi/GpuPowerPolicy.cpp
   src/Hardware/GraphicsProcessingUnit/Multi/GpuManager.cpp
+  src/Hardware/GraphicsProcessingUnit/Multi/GpuPool.cpp
+  src/Hardware/GraphicsProcessingUnit/Multi/GpuNativeDrivers.cpp
   src/Hardware/GraphicsProcessingUnit/UEFI/UefiGopGpu.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdGpuGenerations.cpp
   src/Hardware/GraphicsProcessingUnit/NVIDIA/NvidiaGpuGenerations.cpp
@@ -416,6 +418,10 @@ add_executable(BOOTX64
   src/Graphics/Graphics3D/WebGlAccelerator.cpp
   src/Graphics/Graphics3D/Virgl/VirglDevice.cpp
   src/Graphics/Graphics3D/Svga/SvgaDevice.cpp
+  src/Graphics/RenderNode.cpp
+  src/Graphics/RenderNodeAccel.cpp
+  src/Graphics/Renderer2DSlot.cpp
+  src/Graphics/GraphicsPool.cpp
   src/Graphics/SystemGraphics.cpp
   src/BootLog.cpp
   src/Desktop/Desktop.cpp
