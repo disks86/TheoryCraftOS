@@ -163,15 +163,23 @@ class ObjectManager {
   bool job_kill_for(uint64_t pid, uint32_t* code);                  // lock-free: has this process been flagged to end?
 
   // --- change notifications (kind ChangeNotification; FindFirstChangeNotification/ReadDirectoryChangesW): a handle that becomes signalled, exactly like a manual-reset
-  // event, when something is created, deleted, renamed or linked directly under the directory it watches (or anywhere under it, if `watch_subtree`). It carries no
-  // detail about what changed, matching FindFirstChangeNotification's own contract; reset it (FindNextChangeNotification) with reset_event(), which this kind shares with
-  // Event. `filter` is kept but not matched against: every one of those changes signals every watch of its directory, regardless of which FILE_NOTIFY_CHANGE_* bits it asked
-  // for (a simplification, like this OS's permissive registry access checks).
-  static constexpr uint32_t kMaxWatches = 64, kWatchPathBytes = 512;
+  // event, when something is created, deleted, renamed or linked directly under the directory it watches (or anywhere under it, if `watch_subtree`). Reset it
+  // (FindNextChangeNotification) with reset_event(), which this kind shares with Event. `filter` is kept but not matched against: every one of those changes signals
+  // every watch of its directory, regardless of which FILE_NOTIFY_CHANGE_* bits it asked for (a simplification, like this OS's permissive registry access checks).
+  // A watch also queues what changed (action + name), FILE_NOTIFY_INFORMATION-style, for ReadDirectoryChangesW - a plain FindFirstChangeNotification watch just never
+  // drains that queue, relying only on `signaled`, so one mechanism serves both APIs exactly as it does on real Windows (both go through the same underlying service).
+  static constexpr uint32_t kMaxWatches = 64, kWatchPathBytes = 512, kMaxWatchRecords = 32, kWatchNameBytes = 128;
   Created create_change_notification(StringView path, bool watch_subtree, uint32_t filter);
   // Call after any successful change to a directory's contents (a file or subdirectory created, deleted, renamed or linked): `affected_directory` is that directory's
-  // own virtual path (the parent of whatever changed, not the changed entry itself). Signals every watch whose directory this is under (or equal to).
-  void notify_path_changed(StringView affected_directory);
+  // own virtual path (the parent of whatever changed, not the changed entry itself); `action` is a FILE_ACTION_* constant, `entry_name` the changed entry's own
+  // (not full-path) name. Signals every watch whose directory this is under (or equal to), and queues a record for it if there is room (a full queue just drops the
+  // record - `signaled` still fires, so a FindFirstChangeNotification-only watcher is unaffected, and ReadDirectoryChangesW already has to tolerate missed changes
+  // under real Windows too, documented as "if the buffer overflows").
+  void notify_path_changed(StringView affected_directory, uint32_t action, StringView entry_name);
+  // Takes every record a ReadDirectoryChangesW-backed watch has queued (up to `capacity` of them) as parallel arrays; the watch's queue is cleared. False if `id`
+  // is not a change-notification handle. Returns how many were taken in *count (0 with no error: nothing was queued).
+  struct WatchRecord { uint32_t action = 0; char name[kWatchNameBytes] = {}; uint32_t name_size = 0; };
+  bool take_watch_records(uint32_t id, WatchRecord* out, uint32_t capacity, uint32_t* count);
 
   // --- mailslots (kind Mailslot; CreateMailslot/CreateFile(\\.\mailslot\name)): one reader (the handle CreateMailslot returns) and any number of writers, all on this
   // machine - there is no network broadcast here, unlike a real mailslot's domain-wide one. A writer's message is queued whole (never split across reads) until the
@@ -258,7 +266,15 @@ class ObjectManager {
   void free_pipe_locked(Object& o);
   static constexpr uint32_t kMaxPipes = 128, kMaxSections = 64, kMaxLocks = 256;
 
-  struct Watch { bool used = false; char path[kWatchPathBytes] = {}; uint32_t path_size = 0; bool subtree = false; uint32_t filter = 0; };
+  struct Watch {
+    bool used = false;
+    char path[kWatchPathBytes] = {};
+    uint32_t path_size = 0;
+    bool subtree = false;
+    uint32_t filter = 0;
+    WatchRecord records[kMaxWatchRecords];      // a ring, oldest first: ReadDirectoryChangesW's own queue (a plain FindFirstChangeNotification watch never drains it)
+    uint32_t record_head = 0, record_count = 0;
+  };
   void free_watch_locked(Object& o);
 
   struct Mailslot;

@@ -1134,13 +1134,13 @@ ObjectManager::Created ObjectManager::create_change_notification(StringView path
   return result;
 }
 
-void ObjectManager::notify_path_changed(StringView affected_directory) {
+void ObjectManager::notify_path_changed(StringView affected_directory, uint32_t action, StringView entry_name) {
   Locked hold(sync_);
   if (!watches_) return;
   bool any = false;
   for (Object& o : objects_) {
     if (o.kind != ObjectKind::ChangeNotification || o.watch < 0) continue;
-    const Watch& w = watches_[o.watch];
+    Watch& w = watches_[o.watch];
     const StringView watched(w.path, w.path_size);
     bool matches = affected_directory == watched;
     if (!matches && w.subtree) {
@@ -1150,8 +1150,29 @@ void ObjectManager::notify_path_changed(StringView affected_directory) {
     if (!matches) continue;
     o.signaled = true;
     any = true;
+    if (w.record_count < kMaxWatchRecords && entry_name.size() < kWatchNameBytes) {      // a full queue just drops it: signaled (above) still fires
+      WatchRecord& r = w.records[(w.record_head + w.record_count) % kMaxWatchRecords];
+      r.action = action;
+      for (uint64_t k = 0; k < entry_name.size(); ++k) r.name[k] = entry_name[k];
+      r.name_size = static_cast<uint32_t>(entry_name.size());
+      ++w.record_count;
+    }
   }
   if (any) sync_.notify_all();
+}
+
+bool ObjectManager::take_watch_records(uint32_t id, WatchRecord* out, uint32_t capacity, uint32_t* count) {
+  *count = 0;
+  Locked hold(sync_);
+  Object* o = at(id);
+  if (!o || o->kind != ObjectKind::ChangeNotification || o->watch < 0 || !watches_) return false;
+  Watch& w = watches_[o->watch];
+  const uint32_t n = w.record_count < capacity ? w.record_count : capacity;
+  for (uint32_t i = 0; i < n; ++i) out[i] = w.records[(w.record_head + i) % kMaxWatchRecords];
+  w.record_head = (w.record_head + n) % kMaxWatchRecords;
+  w.record_count -= n;
+  *count = n;
+  return true;
 }
 
 // ---- mailslots

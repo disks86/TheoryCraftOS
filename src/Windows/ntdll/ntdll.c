@@ -102,6 +102,7 @@ NT_SERVICE(NtSocketControl);
 NT_SERVICE(NtSelectSockets);
 NT_SERVICE(NtCreateChangeNotification);
 NT_SERVICE(NtCreateMailslotFile);
+NT_SERVICE(NtNotifyChangeDirectoryFile);
 NT_SERVICE(NtQuerySystemInformation);
 NT_SERVICE(NtSetInformationThread);
 NT_SERVICE(NtSetInformationProcess);

@@ -1163,6 +1163,19 @@ EXPORT BOOL WINAPI WriteFileEx(HANDLE h, LPCVOID buffer, DWORD length, LPOVERLAP
   return TRUE;
 }
 
+/* ReadDirectoryChangesW: done at once (there is no real asynchronous I/O here either) over NtNotifyChangeDirectoryFile; an overlapped call's event is set and its
+ * completion routine, if any, queued as an ordinary APC exactly like ReadFileEx/WriteFileEx above. */
+EXPORT BOOL WINAPI ReadDirectoryChangesW(HANDLE h, LPVOID buffer, DWORD length, BOOL watch_subtree, DWORD filter, LPDWORD bytes_returned, LPOVERLAPPED overlapped,
+                                         LPOVERLAPPED_COMPLETION_ROUTINE_ routine) {
+  IO_STATUS_BLOCK iosb;
+  const NTSTATUS status = NtNotifyChangeDirectoryFile(h, NULL, NULL, NULL, &iosb, buffer, length, filter, (BOOLEAN)watch_subtree);
+  complete_overlapped(overlapped, status, iosb.Information);
+  if (!NT_SUCCESS(status)) { if (bytes_returned) *bytes_returned = 0; return fail_nt(status); }
+  if (bytes_returned) *bytes_returned = (DWORD)iosb.Information;
+  if (overlapped && routine) NtQueueApcThread(NtCurrentThread(), (PVOID)completion_apc, (ULONG_PTR)routine, (ULONG_PTR)overlapped, 0);
+  return TRUE;
+}
+
 /* ---- waitable timers ---------------------------------------------------------------------------------------------------------------------------------- */
 
 EXPORT HANDLE WINAPI CreateWaitableTimerExW(LPSECURITY_ATTRIBUTES sa, LPCWSTR name, DWORD flags, DWORD access) {
