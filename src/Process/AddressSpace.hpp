@@ -53,12 +53,21 @@ class AddressSpace final : public IUserMemory {
 
   // Maps [address, address + size) with `protection` (size rounded up to whole pages), zero-filled. `address` must be page-aligned and size non-zero.
   bool map(uint64_t address, uint64_t size, uint8_t protection);
-  // Unmaps a range that is exactly one or more whole regions. (Splitting a region is not supported yet.)
+  // Unmaps whatever is mapped inside [address, address + size) (size rounded up); regions that stick out are cut. Gaps are fine. False for a bad range
+  // or if cutting a region ran out of memory (nothing is unmapped then).
   bool unmap(uint64_t address, uint64_t size);
   // The lowest page-aligned address at or above `hint` where `size` bytes fit between regions and below kUserTop.
   bool find_free(uint64_t size, uint64_t hint, uint64_t* out) const;
-  // Changes the permissions of a range that is exactly one or more whole regions.
+  // Changes the permissions of a range, cutting regions at its ends. Every page of the range must be mapped, or nothing changes.
   bool protect(uint64_t address, uint64_t size, uint8_t protection);
+  // Makes the region that starts at `base` exactly `size` bytes (rounded up to pages) long: new pages are zero, a size of 0 removes it. Fails if the pages
+  // after it are in use, past kUserTop, or over the byte budget. This is how a heap grows.
+  bool resize(uint64_t base, uint64_t size);
+  // The region that contains `address`: where it starts and how long it is.
+  bool region_extent(uint64_t address, uint64_t* base, uint64_t* size) const;
+  // The whole allocation that contains `address`: the pages one map() call created, which stay together even after protect() or unmap() cut them into
+  // several regions. Returns where the surviving pieces start and the total length up to the last contiguous piece.
+  bool allocation_extent(uint64_t address, uint64_t* base, uint64_t* size) const;
 
   // The kernel's own access, which ignores the permissions (a loader fills read-only code pages this way). Fails if any byte is unmapped.
   bool read_privileged(uint64_t address, ByteView out) const { return check(address, out.size(), 0) && copy_out(address, out); }
@@ -77,7 +86,7 @@ class AddressSpace final : public IUserMemory {
  private:
   struct Region {
     explicit Region(allocators::IAllocator& allocator) : data(allocator) {}
-    uint64_t base = 0, size = 0;
+    uint64_t base = 0, size = 0, allocation = 0;      // `allocation` ties together the pieces of one map() call
     uint8_t protection = 0;
     ByteBuffer data;
   };
@@ -87,12 +96,15 @@ class AddressSpace final : public IUserMemory {
   // Both assume check() passed for the range.
   bool copy_out(uint64_t address, ByteView out) const;
   bool copy_in(uint64_t address, ConstByteView data);
-  bool whole_regions(uint64_t address, uint64_t size, uint64_t* first, uint64_t* last) const;
+  // Makes `address` (page-aligned) a region boundary, copying the tail of the region it falls inside.
+  bool split_at(uint64_t address);
+  bool prepare_range(uint64_t address, uint64_t size, uint64_t* end) const;
 
   allocators::IAllocator& allocator_;
   List<UniquePointer<Region>> regions_;      // sorted by base
   uint64_t max_bytes_;
   uint64_t mapped_bytes_ = 0;
+  uint64_t next_allocation_ = 1;
 };
 
 }  // namespace process

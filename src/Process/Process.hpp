@@ -22,6 +22,8 @@
 
 namespace process {
 
+class AddressSpace;
+
 // The program's address space, as the kernel reaches it from a system call. A read or write fails (false) when any byte of the range is not mapped
 // for the program (or not writable): a bad pointer from user mode must never fault the kernel.
 class IUserMemory {
@@ -79,6 +81,17 @@ class Process {
   bool read_user_u64(uint64_t address, uint64_t* out);
   bool write_user_u64(uint64_t address, uint64_t value);
 
+  // The address space the process runs in, when the kernel manages it (memory system calls need it; without one they fail). `heap_start` is where the
+  // Linux program break begins (page-aligned, just past the image).
+  void attach_address_space(AddressSpace& space, uint64_t heap_start) { space_ = &space; heap_start_ = heap_break_ = heap_start; }
+  AddressSpace* address_space() { return space_; }
+  uint64_t heap_start() const { return heap_start_; }
+  uint64_t heap_break() const { return heap_break_; }
+  void set_heap_break(uint64_t value) { heap_break_ = value; }
+  // Where the next search for free memory starts (mmap, NtAllocateVirtualMemory); moves up as memory is handed out.
+  uint64_t mmap_cursor() const { return mmap_cursor_; }
+  void set_mmap_cursor(uint64_t value) { mmap_cursor_ = value; }
+
   DescriptorKind descriptor(uint64_t slot) const { return slot < kMaxDescriptors ? slots_[slot] : DescriptorKind::Closed; }
   bool close_descriptor(uint64_t slot);
 
@@ -89,6 +102,8 @@ class Process {
   IProcessHost& host_;
   bool exited_ = false;
   uint32_t exit_code_ = 0;
+  AddressSpace* space_ = nullptr;
+  uint64_t heap_start_ = 0, heap_break_ = 0, mmap_cursor_ = 0x00007F0000000000ull;
   DescriptorKind slots_[kMaxDescriptors] = {DescriptorKind::ConsoleInput, DescriptorKind::ConsoleOutput, DescriptorKind::ConsoleError};
 };
 

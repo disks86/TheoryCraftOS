@@ -15,6 +15,7 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
+#include "Process/AddressSpace.hpp"
 #include "Process/Process.hpp"
 #include "Process/Syscall.hpp"
 #include "Process/WindowsSyscalls.hpp"
@@ -27,7 +28,8 @@ namespace process {
 namespace {
 
 constexpr uint32_t kStatusSuccess = 0, kStatusNoYield = 0x40000024u, kStatusNotImplemented = 0xC0000002u, kStatusInvalidHandle = 0xC0000008u,
-                   kStatusInvalidParameter = 0xC000000Du, kStatusAccessViolation = 0xC0000005u, kStatusEndOfFile = 0xC0000011u, kStatusAccessDenied = 0xC0000022u;
+                   kStatusInvalidParameter = 0xC000000Du, kStatusAccessViolation = 0xC0000005u, kStatusEndOfFile = 0xC0000011u, kStatusAccessDenied = 0xC0000022u,
+                   kStatusNoMemory = 0xC0000017u, kStatusConflictingAddresses = 0xC0000018u, kStatusUnableToFreeVm = 0xC000001Au, kStatusInvalidPageProtection = 0xC0000045u;
 constexpr uint64_t kCurrentProcess = ~uint64_t{0};      // NtCurrentProcess()
 constexpr uint64_t kStackArgumentBase = 0x28;           // return address + 32 bytes of home space
 constexpr uint64_t kUnixToNtSeconds = 11644473600ull;   // 1601-01-01 to 1970-01-01
@@ -110,6 +112,127 @@ uint32_t nt_delay_execution(Process& process, const SyscallRequest& r) {
   return kStatusSuccess;
 }
 
+constexpr uint32_t kMemCommit = 0x1000, kMemReserve = 0x2000, kMemDecommit = 0x4000, kMemRelease = 0x8000;
+constexpr uint32_t kPageNoAccess = 0x01, kPageReadOnly = 0x02, kPageReadWrite = 0x04, kPageWriteCopy = 0x08, kPageExecute = 0x10, kPageExecuteRead = 0x20,
+                   kPageExecuteReadWrite = 0x40, kPageExecuteWriteCopy = 0x80;
+constexpr uint64_t kAllocationGranularity = 0x10000;
+
+// PAGE_* -> our permission bits. Modifier flags (guard, no-cache, write-combine) are not supported.
+bool page_protection(uint32_t page, uint8_t* out) {
+  switch (page) {
+    case kPageNoAccess: *out = 0; return true;
+    case kPageReadOnly: *out = kProtRead; return true;
+    case kPageReadWrite:
+    case kPageWriteCopy: *out = kProtRead | kProtWrite; return true;
+    case kPageExecute: *out = kProtExecute; return true;
+    case kPageExecuteRead: *out = kProtRead | kProtExecute; return true;
+    case kPageExecuteReadWrite:
+    case kPageExecuteWriteCopy: *out = kProtRead | kProtWrite | kProtExecute; return true;
+    default: return false;
+  }
+}
+uint32_t page_constant(uint8_t protection) {
+  switch (protection) {
+    case 0: return kPageNoAccess;
+    case kProtRead: return kPageReadOnly;
+    case kProtRead | kProtWrite: return kPageReadWrite;
+    case kProtWrite: return kPageReadWrite;
+    case kProtExecute: return kPageExecute;
+    case kProtRead | kProtExecute: return kPageExecuteRead;
+    default: return kPageExecuteReadWrite;
+  }
+}
+
+bool current_process_handle(uint64_t handle) { return handle == kCurrentProcess; }
+
+// NtAllocateVirtualMemory(Process, PVOID* Base, ULONG_PTR ZeroBits, PSIZE_T Size, ULONG Type, ULONG Protect)
+uint32_t nt_allocate_virtual_memory(Process& process, const SyscallRequest& r) {
+  uint64_t type = 0, protect = 0;
+  if (!argument(process, r, 4, &type) || !argument(process, r, 5, &protect)) return kStatusAccessViolation;
+  AddressSpace* space = process.address_space();
+  if (!current_process_handle(r.args[0])) return kStatusInvalidHandle;
+  uint64_t base = 0, size = 0;
+  if (!process.read_user_u64(r.args[1], &base) || !process.read_user_u64(r.args[3], &size)) return kStatusAccessViolation;
+  uint8_t prot = 0;
+  type &= 0xFFFFFFFFu;
+  if (!(type & (kMemCommit | kMemReserve)) || (type & ~uint64_t{kMemCommit | kMemReserve | 0x100000 /*MEM_TOP_DOWN: the search direction is ours to choose*/})) return kStatusInvalidParameter;
+  if (!page_protection(uint32_t(protect), &prot)) return kStatusInvalidPageProtection;
+  if (!space) return kStatusNoMemory;
+  if (size == 0) return kStatusInvalidParameter;
+  if (!(type & kMemCommit)) prot = 0;      // reserved memory cannot be touched until it is committed
+  uint64_t rounded = 0;
+  if (!AddressSpace::round_up(size, &rounded)) return kStatusInvalidParameter;
+  if (base != 0) {
+    base = AddressSpace::round_down(base);
+    if (space->check(base, rounded, 0)) {
+      // Committing pages that were reserved earlier.
+      if (!(type & kMemCommit) || !space->protect(base, rounded, prot)) return kStatusConflictingAddresses;
+    } else if (!space->map(base, rounded, prot)) {
+      return kStatusConflictingAddresses;
+    }
+  } else {
+    uint64_t at = 0;
+    const uint64_t hint = (process.mmap_cursor() + kAllocationGranularity - 1) & ~(kAllocationGranularity - 1);
+    if (!space->find_free(rounded, hint, &at)) return kStatusNoMemory;
+    at = (at + kAllocationGranularity - 1) & ~(kAllocationGranularity - 1);      // reservations begin on the allocation granularity
+    if (!space->map(at, rounded, prot)) return kStatusNoMemory;
+    process.set_mmap_cursor(at + rounded);
+    base = at;
+  }
+  if (!process.write_user_u64(r.args[1], base) || !process.write_user_u64(r.args[3], rounded)) return kStatusAccessViolation;
+  return kStatusSuccess;
+}
+
+// NtFreeVirtualMemory(Process, PVOID* Base, PSIZE_T Size, ULONG FreeType)
+uint32_t nt_free_virtual_memory(Process& process, const SyscallRequest& r) {
+  if (!current_process_handle(r.args[0])) return kStatusInvalidHandle;
+  AddressSpace* space = process.address_space();
+  uint64_t base = 0, size = 0;
+  if (!process.read_user_u64(r.args[1], &base) || !process.read_user_u64(r.args[2], &size)) return kStatusAccessViolation;
+  const uint32_t type = uint32_t(r.args[3]);
+  if (!space) return kStatusNoMemory;
+  if (type == kMemRelease) {
+    // Releases the whole allocation `base` is the start of (as NtAllocateVirtualMemory returned it); the size must be 0.
+    uint64_t region_base = 0, region_size = 0;
+    if (size != 0) return kStatusInvalidParameter;
+    if (!space->allocation_extent(base, &region_base, &region_size) || region_base != base) return kStatusUnableToFreeVm;
+    if (!space->unmap(region_base, region_size)) return kStatusUnableToFreeVm;
+    return process.write_user_u64(r.args[1], region_base) && process.write_user_u64(r.args[2], region_size) ? kStatusSuccess : kStatusAccessViolation;
+  }
+  if (type == kMemDecommit) {
+    uint64_t rounded = 0;
+    base = AddressSpace::round_down(base);
+    if (size == 0 || !AddressSpace::round_up(size, &rounded)) return kStatusInvalidParameter;
+    if (!space->protect(base, rounded, 0)) return kStatusUnableToFreeVm;      // decommitted pages become inaccessible (their contents are not cleared)
+    return process.write_user_u64(r.args[1], base) && process.write_user_u64(r.args[2], rounded) ? kStatusSuccess : kStatusAccessViolation;
+  }
+  return kStatusInvalidParameter;
+}
+
+// NtProtectVirtualMemory(Process, PVOID* Base, PSIZE_T Size, ULONG NewProtect, PULONG OldProtect)
+uint32_t nt_protect_virtual_memory(Process& process, const SyscallRequest& r) {
+  uint64_t old_pointer = 0;
+  if (!argument(process, r, 4, &old_pointer)) return kStatusAccessViolation;
+  if (!current_process_handle(r.args[0])) return kStatusInvalidHandle;
+  AddressSpace* space = process.address_space();
+  uint64_t base = 0, size = 0;
+  if (!process.read_user_u64(r.args[1], &base) || !process.read_user_u64(r.args[2], &size)) return kStatusAccessViolation;
+  uint8_t prot = 0;
+  if (!page_protection(uint32_t(r.args[3]), &prot)) return kStatusInvalidPageProtection;
+  if (!space) return kStatusNoMemory;
+  uint64_t rounded = 0;
+  base = AddressSpace::round_down(base);
+  if (size == 0 || !AddressSpace::round_up(size, &rounded)) return kStatusInvalidParameter;
+  uint8_t old = 0;
+  if (!space->protection_at(base, &old)) return kStatusConflictingAddresses;
+  uint8_t probe[4] = {};
+  const uint32_t old_page = page_constant(old);
+  for (uint32_t i = 0; i < 4; ++i) probe[i] = uint8_t(old_page >> (8 * i));
+  if (!process.write_user(old_pointer, ConstByteView(probe, 4))) return kStatusAccessViolation;
+  if (!space->protect(base, rounded, prot)) return kStatusConflictingAddresses;
+  return process.write_user_u64(r.args[1], base) && process.write_user_u64(r.args[2], rounded) ? kStatusSuccess : kStatusAccessViolation;
+}
+
 }  // namespace
 
 class WindowsSyscalls final : public ISyscallInterface {
@@ -133,6 +256,9 @@ class WindowsSyscalls final : public ISyscallInterface {
       case WindowsSyscallNumber::NtYieldExecution: process.host().yield(); return kStatusSuccess;
       case WindowsSyscallNumber::NtDelayExecution: return nt_delay_execution(process, r);
       case WindowsSyscallNumber::NtQuerySystemTime: return nt_query_system_time(process, r);
+      case WindowsSyscallNumber::NtAllocateVirtualMemory: return nt_allocate_virtual_memory(process, r);
+      case WindowsSyscallNumber::NtFreeVirtualMemory: return nt_free_virtual_memory(process, r);
+      case WindowsSyscallNumber::NtProtectVirtualMemory: return nt_protect_virtual_memory(process, r);
       default: return kStatusInvalidSystemService;
     }
   }

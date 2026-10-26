@@ -23,6 +23,7 @@
 #include "Process/ImageLoader.hpp"
 #include "Process/Process.hpp"
 #include "Process/Syscall.hpp"
+#include "Process/WindowsSyscalls.hpp"
 
 using namespace process;
 
@@ -94,10 +95,37 @@ static void test_address_space() {
   CHECK(!s.find_free(AddressSpace::kUserTop, 0, &at));
   CHECK(!s.find_free(0, 0, &at));
 
-  CHECK(!s.unmap(0x10000, 4096 - 1 + 4096 * 5));                   // runs past the mapped regions
   CHECK(s.unmap(0xF000, 0x3000));                                  // three whole regions
   CHECK(s.region_count() == 0 && s.mapped_bytes() == 0);
-  CHECK(s.map(0x10000, 4096 * 4, kProtRead) && !s.unmap(0x10000, 4096));      // half a region
+
+  // Cutting regions: unmap the middle of one, protect part of another.
+  CHECK(s.map(0x10000, 4096 * 4, kProtRead | kProtWrite));
+  uint8_t mark[2] = {7, 9};
+  CHECK(s.write(0x10FFF, ConstByteView(mark, 2)));                  // straddles pages 0 and 1
+  CHECK(s.unmap(0x11000, 4096));
+  CHECK(s.region_count() == 2 && s.mapped_bytes() == 3 * 4096);
+  uint8_t one = 0;
+  CHECK(s.read(0x10FFF, ByteView(&one, 1)) && one == 7 && !s.read(0x11000, ByteView(&one, 1)) && !s.read(0x10FFF, ByteView(back, 2)));
+  CHECK(s.read(0x12000, ByteView(&one, 1)) && one == 0);
+  CHECK(s.protect(0x12000, 4096, kProtRead) && !s.write(0x12000, ConstByteView(&one, 1)) && s.write(0x13000, ConstByteView(&one, 1)));
+  CHECK(!s.protect(0x10000, 0x4000, kProtRead));                    // the hole is not protectable
+  CHECK(s.unmap(0x30000, 4096 * 3));                                // nothing there: fine
+  CHECK(s.unmap(0x10000, 0x10000) && s.region_count() == 0 && s.mapped_bytes() == 0);      // several regions and gaps at once
+  CHECK(!s.unmap(0x10001, 4096) && !s.unmap(0x10000, 0) && !s.unmap(AddressSpace::kUserTop, 4096));
+
+  // resize: a heap grows and shrinks, and new pages are zero.
+  CHECK(s.map(0x20000, 4096, kProtRead | kProtWrite) && s.map(0x24000, 4096, kProtRead));
+  CHECK(s.write(0x20000, ConstByteView(mark, 2)));
+  CHECK(s.resize(0x20000, 4096 * 4) && s.mapped_bytes() == 5 * 4096);
+  CHECK(!s.resize(0x20000, 4096 * 5));                              // would hit the region at 0x24000
+  CHECK(s.read(0x20000, ByteView(&one, 1)) && one == 7 && s.read(0x23FFF, ByteView(&one, 1)) && one == 0);
+  CHECK(s.resize(0x20000, 1) && s.mapped_bytes() == 2 * 4096 && !s.read(0x21000, ByteView(&one, 1)));
+  CHECK(s.resize(0x20000, 4096 * 2) && s.read(0x20001, ByteView(&one, 1)) && one == 9 && s.read(0x21000, ByteView(&one, 1)) && one == 0);      // regrown pages are zero
+  CHECK(!s.resize(0x20800, 4096) && !s.resize(0x50000, 4096));
+  CHECK(!s.resize(0x20000, 128 * 1024));                            // over the budget
+  CHECK(s.resize(0x20000, 0) && s.region_count() == 1);
+  uint64_t rb = 0, rs = 0;
+  CHECK(s.region_extent(0x24800, &rb, &rs) && rb == 0x24000 && rs == 4096 && !s.region_extent(0x25000, &rb, &rs));
 }
 
 // A static x86-64 executable: a code segment holding the program headers, and a data segment with a string and a .bss tail.
@@ -359,12 +387,150 @@ static void test_stacks() {
   CHECK(windows_initial_stack_pointer(top) % 16 == 8 && top - windows_initial_stack_pointer(top) >= 0x28);
 }
 
+static SyscallRequest lin(uint64_t n, uint64_t a0 = 0, uint64_t a1 = 0, uint64_t a2 = 0, uint64_t a3 = 0, uint64_t a4 = 0) {
+  SyscallRequest r;
+  r.number = n; r.args[0] = a0; r.args[1] = a1; r.args[2] = a2; r.args[3] = a3; r.args[4] = a4;
+  return r;
+}
+static int64_t sres(uint64_t v) { return int64_t(v); }
+
+static void test_linux_memory() {
+  AddressSpace s(A, 16 << 20);
+  FakeHost host;
+  ProcessBinding binding{SyscallAbi::Linux, UserArch::X86_64, syscall_interface(SyscallAbi::Linux, UserArch::X86_64)};
+  Process p(1, binding, s, host);
+  // Without an attached space the calls fail cleanly.
+  CHECK(sres(p.syscall(lin(9, 0, 4096, 3, 0x22, ~uint64_t{0}))) == -12);
+  p.attach_address_space(s, 0x700000);
+
+  // brk
+  CHECK(p.syscall(lin(12, 0)) == 0x700000);
+  CHECK(p.syscall(lin(12, 0x700000 + 100)) == 0x700000 + 100);
+  uint8_t b = 5;
+  CHECK(s.write(0x700000, ConstByteView(&b, 1)));
+  CHECK(p.syscall(lin(12, 0x700000 + 3 * 4096 + 1)) == 0x700000 + 3 * 4096 + 1);
+  CHECK(s.read(0x700000 + 4 * 4096 - 1, ByteView(&b, 1)) && b == 0);
+  CHECK(p.syscall(lin(12, 0x700000 + 5)) == 0x700000 + 5 && !s.read(0x701000, ByteView(&b, 1)));      // shrinks
+  CHECK(p.syscall(lin(12, 0x1000)) == 0x700000 + 5);                    // below the start: unchanged
+  CHECK(p.syscall(lin(12, 0x700000 + (1ull << 40))) == 0x700000 + 5);   // beyond the budget: unchanged
+  CHECK(p.syscall(lin(12, 0x700000)) == 0x700000 && s.region_count() == 0);
+  CHECK(p.syscall(lin(12, ~uint64_t{0})) == 0x700000);
+
+  // mmap / munmap / mprotect
+  const uint64_t anon = 0x22;      // MAP_PRIVATE | MAP_ANONYMOUS
+  uint64_t a = p.syscall(lin(9, 0, 5000, 3, anon, ~uint64_t{0}));
+  CHECK(int64_t(a) > 0 && a % 4096 == 0 && s.mapped_bytes() == 8192);
+  CHECK(s.write(a + 5000 - 1, ConstByteView(&b, 1)));
+  uint64_t a2 = p.syscall(lin(9, 0, 4096, 1, anon, ~uint64_t{0}));
+  CHECK(a2 == a + 8192 && !s.write(a2, ConstByteView(&b, 1)));
+  CHECK(p.syscall(lin(10, a2, 4096, 3)) == 0 && s.write(a2, ConstByteView(&b, 1)));
+  CHECK(p.syscall(lin(11, a + 4096, 4096)) == 0 && s.mapped_bytes() == 8192 && !s.read(a + 4096, ByteView(&b, 1)));      // the middle goes
+  CHECK(sres(p.syscall(lin(10, a, 3 * 4096, 1))) == -12);                // hole in the range
+  CHECK(sres(p.syscall(lin(11, a + 1, 4096))) == -22);
+  CHECK(sres(p.syscall(lin(11, a, 0))) == -22);
+  CHECK(sres(p.syscall(lin(10, a, 4096, 0x100))) == -22);                // unknown protection bit
+  CHECK(sres(p.syscall(lin(9, 0, 0, 3, anon, ~uint64_t{0}))) == -22);   // empty
+  CHECK(sres(p.syscall(lin(9, 0, 4096, 3, 0x20, ~uint64_t{0}))) == -22); // neither shared nor private
+  CHECK(sres(p.syscall(lin(9, 0, 4096, 3, 0x2, 3))) == -19);            // a file: not supported
+  CHECK(sres(p.syscall(lin(9, 0, 4096, 0x80, anon, ~uint64_t{0}))) == -22);
+  CHECK(sres(p.syscall(lin(9, 0, ~uint64_t{0}, 3, anon, ~uint64_t{0}))) == -22);    // length overflows the page rounding
+  CHECK(sres(p.syscall(lin(9, 0, 1ull << 40, 3, anon, ~uint64_t{0}))) == -12);       // over the budget
+  // MAP_FIXED replaces what is there.
+  CHECK(p.syscall(lin(9, a, 4096, 1, anon | 0x10, ~uint64_t{0})) == a && !s.write(a, ConstByteView(&b, 1)));
+  CHECK(sres(p.syscall(lin(9, a + 1, 4096, 1, anon | 0x10, ~uint64_t{0}))) == -22);
+  CHECK(sres(p.syscall(lin(9, AddressSpace::kUserTop, 4096, 1, anon | 0x10, ~uint64_t{0}))) == -12);
+  CHECK(sres(p.syscall(lin(11, ~uint64_t{0} - 4095, 4096))) == -22);
+  // Position independent code from the loader keeps working next to the mappings.
+  uint64_t a3 = p.syscall(lin(9, 0x700000, 4096, 3, anon, ~uint64_t{0}));
+  CHECK(a3 == 0x700000);      // a hint at a free spot is honoured
+  uint64_t a4 = p.syscall(lin(9, 0x700000, 4096, 3, anon, ~uint64_t{0}));
+  CHECK(a4 == 0x701000);      // a taken hint moves up to the next free page
+}
+
+// The Windows virtual-memory services; five or six arguments, the rest on the stack.
+static void test_windows_memory() {
+  AddressSpace s(A, 16 << 20);
+  FakeHost host;
+  ProcessBinding binding{SyscallAbi::Windows, UserArch::X86_64, syscall_interface(SyscallAbi::Windows, UserArch::X86_64)};
+  Process p(1, binding, s, host);
+  CHECK(s.map(0x10000, 4096 * 4, kProtRead | kProtWrite));              // scratch for the arguments (and stack at 0x12000)
+  const uint64_t kBaseSlot = 0x10000, kSizeSlot = 0x10008, kStack = 0x12000, kOld = 0x10020;
+  auto rd = [&](uint64_t at) { uint8_t raw[8] = {}; s.read(at, ByteView(raw, 8)); uint64_t v = 0; for (int i = 0; i < 8; ++i) v |= uint64_t{raw[i]} << (8 * i); return v; };
+  auto wr = [&](uint64_t at, uint64_t v) { uint8_t raw[8]; for (int i = 0; i < 8; ++i) raw[i] = uint8_t(v >> (8 * i)); s.write(at, ConstByteView(raw, 8)); };
+  auto call = [&](WindowsSyscallNumber n, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t s4 = 0, uint64_t s5 = 0) {
+    wr(kStack + 0x28, s4); wr(kStack + 0x30, s5);
+    SyscallRequest r;
+    r.number = uint64_t(n); r.args[0] = a0; r.args[1] = a1; r.args[2] = a2; r.args[3] = a3; r.user_stack = kStack;
+    return uint32_t(p.syscall(r));
+  };
+  const uint64_t self = ~uint64_t{0};
+  // Allocate: nothing attached yet.
+  wr(kBaseSlot, 0); wr(kSizeSlot, 5000);
+  CHECK(call(WindowsSyscallNumber::NtAllocateVirtualMemory, self, kBaseSlot, 0, kSizeSlot, 0x3000, 4) == 0xC0000017u);
+  p.attach_address_space(s, 0);
+
+  CHECK(call(WindowsSyscallNumber::NtAllocateVirtualMemory, self, kBaseSlot, 0, kSizeSlot, 0x3000, 4) == 0);
+  const uint64_t base = rd(kBaseSlot);
+  CHECK(base % 0x10000 == 0 && rd(kSizeSlot) == 8192);
+  uint8_t byte = 3;
+  CHECK(s.write(base + 8191, ConstByteView(&byte, 1)));
+  // Reserve, then commit part of it.
+  wr(kBaseSlot, 0); wr(kSizeSlot, 0x4000);
+  CHECK(call(WindowsSyscallNumber::NtAllocateVirtualMemory, self, kBaseSlot, 0, kSizeSlot, 0x2000, 1) == 0);
+  const uint64_t reserved = rd(kBaseSlot);
+  CHECK(!s.write(reserved, ConstByteView(&byte, 1)));
+  wr(kBaseSlot, reserved); wr(kSizeSlot, 4096);
+  CHECK(call(WindowsSyscallNumber::NtAllocateVirtualMemory, self, kBaseSlot, 0, kSizeSlot, 0x1000, 4) == 0 && s.write(reserved, ConstByteView(&byte, 1)));
+  CHECK(!s.write(reserved + 4096, ConstByteView(&byte, 1)));
+  // An address that is taken by something that was not reserved by us in the same way.
+  wr(kBaseSlot, 0x10000); wr(kSizeSlot, 4096);
+  CHECK(call(WindowsSyscallNumber::NtAllocateVirtualMemory, self, kBaseSlot, 0, kSizeSlot, 0x2000, 4) == 0xC0000018u);      // reserve on top of mapped pages
+  // Bad parameters.
+  wr(kBaseSlot, 0); wr(kSizeSlot, 4096);
+  CHECK(call(WindowsSyscallNumber::NtAllocateVirtualMemory, 5, kBaseSlot, 0, kSizeSlot, 0x3000, 4) == 0xC0000008u);
+  CHECK(call(WindowsSyscallNumber::NtAllocateVirtualMemory, self, kBaseSlot, 0, kSizeSlot, 0x3000, 0x1000) == 0xC0000045u);
+  CHECK(call(WindowsSyscallNumber::NtAllocateVirtualMemory, self, kBaseSlot, 0, kSizeSlot, 0, 4) == 0xC000000Du);
+  CHECK(call(WindowsSyscallNumber::NtAllocateVirtualMemory, self, 0xDEAD0000, 0, kSizeSlot, 0x3000, 4) == 0xC0000005u);
+  wr(kSizeSlot, 0);
+  CHECK(call(WindowsSyscallNumber::NtAllocateVirtualMemory, self, kBaseSlot, 0, kSizeSlot, 0x3000, 4) == 0xC000000Du);
+  wr(kSizeSlot, ~uint64_t{0});
+  CHECK(call(WindowsSyscallNumber::NtAllocateVirtualMemory, self, kBaseSlot, 0, kSizeSlot, 0x3000, 4) == 0xC000000Du);
+
+  // Protect: read-only, and the old protection is reported.
+  wr(kBaseSlot, base); wr(kSizeSlot, 4096);
+  CHECK(call(WindowsSyscallNumber::NtProtectVirtualMemory, self, kBaseSlot, kSizeSlot, 0x02, kOld) == 0);
+  uint8_t oldp[4] = {};
+  CHECK(s.read(kOld, ByteView(oldp, 4)) && oldp[0] == 0x04);
+  CHECK(!s.write(base, ConstByteView(&byte, 1)) && s.write(base + 4096, ConstByteView(&byte, 1)));
+  wr(kBaseSlot, 0x900000); wr(kSizeSlot, 4096);
+  CHECK(call(WindowsSyscallNumber::NtProtectVirtualMemory, self, kBaseSlot, kSizeSlot, 0x02, kOld) == 0xC0000018u);      // unmapped
+  wr(kBaseSlot, base);
+  CHECK(call(WindowsSyscallNumber::NtProtectVirtualMemory, self, kBaseSlot, kSizeSlot, 0x7777, kOld) == 0xC0000045u);
+
+  // Free: decommit, then release (size must be 0, base must be a region start).
+  wr(kBaseSlot, base + 4096); wr(kSizeSlot, 4096);
+  CHECK(call(WindowsSyscallNumber::NtFreeVirtualMemory, self, kBaseSlot, kSizeSlot, 0x4000) == 0 && !s.write(base + 4096, ConstByteView(&byte, 1)));
+  wr(kBaseSlot, base); wr(kSizeSlot, 4096);
+  CHECK(call(WindowsSyscallNumber::NtFreeVirtualMemory, self, kBaseSlot, kSizeSlot, 0x8000) == 0xC000000Du);      // release needs size 0
+  wr(kBaseSlot, base + 4096); wr(kSizeSlot, 0);
+  CHECK(call(WindowsSyscallNumber::NtFreeVirtualMemory, self, kBaseSlot, kSizeSlot, 0x8000) == 0xC000001Au);      // not the start of an allocation
+  const uint64_t before = s.mapped_bytes();
+  wr(kBaseSlot, base); wr(kSizeSlot, 0);
+  CHECK(call(WindowsSyscallNumber::NtFreeVirtualMemory, self, kBaseSlot, kSizeSlot, 0x8000) == 0);                // both pieces, though protect() cut them apart
+  CHECK(s.mapped_bytes() == before - 8192 && rd(kSizeSlot) == 8192 && !s.read(base, ByteView(&byte, 1)) && !s.read(base + 4096, ByteView(&byte, 1)));
+  wr(kBaseSlot, 0x900000); wr(kSizeSlot, 0);
+  CHECK(call(WindowsSyscallNumber::NtFreeVirtualMemory, self, kBaseSlot, kSizeSlot, 0x8000) == 0xC000001Au);
+  CHECK(call(WindowsSyscallNumber::NtFreeVirtualMemory, self, kBaseSlot, kSizeSlot, 0x1234) == 0xC000000Du);
+}
+
 int main() {
   test_address_space();
   test_load_elf();
   test_load_elf_rejects();
   test_load_pe();
   test_stacks();
+  test_linux_memory();
+  test_windows_memory();
   CHECK(A.live == 0);
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);
