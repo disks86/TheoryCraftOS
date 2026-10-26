@@ -370,6 +370,8 @@ class Device final : public shader::ITextureHost {
   // --- 3D hardware (GpuAccel.cpp). A render pass whose color attachment is cleared (not loaded) is drawn on the accelerator, one device picture per pass, and read back
   // into the texture when the pass ends or at the first draw the hardware cannot take (the rest of the pass is then drawn on the CPU on top of it).
   IAccelerator* hw_ = nullptr;
+  webgl::AccelTextureCache hw_textures_;   // the device copies of the textures the draws sampled, keyed by texture id and mip level
+  bool hw_texture(const Bound& b, uint32_t* handle, webgl::AccelSampler* sampler);
   uint32_t hw_target_ = 0, hw_w_ = 0, hw_h_ = 0;
   bool hw_pass_ = false;     // the open pass is drawn on the hardware
   bool hw_ahead_ = false;    // ... and the device picture is newer than the texture

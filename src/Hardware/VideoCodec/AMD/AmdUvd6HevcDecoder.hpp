@@ -38,6 +38,9 @@ namespace hardware {
 // lives in, the slices behind start codes, and the buffers it works in. The engine keeps the decoded picture buffer itself and writes the decoded picture, as
 // linear NV12, into a target surface the CPU reads back into the picture buffer of the CPU decoder (so the picture comes out, cropped and converted, like any other).
 //
+// Ten-bit streams (Main 10: both depths ten) are taken only after allow_deep(true), which the device does once the engine passed its Main 10 test: the engine writes a P010
+// surface, the CPU decoder's picture holds the samples as 16-bit words (see h265::Picture::deep), and the pictures come out as P010, or converted to the configured format.
+//
 // A sequence the engine cannot take (a size beyond the limits, more reference pictures than its buffers hold) is decoded on the CPU, whole sequences at a time.
 // One session owns the engine's work memory at a time. Unlike VCN's, the firmware's feedback area is not read back. A job that does not finish wedges the ring for good: every later picture is damaged (grey); nothing falls
 // back to the CPU in the middle of a stream, since the CPU decoder would not have the reference pictures.
@@ -63,6 +66,10 @@ class AmdUvd6HevcDecoder final : public IVideoDecoder, private h265::IOffload {
   VideoCodecStatistics statistics() const override;
 
   bool session_open() const { return open_; }
+  // The target surface of a sequence: NV12 bytes, or P010 words, twice the NV12 pitch for the same width.
+  static amd_vcn::TargetLayout target_for(uint32_t width, uint32_t height, bool deep);
+  // Whether ten-bit sequences go to the engine (otherwise they are refused, and nothing decodes them: the CPU decoder has no ten-bit pixel paths).
+  void allow_deep(bool allow) { deep_allowed_ = allow; }
   // Pictures the engine decoded, and how many of them the stream's own picture hashes confirmed or contradicted.
   uint64_t pictures_decoded() const { return decoded_; }
   H265Decoder::HashStatistics hash_statistics() const { return cpu_.hash_statistics(); }
@@ -80,6 +87,8 @@ class AmdUvd6HevcDecoder final : public IVideoDecoder, private h265::IOffload {
   bool send_session_message(bool create);
   bool gather_bitstream(ArrayView<const ConstByteView> slices);
   void read_back(const h265::OffloadPicture& picture);
+  void read_back_deep(const h265::OffloadPicture& picture);
+  bool sequence_ok(const h265::Sps& sps, bool* deep) const;
 
   allocators::IAllocator& allocator_;
   Engine engine_;
@@ -88,6 +97,7 @@ class AmdUvd6HevcDecoder final : public IVideoDecoder, private h265::IOffload {
   bool leased_ = false;    // this session holds the work memory's lease
   bool open_ = false;      // the engine has a session
   uint32_t width_ = 0, height_ = 0, references_needed_ = 0;
+  bool deep_ = false, deep_allowed_ = false;   // the open session's sequence has ten-bit samples; ten-bit sequences may use the engine
 
   amd_uvd6::HevcBufferSizes sizes_;
   amd_vcn::TargetLayout layout_;

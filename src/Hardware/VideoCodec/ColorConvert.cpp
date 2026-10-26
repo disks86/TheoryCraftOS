@@ -39,12 +39,27 @@ uint32_t yuv_to_bgra(int32_t y, int32_t u, int32_t v, bool limited) {
   return 0xFF000000u | (uint32_t{clamp8(r)} << 16) | (uint32_t{clamp8(g)} << 8) | clamp8(b);
 }
 
-// Reads the luma and chroma of pixel (x, y) from an I420 or NV12 picture.
+// A P010 sample as 8 bits (its top eight: the value is held in the top ten bits of the word) and an 8-bit one as P010 (the ten bits it has, replicated into the two low ones).
+uint8_t p010_to_8(const uint8_t* p) { return p[1]; }
+void put_p010(uint8_t* p, uint8_t v) {
+  const uint32_t ten = (uint32_t{v} << 2) | (v >> 6);
+  p[0] = static_cast<uint8_t>(ten << 6);
+  p[1] = static_cast<uint8_t>(ten >> 2);
+}
+
+// Reads the luma and chroma of pixel (x, y) from an I420, NV12 or P010 picture (P010 at eight bits).
 struct YuvReader {
   const VideoFrame& f;
   void sample(uint32_t x, uint32_t y, int32_t* yy, int32_t* u, int32_t* v) const {
-    *yy = f.plane[0][uint64_t{y} * f.stride[0] + x];
     const uint32_t cx = x / 2, cy = y / 2;
+    if (f.format.pixel_format == PixelFormat::P010) {
+      *yy = p010_to_8(f.plane[0] + uint64_t{y} * f.stride[0] + 2 * uint64_t{x});
+      const uint8_t* uv = f.plane[1] + uint64_t{cy} * f.stride[1] + 4 * uint64_t{cx};
+      *u = p010_to_8(uv);
+      *v = p010_to_8(uv + 2);
+      return;
+    }
+    *yy = f.plane[0][uint64_t{y} * f.stride[0] + x];
     if (f.format.pixel_format == PixelFormat::I420) {
       *u = f.plane[1][uint64_t{cy} * f.stride[1] + cx];
       *v = f.plane[2][uint64_t{cy} * f.stride[2] + cx];
@@ -94,6 +109,31 @@ int32_t cb(int32_t r, int32_t g, int32_t b) { return ((-11059 * r - 21709 * g + 
 int32_t cr(int32_t r, int32_t g, int32_t b) { return ((32768 * r - 27439 * g - 5329 * b + 32768) >> 16) + 128; }
 }  // namespace
 
+namespace {
+// Writes 8-bit samples into the destination picture, whatever its YUV layout.
+struct YuvWriter {
+  const VideoFrameBuffer& out;
+  VideoFormat dst;
+  void luma(uint32_t x, uint32_t y, uint8_t v) const {
+    if (dst.pixel_format == PixelFormat::P010) put_p010(out.plane(0).data() + uint64_t{y} * dst.plane_stride(0) + 2 * uint64_t{x}, v);
+    else out.plane(0)[uint64_t{y} * dst.plane_stride(0) + x] = v;
+  }
+  void chroma(uint32_t cx, uint32_t cy, uint8_t u, uint8_t v) const {
+    if (dst.pixel_format == PixelFormat::I420) {
+      out.plane(1)[uint64_t{cy} * dst.plane_stride(1) + cx] = u;
+      out.plane(2)[uint64_t{cy} * dst.plane_stride(2) + cx] = v;
+    } else if (dst.pixel_format == PixelFormat::P010) {
+      uint8_t* uv = out.plane(1).data() + uint64_t{cy} * dst.plane_stride(1) + 4 * uint64_t{cx};
+      put_p010(uv, u);
+      put_p010(uv + 2, v);
+    } else {
+      out.plane(1)[uint64_t{cy} * dst.plane_stride(1) + 2 * cx] = u;
+      out.plane(1)[uint64_t{cy} * dst.plane_stride(1) + 2 * cx + 1] = v;
+    }
+  }
+};
+}  // namespace
+
 bool convert_frame(const VideoFrame& in, const VideoFrameBuffer& out) {
   const VideoFormat& src = in.format;
   const VideoFormat& dst = out.format();
@@ -103,15 +143,25 @@ bool convert_frame(const VideoFrame& in, const VideoFrameBuffer& out) {
     return convert_to_bgra(in, reinterpret_cast<uint32_t*>(out.plane(0).data()), dst.width);
   }
 
-  // Into I420 or NV12.
-  const ByteView luma_plane = out.plane(0);
-  const uint32_t luma_stride = dst.plane_stride(0);
+  // The same YUV layout: the samples as they are (P010 keeps all ten bits).
+  if (src.pixel_format == dst.pixel_format && src.pixel_format != PixelFormat::Bgra8888) {
+    for (uint32_t p = 0; p < dst.plane_count(); ++p) {
+      if (!in.plane[p]) return false;
+      const uint32_t row_bytes = dst.plane_stride(p) < in.stride[p] ? dst.plane_stride(p) : in.stride[p];
+      for (uint32_t y = 0; y < dst.plane_height(p); ++y)
+        __builtin_memcpy(out.plane(p).data() + uint64_t{y} * dst.plane_stride(p), in.plane[p] + uint64_t{y} * in.stride[p], row_bytes);
+    }
+    return true;
+  }
+
+  // Into I420, NV12 or P010.
+  const YuvWriter writer{out, dst};
   if (src.pixel_format == PixelFormat::Bgra8888) {
     for (uint32_t y = 0; y < dst.height; ++y)
       for (uint32_t x = 0; x < dst.width; ++x) {
         int32_t r, g, b;
         read_bgra(in, x, y, &r, &g, &b);
-        luma_plane[uint64_t{y} * luma_stride + x] = clamp8(luma(r, g, b));
+        writer.luma(x, y, clamp8(luma(r, g, b)));
       }
     for (uint32_t cy = 0; cy < dst.chroma_height(); ++cy)
       for (uint32_t cx = 0; cx < dst.chroma_width(); ++cx) {
@@ -123,40 +173,26 @@ bool convert_frame(const VideoFrame& in, const VideoFrameBuffer& out) {
             sr += r; sg += g; sb += b;
           }
         sr = (sr + 2) / 4; sg = (sg + 2) / 4; sb = (sb + 2) / 4;
-        const uint8_t u = clamp8(cb(sr, sg, sb)), v = clamp8(cr(sr, sg, sb));
-        if (dst.pixel_format == PixelFormat::I420) {
-          out.plane(1)[uint64_t{cy} * dst.plane_stride(1) + cx] = u;
-          out.plane(2)[uint64_t{cy} * dst.plane_stride(2) + cx] = v;
-        } else {
-          const ByteView uv = out.plane(1);
-          uv[uint64_t{cy} * dst.plane_stride(1) + 2 * cx] = u;
-          uv[uint64_t{cy} * dst.plane_stride(1) + 2 * cx + 1] = v;
-        }
+        writer.chroma(cx, cy, clamp8(cb(sr, sg, sb)), clamp8(cr(sr, sg, sb)));
       }
     return true;
   }
 
-  // YUV to YUV: the same samples laid out differently (the range is not changed, so a limited-range source stays so).
+  // YUV to YUV: the same samples laid out differently (the range is not changed, so a limited-range source stays so). A P010 source loses its two low bits, and a P010
+  // destination gets 8-bit samples widened to ten.
   if (!in.plane[1] || (src.pixel_format == PixelFormat::I420 && !in.plane[2])) return false;
+  const YuvReader reader{in};
   for (uint32_t y = 0; y < dst.height; ++y)
-    __builtin_memcpy(luma_plane.data() + uint64_t{y} * luma_stride, in.plane[0] + uint64_t{y} * in.stride[0], dst.width);
+    for (uint32_t x = 0; x < dst.width; ++x) {
+      int32_t yy, u, v;
+      reader.sample(x, y, &yy, &u, &v);
+      writer.luma(x, y, static_cast<uint8_t>(yy));
+    }
   for (uint32_t cy = 0; cy < dst.chroma_height(); ++cy)
     for (uint32_t cx = 0; cx < dst.chroma_width(); ++cx) {
-      uint8_t u, v;
-      if (src.pixel_format == PixelFormat::I420) {
-        u = in.plane[1][uint64_t{cy} * in.stride[1] + cx];
-        v = in.plane[2][uint64_t{cy} * in.stride[2] + cx];
-      } else {
-        u = in.plane[1][uint64_t{cy} * in.stride[1] + 2 * cx];
-        v = in.plane[1][uint64_t{cy} * in.stride[1] + 2 * cx + 1];
-      }
-      if (dst.pixel_format == PixelFormat::I420) {
-        out.plane(1)[uint64_t{cy} * dst.plane_stride(1) + cx] = u;
-        out.plane(2)[uint64_t{cy} * dst.plane_stride(2) + cx] = v;
-      } else {
-        out.plane(1)[uint64_t{cy} * dst.plane_stride(1) + 2 * cx] = u;
-        out.plane(1)[uint64_t{cy} * dst.plane_stride(1) + 2 * cx + 1] = v;
-      }
+      int32_t yy, u, v;
+      reader.sample(2 * cx, 2 * cy, &yy, &u, &v);
+      writer.chroma(cx, cy, static_cast<uint8_t>(u), static_cast<uint8_t>(v));
     }
   return true;
 }

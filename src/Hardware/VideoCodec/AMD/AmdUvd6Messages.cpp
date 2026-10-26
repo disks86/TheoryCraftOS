@@ -193,7 +193,7 @@ bool prepare_avc_feedback_and_tables(ByteView message_buffer, const amd_vcn::Avc
   return true;
 }
 
-HevcBufferSizes hevc_buffer_sizes(uint32_t width, uint32_t height, uint32_t max_dec_pic_buffering) {
+HevcBufferSizes hevc_buffer_sizes(uint32_t width, uint32_t height, uint32_t max_dec_pic_buffering, uint32_t deep_log2_ctb) {
   HevcBufferSizes sizes;
   if (width < 16 || height < 16 || width > kMaxWidth || height > kMaxHeight || width % 8 != 0 || height % 8 != 0) return sizes;
   // calc_dpb_size and calc_ctx_size_h265_main: slots for 17 pictures (8 from 4096 x 2000 up), a picture's slot aligned to 256.
@@ -201,8 +201,23 @@ HevcBufferSizes hevc_buffer_sizes(uint32_t width, uint32_t height, uint32_t max_
   if (max_dec_pic_buffering > references) return sizes;
   const uint64_t w16 = align_up(width, 16), h16 = align_up(height, 16);
   sizes.references = references;
-  sizes.dpb = align_up(align_up(w16, kDbPitchAlignment) * h16 * 3 / 2, 256) * references;
-  sizes.context = ((w16 + 255) / 16) * ((h16 + 255) / 16) * 16 * references + 52 * 1024;
+  if (deep_log2_ctb == 0) {
+    sizes.dpb = align_up(align_up(w16, kDbPitchAlignment) * h16 * 3 / 2, 256) * references;
+    sizes.context = ((w16 + 255) / 16) * ((h16 + 255) / 16) * 16 * references + 52 * 1024;
+    return sizes;
+  }
+  if (deep_log2_ctb < 4 || deep_log2_ctb > 6) return HevcBufferSizes();
+  // radeon_uvd.c, for HEVC_MAIN_10: a slot is 9/4 of the luma size (not 3/2), and calc_ctx_size_h265_main10: the motion context per CTB row for every slot, the left-tile
+  // deblocking context, and the left-tile pixels, twice as many as for eight bits.
+  sizes.dpb = align_up(align_up(w16, kDbPitchAlignment) * h16 * 9 / 4, 256) * references;
+  const uint64_t ctb = uint64_t{1} << deep_log2_ctb;
+  const uint64_t width_in_ctb = (w16 + ctb - 1) / ctb, height_in_ctb = (h16 + ctb - 1) / ctb;
+  const uint64_t per_ctb = (ctb >> 4) * (ctb >> 4);
+  const uint64_t per_row = align_up(width_in_ctb * per_ctb * 16, 256);
+  const uint64_t max_mb_address = (uint64_t{h16} * 8 + 2047) / 2048;
+  const uint64_t left_context = 4096 / 16 * (32 + 16 * 4);
+  const uint64_t left_pixels = 2 * (max_mb_address * 2 * 2048 + 1024);
+  sizes.context = references * per_row * height_in_ctb + left_context + left_pixels;
   return sizes;
 }
 
@@ -210,9 +225,10 @@ bool build_hevc_decode_message(ByteView out, uint32_t stream_handle, uint32_t fe
   if (!picture.sps || !picture.pps || !picture.first) return false;
   const h265::Sps& sps = *picture.sps;
   const h265::Pps& pps = *picture.pps;
-  if (sps.chroma_format_idc != 1 || sps.bit_depth_luma != 8 || sps.bit_depth_chroma != 8 || sps.width <= 0 || sps.height <= 0) return false;
+  if (sps.chroma_format_idc != 1 || sps.bit_depth_luma < 8 || sps.bit_depth_luma > 10 || sps.bit_depth_chroma < 8 || sps.bit_depth_chroma > 10 || sps.width <= 0 || sps.height <= 0) return false;
+  const bool deep = sps.bit_depth_luma > 8 || sps.bit_depth_chroma > 8;
   const uint32_t width = static_cast<uint32_t>(sps.width), height = static_cast<uint32_t>(sps.height);
-  if (hevc_buffer_sizes(width, height, 0).dpb == 0 || !build_common_decode(out, kStreamTypeH265, stream_handle, feedback_number, width, height, b)) return false;
+  if (hevc_buffer_sizes(width, height, 0, deep ? static_cast<uint32_t>(sps.log2_ctb) : 0).dpb == 0 || !build_common_decode(out, kStreamTypeH265, stream_handle, feedback_number, width, height, b)) return false;
   Image m(out);
   auto bit = [](bool v, uint32_t n) { return v ? 1u << n : 0u; };
   m.u32(kUvd_H265_sps_info_flags, bit(sps.scaling_list_enabled, 0) | bit(sps.amp, 1) | bit(sps.sao, 2) | bit(sps.pcm, 3) | bit(sps.pcm && sps.pcm_loop_filter_disabled, 4) |
@@ -224,6 +240,8 @@ bool build_hevc_decode_message(ByteView out, uint32_t stream_handle, uint32_t fe
                                       bit(pps.loop_filter_across_slices, 15) | bit(pps.deblocking_override_enabled, 16) | bit(pps.deblocking_disabled, 17) |
                                       bit(pps.lists_modification_present, 18) | bit(pps.slice_header_extension_present, 19));
   m.u8(kUvd_H265_chroma_format, 1);
+  m.u8(kUvd_H265_bit_depth_luma_minus8, static_cast<uint8_t>(sps.bit_depth_luma - 8));
+  m.u8(kUvd_H265_bit_depth_chroma_minus8, static_cast<uint8_t>(sps.bit_depth_chroma - 8));
   m.u8(kUvd_H265_log2_max_pic_order_cnt_lsb_minus4, static_cast<uint8_t>(sps.log2_max_poc_lsb - 4));
   const int dpb_pictures = sps.max_dec_pic_buffering[sps.max_sub_layers - 1];
   m.u8(kUvd_H265_sps_max_dec_pic_buffering_minus1, static_cast<uint8_t>(dpb_pictures > 0 ? dpb_pictures - 1 : 0));
@@ -284,6 +302,12 @@ bool build_hevc_decode_message(ByteView out, uint32_t stream_handle, uint32_t fe
   for (uint32_t i = 0; i < 2; ++i) m.u8(kUvd_H265_ucScalingListDCCoefSizeID3 + i, sl.dc[3][i * 3]);
   for (uint32_t l = 0; l < 2; ++l)
     for (uint32_t i = 0; i < 15; ++i) m.u8(kUvd_H265_direct_reflist + l * 15 + i, picture.list[l][i]);
+  // get_h265_msg, HEVC_MAIN_10 with a P010 target: the surface holds 16-bit words with the value in their top bits. (Mesa's other mode, luma_10to8 = chroma_10to8 = 5 and
+  // sclr_* = 4, makes the engine write an 8-bit surface; this driver always takes the P010 one and converts on the CPU.)
+  if (deep) {
+    m.u8(kUvd_H265_p010_mode, 1);
+    m.u8(kUvd_H265_msb_mode, 1);
+  }
   return true;
 }
 

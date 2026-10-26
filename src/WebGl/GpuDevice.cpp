@@ -295,7 +295,7 @@ void write_decoded(const FormatDesc& f, const uint8_t* p, uint8_t aspect, Image&
 // --- Resources --------------------------------------------------------------------------------------------------------------------------------------------
 
 Device::Device(allocators::IAllocator& a)
-    : error(a), a_(a), buffers_(a), textures_(a), views_(a), samplers_(a), modules_(a), bgls_(a), pls_(a), groups_(a), rps_(a), cps_(a), query_sets_(a), dyn_all_(a), bound_(a) {}
+    : error(a), a_(a), buffers_(a), textures_(a), views_(a), samplers_(a), modules_(a), bgls_(a), pls_(a), groups_(a), rps_(a), cps_(a), query_sets_(a), dyn_all_(a), bound_(a), hw_textures_(a) {}
 
 Device::~Device() { hw_release(); }
 
@@ -367,7 +367,10 @@ uint32_t Device::create_texture(uint32_t w, uint32_t h, uint32_t depth, uint32_t
 
 void Device::destroy_texture(uint32_t id) {
   Texture* t = texture_mut(id);
-  if (t) t->destroyed = true;
+  if (!t) return;
+  t->destroyed = true;
+  if (hw_)
+    for (uint32_t m = 0; m < t->mips.count(); ++m) hw_textures_.forget(*hw_, (uint64_t{id} << 32) | m);
 }
 
 uint32_t Device::create_view(const TextureView& v) {

@@ -33,6 +33,7 @@ enum class PixelFormat : uint8_t {
   Bgra8888,  // one plane, 4 bytes per pixel: blue, green, red, alpha (0xAARRGGBB as a little-endian word; what graphics::Surface holds)
   I420,      // three planes: Y (full size), then U and V (half width and height, rounded up)
   Nv12,      // two planes: Y (full size), then U and V interleaved (half height, rounded up)
+  P010,      // NV12 with 10-bit samples: every sample is a 16-bit little-endian word holding the value in its top ten bits (value << 6); strides count bytes
 };
 
 // Sizes and planes of a frame in a given format. Rows are tight: a plane's stride is its width in bytes.

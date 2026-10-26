@@ -84,6 +84,7 @@ constexpr uint32_t kConfigMemsize = 0x150a, kFbLocation = 0x809, kGbAddrConfig =
 }  // namespace reg
 
 #include "Hardware/VideoCodec/AMD/AmdVcnSelfTestHevcStream.inc"   // the H.265 stream the engine's self-test decodes
+#include "Hardware/VideoCodec/AMD/AmdVcnSelfTestHevc10Stream.inc"   // and the ten-bit one
 #include "Hardware/VideoCodec/AMD/AmdVcnSelfTestMpeg2Stream.inc"   // and the MPEG-2 one
 #include "Hardware/VideoCodec/AMD/AmdVcnSelfTestVc1Stream.inc"   // and the two VC-1 ones
 
@@ -176,6 +177,52 @@ static bool make_hevc_expected(allocators::IAllocator& a, HevcExpected* out) {
   return take() && got == kHevcSelfTestPictures && out->poc.size() == kHevcSelfTestPictures;
 }
 
+// The ten-bit H.265 stream: the pictures the engine must write, per picture in decode order, as P010 words (a 16-bit little-endian word per sample, the value in the top ten bits,
+// Cb and Cr interleaved), with the order count the message must carry. The CPU cannot decode ten bits, so the pictures are FFmpeg's (tests/data/hevc10_selftest.yuv, made by
+// scripts/gen_hevc_test_streams.sh, planar 16-bit in display order); the stream's order counts say which of them each picture is.
+struct Hevc10Expected {
+  std::vector<int32_t> poc;
+  std::vector<std::vector<uint8_t>> luma, chroma;   // by decode order
+};
+
+static bool make_hevc10_expected(allocators::IAllocator& a, Hevc10Expected* out) {
+  const ConstByteView stream(kHevc10SelfTestStream);
+  {
+    H265Decoder recorder_cpu(a);
+    PocRecorder recorder;
+    recorder.pocs = &out->poc;
+    recorder_cpu.set_offload(&recorder);
+    for (uint32_t i = 0; i < kHevc10SelfTestPictures; ++i) {
+      const uint64_t start = i == 0 ? 0 : kHevc10SelfTestEnds[i - 1];
+      if (!recorder_cpu.decode(stream.subview(start, kHevc10SelfTestEnds[i] - start), int64_t{i} * 1000)) return false;
+    }
+    recorder_cpu.flush();
+  }
+  if (out->poc.size() != kHevc10SelfTestPictures) return false;
+  const std::vector<uint8_t> yuv = read_host_file("tests/data/hevc10_selftest.yuv");
+  constexpr uint32_t kLumaBytes = 64 * 64 * 2, kChromaBytes = 32 * 32 * 2, kFrame = kLumaBytes + 2 * kChromaBytes;
+  if (yuv.size() != uint64_t{kFrame} * kHevc10SelfTestPictures) return false;
+  out->luma.assign(kHevc10SelfTestPictures, {});
+  out->chroma.assign(kHevc10SelfTestPictures, {});
+  for (uint32_t k = 0; k < kHevc10SelfTestPictures; ++k) {
+    if (out->poc[k] < 0 || out->poc[k] >= int32_t(kHevc10SelfTestPictures)) return false;   // (the order count is the display position: one picture per count)
+    const uint8_t* picture = yuv.data() + uint64_t{kFrame} * uint32_t(out->poc[k]);
+    auto word = [](const uint8_t* sample) { const uint32_t v = (sample[0] | (sample[1] << 8)) << 6; return std::pair<uint8_t, uint8_t>(uint8_t(v), uint8_t(v >> 8)); };
+    for (uint32_t i = 0; i < 64 * 64; ++i) {
+      const auto w = word(picture + i * 2);
+      out->luma[k].push_back(w.first);
+      out->luma[k].push_back(w.second);
+    }
+    for (uint32_t i = 0; i < 32 * 32; ++i)
+      for (uint32_t plane = 0; plane < 2; ++plane) {
+        const auto w = word(picture + kLumaBytes + plane * kChromaBytes + i * 2);
+        out->chroma[k].push_back(w.first);
+        out->chroma[k].push_back(w.second);
+      }
+  }
+  return true;
+}
+
 // The MPEG-2 stream's pictures, by presentation time (packet k has k * 1000).
 static bool make_mpeg2_expected(allocators::IAllocator& a, Expected* out) {
   const ConstByteView stream(kMpeg2SelfTestStream);
@@ -261,6 +308,9 @@ struct Card final : IVcnRegisters {
   fakevcn::FakeClock clock;
   const Expected* expected = nullptr;
   const HevcExpected* hevc = nullptr;
+  const Hevc10Expected* hevc10 = nullptr;
+  bool write_hevc10 = true;
+  int hevc10_decodes = 0;
   const Expected* mpeg2 = nullptr;
   const Expected* vc1_main = nullptr;
   const Expected* vc1_advanced = nullptr;
@@ -355,6 +405,10 @@ struct Card final : IVcnRegisters {
     if (hang_hevc) ring.stall_fence = true;
     constexpr uint32_t kCodec = dec(52), kCurrIdx = 118, kCurrPoc = 120, kRefList = 124;
     if (!hevc) { problem("no H.265 stream to stand in for"); return; }
+    if (m[kCodec + 9] == 2) {   // bit_depth_luma_minus8
+      on_hevc10(m, height, pitch, chroma_offset);
+      return;
+    }
     const int32_t poc = static_cast<int32_t>(word(m, kCodec + kCurrPoc));
     uint32_t k = 0;
     while (k < hevc->poc.size() && hevc->poc[k] != poc) ++k;
@@ -371,6 +425,32 @@ struct Card final : IVcnRegisters {
     if (!target || pitch < 64 || uint64_t{pitch} * 64 > chroma_offset) { problem("target does not hold a 64 x 64 picture"); return; }
     for (uint32_t y = 0; y < 64; ++y) memcpy(target + uint64_t{pitch} * y, hevc->luma[k].data() + y * 64, 64);
     for (uint32_t y = 0; y < 32; ++y) memcpy(target + chroma_offset + uint64_t{pitch} * y, hevc->chroma[k].data() + y * 64, 64);
+  }
+  // The ten-bit H.265 picture. The message must say ten bits for both components, ask for the P010 surface in the top bits (and not the 8-bit conversion), and carry the sizes
+  // of Mesa's Main 10 buffers, computed here by hand for 64 x 64, 32 x 32 coding trees, 17 slots: a slot is 64 * 64 * 9 / 4 = 9216 bytes (156672 in all), the context 17 *
+  // 256 * 2 + 24576 + 2 * 5120 = 43520; the message carries the sizes of the buffers as allocated, whole pages.
+  void on_hevc10(const uint8_t* m, uint32_t height, uint32_t pitch, uint32_t chroma_offset) {
+    ++hevc10_decodes;
+    constexpr uint32_t kCodec = dec(52), kCurrPoc = 120, kDpmBytes = 39 * 4096, kCtxBytes = 11 * 4096;   // (156672 and 43520 rounded up to pages)
+    if (!hevc10) { problem("no ten-bit H.265 stream to stand in for"); return; }
+    if (hang_hevc) ring.stall_fence = true;
+    if (m[kCodec + 10] != 2) problem("ten-bit H.265 message with eight-bit chroma");
+    if (m[kCodec + 238] != 1 || m[kCodec + 239] != 1) problem("ten-bit H.265 message does not ask for P010 in the top bits");
+    for (uint32_t i = 240; i < 244; ++i)
+      if (m[kCodec + i] != 0) problem("ten-bit H.265 message asks for the 8-bit conversion too");
+    if (word(m, dec(5)) != kDpmBytes || word(m, dec(7)) != kCtxBytes || word(m, dec(2)) != 64 || height != 64) problem("ten-bit H.265 message with the wrong buffer sizes");
+    const int32_t poc = static_cast<int32_t>(word(m, kCodec + kCurrPoc));
+    uint32_t k = 0;
+    while (k < hevc10->poc.size() && hevc10->poc[k] != poc) ++k;
+    if (k == hevc10->poc.size()) { problem("ten-bit H.265 message names an order count the stream does not have"); return; }
+    const uint8_t* bits = ring.translate(buffer[0x100], 4);
+    if (!bits || bits[0] != 0 || bits[1] != 0 || bits[2] != 1) problem("ten-bit H.265 bitstream does not start with a start code");
+    if (!write_hevc10) return;
+    const uint64_t target_bytes = uint64_t{chroma_offset} + uint64_t{pitch} * (height / 2);
+    uint8_t* target = ring.translate(buffer[2], target_bytes);
+    if (!target || pitch < 128 || uint64_t{pitch} * 64 > chroma_offset) { problem("target does not hold a 64 x 64 P010 picture"); return; }
+    for (uint32_t y = 0; y < 64; ++y) memcpy(target + uint64_t{pitch} * y, hevc10->luma[k].data() + y * 128, 128);
+    for (uint32_t y = 0; y < 32; ++y) memcpy(target + chroma_offset + uint64_t{pitch} * y, hevc10->chroma[k].data() + y * 128, 128);
   }
   // The MPEG-2 picture: no context buffer and no scaling table in the job, references among the last six jobs, the slices behind a start code; the CPU's picture for the
   // k-th job goes into the target.
@@ -513,6 +593,68 @@ static bool run_stream(allocators::IAllocator& a, IVideoDecoder& session, const 
   return same && count == AmdVcnSelfTest::kPictures;
 }
 
+// Feeds the ten-bit H.265 stream to a session; true when every picture came out as the expected one (by presentation time) and none was missing. In P010 the words are the
+// engine's; in I420 they are the words' top bytes (the eight bits a conversion keeps).
+static bool run_hevc10_stream(IVideoDecoder& session, const Hevc10Expected& e, PixelFormat output) {
+  const ConstByteView stream(kHevc10SelfTestStream);
+  uint32_t count = 0;
+  bool same = true;
+  auto drain = [&] {
+    VideoFrame f;
+    while (session.receive(&f)) {
+      const uint32_t k = static_cast<uint32_t>(f.pts_us / 1000);
+      if (k >= e.luma.size() || f.format.pixel_format != output || f.format.width != 64 || f.format.height != 64) { same = false; continue; }
+      for (uint32_t y = 0; y < 64; ++y)
+        for (uint32_t x = 0; x < 64; ++x) {
+          const uint8_t* want = e.luma[k].data() + (y * 64 + x) * 2;
+          if (output == PixelFormat::P010 ? (f.plane[0][uint64_t{y} * f.stride[0] + x * 2] != want[0] || f.plane[0][uint64_t{y} * f.stride[0] + x * 2 + 1] != want[1])
+                                          : f.plane[0][uint64_t{y} * f.stride[0] + x] != want[1])
+            same = false;
+        }
+      for (uint32_t y = 0; y < 32; ++y)
+        for (uint32_t x = 0; x < 32; ++x)
+          for (uint32_t c = 0; c < 2; ++c) {
+            const uint8_t* want = e.chroma[k].data() + (y * 32 + x) * 4 + c * 2;
+            if (output == PixelFormat::P010 ? (f.plane[1][uint64_t{y} * f.stride[1] + x * 4 + c * 2] != want[0] || f.plane[1][uint64_t{y} * f.stride[1] + x * 4 + c * 2 + 1] != want[1])
+                                            : f.plane[1 + c][uint64_t{y} * f.stride[1 + c] + x] != want[1])
+              same = false;
+          }
+      ++count;
+    }
+  };
+  for (uint32_t i = 0; i < kHevc10SelfTestPictures; ++i) {
+    VideoPacket p;
+    const uint64_t start = i == 0 ? 0 : kHevc10SelfTestEnds[i - 1];
+    p.data = stream.subview(start, kHevc10SelfTestEnds[i] - start);
+    p.pts_us = int64_t{i} * 1000;
+    p.keyframe = i == 0;
+    if (session.submit(p) != SubmitResult::Accepted) return false;
+    drain();
+  }
+  session.flush();
+  drain();
+  return same && count == kHevc10SelfTestPictures;
+}
+
+// A session with no way to decode the ten-bit stream (the CPU's, or the engine's when its test did not pass): not a single picture comes out of it.
+static bool ten_bit_refused(IVideoDecoder& session) {
+  const ConstByteView stream(kHevc10SelfTestStream);
+  uint32_t frames = 0;
+  VideoFrame f;
+  for (uint32_t i = 0; i < kHevc10SelfTestPictures; ++i) {
+    VideoPacket p;
+    const uint64_t start = i == 0 ? 0 : kHevc10SelfTestEnds[i - 1];
+    p.data = stream.subview(start, kHevc10SelfTestEnds[i] - start);
+    p.pts_us = int64_t{i} * 1000;
+    p.keyframe = i == 0;
+    session.submit(p);
+    while (session.receive(&f)) ++frames;
+  }
+  session.flush();
+  while (session.receive(&f)) ++frames;
+  return frames == 0;
+}
+
 // Feeds the H.265 self-test stream to a session; true when every picture came out as the CPU's (by presentation time) and none was missing.
 static bool run_hevc_stream(IVideoDecoder& session, const HevcExpected& e) {
   const ConstByteView stream(kHevcSelfTestStream);
@@ -648,7 +790,16 @@ static bool run_vc1_stream(IVideoDecoder& session, ConstByteView stream, const u
   return same && count == kVc1SelfTestPictures;
 }
 
-enum class Fault { None, NoFirmware, NoRegisters, SmallAperture, MapperRefuses, NoBoot, NoGbConfig, DeadRing, WrongPictures, Hang, HevcWrong, HevcHang, SmcNotRunning, SmcRefuses, Mpeg2Wrong, Mpeg2Hang, Vc1Wrong, Vc1Hang, NoDpmTable };
+enum class Fault { None, NoFirmware, NoRegisters, SmallAperture, MapperRefuses, NoBoot, NoGbConfig, DeadRing, WrongPictures, Hang, HevcWrong, HevcHang, SmcNotRunning, SmcRefuses, Mpeg2Wrong, Mpeg2Hang, Vc1Wrong, Vc1Hang, NoDpmTable, Hevc10Wrong };
+
+// The P010 target is laid out at twice the NV12 pitch (the 64 x 64 stream cannot tell: both round up to 256 bytes).
+static void test_target_layouts() {
+  const amd_vcn::TargetLayout nv12 = AmdUvd6HevcDecoder::target_for(160, 64, false), p010 = AmdUvd6HevcDecoder::target_for(160, 64, true);
+  CHECK(nv12.luma_pitch == 256 && p010.luma_pitch == 512 && p010.chroma_pitch == 512);
+  CHECK(p010.chroma_offset == uint64_t{512} * 64 && p010.bytes > nv12.bytes);
+  const amd_vcn::TargetLayout small = AmdUvd6HevcDecoder::target_for(64, 64, true);
+  CHECK(small.luma_pitch == 256 && small.chroma_offset == uint64_t{256} * 64);
+}
 
 static void run_case(Fault fault) {
   TestAllocator a;
@@ -657,6 +808,8 @@ static void run_case(Fault fault) {
     CHECK(make_expected(a, &expected));
     HevcExpected hevc;
     CHECK(make_hevc_expected(a, &hevc));
+    Hevc10Expected hevc10;
+    CHECK(make_hevc10_expected(a, &hevc10));
     Expected mpeg2;
     CHECK(make_mpeg2_expected(a, &mpeg2));
     Expected vc1_main, vc1_advanced;
@@ -667,6 +820,8 @@ static void run_case(Fault fault) {
     card.hevc = &hevc;
     card.write_hevc = fault != Fault::HevcWrong;
     card.hang_hevc = fault == Fault::HevcHang;
+    card.hevc10 = &hevc10;
+    card.write_hevc10 = fault != Fault::Hevc10Wrong;
     card.mpeg2 = &mpeg2;
     card.write_mpeg2 = fault != Fault::Mpeg2Wrong;
     card.hang_mpeg2 = fault == Fault::Mpeg2Hang;
@@ -713,20 +868,22 @@ static void run_case(Fault fault) {
     card.place(engine.plan(), engine.firmware().ucode());
     const size_t writes_before = card.ring.writes.size();
     const bool started = engine.start_hardware(card.clock);
-    const bool engine_up = fault == Fault::None || fault == Fault::HevcWrong || fault == Fault::SmcNotRunning || fault == Fault::SmcRefuses || fault == Fault::Mpeg2Wrong || fault == Fault::Vc1Wrong || fault == Fault::NoDpmTable;
+    const bool engine_up = fault == Fault::None || fault == Fault::HevcWrong || fault == Fault::SmcNotRunning || fault == Fault::SmcRefuses || fault == Fault::Mpeg2Wrong || fault == Fault::Vc1Wrong || fault == Fault::NoDpmTable || fault == Fault::Hevc10Wrong;
     CHECK(started == engine_up);
     CHECK(card.problems == 0 || fault == Fault::WrongPictures);
     if (engine_up) {
       const bool hevc_on = fault != Fault::HevcWrong, mpeg2_on = fault != Fault::Mpeg2Wrong, vc1_on = fault != Fault::Vc1Wrong;
-      CHECK(engine.engine_running() && engine.decode_ready() && engine.hevc_ready() == hevc_on);
+      const bool hevc10_on = hevc_on && fault != Fault::Hevc10Wrong;   // (the ten-bit test only runs when the eight-bit one passed)
+      CHECK(engine.engine_running() && engine.decode_ready() && engine.hevc_ready() == hevc_on && engine.hevc10_ready() == hevc10_on);
+      CHECK((strstr(engine.firmware_status(), "Main 10 test failed (the engine's pictures differ from the stream's hashes)") != nullptr) == (fault == Fault::Hevc10Wrong));
       CHECK(engine.mpeg2_ready() == mpeg2_on && engine.vc1_ready() == vc1_on);
       CHECK(engine.info().accelerated_decode_codecs == (codec_mask(VideoCodec::H264) | (hevc_on ? codec_mask(VideoCodec::Hevc) : 0u) | (mpeg2_on ? codec_mask(VideoCodec::Mpeg2) : 0u) | (vc1_on ? codec_mask(VideoCodec::Vc1) : 0u)));
       CHECK(strstr(engine.engine_note(), !hevc_on ? "H.265 self-test failed" : !mpeg2_on ? "MPEG-2 self-test failed" : !vc1_on ? "VC-1 self-test failed" : "H.264, H.265, MPEG-2 and VC-1 decode run on it") != nullptr && strstr(engine.engine_summary(), "UVD 6.3") != nullptr);
       // The tests opened and closed their own sessions: H.264 (five pictures) and H.265 (six; its session is made even when the test then fails).
-      CHECK(card.creates == 1 && card.hevc_creates == 1 && card.mpeg2_creates == 1 && card.vc1_creates == (vc1_on ? 2 : 1) && card.destroys == (vc1_on ? 5 : 4) && card.decodes == int(AmdVcnSelfTest::kPictures));
+      CHECK(card.creates == 1 && card.hevc_creates == (hevc_on ? 2 : 1) && card.mpeg2_creates == 1 && card.vc1_creates == (vc1_on ? 2 : 1) && card.destroys == (vc1_on ? 5 : 4) + (hevc_on ? 1 : 0) && card.decodes == int(AmdVcnSelfTest::kPictures));
       CHECK(mpeg2_on ? card.mpeg2_decodes == int(kMpeg2SelfTestPictures) : card.mpeg2_decodes > 0);
       CHECK(vc1_on ? card.vc1_decodes == int(2 * kVc1SelfTestPictures) : card.vc1_decodes > 0);
-      CHECK(hevc_on ? card.hevc_decodes == int(kHevcSelfTestPictures) : card.hevc_decodes > 0);   // (a failing test stops at the first wrong picture)
+      CHECK(hevc_on ? card.hevc_decodes == int(kHevcSelfTestPictures + kHevc10SelfTestPictures) && card.hevc10_decodes == int(kHevc10SelfTestPictures) : card.hevc_decodes > 0 && card.hevc10_decodes == 0);   // (a failing test stops at the first wrong picture)
       // H.264 sessions are the engine's: the stream decodes on it (decodes go up) and comes out as the CPU's pictures.
       {
         UniquePointer<IVideoDecoder> first = engine.create_decoder(h264_config());
@@ -748,6 +905,30 @@ static void run_case(Fault fault) {
         UniquePointer<IVideoDecoder> second = engine.create_decoder(hevc_config);   // (the engine is busy: the CPU's)
         CHECK(static_cast<bool>(second) && run_hevc_stream(*second, hevc) && card.hevc_decodes == before);
         CHECK(run_hevc_stream(*first, hevc) && card.hevc_decodes == before + (hevc_on ? int(kHevcSelfTestPictures) : 0));
+      }
+      // Ten-bit H.265 is the engine's alone when its test passed (the CPU has no ten-bit decoder): P010 as the engine wrote it, or converted. When it did not pass, nothing decodes it.
+      {
+        DecoderConfig hevc_config = h264_config();
+        hevc_config.codec = VideoCodec::Hevc;
+        const int before = card.hevc10_decodes;
+        for (PixelFormat output : {PixelFormat::P010, PixelFormat::I420}) {
+          hevc_config.output = output;
+          UniquePointer<IVideoDecoder> session = engine.create_decoder(hevc_config);
+          CHECK(static_cast<bool>(session));
+          if (hevc10_on) {
+            CHECK(run_hevc10_stream(*session, hevc10, output));
+          } else {
+            CHECK(ten_bit_refused(*session));
+          }
+        }
+        CHECK(card.hevc10_decodes == before + (hevc10_on ? 2 * int(kHevc10SelfTestPictures) : 0));
+        // While the engine serves one session, a ten-bit stream on a second one has no CPU to fall back on.
+        if (hevc10_on) {
+          hevc_config.output = PixelFormat::P010;
+          UniquePointer<IVideoDecoder> busy = engine.create_decoder(hevc_config);
+          UniquePointer<IVideoDecoder> second = engine.create_decoder(hevc_config);
+          CHECK(static_cast<bool>(second) && ten_bit_refused(*second));
+        }
       }
       // MPEG-2 sessions are the engine's when its test passed, the CPU's when it did not.
       {
@@ -853,7 +1034,8 @@ static void run_case(Fault fault) {
 }
 
 int main() {
-  for (Fault f : {Fault::None, Fault::NoFirmware, Fault::NoRegisters, Fault::SmallAperture, Fault::MapperRefuses, Fault::NoBoot, Fault::NoGbConfig, Fault::DeadRing, Fault::WrongPictures, Fault::Hang, Fault::HevcWrong, Fault::HevcHang, Fault::SmcNotRunning, Fault::SmcRefuses, Fault::Mpeg2Wrong, Fault::Mpeg2Hang, Fault::Vc1Wrong, Fault::Vc1Hang, Fault::NoDpmTable}) {
+  test_target_layouts();
+  for (Fault f : {Fault::None, Fault::NoFirmware, Fault::NoRegisters, Fault::SmallAperture, Fault::MapperRefuses, Fault::NoBoot, Fault::NoGbConfig, Fault::DeadRing, Fault::WrongPictures, Fault::Hang, Fault::HevcWrong, Fault::HevcHang, Fault::SmcNotRunning, Fault::SmcRefuses, Fault::Mpeg2Wrong, Fault::Mpeg2Hang, Fault::Vc1Wrong, Fault::Vc1Hang, Fault::NoDpmTable, Fault::Hevc10Wrong}) {
     printf("case %d\n", static_cast<int>(f));
     run_case(f);
   }

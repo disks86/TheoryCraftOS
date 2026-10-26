@@ -596,6 +596,9 @@ class GlContext final : public shader::ITextureHost {
   uint32_t hw_target_ = 0;
   bool hw_valid_ = false;
   bool hw_ahead_ = false;
+  AccelTextureCache hw_textures_;   // the device copies of the textures the accelerated draws sampled, by GL name
+  bool hw_texture(uint32_t unit, uint32_t* handle, AccelSampler* sampler);
+  void hw_forget_texture(uint32_t name);
   void hw_drop();
   void hw_sync();
   void hw_cpu_write() { hw_sync(); hw_valid_ = false; }

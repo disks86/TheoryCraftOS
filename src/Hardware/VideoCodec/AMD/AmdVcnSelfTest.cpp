@@ -212,6 +212,41 @@ AmdVcnSelfTest::Result AmdVcnSelfTest::run_hevc_session(allocators::IAllocator& 
   return got == kHevcSelfTestPictures ? Result::Passed : Result::Mismatch;
 }
 
+namespace {
+#include "Hardware/VideoCodec/AMD/AmdVcnSelfTestHevc10Stream.inc"
+}  // namespace
+
+AmdVcnSelfTest::Result AmdVcnSelfTest::run_hevc10_session(allocators::IAllocator&, IVideoDecoder& session, bool (*wedged)(const void*), const void* ring, uint64_t (*decoded)(const void*),
+                                                          H265Decoder::HashStatistics (*hashes)(const void*), const void* decoder) {
+  const ConstByteView stream(kHevc10SelfTestStream);
+  uint32_t got = 0;
+  VideoFrame f;
+  auto drain = [&]() {
+    while (session.receive(&f)) {
+      if (f.format.pixel_format != PixelFormat::P010 || f.format.width != kHevc10SelfTestSize || f.format.height != kHevc10SelfTestSize) return false;
+      ++got;
+    }
+    return true;
+  };
+  for (uint32_t i = 0; i < kHevc10SelfTestPictures; ++i) {
+    const uint64_t start = i == 0 ? 0 : kHevc10SelfTestEnds[i - 1];
+    VideoPacket p;
+    p.data = stream.subview(start, kHevc10SelfTestEnds[i] - start);
+    p.pts_us = int64_t{i} * 1000;
+    p.keyframe = i == 0;
+    if (session.submit(p) != SubmitResult::Accepted) return wedged(ring) ? Result::EngineFailed : Result::SessionRefused;
+    if (!drain()) return Result::Mismatch;
+  }
+  session.flush();
+  if (!drain()) return Result::Mismatch;
+  if (wedged(ring) || session.statistics().errors != 0) return Result::EngineFailed;
+  // Every picture through the engine (a stream the session passed to the CPU would fail there: the CPU cannot decode it), and every one confirmed by the stream's own CRC.
+  if (decoded(decoder) != kHevc10SelfTestPictures) return Result::SessionRefused;
+  const H265Decoder::HashStatistics h = hashes(decoder);
+  if (h.mismatched != 0 || h.checked != kHevc10SelfTestPictures) return Result::HashMismatch;
+  return got == kHevc10SelfTestPictures ? Result::Passed : Result::Mismatch;
+}
+
 AmdVcnSelfTest::Result AmdVcnSelfTest::run_hevc(allocators::IAllocator& allocator, const AmdVcnHevcDecoder::Engine& engine) {
   DecoderConfig config;
   config.codec = VideoCodec::Hevc;
@@ -492,6 +527,7 @@ const char* AmdVcnSelfTest::result_name(Result result) {
     case Result::SessionRefused: return "the engine refused the session";
     case Result::EngineFailed: return "the engine did not finish a picture";
     case Result::Mismatch: return "the engine's pictures differ from the CPU's";
+    case Result::HashMismatch: return "the engine's pictures differ from the stream's hashes";
   }
   return "unknown";
 }
