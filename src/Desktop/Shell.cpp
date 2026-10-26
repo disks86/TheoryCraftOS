@@ -203,19 +203,20 @@ void Shell::execute(StringView line) {
     if (count < 2) return say("usage: stat path");
     return stat(args[1]);
   }
-  if (run_program(command)) return;
+  if (run_program(command, args, count)) return;
   say(command, ": command not found (try help)");
 }
 
-// A command that is not built in but names a file (./tool, /bin/tool, tool in the current folder): programs cannot be run yet, so say so if it is
-// one. False if the word names no ELF or PE file.
-bool Shell::run_program(StringView command) {
+// A command that is not built in but names a file (./tool, /bin/tool, tool in the current folder): run it if the host can, else say it cannot be
+// run. False if the word names no ELF or PE file.
+bool Shell::run_program(StringView command, StringView* args, uint32_t count) {
   String path(allocator_);
   if (!resolve(command, &path)) return false;
   DirectoryEntry entry;
   if (fs_->stat(path.view(), &entry) != Status::Ok || entry.type == NodeType::Directory) return false;
   const exe::ExecutableKind kind = exe::identify_executable_file(*fs_, path.view());
   if (kind == exe::ExecutableKind::None) return false;
+  if (host_.run_executable && host_.run_executable(host_.context, path.view(), kind, ArrayView<const StringView>(args + 1, count - 1))) return true;
   String reason(allocator_);
   if (reason.append(": unsupported executable (") && reason.append(exe::executable_kind_name(kind)) && reason.append(" programs cannot be run yet)")) say(command, reason.view());
   if (host_.unsupported_executable) host_.unsupported_executable(host_.context, path.view(), kind);
@@ -236,6 +237,7 @@ void Shell::help() const {
         "  mv source dest      move or rename\n"
         "  stat path           show what a path is\n"
         "  clear, exit         clear the screen, close the terminal\n"
+        "A word that names an ELF (Linux) or PE (Windows) program runs it: ./tool arg... (see the Linux and Windows folders).\n"
         "Drop a folder from the file explorer on the window to go there; a file puts its path on the line.\n");
 }
 

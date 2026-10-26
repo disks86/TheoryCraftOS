@@ -77,9 +77,11 @@ class Terminal : public gui::Frame {
   static void on_link(void* self, gui::Control&);
   static void on_save_picked(void* self, gui::Control&);
   static void host_write(void* self, StringView text);
+  static void host_write_output(void* self, StringView text);
   static void host_clear(void* self);
   static void host_exit(void* self);
   static void host_unsupported_executable(void* self, StringView path, exe::ExecutableKind kind);
+  static bool host_run_executable(void* self, StringView path, exe::ExecutableKind kind, ArrayView<const StringView> arguments);
   void refresh_prompt();
   void notify(gui::NoticeKind kind, StringView text) { gui::NoticeDialog::post(notices_, manager(), kind, text); }
 

@@ -58,6 +58,7 @@ LoadStatus UserProgram::load(ConstByteView file, ArrayView<const StringView> arg
     exe::PeFile pe(allocator_);
     if (!pe.parse(file)) return LoadStatus::Malformed;
     if (!bind_executable(pe, &binding)) return LoadStatus::Unsupported;
+    if (!pe.imports().empty()) return LoadStatus::NeedsLibraries;      // nothing resolves imports yet: it would jump to address 0
     LoadStatus status = load_pe(pe, file, space_, &image);
     if (status == LoadStatus::Ok) status = map_stack(space_, kDefaultStackBytes, &stack_top);
     if (status != LoadStatus::Ok) return status;

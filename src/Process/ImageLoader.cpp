@@ -44,7 +44,7 @@ struct Run {
 
 LoadStatus load_elf(const exe::ElfFile& elf, ConstByteView file, AddressSpace& space, LoadedImage* out) {
   if (!elf.is_64() || elf.data_encoding() != exe::ElfData::Little) return LoadStatus::Unsupported;
-  if (!elf.interpreter().empty()) return LoadStatus::Unsupported;
+  if (!elf.interpreter().empty()) return LoadStatus::NeedsLibraries;
   if (elf.type() != exe::kElfExecutable && elf.type() != exe::kElfShared) return LoadStatus::Unsupported;
   const uint64_t bias = elf.type() == exe::kElfShared ? kElfPieBase : 0;
 
