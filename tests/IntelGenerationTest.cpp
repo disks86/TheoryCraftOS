@@ -84,6 +84,9 @@ static void test_cpu() {
 static void test_gpu() {
   using A = IntelGpuArchitecture;
   CHECK(intel_gpu_identify(0x3E92).architecture == A::Gen9_5 && intel_gpu_identify(0x9BC8).architecture == A::Gen9_5);
+  // Kaby Lake-G (Dell XPS 15 9575, Core i7-8705G): HD Graphics 630, an integrated Gen9.5 with HEVC and VP9 decode.
+  CHECK(intel_gpu_identify(0x591B).architecture == A::Gen9_5 && !intel_gpu_identify(0x591B).discrete && intel_gpu_identify(0x591B).media_hevc && intel_gpu_identify(0x591B).media_vp9);
+  CHECK(intel_gpu_identify(0x58FF).architecture == A::Unknown && intel_gpu_identify(0x5940).architecture == A::Unknown);
   CHECK(intel_gpu_identify(0x8A52).architecture == A::Gen11 && intel_gpu_identify(0x4E55).architecture == A::Gen11);
   CHECK(intel_gpu_identify(0x9A49).architecture == A::XeLp && intel_gpu_identify(0x4C8A).architecture == A::XeLp);
   CHECK(intel_gpu_identify(0x4680).architecture == A::XeLp && intel_gpu_identify(0xA780).architecture == A::XeLp);
