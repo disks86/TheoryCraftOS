@@ -1414,6 +1414,9 @@ class Parser {
       case NodeKind::Ident:
       case NodeKind::Member:
       case NodeKind::Index: return bind_target(pattern, value, statements, sink);
+      case NodeKind::Call:   // { a: [b] = [1] }: the parser has already lowered `[b] = [1]`
+        if (!(pattern->flags & kFlagPatternAssign) || !pattern->c) break;
+        return destructure(pattern->c, value, statements, sink);
       case NodeKind::Assign: {   // target = default
         if (pattern->op != Op::Assign) break;
         const StringView tmp = temp_name("%t");
@@ -1534,7 +1537,15 @@ class Parser {
     fn->flags |= kFlagArrow;
     fn->list = param;
     fn->a = body;
-    return new_call(fn, {value});
+    Node* call = new_call(fn, {value});
+    Node* original = make(NodeKind::Assign);   // a nested `[b] = [1]` inside a pattern is a default value: destructure() takes the pattern apart again from this
+    if (!call || !original) return nullptr;
+    original->op = Op::Assign;
+    original->a = pattern;
+    original->b = value;
+    call->c = original;
+    call->flags |= kFlagPatternAssign;
+    return call;
   }
 
   // --- Classes
