@@ -27,6 +27,7 @@ namespace process {
 
 enum class LoadStatus : uint8_t {
   Ok,
+  NotExecutable,    // not an ELF or PE file at all
   Malformed,        // the headers contradict the file or each other (a segment outside the file, overlapping segments, an entry point outside the code)
   Unsupported,      // a valid file this loader does not handle yet (a dynamic ELF that needs an interpreter, a 32-bit PE)
   OutOfMemory,      // the address space's byte budget or the allocator ran out

@@ -23,6 +23,8 @@
 #include "Process/ImageLoader.hpp"
 #include "Process/Process.hpp"
 #include "Process/Syscall.hpp"
+#include "Process/UserPageTables.hpp"
+#include "Process/UserProgram.hpp"
 #include "Process/WindowsSyscalls.hpp"
 
 using namespace process;
@@ -30,7 +32,7 @@ using namespace process;
 struct TestAllocator final : allocators::IAllocator {
   int live = 0;
   void* allocate(uint64_t size) override { ++live; return malloc(size); }
-  void* allocate_aligned(uint64_t size, uint64_t) override { return allocate(size); }
+  void* allocate_aligned(uint64_t size, uint64_t align) override { ++live; return aligned_alloc(align, (size + align - 1) / align * align); }
   void deallocate(void* p) override { if (p) { --live; free(p); } }
 };
 
@@ -523,6 +525,137 @@ static void test_windows_memory() {
   CHECK(call(WindowsSyscallNumber::NtFreeVirtualMemory, self, kBaseSlot, kSizeSlot, 0x1234) == 0xC000000Du);
 }
 
+static void test_user_program() {
+  FakeHost host;
+  uint8_t random[16] = {1, 2, 3};
+  const StringView args[] = {"prog"};
+  auto load = [&](UserProgram& up, const Bytes& file) {
+    return up.load(view(file), ArrayView<const StringView>(args, 1), ArrayView<const StringView>(), ConstByteView(random, 16));
+  };
+
+  UserProgram lin(A, 5, host);
+  Bytes elf = make_elf();
+  CHECK(!lin.loaded() && lin.process() == nullptr);
+  CHECK(load(lin, elf) == LoadStatus::Ok && lin.loaded());
+  CHECK(lin.process()->abi() == SyscallAbi::Linux && lin.process()->arch() == UserArch::X86_64);
+  CHECK(lin.start().entry == 0x400100 && lin.start().arch == UserArch::X86_64 && lin.start().stack_pointer % 16 == 0);
+  CHECK(lin.start().stack_pointer < AddressSpace::kUserTop && lin.address_space().check(lin.start().stack_pointer, 8, kProtRead | kProtWrite));
+  CHECK(lin.process()->heap_start() == 0x603000);
+  CHECK(load(lin, elf) == LoadStatus::Malformed);                          // only once
+  SyscallRequest r;
+  r.number = 12; r.args[0] = 0;
+  CHECK(lin.process()->syscall(r) == 0x603000);                            // brk is live
+  r.args[0] = 0x603000 + 100;
+  CHECK(lin.process()->syscall(r) == 0x603000 + 100);
+  r.number = 1; r.args[0] = 1; r.args[1] = 0x601000; r.args[2] = 6;
+  CHECK(lin.process()->syscall(r) == 6 && host.out == "hello\n");
+  r.number = 60; r.args[0] = 3;
+  lin.process()->syscall(r);
+  CHECK(lin.process()->exited() && lin.process()->exit_code() == 3);
+
+  UserProgram win(A, 6, host);
+  CHECK(load(win, make_pe()) == LoadStatus::Ok && win.process()->abi() == SyscallAbi::Windows);
+  CHECK(win.start().entry == 0x100001000ull && win.start().stack_pointer % 16 == 8 && win.address_space().check(win.start().stack_pointer, 8, kProtRead | kProtWrite));
+
+  // Failures leave nothing runnable.
+  UserProgram bad(A, 7, host);
+  Bytes text(100, 'x');
+  CHECK(load(bad, text) == LoadStatus::NotExecutable && !bad.loaded());
+  CHECK(load(bad, Bytes()) == LoadStatus::NotExecutable);
+  UserProgram bsd(A, 8, host);
+  Bytes freebsd = make_elf(); freebsd[7] = 9;
+  CHECK(load(bsd, freebsd) == LoadStatus::Unsupported && !bsd.loaded());
+  UserProgram trunc(A, 9, host);
+  Bytes cut = make_elf(); cut.resize(100);
+  CHECK(load(trunc, cut) != LoadStatus::Ok && !trunc.loaded());
+  UserProgram dll(A, 10, host);
+  Bytes d = make_pe(); put(d, 0x56, 0x2002, 2);
+  CHECK(load(dll, d) == LoadStatus::Unsupported && !dll.loaded());
+  UserProgram tiny(A, 11, host, 64 * 1024);                                 // the stack alone does not fit
+  CHECK(load(tiny, make_elf()) == LoadStatus::OutOfMemory && !tiny.loaded());
+  // Bit flips and truncation of the whole pipeline.
+  Bytes base = make_elf();
+  for (size_t i = 0; i < 64 + 56 * 2; ++i) for (int bit = 0; bit < 8; ++bit) {
+    Bytes f = base; f[i] ^= uint8_t(1 << bit);
+    UserProgram u(A, 12, host);
+    (void)load(u, f);
+  }
+}
+
+// Walks the tables the way the CPU would (the host test's pointers stand in for physical addresses). 0 if the page is not present.
+static uint64_t translate(uint64_t root, uint64_t address, uint64_t* flags) {
+  uint64_t table = root, accumulated = UserPageTables::kUser | UserPageTables::kWritable;
+  const int shifts[4] = {39, 30, 21, 12};
+  for (int level = 0; level < 4; ++level) {
+    const uint64_t entry = reinterpret_cast<const uint64_t*>(table)[(address >> shifts[level]) & 511];
+    if (!(entry & UserPageTables::kPresent)) return 0;
+    accumulated &= entry;
+    if (level == 3) {
+      *flags = (accumulated & (UserPageTables::kUser | UserPageTables::kWritable)) | (entry & UserPageTables::kNoExecute);
+      return (entry & 0x000FFFFFFFFFF000ull) | (address & 0xFFF);
+    }
+    table = entry & 0x000FFFFFFFFFF000ull;
+  }
+  return 0;
+}
+
+static void test_user_page_tables() {
+  AddressSpace s(A);
+  CHECK(s.map(0x400000, 0x2000, kProtRead | kProtExecute));
+  CHECK(s.map(0x601000, 0x1000, kProtRead | kProtWrite));
+  CHECK(s.map(0x7F0000000000ull, 0x1000, 0));                      // no access
+  const uint8_t mark = 0x5A;
+  CHECK(s.write_privileged(0x400010, ConstByteView(&mark, 1)) && s.write_privileged(0x601000, ConstByteView(&mark, 1)));
+
+  alignas(4096) static uint8_t kernel_page[8192];
+  UserPageTables tables(A, true);
+  CHECK(!tables.add_identity({0x1001, 4096, false, false}));      // not page aligned
+  CHECK(!tables.add_identity({0x1000, 0, false, false}));
+  CHECK(tables.add_identity({reinterpret_cast<uint64_t>(kernel_page), 4096, false, true}));
+  CHECK(tables.add_identity({reinterpret_cast<uint64_t>(kernel_page) + 4096, 4096, true, false}));
+  CHECK(!tables.built() && tables.root() == 0);
+  CHECK(tables.sync(s) && tables.built() && tables.root() % 4096 == 0);
+
+  uint64_t flags = 0;
+  AddressSpace::RegionInfo info;
+  CHECK(s.region_at(0, &info));
+  uint64_t pa = translate(tables.root(), 0x400010, &flags);
+  CHECK(pa == reinterpret_cast<uint64_t>(info.storage) + 0x10 && *reinterpret_cast<const uint8_t*>(pa) == 0x5A);
+  CHECK((flags & UserPageTables::kUser) && !(flags & UserPageTables::kWritable) && !(flags & UserPageTables::kNoExecute));     // code: user, read-only, executable
+  CHECK(translate(tables.root(), 0x401FFF, &flags) != 0 && translate(tables.root(), 0x402000, &flags) == 0);
+  CHECK(translate(tables.root(), 0x601000, &flags) != 0 && (flags & UserPageTables::kWritable) && (flags & UserPageTables::kNoExecute));       // data: writable, no-execute
+  CHECK(translate(tables.root(), 0x7F0000000000ull, &flags) == 0);                      // PROT_NONE: nothing mapped
+  CHECK(translate(tables.root(), 0x1000, &flags) == 0 && translate(tables.root(), 0, &flags) == 0);
+  const uint64_t k = reinterpret_cast<uint64_t>(kernel_page);
+  CHECK(translate(tables.root(), k + 5, &flags) == k + 5 && !(flags & UserPageTables::kUser) && !(flags & UserPageTables::kNoExecute) && !(flags & UserPageTables::kWritable));
+  CHECK(translate(tables.root(), k + 4096, &flags) == k + 4096 && !(flags & UserPageTables::kUser) && (flags & UserPageTables::kWritable) && (flags & UserPageTables::kNoExecute));
+
+  // Unchanged space: no rebuild. A change: rebuilt, and the new layout shows.
+  const uint64_t root = tables.root();
+  CHECK(tables.sync(s) && tables.root() == root);
+  CHECK(s.unmap(0x601000, 0x1000) && s.map(0x800000, 0x1000, kProtRead | kProtWrite));
+  CHECK(tables.sync(s) && translate(tables.root(), 0x601000, &flags) == 0 && translate(tables.root(), 0x800000, &flags) != 0);
+  CHECK(translate(tables.root(), k + 5, &flags) == k + 5);      // the kernel pages survive a rebuild
+  // The heap moving to bigger memory is noticed.
+  CHECK(s.map(0x900000, 0x1000, kProtRead | kProtWrite) && tables.sync(s));
+  const uint64_t before = translate(tables.root(), 0x900000, &flags);
+  CHECK(s.resize(0x900000, 0x10000) && tables.sync(s));
+  CHECK(translate(tables.root(), 0x900000, &flags) != 0 && translate(tables.root(), 0x90F000, &flags) != 0 && before != 0);
+
+  // Without NX the bit is never set.
+  UserPageTables plain(A, false);
+  CHECK(plain.sync(s) && translate(plain.root(), 0x800000, &flags) != 0 && !(flags & UserPageTables::kNoExecute));
+  // Out of memory while building leaves nothing half-built.
+  struct Limited final : allocators::IAllocator {
+    int left = 3;
+    void* allocate(uint64_t size) override { return left-- > 0 ? malloc(size) : nullptr; }
+    void* allocate_aligned(uint64_t size, uint64_t a) override { return left-- > 0 ? aligned_alloc(a, size) : nullptr; }
+    void deallocate(void* p) override { free(p); }
+  } limited;
+  UserPageTables starved(limited, true);
+  CHECK(!starved.rebuild(s) && !starved.built() && starved.root() == 0);
+}
+
 int main() {
   test_address_space();
   test_load_elf();
@@ -531,6 +664,8 @@ int main() {
   test_stacks();
   test_linux_memory();
   test_windows_memory();
+  test_user_program();
+  test_user_page_tables();
   CHECK(A.live == 0);
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);

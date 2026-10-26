@@ -58,6 +58,12 @@ struct Thread {
   uint64_t cpu_ticks = 0;      // timer ticks that found it running
   WaitList* waiting_on = nullptr;
   WaitList joiners;
+  // User mode (x86-64): a thread that runs a user-mode program has its page tables here (0 for kernel threads); the scheduler hands them to the core
+  // it runs on. `user_gs` is the program's GS base while the thread is in the kernel. `stack_top` is where its kernel stack ends.
+  uint8_t* stack_top = nullptr;
+  uint64_t user_cr3 = 0;
+  uint64_t user_gs = 0;
+  void* user_context = nullptr;
 };
 
 constexpr uint32_t kDefaultStackBytes = 8 * 1024 * 1024;   // (what Linux gives a thread; reading a big web page and running its scripts is deep)

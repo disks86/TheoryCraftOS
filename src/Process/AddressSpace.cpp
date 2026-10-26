@@ -19,6 +19,38 @@
 
 namespace process {
 
+bool AddressSpace::Region::allocate(uint64_t bytes) {
+  release();
+  void* memory = allocator_.allocate_aligned(bytes, kPageSize);
+  if (!memory) return false;
+  storage = static_cast<uint8_t*>(memory);
+  capacity = bytes;
+  ByteView(storage, bytes).fill(0);
+  return true;
+}
+
+void AddressSpace::Region::release() {
+  if (storage) allocator_.deallocate(storage);
+  storage = nullptr;
+  capacity = 0;
+}
+
+bool AddressSpace::overlaps_reserved(uint64_t start, uint64_t end, uint64_t* reserved_end) const {
+  for (const AddressRange& r : reserved_) {
+    if (r.size == 0 || start >= r.base + r.size || end <= r.base) continue;
+    if (reserved_end) *reserved_end = r.base + r.size;
+    return true;
+  }
+  return false;
+}
+
+bool AddressSpace::region_at(uint64_t index, RegionInfo* out) const {
+  if (index >= regions_.count()) return false;
+  const Region& r = *regions_[index];
+  *out = RegionInfo{r.base, r.size, r.protection, r.storage};
+  return true;
+}
+
 uint64_t AddressSpace::first_ending_after(uint64_t address) const {
   uint64_t low = 0, high = regions_.count();
   while (low < high) {
@@ -36,16 +68,18 @@ bool AddressSpace::map(uint64_t address, uint64_t size, uint8_t protection) {
   if (rounded > max_bytes_ || mapped_bytes_ > max_bytes_ - rounded) return false;
   const uint64_t index = first_ending_after(address);
   if (index < regions_.count() && regions_[index]->base < address + rounded) return false;      // overlaps the region after
+  if (overlaps_reserved(address, address + rounded)) return false;
   UniquePointer<Region> region = UniquePointer<Region>::make(allocator_, allocator_);
   if (!region) return false;
   region->base = address;
   region->size = rounded;
   region->protection = protection;
   region->allocation = next_allocation_;
-  if (!region->data.put_zeros(rounded)) return false;
+  if (!region->allocate(rounded)) return false;
   if (!regions_.insert(index, static_cast<UniquePointer<Region>&&>(region))) return false;
   mapped_bytes_ += rounded;
   ++next_allocation_;
+  ++generation_;
   return true;
 }
 
@@ -67,10 +101,10 @@ bool AddressSpace::split_at(uint64_t address) {
   tail->size = r.size - offset;
   tail->protection = r.protection;
   tail->allocation = r.allocation;
-  if (!tail->data.append(r.data.view().subview(offset))) return false;
+  if (!tail->allocate(tail->size) || !ByteView(tail->storage, tail->size).copy_from(ConstByteView(r.storage + offset, tail->size))) return false;
   if (!regions_.insert(i + 1, static_cast<UniquePointer<Region>&&>(tail))) return false;
-  r.size = offset;
-  r.data.truncate(offset);
+  r.size = offset;      // its memory stays (the tail pages are simply unused until it is released)
+  ++generation_;
   return true;
 }
 
@@ -83,6 +117,7 @@ bool AddressSpace::unmap(uint64_t address, uint64_t size) {
     mapped_bytes_ -= regions_[first]->size;
     regions_.remove_at(first);
   }
+  ++generation_;
   return true;
 }
 
@@ -91,6 +126,7 @@ bool AddressSpace::protect(uint64_t address, uint64_t size, uint8_t protection) 
   if (!prepare_range(address, size, &end) || !check(address, end - address, 0)) return false;
   if (!split_at(address) || !split_at(end)) return false;
   for (uint64_t i = first_ending_after(address); i < regions_.count() && regions_[i]->base < end; ++i) regions_[i]->protection = protection;
+  ++generation_;
   return true;
 }
 
@@ -103,19 +139,33 @@ bool AddressSpace::resize(uint64_t base, uint64_t size) {
   if (rounded == 0) {
     mapped_bytes_ -= r.size;
     regions_.remove_at(i);
+    ++generation_;
     return true;
   }
   if (rounded > r.size) {
     const uint64_t extra = rounded - r.size;
     if (base >= kUserTop || rounded > kUserTop - base || extra > max_bytes_ || mapped_bytes_ > max_bytes_ - extra) return false;
     if (i + 1 < regions_.count() && regions_[i + 1]->base < base + rounded) return false;
-    if (!r.data.put_zeros(extra)) return false;
+    if (overlaps_reserved(base + r.size, base + rounded)) return false;
+    if (rounded > r.capacity) {
+      // Move to bigger page-aligned memory.
+      Region bigger(allocator_);
+      if (!bigger.allocate(rounded)) return false;
+      if (r.size) ByteView(bigger.storage, rounded).first(r.size).copy_from(ConstByteView(r.storage, r.size));
+      uint8_t* old = r.storage;
+      r.storage = bigger.storage;
+      r.capacity = bigger.capacity;
+      bigger.storage = old;      // `bigger` now owns (and frees) the old memory
+      bigger.capacity = 0;
+    } else {
+      ByteView(r.storage + r.size, extra).fill(0);      // pages that were cut off earlier come back zeroed
+    }
     mapped_bytes_ += extra;
   } else {
     mapped_bytes_ -= r.size - rounded;
-    r.data.truncate(rounded);
   }
   r.size = rounded;
+  ++generation_;
   return true;
 }
 
@@ -132,13 +182,18 @@ bool AddressSpace::find_free(uint64_t size, uint64_t hint, uint64_t* out) const 
   if (size == 0 || !round_up(size, &rounded) || rounded > kUserTop) return false;
   uint64_t candidate = round_down(hint);
   if (candidate < kPageSize) candidate = kPageSize;      // never hand out page zero
-  for (uint64_t i = first_ending_after(candidate);; ++i) {
+  for (;;) {
     if (candidate > kUserTop - rounded) return false;
-    if (i >= regions_.count() || regions_[i]->base >= candidate + rounded) {
+    uint64_t after = 0;
+    const uint64_t i = first_ending_after(candidate);
+    if (i < regions_.count() && regions_[i]->base < candidate + rounded) {
+      candidate = regions_[i]->base + regions_[i]->size;      // occupied: look after that region
+    } else if (overlaps_reserved(candidate, candidate + rounded, &after)) {
+      if (!round_up(after, &candidate)) return false;
+    } else {
       *out = candidate;
       return true;
     }
-    candidate = regions_[i]->base + regions_[i]->size;
   }
 }
 
@@ -183,7 +238,7 @@ bool AddressSpace::copy_out(uint64_t address, ByteView out) const {
     const uint64_t at = address + done;
     const uint64_t offset = at - r.base;
     const uint64_t n = out.size() - done < r.size - offset ? out.size() - done : r.size - offset;
-    if (!out.subview(done, n).copy_from(r.data.view().subview(offset, n))) return false;
+    if (!out.subview(done, n).copy_from(ConstByteView(r.storage + offset, n))) return false;
     done += n;
   }
   return true;
@@ -197,7 +252,7 @@ bool AddressSpace::copy_in(uint64_t address, ConstByteView data) {
     const uint64_t at = address + done;
     const uint64_t offset = at - r.base;
     const uint64_t n = data.size() - done < r.size - offset ? data.size() - done : r.size - offset;
-    if (!r.data.writable_view().subview(offset, n).copy_from(data.subview(done, n))) return false;
+    if (!r.bytes().subview(offset, n).copy_from(data.subview(done, n))) return false;
     done += n;
   }
   return true;
