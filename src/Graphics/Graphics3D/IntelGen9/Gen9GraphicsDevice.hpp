@@ -36,7 +36,7 @@ namespace graphics {
 // clips the triangles (near plane and a guard band), applies the viewport, culls, and hands the engine window-space triangles; the engine interpolates the colour and
 // blends, tests depth and interpolates the colour perspective-correct from the 1/w the vertices carry. Only B8G8R8A8 and R8G8B8A8 colour images and D32Float depth images
 // up to 4096 x 4096 exist (a depth image is Y-tiled hardware memory: it cannot be read back). A render pass clears depth with a job that draws the clear value and passes
-// every pixel. Textures (BuiltinShaders' textured pair, one texture unit, nearest or linear, wrap or clamp) are drawn by the same path with the copy kernel sampling the bound image. Not done: stencil, and anything the built-in pipelines do not do.
+// every pixel. Textures (BuiltinShaders' textured pair, one texture unit, nearest or linear, wrap or clamp) are drawn by the same path with the copy kernel sampling the bound image. A D32Float image can have a stencil plane (W-tiled, opaque) and a pipeline a stencil test. Not done: tiled colour images, mipmaps, and anything the built-in pipelines do not do.
 // Nothing here has run on a real GPU (see docs/DellXps9575.md).
 class Gen9GraphicsDevice final : public IGraphicsDevice {
  public:

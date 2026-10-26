@@ -692,10 +692,211 @@ static void test_textures() {
   p.gpu->destroy_image(depth);
 }
 
+// --- Stencil --------------------------------------------------------------------
+
+struct StencilItem {
+  float x0, y0, x1, y1, z;
+  float rgba[4];
+  StencilState stencil;
+  bool depth_test = false, depth_write = false;
+};
+
+// Runs the items in one render pass on `device` (colour cleared to black, depth to 1, stencil to `clear`) with a depth image that has a stencil plane (or `plain_depth`), and reads the
+// picture back. False if the recording or the submit failed.
+static bool stencil_run(IGraphicsDevice& device, const std::vector<StencilItem>& items, uint8_t clear, std::vector<uint32_t>* out, IImage* plain_depth = nullptr) {
+  IShaderModule* vs = device.create_shader_module(colored_vertex_shader());
+  IShaderModule* fs = device.create_shader_module(colored_fragment_shader());
+  IImage* color = device.create_image({{kSize, kSize}, Format::B8G8R8A8Unorm, kImageColorAttachment});
+  ImageDesc dd{{kSize, kSize}, Format::D32Float, kImageDepthAttachment};
+  dd.stencil = true;
+  IImage* depth = plain_depth ? plain_depth : device.create_image(dd);
+  bool ok = vs && fs && color && depth;
+  std::vector<IPipeline*> pipelines;
+  std::vector<IBuffer*> buffers;
+  ICommandBuffer* cb = ok ? device.create_command_buffer() : nullptr;
+  if (cb) {
+    cb->begin();
+    RenderPassBegin pass;
+    pass.color = color;
+    pass.depth = depth;
+    pass.clear_color_value = {0, 0, 0, 1};
+    pass.clear_stencil_value = clear;
+    cb->begin_render_pass(pass);
+    for (const StencilItem& it : items) {
+      GraphicsPipelineDesc pd;
+      describe_colored_pipeline(&pd);
+      pd.vertex_shader = vs;
+      pd.fragment_shader = fs;
+      pd.cull_mode = CullMode::None;
+      pd.stencil = it.stencil;
+      pd.depth_test = it.depth_test;
+      pd.depth_write = it.depth_write;
+      IPipeline* pipeline = device.create_graphics_pipeline(pd);
+      pipelines.push_back(pipeline);
+      const float* c = it.rgba;
+      const ColoredVertex v[6] = {cv(it.x0, it.y0, it.z, c[0], c[1], c[2], c[3]), cv(it.x0, it.y1, it.z, c[0], c[1], c[2], c[3]), cv(it.x1, it.y1, it.z, c[0], c[1], c[2], c[3]),
+                                  cv(it.x0, it.y0, it.z, c[0], c[1], c[2], c[3]), cv(it.x1, it.y1, it.z, c[0], c[1], c[2], c[3]), cv(it.x1, it.y0, it.z, c[0], c[1], c[2], c[3])};
+      IBuffer* vb = device.create_buffer(sizeof v + 16, kBufferVertex);
+      buffers.push_back(vb);
+      if (vb && pipeline) {
+        memcpy(vb->map().data(), v, sizeof v);
+        vb->unmap();
+        cb->bind_pipeline(pipeline);
+        cb->bind_vertex_buffer(vb);
+        const Mat4 id = Mat4::identity();
+        cb->push_constants(&id, sizeof id);
+        cb->draw(6);
+      } else {
+        ok = false;
+      }
+    }
+    cb->end_render_pass();
+    ok = ok && cb->end() && device.submit(cb);
+    device.destroy_command_buffer(cb);
+  } else {
+    ok = false;
+  }
+  if (ok && out) *out = read(color);
+  for (IPipeline* p : pipelines) if (p) device.destroy_pipeline(p);
+  for (IBuffer* b : buffers) if (b) device.destroy_buffer(b);
+  if (color) device.destroy_image(color);
+  if (depth && !plain_depth) device.destroy_image(depth);
+  if (vs) device.destroy_shader_module(vs);
+  if (fs) device.destroy_shader_module(fs);
+  return ok;
+}
+
+static void test_stencil() {
+  Pair p;
+  CHECK(p.gpu);
+  if (!p.gpu) return;
+  const float white[4] = {1, 1, 1, 1}, black[4] = {0, 0, 0, 1};
+  auto item = [](float x0, float y0, float x1, float y1, float z, const float* rgba, StencilState st, bool dt = false, bool dw = false) {
+    StencilItem it{x0, y0, x1, y1, z, {rgba[0], rgba[1], rgba[2], rgba[3]}, st, dt, dw};
+    return it;
+  };
+  auto equals = [](uint8_t value) {
+    StencilState st;
+    st.enable = true;
+    st.compare = CompareOp::Equal;
+    st.reference = value;
+    return st;
+  };
+  // Both devices run the scene; the pictures agree (up to the pixels on the diagonal between a rectangle's two triangles) and show what the scene is supposed to show.
+  auto both = [&](const std::vector<StencilItem>& items, uint8_t clear, bool expect_white_at_probe, uint32_t probe_x, uint32_t probe_y, const char* what) {
+    std::vector<uint32_t> gpu_picture, soft_picture;
+    const int jobs = p.rig.gpu.jobs;
+    CHECK(stencil_run(*p.gpu, items, clear, &gpu_picture));
+    CHECK(stencil_run(p.software, items, clear, &soft_picture));
+    CHECK(p.rig.gpu.jobs > jobs && p.rig.gpu.violations.empty());
+    const uint32_t bad = differing(gpu_picture, soft_picture, 0);
+    if (bad > 140) printf("  stencil scene \"%s\": %u pixels differ\n", what, bad);
+    CHECK(bad <= 140);
+    if (gpu_picture.size() == kSize * kSize) {
+      const bool white_here = gpu_picture[probe_y * kSize + probe_x] == 0xFFFFFFFF;
+      if (white_here != expect_white_at_probe) printf("  stencil scene \"%s\": the probe is %s\n", what, white_here ? "white" : "black");
+      CHECK(white_here == expect_white_at_probe);
+    }
+  };
+  // The clear value and a test against it.
+  both({item(-1, -1, 1, 1, 0.5f, white, equals(0))}, 0, true, 30, 20, "cleared to 0, equals 0");
+  both({item(-1, -1, 1, 1, 0.5f, white, equals(5))}, 0, false, 30, 20, "cleared to 0, equals 5");
+  both({item(-1, -1, 1, 1, 0.5f, white, equals(5))}, 5, true, 30, 20, "cleared to 5, equals 5");
+  // Every compare function: the reference 3, 5, 7 against a stored 5.
+  struct Case { CompareOp op; bool less, equal, greater; };
+  const Case cases[] = {{CompareOp::Never, false, false, false}, {CompareOp::Less, true, false, false}, {CompareOp::Equal, false, true, false}, {CompareOp::LessEqual, true, true, false},
+                        {CompareOp::Greater, false, false, true}, {CompareOp::NotEqual, true, false, true}, {CompareOp::GreaterEqual, false, true, true}, {CompareOp::Always, true, true, true}};
+  for (const Case& c : cases) {
+    const uint8_t refs[3] = {3, 5, 7};
+    const bool expect[3] = {c.less, c.equal, c.greater};
+    for (int i = 0; i < 3; ++i) {
+      StencilState st;
+      st.enable = true;
+      st.compare = c.op;
+      st.reference = refs[i];
+      both({item(-1, -1, 1, 1, 0.5f, white, st)}, 5, expect[i], 30, 20, "compare function");
+    }
+  }
+  // Every operation, from a stored value, then probed for the expected result (the reference is 9).
+  struct OpCase { StencilOp op; uint8_t start, expect; };
+  const OpCase ops[] = {{StencilOp::Keep, 250, 250}, {StencilOp::Zero, 250, 0}, {StencilOp::Replace, 250, 9}, {StencilOp::IncrementClamp, 250, 251}, {StencilOp::IncrementClamp, 255, 255},
+                        {StencilOp::DecrementClamp, 250, 249}, {StencilOp::DecrementClamp, 0, 0}, {StencilOp::Invert, 0x0F, 0xF0}, {StencilOp::IncrementWrap, 255, 0},
+                        {StencilOp::DecrementWrap, 0, 255}, {StencilOp::IncrementWrap, 1, 2}};
+  for (const OpCase& c : ops) {
+    StencilState write;
+    write.enable = true;
+    write.pass_op = c.op;
+    write.reference = 9;
+    both({item(-1, -1, 1, 1, 0.5f, black, write), item(-1, -1, 1, 1, 0.5f, white, equals(c.expect))}, c.start, true, 30, 20, "operation");
+  }
+  // A mask: only the left half is written, and the write and compare masks.
+  {
+    StencilState left;
+    left.enable = true;
+    left.pass_op = StencilOp::Replace;
+    left.reference = 1;
+    both({item(-1, -1, 0, 1, 0.5f, black, left), item(-1, -1, 1, 1, 0.5f, white, equals(1))}, 0, true, 10, 40, "left half written");
+    both({item(-1, -1, 0, 1, 0.5f, black, left), item(-1, -1, 1, 1, 0.5f, white, equals(1))}, 0, false, 50, 40, "right half not written");
+    StencilState masked;
+    masked.enable = true;
+    masked.pass_op = StencilOp::Replace;
+    masked.reference = 0xFF;
+    masked.write_mask = 0x0F;
+    both({item(-1, -1, 1, 1, 0.5f, black, masked), item(-1, -1, 1, 1, 0.5f, white, equals(0xAF))}, 0xA0, true, 30, 20, "write mask");
+    StencilState compare_masked;
+    compare_masked.enable = true;
+    compare_masked.compare = CompareOp::Equal;
+    compare_masked.compare_mask = 0xF0;
+    compare_masked.reference = 0xAF;
+    both({item(-1, -1, 1, 1, 0.5f, white, compare_masked)}, 0xA5, true, 30, 20, "compare mask");
+  }
+  // Fail, depth-fail and pass operations are separate.
+  {
+    StencilState fail;
+    fail.enable = true;
+    fail.compare = CompareOp::Never;
+    fail.fail_op = StencilOp::Replace;
+    fail.pass_op = StencilOp::Zero;
+    fail.depth_fail_op = StencilOp::Zero;
+    fail.reference = 4;
+    both({item(-1, -1, 1, 1, 0.5f, white, fail), item(-1, -1, 1, 1, 0.5f, white, equals(4))}, 0, true, 30, 20, "fail op");
+    StencilState none;
+    StencilState counted;
+    counted.enable = true;
+    counted.depth_fail_op = StencilOp::IncrementClamp;
+    counted.pass_op = StencilOp::Zero;
+    const std::vector<StencilItem> depth_scene = {item(-1, -1, 0, 1, 0.2f, black, none, true, true), item(-1, -1, 1, 1, 0.8f, black, counted, true, false),
+                                                  item(-1, -1, 0, 1, 0.5f, white, equals(1)), item(0, -1, 1, 1, 0.5f, white, equals(0))};
+    both(depth_scene, 0, true, 10, 40, "depth fail op, behind");
+    both(depth_scene, 0, true, 50, 40, "pass op, in front");
+  }
+  // Refusals: a stencil test needs a stencil plane; a stencil plane goes with a depth image; memory comes back.
+  {
+    IImage* plain = p.gpu->create_image({{kSize, kSize}, Format::D32Float, kImageDepthAttachment});
+    CHECK(plain);
+    CHECK(!stencil_run(*p.gpu, {item(-1, -1, 1, 1, 0.5f, white, equals(0))}, 0, nullptr, plain));
+    CHECK(stencil_run(*p.gpu, {item(-1, -1, 1, 1, 0.5f, white, StencilState())}, 0, nullptr, plain));
+    p.gpu->destroy_image(plain);
+    ImageDesc bad{{kSize, kSize}, Format::B8G8R8A8Unorm, kImageColorAttachment};
+    bad.stencil = true;
+    CHECK(p.gpu->create_image(bad) == nullptr);
+    const int before = p.rig.mem.live();
+    for (int i = 0; i < 20; ++i) {
+      ImageDesc d{{256, 256}, Format::D32Float, kImageDepthAttachment};
+      d.stencil = true;
+      IImage* image = p.gpu->create_image(d);
+      CHECK(image);
+      p.gpu->destroy_image(image);
+    }
+    CHECK(p.rig.mem.live() == before);
+  }
+}
+
 int main() {
   test_resources();
   test_scenes();
   test_textures();
+  test_stencil();
   test_present_and_failures();
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }
   printf("gen9 graphics device tests passed\n");

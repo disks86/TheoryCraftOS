@@ -129,6 +129,16 @@ static void execute(FakeGpu& gpu, const std::vector<uint32_t>& dump) {
   const bool depth_test = has_depth && ds != 0xFFFFFFFFu && (dump[ds + 1] & (1u << 1));
   const uint32_t depth_func = ds != 0xFFFFFFFFu ? (dump[ds + 1] >> 5) & 7 : 7;
   if (has_depth) CHECK(dump[db + 1] & (1u << 18));   // D32_FLOAT
+  // The stencil test (3DSTATE_WM_DEPTH_STENCIL) and the stencil buffer packet (3DSTATE_STENCIL_BUFFER): on only when both say so.
+  const uint32_t sb = d.one(kStencilBuffer);
+  const bool stencil_buffer_on = sb != 0xFFFFFFFFu && (dump[sb + 1] & (1u << 31));
+  const bool stencil_test = has_depth && ds != 0xFFFFFFFFu && (dump[ds + 1] & (1u << 3));
+  const bool stencil_write = stencil_test && (dump[ds + 1] & (1u << 2)) && (dump[db + 1] & (1u << 27));
+  if (stencil_test) CHECK(stencil_buffer_on);   // a stencil test needs the buffer
+  const uint64_t stencil_base = stencil_buffer_on ? (uint64_t{dump[sb + 3]} << 32) | dump[sb + 2] : 0;
+  const uint32_t stencil_func = stencil_test ? (dump[ds + 1] >> 8) & 7 : 7, stencil_pass_op = stencil_test ? (dump[ds + 1] >> 23) & 7 : 0, stencil_depth_fail_op = stencil_test ? (dump[ds + 1] >> 26) & 7 : 0,
+                 stencil_fail_op = stencil_test ? (dump[ds + 1] >> 29) & 7 : 0, stencil_write_mask = stencil_test ? (dump[ds + 2] >> 16) & 0xFF : 0, stencil_compare_mask = stencil_test ? (dump[ds + 2] >> 24) & 0xFF : 0,
+                 stencil_ref = stencil_test ? (dump[ds + 3] >> 8) & 0xFF : 0;
   // Binding table entry 0, its surface state, and the target.
   uint32_t entry = 0, ss[10] = {};
   if (!read_dword(gpu, uint64_t{surface_base} + dump[bt + 1], &entry, "binding table")) return;
@@ -228,16 +238,51 @@ static void execute(FakeGpu& gpu, const std::vector<uint32_t>& dump) {
         ok = ok && mapped;
       }
       if (!ok) continue;
+      bool depth_passes = true;
+      uint8_t* depth_word = nullptr;
       if (has_depth) {
         bool mapped;
-        uint8_t* stored = gpu.ppgtt_bytes(depth_base + uint64_t{static_cast<uint32_t>(y)} * depth_pitch + static_cast<uint32_t>(x) * 4, 4, "depth buffer", &mapped);
+        depth_word = gpu.ppgtt_bytes(depth_base + uint64_t{static_cast<uint32_t>(y)} * depth_pitch + static_cast<uint32_t>(x) * 4, 4, "depth buffer", &mapped);
         if (!mapped) continue;
         float old_z;
-        memcpy(&old_z, stored, 4);
-        const bool passes = !depth_test || depth_func == 7 || (depth_func == 3 && z <= old_z);
-        if (!passes) continue;
-        if (depth_write) memcpy(stored, &z, 4);
+        memcpy(&old_z, depth_word, 4);
+        depth_passes = !depth_test || depth_func == 7 || (depth_func == 3 && z <= old_z);
       }
+      if (stencil_test) {
+        // The stencil test first, then the depth test: each outcome has its own operation, applied through the write mask. (The model keeps the stencil values in rows of the
+        // target's width; the hardware's W tiling, which the device never looks at, is not modelled.)
+        bool mapped;
+        uint8_t* value = gpu.ppgtt_bytes(stencil_base + uint64_t{static_cast<uint32_t>(y)} * width + static_cast<uint32_t>(x), 1, "stencil buffer", &mapped);
+        if (!mapped) continue;
+        const uint32_t stored = *value, ref = stencil_ref & stencil_compare_mask, masked = stored & stencil_compare_mask;
+        bool test_passes = false;
+        switch (stencil_func) {
+          case 0: test_passes = false; break;
+          case 1: test_passes = ref < masked; break;
+          case 2: test_passes = ref == masked; break;
+          case 3: test_passes = ref <= masked; break;
+          case 4: test_passes = ref > masked; break;
+          case 5: test_passes = ref != masked; break;
+          case 6: test_passes = ref >= masked; break;
+          default: test_passes = true; break;
+        }
+        const uint32_t op = !test_passes ? stencil_fail_op : !depth_passes ? stencil_depth_fail_op : stencil_pass_op;
+        uint32_t result = stored;
+        switch (op) {   // 3D_Stencil_Operation
+          case 1: result = 0; break;
+          case 2: result = stencil_ref; break;
+          case 3: result = stored == 255 ? 255 : stored + 1; break;
+          case 4: result = stored == 0 ? 0 : stored - 1; break;
+          case 5: result = (stored + 1) & 0xFF; break;
+          case 6: result = (stored - 1) & 0xFF; break;
+          case 7: result = ~stored & 0xFF; break;
+          default: break;
+        }
+        if (stencil_write) *value = static_cast<uint8_t>((stored & ~stencil_write_mask) | (result & stencil_write_mask));
+        if (!test_passes) continue;
+      }
+      if (!depth_passes) continue;
+      if (depth_write && depth_word) memcpy(depth_word, &z, 4);
       if (!writes_color) continue;
       // The target's byte order: B8G8R8A8 is blue first.
       const int red = format == 0x0C0 ? 2 : 0, blue = format == 0x0C0 ? 0 : 2;

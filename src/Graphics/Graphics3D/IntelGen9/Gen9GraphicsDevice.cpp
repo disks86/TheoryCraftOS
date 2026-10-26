@@ -25,6 +25,9 @@ namespace graphics {
 using namespace hardware;
 using namespace hardware::intel_gt;
 using hardware::intel_gt::gen9_3d::Blend;
+using hardware::intel_gt::gen9_3d::CompareFunc;
+using hardware::intel_gt::gen9_3d::StencilAction;
+using hardware::intel_gt::gen9_3d::StencilBuffer;
 using hardware::intel_gt::gen9_3d::DepthBuffer;
 using hardware::intel_gt::gen9_3d::DrawState;
 using hardware::intel_gt::gen9_3d::Rect;
@@ -95,6 +98,14 @@ class Gen9Image final : public IImage {
     return s;
   }
   bool is_depth() const { return desc_.format == Format::D32Float; }
+  bool has_stencil() const { return desc_.stencil; }
+  hardware::intel_gt::gen9_3d::StencilBuffer stencil_buffer() const {
+    hardware::intel_gt::gen9_3d::StencilBuffer b;
+    b.gpu_address = stencil_address_;
+    b.width = desc_.extent.width;
+    b.height = desc_.extent.height;
+    return b;
+  }
   DepthBuffer depth_buffer() const {
     DepthBuffer d;
     d.gpu_address = address_;
@@ -132,6 +143,8 @@ class Gen9Image final : public IImage {
   GpuBuffer buffer_;
   uint32_t address_ = 0;
   uint32_t pitch_ = 0;
+  GpuBuffer stencil_buffer_memory_;   // the stencil plane (W-tiled, opaque), when the image has one
+  uint32_t stencil_address_ = 0;
 
  private:
   ImageDesc desc_;
@@ -328,6 +341,7 @@ IImage* Gen9GraphicsDevice::create_image(const ImageDesc& desc) {
   const bool depth = desc.format == Format::D32Float;
   if (!depth && desc.format != Format::B8G8R8A8Unorm && desc.format != Format::R8G8B8A8Unorm) return nullptr;
   if (depth != ((desc.usage & kImageDepthAttachment) != 0) || (depth && (desc.usage & (kImageColorAttachment | kImagePresent)))) return nullptr;
+  if (desc.stencil && !depth) return nullptr;   // (a stencil plane goes with a depth image)
   Gen9Image* image = make<Gen9Image>(allocator_, desc);
   if (!image) return nullptr;
   // A depth buffer is Y-tiled (rows of tiles of 128 bytes by 32 rows) and opaque to us; a colour image is linear.
@@ -343,6 +357,15 @@ IImage* Gen9GraphicsDevice::create_image(const ImageDesc& desc) {
     if (image->buffer_.cpu.try_cast<uint32_t>(&words))
       for (uint32_t& word : words) word = 0x3F800000;
   }
+  if (desc.stencil) {
+    // The stencil plane is W-tiled and opaque too; all zeros is a stencil of zero in any layout.
+    if (!allocate_region(StencilBuffer::bytes_for(w, h), &image->stencil_buffer_memory_, &image->stencil_address_)) {
+      free_region(image->buffer_, image->address_);
+      destroy(allocator_, image);
+      return nullptr;
+    }
+    image->stencil_buffer_memory_.cpu.fill(0);
+  }
   return image;
 }
 
@@ -350,6 +373,7 @@ void Gen9GraphicsDevice::destroy_image(IImage* image) {
   Gen9Image* i = static_cast<Gen9Image*>(image);
   if (!i) return;
   free_region(i->buffer_, i->address_);
+  free_region(i->stencil_buffer_memory_, i->stencil_address_);
   destroy(allocator_, i);
 }
 
@@ -415,6 +439,31 @@ bool Gen9GraphicsDevice::run_draw(const DrawRecord& d, const DrawState& base_sta
   state.blend = pd.alpha_blend ? Blend::SourceOver : Blend::None;
   state.depth_test = pd.depth_test;
   state.depth_write = pd.depth_write;
+  if (pd.stencil.enable) {
+    const StencilState& st = pd.stencil;
+    // (the ops of the API in the hardware's numbering; the compare functions are numbered alike)
+    auto action = [](StencilOp op) {
+      switch (op) {
+        case StencilOp::Keep: return StencilAction::Keep;
+        case StencilOp::Zero: return StencilAction::Zero;
+        case StencilOp::Replace: return StencilAction::Replace;
+        case StencilOp::IncrementClamp: return StencilAction::IncrementSaturate;
+        case StencilOp::DecrementClamp: return StencilAction::DecrementSaturate;
+        case StencilOp::Invert: return StencilAction::Invert;
+        case StencilOp::IncrementWrap: return StencilAction::Increment;
+        case StencilOp::DecrementWrap: return StencilAction::Decrement;
+      }
+      return StencilAction::Keep;
+    };
+    state.stencil_test.enable = true;
+    state.stencil_test.func = static_cast<CompareFunc>(st.compare);
+    state.stencil_test.fail = action(st.fail_op);
+    state.stencil_test.depth_fail = action(st.depth_fail_op);
+    state.stencil_test.pass = action(st.pass_op);
+    state.stencil_test.compare_mask = st.compare_mask;
+    state.stencil_test.write_mask = st.write_mask;
+    state.stencil_test.reference = st.reference;
+  }
   const float min_depth = d.viewport.width != 0 || d.viewport.height != 0 ? d.viewport.min_depth : 0.0f;
   const float max_depth = d.viewport.width != 0 || d.viewport.height != 0 ? d.viewport.max_depth : 1.0f;
   if (!(min_depth >= 0.0f && max_depth <= 1.0f && min_depth <= max_depth)) return false;
@@ -533,6 +582,8 @@ bool Gen9GraphicsDevice::run_pass(const RenderPassBegin& pass, const List<DrawRe
     if (!draws[i].pipeline) return false;
     // A textured draw needs its texture bound, and it is not the image being drawn into (or the depth buffer).
     if (draws[i].pipeline->textured() && (!draws[i].texture.image || draws[i].texture.image == color || draws[i].texture.image == depth)) return false;
+    // A stencil test needs a stencil plane in the depth image.
+    if (draws[i].pipeline->desc().stencil.enable && (!depth || !depth->has_stencil())) return false;
   }
   DrawState state;
   state.target = color->surface();
@@ -540,6 +591,13 @@ bool Gen9GraphicsDevice::run_pass(const RenderPassBegin& pass, const List<DrawRe
   staged_ = 0;
   if (depth) {
     state.depth = depth->depth_buffer();
+    if (depth->has_stencil()) {
+      state.stencil = depth->stencil_buffer();
+      if (pass.clear_stencil) {
+        RenderBatch batch(image_, VcsDriver::kBatchGpuAddress);
+        if (!batch.clear_stencil(state, pass.clear_stencil_value) || engine_.run_batch(ArrayView<const uint32_t>(image_.data(), batch.dwords())) != VcsDriver::Result::Done) return false;
+      }
+    }
     if (pass.clear_depth) {
       RenderBatch batch(image_, VcsDriver::kBatchGpuAddress);
       if (!batch.clear_depth(state, pass.clear_depth_value) || engine_.run_batch(ArrayView<const uint32_t>(image_.data(), batch.dwords())) != VcsDriver::Result::Done) return false;
