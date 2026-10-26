@@ -331,6 +331,20 @@ Status ProcessFiles::rename(StringView from, StringView to) {
   return fs_->rename(a.view(), b.view());
 }
 
+Status ProcessFiles::create_hard_link(StringView existing, StringView link) {
+  if (!fs_) return Status::NotFound;
+  String a(*allocator_), b(*allocator_);
+  if (!host_path(existing, &a) || !host_path(link, &b)) return Status::NotFound;
+  return fs_->create_hard_link(a.view(), b.view());
+}
+
+Status ProcessFiles::create_symbolic_link(StringView link, StringView target, bool target_is_directory) {
+  if (!fs_) return Status::NotFound;
+  String a(*allocator_), b(*allocator_);
+  if (!host_path(link, &a) || !host_path(target, &b)) return Status::NotFound;
+  return fs_->create_symbolic_link(a.view(), b.view(), target_is_directory);
+}
+
 Status ProcessFiles::change_directory(StringView virtual_path) {
   DirectoryEntry entry;
   const Status status = stat(virtual_path, &entry);

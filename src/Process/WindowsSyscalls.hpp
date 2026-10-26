@@ -108,6 +108,9 @@ enum class WindowsSyscallNumber : uint32_t {
   NtQueryInformationJobObject = 81,
   NtSetInformationJobObject = 82,
   NtIsProcessInJob = 83,
+  NtReadVirtualMemory = 84,
+  NtWriteVirtualMemory = 85,
+  NtCreateSymbolicLink = 86,
 };
 
 constexpr uint32_t kStatusInvalidSystemService = 0xC000001Cu;      // the answer for a number that is no service

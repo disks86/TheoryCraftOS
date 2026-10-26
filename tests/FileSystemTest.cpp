@@ -830,6 +830,101 @@ static void check_metadata(IFileSystem& fs, const char* label) {
   CHECK_STATUS(fs.set_metadata("/nosuchfile", change), Status::NotFound);
 }
 
+static void test_links() {
+  TestAllocator a;
+  {
+    RamFileSystem fs(a);
+    CHECK_STATUS(fs.create_directory("/dir"), Status::Ok);
+    UniquePointer<IFile> f;
+    CHECK_STATUS(fs.open_file("/dir/original.txt", OpenMode::CreateTruncate, &f), Status::Ok);
+    uint64_t n = 0;
+    CHECK(f->write(0, bytes_of("hello"), &n) == Status::Ok && n == 5);
+    f.reset();
+
+    // a hard link shares the data, size and read-only flag; a write through either name is seen through the other
+    CHECK_STATUS(fs.create_hard_link("/dir/original.txt", "/dir/also.txt"), Status::Ok);
+    CHECK_STATUS(fs.create_hard_link("/dir/original.txt", "/dir/also.txt"), Status::AlreadyExists);
+    CHECK_STATUS(fs.create_hard_link("/nosuch.txt", "/dir/x.txt"), Status::NotFound);
+    CHECK_STATUS(fs.create_hard_link("/dir", "/dir/to_dir.txt"), Status::IsADirectory);
+    uint8_t buffer[32];
+    uint64_t length = 0;
+    CHECK(read_all(fs, "/dir/also.txt", buffer, sizeof(buffer), &length) && length == 5 && !memcmp(buffer, "hello", 5));
+    CHECK_STATUS(fs.open_file("/dir/also.txt", OpenMode::ReadWrite, &f), Status::Ok);
+    CHECK(f->write(0, bytes_of("HELLO!!"), &n) == Status::Ok && n == 7);
+    f.reset();
+    CHECK(read_all(fs, "/dir/original.txt", buffer, sizeof(buffer), &length) && length == 7 && !memcmp(buffer, "HELLO!!", 7));
+    DirectoryEntry e1, e2;
+    CHECK_STATUS(fs.stat("/dir/original.txt", &e1), Status::Ok);
+    CHECK_STATUS(fs.stat("/dir/also.txt", &e2), Status::Ok);
+    CHECK(e1.size == 7 && e2.size == 7 && !e1.is_symlink && !e2.is_symlink);
+    MetadataChange ro;
+    ro.set_read_only = true;
+    ro.read_only = true;
+    CHECK_STATUS(fs.set_metadata("/dir/also.txt", ro), Status::Ok);      // the flag is shared too
+    CHECK_STATUS(fs.open_file("/dir/original.txt", OpenMode::ReadWrite, &f), Status::ReadOnly);
+    // removing one name keeps the data alive through the other
+    CHECK_STATUS(fs.remove("/dir/original.txt"), Status::Ok);
+    CHECK(read_all(fs, "/dir/also.txt", buffer, sizeof(buffer), &length) && length == 7 && !memcmp(buffer, "HELLO!!", 7));
+    CHECK_STATUS(fs.remove("/dir/also.txt"), Status::Ok);
+
+    // a symbolic link: relative (resolved against its own directory) and absolute (resolved from the root)
+    CHECK_STATUS(fs.open_file("/target.txt", OpenMode::CreateTruncate, &f), Status::Ok);
+    CHECK(f->write(0, bytes_of("world"), &n) == Status::Ok);
+    f.reset();
+    CHECK_STATUS(fs.create_symbolic_link("/dir/rel.txt", "../target.txt", false), Status::Ok);
+    CHECK_STATUS(fs.create_symbolic_link("/dir/abs.txt", "/target.txt", false), Status::Ok);
+    CHECK(read_all(fs, "/dir/rel.txt", buffer, sizeof(buffer), &length) && length == 5 && !memcmp(buffer, "world", 5));
+    CHECK(read_all(fs, "/dir/abs.txt", buffer, sizeof(buffer), &length) && length == 5 && !memcmp(buffer, "world", 5));
+    CHECK_STATUS(fs.stat("/dir/rel.txt", &e1), Status::Ok);
+    CHECK(!e1.is_symlink && e1.type == NodeType::File && e1.size == 5);      // stat() follows it, like open_file(): the target's own information
+    UniquePointer<IDirectory> listed;
+    CHECK_STATUS(fs.open_directory("/dir", &listed), Status::Ok);
+    int rel_seen = 0;
+    DirectoryEntry entry;
+    while (listed->next(&entry) == Status::Ok) if (entry.name.view() == StringView("rel.txt")) { rel_seen = entry.is_symlink ? 1 : 2; }
+    CHECK(rel_seen == 1);      // a directory listing shows the link itself, not what it points to
+    listed.reset();
+    String target(a);
+    bool target_is_directory = true;
+    CHECK_STATUS(fs.read_symbolic_link("/dir/rel.txt", &target, &target_is_directory), Status::Ok);
+    CHECK(target.view() == StringView("../target.txt") && !target_is_directory);
+    CHECK_STATUS(fs.read_symbolic_link("/target.txt", &target, &target_is_directory), Status::InvalidArgument);      // not itself a link
+    char listing[128];
+    list(fs, "/dir", listing, sizeof(listing));
+    CHECK(!strcmp(listing, "rel.txt,abs.txt"));      // the link itself is listed, not followed
+
+    // writing through a symbolic link reaches the target; removing the link leaves the target alone
+    CHECK_STATUS(fs.open_file("/dir/rel.txt", OpenMode::ReadWrite, &f), Status::Ok);
+    CHECK(f->write(0, bytes_of("WORLD"), &n) == Status::Ok);
+    f.reset();
+    CHECK(read_all(fs, "/target.txt", buffer, sizeof(buffer), &length) && length == 5 && !memcmp(buffer, "WORLD", 5));
+    CHECK_STATUS(fs.remove("/dir/rel.txt"), Status::Ok);
+    CHECK(read_all(fs, "/target.txt", buffer, sizeof(buffer), &length) && length == 5);
+
+    // a symbolic link to a symbolic link, and a loop
+    CHECK_STATUS(fs.create_symbolic_link("/dir/chain.txt", "abs.txt", false), Status::Ok);
+    CHECK(read_all(fs, "/dir/chain.txt", buffer, sizeof(buffer), &length) && length == 5 && !memcmp(buffer, "WORLD", 5));
+    CHECK_STATUS(fs.create_symbolic_link("/loop_a", "/loop_b", false), Status::Ok);
+    CHECK_STATUS(fs.create_symbolic_link("/loop_b", "/loop_a", false), Status::Ok);
+    UniquePointer<IFile> looped;
+    CHECK_STATUS(fs.open_file("/loop_a", OpenMode::Read, &looped), Status::TooManyLinks);
+    CHECK_STATUS(fs.create_symbolic_link("/dir/dangling.txt", "/nowhere.txt", false), Status::Ok);
+    CHECK_STATUS(fs.open_file("/dir/dangling.txt", OpenMode::Read, &looped), Status::NotFound);
+
+    // a directory symlink can be traversed into
+    CHECK_STATUS(fs.create_symbolic_link("/dirlink", "/dir", true), Status::Ok);
+    CHECK_STATUS(fs.open_file("/dirlink/chain.txt", OpenMode::Read, &f), Status::Ok);
+    f.reset();
+    CHECK_STATUS(fs.stat("/dirlink", &e1), Status::Ok);
+    CHECK(!e1.is_symlink && e1.type == NodeType::Directory);      // follows through to the directory it names
+    String dirlink_target(a);
+    bool dirlink_is_directory = false;
+    CHECK_STATUS(fs.read_symbolic_link("/dirlink", &dirlink_target, &dirlink_is_directory), Status::Ok);
+    CHECK(dirlink_target.view() == StringView("/dir") && dirlink_is_directory);
+  }
+  CHECK(a.live == 0);
+}
+
 static void test_set_metadata() {
   TestAllocator a;
   {
@@ -862,6 +957,7 @@ int main() {
   test_fat_write(FatImage::F16, 2048, "FAT16/2048 write");
   test_fat_write(FatImage::F32, 2048, "FAT32/2048 write");
   test_fat_bad();
+  test_links();
   test_set_metadata();
   test_fat_offset();
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }

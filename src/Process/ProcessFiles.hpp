@@ -129,6 +129,9 @@ class ProcessFiles {
   filesystem::Status remove(StringView virtual_path);
   filesystem::Status rename(StringView from, StringView to);
   filesystem::Status change_directory(StringView virtual_path);
+  // Hard and symbolic links (CreateHardLink, CreateSymbolicLink): Unsupported if the mounted file system has no way to make one.
+  filesystem::Status create_hard_link(StringView existing, StringView link);
+  filesystem::Status create_symbolic_link(StringView link, StringView target, bool target_is_directory);
 
   // --- operations on open files (the object must be of the right kind)
   filesystem::Status read(OpenObject& object, uint64_t offset, ByteView out, uint64_t* got);

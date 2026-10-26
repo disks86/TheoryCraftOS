@@ -126,6 +126,9 @@ renumbers its services in nearly every build, which is why programs call ntdll);
 | `NtQueryInformationJobObject` | 81 |
 | `NtSetInformationJobObject` | 82 |
 | `NtIsProcessInJob` | 83 |
+| `NtReadVirtualMemory` | 84 |
+| `NtWriteVirtualMemory` | 85 |
+| `NtCreateSymbolicLink` | 86 |
 
 ## Exceptions and the machine
 
@@ -146,6 +149,15 @@ renumbers its services in nearly every build, which is why programs call ntdll);
   `__declspec(thread)` data works (up to 16 modules with thread-local data at once).
 - **Files**: a read-only attribute and the times can be set (RAM and FAT file systems); other attributes are accepted and not stored. Byte-range locks are advisory and
   shared by all programs. File mappings of files are read into memory when made and written back when flushed, when the last view is closed and when the mapping is.
+- **Hard and symbolic links** (`CreateHardLink`, `CreateSymbolicLink`; service `NtCreateSymbolicLink`, and `NtSetInformationFile`'s `FileLinkInformation` class for hard
+  links, the same way `MoveFileEx` goes through `FileRenameInformation`) work on file systems that have a notion of a file apart from its one name — today the RAM file
+  system (which is what the demo and the primary image's `C:\` both use), not FAT. A hard link shares its data, size, read-only flag and times with the name it was made
+  from; writing or changing attributes through either name is seen through the other, and the data outlives either single name. A symbolic link's target is resolved
+  transparently by `CreateFile`/`stat`-style access (reading, writing, traversing into a directory link) and, for a relative target, against the *link's own directory*
+  (not the process's current directory), the one place a path here may use ".."; a directory listing (`FindFirstFile`) shows the link itself, with
+  `FILE_ATTRIBUTE_REPARSE_POINT` set, rather than following it. There is no way yet to read a link's raw, unresolved target from a Windows program (no
+  `DeviceIoControl(FSCTL_GET_REPARSE_POINT)` or `GetFinalPathNameByHandle`), and a target that crosses file systems is not supported, since this OS mounts only one drive
+  for Windows programs anyway.
 - **Overlapped I/O** is done at the call and the OVERLAPPED filled in; completion routines (`ReadFileEx`, `WriteFileEx`, timers, `QueueUserAPC`) run when the thread waits
   alertably.
 - **Locale and strings**: there is one locale, English (United States). `GetLocaleInfo`, `GetNumberFormat`, `GetCurrencyFormat`, `GetDateFormat`, `GetTimeFormat`,
@@ -173,6 +185,11 @@ renumbers its services in nearly every build, which is why programs call ntdll);
   `HeapWalk` walks the blocks of a heap). psapi: `EnumProcessModules`, `GetModuleBaseName`, `GetModuleFileNameEx`, `GetModuleInformation`, `GetProcessMemoryInfo`,
   `GetProcessImageFileName` (the `K32` names and the plain ones). Module paths of other processes are guessed: DLLs are `C:\Windows\System32\name`, and only the program's name
   is known. Memory counters are the mapped size of the address space; thread priorities and start addresses are as the thread was created.
-- **Not provided**: debugging APIs, memory of
-  other processes, remote threads, mailslots, change notifications, hard and symbolic links, and the many exports of the real kernel32 and msvcrt that no program here has needed.
+- **Other processes' memory and threads**: a process handle (from `CreateProcess` or `OpenProcess`) works with `ReadProcessMemory`, `WriteProcessMemory`, `VirtualAllocEx`,
+  `VirtualFreeEx`, `VirtualProtectEx`, `VirtualQueryEx` and `CreateRemoteThread[Ex]` (services `NtReadVirtualMemory` 84, `NtWriteVirtualMemory` 85; the other memory services take
+  the handle). The work is done on the other program under its lock (`IProcessRuntime::remote_operation`, `windowsabi::run_remote`), and its page tables are rebuilt and given to its
+  threads on every core. Reads and writes stop at the first page that is not committed (`ERROR_PARTIAL_COPY`, with the count); writes ignore page protection, as debuggers need.
+  A remote thread's handle can be waited for, `GetExitCodeThread`, `GetThreadId`, `ResumeThread` (if created suspended) and `TerminateThread` work on it; other thread calls
+  (contexts, priorities, APCs) do not. Code can be injected: write it into memory allocated with `VirtualAllocEx` and start a thread on it. There is no access check beyond having a handle.
+- **Not provided**: debugging APIs, mailslots, change notifications (`FindFirstChangeNotification`, `ReadDirectoryChangesW`), and the many exports of the real kernel32 and msvcrt that no program here has needed.
   A call to an import that nothing provides stops the program with a message saying which one.
