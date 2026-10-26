@@ -515,7 +515,7 @@ static void test_style() {
   CHECK(js("<p id=p>abcdef</p>", "var t = document.getElementById('p').firstChild; t.appendData('!'); t.insertData(0, '>'); t.deleteData(1, 2); t.replaceData(0, 1, '<'); console.log(t.data, t.substringData(1, 2))", "<cdef! cd"));
   CHECK(js("<select id=s></select>", "var o = new Option('Label', 'v1', false, true); document.getElementById('s').appendChild(o); console.log(o.textContent, o.value, o instanceof HTMLOptionElement, o.selected, document.getElementById('s').value)", "Label v1 true true v1"));
   CHECK(js("<div id=d>x</div>", "var d = document.getElementById('d'); console.log(d.onclick, window.onerror, typeof new XMLSerializer().serializeToString(d), new XMLSerializer().serializeToString(d), document.implementation.createHTMLDocument('t').title, history instanceof History, new Map([[1, 2]]).get(1))", "null null string <div xmlns=\"http://www.w3.org/1999/xhtml\" id=\"d\">x</div> t true 2"));
-  CHECK(js("<p id=p>x</p>", "var p = document.getElementById('p'); console.log(getComputedStyle(p).color, getComputedStyle(p).display, getComputedStyle(p).marginTop, getComputedStyle(p).textAlign)", "rgb(0, 0, 0) block 16px left"));
+  CHECK(js("<p id=p>x</p>", "var p = document.getElementById('p'); console.log(getComputedStyle(p).color, getComputedStyle(p).display, getComputedStyle(p).marginTop, getComputedStyle(p).textAlign)", "rgb(0, 0, 0) block 16px start"));
   CHECK(is("<html><body><p id=p>x</p><script>console.log(getComputedStyle(document.getElementById('p')).color)</script></body></html>", "rgb(232, 232, 232)") == false || true);
   CHECK(js("<p>x</p>", "console.log(CSS.escape('a.b#c'), CSS.escape('1a'), typeof CSS.supports)", "a\\.b\\#c \\31 a function"));
 }
