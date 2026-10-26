@@ -415,6 +415,8 @@ add_executable(BOOTX64
   src/Hardware/GraphicsProcessingUnit/Intel/IntelExeclist.cpp
   src/Hardware/GraphicsProcessingUnit/Intel/IntelForcewake.cpp
   src/Hardware/GraphicsProcessingUnit/Intel/IntelVcsDriver.cpp
+  src/Hardware/GraphicsProcessingUnit/Intel/IntelRenderCommands.cpp
+  src/Hardware/GraphicsProcessingUnit/Intel/IntelRenderBatch.cpp
   src/Hardware/GraphicsProcessingUnit/QEMU/QemuStdVgaGpu.cpp
   src/Hardware/GraphicsProcessingUnit/Virtio/VirtioGpu.cpp
   src/Hardware/GraphicsProcessingUnit/VMware/VmwareSvgaGpu.cpp

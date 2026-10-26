@@ -27,6 +27,7 @@
 #include <string>
 #include <vector>
 #include "Hardware/GraphicsProcessingUnit/Intel/IntelVcsDriver.hpp"
+#include "Hardware/GraphicsProcessingUnit/Intel/IntelRenderCommands.hpp"
 
 using namespace hardware;
 using namespace hardware::intel_gt;
@@ -76,7 +77,9 @@ struct FakeGpu final : IRegisterBank {
   std::map<uint64_t, uint32_t> regs;
   std::vector<std::string> violations;
   std::vector<std::vector<uint32_t>> batches;
-  bool deny_gt = false, deny_media = false, hang = false, never_idle = false;
+  bool deny_gt = false, deny_media = false, deny_render = false, hang = false, never_idle = false;
+  bool render = false;                // the engine is the render engine: batches are 3D batches, the ring may hold PIPE_CONTROL
+  uint32_t pipe_control_writes = 0;
   uint32_t elsp[4] = {};
   int elsp_count = 0;
   uint32_t csb_wp = 5;
@@ -99,12 +102,13 @@ struct FakeGpu final : IRegisterBank {
   }
 
   void write32(uint64_t offset, uint32_t value) override {
-    if (offset == 0xA188 || offset == 0xA270 || offset == 0xA540) {
-      const bool gt = offset == 0xA188;
+    if (offset == 0xA188 || offset == 0xA270 || offset == 0xA540 || offset == 0xA278) {
+      const bool gt = offset == 0xA188, rcs = offset == 0xA278;
       if ((offset == 0xA270 && gen == Generation::Gen12) || (offset == 0xA540 && gen == Generation::Gen9)) violation("forcewake domain of another generation");
-      const uint32_t ack_reg = gt ? 0x130044 : offset == 0xA540 ? 0x0D50 : 0x0D88;
+      if (offset != 0xA188 && (rcs != render)) violation("forcewake domain of another engine");
+      const uint32_t ack_reg = gt ? 0x130044 : rcs ? 0x0D84 : offset == 0xA540 ? 0x0D50 : 0x0D88;
       const bool enable = (value & 1) && (value >> 16);
-      if (enable && !(gt ? deny_gt : deny_media)) regs[ack_reg] = 1;
+      if (enable && !(gt ? deny_gt : rcs ? deny_render : deny_media)) regs[ack_reg] = 1;
       else if (!enable) regs[ack_reg] = 0;
       regs[offset] = value;
       return;
@@ -182,7 +186,25 @@ struct FakeGpu final : IRegisterBank {
   // Called with every batch the engine runs (the dwords, up to and including MI_BATCH_BUFFER_END); a test plays the decode engine here.
   std::function<void(FakeGpu&, const std::vector<uint32_t>&)> on_batch;
 
+  void run_render_batch_at(uint64_t address) {
+    // The whole batch buffer as the engine can reach it: the commands up to the end marker, then the state they point to.
+    std::vector<uint32_t> dump;
+    for (uint32_t n = 0; n < intel_gt::VcsDriver::kBatchBytes / 4; ++n) {
+      bool ok;
+      uint8_t* p = ppgtt_bytes(address + n * 4, 4, "batch", &ok);
+      if (!ok) return;
+      uint32_t d;
+      memcpy(&d, p, 4);
+      dump.push_back(d);
+    }
+    uint32_t end = 0;
+    if (!intel_gt::gen9_3d::render_batch_is_acceptable(ArrayView<const uint32_t>(dump.data(), dump.size()), &end)) { violation("3D batch the engine cannot parse"); return; }
+    batches.push_back(dump);
+    if (on_batch) on_batch(*this, dump);
+  }
+
   void run_batch_at(uint64_t address) {
+    if (render) { run_render_batch_at(address); return; }
     // Walks the commands by their lengths (a data dword may look like the end marker): MFX commands carry their length, a no-op is one dword, the end is the last.
     std::vector<uint32_t> dump;
     uint32_t remaining = 0;
@@ -258,6 +280,21 @@ struct FakeGpu final : IRegisterBank {
           else violation("marker write outside the global GTT");
           if (target) *target = *v;
         }
+      } else if (render && (h >> 23) == (intel_gt::gen9_3d::kPipeControl >> 23)) {
+        len = 6;
+        uint32_t* flags = at(pos + 4);
+        uint32_t* addr = at(pos + 8);
+        uint32_t* imm = at(pos + 16);
+        if (!flags || !addr || !imm) return;
+        if (*flags & intel_gt::gen9_3d::kPcTlbInvalidate) ++tlb_invalidates;
+        if ((*flags & intel_gt::gen9_3d::kPcPostSyncMask) == intel_gt::gen9_3d::kPcPostSyncWriteImmediate) {
+          if (!(*flags & intel_gt::gen9_3d::kPcGlobalGtt)) { violation("PIPE_CONTROL write outside the global GTT"); return; }
+          if (*addr & 7) { violation("PIPE_CONTROL qword write not qword aligned"); return; }
+          uint32_t* target = ggtt_dword(*addr & ~7u, "pipe control write");
+          if (!target) return;
+          *target = *imm;
+          ++pipe_control_writes;
+        }
       } else {
         violation("unknown ring command");
         return;
@@ -302,13 +339,19 @@ struct Rig {
   std::vector<uint64_t> ggtt = std::vector<uint64_t>(1024, 0xAAAA'AAAA'AAAA'AAAAull);
   FakeGpu gpu{&ggtt, &mem};
   Generation generation;
-  explicit Rig(Generation g = Generation::Gen9) : generation(g) {
+  VcsDriver::Engine engine;
+  explicit Rig(Generation g = Generation::Gen9, VcsDriver::Engine e = VcsDriver::Engine::Video) : generation(g), engine(e) {
     gpu.gen = g;
     gpu.base = g == Generation::Gen12 ? kVd0MmioBase : kBase;
+    if (e == VcsDriver::Engine::Render) {
+      gpu.render = true;
+      gpu.base = kRcs0MmioBase;
+    }
   }
   VcsDriver::Config config() {
     VcsDriver::Config c;
     c.generation = generation;
+    c.engine = engine;
     c.registers = &gpu;
     c.ggtt_table = MmioRegion(reinterpret_cast<uint64_t>(ggtt.data()), ggtt.size() * 8);
     c.ggtt_first_page = 100;
