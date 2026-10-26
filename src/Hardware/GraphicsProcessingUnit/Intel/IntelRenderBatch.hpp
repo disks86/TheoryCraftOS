@@ -89,6 +89,12 @@ struct DrawState {
   bool depth_write = false;
 };
 
+// How a bound texture is read by textured_triangles: the filter (nearest, or bilinear), and for each axis whether it wraps around or takes the edge texel.
+struct Sampler {
+  bool linear = false;
+  bool repeat_u = false, repeat_v = false;
+};
+
 class RenderBatch {
  public:
   // `image` is the buffer the batch is built in (a multiple of 4 KiB, at least kStateOffset + 4 KiB, at most kMaxImageBytes) whose first byte the engine addresses as
@@ -105,6 +111,10 @@ class RenderBatch {
   bool fill_rect(const DrawState& draw, const Rect& rect, const float rgba[4]);
   // Triangles (three vertices each). `gouraud`: the kernel interpolates the vertices' colours; else every pixel gets `flat_rgba`.
   bool triangles(const DrawState& draw, ArrayView<const Vertex> vertices, bool gouraud, const float flat_rgba[4]);
+  // Textured triangles (three vertices each): the vertices' color[0] and color[1] are the texture coordinates u and v, normalised (0..1 spans the texture; (0, 0) is its top left
+  // corner), interpolated perspective-correct like colours, and the pixel kernel is the copy kernel, which samples `texture` with `sampler` and writes the texel. color[2]
+  // and color[3] are not used. The draw's blend applies to the texel's alpha. `texture` must not be the target.
+  bool textured_triangles(const DrawState& draw, ArrayView<const Vertex> vertices, const Surface& texture, const Sampler& sampler);
   // A copy of `src_rect` of `src` to `dst` at (dst_x, dst_y), nearest-neighbour, clipped to `dst`. The texture is read as RGBA whatever its byte order.
   bool copy(const Surface& dst, const Surface& src, const Rect& src_rect, int32_t dst_x, int32_t dst_y);
 

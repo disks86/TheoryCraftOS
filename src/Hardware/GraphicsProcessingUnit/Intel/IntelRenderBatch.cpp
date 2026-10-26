@@ -135,11 +135,13 @@ uint32_t surface_state(Image& img, const Surface& s) {
   return at;
 }
 
-uint32_t sampler_state(Image& img) {
+uint32_t sampler_state(Image& img, const Sampler& sampler) {
   const uint32_t at = img.allocate(16, 64);
   if (!at) return 0;
-  img.state(at, 0, 0);                          // nearest minification and magnification
-  img.state(at, 3, (2u << 0) | (2u << 3) | (2u << 6));   // clamp in r, t and s
+  // SAMPLER_STATE: the minification filter (bits 16:14) and the magnification one (19:17), 0 nearest and 1 linear; no mipmaps are used.
+  img.state(at, 0, sampler.linear ? (1u << 14) | (1u << 17) : 0u);
+  // The address control modes of r, t and s (bits 2:0, 5:3, 8:6): 0 wrap, 2 clamp. (There is no third dimension: r is clamped.)
+  img.state(at, 3, (2u << 0) | ((sampler.repeat_v ? 0u : 2u) << 3) | ((sampler.repeat_u ? 0u : 2u) << 6));
   return at;
 }
 
@@ -397,7 +399,8 @@ void emit_job(Image& img, const Job& job, uint32_t blend_ptr, uint32_t cc_ptr, u
 
   // Flush the render target cache before the job ends.
   img.header(kPipeControl, 6);
-  img.put(kPcRenderTargetCacheFlush | kPcDepthCacheFlush | kPcDcFlush | kPcCsStall);
+  // (and drop the texture cache: a later job may sample what this one drew, or what the CPU has written since)
+  img.put(kPcRenderTargetCacheFlush | kPcDepthCacheFlush | kPcDcFlush | kPcTextureCacheInvalidate | kPcCsStall);
   img.put_zeros(4);
   img.put(kMiBatchBufferEnd);
 }
@@ -566,6 +569,54 @@ bool RenderBatch::triangles(const DrawState& draw, ArrayView<const Vertex> verti
   return true;
 }
 
+bool RenderBatch::textured_triangles(const DrawState& draw, ArrayView<const Vertex> vertices, const Surface& texture, const Sampler& sampler) {
+  used_ = 0;
+  Image img(image_, base_);
+  if (!img.valid_buffer() || !draw.target.valid() || !texture.valid() || vertices.empty() || vertices.size() % 3 != 0 || vertices.size() > max_vertices() || !depth_matches(draw)) return false;
+  // Sampling the surface that is being drawn into is not defined.
+  if (texture.gpu_address < draw.target.gpu_address + uint64_t{draw.target.pitch} * draw.target.height && draw.target.gpu_address < texture.gpu_address + uint64_t{texture.pitch} * texture.height) return false;
+  Rect drawing;
+  if (!clip_to_target(draw, &drawing)) return false;
+  for (const Vertex& v : vertices) {
+    if (!finite_and_bounded(v.position[0]) || !finite_and_bounded(v.position[1]) || !finite_and_bounded(v.position[2]) || !(v.position[3] > 0.0f && v.position[3] < kMaxInverseW)) return false;
+    for (const float c : v.color)
+      if (!(c == c)) return false;
+  }
+  img.reset();
+
+  Job job;
+  job.blend = blend_factors(draw.blend);
+  job.drawing = drawing;
+  job.topology = kTopologyTriangleList;
+  job.vertex_count = static_cast<uint32_t>(vertices.size());
+  job.binding_entries = 2;
+  job.sampler_count = 1;
+  job.depth = draw.depth;
+  job.depth_test = draw.depth_test;
+  job.depth_write = draw.depth_write;
+  const uint32_t target_state = surface_state(img, draw.target), texture_state = surface_state(img, texture);
+  job.binding_table = img.allocate(8, 32);
+  job.sampler = sampler_state(img, sampler);
+  const uint32_t kernel = img.allocate(static_cast<uint32_t>(copy_kernel().size() * 4), 64);
+  job.vertex_bytes = job.vertex_count * kVertexStride;
+  job.vertex_offset = img.allocate(job.vertex_bytes, 64);
+  const uint32_t blend = blend_state(img, job.blend, true), cc = cc_state(img), vp_cc = cc_viewport(img), vp_sf = sf_clip_viewport(img), scissor = img.allocate(8, 64);
+  if (!img.ok()) return false;
+  img.state(job.binding_table, 0, target_state);
+  img.state(job.binding_table, 1, texture_state);
+  img.copy_state(kernel, copy_kernel());
+  job.kernel = kernel;
+  // The copy kernel reads attribute 0's x and y as u and v: the vertex's colour slot carries them.
+  for (uint32_t v = 0; v < vertices.size(); ++v) {
+    for (uint32_t k = 0; k < 4; ++k) img.state(job.vertex_offset, v * 8 + k, float_bits(vertices[v].position[k]));
+    for (uint32_t k = 0; k < 4; ++k) img.state(job.vertex_offset, v * 8 + 4 + k, float_bits(vertices[v].color[k]));
+  }
+  emit_job(img, job, blend, cc, vp_cc, vp_sf, scissor);
+  if (!img.ok()) return false;
+  used_ = img.dwords_used();
+  return true;
+}
+
 bool RenderBatch::copy(const Surface& dst, const Surface& src, const Rect& src_rect, int32_t dst_x, int32_t dst_y) {
   used_ = 0;
   Image img(image_, base_);
@@ -592,7 +643,7 @@ bool RenderBatch::copy(const Surface& dst, const Surface& src, const Rect& src_r
   job.sampler_count = 1;
   const uint32_t dst_state = surface_state(img, dst), src_state = surface_state(img, src);
   job.binding_table = img.allocate(8, 32);
-  job.sampler = sampler_state(img);
+  job.sampler = sampler_state(img, Sampler());
   const uint32_t kernel = img.allocate(static_cast<uint32_t>(copy_kernel().size() * 4), 64);
   job.vertex_bytes = 3 * 12;
   job.vertex_offset = img.allocate(job.vertex_bytes, 64);

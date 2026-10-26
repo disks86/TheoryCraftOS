@@ -366,6 +366,69 @@ static void test_builder_arguments() {
   CHECK(!b.copy(draw.target, src, {2, 2, 2, 2}, 0, 0));
   Surface unaligned = src; unaligned.gpu_address = 0x300001;
   CHECK(!b.copy(draw.target, unaligned, {0, 0, 8, 8}, 0, 0));
+  // Textured triangles: the copy kernel with a sampler, two surfaces in the binding table (the target, then the texture), and the vertices as they are for the other triangle jobs
+  // with the texture coordinates in the colour slot.
+  {
+    Surface texture = {0x300000, 8, 8, 64 * 1, SurfaceFormat::B8G8R8A8Unorm};
+    texture.pitch = 64;
+    Vertex uv[3] = {{{1, 1, 0.5f, 1}, {0.25f, 0.5f, 7, 7}}, {{1, 14, 0.5f, 1}, {0.25f, 0.75f, 7, 7}}, {{14, 14, 0.5f, 1}, {0.5f, 0.75f, 7, 7}}};
+    Sampler nearest_clamp;
+    CHECK(b.textured_triangles(draw, ArrayView<const Vertex>(uv, 3), texture, nearest_clamp));
+    std::vector<uint32_t> job(image.begin(), image.begin() + b.dwords());
+    uint32_t end = 0;
+    CHECK(render_batch_is_acceptable(ArrayView<const uint32_t>(job.data(), job.size()), &end));
+    Decoded d(job);
+    const uint32_t ps = d.one(kPs), bt = d.one(kBindingTablePointersPs), sp = d.one(kSamplerStatePointersPs), vb = d.one(kVertexBuffers);
+    CHECK(ps != 0xFFFFFFFFu && bt != 0xFFFFFFFFu && sp != 0xFFFFFFFFu && vb != 0xFFFFFFFFu);
+    if (ps != 0xFFFFFFFFu && bt != 0xFFFFFFFFu && sp != 0xFFFFFFFFu && vb != 0xFFFFFFFFu) {
+      const uint32_t base = VcsDriver::kBatchGpuAddress;
+      CHECK(((job[ps + 3] >> 18) & 0xFF) == 2 && (job[ps + 3] & (1u << 27)));           // two binding table entries, a sampler
+      const uint32_t kernel = job[ps + 1] / 4;
+      for (uint32_t i = 0; i < 16; ++i) CHECK(image[kernel + i] == copy_kernel()[i]);   // the intel-gpu-tools copy kernel, unchanged
+      const uint32_t table = job[bt + 1] / 4, target_state = image[table], texture_state = image[table + 1];
+      CHECK(target_state != texture_state && image[texture_state / 4 + 8] == 0x300000 && image[target_state / 4 + 8] == static_cast<uint32_t>(draw.target.gpu_address));
+      CHECK(((image[texture_state / 4 + 2]) & 0x3FFF) == 7 && ((image[texture_state / 4 + 2] >> 16) & 0x3FFF) == 7 && image[texture_state / 4 + 3] == 63);
+      const uint32_t sampler = job[sp + 1] / 4;
+      CHECK(image[sampler] == 0 && image[sampler + 3] == (2u | (2u << 3) | (2u << 6)));   // nearest, clamped
+      // The vertices: position then (u, v, 7, 7) at the offsets of the other triangle jobs.
+      const uint32_t at = (job[vb + 2] - base) / 4;
+      CHECK(as_float(image[at + 4]) == 0.25f && as_float(image[at + 5]) == 0.5f && as_float(image[at + 8 + 4 + 1]) == 0.75f && job[vb + 1] == (32u | (1u << 14)));
+    }
+    // Linear filtering and wrapping change only the sampler state.
+    Sampler wrap_linear;
+    wrap_linear.linear = true;
+    wrap_linear.repeat_u = wrap_linear.repeat_v = true;
+    CHECK(b.textured_triangles(draw, ArrayView<const Vertex>(uv, 3), texture, wrap_linear));
+    {
+      std::vector<uint32_t> second(image.begin(), image.begin() + b.dwords());
+      Decoded d2(second);
+      const uint32_t sp2 = d2.one(kSamplerStatePointersPs);
+      CHECK(sp2 != 0xFFFFFFFFu && image[second[sp2 + 1] / 4] == ((1u << 14) | (1u << 17)) && image[second[sp2 + 1] / 4 + 3] == 2u);   // r clamped; s and t wrap
+    }
+    Sampler mixed;
+    mixed.repeat_u = true;
+    CHECK(b.textured_triangles(draw, ArrayView<const Vertex>(uv, 3), texture, mixed));
+    {
+      std::vector<uint32_t> third(image.begin(), image.begin() + b.dwords());
+      Decoded d3(third);
+      const uint32_t sp3 = d3.one(kSamplerStatePointersPs);
+      CHECK(sp3 != 0xFFFFFFFFu && image[third[sp3 + 1] / 4 + 3] == (2u | (2u << 3)));    // s (u) wraps, t (v) clamps
+    }
+    // Refused: the texture is the target (or overlaps it), is not a valid surface, a vertex coordinate is not a number, the vertex count is not whole triangles.
+    Surface same = draw.target;
+    CHECK(!b.textured_triangles(draw, ArrayView<const Vertex>(uv, 3), same, nearest_clamp));
+    Surface overlapping = texture;
+    overlapping.gpu_address = draw.target.gpu_address + 64;
+    CHECK(!b.textured_triangles(draw, ArrayView<const Vertex>(uv, 3), overlapping, nearest_clamp));
+    Surface bad_texture = texture;
+    bad_texture.gpu_address = 0x300001;
+    CHECK(!b.textured_triangles(draw, ArrayView<const Vertex>(uv, 3), bad_texture, nearest_clamp));
+    Vertex nan_uv[3] = {uv[0], uv[1], uv[2]};
+    nan_uv[1].color[0] = nan_uv[1].color[0] / 0.0f * 0.0f;
+    CHECK(!b.textured_triangles(draw, ArrayView<const Vertex>(nan_uv, 3), texture, nearest_clamp));
+    CHECK(!b.textured_triangles(draw, ArrayView<const Vertex>(uv, 2), texture, nearest_clamp));
+    CHECK(!b.textured_triangles(draw, ArrayView<const Vertex>(), texture, nearest_clamp));
+  }
   // Images that are too small, or not whole pages, are refused.
   std::vector<uint32_t> small(1024);
   RenderBatch tiny(ArrayView<uint32_t>(small.data(), small.size()), VcsDriver::kBatchGpuAddress);
