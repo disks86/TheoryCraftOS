@@ -115,6 +115,20 @@ class Gen9Image final : public IImage {
     }
     return true;
   }
+  bool write_pixels(ArrayView<const uint32_t> pixels) override {
+    const uint64_t count = uint64_t{desc_.extent.width} * desc_.extent.height;
+    if (is_depth() || buffer_.cpu.empty() || pixels.size() != count) return false;
+    for (uint32_t y = 0; y < desc_.extent.height; ++y) {
+      for (uint32_t x = 0; x < desc_.extent.width; ++x) {
+        const uint32_t argb = pixels[uint64_t{y} * desc_.extent.width + x];
+        const uint8_t a = static_cast<uint8_t>(argb >> 24), r = static_cast<uint8_t>(argb >> 16), g = static_cast<uint8_t>(argb >> 8), b = static_cast<uint8_t>(argb);
+        // The memory order B, G, R, A or R, G, B, A (the inverse of read_pixels).
+        const uint8_t bytes[4] = {desc_.format == Format::R8G8B8A8Unorm ? r : b, g, desc_.format == Format::R8G8B8A8Unorm ? b : r, a};
+        buffer_.cpu.subview(uint64_t{y} * pitch_ + uint64_t{x} * 4, 4).copy_from(ConstByteView(bytes, 4));
+      }
+    }
+    return true;
+  }
   GpuBuffer buffer_;
   uint32_t address_ = 0;
   uint32_t pitch_ = 0;
@@ -136,14 +150,18 @@ class Gen9ShaderModule final : public IShaderModule {
 
 class Gen9Pipeline final : public IPipeline {
  public:
-  Gen9Pipeline(const GraphicsPipelineDesc& desc, uint32_t position_offset, uint32_t color_offset) : desc_(desc), position_offset_(position_offset), color_offset_(color_offset) {}
+  Gen9Pipeline(const GraphicsPipelineDesc& desc, uint32_t position_offset, uint32_t color_offset, bool textured)
+      : desc_(desc), position_offset_(position_offset), color_offset_(color_offset), textured_(textured) {}
   const GraphicsPipelineDesc& desc() const { return desc_; }
   uint32_t position_offset() const { return position_offset_; }
+  // The second attribute: a float4 colour, or for a textured pipeline a float2 texture coordinate.
   uint32_t color_offset() const { return color_offset_; }
+  bool textured() const { return textured_; }
 
  private:
   GraphicsPipelineDesc desc_;
   uint32_t position_offset_, color_offset_;
+  bool textured_;
 };
 
 // A vertex after the vertex shader: clip-space position and colour.
@@ -176,6 +194,12 @@ uint32_t clip_against(const ClipVertex* in, uint32_t n, ClipVertex* out, const f
 
 }  // namespace
 
+// A texture as bound for a draw: the image and how it is sampled.
+struct Gen9GraphicsDevice::TextureBinding {
+  const Gen9Image* image = nullptr;
+  SamplerDesc sampler;
+};
+
 // One draw of a render pass as recorded: what was bound and set when it was issued.
 struct Gen9GraphicsDevice::DrawRecord {
   const Gen9Pipeline* pipeline = nullptr;
@@ -184,6 +208,7 @@ struct Gen9GraphicsDevice::DrawRecord {
   Gen9Buffer* index_buffer = nullptr;
   uint64_t index_offset = 0;
   IndexType index_type = IndexType::Uint16;
+  TextureBinding texture;
   uint8_t constants[kMaxPushedConstantBytes] = {};
   uint32_t constants_size = 0;
   Viewport viewport;
@@ -329,26 +354,30 @@ void Gen9GraphicsDevice::destroy_image(IImage* image) {
 }
 
 IShaderModule* Gen9GraphicsDevice::create_shader_module(const ShaderModuleDesc& desc) {
-  const bool matches = (desc.stage == ShaderStage::Vertex && desc.eu_program == EuProgram::ColoredVertex) ||
-                       (desc.stage == ShaderStage::Fragment && desc.eu_program == EuProgram::ColoredFragment);
+  const bool matches = (desc.stage == ShaderStage::Vertex && (desc.eu_program == EuProgram::ColoredVertex || desc.eu_program == EuProgram::TexturedVertex)) ||
+                       (desc.stage == ShaderStage::Fragment && (desc.eu_program == EuProgram::ColoredFragment || desc.eu_program == EuProgram::TexturedFragment));
   return matches ? make<Gen9ShaderModule>(allocator_, desc) : nullptr;
 }
 void Gen9GraphicsDevice::destroy_shader_module(IShaderModule* module) { destroy(allocator_, static_cast<Gen9ShaderModule*>(module)); }
 
 IPipeline* Gen9GraphicsDevice::create_graphics_pipeline(const GraphicsPipelineDesc& desc) {
-  if (desc.texture_count != 0 || desc.fragment_shader == nullptr) return nullptr;   // (no textures on this device)
   const Gen9ShaderModule* vs = static_cast<const Gen9ShaderModule*>(desc.vertex_shader);
   const Gen9ShaderModule* fs = static_cast<const Gen9ShaderModule*>(desc.fragment_shader);
-  if (!vs || !fs || vs->program() != EuProgram::ColoredVertex || fs->program() != EuProgram::ColoredFragment) return nullptr;
+  if (!vs || !fs) return nullptr;
+  // The coloured pair (a float3 position and a float4 colour) or the textured pair (a float3 position and a float2 texture coordinate, one texture).
+  const bool textured = vs->program() == EuProgram::TexturedVertex && fs->program() == EuProgram::TexturedFragment;
+  const bool colored = vs->program() == EuProgram::ColoredVertex && fs->program() == EuProgram::ColoredFragment;
+  if (!textured && !colored) return nullptr;
+  if (desc.texture_count != (textured ? 1u : 0u)) return nullptr;
   if (desc.attribute_count != 2 || desc.varying_count != 1 || desc.vertex_stride == 0 || desc.vertex_stride > 2048) return nullptr;
   int32_t position = -1, color = -1;
   for (uint32_t i = 0; i < desc.attribute_count; ++i) {
     const VertexAttribute& a = desc.attributes[i];
     if (a.location == 0 && a.format == VertexFormat::Float3) position = static_cast<int32_t>(a.offset);
-    else if (a.location == 1 && a.format == VertexFormat::Float4) color = static_cast<int32_t>(a.offset);
+    else if (a.location == 1 && a.format == (textured ? VertexFormat::Float2 : VertexFormat::Float4)) color = static_cast<int32_t>(a.offset);
   }
   if (position < 0 || color < 0 || position > 2000 || color > 2000) return nullptr;
-  return make<Gen9Pipeline>(allocator_, desc, static_cast<uint32_t>(position), static_cast<uint32_t>(color));
+  return make<Gen9Pipeline>(allocator_, desc, static_cast<uint32_t>(position), static_cast<uint32_t>(color), textured);
 }
 void Gen9GraphicsDevice::destroy_pipeline(IPipeline* pipeline) { destroy(allocator_, static_cast<Gen9Pipeline*>(pipeline)); }
 
@@ -356,10 +385,18 @@ ICommandBuffer* Gen9GraphicsDevice::create_command_buffer() { return make<Comman
 void Gen9GraphicsDevice::destroy_command_buffer(ICommandBuffer* commands) { destroy(allocator_, static_cast<CommandRecorder*>(commands)); }
 
 // Runs the triangles staged so far as one job.
-bool Gen9GraphicsDevice::run_job(const DrawState& state, uint32_t vertices) {
+bool Gen9GraphicsDevice::run_job(const DrawState& state, uint32_t vertices, const TextureBinding* texture) {
   if (vertices == 0) return true;
   RenderBatch batch(image_, VcsDriver::kBatchGpuAddress);
-  if (!batch.triangles(state, ArrayView<const Vertex>(staging_.data(), vertices), true, nullptr)) return false;
+  if (texture) {
+    hardware::intel_gt::gen9_3d::Sampler sampler;
+    sampler.linear = texture->sampler.filter == Filter::Linear;
+    sampler.repeat_u = texture->sampler.address_u == AddressMode::Repeat;
+    sampler.repeat_v = texture->sampler.address_v == AddressMode::Repeat;
+    if (!batch.textured_triangles(state, ArrayView<const Vertex>(staging_.data(), vertices), texture->image->surface(), sampler)) return false;
+  } else if (!batch.triangles(state, ArrayView<const Vertex>(staging_.data(), vertices), true, nullptr)) {
+    return false;
+  }
   return engine_.run_batch(ArrayView<const uint32_t>(image_.data(), batch.dwords())) == VcsDriver::Result::Done;
 }
 
@@ -411,7 +448,9 @@ bool Gen9GraphicsDevice::run_draw(const DrawRecord& d, const DrawState& base_sta
     indices = d.index_buffer->map();
     if (d.index_offset % index_size != 0) return false;
   }
-  const uint64_t attribute_end = d.pipeline->color_offset() + 16 > d.pipeline->position_offset() + 12 ? d.pipeline->color_offset() + 16 : d.pipeline->position_offset() + 12;
+  const TextureBinding* texture = d.pipeline->textured() ? &d.texture : nullptr;
+  const uint32_t second_bytes = texture ? 8 : 16;   // a texture coordinate or a colour
+  const uint64_t attribute_end = d.pipeline->color_offset() + second_bytes > d.pipeline->position_offset() + 12 ? d.pipeline->color_offset() + second_bytes : d.pipeline->position_offset() + 12;
 
   for (uint32_t t = 0; t < vertex_count; t += 3) {
     ClipVertex poly[2][kMaxClipVertices];
@@ -434,7 +473,8 @@ bool Gen9GraphicsDevice::run_draw(const DrawRecord& d, const DrawState& base_sta
       // The matrix is column major: clip = M * (x, y, z, 1).
       for (int r = 0; r < 4; ++r) poly[0][k].p[r] = mvp[r] * x + mvp[4 + r] * y + mvp[8 + r] * z + mvp[12 + r];
       for (int r = 0; r < 4; ++r) {
-        poly[0][k].c[r] = read_float(col + 4 * r);
+        // A textured vertex carries (u, v) in the first two components of the attribute the kernel reads; the other two are unused.
+        poly[0][k].c[r] = texture && r >= 2 ? 0.0f : read_float(col + 4 * r);
         if (!finite(poly[0][k].c[r]) || !finite(poly[0][k].p[r])) return false;
       }
     }
@@ -470,7 +510,7 @@ bool Gen9GraphicsDevice::run_draw(const DrawRecord& d, const DrawState& base_sta
     if ((pd.cull_mode == CullMode::Back && !front) || (pd.cull_mode == CullMode::Front && front)) continue;
     for (uint32_t i = 1; i + 1 < n; ++i) {
       if (staged_ + 3 > staging_.size()) {
-        if (!run_job(state, staged_)) return false;
+        if (!run_job(state, staged_, texture)) return false;
         staged_ = 0;
       }
       staging_[staged_++] = window[0];
@@ -480,7 +520,7 @@ bool Gen9GraphicsDevice::run_draw(const DrawRecord& d, const DrawState& base_sta
   }
   const uint32_t pending = staged_;
   staged_ = 0;
-  return run_job(state, pending);
+  return run_job(state, pending, texture);
 }
 
 bool Gen9GraphicsDevice::run_pass(const RenderPassBegin& pass, const List<DrawRecord>& draws) {
@@ -489,8 +529,11 @@ bool Gen9GraphicsDevice::run_pass(const RenderPassBegin& pass, const List<DrawRe
   if (!color || color->is_depth() || !(color->usage() & kImageColorAttachment) || !ready() || engine_.state() != VcsDriver::State::Ready) return false;
   if (depth && (!depth->is_depth() || !(depth->usage() & kImageDepthAttachment) || depth->extent().width != color->extent().width || depth->extent().height != color->extent().height))
     return false;
-  for (uint64_t i = 0; i < draws.count(); ++i)
+  for (uint64_t i = 0; i < draws.count(); ++i) {
     if (!draws[i].pipeline) return false;
+    // A textured draw needs its texture bound, and it is not the image being drawn into (or the depth buffer).
+    if (draws[i].pipeline->textured() && (!draws[i].texture.image || draws[i].texture.image == color || draws[i].texture.image == depth)) return false;
+  }
   DrawState state;
   state.target = color->surface();
   if (!state.target.valid()) return false;
@@ -535,7 +578,13 @@ bool Gen9GraphicsDevice::submit(ICommandBuffer* commands) {
       case RecordedCommand::Type::BindPipeline: current.pipeline = static_cast<const Gen9Pipeline*>(cmd.pipeline); break;
       case RecordedCommand::Type::BindVertexBuffer: current.vertex_buffer = static_cast<Gen9Buffer*>(cmd.buffer); current.vertex_offset = cmd.offset; break;
       case RecordedCommand::Type::BindIndexBuffer: current.index_buffer = static_cast<Gen9Buffer*>(cmd.buffer); current.index_offset = cmd.offset; current.index_type = cmd.index_type; break;
-      case RecordedCommand::Type::BindTexture: return false;   // (no pipeline of this device samples a texture)
+      case RecordedCommand::Type::BindTexture: {
+        const Gen9Image* image = static_cast<const Gen9Image*>(cmd.image);
+        if (cmd.unit != 0 || !image || !(image->usage() & kImageSampled) || image->is_depth()) return false;
+        current.texture.image = image;
+        current.texture.sampler = cmd.sampler;
+        break;
+      }
       case RecordedCommand::Type::PushConstants: {
         if (cmd.constants_size > kMaxPushedConstantBytes || cmd.constants_offset > pool.size() || cmd.constants_size > pool.size() - cmd.constants_offset) return false;
         for (uint32_t b = 0; b < cmd.constants_size; ++b) current.constants[b] = pool[cmd.constants_offset + b];

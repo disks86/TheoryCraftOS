@@ -296,8 +296,8 @@ static void test_resources() {
   CHECK(!p.gpu->create_graphics_pipeline(wrong));
   wrong = pd; wrong.vertex_stride = 0;
   CHECK(!p.gpu->create_graphics_pipeline(wrong));
-  // Textures are not on this device yet: the textured built-ins make no pipeline (a texture count on the coloured ones neither), write_pixels says no, and a bound
-  // texture fails the submit.
+  // Textured pipelines: the textured pair with a float2 coordinate and one texture is taken; a texture count on the coloured pair, no count on the textured one, a
+  // coordinate of another size, or a mix of the two pairs, are not.
   {
     IShaderModule* tvs = p.gpu->create_shader_module(textured_vertex_shader());
     IShaderModule* tfs = p.gpu->create_shader_module(textured_fragment_shader());
@@ -305,27 +305,24 @@ static void test_resources() {
     describe_textured_pipeline(&textured);
     textured.vertex_shader = tvs;
     textured.fragment_shader = tfs;
-    CHECK(!p.gpu->create_graphics_pipeline(textured));
+    IPipeline* tp = p.gpu->create_graphics_pipeline(textured);
+    CHECK(tp);
+    p.gpu->destroy_pipeline(tp);
+    GraphicsPipelineDesc bad = textured;
+    bad.texture_count = 0;
+    CHECK(!p.gpu->create_graphics_pipeline(bad));
+    bad = textured; bad.texture_count = 2;
+    CHECK(!p.gpu->create_graphics_pipeline(bad));
+    bad = textured; bad.attributes[1].format = VertexFormat::Float4;
+    CHECK(!p.gpu->create_graphics_pipeline(bad));
+    bad = textured; bad.fragment_shader = fs;
+    CHECK(!p.gpu->create_graphics_pipeline(bad));
+    bad = textured; bad.vertex_shader = vs;
+    CHECK(!p.gpu->create_graphics_pipeline(bad));
     wrong = pd; wrong.texture_count = 1;
     CHECK(!p.gpu->create_graphics_pipeline(wrong));
     p.gpu->destroy_shader_module(tvs);
     p.gpu->destroy_shader_module(tfs);
-    IImage* tex = p.gpu->create_image({{4, 4}, Format::B8G8R8A8Unorm, kImageColorAttachment | kImageSampled});
-    IImage* target = p.gpu->create_image({{16, 16}, Format::B8G8R8A8Unorm, kImageColorAttachment});
-    CHECK(tex && target);
-    uint32_t texels[16] = {};
-    CHECK(tex && !tex->write_pixels(ArrayView<const uint32_t>(texels, 16)));
-    ICommandBuffer* cb = p.gpu->create_command_buffer();
-    cb->begin();
-    RenderPassBegin pass;
-    pass.color = target;
-    cb->begin_render_pass(pass);
-    cb->bind_texture(0, tex, SamplerDesc());
-    cb->end_render_pass();
-    CHECK(cb->end() && !p.gpu->submit(cb));
-    p.gpu->destroy_command_buffer(cb);
-    p.gpu->destroy_image(tex);
-    p.gpu->destroy_image(target);
   }
   p.gpu->destroy_pipeline(ok);
   p.gpu->destroy_shader_module(vs);
@@ -506,9 +503,199 @@ static void test_present_and_failures() {
   p.gpu->destroy_image(rgba);
 }
 
+// --- Textures -------------------------------------------------------------------
+
+struct TexturedScene {
+  Pair& p;
+  IGraphicsDevice* devices[2];
+  IShaderModule* vs[2];
+  IShaderModule* fs[2];
+  IPipeline* pipeline[2] = {nullptr, nullptr};
+  explicit TexturedScene(Pair& pair, bool blend = false) : p(pair) {
+    devices[0] = pair.gpu;
+    devices[1] = &pair.software;
+    for (int i = 0; i < 2; ++i) {
+      vs[i] = devices[i]->create_shader_module(textured_vertex_shader());
+      fs[i] = devices[i]->create_shader_module(textured_fragment_shader());
+      GraphicsPipelineDesc pd;
+      describe_textured_pipeline(&pd);
+      pd.vertex_shader = vs[i];
+      pd.fragment_shader = fs[i];
+      pd.cull_mode = CullMode::None;
+      pd.alpha_blend = blend;
+      pipeline[i] = devices[i]->create_graphics_pipeline(pd);
+    }
+  }
+  ~TexturedScene() {
+    for (int i = 0; i < 2; ++i) {
+      devices[i]->destroy_pipeline(pipeline[i]);
+      devices[i]->destroy_shader_module(vs[i]);
+      devices[i]->destroy_shader_module(fs[i]);
+    }
+  }
+  // Draws `vertices` (triangles) with the texture of `width` x `height` `texels` (0xAARRGGBB) on device `i`; the picture in `out`.
+  bool draw(int i, Format texture_format, uint32_t width, uint32_t height, const uint32_t* texels, const SamplerDesc& sampler, const TexturedVertex* vertices, uint32_t count, const Mat4& mvp,
+            Format target_format, std::vector<uint32_t>* out, Vec4 clear = {0, 0, 0, 1}) {
+    IGraphicsDevice& device = *devices[i];
+    IImage* texture = device.create_image({{width, height}, texture_format, kImageSampled});
+    IImage* target = device.create_image({{kSize, kSize}, target_format, kImageColorAttachment});
+    IBuffer* vb = device.create_buffer(count * sizeof(TexturedVertex) + 16, kBufferVertex);
+    bool ok = texture && target && vb && pipeline[i] && texture->write_pixels(ArrayView<const uint32_t>(texels, uint64_t{width} * height));
+    if (ok) {
+      ByteView m = vb->map();
+      memcpy(m.data(), vertices, count * sizeof(TexturedVertex));
+      vb->unmap();
+      ICommandBuffer* cb = device.create_command_buffer();
+      cb->begin();
+      RenderPassBegin pass;
+      pass.color = target;
+      pass.clear_color_value = clear;
+      cb->begin_render_pass(pass);
+      cb->bind_pipeline(pipeline[i]);
+      cb->bind_vertex_buffer(vb);
+      cb->push_constants(&mvp, sizeof mvp);
+      cb->bind_texture(0, texture, sampler);
+      cb->draw(count);
+      cb->end_render_pass();
+      ok = cb->end() && device.submit(cb);
+      device.destroy_command_buffer(cb);
+      if (ok) *out = read(target);
+    }
+    if (texture) device.destroy_image(texture);
+    if (target) device.destroy_image(target);
+    if (vb) device.destroy_buffer(vb);
+    return ok;
+  }
+};
+
+// A quad over the whole target (two triangles) with texture coordinates (u0, v0) at the top left and (u1, v1) at the bottom right.
+static void quad(TexturedVertex* v, float u0, float v0, float u1, float v1) {
+  const TexturedVertex q[6] = {{{-1, -1, 0.5f}, {u0, v0}}, {{-1, 1, 0.5f}, {u0, v1}}, {{1, 1, 0.5f}, {u1, v1}},
+                               {{-1, -1, 0.5f}, {u0, v0}}, {{1, 1, 0.5f}, {u1, v1}}, {{1, -1, 0.5f}, {u1, v0}}};
+  memcpy(v, q, sizeof q);
+}
+
+// The Gen9 device and the software device draw the same textured scene: pictures agree except along the diagonal between the two triangles and at texel edges.
+static void compare_textured(Pair& p, TexturedScene& ts, Format texture_format, uint32_t w, uint32_t h, const uint32_t* texels, const SamplerDesc& sampler, const TexturedVertex* vertices,
+                             uint32_t count, const Mat4& mvp, Format target_format, uint32_t tolerance, uint32_t allowed_bad, const char* what, Vec4 clear = {0, 0, 0, 1}) {
+  std::vector<uint32_t> gpu_picture, soft_picture;
+  const int jobs = p.rig.gpu.jobs;
+  CHECK(ts.draw(0, texture_format, w, h, texels, sampler, vertices, count, mvp, target_format, &gpu_picture, clear));
+  CHECK(ts.draw(1, texture_format, w, h, texels, sampler, vertices, count, mvp, target_format, &soft_picture, clear));
+  CHECK(p.rig.gpu.jobs > jobs && p.rig.gpu.violations.empty());
+  const uint32_t bad = differing(gpu_picture, soft_picture, tolerance);
+  if (bad > allowed_bad) printf("  textured scene \"%s\": %u pixels differ\n", what, bad);
+  CHECK(bad <= allowed_bad);
+}
+
+static void test_textures() {
+  Pair p;
+  CHECK(p.gpu);
+  if (!p.gpu) return;
+  TexturedScene ts(p);
+  CHECK(ts.pipeline[0] && ts.pipeline[1]);
+  const Mat4 id = Mat4::identity();
+  TexturedVertex v[6];
+
+  // A 4 x 4 texture of different texels, nearest: each texel a block.
+  uint32_t texels[16];
+  for (uint32_t y = 0; y < 4; ++y)
+    for (uint32_t x = 0; x < 4; ++x) texels[y * 4 + x] = 0xFF000000u | ((x * 80) << 16) | ((y * 80) << 8) | 0x40;
+  quad(v, 0, 0, 1, 1);
+  compare_textured(p, ts, Format::B8G8R8A8Unorm, 4, 4, texels, SamplerDesc(), v, 6, id, Format::B8G8R8A8Unorm, 0, 200, "nearest 4x4");
+  // The model really sampled: a block's colour on the Gen9 picture is the texel.
+  {
+    std::vector<uint32_t> picture;
+    CHECK(ts.draw(0, Format::B8G8R8A8Unorm, 4, 4, texels, SamplerDesc(), v, 6, id, Format::B8G8R8A8Unorm, &picture));
+    for (uint32_t y = 0; y < 4; ++y)
+      for (uint32_t x = 0; x < 4; ++x) CHECK(picture[(y * 16 + 8) * kSize + x * 16 + 8] == texels[y * 4 + x]);
+  }
+  // Repeat and clamp addressing (nearest), coordinates outside 0..1.
+  SamplerDesc repeat;
+  quad(v, 0, 0, 2, 2);
+  compare_textured(p, ts, Format::B8G8R8A8Unorm, 4, 4, texels, repeat, v, 6, id, Format::B8G8R8A8Unorm, 0, 400, "repeat");
+  SamplerDesc clamp;
+  clamp.address_u = clamp.address_v = AddressMode::ClampToEdge;
+  quad(v, -1, -1, 2, 2);
+  compare_textured(p, ts, Format::B8G8R8A8Unorm, 4, 4, texels, clamp, v, 6, id, Format::B8G8R8A8Unorm, 0, 300, "clamp");
+  // Linear filtering of a black and white pair of texels, clamped and repeating.
+  const uint32_t bw[2] = {0xFF000000u, 0xFFFFFFFFu};
+  SamplerDesc linear;
+  linear.filter = Filter::Linear;
+  linear.address_u = linear.address_v = AddressMode::ClampToEdge;
+  quad(v, 0, 0, 1, 1);
+  compare_textured(p, ts, Format::B8G8R8A8Unorm, 2, 1, bw, linear, v, 6, id, Format::B8G8R8A8Unorm, 6, 200, "linear clamp");
+  linear.address_u = AddressMode::Repeat;
+  compare_textured(p, ts, Format::B8G8R8A8Unorm, 2, 1, bw, linear, v, 6, id, Format::B8G8R8A8Unorm, 6, 200, "linear repeat");
+  // R8G8B8A8 texture and target.
+  const uint32_t rgba[4] = {0xFF2060A0u, 0xFFA06020u, 0xFF60A020u, 0xFF4080C0u};
+  quad(v, 0, 0, 1, 1);
+  compare_textured(p, ts, Format::R8G8B8A8Unorm, 2, 2, rgba, SamplerDesc(), v, 6, id, Format::R8G8B8A8Unorm, 0, 200, "rgba texture and target");
+  compare_textured(p, ts, Format::R8G8B8A8Unorm, 2, 2, rgba, SamplerDesc(), v, 6, id, Format::B8G8R8A8Unorm, 0, 200, "rgba texture, bgra target");
+  // Perspective: a receding quad, the coordinates interpolated with the vertices' 1/w.
+  const uint32_t checker[4] = {0xFFFFFFFFu, 0xFF000000u, 0xFF000000u, 0xFFFFFFFFu};
+  const Mat4 mvp = Mat4::perspective(1.2f, 1.0f, 0.1f, 100.0f) * Mat4::translation(0, -0.5f, -2.5f) * Mat4::rotation_x(-1.1f);
+  const TexturedVertex tilted[6] = {{{-1, -1, 0}, {0, 0}}, {{-1, 1, 0}, {0, 8}}, {{1, 1, 0}, {8, 8}}, {{-1, -1, 0}, {0, 0}}, {{1, 1, 0}, {8, 8}}, {{1, -1, 0}, {8, 0}}};
+  compare_textured(p, ts, Format::B8G8R8A8Unorm, 2, 2, checker, SamplerDesc(), tilted, 6, mvp, Format::B8G8R8A8Unorm, 0, 450, "perspective", {0, 0, 1, 1});
+  // Alpha and blending: a half-transparent texel over the clear colour.
+  {
+    TexturedScene blended(p, true);
+    const uint32_t half[1] = {0x80FF0000u};
+    quad(v, 0, 0, 1, 1);
+    compare_textured(p, blended, Format::B8G8R8A8Unorm, 1, 1, half, SamplerDesc(), v, 6, id, Format::B8G8R8A8Unorm, 3, 200, "blended", {0, 0, 1, 1});
+  }
+
+  // What is refused: no texture bound, the target as the texture, an image not made for sampling, a depth image, a unit that does not exist, a wrong-size upload.
+  auto run = [&](IImage* target, IImage* bound, bool bind) {
+    IBuffer* vb = p.gpu->create_buffer(sizeof v + 16, kBufferVertex);
+    ByteView m = vb->map();
+    memcpy(m.data(), v, sizeof v);
+    ICommandBuffer* cb = p.gpu->create_command_buffer();
+    cb->begin();
+    RenderPassBegin pass;
+    pass.color = target;
+    cb->begin_render_pass(pass);
+    cb->bind_pipeline(ts.pipeline[0]);
+    cb->bind_vertex_buffer(vb);
+    cb->push_constants(&id, sizeof id);
+    if (bind) cb->bind_texture(0, bound, SamplerDesc());
+    cb->draw(6);
+    cb->end_render_pass();
+    const bool ok = cb->end() && p.gpu->submit(cb);
+    p.gpu->destroy_command_buffer(cb);
+    p.gpu->destroy_buffer(vb);
+    return ok;
+  };
+  IImage* target = p.gpu->create_image({{kSize, kSize}, Format::B8G8R8A8Unorm, kImageColorAttachment | kImageSampled});
+  IImage* plain = p.gpu->create_image({{4, 4}, Format::B8G8R8A8Unorm, kImageColorAttachment});
+  IImage* sampled = p.gpu->create_image({{4, 4}, Format::B8G8R8A8Unorm, kImageSampled});
+  IImage* depth = p.gpu->create_image({{4, 4}, Format::D32Float, kImageDepthAttachment | kImageSampled});
+  CHECK(target && plain && sampled && depth);
+  CHECK(run(target, sampled, true));       // (the control: this one works)
+  CHECK(!run(target, nullptr, false));     // nothing bound
+  CHECK(!run(target, target, true));       // the target as the texture
+  CHECK(!run(target, plain, true));        // not made for sampling
+  CHECK(!run(target, depth, true));        // a depth image
+  CHECK(!depth->write_pixels(ArrayView<const uint32_t>(texels, 16)));
+  CHECK(!sampled->write_pixels(ArrayView<const uint32_t>(texels, 15)));
+  CHECK(sampled->write_pixels(ArrayView<const uint32_t>(texels, 16)));
+  {
+    ICommandBuffer* cb = p.gpu->create_command_buffer();
+    cb->begin();
+    cb->bind_texture(kMaxTextureUnits, sampled, SamplerDesc());
+    CHECK(!cb->end());
+    p.gpu->destroy_command_buffer(cb);
+  }
+  p.gpu->destroy_image(target);
+  p.gpu->destroy_image(plain);
+  p.gpu->destroy_image(sampled);
+  p.gpu->destroy_image(depth);
+}
+
 int main() {
   test_resources();
   test_scenes();
+  test_textures();
   test_present_and_failures();
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }
   printf("gen9 graphics device tests passed\n");

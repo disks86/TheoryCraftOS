@@ -36,7 +36,7 @@ namespace graphics {
 // clips the triangles (near plane and a guard band), applies the viewport, culls, and hands the engine window-space triangles; the engine interpolates the colour and
 // blends, tests depth and interpolates the colour perspective-correct from the 1/w the vertices carry. Only B8G8R8A8 and R8G8B8A8 colour images and D32Float depth images
 // up to 4096 x 4096 exist (a depth image is Y-tiled hardware memory: it cannot be read back). A render pass clears depth with a job that draws the clear value and passes
-// every pixel. Not done: stencil, textures, and anything the built-in coloured pipeline does not do.
+// every pixel. Textures (BuiltinShaders' textured pair, one texture unit, nearest or linear, wrap or clamp) are drawn by the same path with the copy kernel sampling the bound image. Not done: stencil, and anything the built-in pipelines do not do.
 // Nothing here has run on a real GPU (see docs/DellXps9575.md).
 class Gen9GraphicsDevice final : public IGraphicsDevice {
  public:
@@ -70,6 +70,7 @@ class Gen9GraphicsDevice final : public IGraphicsDevice {
 
  private:
   struct DrawRecord;
+  struct TextureBinding;
   class AddressSpace {
    public:
     AddressSpace() { ranges_[0] = {hardware::intel_gt::VcsDriver::kFirstBufferGpuAddress, 0xFFFFF000u - hardware::intel_gt::VcsDriver::kFirstBufferGpuAddress}; count_ = 1; }
@@ -87,7 +88,7 @@ class Gen9GraphicsDevice final : public IGraphicsDevice {
   bool allocate_region(uint64_t bytes, hardware::intel_gt::GpuBuffer* buffer, uint32_t* address);
   void free_region(const hardware::intel_gt::GpuBuffer& buffer, uint32_t address);
   bool run_pass(const RenderPassBegin& pass, const List<DrawRecord>& draws);
-  bool run_job(const hardware::intel_gt::gen9_3d::DrawState& state, uint32_t vertices);
+  bool run_job(const hardware::intel_gt::gen9_3d::DrawState& state, uint32_t vertices, const TextureBinding* texture);
   bool run_draw(const DrawRecord& draw, const hardware::intel_gt::gen9_3d::DrawState& base_state, const Extent2D& target);
 
   allocators::IAllocator& allocator_;
