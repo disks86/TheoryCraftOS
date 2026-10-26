@@ -43,12 +43,36 @@ constexpr uint32_t kMaxImageBytes = 64 * 1024;  // what a batch buffer holds
 
 enum class SurfaceFormat : uint16_t { B8G8R8A8Unorm = 0x0C0, R8G8B8A8Unorm = 0x0C7 };
 
-// A linear 32-bit surface in the context's address space.
+constexpr uint32_t kMaxSurfaceLevels = 13;   // 4096 x 4096 down to 1 x 1
+
+// Where the levels of a 2D surface lie in it, and how many bytes it takes. A linear surface has the one level (pitch a multiple of 64 bytes). A Y-tiled surface (tiles of 128
+// bytes by 32 rows in 4 KiB, laid out row by row of tiles; inside a tile, columns of 16 bytes run down 32 rows, the columns side by side) holds a mip chain the way the
+// hardware lays it out (the Skylake PRM's 2D surface layout, as Mesa's isl computes it for 32-bit texels and no auxiliary surface): every level's size rounded up to a
+// multiple of 4 texels each way; level 0 at the top left, level 1 below it, level 2 to the right of level 1 and every level after that below the one before. Gen9 has no bit 6
+// swizzling of tiled memory, so the CPU may address it as laid out here (the i915 driver programs I915_BIT_6_SWIZZLE_NONE for Gen8 and later).
+struct MipLayout {
+  uint32_t levels = 0;
+  uint32_t pitch = 0;        // bytes per row of the surface (of tiles, when tiled)
+  uint32_t rows = 0;         // rows the memory holds: a multiple of 32 when tiled
+  uint32_t slice_rows = 0;   // rows the levels take (the surface's QPitch counts them): the larger of the two columns of levels, a multiple of 4
+  uint32_t x[kMaxSurfaceLevels] = {}, y[kMaxSurfaceLevels] = {};   // the texel of the surface where each level starts
+  uint32_t w[kMaxSurfaceLevels] = {}, h[kMaxSurfaceLevels] = {};   // the size of each level in texels
+  uint64_t bytes() const { return uint64_t{pitch} * rows; }
+};
+// False for an empty or too big surface, more levels than the size has (down to 1 x 1 at most), or a mip chain that is not tiled.
+bool mip_layout(uint32_t width, uint32_t height, uint32_t levels, bool tiled, MipLayout* out);
+// The byte offset from the start of a Y-tiled surface of the byte at `x_byte` in row `y` (a 32-bit texel at x is 4 * x).
+uint64_t y_tile_offset(uint32_t pitch, uint32_t x_byte, uint32_t y);
+
+// A 32-bit surface in the context's address space: linear, or Y-tiled (and then possibly with a mip chain).
 struct Surface {
-  uint64_t gpu_address = 0;   // 64-byte aligned
-  uint32_t width = 0, height = 0;
-  uint32_t pitch = 0;         // bytes per row, a multiple of 64, at least width * 4
+  uint64_t gpu_address = 0;   // 64-byte aligned (4 KiB when tiled)
+  uint32_t width = 0, height = 0;   // of level 0
+  uint32_t pitch = 0;         // bytes per row, a multiple of 64 (128 when tiled), at least width * 4
   SurfaceFormat format = SurfaceFormat::B8G8R8A8Unorm;
+  bool tiled_y = false;
+  uint32_t levels = 1;        // mip levels (more than one needs tiled_y); a sampled surface only
+  uint32_t slice_rows = 0;    // MipLayout::slice_rows; 0 means the height rounded up to 4
   bool valid() const;
 };
 
@@ -118,10 +142,15 @@ struct DrawState {
   StencilTest stencil_test;   // needs `stencil` (and `depth`) attached
 };
 
-// How a bound texture is read by textured_triangles: the filter (nearest, or bilinear), and for each axis whether it wraps around or takes the edge texel.
+// How a bound texture is read by textured_triangles: the filter (nearest, or bilinear), and for each axis whether it wraps around or takes the edge texel. With a mip chain
+// the mip filter picks the level from the derivatives of the coordinates (none: level 0 only) and the lod fields bound it (the sampler state's bias, and its minimum and
+// maximum, which the caller keeps within the levels the surface has).
+enum class MipMode : uint8_t { None, Nearest, Linear };
 struct Sampler {
   bool linear = false;
   bool repeat_u = false, repeat_v = false;
+  MipMode mip = MipMode::None;
+  float lod_bias = 0.0f, min_lod = 0.0f, max_lod = 0.0f;
 };
 
 class RenderBatch {

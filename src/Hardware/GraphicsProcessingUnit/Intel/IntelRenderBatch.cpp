@@ -119,16 +119,23 @@ class Image {
   bool overflow_ = false;
 };
 
+uint32_t align_to(uint32_t v, uint32_t a) { return (v + a - 1) / a * a; }
+uint32_t minify(uint32_t v, uint32_t level) { return level >= 31 ? 1 : (v >> level ? v >> level : 1); }
+
 uint32_t surface_state(Image& img, const Surface& s) {
   const uint32_t at = img.allocate(64, 64);
   if (!at) return 0;
   // RENDER_SURFACE_STATE of Gen9 (genxml): type, format, 4x4 alignment, render cache read/write; sizes less one; the mip tail start LOD the hardware wants set; the
   // channels selected as they are; the base address.
-  img.state(at, 0, (kSurfaceState2d << 29) | (static_cast<uint32_t>(s.format) << 18) | (1u << 16) | (1u << 14) | (1u << 8));
-  img.state(at, 1, kMocsPageTable << 25);   // memory object control: the table entry that follows the page table entry (the field is the index shifted left by one)
+  // Tile mode (bits 13:12): 0 linear, 3 Y major.
+  img.state(at, 0, (kSurfaceState2d << 29) | (static_cast<uint32_t>(s.format) << 18) | (1u << 16) | (1u << 14) | (1u << 8) | (s.tiled_y ? 3u << 12 : 0u));
+  // The QPitch (bits 14:0, in units of 4 rows: the rows the levels of the surface take) and the memory object control: the table entry that follows the page table entry (the
+  // field is the index shifted left by one).
+  const uint32_t qpitch_rows = s.slice_rows ? s.slice_rows : align_to(s.height, 4);
+  img.state(at, 1, (kMocsPageTable << 25) | ((qpitch_rows / 4) & 0x7FFF));
   img.state(at, 2, ((s.height - 1) << 16) | (s.width - 1));
   img.state(at, 3, s.pitch - 1);
-  img.state(at, 5, 1u << 8);
+  img.state(at, 5, (1u << 8) | ((s.levels - 1) & 0xF));   // the mip tail start LOD the hardware wants set; MIP Count / LOD (bits 3:0): the levels less one, for a surface that is sampled
   img.state(at, 7, (7u << 16) | (6u << 19) | (5u << 22) | (4u << 25));
   img.state(at, 8, static_cast<uint32_t>(s.gpu_address));
   img.state(at, 9, static_cast<uint32_t>(s.gpu_address >> 32));
@@ -138,8 +145,16 @@ uint32_t surface_state(Image& img, const Surface& s) {
 uint32_t sampler_state(Image& img, const Sampler& sampler) {
   const uint32_t at = img.allocate(16, 64);
   if (!at) return 0;
-  // SAMPLER_STATE: the minification filter (bits 16:14) and the magnification one (19:17), 0 nearest and 1 linear; no mipmaps are used.
-  img.state(at, 0, sampler.linear ? (1u << 14) | (1u << 17) : 0u);
+  // SAMPLER_STATE: the minification filter (bits 16:14) and the magnification one (19:17), 0 nearest and 1 linear; the mip mode filter (21:20: 0 none, 1 nearest, 3 linear) and
+  // the LOD bias (13:1, signed 4.8). The second dword holds the maximum (19:8) and minimum (31:20) LOD, unsigned 4.8: both zero keeps a surface without mipmaps at level 0.
+  auto fixed = [](float v, float lo, float hi) {
+    if (!(v > lo)) v = lo;
+    if (v > hi) v = hi;
+    return static_cast<int32_t>(v * 256.0f + (v < 0 ? -0.5f : 0.5f));
+  };
+  const uint32_t mip_mode = sampler.mip == MipMode::Nearest ? 1u : sampler.mip == MipMode::Linear ? 3u : 0u;
+  img.state(at, 0, (sampler.linear ? (1u << 14) | (1u << 17) : 0u) | (mip_mode << 20) | ((static_cast<uint32_t>(fixed(sampler.lod_bias, -16.0f, 15.99f)) & 0x1FFF) << 1));
+  img.state(at, 1, (sampler.mip == MipMode::None ? 0u : ((static_cast<uint32_t>(fixed(sampler.max_lod, 0.0f, 14.0f)) & 0xFFF) << 8) | ((static_cast<uint32_t>(fixed(sampler.min_lod, 0.0f, 14.0f)) & 0xFFF) << 20)));
   // The address control modes of r, t and s (bits 2:0, 5:3, 8:6): 0 wrap, 2 clamp. (There is no third dimension: r is clamped.)
   img.state(at, 3, (2u << 0) | ((sampler.repeat_v ? 0u : 2u) << 3) | ((sampler.repeat_u ? 0u : 2u) << 6));
   return at;
@@ -452,9 +467,71 @@ bool clip_to_target(const DrawState& draw, Rect* out) {
 
 uint32_t float_bits(float value) { return __builtin_bit_cast(uint32_t, value); }
 
+bool mip_layout(uint32_t width, uint32_t height, uint32_t levels, bool tiled, MipLayout* out) {
+  if (width == 0 || height == 0 || width > kMaxSurfaceSize || height > kMaxSurfaceSize || levels == 0 || levels > kMaxSurfaceLevels || (levels > 1 && !tiled)) return false;
+  // A chain stops at 1 x 1 (the larger side halves to 1).
+  uint32_t larger = width > height ? width : height, possible = 1;
+  while (larger > 1) {
+    larger >>= 1;
+    ++possible;
+  }
+  if (levels > possible) return false;
+  MipLayout l;
+  l.levels = levels;
+  for (uint32_t i = 0; i < levels; ++i) {
+    l.w[i] = minify(width, i);
+    l.h[i] = minify(height, i);
+  }
+  if (!tiled) {
+    l.pitch = align_to(width * 4, 64);
+    l.rows = height;
+    l.slice_rows = align_to(height, 4);
+    *out = l;
+    return true;
+  }
+  uint32_t top_w = 0, bottom_w = 0, left_h = 0, right_h = 0;
+  for (uint32_t i = 0; i < levels; ++i) {
+    const uint32_t w = align_to(l.w[i], 4), h = align_to(l.h[i], 4);
+    if (i == 0) {
+      top_w = w;
+      left_h = right_h = h;
+    } else if (i == 1) {
+      bottom_w = w;
+      left_h += h;
+      l.y[1] = align_to(l.h[0], 4);
+    } else {
+      if (i == 2) {
+        bottom_w += w;
+        l.x[2] = align_to(l.w[1], 4);
+        l.y[2] = align_to(l.h[0], 4);
+      } else {
+        l.x[i] = l.x[2];
+        l.y[i] = l.y[i - 1] + align_to(l.h[i - 1], 4);
+      }
+      right_h += h;
+    }
+  }
+  const uint32_t slice_w = top_w > bottom_w ? top_w : bottom_w;
+  l.slice_rows = left_h > right_h ? left_h : right_h;
+  l.pitch = align_to(slice_w * 4, 128);
+  l.rows = align_to(l.slice_rows, 32);
+  *out = l;
+  return true;
+}
+
+uint64_t y_tile_offset(uint32_t pitch, uint32_t x_byte, uint32_t y) {
+  const uint64_t tile = uint64_t{y / 32} * (pitch / 128) + x_byte / 128;
+  const uint32_t in_x = x_byte % 128, in_y = y % 32;
+  return tile * 4096 + uint64_t{in_x / 16} * 512 + uint64_t{in_y} * 16 + in_x % 16;
+}
+
 bool Surface::valid() const {
-  return width != 0 && height != 0 && width <= kMaxSurfaceSize && height <= kMaxSurfaceSize && pitch >= width * 4 && pitch <= kMaxPitch && (pitch & 63) == 0 &&
-         (gpu_address & 63) == 0 && gpu_address != 0 && (format == SurfaceFormat::B8G8R8A8Unorm || format == SurfaceFormat::R8G8B8A8Unorm);
+  if (width == 0 || height == 0 || width > kMaxSurfaceSize || height > kMaxSurfaceSize || pitch < width * 4 || pitch > kMaxPitch || (pitch & 63) != 0 || (gpu_address & 63) != 0 ||
+      gpu_address == 0 || (format != SurfaceFormat::B8G8R8A8Unorm && format != SurfaceFormat::R8G8B8A8Unorm))
+    return false;
+  if (levels == 0 || levels > kMaxSurfaceLevels || (levels > 1 && !tiled_y)) return false;
+  if (tiled_y && ((pitch & 127) != 0 || (gpu_address & 4095) != 0)) return false;
+  return true;
 }
 
 ArrayView<const uint32_t> copy_kernel() { return ArrayView<const uint32_t>(kCopyKernel); }

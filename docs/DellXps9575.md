@@ -111,7 +111,7 @@ clock requests. Not run on a Vega M.
 
 `IGraphicsDevice` now has textures (`src/Graphics/Graphics3D/IGraphicsDevice.hpp`): an image made with `kImageSampled` is filled by `IImage::write_pixels` (0xAARRGGBB, the device converts to its byte order), bound to a unit
 (`kMaxTextureUnits` = 2) by `ICommandBuffer::bind_texture(unit, image, SamplerDesc)`, and read by a fragment shader through `ITextureSet::sample(unit, u, v)`. A sampler has `Nearest` or `Linear` filtering and
-`Repeat` or `ClampToEdge` addressing per axis; coordinates are normalised with (0, 0) at the top left corner of the top left texel and v down; there are no mipmaps. A pipeline says how many units it samples
+`Repeat` or `ClampToEdge` addressing per axis; coordinates are normalised with (0, 0) at the top left corner of the top left texel and v down; mipmaps are described below. A pipeline says how many units it samples
 (`GraphicsPipelineDesc::texture_count`) and its fragment shader is a `textured_fragment_function` (a shader is that or a plain `fragment_function`, never both). `BuiltinShaders` has the textured pair
 (`textured_vertex_shader`, `textured_fragment_shader`, `describe_textured_pipeline`: a float3 position, a float2 coordinate, the matrix in the push constants, texture unit 0).
 
@@ -141,6 +141,36 @@ filter bits, swapping its u and v modes or pointing the texture's binding table 
 Nothing of this has run on a GPU: the sampler state's bit positions are from Mesa's genxml (`gen8.xml`, `gen9.xml`), the kernel and the surface state are the ones the intel-gpu-tools render copy runs with, and the
 hardware's filtering and edge rounding are not modelled exactly (the tests allow a few levels and a few pixels along texel edges).
 
+## Colour tiling and mipmaps
+
+`ImageDesc::mip_levels` and `IImage::write_mip_pixels` / `generate_mipmaps` (the 2 x 2 box filter of `Mipmaps.hpp`, which also has the level sizes and the logarithm); `SamplerDesc::mip_filter`
+(`None`: level 0 only, as before; `Nearest`; `Linear`), `lod_bias`, `min_lod`, `max_lod`. The level of detail is the one OpenGL's formula gives from the derivatives of the coordinates in texels of level 0,
+taken over the 2 x 2 pixel quad a pixel is in (right minus left, lower minus upper, the same for the whole quad - what the sampling hardware does): rho is the longer of the two vectors,
+lambda = log2(rho) + bias clamped to the sampler's bounds and the image's levels; at 0 or less the lookup is magnified and reads level 0; Nearest reads level floor(lambda + 0.5), Linear
+blends floor(lambda) and the next by the fraction. The software device does it by running the textured shader three more times for the quad's upper left, right and lower pixels with the lookups only recorded
+(only for draws that bind a mipmapped image with a mip filter). The Intel Gen9 device does it in hardware; V3d, VMware SVGA and virgl refuse an image with more than one level.
+
+On the Gen9 device **every colour image is now Y-tiled** (tile mode 3 in the surface state; the pitch a multiple of 128 bytes, the base a whole page, the memory a multiple of 32 rows), like the depth buffer already was.
+The old note that the CPU cannot address tiled colour memory because of the memory controller's bit 6 swizzling does not apply to Gen9: the i915 driver programs `I915_BIT_6_SWIZZLE_NONE` for Gen8 and
+later ("on BDW+, swizzling is not used"), so `write_pixels`, `read_pixels` and `present` (which gathers the rows into a linear copy for the display) address the memory as laid out: a tile is 128 bytes by 32 rows in 4 KiB,
+tiles row by row, and inside a tile 16-byte columns run down the 32 rows, side by side (`y_tile_offset`; the layout of `isl_tiled_memcpy.c`). A texture may have a mip chain (a sampled-only image: a render target
+or present image with levels is refused): `mip_layout` lays out the 2D surface as the Skylake PRM and Mesa's isl do for 32-bit texels without an auxiliary surface - every level's size rounded up to
+4 texels each way, level 0 on top, level 1 under it, level 2 right of level 1 and the others under level 2 - and gives the pitch, the rows, and the rows the levels take (the surface state's QPitch,
+in units of 4 rows). The surface state carries the tile mode, the QPitch, and (dword 5, bits 3:0) the number of levels less one; the sampler state the mip mode filter (bits 21:20: 0 none, 1 nearest, 3 linear),
+the LOD bias (13:1, signed 4.8), and the maximum (19:8) and minimum (31:20) LOD of its second dword (unsigned 4.8, kept within the levels the image has; zero when there is no mip filter, which keeps a one-level image at level 0).
+The pixel kernel is still the copy kernel with its sampler message, which takes the level from the quad's derivatives itself.
+
+`tests/FakeIntelRender.hpp` models the memory (a second, bit-formulated version of the tiling), the mip layout (written from the PRM's description, not from `mip_layout`), the sampler's mip mode, bias and bounds, and
+the quad derivatives (the coordinates extended beyond the triangle, as the hardware does for the pixels of a quad it covers in part); `tests/IntelRenderTest.cpp` checks the tile offsets and the layouts against
+numbers worked out by hand (64 x 64 with 7 levels: pitch 256, 100 rows in the levels, 128 rows of memory, level 2 at (32, 64); 5 x 3, 100 x 4 and the refusals) and the surface and sampler state dword by dword;
+`tests/Gen9GraphicsDeviceTest.cpp` draws solid-level chains (which level shows), generated chains, odd sizes and a receding floor on the Gen9 and software devices and compares the pictures, round-trips images of
+33 sizes through the tiling, and checks the refusals and that the memory comes back; `tests/GraphicsTest.cpp` covers the software device's level selection (nearest, linear, bias, bounds, magnification, anisotropy, odd sizes,
+generation, both byte orders). Every colour scene of the earlier tests passes unchanged on tiled images.
+
+What is not verified: nothing has run on a GPU. That the sampling message takes the level from the quad's coarse derivatives the way the model and the software device do (and rounds Nearest levels the same way, and treats
+Nearest and Linear mip filters with the same LOD bounds) is the thing to look at first; the mip layout and QPitch are from the PRM's text as Mesa implements it, and the tests check the code against my reading of them.
+Render targets stay single-level (a chain on a drawn-into image is refused), and mipmaps are not used by the WebGL/WebGPU paths (their textures are level 0 only).
+
 ## Stencil
 
 `IGraphicsDevice` has a stencil test: a D32Float image made with `ImageDesc::stencil` carries an 8-bit stencil plane next to the depth, a pipeline's `StencilState` says how it is tested (compare function, the fail / depth-fail /
@@ -161,8 +191,7 @@ hardware code, or leaving out the clear each makes it fail. `tests/IntelRenderTe
 What is not verified: the W-tile sizes and pitch above are from the documentation and Mesa's surface layout code as I know them, not from a run; the QPitch of the stencil packet is a guess (a single, non-array
 surface should ignore it).
 
-Not done: tiling of colour surfaces (reading or writing a tiled image from the CPU needs the memory controller's bit 6 swizzle, which depends on the machine's memory configuration, and linear surfaces cannot have
-mipmaps, so mipmaps wait for it too), interrupts (the driver polls), a render node for a non-display Intel GPU, the other engines' workarounds, and every check
+Not done: interrupts (the driver polls), a render node for a non-display Intel GPU, the other engines' workarounds, and every check
 on real hardware. The device is not used by the 2D renderer. Treat the first run on a 9575 as a bring-up, not as a working driver.
 
 ## Radeon RX Vega M: UVD 6.3
