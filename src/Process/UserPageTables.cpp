@@ -39,7 +39,7 @@ uint64_t* UserPageTables::new_table() {
   uint64_t* table = static_cast<uint64_t*>(allocator_.allocate_aligned(kPageSize, kPageSize));
   if (!table) return nullptr;
   ArrayView<uint64_t>(table, kEntries).fill(0);
-  if (!tables_.push_back(table)) {
+  if (!sets_[1 - active_].push_back(table)) {
     allocator_.deallocate(table);
     return nullptr;
   }
@@ -47,14 +47,14 @@ uint64_t* UserPageTables::new_table() {
 }
 
 void UserPageTables::release() {
-  for (uint64_t* table : tables_.view()) allocator_.deallocate(table);
-  tables_.clear();
+  for (uint64_t* table : sets_[active_].view()) allocator_.deallocate(table);
+  sets_[active_].clear();
   root_ = 0;
   built_ = false;
 }
 
 bool UserPageTables::map_page(uint64_t address, uint64_t physical, uint64_t leaf_flags) {
-  uint64_t table = root_;
+  uint64_t table = building_root_;
   const uint32_t shifts[4] = {39, 30, 21, 12};
   for (uint32_t level = 0; level < 4; ++level) {
     uint64_t& entry = table_at(table)[(address >> shifts[level]) & (kEntries - 1)];
@@ -74,14 +74,20 @@ bool UserPageTables::map_page(uint64_t address, uint64_t physical, uint64_t leaf
 }
 
 bool UserPageTables::rebuild(const AddressSpace& space) {
-  release();
+  // Everything goes into the spare set; the current one (what the CPU may be running on) is not touched until the new set is whole.
+  auto abandon = [&]() {
+    for (uint64_t* table : sets_[1 - active_].view()) allocator_.deallocate(table);
+    sets_[1 - active_].clear();
+    building_root_ = 0;
+    return false;
+  };
   uint64_t* root = new_table();
-  if (!root) return false;
-  root_ = address_of(root);
+  if (!root) return abandon();
+  building_root_ = address_of(root);
   for (const Identity& range : identity_.view()) {
     const uint64_t flags = kPresent | (range.writable ? kWritable : 0) | ((nx_ && !range.executable) ? kNoExecute : 0);      // no kUser: kernel only
     for (uint64_t offset = 0; offset < range.size; offset += kPageSize) {
-      if (!map_page(range.address + offset, range.address + offset, flags)) { release(); return false; }
+      if (!map_page(range.address + offset, range.address + offset, flags)) return abandon();
     }
   }
   AddressSpace::RegionInfo region;
@@ -90,9 +96,14 @@ bool UserPageTables::rebuild(const AddressSpace& space) {
     if (region.protection == 0) continue;
     const uint64_t flags = kPresent | kUser | ((region.protection & kProtWrite) ? kWritable : 0) | ((nx_ && !(region.protection & kProtExecute)) ? kNoExecute : 0);
     for (uint64_t offset = 0; offset < region.size; offset += kPageSize) {
-      if (!map_page(region.base + offset, address_of(region.storage) + offset, flags)) { release(); return false; }
+      if (!map_page(region.base + offset, address_of(region.storage) + offset, flags)) return abandon();
     }
   }
+  // Done: the new set replaces the old one.
+  release();
+  active_ = 1 - active_;
+  root_ = building_root_;
+  building_root_ = 0;
   built_ = true;
   generation_ = space.generation();
   return true;

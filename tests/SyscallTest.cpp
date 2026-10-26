@@ -380,6 +380,11 @@ static void test_service_numbers_agree() {
       {"NtQueryInformationProcess", WindowsSyscallNumber::NtQueryInformationProcess},
       {"NtContinue", WindowsSyscallNumber::NtContinue},
       {"NtRaiseException", WindowsSyscallNumber::NtRaiseException},
+      {"NtCreateThreadEx", WindowsSyscallNumber::NtCreateThreadEx},
+      {"NtTerminateThread", WindowsSyscallNumber::NtTerminateThread},
+      {"NtWaitForSingleObject", WindowsSyscallNumber::NtWaitForSingleObject},
+      {"NtResumeThread", WindowsSyscallNumber::NtResumeThread},
+      {"NtQueryInformationThread", WindowsSyscallNumber::NtQueryInformationThread},
   };
   FILE* header = fopen("src/Windows/tcos_syscalls.h", "r");
   CHECK(header != nullptr);

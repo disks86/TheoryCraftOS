@@ -44,4 +44,9 @@
 #define NT_SERVICE_NtQueryInformationProcess 21
 #define NT_SERVICE_NtContinue 22
 #define NT_SERVICE_NtRaiseException 23
+#define NT_SERVICE_NtCreateThreadEx 24
+#define NT_SERVICE_NtTerminateThread 25
+#define NT_SERVICE_NtWaitForSingleObject 26
+#define NT_SERVICE_NtResumeThread 27
+#define NT_SERVICE_NtQueryInformationThread 28
 #endif

@@ -21,6 +21,8 @@
 
 namespace kernel {
 
+struct Thread;
+
 #if defined(__x86_64__)
 // Selectors of the per-core GDT (kernel code and data come first, see Interrupts.hpp).
 constexpr uint16_t kSelectorUserData = 0x18 | 3, kSelectorUserCode = 0x20 | 3, kSelectorTss = 0x28;
@@ -49,6 +51,10 @@ uint64_t core_entry_stack_top(uint32_t core);
 // Sets the page tables and context of the calling thread, and of the core it is running on, with interrupts off. Used when a kernel thread turns into a
 // user-mode thread, and when its tables are rebuilt.
 void set_current_user_context(uint64_t cr3, void* context);
+
+// Gives another thread of the same program the page tables it returns to user mode with (after the program's tables were rebuilt). If the thread is the one running on
+// this core they are also made current.
+void set_thread_user_cr3(Thread* thread, uint64_t cr3);
 
 // Changes the FS and/or GS base the calling user thread will return to ring 3 with (and keeps them for later switches).
 void set_current_user_bases(bool set_fs, uint64_t fs, bool set_gs, uint64_t gs);

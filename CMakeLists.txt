@@ -561,6 +561,7 @@ add_executable(BOOTX64
   src/Process/UserPageTables.cpp
   src/Process/WindowsStartup.cpp
   src/Process/WindowsException.cpp
+  src/Process/WindowsThreads.cpp
   src/Process/ModuleLoader.cpp
   src/Process/LinuxSyscalls.cpp
   src/Process/LinuxFiles.cpp

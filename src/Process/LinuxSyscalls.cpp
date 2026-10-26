@@ -215,7 +215,7 @@ class LinuxSyscalls final : public ISyscallInterface {
       case Call::Getuid:
       case Call::Getgid: return 0;
       case Call::SetTidAddress: return process.id();
-      case Call::SchedYield: process.host().yield(); return 0;
+      case Call::SchedYield: process.block_yield(); return 0;
       case Call::Exit:
       case Call::ExitGroup: process.terminate(uint32_t(a[0] & 0xFF)); return 0;
       case Call::Uname: return write_uname(process, a[0]);
@@ -303,7 +303,7 @@ class LinuxSyscalls final : public ISyscallInterface {
     if (!process.read_user_u64(request, &seconds) || !process.read_user_u64(request + 8, &nanos)) return error(kEfault);
     if (int64_t(seconds) < 0 || nanos >= 1000000000u) return error(kEinval);
     const uint64_t kMaxSeconds = (~uint64_t{0} - 999999999u) / 1000000000u;
-    process.host().sleep_ns(seconds > kMaxSeconds ? ~uint64_t{0} : seconds * 1000000000u + nanos);
+    process.block_sleep(seconds > kMaxSeconds ? ~uint64_t{0} : seconds * 1000000000u + nanos);
     if (remaining && (!process.write_user_u64(remaining, 0) || !process.write_user_u64(remaining + 8, 0))) return error(kEfault);
     return 0;
   }

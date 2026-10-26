@@ -41,7 +41,7 @@ constexpr uint64_t kMaxPath = 4096;
 PathResult resolve_path(PathStyle style, StringView cwd, StringView path, String* out);
 
 // What a descriptor (Linux file descriptor, Windows handle) refers to.
-enum class DescriptorKind : uint8_t { Closed, ConsoleInput, ConsoleOutput, ConsoleError, File, Directory, Null, Zero, Random };
+enum class DescriptorKind : uint8_t { Closed, ConsoleInput, ConsoleOutput, ConsoleError, File, Directory, Null, Zero, Random, Thread };
 
 // How open() treats the path. (The Linux O_* and Windows dispositions both reduce to these.)
 struct OpenFlags {
@@ -100,6 +100,9 @@ class ProcessFiles {
   void set_close_on_exec(uint64_t slot, bool value) { if (slot < kMaxDescriptors) slots_[slot].close_on_exec = value; }
   // Opens a device node as a descriptor (the Null/Zero/Random kinds).
   int64_t open_device(DescriptorKind kind);
+  // A descriptor for something the process keeps track of itself (a thread): `token` says which one. -1 if the table is full.
+  int64_t open_token(DescriptorKind kind, uint64_t token);
+  uint64_t token(uint64_t slot) const { return slot < kMaxDescriptors ? slots_[slot].token : 0; }
   // The lowest free descriptor at or above `minimum`; -1 if none.
   int64_t free_slot(uint64_t minimum) const;
 
@@ -134,6 +137,7 @@ class ProcessFiles {
   struct Slot {
     DescriptorKind kind = DescriptorKind::Closed;
     SharedPointer<OpenObject> object;
+    uint64_t token = 0;
     bool close_on_exec = false;
   };
   bool host_path(StringView virtual_path, String* out) const;

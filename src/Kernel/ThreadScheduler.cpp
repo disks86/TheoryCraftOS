@@ -657,6 +657,15 @@ void set_current_user_bases(bool set_fs, uint64_t fs, bool set_gs, uint64_t gs) 
   }
   irq_restore(flags);
 }
+void set_thread_user_cr3(Thread* t, uint64_t cr3) {
+  const uint64_t flags = lock_irq();
+  if (t->user_cr3) {      // (a thread that has not started in user mode yet takes the tables it finds when it does: see set_current_user_context)
+    t->user_cr3 = cr3;
+    Core* c = this_core();
+    if (c->current == t) c->user.user_cr3 = cr3;
+  }
+  unlock_irq(flags);
+}
 void set_current_user_context(uint64_t cr3, void* context) {
   const uint64_t flags = irq_save();
   Core* c = this_core();
@@ -671,6 +680,12 @@ void set_current_user_context(uint64_t cr3, void* context) {
   irq_restore(flags);
 }
 #endif
+
+void set_thread_affinity(Thread* t, int32_t core) {
+  const uint64_t flags = lock_irq();
+  t->affinity = core;
+  unlock_irq(flags);
+}
 
 Thread* current_thread() { return g.running ? this_core()->current : nullptr; }
 

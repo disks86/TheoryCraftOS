@@ -29,8 +29,104 @@ Process::Process(uint64_t id, const ProcessBinding& binding, IUserMemory& memory
     : id_(id), binding_(binding), memory_(memory), host_(host), files_(binding.abi == SyscallAbi::Windows ? PathStyle::Windows : PathStyle::Posix) {}
 
 uint64_t Process::syscall(const SyscallRequest& request) {
-  if (!binding_.interface || exited_) return binding_.abi == SyscallAbi::Windows ? kUnknownWindows : kUnknownLinux;
+  if (!binding_.interface || exited()) return binding_.abi == SyscallAbi::Windows ? kUnknownWindows : kUnknownLinux;
   return binding_.interface->dispatch(*this, request);
+}
+
+void Process::terminate(uint32_t code) {
+  if (exited()) return;
+  exit_code_ = code;
+  __atomic_store_n(&exited_, true, __ATOMIC_RELEASE);
+  host_.wake_blocked();
+  if (runtime_) runtime_->notify();
+}
+
+void Process::register_main_thread(uint64_t id, uint64_t teb) {
+  ThreadRecord* t = add_thread(id);
+  if (!t) return;
+  t->started = true;
+  t->teb = teb;
+}
+
+Process::ThreadRecord* Process::find_thread(uint64_t id) {
+  for (ThreadRecord& t : threads_) if (t.used && t.id == id) return &t;
+  return nullptr;
+}
+
+Process::ThreadRecord* Process::add_thread(uint64_t id) {
+  for (int pass = 0; pass < 2; ++pass) {
+    if (pass == 1) {
+      // The table is full: a thread that has ended and that no handle refers to any more is forgotten (the main thread's record stays).
+      for (ThreadRecord& t : threads_) {
+        if (!t.used || !t.finished || t.id == id_) continue;
+        bool referenced = false;
+        for (uint64_t slot = 0; slot < kMaxDescriptors && !referenced; ++slot) referenced = files_.kind(slot) == DescriptorKind::Thread && files_.token(slot) == t.id;
+        if (!referenced) t.used = false;
+      }
+    }
+    for (ThreadRecord& t : threads_) {
+      if (t.used) continue;
+      t = ThreadRecord();
+      t.used = true;
+      t.id = id;
+      return &t;
+    }
+  }
+  return nullptr;
+}
+
+uint32_t Process::live_threads() const {
+  uint32_t n = 0;
+  for (const ThreadRecord& t : threads_) if (t.used && !t.finished) ++n;
+  return n;
+}
+
+namespace {
+// Gives the process lock back for the length of a blocking host call.
+class Unlocked {
+ public:
+  explicit Unlocked(IProcessRuntime* runtime) : runtime_(runtime) { if (runtime_) runtime_->unlock(); }
+  ~Unlocked() { if (runtime_) runtime_->lock(); }
+  Unlocked(const Unlocked&) = delete;
+  Unlocked& operator=(const Unlocked&) = delete;
+
+ private:
+  IProcessRuntime* runtime_;
+};
+}  // namespace
+
+void Process::block_sleep(uint64_t ns) {
+  if (!runtime_) {
+    host_.sleep_ns(ns);
+    return;
+  }
+  // With threads the sleep is a wait that the process ending (or a kill) cuts short; other changes in the process wake it too, so it keeps track of its deadline.
+  const uint64_t now = host_.monotonic_ns();
+  const uint64_t end = ns > ~uint64_t{0} - now ? ~uint64_t{0} : now + ns;
+  while (!runtime_->interrupted() && !exited()) {
+    const uint64_t t = host_.monotonic_ns();
+    if (t >= end) break;
+    runtime_->wait(end == ~uint64_t{0} ? ~uint64_t{0} : end - t);
+  }
+}
+
+void Process::block_yield() {
+  Unlocked u(runtime_);
+  host_.yield();
+}
+
+bool Process::block_read_console(ByteView out, uint64_t* got) {
+  Unlocked u(runtime_);
+  return host_.read_console(out, got);
+}
+
+bool Process::wait_for_change(uint64_t timeout_ns) {
+  if (!runtime_) {
+    host_.sleep_ns(timeout_ns == ~uint64_t{0} ? 1000000 : timeout_ns);      // a single thread: nothing else can change anything
+    return timeout_ns == ~uint64_t{0};
+  }
+  if (runtime_->interrupted() || exited()) return false;
+  return runtime_->wait(timeout_ns);
 }
 
 bool Process::read_user_u64(uint64_t address, uint64_t* out) {
@@ -75,7 +171,7 @@ uint64_t copy_console_to_user(Process& process, uint64_t address, uint64_t count
   const uint64_t n = count < kChunk ? count : kChunk;      // one read: a terminal read returns what is there, not what was asked for
   if (n == 0) return 0;
   uint64_t got = 0;
-  if (!process.host().read_console(ByteView(buffer, n), &got) || got > n) return 0;
+  if (!process.block_read_console(ByteView(buffer, n), &got) || got > n) return 0;
   if (!process.write_user(address, ConstByteView(buffer, got))) { *faulted = true; return 0; }
   return got;
 }

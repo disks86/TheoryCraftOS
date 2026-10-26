@@ -54,8 +54,21 @@ __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");
  * The errno variable, the arguments, the environment and what start-up and exit need
  * ==================================================================================================================================================================== */
 
-static int g_errno, g_doserrno;
-API int *_errno(void) { return &g_errno; }
+static int g_errno_main, g_doserrno;
+static DWORD g_errno_slot = TLS_OUT_OF_INDEXES;
+/* errno is a variable of each thread (made on first use); before the library has started, or when there is no memory, the main one serves. */
+static int *errno_location(void) {
+  if (g_errno_slot == TLS_OUT_OF_INDEXES) return &g_errno_main;
+  int *p = TlsGetValue(g_errno_slot);
+  if (!p) {
+    p = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(int));
+    if (!p) return &g_errno_main;
+    TlsSetValue(g_errno_slot, p);
+  }
+  return p;
+}
+#define g_errno (*errno_location())
+API int *_errno(void) { return errno_location(); }
 API unsigned long *__doserrno(void) { return (unsigned long *)&g_doserrno; }
 #define EPERM 1
 #define ENOENT 2
@@ -1115,6 +1128,34 @@ API int _fstat64(int fd, void *buffer) { return stat_fd(fd, buffer, 1); }
 API int _fstat(int fd, void *buffer) { return stat_fd(fd, buffer, 0); }
 API int fstat(int fd, void *buffer) { return stat_fd(fd, buffer, 0); }
 
+/* The streams are shared by the threads of the process: one recursive lock (a thread that finds it taken gives its time slice away), taken by each stream function and
+ * for the length of a printf or scanf call. */
+static volatile DWORD g_crt_owner;
+static volatile LONG g_crt_depth;
+static void crt_lock(void) {
+  const DWORD me = GetCurrentThreadId();
+  if (g_crt_owner == me) { ++g_crt_depth; return; }
+  while (!__sync_bool_compare_and_swap(&g_crt_owner, 0, me)) SwitchToThread();
+  g_crt_depth = 1;
+}
+static void crt_unlock(void) { if (--g_crt_depth == 0) __sync_lock_release(&g_crt_owner); }
+API int fgetc(void *stream);
+API int ungetc(int c, void *stream);
+API int fputc(int c, void *stream);
+API int fflush(void *stream);
+API int fclose(void *stream);
+API void * fopen(const char *path, const char *mode);
+API void * freopen(const char *path, const char *mode, void *stream);
+API int fseek(void *stream, long offset, int origin);
+API int _fseeki64(void *stream, long long offset, int origin);
+API long long _ftelli64(void *stream);
+API int setvbuf(void *stream, char *buffer, int mode, size_t_ size);
+API int fputs(const char *s, void *f);
+API int puts(const char *s);
+API char * fgets(char *s, int n, void *f);
+API size_t_ fread(void *buffer, size_t_ size, size_t_ count, void *stream);
+API size_t_ fwrite(const void *buffer, size_t_ size, size_t_ count, void *stream);
+
 /* ---- streams ------------------------------------------------------------------------------------------------------------------------------------------------------ */
 
 #define S_READ 0x1
@@ -1191,7 +1232,7 @@ static int stream_fill(Stream *f) {
   if (n == 0) { f->flags |= S_EOF; return 0; }
   return 1;
 }
-API int fgetc(void *stream) {
+static int fgetc_nolock(void *stream) {
   Stream *f = stream;
   init_streams();
   if (!(f->flags & S_READ)) { f->flags |= S_ERR; g_errno = EBADF; return EOF; }
@@ -1219,14 +1260,14 @@ API int fgetc(void *stream) {
 API int getc(void *f) { return fgetc(f); }
 API int _fgetc_nolock(void *f) { return fgetc(f); }
 API int getchar(void) { return fgetc(STDIN_); }
-API int ungetc(int c, void *stream) {
+static int ungetc_nolock(int c, void *stream) {
   Stream *f = stream;
   if (c == EOF || f->ungot >= 0) return EOF;
   f->ungot = c & 0xFF;
   f->flags &= ~S_EOF;
   return c;
 }
-API int fputc(int c, void *stream) {
+static int fputc_nolock(int c, void *stream) {
   Stream *f = stream;
   init_streams();
   if (!(f->flags & S_WRITE)) { f->flags |= S_ERR; g_errno = EBADF; return EOF; }
@@ -1249,9 +1290,9 @@ API int fputc(int c, void *stream) {
 API int putc(int c, void *f) { return fputc(c, f); }
 API int _fputc_nolock(int c, void *f) { return fputc(c, f); }
 API int putchar(int c) { return fputc(c, STDOUT_); }
-API int fputs(const char *s, void *f) { for (; *s; ++s) if (fputc((unsigned char)*s, f) == EOF) return EOF; return 0; }
-API int puts(const char *s) { if (fputs(s, STDOUT_) == EOF || fputc('\n', STDOUT_) == EOF) return EOF; return 0; }
-API int fflush(void *stream) {
+static int fputs_nolock(const char *s, void *f) { for (; *s; ++s) if (fputc((unsigned char)*s, f) == EOF) return EOF; return 0; }
+static int puts_nolock(const char *s) { if (fputs(s, STDOUT_) == EOF || fputc('\n', STDOUT_) == EOF) return EOF; return 0; }
+static int fflush_nolock(void *stream) {
   init_streams();
   if (!stream) { int r = 0; for (Stream *f = g_streams; f; f = f->next) if (f->flags & S_WRITE) r |= stream_flush_write(f); r |= stream_flush_write(STDOUT_); return r ? EOF : 0; }
   Stream *f = stream;
@@ -1259,7 +1300,7 @@ API int fflush(void *stream) {
   return 0;
 }
 API int _flushall(void) { fflush(NULL); return 0; }
-API char *fgets(char *s, int n, void *f) {
+static char * fgets_nolock(char *s, int n, void *f) {
   if (n <= 0) return NULL;
   int i = 0;
   while (i < n - 1) {
@@ -1273,7 +1314,7 @@ API char *fgets(char *s, int n, void *f) {
 }
 API char *gets_s(char *s, size_t_ n) { if (!fgets(s, (int)n, STDIN_)) return NULL; size_t_ l = strlen(s); if (l && s[l - 1] == '\n') s[l - 1] = 0; return s; }
 API char *gets(char *s) { return gets_s(s, 0x7FFFFFFF); }
-API size_t_ fread(void *buffer, size_t_ size, size_t_ count, void *stream) {
+static size_t_ fread_nolock(void *buffer, size_t_ size, size_t_ count, void *stream) {
   Stream *f = stream;
   unsigned char *out = buffer;
   const size_t_ total = size * count;
@@ -1286,7 +1327,7 @@ API size_t_ fread(void *buffer, size_t_ size, size_t_ count, void *stream) {
   }
   return got / size;
 }
-API size_t_ fwrite(const void *buffer, size_t_ size, size_t_ count, void *stream) {
+static size_t_ fwrite_nolock(const void *buffer, size_t_ size, size_t_ count, void *stream) {
   const unsigned char *p = buffer;
   const size_t_ total = size * count;
   if (size == 0 || count == 0) return 0;
@@ -1298,7 +1339,7 @@ API int ferror(void *f) { return (((Stream *)f)->flags & S_ERR) != 0; }
 API void clearerr(void *f) { ((Stream *)f)->flags &= ~(S_EOF | S_ERR); }
 API int _fileno(void *f) { return ((Stream *)f)->fd; }
 API int fileno(void *f) { return ((Stream *)f)->fd; }
-API int setvbuf(void *stream, char *buffer, int mode, size_t_ size) {
+static int setvbuf_nolock(void *stream, char *buffer, int mode, size_t_ size) {
   Stream *f = stream;
   if (f->buffer && (f->flags & S_BUF_OWNED)) { stream_flush_write(f); free(f->buffer); f->buffer = NULL; f->flags &= ~S_BUF_OWNED; }
   f->flags &= ~(S_UNBUF | S_LINEBUF);
@@ -1308,7 +1349,7 @@ API int setvbuf(void *stream, char *buffer, int mode, size_t_ size) {
   return 0;
 }
 API void setbuf(void *f, char *buffer) { setvbuf(f, buffer, buffer ? 0 : 4, 4096); }
-API int fseek(void *stream, long offset, int origin) { 
+static int fseek_nolock(void *stream, long offset, int origin) { 
   Stream *f = stream;
   FdEntry *e = fd_entry(f->fd);
   if (!e) return -1;
@@ -1319,7 +1360,7 @@ API int fseek(void *stream, long offset, int origin) {
   f->flags &= ~S_EOF;
   return raw_seek(e, offset, origin) < 0 ? -1 : 0;
 }
-API int _fseeki64(void *stream, long long offset, int origin) {
+static int _fseeki64_nolock(void *stream, long long offset, int origin) {
   Stream *f = stream;
   FdEntry *e = fd_entry(f->fd);
   if (!e) return -1;
@@ -1330,7 +1371,7 @@ API int _fseeki64(void *stream, long long offset, int origin) {
   f->flags &= ~S_EOF;
   return raw_seek(e, offset, origin) < 0 ? -1 : 0;
 }
-API long long _ftelli64(void *stream) {
+static long long _ftelli64_nolock(void *stream) {
   Stream *f = stream;
   FdEntry *e = fd_entry(f->fd);
   if (!e) return -1;
@@ -1362,7 +1403,7 @@ API void *_fdopen(int fd, const char *mode) {
   return fd_entry(fd) ? stream_open(fd, flags) : NULL;
 }
 API void *fdopen(int fd, const char *mode) { return _fdopen(fd, mode); }
-API void *fopen(const char *path, const char *mode) {
+static void * fopen_nolock(const char *path, const char *mode) {
   init_streams();
   int oflags = 0, sflags = 0, plus = 0;
   const char *m = mode;
@@ -1387,7 +1428,7 @@ API void *fopen(const char *path, const char *mode) {
 }
 API int fopen_s(void **out, const char *path, const char *mode) { *out = fopen(path, mode); return *out ? 0 : g_errno; }
 API void *_fsopen(const char *path, const char *mode, int share) { (void)share; return fopen(path, mode); }
-API void *freopen(const char *path, const char *mode, void *stream) {
+static void * freopen_nolock(const char *path, const char *mode, void *stream) {
   Stream *f = stream;
   fflush(f);
   if (!(f->flags & S_STATIC)) _close(f->fd);
@@ -1396,7 +1437,7 @@ API void *freopen(const char *path, const char *mode, void *stream) {
   if (f->flags & S_STATIC) { f->fd = n->fd; f->flags = (f->flags & S_STATIC) | (n->flags & (S_READ | S_WRITE)); f->read_pos = f->read_end = f->write_pos = 0; f->ungot = -1; return f; }
   return n;
 }
-API int fclose(void *stream) {
+static int fclose_nolock(void *stream) {
   Stream *f = stream;
   int r = 0;
   if (f->flags & S_WRITE) r = stream_flush_write(f);
@@ -1432,10 +1473,27 @@ API int _set_fmode(int mode) { g_fmode = mode; return 0; }
 API int _get_fmode(int *mode) { *mode = g_fmode; return 0; }
 API void _set_printf_count_output_dummy(void) {}
 
+API int fgetc(void *stream) { crt_lock(); int r = fgetc_nolock(stream); crt_unlock(); return r; }
+API int ungetc(int c, void *stream) { crt_lock(); int r = ungetc_nolock(c, stream); crt_unlock(); return r; }
+API int fputc(int c, void *stream) { crt_lock(); int r = fputc_nolock(c, stream); crt_unlock(); return r; }
+API int fflush(void *stream) { crt_lock(); int r = fflush_nolock(stream); crt_unlock(); return r; }
+API int fclose(void *stream) { crt_lock(); int r = fclose_nolock(stream); crt_unlock(); return r; }
+API void * fopen(const char *path, const char *mode) { crt_lock(); void * r = fopen_nolock(path, mode); crt_unlock(); return r; }
+API void * freopen(const char *path, const char *mode, void *stream) { crt_lock(); void * r = freopen_nolock(path, mode, stream); crt_unlock(); return r; }
+API int fseek(void *stream, long offset, int origin) { crt_lock(); int r = fseek_nolock(stream, offset, origin); crt_unlock(); return r; }
+API int _fseeki64(void *stream, long long offset, int origin) { crt_lock(); int r = _fseeki64_nolock(stream, offset, origin); crt_unlock(); return r; }
+API long long _ftelli64(void *stream) { crt_lock(); long long r = _ftelli64_nolock(stream); crt_unlock(); return r; }
+API int setvbuf(void *stream, char *buffer, int mode, size_t_ size) { crt_lock(); int r = setvbuf_nolock(stream, buffer, mode, size); crt_unlock(); return r; }
+API int fputs(const char *s, void *f) { crt_lock(); int r = fputs_nolock(s, f); crt_unlock(); return r; }
+API int puts(const char *s) { crt_lock(); int r = puts_nolock(s); crt_unlock(); return r; }
+API char * fgets(char *s, int n, void *f) { crt_lock(); char * r = fgets_nolock(s, n, f); crt_unlock(); return r; }
+API size_t_ fread(void *buffer, size_t_ size, size_t_ count, void *stream) { crt_lock(); size_t_ r = fread_nolock(buffer, size, count, stream); crt_unlock(); return r; }
+API size_t_ fwrite(const void *buffer, size_t_ size, size_t_ count, void *stream) { crt_lock(); size_t_ r = fwrite_nolock(buffer, size, count, stream); crt_unlock(); return r; }
+
 /* ---- the printf and scanf functions over streams -------------------------------------------------------------------------------------------------------- */
 
 static void put_to_stream(void *stream, char c) { fputc((unsigned char)c, stream); }
-static int stream_vprintf(void *stream, const char *format, va_list_ args) { return format_a(put_to_stream, stream, format, args); }
+static int stream_vprintf(void *stream, const char *format, va_list_ args) { crt_lock(); int r = format_a(put_to_stream, stream, format, args); crt_unlock(); return r; }
 API int vfprintf(void *f, const char *format, va_list_ a) { return stream_vprintf(f, format, a); }
 API int vprintf(const char *format, va_list_ a) { return stream_vprintf(STDOUT_, format, a); }
 API int fprintf(void *f, const char *format, ...) { va_list_ a; va_start_(a, format); int r = stream_vprintf(f, format, a); va_end_(a); return r; }
@@ -1453,8 +1511,8 @@ static void put_wide_to_stream(void *stream, wchar_t c) {
   else if (cp < 0x10000) { fputc((int)(0xE0 | (cp >> 12)), stream); fputc((int)(0x80 | ((cp >> 6) & 0x3F)), stream); fputc((int)(0x80 | (cp & 0x3F)), stream); }
   else { fputc((int)(0xF0 | (cp >> 18)), stream); fputc((int)(0x80 | ((cp >> 12) & 0x3F)), stream); fputc((int)(0x80 | ((cp >> 6) & 0x3F)), stream); fputc((int)(0x80 | (cp & 0x3F)), stream); }
 }
-API int vfwprintf(void *f, const wchar_t *format, va_list_ a) { return format_w(put_wide_to_stream, f, format, a); }
-API int vwprintf(const wchar_t *format, va_list_ a) { return format_w(put_wide_to_stream, STDOUT_, format, a); }
+API int vfwprintf(void *f, const wchar_t *format, va_list_ a) { crt_lock(); int r = format_w(put_wide_to_stream, f, format, a); crt_unlock(); return r; }
+API int vwprintf(const wchar_t *format, va_list_ a) { crt_lock(); int r = format_w(put_wide_to_stream, STDOUT_, format, a); crt_unlock(); return r; }
 API int fwprintf(void *f, const wchar_t *format, ...) { va_list_ a; va_start_(a, format); int r = vfwprintf(f, format, a); va_end_(a); return r; }
 API int wprintf(const wchar_t *format, ...) { va_list_ a; va_start_(a, format); int r = vwprintf(format, a); va_end_(a); return r; }
 API int fputws(const wchar_t *s, void *f) { for (; *s; ++s) put_wide_to_stream(f, *s); return 0; }
@@ -1473,7 +1531,7 @@ static void reader_unget(void *context, int c) { ungetc(c, context); }
 typedef struct { const char *text; size_t_ position, length; } TextReader;
 static int text_get(void *context) { TextReader *r = context; return r->position < r->length && r->text[r->position] ? (unsigned char)r->text[r->position++] : EOF; }
 static void text_unget(void *context, int c) { TextReader *r = context; (void)c; if (r->position > 0) --r->position; }
-static int stream_vscanf(void *stream, const char *format, va_list_ args) { Reader r = {reader_get, reader_unget, stream}; return scan_format(&r, format, args); }
+static int stream_vscanf(void *stream, const char *format, va_list_ args) { Reader r = {reader_get, reader_unget, stream}; crt_lock(); int n = scan_format(&r, format, args); crt_unlock(); return n; }
 static int text_vscanf(const char *text, size_t_ length, const char *format, va_list_ args) { TextReader t = {text, 0, length}; Reader r = {text_get, text_unget, &t}; return scan_format(&r, format, args); }
 API int vfscanf(void *f, const char *format, va_list_ a) { return stream_vscanf(f, format, a); }
 API int vscanf(const char *format, va_list_ a) { return stream_vscanf(STDIN_, format, a); }
@@ -2061,4 +2119,8 @@ API uintptr_t_ _beginthread(void (__cdecl *start)(void *), unsigned stack, void 
 }
 API void _endthread(void) { ExitThread(0); }
 
-BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID reserved) { (void)module; (void)reason; (void)reserved; return TRUE; }
+BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID reserved) {
+  (void)module; (void)reserved;
+  if (reason == DLL_PROCESS_ATTACH) g_errno_slot = TlsAlloc();
+  return TRUE;
+}

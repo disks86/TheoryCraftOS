@@ -176,6 +176,7 @@ int64_t ProcessFiles::duplicate(uint64_t slot, uint64_t minimum) {
   if (target < 0) return -1;
   slots_[target].kind = slots_[slot].kind;
   slots_[target].object = slots_[slot].object;
+  slots_[target].token = slots_[slot].token;
   slots_[target].close_on_exec = false;
   return target;
 }
@@ -186,8 +187,18 @@ bool ProcessFiles::duplicate_to(uint64_t slot, uint64_t target) {
   close(target);
   slots_[target].kind = slots_[slot].kind;
   slots_[target].object = slots_[slot].object;
+  slots_[target].token = slots_[slot].token;
   slots_[target].close_on_exec = false;
   return true;
+}
+
+int64_t ProcessFiles::open_token(DescriptorKind kind, uint64_t token) {
+  const int64_t target = free_slot(0);
+  if (target < 0) return -1;
+  slots_[target].kind = kind;
+  slots_[target].token = token;
+  slots_[target].close_on_exec = false;
+  return target;
 }
 
 int64_t ProcessFiles::open_device(DescriptorKind device) {

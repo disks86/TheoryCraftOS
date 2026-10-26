@@ -43,7 +43,8 @@ LoadStatus UserProgram::load(ConstByteView file, ArrayView<const StringView> arg
   const exe::ExecutableKind kind = exe::identify_executable(file.at_most(exe::kIdentifyBytes));
   ProcessBinding binding;
   LoadedImage image;
-  uint64_t stack_top = 0, stack_pointer = 0, heap_start = 0, fs_base = 0, gs_base = 0, argument = 0, argument2 = 0, dispatcher = 0;
+  uint64_t stack_top = 0, stack_pointer = 0, heap_start = 0, fs_base = 0, gs_base = 0, argument = 0, argument2 = 0, dispatcher = 0, thread_thunk = 0, thread_teb = 0;
+  Process::ThreadSupport thread_support;
   UniquePointer<ModuleSet> loaded_modules;      // (kept by the program once everything worked)
   const StringView path = arguments.empty() ? StringView("") : arguments[0];
   if (kind == exe::ExecutableKind::Elf) {
@@ -116,6 +117,13 @@ LoadStatus UserProgram::load(ConstByteView file, ArrayView<const StringView> arg
       image.entry = thunk;
     }
     dispatcher = modules ? modules->export_address("ntdll.dll", "KiUserExceptionDispatcher") : 0;
+    thread_thunk = modules ? modules->export_address("ntdll.dll", "TcosThreadStart") : 0;
+    thread_support.peb = startup.peb;
+    thread_support.tls_template = startup.tls_template;
+    thread_support.tls_template_bytes = startup.tls_template_bytes;
+    thread_support.tls_zero_fill = startup.tls_zero_fill;
+    thread_support.start_thunk = thread_thunk;
+    thread_teb = startup.teb;
     loaded_modules = static_cast<UniquePointer<ModuleSet>&&>(modules);
   } else {
     return LoadStatus::NotExecutable;
@@ -125,6 +133,10 @@ LoadStatus UserProgram::load(ConstByteView file, ArrayView<const StringView> arg
   process->attach_address_space(space_, heap_start);
   process->set_initial_thread_pointers(fs_base, gs_base);
   process->set_exception_dispatcher(dispatcher);
+  if (binding.abi == SyscallAbi::Windows) {
+    process->set_thread_support(thread_support);
+    process->register_main_thread(id_, thread_teb);
+  }
   if (files_) {
     process->attach_file_system(allocator_, *files_);
     if (!working_directory_.empty()) process->files().change_directory(working_directory_.view());

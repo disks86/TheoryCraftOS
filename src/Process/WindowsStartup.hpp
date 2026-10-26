@@ -34,6 +34,8 @@ struct WindowsStartup {
   uint64_t tls_block = 0;           // this thread's copy of the image's static thread-local data (0 if it has none)
   uint64_t shared_user_data = 0;    // KUSER_SHARED_DATA at its fixed address
   uint64_t ldr = 0;                 // PEB_LDR_DATA: the module lists (see WindowsModule)
+  // The image's static TLS as new threads need it: the template (initialised data) and the zero fill after it. Bytes 0 if the image has none.
+  uint64_t tls_template = 0, tls_template_bytes = 0, tls_zero_fill = 0;
 };
 
 // A module as the loader list (PEB.Ldr) describes it.
@@ -68,5 +70,18 @@ constexpr uint64_t kStdInputHandle = 4, kStdOutputHandle = 8, kStdErrorHandle = 
 // address space. The image's TLS directory is honoured (the template is copied, the zero fill is zero, the index variable becomes 0, the TEB points at the
 // block); TLS callbacks are not run. Reports a version of Windows 10 (10.0.19045). The shared data is a snapshot, not a live clock.
 LoadStatus build_windows_startup(AddressSpace& space, const exe::PeFile& pe, const LoadedImage& image, const WindowsStartupInput& input, WindowsStartup* out);
+
+// A new thread of a Windows program: one region of the address space holding its stack, its TEB and its static TLS block (copied from the template, as the first
+// thread's was). The whole region is unmapped when the thread ends.
+struct WindowsThreadInput {
+  uint64_t peb = 0, process_id = 0, thread_id = 0;
+  uint64_t stack_bytes = 0;
+  uint64_t tls_template = 0, tls_template_bytes = 0, tls_zero_fill = 0;
+};
+struct WindowsThread {
+  uint64_t teb = 0, stack_top = 0, stack_pointer = 0;
+  uint64_t region_base = 0, region_size = 0;
+};
+LoadStatus build_windows_thread(AddressSpace& space, const WindowsThreadInput& input, WindowsThread* out);
 
 }  // namespace process

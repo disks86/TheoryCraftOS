@@ -238,12 +238,54 @@ LoadStatus build_windows_startup(AddressSpace& space, const exe::PeFile& pe, con
   shared.u32(kSharedUserDataAddress + 0x3C0, input.processor_count);      // ActiveProcessorCount
   if (!shared.ok()) return LoadStatus::Malformed;
 
+  out->tls_template = tls_start;
+  out->tls_template_bytes = tls_end - tls_start;
+  out->tls_zero_fill = tls_zero;
   out->peb = peb;
   out->teb = teb;
   out->parameters = parameters;
   out->tls_block = tls_block;
   out->shared_user_data = kSharedUserDataAddress;
   out->ldr = input.modules.empty() ? 0 : ldr;
+  return LoadStatus::Ok;
+}
+
+LoadStatus build_windows_thread(AddressSpace& space, const WindowsThreadInput& input, WindowsThread* out) {
+  constexpr uint64_t kMinStack = 64 * 1024, kMaxStack = 256ull << 20, kPlacement = 0x00007FE000000000ull;
+  uint64_t stack = 0, tls_bytes = 0, total = 0, tls_size = input.tls_template_bytes + input.tls_zero_fill;
+  if (input.tls_template_bytes > kMaxStartupBytes || input.tls_zero_fill > kMaxStartupBytes) return LoadStatus::Malformed;
+  if (!AddressSpace::round_up(input.stack_bytes < kMinStack ? kMinStack : input.stack_bytes, &stack) || stack > kMaxStack) return LoadStatus::Malformed;
+  if (!AddressSpace::round_up(tls_size ? 16 + tls_size : 0, &tls_bytes)) return LoadStatus::Malformed;
+  total = stack + kTebSize + tls_bytes;
+  uint64_t base = 0;
+  if (!space.find_free(total, kPlacement, &base) || !space.map(base, total, kProtRead | kProtWrite)) return LoadStatus::OutOfMemory;
+  const uint64_t stack_top = base + stack, teb = stack_top, tls_area = teb + kTebSize, tls_block = tls_size ? tls_area + 16 : 0;
+  Writer w(space);
+  w.u64(teb + 0x00, ~uint64_t{0});
+  w.u64(teb + 0x08, stack_top);                     // StackBase
+  w.u64(teb + 0x10, base);                          // StackLimit
+  w.u64(teb + 0x30, teb);                           // Self
+  w.u64(teb + 0x40, input.process_id);              // ClientId
+  w.u64(teb + 0x48, input.thread_id);
+  w.u64(teb + 0x60, input.peb);
+  w.u64(teb + 0x1478, base);                        // DeallocationStack
+  if (tls_size) {
+    w.u64(tls_area, tls_block);
+    w.u64(teb + 0x58, tls_area);                    // ThreadLocalStoragePointer
+    uint8_t chunk[256];
+    for (uint64_t done = 0; done < input.tls_template_bytes;) {
+      const uint64_t n = input.tls_template_bytes - done < sizeof(chunk) ? input.tls_template_bytes - done : sizeof(chunk);
+      if (!space.read_privileged(input.tls_template + done, ByteView(chunk, n))) { space.unmap(base, total); return LoadStatus::Malformed; }
+      w.bytes(tls_block + done, ConstByteView(chunk, n));
+      done += n;
+    }
+  }
+  if (!w.ok()) { space.unmap(base, total); return LoadStatus::Malformed; }
+  out->teb = teb;
+  out->stack_top = stack_top;
+  out->stack_pointer = windows_initial_stack_pointer(stack_top);
+  out->region_base = base;
+  out->region_size = total;
   return LoadStatus::Ok;
 }
 

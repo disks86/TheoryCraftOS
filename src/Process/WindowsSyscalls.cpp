@@ -17,6 +17,7 @@
  */
 #include "Process/AddressSpace.hpp"
 #include "Process/WindowsFiles.hpp"
+#include "Process/WindowsThreads.hpp"
 #include "Process/Process.hpp"
 #include "Process/Syscall.hpp"
 #include "Process/WindowsSyscalls.hpp"
@@ -73,7 +74,7 @@ uint32_t nt_delay_execution(Process& process, const SyscallRequest& r) {
     const uint64_t now = nt_time_now(process);
     units = raw > now ? raw - now : 0;
   }
-  process.host().sleep_ns(units > ~uint64_t{0} / 100 ? ~uint64_t{0} : units * 100);
+  process.block_sleep(units > ~uint64_t{0} / 100 ? ~uint64_t{0} : units * 100);
   return kStatusSuccess;
 }
 
@@ -303,12 +304,17 @@ class WindowsSyscalls final : public ISyscallInterface {
       case WindowsSyscallNumber::NtQueryVirtualMemory: return nt_query_virtual_memory(process, r);
       case WindowsSyscallNumber::NtQueryInformationProcess: return nt_query_information_process(process, r);
       case WindowsSyscallNumber::NtContinue: return nt_continue(process, r);
+      case WindowsSyscallNumber::NtCreateThreadEx: return windowsabi::nt_create_thread_ex(process, r);
+      case WindowsSyscallNumber::NtTerminateThread: return windowsabi::nt_terminate_thread(process, r);
+      case WindowsSyscallNumber::NtWaitForSingleObject: return windowsabi::nt_wait_for_single_object(process, r);
+      case WindowsSyscallNumber::NtResumeThread: return windowsabi::nt_resume_thread(process, r);
+      case WindowsSyscallNumber::NtQueryInformationThread: return windowsabi::nt_query_information_thread(process, r);
       case WindowsSyscallNumber::NtRaiseException: return nt_raise_exception_final(process, r);
       case WindowsSyscallNumber::NtTerminateProcess:
         if (r.args[0] != kCurrentProcess) return kStatusInvalidHandle;      // other processes are not reachable yet
         process.terminate(uint32_t(r.args[1]));
         return kStatusSuccess;
-      case WindowsSyscallNumber::NtYieldExecution: process.host().yield(); return kStatusSuccess;
+      case WindowsSyscallNumber::NtYieldExecution: process.block_yield(); return kStatusSuccess;
       case WindowsSyscallNumber::NtDelayExecution: return nt_delay_execution(process, r);
       case WindowsSyscallNumber::NtQuerySystemTime: return nt_query_system_time(process, r);
       case WindowsSyscallNumber::NtAllocateVirtualMemory: return nt_allocate_virtual_memory(process, r);

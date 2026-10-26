@@ -1,3 +1,21 @@
+/*
+ * TheoryCraftOS - a minimal UEFI x86_64 operating system.
+ * Copyright (C) 2026 Christopher Schaefer
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
 /* Prototypes of the kernel32.dll functions msvcrt.dll imports (the definitions are in kernel32/kernel32.c). */
 #pragma once
 #include "tcos_win.h"
@@ -16,6 +34,7 @@ IMPORT LPWSTR WINAPI GetCommandLineW(void);
 IMPORT DWORD WINAPI GetCurrentDirectoryA(DWORD capacity, LPSTR buffer);
 IMPORT HANDLE WINAPI GetCurrentProcess(void);
 IMPORT DWORD WINAPI GetCurrentProcessId(void);
+IMPORT DWORD WINAPI GetCurrentThreadId(void);
 IMPORT LPWSTR WINAPI GetEnvironmentStringsW(void);
 IMPORT DWORD WINAPI GetFileAttributesA(LPCSTR path);
 IMPORT BOOL WINAPI GetFileAttributesExW(LPCWSTR path, int level, LPVOID data);
@@ -44,6 +63,10 @@ IMPORT BOOL WINAPI SetEndOfFile(HANDLE h);
 IMPORT BOOL WINAPI SetEnvironmentVariableA(LPCSTR name, LPCSTR value);
 IMPORT BOOL WINAPI SetFilePointerEx(HANDLE h, LARGE_INTEGER distance, PLARGE_INTEGER result, DWORD method);
 IMPORT void WINAPI Sleep(DWORD ms);
+IMPORT BOOL WINAPI SwitchToThread(void);
+IMPORT DWORD WINAPI TlsAlloc(void);
+IMPORT LPVOID WINAPI TlsGetValue(DWORD index);
+IMPORT BOOL WINAPI TlsSetValue(DWORD index, LPVOID value);
 IMPORT int WINAPI WideCharToMultiByte(UINT code_page, DWORD flags, LPCWSTR source, int length, LPSTR dest, int capacity, LPCSTR default_char, LPBOOL used_default);
 IMPORT BOOL WINAPI WriteFile(HANDLE h, LPCVOID buffer, DWORD length, LPDWORD written, LPOVERLAPPED overlapped);
 IMPORT int WINAPI lstrlenW(LPCWSTR s);

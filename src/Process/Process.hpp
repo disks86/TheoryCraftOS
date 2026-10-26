@@ -37,6 +37,35 @@ class IUserMemory {
   ~IUserMemory() = default;
 };
 
+// Where a new thread of the program starts. The thread has its own stack and thread pointer (the TEB, for Windows); everything else is the process's.
+struct ThreadStart {
+  uint64_t entry = 0;                     // the first instruction
+  uint64_t argument = 0, argument2 = 0;   // the first two argument registers (RCX, RDX)
+  uint64_t stack_pointer = 0;
+  uint64_t fs_base = 0, gs_base = 0;
+  uint64_t id = 0;
+};
+
+// What a process needs to run more than one thread: supplied by whoever runs the program (the kernel). Without one a process has a single thread. The process has
+// one lock; a system call holds it while it runs and gives it up while it blocks (sleeping, waiting, reading the console), so the threads of a process never
+// look at its tables at the same time.
+class IProcessRuntime {
+ public:
+  virtual void lock() = 0;
+  virtual void unlock() = 0;
+  // With the lock held: sleeps (the lock is released meanwhile) until notify() or the timeout (nanoseconds, ~0 = none); the lock is held again on return. False on timeout.
+  virtual bool wait(uint64_t timeout_ns) = 0;
+  virtual void notify() = 0;                          // wakes every thread in wait()
+  virtual bool interrupted() = 0;                     // the program was told to stop (Ctrl+C): waits end
+  virtual bool start_thread(const ThreadStart& start, bool suspended) = 0;
+  virtual bool resume_thread(uint64_t id) = 0;        // a thread created suspended starts
+  virtual uint64_t current_thread_id() = 0;
+
+ protected:
+  IProcessRuntime() = default;
+  ~IProcessRuntime() = default;
+};
+
 // What a process needs from the rest of the system.
 class IProcessHost {
  public:
@@ -50,6 +79,8 @@ class IProcessHost {
   virtual bool random_bytes(ByteView out) { (void)out; return false; }
   // Optional: a program made a system call this OS does not have (for finding out what a program needs).
   virtual void unhandled_syscall(SyscallAbi abi, uint64_t number) { (void)abi; (void)number; }
+  // Optional: the process ended while one of its threads may be blocked in read_console() or sleep_ns(): make that return.
+  virtual void wake_blocked() {}
 
  protected:
   IProcessHost() = default;
@@ -73,9 +104,10 @@ class Process {
   // Runs one system call through the process's interface. A process without an interface (or one that already exited) gets the ABI's "no such call".
   uint64_t syscall(const SyscallRequest& request);
 
-  bool exited() const { return exited_; }
+  bool exited() const { return __atomic_load_n(&exited_, __ATOMIC_ACQUIRE); }
   uint32_t exit_code() const { return exit_code_; }
-  void terminate(uint32_t code) { exited_ = true; exit_code_ = code; }
+  // The first ending counts: a process that already exited (ExitProcess) keeps its code when its other threads are stopped.
+  void terminate(uint32_t code);
 
   IProcessHost& host() { return host_; }
   bool read_user(uint64_t address, ByteView out) { return memory_.read(address, out); }
@@ -113,6 +145,40 @@ class Process {
   void request_context_restore(uint64_t address) { context_restore_ = address; context_restore_pending_ = true; }
   bool take_context_restore(uint64_t* address) { *address = context_restore_; const bool p = context_restore_pending_; context_restore_pending_ = false; return p; }
 
+  // --- threads (Windows). The table lives here; the runtime starts the CPU's threads.
+  static constexpr uint32_t kMaxThreads = 64;
+  struct ThreadRecord {
+    uint64_t id = 0;
+    bool used = false, started = false, finished = false;
+    uint32_t exit_code = 259;                         // STILL_ACTIVE
+    uint64_t teb = 0, region_base = 0, region_size = 0;      // the thread's TEB and the one region that holds its stack, TEB and TLS block
+  };
+  void attach_runtime(IProcessRuntime* runtime) { runtime_ = runtime; }
+  IProcessRuntime* runtime() { return runtime_; }
+  // The thread the process started with.
+  void register_main_thread(uint64_t id, uint64_t teb);
+  // The Windows startup data a new thread needs: the PEB, the image's static TLS template (see build_windows_thread), and the ntdll function new threads begin in.
+  struct ThreadSupport {
+    uint64_t peb = 0, tls_template = 0, tls_template_bytes = 0, tls_zero_fill = 0, start_thunk = 0;
+    uint64_t stack_bytes = 1ull << 20;                // the default size of a new thread's stack
+  };
+  void set_thread_support(const ThreadSupport& support) { thread_support_ = support; }
+  const ThreadSupport& thread_support() const { return thread_support_; }
+  ThreadRecord* find_thread(uint64_t id);
+  ThreadRecord* add_thread(uint64_t id);
+  uint32_t live_threads() const;
+  uint64_t next_thread_id() { return (uint64_t{++thread_counter_} << 20) | id_; }
+  // The calling thread ended itself (NtTerminateThread): whoever runs the program ends the CPU thread once the call returns. Returns the code.
+  void request_thread_exit(uint32_t code) { thread_exit_pending_ = true; thread_exit_code_ = code; }
+  bool take_thread_exit(uint32_t* code) { *code = thread_exit_code_; const bool p = thread_exit_pending_; thread_exit_pending_ = false; return p; }
+
+  // --- blocking helpers for the system calls: they give up the process lock while the thread is stuck.
+  void block_sleep(uint64_t ns);
+  void block_yield();
+  bool block_read_console(ByteView out, uint64_t* got);
+  // With the lock held: waits for a change in the process (a thread ended, ...) for at most `timeout_ns`. False on timeout, or when the process was told to stop.
+  bool wait_for_change(uint64_t timeout_ns);
+
   // The process's files and descriptors. Without a file system attached only the console descriptors work.
   ProcessFiles& files() { return files_; }
   // Gives the process its tree: "/Linux" is the root of a Linux process, "/Windows" is C:\\ of a Windows one, both in `fs`.
@@ -129,6 +195,11 @@ class Process {
   IProcessHost& host_;
   bool exited_ = false;
   uint32_t exit_code_ = 0;
+  IProcessRuntime* runtime_ = nullptr;
+  ThreadRecord threads_[kMaxThreads];
+  ThreadSupport thread_support_;
+  uint32_t thread_counter_ = 0, thread_exit_code_ = 0;
+  bool thread_exit_pending_ = false;
   uint64_t fs_base_ = 0, gs_base_ = 0;
   bool fs_changed_ = false, gs_changed_ = false;
   uint64_t exception_dispatcher_ = 0, context_restore_ = 0;

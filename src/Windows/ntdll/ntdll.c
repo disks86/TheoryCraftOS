@@ -37,6 +37,11 @@ __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");
 #define _STR2(x) #x
 NT_SERVICE(NtReadFile);
 NT_SERVICE(NtWriteFile);
+NT_SERVICE(NtCreateThreadEx);
+NT_SERVICE(NtTerminateThread);
+NT_SERVICE(NtWaitForSingleObject);
+NT_SERVICE(NtResumeThread);
+NT_SERVICE(NtQueryInformationThread);
 NT_SERVICE(NtClose);
 NT_SERVICE(NtTerminateProcess);
 NT_SERVICE(NtYieldExecution);
@@ -204,7 +209,15 @@ EXPORT void NTAPI RtlExitUserProcess(NTSTATUS status) {
   for (;;) NtTerminateProcess(NtCurrentProcess(), status);
 }
 
-EXPORT void NTAPI RtlExitUserThread(NTSTATUS status) { RtlExitUserProcess(status); }      /* one thread: its end is the process's end */
+/* The thread ends; the process ends with its last thread. */
+EXPORT void NTAPI RtlExitUserThread(NTSTATUS status) {
+  for (;;) NtTerminateThread((HANDLE)(LONG_PTR)-2, status);
+}
+
+/* New threads begin here (the kernel passes the thread's function and parameter in the first two argument registers); the function's return value is the thread's exit code. */
+EXPORT void NTAPI TcosThreadStart(LPTHREAD_START_ROUTINE start, PVOID parameter) {
+  RtlExitUserThread((NTSTATUS)start(parameter));
+}
 
 /* ---- strings ------------------------------------------------------------------------------------------------------------------------------------------- */
 
@@ -362,7 +375,12 @@ EXPORT PVOID NTAPI RtlCreateHeap(ULONG flags, PVOID base, SIZE_T reserve, SIZE_T
   return heap_new(flags, commit);
 }
 
-EXPORT PVOID NTAPI RtlAllocateHeap(PVOID heap, ULONG flags, SIZE_T bytes) {
+/* The heaps are shared by the threads of the process: one spin lock (a waiting thread gives its time slice to the holder) covers all of them. */
+static volatile LONG g_heap_lock;
+static void heap_lock(void) { while (__sync_lock_test_and_set(&g_heap_lock, 1)) NtYieldExecution(); }
+static void heap_unlock(void) { __sync_lock_release(&g_heap_lock); }
+
+static PVOID heap_alloc(PVOID heap, ULONG flags, SIZE_T bytes) {
   Heap *h = heap;
   if (!heap_ok(h)) return NULL;
   if (bytes > (1ull << 46)) return NULL;
@@ -389,7 +407,7 @@ EXPORT PVOID NTAPI RtlAllocateHeap(PVOID heap, ULONG flags, SIZE_T bytes) {
   return NULL;
 }
 
-EXPORT BOOLEAN NTAPI RtlFreeHeap(PVOID heap, ULONG flags, PVOID memory) {
+static BOOLEAN heap_free(PVOID heap, ULONG flags, PVOID memory) {
   (void)flags;
   Heap *h = heap;
   if (!heap_ok(h)) return FALSE;
@@ -414,30 +432,35 @@ EXPORT BOOLEAN NTAPI RtlFreeHeap(PVOID heap, ULONG flags, PVOID memory) {
   return TRUE;
 }
 
-EXPORT SIZE_T NTAPI RtlSizeHeap(PVOID heap, ULONG flags, PVOID memory) {
+static SIZE_T heap_size(PVOID heap, ULONG flags, PVOID memory) {
   (void)flags;
   if (!heap_ok(heap) || !memory) return (SIZE_T)-1;
   Chunk *c = (Chunk *)((BYTE *)memory - 16);
   return (c->size_flags & CHUNK_USED) ? (SIZE_T)(CHUNK_SIZE(c) - 8) : (SIZE_T)-1;
 }
 
-EXPORT PVOID NTAPI RtlReAllocateHeap(PVOID heap, ULONG flags, PVOID memory, SIZE_T bytes) {
-  if (!memory) return RtlAllocateHeap(heap, flags, bytes);
-  const SIZE_T have = RtlSizeHeap(heap, flags, memory);
+static PVOID heap_realloc(PVOID heap, ULONG flags, PVOID memory, SIZE_T bytes) {
+  if (!memory) return heap_alloc(heap, flags, bytes);
+  const SIZE_T have = heap_size(heap, flags, memory);
   if (have == (SIZE_T)-1) return NULL;
   if (bytes <= have) return memory;
-  PVOID fresh = RtlAllocateHeap(heap, flags & ~HEAP_ZERO_MEMORY, bytes);
+  PVOID fresh = heap_alloc(heap, flags & ~HEAP_ZERO_MEMORY, bytes);
   if (!fresh) return NULL;
   memcpy(fresh, memory, have);
   if (flags & HEAP_ZERO_MEMORY) memset((BYTE *)fresh + have, 0, bytes - have);
-  RtlFreeHeap(heap, flags, memory);
+  heap_free(heap, flags, memory);
   return fresh;
 }
+
+EXPORT PVOID NTAPI RtlAllocateHeap(PVOID heap, ULONG flags, SIZE_T bytes) { heap_lock(); PVOID r = heap_alloc(heap, flags, bytes); heap_unlock(); return r; }
+EXPORT BOOLEAN NTAPI RtlFreeHeap(PVOID heap, ULONG flags, PVOID memory) { heap_lock(); BOOLEAN r = heap_free(heap, flags, memory); heap_unlock(); return r; }
+EXPORT SIZE_T NTAPI RtlSizeHeap(PVOID heap, ULONG flags, PVOID memory) { heap_lock(); SIZE_T r = heap_size(heap, flags, memory); heap_unlock(); return r; }
+EXPORT PVOID NTAPI RtlReAllocateHeap(PVOID heap, ULONG flags, PVOID memory, SIZE_T bytes) { heap_lock(); PVOID r = heap_realloc(heap, flags, memory, bytes); heap_unlock(); return r; }
 
 EXPORT BOOLEAN NTAPI RtlValidateHeap(PVOID heap, ULONG flags, PVOID memory) {
   (void)flags;
   if (!heap_ok(heap)) return FALSE;
-  return memory ? RtlSizeHeap(heap, 0, memory) != (SIZE_T)-1 : TRUE;
+  return memory ? heap_size(heap, 0, memory) != (SIZE_T)-1 : TRUE;
 }
 
 EXPORT PVOID NTAPI RtlDestroyHeap(PVOID heap) {
@@ -473,7 +496,7 @@ EXPORT ULONG NTAPI RtlGetProcessHeaps(ULONG count, PVOID *heaps) {
 
 static PVOID process_heap(void) {
   PEB *peb = NtCurrentPeb();
-  if (!peb->ProcessHeap) peb->ProcessHeap = heap_new(0, 0);
+  if (!peb->ProcessHeap) { heap_lock(); if (!peb->ProcessHeap) peb->ProcessHeap = heap_new(0, 0); heap_unlock(); }
   return peb->ProcessHeap;
 }
 EXPORT PVOID NTAPI RtlProcessHeap(void) { return process_heap(); }
@@ -491,17 +514,33 @@ EXPORT NTSTATUS NTAPI RtlInitializeCriticalSection(PRTL_CRITICAL_SECTION cs) {
 }
 EXPORT NTSTATUS NTAPI RtlInitializeCriticalSectionEx(PRTL_CRITICAL_SECTION cs, ULONG spin, ULONG flags) { (void)spin; (void)flags; return RtlInitializeCriticalSection(cs); }
 EXPORT NTSTATUS NTAPI RtlInitializeCriticalSectionAndSpinCount(PRTL_CRITICAL_SECTION cs, ULONG spin) { (void)spin; return RtlInitializeCriticalSection(cs); }
+/* LockCount is -1 while the section is free, and the recursion depth minus one while a thread holds it. A thread that finds it taken gives its time slice away until the owner
+ * has let go. */
 EXPORT NTSTATUS NTAPI RtlEnterCriticalSection(PRTL_CRITICAL_SECTION cs) {
-  ++cs->LockCount;
-  ++cs->RecursionCount;
-  cs->OwningThread = (HANDLE)TEB_CLIENT_THREAD(NtCurrentTeb());
+  const HANDLE me = (HANDLE)TEB_CLIENT_THREAD(NtCurrentTeb());
+  if (cs->OwningThread == me && cs->RecursionCount > 0) {      /* (only the owner can see itself here) */
+    ++cs->RecursionCount;
+    ++cs->LockCount;
+    return STATUS_SUCCESS;
+  }
+  while (!__sync_bool_compare_and_swap(&cs->LockCount, -1, 0)) NtYieldExecution();
+  cs->OwningThread = me;
+  cs->RecursionCount = 1;
   return STATUS_SUCCESS;
 }
-EXPORT BOOLEAN NTAPI RtlTryEnterCriticalSection(PRTL_CRITICAL_SECTION cs) { RtlEnterCriticalSection(cs); return TRUE; }
+EXPORT BOOLEAN NTAPI RtlTryEnterCriticalSection(PRTL_CRITICAL_SECTION cs) {
+  const HANDLE me = (HANDLE)TEB_CLIENT_THREAD(NtCurrentTeb());
+  if (cs->OwningThread == me && cs->RecursionCount > 0) { ++cs->RecursionCount; ++cs->LockCount; return TRUE; }
+  if (!__sync_bool_compare_and_swap(&cs->LockCount, -1, 0)) return FALSE;
+  cs->OwningThread = me;
+  cs->RecursionCount = 1;
+  return TRUE;
+}
 EXPORT NTSTATUS NTAPI RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION cs) {
-  if (cs->RecursionCount > 0) --cs->RecursionCount;
-  --cs->LockCount;
-  if (cs->RecursionCount == 0) cs->OwningThread = NULL;
+  if (cs->RecursionCount <= 0) return STATUS_SUCCESS;
+  if (--cs->RecursionCount > 0) { --cs->LockCount; return STATUS_SUCCESS; }
+  cs->OwningThread = NULL;
+  __sync_lock_test_and_set(&cs->LockCount, -1);
   return STATUS_SUCCESS;
 }
 EXPORT NTSTATUS NTAPI RtlDeleteCriticalSection(PRTL_CRITICAL_SECTION cs) { cs->LockCount = -1; cs->RecursionCount = 0; cs->OwningThread = NULL; return STATUS_SUCCESS; }

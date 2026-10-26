@@ -81,6 +81,8 @@ bool start(hardware::ICentralProcessingUnit& cpu, allocators::IAllocator& alloca
 void stop();
 bool running();
 
+// Restricts the thread to one core (-1: any). Takes effect the next time it is scheduled.
+void set_thread_affinity(Thread* thread, int32_t core);
 Thread* spawn(ThreadFunction fn, void* argument, const char* name = "thread", int32_t core = -1,
               int8_t preferred_kind = -1, uint32_t stack_bytes = kDefaultStackBytes);
 // Gives up the core until the scheduler picks this thread again.

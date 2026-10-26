@@ -33,7 +33,7 @@ namespace process {
 class UserPageTables {
  public:
   // `nx` says the CPU has no-execute enabled (EFER.NXE); without it the bit would be a reserved bit and fault.
-  UserPageTables(allocators::IAllocator& allocator, bool nx) : allocator_(allocator), tables_(allocator), nx_(nx) {}
+  UserPageTables(allocators::IAllocator& allocator, bool nx) : allocator_(allocator), nx_(nx) {}
   ~UserPageTables() { release(); }
   UserPageTables(const UserPageTables&) = delete;
   UserPageTables& operator=(const UserPageTables&) = delete;
@@ -45,7 +45,8 @@ class UserPageTables {
   };
   bool add_identity(const Identity& range);
 
-  // Throws away the tables and builds them again from the address space. False if memory ran out (the tables are then empty: do not run on them).
+  // Builds the tables again from the address space. The new tables are made beside the old ones and replace them only when they are complete, so a failure (memory ran
+  // out) leaves the old ones as they were, still usable by anything that runs on them.
   bool rebuild(const AddressSpace& space);
   // Rebuilds only if the address space changed since the last build.
   bool sync(const AddressSpace& space) { return (built_ && generation_ == space.generation()) || rebuild(space); }
@@ -63,7 +64,9 @@ class UserPageTables {
 
   allocators::IAllocator& allocator_;
   List<Identity> identity_ = List<Identity>(allocator_);
-  List<uint64_t*> tables_;
+  List<uint64_t*> sets_[2] = {List<uint64_t*>(allocator_), List<uint64_t*>(allocator_)};      // the tables of the current set, and of a rebuild in progress
+  uint32_t active_ = 0;                                                                         // which of the two is the current set
+  uint64_t building_root_ = 0;
   bool nx_;
   bool built_ = false;
   uint64_t root_ = 0;
