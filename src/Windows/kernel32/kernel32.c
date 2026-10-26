@@ -61,6 +61,8 @@ static BOOL con_input_ready(void);
 static BOOL con_is_input(HANDLE h);
 static BOOL pipe_nt_name(LPCWSTR name, WCHAR *buffer, UNICODE_STRING *us, OBJECT_ATTRIBUTES *attributes, BOOL inherit);
 EXPORT HANDLE WINAPI CreateFileW(LPCWSTR path, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD disposition, DWORD flags, HANDLE template_file);
+EXPORT BOOL WINAPI CloseHandle(HANDLE h);
+EXPORT BOOL WINAPI GetFileAttributesExW(LPCWSTR path, int level, LPVOID data);
 static BOOL fail_nt(NTSTATUS status) { set_error(RtlNtStatusToDosError(status)); return FALSE; }
 static PVOID heap(void) { return RtlProcessHeap(); }
 static WCHAR upper(WCHAR c) { return c >= 'a' && c <= 'z' ? (WCHAR)(c - 32) : c; }
@@ -148,6 +150,13 @@ EXPORT int WINAPI lstrcmpiW(LPCWSTR a, LPCWSTR b) {
     if (!x) return 0;
   }
 }
+/* The bare (unsuffixed) lstr* names are their own real exports on a real kernel32.dll too, not just source-level UNICODE macros - always the ANSI ones. */
+EXPORT int WINAPI lstrlen(LPCSTR s) { return lstrlenA(s); }
+EXPORT LPSTR WINAPI lstrcpy(LPSTR d, LPCSTR s) { return lstrcpyA(d, s); }
+EXPORT LPSTR WINAPI lstrcpyn(LPSTR d, LPCSTR s, int n) { return lstrcpynA(d, s, n); }
+EXPORT LPSTR WINAPI lstrcat(LPSTR d, LPCSTR s) { return lstrcatA(d, s); }
+EXPORT int WINAPI lstrcmp(LPCSTR a, LPCSTR b) { return lstrcmpA(a, b); }
+EXPORT int WINAPI lstrcmpi(LPCSTR a, LPCSTR b) { return lstrcmpiA(a, b); }
 /* CompareString: 1 = less, 2 = equal, 3 = greater. NORM_IGNORECASE (1) is honoured, the other flags are not. */
 EXPORT int WINAPI CompareStringW(DWORD locale, DWORD flags, LPCWSTR a, int an, LPCWSTR b, int bn) {
   (void)locale;
@@ -354,6 +363,7 @@ EXPORT LPSTR WINAPI GetEnvironmentStringsA(void) {
   return a;
 }
 EXPORT BOOL WINAPI FreeEnvironmentStringsA(LPSTR block) { return block ? RtlFreeHeap(heap(), 0, block) : TRUE; }
+EXPORT LPSTR WINAPI GetEnvironmentStrings(void) { return GetEnvironmentStringsA(); }      /* its own real export too, always the ANSI one */
 
 /* The value of NAME in an environment block ("NAME=value\0...\0\0"); the length goes to *length, NULL if there is no such variable. */
 static const WCHAR *find_variable(const WCHAR *block, const WCHAR *name, size_t_ *length) {
@@ -1719,6 +1729,22 @@ done:
 }
 EXPORT BOOL WINAPI GetThreadContext(HANDLE h, CONTEXT *context) { const NTSTATUS status = NtGetContextThread(h, context); return NT_SUCCESS(status) ? TRUE : fail_nt(status); }
 EXPORT BOOL WINAPI SetThreadContext(HANDLE h, const CONTEXT *context) { const NTSTATUS status = NtSetContextThread(h, context); return NT_SUCCESS(status) ? TRUE : fail_nt(status); }
+/* WinExec: the 16-bit-era way to start a program, kept for old callers; uSuccess (>= 32) is the real contract, not a count. */
+EXPORT UINT WINAPI WinExec(LPCSTR command_line, UINT show) {
+  (void)show;
+  char buffer[1024];
+  size_t_ i = 0;
+  for (; command_line[i] && i + 1 < sizeof(buffer); ++i) buffer[i] = command_line[i];
+  buffer[i] = 0;
+  STARTUPINFOA startup;
+  PROCESS_INFORMATION information;
+  memset(&startup, 0, sizeof(startup));
+  startup.cb = sizeof(startup);
+  if (!CreateProcessA(NULL, buffer, NULL, NULL, FALSE, 0, NULL, NULL, &startup, &information)) return (UINT)GetLastError();
+  CloseHandle(information.hThread);
+  CloseHandle(information.hProcess);
+  return 33;      /* > 31: success, like the real one */
+}
 
 /* ---- handles, time --------------------------------------------------------------------------------------------------------------------------------------- */
 
@@ -2488,6 +2514,41 @@ EXPORT HANDLE WINAPI CreateFileA(LPCSTR path, DWORD access, DWORD share, LPSECUR
   return h;
 }
 
+/* OpenFile: pre-Win32 (16-bit era) file opening, kept for old callers; a small enough subset of uStyle to be worth having (OF_READ/OF_WRITE/OF_READWRITE,
+ * OF_CREATE, OF_EXIST), over CreateFileA like a real one. HFILE is just an int (the real type too, historically narrower than a HANDLE). */
+typedef int HFILE;
+typedef struct _OFSTRUCT { BYTE cBytes, fFixedDisk; WORD nErrCode, Reserved1, Reserved2; CHAR szPathName[128]; } OFSTRUCT, *LPOFSTRUCT;
+#define OF_READ_ 0
+#define OF_WRITE_ 1
+#define OF_READWRITE_ 2
+#define OF_CREATE_ 0x1000
+#define OF_EXIST_ 0x4000
+EXPORT HFILE WINAPI OpenFile(LPCSTR path, LPOFSTRUCT reopen, UINT style) {
+  if (reopen) {
+    memset(reopen, 0, sizeof(*reopen));
+    reopen->cBytes = sizeof(*reopen);
+    size_t_ i = 0;
+    for (; path[i] && i + 1 < sizeof(reopen->szPathName); ++i) reopen->szPathName[i] = path[i];
+  }
+  const DWORD access = (style & 3) == OF_WRITE_ ? GENERIC_WRITE : (style & 3) == OF_READWRITE_ ? GENERIC_READ | GENERIC_WRITE : GENERIC_READ;
+  const DWORD disposition = (style & OF_CREATE_) ? CREATE_ALWAYS : OPEN_EXISTING;
+  HANDLE h = CreateFileA(path, (style & OF_EXIST_) ? 0 : access, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, disposition, 0, NULL);
+  if (h == INVALID_HANDLE_VALUE) { if (reopen) reopen->nErrCode = (WORD)GetLastError(); return (HFILE)-1; }
+  if (style & OF_EXIST_) { CloseHandle(h); return 0; }
+  return (HFILE)(ULONG_PTR)h;
+}
+/* Beep: this OS has no PC speaker driver, so there is nothing to make a sound with; succeeding (not failing outright) matches how real Windows behaves when the
+ * speaker driver isn't present either. CancelIo/CancelIoEx/CancelSynchronousIo: every I/O call here is already done by the time it returns (there is no real
+ * asynchronous I/O to cancel), so there is never anything pending to find. */
+EXPORT BOOL WINAPI Beep(DWORD frequency, DWORD duration) { (void)frequency; (void)duration; return TRUE; }
+EXPORT BOOL WINAPI CancelIo(HANDLE h) { (void)h; return TRUE; }
+EXPORT BOOL WINAPI CancelIoEx(HANDLE h, LPOVERLAPPED overlapped) { (void)h; (void)overlapped; set_error(ERROR_NOT_FOUND); return FALSE; }
+EXPORT BOOL WINAPI CancelSynchronousIo(HANDLE thread) { (void)thread; set_error(ERROR_NOT_FOUND); return FALSE; }
+/* FatalAppExit: ends the process at once (-1 as the exit code, like a real one's message-box dialog being dismissed); there is no message-box UI here to show
+ * the text first. */
+EXPORT void WINAPI FatalAppExitW(UINT action, LPCWSTR text) { (void)action; (void)text; ExitProcess(0xFFFFFFFFu); }
+EXPORT void WINAPI FatalAppExitA(UINT action, LPCSTR text) { (void)action; (void)text; ExitProcess(0xFFFFFFFFu); }
+
 /* FindFirstChangeNotification/FindNextChangeNotification/FindCloseChangeNotification: the handle is an ordinary ChangeNotification object (NtCreateChangeNotification),
  * signalled like a manual-reset event when something changes under the watched directory - WaitForSingleObject/WaitForMultipleObjects already work on it unmodified.
  * FindNextChangeNotification re-arms it the same way ResetEvent does (it is reset(), not a separate NT service); FindCloseChangeNotification is just CloseHandle. */
@@ -2537,6 +2598,20 @@ EXPORT DWORD WINAPI GetFileSize(HANDLE h, LPDWORD high) {
   if (high) *high = (DWORD)((ULONGLONG)size >> 32);
   set_error(ERROR_SUCCESS);
   return (DWORD)size;
+}
+/* No file system here compresses anything, so the compressed size is always the real one. */
+EXPORT DWORD WINAPI GetCompressedFileSizeW(LPCWSTR path, LPDWORD high) {
+  WIN32_FILE_ATTRIBUTE_DATA info;
+  if (!GetFileAttributesExW(path, 0 /* GetFileExInfoStandard */, &info)) return INVALID_FILE_SIZE;
+  if (high) *high = info.nFileSizeHigh;
+  return info.nFileSizeLow;
+}
+EXPORT DWORD WINAPI GetCompressedFileSizeA(LPCSTR path, LPDWORD high) {
+  WCHAR *w = to_wide(path);
+  if (!w) return INVALID_FILE_SIZE;
+  const DWORD r = GetCompressedFileSizeW(w, high);
+  free_wide(w);
+  return r;
 }
 EXPORT BOOL WINAPI SetFilePointerEx(HANDLE h, LARGE_INTEGER distance, PLARGE_INTEGER result, DWORD method) {
   LONGLONG base = 0;

@@ -96,7 +96,7 @@ bool AmdUvd6Vc1Decoder::allocate_buffers() {
 
 bool AmdUvd6Vc1Decoder::accepts(const vc1::SequenceHeader& seq) {
   if (!leased_ || engine_.ring->wedged()) return open_;   // a wedged engine still owns the stream it was decoding; a stream that never started can go to the CPU
-  if (seq.interlace || seq.mb_width <= 0 || seq.mb_height <= 0) return false;
+  if (seq.mb_width <= 0 || seq.mb_height <= 0 || (seq.interlace && !interlace_allowed_)) return false;
   const uint32_t width = static_cast<uint32_t>(seq.mb_width) * 16, height = static_cast<uint32_t>(seq.mb_height) * 16;
   if (open_ && width == width_ && height == height_) return true;
   const amd_uvd6::Vc1BufferSizes sizes = amd_uvd6::vc1_buffer_sizes(width, height);

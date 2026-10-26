@@ -335,6 +335,7 @@ namespace {
 // bit for bit: the pictures must differ by little. A picture the engine failed to produce is grey and far off.
 constexpr uint32_t kMpeg2MaxDifference = 12;
 constexpr uint64_t kMpeg2MaxTotalDifference = 64 * 64 * 3 / 2;   // (a mean of one level over the picture)
+constexpr uint32_t kMpeg4MaxDifference = 12;   // and the same for MPEG-4 (a mean of one level over a 32 x 32 picture, 12 at most anywhere)
 
 bool close_picture(const VideoFrame& a, const VideoFrame& b, uint32_t max_difference = kMpeg2MaxDifference, uint64_t max_total = kMpeg2MaxTotalDifference) {
   if (a.format != b.format || a.pts_us != b.pts_us) return false;
@@ -413,6 +414,56 @@ AmdVcnSelfTest::Result AmdVcnSelfTest::run_mpeg2(allocators::IAllocator& allocat
   return run_mpeg2_session(
       allocator, session, [](const void* ring) { return static_cast<const AmdVcn1Ring*>(ring)->wedged(); }, engine.ring,
       [](const void* decoder) { return static_cast<const AmdVcnMpeg2Decoder*>(decoder)->pictures_decoded(); }, &session);
+}
+
+namespace {
+#include "Hardware/VideoCodec/AMD/AmdVcnSelfTestMpeg4Stream.inc"
+}  // namespace
+
+AmdVcnSelfTest::Result AmdVcnSelfTest::run_mpeg4_session(allocators::IAllocator&, IVideoDecoder& session, bool (*wedged)(const void*), const void* ring, uint64_t (*decoded)(const void*),
+                                                        const void* decoder) {
+  constexpr uint32_t kSize = kMpeg4SelfTestSize, kLuma = kSize * kSize, kChroma = kLuma / 4, kFrame = kLuma + 2 * kChroma;
+  const ConstByteView stream(kMpeg4SelfTestStream);
+  uint32_t got = 0, seen_pts = 0;
+  VideoFrame f;
+  // The picture that should come out `index`-th, as FFmpeg decoded it; the pictures must be close, as for MPEG-2.
+  auto check = [&](const VideoFrame& out) {
+    if (got >= kMpeg4SelfTestPictures || out.format.width != kSize || out.format.height != kSize || out.format.pixel_format != PixelFormat::I420) return false;
+    const int64_t k = out.pts_us / 1000;
+    if (k < 0 || k >= int64_t{kMpeg4SelfTestPictures} || (seen_pts & (1u << k))) return false;   // (every packet's picture comes out once)
+    seen_pts |= 1u << k;
+    VideoFrame want;
+    want.format = out.format;
+    want.pts_us = out.pts_us;
+    const uint8_t* base = kMpeg4SelfTestExpected + uint64_t{got} * kFrame;
+    want.plane[0] = base;
+    want.plane[1] = base + kLuma;
+    want.plane[2] = base + kLuma + kChroma;
+    want.stride[0] = kSize;
+    want.stride[1] = want.stride[2] = kSize / 2;
+    return close_picture(out, want, kMpeg4MaxDifference, kFrame);
+  };
+  for (uint32_t i = 0; i < kMpeg4SelfTestPictures; ++i) {
+    const uint64_t start = i == 0 ? 0 : kMpeg4SelfTestEnds[i - 1];
+    VideoPacket p;
+    p.data = stream.subview(start, kMpeg4SelfTestEnds[i] - start);
+    p.pts_us = int64_t{i} * 1000;
+    p.keyframe = i == 0;
+    if (session.submit(p) != SubmitResult::Accepted) return wedged(ring) ? Result::EngineFailed : Result::SessionRefused;
+    while (session.receive(&f)) {
+      if (!check(f)) return Result::Mismatch;
+      ++got;
+    }
+  }
+  session.flush();
+  while (session.receive(&f)) {
+    if (!check(f)) return Result::Mismatch;
+    ++got;
+  }
+  if (wedged(ring) || session.statistics().errors != 0) return Result::EngineFailed;
+  // The engine must really have done the work: every picture went through it.
+  if (decoded(decoder) != kMpeg4SelfTestPictures) return Result::SessionRefused;
+  return got == kMpeg4SelfTestPictures ? Result::Passed : Result::Mismatch;
 }
 
 namespace {
@@ -496,6 +547,10 @@ AmdVcnSelfTest::Result AmdVcnSelfTest::run_vc1_sessions(allocators::IAllocator& 
   const Result main_profile = run_vc1_stream(allocator, host, kVc1SelfTestMainConfig, ConstByteView(kVc1SelfTestMainStream), kVc1SelfTestMainEnds);
   if (main_profile != Result::Passed) return main_profile;
   return run_vc1_stream(allocator, host, nullptr, ConstByteView(kVc1SelfTestAdvancedStream), kVc1SelfTestAdvancedEnds);
+}
+
+AmdVcnSelfTest::Result AmdVcnSelfTest::run_vc1_interlaced_sessions(allocators::IAllocator& allocator, Vc1SessionHost& host) {
+  return run_vc1_stream(allocator, host, nullptr, ConstByteView(kVc1SelfTestInterlacedStream), kVc1SelfTestInterlacedEnds);
 }
 
 AmdVcnSelfTest::Result AmdVcnSelfTest::run_vc1(allocators::IAllocator& allocator, const AmdVcnVc1Decoder::Engine& engine) {

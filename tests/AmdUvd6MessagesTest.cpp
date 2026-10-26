@@ -529,12 +529,15 @@ struct Vc1Recorder final : vc1::IOffload {
     if (!simple) pps |= bit(seq.resync_marker, 20) | bit(seq.rangered, 19) | bit(seq.loop_filter, 5) | bit(seq.fastuvmc, 4) | bit(seq.extended_mv, 3) | bit(seq.extended_dmv, 8) | (uint32_t(seq.dquant & 3) << 1);
     CHECK(word(m, g + vPps) == pps && word(m, g + vStructure) == 0 && word(m, g + vChroma) == 1 && m[kExtensionSupport] == 1);
     for (uint32_t i = kVc1Size; i < 768 * 4; ++i) CHECK(m[g + i] == 0);
-    // An interlaced sequence is not taken, nor a message that does not fit.
+    // An interlaced sequence is taken, and says so in the sps flags (bit 5, Mesa's `interlace << 5`; the picture structure stays 0 for the firmware to read from the frame);
+    // a message that does not fit is not.
     vc1::SequenceHeader interlaced = seq;
     interlaced.interlace = true;
     vc1::OffloadPicture copy = p;
     copy.seq = &interlaced;
-    CHECK(!build_vc1_decode_message(view(m), 6, 1, copy, b));
+    Bytes mi(message_bytes(), 0xCC);
+    CHECK(build_vc1_decode_message(view(mi), 6, 1, copy, b));
+    CHECK(word(mi, g + vSps) == (word(m, g + vSps) | (1u << 5)) && word(mi, g + vPps) == word(m, g + vPps) && word(mi, g + vStructure) == 0);
     Bytes small(message_bytes() - 1, 0);
     CHECK(!build_vc1_decode_message(view(small), 6, 1, p, b));
     Bytes fb(kMessageFeedbackItBytes, 0xEE);
@@ -572,7 +575,83 @@ static void test_vc1_message() {
   CHECK(alloc.live == 0);
 }
 
+// struct ruvd_mpeg4 at the start of the codec union, worked out by hand: decoded_pic_idx 0, ref_pic_idx[2] 4, variant_type 12, profile_and_level 16, verid 17, shape 18, reserved 19,
+// width 20, height 22, time increment resolution 24, reserved 26, flags 28, quant_type 32, reserved 33, intra matrix 36, non-intra matrix 100 (64 bytes each), sprite config 164.
+static void test_mpeg4() {
+  CHECK(kStreamTypeMpeg4 == 4);
+  // 32 x 32 is under the 30 MiB the buffer is not allowed to be smaller than. 3840 x 2160: image 3840 * 2160 * 3 / 2 = 12441600 (a multiple of 1024), three of them, then
+  // 240 * 136 macroblocks (the height rounded to an even count) * 64 and * 32.
+  Mpeg4BufferSizes sizes = mpeg4_buffer_sizes(32, 32);
+  CHECK(sizes.references == 3 && sizes.dpb == 30u << 20);
+  sizes = mpeg4_buffer_sizes(3840, 2160);
+  CHECK(sizes.dpb == 12441600ull * 3 + 240 * 136 * 64 + 240 * 136 * 32);
+  // A layer that is not whole macroblocks is taken at the next one (the picture buffer is), a zero or a huge one is not.
+  CHECK(mpeg4_buffer_sizes(33, 17).dpb == 30u << 20 && mpeg4_buffer_sizes(0, 32).dpb == 0 && mpeg4_buffer_sizes(32, 0).dpb == 0 && mpeg4_buffer_sizes(16400, 32).dpb == 0);
+  JobAddresses a;
+  a.session_context = 0x1000; a.message = 0x2000; a.dpb = 0x3000; a.context = 0x9999; a.bitstream = 0x4000; a.target = 0x5000;
+  AmdUvd6Ring::Buffer out[kMpeg4JobBuffers];
+  CHECK(mpeg4_job_buffers(a, ArrayView<AmdUvd6Ring::Buffer>(out)) == 6 && out[2].command == 0x001 && out[3].command == 0x100 && out[5].command == 0x003);   // (as MPEG-2's)
+
+  mpeg4::Vol vol;
+  vol.width = 33;
+  vol.height = 17;
+  vol.time_increment_resolution = 30000;
+  vol.interlaced = true;
+  vol.quarter_sample = true;
+  vol.quant_type_mpeg = true;
+  vol.data_partitioned = true;
+  vol.is_object_layer_identifier = true;
+  for (uint32_t i = 0; i < 64; ++i) {
+    vol.intra_matrix[i] = static_cast<uint8_t>(10 + i);
+    vol.non_intra_matrix[i] = static_cast<uint8_t>(100 + i);
+  }
+  DecodeBuffers b;
+  b.bitstream_bytes = 300;
+  b.dpb_bytes = 30u << 20;
+  b.target = amd_vcn::target_layout(48, 32);
+  Mpeg2Pictures jobs;
+  jobs.current = 9;
+  jobs.forward = 4;
+  jobs.backward = 8;
+  Bytes m(message_bytes(), 0xCC);
+  CHECK(build_mpeg4_decode_message(view(m), 6, 9, vol, jobs, b));
+  CHECK(word(m, 0) == 3556 && word(m, 4) == kMsgDecode && word(m, 8) == 6 && word(m, 12) == 9);
+  // The decode message gets the macroblock-aligned size, the codec's structure the layer's own.
+  CHECK(word(m, dec(kDecStreamType)) == 4 && word(m, dec(kDecWidth)) == 48 && word(m, dec(kDecHeight)) == 32 && word(m, dec(kDecDpbSize)) == 30u << 20 && word(m, dec(kDecDpbReserved)) == 0);
+  const uint32_t c = kCodec;
+  CHECK(word(m, c + 0) == 9 && word(m, c + 4) == 4 && word(m, c + 8) == 8 && word(m, c + 12) == 0);
+  CHECK(m[c + 16] == 0xF0 && m[c + 17] == 5 && m[c + 18] == 0 && (m[c + 20] | (m[c + 21] << 8)) == 33 && (m[c + 22] | (m[c + 23] << 8)) == 17 && (m[c + 24] | (m[c + 25] << 8)) == 30000);
+  // Flags: interlaced (2), load matrices (3, 4), quarter sample (5), complexity estimation disabled (6), data partitioning (8), layer identifier (13); not the short header (0), not
+  // OBMC disable (1), not the resync marker disable (7), not reversible VLC (9), not scalability (12), not fixed rate (14).
+  CHECK(word(m, c + 28) == ((1u << 2) | (1u << 3) | (1u << 4) | (1u << 5) | (1u << 6) | (1u << 8) | (1u << 13)));
+  CHECK(m[c + 32] == 1 && m[c + 36] == 10 && m[c + 36 + 63] == 73 && m[c + 100] == 100 && m[c + 100 + 63] == 163);
+  // The sprite configuration stays zero.
+  bool zero = true;
+  for (uint32_t i = 0; i < 16; ++i) zero = zero && m[c + 164 + i] == 0;
+  CHECK(zero);
+  // References: none newer than the picture, none more than six jobs back.
+  Bytes bad(message_bytes(), 0);
+  jobs.forward = 9;
+  CHECK(!build_mpeg4_decode_message(view(bad), 6, 9, vol, jobs, b));
+  jobs.forward = 2;
+  CHECK(!build_mpeg4_decode_message(view(bad), 6, 9, vol, jobs, b));
+  jobs.forward = 3;
+  CHECK(build_mpeg4_decode_message(view(bad), 6, 9, vol, jobs, b));
+  jobs.forward = 0; jobs.backward = 0; jobs.current = 1;
+  CHECK(build_mpeg4_decode_message(view(bad), 6, 1, vol, jobs, b));   // (an intra plane at the start names job 0, the latest)
+  jobs.current = 0;
+  CHECK(!build_mpeg4_decode_message(view(bad), 6, 1, vol, jobs, b));
+  Bytes small(100, 0);
+  jobs.current = 9; jobs.forward = 4;
+  CHECK(!build_mpeg4_decode_message(view(small), 6, 9, vol, jobs, b));
+  mpeg4::Vol empty;
+  CHECK(!build_mpeg4_decode_message(view(bad), 6, 9, empty, jobs, b));
+  Bytes feedback(kMessageFeedbackItBytes, 0xCC);
+  CHECK(prepare_mpeg4_feedback(view(feedback)) && word(feedback, kFeedbackOffset) == kFeedbackBytes);
+}
+
 int main() {
+  test_mpeg4();
   test_vc1_sizes_and_jobs();
   test_vc1_message();
   test_mpeg2_sizes_and_jobs();

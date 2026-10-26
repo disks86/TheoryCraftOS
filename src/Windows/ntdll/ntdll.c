@@ -140,6 +140,19 @@ NT_SERVICE(NtQueryInformationProcess);
 
 #include "../libc_string.inc"
 
+/* The Rtl* names kernel32.dll forwards straight to ntdll for (RtlFillMemory's argument order is (dest, length, fill), not memset's (dest, fill, length) - a real,
+ * easy-to-miss gotcha copying one into the other). RtlCompareMemory returns how many leading bytes match, not a bool. */
+EXPORT void *NTAPI RtlCopyMemory(void *d, const void *s, SIZE_T n) { return memcpy(d, s, n); }
+EXPORT void *NTAPI RtlMoveMemory(void *d, const void *s, SIZE_T n) { return memmove(d, s, n); }
+EXPORT void *NTAPI RtlFillMemory(void *d, SIZE_T n, BYTE fill) { return memset(d, fill, n); }
+EXPORT void *NTAPI RtlZeroMemory(void *d, SIZE_T n) { return memset(d, 0, n); }
+EXPORT SIZE_T NTAPI RtlCompareMemory(const void *a, const void *b, SIZE_T n) {
+  const BYTE *p = a, *q = b;
+  SIZE_T i = 0;
+  while (i < n && p[i] == q[i]) ++i;
+  return i;
+}
+
 /* ---- formatting (the narrow printf family) ------------------------------------------------------------------------------------------------------------- */
 
 typedef struct { char *out; size_t_ capacity, length; } Sink;

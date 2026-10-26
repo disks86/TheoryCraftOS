@@ -35,8 +35,10 @@
 #include "Hardware/VideoCodec/Software/H264.hpp"
 #include "Hardware/VideoCodec/Software/H265.hpp"
 #include "Hardware/VideoCodec/Software/Mpeg2.hpp"
+#include "Hardware/VideoCodec/Software/Mpeg4Headers.hpp"
 #include "Hardware/VideoCodec/Software/Vc1.hpp"
 #include "FakeAmdUvd6.hpp"
+#include "Vc1InterlacedFrames.hpp"
 #include "FakeAmdVcn.hpp"
 
 using namespace hardware;
@@ -85,6 +87,7 @@ constexpr uint32_t kConfigMemsize = 0x150a, kFbLocation = 0x809, kGbAddrConfig =
 
 #include "Hardware/VideoCodec/AMD/AmdVcnSelfTestHevcStream.inc"   // the H.265 stream the engine's self-test decodes
 #include "Hardware/VideoCodec/AMD/AmdVcnSelfTestHevc10Stream.inc"   // and the ten-bit one
+#include "Hardware/VideoCodec/AMD/AmdVcnSelfTestMpeg4Stream.inc"   // and the MPEG-4 one (with FFmpeg's decode of it)
 #include "Hardware/VideoCodec/AMD/AmdVcnSelfTestMpeg2Stream.inc"   // and the MPEG-2 one
 #include "Hardware/VideoCodec/AMD/AmdVcnSelfTestVc1Stream.inc"   // and the two VC-1 ones
 
@@ -223,6 +226,37 @@ static bool make_hevc10_expected(allocators::IAllocator& a, Hevc10Expected* out)
   return true;
 }
 
+// The MPEG-4 stream: for each plane in decode order its type, and where it is in display order (by the time stamps in the plane headers - independent of the order logic of the
+// session, which holds anchors back). The pictures the engine must write are FFmpeg's, kMpeg4SelfTestExpected, in display order.
+struct Mpeg4Expected {
+  std::vector<mpeg4::VopType> type;
+  std::vector<uint32_t> display_of;   // by decode order
+  mpeg4::Vol vol;
+};
+
+static bool make_mpeg4_expected(Mpeg4Expected* out) {
+  const ConstByteView stream(kMpeg4SelfTestStream);
+  std::vector<uint64_t> times;
+  bool have = false;
+  for (uint32_t i = 0; i < kMpeg4SelfTestPictures; ++i) {
+    const uint64_t start = i == 0 ? 0 : kMpeg4SelfTestEnds[i - 1];
+    mpeg4::Packet packet;
+    if (!mpeg4::parse_packet(stream.subview(start, kMpeg4SelfTestEnds[i] - start), have ? &out->vol : nullptr, &packet) || packet.vop_count != 1 || !packet.vop.coded) return false;
+    if (packet.has_vol) {
+      out->vol = packet.vol;
+      have = true;
+    }
+    out->type.push_back(packet.vop.type);
+    times.push_back(uint64_t{packet.vop.modulo_time_base} * out->vol.time_increment_resolution + packet.vop.time_increment);
+  }
+  for (uint32_t i = 0; i < times.size(); ++i) {
+    uint32_t rank = 0;
+    for (uint64_t t : times) rank += t < times[i];
+    out->display_of.push_back(rank);
+  }
+  return out->vol.width == 32 && out->vol.height == 32;
+}
+
 // The MPEG-2 stream's pictures, by presentation time (packet k has k * 1000).
 static bool make_mpeg2_expected(allocators::IAllocator& a, Expected* out) {
   const ConstByteView stream(kMpeg2SelfTestStream);
@@ -309,11 +343,21 @@ struct Card final : IVcnRegisters {
   const Expected* expected = nullptr;
   const HevcExpected* hevc = nullptr;
   const Hevc10Expected* hevc10 = nullptr;
+  const Mpeg4Expected* mpeg4 = nullptr;
+  bool write_mpeg4 = true;
+  int mpeg4_creates = 0, mpeg4_decodes = 0;
   bool write_hevc10 = true;
   int hevc10_decodes = 0;
   const Expected* mpeg2 = nullptr;
   const Expected* vc1_main = nullptr;
   const Expected* vc1_advanced = nullptr;
+  const Expected* vc1_interlaced = nullptr;   // the Advanced profile pattern in an interlaced sequence
+  bool write_vc1_interlaced = true;
+  int vc1_interlaced_decodes = 0;
+  // Pictures of an interlaced sequence that have no stream here (frame and field coded): the engine's job is recorded - its sps flags and the start of its bitstream - and a flat picture written.
+  bool capture_synthetic = false;
+  struct Captured { uint32_t sps_flags = 0; std::vector<uint8_t> bits; };
+  std::vector<Captured> captured;
   std::set<uint32_t> job_commands;   // the commands named since the last engine start
   std::map<uint32_t, uint64_t> buffer;
   uint64_t block_gpu = 0;
@@ -393,6 +437,7 @@ struct Card final : IVcnRegisters {
     if (word(m, 4) == 0) {
       if (word(m, 16) == 0x10) ++hevc_creates;
       else if (word(m, 16) == 3) ++mpeg2_creates;
+      else if (word(m, 16) == 4) ++mpeg4_creates;
       else if (word(m, 16) == 1) ++vc1_creates;
       else ++creates;
     }
@@ -452,6 +497,52 @@ struct Card final : IVcnRegisters {
     for (uint32_t y = 0; y < 64; ++y) memcpy(target + uint64_t{pitch} * y, hevc10->luma[k].data() + y * 128, 128);
     for (uint32_t y = 0; y < 32; ++y) memcpy(target + chroma_offset + uint64_t{pitch} * y, hevc10->chroma[k].data() + y * 128, 128);
   }
+  // The MPEG-4 picture: no context buffer and no scaling table in the job, the layer's parameters as Mesa gives them (and what the stream's layer header says), the job numbers of
+  // the picture and of its anchors (an intra plane names the latest job, a predicted one the newest anchor, a B plane the two), the bitstream behind a start code; then FFmpeg's
+  // picture for this plane goes into the target.
+  void on_mpeg4(const uint8_t* m, const std::set<uint32_t>& commands, uint32_t height, uint32_t pitch, uint32_t chroma_offset) {
+    ++mpeg4_decodes;
+    constexpr uint32_t kCodec = dec(52);
+    const uint32_t current = word(m, kCodec + 0), forward = word(m, kCodec + 4), backward = word(m, kCodec + 8);
+    if (commands.count(0x206) || commands.count(0x204)) problem("MPEG-4 job names a context buffer or a scaling table");
+    for (uint32_t c : {0u, 1u, 2u, 3u, 5u, 0x100u})
+      if (!commands.count(c)) problem("MPEG-4 job lacks a buffer");
+    if (current == 0 || forward >= current || backward >= current || current - forward > 6 || current - backward > 6) problem("MPEG-4 references outside the last six jobs");
+    if (word(m, dec(5)) < 30u << 20 || word(m, dec(7)) != 0 || word(m, dec(2)) != 32 || height != 32) problem("MPEG-4 message with the wrong buffer sizes");
+    // ruvd_mpeg4: profile_and_level 0xF0 and verid 5 as Mesa has them, rectangular shape, the layer's size and time base, flags (load matrices, complexity estimation disable), the
+    // quantiser type and the first matrix values (the defaults in scan order, 8 and 16).
+    if (m[kCodec + 16] != 0xF0 || m[kCodec + 17] != 5 || m[kCodec + 18] != 0 || (m[kCodec + 20] | (m[kCodec + 21] << 8)) != 32 || (m[kCodec + 22] | (m[kCodec + 23] << 8)) != 32)
+      problem("MPEG-4 message with the wrong layer parameters");
+    if (mpeg4 && (m[kCodec + 24] | (m[kCodec + 25] << 8)) != int(mpeg4->vol.time_increment_resolution)) problem("MPEG-4 message with the wrong time base");
+    const uint32_t flags = word(m, kCodec + 28);
+    if ((flags & 0x58) != 0x58 || (flags & 1) || (flags & 0x1000)) problem("MPEG-4 message with the wrong flags");
+    if (m[kCodec + 32] != (mpeg4 && mpeg4->vol.quant_type_mpeg ? 1 : 0) || m[kCodec + 36] != 8 || m[kCodec + 100] != 16) problem("MPEG-4 message with the wrong quantiser");
+    const uint8_t* bits = ring.translate(buffer[0x100], 4);
+    if (!bits || bits[0] != 0 || bits[1] != 0 || bits[2] != 1) problem("MPEG-4 bitstream does not start with a start code");
+    if (!mpeg4 || !write_mpeg4) return;
+    const uint32_t k = (current - 1) % static_cast<uint32_t>(mpeg4->type.size());
+    if (!quiet) {
+      // The job numbers against the planes' types (decode order is job order here: one session, every plane decoded).
+      uint32_t newest = 0, older = 0;
+      for (uint32_t i = 0; i < k; ++i)
+        if (mpeg4->type[i] != mpeg4::VopType::B) { older = newest; newest = i + 1; }
+      const mpeg4::VopType type = mpeg4->type[k];
+      const bool ok = type == mpeg4::VopType::I ? (forward == current - 1 && backward == current - 1) :
+                      type == mpeg4::VopType::P ? (forward == newest && backward == newest) : (forward == older && backward == newest);
+      if (!ok) problem("MPEG-4 job numbers do not match the plane type");
+    }
+    const uint32_t want = mpeg4->display_of[k];
+    const uint64_t target_bytes = uint64_t{chroma_offset} + uint64_t{pitch} * (height / 2);
+    uint8_t* target = ring.translate(buffer[2], target_bytes);
+    if (!target || pitch < 32 || uint64_t{pitch} * 32 > chroma_offset) { problem("target does not hold a 32 x 32 picture"); return; }
+    const uint8_t* picture = kMpeg4SelfTestExpected + uint64_t{want} * (32 * 32 * 3 / 2);
+    for (uint32_t y = 0; y < 32; ++y) memcpy(target + uint64_t{pitch} * y, picture + y * 32, 32);
+    for (uint32_t y = 0; y < 16; ++y)
+      for (uint32_t x = 0; x < 16; ++x) {
+        target[chroma_offset + uint64_t{pitch} * y + x * 2] = picture[32 * 32 + y * 16 + x];
+        target[chroma_offset + uint64_t{pitch} * y + x * 2 + 1] = picture[32 * 32 + 16 * 16 + y * 16 + x];
+      }
+  }
   // The MPEG-2 picture: no context buffer and no scaling table in the job, references among the last six jobs, the slices behind a start code; the CPU's picture for the
   // k-th job goes into the target.
   void on_mpeg2(const uint8_t* m, const std::set<uint32_t>& commands, uint32_t height, uint32_t pitch, uint32_t chroma_offset) {
@@ -488,13 +579,17 @@ struct Card final : IVcnRegisters {
     const bool advanced = profile == 2;
     if (profile != 1 && profile != 2) { problem("VC-1 profile is neither Main nor Advanced"); return; }
     if (word(m, dec(2)) != (advanced ? 64u : 4u) || word(m, dec(3)) != (advanced ? 64u : 4u) || word(m, dec(5)) == 0 || word(m, dec(7)) != 0) problem("VC-1 message with the wrong size or buffers");
-    const Expected* expected = advanced ? vc1_advanced : vc1_main;
-    if (!expected || !write_vc1) return;
+    const uint32_t sps_flags = word(m, kCodec + 8);
+    const bool interlaced = (sps_flags & 0x20) != 0;
+    if ((interlaced && !advanced) || (interlaced && !capture_synthetic && !vc1_interlaced)) problem("VC-1 message flags an interlaced sequence it should not");
+    if (interlaced) ++vc1_interlaced_decodes;
+    const Expected* expected = interlaced ? vc1_interlaced : advanced ? vc1_advanced : vc1_main;
+    if (!expected || !write_vc1 || (interlaced && !write_vc1_interlaced)) return;
     // Which picture: the frame data is the packet of the stream (the Advanced profile's behind a start code of its own when the packet has none).
     const uint8_t* bits = ring.translate(buffer[0x100], 64);
     if (!bits) { problem("VC-1 bitstream outside the card's memory"); return; }
-    const ConstByteView stream = advanced ? ConstByteView(kVc1SelfTestAdvancedStream) : ConstByteView(kVc1SelfTestMainStream);
-    const uint64_t* ends = advanced ? kVc1SelfTestAdvancedEnds : kVc1SelfTestMainEnds;
+    const ConstByteView stream = interlaced ? ConstByteView(kVc1SelfTestInterlacedStream) : advanced ? ConstByteView(kVc1SelfTestAdvancedStream) : ConstByteView(kVc1SelfTestMainStream);
+    const uint64_t* ends = interlaced ? kVc1SelfTestInterlacedEnds : advanced ? kVc1SelfTestAdvancedEnds : kVc1SelfTestMainEnds;
     uint32_t k = kVc1SelfTestPictures;
     for (uint32_t i = 0; i < kVc1SelfTestPictures && k == kVc1SelfTestPictures; ++i) {
       const uint64_t start = i == 0 ? 0 : ends[i - 1];
@@ -502,6 +597,14 @@ struct Card final : IVcnRegisters {
       // (The packet may carry the sequence and entry point headers before the frame, and the frame may come with a start code of its own in front of it.)
       for (uint32_t offset : {0u, 4u})
         if (length >= 24 && memmem(stream.data() + start, length, bits + offset, 24) != nullptr) { k = i; break; }
+    }
+    if (k == kVc1SelfTestPictures && capture_synthetic) {
+      Captured c;
+      c.sps_flags = sps_flags;
+      const uint8_t* all = ring.translate(buffer[0x100], 128);
+      if (all) c.bits.assign(all, all + 128);
+      captured.push_back(c);
+      return;
     }
     if (k == kVc1SelfTestPictures) { problem("VC-1 frame data is no picture of the stream"); return; }
     const uint64_t target_bytes = uint64_t{chroma_offset} + uint64_t{pitch} * (height / 2);
@@ -520,6 +623,10 @@ struct Card final : IVcnRegisters {
     job_commands.clear();
     if (word(m, dec(0)) == 0x10 && word(m, 4) == 1 && word(m, 0) == kMsgBytes) {
       on_hevc(m, height, pitch, chroma_offset);
+      return;
+    }
+    if (word(m, dec(0)) == 4 && word(m, 4) == 1 && word(m, 0) == kMsgBytes) {
+      on_mpeg4(m, commands, height, pitch, chroma_offset);
       return;
     }
     if (word(m, dec(0)) == 3 && word(m, 4) == 1 && word(m, 0) == kMsgBytes) {
@@ -634,6 +741,92 @@ static bool run_hevc10_stream(IVideoDecoder& session, const Hevc10Expected& e, P
   session.flush();
   drain();
   return same && count == kHevc10SelfTestPictures;
+}
+
+// Feeds the MPEG-4 self-test stream to a session; true when the pictures came out in display order and matched FFmpeg's luma, each stamped with the time of the packet it came from,
+// every one once. With `expect_none`, true when the session cannot decode it (not a picture comes out).
+static bool run_mpeg4_stream(IVideoDecoder& session, const Mpeg4Expected& e, bool expect_none = false) {
+  const ConstByteView stream(kMpeg4SelfTestStream);
+  uint32_t count = 0, seen = 0;
+  bool same = true;
+  auto drain = [&] {
+    VideoFrame f;
+    while (session.receive(&f)) {
+      if (f.format.width != 32 || f.format.height != 32 || f.format.pixel_format != PixelFormat::I420 || count >= kMpeg4SelfTestPictures) { same = false; ++count; continue; }
+      const int64_t k = f.pts_us / 1000;   // the packet (decode index) this picture is from
+      if (k < 0 || k >= int64_t(kMpeg4SelfTestPictures) || (seen & (1u << k)) || e.display_of[uint32_t(k)] != count) same = false;
+      else seen |= 1u << k;
+      const uint8_t* want = kMpeg4SelfTestExpected + uint64_t{count} * (32 * 32 * 3 / 2);
+      for (uint32_t y = 0; y < 32; ++y)
+        for (uint32_t x = 0; x < 32; ++x)
+          if (f.plane[0][uint64_t{y} * f.stride[0] + x] != want[y * 32 + x]) same = false;
+      ++count;
+    }
+  };
+  for (uint32_t i = 0; i < kMpeg4SelfTestPictures; ++i) {
+    VideoPacket p;
+    const uint64_t start = i == 0 ? 0 : kMpeg4SelfTestEnds[i - 1];
+    p.data = stream.subview(start, kMpeg4SelfTestEnds[i] - start);
+    p.pts_us = int64_t{i} * 1000;
+    p.keyframe = i == 0;
+    const SubmitResult r = session.submit(p);
+    if (expect_none) continue;
+    if (r != SubmitResult::Accepted) return false;
+    drain();
+  }
+  session.flush();
+  drain();
+  return expect_none ? count == 0 : same && count == kMpeg4SelfTestPictures;
+}
+
+// Interlaced pictures with no stream to decode them from: frame and field coded ones, with headers and nothing else (tests/Vc1InterlacedFrames.hpp). When the engine takes interlaced
+// sequences every one of them reaches it - the sequence flag set in the message, the frame's units behind their start codes in order, the field unit after the frame - and comes
+// out in display order; otherwise (an engine that failed its interlaced test) the CPU has no pixel path for them, and not a picture comes out nor a job is sent.
+static void synthetic_interlaced(AmdUvd6VideoEngine& engine, Card& card, bool engine_takes) {
+  struct Step { int fcm, value; bool field_unit; };
+  const Step steps[] = {{1, 2, false}, {2, 3, true}, {1, 1, false}, {2, 4, true}, {2, 2, true}, {2, 5, true}, {2, 7, true}, {2, 1, true}};
+  const uint32_t count = sizeof steps / sizeof steps[0];
+  DecoderConfig config = h264_config();
+  config.codec = VideoCodec::Vc1;
+  UniquePointer<IVideoDecoder> session = engine.create_decoder(config);
+  CHECK(static_cast<bool>(session));
+  card.capture_synthetic = true;
+  card.captured.clear();
+  const int problems_before = card.problems;
+  std::vector<int64_t> order;
+  VideoFrame f;
+  for (uint32_t i = 0; i < count; ++i) {
+    std::vector<uint8_t> unit;
+    if (i == 0) unit = vc1test::interlaced_headers(true);
+    const std::vector<uint8_t> frame = vc1test::interlaced_frame(steps[i].fcm, steps[i].value, steps[i].field_unit);
+    unit.insert(unit.end(), frame.begin(), frame.end());
+    VideoPacket p;
+    p.data = ConstByteView(unit.data(), unit.size());
+    p.pts_us = int64_t{i} * 1000;
+    p.keyframe = i == 0;
+    const SubmitResult r = session->submit(p);
+    CHECK((r == SubmitResult::Accepted) == engine_takes);
+    while (session->receive(&f)) order.push_back(f.pts_us / 1000);
+  }
+  session->flush();
+  while (session->receive(&f)) order.push_back(f.pts_us / 1000);
+  card.capture_synthetic = false;
+  CHECK(card.problems == problems_before);   // (the stand-in found nothing wrong with the jobs)
+  if (!engine_takes) {
+    CHECK(order.empty() && card.captured.empty());
+    return;
+  }
+  const int64_t want[] = {0, 2, 3, 1, 5, 6, 4, 7};   // (display order: an anchor waits for the next anchor, a B frame goes out at once)
+  CHECK(order.size() == count && card.captured.size() == count);
+  for (uint32_t i = 0; i < count && i < order.size(); ++i) CHECK(order[i] == want[i]);
+  for (uint32_t i = 0; i < count && i < card.captured.size(); ++i) {
+    const std::vector<uint8_t> frame = vc1test::interlaced_frame(steps[i].fcm, steps[i].value, steps[i].field_unit);
+    const Card::Captured& c = card.captured[i];
+    CHECK((c.sps_flags & 0x20) != 0);   // the interlace flag of the sequence
+    bool same = c.bits.size() == 128 && frame.size() <= 128;
+    for (uint32_t k = 0; same && k < 128; ++k) same = c.bits[k] == (k < frame.size() ? frame[k] : 0);   // (the units in order, zeros after them)
+    CHECK(same);
+  }
 }
 
 // A session with no way to decode the ten-bit stream (the CPU's, or the engine's when its test did not pass): not a single picture comes out of it.
@@ -790,7 +983,7 @@ static bool run_vc1_stream(IVideoDecoder& session, ConstByteView stream, const u
   return same && count == kVc1SelfTestPictures;
 }
 
-enum class Fault { None, NoFirmware, NoRegisters, SmallAperture, MapperRefuses, NoBoot, NoGbConfig, DeadRing, WrongPictures, Hang, HevcWrong, HevcHang, SmcNotRunning, SmcRefuses, Mpeg2Wrong, Mpeg2Hang, Vc1Wrong, Vc1Hang, NoDpmTable, Hevc10Wrong };
+enum class Fault { None, NoFirmware, NoRegisters, SmallAperture, MapperRefuses, NoBoot, NoGbConfig, DeadRing, WrongPictures, Hang, HevcWrong, HevcHang, SmcNotRunning, SmcRefuses, Mpeg2Wrong, Mpeg2Hang, Vc1Wrong, Vc1Hang, NoDpmTable, Hevc10Wrong, Mpeg4Wrong, Vc1InterlacedWrong };
 
 // The P010 target is laid out at twice the NV12 pitch (the 64 x 64 stream cannot tell: both round up to 256 bytes).
 static void test_target_layouts() {
@@ -810,9 +1003,12 @@ static void run_case(Fault fault) {
     CHECK(make_hevc_expected(a, &hevc));
     Hevc10Expected hevc10;
     CHECK(make_hevc10_expected(a, &hevc10));
+    Mpeg4Expected mpeg4;
+    CHECK(make_mpeg4_expected(&mpeg4));
     Expected mpeg2;
     CHECK(make_mpeg2_expected(a, &mpeg2));
-    Expected vc1_main, vc1_advanced;
+    Expected vc1_main, vc1_advanced, vc1_interlaced;
+    CHECK(make_vc1_expected(a, nullptr, ConstByteView(kVc1SelfTestInterlacedStream), kVc1SelfTestInterlacedEnds, &vc1_interlaced));
     CHECK(make_vc1_expected(a, kVc1SelfTestMainConfig, ConstByteView(kVc1SelfTestMainStream), kVc1SelfTestMainEnds, &vc1_main));
     CHECK(make_vc1_expected(a, nullptr, ConstByteView(kVc1SelfTestAdvancedStream), kVc1SelfTestAdvancedEnds, &vc1_advanced));
     Card card;
@@ -820,6 +1016,8 @@ static void run_case(Fault fault) {
     card.hevc = &hevc;
     card.write_hevc = fault != Fault::HevcWrong;
     card.hang_hevc = fault == Fault::HevcHang;
+    card.mpeg4 = &mpeg4;
+    card.write_mpeg4 = fault != Fault::Mpeg4Wrong;
     card.hevc10 = &hevc10;
     card.write_hevc10 = fault != Fault::Hevc10Wrong;
     card.mpeg2 = &mpeg2;
@@ -827,6 +1025,8 @@ static void run_case(Fault fault) {
     card.hang_mpeg2 = fault == Fault::Mpeg2Hang;
     card.vc1_main = &vc1_main;
     card.vc1_advanced = &vc1_advanced;
+    card.vc1_interlaced = &vc1_interlaced;
+    card.write_vc1_interlaced = fault != Fault::Vc1InterlacedWrong;
     card.write_vc1 = fault != Fault::Vc1Wrong;
     card.hang_vc1 = fault == Fault::Vc1Hang;
     if (fault == Fault::SmcNotRunning) card.ring.write(0x95, 0), card.smc_running = false;
@@ -868,21 +1068,29 @@ static void run_case(Fault fault) {
     card.place(engine.plan(), engine.firmware().ucode());
     const size_t writes_before = card.ring.writes.size();
     const bool started = engine.start_hardware(card.clock);
-    const bool engine_up = fault == Fault::None || fault == Fault::HevcWrong || fault == Fault::SmcNotRunning || fault == Fault::SmcRefuses || fault == Fault::Mpeg2Wrong || fault == Fault::Vc1Wrong || fault == Fault::NoDpmTable || fault == Fault::Hevc10Wrong;
+    const bool engine_up = fault == Fault::None || fault == Fault::HevcWrong || fault == Fault::SmcNotRunning || fault == Fault::SmcRefuses || fault == Fault::Mpeg2Wrong || fault == Fault::Vc1Wrong || fault == Fault::NoDpmTable || fault == Fault::Hevc10Wrong || fault == Fault::Mpeg4Wrong || fault == Fault::Vc1InterlacedWrong;
     CHECK(started == engine_up);
     CHECK(card.problems == 0 || fault == Fault::WrongPictures);
     if (engine_up) {
       const bool hevc_on = fault != Fault::HevcWrong, mpeg2_on = fault != Fault::Mpeg2Wrong, vc1_on = fault != Fault::Vc1Wrong;
       const bool hevc10_on = hevc_on && fault != Fault::Hevc10Wrong;   // (the ten-bit test only runs when the eight-bit one passed)
-      CHECK(engine.engine_running() && engine.decode_ready() && engine.hevc_ready() == hevc_on && engine.hevc10_ready() == hevc10_on);
+      const bool mpeg4_on = fault != Fault::Mpeg4Wrong;
+      CHECK(engine.engine_running() && engine.decode_ready() && engine.hevc_ready() == hevc_on && engine.hevc10_ready() == hevc10_on && engine.mpeg4_ready() == mpeg4_on);
+      // MPEG-4 has no CPU decoder: the engine's test is what makes it decodable at all.
+      CHECK(engine.can_decode(VideoCodec::Mpeg4) == mpeg4_on && ((engine.info().accelerated_decode_codecs & codec_mask(VideoCodec::Mpeg4)) != 0) == mpeg4_on);
+      CHECK((strstr(engine.firmware_status(), "MPEG-4 test failed (the engine's pictures differ from the CPU's)") != nullptr) == !mpeg4_on);
       CHECK((strstr(engine.firmware_status(), "Main 10 test failed (the engine's pictures differ from the stream's hashes)") != nullptr) == (fault == Fault::Hevc10Wrong));
-      CHECK(engine.mpeg2_ready() == mpeg2_on && engine.vc1_ready() == vc1_on);
-      CHECK(engine.info().accelerated_decode_codecs == (codec_mask(VideoCodec::H264) | (hevc_on ? codec_mask(VideoCodec::Hevc) : 0u) | (mpeg2_on ? codec_mask(VideoCodec::Mpeg2) : 0u) | (vc1_on ? codec_mask(VideoCodec::Vc1) : 0u)));
+      const bool vc1i_on = vc1_on && fault != Fault::Vc1InterlacedWrong;   // (the interlaced test only runs when the progressive one passed)
+      CHECK(engine.mpeg2_ready() == mpeg2_on && engine.vc1_ready() == vc1_on && engine.vc1_interlaced_ready() == vc1i_on);
+      CHECK((strstr(engine.firmware_status(), "interlaced VC-1 test failed (the engine's pictures differ from the CPU's)") != nullptr) == (fault == Fault::Vc1InterlacedWrong));
+      CHECK(engine.info().accelerated_decode_codecs == (codec_mask(VideoCodec::H264) | (hevc_on ? codec_mask(VideoCodec::Hevc) : 0u) | (mpeg2_on ? codec_mask(VideoCodec::Mpeg2) : 0u) | (vc1_on ? codec_mask(VideoCodec::Vc1) : 0u) | (mpeg4_on ? codec_mask(VideoCodec::Mpeg4) : 0u)));
       CHECK(strstr(engine.engine_note(), !hevc_on ? "H.265 self-test failed" : !mpeg2_on ? "MPEG-2 self-test failed" : !vc1_on ? "VC-1 self-test failed" : "H.264, H.265, MPEG-2 and VC-1 decode run on it") != nullptr && strstr(engine.engine_summary(), "UVD 6.3") != nullptr);
       // The tests opened and closed their own sessions: H.264 (five pictures) and H.265 (six; its session is made even when the test then fails).
-      CHECK(card.creates == 1 && card.hevc_creates == (hevc_on ? 2 : 1) && card.mpeg2_creates == 1 && card.vc1_creates == (vc1_on ? 2 : 1) && card.destroys == (vc1_on ? 5 : 4) + (hevc_on ? 1 : 0) && card.decodes == int(AmdVcnSelfTest::kPictures));
+      CHECK(card.creates == 1 && card.hevc_creates == (hevc_on ? 2 : 1) && card.mpeg2_creates == 1 && card.mpeg4_creates == 1 && card.vc1_creates == (vc1_on ? 3 : 1) && card.destroys == (vc1_on ? 7 : 5) + (hevc_on ? 1 : 0) && card.decodes == int(AmdVcnSelfTest::kPictures));
       CHECK(mpeg2_on ? card.mpeg2_decodes == int(kMpeg2SelfTestPictures) : card.mpeg2_decodes > 0);
-      CHECK(vc1_on ? card.vc1_decodes == int(2 * kVc1SelfTestPictures) : card.vc1_decodes > 0);
+      CHECK(mpeg4_on ? card.mpeg4_decodes == int(kMpeg4SelfTestPictures) : card.mpeg4_decodes > 0);   // (a failing test stops at the first wrong picture)
+      CHECK(vc1_on ? card.vc1_decodes == int(2 * kVc1SelfTestPictures) + card.vc1_interlaced_decodes : card.vc1_decodes > 0);
+      CHECK(vc1i_on ? card.vc1_interlaced_decodes == int(kVc1SelfTestPictures) : vc1_on ? card.vc1_interlaced_decodes > 0 : card.vc1_interlaced_decodes == 0);
       CHECK(hevc_on ? card.hevc_decodes == int(kHevcSelfTestPictures + kHevc10SelfTestPictures) && card.hevc10_decodes == int(kHevc10SelfTestPictures) : card.hevc_decodes > 0 && card.hevc10_decodes == 0);   // (a failing test stops at the first wrong picture)
       // H.264 sessions are the engine's: the stream decodes on it (decodes go up) and comes out as the CPU's pictures.
       {
@@ -930,6 +1138,35 @@ static void run_case(Fault fault) {
           CHECK(static_cast<bool>(second) && ten_bit_refused(*second));
         }
       }
+      // The interlaced VC-1 stream (progressive frames) decodes either way, on the engine when its interlaced test passed and on the CPU when it did not; frame and field coded
+      // pictures only on the engine.
+      {
+        DecoderConfig vc1_config = h264_config();
+        vc1_config.codec = VideoCodec::Vc1;
+        const int before = card.vc1_interlaced_decodes;
+        UniquePointer<IVideoDecoder> session = engine.create_decoder(vc1_config);
+        CHECK(static_cast<bool>(session) && run_vc1_stream(*session, ConstByteView(kVc1SelfTestInterlacedStream), kVc1SelfTestInterlacedEnds, vc1_interlaced));
+        CHECK(card.vc1_interlaced_decodes == before + (vc1i_on ? int(kVc1SelfTestPictures) : 0));
+      }
+      synthetic_interlaced(engine, card, vc1i_on);
+      // MPEG-4 sessions are the engine's when its test passed; when it did not there is no CPU to fall back on. While the engine serves one, a second has nothing either.
+      {
+        DecoderConfig mpeg4_config = h264_config();
+        mpeg4_config.codec = VideoCodec::Mpeg4;
+        const int before = card.mpeg4_decodes;
+        const int problems_before = card.problems;
+        UniquePointer<IVideoDecoder> first = engine.create_decoder(mpeg4_config);
+        CHECK(static_cast<bool>(first) == mpeg4_on);
+        CHECK(!engine.create_decoder(mpeg4_config));   // (busy, or not served at all)
+        if (mpeg4_on) {
+          CHECK(run_mpeg4_stream(*first, mpeg4));
+          CHECK(card.mpeg4_decodes == before + int(kMpeg4SelfTestPictures));
+          // A packet that is not the next plane of the same stream does not hurt it: reset() and again.
+          first->reset();
+          CHECK(run_mpeg4_stream(*first, mpeg4));
+          CHECK(card.problems == problems_before);   // (the stand-in checked every job number, the second run's too: a new session counts from one)
+        }
+      }
       // MPEG-2 sessions are the engine's when its test passed, the CPU's when it did not.
       {
         DecoderConfig mpeg2_config = h264_config();
@@ -962,6 +1199,14 @@ static void run_case(Fault fault) {
         const int before = card.vc1_decodes;
         UniquePointer<IVideoDecoder> clean = engine.create_decoder(vc1_config);
         CHECK(static_cast<bool>(clean) && run_vc1_stream(*clean, ConstByteView(kVc1SelfTestAdvancedStream), kVc1SelfTestAdvancedEnds, vc1_advanced) && card.vc1_decodes == before + int(kVc1SelfTestPictures));
+      }
+      if (mpeg4_on) {
+        damaged_streams(engine, card, VideoCodec::Mpeg4, ConstByteView(kMpeg4SelfTestStream), kMpeg4SelfTestEnds, kMpeg4SelfTestPictures);
+        DecoderConfig mpeg4_config = h264_config();
+        mpeg4_config.codec = VideoCodec::Mpeg4;
+        const int before = card.mpeg4_decodes;
+        UniquePointer<IVideoDecoder> clean = engine.create_decoder(mpeg4_config);
+        CHECK(static_cast<bool>(clean) && run_mpeg4_stream(*clean, mpeg4) && card.mpeg4_decodes == before + int(kMpeg4SelfTestPictures));
       }
       if (mpeg2_on) {
         damaged_streams(engine, card, VideoCodec::Mpeg2, ConstByteView(kMpeg2SelfTestStream), kMpeg2SelfTestEnds, kMpeg2SelfTestPictures);
@@ -1035,7 +1280,7 @@ static void run_case(Fault fault) {
 
 int main() {
   test_target_layouts();
-  for (Fault f : {Fault::None, Fault::NoFirmware, Fault::NoRegisters, Fault::SmallAperture, Fault::MapperRefuses, Fault::NoBoot, Fault::NoGbConfig, Fault::DeadRing, Fault::WrongPictures, Fault::Hang, Fault::HevcWrong, Fault::HevcHang, Fault::SmcNotRunning, Fault::SmcRefuses, Fault::Mpeg2Wrong, Fault::Mpeg2Hang, Fault::Vc1Wrong, Fault::Vc1Hang, Fault::NoDpmTable, Fault::Hevc10Wrong}) {
+  for (Fault f : {Fault::None, Fault::NoFirmware, Fault::NoRegisters, Fault::SmallAperture, Fault::MapperRefuses, Fault::NoBoot, Fault::NoGbConfig, Fault::DeadRing, Fault::WrongPictures, Fault::Hang, Fault::HevcWrong, Fault::HevcHang, Fault::SmcNotRunning, Fault::SmcRefuses, Fault::Mpeg2Wrong, Fault::Mpeg2Hang, Fault::Vc1Wrong, Fault::Vc1Hang, Fault::NoDpmTable, Fault::Hevc10Wrong, Fault::Mpeg4Wrong, Fault::Vc1InterlacedWrong}) {
     printf("case %d\n", static_cast<int>(f));
     run_case(f);
   }

@@ -94,6 +94,11 @@ class AmdVcnSelfTest {
   static Result run_mpeg2(allocators::IAllocator& allocator, const AmdVcnMpeg2Decoder::Engine& engine);
   // The same check on any engine's MPEG-2 session (already prepared); see run_hevc_session for the callbacks.
   static Result run_mpeg2_session(allocators::IAllocator& allocator, IVideoDecoder& session, bool (*wedged)(const void*), const void* ring, uint64_t (*decoded)(const void*), const void* decoder);
+  // The same for MPEG-4 Part 2 on a UVD 6 session (already prepared, configured for I420 output): a stream from FFmpeg's encoder (32 x 32, eight pictures with B planes and
+  // reordering; AmdVcnSelfTestMpeg4Stream.inc) goes in one plane per packet, and the pictures that come out must be, in display order, close to FFmpeg's decode of it (the engine's
+  // inverse transform is not FFmpeg's: a level or two, not bit for bit). What passing proves: the layer parameters of the message, the job numbers of the two anchors, the output
+  // order. Not: interlace, quarter-sample motion, custom matrices, other sizes. `wedged(ring)` and `decoded(decoder)` as for run_hevc_session.
+  static Result run_mpeg4_session(allocators::IAllocator& allocator, IVideoDecoder& session, bool (*wedged)(const void*), const void* ring, uint64_t (*decoded)(const void*), const void* decoder);
   // The same for VC-1, with two streams (a Main profile one and an Advanced profile one, 64 x 64, eight pictures each with B pictures and reordering, made by
   // scripts/gen_vc1_synthetic.py; AmdVcnSelfTestVc1Stream.inc), both of which must pass. The pictures must be close to the CPU decoder's (nothing here has checked the
   // engine's VC-1 decoder against the standard: it is held to a level or two, which a wrong reference or a wrong table is far from). What passing proves beyond the
@@ -114,6 +119,10 @@ class AmdVcnSelfTest {
     ~Vc1SessionHost() = default;
   };
   static Result run_vc1_sessions(allocators::IAllocator& allocator, Vc1SessionHost& host);
+  // The same for one more stream: the Advanced profile pattern in an INTERLACED sequence (its frames are progressive, so the CPU decoder is the reference; what passing proves is
+  // that the engine takes the sequence flag and the frame coding mode in every picture header). Interlaced and field coded pictures themselves have no stream to be tested
+  // with, and no CPU decoder to compare with - an engine that passes this is assumed to decode them. The host opens a session that may take interlaced sequences.
+  static Result run_vc1_interlaced_sessions(allocators::IAllocator& allocator, Vc1SessionHost& host);
   static const char* result_name(Result result);
 };
 

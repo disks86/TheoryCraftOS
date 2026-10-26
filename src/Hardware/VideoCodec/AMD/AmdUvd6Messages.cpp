@@ -387,6 +387,56 @@ uint32_t mpeg2_job_buffers(const JobAddresses& a, ArrayView<AmdUvd6Ring::Buffer>
   return kMpeg2JobBuffers;
 }
 
+Mpeg4BufferSizes mpeg4_buffer_sizes(uint32_t width, uint32_t height) {
+  Mpeg4BufferSizes sizes;
+  const uint64_t width16 = align_up(width, 16), height16 = align_up(height, 16);
+  if (!size_ok(static_cast<uint32_t>(width16), static_cast<uint32_t>(height16)) || width == 0 || height == 0) return sizes;
+  uint64_t image = align_up(width16, kDbPitchAlignment) * height16;
+  image += image / 2;
+  image = align_up(image, 1024);
+  const uint64_t width_mb = width16 / 16, height_mb = align_up(height16 / 16, 2);
+  sizes.references = 3;
+  uint64_t dpb = image * sizes.references + width_mb * height_mb * 64 + align_up(width_mb * height_mb * 32, 64);
+  const uint64_t minimum = 30ull * 1024 * 1024;
+  sizes.dpb = dpb < minimum ? minimum : dpb;
+  return sizes;
+}
+
+bool build_mpeg4_decode_message(ByteView out, uint32_t stream_handle, uint32_t feedback_number, const mpeg4::Vol& vol, const Mpeg2Pictures& p, const DecodeBuffers& b) {
+  const uint64_t width16 = align_up(vol.width, 16), height16 = align_up(vol.height, 16);
+  if (vol.width == 0 || vol.height == 0 || mpeg4_buffer_sizes(vol.width, vol.height).dpb == 0) return false;
+  // get_ref_pic_idx limits a reference to the last six jobs; a picture further back is no longer in the engine's buffer.
+  const uint32_t refs[2] = {p.forward, p.backward};
+  for (uint32_t r : refs)
+    if (p.current == 0 || r >= p.current || p.current - r > kMpeg2References) return false;
+  if (!build_common_decode(out, kStreamTypeMpeg4, stream_handle, feedback_number, static_cast<uint32_t>(width16), static_cast<uint32_t>(height16), b)) return false;
+  Image m(out);
+  m.u32(kUvd_Mpeg4_decoded_pic_idx, p.current);
+  m.u32(kUvd_Mpeg4_ref_pic_idx, p.forward);
+  m.u32(kUvd_Mpeg4_ref_pic_idx + 4, p.backward);
+  m.u32(kUvd_Mpeg4_variant_type, 0);
+  m.u8(kUvd_Mpeg4_profile_and_level_indication, 0xF0);   // Mesa: "ASP Level0"
+  m.u8(kUvd_Mpeg4_video_object_layer_verid, 0x5);        // Mesa: "advanced simple"
+  m.u8(kUvd_Mpeg4_video_object_layer_shape, 0);          // rectangular
+  m.u16(kUvd_Mpeg4_video_object_layer_width, static_cast<uint16_t>(vol.width));
+  m.u16(kUvd_Mpeg4_video_object_layer_height, static_cast<uint16_t>(vol.height));
+  m.u16(kUvd_Mpeg4_vop_time_increment_resolution, static_cast<uint16_t>(vol.time_increment_resolution));
+  auto bit = [](bool v, uint32_t n) { return v ? 1u << n : 0u; };
+  // The flags of Mesa's get_mpeg4_msg (bit positions as in its comments; the ones Mesa leaves out because VA-API does not give them are set from the layer header).
+  m.u32(kUvd_Mpeg4_flags, bit(vol.obmc_disable, 1) | bit(vol.interlaced, 2) | bit(true, 3) | bit(true, 4) | bit(vol.quarter_sample, 5) | bit(true, 6) | bit(vol.resync_marker_disable, 7) |
+                              bit(vol.data_partitioned, 8) | bit(vol.reversible_vlc, 9) | bit(vol.is_object_layer_identifier, 13) | bit(vol.fixed_vop_rate, 14));
+  m.u8(kUvd_Mpeg4_quant_type, vol.quant_type_mpeg ? 1 : 0);
+  for (uint32_t i = 0; i < 64; ++i) {
+    m.u8(kUvd_Mpeg4_intra_quant_mat + i, vol.intra_matrix[i]);
+    m.u8(kUvd_Mpeg4_nonintra_quant_mat + i, vol.non_intra_matrix[i]);
+  }
+  return true;
+}
+
+bool prepare_mpeg4_feedback(ByteView message_buffer) { return prepare_mpeg2_feedback(message_buffer); }
+
+uint32_t mpeg4_job_buffers(const JobAddresses& a, ArrayView<AmdUvd6Ring::Buffer> out) { return mpeg2_job_buffers(a, out); }
+
 Vc1BufferSizes vc1_buffer_sizes(uint32_t width, uint32_t height) {
   Vc1BufferSizes sizes;
   if (!size_ok(width, height)) return sizes;
@@ -403,7 +453,7 @@ Vc1BufferSizes vc1_buffer_sizes(uint32_t width, uint32_t height) {
 bool build_vc1_decode_message(ByteView out, uint32_t stream_handle, uint32_t feedback_number, const vc1::OffloadPicture& picture, const DecodeBuffers& b) {
   if (!picture.seq || !picture.pic) return false;
   const vc1::SequenceHeader& seq = *picture.seq;
-  if (seq.mb_width <= 0 || seq.mb_height <= 0 || seq.interlace) return false;
+  if (seq.mb_width <= 0 || seq.mb_height <= 0) return false;
   if (seq.profile != vc1::kSimple && seq.profile != vc1::kMain && seq.profile != vc1::kAdvanced) return false;
   const uint32_t width = static_cast<uint32_t>(seq.mb_width) * kMacroblock, height = static_cast<uint32_t>(seq.mb_height) * kMacroblock;
   if (!size_ok(width, height) || !build_common_decode(out, kStreamTypeVc1, stream_handle, feedback_number, width, height, b)) return false;

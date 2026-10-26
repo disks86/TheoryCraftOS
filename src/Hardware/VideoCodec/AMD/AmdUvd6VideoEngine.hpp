@@ -25,6 +25,7 @@
 #include "Hardware/VideoCodec/AMD/AmdUvd6AvcDecoder.hpp"
 #include "Hardware/VideoCodec/AMD/AmdUvd6HevcDecoder.hpp"
 #include "Hardware/VideoCodec/AMD/AmdUvd6Mpeg2Decoder.hpp"
+#include "Hardware/VideoCodec/AMD/AmdUvd6Mpeg4Decoder.hpp"
 #include "Hardware/VideoCodec/AMD/AmdUvd6Vc1Decoder.hpp"
 #include "Hardware/VideoCodec/AMD/AmdUvd6Ring.hpp"
 #include "Hardware/VideoCodec/AMD/AmdVce3VideoEngine.hpp"
@@ -212,7 +213,8 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
     if (!enable_decode(*registers_, clock, memory_.engine.ring, *mapper_, plan_.work_gpu_address, aperture_physical_ + plan_.work_offset, plan_.work_bytes)) return false;
     if (enable_hevc_decode()) enable_hevc10_decode();   // (H.264 works either way; ten bits is a test on top of the eight-bit one)
     if (engine_running()) enable_mpeg2_decode();
-    if (engine_running()) enable_vc1_decode();
+    if (engine_running() && enable_vc1_decode()) enable_vc1_interlaced_decode();
+    if (engine_running()) enable_mpeg4_decode();
     return engine_running();
   }
 
@@ -231,7 +233,12 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
     hevc10_note_.assign("");
     mpeg2_ready_ = false;
     vc1_ready_ = false;
+    mpeg4_ready_ = false;
+    mpeg4_note_.assign("");
+    vc1_interlaced_ready_ = false;
+    vc1_interlaced_note_.assign("");
     info_.accelerated_decode_codecs = 0;
+    info_.decode_codecs &= ~codec_mask(VideoCodec::Mpeg4);
     ring_.reset();
     if (uvd_) {
       uvd_->stop();
@@ -249,9 +256,13 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
                      uint64_t work_bytes) {
     decode_ready_ = false;
     hevc_ready_ = false;
+    hevc10_ready_ = false;
     mpeg2_ready_ = false;
     vc1_ready_ = false;
+    mpeg4_ready_ = false;
+    vc1_interlaced_ready_ = false;
     info_.accelerated_decode_codecs = 0;
+    info_.decode_codecs &= ~codec_mask(VideoCodec::Mpeg4);
     ring_.reset();
     const char* why = nullptr;
     bool tested = false;
@@ -442,26 +453,9 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
     vc1_ready_ = false;
     if (!ring_) return false;
     // The test makes a session per stream; the host hands them out and drops each before the engine can be stopped.
-    class Host final : public AmdVcnSelfTest::Vc1SessionHost {
-     public:
-      Host(allocators::IAllocator& allocator, const AmdUvd6AvcDecoder::Engine& engine) : allocator_(allocator), engine_(engine) {}
-      bool open(const DecoderConfig& config) override {
-        session_ = UniquePointer<AmdUvd6Vc1Decoder>::make(allocator_, allocator_, engine_, config);
-        return session_ && session_->prepare();
-      }
-      IVideoDecoder& session() override { return *session_; }
-      bool wedged() const override { return engine_.ring->wedged(); }
-      uint64_t decoded() const override { return session_->pictures_decoded(); }
-      void close() override { session_.reset(); }
-
-     private:
-      allocators::IAllocator& allocator_;
-      AmdUvd6AvcDecoder::Engine engine_;
-      UniquePointer<AmdUvd6Vc1Decoder> session_;
-    };
     AmdVcnSelfTest::Result result;
     {
-      Host host(allocator_, engine_);
+      Vc1Host host(allocator_, engine_, /*interlace=*/false);
       result = AmdVcnSelfTest::run_vc1_sessions(allocator_, host);
     }
     if (result != AmdVcnSelfTest::Result::Passed) {
@@ -490,6 +484,87 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
     rebuild_status();
     return true;
   }
+  // After enable_vc1_decode(): the interlaced VC-1 test (AmdVcnSelfTest::run_vc1_interlaced_sessions: an Advanced profile stream in an interlaced sequence, close to the CPU's
+  // pictures). Passing lets VC-1 sessions give interlaced sequences - frame and field coded pictures too, which the CPU cannot decode at all - to the engine; a failure leaves them
+  // undecoded (the CPU decodes the progressive frames of such a sequence) and everything else as it was - unless the engine stopped answering.
+  bool enable_vc1_interlaced_decode() {
+    vc1_interlaced_ready_ = false;
+    vc1_interlaced_note_.assign("");
+    if (!ring_ || !vc1_ready_) return false;
+    AmdVcnSelfTest::Result result;
+    {
+      Vc1Host host(allocator_, engine_, /*interlace=*/true);
+      result = AmdVcnSelfTest::run_vc1_interlaced_sessions(allocator_, host);
+    }
+    if (result != AmdVcnSelfTest::Result::Passed) {
+      if (ring_->wedged()) {
+        decode_ready_ = false;
+        hevc_ready_ = false;
+        mpeg2_ready_ = false;
+        vc1_ready_ = false;
+        info_.accelerated_decode_codecs = 0;
+        decode_text_.assign("Interlaced VC-1 self-test failed (");
+        decode_text_.append(AmdVcnSelfTest::result_name(result));
+        decode_text_.append("); engine stopped");
+        stop_engine();
+        note_ = decode_text_.c_str();
+      } else {
+        vc1_interlaced_note_.assign("interlaced VC-1 test failed (");
+        vc1_interlaced_note_.append(AmdVcnSelfTest::result_name(result));
+        vc1_interlaced_note_.append(")");
+      }
+      rebuild_status();
+      return false;
+    }
+    vc1_interlaced_ready_ = true;
+    return true;
+  }
+  bool vc1_interlaced_ready() const { return vc1_interlaced_ready_; }
+  // After enable_decode(): the same for MPEG-4 Part 2 (AmdVcnSelfTest::run_mpeg4_session: an FFmpeg-encoded stream with B planes, the engine's pictures held to FFmpeg's decode of
+  // it). There is no CPU decoder for this codec, so a pass is what makes MPEG-4 decodable at all (info().decode_codecs gains it); a failure leaves it unsupported and the rest
+  // as it was - unless the engine stopped answering, which stops it altogether.
+  bool enable_mpeg4_decode() {
+    mpeg4_ready_ = false;
+    mpeg4_note_.assign("");
+    if (!ring_) return false;
+    AmdVcnSelfTest::Result result = AmdVcnSelfTest::Result::SessionRefused;
+    {
+      DecoderConfig config;
+      config.codec = VideoCodec::Mpeg4;
+      config.output = PixelFormat::I420;
+      AmdUvd6Mpeg4Decoder session(allocator_, engine_, config);
+      if (session.prepare())
+        result = AmdVcnSelfTest::run_mpeg4_session(
+            allocator_, session, [](const void* ring) { return static_cast<const AmdUvd6Ring*>(ring)->wedged(); }, ring_.get(),
+            [](const void* decoder) { return static_cast<const AmdUvd6Mpeg4Decoder*>(decoder)->pictures_decoded(); }, &session);
+    }
+    if (result != AmdVcnSelfTest::Result::Passed) {
+      if (ring_->wedged()) {
+        decode_ready_ = false;
+        hevc_ready_ = false;
+        mpeg2_ready_ = false;
+        vc1_ready_ = false;
+        info_.accelerated_decode_codecs = 0;
+        decode_text_.assign("MPEG-4 self-test failed (");
+        decode_text_.append(AmdVcnSelfTest::result_name(result));
+        decode_text_.append("); engine stopped");
+        stop_engine();
+        note_ = decode_text_.c_str();
+      } else {
+        mpeg4_note_.assign("MPEG-4 test failed (");
+        mpeg4_note_.append(AmdVcnSelfTest::result_name(result));
+        mpeg4_note_.append(")");
+      }
+      rebuild_status();
+      return false;
+    }
+    mpeg4_ready_ = true;
+    info_.decode_codecs |= codec_mask(VideoCodec::Mpeg4);
+    info_.accelerated_decode_codecs |= codec_mask(VideoCodec::Mpeg4);
+    rebuild_status();
+    return true;
+  }
+  bool mpeg4_ready() const { return mpeg4_ready_; }
   bool decode_ready() const { return decode_ready_; }
   bool vc1_ready() const { return vc1_ready_; }
   bool mpeg2_ready() const { return mpeg2_ready_; }
@@ -499,10 +574,17 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
 
   // H.264, H.265, MPEG-2 and VC-1 go to the engine when they passed their tests and it is free (it runs one session at a time); anything else goes to the CPU.
   UniquePointer<IVideoDecoder> create_decoder(const DecoderConfig& config) override {
+    if (config.codec == VideoCodec::Mpeg4 && mpeg4_ready_ && ring_ && !ring_->wedged()) {
+      AmdUvd6AvcDecoder::Engine engine = engine_;
+      engine.stream_handle = ++next_stream_handle_;
+      UniquePointer<AmdUvd6Mpeg4Decoder> session = UniquePointer<AmdUvd6Mpeg4Decoder>::make(allocator_, allocator_, engine, config);
+      if (session && session->prepare()) return UniquePointer<IVideoDecoder>(util::move(session));
+    }
     if (config.codec == VideoCodec::Vc1 && vc1_ready_ && ring_ && !ring_->wedged()) {
       AmdUvd6AvcDecoder::Engine engine = engine_;
       engine.stream_handle = ++next_stream_handle_;
       UniquePointer<AmdUvd6Vc1Decoder> session = UniquePointer<AmdUvd6Vc1Decoder>::make(allocator_, allocator_, engine, config);
+      if (session) session->allow_interlace(vc1_interlaced_ready_);
       if (session && session->prepare()) return UniquePointer<IVideoDecoder>(util::move(session));
     }
     if (config.codec == VideoCodec::Mpeg2 && mpeg2_ready_ && ring_ && !ring_->wedged()) {
@@ -541,6 +623,27 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
   const AmdVcnFirmware& firmware() const { return firmware_; }
 
  private:
+  // The sessions of the VC-1 tests, handed out one at a time and dropped before the engine can be stopped; `interlace` lets them take interlaced sequences.
+  class Vc1Host final : public AmdVcnSelfTest::Vc1SessionHost {
+   public:
+    Vc1Host(allocators::IAllocator& allocator, const AmdUvd6AvcDecoder::Engine& engine, bool interlace) : allocator_(allocator), engine_(engine), interlace_(interlace) {}
+    bool open(const DecoderConfig& config) override {
+      session_ = UniquePointer<AmdUvd6Vc1Decoder>::make(allocator_, allocator_, engine_, config);
+      if (session_) session_->allow_interlace(interlace_);
+      return session_ && session_->prepare();
+    }
+    IVideoDecoder& session() override { return *session_; }
+    bool wedged() const override { return engine_.ring->wedged(); }
+    uint64_t decoded() const override { return session_->pictures_decoded(); }
+    void close() override { session_.reset(); }
+
+   private:
+    allocators::IAllocator& allocator_;
+    AmdUvd6AvcDecoder::Engine engine_;
+    bool interlace_;
+    UniquePointer<AmdUvd6Vc1Decoder> session_;
+  };
+
   static constexpr uint32_t kBootAttempts = 3;
 
   // "<what> [st=.. pw=.. rst=.. cn=.. lmi=.. rp=.. wp=..]": the registers of AmdUvd6::Diagnostics in hexadecimal, short enough for the status line.
@@ -620,6 +723,14 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
         firmware_text_.append("; ");
         firmware_text_.append(hevc10_note_.view());
       }
+      if (vc1_interlaced_note_.size() != 0) {
+        firmware_text_.append("; ");
+        firmware_text_.append(vc1_interlaced_note_.view());
+      }
+      if (mpeg4_note_.size() != 0) {
+        firmware_text_.append("; ");
+        firmware_text_.append(mpeg4_note_.view());
+      }
       if (power_note_.size() != 0) {
         firmware_text_.append("; ");
         firmware_text_.append(power_note_.view());
@@ -670,6 +781,10 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
   bool hevc_ready_ = false;
   bool hevc10_ready_ = false;   // ten-bit H.265 passed its test
   FixedString<95> hevc10_note_;   // why not, when it did not
+  bool mpeg4_ready_ = false;
+  FixedString<95> mpeg4_note_;
+  bool vc1_interlaced_ready_ = false;   // interlaced VC-1 passed its test
+  FixedString<95> vc1_interlaced_note_;
   bool mpeg2_ready_ = false;
   bool vc1_ready_ = false;
   uint32_t next_stream_handle_ = 1;

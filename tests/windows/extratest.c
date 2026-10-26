@@ -179,6 +179,58 @@ static void test_small(void) {
   check(GetComputerNameExA(ComputerNameDnsHostname, name, &size) && size > 0, "GetComputerNameEx");
 }
 
+/* ---- the kernel32 export audit's first batch: bare lstr*, Rtl*Memory, and a few small legacy functions ---- */
+static void test_export_audit_batch1(void) {
+  check(lstrlen("hello") == 5 && lstrlen("") == 0, "lstrlen (the bare, always-ANSI one)");
+  char dest[32] = "ab";
+  check(!strcmp(lstrcpy(dest, "world"), "world"), "lstrcpy");
+  check(!strcmp(lstrcat(dest, "!"), "world!"), "lstrcat");
+  char small[4];
+  check(!strcmp(lstrcpyn(small, "worldwide", sizeof(small)), "wor"), "lstrcpyn truncates and still NUL-terminates");
+  check(lstrcmp("abc", "abd") < 0 && lstrcmp("abc", "abc") == 0 && lstrcmp("abd", "abc") > 0, "lstrcmp");
+  check(lstrcmpi("ABC", "abc") == 0 && lstrcmpi("abc", "abd") < 0, "lstrcmpi ignores case");
+
+  BYTE src[8] = {1, 2, 3, 4, 5, 6, 7, 8}, out[8] = {0};
+  RtlCopyMemory(out, src, sizeof(src));
+  check(!memcmp(out, src, sizeof(src)), "RtlCopyMemory");
+  RtlZeroMemory(out, sizeof(out));
+  check(out[0] == 0 && out[7] == 0, "RtlZeroMemory");
+  RtlFillMemory(out, sizeof(out), 0xAB);      /* (dest, length, fill) - not memset's (dest, fill, length) */
+  check(out[0] == 0xAB && out[7] == 0xAB, "RtlFillMemory's own argument order");
+  BYTE overlap[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+  RtlMoveMemory(overlap + 1, overlap, 4);      /* overlapping ranges: only a real move (memmove), not memcpy, gets this right */
+  check(overlap[0] == 1 && overlap[1] == 1 && overlap[2] == 2 && overlap[3] == 3 && overlap[4] == 4, "RtlMoveMemory handles overlap");
+  BYTE x[4] = {1, 2, 3, 4}, y[4] = {1, 2, 9, 4};
+  check(RtlCompareMemory(x, y, 4) == 2 && RtlCompareMemory(x, x, 4) == 4, "RtlCompareMemory counts the leading bytes that match, not a bool");
+
+  check(Beep(800, 100), "Beep (no speaker driver here, but it should not fail)");
+  check(CancelIo(GetStdHandle(STD_OUTPUT_HANDLE)), "CancelIo (nothing pending to cancel, but it should not fail)");
+  SetLastError(0);
+  check(!CancelIoEx(GetStdHandle(STD_OUTPUT_HANDLE), NULL) && GetLastError() == ERROR_NOT_FOUND, "CancelIoEx: nothing pending, ERROR_NOT_FOUND");
+
+  LPSTR env = GetEnvironmentStrings();
+  check(env != NULL && env[0] != 0, "GetEnvironmentStrings (the bare, always-ANSI one)");
+  FreeEnvironmentStringsA(env);
+
+  DeleteFileA("C:\\Temp\\audit1.txt");
+  HANDLE f = CreateFileA("C:\\Temp\\audit1.txt", GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+  DWORD written = 0;
+  if (f != INVALID_HANDLE_VALUE) { WriteFile(f, "hello", 5, &written, NULL); CloseHandle(f); }
+  check(written == 5, "set up a file for GetCompressedFileSize/OpenFile");
+  check(GetCompressedFileSizeA("C:\\Temp\\audit1.txt", NULL) == 5, "GetCompressedFileSize (nothing here compresses, so it is the real size)");
+
+  OFSTRUCT reopen;
+  HFILE hf = OpenFile("C:\\Temp\\audit1.txt", &reopen, OF_READ);
+  check(hf != (HFILE)-1 && !strcmp(reopen.szPathName, "C:\\Temp\\audit1.txt"), "OpenFile(OF_READ) on an existing file");
+  if (hf != (HFILE)-1) CloseHandle((HANDLE)(ULONG_PTR)hf);      /* OpenFile's HFILE is this project's real kernel HANDLE value, not a separate DOS one (_lclose is not implemented) */
+  check(OpenFile("C:\\Temp\\audit1.txt", &reopen, OF_EXIST) == 0, "OpenFile(OF_EXIST) just checks and closes");
+  check(OpenFile("C:\\Temp\\no_such_file.txt", &reopen, OF_READ) == (HFILE)-1 && reopen.nErrCode != 0, "OpenFile of a missing file fails and fills nErrCode");
+  DeleteFileA("C:\\Temp\\audit1.txt");
+
+  UINT result = WinExec("C:\\Windows\\System32\\k32test.exe", 0);
+  check(result > 31 || result == ERROR_FILE_NOT_FOUND, "WinExec (k32test.exe may not be installed next to this one; either outcome is fine here)");
+}
+
 /* ---- volumes, search, file information, copying ---- */
 static void test_files(void) {
   ULARGE_INTEGER available, total, free_bytes;
@@ -248,6 +300,7 @@ int main(void) {
   test_fibers();
   test_pool();
   test_small();
+  test_export_audit_batch1();
   test_files();
   test_ini();
   printf("extratest: %d checks, %d failed\n", g_checks, g_failed);
