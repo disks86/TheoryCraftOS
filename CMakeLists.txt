@@ -416,6 +416,7 @@ add_executable(BOOTX64
   src/Hardware/GraphicsProcessingUnit/Intel/IntelForcewake.cpp
   src/Hardware/GraphicsProcessingUnit/Intel/IntelVcsDriver.cpp
   src/Hardware/GraphicsProcessingUnit/Intel/IntelRenderCommands.cpp
+  src/Hardware/GraphicsProcessingUnit/Intel/IntelGen9Setup.cpp
   src/Hardware/GraphicsProcessingUnit/Intel/IntelRenderBatch.cpp
   src/Graphics/Graphics3D/IntelGen9/Gen9GraphicsDevice.cpp
   src/Graphics/Graphics3D/IntelGen9/IntelRenderStack.cpp

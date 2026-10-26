@@ -76,6 +76,7 @@ static void execute(FakeGpu& gpu, const std::vector<uint32_t>& dump) {
     if (!read_dword(gpu, uint64_t{surface_base} + entry + i * 4, &ss[i], "surface state")) return;
   const uint32_t format = (ss[0] >> 18) & 0x1FF, width = (ss[2] & 0x3FFF) + 1, height = ((ss[2] >> 16) & 0x3FFF) + 1, pitch = (ss[3] & 0x3FFFF) + 1;
   const uint64_t target = (uint64_t{ss[9]} << 32) | ss[8];
+  CHECK(ss[1] == (2u << 24));   // memory object control: table entry 1 (the page table's), the field is the index shifted left by one
   CHECK((ss[0] >> 29) == 1 && (format == 0x0C0 || format == 0x0C7) && ss[7] == ((7u << 16) | (6u << 19) | (5u << 22) | (4u << 25)));
   // The vertices.
   const uint64_t vertices_at = (uint64_t{dump[vb + 3]} << 32) | dump[vb + 2];

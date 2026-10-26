@@ -29,6 +29,8 @@ bool IntelRenderStack::initialize(hardware::IntelGpu& gpu) {
   config.registers = hw.registers;
   config.ggtt_table = hw.ggtt_table;
   config.generation = Generation::Gen9;
+  config.device_id = hw.device_id;
+  config.revision = hw.revision;
   config.engine = VcsDriver::Engine::Render;
   // Pages nothing maps now; the driver maps them in initialize(), so the video engine driver, which looks later, finds others.
   if (!find_unused_ggtt_range(hw.ggtt_table, VcsDriver::kRenderGgttPagesNeeded, kGuardPages, &config.ggtt_first_page)) return false;
