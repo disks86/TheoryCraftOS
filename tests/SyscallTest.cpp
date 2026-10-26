@@ -398,6 +398,10 @@ static void test_service_numbers_agree() {
       {"NtReleaseSemaphore", WindowsSyscallNumber::NtReleaseSemaphore},
       {"NtWaitForMultipleObjects", WindowsSyscallNumber::NtWaitForMultipleObjects},
       {"NtDuplicateObject", WindowsSyscallNumber::NtDuplicateObject},
+      {"NtSuspendThread", WindowsSyscallNumber::NtSuspendThread},
+      {"NtGetContextThread", WindowsSyscallNumber::NtGetContextThread},
+      {"NtSetContextThread", WindowsSyscallNumber::NtSetContextThread},
+      {"NtCreateUserProcess", WindowsSyscallNumber::NtCreateUserProcess},
   };
   FILE* header = fopen("src/Windows/tcos_syscalls.h", "r");
   CHECK(header != nullptr);

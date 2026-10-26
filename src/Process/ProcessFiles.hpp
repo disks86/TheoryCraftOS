@@ -41,7 +41,7 @@ constexpr uint64_t kMaxPath = 4096;
 PathResult resolve_path(PathStyle style, StringView cwd, StringView path, String* out);
 
 // What a descriptor (Linux file descriptor, Windows handle) refers to.
-enum class DescriptorKind : uint8_t { Closed, ConsoleInput, ConsoleOutput, ConsoleError, File, Directory, Null, Zero, Random, Thread, Event, Mutex, Semaphore };
+enum class DescriptorKind : uint8_t { Closed, ConsoleInput, ConsoleOutput, ConsoleError, File, Directory, Null, Zero, Random, Thread, Event, Mutex, Semaphore, Process };
 
 // How open() treats the path. (The Linux O_* and Windows dispositions both reduce to these.)
 struct OpenFlags {
@@ -83,6 +83,7 @@ class ProcessFiles {
   // `root_prefix` is the folder of `fs` that is this process's root ("/Linux"). The file system must outlive the process's open files.
   void attach(allocators::IAllocator& allocator, filesystem::IFileSystem& fs, StringView root_prefix);
   bool attached() const { return fs_ != nullptr; }
+  filesystem::IFileSystem* file_system() const { return fs_; }
   // The allocator given to attach() (for the temporary strings of the callers); only valid when attached().
   allocators::IAllocator& allocator() const { return *allocator_; }
   PathStyle style() const { return style_; }

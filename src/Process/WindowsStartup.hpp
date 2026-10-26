@@ -21,6 +21,7 @@
 #include "Executable/PeFile.hpp"
 #include "Process/AddressSpace.hpp"
 #include "Process/ImageLoader.hpp"
+#include "Process/Process.hpp"
 #include "Utility/ArrayView.hpp"
 #include "Utility/StringView.hpp"
 
@@ -35,7 +36,8 @@ struct WindowsStartup {
   uint64_t shared_user_data = 0;    // KUSER_SHARED_DATA at its fixed address
   uint64_t ldr = 0;                 // PEB_LDR_DATA: the module lists (see WindowsModule)
   // The image's static TLS as new threads need it: the template (initialised data) and the zero fill after it. Bytes 0 if the image has none.
-  uint64_t tls_template = 0, tls_template_bytes = 0, tls_zero_fill = 0;
+  TlsTemplate tls[kMaxTlsModules];      // module index (the value of its _tls_index) -> template
+  uint32_t tls_count = 0;
 };
 
 // A module as the loader list (PEB.Ldr) describes it.
@@ -45,6 +47,7 @@ struct WindowsModule {
   uint64_t entry = 0;               // the entry point address, 0 if none
   bool main = false;                // the program itself (first in the list; left out of the initialization order)
   bool in_init_order = true;
+  uint32_t tls_rva = 0, tls_size = 0;      // its TLS directory (0: none)
 };
 
 struct WindowsStartupInput {
@@ -76,7 +79,8 @@ LoadStatus build_windows_startup(AddressSpace& space, const exe::PeFile& pe, con
 struct WindowsThreadInput {
   uint64_t peb = 0, process_id = 0, thread_id = 0;
   uint64_t stack_bytes = 0;
-  uint64_t tls_template = 0, tls_template_bytes = 0, tls_zero_fill = 0;
+  TlsTemplate tls[kMaxTlsModules];
+  uint32_t tls_count = 0;
 };
 struct WindowsThread {
   uint64_t teb = 0, stack_top = 0, stack_pointer = 0;

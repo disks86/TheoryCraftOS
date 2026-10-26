@@ -19,6 +19,7 @@
 #include "Process/WindowsFiles.hpp"
 #include "Process/WindowsObjects.hpp"
 #include "Process/WindowsThreads.hpp"
+#include "Process/WindowsProcess.hpp"
 #include "Process/Process.hpp"
 #include "Process/Syscall.hpp"
 #include "Process/WindowsSyscalls.hpp"
@@ -254,7 +255,11 @@ uint32_t nt_query_virtual_memory(Process& process, const SyscallRequest& r) {
 uint32_t nt_query_information_process(Process& process, const SyscallRequest& r) {
   uint64_t returned = 0;
   if (!argument(process, r, 4, &returned)) return kStatusAccessViolation;
-  if (!current_process_handle(r.args[0])) return kStatusInvalidHandle;
+  bool child_exited = false;
+  uint32_t child_code = 0;
+  uint64_t child_pid = 0;
+  const bool child = !current_process_handle(r.args[0]);
+  if (child && !windowsabi::process_handle_info(process, r.args[0], &child_exited, &child_code, &child_pid)) return kStatusInvalidHandle;
   uint64_t size = 0;
   uint8_t out[48] = {};
   auto put64 = [&](uint32_t at, uint64_t v) { for (uint32_t i = 0; i < 8; ++i) out[at + i] = uint8_t(v >> (8 * i)); };
@@ -263,10 +268,12 @@ uint32_t nt_query_information_process(Process& process, const SyscallRequest& r)
   if (info_class == 0) {
     uint64_t peb = 0;
     process.read_user_u64(process.gs_base() + 0x60, &peb);
+    if (child) peb = 0;       // (another address space)
+    put64(0, child ? (child_exited ? child_code : 259u) : 0u);      // ExitStatus (STILL_ACTIVE)
     put64(8, peb);            // PebBaseAddress
     put64(16, 1);             // AffinityMask
     put64(24, 8);             // BasePriority
-    put64(32, process.id());  // UniqueProcessId
+    put64(32, child ? child_pid : process.id());  // UniqueProcessId
     size = 48;
   } else if (info_class == 26) {
     size = 8;                 // not a 32-bit process on a 64-bit system
@@ -323,9 +330,17 @@ class WindowsSyscalls final : public ISyscallInterface {
       case WindowsSyscallNumber::NtReleaseSemaphore: return windowsabi::nt_release_semaphore(process, r);
       case WindowsSyscallNumber::NtWaitForMultipleObjects: return windowsabi::nt_wait_for_multiple_objects(process, r);
       case WindowsSyscallNumber::NtDuplicateObject: return windowsabi::nt_duplicate_object(process, r);
+      case WindowsSyscallNumber::NtSuspendThread: return windowsabi::nt_suspend_thread(process, r);
+      case WindowsSyscallNumber::NtGetContextThread: return windowsabi::nt_get_context_thread(process, r);
+      case WindowsSyscallNumber::NtCreateUserProcess: return windowsabi::nt_create_user_process(process, r);
+      case WindowsSyscallNumber::NtSetContextThread: return windowsabi::nt_set_context_thread(process, r);
       case WindowsSyscallNumber::NtRaiseException: return nt_raise_exception_final(process, r);
       case WindowsSyscallNumber::NtTerminateProcess:
-        if (r.args[0] != kCurrentProcess) return kStatusInvalidHandle;      // other processes are not reachable yet
+        if (r.args[0] != kCurrentProcess) {      // a process this one created
+          bool handled = false;
+          const uint32_t status = windowsabi::terminate_process_handle(process, r.args[0], uint32_t(r.args[1]), &handled);
+          return status;
+        }
         process.terminate(uint32_t(r.args[1]));
         return kStatusSuccess;
       case WindowsSyscallNumber::NtYieldExecution: process.block_yield(); return kStatusSuccess;

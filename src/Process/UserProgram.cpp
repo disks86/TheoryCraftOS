@@ -75,7 +75,7 @@ LoadStatus UserProgram::load(ConstByteView file, ArrayView<const StringView> arg
     if (status != LoadStatus::Ok) return status;
     stack_pointer = windows_initial_stack_pointer(stack_top);
     String command_line(allocator_);
-    if (!join_command_line(arguments, &command_line)) return LoadStatus::OutOfMemory;
+    if (!command_line_.empty() ? !command_line.assign(command_line_.view()) : !join_command_line(arguments, &command_line)) return LoadStatus::OutOfMemory;
     WindowsStartupInput input;
     input.allocator = &allocator_;
     input.process_id = id_;
@@ -94,7 +94,9 @@ LoadStatus UserProgram::load(ConstByteView file, ArrayView<const StringView> arg
     if (modules) {
       for (uint64_t i = 0; i < modules->count() && listed_count < 64; ++i) {
         const Module& m = modules->at(i);
-        listed[listed_count++] = WindowsModule{m.main ? program_file : m.name.view(), m.base, m.size, m.entry, m.main, true};
+        WindowsModule entry{m.main ? program_file : m.name.view(), m.base, m.size, m.entry, m.main, true};
+        (m.main ? &pe : m.pe)->directory(9, &entry.tls_rva, &entry.tls_size);      // IMAGE_DIRECTORY_ENTRY_TLS (the program's headers are the caller's)
+        listed[listed_count++] = entry;
       }
       for (uint64_t i = 0; i < modules->init_count() && init_count < 64; ++i) {
         for (uint32_t j = 0; j < listed_count; ++j) {
@@ -119,9 +121,8 @@ LoadStatus UserProgram::load(ConstByteView file, ArrayView<const StringView> arg
     dispatcher = modules ? modules->export_address("ntdll.dll", "KiUserExceptionDispatcher") : 0;
     thread_thunk = modules ? modules->export_address("ntdll.dll", "TcosThreadStart") : 0;
     thread_support.peb = startup.peb;
-    thread_support.tls_template = startup.tls_template;
-    thread_support.tls_template_bytes = startup.tls_template_bytes;
-    thread_support.tls_zero_fill = startup.tls_zero_fill;
+    for (uint32_t i = 0; i < startup.tls_count; ++i) thread_support.tls[i] = startup.tls[i];
+    thread_support.tls_count = startup.tls_count;
     thread_support.start_thunk = thread_thunk;
     thread_teb = startup.teb;
     loaded_modules = static_cast<UniquePointer<ModuleSet>&&>(modules);

@@ -27,6 +27,9 @@
 
 #ifdef TCOS_USERMODE_DEMO_PROGRAM
 extern "C" const uint8_t tcos_demo_program[], tcos_demo_program_end[];
+struct DemoFile { const char* name; const uint8_t* begin; const uint8_t* end; };
+extern "C" const DemoFile tcos_demo_files[];
+extern "C" const uint64_t tcos_demo_file_count;
 #endif
 
 namespace {
@@ -5530,6 +5533,13 @@ bool run_usermode_demo(allocators::IAllocator& allocator) {
     const char* path = windows ? "/Windows/Windows/System32/extra.exe" : "/Linux/bin/extra";
     if (files.open_file(path, filesystem::OpenMode::CreateTruncate, &f) == filesystem::Status::Ok) f->write(0, file, &n);
     f.reset();
+    for (uint64_t i = 0; i < tcos_demo_file_count; ++i) {      // the DLLs and programs it uses
+      String extra(allocator);
+      extra.assign(windows ? "/Windows/Windows/System32/" : "/Linux/bin/");
+      extra.append(StringView(tcos_demo_files[i].name));
+      if (files.open_file(extra.view(), filesystem::OpenMode::CreateTruncate, &f) == filesystem::Status::Ok) f->write(0, ConstByteView(tcos_demo_files[i].begin, static_cast<uint64_t>(tcos_demo_files[i].end - tcos_demo_files[i].begin)), &n);
+      f.reset();
+    }
     struct Show {
       static void write(void*, StringView text) { console::puts(text); }
     };

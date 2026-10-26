@@ -117,6 +117,30 @@ bool dispatch_exception(Process& process, const X86Context& at, const ExceptionI
   return true;
 }
 
+bool store_context(Process& process, uint64_t address, const X86Context& at) {
+  uint8_t buffer[kContextBytes];
+  if (!process.read_user(address, ByteView(buffer))) return false;
+  uint32_t flags = uint32_t(buffer[0x30]) | uint32_t(buffer[0x31]) << 8 | uint32_t(buffer[0x32]) << 16 | uint32_t(buffer[0x33]) << 24;
+  if ((flags & kContextAmd64) != kContextAmd64) return false;
+  auto put = [&](uint32_t offset, uint64_t value, uint32_t bytes) { for (uint32_t i = 0; i < bytes; ++i) buffer[offset + i] = uint8_t(value >> (8 * i)); };
+  if (flags & kContextControl) {
+    put(0x38, 0x33, 2);      // cs
+    put(0x42, 0x2B, 2);      // ss
+    put(0x44, at.rflags, 4);
+    put(0x98, at.gpr[X86Context::kRsp], 8);
+    put(0xF8, at.rip, 8);
+  }
+  if (flags & kContextSegments) { put(0x3A, 0x2B, 2); put(0x3C, 0x2B, 2); put(0x3E, 0x2B, 2); put(0x40, 0x2B, 2); }
+  if (flags & kContextInteger) {
+    for (uint32_t i = 0; i < 16; ++i) if (i != X86Context::kRsp) put(0x78 + 8 * i, at.gpr[i], 8);
+  }
+  if (flags & kContextFloatingPoint) {
+    for (uint32_t i = 0; i < 512; ++i) buffer[0x100 + i] = at.fpu[i];
+    put(0x34, mxcsr_of(at.fpu), 4);
+  }
+  return process.write_user(address, ConstByteView(buffer));
+}
+
 bool apply_context(Process& process, uint64_t address, X86Context* context) {
   uint8_t buffer[kContextBytes];
   if (!process.read_user(address, ByteView(buffer))) return false;
