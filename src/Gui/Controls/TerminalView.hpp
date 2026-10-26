@@ -96,6 +96,7 @@ class TerminalView : public Control {
   void scroll_to_end();
 
   bool focusable() const override { return true; }
+  bool shows_caret() const override { return focused(); }
   void layout() override;
   void paint(Painter& painter) override;
   void on_mouse_wheel(const MouseArgs& args) override;

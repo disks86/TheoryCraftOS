@@ -58,6 +58,7 @@ struct RenderOptions {
   // The state of the page's forms that is not in the tree: which control has the focus (a node serial, 0 for none), which drop-down list is open, and the
   // control that broke a constraint when a form was submitted, with what to tell about it.
   uint32_t focus = 0, open_select = 0, invalid_node = 0;
+  bool caret_hidden = false;          // the blinking caret of the focused field is in its hidden half: a blank takes its place, so nothing moves
   StringView invalid_text;
   IFrameSource* frames = nullptr;     // the pages of <iframe>s (nullptr: <iframe> shows nothing)
   IObjectSource* objects = nullptr;   // pictures, videos and canvases (nullptr: <img> shows its alternative text, <video> and <canvas> their fallback content)

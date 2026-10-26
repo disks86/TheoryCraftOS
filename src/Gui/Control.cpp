@@ -153,6 +153,11 @@ Point Control::window_origin() const {
   return p;
 }
 
+bool Control::caret_visible() const {
+  const Window* w = window();
+  return !w || w->caret_visible();
+}
+
 void Control::invalidate() const {
   if (Window* w = window()) w->mark_dirty();
 }

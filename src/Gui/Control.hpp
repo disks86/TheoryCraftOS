@@ -115,6 +115,11 @@ class Control {
   bool hovered() const { return hovered_; }
   bool focused() const { return focused_; }
   virtual bool focusable() const { return false; }
+  // True while the control draws a text caret (it has the focus and is a place to type): the window then repaints every time the caret
+  // changes between shown and hidden (see Window::tick()).
+  virtual bool shows_caret() const { return false; }
+  // The blink phase to draw a caret with: false in the half of the period where it is hidden. Always true for a control in no window.
+  bool caret_visible() const;
   // Asks for a repaint.
   void invalidate() const;
 

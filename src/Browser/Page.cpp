@@ -534,11 +534,13 @@ bool Page::render(HtmlDocument* out) {
   options.objects = &objects_;
   options.frames = this;
   options.focus = focus_;
+  options.caret_hidden = !caret_visible_;
   options.open_select = open_select_;
   options.invalid_node = invalid_node_;
   options.invalid_text = invalid_text_.view();
   const bool ok = render_document(doc_, options, out);
   rendered_version_ = doc_.version();
+  caret_dirty_ = false;
   rendered_media_ = media_;
   deliver_object_events();
   return ok;
@@ -569,6 +571,8 @@ bool Page::render_picture(PagePicture* out, font::FontSet& fonts) {
     paint_options.measurer = &measurer;
     paint_options.sheet = &style_cache_;
     paint_options.doc = &doc_;
+    paint_options.focus = focus_;
+    paint_options.caret_hidden = !caret_visible_;
     ok = paint::build_display_list(out->tree, paint_options, &out->list);
   }
   if (ok) resolve_scroll_target(out->tree);
@@ -576,6 +580,7 @@ bool Page::render_picture(PagePicture* out, font::FontSet& fonts) {
   out->document = &doc_;
   out->viewport_width = media_.width;
   rendered_version_ = doc_.version();
+  caret_dirty_ = false;
   rendered_media_ = media_;
   deliver_object_events();
   if (ok && bindings_) {   // (what is on screen has changed: intersection observers look again)
@@ -2007,7 +2012,7 @@ bool Page::press_key(dom::Node* n, FormKey k, char ch, uint8_t modifiers) {
 // --- Frames ------------------------------------------------------------------------------------------------------------------------
 
 bool Page::changed() const {
-  if (doc_.version() != rendered_version_ || media_ != rendered_media_ || fragment_pending_ || scroll_node_) return true;
+  if (doc_.version() != rendered_version_ || media_ != rendered_media_ || fragment_pending_ || scroll_node_ || caret_dirty_) return true;
   for (uint64_t i = 0; i < frames_.count(); ++i)
     if (frames_[i]->page && frames_[i]->page->changed()) return true;
   return false;
@@ -2018,6 +2023,25 @@ bool Page::has_focus() const {
   for (uint64_t i = 0; i < frames_.count(); ++i)
     if (frames_[i]->page && frames_[i]->page->has_focus()) return true;
   return false;
+}
+
+bool Page::caret_blinks() const {
+  if (focus_ != 0) {
+    const dom::Node* n = doc_.by_serial(focus_);
+    if (n && ((n->is_tag("input") && dom::is_text_field(dom::input_type(n))) || n->is_tag("textarea"))) return true;
+  }
+  for (uint64_t i = 0; i < frames_.count(); ++i)
+    if (frames_[i]->page && frames_[i]->page->caret_blinks()) return true;
+  return false;
+}
+
+void Page::set_caret_visible(bool visible) {
+  if (visible != caret_visible_) {
+    caret_visible_ = visible;
+    if (caret_blinks()) caret_dirty_ = true;
+  }
+  for (uint64_t i = 0; i < frames_.count(); ++i)
+    if (frames_[i]->page) frames_[i]->page->set_caret_visible(visible);
 }
 
 const HtmlDocument* Page::frame_document(const dom::Node* iframe, uint32_t* tag) {

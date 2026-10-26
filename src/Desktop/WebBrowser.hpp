@@ -273,6 +273,8 @@ class WebBrowser : public gui::Frame {
   static void on_form_key(void* self, gui::Control&);
   static void on_view_resized(void* self, gui::Control&);
   static void on_timers(void* self, gui::Control&);
+  static void on_caret(void* self, gui::Control&);
+  void restart_caret();
   static void on_visibility(void* self, gui::Control&);
   bool window_shown();
   static void on_toggle_scripts(void* self, gui::Control&);
@@ -398,7 +400,13 @@ class WebBrowser : public gui::Frame {
   bool scripts_enabled_ = true, dark_ = false;
   gui::MenuItem *scripts_item_ = nullptr, *dark_item_ = nullptr, *third_party_item_ = nullptr;
   bool block_third_party_ = false;
-  gui::Handler pointer_handler_, node_handler_, resize_handler_, scroll_handler_, timer_handler_, key_handler_;
+  gui::Handler pointer_handler_, node_handler_, resize_handler_, scroll_handler_, timer_handler_, key_handler_, caret_handler_;
+  // The blinking caret of a focused text field: tick() flips the phase every half period (counted from the last key or click, so it stays
+  // solid while typing) and queues caret_handler_, which tells the page. `caret_blinks_` is kept by the handler thread.
+  static constexpr uint64_t kCaretHalfPeriodMs = 530;
+  bool caret_blinks_ = false;
+  uint8_t caret_phase_ = 0;      // 1 = hidden half
+  uint64_t caret_epoch_ms_ = 0;
   Env env_;
   UniquePointer<browser::Page> live_;
   browser::MediaEnvironment media_;

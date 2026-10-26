@@ -949,6 +949,7 @@ bool Desktop::step(uint64_t uptime_us) {
 
 void Desktop::pump(uint64_t uptime_us) {
   __atomic_store_n(&now_us_, uptime_us, __ATOMIC_RELAXED);
+  window_.tick(uptime_us);
   input_.pump();
   web_browser_.tick(uptime_us);
   toasts_.tick(uptime_us);

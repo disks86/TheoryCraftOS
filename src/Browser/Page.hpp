@@ -221,6 +221,10 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   bool key(FormKey key, char character, uint8_t modifiers);
   // Is a control focused (a key goes to it)? Does the page have any control to step to?
   bool has_focus() const;
+  // Does the focused control (here or in a frame) show a caret, so that a blink asks for a new picture of the page?
+  bool caret_blinks() const;
+  // The blink phase of the caret of the focused field. The next changed()/render() reflect it.
+  void set_caret_visible(bool visible);
   bool has_controls();
   // Is a modal <dialog> open (the rest of the page does not take clicks or keys)?
   bool has_modal() { return modal_dialog() != nullptr; }
@@ -458,6 +462,7 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   PageObjects objects_;
   uint32_t errors_ = 0;
   uint64_t rendered_version_ = 0;
+  bool caret_visible_ = true, caret_dirty_ = false;   // the blink phase, and whether it changed since the last render
   bool loading_ = true, engine_failed_ = false;
   int32_t scroll_request_ = -1;
   String referrer_;

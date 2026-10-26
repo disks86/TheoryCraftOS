@@ -1166,6 +1166,32 @@ class Builder {
       emit_text(b, value, x, y, width, m.height(), b.node, hint ? 0xFF757575u : (s.color ? s.color : kDefaultInk));
       pop_clip();
     }
+    paint_caret(b, n, content, current.view(), hint || value.empty(), type);
+  }
+
+  // The caret of the focused text field: a one pixel bar between two characters (none while text is selected or in the hidden half of its blink).
+  void paint_caret(const Box& b, const dom::Node* n, const IRect& content, StringView text, bool nothing_drawn, StringView type) {
+    const bool textarea = n->is_tag("textarea");
+    if (b.node != options_.focus || options_.caret_hidden || (!n->is_tag("input") && !textarea)) return;
+    if (n->is_tag("input") && !dom::is_text_field(dom::input_type(n))) return;
+    if (dom::is_disabled(n)) return;
+    uint32_t sel_start = 0, sel_end = 0, caret = 0;
+    dom::get_selection(n, &sel_start, &sel_end, &caret);
+    if (sel_start != sel_end) return;
+    const Style& s = b.style;
+    const layout::TextMetrics m = measurer_.metrics(s);
+    const bool password = n->is_tag("input") && type.equals_ignore_case("password");
+    LayoutUnit before;
+    if (!password && !nothing_drawn && caret <= text.size()) before = measurer_.width(s, text.first(caret));   // (a password is not drawn, so the caret stays at the start)
+    Op bar;
+    bar.kind = OpKind::FillRect;
+    bar.rect.x = content.x + 4 + before.round();
+    bar.rect.y = content.y + (content.height - m.height().round()) / 2;
+    bar.rect.width = 1;
+    bar.rect.height = m.height().round();
+    bar.color = s.color ? s.color : kDefaultInk;
+    if (bar.rect.x >= content.x + static_cast<int32_t>(content.width)) return;
+    add(bar);
   }
 
   const BoxTree& tree_;

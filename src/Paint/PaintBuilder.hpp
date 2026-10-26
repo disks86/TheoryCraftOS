@@ -37,6 +37,8 @@ namespace paint {
 struct PaintOptions {
   layout::FontMeasurer* measurer = nullptr;       // required: the fonts of the text
   const browser::StyleSheet* sheet = nullptr;     // gradients, shadows (without it only colours and borders are drawn)
+  uint32_t focus = 0;                             // the node serial of the control that has the focus (0 none): a text field shows its caret
+  bool caret_hidden = false;                      // the caret is in the hidden half of its blink: it is left out (nothing else moves)
   const dom::Document* doc = nullptr;             // finds the links (their text is blue when the page does not say) and form controls
 };
 

@@ -55,6 +55,12 @@ class Window final : public Control {
   // only while it is drawn, not while the finished frame is presented. Call from one thread at a time.
   void render();
   bool dirty() const { return __atomic_load_n(&dirty_, __ATOMIC_ACQUIRE); }
+  // The clock of the window, in microseconds of uptime (any origin): makes carets blink. Call often, from any thread (Desktop::pump does). When a
+  // control that shows a caret has the focus (or is the popup) and the caret's phase changed since the last call, the window is marked dirty.
+  void tick(uint64_t now_us);
+  // Is the caret in the shown half of its blink period? It stays shown for a moment after every key press and click, so it never blinks away
+  // while you type. Without ticks it is always shown.
+  bool caret_visible() const { return __atomic_load_n(&caret_hidden_, __ATOMIC_ACQUIRE) == 0; }
   // Something changed: wakes whoever waits in wait_for_frame(). Safe from any thread.
   void mark_dirty();
   // Waits until the window was marked dirty (or the timeout passed); true if it was. For render loops.
@@ -198,6 +204,10 @@ class Window final : public Control {
   Point cursor_;
   bool cursor_visible_ = false;
   bool dirty_ = true;
+  static constexpr uint64_t kCaretHalfPeriodUs = 530000;
+  uint64_t now_us_ = 0, caret_epoch_us_ = 0;   // (under the UI lock)
+  void restart_caret();
+  uint8_t caret_hidden_ = 0;                    // 1 in the hidden half of the period (atomic: read by the painters)
 
   kernel::RecursiveMutex ui_mutex_;
   kernel::Event frame_event_{true};  // auto-reset: set when the window becomes dirty

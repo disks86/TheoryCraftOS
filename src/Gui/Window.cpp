@@ -70,6 +70,20 @@ void Window::set_renderer(graphics::IRenderer2D& renderer) {
   mark_dirty();
 }
 
+void Window::restart_caret() {
+  caret_epoch_us_ = now_us_;
+  __atomic_store_n(&caret_hidden_, 0, __ATOMIC_RELEASE);
+}
+
+void Window::tick(uint64_t now_us) {
+  UiGuard lock(this);
+  now_us_ = now_us;
+  const uint8_t hidden = ((now_us - caret_epoch_us_) / kCaretHalfPeriodUs) & 1;   // (an epoch in the future cannot happen: it is only ever set to now_us_)
+  if (hidden == __atomic_load_n(&caret_hidden_, __ATOMIC_RELAXED)) return;
+  __atomic_store_n(&caret_hidden_, hidden, __ATOMIC_RELEASE);
+  if ((focus_ && focus_->shows_caret()) || (popup_ && popup_->shows_caret())) mark_dirty();
+}
+
 void Window::mark_dirty() {
   if (!__atomic_exchange_n(&dirty_, true, __ATOMIC_ACQ_REL)) frame_event_.set();
 }
@@ -216,6 +230,7 @@ void Window::mouse_move(int32_t x, int32_t y) {
 void Window::mouse_button(int32_t x, int32_t y, MouseButton button, bool pressed) {
   UiGuard lock(this);
   cursor_ = {x, y};
+  if (pressed) restart_caret();
   mark_dirty();
   Point origin;
   if (!pressed) {
@@ -339,6 +354,7 @@ void Window::mouse_wheel(int32_t x, int32_t y, int32_t delta) {
 
 void Window::key(const KeyArgs& args) {
   UiGuard lock(this);
+  restart_caret();
   mark_dirty();
   if (key_filter_ && key_filter_(key_filter_context_, args)) return;
   if (drag_source_ && args.usage == hardware::key::kEscape) {
