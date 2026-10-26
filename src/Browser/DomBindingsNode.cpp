@@ -174,6 +174,97 @@ Value cached_object(Vm& vm, JsObject* o, const char* name, Value (*make)(DomBind
   return cached;
 }
 
+// --- Live collections ---------------------------------------------------------------------------------------------------------------
+// childNodes, children and the getElementsBy* lists show what the tree holds now: the object answers length and the indexes from a list of the nodes that is made
+// again when the document has changed since (so a loop over it that changes the tree sees the change, and holding on to one works).
+
+enum class LiveKind : uint8_t { ChildNodes, Children, Tag, Class, Name };
+
+JsObject* live_cache(Vm& vm, JsObject* o) {
+  DomBindings::Impl& c = impl(vm);
+  dom::Node* root = static_cast<dom::Node*>(o->host_data);
+  Value cached, stamp, kind_value, arg_value;
+  JsString* cache_key = vm.intern("__lc");
+  const double version = static_cast<double>(root->owner->version());
+  if (vm.get_plain(o, cache_key, &cached) && cached.is_object() && vm.get_plain(o, vm.intern("__lv"), &stamp) && stamp.is_number() && stamp.u.number == version) return cached.as_object();
+  vm.get_plain(o, vm.intern("__lk"), &kind_value);
+  vm.get_plain(o, vm.intern("__la"), &arg_value);
+  const LiveKind kind = static_cast<LiveKind>(static_cast<int>(kind_value.is_number() ? kind_value.u.number : 0));
+  const StringView arg = arg_value.is_string() ? arg_value.as_string()->view() : StringView();
+  JsObject* list = vm.new_array();
+  auto add = [&](dom::Node* n) { vm.array_push(list, node_value(c, n)); };
+  if (kind == LiveKind::ChildNodes || kind == LiveKind::Children) {
+    for (dom::Node* d = root->first_child; d; d = d->next)
+      if (kind == LiveKind::ChildNodes || d->is_element()) add(d);
+  } else {
+    for (dom::Node* d = root->first_child; d; d = dom::next_in_tree(d, root)) {
+      if (!d->is_element()) continue;
+      if (kind == LiveKind::Tag) {
+        if (arg.equals("*") || d->name.view().equals(arg)) add(d);
+      } else if (kind == LiveKind::Name) {
+        StringView v;
+        if (dom::get_attribute(d, "name", &v) && v.equals(arg)) add(d);
+      } else {   // every class of the (space separated) argument
+        bool any = false, all = true;
+        uint64_t i = 0;
+        while (i < arg.size()) {
+          while (i < arg.size() && is_space(arg[i])) ++i;
+          const uint64_t start = i;
+          while (i < arg.size() && !is_space(arg[i])) ++i;
+          if (i > start) {
+            any = true;
+            if (!dom::has_class(d, arg.substr(start, i - start))) all = false;
+          }
+        }
+        if (any && all) add(d);
+      }
+    }
+  }
+  vm.define(o, cache_key, Value::make_object(list), 0);
+  vm.define(o, vm.intern("__lv"), num_value(version), 0);
+  return list;
+}
+
+bool live_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
+  const StringView k = key->view();
+  if (k.empty() || (k.size() > 1 && k[0] == '_' && k[1] == '_')) return false;
+  if (k.equals("length")) {
+    *out = num_value(static_cast<double>(live_cache(vm, o)->length));
+    return true;
+  }
+  if (k[0] >= '0' && k[0] <= '9') {
+    uint64_t index = 0;
+    if (k.parse_uint(&index)) {
+      JsObject* list = live_cache(vm, o);
+      *out = index < list->length ? list->items[index] : Value();
+      return true;
+    }
+  }
+  return false;
+}
+
+void live_keys(Vm& vm, JsObject* o, JsObject* keys) {
+  const uint32_t n = live_cache(vm, o)->length;
+  for (uint32_t i = 0; i < n; ++i) {
+    String index(vm.allocator());
+    index.append_uint(i);
+    vm.array_push(keys, str_value(vm, index.view()));
+  }
+}
+
+const HostClass kLiveClass = {"HTMLCollection", live_get, nullptr, nullptr, live_keys};
+
+Value make_live(DomBindings::Impl& c, dom::Node* root, LiveKind kind, StringView arg, bool html_collection) {
+  Vm& vm = c.vm;
+  Value ctor, proto;
+  JsObject* base = vm.array_proto();
+  if (vm.get_named(Value::make_object(vm.global()), html_collection ? "HTMLCollection" : "NodeList", &ctor) && ctor.is_object() && vm.get_named(ctor, "prototype", &proto) && proto.is_object()) base = proto.as_object();
+  JsObject* o = vm.new_host_object(base, &kLiveClass, root);
+  vm.define(o, vm.intern("__lk"), num_value(static_cast<double>(kind)), 0);
+  vm.define(o, vm.intern("__la"), str_value(vm, arg), 0);
+  return Value::make_object(o);
+}
+
 Value attributes_value(DomBindings::Impl& c, dom::Node* n) {
   Vm& vm = c.vm;
   JsObject* list = vm.new_array(static_cast<uint32_t>(n->attrs.count()));
@@ -232,9 +323,11 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
   if (IS("previousSibling")) { *out = node_value(c, n->prev); return true; }
   if (IS("nextSibling")) { *out = node_value(c, n->next); return true; }
   if (IS("childNodes")) {
-    List<dom::Node*> list(vm.allocator());
-    children_of(n, &list, false);
-    *out = Value::make_object(make_collection(c, list, false));
+    JsString* key = vm.intern("__childNodes");   // (the same object every time)
+    if (!vm.get_plain(o, key, out)) {
+      *out = make_live(c, n, LiveKind::ChildNodes, StringView(), false);
+      vm.define(o, key, *out, 0);
+    }
     return true;
   }
   if (IS("ownerDocument")) { *out = document ? Value::make_null() : node_value(c, n->owner->root()); return true; }
@@ -242,9 +335,11 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
   if (IS("baseURI")) { *out = str_value(vm, c.host.address()); return true; }
   if (container) {
     if (IS("children")) {
-      List<dom::Node*> list(vm.allocator());
-      children_of(n, &list, true);
-      *out = Value::make_object(make_collection(c, list));
+      JsString* key = vm.intern("__children");
+      if (!vm.get_plain(o, key, out)) {
+        *out = make_live(c, n, LiveKind::Children, StringView(), true);
+        vm.define(o, key, *out, 0);
+      }
       return true;
     }
     if (IS("firstElementChild")) { *out = node_value(c, dom::first_element_child(n)); return true; }
@@ -1002,10 +1097,7 @@ NATIVE(node_get_by_tag) {
   if (!n || !arg_text(vm, arg_at(args, argc, 0), &tag)) return false;
   String lowered(vm.allocator());
   for (uint64_t i = 0; i < tag.size(); ++i) lowered.push_back(lower_char(tag[i]));
-  List<dom::Node*> found(vm.allocator());
-  const StringView t = lowered.view();
-  descendants_with(n, &found, has_tag, &t);
-  *result = Value::make_object(make_collection(impl(vm), found));
+  *result = make_live(impl(vm), n, LiveKind::Tag, lowered.view(), true);
   return true;
 }
 
@@ -1013,26 +1105,7 @@ NATIVE(node_get_by_class) {
   dom::Node* n = this_node(vm, self);
   String names(vm.allocator());
   if (!n || !arg_text(vm, arg_at(args, argc, 0), &names)) return false;
-  List<dom::Node*> found(vm.allocator());
-  for (dom::Node* d = n->first_child; d; d = dom::next_in_tree(d, n)) {
-    if (!d->is_element()) continue;
-    bool all = false;
-    uint64_t i = 0;
-    const StringView v = names.view();
-    all = true;
-    bool any = false;
-    while (i < v.size()) {
-      while (i < v.size() && is_space(v[i])) ++i;
-      const uint64_t start = i;
-      while (i < v.size() && !is_space(v[i])) ++i;
-      if (i > start) {
-        any = true;
-        if (!dom::has_class(d, v.substr(start, i - start))) all = false;
-      }
-    }
-    if (any && all) found.push_back(d);
-  }
-  *result = Value::make_object(make_collection(impl(vm), found));
+  *result = make_live(impl(vm), n, LiveKind::Class, names.view(), true);
   return true;
 }
 
@@ -1040,12 +1113,7 @@ NATIVE(node_get_by_name) {
   dom::Node* n = this_node(vm, self);
   String name(vm.allocator());
   if (!n || !arg_text(vm, arg_at(args, argc, 0), &name)) return false;
-  List<dom::Node*> found(vm.allocator());
-  for (dom::Node* d = n->first_child; d; d = dom::next_in_tree(d, n)) {
-    StringView v;
-    if (d->is_element() && dom::get_attribute(d, "name", &v) && v.equals(name.view())) found.push_back(d);
-  }
-  *result = Value::make_object(make_collection(impl(vm), found));
+  *result = make_live(impl(vm), n, LiveKind::Name, name.view(), false);
   return true;
 }
 

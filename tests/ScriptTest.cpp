@@ -234,6 +234,9 @@ static void test_objects() {
 }
 
 static void test_arrays_and_strings() {
+  // Array.prototype methods work on array-likes (a NodeList is one): the copy of the elements is what they read
+  CHECK(is("var al = {length: 3, 0: 'a', 1: 'b', 2: 'c'}; Array.prototype.map.call(al, function (x) { return x + x; }).join() + ':' + Array.prototype.slice.call(al, 1).join('') + ':' + Array.prototype.indexOf.call(al, 'c')", "aa,bb,cc:bc:2"));
+  CHECK(is("var ok = 0; try { Array.prototype.map.call(5, function () {}); } catch (e) { ok = e instanceof TypeError; } String(ok)", "true"));
   // a global that is a getter on the window is read by its bare name too (YouTube defines Polymer that way), and `typeof` sees it
   CHECK(is("var store = {x: 7}; Object.defineProperty(this, 'Acc', {get: function () { return store; }, set: function (v) { store = v; }, configurable: true}); Acc.x + ':' + typeof Acc + ':' + typeof NoSuchGlobal", "7:object:undefined"));
   // errors have a stack (pages' error reporters read its length)

@@ -925,6 +925,7 @@ const char kStdlib[] = R"JSLIB((function (g) {
     else if (Array.isArray(iterable)) it = iterable.values();
     else if (typeof iterable === 'string') it = Array.from(iterable).values();
     else throw new TypeError(String(iterable) + ' is not async iterable');
+    if (Array.isArray(it)) { var arr = it, at = 0; it = { next: function () { return at < arr.length ? { value: arr[at++], done: false } : { value: undefined, done: true }; } }; }   // (the engine's [Symbol.iterator]() answers an array)
     var wrapped = {
       next: function (v) { var r = it.next(v); return Promise.resolve(r.value).then(function (value) { return { value: value, done: r.done }; }); },
       return: function (v) { if (typeof it.return === 'function') it.return(v); return Promise.resolve({ value: v, done: true }); }

@@ -73,9 +73,29 @@ bool this_string(Vm& vm, const Value& self, JsString** out) {
   return vm.to_string(self, out);
 }
 
+// What the Array.prototype methods work on: an array, or an array-like object (a NodeList, a typed array, {length: n, 0: ...}) as a copy of its elements. (The
+// methods that change the array change the copy then; they are meant for arrays.) A native runs without the collector, so the copy needs no root.
 bool this_array(Vm& vm, const Value& self, JsObject** out) {
-  if (!self.is_object() || self.as_object()->okind != ObjKind::Array) return vm.throw_error(ErrorKind::TypeError, "Array.prototype method called on a value that is not an array");
-  *out = self.as_object();
+  if (self.is_object() && self.as_object()->okind == ObjKind::Array) {
+    *out = self.as_object();
+    return true;
+  }
+  Value length_value;
+  double length = 0;
+  if (!self.is_object() || !vm.get_named(self, "length", &length_value) || !length_value.is_number() || !(length_value.u.number >= 0))
+    return vm.throw_error(ErrorKind::TypeError, "Array.prototype method called on a value that is not an array");
+  length = length_value.u.number;
+  if (length > 16777216.0) length = 16777216.0;
+  const uint32_t count = static_cast<uint32_t>(length);
+  JsObject* copy = vm.new_array(count);
+  for (uint32_t i = 0; i < count; ++i) {
+    String key(vm.allocator());
+    key.append_uint(i);
+    Value item;
+    if (!vm.get(self, vm.intern(key.view()), &item)) return false;
+    vm.array_push(copy, item);
+  }
+  *out = copy;
   return true;
 }
 
@@ -702,6 +722,14 @@ NATIVE(array_includes) {
     }
   }
   *result = Value::make_bool(false);
+  return true;
+}
+
+// [Symbol.iterator]() and values() for the array-likes that inherit them (a NodeList): the elements, as an array a for...of walks.
+NATIVE(array_values) {
+  JsObject* a;
+  if (!this_array(vm, self, &a)) return false;
+  *result = Value::make_object(a);
   return true;
 }
 
@@ -2383,6 +2411,8 @@ bool install_builtins(Vm& vm) {
   vm.define_native(ap, "sort", array_sort, 1);
   vm.define_native(ap, "flat", array_flat, 0);
   vm.define_native(ap, "toString", array_to_string, 0);
+  vm.define_native(ap, "@@iterator", array_values, 0);
+  vm.define_native(ap, "values", array_values, 0);
 
   // String
   JsObject* string = make_ctor("String", string_ctor, 1, vm.string_proto());
