@@ -139,6 +139,22 @@ class Matcher {
     *len = n + 1;
     return true;
   }
+  // The character that ends at `at`: its code point and byte length. False at the start of the input.
+  constexpr bool peek_before(uint64_t at, uint32_t* cp, uint32_t* len) const {
+    if (at == 0) return false;
+    uint64_t i = at - 1;
+    if (utf8_)
+      while (i > 0 && at - i < 4 && (static_cast<uint8_t>(input_[i]) & 0xC0) == 0x80) --i;
+    uint32_t c, n;
+    if (peek_char(i, &c, &n) && i + n == at) {
+      *cp = c;
+      *len = n;
+      return true;
+    }
+    *cp = static_cast<uint8_t>(input_[at - 1]);  // not a whole sequence: the last byte alone
+    *len = 1;
+    return true;
+  }
   static constexpr bool is_line_break(uint32_t c) { return c == '\n' || c == '\r' || c == 0x2028 || c == 0x2029; }
   static constexpr bool is_word(uint32_t c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'; }
   constexpr bool word_at(uint64_t at) const { return at < size_ && is_word(static_cast<uint8_t>(input_[at])); }
@@ -203,6 +219,42 @@ class Matcher {
           ok = peek_char(pos, &cp, &n) && in_class(inst, cp) == (inst.op == Op::Class);
           if (ok) { pos += n; ++pc; }
           break;
+        case Op::CharBack:
+          ok = peek_before(pos, &cp, &n) && cp == static_cast<uint32_t>(inst.a);
+          if (ok) { pos -= n; ++pc; }
+          break;
+        case Op::CharFoldBack:
+          ok = peek_before(pos, &cp, &n) && (cp | 0x20) == static_cast<uint32_t>(inst.a) && cp < 0x80;
+          if (ok) { pos -= n; ++pc; }
+          break;
+        case Op::AnyBack:
+          ok = peek_before(pos, &cp, &n) && !is_line_break(cp);
+          if (ok) { pos -= n; ++pc; }
+          break;
+        case Op::AnyAllBack:
+          ok = peek_before(pos, &cp, &n);
+          if (ok) { pos -= n; ++pc; }
+          break;
+        case Op::ClassBack:
+        case Op::ClassNotBack:
+          ok = peek_before(pos, &cp, &n) && in_class(inst, cp) == (inst.op == Op::ClassBack);
+          if (ok) { pos -= n; ++pc; }
+          break;
+        case Op::BackrefBack:
+        case Op::BackrefFoldBack: {
+          const uint64_t s = slots_[inst.a * 2], e = slots_[inst.a * 2 + 1];
+          if (s != kUnset && e != kUnset && e > s) {
+            const uint64_t len = e - s;
+            ok = pos >= len;
+            for (uint64_t i = 0; ok && i < len; ++i) {
+              const uint8_t x = static_cast<uint8_t>(input_[s + i]), y = static_cast<uint8_t>(input_[pos - len + i]);
+              ok = x == y || (inst.op == Op::BackrefFoldBack && x < 0x80 && y < 0x80 && is_letter(x) && (x | 0x20) == (y | 0x20));
+            }
+            if (ok) pos -= len;
+          }
+          ++pc;
+          break;
+        }
         case Op::Split:
           if (!push(0, pc + static_cast<uint32_t>(inst.b), pos)) return Run::StackFull;
           pc += static_cast<uint32_t>(inst.a);

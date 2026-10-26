@@ -91,6 +91,7 @@ bool make_regexp(Vm& vm, StringView source, StringView flags, Value* out) {
       case 'i': f = f | regex::Flags::IgnoreCase; break;
       case 'm': f = f | regex::Flags::Multiline; break;
       case 's': f = f | regex::Flags::DotAll; break;
+      case 'u': case 'v': f = f | regex::Flags::Unicode; break;
       case 'g': c->global = true; break;
       case 'y': c->sticky = true; break;
       default: break;

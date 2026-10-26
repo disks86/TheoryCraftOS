@@ -46,6 +46,8 @@ enum class Opc : uint8_t {
   ForInStart, ForOfStart, IterNext,
   // exceptions: TryBegin (a = the handler) starts catching; TryEnd stops; the handler is entered with the exception on the stack
   TryBegin, TryEnd,
+  // at the start of a catch clause: if the exception on the stack is the completion of a generator's return(), jump to a (the finally block, then the throw goes on)
+  CheckReturn,
   // async functions: [value] -> (the function is suspended until the value is settled; then the result, or a throw, takes the place of the value)
   Await,
   // generators: [value] -> (the generator is suspended; the value goes to whoever called next(); the argument of the next next() takes its place)

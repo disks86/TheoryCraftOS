@@ -5,7 +5,7 @@
 
 For each ported function it takes the ordered list of register names (mm...) and register field names (REG__FIELD_MASK / __SHIFT) in the kernel function and
 in the port, and compares them. A port that drops, adds, reorders or mistypes a register access fails. The values written are not compared (they are checked by
-tests/AmdVcn1Test.cpp). Not ported on purpose: the encode rings of uvd_v6_0_start (uvd_v6_0_enc_support), the hardware clock gating that is compiled out, and hw_init's clock and ring tests.
+tests/AmdVcn1Test.cpp). Also compares the ring test and the ring commands of a job in AmdUvd6Ring.cpp. Not ported on purpose: the encode rings of uvd_v6_0_start (uvd_v6_0_enc_support), the hardware clock gating that is compiled out, and hw_init's clock and ring tests.
 """
 import os
 import re
@@ -77,6 +77,17 @@ def main():
             if a != b:
                 print(f'    first difference at {i}: kernel {a}, port {b}')
                 break
+    # The ring (AmdUvd6Ring.cpp): the ring test, and the ring commands of a job (the driver's emit_ib followed by emit_fence).
+    ring = open(os.path.join(here, '..', 'src/Hardware/VideoCodec/AMD/AmdUvd6Ring.cpp')).read()
+    k = tokens(body(kernel, r'static int uvd_v6_0_ring_test_ring\([^)]*\)\s*\{'))
+    p = tokens(body(ring, r'bool AmdUvd6Ring::test\([^)]*\)\s*\{'))
+    print(f'{"ring test":28s} kernel {len(k):3d}  port {len(p):3d}  {"same" if k == p else "DIFFERENT"}')
+    failed = failed or k != p
+    k = tokens(body(kernel, r'static void uvd_v6_0_ring_emit_ib\([^)]*\)\s*\{')) + tokens(body(kernel, r'static void uvd_v6_0_ring_emit_fence\([^)]*\)\s*\{'))
+    submit = body(ring, r'AmdUvd6Ring::Result AmdUvd6Ring::submit\([^)]*\)\s*\{')
+    p = tokens(submit[submit.index('// The ring commands, in the driver'):submit.index('commit();')])
+    print(f'{"ring commands (ib, fence)":28s} kernel {len(k):3d}  port {len(p):3d}  {"same" if k == p else "DIFFERENT"}')
+    failed = failed or k != p
     sys.exit(1 if failed else 0)
 
 

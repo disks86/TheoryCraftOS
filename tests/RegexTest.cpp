@@ -57,7 +57,11 @@ static_assert(try_compile<"a**">().error() == Error::NothingToRepeat);
 static_assert(try_compile<"[z-a]">().error() == Error::BadClassRange);
 static_assert(try_compile<"a{3,2}">().error() == Error::BadRepeat);
 static_assert(try_compile<"\\2(a)">().error() == Error::BadBackreference);
-static_assert(try_compile<"(?<=a)b">().error() == Error::Unsupported);
+static_assert("(?<=a)b"_re.contains("ab") && !"(?<=a)b"_re.contains("cb") && "(?<!a)b"_re.contains("cb") && !"(?<!a)b"_re.contains("ab"));   // lookbehind
+static_assert(compile<"(?<=foo|ba)x">().contains("bax") && compile<"(?<=\\d{2})x">().contains("12x") && !compile<"(?<=\\d{2})x">().contains("1x"));
+static_assert(compile<"\\p{Lu}\\p{Ll}+", Flags::Utf8 | Flags::Unicode>().matches("Hello") && !compile<"\\p{Lu}", Flags::Utf8 | Flags::Unicode>().contains("hello"));
+static_assert(compile<"[\\P{L}]", Flags::Utf8 | Flags::Unicode>().matches("1") && !compile<"[\\P{L}]", Flags::Utf8 | Flags::Unicode>().matches("a"));
+static_assert(try_compile<"\\p{Nope}", Flags::Utf8 | Flags::Unicode>().error() == Error::BadProperty);
 static_assert(compile<"(?<year>\\d+)-(?<month>\\d+)">().group_index("month") == 2);
 static_assert(compile<"(a)(b)(c)">().group_count() == 4);
 
@@ -235,7 +239,8 @@ int main() {
   CHECK(error_of(a, "\\q") == Error::BadEscape && error_of(a, "\\xZ1") == Error::BadEscape && error_of(a, "\\u12") == Error::BadEscape && error_of(a, "\\00") == Error::BadEscape);
   CHECK(error_of(a, "(?x)") == Error::BadGroup && error_of(a, "(?<1a>x)") == Error::BadGroupName && error_of(a, "(?<a>x)(?<a>y)") == Error::DuplicateGroupName);
   CHECK(error_of(a, "\\1") == Error::BadBackreference && error_of(a, "(a)\\2") == Error::BadBackreference && error_of(a, "\\k<n>") == Error::BadBackreference);
-  CHECK(error_of(a, "(?<=a)") == Error::Unsupported && error_of(a, "(?<!a)") == Error::Unsupported);
+  CHECK(error_of(a, "(?<=a)") == Error::None && error_of(a, "(?<!a)") == Error::None);   // (lookbehind compiles)
+  CHECK(found(a, "(?<=(\\d)(\\d))x", "12x", "x", 0));
   CHECK(error_of(a, "[b-a]") == Error::BadClassRange && full(a, "[\\d-z]+", "1-z"));  // after a shorthand the dash is a plain character
   {
     String many(a);

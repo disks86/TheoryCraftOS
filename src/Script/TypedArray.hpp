@@ -26,7 +26,7 @@
 
 namespace script {
 
-enum class ArrayKind : uint8_t { Int8, Uint8, Uint8Clamped, Int16, Uint16, Int32, Uint32, Float32, Float64 };
+enum class ArrayKind : uint8_t { Int8, Uint8, Uint8Clamped, Int16, Uint16, Int32, Uint32, Float32, Float64, BigInt64, BigUint64 };
 
 bool install_typed_arrays(Vm& vm);
 
@@ -44,6 +44,8 @@ void detach_array_buffer(JsObject* buffer);
 
 // What the interpreter does with `array[index]`.
 bool typed_array_get(JsObject* array, uint32_t index, Value* out);
+// The same for any kind (a BigInt is made for BigInt64Array / BigUint64Array); false only with an exception pending.
+bool typed_array_get_value(Vm& vm, JsObject* array, uint32_t index, Value* out);
 bool typed_array_put(Vm& vm, JsObject* array, uint32_t index, const Value& value);
 void typed_array_describe(Vm& vm, JsObject* array, String* out, uint32_t depth);
 

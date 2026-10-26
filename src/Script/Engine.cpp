@@ -103,6 +103,213 @@ const char kPrelude[] =
 const char kCollections[] = R"JSLIB((function (g) {
   var ITER = Symbol.iterator;
   var def = function (o, k, v) { Object.defineProperty(o, k, { value: v, writable: true }); };
+
+  // ------------------------------------------------------------------------------------------------------------ Iterator and its helpers
+  function Iterator() {
+    if (new.target === undefined || new.target === Iterator) throw new TypeError('Abstract class Iterator not directly constructable');
+  }
+  var IP = Iterator.prototype;
+  def(IP, ITER, function () { return this; });
+  Object.defineProperty(IP, Symbol.toStringTag, { value: 'Iterator', configurable: true });
+  def(g, 'Iterator', Iterator);
+  // the iterators of arrays, typed arrays and strings: objects that walk a list
+  var ArrayIteratorProto = Object.create(IP);
+  def(ArrayIteratorProto, 'next', function () {
+    var list = this.__list;
+    if (list === undefined) return { value: undefined, done: true };
+    var i = this.__at;
+    if (i >= list.length) { this.__list = undefined; return { value: undefined, done: true }; }
+    this.__at = i + 1;
+    return { value: this.__kind === 0 ? i : this.__kind === 1 ? list[i] : [i, list[i]], done: false };
+  });
+  Object.defineProperty(ArrayIteratorProto, Symbol.toStringTag, { value: 'Array Iterator', configurable: true });
+  def(g, '__array_iterator', function (list, kind) {
+    var it = Object.create(ArrayIteratorProto);
+    Object.defineProperty(it, '__list', { value: list, writable: true });
+    Object.defineProperty(it, '__at', { value: 0, writable: true });
+    Object.defineProperty(it, '__kind', { value: kind });
+    return it;
+  });
+  // the generator objects (and so the iterators of arrays and typed arrays) are iterators
+  (function () {
+    var generator = (function* () { })();
+    Object.setPrototypeOf(Object.getPrototypeOf(Object.getPrototypeOf(generator)), IP);
+  }());
+  function direct(o) {
+    if (o === null || (typeof o !== 'object' && typeof o !== 'function')) throw new TypeError('Iterator helper called on a non-object');
+    return { it: o, next: o.next };
+  }
+  function step(rec) {
+    var r = rec.next.call(rec.it);
+    if (r === null || (typeof r !== 'object' && typeof r !== 'function')) throw new TypeError('Iterator result ' + r + ' is not an object');
+    return r;
+  }
+  function close(rec) {
+    var ret = rec.it.return;
+    if (ret !== undefined && ret !== null) ret.call(rec.it);
+  }
+  function callable(fn) { if (typeof fn !== 'function') throw new TypeError(String(fn) + ' is not a function'); }
+  function count(n, what) {
+    var v = Number(n);
+    if (v !== v) throw new RangeError(String(n) + ' must be positive');
+    v = Math.trunc(v);
+    if (v < 0) throw new RangeError(String(n) + ' must be positive');
+    return v;
+  }
+  // an iterator helper: a generator that closes the underlying iterator when it is stopped early
+  def(IP, 'map', function (fn) {
+    var rec = (callable(fn), direct(this));
+    return (function* () {
+      var done = false, i = 0;
+      try {
+        for (;;) {
+          var r = step(rec);
+          if (r.done) { done = true; return; }
+          var v;
+          try { v = fn(r.value, i++); } catch (e) { done = true; close(rec); throw e; }
+          yield v;
+        }
+      } finally { if (!done) close(rec); }
+    }());
+  });
+  def(IP, 'filter', function (fn) {
+    var rec = (callable(fn), direct(this));
+    return (function* () {
+      var done = false, i = 0;
+      try {
+        for (;;) {
+          var r = step(rec);
+          if (r.done) { done = true; return; }
+          var keep;
+          try { keep = fn(r.value, i++); } catch (e) { done = true; close(rec); throw e; }
+          if (keep) yield r.value;
+        }
+      } finally { if (!done) close(rec); }
+    }());
+  });
+  def(IP, 'take', function (limit) {
+    var n = count(limit), rec = direct(this);
+    return (function* () {
+      var done = false, left = n;
+      try {
+        for (;;) {
+          if (left === 0) return;
+          left--;
+          var r = step(rec);
+          if (r.done) { done = true; return; }
+          yield r.value;
+        }
+      } finally { if (!done) close(rec); }
+    }());
+  });
+  def(IP, 'drop', function (limit) {
+    var n = count(limit), rec = direct(this);
+    return (function* () {
+      var done = false, left = n;
+      try {
+        while (left > 0) { left--; var skipped = step(rec); if (skipped.done) { done = true; return; } }
+        for (;;) {
+          var r = step(rec);
+          if (r.done) { done = true; return; }
+          yield r.value;
+        }
+      } finally { if (!done) close(rec); }
+    }());
+  });
+  def(IP, 'flatMap', function (fn) {
+    var rec = (callable(fn), direct(this));
+    return (function* () {
+      var done = false, i = 0;
+      try {
+        for (;;) {
+          var r = step(rec);
+          if (r.done) { done = true; return; }
+          var inner;
+          try {
+            var mapped = fn(r.value, i++);
+            if (mapped === null || typeof mapped !== 'object' && typeof mapped !== 'function') throw new TypeError('flatMap callback must return an iterable object');
+            var method = mapped[ITER];
+            inner = direct(method === undefined || method === null ? mapped : method.call(mapped));
+          } catch (e) { done = true; close(rec); throw e; }
+          var finished = false;
+          try {
+            for (;;) {
+              var x = step(inner);
+              if (x.done) { finished = true; break; }
+              yield x.value;
+            }
+          } finally { if (!finished) { try { close(inner); } finally { } } }
+        }
+      } finally { if (!done) close(rec); }
+    }());
+  });
+  def(IP, 'reduce', function (fn) {
+    callable(fn);
+    var rec = direct(this), acc, i = 0;
+    if (arguments.length > 1) acc = arguments[1];
+    else {
+      var first = step(rec);
+      if (first.done) throw new TypeError('Reduce of empty iterator with no initial value');
+      acc = first.value; i = 1;
+    }
+    for (;;) {
+      var r = step(rec);
+      if (r.done) return acc;
+      try { acc = fn(acc, r.value, i++); } catch (e) { close(rec); throw e; }
+    }
+  });
+  def(IP, 'toArray', function () {
+    var rec = direct(this), out = [];
+    for (;;) { var r = step(rec); if (r.done) return out; out.push(r.value); }
+  });
+  def(IP, 'forEach', function (fn) {
+    callable(fn);
+    var rec = direct(this), i = 0;
+    for (;;) {
+      var r = step(rec);
+      if (r.done) return undefined;
+      try { fn(r.value, i++); } catch (e) { close(rec); throw e; }
+    }
+  });
+  function search(name, stopOn, found, notFound) {
+    def(IP, name, function (fn) {
+      callable(fn);
+      var rec = direct(this), i = 0;
+      for (;;) {
+        var r = step(rec);
+        if (r.done) return notFound;
+        var hit;
+        try { hit = !!fn(r.value, i++); } catch (e) { close(rec); throw e; }
+        if (hit === stopOn) { close(rec); return found(r.value); }
+      }
+    });
+  }
+  search('some', true, function () { return true; }, false);
+  search('every', false, function () { return false; }, true);
+  search('find', true, function (v) { return v; }, undefined);
+  ['map', 'filter', 'take', 'drop', 'flatMap', 'reduce', 'toArray', 'forEach', 'some', 'every', 'find'].forEach(function (k) { Object.defineProperty(IP[k], 'name', { value: k }); });
+  var WrapProto = Object.create(IP);
+  def(WrapProto, 'next', function () { return this.__rec.next.call(this.__rec.it); });
+  def(WrapProto, 'return', function () {
+    var ret = this.__rec.it.return;
+    if (ret === undefined || ret === null) return { value: undefined, done: true };
+    return ret.call(this.__rec.it);
+  });
+  def(Iterator, 'from', function (o) {
+    if (o === null || (typeof o !== 'object' && typeof o !== 'function' && typeof o !== 'string')) throw new TypeError(String(o) + ' is not an object');
+    var method = o[ITER], it;
+    if (method === undefined || method === null) {
+      if (typeof o === 'string') throw new TypeError('not iterable');
+      it = o;
+    } else {
+      it = method.call(o);
+    }
+    if (it === null || (typeof it !== 'object' && typeof it !== 'function')) throw new TypeError('Iterator is not an object');
+    for (var p = Object.getPrototypeOf(it); p; p = Object.getPrototypeOf(p)) if (p === IP) return it;
+    var wrapper = Object.create(WrapProto);
+    Object.defineProperty(wrapper, '__rec', { value: direct(it) });
+    return wrapper;
+  });
   var nextId = 1;
   // The key of a value in a Map or Set: primitives by type and text, objects by an id they carry (SameValueZero: NaN is NaN, -0 is 0).
   function keyOf(map, value) {
@@ -198,6 +405,7 @@ const char kCollections[] = R"JSLIB((function (g) {
         return { value: undefined, done: true };
       }
     };
+    Object.setPrototypeOf(result, IP);
     def(result, ITER, function () { return this; });
     def(result, 'toString', function () { return '[object ' + name + ']'; });
     return result;
@@ -404,7 +612,7 @@ const char kCollections[] = R"JSLIB((function (g) {
     def(T, 'with', function (index, value) { var out = this.slice(); index = Math.trunc(index) || 0; if (index < 0) index += this.length; if (index < 0 || index >= this.length) throw new RangeError('Invalid typed array index'); out[index] = value; return out; });
     def(T, 'toReversed', function () { return this.slice().reverse(); });
     def(T, 'toSorted', function (compare) { return this.slice().sort(compare); });
-    function* walk(a, kind) { for (var i = 0; i < a.length; i++) yield kind === 0 ? i : kind === 1 ? a[i] : [i, a[i]]; }
+    function walk(a, kind) { return g.__array_iterator(a, kind); }
     def(T, 'keys', function () { return walk(this, 0); });
     def(T, 'values', function () { return walk(this, 1); });
     def(T, 'entries', function () { return walk(this, 2); });
