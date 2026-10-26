@@ -15,6 +15,7 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
+#include "Process/AddressSpace.hpp"
 #include "Process/Process.hpp"
 #include "Process/Syscall.hpp"
 
@@ -25,10 +26,10 @@ namespace process {
 
 namespace {
 
-constexpr int64_t kEbadf = 9, kEfault = 14, kEinval = 22, kEnosys = 38;
+constexpr int64_t kEnomem = 12, kEnodev = 19, kEbadf = 9, kEfault = 14, kEinval = 22, kEnosys = 38;
 constexpr uint64_t kIovMax = 1024, kMaxIoBytes = 0x7FFFF000u;      // what Linux allows in one read or write
 
-enum class Call : uint8_t { None, Read, Write, Writev, Close, Getpid, Gettid, Getuid, Getgid, Exit, ExitGroup, Uname, ClockGettime, Nanosleep, SchedYield, SetTidAddress };
+enum class Call : uint8_t { None, Read, Write, Writev, Close, Getpid, Gettid, Getuid, Getgid, Exit, ExitGroup, Uname, ClockGettime, Nanosleep, SchedYield, SetTidAddress, Brk, Mmap, Munmap, Mprotect };
 
 struct NumberEntry {
   uint16_t x86_64, generic;
@@ -40,6 +41,7 @@ constexpr NumberEntry kNumbers[] = {
     {39, 172, Call::Getpid},       {186, 178, Call::Gettid},    {102, 174, Call::Getuid},     {104, 176, Call::Getgid},
     {60, 93, Call::Exit},          {231, 94, Call::ExitGroup},  {63, 160, Call::Uname},       {228, 113, Call::ClockGettime},
     {35, 101, Call::Nanosleep},    {24, 124, Call::SchedYield}, {218, 96, Call::SetTidAddress},
+    {12, 214, Call::Brk},          {9, 222, Call::Mmap},        {11, 215, Call::Munmap},      {10, 226, Call::Mprotect},
 };
 
 uint64_t error(int64_t errno_value) { return uint64_t(-errno_value); }
@@ -97,6 +99,65 @@ uint64_t do_writev(Process& process, uint64_t fd, uint64_t iov, uint64_t count) 
   return total;
 }
 
+constexpr uint64_t kMapShared = 0x1, kMapPrivate = 0x2, kMapFixed = 0x10, kMapAnonymous = 0x20;
+constexpr uint64_t kMapOtherAccepted = 0x100 | 0x800 | 0x4000 | 0x8000 | 0x10000 | 0x40000;      // GROWSDOWN, DENYWRITE, NORESERVE, POPULATE, NONBLOCK, STACK/HUGETLB: hints we may ignore
+
+bool valid_protection(uint64_t prot) { return (prot & ~uint64_t{kProtRead | kProtWrite | kProtExecute}) == 0; }
+
+// brk(addr): moves the program break within the heap region right after the image. Like Linux, a request it cannot meet returns the unchanged break.
+uint64_t do_brk(Process& process, uint64_t request) {
+  AddressSpace* space = process.address_space();
+  if (!space) return error(kEnomem);
+  const uint64_t start = process.heap_start(), current = process.heap_break();
+  if (request < start) return current;      // includes 0: "where is it?"
+  uint64_t old_end = 0, new_end = 0;
+  if (!AddressSpace::round_up(current, &old_end) || !AddressSpace::round_up(request, &new_end)) return current;
+  if (new_end == old_end) { process.set_heap_break(request); return request; }
+  const uint64_t old_size = old_end - start, new_size = new_end - start;
+  bool ok;
+  if (old_size == 0) ok = space->map(start, new_size, kProtRead | kProtWrite);
+  else ok = space->resize(start, new_size);
+  if (!ok) return current;
+  process.set_heap_break(request);
+  return request;
+}
+
+uint64_t do_mmap(Process& process, uint64_t address, uint64_t length, uint64_t prot, uint64_t flags, uint64_t fd) {
+  AddressSpace* space = process.address_space();
+  if (!space) return error(kEnomem);
+  (void)fd;
+  uint64_t size = 0;
+  if (length == 0 || !AddressSpace::round_up(length, &size) || !valid_protection(prot)) return error(kEinval);
+  if (flags & ~(kMapShared | kMapPrivate | kMapFixed | kMapAnonymous | kMapOtherAccepted)) return error(kEinval);
+  if (((flags & kMapShared) != 0) == ((flags & kMapPrivate) != 0)) return error(kEinval);      // exactly one of the two
+  if (!(flags & kMapAnonymous)) return error(kEnodev);      // files cannot be mapped yet
+  uint64_t where = 0;
+  if (flags & kMapFixed) {
+    if (address % AddressSpace::kPageSize != 0) return error(kEinval);
+    if (!space->unmap(address, size) || !space->map(address, size, uint8_t(prot))) return error(kEnomem);
+    return address;
+  }
+  if (!space->find_free(size, address ? address : process.mmap_cursor(), &where)) return error(kEnomem);
+  if (!space->map(where, size, uint8_t(prot))) return error(kEnomem);
+  if (!address) process.set_mmap_cursor(where + size);
+  return where;
+}
+
+uint64_t do_munmap(Process& process, uint64_t address, uint64_t length) {
+  AddressSpace* space = process.address_space();
+  if (!space) return error(kEnomem);
+  if (length == 0 || address % AddressSpace::kPageSize != 0) return error(kEinval);
+  return space->unmap(address, length) ? 0 : error(kEinval);
+}
+
+uint64_t do_mprotect(Process& process, uint64_t address, uint64_t length, uint64_t prot) {
+  AddressSpace* space = process.address_space();
+  if (!space) return error(kEnomem);
+  if (address % AddressSpace::kPageSize != 0 || !valid_protection(prot)) return error(kEinval);
+  if (length == 0) return 0;
+  return space->protect(address, length, uint8_t(prot)) ? 0 : error(kEnomem);      // part of the range is not mapped
+}
+
 }  // namespace
 
 class LinuxSyscalls final : public ISyscallInterface {
@@ -123,6 +184,10 @@ class LinuxSyscalls final : public ISyscallInterface {
       case Call::Uname: return write_uname(process, a[0]);
       case Call::ClockGettime: return clock_gettime(process, a[0], a[1]);
       case Call::Nanosleep: return nanosleep(process, a[0], a[1]);
+      case Call::Brk: return do_brk(process, a[0]);
+      case Call::Mmap: return do_mmap(process, a[0], a[1], a[2], a[3], a[4]);
+      case Call::Munmap: return do_munmap(process, a[0], a[1]);
+      case Call::Mprotect: return do_mprotect(process, a[0], a[1], a[2]);
       default: return error(kEnosys);
     }
   }

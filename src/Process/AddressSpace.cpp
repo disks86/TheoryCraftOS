@@ -41,44 +41,89 @@ bool AddressSpace::map(uint64_t address, uint64_t size, uint8_t protection) {
   region->base = address;
   region->size = rounded;
   region->protection = protection;
+  region->allocation = next_allocation_;
   if (!region->data.put_zeros(rounded)) return false;
   if (!regions_.insert(index, static_cast<UniquePointer<Region>&&>(region))) return false;
   mapped_bytes_ += rounded;
+  ++next_allocation_;
   return true;
 }
 
-bool AddressSpace::whole_regions(uint64_t address, uint64_t size, uint64_t* first, uint64_t* last) const {
+bool AddressSpace::prepare_range(uint64_t address, uint64_t size, uint64_t* end) const {
   uint64_t rounded = 0;
-  if (size == 0 || address % kPageSize != 0 || !round_up(size, &rounded) || rounded > kUserTop || address > kUserTop - rounded) return false;
-  const uint64_t end = address + rounded;
-  uint64_t index = first_ending_after(address);
-  if (index >= regions_.count() || regions_[index]->base != address) return false;
-  *first = index;
-  uint64_t cursor = address;
-  while (cursor < end) {
-    if (index >= regions_.count() || regions_[index]->base != cursor) return false;      // a gap
-    cursor += regions_[index]->size;
-    ++index;
-  }
-  if (cursor != end) return false;      // the range ends inside a region
-  *last = index;
+  if (size == 0 || address % kPageSize != 0 || !round_up(size, &rounded) || address >= kUserTop || rounded > kUserTop - address) return false;
+  *end = address + rounded;
+  return true;
+}
+
+bool AddressSpace::split_at(uint64_t address) {
+  const uint64_t i = first_ending_after(address);
+  if (i >= regions_.count() || regions_[i]->base >= address) return true;      // already a boundary (or unmapped)
+  Region& r = *regions_[i];
+  const uint64_t offset = address - r.base;
+  UniquePointer<Region> tail = UniquePointer<Region>::make(allocator_, allocator_);
+  if (!tail) return false;
+  tail->base = address;
+  tail->size = r.size - offset;
+  tail->protection = r.protection;
+  tail->allocation = r.allocation;
+  if (!tail->data.append(r.data.view().subview(offset))) return false;
+  if (!regions_.insert(i + 1, static_cast<UniquePointer<Region>&&>(tail))) return false;
+  r.size = offset;
+  r.data.truncate(offset);
   return true;
 }
 
 bool AddressSpace::unmap(uint64_t address, uint64_t size) {
-  uint64_t first = 0, last = 0;
-  if (!whole_regions(address, size, &first, &last)) return false;
-  for (uint64_t i = last; i > first; --i) {
-    mapped_bytes_ -= regions_[i - 1]->size;
-    regions_.remove_at(i - 1);
+  uint64_t end = 0;
+  if (!prepare_range(address, size, &end)) return false;
+  if (!split_at(address) || !split_at(end)) return false;
+  const uint64_t first = first_ending_after(address);
+  while (first < regions_.count() && regions_[first]->base < end) {
+    mapped_bytes_ -= regions_[first]->size;
+    regions_.remove_at(first);
   }
   return true;
 }
 
 bool AddressSpace::protect(uint64_t address, uint64_t size, uint8_t protection) {
-  uint64_t first = 0, last = 0;
-  if (!whole_regions(address, size, &first, &last)) return false;
-  for (uint64_t i = first; i < last; ++i) regions_[i]->protection = protection;
+  uint64_t end = 0;
+  if (!prepare_range(address, size, &end) || !check(address, end - address, 0)) return false;
+  if (!split_at(address) || !split_at(end)) return false;
+  for (uint64_t i = first_ending_after(address); i < regions_.count() && regions_[i]->base < end; ++i) regions_[i]->protection = protection;
+  return true;
+}
+
+bool AddressSpace::resize(uint64_t base, uint64_t size) {
+  const uint64_t i = first_ending_after(base);
+  if (base % kPageSize != 0 || i >= regions_.count() || regions_[i]->base != base) return false;
+  Region& r = *regions_[i];
+  uint64_t rounded = 0;
+  if (!round_up(size, &rounded)) return false;
+  if (rounded == 0) {
+    mapped_bytes_ -= r.size;
+    regions_.remove_at(i);
+    return true;
+  }
+  if (rounded > r.size) {
+    const uint64_t extra = rounded - r.size;
+    if (base >= kUserTop || rounded > kUserTop - base || extra > max_bytes_ || mapped_bytes_ > max_bytes_ - extra) return false;
+    if (i + 1 < regions_.count() && regions_[i + 1]->base < base + rounded) return false;
+    if (!r.data.put_zeros(extra)) return false;
+    mapped_bytes_ += extra;
+  } else {
+    mapped_bytes_ -= r.size - rounded;
+    r.data.truncate(rounded);
+  }
+  r.size = rounded;
+  return true;
+}
+
+bool AddressSpace::region_extent(uint64_t address, uint64_t* base, uint64_t* size) const {
+  const uint64_t i = first_ending_after(address);
+  if (i >= regions_.count() || regions_[i]->base > address) return false;
+  *base = regions_[i]->base;
+  *size = regions_[i]->size;
   return true;
 }
 
@@ -108,6 +153,18 @@ bool AddressSpace::check(uint64_t address, uint64_t size, uint8_t protection) co
     if (r.base > cursor || (r.protection & protection) != protection) return false;
     cursor = r.base + r.size;
   }
+  return true;
+}
+
+bool AddressSpace::allocation_extent(uint64_t address, uint64_t* base, uint64_t* size) const {
+  uint64_t i = first_ending_after(address);
+  if (i >= regions_.count() || regions_[i]->base > address) return false;
+  const uint64_t id = regions_[i]->allocation;
+  uint64_t first = i, last = i;
+  while (first > 0 && regions_[first - 1]->allocation == id && regions_[first - 1]->base + regions_[first - 1]->size == regions_[first]->base) --first;
+  while (last + 1 < regions_.count() && regions_[last + 1]->allocation == id && regions_[last]->base + regions_[last]->size == regions_[last + 1]->base) ++last;
+  *base = regions_[first]->base;
+  *size = regions_[last]->base + regions_[last]->size - *base;
   return true;
 }
 
