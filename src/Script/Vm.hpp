@@ -196,6 +196,11 @@ class Vm {
   JsObject* number_proto() { return number_proto_; }
   JsObject* boolean_proto() { return boolean_proto_; }
   JsObject* symbol_proto() { return symbol_proto_; }
+  // The wrapper object of a primitive (new String('a'), Object(1), a sloppy function's `this`), and the primitive of a wrapper (any other value is itself).
+  JsObject* box(const Value& primitive);
+  static Value primitive_of(const Value& v) { return v.is_object() && v.as_object()->okind == ObjKind::Primitive ? v.as_object()->bound_this : v; }
+  // Turns the fresh object `new String(...)` made into the wrapper of `primitive` (when `self` is such an object); false for a plain call.
+  bool become_wrapper(const Value& self, JsObject* proto, const Value& primitive);
   static bool is_symbol(const Value& v) { return v.tag == Tag::String && v.as_string()->symbol; }
   // A new symbol (not interned: it is its own property key). The well-known ones are interned "@@iterator" and the like, flagged by the builtins.
   JsString* new_symbol(const Value& description);

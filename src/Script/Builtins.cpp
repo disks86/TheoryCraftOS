@@ -112,7 +112,14 @@ bool need_function(Vm& vm, const Value& v) {
 
 NATIVE(object_ctor) {
   const Value v = arg_at(args, argc, 0);
-  *result = v.is_object() ? v : Value::make_object(vm.new_plain());
+  if (v.is_object() && !Vm::is_bigint(v)) {
+    *result = v;
+  } else if (v.is_nullish()) {
+    *result = Value::make_object(vm.new_plain());
+  } else {   // Object(1), Object('a'): the wrapper object
+    JsObject* boxed = vm.box(v);
+    *result = Value::make_object(boxed ? boxed : vm.new_plain());
+  }
   return true;
 }
 
@@ -630,6 +637,11 @@ NATIVE(object_to_string) {
       case ObjKind::Error: name = "[object Error]"; break;
       case ObjKind::RegExp: name = "[object RegExp]"; break;
       case ObjKind::Promise: name = "[object Promise]"; break;
+      case ObjKind::Primitive: {
+        const Value p = self.as_object()->bound_this;
+        name = p.is_number() ? "[object Number]" : p.is_bool() ? "[object Boolean]" : Vm::is_symbol(p) ? "[object Symbol]" : p.is_string() ? "[object String]" : "[object BigInt]";
+        break;
+      }
       default: break;
     }
   }
@@ -1139,14 +1151,14 @@ NATIVE(array_flat) {
 // --- String -------------------------------------------------------------------------------------------------------
 
 NATIVE(string_ctor) {
-  if (argc == 0) {
-    *result = Value::make_string(vm.empty_string());
-    return true;
+  JsString* s = vm.empty_string();
+  if (argc > 0) {
+    const bool constructing = self.is_object() && self.as_object()->okind == ObjKind::Plain && self.as_object()->prop_count == 0;
+    if (Vm::is_symbol(args[0]) && !constructing) s = vm.symbol_descriptive_string(args[0].as_string());   // String(sym) is allowed, unlike sym + ''
+    else if (!vm.to_string(args[0], &s)) return false;
   }
-  JsString* s;
-  if (Vm::is_symbol(args[0])) s = vm.symbol_descriptive_string(args[0].as_string());   // String(sym) is allowed, unlike sym + ''
-  else if (!vm.to_string(args[0], &s)) return false;
   *result = Value::make_string(s);
+  vm.become_wrapper(self, vm.string_proto(), *result);   // new String('a')
   return true;
 }
 
@@ -1638,6 +1650,10 @@ NATIVE(string_locale_compare) {
 }
 
 NATIVE(string_to_string) {
+  if (Vm::primitive_of(self).is_string()) {
+    *result = Vm::primitive_of(self);
+    return true;
+  }
   if (!self.is_string()) return vm.throw_error(ErrorKind::TypeError, "String.prototype.toString requires a string");
   *result = self;
   return true;
@@ -1649,12 +1665,14 @@ NATIVE(number_ctor) {
   double d = 0;
   if (argc > 0 && !vm.to_number(args[0], &d)) return false;
   *result = num_value(d);
+  vm.become_wrapper(self, vm.number_proto(), *result);   // new Number(1)
   return true;
 }
 
 bool this_number(Vm& vm, const Value& self, double* out) {
-  if (!self.is_number()) return vm.throw_error(ErrorKind::TypeError, "Number.prototype method called on a value that is not a number");
-  *out = self.u.number;
+  const Value v = Vm::primitive_of(self);
+  if (!v.is_number()) return vm.throw_error(ErrorKind::TypeError, "Number.prototype method called on a value that is not a number");
+  *out = v.u.number;
   return true;
 }
 
@@ -1790,16 +1808,18 @@ NATIVE(global_parse_int) {
 
 NATIVE(boolean_ctor) {
   *result = Value::make_bool(Vm::to_boolean(arg_at(args, argc, 0)));
+  vm.become_wrapper(self, vm.boolean_proto(), *result);   // new Boolean(false)
   return true;
 }
 
 NATIVE(boolean_to_string) {
-  *result = str_value(vm, self.is_bool() && self.u.boolean ? "true" : "false");
+  const Value v = Vm::primitive_of(self);
+  *result = str_value(vm, v.is_bool() && v.u.boolean ? "true" : "false");
   return true;
 }
 
 NATIVE(boolean_value_of) {
-  *result = self;
+  *result = Vm::primitive_of(self);
   return true;
 }
 
@@ -2020,9 +2040,14 @@ NATIVE(symbol_function) {
 // __symbol_info(symbol, what): 0 the description (undefined if there is none), 1 "Symbol(description)", 2 whether it is a symbol
 NATIVE(symbol_info) {
   (void)self;
-  const Value v = arg_at(args, argc, 0);
+  const Value v = Vm::primitive_of(arg_at(args, argc, 0));
   double what = 0;
   vm.to_number(arg_at(args, argc, 1), &what);
+  if (what == 4) {   // the primitive itself (valueOf of a symbol or of its wrapper)
+    if (!Vm::is_symbol(v)) return vm.throw_error(ErrorKind::TypeError, "Receiver is not a symbol");
+    *result = v;
+    return true;
+  }
   if (what == 2) {
     *result = Value::make_bool(Vm::is_symbol(v));
     return true;
@@ -2046,6 +2071,12 @@ NATIVE(symbol_info) {
     text.append(t.substr(2));
     *result = str_value(vm, text.view());
   } else *result = s->described && i > 2 ? str_value(vm, t.substr(2, i - 3)) : Value();
+  return true;
+}
+
+NATIVE(primitive_of_native) {
+  (void)self;
+  *result = Vm::primitive_of(arg_at(args, argc, 0));
   return true;
 }
 
@@ -2120,6 +2151,7 @@ struct JsonWriter {
       const Value call_args[2] = {Value::make_string(key), value};
       if (!vm.call(replacer_function, holder, call_args, 2, &value)) return false;
     }
+    if (value.is_object() && value.as_object()->okind == ObjKind::Primitive && !Vm::is_bigint(value.as_object()->bound_this)) value = value.as_object()->bound_this;   // new Number(3) is written as 3
     switch (value.tag) {
       case Tag::Undefined: return true;
       case Tag::Null: out.append("null"); *wrote = true; return true;
@@ -3002,6 +3034,7 @@ bool install_builtins(Vm& vm) {
     vm.define_named(symbol, name, Value::make_string(s), 0);
   }
   vm.define_native(g, "__symbol_info", symbol_info, 2);
+  vm.define_native(g, "__primitive_of", primitive_of_native, 1);
   vm.define_native(object, "getOwnPropertySymbols", object_get_own_property_symbols, 1);
 
   // Promise

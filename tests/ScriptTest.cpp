@@ -163,7 +163,8 @@ static void test_variables_and_functions() {
   CHECK(is("var fs = []; for (var i = 0; i < 3; i++) { fs.push(function() { return i; }); } fs[0]() + fs[2]()", "6"));
   CHECK(is("function outer() { var a = 1; function inner() { return a + 1; } return inner(); } outer()", "2"));
   CHECK(is("(function() { return typeof this; })()", "object"));
-  CHECK(is("function f() { return this; } f.call(5) === 5", "true"));   // (`this` is not boxed)
+  CHECK(is("function f() { return this; } f.call(5) === 5", "false"));   // (sloppy code gets the wrapper object of a primitive `this`)
+  CHECK(is("function f() { \"use strict\"; return this; } f.call(5) === 5", "true"));
   CHECK(is("function f(a, b) { return this.x + a + b; } f.call({ x: 1 }, 2, 3)", "6"));
   CHECK(is("function f(a, b) { return this.x + a + b; } f.apply({ x: 1 }, [2, 3])", "6"));
   CHECK(is("function f(a, b) { return this.x + a + b; } var g = f.bind({ x: 1 }, 2); g(3)", "6"));

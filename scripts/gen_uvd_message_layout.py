@@ -41,9 +41,12 @@ FIELDS = (
         'decoded_pic_idx', 'ref_pic_idx', 'load_intra_quantiser_matrix', 'load_nonintra_quantiser_matrix', 'intra_quantiser_matrix', 'nonintra_quantiser_matrix',
         'profile_and_level_indication', 'chroma_format', 'picture_coding_type', 'f_code', 'intra_dc_precision', 'pic_structure', 'top_field_first', 'frame_pred_frame_dct',
         'concealment_motion_vectors', 'q_scale_type', 'intra_vlc_format', 'alternate_scan')]
+    + [('Mpeg4_' + f, 'body.decode.codec.mpeg4.' + f) for f in (
+        'decoded_pic_idx', 'ref_pic_idx', 'variant_type', 'profile_and_level_indication', 'video_object_layer_verid', 'video_object_layer_shape', 'video_object_layer_width',
+        'video_object_layer_height', 'vop_time_increment_resolution', 'flags', 'quant_type', 'intra_quant_mat', 'nonintra_quant_mat', 'sprite_config')]
     + [('Vc1_' + f, 'body.decode.codec.vc1.' + f) for f in ('profile', 'level', 'sps_info_flags', 'pps_info_flags', 'pic_structure', 'chroma_format')]
 )
-SIZES = [('Msg_sizeof', 'struct ruvd_msg'), ('H264_sizeof', 'struct ruvd_h264'), ('H265_sizeof', 'struct ruvd_h265'), ('Mpeg2_sizeof', 'struct ruvd_mpeg2'), ('Vc1_sizeof', 'struct ruvd_vc1')]
+SIZES = [('Msg_sizeof', 'struct ruvd_msg'), ('H264_sizeof', 'struct ruvd_h264'), ('H265_sizeof', 'struct ruvd_h265'), ('Mpeg2_sizeof', 'struct ruvd_mpeg2'), ('Mpeg4_sizeof', 'struct ruvd_mpeg4'), ('Vc1_sizeof', 'struct ruvd_vc1')]
 
 
 def main():

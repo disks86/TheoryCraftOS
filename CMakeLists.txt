@@ -638,6 +638,7 @@ add_executable(BOOTX64
   src/Hardware/VideoCodec/AMD/AmdUvd6AvcDecoder.cpp
   src/Hardware/VideoCodec/AMD/AmdUvd6HevcDecoder.cpp
   src/Hardware/VideoCodec/AMD/AmdUvd6Mpeg2Decoder.cpp
+  src/Hardware/VideoCodec/AMD/AmdUvd6Mpeg4Decoder.cpp
   src/Hardware/VideoCodec/AMD/AmdUvd6Vc1Decoder.cpp
   src/Hardware/VideoCodec/AMD/AmdGmc8Memory.cpp
   src/Hardware/VideoCodec/AMD/AmdRavenMemory.cpp
@@ -702,6 +703,7 @@ add_executable(BOOTX64
   src/Hardware/VideoCodec/Software/Mpeg2Syntax.cpp
   src/Hardware/VideoCodec/Software/Mpeg2Slice.cpp
   src/Hardware/VideoCodec/Software/Mpeg2Recon.cpp
+  src/Hardware/VideoCodec/Software/Mpeg4Headers.cpp
   src/Hardware/VideoCodec/Software/Vc1Syntax.cpp
   src/Hardware/VideoCodec/Software/Vc1Block.cpp
   src/Hardware/VideoCodec/Software/Vc1Recon.cpp

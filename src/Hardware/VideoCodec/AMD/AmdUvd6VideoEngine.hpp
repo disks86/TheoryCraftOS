@@ -25,6 +25,7 @@
 #include "Hardware/VideoCodec/AMD/AmdUvd6AvcDecoder.hpp"
 #include "Hardware/VideoCodec/AMD/AmdUvd6HevcDecoder.hpp"
 #include "Hardware/VideoCodec/AMD/AmdUvd6Mpeg2Decoder.hpp"
+#include "Hardware/VideoCodec/AMD/AmdUvd6Mpeg4Decoder.hpp"
 #include "Hardware/VideoCodec/AMD/AmdUvd6Vc1Decoder.hpp"
 #include "Hardware/VideoCodec/AMD/AmdUvd6Ring.hpp"
 #include "Hardware/VideoCodec/AMD/AmdVce3VideoEngine.hpp"
@@ -213,6 +214,7 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
     if (enable_hevc_decode()) enable_hevc10_decode();   // (H.264 works either way; ten bits is a test on top of the eight-bit one)
     if (engine_running()) enable_mpeg2_decode();
     if (engine_running()) enable_vc1_decode();
+    if (engine_running()) enable_mpeg4_decode();
     return engine_running();
   }
 
@@ -231,7 +233,10 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
     hevc10_note_.assign("");
     mpeg2_ready_ = false;
     vc1_ready_ = false;
+    mpeg4_ready_ = false;
+    mpeg4_note_.assign("");
     info_.accelerated_decode_codecs = 0;
+    info_.decode_codecs &= ~codec_mask(VideoCodec::Mpeg4);
     ring_.reset();
     if (uvd_) {
       uvd_->stop();
@@ -249,9 +254,12 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
                      uint64_t work_bytes) {
     decode_ready_ = false;
     hevc_ready_ = false;
+    hevc10_ready_ = false;
     mpeg2_ready_ = false;
     vc1_ready_ = false;
+    mpeg4_ready_ = false;
     info_.accelerated_decode_codecs = 0;
+    info_.decode_codecs &= ~codec_mask(VideoCodec::Mpeg4);
     ring_.reset();
     const char* why = nullptr;
     bool tested = false;
@@ -490,6 +498,51 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
     rebuild_status();
     return true;
   }
+  // After enable_decode(): the same for MPEG-4 Part 2 (AmdVcnSelfTest::run_mpeg4_session: an FFmpeg-encoded stream with B planes, the engine's pictures held to FFmpeg's decode of
+  // it). There is no CPU decoder for this codec, so a pass is what makes MPEG-4 decodable at all (info().decode_codecs gains it); a failure leaves it unsupported and the rest
+  // as it was - unless the engine stopped answering, which stops it altogether.
+  bool enable_mpeg4_decode() {
+    mpeg4_ready_ = false;
+    mpeg4_note_.assign("");
+    if (!ring_) return false;
+    AmdVcnSelfTest::Result result = AmdVcnSelfTest::Result::SessionRefused;
+    {
+      DecoderConfig config;
+      config.codec = VideoCodec::Mpeg4;
+      config.output = PixelFormat::I420;
+      AmdUvd6Mpeg4Decoder session(allocator_, engine_, config);
+      if (session.prepare())
+        result = AmdVcnSelfTest::run_mpeg4_session(
+            allocator_, session, [](const void* ring) { return static_cast<const AmdUvd6Ring*>(ring)->wedged(); }, ring_.get(),
+            [](const void* decoder) { return static_cast<const AmdUvd6Mpeg4Decoder*>(decoder)->pictures_decoded(); }, &session);
+    }
+    if (result != AmdVcnSelfTest::Result::Passed) {
+      if (ring_->wedged()) {
+        decode_ready_ = false;
+        hevc_ready_ = false;
+        mpeg2_ready_ = false;
+        vc1_ready_ = false;
+        info_.accelerated_decode_codecs = 0;
+        decode_text_.assign("MPEG-4 self-test failed (");
+        decode_text_.append(AmdVcnSelfTest::result_name(result));
+        decode_text_.append("); engine stopped");
+        stop_engine();
+        note_ = decode_text_.c_str();
+      } else {
+        mpeg4_note_.assign("MPEG-4 test failed (");
+        mpeg4_note_.append(AmdVcnSelfTest::result_name(result));
+        mpeg4_note_.append(")");
+      }
+      rebuild_status();
+      return false;
+    }
+    mpeg4_ready_ = true;
+    info_.decode_codecs |= codec_mask(VideoCodec::Mpeg4);
+    info_.accelerated_decode_codecs |= codec_mask(VideoCodec::Mpeg4);
+    rebuild_status();
+    return true;
+  }
+  bool mpeg4_ready() const { return mpeg4_ready_; }
   bool decode_ready() const { return decode_ready_; }
   bool vc1_ready() const { return vc1_ready_; }
   bool mpeg2_ready() const { return mpeg2_ready_; }
@@ -499,6 +552,12 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
 
   // H.264, H.265, MPEG-2 and VC-1 go to the engine when they passed their tests and it is free (it runs one session at a time); anything else goes to the CPU.
   UniquePointer<IVideoDecoder> create_decoder(const DecoderConfig& config) override {
+    if (config.codec == VideoCodec::Mpeg4 && mpeg4_ready_ && ring_ && !ring_->wedged()) {
+      AmdUvd6AvcDecoder::Engine engine = engine_;
+      engine.stream_handle = ++next_stream_handle_;
+      UniquePointer<AmdUvd6Mpeg4Decoder> session = UniquePointer<AmdUvd6Mpeg4Decoder>::make(allocator_, allocator_, engine, config);
+      if (session && session->prepare()) return UniquePointer<IVideoDecoder>(util::move(session));
+    }
     if (config.codec == VideoCodec::Vc1 && vc1_ready_ && ring_ && !ring_->wedged()) {
       AmdUvd6AvcDecoder::Engine engine = engine_;
       engine.stream_handle = ++next_stream_handle_;
@@ -620,6 +679,10 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
         firmware_text_.append("; ");
         firmware_text_.append(hevc10_note_.view());
       }
+      if (mpeg4_note_.size() != 0) {
+        firmware_text_.append("; ");
+        firmware_text_.append(mpeg4_note_.view());
+      }
       if (power_note_.size() != 0) {
         firmware_text_.append("; ");
         firmware_text_.append(power_note_.view());
@@ -670,6 +733,8 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
   bool hevc_ready_ = false;
   bool hevc10_ready_ = false;   // ten-bit H.265 passed its test
   FixedString<95> hevc10_note_;   // why not, when it did not
+  bool mpeg4_ready_ = false;
+  FixedString<95> mpeg4_note_;
   bool mpeg2_ready_ = false;
   bool vc1_ready_ = false;
   uint32_t next_stream_handle_ = 1;
