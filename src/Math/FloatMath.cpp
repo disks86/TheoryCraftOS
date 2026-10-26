@@ -18,6 +18,7 @@
 
 #include "Math/FloatMath.hpp"
 #include <stdint.h>
+#include <initializer_list>
 
 namespace fmath {
 
@@ -85,8 +86,31 @@ double sqrt(double x) {
   DoubleBits b{x};
   b.u = (b.u >> 1) + (uint64_t{1023} << 51);  // halve the exponent for a first guess
   double g = b.d;
-  for (int i = 0; i < 6; ++i) g = 0.5 * (g + x / g);
-  return g;
+  for (int i = 0; i < 8; ++i) g = 0.5 * (g + x / g);
+  // settle on the neighbour (one unit in the last place either way) whose square is closest to x; the squares are worked out exactly (Dekker's product)
+  auto residual = [x](double c) {   // x - c*c
+    const double split = 134217729.0;   // 2^27 + 1
+    const double t = split * c;
+    const double c_hi = t - (t - c), c_lo = c - c_hi;
+    const double p = c * c;
+    const double e = ((c_hi * c_hi - p) + 2 * c_hi * c_lo) + c_lo * c_lo;   // c*c = p + e exactly
+    return (x - p) - e;
+  };
+  DoubleBits lo{g}, hi{g};
+  --lo.u;
+  ++hi.u;
+  double best = g;
+  double best_error = residual(g) < 0 ? -residual(g) : residual(g);
+  const double candidates[2] = {lo.d, hi.d};
+  for (const double c : candidates) {
+    const double r = residual(c);
+    const double error = r < 0 ? -r : r;
+    if (error < best_error) {
+      best = c;
+      best_error = error;
+    }
+  }
+  return best;
 }
 
 // Reduces to [-pi, pi], then folds to [-pi/2, pi/2] and runs the Taylor series.

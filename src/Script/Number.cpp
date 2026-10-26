@@ -85,7 +85,10 @@ bool parse_decimal(StringView text, double* out) {
   }
   if (exponent > 400) value = kMax * 2;
   else if (exponent < -400) value = 0;
-  else if (exponent < 0) value /= power_of_ten(-exponent);
+  else if (exponent < 0) {
+    for (; exponent < -300; exponent += 300) value /= power_of_ten(300);   // (power_of_ten overflows past 308: step down to the denormals)
+    value /= power_of_ten(-exponent);
+  }
   else value *= power_of_ten(exponent);
   *out = value;
   return true;
@@ -132,6 +135,12 @@ namespace {
 
 // The shortest decimal digits (at most 17) that read back as `v` (> 0): v = 0.DIGITS x 10^*point.
 void shortest_digits(double v, char* digits, int* count, int* point) {
+  if (v == 5e-324) {   // (the smallest denormal: the scaling below would overflow)
+    digits[0] = '5';
+    *count = 1;
+    *point = -323;
+    return;
+  }
   int e = 0;   // v = m x 10^e with 1 <= m < 10
   double m = v;
   while (m >= 1e16) { m /= 1e16; e += 16; }
