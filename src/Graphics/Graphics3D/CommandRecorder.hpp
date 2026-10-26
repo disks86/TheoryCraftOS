@@ -28,7 +28,7 @@ namespace graphics {
 
 struct RecordedCommand {
   enum class Type : uint8_t {
-    BeginRenderPass, BindPipeline, BindVertexBuffer, BindIndexBuffer, PushConstants, SetViewport, SetScissor,
+    BeginRenderPass, BindPipeline, BindVertexBuffer, BindIndexBuffer, PushConstants, BindTexture, SetViewport, SetScissor,
     Draw, DrawIndexed, EndRenderPass,
   };
   Type type = Type::Draw;
@@ -42,6 +42,9 @@ struct RecordedCommand {
   Rect2D scissor;
   uint32_t count = 0, first = 0;
   int32_t vertex_offset = 0;
+  uint32_t unit = 0;       // BindTexture
+  IImage* image = nullptr;
+  SamplerDesc sampler;
 };
 
 class CommandRecorder : public ICommandBuffer {
@@ -91,6 +94,18 @@ class CommandRecorder : public ICommandBuffer {
     c.constants_size = size;
     for (uint32_t i = 0; i < size; ++i)
       if (!constants_.push_back(static_cast<const uint8_t*>(data)[i])) ok_ = false;
+    add(c);
+  }
+  void bind_texture(uint32_t unit, IImage* image, const SamplerDesc& sampler) override {
+    if (unit >= kMaxTextureUnits || !image) {
+      ok_ = false;
+      return;
+    }
+    RecordedCommand c;
+    c.type = RecordedCommand::Type::BindTexture;
+    c.unit = unit;
+    c.image = image;
+    c.sampler = sampler;
     add(c);
   }
   void set_viewport(const Viewport& viewport) override {
