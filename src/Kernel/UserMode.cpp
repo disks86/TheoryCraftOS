@@ -654,6 +654,22 @@ bool Task::process_exists(uint64_t pid) {
   return false;
 }
 
+uint32_t Task::list_processes(ProcessEntry* out, uint32_t capacity) {
+  ProcessInfo info[64];
+  // (a system call holds this program's lock, and the snapshot takes every program's lock, this one's too: let go of it meanwhile)
+  mutex.unlock();
+  const uint32_t n = process_snapshot(info, capacity < 64 ? capacity : 64);
+  mutex.lock();
+  for (uint32_t i = 0; i < n; ++i) {
+    out[i] = ProcessEntry();
+    out[i].pid = info[i].id;
+    out[i].parent = info[i].parent_id;
+    out[i].threads = info[i].threads;
+    __builtin_memcpy(out[i].name, info[i].name, sizeof out[i].name);
+  }
+  return n;
+}
+
 bool Task::sync_tables() {
   // The program's threads run side by side on every core, each on the page tables it was given. New tables are built beside the old ones; every thread is then given the new
   // ones (a thread running on another core takes them when that core's interrupt brings it into the kernel and back), and only after all those cores have answered are the old
@@ -770,6 +786,12 @@ uint32_t Task::spawn_process(const process::ChildSpec& spec) {
   child->task = usermode::spawn(p, allocator_, "program", spec.suspended);
   if (!child->task) { discard(); return kNoResources; }
   child->started = !spec.suspended;
+  child->task->parent_id = program.process()->id();
+  {      // the name the process list shows: the program's file name
+    StringView base = spec.image_path;
+    for (uint64_t i = 0; i < base.size(); ++i) if (base[i] == '\\' || base[i] == '/') { base = base.without_prefix(i + 1); i = static_cast<uint64_t>(-1); }
+    child->task->set_name(base);
+  }
   child->next = children;
   children = child;
   return 0;
@@ -877,6 +899,7 @@ uint32_t process_snapshot(ProcessInfo* out, uint32_t capacity) {
     ProcessInfo& info = out[n++];
     info = ProcessInfo();
     info.id = task->program.process()->id();
+    info.parent_id = task->parent_id;
     __builtin_memcpy(info.name, task->name, sizeof info.name);
     info.windows = task->program.process()->abi() == process::SyscallAbi::Windows;
     info.memory_bytes = task->program.address_space().mapped_bytes();

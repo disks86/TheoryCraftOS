@@ -31,11 +31,12 @@ namespace gen9_3d {
 //
 // The command sequence is that of the intel-gpu-tools Gen9 render copy (lib/rendercopy_gen9.c), which runs on hardware: everything the 3D pipeline has that is not used
 // is switched off, the vertex shader is off (the vertices are the final screen positions), the clipper is off (a primitive is clipped to the drawing rectangle by the
-// windower), and the pixel shader is one of three small kernels: copy a texel, write a constant colour, write an interpolated colour. There is no depth buffer.
-// The state is complete for every job (the job does not rely on what an earlier one left).
+// windower), and the pixel shader is one of three small kernels: copy a texel, write a constant colour, write an interpolated colour. The depth test is fixed
+// function and needs no kernel. The state is complete for every job (the job does not rely on what an earlier one left).
 //
-// Positions are window coordinates in pixels (+Y down), and colours are interpolated linearly in screen space (the vertices carry w = 1): perspective-correct
-// interpolation needs the clipper and the viewport transform, which are off. A caller with a perspective projection has to divide by w itself.
+// Positions are window coordinates in pixels (+Y down) with z the window depth (0 to 1). The clipper and the viewport transform are off, so the vertices carry what
+// the clipper would hand the setup stage: the fourth component is 1/w of the clip-space position (1 for an orthographic scene), from which the setup interpolates
+// colours perspective-correct. That the hardware reads it so is the documented behaviour of the clipper's output; it has not been seen on a GPU.
 
 constexpr uint32_t kStateOffset = 4096;         // commands must end before this; state starts here
 constexpr uint32_t kMaxImageBytes = 64 * 1024;  // what a batch buffer holds
@@ -59,17 +60,33 @@ struct Rect {
 
 enum class Blend : uint8_t { None, SourceOver };
 
-// A vertex as the kernels read it: the window position (x, y in pixels, z unused, w = 1) and the colour.
+// A vertex as the kernels read it: the window position (x, y in pixels, z the depth, w = 1/w of the clip-space position) and the colour.
 struct Vertex {
   float position[4];
   float color[4];
 };
 
-// What a draw does to the target: where, and whether it blends with what is there. Drawing is clipped to `clip` and the target.
+// A depth buffer of 32-bit floats. The hardware only has Y-tiled depth buffers, so the memory is opaque to the CPU: it is made by `bytes_for()` bytes of anything
+// (a 1.0 in every word means nothing is in front), its rows are `pitch()` bytes apart in tile rows of 32, and the base is 4 KiB aligned.
+struct DepthBuffer {
+  uint64_t gpu_address = 0;
+  uint32_t width = 0, height = 0;
+  static uint32_t pitch_for(uint32_t width) { return (width * 4 + 127) / 128 * 128; }
+  static uint64_t bytes_for(uint32_t width, uint32_t height) { return uint64_t{pitch_for(width)} * ((height + 31) / 32 * 32); }
+  bool attached() const { return width != 0 || height != 0; }
+  uint32_t pitch() const { return pitch_for(width); }
+  bool valid() const;
+};
+
+// What a draw does to the target: where, and whether it blends with what is there. Drawing is clipped to `clip` and the target. With a depth buffer attached
+// (the size of the target), `depth_test` passes a pixel that is closer than or as close as what is there, and `depth_write` stores its depth.
 struct DrawState {
   Surface target;
   Blend blend = Blend::None;
   Rect clip;   // empty: the whole target
+  DepthBuffer depth;
+  bool depth_test = false;
+  bool depth_write = false;
 };
 
 class RenderBatch {
@@ -81,6 +98,8 @@ class RenderBatch {
   // How many vertices a triangle job can hold.
   uint32_t max_vertices() const;
 
+  // Sets every pixel of the depth buffer of `draw` to `value` (0 to 1), leaving the colours alone; a job of its own.
+  bool clear_depth(const DrawState& draw, float value);
   // The next four build a complete job, replacing what was in the image; false (and an unusable image) if the arguments are not valid or do not fit.
   // A solid rectangle (a clear is one covering the target).
   bool fill_rect(const DrawState& draw, const Rect& rect, const float rgba[4]);
@@ -95,6 +114,7 @@ class RenderBatch {
  private:
   ArrayView<uint32_t> image_;
   uint32_t base_;
+  bool fill(const DrawState& draw, const Rect& rect, const float rgba[4], float z, bool depth_only);
   uint32_t used_ = 0;
 };
 
