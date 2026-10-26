@@ -13287,6 +13287,7 @@ const char kAnimationPrelude[] = R"JSPRELUDE((function (g) {
   };
   var now = function () { return g.performance && g.performance.now ? g.performance.now() : Date.now(); };
   var hasNative = typeof g.__set_animated_style === 'function';
+  var origGCS = g.getComputedStyle;   // (the wrapper below flushes CSS transitions and animations first: this does not)
 
   // ------------------------------------------------------------------------------------------------------------------------------ easing
   function bezier(x1, y1, x2, y2) {
@@ -13541,7 +13542,7 @@ const char kAnimationPrelude[] = R"JSPRELUDE((function (g) {
       namedCount++;
       if (!colorProbe) colorProbe = document.createElement('span');
       colorProbe.style.color = ''; colorProbe.style.color = text;
-      if (colorProbe.style.color !== '' && document.documentElement) { try { document.documentElement.appendChild(colorProbe); var c = g.getComputedStyle(colorProbe).color; colorProbe.remove(); var mm = /^rgba?\(([^)]*)\)$/.exec(c); if (mm) { var q = mm[1].split(',').map(parseFloat); out = [q[0], q[1], q[2], q.length > 3 ? q[3] : 1]; } } catch (e) { } }
+      if (colorProbe.style.color !== '' && document.documentElement) { try { document.documentElement.appendChild(colorProbe); var c = origGCS.call(g, colorProbe).color; colorProbe.remove(); var mm = /^rgba?\(([^)]*)\)$/.exec(c); if (mm) { var q = mm[1].split(',').map(parseFloat); out = [q[0], q[1], q[2], q.length > 3 ? q[3] : 1]; } } catch (e) { } }
     } else if ((m = /^hsla?\(\s*([^)]*)\)$/.exec(text))) {
       var hp = m[1].split(/[\s,\/]+/).filter(Boolean);
       if (hp.length >= 3) {
@@ -13743,7 +13744,7 @@ const char kAnimationPrelude[] = R"JSPRELUDE((function (g) {
     if (effect !== undefined && effect !== null && !(effect instanceof AnimationEffect)) throw new TypeError("Failed to construct 'Animation': Failed to convert value to 'AnimationEffect'.");
     var tl = timeline === undefined ? defaultTimeline : timeline;
     if (tl !== null && !(tl instanceof AnimationTimeline)) throw new TypeError("Failed to construct 'Animation': Failed to convert value to 'AnimationTimeline'.");
-    var s = { effect: null, timeline: tl, startTime: null, holdTime: null, rate: 1, pendingRate: null, pending: null, ready: deferred(), finished: deferred(), finishNotified: false, replace: 'active', id: '', seq: ++sequence, previous: null, flushed: false };
+    var s = { effect: null, timeline: tl, startTime: null, holdTime: null, rate: 1, pendingRate: null, pending: null, ready: deferred(), finished: deferred(), finishNotified: false, replace: 'active', id: '', seq: ++sequence, rank: 2, previous: null, flushed: false };
     s.ready.resolve(null); s.ready.done = true;
     hide(this, '__a', s);
     if (effect) { if (effect.__e.animation) effect.__e.animation.__a.effect = null; s.effect = effect; effect.__e.animation = this; }
@@ -13933,7 +13934,7 @@ const char kAnimationPrelude[] = R"JSPRELUDE((function (g) {
     for (var p in props) t.style.setProperty(p, props[p].value);
   });
   var CSSAnimation = cls('CSSAnimation', Animation, null), CSSTransition = cls('CSSTransition', Animation, null);
-  accessor(CSSAnimation.prototype, 'animationName', function () { return ''; }); accessor(CSSTransition.prototype, 'transitionProperty', function () { return ''; });
+  accessor(CSSAnimation.prototype, 'animationName', function () { return this.__css ? this.__css.name : ''; }); accessor(CSSTransition.prototype, 'transitionProperty', function () { return this.__css ? this.__css.prop : ''; });
 
   // ------------------------------------------------------------------------------------------------------------------------------ applying to elements
   function effectProgress(a) {
@@ -13942,7 +13943,7 @@ const char kAnimationPrelude[] = R"JSPRELUDE((function (g) {
   }
   function underlying(el, prop) {
     var v = '';
-    try { v = g.getComputedStyle(el).getPropertyValue(prop); } catch (err) { }
+    try { v = origGCS.call(g, el).getPropertyValue(prop); } catch (err) { }
     return v;
   }
   function valuesFor(a, ct, under) {
@@ -13984,7 +13985,7 @@ const char kAnimationPrelude[] = R"JSPRELUDE((function (g) {
     // elements that had animations and have none now
     applied.slice().forEach(function (el) { if (elements.indexOf(el) < 0) clearElement(el); });
     elements.forEach(function (el, k) {
-      var list = byEl[k].sort(function (x, y) { return x.__a.seq - y.__a.seq; }), need = [], timings = [];
+      var list = byEl[k].sort(function (x, y) { return (x.__a.rank - y.__a.rank) || (x.__a.seq - y.__a.seq); }), need = [], timings = [];
       list.forEach(function (a) { var ct = effectProgress(a); timings.push(ct); if (ct && ct.progress !== null) a.__a.effect.__e.frames.forEach(function (f) { f.props.forEach(function (p) { if (need.indexOf(p[0]) < 0) need.push(p[0]); }); }); });
       if (!need.length) { clearElement(el); return; }
       var under = {};
@@ -14033,6 +14034,7 @@ const char kAnimationPrelude[] = R"JSPRELUDE((function (g) {
         } else updateFinished(a, false, true);
       });
       removeReplaced(copy);
+      processCssEvents();
       applyAll();
     } finally { tickTime = null; }
     // events and the animations that are still going
@@ -14051,7 +14053,7 @@ const char kAnimationPrelude[] = R"JSPRELUDE((function (g) {
   function removeReplaced(list) {
     list.forEach(function (a) {
       var s = a.__a, e = s.effect;
-      if (!e || s.replace !== 'active' || playStateOf(a) !== 'finished' || !e.__e.target || e.__e.pseudo) return;
+      if (!e || s.rank < 2 || s.replace !== 'active' || playStateOf(a) !== 'finished' || !e.__e.target || e.__e.pseudo) return;
       var ct = effectProgress(a); if (!ct || ct.progress === null) return;
       var props = []; e.__e.frames.forEach(function (f) { f.props.forEach(function (p) { if (props.indexOf(p[0]) < 0) props.push(p[0]); }); });
       if (!props.length) return;
@@ -14086,13 +14088,228 @@ const char kAnimationPrelude[] = R"JSPRELUDE((function (g) {
       return t && (t === self || (subtree && self.contains(t))) && relevant(a);
     });
   });
-  function allAnimations() { return live.slice().sort(function (x, y) { return x.__a.seq - y.__a.seq; }); }
+  function allAnimations() { return live.slice().sort(function (x, y) { return (x.__a.rank - y.__a.rank) || (x.__a.seq - y.__a.seq); }); }
   def(DP, 'getAnimations', function () { return allAnimations().filter(function (a) { var t = a.__a.effect && a.__a.effect.__e.target; return t && t.isConnected && relevant(a); }); });
   accessor(DP, 'timeline', function () { return defaultTimeline; });
   def(g, 'AnimationEvent', g.AnimationEvent || cls('AnimationEvent', g.Event, function (type, init) { var e = new g.Event(type, init); Object.setPrototypeOf(e, g.AnimationEvent.prototype); init = init || {}; hide(e, '__x', { animationName: init.animationName || '', elapsedTime: init.elapsedTime || 0, pseudoElement: init.pseudoElement || '' }); return e; }));
   if (!('animationName' in g.AnimationEvent.prototype)) ['animationName', 'elapsedTime', 'pseudoElement'].forEach(function (k) { accessor(g.AnimationEvent.prototype, k, function () { return this.__x ? this.__x[k] : k === 'elapsedTime' ? 0 : ''; }); });
   if (!g.TransitionEvent) cls('TransitionEvent', g.Event, function (type, init) { var e = new g.Event(type, init); Object.setPrototypeOf(e, g.TransitionEvent.prototype); init = init || {}; hide(e, '__x', { propertyName: init.propertyName || '', elapsedTime: init.elapsedTime || 0, pseudoElement: init.pseudoElement || '' }); return e; });
   if (g.TransitionEvent && !('propertyName' in g.TransitionEvent.prototype)) ['propertyName', 'elapsedTime', 'pseudoElement'].forEach(function (k) { accessor(g.TransitionEvent.prototype, k, function () { return this.__x ? this.__x[k] : k === 'elapsedTime' ? 0 : ''; }); });
+
+  // ------------------------------------------------------------------------------------------------------------------------------ CSS animations and transitions
+  // They are Animation objects (CSSAnimation, CSSTransition) that the style makes: after the page changed, every element is looked at once, and animations are
+  // started, updated or cancelled to match animation-* and transition-*. A transition starts when the value a property would have without animations differs from
+  // the value it had the last time (so the first style of an element never transitions).
+  var states = new Map(), cssTracked = [], cssQueue = [], lastStyleVersion = -1, updating = false, motionScheduled = false;
+  var ALLPROPS = ['width', 'height', 'min-width', 'min-height', 'max-width', 'max-height', 'margin-top', 'margin-right', 'margin-bottom', 'margin-left', 'padding-top', 'padding-right', 'padding-bottom', 'padding-left',
+    'top', 'right', 'bottom', 'left', 'opacity', 'color', 'background-color', 'border-top-color', 'border-right-color', 'border-bottom-color', 'border-left-color', 'border-top-width', 'border-right-width',
+    'border-bottom-width', 'border-left-width', 'border-top-left-radius', 'border-top-right-radius', 'border-bottom-right-radius', 'border-bottom-left-radius', 'font-size', 'font-weight', 'line-height',
+    'letter-spacing', 'word-spacing', 'text-indent', 'transform', 'translate', 'rotate', 'scale', 'transform-origin', 'flex-grow', 'flex-shrink', 'flex-basis', 'outline-color', 'outline-width', 'outline-offset',
+    'box-shadow', 'text-shadow', 'filter', 'visibility', 'row-gap', 'column-gap', 'vertical-align', 'background-position', 'z-index'];
+  var SHORTHANDS = { margin: ['margin-top', 'margin-right', 'margin-bottom', 'margin-left'], padding: ['padding-top', 'padding-right', 'padding-bottom', 'padding-left'], 'border-width': ['border-top-width', 'border-right-width', 'border-bottom-width', 'border-left-width'],
+    'border-color': ['border-top-color', 'border-right-color', 'border-bottom-color', 'border-left-color'], 'border-radius': ['border-top-left-radius', 'border-top-right-radius', 'border-bottom-right-radius', 'border-bottom-left-radius'],
+    border: ['border-top-color', 'border-right-color', 'border-bottom-color', 'border-left-color', 'border-top-width', 'border-right-width', 'border-bottom-width', 'border-left-width'], gap: ['row-gap', 'column-gap'], inset: ['top', 'right', 'bottom', 'left'], outline: ['outline-color', 'outline-width', 'outline-offset'],
+    background: ['background-color', 'background-position'], flex: ['flex-grow', 'flex-shrink', 'flex-basis'] };
+  var listOf = function (text) { return splitTop(String(text || ''), ',').map(function (x) { return x.trim(); }).filter(function (x) { return x !== ''; }); };
+  var millis = function (t) { var m = /^(-?[\d.]+(?:e-?\d+)?)(m?s)$/.exec(String(t).trim()); if (!m) return 0; return m[2] === 'ms' ? parseFloat(m[1]) : parseFloat(m[1]) * 1000; };
+  var pick = function (list, i) { return list.length ? list[i % list.length] : ''; };
+  function motionState(el) { var st = states.get(el); if (!st) { st = { anims: {}, trans: {}, before: {} }; states.set(el, st); } return st; }
+  function queueCss(el, kind, type, name, elapsed) { cssQueue.push({ el: el, kind: kind, type: type, name: name, elapsed: elapsed }); schedule(); }
+  function findKeyframes(name) {
+    var found = null, sheets;
+    try { sheets = document.styleSheets; } catch (e) { return null; }
+    var walk = function (rules, depth) {
+      if (!rules || depth > 4) return;
+      for (var i = 0; i < rules.length; i++) {
+        var r = rules[i];
+        if (r.type === 7 && r.name === name) found = r;
+        else if (r.cssRules && r.type !== 7) walk(r.cssRules, depth + 1);
+      }
+    };
+    for (var i = 0; i < sheets.length; i++) { try { walk(sheets[i].cssRules, 0); } catch (e) { } }
+    return found;
+  }
+  function keyframesSignature(rule) { var out = []; for (var i = 0; i < rule.cssRules.length; i++) out.push(rule.cssRules[i].cssText); return out.join('|'); }
+  function framesOf(rule, easing) {
+    var frames = [];
+    for (var i = 0; i < rule.cssRules.length; i++) {
+      var kr = rule.cssRules[i], props = [], fe = easing, comp = 'auto', st = kr.style;
+      for (var k = 0; k < st.length; k++) {
+        var n = st.item(k), v = st.getPropertyValue(n);
+        if (n === 'animation-timing-function') { try { fe = parseEasing(v); } catch (e) { } }
+        else if (n === 'animation-composition') comp = v === 'add' || v === 'accumulate' ? v : 'auto';
+        else if (/^animation-|^transition-/.test(n)) continue;
+        else props.push([n, v]);
+      }
+      kr.keyText.split(',').forEach(function (t) {
+        t = t.trim(); var off = t === 'from' ? 0 : t === 'to' ? 1 : parseFloat(t) / 100;
+        if (off === off && off >= 0 && off <= 1) frames.push({ offset: off, computed: off, easing: fe, composite: comp, props: props });
+      });
+    }
+    frames.sort(function (a, b) { return a.offset - b.offset; });
+    return frames;
+  }
+  function animationParams(cs, i) {
+    var iter = pick(listOf(cs.animationIterationCount), i), dir = pick(listOf(cs.animationDirection), i), fill = pick(listOf(cs.animationFillMode), i);
+    return {
+      duration: millis(pick(listOf(cs.animationDuration), i) || '0s'), delay: millis(pick(listOf(cs.animationDelay), i) || '0s'), iterations: iter === 'infinite' ? Infinity : (parseFloat(iter) >= 0 ? parseFloat(iter) : 1),
+      direction: DIRECTIONS.indexOf(dir) >= 0 ? dir : 'normal', fill: fill === 'forwards' || fill === 'backwards' || fill === 'both' ? fill : 'none', easing: pick(listOf(cs.animationTimingFunction), i) || 'ease',
+      paused: pick(listOf(cs.animationPlayState), i) === 'paused'
+    };
+  }
+  function cssAnimation(el, name, rule, p) {
+    var easing; try { easing = parseEasing(p.easing); } catch (e) { easing = parseEasing('ease'); }
+    var effect = new KeyframeEffect(el, [], { duration: p.duration, delay: p.delay, iterations: p.iterations, direction: p.direction, fill: p.fill, easing: 'linear' });
+    effect.__e.frames = framesOf(rule, easing);
+    var a = new Animation(effect, defaultTimeline); Object.setPrototypeOf(a, CSSAnimation.prototype); a.__a.rank = 1;
+    hide(a, '__css', { kind: 'animation', name: name, el: el, phase: 'idle', iter: null, signature: keyframesSignature(rule), cancelled: false });
+    cssTracked.push(a); a.play(); if (p.paused) a.pause();
+    return a;
+  }
+  function cancelCss(a, quiet) {
+    var c = a.__css; if (c.cancelled) return;
+    c.cancelled = true;
+    var i = cssTracked.indexOf(a); if (i >= 0) cssTracked.splice(i, 1);
+    if (!quiet) { var ct = effectProgress(a); queueCss(c.el, c.kind, c.kind === 'animation' ? 'animationcancel' : 'transitioncancel', c.kind === 'animation' ? c.name : c.prop, ct && ct.localTime !== null ? Math.max(0, ct.localTime - (ct.delay || 0)) / 1000 : 0); }
+    a.cancel();
+  }
+  function currentValueOf(a, prop) {
+    var ct = effectProgress(a);
+    if (!ct || ct.progress === null) return a.__css.from;
+    var vals = valuesFor(a, ct, {}); return vals[prop] ? vals[prop].value : a.__css.to;
+  }
+  function updateAnimations(el, st, cs) {
+    var names = listOf(cs.animationName), want = {}, i;
+    names.forEach(function (n, k) { if (n !== 'none') want[n] = k; });
+    Object.keys(st.anims).forEach(function (n) {
+      var a = st.anims[n], rule = want[n] !== undefined ? findKeyframes(n) : null;
+      if (want[n] === undefined || !rule || keyframesSignature(rule) !== a.__css.signature) { cancelCss(a, false); delete st.anims[n]; }
+    });
+    Object.keys(want).forEach(function (n) {
+      var rule = findKeyframes(n); if (!rule) return;
+      var p = animationParams(cs, want[n]), a = st.anims[n];
+      if (!a) { st.anims[n] = cssAnimation(el, n, rule, p); return; }
+      var t = a.effect.__e.timing;
+      if (t.duration !== p.duration || t.delay !== p.delay || t.iterations !== p.iterations || t.direction !== p.direction || t.fill !== p.fill) a.effect.updateTiming({ duration: p.duration, delay: p.delay, iterations: p.iterations, direction: p.direction, fill: p.fill });
+      var fe; try { fe = parseEasing(p.easing); } catch (e) { fe = parseEasing('ease'); }
+      a.effect.__e.frames.forEach(function (f) { if (f.easing.__text === a.__css.easing) f.easing = fe; }); a.__css.easing = fe.__text;
+      var st2 = playStateOf(a);
+      if (p.paused && st2 !== 'paused') a.pause(); else if (!p.paused && st2 === 'paused') a.play();
+    });
+  }
+  function transitionParams(cs) {
+    var tp = listOf(cs.transitionProperty), td = listOf(cs.transitionDuration), tdl = listOf(cs.transitionDelay), tf = listOf(cs.transitionTimingFunction), tb = listOf(cs.transitionBehavior), map = {};
+    tp.forEach(function (p, i) {
+      if (p === 'none') return;
+      var one = { dur: millis(pick(td, i) || '0s'), delay: millis(pick(tdl, i) || '0s'), ease: pick(tf, i) || 'ease', discrete: pick(tb, i) === 'allow-discrete' };
+      var names = p === 'all' ? ALLPROPS : SHORTHANDS[p] || [p];
+      names.forEach(function (n) { map[n] = one; });
+    });
+    return map;
+  }
+  function updateTransitions(el, st, cs) {
+    var params = transitionParams(cs), tracked = Object.keys(params);
+    Object.keys(st.trans).forEach(function (p) { if (tracked.indexOf(p) < 0) tracked.push(p); });
+    if (!tracked.length) { st.before = {}; return; }
+    var cur = {};
+    if (hasNative) g.__set_animated_style(el, '');
+    var fresh = origGCS.call(g, el);
+    tracked.forEach(function (p) { cur[p] = fresh.getPropertyValue(p); });
+    tracked.forEach(function (p) {
+      var now = cur[p], old = st.before[p], run = st.trans[p], par = params[p];
+      if (run && (!par || par.dur + par.delay <= 0)) { cancelCss(run, false); delete st.trans[p]; run = null; }
+      if (par && old !== undefined && old !== now && par.dur + par.delay > 0) {
+        if (run && run.__css.to === now) { st.before[p] = now; return; }
+        var from = run ? currentValueOf(run, p) : old;
+        if (from === now) { if (run) { cancelCss(run, false); delete st.trans[p]; } st.before[p] = now; return; }
+        var discrete = mixValue(p, from, now, 0.25) === from && mixValue(p, from, now, 0.75) === now;
+        if (discrete && !par.discrete) { st.before[p] = now; return; }
+        if (run) { cancelCss(run, false); delete st.trans[p]; }
+        var ease; try { ease = parseEasing(par.ease); } catch (e) { ease = parseEasing('ease'); }
+        var effect = new KeyframeEffect(el, [], { duration: par.dur, delay: par.delay, easing: 'linear', fill: 'backwards' });
+        effect.__e.timing.easing = ease;
+        effect.__e.frames = [{ offset: 0, computed: 0, easing: parseEasing('linear'), composite: 'auto', props: [[p, from]] }, { offset: 1, computed: 1, easing: parseEasing('linear'), composite: 'auto', props: [[p, now]] }];
+        var a = new Animation(effect, defaultTimeline); Object.setPrototypeOf(a, CSSTransition.prototype); a.__a.rank = 0;
+        hide(a, '__css', { kind: 'transition', prop: p, el: el, from: from, to: now, phase: 'idle', cancelled: false, started: false });
+        cssTracked.push(a); a.play(); st.trans[p] = a;
+        queueCss(el, 'transition', 'transitionrun', p, Math.max(Math.min(-par.delay, par.dur), 0) / 1000);
+      }
+      st.before[p] = now;
+    });
+    // a property that is no longer tracked forgets its value
+    Object.keys(st.before).forEach(function (p) { if (!params[p] && !st.trans[p]) delete st.before[p]; });
+  }
+  function updateMotion() {
+    var all = document.querySelectorAll('*'), seen = [];
+    for (var i = 0; i < all.length; i++) {
+      var el = all[i], cs = origGCS.call(g, el), st = states.get(el);
+      var hasAnim = cs.animationName !== 'none' && cs.animationName !== '', hasTrans = cs.transitionProperty !== 'none' && cs.transitionProperty !== '' && !(cs.transitionProperty === 'all' && /^0s(,\s*0s)*$/.test(cs.transitionDuration) && /^0s(,\s*0s)*$/.test(cs.transitionDelay));
+      if (!st && !hasAnim && !hasTrans) continue;
+      st = motionState(el);
+      updateAnimations(el, st, cs);
+      updateTransitions(el, st, cs);
+    }
+    states.forEach(function (st, el) {
+      if (el.isConnected) return;
+      Object.keys(st.anims).forEach(function (n) { cancelCss(st.anims[n], true); }); Object.keys(st.trans).forEach(function (n) { cancelCss(st.trans[n], true); });
+      states.delete(el);
+    });
+  }
+  function flushMotion() {
+    if (updating || !hasNative || typeof g.__style_version !== 'function') return;
+    var v = g.__style_version();
+    if (v === lastStyleVersion) return;
+    lastStyleVersion = v;
+    if (!g.__motion_in_use()) {
+      if (states.size) { states.forEach(function (st) { Object.keys(st.anims).forEach(function (n) { cancelCss(st.anims[n], false); }); Object.keys(st.trans).forEach(function (n) { cancelCss(st.trans[n], false); }); }); states.clear(); }
+      return;
+    }
+    updating = true;
+    try { updateMotion(); } finally { updating = false; }
+    if (live.length) { applyAll(); schedule(); }
+  }
+  g.__style_dirty = function () {
+    if (motionScheduled || typeof g.requestAnimationFrame !== 'function' || !hasNative || typeof g.__motion_in_use !== 'function' || !(g.__motion_in_use() || states.size)) return;
+    motionScheduled = true;
+    g.requestAnimationFrame(function () { motionScheduled = false; flushMotion(); });
+  };
+  var wrappedGCS = function (el, pseudo) { flushMotion(); return origGCS.apply(this, arguments); };
+  Object.defineProperty(wrappedGCS, 'name', { value: 'getComputedStyle' });
+  def(g, 'getComputedStyle', wrappedGCS);
+  var origElGet = EP.getAnimations, origDocGet = DP.getAnimations;
+  def(EP, 'getAnimations', function (o) { flushMotion(); return origElGet.call(this, o); });
+  def(DP, 'getAnimations', function (o) { flushMotion(); return origDocGet.call(this, o); });
+  function processCssEvents() {
+    cssTracked.slice().forEach(function (a) {
+      var c = a.__css; if (c.cancelled) return;
+      var ct = effectProgress(a); if (!ct) return;
+      var phase = ct.phase, t = a.__a.effect.__e.timing;
+      if (c.kind === 'animation') {
+        var startElapsed = Math.max(Math.min(-t.delay, ct.activeDuration), 0) / 1000;
+        if ((c.phase === 'idle' || c.phase === 'before') && (phase === 'active' || phase === 'after') && !c.started) { c.started = true; queueCss(c.el, 'animation', 'animationstart', c.name, startElapsed); }
+        if (phase === 'active' && c.iter !== null && ct.currentIteration !== null && ct.currentIteration > c.iter) queueCss(c.el, 'animation', 'animationiteration', c.name, ct.duration * (ct.currentIteration - t.iterationStart) / 1000);
+        if (phase === 'after' && c.phase !== 'after') queueCss(c.el, 'animation', 'animationend', c.name, ct.activeDuration / 1000);
+        if (phase === 'active') c.iter = ct.currentIteration; else if (phase === 'before') c.iter = null;
+      } else {
+        if ((c.phase === 'idle' || c.phase === 'before') && (phase === 'active' || phase === 'after') && !c.started) { c.started = true; queueCss(c.el, 'transition', 'transitionstart', c.prop, Math.max(Math.min(-t.delay, ct.duration), 0) / 1000); }
+        if (phase === 'after' && c.phase !== 'after') {
+          queueCss(c.el, 'transition', 'transitionend', c.prop, ct.duration / 1000);
+          var st = states.get(c.el); if (st && st.trans[c.prop] === a) delete st.trans[c.prop];
+          c.cancelled = true; var k = cssTracked.indexOf(a); if (k >= 0) cssTracked.splice(k, 1); a.cancel();
+        }
+      }
+      c.phase = phase;
+    });
+    var events = cssQueue; cssQueue = [];
+    events.forEach(function (ev) {
+      try {
+        var init = { bubbles: true, cancelable: false, elapsedTime: ev.elapsed, pseudoElement: '' };
+        if (ev.kind === 'animation') { init.animationName = ev.name; ev.el.dispatchEvent(new g.AnimationEvent(ev.type, init)); }
+        else { init.propertyName = ev.name; ev.el.dispatchEvent(new g.TransitionEvent(ev.type, init)); }
+      } catch (e) { }
+    });
+  }
+  if (typeof g.addEventListener === 'function') { g.addEventListener('DOMContentLoaded', function () { g.__style_dirty(); }); g.addEventListener('load', function () { g.__style_dirty(); }); }
 }(globalThis));
 )JSPRELUDE";
 

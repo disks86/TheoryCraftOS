@@ -1568,6 +1568,10 @@ void mutation_epilogue(void* context) {
   DomBindings::Impl& c = *static_cast<DomBindings::Impl*>(context);
   Value fn;
   Value ignored;
+  if (c.style_dirty) {
+    c.style_dirty = false;
+    if (c.vm.get_named(Value::make_object(c.vm.global()), "__style_dirty", &fn) && Vm::is_callable(fn)) c.vm.call(fn, Value(), nullptr, 0, &ignored);
+  }
   while (c.pending_scripts.count() > 0) {
     const uint32_t serial = c.pending_scripts[0];
     c.pending_scripts.remove_at(0);
@@ -1677,9 +1681,42 @@ NATIVE(set_animated_style) {
     return true;
   }
   n->animated.assign(text.view());
-  n->owner->touch();
+  n->owner->touch_animated();
   *result = Value();
   return true;
+}
+
+// __style_version(): a number that changes when the page changes in a way that can change the style (not when animations only move their values)
+NATIVE(style_version) {
+  (void)self;
+  (void)args;
+  (void)argc;
+  *result = Value::make_number(static_cast<double>(impl(vm).doc.style_version()));
+  return true;
+}
+
+// __motion_in_use(): does a style sheet or a style attribute declare a transition or an animation?
+NATIVE(motion_in_use) {
+  (void)self;
+  (void)args;
+  (void)argc;
+  DomBindings::Impl& c = impl(vm);
+  bool used = false;
+  if (const StyleSheet* sheet = c.host.computed_style_sheet()) used = sheet->uses_motion();
+  for (const dom::Node* n = c.doc.root(); n && !used; n = dom::next_in_tree(n, c.doc.root())) {
+    StringView style;
+    if (n->is_element() && dom::get_attribute(n, "style", &style)) used = style.contains("transition") || style.contains("animation");
+  }
+  *result = Value::make_bool(used);
+  return true;
+}
+
+// The page changed: a script that follows the style (CSS transitions and animations) is told at the end of the call that did it.
+void style_change_hook(void* context) {
+  DomBindings::Impl& c = *static_cast<DomBindings::Impl*>(context);
+  if (c.style_dirty) return;
+  c.style_dirty = true;
+  c.vm.request_epilogue();
 }
 
 // `new MyElement()` for a class that extends HTMLElement: a document node whose tag was registered for a prototype in the chain
@@ -1713,6 +1750,9 @@ bool install_nodes(DomBindings::Impl& c) {
   vm.define_native(g, "__register_tag", register_tag, 2);
   vm.define_native(g, "__register_svg_tag", register_svg_tag, 2);
   vm.define_native(g, "__set_animated_style", set_animated_style, 2);
+  vm.define_native(g, "__style_version", style_version, 0);
+  vm.define_native(g, "__motion_in_use", motion_in_use, 0);
+  c.doc.set_change_hook(style_change_hook, &c);
   vm.set_construct_hook(construct_element, &c);
   c.doc.set_insert_hook(script_inserted_hook, &c);
   vm.set_epilogue(mutation_epilogue, &c);
