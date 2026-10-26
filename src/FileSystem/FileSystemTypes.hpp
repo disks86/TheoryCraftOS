@@ -47,6 +47,7 @@ enum class Status : uint8_t {
   LoginFailed,      // the user name or password was refused
   UntrustedHost,    // the server is not who it was: its host key or certificate changed since the first visit, or was refused
   Network,          // the network failed: the server could not be found or reached, or the connection broke
+  TooManyLinks,     // following symbolic links to resolve a path went in a circle (or just too deep)
 };
 
 const char* status_name(Status status);
@@ -88,7 +89,7 @@ constexpr CivilTime civil_from_unix(uint64_t seconds) {
   return t;
 }
 
-enum class NodeType : uint8_t { File, Directory };
+enum class NodeType : uint8_t { File, Directory, Symlink };
 
 // How IFileSystem::open_file() treats the path.
 enum class OpenMode : uint8_t {
@@ -103,9 +104,10 @@ constexpr uint64_t kMaxNameLength = 255;
 // One name in a directory (also what IFileSystem::stat() reports).
 struct DirectoryEntry {
   FixedString<kMaxNameLength + 1> name;  // the last component only; empty for the root
-  NodeType type = NodeType::File;
+  NodeType type = NodeType::File;        // a symbolic link reports what it points to (or File if that is not known): see is_symlink
   uint64_t size = 0;                     // bytes; 0 for directories
   bool read_only = false;
+  bool is_symlink = false;               // the entry itself is a symbolic link (stat()/open_file() still follow it; this is for listings)
   uint64_t modified = 0;                 // last change of the contents, seconds since 1970-01-01 UTC; 0 when the filesystem has none
   uint64_t created = 0;                  // the same for creation; 0 when unknown
 };

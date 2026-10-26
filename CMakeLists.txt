@@ -594,6 +594,7 @@ add_executable(BOOTX64
   src/Process/WindowsPipes.cpp
   src/Process/WindowsLocks.cpp
   src/Process/WindowsJobs.cpp
+  src/Process/WindowsMemory.cpp
   src/Process/Objects.cpp
   src/Process/ModuleLoader.cpp
   src/Process/LinuxSyscalls.cpp

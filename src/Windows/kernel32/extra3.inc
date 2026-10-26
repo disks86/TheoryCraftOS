@@ -710,22 +710,31 @@ EXPORT HRESULT WINAPI GetThreadDescription(HANDLE thread, WCHAR **description) {
   return 0;
 }
 
-static BOOL is_own_process(HANDLE process) { return process == GetCurrentProcess() || (process != NULL && GetProcessId(process) == GetCurrentProcessId()); }
 EXPORT BOOL WINAPI ReadProcessMemory(HANDLE process, LPCVOID base, LPVOID buffer, SIZE_T size, SIZE_T *done) {
-  if (!is_own_process(process)) { set_error(ERROR_ACCESS_DENIED); return FALSE; }
-  if (done) *done = 0;
-  if (IsBadReadPtr(base, size)) { set_error(ERROR_PARTIAL_COPY); return FALSE; }
-  memcpy(buffer, base, size);
-  if (done) *done = size;
-  return TRUE;
+  SIZE_T got = 0;
+  const NTSTATUS status = NtReadVirtualMemory(process, (PVOID)base, buffer, size, &got);
+  if (done) *done = got;
+  return NT_SUCCESS(status) && status != (NTSTATUS)0x8000000D ? TRUE : fail_nt(status);
 }
 EXPORT BOOL WINAPI WriteProcessMemory(HANDLE process, LPVOID base, LPCVOID buffer, SIZE_T size, SIZE_T *done) {
-  if (!is_own_process(process)) { set_error(ERROR_ACCESS_DENIED); return FALSE; }
-  if (done) *done = 0;
-  if (IsBadWritePtr(base, size)) { set_error(ERROR_PARTIAL_COPY); return FALSE; }
-  memcpy(base, buffer, size);
-  if (done) *done = size;
-  return TRUE;
+  SIZE_T got = 0;
+  const NTSTATUS status = NtWriteVirtualMemory(process, base, (PVOID)buffer, size, &got);
+  if (done) *done = got;
+  return NT_SUCCESS(status) && status != (NTSTATUS)0x8000000D ? TRUE : fail_nt(status);
+}
+EXPORT HANDLE WINAPI CreateRemoteThreadEx(HANDLE process, LPSECURITY_ATTRIBUTES sa, SIZE_T stack, LPTHREAD_START_ROUTINE start, LPVOID parameter, DWORD flags, LPVOID attributes, LPDWORD id) {
+  (void)sa; (void)attributes;
+  HANDLE thread = NULL;
+  const NTSTATUS status = NtCreateThreadEx(&thread, 0x1FFFFF, NULL, process, (PVOID)start, parameter, (flags & CREATE_SUSPENDED) ? 1 : 0, 0, stack, stack, NULL);
+  if (!NT_SUCCESS(status)) { set_error(status == STATUS_NOT_IMPLEMENTED ? ERROR_NOT_SUPPORTED : RtlNtStatusToDosError(status)); return NULL; }
+  if (id) {
+    ULONG64 info[6];
+    *id = NT_SUCCESS(NtQueryInformationThread(thread, 0, info, sizeof(info), NULL)) ? (DWORD)info[3] : 0;
+  }
+  return thread;
+}
+EXPORT HANDLE WINAPI CreateRemoteThread(HANDLE process, LPSECURITY_ATTRIBUTES sa, SIZE_T stack, LPTHREAD_START_ROUTINE start, LPVOID parameter, DWORD flags, LPDWORD id) {
+  return CreateRemoteThreadEx(process, sa, stack, start, parameter, flags, NULL, id);
 }
 
 typedef struct { ULONG_PTR ProcessorMask; int Relationship; union { struct { BYTE Flags; } ProcessorCore; struct { DWORD NodeNumber; } NumaNode; ULONGLONG Reserved[2]; }; } SYSTEM_LOGICAL_PROCESSOR_INFORMATION_;

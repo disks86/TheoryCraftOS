@@ -36,5 +36,13 @@ uint32_t nt_queue_apc_thread(Process& p, const SyscallRequest& r);
 uint32_t nt_dequeue_apc(Process& p, const SyscallRequest& r);
 uint32_t nt_open_thread(Process& p, const SyscallRequest& r);
 uint32_t nt_set_information_thread(Process& p, const SyscallRequest& r);
+// Threads of another program (CreateRemoteThread): called on that program, with its lock held (see IProcessRuntime::remote_operation). The thread is started (or left suspended); the
+// caller gets a handle to it that can be waited for.
+uint32_t create_thread_in(Process& target, uint64_t start, uint64_t argument, bool suspended, uint64_t stack_size, uint64_t* thread_id);
+uint32_t thread_status_in(Process& target, uint64_t thread_id, uint64_t* exit_code);      // 259 (STILL_ACTIVE) if it runs
+uint32_t terminate_thread_in(Process& target, uint64_t thread_id, uint32_t code);
+uint32_t resume_thread_in(Process& target, uint64_t thread_id, uint64_t* previous_count);
+// A handle to a thread of another program (what CreateRemoteThread gave out) names a thread id; false if the handle is something else.
+bool remote_thread_handle(Process& p, uint64_t handle, uint64_t* thread_id);
 
 }  // namespace process::windowsabi

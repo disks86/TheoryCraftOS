@@ -63,6 +63,7 @@ const char* status_name(Status status) {
     case Status::LoginFailed: return "login failed";
     case Status::UntrustedHost: return "untrusted host";
     case Status::Network: return "network error";
+    case Status::TooManyLinks: return "too many levels of symbolic links";
   }
   return "unknown";
 }

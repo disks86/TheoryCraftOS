@@ -81,6 +81,12 @@ int main(int argc, char **argv) {
     if (!CreateProcessA(NULL, command, NULL, NULL, FALSE, flags, NULL, NULL, &si, &pi)) return GetLastError() == ERROR_ACCESS_DENIED ? 20 : GetLastError() == ERROR_NOT_ENOUGH_QUOTA ? 21 : 22;
     return 0;
   }
+  if (!strcmp(what, "memexpect")) {      /* the parent put "TCOSREMOTE" at 0x30000000 of this process before it ran; answer at 0x30000010 */
+    volatile char *m = (volatile char *)0x30000000;
+    if (memcmp((const void *)m, "TCOSREMOTE", 10) != 0) return 2;
+    memcpy((void *)(m + 0x10), "ack", 4);
+    return 0;
+  }
   if (!strcmp(what, "pid")) return (int)(GetCurrentProcessId() & 0x7F);
   if (!strcmp(what, "spin")) { volatile unsigned long n = 0; for (;;) n = n + 1; }
   if (!strcmp(what, "waitevent")) {

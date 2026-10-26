@@ -120,6 +120,7 @@ struct Task final : process::IProcessRuntime {
   uint32_t current_processor() override;
   bool process_exists(uint64_t pid) override;
   uint32_t list_processes(ProcessEntry* out, uint32_t capacity) override;
+  uint32_t remote_operation(uint64_t pid, RemoteOp& op) override;
   uint32_t list_threads(uint64_t pid, ThreadEntry* out, uint32_t capacity) override;
   uint32_t list_modules(uint64_t pid, ModuleEntry* out, uint32_t capacity) override;
   uint64_t allocate_process_id() override;
@@ -158,6 +159,8 @@ struct ProcessInfo {
 uint32_t process_snapshot(ProcessInfo* out, uint32_t capacity);
 // The threads and modules of one running program (see process::IProcessRuntime). Safe from any thread that does not hold that program's lock.
 uint32_t thread_snapshot(uint64_t pid, process::IProcessRuntime::ThreadEntry* out, uint32_t capacity);
+// Work on another program's memory or threads (see process::IProcessRuntime::RemoteOp). Safe from any thread that does not hold that program's lock.
+uint32_t remote_operation(uint64_t pid, process::IProcessRuntime::RemoteOp& op);
 uint32_t module_snapshot(uint64_t pid, process::IProcessRuntime::ModuleEntry* out, uint32_t capacity);
 
 

@@ -131,6 +131,20 @@ class IProcessRuntime {
   // The running programs (Toolhelp, EnumProcesses): returns how many entries it wrote.
   struct ProcessEntry { uint64_t pid = 0, parent = 0; uint32_t threads = 0; char name[24] = {}; uint64_t memory_bytes = 0, create_time = 0; };
   virtual uint32_t list_processes(ProcessEntry* out, uint32_t capacity) { (void)out; (void)capacity; return 0; }
+  // Work on the memory and threads of another running program (by process id). The runtime takes that program's lock and gives up the caller's meanwhile; the work is done by
+  // windowsabi::run_remote(). Returns an NTSTATUS.
+  struct RemoteOp {
+    enum Kind : uint8_t { Read, Write, Allocate, Free, Protect, Query, CreateThread, ThreadStatus, TerminateThread, ResumeThread } kind = Read;
+    uint64_t address = 0, size = 0;       // Allocate/Free/Protect: in and out (as the NT services have them); Read/Write: the address; CreateThread: the start routine; thread calls: the thread id
+    ByteView out;                         // Read: where the bytes go
+    ConstByteView in;                     // Write: the bytes
+    uint64_t done = 0;                    // Read/Write: how many bytes were copied
+    uint32_t type = 0, protect = 0, old_protect = 0;
+    uint8_t info[48] = {};                // Query: MEMORY_BASIC_INFORMATION
+    uint64_t argument = 0, stack_size = 0, thread_id = 0;      // CreateThread (thread_id comes back); ThreadStatus: exit code (STILL_ACTIVE if it runs) comes back in `size`
+    bool suspended = false;
+  };
+  virtual uint32_t remote_operation(uint64_t pid, RemoteOp& op) { (void)pid; (void)op; return 0xC0000002u; }
   // The live threads and the loaded modules of the running program with this process id (the program first among the modules); each returns how many it wrote.
   struct ThreadEntry { uint64_t id = 0, start_address = 0; int32_t priority = 0; };
   struct ModuleEntry { uint64_t base = 0, size = 0, entry = 0; bool program = false; char name[40] = {}; };

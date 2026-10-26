@@ -164,7 +164,15 @@ static void test_small(void) {
   DWORD code = 0;
   check(!DeviceIoControl(GetStdHandle(STD_OUTPUT_HANDLE), 0x12345, NULL, 0, NULL, 0, &code, NULL) && GetLastError() == ERROR_INVALID_FUNCTION, "DeviceIoControl: ERROR_INVALID_FUNCTION");
   SetLastError(0);
-  check(!CreateHardLinkA("C:\\Temp\\hl", "C:\\Temp\\hl2", NULL) && GetLastError() == ERROR_NOT_SUPPORTED, "hard links are not supported");
+  check(!CreateHardLinkA("C:\\Temp\\hl", "C:\\Temp\\hl2", NULL) && GetLastError() == ERROR_FILE_NOT_FOUND, "a hard link to a file that does not exist");
+  {
+    HANDLE hlf = CreateFileA("C:\\Temp\\hl2", GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    DWORD put = 0;
+    if (hlf != INVALID_HANDLE_VALUE) { WriteFile(hlf, "x", 1, &put, NULL); CloseHandle(hlf); }
+    check(CreateHardLinkA("C:\\Temp\\hl", "C:\\Temp\\hl2", NULL) && DeleteFileA("C:\\Temp\\hl2") && GetFileAttributesA("C:\\Temp\\hl") != INVALID_FILE_ATTRIBUTES,
+          "a hard link survives the name it was made from (see linktest.c for the rest)");
+    DeleteFileA("C:\\Temp\\hl");
+  }
   check(GetActiveProcessorCount(0) >= 2 && GetActiveProcessorGroupCount() == 1, "GetActiveProcessorCount");
   char name[32];
   DWORD size = sizeof(name);

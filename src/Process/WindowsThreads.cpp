@@ -43,12 +43,105 @@ Process::ThreadRecord* thread_of(Process& p, uint64_t handle) {
   return p.find_thread(p.files().token(slot));
 }
 
+constexpr uint64_t kRemoteThreadIdLimit = uint64_t{1} << 20;      // thread ids are (counter << 20) | process id: a process object whose owner is bigger stands for a thread
+
 bool put32(Process& p, uint64_t address, uint32_t v) {
   const uint8_t raw[4] = {uint8_t(v), uint8_t(v >> 8), uint8_t(v >> 16), uint8_t(v >> 24)};
   return p.write_user(address, ConstByteView(raw, 4));
 }
 
 }  // namespace
+
+bool remote_thread_handle(Process& p, uint64_t handle, uint64_t* thread_id) {
+  if (handle == 0 || handle % 4 != 0 || handle / 4 > Process::kMaxDescriptors) return false;
+  const uint64_t slot = handle / 4 - 1;
+  ObjectManager* objects = system_objects();
+  if (!objects || p.files().kind(slot) != DescriptorKind::Process) return false;
+  bool exited = false;
+  uint32_t code = 0;
+  uint64_t owner = 0;
+  if (!objects->query_process(uint32_t(p.files().token(slot)), &exited, &code, &owner) || owner < kRemoteThreadIdLimit) return false;
+  *thread_id = owner;
+  return true;
+}
+
+uint32_t create_thread_in(Process& target, uint64_t start, uint64_t argument_value, bool suspended, uint64_t stack_size, uint64_t* thread_id) {
+  IProcessRuntime* runtime = target.runtime();
+  AddressSpace* space = target.address_space();
+  const Process::ThreadSupport& support = target.thread_support();
+  if (!runtime || !space || support.start_thunk == 0) return kNotImplemented;      // not a Windows program with threads
+  if (start == 0 || start >= 0x0000800000000000ull) return kInvalidParameter;
+  Process::ThreadRecord* record = target.add_thread(target.next_thread_id());
+  if (!record) return kInsufficientResources;
+  const uint64_t id = record->id;
+  WindowsThreadInput in;
+  in.peb = support.peb;
+  in.process_id = target.id();
+  in.thread_id = id;
+  in.stack_bytes = stack_size ? stack_size : support.stack_bytes;
+  for (uint32_t i = 0; i < support.tls_count; ++i) in.tls[i] = support.tls[i];
+  in.tls_count = support.tls_count;
+  WindowsThread thread;
+  if (build_windows_thread(*space, in, &thread) != LoadStatus::Ok) {
+    record->used = false;
+    return kInsufficientResources;
+  }
+  record->teb = thread.teb;
+  record->start_address = start;
+  record->region_base = thread.region_base;
+  record->region_size = thread.region_size;
+  ThreadStart ts;
+  ts.entry = support.start_thunk;
+  ts.argument = start;
+  ts.argument2 = argument_value;
+  ts.stack_pointer = thread.stack_pointer;
+  ts.gs_base = thread.teb;
+  ts.id = id;
+  if (!runtime->start_thread(ts, suspended)) {
+    space->unmap(thread.region_base, thread.region_size);
+    record->used = false;
+    return kInsufficientResources;
+  }
+  record->started = !suspended;
+  record->suspend_count = suspended ? 1 : 0;
+  *thread_id = id;
+  return kSuccess;
+}
+
+uint32_t thread_status_in(Process& target, uint64_t thread_id, uint64_t* exit_code) {
+  Process::ThreadRecord* record = target.find_thread(thread_id);
+  if (!record) { *exit_code = kStillActive + 1; return kInvalidHandle; }
+  *exit_code = record->finished ? record->exit_code : kStillActive;
+  return kSuccess;
+}
+
+uint32_t terminate_thread_in(Process& target, uint64_t thread_id, uint32_t code) {
+  Process::ThreadRecord* record = target.find_thread(thread_id);
+  if (!record) return kInvalidHandle;
+  if (record->finished) return kSuccess;
+  if (!record->started) { end_thread(target, *record, code); return kSuccess; }
+  if (!target.runtime()) return kNotImplemented;
+  target.runtime()->request_terminate(record->id, code);
+  if (ObjectManager* objects = system_objects()) objects->notify();
+  return kSuccess;
+}
+
+uint32_t resume_thread_in(Process& target, uint64_t thread_id, uint64_t* previous_count) {
+  Process::ThreadRecord* record = target.find_thread(thread_id);
+  if (!record || !target.runtime()) return kInvalidHandle;
+  *previous_count = uint32_t(record->suspend_count);
+  if (record->suspend_count > 0 && !record->finished) {
+    if (--record->suspend_count == 0) {
+      if (!record->started) {
+        if (!target.runtime()->resume_thread(record->id)) { ++record->suspend_count; return kInsufficientResources; }
+        record->started = true;
+      } else {
+        target.runtime()->request_resume(record->id);
+      }
+    }
+  }
+  return kSuccess;
+}
 
 // NtCreateThreadEx(PHANDLE Thread, ACCESS_MASK, POBJECT_ATTRIBUTES, HANDLE Process, PVOID StartRoutine, PVOID Argument, ULONG CreateFlags, SIZE_T ZeroBits,
 //                  SIZE_T StackSize, SIZE_T MaximumStackSize, PVOID AttributeList)
@@ -61,7 +154,31 @@ uint32_t nt_create_thread_ex(Process& p, const SyscallRequest& r) {
   AddressSpace* space = p.address_space();
   const Process::ThreadSupport& support = p.thread_support();
   if (!runtime || !space || support.start_thunk == 0) return kNotImplemented;      // a process of one thread
-  if (r.args[3] != ~uint64_t{0}) return kInvalidHandle;      // threads in other processes are not reachable
+  if (r.args[3] != ~uint64_t{0}) {      // a thread in another program: the handle names it by its id and can be waited for
+    bool exited = false;
+    uint32_t code = 0;
+    uint64_t pid = 0;
+    ObjectManager* objects = system_objects();
+    if (!objects || !process_handle_info(p, r.args[3], &exited, &code, &pid)) return kInvalidHandle;
+    if (pid != p.id()) {
+      if (exited) return 0xC000010Au;      // STATUS_PROCESS_IS_TERMINATING
+      IProcessRuntime::RemoteOp op;
+      op.kind = IProcessRuntime::RemoteOp::CreateThread;
+      op.address = start; op.argument = argument_value; op.suspended = (flags & kCreateSuspended) != 0; op.stack_size = stack_size ? stack_size : max_stack;
+      const uint32_t status = runtime->remote_operation(pid, op);
+      if (status != kSuccess) return status;
+      const ObjectManager::Created c = objects->create_process(op.thread_id);      // (an object that is signalled when the thread ends; see ObjectManager::process_exited)
+      if (c.id == 0) return c.status;
+      const int64_t slot = p.files().open_token(DescriptorKind::Process, c.id);
+      if (slot < 0) { objects->release(c.id); return kInsufficientResources; }
+      if (!p.write_user_u64(r.args[0], (uint64_t(slot) + 1) * 4)) { p.close_descriptor(uint64_t(slot)); return kAccessViolation; }
+      IProcessRuntime::RemoteOp check;      // (it may have ended before the object existed)
+      check.kind = IProcessRuntime::RemoteOp::ThreadStatus;
+      check.thread_id = op.thread_id;
+      if (runtime->remote_operation(pid, check) == kSuccess && check.size != kStillActive) objects->process_exited(op.thread_id, uint32_t(check.size));
+      return kSuccess;
+    }
+  }
   if (start == 0 || start >= 0x0000800000000000ull) return kInvalidParameter;
   Process::ThreadRecord* record = p.add_thread(p.next_thread_id());
   if (!record) return kInsufficientResources;
@@ -123,7 +240,7 @@ void end_thread(Process& p, Process::ThreadRecord& record, uint32_t code) {
     record.extra_tls[i] = 0;
     record.extra_tls_size[i] = 0;
   }
-  if (ObjectManager* objects = system_objects()) objects->abandon_thread(record.id);
+  if (ObjectManager* objects = system_objects()) { objects->abandon_thread(record.id); objects->process_exited(record.id, code); }      // (the second: a handle to the thread from another program)
   if (p.live_threads() == 0) p.terminate(code);
   if (p.runtime()) p.runtime()->notify();
   if (ObjectManager* objects = system_objects()) objects->notify();
@@ -131,6 +248,13 @@ void end_thread(Process& p, Process::ThreadRecord& record, uint32_t code) {
 
 // NtTerminateThread(HANDLE Thread, NTSTATUS ExitStatus): the calling thread ends at once; another one is told to end (it does at its next system call or timer tick).
 uint32_t nt_terminate_thread(Process& p, const SyscallRequest& r) {
+  uint64_t remote_id = 0;
+  if (remote_thread_handle(p, r.args[0], &remote_id)) {
+    IProcessRuntime::RemoteOp op;
+    op.kind = IProcessRuntime::RemoteOp::TerminateThread;
+    op.thread_id = remote_id; op.size = uint32_t(r.args[1]);
+    return p.runtime() ? p.runtime()->remote_operation(remote_id & (kRemoteThreadIdLimit - 1), op) : kNotImplemented;
+  }
   Process::ThreadRecord* record = thread_of(p, r.args[0]);
   if (!record) return kInvalidHandle;
   const uint64_t self = p.runtime() ? p.runtime()->current_thread_id() : p.id();
@@ -168,6 +292,15 @@ uint32_t nt_suspend_thread(Process& p, const SyscallRequest& r) {
 
 // NtResumeThread(HANDLE Thread, PULONG PreviousSuspendCount)
 uint32_t nt_resume_thread(Process& p, const SyscallRequest& r) {
+  uint64_t remote_id = 0;
+  if (remote_thread_handle(p, r.args[0], &remote_id)) {
+    IProcessRuntime::RemoteOp op;
+    op.kind = IProcessRuntime::RemoteOp::ResumeThread;
+    op.thread_id = remote_id;
+    const uint32_t status = p.runtime() ? p.runtime()->remote_operation(remote_id & (kRemoteThreadIdLimit - 1), op) : kNotImplemented;
+    if (status == kSuccess && r.args[1] != 0 && !put32(p, r.args[1], uint32_t(op.size))) return kAccessViolation;
+    return status;
+  }
   {      // the thread handle CreateProcess gave out
     bool other = false;
     uint32_t previous = 0;
@@ -271,6 +404,22 @@ uint32_t nt_open_thread(Process& p, const SyscallRequest& r) {
 uint32_t nt_query_information_thread(Process& p, const SyscallRequest& r) {
   uint64_t returned = 0;
   if (!windowsabi::argument(p, r, 4, &returned)) return kAccessViolation;
+  uint64_t remote_id = 0;
+  if (remote_thread_handle(p, r.args[0], &remote_id)) {      // a thread of another program: what the object knows (basic information only)
+    if (uint32_t(r.args[1]) != 0) return kInvalidInfoClass;
+    if (uint32_t(r.args[3]) < 48) return kInfoLengthMismatch;
+    bool exited = false;
+    uint32_t code = 0;
+    uint64_t owner = 0;
+    uint64_t slot = r.args[0] / 4 - 1;
+    if (!system_objects()->query_process(uint32_t(p.files().token(slot)), &exited, &code, &owner)) return kInvalidHandle;
+    uint8_t info[48] = {};
+    const uint32_t status_value = exited ? code : kStillActive;
+    for (uint32_t i = 0; i < 4; ++i) info[i] = uint8_t(status_value >> (8 * i));
+    for (uint32_t i = 0; i < 8; ++i) { info[16 + i] = uint8_t((owner & (kRemoteThreadIdLimit - 1)) >> (8 * i)); info[24 + i] = uint8_t(owner >> (8 * i)); }
+    if (returned != 0 && !p.write_user_u32(returned, 48)) return kAccessViolation;
+    return p.write_user(r.args[2], ConstByteView(info, 48)) ? kSuccess : kAccessViolation;
+  }
   Process::ThreadRecord* record = thread_of(p, r.args[0]);
   if (!record) return kInvalidHandle;
   const uint32_t info_class = uint32_t(r.args[1]), length = uint32_t(r.args[3]);
