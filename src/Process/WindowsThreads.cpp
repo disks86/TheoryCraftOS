@@ -475,6 +475,7 @@ uint32_t nt_set_information_thread(Process& p, const SyscallRequest& r) {
       const int32_t value = int32_t(in[0] | (uint32_t{in[1]} << 8) | (uint32_t{in[2]} << 16) | (uint32_t{in[3]} << 24));
       if (value < -16 || value > 16) return kInvalidParameter;
       record->priority = value;
+      if (p.runtime()) p.runtime()->set_priority(record->id, absolute_thread_priority(p.priority_class, value));
       return kSuccess;
     }
     case 4: {      // ThreadAffinityMask

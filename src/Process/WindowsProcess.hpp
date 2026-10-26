@@ -43,6 +43,12 @@ bool read_program_file(Process& p, StringView path, ByteBuffer* out, uint32_t* s
 bool process_handle_info(Process& p, uint64_t handle, bool* exited, uint32_t* code, uint64_t* pid);
 // NtTerminateProcess / NtResumeThread on a handle from nt_create_user_process; `handled` is false if the handle is not one.
 uint32_t terminate_process_handle(Process& p, uint64_t handle, uint32_t code, bool* handled);
+// The kernel scheduler's absolute priority (0..31) for a thread whose process has the Win32 priority class `win32_class` (one of the *_PRIORITY_CLASS constants) and whose
+// own relative priority (SetThreadPriority's argument, -16..16) is `relative`. Used both when a thread's own priority changes and, since every thread's absolute priority
+// depends on its process's class, when the class itself does.
+int32_t absolute_thread_priority(uint32_t win32_class, int32_t relative);
+// Pushes every one of this process's existing threads' absolute priority down to the kernel scheduler again (the process's priority class just changed).
+void repriority_threads(Process& p);
 uint32_t resume_process_handle(Process& p, uint64_t handle, uint32_t* previous, bool* handled);
 
 }  // namespace process::windowsabi
