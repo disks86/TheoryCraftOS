@@ -1301,12 +1301,18 @@ class Parser {
     if (!is(T::LBrace)) return null_fail("Unexpected token");
     Node* prologue = pending_prologue_;
     pending_prologue_ = nullptr;
-    const bool saved = in_function_, saved_async = in_async_, saved_generator = in_generator_, saved_async_generator = in_async_generator_;
+    const bool saved = in_function_, saved_async = in_async_, saved_generator = in_generator_, saved_async_generator = in_async_generator_, saved_check = check_this_;
+    const bool arrow = arrow_next_;
+    arrow_next_ = false;
+    if (derived_ctor_next_) check_this_ = true;
+    else if (!arrow) check_this_ = false;   // (a function of its own has a `this` of its own; an arrow keeps the one it is in)
+    derived_ctor_next_ = false;
     in_function_ = true;
     in_async_ = is_async;
     in_generator_ = is_generator;
     in_async_generator_ = is_async && is_generator;   // (await becomes a yield the driver of the async generator understands)
     Node* b = block();
+    check_this_ = saved_check;
     in_function_ = saved;
     in_async_ = saved_async;
     in_generator_ = saved_generator;
@@ -1360,6 +1366,7 @@ class Parser {
     }
     if (!expect(T::Arrow, "Unexpected token")) return nullptr;
     if (is(T::LBrace)) {
+      arrow_next_ = true;
       f->a = function_body(is_async);
     } else {
       Node* prologue = pending_prologue_;
@@ -2036,11 +2043,20 @@ class Parser {
         if (async_method) f->flags |= kFlagAsync;
         if (generator_method) f->flags |= kFlagGenerator;
         if (!parameters(f)) return nullptr;
+        const bool is_constructor = !m->is_static && !m->accessor && !m->computed && holder->text.equals("constructor");
+        derived_ctor_next_ = is_constructor && !class_super_.empty();
         f->a = function_body(async_method, generator_method);
+        derived_ctor_next_ = false;
         if (!f->a) return nullptr;
         if (async_method && generator_method) wrap_async_generator(f);
         m->value = f;
-        if (!m->is_static && !m->accessor && !m->computed && holder->text.equals("constructor")) {
+        if (is_constructor) {
+          if (!class_super_.empty()) {   // __this_pending(this) first: `this` is not usable until super(...) is called
+            Node* pending = new_statement(new_call(new_ident("__this_pending"), {make(NodeKind::This)}));
+            if (!pending) return nullptr;
+            pending->next = f->a->list;
+            f->a->list = pending;
+          }
           constructor = f;
           class_static_ = saved_static;
           continue;
@@ -2284,7 +2300,9 @@ class Parser {
   // tag`text ${value} more`: tag(strings, value), the strings array carrying .raw
   Node* tagged_template(Node* tag) {
     Node* raw_chunks = nullptr;
+    lenient_escapes_ = true;
     Node* tpl = template_literal(&raw_chunks);
+    lenient_escapes_ = false;
     if (!tpl) return nullptr;
     Node* cooked = make(NodeKind::ArrayLit);
     Node* raw = make(NodeKind::ArrayLit);
@@ -2314,6 +2332,8 @@ class Parser {
     helper->a = helper_name;
     helper->list = cooked;
     cooked->next = raw;
+    static uint32_t next_site = 1;   // (one number for each tagged template in the source, for the strings array that is made once: __template(cooked, raw, site))
+    raw->next = number_node(static_cast<double>(__atomic_fetch_add(&next_site, 1, __ATOMIC_RELAXED)));
     call->a = tag;
     call->list = helper;
     helper->next = expressions;
@@ -2480,6 +2500,7 @@ class Parser {
     if (w.equals("this")) {
       Node* n = make(NodeKind::This);
       next();
+      if (check_this_ && n) return new_call(new_ident("__this_check"), {n});
       return n;
     }
     if (w.equals("null")) {
@@ -2658,6 +2679,7 @@ class Parser {
     for (;;) {
       scratch_.clear();
       bool expression_follows = false;
+      bool invalid_escape = false;
       const uint64_t chunk_start = pos_;
       for (;;) {
         if (at_end()) return null_fail("Unterminated template literal");
@@ -2674,6 +2696,11 @@ class Parser {
         if (c == '\\') {
           ++pos_;
           read_escape(&scratch_);
+          if (failed_ && lenient_escapes_) {   // (a tagged template: the cooked string of this part is undefined, the raw one is the text)
+            failed_ = false;
+            error_->clear();
+            invalid_escape = true;
+          }
           if (failed_) return nullptr;
         } else {
           if (c == '\n') ++line_;
@@ -2681,9 +2708,10 @@ class Parser {
           ++pos_;
         }
       }
-      Node* chunk = make(NodeKind::String);
+      Node* chunk = make(invalid_escape ? NodeKind::Ident : NodeKind::String);
       if (!chunk) return nullptr;
-      chunk->text = arena_.copy(scratch_.view());
+      if (invalid_escape) chunk->text = "undefined";
+      else chunk->text = arena_.copy(scratch_.view());
       *tail = chunk;
       tail = &chunk->next;
       if (raw_tail) {   // the text as it was written (line ends as \n)
@@ -2717,6 +2745,8 @@ class Parser {
   uint64_t pos_ = 0, prev_end_ = 0;
   uint32_t line_ = 1;
   Token cur_;
+  bool lenient_escapes_ = false;   // inside a tagged template an invalid escape is allowed: the cooked string is undefined
+  bool check_this_ = false, arrow_next_ = false, derived_ctor_next_ = false;   // `this` in the body of a derived constructor is checked (see __this_check)
   bool failed_ = false, in_function_ = false, in_async_ = false, in_generator_ = false, in_async_generator_ = false;
   Node* pending_prologue_ = nullptr;   // the statements that unpack the parameters of the function whose body comes next
   uint32_t temp_counter_ = 0;

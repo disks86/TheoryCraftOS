@@ -85,6 +85,7 @@ Vm::Vm(allocators::IAllocator& allocator, IHost* host)
   number_proto_ = new_object(object_proto_);
   boolean_proto_ = new_object(object_proto_);
   symbol_proto_ = new_object(object_proto_);
+  for (JsObject*& p : function_kind_protos_) p = new_object(function_proto_);
   error_proto_ = new_object(object_proto_);
   iterator_proto_ = new_object(object_proto_);
   sentinel_ = new_object(object_proto_);
@@ -706,7 +707,7 @@ JsObject* Vm::new_native(NativeFn fn, StringView name, uint32_t arity) {
 }
 
 JsObject* Vm::new_function(FunctionCode* code, Env* env, const Value& this_value) {
-  JsObject* f = new_object(function_proto_);
+  JsObject* f = new_object(code->is_generator && function_kind_protos_[0] ? function_kind_protos_[0] : code->is_async && function_kind_protos_[1] ? function_kind_protos_[1] : function_proto_);
   if (f == sentinel_) return f;
   f->okind = ObjKind::Function;
   f->code = code;
@@ -866,8 +867,12 @@ void Vm::collect() {
     mark_value(f.this_value);
     mark(f.callee);
     mark_value(f.construct_this);
+    mark_value(f.new_target);
     mark(f.coroutine);
   }
+  for (JsObject* p : function_kind_protos_) mark(p);
+  mark_value(new_target_override_);
+  mark_value(pending_frame_new_target_);
   for (uint64_t i = 0; i < handlers_.count(); ++i) mark(handlers_[i].env);
   mark_value(exception_);
   mark_value(last_result_);
@@ -2354,6 +2359,8 @@ bool Vm::push_frame(JsObject* fn, const Value& this_value, const Value* args, ui
   f.via_super = super_pending_;
   super_pending_ = false;
   f.construct_this = construct_this;
+  f.new_target = pending_frame_new_target_;
+  pending_frame_new_target_ = Value();
   f.coroutine = nullptr;
   if (!frames_.push_back(f)) return throw_error(ErrorKind::RangeError, "out of memory");
   return true;
@@ -2439,9 +2446,11 @@ bool Vm::call_value(const Value& function, const Value& this_value, const Value*
     sp_ = base;
     return throw_error(ErrorKind::TypeError, "function is not a constructor");
   }
+  const Value new_target = new_target_override_;
+  new_target_override_ = Value();
   if (construct) {
     Value proto;
-    if (!get(fn, prototype_, &proto)) {
+    if (!get(new_target.is_object() ? new_target : fn, prototype_, &proto)) {
       sp_ = base;
       return false;
     }
@@ -2482,6 +2491,7 @@ bool Vm::call_value(const Value& function, const Value& this_value, const Value*
     return started;
   }
   const uint32_t entry = static_cast<uint32_t>(frames_.count());
+  pending_frame_new_target_ = new_target;
   if (!push_frame(f, this_for_call, a, total, base, construct, created)) {
     sp_ = base;
     return false;
@@ -2506,6 +2516,13 @@ bool Vm::construct(const Value& function, const Value* args, uint32_t argc, Valu
   if (ok) {
     keeping(result, [this] { checkpoint(); });
   }
+  return ok;
+}
+
+bool Vm::construct_with(const Value& function, const Value* args, uint32_t argc, const Value& new_target, Value* result) {
+  new_target_override_ = new_target;
+  const bool ok = construct(function, args, argc, result);
+  new_target_override_ = Value();
   return ok;
 }
 
@@ -2569,7 +2586,7 @@ reload:
       case Opc::NewTarget: {
         Value target;
         if (fp->construct && fp->callee) {
-          target = Value::make_object(fp->callee);
+          target = fp->new_target.is_object() ? fp->new_target : Value::make_object(fp->callee);
         } else if (fp->via_super && fp->this_value.is_object()) {   // (a parent constructor run by super(...): the class that `new` named)
           get(fp->this_value, intern("constructor"), &target);
           if (!is_callable(target)) target = Value();
@@ -3355,6 +3372,7 @@ bool Vm::run_coroutine(JsObject* co, bool start, bool throwing, const Value& inp
     f.handlers = static_cast<uint32_t>(handlers_.count());
     f.construct = false;
     f.via_super = false;
+    f.new_target = Value();
     f.coroutine = co;
     for (uint64_t i = 0; i < s->stack.count(); ++i) stack_[sp_++] = s->stack[i];
     const uint32_t index = static_cast<uint32_t>(frames_.count());
@@ -3450,6 +3468,7 @@ bool Vm::run_generator(JsObject* co, bool start, int mode, const Value& input, V
     f.handlers = static_cast<uint32_t>(handlers_.count());
     f.construct = false;
     f.via_super = false;
+    f.new_target = Value();
     f.coroutine = co;
     for (uint64_t i = 0; i < s->stack.count(); ++i) stack_[sp_++] = s->stack[i];
     const uint32_t index = static_cast<uint32_t>(frames_.count());

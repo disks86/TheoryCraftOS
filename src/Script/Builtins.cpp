@@ -480,7 +480,24 @@ NATIVE(class_define) {
 }
 
 // __super_init(parent, this, ...args): super(...args). A parent that is a built-in (Error ...) answers with an object of its own: what it made is copied onto `this`.
+// __this_pending(this) starts a derived constructor, __this_check(this) is every `this` in it: using `this` before super(...) is a ReferenceError.
+NATIVE(this_pending) {
+  (void)vm;
+  (void)self;
+  (void)result;
+  if (argc > 0 && args[0].is_object()) args[0].as_object()->uninit_this = true;
+  return true;
+}
+
+NATIVE(this_check) {
+  const Value v = arg_at(args, argc, 0);
+  if (v.is_object() && v.as_object()->uninit_this) return vm.throw_error(ErrorKind::ReferenceError, "Must call super constructor in derived class before accessing 'this' or returning from derived constructor");
+  *result = v;
+  return true;
+}
+
 NATIVE(class_super_init) {
+  if (argc > 1 && args[1].is_object()) args[1].as_object()->uninit_this = false;   // (the arguments of super(...) were evaluated: `this` is usable from here)
   const Value parent = arg_at(args, argc, 0), self_value = arg_at(args, argc, 1);
   if (!Vm::is_callable(parent)) return vm.throw_error(ErrorKind::TypeError, "Super constructor is not a constructor");
   if (self_value.is_object() && self_value.as_object()->host && parent.as_object()->okind == ObjKind::Native) {   // a class that extends a built-in of the page (HTMLElement): the object is made already
@@ -600,11 +617,33 @@ NATIVE(object_has_own_property) {
 // __template(cooked, raw): the strings array a tag function gets
 NATIVE(template_object) {
   const Value cooked = arg_at(args, argc, 0), raw = arg_at(args, argc, 1);
+  // the strings array of a site is one object: kept in a hidden list, by site number
+  Value cache_value;
+  JsObject* cache = nullptr;
+  double site = 0;
+  if (argc > 2 && args[2].is_number()) site = args[2].u.number;
+  if (site >= 1 && site < 1e7) {
+    if (vm.get_named(Value::make_object(vm.global()), "__template_cache", &cache_value) && cache_value.is_object()) cache = cache_value.as_object();
+    if (!cache) {
+      cache = vm.new_array();
+      vm.define_named(vm.global(), "__template_cache", Value::make_object(cache), 0);
+    }
+    for (uint32_t i = 0; i + 1 < cache->length; i += 2) {
+      if (cache->items[i].is_number() && cache->items[i].u.number == site) {
+        *result = cache->items[i + 1];
+        return true;
+      }
+    }
+  }
   if (cooked.is_object() && raw.is_object()) {
     vm.define_named(cooked.as_object(), "raw", raw, 0);
     cooked.as_object()->frozen = raw.as_object()->frozen = true;   // (the strings array of a tagged template and its raw array are frozen)
   }
   *result = cooked;
+  if (cache && cooked.is_object()) {
+    vm.array_push(cache, Value::make_number(site));
+    vm.array_push(cache, cooked);
+  }
   return true;
 }
 
@@ -722,6 +761,7 @@ NATIVE(array_ctor) {
       *result = self;
       return true;
     }
+    if (self.as_object() != vm.global() && self.as_object()->prop_count == 0) a->proto = self.as_object()->proto;   // Reflect.construct(Array, args, NewTarget): the prototype of the new target
   }
   *result = Value::make_object(a);
   return true;
@@ -807,6 +847,37 @@ NATIVE(array_unshift) {
   return true;
 }
 
+// ArraySpeciesCreate for the natives that make a new array (map, filter, slice, concat): an instance of a subclass of Array makes its own kind
+// (this.constructor[Symbol.species]); everything else, and the plain Array, makes an ordinary array.
+bool species_array(Vm& vm, const Value& self, uint32_t length, JsObject** out) {
+  *out = nullptr;
+  if (self.is_object() && self.as_object()->okind == ObjKind::Array && self.as_object()->proto != vm.array_proto()) {
+    Value ctor, species, array_ctor;
+    if (!vm.get_named(self, "constructor", &ctor)) return false;
+    if (ctor.is_object() && vm.get_named(ctor, "@@species", &species) && Vm::is_callable(species) && vm.get_named(Value::make_object(vm.global()), "Array", &array_ctor) &&
+        !vm.strict_equals(species, array_ctor)) {
+      Value species_proto;   // (only a class of the page that derives from Array: a NodeList is array-like but not an array)
+      bool derived = false;
+      if (species.as_object()->okind == ObjKind::Function && !species.as_object()->code->library && vm.get_named(species, "prototype", &species_proto) && species_proto.is_object())
+        for (JsObject* p = species_proto.as_object(); p && !derived; p = p->proto) derived = p == vm.array_proto();
+      if (!derived) {
+        *out = vm.new_array(length);
+        return true;
+      }
+      Value made;
+      const Value len = Value::make_number(length);
+      if (!vm.construct(species, &len, 1, &made)) return false;
+      if (made.is_object() && made.as_object()->okind == ObjKind::Array) {
+        vm.array_set_length(made.as_object(), 0);
+        *out = made.as_object();
+        return true;
+      }
+    }
+  }
+  *out = vm.new_array(length);
+  return true;
+}
+
 NATIVE(array_slice) {
   JsObject* a;
   if (!this_array(vm, self, &a)) return false;
@@ -814,7 +885,8 @@ NATIVE(array_slice) {
   if (!arg_integer(vm, args, argc, 0, 0, &from) || !arg_integer(vm, args, argc, 1, a->length, &to)) return false;
   from = relative(from, a->length);
   to = relative(to, a->length);
-  JsObject* out = vm.new_array(to > from ? static_cast<uint32_t>(to - from) : 0);
+  JsObject* out;
+  if (!species_array(vm, self, to > from ? static_cast<uint32_t>(to - from) : 0, &out)) return false;
   for (int64_t i = from; i < to; ++i) vm.array_push(out, a->items[i]);
   *result = Value::make_object(out);
   return true;
@@ -850,7 +922,8 @@ NATIVE(array_splice) {
 NATIVE(array_concat) {
   JsObject* a;
   if (!this_array(vm, self, &a)) return false;
-  JsObject* out = vm.new_array(a->length);
+  JsObject* out;
+  if (!species_array(vm, self, a->length, &out)) return false;
   for (uint32_t i = 0; i < a->length; ++i) vm.array_push(out, a->items[i]);
   for (uint32_t k = 0; k < argc; ++k) {
     if (args[k].is_object() && args[k].as_object()->okind == ObjKind::Array) {
@@ -968,7 +1041,8 @@ bool array_each(Vm& vm, const Value& self, const Value* args, uint32_t argc, Val
   if (!this_array(vm, self, &a)) return false;
   const Value fn = arg_at(args, argc, 0), this_arg = arg_at(args, argc, 1);
   if (!need_function(vm, fn)) return false;
-  JsObject* out = (mode == Each::Map || mode == Each::Filter) ? vm.new_array(a->length) : nullptr;
+  JsObject* out = nullptr;
+  if ((mode == Each::Map || mode == Each::Filter) && !species_array(vm, self, a->length, &out)) return false;
   *result = out ? Value::make_object(out) : Value();
   if (mode == Each::FindIndex) *result = num_value(-1);
   if (mode == Each::Some) *result = Value::make_bool(false);
@@ -2074,6 +2148,24 @@ NATIVE(symbol_info) {
   return true;
 }
 
+// __reflect_construct(F, argsArray, newTarget)
+NATIVE(reflect_construct) {
+  (void)self;
+  const Value f = arg_at(args, argc, 0), list = arg_at(args, argc, 1), target = arg_at(args, argc, 2);
+  if (!list.is_object() || list.as_object()->okind != ObjKind::Array) return vm.throw_error(ErrorKind::TypeError, "CreateListFromArrayLike called on non-object");
+  return vm.construct_with(f, list.as_object()->items, list.as_object()->length, target, result);
+}
+
+NATIVE(function_protos) {
+  (void)self;
+  (void)args;
+  (void)argc;
+  JsObject* list = vm.new_array(3);
+  for (int i = 0; i < 3; ++i) vm.array_push(list, Value::make_object(vm.function_kind_proto(i)));
+  *result = Value::make_object(list);
+  return true;
+}
+
 NATIVE(primitive_of_native) {
   (void)self;
   *result = Vm::primitive_of(arg_at(args, argc, 0));
@@ -2857,7 +2949,8 @@ bool install_builtins(Vm& vm) {
   vm.define_native(generator_proto, "toString", generator_to_string, 0);
   vm.define(generator_proto, vm.intern("@@iterator"), Value::make_object(vm.new_native(return_this, "[Symbol.iterator]", 0)), kWritable);
   vm.define_named(g, "__generator_proto", Value::make_object(generator_proto), 0);
-  vm.define_native(g, "__template", template_object, 2);
+  vm.define_named(generator_proto, "@@toStringTag", str_value(vm, "Generator"), 0);
+  vm.define_native(g, "__template", template_object, 3);
   vm.define_native(g, "__bigint_new", bigint_new, 2);
   vm.define_native(g, "__to_array", destructure_to_array, 2);
   vm.define_native(g, "__req_object", destructure_require_object, 1);
@@ -2866,6 +2959,8 @@ bool install_builtins(Vm& vm) {
   vm.define_native(g, "__class_check", class_check, 2);
   vm.define_native(g, "__def", class_define, 4);
   vm.define_native(g, "__super_init", class_super_init, 2);
+  vm.define_native(g, "__this_pending", this_pending, 0);
+  vm.define_native(g, "__this_check", this_check, 1);
   vm.define_native(vm.object_proto(), "toString", object_to_string, 0);
   vm.define_native(vm.object_proto(), "valueOf", object_value_of, 0);
   make_ctor("Function", function_constructor, 1, vm.function_proto());
@@ -3035,6 +3130,8 @@ bool install_builtins(Vm& vm) {
   }
   vm.define_native(g, "__symbol_info", symbol_info, 2);
   vm.define_native(g, "__primitive_of", primitive_of_native, 1);
+  vm.define_native(g, "__reflect_construct", reflect_construct, 3);
+  vm.define_native(g, "__function_protos", function_protos, 0);
   vm.define_native(object, "getOwnPropertySymbols", object_get_own_property_symbols, 1);
 
   // Promise

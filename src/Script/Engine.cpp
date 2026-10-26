@@ -130,6 +130,23 @@ const char kCollections[] = R"JSLIB((function (g) {
     Object.defineProperty(it, '__kind', { value: kind });
     return it;
   });
+  // GeneratorFunction and AsyncFunction: the constructors of generator and async functions (not globals); they build a function from source like Function does
+  (function () {
+    var protos = __function_protos(), generatorProto = __generator_proto;
+    [['GeneratorFunction', protos[0], 'function*'], ['AsyncFunction', protos[1], 'async function']].forEach(function (spec) {
+      var proto = spec[1], prefix = spec[2];
+      var C = function () {
+        var a = Array.prototype.slice.call(arguments), body = a.length ? String(a.pop()) : '';
+        return (0, eval)('(' + prefix + ' anonymous(' + a.join(',') + '\n) {\n' + body + '\n})');
+      };
+      Object.defineProperty(C, 'name', { value: spec[0] });
+      Object.setPrototypeOf(C, Function);
+      Object.defineProperty(C, 'prototype', { value: proto });
+      Object.defineProperty(proto, 'constructor', { value: C, configurable: true });
+      Object.defineProperty(proto, Symbol.toStringTag, { value: spec[0], configurable: true });
+      if (spec[0] === 'GeneratorFunction') Object.defineProperty(proto, 'prototype', { value: generatorProto, configurable: true });
+    });
+  }());
   // the generator objects (and so the iterators of arrays and typed arrays) are iterators
   (function () {
     var generator = (function* () { })();
@@ -719,17 +736,11 @@ const char kCollections[] = R"JSLIB((function (g) {
   if (!Object.fromEntries) def(Object, 'fromEntries', function (iterable) { var o = {}; for (var e of iterable) o[e[0]] = e[1]; return o; });
   var Reflect = {
     apply: function (f, self, args) { return f.apply(self, args); },
-    construct: function (F, args) {
-      var a = args || [];
-      switch (a.length) {
-        case 0: return new F();
-        case 1: return new F(a[0]);
-        case 2: return new F(a[0], a[1]);
-        case 3: return new F(a[0], a[1], a[2]);
-        case 4: return new F(a[0], a[1], a[2], a[3]);
-        case 5: return new F(a[0], a[1], a[2], a[3], a[4]);
-        default: return new F(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]);
-      }
+    construct: function (F, args, newTarget) {
+      if (typeof F !== 'function') throw new TypeError(String(F) + ' is not a constructor');
+      if (newTarget === undefined) newTarget = F; else if (typeof newTarget !== 'function') throw new TypeError(String(newTarget) + ' is not a constructor');
+      if (args === null || (typeof args !== 'object' && typeof args !== 'function')) throw new TypeError('CreateListFromArrayLike called on non-object');
+      return __reflect_construct(F, Array.prototype.slice.call(args), newTarget);
     },
     defineProperty: function (o, k, d) {
       if (o === null || (typeof o !== 'object' && typeof o !== 'function')) throw new TypeError('Reflect.defineProperty called on non-object');
