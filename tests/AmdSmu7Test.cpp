@@ -82,6 +82,17 @@ static void test_power_messages() {
   CHECK(smc.writes.size() == 2 && smc.writes[0] == std::make_pair(kResp, 0u) && smc.writes[1] == std::make_pair(kMessage, 0x60u));
 }
 
+static void test_vce_power() {
+  FakeSmc smc;
+  smc.regs[kResp] = 1;
+  fakevcn::FakeClock clock;
+  AmdSmu7 smu(smc, clock);
+  // PPSMC_MSG_VCEPowerON / OFF (0x10f / 0x10e in smu7_ppsmc.h), plain messages: the argument register is not written.
+  CHECK(smu.vce_power(true) == AmdSmu7::Result::Ok && smu.vce_power(false) == AmdSmu7::Result::Ok);
+  CHECK(smc.handled.size() == 2 && smc.handled[0].first == 0x10f && smc.handled[1].first == 0x10e);
+  CHECK(smc.writes.size() == 4 && smc.writes[0] == std::make_pair(kResp, 0u) && smc.writes[1] == std::make_pair(kMessage, 0x10fu));
+}
+
 static void test_results() {
   fakevcn::FakeClock clock;
   {
@@ -162,6 +173,7 @@ static void test_not_running() {
 
 int main() {
   test_power_messages();
+  test_vce_power();
   test_results();
   test_not_running();
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }
