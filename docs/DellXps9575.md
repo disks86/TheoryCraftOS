@@ -70,7 +70,23 @@ engine might write to is kept) are covered too.
 The context workarounds are written to the registers directly instead of being loaded into every context with `MI_LOAD_REGISTER_IMM`, which is enough because the driver has one context (the engine saves them with it). The MCR steering
 selector (needed for reads of slice-specific registers) is not set; nothing here reads them.
 
-Not done: stencil, textured triangles, tiling, interrupts (the driver polls), a render node for a non-display Intel GPU, the other engines' workarounds, and every check
+## Textures in the graphics device API
+
+`IGraphicsDevice` now has textures (`src/Graphics/Graphics3D/IGraphicsDevice.hpp`): an image made with `kImageSampled` is filled by `IImage::write_pixels` (0xAARRGGBB, the device converts to its byte order), bound to a unit
+(`kMaxTextureUnits` = 2) by `ICommandBuffer::bind_texture(unit, image, SamplerDesc)`, and read by a fragment shader through `ITextureSet::sample(unit, u, v)`. A sampler has `Nearest` or `Linear` filtering and
+`Repeat` or `ClampToEdge` addressing per axis; coordinates are normalised with (0, 0) at the top left corner of the top left texel and v down; there are no mipmaps. A pipeline says how many units it samples
+(`GraphicsPipelineDesc::texture_count`) and its fragment shader is a `textured_fragment_function` (a shader is that or a plain `fragment_function`, never both). `BuiltinShaders` has the textured pair
+(`textured_vertex_shader`, `textured_fragment_shader`, `describe_textured_pipeline`: a float3 position, a float2 coordinate, the matrix in the push constants, texture unit 0).
+
+Only the software device runs textures so far. The other devices refuse a pipeline with a texture count (`nullptr`) and fail a submit that binds a texture, so a caller falls back to the software device the same way it does
+for any pipeline they cannot take. The software device refuses a draw whose textures are not all bound, whose texture is the image being drawn into, or whose image was not made for sampling. `tests/GraphicsTest.cpp` covers
+nearest and linear filtering, both address modes, both byte orders, alpha and blending, perspective-correct coordinates (the test fails with affine interpolation) and every refusal; `tests/Gen9GraphicsDeviceTest.cpp` the
+Intel device's refusals.
+
+The Gen9 hardware path for it is not written. The render copy kernel it already has (from the intel-gpu-tools Gen9 render copy) samples a surface at an interpolated coordinate, which is what a textured triangle needs:
+the work is carrying the coordinate through the batch's vertex layout, the sampler and surface state for a bound texture, the image upload through the page tables, and the fake pipeline's model of it.
+
+Not done: stencil, textured triangles on the Intel device, tiling, interrupts (the driver polls), a render node for a non-display Intel GPU, the other engines' workarounds, and every check
 on real hardware. The device is not used by the 2D renderer. Treat the first run on a 9575 as a bring-up, not as a working driver.
 
 ## Radeon RX Vega M: UVD 6.3
