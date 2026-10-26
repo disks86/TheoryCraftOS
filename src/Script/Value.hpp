@@ -107,6 +107,14 @@ struct JsString : Cell {
   uint32_t length = 0;
   uint32_t hash = 0;
   bool interned = false;   // property names are interned: two equal names are the same cell
+  // What the bytes mean to a script (looked at when something asks for the length in characters or an index; see Vm::string_kind):
+  //   ascii: every byte is a character; text: valid UTF-8 (a lone surrogate is kept as its three bytes), a character is a UTF-16 code unit;
+  //   binary: raw bytes made by __bytes_to_string, atob and the like (or anything that is not valid UTF-8): every byte is a character, its value.
+  uint8_t kind = 0;        // 0 not looked at yet, 1 ascii, 2 text, 3 binary
+  bool binary = false;     // made from raw bytes: kind 3 whatever the bytes are
+  uint32_t units = 0;      // the length in characters (UTF-16 code units for text), once kind is set
+  uint32_t map_unit = 0, map_byte = 0;   // the last place a character offset was turned into a byte offset (text only): the next one starts from there
+  uint16_t* wide = nullptr;   // the code units of a text string, made when a script indexes into it (freed with the string)
   JsString() : Cell(CellKind::String) {}
   char* data() { return reinterpret_cast<char*>(this + 1); }
   const char* data() const { return reinterpret_cast<const char*>(this + 1); }

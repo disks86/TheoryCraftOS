@@ -89,7 +89,15 @@ NATIVE(net_bytes_to_string) {
     return true;
   }
   if (!byte_array_bytes(a, &bytes)) return vm.throw_error(ErrorKind::TypeError, "The provided value is not a byte array.");
-  *result = str_value(vm, bytes);
+  *result = Value::make_string(vm.new_binary_string(bytes));   // (bytes: scripts see every byte as a character 0..255)
+  return true;
+}
+
+// __text_bytes(string): the UTF-8 bytes of a string as a byte string (its characters are the bytes).
+NATIVE(net_text_bytes) {
+  String text(vm.allocator());
+  if (!arg_text(vm, arg_at(args, argc, 0), &text)) return false;
+  *result = Value::make_string(vm.new_binary_string(text.view()));
   return true;
 }
 
@@ -766,6 +774,7 @@ bool install_net(DomBindings::Impl& c) {
   vm.define_native(g, "__net_send_sync", net_send_sync, 1);
   vm.define_native(g, "__utf8_clean", net_utf8_clean, 1);
   vm.define_native(g, "__bytes_to_string", net_bytes_to_string, 1);
+  vm.define_native(g, "__text_bytes", net_text_bytes, 1);
   vm.define_native(g, "__string_to_bytes", net_string_to_bytes, 1);
   vm.define_native(g, "__form_encode", net_form_encode, 1);
   vm.define_native(g, "__form_decode", net_form_decode, 1);

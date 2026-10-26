@@ -390,7 +390,7 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
     *out = str_value(vm, all.view());
     return true;
   }
-  if ((n->is_text() || n->type == dom::NodeType::Comment) && IS("length")) { *out = num_value(static_cast<double>(n->data.size())); return true; }
+  if ((n->is_text() || n->type == dom::NodeType::Comment) && IS("length")) { *out = num_value(static_cast<double>(utf16_length(n->data.view()))); return true; }
   if ((n->is_text() || n->type == dom::NodeType::Comment) && IS("data")) { *out = str_value(vm, n->data.view()); return true; }
   // --- documents
   if (document) {
@@ -998,8 +998,8 @@ NATIVE(text_split) {
   if (!n || !n->is_text()) return vm.throw_error(ErrorKind::TypeError, "Illegal invocation");
   double at = 0;
   if (!vm.to_number(arg_at(args, argc, 0), &at)) return false;
-  if (at != at || at < 0 || at > static_cast<double>(n->data.size())) return throw_dom(vm, "IndexSizeError", "The offset is larger than the node's length.");
-  const uint64_t i = static_cast<uint64_t>(at);
+  if (at != at || at < 0 || at > static_cast<double>(utf16_length(n->data.view()))) return throw_dom(vm, "IndexSizeError", "The offset is larger than the node's length.");
+  const uint64_t i = utf16_to_byte(n->data.view(), static_cast<uint64_t>(at));
   dom::Node* tail = n->owner->create_text(n->data.view().substr(i));
   if (!tail) return throw_dom_error(vm, dom::DomError::OutOfMemory);
   n->data.truncate(i);

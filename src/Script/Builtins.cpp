@@ -23,6 +23,7 @@
 // Stdlib.cpp). Not here: the DOM.
 #include <initializer_list>
 #include "Math/FloatMath.hpp"
+#include "Script/UnicodeText.hpp"
 #include "Script/Number.hpp"
 #include "Script/Ast.hpp"
 #include "Script/Compiler.hpp"
@@ -1116,22 +1117,14 @@ NATIVE(string_ctor) {
 }
 
 NATIVE(string_from_char_code) {
-  String text(vm.allocator());
+  List<uint16_t> units(vm.allocator());
   for (uint32_t i = 0; i < argc; ++i) {
     double d;
     if (!vm.to_number(args[i], &d)) return false;
-    const uint32_t cp = d == d && d >= 0 ? static_cast<uint32_t>(d) & 0xFFFF : 0;
-    if (cp < 0x80) text.push_back(static_cast<char>(cp));
-    else if (cp < 0x800) {
-      text.push_back(static_cast<char>(0xC0 | (cp >> 6)));
-      text.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-    } else {
-      text.push_back(static_cast<char>(0xE0 | (cp >> 12)));
-      text.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
-      text.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-    }
+    const uint32_t unit = d == d && d >= 0 && d < 4294967296.0 ? static_cast<uint32_t>(d) & 0xFFFF : (d == d && d < 0 && d > -4294967296.0 ? static_cast<uint32_t>(static_cast<int64_t>(d)) & 0xFFFF : 0);
+    units.push_back(static_cast<uint16_t>(unit));
   }
-  *result = str_value(vm, text.view());
+  *result = Value::make_string(vm.string_from_units(units.count() ? &units[0] : nullptr, static_cast<uint32_t>(units.count())));
   return true;
 }
 
@@ -1168,11 +1161,34 @@ NATIVE(string_from_code_point) {
   return true;
 }
 
+// The characters of a string as an array of code units (for text, its wide copy; for the others, the bytes widened).
+struct Units {
+  const uint16_t* wide = nullptr;
+  const uint8_t* bytes = nullptr;
+  uint32_t count = 0;
+  uint32_t at(uint32_t i) const { return wide ? wide[i] : bytes[i]; }
+};
+Units units_of(Vm& vm, JsString* s) {
+  Units u;
+  u.count = vm.string_length(s);
+  u.wide = vm.string_wide(s);
+  if (!u.wide) u.bytes = reinterpret_cast<const uint8_t*>(s->data());
+  return u;
+}
+// Does `needle` occur in `hay` at the unit `at`?
+bool units_match(const Units& hay, const Units& needle, int64_t at) {
+  if (at < 0 || static_cast<uint64_t>(at) + needle.count > hay.count) return false;
+  for (uint32_t k = 0; k < needle.count; ++k)
+    if (hay.at(static_cast<uint32_t>(at) + k) != needle.at(k)) return false;
+  return true;
+}
+
 NATIVE(string_char_at) {
   JsString* s;
   int64_t i;
   if (!this_string(vm, self, &s) || !arg_integer(vm, args, argc, 0, 0, &i)) return false;
-  *result = i >= 0 && i < s->length ? str_value(vm, StringView(s->data() + i, 1)) : Value::make_string(vm.empty_string());
+  const int64_t n = vm.string_length(s);
+  *result = i >= 0 && i < n ? Value::make_string(vm.string_part(s, static_cast<uint32_t>(i), static_cast<uint32_t>(i) + 1)) : Value::make_string(vm.empty_string());
   return true;
 }
 
@@ -1180,8 +1196,9 @@ NATIVE(string_at) {
   JsString* s;
   int64_t i;
   if (!this_string(vm, self, &s) || !arg_integer(vm, args, argc, 0, 0, &i)) return false;
-  if (i < 0) i += s->length;
-  *result = i >= 0 && i < s->length ? str_value(vm, StringView(s->data() + i, 1)) : Value();
+  const int64_t n = vm.string_length(s);
+  if (i < 0) i += n;
+  *result = i >= 0 && i < n ? Value::make_string(vm.string_part(s, static_cast<uint32_t>(i), static_cast<uint32_t>(i) + 1)) : Value();
   return true;
 }
 
@@ -1189,7 +1206,7 @@ NATIVE(string_char_code_at) {
   JsString* s;
   int64_t i;
   if (!this_string(vm, self, &s) || !arg_integer(vm, args, argc, 0, 0, &i)) return false;
-  *result = i >= 0 && i < s->length ? num_value(static_cast<uint8_t>(s->data()[i])) : num_value(kNaN);
+  *result = i >= 0 && i < vm.string_length(s) ? num_value(vm.string_unit_at(s, static_cast<uint32_t>(i))) : num_value(kNaN);
   return true;
 }
 
@@ -1197,10 +1214,18 @@ NATIVE(string_index_of) {
   JsString *s, *needle;
   int64_t from;
   if (!this_string(vm, self, &s) || !arg_string(vm, args, argc, 0, &needle) || !arg_integer(vm, args, argc, 1, 0, &from)) return false;
+  const Units hay = units_of(vm, s), pin = units_of(vm, needle);
   if (from < 0) from = 0;
-  if (from > s->length) from = s->length;
-  const uint64_t at = s->view().find(needle->view(), static_cast<uint64_t>(from));
-  *result = num_value(at == StringView::npos ? -1 : static_cast<double>(at));
+  if (from > hay.count) from = hay.count;
+  int64_t found = -1;
+  if (!hay.wide && !pin.wide) {   // (bytes on both sides)
+    const uint64_t at = s->view().find(needle->view(), static_cast<uint64_t>(from));
+    found = at == StringView::npos ? -1 : static_cast<int64_t>(at);
+  } else {
+    for (int64_t i = from; i + pin.count <= hay.count; ++i)
+      if (units_match(hay, pin, i)) { found = i; break; }
+  }
+  *result = num_value(static_cast<double>(found));
   return true;
 }
 
@@ -1209,14 +1234,15 @@ NATIVE(string_last_index_of) {
   if (!this_string(vm, self, &s) || !arg_string(vm, args, argc, 0, &needle)) return false;
   double from_index = kNaN;   // (NaN: from the end)
   if (argc > 1 && !args[1].is_undefined() && !vm.to_number(args[1], &from_index)) return false;
+  const Units hay = units_of(vm, s), pin = units_of(vm, needle);
   int64_t found = -1;
-  int64_t start = static_cast<int64_t>(s->length) - needle->length;
+  int64_t start = static_cast<int64_t>(hay.count) - pin.count;
   if (from_index == from_index) {
     const int64_t limit = from_index < 0 ? 0 : from_index > 9e15 ? static_cast<int64_t>(9e15) : static_cast<int64_t>(from_index);
     if (limit < start) start = limit;
   }
   for (int64_t i = start; i >= 0; --i) {
-    if (s->view().substr(static_cast<uint64_t>(i), needle->length).equals(needle->view())) {
+    if (units_match(hay, pin, i)) {
       found = i;
       break;
     }
@@ -1229,9 +1255,12 @@ NATIVE(string_includes) {
   JsString *s, *needle;
   int64_t from;
   if (!this_string(vm, self, &s) || !arg_string(vm, args, argc, 0, &needle) || !arg_integer(vm, args, argc, 1, 0, &from)) return false;
+  const Units hay = units_of(vm, s), pin = units_of(vm, needle);
   if (from < 0) from = 0;
-  if (from > s->length) from = s->length;
-  *result = Value::make_bool(s->view().find(needle->view(), static_cast<uint64_t>(from)) != StringView::npos);
+  if (from > hay.count) from = hay.count;
+  bool found = false;
+  for (int64_t i = from; i + pin.count <= hay.count && !found; ++i) found = units_match(hay, pin, i);
+  *result = Value::make_bool(found);
   return true;
 }
 
@@ -1239,74 +1268,147 @@ NATIVE(string_starts_with) {
   JsString *s, *needle;
   int64_t from;
   if (!this_string(vm, self, &s) || !arg_string(vm, args, argc, 0, &needle) || !arg_integer(vm, args, argc, 1, 0, &from)) return false;
+  const Units hay = units_of(vm, s), pin = units_of(vm, needle);
   if (from < 0) from = 0;
-  if (from > s->length) from = s->length;
-  *result = Value::make_bool(s->view().substr(static_cast<uint64_t>(from)).starts_with(needle->view()));
+  if (from > hay.count) from = hay.count;
+  *result = Value::make_bool(units_match(hay, pin, from));
   return true;
 }
 
 NATIVE(string_ends_with) {
   JsString *s, *needle;
   int64_t end;
-  if (!this_string(vm, self, &s) || !arg_string(vm, args, argc, 0, &needle) || !arg_integer(vm, args, argc, 1, s->length, &end)) return false;
+  if (!this_string(vm, self, &s) || !arg_string(vm, args, argc, 0, &needle)) return false;
+  const Units hay = units_of(vm, s), pin = units_of(vm, needle);
+  if (!arg_integer(vm, args, argc, 1, hay.count, &end)) return false;
   if (end < 0) end = 0;
-  if (end > s->length) end = s->length;
-  *result = Value::make_bool(s->view().substr(0, static_cast<uint64_t>(end)).ends_with(needle->view()));
+  if (end > hay.count) end = hay.count;
+  *result = Value::make_bool(units_match(hay, pin, end - static_cast<int64_t>(pin.count)));
   return true;
 }
 
 NATIVE(string_slice) {
   JsString* s;
   int64_t from, to;
-  if (!this_string(vm, self, &s) || !arg_integer(vm, args, argc, 0, 0, &from) || !arg_integer(vm, args, argc, 1, s->length, &to)) return false;
-  from = relative(from, s->length);
-  to = relative(to, s->length);
-  *result = to > from ? str_value(vm, s->view().substr(static_cast<uint64_t>(from), static_cast<uint64_t>(to - from))) : Value::make_string(vm.empty_string());
+  if (!this_string(vm, self, &s)) return false;
+  const int64_t n = vm.string_length(s);
+  if (!arg_integer(vm, args, argc, 0, 0, &from) || !arg_integer(vm, args, argc, 1, n, &to)) return false;
+  from = relative(from, n);
+  to = relative(to, n);
+  *result = to > from ? Value::make_string(vm.string_part(s, static_cast<uint32_t>(from), static_cast<uint32_t>(to))) : Value::make_string(vm.empty_string());
   return true;
 }
 
 NATIVE(string_substring) {
   JsString* s;
   int64_t from, to;
-  if (!this_string(vm, self, &s) || !arg_integer(vm, args, argc, 0, 0, &from) || !arg_integer(vm, args, argc, 1, s->length, &to)) return false;
+  if (!this_string(vm, self, &s)) return false;
+  const int64_t n = vm.string_length(s);
+  if (!arg_integer(vm, args, argc, 0, 0, &from) || !arg_integer(vm, args, argc, 1, n, &to)) return false;
   if (from < 0) from = 0;
   if (to < 0) to = 0;
-  if (from > s->length) from = s->length;
-  if (to > s->length) to = s->length;
+  if (from > n) from = n;
+  if (to > n) to = n;
   if (from > to) {
     const int64_t t = from;
     from = to;
     to = t;
   }
-  *result = str_value(vm, s->view().substr(static_cast<uint64_t>(from), static_cast<uint64_t>(to - from)));
+  *result = Value::make_string(vm.string_part(s, static_cast<uint32_t>(from), static_cast<uint32_t>(to)));
   return true;
 }
 
 NATIVE(string_substr) {
   JsString* s;
   int64_t from, length;
-  if (!this_string(vm, self, &s) || !arg_integer(vm, args, argc, 0, 0, &from) || !arg_integer(vm, args, argc, 1, s->length, &length)) return false;
-  from = relative(from, s->length);
+  if (!this_string(vm, self, &s)) return false;
+  const int64_t n = vm.string_length(s);
+  if (!arg_integer(vm, args, argc, 0, 0, &from) || !arg_integer(vm, args, argc, 1, n, &length)) return false;
+  from = relative(from, n);
   if (length < 0) length = 0;
-  if (length > s->length - from) length = s->length - from;
-  *result = str_value(vm, s->view().substr(static_cast<uint64_t>(from), static_cast<uint64_t>(length)));
+  if (length > n - from) length = n - from;
+  *result = Value::make_string(vm.string_part(s, static_cast<uint32_t>(from), static_cast<uint32_t>(from + length)));
   return true;
 }
 
-NATIVE(string_upper) {
-  JsString* s;
-  if (!this_string(vm, self, &s)) return false;
-  String out(vm.allocator());
-  for (uint32_t i = 0; i < s->length; ++i) out.push_back(s->data()[i] >= 'a' && s->data()[i] <= 'z' ? static_cast<char>(s->data()[i] - 32) : s->data()[i]);
-  *result = str_value(vm, out.view());
-  return true;
+// The code points of a text string (a surrogate pair is one; a lone surrogate is itself).
+void code_points_of(JsString* s, List<uint32_t>* out) {
+  const uint8_t* p = reinterpret_cast<const uint8_t*>(s->data());
+  for (uint32_t i = 0; i < s->length;) {
+    const uint8_t c = p[i];
+    uint32_t cp, step;
+    if (c < 0x80) { cp = c; step = 1; }
+    else if (c < 0xE0) { cp = ((c & 0x1Fu) << 6) | (p[i + 1] & 0x3Fu); step = 2; }
+    else if (c < 0xF0) { cp = ((c & 0x0Fu) << 12) | ((p[i + 1] & 0x3Fu) << 6) | (p[i + 2] & 0x3Fu); step = 3; }
+    else { cp = ((c & 0x07u) << 18) | ((p[i + 1] & 0x3Fu) << 12) | ((p[i + 2] & 0x3Fu) << 6) | (p[i + 3] & 0x3Fu); step = 4; }
+    out->push_back(cp);
+    i += step;
+  }
 }
 
-NATIVE(string_lower) {
+void append_code_point(String* out, uint32_t cp) {
+  if (cp < 0x80) {
+    out->push_back(static_cast<char>(cp));
+  } else if (cp < 0x800) {
+    out->push_back(static_cast<char>(0xC0 | (cp >> 6)));
+    out->push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+  } else if (cp < 0x10000) {
+    out->push_back(static_cast<char>(0xE0 | (cp >> 12)));
+    out->push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+    out->push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+  } else {
+    out->push_back(static_cast<char>(0xF0 | (cp >> 18)));
+    out->push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+    out->push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+    out->push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+  }
+}
+
+bool case_convert(Vm& vm, const Value& self, Value* result, bool upper) {
   JsString* s;
   if (!this_string(vm, self, &s)) return false;
   String out(vm.allocator());
-  for (uint32_t i = 0; i < s->length; ++i) out.push_back(s->data()[i] >= 'A' && s->data()[i] <= 'Z' ? static_cast<char>(s->data()[i] + 32) : s->data()[i]);
+  if (vm.string_kind(s) == 2) {
+    List<uint32_t> in(vm.allocator()), mapped(vm.allocator());
+    code_points_of(s, &in);
+    unicode_text::convert_case(in, upper, &mapped);
+    for (uint64_t i = 0; i < mapped.count(); ++i) append_code_point(&out, mapped[i]);
+  } else {   // (ascii, and raw bytes: only the letters A-Z change)
+    for (uint32_t i = 0; i < s->length; ++i) {
+      const char c = s->data()[i];
+      out.push_back(upper ? (c >= 'a' && c <= 'z' ? static_cast<char>(c - 32) : c) : (c >= 'A' && c <= 'Z' ? static_cast<char>(c + 32) : c));
+    }
+  }
+  JsString* made = vm.new_string(out.view());
+  if (s->binary && made != vm.empty_string()) made->binary = true;
+  *result = Value::make_string(made);
+  return true;
+}
+NATIVE(string_upper) { return case_convert(vm, self, result, true); }
+NATIVE(string_lower) { return case_convert(vm, self, result, false); }
+
+NATIVE(string_normalize) {
+  JsString* s;
+  if (!this_string(vm, self, &s)) return false;
+  int form = 0;
+  if (argc > 0 && !args[0].is_undefined()) {
+    JsString* name;
+    if (!vm.to_string(args[0], &name)) return false;
+    if (name->view().equals("NFC")) form = 0;
+    else if (name->view().equals("NFD")) form = 1;
+    else if (name->view().equals("NFKC")) form = 2;
+    else if (name->view().equals("NFKD")) form = 3;
+    else return vm.throw_error(ErrorKind::RangeError, "The normalization form should be one of NFC, NFD, NFKC, NFKD.");
+  }
+  if (vm.string_kind(s) != 2) {   // (ascii and bytes are in every form already)
+    *result = Value::make_string(s);
+    return true;
+  }
+  List<uint32_t> in(vm.allocator()), normalized(vm.allocator());
+  code_points_of(s, &in);
+  unicode_text::normalize(in, form, &normalized, vm.allocator());
+  String out(vm.allocator());
+  for (uint64_t i = 0; i < normalized.count(); ++i) append_code_point(&out, normalized[i]);
   *result = str_value(vm, out.view());
   return true;
 }
@@ -1342,7 +1444,8 @@ NATIVE(string_split) {
   JsString* d;
   if (!vm.to_string(sep, &d)) return false;
   if (d->length == 0) {
-    for (uint32_t i = 0; i < s->length && static_cast<int64_t>(out->length) < limit; ++i) vm.array_push(out, str_value(vm, StringView(s->data() + i, 1)));
+    const uint32_t count = vm.string_length(s);
+    for (uint32_t i = 0; i < count && static_cast<int64_t>(out->length) < limit; ++i) vm.array_push(out, Value::make_string(vm.string_part(s, i, i + 1)));
     return true;
   }
   uint64_t pos = 0;
@@ -1373,6 +1476,17 @@ void append_replacement(String* out, StringView text, StringView subject, uint64
   }
 }
 
+// The number of characters (code units) before byte `at` of a string.
+double unit_offset_of_byte(Vm& vm, JsString* s, uint64_t at) {
+  if (vm.string_kind(s) != 2) return static_cast<double>(at);
+  uint32_t units = 0;
+  for (uint64_t i = 0; i < at && i < s->length; ++i) {
+    const uint8_t c = static_cast<uint8_t>(s->data()[i]);
+    if ((c & 0xC0) != 0x80) units += c >= 0xF0 ? 2 : 1;
+  }
+  return units;
+}
+
 bool replace_impl(Vm& vm, const Value& self, const Value* args, uint32_t argc, Value* result, bool all) {
   JsString *s, *pattern;
   if (!this_string(vm, self, &s)) return false;
@@ -1390,7 +1504,7 @@ bool replace_impl(Vm& vm, const Value& self, const Value* args, uint32_t argc, V
     if (fixed) {
       append_replacement(&out, fixed->view(), s->view(), at, pattern->view());
     } else {
-      Value call_args[3] = {Value::make_string(pattern), num_value(static_cast<double>(at)), Value::make_string(s)};
+      Value call_args[3] = {Value::make_string(pattern), num_value(unit_offset_of_byte(vm, s, at)), Value::make_string(s)};
       Value r;
       JsString* rs;
       if (!vm.call(replacement, Value(), call_args, 3, &r) || !vm.to_string(r, &rs)) return false;
@@ -1447,18 +1561,21 @@ bool pad_impl(Vm& vm, const Value& self, const Value* args, uint32_t argc, Value
   if (argc > 1 && !args[1].is_undefined()) {
     if (!vm.to_string(args[1], &fill)) return false;
   }
-  StringView pad = fill ? fill->view() : StringView(" ");
-  if (target <= s->length || pad.empty() || target > (16 << 20)) {
+  const Units text = units_of(vm, s);
+  Units pad;
+  if (fill) pad = units_of(vm, fill);
+  if (target <= text.count || (fill && pad.count == 0) || target > (16 << 20)) {
     *result = Value::make_string(s);
     return true;
   }
-  String padding(vm.allocator());
-  for (int64_t i = 0; i < target - s->length; ++i) padding.push_back(pad[static_cast<uint64_t>(i) % pad.size()]);
-  String out(vm.allocator());
-  if (start) out.append(padding.view());
-  out.append(s->view());
-  if (!start) out.append(padding.view());
-  *result = str_value(vm, out.view());
+  List<uint16_t> units(vm.allocator());
+  const uint32_t padding = static_cast<uint32_t>(target - text.count);
+  if (!start)
+    for (uint32_t i = 0; i < text.count; ++i) units.push_back(static_cast<uint16_t>(text.at(i)));
+  for (uint32_t i = 0; i < padding; ++i) units.push_back(static_cast<uint16_t>(fill ? pad.at(i % pad.count) : ' '));
+  if (start)
+    for (uint32_t i = 0; i < text.count; ++i) units.push_back(static_cast<uint16_t>(text.at(i)));
+  *result = Value::make_string(vm.string_from_units(&units[0], static_cast<uint32_t>(units.count())));
   return true;
 }
 NATIVE(string_pad_start) { return pad_impl(vm, self, args, argc, result, true); }
@@ -1889,7 +2006,12 @@ void json_quote(StringView s, String* out) {
       case '\b': out->append("\\b"); break;
       case '\f': out->append("\\f"); break;
       default:
-        if (static_cast<uint8_t>(c) < 0x20 || c == 0x7F) {
+        if (static_cast<uint8_t>(c) == 0xED && i + 2 < s.size() && static_cast<uint8_t>(s[i + 1]) >= 0xA0) {   // a lone surrogate is written as an escape
+          const uint32_t cp = 0xD000u + ((static_cast<uint8_t>(s[i + 1]) & 0x3Fu) << 6) + (static_cast<uint8_t>(s[i + 2]) & 0x3Fu);
+          out->append("\\u");
+          for (int shift = 12; shift >= 0; shift -= 4) out->push_back(kHex[(cp >> shift) & 15]);
+          i += 2;
+        } else if (static_cast<uint8_t>(c) < 0x20 || c == 0x7F) {
           out->append("\\u00");
           out->push_back(kHex[(c >> 4) & 15]);
           out->push_back(kHex[c & 15]);
@@ -2691,6 +2813,7 @@ bool install_builtins(Vm& vm) {
   vm.define_native(sp, "charCodeAt", string_char_code_at, 1);
   vm.define_native(sp, "indexOf", string_index_of, 1);
   vm.define_native(sp, "lastIndexOf", string_last_index_of, 1);
+  vm.define_native(sp, "normalize", string_normalize, 0);
   vm.define_native(sp, "includes", string_includes, 1);
   vm.define_native(sp, "startsWith", string_starts_with, 1);
   vm.define_native(sp, "endsWith", string_ends_with, 1);
