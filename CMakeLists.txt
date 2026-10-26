@@ -417,6 +417,8 @@ add_executable(BOOTX64
   src/Hardware/GraphicsProcessingUnit/Intel/IntelVcsDriver.cpp
   src/Hardware/GraphicsProcessingUnit/Intel/IntelRenderCommands.cpp
   src/Hardware/GraphicsProcessingUnit/Intel/IntelRenderBatch.cpp
+  src/Graphics/Graphics3D/IntelGen9/Gen9GraphicsDevice.cpp
+  src/Graphics/Graphics3D/IntelGen9/IntelRenderStack.cpp
   src/Hardware/GraphicsProcessingUnit/QEMU/QemuStdVgaGpu.cpp
   src/Hardware/GraphicsProcessingUnit/Virtio/VirtioGpu.cpp
   src/Hardware/GraphicsProcessingUnit/VMware/VmwareSvgaGpu.cpp
@@ -803,6 +805,10 @@ if(TCOS_USERMODE_DEMO AND TCOS_USERMODE_DEMO_PROGRAM)
   file(WRITE ${CMAKE_BINARY_DIR}/demo_files.S "${_demo_files_s}")
   target_sources(BOOTX64 PRIVATE ${CMAKE_BINARY_DIR}/demo_files.S)
   set_source_files_properties(${CMAKE_BINARY_DIR}/demo_files.S PROPERTIES OBJECT_DEPENDS "${TCOS_USERMODE_DEMO_FILES}")
+endif()
+option(TCOS_INTEL_RENDER "Use the render engine of an Intel Gen9.5 display GPU for 3D (not yet run on real hardware; the CPU renderer is used if its self-test fails)" OFF)
+if(TCOS_INTEL_RENDER)
+  target_compile_definitions(BOOTX64 PRIVATE TCOS_INTEL_RENDER)
 endif()
 option(TCOS_SELFTESTS "Run the boot-time self-checks and demos of every subsystem" OFF)
 if(TCOS_SELFTESTS)

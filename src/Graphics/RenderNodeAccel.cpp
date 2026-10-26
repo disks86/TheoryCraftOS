@@ -21,10 +21,12 @@
 #include "Graphics/RenderNode.hpp"
 #include <new>
 #include "Graphics/Graphics3D/BuiltinShaders.hpp"
+#include "Graphics/Graphics3D/IntelGen9/IntelRenderStack.hpp"
 
 namespace graphics {
 
-void RenderNode::build_accelerated(hardware::VirtioGpu* virtio, hardware::VmwareSvgaGpu* svga, allocators::IAllocator& allocator, bool allow_acceleration) {
+void RenderNode::build_accelerated(hardware::VirtioGpu* virtio, hardware::VmwareSvgaGpu* svga, hardware::IntelGpu* intel, allocators::IAllocator& allocator,
+                                   bool allow_acceleration, bool allow_intel_render) {
   if (!allow_acceleration) {
     reason_ = "acceleration was switched off";
   } else if (virtio) {
@@ -54,6 +56,24 @@ void RenderNode::build_accelerated(hardware::VirtioGpu* virtio, hardware::Vmware
         reason_ = "SVGA3D did not draw the test picture correctly";
       }
     }
+  } else if (intel && allow_intel_render) {
+    // The render engine of the Intel GPU, on the strength of its own test: the device must draw the test picture, or the CPU renderer stays.
+    void* memory = allocator.allocate(sizeof(IntelRenderStack));
+    IntelRenderStack* stack = memory ? new (memory) IntelRenderStack(allocator, gpu_) : nullptr;
+    if (stack && stack->initialize(*intel) && self_test(stack->device()) && drawing_test(stack->device())) {
+      gpu_device_ = &stack->device();
+      active_ = gpu_device_;
+      intel_stack_ = stack;
+      intel_allocator_ = &allocator;
+    } else {
+      if (stack) {
+        stack->~IntelRenderStack();
+        allocator.deallocate(stack);
+      }
+      reason_ = "the Intel render engine did not start or did not draw the test picture";
+    }
+  } else if (intel) {
+    reason_ = "the Intel render engine is off (build with TCOS_INTEL_RENDER to try it)";
   } else {
     reason_text_.assign("the display adapter has no 3D driver: ");
     reason_text_.append(gpu_ ? gpu_->name() : "none");
@@ -69,9 +89,14 @@ void RenderNode::build_accelerated(hardware::VirtioGpu* virtio, hardware::Vmware
 
 void RenderNode::destroy_accelerated() {
   if (locked_) locked_->~LockedDevice();
-  if (raw_device_) {
+  if (raw_device_ && !intel_stack_) {
     if (svga_) static_cast<SvgaDevice*>(raw_device_)->~SvgaDevice();
     else static_cast<VirglDevice*>(raw_device_)->~VirglDevice();
+  }
+  if (intel_stack_) {   // (after the locked wrapper that points into it)
+    intel_stack_->~IntelRenderStack();
+    intel_allocator_->deallocate(intel_stack_);
+    intel_stack_ = nullptr;
   }
 }
 

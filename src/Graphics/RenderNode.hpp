@@ -29,15 +29,22 @@
 #include "Hardware/GraphicsProcessingUnit/Virtio/VirtioGpu.hpp"
 #include "Utility/FixedString.hpp"
 
+namespace hardware {
+class IntelGpu;
+}
+
 namespace graphics {
+
+class IntelRenderStack;
 
 class RenderNode {
  public:
   // `gpu` is the display driver of the GPU (null if it has none: only the CPU renders then); `virtio` / `vmware` are the same driver when it is
   // one of those (they carry the 3D command channel). All must outlive this object. With `allow_acceleration` false the CPU renderer is used
-  // even where a GPU device would work.
+  // even where a GPU device would work. `intel` is the same driver when it is an Intel one; its render engine is used only if `allow_intel_render` is true (the path
+  // has not run on real hardware: it is opt-in, see TCOS_INTEL_RENDER).
   RenderNode(hardware::IGraphicsProcessingUnit* gpu, hardware::VirtioGpu* virtio, hardware::VmwareSvgaGpu* vmware, allocators::IAllocator& allocator,
-             bool allow_acceleration = true);
+             bool allow_acceleration = true, hardware::IntelGpu* intel = nullptr, bool allow_intel_render = false);
   ~RenderNode();
   RenderNode(const RenderNode&) = delete;
   RenderNode& operator=(const RenderNode&) = delete;
@@ -54,7 +61,8 @@ class RenderNode {
 
  private:
   // Look for a 3D engine on the GPU and use it if it works (sets the device, or the reason there is none); and give it back (RenderNodeAccel.cpp).
-  void build_accelerated(hardware::VirtioGpu* virtio, hardware::VmwareSvgaGpu* vmware, allocators::IAllocator& allocator, bool allow_acceleration);
+  void build_accelerated(hardware::VirtioGpu* virtio, hardware::VmwareSvgaGpu* vmware, hardware::IntelGpu* intel, allocators::IAllocator& allocator, bool allow_acceleration,
+                         bool allow_intel_render);
   void destroy_accelerated();
   bool self_test(IGraphicsDevice& device);
   // Draws a triangle on the device and looks at the pixel: for back ends whose protocol could not be tried against a real host in advance.
@@ -70,6 +78,8 @@ class RenderNode {
   LockedDevice* locked_ = nullptr;
   IGraphicsDevice* raw_device_ = nullptr;
   bool svga_ = false;
+  IntelRenderStack* intel_stack_ = nullptr;          // (RenderNodeAccel.cpp makes and destroys it, so this file needs nothing of the Intel driver)
+  allocators::IAllocator* intel_allocator_ = nullptr;
   const char* reason_ = "";
   FixedString<96> reason_text_;
   IGraphicsDevice* gpu_device_ = nullptr;
