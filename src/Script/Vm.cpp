@@ -580,23 +580,319 @@ bool Vm::proxy_trap(JsObject* proxy, const char* name, JsObject** target, Value*
   return true;
 }
 
+namespace {
+bool same_value_of(Vm& vm, const Value& a, const Value& b) {
+  if (a.is_number() && b.is_number()) {
+    if (a.u.number != a.u.number && b.u.number != b.u.number) return true;
+    if (a.u.number == 0 && b.u.number == 0) return (1 / a.u.number > 0) == (1 / b.u.number > 0);
+    return a.u.number == b.u.number;
+  }
+  return vm.strict_equals(a, b);
+}
+}  // namespace
+
+// The invariants below are the ones of the language: a proxy may not lie about a property of its target that cannot change.
+bool Vm::proxy_fail(const char* trap, const char* what, JsString* key) {
+  String message(allocator_);
+  message.append("'");
+  message.append(trap);
+  message.append("' on proxy: ");
+  message.append(what);
+  if (key) {
+    message.append(" '");
+    message.append(key->symbol ? StringView("(symbol)") : key->view());
+    message.append("'");
+  }
+  return throw_error(ErrorKind::TypeError, message.view());
+}
+
+bool Vm::ordinary_descriptor(JsObject* o, JsString* key, PropDesc* out) {
+  Value value;
+  uint8_t flags;
+  if (!own_property(o, key, &value, &flags)) return false;
+  *out = PropDesc();
+  out->has_enumerable = out->has_configurable = true;
+  out->enumerable = (flags & kEnumerable) != 0;
+  out->configurable = !(flags & kNonConfigurable) && !o->frozen && !o->sealed;
+  if (flags & kAccessor) {
+    out->has_get = out->has_set = true;
+    const bool pair = value.is_object() && value.as_object()->length >= 2;
+    out->getter = pair ? value.as_object()->items[0] : Value();
+    out->setter = pair ? value.as_object()->items[1] : Value();
+  } else {
+    out->has_value = out->has_writable = true;
+    out->value = value;
+    out->writable = (flags & kWritable) != 0 && !o->frozen;
+  }
+  return true;
+}
+
+bool Vm::to_descriptor(const Value& v, PropDesc* out) {
+  if (!v.is_object()) return throw_error(ErrorKind::TypeError, "Property description must be an object");
+  *out = PropDesc();
+  JsObject* d = v.as_object();
+  Value x;
+  if (has_property(d, intern("enumerable"))) { if (!get_named(v, "enumerable", &x)) return false; out->has_enumerable = true; out->enumerable = to_boolean(x); }
+  if (has_property(d, intern("configurable"))) { if (!get_named(v, "configurable", &x)) return false; out->has_configurable = true; out->configurable = to_boolean(x); }
+  if (has_property(d, intern("value"))) { if (!get_named(v, "value", &out->value)) return false; out->has_value = true; }
+  if (has_property(d, intern("writable"))) { if (!get_named(v, "writable", &x)) return false; out->has_writable = true; out->writable = to_boolean(x); }
+  if (has_property(d, intern("get"))) {
+    if (!get_named(v, "get", &out->getter)) return false;
+    if (!out->getter.is_undefined() && !is_callable(out->getter)) return throw_error(ErrorKind::TypeError, "Getter must be a function");
+    out->has_get = true;
+  }
+  if (has_property(d, intern("set"))) {
+    if (!get_named(v, "set", &out->setter)) return false;
+    if (!out->setter.is_undefined() && !is_callable(out->setter)) return throw_error(ErrorKind::TypeError, "Setter must be a function");
+    out->has_set = true;
+  }
+  if (out->accessor() && out->data()) return throw_error(ErrorKind::TypeError, "Invalid property descriptor. Cannot both specify accessors and a value or writable attribute");
+  return true;
+}
+
+Value Vm::descriptor_to_object(const PropDesc& d) {
+  JsObject* o = new_plain();
+  if (d.has_value) define_named(o, "value", d.value);
+  if (d.has_writable) define_named(o, "writable", Value::make_bool(d.writable));
+  if (d.has_get) define_named(o, "get", d.getter);
+  if (d.has_set) define_named(o, "set", d.setter);
+  if (d.has_enumerable) define_named(o, "enumerable", Value::make_bool(d.enumerable));
+  if (d.has_configurable) define_named(o, "configurable", Value::make_bool(d.configurable));
+  return Value::make_object(o);
+}
+
+// Could `desc` be applied to a property whose current state is `current` (when there is one)?
+bool Vm::compatible_descriptor(bool extensible, const PropDesc& desc, bool has_current, const PropDesc& current) {
+  if (!has_current) return extensible;
+  if (!desc.has_value && !desc.has_writable && !desc.has_get && !desc.has_set && !desc.has_enumerable && !desc.has_configurable) return true;
+  if (!current.configurable) {
+    if (desc.has_configurable && desc.configurable) return false;
+    if (desc.has_enumerable && desc.enumerable != current.enumerable) return false;
+    if (desc.accessor() || desc.data()) {
+      if (desc.accessor() != current.accessor()) return false;
+      if (current.accessor()) {
+        if (desc.has_get && !same_value_of(*this, desc.getter, current.getter)) return false;
+        if (desc.has_set && !same_value_of(*this, desc.setter, current.setter)) return false;
+      } else if (!current.writable) {
+        if (desc.has_writable && desc.writable) return false;
+        if (desc.has_value && !same_value_of(*this, desc.value, current.value)) return false;
+      }
+    }
+  }
+  return true;
+}
+
+bool Vm::get_own_descriptor(JsObject* o, JsString* key, bool* present, PropDesc* out) {
+  if (o->okind == ObjKind::Proxy) return proxy_get_own_property(o, key, present, out);
+  *present = ordinary_descriptor(o, key, out);
+  return true;
+}
+
+bool Vm::is_extensible_op(JsObject* o, bool* out) {
+  if (o->okind == ObjKind::Proxy) return proxy_is_extensible(o, out);
+  *out = !o->non_extensible && !o->sealed && !o->frozen;
+  return true;
+}
+
+bool Vm::get_prototype_op(JsObject* o, JsObject** out) {
+  if (o->okind == ObjKind::Proxy) return proxy_get_prototype(o, out);
+  *out = o->proto;
+  return true;
+}
+
+bool Vm::proxy_get_own_property(JsObject* proxy, JsString* key, bool* present, PropDesc* out) {
+  JsObject* target;
+  Value handler, trap;
+  if (!proxy_trap(proxy, "getOwnPropertyDescriptor", &target, &handler, &trap)) return false;
+  if (trap.is_undefined()) return get_own_descriptor(target, key, present, out);
+  const Value call_args[2] = {Value::make_object(target), Value::make_string(key)};
+  Value r;
+  if (!call(trap, handler, call_args, 2, &r)) return false;
+  if (!r.is_object() && !r.is_undefined()) return proxy_fail("getOwnPropertyDescriptor", "trap returned neither object nor undefined for property", key);
+  PropDesc target_desc;
+  bool has_target = false;
+  if (!get_own_descriptor(target, key, &has_target, &target_desc)) return false;
+  bool extensible = true;
+  if (!is_extensible_op(target, &extensible)) return false;
+  if (r.is_undefined()) {
+    if (has_target && (!target_desc.configurable || !extensible)) return proxy_fail("getOwnPropertyDescriptor", has_target && !target_desc.configurable ? "trap returned undefined for non-configurable property" : "trap returned undefined for a property of a non-extensible target", key);
+    *present = false;
+    return true;
+  }
+  PropDesc result;
+  if (!to_descriptor(r, &result)) return false;
+  if (!result.has_enumerable) { result.has_enumerable = true; result.enumerable = false; }   // (completed: absent fields take their defaults)
+  if (!result.has_configurable) { result.has_configurable = true; result.configurable = false; }
+  if (!result.accessor()) {
+    if (!result.has_value) { result.has_value = true; result.value = Value(); }
+    if (!result.has_writable) { result.has_writable = true; result.writable = false; }
+  } else {
+    result.has_get = result.has_set = true;
+  }
+  if (!compatible_descriptor(extensible, result, has_target, target_desc)) return proxy_fail("getOwnPropertyDescriptor", "trap returned a descriptor that is incompatible with the target's for property", key);
+  if (!result.configurable) {
+    if (!has_target || target_desc.configurable) return proxy_fail("getOwnPropertyDescriptor", "trap reported non-configurability for a property that is configurable or missing in the target:", key);
+    if (result.has_writable && !result.writable && target_desc.writable) return proxy_fail("getOwnPropertyDescriptor", "trap reported non-writable for a property that is writable in the target:", key);
+  }
+  *present = true;
+  *out = result;
+  return true;
+}
+
+// *forward is set (and *ok untouched) when there is no trap: the caller defines the property on the target.
+bool Vm::proxy_define_property(JsObject* proxy, JsString* key, const PropDesc& desc, bool* ok, JsObject** forward) {
+  JsObject* target;
+  Value handler, trap;
+  *forward = nullptr;
+  if (!proxy_trap(proxy, "defineProperty", &target, &handler, &trap)) return false;
+  if (trap.is_undefined()) {
+    *forward = target;
+    return true;
+  }
+  const Value call_args[3] = {Value::make_object(target), Value::make_string(key), descriptor_to_object(desc)};
+  Value r;
+  if (!call(trap, handler, call_args, 3, &r)) return false;
+  if (!to_boolean(r)) {
+    *ok = false;
+    return true;
+  }
+  PropDesc target_desc;
+  bool has_target = false, extensible = true;
+  if (!get_own_descriptor(target, key, &has_target, &target_desc) || !is_extensible_op(target, &extensible)) return false;
+  const bool setting_non_configurable = desc.has_configurable && !desc.configurable;
+  if (!has_target) {
+    if (!extensible) return proxy_fail("defineProperty", "trap returned truish for adding property to a non-extensible target:", key);
+    if (setting_non_configurable) return proxy_fail("defineProperty", "trap returned truish for defining non-configurable property which is missing in the target:", key);
+  } else {
+    if (!compatible_descriptor(extensible, desc, true, target_desc)) return proxy_fail("defineProperty", "trap returned truish for adding a property that is incompatible with the existing property in the target:", key);
+    if (setting_non_configurable && target_desc.configurable) return proxy_fail("defineProperty", "trap returned truish for defining non-configurable property which is configurable in the target:", key);
+    if (target_desc.data() && !target_desc.configurable && target_desc.writable && desc.has_writable && !desc.writable)
+      return proxy_fail("defineProperty", "trap returned truish for defining non-configurable property which cannot be non-writable:", key);
+  }
+  *ok = true;
+  return true;
+}
+
+bool Vm::proxy_get_prototype(JsObject* proxy, JsObject** out) {
+  JsObject* target;
+  Value handler, trap;
+  if (!proxy_trap(proxy, "getPrototypeOf", &target, &handler, &trap)) return false;
+  if (trap.is_undefined()) return get_prototype_op(target, out);
+  const Value call_args[1] = {Value::make_object(target)};
+  Value r;
+  if (!call(trap, handler, call_args, 1, &r)) return false;
+  if (!r.is_object() && !r.is_null()) return proxy_fail("getPrototypeOf", "trap returned neither object nor null", nullptr);
+  JsObject* result = r.is_object() ? r.as_object() : nullptr;
+  bool extensible = true;
+  if (!is_extensible_op(target, &extensible)) return false;
+  if (!extensible) {
+    JsObject* actual = nullptr;
+    if (!get_prototype_op(target, &actual)) return false;
+    if (actual != result) return proxy_fail("getPrototypeOf", "proxy target is non-extensible but the trap did not return its actual prototype", nullptr);
+  }
+  *out = result;
+  return true;
+}
+
+// *forward is set when there is no trap.
+bool Vm::proxy_set_prototype(JsObject* proxy, JsObject* proto, bool* ok, JsObject** forward) {
+  JsObject* target;
+  Value handler, trap;
+  *forward = nullptr;
+  if (!proxy_trap(proxy, "setPrototypeOf", &target, &handler, &trap)) return false;
+  if (trap.is_undefined()) {
+    *forward = target;
+    return true;
+  }
+  const Value call_args[2] = {Value::make_object(target), proto ? Value::make_object(proto) : Value::make_null()};
+  Value r;
+  if (!call(trap, handler, call_args, 2, &r)) return false;
+  if (!to_boolean(r)) {
+    *ok = false;
+    return true;
+  }
+  bool extensible = true;
+  if (!is_extensible_op(target, &extensible)) return false;
+  if (!extensible) {
+    JsObject* actual = nullptr;
+    if (!get_prototype_op(target, &actual)) return false;
+    if (actual != proto) return proxy_fail("setPrototypeOf", "trap returned truish for setting a new prototype on the non-extensible proxy target", nullptr);
+  }
+  *ok = true;
+  return true;
+}
+
+bool Vm::proxy_is_extensible(JsObject* proxy, bool* out) {
+  JsObject* target;
+  Value handler, trap;
+  if (!proxy_trap(proxy, "isExtensible", &target, &handler, &trap)) return false;
+  if (trap.is_undefined()) return is_extensible_op(target, out);
+  const Value call_args[1] = {Value::make_object(target)};
+  Value r;
+  if (!call(trap, handler, call_args, 1, &r)) return false;
+  const bool answer = to_boolean(r);
+  bool actual = true;
+  if (!is_extensible_op(target, &actual)) return false;
+  if (answer != actual) return proxy_fail("isExtensible", "trap result does not reflect extensibility of the proxy target", nullptr);
+  *out = answer;
+  return true;
+}
+
+bool Vm::proxy_prevent_extensions(JsObject* proxy, bool* ok, JsObject** forward) {
+  JsObject* target;
+  Value handler, trap;
+  *forward = nullptr;
+  if (!proxy_trap(proxy, "preventExtensions", &target, &handler, &trap)) return false;
+  if (trap.is_undefined()) {
+    *forward = target;
+    return true;
+  }
+  const Value call_args[1] = {Value::make_object(target)};
+  Value r;
+  if (!call(trap, handler, call_args, 1, &r)) return false;
+  if (to_boolean(r)) {
+    bool extensible = true;
+    if (!is_extensible_op(target, &extensible)) return false;
+    if (extensible) return proxy_fail("preventExtensions", "trap returned truish but the proxy target is extensible", nullptr);
+  }
+  *ok = to_boolean(r);
+  return true;
+}
+
 bool Vm::proxy_get(JsObject* proxy, JsString* key, const Value& receiver, Value* out) {
   JsObject* target;
   Value handler, trap;
   if (!proxy_trap(proxy, "get", &target, &handler, &trap)) return false;
-  if (trap.is_undefined()) return get(Value::make_object(target), key, out);
+  if (trap.is_undefined()) return get_with_receiver(Value::make_object(target), key, receiver, out);
   const Value call_args[3] = {Value::make_object(target), Value::make_string(key), receiver};
-  return call(trap, handler, call_args, 3, out);
+  if (!call(trap, handler, call_args, 3, out)) return false;
+  PropDesc d;
+  bool present = false;
+  if (!get_own_descriptor(target, key, &present, &d)) return false;
+  if (present && !d.configurable) {
+    if (d.data() && !d.writable && !same_value_of(*this, *out, d.value)) return proxy_fail("get", "trap returned a different value for a read-only, non-configurable data property:", key);
+    if (d.accessor() && d.getter.is_undefined() && !out->is_undefined()) return proxy_fail("get", "trap returned a value for a non-configurable accessor property without a getter:", key);
+  }
+  return true;
 }
 
-bool Vm::proxy_set(JsObject* proxy, JsString* key, const Value& value, const Value& receiver) {
+bool Vm::proxy_set(JsObject* proxy, JsString* key, const Value& value, const Value& receiver, bool strict) {
   JsObject* target;
   Value handler, trap;
   if (!proxy_trap(proxy, "set", &target, &handler, &trap)) return false;
-  if (trap.is_undefined()) return put(Value::make_object(target), key, value);
+  if (trap.is_undefined()) return put_ex(Value::make_object(target), key, value, strict);
   const Value call_args[4] = {Value::make_object(target), Value::make_string(key), value, receiver};
-  Value ignored;
-  return call(trap, handler, call_args, 4, &ignored);
+  Value r;
+  if (!call(trap, handler, call_args, 4, &r)) return false;
+  if (!to_boolean(r)) return strict ? proxy_fail("set", "trap returned falsish for property", key) : true;
+  PropDesc d;
+  bool present = false;
+  if (!get_own_descriptor(target, key, &present, &d)) return false;
+  if (present && !d.configurable) {
+    if (d.data() && !d.writable && !same_value_of(*this, value, d.value)) return proxy_fail("set", "trap returned truish for a read-only, non-configurable data property with a different value:", key);
+    if (d.accessor() && d.setter.is_undefined()) return proxy_fail("set", "trap returned truish for a non-configurable accessor property without a setter:", key);
+  }
+  return true;
 }
 
 bool Vm::proxy_has(JsObject* proxy, JsString* key, bool* out) {
@@ -611,6 +907,17 @@ bool Vm::proxy_has(JsObject* proxy, JsString* key, bool* out) {
   Value r;
   if (!call(trap, handler, call_args, 2, &r)) return false;
   *out = to_boolean(r);
+  if (!*out) {
+    PropDesc d;
+    bool present = false;
+    if (!get_own_descriptor(target, key, &present, &d)) return false;
+    if (present) {
+      bool extensible = true;
+      if (!is_extensible_op(target, &extensible)) return false;
+      if (!d.configurable) return proxy_fail("has", "trap returned falsish for a non-configurable property of the target:", key);
+      if (!extensible) return proxy_fail("has", "trap returned falsish for a property of a non-extensible target:", key);
+    }
+  }
   return true;
 }
 
@@ -626,29 +933,115 @@ bool Vm::proxy_delete(JsObject* proxy, JsString* key, bool* out) {
   Value r;
   if (!call(trap, handler, call_args, 2, &r)) return false;
   *out = to_boolean(r);
+  if (*out) {
+    PropDesc d;
+    bool present = false;
+    if (!get_own_descriptor(target, key, &present, &d)) return false;
+    if (present) {
+      bool extensible = true;
+      if (!is_extensible_op(target, &extensible)) return false;
+      if (!d.configurable) return proxy_fail("deleteProperty", "trap returned truish for a non-configurable property of the target:", key);
+      if (!extensible) return proxy_fail("deleteProperty", "trap returned truish for a property of a non-extensible target:", key);
+    }
+  }
   return true;
 }
 
-JsObject* Vm::proxy_keys(JsObject* proxy, bool all) {
+// ownKeys: the names (all: also the ones that are not enumerable) the trap lists, checked against the target. Symbols are in the list too (the callers sort them out).
+JsObject* Vm::proxy_keys(JsObject* proxy, int mode) {   // mode: 0 the enumerable string keys, 1 all string keys, 2 the symbols
   JsObject* target;
   Value handler, trap;
-  if (!proxy_trap(proxy, "ownKeys", &target, &handler, &trap)) return new_array();
-  if (trap.is_undefined()) return all ? own_names(target) : own_keys(target);
+  JsObject* none = new_array();
+  if (!proxy_trap(proxy, "ownKeys", &target, &handler, &trap)) return none;
+  JsObject* keys = new_array();
+  if (trap.is_undefined()) {
+    return mode == 2 ? own_symbols(target) : mode == 1 ? own_names(target) : own_keys(target);
+  }
   const Value call_args[1] = {Value::make_object(target)};
   Value r;
-  JsObject* keys = new_array();
-  if (!call(trap, handler, call_args, 1, &r) || !r.is_object()) return keys;
-  for (uint32_t i = 0; i < r.as_object()->length; ++i) {
-    JsString* name;
-    if (!to_string(r.as_object()->items[i], &name)) return keys;
-    if (all) {
-      array_push(keys, Value::make_string(name));
+  if (!call(trap, handler, call_args, 1, &r)) return none;
+  if (!r.is_object()) {
+    proxy_fail("ownKeys", "trap result is not an object", nullptr);
+    return none;
+  }
+  JsObject* list = r.as_object();
+  uint32_t n = list->okind == ObjKind::Array ? list->length : 0;
+  List<JsString*> names(allocator_);
+  for (uint32_t i = 0; i < n; ++i) {
+    const Value item = list->items[i].unhole();
+    if (!item.is_string()) {
+      proxy_fail("ownKeys", "trap result contains a value that is neither a string nor a symbol", nullptr);
+      return none;
+    }
+    JsString* name = item.as_string()->interned || item.as_string()->symbol ? item.as_string() : intern(item.as_string()->view());
+    for (uint64_t k = 0; k < names.count(); ++k) {
+      if (names[k] == name) {
+        proxy_fail("ownKeys", "trap result contains duplicate entries", name);
+        return none;
+      }
+    }
+    names.push_back(name);
+  }
+  // the checks against the target
+  bool extensible = true;
+  if (!is_extensible_op(target, &extensible)) return none;
+  JsObject* target_names = own_names(target);
+  JsObject* target_symbols = own_symbols(target);
+  List<JsString*> target_keys(allocator_);
+  for (uint32_t i = 0; i < target_names->length; ++i) target_keys.push_back(target_names->items[i].as_string());
+  for (uint32_t i = 0; i < target_symbols->length; ++i) target_keys.push_back(target_symbols->items[i].as_string());
+  List<JsString*> unchecked(allocator_);
+  for (uint64_t i = 0; i < names.count(); ++i) unchecked.push_back(names[i]);
+  auto take = [&](JsString* key) {
+    for (uint64_t i = 0; i < unchecked.count(); ++i) {
+      if (unchecked[i] == key) {
+        unchecked.remove_at(i);
+        return true;
+      }
+    }
+    return false;
+  };
+  List<JsString*> configurable(allocator_);
+  for (uint64_t i = 0; i < target_keys.count(); ++i) {
+    PropDesc d;
+    bool present = false;
+    if (!get_own_descriptor(target, target_keys[i], &present, &d)) return none;
+    if (present && !d.configurable) {
+      if (!take(target_keys[i])) {
+        proxy_fail("ownKeys", "trap result did not include a non-configurable key of the target:", target_keys[i]);
+        return none;
+      }
+    } else {
+      configurable.push_back(target_keys[i]);
+    }
+  }
+  if (!extensible) {
+    for (uint64_t i = 0; i < configurable.count(); ++i) {
+      if (!take(configurable[i])) {
+        proxy_fail("ownKeys", "trap result did not include a key of the non-extensible target:", configurable[i]);
+        return none;
+      }
+    }
+    if (unchecked.count()) {
+      proxy_fail("ownKeys", "trap returned extra keys for a non-extensible target", nullptr);
+      return none;
+    }
+  }
+  for (uint64_t i = 0; i < names.count(); ++i) {
+    if (mode == 2) {
+      if (names[i]->symbol) array_push(keys, Value::make_string(names[i]));
       continue;
     }
-    // for Object.keys only the enumerable ones count: those the target has (or that it does not know of at all)
-    Value ignored;
-    uint8_t flags = kDefaultFlags;
-    if (!own_property(target, name, &ignored, &flags) || (flags & kEnumerable)) array_push(keys, Value::make_string(name));
+    if (names[i]->symbol) continue;   // (the string lists leave the symbols out)
+    if (mode == 1) {
+      array_push(keys, Value::make_string(names[i]));
+      continue;
+    }
+    // Object.keys: the enumerable ones, asked of the proxy itself (its getOwnPropertyDescriptor trap)
+    PropDesc d;
+    bool present = false;
+    if (!get_own_descriptor(proxy, names[i], &present, &d)) return none;
+    if (present && d.enumerable) array_push(keys, Value::make_string(names[i]));
   }
   return keys;
 }
@@ -1265,6 +1658,26 @@ bool Vm::get(const Value& base, JsString* key, Value* out) {
   return true;
 }
 
+// [[Get]] on `base` (an object) with `receiver` as the `this` of getters.
+bool Vm::get_with_receiver(const Value& base, JsString* key, const Value& receiver, Value* out) {
+  JsObject* o = base.as_object();
+  if (o->okind == ObjKind::Proxy) return proxy_get(o, key, receiver, out);
+  const Value saved_receiver = receiver_;
+  const bool saved_has = has_receiver_;
+  receiver_ = receiver;
+  has_receiver_ = true;
+  bool found = false;
+  for (; o && !found; o = o->proto) found = get_own(o, key, out);
+  receiver_ = saved_receiver;
+  has_receiver_ = saved_has;
+  if (getter_failed_) {
+    getter_failed_ = false;
+    return false;
+  }
+  if (!found) *out = Value();
+  return true;
+}
+
 bool Vm::to_property_key(const Value& v, JsString** out) {
   if (v.is_string()) {
     JsString* s = v.as_string();
@@ -1344,7 +1757,7 @@ bool Vm::put_ex(const Value& base, JsString* key, const Value& value, bool stric
   };
   if (!base.is_object()) return refuse("Cannot create property '", "' on a primitive value");
   JsObject* o = base.as_object();
-  if (o->okind == ObjKind::Proxy) return proxy_set(o, key, value, base);
+  if (o->okind == ObjKind::Proxy) return proxy_set(o, key, value, base, strict);
   if (o->host && o->host->set) {
     const HostClass::Set r = o->host->set(*this, o, key, value);
     if (r == HostClass::Set::Threw) return false;
@@ -1457,7 +1870,7 @@ bool Vm::delete_property(JsObject* o, JsString* key) {
 }
 
 JsObject* Vm::own_keys(JsObject* o) {
-  if (o->okind == ObjKind::Proxy) return proxy_keys(o, false);
+  if (o->okind == ObjKind::Proxy) return proxy_keys(o, 0);
   JsObject* keys = new_array(o->prop_count + (o->okind == ObjKind::Array ? o->length : 0));
   if (o->okind == ObjKind::Array) {
     for (uint32_t i = 0; i < o->length; ++i) {
@@ -1551,8 +1964,8 @@ JsString* Vm::symbol_descriptive_string(JsString* symbol) {
 }
 
 JsObject* Vm::own_symbols(JsObject* o) {
+  if (o->okind == ObjKind::Proxy) return proxy_keys(o, 2);
   JsObject* out = new_array(0);
-  if (o->okind == ObjKind::Proxy) return out;
   for (uint32_t i = 0; i < o->prop_count; ++i)
     if (o->props[i].key->symbol) array_push(out, Value::make_string(o->props[i].key));
   return out;
@@ -1586,7 +1999,7 @@ void Vm::push_property_keys(JsObject* names, JsObject* o, bool enumerable) {
 }
 
 JsObject* Vm::own_names(JsObject* o) {
-  if (o->okind == ObjKind::Proxy) return proxy_keys(o, true);
+  if (o->okind == ObjKind::Proxy) return proxy_keys(o, 1);
   JsObject* names = own_keys(o);
   if (o->okind == ObjKind::Array) array_push(names, Value::make_string(length_));
   push_property_keys(names, o, false);
@@ -2009,7 +2422,7 @@ bool Vm::has_in(const Value& key, const Value& object, bool* out) {
   JsString* k;
   if (!to_property_key(key, &k)) return false;
   *out = has_property(object.as_object(), k);
-  return true;
+  return !has_exception_;   // (a proxy's has trap can throw)
 }
 
 bool Vm::binary_op(Opc op, const Value& a, const Value& b, Value* out) {
@@ -2485,7 +2898,7 @@ bool Vm::call_value(const Value& function, const Value& this_value, const Value*
     ++native_depth_;
     Value r;
     current_native_ = f;
-    const bool ok = f->native(*this, this_for_call, a, total, &r);
+    const bool ok = f->native(*this, this_for_call, a, total, &r) && !has_exception_;   // (a native that reports success with an exception pending - a proxy trap failed under it - has failed)
     --native_depth_;
     sp_ = base;
     if (!ok) return false;
@@ -2774,6 +3187,7 @@ reload:
         }
         bool r = true;
         if (base.is_object()) r = delete_property(base.as_object(), k);
+        if (has_exception_) THROW_PENDING();   // (a proxy's trap threw or broke an invariant)
         if (!r && code->strict) {
           String message(allocator_);
           message.append("Cannot delete property '");
@@ -2853,7 +3267,7 @@ reload:
           }
           ++native_depth_;
           current_native_ = callee.as_object();
-          const bool ok = callee.as_object()->native(*this, this_for_call, args, argc, &result);
+          const bool ok = callee.as_object()->native(*this, this_for_call, args, argc, &result) && !has_exception_;
           --native_depth_;
           CHECK(ok);
           if (epilogue_pending_) {

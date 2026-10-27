@@ -748,19 +748,33 @@ const char kCollections[] = R"JSLIB((function (g) {
         if (d !== null && typeof d === 'object' && !('configurable' in d)) { var c = {}; for (var p in d) c[p] = d[p]; c.configurable = false; d = c; }   // (a property made here is not configurable unless the descriptor says so)
         Object.defineProperty(o, k, d);
         return true;
-      } catch (e) { if (e instanceof TypeError && /Invalid property descriptor|non-object|Getter must/.test(e.message)) throw e; return false; }
+      } catch (e) { if (e instanceof TypeError && (/Invalid property descriptor|non-object|Getter must/.test(e.message) || (/ on proxy: /.test(e.message) && !/trap returned falsish/.test(e.message)))) throw e; return false; }
     },
     deleteProperty: function (o, k) { return delete o[k]; },
     get: function (o, k) { return o[k]; },
-    set: function (o, k, v) {
+    set: function (o, k, v, receiver) {
       'use strict';
+      if (arguments.length > 3 && receiver !== o) {   // OrdinarySet with a receiver: the property is found on o (or its prototypes), the write lands on the receiver
+        var d, p = o;
+        while (p !== null && p !== undefined) { d = Object.getOwnPropertyDescriptor(p, k); if (d) break; p = Object.getPrototypeOf(p); }
+        if (d && ('get' in d || 'set' in d)) { if (typeof d.set !== 'function') return false; d.set.call(receiver, v); return true; }
+        if (d && d.writable === false) return false;
+        if (receiver === null || (typeof receiver !== 'object' && typeof receiver !== 'function')) return false;
+        var existing = Object.getOwnPropertyDescriptor(receiver, k);
+        if (existing) {
+          if ('get' in existing || 'set' in existing || !existing.writable) return false;
+          return Reflect.defineProperty(receiver, k, { value: v });
+        }
+        return Reflect.defineProperty(receiver, k, { value: v, writable: true, enumerable: true, configurable: true });
+      }
       try { o[k] = v; return true; } catch (e) { if (e instanceof TypeError && /^Cannot (assign|add|set|create)/.test(e.message)) return false; throw e; }   // (a write the object refuses)
     },
     has: function (o, k) { return k in o; },
+    getOwnPropertyDescriptor: function (o, k) { if (o === null || (typeof o !== 'object' && typeof o !== 'function')) throw new TypeError('Reflect.getOwnPropertyDescriptor called on non-object'); return Object.getOwnPropertyDescriptor(o, k); },
     getPrototypeOf: function (o) { return Object.getPrototypeOf(o); },
     ownKeys: function (o) { return Object.getOwnPropertyNames(o).concat(Object.getOwnPropertySymbols(o)); },
     isExtensible: function (o) { return Object.isExtensible(o); },
-    preventExtensions: function (o) { Object.preventExtensions(o); return true; },
+    preventExtensions: function (o) { try { Object.preventExtensions(o); return true; } catch (e) { if (e instanceof TypeError && /trap returned falsish/.test(e.message)) return false; throw e; } },
     setPrototypeOf: function (o, p) { try { Object.setPrototypeOf(o, p); return true; } catch (e) { return false; } }
   };
   def(g, 'Reflect', Reflect);

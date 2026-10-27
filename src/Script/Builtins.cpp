@@ -262,6 +262,20 @@ NATIVE(object_is_frozen) {
 
 NATIVE(object_prevent_extensions) {
   const Value v = arg_at(args, argc, 0);
+  if (v.is_object() && v.as_object()->okind == ObjKind::Proxy) {
+    bool ok = true;
+    JsObject* forward = nullptr;
+    if (!vm.proxy_prevent_extensions(v.as_object(), &ok, &forward)) return false;
+    if (forward) {
+      const Value forwarded[1] = {Value::make_object(forward)};
+      Value ignored;
+      if (!object_prevent_extensions(vm, Value(), forwarded, 1, &ignored)) return false;
+    } else if (!ok) {
+      return vm.throw_error(ErrorKind::TypeError, "'preventExtensions' on proxy: trap returned falsish");
+    }
+    *result = v;
+    return true;
+  }
   if (v.is_object()) v.as_object()->non_extensible = true;
   *result = v;
   return true;
@@ -269,6 +283,12 @@ NATIVE(object_prevent_extensions) {
 
 NATIVE(object_is_extensible) {
   const Value v = arg_at(args, argc, 0);
+  if (v.is_object() && v.as_object()->okind == ObjKind::Proxy) {
+    bool extensible = true;
+    if (!vm.is_extensible_op(v.as_object(), &extensible)) return false;
+    *result = Value::make_bool(extensible);
+    return true;
+  }
   *result = Value::make_bool(v.is_object() && !v.as_object()->non_extensible && !v.as_object()->sealed && !v.as_object()->frozen);
   return true;
 }
@@ -291,6 +311,12 @@ NATIVE(object_is_sealed) {
 
 NATIVE(object_get_prototype_of) {
   const Value v = arg_at(args, argc, 0);
+  if (v.is_object() && v.as_object()->okind == ObjKind::Proxy) {
+    JsObject* proto = nullptr;
+    if (!vm.get_prototype_op(v.as_object(), &proto)) return false;
+    *result = proto ? Value::make_object(proto) : Value::make_null();
+    return true;
+  }
   *result = v.is_object() && v.as_object()->proto ? Value::make_object(v.as_object()->proto) : Value::make_null();
   return true;
 }
@@ -301,6 +327,22 @@ NATIVE(object_define_property) {
   JsString* key;
   if (!vm.to_property_key(arg_at(args, argc, 1), &key)) return false;
   JsObject* o = target.as_object();
+  if (o->okind == ObjKind::Proxy) {
+    Vm::PropDesc parsed;
+    if (!vm.to_descriptor(desc, &parsed)) return false;
+    bool ok = true;
+    JsObject* forward = nullptr;
+    if (!vm.proxy_define_property(o, key, parsed, &ok, &forward)) return false;
+    if (forward) {
+      const Value forwarded[3] = {Value::make_object(forward), Value::make_string(key), desc};
+      Value ignored;
+      if (!object_define_property(vm, Value(), forwarded, 3, &ignored)) return false;
+    } else if (!ok) {
+      return vm.throw_error(ErrorKind::TypeError, "'defineProperty' on proxy: trap returned falsish for property");
+    }
+    *result = target;
+    return true;
+  }
   JsObject* d = desc.as_object();
   // which fields the descriptor has (absent is not the same as undefined)
   const bool has_value = vm.has_property(d, vm.intern("value")), has_enumerable = vm.has_property(d, vm.intern("enumerable")), has_writable = vm.has_property(d, vm.intern("writable")),
@@ -391,6 +433,13 @@ NATIVE(object_get_own_property_descriptor) {
   }
   JsString* key;
   if (!vm.to_property_key(arg_at(args, argc, 1), &key)) return false;
+  if (target.as_object()->okind == ObjKind::Proxy) {
+    Vm::PropDesc desc;
+    bool present = false;
+    if (!vm.get_own_descriptor(target.as_object(), key, &present, &desc)) return false;
+    *result = present ? vm.descriptor_to_object(desc) : Value();
+    return true;
+  }
   Value value;
   uint8_t flags;
   if (!vm.own_property(target.as_object(), key, &value, &flags)) {
@@ -424,6 +473,20 @@ NATIVE(object_get_own_property_names) {
 
 NATIVE(object_set_prototype_of) {
   const Value target = arg_at(args, argc, 0), proto = arg_at(args, argc, 1);
+  if (target.is_object() && target.as_object()->okind == ObjKind::Proxy && (proto.is_object() || proto.is_null())) {
+    bool ok = true;
+    JsObject* forward = nullptr;
+    if (!vm.proxy_set_prototype(target.as_object(), proto.is_object() ? proto.as_object() : nullptr, &ok, &forward)) return false;
+    if (forward) {
+      const Value forwarded[2] = {Value::make_object(forward), proto};
+      Value ignored;
+      if (!object_set_prototype_of(vm, Value(), forwarded, 2, &ignored)) return false;
+    } else if (!ok) {
+      return vm.throw_error(ErrorKind::TypeError, "'setPrototypeOf' on proxy: trap returned falsish");
+    }
+    *result = target;
+    return true;
+  }
   if (target.is_object() && (proto.is_object() || proto.is_null())) {
     for (JsObject* p = proto.is_object() ? proto.as_object() : nullptr; p; p = p->proto)
       if (p == target.as_object()) return vm.throw_error(ErrorKind::TypeError, "Cyclic __proto__ value");
@@ -610,6 +673,13 @@ NATIVE(generator_to_string) {
 NATIVE(object_has_own_property) {
   JsString* key;
   if (!vm.to_property_key(arg_at(args, argc, 0), &key)) return false;
+  if (self.is_object() && self.as_object()->okind == ObjKind::Proxy) {
+    Vm::PropDesc desc;
+    bool present = false;
+    if (!vm.get_own_descriptor(self.as_object(), key, &present, &desc)) return false;
+    *result = Value::make_bool(present);
+    return true;
+  }
   Value ignored;
   *result = Value::make_bool(self.is_object() && vm.get_own(self.as_object(), key, &ignored));
   return true;
