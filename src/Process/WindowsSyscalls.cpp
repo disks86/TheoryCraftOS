@@ -227,7 +227,8 @@ class WindowsSyscalls final : public ISyscallInterface {
       case WindowsSyscallNumber::NtCreateChangeNotification: return windowsabi::nt_create_change_notification(process, r);
       case WindowsSyscallNumber::NtCreateMailslotFile: return windowsabi::nt_create_mailslot_file(process, r);
       case WindowsSyscallNumber::NtNotifyChangeDirectoryFile: return windowsabi::nt_notify_change_directory_file(process, r);
-      default: process.host().unhandled_syscall(SyscallAbi::Windows, r.number); return kStatusInvalidSystemService;
+      // A service of the list that has no code yet answers like a real kernel does for a call it does not support; a number outside the list is no service.
+      default: process.host().unhandled_syscall(SyscallAbi::Windows, r.number); return r.number < kWindowsServiceCount ? kStatusNotImplemented : kStatusInvalidSystemService;
     }
   }
 };
