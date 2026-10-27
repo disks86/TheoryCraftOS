@@ -2724,7 +2724,7 @@ EXPORT BOOL WINAPI DeleteFileW(LPCWSTR path) {
   BYTE basic[40];
   NTSTATUS status = NtQueryAttributesFile(&attributes, basic);
   if (!NT_SUCCESS(status)) return fail_nt(status);
-  if (*(DWORD *)(basic + 32) & FILE_ATTRIBUTE_DIRECTORY) { set_error(ERROR_ACCESS_DENIED); return FALSE; }
+  if (*(DWORD *)(basic + 32) & (FILE_ATTRIBUTE_DIRECTORY | 1 /* FILE_ATTRIBUTE_READONLY */)) { set_error(ERROR_ACCESS_DENIED); return FALSE; }
   status = NtDeleteFile(&attributes);
   return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
@@ -2789,6 +2789,7 @@ EXPORT BOOL WINAPI MoveFileExA(LPCSTR from, LPCSTR to, DWORD flags) {
 }
 EXPORT BOOL WINAPI MoveFileA(LPCSTR from, LPCSTR to) { return MoveFileExA(from, to, 0); }
 EXPORT BOOL WINAPI CopyFileW(LPCWSTR from, LPCWSTR to, BOOL fail_if_exists) {
+  if (!from || !to) { set_error(ERROR_PATH_NOT_FOUND); return FALSE; }
   HANDLE in = CreateFileW(from, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
   if (in == INVALID_HANDLE_VALUE) return FALSE;
   HANDLE out = CreateFileW(to, GENERIC_WRITE, 0, NULL, fail_if_exists ? CREATE_NEW : CREATE_ALWAYS, 0, NULL);
@@ -2810,6 +2811,7 @@ EXPORT BOOL WINAPI CopyFileW(LPCWSTR from, LPCWSTR to, BOOL fail_if_exists) {
   return ok;
 }
 EXPORT BOOL WINAPI CopyFileA(LPCSTR from, LPCSTR to, BOOL fail_if_exists) {
+  if (!from || !to) { set_error(ERROR_PATH_NOT_FOUND); return FALSE; }
   WCHAR *a = to_wide(from), *b = to_wide(to);
   const BOOL ok = a && b ? CopyFileW(a, b, fail_if_exists) : FALSE;
   free_wide(a);
@@ -2826,7 +2828,7 @@ EXPORT UINT WINAPI GetTempFileNameW(LPCWSTR dir, LPCWSTR prefix, UINT unique, LP
     DWORD length = n;
     if (full[length - 1] != '\\') full[length++] = '\\';
     for (int i = 0; i < 3 && prefix && prefix[i]; ++i) full[length++] = prefix[i];
-    for (int shift = 12; shift >= 0; shift -= 4) full[length++] = (WCHAR)"0123456789ABCDEF"[(id >> shift) & 15];
+    for (int shift = 12; shift >= 0; shift -= 4) { const UINT digit = (id >> shift) & 15; if (unique && digit == 0 && shift > 0 && (id >> shift) == 0) continue; full[length++] = (WCHAR)"0123456789ABCDEF"[digit]; }
     full[length++] = '.'; full[length++] = 't'; full[length++] = 'm'; full[length++] = 'p'; full[length] = 0;
     if (unique) { memcpy(result, full, (length + 1) * 2); return unique; }
     HANDLE h = CreateFileW(full, GENERIC_WRITE, 0, NULL, CREATE_NEW, 0, NULL);
