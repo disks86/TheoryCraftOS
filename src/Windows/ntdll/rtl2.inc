@@ -589,3 +589,52 @@ EXPORT PVOID NTAPI RtlEnumerateGenericTableWithoutSplaying(RTL_GENERIC_TABLE_ *t
   *restart_key = n ? GT_DATA(n) : *restart_key;
   return n ? GT_DATA(n) : NULL;
 }
+
+/* ---- locale names and numbers ------------------------------------------------------------------------------------------------------------------------------ */
+
+/* The locales of this OS: the invariant one and English (United States), with the neutral name "en". */
+#define NLS_STATUS_INVALID_PARAMETER_1 ((NTSTATUS)0xC00000EF)
+#define NLS_STATUS_INVALID_PARAMETER_2 ((NTSTATUS)0xC00000F0)
+#define NLS_STATUS_BUFFER_TOO_SMALL ((NTSTATUS)0xC0000023)
+static WCHAR nls_low(WCHAR c) { return c >= 'A' && c <= 'Z' ? (WCHAR)(c + 32) : c; }
+static BOOL nls_name_equals(const WCHAR *name, const char *text) {
+  for (; *text; ++text, ++name) if (nls_low(*name) != (WCHAR)*text) return FALSE;
+  return *name == 0;
+}
+EXPORT BOOLEAN NTAPI RtlIsValidLocaleName(const WCHAR *name, ULONG flags) {
+  if (!name) return FALSE;
+  if (*name == 0) return TRUE;
+  if (nls_name_equals(name, "en-us")) return TRUE;
+  return (flags & 2) && nls_name_equals(name, "en");
+}
+EXPORT NTSTATUS NTAPI RtlLocaleNameToLcid(const WCHAR *name, ULONG *lcid, ULONG flags) {
+  if (!name) return NLS_STATUS_INVALID_PARAMETER_1;
+  if (*name == 0) { *lcid = 0x7F; return 0; }
+  if (nls_name_equals(name, "en-us")) { *lcid = 0x409; return 0; }
+  if ((flags & 2) && nls_name_equals(name, "en")) { *lcid = 0x09; return 0; }
+  return NLS_STATUS_INVALID_PARAMETER_1;
+}
+EXPORT NTSTATUS NTAPI RtlLcidToLocaleName(ULONG lcid, UNICODE_STRING *name, ULONG flags, BOOLEAN allocate) {
+  static const WCHAR en_us[] = {'e', 'n', '-', 'U', 'S', 0}, en[] = {'e', 'n', 0}, invariant[] = {0};
+  (void)flags;
+  const WCHAR *text;
+  switch (lcid) {
+    case 0x409: case 0x1000: case 0x2000: case 0x800: case 0x400: text = en_us; break;
+    case 0x7F: text = invariant; break;
+    case 0x09: text = en; break;
+    default: return NLS_STATUS_INVALID_PARAMETER_1;
+  }
+  if (!name) return NLS_STATUS_INVALID_PARAMETER_2;
+  if (lcid == 0x1000) return NLS_STATUS_INVALID_PARAMETER_1;
+  USHORT length = 0;
+  while (text[length]) ++length;
+  length = (USHORT)(length * 2);
+  if (allocate) {
+    name->Buffer = RtlAllocateHeap(RtlProcessHeap(), 0, (SIZE_T)length + 2);
+    if (!name->Buffer) return STATUS_NO_MEMORY;
+    name->MaximumLength = (USHORT)(length + 2);
+  } else if (name->MaximumLength < length + 2) return NLS_STATUS_BUFFER_TOO_SMALL;
+  memcpy(name->Buffer, text, (SIZE_T)length + 2);
+  name->Length = length;
+  return 0;
+}

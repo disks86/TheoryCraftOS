@@ -139,21 +139,24 @@ EXPORT LPWSTR WINAPI lstrcpynW(LPWSTR d, LPCWSTR s, int n) {
 }
 EXPORT LPSTR WINAPI lstrcatA(LPSTR d, LPCSTR s) { lstrcpyA(d + strlen(d), s); return d; }
 EXPORT LPWSTR WINAPI lstrcatW(LPWSTR d, LPCWSTR s) { lstrcpyW(d + wcslen(d), s); return d; }
-EXPORT int WINAPI lstrcmpA(LPCSTR a, LPCSTR b) { while (*a && *a == *b) ++a, ++b; return (BYTE)*a < (BYTE)*b ? -1 : (BYTE)*a > (BYTE)*b; }
-EXPORT int WINAPI lstrcmpW(LPCWSTR a, LPCWSTR b) { while (*a && *a == *b) ++a, ++b; return *a < *b ? -1 : *a > *b; }
+/* The comparisons use the sorting of the locale (nls.inc): "co-op" and "coop" are near, upper case follows lower case. */
+EXPORT int WINAPI CompareStringW(DWORD locale, DWORD flags, LPCWSTR a, int an, LPCWSTR b, int bn);
+EXPORT int WINAPI CompareStringA(DWORD locale, DWORD flags, LPCSTR a, int an, LPCSTR b, int bn);
+EXPORT int WINAPI lstrcmpA(LPCSTR a, LPCSTR b) {
+  if (!a || !b) return a == b ? 0 : !a ? -1 : 1;
+  return CompareStringA(0x400, 0, a, -1, b, -1) - 2;
+}
+EXPORT int WINAPI lstrcmpW(LPCWSTR a, LPCWSTR b) {
+  if (!a || !b) return a == b ? 0 : !a ? -1 : 1;
+  return CompareStringW(0x400, 0, a, -1, b, -1) - 2;
+}
 EXPORT int WINAPI lstrcmpiA(LPCSTR a, LPCSTR b) {
-  for (;; ++a, ++b) {
-    const int x = (BYTE)*a >= 'a' && (BYTE)*a <= 'z' ? *a - 32 : (BYTE)*a, y = (BYTE)*b >= 'a' && (BYTE)*b <= 'z' ? *b - 32 : (BYTE)*b;
-    if (x != y) return x < y ? -1 : 1;
-    if (!x) return 0;
-  }
+  if (!a || !b) return a == b ? 0 : !a ? -1 : 1;
+  return CompareStringA(0x400, 1, a, -1, b, -1) - 2;
 }
 EXPORT int WINAPI lstrcmpiW(LPCWSTR a, LPCWSTR b) {
-  for (;; ++a, ++b) {
-    const int x = upper(*a), y = upper(*b);
-    if (x != y) return x < y ? -1 : 1;
-    if (!x) return 0;
-  }
+  if (!a || !b) return a == b ? 0 : !a ? -1 : 1;
+  return CompareStringW(0x400, 1, a, -1, b, -1) - 2;
 }
 /* The bare (unsuffixed) lstr* names are their own real exports on a real kernel32.dll too, not just source-level UNICODE macros - always the ANSI ones. */
 EXPORT int WINAPI lstrlen(LPCSTR s) { return lstrlenA(s); }
@@ -162,29 +165,6 @@ EXPORT LPSTR WINAPI lstrcpyn(LPSTR d, LPCSTR s, int n) { return lstrcpynA(d, s, 
 EXPORT LPSTR WINAPI lstrcat(LPSTR d, LPCSTR s) { return lstrcatA(d, s); }
 EXPORT int WINAPI lstrcmp(LPCSTR a, LPCSTR b) { return lstrcmpA(a, b); }
 EXPORT int WINAPI lstrcmpi(LPCSTR a, LPCSTR b) { return lstrcmpiA(a, b); }
-/* CompareString: 1 = less, 2 = equal, 3 = greater. NORM_IGNORECASE (1) is honoured, the other flags are not. */
-EXPORT int WINAPI CompareStringW(DWORD locale, DWORD flags, LPCWSTR a, int an, LPCWSTR b, int bn) {
-  (void)locale;
-  if (an < 0) an = (int)wcslen(a);
-  if (bn < 0) bn = (int)wcslen(b);
-  for (int i = 0; i < an || i < bn; ++i) {
-    const int x = i < an ? ((flags & 1) ? upper(a[i]) : a[i]) : -1, y = i < bn ? ((flags & 1) ? upper(b[i]) : b[i]) : -1;
-    if (x != y) return x < y ? 1 : 3;
-  }
-  return 2;
-}
-EXPORT int WINAPI CompareStringA(DWORD locale, DWORD flags, LPCSTR a, int an, LPCSTR b, int bn) {
-  (void)locale;
-  if (an < 0) an = (int)strlen(a);
-  if (bn < 0) bn = (int)strlen(b);
-  for (int i = 0; i < an || i < bn; ++i) {
-    int x = i < an ? (BYTE)a[i] : -1, y = i < bn ? (BYTE)b[i] : -1;
-    if (flags & 1) { if (x >= 'a' && x <= 'z') x -= 32; if (y >= 'a' && y <= 'z') y -= 32; }
-    if (x != y) return x < y ? 1 : 3;
-  }
-  return 2;
-}
-
 /* Wide text from an ANSI argument, in memory from the process heap (the caller frees it). */
 static WCHAR *to_wide(LPCSTR text) {
   if (!text) return NULL;
@@ -3019,3 +2999,4 @@ EXPORT BOOL WINAPI DllMain(HANDLE module, DWORD reason, PVOID reserved) {
 #include "legacy.inc"
 #include "fmtmsg.inc"
 #include "time.inc"
+#include "nls.inc"

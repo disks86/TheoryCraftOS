@@ -12,6 +12,7 @@ RtlDeleteFunctionTable = ntdll.RtlDeleteFunctionTable
 RtlInstallFunctionTableCallback = ntdll.RtlInstallFunctionTableCallback
 RtlCaptureStackBackTrace = ntdll.RtlCaptureStackBackTrace
 RtlRaiseException = ntdll.RtlRaiseException
+__C_specific_handler = ntdll.__C_specific_handler
 RtlCopyMemory = ntdll.RtlCopyMemory
 RtlMoveMemory = ntdll.RtlMoveMemory
 RtlFillMemory = ntdll.RtlFillMemory

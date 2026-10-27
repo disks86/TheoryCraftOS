@@ -133,7 +133,6 @@ EXPORT LANGID WINAPI GetSystemDefaultUILanguage(void) { return 0x0409; }
 EXPORT LANGID WINAPI GetThreadUILanguage(LANGID l) { (void)l; return 0x0409; }
 EXPORT LCID WINAPI GetThreadLocale(void) { return 0x0409; }
 EXPORT BOOL WINAPI SetThreadLocale(LCID l) { return l == 0x0409 || l == 0x0400 || l == 0x0800; }
-EXPORT BOOL WINAPI IsValidLocale(LCID l, DWORD flags) { (void)flags; return l == 0x0409; }
 EXPORT int WINAPI GetUserDefaultLocaleName(LPWSTR name, int capacity) { static const WCHAR n[] = {'e', 'n', '-', 'U', 'S', 0}; if (capacity < 6) return 0; memcpy(name, n, sizeof(n)); return 6; }
 EXPORT int WINAPI GetSystemDefaultLocaleName(LPWSTR name, int capacity) { return GetUserDefaultLocaleName(name, capacity); }
 
