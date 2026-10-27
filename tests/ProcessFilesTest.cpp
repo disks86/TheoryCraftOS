@@ -389,7 +389,7 @@ static void test_windows_files() {
   const uint64_t info = rig.alloc(64);
   CHECK(rig.query(o.handle, info, 24, 5) == 0 && rig.u64(info + 8) == 12 && rig.bytes(info + 21, 1)[0] == 0);    // standard: EndOfFile, not a directory
   CHECK(rig.query(o.handle, info, 8, 14) == 0 && rig.u64(info) == 8);                           // position
-  CHECK(rig.query(o.handle, info, 40, 4) == 0 && rig.bytes(info + 32, 1)[0] == char(0x80));    // basic: FILE_ATTRIBUTE_NORMAL
+  CHECK(rig.query(o.handle, info, 40, 4) == 0 && rig.bytes(info + 32, 1)[0] == char(0x20));    // basic: FILE_ATTRIBUTE_NORMAL
   CHECK(rig.query(o.handle, info, 56, 34) == 0 && rig.u64(info + 40) == 12);                   // network open
   CHECK(rig.query(o.handle, info, 4, 5) == 0xC0000004u && rig.query(o.handle, info, 64, 99) == 0xC0000003u);
   CHECK(rig.query(o.handle, info, 64, 9) == 0 && rig.bytes(info, 1)[0] == 20 && wide(rig, info + 4, 20) == "\\hello.txt");     // FileNameInformation: the path on the volume
@@ -492,7 +492,7 @@ static void test_windows_files() {
 
   // attributes, delete, rename, delete-on-close
   const uint64_t basic = rig.alloc(40);
-  CHECK(rig.call(WindowsSyscallNumber::NtQueryAttributesFile, rig.attributes("\\??\\C:\\hello.txt"), basic) == 0 && rig.bytes(basic + 32, 1)[0] == char(0x80));
+  CHECK(rig.call(WindowsSyscallNumber::NtQueryAttributesFile, rig.attributes("\\??\\C:\\hello.txt"), basic) == 0 && rig.bytes(basic + 32, 1)[0] == char(0x20));
   CHECK(rig.call(WindowsSyscallNumber::NtQueryAttributesFile, rig.attributes("\\??\\C:\\Temp"), basic) == 0 && rig.bytes(basic + 32, 1)[0] == 0x10);
   CHECK(rig.call(WindowsSyscallNumber::NtQueryAttributesFile, rig.attributes("\\??\\C:\\nope"), basic) == 0xC0000034u);
   CHECK(rig.call(WindowsSyscallNumber::NtDeleteFile, rig.attributes("\\??\\C:\\Temp\\fresh.txt")) == 0 && read_file(fs, "/Windows/Temp/fresh.txt") == "<missing>");

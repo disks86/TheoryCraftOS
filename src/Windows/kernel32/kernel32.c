@@ -1884,14 +1884,26 @@ EXPORT BOOL WINAPI WriteFile(HANDLE h, LPCVOID buffer, DWORD length, LPDWORD wri
   complete_overlapped(overlapped, status, iosb.Information);
   return TRUE;
 }
-EXPORT BOOL WINAPI GetOverlappedResult(HANDLE h, LPOVERLAPPED overlapped, LPDWORD transferred, BOOL wait) {
-  (void)h; (void)wait;      /* (the operation is finished by the time the call that started it returned) */
-  if (!overlapped) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+/* An asynchronous operation's result is in the OVERLAPPED: Internal is its status (STATUS_PENDING until it is done), InternalHigh the bytes moved. While it is pending the
+ * call may wait for the event (or the file) to be signalled; GetOverlappedResultEx also waits on a completed one unless the low bit of the file handle is set. */
+EXPORT BOOL WINAPI GetOverlappedResultEx(HANDLE file, LPOVERLAPPED overlapped, LPDWORD transferred, DWORD timeout, BOOL alertable) {
+  NTSTATUS status = (NTSTATUS)overlapped->Internal;
+  if (status == STATUS_PENDING || (1 && timeout && !((ULONG_PTR)file & 1))) {
+    if (!timeout) { set_error(ERROR_IO_INCOMPLETE); return FALSE; }
+    const DWORD waited = WaitForSingleObjectEx(overlapped->hEvent ? overlapped->hEvent : file, timeout, alertable);
+    if (waited == WAIT_FAILED) return FALSE;
+    if (waited == WAIT_IO_COMPLETION || waited == WAIT_TIMEOUT) { set_error(waited); return FALSE; }
+    status = (NTSTATUS)overlapped->Internal;
+  }
   if (transferred) *transferred = (DWORD)overlapped->InternalHigh;
-  const NTSTATUS status = (NTSTATUS)(ULONG)overlapped->Internal;
-  return NT_SUCCESS(status) ? TRUE : fail_nt(status);
+  set_error(RtlNtStatusToDosError(status));
+  return status == STATUS_SUCCESS || status == STATUS_PENDING;
 }
-EXPORT BOOL WINAPI GetOverlappedResultEx(HANDLE h, LPOVERLAPPED overlapped, LPDWORD transferred, DWORD ms, BOOL alertable) { (void)ms; (void)alertable; return GetOverlappedResult(h, overlapped, transferred, TRUE); }
+EXPORT BOOL WINAPI GetOverlappedResult(HANDLE file, LPOVERLAPPED overlapped, LPDWORD transferred, BOOL wait) {
+  if (!overlapped) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  if ((NTSTATUS)overlapped->Internal != STATUS_PENDING) return GetOverlappedResultEx(file, overlapped, transferred, 0, FALSE);      /* (a finished operation is not waited for) */
+  return GetOverlappedResultEx(file, overlapped, transferred, wait ? INFINITE : 0, FALSE);
+}
 
 /* ---- pipes ------------------------------------------------------------------------------------------------------------------------------------------- */
 
@@ -2453,7 +2465,7 @@ EXPORT DWORD WINAPI GetTempPathA(DWORD capacity, LPSTR buffer) {
 
 EXPORT HANDLE WINAPI CreateFileW(LPCWSTR path, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD disposition, DWORD flags, HANDLE template_file) {
   (void)template_file;
-  if (!path) { set_error(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE; }
+  if (!path || !path[0]) { set_error(ERROR_PATH_NOT_FOUND); return INVALID_HANDLE_VALUE; }
   /* The console by its device names. */
   if (equals_ignore_case(path, (const WCHAR *)L"CONOUT$")) return GetStdHandle(STD_OUTPUT_HANDLE);
   if (equals_ignore_case(path, (const WCHAR *)L"CONIN$")) return GetStdHandle(STD_INPUT_HANDLE);
@@ -2472,6 +2484,7 @@ EXPORT HANDLE WINAPI CreateFileW(LPCWSTR path, DWORD access, DWORD share, LPSECU
     return INVALID_HANDLE_VALUE;
   }
   if (sa && sa->bInheritHandle) attributes.Attributes |= 2;      /* OBJ_INHERIT */
+  if (disposition == TRUNCATE_EXISTING && !(access & GENERIC_WRITE)) { set_error(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE; }      /* (it has to be able to write) */
   ULONG nt_disposition;
   switch (disposition) {
     case CREATE_NEW: nt_disposition = FILE_CREATE_; break;
@@ -2484,13 +2497,12 @@ EXPORT HANDLE WINAPI CreateFileW(LPCWSTR path, DWORD access, DWORD share, LPSECU
   ULONG nt_access = (access & ~(GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | GENERIC_ALL)) | SYNCHRONIZE | FILE_READ_ATTRIBUTES;
   if (access & (GENERIC_READ | GENERIC_ALL)) nt_access |= FILE_READ_DATA;
   if (access & (GENERIC_WRITE | GENERIC_ALL)) nt_access |= FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES;
-  if (disposition == TRUNCATE_EXISTING || disposition == CREATE_ALWAYS) nt_access |= FILE_WRITE_DATA;
   ULONG options = FILE_SYNCHRONOUS_IO_NONALERT_;
   if (!(flags & FILE_FLAG_BACKUP_SEMANTICS)) options |= FILE_NON_DIRECTORY_FILE_;
   if (flags & FILE_FLAG_DELETE_ON_CLOSE) { options |= FILE_DELETE_ON_CLOSE_; nt_access |= DELETE; }
   HANDLE handle = NULL;
   IO_STATUS_BLOCK iosb;
-  const NTSTATUS status = NtCreateFile(&handle, nt_access, &attributes, &iosb, NULL, FILE_ATTRIBUTE_NORMAL, share ? share : 7, nt_disposition, options, NULL, 0);
+  const NTSTATUS status = NtCreateFile(&handle, nt_access, &attributes, &iosb, NULL, (flags & 0x7FB7) ? (flags & 0x7FB7) : FILE_ATTRIBUTE_NORMAL, share & 7, nt_disposition, options, NULL, 0);
   if (!NT_SUCCESS(status)) {
     set_error(status == STATUS_OBJECT_NAME_COLLISION ? ERROR_FILE_EXISTS : status == STATUS_FILE_IS_A_DIRECTORY ? ERROR_ACCESS_DENIED : RtlNtStatusToDosError(status));
     return INVALID_HANDLE_VALUE;
@@ -2500,11 +2512,21 @@ EXPORT HANDLE WINAPI CreateFileW(LPCWSTR path, DWORD access, DWORD share, LPSECU
   return handle;
 }
 EXPORT HANDLE WINAPI CreateFileA(LPCSTR path, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD disposition, DWORD flags, HANDLE template_file) {
+  if (!path) { set_error(ERROR_PATH_NOT_FOUND); return INVALID_HANDLE_VALUE; }
   WCHAR *w = to_wide(path);
   if (!w) return INVALID_HANDLE_VALUE;
   HANDLE h = CreateFileW(w, access, share, sa, disposition, flags, template_file);
   free_wide(w);
   return h;
+}
+
+typedef struct { DWORD dwSize, dwFileAttributes, dwFileFlags, dwSecurityQosFlags; LPSECURITY_ATTRIBUTES lpSecurityAttributes; HANDLE hTemplateFile; } CREATEFILE2_PARAMS_;
+/* CreateFile2: CreateFileW with its optional arguments in a structure. */
+EXPORT HANDLE WINAPI CreateFile2(LPCWSTR path, DWORD access, DWORD share, DWORD disposition, const CREATEFILE2_PARAMS_ *parameters) {
+  DWORD flags = 0;
+  LPSECURITY_ATTRIBUTES sa = NULL;
+  if (parameters) { flags = parameters->dwFileAttributes | parameters->dwFileFlags | parameters->dwSecurityQosFlags; sa = parameters->lpSecurityAttributes; }
+  return CreateFileW(path, access, share, sa, disposition, flags, parameters ? parameters->hTemplateFile : NULL);
 }
 
 /* OpenFile: pre-Win32 (16-bit era) file opening, kept for old callers; a small enough subset of uStyle to be worth having (OF_READ/OF_WRITE/OF_READWRITE,
@@ -2709,6 +2731,7 @@ EXPORT DWORD WINAPI GetFinalPathNameByHandleW(HANDLE h, LPWSTR buffer, DWORD cap
 }
 
 EXPORT BOOL WINAPI DeleteFileW(LPCWSTR path) {
+  if (!path || !path[0]) { set_error(ERROR_PATH_NOT_FOUND); return FALSE; }
   WCHAR buffer[PATH_CHARS + 8];
   UNICODE_STRING name;
   OBJECT_ATTRIBUTES attributes;
@@ -2720,7 +2743,7 @@ EXPORT BOOL WINAPI DeleteFileW(LPCWSTR path) {
   status = NtDeleteFile(&attributes);
   return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
-EXPORT BOOL WINAPI DeleteFileA(LPCSTR path) { WCHAR *w = to_wide(path); const BOOL ok = w ? DeleteFileW(w) : FALSE; free_wide(w); return ok; }
+EXPORT BOOL WINAPI DeleteFileA(LPCSTR path) { if (!path) { set_error(ERROR_PATH_NOT_FOUND); return FALSE; } WCHAR *w = to_wide(path); const BOOL ok = w ? DeleteFileW(w) : FALSE; free_wide(w); return ok; }
 
 EXPORT BOOL WINAPI CreateDirectoryW(LPCWSTR path, LPSECURITY_ATTRIBUTES sa) {
   (void)sa;
@@ -2755,6 +2778,11 @@ EXPORT BOOL WINAPI MoveFileExW(LPCWSTR from, LPCWSTR to, DWORD flags) {
   UNICODE_STRING source_name, target_name;
   OBJECT_ATTRIBUTES source, target;
   if (!nt_name(from, source_buffer, &source_name, &source) || !nt_name(to, target_buffer, &target_name, &target)) return FALSE;
+  if (source_name.Length == target_name.Length) {      /* a file moved onto itself (the spelling of the name may differ) stays where it is */
+    ULONG same = 1;
+    for (ULONG i = 0; i < source_name.Length / 2 && same; ++i) if (upper(source_name.Buffer[i]) != upper(target_name.Buffer[i])) same = 0;
+    if (same && GetFileAttributesW(from) != INVALID_FILE_ATTRIBUTES) return TRUE;
+  }
   HANDLE h = NULL;
   IO_STATUS_BLOCK iosb;
   NTSTATUS status = NtOpenFile(&h, DELETE | SYNCHRONIZE | FILE_READ_ATTRIBUTES, &source, &iosb, 7, FILE_SYNCHRONOUS_IO_NONALERT_);
@@ -2780,28 +2808,61 @@ EXPORT BOOL WINAPI MoveFileExA(LPCSTR from, LPCSTR to, DWORD flags) {
   return ok;
 }
 EXPORT BOOL WINAPI MoveFileA(LPCSTR from, LPCSTR to) { return MoveFileExA(from, to, 0); }
-EXPORT BOOL WINAPI CopyFileW(LPCWSTR from, LPCWSTR to, BOOL fail_if_exists) {
+/* Copying: the source is opened first (reading, sharing everything); the destination is created or overwritten (sharing reading and writing, and asking for DELETE access
+ * too if the others allow it, which a cancelled copy needs to remove it again). The data goes over in pieces; the last write time and the read-only attribute follow.
+ * `progress` is called once when the stream starts and after each piece; it may cancel (PROGRESS_CANCEL: the destination is removed if it can be) or stop. */
+typedef DWORD (WINAPI *COPY_PROGRESS_)(LARGE_INTEGER, LARGE_INTEGER, LARGE_INTEGER, LARGE_INTEGER, DWORD, DWORD, HANDLE, HANDLE, LPVOID);
+static BOOL copy_file_core(LPCWSTR from, LPCWSTR to, BOOL fail_if_exists, COPY_PROGRESS_ progress, LPVOID data, LPBOOL cancel) {
   if (!from || !to) { set_error(ERROR_PATH_NOT_FOUND); return FALSE; }
-  HANDLE in = CreateFileW(from, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+  if (cancel && *cancel) { set_error(ERROR_REQUEST_ABORTED); return FALSE; }
+  HANDLE in = CreateFileW(from, GENERIC_READ, 7, NULL, OPEN_EXISTING, 0, NULL);
   if (in == INVALID_HANDLE_VALUE) return FALSE;
-  HANDLE out = CreateFileW(to, GENERIC_WRITE, 0, NULL, fail_if_exists ? CREATE_NEW : CREATE_ALWAYS, 0, NULL);
+  WCHAR full_from[PATH_CHARS], full_to[PATH_CHARS];
+  if (full_path_w(from, full_from, PATH_CHARS) && full_path_w(to, full_to, PATH_CHARS) && equals_ignore_case(full_from, full_to)) { CloseHandle(in); set_error(ERROR_SHARING_VIOLATION); return FALSE; }
+  BOOL can_delete = TRUE;
+  HANDLE out = CreateFileW(to, GENERIC_WRITE | DELETE, 3, NULL, fail_if_exists ? CREATE_NEW : CREATE_ALWAYS, 0, NULL);
+  if (out == INVALID_HANDLE_VALUE && GetLastError() == ERROR_SHARING_VIOLATION) {
+    can_delete = FALSE;
+    out = CreateFileW(to, GENERIC_WRITE, 3, NULL, fail_if_exists ? CREATE_NEW : CREATE_ALWAYS, 0, NULL);
+  }
   if (out == INVALID_HANDLE_VALUE) { const DWORD e = GetLastError(); CloseHandle(in); set_error(e); return FALSE; }
-  BYTE *chunk = RtlAllocateHeap(heap(), 0, 16384);
-  BOOL ok = chunk != NULL;
-  if (!chunk) set_error(ERROR_NOT_ENOUGH_MEMORY);
+  LARGE_INTEGER total;
+  total.QuadPart = 0;
+  GetFileSizeEx(in, &total);
+  LARGE_INTEGER done;
+  done.QuadPart = 0;
+  DWORD verdict = 0;      /* PROGRESS_CONTINUE */
+  if (progress) verdict = progress(total, done, total, done, 1, 1 /* CALLBACK_STREAM_SWITCH */, in, out, data);
+  BYTE *chunk = verdict == 0 ? RtlAllocateHeap(heap(), 0, 16384) : NULL;
+  BOOL ok = verdict == 0 && chunk != NULL;
+  DWORD error = verdict == 0 ? (chunk ? ERROR_SUCCESS : ERROR_NOT_ENOUGH_MEMORY) : ERROR_REQUEST_ABORTED;
   while (ok) {
     DWORD got = 0, put = 0;
     ok = ReadFile(in, chunk, 16384, &got, NULL);
-    if (!ok || got == 0) break;
+    if (!ok || got == 0) { error = GetLastError(); break; }
     ok = WriteFile(out, chunk, got, &put, NULL) && put == got;
+    if (!ok) { error = GetLastError(); break; }
+    done.QuadPart += got;
+    if (progress) {
+      verdict = progress(total, done, total, done, 1, 0 /* CALLBACK_CHUNK_FINISHED */, in, out, data);
+      if (verdict) { ok = FALSE; error = ERROR_REQUEST_ABORTED; }
+    }
+    if (cancel && *cancel) { ok = FALSE; error = ERROR_REQUEST_ABORTED; }
   }
-  const DWORD e = GetLastError();
   if (chunk) RtlFreeHeap(heap(), 0, chunk);
+  if (ok || (error == ERROR_SUCCESS && !chunk)) { ok = TRUE; error = ERROR_SUCCESS; }
+  FILETIME written;
+  const BOOL have_time = ok && GetFileTime(in, NULL, NULL, &written);
+  if (have_time) SetFileTime(out, NULL, NULL, &written);
+  const DWORD source_attributes = GetFileAttributesW(from);
   CloseHandle(in);
   CloseHandle(out);
-  if (!ok) set_error(e);
+  if (ok && source_attributes != INVALID_FILE_ATTRIBUTES && (source_attributes & FILE_ATTRIBUTE_READONLY)) SetFileAttributesW(to, FILE_ATTRIBUTE_READONLY);
+  if (!ok && verdict == 1 /* PROGRESS_CANCEL */ && can_delete) DeleteFileW(to);
+  set_error(ok ? ERROR_SUCCESS : error);
   return ok;
 }
+EXPORT BOOL WINAPI CopyFileW(LPCWSTR from, LPCWSTR to, BOOL fail_if_exists) { return copy_file_core(from, to, fail_if_exists, NULL, NULL, NULL); }
 EXPORT BOOL WINAPI CopyFileA(LPCSTR from, LPCSTR to, BOOL fail_if_exists) {
   if (!from || !to) { set_error(ERROR_PATH_NOT_FOUND); return FALSE; }
   WCHAR *a = to_wide(from), *b = to_wide(to);
@@ -2892,18 +2953,26 @@ static void fill_find_data(const BYTE *record, WIN32_FIND_DATAW *data) {
 }
 
 EXPORT HANDLE WINAPI FindFirstFileW(LPCWSTR path, LPWIN32_FIND_DATAW data) {
+  if (!path) { set_error(ERROR_PATH_NOT_FOUND); return INVALID_HANDLE_VALUE; }
+  /* The pattern is what follows the last separator of the path as it was written: normalising the whole path would take trailing dots and spaces off it, and those
+   * mean something in a pattern ("*." is the names without an extension). */
+  const size_t_ path_length = wcslen(path);
+  size_t_ cut = path_length;
+  while (cut > 0 && path[cut - 1] != '\\' && path[cut - 1] != '/' && !(cut == 2 && path[1] == ':')) --cut;
+  WCHAR directory_text[PATH_CHARS];
+  if (path_length >= PATH_CHARS) { set_error(ERROR_FILENAME_EXCED_RANGE); return INVALID_HANDLE_VALUE; }
+  if (cut == 0) { directory_text[0] = '.'; directory_text[1] = '\\'; directory_text[2] = 0; }
+  else { memcpy(directory_text, path, cut * 2); directory_text[cut] = 0; }
   WCHAR full[PATH_CHARS];
-  const DWORD n = full_path_w(path, full, PATH_CHARS);
+  const DWORD n = full_path_w(directory_text, full, PATH_CHARS - 2);
   if (n == 0) return INVALID_HANDLE_VALUE;
-  /* "C:\dir\*.txt": the directory is everything before the last backslash, the pattern what follows. */
   DWORD split = n;
-  while (split > 0 && full[split - 1] != '\\') --split;
-  if (split == 0) { set_error(ERROR_PATH_NOT_FOUND); return INVALID_HANDLE_VALUE; }
+  if (full[split - 1] != '\\') full[split++] = '\\';
   FindState *f = RtlAllocateHeap(heap(), HEAP_ZERO_MEMORY, sizeof(FindState));
   if (!f) { set_error(ERROR_NOT_ENOUGH_MEMORY); return INVALID_HANDLE_VALUE; }
-  const DWORD pattern_length = n - split;
+  const DWORD pattern_length = (DWORD)(path_length - cut);
   if (pattern_length == 0 || pattern_length >= MAX_PATH) { RtlFreeHeap(heap(), 0, f); set_error(ERROR_FILE_NOT_FOUND); return INVALID_HANDLE_VALUE; }
-  memcpy(f->pattern, full + split, pattern_length * 2);
+  memcpy(f->pattern, path + cut, pattern_length * 2);
   f->pattern[pattern_length] = 0;
   if (split > 3) --split;      /* the directory without its trailing backslash, except the root */
   full[split] = 0;

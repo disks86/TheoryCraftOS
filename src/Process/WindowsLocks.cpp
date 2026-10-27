@@ -24,7 +24,7 @@ namespace process::windowsabi {
 
 namespace {
 constexpr uint32_t kSuccess = 0, kAccessViolation = 0xC0000005u, kInvalidHandle = 0xC0000008u, kInvalidParameter = 0xC000000Du, kNotImplemented = 0xC0000002u,
-                   kLockNotGranted = 0xC0000055u, kRangeNotLocked = 0xC000007Eu, kNoResources = 0xC000009Au, kInvalidDevice = 0xC0000010u;
+                   kLockNotGranted = 0xC0000055u, kRangeNotLocked = 0xC000007Eu, kInvalidLockRange = 0xC00001A1u, kNoResources = 0xC000009Au, kInvalidDevice = 0xC0000010u;
 
 // The file of a handle as the system names it, and the range asked for.
 bool file_and_range(Process& p, const SyscallRequest& r, uint64_t offset_at, uint64_t length_at, String* path, const void** owner, uint64_t* offset, uint64_t* length, uint32_t* status) {
@@ -36,7 +36,7 @@ bool file_and_range(Process& p, const SyscallRequest& r, uint64_t offset_at, uin
   if (p.files().kind(slot) != DescriptorKind::File || !file || !p.files().host_path_of(file->path.view(), path)) { *status = kInvalidDevice; return false; }
   *owner = file;
   if (!p.read_user_u64(offset_at, offset) || !p.read_user_u64(length_at, length)) { *status = kAccessViolation; return false; }
-  if (*length == 0 || int64_t(*offset) < 0 || int64_t(*length) < 0) { *status = kInvalidParameter; return false; }
+  if (*length != 0 && *length - 1 > ~uint64_t{0} - *offset) { *status = kInvalidLockRange; return false; }      // past the end of the 64-bit range
   return true;
 }
 }  // namespace
@@ -70,6 +70,7 @@ uint32_t nt_unlock_file(Process& p, const SyscallRequest& r) {
   if (!argument(p, r, 4, &key)) return kAccessViolation;
   ObjectManager* objects = system_objects();
   if (!objects) return kNotImplemented;
+  if (r.args[1] == 0) return kAccessViolation;      // (the status block is not optional)
   String path(p.files().allocator());
   const void* owner = nullptr;
   uint64_t offset = 0, length = 0;

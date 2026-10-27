@@ -50,7 +50,8 @@ DescriptorKind descriptor_kind_of(ObjectKind k) {
 }
 
 bool slot_of(uint64_t handle, uint64_t* slot) {
-  if (handle == 0 || handle % 4 != 0 || handle / 4 > Process::kMaxDescriptors) return false;
+  handle &= ~uint64_t{3};      // (the low two bits of a handle are free for the program's own use, as on Windows)
+  if (handle == 0 || handle / 4 > Process::kMaxDescriptors) return false;
   *slot = handle / 4 - 1;
   return true;
 }

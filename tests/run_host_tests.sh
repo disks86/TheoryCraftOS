@@ -52,6 +52,7 @@ for t in "${WANTED[@]}"; do
     ModuleLoaderTest) build_and_run ModuleLoaderTest tests/ModuleLoaderTest.cpp src/Process/*.cpp src/Executable/*.cpp src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp src/Kernel/Sync.cpp tests/KernelStubs.cpp ;;
     ProgramHostTest) build_and_run ProgramHostTest tests/ProgramHostTest.cpp src/Program/ProgramHost.cpp src/Desktop/Shell.cpp src/Desktop/DirectoryListing.cpp src/Desktop/FileTransfer.cpp src/Process/ProgramEnvironment.cpp src/Executable/*.cpp src/Crypto/*.cpp \
                       src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp src/Kernel/Sync.cpp tests/KernelStubs.cpp ;;
+    DosWildcardTest) build_and_run DosWildcardTest tests/DosWildcardTest.cpp src/Process/DosWildcard.cpp ;;
     RegistryTest) build_and_run RegistryTest tests/RegistryTest.cpp src/Process/RegistryTree.cpp ;;
     ProcessFilesTest) build_and_run ProcessFilesTest tests/ProcessFilesTest.cpp src/Process/*.cpp src/Executable/*.cpp src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp src/Kernel/Sync.cpp tests/KernelStubs.cpp ;;
     LoaderTest) build_and_run LoaderTest tests/LoaderTest.cpp src/Process/*.cpp src/Executable/*.cpp src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp src/Kernel/Sync.cpp tests/KernelStubs.cpp ;;
