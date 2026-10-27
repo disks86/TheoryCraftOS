@@ -3005,58 +3005,6 @@ static const char *error_text(DWORD error) {
     default: return NULL;
   }
 }
-#define FORMAT_MESSAGE_ALLOCATE_BUFFER 0x100
-#define FORMAT_MESSAGE_IGNORE_INSERTS 0x200
-#define FORMAT_MESSAGE_FROM_SYSTEM 0x1000
-EXPORT DWORD WINAPI FormatMessageA(DWORD flags, LPCVOID source, DWORD id, DWORD language, LPSTR buffer, DWORD capacity, PVOID arguments) {
-  (void)source; (void)language; (void)arguments;
-  if (!(flags & FORMAT_MESSAGE_FROM_SYSTEM)) { set_error(ERROR_INVALID_PARAMETER); return 0; }
-  char fallback[40];
-  const char *text = error_text(id);
-  if (!text) {
-    const char *prefix = "Error ";
-    size_t_ n = 0;
-    while (prefix[n]) { fallback[n] = prefix[n]; ++n; }
-    char digits[12];
-    int d = 0;
-    DWORD v = id;
-    do { digits[d++] = (char)('0' + v % 10); v /= 10; } while (v);
-    while (d) fallback[n++] = digits[--d];
-    fallback[n++] = '.';
-    fallback[n] = 0;
-    text = fallback;
-  }
-  const DWORD length = (DWORD)strlen(text);
-  if (flags & FORMAT_MESSAGE_ALLOCATE_BUFFER) {
-    char *allocated = RtlAllocateHeap(heap(), 0, length + 3);
-    if (!allocated) { set_error(ERROR_NOT_ENOUGH_MEMORY); return 0; }
-    memcpy(allocated, text, length);
-    allocated[length] = '\r'; allocated[length + 1] = '\n'; allocated[length + 2] = 0;
-    *(char **)buffer = allocated;
-    return length + 2;
-  }
-  if (length + 3 > capacity) { set_error(ERROR_INSUFFICIENT_BUFFER); return 0; }
-  memcpy(buffer, text, length);
-  buffer[length] = '\r'; buffer[length + 1] = '\n'; buffer[length + 2] = 0;
-  return length + 2;
-}
-EXPORT DWORD WINAPI FormatMessageW(DWORD flags, LPCVOID source, DWORD id, DWORD language, LPWSTR buffer, DWORD capacity, PVOID arguments) {
-  char narrow[256];
-  const DWORD n = FormatMessageA(flags & ~FORMAT_MESSAGE_ALLOCATE_BUFFER, source, id, language, narrow, sizeof(narrow), arguments);
-  if (n == 0) return 0;
-  const int units = MultiByteToWideChar(CP_UTF8, 0, narrow, (int)n + 1, NULL, 0);
-  if (flags & FORMAT_MESSAGE_ALLOCATE_BUFFER) {
-    WCHAR *allocated = RtlAllocateHeap(heap(), 0, (SIZE_T)units * 2);
-    if (!allocated) return 0;
-    MultiByteToWideChar(CP_UTF8, 0, narrow, (int)n + 1, allocated, units);
-    *(WCHAR **)buffer = allocated;
-    return n;
-  }
-  if ((DWORD)units > capacity) { set_error(ERROR_INSUFFICIENT_BUFFER); return 0; }
-  MultiByteToWideChar(CP_UTF8, 0, narrow, (int)n + 1, buffer, (int)capacity);
-  return n;
-}
-
 /* ---- start ------------------------------------------------------------------------------------------------------------------------------------------------ */
 
 EXPORT BOOL WINAPI DllMain(HANDLE module, DWORD reason, PVOID reserved) {
@@ -3068,3 +3016,4 @@ EXPORT BOOL WINAPI DllMain(HANDLE module, DWORD reason, PVOID reserved) {
 #include "extra2.inc"
 #include "extra3.inc"
 #include "legacy.inc"
+#include "fmtmsg.inc"

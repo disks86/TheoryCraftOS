@@ -22,3 +22,27 @@ list of failing tests is the to-do list for the implementation.
 26 tests are imported but do not link here, because they need something mingw-w64 lacks: the import libraries of `kernelbase`, `win32u`, `winspool.drv` and `d3d10_1`,
 the private entry points `__STRINGTOLD`, `GetDiskInfoA` and `D3D10CreateDevice1`, or GUIDs and helpers that Wine's build makes from IDL files of its own tree (msi, dsound,
 oleaut32 `tmarshal`, rpcrt4 `cstub`, ole32 `CLSID_ManualResetEvent`, ...). Wine tests of DLLs this OS has no file for (windowscodecs, jscript, vbscript, ...) are not imported.
+
+## Running them, and where the implementations stand
+
+`scripts/winetest.sh <dll> [test ...]` builds the tests of a DLL, boots the OS headless under KVM with `tests/windows/winerun.exe` as the program, runs each test as a process
+of its own and prints the failed checks per test (a test that stops the machine is recorded as HUNG and the rest go on). The debug console is slow, so each test stops
+printing after 30 failures: the number is a lower bound. `WINETEST_ENV=WINETEST_DEBUG=2` or `scripts/winetest.sh ntdll "rtl@VAR=value"` set environment variables for a test.
+`scripts/gen-test-stubs.py` adds the names the tests look up with GetProcAddress to the stub lists; `scripts/unstub.py` removes the stubs a source file now defines.
+
+Checks that failed (Wine commit f343ca6), before the implementation of the library started and now:
+
+| DLL / test | before | now |
+|---|---|---|
+| ntdll rtlbitmap | 2 | 0 |
+| ntdll large_int | 432 | 5 (the NUL after a number that fills MaximumLength exactly) |
+| ntdll rtlstr | 8+, hung | 4 + RtlIsTextUnicode (not done) |
+| ntdll error (RtlNtStatusToDosError) | 633 | 155 |
+| ntdll string (C library in ntdll) | crash | 14 |
+| shlwapi string | 16751 | about 150 (needs ordinal exports and StrRetTo*/StrFromTimeInterval) |
+| lz32 lzexpand | 117 | 17 |
+| kernel32 format_msg | 591 | 270 |
+
+Everything else was measured once and has not been worked on: ntdll alpc 1684, directory 784, file 354, sync 246, threadpool 244, reg 133 (the NT registry services), path 279;
+kernel32 loader 5231, file 2756, time 786, comm 763, locale 150, version 92; shlwapi url/istream/shreg/assoc; mpr 211, psapi 123, userenv 68, secur32 53. Most of those are
+missing system services (the NT registry, object namespace, ALPC, thread pools, `NtQuerySystemInformation` classes) rather than missing library code.
