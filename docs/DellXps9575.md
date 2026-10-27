@@ -375,8 +375,15 @@ Everything is off again at shutdown (`dce_v11_0_hw_fini`: `hpd_fini`, page flip 
 `scripts/check_irq_port.py` now also checks these against `dce_v11_0.c` and `vid.h`: the registered source ids, the data decoding, the order of `hpd_init`, the polarity rule, the filter delays, the register block offsets, the
 status register table and the acknowledgements.
 
+The video engines' interrupts need no enabling here: the driver turns them on in the engines' own start code, and the ports do the same - `AmdUvd6` start writes `UVD_MASTINT_EN` (`VCPU_EN | SYS_EN`, `uvd_v6_0_start`)
+and `AmdVce3::mc_resume` sets `VCE_SYS_INT_EN.VCE_SYS_INT_TRAP_INTERRUPT_EN` (`vce_v3_0_mc_resume`), so the card posts as soon as an engine is started. What was missing was the dispatch (`uvd_v6_0_process_interrupt`,
+`vce_v3_0_process_interrupt`): source 124 is the decode ring's fence, 119 and 120 the two encode rings' (`AmdIrq::Kind::UvdFence`, `UvdEncodeFence` with `ring`), and 167 a VCE ring's fence with the ring (0..2) in the data
+(`VceFence`; any other data is not a fence). A VCE fence is acknowledged first with `VCE_SYS_INT_STATUS.VCE_SYS_INT_TRAP_INTERRUPT_INT`, as the driver's handler does. The engines' own paths still wait for their fences by
+polling, so these are counted (`uvd_encode_fences`, `vce_fences`) and shown to whoever asks: `AmdVegaM::set_event_observer(AmdIrq::ISink*)` passes every event on after the card has dealt with it. Nothing connects the
+video engines to the observer yet. `check_irq_port.py` also checks these ids and handlers and that both engines' start code still enables their sources.
+
 Nothing in the OS reacts to a hot plug yet: the connector cannot be re-detected (no AtomBIOS, no DDC/EDID over the card's own aux channels), so a plug or unplug is only counted and its state kept. Not done: the vline
-interrupt is not enabled (only classified and acknowledged), the audio and DP short-pulse (`DC_HPD_RX_INT`) interrupts, the UVD/VCE interrupts; no ring reset or recovery after a fault (the engine has to be restarted).
+interrupt is not enabled (only classified and acknowledged), the audio and DP short-pulse (`DC_HPD_RX_INT`) interrupts; no ring reset or recovery after a fault (the engine has to be restarted).
 
 ### MSI: interrupts wake the CPU
 

@@ -30,6 +30,8 @@ constexpr uint32_t mmVM_CONTEXT1_CNTL2 = 0x50d, mmVM_CONTEXT1_PROTECTION_FAULT_S
 // gmc_8_1_sh_mask.h
 constexpr uint32_t kStatusProtectionsMask = 0xff, kStatusClientIdMask = 0x1ff000, kStatusClientIdShift = 0xc, kStatusRwMask = 0x1000000, kStatusVmidMask = 0x1e000000, kStatusVmidShift = 0x19;
 constexpr uint32_t kClearProtectionFaultStatusAddrMask = 0x1;
+// vce_3_0_d.h and vce_3_0_sh_mask.h
+constexpr uint32_t mmVCE_SYS_INT_STATUS = 0x8541, kVceSysIntTrapInterruptIntMask = 0x8;
 // gfx_8_0_d.h
 constexpr uint32_t mmGRBM_GFX_INDEX = 0xc200, mmSQ_EDC_INFO = 0x23a3;
 // gfx_8_0_sh_mask.h
@@ -57,6 +59,9 @@ const char* AmdIrq::kind_name(Kind kind) {
     case Kind::DisplayVline: return "display vline";
     case Kind::DisplayPageFlip: return "display page flip";
     case Kind::DisplayHotplug: return "display hot plug";
+    case Kind::UvdFence: return "UVD fence";
+    case Kind::UvdEncodeFence: return "UVD encode fence";
+    case Kind::VceFence: return "VCE fence";
 
   }
   return "unknown";
@@ -92,6 +97,16 @@ AmdIrq::Event AmdIrq::classify(const AmdIh3::Vector& vector) {
     case kSrcGfxPageInvFault:
     case kSrcGfxMemProtFault: e.kind = Kind::VmFault; break;
     default: break;
+  }
+  // The video engines' (uvd_v6_0_sw_init registers 124 and 119 + i for the encode rings; vce_v3_0_sw_init 167, whose data names the ring)
+  if (vector.src_id == kSrcUvdSystemMessage) {
+    e.kind = Kind::UvdFence;
+  } else if (vector.src_id == kSrcUvdEncodeFirst || vector.src_id == kSrcUvdEncodeFirst + 1) {
+    e.ring = vector.src_id - kSrcUvdEncodeFirst;
+    e.kind = Kind::UvdEncodeFence;
+  } else if (vector.src_id == kSrcVceTrap && vector.src_data < 3) {
+    e.ring = vector.src_data;
+    e.kind = Kind::VceFence;
   }
   // The display engine's (dce_v11_0_sw_init registers 1..6 for the controllers, the even ids 8..18 for page flips and 42 for the hot plug pins)
   if (vector.src_id >= kSrcDisplayCrtcFirst && vector.src_id < kSrcDisplayCrtcFirst + amd_dce11::kMaxCrtcs) {
@@ -164,6 +179,11 @@ uint32_t AmdIrq::process(AmdIh3& ih, ISink* sink, uint32_t max_vectors) {
       last_vm_fault_ = event.vm;
     }
     switch (event.kind) {
+      case Kind::UvdEncodeFence: ++uvd_encode_[event.ring]; break;
+      case Kind::VceFence:   // WREG32_FIELD(VCE_SYS_INT_STATUS, VCE_SYS_INT_TRAP_INTERRUPT_INT, 1): acknowledged before the ring is looked at
+        registers_.write(mmVCE_SYS_INT_STATUS, registers_.read(mmVCE_SYS_INT_STATUS) | kVceSysIntTrapInterruptIntMask);
+        ++vce_[event.ring];
+        break;
       case Kind::DisplayVblank:   // (the driver acknowledges what the status says is pending, and counts the vblank either way)
         event.asserted = display_.vblank_asserted(event.crtc);
         if (event.asserted) display_.ack_vblank(event.crtc);

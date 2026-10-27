@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Checks the interrupt source ids and fault registers of src/Hardware/GraphicsProcessingUnit/AMD/AmdIrq.{hpp,cpp} against the Linux driver they were taken from.
 
-  check_irq_port.py path/to/ivsrcid_vislands30.h path/to/gmc_8_1_d.h path/to/gmc_8_1_sh_mask.h path/to/gfx_v8_0.c path/to/sdma_v3_0.c path/to/gmc_v8_0.c path/to/gfx_8_0_d.h path/to/gfx_8_0_sh_mask.h path/to/dce_v11_0.c vid.h
+  check_irq_port.py path/to/ivsrcid_vislands30.h path/to/gmc_8_1_d.h path/to/gmc_8_1_sh_mask.h path/to/gfx_v8_0.c path/to/sdma_v3_0.c path/to/gmc_v8_0.c path/to/gfx_8_0_d.h path/to/gfx_8_0_sh_mask.h path/to/dce_v11_0.c vid.h path/to/uvd_v6_0.c path/to/vce_v3_0.c path/to/vce_3_0_d.h path/to/vce_3_0_sh_mask.h
 
 (from kernel tag v6.12, drivers/gpu/drm/amd/include/ivsrcid/, include/asic_reg/gmc/, include/asic_reg/gca/ and amdgpu/). It checks that the source ids are the ones the driver registers with
 amdgpu_irq_add_id in the three blocks' sw_init, that the register numbers and masks are the headers', and that the ring id decoding in the handlers is the one classify() uses.
@@ -27,9 +27,9 @@ def define(src, name):
 
 
 def main():
-    if len(sys.argv) != 11:
+    if len(sys.argv) != 15:
         sys.exit(__doc__)
-    ivs, gmc_d, gmc_m, gfx, sdma, gmc_c, gfx_d, gfx_m, dce_c, vid_h = [open(a).read() for a in sys.argv[1:]]
+    ivs, gmc_d, gmc_m, gfx, sdma, gmc_c, gfx_d, gfx_m, dce_c, vid_h, uvd_c, vce_c, vce_d, vce_m = [open(a).read() for a in sys.argv[1:]]
     hpp = open(os.path.join(ROOT, 'AmdIrq.hpp')).read()
     cpp = open(os.path.join(ROOT, 'AmdIrq.cpp')).read()
 
@@ -90,6 +90,7 @@ def main():
 
     check_sq(gfx, gfx_d, gfx_m, cpp)
     check_display(dce_c, vid_h, hpp, cpp)
+    check_video(ivs, uvd_c, vce_c, vce_d, vce_m, hpp, cpp)
     check_enables(gfx, sdma, gmc_c)
     check_ecc_and_sq_enables(gfx, gfx_m)
     if bad:
@@ -107,6 +108,44 @@ def function_body(src, name):
         if depth == 0:
             return src[i:j + 1]
     sys.exit('unbalanced: ' + name)
+
+
+def check_video(ivs, uvd, vce, vce_d, vce_m, hpp, cpp):
+    """The UVD and VCE interrupt sources: ids, the handlers' decoding, VCE's acknowledgement, and that the engines' own start code turns the sources on as the driver's does."""
+    ours = {m.group(1): int(m.group(2)) for m in re.finditer(r'\b(kSrc\w+) = (\d+)', hpp)}
+    for k, h in (('kSrcUvdEncodeFirst', 'VISLANDS30_IV_SRCID_UVD_ENC_GEN_PURP'), ('kSrcUvdSystemMessage', 'VISLANDS30_IV_SRCID_UVD_SYSTEM_MESSAGE'), ('kSrcVceTrap', 'VISLANDS30_IV_SRCID_VCE_TRAP')):
+        if ours.get(k) != define(ivs, h):
+            fail(f'{k}: ours {ours.get(k)}, driver {define(ivs, h)}')
+    sw = function_body(uvd, 'uvd_v6_0_sw_init')
+    if 'VISLANDS30_IV_SRCID_UVD_SYSTEM_MESSAGE, &adev->uvd.inst->irq' not in sw or 'i + VISLANDS30_IV_SRCID_UVD_ENC_GEN_PURP' not in sw or 'i < adev->uvd.num_enc_rings' not in sw:
+        fail('uvd_v6_0_sw_init registers other sources')
+    handler = function_body(uvd, 'uvd_v6_0_process_interrupt')
+    if 'case 124:' not in handler or 'case 119:' not in handler or 'case 120:' not in handler or 'ring_enc[0]' not in handler or 'ring_enc[1]' not in handler:
+        fail('uvd_v6_0_process_interrupt decoding changed')
+    if 'VISLANDS30_IV_SRCID_VCE_TRAP, &adev->vce.irq' not in function_body(vce, 'vce_v3_0_sw_init'):
+        fail('vce_v3_0_sw_init registers another source')
+    handler = function_body(vce, 'vce_v3_0_process_interrupt')
+    if 'WREG32_FIELD(VCE_SYS_INT_STATUS, VCE_SYS_INT_TRAP_INTERRUPT_INT, 1)' not in handler or 'switch (entry->src_data[0])' not in handler or \
+            'case 0:\n\tcase 1:\n\tcase 2:' not in handler or handler.index('WREG32_FIELD') > handler.index('switch'):
+        fail('vce_v3_0_process_interrupt changed')
+    for name, mine in (('mmVCE_SYS_INT_STATUS', 'mmVCE_SYS_INT_STATUS = '),):
+        m = re.search(mine + r'(0x[0-9a-fA-F]+)', cpp)
+        if not m or int(m.group(1), 16) != define(vce_d, name):
+            fail(f'{name}: ours {m.group(1) if m else None}, header {define(vce_d, name)}')
+    m = re.search(r'kVceSysIntTrapInterruptIntMask = (0x[0-9a-fA-F]+)', cpp)
+    if not m or int(m.group(1), 16) != define(vce_m, 'VCE_SYS_INT_STATUS__VCE_SYS_INT_TRAP_INTERRUPT_INT_MASK'):
+        fail('VCE_SYS_INT_STATUS trap bit')
+    # the enables are in the engines' start code in the driver (uvd_v6_0_start, vce_v3_0_mc_resume) and in the ports of them
+    uvd_start = function_body(uvd, 'uvd_v6_0_start')
+    if 'UVD_MASTINT_EN__VCPU_EN_MASK|UVD_MASTINT_EN__SYS_EN_MASK' not in uvd_start:
+        fail('uvd_v6_0_start no longer enables the master interrupt that way')
+    if 'WREG32_FIELD(VCE_SYS_INT_EN, VCE_SYS_INT_TRAP_INTERRUPT_EN, 1)' not in function_body(vce, 'vce_v3_0_mc_resume'):
+        fail('vce_v3_0_mc_resume no longer enables the trap interrupt')
+    base = os.path.join(ROOT, '..', '..', 'VideoCodec', 'AMD')
+    if 'UVD_MASTINT_EN__VCPU_EN_MASK|UVD_MASTINT_EN__SYS_EN_MASK' not in open(os.path.join(base, 'AmdUvd6.cpp')).read():
+        fail('AmdUvd6.cpp does not enable the master interrupt')
+    if 'WREG32_FIELD(VCE_SYS_INT_EN, VCE_SYS_INT_TRAP_INTERRUPT_EN, 1)' not in open(os.path.join(base, 'AmdVce3.cpp')).read():
+        fail('AmdVce3.cpp does not enable the trap interrupt')
 
 
 def check_display(dce, vid, hpp, cpp):

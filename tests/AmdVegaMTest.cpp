@@ -793,6 +793,45 @@ static void test_vblank_interrupt() {
   CHECK(!(rig.card.dce.get(0x1ac8 + 0x400) & 1));
 }
 
+// The video engines' fences: UVD's decode ring (124), its two encode rings (119, 120) and VCE's three rings (167, data 0..2) are classified and counted; a VCE fence is acknowledged in
+// VCE_SYS_INT_STATUS (bit 3) before anything else; an observer sees every event, in order, after the card dealt with it.
+static void test_video_engine_interrupts() {
+  Rig rig;
+  AmdVegaM vega(rig.alloc);
+  CHECK(vega.bring_up(rig.inputs()));
+  if (!vega.up()) return;
+  const AmdIrq& irq = *vega.irq();
+  Recorder rec;
+  vega.set_event_observer(&rec);
+  rig.card.ih.post(124, 0, 0, 0, 0);
+  rig.card.ih.post(119, 0, 0, 0, 0);
+  rig.card.ih.post(120, 0, 0, 0, 0);
+  rig.card.ih.post(120, 0, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 4 && irq.count(AmdIrq::Kind::UvdFence) == 1 && irq.count(AmdIrq::Kind::UvdEncodeFence) == 3 && irq.uvd_encode_fences(0) == 1 && irq.uvd_encode_fences(1) == 2);
+  CHECK(rig.card.gfx.reg(0x8541) == 0 && irq.uvd_encode_fences(2) == 0);   // (UVD has nothing to acknowledge here)
+  rig.card.ih.post(167, 2, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && irq.vce_fences(2) == 1 && irq.vce_fences(0) == 0 && irq.count(AmdIrq::Kind::VceFence) == 1);
+  CHECK(rig.card.gfx.reg(0x8541) == 0x8);
+  rig.card.gfx.set_reg(0x8541, 0x1);   // the other bits are kept
+  rig.card.ih.post(167, 0, 0, 0, 0);
+  rig.card.ih.post(167, 1, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 2 && irq.vce_fences(0) == 1 && irq.vce_fences(1) == 1 && rig.card.gfx.reg(0x8541) == 0x9);
+  // A ring that does not exist: not a fence, not acknowledged.
+  rig.card.gfx.set_reg(0x8541, 0);
+  rig.card.ih.post(167, 3, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && irq.count(AmdIrq::Kind::VceFence) == 3 && irq.unknown_source(167) == 1 && rig.card.gfx.reg(0x8541) == 0);
+  // The observer saw all eight events in the order they were posted.
+  CHECK(rec.events.size() == 8);
+  const AmdIrq::Kind order[] = {AmdIrq::Kind::UvdFence, AmdIrq::Kind::UvdEncodeFence, AmdIrq::Kind::UvdEncodeFence, AmdIrq::Kind::UvdEncodeFence,
+                                AmdIrq::Kind::VceFence, AmdIrq::Kind::VceFence, AmdIrq::Kind::VceFence, AmdIrq::Kind::Unknown};
+  for (size_t i = 0; i < rec.events.size() && i < 8; ++i) CHECK(rec.events[i].kind == order[i]);
+  CHECK(rec.events[1].ring == 0 && rec.events[2].ring == 1 && rec.events[4].ring == 2 && rec.events[5].ring == 0 && rec.events[6].ring == 1);
+  // Stopped observing.
+  vega.set_event_observer(nullptr);
+  rig.card.ih.post(124, 0, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && rec.events.size() == 8);
+}
+
 int main() {
   setvbuf(stdout, nullptr, _IONBF, 0);
   test_plan();
@@ -807,6 +846,7 @@ int main() {
   test_sq_messages();
   test_display_interrupts();
   test_vblank_interrupt();
+  test_video_engine_interrupts();
   printf(g_failed ? "AmdVegaMTest: %d FAILED\n" : "AmdVegaMTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }
