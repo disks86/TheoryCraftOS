@@ -211,6 +211,27 @@ class Vm {
   // Turns the fresh object `new String(...)` made into the wrapper of `primitive` (when `self` is such an object); false for a plain call.
   bool become_wrapper(const Value& self, JsObject* proto, const Value& primitive);
   static bool is_symbol(const Value& v) { return v.tag == Tag::String && v.as_string()->symbol; }
+  // A property's state as the language describes it (the fields a descriptor object has).
+  struct PropDesc {
+    bool has_value = false, has_writable = false, has_get = false, has_set = false, has_enumerable = false, has_configurable = false;
+    Value value, getter, setter;
+    bool writable = false, enumerable = false, configurable = false;
+    bool accessor() const { return has_get || has_set; }
+    bool data() const { return has_value || has_writable; }
+  };
+  bool to_descriptor(const Value& v, PropDesc* out);
+  Value descriptor_to_object(const PropDesc& d);
+  bool compatible_descriptor(bool extensible, const PropDesc& desc, bool has_current, const PropDesc& current);
+  // The object operations that a proxy can intercept, for ordinary objects and proxies alike.
+  bool get_own_descriptor(JsObject* o, JsString* key, bool* present, PropDesc* out);
+  bool is_extensible_op(JsObject* o, bool* out);
+  bool get_prototype_op(JsObject* o, JsObject** out);
+  bool proxy_get_own_property(JsObject* proxy, JsString* key, bool* present, PropDesc* out);
+  bool proxy_define_property(JsObject* proxy, JsString* key, const PropDesc& desc, bool* ok, JsObject** forward);
+  bool proxy_get_prototype(JsObject* proxy, JsObject** out);
+  bool proxy_set_prototype(JsObject* proxy, JsObject* proto, bool* ok, JsObject** forward);
+  bool proxy_is_extensible(JsObject* proxy, bool* out);
+  bool proxy_prevent_extensions(JsObject* proxy, bool* ok, JsObject** forward);
   // A new symbol (not interned: it is its own property key). The well-known ones are interned "@@iterator" and the like, flagged by the builtins.
   JsString* new_symbol(const Value& description);
   // The own property keys that are symbols (enumerable or not).
@@ -414,10 +435,13 @@ class Vm {
   bool proxy_parts(JsObject* proxy, const char* operation, JsObject** target, Value* handler);
   bool proxy_trap(JsObject* proxy, const char* name, JsObject** target, Value* handler, Value* trap);
   bool proxy_get(JsObject* proxy, JsString* key, const Value& receiver, Value* out);
-  bool proxy_set(JsObject* proxy, JsString* key, const Value& value, const Value& receiver);
+  bool proxy_set(JsObject* proxy, JsString* key, const Value& value, const Value& receiver, bool strict);
+  bool proxy_fail(const char* trap, const char* what, JsString* key);
+  bool ordinary_descriptor(JsObject* o, JsString* key, PropDesc* out);
+  bool get_with_receiver(const Value& base, JsString* key, const Value& receiver, Value* out);
   bool proxy_has(JsObject* proxy, JsString* key, bool* out);
   bool proxy_delete(JsObject* proxy, JsString* key, bool* out);
-  JsObject* proxy_keys(JsObject* proxy, bool all);
+  JsObject* proxy_keys(JsObject* proxy, int mode);
   bool proxy_call(JsObject* proxy, const Value& this_value, const Value* args, uint32_t argc, Value* result, bool construct);
   bool call_setter(const Value& pair, const Value& receiver, const Value& value);
   String halt_reason_;

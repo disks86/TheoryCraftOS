@@ -854,7 +854,7 @@ static void test_modern_syntax() {
 static void test_proxy() {
   CHECK(is("var log = []; var p = new Proxy({ a: 1 }, { get: function (t, k, r) { log.push('get:' + k); return k in t ? t[k] : 'none'; }, set: function (t, k, v) { log.push('set:' + k + '=' + v); t[k] = v * 2; return true; } }); p.a; p.b; p.c = 5; [p.c, log.join()].join('|')", "10|get:a,get:b,set:c=5,get:c"));
   CHECK(is("var p = new Proxy({ x: 1 }, {}); p.y = 2; [p.x, p.y, 'x' in p, 'z' in p, Object.keys(p).join(), JSON.stringify(p)].join()", "1,2,true,false,x,y,{\"x\":1,\"y\":2}"));
-  CHECK(is("var p = new Proxy({ a: 1 }, { has: function (t, k) { return k === 'magic' || k in t; }, deleteProperty: function (t, k) { t.deleted = k; delete t[k]; return true; }, ownKeys: function (t) { return ['a', 'virtual']; } }); var t2 = p; ['magic' in p, 'a' in p, delete p.a, Object.keys(p).join()].join()", "true,true,true,a,virtual"));
+  CHECK(is("var p = new Proxy({ a: 1 }, { has: function (t, k) { return k === 'magic' || k in t; }, deleteProperty: function (t, k) { t.deleted = k; delete t[k]; return true; }, ownKeys: function (t) { return ['a', 'virtual']; } }); var t2 = p; ['magic' in p, 'a' in p, delete p.a, Object.keys(p).join()].join()", "true,true,true,"));
   CHECK(is("var f = new Proxy(function (a, b) { return a + b; }, { apply: function (t, thisArg, args) { return t.apply(thisArg, args) * 10; } }); [f(1, 2), typeof f].join()", "30,function"));
   CHECK(is("class K { constructor(v) { this.v = v; } } var P = new Proxy(K, { construct: function (t, args) { return new t(args[0] + 1); } }); new P(1).v", "2"));
   CHECK(is("var r = Proxy.revocable({ a: 1 }, {}); var before = r.proxy.a; r.revoke(); var e = ''; try { r.proxy.a; } catch (x) { e = x.name; } before + e", "1TypeError"));
