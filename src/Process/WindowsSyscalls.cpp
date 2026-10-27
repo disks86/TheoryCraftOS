@@ -111,6 +111,8 @@ uint32_t nt_query_performance_counter(Process& process, const SyscallRequest& r)
   return kStatusSuccess;
 }
 
+bool is_service(uint64_t number) { return number < kWindowsServiceCount || (number >= kWin32kServiceBase && number < kWin32kServiceEnd); }
+
 }  // namespace
 
 class WindowsSyscalls final : public ISyscallInterface {
@@ -228,7 +230,7 @@ class WindowsSyscalls final : public ISyscallInterface {
       case WindowsSyscallNumber::NtCreateMailslotFile: return windowsabi::nt_create_mailslot_file(process, r);
       case WindowsSyscallNumber::NtNotifyChangeDirectoryFile: return windowsabi::nt_notify_change_directory_file(process, r);
       // A service of the list that has no code yet answers like a real kernel does for a call it does not support; a number outside the list is no service.
-      default: process.host().unhandled_syscall(SyscallAbi::Windows, r.number); return r.number < kWindowsServiceCount ? kStatusNotImplemented : kStatusInvalidSystemService;
+      default: process.host().unhandled_syscall(SyscallAbi::Windows, r.number); return is_service(r.number) ? kStatusNotImplemented : kStatusInvalidSystemService;
     }
   }
 };

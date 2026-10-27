@@ -823,7 +823,13 @@ if(TCOS_ARCH STREQUAL "x86_64")
       dbghelp psapi wininet winhttp wintrust netapi32 dwmapi uxtheme mswsock gdiplus msimg32 opengl32 glu32 dnsapi mpr wtsapi32 powrprof cfgmgr32 d3d9 d3d11 dxgi dwrite shcore
       avrt winspool wevtapi pdh wldap32 urlmon msi propsys hid usp10 winscard odbc32 xinput1_4 dsound dinput8 d2d1 d3dcompiler_47 lz32 oleacc oledlg credui ntdsapi samlib
       activeds normaliz sensapi)
-  set(WINDOWS_LIBRARIES ntdll kernel32 msvcrt advapi32 ws2_32 ${WINDOWS_STUB_LIBRARIES})
+  # win32u.dll holds the system-call stubs of win32k (NtUser*, NtGdi*: src/Windows/win32u/services.inc).
+  add_custom_command(OUTPUT ${WINDOWS_DIR}/win32u.dll
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${WINDOWS_DIR}
+    COMMAND ${CMAKE_C_COMPILER} ${WINDOWS_DLL_FLAGS} -Wl,--image-base=0x180900000 -o ${WINDOWS_DIR}/win32u.dll ${CMAKE_SOURCE_DIR}/src/Windows/win32u/win32u.c
+    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/win32u/win32u.c ${CMAKE_SOURCE_DIR}/src/Windows/win32u/services.inc ${WINDOWS_HEADERS}
+    COMMENT "Building win32u.dll")
+  set(WINDOWS_LIBRARIES ntdll kernel32 msvcrt advapi32 ws2_32 win32u ${WINDOWS_STUB_LIBRARIES})
   set(_stub_image_base 0x180A00000)
   foreach(_library ${WINDOWS_STUB_LIBRARIES})
     windows_stub_flags(_flags ${_library} 0)

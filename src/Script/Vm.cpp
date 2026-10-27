@@ -58,6 +58,18 @@ struct Vm::Coroutine {
 
 // --- Construction ------------------------------------------------------------------------------------------------
 
+namespace {
+// Function.prototype is itself a function that accepts anything and returns undefined.
+bool function_prototype_call(Vm& vm, const Value& self, const Value* args, uint32_t argc, Value* result) {
+  (void)vm;
+  (void)self;
+  (void)args;
+  (void)argc;
+  *result = Value();
+  return true;
+}
+}  // namespace
+
 Vm::Vm(allocators::IAllocator& allocator, IHost* host)
     : allocator_(allocator), host_(host), gray_(allocator), codes_(allocator), halt_reason_(allocator), frames_(allocator), handlers_(allocator) {
   frames_.reserve(kMaxFrames + 8);   // (the interpreter keeps pointers to frames: the list must never move them)
@@ -80,7 +92,12 @@ Vm::Vm(allocators::IAllocator& allocator, IHost* host)
   false_text_ = intern("false");
   object_proto_ = new_object(nullptr);
   function_proto_ = new_object(object_proto_);
+  function_proto_->okind = ObjKind::Native;
+  function_proto_->native = function_prototype_call;
+  function_proto_->position = 0;
+  function_proto_->bound_this = Value::make_string(empty_);
   array_proto_ = new_object(object_proto_);
+  array_proto_->okind = ObjKind::Array;   // (Array.prototype is an empty array)
   string_proto_ = new_object(object_proto_);
   number_proto_ = new_object(object_proto_);
   boolean_proto_ = new_object(object_proto_);
@@ -2032,6 +2049,7 @@ bool Vm::to_boolean(const Value& v) {
     case Tag::Number: return v.u.number == v.u.number && v.u.number != 0;
     case Tag::String: return v.as_string()->length > 0;
     default: {
+      if (v.as_object()->htmldda) return false;
       if (is_bigint(v)) {   // 0n is false
         const JsObject* o = v.as_object();
         for (uint32_t i = 0; i < o->prop_count; ++i)
@@ -2159,7 +2177,7 @@ StringView Vm::type_of(const Value& v) {
     case Tag::Boolean: return "boolean";
     case Tag::Number: return "number";
     case Tag::String: return v.as_string()->symbol ? "symbol" : "string";
-    default: return is_bigint(v) ? "bigint" : is_callable(v) ? "function" : "object";
+    default: return v.as_object()->htmldda ? "undefined" : is_bigint(v) ? "bigint" : is_callable(v) ? "function" : "object";
   }
 }
 
@@ -2188,6 +2206,7 @@ bool Vm::loose_equals(const Value& a, const Value& b) {
   }
   if (a.tag == b.tag) return strict_equals(a, b);
   if (a.is_nullish() && b.is_nullish()) return true;
+  if ((a.is_object() && a.as_object()->htmldda && b.is_nullish()) || (b.is_object() && b.as_object()->htmldda && a.is_nullish())) return true;   // document.all == null
   if (a.is_nullish() || b.is_nullish()) return false;
   if (a.is_object() && !b.is_object()) {
     Value p;
@@ -3124,6 +3143,10 @@ reload:
           message.append(" is not defined");
           throw_error(ErrorKind::ReferenceError, message.view());
           THROW_PENDING();
+        }
+        if (find_prop(global_, name) >= 0) {   // (an existing property keeps its attributes; a read-only one like NaN is not written)
+          CHECK(put_ex(Value::make_object(global_), name, stack_[sp_ - 1], code->strict));
+          break;
         }
         define(global_, name, stack_[sp_ - 1], kDefaultFlags);
         break;
