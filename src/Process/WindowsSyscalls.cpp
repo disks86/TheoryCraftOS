@@ -22,6 +22,7 @@
 #include "Process/WindowsLocks.hpp"
 #include "Process/WindowsJobs.hpp"
 #include "Process/WindowsMailslots.hpp"
+#include "Process/WindowsRegistry.hpp"
 #include "Process/WindowsMemory.hpp"
 #include "Process/WindowsSockets.hpp"
 #include "Process/WindowsModules.hpp"
@@ -228,6 +229,17 @@ class WindowsSyscalls final : public ISyscallInterface {
       case WindowsSyscallNumber::NtSelectSockets: return windowsabi::nt_select_sockets(process, r);
       case WindowsSyscallNumber::NtCreateChangeNotification: return windowsabi::nt_create_change_notification(process, r);
       case WindowsSyscallNumber::NtCreateMailslotFile: return windowsabi::nt_create_mailslot_file(process, r);
+      case WindowsSyscallNumber::NtCreateKey: return windowsabi::nt_create_key(process, r);
+      case WindowsSyscallNumber::NtOpenKey: return windowsabi::nt_open_key(process, r);
+      case WindowsSyscallNumber::NtOpenKeyEx: return windowsabi::nt_open_key_ex(process, r);
+      case WindowsSyscallNumber::NtQueryKey: return windowsabi::nt_query_key(process, r);
+      case WindowsSyscallNumber::NtEnumerateKey: return windowsabi::nt_enumerate_key(process, r);
+      case WindowsSyscallNumber::NtEnumerateValueKey: return windowsabi::nt_enumerate_value_key(process, r);
+      case WindowsSyscallNumber::NtQueryValueKey: return windowsabi::nt_query_value_key(process, r);
+      case WindowsSyscallNumber::NtSetValueKey: return windowsabi::nt_set_value_key(process, r);
+      case WindowsSyscallNumber::NtDeleteKey: return windowsabi::nt_delete_key(process, r);
+      case WindowsSyscallNumber::NtDeleteValueKey: return windowsabi::nt_delete_value_key(process, r);
+      case WindowsSyscallNumber::NtFlushKey: return windowsabi::nt_flush_key(process, r);
       case WindowsSyscallNumber::NtNotifyChangeDirectoryFile: return windowsabi::nt_notify_change_directory_file(process, r);
       // A service of the list that has no code yet answers like a real kernel does for a call it does not support; a number outside the list is no service.
       default: process.host().unhandled_syscall(SyscallAbi::Windows, r.number); return is_service(r.number) ? kStatusNotImplemented : kStatusInvalidSystemService;

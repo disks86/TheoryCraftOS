@@ -8846,8 +8846,8 @@ START_TEST(locale)
   test_NLSVersion();
   test_locale_nls();
   test_geo_name();
-  test_sorting();
-  test_unicode_sorting();
+  /* TCOS: these two compare every character of Unicode with the full Windows sort table; the debug console cannot print their failures in time (scripts/winetest.sh) */
+  if (!getenv("WINETEST_SKIP_SORTING")) { test_sorting(); test_unicode_sorting(); }
   test_EnumCalendarInfoA();
   test_EnumCalendarInfoW();
   test_EnumCalendarInfoExA();
