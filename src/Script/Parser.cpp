@@ -1995,7 +1995,8 @@ class Parser {
       if (!parent) return nullptr;
     }
     if (!expect(T::LBrace, "Unexpected token")) return nullptr;
-    const StringView saved_super = class_super_;
+    const StringView saved_super = class_super_, saved_object_super = object_super_;
+    object_super_ = StringView();
     const bool saved_static = class_static_;
     class_super_ = parent ? StringView("%S") : StringView();
     const StringView cname = name.empty() ? StringView("%C") : name;
@@ -2088,6 +2089,7 @@ class Parser {
       tail = &m->next;
     }
     class_super_ = saved_super;
+    object_super_ = saved_object_super;
     class_static_ = saved_static;
     if (!expect(T::RBrace, "Unexpected token")) return nullptr;
 
@@ -2231,10 +2233,33 @@ class Parser {
 
   // super(...), super.name, super[expr]
   Node* super_expression() {
-    if (class_super_.empty()) return null_fail("'super' keyword unexpected here");
+    if (class_super_.empty() && object_super_.empty()) return null_fail("'super' keyword unexpected here");
     next();   // `super`
     Node* self = make(NodeKind::This);
     if (!self) return nullptr;
+    if (class_super_.empty()) {   // in a method of an object literal: super.name looks in the prototype of the object (the literal is wrapped in a function that names it, see object_literal)
+      object_super_used_ = true;
+      Node* base = new_call(new_ident("__proto_of"), {new_ident(object_super_)});
+      if (!base) return nullptr;
+      if (accept(T::Dot)) {
+        if (!is(T::Ident)) return null_fail("Unexpected token");
+        Node* m = new_member(base, cur_.text);
+        if (!m) return nullptr;
+        m->flags |= kFlagSuper;
+        next();
+        return m;
+      }
+      if (accept(T::LBracket)) {
+        Node* index = make(NodeKind::Index);
+        if (!index) return nullptr;
+        index->a = base;
+        index->b = expression(false);
+        if (!index->b || !expect(T::RBracket, "Unexpected token")) return nullptr;
+        index->flags |= kFlagSuper;
+        return index;
+      }
+      return null_fail("'super' keyword unexpected here");
+    }
     if (is(T::LParen)) {
       Node* call = make(NodeKind::Call);
       if (!call) return nullptr;
@@ -2504,6 +2529,14 @@ class Parser {
     if (w.equals("function")) return function_rest(true);
     if (w.equals("class")) return class_expression();
     if (w.equals("super")) return super_expression();
+    if (w.size() > 1 && w[0] == '#') {   // #name in object: the brand check; a private member is a property called "#name" (see class_define)
+      Node* name = make(NodeKind::String);
+      if (!name) return nullptr;
+      name->text = w;
+      next();
+      if (!is_word("in")) return null_fail("Unexpected token");
+      return name;
+    }
     if (w.equals("async") && async_function_ahead()) {
       next();   // `async`
       return function_rest(true, true);
@@ -2608,7 +2641,34 @@ class Parser {
     return false;
   }
 
+  // An object literal whose methods use super is `(() => { var %O = {...}; return %O; })()`: the methods find their home object in %O.
   Node* object_literal() {
+    const StringView saved_object = object_super_, saved_class = class_super_;
+    const bool saved_used = object_super_used_;
+    object_super_ = temp_name("%O");
+    class_super_ = StringView();
+    object_super_used_ = false;
+    const StringView name = object_super_;
+    Node* literal = object_literal_body();
+    const bool used = object_super_used_;
+    object_super_ = saved_object;
+    class_super_ = saved_class;
+    object_super_used_ = saved_used;
+    if (!literal || !used) return literal;
+    Node* function = make(NodeKind::Function);
+    Node* body = make(NodeKind::Block);
+    Node* declaration = new_var(name, literal);
+    Node* ret = make(NodeKind::Return);
+    if (!function || !body || !declaration || !ret) return nullptr;
+    ret->a = new_ident(name);
+    declaration->next = ret;
+    body->list = declaration;
+    function->flags |= kFlagArrow;
+    function->a = body;
+    return new_call(function, {});
+  }
+
+  Node* object_literal_body() {
     Node* n = make(NodeKind::ObjectLit);
     if (!n) return nullptr;
     next();
@@ -2757,6 +2817,8 @@ class Parser {
   uint32_t line_ = 1;
   Token cur_;
   bool lenient_escapes_ = false;   // inside a tagged template an invalid escape is allowed: the cooked string is undefined
+  StringView object_super_;   // while an object literal is parsed: the variable that will hold it (for super.name in its methods), empty outside
+  bool object_super_used_ = false;
   bool check_this_ = false, arrow_next_ = false, derived_ctor_next_ = false;   // `this` in the body of a derived constructor is checked (see __this_check)
   bool failed_ = false, in_function_ = false, in_async_ = false, in_generator_ = false, in_async_generator_ = false;
   Node* pending_prologue_ = nullptr;   // the statements that unpack the parameters of the function whose body comes next
