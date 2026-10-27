@@ -473,9 +473,11 @@ struct ObjectManager::RangeLock {
 };
 
 namespace {
+// Byte ranges [offset, offset + length) up to the end of the 64-bit space; a range of no bytes locks nothing and conflicts with nothing.
 bool ranges_overlap(uint64_t a, uint64_t alen, uint64_t b, uint64_t blen) {
-  const uint64_t aend = a + alen < a ? ~uint64_t{0} : a + alen, bend = b + blen < b ? ~uint64_t{0} : b + blen;
-  return a < bend && b < aend;
+  if (alen == 0 || blen == 0) return false;
+  const uint64_t alast = alen - 1 > ~uint64_t{0} - a ? ~uint64_t{0} : a + (alen - 1), blast = blen - 1 > ~uint64_t{0} - b ? ~uint64_t{0} : b + (blen - 1);
+  return a <= blast && b <= alast;
 }
 }  // namespace
 
@@ -490,6 +492,7 @@ ObjectManager::LockResult ObjectManager::lock_range_locked(StringView path, cons
   for (uint32_t i = 0; i < kMaxLocks; ++i) {
     const RangeLock& l = locks_[i];
     if (!l.used || !same_name(l.path, l.path_size, path) || !ranges_overlap(l.offset, l.length, offset, length)) continue;
+    if (l.owner == owner) { if (exclusive) return LockResult::Conflict; continue; }      // (an open file does not lock itself out, except with an exclusive lock over its own)
     if (l.exclusive || exclusive) return LockResult::Conflict;      // (two shared locks may overlap, even of one file; anything with an exclusive one may not)
   }
   for (uint32_t i = 0; i < kMaxLocks; ++i) {
@@ -511,12 +514,14 @@ ObjectManager::LockResult ObjectManager::lock_range_locked(StringView path, cons
 bool ObjectManager::unlock_range(StringView path, const void* owner, uint64_t offset, uint64_t length) {
   Locked hold(sync_);
   if (!locks_) return false;
-  for (uint32_t i = 0; i < kMaxLocks; ++i) {
-    RangeLock& l = locks_[i];
-    if (!l.used || l.owner != owner || l.offset != offset || l.length != length || !same_name(l.path, l.path_size, path)) continue;
-    l.used = false;
-    sync_.notify_all();      // whoever waits for the range looks again
-    return true;
+  for (int pass = 0; pass < 2; ++pass) {      // an exclusive lock of exactly this range goes before a shared one
+    for (uint32_t i = 0; i < kMaxLocks; ++i) {
+      RangeLock& l = locks_[i];
+      if (!l.used || l.owner != owner || l.offset != offset || l.length != length || !same_name(l.path, l.path_size, path) || l.exclusive != (pass == 0)) continue;
+      l.used = false;
+      sync_.notify_all();      // whoever waits for the range looks again
+      return true;
+    }
   }
   return false;
 }
