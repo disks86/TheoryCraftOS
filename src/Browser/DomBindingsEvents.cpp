@@ -548,7 +548,7 @@ bool install_events(DomBindings::Impl& c) {
   for (const char* name : kEventClasses) {
     JsObject* f = vm.new_native(event_constructor, name, 1);
     JsObject* proto = StringView(name).equals("Event") ? c.event_proto : vm.new_object(c.event_proto);
-    vm.define(f, vm.prototype_name(), Value::make_object(proto), 0);
+    vm.define(f, vm.prototype_name(), Value::make_object(proto), kNonConfigurable);
     vm.define(proto, vm.intern("constructor"), Value::make_object(f), kWritable);
     vm.define_named(g, name, Value::make_object(f), kWritable);
   }

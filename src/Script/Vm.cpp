@@ -1562,7 +1562,7 @@ bool Vm::get_own(JsObject* o, JsString* key, Value* out) {
       } else {
         define(proto, constructor_, Value::make_object(o), kWritable);
       }
-      define(o, prototype_, Value::make_object(proto), kWritable);
+      define(o, prototype_, Value::make_object(proto), kWritable | kNonConfigurable);
       *out = Value::make_object(proto);
       return true;
     }

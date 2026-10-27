@@ -525,6 +525,7 @@ NATIVE(class_setup) {
     }
   }
   vm.define(proto.as_object(), vm.intern("constructor"), ctor, kWritable);
+  vm.define(ctor.as_object(), vm.prototype_name(), proto, kNonConfigurable);   // (the prototype of a class can be neither assigned nor deleted)
   *result = proto;
   return true;
 }

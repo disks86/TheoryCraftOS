@@ -1514,7 +1514,7 @@ NATIVE(exception_constructor) {
 JsObject* make_class(DomBindings::Impl& c, const char* name, NativeFn ctor, JsObject* proto) {
   Vm& vm = c.vm;
   JsObject* f = vm.new_native(ctor, name, 0);
-  vm.define(f, vm.prototype_name(), Value::make_object(proto), 0);
+  vm.define(f, vm.prototype_name(), Value::make_object(proto), kNonConfigurable);
   vm.define(proto, vm.intern("constructor"), Value::make_object(f), kWritable);
   vm.define_named(vm.global(), name, Value::make_object(f), kWritable);
   return f;
@@ -1955,20 +1955,20 @@ bool install_nodes(DomBindings::Impl& c) {
   make_class(c, "ProcessingInstruction", illegal_constructor, vm.new_object(c.character_data_proto));
   make_class(c, "Comment", illegal_constructor, c.comment_proto);
   make_class(c, "Document", illegal_constructor, dp);
-  make_class(c, "HTMLDocument", illegal_constructor, dp);
+  make_class(c, "HTMLDocument", illegal_constructor, vm.new_object(dp));   // (the interface of the document of a page: it inherits from Document)
   make_class(c, "DocumentFragment", illegal_constructor, c.fragment_proto);
   c.shadow_root_proto = vm.new_object(c.fragment_proto);
   make_class(c, "ShadowRoot", illegal_constructor, c.shadow_root_proto);
   {
     JsObject* image = vm.new_native(image_constructor, "Image", 2);
     JsObject* image_proto = vm.new_object(c.html_proto);
-    vm.define(image, vm.prototype_name(), Value::make_object(image_proto), 0);
+    vm.define(image, vm.prototype_name(), Value::make_object(image_proto), kNonConfigurable);
     vm.define_named(g, "Image", Value::make_object(image), kWritable);
   }
   {   // new Audio(src)
     JsObject* audio = vm.new_native(audio_constructor, "Audio", 1);
     JsObject* audio_proto = vm.new_object(c.html_proto);
-    vm.define(audio, vm.prototype_name(), Value::make_object(audio_proto), 0);
+    vm.define(audio, vm.prototype_name(), Value::make_object(audio_proto), kNonConfigurable);
     vm.define_named(g, "Audio", Value::make_object(audio), kWritable);
   }
   {
