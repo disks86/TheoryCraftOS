@@ -28,7 +28,7 @@ static int g_failed = 0;
 #define CHECK(...) do { if (!(__VA_ARGS__)) { printf("FAILED line %d: %s\n", __LINE__, #__VA_ARGS__); ++g_failed; } } while (0)
 
 // The expected kind, spelled out per source rather than computed the way classify does it.
-static AmdIrq::Kind expected(uint32_t src, uint32_t ring) {
+static AmdIrq::Kind expected(uint32_t src, uint32_t ring, uint32_t data) {
   const uint32_t me = (ring >> 2) & 3;
   switch (src) {
     case 181: return me == 0 ? AmdIrq::Kind::GraphicsFence : (me == 1 || me == 2) ? AmdIrq::Kind::ComputeFence : AmdIrq::Kind::Unknown;
@@ -36,6 +36,9 @@ static AmdIrq::Kind expected(uint32_t src, uint32_t ring) {
     case 185: return AmdIrq::Kind::GfxPrivilegedInstruction;
     case 197: return AmdIrq::Kind::GfxEccError;
     case 239: return AmdIrq::Kind::SqMessage;
+    case 1: case 2: case 3: case 4: case 5: case 6: return data == 0 ? AmdIrq::Kind::DisplayVblank : data == 1 ? AmdIrq::Kind::DisplayVline : AmdIrq::Kind::Unknown;
+    case 8: case 10: case 12: case 14: case 16: case 18: return AmdIrq::Kind::DisplayPageFlip;
+    case 42: return data < 6 ? AmdIrq::Kind::DisplayHotplug : AmdIrq::Kind::Unknown;
     case 224: return ((ring & 3) < 2 && ((ring >> 2) & 3) == 0) ? AmdIrq::Kind::SdmaTrap : AmdIrq::Kind::Unknown;
     case 241:
     case 247: return (ring & 3) < 2 ? AmdIrq::Kind::SdmaIllegalInstruction : AmdIrq::Kind::Unknown;
@@ -46,17 +49,24 @@ static AmdIrq::Kind expected(uint32_t src, uint32_t ring) {
 }
 
 static void test_classify_all() {
+  static const uint32_t kData[] = {0u, 1u, 2u, 5u, 6u, 0x0ABCDEFu};
   uint32_t mismatches = 0;
   for (uint32_t src = 0; src < 256; ++src) {
     for (uint32_t ring = 0; ring < 256; ++ring) {
-      AmdIh3::Vector v;
-      v.src_id = src;
-      v.ring_id = ring;
-      v.src_data = 0x0ABCDEF;
-      const AmdIrq::Event e = AmdIrq::classify(v);
-      if (e.kind != expected(src, ring)) ++mismatches;
-      if (e.vector.src_id != src || e.vector.ring_id != ring || e.vector.src_data != 0x0ABCDEF) ++mismatches;
-      if (e.me != ((ring >> 2) & 3) || e.pipe != (ring & 3) || e.queue != ((ring >> 4) & 7)) ++mismatches;
+      for (uint32_t data : kData) {
+        AmdIh3::Vector v;
+        v.src_id = src;
+        v.ring_id = ring;
+        v.src_data = data;
+        const AmdIrq::Event e = AmdIrq::classify(v);
+        if (e.kind != expected(src, ring, data)) ++mismatches;
+        if (e.vector.src_id != src || e.vector.ring_id != ring || e.vector.src_data != data) ++mismatches;
+        if (e.me != ((ring >> 2) & 3) || e.pipe != (ring & 3) || e.queue != ((ring >> 4) & 7)) ++mismatches;
+        // the controller and the pin of the display events
+        if (e.kind == AmdIrq::Kind::DisplayVblank && e.crtc != src - 1) ++mismatches;
+        if (e.kind == AmdIrq::Kind::DisplayPageFlip && e.crtc != (src - 8) / 2) ++mismatches;
+        if (e.kind == AmdIrq::Kind::DisplayHotplug && e.pin != data) ++mismatches;
+      }
     }
   }
   CHECK(mismatches == 0);

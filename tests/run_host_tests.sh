@@ -171,7 +171,7 @@ for t in "${WANTED[@]}"; do
     AmdDce11Test) build_and_run AmdDce11Test tests/AmdDce11Test.cpp tests/KernelStubs.cpp src/Hardware/GraphicsProcessingUnit/AMD/AmdDce11.cpp ;;
     AmdSdma3Test) build_and_run AmdSdma3Test tests/AmdSdma3Test.cpp tests/KernelStubs.cpp src/Hardware/GraphicsProcessingUnit/AMD/AmdSdma3.cpp src/Hardware/VideoCodec/AMD/AmdGmc8Memory.cpp src/Hardware/VideoCodec/AMD/AmdUvd6.cpp src/Hardware/VideoCodec/AMD/AmdVcnFirmware.cpp ;;
     PciMsiTest) build_and_run PciMsiTest tests/PciMsiTest.cpp tests/KernelStubs.cpp src/Hardware/Bus/Pci/PciMsi.cpp ;;
-    AmdIrqTest) build_and_run AmdIrqTest tests/AmdIrqTest.cpp tests/KernelStubs.cpp src/Hardware/GraphicsProcessingUnit/AMD/AmdIrq.cpp src/Hardware/GraphicsProcessingUnit/AMD/AmdIh3.cpp ;;
+    AmdIrqTest) build_and_run AmdIrqTest tests/AmdIrqTest.cpp tests/KernelStubs.cpp src/Hardware/GraphicsProcessingUnit/AMD/AmdIrq.cpp src/Hardware/GraphicsProcessingUnit/AMD/AmdDce11.cpp src/Hardware/GraphicsProcessingUnit/AMD/AmdIh3.cpp ;;
     AmdIh3Test) build_and_run AmdIh3Test tests/AmdIh3Test.cpp tests/KernelStubs.cpp src/Hardware/GraphicsProcessingUnit/AMD/AmdIh3.cpp ;;
     AmdGmc8Test) build_and_run AmdGmc8Test tests/AmdGmc8Test.cpp tests/KernelStubs.cpp src/Hardware/GraphicsProcessingUnit/AMD/AmdGmc8.cpp src/Hardware/VideoCodec/AMD/AmdGmc8Memory.cpp src/Hardware/VideoCodec/AMD/AmdUvd6.cpp src/Hardware/VideoCodec/AMD/AmdVcnFirmware.cpp ;;
     AmdVce3RingTest) build_and_run AmdVce3RingTest tests/AmdVce3RingTest.cpp tests/KernelStubs.cpp src/Hardware/VideoCodec/AMD/AmdVce3Ring.cpp src/Hardware/VideoCodec/AMD/AmdVce3.cpp src/Hardware/VideoCodec/AMD/AmdVcnFirmware.cpp ;;

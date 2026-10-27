@@ -359,7 +359,24 @@ encoding (0 general purpose event with its flags, 1 a wave's instruction interru
 is read from `SQ_EDC_INFO` of that compute unit (`GRBM_GFX_INDEX` selected for it and put back to broadcast, as the driver's worker does; here it runs in the polling pass, not a work item). Like the driver, nothing
 is done about them beyond reporting: an ECC error or SQ report does not wedge a ring.
 
-Not done: the display's interrupts (vblank, page flip, hot plug) and the UVD/VCE ones are not dispatched; no ring reset or recovery after a fault (the engine has to be restarted).
+The display engine's interrupts (`amd_dce11::Interrupts` in `AmdDce11.*`, from `dce_v11_0.c`) are enabled by `bring_up` and dispatched by `AmdIrq`:
+- **Page flips** (sources 8, 10, ..., 18, one per controller): `GRPH_INTERRUPT_CONTROL.GRPH_PFLIP_INT_MASK` on for all six controllers (`dce_v11_0_pageflip_interrupt_init`); the handler clears `GRPH_PFLIP_INT_OCCURRED`
+  if set, as the driver's does, and counts per controller (`AmdIrq::pageflip_count`). The OS's own flips (at `engage_display` and when the firmware's framebuffer is put back) therefore come back as events.
+- **Vertical blank** (sources 1..6, data 0; data 1 is the line interrupt): `LB_INTERRUPT_MASK.VBLANK_INTERRUPT_MASK`. It fires every frame, so it is off until `AmdVegaM::set_vblank_interrupt(true)`, which turns it on for
+  the controller that shows the OS's framebuffer, and off again when the display is given back or the card stopped. The handler reads `DISP_INTERRUPT_STATUS*`, acknowledges with `LB_VBLANK_STATUS.VBLANK_ACK` when the bit is
+  set and counts either way (`vblank_count`), like `dce_v11_0_crtc_irq`.
+- **Hot plug** (source 42, data: the pin): `dce_v11_0_hpd_init` for the pins in `Inputs::hpd_pins` (default all six; which pin a connector uses is in the video BIOS, which is not read, and the driver's exclusion of eDP and
+  LVDS cannot be made here): `DC_HPD_EN`, the toggle filter (50 ms connect, 10 ms disconnect), acknowledge, polarity from `DC_HPD_SENSE`, interrupt on. On an interrupt the pin's status bit must be set (else nothing is done,
+  as in `dce_v11_0_hpd_irq`); it is acknowledged, the polarity flipped to report the next change in the other direction (the driver's hotplug work does that when it detects the connector again), and the new state kept
+  (`AmdIrq::hpd_connected`, `hotplug_count`). Because a pin that is not what it seems (the internal panel's) could interrupt forever, a pin that interrupts more than `kHotplugStormLimit` (256) times is switched off
+  (`hpd_throttled`).
+Everything is off again at shutdown (`dce_v11_0_hw_fini`: `hpd_fini`, page flip interrupts off).
+
+`scripts/check_irq_port.py` now also checks these against `dce_v11_0.c` and `vid.h`: the registered source ids, the data decoding, the order of `hpd_init`, the polarity rule, the filter delays, the register block offsets, the
+status register table and the acknowledgements.
+
+Nothing in the OS reacts to a hot plug yet: the connector cannot be re-detected (no AtomBIOS, no DDC/EDID over the card's own aux channels), so a plug or unplug is only counted and its state kept. Not done: the vline
+interrupt is not enabled (only classified and acknowledged), the audio and DP short-pulse (`DC_HPD_RX_INT`) interrupts, the UVD/VCE interrupts; no ring reset or recovery after a fault (the engine has to be restarted).
 
 ### MSI: interrupts wake the CPU
 

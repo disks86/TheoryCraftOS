@@ -53,6 +53,10 @@ const char* AmdIrq::kind_name(Kind kind) {
     case Kind::SdmaIllegalInstruction: return "SDMA illegal instruction";
     case Kind::VmFault: return "VM fault";
     case Kind::SqMessage: return "SQ message";
+    case Kind::DisplayVblank: return "display vblank";
+    case Kind::DisplayVline: return "display vline";
+    case Kind::DisplayPageFlip: return "display page flip";
+    case Kind::DisplayHotplug: return "display hot plug";
 
   }
   return "unknown";
@@ -88,6 +92,18 @@ AmdIrq::Event AmdIrq::classify(const AmdIh3::Vector& vector) {
     case kSrcGfxPageInvFault:
     case kSrcGfxMemProtFault: e.kind = Kind::VmFault; break;
     default: break;
+  }
+  // The display engine's (dce_v11_0_sw_init registers 1..6 for the controllers, the even ids 8..18 for page flips and 42 for the hot plug pins)
+  if (vector.src_id >= kSrcDisplayCrtcFirst && vector.src_id < kSrcDisplayCrtcFirst + amd_dce11::kMaxCrtcs) {
+    e.crtc = vector.src_id - kSrcDisplayCrtcFirst;
+    if (vector.src_data == 0) e.kind = Kind::DisplayVblank;
+    else if (vector.src_data == 1) e.kind = Kind::DisplayVline;
+  } else if (vector.src_id >= kSrcPageFlipFirst && vector.src_id <= kSrcPageFlipLast && ((vector.src_id - kSrcPageFlipFirst) & 1) == 0) {
+    e.crtc = (vector.src_id - kSrcPageFlipFirst) >> 1;
+    e.kind = Kind::DisplayPageFlip;
+  } else if (vector.src_id == kSrcHotplugDetect && vector.src_data < amd_dce11::Interrupts::kMaxHpd) {
+    e.pin = vector.src_data;
+    e.kind = Kind::DisplayHotplug;
   }
   return e;
 }
@@ -146,6 +162,33 @@ uint32_t AmdIrq::process(AmdIh3& ih, ISink* sink, uint32_t max_vectors) {
       event.vm = read_vm_fault();
       if (!event.vm.valid) continue;   // (gmc_v8_0_process_interrupt returns without a report)
       last_vm_fault_ = event.vm;
+    }
+    switch (event.kind) {
+      case Kind::DisplayVblank:   // (the driver acknowledges what the status says is pending, and counts the vblank either way)
+        event.asserted = display_.vblank_asserted(event.crtc);
+        if (event.asserted) display_.ack_vblank(event.crtc);
+        ++vblanks_[event.crtc];
+        break;
+      case Kind::DisplayVline:
+        event.asserted = display_.vline_asserted(event.crtc);
+        if (event.asserted) display_.ack_vline(event.crtc);
+        break;
+      case Kind::DisplayPageFlip:
+        display_.ack_pageflip(event.crtc);
+        ++pageflips_[event.crtc];
+        break;
+      case Kind::DisplayHotplug:
+        if (!display_.hpd_asserted(event.pin)) continue;   // (dce_v11_0_hpd_irq does nothing without the pin's bit)
+        display_.ack_hpd(event.pin);
+        display_.hpd_set_polarity(event.pin);   // the next change is the other way (the driver's hotplug work does this when it detects the connector again)
+        event.connected = display_.hpd_sense(event.pin);
+        connected_ = event.connected ? (connected_ | 1u << event.pin) : (connected_ & ~(1u << event.pin));
+        if (++hotplugs_[event.pin] > kHotplugStormLimit && !(throttled_ >> event.pin & 1)) {
+          display_.hpd_set_interrupt(event.pin, false);
+          throttled_ |= 1u << event.pin;
+        }
+        break;
+      default: break;
     }
     if (event.kind == Kind::SqMessage) last_sq_ = event.sq = read_sq(vectors[i].src_data);
     ++total_;

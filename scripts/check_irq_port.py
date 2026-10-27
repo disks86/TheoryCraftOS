@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Checks the interrupt source ids and fault registers of src/Hardware/GraphicsProcessingUnit/AMD/AmdIrq.{hpp,cpp} against the Linux driver they were taken from.
 
-  check_irq_port.py path/to/ivsrcid_vislands30.h path/to/gmc_8_1_d.h path/to/gmc_8_1_sh_mask.h path/to/gfx_v8_0.c path/to/sdma_v3_0.c path/to/gmc_v8_0.c path/to/gfx_8_0_d.h path/to/gfx_8_0_sh_mask.h
+  check_irq_port.py path/to/ivsrcid_vislands30.h path/to/gmc_8_1_d.h path/to/gmc_8_1_sh_mask.h path/to/gfx_v8_0.c path/to/sdma_v3_0.c path/to/gmc_v8_0.c path/to/gfx_8_0_d.h path/to/gfx_8_0_sh_mask.h path/to/dce_v11_0.c vid.h
 
 (from kernel tag v6.12, drivers/gpu/drm/amd/include/ivsrcid/, include/asic_reg/gmc/, include/asic_reg/gca/ and amdgpu/). It checks that the source ids are the ones the driver registers with
 amdgpu_irq_add_id in the three blocks' sw_init, that the register numbers and masks are the headers', and that the ring id decoding in the handlers is the one classify() uses.
@@ -27,9 +27,9 @@ def define(src, name):
 
 
 def main():
-    if len(sys.argv) != 9:
+    if len(sys.argv) != 11:
         sys.exit(__doc__)
-    ivs, gmc_d, gmc_m, gfx, sdma, gmc_c, gfx_d, gfx_m = [open(a).read() for a in sys.argv[1:]]
+    ivs, gmc_d, gmc_m, gfx, sdma, gmc_c, gfx_d, gfx_m, dce_c, vid_h = [open(a).read() for a in sys.argv[1:]]
     hpp = open(os.path.join(ROOT, 'AmdIrq.hpp')).read()
     cpp = open(os.path.join(ROOT, 'AmdIrq.cpp')).read()
 
@@ -89,6 +89,7 @@ def main():
             fail('AmdIrq.cpp lacks ' + expr)
 
     check_sq(gfx, gfx_d, gfx_m, cpp)
+    check_display(dce_c, vid_h, hpp, cpp)
     check_enables(gfx, sdma, gmc_c)
     check_ecc_and_sq_enables(gfx, gfx_m)
     if bad:
@@ -97,7 +98,7 @@ def main():
 
 
 def function_body(src, name):
-    m = re.search(r'\n(?:static )?\w[\w \*]*\b' + re.escape(name) + r'\([^{]*\{', src)
+    m = re.search(r'\n(?:static )?\w[\w \*]*\b' + re.escape(name) + r'\([^;{]*\)\s*\{', src)
     if not m:
         sys.exit('function not found: ' + name)
     depth, i = 0, m.end() - 1
@@ -106,6 +107,65 @@ def function_body(src, name):
         if depth == 0:
             return src[i:j + 1]
     sys.exit('unbalanced: ' + name)
+
+
+def check_display(dce, vid, hpp, cpp):
+    """The display interrupts: source ids and data decoding of dce_v11_0.c against AmdIrq, the acknowledgements and pin set-up against AmdDce11.cpp (whose register numbers are generated
+    from the headers), and the register block offsets of vid.h."""
+    dcpp = open(os.path.join(ROOT, 'AmdDce11.cpp')).read()
+    sw = function_body(dce, 'dce_v11_0_sw_init')
+    if 'AMDGPU_IRQ_CLIENTID_LEGACY, i + 1, &adev->crtc_irq' not in sw or 'i = VISLANDS30_IV_SRCID_D1_GRPH_PFLIP; i < 20; i += 2' not in sw or \
+            'VISLANDS30_IV_SRCID_HOTPLUG_DETECT_A, &adev->hpd_irq' not in sw:
+        fail('dce_v11_0_sw_init registers other sources')
+    ours = {m.group(1): int(m.group(2)) for m in re.finditer(r'\b(kSrc\w+) = (\d+)', hpp)}
+    if ours.get('kSrcDisplayCrtcFirst') != 1 or ours.get('kSrcPageFlipLast') != 18:
+        fail('display source id range')
+    # (the pageflip source ids start at VISLANDS30_IV_SRCID_D1_GRPH_PFLIP, the hot plug at HOTPLUG_DETECT_A: read from the ivsrcid header by the checks above for the others)
+    crtc = function_body(dce, 'dce_v11_0_crtc_irq')
+    if 'unsigned crtc = entry->src_id - 1;' not in crtc or 'case 0: /* vblank */' not in crtc or 'case 1: /* vline */' not in crtc:
+        fail('crtc interrupt decoding changed')
+    if '(entry->src_id - 8) >> 1' not in function_body(dce, 'dce_v11_0_pageflip_irq'):
+        fail('page flip controller decoding changed')
+    hpd = function_body(dce, 'dce_v11_0_hpd_irq')
+    if 'hpd = entry->src_data[0];' not in hpd or 'entry->src_data[0] >= adev->mode_info.num_hpd' not in hpd:
+        fail('hot plug pin decoding changed')
+    # hpd_init order: DC_HPD_EN, the filter delays, ack, polarity, interrupt on (amdgpu_irq_get)
+    init = function_body(dce, 'dce_v11_0_hpd_init')
+    order = [init.find(x) for x in ('DC_HPD_CONTROL, DC_HPD_EN, 1', 'DC_HPD_CONNECT_INT_DELAY', 'DC_HPD_DISCONNECT_INT_DELAY', 'dce_v11_0_hpd_int_ack', 'dce_v11_0_hpd_set_polarity', 'amdgpu_irq_get')]
+    if min(order) < 0 or order != sorted(order):
+        fail('hpd_init order changed')
+    mine = function_body(dcpp, 'hpd_init') if False else dcpp[dcpp.index('void Interrupts::hpd_init'):dcpp.index('void Interrupts::hpd_fini')]
+    order = [mine.find(x) for x in ('DC_HPD_CONTROL, DC_HPD_EN, 1', 'DC_HPD_CONNECT_INT_DELAY', 'DC_HPD_DISCONNECT_INT_DELAY', 'ack_hpd(pin)', 'hpd_set_polarity(pin)', 'hpd_set_interrupt(pin, true)')]
+    if min(order) < 0 or order != sorted(order):
+        fail('Interrupts::hpd_init order differs from the driver')
+    if 'connected ? 0 : 1' not in dcpp or 'DC_HPD_INT_POLARITY, 0);' not in function_body(dce, 'dce_v11_0_hpd_set_polarity'):
+        fail('polarity')
+    for name, delay in (('AMDGPU_HPD_CONNECT_INT_DELAY_IN_MS', 50), ('AMDGPU_HPD_DISCONNECT_INT_DELAY_IN_MS', 10)):
+        pass
+    if 'kHpdConnectDelayMs = 50, kHpdDisconnectDelayMs = 10' not in open(os.path.join(ROOT, 'AmdDce11.hpp')).read():
+        fail('hpd filter delays')
+    # the offsets of vid.h
+    for i, off in enumerate(('0x1898', '0x18a0', '0x18a8', '0x18b0', '0x18b8', '0x18c0')):
+        if not re.search(r'HPD%d_REGISTER_OFFSET\s+\(%s - 0x1898\)' % (i, off), vid) or ('%s - 0x1898' % off) not in dcpp:
+            fail('HPD%d offset' % i)
+    for i, off in enumerate(('0x1b9c', '0x1d9c', '0x1f9c', '0x419c', '0x439c', '0x459c')):
+        if not re.search(r'CRTC%d_REGISTER_OFFSET\s+\(%s - 0x1b9c\)' % (i, off), vid) or ('%s - 0x1b9c' % off) not in dcpp:
+            fail('CRTC%d offset' % i)
+    # the status table of the driver and ours name the same registers and bits
+    table = re.findall(r'\.reg = (mm\w+),\s*\.vblank = (\w+),\s*\.vline = (\w+),\s*\.hpd = (\w+)', dce)
+    mine = re.findall(r'\{(mmDISP\w+), (\w+),\s*(\w+),\s*(\w+)\}', dcpp)
+    if table != mine or len(table) != 6:
+        fail('interrupt_status_offsets differs (%d vs %d rows)' % (len(table), len(mine)))
+    # the acknowledgements
+    for fn, field in (('dce_v11_0_hpd_int_ack', 'DC_HPD_INT_ACK'), ('dce_v11_0_crtc_vblank_int_ack', 'VBLANK_ACK'), ('dce_v11_0_crtc_vline_int_ack', 'VLINE_ACK')):
+        if field + ', 1' not in function_body(dce, fn) or field + ', 1' not in dcpp:
+            fail(fn)
+    if 'GRPH_INTERRUPT_STATUS__GRPH_PFLIP_INT_CLEAR_MASK' not in function_body(dce, 'dce_v11_0_pageflip_irq') or 'GRPH_PFLIP_INT_CLEAR_MASK' not in dcpp:
+        fail('page flip acknowledgement')
+    for fn, field in (('dce_v11_0_set_pageflip_irq_state', 'GRPH_PFLIP_INT_MASK_MASK'), ('dce_v11_0_set_crtc_vblank_interrupt_state', 'VBLANK_INTERRUPT_MASK'),
+                      ('dce_v11_0_set_hpd_irq_state', 'DC_HPD_INT_EN')):
+        if field not in function_body(dce, fn) or field not in dcpp:
+            fail(fn)
 
 
 def check_sq(gfx, gfx_d, gfx_m, cpp):
