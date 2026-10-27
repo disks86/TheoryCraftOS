@@ -65,9 +65,10 @@ LoadStatus map_stack(AddressSpace& space, uint64_t size, uint64_t* top);
 
 constexpr uint64_t kMaxStartupStrings = 128 * 1024;      // bytes of arguments and environment together
 // Builds the System V startup block on the stack: argc, the argv and envp pointers, and the auxiliary vector (program headers, entry, page size,
-// clock ticks, the program's path and platform name, random bytes). `random` supplies the 16 bytes of AT_RANDOM. `*stack_pointer` is the value for the program's stack pointer: 16-byte aligned, pointing at argc.
+// clock ticks, the program's path and platform name ("x86_64", "aarch64"), random bytes). `random` supplies the 16 bytes of AT_RANDOM. `*stack_pointer` is the value for the program's stack pointer: 16-byte aligned, pointing at argc.
 LoadStatus build_linux_stack(AddressSpace& space, uint64_t stack_top, const LoadedImage& image, ArrayView<const StringView> arguments,
-                             ArrayView<const StringView> environment, StringView executable, ConstByteView random, uint64_t* stack_pointer);
+                             ArrayView<const StringView> environment, StringView executable, ConstByteView random, uint64_t* stack_pointer,
+                             StringView platform = "x86_64");
 // The stack pointer a Windows thread starts with: 16-byte aligned plus 8 (as if just called), with the 32-byte home space above it.
 uint64_t windows_initial_stack_pointer(uint64_t stack_top);
 

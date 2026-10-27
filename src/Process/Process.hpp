@@ -104,6 +104,8 @@ class IProcessRuntime {
   virtual bool start_thread(const ThreadStart& start, bool suspended) = 0;
   virtual bool resume_thread(uint64_t id) = 0;        // a thread created suspended starts
   virtual uint64_t current_thread_id() = 0;
+  // Does the runtime start the threads that Linux clone() asks for (it must copy the calling thread's registers: Process::take_clone)? Without it clone() says -ENOSYS.
+  virtual bool supports_linux_threads() { return false; }
   // Stopping and ending other threads. A thread asked to suspend stops at its next system call or timer tick ("parked"); its registers are then kept.
   virtual void request_suspend(uint64_t id) { (void)id; }
   virtual void request_resume(uint64_t id) { (void)id; }
@@ -305,6 +307,20 @@ class Process {
   void request_thread_exit(uint32_t code) { thread_exit_pending_ = true; thread_exit_code_ = code; }
   bool take_thread_exit(uint32_t* code) { *code = thread_exit_code_; const bool p = thread_exit_pending_; thread_exit_pending_ = false; return p; }
 
+  // --- Linux threads (clone, futex). The table lives here; the runtime starts the CPU threads. All of it is touched with the process lock held.
+  struct LinuxThreadState {
+    static constexpr uint32_t kMaxThreads = 64, kMaxWaiters = 64;
+    struct Thread { uint64_t tid = 0, clear_child_tid = 0; bool used = false; };
+    struct Waiter { uint64_t address = 0; uint32_t bitset = 0; bool used = false, woken = false; };
+    // clone() decided to make a thread: the runtime copies the calling thread's registers for it (see take_clone).
+    struct CloneRequest { bool pending = false; uint64_t tid = 0, stack = 0, tls = 0; bool set_tls = false; };
+    Thread threads[kMaxThreads];
+    Waiter waiters[kMaxWaiters];
+    CloneRequest clone;
+  };
+  LinuxThreadState& linux_threads() { return linux_; }
+  bool take_clone(LinuxThreadState::CloneRequest* out) { *out = linux_.clone; const bool p = linux_.clone.pending; linux_.clone = LinuxThreadState::CloneRequest(); return p; }
+
   // --- blocking helpers for the system calls: they give up the process lock while the thread is stuck.
   void block_sleep(uint64_t ns);
   void block_yield();
@@ -331,6 +347,7 @@ class Process {
   uint32_t exit_code_ = 0;
   IProcessRuntime* runtime_ = nullptr;
   ThreadRecord threads_[kMaxThreads];
+  LinuxThreadState linux_;
   ThreadSupport thread_support_;
   uint32_t thread_counter_ = 0, thread_exit_code_ = 0;
   bool thread_exit_pending_ = false;

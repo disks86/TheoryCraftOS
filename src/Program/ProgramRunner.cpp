@@ -17,11 +17,15 @@
  */
 #include "Program/ProgramRunner.hpp"
 #include "Program/ProgramHost.hpp"
+#include "Emulation/GuestCpu.hpp"
+#include "Executable/ExecutableKind.hpp"
 #include "Kernel/Delay.hpp"
 #include "Kernel/Sync.hpp"
+#include "Process/HostArch.hpp"
 #include "Process/ProgramEnvironment.hpp"
 #include "Process/ProcessFiles.hpp"
 #include "Process/UserProgram.hpp"
+#include "Program/EmulatedTask.hpp"
 #include "Utility/ByteBuffer.hpp"
 
 #if defined(__x86_64__)
@@ -60,7 +64,7 @@ StringView load_failure(process::LoadStatus status) {
   switch (status) {
     case process::LoadStatus::NotExecutable: return "this is not a program";
     case process::LoadStatus::Malformed: return "the program file is damaged, or its layout is not one this OS can load";
-    case process::LoadStatus::Unsupported: return "this kind of program cannot run here (only 64-bit x86 programs for Linux and Windows)";
+    case process::LoadStatus::Unsupported: return "this kind of program cannot run here (only 64-bit programs for Linux, and x86-64 programs for Windows)";
     case process::LoadStatus::NeedsLibraries: return "the program needs shared libraries or DLLs, which this OS does not have yet (it must be statically linked, or use the NT interface directly)";
     case process::LoadStatus::OutOfMemory: return "not enough memory to start the program";
     default: return "the program could not be loaded";
@@ -91,20 +95,50 @@ void pass_on_output(ProgramHost& host, const ProgramRun& run, allocators::IAlloc
 
 }  // namespace
 
+namespace {
+
+// What the CPU of the program means for running it: directly in user mode (only a program for this machine's own CPU), or on the in-kernel emulator.
+enum class Plan : uint8_t { Native, Emulated, Impossible };
+
+Plan plan_for(const ProgramRun& run, ConstByteView image, String* message) {
+  const exe::Architecture arch = exe::identify_architecture(image.at_most(exe::kIdentifyBytes));
+  const process::UserArch guest = process::user_arch_for(arch);
+  if (guest == process::UserArch::None) {
+    if (arch == exe::Architecture::Unknown) return Plan::Native;      // (the loader names whatever is wrong with the file)
+    message->assign("this program is for ");
+    message->append(exe::architecture_name(arch));
+    message->append(", which this OS cannot run");
+    return Plan::Impossible;
+  }
+  if (run.kind == exe::ExecutableKind::Pe && guest != process::UserArch::X86_64) {
+    message->assign("this Windows program is for ");
+    message->append(exe::architecture_name(arch));
+    message->append("; only x86-64 Windows programs are supported");
+    return Plan::Impossible;
+  }
+  const bool native_possible =
 #if defined(__x86_64__)
+      guest == process::native_arch();
+#else
+      false;      // (the other machines have no ring-3 entry yet: every program is emulated)
+#endif
+  if (native_possible && !run.force_emulation) return Plan::Native;
+  if (!emulation::can_emulate(guest)) {
+    message->assign("this program is for ");
+    message->append(exe::architecture_name(arch));
+    message->append(", which this OS can neither run directly nor emulate on this machine");
+    return Plan::Impossible;
+  }
+  return Plan::Emulated;
+}
+
+}  // namespace
 
 RunResult run_program(const ProgramRun& run, uint32_t* exit_code, String* message) {
   *exit_code = 0;
   allocators::IAllocator& allocator = *run.allocator;
   static kernel::Mutex init_mutex;
   static uint64_t next_id = 100;
-  {
-    kernel::ScopedMutex lock(init_mutex);
-    if (!kernel::usermode::ready() && !kernel::usermode::init(allocator)) {
-      fail(message, "user mode is not available on this machine");
-      return RunResult::CouldNotRun;
-    }
-  }
   const process::SyscallAbi abi = process::abi_for_executable(run.kind);
   if (abi == process::SyscallAbi::None) {
     fail(message, "this is not a program");
@@ -114,6 +148,17 @@ RunResult run_program(const ProgramRun& run, uint32_t* exit_code, String* messag
 
   ByteBuffer image(allocator);
   if (!read_program(*run.files, run.path, &image, message)) return RunResult::CouldNotRun;
+  const Plan plan = plan_for(run, image.view(), message);
+  if (plan == Plan::Impossible) return RunResult::CouldNotRun;
+#if defined(__x86_64__)
+  if (plan == Plan::Native) {
+    kernel::ScopedMutex lock(init_mutex);
+    if (!kernel::usermode::ready() && !kernel::usermode::init(allocator)) {
+      fail(message, "user mode is not available on this machine");
+      return RunResult::CouldNotRun;
+    }
+  }
+#endif
 
   String name(allocator);
   StringView argv[kMaxArguments + 1];
@@ -136,7 +181,7 @@ RunResult run_program(const ProgramRun& run, uint32_t* exit_code, String* messag
   if (!run.host) host.close_input();
   uint8_t random[16];
   if (!host.random_bytes(ByteView(random, sizeof(random)))) {      // (no hardware generator: the stack protector's canary is only as good as this)
-    uint64_t t = hardware::read_tsc();
+    uint64_t t = host.monotonic_ns() ^ reinterpret_cast<uintptr_t>(&random);
     for (uint8_t& b : random) {
       t = t * 6364136223846793005ull + 1442695040888963407ull;
       b = static_cast<uint8_t>(t >> 56);
@@ -148,7 +193,9 @@ RunResult run_program(const ProgramRun& run, uint32_t* exit_code, String* messag
     id = next_id++;
   }
   process::UserProgram program(allocator, id, host);
-  program.address_space().set_reserved(kernel::usermode::reserved_ranges());
+#if defined(__x86_64__)
+  if (plan == Plan::Native) program.address_space().set_reserved(kernel::usermode::reserved_ranges());      // (pages the CPU's own page tables need; an emulated program has none)
+#endif
   program.set_file_system(run.files);
   process::FileLibraryProvider libraries(allocator, run.files);      // every DLL, ntdll.dll and kernel32.dll included, comes from C:\Windows\System32
   if (abi == process::SyscallAbi::Windows) program.set_library_provider(&libraries);
@@ -186,23 +233,63 @@ RunResult run_program(const ProgramRun& run, uint32_t* exit_code, String* messag
     return RunResult::CouldNotRun;
   }
 
-  UniquePointer<kernel::usermode::Task> task = kernel::usermode::spawn(program, allocator, "program");
-  if (!task) {
-    fail(message, "could not start the program (out of memory)");
-    return RunResult::CouldNotRun;
-  }
-  task->set_name(name.view());      // (what the computer manager lists)
+  // How it ended, whichever way it ran.
   uint32_t code = 0;
-  bool kill_sent = false;
-  host.set_interrupt_callback([](void* t) { kernel::usermode::request_kill(*static_cast<kernel::usermode::Task*>(t)); }, task.get());
-  while (!kernel::usermode::wait(*task, &code, 20000)) {
-    pass_on_output(host, run, allocator);
-    if (host.interrupted() && !kill_sent) {
-      kernel::usermode::request_kill(*task);
-      kill_sent = true;
+  bool killed = false, faulted = false;
+  uint64_t fault_vector = 0, fault_address = 0, fault_rip = 0;
+  if (plan == Plan::Emulated) {
+    if (!ensure_system_objects(allocator)) {
+      fail(message, "not enough memory to start the program");
+      return RunResult::CouldNotRun;
     }
+    UniquePointer<emulation::IGuestCpu> cpu = emulation::create_guest_cpu(program.start().arch, allocator);
+    if (!cpu) {
+      fail(message, "no emulator for this program's CPU");
+      return RunResult::CouldNotRun;
+    }
+    EmulatedTask task(program, static_cast<UniquePointer<emulation::IGuestCpu>&&>(cpu), allocator);
+    if (!task.start("emulated")) {
+      fail(message, "could not start the program (out of memory)");
+      return RunResult::CouldNotRun;
+    }
+    host.set_interrupt_callback([](void* t) { static_cast<EmulatedTask*>(t)->request_stop(); }, &task);
+    while (!task.wait(20000)) {
+      pass_on_output(host, run, allocator);
+      if (host.interrupted()) task.request_stop();
+    }
+    host.set_interrupt_callback(nullptr, nullptr);
+    const emulation::EmulatedOutcome& outcome = task.outcome();
+    code = outcome.exit_code;
+    killed = outcome.killed;
+    faulted = outcome.faulted;
+    fault_vector = outcome.fault.vector;
+    fault_address = outcome.fault.address;
+    fault_rip = outcome.fault.pc;
+  } else {
+#if defined(__x86_64__)
+    UniquePointer<kernel::usermode::Task> task = kernel::usermode::spawn(program, allocator, "program");
+    if (!task) {
+      fail(message, "could not start the program (out of memory)");
+      return RunResult::CouldNotRun;
+    }
+    task->set_name(name.view());      // (what the computer manager lists)
+    bool kill_sent = false;
+    host.set_interrupt_callback([](void* t) { kernel::usermode::request_kill(*static_cast<kernel::usermode::Task*>(t)); }, task.get());
+    while (!kernel::usermode::wait(*task, &code, 20000)) {
+      pass_on_output(host, run, allocator);
+      if (host.interrupted() && !kill_sent) {
+        kernel::usermode::request_kill(*task);
+        kill_sent = true;
+      }
+    }
+    host.set_interrupt_callback(nullptr, nullptr);
+    killed = task->killed;
+    faulted = task->faulted;
+    fault_vector = task->fault_vector;
+    fault_address = task->fault_address;
+    fault_rip = task->fault_rip;
+#endif
   }
-  host.set_interrupt_callback(nullptr, nullptr);
   pass_on_output(host, run, allocator);
   *exit_code = code;
 
@@ -215,24 +302,24 @@ RunResult run_program(const ProgramRun& run, uint32_t* exit_code, String* messag
     if (!message->empty()) message->append("; ");
     message->append("some of its output was dropped");
   }
-  if (task->killed) return RunResult::Interrupted;
-  if (task->faulted) {
+  if (killed) return RunResult::Interrupted;
+  if (faulted) {
     String text(allocator);
     String import_name(allocator);
-    if (task->fault_vector == 6 && program.describe_missing_import(task->fault_rip, &import_name)) {
+    if (fault_vector == 6 && program.describe_missing_import(fault_rip, &import_name)) {
       text.assign("the program called ");
       text.append(import_name.view());
       text.append(", which this OS does not provide");
       message->assign(text.view());
       return RunResult::Faulted;
     }
-    text.assign("stopped by the processor: ");
-    text.append(fault_name(task->fault_vector));
-    if (task->fault_vector == 14) {
+    text.assign(plan == Plan::Emulated ? "stopped by the emulated processor: " : "stopped by the processor: ");
+    text.append(fault_name(fault_vector));
+    if (fault_vector == 14) {
       text.append(" at address 0x");
       int shift = 60;
-      while (shift > 0 && ((task->fault_address >> shift) & 15) == 0) shift -= 4;      // no leading zeros
-      for (; shift >= 0; shift -= 4) text.push_back("0123456789abcdef"[(task->fault_address >> shift) & 15]);
+      while (shift > 0 && ((fault_address >> shift) & 15) == 0) shift -= 4;      // no leading zeros
+      for (; shift >= 0; shift -= 4) text.push_back("0123456789abcdef"[(fault_address >> shift) & 15]);
     }
     if (!message->empty()) {
       text.append("; ");
@@ -243,16 +330,6 @@ RunResult run_program(const ProgramRun& run, uint32_t* exit_code, String* messag
   }
   return RunResult::Exited;
 }
-
-#else
-
-RunResult run_program(const ProgramRun&, uint32_t* exit_code, String* message) {
-  *exit_code = 0;
-  message->assign("programs can only run on x86-64 so far");
-  return RunResult::CouldNotRun;
-}
-
-#endif
 
 namespace {
 

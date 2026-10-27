@@ -33,6 +33,7 @@ struct X86Context {
   uint64_t rip = 0;
   uint64_t rflags = 0x202;
   uint8_t fpu[512] = {};      // FXSAVE image (x87 and SSE state, MXCSR at byte 24)
+  uint8_t ymm_high[256] = {};      // bits 255:128 of YMM0..15 (AVX); not part of the CONTEXT in memory, kept across an exception by the emulator
 };
 
 constexpr uint32_t kContextBytes = 0x4D0;           // sizeof(CONTEXT) of x64

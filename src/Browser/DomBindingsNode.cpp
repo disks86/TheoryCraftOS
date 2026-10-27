@@ -1006,6 +1006,17 @@ NATIVE(node_replace_with) {
 NATIVE(node_remove) {
   dom::Node* n = this_node(vm, self);
   if (!n) return false;
+  if (n->is_tag("select") && argc >= 1) {   // select.remove(index): the option at that index (nothing when there is none)
+    double index = 0;
+    if (!vm.to_number(args[0], &index)) return false;
+    if (index != index || index < 0) return true;
+    double at = 0;
+    for (dom::Node* d = n->first_child; d; d = dom::next_in_tree(d, n)) {
+      if (!d->is_tag("option")) continue;
+      if (at++ == static_cast<double>(static_cast<uint64_t>(index))) { dom::detach(d); break; }
+    }
+    return true;
+  }
   dom::detach(n);
   return true;
 }
