@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Process/WindowsObjects.hpp"
+#include "Process/WindowsMemory.hpp"
 #include "Process/Objects.hpp"
 #include "Process/WindowsFiles.hpp"
 #include "Process/WindowsMailslots.hpp"
@@ -391,6 +392,10 @@ uint32_t nt_duplicate_object(Process& p, const SyscallRequest& r) {
     p.close_descriptor(uint64_t(copy));
     return kAccessViolation;
   }
+  {      // DUPLICATE_SAME_ACCESS keeps the rights; otherwise the copy has the ones asked for (the rights of a section are the ones MapViewOfFile checks)
+    const uint32_t original = p.files().denied_access(slot);
+    p.files().set_denied_access(uint64_t(copy), (options & 2) ? original : (original | ~uint32_t(r.args[4])));
+  }
   const bool same = (options & 4) != 0;      // DUPLICATE_SAME_ATTRIBUTES; otherwise the handle is inheritable if the attributes say OBJ_INHERIT
   p.files().set_handle_flags(uint64_t(copy), same ? p.files().inheritable(slot) : (attributes & 2) != 0, false);
   if (options & 1) p.close_descriptor(slot);      // DUPLICATE_CLOSE_SOURCE
@@ -501,11 +506,13 @@ constexpr uint32_t kPageReadOnly = 0x02, kPageReadWrite = 0x04, kPageWriteCopy =
                    kPageExecuteWriteCopy = 0x80;
 constexpr uint32_t kStatusSectionProtection = 0xC000004Eu, kStatusConflictingAddresses = 0xC0000018u, kStatusNotMappedView = 0xC0000019u;
 
-uint8_t protection_of_page(uint32_t page, bool* private_copy) {
+// The permissions of a PAGE_* constant; `valid` is false for a constant that is none of them. PAGE_NOACCESS is valid (a view that cannot be touched).
+uint8_t protection_of_page(uint32_t page, bool* private_copy, bool* valid = nullptr) {
+  if (valid) *valid = page == 0x01 || page == kPageReadOnly || page == kPageReadWrite || page == kPageWriteCopy || page == kPageExecute || page == kPageExecuteRead || page == kPageExecuteReadWrite || page == kPageExecuteWriteCopy;
   *private_copy = page == kPageWriteCopy || page == kPageExecuteWriteCopy;
   uint8_t prot = 0;
   if (page == kPageReadOnly || page == kPageExecuteRead || page == kPageReadWrite || page == kPageWriteCopy || page == kPageExecuteReadWrite || page == kPageExecuteWriteCopy) prot |= kProtRead;
-  if (page == kPageReadWrite || page == kPageWriteCopy || page == kPageExecuteReadWrite || page == kPageExecuteWriteCopy) prot |= kProtWrite;
+  if (page == kPageReadWrite || page == kPageExecuteReadWrite) prot |= kProtWrite;      // (a copy-on-write page is written to only after AddressSpace::break_copy_on_write)
   if (page == kPageExecute || page == kPageExecuteRead || page == kPageExecuteReadWrite || page == kPageExecuteWriteCopy) prot |= kProtExecute;
   return prot;
 }
@@ -521,7 +528,7 @@ uint32_t nt_create_section(Process& p, const SyscallRequest& r) {
   if (!objects) return kNotImplemented;
   const uint32_t page = uint32_t(page_protection);
   bool copy = false;
-  if (protection_of_page(page, &copy) == 0) return kInvalidParameter;
+  if (protection_of_page(page, &copy) == 0 || page == kPageExecute) return kInvalidParameter;      // (no access and execute-only sections do not exist)
   char name[ObjectManager::kNameBytes + 1];
   uint32_t name_size = 0;
   uint32_t status = read_name(p, r.args[2], name, ObjectManager::kNameBytes, &name_size);
@@ -536,12 +543,12 @@ uint32_t nt_create_section(Process& p, const SyscallRequest& r) {
     OpenObject* file = p.files().object(slot);
     if (!file || !p.files().host_path_of(file->path.view(), &host)) return kInvalidHandle;
     fs = p.files().file_system();
+    if (!file->writable && (page == kPageReadWrite || page == kPageExecuteReadWrite || page == kPageExecuteRead || page == kPageExecuteWriteCopy)) return 0xC0000022u;      // STATUS_ACCESS_DENIED
     if (size > p.files().size_of(*file) && !file->writable) return 0xC000004Eu;
   } else if (size == 0) {
     return kInvalidParameter;
   }
-  const bool writable = (page == kPageReadWrite || page == kPageExecuteReadWrite);
-  const ObjectManager::Created c = objects->create_section(StringView(name, name_size), size, writable, fs, host.view());
+  const ObjectManager::Created c = objects->create_section(StringView(name, name_size), size, page, fs, host.view());
   if (c.id == 0) return c.status;
   return give_handle(p, *objects, ObjectKind::Section, c.id, r.args[0], c.status, wants_inherit(p, r.args[2]));
 }
@@ -566,10 +573,18 @@ uint32_t nt_map_view_of_section(Process& p, const SyscallRequest& r) {
   uint64_t rounded = 0;
   SharedMemory* owner = nullptr;
   if (!objects->section_info(id, &info) || !objects->section_memory(id, &storage, &rounded, &owner)) return kInvalidHandle;
-  bool copy = false;
-  uint8_t prot = protection_of_page(uint32_t(protect) ? uint32_t(protect) : kPageReadWrite, &copy);
-  if (prot == 0) return kInvalidParameter;
-  if ((prot & kProtWrite) && !copy && !info.writable) return kStatusSectionProtection;
+  bool copy = false, valid = false;
+  const uint32_t view_page = uint32_t(protect) ? uint32_t(protect) : kPageReadWrite;
+  const uint8_t prot = protection_of_page(view_page, &copy, &valid);
+  if (!valid) return kInvalidParameter;
+  {      // what the view may do must be allowed by the section; a view that cannot be touched needs read access to the section
+    const uint8_t wanted = page_access(view_page) ? page_access(view_page) : uint8_t{1};
+    if (wanted & ~page_access(info.page ? info.page : kPageReadWrite)) return 0xC0000022u;      // STATUS_ACCESS_DENIED: the section was not opened for that
+    uint64_t handle_slot = 0;
+    const uint32_t denied = slot_of(r.args[0], &handle_slot) ? p.files().denied_access(handle_slot) : 0;
+    constexpr uint32_t kSectionMapWrite = 2, kSectionMapRead = 4, kSectionMapExecute = 8;
+    if (((wanted & 1) && (denied & kSectionMapRead)) || ((wanted & 2) && (denied & kSectionMapWrite)) || ((wanted & 4) && (denied & kSectionMapExecute))) return 0xC0000022u;
+  }
   uint64_t offset = 0, view = 0, base = 0;
   if (offset_at != 0 && !p.read_user_u64(offset_at, &offset)) return kAccessViolation;
   if (size_at == 0 || !p.read_user_u64(size_at, &view) || !p.read_user_u64(r.args[2], &base)) return kAccessViolation;
@@ -582,13 +597,13 @@ uint32_t nt_map_view_of_section(Process& p, const SyscallRequest& r) {
   } else if (base % 4096 != 0) {
     return kInvalidParameter;
   }
-  if (copy) {      // a private copy: changes are not seen by anyone else, nor written back
-    if (!space->map(base, bytes, kProtRead | kProtWrite)) return kStatusConflictingAddresses;
-    if (!space->write_privileged(base, ConstByteView(storage + offset, bytes))) { space->unmap(base, bytes); return kNoResources; }
-    space->protect(base, bytes, prot);
-  } else if (!space->map_shared(base, bytes, prot, storage + offset, owner)) {
-    return kStatusConflictingAddresses;
-  }
+  // A copy-on-write view shares the section's memory until a page is written to (AddressSpace::break_copy_on_write gives that page a copy of its own).
+  if (!space->map_shared(base, bytes, prot, storage + offset, owner)) return kStatusConflictingAddresses;
+  PageAttributes attributes;
+  attributes.type = PageAttributes::Mapped;
+  attributes.protect = attributes.allocation_protect = view_page;
+  attributes.file_view = info.file_backed;
+  space->set_attributes(base, bytes, attributes);
   const bool ok = p.write_user_u64(r.args[2], base) && p.write_user_u64(size_at, bytes);
   if (!ok) { space->unmap(base, bytes); return kAccessViolation; }
   return kSuccess;

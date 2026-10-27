@@ -1300,8 +1300,9 @@ EXPORT HANDLE WINAPI OpenFileMappingA(DWORD access, BOOL inherit, LPCSTR name) {
   return h;
 }
 EXPORT LPVOID WINAPI MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offset_high, DWORD offset_low, SIZE_T bytes, LPVOID base_address) {
-  ULONG page = (access & FILE_MAP_WRITE_) ? PAGE_READWRITE : (access & FILE_MAP_COPY_) ? 0x08 /* PAGE_WRITECOPY */ : 0x02 /* PAGE_READONLY */;
-  if (access & FILE_MAP_EXECUTE_) page = page == PAGE_READWRITE ? 0x40 : page == 0x08 ? 0x80 : 0x20;
+  const BOOL exec = (access & FILE_MAP_EXECUTE_) != 0;      /* a copy-on-write view only when COPY is the whole request; no read/write/copy bit: a view nobody may touch */
+  access &= ~(DWORD)FILE_MAP_EXECUTE_;
+  ULONG page = access == FILE_MAP_COPY_ ? (exec ? 0x80 : 0x08) : (access & FILE_MAP_WRITE_) ? (exec ? 0x40 : PAGE_READWRITE) : (access & FILE_MAP_READ_) ? (exec ? 0x20 : 0x02) : 0x01;
   LARGE_INTEGER offset;
   offset.LowPart = offset_low;
   offset.HighPart = (LONG)offset_high;

@@ -42,12 +42,12 @@ bool page_protection(uint32_t page, uint8_t* out) {
   switch (page) {
     case kPageNoAccess: *out = 0; return true;
     case kPageReadOnly: *out = kProtRead; return true;
-    case kPageReadWrite:
-    case kPageWriteCopy: *out = kProtRead | kProtWrite; return true;
+    case kPageReadWrite: *out = kProtRead | kProtWrite; return true;
+    case kPageWriteCopy: *out = kProtRead; return true;      // (the first write copies the page: AddressSpace::break_copy_on_write)
     case kPageExecute: *out = kProtExecute; return true;
     case kPageExecuteRead: *out = kProtRead | kProtExecute; return true;
-    case kPageExecuteReadWrite:
-    case kPageExecuteWriteCopy: *out = kProtRead | kProtWrite | kProtExecute; return true;
+    case kPageExecuteReadWrite: *out = kProtRead | kProtWrite | kProtExecute; return true;
+    case kPageExecuteWriteCopy: *out = kProtRead | kProtExecute; return true;
     default: return false;
   }
 }
@@ -63,7 +63,26 @@ uint32_t page_constant(uint8_t protection) {
   }
 }
 
+// The PAGE_* constant of the page, as the program asked for it (copy-on-write and the like); pages the loader mapped have only their permissions to go by.
+uint32_t effective_protect(const AddressSpace& space, uint64_t address) {
+  uint8_t prot = 0;
+  PageAttributes attributes;
+  if (!space.protection_at(address, &prot)) return 0;
+  if (space.attributes_at(address, &attributes) && attributes.protect != 0) return attributes.protect;
+  return page_constant(prot);
+}
+
+constexpr uint32_t kStatusAccessDenied = 0xC0000022u;
+
 // ---- the operations, on one process
+
+void set_private_attributes(AddressSpace& space, uint64_t base, uint64_t size, uint32_t protect, uint32_t type) {
+  PageAttributes attributes;
+  attributes.allocation_protect = protect;
+  attributes.reserved = !(type & kMemCommit);
+  attributes.protect = attributes.reserved ? kPageNoAccess : protect;
+  space.set_attributes(base, size, attributes);
+}
 
 uint32_t vm_allocate(Process& target, uint64_t* base_io, uint64_t* size_io, uint32_t type, uint32_t protect) {
   AddressSpace* space = target.address_space();
@@ -80,9 +99,17 @@ uint32_t vm_allocate(Process& target, uint64_t* base_io, uint64_t* size_io, uint
     base = AddressSpace::round_down(base);
     if (space->check(base, rounded, 0)) {
       // Committing pages that were reserved earlier.
-      if (!(type & kMemCommit) || !space->protect(base, rounded, prot)) return kStatusConflictingAddresses;
+      if (!(type & kMemCommit)) return kStatusConflictingAddresses;
+      PageAttributes existing;
+      if (space->attributes_at(base, &existing) && existing.type == PageAttributes::Mapped) {      // a view: a file's pages are already there; plain memory takes what the view allows
+        if (existing.file_view) return kStatusAccessDenied;
+        if (page_access(protect) & ~page_access(existing.allocation_protect)) return kStatusInvalidParameter;
+      }
+      if (!space->protect(base, rounded, prot) || !space->set_page_protect(base, rounded, protect, false)) return kStatusConflictingAddresses;
     } else if (!space->map(base, rounded, prot)) {
       return kStatusConflictingAddresses;
+    } else {
+      set_private_attributes(*space, base, rounded, protect, type);
     }
   } else {
     uint64_t at = 0;
@@ -90,6 +117,7 @@ uint32_t vm_allocate(Process& target, uint64_t* base_io, uint64_t* size_io, uint
     if (!space->find_free(rounded, hint, &at)) return kStatusNoMemory;
     at = (at + kAllocationGranularity - 1) & ~(kAllocationGranularity - 1);      // reservations begin on the allocation granularity
     if (!space->map(at, rounded, prot)) return kStatusNoMemory;
+    set_private_attributes(*space, at, rounded, protect, type);
     target.set_mmap_cursor(at + rounded);
     base = at;
   }
@@ -117,6 +145,7 @@ uint32_t vm_free(Process& target, uint64_t* base_io, uint64_t* size_io, uint32_t
     base = AddressSpace::round_down(base);
     if (size == 0 || !AddressSpace::round_up(size, &rounded)) return kStatusInvalidParameter;
     if (!space->protect(base, rounded, 0)) return kStatusUnableToFreeVm;      // decommitted pages become inaccessible (their contents are not cleared)
+    space->set_page_protect(base, rounded, kPageNoAccess, true);
     *base_io = base;
     *size_io = rounded;
     return kStatusSuccess;
@@ -134,8 +163,14 @@ uint32_t vm_protect(Process& target, uint64_t* base_io, uint64_t* size_io, uint3
   if (*size_io == 0 || !AddressSpace::round_up(*size_io, &rounded)) return kStatusInvalidParameter;
   uint8_t old = 0;
   if (!space->protection_at(base, &old)) return kStatusConflictingAddresses;
-  *old_protect = page_constant(old);
-  if (!space->protect(base, rounded, prot)) return kStatusConflictingAddresses;
+  *old_protect = effective_protect(*space, base);
+  PageAttributes attributes;
+  if (space->attributes_at(base, &attributes) && attributes.type == PageAttributes::Mapped && (page_access(protect) & ~page_access(attributes.allocation_protect))) return kStatusInvalidParameter;
+  if (attributes.type == PageAttributes::Mapped && !space->is_shared(base)) {      // a page of a view that already has a copy of its own is written to freely
+    if (protect == kPageWriteCopy) { protect = kPageReadWrite; prot = kProtRead | kProtWrite; }
+    else if (protect == kPageExecuteWriteCopy) { protect = kPageExecuteReadWrite; prot = kProtRead | kProtWrite | kProtExecute; }
+  }
+  if (!space->protect(base, rounded, prot) || !space->set_page_protect(base, rounded, protect, false)) return kStatusConflictingAddresses;
   *base_io = base;
   *size_io = rounded;
   return kStatusSuccess;
@@ -152,13 +187,26 @@ void vm_query(Process& target, uint64_t address, uint8_t* out) {
   if (space && space->region_extent(page, &base, &size) && space->protection_at(page, &protection)) {
     uint64_t allocation = 0, allocation_size = 0;
     if (!space->allocation_extent(page, &allocation, &allocation_size)) allocation = base;
+    PageAttributes attributes;
+    const bool known = space->attributes_at(page, &attributes) && attributes.protect != 0;
+    const uint32_t current = known ? attributes.protect : page_constant(protection);
+    // The run of pages that look the same: neighbours of one allocation with the same permissions and attributes.
+    uint64_t end = base + size, id = 0;
+    AddressSpace::RegionInfo next;
+    for (uint64_t i = 0; space->region_at(i, &next); ++i) {
+      if (next.base == base) { id = next.allocation; continue; }
+      if (next.base < end) continue;
+      if (next.base != end || next.allocation != id || next.protection != protection || !(next.attributes == attributes)) break;
+      end = next.base + next.size;
+    }
     put64(0, page);
     put64(8, allocation);
-    put32(16, page_constant(protection));      // AllocationProtect
-    put64(24, base + size - page);             // RegionSize: to the end of this run of pages
-    put32(32, protection == 0 ? 0x2000 : 0x1000);      // State: MEM_RESERVE for pages nobody may touch, else MEM_COMMIT
-    put32(36, page_constant(protection));      // Protect
-    put32(40, 0x20000);                        // Type: MEM_PRIVATE
+    put32(16, known && attributes.allocation_protect ? attributes.allocation_protect : current);      // AllocationProtect
+    put64(24, end - page);                     // RegionSize: to the end of this run of pages
+    const bool reserved = known ? attributes.reserved : protection == 0;
+    put32(32, reserved ? 0x2000 : 0x1000);     // State: MEM_RESERVE for pages nobody may touch, else MEM_COMMIT
+    put32(36, reserved ? 0 : current);         // Protect
+    put32(40, attributes.type == PageAttributes::Mapped ? 0x40000 : attributes.type == PageAttributes::Image ? 0x1000000 : 0x20000);      // Type: MEM_MAPPED, MEM_IMAGE, MEM_PRIVATE
   } else {
     // Free: up to the next mapped page.
     uint64_t next = AddressSpace::kUserTop;
@@ -306,7 +354,7 @@ uint32_t nt_protect_virtual_memory(Process& process, const SyscallRequest& r) {
     AddressSpace* space = process.address_space();
     if (space && space->protection_at(AddressSpace::round_down(base), &probe)) {
       uint8_t bytes[4] = {};
-      const uint32_t value = page_constant(probe);
+      const uint32_t value = effective_protect(*space, AddressSpace::round_down(base));
       for (uint32_t i = 0; i < 4; ++i) bytes[i] = uint8_t(value >> (8 * i));
       if (!process.write_user(old_pointer, ConstByteView(bytes, 4))) return kStatusAccessViolation;
     }

@@ -23,6 +23,18 @@
 
 namespace process::windowsabi {
 
+// The access a PAGE_* constant grants, as the checks on sections and views see it (bit 1 read, 2 write, 4 execute): copy-on-write pages read, a page that can only execute
+// reads as well, no access and anything unknown grant nothing.
+constexpr uint8_t page_access(uint32_t page) {
+  switch (page) {
+    case 0x02: case 0x08: return 1;
+    case 0x04: return 3;
+    case 0x10: case 0x20: case 0x80: return 5;
+    case 0x40: return 7;
+    default: return 0;
+  }
+}
+
 // The virtual memory services. Each takes a process handle: -1 (this process), or a handle to another running program (from CreateProcess or OpenProcess), whose memory is
 // then reached through IProcessRuntime::remote_operation().
 // NtAllocateVirtualMemory(Process, PVOID* Base, ULONG_PTR ZeroBits, PSIZE_T Size, ULONG Type, ULONG Protect), NtFreeVirtualMemory(Process, PVOID* Base, PSIZE_T Size, ULONG FreeType),

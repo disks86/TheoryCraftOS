@@ -60,7 +60,7 @@ bool AddressSpace::overlaps_reserved(uint64_t start, uint64_t end, uint64_t* res
 bool AddressSpace::region_at(uint64_t index, RegionInfo* out) const {
   if (index >= regions_.count()) return false;
   const Region& r = *regions_[index];
-  *out = RegionInfo{r.base, r.size, r.protection, r.storage};
+  *out = RegionInfo{r.base, r.size, r.protection, r.storage, r.allocation, r.attributes};
   return true;
 }
 
@@ -149,6 +149,7 @@ bool AddressSpace::split_at(uint64_t address) {
   tail->size = r.size - offset;
   tail->protection = r.protection;
   tail->allocation = r.allocation;
+  tail->attributes = r.attributes;
   if (r.shared) {      // the tail maps the same memory further on
     tail->storage = r.storage + offset;
     tail->capacity = tail->size;
@@ -185,6 +186,61 @@ bool AddressSpace::protect(uint64_t address, uint64_t size, uint8_t protection) 
   if (!split_at(address) || !split_at(end)) return false;
   for (uint64_t i = first_ending_after(address); i < regions_.count() && regions_[i]->base < end; ++i) regions_[i]->protection = protection;
   ++generation_;
+  return true;
+}
+
+bool AddressSpace::set_attributes(uint64_t address, uint64_t size, const PageAttributes& attributes) {
+  uint64_t end = 0;
+  if (!prepare_range(address, size, &end) || !check(address, end - address, 0)) return false;
+  if (!split_at(address) || !split_at(end)) return false;
+  for (uint64_t i = first_ending_after(address); i < regions_.count() && regions_[i]->base < end; ++i) regions_[i]->attributes = attributes;
+  ++generation_;
+  return true;
+}
+
+bool AddressSpace::set_page_protect(uint64_t address, uint64_t size, uint32_t protect, bool reserved) {
+  uint64_t end = 0;
+  if (!prepare_range(address, size, &end) || !check(address, end - address, 0)) return false;
+  if (!split_at(address) || !split_at(end)) return false;
+  for (uint64_t i = first_ending_after(address); i < regions_.count() && regions_[i]->base < end; ++i) {
+    regions_[i]->attributes.protect = protect;
+    regions_[i]->attributes.reserved = reserved;
+  }
+  ++generation_;
+  return true;
+}
+
+bool AddressSpace::break_copy_on_write(uint64_t address, uint64_t size) {
+  if (size == 0 || address >= kUserTop || size > kUserTop - address) return false;
+  bool any = false;
+  for (uint64_t page = round_down(address); page < address + size; page += kPageSize) {
+    uint64_t i = first_ending_after(page);
+    if (i >= regions_.count() || regions_[i]->base > page) continue;
+    const uint32_t protect = regions_[i]->attributes.protect;
+    if (protect != 0x08 && protect != 0x80) continue;
+    if (!split_at(page) || !split_at(page + kPageSize)) return false;
+    i = first_ending_after(page);
+    Region& r = *regions_[i];
+    if (r.shared) {      // a copy of this page for this address space alone
+      uint8_t* copy = static_cast<uint8_t*>(allocator_.allocate_aligned(kPageSize, kPageSize));
+      if (!copy) return false;
+      if (!ByteView(copy, kPageSize).copy_from(ConstByteView(r.storage, kPageSize))) { allocator_.deallocate(copy); return false; }
+      r.release();      // (the mapping is let go of; its memory is not ours)
+      r.storage = copy;
+      r.capacity = kPageSize;
+    }
+    r.protection |= kProtWrite;
+    r.attributes.protect = protect == 0x08 ? 0x04 : 0x40;
+    any = true;
+  }
+  if (any) ++generation_;
+  return any;
+}
+
+bool AddressSpace::attributes_at(uint64_t address, PageAttributes* out) const {
+  const uint64_t i = first_ending_after(address);
+  if (i >= regions_.count() || regions_[i]->base > address) return false;
+  *out = regions_[i]->attributes;
   return true;
 }
 
