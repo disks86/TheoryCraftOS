@@ -86,9 +86,57 @@ def main():
     for expr in ('(vector.ring_id & 0x0c) >> 2', '(vector.ring_id & 0x03) >> 0', '(vector.ring_id & 0x70) >> 4', 'vector.ring_id & 0x3', '(vector.ring_id & 0xc) >> 2'):
         if expr not in cpp:
             fail('AmdIrq.cpp lacks ' + expr)
+
+    check_enables(gfx, sdma, gmc_c)
     if bad:
         sys.exit(1)
-    print('AmdIrq matches the driver: %d source ids, 4 registers, %d masks, ring id decoding' % (len(want), len(masks)))
+    print('AmdIrq matches the driver: %d source ids, 4 registers, %d masks, ring id decoding, the sources\' enables' % (len(want), len(masks)))
+
+
+def function_body(src, name):
+    m = re.search(r'\n(?:static )?\w[\w \*]*\b' + re.escape(name) + r'\([^{]*\{', src)
+    if not m:
+        sys.exit('function not found: ' + name)
+    depth, i = 0, m.end() - 1
+    for j in range(i, len(src)):
+        depth += (src[j] == '{') - (src[j] == '}')
+        if depth == 0:
+            return src[i:j + 1]
+    sys.exit('unbalanced: ' + name)
+
+
+def check_enables(gfx, sdma, gmc_c):
+    """The registers and fields the sources are enabled with (the *_set_*_state functions), against the ports in AmdGfx8.cpp, AmdGfx8Compute.cpp, AmdSdma3.cpp and AmdGmc8.cpp."""
+    ours = {f: open(os.path.join(ROOT, f)).read() for f in ('AmdGfx8.cpp', 'AmdGfx8Compute.cpp', 'AmdSdma3.cpp', 'AmdGmc8.cpp')}
+    # graphics ring: CP_INT_CNTL_RING0 TIME_STAMP / PRIV_REG / PRIV_INSTR
+    for fn, field in (('gfx_v8_0_set_gfx_eop_interrupt_state', 'TIME_STAMP_INT_ENABLE'), ('gfx_v8_0_set_priv_reg_fault_state', 'PRIV_REG_INT_ENABLE'),
+                      ('gfx_v8_0_set_priv_inst_fault_state', 'PRIV_INSTR_INT_ENABLE')):
+        if 'WREG32_FIELD(CP_INT_CNTL_RING0, ' + field not in function_body(gfx, fn):
+            fail(fn + ' no longer sets CP_INT_CNTL_RING0.' + field)
+        if 'CP_INT_CNTL_RING0__' + field + '_MASK' not in ours['AmdGfx8.cpp']:
+            fail('AmdGfx8.cpp lacks CP_INT_CNTL_RING0.' + field)
+    # compute pipe: CP_ME1_PIPEn_INT_CNTL, TIME_STAMP_INT_ENABLE of CP_INT_CNTL_RING0, MEC 1 only
+    body = function_body(gfx, 'gfx_v8_0_set_compute_eop_interrupt_state')
+    for pipe in range(4):
+        if 'mmCP_ME1_PIPE%d_INT_CNTL' % pipe not in body or 'mmCP_ME1_PIPE%d_INT_CNTL' % pipe not in ours['AmdGfx8Compute.cpp']:
+            fail('compute pipe %d interrupt register' % pipe)
+    if 'CP_INT_CNTL_RING0__TIME_STAMP_INT_ENABLE_MASK' not in body or 'CP_INT_CNTL_RING0__TIME_STAMP_INT_ENABLE_MASK' not in ours['AmdGfx8Compute.cpp']:
+        fail('compute pipe interrupt field')
+    if 'if (me == 1)' not in body or 'compute_me != 1' not in ours['AmdGfx8Compute.cpp']:
+        fail('compute pipe interrupts are for MEC 1 only')
+    # SDMA: TRAP_ENABLE of SDMA0_CNTL for both engines
+    body = function_body(sdma, 'sdma_v3_0_set_trap_irq_state')
+    if 'SDMA0_CNTL, TRAP_ENABLE' not in body or 'SDMA0_CNTL, TRAP_ENABLE' not in ours['AmdSdma3.cpp'] or body.count('SDMA1_REGISTER_OFFSET') < 2:
+        fail('sdma trap enable')
+    # memory controller: the seven *_FAULT_ENABLE_INTERRUPT bits of both contexts
+    body = function_body(gmc_c, 'gmc_v8_0_vm_fault_interrupt_state')
+    kinds = ('RANGE', 'DUMMY_PAGE', 'PDE0', 'VALID', 'READ', 'WRITE', 'EXECUTE')
+    for kind in kinds:
+        name = 'VM_CONTEXT1_CNTL__%s_PROTECTION_FAULT_ENABLE_INTERRUPT_MASK' % kind
+        if name not in body or name not in ours['AmdGmc8.cpp']:
+            fail('memory controller fault enable ' + kind)
+    if 'mmVM_CONTEXT0_CNTL' not in body or 'mmVM_CONTEXT1_CNTL' not in body or 'mmVM_CONTEXT0_CNTL' not in ours['AmdGmc8.cpp']:
+        fail('memory controller contexts')
 
 
 bad = False

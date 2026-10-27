@@ -448,9 +448,36 @@ static void test_attach() {
   CHECK(clear && rig.compute_block.base[4096] == 0xAA);
 }
 
+// The end-of-pipe interrupt of the pipe the queues are on: TIME_STAMP_INT_ENABLE (0x04000000) of CP_ME1_PIPEn_INT_CNTL (0x3085 + n), only for MEC 1.
+static void test_eop_interrupt() {
+  for (uint32_t pipe = 0; pipe < 3; ++pipe) {
+    Rig rig;
+    AmdGfx8Compute::Config c;
+    c.queues = 2;
+    c.compute_pipe = pipe;
+    AmdGfx8Compute compute(rig.card, rig.clock, c);
+    CHECK(compute.attach(rig.compute_memory()) == AmdGfx8Compute::Result::Ok);
+    const uint32_t reg = 0x3085 + pipe;
+    rig.card.set_reg(reg, 0x00000003);
+    rig.card.set_reg(0x3085 + (pipe + 1) % 4, 0x7);
+    CHECK(compute.set_eop_interrupt(true) && rig.card.reg(reg) == 0x04000003 && rig.card.reg(0x3085 + (pipe + 1) % 4) == 0x7);
+    CHECK(compute.set_eop_interrupt(false) && rig.card.reg(reg) == 0x00000003);
+  }
+  Rig rig;
+  AmdGfx8Compute::Config c;
+  c.queues = 2;
+  c.compute_me = 2;
+  c.kiq_me = 1;
+  AmdGfx8Compute second(rig.card, rig.clock, c);
+  CHECK(second.attach(rig.compute_memory()) == AmdGfx8Compute::Result::Ok);
+  const size_t writes = rig.card.writes.size();
+  CHECK(!second.set_eop_interrupt(true) && rig.card.writes.size() == writes);
+}
+
 int main() {
   test_start();
   test_stop();
+  test_eop_interrupt();
   test_fewer_queues();
   test_other_pipe_and_doorbells();
   test_failures();

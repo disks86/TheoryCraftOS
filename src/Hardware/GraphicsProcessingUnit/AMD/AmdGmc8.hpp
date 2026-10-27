@@ -99,6 +99,9 @@ class AmdGmc8 {
   // Maps the pages at `gpu_page_addresses` (each page aligned, inside the 40-bit space) to the GART pages from `first_page` on, with `pte_flags`, then flushes the host data
   // path and the GPU's TLBs. False if the range leaves the GART or an address is not a valid page (nothing is written then).
   bool map(uint64_t first_page, ArrayView<const uint64_t> gpu_page_addresses, uint64_t pte_flags);
+  // gmc_v8_0_vm_fault_interrupt_state: the seven *_PROTECTION_FAULT_ENABLE_INTERRUPT bits of VM_CONTEXT0_CNTL (the system context) and VM_CONTEXT1_CNTL (the VMs), so a fault
+  // posts to the interrupt ring. Read-modify-write; needs start() (the registers are the ones it programmed).
+  bool set_fault_interrupts(bool enable);
   // Makes `count` GART pages invalid again.
   bool unmap(uint64_t first_page, uint64_t count);
   // The GPU address of a GART page (plan.gart_start + page * 4 KiB).

@@ -234,11 +234,16 @@ bool AmdVegaM::bring_up(const Inputs& in) {
   sdma_memory.doorbells = in.doorbells;
   const AmdSdma3::Result sdma_result = sdma_->start(sdma_memory);
   if (sdma_result != AmdSdma3::Result::Ok) return fail(Step::Sdma, AmdSdma3::result_name(sdma_result));
+  // The interrupt sources, at the places the driver turns them on (ring init and late_init): the graphics ring's, the compute pipe's, the SDMA engines' and the memory controller's.
+  gfx_->set_interrupts(true);
+  compute_->set_eop_interrupt(true);
+  sdma_->set_trap_interrupts(true);
+  gmc_->set_fault_interrupts(true);
   step_ = Step::Done;
 
   status_.assign("GART ");
   status_.append_uint(gart_plan_.gart_size / kMiB);
-  status_.append(" MiB, interrupt ring, microcode loaded by the SMC, graphics engine with ");
+  status_.append(" MiB, interrupt ring and sources, microcode loaded by the SMC, graphics engine with ");
   status_.append_uint(compute_config.queues);
   status_.append(" compute queues, 2 SDMA engines");
   return true;
@@ -246,6 +251,12 @@ bool AmdVegaM::bring_up(const Inputs& in) {
 
 void AmdVegaM::shutdown() {
   display_ = UniquePointer<amd_dce11::Display>();   // (puts the firmware's framebuffer back)
+  if (up()) {   // (amdgpu_irq_put in the blocks' hw_fini, before the engines stop)
+    gmc_->set_fault_interrupts(false);
+    sdma_->set_trap_interrupts(false);
+    compute_->set_eop_interrupt(false);
+    gfx_->set_interrupts(false);
+  }
   if (sdma_) sdma_->stop();
   sdma_ = UniquePointer<AmdSdma3>();
   if (gfx_ && compute_) gfx_->stop();

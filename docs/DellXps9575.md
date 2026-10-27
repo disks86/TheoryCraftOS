@@ -347,8 +347,13 @@ What a handler does: the driver passes fences to its scheduler and faults to its
 shown to the sink, and a fault wedges the ring it came from (`AmdGfx8::fault`, `AmdGfx8Compute::fault(me, pipe, queue)`, `AmdSdma3::fault`) until the engine is started again. The desktop loop calls
 `service_interrupts()` (under `TCOS_AMD_VEGAM`), because the card's interrupt line is not connected: no MSI is set up, so nothing wakes the CPU and a fault is seen at the next pass of the loop.
 
-Not done: the sources' own enables (`CP_INT_CNTL_RING0`, the compute pipes' EOP enables, the SDMA trap enable, the memory controller's fault interrupts) are not programmed, so a real card posts nothing to the ring until
-they are; the display's interrupts (vblank, page flip, hot plug) and the UVD/VCE ones are not dispatched; no PCI MSI; no ring reset or recovery after a fault (the engine has to be restarted).
+The sources are turned on at the end of `AmdVegaM::bring_up` (after the SDMA ring tests) and off at the start of `shutdown`, each a read-modify-write like the driver's `amdgpu_irq_get`/`put` state functions:
+`AmdGfx8::set_interrupts` (`CP_INT_CNTL_RING0` TIME_STAMP, PRIV_REG, PRIV_INSTR: `gfx_v8_0_set_gfx_eop_interrupt_state`, `_set_priv_reg_fault_state`, `_set_priv_inst_fault_state`),
+`AmdGfx8Compute::set_eop_interrupt` (TIME_STAMP of `CP_ME1_PIPEn_INT_CNTL` for the queues' pipe; MEC 1 only, as amdgpu leaves MEC 2 to amdkfd), `AmdSdma3::set_trap_interrupts` (`SDMA0_CNTL.TRAP_ENABLE` of both
+engines) and `AmdGmc8::set_fault_interrupts` (the seven `*_PROTECTION_FAULT_ENABLE_INTERRUPT` bits of `VM_CONTEXT0_CNTL` and `VM_CONTEXT1_CNTL`). `scripts/check_irq_port.py` checks the registers and fields against the
+kernel's state functions. The illegal-instruction sources have no enable in the driver (always on).
+
+Not done: the CP ECC error (`gfx_v8_0_set_cp_ecc_int_state`, 13 registers) and SQ interrupts are not enabled (source 197 is classified but a real card will not post it); the display's interrupts (vblank, page flip, hot plug) and the UVD/VCE ones are not dispatched; no PCI MSI; no ring reset or recovery after a fault (the engine has to be restarted).
 
 ## Radeon RX Vega M: UVD 6.3
 

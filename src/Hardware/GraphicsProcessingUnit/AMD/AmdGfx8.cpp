@@ -159,6 +159,12 @@ void AmdGfx8::wait_for_rlc_serdes(uint32_t timeout_us) {
   }
 }
 
+void AmdGfx8::set_interrupts(bool enable) {
+  const uint32_t bits = CP_INT_CNTL_RING0__TIME_STAMP_INT_ENABLE_MASK | CP_INT_CNTL_RING0__PRIV_REG_INT_ENABLE_MASK | CP_INT_CNTL_RING0__PRIV_INSTR_INT_ENABLE_MASK;
+  const uint32_t tmp = rd(mmCP_INT_CNTL_RING0);
+  wr(mmCP_INT_CNTL_RING0, enable ? (tmp | bits) : (tmp & ~bits));
+}
+
 void AmdGfx8::gui_idle_interrupt(bool enable) {
   uint32_t tmp = rd(mmCP_INT_CNTL_RING0);
   const uint32_t bits = CP_INT_CNTL_RING0__CNTX_BUSY_INT_ENABLE_MASK | CP_INT_CNTL_RING0__CNTX_EMPTY_INT_ENABLE_MASK | CP_INT_CNTL_RING0__CMP_BUSY_INT_ENABLE_MASK |

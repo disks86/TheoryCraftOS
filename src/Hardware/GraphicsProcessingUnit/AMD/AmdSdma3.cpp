@@ -281,6 +281,14 @@ AmdSdma3::Result AmdSdma3::start(const Memory& memory, uint32_t timeout_us) {
   return Result::Ok;
 }
 
+void AmdSdma3::set_trap_interrupts(bool enable) {
+  for (uint32_t i = 0; i < kInstances; ++i) {
+    uint32_t sdma_cntl = rd(mmSDMA0_CNTL + kRegisterOffset[i]);
+    sdma_cntl = REG_SET_FIELD(sdma_cntl, SDMA0_CNTL, TRAP_ENABLE, enable ? 1 : 0);
+    wr(mmSDMA0_CNTL + kRegisterOffset[i], sdma_cntl);
+  }
+}
+
 void AmdSdma3::stop() {
   ctx_switch_enable(false);
   enable(false);
