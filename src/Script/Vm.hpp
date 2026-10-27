@@ -47,7 +47,7 @@ class IHost {
 
 class Vm {
  public:
-  static constexpr uint32_t kStackValues = 16384, kMaxFrames = 256;
+  static constexpr uint32_t kStackValues = 65536, kMaxFrames = 2048;
 
   Vm(allocators::IAllocator& allocator, IHost* host);
   ~Vm();

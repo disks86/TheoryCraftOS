@@ -8082,7 +8082,7 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     var emptyList = function (C) { return function () { return Object.create(C.prototype); }; };
     put('plugins', function () { return g.navigator.plugins; });
     put('applets', function () { return []; });
-    put('all', function () { var l = Array.prototype.slice.call(this.getElementsByTagName('*')); l.namedItem = function (n) { return doc.getElementById(n) || doc.getElementsByName(n)[0] || null; }; return l; });
+    put('all', function () { var l = Array.prototype.slice.call(this.getElementsByTagName('*')); l.namedItem = function (n) { return doc.getElementById(n) || doc.getElementsByName(n)[0] || null; }; __htmldda(l); return l; });
     put('wasDiscarded', function () { return false; });
     put('pointerLockElement', function () { return null; });
     put('xmlVersion', function () { return this.contentType === 'text/html' ? null : '1.0'; }, function () { });

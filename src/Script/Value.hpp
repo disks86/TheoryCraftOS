@@ -181,6 +181,7 @@ struct JsObject : Cell {
   bool frozen = false;         // Object.freeze (also set on an iterator object whose next() is called: see Vm.cpp)
   bool non_extensible = false; // Object.preventExtensions: no property can be added
   bool sealed = false;         // Object.seal: ... and none can be deleted or reconfigured
+  bool htmldda = false;        // document.all: typeof says undefined, it is falsy and loosely equal to null
   bool uninit_this = false;    // a derived class's `this` before super() has returned (a ReferenceError to use it)
   bool constructs = false;     // a native that `new` accepts although it has no prototype property (Proxy); other natives are methods
   JsObject* proto = nullptr;
