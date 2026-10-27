@@ -2523,20 +2523,6 @@ typedef struct _OFSTRUCT { BYTE cBytes, fFixedDisk; WORD nErrCode, Reserved1, Re
 #define OF_READWRITE_ 2
 #define OF_CREATE_ 0x1000
 #define OF_EXIST_ 0x4000
-EXPORT HFILE WINAPI OpenFile(LPCSTR path, LPOFSTRUCT reopen, UINT style) {
-  if (reopen) {
-    memset(reopen, 0, sizeof(*reopen));
-    reopen->cBytes = sizeof(*reopen);
-    size_t_ i = 0;
-    for (; path[i] && i + 1 < sizeof(reopen->szPathName); ++i) reopen->szPathName[i] = path[i];
-  }
-  const DWORD access = (style & 3) == OF_WRITE_ ? GENERIC_WRITE : (style & 3) == OF_READWRITE_ ? GENERIC_READ | GENERIC_WRITE : GENERIC_READ;
-  const DWORD disposition = (style & OF_CREATE_) ? CREATE_ALWAYS : OPEN_EXISTING;
-  HANDLE h = CreateFileA(path, (style & OF_EXIST_) ? 0 : access, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, disposition, 0, NULL);
-  if (h == INVALID_HANDLE_VALUE) { if (reopen) reopen->nErrCode = (WORD)GetLastError(); return (HFILE)-1; }
-  if (style & OF_EXIST_) { CloseHandle(h); return 0; }
-  return (HFILE)(ULONG_PTR)h;
-}
 /* Beep: this OS has no PC speaker driver, so there is nothing to make a sound with; succeeding (not failing outright) matches how real Windows behaves when the
  * speaker driver isn't present either. CancelIo/CancelIoEx/CancelSynchronousIo: every I/O call here is already done by the time it returns (there is no real
  * asynchronous I/O to cancel), so there is never anything pending to find. */
@@ -3081,3 +3067,4 @@ EXPORT BOOL WINAPI DllMain(HANDLE module, DWORD reason, PVOID reserved) {
 #include "extra.inc"
 #include "extra2.inc"
 #include "extra3.inc"
+#include "legacy.inc"
