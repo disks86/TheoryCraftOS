@@ -26,7 +26,7 @@ namespace process::windowsabi {
 // The access a PAGE_* constant grants, as the checks on sections and views see it (bit 1 read, 2 write, 4 execute): copy-on-write pages read, a page that can only execute
 // reads as well, no access and anything unknown grant nothing.
 constexpr uint8_t page_access(uint32_t page) {
-  switch (page) {
+  switch (page & 0xFF) {      // (the modifiers PAGE_GUARD, PAGE_NOCACHE and PAGE_WRITECOMBINE do not change the access)
     case 0x02: case 0x08: return 1;
     case 0x04: return 3;
     case 0x10: case 0x20: case 0x80: return 5;

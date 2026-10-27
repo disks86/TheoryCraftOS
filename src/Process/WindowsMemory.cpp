@@ -39,7 +39,8 @@ constexpr uint64_t kChunk = 2048;      // how much of another process's memory i
 
 // PAGE_* -> our permission bits. Modifier flags (guard, no-cache, write-combine) are not supported.
 bool page_protection(uint32_t page, uint8_t* out) {
-  switch (page) {
+  if (page & ~uint32_t{0x7FF}) return false;
+  switch (page & 0xFF) {
     case kPageNoAccess: *out = 0; return true;
     case kPageReadOnly: *out = kProtRead; return true;
     case kPageReadWrite: *out = kProtRead | kProtWrite; return true;
@@ -85,14 +86,26 @@ void set_private_attributes(AddressSpace& space, uint64_t base, uint64_t size, u
 }
 
 uint32_t vm_allocate(Process& target, uint64_t* base_io, uint64_t* size_io, uint32_t type, uint32_t protect) {
+  if (type == (kMemReserve | 0x400000)) type = kMemReserve;      // MEM_PHYSICAL (address windowing): a plain reservation
   AddressSpace* space = target.address_space();
   uint64_t base = *base_io, size = *size_io;
   uint8_t prot = 0;
+  constexpr uint32_t kMemReset = 0x80000, kMemResetUndo = 0x1000000;
+  if (type & (kMemReset | kMemResetUndo)) {      // the contents of the pages may be dropped; nothing here keeps them, so the pages only have to exist
+    if (!space || base == 0 || size == 0 || (type & ~uint32_t{kMemReset | kMemResetUndo})) return kStatusInvalidParameter;
+    uint64_t reset_size = 0;
+    const uint64_t reset_base = AddressSpace::round_down(base);
+    if (!AddressSpace::round_up(size + (base - reset_base), &reset_size)) return kStatusInvalidParameter;
+    if (!space->check(reset_base, reset_size, 0)) return kStatusConflictingAddresses;
+    *base_io = reset_base;
+    *size_io = reset_size;
+    return kStatusSuccess;
+  }
   if (!(type & (kMemCommit | kMemReserve)) || (type & ~uint32_t{kMemCommit | kMemReserve | 0x100000 /*MEM_TOP_DOWN: the search direction is ours to choose*/})) return kStatusInvalidParameter;
   if (!page_protection(protect, &prot)) return kStatusInvalidPageProtection;
   if (!space) return kStatusNoMemory;
   if (size == 0) return kStatusInvalidParameter;
-  if (protect == kPageWriteCopy || protect == kPageExecuteWriteCopy) {      // private memory is not copy-on-write; only a view can be (committing into a view is checked below)
+  if ((protect & 0xFF) == kPageWriteCopy || (protect & 0xFF) == kPageExecuteWriteCopy) {      // private memory is not copy-on-write; only a view can be (committing into a view is checked below)
     PageAttributes existing;
     if (base == 0 || !space->attributes_at(AddressSpace::round_down(base), &existing) || existing.type != PageAttributes::Mapped) return kStatusInvalidPageProtection;
   }
@@ -164,13 +177,21 @@ uint32_t vm_protect(Process& target, uint64_t* base_io, uint64_t* size_io, uint3
   if (!space) return kStatusNoMemory;
   uint64_t rounded = 0;
   const uint64_t base = AddressSpace::round_down(*base_io);
-  if (protect == kPageWriteCopy || protect == kPageExecuteWriteCopy) {      // only a view can be copy-on-write
+  if ((protect & 0xFF) == kPageWriteCopy || (protect & 0xFF) == kPageExecuteWriteCopy) {      // only a view can be copy-on-write
     PageAttributes existing;
     if (!space->attributes_at(base, &existing) || existing.type != PageAttributes::Mapped) return kStatusInvalidPageProtection;
   }
   if (*size_io == 0 || !AddressSpace::round_up(*size_io, &rounded)) return kStatusInvalidParameter;
   uint8_t old = 0;
   if (!space->protection_at(base, &old)) return kStatusConflictingAddresses;
+  {      // every page of the range has to be committed
+    AddressSpace::RegionInfo region;
+    for (uint64_t i = 0; space->region_at(i, &region); ++i) {
+      if (region.base + region.size <= base) continue;
+      if (region.base >= base + rounded) break;
+      if (region.attributes.protect != 0 && region.attributes.reserved) return kStatusConflictingAddresses;
+    }
+  }
   *old_protect = effective_protect(*space, base);
   PageAttributes attributes;
   if (space->attributes_at(base, &attributes) && attributes.type == PageAttributes::Mapped && (page_access(protect) & ~page_access(attributes.allocation_protect))) return kStatusInvalidParameter;
