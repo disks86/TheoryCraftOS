@@ -9446,9 +9446,7 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
         var div = d.createElementNS(ns, 'div'); div.setAttribute('style', 'font-family:monospace;font-size:12px'); div.textContent = 'error at offset ' + e.position + ': ' + e.message;
         var h32 = d.createElementNS(ns, 'h3'); h32.textContent = 'Below is a rendering of the page up to the first error.';
         pe.appendChild(h3); pe.appendChild(div); pe.appendChild(h32);
-        var root = d.createElementNS(null, 'html');
-        root.appendChild(pe);
-        d.appendChild(root);
+        d.appendChild(pe);   // (the document element is the error, as in Gecko; script finds it with getElementsByTagName('parsererror'))
       }
       return d;
     };
@@ -9685,9 +9683,9 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     try { return base === undefined ? new g.URL(url) : new g.URL(url, base); } catch (e) { return null; }
   });
 
-  hide(g, '__doctype_of', function (d) {
+  hide(g, '__doctype_of', function (d, name, publicId, systemId) {
     var t = d.__doctype;
-    if (!t) { t = document.implementation.createDocumentType('html', '', ''); Object.defineProperty(d, '__doctype', { value: t }); }
+    if (!t) { t = document.implementation.createDocumentType(name === undefined ? 'html' : name, publicId || '', systemId || ''); Object.defineProperty(d, '__doctype', { value: t }); }
     return t;
   });
 
