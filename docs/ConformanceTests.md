@@ -45,6 +45,14 @@ gaps: `grep -c xfail tests/data/wpt/*.js`. The largest ones today:
   apart), all 2125 named character references are known (`src/Dom/EntityTable.inc`, generated from the standard's table, including the two code point ones), a
   malformed XML document from `DOMParser` has a `parsererror` document element, `document.defaultView` is `null` outside the page's own document, and
   `outerHTML` on the document element throws `NoModificationAllowedError`. `html_parser.js` has no xfail left.
+- **Platform interfaces** (`web_apis.js`, no xfail left): every interface of the idlharness table exists with its parent and members. Real behaviour was added
+  for `CharacterData` data editing, `NamedNodeMap` (`setNamedItem`, `removeNamedItem`, `*NS`), `DocumentType` (a `Node`), `HTMLDocument` (the prototype of the page's
+  document), `Document.parseHTMLUnsafe`, `ElementInternals`/`ValidityState` via `attachInternals()`, `URLPattern` (names, `*`, `(regexp)`, `{groups}` and `? + *`
+  modifiers, base URLs; not the full constructor-string grammar), SVG `getPathData()` and polygon/polyline `points`, `Highlight`/`CSS.highlights` (registered, not painted),
+  `form.elements`/`select.options` as `HTMLFormControlsCollection`/`HTMLOptionsCollection` (`add`, `remove`, `selectedIndex`; a form not in the document lists no controls), `dialog.requestClose()`, `getModifierState`, `PerformanceObserver.supportedEntryTypes`. Interface-only (calling the members is an illegal invocation, or there is
+  nothing behind them): `MediaRecorder` (the constructor throws `NotSupportedError`: no encoder), `Worklet`, the worker global scope interfaces, `FileSystem*Handle`, `PublicKeyCredential`,
+  `OffscreenCanvas.transferToImageBitmap`; `createScriptProcessor` returns a gain node whose `onaudioprocess` is never called. Interface objects are now not
+  enumerable and have a read-only `prototype`.
 - **CSS**: closed: `getComputedStyle` reports table parts (with `cellpadding`), controls, closed `dialog`, blockified `display`, `em`/`i`, `pre`, `ol`, link colour,
   `sub`/`sup`, `mark`; the properties that used to read `""` (`text-indent`, `white-space` longhands, `word-break`, `overflow-wrap`, `text-overflow`, `quotes`,
   `tab-size`, `list-style-position`, counters, `content`, `grid-*-start/end`, `column-count`, `mix-blend-mode`, `contain`, `accent-color`, `appearance`, `will-change`,

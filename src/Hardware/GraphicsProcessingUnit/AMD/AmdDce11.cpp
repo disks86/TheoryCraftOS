@@ -36,6 +36,26 @@ namespace {
 constexpr uint32_t kCrtcOffsets[kMaxCrtcs] = {0x1b9c - 0x1b9c, 0x1d9c - 0x1b9c, 0x1f9c - 0x1b9c, 0x419c - 0x1b9c, 0x439c - 0x1b9c, 0x459c - 0x1b9c};
 // GRPH_CONTROL: the 32-bit ARGB8888 format of dce_v11_0_crtc_do_set_base (GRPH_DEPTH 2, GRPH_FORMAT 0) and linear addressing (array mode 0).
 constexpr uint32_t kDepth32 = 2, kFormatArgb8888 = 0, kArrayLinear = 0;
+// HPDn_REGISTER_OFFSET (vid.h)
+constexpr uint32_t kHpdOffsets[Interrupts::kMaxHpd] = {0x1898 - 0x1898, 0x18a0 - 0x1898, 0x18a8 - 0x1898, 0x18b0 - 0x1898, 0x18b8 - 0x1898, 0x18c0 - 0x1898};
+
+// interrupt_status_offsets of dce_v11_0.c: the register and bits that say which controller's vertical blank and line and which hot plug pin interrupted.
+struct InterruptStatus {
+  uint32_t reg, vblank, vline, hpd;
+};
+const InterruptStatus kInterruptStatus[kMaxCrtcs] = {
+    {mmDISP_INTERRUPT_STATUS, DISP_INTERRUPT_STATUS__LB_D1_VBLANK_INTERRUPT_MASK, DISP_INTERRUPT_STATUS__LB_D1_VLINE_INTERRUPT_MASK, DISP_INTERRUPT_STATUS__DC_HPD1_INTERRUPT_MASK},
+    {mmDISP_INTERRUPT_STATUS_CONTINUE, DISP_INTERRUPT_STATUS_CONTINUE__LB_D2_VBLANK_INTERRUPT_MASK, DISP_INTERRUPT_STATUS_CONTINUE__LB_D2_VLINE_INTERRUPT_MASK,
+     DISP_INTERRUPT_STATUS_CONTINUE__DC_HPD2_INTERRUPT_MASK},
+    {mmDISP_INTERRUPT_STATUS_CONTINUE2, DISP_INTERRUPT_STATUS_CONTINUE2__LB_D3_VBLANK_INTERRUPT_MASK, DISP_INTERRUPT_STATUS_CONTINUE2__LB_D3_VLINE_INTERRUPT_MASK,
+     DISP_INTERRUPT_STATUS_CONTINUE2__DC_HPD3_INTERRUPT_MASK},
+    {mmDISP_INTERRUPT_STATUS_CONTINUE3, DISP_INTERRUPT_STATUS_CONTINUE3__LB_D4_VBLANK_INTERRUPT_MASK, DISP_INTERRUPT_STATUS_CONTINUE3__LB_D4_VLINE_INTERRUPT_MASK,
+     DISP_INTERRUPT_STATUS_CONTINUE3__DC_HPD4_INTERRUPT_MASK},
+    {mmDISP_INTERRUPT_STATUS_CONTINUE4, DISP_INTERRUPT_STATUS_CONTINUE4__LB_D5_VBLANK_INTERRUPT_MASK, DISP_INTERRUPT_STATUS_CONTINUE4__LB_D5_VLINE_INTERRUPT_MASK,
+     DISP_INTERRUPT_STATUS_CONTINUE4__DC_HPD5_INTERRUPT_MASK},
+    {mmDISP_INTERRUPT_STATUS_CONTINUE5, DISP_INTERRUPT_STATUS_CONTINUE5__LB_D6_VBLANK_INTERRUPT_MASK, DISP_INTERRUPT_STATUS_CONTINUE5__LB_D6_VLINE_INTERRUPT_MASK,
+     DISP_INTERRUPT_STATUS_CONTINUE5__DC_HPD6_INTERRUPT_MASK},
+};
 }  // namespace
 
 uint32_t Plane::offset() const { return kCrtcOffsets[crtc_]; }
@@ -158,6 +178,94 @@ void Display::disengage() {
   firmware_view(firmware_, memory_.size()).copy_from(memory_);
   plane_.restore();
   memory_ = ByteView();
+}
+
+void Interrupts::set_pageflip(uint32_t crtc, bool enable) {
+  if (crtc >= kMaxCrtcs) return;
+  const uint32_t reg = r_.read(mmGRPH_INTERRUPT_CONTROL + kCrtcOffsets[crtc]);
+  r_.write(mmGRPH_INTERRUPT_CONTROL + kCrtcOffsets[crtc], enable ? (reg | GRPH_INTERRUPT_CONTROL__GRPH_PFLIP_INT_MASK_MASK) : (reg & ~GRPH_INTERRUPT_CONTROL__GRPH_PFLIP_INT_MASK_MASK));
+}
+
+void Interrupts::set_vblank(uint32_t crtc, bool enable) {
+  if (crtc >= kMaxCrtcs) return;
+  uint32_t mask = r_.read(mmLB_INTERRUPT_MASK + kCrtcOffsets[crtc]);
+  mask = REG_SET_FIELD(mask, LB_INTERRUPT_MASK, VBLANK_INTERRUPT_MASK, enable ? 1 : 0);
+  r_.write(mmLB_INTERRUPT_MASK + kCrtcOffsets[crtc], mask);
+}
+
+bool Interrupts::hpd_sense(uint32_t pin) {
+  return pin < kMaxHpd && (r_.read(mmDC_HPD_INT_STATUS + kHpdOffsets[pin]) & DC_HPD_INT_STATUS__DC_HPD_SENSE_MASK) != 0;
+}
+
+void Interrupts::hpd_set_polarity(uint32_t pin) {
+  if (pin >= kMaxHpd) return;
+  const bool connected = hpd_sense(pin);
+  uint32_t tmp = r_.read(mmDC_HPD_INT_CONTROL + kHpdOffsets[pin]);
+  tmp = REG_SET_FIELD(tmp, DC_HPD_INT_CONTROL, DC_HPD_INT_POLARITY, connected ? 0 : 1);
+  r_.write(mmDC_HPD_INT_CONTROL + kHpdOffsets[pin], tmp);
+}
+
+void Interrupts::ack_hpd(uint32_t pin) {
+  if (pin >= kMaxHpd) return;
+  uint32_t tmp = r_.read(mmDC_HPD_INT_CONTROL + kHpdOffsets[pin]);
+  tmp = REG_SET_FIELD(tmp, DC_HPD_INT_CONTROL, DC_HPD_INT_ACK, 1);
+  r_.write(mmDC_HPD_INT_CONTROL + kHpdOffsets[pin], tmp);
+}
+
+void Interrupts::hpd_set_interrupt(uint32_t pin, bool enable) {
+  if (pin >= kMaxHpd) return;
+  uint32_t tmp = r_.read(mmDC_HPD_INT_CONTROL + kHpdOffsets[pin]);
+  tmp = REG_SET_FIELD(tmp, DC_HPD_INT_CONTROL, DC_HPD_INT_EN, enable ? 1 : 0);
+  r_.write(mmDC_HPD_INT_CONTROL + kHpdOffsets[pin], tmp);
+}
+
+void Interrupts::hpd_init(uint32_t pin) {
+  if (pin >= kMaxHpd) return;
+  uint32_t tmp = r_.read(mmDC_HPD_CONTROL + kHpdOffsets[pin]);
+  tmp = REG_SET_FIELD(tmp, DC_HPD_CONTROL, DC_HPD_EN, 1);
+  r_.write(mmDC_HPD_CONTROL + kHpdOffsets[pin], tmp);
+
+  tmp = r_.read(mmDC_HPD_TOGGLE_FILT_CNTL + kHpdOffsets[pin]);
+  tmp = REG_SET_FIELD(tmp, DC_HPD_TOGGLE_FILT_CNTL, DC_HPD_CONNECT_INT_DELAY, kHpdConnectDelayMs);
+  tmp = REG_SET_FIELD(tmp, DC_HPD_TOGGLE_FILT_CNTL, DC_HPD_DISCONNECT_INT_DELAY, kHpdDisconnectDelayMs);
+  r_.write(mmDC_HPD_TOGGLE_FILT_CNTL + kHpdOffsets[pin], tmp);
+
+  ack_hpd(pin);
+  hpd_set_polarity(pin);
+  hpd_set_interrupt(pin, true);   // (amdgpu_irq_get -> dce_v11_0_set_hpd_irq_state)
+}
+
+void Interrupts::hpd_fini(uint32_t pin) {
+  if (pin >= kMaxHpd) return;
+  uint32_t tmp = r_.read(mmDC_HPD_CONTROL + kHpdOffsets[pin]);
+  tmp = REG_SET_FIELD(tmp, DC_HPD_CONTROL, DC_HPD_EN, 0);
+  r_.write(mmDC_HPD_CONTROL + kHpdOffsets[pin], tmp);
+  hpd_set_interrupt(pin, false);   // (amdgpu_irq_put)
+}
+
+bool Interrupts::vblank_asserted(uint32_t crtc) { return crtc < kMaxCrtcs && (r_.read(kInterruptStatus[crtc].reg) & kInterruptStatus[crtc].vblank) != 0; }
+bool Interrupts::vline_asserted(uint32_t crtc) { return crtc < kMaxCrtcs && (r_.read(kInterruptStatus[crtc].reg) & kInterruptStatus[crtc].vline) != 0; }
+bool Interrupts::hpd_asserted(uint32_t pin) { return pin < kMaxHpd && (r_.read(kInterruptStatus[pin].reg) & kInterruptStatus[pin].hpd) != 0; }
+
+void Interrupts::ack_vblank(uint32_t crtc) {
+  if (crtc >= kMaxCrtcs) return;
+  uint32_t tmp = r_.read(mmLB_VBLANK_STATUS + kCrtcOffsets[crtc]);
+  tmp = REG_SET_FIELD(tmp, LB_VBLANK_STATUS, VBLANK_ACK, 1);
+  r_.write(mmLB_VBLANK_STATUS + kCrtcOffsets[crtc], tmp);
+}
+
+void Interrupts::ack_vline(uint32_t crtc) {
+  if (crtc >= kMaxCrtcs) return;
+  uint32_t tmp = r_.read(mmLB_VLINE_STATUS + kCrtcOffsets[crtc]);
+  tmp = REG_SET_FIELD(tmp, LB_VLINE_STATUS, VLINE_ACK, 1);
+  r_.write(mmLB_VLINE_STATUS + kCrtcOffsets[crtc], tmp);
+}
+
+bool Interrupts::ack_pageflip(uint32_t crtc) {
+  if (crtc >= kMaxCrtcs) return false;
+  if (!(r_.read(mmGRPH_INTERRUPT_STATUS + kCrtcOffsets[crtc]) & GRPH_INTERRUPT_STATUS__GRPH_PFLIP_INT_OCCURRED_MASK)) return false;
+  r_.write(mmGRPH_INTERRUPT_STATUS + kCrtcOffsets[crtc], GRPH_INTERRUPT_STATUS__GRPH_PFLIP_INT_CLEAR_MASK);
+  return true;
 }
 
 bool Presenter::start(INativeDisplay& display, ByteView video, uint32_t pitch_bytes, uint32_t height) {

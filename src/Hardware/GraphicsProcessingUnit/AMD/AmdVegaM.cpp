@@ -179,7 +179,9 @@ bool AmdVegaM::bring_up(const Inputs& in) {
   // The interrupt handler.
   AmdIh3::Config ih_config;
   ih_config.ring_in_video_memory = true;
+  ih_config.msi = in.msi;
   ih_ = UniquePointer<AmdIh3>::make(allocator, *in.registers, *in.clock, ih_config);
+  irq_ = UniquePointer<AmdIrq>::make(allocator, *in.registers);
   if (!ih_) return fail(Step::MemoryController, "out of memory");
   AmdIh3::Memory ih_memory;
   ih_memory.ring_gpu_address = block_gpu_ + layout_.ih;
@@ -233,24 +235,53 @@ bool AmdVegaM::bring_up(const Inputs& in) {
   sdma_memory.doorbells = in.doorbells;
   const AmdSdma3::Result sdma_result = sdma_->start(sdma_memory);
   if (sdma_result != AmdSdma3::Result::Ok) return fail(Step::Sdma, AmdSdma3::result_name(sdma_result));
+  // The interrupt sources, at the places the driver turns them on (ring init and late_init): the graphics ring's, the compute pipe's, the SDMA engines' and the memory controller's.
+  gfx_->set_interrupts(true);
+  gfx_->set_ecc_interrupts(true);   // (gfx_v8_0_late_init: priv reg, priv inst, ECC, SQ)
+  gfx_->set_sq_interrupts(true);
+  compute_->set_eop_interrupt(true);
+  sdma_->set_trap_interrupts(true);
+  gmc_->set_fault_interrupts(true);
+  // The display engine's: page flips of every controller (dce_v11_0_pageflip_interrupt_init) and the hot plug pins (dce_v11_0_hpd_init); vertical blank only on request.
+  display_irq_ = UniquePointer<amd_dce11::Interrupts>::make(allocator, *in.registers);
+  if (!display_irq_) return fail(Step::Sdma, "out of memory");
+  for (uint32_t crtc = 0; crtc < amd_dce11::kMaxCrtcs; ++crtc) display_irq_->set_pageflip(crtc, true);
+  for (uint32_t pin = 0; pin < amd_dce11::Interrupts::kMaxHpd; ++pin)
+    if (in.hpd_pins >> pin & 1) display_irq_->hpd_init(pin);
   step_ = Step::Done;
 
   status_.assign("GART ");
   status_.append_uint(gart_plan_.gart_size / kMiB);
-  status_.append(" MiB, interrupt ring, microcode loaded by the SMC, graphics engine with ");
+  status_.append(" MiB, interrupt ring and sources, microcode loaded by the SMC, graphics engine with ");
   status_.append_uint(compute_config.queues);
   status_.append(" compute queues, 2 SDMA engines");
   return true;
 }
 
 void AmdVegaM::shutdown() {
+  set_vblank_interrupt(false);
+  if (display_irq_) {   // (dce_v11_0_hw_fini: the hot plug pins and the page flip interrupts)
+    for (uint32_t pin = 0; pin < amd_dce11::Interrupts::kMaxHpd; ++pin)
+      if (inputs_.hpd_pins >> pin & 1) display_irq_->hpd_fini(pin);
+    for (uint32_t crtc = 0; crtc < amd_dce11::kMaxCrtcs; ++crtc) display_irq_->set_pageflip(crtc, false);
+  }
+  display_irq_ = UniquePointer<amd_dce11::Interrupts>();
   display_ = UniquePointer<amd_dce11::Display>();   // (puts the firmware's framebuffer back)
+  if (up()) {   // (amdgpu_irq_put in the blocks' hw_fini, before the engines stop)
+    gmc_->set_fault_interrupts(false);
+    sdma_->set_trap_interrupts(false);
+    compute_->set_eop_interrupt(false);
+    gfx_->set_interrupts(false);
+    gfx_->set_ecc_interrupts(false);
+    gfx_->set_sq_interrupts(false);
+  }
   if (sdma_) sdma_->stop();
   sdma_ = UniquePointer<AmdSdma3>();
   if (gfx_ && compute_) gfx_->stop();
   gfx_ = UniquePointer<AmdGfx8>();
   compute_ = UniquePointer<AmdGfx8Compute>();
   if (ih_) ih_->stop();
+  irq_ = UniquePointer<AmdIrq>();
   ih_ = UniquePointer<AmdIh3>();
   if (gmc_) gmc_->stop();
   gmc_ = UniquePointer<AmdGmc8>();
@@ -333,6 +364,24 @@ bool AmdVegaM::download(ByteView destination, uint64_t offset, uint32_t instance
   return transfer(physical_address(inputs_.system_addresses, destination.data()), destination.size(), offset, false, instance, timeout_us);
 }
 
+uint32_t AmdVegaM::service_interrupts(uint32_t max_vectors) {
+  if (!up() || !ih_ || !irq_) return 0;
+  return irq_->process(*ih_, this, max_vectors);
+}
+
+// The driver's handlers for the faults hand the ring to the scheduler's timeout handling (drm_sched_fault); wedging the ring is that here.
+void AmdVegaM::on_event(const AmdIrq::Event& event) {
+  switch (event.kind) {
+    case AmdIrq::Kind::GfxPrivilegedRegister:
+    case AmdIrq::Kind::GfxPrivilegedInstruction:
+      if (event.me == 0) gfx_->fault();
+      else if (event.me == 1 || event.me == 2) compute_->fault(event.me, event.pipe, event.queue);
+      break;
+    case AmdIrq::Kind::SdmaIllegalInstruction: sdma_->fault(event.engine); break;
+    default: break;
+  }
+}
+
 bool AmdVegaM::engage_display(const amd_dce11::FirmwareFramebuffer& firmware, ByteView* memory) {
   if (!up() || layout_.framebuffer_bytes == 0 || !inputs_.allocator) return false;
   display_ = UniquePointer<amd_dce11::Display>();
@@ -343,6 +392,22 @@ bool AmdVegaM::engage_display(const amd_dce11::FirmwareFramebuffer& firmware, By
   return true;
 }
 
-void AmdVegaM::disengage_display() { display_ = UniquePointer<amd_dce11::Display>(); }
+void AmdVegaM::disengage_display() {
+  set_vblank_interrupt(false);
+  display_ = UniquePointer<amd_dce11::Display>();
+}
+
+bool AmdVegaM::set_vblank_interrupt(bool enable) {
+  if (!enable) {
+    if (vblank_crtc_ >= 0 && display_irq_) display_irq_->set_vblank(static_cast<uint32_t>(vblank_crtc_), false);
+    vblank_crtc_ = -1;
+    return true;
+  }
+  if (!display_irq_ || !display_ || !display_->engaged()) return false;
+  set_vblank_interrupt(false);
+  vblank_crtc_ = static_cast<int>(display_->plane().crtc());
+  display_irq_->set_vblank(static_cast<uint32_t>(vblank_crtc_), true);
+  return true;
+}
 
 }  // namespace hardware

@@ -4556,7 +4556,6 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
   alias('CSSStyleDeclaration', probe.style);
   alias('History', g.history);
   alias('Location', g.location);
-  alias('Navigator', g.navigator);
   alias('Storage', g.localStorage);
 
   // ------------------------------------------------------------------------------------------------------------------ small objects pages poke at
@@ -11723,7 +11722,7 @@ const char kFinishPrelude[] = R"JSPRELUDE((function (g) {
   };
   Object.keys(attributes).forEach(function (name) {
     var C = g[name];
-    if (typeof C !== 'function' || C.prototype === null || typeof C.prototype !== 'object') return;
+    if (typeof C !== 'function' || C.prototype === null || typeof C.prototype !== 'object' || C.prototype === Object.prototype) return;
     var proto = C.prototype;
     attributes[name].split(' ').forEach(function (n) {
       if (n in proto) return;
@@ -11738,6 +11737,494 @@ const char kFinishPrelude[] = R"JSPRELUDE((function (g) {
     Object.defineProperty(g[name].prototype, 'disabled', { get: function () { var sh = g.__sheet_of(this); return sh ? sh.disabled : false; },
       set: function (v) { var sh = g.__sheet_of(this); if (sh) sh.disabled = v; }, enumerable: true, configurable: true });
   });
+
+  // ---------------------------------------------------------------------------------------------------------------------- members and interfaces the platform lists
+  // A method that exists on the interface but is only meaningful on an object the engine made (its instances carry their own): called on anything else it is an illegal invocation.
+  var M = function (C, name, fn) { if (typeof C === 'function' && C.prototype && !(name in C.prototype)) def(C.prototype, name, fn); };
+  var S = function (C, name, v) { if (typeof C === 'function' && !(name in C)) def(C, name, v); };
+  var G = function (C, name, fn) { if (typeof C === 'function' && C.prototype && !(name in C.prototype)) Object.defineProperty(C.prototype, name, { get: fn, enumerable: true, configurable: true }); };
+  var illegalCall = function () { throw new TypeError('Illegal invocation'); };
+  var need = function (name, parent) { return typeof g[name] === 'function' ? g[name] : iface(name, parent ? g[parent] : null); };
+  var domErr = function (message, name) { return new DOMException(message, name); };
+  var notSupported = function (what) { return domErr(what, 'NotSupportedError'); };
+
+  (function () {   // CharacterData: the data editing methods
+    var CD = g.CharacterData;
+    var offset = function (s, o, what) {
+      o = o >>> 0;
+      if (o > s.length) throw domErr("Failed to execute '" + what + "' on 'CharacterData': The offset " + o + " is greater than the node's length (" + s.length + ').', 'IndexSizeError');
+      return o;
+    };
+    var need2 = function (n, args, what) { if (args.length < n) throw new TypeError("Failed to execute '" + what + "' on 'CharacterData': " + n + ' arguments required, but only ' + args.length + ' present.'); };
+    M(CD, 'substringData', function (o, c) { need2(2, arguments, 'substringData'); var s = this.data; o = offset(s, o, 'substringData'); return s.slice(o, o + (c >>> 0)); });
+    M(CD, 'replaceData', function (o, c, d) { need2(3, arguments, 'replaceData'); var s = this.data; o = offset(s, o, 'replaceData'); this.data = s.slice(0, o) + String(d) + s.slice(o + (c >>> 0)); });
+    M(CD, 'appendData', function (d) { need2(1, arguments, 'appendData'); this.data = this.data + String(d); });
+    M(CD, 'insertData', function (o, d) { need2(2, arguments, 'insertData'); var s = this.data; o = offset(s, o, 'insertData'); this.data = s.slice(0, o) + String(d) + s.slice(o); });
+    M(CD, 'deleteData', function (o, c) { need2(2, arguments, 'deleteData'); var s = this.data; o = offset(s, o, 'deleteData'); this.data = s.slice(0, o) + s.slice(o + (c >>> 0)); });
+  }());
+
+  // ShadowRoot HTML, Document.parseHTMLUnsafe
+  M(g.ShadowRoot, 'getHTML', function () { return this.innerHTML; });
+  M(g.ShadowRoot, 'setHTMLUnsafe', function (html) { this.innerHTML = String(html); });
+  S(g.Document, 'parseHTMLUnsafe', function (html) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'parseHTMLUnsafe' on 'Document': 1 argument required, but only 0 present.");
+    return new g.DOMParser().parseFromString(String(html), 'text/html');
+  });
+
+  // DocumentType: what createDocumentType and document.doctype give is a node of that interface
+  (function () {
+    var DT = need('DocumentType', 'Node');
+    var DI = g.DOMImplementation && g.DOMImplementation.prototype;
+    if (!DI || !DI.createDocumentType || DI.createDocumentType.__dt) return;
+    var create = DI.createDocumentType;
+    var wrapped = function (name, publicId, systemId) {
+      var t = create.apply(this, arguments);
+      if (t && typeof t === 'object' && Object.getPrototypeOf(t) === Object.prototype) Object.setPrototypeOf(t, DT.prototype);
+      return t;
+    };
+    wrapped.__dt = true;
+    def(DI, 'createDocumentType', wrapped);
+    ['name', 'publicId', 'systemId'].forEach(function (n) { G(DT, n, function () { return undefined; }); });
+  }());
+
+  // collections: HTMLAllCollection.namedItem, the form and select collections as interfaces over HTMLCollection
+  M(g.HTMLAllCollection, 'namedItem', function (name) { return g.HTMLCollection.prototype.namedItem.call(this, name); });
+  M(g.NamedNodeMap, 'getNamedItemNS', function (ns, local) {
+    ns = ns === null || ns === undefined || ns === '' ? null : String(ns); local = String(local);
+    for (var i = 0; i < this.length; i++) if (this[i].localName === local && this[i].namespaceURI === ns) return this[i];
+    return null;
+  });
+  (function () {
+    var NNM = g.NamedNodeMap;
+    var owner = function (map) { if (!map.__owner) throw notSupported('The attribute map has no element.'); return map.__owner; };
+    M(NNM, 'setNamedItem', function (attr) {
+      if (arguments.length < 1) throw new TypeError("Failed to execute 'setNamedItem' on 'NamedNodeMap': 1 argument required, but only 0 present.");
+      var el = owner(this), old = this.getNamedItem(attr.name);
+      if (attr.namespaceURI) el.setAttributeNS(attr.namespaceURI, attr.name, attr.value); else el.setAttribute(attr.name, attr.value);
+      return old;
+    });
+    M(NNM, 'setNamedItemNS', function (attr) { return this.setNamedItem(attr); });
+    M(NNM, 'removeNamedItem', function (name) {
+      var el = owner(this), old = this.getNamedItem(name);
+      if (!old) throw domErr("Failed to execute 'removeNamedItem' on 'NamedNodeMap': No item with name '" + name + "' was found.", 'NotFoundError');
+      el.removeAttribute(old.name);
+      return old;
+    });
+    M(NNM, 'removeNamedItemNS', function (ns, local) {
+      var el = owner(this), old = this.getNamedItemNS(ns, local);
+      if (!old) throw domErr("Failed to execute 'removeNamedItemNS' on 'NamedNodeMap': No item with name '" + local + "' was found.", 'NotFoundError');
+      el.removeAttribute(old.name);
+      return old;
+    });
+  }());
+  need('HTMLFormControlsCollection', 'HTMLCollection');
+  (function () {
+    var HOC = need('HTMLOptionsCollection', 'HTMLCollection');
+    var owner = function (c) { if (!c.__owner) illegalCall(); return c.__owner; };
+    M(HOC, 'add', function (option, before) { owner(this).add(option, before); });
+    M(HOC, 'remove', function (i) { owner(this); var o = this[i >>> 0]; if (o) o.remove(); });
+    Object.defineProperty(HOC.prototype, 'selectedIndex', { get: function () { return owner(this).selectedIndex; }, set: function (v) { owner(this).selectedIndex = v; }, enumerable: true, configurable: true });
+  }());
+  need('DOMStringMap', null);
+  (function () {
+    var L = need('DOMRectList', null);
+    G(L, 'length', function () { return 0; });
+    M(L, 'item', function (i) { return this[i >>> 0] || null; });
+  }());
+  M(g.DOMQuad, 'toJSON', function () { return { p1: this.p1.toJSON(), p2: this.p2.toJSON(), p3: this.p3.toJSON(), p4: this.p4.toJSON() }; });
+  M(g.CSSRuleList, 'item', function (i) { return this[i >>> 0] || null; });
+  M(g.HTMLSelectElement, 'item', function (i) { return this.options.item(i); });
+  M(g.HTMLSelectElement, 'namedItem', function (n) { return this.options.namedItem(n); });
+
+  // events: modifier state, the lists of pointer events, input ranges
+  (function () {
+    var keys = { Control: 'ctrlKey', Shift: 'shiftKey', Alt: 'altKey', Meta: 'metaKey', CapsLock: 'modifierCapsLock', NumLock: 'modifierNumLock', ScrollLock: 'modifierScrollLock', AltGraph: 'modifierAltGraph', Fn: 'modifierFn', Symbol: 'modifierSymbol' };
+    var state = function (key) {
+      if (arguments.length < 1) throw new TypeError("Failed to execute 'getModifierState' on 'KeyboardEvent': 1 argument required, but only 0 present.");
+      return !!this[keys[String(key)]];
+    };
+    M(g.MouseEvent, 'getModifierState', state); M(g.KeyboardEvent, 'getModifierState', state);
+    M(g.PointerEvent, 'getCoalescedEvents', function () { return []; });
+    M(g.PointerEvent, 'getPredictedEvents', function () { return []; });
+    M(g.InputEvent, 'getTargetRanges', function () { return []; });
+    M(g.MessageEvent, 'initMessageEvent', function (type, bubbles, cancelable, data, origin, lastEventId, source, ports) {
+      if (arguments.length < 1) throw new TypeError("Failed to execute 'initMessageEvent' on 'MessageEvent': 1 argument required, but only 0 present.");
+      this.initEvent(type, !!bubbles, !!cancelable);
+      var set = { data: data === undefined ? null : data, origin: origin === undefined ? '' : String(origin), lastEventId: lastEventId === undefined ? '' : String(lastEventId), source: source === undefined ? null : source, ports: ports ? Array.prototype.slice.call(ports) : [] };
+      Object.keys(set).forEach(function (k) { try { Object.defineProperty(this, k, { value: set[k], configurable: true, enumerable: true }); } catch (e) { } }, this);
+    });
+  }());
+
+  // observers
+  S(g.PerformanceObserver, 'supportedEntryTypes', Object.freeze(['element', 'event', 'first-input', 'largest-contentful-paint', 'layout-shift', 'longtask', 'mark', 'measure', 'navigation', 'paint', 'resource']));
+  (function () {
+    var L = g.PerformanceObserverEntryList;
+    M(L, 'getEntries', function () { return (this.__entries || []).slice(); });
+    M(L, 'getEntriesByType', function (type) { type = String(type); return (this.__entries || []).filter(function (e) { return e.entryType === type; }); });
+    M(L, 'getEntriesByName', function (name, type) { name = String(name); return (this.__entries || []).filter(function (e) { return e.name === name && (type === undefined || e.entryType === String(type)); }); });
+  }());
+
+  // the pages the platform has no device for: indexed database cursors keep their methods on the object, the screen orientation cannot be locked
+  ['advance', 'continue', 'continuePrimaryKey', 'update', 'delete'].forEach(function (n) { M(g.IDBCursor, n, illegalCall); });
+  M(g.ScreenOrientation, 'lock', function () { return Promise.reject(notSupported('screen.orientation.lock() is not available on this device.')); });
+  M(g.ScreenOrientation, 'unlock', function () { });
+  ['sendBeacon', 'share', 'canShare'].forEach(function (n) { M(g.Navigator, n, illegalCall); });
+  (function () {   // the global object has the members of Window: its own properties are the ones that count, the interface lists them for `in` and for pages that read them off the prototype
+    var W = g.Window;
+    if (typeof W !== 'function' || !W.prototype) return;
+    ['window', 'self', 'document', 'name', 'location', 'history', 'navigator', 'frames', 'length', 'top', 'parent', 'opener', 'frameElement', 'closed', 'screen', 'innerWidth', 'innerHeight', 'scrollX', 'scrollY', 'pageXOffset', 'pageYOffset', 'screenX', 'screenY', 'outerWidth', 'outerHeight', 'devicePixelRatio', 'performance', 'crypto', 'localStorage', 'sessionStorage', 'indexedDB', 'caches', 'customElements', 'visualViewport', 'origin', 'isSecureContext', 'crossOriginIsolated', 'speechSynthesis', 'trustedTypes', 'onload', 'onerror', 'onmessage', 'onhashchange', 'onpopstate', 'onresize', 'onscroll', 'onunload', 'onbeforeunload', 'onstorage', 'onpagehide', 'onpageshow', 'ononline', 'onoffline', 'onfocus', 'onblur', 'onclick', 'onkeydown', 'ontransitionend', 'onanimationend'].forEach(function (n) {
+      if (n in W.prototype) return;
+      var dflt = n.slice(0, 2) === 'on' ? null : undefined;
+      Object.defineProperty(W.prototype, n, { get: function () { return dflt; }, set: function (v) { Object.defineProperty(this, n, { value: v, writable: true, enumerable: true, configurable: true }); }, enumerable: true, configurable: true });
+    });
+    ['open', 'close', 'stop', 'focus', 'blur', 'alert', 'confirm', 'prompt', 'print', 'postMessage', 'getComputedStyle', 'matchMedia', 'scrollTo', 'scroll', 'scrollBy', 'requestAnimationFrame', 'cancelAnimationFrame', 'requestIdleCallback', 'cancelIdleCallback', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'queueMicrotask', 'structuredClone', 'reportError', 'atob', 'btoa', 'fetch', 'createImageBitmap', 'getSelection'].forEach(function (n) { M(W, n, illegalCall); });
+  }());
+
+  // elements
+  (function () {
+    var flagNames = ['valueMissing', 'typeMismatch', 'patternMismatch', 'tooLong', 'tooShort', 'rangeUnderflow', 'rangeOverflow', 'stepMismatch', 'badInput', 'customError'];
+    var ValidityState = need('ValidityState', null);
+    flagNames.forEach(function (n) { Object.defineProperty(ValidityState.prototype, n, { get: function () { return !!(this.__flags && this.__flags[n]); }, enumerable: true, configurable: true }); });
+    Object.defineProperty(ValidityState.prototype, 'valid', { get: function () { var f = this.__flags; return !f || !flagNames.some(function (n) { return f[n]; }); }, enumerable: true, configurable: true });
+    var ElementInternals = need('ElementInternals', null);
+    var attached = new WeakMap(), seen = new WeakSet();
+    var internals = function (o) { var s = attached.get(o); if (!s) illegalCall(); return s; };
+    Object.defineProperty(ElementInternals.prototype, 'shadowRoot', { get: function () { var el = internals(this).el, r = el.shadowRoot; return r && r.mode === 'closed' ? r : null; }, enumerable: true, configurable: true });
+    Object.defineProperty(ElementInternals.prototype, 'form', { get: function () { return internals(this).el.closest('form'); }, enumerable: true, configurable: true });
+    Object.defineProperty(ElementInternals.prototype, 'labels', { get: function () { internals(this); return []; }, enumerable: true, configurable: true });
+    Object.defineProperty(ElementInternals.prototype, 'willValidate', { get: function () { internals(this); return true; }, enumerable: true, configurable: true });
+    Object.defineProperty(ElementInternals.prototype, 'validity', { get: function () { return internals(this).validity; }, enumerable: true, configurable: true });
+    Object.defineProperty(ElementInternals.prototype, 'validationMessage', { get: function () { return internals(this).message; }, enumerable: true, configurable: true });
+    Object.defineProperty(ElementInternals.prototype, 'states', { get: function () { return internals(this).states; }, enumerable: true, configurable: true });
+    ['role', 'ariaLabel'].forEach(function (n) {
+      Object.defineProperty(ElementInternals.prototype, n, { get: function () { var v = internals(this).aria[n]; return v === undefined ? null : v; }, set: function (v) { internals(this).aria[n] = v === null ? null : String(v); }, enumerable: true, configurable: true });
+    });
+    def(ElementInternals.prototype, 'setFormValue', function (value) { internals(this).value = value; });
+    def(ElementInternals.prototype, 'setValidity', function (flags, message) {
+      var s = internals(this);
+      flags = flags || {};
+      var any = flagNames.some(function (n) { return flags[n]; });
+      if (any && (message === undefined || message === '')) throw new TypeError("Failed to execute 'setValidity' on 'ElementInternals': The second argument should not be empty if one or more flags in the first argument are true.");
+      s.validity.__flags = {}; flagNames.forEach(function (n) { s.validity.__flags[n] = !!flags[n]; });
+      s.message = any ? String(message) : '';
+    });
+    def(ElementInternals.prototype, 'checkValidity', function () {
+      var s = internals(this);
+      if (s.validity.valid) return true;
+      s.el.dispatchEvent(new g.Event('invalid', { cancelable: true }));
+      return false;
+    });
+    def(ElementInternals.prototype, 'reportValidity', function () { return this.checkValidity(); });
+    M(g.HTMLElement, 'attachInternals', function () {
+      if (!/^[a-z][^A-Z\s]*-/.test(this.localName)) throw notSupported("Failed to execute 'attachInternals' on 'HTMLElement': Unable to attach ElementInternals to a non-custom element.");
+      if (seen.has(this)) throw domErr("Failed to execute 'attachInternals' on 'HTMLElement': ElementInternals for the specified element was already attached.", 'InvalidStateError');
+      seen.add(this);
+      var o = Object.create(ElementInternals.prototype), v = Object.create(ValidityState.prototype);
+      v.__flags = {};
+      Object.defineProperty(v, '__flags', { enumerable: false });
+      attached.set(o, { el: this, validity: v, message: '', value: null, states: new Set(), aria: {} });
+      return o;
+    });
+    M(g.HTMLDialogElement, 'requestClose', function (returnValue) {
+      if (!this.open) return;
+      if (this.dispatchEvent(new g.Event('cancel', { cancelable: true }))) this.close(returnValue);
+    });
+    M(g.HTMLIFrameElement, 'getSVGDocument', function () { var d = this.contentDocument; return d && d.documentElement && d.documentElement.localName === 'svg' ? d : null; });
+    M(g.HTMLMarqueeElement, 'start', function () { });
+    M(g.HTMLMarqueeElement, 'stop', function () { });
+    (function () {
+      var ids = 0;
+      M(g.HTMLVideoElement, 'getVideoPlaybackQuality', function () { return { creationTime: g.performance.now(), totalVideoFrames: 0, droppedVideoFrames: 0, corruptedVideoFrames: 0, totalFrameDelay: 0 }; });
+      M(g.HTMLVideoElement, 'requestVideoFrameCallback', function (cb) {
+        if (typeof cb !== 'function') throw new TypeError("Failed to execute 'requestVideoFrameCallback' on 'HTMLVideoElement': The provided callback is not a function.");
+        return ++ids;
+      });
+      M(g.HTMLVideoElement, 'cancelVideoFrameCallback', function () { });
+    }());
+    M(g.HTMLCanvasElement, 'transferControlToOffscreen', function () { throw domErr("Failed to execute 'transferControlToOffscreen' on 'HTMLCanvasElement': Cannot transfer control from a canvas for which a rendering context has been created.", 'InvalidStateError'); });
+  }());
+
+  // canvases that draw off the page
+  (function () {
+    var OC = g.OffscreenCanvas;
+    if (typeof OC === 'function') {
+      M(OC, 'getContext', function (type, options) { return g.HTMLCanvasElement.prototype.getContext.call(this, type, options); });
+      M(OC, 'convertToBlob', function (options) {
+        var self = this, type = options && options.type !== undefined ? String(options.type) : 'image/png', quality = options ? options.quality : undefined;
+        return new Promise(function (resolve, reject) { g.HTMLCanvasElement.prototype.toBlob.call(self, function (b) { b ? resolve(b) : reject(domErr('Failed to execute convertToBlob: the canvas has no pixels.', 'InvalidStateError')); }, type, quality); });
+      });
+      M(OC, 'transferToImageBitmap', function () { throw domErr("Failed to execute 'transferToImageBitmap' on 'OffscreenCanvas': The canvas has no context to transfer from.", 'InvalidStateError'); });
+    }
+    var ctx = function (name, parentless) {
+      var C = need(name, null);
+      G(C, 'canvas', function () { return undefined; });
+      return C;
+    };
+    var OCtx = ctx('OffscreenCanvasRenderingContext2D'), CRC = g.CanvasRenderingContext2D;
+    M(OCtx, 'commit', function () { });
+    if (CRC) Object.getOwnPropertyNames(CRC.prototype).forEach(function (n) {   // (the same drawing interface: what a 2d context of an offscreen canvas offers)
+      if (n === 'constructor' || n in OCtx.prototype) return;
+      var d = Object.getOwnPropertyDescriptor(CRC.prototype, n);
+      if (d.get || d.set) Object.defineProperty(OCtx.prototype, n, { get: d.get && function () { return d.get.call(this); }, set: d.set && function (v) { d.set.call(this, v); }, enumerable: d.enumerable, configurable: true });
+      else if (typeof d.value === 'function') def(OCtx.prototype, n, function () { return d.value.apply(this, arguments); });
+    });
+    var IBRC = ctx('ImageBitmapRenderingContext');
+    M(IBRC, 'transferFromImageBitmap', illegalCall);
+    M(g.CanvasPattern, 'setTransform', function (m) { });
+    M(g.ImageBitmap, 'close', function () { });
+  }());
+
+  (function () {   // HTMLDocument is the interface of the document of a page: it inherits from Document
+    var HD = g.HTMLDocument, D = g.Document;
+    if (typeof HD !== 'function' || typeof D !== 'function' || HD.prototype !== D.prototype) return;
+    var p = Object.create(D.prototype);
+    def(p, 'constructor', HD);
+    Object.defineProperty(p, Symbol.toStringTag, { value: 'HTMLDocument', configurable: true });
+    try { Object.defineProperty(HD, 'prototype', { value: p, writable: true }); Object.setPrototypeOf(HD, D); Object.setPrototypeOf(g.document, p); } catch (e) { }
+  }());
+
+  // GPU adapters and audio
+  M(g.GPUAdapter, 'requestDevice', illegalCall);
+  (function () {
+    var B = g.BaseAudioContext;
+    M(B, 'createScriptProcessor', function (bufferSize, inputs, outputs) {
+      // a node that passes its input through; its onaudioprocess is never called (the audio graph is rendered by the engine, not in blocks for script)
+      var node = this.createGain();
+      Object.defineProperty(node, 'bufferSize', { value: bufferSize === undefined ? 0 : bufferSize | 0, enumerable: true });
+      node.onaudioprocess = null;
+      return node;
+    });
+  }());
+
+  // SVG and the rest
+  (function () {
+    var vt = g.Document && g.Document.prototype.startViewTransition;
+    var VT = need('ViewTransition', null);
+    ['ready', 'finished', 'updateCallbackDone'].forEach(function (n) { G(VT, n, function () { return undefined; }); });
+    M(VT, 'skipTransition', illegalCall);
+    if (vt && !vt.__vt) {
+      var wrapped = function (callback) { var t = vt.apply(this, arguments); if (t && Object.getPrototypeOf(t) === Object.prototype) Object.setPrototypeOf(t, VT.prototype); return t; };
+      wrapped.__vt = true;
+      def(g.Document.prototype, 'startViewTransition', wrapped);
+    }
+  }());
+  (function () {   // CSS custom highlights: ranges are registered by name; the page is not painted with them
+    var Highlight = need('Highlight', null), Registry = need('HighlightRegistry', null);
+    if (!Highlight.__set) {
+      var H = function Highlight() {
+        if (!new.target) throw new TypeError("Failed to construct 'Highlight': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+        var self = Reflect.construct(Set, [], new.target);
+        Array.prototype.forEach.call(arguments, function (r) { Set.prototype.add.call(self, r); });
+        Object.defineProperty(self, '__p', { value: { priority: 0, type: 'highlight' }, writable: true });
+        return self;
+      };
+      H.prototype = Highlight.prototype; Object.setPrototypeOf(Highlight.prototype, Set.prototype); Object.setPrototypeOf(H, Set);
+      Object.defineProperty(H, 'name', { value: 'Highlight' }); def(H.prototype, 'constructor', H); def(g, 'Highlight', H); H.__set = true;
+      Object.defineProperty(H.prototype, 'size', { get: function () { var n = 0; Set.prototype.forEach.call(this, function () { n++; }); return n; }, set: function () { }, enumerable: false, configurable: true });   // (a set of this engine keeps its size on the object; a highlight counts)
+      ['priority', 'type'].forEach(function (n) { Object.defineProperty(H.prototype, n, { get: function () { return this.__p[n]; }, set: function (v) { this.__p[n] = n === 'priority' ? v | 0 : String(v); }, enumerable: true, configurable: true }); });
+      var R = function HighlightRegistry() { throw new TypeError('Illegal constructor'); };
+      R.prototype = Registry.prototype; Object.setPrototypeOf(Registry.prototype, Map.prototype);
+      Object.defineProperty(R, 'name', { value: 'HighlightRegistry' }); def(R.prototype, 'constructor', R); def(g, 'HighlightRegistry', R);
+      if (g.CSS) Object.defineProperty(g.CSS, 'highlights', { value: Object.setPrototypeOf(new Map(), R.prototype), enumerable: true, configurable: true });
+    }
+  }());
+  (function () {   // credentials, media recording, worklets and the file system: the interfaces exist, there is nothing behind them
+    var Credential = need('Credential', null);
+    ['id', 'type'].forEach(function (n) { G(Credential, n, function () { return undefined; }); });
+    var PKC = need('PublicKeyCredential', 'Credential');
+    ['rawId', 'response'].forEach(function (n) { G(PKC, n, function () { return undefined; }); });
+    S(PKC, 'isUserVerifyingPlatformAuthenticatorAvailable', function () { return Promise.resolve(false); });
+    var MR = need('MediaRecorder', 'EventTarget');
+    ['stream', 'mimeType', 'state'].forEach(function (n) { G(MR, n, function () { return undefined; }); });
+    ['start', 'stop', 'pause', 'resume', 'requestData'].forEach(function (n) { M(MR, n, illegalCall); });
+    S(MR, 'isTypeSupported', function () { if (arguments.length < 1) throw new TypeError("Failed to execute 'isTypeSupported' on 'MediaRecorder': 1 argument required, but only 0 present."); return false; });
+    var MediaRecorder = function MediaRecorder(stream, options) {
+      if (!new.target) throw new TypeError("Failed to construct 'MediaRecorder': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+      throw notSupported("Failed to construct 'MediaRecorder': there is no encoder for the streams of this device.");
+    };
+    MediaRecorder.prototype = MR.prototype; Object.setPrototypeOf(MediaRecorder, Object.getPrototypeOf(MR));
+    Object.defineProperty(MediaRecorder, 'isTypeSupported', { value: MR.isTypeSupported, writable: true, configurable: true });
+    def(MediaRecorder.prototype, 'constructor', MediaRecorder); def(g, 'MediaRecorder', MediaRecorder);
+    var W = need('Worklet', null);
+    M(W, 'addModule', function () { return Promise.reject(domErr('Worklets are not available on this device.', 'NotSupportedError')); });
+    var WGS = need('WorkerGlobalScope', 'EventTarget');
+    ['self', 'location', 'navigator', 'onerror'].forEach(function (n) { G(WGS, n, function () { return undefined; }); });
+    M(WGS, 'importScripts', illegalCall);
+    var DWGS = need('DedicatedWorkerGlobalScope', 'WorkerGlobalScope');
+    G(DWGS, 'name', function () { return undefined; });
+    ['postMessage', 'close'].forEach(function (n) { M(DWGS, n, illegalCall); });
+    G(need('WorkerLocation', null), 'href', function () { return undefined; });
+    G(need('WorkerNavigator', null), 'userAgent', function () { return undefined; });
+    var FSH = need('FileSystemHandle', null);
+    ['kind', 'name'].forEach(function (n) { G(FSH, n, function () { return undefined; }); });
+    M(FSH, 'isSameEntry', illegalCall);
+    var FSF = need('FileSystemFileHandle', 'FileSystemHandle');
+    ['getFile', 'createWritable'].forEach(function (n) { M(FSF, n, illegalCall); });
+    var FSD = need('FileSystemDirectoryHandle', 'FileSystemHandle');
+    ['getFileHandle', 'getDirectoryHandle', 'removeEntry', 'entries', 'keys', 'values'].forEach(function (n) { M(FSD, n, illegalCall); });
+  }());
+
+  (function () {   // URLPattern: patterns of :names, (regular expressions), * and {groups} with ? + * modifiers, for each part of a URL
+    var PARTS = ['protocol', 'username', 'password', 'hostname', 'port', 'pathname', 'search', 'hash'];
+    var segmentOf = { hostname: '[^.]+?', pathname: '[^/]+?' };
+    var esc = function (c) { return c.replace(/[.*+?^${}()|[\]\\\/]/g, '\\$&'); };
+    var groupsIn = function (src) { return new RegExp(src + '|').exec('').length - 1; };
+    var bad = function (what) { return new TypeError('Failed to construct \'URLPattern\': ' + what); };
+    // compile one part: the source of a regular expression and the name of each of its capture groups
+    var compile = function (part, pattern) {
+      var names = [], counter = 0, regex = false, i = 0;
+      var seg = segmentOf[part] || '[^]+?';
+      var parse = function (closing) {
+        var out = [];   // pieces: { lit: 'text' } or { src: '...', prefix: '/'? }
+        while (i < pattern.length) {
+          var c = pattern[i];
+          if (c === closing) { i++; return out; }
+          var piece = null;
+          if (c === '\\') { piece = { lit: pattern[i + 1] === undefined ? '' : pattern[i + 1] }; i += 2; }
+          else if (c === ':') {
+            var m = /^[A-Za-z_$][A-Za-z0-9_$]*/.exec(pattern.slice(i + 1));
+            if (!m) throw bad('Invalid pattern, a name is missing after ":".');
+            i += 1 + m[0].length;
+            var body = seg;
+            if (pattern[i] === '(') { var cs = readParens(); body = cs; regex = true; }
+            piece = { group: body, name: m[0] };
+          }
+          else if (c === '(') { regex = true; piece = { group: readParens(), name: String(counter++) }; }
+          else if (c === '*') { i++; piece = { group: '.*', name: String(counter++) }; }
+          else if (c === '{') { i++; var inner = parse('}'); piece = { sub: inner }; }
+          else { piece = { lit: c }; i++; }
+          var mod = piece.lit === undefined ? pattern[i] : '';
+          if (mod === '?' || mod === '+' || mod === '*') { piece.mod = mod; i++; }
+          out.push(piece);
+        }
+        if (closing) throw bad('Invalid pattern, a "{" is not closed.');
+        return out;
+      };
+      var readParens = function () {
+        var depth = 0, start = i + 1;
+        for (; i < pattern.length; i++) {
+          if (pattern[i] === '\\') { i++; continue; }
+          if (pattern[i] === '(') depth++;
+          else if (pattern[i] === ')' && --depth === 0) { var s = pattern.slice(start, i); i++; return s; }
+        }
+        throw bad('Invalid pattern, a "(" is not closed.');
+      };
+      var emit = function (pieces) {
+        var src = '';
+        pieces.forEach(function (p, k) {
+          if (p.lit !== undefined) { src += esc(p.lit); return; }
+          var inner;
+          if (p.sub) inner = emit(p.sub);
+          else {
+            var extra = groupsIn(p.group);
+            names.push(p.name); for (var e = 0; e < extra; e++) names.push(null);
+            inner = '(' + p.group + ')';
+          }
+          if (p.mod === '+') inner = p.sub ? '(?:' + inner + ')+' : '(?:' + inner + ')+';
+          if (p.mod === '*' || p.mod === '?') {
+            if (part === 'pathname' && !p.sub && k > 0 && pieces[k - 1].lit === '/' && src.slice(-2) === '\\/') { src = src.slice(0, -2); inner = '\\/' + inner; }
+            inner = '(?:' + inner + ')' + p.mod;
+          } else if (p.sub) inner = '(?:' + inner + ')';
+          src += inner;
+        });
+        return src;
+      };
+      var src = emit(parse(null));
+      return { re: new RegExp('^' + src + '$', part === 'protocol' || part === 'hostname' ? 'i' : ''), names: names, regex: regex };
+    };
+    var canon = {
+      protocol: function (v) { return v.replace(/:$/, ''); }, search: function (v) { return v.replace(/^\?/, ''); }, hash: function (v) { return v.replace(/^#/, ''); },
+      username: function (v) { return v; }, password: function (v) { return v; }, hostname: function (v) { return v; }, port: function (v) { return v; },
+      pathname: function (v) { return v; }
+    };
+    var fromUrl = function (u) {
+      return { protocol: u.protocol.replace(/:$/, ''), username: u.username, password: u.password, hostname: u.hostname, port: u.port, pathname: u.pathname, search: u.search.replace(/^\?/, ''), hash: u.hash.replace(/^#/, '') };
+    };
+    var escapePattern = function (s) { return String(s).replace(/[+*?:{}()\\]/g, '\\$&'); };
+    // a string pattern: its parts, those it does not name are wildcards
+    var fromString = function (text, baseURL) {
+      var m = /^([A-Za-z*][A-Za-z0-9+.\-*]*):(?:\/\/([^\/?#]*))?([^?#]*)(?:\?([^#]*))?(?:#([\s\S]*))?$/.exec(text), o = {};
+      if (m && (m[2] !== undefined || /^[A-Za-z*][A-Za-z0-9+.\-*]*:\/\//.test(text) === false || !baseURL) && (m[2] !== undefined || !baseURL)) {
+        o.protocol = m[1];
+        if (m[2] !== undefined) {
+          var auth = m[2], at = auth.lastIndexOf('@');
+          if (at >= 0) { var cred = auth.slice(0, at).split(':'); o.username = cred[0]; if (cred.length > 1) o.password = cred.slice(1).join(':'); auth = auth.slice(at + 1); }
+          var pm = /^(.*?)(?::(\d+|\*))?$/.exec(auth);
+          o.hostname = pm[1]; o.port = pm[2] === undefined ? '' : pm[2];
+          if (m[3] === '' && (m[4] !== undefined || m[5] !== undefined)) o.pathname = '/'; else if (m[3] !== '') o.pathname = m[3];
+          else o.pathname = '/';
+        } else if (m[3] !== '') o.pathname = m[3];
+        if (m[4] !== undefined) o.search = m[4];
+        else if (m[5] !== undefined) o.search = '';
+        if (m[5] !== undefined) o.hash = m[5];
+        return o;
+      }
+      if (!baseURL) throw bad('Invalid URL pattern string "' + text + '" without a base URL.');
+      var b = fromUrl(new g.URL(baseURL)), rm = /^([^?#]*)(?:\?([^#]*))?(?:#([\s\S]*))?$/.exec(text);
+      ['protocol', 'username', 'password', 'hostname', 'port'].forEach(function (k) { o[k] = escapePattern(b[k]); });
+      o.pathname = rm[1] === '' ? escapePattern(b.pathname) : rm[1][0] === '/' ? rm[1] : escapePattern(b.pathname.replace(/[^\/]*$/, '')) + rm[1];
+      if (rm[2] !== undefined) o.search = rm[2]; else if (rm[1] === '') o.search = escapePattern(b.search);
+      if (rm[3] !== undefined) o.hash = rm[3];
+      return o;
+    };
+    var URLPattern = function URLPattern(input, baseURL, options) {
+      if (!new.target) throw new TypeError("Failed to construct 'URLPattern': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+      var o;
+      if (input === undefined) input = {};
+      if (typeof input === 'string') {
+        if (baseURL !== undefined && typeof baseURL !== 'string') baseURL = String(baseURL);
+        o = fromString(input, baseURL);
+      } else if (input && typeof input === 'object') {
+        o = {};
+        PARTS.forEach(function (k) { if (input[k] !== undefined) o[k] = String(input[k]); });
+        var base = input.baseURL !== undefined ? String(input.baseURL) : (typeof baseURL === 'string' ? undefined : undefined);
+        if (base !== undefined) {
+          var b = fromUrl(new g.URL(base)), first = PARTS.length;
+          PARTS.forEach(function (k, ix) { if (o[k] !== undefined && ix < first) first = ix; });
+          PARTS.forEach(function (k, ix) { if (o[k] === undefined && ix < first) o[k] = escapePattern(b[k]); });
+        }
+      } else throw bad("The provided value is not of type '(URLPatternInit or USVString)'.");
+      var state = { parts: {}, regex: false };
+      PARTS.forEach(function (k) {
+        var text = o[k] === undefined ? '*' : canon[k](o[k]);
+        var c = compile(k, text);
+        state.parts[k] = { text: text, re: c.re, names: c.names };
+        if (c.regex) state.regex = true;
+      });
+      Object.defineProperty(this, '__u', { value: state });
+    };
+    var proto = URLPattern.prototype;
+    Object.defineProperty(proto, Symbol.toStringTag, { value: 'URLPattern', configurable: true });
+    PARTS.forEach(function (k) { Object.defineProperty(proto, k, { get: function () { if (!this.__u) illegalCall(); return this.__u.parts[k].text; }, enumerable: true, configurable: true }); });
+    Object.defineProperty(proto, 'hasRegExpGroups', { get: function () { if (!this.__u) illegalCall(); return this.__u.regex; }, enumerable: true, configurable: true });
+    var run = function (self, input, baseURL, what) {
+      if (!self.__u) illegalCall();
+      var parts, inputs;
+      try {
+        if (typeof input === 'string') { parts = fromUrl(baseURL === undefined ? new g.URL(input) : new g.URL(input, String(baseURL))); inputs = baseURL === undefined ? [input] : [input, String(baseURL)]; }
+        else if (input && typeof input === 'object') {
+          var base = input.baseURL !== undefined ? fromUrl(new g.URL(String(input.baseURL))) : null, first = PARTS.length;
+          PARTS.forEach(function (k, ix) { if (input[k] !== undefined && ix < first) first = ix; });
+          parts = {};
+          PARTS.forEach(function (k, ix) { parts[k] = input[k] !== undefined ? String(input[k]) : base && ix < first ? base[k] : ''; });
+          inputs = [input];
+        } else throw new TypeError("Failed to execute '" + what + "' on 'URLPattern': The provided value is not of type '(URLPatternInit or USVString)'.");
+      } catch (e) { if (e instanceof TypeError && /Failed to execute/.test(e.message)) throw e; return null; }
+      var result = { inputs: inputs };
+      for (var n = 0; n < PARTS.length; n++) {
+        var k = PARTS[n], part = self.__u.parts[k], m = part.re.exec(parts[k]);
+        if (!m) return null;
+        var groups = {};
+        part.names.forEach(function (name, ix) { if (name !== null) groups[name] = m[ix + 1]; });
+        result[k] = { input: parts[k], groups: groups };
+      }
+      return result;
+    };
+    def(proto, 'test', function (input, baseURL) { return run(this, input, baseURL, 'test') !== null; });
+    def(proto, 'exec', function (input, baseURL) { return run(this, input, baseURL, 'exec'); });
+    def(proto, 'constructor', URLPattern);
+    def(g, 'URLPattern', URLPattern);
+  }());
 
   // the constructor property of a prototype names its interface (Image, Option and Audio share the prototype of the element interface they make)
   Object.getOwnPropertyNames(g).forEach(function (name) {
@@ -11760,6 +12247,18 @@ const char kFinishPrelude[] = R"JSPRELUDE((function (g) {
     if (!parent || parent === Object.prototype) return;
     var P = parent.constructor;
     if (typeof P === 'function' && P !== C && P.prototype === parent) Object.setPrototypeOf(C, P);
+  });
+
+  // an interface object is a global that is not enumerated, and its prototype property cannot be assigned
+  Object.getOwnPropertyNames(g).forEach(function (name) {
+    if (!/^[A-Z]/.test(name)) return;
+    var d = Object.getOwnPropertyDescriptor(g, name);
+    if (!d || typeof d.value !== 'function') return;
+    if (d.enumerable) { try { Object.defineProperty(g, name, { enumerable: false }); } catch (e) { } }
+    var pd = Object.getOwnPropertyDescriptor(d.value, 'prototype');
+    if (pd && pd.writable && d.value.prototype && d.value.prototype.constructor === d.value && d.value.prototype !== Object.prototype) {
+      try { Object.defineProperty(d.value, 'prototype', { writable: false }); } catch (e) { }
+    }
   });
 }(this));
 )JSPRELUDE";
@@ -12164,6 +12663,39 @@ const char kSvgPrelude[] = R"JSPRELUDE((function (g) {
   var protos = { svg: SVGSVGElement.prototype, g: null };
   table.forEach(function (row) { var C = iface(row[0], row[2]); protos[row[1]] = C.prototype; });
   Object.keys(protos).forEach(function (name) { if (protos[name]) g.__register_svg_tag(name, protos[name]); });
+  // points of a polygon or polyline (a list of points over its attribute) and the path data of a path as segments
+  function pointList(el) {
+    var st = store(el);
+    if (st.PL) return st.PL;
+    var list = Object.create(SVGPointList.prototype);
+    hide(list, '__items', function () {
+      var t = el.getAttribute('points'), n = t ? t.trim().split(/[\s,]+/).filter(Boolean).map(num) : [], out = [];
+      for (var i = 0; i + 1 < n.length; i += 2) out.push(new g.DOMPoint(n[i], n[i + 1]));
+      return out;
+    });
+    hide(list, '__write', function (items) { el.setAttribute('points', items.map(function (p) { return p.x + ',' + p.y; }).join(' ')); });
+    return (st.PL = list);
+  }
+  ['SVGPolygonElement', 'SVGPolylineElement'].forEach(function (name) {
+    accessor(g[name].prototype, 'points', function () { return pointList(this); });
+    accessor(g[name].prototype, 'animatedPoints', function () { return pointList(this); });
+  });
+  def(g.SVGPathElement.prototype, 'getPathData', function (options) {
+    var d = this.getAttribute('d') || '', out = [], re = /([MmLlHhVvCcSsQqTtAaZz])([^MmLlHhVvCcSsQqTtAaZz]*)/g, m;
+    var arity = { M: 2, L: 2, H: 1, V: 1, C: 6, S: 4, Q: 4, T: 2, A: 7, Z: 0 };
+    while ((m = re.exec(d))) {
+      var letter = m[1], n = arity[letter.toUpperCase()];
+      var values = (m[2].match(/[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?/g) || []).map(Number);
+      if (n === 0) { out.push({ type: letter, values: [] }); continue; }
+      if (values.length < n) break;
+      for (var i = 0; i + n <= values.length; i += n) {
+        var type = letter;
+        if (i > 0 && letter === 'M') type = 'L'; else if (i > 0 && letter === 'm') type = 'l';
+        out.push({ type: type, values: values.slice(i, i + n) });
+      }
+    }
+    return out;
+  });
   g.__register_svg_tag('svg', SVGSVGElement.prototype);
   function lengthsFor(proto, names, defaults) { names.forEach(function (n) { accessor(proto, n, function () { return animatedLength(this, n, defaults && defaults[n]); }); }); }
   lengthsFor(SVGSVGElement.prototype, ['x', 'y', 'width', 'height']);

@@ -642,6 +642,8 @@ add_executable(BOOTX64
   src/Hardware/GraphicsProcessingUnit/AMD/AmdGfx8Compute.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdGmc8.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdIh3.cpp
+  src/Hardware/Bus/Pci/PciMsi.cpp
+  src/Hardware/GraphicsProcessingUnit/AMD/AmdIrq.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdSdma3.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdDce11.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdVegaM.cpp

@@ -186,6 +186,7 @@ static void test_plan() {
 
 static void test_bring_up() {
   Rig rig;
+  rig.card.gfx.set_reg(0x2315, 1);   // SQ_INTERRUPT_MSG_CTRL.STALL: the messages are held back until the driver lets them through
   AmdVegaM vega(rig.alloc);
   const bool up = vega.bring_up(rig.inputs());
   if (!up) printf("  %s (step %s)\n", vega.status(), AmdVegaM::step_name(vega.step()));
@@ -197,7 +198,7 @@ static void test_bring_up() {
   // The memory controller: the GART at the top of the address space, its table in the block, the dummy and scratch pages in the block.
   CHECK(vega.gart_plan().ok && vega.gart_plan().gart_start == 0xFF00000000ull);
   CHECK(rig.card.gmc.reg(0x54F) == (block_gpu + l.gart_table) >> 12 && rig.card.gmc.reg(0x546) == (block_gpu + l.dummy_page) >> 12 && rig.card.gmc.reg(0x80f) == (block_gpu + l.scratch_page) >> 12);
-  CHECK(rig.card.gmc.reg(0x504) == 0x11 && rig.card.gmc.reg(0x80d) == kGpuBase >> 12 && rig.card.gmc.reg(0x80e) == ((kGpuBase + kVideoMemory) >> 12) - 1);
+  CHECK(rig.card.gmc.reg(0x504) == (0x11 | 0x249248) && rig.card.gmc.reg(0x80d) == kGpuBase >> 12 && rig.card.gmc.reg(0x80e) == ((kGpuBase + kVideoMemory) >> 12) - 1);
   // The interrupt ring is in the block and is not snooped; a vector posted by the card is read back.
   CHECK(vega.interrupts() && vega.interrupts()->running() && rig.card.ih.reg(0xe31) == (block_gpu + l.ih) >> 8 && (rig.card.ih.reg(0x151a) & 0x8));
   rig.card.ih.post(181, 0x1234, 7, 0, 0);
@@ -216,6 +217,13 @@ static void test_bring_up() {
   CHECK(vega.sdma() && vega.sdma()->running() && vega.sdma()->copy(0, fb, fb + 1024, 256) && memcmp(fbhost + 1024, fbhost, 256) == 0);
   CHECK(vega.sdma()->fill(1, fb + 2048, 0xA5A5A5A5, 64) && fbhost[2048] == 0xA5 && fbhost[2111] == 0xA5 && fbhost[2112] == 0);
   CHECK(rig.card.sdma.protocol_errors == 0 && rig.card.sdma.copies == 1 && rig.card.sdma.fills == 1);
+  // The interrupt sources are on, so the blocks post to the interrupt ring: the graphics ring's three enables, the compute pipe's end of pipe (pipe 0 of MEC 1), the SDMA traps,
+  // and the memory controller's seven fault enables in both contexts. Each is the last write to its register, after the engine came up.
+  constexpr uint32_t kCpIntBits = 0x04000000 | 0x00800000 | 0x00400000;
+  CHECK((rig.card.gfx.reg(0x306a) & kCpIntBits) == kCpIntBits && (rig.card.gfx.reg(0x3085) & 0x04000000) && !(rig.card.gfx.reg(0x3086) & 0x04000000));
+  CHECK((rig.card.gfx.reg(0x3049) & 0x4000) && (rig.card.gfx.reg(0x308c) & 0x4000) && (rig.card.gfx.reg(0x2315) & 1) == 0);   // ECC errors on, SQ messages let through
+  CHECK((rig.card.sdma.reg(0x3404) & 1) && (rig.card.sdma.reg(0x3604) & 1) && rig.card.sdma.writes.back().first == 0x3604 && rig.card.sdma.writes.back().second == rig.card.sdma.reg(0x3604));
+  CHECK((rig.card.gmc.reg(0x504) & 0x249248) == 0x249248 && (rig.card.gmc.reg(0x505) & 0x249248) == 0x249248);
   // The burst NOP follows the firmware's feature version (31 for the first engine's file, 0 for the second's): the padding after the ring test packet.
   const uint8_t* sdma_ring0 = rig.vram + kRegion + l.sdma;
   const uint8_t* sdma_ring1 = sdma_ring0 + AmdSdma3::kSlotBytes;
@@ -244,6 +252,8 @@ static void test_bring_up() {
   // Shutting down stops it all in reverse: SDMA halted, compute queues unmapped and the engines halted, the interrupt ring off, the GART off.
   vega.shutdown();
   CHECK(!vega.up() && rig.card.sdma.reg(0x3412) == 1 && rig.card.sdma.reg(0x3612) == 1);
+  CHECK(!(rig.card.gfx.reg(0x3049) & 0x4000) && !(rig.card.gfx.reg(0x308c) & 0x4000) && (rig.card.gfx.reg(0x2315) & 1));
+  CHECK(!(rig.card.gfx.reg(0x306a) & kCpIntBits) && !(rig.card.gfx.reg(0x3085) & 0x04000000) && !(rig.card.sdma.reg(0x3404) & 1) && !(rig.card.sdma.reg(0x3604) & 1));
   CHECK(rig.card.gfx.unmapped_doorbells.size() == 8 && (rig.card.gfx.reg(fakegfx::kCpMeCntl) & fakegfx::kMeHalt));
   CHECK(!(rig.card.ih.reg(0xe30) & 1) && rig.card.gmc.reg(0x504) == 0 && rig.card.gmc.reg(0x505) == 0);
   // And it can be brought up again.
@@ -524,6 +534,265 @@ static void test_present() {
   CHECK(rig.vram[0] == 0x99 && rig.vram[pitch - 1] == 0x99);
 }
 
+// Vectors the card posts to the interrupt ring are dispatched by source: counted, faults wedge the ring they came from, VM faults are read from the memory controller and cleared.
+struct Recorder final : AmdIrq::ISink {
+  std::vector<AmdIrq::Event> events;
+  void on_event(const AmdIrq::Event& e) override { events.push_back(e); }
+};
+
+static void test_interrupts() {
+  Rig rig;
+  AmdVegaM vega(rig.alloc);
+  CHECK(vega.bring_up(rig.inputs()));
+  if (!vega.up()) return;
+  CHECK(vega.irq() && vega.service_interrupts() == 0);
+  const uint32_t nop_early[] = {0xC0001000};
+  // Fences and an unknown source: counted, nothing wedged.
+  rig.card.ih.post(181, 0, 0, 0, 0);                 // graphics fence
+  rig.card.ih.post(181, 0, (2u << 4) | (1u << 2), 0, 0);   // compute fence, ME 1 queue 2
+  rig.card.ih.post(224, 0, 1, 0, 0);                 // SDMA 1 trap
+  rig.card.ih.post(99, 0x123, 0, 0, 0);              // not one of ours
+  CHECK(vega.service_interrupts() == 4);
+  const AmdIrq& irq = *vega.irq();
+  CHECK(irq.total() == 4 && irq.count(AmdIrq::Kind::GraphicsFence) == 1 && irq.count(AmdIrq::Kind::ComputeFence) == 1 && irq.count(AmdIrq::Kind::SdmaTrap) == 1 &&
+        irq.count(AmdIrq::Kind::Unknown) == 1 && irq.unknown_source(99) == 1);
+  CHECK(!vega.graphics()->wedged() && !vega.sdma()->wedged(0) && !vega.sdma()->wedged(1) && vega.service_interrupts() == 0);
+  // Faults wedge the ring: a privileged register on the graphics ring, an illegal instruction on SDMA 1, a privileged instruction on compute queue 2 (and one from a queue that is
+  // not ours changes nothing).
+  rig.card.ih.post(184, 0, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && vega.graphics()->wedged() && !vega.sdma()->wedged(1));
+  rig.card.ih.post(241, 0, 1, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && vega.sdma()->wedged(1) && !vega.sdma()->wedged(0));
+  rig.card.ih.post(185, 0, (7u << 4) | (1u << 2) | 3, 0, 0);   // pipe 3 queue 7: the KIQ is pipe 3 queue 0, not this
+  CHECK(vega.service_interrupts() == 1);
+  rig.card.ih.post(185, 0, (2u << 4) | (1u << 2), 0, 0);
+  CHECK(vega.service_interrupts() == 1);
+  rig.card.ih.post(185, 0, (5u << 4) | (1u << 2) | 1, 0, 0);   // ME 1 pipe 1 queue 5: queue 5 of pipe 0 is ours, this is not
+  CHECK(vega.service_interrupts() == 1 && vega.submit_compute(5, ArrayView<const uint32_t>(nop_early, 1)));
+  // (a wedged ring refuses command buffers)
+  const uint32_t nop[] = {0xC0001000};
+  CHECK(!vega.submit_graphics(ArrayView<const uint32_t>(nop, 1)) && !vega.submit_sdma(1, ArrayView<const uint32_t>(nop, 1)) && !vega.submit_compute(2, ArrayView<const uint32_t>(nop, 1)));
+  CHECK(vega.submit_compute(1, ArrayView<const uint32_t>(nop, 1)) && vega.submit_sdma(0, ArrayView<const uint32_t>(nop, 1)));
+  CHECK(irq.count(AmdIrq::Kind::GfxPrivilegedRegister) == 1 && irq.count(AmdIrq::Kind::SdmaIllegalInstruction) == 1 && irq.count(AmdIrq::Kind::GfxPrivilegedInstruction) == 3);
+  // A VM fault: the registers are read and cleared (bit 0 of VM_CONTEXT1_CNTL2).
+  rig.card.gmc.set_reg(0x53f, 0x12345);                                 // ADDR: page
+  rig.card.gmc.set_reg(0x537, 0x1000000 | (5u << 25) | (0x2A << 12) | 0x3);   // STATUS: write, vmid 5, client 0x2A, protections 3
+  rig.card.gmc.set_reg(0x539, 0x43425F30);                              // MCCLIENT: "CB_0"
+  rig.card.ih.post(146, 0, 0, 5, 77);
+  CHECK(vega.service_interrupts() == 1);
+  const AmdIrq::VmFaultInfo& f = irq.last_vm_fault();
+  CHECK(f.valid && f.page == 0x12345 && f.vmid == 5 && f.client_id == 0x2A && f.protections == 3 && f.write && f.mc_client == 0x43425F30 && irq.count(AmdIrq::Kind::VmFault) == 1);
+  CHECK((rig.card.gmc.reg(0x50d) & 1) == 1);
+  // A fault interrupt with both registers zero reports nothing and is not counted; but the registers are cleared all the same.
+  rig.card.gmc.set_reg(0x53f, 0);
+  rig.card.gmc.set_reg(0x537, 0);
+  rig.card.gmc.set_reg(0x50d, 0);
+  rig.card.ih.post(147, 0, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && irq.count(AmdIrq::Kind::VmFault) == 1 && (rig.card.gmc.reg(0x50d) & 1) == 1);
+  // A fault at page 0 (the status alone says there was one) is reported; so is one with the status zero.
+  rig.card.gmc.set_reg(0x53f, 0);
+  rig.card.gmc.set_reg(0x537, 0x3);
+  rig.card.ih.post(147, 0, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && irq.count(AmdIrq::Kind::VmFault) == 2 && irq.last_vm_fault().page == 0 && irq.last_vm_fault().protections == 3);
+  rig.card.gmc.set_reg(0x53f, 0x77);
+  rig.card.gmc.set_reg(0x537, 0);
+  rig.card.ih.post(147, 0, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && irq.count(AmdIrq::Kind::VmFault) == 3 && irq.last_vm_fault().page == 0x77);
+  // A limit on the vectors handled in one call.
+  for (int i = 0; i < 10; ++i) rig.card.ih.post(181, 0, 0, 0, 0);
+  CHECK(vega.service_interrupts(4) == 4 && vega.service_interrupts(4) == 4 && vega.service_interrupts() == 2 && vega.service_interrupts() == 0);
+  // After a restart the engines work again and a card that is not up handles nothing.
+  vega.shutdown();
+  CHECK(vega.service_interrupts() == 0 && !vega.irq());
+}
+
+// The sink sees every event in order, with the ring id decoded.
+static void test_interrupt_sink() {
+  Rig rig;
+  AmdVegaM vega(rig.alloc);
+  CHECK(vega.bring_up(rig.inputs()));
+  if (!vega.up()) return;
+  AmdIh3* ih = vega.interrupts();
+  CHECK(ih != nullptr);
+  AmdIrq irq(rig.card);
+  Recorder rec;
+  rig.card.ih.post(181, 0x77, (3u << 4) | (2u << 2) | 1, 4, 9);
+  rig.card.ih.post(247, 0, 1, 0, 0);
+  CHECK(irq.process(*ih, &rec) == 2 && rec.events.size() == 2);
+  CHECK(rec.events[0].kind == AmdIrq::Kind::ComputeFence && rec.events[0].me == 2 && rec.events[0].pipe == 1 && rec.events[0].queue == 3 && rec.events[0].vector.src_data == 0x77 &&
+        rec.events[0].vector.vmid == 4 && rec.events[0].vector.pasid == 9);
+  CHECK(rec.events[1].kind == AmdIrq::Kind::SdmaIllegalInstruction && rec.events[1].engine == 1);
+}
+
+// With MSI on (Inputs::msi) the interrupt ring is started the way the driver starts it with adev->irq.msi_enabled: the read pointer re-arms the message. Nothing else differs.
+static void test_msi_input() {
+  uint32_t cntl[2], other_writes[2];
+  for (int msi = 0; msi < 2; ++msi) {
+    Rig rig;
+    AmdVegaM vega(rig.alloc);
+    AmdVegaM::Inputs in = rig.inputs();
+    in.msi = msi != 0;
+    CHECK(vega.bring_up(in));
+    cntl[msi] = rig.card.ih.reg(0xe30);
+    other_writes[msi] = static_cast<uint32_t>(rig.card.ih.writes.size());
+    CHECK(vega.service_interrupts() == 0);
+  }
+  const uint32_t diff = cntl[0] ^ cntl[1];
+  CHECK(diff != 0 && (diff & (diff - 1)) == 0 && (cntl[1] & diff) && other_writes[0] == other_writes[1]);
+}
+
+// SQ messages: the word in the vector's data is decoded, and for a wave's report the error source is read from SQ_EDC_INFO of that compute unit (GRBM_GFX_INDEX selected for it and
+// put back to broadcasting).
+static void test_sq_messages() {
+  Rig rig;
+  AmdVegaM vega(rig.alloc);
+  CHECK(vega.bring_up(rig.inputs()));
+  if (!vega.up()) return;
+  const AmdIrq& irq = *vega.irq();
+  // EDC/ECC error (encoding 2) of SE 1, SH 1, CU 5, SIMD 2, wave 7, VM 9, privileged; the source in SQ_EDC_INFO is VGPR (3).
+  const uint32_t wave = (2u << 26) | (1u << 24) | (5u << 20) | (2u << 18) | (7u << 14) | (9u << 10) | 0x200 | 0x100 | 0x55;
+  rig.card.gfx.set_reg(0x23a3, (3u << 6) | 0x1E01);
+  const size_t before = rig.card.gfx.writes.size();
+  rig.card.ih.post(239, wave, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && irq.count(AmdIrq::Kind::SqMessage) == 1);
+  const AmdIrq::SqInfo& q = irq.last_sq();
+  CHECK(q.encoding == 2 && q.se_id == 1 && q.sh_id == 1 && q.cu_id == 5 && q.simd_id == 2 && q.wave_id == 7 && q.vm_id == 9 && q.priv && q.edc_valid && q.edc_source == 3);
+  CHECK(AmdIrq::sq_edc_source_name(q.edc_source)[0] == 'V' && AmdIrq::sq_edc_source_name(7)[0] == 'i');
+  // GRBM_GFX_INDEX: SE 1 << 16 | SH 1 << 8 | instance (CU) 5, then everything broadcast again.
+  CHECK(rig.card.gfx.writes.size() == before + 2 && rig.card.gfx.writes[before].first == 0xc200 && rig.card.gfx.writes[before].second == 0x00010105 &&
+        rig.card.gfx.writes[before + 1].first == 0xc200 && rig.card.gfx.writes[before + 1].second == 0xE0000000u);
+  // An instruction interrupt (encoding 1) reads the same way; the source is whatever the register says.
+  rig.card.gfx.set_reg(0x23a3, 6u << 6);
+  rig.card.ih.post(239, (1u << 26) | (3u << 24) | (0xF << 20), 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && irq.last_sq().encoding == 1 && irq.last_sq().se_id == 3 && irq.last_sq().cu_id == 15 && irq.last_sq().edc_source == 6 && !irq.last_sq().priv);
+  // A general purpose event (encoding 0): the flags, no register is touched.
+  const size_t writes = rig.card.gfx.writes.size();
+  rig.card.ih.post(239, (2u << 24) | 0x8A, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && irq.last_sq().encoding == 0 && irq.last_sq().se_id == 2 && irq.last_sq().general == 0x8A && !irq.last_sq().edc_valid && rig.card.gfx.writes.size() == writes);
+  // An encoding that does not exist is counted and left alone.
+  rig.card.ih.post(239, 3u << 26, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && irq.last_sq().encoding == 3 && !irq.last_sq().edc_valid && rig.card.gfx.writes.size() == writes && irq.count(AmdIrq::Kind::SqMessage) == 4);
+  // The CP's ECC error is counted too, and wedges nothing.
+  rig.card.ih.post(197, 0, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && irq.count(AmdIrq::Kind::GfxEccError) == 1 && !vega.graphics()->wedged());
+}
+
+// The display engine's interrupts: page flips of the six controllers and the hot plug pins on from bring-up (vertical blank only when asked), dispatched with the driver's
+// acknowledgements, a pin that will not stop interrupting switched off, everything off again at shutdown.
+constexpr uint32_t kCrtcOff[6] = {0x0, 0x200, 0x400, 0x2600, 0x2800, 0x2a00};   // CRTCn_REGISTER_OFFSET (vid.h)
+
+static void test_display_interrupts() {
+  Rig rig;
+  rig.card.gfx.set_reg(0x1898 + 8, 0x2);    // pin 1 senses something connected
+  AmdVegaM vega(rig.alloc);
+  AmdVegaM::Inputs in = rig.inputs();
+  in.hpd_pins = 0x0F;                       // pins 0..3
+  CHECK(vega.bring_up(in));
+  if (!vega.up()) return;
+  const AmdIrq& irq = *vega.irq();
+  // Page flip interrupts on every controller (GRPH_INTERRUPT_CONTROL, bit 0).
+  for (uint32_t c = 0; c < 6; ++c) CHECK(rig.card.dce.get(0x1a17 + kCrtcOff[c]) == 1);
+  // The pins asked for: DC_HPD_EN (bit 28), the filter (connect 50 ms, disconnect 10 ms << 20), the interrupt on with the polarity for the next change; the others untouched.
+  for (uint32_t p = 0; p < 4; ++p) {
+    const uint32_t polarity = p == 1 ? 0 : 0x100;   // pin 1 is connected: the next change is a disconnect
+    CHECK(rig.card.gfx.reg(0x189a + 8 * p) == 0x10000000 && rig.card.gfx.reg(0x189c + 8 * p) == (50u | 10u << 20) && rig.card.gfx.reg(0x1899 + 8 * p) == (0x10000 | polarity | 1));
+  }
+  for (uint32_t p = 4; p < 6; ++p) CHECK(rig.card.gfx.reg(0x189a + 8 * p) == 0 && rig.card.gfx.reg(0x1899 + 8 * p) == 0 && rig.card.gfx.reg(0x189c + 8 * p) == 0);
+  // The order for a pin: enable, filter, acknowledge, polarity, interrupt on.
+  {
+    std::vector<uint32_t> regs;
+    for (const auto& w : rig.card.gfx.writes) if (w.first >= 0x1898 && w.first <= 0x189f) regs.push_back(w.first);
+    const uint32_t expect[] = {0x189a, 0x189c, 0x1899, 0x1899, 0x1899};
+    CHECK(regs.size() >= 5 && memcmp(regs.data(), expect, sizeof(expect)) == 0);
+  }
+  // The vertical blank is off until asked for, and cannot be asked for without a display.
+  CHECK(rig.card.dce.get(0x1ac8 + 0x200) == 0 && !vega.set_vblank_interrupt(true) && vega.set_vblank_interrupt(false));
+
+  // A page flip of controller 1 (source 10): acknowledged when the status says it happened, counted either way.
+  rig.card.dce.set(0x1a16 + 0x200, 1);
+  rig.card.ih.post(10, 0, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && irq.pageflip_count(1) == 1 && irq.count(AmdIrq::Kind::DisplayPageFlip) == 1 && rig.card.dce.get(0x1a16 + 0x200) == 0x100);
+  rig.card.dce.set(0x1a16 + 0x200, 0);
+  rig.card.ih.post(18, 0, 0, 0, 0);   // controller 5
+  CHECK(vega.service_interrupts() == 1 && irq.pageflip_count(5) == 1 && rig.card.dce.get(0x1a16 + 0x2a00) == 0 && irq.pageflip_count(1) == 1);
+
+  // Hot plug: pin 0 is asserted in DISP_INTERRUPT_STATUS (bit 17); a device has been plugged in since the polarity was set.
+  rig.card.gfx.set_reg(0x1857, 0x20000);
+  rig.card.gfx.set_reg(0x1898, 0x2);
+  rig.card.ih.post(42, 0, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && irq.count(AmdIrq::Kind::DisplayHotplug) == 1 && irq.hotplug_count(0) == 1 && irq.hpd_connected(0) && !irq.hpd_connected(1));
+  CHECK((rig.card.gfx.reg(0x1899) & 0x100) == 0 && (rig.card.gfx.reg(0x1899) & 1) == 1 && (rig.card.gfx.reg(0x1899) & 0x10000));   // acknowledged, polarity now "disconnect", still on
+  // Not asserted (pin 1 in the second status register): the driver does nothing, and nothing is counted.
+  const size_t writes = rig.card.gfx.writes.size();
+  rig.card.ih.post(42, 1, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && irq.hotplug_count(1) == 0 && irq.count(AmdIrq::Kind::DisplayHotplug) == 1 && rig.card.gfx.writes.size() == writes);
+  // Unplugged again: pin 0 reports the change the other way.
+  rig.card.gfx.set_reg(0x1898, 0x0);
+  rig.card.ih.post(42, 0, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && irq.hotplug_count(0) == 2 && !irq.hpd_connected(0) && (rig.card.gfx.reg(0x1899) & 0x100));
+  // A pin that does not exist.
+  rig.card.ih.post(42, 6, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && irq.count(AmdIrq::Kind::DisplayHotplug) == 2 && irq.count(AmdIrq::Kind::Unknown) == 1);
+
+  // A pin that keeps interrupting is switched off after kHotplugStormLimit events (pin 2: DISP_INTERRUPT_STATUS_CONTINUE2 bit 17).
+  rig.card.gfx.set_reg(0x1859, 0x20000);
+  for (uint32_t i = 0; i < AmdIrq::kHotplugStormLimit + 4; ++i) {
+    rig.card.ih.post(42, 2, 0, 0, 0);
+    vega.service_interrupts();
+    if (i + 1 == AmdIrq::kHotplugStormLimit) CHECK(!irq.hpd_throttled(2) && (rig.card.gfx.reg(0x1899 + 16) & 0x10000));
+  }
+  CHECK(irq.hpd_throttled(2) && !(rig.card.gfx.reg(0x1899 + 16) & 0x10000) && !irq.hpd_throttled(0) && (rig.card.gfx.reg(0x1899) & 0x10000));
+
+  // Shutdown: pins off (DC_HPD_EN and the interrupt), page flip interrupts off.
+  vega.shutdown();
+  for (uint32_t p = 0; p < 4; ++p) CHECK(!(rig.card.gfx.reg(0x189a + 8 * p) & 0x10000000) && !(rig.card.gfx.reg(0x1899 + 8 * p) & 0x10000));
+  for (uint32_t c = 0; c < 6; ++c) CHECK(rig.card.dce.get(0x1a17 + kCrtcOff[c]) == 0);
+}
+
+static void test_vblank_interrupt() {
+  Rig rig;
+  AmdVegaM vega(rig.alloc);
+  CHECK(vega.bring_up(rig.inputs()));
+  const uint32_t width = 64, height = 8;
+  amd_dce11::FirmwareFramebuffer fw;
+  fw.physical = reinterpret_cast<uint64_t>(rig.vram);
+  fw.bytes = width * height * 4;
+  fw.width = width;
+  fw.height = height;
+  fw.pitch_pixels = width;
+  for (uint32_t i = 0; i < width * height; ++i) reinterpret_cast<uint32_t*>(rig.vram)[i] = 0xFF000000u | i;
+  rig.card.dce.crtc(2, kGpuBase, width);   // controller 2 (the third) shows the firmware's framebuffer
+  fakedce::setup_aperture(rig.card.dce);
+  rig.card.dce.set(0x80d, kGpuBase >> 12);
+  rig.card.dce.set(0x80e, ((kGpuBase + kVideoMemory) >> 12) - 1);
+  ByteView memory;
+  CHECK(vega.engage_display(fw, &memory) && vega.display_engaged());
+  const AmdIrq& irq = *vega.irq();
+  // On for the controller that shows the framebuffer (LB_INTERRUPT_MASK bit 0), only that one; asking twice moves nothing.
+  rig.card.dce.set(0x1ac8 + 0x400, 0x110);   // (other bits are kept)
+  CHECK(vega.set_vblank_interrupt(true) && rig.card.dce.get(0x1ac8 + 0x400) == 0x111 && rig.card.dce.get(0x1ac8) == 0 && rig.card.dce.get(0x1ac8 + 0x200) == 0);
+  CHECK(vega.set_vblank_interrupt(true) && rig.card.dce.get(0x1ac8 + 0x400) == 0x111);
+  // A vertical blank of controller 2 (source 3, data 0): DISP_INTERRUPT_STATUS_CONTINUE2 (0x1859) bit 3 says it is pending; acknowledged with LB_VBLANK_STATUS.VBLANK_ACK (0x10).
+  rig.card.gfx.set_reg(0x1859, 0x8);
+  rig.card.ih.post(3, 0, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && irq.vblank_count(2) == 1 && irq.count(AmdIrq::Kind::DisplayVblank) == 1 && rig.card.dce.get(0x1acb + 0x400) == 0x10);
+  // The status does not say so: counted, nothing acknowledged.
+  rig.card.dce.set(0x1acb + 0x400, 0);
+  rig.card.gfx.set_reg(0x1859, 0);
+  rig.card.ih.post(3, 0, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && irq.vblank_count(2) == 2 && rig.card.dce.get(0x1acb + 0x400) == 0);
+  // The line interrupt (data 1) is acknowledged with LB_VLINE_STATUS.VLINE_ACK (0x10) when pending, and is not a vblank.
+  rig.card.gfx.set_reg(0x1859, 0x4);
+  rig.card.ih.post(3, 1, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && irq.count(AmdIrq::Kind::DisplayVline) == 1 && irq.vblank_count(2) == 2 && rig.card.dce.get(0x1ac9 + 0x400) == 0x10);
+  // Giving the display back turns it off, and it can be asked for again afterwards only with a display.
+  vega.disengage_display();
+  CHECK(rig.card.dce.get(0x1ac8 + 0x400) == 0x110 && !vega.set_vblank_interrupt(true));
+  CHECK(vega.engage_display(fw, &memory) && vega.set_vblank_interrupt(true) && (rig.card.dce.get(0x1ac8 + 0x400) & 1));
+  vega.shutdown();   // (also off at shutdown)
+  CHECK(!(rig.card.dce.get(0x1ac8 + 0x400) & 1));
+}
+
 int main() {
   setvbuf(stdout, nullptr, _IONBF, 0);
   test_plan();
@@ -532,6 +801,12 @@ int main() {
   test_failures();
   test_display();
   test_present();
+  test_interrupts();
+  test_interrupt_sink();
+  test_msi_input();
+  test_sq_messages();
+  test_display_interrupts();
+  test_vblank_interrupt();
   printf(g_failed ? "AmdVegaMTest: %d FAILED\n" : "AmdVegaMTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }

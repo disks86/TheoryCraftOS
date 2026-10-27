@@ -344,6 +344,19 @@ static void test_stop() {
   CHECK(!sdma.copy(0, rig.data_gpu, rig.data_gpu + 64, 16));
 }
 
+// sdma_v3_0_set_trap_irq_state: TRAP_ENABLE (bit 0) of SDMA0_CNTL of each engine (0x3404, 0x3604), the rest kept.
+static void test_trap_interrupts() {
+  Rig rig;
+  AmdSdma3 sdma(rig.card, rig.clock);
+  CHECK(sdma.start(rig.memory()) == AmdSdma3::Result::Ok);
+  rig.card.set_reg(0x3404, 0x40006);
+  rig.card.set_reg(0x3604, 0x0);
+  sdma.set_trap_interrupts(true);
+  CHECK(rig.card.reg(0x3404) == 0x40007 && rig.card.reg(0x3604) == 0x1);
+  sdma.set_trap_interrupts(false);
+  CHECK(rig.card.reg(0x3404) == 0x40006 && rig.card.reg(0x3604) == 0x0);
+}
+
 int main() {
   test_start();
   test_copy_fill();
@@ -354,6 +367,7 @@ int main() {
   test_ib_faults();
   test_ring_space();
   test_stop();
+  test_trap_interrupts();
   printf(g_failed ? "AmdSdma3Test: %d FAILED\n" : "AmdSdma3Test: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }

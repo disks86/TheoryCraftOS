@@ -250,11 +250,35 @@ static void test_refusals() {
   CHECK(rig.card.reg(fakegmc::kContext1Cntl) == 0x1492493 && rig.card.reg(0x560) == (128u << 18) - 1 && rig.card.reg(fakegmc::kL2Cntl3) == 0x120004);
 }
 
+// gmc_v8_0_vm_fault_interrupt_state: the seven fault interrupt enables of both contexts' control registers, nothing else changed.
+static void test_fault_interrupts() {
+  Rig rig;
+  AmdGmc8 gmc(rig.card, rig.clock);
+  CHECK(!gmc.set_fault_interrupts(true));   // (not started)
+  CHECK(gmc.start(rig.plan, rig.memory()) == AmdGmc8::Result::Ok);
+  const uint32_t ctx0 = rig.card.reg(fakegmc::kContext0Cntl), ctx1 = rig.card.reg(fakegmc::kContext1Cntl);
+  // RANGE 0x8, DUMMY_PAGE 0x40, PDE0 0x200, VALID 0x1000, READ 0x8000, WRITE 0x40000, EXECUTE 0x200000
+  const uint32_t bits = 0x8 | 0x40 | 0x200 | 0x1000 | 0x8000 | 0x40000 | 0x200000;
+  CHECK(bits == 0x249248);
+  const size_t before = rig.card.writes.size();
+  CHECK(gmc.set_fault_interrupts(true));
+  CHECK(rig.card.reg(fakegmc::kContext0Cntl) == (ctx0 | bits) && rig.card.reg(fakegmc::kContext1Cntl) == (ctx1 | bits));
+  CHECK(rig.card.writes.size() == before + 2 && rig.card.writes[before].first == fakegmc::kContext0Cntl && rig.card.writes[before + 1].first == fakegmc::kContext1Cntl);
+  CHECK(gmc.set_fault_interrupts(false));
+  CHECK(rig.card.reg(fakegmc::kContext0Cntl) == (ctx0 & ~bits) && rig.card.reg(fakegmc::kContext1Cntl) == (ctx1 & ~bits));
+  // Other bits survive, whatever the register held.
+  rig.card.set_reg(fakegmc::kContext0Cntl, 0xFFFFFFFF);
+  CHECK(gmc.set_fault_interrupts(false) && rig.card.reg(fakegmc::kContext0Cntl) == (0xFFFFFFFFu & ~bits));
+  gmc.stop();
+  CHECK(!gmc.set_fault_interrupts(true));
+}
+
 int main() {
   test_plan();
   test_start();
   test_map();
   test_refusals();
+  test_fault_interrupts();
   printf(g_failed ? "AmdGmc8Test: %d FAILED\n" : "AmdGmc8Test: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }

@@ -283,6 +283,20 @@ bool AmdGmc8::map(uint64_t first_page, ArrayView<const uint64_t> gpu_page_addres
   return true;
 }
 
+bool AmdGmc8::set_fault_interrupts(bool enable) {
+  if (!started_) return false;
+  const uint32_t bits = VM_CONTEXT1_CNTL__RANGE_PROTECTION_FAULT_ENABLE_INTERRUPT_MASK | VM_CONTEXT1_CNTL__DUMMY_PAGE_PROTECTION_FAULT_ENABLE_INTERRUPT_MASK |
+                        VM_CONTEXT1_CNTL__PDE0_PROTECTION_FAULT_ENABLE_INTERRUPT_MASK | VM_CONTEXT1_CNTL__VALID_PROTECTION_FAULT_ENABLE_INTERRUPT_MASK |
+                        VM_CONTEXT1_CNTL__READ_PROTECTION_FAULT_ENABLE_INTERRUPT_MASK | VM_CONTEXT1_CNTL__WRITE_PROTECTION_FAULT_ENABLE_INTERRUPT_MASK |
+                        VM_CONTEXT1_CNTL__EXECUTE_PROTECTION_FAULT_ENABLE_INTERRUPT_MASK;
+  const uint32_t contexts[] = {mmVM_CONTEXT0_CNTL, mmVM_CONTEXT1_CNTL};   // the system context, then the VMs
+  for (uint32_t reg : contexts) {
+    const uint32_t tmp = rd(reg);
+    wr(reg, enable ? (tmp | bits) : (tmp & ~bits));
+  }
+  return true;
+}
+
 bool AmdGmc8::unmap(uint64_t first_page, uint64_t count) {
   const uint64_t pages = plan_.gart_size / kAmdGmc8PageBytes;
   if (!started_ || first_page >= pages || count > pages - first_page) return false;

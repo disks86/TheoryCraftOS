@@ -136,6 +136,40 @@ class Display {
   ByteView memory_;
 };
 
+// The display engine's interrupt sources, as dce_v11_0.c controls them: the page flip of a controller's graphics surface (dce_v11_0_set_pageflip_irq_state), its vertical blank
+// (dce_v11_0_set_crtc_vblank_interrupt_state), and the hot plug detect pins (dce_v11_0_hpd_init / _hpd_fini / _set_hpd_irq_state / _hpd_set_polarity), with the acknowledgements the
+// driver's handlers make (dce_v11_0_crtc_vblank_int_ack, the pageflip handler's clear, dce_v11_0_hpd_int_ack). The pins and controllers are numbered from 0; which pin a connector
+// uses is in the video BIOS, which is not read here, so the pins are handled all alike.
+class Interrupts {
+ public:
+  static constexpr uint32_t kMaxHpd = 6;
+  // dce_v11_0_hpd_init's filter: AMDGPU_HPD_CONNECT_INT_DELAY_IN_MS and AMDGPU_HPD_DISCONNECT_INT_DELAY_IN_MS (amdgpu_mode.h)
+  static constexpr uint32_t kHpdConnectDelayMs = 50, kHpdDisconnectDelayMs = 10;
+
+  explicit Interrupts(IVcnRegisters& registers) : r_(registers) {}
+
+  void set_pageflip(uint32_t crtc, bool enable);   // GRPH_INTERRUPT_CONTROL.GRPH_PFLIP_INT_MASK
+  void set_vblank(uint32_t crtc, bool enable);     // LB_INTERRUPT_MASK.VBLANK_INTERRUPT_MASK
+  // A pin on: DC_HPD_EN, the toggle filter, the pending interrupt acknowledged, the polarity set to report the next change, then DC_HPD_INT_EN. Off: DC_HPD_EN and DC_HPD_INT_EN cleared.
+  void hpd_init(uint32_t pin);
+  void hpd_fini(uint32_t pin);
+  void hpd_set_interrupt(uint32_t pin, bool enable);   // DC_HPD_INT_EN alone (dce_v11_0_set_hpd_irq_state)
+  bool hpd_sense(uint32_t pin);                        // dce_v11_0_hpd_sense: something is connected
+  void hpd_set_polarity(uint32_t pin);                 // interrupt on the next change from what is sensed now
+
+  // What a handler does with a vector: whether the interrupt was asserted (DISP_INTERRUPT_STATUS*), and the acknowledgement. False if the controller or pin does not exist.
+  bool vblank_asserted(uint32_t crtc);
+  bool hpd_asserted(uint32_t pin);
+  void ack_vblank(uint32_t crtc);
+  void ack_vline(uint32_t crtc);
+  bool vline_asserted(uint32_t crtc);
+  bool ack_pageflip(uint32_t crtc);   // clears GRPH_PFLIP_INT_OCCURRED if it is set; true if it was
+  void ack_hpd(uint32_t pin);
+
+ private:
+  IVcnRegisters& r_;
+};
+
 // The OS's picture kept in system memory (cached, so reading and blending are fast; the mapped window of video memory is uncached and slow to read) and sent to the display's
 // framebuffer in video memory a run of rows at a time: by the card's DMA engines when the display offers them, else by the CPU. `video` is the picture in video memory as the
 // display gave it (Display::engage's `memory`).

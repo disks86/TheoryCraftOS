@@ -290,6 +290,7 @@ Value attributes_value(DomBindings::Impl& c, dom::Node* n) {
   Value item;
   vm.get_named(Value::make_object(vm.global()), "__collection_item", &item);
   vm.define_named(list, "item", item, kWritable);
+  vm.define_named(list, "__owner", node_value(c, n), kWritable);   // (setNamedItem and removeNamedItem act on this element)
   set_interface(vm, list, "NamedNodeMap");
   return Value::make_object(list);
 }
@@ -583,7 +584,12 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
       if (IS("cells") && d->parent != n) continue;   // (a row's own cells, not those of a table inside one)
       if ((IS("options") && d->is_tag("option")) || (IS("cells") && (d->is_tag("td") || d->is_tag("th")))) list.push_back(d);
     }
-    *out = Value::make_object(make_collection(c, list));
+    JsObject* collection = make_collection(c, list);
+    if (IS("options")) {   // (an HTMLOptionsCollection acts on its select)
+      set_interface(vm, collection, "HTMLOptionsCollection");
+      vm.define_named(collection, "__owner", node_value(c, n), kWritable);
+    }
+    *out = Value::make_object(collection);
     return true;
   }
   if (IS("selectedIndex") && n->is_tag("select")) {
