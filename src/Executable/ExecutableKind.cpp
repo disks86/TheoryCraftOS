@@ -18,6 +18,7 @@
 #include "Executable/ExecutableKind.hpp"
 #include "Executable/ElfFile.hpp"
 #include "Executable/PeFile.hpp"
+#include "Utility/ByteStream.hpp"
 
 namespace exe {
 
@@ -25,6 +26,53 @@ ExecutableKind identify_executable(ConstByteView head) {
   if (ElfFile::looks_like_elf(head)) return ExecutableKind::Elf;
   if (PeFile::looks_like_pe(head)) return ExecutableKind::Pe;
   return ExecutableKind::None;
+}
+
+Architecture identify_architecture(ConstByteView head) {
+  ByteReader r(head);
+  if (ElfFile::looks_like_elf(head)) {
+    r.seek(5);
+    const uint8_t encoding = r.u8();
+    r.seek(18);
+    const uint16_t machine = r.le16();
+    if (!r.ok()) return Architecture::Unknown;
+    if (encoding != 1) return Architecture::Other;
+    switch (machine) {
+      case 62: return Architecture::X86_64;
+      case 183: return Architecture::AArch64;
+      case 243: return Architecture::RiscV64;
+      case 3: return Architecture::X86_32;
+      case 40: return Architecture::Arm32;
+      default: return Architecture::Other;
+    }
+  }
+  if (PeFile::looks_like_pe(head)) {
+    r.seek(0x3C);
+    const uint32_t lfanew = r.le32();
+    r.seek(uint64_t{lfanew} + 4);
+    const uint16_t machine = r.le16();
+    if (!r.ok()) return Architecture::Unknown;
+    switch (machine) {
+      case kPeMachineAmd64: return Architecture::X86_64;
+      case kPeMachineArm64: return Architecture::AArch64;
+      case kPeMachineI386: return Architecture::X86_32;
+      case kPeMachineArm: return Architecture::Arm32;
+      default: return Architecture::Other;
+    }
+  }
+  return Architecture::Unknown;
+}
+
+StringView architecture_name(Architecture arch) {
+  switch (arch) {
+    case Architecture::X86_64: return "x86-64";
+    case Architecture::AArch64: return "AArch64";
+    case Architecture::RiscV64: return "RISC-V 64";
+    case Architecture::X86_32: return "x86 (32-bit)";
+    case Architecture::Arm32: return "ARM (32-bit)";
+    case Architecture::Other: return "an unknown CPU";
+    default: return "";
+  }
 }
 
 ExecutableKind identify_executable_file(filesystem::IFileSystem& fs, StringView path) {

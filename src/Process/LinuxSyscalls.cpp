@@ -17,6 +17,7 @@
  */
 #include "Process/AddressSpace.hpp"
 #include "Process/LinuxFiles.hpp"
+#include "Process/LinuxThreads.hpp"
 #include "Process/Process.hpp"
 #include "Process/Syscall.hpp"
 
@@ -34,7 +35,7 @@ constexpr uint64_t kAtFdCwd = ~uint64_t{99};      // -100
 enum class Call : uint8_t { None, Read, Write, Writev, Close, Getpid, Gettid, Getuid, Getgid, Exit, ExitGroup, Uname, ClockGettime, Nanosleep, SchedYield, SetTidAddress, Brk, Mmap, Munmap, Mprotect, ArchPrctl, Ioctl, Fstat, Newfstatat, Lseek, Openat, Readlinkat, RtSigaction, RtSigprocmask, Sigaltstack,
   SetRobustList, Rseq, Prlimit64, Getrandom, Gettimeofday, Getppid, Madvise,
   Open, Stat, Lstat, Pread, Pwrite, Readv, Getdents64, Mkdir, Mkdirat, Rmdir, Unlink, Unlinkat, Rename, Renameat, Renameat2, Getcwd, Chdir, Fchdir, Access, Faccessat,
-  Truncate, Ftruncate, Fsync, Dup, Dup2, Dup3, Fcntl, Readlink, Statx, Umask, Succeed };
+  Truncate, Ftruncate, Fsync, Dup, Dup2, Dup3, Fcntl, Readlink, Statx, Umask, Clone, Futex, Tgkill, SchedGetaffinity, Prctl, Succeed };
 constexpr uint16_t kAbsent = 0xFFFF;      // this CPU's table has no such call
 
 struct NumberEntry {
@@ -64,6 +65,8 @@ constexpr NumberEntry kNumbers[] = {
     {90, kAbsent, Call::Succeed},  {91, 52, Call::Succeed},     {268, 53, Call::Succeed},     {92, kAbsent, Call::Succeed},
     {93, 55, Call::Succeed},       {94, kAbsent, Call::Succeed}, {260, 54, Call::Succeed},    {280, 88, Call::Succeed},
     {162, 81, Call::Succeed},
+    {56, 220, Call::Clone},        {202, 98, Call::Futex},      {234, 131, Call::Tgkill},     {200, 130, Call::Tgkill},     {204, 123, Call::SchedGetaffinity},
+    {203, 122, Call::Succeed},     {157, 167, Call::Prctl},
 };
 
 uint64_t error(int64_t errno_value) { return uint64_t(-errno_value); }
@@ -211,13 +214,18 @@ class LinuxSyscalls final : public ISyscallInterface {
       case Call::Writev: return linuxabi::sys_writev(process, a[0], a[1], a[2]);
       case Call::Close: return process.close_descriptor(a[0]) ? 0 : error(kEbadf);
       case Call::Getpid: return process.id();
-      case Call::Gettid: return process.id();        // one thread per process so far
+      case Call::Gettid: return linuxabi::sys_gettid(process);
       case Call::Getuid:
       case Call::Getgid: return 0;
-      case Call::SetTidAddress: return process.id();
+      case Call::SetTidAddress: return linuxabi::sys_set_tid_address(process, a[0]);
       case Call::SchedYield: process.block_yield(); return 0;
-      case Call::Exit:
+      case Call::Exit: return linuxabi::sys_thread_exit(process, uint32_t(a[0] & 0xFF));      // (a thread; the last one takes the process with it)
       case Call::ExitGroup: process.terminate(uint32_t(a[0] & 0xFF)); return 0;
+      case Call::Clone: return linuxabi::sys_clone(process, arch_, a);
+      case Call::Futex: return linuxabi::sys_futex(process, a[0], a[1], a[2], a[3], a[4], a[5]);
+      case Call::Tgkill: return 0;      // signals are not delivered; asking whether a thread exists, or sending one, succeeds
+      case Call::SchedGetaffinity: return linuxabi::sys_sched_getaffinity(process, a[1], a[2]);
+      case Call::Prctl: return 0;      // PR_SET_NAME and friends
       case Call::Uname: return write_uname(process, a[0]);
       case Call::ClockGettime: return clock_gettime(process, a[0], a[1]);
       case Call::Nanosleep: return nanosleep(process, a[0], a[1]);

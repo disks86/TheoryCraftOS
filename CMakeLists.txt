@@ -602,11 +602,30 @@ add_executable(BOOTX64
   src/Process/ModuleLoader.cpp
   src/Process/LinuxSyscalls.cpp
   src/Process/LinuxFiles.cpp
+  src/Process/LinuxThreads.cpp
   src/Process/ProcessFiles.cpp
   src/Process/WindowsFiles.cpp
   src/Process/ProgramEnvironment.cpp
   src/Program/ProgramHost.cpp
   src/Program/ProgramRunner.cpp
+  src/Program/EmulatedTask.cpp
+  src/Emulation/GuestCpu.cpp
+  src/Emulation/EmulatedProcess.cpp
+  src/Emulation/X86_64Cpu.cpp
+  src/Emulation/SoftFloat.cpp
+  src/Emulation/SoftFloatExt.cpp
+  src/Emulation/SoftFloatExtMath.cpp
+  src/Emulation/X86_64X87.cpp
+  src/Emulation/X86_64Vex.cpp
+  src/Emulation/X86_64Crypto.cpp
+  src/Emulation/AArch64Cpu.cpp
+  src/Emulation/AArch64Fp.cpp
+  src/Emulation/AArch64Simd.cpp
+  src/Emulation/RiscV64Cpu.cpp
+  src/Emulation/RiscV64Fp.cpp
+  src/Emulation/RiscV64Vector.cpp
+  src/Emulation/RiscV64VectorInt.cpp
+  src/Emulation/RiscV64VectorFp.cpp
   src/Process/WindowsSyscalls.cpp
   src/Media/Dash.cpp
   src/Media/DashClient.cpp

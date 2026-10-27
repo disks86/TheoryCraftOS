@@ -419,7 +419,7 @@ bool init(allocators::IAllocator& allocator) {
   __asm__ volatile("cpuid" : "+a"(eax), "=b"(ebx), "+c"(ecx), "=d"(edx));
   if (!(edx & (1u << 11))) return false;      // no SYSCALL
   g.allocator = &allocator;
-  if (!g.sync) {
+  if (!g.sync && !process::system_objects()) {      // (an emulated program may have made the system-wide objects already: both kinds of program share them)
     void* sync_memory = allocator.allocate(sizeof(SystemSync));
     void* objects_memory = sync_memory ? allocator.allocate(sizeof(process::ObjectManager)) : nullptr;
     if (!objects_memory) { if (sync_memory) allocator.deallocate(sync_memory); return false; }
