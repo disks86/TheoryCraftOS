@@ -384,7 +384,14 @@ NATIVE(win_get_computed_style) {
   DomBindings::Impl& c = impl(vm);
   dom::Node* n = node_of(arg_at(args, argc, 0));
   if (!n || !n->is_element()) return vm.throw_error(ErrorKind::TypeError, "Failed to execute 'getComputedStyle' on 'Window': parameter 1 is not of type 'Element'.");
-  *result = make_computed_style(c, n);
+  uint32_t pseudo = 0;   // getComputedStyle(element, '::before')
+  String which(vm.allocator());
+  if (argc > 1 && !args[1].is_undefined() && !args[1].is_null() && arg_text(vm, args[1], &which)) {
+    const StringView w = which.view();
+    if (w.equals_ignore_case("::before") || w.equals_ignore_case(":before")) pseudo = static_cast<uint32_t>(PseudoElement::Before);
+    else if (w.equals_ignore_case("::after") || w.equals_ignore_case(":after")) pseudo = static_cast<uint32_t>(PseudoElement::After);
+  }
+  *result = make_computed_style(c, n, pseudo);
   return true;
 }
 

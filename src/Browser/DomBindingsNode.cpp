@@ -611,7 +611,7 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
     if (n->is_tag("input")) { *out = str_value(vm, "text"); return true; }
     if (n->is_tag("button")) { *out = str_value(vm, "submit"); return true; }
   }
-  if ((IS("htmlFor") && n->is_tag("output")) || (IS("sandbox") && n->is_tag("iframe"))) return false;   // (token lists: the script's accessors)
+  if ((IS("htmlFor") && n->is_tag("output")) || (IS("sandbox") && n->is_tag("iframe")) || (IS("disabled") && (n->is_tag("style") || n->is_tag("link")))) return false;   // (token lists, and the flag of a style sheet: the script's accessors)
   if (in_svg_namespace(n) && svg_own_name(k)) return false;
   if (const ReflectedAttribute* r = find_reflected(k)) {
     StringView v;
@@ -745,7 +745,7 @@ HostClass::Set node_set(Vm& vm, JsObject* o, JsString* key, const Value& value) 
     if (!arg_text(vm, value, &text)) return HostClass::Set::Threw;
     return done(dom::set_text_content(n, text.view()));
   }
-  if ((IS("htmlFor") && n->is_tag("output")) || (IS("sandbox") && n->is_tag("iframe"))) return HostClass::Set::NotHandled;
+  if ((IS("htmlFor") && n->is_tag("output")) || (IS("sandbox") && n->is_tag("iframe")) || (IS("disabled") && (n->is_tag("style") || n->is_tag("link")))) return HostClass::Set::NotHandled;
   if (in_svg_namespace(n) && svg_own_name(k)) return HostClass::Set::NotHandled;
   if (const ReflectedAttribute* r = find_reflected(k)) {
     switch (r->kind) {

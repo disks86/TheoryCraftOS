@@ -637,27 +637,39 @@ void position_list_text(StringView value, String* out) {
   }
 }
 
+Value computed_snapshot(DomBindings::Impl& c, dom::Node* element, PseudoElement pseudo);
+extern const HostClass kComputedClass;
+
+PseudoElement computed_pseudo(JsObject* o) { return static_cast<PseudoElement>(o->position); }   // (a computed style keeps its pseudo-element here)
+
+Value computed_view(Vm& vm, const Value& self) {   // the snapshot behind a live computed style
+  if (!self.is_object() || self.as_object()->host != &kComputedClass) return Value::make_null();
+  return computed_snapshot(impl(vm), static_cast<dom::Node*>(self.as_object()->host_data), computed_pseudo(self.as_object()));
+}
+
 NATIVE(computed_get_property_value) {
   String name(vm.allocator());
-  if (!self.is_object() || !arg_text(vm, arg_at(args, argc, 0), &name)) return false;
+  const Value snap = computed_view(vm, self);
+  if (!snap.is_object() || !arg_text(vm, arg_at(args, argc, 0), &name)) return false;
   String js(vm.allocator());
   if (name.view().starts_with("--")) js.assign(name.view());   // (a custom property keeps its name)
   else js_name_from_css(name.view(), &js);
   if (name.view().equals("float")) js.assign("cssFloat");
   Value v;
-  *result = vm.get_plain(self.as_object(), vm.intern(js.view()), &v) ? v : str_value(vm, "");
+  *result = vm.get_plain(snap.as_object(), vm.intern(js.view()), &v) ? v : str_value(vm, "");
   return true;
 }
 
 NATIVE(computed_item) {   // the name of the i-th property the style lists
   double d;
   *result = str_value(vm, "");
-  if (!self.is_object() || !vm.to_number(arg_at(args, argc, 0), &d) || d < 0) return true;
-  JsObject* keys = vm.own_keys(self.as_object());
+  const Value snap = computed_view(vm, self);
+  if (!snap.is_object() || !vm.to_number(arg_at(args, argc, 0), &d) || d < 0) return true;
+  JsObject* keys = vm.own_keys(snap.as_object());
   uint64_t seen = 0;
   for (uint32_t i = 0; i < keys->length; ++i) {
     const StringView k = keys->items[i].as_string()->view();
-    if (k.empty() || (k[0] >= '0' && k[0] <= '9') || k.equals("length")) continue;
+    if (k.empty() || (k[0] >= '0' && k[0] <= '9') || k.equals("length") || k.equals("cssText")) continue;
     if (seen++ == static_cast<uint64_t>(d)) {
       String css(vm.allocator());
       if (k.starts_with("--")) css.assign(k);
@@ -835,11 +847,51 @@ const char* overscroll_text(OverscrollBehavior o) { return o == OverscrollBehavi
 
 }  // namespace
 
-Value make_computed_style(DomBindings::Impl& c, dom::Node* element) {
+namespace {
+
+// A snapshot of the computed style of `element`: a plain object holding the properties. The object script sees (make_computed_style) is live and builds one of these
+// whenever it is read.
+// The `content` of a pseudo-element as getComputedStyle gives it: strings and attr() become one string (counters and quotes stay as written).
+bool pseudo_content_text(const dom::Node* n, StringView raw, String* out) {
+  String text(out->allocator());
+  uint64_t i = 0;
+  while (i < raw.size()) {
+    const char c = raw[i];
+    if (c == ' ' || c == '\t' || c == '\n') { ++i; continue; }
+    if (c == '"' || c == '\'') {
+      ++i;
+      while (i < raw.size() && raw[i] != c) {
+        if (raw[i] == '\\' && i + 1 < raw.size()) ++i;
+        text.push_back(raw[i++]);
+      }
+      if (i >= raw.size()) return false;
+      ++i;
+      continue;
+    }
+    if (raw.substr(i).starts_with("attr(")) {
+      const uint64_t close = raw.substr(i).find(')');
+      if (close == StringView::npos) return false;
+      StringView value;
+      if (dom::get_attribute(n, raw.substr(i + 5, close - 5).trimmed(), &value)) text.append(value);
+      i += close + 1;
+      continue;
+    }
+    return false;
+  }
+  out->push_back('"');
+  for (uint64_t k = 0; k < text.size(); ++k) {
+    if (text[k] == '"' || text[k] == '\\') out->push_back('\\');
+    out->push_back(text[k]);
+  }
+  out->push_back('"');
+  return true;
+}
+
+Value computed_snapshot(DomBindings::Impl& c, dom::Node* element, PseudoElement pseudo) {
   Vm& vm = c.vm;
-  JsObject* o = vm.new_object(c.computed_proto);
+  JsObject* o = vm.new_plain();
   Style s;
-  const bool known = element && element->is_element() && c.host.computed_style(element, &s);
+  const bool known = element && element->is_element() && (pseudo == PseudoElement::None ? c.host.computed_style(element, &s) : c.host.computed_pseudo_style(element, pseudo, &s));
   auto set = [&](const char* name, StringView value) { vm.define_named(o, name, str_value(vm, value)); };
   String t(vm.allocator());
   if (!known) {
@@ -870,7 +922,7 @@ Value make_computed_style(DomBindings::Impl& c, dom::Node* element) {
       case Layout::TableRow: display = "table-row"; break;
       case Layout::TableCell: display = "table-cell"; break;
       case Layout::TableCaption: display = "table-caption"; break;
-      default: display = s.display == Display::ListItem ? "list-item" : s.display == Display::Block ? (s.inline_box ? "inline-block" : "block") : s.inline_box ? "inline-block" : "inline"; break;
+      default: display = s.display == Display::ListItem ? "list-item" : s.display == Display::Block ? (s.inline_box ? "inline-block" : s.flow_root ? "flow-root" : "block") : s.inline_box ? "inline-block" : "inline"; break;
     }
   }
   // controls are inline-blocks; a floated or absolutely positioned box is blockified
@@ -1223,7 +1275,10 @@ Value make_computed_style(DomBindings::Impl& c, dom::Node* element) {
   set("listStylePosition", s.list_inside ? "inside" : "outside");
   set("counterReset", text_of(s.counter_reset, "none"));
   set("counterIncrement", text_of(s.counter_increment, "none"));
-  set("content", s.has_content ? text_of(s.content, "normal") : StringView(s.content_kind == 1 ? "none" : "normal"));
+  String content_text(vm.allocator());
+  if (pseudo != PseudoElement::None && s.has_content && pseudo_content_text(element, text_of(s.content, "normal"), &content_text)) set("content", content_text.view());
+  else if (pseudo != PseudoElement::None && !s.has_content) set("content", "none");
+  else set("content", s.has_content ? text_of(s.content, "normal") : StringView(s.content_kind == 1 ? "none" : "normal"));
   set("gridColumnStart", text_of(s.grid_column_start, "auto"));
   set("gridColumnEnd", text_of(s.grid_column_end, "auto"));
   set("gridRowStart", text_of(s.grid_row_start, "auto"));
@@ -1265,17 +1320,74 @@ Value make_computed_style(DomBindings::Impl& c, dom::Node* element) {
   {   // length and the indexes list the properties (the names the item() method gives)
     JsObject* keys = vm.own_keys(o);
     uint32_t count = 0;
+    String css_text(vm.allocator());   // cssText: every property, as `name: value;`
     for (uint32_t i = 0; i < keys->length; ++i) {
       const StringView k = keys->items[i].as_string()->view();
-      if (k.empty() || (k[0] >= '0' && k[0] <= '9') || k.equals("length")) continue;
+      if (k.empty() || (k[0] >= '0' && k[0] <= '9') || k.equals("length") || k.equals("cssText")) continue;
       String css(vm.allocator()), index(vm.allocator());
       if (k.starts_with("--")) css.assign(k);
       else css_name_from_js(k, &css);
       index.append_uint(count++);
       vm.define(o, vm.intern(index.view()), str_value(vm, css.equals("css-float") ? StringView("float") : css.view()), 0);
+      Value pv;
+      if (vm.get_plain(o, keys->items[i].as_string(), &pv) && pv.is_string()) {
+        if (!css_text.empty()) css_text.push_back(' ');
+        css_text.append(css.equals("css-float") ? StringView("float") : css.view());
+        css_text.append(": ");
+        css_text.append(pv.as_string()->view());
+        css_text.push_back(';');
+      }
     }
+    vm.define(o, vm.intern("cssText"), str_value(vm, css_text.view()), 0);
     vm.define(o, vm.intern("length"), num_value(static_cast<double>(count)), 0);
   }
+  return Value::make_object(o);
+}
+
+dom::Node* computed_node(JsObject* o) { return static_cast<dom::Node*>(o->host_data); }
+
+bool computed_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
+  const StringView k = key->view();
+  if (k.empty() || (k.size() > 1 && k[0] == '_' && k[1] == '_')) return false;
+  Value ignored;
+  if (vm.get_plain(impl(vm).computed_proto, key, &ignored)) return false;   // (a method: no snapshot is needed to find it)
+  const Value snap = computed_snapshot(impl(vm), computed_node(o), computed_pseudo(o));
+  return snap.is_object() && vm.get_plain(snap.as_object(), key, out);
+}
+
+HostClass::Set computed_set(Vm& vm, JsObject* o, JsString* key, const Value& value) {
+  (void)o;
+  (void)value;
+  const StringView k = key->view();
+  if (k.empty() || (k.size() > 1 && k[0] == '_' && k[1] == '_') || k.equals("getPropertyValue") || k.equals("item") || k.equals("getPropertyPriority") || k.equals("setProperty") ||
+      k.equals("removeProperty"))
+    return HostClass::Set::NotHandled;
+  throw_dom(vm, "NoModificationAllowedError", "These styles are computed, and therefore the property is read-only.");
+  return HostClass::Set::Threw;
+}
+
+bool computed_remove(Vm& vm, JsObject* o, JsString* key, bool* deleted) {
+  (void)vm;
+  (void)o;
+  (void)key;
+  *deleted = false;
+  return true;
+}
+
+void computed_keys(Vm& vm, JsObject* o, JsObject* keys) {
+  const Value snap = computed_snapshot(impl(vm), computed_node(o), computed_pseudo(o));
+  if (!snap.is_object()) return;
+  JsObject* own = vm.own_keys(snap.as_object());
+  for (uint32_t i = 0; i < own->length; ++i) vm.array_push(keys, own->items[i]);
+}
+
+const HostClass kComputedClass = {"CSSStyleDeclaration", computed_get, computed_set, computed_remove, computed_keys};
+
+}  // namespace
+
+Value make_computed_style(DomBindings::Impl& c, dom::Node* element, uint32_t pseudo) {
+  JsObject* o = c.vm.new_host_object(c.computed_proto, &kComputedClass, element);
+  o->position = pseudo;
   return Value::make_object(o);
 }
 
@@ -1544,23 +1656,30 @@ const HostClass kDatasetClass = {"DOMStringMap", dataset_get, dataset_set, datas
 
 // --- CSS ------------------------------------------------------------------------------------------------------------------------
 
-NATIVE(css_escape) {
+NATIVE(css_escape) {   // CSSOM 2.1 "serialize an identifier"
   String text(vm.allocator()), out(vm.allocator());
   if (!arg_text(vm, arg_at(args, argc, 0), &text)) return false;
-  for (uint64_t i = 0; i < text.size(); ++i) {
+  const char hex[] = "0123456789abcdef";
+  const uint64_t n = text.size();
+  for (uint64_t i = 0; i < n; ++i) {
     const char ch = text[i];
-    const bool plain = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '-' || ch == '_' || static_cast<uint8_t>(ch) >= 0x80 || (ch >= '0' && ch <= '9' && i > 0);
-    if (!plain) {
-      if (ch >= '0' && ch <= '9') {   // a digit at the start: as a code point escape
-        out.push_back('\\');
-        out.push_back('3');
-        out.push_back(ch);
-        out.push_back(' ');
-        continue;
-      }
+    const uint8_t u = static_cast<uint8_t>(ch);
+    const bool digit = ch >= '0' && ch <= '9';
+    if (u == 0) {
+      out.append("\xEF\xBF\xBD");   // U+FFFD
+    } else if ((u >= 0x01 && u <= 0x1f) || u == 0x7f || (digit && i == 0) || (digit && i == 1 && text[0] == '-')) {
+      out.push_back('\\');   // a code point escape, closed by a space
+      if (u >= 0x10) out.push_back(hex[u >> 4]);
+      out.push_back(hex[u & 15]);
+      out.push_back(' ');
+    } else if (i == 0 && ch == '-' && n == 1) {
       out.push_back('\\');
+      out.push_back(ch);
+    } else {
+      const bool plain = u >= 0x80 || ch == '-' || ch == '_' || digit || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z');
+      if (!plain) out.push_back('\\');
+      out.push_back(ch);
     }
-    out.push_back(ch);
   }
   *result = str_value(vm, out.view());
   return true;
