@@ -241,7 +241,8 @@ Node* form_owner(const Node* control) {
 }
 
 void form_controls(const Node* form, List<Node*>* out) {
-  const Node* root = form->owner->root();
+  const Node* root = form;   // (the tree the form is in: a form that is not in the document still has its controls)
+  while (root->parent) root = root->parent;
   for (Node* n = root->first_child; n; n = next_in_tree(n, root))
     if (n->is_element() && is_listed_control(n) && form_owner(n) == form) out->push_back(n);
 }
