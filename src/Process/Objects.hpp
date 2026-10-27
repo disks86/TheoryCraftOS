@@ -143,6 +143,16 @@ class ObjectManager {
   bool unlock_range(StringView path, const void* owner, uint64_t offset, uint64_t length);
   void unlock_all(const void* owner);      // the open file is gone
 
+  // --- sharing of files (the access an open file has and the access it lets others have): a new open fails with a sharing violation if the access it wants is not shared by an
+  // open file of the same path, or if it shares less than the access an open file already has. `access` and `share` use ShareBits. Opens that want none of the three (attribute
+  // queries) neither conflict nor count.
+  static constexpr uint32_t kShareRead = 1, kShareWrite = 2, kShareDelete = 4;
+  enum class ShareResult { Granted, Violation, Full };
+  ShareResult share_acquire(StringView path, const void* owner, uint32_t access, uint32_t share);      // (owner null: only check)
+  // Would an open wanting `access` with everything shared be allowed? (Deleting a file, renaming it.) Takes the lock itself.
+  bool share_allows(StringView path, uint32_t access);
+  void share_release(const void* owner);      // the open file is gone
+
   // --- job objects (kind Job: create() and open() make and find them). A job groups processes: its limits (active process count, kill on close, breakaway) are enforced and
   // its members can be ended together. A process belongs to at most one job; the processes it starts join the same job. Members are ended by a flag that they see themselves
   // at their next system call or timer tick (job_kill_for(), which takes no lock). All these take the lock themselves.
@@ -266,7 +276,7 @@ class ObjectManager {
   void job_flag_all_locked(Job& j, uint32_t code);
   Pipe* pipe_of(uint32_t id);      // (locked)
   void free_pipe_locked(Object& o);
-  static constexpr uint32_t kMaxPipes = 128, kMaxSections = 64, kMaxLocks = 256;
+  static constexpr uint32_t kMaxPipes = 128, kMaxSections = 64, kMaxLocks = 256, kMaxShares = 1024;
 
   struct Watch {
     bool used = false;
@@ -289,6 +299,8 @@ class ObjectManager {
   Pipe* pipes_ = nullptr;      // kMaxPipes of them, made when the first pipe is
   struct RangeLock;
   RangeLock* locks_ = nullptr;      // kMaxLocks of them, made with the first
+  struct ShareEntry;
+  ShareEntry* shares_ = nullptr;      // kMaxShares of them, made with the first
   Section* sections_ = nullptr;      // kMaxSections, made with the first section
   Job* jobs_ = nullptr;              // kJobMaxJobs, made with the first job (never moved: job_kill_for() reads it without the lock)
   uint32_t pending_kills_ = 0;       // members flagged to end that have not ended yet (atomic)

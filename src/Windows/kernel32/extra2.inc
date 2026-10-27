@@ -213,16 +213,15 @@ EXPORT BOOL WINAPI SetFileInformationByHandle(HANDLE h, int info_class, LPVOID i
 
 typedef DWORD (WINAPI *LPPROGRESS_ROUTINE_)(LARGE_INTEGER, LARGE_INTEGER, LARGE_INTEGER, LARGE_INTEGER, DWORD, DWORD, HANDLE, HANDLE, LPVOID);
 EXPORT BOOL WINAPI CopyFileExW(LPCWSTR from, LPCWSTR to, LPPROGRESS_ROUTINE_ progress, LPVOID data, LPBOOL cancel, DWORD flags) {
-  if (cancel && *cancel) { set_error(ERROR_REQUEST_ABORTED); return FALSE; }
-  if (!CopyFileW(from, to, (flags & 1 /* COPY_FILE_FAIL_IF_EXISTS */) != 0)) return FALSE;
-  if (progress) {      /* one call at the end, as for a copy that went in one piece */
-    WIN32_FILE_ATTRIBUTE_DATA attributes;
-    LARGE_INTEGER size;
-    size.QuadPart = GetFileAttributesExW(to, 0, &attributes) ? ((LONGLONG)attributes.nFileSizeHigh << 32) | attributes.nFileSizeLow : 0;
-    const DWORD r = progress(size, size, size, size, 1 /* STREAM_CHANGED */, 1 /* CALLBACK_STREAM_SWITCH */, NULL, NULL, data);
-    (void)r;
-  }
-  return TRUE;
+  return copy_file_core(from, to, (flags & 1 /* COPY_FILE_FAIL_IF_EXISTS */) != 0, (COPY_PROGRESS_)progress, data, cancel);
+}
+typedef struct { DWORD dwSize, dwCopyFlags; BOOL *pfCancel; PVOID pProgressRoutine; PVOID pvCallbackContext; } COPYFILE2_PARAMETERS_;
+/* CopyFile2: the same copy, answering an HRESULT (and leaving the Win32 error behind). The progress routine of its own kind is not called. */
+EXPORT LONG WINAPI CopyFile2(LPCWSTR from, LPCWSTR to, const COPYFILE2_PARAMETERS_ *parameters) {
+  const BOOL fail_if_exists = parameters && (parameters->dwCopyFlags & 1);
+  if (copy_file_core(from, to, fail_if_exists, NULL, NULL, parameters ? parameters->pfCancel : NULL)) return 0;
+  const DWORD error = GetLastError();
+  return (LONG)(error == 0 ? 0u : ((error & 0xFFFF) | 0x80070000u));
 }
 EXPORT BOOL WINAPI CopyFileExA(LPCSTR from, LPCSTR to, LPPROGRESS_ROUTINE_ progress, LPVOID data, LPBOOL cancel, DWORD flags) {
   WCHAR *a = from ? to_wide(from) : NULL, *b = to ? to_wide(to) : NULL;

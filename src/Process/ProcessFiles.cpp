@@ -162,7 +162,7 @@ bool ProcessFiles::close(uint64_t slot) {
   closing.kind = slots_[slot].kind;
   closing.object = static_cast<SharedPointer<OpenObject>&&>(slots_[slot].object);
   slots_[slot] = Slot();
-  if (closing.object && closing.object.use_count() == 1) if (ObjectManager* objects = system_objects()) objects->unlock_all(closing.object.get());      // (its byte-range locks go with it)
+  if (closing.object && closing.object.use_count() == 1) if (ObjectManager* objects = system_objects()) { objects->unlock_all(closing.object.get()); objects->share_release(closing.object.get()); }      // (its byte-range locks and its share of the file go with it)
   if (closing.object && closing.object.use_count() == 1 && closing.object->change_watch != 0)
     if (ObjectManager* objects = system_objects()) objects->release(closing.object->change_watch);      // ReadDirectoryChangesW's own watch goes with the handle
   if (closing.object && closing.object.use_count() == 1 && closing.object->delete_on_close) {

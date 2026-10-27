@@ -44,9 +44,10 @@ constexpr uint64_t kUseFilePointer = 0xFFFFFFFFFFFFFFFEull, kWriteToEnd = 0xFFFF
 // NtCreateFile dispositions, options, access bits, Information results
 constexpr uint32_t kSupersede = 0, kOpen = 1, kCreate = 2, kOpenIf = 3, kOverwrite = 4, kOverwriteIf = 5;
 constexpr uint32_t kDirectoryFile = 1, kNonDirectoryFile = 0x40, kDeleteOnClose = 0x1000;
+constexpr uint32_t kCannotDelete = 0xC0000121u;
 constexpr uint32_t kGenericRead = 0x80000000u, kGenericWrite = 0x40000000u, kGenericAll = 0x10000000u, kFileReadData = 1, kFileWriteData = 2, kFileAppendData = 4;
 constexpr uint64_t kFileSuperseded = 0, kFileOpened = 1, kFileCreated = 2, kFileOverwritten = 3;
-constexpr uint32_t kAttributeReadOnly = 1, kAttributeDirectory = 0x10, kAttributeNormal = 0x80, kAttributeReparsePoint = 0x400;
+constexpr uint32_t kAttributeReadOnly = 1, kAttributeDirectory = 0x10, kAttributeNormal = 0x80, kAttributeArchive = 0x20, kAttributeReparsePoint = 0x400;
 // FILE_INFORMATION_CLASS
 constexpr uint32_t kFileDirectoryInformation = 1, kFileFullDirectoryInformation = 2, kFileBothDirectoryInformation = 3, kFileBasicInformation = 4,
                    kFileStandardInformation = 5, kFileRenameInformation = 10, kFileNamesInformation = 12, kFileDispositionInformation = 13,
@@ -120,6 +121,7 @@ uint32_t attributes_of(const DirectoryEntry& e) {
   uint32_t a = e.type == NodeType::Directory ? kAttributeDirectory : 0;
   if (e.read_only) a |= kAttributeReadOnly;
   if (e.is_symlink) a |= kAttributeReparsePoint;
+  if (e.type != NodeType::Directory && !e.is_symlink) a |= kAttributeArchive;      // (not kept: a file always counts as one that has not been backed up)
   return a ? a : kAttributeNormal;
 }
 
@@ -182,7 +184,7 @@ uint32_t status_for(ProcessFiles& files, Status status, StringView virtual_path)
 }
 
 // Opens (or creates) what the OBJECT_ATTRIBUTES name. On success *handle and *information (FILE_OPENED, ...) are set.
-uint32_t open_by_attributes(Process& p, uint64_t object_attributes, uint32_t access, uint32_t disposition, uint32_t options, uint64_t* information, uint64_t* handle) {
+uint32_t open_by_attributes(Process& p, uint64_t object_attributes, uint32_t access, uint32_t disposition, uint32_t options, uint64_t* information, uint64_t* handle, uint32_t share = 7, uint32_t file_attributes = 0) {
   ProcessFiles& files = p.files();
   {
     uint32_t pipe_status = 0;
@@ -224,12 +226,35 @@ uint32_t open_by_attributes(Process& p, uint64_t object_attributes, uint32_t acc
     if (disposition == kCreate) return kObjectNameCollision;
     if (f.must_not_be_directory) return kFileIsADirectory;
   }
+  ObjectManager* sharing = system_objects();
+  uint32_t wanted = 0;      // what the open does with the file, for the sharing rules
+  if (access & (kGenericRead | kGenericAll | kFileReadData | 0x20 /* FILE_EXECUTE */ | 0x20000000u /* GENERIC_EXECUTE */)) wanted |= ObjectManager::kShareRead;
+  if (access & (kGenericWrite | kGenericAll | kFileWriteData | kFileAppendData)) wanted |= ObjectManager::kShareWrite;
+  if ((access & (kGenericAll | 0x10000 /* DELETE */)) || (options & kDeleteOnClose)) wanted |= ObjectManager::kShareDelete;
+  if (existed && before.type != NodeType::Directory) {
+    if (f.must_be_directory) return kNotADirectory;
+    if (before.read_only && f.write) return kAccessDenied;      // a read-only file cannot be opened for writing, nor overwritten
+    if (options & kDeleteOnClose) {
+      if (!(access & (kGenericAll | 0x10000))) return kAccessDenied;
+      if (before.read_only) return kCannotDelete;
+    }
+    if (sharing && wanted && sharing->share_acquire(virtual_path.view(), nullptr, wanted, share) == ObjectManager::ShareResult::Violation) return kSharingViolation;
+  } else if ((options & kDeleteOnClose) && !(access & (kGenericAll | 0x10000))) {
+    return kAccessDenied;
+  }
   uint32_t slot = 0;
   bool created = false;
   const Status status = files.open(virtual_path.view(), f, &slot, &created);
   if (status == Status::OutOfMemory && files.free_slot(0) < 0) return kTooManyOpenedFiles;
   if (status != Status::Ok) return status_for(files, status, virtual_path.view());
   if (created) notify_directory_changed(virtual_path.view(), kFileActionAdded);
+  if (created && (file_attributes & kAttributeReadOnly)) {
+    filesystem::MetadataChange change;
+    change.set_read_only = true;
+    change.read_only = true;
+    files.set_metadata(virtual_path.view(), change);
+  }
+  if (sharing && wanted && files.kind(slot) == DescriptorKind::File) sharing->share_acquire(virtual_path.view(), files.object(slot), wanted, share);
   if (options & kDeleteOnClose) files.object(slot)->delete_on_close = true;
   uint32_t object_flags = 0;
   uint8_t flag_bytes[4];
@@ -434,10 +459,10 @@ bool argument(Process& p, const SyscallRequest& r, uint32_t index, uint64_t* out
 uint32_t nt_create_file(Process& p, const SyscallRequest& r) {
   // NtCreateFile(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, PLARGE_INTEGER AllocationSize, ULONG FileAttributes, ULONG ShareAccess,
   //              ULONG CreateDisposition, ULONG CreateOptions, PVOID EaBuffer, ULONG EaLength)
-  uint64_t status_block = 0, disposition = 0, options = 0;
-  if (!argument(p, r, 3, &status_block) || !argument(p, r, 7, &disposition) || !argument(p, r, 8, &options)) return kAccessViolation;
+  uint64_t status_block = 0, disposition = 0, options = 0, file_attributes = 0, share = 0;
+  if (!argument(p, r, 3, &status_block) || !argument(p, r, 5, &file_attributes) || !argument(p, r, 6, &share) || !argument(p, r, 7, &disposition) || !argument(p, r, 8, &options)) return kAccessViolation;
   uint64_t information = 0, handle = 0;
-  const uint32_t status = open_by_attributes(p, r.args[2], static_cast<uint32_t>(r.args[1]), static_cast<uint32_t>(disposition), static_cast<uint32_t>(options), &information, &handle);
+  const uint32_t status = open_by_attributes(p, r.args[2], static_cast<uint32_t>(r.args[1]), static_cast<uint32_t>(disposition), static_cast<uint32_t>(options), &information, &handle, static_cast<uint32_t>(share) & 7, static_cast<uint32_t>(file_attributes));
   if (status != kSuccess) {
     store_io_status(p, status_block, status, 0);
     return status;
@@ -451,10 +476,10 @@ uint32_t nt_create_file(Process& p, const SyscallRequest& r) {
 
 uint32_t nt_open_file(Process& p, const SyscallRequest& r) {
   // NtOpenFile(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, ULONG ShareAccess, ULONG OpenOptions)
-  uint64_t status_block = 0, options = 0;
-  if (!argument(p, r, 3, &status_block) || !argument(p, r, 5, &options)) return kAccessViolation;
+  uint64_t status_block = 0, options = 0, share = 0;
+  if (!argument(p, r, 3, &status_block) || !argument(p, r, 4, &share) || !argument(p, r, 5, &options)) return kAccessViolation;
   uint64_t information = 0, handle = 0;
-  const uint32_t status = open_by_attributes(p, r.args[2], static_cast<uint32_t>(r.args[1]), kOpen, static_cast<uint32_t>(options), &information, &handle);
+  const uint32_t status = open_by_attributes(p, r.args[2], static_cast<uint32_t>(r.args[1]), kOpen, static_cast<uint32_t>(options), &information, &handle, static_cast<uint32_t>(share) & 7);
   if (status != kSuccess) {
     store_io_status(p, status_block, status, 0);
     return status;
@@ -775,6 +800,7 @@ uint32_t nt_delete_file(Process& p, const SyscallRequest& r) {
   const uint32_t named = object_path(p, r.args[0], &virtual_path);
   if (named != kSuccess) return named;
   if (virtual_path.view() == StringView("/")) return kAccessDenied;
+  if (ObjectManager* sharing = system_objects()) if (!sharing->share_allows(virtual_path.view(), ObjectManager::kShareDelete)) return kSharingViolation;
   const Status status = files.remove(virtual_path.view());
   if (status == Status::Ok) notify_directory_changed(virtual_path.view(), kFileActionRemoved);
   return status_for(files, status, virtual_path.view());

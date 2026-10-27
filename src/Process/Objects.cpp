@@ -228,6 +228,7 @@ ObjectManager::~ObjectManager() {
   }
   if (jobs_ && allocator_) allocator_->deallocate(jobs_);
   if (locks_ && allocator_) allocator_->deallocate(locks_);
+  if (shares_ && allocator_) allocator_->deallocate(shares_);
   if (sections_) {
     for (uint32_t i = 0; i < kMaxSections; ++i) if (sections_[i].storage && allocator_) allocator_->deallocate(sections_[i].storage);
     if (allocator_) allocator_->deallocate(sections_);
@@ -518,6 +519,61 @@ bool ObjectManager::unlock_range(StringView path, const void* owner, uint64_t of
     return true;
   }
   return false;
+}
+
+struct ObjectManager::ShareEntry {
+  bool used = false;
+  const void* owner = nullptr;
+  uint32_t access = 0, share = 0;
+  char path[260] = {};
+  uint32_t path_size = 0;
+};
+
+ObjectManager::ShareResult ObjectManager::share_acquire(StringView path, const void* owner, uint32_t access, uint32_t share) {
+  Locked hold(sync_);
+  if (!allocator_ || path.size() >= 260) return ShareResult::Full;
+  if (!shares_) {
+    void* memory = allocator_->allocate(sizeof(ShareEntry) * kMaxShares);
+    if (!memory) return ShareResult::Full;
+    shares_ = static_cast<ShareEntry*>(memory);
+    for (uint32_t i = 0; i < kMaxShares; ++i) new (&shares_[i]) ShareEntry();
+  }
+  access &= kShareRead | kShareWrite | kShareDelete;
+  if (access == 0) return ShareResult::Granted;      // (nothing to conflict with, and nothing to remember)
+  for (uint32_t i = 0; i < kMaxShares; ++i) {
+    const ShareEntry& e = shares_[i];
+    if (!e.used || !same_name(e.path, e.path_size, path)) continue;
+    if ((access & ~e.share) != 0 || (e.access & ~share) != 0) return ShareResult::Violation;
+  }
+  if (!owner) return ShareResult::Granted;      // only asked whether it would be allowed
+  for (uint32_t i = 0; i < kMaxShares; ++i) {
+    ShareEntry& e = shares_[i];
+    if (e.used) continue;
+    e.used = true;
+    e.owner = owner;
+    e.access = access;
+    e.share = share & (kShareRead | kShareWrite | kShareDelete);
+    for (uint32_t k = 0; k < path.size(); ++k) e.path[k] = path[k];
+    e.path_size = static_cast<uint32_t>(path.size());
+    return ShareResult::Granted;
+  }
+  return ShareResult::Full;
+}
+
+bool ObjectManager::share_allows(StringView path, uint32_t access) {
+  Locked hold(sync_);
+  if (!shares_) return true;
+  for (uint32_t i = 0; i < kMaxShares; ++i) {
+    const ShareEntry& e = shares_[i];
+    if (e.used && same_name(e.path, e.path_size, path) && (access & ~e.share) != 0) return false;
+  }
+  return true;
+}
+
+void ObjectManager::share_release(const void* owner) {
+  Locked hold(sync_);
+  if (!shares_) return;
+  for (uint32_t i = 0; i < kMaxShares; ++i) if (shares_[i].used && shares_[i].owner == owner) shares_[i].used = false;
 }
 
 void ObjectManager::unlock_all(const void* owner) {
