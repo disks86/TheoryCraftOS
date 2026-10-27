@@ -11820,9 +11820,10 @@ const char kFinishPrelude[] = R"JSPRELUDE((function (g) {
   need('HTMLFormControlsCollection', 'HTMLCollection');
   (function () {
     var HOC = need('HTMLOptionsCollection', 'HTMLCollection');
-    M(HOC, 'add', function (option, before) { illegalCall(); });
-    M(HOC, 'remove', function (i) { illegalCall(); });
-    G(HOC, 'selectedIndex', function () { return undefined; });
+    var owner = function (c) { if (!c.__owner) illegalCall(); return c.__owner; };
+    M(HOC, 'add', function (option, before) { owner(this).add(option, before); });
+    M(HOC, 'remove', function (i) { owner(this); var o = this[i >>> 0]; if (o) o.remove(); });
+    Object.defineProperty(HOC.prototype, 'selectedIndex', { get: function () { return owner(this).selectedIndex; }, set: function (v) { owner(this).selectedIndex = v; }, enumerable: true, configurable: true });
   }());
   need('DOMStringMap', null);
   (function () {

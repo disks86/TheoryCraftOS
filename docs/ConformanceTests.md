@@ -49,9 +49,8 @@ gaps: `grep -c xfail tests/data/wpt/*.js`. The largest ones today:
   for `CharacterData` data editing, `NamedNodeMap` (`setNamedItem`, `removeNamedItem`, `*NS`), `DocumentType` (a `Node`), `HTMLDocument` (the prototype of the page's
   document), `Document.parseHTMLUnsafe`, `ElementInternals`/`ValidityState` via `attachInternals()`, `URLPattern` (names, `*`, `(regexp)`, `{groups}` and `? + *`
   modifiers, base URLs; not the full constructor-string grammar), SVG `getPathData()` and polygon/polyline `points`, `Highlight`/`CSS.highlights` (registered, not painted),
-  `dialog.requestClose()`, `getModifierState`, `PerformanceObserver.supportedEntryTypes`. Interface-only (calling the members is an illegal invocation, or there is
-  nothing behind them): `HTMLOptionsCollection`/`HTMLFormControlsCollection` (`form.elements` and `select.options` are still plain `HTMLCollection`s),
-  `MediaRecorder` (the constructor throws `NotSupportedError`: no encoder), `Worklet`, the worker global scope interfaces, `FileSystem*Handle`, `PublicKeyCredential`,
+  `form.elements`/`select.options` as `HTMLFormControlsCollection`/`HTMLOptionsCollection` (`add`, `remove`, `selectedIndex`; a form not in the document lists no controls), `dialog.requestClose()`, `getModifierState`, `PerformanceObserver.supportedEntryTypes`. Interface-only (calling the members is an illegal invocation, or there is
+  nothing behind them): `MediaRecorder` (the constructor throws `NotSupportedError`: no encoder), `Worklet`, the worker global scope interfaces, `FileSystem*Handle`, `PublicKeyCredential`,
   `OffscreenCanvas.transferToImageBitmap`; `createScriptProcessor` returns a gain node whose `onaudioprocess` is never called. Interface objects are now not
   enumerable and have a read-only `prototype`.
 - **CSS**: closed: `getComputedStyle` reports table parts (with `cellpadding`), controls, closed `dialog`, blockified `display`, `em`/`i`, `pre`, `ol`, link colour,
