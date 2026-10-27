@@ -283,3 +283,11 @@ rest instead of returning them on a later call (each watch keeps only its most r
   `FatalAppExitA`/`W` are the first batch; debugging APIs, transacted file operations, serial port (`COMM`) functions, volume enumeration, and the rest are not
   done yet.
   A call to an import that nothing provides stops the program with a message saying which one.
+
+## Stubs: every service and every export is in place
+
+Nothing a program links against is missing, even where nothing is implemented yet (`scripts/gen-windows-stubs.py` produced the lists from the mingw-w64 import libraries, which name the exports of the real DLLs).
+
+- **System services.** `src/Windows/tcos_syscalls.h` and `WindowsSyscallNumber` number all 500 `Nt*` services of ntdll.dll (0-98 are the implemented ones, the rest follow in alphabetical order; a number never changes once given). A number below `kWindowsServiceCount` that has no code answers `STATUS_NOT_IMPLEMENTED`; a number above it is `STATUS_INVALID_SYSTEM_SERVICE`. ntdll.dll has the stub of every service (`ntdll/services.inc`) and the `Zw*` twin of each (`ntdll/zw.inc`). The 1540 services of win32k (`NtUser*`, `NtGdi*`, `NtDxgk*`, ...) are a second table numbered from 0x1000 (`kWin32kServiceBase`, as Windows does), named in `scripts/win32k-services.txt` (taken from Wine's `win32u.spec`); their stubs are the exports of `win32u.dll` (`src/Windows/win32u`). user32.dll and gdi32.dll do not call them yet.
+- **Exports.** `src/Windows/stubs/<dll>.inc` lists, per DLL, the exports that are not implemented; `stubs/stubs.c` compiles them into functions that return `STATUS_NOT_IMPLEMENTED` (ntdll.dll) or 0 (all the others). To implement one, write it in the DLL and delete its line from the list (a duplicate is a link error). The five real DLLs link their list in; the other libraries (user32, gdi32, shell32, ole32, ... 71 in all, see `WINDOWS_STUB_LIBRARIES` in `CMakeLists.txt`) are DLLs of nothing but stubs. All of them are files of `/Windows/Windows/System32`.
+- **Gaps.** Only functions are stubbed (not data exports such as `_environ`), and names that are not C identifiers (C++ decorated names) are left out. kernelbase.dll and `api-ms-win-*` still fold into kernel32.dll (see `canonical_library_name()`), so their extra exports are not listed.

@@ -101,6 +101,7 @@ const char* AmdGfx8::result_name(Result result) {
     case Result::Ok: return "ok";
     case Result::BadArgument: return "bad argument";
     case Result::RingTestFailed: return "ring test failed";
+    case Result::ComputeFailed: return "compute queue test failed";
   }
   return "?";
 }
@@ -592,13 +593,18 @@ AmdGfx8::Result AmdGfx8::start(const Memory& memory, uint32_t timeout_us) {
   rlc_start();
   // gfx_v8_0_cp_resume
   gui_idle_interrupt(false);
+  if (compute_) compute_->kiq_resume();
   cp_resume_ring(memory);
+  if (compute_) compute_->kcq_resume();
+  // gfx_v8_0_cp_test_all_rings: graphics, then the KIQ and the compute queues
   if (!test_ring(timeout_us)) return Result::RingTestFailed;
+  if (compute_ && compute_->test_rings(timeout_us) != AmdGfx8Compute::Result::Ok) return Result::ComputeFailed;
   gui_idle_interrupt(true);
   return Result::Ok;
 }
 
 void AmdGfx8::stop() {
+  if (compute_ && compute_->attached()) compute_->disable_queues();   // gfx_v8_0_kcq_disable
   cp_gfx_enable(false);
   wr(mmCP_MEC_CNTL, CP_MEC_CNTL__MEC_ME1_HALT_MASK | CP_MEC_CNTL__MEC_ME2_HALT_MASK);   // gfx_v8_0_cp_compute_enable(false)
   delay_us(50);

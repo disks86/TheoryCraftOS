@@ -39,6 +39,7 @@ const char* amd_gfx8_firmware_name(uint16_t pci_device_id, AmdGfx8Block block);
 struct AmdGfx8Image {
   bool valid = false;
   uint32_t version = 0;               // common header: ucode_version
+  uint32_t feature_version = 0;       // ucode_feature_version (the word after the common header; not for the RLC file, which has others there)
   ConstByteView ucode;                // ucode_size_bytes at ucode_array_offset_bytes
   // The command processor's compute microcode (MEC) ends in a jump table the SMU is told about separately (cgs_get_firmware_info): jt_size dwords at dword jt_offset of
   // the ucode array. Empty for every other file (the PFP, ME and CE headers carry the same two fields, but the driver only uses them for the MEC).

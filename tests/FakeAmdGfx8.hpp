@@ -53,6 +53,13 @@ struct TocEntry {
   bool readable = false;
 };
 
+// What the compute microcode (MEC) did with a MAP_QUEUES packet.
+struct Mapped {
+  uint32_t me, pipe, queue, doorbell;
+  uint64_t mqd_address, wptr_address;
+  std::vector<uint32_t> mqd;   // the descriptor as the microcode read it
+};
+
 struct Executed {
   uint32_t opcode;
   std::vector<uint32_t> body;
@@ -81,11 +88,27 @@ class Card final : public hardware::IVcnRegisters {
   uint32_t user_backend_disable[4] = {0, 0, 0, 0};       // GC_USER_RB_BACKEND_DISABLE of each shader engine (banked by the GRBM_GFX_INDEX selection)
   uint32_t serdes_busy_reads = 0;                        // reads of the CU busy register that still show busy
 
+  // The compute microcode: hardware queue descriptors by (me, pipe, queue), kept in banks selected through SRBM_GFX_CNTL like the registers they are; a bank runs when the MEC is
+  // loaded, un-halted and its doorbell (in the doorbell memory the test supplies) changes. Only the KIQ (the queue RLC_CP_SCHEDULERS names) takes MAP/UNMAP_QUEUES packets.
+  uint8_t* doorbell_host = nullptr;
+  uint64_t doorbell_bytes = 0;
+  std::vector<Mapped> mapped;
+  std::vector<uint32_t> unmapped_doorbells;
+  uint64_t queue_mask = 0;
+  bool resources_set = false;
+  uint32_t compute_protocol_errors = 0;
+  bool mec_alive = true;
+  uint32_t skip_map_bit = 0xFFFFFFFFu;   // MAP_QUEUES for this queue bit (pipe * 8 + queue) is ignored, as if the microcode failed to map it
+  uint32_t queue_executed = 0;   // packets run by compute queues other than the KIQ's (the test packets)
+
   Card() {
     regs_[kSmcResp] = 1;
     regs_[kCpMeCntl] = kMeHalt | kPfpHalt | kCeHalt;
     regs_[kCpMecCntl] = kMecMe1Halt | kMecMe2Halt;
   }
+
+  uint32_t bank_reg(uint32_t me, uint32_t pipe, uint32_t queue, uint32_t r) { auto& b = banks_[me << 8 | pipe << 4 | queue]; auto at = b.regs.find(r); return at == b.regs.end() ? 0 : at->second; }
+  bool bank_active(uint32_t me, uint32_t pipe, uint32_t queue) { return banks_[me << 8 | pipe << 4 | queue].active; }
 
   uint32_t soft_status_address() const { return soft_registers + 108; }
   uint32_t status() const { auto at = sram_.find(soft_status_address()); return at == sram_.end() ? 0 : at->second; }
@@ -109,6 +132,13 @@ class Card final : public hardware::IVcnRegisters {
   void set_sram(uint32_t address, uint32_t value) { sram_[address] = value; }
 
   uint32_t read(uint32_t r) override {
+    if (r >= 0x3245 && r <= 0x3279) {
+      poll_mec();
+      auto& bank = banks_[bank_key()];
+      auto at = bank.regs.find(r);
+      return at == bank.regs.end() ? 0 : at->second;
+    }
+    if (r == kScratch0) poll_mec();
     if (r == kSmcData) {
       const uint32_t address = regs_[kSmcIndex];
       if (smc_running && address == soft_status_address() && status_polls_ > 0) {
@@ -137,6 +167,13 @@ class Card final : public hardware::IVcnRegisters {
       regs_[r] = v;
       return;
     }
+    if (r >= 0x3245 && r <= 0x3279) {
+      Bank& bank = banks_[bank_key()];
+      bank.regs[r] = v;
+      if (r == 0x3247) bank.active = (v & 1) != 0;   // CP_HQD_ACTIVE
+      if (r == 0x324f) bank.rptr = v;                // CP_HQD_PQ_RPTR
+      return;
+    }
     if (r == kSmcMessage) {
       handle_message(static_cast<uint16_t>(v));
       return;
@@ -158,6 +195,125 @@ class Card final : public hardware::IVcnRegisters {
   }
 
  private:
+  struct Bank {
+    std::map<uint32_t, uint32_t> regs;
+    bool active = false;
+    uint32_t rptr = 0, seen = 0;
+  };
+  uint32_t bank_key() {
+    const uint32_t v = regs_[0x391];   // SRBM_GFX_CNTL: PIPEID 1:0, MEID 3:2, VMID 7:4, QUEUEID 10:8
+    return (v >> 2 & 3) << 8 | (v & 3) << 4 | (v >> 8 & 7);
+  }
+  uint32_t doorbell_value(uint32_t index) const {
+    if (!doorbell_host || (uint64_t{index} + 1) * 4 > doorbell_bytes) return 0;
+    const uint8_t* p = doorbell_host + uint64_t{index} * 4;
+    return p[0] | (p[1] << 8) | (p[2] << 16) | (uint32_t{p[3]} << 24);
+  }
+  bool mec_ready() const {
+    return mec_alive && (reg(kCpMecCntl) & (kMecMe1Halt | kMecMe2Halt)) == 0 && (status() & (1u << 6)) != 0;   // MEC loaded by the SMC
+  }
+  bool is_kiq(uint32_t key) const {
+    const uint32_t sched = reg(0xecaa);   // RLC_CP_SCHEDULERS: queue in bits 2:0, pipe 4:3, me 6:5, enable bit 7
+    if (!(sched & 0x80)) return false;
+    const uint32_t me = sched >> 5 & 3, pipe = sched >> 3 & 3, queue = sched & 7;
+    return key == (me << 8 | pipe << 4 | queue);
+  }
+
+  // The microcode polls its doorbells: a queue whose doorbell memory changed runs its ring up to the new write pointer.
+  void poll_mec() {
+    if (!mec_ready()) return;
+    for (auto& entry : banks_) {
+      Bank& bank = entry.second;
+      const uint32_t control = bank.regs[0x3254];   // CP_HQD_PQ_DOORBELL_CONTROL
+      if (!bank.active || !(control & 0x40000000)) continue;
+      const uint32_t value = doorbell_value((control & 0x7ffffc) >> 2);
+      if (value == bank.seen) continue;
+      bank.seen = value;
+      run_queue(entry.first, bank, value);
+    }
+  }
+
+  void run_queue(uint32_t key, Bank& bank, uint32_t wptr_value) {
+    const uint64_t base = (uint64_t{bank.regs[0x324e]} << 32 | bank.regs[0x324d]) << 8;
+    const uint32_t dwords = 2u << (bank.regs[0x3256] & 0x3f);   // CP_HQD_PQ_CONTROL.QUEUE_SIZE: 2^(n+1) dwords
+    const uint32_t wptr = wptr_value & (dwords - 1);
+    while (bank.rptr != wptr) {
+      const uint32_t header = get32(base + uint64_t{bank.rptr} * 4);
+      if ((header >> 30) != 3) {
+        ++compute_protocol_errors;
+        bank.rptr = wptr;
+        break;
+      }
+      const uint32_t opcode = header >> 8 & 0xFF, count = header >> 16 & 0x3FFF;
+      const bool filler = opcode == 0x10 && count == 0x3FFF;
+      const uint32_t body = filler ? 0 : count + 1;
+      if (body > ((wptr - bank.rptr - 1) & (dwords - 1))) {
+        ++compute_protocol_errors;
+        bank.rptr = wptr;
+        break;
+      }
+      std::vector<uint32_t> d;
+      for (uint32_t i = 0; i < body; ++i) d.push_back(get32(base + uint64_t{(bank.rptr + 1 + i) & (dwords - 1)} * 4));
+      bank.rptr = (bank.rptr + 1 + body) & (dwords - 1);
+      if (filler) continue;
+      execute_compute(key, opcode, d);
+    }
+    const uint64_t report = uint64_t{bank.regs[0x3251] & 0xffff} << 32 | bank.regs[0x3250];
+    put32(report, bank.rptr);
+  }
+
+  void execute_compute(uint32_t key, uint32_t opcode, const std::vector<uint32_t>& d) {
+    const bool kiq = is_kiq(key);
+    switch (opcode) {
+      case 0x79:   // SET_UCONFIG_REG
+        if (d.size() < 2) { ++compute_protocol_errors; return; }
+        for (size_t i = 1; i < d.size(); ++i) regs_[0xC000 + d[0] + static_cast<uint32_t>(i) - 1] = d[i];
+        if (!kiq) ++queue_executed;
+        return;
+      case 0xA0:   // SET_RESOURCES: vmid mask, queue mask lo/hi, gws lo/hi, oac, gds
+        if (!kiq || d.size() != 7) { ++compute_protocol_errors; return; }
+        queue_mask = uint64_t{d[2]} << 32 | d[1];
+        resources_set = true;
+        return;
+      case 0xA2: {   // MAP_QUEUES
+        if (!kiq || d.size() != 6 || !resources_set || (d[0] >> 29) != 1) { ++compute_protocol_errors; return; }
+        const uint32_t doorbell = (d[1] >> 2) & 0xFFFFF, queue = d[1] >> 26 & 7, pipe = d[1] >> 29 & 3, me = (d[1] >> 31) + 1;
+        const uint64_t mqd_address = uint64_t{d[3]} << 32 | d[2], wptr_address = uint64_t{d[5]} << 32 | d[4];
+        const uint32_t bit = pipe * 8 + queue;
+        if (me != 1 || !(queue_mask >> bit & 1)) { ++compute_protocol_errors; return; }
+        if (bit == skip_map_bit) return;
+        const uint8_t* raw = translate(mqd_address, 512 * 4);
+        if (!raw) { ++compute_protocol_errors; return; }
+        Mapped m{me, pipe, queue, doorbell, mqd_address, wptr_address, {}};
+        for (uint32_t i = 0; i < 512; ++i) m.mqd.push_back(raw[4 * i] | raw[4 * i + 1] << 8 | raw[4 * i + 2] << 16 | uint32_t{raw[4 * i + 3]} << 24);
+        // the descriptor must be the one the packet names, for the doorbell the packet names
+        if (m.mqd[0] != 0xC0310800 || m.mqd[128] != (mqd_address & 0xfffffffc) || m.mqd[129] != (mqd_address >> 32) || ((m.mqd[128 + (0x3254 - 0x3245)] & 0x7ffffc) >> 2) != doorbell) {
+          ++compute_protocol_errors;
+          return;
+        }
+        Bank& bank = banks_[me << 8 | pipe << 4 | queue];
+        for (uint32_t k = 0; k <= 0x3279 - 0x3245; ++k) bank.regs[0x3245 + k] = m.mqd[128 + k];
+        bank.active = true;   // the microcode activates the queue
+        bank.rptr = m.mqd[128 + (0x324f - 0x3245)];
+        bank.seen = doorbell_value(doorbell);
+        mapped.push_back(m);
+        return;
+      }
+      case 0xA3: {   // UNMAP_QUEUES: RESET_QUEUES of the queue whose doorbell the packet names
+        if (!kiq || d.size() != 5 || (d[0] & 0xF) != 1) { ++compute_protocol_errors; return; }
+        const uint32_t doorbell = (d[1] >> 2) & 0xFFFFF;
+        for (auto& entry : banks_) {
+          const uint32_t control = entry.second.regs[0x3254];
+          if (entry.second.active && !is_kiq(entry.first) && ((control & 0x7ffffc) >> 2) == doorbell) entry.second.active = false;
+        }
+        unmapped_doorbells.push_back(doorbell);
+        return;
+      }
+      default: ++compute_protocol_errors;
+    }
+  }
+
+  std::map<uint32_t, Bank> banks_;
   uint32_t selected_se() {
     const uint32_t index = regs_[kGrbmGfxIndex];
     return (index & 0x80000000u) ? 0 : (index >> 16 & 0xFF) & 3;   // (a broadcast read shows the first engine)

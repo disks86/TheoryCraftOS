@@ -7,7 +7,7 @@ that its golden register table is the driver's, value for value.
 For each ported function it takes the ordered list of register names (mm...) in the kernel function and in the port and compares them; WREG32_FIELD(REG, ...) counts as
 a read and a write of REG (the port spells the read-modify-write out). A port that drops, adds, reorders or mistypes a register access fails. The values written are
 compared only for the golden table (the rest are checked by tests/AmdGfx8Test.cpp). Left out of the port on purpose, and so of the comparison: the doorbell range registers
-and the compute queues (see AmdGfx8.hpp). The GDS registers are numbered by arithmetic in the port, by a table in the kernel, and are not compared.
+(see AmdGfx8.hpp), the Tonga-only branch of mqd_commit and the queue priority of mqd_init. The GDS registers are numbered by arithmetic in the port, by a table in the kernel, and are not compared.
 """
 import os
 import re
@@ -83,6 +83,11 @@ def main():
     resume_p = body(port, r'void AmdGfx8::cp_resume_ring\([^)]*\)\s*\{')
     start_k = body(kernel, r'static int gfx_v8_0_cp_gfx_start\([^)]*\)\s*\{')
     door_k = body(kernel, r'static void gfx_v8_0_set_cpg_door_bell\([^)]*\)\s*\{')
+    compute = open(os.path.join(here, '..', 'src/Hardware/GraphicsProcessingUnit/AMD/AmdGfx8Compute.cpp')).read()
+
+    def mine_c(name):
+        return tokens(body(compute, r'(?:void|bool|uint32_t) AmdGfx8Compute::%s\([^)]*\)\s*\{' % name))
+
     pairs = [
         ('rlc_stop', kern('gfx_v8_0_rlc_stop') + kern('gfx_v8_0_enable_gui_idle_interrupt'), mine('rlc_stop') + mine('gui_idle_interrupt')),
         ('rlc_reset', kern('gfx_v8_0_rlc_reset'), mine('rlc_reset')),
@@ -104,6 +109,12 @@ def main():
         ('init_compute_vmid', kern('gfx_v8_0_init_compute_vmid'), [t for t in mine('init_compute_vmid') if not t.startswith('mmGDS_')]),
         ('init_gds_vmid', kern('gfx_v8_0_init_gds_vmid'), [t for t in mine('init_gds_vmid') if not t.startswith('mmGDS_')]),
         ('init_csb', kern('gfx_v8_0_init_csb'), mine('init_csb')),
+        ('compute enable', kern('gfx_v8_0_cp_compute_enable'), mine_c('cp_compute_enable')),
+        ('kiq setting', kern('gfx_v8_0_kiq_setting'), mine_c('kiq_setting')),
+        ('mqd_init', kern('gfx_v8_0_mqd_init'), mine_c('mqd_init')),
+        ('mqd_commit', kern('gfx_v8_0_mqd_commit'), mine_c('mqd_commit')),
+        ('mec doorbell range', kern('gfx_v8_0_set_mec_doorbell_range'), mine_c('set_mec_doorbell_range')),
+        ('compute ring test', kern('gfx_v8_0_ring_test_ring'), mine_c('test_ring')),
     ]
     for name, k, p in pairs:
         print(f'{name:28s} kernel {len(k):3d}  port {len(p):3d}  {"same" if k == p else "DIFFERENT"}')
