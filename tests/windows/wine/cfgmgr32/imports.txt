@@ -1,0 +1,1 @@
+cfgmgr32 user32 setupapi ole32 uuid advapi32
