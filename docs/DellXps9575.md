@@ -331,7 +331,7 @@ memory with `INativeDisplay::upload_picture`, which `AmdVegaM` implements with `
 window, so the picture is always right. Before the display goes back to the firmware's framebuffer (mode change, shutdown) the whole back buffer is presented first.
 
 The Presenter is host-tested with the real `AmdVegaM` and the simulated SDMA engine (data in video memory, one copy per present, the CPU fallback, a wedged engine, rows outside the picture, the final present
-before disengaging). `AmdGpu`'s own use of it (the back buffer swap and the flush) is not host-tested: that needs the UEFI graphics classes. Decoded video frames are not routed this way yet: the video
+before disengaging). `AmdGpu`'s own use of it (the back buffer swap, the flush by rows, giving the screen back on a mode change, shutdown or taking the display away) is tested by `AmdGpuTest`, with a simulated UEFI graphics output (two modes) and a simulated display engine that keeps its own picture and takes rows by `upload_picture`; the sequence of drawing calls, the rows each sends (a character at a time for text), the CPU fallback when the upload fails, the whole-picture present before the disengage, a display that refuses or hands out video memory of the wrong size, and swapping one display for another are covered. Decoded video frames are not routed this way yet: the video
 player draws through the same GPU `blit`, so they take this path only as far as the player calls the GPU's drawing functions.
 
 ### Interrupts: dispatch by source
