@@ -640,6 +640,7 @@ add_executable(BOOTX64
   src/Hardware/GraphicsProcessingUnit/AMD/AmdGfx8Compute.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdGmc8.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdIh3.cpp
+  src/Hardware/GraphicsProcessingUnit/AMD/AmdSdma3.cpp
   src/Hardware/VideoCodec/AMD/AmdUvd6Messages.cpp
   src/Hardware/VideoCodec/AMD/AmdUvd6AvcDecoder.cpp
   src/Hardware/VideoCodec/AMD/AmdUvd6HevcDecoder.cpp

@@ -101,6 +101,8 @@ static void test_parse_real() {
   CHECK(im.mec.version == 718 && im.mec.ucode.size() == 262568);
   CHECK(im.mec.jump_table_offset_bytes == 65541u * 4 && im.mec.jump_table.size() == 101u * 4 && im.mec.jump_table.data() == im.mec.ucode.data() + 65541u * 4);
   CHECK(im.mec2.valid && !im.mec2.jump_table.empty());
+  // The feature versions (the word after the common header): 48 for the command processor's files, 31 and 0 for the two DMA engines; the RLC's is not read.
+  CHECK(im.pfp.feature_version == 48 && im.me.feature_version == 48 && im.ce.feature_version == 48 && im.mec.feature_version == 48 && im.sdma0.feature_version == 31 && im.sdma1.feature_version == 0 && im.rlc.feature_version == 0);
   // A file of the wrong kind (the RLC's header version is 2, the others 1), and the RLC file where a CP file is expected, are refused.
   AmdGfx8Image junk;
   CHECK(!amd_gfx8_parse_firmware(ConstByteView(g_files.rlc.data(), g_files.rlc.size()), AmdGfx8Block::CpPfp, &junk) && !junk.valid);
