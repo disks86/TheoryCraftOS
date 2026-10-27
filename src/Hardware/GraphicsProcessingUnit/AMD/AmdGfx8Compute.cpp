@@ -466,4 +466,16 @@ bool AmdGfx8Compute::disable_queues(uint32_t timeout_us) {
   return test_ring(kiq, timeout_us);
 }
 
+bool AmdGfx8Compute::fault(uint32_t me, uint32_t pipe, uint32_t queue) {
+  if (!ready_) return false;
+  for (uint32_t i = 1; i <= config_.queues && i <= kMaxQueues; ++i) {
+    Queue& q = queues_[i];
+    if (q.me == me && q.pipe == pipe && q.queue == queue) {
+      q.wedged = true;
+      return true;
+    }
+  }
+  return false;
+}
+
 }  // namespace hardware

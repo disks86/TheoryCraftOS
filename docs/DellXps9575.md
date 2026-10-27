@@ -334,6 +334,22 @@ The Presenter is host-tested with the real `AmdVegaM` and the simulated SDMA eng
 before disengaging). `AmdGpu`'s own use of it (the back buffer swap and the flush) is not host-tested: that needs the UEFI graphics classes. Decoded video frames are not routed this way yet: the video
 player draws through the same GPU `blit`, so they take this path only as far as the player calls the GPU's drawing functions.
 
+### Interrupts: dispatch by source
+
+`AmdIrq` (`AmdIrq.*`) is the dispatch half of `amdgpu_irq_dispatch` for the sources of the blocks `AmdVegaM` brings up. `AmdVegaM::service_interrupts()` drains the IH ring (`AmdIh3::drain`), classifies each
+vector by source id and ring id, and passes every event to a sink. Sources, from the blocks' `sw_init` (`amdgpu_irq_add_id`): `gfx_v8_0` 181 end of pipe (a graphics fence for ME 0, a compute fence for ME 1 and 2;
+ring id bits 3:2 ME, 1:0 pipe, 6:4 queue), 184 privileged register, 185 privileged instruction, 197 ECC error; `sdma_v3_0` 224 trap (engine in ring id bits 1:0, a fence only for queue 0), 241 and 247 illegal
+instruction; `gmc_v8_0` 146 and 147 VM faults, for which `VM_CONTEXT1_PROTECTION_FAULT_ADDR/STATUS/MCCLIENT` are read, decoded (vmid, protections, client, read/write) and cleared (`VM_CONTEXT1_CNTL2` bit 0). A
+vector with both fault registers zero is dropped, as in the driver. Everything else is counted by source id. `scripts/check_irq_port.py` checks the ids, registers, masks and ring id decoding against the kernel
+sources (v6.12).
+
+What a handler does: the driver passes fences to its scheduler and faults to its timeout handling (`drm_sched_fault`). Here the engines' `submit_*` functions poll their fence words, so a fence is only counted and
+shown to the sink, and a fault wedges the ring it came from (`AmdGfx8::fault`, `AmdGfx8Compute::fault(me, pipe, queue)`, `AmdSdma3::fault`) until the engine is started again. The desktop loop calls
+`service_interrupts()` (under `TCOS_AMD_VEGAM`), because the card's interrupt line is not connected: no MSI is set up, so nothing wakes the CPU and a fault is seen at the next pass of the loop.
+
+Not done: the sources' own enables (`CP_INT_CNTL_RING0`, the compute pipes' EOP enables, the SDMA trap enable, the memory controller's fault interrupts) are not programmed, so a real card posts nothing to the ring until
+they are; the display's interrupts (vblank, page flip, hot plug) and the UVD/VCE ones are not dispatched; no PCI MSI; no ring reset or recovery after a fault (the engine has to be restarted).
+
 ## Radeon RX Vega M: UVD 6.3
 
 `src/Hardware/VideoCodec/AMD/AmdUvd6.*` is the start/stop of the Unified Video Decoder 6.3, ported from amdgpu (`uvd_v6_0.c`: `mc_resume`, `start`, `stop`, the clock-gating "ungate" path; `amdgpu_uvd.c`: the memory layout

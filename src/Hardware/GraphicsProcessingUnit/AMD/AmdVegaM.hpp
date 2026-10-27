@@ -27,6 +27,7 @@
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdGfx8Compute.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdGmc8.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdIh3.hpp"
+#include "Hardware/GraphicsProcessingUnit/AMD/AmdIrq.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdSdma3.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdSmu7Ucode.hpp"
 #include "Hardware/Mmio.hpp"
@@ -57,7 +58,7 @@ class ISystemAddresses {
   virtual uint64_t physical_address(const void* p) const = 0;
 };
 
-class AmdVegaM final : public amd_dce11::INativeDisplay {
+class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
  public:
   // Where the block starts in video memory, and the most the whole block may reach: the visible part of video memory is 256 MiB without Resizable BAR, and the video engine's
   // memory is in its last half.
@@ -133,6 +134,12 @@ class AmdVegaM final : public amd_dce11::INativeDisplay {
   bool upload(ConstByteView source, uint64_t offset, uint32_t instance = 0, uint32_t timeout_us = 100000);
   bool download(ByteView destination, uint64_t offset, uint32_t instance = 0, uint32_t timeout_us = 100000);
 
+  // Interrupts: reads what the card posted to the interrupt ring and dispatches it by source (AmdIrq). A fault the engines report (a privileged register or instruction in a
+  // command buffer, an SDMA illegal instruction) wedges the ring it came from, as the driver's fault handlers hand the ring to its scheduler's timeout handling; fences and
+  // other events are counted. The card's interrupt line is not connected, so the caller polls this (the desktop loop does). Returns how many vectors were handled.
+  uint32_t service_interrupts(uint32_t max_vectors = 64);
+  const AmdIrq* irq() const { return irq_.get(); }
+
   // For tests and diagnostics
   const AmdGmc8GartPlan& gart_plan() const { return gart_plan_; }
   const Layout& layout() const { return layout_; }
@@ -143,6 +150,7 @@ class AmdVegaM final : public amd_dce11::INativeDisplay {
 
  private:
   bool fail(Step failed, const char* text);
+  void on_event(const AmdIrq::Event& event) override;
   bool transfer(uint64_t system_address, uint64_t bytes, uint64_t offset, bool to_video, uint32_t instance, uint32_t timeout_us);
 
   Step step_ = Step::None;
@@ -154,6 +162,7 @@ class AmdVegaM final : public amd_dce11::INativeDisplay {
   uint64_t block_gpu_ = 0;
   UniquePointer<AmdGmc8> gmc_;
   UniquePointer<AmdIh3> ih_;
+  UniquePointer<AmdIrq> irq_;
   UniquePointer<AmdGfx8Compute> compute_;
   UniquePointer<AmdGfx8> gfx_;
   UniquePointer<AmdSdma3> sdma_;

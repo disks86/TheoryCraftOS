@@ -88,6 +88,8 @@ class AmdGfx8Compute {
   // queue is wedged (nothing more is queued on it) until the queues are started again.
   bool submit_ib(uint32_t queue, uint64_t ib_gpu_address, uint32_t dwords, uint32_t timeout_us = kDefaultTimeoutUs);
   bool queue_wedged(uint32_t queue) const { return queue < kMaxQueues && queues_[queue + 1].wedged; }
+  // A fault reported from the queue at (me, pipe, queue) of the CP (gfx_v8_0_fault): that compute queue is wedged. False if none of ours is there.
+  bool fault(uint32_t me, uint32_t pipe, uint32_t queue);
   uint32_t fence_sequence(uint32_t queue) const { return queue < kMaxQueues ? queues_[queue + 1].sequence : 0; }
   static constexpr uint32_t kFenceWordOffset = 16;   // in a queue's write-back page
   int failed_queue() const { return failed_queue_; }            // -1 none, 0 the KIQ, i + 1 compute queue i

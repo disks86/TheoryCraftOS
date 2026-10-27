@@ -91,6 +91,8 @@ class AmdSdma3 {
   // sdma_v3_0_ring_pad_ib: NOPs appended to `words` (holding `count`) up to a multiple of 8 dwords (a burst NOP first when the engine's firmware has it); the new count, 0 if it does not fit.
   uint32_t pad_ib(uint32_t instance, ArrayView<uint32_t> words, uint32_t count) const;
   static constexpr uint32_t kMaxIbDwords = 0xFFFFF;
+  // The engine reported an illegal instruction (sdma_v3_0_process_illegal_inst_irq): nothing more is queued on it until it is started again.
+  void fault(uint32_t instance) { if (instance < kInstances && running_) state_[instance].wedged = true; }
   bool wedged(uint32_t instance) const { return instance < kInstances && state_[instance].wedged; }
   uint32_t write_pointer(uint32_t instance) const { return instance < kInstances ? state_[instance].wptr : 0; }
 

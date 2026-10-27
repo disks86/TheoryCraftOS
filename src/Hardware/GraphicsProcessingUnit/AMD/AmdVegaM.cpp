@@ -180,6 +180,7 @@ bool AmdVegaM::bring_up(const Inputs& in) {
   AmdIh3::Config ih_config;
   ih_config.ring_in_video_memory = true;
   ih_ = UniquePointer<AmdIh3>::make(allocator, *in.registers, *in.clock, ih_config);
+  irq_ = UniquePointer<AmdIrq>::make(allocator, *in.registers);
   if (!ih_) return fail(Step::MemoryController, "out of memory");
   AmdIh3::Memory ih_memory;
   ih_memory.ring_gpu_address = block_gpu_ + layout_.ih;
@@ -251,6 +252,7 @@ void AmdVegaM::shutdown() {
   gfx_ = UniquePointer<AmdGfx8>();
   compute_ = UniquePointer<AmdGfx8Compute>();
   if (ih_) ih_->stop();
+  irq_ = UniquePointer<AmdIrq>();
   ih_ = UniquePointer<AmdIh3>();
   if (gmc_) gmc_->stop();
   gmc_ = UniquePointer<AmdGmc8>();
@@ -331,6 +333,24 @@ bool AmdVegaM::upload(ConstByteView source, uint64_t offset, uint32_t instance, 
 
 bool AmdVegaM::download(ByteView destination, uint64_t offset, uint32_t instance, uint32_t timeout_us) {
   return transfer(physical_address(inputs_.system_addresses, destination.data()), destination.size(), offset, false, instance, timeout_us);
+}
+
+uint32_t AmdVegaM::service_interrupts(uint32_t max_vectors) {
+  if (!up() || !ih_ || !irq_) return 0;
+  return irq_->process(*ih_, this, max_vectors);
+}
+
+// The driver's handlers for the faults hand the ring to the scheduler's timeout handling (drm_sched_fault); wedging the ring is that here.
+void AmdVegaM::on_event(const AmdIrq::Event& event) {
+  switch (event.kind) {
+    case AmdIrq::Kind::GfxPrivilegedRegister:
+    case AmdIrq::Kind::GfxPrivilegedInstruction:
+      if (event.me == 0) gfx_->fault();
+      else if (event.me == 1 || event.me == 2) compute_->fault(event.me, event.pipe, event.queue);
+      break;
+    case AmdIrq::Kind::SdmaIllegalInstruction: sdma_->fault(event.engine); break;
+    default: break;
+  }
 }
 
 bool AmdVegaM::engage_display(const amd_dce11::FirmwareFramebuffer& firmware, ByteView* memory) {

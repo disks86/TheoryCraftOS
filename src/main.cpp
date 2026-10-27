@@ -1202,6 +1202,9 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       }
       if (hyperv.take_shutdown_request(&hyperv_restart)) desktop.request_shutdown();   // the Hyper-V manager asked
       if (vmware_tools.take_shutdown_request(&vmware_restart)) desktop.request_shutdown();   // so did VMware
+#ifdef TCOS_AMD_VEGAM
+      if (vega_m) vega_m->service_interrupts();   // the Vega M's interrupt ring (its interrupt line is not connected): faults wedge the ring they came from
+#endif
       uint32_t tools_width, tools_height;
       if (vmware_tools.take_resolution(&tools_width, &tools_height)) on_vbox_display_request(&vbox_display, tools_width, tools_height);
       if (threaded) {

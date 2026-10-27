@@ -107,6 +107,8 @@ class AmdGfx8 {
   // (nothing more is queued) until the engine is started again.
   bool submit_ib(uint64_t ib_gpu_address, uint32_t dwords, uint32_t timeout_us = kDefaultTimeoutUs);
   bool wedged() const { return wedged_; }
+  // The engine reported a fault from this ring (a privileged register or instruction in a command buffer: gfx_v8_0_fault): nothing more is queued until it is started again.
+  void fault() { if (running_) wedged_ = true; }
   uint32_t fence_sequence() const { return fence_sequence_; }
   // amdgpu_ring_generic_pad_ib: appends NOP packets to `words` (a buffer of `capacity` dwords holding `count`) up to a multiple of 256; returns the new count, or 0 if it does not fit.
   static uint32_t pad_ib(ArrayView<uint32_t> words, uint32_t count);

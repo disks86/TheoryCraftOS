@@ -524,6 +524,96 @@ static void test_present() {
   CHECK(rig.vram[0] == 0x99 && rig.vram[pitch - 1] == 0x99);
 }
 
+// Vectors the card posts to the interrupt ring are dispatched by source: counted, faults wedge the ring they came from, VM faults are read from the memory controller and cleared.
+struct Recorder final : AmdIrq::ISink {
+  std::vector<AmdIrq::Event> events;
+  void on_event(const AmdIrq::Event& e) override { events.push_back(e); }
+};
+
+static void test_interrupts() {
+  Rig rig;
+  AmdVegaM vega(rig.alloc);
+  CHECK(vega.bring_up(rig.inputs()));
+  if (!vega.up()) return;
+  CHECK(vega.irq() && vega.service_interrupts() == 0);
+  const uint32_t nop_early[] = {0xC0001000};
+  // Fences and an unknown source: counted, nothing wedged.
+  rig.card.ih.post(181, 0, 0, 0, 0);                 // graphics fence
+  rig.card.ih.post(181, 0, (2u << 4) | (1u << 2), 0, 0);   // compute fence, ME 1 queue 2
+  rig.card.ih.post(224, 0, 1, 0, 0);                 // SDMA 1 trap
+  rig.card.ih.post(99, 0x123, 0, 0, 0);              // not one of ours
+  CHECK(vega.service_interrupts() == 4);
+  const AmdIrq& irq = *vega.irq();
+  CHECK(irq.total() == 4 && irq.count(AmdIrq::Kind::GraphicsFence) == 1 && irq.count(AmdIrq::Kind::ComputeFence) == 1 && irq.count(AmdIrq::Kind::SdmaTrap) == 1 &&
+        irq.count(AmdIrq::Kind::Unknown) == 1 && irq.unknown_source(99) == 1);
+  CHECK(!vega.graphics()->wedged() && !vega.sdma()->wedged(0) && !vega.sdma()->wedged(1) && vega.service_interrupts() == 0);
+  // Faults wedge the ring: a privileged register on the graphics ring, an illegal instruction on SDMA 1, a privileged instruction on compute queue 2 (and one from a queue that is
+  // not ours changes nothing).
+  rig.card.ih.post(184, 0, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && vega.graphics()->wedged() && !vega.sdma()->wedged(1));
+  rig.card.ih.post(241, 0, 1, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && vega.sdma()->wedged(1) && !vega.sdma()->wedged(0));
+  rig.card.ih.post(185, 0, (7u << 4) | (1u << 2) | 3, 0, 0);   // pipe 3 queue 7: the KIQ is pipe 3 queue 0, not this
+  CHECK(vega.service_interrupts() == 1);
+  rig.card.ih.post(185, 0, (2u << 4) | (1u << 2), 0, 0);
+  CHECK(vega.service_interrupts() == 1);
+  rig.card.ih.post(185, 0, (5u << 4) | (1u << 2) | 1, 0, 0);   // ME 1 pipe 1 queue 5: queue 5 of pipe 0 is ours, this is not
+  CHECK(vega.service_interrupts() == 1 && vega.submit_compute(5, ArrayView<const uint32_t>(nop_early, 1)));
+  // (a wedged ring refuses command buffers)
+  const uint32_t nop[] = {0xC0001000};
+  CHECK(!vega.submit_graphics(ArrayView<const uint32_t>(nop, 1)) && !vega.submit_sdma(1, ArrayView<const uint32_t>(nop, 1)) && !vega.submit_compute(2, ArrayView<const uint32_t>(nop, 1)));
+  CHECK(vega.submit_compute(1, ArrayView<const uint32_t>(nop, 1)) && vega.submit_sdma(0, ArrayView<const uint32_t>(nop, 1)));
+  CHECK(irq.count(AmdIrq::Kind::GfxPrivilegedRegister) == 1 && irq.count(AmdIrq::Kind::SdmaIllegalInstruction) == 1 && irq.count(AmdIrq::Kind::GfxPrivilegedInstruction) == 3);
+  // A VM fault: the registers are read and cleared (bit 0 of VM_CONTEXT1_CNTL2).
+  rig.card.gmc.set_reg(0x53f, 0x12345);                                 // ADDR: page
+  rig.card.gmc.set_reg(0x537, 0x1000000 | (5u << 25) | (0x2A << 12) | 0x3);   // STATUS: write, vmid 5, client 0x2A, protections 3
+  rig.card.gmc.set_reg(0x539, 0x43425F30);                              // MCCLIENT: "CB_0"
+  rig.card.ih.post(146, 0, 0, 5, 77);
+  CHECK(vega.service_interrupts() == 1);
+  const AmdIrq::VmFaultInfo& f = irq.last_vm_fault();
+  CHECK(f.valid && f.page == 0x12345 && f.vmid == 5 && f.client_id == 0x2A && f.protections == 3 && f.write && f.mc_client == 0x43425F30 && irq.count(AmdIrq::Kind::VmFault) == 1);
+  CHECK((rig.card.gmc.reg(0x50d) & 1) == 1);
+  // A fault interrupt with both registers zero reports nothing and is not counted; but the registers are cleared all the same.
+  rig.card.gmc.set_reg(0x53f, 0);
+  rig.card.gmc.set_reg(0x537, 0);
+  rig.card.gmc.set_reg(0x50d, 0);
+  rig.card.ih.post(147, 0, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && irq.count(AmdIrq::Kind::VmFault) == 1 && (rig.card.gmc.reg(0x50d) & 1) == 1);
+  // A fault at page 0 (the status alone says there was one) is reported; so is one with the status zero.
+  rig.card.gmc.set_reg(0x53f, 0);
+  rig.card.gmc.set_reg(0x537, 0x3);
+  rig.card.ih.post(147, 0, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && irq.count(AmdIrq::Kind::VmFault) == 2 && irq.last_vm_fault().page == 0 && irq.last_vm_fault().protections == 3);
+  rig.card.gmc.set_reg(0x53f, 0x77);
+  rig.card.gmc.set_reg(0x537, 0);
+  rig.card.ih.post(147, 0, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && irq.count(AmdIrq::Kind::VmFault) == 3 && irq.last_vm_fault().page == 0x77);
+  // A limit on the vectors handled in one call.
+  for (int i = 0; i < 10; ++i) rig.card.ih.post(181, 0, 0, 0, 0);
+  CHECK(vega.service_interrupts(4) == 4 && vega.service_interrupts(4) == 4 && vega.service_interrupts() == 2 && vega.service_interrupts() == 0);
+  // After a restart the engines work again and a card that is not up handles nothing.
+  vega.shutdown();
+  CHECK(vega.service_interrupts() == 0 && !vega.irq());
+}
+
+// The sink sees every event in order, with the ring id decoded.
+static void test_interrupt_sink() {
+  Rig rig;
+  AmdVegaM vega(rig.alloc);
+  CHECK(vega.bring_up(rig.inputs()));
+  if (!vega.up()) return;
+  AmdIh3* ih = vega.interrupts();
+  CHECK(ih != nullptr);
+  AmdIrq irq(rig.card);
+  Recorder rec;
+  rig.card.ih.post(181, 0x77, (3u << 4) | (2u << 2) | 1, 4, 9);
+  rig.card.ih.post(247, 0, 1, 0, 0);
+  CHECK(irq.process(*ih, &rec) == 2 && rec.events.size() == 2);
+  CHECK(rec.events[0].kind == AmdIrq::Kind::ComputeFence && rec.events[0].me == 2 && rec.events[0].pipe == 1 && rec.events[0].queue == 3 && rec.events[0].vector.src_data == 0x77 &&
+        rec.events[0].vector.vmid == 4 && rec.events[0].vector.pasid == 9);
+  CHECK(rec.events[1].kind == AmdIrq::Kind::SdmaIllegalInstruction && rec.events[1].engine == 1);
+}
+
 int main() {
   setvbuf(stdout, nullptr, _IONBF, 0);
   test_plan();
@@ -532,6 +622,8 @@ int main() {
   test_failures();
   test_display();
   test_present();
+  test_interrupts();
+  test_interrupt_sink();
   printf(g_failed ? "AmdVegaMTest: %d FAILED\n" : "AmdVegaMTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }
