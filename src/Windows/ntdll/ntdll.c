@@ -623,7 +623,8 @@ static PVOID heap_alloc(PVOID heap, ULONG flags, SIZE_T bytes) {
   Heap *h = heap;
   if (!heap_ok(h)) return NULL;
   if (bytes > (1ull << 46)) return NULL;
-  ULONGLONG need = (bytes + 16 + 15) & ~15ull;      /* (8 for the next chunk's prev_size field, which is payload while this chunk is used, and 8 for the size asked for, kept there) */
+  /* (16 for the header; at the end of the payload 8 for the user value and 8 for the user flags - RtlSetUserValueHeap and friends - and the size asked for, kept in the next chunk's prev_size field, which is payload while this chunk is used) */
+  ULONGLONG need = (bytes + 32 + 15) & ~15ull;
   if (need < MIN_CHUNK) need = MIN_CHUNK;
   for (int attempt = 0; attempt < 2; ++attempt) {
     for (Chunk *c = h->free_list.next; c != &h->free_list; c = c->next) {
@@ -640,6 +641,8 @@ static PVOID heap_alloc(PVOID heap, ULONG flags, SIZE_T bytes) {
       BYTE *user = (BYTE *)c + 16;
       if (flags & HEAP_ZERO_MEMORY) memset(user, 0, (size_t_)bytes);
       *(ULONGLONG *)((BYTE *)c + CHUNK_SIZE(c)) = bytes;      /* the last 8 bytes of the payload say how many were asked for (HeapSize) */
+      *(ULONGLONG *)((BYTE *)c + CHUNK_SIZE(c) - 16) = 0;      /* user value */
+      *(ULONGLONG *)((BYTE *)c + CHUNK_SIZE(c) - 8) = flags & 0xF00;      /* user flags (HEAP_SETTABLE_USER_FLAG1..3) and whether there is a user value (HEAP_SETTABLE_USER_VALUE) */
       return user;
     }
     if (attempt == 0 && !heap_add_segment(h, need)) return NULL;
@@ -647,11 +650,23 @@ static PVOID heap_alloc(PVOID heap, ULONG flags, SIZE_T bytes) {
   return NULL;
 }
 
+/* Does `memory` lie inside a segment of the heap, where a block can be? (Callers hand over all kinds of pointers; none must be followed before this says yes.) */
+static int heap_owns(Heap *h, PVOID memory) {
+  const ULONG_PTR p = (ULONG_PTR)memory;
+  if (p & 15) return 0;
+  for (Segment *s = h->segments; s; s = s->next) {
+    const ULONG_PTR base = (ULONG_PTR)s->base;
+    if (p >= base + sizeof(Segment) + 16 && p < base + s->size) return 1;
+  }
+  return 0;
+}
+
 static BOOLEAN heap_free(PVOID heap, ULONG flags, PVOID memory) {
   (void)flags;
   Heap *h = heap;
   if (!heap_ok(h)) return FALSE;
   if (!memory) return TRUE;
+  if (!heap_owns(h, memory)) return FALSE;
   Chunk *c = (Chunk *)((BYTE *)memory - 16);
   if (!(c->size_flags & CHUNK_USED)) return FALSE;      /* freed twice */
   ULONGLONG size = CHUNK_SIZE(c);
@@ -674,11 +689,13 @@ static BOOLEAN heap_free(PVOID heap, ULONG flags, PVOID memory) {
 
 static SIZE_T heap_size(PVOID heap, ULONG flags, PVOID memory) {
   (void)flags;
-  if (!heap_ok(heap) || !memory) return (SIZE_T)-1;
+  if (!heap_ok(heap) || !memory || !heap_owns(heap, memory)) return (SIZE_T)-1;
   Chunk *c = (Chunk *)((BYTE *)memory - 16);
   return (c->size_flags & CHUNK_USED) ? (SIZE_T) * (ULONGLONG *)((BYTE *)c + CHUNK_SIZE(c)) : (SIZE_T)-1;
 }
-static SIZE_T heap_capacity(PVOID memory) { Chunk *c = (Chunk *)((BYTE *)memory - 16); return (SIZE_T)(CHUNK_SIZE(c) - 16); }
+static SIZE_T heap_capacity(PVOID memory) { Chunk *c = (Chunk *)((BYTE *)memory - 16); return (SIZE_T)(CHUNK_SIZE(c) - 32); }
+static ULONGLONG *chunk_user_value(PVOID memory) { Chunk *c = (Chunk *)((BYTE *)memory - 16); return (ULONGLONG *)((BYTE *)c + CHUNK_SIZE(c) - 16); }
+static ULONGLONG *chunk_user_flags(PVOID memory) { Chunk *c = (Chunk *)((BYTE *)memory - 16); return (ULONGLONG *)((BYTE *)c + CHUNK_SIZE(c) - 8); }
 
 static PVOID heap_realloc(PVOID heap, ULONG flags, PVOID memory, SIZE_T bytes) {
   if (!memory) return heap_alloc(heap, flags, bytes);
@@ -690,15 +707,63 @@ static PVOID heap_realloc(PVOID heap, ULONG flags, PVOID memory, SIZE_T bytes) {
     *(ULONGLONG *)((BYTE *)c + CHUNK_SIZE(c)) = bytes;
     return memory;
   }
-  if (flags & 0x10 /* HEAP_REALLOC_IN_PLACE_ONLY */) return NULL;
+  if (flags & 0x10 /* HEAP_REALLOC_IN_PLACE_ONLY */) {
+    /* A big block may grow into the free chunk after it (a small one is never grown in place: it would be a low-fragmentation block on Windows). */
+    Chunk *c = (Chunk *)((BYTE *)memory - 16);
+    Chunk *after = chunk_next(c);
+    const ULONGLONG have_size = CHUNK_SIZE(c), need = (bytes + 32 + 15) & ~15ull;
+    if (have_size < 0x4000 || (after->size_flags & CHUNK_USED) || have_size + CHUNK_SIZE(after) < need) return NULL;
+    const ULONGLONG total = have_size + CHUNK_SIZE(after);
+    free_unlink(after);
+    if (total - need >= MIN_CHUNK) {
+      c->size_flags = need | CHUNK_USED | (c->size_flags & CHUNK_PREV_USED);
+      make_free(heap, (Chunk *)((BYTE *)c + need), total - need, 1);
+    } else {
+      c->size_flags = total | CHUNK_USED | (c->size_flags & CHUNK_PREV_USED);
+      chunk_next(c)->size_flags |= CHUNK_PREV_USED;
+    }
+    const ULONGLONG user_value = *(ULONGLONG *)((BYTE *)c + have_size - 16), user_flags = *(ULONGLONG *)((BYTE *)c + have_size - 8);
+    *(ULONGLONG *)((BYTE *)c + CHUNK_SIZE(c) - 16) = user_value;
+    *(ULONGLONG *)((BYTE *)c + CHUNK_SIZE(c) - 8) = user_flags;
+    if ((flags & HEAP_ZERO_MEMORY) && bytes > have) memset((BYTE *)memory + have, 0, bytes - have);
+    *(ULONGLONG *)((BYTE *)c + CHUNK_SIZE(c)) = bytes;
+    return memory;
+  }
   PVOID fresh = heap_alloc(heap, flags & ~HEAP_ZERO_MEMORY, bytes);
   if (!fresh) return NULL;
   memcpy(fresh, memory, have < bytes ? have : bytes);
   if ((flags & HEAP_ZERO_MEMORY) && bytes > have) memset((BYTE *)fresh + have, 0, bytes - have);
+  *chunk_user_value(fresh) = *chunk_user_value(memory);
+  *chunk_user_flags(fresh) = *chunk_user_flags(memory);
   heap_free(heap, flags, memory);
   return fresh;
 }
 
+/* The value and the flags (HEAP_SETTABLE_USER_FLAG1..3) a program can keep with a block. */
+EXPORT BOOLEAN NTAPI RtlGetUserInfoHeap(PVOID heap, ULONG flags, PVOID memory, PVOID *value, PULONG user_flags) {
+  (void)flags;
+  heap_lock();
+  const int ok = heap_ok(heap) && memory && heap_size(heap, 0, memory) != (SIZE_T)-1;
+  if (ok) { if (value && (*chunk_user_flags(memory) & 0x100)) *value = (PVOID)(ULONG_PTR)*chunk_user_value(memory); if (user_flags) *user_flags = (ULONG)(*chunk_user_flags(memory) & 0xE00); }
+  heap_unlock();
+  return ok ? TRUE : FALSE;
+}
+EXPORT BOOLEAN NTAPI RtlSetUserValueHeap(PVOID heap, ULONG flags, PVOID memory, PVOID value) {
+  (void)flags;
+  heap_lock();
+  const int ok = heap_ok(heap) && memory && heap_size(heap, 0, memory) != (SIZE_T)-1;
+  if (ok) { *chunk_user_value(memory) = (ULONGLONG)(ULONG_PTR)value; *chunk_user_flags(memory) |= 0x100; }
+  heap_unlock();
+  return ok ? TRUE : FALSE;
+}
+EXPORT BOOLEAN NTAPI RtlSetUserFlagsHeap(PVOID heap, ULONG flags, PVOID memory, ULONG clear, ULONG set) {
+  (void)flags;
+  heap_lock();
+  const int ok = heap_ok(heap) && memory && heap_size(heap, 0, memory) != (SIZE_T)-1;
+  if (ok) *chunk_user_flags(memory) = (*chunk_user_flags(memory) & ~(ULONGLONG)(clear & 0xE00)) | (set & 0xE00);
+  heap_unlock();
+  return ok ? TRUE : FALSE;
+}
 EXPORT PVOID NTAPI RtlAllocateHeap(PVOID heap, ULONG flags, SIZE_T bytes) { heap_lock(); PVOID r = heap_alloc(heap, flags, bytes); heap_unlock(); return r; }
 EXPORT BOOLEAN NTAPI RtlFreeHeap(PVOID heap, ULONG flags, PVOID memory) { heap_lock(); BOOLEAN r = heap_free(heap, flags, memory); heap_unlock(); return r; }
 EXPORT SIZE_T NTAPI RtlSizeHeap(PVOID heap, ULONG flags, PVOID memory) { heap_lock(); SIZE_T r = heap_size(heap, flags, memory); heap_unlock(); return r; }
