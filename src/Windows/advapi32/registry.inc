@@ -96,7 +96,22 @@ static LSTATUS open_or_create(HKEY key, LPCWSTR sub, BOOL create, DWORD options,
   HANDLE h = NULL;
   ULONG made = 0;
   NTSTATUS status;
-  if (create) status = NtCreateKey(&h, 0xF003F, &attributes, 0, NULL, options, &made);
+  if (create) {      /* the kernel makes the last key only: the ones above it are made here */
+    for (size_t_ i = 0; sub && sub[i]; ++i) {
+      if (sub[i] != '\\' || i == 0 || sub[i - 1] == '\\') continue;
+      WCHAR part[300];
+      if (i >= 300) break;
+      memcpy(part, sub, i * 2);
+      part[i] = 0;
+      UNICODE_STRING upper;
+      wide_set(&upper, part);
+      OBJECT_ATTRIBUTES above = {sizeof(above), root, &upper, 0x40, NULL, NULL};
+      HANDLE hh = NULL;
+      ULONG dispo = 0;
+      if (NT_SUCCESS(NtCreateKey(&hh, 0xF003F, &above, 0, NULL, 0, &dispo))) NtClose(hh);
+    }
+    status = NtCreateKey(&h, 0xF003F, &attributes, 0, NULL, options, &made);
+  }
   else status = NtOpenKey(&h, 0x20019, &attributes);
   if (!NT_SUCCESS(status)) return status == 0xC0000034u ? ERROR_FILE_NOT_FOUND : nt_error(status);
   *result = (HKEY)h;

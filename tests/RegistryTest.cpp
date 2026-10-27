@@ -50,10 +50,13 @@ int main() {
 
   // missing keys, creating, casing
   CHECK(tree.resolve(RegistryTree::kRoot, "MACHINE\\Software\\Wine", false, 1, &id, &created) == kRegNameNotFound);
-  CHECK(tree.resolve(RegistryTree::kRoot, "MACHINE\\Software\\Wine\\Deep\\Er", true, 5, &id, &created) == kRegSuccess && created);
+  CHECK(tree.resolve(RegistryTree::kRoot, "MACHINE\\Software\\Wine\\Deep\\Er", true, 5, &id, &created) == kRegNameNotFound);
+  CHECK(tree.resolve(RegistryTree::kRoot, "MACHINE\\Software\\Wine", true, 5, &id, &created) == kRegSuccess && created);
+  CHECK(tree.resolve(id, "Deep", true, 5, &id, &created) == kRegSuccess && created);
+  CHECK(tree.resolve(id, "Er", true, 5, &id, &created) == kRegSuccess && created);
   CHECK(tree.resolve(RegistryTree::kRoot, "machine\\software\\WINE\\deep\\er", true, 6, &other, &created) == kRegSuccess && !created && other == id);
   CHECK(tree.resolve(RegistryTree::kRoot, "\\Other\\Machine", false, 1, &other, &created) == kRegNameNotFound);
-  CHECK(tree.resolve(RegistryTree::kRoot, "MACHINE\\\\X", true, 1, &other, &created) == kRegPathSyntax);
+  CHECK(tree.resolve(RegistryTree::kRoot, "MACHINE\\\\X", true, 1, &other, &created) == kRegNameNotFound);
 
   // values
   CHECK(tree.set_value(id, "Alpha", 4, ConstByteView(reinterpret_cast<const uint8_t*>("\x01\x00\x00\x00"), 4), 7) == kRegSuccess);

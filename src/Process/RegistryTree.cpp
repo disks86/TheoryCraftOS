@@ -54,10 +54,14 @@ RegistryTree::RegistryTree(allocators::IAllocator& allocator, uint64_t now) : al
                                        "MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", "MACHINE\\SYSTEM\\CurrentControlSet\\Control", "MACHINE\\SYSTEM\\CurrentControlSet\\Services",
                                        "MACHINE\\SYSTEM\\CurrentControlSet\\Hardware Profiles\\Current", "USER\\.DEFAULT", "USER\\S-1-5-21-0-0-0-1000\\Software\\Microsoft\\Windows\\CurrentVersion",
                                        "USER\\S-1-5-21-0-0-0-1000\\Environment", "USER\\S-1-5-21-0-0-0-1000\\Volatile Environment", "USER\\S-1-5-21-0-0-0-1000\\Control Panel"};
-  for (const char* path : kHives) {
-    uint32_t id = 0;
-    bool created = false;
-    resolve(kRoot, StringView(path), true, now, &id, &created);
+  for (const char* path : kHives) {      // every level, one after the other: a path is made one key at a time
+    const StringView whole(path);
+    for (uint64_t end = whole.find('\\'); ; end = whole.find('\\', end + 1)) {
+      uint32_t id = 0;
+      bool created = false;
+      resolve(kRoot, end == StringView::npos ? whole : whole.first(end), true, now, &id, &created);
+      if (end == StringView::npos) break;
+    }
   }
   uint32_t version = 0;
   bool created = false;
@@ -137,11 +141,11 @@ uint32_t RegistryTree::resolve(uint32_t base, StringView path, bool create, uint
     if (end == StringView::npos) end = path.size();
     const StringView part = path.substr(pos, end - pos);
     pos = end < path.size() ? end + 1 : end;
-    if (part.empty()) { if (pos >= path.size()) break; return kRegPathSyntax; }      // "a\\b" is not a name; a trailing '\' is allowed
+    if (part.empty()) return kRegNameNotFound;      // "a\\b" and a trailing '\' name nothing
     if (!valid_key_name(part) || ++depth > kRegMaxDepth) return kRegInvalidParameter;
     uint32_t child = find_child(at, part);
     if (child == ~0u) {
-      if (!create) return kRegNameNotFound;
+      if (!create || pos < path.size()) return kRegNameNotFound;      // only the last key of a path is made: its parents have to be there
       child = new_key(at, part, now);
       if (child == ~0u) return kRegNoMemory;
       made = true;

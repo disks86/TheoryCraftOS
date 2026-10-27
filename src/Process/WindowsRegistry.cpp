@@ -66,15 +66,20 @@ bool key_of(Process& p, uint64_t handle, uint32_t* id) {
 uint32_t read_attributes(Process& p, uint64_t attributes, uint32_t* base, String* path, bool* inherit) {
   *base = RegistryTree::kRoot;
   *inherit = false;
-  if (attributes == 0) return kInvalidParameter;
+  if (attributes == 0) return kAccessViolation;
   uint8_t raw[32];
   if (!p.read_user(attributes, ByteView(raw, 32))) return kAccessViolation;
+  if (raw[0] != 48 || raw[1] != 0 || raw[2] != 0 || raw[3] != 0) return kInvalidParameter;      // Length is sizeof(OBJECT_ATTRIBUTES)
   uint64_t root = 0, name_at = 0;
   for (int i = 0; i < 8; ++i) { root |= uint64_t{raw[8 + i]} << (8 * i); name_at |= uint64_t{raw[16 + i]} << (8 * i); }
   *inherit = (raw[24] & 2) != 0;
   if (root != 0 && !key_of(p, root, base)) return kInvalidHandle;
   if (name_at == 0) return kSuccess;
-  return read_unicode_string_argument(p, name_at, path);
+  const uint32_t status = read_unicode_string_argument(p, name_at, path);
+  if (status != kSuccess) return status;
+  if (root == 0 && !path->view().starts_with('\\') && !path->empty()) return kRegPathSyntax;      // without a parent key the name has to be a full path
+  if (root != 0 && path->view().starts_with('\\')) return kRegPathSyntax;
+  return kSuccess;
 }
 
 uint32_t give_handle(Process& p, uint32_t id, bool inherit, uint64_t* handle) {
@@ -86,6 +91,9 @@ uint32_t give_handle(Process& p, uint32_t id, bool inherit, uint64_t* handle) {
 }
 
 uint32_t open_or_create(Process& p, const SyscallRequest& r, bool create, uint32_t* disposition) {
+  if (r.args[0] == 0) return kAccessViolation;
+  if (r.args[2] == 0) return kAccessViolation;
+  if ((r.args[1] & 0xFFFFFFFFu) == 0) { p.write_user_u64(r.args[0], 0); return 0xC0000022u; }      // no access asked for: STATUS_ACCESS_DENIED
   uint32_t base = 0;
   bool inherit = false;
   String path(p.files().allocator());
