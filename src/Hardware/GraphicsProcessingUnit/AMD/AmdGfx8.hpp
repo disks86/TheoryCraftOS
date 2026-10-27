@@ -21,6 +21,7 @@
 #include <stdint.h>
 #include "Hardware/Clock/IClock.hpp"
 #include "Hardware/Mmio.hpp"
+#include "Hardware/GraphicsProcessingUnit/AMD/AmdGfx8Compute.hpp"
 #include "Hardware/VideoCodec/AMD/AmdVcn1.hpp"
 #include "Utility/ArrayView.hpp"
 
@@ -33,11 +34,12 @@ namespace hardware {
 // It starts from a card whose microcode is loaded: on this chip the SMC loads the engines' microcode (AmdSmu7Ucode), not the driver, so there is no firmware upload here. What
 // it leaves out, and what is needed before the engine draws anything:
 //  - gfx_v8_0_init_pg beyond the clear-state buffer (the save/restore list and power gating), and gfx_v8_0_get_cu_info (it only collects information for user space);
-//  - the compute queues (KIQ and the kernel compute queues of the MEC), doorbells (the write pointer goes through its register) and every interrupt (the driver polls);
+//  - the graphics ring's doorbell (its write pointer goes through its register) and every interrupt (the driver polls);
 //  - the RLC's safe mode and the wait for an idle engine that gfx_v8_0_hw_fini makes before it halts the CP.
 // It does do gfx_v8_0_constants_init (address configuration, the tile mode tables, the render back-end set-up with the harvested raster configuration, the shader memory
 // apertures of every VMID, the GDS and the fixed-function FIFO sizes) and the clear state: the context register defaults of vi_cs_data go to the ring and to the RLC's
-// clear-state buffer.
+// clear-state buffer. The compute queues (AmdGfx8Compute) are started too when one is attached (attach_compute): the KIQ before the graphics ring, the compute queues after it,
+// the ring tests of all of them together.
 // The ring test is the one the driver runs: a register write through the ring.
 class AmdGfx8 {
  public:
@@ -80,6 +82,7 @@ class AmdGfx8 {
     Ok,
     BadArgument,
     RingTestFailed,   // the CP did not execute the test packet: its microcode is not running
+    ComputeFailed,    // the graphics ring works but a compute queue (or the KIQ) did not execute its test packet
   };
   static const char* result_name(Result result);
 
@@ -88,7 +91,9 @@ class AmdGfx8 {
 
   // gfx_v8_0_hw_init (without constants_init and the parts listed above). The ring is empty and idle afterwards.
   Result start(const Memory& memory, uint32_t timeout_us = kDefaultTimeoutUs);
-  // gfx_v8_0_hw_fini: halts the command processors (graphics and compute) and the RLC.
+  // The compute queues to start with the engine (not owned; they must outlive this object, and be attached to their memory first). nullptr: none.
+  void attach_compute(AmdGfx8Compute* compute) { compute_ = compute; }
+  // gfx_v8_0_hw_fini: unmaps the compute queues, halts the command processors (graphics and compute) and the RLC.
   void stop();
 
   // gfx_v8_0_ring_test_ring on its own, for later use.
@@ -140,6 +145,7 @@ class AmdGfx8 {
   Memory memory_;
   uint32_t wptr_ = 0;   // in dwords, modulo the ring
   uint32_t raster_config_ = 0, raster_config_1_ = 0, active_rbs_ = 0;
+  AmdGfx8Compute* compute_ = nullptr;
 };
 
 }  // namespace hardware
