@@ -119,26 +119,62 @@ EXPORT BOOL WINAPI GetCPInfo(UINT cp, CPINFO *info) {
   info->DefaultChar[0] = '?';
   return TRUE;
 }
-EXPORT int WINAPI lstrlenA(LPCSTR s) { return s ? (int)strlen(s) : 0; }
-EXPORT int WINAPI lstrlenW(LPCWSTR s) { return s ? (int)wcslen(s) : 0; }
-EXPORT LPSTR WINAPI lstrcpyA(LPSTR d, LPCSTR s) { char *r = d; while ((*d++ = *s++)) {} return r; }
-EXPORT LPWSTR WINAPI lstrcpyW(LPWSTR d, LPCWSTR s) { WCHAR *r = d; while ((*d++ = *s++)) {} return r; }
+/* The lstr functions of Windows end quietly on an address that cannot be read; the pages are probed as the string crosses into them. */
+static BOOL range_allowed(const void *p, SIZE_T length, BOOL write);
+static int probe_length_a(const char *s) {
+  int n = 0;
+  for (;; ++n) {
+    if ((n == 0 || (((ULONG_PTR)(s + n) & 0xFFF) == 0)) && !range_allowed(s + n, 1, FALSE)) return -1;
+    if (!s[n]) return n;
+  }
+}
+static int probe_length_w(const WCHAR *s) {
+  int n = 0;
+  for (;; ++n) {
+    if ((n == 0 || (((ULONG_PTR)(s + n) & 0xFFF) < 2)) && !range_allowed(s + n, 2, FALSE)) return -1;
+    if (!s[n]) return n;
+  }
+}
+EXPORT int WINAPI lstrlenA(LPCSTR s) { if (!s) return 0; const int n = probe_length_a(s); return n < 0 ? 0 : n; }
+EXPORT int WINAPI lstrlenW(LPCWSTR s) { if (!s) return 0; const int n = probe_length_w(s); return n < 0 ? 0 : n; }
+EXPORT LPSTR WINAPI lstrcpyA(LPSTR d, LPCSTR s) {
+  const int n = s ? probe_length_a(s) : -1;
+  if (n < 0 || !d || !range_allowed(d, (UINT_PTR)n + 1, TRUE)) { set_error(ERROR_INVALID_PARAMETER); return NULL; }
+  memcpy(d, s, (size_t_)n + 1);
+  return d;
+}
+EXPORT LPWSTR WINAPI lstrcpyW(LPWSTR d, LPCWSTR s) {
+  const int n = s ? probe_length_w(s) : -1;
+  if (n < 0 || !d || !range_allowed(d, ((UINT_PTR)n + 1) * 2, TRUE)) { set_error(ERROR_INVALID_PARAMETER); return NULL; }
+  memcpy(d, s, ((size_t_)n + 1) * 2);
+  return d;
+}
 EXPORT LPSTR WINAPI lstrcpynA(LPSTR d, LPCSTR s, int n) {
   if (n <= 0) return d;
+  if (!d || !s || !range_allowed(d, (UINT_PTR)n, TRUE)) return NULL;
   int i = 0;
-  for (; i < n - 1 && s[i]; ++i) d[i] = s[i];
+  for (; i < n - 1; ++i) {
+    if ((i == 0 || (((ULONG_PTR)(s + i) & 0xFFF) == 0)) && !range_allowed(s + i, 1, FALSE)) break;
+    if (!s[i]) break;
+    d[i] = s[i];
+  }
   d[i] = 0;
   return d;
 }
 EXPORT LPWSTR WINAPI lstrcpynW(LPWSTR d, LPCWSTR s, int n) {
   if (n <= 0) return d;
+  if (!d || !s || !range_allowed(d, (UINT_PTR)n * 2, TRUE)) return NULL;
   int i = 0;
-  for (; i < n - 1 && s[i]; ++i) d[i] = s[i];
+  for (; i < n - 1; ++i) {
+    if ((i == 0 || (((ULONG_PTR)(s + i) & 0xFFF) < 2)) && !range_allowed(s + i, 2, FALSE)) break;
+    if (!s[i]) break;
+    d[i] = s[i];
+  }
   d[i] = 0;
   return d;
 }
-EXPORT LPSTR WINAPI lstrcatA(LPSTR d, LPCSTR s) { lstrcpyA(d + strlen(d), s); return d; }
-EXPORT LPWSTR WINAPI lstrcatW(LPWSTR d, LPCWSTR s) { lstrcpyW(d + wcslen(d), s); return d; }
+EXPORT LPSTR WINAPI lstrcatA(LPSTR d, LPCSTR s) { const int n = d ? probe_length_a(d) : -1; if (n < 0 || !lstrcpyA(d + n, s)) return NULL; return d; }
+EXPORT LPWSTR WINAPI lstrcatW(LPWSTR d, LPCWSTR s) { const int n = d ? probe_length_w(d) : -1; if (n < 0 || !lstrcpyW(d + n, s)) return NULL; return d; }
 /* The comparisons use the sorting of the locale (nls.inc): "co-op" and "coop" are near, upper case follows lower case. */
 EXPORT int WINAPI CompareStringW(DWORD locale, DWORD flags, LPCWSTR a, int an, LPCWSTR b, int bn);
 EXPORT int WINAPI CompareStringA(DWORD locale, DWORD flags, LPCSTR a, int an, LPCSTR b, int bn);
@@ -291,7 +327,7 @@ EXPORT BOOL WINAPI GetExitCodeProcess(HANDLE h, LPDWORD code) {
 }
 EXPORT BOOL WINAPI IsWow64Process(HANDLE h, LPBOOL wow) { (void)h; *wow = FALSE; return TRUE; }
 EXPORT BOOL WINAPI IsDebuggerPresent(void) { return FALSE; }
-EXPORT BOOL WINAPI CheckRemoteDebuggerPresent(HANDLE h, LPBOOL present) { (void)h; *present = FALSE; return TRUE; }
+EXPORT BOOL WINAPI CheckRemoteDebuggerPresent(HANDLE h, LPBOOL present) { if (!h || !present) { set_error(ERROR_INVALID_PARAMETER); return FALSE; } *present = FALSE; return TRUE; }
 EXPORT void WINAPI DebugBreak(void) { __asm__ volatile("int3"); }
 EXPORT void WINAPI OutputDebugStringA(LPCSTR s) { (void)s; }
 EXPORT void WINAPI OutputDebugStringW(LPCWSTR s) { (void)s; }
@@ -365,6 +401,7 @@ static const WCHAR *find_variable(const WCHAR *block, const WCHAR *name, size_t_
 }
 EXPORT DWORD WINAPI GetEnvironmentVariableW(LPCWSTR name, LPWSTR buffer, DWORD capacity) {
   size_t_ length = 0;
+  if (!name) { set_error(ERROR_ENVVAR_NOT_FOUND); return 0; }
   const WCHAR *value = find_variable(parameters()->Environment, name, &length);
   if (!value) { set_error(ERROR_ENVVAR_NOT_FOUND); return 0; }
   if (length + 1 > capacity) return (DWORD)length + 1;
@@ -372,6 +409,7 @@ EXPORT DWORD WINAPI GetEnvironmentVariableW(LPCWSTR name, LPWSTR buffer, DWORD c
   return (DWORD)length;
 }
 EXPORT DWORD WINAPI GetEnvironmentVariableA(LPCSTR name, LPSTR buffer, DWORD capacity) {
+  if (!name) { set_error(ERROR_ENVVAR_NOT_FOUND); return 0; }
   WCHAR *w = to_wide(name);
   if (!w) return 0;
   size_t_ length = 0;
@@ -722,6 +760,9 @@ static FARPROC export_of(HMODULE module, LPCSTR name, DWORD ordinal, int depth) 
   return (FARPROC)(base + rva);
 }
 EXPORT FARPROC WINAPI GetProcAddress(HMODULE module, LPCSTR name) {
+  if (!module) module = GetModuleHandleW(NULL);
+  if (!name) { set_error(ERROR_INVALID_PARAMETER); return NULL; }
+  if (!range_allowed(module, 0x40, FALSE) || *(const WORD *)module != 0x5A4D) { set_error(ERROR_MOD_NOT_FOUND); return NULL; }
   FARPROC p = ((ULONG_PTR)name >> 16) == 0 ? export_of(module, NULL, (DWORD)(ULONG_PTR)name, 0) : export_of(module, name, 0, 0);
   if (!p) set_error(ERROR_PROC_NOT_FOUND);
   return p;
@@ -888,27 +929,6 @@ EXPORT LONG WINAPI InterlockedExchange(volatile LONG *p, LONG v) { return __sync
 EXPORT LONG WINAPI InterlockedExchangeAdd(volatile LONG *p, LONG v) { return __sync_fetch_and_add(p, v); }
 EXPORT LONG WINAPI InterlockedCompareExchange(volatile LONG *p, LONG exchange, LONG compare) { return __sync_val_compare_and_swap(p, compare, exchange); }
 EXPORT LONG64 WINAPI InterlockedCompareExchange64(volatile LONG64 *p, LONG64 exchange, LONG64 compare) { return __sync_val_compare_and_swap(p, compare, exchange); }
-
-EXPORT void WINAPI InitializeSListHead(PSLIST_HEADER head) { head->Alignment = head->Region = 0; }
-EXPORT PSLIST_ENTRY WINAPI InterlockedPushEntrySList(PSLIST_HEADER head, PSLIST_ENTRY entry) {
-  PSLIST_ENTRY old = head->Next;
-  entry->Next = old;
-  head->Next = entry;
-  ++head->Depth;
-  return old;
-}
-EXPORT PSLIST_ENTRY WINAPI InterlockedPopEntrySList(PSLIST_HEADER head) {
-  PSLIST_ENTRY top = head->Next;
-  if (top) { head->Next = top->Next; --head->Depth; }
-  return top;
-}
-EXPORT PSLIST_ENTRY WINAPI InterlockedFlushSList(PSLIST_HEADER head) {
-  PSLIST_ENTRY top = head->Next;
-  head->Next = NULL;
-  head->Depth = 0;
-  return top;
-}
-EXPORT USHORT WINAPI QueryDepthSList(PSLIST_HEADER head) { return (USHORT)head->Depth; }
 
 EXPORT BOOL WINAPI InitOnceExecuteOnce(PINIT_ONCE once, PINIT_ONCE_FN function, PVOID parameter, PVOID *context) {
   if ((ULONG_PTR)once->Ptr & 2) { if (context) *context = (PVOID)((ULONG_PTR)once->Ptr & ~3ull); return TRUE; }

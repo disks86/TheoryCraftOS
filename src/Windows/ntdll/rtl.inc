@@ -563,6 +563,30 @@ EXPORT ULONG NTAPI RtlFindClearRuns(const RTL_BITMAP *b, RTL_BITMAP_RUN *runs, U
   }
   return n;
 }
+EXPORT ULONG NTAPI RtlFindSetRuns(const RTL_BITMAP *b, RTL_BITMAP_RUN *runs, ULONG max, BOOLEAN longest_first) {
+  ULONG n = 0, i = 0;
+  while (i < b->SizeOfBitMap) {
+    if (!bm_get(b, i)) { ++i; continue; }
+    const ULONG start = i;
+    while (i < b->SizeOfBitMap && bm_get(b, i)) ++i;
+    if (!longest_first) {
+      if (n == max) break;
+      runs[n].StartingIndex = start;
+      runs[n].NumberOfBits = i - start;
+      ++n;
+      continue;
+    }
+    /* keep the `max` longest runs seen so far, longest first (a shorter or equal run does not replace an earlier one) */
+    ULONG at = n;
+    while (at > 0 && runs[at - 1].NumberOfBits < i - start) --at;
+    if (at >= max) continue;
+    if (n < max) ++n;
+    for (ULONG k = n - 1; k > at; --k) runs[k] = runs[k - 1];
+    runs[at].StartingIndex = start;
+    runs[at].NumberOfBits = i - start;
+  }
+  return n;
+}
 EXPORT ULONG NTAPI RtlFindLongestRunClear(const RTL_BITMAP *b, PULONG start) {
   ULONG best = 0, best_at = 0, i = 0;
   while (i < b->SizeOfBitMap) {

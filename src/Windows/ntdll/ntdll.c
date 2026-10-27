@@ -567,8 +567,8 @@ static int heap_add_segment(Heap *h, SIZE_T minimum) {
   segment->size = size;
   segment->next = h->segments;
   h->segments = segment;
-  BYTE *start = (BYTE *)(((ULONG_PTR)base + sizeof(Segment) + 15 + 8) & ~15ull) - 8;      /* so that start + 16 is 16-byte aligned */
-  BYTE *end = (BYTE *)(((ULONG_PTR)base + size) & ~15ull) - 24;      /* (so that end - start is a multiple of 16: the chunks are) */
+  BYTE *start = (BYTE *)(((ULONG_PTR)base + sizeof(Segment) + 15) & ~15ull);      /* (16-aligned, so that start + 16, the payload, is too) */
+  BYTE *end = (BYTE *)(((ULONG_PTR)base + size) & ~15ull) - 16;      /* (so that end - start is a multiple of 16: the chunks are) */
   Chunk *sentinel = (Chunk *)end;
   sentinel->size_flags = CHUNK_USED;      /* size 0 */
   make_free(h, (Chunk *)start, (ULONGLONG)(end - start), 1);
@@ -589,8 +589,8 @@ static Heap *heap_new(ULONG flags, SIZE_T commit) {
   segment->size = size;
   segment->next = NULL;
   h->segments = segment;
-  BYTE *start = (BYTE *)(((ULONG_PTR)segment + sizeof(Segment) + 15 + 8) & ~15ull) - 8;
-  BYTE *end = (BYTE *)(((ULONG_PTR)base + size) & ~15ull) - 24;      /* (so that end - start is a multiple of 16: the chunks are) */
+  BYTE *start = (BYTE *)(((ULONG_PTR)segment + sizeof(Segment) + 15) & ~15ull);
+  BYTE *end = (BYTE *)(((ULONG_PTR)base + size) & ~15ull) - 16;      /* (so that end - start is a multiple of 16: the chunks are) */
   Chunk *sentinel = (Chunk *)end;
   sentinel->size_flags = CHUNK_USED;
   make_free(h, (Chunk *)start, (ULONGLONG)(end - start), 1);
@@ -623,7 +623,7 @@ static PVOID heap_alloc(PVOID heap, ULONG flags, SIZE_T bytes) {
   Heap *h = heap;
   if (!heap_ok(h)) return NULL;
   if (bytes > (1ull << 46)) return NULL;
-  ULONGLONG need = (bytes + 8 + 15) & ~15ull;
+  ULONGLONG need = (bytes + 16 + 15) & ~15ull;      /* (8 for the next chunk's prev_size field, which is payload while this chunk is used, and 8 for the size asked for, kept there) */
   if (need < MIN_CHUNK) need = MIN_CHUNK;
   for (int attempt = 0; attempt < 2; ++attempt) {
     for (Chunk *c = h->free_list.next; c != &h->free_list; c = c->next) {
@@ -638,7 +638,8 @@ static PVOID heap_alloc(PVOID heap, ULONG flags, SIZE_T bytes) {
         chunk_next(c)->size_flags |= CHUNK_PREV_USED;
       }
       BYTE *user = (BYTE *)c + 16;
-      if (flags & HEAP_ZERO_MEMORY) memset(user, 0, (size_t_)(CHUNK_SIZE(c) - 8));
+      if (flags & HEAP_ZERO_MEMORY) memset(user, 0, (size_t_)bytes);
+      *(ULONGLONG *)((BYTE *)c + CHUNK_SIZE(c)) = bytes;      /* the last 8 bytes of the payload say how many were asked for (HeapSize) */
       return user;
     }
     if (attempt == 0 && !heap_add_segment(h, need)) return NULL;
@@ -675,18 +676,25 @@ static SIZE_T heap_size(PVOID heap, ULONG flags, PVOID memory) {
   (void)flags;
   if (!heap_ok(heap) || !memory) return (SIZE_T)-1;
   Chunk *c = (Chunk *)((BYTE *)memory - 16);
-  return (c->size_flags & CHUNK_USED) ? (SIZE_T)(CHUNK_SIZE(c) - 8) : (SIZE_T)-1;
+  return (c->size_flags & CHUNK_USED) ? (SIZE_T) * (ULONGLONG *)((BYTE *)c + CHUNK_SIZE(c)) : (SIZE_T)-1;
 }
+static SIZE_T heap_capacity(PVOID memory) { Chunk *c = (Chunk *)((BYTE *)memory - 16); return (SIZE_T)(CHUNK_SIZE(c) - 16); }
 
 static PVOID heap_realloc(PVOID heap, ULONG flags, PVOID memory, SIZE_T bytes) {
   if (!memory) return heap_alloc(heap, flags, bytes);
   const SIZE_T have = heap_size(heap, flags, memory);
   if (have == (SIZE_T)-1) return NULL;
-  if (bytes <= have) return memory;
+  if (bytes <= heap_capacity(memory)) {      /* fits in the chunk: stays where it is */
+    Chunk *c = (Chunk *)((BYTE *)memory - 16);
+    if ((flags & HEAP_ZERO_MEMORY) && bytes > have) memset((BYTE *)memory + have, 0, bytes - have);
+    *(ULONGLONG *)((BYTE *)c + CHUNK_SIZE(c)) = bytes;
+    return memory;
+  }
+  if (flags & 0x10 /* HEAP_REALLOC_IN_PLACE_ONLY */) return NULL;
   PVOID fresh = heap_alloc(heap, flags & ~HEAP_ZERO_MEMORY, bytes);
   if (!fresh) return NULL;
-  memcpy(fresh, memory, have);
-  if (flags & HEAP_ZERO_MEMORY) memset((BYTE *)fresh + have, 0, bytes - have);
+  memcpy(fresh, memory, have < bytes ? have : bytes);
+  if ((flags & HEAP_ZERO_MEMORY) && bytes > have) memset((BYTE *)fresh + have, 0, bytes - have);
   heap_free(heap, flags, memory);
   return fresh;
 }
@@ -739,7 +747,7 @@ EXPORT ULONG NTAPI RtlGetProcessHeaps(ULONG count, PVOID *heaps) {
 
 /* RtlWalkHeap(heap, entry): the blocks of a heap one after the other, in the layout of PROCESS_HEAP_ENTRY (lpData NULL starts). */
 typedef struct { PVOID lpData; DWORD cbData; BYTE cbOverhead, iRegionIndex; WORD wFlags; ULONGLONG region[3]; } HeapWalkEntry;
-static Chunk *segment_first_chunk(Segment *s) { return (Chunk *)((BYTE *)(((ULONG_PTR)s + sizeof(Segment) + 15 + 8) & ~15ull) - 8); }
+static Chunk *segment_first_chunk(Segment *s) { return (Chunk *)((BYTE *)(((ULONG_PTR)s + sizeof(Segment) + 15) & ~15ull)); }
 EXPORT NTSTATUS NTAPI RtlWalkHeap(PVOID heap, PVOID entry) {
   Heap *h = heap;
   HeapWalkEntry *e = entry;
@@ -760,7 +768,7 @@ EXPORT NTSTATUS NTAPI RtlWalkHeap(PVOID heap, PVOID entry) {
   }
   if (c) {
     e->lpData = (BYTE *)c + 16;
-    e->cbData = (DWORD)(CHUNK_SIZE(c) - 8);
+    e->cbData = (c->size_flags & CHUNK_USED) ? (DWORD)*(ULONGLONG *)((BYTE *)c + CHUNK_SIZE(c)) : (DWORD)(CHUNK_SIZE(c) - 16);
     e->cbOverhead = 8;
     e->iRegionIndex = (BYTE)region;
     e->wFlags = (c->size_flags & CHUNK_USED) ? 4 /* PROCESS_HEAP_ENTRY_BUSY */ : 0;
