@@ -27,6 +27,11 @@ dll = sys.argv[1]
 names = set()
 for path in sys.argv[2:]:
     for line in open(path, errors="replace"):
+        m = re.match(r"^\s*(?:EXPORT|__declspec\(dllexport\))[^()=;]*?\bFN\((\w+)\)\s*\(", line)
+        if m:      # a function written once for narrow and wide characters (FN(Name) is NameA and NameW)
+            names.add(m.group(1) + "A")
+            names.add(m.group(1) + "W")
+            continue
         m = re.match(r"^\s*(?:EXPORT|__declspec\(dllexport\))[^()=;]*?\b(\w+)\s*\(", line)
         if m:
             names.add(m.group(1))

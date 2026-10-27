@@ -863,10 +863,19 @@ if(TCOS_ARCH STREQUAL "x86_64")
   set(_stub_image_base 0x180A00000)
   foreach(_library ${WINDOWS_STUB_LIBRARIES})
     windows_stub_flags(_flags ${_library} 0)
+    # A library with code of its own (src/Windows/<dll>/<dll>.c and the .inc files next to it) is linked over kernel32.dll; the stubs fill in what it does not define yet.
+    set(_own ${CMAKE_SOURCE_DIR}/src/Windows/${_library}/${_library}.c)
+    set(_own_sources "")
+    set(_own_depends "")
+    if(EXISTS ${_own})
+      file(GLOB _own_incs ${CMAKE_SOURCE_DIR}/src/Windows/${_library}/*.inc)
+      set(_own_sources ${_own} ${WINDOWS_DIR}/libntdll.a ${WINDOWS_DIR}/kernel32.dll)
+      set(_own_depends ${_own} ${_own_incs} ${WINDOWS_DIR}/libntdll.a ${WINDOWS_DIR}/kernel32.dll ${WINDOWS_HEADERS})
+    endif()
     add_custom_command(OUTPUT ${WINDOWS_DIR}/${_library}.dll
       COMMAND ${CMAKE_COMMAND} -E make_directory ${WINDOWS_DIR}
-      COMMAND ${CMAKE_C_COMPILER} ${WINDOWS_DLL_FLAGS} ${_flags} -DSTUB_DLLMAIN -Wl,--image-base=${_stub_image_base} -o ${WINDOWS_DIR}/${_library}.dll
-      DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/stubs/${_library}.inc ${WINDOWS_STUBS_C}
+      COMMAND ${CMAKE_C_COMPILER} ${WINDOWS_DLL_FLAGS} ${_flags} -DSTUB_DLLMAIN -Wl,--image-base=${_stub_image_base} -o ${WINDOWS_DIR}/${_library}.dll ${_own_sources}
+      DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/stubs/${_library}.inc ${WINDOWS_STUBS_C} ${_own_depends}
       COMMENT "Building ${_library}.dll")
     math(EXPR _stub_image_base "${_stub_image_base}+0x100000" OUTPUT_FORMAT HEXADECIMAL)
   endforeach()
