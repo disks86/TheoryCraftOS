@@ -975,3 +975,218 @@ EXPORT int WINAPI ResolveLocaleName(LPCWSTR name, LPWSTR out, int capacity) {
   memcpy(out, text, (size_t_)n * 2);
   return n;
 }
+
+/* ---- lists of date and time formats ----------------------------------------------------------------------------------------------------------------------- */
+
+static const char *const k_short_dates[] = {"M/d/yyyy", "M/d/yy", "MM/dd/yy", "MM/dd/yyyy", "yy/MM/dd", "yyyy-MM-dd", "dd-MMM-yy", NULL};
+static const char *const k_long_dates[] = {"dddd, MMMM d, yyyy", "MMMM d, yyyy", "dddd, d MMMM, yyyy", "d MMMM, yyyy", NULL};
+static const char *const k_year_months[] = {"MMMM yyyy", "MMMM, yyyy", NULL};
+static const char *const k_times[] = {"h:mm:ss tt", "hh:mm:ss tt", "H:mm:ss", "HH:mm:ss", NULL};
+static const char *const k_times_short[] = {"h:mm tt", "hh:mm tt", "H:mm", "HH:mm", NULL};
+
+typedef BOOL (CALLBACK *DATEFMT_ENUMPROCA_)(LPSTR);
+typedef BOOL (CALLBACK *DATEFMT_ENUMPROCW_)(LPWSTR);
+typedef BOOL (CALLBACK *DATEFMT_ENUMPROCEXA_)(LPSTR, DWORD);
+typedef BOOL (CALLBACK *DATEFMT_ENUMPROCEXW_)(LPWSTR, DWORD);
+typedef BOOL (CALLBACK *DATEFMT_ENUMPROCEXEX_)(LPWSTR, DWORD, LPARAM);
+typedef BOOL (CALLBACK *TIMEFMT_ENUMPROCEX_)(LPWSTR, LPARAM);
+
+/* Calls `call(text)` (wide) for each of the formats until it answers FALSE. */
+typedef BOOL (*nls_each_fn)(const WCHAR *text, void *context);
+static BOOL nls_each_format(const char *const *list, nls_each_fn call, void *context) {
+  for (; *list; ++list) {
+    WCHAR text[40];
+    nls_widen(text, *list);
+    if (!call(text, context)) break;
+  }
+  return TRUE;
+}
+static const char *const *nls_date_list(DWORD flags) {
+  if (flags & NLS_DATE_LONGDATE) return k_long_dates;
+  if (flags & NLS_DATE_YEARMONTH) return k_year_months;
+  return k_short_dates;
+}
+static BOOL nls_date_flags_ok(DWORD flags) {
+  flags &= ~(LCT_USE_CP_ACP | NLS_NOUSEROVERRIDE);
+  return flags == 0 || flags == NLS_DATE_SHORTDATE || flags == NLS_DATE_LONGDATE || flags == NLS_DATE_YEARMONTH;
+}
+static BOOL nls_call_narrow(const WCHAR *text, int mode, void *proc, DWORD calendar, LPARAM param) {
+  char narrow[80];
+  WideCharToMultiByte(CP_UTF8, 0, text, -1, narrow, sizeof(narrow), NULL, NULL);
+  if (mode == 0) return ((DATEFMT_ENUMPROCA_)proc)(narrow);
+  return ((DATEFMT_ENUMPROCEXA_)proc)(narrow, calendar);
+}
+typedef struct { void *proc; int mode; DWORD calendar; LPARAM param; } NlsEnumContext;
+static BOOL nls_each_a(const WCHAR *text, void *context) { NlsEnumContext *c = context; return nls_call_narrow(text, c->mode, c->proc, c->calendar, c->param); }
+static BOOL nls_each_w(const WCHAR *text, void *context) {
+  NlsEnumContext *c = context;
+  switch (c->mode) {
+    case 0: return ((DATEFMT_ENUMPROCW_)c->proc)((LPWSTR)text);
+    case 1: return ((DATEFMT_ENUMPROCEXW_)c->proc)((LPWSTR)text, c->calendar);
+    case 2: return ((DATEFMT_ENUMPROCEXEX_)c->proc)((LPWSTR)text, c->calendar, c->param);
+    default: return ((TIMEFMT_ENUMPROCEX_)c->proc)((LPWSTR)text, c->param);
+  }
+}
+static BOOL nls_enum_check(int kind, void *proc, BOOL flags_ok) {
+  if (!proc) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (kind == 0) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (!flags_ok) { set_error(ERROR_INVALID_FLAGS); return FALSE; }
+  return TRUE;
+}
+EXPORT BOOL WINAPI EnumDateFormatsA(DATEFMT_ENUMPROCA_ proc, LCID locale, DWORD flags) {
+  if (!nls_enum_check(nls_locale_of(locale), (void *)proc, nls_date_flags_ok(flags))) return FALSE;
+  NlsEnumContext c = {(void *)proc, 0, 1, 0};
+  return nls_each_format(nls_date_list(flags), nls_each_a, &c);
+}
+EXPORT BOOL WINAPI EnumDateFormatsW(DATEFMT_ENUMPROCW_ proc, LCID locale, DWORD flags) {
+  if (!nls_enum_check(nls_locale_of(locale), (void *)proc, nls_date_flags_ok(flags))) return FALSE;
+  NlsEnumContext c = {(void *)proc, 0, 1, 0};
+  return nls_each_format(nls_date_list(flags), nls_each_w, &c);
+}
+EXPORT BOOL WINAPI EnumDateFormatsExA(DATEFMT_ENUMPROCEXA_ proc, LCID locale, DWORD flags) {
+  if (!nls_enum_check(nls_locale_of(locale), (void *)proc, nls_date_flags_ok(flags))) return FALSE;
+  NlsEnumContext c = {(void *)proc, 1, 1, 0};
+  return nls_each_format(nls_date_list(flags), nls_each_a, &c);
+}
+EXPORT BOOL WINAPI EnumDateFormatsExW(DATEFMT_ENUMPROCEXW_ proc, LCID locale, DWORD flags) {
+  if (!nls_enum_check(nls_locale_of(locale), (void *)proc, nls_date_flags_ok(flags))) return FALSE;
+  NlsEnumContext c = {(void *)proc, 1, 1, 0};
+  return nls_each_format(nls_date_list(flags), nls_each_w, &c);
+}
+EXPORT BOOL WINAPI EnumDateFormatsExEx(DATEFMT_ENUMPROCEXEX_ proc, LPCWSTR name, DWORD flags, LPARAM param) {
+  if (!nls_enum_check(nls_locale_of_name(name), (void *)proc, nls_date_flags_ok(flags))) return FALSE;
+  NlsEnumContext c = {(void *)proc, 2, 1, param};
+  return nls_each_format(nls_date_list(flags), nls_each_w, &c);
+}
+static BOOL nls_time_flags_ok(DWORD flags) { flags &= ~(LCT_USE_CP_ACP | NLS_NOUSEROVERRIDE); return flags == 0 || flags == NLS_TIME_NOSECONDS; }
+EXPORT BOOL WINAPI EnumTimeFormatsA(DATEFMT_ENUMPROCA_ proc, LCID locale, DWORD flags) {
+  if (!nls_enum_check(nls_locale_of(locale), (void *)proc, nls_time_flags_ok(flags))) return FALSE;
+  NlsEnumContext c = {(void *)proc, 0, 0, 0};
+  return nls_each_format((flags & NLS_TIME_NOSECONDS) ? k_times_short : k_times, nls_each_a, &c);
+}
+EXPORT BOOL WINAPI EnumTimeFormatsW(DATEFMT_ENUMPROCW_ proc, LCID locale, DWORD flags) {
+  if (!nls_enum_check(nls_locale_of(locale), (void *)proc, nls_time_flags_ok(flags))) return FALSE;
+  NlsEnumContext c = {(void *)proc, 0, 0, 0};
+  return nls_each_format((flags & NLS_TIME_NOSECONDS) ? k_times_short : k_times, nls_each_w, &c);
+}
+EXPORT BOOL WINAPI EnumTimeFormatsEx(TIMEFMT_ENUMPROCEX_ proc, LPCWSTR name, DWORD flags, LPARAM param) {
+  if (!nls_enum_check(nls_locale_of_name(name), (void *)proc, nls_time_flags_ok(flags))) return FALSE;
+  NlsEnumContext c = {(void *)proc, 3, 0, param};
+  return nls_each_format((flags & NLS_TIME_NOSECONDS) ? k_times_short : k_times, nls_each_w, &c);
+}
+
+/* ---- the calendar ------------------------------------------------------------------------------------------------------------------------------------------- */
+
+#define CALENDAR_RETURN_NUMBER 0x20000000u
+#define CALENDAR_ALL 0xFFFFFFFFu
+/* The text of a CAL_ value for the Gregorian calendars (1 and 2); the numbers are written as text. FALSE if the calendar has no such value. */
+static BOOL nls_calendar_text(int kind, DWORD calendar, DWORD type, WCHAR *out /* 80 */) {
+  const DWORD t = type & 0xFFFF;
+  if (t == 0x30 /* CAL_ITWODIGITYEARMAX */) { nls_widen(out, "2029"); return TRUE; }
+  if (calendar != 1 && calendar != 2) return FALSE;
+  WCHAR scratch[16];
+  const char *text = NULL;
+  switch (t) {
+    case 0x01: text = calendar == 2 ? "2" : "1"; break;
+    case 0x02: text = calendar == 2 ? "Gregorian Calendar (U.S.)" : "Gregorian Calendar"; break;
+    case 0x03: text = "0"; break;
+    case 0x04: text = "A.D."; break;
+    case 0x39: text = "AD"; break;
+    case 0x05: text = kind == 2 ? "MM/dd/yyyy" : "M/d/yyyy"; break;
+    case 0x06: text = kind == 2 ? "dddd, dd MMMM yyyy" : "dddd, MMMM d, yyyy"; break;
+    case 0x2F: text = kind == 2 ? "yyyy MMMM" : "MMMM yyyy"; break;
+    case 0x38: text = kind == 2 ? "MMMM dd" : "MMMM d"; break;
+    case 0x3A: text = kind == 2 ? "dddd, dd MMMM yyyy" : "dddd, MMMM d, yyyy"; break;
+    default: break;
+  }
+  if (text) { nls_widen(out, text); return TRUE; }
+  if (t >= 0x07 && t <= 0x0D) { nls_day_name((int)((t - 0x07 + 1) % 7), FALSE, out); return TRUE; }
+  if (t >= 0x0E && t <= 0x14) { nls_day_name((int)((t - 0x0E + 1) % 7), TRUE, out); return TRUE; }
+  if (t >= 0x15 && t <= 0x20) { nls_month_name((int)(t - 0x15 + 1), FALSE, out); return TRUE; }
+  if (t == 0x21) { out[0] = 0; return TRUE; }
+  if (t >= 0x22 && t <= 0x2D) { nls_month_name((int)(t - 0x22 + 1), TRUE, out); return TRUE; }
+  if (t == 0x2E) { out[0] = 0; return TRUE; }
+  if (t >= 0x31 && t <= 0x37) { nls_day_name((int)((t - 0x31 + 1) % 7), TRUE, scratch); out[0] = scratch[0]; out[1] = scratch[1]; out[2] = 0; return TRUE; }
+  return FALSE;
+}
+static int nls_calendar_info(int kind, DWORD calendar, DWORD type, WCHAR *buffer, int capacity, DWORD *value) {
+  WCHAR text[80];
+  if (kind == 0 || capacity < 0 || (capacity > 0 && !buffer)) { set_error(ERROR_INVALID_PARAMETER); return 0; }
+  if (type & CALENDAR_RETURN_NUMBER) {
+    if (!value) { set_error(ERROR_INVALID_PARAMETER); return 0; }
+    if (!nls_calendar_text(kind, calendar, type, text)) { set_error(ERROR_INVALID_PARAMETER); return 0; }
+    DWORD v = 0;
+    for (const WCHAR *c = text; *c >= '0' && *c <= '9'; ++c) v = v * 10 + (DWORD)(*c - '0');
+    *value = v;
+    return 2;
+  }
+  if (!nls_calendar_text(kind, calendar, type, text)) { set_error(ERROR_INVALID_PARAMETER); return 0; }
+  const int n = (int)wcslen(text) + 1;
+  if (capacity == 0) return n;
+  if (capacity < n) { set_error(ERROR_INSUFFICIENT_BUFFER); return 0; }
+  memcpy(buffer, text, (size_t_)n * 2);
+  return n;
+}
+EXPORT int WINAPI GetCalendarInfoW(LCID locale, DWORD calendar, DWORD type, LPWSTR buffer, int capacity, LPDWORD value) {
+  return nls_calendar_info(nls_locale_of(locale), calendar, type, buffer, capacity, value);
+}
+EXPORT int WINAPI GetCalendarInfoEx(LPCWSTR name, DWORD calendar, LPCWSTR reserved, DWORD type, LPWSTR buffer, int capacity, LPDWORD value) {
+  if (reserved) { set_error(ERROR_INVALID_PARAMETER); return 0; }
+  return nls_calendar_info(nls_locale_of_name(name), calendar, type, buffer, capacity, value);
+}
+EXPORT int WINAPI GetCalendarInfoA(LCID locale, DWORD calendar, DWORD type, LPSTR buffer, int capacity, LPDWORD value) {
+  if (capacity < 0 || (capacity > 0 && !buffer)) { set_error(ERROR_INVALID_PARAMETER); return 0; }
+  if (type & CALENDAR_RETURN_NUMBER) return nls_calendar_info(nls_locale_of(locale), calendar, type, NULL, 0, value) ? 4 : 0;
+  WCHAR wide[80];
+  const int n = nls_calendar_info(nls_locale_of(locale), calendar, type, wide, 80, value);
+  return nls_narrow_result(n, wide, buffer, capacity);
+}
+
+typedef BOOL (CALLBACK *CALINFO_ENUMPROCA_)(LPSTR);
+typedef BOOL (CALLBACK *CALINFO_ENUMPROCW_)(LPWSTR);
+typedef BOOL (CALLBACK *CALINFO_ENUMPROCEXA_)(LPSTR, DWORD);
+typedef BOOL (CALLBACK *CALINFO_ENUMPROCEXW_)(LPWSTR, DWORD);
+typedef BOOL (CALLBACK *CALINFO_ENUMPROCEXEX_)(LPWSTR, DWORD, LPWSTR, LPARAM);
+/* The values of one calendar value type: a list for the date formats, one value for the rest. mode: 0 narrow, 1 narrow+calendar, 2 wide, 3 wide+calendar, 4 wide+all. */
+static BOOL nls_enum_calendar(int kind, DWORD calendar, DWORD type, int mode, void *proc, LPARAM param) {
+  if (kind == 0 || !proc) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  const DWORD calendars[2] = {1, 2};
+  for (int i = 0; i < 2; ++i) {
+    if (calendar != CALENDAR_ALL && calendar != calendars[i]) continue;
+    if (calendar == CALENDAR_ALL && i == 1) break;      /* (the U.S. variant is not offered as an alternate here) */
+    WCHAR one[80];
+    const char *const *list = NULL;
+    const DWORD t = type & 0xFFFF;
+    if (t == 0x05) list = k_short_dates; else if (t == 0x06) list = k_long_dates; else if (t == 0x2F) list = k_year_months;
+    WCHAR items[8][40];
+    int count = 0;
+    if (list) for (; list[count] && count < 8; ++count) nls_widen(items[count], list[count]);
+    else {
+      if (!nls_calendar_text(kind, calendars[i], type, one)) { if (calendar == CALENDAR_ALL) continue; set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+      if (type & CALENDAR_RETURN_NUMBER) { DWORD v = 0; for (const WCHAR *c = one; *c >= '0' && *c <= '9'; ++c) v = v * 10 + (DWORD)(*c - '0'); WCHAR num[12]; int k = 0; WCHAR digits[12]; int d = 0; do { digits[d++] = (WCHAR)('0' + v % 10); v /= 10; } while (v); while (d) num[k++] = digits[--d]; num[k] = 0; memcpy(items[0], num, ((size_t_)k + 1) * 2); }
+      else memcpy(items[0], one, ((size_t_)wcslen(one) + 1) * 2);
+      count = 1;
+    }
+    for (int k = 0; k < count; ++k) {
+      BOOL more;
+      char narrow[80];
+      switch (mode) {
+        case 0: WideCharToMultiByte(CP_UTF8, 0, items[k], -1, narrow, sizeof(narrow), NULL, NULL); more = ((CALINFO_ENUMPROCA_)proc)(narrow); break;
+        case 1: WideCharToMultiByte(CP_UTF8, 0, items[k], -1, narrow, sizeof(narrow), NULL, NULL); more = ((CALINFO_ENUMPROCEXA_)proc)(narrow, calendars[i]); break;
+        case 2: more = ((CALINFO_ENUMPROCW_)proc)(items[k]); break;
+        case 3: more = ((CALINFO_ENUMPROCEXW_)proc)(items[k], calendars[i]); break;
+        default: more = ((CALINFO_ENUMPROCEXEX_)proc)(items[k], calendars[i], NULL, param); break;
+      }
+      if (!more) return TRUE;
+    }
+  }
+  return TRUE;
+}
+EXPORT BOOL WINAPI EnumCalendarInfoA(CALINFO_ENUMPROCA_ proc, LCID locale, DWORD calendar, DWORD type) { return nls_enum_calendar(nls_locale_of(locale), calendar, type, 0, (void *)proc, 0); }
+EXPORT BOOL WINAPI EnumCalendarInfoW(CALINFO_ENUMPROCW_ proc, LCID locale, DWORD calendar, DWORD type) { return nls_enum_calendar(nls_locale_of(locale), calendar, type, 2, (void *)proc, 0); }
+EXPORT BOOL WINAPI EnumCalendarInfoExA(CALINFO_ENUMPROCEXA_ proc, LCID locale, DWORD calendar, DWORD type) { return nls_enum_calendar(nls_locale_of(locale), calendar, type, 1, (void *)proc, 0); }
+EXPORT BOOL WINAPI EnumCalendarInfoExW(CALINFO_ENUMPROCEXW_ proc, LCID locale, DWORD calendar, DWORD type) { return nls_enum_calendar(nls_locale_of(locale), calendar, type, 3, (void *)proc, 0); }
+EXPORT BOOL WINAPI EnumCalendarInfoExEx(CALINFO_ENUMPROCEXEX_ proc, LPCWSTR name, DWORD calendar, LPCWSTR reserved, DWORD type, LPARAM param) {
+  if (reserved) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  return nls_enum_calendar(nls_locale_of_name(name), calendar, type, 4, (void *)proc, param);
+}

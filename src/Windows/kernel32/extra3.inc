@@ -189,6 +189,8 @@ static const char *locale_text(DWORD type, DWORD *number, char *scratch) {
     case 0x5C: return "en-US";                 /* SNAME */
     case 0x1002: return "United States";       /* SENGLISHCOUNTRYNAME */
     case 0x1003: return "h:mm:ss tt";          /* STIMEFORMAT */
+    case 0x1006: return "MMMM yyyy";           /* SYEARMONTH */
+    case 0x79: return "h:mm tt";               /* SSHORTTIME */
     case 0x1004: *number = 65001; return NULL; /* IDEFAULTANSICODEPAGE */
     case 0x1007: *number = 437; return NULL;   /* IDEFAULTCODEPAGE */
     case 0x100B: *number = 0; return NULL;     /* IFIRSTWEEKOFYEAR */
