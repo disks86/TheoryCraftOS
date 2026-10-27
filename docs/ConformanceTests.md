@@ -90,3 +90,10 @@ selection of an input) and iteration by code point all work on them. `toUpperCas
 `normalize` use the tables of `src/Script/UnicodeTables.hpp`, made by `scripts/gen_unicode_text_tables.py`.
 A string that is not valid UTF-8 is a *byte string*: every byte is a character 0..255 (the internal convention of `Blob`, `TextDecoder`, `atob` ...; `__bytes_to_string`
 and `atob` mark theirs). A byte string that happens to be valid UTF-8 and is not marked is read as text. Use `__text_bytes(str)` for the UTF-8 bytes of a string.
+
+
+## Wine's Windows tests
+
+`tests/windows/wine` holds Wine's conformance tests for the system DLLs of `src/Windows` (343 programs build; see its README for the build, the licence and what does not
+link). They measure how far the DLLs and system services are from real Windows: nearly all of them fail today because the DLLs are stubs (`docs/WindowsUserMode.md`),
+and they are meant to be worked through DLL by DLL as the implementations arrive.
