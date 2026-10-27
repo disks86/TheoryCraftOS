@@ -380,6 +380,7 @@ void AmdVegaM::on_event(const AmdIrq::Event& event) {
     case AmdIrq::Kind::SdmaIllegalInstruction: sdma_->fault(event.engine); break;
     default: break;
   }
+  if (observer_) observer_->on_event(event);
 }
 
 bool AmdVegaM::engage_display(const amd_dce11::FirmwareFramebuffer& firmware, ByteView* memory) {

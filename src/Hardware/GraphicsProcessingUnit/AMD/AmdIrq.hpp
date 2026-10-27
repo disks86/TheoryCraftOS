@@ -31,6 +31,8 @@ namespace hardware {
 //              239 SQ message (the shader sequencer: general events, and the instruction or EDC/ECC reports of a wave; the vector's data is the SQ_INTERRUPT_WORD)
 //   sdma_v3_0  224 trap (a fence), 241 and 247 illegal instruction                                            (ring id: bits 1:0 engine, 3:2 queue)
 //   dce_v11_0  1..6 a controller's vertical blank (data 0) or line (data 1), 8, 10, ..., 18 a controller's page flip, 42 hot plug detect (data: the pin)
+//   uvd_v6_0   124 the decode ring's fence (system message), 119 and 120 the two encode rings' fences
+//   vce_v3_0   167 a VCE ring's fence (data 0, 1, 2: the rings)
 //   gmc_v8_0   146 page fault, 147 memory protection fault: the fault's address and status are read from the memory controller and the registers cleared
 // Anything else is counted and left. The driver's handlers hand fences to the scheduler and faults to its timeout handling; here a fence is an event for the sink (the engines'
 // submit functions poll their fence words), and a fault is reported to the sink, which can stop the ring it came from. The caller polls (process): the card's interrupt line is
@@ -52,13 +54,17 @@ class AmdIrq {
     DisplayVline,               // dce_v11_0_crtc_irq, data 1
     DisplayPageFlip,            // dce_v11_0_pageflip_irq
     DisplayHotplug,             // dce_v11_0_hpd_irq
+    UvdFence,                   // uvd_v6_0_process_interrupt, 124
+    UvdEncodeFence,             // uvd_v6_0_process_interrupt, 119 and 120
+    VceFence,                   // vce_v3_0_process_interrupt
   };
-  static constexpr uint32_t kKinds = 14;
+  static constexpr uint32_t kKinds = 17;
   static const char* kind_name(Kind kind);
 
   // The source ids (ivsrcid_vislands30.h; the SDMA illegal instruction has a bare 241 in sdma_v3_0_sw_init).
   static constexpr uint32_t kSrcCpEndOfPipe = 181, kSrcCpPrivRegFault = 184, kSrcCpPrivInstrFault = 185, kSrcCpEccError = 197, kSrcSqInterruptMsg = 239;
   static constexpr uint32_t kSrcDisplayCrtcFirst = 1, kSrcPageFlipFirst = 8, kSrcPageFlipLast = 18, kSrcHotplugDetect = 42;
+  static constexpr uint32_t kSrcUvdEncodeFirst = 119, kSrcUvdSystemMessage = 124, kSrcVceTrap = 167;
   static constexpr uint32_t kSrcSdmaTrap = 224, kSrcSdmaIllegalInstruction = 241, kSrcSdmaSrbmWrite = 247;
   static constexpr uint32_t kSrcGfxPageInvFault = 146, kSrcGfxMemProtFault = 147;
 
@@ -88,6 +94,7 @@ class AmdIrq {
     uint32_t me = 0, pipe = 0, queue = 0;   // the CP's: ring id decoded for the gfx_v8_0 sources
     uint32_t engine = 0;                    // the SDMA engine (0, 1) for the sdma_v3_0 sources
     uint32_t crtc = 0;                      // the display controller of a vblank, line or page flip
+    uint32_t ring = 0;                      // the UVD encode ring (0, 1) or the VCE ring (0..2) of a fence
     uint32_t pin = 0;                       // the hot plug pin of a hot plug
     bool connected = false;                 // after a hot plug: something is connected to the pin
     bool asserted = false;                  // the display engine's status said this interrupt was pending (vblank, line)
@@ -119,6 +126,10 @@ class AmdIrq {
   uint32_t unknown_source(uint32_t src_id) const { return src_id < 256 ? unknown_[src_id] : 0; }
   const VmFaultInfo& last_vm_fault() const { return last_vm_fault_; }
   const SqInfo& last_sq() const { return last_sq_; }
+  // The video engines' fences: the decode ring, the two encode rings of UVD and the three rings of VCE (the engines' submit paths poll their fence words, so these only show
+  // that the engine raised its interrupt).
+  uint32_t uvd_encode_fences(uint32_t ring) const { return ring < 2 ? uvd_encode_[ring] : 0; }
+  uint32_t vce_fences(uint32_t ring) const { return ring < 3 ? vce_[ring] : 0; }
   // The display interrupts, per controller and per pin.
   uint32_t vblank_count(uint32_t crtc) const { return crtc < amd_dce11::kMaxCrtcs ? vblanks_[crtc] : 0; }
   uint32_t pageflip_count(uint32_t crtc) const { return crtc < amd_dce11::kMaxCrtcs ? pageflips_[crtc] : 0; }
@@ -138,6 +149,7 @@ class AmdIrq {
   uint32_t total_ = 0;
   amd_dce11::Interrupts display_;
   uint32_t vblanks_[amd_dce11::kMaxCrtcs] = {}, pageflips_[amd_dce11::kMaxCrtcs] = {}, hotplugs_[amd_dce11::Interrupts::kMaxHpd] = {};
+  uint32_t uvd_encode_[2] = {}, vce_[3] = {};
   uint32_t connected_ = 0, throttled_ = 0;
   VmFaultInfo last_vm_fault_;
   SqInfo last_sq_;

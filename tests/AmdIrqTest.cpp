@@ -39,6 +39,9 @@ static AmdIrq::Kind expected(uint32_t src, uint32_t ring, uint32_t data) {
     case 1: case 2: case 3: case 4: case 5: case 6: return data == 0 ? AmdIrq::Kind::DisplayVblank : data == 1 ? AmdIrq::Kind::DisplayVline : AmdIrq::Kind::Unknown;
     case 8: case 10: case 12: case 14: case 16: case 18: return AmdIrq::Kind::DisplayPageFlip;
     case 42: return data < 6 ? AmdIrq::Kind::DisplayHotplug : AmdIrq::Kind::Unknown;
+    case 124: return AmdIrq::Kind::UvdFence;
+    case 119: case 120: return AmdIrq::Kind::UvdEncodeFence;
+    case 167: return data < 3 ? AmdIrq::Kind::VceFence : AmdIrq::Kind::Unknown;
     case 224: return ((ring & 3) < 2 && ((ring >> 2) & 3) == 0) ? AmdIrq::Kind::SdmaTrap : AmdIrq::Kind::Unknown;
     case 241:
     case 247: return (ring & 3) < 2 ? AmdIrq::Kind::SdmaIllegalInstruction : AmdIrq::Kind::Unknown;
@@ -66,6 +69,8 @@ static void test_classify_all() {
         if (e.kind == AmdIrq::Kind::DisplayVblank && e.crtc != src - 1) ++mismatches;
         if (e.kind == AmdIrq::Kind::DisplayPageFlip && e.crtc != (src - 8) / 2) ++mismatches;
         if (e.kind == AmdIrq::Kind::DisplayHotplug && e.pin != data) ++mismatches;
+        if (e.kind == AmdIrq::Kind::UvdEncodeFence && e.ring != src - 119) ++mismatches;
+        if (e.kind == AmdIrq::Kind::VceFence && e.ring != data) ++mismatches;
       }
     }
   }

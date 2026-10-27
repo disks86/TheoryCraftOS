@@ -141,6 +141,9 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
   // other events are counted. The card's interrupt line is not connected, so the caller polls this (the desktop loop does). Returns how many vectors were handled.
   uint32_t service_interrupts(uint32_t max_vectors = 64);
   const AmdIrq* irq() const { return irq_.get(); }
+  // Everything the interrupt ring delivers is also passed to `observer` (not owned; null to stop), after the card has dealt with it: how the video engines, which run on their own,
+  // learn of their fences. Called from service_interrupts().
+  void set_event_observer(AmdIrq::ISink* observer) { observer_ = observer; }
   // The vertical blank interrupt of the controller that shows the OS's framebuffer (it comes every frame, so it is off until asked for): counted per controller in irq()->vblank_count().
   // False if the display is not engaged. It is switched off again when the display is given back or the card stopped.
   bool set_vblank_interrupt(bool enable);
@@ -170,6 +173,7 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
   UniquePointer<AmdIrq> irq_;
   UniquePointer<amd_dce11::Interrupts> display_irq_;
   int vblank_crtc_ = -1;
+  AmdIrq::ISink* observer_ = nullptr;
   UniquePointer<AmdGfx8Compute> compute_;
   UniquePointer<AmdGfx8> gfx_;
   UniquePointer<AmdSdma3> sdma_;
