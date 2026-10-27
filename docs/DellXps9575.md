@@ -12,7 +12,7 @@ The internal panel is wired to the Intel GPU, so the Intel GPU is the boot displ
 
 ## Not done
 
-- **Polaris bring-up**: the SMC microcode load and the GFX 8 command processor start are written and so are the memory controller and GART (see "Radeon RX Vega M: graphics engine start-up" and "... memory controller and GART" below, simulation only). Still missing: SDMA, DCE 11.2 display, the rest of GFX 8. The interrupt handler ring is written ("... interrupt handler" below).
+- **Polaris bring-up**: the SMC microcode load and the GFX 8 command processor start are written and so are the memory controller and GART (see "Radeon RX Vega M: graphics engine start-up" and "... memory controller and GART" below, simulation only). Still missing: DCE 11.2 display, the rest of GFX 8. The interrupt handler ring is written ("... interrupt handler" below).
   None of it can be checked without the hardware.
 - **UVD 6.3 video decode** for the Vega M beyond H.264, H.265 (8 and 10 bit), MPEG-2, VC-1 (interlaced pictures untested against real data, see below) and MPEG-4 (the MPEG-4 tools listed below; the chip has no VP9), and any run of it on the card.
 - **VCE 3.4 video encode** on the Vega M beyond the start and stop (see the VCE section), and any run of it on the card.
@@ -247,6 +247,19 @@ moves to the write pointer + 16 and `WPTR_OVERFLOW_CLEAR` is pulsed) / `_decode_
 pipes' EOP enables, the memory controller's fault interrupts) is a separate thing and is not switched on here. Not done and assumed: bus mastering (the PCI layer must set it before the ring is enabled),
 MSI (`Config::msi` only sets `RPTR_REARM`), the software ring (`ih_soft`), the ring in video memory (it expects memory the CPU can read and the card can write, e.g. system RAM mapped through the GART; the
 non-snooped bit is left clear as in the driver for system memory), and every check on a real card.
+
+## Radeon RX Vega M: SDMA engines
+
+Code: `src/Hardware/GraphicsProcessingUnit/AMD/AmdSdma3.*` (+ generated `AmdSdma3Registers.inc`), tests: `tests/AmdSdma3Test.cpp` with `tests/FakeAmdSdma3.hpp` (`tests/run_host_tests.sh AmdSdma3Test`), checker:
+`scripts/check_sdma3_port.py <sdma_v3_0.c>`. Ported from `sdma_v3_0.c`: the golden registers (`golden_settings_polaris11_a11`, compared by value), both engines halted, each engine's ring (8 KiB: size, base, read pointer
+write-back, doorbell `0x1E0` / `0x1E1`, no write-pointer polling), un-halt, context switching, and the driver's ring test (a WRITE packet to a word of memory). Their microcode is loaded by the SMC
+(`AmdSmu7Ucode`). `copy()` and `fill()` build the driver's COPY_LINEAR / CONST_FILL packets (chunks of at most `0x3fffe0` bytes), then the fence write and a trap (`sdma_v3_0_ring_emit_fence`), and wait for the
+fence; an engine that does not answer is wedged until it is started again. Padding to 16 dwords uses a burst NOP when `Config::burst_nop` is set (the driver sets it for a firmware feature version of at
+least 20: `AmdGfx8Image::feature_version`, 31 for `vegam_sdma.bin`, 0 for `vegam_sdma1.bin`).
+
+With the GART (`AmdGmc8`) this moves data between video memory and system RAM without the CPU. Not done and assumed: interrupts (the trap packet is sent; see `AmdIh3`), indirect buffers, the VM flush and
+page-table update packets (the rings use VMID 0), the RLC queues, tiled copies, clock gating, soft reset and the SR-IOV poll-memory mode. The test's engines are written from the driver's description of the
+packets; a real engine's handling of a burst NOP, an unaligned destination or a copy that crosses the end of a GART mapping has not been seen. Nothing here was run on a real 9575.
 
 ## Radeon RX Vega M: UVD 6.3
 

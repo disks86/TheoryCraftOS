@@ -26,7 +26,7 @@ namespace hardware {
 namespace {
 // struct common_firmware_header: size_bytes, header_size_bytes, header_version_major/minor, ip_version_major/minor (16 bits each), ucode_version, ucode_size_bytes,
 // ucode_array_offset_bytes, crc32.
-constexpr uint32_t kCommonHeaderBytes = 32;
+constexpr uint32_t kCommonHeaderBytes = 36;   // the common header and the feature version word that follows it in every kind of file but the RLC's
 // struct gfx_firmware_header_v1_0 adds ucode_feature_version, jt_offset, jt_size.
 constexpr uint32_t kGfxHeaderBytes = 44;
 constexpr uint32_t kMaxFirmwareBytes = 4u << 20;   // far above the largest file (the MEC, 257 KiB); a bigger size field is damage
@@ -73,6 +73,11 @@ bool amd_gfx8_parse_firmware(ConstByteView file, AmdGfx8Block block, AmdGfx8Imag
 
   AmdGfx8Image result;
   result.version = ucode_version;
+  if (block != AmdGfx8Block::RlcG) {
+    in.seek(32);
+    result.feature_version = in.le32();
+    if (!in.ok()) return false;
+  }
   result.ucode = file.subview(array_offset, ucode_size);
   if (block == AmdGfx8Block::CpMec || block == AmdGfx8Block::CpMec2) {
     in.seek(32);
