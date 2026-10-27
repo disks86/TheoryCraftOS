@@ -12,7 +12,7 @@ The internal panel is wired to the Intel GPU, so the Intel GPU is the boot displ
 
 ## Not done
 
-- **Polaris bring-up**: the SMC microcode load and the GFX 8 command processor start are written and so are the memory controller and GART (see "Radeon RX Vega M: graphics engine start-up" and "... memory controller and GART" below, simulation only). Still missing: DCE 11.2 display, the rest of GFX 8. The interrupt handler ring is written ("... interrupt handler" below).
+- **Polaris bring-up**: the SMC microcode load and the GFX 8 command processor start are written and so are the memory controller and GART (see "Radeon RX Vega M: graphics engine start-up" and "... memory controller and GART" below, simulation only). Still missing: DCE 11.2 mode setting (only the surface address is written, see below), the rest of GFX 8. The interrupt handler ring is written ("... interrupt handler" below).
   None of it can be checked without the hardware.
 - **UVD 6.3 video decode** for the Vega M beyond H.264, H.265 (8 and 10 bit), MPEG-2, VC-1 (interlaced pictures untested against real data, see below) and MPEG-4 (the MPEG-4 tools listed below; the chip has no VP9), and any run of it on the card.
 - **VCE 3.4 video encode** on the Vega M beyond the start and stop (see the VCE section), and any run of it on the card.
@@ -260,6 +260,21 @@ least 20: `AmdGfx8Image::feature_version`, 31 for `vegam_sdma.bin`, 0 for `vegam
 With the GART (`AmdGmc8`) this moves data between video memory and system RAM without the CPU. Not done and assumed: interrupts (the trap packet is sent; see `AmdIh3`), indirect buffers, the VM flush and
 page-table update packets (the rings use VMID 0), the RLC queues, tiled copies, clock gating, soft reset and the SR-IOV poll-memory mode. The test's engines are written from the driver's description of the
 packets; a real engine's handling of a burst NOP, an unaligned destination or a copy that crosses the end of a GART mapping has not been seen. Nothing here was run on a real 9575.
+
+## Radeon RX Vega M: DCE 11.2 display
+
+Code: `src/Hardware/GraphicsProcessingUnit/AMD/AmdDce11.*` (+ generated `AmdDce11Registers.inc`), tests: `tests/AmdDce11Test.cpp` (`tests/run_host_tests.sh AmdDce11Test`), checker:
+`scripts/check_dce11_port.py <dce_v11_0.c>` (the file is from kernel 6.12; later kernels dropped the legacy display code for the display core). The VEGAM uses the DCE 11.2 block
+(`dce_v11_0.c`, register headers `dce_11_2_*`). This is the dGPU counterpart of `amd_dcn1::Plane`: it **does not set a mode**. The card's video BIOS lit the screen at POST; `amd_dce11::Plane::probe()` finds the
+CRTC (of six) whose graphics surface is the firmware's framebuffer (same GPU address, same pitch, ARGB8888, linear, no byte swapping, CRTC and surface on) and `set_surface()` points it at another
+address inside the memory controller's system aperture the way `dce_v11_0_page_flip` does (immediate flip, pitch, high half, low half; the firmware's flip policy is put back), waits until the update is no
+longer pending and the address is the new one, and puts the old address back if it is not taken. `restore()` returns to the firmware's picture.
+
+Why no mode setting: the driver programs the PLLs, the DIG encoders and the transmitters (and trains DisplayPort links) through the video BIOS's AtomBIOS command tables, which need an interpreter this OS does not
+have, and the panel of the 9575 is wired to the Intel GPU anyway: the Vega M's outputs are the external ports. Not done: wiring it into `AmdGpu` / the scanout (the Raven path's `Scanout` plans a framebuffer in
+the carve-out and copies the firmware's picture; the Vega M would put its framebuffer in the part of video memory the video engine does not use and map it through BAR 0), hotplug, cursors, the colour
+pipeline, vblank counters, underflow detection and every check on a real card. Whether the display reads the new address through the system aperture unchanged after `AmdGmc8` rewrote the aperture is the
+driver's behaviour and has not been seen on the card.
 
 ## Radeon RX Vega M: UVD 6.3
 
