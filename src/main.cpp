@@ -1052,6 +1052,11 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         inputs.aperture_bytes = aperture_bytes;
         inputs.doorbells = doorbells;
         inputs.max_framebuffer_bytes = largest;
+        // The full reset of the card as the last resort when an engine will not come back from its soft reset. This OS cannot POST a card afterwards (no AtomBIOS interpreter), so the
+        // card would stay down and whatever it shows would go dark: only allowed when the card does not drive the display.
+        inputs.pci = &pci;
+        inputs.pci_address = d.address;
+        inputs.allow_asic_reset = !drives_display;
         inputs.auto_recover = true;   // an engine that hung or faulted is reset from the desktop loop (service_interrupts), a few times at most
         // MSI first, as the driver does (the interrupt ring is told it is on): the handler, then the message, to the core that runs this.
         const uint32_t apic_id = kernel::running() ? kernel::apic::this_apic_id() : 0xFFFF;

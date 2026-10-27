@@ -22,6 +22,8 @@
 #include "Allocators/IAllocator.hpp"
 #include "FileSystem/IFileSystem.hpp"
 #include "Hardware/Clock/IClock.hpp"
+#include "Hardware/Bus/Pci/IPciBus.hpp"
+#include "Hardware/GraphicsProcessingUnit/AMD/AmdAsicReset.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdDce11.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdGfx8.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdGfx8Compute.hpp"
@@ -78,6 +80,9 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
     MmioRegion doorbells;                         // the doorbell BAR (BAR 2), at least the first 8 KiB
     uint64_t max_framebuffer_bytes = 0;           // the largest picture the display could show (0: no display part)
     uint32_t hpd_pins = 0x3F;                     // the hot plug detect pins to watch (bit n: pin n); which pin a connector is on is in the video BIOS, so by default all of them
+    IPciBus* pci = nullptr;                       // where the card is, for the full reset (AmdAsicReset): its configuration space
+    PciAddress pci_address{};
+    bool allow_asic_reset = false;                // recover() falls back to a full reset of the card when an engine will not come back from its soft reset (read the warning at reset_card())
     bool auto_recover = false;                    // service_interrupts() resets an engine that a fault or a timeout left wedged (at most kMaxRecoveries times in all)
     bool msi = false;                             // the card's MSI is on (PciMsi): the interrupt ring is told to re-arm it as the driver does (adev->irq.msi_enabled)
     const ISystemAddresses* system_addresses = nullptr;   // for upload() and download(); null: a pointer is its own address
@@ -152,8 +157,16 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
   // bring_up). Nothing is done for engines that are running and not wedged.
   struct Recovery {
     bool graphics = false, sdma = false, failed = false;
+    bool card_reset = false;   // the soft reset did not help and the whole card was reset (reset_card); `failed` then says whether it is up again
   };
   Recovery recover();
+  // The full reset of the card (AmdAsicReset: the PCI configuration reset the driver falls back to): everything is stopped, the card is reset, and bring_up is run again with the same
+  // inputs. True if the card is up again. WARNING: the driver then POSTs the card (the video BIOS's init tables, through the AtomBIOS interpreter) to train the memory and set the
+  // clocks up, and this OS has no interpreter for them. A real card that has been reset therefore comes back quiet (no engine, no DMA) but not usable, and bring_up is expected to
+  // fail until the machine is restarted; the video memory, including the firmware's framebuffer, is gone with it. Needs Inputs::pci. At most kMaxAsicResets in all.
+  bool reset_card();
+  uint32_t asic_resets() const { return asic_resets_; }
+  static constexpr uint32_t kMaxAsicResets = 2;
   bool wedged() const;   // any engine is, or was left stopped by a recovery that did not work
   uint32_t recoveries() const { return recoveries_; }
   static constexpr uint32_t kMaxRecoveries = 8;   // what service_interrupts() will do by itself in one life of the card (a card that keeps hanging is left alone)
@@ -186,7 +199,7 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
   UniquePointer<AmdIrq> irq_;
   UniquePointer<amd_dce11::Interrupts> display_irq_;
   int vblank_crtc_ = -1;
-  uint32_t recoveries_ = 0;
+  uint32_t recoveries_ = 0, asic_resets_ = 0;
   AmdIrq::ISink* observer_ = nullptr;
   UniquePointer<AmdGfx8Compute> compute_;
   UniquePointer<AmdGfx8> gfx_;

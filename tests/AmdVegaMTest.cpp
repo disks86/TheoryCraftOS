@@ -91,6 +91,8 @@ struct Card final : IVcnRegisters {
   fakesdma::Card sdma;
   fakedce::FakeDisplay dce;
   size_t other_writes = 0;
+  uint32_t memsize_ones = 0;        // CONFIG_MEMSIZE reads all ones this many more times (the card is in reset)
+  bool memsize_never = false;
   static bool in(uint32_t r, uint32_t lo, uint32_t hi) { return r >= lo && r <= hi; }
   IVcnRegisters& owner(uint32_t r) {
     if (in(r, 0x3400, 0x37ff)) return sdma;
@@ -99,7 +101,13 @@ struct Card final : IVcnRegisters {
     if (in(r, 0x1a00, 0x1fff) || in(r, 0x4000, 0x47ff)) return dce;
     return gfx;
   }
-  uint32_t read(uint32_t r) override { return owner(r).read(r); }
+  uint32_t read(uint32_t r) override {
+    if (r == 0x150a && (memsize_never || memsize_ones > 0)) {
+      if (memsize_ones > 0) --memsize_ones;
+      return 0xFFFFFFFFu;
+    }
+    return owner(r).read(r);
+  }
   void write(uint32_t r, uint32_t v) override {
     owner(r).write(r, v);
     if (r == 0x398) sdma.write(r, v);   // SRBM_SOFT_RESET reaches both the graphics and the DMA engines
@@ -966,6 +974,178 @@ static void test_recovery_failure_sdma() {
   CHECK(!r.graphics && !r.sdma && !r.failed);
 }
 
+// The card that reset itself: the PCI configuration reset, the way the card sees it from its configuration space.
+struct FakePci final : IPciBus {
+  Rig& rig;
+  uint32_t command = 0x0407, status = 0x0010, resets = 0, bm_off = 0;
+  bool needs_post = false;      // after the reset the video memory is not trained: the memory controller's registers read as they do at power on
+  bool never_returns = false;   // the card does not answer after the reset
+  bool clears_hang = true;      // the reset brings a hung engine back
+  explicit FakePci(Rig& r) : rig(r) {}
+  const char* name() const override { return "pci"; }
+  bool initialize() override { return true; }
+  void shutdown() override {}
+  uint32_t device_count() const override { return 1; }
+  bool pci_device(uint32_t, PciDeviceInfo*) const override { return false; }
+  uint32_t read32(PciAddress, uint16_t offset) const override { return offset == 4 ? (command | (status << 16)) : 0; }
+  void write32(PciAddress, uint16_t offset, uint32_t value) const override {
+    FakePci& self = const_cast<FakePci&>(*this);   // (the interface's writes are const; the fake keeps state)
+    if (offset == 4) {
+      if ((command & 4) && !(value & 4)) ++self.bm_off;
+      self.command = value & 0xFFFF;
+    } else if (offset == 0x7c && value == 0x39d5e86b) {
+      ++self.resets;
+      rig.card.memsize_ones = 4;
+      rig.card.memsize_never = never_returns;
+      if (clears_hang) {
+        rig.card.gfx.hung = false;
+        rig.card.gfx.reset_fails = false;
+        rig.card.sdma.stall[0] = rig.card.sdma.stall[1] = false;
+        rig.card.sdma.reset_fails = false;
+        rig.card.sdma.ignore_fences = false;
+      }
+      memset(rig.doorbell_base, 0, 0x800 * 4);   // (the doorbell BAR is part of the card)
+      if (needs_post) {
+        rig.card.gmc.set_reg(0x150a, 0);
+        rig.card.gmc.set_reg(0x809, 0);
+      }
+    }
+  }
+  uint64_t memory_bar(PciAddress, uint8_t) const override { return 0; }
+  uint16_t find_capability(PciAddress, uint8_t) const override { return 0; }
+};
+
+// The full reset as the fallback when the soft reset does not bring an engine back.
+static void test_card_reset() {
+  const uint32_t nop[] = {0xC0001000};
+  const ArrayView<const uint32_t> ib(nop, 1);
+  {
+    // A command processor that hangs and does not come back from its soft reset: the card is reset and brought up again, and everything works.
+    Rig rig;
+    FakePci pci(rig);
+    AmdVegaM vega(rig.alloc);
+    AmdVegaM::Inputs in = rig.inputs();
+    in.pci = &pci;
+    in.pci_address = PciAddress{1, 0, 0};
+    in.allow_asic_reset = true;
+    CHECK(vega.bring_up(in));
+    rig.card.gfx.hung = true;
+    rig.card.gfx.reset_fails = true;
+    CHECK(!vega.submit_graphics(ib, 2000) && vega.wedged());
+    const AmdVegaM::Recovery r = vega.recover();
+    CHECK(r.graphics && r.card_reset && !r.failed && vega.up() && pci.resets == 1 && vega.asic_resets() == 1 && !vega.wedged());
+    CHECK(pci.bm_off == 1 && (pci.command & 4) && pci.status == 0x0010);   // (bus mastering off for the reset, on again after)
+    CHECK(vega.submit_graphics(ib) && vega.submit_compute(1, ib) && vega.submit_sdma(0, ib) && vega.submit_sdma(1, ib));
+    // It does not try again for a card that is fine.
+    CHECK(!vega.recover().card_reset && pci.resets == 1);
+  }
+  {
+    // Not allowed (the default): the soft reset's failure is the answer, and the card's PCI configuration is not touched.
+    Rig rig;
+    FakePci pci(rig);
+    AmdVegaM vega(rig.alloc);
+    AmdVegaM::Inputs in = rig.inputs();
+    in.pci = &pci;
+    CHECK(vega.bring_up(in));
+    rig.card.gfx.hung = true;
+    rig.card.gfx.reset_fails = true;
+    CHECK(!vega.submit_graphics(ib, 2000));
+    const AmdVegaM::Recovery r = vega.recover();
+    CHECK(r.graphics && !r.card_reset && r.failed && pci.resets == 0 && vega.up() && vega.asic_resets() == 0);
+  }
+  {
+    // Allowed but nowhere to write: the same.
+    Rig rig;
+    AmdVegaM vega(rig.alloc);
+    AmdVegaM::Inputs in = rig.inputs();
+    in.allow_asic_reset = true;
+    CHECK(vega.bring_up(in));
+    rig.card.gfx.hung = true;
+    rig.card.gfx.reset_fails = true;
+    CHECK(!vega.submit_graphics(ib, 2000));
+    const AmdVegaM::Recovery r = vega.recover();
+    CHECK(r.failed && !r.card_reset && !vega.reset_card() && vega.asic_resets() == 0);
+  }
+  {
+    // A card that needs its video BIOS to POST it (what a real one does): the reset works, the card answers, but it cannot be brought up. The card is left down and says why.
+    Rig rig;
+    FakePci pci(rig);
+    pci.needs_post = true;
+    AmdVegaM vega(rig.alloc);
+    AmdVegaM::Inputs in = rig.inputs();
+    in.pci = &pci;
+    in.allow_asic_reset = true;
+    CHECK(vega.bring_up(in));
+    rig.card.gfx.hung = true;
+    rig.card.gfx.reset_fails = true;
+    CHECK(!vega.submit_graphics(ib, 2000));
+    const AmdVegaM::Recovery r = vega.recover();
+    CHECK(r.card_reset && r.failed && !vega.up() && pci.resets == 1 && strstr(vega.status(), "after a card reset: "));
+    CHECK((pci.command & 4) && !vega.submit_graphics(ib) && !vega.wedged() && !vega.recover().graphics);
+  }
+  {
+    // A card that does not answer after the reset: down, bus mastering left off.
+    Rig rig;
+    FakePci pci(rig);
+    pci.never_returns = true;
+    AmdVegaM vega(rig.alloc);
+    AmdVegaM::Inputs in = rig.inputs();
+    in.pci = &pci;
+    in.allow_asic_reset = true;
+    CHECK(vega.bring_up(in));
+    rig.card.gfx.hung = true;
+    rig.card.gfx.reset_fails = true;
+    CHECK(!vega.submit_graphics(ib, 2000));
+    const AmdVegaM::Recovery r = vega.recover();
+    CHECK(r.card_reset && r.failed && !vega.up() && !(pci.command & 4) && strstr(vega.status(), "card reset: the card did not answer"));
+  }
+  {
+    // The reset that does not help either: tried at most kMaxAsicResets times, then left alone.
+    Rig rig;
+    FakePci pci(rig);
+    pci.clears_hang = false;
+    AmdVegaM vega(rig.alloc);
+    AmdVegaM::Inputs in = rig.inputs();
+    in.pci = &pci;
+    in.allow_asic_reset = true;
+    CHECK(vega.bring_up(in));
+    rig.card.gfx.hung = true;
+    rig.card.gfx.reset_fails = true;
+    CHECK(!vega.submit_graphics(ib, 2000));
+    AmdVegaM::Recovery r = vega.recover();
+    CHECK(r.card_reset && r.failed && !vega.up() && pci.resets == 1);   // (brought up again, but the ring test of the still hung card fails: down)
+    // Bring it up by hand for the next try; the engine hangs again.
+    rig.card.gfx.hung = false;
+    rig.card.gfx.reset_fails = false;
+    memset(rig.doorbell_base, 0, 0x800 * 4);   // (a new life of the card starts with clean doorbells)
+    CHECK(vega.bring_up(in));
+    rig.card.gfx.hung = true;
+    rig.card.gfx.reset_fails = true;
+    CHECK(!vega.submit_graphics(ib, 2000));
+    r = vega.recover();
+    CHECK(r.card_reset && pci.resets == 2 && vega.asic_resets() == 2);
+    rig.card.gfx.hung = false;
+    rig.card.gfx.reset_fails = false;
+    memset(rig.doorbell_base, 0, 0x800 * 4);   // (a new life of the card starts with clean doorbells)
+    CHECK(vega.bring_up(in));
+    rig.card.gfx.hung = true;
+    rig.card.gfx.reset_fails = true;
+    CHECK(!vega.submit_graphics(ib, 2000));
+    r = vega.recover();
+    CHECK(r.failed && !r.card_reset && pci.resets == 2 && vega.asic_resets() == AmdVegaM::kMaxAsicResets);
+  }
+  {
+    // By hand, on a healthy card: reset and brought up again.
+    Rig rig;
+    FakePci pci(rig);
+    AmdVegaM vega(rig.alloc);
+    AmdVegaM::Inputs in = rig.inputs();
+    in.pci = &pci;
+    CHECK(vega.bring_up(in));
+    CHECK(vega.reset_card() && vega.up() && pci.resets == 1 && vega.submit_graphics(ib) && vega.submit_sdma(1, ib));
+  }
+}
+
 int main() {
   setvbuf(stdout, nullptr, _IONBF, 0);
   test_plan();
@@ -985,6 +1165,7 @@ int main() {
   test_auto_recovery();
   test_recovery_failure();
   test_recovery_failure_sdma();
+  test_card_reset();
   printf(g_failed ? "AmdVegaMTest: %d FAILED\n" : "AmdVegaMTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }
