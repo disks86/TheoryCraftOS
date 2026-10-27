@@ -130,6 +130,23 @@ const char kCollections[] = R"JSLIB((function (g) {
     Object.defineProperty(it, '__kind', { value: kind });
     return it;
   });
+  // GeneratorFunction and AsyncFunction: the constructors of generator and async functions (not globals); they build a function from source like Function does
+  (function () {
+    var protos = __function_protos(), generatorProto = __generator_proto;
+    [['GeneratorFunction', protos[0], 'function*'], ['AsyncFunction', protos[1], 'async function']].forEach(function (spec) {
+      var proto = spec[1], prefix = spec[2];
+      var C = function () {
+        var a = Array.prototype.slice.call(arguments), body = a.length ? String(a.pop()) : '';
+        return (0, eval)('(' + prefix + ' anonymous(' + a.join(',') + '\n) {\n' + body + '\n})');
+      };
+      Object.defineProperty(C, 'name', { value: spec[0] });
+      Object.setPrototypeOf(C, Function);
+      Object.defineProperty(C, 'prototype', { value: proto });
+      Object.defineProperty(proto, 'constructor', { value: C, configurable: true });
+      Object.defineProperty(proto, Symbol.toStringTag, { value: spec[0], configurable: true });
+      if (spec[0] === 'GeneratorFunction') Object.defineProperty(proto, 'prototype', { value: generatorProto, configurable: true });
+    });
+  }());
   // the generator objects (and so the iterators of arrays and typed arrays) are iterators
   (function () {
     var generator = (function* () { })();
@@ -719,17 +736,11 @@ const char kCollections[] = R"JSLIB((function (g) {
   if (!Object.fromEntries) def(Object, 'fromEntries', function (iterable) { var o = {}; for (var e of iterable) o[e[0]] = e[1]; return o; });
   var Reflect = {
     apply: function (f, self, args) { return f.apply(self, args); },
-    construct: function (F, args) {
-      var a = args || [];
-      switch (a.length) {
-        case 0: return new F();
-        case 1: return new F(a[0]);
-        case 2: return new F(a[0], a[1]);
-        case 3: return new F(a[0], a[1], a[2]);
-        case 4: return new F(a[0], a[1], a[2], a[3]);
-        case 5: return new F(a[0], a[1], a[2], a[3], a[4]);
-        default: return new F(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]);
-      }
+    construct: function (F, args, newTarget) {
+      if (typeof F !== 'function') throw new TypeError(String(F) + ' is not a constructor');
+      if (newTarget === undefined) newTarget = F; else if (typeof newTarget !== 'function') throw new TypeError(String(newTarget) + ' is not a constructor');
+      if (args === null || (typeof args !== 'object' && typeof args !== 'function')) throw new TypeError('CreateListFromArrayLike called on non-object');
+      return __reflect_construct(F, Array.prototype.slice.call(args), newTarget);
     },
     defineProperty: function (o, k, d) {
       if (o === null || (typeof o !== 'object' && typeof o !== 'function')) throw new TypeError('Reflect.defineProperty called on non-object');
@@ -737,19 +748,33 @@ const char kCollections[] = R"JSLIB((function (g) {
         if (d !== null && typeof d === 'object' && !('configurable' in d)) { var c = {}; for (var p in d) c[p] = d[p]; c.configurable = false; d = c; }   // (a property made here is not configurable unless the descriptor says so)
         Object.defineProperty(o, k, d);
         return true;
-      } catch (e) { if (e instanceof TypeError && /Invalid property descriptor|non-object|Getter must/.test(e.message)) throw e; return false; }
+      } catch (e) { if (e instanceof TypeError && (/Invalid property descriptor|non-object|Getter must/.test(e.message) || (/ on proxy: /.test(e.message) && !/trap returned falsish/.test(e.message)))) throw e; return false; }
     },
     deleteProperty: function (o, k) { return delete o[k]; },
     get: function (o, k) { return o[k]; },
-    set: function (o, k, v) {
+    set: function (o, k, v, receiver) {
       'use strict';
+      if (arguments.length > 3 && receiver !== o) {   // OrdinarySet with a receiver: the property is found on o (or its prototypes), the write lands on the receiver
+        var d, p = o;
+        while (p !== null && p !== undefined) { d = Object.getOwnPropertyDescriptor(p, k); if (d) break; p = Object.getPrototypeOf(p); }
+        if (d && ('get' in d || 'set' in d)) { if (typeof d.set !== 'function') return false; d.set.call(receiver, v); return true; }
+        if (d && d.writable === false) return false;
+        if (receiver === null || (typeof receiver !== 'object' && typeof receiver !== 'function')) return false;
+        var existing = Object.getOwnPropertyDescriptor(receiver, k);
+        if (existing) {
+          if ('get' in existing || 'set' in existing || !existing.writable) return false;
+          return Reflect.defineProperty(receiver, k, { value: v });
+        }
+        return Reflect.defineProperty(receiver, k, { value: v, writable: true, enumerable: true, configurable: true });
+      }
       try { o[k] = v; return true; } catch (e) { if (e instanceof TypeError && /^Cannot (assign|add|set|create)/.test(e.message)) return false; throw e; }   // (a write the object refuses)
     },
     has: function (o, k) { return k in o; },
+    getOwnPropertyDescriptor: function (o, k) { if (o === null || (typeof o !== 'object' && typeof o !== 'function')) throw new TypeError('Reflect.getOwnPropertyDescriptor called on non-object'); return Object.getOwnPropertyDescriptor(o, k); },
     getPrototypeOf: function (o) { return Object.getPrototypeOf(o); },
     ownKeys: function (o) { return Object.getOwnPropertyNames(o).concat(Object.getOwnPropertySymbols(o)); },
     isExtensible: function (o) { return Object.isExtensible(o); },
-    preventExtensions: function (o) { Object.preventExtensions(o); return true; },
+    preventExtensions: function (o) { try { Object.preventExtensions(o); return true; } catch (e) { if (e instanceof TypeError && /trap returned falsish/.test(e.message)) return false; throw e; } },
     setPrototypeOf: function (o, p) { try { Object.setPrototypeOf(o, p); return true; } catch (e) { return false; } }
   };
   def(g, 'Reflect', Reflect);

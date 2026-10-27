@@ -17,6 +17,7 @@
  */
 
 #pragma once
+#include "Regex/CaseFold.hpp"
 #include "Regex/RegexProgram.hpp"
 #include "Regex/UnicodeProperties.hpp"
 
@@ -115,6 +116,16 @@ class Compiler {
     }
   }
   constexpr bool emit_char(uint32_t cp) {
+    if (fold_ && (cp >= 0x80 || (has_flag(flags_, Flags::Unicode) && (cp == 'k' || cp == 'K' || cp == 's' || cp == 'S')))) {   // (a character with other cases beyond ASCII: a set of them)
+      uint32_t v[casefold::kMaxVariants];
+      const uint32_t n = casefold::variants(cp, has_flag(flags_, Flags::Unicode), v);
+      if (n > 1) {
+        const uint64_t first = ranges_.size();
+        for (uint32_t i = 0; i < n; ++i)
+          if (!push_range(v[i], v[i])) return false;
+        return emit(reading(Op::Class), static_cast<int32_t>(first), static_cast<int32_t>(n));
+      }
+    }
     if (fold_ && ((cp >= 'a' && cp <= 'z') || (cp >= 'A' && cp <= 'Z')))
       return emit(reading(Op::CharFold), static_cast<int32_t>(cp | 0x20));
     return emit(reading(Op::Char), static_cast<int32_t>(cp));
@@ -187,6 +198,19 @@ class Compiler {
       a = lo > 'A' ? lo : 'A';
       b = hi < 'Z' ? hi : 'Z';
       if (a <= b && !push_range(a + 32, b + 32)) return false;
+      const bool unicode = has_flag(flags_, Flags::Unicode);
+      if (unicode) {   // (k and s have a second other case each: the Kelvin sign and the long s)
+        if ((lo <= 'k' && hi >= 'k') || (lo <= 'K' && hi >= 'K')) { if (!push_range(0x212A, 0x212A)) return false; }
+        if ((lo <= 's' && hi >= 's') || (lo <= 'S' && hi >= 'S')) { if (!push_range(0x17F, 0x17F)) return false; }
+      }
+      if (hi >= 0x80 && hi - lo <= 255) {   // the other cases of the non-ASCII characters in a small range
+        for (uint32_t c = lo > 0x80 ? lo : 0x80; c <= hi; ++c) {
+          uint32_t v[casefold::kMaxVariants];
+          const uint32_t n = casefold::variants(c, unicode, v);
+          for (uint32_t i = 0; i < n; ++i)
+            if (v[i] != c && !push_range(v[i], v[i])) return false;
+        }
+      }
     }
     return true;
   }
@@ -556,7 +580,7 @@ class Compiler {
         const uint64_t name_length = pos_ - name_start;
         ++pos_;
         if (name_length > kMaxNameLength) return fail(Error::BadGroupName);
-        if (find_name(name_start, name_length) >= 0) return fail(Error::DuplicateGroupName);
+        // (the same name may be used again: in another alternative, only one of the groups takes part in a match)
         if (groups_ >= kMaxGroups) return fail(Error::TooManyGroups);
         NameEntry entry;
         for (uint64_t i = 0; i < name_length; ++i) entry.text[i] = text_[name_start + i];

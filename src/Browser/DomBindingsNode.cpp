@@ -290,6 +290,7 @@ Value attributes_value(DomBindings::Impl& c, dom::Node* n) {
   Value item;
   vm.get_named(Value::make_object(vm.global()), "__collection_item", &item);
   vm.define_named(list, "item", item, kWritable);
+  vm.define_named(list, "__owner", node_value(c, n), kWritable);   // (setNamedItem and removeNamedItem act on this element)
   set_interface(vm, list, "NamedNodeMap");
   return Value::make_object(list);
 }
@@ -422,13 +423,15 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
     }
     if (IS("characterSet") || IS("charset") || IS("inputEncoding")) { *out = str_value(vm, "UTF-8"); return true; }
     if (IS("contentType")) { *out = str_value(vm, n->owner->content_type.empty() ? StringView("text/html") : n->owner->content_type.view()); return true; }
-    if (IS("compatMode")) { *out = str_value(vm, "CSS1Compat"); return true; }
+    if (IS("compatMode")) { *out = str_value(vm, n->owner->quirks_mode ? "BackCompat" : "CSS1Compat"); return true; }
     if (IS("doctype")) {   // a page that began with <!DOCTYPE ...> has one: the built-in script makes the object
       *out = Value::make_null();
       Value make;
-      if (!n->owner->quirks_mode && (n->owner->content_type.empty() || n->owner->content_type.view() == StringView("text/html")) && vm.get_named(Value::make_object(vm.global()), "__doctype_of", &make) && Vm::is_callable(make)) {
-        const Value arg = node_value(c, n);
-        if (!vm.call(make, Value(), &arg, 1, out)) {
+      if ((n->owner->has_doctype || !n->owner->quirks_mode) && (n->owner->content_type.empty() || n->owner->content_type.view() == StringView("text/html")) && vm.get_named(Value::make_object(vm.global()), "__doctype_of", &make) && Vm::is_callable(make)) {
+        const Value arg[3] = {node_value(c, n), n->owner->has_doctype ? str_value(vm, n->owner->doctype_name.view()) : str_value(vm, "html"), n->owner->has_doctype ? str_value(vm, n->owner->doctype_public.view()) : str_value(vm, "")};
+        const Value sys = n->owner->has_doctype ? str_value(vm, n->owner->doctype_system.view()) : str_value(vm, "");
+        const Value all[4] = {arg[0], arg[1], arg[2], sys};
+        if (!vm.call(make, Value(), all, 4, out)) {
           String ignored(vm.allocator());
           vm.take_exception(&ignored);
           *out = Value::make_null();
@@ -436,7 +439,7 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
       }
       return true;
     }
-    if (IS("defaultView")) { *out = Value::make_object(vm.global()); return true; }
+    if (IS("defaultView")) { *out = n->owner == &c.doc ? Value::make_object(vm.global()) : Value::make_null(); return true; }   // (a document made by DOMParser or createHTMLDocument has no window)
     if (IS("location")) { *out = object_value(c.location); return true; }
     if (IS("activeElement")) {   // what has the focus, as seen from the page: an element inside a shadow tree shows up as the host
       dom::Node* focused = c.host.focused();
@@ -581,7 +584,12 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
       if (IS("cells") && d->parent != n) continue;   // (a row's own cells, not those of a table inside one)
       if ((IS("options") && d->is_tag("option")) || (IS("cells") && (d->is_tag("td") || d->is_tag("th")))) list.push_back(d);
     }
-    *out = Value::make_object(make_collection(c, list));
+    JsObject* collection = make_collection(c, list);
+    if (IS("options")) {   // (an HTMLOptionsCollection acts on its select)
+      set_interface(vm, collection, "HTMLOptionsCollection");
+      vm.define_named(collection, "__owner", node_value(c, n), kWritable);
+    }
+    *out = Value::make_object(collection);
     return true;
   }
   if (IS("selectedIndex") && n->is_tag("select")) {
@@ -611,7 +619,7 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
     if (n->is_tag("input")) { *out = str_value(vm, "text"); return true; }
     if (n->is_tag("button")) { *out = str_value(vm, "submit"); return true; }
   }
-  if ((IS("htmlFor") && n->is_tag("output")) || (IS("sandbox") && n->is_tag("iframe"))) return false;   // (token lists: the script's accessors)
+  if ((IS("htmlFor") && n->is_tag("output")) || (IS("sandbox") && n->is_tag("iframe")) || (IS("disabled") && (n->is_tag("style") || n->is_tag("link")))) return false;   // (token lists, and the flag of a style sheet: the script's accessors)
   if (in_svg_namespace(n) && svg_own_name(k)) return false;
   if (const ReflectedAttribute* r = find_reflected(k)) {
     StringView v;
@@ -729,7 +737,10 @@ HostClass::Set node_set(Vm& vm, JsObject* o, JsString* key, const Value& value) 
     if (!arg_text(vm, value, &text)) return HostClass::Set::Threw;
     dom::Node* parent = n->parent;
     if (!parent) return HostClass::Set::Handled;
-    if (parent->type == dom::NodeType::Document) return done(dom::DomError::HierarchyRequest);
+    if (parent->type == dom::NodeType::Document) {
+      throw_dom(vm, "NoModificationAllowedError", "Failed to set the 'outerHTML' property on 'Element': This element's parent is of type '#document', which is not an element node.");
+      return HostClass::Set::Threw;
+    }
     dom::Node* fragment = dom::parse_fragment(*n->owner, text.view(), parent->name.view());
     if (!fragment) return done(dom::DomError::OutOfMemory);
     return done(dom::replace_child(parent, fragment, n));
@@ -745,7 +756,7 @@ HostClass::Set node_set(Vm& vm, JsObject* o, JsString* key, const Value& value) 
     if (!arg_text(vm, value, &text)) return HostClass::Set::Threw;
     return done(dom::set_text_content(n, text.view()));
   }
-  if ((IS("htmlFor") && n->is_tag("output")) || (IS("sandbox") && n->is_tag("iframe"))) return HostClass::Set::NotHandled;
+  if ((IS("htmlFor") && n->is_tag("output")) || (IS("sandbox") && n->is_tag("iframe")) || (IS("disabled") && (n->is_tag("style") || n->is_tag("link")))) return HostClass::Set::NotHandled;
   if (in_svg_namespace(n) && svg_own_name(k)) return HostClass::Set::NotHandled;
   if (const ReflectedAttribute* r = find_reflected(k)) {
     switch (r->kind) {
@@ -995,6 +1006,17 @@ NATIVE(node_replace_with) {
 NATIVE(node_remove) {
   dom::Node* n = this_node(vm, self);
   if (!n) return false;
+  if (n->is_tag("select") && argc >= 1) {   // select.remove(index): the option at that index (nothing when there is none)
+    double index = 0;
+    if (!vm.to_number(args[0], &index)) return false;
+    if (index != index || index < 0) return true;
+    double at = 0;
+    for (dom::Node* d = n->first_child; d; d = dom::next_in_tree(d, n)) {
+      if (!d->is_tag("option")) continue;
+      if (at++ == static_cast<double>(static_cast<uint64_t>(index))) { dom::detach(d); break; }
+    }
+    return true;
+  }
   dom::detach(n);
   return true;
 }

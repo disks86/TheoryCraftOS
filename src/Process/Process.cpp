@@ -17,6 +17,7 @@
  */
 #include "Process/Process.hpp"
 #include "Process/WindowsMailslots.hpp"
+#include "Process/WindowsRegistry.hpp"
 #include "Process/WindowsPipes.hpp"
 #include "Process/WindowsSockets.hpp"
 #include "Process/Objects.hpp"
@@ -51,6 +52,7 @@ Process::~Process() {
       else if (files_.kind(slot) == DescriptorKind::Pipe) windowsabi::pipe_token_release(files_.token(slot));
       else if (files_.kind(slot) == DescriptorKind::Socket) windowsabi::socket_token_release(files_.token(slot));
       else if (files_.kind(slot) == DescriptorKind::Mailslot) windowsabi::mailslot_token_release(files_.token(slot));
+      else if (files_.kind(slot) == DescriptorKind::Key) windowsabi::key_token_release(files_.token(slot));
     }
   }
 }
@@ -63,6 +65,7 @@ bool Process::close_descriptor(uint64_t slot) {
   if (kind == DescriptorKind::Pipe) windowsabi::pipe_token_release(token);
   if (kind == DescriptorKind::Socket) windowsabi::socket_token_release(token);
   if (kind == DescriptorKind::Mailslot) windowsabi::mailslot_token_release(token);
+  if (kind == DescriptorKind::Key) windowsabi::key_token_release(token);
   return true;
 }
 

@@ -181,7 +181,7 @@ bool Core::parse_sequence_adv(BitReader& br) {
     br.skip(8);
     br.skip(32 * s.hrd_num_leaky_buckets);
   }
-  if (br.error() || s.interlace || s.psf) return false;
+  if (br.error() || s.psf) return false;   // (progressive segmented frames: only a display matter, but no reference decoder has them to check against)
   s.valid = true;
   s.width = s.max_coded_width;
   s.height = s.max_coded_height;
@@ -469,24 +469,38 @@ bool Core::parse_picture_header(BitReader& br) {
     if (h.type == kPictureI || h.type == kPictureBI) h.rnd = 1;
     else if (h.type == kPictureP) h.rnd ^= 1;
   } else {
-    // (an interlaced sequence is refused; the frame coding mode is absent)
-    switch (br.unary(0, 4)) {
-      case 0: h.type = kPictureP; break;
-      case 1: h.type = kPictureB; break;
-      case 2: h.type = kPictureI; break;
-      case 3: h.type = kPictureBI; break;
-      default:
-        h.type = kPictureP;
-        h.skipped = true;
-        break;
+    // In an interlaced sequence the frame starts with its coding mode: 0 progressive, 10 frame interlace, 11 field interlace (two field pictures).
+    if (seq_.interlace && br.bit()) h.fcm = br.bit() ? kFcmFieldInterlace : kFcmFrameInterlace;
+    if (h.fcm == kFcmFieldInterlace) {
+      // FPTYPE: bit 2 says the fields are B pictures, bit 1 that the first is the second kind (BI, P), bit 0 the same for the second field.
+      h.fptype = static_cast<int>(br.get(3));
+      const bool b_fields = (h.fptype & 4) != 0, first_other = (h.fptype & 2) != 0, second_other = (h.fptype & 1) != 0;
+      if (b_fields) h.type = first_other && second_other ? kPictureBI : kPictureB;
+      else h.type = first_other ? kPictureP : kPictureI;   // (a frame whose first field is intra can be decoded alone: it is an I frame, whatever its second field)
+    } else {
+      switch (br.unary(0, 4)) {
+        case 0: h.type = kPictureP; break;
+        case 1: h.type = kPictureB; break;
+        case 2: h.type = kPictureI; break;
+        case 3: h.type = kPictureBI; break;
+        default:
+          h.type = kPictureP;
+          h.skipped = true;
+          break;
+      }
     }
     if (seq_.tfcntrflag) br.skip(8);
-    if (seq_.broadcast) br.skip(2);   // RPTFRM (progressive)
+    if (seq_.broadcast) br.skip(2);   // RPTFRM (progressive, or psf), or TFF and RFF
     if (h.skipped) {
       pic_ = h;
       return !br.error();
     }
     h.rnd = br.bit();
+    if (seq_.interlace) h.uvsamp = br.bit() != 0;
+    if (h.fcm != kFcmProgressive) {
+      pic_ = h;   // (the rest of the header, the bit planes and the macroblocks are the engine's)
+      return !br.error();
+    }
     if (seq_.finterpflag) h.interpfrm = br.bit() != 0;
     if (h.type == kPictureB) {
       int index = static_cast<int>(br.get(3));
@@ -540,6 +554,7 @@ bool Core::parse_picture_header(BitReader& br) {
   if (type == kPictureP) {
     if (adv) {
       pic_.mvrange = seq_.extended_mv ? br.unary(0, 3) : 0;
+      if (seq_.interlace && seq_.extended_dmv) br.unary(0, 3);   // DMVRANGE (only the interlaced pictures use it)
       pic_.k_x = pic_.mvrange + 9 + (pic_.mvrange >> 1);
       pic_.k_y = pic_.mvrange + 8;
       pic_.range_x = 1 << (pic_.k_x - 1);
@@ -745,7 +760,8 @@ bool Core::decode(ConstByteView data, int64_t pts) {
       } else if (code == kCodeSlice) {
         if (!have_frame || !slices.push_back(stash(unit)) || !units.push_back(whole)) return false;
       } else if (code == kCodeField) {
-        return false;   // interlaced field pictures
+        // The second field of a field interlace frame: its data goes to the engine with the rest of the frame, in order.
+        if (!have_frame || !units.push_back(whole)) return false;
       }
       i = end;
     }
@@ -757,6 +773,8 @@ bool Core::decode(ConstByteView data, int64_t pts) {
 bool Core::decode_frame(ConstByteView frame, ArrayView<const ConstByteView> slices, ArrayView<const ConstByteView> raw_units) {
   BitReader br(frame);
   if (!parse_picture_header(br)) return false;
+  // An interlaced picture (frame or field coding) has no pixel path here: only an engine can decode it.
+  if (pic_.fcm != kFcmProgressive && !offloaded_) return false;
   // Pictures that cannot be decoded: a stream starts at an intra picture, and a B picture needs both anchors.
   if (need_intra_ && pic_.type != kPictureI) return false;
   if ((pic_.type == kPictureB || pic_.type == kPictureBI) && !anchor_[0]) return false;
@@ -841,7 +859,7 @@ void Core::finish_picture(ArrayView<const ConstByteView> units) {
     o.unit_info = unit_infos_.view();
     if (!pic_.skipped) {
       const bool intra_like = pic_.type == kPictureI || pic_.type == kPictureBI;
-      const bool adv = seq_.profile == kAdvanced;
+      const bool adv = seq_.profile == kAdvanced && pic_.fcm == kFcmProgressive;   // (an interlaced picture's bit planes are not read here)
       auto plane = [&](const Buf<uint8_t>& b) { return ArrayView<const uint8_t>(b.data(), b.size()); };
       if (pic_.type == kPictureP) {
         if (!pic_.skip_raw) o.skip_plane = plane(plane_skip_);

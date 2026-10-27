@@ -1848,6 +1848,10 @@ class TreeBuilder {
                   (t.has_sys && sys.equals_ignore_case("http://www.ibm.com/data/dtd/v11/ibmxhtml1-transitional.dtd"));
     if (!quirks && !t.has_sys && (starts_with_ci(pub, "-//w3c//dtd html 4.01 frameset//") || starts_with_ci(pub, "-//w3c//dtd html 4.01 transitional//"))) quirks = true;
     doc_.quirks_mode = quirks;
+    doc_.has_doctype = true;
+    doc_.doctype_name.assign(t.name.view());
+    doc_.doctype_public.assign(pub);
+    doc_.doctype_system.assign(sys);
   }
 
   void mode_initial(Token& t) {

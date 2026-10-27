@@ -1,0 +1,158 @@
+/*
+ * TheoryCraftOS - a minimal UEFI x86_64 operating system.
+ * Copyright (C) 2026 Christopher Schaefer
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+#pragma once
+#include <stdint.h>
+#include "Hardware/GraphicsProcessingUnit/AMD/AmdDce11.hpp"
+#include "Hardware/GraphicsProcessingUnit/AMD/AmdIh3.hpp"
+#include "Hardware/VideoCodec/AMD/AmdVcn1.hpp"
+#include "Utility/ArrayView.hpp"
+
+namespace hardware {
+
+// What the interrupt vectors of a Radeon RX Vega M mean: the dispatch half of the Linux amdgpu driver's amdgpu_irq_dispatch for the VI generation. The driver registers a handler
+// per source id (amdgpu_irq_add_id) in each block's sw_init, and the handler decodes the vector's ring id; this does the same for the sources of the blocks AmdVegaM brings up:
+//   gfx_v8_0   181 end of pipe (a fence), 184 privileged register, 185 privileged instruction, 197 ECC error   (ring id: bits 3:2 ME, 1:0 pipe, 6:4 queue)
+//              239 SQ message (the shader sequencer: general events, and the instruction or EDC/ECC reports of a wave; the vector's data is the SQ_INTERRUPT_WORD)
+//   sdma_v3_0  224 trap (a fence), 241 and 247 illegal instruction                                            (ring id: bits 1:0 engine, 3:2 queue)
+//   dce_v11_0  1..6 a controller's vertical blank (data 0) or line (data 1), 8, 10, ..., 18 a controller's page flip, 42 hot plug detect (data: the pin)
+//   uvd_v6_0   124 the decode ring's fence (system message), 119 and 120 the two encode rings' fences
+//   vce_v3_0   167 a VCE ring's fence (data 0, 1, 2: the rings)
+//   gmc_v8_0   146 page fault, 147 memory protection fault: the fault's address and status are read from the memory controller and the registers cleared
+// Anything else is counted and left. The driver's handlers hand fences to the scheduler and faults to its timeout handling; here a fence is an event for the sink (the engines'
+// submit functions poll their fence words), and a fault is reported to the sink, which can stop the ring it came from. The caller polls (process): the card's interrupt line is
+// not connected to anything (see AmdIh3).
+class AmdIrq {
+ public:
+  enum class Kind : uint8_t {
+    Unknown,
+    GraphicsFence,              // gfx_v8_0_eop_irq, ME 0
+    ComputeFence,               // gfx_v8_0_eop_irq, ME 1 or 2
+    GfxPrivilegedRegister,      // gfx_v8_0_priv_reg_irq
+    GfxPrivilegedInstruction,   // gfx_v8_0_priv_inst_irq
+    GfxEccError,                // gfx_v8_0_cp_ecc_error_irq
+    SdmaTrap,                   // sdma_v3_0_process_trap_irq
+    SdmaIllegalInstruction,     // sdma_v3_0_process_illegal_inst_irq
+    VmFault,                    // gmc_v8_0_process_interrupt
+    SqMessage,                  // gfx_v8_0_sq_irq
+    DisplayVblank,              // dce_v11_0_crtc_irq, data 0
+    DisplayVline,               // dce_v11_0_crtc_irq, data 1
+    DisplayPageFlip,            // dce_v11_0_pageflip_irq
+    DisplayHotplug,             // dce_v11_0_hpd_irq
+    UvdFence,                   // uvd_v6_0_process_interrupt, 124
+    UvdEncodeFence,             // uvd_v6_0_process_interrupt, 119 and 120
+    VceFence,                   // vce_v3_0_process_interrupt
+  };
+  static constexpr uint32_t kKinds = 17;
+  static const char* kind_name(Kind kind);
+
+  // The source ids (ivsrcid_vislands30.h; the SDMA illegal instruction has a bare 241 in sdma_v3_0_sw_init).
+  static constexpr uint32_t kSrcCpEndOfPipe = 181, kSrcCpPrivRegFault = 184, kSrcCpPrivInstrFault = 185, kSrcCpEccError = 197, kSrcSqInterruptMsg = 239;
+  static constexpr uint32_t kSrcDisplayCrtcFirst = 1, kSrcPageFlipFirst = 8, kSrcPageFlipLast = 18, kSrcHotplugDetect = 42;
+  static constexpr uint32_t kSrcUvdEncodeFirst = 119, kSrcUvdSystemMessage = 124, kSrcVceTrap = 167;
+  static constexpr uint32_t kSrcSdmaTrap = 224, kSrcSdmaIllegalInstruction = 241, kSrcSdmaSrbmWrite = 247;
+  static constexpr uint32_t kSrcGfxPageInvFault = 146, kSrcGfxMemProtFault = 147;
+
+  // gmc_v8_0_process_interrupt: VM_CONTEXT1_PROTECTION_FAULT_ADDR / _STATUS / _MCCLIENT, decoded as gmc_v8_0_vm_decode_fault does.
+  struct VmFaultInfo {
+    bool valid = false;         // false when both registers were zero (nothing to report)
+    uint32_t page = 0;          // the register: the faulting address in 4 KiB pages
+    uint32_t status = 0;
+    uint32_t mc_client = 0;     // four ASCII characters naming the block
+    uint32_t vmid = 0, protections = 0, client_id = 0;
+    bool write = false;
+  };
+  // gfx_v8_0_parse_sq_irq: the SQ_INTERRUPT_WORD of a vector's data. Encoding 0 is a general purpose event (`general` holds the flags of SQ_INTERRUPT_WORD_AUTO), 1 an
+  // instruction interrupt of a wave and 2 an EDC/ECC error in one; for those the wave's place is decoded and, as the driver's worker does, the error's source is read from
+  // SQ_EDC_INFO of that compute unit (edc_valid; the index into sq_edc_source_name).
+  struct SqInfo {
+    uint32_t encoding = 0, se_id = 0;
+    uint32_t general = 0;
+    uint32_t sh_id = 0, cu_id = 0, simd_id = 0, wave_id = 0, vm_id = 0;
+    bool priv = false;
+    bool edc_valid = false;
+    uint32_t edc_source = 0;
+  };
+  static const char* sq_edc_source_name(uint32_t source);   // the driver's sq_edc_source_names, shortened; "invalid" past the table
+  struct Event {
+    Kind kind = Kind::Unknown;
+    uint32_t me = 0, pipe = 0, queue = 0;   // the CP's: ring id decoded for the gfx_v8_0 sources
+    uint32_t engine = 0;                    // the SDMA engine (0, 1) for the sdma_v3_0 sources
+    uint32_t crtc = 0;                      // the display controller of a vblank, line or page flip
+    uint32_t ring = 0;                      // the UVD encode ring (0, 1) or the VCE ring (0..2) of a fence
+    uint32_t pin = 0;                       // the hot plug pin of a hot plug
+    bool connected = false;                 // after a hot plug: something is connected to the pin
+    bool asserted = false;                  // the display engine's status said this interrupt was pending (vblank, line)
+    AmdIh3::Vector vector;
+    VmFaultInfo vm;                         // for VmFault
+    SqInfo sq;                              // for SqMessage
+  };
+  // The vector's source and ring id; no registers are read.
+  static Event classify(const AmdIh3::Vector& vector);
+
+  // Called for every vector, in order.
+  class ISink {
+   public:
+    virtual void on_event(const Event& event) = 0;
+
+   protected:
+    ISink() = default;
+    ~ISink() = default;
+  };
+
+  explicit AmdIrq(IVcnRegisters& registers) : registers_(registers), display_(registers) {}
+
+  // Reads what is in the IH ring (up to `max_vectors`), classifies each vector, reads and clears the fault registers for VM faults and passes every event to `sink` (may be null).
+  // Returns how many vectors were handled.
+  uint32_t process(AmdIh3& ih, ISink* sink, uint32_t max_vectors = 64);
+
+  uint32_t count(Kind kind) const { return counts_[static_cast<uint32_t>(kind)]; }
+  uint32_t total() const { return total_; }
+  uint32_t unknown_source(uint32_t src_id) const { return src_id < 256 ? unknown_[src_id] : 0; }
+  const VmFaultInfo& last_vm_fault() const { return last_vm_fault_; }
+  const SqInfo& last_sq() const { return last_sq_; }
+  // The video engines' fences: the decode ring, the two encode rings of UVD and the three rings of VCE (the engines' submit paths poll their fence words, so these only show
+  // that the engine raised its interrupt).
+  uint32_t uvd_encode_fences(uint32_t ring) const { return ring < 2 ? uvd_encode_[ring] : 0; }
+  uint32_t vce_fences(uint32_t ring) const { return ring < 3 ? vce_[ring] : 0; }
+  // The display interrupts, per controller and per pin.
+  uint32_t vblank_count(uint32_t crtc) const { return crtc < amd_dce11::kMaxCrtcs ? vblanks_[crtc] : 0; }
+  uint32_t pageflip_count(uint32_t crtc) const { return crtc < amd_dce11::kMaxCrtcs ? pageflips_[crtc] : 0; }
+  uint32_t hotplug_count(uint32_t pin) const { return pin < amd_dce11::Interrupts::kMaxHpd ? hotplugs_[pin] : 0; }
+  bool hpd_connected(uint32_t pin) const { return pin < amd_dce11::Interrupts::kMaxHpd && (connected_ >> pin & 1); }   // as of the last hot plug on the pin
+  // A pin that interrupted more than kHotplugStormLimit times is switched off (a connector that bounces, or a pin that is not what it seems, would otherwise keep the CPU busy).
+  static constexpr uint32_t kHotplugStormLimit = 256;
+  bool hpd_throttled(uint32_t pin) const { return pin < amd_dce11::Interrupts::kMaxHpd && (throttled_ >> pin & 1); }
+
+ private:
+  VmFaultInfo read_vm_fault();
+  SqInfo read_sq(uint32_t word);
+
+  IVcnRegisters& registers_;
+  uint32_t counts_[kKinds] = {};
+  uint32_t unknown_[256] = {};
+  uint32_t total_ = 0;
+  amd_dce11::Interrupts display_;
+  uint32_t vblanks_[amd_dce11::kMaxCrtcs] = {}, pageflips_[amd_dce11::kMaxCrtcs] = {}, hotplugs_[amd_dce11::Interrupts::kMaxHpd] = {};
+  uint32_t uvd_encode_[2] = {}, vce_[3] = {};
+  uint32_t connected_ = 0, throttled_ = 0;
+  VmFaultInfo last_vm_fault_;
+  SqInfo last_sq_;
+};
+
+}  // namespace hardware

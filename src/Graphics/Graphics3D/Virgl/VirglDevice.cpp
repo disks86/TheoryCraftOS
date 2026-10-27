@@ -426,6 +426,7 @@ void VirglDevice::destroy_buffer(IBuffer* buffer) { destroy(gpu_.allocator(), st
 
 IImage* VirglDevice::create_image(const ImageDesc& desc) {
   if (desc.stencil) return nullptr;   // (no stencil plane on this device)
+  if (desc.mip_levels != 1) return nullptr;   // (no mipmaps either)
   // A texture is not drawn into: the two kinds of image are stored in opposite row order (see VirglImage).
   if ((desc.usage & kImageSampled) && (desc.usage & (kImageColorAttachment | kImageDepthAttachment | kImagePresent))) return nullptr;
   if ((desc.usage & kImageSampled) && desc.format != Format::B8G8R8A8Unorm) return nullptr;

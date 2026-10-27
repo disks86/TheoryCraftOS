@@ -1,0 +1,1 @@
+wininet crypt32 ws2_32 user32 advapi32 shell32

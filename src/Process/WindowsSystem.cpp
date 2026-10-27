@@ -127,6 +127,18 @@ uint32_t nt_query_system_information(Process& p, const SyscallRequest& r) {
       }
       return kSuccess;
     }
+    case 8: {    // SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION for each processor (48 bytes): the time idle, in the kernel (idle included) and in programs, in 100 ns units
+      constexpr uint32_t kEntry = 48, kMax = 256;
+      const uint32_t cpus = processors > kMax ? kMax : processors, total_size = cpus * kEntry;
+      if (returned != 0 && !p.write_user_u32(returned, total_size)) return kAccessViolation;
+      if (length < total_size) return kInfoLengthMismatch;
+      const uint64_t idle = p.host().monotonic_ns() / 100;
+      uint8_t out[kMax * kEntry] = {};
+      for (uint32_t i = 0; i < cpus; ++i) {
+        for (uint32_t k = 0; k < 8; ++k) { out[i * kEntry + k] = uint8_t(idle >> (8 * k)); out[i * kEntry + 8 + k] = uint8_t(idle >> (8 * k)); }      // IdleTime, KernelTime
+      }
+      return p.write_user(buffer, ConstByteView(out, total_size)) ? kSuccess : kAccessViolation;
+    }
     case 0x80: {    // this OS's own class: the loaded modules of the process whose id is in the first 8 bytes of the buffer (0: this one)
       // Reply: u32 count, u32 record size (112), then per module: base (8), size (8), entry (8), flags (4: bit 0 the program), name length in characters (4), name (40 UTF-16 characters).
       constexpr uint32_t kRecord = 112, kMaxModules = 64;

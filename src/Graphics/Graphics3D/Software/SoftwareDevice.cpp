@@ -61,11 +61,17 @@ class SoftwareImage final : public IImage {
  public:
   SoftwareImage(allocators::IAllocator& allocator, const ImageDesc& desc) : allocator_(allocator), desc_(desc) {
     const uint64_t count = uint64_t{desc.extent.width} * desc.extent.height;
+    uint64_t total = count;
+    // The levels of a mipmapped image follow level 0 in the same storage, each as tight rows.
+    for (uint32_t level = 1; level < desc.mip_levels && level < kMaxMipLevels; ++level) {
+      level_offset_[level] = total;
+      total += uint64_t{mip_extent(desc.extent.width, level)} * mip_extent(desc.extent.height, level);
+    }
     if (desc.format == Format::D32Float) {
       depth_ = allocate_view<float>(allocator, count);
       if (desc.stencil) stencil_ = allocate_view<uint8_t>(allocator, count);
     } else if (desc.format != Format::Undefined) {
-      color_ = allocate_view<uint32_t>(allocator, count);
+      color_ = allocate_view<uint32_t>(allocator, total);
     }
     for (float& d : depth_) d = 1.0f;
     for (uint32_t& c : color_) c = 0;
@@ -77,27 +83,51 @@ class SoftwareImage final : public IImage {
     release_view(allocator_, stencil_);
   }
   bool valid() const { return (!color_.empty() || !depth_.empty()) && (!desc_.stencil || !stencil_.empty()); }
+  uint32_t mip_levels() const override { return desc_.mip_levels; }
   Extent2D extent() const override { return desc_.extent; }
   Format format() const override { return desc_.format; }
   uint32_t usage() const { return desc_.usage; }
   bool read_pixels(ArrayView<uint32_t> out) override {
-    if (color_.empty() || out.size() < color_.size()) return false;
+    const uint64_t count = uint64_t{desc_.extent.width} * desc_.extent.height;
+    if (color_.empty() || out.size() < count) return false;
     Surface s = surface();
-    for (uint32_t i = 0; i < color_.size(); ++i) out[i] = s.decode(color_[i]);
+    for (uint64_t i = 0; i < count; ++i) out[i] = s.decode(color_[i]);
     return true;
   }
-  bool write_pixels(ArrayView<const uint32_t> pixels) override {
-    if (color_.empty() || pixels.size() != color_.size()) return false;
-    const Surface s = surface();
-    for (uint32_t i = 0; i < color_.size(); ++i) color_[i] = s.encode(pixels[i]);
+  bool write_pixels(ArrayView<const uint32_t> pixels) override { return write_mip_pixels(0, pixels); }
+  bool write_mip_pixels(uint32_t level, ArrayView<const uint32_t> pixels) override {
+    if (color_.empty() || level >= desc_.mip_levels) return false;
+    const Surface s = surface(level);
+    const uint64_t count = uint64_t{s.width} * s.height;
+    if (pixels.size() != count) return false;
+    for (uint64_t i = 0; i < count; ++i) s.pixels[i] = s.encode(pixels[i]);
     return true;
   }
-  Surface surface() const {
+  bool generate_mipmaps() override {
+    if (color_.empty() || desc_.mip_levels < 2) return false;
+    // (the box filter is applied to 0xAARRGGBB values, so the stored order is undone and redone around it)
+    for (uint32_t level = 1; level < desc_.mip_levels; ++level) {
+      const Surface src = surface(level - 1), dst = surface(level);
+      for (uint64_t i = 0; i < uint64_t{dst.width} * dst.height; ++i) {
+        const uint32_t y = static_cast<uint32_t>(i / dst.width), x = static_cast<uint32_t>(i % dst.width);
+        const uint32_t y0 = 2 * y < src.height ? 2 * y : src.height - 1, y1 = 2 * y + 1 < src.height ? 2 * y + 1 : src.height - 1;
+        const uint32_t x0 = 2 * x < src.width ? 2 * x : src.width - 1, x1 = 2 * x + 1 < src.width ? 2 * x + 1 : src.width - 1;
+        const uint32_t block[4] = {src.decode(src.pixels[uint64_t{y0} * src.width + x0]), src.decode(src.pixels[uint64_t{y0} * src.width + x1]),
+                                   src.decode(src.pixels[uint64_t{y1} * src.width + x0]), src.decode(src.pixels[uint64_t{y1} * src.width + x1])};
+        uint32_t averaged = 0;
+        mip_box_downsample(ArrayView<const uint32_t>(block, 4), 2, 2, ArrayView<uint32_t>(&averaged, 1), 1, 1);
+        dst.pixels[i] = dst.encode(averaged);
+      }
+    }
+    return true;
+  }
+  Surface surface(uint32_t level = 0) const {
     Surface s;
-    s.pixels = color_;
-    s.width = desc_.extent.width;
-    s.height = desc_.extent.height;
-    s.pitch = desc_.extent.width;
+    const uint64_t offset = level == 0 ? 0 : level_offset_[level];
+    s.width = mip_extent(desc_.extent.width, level);
+    s.height = mip_extent(desc_.extent.height, level);
+    s.pixels = color_.subview(offset, uint64_t{s.width} * s.height);
+    s.pitch = s.width;
     s.format = desc_.format;
     return s;
   }
@@ -110,6 +140,7 @@ class SoftwareImage final : public IImage {
   ArrayView<uint32_t> color_;
   ArrayView<float> depth_;
   ArrayView<uint8_t> stencil_;
+  uint64_t level_offset_[kMaxMipLevels] = {};   // (in pixels, from the start of level 0)
 };
 
 class SoftwareShaderModule final : public IShaderModule {
@@ -147,11 +178,73 @@ class TextureSet final : public ITextureSet {
   }
   const SoftwareImage* image(uint32_t unit) const { return unit < kMaxTextureUnits ? images_[unit] : nullptr; }
 
+  // Whether any bound unit reads mip levels: only then does a pixel need its quad's derivatives.
+  bool uses_lod() const {
+    for (uint32_t unit = 0; unit < kMaxTextureUnits; ++unit)
+      if (images_[unit] && images_[unit]->mip_levels() > 1 && samplers_[unit].mip_filter != MipFilter::None) return true;
+    return false;
+  }
+  // For the derivative passes: the next lookups record their first coordinate pair per unit and answer black.
+  void start_recording() const {
+    recording_ = true;
+    for (uint32_t unit = 0; unit < kMaxTextureUnits; ++unit) recorded_[unit] = false;
+  }
+  void stop_recording() const { recording_ = false; }
+  bool recorded(uint32_t unit, float* u, float* v) const {
+    if (unit >= kMaxTextureUnits || !recorded_[unit]) return false;
+    *u = record_u_[unit];
+    *v = record_v_[unit];
+    return true;
+  }
+  // The level of detail the pixel's lookups of `unit` use, from the coordinates recorded at the quad's anchor and at its right and lower neighbours.
+  void set_lod(uint32_t unit, const float anchor[2], const float right[2], const float below[2]) const {
+    if (unit >= kMaxTextureUnits || !images_[unit]) return;
+    const SamplerDesc& sampler = samplers_[unit];
+    const float w = static_cast<float>(images_[unit]->extent().width), h = static_cast<float>(images_[unit]->extent().height);
+    const float dudx = (right[0] - anchor[0]) * w, dvdx = (right[1] - anchor[1]) * h, dudy = (below[0] - anchor[0]) * w, dvdy = (below[1] - anchor[1]) * h;
+    const float rho_x = dudx * dudx + dvdx * dvdx, rho_y = dudy * dudy + dvdy * dvdy;
+    const float rho2 = rho_x > rho_y ? rho_x : rho_y;   // (the square of rho: log2(rho) is half of log2(rho2))
+    float lambda = 0.5f * mip_log2(rho2) + sampler.lod_bias;
+    if (lambda < sampler.min_lod) lambda = sampler.min_lod;
+    if (lambda > sampler.max_lod) lambda = sampler.max_lod;
+    lambda_[unit] = lambda == lambda ? lambda : 0.0f;
+  }
+  void clear_lod() const {
+    for (uint32_t unit = 0; unit < kMaxTextureUnits; ++unit) lambda_[unit] = 0.0f;
+  }
+
   Vec4 sample(uint32_t unit, float u, float v) const override {
     const SoftwareImage* image = image_for(unit);
     if (!image) return {0, 0, 0, 1};
+    if (recording_) {
+      if (!recorded_[unit]) {
+        recorded_[unit] = true;
+        record_u_[unit] = u;
+        record_v_[unit] = v;
+      }
+      return {0, 0, 0, 1};
+    }
     const SamplerDesc& sampler = samplers_[unit];
-    const Surface surface = image->surface();
+    const uint32_t levels = image->mip_levels();
+    if (sampler.mip_filter == MipFilter::None || levels < 2) return sample_level(*image, 0, sampler, u, v);
+    const float top = static_cast<float>(levels - 1);
+    float lambda = lambda_[unit];
+    if (lambda > top) lambda = top;
+    if (!(lambda > 0.0f)) return sample_level(*image, 0, sampler, u, v);   // (magnification)
+    if (sampler.mip_filter == MipFilter::Nearest) {
+      uint32_t level = static_cast<uint32_t>(lambda + 0.5f);
+      if (level > levels - 1) level = levels - 1;
+      return sample_level(*image, level, sampler, u, v);
+    }
+    const uint32_t l0 = static_cast<uint32_t>(lambda), l1 = l0 + 1 < levels ? l0 + 1 : levels - 1;
+    const float fraction = lambda - static_cast<float>(l0);
+    const Vec4 a = sample_level(*image, l0, sampler, u, v), b = sample_level(*image, l1, sampler, u, v);
+    return a * (1.0f - fraction) + b * fraction;
+  }
+
+ private:
+  static Vec4 sample_level(const SoftwareImage& image, uint32_t level, const SamplerDesc& sampler, float u, float v) {
+    const Surface surface = image.surface(level);
     const int64_t w = surface.width, h = surface.height;
     if (sampler.filter == Filter::Nearest) {
       return texel(surface, index(floor_to(unit_coordinate(u) * static_cast<float>(w)), w, sampler.address_u), index(floor_to(unit_coordinate(v) * static_cast<float>(h)), h, sampler.address_v));
@@ -166,8 +259,6 @@ class TextureSet final : public ITextureSet {
     const Vec4 top = a * (1 - tx) + b * tx, bottom = c * (1 - tx) + d * tx;
     return top * (1 - ty) + bottom * ty;
   }
-
- private:
   const SoftwareImage* image_for(uint32_t unit) const { return unit < kMaxTextureUnits ? images_[unit] : nullptr; }
   // A coordinate a NaN or a very large value cannot turn into an index outside the image: both are brought into a range the integer conversion can take.
   static float unit_coordinate(float c) {
@@ -196,6 +287,11 @@ class TextureSet final : public ITextureSet {
 
   const SoftwareImage* images_[kMaxTextureUnits] = {};
   SamplerDesc samplers_[kMaxTextureUnits];
+  // The state of the pixel being shaded (the shader sees this set through a const reference).
+  mutable bool recording_ = false;
+  mutable bool recorded_[kMaxTextureUnits] = {};
+  mutable float record_u_[kMaxTextureUnits] = {}, record_v_[kMaxTextureUnits] = {};
+  mutable float lambda_[kMaxTextureUnits] = {};
 };
 
 // --- Rasterization -------------------------------------------------------------
@@ -323,6 +419,16 @@ void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVert
   const ArrayView<float> depth = s.depth ? s.depth->depth() : ArrayView<float>();
   const ArrayView<uint8_t> stencil = s.depth ? s.depth->stencil() : ArrayView<uint8_t>();
   const bool stencil_on = pd.stencil.enable && !stencil.empty();
+  // The varyings at any point of the plane of the triangle (also outside it, as the hardware extends them to the pixels of a quad it only partly covers).
+  auto varyings_at = [&](float qx, float qy, Vec4* out) {
+    const float l0 = -((qx - v1->x) * e0dy - (qy - v1->y) * e0dx), l1 = -((qx - v2->x) * e1dy - (qy - v2->y) * e1dx), l2 = -((qx - v0->x) * e2dy - (qy - v0->y) * e2dx);
+    const float p0 = l0 * inv_area * v0->inv_w, p1 = l1 * inv_area * v1->inv_w, p2 = l2 * inv_area * v2->inv_w;
+    const float norm = 1.0f / (p0 + p1 + p2);
+    for (uint32_t i = 0; i < pd.varying_count; ++i)
+      out[i] = {(v0->varying[i].x * p0 + v1->varying[i].x * p1 + v2->varying[i].x * p2) * norm, (v0->varying[i].y * p0 + v1->varying[i].y * p1 + v2->varying[i].y * p2) * norm,
+                (v0->varying[i].z * p0 + v1->varying[i].z * p1 + v2->varying[i].z * p2) * norm, (v0->varying[i].w * p0 + v1->varying[i].w * p1 + v2->varying[i].w * p2) * norm};
+  };
+  const bool lod_pass = s.pipeline->textured() && s.textures.uses_lod();
 
   for (int32_t y = min_y; y < max_y; ++y) {
     for (int32_t x = min_x; x < max_x; ++x) {
@@ -354,6 +460,26 @@ void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVert
                       (v0->varying[i].w * p0 + v1->varying[i].w * p1 + v2->varying[i].w * p2) * norm};
       }
       Vec4 color;
+      if (lod_pass) {
+        // The level of detail comes from the 2 x 2 quad the pixel is in: the shader is run for the quad's upper left, right and lower pixels with the lookups only recorded.
+        const int32_t qx = x & ~1, qy = y & ~1;
+        const float xs[3] = {static_cast<float>(qx) + 0.5f, static_cast<float>(qx) + 1.5f, static_cast<float>(qx) + 0.5f};
+        const float ys[3] = {static_cast<float>(qy) + 0.5f, static_cast<float>(qy) + 0.5f, static_cast<float>(qy) + 1.5f};
+        float coord[3][kMaxTextureUnits][2] = {};
+        bool have[3][kMaxTextureUnits] = {};
+        for (int k = 0; k < 3; ++k) {
+          Vec4 quad_varying[kMaxVaryings];
+          varyings_at(xs[k], ys[k], quad_varying);
+          Vec4 ignored;
+          s.textures.start_recording();
+          s.pipeline->textured()(quad_varying, s.constants, s.textures, &ignored);
+          s.textures.stop_recording();
+          for (uint32_t unit = 0; unit < kMaxTextureUnits; ++unit) have[k][unit] = s.textures.recorded(unit, &coord[k][unit][0], &coord[k][unit][1]);
+        }
+        s.textures.clear_lod();
+        for (uint32_t unit = 0; unit < kMaxTextureUnits; ++unit)
+          if (have[0][unit] && have[1][unit] && have[2][unit]) s.textures.set_lod(unit, coord[0][unit], coord[1][unit], coord[2][unit]);
+      }
       if (s.pipeline->textured() ? !s.pipeline->textured()(varying, s.constants, s.textures, &color) : !s.pipeline->fragment()(varying, s.constants, &color)) continue;
 
       if (stencil_on) {
@@ -444,6 +570,8 @@ void SoftwareDevice::destroy_buffer(IBuffer* buffer) { destroy(allocator_, stati
 
 IImage* SoftwareDevice::create_image(const ImageDesc& desc) {
   if (!desc.extent.width || !desc.extent.height || desc.format == Format::Undefined) return nullptr;
+  // Levels need a colour image to sample, and no more than the extent has.
+  if (desc.mip_levels == 0 || desc.mip_levels > mip_level_limit(desc.extent) || desc.mip_levels > kMaxMipLevels || (desc.mip_levels > 1 && (desc.format == Format::D32Float || !(desc.usage & kImageSampled)))) return nullptr;
   SoftwareImage* image = make<SoftwareImage>(allocator_, allocator_, desc);
   if (image && !image->valid()) {
     destroy(allocator_, image);

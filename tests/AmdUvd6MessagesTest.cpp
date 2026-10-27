@@ -529,12 +529,15 @@ struct Vc1Recorder final : vc1::IOffload {
     if (!simple) pps |= bit(seq.resync_marker, 20) | bit(seq.rangered, 19) | bit(seq.loop_filter, 5) | bit(seq.fastuvmc, 4) | bit(seq.extended_mv, 3) | bit(seq.extended_dmv, 8) | (uint32_t(seq.dquant & 3) << 1);
     CHECK(word(m, g + vPps) == pps && word(m, g + vStructure) == 0 && word(m, g + vChroma) == 1 && m[kExtensionSupport] == 1);
     for (uint32_t i = kVc1Size; i < 768 * 4; ++i) CHECK(m[g + i] == 0);
-    // An interlaced sequence is not taken, nor a message that does not fit.
+    // An interlaced sequence is taken, and says so in the sps flags (bit 5, Mesa's `interlace << 5`; the picture structure stays 0 for the firmware to read from the frame);
+    // a message that does not fit is not.
     vc1::SequenceHeader interlaced = seq;
     interlaced.interlace = true;
     vc1::OffloadPicture copy = p;
     copy.seq = &interlaced;
-    CHECK(!build_vc1_decode_message(view(m), 6, 1, copy, b));
+    Bytes mi(message_bytes(), 0xCC);
+    CHECK(build_vc1_decode_message(view(mi), 6, 1, copy, b));
+    CHECK(word(mi, g + vSps) == (word(m, g + vSps) | (1u << 5)) && word(mi, g + vPps) == word(m, g + vPps) && word(mi, g + vStructure) == 0);
     Bytes small(message_bytes() - 1, 0);
     CHECK(!build_vc1_decode_message(view(small), 6, 1, p, b));
     Bytes fb(kMessageFeedbackItBytes, 0xEE);

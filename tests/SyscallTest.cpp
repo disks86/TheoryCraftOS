@@ -339,7 +339,13 @@ static void test_windows() {
   CHECK(st(p.syscall(nt(WindowsSyscallNumber::NtDelayExecution, 0, kBase + 0x500))) == kNtSuccess);
   CHECK(st(p.syscall(nt(WindowsSyscallNumber::NtDelayExecution, 0, 0))) == kNtAccessViolation);
 
-  CHECK(st(p.syscall(nt(static_cast<WindowsSyscallNumber>(500)))) == kNtNoService);
+  CHECK(st(p.syscall(nt(static_cast<WindowsSyscallNumber>(kWindowsServiceCount)))) == kNtNoService);      // the first number past the list
+  CHECK(st(p.syscall(nt(static_cast<WindowsSyscallNumber>(kWindowsServiceCount - 1)))) == kNtNotImpl);      // the last service has no code yet
+  CHECK(st(p.syscall(nt(static_cast<WindowsSyscallNumber>(kWin32kServiceBase)))) == kNtNotImpl);          // win32k's first and last service
+  CHECK(st(p.syscall(nt(static_cast<WindowsSyscallNumber>(kWin32kServiceEnd - 1)))) == kNtNotImpl);
+  CHECK(st(p.syscall(nt(static_cast<WindowsSyscallNumber>(kWin32kServiceBase - 1)))) == kNtNoService);     // the gap between the two tables
+  CHECK(st(p.syscall(nt(static_cast<WindowsSyscallNumber>(kWin32kServiceEnd)))) == kNtNoService);
+  CHECK(st(p.syscall(nt(static_cast<WindowsSyscallNumber>(99)))) == kNtNotImpl);                            // the first service without code
   SyscallRequest wide = nt(WindowsSyscallNumber::NtYieldExecution);
   wide.number |= 0x100000000ull;                                 // decoders mask this; a raw caller gets "no such service"
   CHECK(st(p.syscall(wide)) == kNtNoService);
@@ -459,12 +465,28 @@ static void test_service_numbers_agree() {
   FILE* header = fopen("src/Windows/tcos_syscalls.h", "r");
   CHECK(header != nullptr);
   if (!header) return;
+  std::string enum_text;
+  if (FILE* hpp = fopen("src/Process/WindowsSyscalls.hpp", "r")) {
+    char chunk[4096];
+    for (size_t got; (got = fread(chunk, 1, sizeof(chunk), hpp)) > 0;) enum_text.append(chunk, got);
+    fclose(hpp);
+  }
+  CHECK(!enum_text.empty());
+  size_t generated = 0;
   char line[256];
   size_t found = 0;
   while (fgets(line, sizeof(line), header)) {
     char name[96];
     unsigned number;
     if (sscanf(line, "#define NT_SERVICE_%95s %u", name, &number) != 2) continue;
+    if (std::string(name) == "COUNT") {
+      CHECK(number == kWindowsServiceCount);
+      continue;
+    }
+    if (std::string(name) == "WIN32K_BASE" || std::string(name) == "WIN32K_END") {
+      CHECK(number == (std::string(name) == "WIN32K_BASE" ? kWin32kServiceBase : kWin32kServiceEnd));
+      continue;
+    }
     bool known = false;
     for (const Pair& pair : table) {
       if (std::string(pair.name) != name) continue;
@@ -472,10 +494,15 @@ static void test_service_numbers_agree() {
       ++found;
       CHECK(uint32_t(pair.number) == number);
     }
-    CHECK(known);      // a service in the header that the kernel does not list here
+    if (!known) {      // a service without code: the header and the enum of WindowsSyscallNumber must agree on it
+      ++generated;
+      const std::string wanted = "  " + std::string(name) + " = " + std::to_string(number) + ",";
+      CHECK(enum_text.find("\n" + wanted + "\n") != std::string::npos);
+    }
   }
   fclose(header);
   CHECK(found == sizeof(table) / sizeof(table[0]));
+  CHECK(found + generated == kWindowsServiceCount + (kWin32kServiceEnd - kWin32kServiceBase));      // every number below the count is a service of the header
 }
 
 int main() {

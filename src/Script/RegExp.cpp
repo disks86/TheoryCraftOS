@@ -36,9 +36,42 @@ struct Compiled {
   regex::Regex regex;
   String source, flags;
   bool global = false, sticky = false;
+  bool code_units = false;   // no u / v flag: a character outside the BMP is two characters (surrogates) to the pattern and the matcher
 };
 
 Compiled* compiled_of(const Value& v) { return v.is_object() && v.as_object()->okind == ObjKind::RegExp ? static_cast<Compiled*>(v.as_object()->host_data) : nullptr; }
+
+// Without the u flag a character outside the BMP is two code units. The matcher reads UTF-8 one character at a time, so for such a pattern or subject the astral
+// characters are written as their two surrogates (3 bytes each, which the matcher reads as two characters), and the positions of a match are mapped back.
+bool has_astral(StringView s) {
+  for (uint64_t i = 0; i < s.size(); ++i) {
+    const uint8_t b = static_cast<uint8_t>(s[i]);
+    if (b >= 0xF0 && b < 0xF8) return true;
+  }
+  return false;
+}
+
+void append_surrogate(String* out, uint32_t u) {
+  out->push_back(static_cast<char>(0xE0 | (u >> 12)));
+  out->push_back(static_cast<char>(0x80 | ((u >> 6) & 0x3F)));
+  out->push_back(static_cast<char>(0x80 | (u & 0x3F)));
+}
+
+// `where` (when given) gets the offset of each astral character in `s`.
+void split_astral(StringView s, String* out, List<uint64_t>* where) {
+  for (uint64_t i = 0; i < s.size(); ++i) {
+    const uint8_t b = static_cast<uint8_t>(s[i]);
+    if (b >= 0xF0 && b < 0xF8 && i + 3 < s.size() && (static_cast<uint8_t>(s[i + 1]) & 0xC0) == 0x80 && (static_cast<uint8_t>(s[i + 2]) & 0xC0) == 0x80 && (static_cast<uint8_t>(s[i + 3]) & 0xC0) == 0x80) {
+      const uint32_t cp = ((b & 0x07u) << 18) | ((static_cast<uint8_t>(s[i + 1]) & 0x3Fu) << 12) | ((static_cast<uint8_t>(s[i + 2]) & 0x3Fu) << 6) | (static_cast<uint8_t>(s[i + 3]) & 0x3Fu);
+      if (where) where->push_back(i);
+      append_surrogate(out, 0xD800 + ((cp - 0x10000) >> 10));
+      append_surrogate(out, 0xDC00 + ((cp - 0x10000) & 0x3FF));
+      i += 3;
+    } else {
+      out->push_back(static_cast<char>(b));
+    }
+  }
+}
 
 bool valid_flags(StringView flags) {
   bool seen[128] = {};
@@ -97,7 +130,14 @@ bool make_regexp(Vm& vm, StringView source, StringView flags, Value* out) {
       default: break;
     }
   }
-  const regex::Error error = c->regex.compile(source, f);
+  c->code_units = !flags.contains('u') && !flags.contains('v');
+  String split_source(vm.allocator());
+  StringView compiled_source = source;
+  if (c->code_units && has_astral(source)) {   // /😀+/ repeats the last surrogate: the pattern is read as code units too
+    split_astral(source, &split_source, nullptr);
+    compiled_source = split_source.view();
+  }
+  const regex::Error error = c->regex.compile(compiled_source, f);
   if (error != regex::Error::None) {
     String message(vm.allocator());
     message.append("Invalid regular expression: /");
@@ -149,6 +189,40 @@ bool limit_error(Vm& vm) { return vm.throw_error(ErrorKind::RangeError, "Regular
 bool search_from(Vm& vm, Compiled* c, StringView s, uint64_t from, bool prefix_only, regex::Match* m, bool* found) {
   *found = false;
   if (from > s.size()) return true;
+  if (c->code_units && has_astral(s)) {   // match against the surrogate form of the subject, then map the positions back (a boundary inside a pair rounds to the character)
+    String t(vm.allocator());
+    List<uint64_t> astral(vm.allocator());
+    split_astral(s, &t, &astral);
+    uint64_t t_from = from;
+    for (uint64_t i = 0; i < astral.count(); ++i)
+      if (astral[i] < from) t_from += 2;
+    const regex::Result r = prefix_only ? c->regex.match_prefix(t.view(), m, t_from) : c->regex.search(t.view(), m, t_from);
+    if (r == regex::Result::NoMatch) return true;
+    if (r != regex::Result::Matched) return limit_error(vm);
+    auto back = [&](uint64_t at, bool end_side) -> uint64_t {
+      uint64_t shift = 0;
+      for (uint64_t i = 0; i < astral.count(); ++i) {
+        const uint64_t start = astral[i] + 2 * i;   // where this character begins in the surrogate form
+        if (at >= start + 6) {
+          shift += 2;
+        } else if (at > start) {
+          return end_side ? astral[i] + 4 : astral[i];
+        } else {
+          break;
+        }
+      }
+      return at - shift;
+    };
+    for (uint32_t g = 0; g < m->count; ++g) {
+      if (!m->has(g)) continue;
+      const bool empty = m->begins[g] == m->ends[g];
+      const uint64_t b = back(m->begins[g], false);
+      m->ends[g] = empty ? b : back(m->ends[g], true);
+      m->begins[g] = b;
+    }
+    *found = true;
+    return true;
+  }
   const regex::Result r = prefix_only ? c->regex.match_prefix(s, m, from) : c->regex.search(s, m, from);
   if (r == regex::Result::Matched) {
     *found = true;
@@ -168,22 +242,53 @@ bool read_last_index(Vm& vm, JsObject* re, double* out) {
 
 void write_last_index(Vm& vm, JsObject* re, double v) { vm.define_named(re, "lastIndex", Value::make_number(v), kWritable); }
 
-// The groups of a match as the array exec() returns: the texts, and index, input and groups.
+// The groups object for the named groups of a match: a name used by several groups (in different alternatives) gets the one that took part.
+Value named_groups(Vm& vm, const regex::Program& p, StringView subject, const regex::Match& m, bool indices, JsString* s) {
+  JsObject* groups = vm.new_plain();
+  for (int pass = 0; pass < 2; ++pass) {   // (first every name as undefined, in order, then the groups that matched)
+    for (uint64_t i = 0; i < p.names.size(); ++i) {
+      const regex::NameEntry& e = p.names[i];
+      const StringView name(e.text, e.length);
+      if (pass == 0) {
+        vm.define_named(groups, name, Value());
+      } else if (m.has(e.group)) {
+        if (!indices) {
+          vm.define_named(groups, name, str_value(vm, m.text(subject, e.group)));
+        } else {
+          JsObject* pair = vm.new_array(2);
+          vm.array_push(pair, Value::make_number(static_cast<double>(vm.string_unit_of_byte(s, m.begins[e.group]))));
+          vm.array_push(pair, Value::make_number(static_cast<double>(vm.string_unit_of_byte(s, m.ends[e.group]))));
+          vm.define_named(groups, name, Value::make_object(pair));
+        }
+      }
+    }
+  }
+  return Value::make_object(groups);
+}
+
+// The groups of a match as the array exec() returns: the texts, and index, input and groups (and indices with the d flag).
 Value match_array(Vm& vm, Compiled* c, JsString* s, const regex::Match& m) {
   JsObject* a = vm.new_array(m.count);
   for (uint32_t g = 0; g < m.count; ++g) vm.array_push(a, m.has(g) ? str_value(vm, m.text(s->view(), g)) : Value());
   vm.define_named(a, "index", Value::make_number(static_cast<double>(vm.string_unit_of_byte(s, m.begin()))));
   vm.define_named(a, "input", Value::make_string(s));
   const regex::Program p = c->regex.program();
-  if (p.names.size() == 0) {
-    vm.define_named(a, "groups", Value());
-  } else {
-    JsObject* groups = vm.new_plain();
-    for (uint64_t i = 0; i < p.names.size(); ++i) {
-      const regex::NameEntry& e = p.names[i];
-      vm.define_named(groups, StringView(e.text, e.length), m.has(e.group) ? str_value(vm, m.text(s->view(), e.group)) : Value());
+  if (p.names.size() == 0) vm.define_named(a, "groups", Value());
+  else vm.define_named(a, "groups", named_groups(vm, p, s->view(), m, false, s));
+  if (c->flags.view().contains('d')) {   // hasIndices: [start, end] of each group, in characters of the subject
+    JsObject* indices = vm.new_array(m.count);
+    for (uint32_t g = 0; g < m.count; ++g) {
+      if (!m.has(g)) {
+        vm.array_push(indices, Value());
+        continue;
+      }
+      JsObject* pair = vm.new_array(2);
+      vm.array_push(pair, Value::make_number(static_cast<double>(vm.string_unit_of_byte(s, m.begins[g]))));
+      vm.array_push(pair, Value::make_number(static_cast<double>(vm.string_unit_of_byte(s, m.ends[g]))));
+      vm.array_push(indices, Value::make_object(pair));
     }
-    vm.define_named(a, "groups", Value::make_object(groups));
+    vm.define_named(indices, "groups", p.names.size() == 0 ? Value() : named_groups(vm, p, s->view(), m, true, s));
+    vm.define_named(a, "indices", Value::make_object(indices));
   }
   return Value::make_object(a);
 }
@@ -305,7 +410,14 @@ void expand_template(StringView repl, StringView subject, Compiled* c, const reg
       i += used;
     } else if (n == '<' && p.names.size() > 0) {
       const uint64_t close = repl.find('>', i + 2);
-      const int32_t g = close == StringView::npos ? -1 : p.group_index(repl.substr(i + 2, close - i - 2));
+      int32_t g = close == StringView::npos ? -1 : p.group_index(repl.substr(i + 2, close - i - 2));
+      if (g >= 0) {   // (a name used by several groups: the one that took part)
+        const StringView wanted = repl.substr(i + 2, close - i - 2);
+        for (uint64_t k = 0; k < p.names.size(); ++k) {
+          const regex::NameEntry& e = p.names[k];
+          if (StringView(e.text, e.length).equals(wanted) && m.has(e.group)) g = static_cast<int32_t>(e.group);
+        }
+      }
       if (close == StringView::npos) {
         out->push_back('$');
         continue;
@@ -420,12 +532,7 @@ bool regexp_replace(Vm& vm, JsString* s, const Value& regexp, const Value& repla
       call_args.push_back(Value::make_number(static_cast<double>(vm.string_unit_of_byte(s, m.begin()))));
       call_args.push_back(Value::make_string(s));
       if (p.names.size() > 0) {
-        JsObject* groups = vm.new_plain();
-        for (uint64_t i = 0; i < p.names.size(); ++i) {
-          const regex::NameEntry& e = p.names[i];
-          vm.define_named(groups, StringView(e.text, e.length), m.has(e.group) ? str_value(vm, m.text(subject, e.group)) : Value());
-        }
-        call_args.push_back(Value::make_object(groups));
+        call_args.push_back(named_groups(vm, p, subject, m, false, s));
       }
       Value r;
       JsString* rs;

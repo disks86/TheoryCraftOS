@@ -22,6 +22,7 @@
 #include "Process/Objects.hpp"
 #include "Process/WindowsException.hpp"
 #include "Process/WindowsMailslots.hpp"
+#include "Process/WindowsRegistry.hpp"
 #include "Process/WindowsMemory.hpp"
 #include "Process/WindowsPipes.hpp"
 #include "Process/WindowsSockets.hpp"
@@ -337,6 +338,17 @@ Frame* on_user_fault(Frame* frame) {
     if (ends) exit_thread();
     irq_disable();
     return frame;
+  }
+  // A write to a copy-on-write page (PAGE_WRITECOPY) is not a fault: the page gets its own copy and the instruction runs again.
+  if ((frame->vector & 0xFF) == 14 && (frame->error & 3) == 3 && task->program.process()->abi() == process::SyscallAbi::Windows) {
+    const uint64_t cow_address = read_cr2();
+    irq_enable();
+    task->mutex.lock();
+    process::AddressSpace* space = task->program.process()->address_space();
+    const bool copied = space && space->break_copy_on_write(cow_address, 1) && task->sync_tables();
+    task->mutex.unlock();
+    irq_disable();
+    if (copied) return frame;
   }
   // A Windows program gets its exception delivered, to be handled by SEH or C++ code (or to end up in ntdll's last resort); only when that cannot be done is the program stopped.
   process::Process* process = task->program.process();
@@ -828,6 +840,7 @@ uint32_t Task::spawn_process(const process::ChildSpec& spec) {
         if (kind == process::DescriptorKind::Pipe) process::windowsabi::pipe_token_add(token);
       else if (kind == process::DescriptorKind::Socket) process::windowsabi::socket_token_add(token);
         else if (kind == process::DescriptorKind::Mailslot) process::windowsabi::mailslot_token_add(token);
+        else if (kind == process::DescriptorKind::Key) process::windowsabi::key_token_add(token);
         else if (kind == process::DescriptorKind::Event || kind == process::DescriptorKind::Mutex || kind == process::DescriptorKind::Semaphore || kind == process::DescriptorKind::Process || kind == process::DescriptorKind::Timer || kind == process::DescriptorKind::Section || kind == process::DescriptorKind::Job || kind == process::DescriptorKind::ChangeNotification) objects->add_ref(uint32_t(token));
       }
     };

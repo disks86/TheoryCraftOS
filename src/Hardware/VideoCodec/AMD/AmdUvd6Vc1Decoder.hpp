@@ -64,6 +64,9 @@ class AmdUvd6Vc1Decoder final : public IVideoDecoder, private vc1::IOffload {
   VideoCodecStatistics statistics() const override;
 
   bool session_open() const { return open_; }
+  // Whether interlaced sequences (frame and field coded pictures too) go to the engine; otherwise they are refused, and the CPU decodes the progressive frames of such a
+  // sequence and drops the rest. The device sets it once the engine passed its interlaced test.
+  void allow_interlace(bool allow) { interlace_allowed_ = allow; }
   uint64_t pictures_decoded() const { return decoded_; }
 
  private:
@@ -84,6 +87,7 @@ class AmdUvd6Vc1Decoder final : public IVideoDecoder, private vc1::IOffload {
   Vc1Decoder cpu_;
   bool leased_ = false;    // this session holds the work memory's lease
   bool open_ = false;      // the engine has a session
+  bool interlace_allowed_ = false;   // interlaced sequences may use the engine
   uint32_t width_ = 0, height_ = 0;
 
   amd_uvd6::Vc1BufferSizes sizes_;

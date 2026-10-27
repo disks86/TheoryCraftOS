@@ -220,9 +220,12 @@ bool typed_hook_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
   const StringView k = key->view();
   uint32_t i;
   if (parse_index(k, &i)) {
-    if (i < live_length(o)) typed_array_get_value(vm, o, i, out);
-    else *out = Value();
-    return true;
+    if (i < live_length(o)) {
+      typed_array_get_value(vm, o, i, out);
+      return true;
+    }
+    *out = Value();
+    return false;   // (there is no element there: `10 in array` is false)
   }
   if (k.equals("length")) {
     *out = num_value(live_length(o));

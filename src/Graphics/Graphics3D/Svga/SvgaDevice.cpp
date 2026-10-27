@@ -270,6 +270,7 @@ void SvgaDevice::destroy_buffer(IBuffer* buffer) { destroy(allocator_, static_ca
 
 IImage* SvgaDevice::create_image(const ImageDesc& desc) {
   if (desc.stencil) return nullptr;   // (no stencil plane on this device)
+  if (desc.mip_levels != 1) return nullptr;   // (no mipmaps either)
   if (!desc.extent.width || !desc.extent.height || desc.format == Format::Undefined || desc.format == Format::R8G8B8A8Unorm) return nullptr;
   SvgaImage* image = make<SvgaImage>(allocator_, *this, desc);
   if (image && !image->valid()) {

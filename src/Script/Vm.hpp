@@ -47,7 +47,7 @@ class IHost {
 
 class Vm {
  public:
-  static constexpr uint32_t kStackValues = 16384, kMaxFrames = 256;
+  static constexpr uint32_t kStackValues = 65536, kMaxFrames = 2048;
 
   Vm(allocators::IAllocator& allocator, IHost* host);
   ~Vm();
@@ -82,6 +82,13 @@ class Vm {
   // Calls a function value.
   bool call(const Value& function, const Value& this_value, const Value* args, uint32_t argc, Value* result);
   bool construct(const Value& function, const Value* args, uint32_t argc, Value* result);
+  // A sloppy function's arguments object shares its first parameters' variables: the elements are read from the function's environment. This copies them into
+  // the items, for code that reads the items directly (slice.call(arguments), apply, spread).
+  void refresh_arguments(JsObject* o) {
+    if (o->env && o->okind == ObjKind::Array && o->position == kArgumentsMark) sync_arguments(o);
+  }
+  // Reflect.construct: `new function(...args)` whose new.target (and so the prototype of the object it makes) is `new_target`.
+  bool construct_with(const Value& function, const Value* args, uint32_t argc, const Value& new_target, Value* result);
   // The pending exception as text ("TypeError: x is not a function"), and it is cleared.
   void take_exception(String* text);
   bool has_exception() const { return has_exception_; }
@@ -196,12 +203,35 @@ class Vm {
   JsObject* number_proto() { return number_proto_; }
   JsObject* boolean_proto() { return boolean_proto_; }
   JsObject* symbol_proto() { return symbol_proto_; }
+  // The prototypes of generator, async and async generator functions (GeneratorFunction.prototype ...): [0] [1] [2].
+  JsObject* function_kind_proto(int kind) { return function_kind_protos_[kind]; }
   // The wrapper object of a primitive (new String('a'), Object(1), a sloppy function's `this`), and the primitive of a wrapper (any other value is itself).
   JsObject* box(const Value& primitive);
   static Value primitive_of(const Value& v) { return v.is_object() && v.as_object()->okind == ObjKind::Primitive ? v.as_object()->bound_this : v; }
   // Turns the fresh object `new String(...)` made into the wrapper of `primitive` (when `self` is such an object); false for a plain call.
   bool become_wrapper(const Value& self, JsObject* proto, const Value& primitive);
   static bool is_symbol(const Value& v) { return v.tag == Tag::String && v.as_string()->symbol; }
+  // A property's state as the language describes it (the fields a descriptor object has).
+  struct PropDesc {
+    bool has_value = false, has_writable = false, has_get = false, has_set = false, has_enumerable = false, has_configurable = false;
+    Value value, getter, setter;
+    bool writable = false, enumerable = false, configurable = false;
+    bool accessor() const { return has_get || has_set; }
+    bool data() const { return has_value || has_writable; }
+  };
+  bool to_descriptor(const Value& v, PropDesc* out);
+  Value descriptor_to_object(const PropDesc& d);
+  bool compatible_descriptor(bool extensible, const PropDesc& desc, bool has_current, const PropDesc& current);
+  // The object operations that a proxy can intercept, for ordinary objects and proxies alike.
+  bool get_own_descriptor(JsObject* o, JsString* key, bool* present, PropDesc* out);
+  bool is_extensible_op(JsObject* o, bool* out);
+  bool get_prototype_op(JsObject* o, JsObject** out);
+  bool proxy_get_own_property(JsObject* proxy, JsString* key, bool* present, PropDesc* out);
+  bool proxy_define_property(JsObject* proxy, JsString* key, const PropDesc& desc, bool* ok, JsObject** forward);
+  bool proxy_get_prototype(JsObject* proxy, JsObject** out);
+  bool proxy_set_prototype(JsObject* proxy, JsObject* proto, bool* ok, JsObject** forward);
+  bool proxy_is_extensible(JsObject* proxy, bool* out);
+  bool proxy_prevent_extensions(JsObject* proxy, bool* ok, JsObject** forward);
   // A new symbol (not interned: it is its own property key). The well-known ones are interned "@@iterator" and the like, flagged by the builtins.
   JsString* new_symbol(const Value& description);
   // The own property keys that are symbols (enumerable or not).
@@ -309,6 +339,7 @@ class Vm {
     bool construct;
     bool via_super;          // the frame is a parent class constructor that super(...) called: new.target is the class of `this`
     Value construct_this;
+    Value new_target;        // set by Reflect.construct; otherwise new.target of a construct frame is the callee
     JsObject* coroutine;     // the async function this frame is running (its state is saved here at an `await`)
   };
   struct Handler {
@@ -333,6 +364,11 @@ class Vm {
   int64_t find_prop(JsObject* o, JsString* key) const;
   void push_property_keys(JsObject* names, JsObject* o, bool enumerable);
   uint32_t symbol_counter_ = 0;
+  void sync_arguments(JsObject* o);
+  Env* mapped_env(JsObject* o, uint32_t index) const;   // the environment whose slot `index` of arguments object `o` is, or null
+  JsObject* function_kind_protos_[3] = {};
+  Value new_target_override_;   // for the next construct call (see construct_with)
+  Value pending_frame_new_target_;   // ... on its way to the frame
   bool array_index(const Value& key, uint32_t* index) const;
   static bool canonical_index(StringView s, uint32_t* index);
   bool ensure_items(JsObject* o, uint32_t capacity);
@@ -399,10 +435,13 @@ class Vm {
   bool proxy_parts(JsObject* proxy, const char* operation, JsObject** target, Value* handler);
   bool proxy_trap(JsObject* proxy, const char* name, JsObject** target, Value* handler, Value* trap);
   bool proxy_get(JsObject* proxy, JsString* key, const Value& receiver, Value* out);
-  bool proxy_set(JsObject* proxy, JsString* key, const Value& value, const Value& receiver);
+  bool proxy_set(JsObject* proxy, JsString* key, const Value& value, const Value& receiver, bool strict);
+  bool proxy_fail(const char* trap, const char* what, JsString* key);
+  bool ordinary_descriptor(JsObject* o, JsString* key, PropDesc* out);
+  bool get_with_receiver(const Value& base, JsString* key, const Value& receiver, Value* out);
   bool proxy_has(JsObject* proxy, JsString* key, bool* out);
   bool proxy_delete(JsObject* proxy, JsString* key, bool* out);
-  JsObject* proxy_keys(JsObject* proxy, bool all);
+  JsObject* proxy_keys(JsObject* proxy, int mode);
   bool proxy_call(JsObject* proxy, const Value& this_value, const Value* args, uint32_t argc, Value* result, bool construct);
   bool call_setter(const Value& pair, const Value& receiver, const Value& value);
   String halt_reason_;

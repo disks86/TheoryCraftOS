@@ -384,7 +384,14 @@ NATIVE(win_get_computed_style) {
   DomBindings::Impl& c = impl(vm);
   dom::Node* n = node_of(arg_at(args, argc, 0));
   if (!n || !n->is_element()) return vm.throw_error(ErrorKind::TypeError, "Failed to execute 'getComputedStyle' on 'Window': parameter 1 is not of type 'Element'.");
-  *result = make_computed_style(c, n);
+  uint32_t pseudo = 0;   // getComputedStyle(element, '::before')
+  String which(vm.allocator());
+  if (argc > 1 && !args[1].is_undefined() && !args[1].is_null() && arg_text(vm, args[1], &which)) {
+    const StringView w = which.view();
+    if (w.equals_ignore_case("::before") || w.equals_ignore_case(":before")) pseudo = static_cast<uint32_t>(PseudoElement::Before);
+    else if (w.equals_ignore_case("::after") || w.equals_ignore_case(":after")) pseudo = static_cast<uint32_t>(PseudoElement::After);
+  }
+  *result = make_computed_style(c, n, pseudo);
   return true;
 }
 
@@ -624,12 +631,25 @@ NATIVE(win_atob) {
   return true;
 }
 
+// Throws a URIError (an Error with the message when that class is not there).
+bool throw_uri_error(Vm& vm, const char* message) {
+  Value ctor;
+  if (vm.get_named(Value::make_object(vm.global()), "URIError", &ctor) && Vm::is_callable(ctor)) {
+    Value text = Value::make_string(vm.new_string(message));
+    Value error;
+    if (vm.construct(ctor, &text, 1, &error)) return vm.throw_value(error);
+    return false;
+  }
+  return vm.throw_error(ErrorKind::Error, message);
+}
+
 bool uri_encode(Vm& vm, const Value* args, uint32_t argc, Value* result, const char* keep) {
   String text(vm.allocator()), out(vm.allocator());
   if (!arg_text(vm, arg_at(args, argc, 0), &text)) return false;
   static const char kHex[] = "0123456789ABCDEF";
   for (uint64_t i = 0; i < text.size(); ++i) {
     const char ch = text[i];
+    if (static_cast<uint8_t>(ch) == 0xED && i + 1 < text.size() && static_cast<uint8_t>(text[i + 1]) >= 0xA0) return throw_uri_error(vm, "URI malformed");   // (a lone surrogate)
     bool plain = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9');
     for (const char* p = keep; *p && !plain; ++p) plain = *p == ch;
     if (plain) {
@@ -655,7 +675,7 @@ bool uri_decode(Vm& vm, const Value* args, uint32_t argc, Value* result, const c
       out.push_back(text[i]);
       continue;
     }
-    if (i + 2 >= text.size() || hex(text[i + 1]) < 0 || hex(text[i + 2]) < 0) return vm.throw_error(ErrorKind::Error, "URIError: URI malformed");
+    if (i + 2 >= text.size() || hex(text[i + 1]) < 0 || hex(text[i + 2]) < 0) return throw_uri_error(vm, "URI malformed");
     const char decoded = static_cast<char>(hex(text[i + 1]) * 16 + hex(text[i + 2]));
     bool keep = false;
     for (const char* p = keep_encoded; *p && !keep; ++p) keep = *p == decoded;

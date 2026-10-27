@@ -59,6 +59,8 @@ constexpr int kMaxMbWidth = 256, kMaxMbHeight = 256;   // 4096 x 4096
 
 enum Profile : int { kSimple = 0, kMain = 1, kComplex = 2, kAdvanced = 3 };
 enum PictureType : int { kPictureI = 0, kPictureP = 1, kPictureB = 2, kPictureBI = 3 };
+// The frame coding mode of an Advanced profile frame in an interlaced sequence (the FCM syntax element).
+enum FrameCodingMode : int { kFcmProgressive = 0, kFcmFrameInterlace = 1, kFcmFieldInterlace = 2 };
 enum MvMode : int { kMv1MvHpelBilin = 0, kMv1Mv = 1, kMv1MvHpel = 2, kMvMixed = 3, kMvIntensityComp = 4 };
 enum TransformType : int { kTt8x8 = 0, kTt8x4Bottom, kTt8x4Top, kTt8x4, kTt4x8Right, kTt4x8Left, kTt4x8, kTt4x4 };
 enum QuantMode : int { kQuantFrameImplicit = 0, kQuantFrameExplicit, kQuantNonUniform, kQuantUniform };
@@ -89,6 +91,12 @@ struct SequenceHeader {
 
 // 7: the picture layer, for progressive pictures.
 struct PictureHeader {
+  // Only a progressive frame is decoded here: for the other modes (frame interlace, and field interlace with its two field pictures) the header is read as far as the picture
+  // type and the engine takes the rest, so `type` is the frame's class (an I or P frame has an intra first field; a B frame has B or BI fields only) and none of the fields
+  // below it are filled in.
+  int fcm = kFcmProgressive;
+  int fptype = 0;            // the field picture type (field interlace): first field class in bits 2:1, second in bits 2 and 0
+  bool uvsamp = false;
   int type = kPictureI;
   bool skipped = false;      // a P picture that repeats the one before
   bool rangeredfrm = false;

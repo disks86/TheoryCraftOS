@@ -23,7 +23,7 @@
 // What differs from Vulkan, on purpose: no instance/queue-family/descriptor-set/
 // synchronization machinery (submit() is synchronous), memory is always
 // host-visible, shader state is limited to push constants and a few bound textures
-// (a sampled image with its sampler state, no mipmaps), and shaders are not
+// (a sampled image with its sampler state, with or without mipmaps), and shaders are not
 // SPIR-V (there is no compiler in the OS yet): a ShaderModule carries a native
 // C++ function for the software device and/or TGSI text for the GPU device. The
 // built-in shaders (BuiltinShaders.hpp) come with both, so the same program
@@ -33,6 +33,7 @@
 // triangle's winding is judged as it appears on screen.
 #pragma once
 #include "Graphics/GraphicsTypes.hpp"
+#include "Graphics/Graphics3D/Mipmaps.hpp"
 
 namespace graphics {
 
@@ -73,6 +74,9 @@ struct ImageDesc {
   uint32_t usage = kImageColorAttachment;
   // A D32Float image can carry an 8-bit stencil plane next to the depth (the stencil test of a pipeline needs one). Devices without stencil refuse such an image.
   bool stencil = false;
+  // The levels of a sampled colour image (Mipmaps.hpp): level 0 is `extent`, each next is half as large each way. More than one needs kImageSampled and no other usage on
+  // the Intel Gen9 device; devices that cannot refuse the image. A level is filled by write_mip_pixels, or all of them from level 0 by generate_mipmaps.
+  uint32_t mip_levels = 1;
 };
 
 class IImage {
@@ -88,6 +92,16 @@ class IImage {
     (void)pixels;
     return false;
   }
+  // The number of levels the image was made with.
+  virtual uint32_t mip_levels() const { return 1; }
+  // The same for level `level` of a mipmapped image (mip_extent() of the extent, rows top to bottom). Level 0 is write_pixels.
+  virtual bool write_mip_pixels(uint32_t level, ArrayView<const uint32_t> pixels) {
+    (void)level;
+    (void)pixels;
+    return false;
+  }
+  // Makes every level above 0 from level 0 by the 2 x 2 box filter of mip_box_downsample, each from the one before it. False when the image has one level or cannot.
+  virtual bool generate_mipmaps() { return false; }
 
  protected:
   constexpr IImage() = default;
@@ -101,14 +115,25 @@ enum class ShaderStage : uint8_t { Vertex, Fragment };
 // --- Textures ----------------------------------------------------------------
 
 // How a texture is read. Coordinates are normalised: (0, 0) is the top left corner of the top left texel and (1, 1) the bottom right corner of the bottom right one,
-// +v down the picture. Nearest takes the texel the point lies in; Linear blends the four texels around it (their centres are half a texel in). There are no mipmaps.
+// +v down the picture. Nearest takes the texel the point lies in; Linear blends the four texels around it (their centres are half a texel in).
+//
+// Mipmaps: with mip_filter None only level 0 is read. Otherwise the lookup picks a level of detail from how fast the coordinates change from pixel to pixel: the derivatives
+// of (u, v) along x and y are taken from the 2 x 2 pixel quad the pixel is in (the right pixel's lookup minus the left's, the lower's minus the upper's - the same for the two
+// pixels of a row or column of the quad), in texels of level 0; rho is the longer of the two vectors; lambda = log2(rho) + lod_bias, clamped to [min_lod, max_lod] and to the
+// levels the image has. A lambda of 0 or less is magnification and reads level 0 with `filter`. Above it, Nearest reads the level floor(lambda + 0.5) and Linear blends
+// the levels floor(lambda) and the next by the fraction of lambda, each read with `filter`. Only the first lookup of a unit in a fragment shader invocation takes its level
+// from the derivatives; any further lookup of the unit in the same invocation uses the same level.
 enum class Filter : uint8_t { Nearest, Linear };
+enum class MipFilter : uint8_t { None, Nearest, Linear };
 // What a coordinate outside 0..1 means: wrap around, or take the edge texel.
 enum class AddressMode : uint8_t { Repeat, ClampToEdge };
 struct SamplerDesc {
   Filter filter = Filter::Nearest;
   AddressMode address_u = AddressMode::Repeat;
   AddressMode address_v = AddressMode::Repeat;
+  MipFilter mip_filter = MipFilter::None;
+  float lod_bias = 0.0f;
+  float min_lod = 0.0f, max_lod = 1000.0f;
 };
 
 // The bound textures as a fragment shader sees them: sample(unit, u, v) gives the colour (0..1 per component, straight alpha) of the image bound to `unit` with the sampler

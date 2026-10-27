@@ -103,7 +103,7 @@ EXPORT DWORD WINAPI GetActiveProcessorCount(WORD group) {
 EXPORT DWORD WINAPI GetMaximumProcessorCount(WORD group) { return GetActiveProcessorCount(group); }
 EXPORT WORD WINAPI GetActiveProcessorGroupCount(void) { return 1; }
 EXPORT WORD WINAPI GetMaximumProcessorGroupCount(void) { return 1; }
-EXPORT BOOL WINAPI QueryUnbiasedInterruptTime(PULONGLONG t) { *t = GetTickCount64() * 10000; return TRUE; }
+EXPORT BOOL WINAPI QueryUnbiasedInterruptTime(PULONGLONG t) { if (!t) { set_error(ERROR_INVALID_PARAMETER); return FALSE; } *t = GetTickCount64() * 10000; return TRUE; }
 EXPORT DWORD WINAPI GetProcessIdOfThread(HANDLE thread) {
   BYTE info[48];
   if (!NT_SUCCESS(NtQueryInformationThread(thread, 0, info, sizeof(info), NULL))) { set_error(ERROR_INVALID_HANDLE); return 0; }
@@ -133,7 +133,6 @@ EXPORT LANGID WINAPI GetSystemDefaultUILanguage(void) { return 0x0409; }
 EXPORT LANGID WINAPI GetThreadUILanguage(LANGID l) { (void)l; return 0x0409; }
 EXPORT LCID WINAPI GetThreadLocale(void) { return 0x0409; }
 EXPORT BOOL WINAPI SetThreadLocale(LCID l) { return l == 0x0409 || l == 0x0400 || l == 0x0800; }
-EXPORT BOOL WINAPI IsValidLocale(LCID l, DWORD flags) { (void)flags; return l == 0x0409; }
 EXPORT int WINAPI GetUserDefaultLocaleName(LPWSTR name, int capacity) { static const WCHAR n[] = {'e', 'n', '-', 'U', 'S', 0}; if (capacity < 6) return 0; memcpy(name, n, sizeof(n)); return 6; }
 EXPORT int WINAPI GetSystemDefaultLocaleName(LPWSTR name, int capacity) { return GetUserDefaultLocaleName(name, capacity); }
 

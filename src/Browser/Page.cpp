@@ -547,6 +547,7 @@ const StyleSheet& Page::style_sheet() {
         " height: 100% !important; max-width: none !important; max-height: none !important; margin: 0 !important; box-sizing: border-box !important; z-index: 2147483647 !important; }";
     if (!fullscreen_stack_.empty()) options.extra_css = StringView(kFullscreenCss);
     collect_style_sheets(doc_, options, &style_cache_);
+    style_cache_.set_container_sizes(this);
     style_cache_version_ = doc_.version();
     style_cache_media_ = media_;
     style_cache_valid_ = true;
@@ -555,6 +556,40 @@ const StyleSheet& Page::style_sheet() {
 }
 
 Style derive_style(const Style& parent, const dom::Node* n, const StyleSheet& sheet);   // Renderer.cpp
+
+// The container of an element: the nearest ancestor with container-type (named `name` when given). Its width and height are the lengths its style gives (the
+// viewport where it has none: the page layout does not report box sizes back to the style).
+bool Page::container_size(const dom::Node* element, StringView name, int32_t* width_px, int32_t* height_px) {
+  for (const dom::Node* a = element ? element->parent : nullptr; a && a->is_element(); a = a->parent) {
+    Style s;
+    if (!computed_style(a, &s) || s.container_type == 0) continue;
+    if (!name.empty()) {
+      bool named = false;
+      const StringView names = style_cache_.text(s.container_name);
+      uint64_t at = 0;
+      while (at < names.size()) {
+        while (at < names.size() && names[at] == ' ') ++at;
+        const uint64_t start = at;
+        while (at < names.size() && names[at] != ' ') ++at;
+        if (at > start && names.substr(start, at - start).equals(name)) named = true;
+      }
+      if (!named) continue;
+    }
+    if (s.width.kind == Length::Px && !s.width.has_percent()) *width_px = s.width.px100 / 100;
+    if (s.height.kind == Length::Px && !s.height.has_percent()) *height_px = s.height.px100 / 100;
+    return true;
+  }
+  return false;
+}
+
+bool Page::computed_pseudo_style(const dom::Node* element, PseudoElement pseudo, Style* out) {
+  Style parent;
+  if (!computed_style(element, &parent)) return false;
+  Style s = parent.inherit();
+  if (style_sheet().has_pseudo(element, pseudo)) style_sheet().apply(element, StringView(), parent, &s, pseudo);
+  *out = s;
+  return true;
+}
 
 bool Page::computed_style(const dom::Node* element, Style* out) {
   // the same chain the box builder walks, table presentation (td, tr, cellpadding ...) included

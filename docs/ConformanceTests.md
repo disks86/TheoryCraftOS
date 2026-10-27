@@ -39,21 +39,31 @@ gaps: `grep -c xfail tests/data/wpt/*.js`. The largest ones today:
   objects and non-configurable properties are implemented (`js_strict.js`); the host's own scripts keep configurable-by-default properties
   (`FunctionCode::library`). Left: the `prototype` of built-in constructors is configurable, module namespace properties are accessors
   (not writable data properties), no strict-only early errors (octal literals, duplicate parameters, `eval`/`arguments` assignment). Also missing:
-  `SharedArrayBuffer`/`Atomics` are single-threaded stand-ins (no `wait`/`notify` blocking, `instanceof ArrayBuffer` is true); missing: `Intl` beyond basic formatting, RegExp `v` flag (set notation) / `d` flag /
-  duplicate named groups / case folding beyond ASCII (and a non-`u` `.` matches a whole code point, not a code unit) (and `\p` covers the general categories, the main scripts and some binary properties only), `Object.prototype.toString` tag for Date,
-  TDZ and `const` only inside functions and blocks (top-level `let`/`const` are globals), duplicate `let` at top level, array destructuring does not close its iterator, sloppy `arguments` mapping, `Symbol.match/split/unscopables`, locale-specific case mapping (`toLocaleUpperCase('tr')`), `new.target`/`Reflect.construct`, tagged template caching, `for…in` integer key order, and a call depth of 500.
+  `SharedArrayBuffer`/`Atomics` are single-threaded stand-ins (no `wait`/`notify` blocking, `instanceof ArrayBuffer` is true); missing: `Intl` date and number formatting beyond English and a few numeric orders (the Collator, `Locale`, `Segmenter`, `DisplayNames` and `getCanonicalLocales` are there, with English names and an outline of the UAX 29 and collation rules), the RegExp `v` flag (set notation), a non-`u` match that starts or ends between the two halves of a surrogate pair (the matcher is right about it - `/^.$/` fails on an emoji, `/^..$/` matches - but the match is reported as the whole character, so `/./g` finds one match in an emoji where a browser finds two), `\p` beyond the general categories, the main scripts and some binary properties, top-level `let`/`const` temporal dead zone (they are globals), direct `eval` that sees local variables, `Symbol` wrapper in object spread, and `for…in` on a proxy calling `getPrototypeOf`. Closed since the first pass: mapped `arguments`, `with`, redeclaration errors, wrapper objects, `Reflect.construct`/`new.target`, `super` in object literals, `#x in obj`, destructuring closing its iterator, holes, symbols, proxies with all traps and invariants.
 - **HTML**: the parser follows the standard (`src/Dom/HtmlBuilder.cpp`: tokenizer states, insertion modes, adoption agency, foster parenting, foreign
-  content, templates, quirks mode). Left: the doctype is not a node (`document.doctype`, `publicId`/`systemId`), `DOMParser` with XML, character
-  references that stand for two code points, `innerHTML` scripts must not run.
+  content, templates, quirks mode). The doctype is kept (`document.doctype` with `publicId`/`systemId`; `compatMode` is `BackCompat` in quirks mode; limited-quirks is not told
+  apart), all 2125 named character references are known (`src/Dom/EntityTable.inc`, generated from the standard's table, including the two code point ones), a
+  malformed XML document from `DOMParser` has a `parsererror` document element, `document.defaultView` is `null` outside the page's own document, and
+  `outerHTML` on the document element throws `NoModificationAllowedError`. `html_parser.js` has no xfail left.
+- **Platform interfaces** (`web_apis.js`, no xfail left): every interface of the idlharness table exists with its parent and members. Real behaviour was added
+  for `CharacterData` data editing, `NamedNodeMap` (`setNamedItem`, `removeNamedItem`, `*NS`), `DocumentType` (a `Node`), `HTMLDocument` (the prototype of the page's
+  document), `Document.parseHTMLUnsafe`, `ElementInternals`/`ValidityState` via `attachInternals()`, `URLPattern` (names, `*`, `(regexp)`, `{groups}` and `? + *`
+  modifiers, base URLs; not the full constructor-string grammar), SVG `getPathData()` and polygon/polyline `points`, `Highlight`/`CSS.highlights` (registered, not painted),
+  `form.elements`/`select.options` as `HTMLFormControlsCollection`/`HTMLOptionsCollection` (`add`, `remove`, `selectedIndex`; a form not in the document lists no controls), `dialog.requestClose()`, `getModifierState`, `PerformanceObserver.supportedEntryTypes`. Interface-only (calling the members is an illegal invocation, or there is
+  nothing behind them): `MediaRecorder` (the constructor throws `NotSupportedError`: no encoder), `Worklet`, the worker global scope interfaces, `FileSystem*Handle`, `PublicKeyCredential`,
+  `OffscreenCanvas.transferToImageBitmap`; `createScriptProcessor` returns a gain node whose `onaudioprocess` is never called. Interface objects are now not
+  enumerable and have a read-only `prototype`.
 - **CSS**: closed: `getComputedStyle` reports table parts (with `cellpadding`), controls, closed `dialog`, blockified `display`, `em`/`i`, `pre`, `ol`, link colour,
   `sub`/`sup`, `mark`; the properties that used to read `""` (`text-indent`, `white-space` longhands, `word-break`, `overflow-wrap`, `text-overflow`, `quotes`,
   `tab-size`, `list-style-position`, counters, `content`, `grid-*-start/end`, `column-count`, `mix-blend-mode`, `contain`, `accent-color`, `appearance`, `will-change`,
   `border-collapse`); `line-height: normal` and numbers that follow the font size; `text-align: start`; `font-style: oblique <angle>`; `aspect-ratio` as written;
-  `transform-origin` and `background-position` keywords; `url()` and gradient colours serialized; `lh`; `all`; `revert`; CSS nesting; logical properties with
+  `transform-origin` and `background-position` keywords; `url()` and gradient colours serialized; `lh`; `all`; `revert` and `revert-layer`; `flow-root`; CSS nesting; logical properties with
   `direction` / `writing-mode`; `:nth-child(… of S)`, `:dir()`, `:read-write` on `contenteditable`; `calc()` needs spaces around `+` and `-`; an empty custom property;
   a `var()` cycle uses its fallback; `rgb()` rounds; `color` keeps `lab()`, `lch()`, `oklab()`, `oklch()`, `color()` and `color-mix()` in their own space and `rgb()`/`hsl()`/`hwb()`/`lab()`… relative colours (`from`) work for plain channel keywords (a `calc()` of them does not).
-  Still open: heading sizes, `ul` padding (40px), `blockquote` margin and `small` size (the UA metrics are terminal cells on purpose), `hr` border, other properties than `color` (`background-color`, borders) still read newer colour spaces as sRGB, `revert-layer`, `flow-root` (reads `block`), `@container` conditions (container sizes are
-  unknown without layout, so they match), unitless non-zero lengths (accepted as pixels, as in quirks mode)
+  Also closed: `getComputedStyle` is live (it reads the element each time) and read-only (`NoModificationAllowedError`, `cssText`), and takes `::before` / `::after` (`attr()` and strings in `content` are resolved,
+  `counter()` stays as written); `HTMLStyleElement.disabled` is the sheet's flag; `@container` is evaluated against the nearest container ancestor whose `width` / `height` is a length (the viewport otherwise; no container
+  ancestor: no match); `CSS.escape` per CSSOM, `CSS.px()` and the other numeric factories (`CSSUnitValue`), `CSS.registerProperty` (validated and recorded; its syntax and initial value are not applied to computed values yet).
+  Still open: heading sizes, `ul` padding (40px), `blockquote` margin and `small` size (the UA metrics are terminal cells on purpose), `hr` border, other properties than `color` (`background-color`, borders) still read newer colour spaces as sRGB, unitless non-zero lengths (accepted as pixels, as in quirks mode)
 - **Web APIs**: the constructor of an interface inherits from the constructor of its parent, `AbstractRange`/`StaticRange`, `EventSource`,
   `IDBVersionChangeEvent`, the device events, `DOMImplementation`, `NodeFilter` as an interface object, the legacy element interfaces and the
   constants of `WheelEvent`/`KeyboardEvent`/`DOMException` exist (`finish_prelude()` in `WebPrelude.cpp`, run last). The attributes the engine keeps on the
@@ -92,3 +102,10 @@ selection of an input) and iteration by code point all work on them. `toUpperCas
 `normalize` use the tables of `src/Script/UnicodeTables.hpp`, made by `scripts/gen_unicode_text_tables.py`.
 A string that is not valid UTF-8 is a *byte string*: every byte is a character 0..255 (the internal convention of `Blob`, `TextDecoder`, `atob` ...; `__bytes_to_string`
 and `atob` mark theirs). A byte string that happens to be valid UTF-8 and is not marked is read as text. Use `__text_bytes(str)` for the UTF-8 bytes of a string.
+
+
+## Wine's Windows tests
+
+`tests/windows/wine` holds Wine's conformance tests for the system DLLs of `src/Windows` (343 programs build; see its README for the build, the licence and what does not
+link). They measure how far the DLLs and system services are from real Windows: nearly all of them fail today because the DLLs are stubs (`docs/WindowsUserMode.md`),
+and they are meant to be worked through DLL by DLL as the implementations arrive.

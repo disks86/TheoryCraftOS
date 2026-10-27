@@ -80,8 +80,17 @@ const char kStdlib[] = R"JSLIB((function (g) {
     for (var i = 0; i < raw.length; i++) { out += raw[i]; if (i + 1 < raw.length && i + 1 < arguments.length) out += arguments[i + 1]; }
     return out;
   });
-  def(SP, 'toLocaleLowerCase', function () { return this.toLowerCase(); });
-  def(SP, 'toLocaleUpperCase', function () { return this.toUpperCase(); });
+  // Turkish and Azeri keep the dot of the i: I is the dotless i when lowercased, i is the dotted I when uppercased
+  function dotted(locale) { if (Array.isArray(locale)) locale = locale[0]; return typeof locale === 'string' && /^(tr|az)(-|$)/i.test(locale); }
+  var DOTLESS = String.fromCharCode(0x131), DOTTED = String.fromCharCode(0x130);
+  def(SP, 'toLocaleLowerCase', function (locale) {
+    var s = String(this);
+    return dotted(locale) ? s.replace(new RegExp(DOTTED, 'g'), 'i').replace(/I(?!\u0307)/g, DOTLESS).replace(/I\u0307/g, 'i').toLowerCase() : s.toLowerCase();
+  });
+  def(SP, 'toLocaleUpperCase', function (locale) {
+    var s = String(this);
+    return dotted(locale) ? s.replace(/i/g, DOTTED).toUpperCase() : s.toUpperCase();
+  });
   function lonelySurrogate(text, i) {
     var c = text.charCodeAt(i);
     if (c >= 0xD800 && c <= 0xDBFF) { var d = text.charCodeAt(i + 1); return !(d >= 0xDC00 && d <= 0xDFFF); }
@@ -113,6 +122,7 @@ const char kStdlib[] = R"JSLIB((function (g) {
   [['match', Symbol.match], ['matchAll', Symbol.matchAll], ['replace', Symbol.replace], ['search', Symbol.search], ['split', Symbol.split]].forEach(function (pair) {
     var name = pair[0], sym = pair[1], orig = SP[name];
     var wrapper = function (arg) {
+      if (new.target !== undefined) throw new TypeError('String.prototype.' + name + ' is not a constructor');
       if (arg !== null && arg !== undefined && typeof arg === 'object' && !(arg instanceof RegExp)) {
         var method = arg[sym];
         if (typeof method === 'function') return method.apply(arg, [this].concat(Array.prototype.slice.call(arguments, 1)));
@@ -126,7 +136,12 @@ const char kStdlib[] = R"JSLIB((function (g) {
   (function () {
     var orig = AP.concat, spread = Symbol.isConcatSpreadable;
     var wrapper = function (item) {
-      var args = [];
+      'use strict';
+      if (new.target !== undefined) throw new TypeError('Array.prototype.concat is not a constructor');
+      var args = [], base = this;
+      if (base === null || base === undefined) throw new TypeError('Array.prototype.concat called on null or undefined');
+      var flagged = typeof base === 'object' || typeof base === 'function' ? base[spread] : undefined;
+      if (!(flagged !== undefined ? flagged : Array.isArray(base))) base = [typeof base === 'object' || typeof base === 'function' ? base : Object(base)];   // (not spreadable: it is the first element)
       for (var i = 0; i < arguments.length; i++) {
         var a = arguments[i];
         if (a !== null && typeof a === 'object') {
@@ -135,7 +150,7 @@ const char kStdlib[] = R"JSLIB((function (g) {
         }
         args.push(a);
       }
-      return orig.apply(this, args);
+      return orig.apply(base, args);
     };
     Object.defineProperty(wrapper, 'name', { value: 'concat' });
     Object.defineProperty(wrapper, 'length', { value: 1 });
@@ -412,7 +427,9 @@ const char kStdlib[] = R"JSLIB((function (g) {
   // ------------------------------------------------------------------------------------------------------------------ Intl (English formats, with a few numeric orders for other locales)
   function localeOf(locales) {
     var l = Array.isArray(locales) ? locales[0] : locales;
-    return typeof l === 'string' && l.length ? l : 'en-US';
+    if (l !== null && typeof l === 'object' && typeof l.toString === 'function' && l.baseName !== undefined) l = String(l);
+    if (typeof l === 'string' && l.length) { try { return canonicalTag(l); } catch (e) { return l; } }
+    return 'en-US';
   }
   var NUMERIC = {
     'en-US': { order: 'mdy', sep: '/', hour12: true, group: ',', decimal: '.' }, 'en-GB': { order: 'dmy', sep: '/', hour12: false, pad: true, group: ',', decimal: '.' },
@@ -567,21 +584,6 @@ const char kStdlib[] = R"JSLIB((function (g) {
     return n === 1 ? 'one' : 'other';
   });
   def(PluralRules.prototype, 'resolvedOptions', function () { return { locale: 'en-US', type: this.__ordinal ? 'ordinal' : 'cardinal' }; });
-  function Collator(locales, options) {
-    if (!(this instanceof Collator)) return new Collator(locales, options);
-    options = options || {};
-    var numericSort = !!options.numeric, base = options.sensitivity === 'base' || options.sensitivity === 'accent';
-    this.compare = function (a, b) {
-      a = String(a); b = String(b);
-      if (base) { a = a.toLowerCase(); b = b.toLowerCase(); }
-      if (numericSort) {
-        var ra = /^(\D*)(\d+)(.*)$/.exec(a), rb = /^(\D*)(\d+)(.*)$/.exec(b);
-        if (ra && rb && ra[1] === rb[1] && Number(ra[2]) !== Number(rb[2])) return Number(ra[2]) < Number(rb[2]) ? -1 : 1;
-      }
-      return a.localeCompare(b);
-    };
-  }
-  def(Collator.prototype, 'resolvedOptions', function () { return { locale: 'en-US', usage: 'sort', sensitivity: 'variant' }; });
   function RelativeTimeFormat(locales, options) {
     if (!(this instanceof RelativeTimeFormat)) return new RelativeTimeFormat(locales, options);
     this.__auto = !!options && options.numeric === 'auto';
@@ -609,10 +611,404 @@ const char kStdlib[] = R"JSLIB((function (g) {
     if (n === 2) return items[0] + ' ' + this.__word + ' ' + items[1];
     return items.slice(0, -1).join(', ') + ', ' + this.__word + ' ' + items[n - 1];
   });
+  // --- locale identifiers: parsing, canonical form, Intl.Locale
+  var ALIASES = { iw: 'he', 'in': 'id', ji: 'yi', mo: 'ro', tl: 'fil', no: 'nb', sh: 'sr-Latn' };
+  function title(s) { return s.charAt(0).toUpperCase() + s.slice(1).toLowerCase(); }
+  function bad() { return new RangeError('Incorrect locale information provided'); }
+  // { language, script, region, variants[], extensions[{singleton, subtags[]}], privateUse[] } of a tag; RangeError when it is not a well-formed tag
+  function parseTag(tag) {
+    if (typeof tag !== 'string') throw new TypeError('Incorrect locale information provided');
+    var parts = tag.split('-'), i = 0;
+    if (!parts.every(function (p) { return /^[a-z0-9]{1,8}$/i.test(p); })) throw bad();
+    var out = { language: parts[i++].toLowerCase(), script: undefined, region: undefined, variants: [], extensions: [], privateUse: [] };
+    if (!/^([a-z]{2,3}|[a-z]{5,8})$/.test(out.language)) throw bad();
+    if (parts[i] && /^[a-z]{4}$/i.test(parts[i])) out.script = title(parts[i++]);
+    if (parts[i] && /^([a-z]{2}|[0-9]{3})$/i.test(parts[i])) out.region = parts[i++].toUpperCase();
+    while (parts[i] && /^([a-z0-9]{5,8}|[0-9][a-z0-9]{3})$/i.test(parts[i])) { var v = parts[i++].toLowerCase(); if (out.variants.indexOf(v) >= 0) throw bad(); out.variants.push(v); }
+    var seen = {};
+    while (i < parts.length) {
+      var s = parts[i].toLowerCase();
+      if (s.length !== 1) throw bad();
+      i++;
+      if (s === 'x') { if (i >= parts.length) throw bad(); while (i < parts.length) out.privateUse.push(parts[i++].toLowerCase()); break; }
+      if (seen[s]) throw bad();
+      seen[s] = true;
+      var subtags = [];
+      while (i < parts.length && parts[i].length > 1) subtags.push(parts[i++].toLowerCase());
+      if (!subtags.length) throw bad();
+      out.extensions.push({ singleton: s, subtags: subtags });
+    }
+    var alias = ALIASES[out.language];
+    if (alias && !out.script && !out.region) { var ap = alias.split('-'); out.language = ap[0]; if (ap[1]) out.script = ap[1]; }
+    return out;
+  }
+  function unicodeKeywords(ext) {   // the -u- extension as { attributes[], keywords{} } (keys sorted when written)
+    var attrs = [], kw = {}, key = null;
+    ext.subtags.forEach(function (t) {
+      if (t.length === 2) { key = t; kw[key] = []; } else if (key) kw[key].push(t); else attrs.push(t);
+    });
+    return { attributes: attrs, keywords: kw };
+  }
+  function formatTag(p) {
+    var out = [p.language];
+    if (p.script) out.push(p.script);
+    if (p.region) out.push(p.region);
+    out = out.concat(p.variants.slice().sort());
+    p.extensions.slice().sort(function (a, b) { return a.singleton < b.singleton ? -1 : 1; }).forEach(function (e) {
+      out.push(e.singleton);
+      if (e.singleton === 'u') {
+        var u = unicodeKeywords(e);
+        out = out.concat(u.attributes.slice().sort());
+        Object.keys(u.keywords).sort().forEach(function (k) { out.push(k); u.keywords[k].forEach(function (v) { if (v !== 'true') out.push(v); }); });
+      } else out = out.concat(e.subtags);
+    });
+    if (p.privateUse.length) out = out.concat(['x'], p.privateUse);
+    return out.join('-');
+  }
+  function canonicalTag(tag) { return formatTag(parseTag(tag)); }
+  function localeList(locales) {
+    if (locales === undefined) return [];
+    if (typeof locales === 'string' || locales instanceof Locale) locales = [locales];
+    if (locales === null) throw new TypeError('Cannot convert undefined or null to object');
+    var out = [];
+    Array.prototype.forEach.call(Object(locales), function (l) {
+      if (typeof l !== 'string' && !(l instanceof Locale)) throw new TypeError('Incorrect locale information provided');
+      var c = canonicalTag(String(l));
+      if (out.indexOf(c) < 0) out.push(c);
+    });
+    return out;
+  }
+  var LIKELY = { en: 'Latn-US', fr: 'Latn-FR', de: 'Latn-DE', es: 'Latn-ES', it: 'Latn-IT', pt: 'Latn-BR', nl: 'Latn-NL', sv: 'Latn-SE', da: 'Latn-DK', nb: 'Latn-NO', fi: 'Latn-FI', pl: 'Latn-PL', cs: 'Latn-CZ',
+    tr: 'Latn-TR', ru: 'Cyrl-RU', uk: 'Cyrl-UA', el: 'Grek-GR', he: 'Hebr-IL', ar: 'Arab-EG', fa: 'Arab-IR', hi: 'Deva-IN', th: 'Thai-TH', ja: 'Jpan-JP', ko: 'Kore-KR', zh: 'Hans-CN', vi: 'Latn-VN',
+    id: 'Latn-ID', hu: 'Latn-HU', ro: 'Latn-RO', bg: 'Cyrl-BG', hr: 'Latn-HR', sk: 'Latn-SK', sr: 'Cyrl-RS', 'zh-TW': 'Hant-TW', 'zh-HK': 'Hant-HK', 'zh-Hant': 'Hant-TW' };
+  function likelyFor(p) {
+    return (p.script && LIKELY[p.language + '-' + p.script]) || (p.region && LIKELY[p.language + '-' + p.region]) || LIKELY[p.language];
+  }
+  function Locale(tag, options) {
+    if (!(this instanceof Locale)) throw new TypeError("Constructor Intl.Locale requires 'new'");
+    if (typeof tag !== 'string' && !(tag instanceof Locale)) throw new TypeError('First argument to Intl.Locale constructor can\'t be empty or missing');
+    var p = parseTag(String(tag));
+    options = options === undefined ? {} : Object(options);
+    function opt(name, test) { var v = options[name]; if (v === undefined) return undefined; v = String(v); if (test && !test.test(v)) throw new RangeError('Incorrect locale information provided'); return v; }
+    var lang = opt('language', /^([a-z]{2,3}|[a-z]{5,8})$/i), script = opt('script', /^[a-z]{4}$/i), region = opt('region', /^([a-z]{2}|[0-9]{3})$/i);
+    if (lang !== undefined) p.language = lang.toLowerCase();
+    if (script !== undefined) p.script = title(script);
+    if (region !== undefined) p.region = region.toUpperCase();
+    var u = null;
+    for (var k = 0; k < p.extensions.length; k++) if (p.extensions[k].singleton === 'u') u = unicodeKeywords(p.extensions[k]);
+    if (!u) u = { attributes: [], keywords: {} };
+    [['calendar', 'ca', /^[a-z0-9]{3,8}(-[a-z0-9]{3,8})*$/i], ['collation', 'co', /^[a-z0-9]{3,8}(-[a-z0-9]{3,8})*$/i], ['hourCycle', 'hc', /^(h11|h12|h23|h24)$/], ['caseFirst', 'kf', /^(upper|lower|false)$/],
+     ['numberingSystem', 'nu', /^[a-z0-9]{3,8}(-[a-z0-9]{3,8})*$/i]].forEach(function (spec) { var v = opt(spec[0], spec[2]); if (v !== undefined) u.keywords[spec[1]] = v.toLowerCase().split('-'); });
+    if (options.numeric !== undefined) u.keywords.kn = Boolean(options.numeric) ? [] : ['false'];
+    p.extensions = p.extensions.filter(function (e) { return e.singleton !== 'u'; });
+    var sub = u.attributes.slice();
+    Object.keys(u.keywords).sort().forEach(function (key) { sub.push(key); u.keywords[key].forEach(function (v) { sub.push(v); }); });
+    if (sub.length) p.extensions.push({ singleton: 'u', subtags: sub });
+    Object.defineProperty(this, '__p', { value: p });
+    Object.defineProperty(this, '__locale', { value: formatTag(p) });
+    Object.defineProperty(this, '__u', { value: u });
+  }
+  [['language', function (p) { return p.language; }], ['script', function (p) { return p.script; }], ['region', function (p) { return p.region; }],
+   ['baseName', function (p) { return formatTag({ language: p.language, script: p.script, region: p.region, variants: p.variants, extensions: [], privateUse: [] }); }]].forEach(function (spec) {
+    Object.defineProperty(Locale.prototype, spec[0], { get: function () { if (!this.__p) throw new TypeError('Illegal invocation'); return spec[1](this.__p); }, enumerable: false, configurable: true });
+  });
+  [['calendar', 'ca'], ['collation', 'co'], ['hourCycle', 'hc'], ['caseFirst', 'kf'], ['numberingSystem', 'nu']].forEach(function (spec) {
+    Object.defineProperty(Locale.prototype, spec[0], { get: function () { var v = this.__u.keywords[spec[1]]; return v === undefined ? undefined : v.join('-'); }, enumerable: false, configurable: true });
+  });
+  Object.defineProperty(Locale.prototype, 'numeric', { get: function () { var v = this.__u.keywords.kn; return v !== undefined && (v.length === 0 || v[0] === 'true'); }, enumerable: false, configurable: true });
+  def(Locale.prototype, 'toString', function () { return this.__locale; });
+  def(Locale.prototype, 'maximize', function () {
+    var p = this.__p, likely = likelyFor(p), c = { language: p.language, script: p.script, region: p.region, variants: p.variants, extensions: p.extensions, privateUse: p.privateUse };
+    if (likely) { var l = likely.split('-'); if (!c.script) c.script = l[0]; if (!c.region) c.region = l[1]; }
+    return new Locale(formatTag(c));
+  });
+  def(Locale.prototype, 'minimize', function () {
+    var p = this.__p, c = { language: p.language, script: p.script, region: p.region, variants: p.variants, extensions: p.extensions, privateUse: p.privateUse }, full = this.maximize().__p;
+    var likely = likelyFor({ language: p.language, script: undefined, region: undefined });
+    if (likely) { var l = likely.split('-'); if (full.script === l[0]) c.script = undefined; if (full.region === l[1]) c.region = undefined; }
+    return new Locale(formatTag(c));
+  });
+  Object.defineProperty(Locale.prototype, Symbol.toStringTag, { value: 'Intl.Locale', configurable: true });
+  def(Locale, 'supportedLocalesOf', function (l) { return localeList(l); });
+
+  // --- Collator: the order of the Unicode collation algorithm in outline: spaces, punctuation, symbols, digits, then letters by their base letter; accents and case only break ties
+  var MARK = /^\p{M}$/u, LETTER = /^\p{L}$/u, DIGIT = /^\p{Nd}$/u, SPACE = /^\s$/u, PUNCT = /^\p{P}$/u;
+  function charClass(ch) { return SPACE.test(ch) ? 0 : PUNCT.test(ch) ? 1 : DIGIT.test(ch) ? 3 : LETTER.test(ch) ? 4 : 2; }
+  var SYMBOL_ORDER = '_-,;:!?.\'"()[]{}@*/\\&#%`^+<=>|~$';
+  var SWEDISH = { 'å': 0x7B, 'ä': 0x7C, 'ö': 0x7D };   // sorted after z
+  function collationElements(s, tail) {
+    var out = [], d = s.normalize('NFD');
+    for (var ch of d) {
+      if (MARK.test(ch)) { if (out.length) out[out.length - 1].a += ch; continue; }
+      var low = ch.toLowerCase(), cls = charClass(ch), el = { cls: cls, p: low.codePointAt(0), up: low !== ch ? 1 : 0, a: '' };
+      if (cls === 1 || cls === 2) { var rank = SYMBOL_ORDER.indexOf(ch); el.p = rank >= 0 ? rank : 1000 + el.p; }   // (punctuation and symbols in the order of the root collation, not of the code points)
+      if (cls === 3) { var last = out[out.length - 1]; if (last && last.cls === 3 && last.num !== undefined) { last.num += ch; continue; } el.num = ch; }
+      out.push(el);
+    }
+    if (tail) {   // the Nordic letters that are not "a with a mark" there
+      var comp = s.normalize('NFC'), at = 0;
+      out = []; 
+      for (var c2 of comp) {
+        var l2 = c2.toLowerCase(), t = tail[l2];
+        if (t !== undefined) { out.push({ cls: 4, p: t, up: l2 !== c2 ? 1 : 0, a: '' }); continue; }
+        var parts = collationElements(c2, null);
+        out = out.concat(parts);
+      }
+    }
+    return out;
+  }
+  function Collator(locales, options) {
+    if (!(this instanceof Collator)) return new Collator(locales, options);
+    var list = localeList(locales);
+    options = options === undefined ? {} : Object(options);
+    var locale = list[0] || 'en-US', lang = locale.split('-')[0];
+    var usage = options.usage === undefined ? 'sort' : String(options.usage);
+    if (usage !== 'sort' && usage !== 'search') throw new RangeError('Value ' + usage + ' out of range for Intl.Collator options property usage');
+    var sensitivity = options.sensitivity === undefined ? 'variant' : String(options.sensitivity);
+    if (['base', 'accent', 'case', 'variant'].indexOf(sensitivity) < 0) throw new RangeError('Value ' + sensitivity + ' out of range for Intl.Collator options property sensitivity');
+    var caseFirst = options.caseFirst === undefined ? 'false' : String(options.caseFirst);
+    if (['upper', 'lower', 'false'].indexOf(caseFirst) < 0) throw new RangeError('Value ' + caseFirst + ' out of range for Intl.Collator options property caseFirst');
+    var numericSort = options.numeric === undefined ? /-u-(?:[a-z0-9-]*-)?kn(?:-|$)(?!false)/.test(locale) : Boolean(options.numeric);
+    var ignorePunctuation = Boolean(options.ignorePunctuation);
+    var tail = lang === 'sv' || lang === 'fi' ? SWEDISH : null, cache = new Map();
+    var o = { locale: list[0] || 'en-US', usage: usage, sensitivity: sensitivity, ignorePunctuation: ignorePunctuation, collation: 'default', numeric: numericSort, caseFirst: caseFirst };
+    Object.defineProperty(this, '__o', { value: o });
+    function elements(s) {
+      var e = cache.get(s);
+      if (e === undefined) { e = collationElements(s, tail); if (ignorePunctuation) e = e.filter(function (x) { return x.cls > 1; }); if (cache.size > 500) cache.clear(); cache.set(s, e); }
+      return e;
+    }
+    var accents = sensitivity === 'accent' || sensitivity === 'variant', cases = sensitivity === 'case' || sensitivity === 'variant';
+    var compare = function (x, y) {
+      x = String(x); y = String(y);
+      var a = elements(x), b = elements(y), n = Math.min(a.length, b.length), i;
+      for (i = 0; i < n; i++) {
+        if (a[i].cls !== b[i].cls) return a[i].cls < b[i].cls ? -1 : 1;
+        if (numericSort && a[i].num !== undefined && b[i].num !== undefined) {
+          var na = a[i].num.replace(/^0+(?=.)/, ''), nb = b[i].num.replace(/^0+(?=.)/, '');
+          if (na.length !== nb.length) return na.length < nb.length ? -1 : 1;
+          if (na !== nb) return na < nb ? -1 : 1;
+          continue;
+        }
+        if (a[i].p !== b[i].p) return a[i].p < b[i].p ? -1 : 1;
+      }
+      if (a.length !== b.length) return a.length < b.length ? -1 : 1;
+      if (accents) for (i = 0; i < n; i++) if (a[i].a !== b[i].a) return a[i].a < b[i].a ? -1 : 1;
+      if (cases) for (i = 0; i < n; i++) if (a[i].up !== b[i].up) return (a[i].up < b[i].up) === (caseFirst !== 'upper') ? -1 : 1;
+      return 0;
+    };
+    Object.defineProperty(compare, 'name', { value: '' });
+    Object.defineProperty(this, 'compare', { value: compare, enumerable: false, configurable: true });
+  }
+  def(Collator.prototype, 'resolvedOptions', function () { var o = this.__o; return { locale: o.locale, usage: o.usage, sensitivity: o.sensitivity, ignorePunctuation: o.ignorePunctuation, collation: o.collation, numeric: o.numeric, caseFirst: o.caseFirst }; });
+  def(Collator, 'supportedLocalesOf', function (l) { return localeList(l); });
+  Object.defineProperty(Collator.prototype, Symbol.toStringTag, { value: 'Intl.Collator', configurable: true });
+  var defaultCollator = null;
+  def(SP, 'localeCompare', function (that, locales, options) {
+    if (this === null || this === undefined) throw new TypeError('String.prototype.localeCompare called on null or undefined');
+    var c = locales === undefined && options === undefined ? (defaultCollator || (defaultCollator = new Collator())) : new Collator(locales, options);
+    return c.compare(String(this), String(that));
+  });
+
+  // --- Segmenter: graphemes, words and sentences (the rules of UAX 29 in outline)
+  var EXTEND = /^[\p{M}‍️]$/u;
+  function isExtender(cp) { return cp === 0x200D || (cp >= 0xFE00 && cp <= 0xFE0F) || (cp >= 0x1F3FB && cp <= 0x1F3FF) || (cp >= 0xE0020 && cp <= 0xE007F) || MARK.test(String.fromCodePoint(cp)); }
+  function isPictographic(cp) {
+    return (cp >= 0x1F000 && cp <= 0x1FAFF) || (cp >= 0x2600 && cp <= 0x27BF) || (cp >= 0x2190 && cp <= 0x21FF) || (cp >= 0x2B00 && cp <= 0x2BFF) || (cp >= 0x231A && cp <= 0x23FF) || cp === 0xA9 || cp === 0xAE || cp === 0x203C || cp === 0x2049 || cp === 0x2122 || cp === 0x2139;
+  }
+  function isRegional(cp) { return cp >= 0x1F1E6 && cp <= 0x1F1FF; }
+  function graphemeSegments(s) {
+    var out = [], units = Array.from(s), i = 0, index = 0;
+    while (i < units.length) {
+      var start = i, cp = units[i].codePointAt(0);
+      i++;
+      if (cp === 13 && units[i] === '\n') i++;
+      else if (cp !== 10 && cp !== 13) {
+        if (isRegional(cp) && i < units.length && isRegional(units[i].codePointAt(0))) i++;
+        for (;;) {
+          while (i < units.length && isExtender(units[i].codePointAt(0))) {
+            var z = units[i].codePointAt(0);
+            i++;
+            if (z === 0x200D && i < units.length && isPictographic(units[i].codePointAt(0))) { i++; }
+          }
+          break;
+        }
+        if (/^[ᄀ-ᅟ]$/u.test(units[start])) while (i < units.length && /^[ᅠ-ᇿ]$/u.test(units[i])) i++;
+      }
+      var text = units.slice(start, i).join('');
+      out.push({ segment: text, index: index });
+      index += text.length;
+    }
+    return out;
+  }
+  var WORD = /^[\p{L}\p{N}_]$/u, HAN = /^[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Thai}]$/u;
+  function wordSegments(s) {
+    var out = [], g = graphemeSegments(s), i = 0;
+    while (i < g.length) {
+      var start = i, first = g[i].segment, lead = Array.from(first)[0];
+      i++;
+      var kind;
+      if (WORD.test(lead) && !HAN.test(lead)) {
+        kind = 'word';
+        while (i < g.length) {
+          var c = Array.from(g[i].segment)[0];
+          if (WORD.test(c) && !HAN.test(c)) { i++; continue; }
+          if ((c === "'" || c === '.' || c === ':' || c === String.fromCharCode(0x2019)) && i + 1 < g.length) {   // an apostrophe or a dot between letters / digits stays in the word
+            var next = Array.from(g[i + 1].segment)[0];
+            if (WORD.test(next) && !HAN.test(next) && (c !== '.' || (/\p{N}/u.test(next) && /\p{N}/u.test(Array.from(g[i - 1].segment)[0])) || /\p{L}/u.test(next) && c !== '.')) { i += 2; continue; }
+          }
+          break;
+        }
+      } else if (/^\s$/u.test(lead) && lead !== '\n' && lead !== '\r') {
+        kind = 'space';
+        while (i < g.length && /^\s$/u.test(Array.from(g[i].segment)[0]) && !/^[\n\r]/.test(g[i].segment)) i++;
+      } else if (WORD.test(lead)) kind = 'word';
+      else kind = 'other';
+      var text = g.slice(start, i).map(function (x) { return x.segment; }).join('');
+      out.push({ segment: text, index: g[start].index, isWordLike: kind === 'word' });
+    }
+    return out;
+  }
+  function sentenceSegments(s) {
+    var out = [], start = 0, i = 0;
+    while (i < s.length) {
+      var c = s.charAt(i);
+      if (c === '.' || c === '!' || c === '?' || c === String.fromCharCode(0x3002)) {
+        var j = i + 1;
+        while (j < s.length && /[.!?)"'\]]/.test(s.charAt(j))) j++;
+        if (j >= s.length) { i = j; break; }
+        if (/\s/.test(s.charAt(j))) {
+          var k = j;
+          while (k < s.length && /\s/.test(s.charAt(k))) k++;
+          var nextCh = s.charAt(k);
+          if (c !== '.' || k >= s.length || !/\p{Ll}/u.test(nextCh)) { out.push({ segment: s.slice(start, k), index: start }); start = k; i = k; continue; }
+        }
+        i = j;
+        continue;
+      }
+      if (c === '\n') { var e = i + 1; out.push({ segment: s.slice(start, e), index: start }); start = e; i = e; continue; }
+      i++;
+    }
+    if (start < s.length) out.push({ segment: s.slice(start), index: start });
+    return out;
+  }
+  function Segmenter(locales, options) {
+    if (!(this instanceof Segmenter)) throw new TypeError("Constructor Intl.Segmenter requires 'new'");
+    var list = localeList(locales);
+    options = options === undefined ? {} : Object(options);
+    var granularity = options.granularity === undefined ? 'grapheme' : String(options.granularity);
+    if (['grapheme', 'word', 'sentence'].indexOf(granularity) < 0) throw new RangeError('Value ' + granularity + ' out of range for Intl.Segmenter options property granularity');
+    Object.defineProperty(this, '__o', { value: { locale: list[0] || 'en-US', granularity: granularity } });
+  }
+  function Segments(segmenter, input) { Object.defineProperty(this, '__s', { value: segmenter }); Object.defineProperty(this, '__input', { value: input }); }
+  function segmentsOf(segments) {
+    var g = segments.__s.__o.granularity, input = segments.__input;
+    var list = g === 'word' ? wordSegments(input) : g === 'sentence' ? sentenceSegments(input) : graphemeSegments(input);
+    return list.map(function (x) { var r = { segment: x.segment, index: x.index, input: input }; if (g === 'word') r.isWordLike = x.isWordLike; return r; });
+  }
+  def(Segmenter.prototype, 'segment', function (input) { if (!this.__o) throw new TypeError('Illegal invocation'); return new Segments(this, String(input)); });
+  def(Segmenter.prototype, 'resolvedOptions', function () { return { locale: this.__o.locale, granularity: this.__o.granularity }; });
+  def(Segmenter, 'supportedLocalesOf', function (l) { return localeList(l); });
+  Object.defineProperty(Segmenter.prototype, Symbol.toStringTag, { value: 'Intl.Segmenter', configurable: true });
+  def(Segments.prototype, 'containing', function (index) {
+    index = Number(index); index = index !== index ? 0 : Math.trunc(index);
+    var list = segmentsOf(this);
+    if (index < 0 || index >= this.__input.length) return undefined;
+    for (var i = 0; i < list.length; i++) if (index >= list[i].index && index < list[i].index + list[i].segment.length) return list[i];
+    return undefined;
+  });
+  def(Segments.prototype, Symbol.iterator, function () {
+    var list = segmentsOf(this), at = 0;
+    var it = { next: function () { return at < list.length ? { value: list[at++], done: false } : { value: undefined, done: true }; } };
+    it[Symbol.iterator] = function () { return this; };
+    Object.defineProperty(it, Symbol.toStringTag, { value: 'Segmenter String Iterator', configurable: true });
+    return it;
+  });
+
+  // --- DisplayNames (English names; other locales get the English ones)
+  var REGIONS = { US: 'United States', GB: 'United Kingdom', CA: 'Canada', AU: 'Australia', NZ: 'New Zealand', IE: 'Ireland', DE: 'Germany', FR: 'France', ES: 'Spain', IT: 'Italy', PT: 'Portugal', NL: 'Netherlands', BE: 'Belgium', CH: 'Switzerland',
+    AT: 'Austria', SE: 'Sweden', NO: 'Norway', DK: 'Denmark', FI: 'Finland', IS: 'Iceland', PL: 'Poland', CZ: 'Czechia', SK: 'Slovakia', HU: 'Hungary', RO: 'Romania', BG: 'Bulgaria', GR: 'Greece', TR: 'Türkiye', RU: 'Russia', UA: 'Ukraine',
+    BY: 'Belarus', RS: 'Serbia', HR: 'Croatia', SI: 'Slovenia', BA: 'Bosnia & Herzegovina', LT: 'Lithuania', LV: 'Latvia', EE: 'Estonia', CN: 'China', JP: 'Japan', KR: 'South Korea', KP: 'North Korea', TW: 'Taiwan', HK: 'Hong Kong SAR China',
+    IN: 'India', PK: 'Pakistan', BD: 'Bangladesh', LK: 'Sri Lanka', NP: 'Nepal', TH: 'Thailand', VN: 'Vietnam', ID: 'Indonesia', MY: 'Malaysia', SG: 'Singapore', PH: 'Philippines', IL: 'Israel', SA: 'Saudi Arabia', AE: 'United Arab Emirates',
+    EG: 'Egypt', IR: 'Iran', IQ: 'Iraq', JO: 'Jordan', LB: 'Lebanon', QA: 'Qatar', KW: 'Kuwait', MA: 'Morocco', DZ: 'Algeria', TN: 'Tunisia', NG: 'Nigeria', KE: 'Kenya', ET: 'Ethiopia', GH: 'Ghana', ZA: 'South Africa', TZ: 'Tanzania',
+    UG: 'Uganda', MX: 'Mexico', BR: 'Brazil', AR: 'Argentina', CL: 'Chile', CO: 'Colombia', PE: 'Peru', VE: 'Venezuela', EC: 'Ecuador', UY: 'Uruguay', PY: 'Paraguay', BO: 'Bolivia', CU: 'Cuba', DO: 'Dominican Republic', JM: 'Jamaica',
+    PR: 'Puerto Rico', CR: 'Costa Rica', PA: 'Panama', GT: 'Guatemala', KZ: 'Kazakhstan', UZ: 'Uzbekistan', AF: 'Afghanistan', MM: 'Myanmar (Burma)', KH: 'Cambodia', LA: 'Laos', MN: 'Mongolia', LU: 'Luxembourg', MT: 'Malta', CY: 'Cyprus',
+    ZZ: 'Unknown Region', EU: 'European Union', UN: 'United Nations', '001': 'world', '419': 'Latin America', '150': 'Europe' };
+  var LANGUAGES = { en: 'English', fr: 'French', de: 'German', es: 'Spanish', it: 'Italian', pt: 'Portuguese', nl: 'Dutch', sv: 'Swedish', da: 'Danish', nb: 'Norwegian Bokmål', no: 'Norwegian', nn: 'Norwegian Nynorsk', fi: 'Finnish',
+    is: 'Icelandic', pl: 'Polish', cs: 'Czech', sk: 'Slovak', hu: 'Hungarian', ro: 'Romanian', bg: 'Bulgarian', el: 'Greek', tr: 'Turkish', ru: 'Russian', uk: 'Ukrainian', be: 'Belarusian', sr: 'Serbian', hr: 'Croatian', sl: 'Slovenian',
+    lt: 'Lithuanian', lv: 'Latvian', et: 'Estonian', zh: 'Chinese', ja: 'Japanese', ko: 'Korean', hi: 'Hindi', bn: 'Bangla', ur: 'Urdu', ta: 'Tamil', te: 'Telugu', mr: 'Marathi', th: 'Thai', vi: 'Vietnamese', id: 'Indonesian', ms: 'Malay',
+    fil: 'Filipino', he: 'Hebrew', ar: 'Arabic', fa: 'Persian', sw: 'Swahili', af: 'Afrikaans', zu: 'Zulu', ca: 'Catalan', eu: 'Basque', gl: 'Galician', cy: 'Welsh', ga: 'Irish', la: 'Latin', eo: 'Esperanto', mn: 'Mongolian', ne: 'Nepali', yi: 'Yiddish' };
+  var SCRIPTS = { Latn: 'Latin', Cyrl: 'Cyrillic', Grek: 'Greek', Arab: 'Arabic', Hebr: 'Hebrew', Deva: 'Devanagari', Hans: 'Simplified Han', Hant: 'Traditional Han', Hani: 'Han', Hira: 'Hiragana', Kana: 'Katakana', Jpan: 'Japanese',
+    Kore: 'Korean', Hang: 'Hangul', Thai: 'Thai', Beng: 'Bangla', Taml: 'Tamil', Telu: 'Telugu', Armn: 'Armenian', Geor: 'Georgian', Ethi: 'Ethiopic', Khmr: 'Khmer', Mong: 'Mongolian', Tibt: 'Tibetan', Zyyy: 'Common', Zzzz: 'Unknown Script' };
+  var CURRENCIES = { USD: 'US Dollar', EUR: 'Euro', GBP: 'British Pound', JPY: 'Japanese Yen', CNY: 'Chinese Yuan', INR: 'Indian Rupee', CAD: 'Canadian Dollar', AUD: 'Australian Dollar', CHF: 'Swiss Franc', SEK: 'Swedish Krona',
+    NOK: 'Norwegian Krone', DKK: 'Danish Krone', PLN: 'Polish Zloty', CZK: 'Czech Koruna', HUF: 'Hungarian Forint', RUB: 'Russian Ruble', UAH: 'Ukrainian Hryvnia', TRY: 'Turkish Lira', BRL: 'Brazilian Real', MXN: 'Mexican Peso',
+    ARS: 'Argentine Peso', CLP: 'Chilean Peso', COP: 'Colombian Peso', KRW: 'South Korean Won', HKD: 'Hong Kong Dollar', SGD: 'Singapore Dollar', NZD: 'New Zealand Dollar', ZAR: 'South African Rand', ILS: 'Israeli New Shekel',
+    AED: 'United Arab Emirates Dirham', SAR: 'Saudi Riyal', EGP: 'Egyptian Pound', THB: 'Thai Baht', IDR: 'Indonesian Rupiah', MYR: 'Malaysian Ringgit', PHP: 'Philippine Peso', VND: 'Vietnamese Dong', BTC: 'BTC' };
+  var CALENDARS = { gregory: 'Gregorian Calendar', buddhist: 'Buddhist Calendar', chinese: 'Chinese Calendar', hebrew: 'Hebrew Calendar', islamic: 'Islamic Calendar', japanese: 'Japanese Calendar', persian: 'Persian Calendar', iso8601: 'ISO-8601 Calendar' };
+  var FIELDS = { era: 'era', year: 'year', quarter: 'quarter', month: 'month', weekOfYear: 'week', weekday: 'day of the week', day: 'day', dayPeriod: 'AM/PM', hour: 'hour', minute: 'minute', second: 'second', timeZoneName: 'time zone' };
+  function DisplayNames(locales, options) {
+    if (!(this instanceof DisplayNames)) throw new TypeError("Constructor Intl.DisplayNames requires 'new'");
+    var list = localeList(locales);
+    if (options === undefined) throw new TypeError('Required option "type" is missing');
+    options = Object(options);
+    var type = options.type === undefined ? undefined : String(options.type);
+    if (type === undefined) throw new TypeError('Required option "type" is missing');
+    if (['language', 'region', 'script', 'currency', 'calendar', 'dateTimeField'].indexOf(type) < 0) throw new RangeError('Value ' + type + ' out of range for Intl.DisplayNames options property type');
+    var style = options.style === undefined ? 'long' : String(options.style), fallback = options.fallback === undefined ? 'code' : String(options.fallback), dialect = options.languageDisplay === undefined ? 'dialect' : String(options.languageDisplay);
+    if (['narrow', 'short', 'long'].indexOf(style) < 0) throw new RangeError('Value ' + style + ' out of range for Intl.DisplayNames options property style');
+    if (['code', 'none'].indexOf(fallback) < 0) throw new RangeError('Value ' + fallback + ' out of range for Intl.DisplayNames options property fallback');
+    if (['dialect', 'standard'].indexOf(dialect) < 0) throw new RangeError('Value ' + dialect + ' out of range for Intl.DisplayNames options property languageDisplay');
+    Object.defineProperty(this, '__o', { value: { locale: list[0] || 'en-US', style: style, type: type, fallback: fallback, languageDisplay: dialect } });
+  }
+  var DIALECTS = { 'en-US': 'American English', 'en-GB': 'British English', 'en-AU': 'Australian English', 'en-CA': 'Canadian English', 'fr-CA': 'Canadian French', 'fr-CH': 'Swiss French', 'es-419': 'Latin American Spanish',
+    'es-ES': 'European Spanish', 'es-MX': 'Mexican Spanish', 'pt-BR': 'Brazilian Portuguese', 'pt-PT': 'European Portuguese', 'de-AT': 'Austrian German', 'de-CH': 'Swiss High German', 'nl-BE': 'Flemish', 'zh-Hans': 'Simplified Chinese', 'zh-Hant': 'Traditional Chinese' };
+  def(DisplayNames.prototype, 'of', function (code) {
+    var o = this.__o;
+    if (!o) throw new TypeError('Illegal invocation');
+    code = String(code);
+    var result;
+    switch (o.type) {
+      case 'region':
+        if (!/^([a-z]{2}|[0-9]{3})$/i.test(code)) throw new RangeError('Invalid argument: ' + code);
+        code = code.toUpperCase(); result = REGIONS[code]; break;
+      case 'script':
+        if (!/^[a-z]{4}$/i.test(code)) throw new RangeError('Invalid argument: ' + code);
+        code = title(code); result = SCRIPTS[code]; break;
+      case 'currency':
+        if (!/^[a-z]{3}$/i.test(code)) throw new RangeError('Invalid argument: ' + code);
+        code = code.toUpperCase(); result = CURRENCIES[code]; break;
+      case 'calendar':
+        if (!/^[a-z0-9]{3,8}(-[a-z0-9]{3,8})*$/i.test(code)) throw new RangeError('Invalid argument: ' + code);
+        code = code.toLowerCase(); result = CALENDARS[code]; break;
+      case 'dateTimeField':
+        if (!Object.prototype.hasOwnProperty.call(FIELDS, code)) throw new RangeError('Invalid argument: ' + code);
+        result = FIELDS[code]; break;
+      default: {   // language: language[-script][-region]
+        var p = parseTag(code);
+        code = canonicalTag(code);
+        var dialectName = o.languageDisplay === 'dialect' ? DIALECTS[code] || DIALECTS[p.language + '-' + p.region] : undefined;
+        if (dialectName && !p.script !== !!DIALECTS[code]) { }
+        if (dialectName) { result = dialectName; break; }
+        var base = LANGUAGES[p.language];
+        if (base) {
+          var extra = [];
+          if (p.script && SCRIPTS[p.script]) extra.push(SCRIPTS[p.script]);
+          if (p.region && REGIONS[p.region]) extra.push(REGIONS[p.region]);
+          result = extra.length ? base + ' (' + extra.join(', ') + ')' : base;
+        }
+      }
+    }
+    if (result !== undefined) return result;
+    return o.fallback === 'code' ? code : undefined;
+  });
+  def(DisplayNames.prototype, 'resolvedOptions', function () { var o = this.__o; var r = { locale: o.locale, style: o.style, type: o.type, fallback: o.fallback }; if (o.type === 'language') r.languageDisplay = o.languageDisplay; return r; });
+  def(DisplayNames, 'supportedLocalesOf', function (l) { return localeList(l); });
+  Object.defineProperty(DisplayNames.prototype, Symbol.toStringTag, { value: 'Intl.DisplayNames', configurable: true });
   var Intl = {};
   def(Intl, 'DateTimeFormat', DateTimeFormat); def(Intl, 'NumberFormat', NumberFormat); def(Intl, 'PluralRules', PluralRules); def(Intl, 'Collator', Collator);
-  def(Intl, 'RelativeTimeFormat', RelativeTimeFormat); def(Intl, 'ListFormat', ListFormat);
-  def(Intl, 'getCanonicalLocales', function (l) { return Array.isArray(l) ? l.slice() : l ? [l] : []; });
+  def(Intl, 'RelativeTimeFormat', RelativeTimeFormat); def(Intl, 'ListFormat', ListFormat); def(Intl, 'Locale', Locale); def(Intl, 'Segmenter', Segmenter); def(Intl, 'DisplayNames', DisplayNames);
+  Object.defineProperty(Intl, Symbol.toStringTag, { value: 'Intl', configurable: true });
+  def(Intl, 'getCanonicalLocales', function (l) { return localeList(l); });
   def(Intl, 'supportedValuesOf', function () { return []; });
   def(g, 'Intl', Intl);
 
@@ -982,6 +1378,31 @@ const char kStdlib[] = R"JSLIB((function (g) {
     };
     wrapped['@@asyncIterator'] = function () { return this; };
     return wrapped;
+  });
+  // Array.fromAsync: Array.from for async iterables (and iterables of promises, and array-likes): each element and each mapped value is awaited
+  def(Array, 'fromAsync', function fromAsync(items, mapfn, thisArg) {
+    if (new.target !== undefined) throw new TypeError('Array.fromAsync is not a constructor');
+    return (async function () {
+      if (mapfn !== undefined && typeof mapfn !== 'function') throw new TypeError(String(mapfn) + ' is not a function');
+      var out = [], index = 0;
+      var add = async function (value) { out.push(mapfn ? await mapfn.call(thisArg, value, index) : value); index++; };
+      if (items === null || items === undefined) throw new TypeError(String(items) + ' is not iterable');
+      if (typeof items[Symbol.asyncIterator] === 'function') { for await (var a of items) await add(a); }
+      else if (typeof items[Symbol.iterator] === 'function') { for (var v of items) await add(await v); }
+      else { var length = Number(items.length) || 0; for (var i = 0; i < length; i++) await add(await items[i]); }
+      return out;
+    }());
+  });
+  Object.defineProperty(Array.fromAsync, 'length', { value: 1 });
+  // the value properties of the global object cannot be changed, and neither can the prototype of a built-in constructor
+  ['NaN', 'Infinity', 'undefined'].forEach(function (n) {
+    var value = n === 'NaN' ? NaN : n === 'Infinity' ? Infinity : undefined;
+    Object.defineProperty(g, n, { value: value, writable: false, enumerable: false, configurable: false });
+  });
+  ['Object', 'Function', 'Array', 'String', 'Number', 'Boolean', 'Symbol', 'BigInt', 'Date', 'RegExp', 'Map', 'Set', 'WeakMap', 'WeakSet', 'WeakRef', 'Promise', 'Error', 'TypeError', 'RangeError', 'SyntaxError', 'ReferenceError',
+   'EvalError', 'URIError', 'ArrayBuffer', 'DataView', 'Int8Array', 'Uint8Array', 'Uint8ClampedArray', 'Int16Array', 'Uint16Array', 'Int32Array', 'Uint32Array', 'Float32Array', 'Float64Array'].forEach(function (n) {
+    var C = g[n];
+    if (typeof C === 'function' && C.prototype !== undefined) { try { Object.defineProperty(C, 'prototype', { writable: false, enumerable: false, configurable: false }); } catch (e) { } }
   });
 }(this));
 )JSLIB";

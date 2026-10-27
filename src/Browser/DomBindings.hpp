@@ -119,6 +119,8 @@ class IDomHost {
   virtual void fullscreen_exit() {}
   // The style of an element as it is drawn now (false if the page cannot say).
   virtual bool computed_style(const dom::Node* element, Style* out) = 0;
+  // The style of a pseudo-element (::before, ::after) of an element, as the rules for it give it (false if the page cannot say).
+  virtual bool computed_pseudo_style(const dom::Node* element, PseudoElement pseudo, Style* out) { (void)element; (void)pseudo; (void)out; return false; }
   // The style sheet that computed_style() worked against: what the TextRefs of a Style point into, and the readers for list valued properties (font-family,
   // box-shadow, transform ...). nullptr if the host has none.
   virtual const StyleSheet* computed_style_sheet() { return nullptr; }

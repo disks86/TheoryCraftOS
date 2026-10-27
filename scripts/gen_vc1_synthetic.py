@@ -93,7 +93,7 @@ class Enc:
         self.w, self.h = width, height
         self.mbw, self.mbh = (width + 15) // 16, (height + 15) // 16
         f = dict(loop_filter=0, multires=0, fastuvmc=1, extended_mv=0, dquant=0, vstransform=0, overlap=0, rangered=0, max_b_frames=0, quantizer=0, finterp=0,
-                 postproc=0, broadcast=0, tfcntr=0, hrd=0, resync=0, no_ic=0)
+                 postproc=0, broadcast=0, tfcntr=0, hrd=0, resync=0, no_ic=0, interlace=0, psf=0, extended_dmv=0)
         f.update(flags)
         self.f = f
         self.rnd = 0
@@ -117,7 +117,7 @@ class Enc:
         b.put(3, 2); b.put(self.rng.randint(0, 4), 3); b.put(1, 2)
         b.put(self.rng.randint(0, 7), 3); b.put(self.rng.randint(0, 31), 5); b.put(f['postproc'], 1)
         b.put((self.w >> 1) - 1, 12); b.put((self.h >> 1) - 1, 12)
-        b.put(f['broadcast'], 1); b.put(0, 1); b.put(f['tfcntr'], 1); b.put(f['finterp'], 1); b.put(0, 1); b.put(0, 1)
+        b.put(f['broadcast'], 1); b.put(f['interlace'], 1); b.put(f['tfcntr'], 1); b.put(f['finterp'], 1); b.put(0, 1); b.put(f['psf'], 1)
         b.put(0, 1)   # display extended info
         b.put(f['hrd'], 1)
         if f['hrd']:
@@ -139,7 +139,7 @@ class Enc:
         if size_override:
             b.put((self.w >> 1) - 1, 12); b.put((self.h >> 1) - 1, 12)
         if f['extended_mv']:
-            b.put(0, 1)
+            b.put(f['extended_dmv'], 1)
         b.put(0, 1); b.put(0, 1)
         return b.data(stop_bit=True)
 
@@ -361,6 +361,8 @@ class Enc:
             u = {'P': 0, 'B': 1, 'I': 2, 'BI': 3}[t]
             if p['skipped']:
                 u = 4
+            if f['interlace']:
+                b.put(0, 1)   # FCM: a progressive frame in an interlaced sequence
             # unary with stop bit 0, length at most 4
             for _ in range(u):
                 b.put(1, 1)
@@ -374,6 +376,8 @@ class Enc:
                 return
             p['rnd'] = r.randint(0, 1)
             b.put(p['rnd'], 1)
+            if f['interlace']:
+                b.put(r.randint(0, 1), 1)   # UVSAMP
             if f['finterp']:
                 b.put(p['interpfrm'], 1)
             if t == 'BI':   # (the picture type already says it; no BFRACTION)
@@ -411,6 +415,12 @@ class Enc:
                     for _ in range(p['mvrange']):
                         b.put(1, 1)
                     if p['mvrange'] < 3:
+                        b.put(0, 1)
+                if f['interlace'] and f['extended_dmv']:   # DMVRANGE (unused by progressive frames, but there)
+                    dmv = r.randint(0, 3)
+                    for _ in range(dmv):
+                        b.put(1, 1)
+                    if dmv < 3:
                         b.put(0, 1)
             lowquant = 0 if p['pq'] > 12 else 1
             mode_idx = p['mvmode_idx'] = r.randint(0, 3 if f.get('no_ic') else 4)
@@ -1108,11 +1118,19 @@ def selftest_streams():
         if i == 0:
             u += b'\x00\x00\x01\x0f' + escape_bytes(enc_a.adv_sequence()) + b'\x00\x00\x01\x0e' + escape_bytes(enc_a.adv_entry_point())
         units.append(u + b'\x00\x00\x01\x0d' + escape_bytes(data))
-    return enc_m.struct_c(), [d for d, _ in frames_m], units
+    # The third stream: Advanced profile in an interlaced sequence (the frames are progressive; FFmpeg has no interlaced VC-1 encoder or reference for a stream made here).
+    enc_i, frames_i = stream_pattern(43, 3, 64, 64, 8, **dict(pattern='IPBBPBBP', interlace=1, broadcast=1, loop_filter=1, overlap=1, vstransform=1, no_ic=1))
+    units_i = []
+    for i, (data, key) in enumerate(frames_i):
+        u = b''
+        if i == 0:
+            u += b'\x00\x00\x01\x0f' + escape_bytes(enc_i.adv_sequence()) + b'\x00\x00\x01\x0e' + escape_bytes(enc_i.adv_entry_point())
+        units_i.append(u + b'\x00\x00\x01\x0d' + escape_bytes(data))
+    return enc_m.struct_c(), [d for d, _ in frames_m], units, units_i
 
 
 def write_selftest(path):
-    config, main, adv = selftest_streams()
+    config, main, adv, interlaced = selftest_streams()
 
     def array(name, data, ctype='uint8_t'):
         rows = ['    ' + ', '.join('0x%02X' % b for b in data[j:j + 24]) + ',' for j in range(0, len(data), 24)]
@@ -1135,6 +1153,9 @@ def write_selftest(path):
     text += array('kVc1SelfTestMainStream', b''.join(main))
     text += ends('kVc1SelfTestAdvancedEnds', adv)
     text += array('kVc1SelfTestAdvancedStream', b''.join(adv))
+    text += '// The same pattern in an interlaced sequence (progressive frames).\n'
+    text += ends('kVc1SelfTestInterlacedEnds', interlaced)
+    text += array('kVc1SelfTestInterlacedStream', b''.join(interlaced))
     open(path, 'w').write(text)
 
 
@@ -1177,6 +1198,10 @@ STREAMS = {
     'adv_ipb': (18, 3, 112, 80, 10, dict(pattern='IPBBPBXB', loop_filter=1, overlap=1, dquant=1, extended_mv=1, vstransform=1, finterp=1)),
     'adv_ipp_odd': (19, 3, 90, 54, 8, dict(pattern='IPPBPP', loop_filter=1, overlap=1, quantizer=1, postproc=1, broadcast=1, tfcntr=1)),
     'adv_skip': (22, 3, 80, 48, 10, dict(pattern='IPSPPSSP', extended_mv=1, loop_filter=1, overlap=1, broadcast=1)),
+    # Advanced profile in an interlaced sequence, every frame progressive (the frame coding mode is there, and the pulldown bits are TFF and RFF; FFmpeg has no progressive segmented frame mode, so psf stays 0)
+    'adv_il_ipb': (31, 3, 96, 64, 10, dict(pattern='IPBBPBXB', interlace=1, loop_filter=1, overlap=1, dquant=1, extended_mv=1, vstransform=1, finterp=1, broadcast=1, tfcntr=1)),
+    'adv_il_ipp': (32, 3, 90, 54, 8, dict(pattern='IPPBPP', interlace=1, loop_filter=1, overlap=1, quantizer=1, postproc=1, broadcast=1, extended_mv=1, extended_dmv=1)),
+    'adv_il_skip': (33, 3, 80, 48, 10, dict(pattern='IPSPPSSP', interlace=1, extended_mv=1, loop_filter=1, overlap=1)),
 }
 BUILDERS = {name: (stream_pattern if 'pattern' in STREAMS[name][5] else stream_i_only) for name in STREAMS}
 

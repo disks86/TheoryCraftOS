@@ -21,3 +21,9 @@
 // Runs two tiny Linux programs in ring 3 (see UserModeDemo.cpp): one that writes to the console, maps memory and exits with a code, one that touches an
 // unmapped address. Checks the output, the exit codes and that the kernel survives the fault. Returns false if any check failed.
 bool run_usermode_demo(allocators::IAllocator& allocator);
+
+// Runs one Windows program (TCOS_WINE_TEST_PROGRAM), the way the shell starts it, and prints its output and exit code. Unlike run_usermode_demo(), the
+// caller decides when: running a PE program corrupts firmware's own state in a way that later crashes a Boot Services call (see the project's
+// "usermode-windows" memory for the investigation), so this must run after all hardware bring-up - in particular after every detach_firmware_drivers()
+// caller (network and storage device init) - not before it, the way the full demo does.
+bool run_wine_test_program(allocators::IAllocator& allocator);
