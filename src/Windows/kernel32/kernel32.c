@@ -2523,20 +2523,6 @@ typedef struct _OFSTRUCT { BYTE cBytes, fFixedDisk; WORD nErrCode, Reserved1, Re
 #define OF_READWRITE_ 2
 #define OF_CREATE_ 0x1000
 #define OF_EXIST_ 0x4000
-EXPORT HFILE WINAPI OpenFile(LPCSTR path, LPOFSTRUCT reopen, UINT style) {
-  if (reopen) {
-    memset(reopen, 0, sizeof(*reopen));
-    reopen->cBytes = sizeof(*reopen);
-    size_t_ i = 0;
-    for (; path[i] && i + 1 < sizeof(reopen->szPathName); ++i) reopen->szPathName[i] = path[i];
-  }
-  const DWORD access = (style & 3) == OF_WRITE_ ? GENERIC_WRITE : (style & 3) == OF_READWRITE_ ? GENERIC_READ | GENERIC_WRITE : GENERIC_READ;
-  const DWORD disposition = (style & OF_CREATE_) ? CREATE_ALWAYS : OPEN_EXISTING;
-  HANDLE h = CreateFileA(path, (style & OF_EXIST_) ? 0 : access, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, disposition, 0, NULL);
-  if (h == INVALID_HANDLE_VALUE) { if (reopen) reopen->nErrCode = (WORD)GetLastError(); return (HFILE)-1; }
-  if (style & OF_EXIST_) { CloseHandle(h); return 0; }
-  return (HFILE)(ULONG_PTR)h;
-}
 /* Beep: this OS has no PC speaker driver, so there is nothing to make a sound with; succeeding (not failing outright) matches how real Windows behaves when the
  * speaker driver isn't present either. CancelIo/CancelIoEx/CancelSynchronousIo: every I/O call here is already done by the time it returns (there is no real
  * asynchronous I/O to cancel), so there is never anything pending to find. */
@@ -3019,58 +3005,6 @@ static const char *error_text(DWORD error) {
     default: return NULL;
   }
 }
-#define FORMAT_MESSAGE_ALLOCATE_BUFFER 0x100
-#define FORMAT_MESSAGE_IGNORE_INSERTS 0x200
-#define FORMAT_MESSAGE_FROM_SYSTEM 0x1000
-EXPORT DWORD WINAPI FormatMessageA(DWORD flags, LPCVOID source, DWORD id, DWORD language, LPSTR buffer, DWORD capacity, PVOID arguments) {
-  (void)source; (void)language; (void)arguments;
-  if (!(flags & FORMAT_MESSAGE_FROM_SYSTEM)) { set_error(ERROR_INVALID_PARAMETER); return 0; }
-  char fallback[40];
-  const char *text = error_text(id);
-  if (!text) {
-    const char *prefix = "Error ";
-    size_t_ n = 0;
-    while (prefix[n]) { fallback[n] = prefix[n]; ++n; }
-    char digits[12];
-    int d = 0;
-    DWORD v = id;
-    do { digits[d++] = (char)('0' + v % 10); v /= 10; } while (v);
-    while (d) fallback[n++] = digits[--d];
-    fallback[n++] = '.';
-    fallback[n] = 0;
-    text = fallback;
-  }
-  const DWORD length = (DWORD)strlen(text);
-  if (flags & FORMAT_MESSAGE_ALLOCATE_BUFFER) {
-    char *allocated = RtlAllocateHeap(heap(), 0, length + 3);
-    if (!allocated) { set_error(ERROR_NOT_ENOUGH_MEMORY); return 0; }
-    memcpy(allocated, text, length);
-    allocated[length] = '\r'; allocated[length + 1] = '\n'; allocated[length + 2] = 0;
-    *(char **)buffer = allocated;
-    return length + 2;
-  }
-  if (length + 3 > capacity) { set_error(ERROR_INSUFFICIENT_BUFFER); return 0; }
-  memcpy(buffer, text, length);
-  buffer[length] = '\r'; buffer[length + 1] = '\n'; buffer[length + 2] = 0;
-  return length + 2;
-}
-EXPORT DWORD WINAPI FormatMessageW(DWORD flags, LPCVOID source, DWORD id, DWORD language, LPWSTR buffer, DWORD capacity, PVOID arguments) {
-  char narrow[256];
-  const DWORD n = FormatMessageA(flags & ~FORMAT_MESSAGE_ALLOCATE_BUFFER, source, id, language, narrow, sizeof(narrow), arguments);
-  if (n == 0) return 0;
-  const int units = MultiByteToWideChar(CP_UTF8, 0, narrow, (int)n + 1, NULL, 0);
-  if (flags & FORMAT_MESSAGE_ALLOCATE_BUFFER) {
-    WCHAR *allocated = RtlAllocateHeap(heap(), 0, (SIZE_T)units * 2);
-    if (!allocated) return 0;
-    MultiByteToWideChar(CP_UTF8, 0, narrow, (int)n + 1, allocated, units);
-    *(WCHAR **)buffer = allocated;
-    return n;
-  }
-  if ((DWORD)units > capacity) { set_error(ERROR_INSUFFICIENT_BUFFER); return 0; }
-  MultiByteToWideChar(CP_UTF8, 0, narrow, (int)n + 1, buffer, (int)capacity);
-  return n;
-}
-
 /* ---- start ------------------------------------------------------------------------------------------------------------------------------------------------ */
 
 EXPORT BOOL WINAPI DllMain(HANDLE module, DWORD reason, PVOID reserved) {
@@ -3081,3 +3015,5 @@ EXPORT BOOL WINAPI DllMain(HANDLE module, DWORD reason, PVOID reserved) {
 #include "extra.inc"
 #include "extra2.inc"
 #include "extra3.inc"
+#include "legacy.inc"
+#include "fmtmsg.inc"

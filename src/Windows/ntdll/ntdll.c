@@ -255,7 +255,18 @@ EXPORT PEB *NTAPI RtlGetCurrentPeb(void) { return NtCurrentPeb(); }
 EXPORT ULONG NTAPI RtlGetLastWin32Error(void) { return TEB_LAST_ERROR(NtCurrentTeb()); }
 EXPORT void NTAPI RtlSetLastWin32Error(ULONG error) { TEB_LAST_ERROR(NtCurrentTeb()) = error; }
 
+#include "status.inc"
 EXPORT ULONG NTAPI RtlNtStatusToDosError(NTSTATUS status) {
+  {      /* the documented table (binary search), then the codes this OS gives its own meaning */
+    ULONG lo = 0, hi = sizeof(status_table) / sizeof(status_table[0]);
+    while (lo < hi) {
+      const ULONG mid = (lo + hi) / 2;
+      if (status_table[mid].status == (ULONG)status) return status_table[mid].error;
+      if (status_table[mid].status < (ULONG)status) lo = mid + 1; else hi = mid;
+    }
+  }
+  if (((ULONG)status >> 16) == 0x8007u || ((ULONG)status >> 16) == 0xC007u) return (ULONG)status & 0xFFFFu;      /* an HRESULT_FROM_WIN32 / NT_FACILITY_WIN32 code */
+  if ((ULONG)status & 0x20000000u) return (ULONG)status;      /* a customer code */
   switch ((ULONG)status) {
     case 0: return ERROR_SUCCESS;
     case 0x80000005u: return ERROR_MORE_DATA;
@@ -765,6 +776,10 @@ static PVOID process_heap(void) {
   return peb->ProcessHeap;
 }
 EXPORT PVOID NTAPI RtlProcessHeap(void) { return process_heap(); }
+
+#include "rtl.inc"
+#include "libc.inc"
+#include "rtl2.inc"
 
 /* ---- critical sections (one thread: they only count) ---------------------------------------------------------------------------------------------------- */
 
