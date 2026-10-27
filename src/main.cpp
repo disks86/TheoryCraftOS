@@ -72,6 +72,9 @@
 #ifdef TCOS_AMD_VEGAM
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdVegaM.hpp"
 #include "Hardware/VideoCodec/AMD/AmdGmc8Memory.hpp"
+#include "Hardware/Bus/Pci/PciMsi.hpp"
+#include "Kernel/Apic.hpp"
+#include "Kernel/Interrupts.hpp"
 #endif
 #include "Media/MediaCodecs.hpp"
 #include "Hardware/Guest/SystemGuestServices.hpp"
@@ -143,6 +146,16 @@ static void demo_task(void* context) {
 
 using bootlog::Entry;
 using bootlog::Level;
+
+#ifdef TCOS_AMD_VEGAM
+// The Radeon RX Vega M's MSI: counts the interrupts; the desktop loop then reads the card's interrupt ring (no register is touched here).
+static uint32_t g_vega_interrupts = 0;
+static kernel::Frame* on_vega_interrupt(kernel::Frame* frame, void*) {
+  kernel::apic::eoi();
+  __atomic_fetch_add(&g_vega_interrupts, 1, __ATOMIC_ACQ_REL);
+  return frame;
+}
+#endif
 
 // Waits up to `microseconds` for a key press (any keyboard we have, else the firmware's input).
 static void wait_for_key(efi::SystemTable* st, hardware::SystemInput& input, uint64_t microseconds) {
@@ -609,6 +622,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   hardware::SystemVideoCodecs video_codecs(pci, shared_allocator);
 #ifdef TCOS_AMD_VEGAM
   UniquePointer<hardware::AmdVegaM> vega_m;   // the Radeon RX Vega M's memory controller, engines and display (opt-in, below)
+  UniquePointer<hardware::PciMsi> vega_msi;   // its MSI, when the machine delivers it
+  bool vega_msi_working = false;              // the interrupt arrived in the self-test: the desktop loop looks at the ring only when one comes
 #endif
 #ifdef TCOS_AMD_UVD
   video_codecs.set_amd_uvd6(true);   // the Radeon RX Vega M's UVD 6 engine (opt-in: it has not run on a real card)
@@ -1037,9 +1052,37 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         inputs.aperture_bytes = aperture_bytes;
         inputs.doorbells = doorbells;
         inputs.max_framebuffer_bytes = largest;
+        // MSI first, as the driver does (the interrupt ring is told it is on): the handler, then the message, to the core that runs this.
+        const uint32_t apic_id = kernel::running() ? kernel::apic::this_apic_id() : 0xFFFF;
+        if (apic_id <= 0xFF) {
+          kernel::set_interrupt_handler(kernel::kVectorAmdVegaM, &on_vega_interrupt, nullptr);
+          vega_msi = UniquePointer<hardware::PciMsi>::make(shared_allocator, pci);
+          if (vega_msi && vega_msi->enable(d.address, 0xFEE00000u | (apic_id << 12), kernel::kVectorAmdVegaM)) {
+            inputs.msi = true;
+          } else {
+            vega_msi = UniquePointer<hardware::PciMsi>();
+            kernel::set_interrupt_handler(kernel::kVectorAmdVegaM, nullptr, nullptr);
+          }
+        }
         const bool up = vega_m->bring_up(inputs);
         Entry(up ? Level::Ok : Level::Warning, "Vega M").text(up ? "started: " : "not started - ").text(vega_m->status());
+        if (up && vega_msi) {
+          // Try it out, as virtio-gpu does: a copy through the SDMA engine ends with a trap, which must come back as an interrupt. If it does not, polling stays.
+          const uint32_t before = __atomic_load_n(&g_vega_interrupts, __ATOMIC_ACQUIRE);
+          const uint8_t probe[16] = {};
+          vega_m->upload(ConstByteView(probe, sizeof(probe)), 0);
+          for (int wait = 0; wait < 50 && __atomic_load_n(&g_vega_interrupts, __ATOMIC_ACQUIRE) == before; ++wait) hardware::delay_us(100);
+          vega_msi_working = __atomic_load_n(&g_vega_interrupts, __ATOMIC_ACQUIRE) != before;
+          vega_m->service_interrupts();
+          Entry(vega_msi_working ? Level::Ok : Level::Warning, "Vega M").text(vega_msi_working ? "interrupts: MSI wakes the CPU" : "interrupts: MSI did not arrive; the interrupt ring is polled");
+          if (!vega_msi_working) {
+            vega_msi = UniquePointer<hardware::PciMsi>();
+            kernel::set_interrupt_handler(kernel::kVectorAmdVegaM, nullptr, nullptr);
+          }
+        }
         if (!up) {
+          vega_msi = UniquePointer<hardware::PciMsi>();
+          kernel::set_interrupt_handler(kernel::kVectorAmdVegaM, nullptr, nullptr);
           vega_m = UniquePointer<hardware::AmdVegaM>();
         } else if (drives_display) {
           display->set_native_display(vega_m.get());
@@ -1203,7 +1246,15 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       if (hyperv.take_shutdown_request(&hyperv_restart)) desktop.request_shutdown();   // the Hyper-V manager asked
       if (vmware_tools.take_shutdown_request(&vmware_restart)) desktop.request_shutdown();   // so did VMware
 #ifdef TCOS_AMD_VEGAM
-      if (vega_m) vega_m->service_interrupts();   // the Vega M's interrupt ring (its interrupt line is not connected): faults wedge the ring they came from
+      if (vega_m) {   // the Vega M's interrupt ring: faults wedge the ring they came from. With MSI the ring is read when an interrupt came (and now and then in case one was lost)
+        static uint32_t vega_seen = 0, vega_idle = 0;
+        const uint32_t arrived = __atomic_load_n(&g_vega_interrupts, __ATOMIC_ACQUIRE);
+        if (!vega_msi_working || arrived != vega_seen || ++vega_idle >= 250) {
+          vega_seen = arrived;
+          vega_idle = 0;
+          vega_m->service_interrupts();
+        }
+      }
 #endif
       uint32_t tools_width, tools_height;
       if (vmware_tools.take_resolution(&tools_width, &tools_height)) on_vbox_display_request(&vbox_display, tools_width, tools_height);
@@ -1268,6 +1319,10 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
 #ifdef TCOS_AMD_VEGAM
   if (hardware::AmdGpu* display = system_gpu.amd_gpu()) display->set_native_display(nullptr);   // (gives the firmware's framebuffer back before the card is stopped)
   vega_m = UniquePointer<hardware::AmdVegaM>();
+  if (vega_msi) {   // (after the card stopped posting)
+    vega_msi = UniquePointer<hardware::PciMsi>();
+    kernel::set_interrupt_handler(kernel::kVectorAmdVegaM, nullptr, nullptr);
+  }
 #endif
   video_codecs.shutdown();
   network.shutdown();

@@ -179,6 +179,7 @@ bool AmdVegaM::bring_up(const Inputs& in) {
   // The interrupt handler.
   AmdIh3::Config ih_config;
   ih_config.ring_in_video_memory = true;
+  ih_config.msi = in.msi;
   ih_ = UniquePointer<AmdIh3>::make(allocator, *in.registers, *in.clock, ih_config);
   irq_ = UniquePointer<AmdIrq>::make(allocator, *in.registers);
   if (!ih_) return fail(Step::MemoryController, "out of memory");

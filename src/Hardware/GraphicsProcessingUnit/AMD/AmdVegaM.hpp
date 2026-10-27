@@ -77,6 +77,7 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
     uint64_t aperture_bytes = 0;
     MmioRegion doorbells;                         // the doorbell BAR (BAR 2), at least the first 8 KiB
     uint64_t max_framebuffer_bytes = 0;           // the largest picture the display could show (0: no display part)
+    bool msi = false;                             // the card's MSI is on (PciMsi): the interrupt ring is told to re-arm it as the driver does (adev->irq.msi_enabled)
     const ISystemAddresses* system_addresses = nullptr;   // for upload() and download(); null: a pointer is its own address
   };
   // The sizes of the pieces of the block, for a given microcode set, GART table and framebuffer.

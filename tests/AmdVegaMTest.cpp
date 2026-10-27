@@ -621,6 +621,23 @@ static void test_interrupt_sink() {
   CHECK(rec.events[1].kind == AmdIrq::Kind::SdmaIllegalInstruction && rec.events[1].engine == 1);
 }
 
+// With MSI on (Inputs::msi) the interrupt ring is started the way the driver starts it with adev->irq.msi_enabled: the read pointer re-arms the message. Nothing else differs.
+static void test_msi_input() {
+  uint32_t cntl[2], other_writes[2];
+  for (int msi = 0; msi < 2; ++msi) {
+    Rig rig;
+    AmdVegaM vega(rig.alloc);
+    AmdVegaM::Inputs in = rig.inputs();
+    in.msi = msi != 0;
+    CHECK(vega.bring_up(in));
+    cntl[msi] = rig.card.ih.reg(0xe30);
+    other_writes[msi] = static_cast<uint32_t>(rig.card.ih.writes.size());
+    CHECK(vega.service_interrupts() == 0);
+  }
+  const uint32_t diff = cntl[0] ^ cntl[1];
+  CHECK(diff != 0 && (diff & (diff - 1)) == 0 && (cntl[1] & diff) && other_writes[0] == other_writes[1]);
+}
+
 int main() {
   setvbuf(stdout, nullptr, _IONBF, 0);
   test_plan();
@@ -631,6 +648,7 @@ int main() {
   test_present();
   test_interrupts();
   test_interrupt_sink();
+  test_msi_input();
   printf(g_failed ? "AmdVegaMTest: %d FAILED\n" : "AmdVegaMTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }
