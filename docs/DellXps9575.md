@@ -276,6 +276,41 @@ the carve-out and copies the firmware's picture; the Vega M would put its frameb
 pipeline, vblank counters, underflow detection and every check on a real card. Whether the display reads the new address through the system aperture unchanged after `AmdGmc8` rewrote the aperture is the
 driver's behaviour and has not been seen on the card.
 
+## Radeon RX Vega M: bringing it up together (`TCOS_AMD_VEGAM`)
+
+Code: `src/Hardware/GraphicsProcessingUnit/AMD/AmdVegaM.*`, test: `tests/AmdVegaMTest.cpp` (`tests/run_host_tests.sh AmdVegaMTest`), switch: `cmake -DTCOS_AMD_VEGAM=ON` (off by default, like `TCOS_AMD_UVD`: none of it has run on a real
+card, and a wrong register on a real GPU can hang the machine). `main.cpp` runs it once the root volume is mounted (it reads `/firmware`) and before the video engines start (the memory controller comes first, as in the driver):
+bus mastering is switched on, BAR 5 (registers), BAR 2 (doorbells) and BAR 0 (video memory) are mapped, and `AmdVegaM::bring_up` does, in the Linux driver's order: read the memory controller (`AmdGmc8Memory`), read and
+parse the eight microcode files, lay out one block of video memory (below), `AmdGmc8::start` (GART), `AmdIh3::start`, `AmdSmu7Ucode::load`, `AmdGfx8::start` with `AmdGfx8Compute` (eight queues), `AmdSdma3::start`. Each
+log line says how far it got (`Vega M: started: GART 256 MiB, ...` or `not started - <step>: <reason>`); a step that fails stops the earlier ones again in reverse.
+
+The block is at 48 MiB of video memory (above the firmware's framebuffer, below the video engine, which sits in the last half of the 256 MiB the memory BAR shows; the whole block ends by 128 MiB): dummy and scratch pages,
+the GART's 512 KiB page table, the microcode images and the SMC's scratch area (1.3 MiB), the graphics ring with its write-back page and clear-state buffer, the compute queues (184 KiB), the SDMA rings, the interrupt ring
+(told it is not snooped: `AmdIh3::Config::ring_in_video_memory`) and the OS's framebuffer (the largest mode, whole MiB). Everything is reached by the CPU through the memory BAR and by the card at the memory controller's
+base plus the offset.
+
+The display part: if the active display GPU (`AmdGpu`) is this card, `AmdGpu::set_native_display` takes the CRTC that shows the firmware's framebuffer over for a framebuffer in the block (`amd_dce11::Display`), hands it to
+the renderer, and gives the firmware's back before a mode change and at shutdown. On the 9575 the boot display is the Intel GPU, so the Vega M normally does not drive it and the log says so; the hook is not covered by a host
+test (no test builds `AmdGpu`), only by the pieces' own.
+
+Not done: the GFX configuration numbers that the driver takes from the video BIOS are defaults (`AmdGfx8::Config`: 2 shader engines, 1 array, 2 back-ends: wrong values would write a wrong raster configuration),
+the clock and power requests the video engines make are separate, nothing uses the rings yet (no command submission, no use of SDMA by the OS, interrupts are not dispatched), and the UVD engine's memory plan does not know about
+this block (it relies on the 128 MiB limit). Treat the first run on a 9575 as a bring-up.
+
+### Command buffers: indirect buffers and fences
+
+`AmdGfx8::submit_ib`, `AmdGfx8Compute::submit_ib` and `AmdSdma3::submit_ib` run an indirect buffer (a command buffer already in memory the engine reads) and wait for a fence, each ported from the driver's
+emit functions: the graphics ring gets `INDIRECT_BUFFER` (`gfx_v8_0_ring_emit_ib_gfx`) and the fence of `gfx_v8_0_ring_emit_fence_gfx` (two `EVENT_WRITE_EOP`, the first a workaround that writes the number below,
+the second the number; word 12 of the write-back page); a compute queue gets `INDIRECT_BUFFER` with the valid bit (`..._emit_ib_compute`) and `RELEASE_MEM` (`..._emit_fence_compute`; word 16 of the queue's
+write-back page); an SDMA engine gets the `INDIRECT` packet placed to end on an 8-dword boundary of the ring (`sdma_v3_0_ring_emit_ib`) and the fence/trap of the copy path. Buffers are padded as the driver pads them
+(`AmdGfx8::pad_ib`: NOPs to a multiple of 256 dwords; `AmdSdma3::pad_ib`: to 8, with a burst NOP where the engine has it). A fence that never comes wedges that ring until the engine is started again.
+`AmdVegaM::submit_graphics` / `submit_compute` / `submit_sdma` copy a command buffer into the block's 8 KiB staging area, pad it and run it, one at a time.
+
+The simulated engines run the buffers' packets (register writes, memory writes, copies, fences) and object to anything else (a buffer that is not packets, a compute buffer without the valid bit, a VMID, an
+IB that does not end on an 8-dword boundary), so the packets' framing is checked; what the real microcode does with these framings, and with caches (the driver's fence packets flush the GPU's caches before the write;
+the simulated ones do not model caches), has not been seen. No shaders are run (there is no compiler for the GCN4 instruction set), no draws are issued, VMIDs other than 0 and the hardware-queue
+priorities are not used, and nothing in the OS calls these yet.
+
 ## Radeon RX Vega M: UVD 6.3
 
 `src/Hardware/VideoCodec/AMD/AmdUvd6.*` is the start/stop of the Unified Video Decoder 6.3, ported from amdgpu (`uvd_v6_0.c`: `mc_resume`, `start`, `stop`, the clock-gating "ungate" path; `amdgpu_uvd.c`: the memory layout

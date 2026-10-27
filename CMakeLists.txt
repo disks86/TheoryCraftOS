@@ -642,6 +642,7 @@ add_executable(BOOTX64
   src/Hardware/GraphicsProcessingUnit/AMD/AmdIh3.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdSdma3.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdDce11.cpp
+  src/Hardware/GraphicsProcessingUnit/AMD/AmdVegaM.cpp
   src/Hardware/VideoCodec/AMD/AmdUvd6Messages.cpp
   src/Hardware/VideoCodec/AMD/AmdUvd6AvcDecoder.cpp
   src/Hardware/VideoCodec/AMD/AmdUvd6HevcDecoder.cpp
@@ -924,6 +925,10 @@ endif()
 option(TCOS_AMD_UVD "Start the UVD 6 video engine of a Radeon RX Vega M (Kaby Lake-G) and decode H.264 on it (not yet run on a real card; H.264 stays on the CPU if its self-test fails)" OFF)
 if(TCOS_AMD_UVD)
   target_compile_definitions(BOOTX64 PRIVATE TCOS_AMD_UVD)
+endif()
+option(TCOS_AMD_VEGAM "Bring up the Radeon RX Vega M (Kaby Lake-G): memory controller and GART, interrupt ring, microcode through the SMC, graphics engine with compute queues, SDMA, and the display surface (not yet run on a real card)" OFF)
+if(TCOS_AMD_VEGAM)
+  target_compile_definitions(BOOTX64 PRIVATE TCOS_AMD_VEGAM)
 endif()
 option(TCOS_SELFTESTS "Run the boot-time self-checks and demos of every subsystem" OFF)
 if(TCOS_SELFTESTS)

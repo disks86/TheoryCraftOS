@@ -42,7 +42,8 @@ uint32_t Plane::offset() const { return kCrtcOffsets[crtc_]; }
 
 bool Plane::probe(uint64_t surface, uint32_t pitch_pixels) {
   active_ = false;
-  if (surface == 0 || (surface & (kSurfaceAlignment - 1)) != 0 || pitch_pixels == 0) return false;
+  // (address 0 is a valid place for a framebuffer: video memory starts at the card's own address 0 when the memory controller's base is 0)
+  if ((surface & (kSurfaceAlignment - 1)) != 0 || pitch_pixels == 0) return false;
   for (uint32_t i = 0; i < kMaxCrtcs; ++i) {
     const uint32_t off = kCrtcOffsets[i];
     const uint32_t crtc_control = r_.read(mmCRTC_CONTROL + off);
@@ -121,6 +122,42 @@ bool Plane::set_surface(uint64_t address, uint64_t bytes, uint32_t timeout_us) {
 bool Plane::restore(uint32_t timeout_us) {
   if (!active_) return false;
   return surface() == original_ || flip(original_, timeout_us);
+}
+
+namespace {
+// The one place a mapped window becomes a view of bytes. The window is memory the mapper handed out for this driver alone (it refuses a range the OS owns), at an
+// address that is the same for the CPU as the OS's identity map says, and it outlives the view: the mapping is never torn down.
+ByteView view_of(const MmioRegion& window, uint64_t length) { return ByteView(reinterpret_cast<uint8_t*>(window.address()), length); }
+// The firmware's framebuffer, which the firmware identity-maps (the UEFI graphics output gave its address).
+ByteView firmware_view(const FirmwareFramebuffer& fb, uint64_t length) { return ByteView(reinterpret_cast<uint8_t*>(fb.physical), length); }
+}  // namespace
+
+bool Display::engage(const FirmwareFramebuffer& fb, ByteView* memory) {
+  disengage();
+  if (fb.width == 0 || fb.height == 0 || fb.pitch_pixels < fb.width || fb.physical == 0 || fb.pitch_pixels > UINT32_MAX / 4) return false;
+  const uint64_t picture = uint64_t{fb.pitch_pixels} * 4 * fb.height;
+  if (picture > fb.bytes || !region_.valid() || region_.length() < picture || (region_gpu_ & (kSurfaceAlignment - 1)) != 0) return false;
+  if (fb.physical < cpu_base_ || fb.physical - cpu_base_ > UINT64_MAX - gpu_base_) return false;
+  // The firmware's framebuffer as the GPU addresses it must be what the CRTC is fetching now: this is what ties the registers to the memory map.
+  const uint64_t firmware_gpu = gpu_base_ + (fb.physical - cpu_base_);
+  if (!plane_.probe(firmware_gpu, fb.pitch_pixels) || !plane_.in_aperture(region_gpu_, picture)) return false;
+  const ByteView ours = view_of(region_, region_.length());
+  if (!ours.first(picture).copy_from(firmware_view(fb, picture))) return false;
+  if (!plane_.set_surface(region_gpu_, picture)) return false;
+  firmware_ = fb;
+  memory_ = ours.first(picture);
+  *memory = memory_;
+  engaged_ = true;
+  return true;
+}
+
+void Display::disengage() {
+  if (!engaged_) return;
+  engaged_ = false;
+  // What was drawn since goes back into the firmware's framebuffer, so the picture does not jump when the display goes back to it.
+  firmware_view(firmware_, memory_.size()).copy_from(memory_);
+  plane_.restore();
+  memory_ = ByteView();
 }
 
 }  // namespace amd_dce11

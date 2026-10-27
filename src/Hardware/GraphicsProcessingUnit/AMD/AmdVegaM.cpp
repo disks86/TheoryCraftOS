@@ -1,0 +1,310 @@
+/*
+ * TheoryCraftOS - a minimal UEFI x86_64 operating system.
+ * Copyright (C) 2026 Christopher Schaefer
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+
+#include "Hardware/GraphicsProcessingUnit/AMD/AmdVegaM.hpp"
+#include "Hardware/VideoCodec/AMD/AmdGmc8Memory.hpp"
+#include "Utility/ByteBuffer.hpp"
+
+namespace hardware {
+
+namespace {
+constexpr uint64_t kMiB = 1ull << 20;
+constexpr uint64_t align_up(uint64_t v, uint64_t a) { return (v + a - 1) / a * a; }
+constexpr uint64_t kMaxFirmwareBytes = 4u << 20;
+
+enum class ReadResult : uint8_t { Ok, NotFound, TooLarge, Failed, NoMemory };
+
+// Reads "/firmware/<name>" whole.
+ReadResult read_firmware(filesystem::IFileSystem& file_system, allocators::IAllocator& allocator, const char* name, ByteBuffer* out) {
+  String path(allocator);
+  if (!path.assign("/firmware/") || !path.append(StringView(name))) return ReadResult::NoMemory;
+  UniquePointer<filesystem::IFile> file;
+  const filesystem::Status opened = file_system.open_file(StringView(path.c_str()), filesystem::OpenMode::Read, &file);
+  if (opened == filesystem::Status::NotFound) return ReadResult::NotFound;
+  if (opened != filesystem::Status::Ok || !file) return ReadResult::Failed;
+  const uint64_t size = file->size();
+  if (size == 0 || size > kMaxFirmwareBytes) return ReadResult::TooLarge;
+  if (!out->put_zeros(size)) return ReadResult::NoMemory;
+  uint64_t got = 0;
+  if (file->read(0, out->writable_view(), &got) != filesystem::Status::Ok || got != size) return ReadResult::Failed;
+  return ReadResult::Ok;
+}
+}  // namespace
+
+const char* AmdVegaM::step_name(Step step) {
+  switch (step) {
+    case Step::None: return "start";
+    case Step::MemoryMap: return "memory map";
+    case Step::Firmware: return "firmware";
+    case Step::Memory: return "memory";
+    case Step::MemoryController: return "memory controller";
+    case Step::InterruptHandler: return "interrupt handler";
+    case Step::Microcode: return "microcode";
+    case Step::GraphicsEngine: return "graphics engine";
+    case Step::Sdma: return "SDMA";
+    case Step::Done: return "done";
+  }
+  return "?";
+}
+
+AmdVegaM::Layout AmdVegaM::plan(uint64_t smu_bytes, uint64_t gart_table_bytes, uint32_t compute_queues, uint64_t framebuffer_bytes) {
+  Layout l;
+  if (smu_bytes == 0 || gart_table_bytes == 0 || compute_queues == 0 || compute_queues > AmdGfx8Compute::kMaxQueues || smu_bytes > kRegionLimit || gart_table_bytes > kRegionLimit ||
+      framebuffer_bytes > kRegionLimit)
+    return l;
+  uint64_t at = 0;
+  auto take = [&](uint64_t bytes) {
+    const uint64_t offset = at;
+    at += align_up(bytes, kPageBytes);
+    return offset;
+  };
+  l.dummy_page = take(kPageBytes);
+  l.scratch_page = take(kPageBytes);
+  l.gart_table = take(gart_table_bytes);
+  l.smu = take(smu_bytes);
+  l.gfx = take(kGfxBytes);
+  l.compute = take(AmdGfx8Compute::block_bytes(compute_queues));
+  l.sdma = take(AmdSdma3::kInstances * AmdSdma3::kSlotBytes);
+  l.ih = take(kIhBytes);
+  l.ib = take(kIbBytes);
+  at = align_up(at, kMiB);
+  l.framebuffer = at;
+  l.framebuffer_bytes = align_up(framebuffer_bytes, kMiB);
+  at += l.framebuffer_bytes;
+  l.smu_bytes = smu_bytes;
+  l.gart_table_bytes = gart_table_bytes;
+  l.total = at;
+  l.ok = at <= kRegionLimit - kRegionOffset;
+  return l;
+}
+
+bool AmdVegaM::fail(Step failed, const char* text) {
+  String message(status_.allocator());
+  message.assign(step_name(failed));
+  message.append(": ");
+  message.append(text);
+  const Step reached = step_;
+  shutdown();   // (stops what came up, in reverse)
+  status_.assign(message.view());
+  step_ = failed == Step::None ? Step::None : reached;
+  return false;
+}
+
+bool AmdVegaM::bring_up(const Inputs& in) {
+  shutdown();
+  status_.assign("");
+  inputs_ = in;
+  if (!in.registers || !in.clock || !in.file_system || !in.allocator || !in.mapper || in.aperture_bytes == 0 || in.aperture_physical == 0 || !in.doorbells.valid() ||
+      amd_gfx8_firmware_name(in.device_id, AmdGfx8Block::CpPfp) == nullptr)
+    return fail(Step::None, "no access to the card (registers, memory BAR, doorbells or a Vega M device)");
+
+  // The memory controller as the card's firmware left it.
+  const AmdGmc8MemoryMap map = amd_read_gmc8_memory_map(*in.registers);
+  if (!map.read) return fail(Step::MemoryMap, "the memory controller's registers do not answer");
+  gpu_base_ = map.gpu_base;
+  cpu_base_ = in.aperture_physical;
+  step_ = Step::MemoryMap;
+
+  // The microcode files.
+  allocators::IAllocator& allocator = *in.allocator;
+  ByteBuffer pfp(allocator), me(allocator), ce(allocator), mec(allocator), mec2(allocator), rlc(allocator), sdma0(allocator), sdma1(allocator);
+  struct File {
+    AmdGfx8Block block;
+    ByteBuffer* data;
+    AmdGfx8Image* image;
+  };
+  AmdSmu7Ucode::Images images;
+  const File files[] = {{AmdGfx8Block::CpPfp, &pfp, &images.pfp}, {AmdGfx8Block::CpMe, &me, &images.me},       {AmdGfx8Block::CpCe, &ce, &images.ce},
+                        {AmdGfx8Block::CpMec, &mec, &images.mec},  {AmdGfx8Block::CpMec2, &mec2, &images.mec2}, {AmdGfx8Block::RlcG, &rlc, &images.rlc},
+                        {AmdGfx8Block::Sdma0, &sdma0, &images.sdma0}, {AmdGfx8Block::Sdma1, &sdma1, &images.sdma1}};
+  for (const File& f : files) {
+    const char* name = amd_gfx8_firmware_name(in.device_id, f.block);
+    const ReadResult r = read_firmware(*in.file_system, allocator, name, f.data);
+    if (r != ReadResult::Ok) {
+      String text(allocator);
+      text.assign(name);
+      text.append(r == ReadResult::NotFound ? " not found" : r == ReadResult::NoMemory ? ": out of memory" : r == ReadResult::TooLarge ? " has an unusable size" : " could not be read");
+      return fail(Step::Firmware, text.c_str());
+    }
+    if (!amd_gfx8_parse_firmware(f.data->view(), f.block, f.image)) {
+      String text(allocator);
+      text.assign(name);
+      text.append(" is not a microcode file this driver understands");
+      return fail(Step::Firmware, text.c_str());
+    }
+  }
+  step_ = Step::Firmware;
+  const AmdSmu7Ucode::Layout ucode_layout = AmdSmu7Ucode::plan(images);   // (a set that parsed is complete; a layout that is not ok has no size and the block below refuses it)
+
+  // The block of video memory.
+  gart_plan_ = amd_plan_gmc8_gart(map);
+  if (!gart_plan_.ok) return fail(Step::Memory, "no room in the GPU's address space for the GART");
+  AmdGfx8Compute::Config compute_config;
+  layout_ = plan(ucode_layout.total_bytes, gart_plan_.table_bytes, compute_config.queues, in.max_framebuffer_bytes);
+  if (!layout_.ok) return fail(Step::Memory, "the block does not fit the part of video memory set aside for it");
+  if (kRegionOffset + layout_.total > in.aperture_bytes || kRegionOffset + layout_.total > map.video_memory_bytes) return fail(Step::Memory, "the memory BAR or video memory is too small");
+  if (!in.mapper->map_registers(in.aperture_physical + kRegionOffset, layout_.total, &block_)) return fail(Step::Memory, "the memory BAR cannot be mapped");
+  block_gpu_ = map.gpu_base + kRegionOffset;
+  step_ = Step::Memory;
+  auto sub = [&](uint64_t offset, uint64_t bytes) { return block_.subregion(offset, bytes); };
+
+  // The memory controller and the GART.
+  gmc_ = UniquePointer<AmdGmc8>::make(allocator, *in.registers, *in.clock);
+  if (!gmc_) return fail(Step::Memory, "out of memory");
+  AmdGmc8::Memory gmc_memory;
+  gmc_memory.table_gpu_address = block_gpu_ + layout_.gart_table;
+  gmc_memory.table = sub(layout_.gart_table, gart_plan_.table_bytes);
+  gmc_memory.dummy_page_gpu_address = block_gpu_ + layout_.dummy_page;
+  gmc_memory.scratch_page_gpu_address = block_gpu_ + layout_.scratch_page;
+  const AmdGmc8::Result gmc_result = gmc_->start(gart_plan_, gmc_memory);
+  if (gmc_result == AmdGmc8::Result::BadArgument) return fail(Step::MemoryController, AmdGmc8::result_name(gmc_result));
+  step_ = Step::MemoryController;   // (a controller that was busy at the end of the start is carried on with, as the driver does)
+
+  // The interrupt handler.
+  AmdIh3::Config ih_config;
+  ih_config.ring_in_video_memory = true;
+  ih_ = UniquePointer<AmdIh3>::make(allocator, *in.registers, *in.clock, ih_config);
+  if (!ih_) return fail(Step::MemoryController, "out of memory");
+  AmdIh3::Memory ih_memory;
+  ih_memory.ring_gpu_address = block_gpu_ + layout_.ih;
+  ih_memory.ring = sub(layout_.ih, kIhBytes);
+  ih_memory.dummy_page_gpu_address = block_gpu_ + layout_.dummy_page;
+  ih_memory.doorbells = in.doorbells;
+  const AmdIh3::Result ih_result = ih_->start(ih_memory);
+  if (ih_result != AmdIh3::Result::Ok) return fail(Step::InterruptHandler, AmdIh3::result_name(ih_result));
+  step_ = Step::InterruptHandler;
+
+  // The microcode, loaded by the SMC.
+  AmdSmu7Ucode loader(*in.registers, *in.clock);
+  AmdSmu7Ucode::Memory ucode_memory;
+  ucode_memory.gpu_address = block_gpu_ + layout_.smu;
+  ucode_memory.block = sub(layout_.smu, layout_.smu_bytes);
+  const AmdSmu7Ucode::Result loaded = loader.load(images, ucode_memory);
+  if (loaded != AmdSmu7Ucode::Result::Ok) return fail(Step::Microcode, AmdSmu7Ucode::result_name(loaded));
+  step_ = Step::Microcode;
+
+  // The graphics engine and its compute queues.
+  compute_ = UniquePointer<AmdGfx8Compute>::make(allocator, *in.registers, *in.clock, compute_config);
+  gfx_ = UniquePointer<AmdGfx8>::make(allocator, *in.registers, *in.clock);
+  if (!compute_ || !gfx_) return fail(Step::Microcode, "out of memory");
+  AmdGfx8Compute::Memory compute_memory;
+  compute_memory.gpu_address = block_gpu_ + layout_.compute;
+  compute_memory.block = sub(layout_.compute, AmdGfx8Compute::block_bytes(compute_config.queues));
+  compute_memory.doorbells = in.doorbells;
+  const AmdGfx8Compute::Result attached = compute_->attach(compute_memory);
+  if (attached != AmdGfx8Compute::Result::Ok) return fail(Step::GraphicsEngine, AmdGfx8Compute::result_name(attached));
+  gfx_->attach_compute(compute_.get());
+  AmdGfx8::Memory gfx_memory;
+  gfx_memory.ring_gpu_address = block_gpu_ + layout_.gfx;
+  gfx_memory.ring = sub(layout_.gfx, AmdGfx8::kRingBytes);
+  gfx_memory.writeback_gpu_address = block_gpu_ + layout_.gfx + AmdGfx8::kRingBytes;
+  gfx_memory.writeback = sub(layout_.gfx + AmdGfx8::kRingBytes, 4096);
+  gfx_memory.csb_gpu_address = block_gpu_ + layout_.gfx + AmdGfx8::kRingBytes + 4096;
+  gfx_memory.csb = sub(layout_.gfx + AmdGfx8::kRingBytes + 4096, 4096);
+  const AmdGfx8::Result gfx_result = gfx_->start(gfx_memory);
+  if (gfx_result != AmdGfx8::Result::Ok) return fail(Step::GraphicsEngine, AmdGfx8::result_name(gfx_result));
+  step_ = Step::GraphicsEngine;
+
+  // The DMA engines.
+  AmdSdma3::Config sdma_config;
+  sdma_config.burst_nop[0] = images.sdma0.feature_version >= 20;   // sdma_v3_0_init_microcode
+  sdma_config.burst_nop[1] = images.sdma1.feature_version >= 20;
+  sdma_ = UniquePointer<AmdSdma3>::make(allocator, *in.registers, *in.clock, sdma_config);
+  if (!sdma_) return fail(Step::GraphicsEngine, "out of memory");
+  AmdSdma3::Memory sdma_memory;
+  sdma_memory.gpu_address = block_gpu_ + layout_.sdma;
+  sdma_memory.block = sub(layout_.sdma, AmdSdma3::kInstances * AmdSdma3::kSlotBytes);
+  sdma_memory.doorbells = in.doorbells;
+  const AmdSdma3::Result sdma_result = sdma_->start(sdma_memory);
+  if (sdma_result != AmdSdma3::Result::Ok) return fail(Step::Sdma, AmdSdma3::result_name(sdma_result));
+  step_ = Step::Done;
+
+  status_.assign("GART ");
+  status_.append_uint(gart_plan_.gart_size / kMiB);
+  status_.append(" MiB, interrupt ring, microcode loaded by the SMC, graphics engine with ");
+  status_.append_uint(compute_config.queues);
+  status_.append(" compute queues, 2 SDMA engines");
+  return true;
+}
+
+void AmdVegaM::shutdown() {
+  display_ = UniquePointer<amd_dce11::Display>();   // (puts the firmware's framebuffer back)
+  if (sdma_) sdma_->stop();
+  sdma_ = UniquePointer<AmdSdma3>();
+  if (gfx_ && compute_) gfx_->stop();
+  gfx_ = UniquePointer<AmdGfx8>();
+  compute_ = UniquePointer<AmdGfx8Compute>();
+  if (ih_) ih_->stop();
+  ih_ = UniquePointer<AmdIh3>();
+  if (gmc_) gmc_->stop();
+  gmc_ = UniquePointer<AmdGmc8>();
+  step_ = Step::None;
+}
+
+// Copies `count` dwords into the staging area (the padding is already in `words`).
+static void stage(const MmioRegion& area, const uint32_t* words, uint32_t count) {
+  for (uint32_t i = 0; i < count; ++i) area.write32(uint64_t{i} * 4, words[i]);
+}
+
+bool AmdVegaM::submit_graphics(ArrayView<const uint32_t> commands, uint32_t timeout_us) {
+  if (!up() || commands.size() == 0 || commands.size() > kIbDwords) return false;
+  uint32_t words[kIbDwords];
+  for (size_t i = 0; i < commands.size(); ++i) words[i] = commands[i];
+  const uint32_t count = AmdGfx8::pad_ib(ArrayView<uint32_t>(words, kIbDwords), static_cast<uint32_t>(commands.size()));
+  if (count == 0) return false;
+  stage(block_.subregion(layout_.ib, kIbBytes), words, count);
+  amd_gmc8_flush_hdp(*inputs_.registers);
+  return gfx_->submit_ib(block_gpu_ + layout_.ib, count, timeout_us);
+}
+
+bool AmdVegaM::submit_compute(uint32_t queue, ArrayView<const uint32_t> commands, uint32_t timeout_us) {
+  if (!up() || commands.size() == 0 || commands.size() > kIbDwords) return false;
+  uint32_t words[kIbDwords];
+  for (size_t i = 0; i < commands.size(); ++i) words[i] = commands[i];
+  const uint32_t count = AmdGfx8::pad_ib(ArrayView<uint32_t>(words, kIbDwords), static_cast<uint32_t>(commands.size()));
+  if (count == 0) return false;
+  stage(block_.subregion(layout_.ib, kIbBytes), words, count);
+  amd_gmc8_flush_hdp(*inputs_.registers);
+  return compute_->submit_ib(queue, block_gpu_ + layout_.ib, count, timeout_us);
+}
+
+bool AmdVegaM::submit_sdma(uint32_t instance, ArrayView<const uint32_t> commands, uint32_t timeout_us) {
+  if (!up() || commands.size() == 0 || commands.size() > kIbDwords) return false;
+  uint32_t words[kIbDwords];
+  for (size_t i = 0; i < commands.size(); ++i) words[i] = commands[i];
+  const uint32_t count = sdma_->pad_ib(instance, ArrayView<uint32_t>(words, kIbDwords), static_cast<uint32_t>(commands.size()));
+  if (count == 0) return false;
+  stage(block_.subregion(layout_.ib, kIbBytes), words, count);
+  amd_gmc8_flush_hdp(*inputs_.registers);
+  return sdma_->submit_ib(instance, block_gpu_ + layout_.ib, count, timeout_us);
+}
+
+bool AmdVegaM::engage_display(const amd_dce11::FirmwareFramebuffer& firmware, ByteView* memory) {
+  if (!up() || layout_.framebuffer_bytes == 0 || !inputs_.allocator) return false;
+  display_ = UniquePointer<amd_dce11::Display>();
+  UniquePointer<amd_dce11::Display> display = UniquePointer<amd_dce11::Display>::make(*inputs_.allocator, *inputs_.registers, *inputs_.clock, cpu_base_, gpu_base_,
+                                                                                      block_.subregion(layout_.framebuffer, layout_.framebuffer_bytes), block_gpu_ + layout_.framebuffer);
+  if (!display || !display->engage(firmware, memory)) return false;
+  display_ = util::move(display);
+  return true;
+}
+
+void AmdVegaM::disengage_display() { display_ = UniquePointer<amd_dce11::Display>(); }
+
+}  // namespace hardware

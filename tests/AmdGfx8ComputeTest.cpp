@@ -22,6 +22,7 @@
 // stop, and the failures (the microcode not loaded, one queue not mapped). The register values are worked out by hand from the bit positions in AMD's headers; the descriptor's
 // word for the register R of the hardware queue is word 128 + (R - 0x3245), which the generator checked against the kernel header.
 #include <stdio.h>
+#include <string.h>
 #include <vector>
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdGfx8.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdGfx8Compute.hpp"
@@ -43,9 +44,11 @@ constexpr uint64_t kSlot = AmdGfx8Compute::kSlotBytes;   // 20480
 struct Rig {
   fakegfx::Card card;
   fakegfx::FakeClock clock;
-  Block ring_block, wb_block, csb_block, compute_block, doorbells;
-  uint64_t ring_gpu = 0x2'0010'0000ull, wb_gpu = 0x2'0020'0000ull, csb_gpu = 0x2'0030'0000ull, compute_gpu = 0x2'0100'0000ull;
-  Rig() : ring_block(AmdGfx8::kRingBytes), wb_block(4096), csb_block(8192), compute_block(9 * kSlot), doorbells(4096) {
+  Block ring_block, wb_block, csb_block, compute_block, doorbells, ib_block;
+  uint64_t ring_gpu = 0x2'0010'0000ull, wb_gpu = 0x2'0020'0000ull, csb_gpu = 0x2'0030'0000ull, compute_gpu = 0x2'0100'0000ull, ib_gpu = 0x2'0200'0000ull;
+  Rig() : ring_block(AmdGfx8::kRingBytes), wb_block(4096), csb_block(8192), compute_block(9 * kSlot), doorbells(4096), ib_block(16384) {
+    card.windows.push_back({ib_gpu, ib_block.base, 16384});
+    clock.on_tick = [this] { card.poll_mec(); };
     card.windows.push_back({ring_gpu, ring_block.base, AmdGfx8::kRingBytes});
     card.windows.push_back({wb_gpu, wb_block.base, 4096});
     card.windows.push_back({csb_gpu, csb_block.base, 8192});
@@ -245,6 +248,114 @@ static void test_other_pipe_and_doorbells() {
   CHECK(rig.card.bank_reg(1, 3, 0, 0x3254) == (0x40000000u | 2u << 2));
 }
 
+
+static std::vector<uint32_t> make_ib(uint32_t scratch_value, uint64_t data_address, uint32_t data) {
+  std::vector<uint32_t> ib = {0xC0017900, 0x40, scratch_value, 0xC0043700, 0x00000500, static_cast<uint32_t>(data_address), static_cast<uint32_t>(data_address >> 32), data};
+  ib.resize(256, 0xFFFF1000);
+  return ib;
+}
+
+static void test_submit_ib() {
+  Rig rig;
+  AmdGfx8Compute compute(rig.card, rig.clock);
+  CHECK(compute.attach(rig.compute_memory()) == AmdGfx8Compute::Result::Ok);
+  CHECK(!compute.submit_ib(0, rig.ib_gpu, 256));   // the queues are not mapped yet
+  AmdGfx8 gfx(rig.card, rig.clock);
+  gfx.attach_compute(&compute);
+  CHECK(gfx.start(rig.memory()) == AmdGfx8::Result::Ok);
+  const uint64_t data_address = rig.ib_gpu + 8192;
+  for (uint32_t queue : {0u, 5u, 7u}) {
+    const std::vector<uint32_t> ib = make_ib(0x1000 + queue, data_address + queue * 4, 0xABC00000 + queue);
+    for (size_t i = 0; i < ib.size(); ++i) rig.card.put32(rig.ib_gpu + i * 4, ib[i]);
+    const uint32_t wptr = compute.write_pointer(queue + 1);
+    CHECK(compute.submit_ib(queue, rig.ib_gpu, 256) && compute.fence_sequence(queue) == 1 && !compute.queue_wedged(queue));
+    CHECK(rig.card.reg(fakegfx::kScratch0) == 0x1000 + queue && rig.card.get32(data_address + queue * 4) == 0xABC00000 + queue);
+    // The ring: the INDIRECT_BUFFER packet (with the valid bit), the RELEASE_MEM with the fence number.
+    const uint64_t slot = rig.compute_gpu + (queue + 1) * kSlot, ring = slot + 4096, fence = slot + 4096 + 8192 + 4096 + 16;
+    const uint32_t expected[] = {0xC0023F00, static_cast<uint32_t>(rig.ib_gpu), static_cast<uint32_t>(rig.ib_gpu >> 32), 0x800000 | 256,
+                                 0xC0054900, 0x38514, 0x20000000, static_cast<uint32_t>(fence), static_cast<uint32_t>(fence >> 32), 1, 0};
+    for (uint32_t i = 0; i < 11; ++i) CHECK(rig.card.get32(ring + uint64_t{wptr + i} * 4) == expected[i]);
+    CHECK(rig.card.get32(fence) == 1 && rig.doorbell(0x10 + queue) == ((wptr + 11 + 255) & ~255u) % 2048);
+  }
+  CHECK(rig.card.ib_runs.size() == 3 && rig.card.ib_runs[0].compute && rig.card.ib_protocol_errors == 0 && rig.card.compute_protocol_errors == 0 && rig.card.fence_writes == 3);
+  // The same queue again counts on.
+  CHECK(compute.submit_ib(0, rig.ib_gpu, 256) && compute.fence_sequence(0) == 2);
+  // Refused: no such queue, no length, too long, unaligned, beyond 48 bits.
+  const uint32_t doorbell = rig.doorbell(0x10);
+  CHECK(!compute.submit_ib(8, rig.ib_gpu, 256) && !compute.submit_ib(0, rig.ib_gpu, 0) && !compute.submit_ib(0, rig.ib_gpu, 0x100000) && !compute.submit_ib(0, rig.ib_gpu + 1, 256) &&
+        !compute.submit_ib(0, 1ull << 48, 256) && rig.doorbell(0x10) == doorbell);
+  // A queue whose fence never comes is wedged, the others are not.
+  rig.card.ignore_fences = true;
+  CHECK(!compute.submit_ib(2, rig.ib_gpu, 256, 2000) && compute.queue_wedged(2) && !compute.queue_wedged(3));
+  rig.card.ignore_fences = false;
+  CHECK(!compute.submit_ib(2, rig.ib_gpu, 256) && compute.submit_ib(3, rig.ib_gpu, 256));
+  // Unmapped (stopping): refused again, and nothing is queued.
+  gfx.stop();
+  const uint32_t wptr3 = compute.write_pointer(4);
+  CHECK(!compute.submit_ib(3, rig.ib_gpu, 256) && compute.write_pointer(4) == wptr3);
+}
+
+static void test_ib_state_per_life() {
+  // Not every queue passed its ring test: nothing is submitted to the ones that did.
+  {
+    Rig rig;
+    rig.card.skip_map_bit = 3;
+    AmdGfx8Compute compute(rig.card, rig.clock);
+    CHECK(compute.attach(rig.compute_memory()) == AmdGfx8Compute::Result::Ok);
+    AmdGfx8 gfx(rig.card, rig.clock);
+    gfx.attach_compute(&compute);
+    CHECK(gfx.start(rig.memory(), 2000) == AmdGfx8::Result::ComputeFailed);
+    const uint32_t wptr = compute.write_pointer(1);
+    CHECK(!compute.submit_ib(0, rig.ib_gpu, 256) && compute.write_pointer(1) == wptr);
+  }
+  // Unmapping the queues (without stopping the rest) makes them not ready.
+  {
+    Rig rig;
+    AmdGfx8Compute compute(rig.card, rig.clock);
+    CHECK(compute.attach(rig.compute_memory()) == AmdGfx8Compute::Result::Ok);
+    AmdGfx8 gfx(rig.card, rig.clock);
+    gfx.attach_compute(&compute);
+    CHECK(gfx.start(rig.memory()) == AmdGfx8::Result::Ok && compute.disable_queues());
+    const uint32_t wptr = compute.write_pointer(1);
+    CHECK(!compute.submit_ib(0, rig.ib_gpu, 256) && compute.write_pointer(1) == wptr);
+  }
+  // A fence word left at 1 in a write-back page does not finish the first submission; a wedged queue and its numbers start again with the next life.
+  {
+    Rig rig;
+    rig.compute_block.base[1 * kSlot + 4096 + 8192 + 4096 + 16] = 1;
+    AmdGfx8Compute compute(rig.card, rig.clock);
+    CHECK(compute.attach(rig.compute_memory()) == AmdGfx8Compute::Result::Ok);
+    AmdGfx8 gfx(rig.card, rig.clock);
+    gfx.attach_compute(&compute);
+    CHECK(gfx.start(rig.memory()) == AmdGfx8::Result::Ok);
+    rig.card.ignore_fences = true;
+    CHECK(!compute.submit_ib(0, rig.ib_gpu, 256, 2000) && compute.queue_wedged(0));
+    rig.card.ignore_fences = false;
+    gfx.stop();
+    for (uint32_t i = 0; i < 256; ++i) rig.card.put32(rig.ib_gpu + i * 4, 0xFFFF1000);
+    memset(rig.doorbells.base, 0, 4096);
+    CHECK(compute.attach(rig.compute_memory()) == AmdGfx8Compute::Result::Ok && !compute.queue_wedged(0) && compute.fence_sequence(0) == 0);
+    CHECK(gfx.start(rig.memory()) == AmdGfx8::Result::Ok);
+    CHECK(compute.submit_ib(0, rig.ib_gpu, 256) && compute.fence_sequence(0) == 1);
+  }
+}
+
+static void test_ib_of_nops() {
+  // A buffer of nothing but padding runs and fences (and the simulated microcode, which refuses a compute buffer without the valid bit or one that is not whole packets, is content).
+  Rig rig;
+  AmdGfx8Compute compute(rig.card, rig.clock);
+  CHECK(compute.attach(rig.compute_memory()) == AmdGfx8Compute::Result::Ok);
+  AmdGfx8 gfx(rig.card, rig.clock);
+  gfx.attach_compute(&compute);
+  CHECK(gfx.start(rig.memory()) == AmdGfx8::Result::Ok);
+  for (uint32_t i = 0; i < 256; ++i) rig.card.put32(rig.ib_gpu + i * 4, 0xFFFF1000);
+  CHECK(compute.submit_ib(1, rig.ib_gpu, 256) && rig.card.ib_protocol_errors == 0 && rig.card.ib_runs.size() == 1);
+  // A buffer that is not packets is the microcode's complaint; the fence still comes.
+  for (uint32_t i = 0; i < 256; ++i) rig.card.put32(rig.ib_gpu + i * 4, 0x12345678);
+  compute.submit_ib(1, rig.ib_gpu, 256);
+  CHECK(rig.card.ib_protocol_errors == 1);
+}
+
 static void test_failures() {
   {
     Rig rig;   // the microcode is not loaded: the KIQ never runs
@@ -343,6 +454,9 @@ int main() {
   test_fewer_queues();
   test_other_pipe_and_doorbells();
   test_failures();
+  test_submit_ib();
+  test_ib_of_nops();
+  test_ib_state_per_life();
   test_attach();
   printf(g_failed ? "AmdGfx8ComputeTest: %d FAILED\n" : "AmdGfx8ComputeTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;

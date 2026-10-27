@@ -22,6 +22,7 @@
 #include "Hardware/Clock/IClock.hpp"
 #include "Hardware/Mmio.hpp"
 #include "Hardware/VideoCodec/AMD/AmdVcn1.hpp"
+#include "Utility/ArrayView.hpp"
 
 namespace hardware {
 
@@ -83,6 +84,13 @@ class AmdSdma3 {
   // did not finish in time (the engine is then wedged: later calls are refused until it is started again). `fill` writes `value` into every dword; `bytes` is a multiple of 4.
   bool copy(uint32_t instance, uint64_t source, uint64_t destination, uint64_t bytes, uint32_t timeout_us = kDefaultTimeoutUs);
   bool fill(uint32_t instance, uint64_t destination, uint32_t value, uint64_t bytes, uint32_t timeout_us = kDefaultTimeoutUs);
+  // Runs an indirect buffer of SDMA packets on engine `instance` and waits for it (sdma_v3_0_ring_emit_ib, then the fence): `dwords` dwords at GPU address `ib_gpu_address`
+  // (32-byte aligned, 40 bits), already written to memory the engine reads and padded with NOPs to a multiple of 8 dwords (pad_ib). The packet is placed so that it ends on an
+  // 8-dword boundary of the ring, as the engine requires. False for a bad argument, an engine that is not running or wedged, or a timeout (which wedges it).
+  bool submit_ib(uint32_t instance, uint64_t ib_gpu_address, uint32_t dwords, uint32_t timeout_us = kDefaultTimeoutUs);
+  // sdma_v3_0_ring_pad_ib: NOPs appended to `words` (holding `count`) up to a multiple of 8 dwords (a burst NOP first when the engine's firmware has it); the new count, 0 if it does not fit.
+  uint32_t pad_ib(uint32_t instance, ArrayView<uint32_t> words, uint32_t count) const;
+  static constexpr uint32_t kMaxIbDwords = 0xFFFFF;
   bool wedged(uint32_t instance) const { return instance < kInstances && state_[instance].wedged; }
   uint32_t write_pointer(uint32_t instance) const { return instance < kInstances ? state_[instance].wptr : 0; }
 

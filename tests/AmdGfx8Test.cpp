@@ -366,9 +366,10 @@ static void test_load_failures() {
 struct GfxRig {
   fakegfx::Card card;
   fakegfx::FakeClock clock;
-  Block ring_block, wb_block, csb_block;
-  uint64_t ring_gpu = 0x2'0010'0000ull, wb_gpu = 0x2'0020'0000ull, csb_gpu = 0x2'0030'0000ull;
-  GfxRig() : ring_block(AmdGfx8::kRingBytes), wb_block(4096), csb_block(8192) {
+  Block ring_block, wb_block, csb_block, ib_block;
+  uint64_t ring_gpu = 0x2'0010'0000ull, wb_gpu = 0x2'0020'0000ull, csb_gpu = 0x2'0030'0000ull, ib_gpu = 0x2'0040'0000ull;
+  GfxRig() : ring_block(AmdGfx8::kRingBytes), wb_block(4096), csb_block(8192), ib_block(16384) {
+    card.windows.push_back({ib_gpu, ib_block.base, 16384});
     card.windows.push_back({ring_gpu, ring_block.base, AmdGfx8::kRingBytes});
     card.windows.push_back({csb_gpu, csb_block.base, 8192});
     card.windows.push_back({wb_gpu, wb_block.base, 4096});
@@ -385,6 +386,7 @@ struct GfxRig {
     return m;
   }
   uint32_t ring_word(uint32_t i) { return card.get32(ring_gpu + uint64_t{i} * 4); }
+  void put_ib(const std::vector<uint32_t>& words) { for (size_t i = 0; i < words.size(); ++i) card.put32(ib_gpu + i * 4, words[i]); }
 };
 
 // golden_settings_vegam_a11 and vegam_golden_common_all, with the register numbers of gfx_8_0_d.h (extracted from the kernel source with a script, not by the code under test).
@@ -738,6 +740,89 @@ static void test_config_refusals() {
   CHECK(rig.card.writes.empty());
 }
 
+
+// An indirect buffer: a register write (SET_UCONFIG_REG of SCRATCH_REG0) and a memory write (WRITE_DATA), padded to 256 dwords.
+static std::vector<uint32_t> make_ib(uint32_t scratch_value, uint64_t data_address, uint32_t data) {
+  std::vector<uint32_t> ib = {0xC0017900, 0x40, scratch_value, 0xC0043700, 0x00000500, static_cast<uint32_t>(data_address), static_cast<uint32_t>(data_address >> 32), data};
+  ib.resize(256, 0xFFFF1000);
+  return ib;
+}
+
+static void test_submit_ib() {
+  GfxRig rig;
+  AmdGfx8 gfx(rig.card, rig.clock);
+  CHECK(!gfx.submit_ib(rig.ib_gpu, 256));   // not running
+  CHECK(gfx.start(rig.memory()) == AmdGfx8::Result::Ok);
+  const uint64_t data_address = rig.ib_gpu + 8192;
+  rig.put_ib(make_ib(0x1234, data_address, 0xCAFE0001));
+  const uint32_t wptr0 = gfx.write_pointer();
+  CHECK(gfx.submit_ib(rig.ib_gpu, 256) && gfx.fence_sequence() == 1 && !gfx.wedged());
+  CHECK(rig.card.reg(fakegfx::kScratch0) == 0x1234 && rig.card.get32(data_address) == 0xCAFE0001);
+  CHECK(rig.card.ib_runs.size() == 1 && rig.card.ib_runs[0].address == rig.ib_gpu && rig.card.ib_runs[0].dwords == 256 && !rig.card.ib_runs[0].compute);
+  CHECK(rig.card.ib_protocol_errors == 0 && rig.card.protocol_errors == 0 && rig.card.write_data_packets == 1 && rig.card.fence_writes == 2);
+  // The fence word is the number; the ring has the INDIRECT_BUFFER packet, the dummy EOP with the number below, the real one with the number, then padding.
+  const uint64_t fence = rig.wb_gpu + 12;
+  CHECK(rig.card.get32(fence) == 1);
+  const uint32_t expected[] = {0xC0023F00, static_cast<uint32_t>(rig.ib_gpu), static_cast<uint32_t>(rig.ib_gpu >> 32), 256,
+                               0xC0044700, 0x38514, static_cast<uint32_t>(fence), 0x20000000u | static_cast<uint32_t>(fence >> 32), 0, 0,
+                               0xC0044700, 0x38514, static_cast<uint32_t>(fence), 0x20000000u | static_cast<uint32_t>(fence >> 32), 1, 0};
+  for (uint32_t i = 0; i < 16; ++i) CHECK(rig.ring_word(wptr0 + i) == expected[i]);
+  CHECK(gfx.write_pointer() == ((wptr0 + 16 + 255) & ~255u) % 2048);
+  // The next one counts on.
+  rig.put_ib(make_ib(0x4321, data_address + 4, 0xCAFE0002));
+  CHECK(gfx.submit_ib(rig.ib_gpu, 256) && gfx.fence_sequence() == 2 && rig.card.get32(fence) == 2 && rig.card.reg(fakegfx::kScratch0) == 0x4321 && rig.card.get32(data_address + 4) == 0xCAFE0002);
+  // Refused: no length, too long, unaligned, beyond 48 bits.
+  const size_t before = rig.card.writes.size();
+  const uint32_t wptr = gfx.write_pointer();
+  CHECK(!gfx.submit_ib(rig.ib_gpu, 0) && !gfx.submit_ib(rig.ib_gpu, 0x100000) && !gfx.submit_ib(rig.ib_gpu + 2, 256) && !gfx.submit_ib(1ull << 48, 256));
+  CHECK(gfx.write_pointer() == wptr && rig.card.writes.size() == before);
+  // An engine that never writes the fence: timeout, wedged, nothing more queued until it is started again.
+  rig.card.ignore_fences = true;
+  CHECK(!gfx.submit_ib(rig.ib_gpu, 256, 2000) && gfx.wedged());
+  rig.card.ignore_fences = false;
+  const uint32_t stuck = gfx.write_pointer();
+  CHECK(!gfx.submit_ib(rig.ib_gpu, 256) && gfx.write_pointer() == stuck);
+  CHECK(gfx.start(rig.memory()) == AmdGfx8::Result::Ok && !gfx.wedged() && gfx.fence_sequence() == 0 && gfx.submit_ib(rig.ib_gpu, 256));
+  // Stopped: refused again, and nothing is queued.
+  gfx.stop();
+  const uint32_t stopped_wptr = gfx.write_pointer();
+  CHECK(!gfx.submit_ib(rig.ib_gpu, 256) && gfx.write_pointer() == stopped_wptr);
+}
+
+static void test_stale_fence() {
+  // A fence word left at 1 in the write-back page must not make the first submission look finished.
+  GfxRig rig;
+  rig.wb_block.base[12] = 1;
+  AmdGfx8 gfx(rig.card, rig.clock);
+  CHECK(gfx.start(rig.memory()) == AmdGfx8::Result::Ok);
+  rig.card.ignore_fences = true;
+  CHECK(!gfx.submit_ib(rig.ib_gpu, 256, 2000) && gfx.wedged());
+}
+
+static void test_submit_ib_faults() {
+  // A buffer the engine cannot read, or one that is not whole packets, is the engine's business: it objects, the fence still comes (the ring went on) and the driver sees a protocol error.
+  GfxRig rig;
+  AmdGfx8 gfx(rig.card, rig.clock);
+  CHECK(gfx.start(rig.memory()) == AmdGfx8::Result::Ok);
+  std::vector<uint32_t> bad(256, 0xFFFF1000);
+  bad[0] = 0x12345678;   // not a packet
+  rig.put_ib(bad);
+  gfx.submit_ib(rig.ib_gpu, 256);
+  CHECK(rig.card.ib_protocol_errors == 1);
+}
+
+static void test_pad_ib() {
+  uint32_t words[512];
+  for (uint32_t& w : words) w = 0xDEAD;
+  CHECK(AmdGfx8::pad_ib(ArrayView<uint32_t>(words, 512), 5) == 256);
+  for (uint32_t i = 0; i < 5; ++i) CHECK(words[i] == 0xDEAD);
+  for (uint32_t i = 5; i < 256; ++i) CHECK(words[i] == 0xFFFF1000);
+  CHECK(words[256] == 0xDEAD);
+  CHECK(AmdGfx8::pad_ib(ArrayView<uint32_t>(words, 512), 256) == 256 && AmdGfx8::pad_ib(ArrayView<uint32_t>(words, 512), 257) == 512);
+  CHECK(AmdGfx8::pad_ib(ArrayView<uint32_t>(words, 512), 0) == 0);
+  CHECK(AmdGfx8::pad_ib(ArrayView<uint32_t>(words, 100), 256) == 0 && AmdGfx8::pad_ib(ArrayView<uint32_t>(words, 100), 5) == 0 && AmdGfx8::pad_ib(ArrayView<uint32_t>(words, 255), 255) == 0 && AmdGfx8::pad_ib(ArrayView<uint32_t>(words, 4), 5) == 0);
+}
+
 static void test_ring_wrap_and_stop() {
   GfxRig rig;
   AmdGfx8 gfx(rig.card, rig.clock);
@@ -801,6 +886,10 @@ int main() {
   test_start();
   test_start_failures();
   test_high_address();
+  test_submit_ib();
+  test_submit_ib_faults();
+  test_stale_fence();
+  test_pad_ib();
   test_clear_state();
   test_tables();
   test_raster_configs();

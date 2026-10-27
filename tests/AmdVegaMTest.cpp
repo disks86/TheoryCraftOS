@@ -1,0 +1,395 @@
+/*
+ * TheoryCraftOS - a minimal UEFI x86_64 operating system.
+ * Copyright (C) 2026 Christopher Schaefer
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+
+// Host-side tests for the Vega M bring-up (AmdVegaM): all the pieces of the card at once, each against its own simulated hardware behind a router that gives every register to
+// the model that owns it, all sharing one simulated video memory. A bring-up must give a memory controller with its GART on, a running interrupt ring, the microcode loaded by
+// the SMC, a graphics engine with eight compute queues, working SDMA engines, and a framebuffer the display can be switched to; every step that can fail must stop the earlier
+// ones. The pieces themselves are covered by their own tests; this checks the glue: the layout of the block, the firmware files, the addresses given to each piece, the order.
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <memory>
+#include <vector>
+#include "FileSystem/Ram/RamFileSystem.hpp"
+#include "Hardware/GraphicsProcessingUnit/AMD/AmdVegaM.hpp"
+#include "FakeAmdDce11.hpp"
+#include "FakeAmdGfx8.hpp"
+#include "FakeAmdGmc8.hpp"
+#include "FakeAmdIh3.hpp"
+#include "FakeAmdSdma3.hpp"
+
+using namespace hardware;
+
+static int g_failed = 0;
+#define CHECK(...) do { if (!(__VA_ARGS__)) { printf("FAILED line %d: %s\n", __LINE__, #__VA_ARGS__); ++g_failed; } } while (0)
+
+struct TestAllocator final : allocators::IAllocator {
+  void* allocate(uint64_t size) override { return malloc(size); }
+  void* allocate_aligned(uint64_t size, uint64_t alignment) override {
+    const uint64_t al = alignment < 16 ? 16 : alignment;
+    return aligned_alloc(al, (size + al - 1) / al * al);
+  }
+  void deallocate(void* p) override { if (p) free(p); }
+};
+
+static std::vector<uint8_t> read_host_file(const char* path) {
+  std::vector<uint8_t> bytes;
+  FILE* f = fopen(path, "rb");
+  if (!f) return bytes;
+  uint8_t chunk[4096];
+  size_t n;
+  while ((n = fread(chunk, 1, sizeof chunk, f)) > 0) bytes.insert(bytes.end(), chunk, chunk + n);
+  fclose(f);
+  return bytes;
+}
+
+static const char* const kFiles[] = {"vegam_pfp.bin", "vegam_me.bin", "vegam_ce.bin", "vegam_mec.bin", "vegam_mec2.bin", "vegam_rlc.bin", "vegam_sdma.bin", "vegam_sdma1.bin"};
+
+static bool put_file(filesystem::RamFileSystem& fs, const char* name) {
+  const std::string host = std::string("firmware/") + name, path = std::string("/firmware/") + name;
+  const std::vector<uint8_t> image = read_host_file(host.c_str());
+  UniquePointer<filesystem::IFile> file;
+  if (image.empty() || fs.open_file(StringView(path.c_str()), filesystem::OpenMode::CreateTruncate, &file) != filesystem::Status::Ok) return false;
+  uint64_t put = 0;
+  return file->write(0, ConstByteView(image.data(), image.size()), &put) == filesystem::Status::Ok && put == image.size();
+}
+
+// A mapper that hands out the simulated video memory: the memory BAR starts at kAperture.
+constexpr uint64_t kVideoMemory = 64ull << 20, kGpuBase = 64ull << 20;   // the memory controller puts video memory at 64 MiB of the GPU's address space   // (the memory BAR is at the simulated memory's own address: the OS runs identity mapped, and the firmware's framebuffer is reached through it)
+struct Mapper final : IRegisterMapper {
+  uint8_t* host = nullptr;
+  bool refuse = false;
+  bool map_registers(uint64_t physical, uint64_t length, MmioRegion* region) override {
+    const uint64_t base = reinterpret_cast<uint64_t>(host);
+    if (refuse || physical < base || physical - base + length > kVideoMemory) return false;
+    *region = MmioRegion(physical, length);
+    return true;
+  }
+};
+
+// The whole card
+struct Card final : IVcnRegisters {
+  fakegfx::Card gfx;
+  fakegmc::Card gmc;
+  fakeih::Card ih;
+  fakesdma::Card sdma;
+  fakedce::FakeDisplay dce;
+  size_t other_writes = 0;
+  static bool in(uint32_t r, uint32_t lo, uint32_t hi) { return r >= lo && r <= hi; }
+  IVcnRegisters& owner(uint32_t r) {
+    if (in(r, 0x3400, 0x37ff)) return sdma;
+    if (in(r, 0xe30, 0xe4b) || r == 0x151a || r == 0x151b) return ih;
+    if (in(r, 0x500, 0x57f) || in(r, 0x800, 0x82f) || in(r, 0xb00, 0xbff) || r == 0x394 || r == 0x1524 || r == 0x1528 || r == 0x150a) return gmc;
+    if (in(r, 0x1a00, 0x1fff) || in(r, 0x4000, 0x47ff)) return dce;
+    return gfx;
+  }
+  uint32_t read(uint32_t r) override { return owner(r).read(r); }
+  void write(uint32_t r, uint32_t v) override { owner(r).write(r, v); }
+  size_t writes() const { return gfx.writes.size() + gmc.writes.size() + ih.writes.size() + sdma.writes.size() + dce.writes.size(); }
+};
+
+struct Clock final : IClock {
+  mutable uint64_t now = 0;
+  Card* card = nullptr;
+  uint64_t now_us() const override {
+    now += 50;
+    if (card) {
+      card->sdma.poll();
+      card->gfx.poll_mec();
+    }
+    return now;
+  }
+  const char* name() const override { return "clock"; }
+  bool initialize() override { return true; }
+  void shutdown() override {}
+};
+
+struct Rig {
+  TestAllocator alloc;
+  Card card;
+  Clock clock;
+  Mapper mapper;
+  std::vector<uint8_t> storage, doorbells;
+  uint8_t* vram = nullptr;
+  std::unique_ptr<filesystem::RamFileSystem> fs;
+  explicit Rig(bool with_files = true) : storage(kVideoMemory + 4096), doorbells(0x800 * 4 + 4096) {
+    vram = reinterpret_cast<uint8_t*>((reinterpret_cast<uintptr_t>(storage.data()) + 4095) & ~uintptr_t{4095});
+    mapper.host = vram;
+    clock.card = &card;
+    uint8_t* db = reinterpret_cast<uint8_t*>((reinterpret_cast<uintptr_t>(doorbells.data()) + 4095) & ~uintptr_t{4095});
+    doorbell_base = db;
+    // the memory controller as the firmware left it: 64 MiB at GPU address 0
+    card.gmc.set_reg(0x150a, 64);
+    card.gmc.set_reg(0x809, (7u << 16) | 4u);   // MC_VM_FB_LOCATION: base 4 * 16 MiB, top 7
+    const fakegmc::Window w{kGpuBase, vram, kVideoMemory};
+    card.gmc.windows.push_back(w);
+    card.gfx.windows.push_back({kGpuBase, vram, kVideoMemory});
+    card.sdma.windows.push_back({kGpuBase, vram, kVideoMemory});
+    card.ih.windows.push_back({kGpuBase, vram, kVideoMemory});
+    card.gfx.doorbell_host = db;
+    card.gfx.doorbell_bytes = 0x800 * 4;
+    card.sdma.doorbell_host = db;
+    card.sdma.doorbell_bytes = 0x800 * 4;
+    card.ih.doorbell_host = db;
+    card.ih.doorbell_bytes = 0x800 * 4;
+    card.gfx.set_smc_header();
+    fs.reset(new filesystem::RamFileSystem(alloc));
+    fs->create_directory("/firmware");
+    if (with_files) for (const char* name : kFiles) put_file(*fs, name);
+  }
+  uint8_t* doorbell_base = nullptr;
+  AmdVegaM::Inputs inputs() {
+    AmdVegaM::Inputs in;
+    in.registers = &card;
+    in.clock = &clock;
+    in.file_system = fs.get();
+    in.allocator = &alloc;
+    in.mapper = &mapper;
+    in.device_id = 0x694C;
+    in.aperture_physical = reinterpret_cast<uint64_t>(vram);
+    in.aperture_bytes = 256ull << 20;
+    in.doorbells = MmioRegion(reinterpret_cast<uint64_t>(doorbell_base), 0x800 * 4);
+    in.max_framebuffer_bytes = 4ull << 20;
+    return in;
+  }
+};
+
+constexpr uint64_t kRegion = AmdVegaM::kRegionOffset;
+
+static void test_plan() {
+  const AmdVegaM::Layout l = AmdVegaM::plan(0x140000, 512 * 1024, 8, 4ull << 20);
+  CHECK(l.ok && l.dummy_page == 0 && l.scratch_page == 4096 && l.gart_table == 8192 && l.smu == 8192 + 512 * 1024);
+  CHECK(l.gfx == l.smu + 0x140000 && l.compute == l.gfx + 16384 && l.sdma == l.compute + 9 * 20480 && l.ih == l.sdma + 24576 && l.ib == l.ih + 69632 && l.framebuffer % (1 << 20) == 0 && l.framebuffer >= l.ib + 8192);
+  CHECK(l.total == l.framebuffer + (4ull << 20) && l.total < AmdVegaM::kRegionLimit - AmdVegaM::kRegionOffset);
+  CHECK(!AmdVegaM::plan(0, 512 * 1024, 8, 0).ok && !AmdVegaM::plan(0x140000, 0, 8, 0).ok && !AmdVegaM::plan(0x140000, 512 * 1024, 0, 0).ok && !AmdVegaM::plan(0x140000, 512 * 1024, 9, 0).ok);
+  CHECK(!AmdVegaM::plan(0x140000, 512 * 1024, 8, 80ull << 20).ok && !AmdVegaM::plan(~0ull, 512 * 1024, 8, 0).ok);
+  // The block ends where the video engine's memory may start (half of the visible part).
+  const uint64_t room = AmdVegaM::kRegionLimit - AmdVegaM::kRegionOffset - AmdVegaM::plan(0x140000, 512 * 1024, 8, 0).framebuffer;   // what is left for the framebuffer
+  CHECK(AmdVegaM::plan(0x140000, 512 * 1024, 8, room).ok && !AmdVegaM::plan(0x140000, 512 * 1024, 8, room + 1).ok && room % (1 << 20) == 0 && room > (60ull << 20));
+}
+
+static void test_bring_up() {
+  Rig rig;
+  AmdVegaM vega(rig.alloc);
+  const bool up = vega.bring_up(rig.inputs());
+  if (!up) printf("  %s (step %s)\n", vega.status(), AmdVegaM::step_name(vega.step()));
+  CHECK(up && vega.up() && vega.step() == AmdVegaM::Step::Done);
+  if (!up) return;
+  CHECK(strstr(vega.status(), "GART 256 MiB") && strstr(vega.status(), "8 compute queues"));
+  const AmdVegaM::Layout& l = vega.layout();
+  const uint64_t block_gpu = kGpuBase + kRegion;
+  // The memory controller: the GART at the top of the address space, its table in the block, the dummy and scratch pages in the block.
+  CHECK(vega.gart_plan().ok && vega.gart_plan().gart_start == 0xFF00000000ull);
+  CHECK(rig.card.gmc.reg(0x54F) == (block_gpu + l.gart_table) >> 12 && rig.card.gmc.reg(0x546) == (block_gpu + l.dummy_page) >> 12 && rig.card.gmc.reg(0x80f) == (block_gpu + l.scratch_page) >> 12);
+  CHECK(rig.card.gmc.reg(0x504) == 0x11 && rig.card.gmc.reg(0x80d) == kGpuBase >> 12 && rig.card.gmc.reg(0x80e) == ((kGpuBase + kVideoMemory) >> 12) - 1);
+  // The interrupt ring is in the block and is not snooped; a vector posted by the card is read back.
+  CHECK(vega.interrupts() && vega.interrupts()->running() && rig.card.ih.reg(0xe31) == (block_gpu + l.ih) >> 8 && (rig.card.ih.reg(0x151a) & 0x8));
+  rig.card.ih.post(181, 0x1234, 7, 0, 0);
+  AmdIh3::Vector v[2];
+  CHECK(vega.interrupts()->drain(ArrayView<AmdIh3::Vector>(v, 2)) == 1 && v[0].src_id == 181 && v[0].src_data == 0x1234 && v[0].ring_id == 7);
+  // The microcode: the SMC was told to load the images, which sit in the block.
+  CHECK(rig.card.gfx.status() == 0x47E && rig.card.gfx.toc.size() == 9 && rig.card.gfx.toc_address == block_gpu + l.smu && rig.card.gfx.scratch_address == block_gpu + l.smu + 4096);
+  // The graphics engine, its ring and clear state in the block, and the eight compute queues.
+  CHECK(vega.graphics() && rig.card.gfx.protocol_errors == 0 && rig.card.gfx.compute_protocol_errors == 0 && rig.card.gfx.mapped.size() == 8);
+  CHECK(rig.card.gfx.reg(0x3040) == (block_gpu + l.gfx) >> 8 && rig.card.gfx.reg(0xeca2) == static_cast<uint32_t>(block_gpu + l.gfx + 8192 + 4096));
+  CHECK(rig.card.gfx.mapped[0].mqd_address == block_gpu + l.compute + AmdGfx8Compute::kSlotBytes);
+  // The SDMA engines work in the block: copy a pattern inside the framebuffer area through both.
+  const uint64_t fb = block_gpu + l.framebuffer;
+  uint8_t* fbhost = rig.vram + kRegion + l.framebuffer;
+  for (int i = 0; i < 256; ++i) fbhost[i] = static_cast<uint8_t>(i * 3 + 1);
+  CHECK(vega.sdma() && vega.sdma()->running() && vega.sdma()->copy(0, fb, fb + 1024, 256) && memcmp(fbhost + 1024, fbhost, 256) == 0);
+  CHECK(vega.sdma()->fill(1, fb + 2048, 0xA5A5A5A5, 64) && fbhost[2048] == 0xA5 && fbhost[2111] == 0xA5 && fbhost[2112] == 0);
+  CHECK(rig.card.sdma.protocol_errors == 0 && rig.card.sdma.copies == 1 && rig.card.sdma.fills == 1);
+  // The burst NOP follows the firmware's feature version (31 for the first engine's file, 0 for the second's): the padding after the ring test packet.
+  const uint8_t* sdma_ring0 = rig.vram + kRegion + l.sdma;
+  const uint8_t* sdma_ring1 = sdma_ring0 + AmdSdma3::kSlotBytes;
+  CHECK(sdma_ring0[5 * 4 + 2] == 0x0A && sdma_ring1[5 * 4 + 2] == 0x00);
+  // Command buffers through the three kinds of engine, on the one staging area: a register write on the graphics ring and on a compute queue, a copy on each DMA engine.
+  {
+    const uint64_t data = block_gpu + l.framebuffer + 8192;
+    uint8_t* data_host = rig.vram + kRegion + l.framebuffer + 8192;
+    const uint32_t gfx_ib[] = {0xC0017900, 0x40, 0x0A0A, 0xC0043700, 0x500, static_cast<uint32_t>(data), static_cast<uint32_t>(data >> 32), 0x11110000};
+    CHECK(vega.submit_graphics(ArrayView<const uint32_t>(gfx_ib, 8)) && rig.card.gfx.reg(0xc040) == 0x0A0A && memcmp(data_host, "\0\0\x11\x11", 4) == 0 && rig.card.gfx.ib_runs.size() == 1);
+    const uint32_t compute_ib[] = {0xC0017900, 0x40, 0x0B0B, 0xC0043700, 0x500, static_cast<uint32_t>(data + 4), static_cast<uint32_t>((data + 4) >> 32), 0x22220000};
+    CHECK(vega.submit_compute(6, ArrayView<const uint32_t>(compute_ib, 8)) && rig.card.gfx.reg(0xc040) == 0x0B0B && memcmp(data_host + 4, "\0\0\x22\x22", 4) == 0 && rig.card.gfx.ib_runs.size() == 2 &&
+          rig.card.gfx.ib_runs[1].compute);
+    for (int i = 0; i < 16; ++i) data_host[64 + i] = static_cast<uint8_t>(0x90 + i);
+    for (uint32_t engine : {0u, 1u}) {
+      const uint32_t sdma_ib[] = {1, 16, 0, static_cast<uint32_t>(data + 64), static_cast<uint32_t>((data + 64) >> 32), static_cast<uint32_t>(data + 256 + engine * 64), static_cast<uint32_t>((data + 256 + engine * 64) >> 32)};
+      CHECK(vega.submit_sdma(engine, ArrayView<const uint32_t>(sdma_ib, 7)) && memcmp(data_host + 256 + engine * 64, data_host + 64, 16) == 0);
+    }
+    CHECK(rig.card.sdma.ib_runs.size() == 2 && rig.card.sdma.ib_errors == 0 && rig.card.gfx.ib_protocol_errors == 0);
+    // No commands, too many, a queue or an engine that does not exist.
+    uint32_t big[AmdVegaM::kIbDwords + 1] = {};
+    CHECK(!vega.submit_graphics(ArrayView<const uint32_t>(gfx_ib, 0)) && !vega.submit_graphics(ArrayView<const uint32_t>(big, AmdVegaM::kIbDwords + 1)) &&
+          !vega.submit_compute(8, ArrayView<const uint32_t>(compute_ib, 8)) &&
+          !vega.submit_sdma(2, ArrayView<const uint32_t>(gfx_ib, 8)) && !vega.submit_sdma(0, ArrayView<const uint32_t>(big, 0)));
+  }
+  // Shutting down stops it all in reverse: SDMA halted, compute queues unmapped and the engines halted, the interrupt ring off, the GART off.
+  vega.shutdown();
+  CHECK(!vega.up() && rig.card.sdma.reg(0x3412) == 1 && rig.card.sdma.reg(0x3612) == 1);
+  CHECK(rig.card.gfx.unmapped_doorbells.size() == 8 && (rig.card.gfx.reg(fakegfx::kCpMeCntl) & fakegfx::kMeHalt));
+  CHECK(!(rig.card.ih.reg(0xe30) & 1) && rig.card.gmc.reg(0x504) == 0 && rig.card.gmc.reg(0x505) == 0);
+  // And it can be brought up again.
+  memset(rig.doorbell_base, 0, 0x800 * 4);   // (the doorbell BAR reads back what was last written; the simulated microcode watches for changes, so a new life starts clean)
+  const bool again = vega.bring_up(rig.inputs());
+  if (!again) printf("  second bring-up: %s\n", vega.status());
+  CHECK(again && vega.up());
+}
+
+static void test_failures() {
+  {
+    Rig rig(false);   // no firmware files
+    AmdVegaM vega(rig.alloc);
+    CHECK(!vega.bring_up(rig.inputs()) && strstr(vega.status(), "firmware: vegam_pfp.bin not found") && vega.step() == AmdVegaM::Step::MemoryMap);
+    CHECK(rig.card.writes() == 0);   // the card was only read
+  }
+  {
+    Rig rig;   // one file missing
+    UniquePointer<filesystem::IFile> none;
+    rig.fs->remove("/firmware/vegam_mec2.bin");
+    AmdVegaM vega(rig.alloc);
+    CHECK(!vega.bring_up(rig.inputs()) && strstr(vega.status(), "vegam_mec2.bin not found") && rig.card.writes() == 0);
+  }
+  {
+    Rig rig;   // a file that is not a microcode file
+    UniquePointer<filesystem::IFile> file;
+    CHECK(rig.fs->open_file("/firmware/vegam_ce.bin", filesystem::OpenMode::CreateTruncate, &file) == filesystem::Status::Ok);
+    uint8_t junk[64] = {1, 2, 3};
+    uint64_t put = 0;
+    file->write(0, ConstByteView(junk, 64), &put);
+    AmdVegaM vega(rig.alloc);
+    CHECK(!vega.bring_up(rig.inputs()) && strstr(vega.status(), "not a microcode file") && rig.card.writes() == 0);
+  }
+  {
+    Rig rig;   // the memory controller does not answer
+    rig.card.gmc.set_reg(0x150a, 0);
+    AmdVegaM vega(rig.alloc);
+    CHECK(!vega.bring_up(rig.inputs()) && strstr(vega.status(), "memory map") && rig.card.writes() == 0);
+  }
+  {
+    Rig rig;   // not a Vega M, or no access to the card
+    AmdVegaM vega(rig.alloc);
+    AmdVegaM::Inputs in = rig.inputs();
+    in.device_id = 0x67DF;
+    CHECK(!vega.bring_up(in) && vega.step() == AmdVegaM::Step::None);
+    in = rig.inputs();
+    in.registers = nullptr;
+    CHECK(!vega.bring_up(in));
+    in = rig.inputs();
+    in.doorbells = MmioRegion();
+    CHECK(!vega.bring_up(in));
+    in = rig.inputs();
+    in.aperture_physical = 0;
+    CHECK(!vega.bring_up(in) && rig.card.writes() == 0);
+  }
+  {
+    Rig rig;   // the memory BAR is too small for the block, or cannot be mapped
+    AmdVegaM vega(rig.alloc);
+    AmdVegaM::Inputs in = rig.inputs();
+    in.aperture_bytes = 32ull << 20;
+    CHECK(!vega.bring_up(in) && strstr(vega.status(), "memory: ") && rig.card.writes() == 0);
+    in = rig.inputs();
+    in.max_framebuffer_bytes = 90ull << 20;
+    CHECK(!vega.bring_up(in) && strstr(vega.status(), "does not fit") && rig.card.writes() == 0);
+    Rig small;   // video memory smaller than the block reaches (the memory BAR is not)
+    small.card.gmc.set_reg(0x150a, 52);
+    AmdVegaM v2(small.alloc);
+    CHECK(!v2.bring_up(small.inputs()) && strstr(v2.status(), "too small") && small.card.writes() == 0);
+    rig.mapper.refuse = true;
+    CHECK(!vega.bring_up(rig.inputs()) && strstr(vega.status(), "cannot be mapped") && rig.card.writes() == 0);
+  }
+  {
+    Rig rig;   // the SMC is not running: the memory controller and the interrupt ring that came up are stopped again
+    rig.card.gfx.smc_running = false;
+    AmdVegaM vega(rig.alloc);
+    CHECK(!vega.bring_up(rig.inputs()) && strstr(vega.status(), "microcode: SMC not answering") && vega.step() == AmdVegaM::Step::InterruptHandler);
+    CHECK(rig.card.gmc.reg(0x504) == 0 && !(rig.card.ih.reg(0xe30) & 1));
+  }
+  {
+    Rig rig;   // the command processor does not run: graphics engine failure, everything stopped
+    rig.card.gfx.cp_alive = false;
+    AmdVegaM vega(rig.alloc);
+    CHECK(!vega.bring_up(rig.inputs()) && strstr(vega.status(), "graphics engine: ring test failed") && vega.step() == AmdVegaM::Step::Microcode);
+    CHECK(rig.card.gmc.reg(0x504) == 0 && !(rig.card.ih.reg(0xe30) & 1) && !vega.up());
+  }
+  {
+    Rig rig;   // an SDMA engine that does not run
+    rig.card.sdma.stall[1] = true;
+    AmdVegaM vega(rig.alloc);
+    CHECK(!vega.bring_up(rig.inputs()) && strstr(vega.status(), "SDMA: ring test failed") && vega.step() == AmdVegaM::Step::GraphicsEngine);
+    CHECK(rig.card.gfx.unmapped_doorbells.size() == 8 && rig.card.gmc.reg(0x504) == 0);
+  }
+}
+
+static void test_display() {
+  Rig rig;
+  AmdVegaM vega(rig.alloc);
+  CHECK(vega.bring_up(rig.inputs()));
+  // The firmware's framebuffer at the start of video memory, shown by CRTC 1; the memory BAR starts at kAperture.
+  const uint32_t width = 64, height = 8;
+  amd_dce11::FirmwareFramebuffer fw;
+  fw.physical = reinterpret_cast<uint64_t>(rig.vram);
+  fw.bytes = width * height * 4;
+  fw.width = width;
+  fw.height = height;
+  fw.pitch_pixels = width;
+  for (uint32_t i = 0; i < width * height; ++i) reinterpret_cast<uint32_t*>(rig.vram)[i] = 0xFF000000u | i;
+  rig.card.dce.crtc(1, kGpuBase, width);
+  fakedce::setup_aperture(rig.card.dce);
+  rig.card.dce.set(0x80d, kGpuBase >> 12);          // the aperture covers the block: all of video memory
+  rig.card.dce.set(0x80e, ((kGpuBase + kVideoMemory) >> 12) - 1);
+  // The mapped window for the CPU is where the block is; the firmware's framebuffer lives at the start of the memory BAR.
+  AmdVegaM::Inputs in = rig.inputs();
+  (void)in;
+  ByteView memory;
+  amd_dce11::FirmwareFramebuffer wrong = fw;
+  wrong.pitch_pixels = width + 8;
+  CHECK(!vega.engage_display(wrong, &memory) && !vega.display_engaged());
+  CHECK(vega.engage_display(fw, &memory) && vega.display_engaged() && memory.size() == width * height * 4);
+  CHECK(memory.data() == rig.vram + kRegion + vega.layout().framebuffer && memcmp(memory.data(), rig.vram, width * height * 4) == 0);
+  CHECK(rig.card.dce.get(0x1a04 + 0x200) == static_cast<uint32_t>(kGpuBase + kRegion + vega.layout().framebuffer));
+  memory[0] = 0x55;
+  vega.disengage_display();
+  CHECK(!vega.display_engaged() && rig.card.dce.get(0x1a04 + 0x200) == static_cast<uint32_t>(kGpuBase) && rig.vram[0] == 0x55);
+  // Shutting down with the display engaged puts the firmware's framebuffer back.
+  CHECK(vega.engage_display(fw, &memory) && vega.display_engaged());
+  vega.shutdown();
+  CHECK(rig.card.dce.get(0x1a04 + 0x200) == static_cast<uint32_t>(kGpuBase));
+  // A picture bigger than the block's framebuffer, or a card that is not up, refuses.
+  amd_dce11::FirmwareFramebuffer big = fw;
+  big.pitch_pixels = 4096;
+  big.height = 4096;
+  big.bytes = 4096ull * 4096 * 4;
+  CHECK(!vega.engage_display(fw, &memory));
+  memset(rig.doorbell_base, 0, 0x800 * 4);
+  const bool up2 = vega.bring_up(rig.inputs());
+  if (!up2) printf("  display test, second bring-up: %s\n", vega.status());
+  CHECK(up2 && !vega.engage_display(big, &memory));
+}
+
+int main() {
+  setvbuf(stdout, nullptr, _IONBF, 0);
+  test_plan();
+  test_bring_up();
+  test_failures();
+  test_display();
+  printf(g_failed ? "AmdVegaMTest: %d FAILED\n" : "AmdVegaMTest: all passed\n", g_failed);
+  return g_failed ? 1 : 0;
+}

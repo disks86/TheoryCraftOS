@@ -17,6 +17,7 @@
  */
 
 #pragma once
+#include "Hardware/GraphicsProcessingUnit/AMD/AmdDce11.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdGpuGenerations.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdScanout.hpp"
 #include "Hardware/GraphicsProcessingUnit/UEFI/UefiGopGpu.hpp"
@@ -49,9 +50,12 @@ class AmdGpu final : public UefiGopGpu {
   bool framebuffer_range(uint64_t* base, uint64_t* bytes) const override;
 
   // True while the display engine shows the OS's framebuffer.
-  bool native_scanout() const { return scanout_ && scanout_->engaged(); }
+  bool native_scanout() const { return (scanout_ && scanout_->engaged()) || (native_display_ && native_display_->display_engaged()); }
   // True if the display engine was found and could be driven.
-  bool native_available() const { return scanout_ != nullptr; }
+  bool native_available() const { return scanout_ != nullptr || native_display_ != nullptr; }
+  // A display engine of another kind that shows the OS's framebuffer (the Radeon RX Vega M's DCE 11.2: AmdVegaM). Not owned: it must stay until it is taken away again
+  // with nullptr. The screen is taken over at once for the current mode; taking it away gives the firmware's framebuffer back.
+  void set_native_display(amd_dce11::INativeDisplay* display);
   // Bytes of video memory the OS's framebuffer needs, to be kept clear of other uses (the video engine's memory); 0 if it is not used.
   uint64_t reserved_video_memory() const { return reserved_; }
 
@@ -75,6 +79,7 @@ class AmdGpu final : public UefiGopGpu {
   GpuContext context_;
   MmioVcnRegisters registers_{MmioRegion()};
   UniquePointer<amd_dcn1::Scanout> scanout_;
+  amd_dce11::INativeDisplay* native_display_ = nullptr;
   uint64_t reserved_ = 0;
   uint64_t firmware_base_ = 0, firmware_bytes_ = 0;
   ByteView native_memory_;

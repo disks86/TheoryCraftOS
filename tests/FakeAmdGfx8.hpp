@@ -24,6 +24,7 @@
 #pragma once
 #include <stdint.h>
 #include <string.h>
+#include <functional>
 #include <map>
 #include <vector>
 #include "Hardware/Clock/IClock.hpp"
@@ -100,6 +101,14 @@ class Card final : public hardware::IVcnRegisters {
   bool mec_alive = true;
   uint32_t skip_map_bit = 0xFFFFFFFFu;   // MAP_QUEUES for this queue bit (pipe * 8 + queue) is ignored, as if the microcode failed to map it
   uint32_t queue_executed = 0;   // packets run by compute queues other than the KIQ's (the test packets)
+  // Indirect buffers: every INDIRECT_BUFFER the rings ran (where, how long, on a compute queue or the graphics ring), the fence words written by EVENT_WRITE_EOP / RELEASE_MEM,
+  // and the data written by WRITE_DATA packets inside buffers.
+  struct IbRun { uint64_t address; uint32_t dwords; bool compute; };
+  std::vector<IbRun> ib_runs;
+  uint32_t fence_writes = 0, write_data_packets = 0, ib_protocol_errors = 0;
+  bool ignore_fences = false;    // the engine runs everything but never writes a fence
+
+  void set_smc_header() { set_sram(0x20000 + 48, soft_registers); }   // SMU75_Firmware_Header.SoftRegisters
 
   Card() {
     regs_[kSmcResp] = 1;
@@ -220,6 +229,7 @@ class Card final : public hardware::IVcnRegisters {
   }
 
   // The microcode polls its doorbells: a queue whose doorbell memory changed runs its ring up to the new write pointer.
+ public:
   void poll_mec() {
     if (!mec_ready()) return;
     for (auto& entry : banks_) {
@@ -233,6 +243,7 @@ class Card final : public hardware::IVcnRegisters {
     }
   }
 
+ private:
   void run_queue(uint32_t key, Bank& bank, uint32_t wptr_value) {
     const uint64_t base = (uint64_t{bank.regs[0x324e]} << 32 | bank.regs[0x324d]) << 8;
     const uint32_t dwords = 2u << (bank.regs[0x3256] & 0x3f);   // CP_HQD_PQ_CONTROL.QUEUE_SIZE: 2^(n+1) dwords
@@ -265,6 +276,8 @@ class Card final : public hardware::IVcnRegisters {
   void execute_compute(uint32_t key, uint32_t opcode, const std::vector<uint32_t>& d) {
     const bool kiq = is_kiq(key);
     switch (opcode) {
+      case 0x3F: run_ib(d, true); return;
+      case 0x49: execute_buffer_packet(0x49, d, true); return;
       case 0x79:   // SET_UCONFIG_REG
         if (d.size() < 2) { ++compute_protocol_errors; return; }
         for (size_t i = 1; i < d.size(); ++i) regs_[0xC000 + d[0] + static_cast<uint32_t>(i) - 1] = d[i];
@@ -404,8 +417,62 @@ class Card final : public hardware::IVcnRegisters {
     put32(uint64_t{regs_[kRb0RptrAddrHi]} << 32 | regs_[kRb0RptrAddr], rptr_);
   }
 
+  // One packet of an indirect buffer (or of a ring, for the fence packets).
+  void execute_buffer_packet(uint32_t opcode, const std::vector<uint32_t>& d, bool compute) {
+    switch (opcode) {
+      case 0x10: return;                                    // NOP
+      case 0x79:                                            // SET_UCONFIG_REG
+        if (d.size() < 2) { ++ib_protocol_errors; return; }
+        for (size_t i = 1; i < d.size(); ++i) regs_[0xC000 + d[0] + static_cast<uint32_t>(i) - 1] = d[i];
+        return;
+      case 0x37: {                                          // WRITE_DATA: control, address lo, hi, data...
+        if (d.size() < 4) { ++ib_protocol_errors; return; }
+        const uint64_t address = uint64_t{d[2]} << 32 | (d[1] & ~3u);
+        for (size_t i = 3; i < d.size(); ++i) put32(address + 4 * (i - 3), d[i]);
+        ++write_data_packets;
+        return;
+      }
+      case 0x47:                                            // EVENT_WRITE_EOP (graphics): flags, address lo, hi + selects, data lo, hi
+        if (compute || d.size() != 5) { ++ib_protocol_errors; return; }
+        write_fence(uint64_t{d[2] & 0xFFFF} << 32 | (d[1] & ~3u), d[2] >> 29, d[3], d[4]);
+        return;
+      case 0x49:                                            // RELEASE_MEM (compute): flags, selects, address lo, hi, data lo, hi
+        if (!compute || d.size() != 6) { ++ib_protocol_errors; return; }
+        write_fence(uint64_t{d[3]} << 32 | (d[2] & ~3u), d[1] >> 29, d[4], d[5]);
+        return;
+      default: ++ib_protocol_errors;
+    }
+  }
+  void write_fence(uint64_t address, uint32_t data_sel, uint32_t lo, uint32_t hi) {
+    if (data_sel == 0 || ignore_fences) return;
+    put32(address, lo);
+    if (data_sel == 2) put32(address + 4, hi);
+    ++fence_writes;
+  }
+  // INDIRECT_BUFFER: address lo, hi (16 bits), control (length in dwords, valid bit 23 for compute, VMID 27:24)
+  void run_ib(const std::vector<uint32_t>& d, bool compute) {
+    if (d.size() != 3) { ++ib_protocol_errors; return; }
+    const uint64_t address = uint64_t{d[1] & 0xFFFF} << 32 | (d[0] & ~3u);
+    const uint32_t dwords = d[2] & 0xFFFFF, vmid = d[2] >> 24 & 0xF;
+    if (vmid != 0 || compute != ((d[2] >> 23 & 1) != 0) || dwords == 0 || !translate(address, uint64_t{dwords} * 4)) { ++ib_protocol_errors; return; }
+    ib_runs.push_back({address, dwords, compute});
+    for (uint32_t pos = 0; pos < dwords;) {
+      const uint32_t h = get32(address + uint64_t{pos} * 4);
+      const uint32_t opcode = h >> 8 & 0xFF, count = h >> 16 & 0x3FFF;
+      const bool filler = opcode == 0x10 && count == 0x3FFF;
+      const uint32_t body = filler ? 0 : count + 1;
+      if ((h >> 30) != 3 || pos + 1 + body > dwords) { ++ib_protocol_errors; return; }
+      std::vector<uint32_t> body_words;
+      for (uint32_t i = 0; i < body; ++i) body_words.push_back(get32(address + uint64_t{pos + 1 + i} * 4));
+      pos += 1 + body;
+      if (!filler) execute_buffer_packet(opcode, body_words, compute);
+    }
+  }
+
   void execute(const Executed& e) {
     switch (e.opcode) {
+      case 0x3F: run_ib(e.body, false); break;
+      case 0x47: execute_buffer_packet(0x47, e.body, false); break;
       case 0x10: case 0x11: case 0x12: case 0x28: case 0x4A: case 0x69: break;   // NOP, SET_BASE, CLEAR_STATE, CONTEXT_CONTROL, PREAMBLE_CNTL, SET_CONTEXT_REG
       case 0x79:                                                                // SET_UCONFIG_REG
         for (size_t i = 1; i < e.body.size(); ++i) regs_[0xC000 + e.body[0] + static_cast<uint32_t>(i) - 1] = e.body[i];
@@ -432,7 +499,12 @@ class Card final : public hardware::IVcnRegisters {
 
 struct FakeClock final : hardware::IClock {
   mutable uint64_t now = 0;
-  uint64_t now_us() const override { now += 50; return now; }
+  std::function<void()> on_tick;   // the microcode looks at its doorbells now (code that waits on memory words, not registers, would never give it the chance)
+  uint64_t now_us() const override {
+    now += 50;
+    if (on_tick) on_tick();
+    return now;
+  }
   const char* name() const override { return "fake clock"; }
   bool initialize() override { return true; }
   void shutdown() override {}
