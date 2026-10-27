@@ -90,7 +90,7 @@ AmdIh3::Result AmdIh3::start(const Memory& memory) {
   // INTERRUPT_CNTL__IH_DUMMY_RD_OVERRIDE_MASK=1 - dummy read controlled by IH_DUMMY_RD_EN
   interrupt_cntl = REG_SET_FIELD(interrupt_cntl, INTERRUPT_CNTL, IH_DUMMY_RD_OVERRIDE, 0);
   // INTERRUPT_CNTL__IH_REQ_NONSNOOP_EN_MASK=1 if ring is in non-cacheable memory, e.g., vram
-  interrupt_cntl = REG_SET_FIELD(interrupt_cntl, INTERRUPT_CNTL, IH_REQ_NONSNOOP_EN, 0);
+  interrupt_cntl = REG_SET_FIELD(interrupt_cntl, INTERRUPT_CNTL, IH_REQ_NONSNOOP_EN, config_.ring_in_video_memory ? 1 : 0);
   wr(mmINTERRUPT_CNTL, interrupt_cntl);
 
   // Ring Buffer base. [39:8] of 40-bit address of the beginning of the ring buffer

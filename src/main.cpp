@@ -69,6 +69,10 @@
 #include "Hardware/SerialPort/X86SerialPortIo.hpp"
 #include "Hardware/Clock/TscClock.hpp"
 #include "Hardware/VideoCodec/SystemVideoCodecs.hpp"
+#ifdef TCOS_AMD_VEGAM
+#include "Hardware/GraphicsProcessingUnit/AMD/AmdVegaM.hpp"
+#include "Hardware/VideoCodec/AMD/AmdGmc8Memory.hpp"
+#endif
 #include "Media/MediaCodecs.hpp"
 #include "Hardware/Guest/SystemGuestServices.hpp"
 #include "Hardware/HyperV/SystemHyperV.hpp"
@@ -603,6 +607,9 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
 
   // Video codecs: a device per GPU video engine found (not driven yet: its sessions run on the CPU) and the software codec.
   hardware::SystemVideoCodecs video_codecs(pci, shared_allocator);
+#ifdef TCOS_AMD_VEGAM
+  UniquePointer<hardware::AmdVegaM> vega_m;   // the Radeon RX Vega M's memory controller, engines and display (opt-in, below)
+#endif
 #ifdef TCOS_AMD_UVD
   video_codecs.set_amd_uvd6(true);   // the Radeon RX Vega M's UVD 6 engine (opt-in: it has not run on a real card)
 #endif
@@ -982,6 +989,62 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     filesystem::set_unix_clock(wall_clock_seconds, nullptr);   // before the volumes are mounted: they stamp what they create
     SystemFileSystem explorer_files(shared_allocator, storage);
     desktop::KernelProgramLauncher program_launcher(shared_allocator);      // what the terminals run programs with
+#ifdef TCOS_AMD_VEGAM
+    // The Radeon RX Vega M of a Kaby Lake-G machine: the memory controller with its GART, the interrupt ring, the engines' microcode through the SMC, the graphics engine with
+    // its compute queues and the SDMA engines (in the order of the Linux driver, before the video engine, which needs the memory controller), and, if the card drives the display
+    // the firmware set up, the OS's own framebuffer in its memory. Opt-in (-DTCOS_AMD_VEGAM=ON): none of it has run on a real card.
+    if (clock_ok && paging_ok) {
+      for (uint32_t i = 0; i < pci.device_count(); ++i) {
+        hardware::PciDeviceInfo d;
+        if (!pci.pci_device(i, &d) || d.vendor_id != hardware::AmdGpu::kPciVendor || !hardware::amd_uvd6_firmware_name(d.device_id)) continue;
+        constexpr uint16_t kPciCommand = 0x04;
+        const uint32_t command = pci.read32(d.address, kPciCommand) & 0xFFFF;   // (not the status bits above, which clear when written)
+        pci.write32(d.address, kPciCommand, command | (1u << 1) | (1u << 2));   // memory space and bus mastering: the card writes its interrupt ring
+        hardware::MmioRegion registers_window, doorbells;
+        const uint64_t registers_base = pci.memory_bar(d.address, 5), doorbell_base = pci.memory_bar(d.address, 2), aperture_base = pci.memory_bar(d.address, 0);
+        uint64_t aperture_bytes = 0;
+        if (!registers_base || !doorbell_base || !aperture_base || !bar_sizer.bar_size(d.address, 0, &aperture_bytes) ||
+            !register_mapper.map_registers(registers_base, hardware::kAmdGmc8RegisterBytes, &registers_window) || !register_mapper.map_registers(doorbell_base, 0x10000, &doorbells)) {
+          Entry(Level::Warning, "Vega M").text("not started - the card's BARs cannot be mapped");
+          break;
+        }
+        hardware::MmioVcnRegisters vega_registers(registers_window);
+        hardware::AmdGpu* display = system_gpu.amd_gpu();
+        hardware::PciAddress display_location{};
+        const bool drives_display = display && display->pci_location(&display_location) && display_location.bus == d.address.bus && display_location.device == d.address.device &&
+                                    display_location.function == d.address.function;
+        uint64_t largest = 0;
+        for (uint32_t m = 0; drives_display && m < display->mode_count(); ++m) {
+          hardware::DisplayMode mode;
+          if (display->mode_info(m, &mode)) largest = largest > (uint64_t{mode.width} + 64) * 4 * mode.height ? largest : (uint64_t{mode.width} + 64) * 4 * mode.height;
+        }
+        vega_m = UniquePointer<hardware::AmdVegaM>::make(shared_allocator, shared_allocator);
+        if (!vega_m) break;
+        hardware::AmdVegaM::Inputs inputs;
+        inputs.registers = &vega_registers;
+        inputs.clock = &clock;
+        inputs.file_system = &explorer_files.file_system();
+        inputs.allocator = &shared_allocator;
+        inputs.mapper = &register_mapper;
+        inputs.device_id = d.device_id;
+        inputs.aperture_physical = aperture_base;
+        inputs.aperture_bytes = aperture_bytes;
+        inputs.doorbells = doorbells;
+        inputs.max_framebuffer_bytes = largest;
+        const bool up = vega_m->bring_up(inputs);
+        Entry(up ? Level::Ok : Level::Warning, "Vega M").text(up ? "started: " : "not started - ").text(vega_m->status());
+        if (!up) {
+          vega_m = UniquePointer<hardware::AmdVegaM>();
+        } else if (drives_display) {
+          display->set_native_display(vega_m.get());
+          Entry(display->native_scanout() ? Level::Ok : Level::Info, "Vega M").text(display->native_scanout() ? "display: own framebuffer in video memory (DCE 11.2)" : "display: the firmware's framebuffer stays (the CRTC does not show it as expected)");
+        } else {
+          Entry(Level::Info, "Vega M").text("display: the card does not drive the display the firmware set up");
+        }
+        break;
+      }
+    }
+#endif
     // Microcode the video engines need, from /firmware on the root volume (AMD VCN 1: Ryzen 2000/3000 "Raven" APUs). Only read and checked here; no engine is
     // started with it yet.
     for (uint32_t i = 0; i < video_codecs.count(); ++i) {
@@ -1193,6 +1256,10 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   audio.shutdown();
   cameras.shutdown();
   serial_ports.shutdown();
+#ifdef TCOS_AMD_VEGAM
+  if (hardware::AmdGpu* display = system_gpu.amd_gpu()) display->set_native_display(nullptr);   // (gives the firmware's framebuffer back before the card is stopped)
+  vega_m = UniquePointer<hardware::AmdVegaM>();
+#endif
   video_codecs.shutdown();
   network.shutdown();
   printers.shutdown();
