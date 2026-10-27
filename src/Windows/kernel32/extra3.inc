@@ -246,10 +246,11 @@ static void atom_lock(void) {
 static WCHAR wide_fold(WCHAR c) { return wide_upper(c); }
 static BOOL atom_equal(const WCHAR *a, const WCHAR *b) { while (*a && *b) { if (wide_fold(*a) != wide_fold(*b)) return FALSE; ++a; ++b; } return *a == *b; }
 static ATOM atom_add(LPCWSTR name, BOOL global) {
-  if (!name) { set_error(ERROR_INVALID_PARAMETER); return 0; }
+  if (!name) return 0;      /* fails without an error code */
   if (((ULONG_PTR)name >> 16) == 0) {      /* MAKEINTATOM */
     const ULONG_PTR id = (ULONG_PTR)name;
-    if (id == 0 || id >= 0xC000) { set_error(ERROR_INVALID_PARAMETER); return 0; }
+    if (id == 0) return 0;      /* fails without an error code */
+    if (id >= 0xC000) { set_error(ERROR_INVALID_PARAMETER); return 0; }
     return (ATOM)id;
   }
   if (name[0] == '#') {      /* "#123" is the integer atom 123 */
@@ -258,7 +259,7 @@ static ATOM atom_add(LPCWSTR name, BOOL global) {
     if (digits) { if (v == 0 || v >= 0xC000) { set_error(ERROR_INVALID_PARAMETER); return 0; } return (ATOM)v; }
   }
   const size_t_ len = wcslen(name);
-  if (len == 0 || len > 255) { set_error(len == 0 ? ERROR_INVALID_PARAMETER : ERROR_BUFFER_OVERFLOW); return 0; }
+  if (len == 0 || len > 255) { set_error(ERROR_INVALID_PARAMETER); return 0; }
   atom_lock();
   int free_slot = -1;
   for (int i = 0; i < ATOM_MAX; ++i) {
@@ -295,42 +296,59 @@ static ATOM atom_delete(ATOM atom, BOOL global) {
   LeaveCriticalSection(&g_atom_lock);
   return result;
 }
-static UINT atom_name(ATOM atom, BOOL global, LPWSTR buffer, int capacity) {
+/* The text of an atom (an integer atom is "#n"); returns its length, or 0 with the error set. */
+static UINT atom_text(ATOM atom, BOOL global, WCHAR *text) {
   if (atom == 0) { set_error(ERROR_INVALID_PARAMETER); return 0; }
-  if (atom < 0xC000) {      /* an integer atom is written as #n */
-    WCHAR tmp[8]; int t = 0; unsigned x = atom; WCHAR digits[6]; int d = 0;
+  if (atom < 0xC000) {
+    WCHAR digits[6]; int d = 0, t = 0; unsigned x = atom;
     do { digits[d++] = (WCHAR)('0' + x % 10); x /= 10; } while (x);
-    tmp[t++] = '#'; while (d) tmp[t++] = digits[--d]; tmp[t] = 0;
-    if (capacity <= t) { set_error(ERROR_INSUFFICIENT_BUFFER); return 0; }
-    memcpy(buffer, tmp, ((size_t_)t + 1) * 2);
+    text[t++] = '#'; while (d) text[t++] = digits[--d]; text[t] = 0;
     return (UINT)t;
   }
   const int i = atom - 0xC000;
   atom_lock();
   UINT result = 0;
   if (i >= ATOM_MAX || !g_atoms[i].name || g_atoms[i].global != global) set_error(ERROR_INVALID_HANDLE);
-  else {
-    const int len = (int)wcslen(g_atoms[i].name);
-    if (capacity <= 0) set_error(ERROR_INSUFFICIENT_BUFFER);
-    else {      /* truncated to fit, like the original */
-      const int n = len < capacity - 1 ? len : capacity - 1;
-      memcpy(buffer, g_atoms[i].name, (size_t_)n * 2);
-      buffer[n] = 0;
-      result = (UINT)n;
-    }
-  }
+  else { result = (UINT)wcslen(g_atoms[i].name); memcpy(text, g_atoms[i].name, ((size_t_)result + 1) * 2); }
   LeaveCriticalSection(&g_atom_lock);
   return result;
 }
+/* The local atoms cut a name that does not fit and terminate it; with room for no character the call fails with ERROR_INSUFFICIENT_BUFFER. */
+static BOOL atom_cut_local(UINT len, int capacity, UINT *n) {
+  if (capacity <= 1) { set_error(capacity <= 0 ? ERROR_INVALID_PARAMETER : ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+  *n = len < (UINT)capacity - 1 ? len : (UINT)capacity - 1;
+  return TRUE;
+}
+/* Wide (global atoms): as many characters as fit; the terminator only when there is room for it. */
+static UINT atom_name(ATOM atom, BOOL global, LPWSTR buffer, int capacity) {
+  WCHAR text[260];
+  const UINT len = atom_text(atom, global, text);
+  if (len == 0) return 0;
+  if (!global) {
+    UINT cut;
+    if (!atom_cut_local(len, capacity, &cut)) return 0;
+    memcpy(buffer, text, (size_t_)cut * 2);
+    buffer[cut] = 0;
+    return cut;
+  }
+  if (capacity <= 0) { set_error(ERROR_INVALID_PARAMETER); return 0; }
+  const UINT n = len < (UINT)capacity ? len : (UINT)capacity;
+  memcpy(buffer, text, (size_t_)n * 2);
+  if (n < (UINT)capacity) buffer[n] = 0;
+  return n;
+}
+/* ANSI: a name that does not fit is cut short, terminated, and reported as ERROR_MORE_DATA with a length of 0. */
 static UINT atom_name_a(ATOM atom, BOOL global, LPSTR buffer, int capacity) {
-  WCHAR wide[256];
-  const UINT n = atom_name(atom, global, wide, 256);
-  if (n == 0) return 0;
-  const int m = capacity - 1 < (int)n ? capacity - 1 : (int)n;
-  if (capacity <= 0) { set_error(ERROR_INSUFFICIENT_BUFFER); return 0; }
-  for (int i = 0; i < m; ++i) buffer[i] = (char)wide[i];
-  buffer[m] = 0;
-  return (UINT)m;
+  WCHAR text[260];
+  const UINT len = atom_text(atom, global, text);
+  if (len == 0) return 0;
+  UINT n;
+  if (!global) { if (!atom_cut_local(len, capacity, &n)) return 0; }
+  else { if (capacity <= 0) { set_error(ERROR_INVALID_PARAMETER); return 0; } n = len < (UINT)capacity - 1 ? len : (UINT)capacity - 1; }
+  for (UINT i = 0; i < n; ++i) buffer[i] = (char)text[i];
+  buffer[n] = 0;
+  if (global && n < len) { set_error(ERROR_MORE_DATA); return 0; }
+  return n;
 }
 #define ATOM_FROM_A(call) do { WCHAR *w_ = ((ULONG_PTR)name >> 16) ? to_wide(name) : (WCHAR *)name; ATOM r_ = (call); if (((ULONG_PTR)name >> 16)) free_wide(w_); return r_; } while (0)
 EXPORT ATOM WINAPI AddAtomW(LPCWSTR name) { return atom_add(name, FALSE); }
