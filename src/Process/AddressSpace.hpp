@@ -49,6 +49,17 @@ class SharedMemory {
   ~SharedMemory() = default;
 };
 
+// What the Windows layer knows about a run of pages beyond the permissions: the PAGE_* constant it was given (copy-on-write, guard ...), the one the allocation started
+// with, what kind of memory it is and whether it is only reserved. protect == 0: nothing recorded, the Windows layer derives it from the permissions.
+struct PageAttributes {
+  enum Type : uint8_t { Private = 0, Mapped = 1, Image = 2 };
+  uint32_t protect = 0, allocation_protect = 0;
+  uint8_t type = Private;
+  bool reserved = false;      // reserved, not committed
+  bool file_view = false;     // a view of a file (a view of plain memory can still be committed)
+  bool operator==(const PageAttributes& o) const { return protect == o.protect && allocation_protect == o.allocation_protect && type == o.type && reserved == o.reserved && file_view == o.file_view; }
+};
+
 class AddressSpace final : public IUserMemory {
  public:
   static constexpr uint64_t kPageSize = 4096;
@@ -109,6 +120,8 @@ class AddressSpace final : public IUserMemory {
     uint64_t base = 0, size = 0;
     uint8_t protection = 0;
     const uint8_t* storage = nullptr;
+    uint64_t allocation = 0;
+    PageAttributes attributes;
   };
   bool region_at(uint64_t index, RegionInfo* out) const;
   // Counts every change to the layout (map, unmap, protect, resize), so a user of the page tables knows when to rebuild them.
@@ -120,11 +133,19 @@ class AddressSpace final : public IUserMemory {
 
   // IUserMemory: the program's access. Needs read (or write) permission on every page; fails without changing anything otherwise.
   bool read(uint64_t address, ByteView out) override { return check(address, out.size(), kProtRead) && copy_out(address, out); }
-  bool write(uint64_t address, ConstByteView data) override { return check(address, data.size(), kProtWrite) && copy_in(address, data); }
+  bool write(uint64_t address, ConstByteView data) override { return (check(address, data.size(), kProtWrite) || (break_copy_on_write(address, data.size()) && check(address, data.size(), kProtWrite))) && copy_in(address, data); }
 
   // Is every byte of the range mapped with at least these permissions?
   bool check(uint64_t address, uint64_t size, uint8_t protection) const;
   bool protection_at(uint64_t address, uint8_t* out) const;
+  // The Windows attributes of [address, address + size), which must be mapped; the regions are cut at its ends.
+  bool set_attributes(uint64_t address, uint64_t size, const PageAttributes& attributes);
+  bool attributes_at(uint64_t address, PageAttributes* out) const;
+  // Changes only the PAGE_* constant and the reserved flag of [address, address + size), keeping the rest of each region's attributes.
+  // A write to copy-on-write pages (PAGE_WRITECOPY, PAGE_EXECUTE_WRITECOPY) of [address, address + size): each such page gets a copy of its own (a view of a section stops
+  // sharing it), becomes writable and is PAGE_READWRITE / PAGE_EXECUTE_READWRITE from then on. False if the range holds no such page or memory ran out.
+  bool break_copy_on_write(uint64_t address, uint64_t size);
+  bool set_page_protect(uint64_t address, uint64_t size, uint32_t protect, bool reserved);
   uint64_t mapped_bytes() const { return mapped_bytes_; }
   uint64_t region_count() const { return regions_.count(); }
 
@@ -151,6 +172,7 @@ class AddressSpace final : public IUserMemory {
     ByteView bytes() const { return ByteView(storage, size); }
     uint64_t base = 0, size = 0, allocation = 0;      // `allocation` ties together the pieces of one map() call
     uint8_t protection = 0;
+    PageAttributes attributes;
     uint8_t* storage = nullptr;
     uint64_t capacity = 0;
     SharedMemory* shared = nullptr;      // not ours: a section's memory, which we only map

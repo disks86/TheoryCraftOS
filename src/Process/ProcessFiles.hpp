@@ -100,6 +100,8 @@ class ProcessFiles {
   bool duplicate_to(uint64_t slot, uint64_t target);
   bool close_on_exec(uint64_t slot) const { return slot < kMaxDescriptors && slots_[slot].close_on_exec; }
   void set_close_on_exec(uint64_t slot, bool value) { if (slot < kMaxDescriptors) slots_[slot].close_on_exec = value; }
+  uint32_t denied_access(uint64_t slot) const { return slot < kMaxDescriptors ? slots_[slot].denied : 0; }
+  void set_denied_access(uint64_t slot, uint32_t denied) { if (slot < kMaxDescriptors) slots_[slot].denied = denied; }
   bool inheritable(uint64_t slot) const { return slot < kMaxDescriptors && slots_[slot].inherit; }
   bool protected_from_close(uint64_t slot) const { return slot < kMaxDescriptors && slots_[slot].protect; }
   void set_handle_flags(uint64_t slot, bool inherit, bool protect) { if (slot < kMaxDescriptors) { slots_[slot].inherit = inherit; slots_[slot].protect = protect; } }
@@ -152,6 +154,7 @@ class ProcessFiles {
     SharedPointer<OpenObject> object;
     uint64_t token = 0;
     bool close_on_exec = false;
+    uint32_t denied = 0;      // access rights the handle lacks (a duplicate made with fewer rights than the original); 0 for a handle with all its object's rights
     bool inherit = false, protect = false;      // Windows handle flags: a child process gets the handle (CreateProcess with bInheritHandles); it cannot be closed
   };
   bool host_path(StringView virtual_path, String* out) const;

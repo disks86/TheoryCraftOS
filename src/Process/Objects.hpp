@@ -124,9 +124,11 @@ class ObjectManager {
   struct SectionInfo {
     uint64_t size = 0;
     bool writable = false, file_backed = false;
+    uint32_t page = 0;      // the PAGE_* protection it was made with
+    uint32_t attributes = 0;      // what NtQuerySection reports: SEC_COMMIT / SEC_RESERVE / SEC_FILE / SEC_NOCACHE ...
   };
   // `fs` / `host_path`: the file that backs it (nullptr: plain memory, zero at the start). A file is read into the section (its size or `size`, the bigger).
-  Created create_section(StringView name, uint64_t size, bool writable, filesystem::IFileSystem* fs, StringView host_path);
+  Created create_section(StringView name, uint64_t size, uint32_t page, uint32_t attributes, filesystem::IFileSystem* fs, StringView host_path);
   // The memory of the section for AddressSpace::map_shared(); false if there is no such section.
   bool section_memory(uint32_t id, uint8_t** storage, uint64_t* size, SharedMemory** owner);
   bool section_info(uint32_t id, SectionInfo* out);

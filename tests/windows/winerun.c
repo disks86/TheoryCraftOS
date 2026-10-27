@@ -42,7 +42,13 @@ int main(void) {
       continue;
     }
     char command[260];
-    snprintf(command, sizeof(command), "C:\\Windows\\System32\\%s", line);
+    /* Wine's tests start themselves again to get a second process, and for that they need their own name as the first argument (<dll>_<test>.exe: the test is <test>). */
+    char test_name[100] = "";
+    {
+      const char *underscore = strchr(line, '_'), *dot = strrchr(line, '.');
+      if (underscore && dot && dot > underscore + 1 && (size_t)(dot - underscore) < sizeof(test_name)) { memcpy(test_name, underscore + 1, (size_t)(dot - underscore - 1)); test_name[dot - underscore - 1] = 0; }
+    }
+    snprintf(command, sizeof(command), "C:\\Windows\\System32\\%s%s%s", line, test_name[0] ? " " : "", test_name);
     STARTUPINFOA si;
     memset(&si, 0, sizeof(si));
     si.cb = sizeof(si);
