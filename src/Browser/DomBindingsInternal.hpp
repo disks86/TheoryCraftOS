@@ -211,7 +211,7 @@ Value make_event(DomBindings::Impl& c, StringView type, const EventInit& init, J
 
 // Styles (DomBindingsStyle.cpp).
 Value make_style_object(DomBindings::Impl& c, dom::Node* element);
-Value make_computed_style(DomBindings::Impl& c, dom::Node* element);
+Value make_computed_style(DomBindings::Impl& c, dom::Node* element, uint32_t pseudo = 0);   // pseudo: a PseudoElement
 Value make_token_list(DomBindings::Impl& c, dom::Node* element);
 Value make_dataset(DomBindings::Impl& c, dom::Node* element);
 

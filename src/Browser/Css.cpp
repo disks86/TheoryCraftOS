@@ -2851,9 +2851,10 @@ struct CssApply {
   EvalContext eval;
   const Style initial;   // the style with every property at its initial value
   const Style ua_start;  // the style the cascade began with (what the browser's own style sheet gave): what `revert` goes back to
+  Style layer_start;     // the style before the declarations of the layer being applied: what `revert-layer` goes back to
   uint32_t inherited_scope;   // the custom property scope the style started with (what the parent passed on)
 
-  CssApply(const StyleSheet& s, const Style& p, Style* st, const dom::Node* el) : sheet(s), parent(p), style(st), element(el), ua_start(*st), inherited_scope(st->custom_scope) { refresh(); }
+  CssApply(const StyleSheet& s, const Style& p, Style* st, const dom::Node* el) : sheet(s), parent(p), style(st), element(el), ua_start(*st), layer_start(*st), inherited_scope(st->custom_scope) { refresh(); }
 
   void refresh() {
     eval.font_px = style->font_px;
@@ -3194,7 +3195,7 @@ struct CssApply {
       if (value.empty()) { apply_wide(p, 2); return; }
     }
     if (p == pAll) {   // all: every property but the custom ones takes the keyword
-      const int which = eq(value, "inherit") ? 0 : eq(value, "initial") ? 1 : eq(value, "unset") ? 2 : eq(value, "revert") ? 3 : -1;
+      const int which = eq(value, "inherit") ? 0 : eq(value, "initial") ? 1 : eq(value, "unset") ? 2 : eq(value, "revert") ? 3 : eq(value, "revert-layer") ? 4 : -1;
       if (which >= 0)
         for (uint32_t q = pCustom + 1; q < pLastLonghand; ++q)
           if (q != pDirection && q != pWritingMode) apply_wide(static_cast<Prop>(q), which);
@@ -3204,20 +3205,21 @@ struct CssApply {
     else if (eq(value, "initial")) apply_wide(p, 1);
     else if (eq(value, "unset")) apply_wide(p, 2);
     else if (eq(value, "revert")) apply_wide(p, 3);
-    else if (eq(value, "revert-layer")) apply_wide(p, 2);
+    else if (eq(value, "revert-layer")) apply_wide(p, 4);
     else apply_value(p, value);
     if (p == pFontSize || p == pFont || p == pDisplay || p == pLineHeight) refresh();
   }
 
-  // inherit (0), initial (1) and unset (2) for a property or all the longhands of a shorthand.
+  // inherit (0), initial (1), unset (2), revert (3) and revert-layer (4) for a property or all the longhands of a shorthand.
   void apply_wide(Prop p, int which) {
     Prop list[16];
     const uint32_t n = longhands_of(p, list);
     for (uint32_t i = 0; i < n; ++i) {
       const bool from_parent = which == 0 || (which == 2 && inherited_property(list[i]));
-      copy_property(list[i], which == 3 ? ua_start : from_parent ? parent : initial, style);
+      copy_property(list[i], which == 3 ? ua_start : which == 4 ? layer_start : from_parent ? parent : initial, style);
       if (list[i] == pFontSize) {
         if (which == 3) style->font_px = ua_start.font_px;
+        else if (which == 4) style->font_px = layer_start.font_px;
         else if (from_parent) style->font_px = parent.font_px;
         else style->font_px = 16;
       }
@@ -3310,6 +3312,7 @@ struct CssApply {
 
   void display_kind(StringView v) {
     style->contents = false;
+    style->flow_root = eq(v, "flow-root");
     style->inline_box = false;
     style->layout = Layout::Flow;
     if (eq(v, "none")) style->display = Display::None;
@@ -6456,6 +6459,7 @@ void StyleSheet::apply(const dom::Node* element, StringView inline_style, const 
     for (int pass = 0; pass < 2; ++pass) {
       const bool important = pass == 1;
       for (uint32_t m = 0; m < count; ++m) {
+        if (round == 2 && (m == 0 || rank_of(ordered[pass][m]) != rank_of(ordered[pass][m - 1]))) a.layer_start = *style;   // (a new layer: revert-layer goes back to here)
         const Rule& rule = rules_[selectors_.tag(ordered[pass][m])];
         for (uint32_t d = 0; d < rule.declaration_count; ++d) {
           const Declaration& decl = declarations_[rule.first_declaration + d];
@@ -6480,6 +6484,7 @@ void StyleSheet::apply(const dom::Node* element, StringView inline_style, const 
         }
       }
       if (inline_style.empty()) continue;
+      if (round == 2) a.layer_start = *style;
       for_each_declaration(inline_style, [&](StringView name, StringView value, bool is_important) {
         if (is_important != important) return;
         const Prop p = property_from_name(name);

@@ -152,7 +152,7 @@ class IPageEnvironment : public IObjectEnvironment {
   ~IPageEnvironment() = default;
 };
 
-class Page final : public script::IHost, public IDomHost, public dom::IScriptRunner, public IStyleSource, public IFrameSource {
+class Page final : public script::IHost, public IDomHost, public dom::IScriptRunner, public IStyleSource, public IFrameSource, public IContainerSizes {
  public:
   static constexpr uint32_t kMaxExternalScripts = 12, kMaxStyleSheets = 8;
   static constexpr uint64_t kMaxScriptBytes = 1u << 20, kMaxStyleSheetBytes = 512u << 10;
@@ -308,6 +308,8 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   bool fullscreen_request(dom::Node* element) override;
   void fullscreen_exit() override;
   bool computed_style(const dom::Node* element, Style* out) override;
+  bool computed_pseudo_style(const dom::Node* element, PseudoElement pseudo, Style* out) override;
+  bool container_size(const dom::Node* element, StringView name, int32_t* width_px, int32_t* height_px) override;   // for @container rules
   const StyleSheet* computed_style_sheet() override { return &style_sheet(); }
   dom::Document* parse_document(StringView html) override;
   StorageArea& local_storage() override { return env_.local_storage_hub().area(storage_origin()); }
