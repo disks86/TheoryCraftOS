@@ -152,6 +152,8 @@ class ObjectManager {
   // Would an open wanting `access` with everything shared be allowed? (Deleting a file, renaming it.) Takes the lock itself.
   bool share_allows(StringView path, uint32_t access);
   void share_release(const void* owner);      // the open file is gone
+  // The open files of `path` (at most `capacity` of them are written to `owners`); how many there are.
+  uint32_t share_owners(StringView path, const void** owners, uint32_t capacity);
 
   // --- job objects (kind Job: create() and open() make and find them). A job groups processes: its limits (active process count, kill on close, breakaway) are enforced and
   // its members can be ended together. A process belongs to at most one job; the processes it starts join the same job. Members are ended by a flag that they see themselves

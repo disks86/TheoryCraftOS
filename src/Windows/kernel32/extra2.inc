@@ -224,6 +224,7 @@ EXPORT LONG WINAPI CopyFile2(LPCWSTR from, LPCWSTR to, const COPYFILE2_PARAMETER
   return (LONG)(error == 0 ? 0u : ((error & 0xFFFF) | 0x80070000u));
 }
 EXPORT BOOL WINAPI CopyFileExA(LPCSTR from, LPCSTR to, LPPROGRESS_ROUTINE_ progress, LPVOID data, LPBOOL cancel, DWORD flags) {
+  if (!from || !to) { set_error(ERROR_PATH_NOT_FOUND); return FALSE; }
   WCHAR *a = from ? to_wide(from) : NULL, *b = to ? to_wide(to) : NULL;
   const BOOL ok = a && b ? CopyFileExW(a, b, progress, data, cancel, flags) : FALSE;
   free_wide(a); free_wide(b);

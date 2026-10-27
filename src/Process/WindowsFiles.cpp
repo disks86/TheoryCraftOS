@@ -223,14 +223,15 @@ uint32_t open_by_attributes(Process& p, uint64_t object_attributes, uint32_t acc
   if (existed && before.type == NodeType::Directory) {
     f.write = false;      // a directory is opened to be listed or queried
     f.truncate = false;
-    if (disposition == kCreate) return kObjectNameCollision;
     if (f.must_not_be_directory) return kFileIsADirectory;
+    if (disposition == kCreate) return kObjectNameCollision;
   }
   ObjectManager* sharing = system_objects();
   uint32_t wanted = 0;      // what the open does with the file, for the sharing rules
   if (access & (kGenericRead | kGenericAll | kFileReadData | 0x20 /* FILE_EXECUTE */ | 0x20000000u /* GENERIC_EXECUTE */)) wanted |= ObjectManager::kShareRead;
   if (access & (kGenericWrite | kGenericAll | kFileWriteData | kFileAppendData)) wanted |= ObjectManager::kShareWrite;
   if ((access & (kGenericAll | 0x10000 /* DELETE */)) || (options & kDeleteOnClose)) wanted |= ObjectManager::kShareDelete;
+  if (f.truncate) wanted |= ObjectManager::kShareWrite;      // overwriting a file writes to it
   if (existed && before.type != NodeType::Directory) {
     if (f.must_be_directory) return kNotADirectory;
     if (before.read_only && f.write) return kAccessDenied;      // a read-only file cannot be opened for writing, nor overwritten
@@ -253,6 +254,11 @@ uint32_t open_by_attributes(Process& p, uint64_t object_attributes, uint32_t acc
     change.set_read_only = true;
     change.read_only = true;
     files.set_metadata(virtual_path.view(), change);
+  }
+  if (files.kind(slot) == DescriptorKind::File) {
+    OpenObject* opened = files.object(slot);
+    opened->granted_access = access;
+    opened->writable = (access & (kGenericAll | kGenericWrite | kFileWriteData | kFileAppendData)) != 0;      // (an overwrite writes through the file system's own handle, not the program's)
   }
   if (sharing && wanted && files.kind(slot) == DescriptorKind::File) sharing->share_acquire(virtual_path.view(), files.object(slot), wanted, share);
   if (options & kDeleteOnClose) files.object(slot)->delete_on_close = true;
@@ -621,6 +627,7 @@ uint32_t nt_set_information_file(Process& p, const SyscallRequest& r) {
     case kFileAllocationInformation: break;      // nothing to change: sizes are exact
     case kFileBasicInformation: {      // the times (0 or -1: leave as they are) and the read-only attribute (0: leave); the file system says if it keeps none of that
       if (length < 40) return kInfoLengthMismatch;
+      if (!(object->granted_access & (0x100 /* FILE_WRITE_ATTRIBUTES */ | kGenericWrite | kGenericAll))) return kAccessDenied;
       uint8_t raw[40];
       if (!p.read_user(address, ByteView(raw, 40))) return kAccessViolation;
       auto le64 = [&](uint32_t at) { uint64_t v = 0; for (uint32_t i = 0; i < 8; ++i) v |= uint64_t{raw[at + i]} << (8 * i); return v; };
@@ -800,7 +807,16 @@ uint32_t nt_delete_file(Process& p, const SyscallRequest& r) {
   const uint32_t named = object_path(p, r.args[0], &virtual_path);
   if (named != kSuccess) return named;
   if (virtual_path.view() == StringView("/")) return kAccessDenied;
-  if (ObjectManager* sharing = system_objects()) if (!sharing->share_allows(virtual_path.view(), ObjectManager::kShareDelete)) return kSharingViolation;
+  if (ObjectManager* sharing = system_objects()) {
+    if (!sharing->share_allows(virtual_path.view(), ObjectManager::kShareDelete)) return kSharingViolation;
+    // Files that are open (and share deletion) go away when the last of them is closed.
+    const void* owners[8];
+    const uint32_t open_count = sharing->share_owners(virtual_path.view(), owners, 8);
+    if (open_count != 0 && open_count <= 8) {
+      for (uint32_t i = 0; i < open_count; ++i) const_cast<OpenObject*>(static_cast<const OpenObject*>(owners[i]))->delete_on_close = true;
+      return kSuccess;
+    }
+  }
   const Status status = files.remove(virtual_path.view());
   if (status == Status::Ok) notify_directory_changed(virtual_path.view(), kFileActionRemoved);
   return status_for(files, status, virtual_path.view());

@@ -63,6 +63,7 @@ struct OpenObject {
   String pattern;                    // directory listing: only names matching this (Windows wildcards); empty = all
   uint64_t position = 0;
   bool readable = false, writable = false, append = false;
+  uint32_t granted_access = 0xFFFFFFFFu;      // the access mask it was opened with (Windows; a handle made some other way has every right)
   bool delete_on_close = false;
   // Directory listing: 0 = "." next, 1 = ".." next, 2 = the real entries.
   uint32_t directory_phase = 0;

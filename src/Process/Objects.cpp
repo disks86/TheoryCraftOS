@@ -570,6 +570,19 @@ bool ObjectManager::share_allows(StringView path, uint32_t access) {
   return true;
 }
 
+uint32_t ObjectManager::share_owners(StringView path, const void** owners, uint32_t capacity) {
+  Locked hold(sync_);
+  uint32_t count = 0;
+  if (!shares_) return 0;
+  for (uint32_t i = 0; i < kMaxShares; ++i) {
+    const ShareEntry& e = shares_[i];
+    if (!e.used || !same_name(e.path, e.path_size, path)) continue;
+    if (count < capacity) owners[count] = e.owner;
+    ++count;
+  }
+  return count;
+}
+
 void ObjectManager::share_release(const void* owner) {
   Locked hold(sync_);
   if (!shares_) return;

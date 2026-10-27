@@ -2465,7 +2465,7 @@ EXPORT DWORD WINAPI GetTempPathA(DWORD capacity, LPSTR buffer) {
 
 EXPORT HANDLE WINAPI CreateFileW(LPCWSTR path, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD disposition, DWORD flags, HANDLE template_file) {
   (void)template_file;
-  if (!path) { set_error(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE; }
+  if (!path || !path[0]) { set_error(ERROR_PATH_NOT_FOUND); return INVALID_HANDLE_VALUE; }
   /* The console by its device names. */
   if (equals_ignore_case(path, (const WCHAR *)L"CONOUT$")) return GetStdHandle(STD_OUTPUT_HANDLE);
   if (equals_ignore_case(path, (const WCHAR *)L"CONIN$")) return GetStdHandle(STD_INPUT_HANDLE);
@@ -2484,6 +2484,7 @@ EXPORT HANDLE WINAPI CreateFileW(LPCWSTR path, DWORD access, DWORD share, LPSECU
     return INVALID_HANDLE_VALUE;
   }
   if (sa && sa->bInheritHandle) attributes.Attributes |= 2;      /* OBJ_INHERIT */
+  if (disposition == TRUNCATE_EXISTING && !(access & GENERIC_WRITE)) { set_error(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE; }      /* (it has to be able to write) */
   ULONG nt_disposition;
   switch (disposition) {
     case CREATE_NEW: nt_disposition = FILE_CREATE_; break;
@@ -2496,7 +2497,6 @@ EXPORT HANDLE WINAPI CreateFileW(LPCWSTR path, DWORD access, DWORD share, LPSECU
   ULONG nt_access = (access & ~(GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | GENERIC_ALL)) | SYNCHRONIZE | FILE_READ_ATTRIBUTES;
   if (access & (GENERIC_READ | GENERIC_ALL)) nt_access |= FILE_READ_DATA;
   if (access & (GENERIC_WRITE | GENERIC_ALL)) nt_access |= FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES;
-  if (disposition == TRUNCATE_EXISTING || disposition == CREATE_ALWAYS) nt_access |= FILE_WRITE_DATA;
   ULONG options = FILE_SYNCHRONOUS_IO_NONALERT_;
   if (!(flags & FILE_FLAG_BACKUP_SEMANTICS)) options |= FILE_NON_DIRECTORY_FILE_;
   if (flags & FILE_FLAG_DELETE_ON_CLOSE) { options |= FILE_DELETE_ON_CLOSE_; nt_access |= DELETE; }
@@ -2512,11 +2512,21 @@ EXPORT HANDLE WINAPI CreateFileW(LPCWSTR path, DWORD access, DWORD share, LPSECU
   return handle;
 }
 EXPORT HANDLE WINAPI CreateFileA(LPCSTR path, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD disposition, DWORD flags, HANDLE template_file) {
+  if (!path) { set_error(ERROR_PATH_NOT_FOUND); return INVALID_HANDLE_VALUE; }
   WCHAR *w = to_wide(path);
   if (!w) return INVALID_HANDLE_VALUE;
   HANDLE h = CreateFileW(w, access, share, sa, disposition, flags, template_file);
   free_wide(w);
   return h;
+}
+
+typedef struct { DWORD dwSize, dwFileAttributes, dwFileFlags, dwSecurityQosFlags; LPSECURITY_ATTRIBUTES lpSecurityAttributes; HANDLE hTemplateFile; } CREATEFILE2_PARAMS_;
+/* CreateFile2: CreateFileW with its optional arguments in a structure. */
+EXPORT HANDLE WINAPI CreateFile2(LPCWSTR path, DWORD access, DWORD share, DWORD disposition, const CREATEFILE2_PARAMS_ *parameters) {
+  DWORD flags = 0;
+  LPSECURITY_ATTRIBUTES sa = NULL;
+  if (parameters) { flags = parameters->dwFileAttributes | parameters->dwFileFlags | parameters->dwSecurityQosFlags; sa = parameters->lpSecurityAttributes; }
+  return CreateFileW(path, access, share, sa, disposition, flags, parameters ? parameters->hTemplateFile : NULL);
 }
 
 /* OpenFile: pre-Win32 (16-bit era) file opening, kept for old callers; a small enough subset of uStyle to be worth having (OF_READ/OF_WRITE/OF_READWRITE,
@@ -2721,6 +2731,7 @@ EXPORT DWORD WINAPI GetFinalPathNameByHandleW(HANDLE h, LPWSTR buffer, DWORD cap
 }
 
 EXPORT BOOL WINAPI DeleteFileW(LPCWSTR path) {
+  if (!path || !path[0]) { set_error(ERROR_PATH_NOT_FOUND); return FALSE; }
   WCHAR buffer[PATH_CHARS + 8];
   UNICODE_STRING name;
   OBJECT_ATTRIBUTES attributes;
@@ -2732,7 +2743,7 @@ EXPORT BOOL WINAPI DeleteFileW(LPCWSTR path) {
   status = NtDeleteFile(&attributes);
   return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
-EXPORT BOOL WINAPI DeleteFileA(LPCSTR path) { WCHAR *w = to_wide(path); const BOOL ok = w ? DeleteFileW(w) : FALSE; free_wide(w); return ok; }
+EXPORT BOOL WINAPI DeleteFileA(LPCSTR path) { if (!path) { set_error(ERROR_PATH_NOT_FOUND); return FALSE; } WCHAR *w = to_wide(path); const BOOL ok = w ? DeleteFileW(w) : FALSE; free_wide(w); return ok; }
 
 EXPORT BOOL WINAPI CreateDirectoryW(LPCWSTR path, LPSECURITY_ATTRIBUTES sa) {
   (void)sa;
@@ -2767,6 +2778,11 @@ EXPORT BOOL WINAPI MoveFileExW(LPCWSTR from, LPCWSTR to, DWORD flags) {
   UNICODE_STRING source_name, target_name;
   OBJECT_ATTRIBUTES source, target;
   if (!nt_name(from, source_buffer, &source_name, &source) || !nt_name(to, target_buffer, &target_name, &target)) return FALSE;
+  if (source_name.Length == target_name.Length) {      /* a file moved onto itself (the spelling of the name may differ) stays where it is */
+    ULONG same = 1;
+    for (ULONG i = 0; i < source_name.Length / 2 && same; ++i) if (upper(source_name.Buffer[i]) != upper(target_name.Buffer[i])) same = 0;
+    if (same && GetFileAttributesW(from) != INVALID_FILE_ATTRIBUTES) return TRUE;
+  }
   HANDLE h = NULL;
   IO_STATUS_BLOCK iosb;
   NTSTATUS status = NtOpenFile(&h, DELETE | SYNCHRONIZE | FILE_READ_ATTRIBUTES, &source, &iosb, 7, FILE_SYNCHRONOUS_IO_NONALERT_);

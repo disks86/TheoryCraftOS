@@ -285,11 +285,10 @@ Status ProcessFiles::open(StringView virtual_path, const OpenFlags& flags, uint3
       OpenMode mode = OpenMode::Read;
       if (flags.write) mode = OpenMode::ReadWrite;
       if (!exists) mode = OpenMode::CreateOrOpen;
-      else if (flags.create && flags.truncate) mode = OpenMode::CreateTruncate;
       status = fs_->open_file(path.view(), mode, &object->file);
       if (status != Status::Ok) return status;
       if (!exists && created) *created = true;
-      if (exists && flags.truncate && mode != OpenMode::CreateTruncate && object->file->resize(0) != Status::Ok) return Status::IoError;
+      if (exists && flags.truncate && object->file->resize(0) != Status::Ok) return Status::IoError;      // (truncated through the open file: the file system refuses to re-create a file that is open elsewhere)
       object->readable = flags.read;
       object->writable = flags.write;
       object->append = flags.append;
