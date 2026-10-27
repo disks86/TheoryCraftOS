@@ -42,7 +42,12 @@ Checks that failed (Wine commit f343ca6), before the implementation of the libra
 | shlwapi string | 16751 | about 150 (needs ordinal exports and StrRetTo*/StrFromTimeInterval) |
 | lz32 lzexpand | 117 | 17 |
 | kernel32 format_msg | 591 | 270 |
+| kernel32 time | 786 | 1 |
+| kernel32 locale | 150 (stopped early) | about 4600, runs to the end (en-US and the invariant locale only; no normalization, locale enumeration, geo info or code pages) |
+| ntdll reg (NT registry services) | 133 | about 90 (needs an in-kernel registry: done; registry links, RtlQueryRegistryValues not) |
+| advapi32 registry | not run | 166, runs to the end |
+| kernel32 environ / module / file | crashed or hung | run to the end |
 
 Everything else was measured once and has not been worked on: ntdll alpc 1684, directory 784, file 354, sync 246, threadpool 244, reg 133 (the NT registry services), path 279;
-kernel32 loader 5231, file 2756, time 786, comm 763, locale 150, version 92; shlwapi url/istream/shreg/assoc; mpr 211, psapi 123, userenv 68, secur32 53. Most of those are
+kernel32 loader 5231 (needs image sections), file 2752, comm 763, heap 3400 (HeapWalk and region details), atom 2100, virtual 1600, version 92 (needs manifest-based version emulation); debugger, sync and thread tests hang or crash the machine; shlwapi url/istream/shreg/assoc; mpr 211, psapi 123, userenv 68, secur32 53. Most of those are
 missing system services (the NT registry, object namespace, ALPC, thread pools, `NtQuerySystemInformation` classes) rather than missing library code.
