@@ -88,6 +88,8 @@ class Card final : public hardware::IVcnRegisters {
   const uint8_t* gart_table = nullptr;
   uint8_t* system_host = nullptr;   // system page addresses are offsets from system_base into this memory
   uint64_t system_base = 0, system_bytes = 0;
+  bool system_by_high = false;       // instead: a system page address is the low 40 bits of a host address whose upper bits are system_high
+  uint64_t system_high = 0;
   uint32_t gart_faults = 0;
   mutable uint64_t pte_and = ~0ull;   // the flags every page table entry the engines walked had in common
 
@@ -106,6 +108,7 @@ class Card final : public hardware::IVcnRegisters {
       pte_and &= pte;
       const uint64_t page = pte & 0x000000FFFFFFF000ull;
       if (!(pte & 2)) return window_host(page + offset, bytes);
+      if (system_by_high) return reinterpret_cast<uint8_t*>(system_high | (page + offset));
       if (!system_host || page < system_base || page - system_base >= system_bytes || offset + bytes > system_bytes - (page - system_base)) return nullptr;
       return system_host + (page - system_base) + offset;
     }

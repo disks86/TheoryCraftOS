@@ -74,12 +74,14 @@ class AmdGpu final : public UefiGopGpu {
   void prepare_native();
   void engage();
   void flush_dirty();
+  void release_native_display();
 
   AmdGpuInfo info_;
   GpuContext context_;
   MmioVcnRegisters registers_{MmioRegion()};
   UniquePointer<amd_dcn1::Scanout> scanout_;
   amd_dce11::INativeDisplay* native_display_ = nullptr;
+  UniquePointer<amd_dce11::Presenter> presenter_;
   uint64_t reserved_ = 0;
   uint64_t firmware_base_ = 0, firmware_bytes_ = 0;
   ByteView native_memory_;

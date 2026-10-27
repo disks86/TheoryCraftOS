@@ -36,7 +36,9 @@
 #include "Hardware/Clock/IClock.hpp"
 #include "Hardware/Mmio.hpp"
 #include "Hardware/VideoCodec/AMD/AmdVcn1.hpp"
+#include "Allocators/IAllocator.hpp"
 #include "Utility/ArrayView.hpp"
+#include "Utility/ByteBuffer.hpp"
 
 namespace hardware {
 namespace amd_dce11 {
@@ -96,6 +98,9 @@ class INativeDisplay {
   virtual bool engage_display(const FirmwareFramebuffer& firmware, ByteView* memory) = 0;
   virtual bool display_engaged() const = 0;
   virtual void disengage_display() = 0;
+  // Copies `pixels` (a run of whole rows of the picture, in system memory) to `offset` bytes into the picture in video memory by the card's DMA engines. False if the card
+  // cannot (no engine, the copy failed): the caller then copies by the CPU.
+  virtual bool upload_picture(ConstByteView pixels, uint64_t offset) { (void)pixels; (void)offset; return false; }
 
  protected:
   INativeDisplay() = default;
@@ -129,6 +134,29 @@ class Display {
   bool engaged_ = false;
   FirmwareFramebuffer firmware_;
   ByteView memory_;
+};
+
+// The OS's picture kept in system memory (cached, so reading and blending are fast; the mapped window of video memory is uncached and slow to read) and sent to the display's
+// framebuffer in video memory a run of rows at a time: by the card's DMA engines when the display offers them, else by the CPU. `video` is the picture in video memory as the
+// display gave it (Display::engage's `memory`).
+class Presenter {
+ public:
+  explicit Presenter(allocators::IAllocator& allocator) : back_(allocator) {}
+  // The back buffer is filled from what the display shows now. False if there is no memory or the sizes do not match.
+  bool start(INativeDisplay& display, ByteView video, uint32_t pitch_bytes, uint32_t height);
+  // What to draw in.
+  ByteView buffer() { return back_.writable_view(); }
+  // Sends rows [first_row, first_row + rows) of the back buffer to video memory. False if the rows are outside the picture.
+  bool present(uint32_t first_row, uint32_t rows);
+  bool present_all() { return present(0, height_); }
+  uint32_t dma_presents() const { return dma_presents_; }
+  uint32_t cpu_presents() const { return cpu_presents_; }
+
+ private:
+  ByteBuffer back_;
+  INativeDisplay* display_ = nullptr;
+  ByteView video_;
+  uint32_t pitch_ = 0, height_ = 0, dma_presents_ = 0, cpu_presents_ = 0;
 };
 
 }  // namespace amd_dce11
