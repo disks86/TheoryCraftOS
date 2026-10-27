@@ -71,6 +71,8 @@ class Card final : public hardware::IVcnRegisters {
   std::vector<IbRun> ib_runs;     // every indirect buffer the engines ran
   uint32_t ib_errors = 0;         // indirect packets the engine refused
   bool ignore_fences = false;     // the engine runs everything but never writes a fence
+  bool reset_fails = false;       // SRBM_SOFT_RESET (0x398) does not bring a stalled engine back
+  std::vector<uint32_t> srbm_resets;   // every value written to SRBM_SOFT_RESET
 
   uint32_t reg(uint32_t r) const { auto at = regs_.find(r); return at == regs_.end() ? 0 : at->second; }
   void set_reg(uint32_t r, uint32_t v) { regs_[r] = v; }
@@ -78,6 +80,16 @@ class Card final : public hardware::IVcnRegisters {
   void write(uint32_t r, uint32_t v) override {
     writes.push_back({r, v});
     regs_[r] = v;
+    if (r == 0x398) {
+      srbm_resets.push_back(v);
+      if ((v & (0x100000 | 0x40)) && !reset_fails) {   // SOFT_RESET_SDMA, SOFT_RESET_SDMA1: the engines come back, with their registers at the reset values
+        stall[0] = stall[1] = false;
+        ignore_fences = false;
+        rptr_[0] = rptr_[1] = 0;
+        regs_[kSdmaCntl] = 0;
+        regs_[kSdmaCntl + 0x200] = 0;
+      }
+    }
     if (r == kRbRptr) rptr_[0] = v;            // the driver sets the read pointer (to 0) when it programs the ring
     if (r == kRbRptr + 0x200) rptr_[1] = v;
   }

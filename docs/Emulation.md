@@ -1,0 +1,241 @@
+# Running programs built for another CPU
+
+A program whose ELF or PE header names a CPU other than the machine's own is run by an **in-kernel emulator** (`src/Emulation`) instead of
+in the CPU's user mode. The goal is the FEX-style case: an x86-64 program on an Arm or RISC-V machine.
+
+## How a program is dispatched
+
+1. `exe::identify_architecture()` reads the machine field of the header (ELF `e_machine`, PE `Machine`) from the first 4 KiB of the file.
+2. `process::native_arch()` is the CPU the kernel was built for; `process::needs_emulation(guest)` is true for any other guest.
+3. `desktop::run_program()` (`src/Program/ProgramRunner.cpp`) chooses a plan: **Native** (ring 3, x86-64 only today), **Emulated**
+   (`emulation::create_guest_cpu()` + `desktop::EmulatedTask`), or **Impossible** (a 32-bit or unknown CPU, or a guest with no emulator),
+   which ends in a message naming the CPU (`this program is for AArch64, which this OS can neither run directly nor emulate on this machine`).
+   `ProgramRun::force_emulation` runs a native-CPU program on the emulator anyway (to compare the two).
+
+## Why it lives in the kernel and what that buys
+
+The guest never executes on the host CPU. Its memory is the program's `AddressSpace`, reached only through the bounds-checked accessors
+(`GuestMemory`); a bad guest pointer is a guest fault, never a kernel one. Its system calls go straight to the same `process::Process` a native
+program uses, through the same ABI tables (`decode_x86_64` for the registers, then the Linux or Windows interface), so files, pipes, the console,
+`mmap` and the loader are shared with native programs. Consequences:
+
+- no hardware user mode is needed, so it works on the AArch64 and RISC-V builds, which have none;
+- the guest's CPU and the host's are independent: `emulation::IGuestCpu` has an x86-64, an AArch64 and a RISC-V implementation, so an Arm or RISC-V Linux
+  program runs on x86-64;
+- the interpreter runs with kernel privilege, so it is written to the memory-safety rules in `CLAUDE.md` (no raw guest pointers, checked
+  arithmetic, decoder tested with truncated and bit-flipped code under ASan/UBSan).
+
+## The x86-64 guest (`X86_64Cpu`)
+
+An interpreter, one instruction per decode, flags computed eagerly.
+
+- **Integer ISA**: all legacy prefixes (operand/address size, REP/REPNE, FS/GS), REX, ModRM/SIB/RIP-relative addressing, the arithmetic and logic
+  groups, shifts and rotates (not RCL/RCR), MUL/IMUL/DIV/IDIV at every width (128-bit divide done without a compiler runtime call), string
+  instructions with REP (4096 iterations per step, resumable), CMOVcc/SETcc/Jcc, BT*/BSF/BSR/POPCNT/TZCNT/LZCNT, SHLD/SHRD, XCHG/CMPXCHG/XADD,
+  BSWAP, PUSH/POP/CALL/RET/LEAVE, PUSHF/POPF, CPUID (a plain x86-64 baseline), RDTSC (instruction count), SYSCALL.
+- **SSE2 integer and moves**: MOVUPS/MOVAPS/MOVDQA/MOVDQU, MOVSS/MOVSD *as bit moves*, MOVD/MOVQ, MOVLPS/MOVHPS, the bitwise ops, PADD/PSUB (plain
+  and saturating), PCMPEQ/PCMPGT, PMOVMSKB, PUNPCK*, PACK*, PSHUFD/PSHUFLW/PSHUFHW, PMUL*, PMADDWD, PSADBW, PMIN/PMAX, PAVG, all PSLL/PSRL/PSRA
+  forms. These are what compilers emit for `memcpy`/`strlen`-style and auto-vectorized integer code.
+- **Floating point (SSE/SSE2, soft-float)**: ADD/SUB/MUL/DIV/SQRT/MIN/MAX in scalar and packed single and double forms, CMPcc, COMIS/UCOMIS, CVTSS2SD / CVTSD2SS /
+  CVTPS2PD / CVTPD2PS, CVTSI2SS/SD, CVT(T)SS/SD2SI, CVTDQ2PS/PD, CVT(T)PS/PD2DQ, UNPCK*, SHUFPS/PD, MOVMSKPS/PD, LDMXCSR/STMXCSR. The arithmetic is
+  `emulation::softfloat` (`SoftFloat.cpp`): IEEE 754 binary32/64 done in integer operations (the kernel cannot assume an FPU and the host's float would not be
+  bit-exact), with x86 semantics: the default NaN, first-NaN propagation, all four MXCSR rounding modes, and the MXCSR exception flags (exceptions are always masked, so
+  none traps). Not modelled: denormals-are-zero / flush-to-zero, RCPPS/RSQRTPS (the hardware approximations), AVX.
+- **Faults** are reported as x86 vectors (0, 3, 6, 13, 14 with the address), restartable (`rip` stays at the instruction).
+- **Not implemented** (each is an invalid-opcode fault, never a wrong result): packed-decimal x87 (`fbld`/`fbstp`), AVX-512, FXSAVE/XSAVE, RCL/RCR, segment registers, the system instructions.
+
+## The AArch64 guest (`AArch64Cpu`)
+
+Linux programs only (there is no AArch64 Windows interface). Files: `AArch64Cpu.cpp` (integer, branches, loads/stores, system), `AArch64Fp.cpp`
+(scalar FP), `AArch64Simd.cpp` (Advanced SIMD).
+
+- **Integer ISA**: add/sub (immediate, shifted, extended, with carry), logical (immediate and shifted), move wide, bitfield moves and `extr`, conditional
+  select and compare, `madd`/`msub`/`smaddl`/`umulh`..., `udiv`/`sdiv`, shifts, `rbit`/`rev*`/`clz`/`cls`, `adr`/`adrp`, every branch form (`ret`, `br`,
+  `cbz`, `tbz`, `b.cond`), `svc`, hints and barriers, `mrs`/`msr` of TPIDR_EL0, NZCV, FPCR, FPSR, the counter and a few ID registers.
+- **Loads and stores**: all single-register addressing modes (unsigned, unscaled, pre/post-index, register offset with extend), literal loads, pairs
+  (`ldp`/`stp`/`ldpsw`), exclusives (`ldxr`/`stxr`, `ldar`/`stlr`), `cas*`, and the LSE atomics (`ldadd` ... `swp`). SIMD/FP registers load and store at
+  every width; Advanced SIMD structure loads and stores (`ld1`-`ld4`, `st1`-`st4`, single-lane and replicate forms, post-index).
+- **Scalar floating point**: soft-float with the AArch64 rules (positive default NaN, signaling NaN first, FPCR rounding mode and FPSR flags): arithmetic,
+  fused `fmadd` family, `fsqrt`, `fmax`/`fmin`/`fmaxnm`/`fminnm`, `fcmp`/`fccmp`/`fcsel`, `fcvt`, int/fixed-point conversions with saturation, every `frint*`.
+- **Advanced SIMD (a subset)**: copy (`dup`/`ins`/`umov`/`smov`), three-same integer (arithmetic, logic, compares, min/max, halving, saturating add/sub, shifts
+  by register, pairwise) and floating-point forms, three-different (widening add/sub/mul/accumulate), two-register miscellaneous (`rev*`, `cnt`, `clz`, `not`,
+  `abs`/`neg`, compares with zero, `xtn`, `shll`, pairwise adds, FP `abs`/`neg`/`sqrt`/convert/`frint*`), across lanes (`addv`, `*maxv`, `*minv`, `*addlv`),
+  `zip`/`uzp`/`trn`/`ext`/`tbl`/`tbx`, modified immediates, shifts by immediate (`shl`, `sshr`, `usra`, `shrn`, `ushll`, `sli`/`sri`), and by-element multiplies.
+  Anything else (crypto, SVE, half precision, `sqdmulh`, the rounding shifts, `fcvtn` variants...) is an invalid-instruction fault.
+- **Faults** use the same x86 vectors as the other guest (an undefined encoding is 6, a bad address 14 with the address, `brk` 3, a misaligned `pc` 13).
+
+How it was checked: besides `EmulationTest`, `tests/aarch64_diff.sh` assembles tens of thousands of random instructions with random register state, runs them under
+`qemu-aarch64` and under the emulator, and compares every register, NZCV, FPSR (including QC) and a scratch buffer; the integer, FP, NEON and memory modes are
+clean over several seeds. It needs clang's AArch64 target, an AArch64-capable `ld.lld` (rustup's works) and `qemu-aarch64`, so it is not in `run_host_tests.sh`.
+`tests/data/emulation/guest-aarch64.elf` is the checked-in build of the test guest (`clang --target=aarch64-linux-gnu -O2 -static -nostdlib -ffreestanding
+-fno-builtin -fno-stack-protector -ffp-contract=off -fuse-ld=lld tests/data/emulation/guest.c`); its output must equal the x86-64 build's.
+
+## The RISC-V guest (`RiscV64Cpu`)
+
+An RV64GC user-mode interpreter (`RiscV64Cpu.cpp`: core, integer, memory, atomics, compressed; `RiscV64Fp.cpp`: F and D). A RISC-V Linux ELF (`e_machine` 243) is
+recognized by `identify_architecture` and its system calls (`ecall`, number in a7, arguments a0..a5) are decoded by `decode_riscv64_linux` into the same "generic" Linux table
+AArch64 uses, so files, pipes, `mmap` and `clone` are shared with every other kind of program.
+
+- **Integer**: RV64I, M (multiply/divide with the architected division-by-zero and overflow results; the 128-bit high products come from `Wide.hpp`, not `__int128`),
+  A (LR/SC with a reservation, all nine AMOs, `.w` and `.d`; misaligned atomics fault), Zicsr for `fflags`/`frm`/`fcsr` and the read-only `cycle`/`time`/`instret`
+  (the instruction count stands in for a clock), `fence`/`fence.i` as no-ops. Misaligned ordinary loads and stores work (Linux emulates them for user programs).
+- **C**: every RV64C instruction is expanded to the 32-bit encoding it stands for (`expand_compressed`) and executed as that, so there is one implementation of each operation.
+  Reserved encodings (the all-zero halfword, `c.addi4spn` with a zero immediate, `c.lui` with zero, `c.lwsp` into x0, ...) are invalid instructions.
+- **F and D** (soft-float, so it works on kernels without an FPU): the RISC-V rules on top of `SoftFloat`: every NaN result is the canonical NaN, singles are NaN-boxed (an
+  improperly boxed operand reads as the canonical NaN), `fmin`/`fmax` return the number when only one operand is a NaN and order -0 below +0, NV is raised by a signaling NaN
+  even when the result is not a NaN, conversions to integers saturate with a NaN converting to the largest value and sign-extend the 32-bit forms, fused multiply-add raises NV
+  for inf*0 even with a quiet NaN addend, `fclass`, the five rounding modes (RMM, round to nearest ties away, also for arithmetic) and the dynamic mode from `frm`
+  (a reserved mode is an invalid instruction). Underflow is detected **after rounding**, as RISC-V requires (x86 and AArch64 detect before): `Env::tininess_after` in `SoftFloat`.
+- **Registers** at program start: `sp` = the stack, `tp` = the thread pointer (`set_thread_pointers`, `clone` with `CLONE_SETTLS`), everything else 0.
+- **B and friends**: Zba, Zbb, Zbs, Zbc and Zicond (`bit_manipulation()` in `RiscV64Cpu.cpp`), plus the cache-block operations Zicbom/Zicboz (`cbo.zero` clears its 64-byte block, the others do nothing) and the Zihintpause hint (a fence), so RVA22U64 binaries run.
+- **V (vector, 1.0)**: VLEN = 128, ELEN = 64, in `RiscV64Vector.cpp` (configuration, loads and stores), `RiscV64VectorInt.cpp` (integer, fixed-point, mask, reduction and permutation
+  instructions) and `RiscV64VectorFp.cpp` (floating point), around `VectorUnit` in `RiscV64VectorUnit.hpp`. The 32 registers are one flat byte array, so a register group is a plain
+  slice and LMUL 1/8..8, every SEW, widening/narrowing and segments need no special cases. Covered: `vsetvl*`; unit-stride, strided, indexed (ordered and not), segment,
+  whole-register, mask (`vlm`/`vsm`) and fault-only-first loads and stores (a fault leaves `vstart` at the element, like a real trap); all of OPIVV/OPIVX/OPIVI and OPMVV/OPMVX
+  (add/sub/shift/logic/min/max, `vadc`/`vmadc`, merge, compares, saturating and averaging adds with the four `vxrm` rounding modes, `vsmul`, `vnclip*`, multiply/divide, the
+  multiply-add family, widening and narrowing forms, reductions, mask logic, `vmsbf`/`vmsif`/`vmsof`/`viota`/`vid`/`vcpop`/`vfirst`, slides, `vrgather`/`vrgatherei16`,
+  `vcompress`, `vzext`/`vsext`, `vmv<nr>r`); and the floating-point set at SEW 32 and 64 through the same soft-float as the scalar F/D (arithmetic, fused multiply-add, min/max,
+  sign injection, compares, `vfsqrt`, `vfclass`, `vfrec7`/`vfrsqrt7` (the 7-bit tables were read out of qemu), all `vfcvt`/`vfwcvt`/`vfncvt` including round-to-odd, widening
+  arithmetic, ordered and unordered reductions). Tail and masked-off elements are written with all ones (the "agnostic" choice; qemu does the same with `rvv_ta_all_1s`), and a
+  mask destination's tail is always ones. An instruction with `vstart >= vl` changes nothing. `vtype` is `vill` until the first `vsetvl`; an invalid configuration, a register
+  group not aligned to EMUL, or a masked instruction writing v0 is an invalid instruction. The emulator does not check every register-overlap rule (an assembler or compiler never
+  emits a violation, and the result of one is unspecified anyway).
+- **Not implemented** (an invalid-instruction fault, never a wrong result): half-precision vectors (Zvfh, `SEW=16` floats), Zvbb/Zvbc/Zvk\*, Zfh/Zfhmin, Zcb, Zbkb/Zbkx crypto bit ops, H, RV32, privileged instructions.
+
+## AVX, AVX2, FMA, BMI, F16C
+
+The x86-64 guest implements the VEX-encoded instruction sets and reports them through `cpuid`: AVX, AVX2, FMA3, BMI1, BMI2, F16C, MOVBE, LZCNT, POPCNT, XSAVE/OSXSAVE (with
+`xgetbv` returning XCR0 = x87|SSE|AVX, and `xsave`/`xrstor`). A dispatcher such as a C library's `memcpy`/`strlen` selection therefore picks its AVX2 paths, and
+programs built with `-march=haswell` (or x86-64-v3) run. `X86_64Vex.cpp` holds all of it.
+
+- **State**: YMM0..15 are the XMM registers plus `ymm_high`; legacy SSE instructions leave the upper halves alone and VEX.128 forms clear them, as on hardware. The upper
+  halves travel in the `X86Context` so exceptions keep them.
+- **How the arithmetic is shared**: a VEX instruction on 128-bit lanes is "the SSE instruction on each 128-bit half with three operands". `vex_simd()` copies the first
+  source into the destination, the second source into a scratch register, runs the existing SSE code once per half, and merges the halves; shifts by an XMM count use the
+  low 128 bits for both halves, and the width-changing conversions (`vcvtps2pd`, `vcvtpd2ps`, `vcvtdq2pd`, `vcvt(t)pd2dq`) and the mask extractions are written out.
+  So every SSE/SSE2 operation (float, integer, moves, conversions, compares) exists with a VEX prefix in 128 and 256 bits.
+- **VEX-only instructions**: broadcasts (`vbroadcastss/sd/f128/i128`, `vpbroadcastb/w/d/q`), `vinsert/vextract[fi]128`, `vperm2[fi]128`, `vpermq/pd/d/ps`, `vpermilps/pd`
+  (both forms), `vpblendw/d`, `vblendps/pd`, `vblendv*`, `vpblendvb`, the variable shifts (`vpsllv/vpsrlv/vpsravd/q`), the SSSE3/SSE4.1 integer set in VEX form (`vpshufb`,
+  `vpalignr`, `vphadd/sub`, `vpmaddubsw`, `vpmulhrsw`, `vpsign`, `vpabs`, `vpmovsx/zx`, `vpmulld/dq`, `vpmin/max[su]*`, `vpackusdw`, `vpcmpeqq/gtq`, `vptest`, `vtestps/pd`,
+  `vroundps/pd/ss/sd`, `vpextr*`, `vpinsr*`, `vinsertps`), masked moves (`vmaskmovps/pd`, `vpmaskmovd/q`), gathers (all eight `vgather`/`vpgather` forms), F16C
+  (`vcvtph2ps`, `vcvtps2ph`), `vzeroupper`/`vzeroall`.
+- **FMA3**: the 132/213/231 forms of `fmadd`, `fmsub`, `fnmadd`, `fnmsub` (packed and scalar, single and double) and `fmaddsub`/`fmsubadd`, with one rounding (the soft-float
+  fused multiply-add) and the hardware's NaN selection order (multiplicand, multiplicand, addend).
+- **BMI1/BMI2**: `andn`, `bextr`, `blsi`, `blsmsk`, `blsr`, `bzhi`, `mulx`, `pdep`, `pext`, `rorx`, `sarx`, `shlx`, `shrx` (and `tzcnt`/`lzcnt`/`popcnt` that already existed).
+- **AES-NI, PCLMULQDQ, SHA** (`X86_64Crypto.cpp`): `aesenc/enclast/dec/declast`, `aesimc`, `aeskeygenassist`, `pclmulqdq` (all immediates), SHA-1 (`sha1rnds4`, `sha1nexte`, `sha1msg1/2`) and SHA-256 (`sha256rnds2`, `sha256msg1/2`), plus the VEX forms and the 256-bit VAES / VPCLMULQDQ. The S-box is computed at compile time. cpuid reports AES, PCLMULQDQ, SHA, VAES and VPCLMULQDQ. Tested by 125 more `AvxTest` cases against the host CPU (bit-exact), and by `tests/data/emulation/crypto.c` (FIPS-197 vector, key schedule, CTR, GHASH, SHA-256 and SHA-1 of "abc" with the published digests).
+- **Not implemented** (an invalid-instruction fault, never a wrong result): AVX-512, SHA-512/SM3/SM4, TSX, `xsaveopt`/`xsavec`, and the MMX registers (so the MMX forms of the SSSE3
+  instructions, the ones without a 66 prefix, are invalid).
+  Exceptions delivered to a Windows program save the XMM halves of vector state in the `CONTEXT` in memory, not the upper halves (the emulator keeps those itself).
+- **Checked against the real thing**: `tests/AvxTest.cpp` assembles about 1,400 instruction forms with `llvm-mc` (`tests/data/emulation/avx_cases_gen.py`), runs each on the host
+  and on the emulator from the same random state (80,000+ comparisons per run: all vector registers, written general registers, flags, MXCSR flags except DE, the memory operand)
+  and requires them to be identical; truncations and bit flips of every encoding run under ASan/UBSan. `tests/data/emulation/avx.c` (auto-vectorized loops, intrinsics, gathers, BMI,
+  feature detection through `cpuid` and `xgetbv`; 440 ymm instructions) prints the same text natively and on the emulator.
+
+## SSE3, SSSE3, SSE4.1, SSE4.2 (legacy encodings)
+
+`cpuid` reports SSE3, SSSE3, SSE4.1, SSE4.2 and POPCNT, so a program built for `-march=x86-64-v2` (or a library that dispatches on those bits) runs.
+
+- **SSE3** (`X86_64Cpu.cpp`): `haddps/pd`, `hsubps/pd`, `addsubps/pd` in `step_float` (the same soft-float add/sub, per-element exception flags), `movddup`, `movsldup`,
+  `movshdup` and `lddqu` in `step_sse`. The VEX forms (`vhaddps`, `vmovddup ymm`, ...) reuse them through the per-half scheme (`classify_map1`).
+- **SSSE3 and SSE4.1/4.2 with the `0F 38` / `0F 3A` escapes** (`legacy_sse_map` in `X86_64Vex.cpp`): these are the same instructions as the VEX ones with the destination
+  also the first source, so `0F 38 xx` and `0F 3A xx` hand the opcode to `vex_map2`/`vex_map3` as a 128-bit operation with `vvvv = reg`, and the upper halves of the YMM registers
+  are put back afterwards (legacy SSE leaves them alone). An allow list names the opcodes that exist without a prefix, so a VEX-only opcode (`vbroadcastss`, `vinserti128`,
+  ...) is still an invalid instruction without one. Only the 66-prefixed (XMM) forms exist; the MMX ones fault.
+- **What was written new** (shared by the VEX and legacy forms): `dpps`/`dppd` (products rounded one by one, summed as (p0+p1)+(p2+p3)), `mpsadbw`, `phminposuw`,
+  `pcmpestri/m` and `pcmpistri/m` (all four aggregations, both polarities, bytes or words, signed or unsigned; the flags and ECX/XMM0 results as the SDM defines them; explicit
+  lengths from RAX/RDX honoring REX.W), `crc32` (CRC-32C, 8/16/32/64-bit sources), and the legacy-only `blendvps/pd` and `pblendvb` (the selector is XMM0).
+- **Checked**: `AvxTest` now holds about 2,150 forms (the legacy encodings of every instruction above, the 128 immediates of `pcmpistri`, every `crc32` width, the VEX versions of
+  the new instructions) and compares each with the host CPU like the AVX ones; a mutation of the `dpps` sum order, the CRC polynomial, the negate-masked polarity and the equal-ordered
+  rule of `pcmpistri` each fail it. Hand-written checks cover the CRC-32C check value of "123456789", strlen with `pcmpistri`, the MMX forms and VEX-only opcodes being invalid, and the
+  `cpuid` bits. `tests/data/emulation/sse4.c` (built with `-O2 -msse4.2 -mno-avx`: CRC-32C, strlen/span/substring searches with `pcmpistri`, auto-vectorized `pmulld`/`pminsd`/
+  `pmaxud`/`pmovsx`, `haddps`, `dpps`, `pshufb`, `mpsadbw`, ...) prints the same text natively and on the emulator.
+
+## x87 (80-bit extended precision)
+
+The x87 unit is emulated in full except packed decimal (`fbld`/`fbstp`), which faults. `SoftFloatExt.cpp` is the arithmetic on the 80-bit format (64-bit significand with an
+explicit integer bit, 15-bit exponent), `SoftFloatExtMath.cpp` the transcendental functions, `X86_64X87.cpp` the register stack and the decoding of `D8`..`DF`.
+
+- **State**: eight 80-bit registers used as a stack with TOP in the status word, the control word (precision control 24/53/64 bits, all four rounding modes), the status word
+  (C0..C3, the sticky exception flags, stack fault), and which registers hold a value. All exceptions are masked, so nothing traps; an empty-register read gives the real
+  indefinite and sets the stack-fault flags, a push onto a full stack too. The images `fxsave`/`fxrstor` (ST registers in stack order, abbreviated tags), `fnsave`/`frstor`
+  and `fnstenv`/`fldenv` (32-bit layouts) are real, and the x87 state is part of the `X86Context` that exceptions save and `NtContinue` restores.
+- **Instructions**: loads and stores in all formats (`fld`/`fst`/`fstp` of 32, 64 and 80 bits, `fild`/`fist`/`fistp`/`fisttp` of 16, 32 and 64), `fadd`/`fsub`/`fsubr`/
+  `fmul`/`fdiv`/`fdivr` in every register and memory form (`faddp`, `fiadd`...), `fcom`/`fucom`/`fcomi`/`fucomi` and `ftst`/`fxam`, `fsqrt`, `frndint`, `fscale`,
+  `fprem`/`fprem1` (with the hardware's partial-remainder behaviour: C2 and a reduction by a multiple of 32 bits per round), `fxtract`, `fchs`/`fabs`, `fxch`, `fcmov`, the
+  constants, `fincstp`/`fdecstp`/`ffree`, the control instructions, and the transcendentals `f2xm1`, `fyl2x`, `fyl2xp1`, `fpatan`, `fsin`, `fcos`, `fsincos`, `fptan`.
+- **Exactness**: the arithmetic, conversions, comparisons, remainder, `fscale`, `frndint` and `fsqrt` are bit-exact with a real x87 (results, flags, C1 "rounded up", the
+  condition codes), checked against the host's x87 with random operands in every rounding mode and precision (`tests/X87Test.cpp`: 200k+ arithmetic and 100k+ instruction
+  cases per run). The transcendentals are series in the extended format with 32-bit-piece Cody-Waite argument reduction: within about 7 units in the last place of the hardware
+  (the hardware does not round them exactly either; it uses a 66-bit pi, so its sin/cos of huge arguments are not the true values and ours are closer). `fsin`, `fcos` and
+  `fptan` give C2 = 1 for |x| >= 2^63. Denormals are handled as the hardware does (flags, precision-control rounding of denormal results).
+- **What it unlocked**: the C runtime's `printf("%f")` uses it, so the Windows `crttest` and `cxxtest` programs now run on the emulator, as does `tests/data/emulation/x87.c`
+  (series for e and pi, square roots, conversions, 64-bit significand checks).
+
+## Windows structured exceptions
+
+A fault in an emulated x86-64 Windows program is delivered the way the hardware path does it. `EmulatedProcess::deliver_exception` takes the CPU's `GuestFault` (vector,
+address, and for a page fault whether it was a read, a write or an instruction fetch), turns it into an NT exception with the shared `process::fault_to_exception`
+(`STATUS_ACCESS_VIOLATION` with the right information, divide error, breakpoint reported at the `int3`, illegal instruction...), and `process::dispatch_exception` pushes
+the machine frame, `CONTEXT` and `EXCEPTION_RECORD` on the faulting thread's own stack; the thread continues in ntdll's `KiUserExceptionDispatcher`, whose unwinder finds the
+`__try`/`__except` and C++ handlers. `NtContinue` (what the unwinder ends with) goes through `process::apply_context`, which sanitizes the registers, into the CPU.
+`IGuestCpu::get_x86_context`/`set_x86_context` convert between the interpreter's registers and the `X86Context` image (general registers, `rip`, flags, and an FXSAVE image
+holding `MXCSR` and XMM0-15). A fault that cannot be delivered (no dispatcher, no stack left) ends the program as before. For this the interpreter gained `fxsave`/`fxrstor` and
+`mov` to and from the segment registers (user selectors), which `RtlCaptureContext`/`RtlRestoreContext` use.
+
+`tests/emulated_windows.sh` builds the OS's own DLLs and runs `emuthreads.c`, `sehtest.c` (`__try`/`__except`/`__finally`, `RaiseException`, a deep recursion) and
+`threadtest.c` (the same inside worker threads) on the emulator: all pass. The other Windows test programs mostly do too, except where they need things an emulated process does not
+have (other processes, several processors).
+
+## Threads
+
+An emulated program can have threads, for both ABIs. `EmulatedProcess` (`src/Emulation/EmulatedProcess.cpp`) is the program's `process::IProcessRuntime`:
+
+- Every guest thread is a system thread of its own (a kernel thread; a `std::thread` in the host tests) with its own CPU state, but **all of a program's threads take
+  turns on one process lock**: a thread runs a slice of instructions (20000) or a system call with the lock held, lets go of it between slices and while a call waits
+  (`Process::block_*`, `IProcessRuntime::wait`). So the guest sees a sequentially consistent machine, its atomic instructions are atomic for free, and the system-call
+  code (written for "one lock held by every call") needs no changes. The price: no parallel speed-up, whatever the number of cores.
+- AArch64 `ldxr`/`stxr`: a turn never ends inside an exclusive sequence (a reservation still open after 64 extra instructions is dropped, which the architecture allows),
+  otherwise another thread's store would not clear it.
+- Linux: `clone` (the thread flag set a threading library uses: `CLONE_VM|FS|FILES|SIGHAND|THREAD`, plus `SETTLS`, `PARENT_SETTID`, `CHILD_SETTID`, `CHILD_CLEARTID`;
+  anything else, `fork` included, is `-ENOSYS`), `futex` (`WAIT`, `WAKE`, `REQUEUE`, `CMP_REQUEUE`, `WAIT_BITSET`, `WAKE_BITSET`, with timeouts; `WAKE_OP` and the PI
+  forms are `-ENOSYS`), `exit` (a thread; the last one takes the process with it), `exit_group`, `gettid`, `set_tid_address` (`CHILD_CLEARTID` zeroes the word and wakes it
+  on exit, which is what `pthread_join` waits for), `tgkill`/`tkill` (accepted, no signals), `sched_getaffinity`, `prctl`. The code is in `src/Process/LinuxThreads.cpp`
+  and is shared with the native path, which does not support it yet (`supports_linux_threads()` is false there).
+- Windows: `NtCreateThread`, `CreateThread`, `ExitThread`, `TerminateThread`, waits on threads and objects, critical sections, TLS, events all work through the same
+  runtime (`start_thread`, `resume_thread`, `request_terminate`). `SuspendThread`, `Get/SetThreadContext` and thread-targeted APCs are not available.
+- At most 64 threads at a time per program.
+- Tests: `threads.c` (raw `clone` + futex mutex, atomics, join through `CLONE_CHILD_CLEARTID`, a futex hand-off and an `exit_group` that must stop a spinning thread) for
+  x86-64 and AArch64, run on real host threads at several slice lengths, clean under ASan/UBSan and ThreadSanitizer. `tests/emulated_windows.sh` runs
+  `tests/windows/emuthreads.c` (threads, critical sections, events, TLS, `TerminateThread`) on the emulator with the OS's own ntdll/kernel32.
+
+## What an emulated program cannot do yet
+- Windows exceptions only work for x86-64 Windows programs (the only kind there is), and `SuspendThread`, `Get/SetThreadContext` and thread-targeted APCs are missing.
+- Speed: a plain interpreter, tens of times slower than native. The seam for a translator (decode once into blocks, cache by address, invalidate on
+  `AddressSpace::generation()`) is `IGuestCpu::run()`.
+- Only x86-64, AArch64 and RISC-V (RV64GC) guests exist; a 32-bit guest (x86, Arm, RV32) needs its own `IGuestCpu`. AArch64 and RISC-V Windows programs are refused with a clear message.
+- The AArch64 and RISC-V kernel builds do not yet contain the shell, `ProgramRunner` or the process layer, so nothing launches programs there yet;
+  the emulator core compiles for both targets (checked with clang `--target=aarch64-linux-gnu` / `riscv64-linux-gnu`) and `ProgramRunner` already
+  falls back to emulation on any non-x86-64 build.
+- Nothing has been run in QEMU yet: the host test and the x86-64 kernel build are what exist.
+
+## Tests
+
+`tests/run_host_tests.sh EmulationTest` builds a freestanding Linux program (`tests/data/emulation/guest.c`) with the host compiler, runs it natively
+for the expected output, and checks the emulator prints the same for the x86-64 build and for the checked-in AArch64 build, also when run in tiny slices. It also covers instruction semantics
+against hand-assembled bytes, the soft-float against the host FPU (random and edge-case operands, all four rounding modes, results and flags compared bit for bit; the
+guest program also does double and float work), faults, architecture detection, and the truncation / bit-flip / random-byte robustness cases.
+
+`tests/riscv_diff.sh [int|mem|fp|comp|bit|vint|vmem|vfp] [--seeds N]` is the differential test of the RISC-V guest against `qemu-riscv64` (it needs clang with the riscv64 target, the rustup
+`ld.lld` and qemu, so it is not part of `run_host_tests.sh`): `tests/riscv_diff/gen.py` assembles thousands of random instructions with random register contents (x1..x30, f0..f31,
+fcsr and a 256-byte buffer) into one program that dumps the whole state after each, the program runs under qemu and under `tests/EmulationRun.cpp`, and `compare.py` requires
+identical state. About 105,000 cases (4 seeds of each mode: the integer set including M and the branches, loads/stores/LR/SC/AMOs, F and D with every rounding mode, the
+compressed set) match. The generator includes targeted cases for what random operands almost never reach (products that round up to the smallest normal number, `fmin`/`fmax`/compares/
+sign injection of +0 and -0); without them a wrong tininess rule and a wrong zero ordering both went unnoticed, and each is now caught. `EmulationTest` also runs the RISC-V builds of
+`guest.c` and `threads.c` (checked-in `guest-riscv64.elf`, `threads-riscv64.elf`; built with `clang --target=riscv64-linux-gnu -march=rv64gc -O2 -ffreestanding -nostdlib` and the
+rustup `ld.lld`) and has hand-assembled checks, fault vectors and truncation / bit-flip / random-word robustness cases for the RISC-V decoder.
+The `bit` mode covers Zba/Zbb/Zbs/Zbc/Zicond (qemu `-cpu max`); the `vint`, `vmem` and `vfp` modes (qemu `-cpu max,vlen=128,rvv_ta_all_1s=true,rvv_ma_all_1s=true`) start every case
+with a random legal `vsetvli` (SEW, LMUL 1/8..8, tail and mask policy, `vl` from 0 to past VLMAX), initialize all 32 vector registers with random, special or float-like lanes, run
+one instruction with legal register groups, and compare every vector register, `vl`, `vtype`, `vxsat`, `vxrm`, `fcsr`, the scalar registers and a 1 KiB buffer. 4,000 to 5,000 cases
+per seed; several seeds of each match with no mismatch. `tests/data/emulation/rvv.c` (checked in as `rvv-riscv64.elf` with the qemu output in `rvv-expected.txt`) is a program of
+intrinsics loops and auto-vectorized code that `EmulationTest` runs. `EmulationTest` also feeds 80,000 random vector instructions under random valid configurations to the
+decoder under ASan/UBSan.

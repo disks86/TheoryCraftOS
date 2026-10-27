@@ -31,7 +31,10 @@ constexpr uint64_t kUnknownWindows = 0xC000001Cu;      // STATUS_INVALID_SYSTEM_
 }  // namespace
 
 Process::Process(uint64_t id, const ProcessBinding& binding, IUserMemory& memory, IProcessHost& host)
-    : id_(id), binding_(binding), memory_(memory), host_(host), files_(binding.abi == SyscallAbi::Windows ? PathStyle::Windows : PathStyle::Posix) {}
+    : id_(id), binding_(binding), memory_(memory), host_(host), files_(binding.abi == SyscallAbi::Windows ? PathStyle::Windows : PathStyle::Posix) {
+  linux_.threads[0].tid = id;      // (the first thread of a Linux process has the process's id)
+  linux_.threads[0].used = true;
+}
 
 uint64_t Process::syscall(const SyscallRequest& request) {
   if (!binding_.interface || exited()) return binding_.abi == SyscallAbi::Windows ? kUnknownWindows : kUnknownLinux;

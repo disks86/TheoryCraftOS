@@ -282,11 +282,37 @@ AmdSdma3::Result AmdSdma3::start(const Memory& memory, uint32_t timeout_us) {
 }
 
 void AmdSdma3::set_trap_interrupts(bool enable) {
+  trap_interrupts_ = enable;
   for (uint32_t i = 0; i < kInstances; ++i) {
     uint32_t sdma_cntl = rd(mmSDMA0_CNTL + kRegisterOffset[i]);
     sdma_cntl = REG_SET_FIELD(sdma_cntl, SDMA0_CNTL, TRAP_ENABLE, enable ? 1 : 0);
     wr(mmSDMA0_CNTL + kRegisterOffset[i], sdma_cntl);
   }
+}
+
+AmdSdma3::Result AmdSdma3::recover(uint32_t timeout_us) {
+  if (!memory_.block.valid()) return Result::BadArgument;   // never started
+  ++recoveries_;
+  const uint32_t srbm_soft_reset = SRBM_SOFT_RESET__SOFT_RESET_SDMA_MASK | SRBM_SOFT_RESET__SOFT_RESET_SDMA1_MASK;   // (sdma_v3_0_check_soft_reset sets both when either is busy)
+  // sdma_v3_0_pre_soft_reset
+  ctx_switch_enable(false);
+  enable(false);
+  running_ = false;
+  // sdma_v3_0_soft_reset
+  uint32_t tmp = rd(mmSRBM_SOFT_RESET);
+  tmp |= srbm_soft_reset;
+  wr(mmSRBM_SOFT_RESET, tmp);
+  tmp = rd(mmSRBM_SOFT_RESET);
+  delay_us(50);
+  tmp &= ~srbm_soft_reset;
+  wr(mmSRBM_SOFT_RESET, tmp);
+  tmp = rd(mmSRBM_SOFT_RESET);
+  delay_us(50);   // wait a little for things to settle down
+  // sdma_v3_0_post_soft_reset
+  const Memory memory = memory_;
+  const Result result = start(memory, timeout_us);
+  if (result == Result::Ok && trap_interrupts_) set_trap_interrupts(true);
+  return result;
 }
 
 void AmdSdma3::stop() {

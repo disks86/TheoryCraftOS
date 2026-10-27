@@ -604,11 +604,30 @@ add_executable(BOOTX64
   src/Process/ModuleLoader.cpp
   src/Process/LinuxSyscalls.cpp
   src/Process/LinuxFiles.cpp
+  src/Process/LinuxThreads.cpp
   src/Process/ProcessFiles.cpp
   src/Process/WindowsFiles.cpp
   src/Process/ProgramEnvironment.cpp
   src/Program/ProgramHost.cpp
   src/Program/ProgramRunner.cpp
+  src/Program/EmulatedTask.cpp
+  src/Emulation/GuestCpu.cpp
+  src/Emulation/EmulatedProcess.cpp
+  src/Emulation/X86_64Cpu.cpp
+  src/Emulation/SoftFloat.cpp
+  src/Emulation/SoftFloatExt.cpp
+  src/Emulation/SoftFloatExtMath.cpp
+  src/Emulation/X86_64X87.cpp
+  src/Emulation/X86_64Vex.cpp
+  src/Emulation/X86_64Crypto.cpp
+  src/Emulation/AArch64Cpu.cpp
+  src/Emulation/AArch64Fp.cpp
+  src/Emulation/AArch64Simd.cpp
+  src/Emulation/RiscV64Cpu.cpp
+  src/Emulation/RiscV64Fp.cpp
+  src/Emulation/RiscV64Vector.cpp
+  src/Emulation/RiscV64VectorInt.cpp
+  src/Emulation/RiscV64VectorFp.cpp
   src/Process/WindowsSyscalls.cpp
   src/Media/Dash.cpp
   src/Media/DashClient.cpp
@@ -829,7 +848,7 @@ if(TCOS_ARCH STREQUAL "x86_64")
   add_custom_command(OUTPUT ${WINDOWS_DIR}/kernel32.dll
     COMMAND ${CMAKE_C_COMPILER} ${WINDOWS_DLL_FLAGS} ${kernel32_stubs} -Wl,--image-base=0x180200000 -o ${WINDOWS_DIR}/kernel32.dll
             ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.c ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.def ${WINDOWS_DIR}/libntdll.a
-    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.c ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra2.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra3.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/console.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/legacy.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/fmtmsg.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/time.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/nls.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.def ${WINDOWS_DIR}/libntdll.a ${WINDOWS_HEADERS} ${CMAKE_SOURCE_DIR}/src/Windows/stubs/kernel32.inc ${WINDOWS_STUBS_C}
+    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.c ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra2.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra3.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/console.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/legacy.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/fmtmsg.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/time.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/memory.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/nls.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.def ${WINDOWS_DIR}/libntdll.a ${WINDOWS_HEADERS} ${CMAKE_SOURCE_DIR}/src/Windows/stubs/kernel32.inc ${WINDOWS_STUBS_C}
     COMMENT "Building kernel32.dll")
   windows_stub_flags(msvcrt_stubs msvcrt 0)
   add_custom_command(OUTPUT ${WINDOWS_DIR}/msvcrt.dll

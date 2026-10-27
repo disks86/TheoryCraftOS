@@ -784,8 +784,8 @@ static void test_linux_thread_pointer_and_startup_calls() {
   CHECK(sres(p.syscall(lin(318, 0xDEAD0000, 16, 0))) == -14);
   host.give_random = false;
   CHECK(sres(p.syscall(lin(318, 0x10600, 16, 0))) == -38);
-  // A call this OS lacks is reported to the host.
-  CHECK(sres(p.syscall(lin(202, 0, 0, 0))) == -38 && host.unhandled == 202);
+  // A call this OS lacks (reboot) is reported to the host.
+  CHECK(sres(p.syscall(lin(169, 0, 0, 0))) == -38 && host.unhandled == 169);
   // The generic table has its own numbers and no arch_prctl.
   Process g(2, ProcessBinding{SyscallAbi::Linux, UserArch::AArch64, syscall_interface(SyscallAbi::Linux, UserArch::AArch64)}, s, host);
   CHECK(sres(g.syscall(lin(158, 0x1002, 0x7000))) == -38 && g.syscall(lin(173)) == 0 && g.syscall(lin(169, 0x10500, 0)) == 0);

@@ -100,7 +100,10 @@ struct Card final : IVcnRegisters {
     return gfx;
   }
   uint32_t read(uint32_t r) override { return owner(r).read(r); }
-  void write(uint32_t r, uint32_t v) override { owner(r).write(r, v); }
+  void write(uint32_t r, uint32_t v) override {
+    owner(r).write(r, v);
+    if (r == 0x398) sdma.write(r, v);   // SRBM_SOFT_RESET reaches both the graphics and the DMA engines
+  }
   size_t writes() const { return gfx.writes.size() + gmc.writes.size() + ih.writes.size() + sdma.writes.size() + dce.writes.size(); }
 };
 
@@ -832,6 +835,137 @@ static void test_video_engine_interrupts() {
   CHECK(vega.service_interrupts() == 1 && rec.events.size() == 8);
 }
 
+// Recovery of the whole card: a fault or a timeout wedges a ring, recover() resets the engines that are wedged and only those.
+static void test_recovery() {
+  Rig rig;
+  AmdVegaM vega(rig.alloc);
+  CHECK(vega.bring_up(rig.inputs()));
+  if (!vega.up()) return;
+  const uint32_t nop[] = {0xC0001000};
+  const ArrayView<const uint32_t> ib(nop, 1);
+  // Nothing wedged: nothing is done.
+  const size_t writes = rig.card.writes();
+  AmdVegaM::Recovery r = vega.recover();
+  CHECK(!vega.wedged() && !r.graphics && !r.sdma && !r.failed && rig.card.writes() == writes && vega.recoveries() == 0);
+  // A privileged-register fault on the graphics ring: wedged; recovering resets graphics (and the compute queues with it) and not the DMA engines.
+  rig.card.ih.post(184, 0, 0, 0, 0);
+  vega.service_interrupts();
+  CHECK(vega.wedged() && !vega.submit_graphics(ib));
+  auto sdma_resets = [&]() { size_t n = 0; for (uint32_t v : rig.card.sdma.srbm_resets) n += (v & 0x100040) != 0; return n; };   // (SRBM_SOFT_RESET reaches both fakes: count the SDMA bits)
+  const size_t sdma_before = sdma_resets();
+  r = vega.recover();
+  CHECK(r.graphics && !r.sdma && !r.failed && vega.recoveries() == 1 && !vega.wedged() && sdma_resets() == sdma_before);
+  CHECK(vega.submit_graphics(ib) && vega.submit_compute(3, ib) && vega.submit_sdma(1, ib));
+  // The interrupt sources the reset took are back: the graphics ring's, the compute pipe's, ECC and SQ.
+  CHECK((rig.card.gfx.reg(0x306a) & 0x04C00000) == 0x04C00000 && (rig.card.gfx.reg(0x3085) & 0x04000000) && (rig.card.gfx.reg(0x3049) & 0x4000) && !(rig.card.gfx.reg(0x2315) & 1));
+  // A fault of one compute queue: all the compute queues are reset with the graphics engine, as the driver's soft reset of the IP does.
+  const size_t mapped = rig.card.gfx.mapped.size();
+  rig.card.ih.post(185, 0, (2u << 4) | (1u << 2), 0, 0);   // ME 1, pipe 0, queue 2
+  vega.service_interrupts();
+  CHECK(vega.wedged() && !vega.submit_compute(2, ib) && vega.submit_compute(3, ib));
+  r = vega.recover();
+  CHECK(r.graphics && !r.sdma && vega.recoveries() == 2 && rig.card.gfx.mapped.size() == mapped + 8 && vega.submit_compute(2, ib));
+  // An SDMA illegal instruction: the DMA engines are reset (both), the graphics engine is left alone, TRAP_ENABLE is back.
+  const size_t gfx_resets = rig.card.gfx.grbm_resets.size();
+  rig.card.ih.post(241, 0, 1, 0, 0);
+  vega.service_interrupts();
+  CHECK(vega.wedged() && !vega.submit_sdma(1, ib));
+  r = vega.recover();
+  CHECK(!r.graphics && r.sdma && !r.failed && vega.recoveries() == 3 && rig.card.gfx.grbm_resets.size() == gfx_resets && sdma_resets() == sdma_before + 1);
+  CHECK(vega.submit_sdma(1, ib) && vega.submit_sdma(0, ib) && (rig.card.sdma.reg(0x3404) & 1) && (rig.card.sdma.reg(0x3604) & 1));
+  // Both at once.
+  rig.card.ih.post(184, 0, 0, 0, 0);
+  rig.card.ih.post(247, 0, 0, 0, 0);
+  vega.service_interrupts();
+  r = vega.recover();
+  CHECK(r.graphics && r.sdma && !r.failed && vega.recoveries() == 5 && !vega.wedged());
+  // service_interrupts() does not recover by itself unless asked to (Inputs::auto_recover).
+  rig.card.ih.post(184, 0, 0, 0, 0);
+  vega.service_interrupts();
+  CHECK(vega.wedged());
+  vega.recover();
+  // The card is shut down: nothing to recover.
+  vega.shutdown();
+  r = vega.recover();
+  CHECK(!r.graphics && !r.sdma && !vega.wedged());
+}
+
+static void test_auto_recovery() {
+  Rig rig;
+  AmdVegaM vega(rig.alloc);
+  AmdVegaM::Inputs in = rig.inputs();
+  in.auto_recover = true;
+  CHECK(vega.bring_up(in));
+  if (!vega.up()) return;
+  const uint32_t nop[] = {0xC0001000};
+  const ArrayView<const uint32_t> ib(nop, 1);
+  // A fault is dealt with in the same pass.
+  rig.card.ih.post(184, 0, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && !vega.wedged() && vega.recoveries() == 1 && vega.submit_graphics(ib));
+  rig.card.ih.post(241, 0, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && !vega.wedged() && vega.recoveries() == 2 && vega.submit_sdma(0, ib));
+  // A card that keeps hanging is left alone after kMaxRecoveries.
+  for (uint32_t i = 2; i < AmdVegaM::kMaxRecoveries; ++i) {
+    rig.card.ih.post(184, 0, 0, 0, 0);
+    vega.service_interrupts();
+  }
+  CHECK(vega.recoveries() == AmdVegaM::kMaxRecoveries && !vega.wedged());
+  rig.card.ih.post(184, 0, 0, 0, 0);
+  vega.service_interrupts();
+  CHECK(vega.wedged() && vega.recoveries() == AmdVegaM::kMaxRecoveries && !vega.submit_graphics(ib));
+  // Asking for it by hand still works.
+  const AmdVegaM::Recovery r = vega.recover();
+  CHECK(r.graphics && !r.failed && !vega.wedged() && vega.recoveries() == AmdVegaM::kMaxRecoveries + 1 && vega.submit_graphics(ib));
+}
+
+static void test_recovery_failure() {
+  Rig rig;
+  AmdVegaM vega(rig.alloc);
+  CHECK(vega.bring_up(rig.inputs()));
+  if (!vega.up()) return;
+  const uint32_t nop[] = {0xC0001000};
+  const ArrayView<const uint32_t> ib(nop, 1);
+  // The command processor hangs and the reset does not help: the engine comes back stopped and the card says so.
+  rig.card.gfx.hung = true;
+  rig.card.gfx.reset_fails = true;
+  CHECK(!vega.submit_graphics(ib, 2000) && vega.wedged());
+  AmdVegaM::Recovery r = vega.recover();
+  CHECK(r.graphics && r.failed && !vega.graphics()->running() && !vega.submit_graphics(ib));
+  // The DMA engines are independent: a stalled one resets fine, and the graphics engine is tried again (it is stopped, not wedged) and stays down.
+  rig.card.sdma.stall[0] = true;
+  CHECK(!vega.submit_sdma(0, ib, 2000) && vega.wedged());
+  r = vega.recover();
+  CHECK(r.graphics && r.sdma && r.failed && !vega.graphics()->running() && vega.sdma()->running() && vega.submit_sdma(0, ib));
+  // When the hardware lets the reset work, the next recovery brings the graphics engine back.
+  rig.card.gfx.reset_fails = false;
+  CHECK(vega.wedged());
+  r = vega.recover();
+  CHECK(r.graphics && !r.sdma && !r.failed && !vega.wedged() && vega.graphics()->running() && vega.submit_graphics(ib) && vega.submit_compute(0, ib));
+}
+
+static void test_recovery_failure_sdma() {
+  Rig rig;
+  AmdVegaM vega(rig.alloc);
+  CHECK(vega.bring_up(rig.inputs()));
+  if (!vega.up()) return;
+  const uint32_t nop[] = {0xC0001000};
+  const ArrayView<const uint32_t> ib(nop, 1);
+  // A DMA engine whose reset does not work: failed (and only the DMA engines were reset), tried again next time.
+  rig.card.sdma.stall[1] = true;
+  rig.card.sdma.reset_fails = true;
+  CHECK(!vega.submit_sdma(1, ib, 2000));
+  AmdVegaM::Recovery r = vega.recover();
+  CHECK(!r.graphics && r.sdma && r.failed && !vega.sdma()->running() && vega.wedged());
+  r = vega.recover();   // (stopped, so tried again - and fails again)
+  CHECK(!r.graphics && r.sdma && r.failed && vega.recoveries() == 2);
+  rig.card.sdma.reset_fails = false;
+  r = vega.recover();
+  CHECK(!r.graphics && r.sdma && !r.failed && vega.sdma()->running() && !vega.wedged() && vega.submit_sdma(0, ib) && vega.submit_sdma(1, ib));
+  // Nothing wedged and running: nothing to do.
+  r = vega.recover();
+  CHECK(!r.graphics && !r.sdma && !r.failed);
+}
+
 int main() {
   setvbuf(stdout, nullptr, _IONBF, 0);
   test_plan();
@@ -847,6 +981,10 @@ int main() {
   test_display_interrupts();
   test_vblank_interrupt();
   test_video_engine_interrupts();
+  test_recovery();
+  test_auto_recovery();
+  test_recovery_failure();
+  test_recovery_failure_sdma();
   printf(g_failed ? "AmdVegaMTest: %d FAILED\n" : "AmdVegaMTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }

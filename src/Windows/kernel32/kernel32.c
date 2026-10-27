@@ -281,18 +281,7 @@ EXPORT BOOL WINAPI HeapSetInformation(HANDLE h, int info_class, PVOID info, SIZE
 EXPORT SIZE_T WINAPI HeapCompact(HANDLE h, DWORD flags) { (void)h; (void)flags; return 0; }
 EXPORT BOOL WINAPI HeapLock(HANDLE h) { (void)h; return TRUE; }
 EXPORT BOOL WINAPI HeapUnlock(HANDLE h) { (void)h; return TRUE; }
-EXPORT HLOCAL WINAPI LocalAlloc(UINT flags, SIZE_T bytes) { return HeapAlloc(heap(), (flags & LMEM_ZEROINIT) ? HEAP_ZERO_MEMORY : 0, bytes); }
-EXPORT HLOCAL WINAPI LocalReAlloc(HLOCAL m, SIZE_T bytes, UINT flags) { return HeapReAlloc(heap(), (flags & LMEM_ZEROINIT) ? HEAP_ZERO_MEMORY : 0, m, bytes); }
-EXPORT HLOCAL WINAPI LocalFree(HLOCAL m) { return m && !RtlFreeHeap(heap(), 0, m) ? m : NULL; }
-EXPORT SIZE_T WINAPI LocalSize(HLOCAL m) { return RtlSizeHeap(heap(), 0, m); }
-EXPORT HGLOBAL WINAPI GlobalAlloc(UINT flags, SIZE_T bytes) { return HeapAlloc(heap(), (flags & GMEM_ZEROINIT) ? HEAP_ZERO_MEMORY : 0, bytes); }
-EXPORT HGLOBAL WINAPI GlobalReAlloc(HGLOBAL m, SIZE_T bytes, UINT flags) { return HeapReAlloc(heap(), (flags & GMEM_ZEROINIT) ? HEAP_ZERO_MEMORY : 0, m, bytes); }
-EXPORT HGLOBAL WINAPI GlobalFree(HGLOBAL m) { return m && !RtlFreeHeap(heap(), 0, m) ? m : NULL; }
-EXPORT SIZE_T WINAPI GlobalSize(HGLOBAL m) { return RtlSizeHeap(heap(), 0, m); }
-EXPORT LPVOID WINAPI GlobalLock(HGLOBAL m) { return m; }
-EXPORT BOOL WINAPI GlobalUnlock(HGLOBAL m) { (void)m; return FALSE; }
-EXPORT LPVOID WINAPI LocalLock(HLOCAL m) { return m; }
-EXPORT BOOL WINAPI LocalUnlock(HLOCAL m) { (void)m; return FALSE; }
+#include "memory.inc"
 
 /* ---- the process: ids, command line, environment, modules, version ---------------------------------------------------------------------------------------- */
 
@@ -584,6 +573,7 @@ EXPORT void WINAPI GlobalMemoryStatus(LPMEMORYSTATUS m) {
   m->dwAvailVirtual = x.ullAvailVirtual;
 }
 EXPORT BOOL WINAPI GetPhysicallyInstalledSystemMemory(ULONGLONG *kilobytes) {
+  if (!kilobytes) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
   MEMORYSTATUSEX x;
   x.dwLength = sizeof(x);
   if (!GlobalMemoryStatusEx(&x)) return FALSE;

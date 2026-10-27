@@ -93,6 +93,16 @@ class AmdGfx8 {
   Result start(const Memory& memory, uint32_t timeout_us = kDefaultTimeoutUs);
   // The compute queues to start with the engine (not owned; they must outlive this object, and be attached to their memory first). nullptr: none.
   void attach_compute(AmdGfx8Compute* compute) { compute_ = compute; }
+  // Recovery after a hang (a fence that never came, a fault reported by the CP): the soft reset of gfx_v8_0.c as the driver's amdgpu_device_gpu_recover runs it for this IP.
+  // gfx_v8_0_check_soft_reset reads GRBM_STATUS, GRBM_STATUS2 and SRBM_STATUS for what is busy and picks the reset bits (when nothing shows busy, as for a fence that was never
+  // written, the command processor is reset all the same: CP, GFX, CPF, CPC, CPG and the GRBM). gfx_v8_0_pre_soft_reset stops the RLC, the graphics command processor, dequeues
+  // the compute queues directly and halts the MEC; gfx_v8_0_soft_reset stalls the memory controller's graphics clients (GMCON_DEBUG), pulses GRBM_SOFT_RESET and SRBM_SOFT_RESET and
+  // releases them; gfx_v8_0_post_soft_reset resumes the KIQ, the compute queues and the graphics ring, runs the ring tests and starts the RLC. The ring is empty afterwards, fence
+  // numbers start again, the wedged state is gone, and the interrupt sources that were on are put back. Needs start() to have worked once (for the memory). On a ring test failure
+  // the engine is left stopped (running() is false) and the result says which.
+  Result recover(uint32_t timeout_us = kDefaultTimeoutUs);
+  bool running() const { return running_; }
+  uint32_t recoveries() const { return recoveries_; }
   // gfx_v8_0_hw_fini: unmaps the compute queues, halts the command processors (graphics and compute) and the RLC.
   void stop();
 
@@ -158,6 +168,8 @@ class AmdGfx8 {
   void rlc_reset();
   void rlc_start();
   void cp_gfx_enable(bool enable);
+  void check_soft_reset(uint32_t* grbm_soft_reset, uint32_t* srbm_soft_reset);
+  void apply_interrupts();
   void cp_resume_ring(const Memory& memory);
   void ring_write(uint32_t dword);
   void ring_commit();
@@ -170,6 +182,8 @@ class AmdGfx8 {
   uint32_t raster_config_ = 0, raster_config_1_ = 0, active_rbs_ = 0;
   AmdGfx8Compute* compute_ = nullptr;
   bool running_ = false, wedged_ = false;
+  bool int_gfx_ = false, int_ecc_ = false, int_sq_ = false;   // the interrupt sources asked for, to put back after a reset
+  uint32_t recoveries_ = 0;
   uint32_t fence_sequence_ = 0;
 };
 
