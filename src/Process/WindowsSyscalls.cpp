@@ -154,6 +154,7 @@ class WindowsSyscalls final : public ISyscallInterface {
       case WindowsSyscallNumber::NtOpenThread: return windowsabi::nt_open_thread(process, r);
       case WindowsSyscallNumber::NtOpenProcess: return windowsabi::nt_open_process(process, r);
       case WindowsSyscallNumber::NtCreateSection: return windowsabi::nt_create_section(process, r);
+      case WindowsSyscallNumber::NtQuerySection: return windowsabi::nt_query_section(process, r);
       case WindowsSyscallNumber::NtOpenSection: return windowsabi::nt_open_section(process, r);
       case WindowsSyscallNumber::NtMapViewOfSection: return windowsabi::nt_map_view_of_section(process, r);
       case WindowsSyscallNumber::NtUnmapViewOfSection: return windowsabi::nt_unmap_view_of_section(process, r);

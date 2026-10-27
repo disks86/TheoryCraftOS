@@ -238,6 +238,7 @@ EXPORT BOOL WINAPI VirtualFree(LPVOID address, SIZE_T size, DWORD type) {
   return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
 EXPORT BOOL WINAPI VirtualProtect(LPVOID address, SIZE_T size, DWORD protect, PDWORD old) {
+  if (!old) { set_error(ERROR_NOACCESS); return FALSE; }
   PVOID base = address;
   SIZE_T bytes = size;
   ULONG previous = 0;
@@ -1270,7 +1271,7 @@ EXPORT HANDLE WINAPI CreateFileMappingW(HANDLE file, LPSECURITY_ATTRIBUTES sa, D
   }
   NamedAttributes n;
   HANDLE h = NULL;
-  const NTSTATUS status = NtCreateSection(&h, SECTION_ALL_, named_attributes(&n, name, sa && sa->bInheritHandle), size_pointer, page, 0x8000000 /* SEC_COMMIT */, file);
+  const NTSTATUS status = NtCreateSection(&h, SECTION_ALL_, named_attributes(&n, name, sa && sa->bInheritHandle), size_pointer, page, protect & 0xFFFFFF00u /* the SEC_* flags */, file);
   if (!NT_SUCCESS(status)) { fail_nt(status); return NULL; }
   set_error(status == 0x40000000 ? ERROR_ALREADY_EXISTS : ERROR_SUCCESS);
   return h;
@@ -1285,10 +1286,9 @@ EXPORT HANDLE WINAPI CreateFileMappingA(HANDLE file, LPSECURITY_ATTRIBUTES sa, D
   return h;
 }
 EXPORT HANDLE WINAPI OpenFileMappingW(DWORD access, BOOL inherit, LPCWSTR name) {
-  (void)access;
   NamedAttributes n;
   HANDLE h = NULL;
-  const NTSTATUS status = NtOpenSection(&h, SECTION_ALL_, named_attributes(&n, name, inherit));
+  const NTSTATUS status = NtOpenSection(&h, access, named_attributes(&n, name, inherit));
   if (!NT_SUCCESS(status)) { fail_nt(status); return NULL; }
   return h;
 }
@@ -1300,8 +1300,9 @@ EXPORT HANDLE WINAPI OpenFileMappingA(DWORD access, BOOL inherit, LPCSTR name) {
   return h;
 }
 EXPORT LPVOID WINAPI MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offset_high, DWORD offset_low, SIZE_T bytes, LPVOID base_address) {
-  ULONG page = (access & FILE_MAP_WRITE_) ? PAGE_READWRITE : (access & FILE_MAP_COPY_) ? 0x08 /* PAGE_WRITECOPY */ : 0x02 /* PAGE_READONLY */;
-  if (access & FILE_MAP_EXECUTE_) page = page == PAGE_READWRITE ? 0x40 : page == 0x08 ? 0x80 : 0x20;
+  const BOOL exec = (access & FILE_MAP_EXECUTE_) != 0;      /* a copy-on-write view only when COPY is the whole request; no read/write/copy bit: a view nobody may touch */
+  access &= ~(DWORD)FILE_MAP_EXECUTE_;
+  ULONG page = access == FILE_MAP_COPY_ ? (exec ? 0x80 : 0x08) : (access & FILE_MAP_WRITE_) ? (exec ? 0x40 : PAGE_READWRITE) : (access & FILE_MAP_READ_) ? (exec ? 0x20 : 0x02) : 0x01;
   LARGE_INTEGER offset;
   offset.LowPart = offset_low;
   offset.HighPart = (LONG)offset_high;
@@ -1339,6 +1340,7 @@ EXPORT BOOL WINAPI VirtualFreeEx(HANDLE process, LPVOID address, SIZE_T size, DW
   return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
 EXPORT BOOL WINAPI VirtualProtectEx(HANDLE process, LPVOID address, SIZE_T size, DWORD protect, PDWORD old) {
+  if (!old) { set_error(ERROR_NOACCESS); return FALSE; }
   PVOID base = address;
   SIZE_T bytes = size;
   ULONG previous = 0;
@@ -2847,8 +2849,7 @@ EXPORT UINT WINAPI GetTempFileNameA(LPCSTR dir, LPCSTR prefix, UINT unique, LPST
   return id;
 }
 EXPORT BOOL WINAPI DuplicateHandle(HANDLE sp, HANDLE source, HANDLE tp, HANDLE *target, DWORD access, BOOL inherit, DWORD options) {
-  (void)inherit;
-  const NTSTATUS status = NtDuplicateObject(sp, source, tp, target, access, 0, options & 1);      /* DUPLICATE_CLOSE_SOURCE; within this process */
+  const NTSTATUS status = NtDuplicateObject(sp, source, tp, target, access, inherit ? 2 /* OBJ_INHERIT */ : 0, options & 3);      /* DUPLICATE_CLOSE_SOURCE, DUPLICATE_SAME_ACCESS; within this process */
   return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
 
