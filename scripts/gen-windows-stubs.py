@@ -19,6 +19,7 @@
 Writes, under src/Windows:
   stubs/<dll>.inc          one X(Name) per export the DLL does not implement; stubs/stubs.c turns the list into exported functions that do nothing
   ntdll/services.inc       NT_SERVICE(NtName) for every service that ntdll.dll has no stub for yet
+  win32u/services.inc      NT_SERVICE(NtUserName), NT_SERVICE(NtGdiName), ... for the services of win32k (the names are scripts/win32k-services.txt)
   ntdll/zw.inc             ZW_SERVICE(NtName, ZwName): the Zw twin of every service
   tcos_syscalls.h          the numbers of the new services (also added to WindowsSyscallNumber in src/Process/WindowsSyscalls.hpp)
 
@@ -53,6 +54,7 @@ wevtapi pdh wldap32 urlmon msi propsys hid usp10 winscard odbc32 xinput1_4 dsoun
 normaliz sensapi""".split()
 # Exports of ntdll.dll that are ordinary functions although their names look like system services.
 NOT_SERVICES = {"NtGetTickCount"}
+WIN32K_BASE = 0x1000      # where the win32k services start (the second service table of Windows has index 1: 0x1000)
 IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -116,33 +118,47 @@ def main():
                     existing[dll].add(line.split("=")[0].strip())
 
     # ---- the system services -------------------------------------------------------------------------------------------------------------------------------
+    # Two ranges, as on Windows: the services of the executive from 0, those of win32k (called through win32u.dll) from WIN32K_BASE.
     nt_names = sorted(n for n in library_exports(["ntdll"]) if re.match(r"^Nt[A-Z]", n) and n not in NOT_SERVICES)
+    with open(os.path.join(ROOT, "scripts", "win32k-services.txt")) as f:
+        k_names = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+    k_names = [n for n in dict.fromkeys(k_names) if n not in nt_names]
     header_path = os.path.join(WIN, "tcos_syscalls.h")
     with open(header_path) as f:
         header = f.read()
-    numbered = {m.group(1): int(m.group(2)) for m in re.finditer(r"#define NT_SERVICE_(\w+) (\d+)", header)}
-    next_number = max(numbered.values()) + 1
+    numbered = {m.group(1): int(m.group(2)) for m in re.finditer(r"#define NT_SERVICE_(\w+) (\d+)", header) if not re.match(r"(COUNT|WIN32K_)", m.group(1))}
+    next_number = max(v for v in numbered.values() if v < WIN32K_BASE) + 1
+    next_k = max([v for v in numbered.values() if v >= WIN32K_BASE] + [WIN32K_BASE - 1]) + 1
     added = []
     for name in nt_names:
         if name not in numbered:
             numbered[name] = next_number
             added.append((name, next_number))
             next_number += 1
+    for name in k_names:
+        if name not in numbered:
+            numbered[name] = next_k
+            added.append((name, next_k))
+            next_k += 1
     if added:
-        text = header.replace("#endif\n", "".join("#define NT_SERVICE_%s %d\n" % a for a in added) + "#endif\n")
-        text = re.sub(r"#define NT_SERVICE_COUNT \d+\n", "", text)
-        text = text.replace("#endif\n", "#define NT_SERVICE_COUNT %d\n#endif\n" % next_number)
+        text = re.sub(r"#define NT_SERVICE_(COUNT|WIN32K_BASE|WIN32K_END) \d+\n", "", header)
+        text = text.replace("#endif\n", "".join("#define NT_SERVICE_%s %d\n" % a for a in added) + "#endif\n")
+        text = text.replace("#endif\n", "#define NT_SERVICE_COUNT %d\n#define NT_SERVICE_WIN32K_BASE %d\n#define NT_SERVICE_WIN32K_END %d\n#endif\n" % (next_number, WIN32K_BASE, next_k))
         write(header_path, text)
         hpp_path = os.path.join(ROOT, "src", "Process", "WindowsSyscalls.hpp")
         with open(hpp_path) as f:
             hpp = f.read()
-        hpp = hpp.replace("};\n\nconstexpr uint32_t kStatusInvalidSystemService", "".join("  %s = %d,\n" % a for a in added) + "};\n\nconstexpr uint32_t kStatusInvalidSystemService", 1)
         hpp = re.sub(r"constexpr uint32_t kWindowsServiceCount = \d+;[^\n]*\n", "", hpp)
+        hpp = re.sub(r"constexpr uint32_t kWin32kService(Base|End) = \w+;[^\n]*\n", "", hpp)
+        hpp = hpp.replace("};\n\nconstexpr uint32_t kStatusInvalidSystemService", "".join("  %s = %d,\n" % a for a in added) + "};\n\nconstexpr uint32_t kStatusInvalidSystemService", 1)
         hpp = hpp.replace("constexpr uint32_t kStatusInvalidSystemService",
-                          "constexpr uint32_t kWindowsServiceCount = %d;      // numbers below this are services (the ones without code answer STATUS_NOT_IMPLEMENTED)\n"
-                          "constexpr uint32_t kStatusInvalidSystemService" % next_number, 1)
+                          "constexpr uint32_t kWindowsServiceCount = %d;      // numbers below this are services of the executive (the ones without code answer STATUS_NOT_IMPLEMENTED)\n"
+                          "constexpr uint32_t kWin32kServiceBase = %d, kWin32kServiceEnd = %d;      // the services of win32k (NtUser*, NtGdi*, ...) are these numbers; same answer\n"
+                          "constexpr uint32_t kStatusInvalidSystemService" % (next_number, WIN32K_BASE, next_k), 1)
         write(hpp_path, hpp)
     have_stub = existing["ntdll"]
+    write(os.path.join(WIN, "win32u", "services.inc"), HEADER + "/* The services of win32k, as win32u.dll exports them: generated by scripts/gen-windows-stubs.py from scripts/win32k-services.txt. They end in\n * STATUS_NOT_IMPLEMENTED until the kernel implements them. */\n" +
+          "".join("NT_SERVICE(%s);\n" % n for n in k_names))
     write(os.path.join(WIN, "ntdll", "services.inc"), HEADER + "/* The services that ntdll.dll has no stub for in ntdll.c: generated by scripts/gen-windows-stubs.py. They end in STATUS_NOT_IMPLEMENTED until the kernel\n * implements them. */\n" +
           "".join("NT_SERVICE(%s);\n" % n for n in nt_names if n not in have_stub and not re.search(r"\bNT_SERVICE(_RAW)?\(%s\)" % n, open(os.path.join(WIN, "ntdll", "ntdll.c")).read())))
     write(os.path.join(WIN, "ntdll", "zw.inc"), HEADER + "/* Zw twins of the services (in user mode they are the same calls): generated by scripts/gen-windows-stubs.py. */\n" +

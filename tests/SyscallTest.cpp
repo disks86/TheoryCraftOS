@@ -341,6 +341,10 @@ static void test_windows() {
 
   CHECK(st(p.syscall(nt(static_cast<WindowsSyscallNumber>(kWindowsServiceCount)))) == kNtNoService);      // the first number past the list
   CHECK(st(p.syscall(nt(static_cast<WindowsSyscallNumber>(kWindowsServiceCount - 1)))) == kNtNotImpl);      // the last service has no code yet
+  CHECK(st(p.syscall(nt(static_cast<WindowsSyscallNumber>(kWin32kServiceBase)))) == kNtNotImpl);          // win32k's first and last service
+  CHECK(st(p.syscall(nt(static_cast<WindowsSyscallNumber>(kWin32kServiceEnd - 1)))) == kNtNotImpl);
+  CHECK(st(p.syscall(nt(static_cast<WindowsSyscallNumber>(kWin32kServiceBase - 1)))) == kNtNoService);     // the gap between the two tables
+  CHECK(st(p.syscall(nt(static_cast<WindowsSyscallNumber>(kWin32kServiceEnd)))) == kNtNoService);
   CHECK(st(p.syscall(nt(static_cast<WindowsSyscallNumber>(99)))) == kNtNotImpl);                            // the first service without code
   SyscallRequest wide = nt(WindowsSyscallNumber::NtYieldExecution);
   wide.number |= 0x100000000ull;                                 // decoders mask this; a raw caller gets "no such service"
@@ -479,6 +483,10 @@ static void test_service_numbers_agree() {
       CHECK(number == kWindowsServiceCount);
       continue;
     }
+    if (std::string(name) == "WIN32K_BASE" || std::string(name) == "WIN32K_END") {
+      CHECK(number == (std::string(name) == "WIN32K_BASE" ? kWin32kServiceBase : kWin32kServiceEnd));
+      continue;
+    }
     bool known = false;
     for (const Pair& pair : table) {
       if (std::string(pair.name) != name) continue;
@@ -494,7 +502,7 @@ static void test_service_numbers_agree() {
   }
   fclose(header);
   CHECK(found == sizeof(table) / sizeof(table[0]));
-  CHECK(found + generated == kWindowsServiceCount);      // every number below the count is a service of the header
+  CHECK(found + generated == kWindowsServiceCount + (kWin32kServiceEnd - kWin32kServiceBase));      // every number below the count is a service of the header
 }
 
 int main() {
