@@ -600,6 +600,7 @@ add_executable(BOOTX64
   src/Process/WindowsMailslots.cpp
   src/Process/WindowsRegistry.cpp
   src/Process/RegistryTree.cpp
+  src/Process/DosWildcard.cpp
   src/Process/Objects.cpp
   src/Process/ModuleLoader.cpp
   src/Process/LinuxSyscalls.cpp

@@ -2953,18 +2953,26 @@ static void fill_find_data(const BYTE *record, WIN32_FIND_DATAW *data) {
 }
 
 EXPORT HANDLE WINAPI FindFirstFileW(LPCWSTR path, LPWIN32_FIND_DATAW data) {
+  if (!path) { set_error(ERROR_PATH_NOT_FOUND); return INVALID_HANDLE_VALUE; }
+  /* The pattern is what follows the last separator of the path as it was written: normalising the whole path would take trailing dots and spaces off it, and those
+   * mean something in a pattern ("*." is the names without an extension). */
+  const size_t_ path_length = wcslen(path);
+  size_t_ cut = path_length;
+  while (cut > 0 && path[cut - 1] != '\\' && path[cut - 1] != '/' && !(cut == 2 && path[1] == ':')) --cut;
+  WCHAR directory_text[PATH_CHARS];
+  if (path_length >= PATH_CHARS) { set_error(ERROR_FILENAME_EXCED_RANGE); return INVALID_HANDLE_VALUE; }
+  if (cut == 0) { directory_text[0] = '.'; directory_text[1] = '\\'; directory_text[2] = 0; }
+  else { memcpy(directory_text, path, cut * 2); directory_text[cut] = 0; }
   WCHAR full[PATH_CHARS];
-  const DWORD n = full_path_w(path, full, PATH_CHARS);
+  const DWORD n = full_path_w(directory_text, full, PATH_CHARS - 2);
   if (n == 0) return INVALID_HANDLE_VALUE;
-  /* "C:\dir\*.txt": the directory is everything before the last backslash, the pattern what follows. */
   DWORD split = n;
-  while (split > 0 && full[split - 1] != '\\') --split;
-  if (split == 0) { set_error(ERROR_PATH_NOT_FOUND); return INVALID_HANDLE_VALUE; }
+  if (full[split - 1] != '\\') full[split++] = '\\';
   FindState *f = RtlAllocateHeap(heap(), HEAP_ZERO_MEMORY, sizeof(FindState));
   if (!f) { set_error(ERROR_NOT_ENOUGH_MEMORY); return INVALID_HANDLE_VALUE; }
-  const DWORD pattern_length = n - split;
+  const DWORD pattern_length = (DWORD)(path_length - cut);
   if (pattern_length == 0 || pattern_length >= MAX_PATH) { RtlFreeHeap(heap(), 0, f); set_error(ERROR_FILE_NOT_FOUND); return INVALID_HANDLE_VALUE; }
-  memcpy(f->pattern, full + split, pattern_length * 2);
+  memcpy(f->pattern, path + cut, pattern_length * 2);
   f->pattern[pattern_length] = 0;
   if (split > 3) --split;      /* the directory without its trailing backslash, except the root */
   full[split] = 0;

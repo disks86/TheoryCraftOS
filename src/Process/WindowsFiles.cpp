@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Process/WindowsFiles.hpp"
+#include "Process/DosWildcard.hpp"
 #include "Process/Objects.hpp"
 #include "Process/WindowsMailslots.hpp"
 #include "Process/WindowsPipes.hpp"
@@ -346,20 +347,6 @@ uint32_t file_io(Process& p, const SyscallRequest& r, bool write) {
 
 // --- queries
 
-bool wildcard(StringView pattern, StringView name) {
-  // * and ? against a name, ignoring case; "*.*" means every name.
-  if (pattern.equals("*.*")) return true;
-  uint64_t p = 0, n = 0, star = StringView::npos, mark = 0;
-  auto lower = [](char c) { return (c >= 'A' && c <= 'Z') ? static_cast<char>(c + 32) : c; };
-  while (n < name.size()) {
-    if (p < pattern.size() && (pattern[p] == '?' || lower(pattern[p]) == lower(name[n]))) { ++p; ++n; }
-    else if (p < pattern.size() && pattern[p] == '*') { star = p++; mark = n; }
-    else if (star != StringView::npos) { p = star + 1; n = ++mark; }
-    else return false;
-  }
-  while (p < pattern.size() && pattern[p] == '*') ++p;
-  return p == pattern.size();
-}
 
 void write_times(ByteView out, uint64_t at, const DirectoryEntry& e) {
   put(out, at, file_time(e.created ? e.created : e.modified), 8);      // CreationTime
@@ -735,7 +722,7 @@ uint32_t nt_query_directory_file(Process& p, const SyscallRequest& r) {
     Status status = files.next_entry(object, &entry);
     if (status == Status::EndOfDirectory) break;
     if (status != Status::Ok) return any ? kSuccess : nt_status(status);
-    if (!pattern.empty() && !wildcard(pattern, entry.name.view())) continue;
+    if (!pattern.empty() && !dos_wildcard_matches(pattern, entry.name.view())) continue;
     const uint64_t size = build_directory_record(static_cast<uint32_t>(info_class), entry, ++object.directory_index, record, sizeof(record));
     if (size == 0) return kInvalidInfoClass;
     const uint64_t padded = (size + 7) & ~uint64_t{7};
