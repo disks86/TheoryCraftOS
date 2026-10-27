@@ -47,6 +47,7 @@ class AmdIh3 {
     bool use_doorbell = true;      // adev->irq.ih.use_doorbell: the read pointer goes through the doorbell BAR
     uint32_t doorbell_index = kDefaultDoorbell;
     bool msi = false;              // adev->irq.msi_enabled: RPTR_REARM
+    bool ring_in_video_memory = false;   // the ring is in non-cacheable memory, e.g. video memory: INTERRUPT_CNTL.IH_REQ_NONSNOOP_EN (the driver puts its ring in system memory)
   };
   // `ring` is kRingBytes + kWritebackBytes long, page aligned in the GPU's address space (`ring_gpu_address`). `dummy_page_gpu_address` is the page the controller reads
   // after an interrupt (the driver's dummy page). `doorbells` is the doorbell BAR (only used with use_doorbell).

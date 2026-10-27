@@ -34,7 +34,9 @@
 #pragma once
 #include <stdint.h>
 #include "Hardware/Clock/IClock.hpp"
+#include "Hardware/Mmio.hpp"
 #include "Hardware/VideoCodec/AMD/AmdVcn1.hpp"
+#include "Utility/ArrayView.hpp"
 
 namespace hardware {
 namespace amd_dce11 {
@@ -77,6 +79,56 @@ class Plane {
   uint64_t original_ = 0;
   uint32_t pitch_ = 0;
   uint64_t aperture_low_ = 0, aperture_high_ = 0;
+};
+
+// The firmware's framebuffer as the UEFI graphics output describes the current mode.
+struct FirmwareFramebuffer {
+  uint64_t physical = 0;     // the CPU's address of its first byte (the OS runs identity mapped)
+  uint64_t bytes = 0;        // the whole allocation
+  uint32_t width = 0, height = 0;
+  uint32_t pitch_pixels = 0;
+};
+
+// What AmdGpu needs of a display engine that can show the OS's own framebuffer in place of the firmware's (the Vega M's, see AmdVegaM): take the screen over for the firmware's
+// current mode, hand the memory to draw in back, and give the screen back before the firmware changes the mode.
+class INativeDisplay {
+ public:
+  virtual bool engage_display(const FirmwareFramebuffer& firmware, ByteView* memory) = 0;
+  virtual bool display_engaged() const = 0;
+  virtual void disengage_display() = 0;
+
+ protected:
+  INativeDisplay() = default;
+  ~INativeDisplay() = default;
+};
+
+// The OS's own framebuffer in video memory and the display pointed at it, the counterpart of amd_dcn1::Scanout for a card with its own memory: the picture is copied into a
+// window of video memory (`region`, mapped for the CPU through the memory BAR, `region_gpu` its GPU address), the surface address is switched, and `memory` is what to draw
+// in. The firmware's framebuffer has to be in video memory the memory BAR shows (the card drives the firmware's display): its GPU address is `gpu_base` plus its distance
+// from `cpu_base`, the start of the memory BAR. Anything that does not fit (another GPU's display, a mode the plane is not in, no room, the engine not taking the address)
+// leaves the firmware's framebuffer on the screen. The window is uncached memory (a mapped BAR), so there is nothing to flush.
+class Display {
+ public:
+  Display(IVcnRegisters& registers, const IClock& clock, uint64_t cpu_base, uint64_t gpu_base, const MmioRegion& region, uint64_t region_gpu)
+      : plane_(registers, clock), cpu_base_(cpu_base), gpu_base_(gpu_base), region_(region), region_gpu_(region_gpu) {}
+  ~Display() { disengage(); }
+  Display(const Display&) = delete;
+  Display& operator=(const Display&) = delete;
+
+  bool engage(const FirmwareFramebuffer& firmware, ByteView* memory);
+  bool engaged() const { return engaged_; }
+  // Gives the screen back to the firmware's framebuffer, with what was drawn since copied back into it.
+  void disengage();
+  const Plane& plane() const { return plane_; }
+
+ private:
+  Plane plane_;
+  uint64_t cpu_base_, gpu_base_;
+  MmioRegion region_;
+  uint64_t region_gpu_;
+  bool engaged_ = false;
+  FirmwareFramebuffer firmware_;
+  ByteView memory_;
 };
 
 }  // namespace amd_dce11

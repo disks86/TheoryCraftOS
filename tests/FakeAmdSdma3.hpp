@@ -74,6 +74,8 @@ class Card final : public hardware::IVcnRegisters {
   void write(uint32_t r, uint32_t v) override {
     writes.push_back({r, v});
     regs_[r] = v;
+    if (r == kRbRptr) rptr_[0] = v;            // the driver sets the read pointer (to 0) when it programs the ring
+    if (r == kRbRptr + 0x200) rptr_[1] = v;
   }
 
   uint8_t* host(uint64_t gpu, uint64_t bytes) const {

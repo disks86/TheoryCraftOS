@@ -23,97 +23,18 @@
 // the put-back when the engine does not take the address, and the aperture checks.
 #include <stdio.h>
 #include <map>
+#include <string.h>
 #include <vector>
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdDce11.hpp"
 #include "Hardware/Clock/IClock.hpp"
+#include "FakeAmdDce11.hpp"
 
 using namespace hardware;
 using namespace hardware::amd_dce11;
+using namespace fakedce;
 
 static int g_failed = 0;
 #define CHECK(...) do { if (!(__VA_ARGS__)) { printf("FAILED line %d: %s\n", __LINE__, #__VA_ARGS__); ++g_failed; } } while (0)
-
-constexpr uint32_t kCrtcControl = 0x1b9c, kGrphEnable = 0x1a00, kGrphControl = 0x1a01, kGrphSwap = 0x1a03, kGrphPrimary = 0x1a04, kGrphPitch = 0x1a06, kGrphPrimaryHigh = 0x1a07;
-constexpr uint32_t kGrphUpdate = 0x1a11, kGrphFlipControl = 0x1a12, kApertureLow = 0x80d, kApertureHigh = 0x80e;
-constexpr uint32_t kOffsets[6] = {0x0, 0x200, 0x400, 0x2600, 0x2800, 0x2a00};
-constexpr uint64_t kSurface = 0x1'2000'0000ull;
-
-struct FakeClock final : IClock {
-  mutable uint64_t now = 0;
-  uint64_t now_us() const override { now += 50; return now; }
-  const char* name() const override { return "fake clock"; }
-  bool initialize() override { return true; }
-  void shutdown() override {}
-};
-
-class FakeDisplay final : public IVcnRegisters {
- public:
-  std::vector<std::pair<uint32_t, uint32_t>> writes;
-  uint32_t latency_reads = 2;       // reads of GRPH_UPDATE that still show the update pending
-  bool never_take = false;          // the engine never latches the new address
-  bool all_ones = false;            // the registers are not there
-  bool drop_address = false;        // the pending flag clears but the engine keeps showing the old address
-
-  void set(uint32_t r, uint32_t v) { regs_[r] = v; }
-  uint32_t get(uint32_t r) const { auto at = regs_.find(r); return at == regs_.end() ? 0 : at->second; }
-  // A CRTC in the state the firmware leaves it in: on, 32-bit ARGB8888 linear, showing `surface`.
-  void crtc(uint32_t index, uint64_t surface, uint32_t pitch) {
-    const uint32_t off = kOffsets[index];
-    set(kCrtcControl + off, 0x1);
-    set(kGrphEnable + off, 0x1);
-    set(kGrphControl + off, 0x2);          // GRPH_DEPTH 2, GRPH_FORMAT 0, GRPH_ARRAY_MODE 0
-    set(kGrphSwap + off, 0);
-    set(kGrphPitch + off, pitch);
-    set(kGrphPrimaryHigh + off, static_cast<uint32_t>(surface >> 32));
-    set(kGrphPrimary + off, static_cast<uint32_t>(surface));
-    set(kGrphFlipControl + off, 0x0);
-  }
-  uint32_t read(uint32_t r) override {
-    if (all_ones) return 0xFFFFFFFFu;
-    for (uint32_t off : kOffsets)
-      if (r == kGrphUpdate + off) {
-        if (pending_reads_ > 0) {
-          --pending_reads_;
-          return 0x4;   // GRPH_SURFACE_UPDATE_PENDING
-        }
-        if (!never_take && have_pending_) {
-          if (!drop_address) {
-            set(kGrphPrimary + off_, pending_low_);
-            set(kGrphPrimaryHigh + off_, pending_high_);
-          }
-          have_pending_ = false;
-        }
-        return never_take && have_pending_ ? 0x4 : 0;
-      }
-    return get(r);
-  }
-  void write(uint32_t r, uint32_t v) override {
-    writes.push_back({r, v});
-    for (uint32_t off : kOffsets) {
-      if (r == kGrphPrimaryHigh + off) { pending_high_ = v; return; }
-      if (r == kGrphPrimary + off) {
-        // the write of the low half triggers the update (taken at once with the immediate flip, never with a vsync flip)
-        pending_low_ = v;
-        off_ = off;
-        const bool immediate = get(kGrphFlipControl + off) & 0x10;
-        if (immediate) { have_pending_ = true; pending_reads_ = latency_reads; }
-        else { have_pending_ = true; never_take = true; }
-        return;
-      }
-    }
-    set(r, v);
-  }
-
- private:
-  std::map<uint32_t, uint32_t> regs_;
-  bool have_pending_ = false;
-  uint32_t pending_reads_ = 0, pending_low_ = 0, pending_high_ = 0, off_ = 0;
-};
-
-static void setup_aperture(FakeDisplay& d) {
-  d.set(kApertureLow, 0x100000);        // 0x1_0000_0000
-  d.set(kApertureHigh, 0x1FFFFF);       // up to 0x1_FFFF_FFFF
-}
 
 static void test_probe() {
   FakeClock clock;
@@ -161,7 +82,7 @@ static void test_probe() {
     setup_aperture(d);
     d.crtc(0, kSurface, 1920);
     Plane plane(d, clock);
-    CHECK(!plane.probe(0, 1920) && !plane.probe(kSurface + 128, 1920) && !plane.probe(kSurface, 0) && !plane.probe(kSurface, 1920 + 1));
+    CHECK(!plane.probe(kSurface + 128, 1920) && !plane.probe(kSurface, 0) && !plane.probe(kSurface, 1920 + 1));
     CHECK(!plane.set_surface(kSurface, 4096) && !plane.restore());   // not active
   }
   for (uint32_t i = 0; i < 6; ++i) {   // each of the six controllers is found
@@ -176,9 +97,11 @@ static void test_probe() {
     setup_aperture(d);
     d.crtc(0, 0, 0);
     Plane plane(d, clock);
-    CHECK(!plane.probe(0, 1920) && !plane.probe(0, 0));
+    CHECK(!plane.probe(0, 1920) && !plane.probe(0, 0));   // (a framebuffer at address 0 is possible, but not one with a pitch the plane does not have)
     d.crtc(0, kSurface, 0);
     CHECK(!plane.probe(kSurface, 0));
+    d.crtc(0, 0, 1920);
+    CHECK(plane.probe(0, 1920) && plane.surface() == 0);
   }
 }
 
@@ -249,11 +172,101 @@ static void test_refusals() {
   CHECK(d.writes.empty());
 }
 
+static void test_display() {
+  FakeClock clock;
+  // Two 64x4 pictures in "video memory" seen through the memory BAR: the CPU's address of its start, the GPU's address of the same byte, the firmware's framebuffer at the
+  // start and ours after it.
+  const uint32_t width = 64, height = 4, pitch = 64;
+  std::vector<uint8_t> memory(0x4000 + 8192);
+  uint8_t* base = reinterpret_cast<uint8_t*>((reinterpret_cast<uintptr_t>(memory.data()) + 255) & ~uintptr_t{255});
+  const uint64_t cpu_base = reinterpret_cast<uint64_t>(base), gpu_base = 0x1'0000'0000ull;
+  FirmwareFramebuffer fw;
+  fw.physical = cpu_base;
+  fw.bytes = 0x1000;
+  fw.width = width;
+  fw.height = height;
+  fw.pitch_pixels = pitch;
+  for (uint32_t i = 0; i < width * height; ++i) reinterpret_cast<uint32_t*>(base)[i] = 0xFF000000u | i;
+  const MmioRegion region(cpu_base + 0x2000, 0x1000);
+  {
+    FakeDisplay d;
+    setup_aperture(d);
+    d.crtc(2, gpu_base, pitch);
+    Display display(d, clock, cpu_base, gpu_base, region, gpu_base + 0x2000);
+    ByteView ours;
+    CHECK(display.engage(fw, &ours) && display.engaged() && ours.size() == width * height * 4 && ours.data() == base + 0x2000);
+    CHECK(memcmp(ours.data(), base, width * height * 4) == 0 && display.plane().crtc() == 2 && display.plane().surface() == gpu_base + 0x2000);
+    ours[0] = 0x77;   // drawn on after the switch
+    display.disengage();
+    CHECK(!display.engaged() && display.plane().surface() == gpu_base && base[0] == 0x77 && base[4] == 1);
+    display.disengage();   // (again: nothing)
+    ByteView again;
+    CHECK(display.engage(fw, &again) && display.plane().surface() == gpu_base + 0x2000);
+    // (leaves the display engaged for the destructor to put back)
+  }
+  const struct { const char* what; void (*mutate)(FakeDisplay&, FirmwareFramebuffer&, MmioRegion&); } refused[] = {
+      {"another picture on the screen", [](FakeDisplay& d, FirmwareFramebuffer&, MmioRegion&) { d.crtc(2, 0x1'0000'4000ull, 64); }},
+      {"other pitch", [](FakeDisplay& d, FirmwareFramebuffer&, MmioRegion&) { d.crtc(2, 0x1'0000'0000ull, 128); }},
+      {"firmware below the memory BAR", [](FakeDisplay&, FirmwareFramebuffer& f, MmioRegion&) { f.physical -= 256; }},
+      {"zero size", [](FakeDisplay&, FirmwareFramebuffer& f, MmioRegion&) { f.height = 0; }},
+      {"pitch under the width", [](FakeDisplay&, FirmwareFramebuffer& f, MmioRegion&) { f.pitch_pixels = 32; }},
+      {"picture bigger than the allocation", [](FakeDisplay&, FirmwareFramebuffer& f, MmioRegion&) { f.bytes = 100; }},
+      {"window too small", [](FakeDisplay&, FirmwareFramebuffer&, MmioRegion& r) { r = MmioRegion(r.address(), 0x3FC); }},
+      {"no window", [](FakeDisplay&, FirmwareFramebuffer&, MmioRegion& r) { r = MmioRegion(); }},
+  };
+  for (const auto& r : refused) {
+    FakeDisplay d;
+    setup_aperture(d);
+    d.crtc(2, gpu_base, pitch);
+    FirmwareFramebuffer f = fw;
+    MmioRegion window = region;
+    r.mutate(d, f, window);
+    Display display(d, clock, cpu_base, gpu_base, window, gpu_base + 0x2000);
+    ByteView ours;
+    if (display.engage(f, &ours)) printf("  engaged: %s\n", r.what);
+    CHECK(!display.engage(f, &ours) && !display.engaged() && d.writes.empty());
+  }
+  {
+    // The firmware's picture not at the start of the memory BAR: its GPU address is the base plus its distance.
+    FakeDisplay d;
+    setup_aperture(d);
+    FirmwareFramebuffer inner = fw;
+    inner.physical = cpu_base + 0x1000;
+    inner.bytes = 0x1000;
+    d.crtc(2, gpu_base + 0x1000, pitch);
+    for (uint32_t i = 0; i < width * height; ++i) reinterpret_cast<uint32_t*>(base + 0x1000)[i] = 0xFF000000u | (i + 7);
+    Display display(d, clock, cpu_base, gpu_base, region, gpu_base + 0x2000);
+    ByteView ours;
+    CHECK(display.engage(inner, &ours) && display.plane().surface() == gpu_base + 0x2000 && memcmp(ours.data(), base + 0x1000, width * height * 4) == 0);
+    // Engaging again first gives the screen back (the plane shows the firmware's picture again, so it is found again).
+    CHECK(display.engage(inner, &ours) && display.engaged() && display.plane().surface() == gpu_base + 0x2000);
+    display.disengage();
+    CHECK(display.plane().surface() == gpu_base + 0x1000);
+    // A GPU base so high that the address would wrap.
+    Display wrapped(d, clock, cpu_base, ~0ull - 100, region, gpu_base + 0x2000);
+    CHECK(!wrapped.engage(inner, &ours));
+  }
+  {
+    FakeDisplay d;   // the region is outside the aperture, or the engine never takes the address
+    setup_aperture(d);
+    d.crtc(2, gpu_base, pitch);
+    Display outside(d, clock, cpu_base, gpu_base, region, 0x3'0000'0000ull);
+    ByteView ours;
+    CHECK(!outside.engage(fw, &ours));
+    Display skew(d, clock, cpu_base, gpu_base, region, gpu_base + 0x2080);
+    CHECK(!skew.engage(fw, &ours));
+    d.never_take = true;
+    Display stuck(d, clock, cpu_base, gpu_base, region, gpu_base + 0x2000);
+    CHECK(!stuck.engage(fw, &ours) && !stuck.engaged());
+  }
+}
+
 int main() {
   test_probe();
   test_flip();
   test_not_taken();
   test_refusals();
+  test_display();
   printf(g_failed ? "AmdDce11Test: %d FAILED\n" : "AmdDce11Test: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }

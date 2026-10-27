@@ -101,6 +101,8 @@ class Card final : public hardware::IVcnRegisters {
   uint32_t skip_map_bit = 0xFFFFFFFFu;   // MAP_QUEUES for this queue bit (pipe * 8 + queue) is ignored, as if the microcode failed to map it
   uint32_t queue_executed = 0;   // packets run by compute queues other than the KIQ's (the test packets)
 
+  void set_smc_header() { set_sram(0x20000 + 48, soft_registers); }   // SMU75_Firmware_Header.SoftRegisters
+
   Card() {
     regs_[kSmcResp] = 1;
     regs_[kCpMeCntl] = kMeHalt | kPfpHalt | kCeHalt;

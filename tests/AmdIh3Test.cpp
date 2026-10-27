@@ -96,6 +96,12 @@ static void test_start() {
   AmdIh3 ih2(msi.card, msi.clock, c);
   CHECK(ih2.start(msi.memory()) == AmdIh3::Result::Ok);
   CHECK(msi.card.reg(fakeih::kRbCntl) == 0x8022011D && msi.card.reg(fakeih::kDoorbellRptr) == 0x55);
+  // A ring in video memory is not snooped.
+  Rig vram;
+  AmdIh3::Config v;
+  v.ring_in_video_memory = true;
+  AmdIh3 ih4(vram.card, vram.clock, v);
+  CHECK(ih4.start(vram.memory()) == AmdIh3::Result::Ok && vram.card.reg(fakeih::kInterruptCntl) == 0x8);
   // A different doorbell index is programmed.
   Rig other;
   AmdIh3::Config d;
