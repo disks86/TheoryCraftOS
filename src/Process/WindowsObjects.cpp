@@ -19,6 +19,7 @@
 #include "Process/Objects.hpp"
 #include "Process/WindowsFiles.hpp"
 #include "Process/WindowsMailslots.hpp"
+#include "Process/WindowsRegistry.hpp"
 #include "Process/WindowsPipes.hpp"
 #include "Process/WindowsSockets.hpp"
 
@@ -385,6 +386,7 @@ uint32_t nt_duplicate_object(Process& p, const SyscallRequest& r) {
   if (p.files().kind(slot) == DescriptorKind::Pipe) pipe_token_add(p.files().token(slot));
   if (p.files().kind(slot) == DescriptorKind::Socket) socket_token_add(p.files().token(slot));
   if (p.files().kind(slot) == DescriptorKind::Mailslot) mailslot_token_add(p.files().token(slot));
+  if (p.files().kind(slot) == DescriptorKind::Key) key_token_add(p.files().token(slot));
   if (target_at != 0 && !p.write_user_u64(target_at, (uint64_t(copy) + 1) * 4)) {
     p.close_descriptor(uint64_t(copy));
     return kAccessViolation;
@@ -643,6 +645,7 @@ uint32_t nt_query_object(Process& p, const SyscallRequest& r) {
         case DescriptorKind::Job: type = "Job"; break;
         case DescriptorKind::ChangeNotification: type = "ChangeNotification"; break;
         case DescriptorKind::Mailslot: type = "Mailslot"; break;
+        case DescriptorKind::Key: type = "Key"; break;
         default: break;
       }
       uint32_t n = 0;

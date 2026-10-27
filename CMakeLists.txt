@@ -598,6 +598,8 @@ add_executable(BOOTX64
   src/Process/WindowsSockets.cpp
   src/Process/Sockets.cpp
   src/Process/WindowsMailslots.cpp
+  src/Process/WindowsRegistry.cpp
+  src/Process/RegistryTree.cpp
   src/Process/Objects.cpp
   src/Process/ModuleLoader.cpp
   src/Process/LinuxSyscalls.cpp
@@ -640,6 +642,8 @@ add_executable(BOOTX64
   src/Hardware/GraphicsProcessingUnit/AMD/AmdGfx8Compute.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdGmc8.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdIh3.cpp
+  src/Hardware/Bus/Pci/PciMsi.cpp
+  src/Hardware/GraphicsProcessingUnit/AMD/AmdIrq.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdSdma3.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdDce11.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdVegaM.cpp
@@ -819,13 +823,13 @@ if(TCOS_ARCH STREQUAL "x86_64")
     COMMAND ${CMAKE_COMMAND} -E make_directory ${WINDOWS_DIR}
     COMMAND ${CMAKE_C_COMPILER} ${WINDOWS_DLL_FLAGS} ${ntdll_stubs} -Wl,--image-base=0x180000000 -Wl,--out-implib=${WINDOWS_DIR}/libntdll.a
             -o ${WINDOWS_DIR}/ntdll.dll ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/ntdll.c
-    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/ntdll.c ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/except.inc ${CMAKE_SOURCE_DIR}/src/Windows/libc_string.inc ${WINDOWS_HEADERS} ${CMAKE_SOURCE_DIR}/src/Windows/stubs/ntdll.inc ${WINDOWS_STUBS_C} ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/services.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/zw.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/rtl.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/libc.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/rtl2.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/status.inc
+    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/ntdll.c ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/except.inc ${CMAKE_SOURCE_DIR}/src/Windows/libc_string.inc ${WINDOWS_HEADERS} ${CMAKE_SOURCE_DIR}/src/Windows/stubs/ntdll.inc ${WINDOWS_STUBS_C} ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/services.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/zw.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/rtl.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/libc.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/rtl2.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/status.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/casetab.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/reg.inc
     COMMENT "Building ntdll.dll")
   windows_stub_flags(kernel32_stubs kernel32 0)
   add_custom_command(OUTPUT ${WINDOWS_DIR}/kernel32.dll
     COMMAND ${CMAKE_C_COMPILER} ${WINDOWS_DLL_FLAGS} ${kernel32_stubs} -Wl,--image-base=0x180200000 -o ${WINDOWS_DIR}/kernel32.dll
             ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.c ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.def ${WINDOWS_DIR}/libntdll.a
-    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.c ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra2.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra3.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/console.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/legacy.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/fmtmsg.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.def ${WINDOWS_DIR}/libntdll.a ${WINDOWS_HEADERS} ${CMAKE_SOURCE_DIR}/src/Windows/stubs/kernel32.inc ${WINDOWS_STUBS_C}
+    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.c ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra2.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra3.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/console.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/legacy.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/fmtmsg.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/time.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/nls.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.def ${WINDOWS_DIR}/libntdll.a ${WINDOWS_HEADERS} ${CMAKE_SOURCE_DIR}/src/Windows/stubs/kernel32.inc ${WINDOWS_STUBS_C}
     COMMENT "Building kernel32.dll")
   windows_stub_flags(msvcrt_stubs msvcrt 0)
   add_custom_command(OUTPUT ${WINDOWS_DIR}/msvcrt.dll
@@ -838,7 +842,7 @@ if(TCOS_ARCH STREQUAL "x86_64")
   add_custom_command(OUTPUT ${WINDOWS_DIR}/advapi32.dll
     COMMAND ${CMAKE_C_COMPILER} ${WINDOWS_DLL_FLAGS} ${advapi32_stubs} -Wl,--image-base=0x180600000 -o ${WINDOWS_DIR}/advapi32.dll
             ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/advapi32.c ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/advapi32.def ${WINDOWS_DIR}/libntdll.a ${WINDOWS_DIR}/kernel32.dll
-    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/advapi32.c ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/advapi32.def
+    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/advapi32.c ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/advapi32.def ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/registry.inc
             ${WINDOWS_DIR}/libntdll.a ${WINDOWS_DIR}/kernel32.dll ${WINDOWS_HEADERS} ${CMAKE_SOURCE_DIR}/src/Windows/stubs/advapi32.inc ${WINDOWS_STUBS_C}
     COMMENT "Building advapi32.dll")
   windows_stub_flags(ws2_32_stubs ws2_32 0)

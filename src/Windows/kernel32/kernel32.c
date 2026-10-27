@@ -50,6 +50,11 @@ IMPORT size_t_ wcslen(const WCHAR *);
 
 static void set_error(DWORD error) { TEB_LAST_ERROR(NtCurrentTeb()) = error; }
 /* Records the Win32 error of a failed NT call and returns FALSE. */
+#ifndef ERROR_PRIVILEGE_NOT_HELD
+#define ERROR_PRIVILEGE_NOT_HELD 1314
+#endif
+static int month_days(LONGLONG y, int m);
+EXPORT void WINAPI GetLocalTime(LPSYSTEMTIME st);
 static void complete_overlapped(LPOVERLAPPED overlapped, NTSTATUS status, ULONG_PTR bytes);
 static DWORD wait_result(NTSTATUS status);
 EXPORT BOOL WINAPI ReadFile(HANDLE h, LPVOID buffer, DWORD length, LPDWORD read, LPOVERLAPPED overlapped);
@@ -114,41 +119,80 @@ EXPORT BOOL WINAPI GetCPInfo(UINT cp, CPINFO *info) {
   info->DefaultChar[0] = '?';
   return TRUE;
 }
-EXPORT int WINAPI lstrlenA(LPCSTR s) { return s ? (int)strlen(s) : 0; }
-EXPORT int WINAPI lstrlenW(LPCWSTR s) { return s ? (int)wcslen(s) : 0; }
-EXPORT LPSTR WINAPI lstrcpyA(LPSTR d, LPCSTR s) { char *r = d; while ((*d++ = *s++)) {} return r; }
-EXPORT LPWSTR WINAPI lstrcpyW(LPWSTR d, LPCWSTR s) { WCHAR *r = d; while ((*d++ = *s++)) {} return r; }
+/* The lstr functions of Windows end quietly on an address that cannot be read; the pages are probed as the string crosses into them. */
+static BOOL range_allowed(const void *p, SIZE_T length, BOOL write);
+static int probe_length_a(const char *s) {
+  int n = 0;
+  for (;; ++n) {
+    if ((n == 0 || (((ULONG_PTR)(s + n) & 0xFFF) == 0)) && !range_allowed(s + n, 1, FALSE)) return -1;
+    if (!s[n]) return n;
+  }
+}
+static int probe_length_w(const WCHAR *s) {
+  int n = 0;
+  for (;; ++n) {
+    if ((n == 0 || (((ULONG_PTR)(s + n) & 0xFFF) < 2)) && !range_allowed(s + n, 2, FALSE)) return -1;
+    if (!s[n]) return n;
+  }
+}
+EXPORT int WINAPI lstrlenA(LPCSTR s) { if (!s) return 0; const int n = probe_length_a(s); return n < 0 ? 0 : n; }
+EXPORT int WINAPI lstrlenW(LPCWSTR s) { if (!s) return 0; const int n = probe_length_w(s); return n < 0 ? 0 : n; }
+EXPORT LPSTR WINAPI lstrcpyA(LPSTR d, LPCSTR s) {
+  const int n = s ? probe_length_a(s) : -1;
+  if (n < 0 || !d || !range_allowed(d, (UINT_PTR)n + 1, TRUE)) { set_error(ERROR_INVALID_PARAMETER); return NULL; }
+  memcpy(d, s, (size_t_)n + 1);
+  return d;
+}
+EXPORT LPWSTR WINAPI lstrcpyW(LPWSTR d, LPCWSTR s) {
+  const int n = s ? probe_length_w(s) : -1;
+  if (n < 0 || !d || !range_allowed(d, ((UINT_PTR)n + 1) * 2, TRUE)) { set_error(ERROR_INVALID_PARAMETER); return NULL; }
+  memcpy(d, s, ((size_t_)n + 1) * 2);
+  return d;
+}
 EXPORT LPSTR WINAPI lstrcpynA(LPSTR d, LPCSTR s, int n) {
   if (n <= 0) return d;
+  if (!d || !s || !range_allowed(d, (UINT_PTR)n, TRUE)) return NULL;
   int i = 0;
-  for (; i < n - 1 && s[i]; ++i) d[i] = s[i];
+  for (; i < n - 1; ++i) {
+    if ((i == 0 || (((ULONG_PTR)(s + i) & 0xFFF) == 0)) && !range_allowed(s + i, 1, FALSE)) break;
+    if (!s[i]) break;
+    d[i] = s[i];
+  }
   d[i] = 0;
   return d;
 }
 EXPORT LPWSTR WINAPI lstrcpynW(LPWSTR d, LPCWSTR s, int n) {
   if (n <= 0) return d;
+  if (!d || !s || !range_allowed(d, (UINT_PTR)n * 2, TRUE)) return NULL;
   int i = 0;
-  for (; i < n - 1 && s[i]; ++i) d[i] = s[i];
+  for (; i < n - 1; ++i) {
+    if ((i == 0 || (((ULONG_PTR)(s + i) & 0xFFF) < 2)) && !range_allowed(s + i, 2, FALSE)) break;
+    if (!s[i]) break;
+    d[i] = s[i];
+  }
   d[i] = 0;
   return d;
 }
-EXPORT LPSTR WINAPI lstrcatA(LPSTR d, LPCSTR s) { lstrcpyA(d + strlen(d), s); return d; }
-EXPORT LPWSTR WINAPI lstrcatW(LPWSTR d, LPCWSTR s) { lstrcpyW(d + wcslen(d), s); return d; }
-EXPORT int WINAPI lstrcmpA(LPCSTR a, LPCSTR b) { while (*a && *a == *b) ++a, ++b; return (BYTE)*a < (BYTE)*b ? -1 : (BYTE)*a > (BYTE)*b; }
-EXPORT int WINAPI lstrcmpW(LPCWSTR a, LPCWSTR b) { while (*a && *a == *b) ++a, ++b; return *a < *b ? -1 : *a > *b; }
+EXPORT LPSTR WINAPI lstrcatA(LPSTR d, LPCSTR s) { const int n = d ? probe_length_a(d) : -1; if (n < 0 || !lstrcpyA(d + n, s)) return NULL; return d; }
+EXPORT LPWSTR WINAPI lstrcatW(LPWSTR d, LPCWSTR s) { const int n = d ? probe_length_w(d) : -1; if (n < 0 || !lstrcpyW(d + n, s)) return NULL; return d; }
+/* The comparisons use the sorting of the locale (nls.inc): "co-op" and "coop" are near, upper case follows lower case. */
+EXPORT int WINAPI CompareStringW(DWORD locale, DWORD flags, LPCWSTR a, int an, LPCWSTR b, int bn);
+EXPORT int WINAPI CompareStringA(DWORD locale, DWORD flags, LPCSTR a, int an, LPCSTR b, int bn);
+EXPORT int WINAPI lstrcmpA(LPCSTR a, LPCSTR b) {
+  if (!a || !b) return a == b ? 0 : !a ? -1 : 1;
+  return CompareStringA(0x400, 0, a, -1, b, -1) - 2;
+}
+EXPORT int WINAPI lstrcmpW(LPCWSTR a, LPCWSTR b) {
+  if (!a || !b) return a == b ? 0 : !a ? -1 : 1;
+  return CompareStringW(0x400, 0, a, -1, b, -1) - 2;
+}
 EXPORT int WINAPI lstrcmpiA(LPCSTR a, LPCSTR b) {
-  for (;; ++a, ++b) {
-    const int x = (BYTE)*a >= 'a' && (BYTE)*a <= 'z' ? *a - 32 : (BYTE)*a, y = (BYTE)*b >= 'a' && (BYTE)*b <= 'z' ? *b - 32 : (BYTE)*b;
-    if (x != y) return x < y ? -1 : 1;
-    if (!x) return 0;
-  }
+  if (!a || !b) return a == b ? 0 : !a ? -1 : 1;
+  return CompareStringA(0x400, 1, a, -1, b, -1) - 2;
 }
 EXPORT int WINAPI lstrcmpiW(LPCWSTR a, LPCWSTR b) {
-  for (;; ++a, ++b) {
-    const int x = upper(*a), y = upper(*b);
-    if (x != y) return x < y ? -1 : 1;
-    if (!x) return 0;
-  }
+  if (!a || !b) return a == b ? 0 : !a ? -1 : 1;
+  return CompareStringW(0x400, 1, a, -1, b, -1) - 2;
 }
 /* The bare (unsuffixed) lstr* names are their own real exports on a real kernel32.dll too, not just source-level UNICODE macros - always the ANSI ones. */
 EXPORT int WINAPI lstrlen(LPCSTR s) { return lstrlenA(s); }
@@ -157,29 +201,6 @@ EXPORT LPSTR WINAPI lstrcpyn(LPSTR d, LPCSTR s, int n) { return lstrcpynA(d, s, 
 EXPORT LPSTR WINAPI lstrcat(LPSTR d, LPCSTR s) { return lstrcatA(d, s); }
 EXPORT int WINAPI lstrcmp(LPCSTR a, LPCSTR b) { return lstrcmpA(a, b); }
 EXPORT int WINAPI lstrcmpi(LPCSTR a, LPCSTR b) { return lstrcmpiA(a, b); }
-/* CompareString: 1 = less, 2 = equal, 3 = greater. NORM_IGNORECASE (1) is honoured, the other flags are not. */
-EXPORT int WINAPI CompareStringW(DWORD locale, DWORD flags, LPCWSTR a, int an, LPCWSTR b, int bn) {
-  (void)locale;
-  if (an < 0) an = (int)wcslen(a);
-  if (bn < 0) bn = (int)wcslen(b);
-  for (int i = 0; i < an || i < bn; ++i) {
-    const int x = i < an ? ((flags & 1) ? upper(a[i]) : a[i]) : -1, y = i < bn ? ((flags & 1) ? upper(b[i]) : b[i]) : -1;
-    if (x != y) return x < y ? 1 : 3;
-  }
-  return 2;
-}
-EXPORT int WINAPI CompareStringA(DWORD locale, DWORD flags, LPCSTR a, int an, LPCSTR b, int bn) {
-  (void)locale;
-  if (an < 0) an = (int)strlen(a);
-  if (bn < 0) bn = (int)strlen(b);
-  for (int i = 0; i < an || i < bn; ++i) {
-    int x = i < an ? (BYTE)a[i] : -1, y = i < bn ? (BYTE)b[i] : -1;
-    if (flags & 1) { if (x >= 'a' && x <= 'z') x -= 32; if (y >= 'a' && y <= 'z') y -= 32; }
-    if (x != y) return x < y ? 1 : 3;
-  }
-  return 2;
-}
-
 /* Wide text from an ANSI argument, in memory from the process heap (the caller frees it). */
 static WCHAR *to_wide(LPCSTR text) {
   if (!text) return NULL;
@@ -306,7 +327,7 @@ EXPORT BOOL WINAPI GetExitCodeProcess(HANDLE h, LPDWORD code) {
 }
 EXPORT BOOL WINAPI IsWow64Process(HANDLE h, LPBOOL wow) { (void)h; *wow = FALSE; return TRUE; }
 EXPORT BOOL WINAPI IsDebuggerPresent(void) { return FALSE; }
-EXPORT BOOL WINAPI CheckRemoteDebuggerPresent(HANDLE h, LPBOOL present) { (void)h; *present = FALSE; return TRUE; }
+EXPORT BOOL WINAPI CheckRemoteDebuggerPresent(HANDLE h, LPBOOL present) { if (!h || !present) { set_error(ERROR_INVALID_PARAMETER); return FALSE; } *present = FALSE; return TRUE; }
 EXPORT void WINAPI DebugBreak(void) { __asm__ volatile("int3"); }
 EXPORT void WINAPI OutputDebugStringA(LPCSTR s) { (void)s; }
 EXPORT void WINAPI OutputDebugStringW(LPCWSTR s) { (void)s; }
@@ -380,6 +401,7 @@ static const WCHAR *find_variable(const WCHAR *block, const WCHAR *name, size_t_
 }
 EXPORT DWORD WINAPI GetEnvironmentVariableW(LPCWSTR name, LPWSTR buffer, DWORD capacity) {
   size_t_ length = 0;
+  if (!name) { set_error(ERROR_ENVVAR_NOT_FOUND); return 0; }
   const WCHAR *value = find_variable(parameters()->Environment, name, &length);
   if (!value) { set_error(ERROR_ENVVAR_NOT_FOUND); return 0; }
   if (length + 1 > capacity) return (DWORD)length + 1;
@@ -387,6 +409,7 @@ EXPORT DWORD WINAPI GetEnvironmentVariableW(LPCWSTR name, LPWSTR buffer, DWORD c
   return (DWORD)length;
 }
 EXPORT DWORD WINAPI GetEnvironmentVariableA(LPCSTR name, LPSTR buffer, DWORD capacity) {
+  if (!name) { set_error(ERROR_ENVVAR_NOT_FOUND); return 0; }
   WCHAR *w = to_wide(name);
   if (!w) return 0;
   size_t_ length = 0;
@@ -737,6 +760,9 @@ static FARPROC export_of(HMODULE module, LPCSTR name, DWORD ordinal, int depth) 
   return (FARPROC)(base + rva);
 }
 EXPORT FARPROC WINAPI GetProcAddress(HMODULE module, LPCSTR name) {
+  if (!module) module = GetModuleHandleW(NULL);
+  if (!name) { set_error(ERROR_INVALID_PARAMETER); return NULL; }
+  if (!range_allowed(module, 0x40, FALSE) || *(const WORD *)module != 0x5A4D) { set_error(ERROR_MOD_NOT_FOUND); return NULL; }
   FARPROC p = ((ULONG_PTR)name >> 16) == 0 ? export_of(module, NULL, (DWORD)(ULONG_PTR)name, 0) : export_of(module, name, 0, 0);
   if (!p) set_error(ERROR_PROC_NOT_FOUND);
   return p;
@@ -903,27 +929,6 @@ EXPORT LONG WINAPI InterlockedExchange(volatile LONG *p, LONG v) { return __sync
 EXPORT LONG WINAPI InterlockedExchangeAdd(volatile LONG *p, LONG v) { return __sync_fetch_and_add(p, v); }
 EXPORT LONG WINAPI InterlockedCompareExchange(volatile LONG *p, LONG exchange, LONG compare) { return __sync_val_compare_and_swap(p, compare, exchange); }
 EXPORT LONG64 WINAPI InterlockedCompareExchange64(volatile LONG64 *p, LONG64 exchange, LONG64 compare) { return __sync_val_compare_and_swap(p, compare, exchange); }
-
-EXPORT void WINAPI InitializeSListHead(PSLIST_HEADER head) { head->Alignment = head->Region = 0; }
-EXPORT PSLIST_ENTRY WINAPI InterlockedPushEntrySList(PSLIST_HEADER head, PSLIST_ENTRY entry) {
-  PSLIST_ENTRY old = head->Next;
-  entry->Next = old;
-  head->Next = entry;
-  ++head->Depth;
-  return old;
-}
-EXPORT PSLIST_ENTRY WINAPI InterlockedPopEntrySList(PSLIST_HEADER head) {
-  PSLIST_ENTRY top = head->Next;
-  if (top) { head->Next = top->Next; --head->Depth; }
-  return top;
-}
-EXPORT PSLIST_ENTRY WINAPI InterlockedFlushSList(PSLIST_HEADER head) {
-  PSLIST_ENTRY top = head->Next;
-  head->Next = NULL;
-  head->Depth = 0;
-  return top;
-}
-EXPORT USHORT WINAPI QueryDepthSList(PSLIST_HEADER head) { return (USHORT)head->Depth; }
 
 EXPORT BOOL WINAPI InitOnceExecuteOnce(PINIT_ONCE once, PINIT_ONCE_FN function, PVOID parameter, PVOID *context) {
   if ((ULONG_PTR)once->Ptr & 2) { if (context) *context = (PVOID)((ULONG_PTR)once->Ptr & ~3ull); return TRUE; }
@@ -1806,7 +1811,7 @@ EXPORT BOOL WINAPI FileTimeToSystemTime(const FILETIME *ft, LPSYSTEMTIME st) {
   return TRUE;
 }
 EXPORT BOOL WINAPI SystemTimeToFileTime(const SYSTEMTIME *st, LPFILETIME ft) {
-  if (st->wMonth < 1 || st->wMonth > 12 || st->wDay < 1 || st->wDay > 31 || st->wHour > 23 || st->wMinute > 59 || st->wSecond > 59 || st->wMilliseconds > 999) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (st->wYear < 1601 || st->wYear > 30827 || st->wMonth < 1 || st->wMonth > 12 || st->wDay < 1 || st->wDay > month_days(st->wYear, st->wMonth) || st->wHour > 23 || st->wMinute > 59 || st->wSecond > 59 || st->wMilliseconds > 999) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
   const LONGLONG days = days_from_civil(st->wYear, st->wMonth, st->wDay) + 134774;
   const ULONGLONG ms = (ULONGLONG)days * 86400000ull + (ULONGLONG)st->wHour * 3600000ull + (ULONGLONG)st->wMinute * 60000ull + (ULONGLONG)st->wSecond * 1000ull + st->wMilliseconds;
   const ULONGLONG t = ms * 10000;
@@ -1815,10 +1820,6 @@ EXPORT BOOL WINAPI SystemTimeToFileTime(const SYSTEMTIME *st, LPFILETIME ft) {
   return TRUE;
 }
 EXPORT void WINAPI GetSystemTime(LPSYSTEMTIME st) { FILETIME ft; GetSystemTimeAsFileTime(&ft); FileTimeToSystemTime(&ft, st); }
-EXPORT void WINAPI GetLocalTime(LPSYSTEMTIME st) { GetSystemTime(st); }      /* the time zone is UTC */
-EXPORT BOOL WINAPI FileTimeToLocalFileTime(const FILETIME *in, LPFILETIME out) { *out = *in; return TRUE; }
-EXPORT BOOL WINAPI LocalFileTimeToFileTime(const FILETIME *in, LPFILETIME out) { *out = *in; return TRUE; }
-EXPORT DWORD WINAPI GetTimeZoneInformation(LPTIME_ZONE_INFORMATION tz) { memset(tz, 0, sizeof(*tz)); return 0; /* TIME_ZONE_ID_UNKNOWN */ }
 /* Exception handling lives in ntdll.dll (src/Windows/ntdll/except.inc); kernel32 gives programs the names they know. RtlUnwindEx, RtlVirtualUnwind and the others
  * are forwarded to ntdll by kernel32.def. */
 EXPORT LPTOP_LEVEL_EXCEPTION_FILTER WINAPI SetUnhandledExceptionFilter(LPTOP_LEVEL_EXCEPTION_FILTER filter) { return RtlSetUnhandledExceptionFilter(filter); }
@@ -2723,7 +2724,7 @@ EXPORT BOOL WINAPI DeleteFileW(LPCWSTR path) {
   BYTE basic[40];
   NTSTATUS status = NtQueryAttributesFile(&attributes, basic);
   if (!NT_SUCCESS(status)) return fail_nt(status);
-  if (*(DWORD *)(basic + 32) & FILE_ATTRIBUTE_DIRECTORY) { set_error(ERROR_ACCESS_DENIED); return FALSE; }
+  if (*(DWORD *)(basic + 32) & (FILE_ATTRIBUTE_DIRECTORY | 1 /* FILE_ATTRIBUTE_READONLY */)) { set_error(ERROR_ACCESS_DENIED); return FALSE; }
   status = NtDeleteFile(&attributes);
   return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
@@ -2788,6 +2789,7 @@ EXPORT BOOL WINAPI MoveFileExA(LPCSTR from, LPCSTR to, DWORD flags) {
 }
 EXPORT BOOL WINAPI MoveFileA(LPCSTR from, LPCSTR to) { return MoveFileExA(from, to, 0); }
 EXPORT BOOL WINAPI CopyFileW(LPCWSTR from, LPCWSTR to, BOOL fail_if_exists) {
+  if (!from || !to) { set_error(ERROR_PATH_NOT_FOUND); return FALSE; }
   HANDLE in = CreateFileW(from, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
   if (in == INVALID_HANDLE_VALUE) return FALSE;
   HANDLE out = CreateFileW(to, GENERIC_WRITE, 0, NULL, fail_if_exists ? CREATE_NEW : CREATE_ALWAYS, 0, NULL);
@@ -2809,6 +2811,7 @@ EXPORT BOOL WINAPI CopyFileW(LPCWSTR from, LPCWSTR to, BOOL fail_if_exists) {
   return ok;
 }
 EXPORT BOOL WINAPI CopyFileA(LPCSTR from, LPCSTR to, BOOL fail_if_exists) {
+  if (!from || !to) { set_error(ERROR_PATH_NOT_FOUND); return FALSE; }
   WCHAR *a = to_wide(from), *b = to_wide(to);
   const BOOL ok = a && b ? CopyFileW(a, b, fail_if_exists) : FALSE;
   free_wide(a);
@@ -2825,7 +2828,7 @@ EXPORT UINT WINAPI GetTempFileNameW(LPCWSTR dir, LPCWSTR prefix, UINT unique, LP
     DWORD length = n;
     if (full[length - 1] != '\\') full[length++] = '\\';
     for (int i = 0; i < 3 && prefix && prefix[i]; ++i) full[length++] = prefix[i];
-    for (int shift = 12; shift >= 0; shift -= 4) full[length++] = (WCHAR)"0123456789ABCDEF"[(id >> shift) & 15];
+    for (int shift = 12; shift >= 0; shift -= 4) { const UINT digit = (id >> shift) & 15; if (unique && digit == 0 && shift > 0 && (id >> shift) == 0) continue; full[length++] = (WCHAR)"0123456789ABCDEF"[digit]; }
     full[length++] = '.'; full[length++] = 't'; full[length++] = 'm'; full[length++] = 'p'; full[length] = 0;
     if (unique) { memcpy(result, full, (length + 1) * 2); return unique; }
     HANDLE h = CreateFileW(full, GENERIC_WRITE, 0, NULL, CREATE_NEW, 0, NULL);
@@ -3017,3 +3020,5 @@ EXPORT BOOL WINAPI DllMain(HANDLE module, DWORD reason, PVOID reserved) {
 #include "extra3.inc"
 #include "legacy.inc"
 #include "fmtmsg.inc"
+#include "time.inc"
+#include "nls.inc"

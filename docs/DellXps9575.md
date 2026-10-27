@@ -334,6 +334,42 @@ The Presenter is host-tested with the real `AmdVegaM` and the simulated SDMA eng
 before disengaging). `AmdGpu`'s own use of it (the back buffer swap and the flush) is not host-tested: that needs the UEFI graphics classes. Decoded video frames are not routed this way yet: the video
 player draws through the same GPU `blit`, so they take this path only as far as the player calls the GPU's drawing functions.
 
+### Interrupts: dispatch by source
+
+`AmdIrq` (`AmdIrq.*`) is the dispatch half of `amdgpu_irq_dispatch` for the sources of the blocks `AmdVegaM` brings up. `AmdVegaM::service_interrupts()` drains the IH ring (`AmdIh3::drain`), classifies each
+vector by source id and ring id, and passes every event to a sink. Sources, from the blocks' `sw_init` (`amdgpu_irq_add_id`): `gfx_v8_0` 181 end of pipe (a graphics fence for ME 0, a compute fence for ME 1 and 2;
+ring id bits 3:2 ME, 1:0 pipe, 6:4 queue), 184 privileged register, 185 privileged instruction, 197 ECC error; `sdma_v3_0` 224 trap (engine in ring id bits 1:0, a fence only for queue 0), 241 and 247 illegal
+instruction; `gmc_v8_0` 146 and 147 VM faults, for which `VM_CONTEXT1_PROTECTION_FAULT_ADDR/STATUS/MCCLIENT` are read, decoded (vmid, protections, client, read/write) and cleared (`VM_CONTEXT1_CNTL2` bit 0). A
+vector with both fault registers zero is dropped, as in the driver. Everything else is counted by source id. `scripts/check_irq_port.py` checks the ids, registers, masks and ring id decoding against the kernel
+sources (v6.12).
+
+What a handler does: the driver passes fences to its scheduler and faults to its timeout handling (`drm_sched_fault`). Here the engines' `submit_*` functions poll their fence words, so a fence is only counted and
+shown to the sink, and a fault wedges the ring it came from (`AmdGfx8::fault`, `AmdGfx8Compute::fault(me, pipe, queue)`, `AmdSdma3::fault`) until the engine is started again. The desktop loop calls
+`service_interrupts()` (under `TCOS_AMD_VEGAM`); with MSI (below) only when an interrupt came.
+
+The sources are turned on at the end of `AmdVegaM::bring_up` (after the SDMA ring tests) and off at the start of `shutdown`, each a read-modify-write like the driver's `amdgpu_irq_get`/`put` state functions:
+`AmdGfx8::set_interrupts` (`CP_INT_CNTL_RING0` TIME_STAMP, PRIV_REG, PRIV_INSTR: `gfx_v8_0_set_gfx_eop_interrupt_state`, `_set_priv_reg_fault_state`, `_set_priv_inst_fault_state`),
+`AmdGfx8Compute::set_eop_interrupt` (TIME_STAMP of `CP_ME1_PIPEn_INT_CNTL` for the queues' pipe; MEC 1 only, as amdgpu leaves MEC 2 to amdkfd), `AmdSdma3::set_trap_interrupts` (`SDMA0_CNTL.TRAP_ENABLE` of both
+engines) and `AmdGmc8::set_fault_interrupts` (the seven `*_PROTECTION_FAULT_ENABLE_INTERRUPT` bits of `VM_CONTEXT0_CNTL` and `VM_CONTEXT1_CNTL`). `scripts/check_irq_port.py` checks the registers and fields against the
+kernel's state functions. The illegal-instruction sources have no enable in the driver (always on).
+
+Not done: the CP ECC error (`gfx_v8_0_set_cp_ecc_int_state`, 13 registers) and SQ interrupts are not enabled (source 197 is classified but a real card will not post it); the display's interrupts (vblank, page flip, hot plug) and the UVD/VCE ones are not dispatched; no ring reset or recovery after a fault (the engine has to be restarted).
+
+### MSI: interrupts wake the CPU
+
+`PciMsi` (`src/Hardware/Bus/Pci/PciMsi.*`) programs the MSI capability (id 0x05) of a PCI function as PCI Local Bus Specification 3.0 section 6.8.1 describes: message control cleared of enable and
+multiple-message-enable, the address (and its upper half for a 64-bit function), the data word, the per-vector mask bits cleared, then enable, checked by reading the enable bit back (a function that does not take
+it is left off). The command register's INTx disable bit is set while MSI is on and cleared again after, written without touching the status bits (they clear when written). The message is the caller's: `main.cpp` builds
+the x86 one, `0xFEE00000 | apic_id << 12` with vector `kVectorAmdVegaM` (0x51), for the boot core.
+
+With `TCOS_AMD_VEGAM`, `main.cpp` installs the handler (EOI and a counter; no register is touched in the interrupt), enables MSI **before** `AmdVegaM::bring_up` (the driver's order; `Inputs::msi` makes the interrupt
+ring re-arm the message, `IH_RB_CNTL.RPTR_REARM`), then tries it out as virtio-gpu does: an SDMA copy ends with a trap, which must arrive as an interrupt within 5 ms. If it does, the desktop loop reads the ring only
+when the counter moved (and once a second in case a message was lost); if not, MSI is switched off again and the ring is polled every pass as before.
+
+Host-tested: the capability programming (`PciMsiTest`: 32/64-bit, with and without per-vector masking, refusals, status bits never written, undone by the destructor) and that `Inputs::msi` changes only the ring's re-arm
+bit. Not tested: the handler and the loop (they need the kernel), and nothing has run on a real machine: whether the Kaby Lake-G's PCH/root port delivers the message, the APIC id format beyond 255 cores (refused),
+and the card's re-arm behaviour are unseen.
+
 ## Radeon RX Vega M: UVD 6.3
 
 `src/Hardware/VideoCodec/AMD/AmdUvd6.*` is the start/stop of the Unified Video Decoder 6.3, ported from amdgpu (`uvd_v6_0.c`: `mc_resume`, `start`, `stop`, the clock-gating "ungate" path; `amdgpu_uvd.c`: the memory layout

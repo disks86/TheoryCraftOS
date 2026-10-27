@@ -10,32 +10,10 @@ static void copy_text(char *dst, const char *src) { while ((*dst++ = *src++) != 
 
 /* ---- characters ---------------------------------------------------------------------------------------------------------------------------------------- */
 
-static WCHAR wide_lower(WCHAR c) {
-  if (c < 0x80) return (c >= 'A' && c <= 'Z') ? (WCHAR)(c + 32) : c;
-  if ((c >= 0xC0 && c <= 0xDE && c != 0xD7)) return (WCHAR)(c + 32);
-  if (c >= 0x100 && c <= 0x17F && c != 0x130 && c != 0x131 && c != 0x138 && c != 0x149 && c != 0x178 && c != 0x17F) {
-    if ((c >= 0x139 && c <= 0x148) || (c >= 0x179 && c <= 0x17E)) return (c & 1) ? (WCHAR)(c + 1) : c;
-    return (c & 1) ? c : (WCHAR)(c + 1);
-  }
-  if (c == 0x178) return 0xFF;
-  if (c >= 0x391 && c <= 0x3A9 && c != 0x3A2) return (WCHAR)(c + 32);
-  if (c >= 0x410 && c <= 0x42F) return (WCHAR)(c + 32);
-  if (c >= 0x400 && c <= 0x40F) return (WCHAR)(c + 80);
-  return c;
-}
-static WCHAR wide_upper(WCHAR c) {
-  if (c < 0x80) return (c >= 'a' && c <= 'z') ? (WCHAR)(c - 32) : c;
-  if (c >= 0xE0 && c <= 0xFE && c != 0xF7) return (WCHAR)(c - 32);
-  if (c == 0xFF) return 0x178;
-  if (c >= 0x100 && c <= 0x17F && c != 0x130 && c != 0x131 && c != 0x138 && c != 0x149 && c != 0x17F) {
-    if ((c >= 0x139 && c <= 0x148) || (c >= 0x179 && c <= 0x17E)) return (c & 1) ? c : (WCHAR)(c - 1);
-    return (c & 1) ? (WCHAR)(c - 1) : c;
-  }
-  if (c >= 0x3B1 && c <= 0x3C9 && c != 0x3C2) return (WCHAR)(c - 32);
-  if (c >= 0x430 && c <= 0x44F) return (WCHAR)(c - 32);
-  if (c >= 0x450 && c <= 0x45F) return (WCHAR)(c - 80);
-  return c;
-}
+IMPORT WCHAR NTAPI RtlUpcaseUnicodeChar(WCHAR);
+IMPORT WCHAR NTAPI RtlDowncaseUnicodeChar(WCHAR);
+static WCHAR wide_lower(WCHAR c) { return RtlDowncaseUnicodeChar(c); }
+static WCHAR wide_upper(WCHAR c) { return RtlUpcaseUnicodeChar(c); }
 static BOOL wide_is_letter(WCHAR c) {
   if (c < 0x80) return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
   if (c < 0x100) return (c >= 0xC0 && c != 0xD7 && c != 0xF7) || c == 0xAA || c == 0xB5 || c == 0xBA;
@@ -92,57 +70,6 @@ EXPORT BOOL WINAPI GetStringTypeA(LCID locale, DWORD info_type, LPCSTR source, i
 }
 EXPORT BOOL WINAPI GetStringTypeExA(LCID locale, DWORD info_type, LPCSTR source, int count, LPWORD types) { return GetStringTypeA(locale, info_type, source, count, types); }
 
-#define LCMAP_LOWERCASE_ 0x100
-#define LCMAP_UPPERCASE_ 0x200
-#define LCMAP_SORTKEY_ 0x400
-#define LCMAP_BYTEREV_ 0x800
-EXPORT int WINAPI LCMapStringW(LCID locale, DWORD flags, LPCWSTR source, int count, LPWSTR dest, int capacity) {
-  (void)locale;
-  if (!source || (flags & (LCMAP_LOWERCASE_ | LCMAP_UPPERCASE_)) == (LCMAP_LOWERCASE_ | LCMAP_UPPERCASE_)) { set_error(ERROR_INVALID_FLAGS); return 0; }
-  if (count < 0) count = (int)wcslen(source) + 1;
-  const int needed = (flags & LCMAP_SORTKEY_) ? count * 2 + 2 : count;
-  if (capacity == 0) return needed;
-  if (capacity < needed) { set_error(ERROR_INSUFFICIENT_BUFFER); return 0; }
-  if (flags & LCMAP_SORTKEY_) {      /* a key that sorts as the text does (case folded, big-endian), ended by 0 0 */
-    BYTE *out = (BYTE *)dest;
-    for (int i = 0; i < count; ++i) { const WCHAR c = (flags & 1 /* NORM_IGNORECASE */) ? wide_lower(source[i]) : source[i]; out[2 * i] = (BYTE)(c >> 8); out[2 * i + 1] = (BYTE)c; }
-    out[2 * count] = 0; out[2 * count + 1] = 0;
-    return needed;
-  }
-  for (int i = 0; i < count; ++i) {
-    WCHAR c = source[i];
-    if (flags & LCMAP_LOWERCASE_) c = wide_lower(c);
-    else if (flags & LCMAP_UPPERCASE_) c = wide_upper(c);
-    if (flags & LCMAP_BYTEREV_) c = (WCHAR)((c << 8) | (c >> 8));
-    dest[i] = c;
-  }
-  return count;
-}
-EXPORT int WINAPI LCMapStringEx(LPCWSTR locale_name, DWORD flags, LPCWSTR source, int count, LPWSTR dest, int capacity, LPVOID version, LPVOID reserved, LPARAM sort_handle) {
-  (void)locale_name; (void)version; (void)reserved; (void)sort_handle;
-  return LCMapStringW(0x409, flags, source, count, dest, capacity);
-}
-EXPORT int WINAPI LCMapStringA(LCID locale, DWORD flags, LPCSTR source, int count, LPSTR dest, int capacity) {
-  if (!source) { set_error(ERROR_INVALID_PARAMETER); return 0; }
-  if (count < 0) count = (int)strlen(source) + 1;
-  WCHAR *w = RtlAllocateHeap(heap(), 0, ((SIZE_T)count + 1) * 4);
-  if (!w) { set_error(ERROR_NOT_ENOUGH_MEMORY); return 0; }
-  const int n = MultiByteToWideChar(CP_UTF8, 0, source, count, w, count);
-  int result = 0;
-  if (flags & LCMAP_SORTKEY_) {
-    result = LCMapStringW(locale, flags, w, n, (LPWSTR)dest, capacity / 2 > 0 ? capacity / 2 : 0);
-    if (capacity == 0) result = n * 2 + 2;
-  } else {
-    WCHAR *mapped = w + count + 1;
-    const int m = LCMapStringW(locale, flags, w, n, mapped, count);
-    if (m > 0) {
-      if (capacity == 0) result = WideCharToMultiByte(CP_UTF8, 0, mapped, m, NULL, 0, NULL, NULL);
-      else result = WideCharToMultiByte(CP_UTF8, 0, mapped, m, dest, capacity, NULL, NULL);
-    }
-  }
-  RtlFreeHeap(heap(), 0, w);
-  return result;
-}
 EXPORT int WINAPI FoldStringW(DWORD flags, LPCWSTR source, int count, LPWSTR dest, int capacity) {
   if (!source) { set_error(ERROR_INVALID_PARAMETER); return 0; }
   if (count < 0) count = (int)wcslen(source) + 1;
@@ -157,10 +84,6 @@ EXPORT int WINAPI FoldStringW(DWORD flags, LPCWSTR source, int count, LPWSTR des
   return count;
 }
 EXPORT int WINAPI FoldStringA(DWORD flags, LPCSTR source, int count, LPSTR dest, int capacity) { (void)flags; if (count < 0) count = (int)strlen(source) + 1; if (capacity == 0) return count; if (capacity < count) { set_error(ERROR_INSUFFICIENT_BUFFER); return 0; } memcpy(dest, source, (size_t_)count); return count; }
-EXPORT int WINAPI CompareStringEx(LPCWSTR locale_name, DWORD flags, LPCWSTR a, int an, LPCWSTR b, int bn, LPVOID version, LPVOID reserved, LPARAM sort_handle) {
-  (void)locale_name; (void)version; (void)reserved; (void)sort_handle;
-  return CompareStringW(0x409, flags, a, an, b, bn);
-}
 EXPORT int WINAPI CompareStringOrdinal(LPCWSTR a, int an, LPCWSTR b, int bn, BOOL ignore_case) {
   if (!a || !b) { set_error(ERROR_INVALID_PARAMETER); return 0; }
   if (an < 0) an = (int)wcslen(a);
@@ -266,6 +189,8 @@ static const char *locale_text(DWORD type, DWORD *number, char *scratch) {
     case 0x5C: return "en-US";                 /* SNAME */
     case 0x1002: return "United States";       /* SENGLISHCOUNTRYNAME */
     case 0x1003: return "h:mm:ss tt";          /* STIMEFORMAT */
+    case 0x1006: return "MMMM yyyy";           /* SYEARMONTH */
+    case 0x79: return "h:mm tt";               /* SSHORTTIME */
     case 0x1004: *number = 65001; return NULL; /* IDEFAULTANSICODEPAGE */
     case 0x1007: *number = 437; return NULL;   /* IDEFAULTCODEPAGE */
     case 0x100B: *number = 0; return NULL;     /* IFIRSTWEEKOFYEAR */
@@ -281,49 +206,6 @@ static const char *locale_text(DWORD type, DWORD *number, char *scratch) {
   if (t >= 0x44 && t <= 0x4F) { memcpy(scratch, k_months[t - 0x44], 3); scratch[3] = 0; return scratch; }      /* SABBREVMONTHNAME */
   return NULL;
 }
-EXPORT int WINAPI GetLocaleInfoW(LCID locale, LCTYPE type, LPWSTR buffer, int capacity) {
-  if (locale != 0x409 && locale != 0x400 && locale != 0x800 && locale != 0x1000 && locale != 0) { set_error(ERROR_INVALID_PARAMETER); return 0; }
-  char scratch[8], number_text[16];
-  DWORD number = (DWORD)-1;
-  const char *text = locale_text(type, &number, scratch);
-  if ((type & 0x20000000 /* LOCALE_RETURN_NUMBER */)) {
-    if (number == (DWORD)-1 && text) { number = 0; for (const char *c = text; *c >= '0' && *c <= '9'; ++c) number = number * 10 + (DWORD)(*c - '0'); }
-    if (number == (DWORD)-1) { set_error(ERROR_INVALID_FLAGS); return 0; }
-    if (capacity == 0) return 2;
-    if (capacity < 2) { set_error(ERROR_INSUFFICIENT_BUFFER); return 0; }
-    memcpy(buffer, &number, 4);
-    return 2;
-  }
-  if (!text && number != (DWORD)-1) {
-    char *p = number_text + sizeof(number_text) - 1;
-    *p = 0;
-    DWORD v = number;
-    do { *--p = (char)('0' + v % 10); v /= 10; } while (v);
-    text = p;
-  }
-  if (!text) { set_error(ERROR_INVALID_FLAGS); return 0; }
-  const int n = (int)strlen(text) + 1;
-  if (capacity == 0) return n;
-  if (capacity < n) { set_error(ERROR_INSUFFICIENT_BUFFER); return 0; }
-  for (int i = 0; i < n; ++i) buffer[i] = (WCHAR)(BYTE)text[i];
-  return n;
-}
-EXPORT int WINAPI GetLocaleInfoA(LCID locale, LCTYPE type, LPSTR buffer, int capacity) {
-  WCHAR wide[96];
-  if (type & 0x20000000) { if (capacity == 0) return 4; if (capacity < 4) { set_error(ERROR_INSUFFICIENT_BUFFER); return 0; } return GetLocaleInfoW(locale, type, (LPWSTR)buffer, 2) ? 4 : 0; }
-  const int n = GetLocaleInfoW(locale, type, wide, 96);
-  if (n == 0) return 0;
-  if (capacity == 0) return n;
-  if (capacity < n) { set_error(ERROR_INSUFFICIENT_BUFFER); return 0; }
-  for (int i = 0; i < n; ++i) buffer[i] = (char)wide[i];
-  return n;
-}
-EXPORT int WINAPI GetLocaleInfoEx(LPCWSTR name, LCTYPE type, LPWSTR buffer, int capacity) { (void)name; return GetLocaleInfoW(0x409, type, buffer, capacity); }
-EXPORT BOOL WINAPI SetLocaleInfoW(LCID locale, LCTYPE type, LPCWSTR value) { (void)locale; (void)type; (void)value; set_error(ERROR_ACCESS_DENIED); return FALSE; }
-EXPORT BOOL WINAPI SetLocaleInfoA(LCID locale, LCTYPE type, LPCSTR value) { (void)locale; (void)type; (void)value; set_error(ERROR_ACCESS_DENIED); return FALSE; }
-EXPORT int WINAPI LCIDToLocaleName(LCID locale, LPWSTR name, int capacity, DWORD flags) { (void)flags; return locale == 0x409 ? GetUserDefaultLocaleName(name, capacity) : (set_error(ERROR_INVALID_PARAMETER), 0); }
-EXPORT LCID WINAPI LocaleNameToLCID(LPCWSTR name, DWORD flags) { (void)flags; if (!name || !*name) return 0x409; if ((name[0] | 0x20) == 'e' && (name[1] | 0x20) == 'n') return 0x409; set_error(ERROR_INVALID_PARAMETER); return 0; }
-EXPORT BOOL WINAPI IsValidLocaleName(LPCWSTR name) { return name && (name[0] | 0x20) == 'e' && (name[1] | 0x20) == 'n'; }
 EXPORT int WINAPI GetUserPreferredUILanguages(DWORD flags, PULONG count, LPWSTR languages, PULONG length) {
   (void)flags;
   static const WCHAR en[] = {'e', 'n', '-', 'U', 'S', 0, 0};
@@ -346,212 +228,6 @@ typedef BOOL (CALLBACK *CODEPAGE_ENUMPROCW_)(LPWSTR);
 EXPORT BOOL WINAPI EnumSystemCodePagesA(CODEPAGE_ENUMPROCA_ proc, DWORD flags) { (void)flags; char cps[][6] = {"65001", "1252", "437"}; for (int i = 0; i < 3; ++i) if (!proc(cps[i])) break; return TRUE; }
 EXPORT BOOL WINAPI EnumSystemCodePagesW(CODEPAGE_ENUMPROCW_ proc, DWORD flags) { (void)flags; WCHAR a[] = {'6', '5', '0', '0', '1', 0}, b[] = {'1', '2', '5', '2', 0}, c[] = {'4', '3', '7', 0}; if (proc(a) && proc(b)) proc(c); return TRUE; }
 
-/* ---- number, currency, date and time formats ---------------------------------------------------------------------------------------------------------------- */
-
-/* The number in `text` ("-1234.5") as the locale writes it: grouped with thousands separators, `digits` decimals (rounded away), a leading zero, the sign. */
-static int format_decimal_text(const char *text, int digits, BOOL group, const char *decimal, const char *thousand, char *out, int capacity) {
-  char whole[64], frac[64];
-  int w = 0, f = 0;
-  BOOL negative = FALSE;
-  const char *c = text;
-  while (*c == ' ') ++c;
-  if (*c == '-') { negative = TRUE; ++c; }
-  while (*c >= '0' && *c <= '9' && w < 60) whole[w++] = *c++;
-  if (*c == '.') { ++c; while (*c >= '0' && *c <= '9' && f < 60) frac[f++] = *c++; }
-  if (w == 0) whole[w++] = '0';
-  while (w > 1 && whole[0] == '0') { memmove(whole, whole + 1, (size_t_)--w); }
-  /* round to `digits` decimals (the digit after decides) */
-  if (f > digits) {
-    const BOOL up = frac[digits] >= '5';
-    f = digits;
-    if (up) {
-      int i = f - 1;
-      while (i >= 0 && frac[i] == '9') frac[i--] = '0';
-      if (i >= 0) ++frac[i];
-      else { i = w - 1; while (i >= 0 && whole[i] == '9') whole[i--] = '0'; if (i >= 0) ++whole[i]; else { memmove(whole + 1, whole, (size_t_)w); whole[0] = '1'; ++w; } }
-    }
-  }
-  while (f < digits && f < 60) frac[f++] = '0';
-  int n = 0;
-  if (negative) { BOOL zero = TRUE; for (int i = 0; i < w; ++i) if (whole[i] != '0') zero = FALSE; for (int i = 0; i < f; ++i) if (frac[i] != '0') zero = FALSE; if (!zero) { if (n < capacity) out[n] = '-'; ++n; } }
-  for (int i = 0; i < w; ++i) {
-    if (group && i > 0 && (w - i) % 3 == 0) for (const char *t = thousand; *t; ++t) { if (n < capacity) out[n] = *t; ++n; }
-    if (n < capacity) out[n] = whole[i];
-    ++n;
-  }
-  if (f > 0) {
-    for (const char *d = decimal; *d; ++d) { if (n < capacity) out[n] = *d; ++n; }
-    for (int i = 0; i < f; ++i) { if (n < capacity) out[n] = frac[i]; ++n; }
-  }
-  if (n < capacity) out[n] = 0;
-  return n + 1;
-}
-typedef struct { UINT NumDigits, LeadingZero, Grouping; LPWSTR lpDecimalSep, lpThousandSep; UINT NegativeOrder; } NUMBERFMTW_;
-typedef struct { UINT NumDigits, LeadingZero, Grouping; LPWSTR lpDecimalSep, lpThousandSep; UINT NegativeOrder, PositiveOrder; LPWSTR lpCurrencySymbol; } CURRENCYFMTW_;
-static int copy_narrow_to_wide(const char *text, int n, LPWSTR out, int capacity) {
-  if (capacity == 0) return n;
-  if (capacity < n) { set_error(ERROR_INSUFFICIENT_BUFFER); return 0; }
-  for (int i = 0; i < n; ++i) out[i] = (WCHAR)(BYTE)text[i];
-  return n;
-}
-EXPORT int WINAPI GetNumberFormatW(LCID locale, DWORD flags, LPCWSTR value, const NUMBERFMTW_ *format, LPWSTR out, int capacity) {
-  (void)locale; (void)flags;
-  if (!value) { set_error(ERROR_INVALID_PARAMETER); return 0; }
-  char text[64];
-  int i = 0;
-  for (; value[i] && i < 63; ++i) text[i] = (char)value[i];
-  text[i] = 0;
-  char decimal[8] = ".", thousand[8] = ",";
-  int digits = 2;
-  BOOL group = TRUE;
-  if (format) {
-    digits = (int)format->NumDigits;
-    group = format->Grouping != 0;
-    if (format->lpDecimalSep) { int k = 0; for (; format->lpDecimalSep[k] && k < 7; ++k) decimal[k] = (char)format->lpDecimalSep[k]; decimal[k] = 0; }
-    if (format->lpThousandSep) { int k = 0; for (; format->lpThousandSep[k] && k < 7; ++k) thousand[k] = (char)format->lpThousandSep[k]; thousand[k] = 0; }
-  }
-  char result[128];
-  const int n = format_decimal_text(text, digits, group, decimal, thousand, result, sizeof(result));
-  return copy_narrow_to_wide(result, n, out, capacity);
-}
-EXPORT int WINAPI GetNumberFormatEx(LPCWSTR locale_name, DWORD flags, LPCWSTR value, const NUMBERFMTW_ *format, LPWSTR out, int capacity) { (void)locale_name; return GetNumberFormatW(0x409, flags, value, format, out, capacity); }
-EXPORT int WINAPI GetNumberFormatA(LCID locale, DWORD flags, LPCSTR value, const NUMBERFMTW_ *format, LPSTR out, int capacity) {
-  (void)format;
-  WCHAR *w = value ? to_wide(value) : NULL;
-  if (!w) return 0;
-  WCHAR wide[128];
-  int n = GetNumberFormatW(locale, flags, w, NULL, wide, 128);
-  free_wide(w);
-  if (n == 0) return 0;
-  if (capacity == 0) return n;
-  if (capacity < n) { set_error(ERROR_INSUFFICIENT_BUFFER); return 0; }
-  for (int i = 0; i < n; ++i) out[i] = (char)wide[i];
-  return n;
-}
-EXPORT int WINAPI GetCurrencyFormatW(LCID locale, DWORD flags, LPCWSTR value, const CURRENCYFMTW_ *format, LPWSTR out, int capacity) {
-  (void)locale; (void)flags;
-  if (!value) { set_error(ERROR_INVALID_PARAMETER); return 0; }
-  char text[64];
-  int i = 0;
-  for (; value[i] && i < 63; ++i) text[i] = (char)value[i];
-  text[i] = 0;
-  const BOOL negative = text[0] == '-';
-  char number[128];
-  const int digits = format ? (int)format->NumDigits : 2;
-  const int n = format_decimal_text(negative ? text + 1 : text, digits, TRUE, ".", ",", number, sizeof(number));
-  char symbol[16] = "$";
-  if (format && format->lpCurrencySymbol) { int k = 0; for (; format->lpCurrencySymbol[k] && k < 15; ++k) symbol[k] = (char)format->lpCurrencySymbol[k]; symbol[k] = 0; }
-  char result[160];
-  int len = 0;
-  if (negative) result[len++] = '(';      /* the US negative form is ($1.00) */
-  for (const char *s = symbol; *s; ++s) result[len++] = *s;
-  for (int k = 0; k < n - 1; ++k) result[len++] = number[k];
-  if (negative) result[len++] = ')';
-  result[len++] = 0;
-  return copy_narrow_to_wide(result, len, out, capacity);
-}
-EXPORT int WINAPI GetCurrencyFormatEx(LPCWSTR locale_name, DWORD flags, LPCWSTR value, const CURRENCYFMTW_ *format, LPWSTR out, int capacity) { (void)locale_name; return GetCurrencyFormatW(0x409, flags, value, format, out, capacity); }
-EXPORT int WINAPI GetCurrencyFormatA(LCID locale, DWORD flags, LPCSTR value, const CURRENCYFMTW_ *format, LPSTR out, int capacity) {
-  (void)format;
-  WCHAR *w = value ? to_wide(value) : NULL;
-  if (!w) return 0;
-  WCHAR wide[160];
-  int n = GetCurrencyFormatW(locale, flags, w, NULL, wide, 160);
-  free_wide(w);
-  if (n == 0) return 0;
-  if (capacity == 0) return n;
-  if (capacity < n) { set_error(ERROR_INSUFFICIENT_BUFFER); return 0; }
-  for (int i = 0; i < n; ++i) out[i] = (char)wide[i];
-  return n;
-}
-
-/* A picture of a date or time ("dddd, MMMM d, yyyy", "h:mm:ss tt") filled in from a SYSTEMTIME. */
-static int format_picture(const char *picture, const SYSTEMTIME *st, WCHAR *out, int capacity) {
-  char result[160];
-  int n = 0;
-  #define PUT(ch) do { if (n < 159) result[n] = (ch); ++n; } while (0)
-  #define PUTS(text) do { for (const char *q = (text); *q; ++q) PUT(*q); } while (0)
-  char number[16];
-  for (const char *p = picture; *p;) {
-    const char c = *p;
-    int run = 1;
-    while (p[run] == c) ++run;
-    if (c == '\'') {      /* quoted text; '' is a quote */
-      ++p;
-      while (*p && !(*p == '\'' && p[1] != '\'')) { if (*p == '\'' && p[1] == '\'') ++p; PUT(*p); ++p; }
-      if (*p) ++p;
-      continue;
-    }
-    p += run;
-    #define NUM(v, width) do { unsigned vv = (unsigned)(v); char tmp[12]; int t = 0; do { tmp[t++] = (char)('0' + vv % 10); vv /= 10; } while (vv); while (t < (width)) tmp[t++] = '0'; for (int z = t - 1; z >= 0; --z) PUT(tmp[z]); } while (0)
-    switch (c) {
-      case 'd': if (run <= 2) { NUM(st->wDay, run); } else { const int day = (st->wDayOfWeek + 6) % 7; if (run == 3) { PUT(k_days[day][0]); PUT(k_days[day][1]); PUT(k_days[day][2]); } else PUTS(k_days[day]); } break;
-      case 'M': if (run <= 2) { NUM(st->wMonth, run); } else if (st->wMonth >= 1 && st->wMonth <= 12) { const char *mn = k_months[st->wMonth - 1]; if (run == 3) { PUT(mn[0]); PUT(mn[1]); PUT(mn[2]); } else PUTS(mn); } break;
-      case 'y': if (run <= 2) { NUM(st->wYear % 100, 2); } else { NUM(st->wYear, run); } break;
-      case 'g': PUTS("A.D."); break;
-      case 'h': { int h = st->wHour % 12; if (h == 0) h = 12; NUM(h, run >= 2 ? 2 : 1); break; }
-      case 'H': NUM(st->wHour, run >= 2 ? 2 : 1); break;
-      case 'm': NUM(st->wMinute, run >= 2 ? 2 : 1); break;
-      case 's': NUM(st->wSecond, run >= 2 ? 2 : 1); break;
-      case 't': if (run == 1) PUT(st->wHour < 12 ? 'A' : 'P'); else PUTS(st->wHour < 12 ? "AM" : "PM"); break;
-      default: for (int k = 0; k < run; ++k) PUT(c); break;
-    }
-    #undef NUM
-  }
-  (void)number;
-  #undef PUT
-  #undef PUTS
-  result[n < 159 ? n : 159] = 0;
-  return copy_narrow_to_wide(result, (n < 159 ? n : 159) + 1, out, capacity);
-}
-#define DATE_SHORTDATE_ 1
-#define DATE_LONGDATE_ 2
-#define TIME_NOSECONDS_ 2
-#define TIME_FORCE24HOURFORMAT_ 8
-EXPORT int WINAPI GetDateFormatW(LCID locale, DWORD flags, const SYSTEMTIME *time, LPCWSTR format, LPWSTR out, int capacity) {
-  (void)locale;
-  SYSTEMTIME now;
-  if (!time) { GetLocalTime(&now); time = &now; }
-  if (time->wMonth < 1 || time->wMonth > 12 || time->wDay < 1 || time->wDay > 31) { set_error(ERROR_INVALID_PARAMETER); return 0; }
-  char picture[64];
-  if (format) { int i = 0; for (; format[i] && i < 63; ++i) picture[i] = (char)format[i]; picture[i] = 0; }
-  else copy_text(picture, (flags & DATE_LONGDATE_) ? "dddd, MMMM d, yyyy" : "M/d/yyyy");
-  return format_picture(picture, time, out, capacity);
-}
-EXPORT int WINAPI GetDateFormatEx(LPCWSTR locale_name, DWORD flags, const SYSTEMTIME *time, LPCWSTR format, LPWSTR out, int capacity, LPCWSTR calendar) { (void)locale_name; (void)calendar; return GetDateFormatW(0x409, flags, time, format, out, capacity); }
-EXPORT int WINAPI GetTimeFormatW(LCID locale, DWORD flags, const SYSTEMTIME *time, LPCWSTR format, LPWSTR out, int capacity) {
-  (void)locale;
-  SYSTEMTIME now;
-  if (!time) { GetLocalTime(&now); time = &now; }
-  if (time->wHour > 23 || time->wMinute > 59 || time->wSecond > 59) { set_error(ERROR_INVALID_PARAMETER); return 0; }
-  char picture[64];
-  if (format) { int i = 0; for (; format[i] && i < 63; ++i) picture[i] = (char)format[i]; picture[i] = 0; }
-  else if (flags & TIME_FORCE24HOURFORMAT_) copy_text(picture, (flags & TIME_NOSECONDS_) ? "HH:mm" : "HH:mm:ss");
-  else copy_text(picture, (flags & TIME_NOSECONDS_) ? "h:mm tt" : "h:mm:ss tt");
-  return format_picture(picture, time, out, capacity);
-}
-EXPORT int WINAPI GetTimeFormatEx(LPCWSTR locale_name, DWORD flags, const SYSTEMTIME *time, LPCWSTR format, LPWSTR out, int capacity) { (void)locale_name; return GetTimeFormatW(0x409, flags, time, format, out, capacity); }
-EXPORT int WINAPI GetDateFormatA(LCID locale, DWORD flags, const SYSTEMTIME *time, LPCSTR format, LPSTR out, int capacity) {
-  WCHAR wide[160], *f = format ? to_wide(format) : NULL;
-  const int n = GetDateFormatW(locale, flags, time, f, wide, 160);
-  free_wide(f);
-  if (n == 0) return 0;
-  if (capacity == 0) return n;
-  if (capacity < n) { set_error(ERROR_INSUFFICIENT_BUFFER); return 0; }
-  for (int i = 0; i < n; ++i) out[i] = (char)wide[i];
-  return n;
-}
-EXPORT int WINAPI GetTimeFormatA(LCID locale, DWORD flags, const SYSTEMTIME *time, LPCSTR format, LPSTR out, int capacity) {
-  WCHAR wide[160], *f = format ? to_wide(format) : NULL;
-  const int n = GetTimeFormatW(locale, flags, time, f, wide, 160);
-  free_wide(f);
-  if (n == 0) return 0;
-  if (capacity == 0) return n;
-  if (capacity < n) { set_error(ERROR_INSUFFICIENT_BUFFER); return 0; }
-  for (int i = 0; i < n; ++i) out[i] = (char)wide[i];
-  return n;
-}
-
 /* ---- atoms ----------------------------------------------------------------------------------------------------------------------------------------------- */
 
 /* One table serves the local and the global atoms (a program is the only user of its global atoms). Atoms 0xC000.. name strings; integer atoms are below 0xC000. */
@@ -570,10 +246,11 @@ static void atom_lock(void) {
 static WCHAR wide_fold(WCHAR c) { return wide_upper(c); }
 static BOOL atom_equal(const WCHAR *a, const WCHAR *b) { while (*a && *b) { if (wide_fold(*a) != wide_fold(*b)) return FALSE; ++a; ++b; } return *a == *b; }
 static ATOM atom_add(LPCWSTR name, BOOL global) {
-  if (!name) { set_error(ERROR_INVALID_PARAMETER); return 0; }
+  if (!name) return 0;      /* fails without an error code */
   if (((ULONG_PTR)name >> 16) == 0) {      /* MAKEINTATOM */
     const ULONG_PTR id = (ULONG_PTR)name;
-    if (id == 0 || id >= 0xC000) { set_error(ERROR_INVALID_PARAMETER); return 0; }
+    if (id == 0) return 0;      /* fails without an error code */
+    if (id >= 0xC000) { set_error(ERROR_INVALID_PARAMETER); return 0; }
     return (ATOM)id;
   }
   if (name[0] == '#') {      /* "#123" is the integer atom 123 */
@@ -582,7 +259,7 @@ static ATOM atom_add(LPCWSTR name, BOOL global) {
     if (digits) { if (v == 0 || v >= 0xC000) { set_error(ERROR_INVALID_PARAMETER); return 0; } return (ATOM)v; }
   }
   const size_t_ len = wcslen(name);
-  if (len == 0 || len > 255) { set_error(len == 0 ? ERROR_INVALID_PARAMETER : ERROR_BUFFER_OVERFLOW); return 0; }
+  if (len == 0 || len > 255) { set_error(ERROR_INVALID_PARAMETER); return 0; }
   atom_lock();
   int free_slot = -1;
   for (int i = 0; i < ATOM_MAX; ++i) {
@@ -619,42 +296,59 @@ static ATOM atom_delete(ATOM atom, BOOL global) {
   LeaveCriticalSection(&g_atom_lock);
   return result;
 }
-static UINT atom_name(ATOM atom, BOOL global, LPWSTR buffer, int capacity) {
+/* The text of an atom (an integer atom is "#n"); returns its length, or 0 with the error set. */
+static UINT atom_text(ATOM atom, BOOL global, WCHAR *text) {
   if (atom == 0) { set_error(ERROR_INVALID_PARAMETER); return 0; }
-  if (atom < 0xC000) {      /* an integer atom is written as #n */
-    WCHAR tmp[8]; int t = 0; unsigned x = atom; WCHAR digits[6]; int d = 0;
+  if (atom < 0xC000) {
+    WCHAR digits[6]; int d = 0, t = 0; unsigned x = atom;
     do { digits[d++] = (WCHAR)('0' + x % 10); x /= 10; } while (x);
-    tmp[t++] = '#'; while (d) tmp[t++] = digits[--d]; tmp[t] = 0;
-    if (capacity <= t) { set_error(ERROR_INSUFFICIENT_BUFFER); return 0; }
-    memcpy(buffer, tmp, ((size_t_)t + 1) * 2);
+    text[t++] = '#'; while (d) text[t++] = digits[--d]; text[t] = 0;
     return (UINT)t;
   }
   const int i = atom - 0xC000;
   atom_lock();
   UINT result = 0;
   if (i >= ATOM_MAX || !g_atoms[i].name || g_atoms[i].global != global) set_error(ERROR_INVALID_HANDLE);
-  else {
-    const int len = (int)wcslen(g_atoms[i].name);
-    if (capacity <= 0) set_error(ERROR_INSUFFICIENT_BUFFER);
-    else {      /* truncated to fit, like the original */
-      const int n = len < capacity - 1 ? len : capacity - 1;
-      memcpy(buffer, g_atoms[i].name, (size_t_)n * 2);
-      buffer[n] = 0;
-      result = (UINT)n;
-    }
-  }
+  else { result = (UINT)wcslen(g_atoms[i].name); memcpy(text, g_atoms[i].name, ((size_t_)result + 1) * 2); }
   LeaveCriticalSection(&g_atom_lock);
   return result;
 }
+/* The local atoms cut a name that does not fit and terminate it; with room for no character the call fails with ERROR_INSUFFICIENT_BUFFER. */
+static BOOL atom_cut_local(UINT len, int capacity, UINT *n) {
+  if (capacity <= 1) { set_error(capacity <= 0 ? ERROR_INVALID_PARAMETER : ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+  *n = len < (UINT)capacity - 1 ? len : (UINT)capacity - 1;
+  return TRUE;
+}
+/* Wide (global atoms): as many characters as fit; the terminator only when there is room for it. */
+static UINT atom_name(ATOM atom, BOOL global, LPWSTR buffer, int capacity) {
+  WCHAR text[260];
+  const UINT len = atom_text(atom, global, text);
+  if (len == 0) return 0;
+  if (!global) {
+    UINT cut;
+    if (!atom_cut_local(len, capacity, &cut)) return 0;
+    memcpy(buffer, text, (size_t_)cut * 2);
+    buffer[cut] = 0;
+    return cut;
+  }
+  if (capacity <= 0) { set_error(ERROR_INVALID_PARAMETER); return 0; }
+  const UINT n = len < (UINT)capacity ? len : (UINT)capacity;
+  memcpy(buffer, text, (size_t_)n * 2);
+  if (n < (UINT)capacity) buffer[n] = 0;
+  return n;
+}
+/* ANSI: a name that does not fit is cut short, terminated, and reported as ERROR_MORE_DATA with a length of 0. */
 static UINT atom_name_a(ATOM atom, BOOL global, LPSTR buffer, int capacity) {
-  WCHAR wide[256];
-  const UINT n = atom_name(atom, global, wide, 256);
-  if (n == 0) return 0;
-  const int m = capacity - 1 < (int)n ? capacity - 1 : (int)n;
-  if (capacity <= 0) { set_error(ERROR_INSUFFICIENT_BUFFER); return 0; }
-  for (int i = 0; i < m; ++i) buffer[i] = (char)wide[i];
-  buffer[m] = 0;
-  return (UINT)m;
+  WCHAR text[260];
+  const UINT len = atom_text(atom, global, text);
+  if (len == 0) return 0;
+  UINT n;
+  if (!global) { if (!atom_cut_local(len, capacity, &n)) return 0; }
+  else { if (capacity <= 0) { set_error(ERROR_INVALID_PARAMETER); return 0; } n = len < (UINT)capacity - 1 ? len : (UINT)capacity - 1; }
+  for (UINT i = 0; i < n; ++i) buffer[i] = (char)text[i];
+  buffer[n] = 0;
+  if (global && n < len) { set_error(ERROR_MORE_DATA); return 0; }
+  return n;
 }
 #define ATOM_FROM_A(call) do { WCHAR *w_ = ((ULONG_PTR)name >> 16) ? to_wide(name) : (WCHAR *)name; ATOM r_ = (call); if (((ULONG_PTR)name >> 16)) free_wide(w_); return r_; } while (0)
 EXPORT ATOM WINAPI AddAtomW(LPCWSTR name) { return atom_add(name, FALSE); }

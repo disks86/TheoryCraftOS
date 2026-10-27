@@ -86,11 +86,18 @@ EXPORT void NTAPI RtlSecondsSince1980ToTime(ULONG seconds, LONGLONG *time) { *ti
 
 EXPORT BOOLEAN NTAPI RtlQueryPerformanceCounter(PLARGE_INTEGER counter) { LARGE_INTEGER f; NtQueryPerformanceCounter(counter, &f); return TRUE; }
 EXPORT BOOLEAN NTAPI RtlQueryPerformanceFrequency(PLARGE_INTEGER frequency) { LARGE_INTEGER c; NtQueryPerformanceCounter(&c, frequency); return TRUE; }
-EXPORT void NTAPI RtlQueryUnbiasedInterruptTime(ULONGLONG *time) {
+EXPORT BOOLEAN NTAPI RtlQueryUnbiasedInterruptTime(ULONGLONG *time) {
+  if (!time) { TEB_LAST_ERROR(NtCurrentTeb()) = 87; return FALSE; }      /* ERROR_INVALID_PARAMETER */
   LARGE_INTEGER c, f;
   NtQueryPerformanceCounter(&c, &f);
   const ULONGLONG hz = (ULONGLONG)f.QuadPart, ticks = (ULONGLONG)c.QuadPart;
   *time = hz ? (ticks / hz) * 10000000u + (ticks % hz) * 10000000u / hz : 0;
+  return TRUE;
+}
+EXPORT ULONG NTAPI NtGetTickCount(void) {
+  LARGE_INTEGER c, f;
+  NtQueryPerformanceCounter(&c, &f);
+  return f.QuadPart ? (ULONG)((ULONGLONG)c.QuadPart / ((ULONGLONG)f.QuadPart / 1000)) : 0;
 }
 
 /* ---- the thread error mode ------------------------------------------------------------------------------------------------------------------------------- */
@@ -581,4 +588,97 @@ EXPORT PVOID NTAPI RtlEnumerateGenericTableWithoutSplaying(RTL_GENERIC_TABLE_ *t
   GTNode *n = *restart_key ? GT_NODE(*restart_key)->next : t->TableRoot;
   *restart_key = n ? GT_DATA(n) : *restart_key;
   return n ? GT_DATA(n) : NULL;
+}
+
+/* ---- locale names and numbers ------------------------------------------------------------------------------------------------------------------------------ */
+
+/* The locales of this OS: the invariant one and English (United States), with the neutral name "en". */
+#define NLS_STATUS_INVALID_PARAMETER_1 ((NTSTATUS)0xC00000EF)
+#define NLS_STATUS_INVALID_PARAMETER_2 ((NTSTATUS)0xC00000F0)
+#define NLS_STATUS_BUFFER_TOO_SMALL ((NTSTATUS)0xC0000023)
+static WCHAR nls_low(WCHAR c) { return c >= 'A' && c <= 'Z' ? (WCHAR)(c + 32) : c; }
+static BOOL nls_name_equals(const WCHAR *name, const char *text) {
+  for (; *text; ++text, ++name) if (nls_low(*name) != (WCHAR)*text) return FALSE;
+  return *name == 0;
+}
+EXPORT BOOLEAN NTAPI RtlIsValidLocaleName(const WCHAR *name, ULONG flags) {
+  if (!name) return FALSE;
+  if (*name == 0) return TRUE;
+  if (nls_name_equals(name, "en-us")) return TRUE;
+  return (flags & 2) && nls_name_equals(name, "en");
+}
+EXPORT NTSTATUS NTAPI RtlLocaleNameToLcid(const WCHAR *name, ULONG *lcid, ULONG flags) {
+  if (!name) return NLS_STATUS_INVALID_PARAMETER_1;
+  if (*name == 0) { *lcid = 0x7F; return 0; }
+  if (nls_name_equals(name, "en-us")) { *lcid = 0x409; return 0; }
+  if ((flags & 2) && nls_name_equals(name, "en")) { *lcid = 0x09; return 0; }
+  return NLS_STATUS_INVALID_PARAMETER_1;
+}
+EXPORT NTSTATUS NTAPI RtlLcidToLocaleName(ULONG lcid, UNICODE_STRING *name, ULONG flags, BOOLEAN allocate) {
+  static const WCHAR en_us[] = {'e', 'n', '-', 'U', 'S', 0}, en[] = {'e', 'n', 0}, invariant[] = {0};
+  (void)flags;
+  const WCHAR *text;
+  switch (lcid) {
+    case 0x409: case 0x1000: case 0x2000: case 0x800: case 0x400: text = en_us; break;
+    case 0x7F: text = invariant; break;
+    case 0x09: text = en; break;
+    default: return NLS_STATUS_INVALID_PARAMETER_1;
+  }
+  if (!name) return NLS_STATUS_INVALID_PARAMETER_2;
+  if (lcid == 0x1000) return NLS_STATUS_INVALID_PARAMETER_1;
+  USHORT length = 0;
+  while (text[length]) ++length;
+  length = (USHORT)(length * 2);
+  if (allocate) {
+    name->Buffer = RtlAllocateHeap(RtlProcessHeap(), 0, (SIZE_T)length + 2);
+    if (!name->Buffer) return STATUS_NO_MEMORY;
+    name->MaximumLength = (USHORT)(length + 2);
+  } else if (name->MaximumLength < length + 2) return NLS_STATUS_BUFFER_TOO_SMALL;
+  memcpy(name->Buffer, text, (SIZE_T)length + 2);
+  name->Length = length;
+  return 0;
+}
+
+/* ---- interlocked singly linked lists --------------------------------------------------------------------------------------------------------------------- */
+
+/* The header is the x64 one of Windows: the first quadword has the depth (16 bits) and a sequence number (48), the second the address of the first entry shifted
+ * right by 4 (the entries are 16-aligned). One lock covers every list. */
+static volatile LONG g_slist_lock;
+static void slist_lock(void) { while (__sync_lock_test_and_set(&g_slist_lock, 1)) {} }
+static void slist_unlock(void) { __sync_lock_release(&g_slist_lock); }
+typedef struct { ULONGLONG depth_sequence, next; } SlistHeader;
+static PSLIST_ENTRY slist_first(const SlistHeader *h) { return (PSLIST_ENTRY)(ULONG_PTR)(h->next & ~0xFull); }
+static void slist_set(SlistHeader *h, PSLIST_ENTRY first, ULONGLONG depth) {
+  h->depth_sequence = ((h->depth_sequence + 0x10000) & ~0xFFFFull) | (depth & 0xFFFF);
+  h->next = (ULONGLONG)(ULONG_PTR)first & ~0xFull;
+}
+EXPORT void NTAPI RtlInitializeSListHead(PSLIST_HEADER head) { SlistHeader *h = (SlistHeader *)head; h->depth_sequence = 0; h->next = 0; }
+EXPORT PSLIST_ENTRY NTAPI RtlFirstEntrySList(const SLIST_HEADER *head) { return slist_first((const SlistHeader *)head); }
+EXPORT USHORT NTAPI RtlQueryDepthSList(PSLIST_HEADER head) { return (USHORT)(((SlistHeader *)head)->depth_sequence & 0xFFFF); }
+EXPORT PSLIST_ENTRY NTAPI RtlInterlockedPushListSListEx(PSLIST_HEADER head, PSLIST_ENTRY first, PSLIST_ENTRY last, ULONG count) {
+  SlistHeader *h = (SlistHeader *)head;
+  slist_lock();
+  PSLIST_ENTRY old = slist_first(h);
+  last->Next = old;
+  slist_set(h, first, (h->depth_sequence & 0xFFFF) + count);
+  slist_unlock();
+  return old;
+}
+EXPORT PSLIST_ENTRY NTAPI RtlInterlockedPushListSList(PSLIST_HEADER head, PSLIST_ENTRY first, PSLIST_ENTRY last, ULONG count) { return RtlInterlockedPushListSListEx(head, first, last, count); }
+EXPORT PSLIST_ENTRY NTAPI RtlInterlockedPushEntrySList(PSLIST_HEADER head, PSLIST_ENTRY entry) { return RtlInterlockedPushListSListEx(head, entry, entry, 1); }
+EXPORT PSLIST_ENTRY NTAPI RtlInterlockedPopEntrySList(PSLIST_HEADER head) {
+  SlistHeader *h = (SlistHeader *)head;
+  slist_lock();
+  PSLIST_ENTRY top = slist_first(h);
+  if (top) slist_set(h, top->Next, (h->depth_sequence & 0xFFFF) - 1);
+  slist_unlock();
+  return top;
+}
+EXPORT PSLIST_ENTRY NTAPI RtlInterlockedFlushSList(PSLIST_HEADER head) {
+  SlistHeader *h = (SlistHeader *)head;
+  slist_lock();
+  PSLIST_ENTRY top = slist_first(h);
+  if (top) slist_set(h, NULL, 0);
+  slist_unlock();
+  return top;
 }

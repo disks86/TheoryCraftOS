@@ -871,6 +871,21 @@ static void test_end_to_end() {
   CHECK(again.start(m) == AmdGfx8::Result::Ok);
 }
 
+// The graphics ring's interrupt sources: TIME_STAMP (0x04000000), PRIV_REG (0x00800000) and PRIV_INSTR (0x00400000) of CP_INT_CNTL_RING0 (0x306a), the rest kept.
+static void test_interrupt_sources() {
+  GfxRig rig;
+  AmdGfx8 gfx(rig.card, rig.clock);
+  CHECK(gfx.start(rig.memory()) == AmdGfx8::Result::Ok);
+  rig.card.set_reg(0x306a, 0x00280001);
+  const size_t before = rig.card.writes.size();
+  gfx.set_interrupts(true);
+  CHECK(rig.card.reg(0x306a) == 0x04E80001 && rig.card.writes.size() == before + 1 && rig.card.writes[before].first == 0x306a);
+  gfx.set_interrupts(true);
+  CHECK(rig.card.reg(0x306a) == 0x04E80001);
+  gfx.set_interrupts(false);
+  CHECK(rig.card.reg(0x306a) == 0x00280001);
+}
+
 int main() {
   if (!g_files.load()) {
     printf("the firmware files are missing (run from the repository root)\n");
@@ -897,6 +912,7 @@ int main() {
   test_backend_discovery();
   test_config_refusals();
   test_ring_wrap_and_stop();
+  test_interrupt_sources();
   test_end_to_end();
   printf(g_failed ? "AmdGfx8Test: %d FAILED\n" : "AmdGfx8Test: all passed\n", g_failed);
   return g_failed ? 1 : 0;

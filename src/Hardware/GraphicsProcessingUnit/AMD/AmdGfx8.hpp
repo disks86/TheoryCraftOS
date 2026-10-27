@@ -107,6 +107,11 @@ class AmdGfx8 {
   // (nothing more is queued) until the engine is started again.
   bool submit_ib(uint64_t ib_gpu_address, uint32_t dwords, uint32_t timeout_us = kDefaultTimeoutUs);
   bool wedged() const { return wedged_; }
+  // The graphics ring's interrupt sources, as the driver turns them on with amdgpu_irq_get (gfx_v8_0_set_eop_interrupt_state for the ring's pipe, _set_priv_reg_fault_state and
+  // _set_priv_inst_fault_state): the end-of-pipe (fence), privileged register and privileged instruction enables of CP_INT_CNTL_RING0. Read-modify-write.
+  void set_interrupts(bool enable);
+  // The engine reported a fault from this ring (a privileged register or instruction in a command buffer: gfx_v8_0_fault): nothing more is queued until it is started again.
+  void fault() { if (running_) wedged_ = true; }
   uint32_t fence_sequence() const { return fence_sequence_; }
   // amdgpu_ring_generic_pad_ib: appends NOP packets to `words` (a buffer of `capacity` dwords holding `count`) up to a multiple of 256; returns the new count, or 0 if it does not fit.
   static uint32_t pad_ib(ArrayView<uint32_t> words, uint32_t count);

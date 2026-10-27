@@ -37,40 +37,28 @@ typedef signed char CCHAR_;
 
 /* ---- strings ------------------------------------------------------------------------------------------------------------------------------------------- */
 
-static WCHAR rtl_upcase(WCHAR c) {
-  if (c < 0x80) return c >= 'a' && c <= 'z' ? (WCHAR)(c - 32) : c;
-  if (c == 0xB5) return 0x39C;
-  if (c >= 0xE0 && c <= 0xFE && c != 0xF7) return (WCHAR)(c - 32);
-  if (c == 0xFF) return 0x178;
-  if ((c >= 0x100 && c <= 0x137) || (c >= 0x14A && c <= 0x177)) return (c & 1) ? (WCHAR)(c - 1) : c;
-  if ((c >= 0x139 && c <= 0x148) || (c >= 0x179 && c <= 0x17E)) return (c & 1) ? c : (WCHAR)(c - 1);
-  if (c >= 0x3B1 && c <= 0x3C9) return c == 0x3C2 ? 0x3A3 : (WCHAR)(c - 32);
-  if (c >= 0x3AC && c <= 0x3AF) return c == 0x3AC ? 0x386 : (WCHAR)(c - 37);
-  if (c >= 0x430 && c <= 0x44F) return (WCHAR)(c - 32);
-  if (c >= 0x450 && c <= 0x45F) return (WCHAR)(c - 80);
-  if (c >= 0x460 && c <= 0x481) return (c & 1) ? (WCHAR)(c - 1) : c;
-  if (c >= 0x561 && c <= 0x586) return (WCHAR)(c - 48);
-  if (c >= 0x1E00 && c <= 0x1EFF && c != 0x1E9E) return (c & 1) ? (WCHAR)(c - 1) : c;
-  if (c >= 0x24D0 && c <= 0x24E9) return (WCHAR)(c - 26);
-  if (c >= 0xFF41 && c <= 0xFF5A) return (WCHAR)(c - 32);
+#include "casetab.inc"
+/* The mapping of a character in one of the range tables (binary search on the first character of each range). */
+static WCHAR rtl_case_map(WCHAR c, const CaseRange *table, int count) {
+  if (c < 0x80) {
+    if (table == (const void *)k_upcase_ranges) return c >= 'a' && c <= 'z' ? (WCHAR)(c - 32) : c;
+    return c >= 'A' && c <= 'Z' ? (WCHAR)(c + 32) : c;
+  }
+  int low = 0, high = count - 1;
+  while (low <= high) {
+    const int mid = (low + high) / 2;
+    if (c < table[mid].first) high = mid - 1;
+    else {
+      const unsigned offset = (unsigned)c - table[mid].first;
+      if (offset % table[mid].step == 0 && offset / table[mid].step < table[mid].count) return (WCHAR)(c + table[mid].delta);
+      if (offset < (unsigned)table[mid].count * table[mid].step) return c;
+      low = mid + 1;
+    }
+  }
   return c;
 }
-static WCHAR rtl_downcase(WCHAR c) {
-  if (c < 0x80) return c >= 'A' && c <= 'Z' ? (WCHAR)(c + 32) : c;
-  if (c >= 0xC0 && c <= 0xDE && c != 0xD7) return (WCHAR)(c + 32);
-  if (c == 0x178) return 0xFF;
-  if ((c >= 0x100 && c <= 0x137) || (c >= 0x14A && c <= 0x177)) return (c & 1) ? c : (WCHAR)(c + 1);
-  if ((c >= 0x139 && c <= 0x148) || (c >= 0x179 && c <= 0x17E)) return (c & 1) ? (WCHAR)(c + 1) : c;
-  if (c >= 0x391 && c <= 0x3A9 && c != 0x3A2) return (WCHAR)(c + 32);
-  if (c >= 0x410 && c <= 0x42F) return (WCHAR)(c + 32);
-  if (c >= 0x400 && c <= 0x40F) return (WCHAR)(c + 80);
-  if (c >= 0x460 && c <= 0x481) return (c & 1) ? c : (WCHAR)(c + 1);
-  if (c >= 0x531 && c <= 0x556) return (WCHAR)(c + 48);
-  if (c >= 0x1E00 && c <= 0x1EFF && c != 0x1E9E) return (c & 1) ? c : (WCHAR)(c + 1);
-  if (c >= 0x24B6 && c <= 0x24CF) return (WCHAR)(c + 26);
-  if (c >= 0xFF21 && c <= 0xFF3A) return (WCHAR)(c + 32);
-  return c;
-}
+static WCHAR rtl_upcase(WCHAR c) { return rtl_case_map(c, k_upcase_ranges, (int)(sizeof(k_upcase_ranges) / sizeof(k_upcase_ranges[0]))); }
+static WCHAR rtl_downcase(WCHAR c) { return rtl_case_map(c, k_downcase_ranges, (int)(sizeof(k_downcase_ranges) / sizeof(k_downcase_ranges[0]))); }
 EXPORT WCHAR NTAPI RtlUpcaseUnicodeChar(WCHAR c) { return rtl_upcase(c); }
 EXPORT WCHAR NTAPI RtlDowncaseUnicodeChar(WCHAR c) { return rtl_downcase(c); }
 EXPORT CHAR NTAPI RtlUpperChar(CHAR c) { return c >= 'a' && c <= 'z' ? (CHAR)(c - 32) : c; }
@@ -557,6 +545,30 @@ EXPORT ULONG NTAPI RtlFindClearRuns(const RTL_BITMAP *b, RTL_BITMAP_RUN *runs, U
     if (bm_get(b, i)) { ++i; continue; }
     const ULONG start = i;
     while (i < b->SizeOfBitMap && !bm_get(b, i)) ++i;
+    if (!longest_first) {
+      if (n == max) break;
+      runs[n].StartingIndex = start;
+      runs[n].NumberOfBits = i - start;
+      ++n;
+      continue;
+    }
+    /* keep the `max` longest runs seen so far, longest first (a shorter or equal run does not replace an earlier one) */
+    ULONG at = n;
+    while (at > 0 && runs[at - 1].NumberOfBits < i - start) --at;
+    if (at >= max) continue;
+    if (n < max) ++n;
+    for (ULONG k = n - 1; k > at; --k) runs[k] = runs[k - 1];
+    runs[at].StartingIndex = start;
+    runs[at].NumberOfBits = i - start;
+  }
+  return n;
+}
+EXPORT ULONG NTAPI RtlFindSetRuns(const RTL_BITMAP *b, RTL_BITMAP_RUN *runs, ULONG max, BOOLEAN longest_first) {
+  ULONG n = 0, i = 0;
+  while (i < b->SizeOfBitMap) {
+    if (!bm_get(b, i)) { ++i; continue; }
+    const ULONG start = i;
+    while (i < b->SizeOfBitMap && bm_get(b, i)) ++i;
     if (!longest_first) {
       if (n == max) break;
       runs[n].StartingIndex = start;

@@ -466,4 +466,31 @@ bool AmdGfx8Compute::disable_queues(uint32_t timeout_us) {
   return test_ring(kiq, timeout_us);
 }
 
+bool AmdGfx8Compute::set_eop_interrupt(bool enable) {
+  if (config_.compute_me != 1) return false;
+  uint32_t reg;
+  switch (config_.compute_pipe) {
+    case 0: reg = mmCP_ME1_PIPE0_INT_CNTL; break;
+    case 1: reg = mmCP_ME1_PIPE1_INT_CNTL; break;
+    case 2: reg = mmCP_ME1_PIPE2_INT_CNTL; break;
+    case 3: reg = mmCP_ME1_PIPE3_INT_CNTL; break;
+    default: return false;
+  }
+  const uint32_t tmp = rd(reg);
+  wr(reg, enable ? (tmp | CP_INT_CNTL_RING0__TIME_STAMP_INT_ENABLE_MASK) : (tmp & ~CP_INT_CNTL_RING0__TIME_STAMP_INT_ENABLE_MASK));
+  return true;
+}
+
+bool AmdGfx8Compute::fault(uint32_t me, uint32_t pipe, uint32_t queue) {
+  if (!ready_) return false;
+  for (uint32_t i = 1; i <= config_.queues && i <= kMaxQueues; ++i) {
+    Queue& q = queues_[i];
+    if (q.me == me && q.pipe == pipe && q.queue == queue) {
+      q.wedged = true;
+      return true;
+    }
+  }
+  return false;
+}
+
 }  // namespace hardware
