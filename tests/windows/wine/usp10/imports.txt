@@ -1,0 +1,1 @@
+usp10 user32 gdi32

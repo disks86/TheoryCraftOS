@@ -2717,17 +2717,22 @@ bool Vm::iterator_close(JsObject* it, bool silent) {
 }
 
 bool Vm::iterate_into(JsObject* array, const Value& iterable, int64_t max) {
-  if (max == 0) return true;
   Value it_value;
   if (!make_iterator(iterable, false, &it_value)) return false;
   JsObject* it = it_value.as_object();
+  if (max == 0) return iterator_close(it, false);   // [] = iterable: nothing is taken, the iterator is closed
   Value item;
   int64_t taken = 0;
+  bool stopped = false;
   while (iterator_next(it, &item)) {
     if (!array_push(array, item)) break;
-    if (max > 0 && ++taken >= max) break;
+    if (max > 0 && ++taken >= max) {
+      stopped = true;
+      break;
+    }
   }
-  return !has_exception_;
+  if (has_exception_) return false;
+  return stopped ? iterator_close(it, false) : true;   // (an iterator that was not run to its end is closed: its return() is called)
 }
 
 bool Vm::spread_into(JsObject* array, const Value& iterable) {

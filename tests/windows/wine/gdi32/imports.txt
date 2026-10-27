@@ -1,0 +1,1 @@
+setupapi user32 gdi32 advapi32

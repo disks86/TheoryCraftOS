@@ -1,0 +1,1 @@
+dnsapi ws2_32 iphlpapi

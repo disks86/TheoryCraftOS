@@ -1,0 +1,1 @@
+user32 gdi32 advapi32 hid imm32 setupapi

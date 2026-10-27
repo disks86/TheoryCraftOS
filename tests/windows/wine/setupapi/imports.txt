@@ -1,0 +1,1 @@
+advapi32 cabinet crypt32 ole32 setupapi shell32 uuid user32 wintrust

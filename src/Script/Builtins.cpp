@@ -3265,6 +3265,7 @@ bool install_builtins(Vm& vm) {
   vm.define_native(g, "__symbol_info", symbol_info, 2);
   vm.define_native(g, "__primitive_of", primitive_of_native, 1);
   vm.define_native(g, "__htmldda", mark_htmldda, 1);
+  vm.define_native(g, "__proto_of", object_get_prototype_of, 1);
   vm.define_accessor(vm.object_proto(), vm.intern("__proto__"), Value::make_object(vm.new_native(proto_getter, "get __proto__", 0)), Value::make_object(vm.new_native(proto_setter, "set __proto__", 1)), 0);
   vm.define_native(g, "__reflect_construct", reflect_construct, 3);
   vm.define_native(g, "__function_protos", function_protos, 0);
