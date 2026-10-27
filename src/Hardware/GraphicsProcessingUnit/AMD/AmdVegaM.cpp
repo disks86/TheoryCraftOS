@@ -237,9 +237,17 @@ bool AmdVegaM::bring_up(const Inputs& in) {
   if (sdma_result != AmdSdma3::Result::Ok) return fail(Step::Sdma, AmdSdma3::result_name(sdma_result));
   // The interrupt sources, at the places the driver turns them on (ring init and late_init): the graphics ring's, the compute pipe's, the SDMA engines' and the memory controller's.
   gfx_->set_interrupts(true);
+  gfx_->set_ecc_interrupts(true);   // (gfx_v8_0_late_init: priv reg, priv inst, ECC, SQ)
+  gfx_->set_sq_interrupts(true);
   compute_->set_eop_interrupt(true);
   sdma_->set_trap_interrupts(true);
   gmc_->set_fault_interrupts(true);
+  // The display engine's: page flips of every controller (dce_v11_0_pageflip_interrupt_init) and the hot plug pins (dce_v11_0_hpd_init); vertical blank only on request.
+  display_irq_ = UniquePointer<amd_dce11::Interrupts>::make(allocator, *in.registers);
+  if (!display_irq_) return fail(Step::Sdma, "out of memory");
+  for (uint32_t crtc = 0; crtc < amd_dce11::kMaxCrtcs; ++crtc) display_irq_->set_pageflip(crtc, true);
+  for (uint32_t pin = 0; pin < amd_dce11::Interrupts::kMaxHpd; ++pin)
+    if (in.hpd_pins >> pin & 1) display_irq_->hpd_init(pin);
   step_ = Step::Done;
 
   status_.assign("GART ");
@@ -251,12 +259,21 @@ bool AmdVegaM::bring_up(const Inputs& in) {
 }
 
 void AmdVegaM::shutdown() {
+  set_vblank_interrupt(false);
+  if (display_irq_) {   // (dce_v11_0_hw_fini: the hot plug pins and the page flip interrupts)
+    for (uint32_t pin = 0; pin < amd_dce11::Interrupts::kMaxHpd; ++pin)
+      if (inputs_.hpd_pins >> pin & 1) display_irq_->hpd_fini(pin);
+    for (uint32_t crtc = 0; crtc < amd_dce11::kMaxCrtcs; ++crtc) display_irq_->set_pageflip(crtc, false);
+  }
+  display_irq_ = UniquePointer<amd_dce11::Interrupts>();
   display_ = UniquePointer<amd_dce11::Display>();   // (puts the firmware's framebuffer back)
   if (up()) {   // (amdgpu_irq_put in the blocks' hw_fini, before the engines stop)
     gmc_->set_fault_interrupts(false);
     sdma_->set_trap_interrupts(false);
     compute_->set_eop_interrupt(false);
     gfx_->set_interrupts(false);
+    gfx_->set_ecc_interrupts(false);
+    gfx_->set_sq_interrupts(false);
   }
   if (sdma_) sdma_->stop();
   sdma_ = UniquePointer<AmdSdma3>();
@@ -375,6 +392,22 @@ bool AmdVegaM::engage_display(const amd_dce11::FirmwareFramebuffer& firmware, By
   return true;
 }
 
-void AmdVegaM::disengage_display() { display_ = UniquePointer<amd_dce11::Display>(); }
+void AmdVegaM::disengage_display() {
+  set_vblank_interrupt(false);
+  display_ = UniquePointer<amd_dce11::Display>();
+}
+
+bool AmdVegaM::set_vblank_interrupt(bool enable) {
+  if (!enable) {
+    if (vblank_crtc_ >= 0 && display_irq_) display_irq_->set_vblank(static_cast<uint32_t>(vblank_crtc_), false);
+    vblank_crtc_ = -1;
+    return true;
+  }
+  if (!display_irq_ || !display_ || !display_->engaged()) return false;
+  set_vblank_interrupt(false);
+  vblank_crtc_ = static_cast<int>(display_->plane().crtc());
+  display_irq_->set_vblank(static_cast<uint32_t>(vblank_crtc_), true);
+  return true;
+}
 
 }  // namespace hardware

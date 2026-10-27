@@ -886,6 +886,32 @@ static void test_interrupt_sources() {
   CHECK(rig.card.reg(0x306a) == 0x00280001);
 }
 
+// gfx_v8_0_set_cp_ecc_int_state: CP_ECC_ERROR_INT_ENABLE (0x4000) in thirteen interrupt control registers of the command processor, each read-modify-write; and the
+// SQ messages by SQ_INTERRUPT_MSG_CTRL.STALL (bit 0, clear lets them through).
+static void test_ecc_and_sq_interrupts() {
+  GfxRig rig;
+  AmdGfx8 gfx(rig.card, rig.clock);
+  CHECK(gfx.start(rig.memory()) == AmdGfx8::Result::Ok);
+  // (register, the ECC enable's bit): CP_INT_CNTL 0x3049, RING0 0x306a, RING1 0x306b, RING2 0x306c, CPC 0x30b4, ME1 pipes 0x3085..0x3088, ME2 pipes 0x3089..0x308c
+  const uint32_t regs[13] = {0x3049, 0x306a, 0x306b, 0x306c, 0x30b4, 0x3085, 0x3086, 0x3087, 0x3088, 0x3089, 0x308a, 0x308b, 0x308c};
+  constexpr uint32_t kBit = 0x00004000;   // CP_ECC_ERROR_INT_ENABLE in every one of them (checked against the header by scripts/check_irq_port.py)
+  for (uint32_t r : regs) rig.card.set_reg(r, 0x00000003);
+  const size_t before = rig.card.writes.size();
+  gfx.set_ecc_interrupts(true);
+  CHECK(rig.card.writes.size() == before + 13);
+  for (uint32_t i = 0; i < 13; ++i) CHECK(rig.card.writes[before + i].first == regs[i] && rig.card.reg(regs[i]) == (0x00000003 | kBit));
+  gfx.set_ecc_interrupts(false);
+  for (uint32_t r : regs) CHECK(rig.card.reg(r) == 0x00000003);
+  rig.card.set_reg(0x2315, 0x1);
+  gfx.set_sq_interrupts(true);
+  CHECK(rig.card.reg(0x2315) == 0x0);
+  gfx.set_sq_interrupts(false);
+  CHECK(rig.card.reg(0x2315) == 0x1);
+  rig.card.set_reg(0x2315, 0x6);
+  gfx.set_sq_interrupts(true);
+  CHECK(rig.card.reg(0x2315) == 0x6);
+}
+
 int main() {
   if (!g_files.load()) {
     printf("the firmware files are missing (run from the repository root)\n");
@@ -913,6 +939,7 @@ int main() {
   test_config_refusals();
   test_ring_wrap_and_stop();
   test_interrupt_sources();
+  test_ecc_and_sq_interrupts();
   test_end_to_end();
   printf(g_failed ? "AmdGfx8Test: %d FAILED\n" : "AmdGfx8Test: all passed\n", g_failed);
   return g_failed ? 1 : 0;

@@ -77,6 +77,7 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
     uint64_t aperture_bytes = 0;
     MmioRegion doorbells;                         // the doorbell BAR (BAR 2), at least the first 8 KiB
     uint64_t max_framebuffer_bytes = 0;           // the largest picture the display could show (0: no display part)
+    uint32_t hpd_pins = 0x3F;                     // the hot plug detect pins to watch (bit n: pin n); which pin a connector is on is in the video BIOS, so by default all of them
     bool msi = false;                             // the card's MSI is on (PciMsi): the interrupt ring is told to re-arm it as the driver does (adev->irq.msi_enabled)
     const ISystemAddresses* system_addresses = nullptr;   // for upload() and download(); null: a pointer is its own address
   };
@@ -140,6 +141,9 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
   // other events are counted. The card's interrupt line is not connected, so the caller polls this (the desktop loop does). Returns how many vectors were handled.
   uint32_t service_interrupts(uint32_t max_vectors = 64);
   const AmdIrq* irq() const { return irq_.get(); }
+  // The vertical blank interrupt of the controller that shows the OS's framebuffer (it comes every frame, so it is off until asked for): counted per controller in irq()->vblank_count().
+  // False if the display is not engaged. It is switched off again when the display is given back or the card stopped.
+  bool set_vblank_interrupt(bool enable);
 
   // For tests and diagnostics
   const AmdGmc8GartPlan& gart_plan() const { return gart_plan_; }
@@ -164,6 +168,8 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
   UniquePointer<AmdGmc8> gmc_;
   UniquePointer<AmdIh3> ih_;
   UniquePointer<AmdIrq> irq_;
+  UniquePointer<amd_dce11::Interrupts> display_irq_;
+  int vblank_crtc_ = -1;
   UniquePointer<AmdGfx8Compute> compute_;
   UniquePointer<AmdGfx8> gfx_;
   UniquePointer<AmdSdma3> sdma_;

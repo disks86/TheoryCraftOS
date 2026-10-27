@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Checks the interrupt source ids and fault registers of src/Hardware/GraphicsProcessingUnit/AMD/AmdIrq.{hpp,cpp} against the Linux driver they were taken from.
 
-  check_irq_port.py path/to/ivsrcid_vislands30.h path/to/gmc_8_1_d.h path/to/gmc_8_1_sh_mask.h path/to/gfx_v8_0.c path/to/sdma_v3_0.c path/to/gmc_v8_0.c
+  check_irq_port.py path/to/ivsrcid_vislands30.h path/to/gmc_8_1_d.h path/to/gmc_8_1_sh_mask.h path/to/gfx_v8_0.c path/to/sdma_v3_0.c path/to/gmc_v8_0.c path/to/gfx_8_0_d.h path/to/gfx_8_0_sh_mask.h path/to/dce_v11_0.c vid.h
 
-(from kernel tag v6.12, drivers/gpu/drm/amd/include/ivsrcid/, include/asic_reg/gmc/ and amdgpu/). It checks that the source ids are the ones the driver registers with
+(from kernel tag v6.12, drivers/gpu/drm/amd/include/ivsrcid/, include/asic_reg/gmc/, include/asic_reg/gca/ and amdgpu/). It checks that the source ids are the ones the driver registers with
 amdgpu_irq_add_id in the three blocks' sw_init, that the register numbers and masks are the headers', and that the ring id decoding in the handlers is the one classify() uses.
 """
 import os
@@ -27,9 +27,9 @@ def define(src, name):
 
 
 def main():
-    if len(sys.argv) != 7:
+    if len(sys.argv) != 11:
         sys.exit(__doc__)
-    ivs, gmc_d, gmc_m, gfx, sdma, gmc_c = [open(a).read() for a in sys.argv[1:]]
+    ivs, gmc_d, gmc_m, gfx, sdma, gmc_c, gfx_d, gfx_m, dce_c, vid_h = [open(a).read() for a in sys.argv[1:]]
     hpp = open(os.path.join(ROOT, 'AmdIrq.hpp')).read()
     cpp = open(os.path.join(ROOT, 'AmdIrq.cpp')).read()
 
@@ -41,6 +41,7 @@ def main():
         'kSrcCpPrivInstrFault': define(ivs, 'VISLANDS30_IV_SRCID_CP_PRIV_INSTR_FAULT'),
         'kSrcCpEccError': define(ivs, 'VISLANDS30_IV_SRCID_CP_ECC_ERROR'),
         'kSrcSdmaTrap': define(ivs, 'VISLANDS30_IV_SRCID_SDMA_TRAP'),
+        'kSrcSqInterruptMsg': define(ivs, 'VISLANDS30_IV_SRCID_SQ_INTERRUPT_MSG'),
         'kSrcSdmaSrbmWrite': define(ivs, 'VISLANDS30_IV_SRCID_SDMA_SRBM_WRITE'),
         'kSrcGfxPageInvFault': define(ivs, 'VISLANDS30_IV_SRCID_GFX_PAGE_INV_FAULT'),
         'kSrcGfxMemProtFault': define(ivs, 'VISLANDS30_IV_SRCID_GFX_MEM_PROT_FAULT'),
@@ -87,14 +88,17 @@ def main():
         if expr not in cpp:
             fail('AmdIrq.cpp lacks ' + expr)
 
+    check_sq(gfx, gfx_d, gfx_m, cpp)
+    check_display(dce_c, vid_h, hpp, cpp)
     check_enables(gfx, sdma, gmc_c)
+    check_ecc_and_sq_enables(gfx, gfx_m)
     if bad:
         sys.exit(1)
     print('AmdIrq matches the driver: %d source ids, 4 registers, %d masks, ring id decoding, the sources\' enables' % (len(want), len(masks)))
 
 
 def function_body(src, name):
-    m = re.search(r'\n(?:static )?\w[\w \*]*\b' + re.escape(name) + r'\([^{]*\{', src)
+    m = re.search(r'\n(?:static )?\w[\w \*]*\b' + re.escape(name) + r'\([^;{]*\)\s*\{', src)
     if not m:
         sys.exit('function not found: ' + name)
     depth, i = 0, m.end() - 1
@@ -103,6 +107,128 @@ def function_body(src, name):
         if depth == 0:
             return src[i:j + 1]
     sys.exit('unbalanced: ' + name)
+
+
+def check_display(dce, vid, hpp, cpp):
+    """The display interrupts: source ids and data decoding of dce_v11_0.c against AmdIrq, the acknowledgements and pin set-up against AmdDce11.cpp (whose register numbers are generated
+    from the headers), and the register block offsets of vid.h."""
+    dcpp = open(os.path.join(ROOT, 'AmdDce11.cpp')).read()
+    sw = function_body(dce, 'dce_v11_0_sw_init')
+    if 'AMDGPU_IRQ_CLIENTID_LEGACY, i + 1, &adev->crtc_irq' not in sw or 'i = VISLANDS30_IV_SRCID_D1_GRPH_PFLIP; i < 20; i += 2' not in sw or \
+            'VISLANDS30_IV_SRCID_HOTPLUG_DETECT_A, &adev->hpd_irq' not in sw:
+        fail('dce_v11_0_sw_init registers other sources')
+    ours = {m.group(1): int(m.group(2)) for m in re.finditer(r'\b(kSrc\w+) = (\d+)', hpp)}
+    if ours.get('kSrcDisplayCrtcFirst') != 1 or ours.get('kSrcPageFlipLast') != 18:
+        fail('display source id range')
+    # (the pageflip source ids start at VISLANDS30_IV_SRCID_D1_GRPH_PFLIP, the hot plug at HOTPLUG_DETECT_A: read from the ivsrcid header by the checks above for the others)
+    crtc = function_body(dce, 'dce_v11_0_crtc_irq')
+    if 'unsigned crtc = entry->src_id - 1;' not in crtc or 'case 0: /* vblank */' not in crtc or 'case 1: /* vline */' not in crtc:
+        fail('crtc interrupt decoding changed')
+    if '(entry->src_id - 8) >> 1' not in function_body(dce, 'dce_v11_0_pageflip_irq'):
+        fail('page flip controller decoding changed')
+    hpd = function_body(dce, 'dce_v11_0_hpd_irq')
+    if 'hpd = entry->src_data[0];' not in hpd or 'entry->src_data[0] >= adev->mode_info.num_hpd' not in hpd:
+        fail('hot plug pin decoding changed')
+    # hpd_init order: DC_HPD_EN, the filter delays, ack, polarity, interrupt on (amdgpu_irq_get)
+    init = function_body(dce, 'dce_v11_0_hpd_init')
+    order = [init.find(x) for x in ('DC_HPD_CONTROL, DC_HPD_EN, 1', 'DC_HPD_CONNECT_INT_DELAY', 'DC_HPD_DISCONNECT_INT_DELAY', 'dce_v11_0_hpd_int_ack', 'dce_v11_0_hpd_set_polarity', 'amdgpu_irq_get')]
+    if min(order) < 0 or order != sorted(order):
+        fail('hpd_init order changed')
+    mine = function_body(dcpp, 'hpd_init') if False else dcpp[dcpp.index('void Interrupts::hpd_init'):dcpp.index('void Interrupts::hpd_fini')]
+    order = [mine.find(x) for x in ('DC_HPD_CONTROL, DC_HPD_EN, 1', 'DC_HPD_CONNECT_INT_DELAY', 'DC_HPD_DISCONNECT_INT_DELAY', 'ack_hpd(pin)', 'hpd_set_polarity(pin)', 'hpd_set_interrupt(pin, true)')]
+    if min(order) < 0 or order != sorted(order):
+        fail('Interrupts::hpd_init order differs from the driver')
+    if 'connected ? 0 : 1' not in dcpp or 'DC_HPD_INT_POLARITY, 0);' not in function_body(dce, 'dce_v11_0_hpd_set_polarity'):
+        fail('polarity')
+    for name, delay in (('AMDGPU_HPD_CONNECT_INT_DELAY_IN_MS', 50), ('AMDGPU_HPD_DISCONNECT_INT_DELAY_IN_MS', 10)):
+        pass
+    if 'kHpdConnectDelayMs = 50, kHpdDisconnectDelayMs = 10' not in open(os.path.join(ROOT, 'AmdDce11.hpp')).read():
+        fail('hpd filter delays')
+    # the offsets of vid.h
+    for i, off in enumerate(('0x1898', '0x18a0', '0x18a8', '0x18b0', '0x18b8', '0x18c0')):
+        if not re.search(r'HPD%d_REGISTER_OFFSET\s+\(%s - 0x1898\)' % (i, off), vid) or ('%s - 0x1898' % off) not in dcpp:
+            fail('HPD%d offset' % i)
+    for i, off in enumerate(('0x1b9c', '0x1d9c', '0x1f9c', '0x419c', '0x439c', '0x459c')):
+        if not re.search(r'CRTC%d_REGISTER_OFFSET\s+\(%s - 0x1b9c\)' % (i, off), vid) or ('%s - 0x1b9c' % off) not in dcpp:
+            fail('CRTC%d offset' % i)
+    # the status table of the driver and ours name the same registers and bits
+    table = re.findall(r'\.reg = (mm\w+),\s*\.vblank = (\w+),\s*\.vline = (\w+),\s*\.hpd = (\w+)', dce)
+    mine = re.findall(r'\{(mmDISP\w+), (\w+),\s*(\w+),\s*(\w+)\}', dcpp)
+    if table != mine or len(table) != 6:
+        fail('interrupt_status_offsets differs (%d vs %d rows)' % (len(table), len(mine)))
+    # the acknowledgements
+    for fn, field in (('dce_v11_0_hpd_int_ack', 'DC_HPD_INT_ACK'), ('dce_v11_0_crtc_vblank_int_ack', 'VBLANK_ACK'), ('dce_v11_0_crtc_vline_int_ack', 'VLINE_ACK')):
+        if field + ', 1' not in function_body(dce, fn) or field + ', 1' not in dcpp:
+            fail(fn)
+    if 'GRPH_INTERRUPT_STATUS__GRPH_PFLIP_INT_CLEAR_MASK' not in function_body(dce, 'dce_v11_0_pageflip_irq') or 'GRPH_PFLIP_INT_CLEAR_MASK' not in dcpp:
+        fail('page flip acknowledgement')
+    for fn, field in (('dce_v11_0_set_pageflip_irq_state', 'GRPH_PFLIP_INT_MASK_MASK'), ('dce_v11_0_set_crtc_vblank_interrupt_state', 'VBLANK_INTERRUPT_MASK'),
+                      ('dce_v11_0_set_hpd_irq_state', 'DC_HPD_INT_EN')):
+        if field not in function_body(dce, fn) or field not in dcpp:
+            fail(fn)
+
+
+def check_sq(gfx, gfx_d, gfx_m, cpp):
+    """The SQ message decoding of AmdIrq.cpp against gfx_v8_0_parse_sq_irq and the register headers."""
+    for name, header in (('mmGRBM_GFX_INDEX', gfx_d), ('mmSQ_EDC_INFO', gfx_d)):
+        m = re.search(name + r' = (0x[0-9a-fA-F]+)', cpp)
+        if not m or int(m.group(1), 16) != define(header, name):
+            fail(f'{name}: ours {m.group(1) if m else None}, header {define(header, name)}')
+    def shift(mask):
+        return mask.bit_length() - bin(mask).count('1') if mask else 0
+    fields = {   # constant name -> (header mask name, shift constant or None)
+        'kSqEdcSourceMask': 'SQ_EDC_INFO__SOURCE_MASK', 'kSqSeIdMask': 'SQ_INTERRUPT_WORD_CMN__SE_ID_MASK', 'kSqEncodingMask': 'SQ_INTERRUPT_WORD_CMN__ENCODING_MASK',
+        'kSqWaveShIdMask': 'SQ_INTERRUPT_WORD_WAVE__SH_ID_MASK', 'kSqWavePrivMask': 'SQ_INTERRUPT_WORD_WAVE__PRIV_MASK', 'kSqWaveVmIdMask': 'SQ_INTERRUPT_WORD_WAVE__VM_ID_MASK',
+        'kSqWaveWaveIdMask': 'SQ_INTERRUPT_WORD_WAVE__WAVE_ID_MASK', 'kSqWaveSimdIdMask': 'SQ_INTERRUPT_WORD_WAVE__SIMD_ID_MASK', 'kSqWaveCuIdMask': 'SQ_INTERRUPT_WORD_WAVE__CU_ID_MASK',
+    }
+    for k, h in fields.items():
+        m = re.search(r'\b' + k + r' = (0x[0-9a-fA-F]+)', cpp)
+        if not m or int(m.group(1), 16) != define(gfx_m, h):
+            fail(f'{k}: ours {m.group(1) if m else None}, header {define(gfx_m, h)}')
+        if k == 'kSqWavePrivMask':
+            continue   # (a flag: no shift)
+        sm = re.search(r'\b' + k.replace('Mask', 'Shift') + r' = (0x[0-9a-fA-F]+|\d+)', cpp)
+        if not sm or int(sm.group(1), 0) != shift(define(gfx_m, h)):
+            fail(f'{k.replace("Mask", "Shift")}: ours {sm.group(1) if sm else None}, from the mask {shift(define(gfx_m, h))}')
+    auto = 0
+    for f in ('THREAD_TRACE', 'WLT', 'THREAD_TRACE_BUF_FULL', 'REG_TIMESTAMP', 'CMD_TIMESTAMP', 'HOST_CMD_OVERFLOW', 'HOST_REG_OVERFLOW', 'IMMED_OVERFLOW'):
+        auto |= define(gfx_m, 'SQ_INTERRUPT_WORD_AUTO__%s_MASK' % f)
+    m = re.search(r'kSqAutoFlagsMask = (0x[0-9a-fA-F]+)', cpp)
+    if not m or int(m.group(1), 16) != auto:
+        fail('kSqAutoFlagsMask is not the union of the SQ_INTERRUPT_WORD_AUTO flags')
+    for idx, bit in (('INSTANCE_INDEX', 'kGrbmInstanceIndexShift'), ('SH_INDEX', 'kGrbmShIndexShift'), ('SE_INDEX', 'kGrbmSeIndexShift')):
+        m = re.search(bit + r' = (0x[0-9a-fA-F]+)', cpp)
+        if not m or int(m.group(1), 16) != shift(define(gfx_m, 'GRBM_GFX_INDEX__%s_MASK' % idx)):
+            fail(bit)
+    broadcast = sum(define(gfx_m, 'GRBM_GFX_INDEX__%s_BROADCAST_WRITES_MASK' % b) for b in ('SH', 'INSTANCE', 'SE'))
+    if '0x20000000 | 0x40000000 | 0x80000000' not in cpp or broadcast != 0xE0000000:
+        fail('GRBM_GFX_INDEX broadcast bits')
+    # the driver's order: select, read SQ_EDC_INFO, select everything again; the cu id is the instance
+    body = function_body(gfx, 'gfx_v8_0_parse_sq_irq')
+    if 'gfx_v8_0_select_se_sh(adev, se_id, sh_id, cu_id, 0)' not in body or 'RREG32(mmSQ_EDC_INFO)' not in body or '0xffffffff, 0xffffffff, 0xffffffff' not in body:
+        fail('gfx_v8_0_parse_sq_irq no longer reads SQ_EDC_INFO that way')
+    names = re.findall(r'"SQ_EDC_INFO_SOURCE_(\w+):', gfx)
+    if names != ['INVALID', 'INST', 'SGPR', 'VGPR', 'LDS', 'GDS', 'TA']:
+        fail('sq_edc_source_names changed: %s' % names)
+
+
+def check_ecc_and_sq_enables(gfx, gfx_m):
+    ours = open(os.path.join(ROOT, 'AmdGfx8.cpp')).read()
+    body = function_body(gfx, 'gfx_v8_0_set_cp_ecc_int_state')
+    regs = re.findall(r'WREG32_FIELD\((\w+), CP_ECC_ERROR_INT_ENABLE', body)
+    if len(regs) != 13:
+        fail('gfx_v8_0_set_cp_ecc_int_state: %d registers' % len(regs))
+    for r in regs:
+        mask = '%s__CP_ECC_ERROR_INT_ENABLE_MASK' % r
+        define(gfx_m, mask)   # exists
+        if 'mm%s,' % r not in ours or mask not in ours:
+            fail('AmdGfx8.cpp lacks ' + r)
+    masks = {define(gfx_m, '%s__CP_ECC_ERROR_INT_ENABLE_MASK' % r) for r in regs}
+    if masks != {0x4000}:
+        fail('the ECC enable bit differs between registers (the test assumes 0x4000)')
+    sq = function_body(gfx, 'gfx_v8_0_set_sq_int_state')
+    if 'WREG32_FIELD(SQ_INTERRUPT_MSG_CTRL, STALL' not in sq or 'AMDGPU_IRQ_STATE_ENABLE:\n\t\tenable_flag = 0' not in sq or 'SQ_INTERRUPT_MSG_CTRL__STALL_MASK' not in ours:
+        fail('SQ message stall')
 
 
 def check_enables(gfx, sdma, gmc_c):
