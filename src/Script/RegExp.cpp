@@ -36,9 +36,42 @@ struct Compiled {
   regex::Regex regex;
   String source, flags;
   bool global = false, sticky = false;
+  bool code_units = false;   // no u / v flag: a character outside the BMP is two characters (surrogates) to the pattern and the matcher
 };
 
 Compiled* compiled_of(const Value& v) { return v.is_object() && v.as_object()->okind == ObjKind::RegExp ? static_cast<Compiled*>(v.as_object()->host_data) : nullptr; }
+
+// Without the u flag a character outside the BMP is two code units. The matcher reads UTF-8 one character at a time, so for such a pattern or subject the astral
+// characters are written as their two surrogates (3 bytes each, which the matcher reads as two characters), and the positions of a match are mapped back.
+bool has_astral(StringView s) {
+  for (uint64_t i = 0; i < s.size(); ++i) {
+    const uint8_t b = static_cast<uint8_t>(s[i]);
+    if (b >= 0xF0 && b < 0xF8) return true;
+  }
+  return false;
+}
+
+void append_surrogate(String* out, uint32_t u) {
+  out->push_back(static_cast<char>(0xE0 | (u >> 12)));
+  out->push_back(static_cast<char>(0x80 | ((u >> 6) & 0x3F)));
+  out->push_back(static_cast<char>(0x80 | (u & 0x3F)));
+}
+
+// `where` (when given) gets the offset of each astral character in `s`.
+void split_astral(StringView s, String* out, List<uint64_t>* where) {
+  for (uint64_t i = 0; i < s.size(); ++i) {
+    const uint8_t b = static_cast<uint8_t>(s[i]);
+    if (b >= 0xF0 && b < 0xF8 && i + 3 < s.size() && (static_cast<uint8_t>(s[i + 1]) & 0xC0) == 0x80 && (static_cast<uint8_t>(s[i + 2]) & 0xC0) == 0x80 && (static_cast<uint8_t>(s[i + 3]) & 0xC0) == 0x80) {
+      const uint32_t cp = ((b & 0x07u) << 18) | ((static_cast<uint8_t>(s[i + 1]) & 0x3Fu) << 12) | ((static_cast<uint8_t>(s[i + 2]) & 0x3Fu) << 6) | (static_cast<uint8_t>(s[i + 3]) & 0x3Fu);
+      if (where) where->push_back(i);
+      append_surrogate(out, 0xD800 + ((cp - 0x10000) >> 10));
+      append_surrogate(out, 0xDC00 + ((cp - 0x10000) & 0x3FF));
+      i += 3;
+    } else {
+      out->push_back(static_cast<char>(b));
+    }
+  }
+}
 
 bool valid_flags(StringView flags) {
   bool seen[128] = {};
@@ -97,7 +130,14 @@ bool make_regexp(Vm& vm, StringView source, StringView flags, Value* out) {
       default: break;
     }
   }
-  const regex::Error error = c->regex.compile(source, f);
+  c->code_units = !flags.contains('u') && !flags.contains('v');
+  String split_source(vm.allocator());
+  StringView compiled_source = source;
+  if (c->code_units && has_astral(source)) {   // /😀+/ repeats the last surrogate: the pattern is read as code units too
+    split_astral(source, &split_source, nullptr);
+    compiled_source = split_source.view();
+  }
+  const regex::Error error = c->regex.compile(compiled_source, f);
   if (error != regex::Error::None) {
     String message(vm.allocator());
     message.append("Invalid regular expression: /");
@@ -149,6 +189,40 @@ bool limit_error(Vm& vm) { return vm.throw_error(ErrorKind::RangeError, "Regular
 bool search_from(Vm& vm, Compiled* c, StringView s, uint64_t from, bool prefix_only, regex::Match* m, bool* found) {
   *found = false;
   if (from > s.size()) return true;
+  if (c->code_units && has_astral(s)) {   // match against the surrogate form of the subject, then map the positions back (a boundary inside a pair rounds to the character)
+    String t(vm.allocator());
+    List<uint64_t> astral(vm.allocator());
+    split_astral(s, &t, &astral);
+    uint64_t t_from = from;
+    for (uint64_t i = 0; i < astral.count(); ++i)
+      if (astral[i] < from) t_from += 2;
+    const regex::Result r = prefix_only ? c->regex.match_prefix(t.view(), m, t_from) : c->regex.search(t.view(), m, t_from);
+    if (r == regex::Result::NoMatch) return true;
+    if (r != regex::Result::Matched) return limit_error(vm);
+    auto back = [&](uint64_t at, bool end_side) -> uint64_t {
+      uint64_t shift = 0;
+      for (uint64_t i = 0; i < astral.count(); ++i) {
+        const uint64_t start = astral[i] + 2 * i;   // where this character begins in the surrogate form
+        if (at >= start + 6) {
+          shift += 2;
+        } else if (at > start) {
+          return end_side ? astral[i] + 4 : astral[i];
+        } else {
+          break;
+        }
+      }
+      return at - shift;
+    };
+    for (uint32_t g = 0; g < m->count; ++g) {
+      if (!m->has(g)) continue;
+      const bool empty = m->begins[g] == m->ends[g];
+      const uint64_t b = back(m->begins[g], false);
+      m->ends[g] = empty ? b : back(m->ends[g], true);
+      m->begins[g] = b;
+    }
+    *found = true;
+    return true;
+  }
   const regex::Result r = prefix_only ? c->regex.match_prefix(s, m, from) : c->regex.search(s, m, from);
   if (r == regex::Result::Matched) {
     *found = true;
