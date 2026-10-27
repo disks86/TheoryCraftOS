@@ -394,7 +394,33 @@ AmdVegaM::Recovery AmdVegaM::recover() {
     r.sdma = true;
     if (sdma_->recover() != AmdSdma3::Result::Ok) r.failed = true;
   }
+  // The soft reset did not bring an engine back: the whole card, if that was allowed.
+  if (r.failed && inputs_.allow_asic_reset && inputs_.pci && asic_resets_ < kMaxAsicResets) {
+    r.card_reset = true;
+    r.failed = !reset_card();
+  }
   return r;
+}
+
+bool AmdVegaM::reset_card() {
+  if (!inputs_.pci || !inputs_.registers || !inputs_.clock || !inputs_.allocator) return false;
+  ++asic_resets_;
+  const Inputs in = inputs_;
+  shutdown();   // (what can still be stopped is; the display gets the firmware's framebuffer back)
+  const AmdAsicReset::Result reset = AmdAsicReset::pci_config_reset(*in.registers, *in.clock, *in.pci, in.pci_address);
+  if (reset != AmdAsicReset::Result::Ok) {
+    status_.assign("card reset: ");
+    status_.append(StringView(AmdAsicReset::result_name(reset)));
+    return false;
+  }
+  if (!bring_up(in)) {
+    String text(*in.allocator);
+    text.assign("after a card reset: ");
+    text.append(StringView(status_.c_str()));
+    status_.assign(text.view());
+    return false;
+  }
+  return true;
 }
 
 // The driver's handlers for the faults hand the ring to the scheduler's timeout handling (drm_sched_fault); wedging the ring is that here.

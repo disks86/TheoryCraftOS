@@ -419,9 +419,27 @@ An engine that timed out on a fence or reported a fault is wedged (nothing is qu
 
 The simulated engines hang (`hung` for the command processor, `stall` for SDMA) until the reset pulse reaches them, unless told the reset does not work; the reset also takes their interrupt enables, hardware queues and
 doorbells away, so the ordering of the steps, the exact reset bits for each status, and what is restored are checked. `scripts/check_reset_port.py` compares the status bits, reset bits, pre/soft/post order, the reset pulses,
-the queue dequeue and the SDMA sequence with the kernel sources. Not done: a full reset of the card (the driver's PCI config reset or BACO, `vi_asic_reset`, which is what it falls back to when a soft reset does not
-help, and which would also need the memory controller, the interrupt ring and the display set up again), resetting the video engines (UVD/VCE), and the replay of the work that was lost: callers see the failure of their
+the queue dequeue and the SDMA sequence with the kernel sources. Not done: resetting the video engines (UVD/VCE), and the replay of the work that was lost: callers see the failure of their
 submission and must resubmit. Whether a real CP comes back from `GRBM_SOFT_RESET` with the microcode the SMC loaded is what the driver relies on and has not been seen here.
+
+### Full reset of the card
+
+When an engine does not come back from its soft reset, `AmdVegaM::recover()` can fall back to resetting the whole card (`Inputs::allow_asic_reset`, with `Inputs::pci` and `pci_address` saying where the card is;
+`Recovery::card_reset` and `asic_resets()` say it happened, at most `kMaxAsicResets` (2) times). `AmdAsicReset::pci_config_reset` is `vi_asic_reset` -> `vi_asic_pci_config_reset`: the BIOS scratch register's
+"graphics engine hung" flag is set, bus mastering is switched off, the magic value 0x39d5e86b is written to dword 0x7c of the card's PCI configuration space (`amdgpu_device_pci_config_reset`), after 100 us the card has
+`usec_timeout` (100 ms) to answer reads of `CONFIG_MEMSIZE` again (all ones while it is in reset), bus mastering is switched back on if it did (not if it did not), and the flag is cleared either way. The VEGAM has
+no other method: the driver's BACO (power-off through the SMU) is only for Fiji, Tonga, Polaris 10, 11 and 12 and Topaz. `reset_card()` does it with the rest around it: everything is stopped (the display
+gets the firmware's framebuffer back), the card is reset, and `bring_up` is run again with the same inputs; `status()` says what failed ("card reset: ..." if the card did not answer, "after a card reset: ..." if
+the bring-up failed afterwards).
+
+**What this does not do, and what that means on a real card.** After a hardware reset the driver marks the card as needing a POST and runs the video BIOS's init tables (the memory controller's training, the
+clocks, the display PLLs) through its AtomBIOS interpreter, then initialises every block. This OS has no interpreter, so a card that has been reset comes back quiet - no engine, no DMA, bus mastering on or off as
+above - but its video memory is not trained, `bring_up` is expected to fail, and everything in video memory (including the firmware's framebuffer) is gone. The reset is therefore a last resort, off by default, and
+`main.cpp` allows it only when the card does not drive the display (a dark screen on top of a dead card is no improvement over a hung engine); the benefit is a card that is known to be quiescent instead of one that
+is hung and may still be mastering the bus. Host tests (`AmdAsicResetTest`, `AmdVegaMTest::test_card_reset`) cover the step order and timing, a slow card, a card that never answers, the fallback conditions and the
+cap, a card that is brought up again, and one that cannot be (not POSTed); the simulated card has none of the real one's behaviour here. `scripts/check_asic_reset_port.py` checks the steps, the value, the
+dword, the scratch register and flag, `CONFIG_MEMSIZE` and that the VEGAM is not a BACO chip against the kernel sources. Not done: the AtomBIOS POST (which would make the reset recoverable), the PCI-level resets
+(function level reset, secondary bus reset) the driver also has for other cases, and BACO.
 
 ## Radeon RX Vega M: UVD 6.3
 
