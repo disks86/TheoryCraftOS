@@ -237,6 +237,8 @@ bool AmdVegaM::bring_up(const Inputs& in) {
   if (sdma_result != AmdSdma3::Result::Ok) return fail(Step::Sdma, AmdSdma3::result_name(sdma_result));
   // The interrupt sources, at the places the driver turns them on (ring init and late_init): the graphics ring's, the compute pipe's, the SDMA engines' and the memory controller's.
   gfx_->set_interrupts(true);
+  gfx_->set_ecc_interrupts(true);   // (gfx_v8_0_late_init: priv reg, priv inst, ECC, SQ)
+  gfx_->set_sq_interrupts(true);
   compute_->set_eop_interrupt(true);
   sdma_->set_trap_interrupts(true);
   gmc_->set_fault_interrupts(true);
@@ -257,6 +259,8 @@ void AmdVegaM::shutdown() {
     sdma_->set_trap_interrupts(false);
     compute_->set_eop_interrupt(false);
     gfx_->set_interrupts(false);
+    gfx_->set_ecc_interrupts(false);
+    gfx_->set_sq_interrupts(false);
   }
   if (sdma_) sdma_->stop();
   sdma_ = UniquePointer<AmdSdma3>();

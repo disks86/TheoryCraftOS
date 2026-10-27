@@ -110,6 +110,12 @@ class AmdGfx8 {
   // The graphics ring's interrupt sources, as the driver turns them on with amdgpu_irq_get (gfx_v8_0_set_eop_interrupt_state for the ring's pipe, _set_priv_reg_fault_state and
   // _set_priv_inst_fault_state): the end-of-pipe (fence), privileged register and privileged instruction enables of CP_INT_CNTL_RING0. Read-modify-write.
   void set_interrupts(bool enable);
+  // gfx_v8_0_set_cp_ecc_int_state: CP_ECC_ERROR_INT_ENABLE in the thirteen command processor interrupt control registers (CP_INT_CNTL, the three CP_INT_CNTL_RINGn, CPC_INT_CNTL and
+  // the four CP_ME1_PIPEn_ and four CP_ME2_PIPEn_INT_CNTL), each read-modify-write.
+  void set_ecc_interrupts(bool enable);
+  // gfx_v8_0_set_sq_int_state: the shader sequencer's interrupt messages (instruction and EDC/ECC reports of the waves, general purpose events) are let through by clearing
+  // SQ_INTERRUPT_MSG_CTRL.STALL, held back by setting it.
+  void set_sq_interrupts(bool enable);
   // The engine reported a fault from this ring (a privileged register or instruction in a command buffer: gfx_v8_0_fault): nothing more is queued until it is started again.
   void fault() { if (running_) wedged_ = true; }
   uint32_t fence_sequence() const { return fence_sequence_; }

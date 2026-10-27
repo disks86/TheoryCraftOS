@@ -353,7 +353,13 @@ The sources are turned on at the end of `AmdVegaM::bring_up` (after the SDMA rin
 engines) and `AmdGmc8::set_fault_interrupts` (the seven `*_PROTECTION_FAULT_ENABLE_INTERRUPT` bits of `VM_CONTEXT0_CNTL` and `VM_CONTEXT1_CNTL`). `scripts/check_irq_port.py` checks the registers and fields against the
 kernel's state functions. The illegal-instruction sources have no enable in the driver (always on).
 
-Not done: the CP ECC error (`gfx_v8_0_set_cp_ecc_int_state`, 13 registers) and SQ interrupts are not enabled (source 197 is classified but a real card will not post it); the display's interrupts (vblank, page flip, hot plug) and the UVD/VCE ones are not dispatched; no ring reset or recovery after a fault (the engine has to be restarted).
+The CP ECC error (`AmdGfx8::set_ecc_interrupts`: `CP_ECC_ERROR_INT_ENABLE` in the 13 registers of `gfx_v8_0_set_cp_ecc_int_state`) and the SQ messages (`set_sq_interrupts`: `SQ_INTERRUPT_MSG_CTRL.STALL`
+cleared) are enabled after the others, in the order of `gfx_v8_0_late_init`, and put back in `gfx_v8_0_hw_fini`'s order. Source 197 is counted; source 239 (`gfx_v8_0_sq_irq`) is decoded: `AmdIrq::SqInfo` has the
+encoding (0 general purpose event with its flags, 1 a wave's instruction interrupt, 2 an EDC/ECC error in a wave), the SE, and for waves the SH, CU, SIMD, wave, VM id and privilege bit; for waves the error's source
+is read from `SQ_EDC_INFO` of that compute unit (`GRBM_GFX_INDEX` selected for it and put back to broadcast, as the driver's worker does; here it runs in the polling pass, not a work item). Like the driver, nothing
+is done about them beyond reporting: an ECC error or SQ report does not wedge a ring.
+
+Not done: the display's interrupts (vblank, page flip, hot plug) and the UVD/VCE ones are not dispatched; no ring reset or recovery after a fault (the engine has to be restarted).
 
 ### MSI: interrupts wake the CPU
 

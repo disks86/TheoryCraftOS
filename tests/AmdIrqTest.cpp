@@ -19,6 +19,7 @@
 // AmdIrq::classify against a table written from the Linux driver's handlers (gfx_v8_0_eop_irq / _fault, sdma_v3_0_process_trap_irq / _illegal_inst_irq, the gmc_v8_0 fault
 // sources), for every source id and ring id a vector can hold; AmdIrq::process with the interrupt ring itself is in AmdVegaMTest (it needs the whole card).
 #include <stdio.h>
+#include <string.h>
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdIrq.hpp"
 
 using namespace hardware;
@@ -34,6 +35,7 @@ static AmdIrq::Kind expected(uint32_t src, uint32_t ring) {
     case 184: return AmdIrq::Kind::GfxPrivilegedRegister;
     case 185: return AmdIrq::Kind::GfxPrivilegedInstruction;
     case 197: return AmdIrq::Kind::GfxEccError;
+    case 239: return AmdIrq::Kind::SqMessage;
     case 224: return ((ring & 3) < 2 && ((ring >> 2) & 3) == 0) ? AmdIrq::Kind::SdmaTrap : AmdIrq::Kind::Unknown;
     case 241:
     case 247: return (ring & 3) < 2 ? AmdIrq::Kind::SdmaIllegalInstruction : AmdIrq::Kind::Unknown;
@@ -72,6 +74,9 @@ static void test_classify_all() {
   e = AmdIrq::classify(v);
   CHECK(e.kind == AmdIrq::Kind::SdmaIllegalInstruction && e.engine == 0);
   CHECK(AmdIrq::kind_name(AmdIrq::Kind::VmFault) && AmdIrq::kind_name(AmdIrq::Kind::Unknown));
+  // Every kind has a name of its own.
+  for (uint32_t a = 0; a < AmdIrq::kKinds; ++a)
+    for (uint32_t b = a + 1; b < AmdIrq::kKinds; ++b) CHECK(strcmp(AmdIrq::kind_name(static_cast<AmdIrq::Kind>(a)), AmdIrq::kind_name(static_cast<AmdIrq::Kind>(b))) != 0);
 }
 
 int main() {

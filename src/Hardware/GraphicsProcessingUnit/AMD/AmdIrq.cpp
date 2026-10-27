@@ -19,7 +19,7 @@
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdIrq.hpp"
 
 // Follows the Linux amdgpu driver (Copyright Advanced Micro Devices, Inc.; MIT license): gfx_v8_0.c (gfx_v8_0_eop_irq, _fault, _priv_reg_irq, _priv_inst_irq), sdma_v3_0.c
-// (sdma_v3_0_process_trap_irq, _process_illegal_inst_irq), gmc_v8_0.c (gmc_v8_0_process_interrupt, _vm_decode_fault) and ivsrcid_vislands30.h. scripts/check_irq_port.py checks the
+// (sdma_v3_0_process_trap_irq, _process_illegal_inst_irq, gfx_v8_0_parse_sq_irq, _select_se_sh), gmc_v8_0.c (gmc_v8_0_process_interrupt, _vm_decode_fault) and ivsrcid_vislands30.h. scripts/check_irq_port.py checks the
 // numbers below against the kernel's headers.
 
 namespace hardware {
@@ -30,6 +30,15 @@ constexpr uint32_t mmVM_CONTEXT1_CNTL2 = 0x50d, mmVM_CONTEXT1_PROTECTION_FAULT_S
 // gmc_8_1_sh_mask.h
 constexpr uint32_t kStatusProtectionsMask = 0xff, kStatusClientIdMask = 0x1ff000, kStatusClientIdShift = 0xc, kStatusRwMask = 0x1000000, kStatusVmidMask = 0x1e000000, kStatusVmidShift = 0x19;
 constexpr uint32_t kClearProtectionFaultStatusAddrMask = 0x1;
+// gfx_8_0_d.h
+constexpr uint32_t mmGRBM_GFX_INDEX = 0xc200, mmSQ_EDC_INFO = 0x23a3;
+// gfx_8_0_sh_mask.h
+constexpr uint32_t kGrbmInstanceIndexShift = 0x0, kGrbmShIndexShift = 0x8, kGrbmSeIndexShift = 0x10, kGrbmBroadcastAll = 0x20000000 | 0x40000000 | 0x80000000;   // SH, INSTANCE, SE_BROADCAST_WRITES
+constexpr uint32_t kSqEdcSourceMask = 0x1c0, kSqEdcSourceShift = 0x6;
+constexpr uint32_t kSqSeIdMask = 0x3000000, kSqSeIdShift = 24, kSqEncodingMask = 0xc000000, kSqEncodingShift = 26;
+constexpr uint32_t kSqWaveShIdMask = 0x100, kSqWaveShIdShift = 8, kSqWavePrivMask = 0x200, kSqWaveVmIdMask = 0x3c00, kSqWaveVmIdShift = 10, kSqWaveWaveIdMask = 0x3c000, kSqWaveWaveIdShift = 14;
+constexpr uint32_t kSqWaveSimdIdMask = 0xc0000, kSqWaveSimdIdShift = 18, kSqWaveCuIdMask = 0xf00000, kSqWaveCuIdShift = 20;
+constexpr uint32_t kSqAutoFlagsMask = 0xff;   // THREAD_TRACE, WLT, THREAD_TRACE_BUF_FULL, REG_TIMESTAMP, CMD_TIMESTAMP, HOST_CMD_OVERFLOW, HOST_REG_OVERFLOW, IMMED_OVERFLOW
 }  // namespace
 
 const char* AmdIrq::kind_name(Kind kind) {
@@ -43,6 +52,8 @@ const char* AmdIrq::kind_name(Kind kind) {
     case Kind::SdmaTrap: return "SDMA trap";
     case Kind::SdmaIllegalInstruction: return "SDMA illegal instruction";
     case Kind::VmFault: return "VM fault";
+    case Kind::SqMessage: return "SQ message";
+
   }
   return "unknown";
 }
@@ -64,6 +75,7 @@ AmdIrq::Event AmdIrq::classify(const AmdIh3::Vector& vector) {
     case kSrcCpPrivRegFault: e.kind = Kind::GfxPrivilegedRegister; break;
     case kSrcCpPrivInstrFault: e.kind = Kind::GfxPrivilegedInstruction; break;
     case kSrcCpEccError: e.kind = Kind::GfxEccError; break;
+    case kSrcSqInterruptMsg: e.kind = Kind::SqMessage; break;
     case kSrcSdmaTrap:
       e.engine = sdma_engine;
       if (sdma_engine < 2 && sdma_queue == 0) e.kind = Kind::SdmaTrap;
@@ -78,6 +90,34 @@ AmdIrq::Event AmdIrq::classify(const AmdIh3::Vector& vector) {
     default: break;
   }
   return e;
+}
+
+const char* AmdIrq::sq_edc_source_name(uint32_t source) {
+  static const char* const kNames[] = {"invalid (no EDC error has occurred)", "instruction fetch", "SGPR or SQC data return", "VGPR", "LDS", "GDS", "TA"};
+  return source < sizeof(kNames) / sizeof(kNames[0]) ? kNames[source] : "invalid";
+}
+
+AmdIrq::SqInfo AmdIrq::read_sq(uint32_t word) {
+  SqInfo info;
+  info.encoding = (word & kSqEncodingMask) >> kSqEncodingShift;
+  info.se_id = (word & kSqSeIdMask) >> kSqSeIdShift;
+  if (info.encoding == 0) {
+    info.general = word & kSqAutoFlagsMask;
+    return info;
+  }
+  if (info.encoding > 2) return info;   // ("SQ invalid encoding type")
+  info.sh_id = (word & kSqWaveShIdMask) >> kSqWaveShIdShift;
+  info.cu_id = (word & kSqWaveCuIdMask) >> kSqWaveCuIdShift;
+  info.simd_id = (word & kSqWaveSimdIdMask) >> kSqWaveSimdIdShift;
+  info.wave_id = (word & kSqWaveWaveIdMask) >> kSqWaveWaveIdShift;
+  info.vm_id = (word & kSqWaveVmIdMask) >> kSqWaveVmIdShift;
+  info.priv = (word & kSqWavePrivMask) != 0;
+  // gfx_v8_0_select_se_sh(se_id, sh_id, cu_id), the read of SQ_EDC_INFO, and back to broadcasting to everything
+  registers_.write(mmGRBM_GFX_INDEX, (info.cu_id << kGrbmInstanceIndexShift) | (info.sh_id << kGrbmShIndexShift) | (info.se_id << kGrbmSeIndexShift));
+  info.edc_source = (registers_.read(mmSQ_EDC_INFO) & kSqEdcSourceMask) >> kSqEdcSourceShift;
+  info.edc_valid = true;
+  registers_.write(mmGRBM_GFX_INDEX, kGrbmBroadcastAll);
+  return info;
 }
 
 AmdIrq::VmFaultInfo AmdIrq::read_vm_fault() {
@@ -107,6 +147,7 @@ uint32_t AmdIrq::process(AmdIh3& ih, ISink* sink, uint32_t max_vectors) {
       if (!event.vm.valid) continue;   // (gmc_v8_0_process_interrupt returns without a report)
       last_vm_fault_ = event.vm;
     }
+    if (event.kind == Kind::SqMessage) last_sq_ = event.sq = read_sq(vectors[i].src_data);
     ++total_;
     ++counts_[static_cast<uint32_t>(event.kind)];
     if (event.kind == Kind::Unknown && vectors[i].src_id < 256) ++unknown_[vectors[i].src_id];

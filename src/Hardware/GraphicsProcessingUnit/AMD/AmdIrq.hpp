@@ -27,6 +27,7 @@ namespace hardware {
 // What the interrupt vectors of a Radeon RX Vega M mean: the dispatch half of the Linux amdgpu driver's amdgpu_irq_dispatch for the VI generation. The driver registers a handler
 // per source id (amdgpu_irq_add_id) in each block's sw_init, and the handler decodes the vector's ring id; this does the same for the sources of the blocks AmdVegaM brings up:
 //   gfx_v8_0   181 end of pipe (a fence), 184 privileged register, 185 privileged instruction, 197 ECC error   (ring id: bits 3:2 ME, 1:0 pipe, 6:4 queue)
+//              239 SQ message (the shader sequencer: general events, and the instruction or EDC/ECC reports of a wave; the vector's data is the SQ_INTERRUPT_WORD)
 //   sdma_v3_0  224 trap (a fence), 241 and 247 illegal instruction                                            (ring id: bits 1:0 engine, 3:2 queue)
 //   gmc_v8_0   146 page fault, 147 memory protection fault: the fault's address and status are read from the memory controller and the registers cleared
 // Anything else is counted and left. The driver's handlers hand fences to the scheduler and faults to its timeout handling; here a fence is an event for the sink (the engines'
@@ -44,12 +45,13 @@ class AmdIrq {
     SdmaTrap,                   // sdma_v3_0_process_trap_irq
     SdmaIllegalInstruction,     // sdma_v3_0_process_illegal_inst_irq
     VmFault,                    // gmc_v8_0_process_interrupt
+    SqMessage,                  // gfx_v8_0_sq_irq
   };
-  static constexpr uint32_t kKinds = 9;
+  static constexpr uint32_t kKinds = 10;
   static const char* kind_name(Kind kind);
 
   // The source ids (ivsrcid_vislands30.h; the SDMA illegal instruction has a bare 241 in sdma_v3_0_sw_init).
-  static constexpr uint32_t kSrcCpEndOfPipe = 181, kSrcCpPrivRegFault = 184, kSrcCpPrivInstrFault = 185, kSrcCpEccError = 197;
+  static constexpr uint32_t kSrcCpEndOfPipe = 181, kSrcCpPrivRegFault = 184, kSrcCpPrivInstrFault = 185, kSrcCpEccError = 197, kSrcSqInterruptMsg = 239;
   static constexpr uint32_t kSrcSdmaTrap = 224, kSrcSdmaIllegalInstruction = 241, kSrcSdmaSrbmWrite = 247;
   static constexpr uint32_t kSrcGfxPageInvFault = 146, kSrcGfxMemProtFault = 147;
 
@@ -62,12 +64,25 @@ class AmdIrq {
     uint32_t vmid = 0, protections = 0, client_id = 0;
     bool write = false;
   };
+  // gfx_v8_0_parse_sq_irq: the SQ_INTERRUPT_WORD of a vector's data. Encoding 0 is a general purpose event (`general` holds the flags of SQ_INTERRUPT_WORD_AUTO), 1 an
+  // instruction interrupt of a wave and 2 an EDC/ECC error in one; for those the wave's place is decoded and, as the driver's worker does, the error's source is read from
+  // SQ_EDC_INFO of that compute unit (edc_valid; the index into sq_edc_source_name).
+  struct SqInfo {
+    uint32_t encoding = 0, se_id = 0;
+    uint32_t general = 0;
+    uint32_t sh_id = 0, cu_id = 0, simd_id = 0, wave_id = 0, vm_id = 0;
+    bool priv = false;
+    bool edc_valid = false;
+    uint32_t edc_source = 0;
+  };
+  static const char* sq_edc_source_name(uint32_t source);   // the driver's sq_edc_source_names, shortened; "invalid" past the table
   struct Event {
     Kind kind = Kind::Unknown;
     uint32_t me = 0, pipe = 0, queue = 0;   // the CP's: ring id decoded for the gfx_v8_0 sources
     uint32_t engine = 0;                    // the SDMA engine (0, 1) for the sdma_v3_0 sources
     AmdIh3::Vector vector;
     VmFaultInfo vm;                         // for VmFault
+    SqInfo sq;                              // for SqMessage
   };
   // The vector's source and ring id; no registers are read.
   static Event classify(const AmdIh3::Vector& vector);
@@ -92,15 +107,18 @@ class AmdIrq {
   uint32_t total() const { return total_; }
   uint32_t unknown_source(uint32_t src_id) const { return src_id < 256 ? unknown_[src_id] : 0; }
   const VmFaultInfo& last_vm_fault() const { return last_vm_fault_; }
+  const SqInfo& last_sq() const { return last_sq_; }
 
  private:
   VmFaultInfo read_vm_fault();
+  SqInfo read_sq(uint32_t word);
 
   IVcnRegisters& registers_;
   uint32_t counts_[kKinds] = {};
   uint32_t unknown_[256] = {};
   uint32_t total_ = 0;
   VmFaultInfo last_vm_fault_;
+  SqInfo last_sq_;
 };
 
 }  // namespace hardware

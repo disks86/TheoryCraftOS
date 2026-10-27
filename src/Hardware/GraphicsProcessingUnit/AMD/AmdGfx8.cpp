@@ -165,6 +165,34 @@ void AmdGfx8::set_interrupts(bool enable) {
   wr(mmCP_INT_CNTL_RING0, enable ? (tmp | bits) : (tmp & ~bits));
 }
 
+void AmdGfx8::set_ecc_interrupts(bool enable) {
+  struct Control { uint32_t reg, mask; };
+  static const Control kControls[] = {
+      {mmCP_INT_CNTL, CP_INT_CNTL__CP_ECC_ERROR_INT_ENABLE_MASK},
+      {mmCP_INT_CNTL_RING0, CP_INT_CNTL_RING0__CP_ECC_ERROR_INT_ENABLE_MASK},
+      {mmCP_INT_CNTL_RING1, CP_INT_CNTL_RING1__CP_ECC_ERROR_INT_ENABLE_MASK},
+      {mmCP_INT_CNTL_RING2, CP_INT_CNTL_RING2__CP_ECC_ERROR_INT_ENABLE_MASK},
+      {mmCPC_INT_CNTL, CPC_INT_CNTL__CP_ECC_ERROR_INT_ENABLE_MASK},
+      {mmCP_ME1_PIPE0_INT_CNTL, CP_ME1_PIPE0_INT_CNTL__CP_ECC_ERROR_INT_ENABLE_MASK},
+      {mmCP_ME1_PIPE1_INT_CNTL, CP_ME1_PIPE1_INT_CNTL__CP_ECC_ERROR_INT_ENABLE_MASK},
+      {mmCP_ME1_PIPE2_INT_CNTL, CP_ME1_PIPE2_INT_CNTL__CP_ECC_ERROR_INT_ENABLE_MASK},
+      {mmCP_ME1_PIPE3_INT_CNTL, CP_ME1_PIPE3_INT_CNTL__CP_ECC_ERROR_INT_ENABLE_MASK},
+      {mmCP_ME2_PIPE0_INT_CNTL, CP_ME2_PIPE0_INT_CNTL__CP_ECC_ERROR_INT_ENABLE_MASK},
+      {mmCP_ME2_PIPE1_INT_CNTL, CP_ME2_PIPE1_INT_CNTL__CP_ECC_ERROR_INT_ENABLE_MASK},
+      {mmCP_ME2_PIPE2_INT_CNTL, CP_ME2_PIPE2_INT_CNTL__CP_ECC_ERROR_INT_ENABLE_MASK},
+      {mmCP_ME2_PIPE3_INT_CNTL, CP_ME2_PIPE3_INT_CNTL__CP_ECC_ERROR_INT_ENABLE_MASK},
+  };
+  for (const Control& c : kControls) {
+    const uint32_t tmp = rd(c.reg);
+    wr(c.reg, enable ? (tmp | c.mask) : (tmp & ~c.mask));
+  }
+}
+
+void AmdGfx8::set_sq_interrupts(bool enable) {
+  const uint32_t tmp = rd(mmSQ_INTERRUPT_MSG_CTRL);
+  wr(mmSQ_INTERRUPT_MSG_CTRL, enable ? (tmp & ~SQ_INTERRUPT_MSG_CTRL__STALL_MASK) : (tmp | SQ_INTERRUPT_MSG_CTRL__STALL_MASK));
+}
+
 void AmdGfx8::gui_idle_interrupt(bool enable) {
   uint32_t tmp = rd(mmCP_INT_CNTL_RING0);
   const uint32_t bits = CP_INT_CNTL_RING0__CNTX_BUSY_INT_ENABLE_MASK | CP_INT_CNTL_RING0__CNTX_EMPTY_INT_ENABLE_MASK | CP_INT_CNTL_RING0__CMP_BUSY_INT_ENABLE_MASK |

@@ -186,6 +186,7 @@ static void test_plan() {
 
 static void test_bring_up() {
   Rig rig;
+  rig.card.gfx.set_reg(0x2315, 1);   // SQ_INTERRUPT_MSG_CTRL.STALL: the messages are held back until the driver lets them through
   AmdVegaM vega(rig.alloc);
   const bool up = vega.bring_up(rig.inputs());
   if (!up) printf("  %s (step %s)\n", vega.status(), AmdVegaM::step_name(vega.step()));
@@ -220,6 +221,7 @@ static void test_bring_up() {
   // and the memory controller's seven fault enables in both contexts. Each is the last write to its register, after the engine came up.
   constexpr uint32_t kCpIntBits = 0x04000000 | 0x00800000 | 0x00400000;
   CHECK((rig.card.gfx.reg(0x306a) & kCpIntBits) == kCpIntBits && (rig.card.gfx.reg(0x3085) & 0x04000000) && !(rig.card.gfx.reg(0x3086) & 0x04000000));
+  CHECK((rig.card.gfx.reg(0x3049) & 0x4000) && (rig.card.gfx.reg(0x308c) & 0x4000) && (rig.card.gfx.reg(0x2315) & 1) == 0);   // ECC errors on, SQ messages let through
   CHECK((rig.card.sdma.reg(0x3404) & 1) && (rig.card.sdma.reg(0x3604) & 1) && rig.card.sdma.writes.back().first == 0x3604 && rig.card.sdma.writes.back().second == rig.card.sdma.reg(0x3604));
   CHECK((rig.card.gmc.reg(0x504) & 0x249248) == 0x249248 && (rig.card.gmc.reg(0x505) & 0x249248) == 0x249248);
   // The burst NOP follows the firmware's feature version (31 for the first engine's file, 0 for the second's): the padding after the ring test packet.
@@ -250,6 +252,7 @@ static void test_bring_up() {
   // Shutting down stops it all in reverse: SDMA halted, compute queues unmapped and the engines halted, the interrupt ring off, the GART off.
   vega.shutdown();
   CHECK(!vega.up() && rig.card.sdma.reg(0x3412) == 1 && rig.card.sdma.reg(0x3612) == 1);
+  CHECK(!(rig.card.gfx.reg(0x3049) & 0x4000) && !(rig.card.gfx.reg(0x308c) & 0x4000) && (rig.card.gfx.reg(0x2315) & 1));
   CHECK(!(rig.card.gfx.reg(0x306a) & kCpIntBits) && !(rig.card.gfx.reg(0x3085) & 0x04000000) && !(rig.card.sdma.reg(0x3404) & 1) && !(rig.card.sdma.reg(0x3604) & 1));
   CHECK(rig.card.gfx.unmapped_doorbells.size() == 8 && (rig.card.gfx.reg(fakegfx::kCpMeCntl) & fakegfx::kMeHalt));
   CHECK(!(rig.card.ih.reg(0xe30) & 1) && rig.card.gmc.reg(0x504) == 0 && rig.card.gmc.reg(0x505) == 0);
@@ -638,6 +641,42 @@ static void test_msi_input() {
   CHECK(diff != 0 && (diff & (diff - 1)) == 0 && (cntl[1] & diff) && other_writes[0] == other_writes[1]);
 }
 
+// SQ messages: the word in the vector's data is decoded, and for a wave's report the error source is read from SQ_EDC_INFO of that compute unit (GRBM_GFX_INDEX selected for it and
+// put back to broadcasting).
+static void test_sq_messages() {
+  Rig rig;
+  AmdVegaM vega(rig.alloc);
+  CHECK(vega.bring_up(rig.inputs()));
+  if (!vega.up()) return;
+  const AmdIrq& irq = *vega.irq();
+  // EDC/ECC error (encoding 2) of SE 1, SH 1, CU 5, SIMD 2, wave 7, VM 9, privileged; the source in SQ_EDC_INFO is VGPR (3).
+  const uint32_t wave = (2u << 26) | (1u << 24) | (5u << 20) | (2u << 18) | (7u << 14) | (9u << 10) | 0x200 | 0x100 | 0x55;
+  rig.card.gfx.set_reg(0x23a3, (3u << 6) | 0x1E01);
+  const size_t before = rig.card.gfx.writes.size();
+  rig.card.ih.post(239, wave, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && irq.count(AmdIrq::Kind::SqMessage) == 1);
+  const AmdIrq::SqInfo& q = irq.last_sq();
+  CHECK(q.encoding == 2 && q.se_id == 1 && q.sh_id == 1 && q.cu_id == 5 && q.simd_id == 2 && q.wave_id == 7 && q.vm_id == 9 && q.priv && q.edc_valid && q.edc_source == 3);
+  CHECK(AmdIrq::sq_edc_source_name(q.edc_source)[0] == 'V' && AmdIrq::sq_edc_source_name(7)[0] == 'i');
+  // GRBM_GFX_INDEX: SE 1 << 16 | SH 1 << 8 | instance (CU) 5, then everything broadcast again.
+  CHECK(rig.card.gfx.writes.size() == before + 2 && rig.card.gfx.writes[before].first == 0xc200 && rig.card.gfx.writes[before].second == 0x00010105 &&
+        rig.card.gfx.writes[before + 1].first == 0xc200 && rig.card.gfx.writes[before + 1].second == 0xE0000000u);
+  // An instruction interrupt (encoding 1) reads the same way; the source is whatever the register says.
+  rig.card.gfx.set_reg(0x23a3, 6u << 6);
+  rig.card.ih.post(239, (1u << 26) | (3u << 24) | (0xF << 20), 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && irq.last_sq().encoding == 1 && irq.last_sq().se_id == 3 && irq.last_sq().cu_id == 15 && irq.last_sq().edc_source == 6 && !irq.last_sq().priv);
+  // A general purpose event (encoding 0): the flags, no register is touched.
+  const size_t writes = rig.card.gfx.writes.size();
+  rig.card.ih.post(239, (2u << 24) | 0x8A, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && irq.last_sq().encoding == 0 && irq.last_sq().se_id == 2 && irq.last_sq().general == 0x8A && !irq.last_sq().edc_valid && rig.card.gfx.writes.size() == writes);
+  // An encoding that does not exist is counted and left alone.
+  rig.card.ih.post(239, 3u << 26, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && irq.last_sq().encoding == 3 && !irq.last_sq().edc_valid && rig.card.gfx.writes.size() == writes && irq.count(AmdIrq::Kind::SqMessage) == 4);
+  // The CP's ECC error is counted too, and wedges nothing.
+  rig.card.ih.post(197, 0, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && irq.count(AmdIrq::Kind::GfxEccError) == 1 && !vega.graphics()->wedged());
+}
+
 int main() {
   setvbuf(stdout, nullptr, _IONBF, 0);
   test_plan();
@@ -649,6 +688,7 @@ int main() {
   test_interrupts();
   test_interrupt_sink();
   test_msi_input();
+  test_sq_messages();
   printf(g_failed ? "AmdVegaMTest: %d FAILED\n" : "AmdVegaMTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }
