@@ -311,6 +311,29 @@ IB that does not end on an 8-dword boundary), so the packets' framing is checked
 the simulated ones do not model caches), has not been seen. No shaders are run (there is no compiler for the GCN4 instruction set), no draws are issued, VMIDs other than 0 and the hardware-queue
 priorities are not used, and nothing in the OS calls these yet.
 
+### Copies between system memory and video memory
+
+`AmdVegaM::upload(source, offset)` and `download(destination, offset)` copy between a buffer in system RAM and the block's framebuffer area (the part of the block meant for data; `offset` is in it). The
+system pages are mapped into the first `kTransferPages` (512, 2 MiB) pages of the GART with `kAmdGmc8PteSystemPage` (valid, system, snooped, readable, writeable, executable: what `amdgpu_ttm_gart_bind` writes
+for ordinary memory), the SDMA engine (`instance`, default 0) copies between that window and video memory with `AmdSdma3::copy`, a window at a time, and the window is unmapped again. A buffer that
+starts inside a page is handled (the page offset is added to the window address). The card is given a buffer's address as it is (the OS keeps its memory mapped at its own addresses), or whatever
+`Inputs::system_addresses` (`ISystemAddresses`) returns; addresses beyond the card's 40 bits are refused. A call returns when the copy is done; one at a time. If the engine does not finish it is wedged, the
+window stays mapped (the engine may still use the pages, so the caller must not free the buffer) and the engine is given nothing more until it is started again. A copy the engine never took is unmapped.
+
+The simulated SDMA engine walks the GART table the driver wrote (a system page is a page of the test's own memory, a video page is video memory) and faults on an invalid entry, so the table's contents and
+flags are checked, as well as the data. Nothing in the OS calls these yet, and the real engine's behaviour with snooped system pages (cache coherency, the IOMMU if one is on) has not been seen.
+
+### The OS's picture goes through SDMA
+
+When the Vega M's display is engaged, `AmdGpu` no longer draws into the uncached window of video memory (slow to write a pixel at a time and very slow to read for `copy_rect`). It draws in a back buffer
+in system memory (`amd_dce11::Presenter`, started from what the display shows) and, after each drawing call, sends the rows the dirty rectangles cover (one run, from the first dirty row to the last) to video
+memory with `INativeDisplay::upload_picture`, which `AmdVegaM` implements with `upload()`. If the engine cannot (not up, wedged, address beyond 40 bits, copy refused) the CPU copies the same rows into the
+window, so the picture is always right. Before the display goes back to the firmware's framebuffer (mode change, shutdown) the whole back buffer is presented first.
+
+The Presenter is host-tested with the real `AmdVegaM` and the simulated SDMA engine (data in video memory, one copy per present, the CPU fallback, a wedged engine, rows outside the picture, the final present
+before disengaging). `AmdGpu`'s own use of it (the back buffer swap and the flush) is not host-tested: that needs the UEFI graphics classes. Decoded video frames are not routed this way yet: the video
+player draws through the same GPU `blit`, so they take this path only as far as the player calls the GPU's drawing functions.
+
 ## Radeon RX Vega M: UVD 6.3
 
 `src/Hardware/VideoCodec/AMD/AmdUvd6.*` is the start/stop of the Unified Video Decoder 6.3, ported from amdgpu (`uvd_v6_0.c`: `mc_resume`, `start`, `stop`, the clock-gating "ungate" path; `amdgpu_uvd.c`: the memory layout

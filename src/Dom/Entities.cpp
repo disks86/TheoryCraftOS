@@ -24,39 +24,30 @@ namespace {
 
 struct Entity {
   const char* name;
-  uint16_t code_point;
+  uint32_t code_point, second;   // second: 0 when the name stands for one character
+  bool legacy;                   // also a reference without the closing ";"
 };
 
-// The named references that pages use: the Latin-1 letters and signs, Greek, punctuation, arrows, mathematics and cards.
 const Entity kEntities[] = {
-    {"quot", 34}, {"amp", 38}, {"apos", 39}, {"lt", 60}, {"gt", 62}, {"nbsp", 160}, {"iexcl", 161}, {"cent", 162}, {"pound", 163}, {"curren", 164},
-    {"yen", 165}, {"brvbar", 166}, {"sect", 167}, {"uml", 168}, {"copy", 169}, {"ordf", 170}, {"laquo", 171}, {"not", 172}, {"shy", 173}, {"reg", 174},
-    {"macr", 175}, {"deg", 176}, {"plusmn", 177}, {"sup2", 178}, {"sup3", 179}, {"acute", 180}, {"micro", 181}, {"para", 182}, {"middot", 183},
-    {"cedil", 184}, {"sup1", 185}, {"ordm", 186}, {"raquo", 187}, {"frac14", 188}, {"frac12", 189}, {"frac34", 190}, {"iquest", 191},
-    {"Agrave", 192}, {"Aacute", 193}, {"Acirc", 194}, {"Atilde", 195}, {"Auml", 196}, {"Aring", 197}, {"AElig", 198}, {"Ccedil", 199}, {"Egrave", 200},
-    {"Eacute", 201}, {"Ecirc", 202}, {"Euml", 203}, {"Igrave", 204}, {"Iacute", 205}, {"Icirc", 206}, {"Iuml", 207}, {"ETH", 208}, {"Ntilde", 209},
-    {"Ograve", 210}, {"Oacute", 211}, {"Ocirc", 212}, {"Otilde", 213}, {"Ouml", 214}, {"times", 215}, {"Oslash", 216}, {"Ugrave", 217}, {"Uacute", 218},
-    {"Ucirc", 219}, {"Uuml", 220}, {"Yacute", 221}, {"THORN", 222}, {"szlig", 223}, {"agrave", 224}, {"aacute", 225}, {"acirc", 226}, {"atilde", 227},
-    {"auml", 228}, {"aring", 229}, {"aelig", 230}, {"ccedil", 231}, {"egrave", 232}, {"eacute", 233}, {"ecirc", 234}, {"euml", 235}, {"igrave", 236},
-    {"iacute", 237}, {"icirc", 238}, {"iuml", 239}, {"eth", 240}, {"ntilde", 241}, {"ograve", 242}, {"oacute", 243}, {"ocirc", 244}, {"otilde", 245},
-    {"ouml", 246}, {"divide", 247}, {"oslash", 248}, {"ugrave", 249}, {"uacute", 250}, {"ucirc", 251}, {"uuml", 252}, {"yacute", 253}, {"thorn", 254},
-    {"yuml", 255}, {"OElig", 338}, {"oelig", 339}, {"Scaron", 352}, {"scaron", 353}, {"Yuml", 376}, {"fnof", 402}, {"circ", 710}, {"tilde", 732},
-    {"Alpha", 913}, {"Beta", 914}, {"Gamma", 915}, {"Delta", 916}, {"Epsilon", 917}, {"Zeta", 918}, {"Eta", 919}, {"Theta", 920}, {"Iota", 921},
-    {"Kappa", 922}, {"Lambda", 923}, {"Mu", 924}, {"Nu", 925}, {"Xi", 926}, {"Omicron", 927}, {"Pi", 928}, {"Rho", 929}, {"Sigma", 931}, {"Tau", 932},
-    {"Upsilon", 933}, {"Phi", 934}, {"Chi", 935}, {"Psi", 936}, {"Omega", 937}, {"alpha", 945}, {"beta", 946}, {"gamma", 947}, {"delta", 948},
-    {"epsilon", 949}, {"zeta", 950}, {"eta", 951}, {"theta", 952}, {"iota", 953}, {"kappa", 954}, {"lambda", 955}, {"mu", 956}, {"nu", 957}, {"xi", 958},
-    {"omicron", 959}, {"pi", 960}, {"rho", 961}, {"sigmaf", 962}, {"sigma", 963}, {"tau", 964}, {"upsilon", 965}, {"phi", 966}, {"chi", 967}, {"psi", 968},
-    {"omega", 969}, {"ensp", 8194}, {"emsp", 8195}, {"thinsp", 8201}, {"zwnj", 8204}, {"zwj", 8205}, {"lrm", 8206}, {"rlm", 8207}, {"ndash", 8211},
-    {"mdash", 8212}, {"lsquo", 8216}, {"rsquo", 8217}, {"sbquo", 8218}, {"ldquo", 8220}, {"rdquo", 8221}, {"bdquo", 8222}, {"dagger", 8224},
-    {"Dagger", 8225}, {"bull", 8226}, {"hellip", 8230}, {"permil", 8240}, {"prime", 8242}, {"Prime", 8243}, {"lsaquo", 8249}, {"rsaquo", 8250},
-    {"oline", 8254}, {"euro", 8364}, {"trade", 8482}, {"larr", 8592}, {"uarr", 8593}, {"rarr", 8594}, {"darr", 8595}, {"harr", 8596}, {"lArr", 8656},
-    {"rArr", 8658}, {"hArr", 8660}, {"forall", 8704}, {"part", 8706}, {"exist", 8707}, {"empty", 8709}, {"nabla", 8711}, {"isin", 8712}, {"notin", 8713},
-    {"ni", 8715}, {"prod", 8719}, {"sum", 8721}, {"minus", 8722}, {"lowast", 8727}, {"radic", 8730}, {"prop", 8733}, {"infin", 8734}, {"ang", 8736},
-    {"and", 8743}, {"or", 8744}, {"cap", 8745}, {"cup", 8746}, {"int", 8747}, {"there4", 8756}, {"sim", 8764}, {"cong", 8773}, {"asymp", 8776},
-    {"ne", 8800}, {"equiv", 8801}, {"le", 8804}, {"ge", 8805}, {"sub", 8834}, {"sup", 8835}, {"nsub", 8836}, {"sube", 8838}, {"supe", 8839},
-    {"oplus", 8853}, {"otimes", 8855}, {"perp", 8869}, {"sdot", 8901}, {"lceil", 8968}, {"rceil", 8969}, {"lfloor", 8970}, {"rfloor", 8971},
-    {"lang", 9001}, {"rang", 9002}, {"loz", 9674}, {"spades", 9824}, {"clubs", 9827}, {"hearts", 9829}, {"diams", 9830}, {"check", 10003},
+#include "Dom/EntityTable.inc"
 };
+constexpr uint64_t kLongestEntity = 31;
+
+const Entity* find_entity(StringView name) {   // binary search over the sorted table
+  uint64_t low = 0, high = sizeof(kEntities) / sizeof(kEntities[0]);
+  while (low < high) {
+    const uint64_t mid = low + (high - low) / 2;
+    const StringView n(kEntities[mid].name);
+    int order = 0;
+    const uint64_t common = n.size() < name.size() ? n.size() : name.size();
+    for (uint64_t i = 0; i < common && order == 0; ++i) order = static_cast<uint8_t>(n[i]) < static_cast<uint8_t>(name[i]) ? -1 : static_cast<uint8_t>(n[i]) > static_cast<uint8_t>(name[i]) ? 1 : 0;
+    if (order == 0) order = n.size() < name.size() ? -1 : n.size() > name.size() ? 1 : 0;
+    if (order == 0) return &kEntities[mid];
+    if (order < 0) low = mid + 1;
+    else high = mid;
+  }
+  return nullptr;
+}
 
 int hex_value(char c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1; }
 
@@ -133,24 +124,21 @@ uint64_t decode_reference(StringView s, uint64_t at, bool in_attribute, String* 
     return end - at;
   }
   const uint64_t name_start = end;
-  while (end < s.size() && ((s[end] >= 'a' && s[end] <= 'z') || (s[end] >= 'A' && s[end] <= 'Z') || (s[end] >= '0' && s[end] <= '9')) && end - name_start < 12) ++end;
+  while (end < s.size() && ((s[end] >= 'a' && s[end] <= 'z') || (s[end] >= 'A' && s[end] <= 'Z') || (s[end] >= '0' && s[end] <= '9')) && end - name_start < kLongestEntity) ++end;
   const StringView name = s.substr(name_start, end - name_start);
   const bool semicolon = end < s.size() && s[end] == ';';
-  // the longest name that matches (references without ";" are allowed for the few old ones, in text)
+  // the longest name that matches (references without ";" are allowed for the legacy ones)
   for (uint64_t length = name.size(); length > 0; --length) {
-    const StringView candidate = name.first(length);
-    for (const Entity& e : kEntities) {
-      if (!candidate.equals(e.name)) continue;
-      const bool whole = length == name.size() && semicolon;
-      if (!whole) {
-        // without a ";" only the legacy references count, and not before more name characters in an attribute
-        const bool legacy = e.code_point <= 255 || candidate.equals("amp") || candidate.equals("lt") || candidate.equals("gt") || candidate.equals("quot");
-        if (!legacy) continue;
-        if (in_attribute && (length < name.size() || (end < s.size() && s[end] == '='))) continue;
-      }
-      append_utf8(e.code_point, out);
-      return 1 + length + (whole ? 1 : 0);
+    const Entity* e = find_entity(name.first(length));
+    if (!e) continue;
+    const bool whole = length == name.size() && semicolon;
+    if (!whole) {
+      if (!e->legacy) continue;
+      if (in_attribute && (length < name.size() || (end < s.size() && s[end] == '='))) continue;
     }
+    append_utf8(e->code_point, out);
+    if (e->second) append_utf8(e->second, out);
+    return 1 + length + (whole ? 1 : 0);
   }
   out->push_back('&');
   return 1;

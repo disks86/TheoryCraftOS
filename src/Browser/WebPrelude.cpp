@@ -6372,6 +6372,44 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     if (!(name in g)) hide(g, name, f);   // (an interface the browser already has stays: the native code holds its prototype)
     return f;
   };
+  // The CSS namespace beyond escape()/supports(): the numeric factories of Typed OM (CSS.px(5) is a CSSUnitValue) and registerProperty().
+  // A registered property is recorded and validated; its syntax is not applied to computed values yet.
+  (function () {
+    if (!g.CSS) return;
+    var CSSNumericValue = klass('CSSNumericValue', null);
+    var CSSUnitValue = klass('CSSUnitValue', CSSNumericValue, function (value, unit) {
+      if (arguments.length < 2) throw new TypeError("Failed to construct 'CSSUnitValue': 2 arguments required, but only " + arguments.length + " present.");
+      value = Number(value);
+      if (!isFinite(value)) throw new TypeError("Failed to construct 'CSSUnitValue': The provided double value is non-finite.");
+      Object.defineProperty(this, '__v', { value: value, writable: true });
+      Object.defineProperty(this, '__u', { value: String(unit).toLowerCase() === 'number' || String(unit) === 'percent' ? String(unit).toLowerCase() : String(unit) });
+    });
+    defineGetter(CSSUnitValue.prototype, 'value', function () { return this.__v; }, function (v) { this.__v = Number(v); });
+    defineGetter(CSSUnitValue.prototype, 'unit', function () { return this.__u; });
+    method(CSSUnitValue.prototype, 'toString', function () { return this.__u === 'number' ? String(this.__v) : this.__u === 'percent' ? this.__v + '%' : this.__v + this.__u; });
+    method(CSSUnitValue.prototype, 'toJSON', function () { return { value: this.__v, unit: this.__u, type: {} }; });
+    var UNITS = ['number', 'percent', 'em', 'rem', 'ex', 'rex', 'cap', 'rcap', 'ch', 'rch', 'ic', 'ric', 'lh', 'rlh', 'vw', 'vh', 'vi', 'vb', 'vmin', 'vmax',
+      'svw', 'svh', 'svi', 'svb', 'svmin', 'svmax', 'lvw', 'lvh', 'lvi', 'lvb', 'lvmin', 'lvmax', 'dvw', 'dvh', 'dvi', 'dvb', 'dvmin', 'dvmax',
+      'cqw', 'cqh', 'cqi', 'cqb', 'cqmin', 'cqmax', 'cm', 'mm', 'Q', 'in', 'pt', 'pc', 'px', 'deg', 'grad', 'rad', 'turn', 's', 'ms', 'Hz', 'kHz',
+      'dpi', 'dpcm', 'dppx', 'fr', 'x'];
+    UNITS.forEach(function (u) {
+      Object.defineProperty(g.CSS, u, { value: function (v) { return new CSSUnitValue(v, u); }, writable: true, configurable: true, enumerable: true });
+    });
+    var registered = {};
+    Object.defineProperty(g.CSS, 'registerProperty', { writable: true, configurable: true, enumerable: true, value: function registerProperty(def) {
+      var fail = function (m, name) { return new DOMException("Failed to execute 'registerProperty' on 'CSS': " + m, name || 'SyntaxError'); };
+      if (arguments.length < 1 || def === null || (typeof def !== 'object' && typeof def !== 'function')) throw new TypeError("Failed to execute 'registerProperty' on 'CSS': parameter 1 is not of type 'PropertyDefinition'.");
+      var name = String(def.name);
+      if (name.length < 3 || name.slice(0, 2) !== '--') throw fail('Invalid property name.');
+      if (def.syntax === undefined) throw new TypeError("Failed to execute 'registerProperty' on 'CSS': Failed to read the 'syntax' property from 'PropertyDefinition': Required member is undefined.");
+      if (def.inherits === undefined) throw new TypeError("Failed to execute 'registerProperty' on 'CSS': Failed to read the 'inherits' property from 'PropertyDefinition': Required member is undefined.");
+      var syntax = String(def.syntax).trim();
+      if (!syntax.length) throw fail('The syntax provided is not a valid CSS syntax string.');
+      if (syntax !== '*' && def.initialValue === undefined) throw fail('An initial value must be provided if the syntax is not universal.');
+      if (Object.prototype.hasOwnProperty.call(registered, name)) throw fail('The name provided has already been registered.', 'InvalidModificationError');
+      registered[name] = { syntax: syntax, inherits: !!def.inherits, initialValue: def.initialValue === undefined ? undefined : String(def.initialValue) };
+    } });
+  })();
   var ET = g.EventTarget;
   var later = function (fn) { setTimeout(fn, 0); };
   var denied = function (what) { return new DOMException(what, 'NotAllowedError'); };
@@ -8668,7 +8706,11 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
       var s = this.__s; v = !!v;
       if (s.disabled === v) return;
       s.disabled = v;
-      if (s.owner) { if (v) s.owner.setAttribute('media', 'not all'); else s.owner.removeAttribute('media'); }
+      if (s.owner) {   // (the owner's own media is put back when the sheet is enabled again)
+        if (v) { s.savedMedia = s.owner.getAttribute('media'); s.owner.setAttribute('media', 'not all'); }
+        else if (s.savedMedia === null || s.savedMedia === undefined) s.owner.removeAttribute('media');
+        else { s.owner.setAttribute('media', s.savedMedia); s.savedMedia = undefined; }
+      }
     });
     defineGetter(CSSStyleSheet.prototype, 'ownerRule', function () { return this.__s.ownerRule; });
     method(CSSStyleSheet.prototype, 'replaceSync', function (text) {
@@ -9404,9 +9446,7 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
         var div = d.createElementNS(ns, 'div'); div.setAttribute('style', 'font-family:monospace;font-size:12px'); div.textContent = 'error at offset ' + e.position + ': ' + e.message;
         var h32 = d.createElementNS(ns, 'h3'); h32.textContent = 'Below is a rendering of the page up to the first error.';
         pe.appendChild(h3); pe.appendChild(div); pe.appendChild(h32);
-        var root = d.createElementNS(null, 'html');
-        root.appendChild(pe);
-        d.appendChild(root);
+        d.appendChild(pe);   // (the document element is the error, as in Gecko; script finds it with getElementsByTagName('parsererror'))
       }
       return d;
     };
@@ -9643,9 +9683,9 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     try { return base === undefined ? new g.URL(url) : new g.URL(url, base); } catch (e) { return null; }
   });
 
-  hide(g, '__doctype_of', function (d) {
+  hide(g, '__doctype_of', function (d, name, publicId, systemId) {
     var t = d.__doctype;
-    if (!t) { t = document.implementation.createDocumentType('html', '', ''); Object.defineProperty(d, '__doctype', { value: t }); }
+    if (!t) { t = document.implementation.createDocumentType(name === undefined ? 'html' : name, publicId || '', systemId || ''); Object.defineProperty(d, '__doctype', { value: t }); }
     return t;
   });
 
@@ -11692,6 +11732,11 @@ const char kFinishPrelude[] = R"JSPRELUDE((function (g) {
         set: function (v) { if (this === proto) throw new TypeError('Illegal invocation'); Object.defineProperty(this, n, { value: v, writable: true, enumerable: true, configurable: true }); },
         enumerable: false, configurable: true });
     });
+  });
+  ['HTMLStyleElement', 'HTMLLinkElement'].forEach(function (name) {   // `disabled` of a style or link element is the flag of its style sheet
+    if (!g[name] || !g.__sheet_of) return;
+    Object.defineProperty(g[name].prototype, 'disabled', { get: function () { var sh = g.__sheet_of(this); return sh ? sh.disabled : false; },
+      set: function (v) { var sh = g.__sheet_of(this); if (sh) sh.disabled = v; }, enumerable: true, configurable: true });
   });
 
   // the constructor property of a prototype names its interface (Image, Option and Audio share the prototype of the element interface they make)

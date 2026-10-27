@@ -253,6 +253,84 @@ static void test_bring_up() {
   CHECK(again && vega.up());
 }
 
+// System memory for the transfers: one pool, "physical" addresses from 1 GiB (the host's own addresses are beyond the card's 40 bits).
+struct Pool final : ISystemAddresses {
+  static constexpr uint64_t kBase = 1ull << 30;
+  std::vector<uint8_t> memory;
+  explicit Pool(size_t bytes) : memory(bytes) {}
+  uint64_t physical_address(const void* p) const override { return kBase + (static_cast<const uint8_t*>(p) - memory.data()); }
+};
+
+static void test_transfer() {
+  Rig rig;
+  AmdVegaM vega(rig.alloc);
+  Pool pool(10u << 20);
+  AmdVegaM::Inputs in = rig.inputs();
+  in.system_addresses = &pool;
+  CHECK(vega.bring_up(in));
+  if (!vega.up()) return;
+  const AmdVegaM::Layout& l = vega.layout();
+  uint8_t* area = rig.vram + kRegion + l.framebuffer;
+  const uint8_t* table = rig.vram + kRegion + l.gart_table;
+  rig.card.sdma.gart_start = vega.gart_plan().gart_start;
+  rig.card.sdma.gart_size = vega.gart_plan().gart_size;
+  rig.card.sdma.gart_table = table;
+  rig.card.sdma.system_host = pool.memory.data();
+  rig.card.sdma.system_base = Pool::kBase;
+  rig.card.sdma.system_bytes = pool.memory.size();
+  auto table_empty = [&]() {
+    for (uint32_t i = 0; i < AmdVegaM::kTransferPages * 8; ++i) if (table[i] != 0) return false;
+    return true;
+  };
+  auto pattern = [](const auto& v, uint32_t seed) { for (size_t i = 0; i < v.size(); ++i) v[i] = static_cast<uint8_t>((i * 7 + seed + (i >> 8)) & 0xFF); };
+  // A small buffer that starts in the middle of a page, to an offset that does not: one copy, through the GART, with the flags of a snooped system page.
+  // (carved from the pool, one after the other)
+  size_t used = 0;
+  auto carve = [&](size_t bytes) { uint8_t* p = pool.memory.data() + used; used += (bytes + 4095) / 4096 * 4096 + 4096; return p; };
+  struct Buf { uint8_t* p; size_t n; uint8_t* data() const { return p; } size_t size() const { return n; } uint8_t& operator[](size_t i) const { return p[i]; } };
+  Buf small{carve(300), 300};
+  pattern(small, 5);
+  CHECK(vega.upload(ConstByteView(small.data(), small.size()), 4097 + 5));
+  CHECK(memcmp(area + 4097 + 5, small.data(), 300) == 0 && area[4097 + 4] == 0 && area[4097 + 5 + 300] == 0);
+  CHECK(rig.card.sdma.copies == 1 && rig.card.sdma.gart_faults == 0 && rig.card.sdma.protocol_errors == 0 && table_empty());
+  CHECK((rig.card.sdma.pte_and & 0x77) == 0x77);   // valid, system, snooped, readable, writeable, executable
+  // The same back, into a buffer that is not page aligned.
+  Buf back{carve(364), 364};
+  memset(back.p, 0xEE, back.n);
+  CHECK(vega.download(ByteView(back.data() + 3, 300), 4097 + 5));
+  CHECK(memcmp(back.data() + 3, small.data(), 300) == 0 && back[2] == 0xEE && back[303] == 0xEE && table_empty());
+  // More than a window (2 MiB) at once, on the second engine: one copy a window, the data intact, the end of the area reached exactly.
+  const uint64_t big_bytes = 3ull * 1024 * 1024 + 37;
+  Buf big{carve(big_bytes + 4096), big_bytes + 4096};
+  pattern(big, 11);
+  const uint64_t offset = l.framebuffer_bytes - big_bytes;
+  const uint32_t copies_before = rig.card.sdma.copies, engine1_before = rig.card.sdma.executed[1];
+  CHECK(vega.upload(ConstByteView(big.data() + 13, big_bytes), offset, 1));
+  CHECK(memcmp(area + offset, big.data() + 13, big_bytes) == 0 && rig.card.sdma.copies == copies_before + 2 && table_empty());
+  CHECK(rig.card.sdma.copy_sizes[copies_before] == 2u * 1024 * 1024 - 13 && rig.card.sdma.copy_sizes[copies_before + 1] == big_bytes - (2u * 1024 * 1024 - 13));
+  CHECK(rig.card.sdma.executed[1] > engine1_before);
+  Buf big_back{carve(big_bytes + 8), big_bytes + 8};
+  memset(big_back.p, 0, big_back.n);
+  CHECK(vega.download(ByteView(big_back.data() + 8, big_bytes), offset, 1) && memcmp(big_back.data() + 8, big.data() + 13, big_bytes) == 0 && table_empty());
+  CHECK(rig.card.sdma.gart_faults == 0 && rig.card.sdma.protocol_errors == 0);
+  // The video memory outside the range is not touched, and what is refused changes nothing.
+  const uint32_t copies_now = rig.card.sdma.copies;
+  CHECK(!vega.upload(ConstByteView(small.data(), 0), 0) && !vega.upload(ConstByteView(small.data(), 300), l.framebuffer_bytes - 299) && !vega.upload(ConstByteView(small.data(), 300), l.framebuffer_bytes + 1) &&
+        !vega.upload(ConstByteView(small.data(), 300), ~0ull - 100) && !vega.download(ByteView(back.data(), 300), l.framebuffer_bytes - 299) && !vega.upload(ConstByteView(small.data(), 300), 0, 2));
+  CHECK(rig.card.sdma.copies == copies_now);
+  // A system address beyond the card's 40 bits.
+  CHECK(!vega.upload(ConstByteView(pool.memory.data() + (1ull << 40), 16), 0) && table_empty());
+  // An engine that does not answer: false, and the window stays mapped (the engine may still be reading the pages).
+  rig.card.sdma.stall[0] = true;
+  CHECK(!vega.upload(ConstByteView(small.data(), 300), 0, 0, 1000) && !table_empty() && vega.sdma()->wedged(0));
+  CHECK(!vega.upload(ConstByteView(back.data(), 300), 0, 0) && !table_empty());   // (a wedged engine is not given more, and the pages it may still use stay as they were)
+  CHECK(table[1] == ((Pool::kBase >> 8) & 0xFF) && table[2] == ((Pool::kBase >> 16) & 0xFF) && table[3] == (Pool::kBase >> 24) && (table[0] & 1));
+  rig.card.sdma.stall[0] = false;
+  // Not up: nothing.
+  vega.shutdown();
+  CHECK(!vega.upload(ConstByteView(small.data(), 300), 0) && !vega.download(ByteView(back.data(), 16), 0));
+}
+
 static void test_failures() {
   {
     Rig rig(false);   // no firmware files
@@ -384,12 +462,76 @@ static void test_display() {
   CHECK(up2 && !vega.engage_display(big, &memory));
 }
 
+// The card's addresses for host memory: the low 40 bits of the pointer (the host's pointers are wider than the card's address space).
+struct LowBits final : ISystemAddresses {
+  uint64_t physical_address(const void* p) const override { return reinterpret_cast<uint64_t>(p) & 0xFFFFFFFFFFull; }
+};
+
+// The OS's picture in system memory sent to the display by Presenter: through the SDMA engine, and by the CPU when the engine cannot.
+static void test_present() {
+  Rig rig;
+  AmdVegaM vega(rig.alloc);
+  LowBits low;
+  AmdVegaM::Inputs in = rig.inputs();
+  in.system_addresses = &low;
+  CHECK(vega.bring_up(in));
+  const uint32_t width = 64, height = 16, pitch = width * 4;
+  amd_dce11::FirmwareFramebuffer fw;
+  fw.physical = reinterpret_cast<uint64_t>(rig.vram);
+  fw.bytes = pitch * height;
+  fw.width = width;
+  fw.height = height;
+  fw.pitch_pixels = width;
+  for (uint32_t i = 0; i < width * height; ++i) reinterpret_cast<uint32_t*>(rig.vram)[i] = 0xFF000000u | i;
+  rig.card.dce.crtc(1, kGpuBase, width);
+  fakedce::setup_aperture(rig.card.dce);
+  rig.card.dce.set(0x80d, kGpuBase >> 12);
+  rig.card.dce.set(0x80e, ((kGpuBase + kVideoMemory) >> 12) - 1);
+  ByteView video;
+  CHECK(vega.engage_display(fw, &video));
+  if (!vega.display_engaged()) return;
+  rig.card.sdma.gart_start = vega.gart_plan().gart_start;
+  rig.card.sdma.gart_size = vega.gart_plan().gart_size;
+  rig.card.sdma.gart_table = rig.vram + kRegion + vega.layout().gart_table;
+  amd_dce11::Presenter presenter(rig.alloc);
+  CHECK(presenter.start(vega, video, pitch, height) && presenter.buffer().size() == pitch * height && memcmp(presenter.buffer().data(), video.data(), pitch * height) == 0);
+  rig.card.sdma.system_by_high = true;
+  rig.card.sdma.system_high = reinterpret_cast<uint64_t>(presenter.buffer().data()) & ~0xFFFFFFFFFFull;
+  // Draw in the back buffer: video memory has not changed until the rows are presented.
+  uint8_t* back = presenter.buffer().data();
+  for (uint32_t y = 4; y < 8; ++y) memset(back + y * pitch, 0x30 + y, pitch);
+  CHECK(memcmp(video.data() + 4 * pitch, back + 4 * pitch, pitch) != 0);
+  const uint32_t copies = rig.card.sdma.copies;
+  CHECK(presenter.present(4, 4) && presenter.dma_presents() == 1 && presenter.cpu_presents() == 0 && rig.card.sdma.copies == copies + 1);
+  CHECK(memcmp(video.data() + 4 * pitch, back + 4 * pitch, 4 * pitch) == 0 && memcmp(video.data(), back, 4 * pitch) == 0);
+  CHECK(video.data()[3 * pitch] == back[3 * pitch] && video.data()[8 * pitch] == back[8 * pitch] && rig.card.sdma.gart_faults == 0);
+  // Rows outside the picture are refused.
+  CHECK(!presenter.present(16, 1) && !presenter.present(20, 1) && !presenter.present(15, 2) && !presenter.present(0, 0) && rig.card.sdma.copies == copies + 1);
+  // The engine stalls: the CPU copies instead, and the picture is still right.
+  rig.card.sdma.stall[0] = true;
+  memset(back + 10 * pitch, 0x77, 2 * pitch);
+  CHECK(presenter.present(10, 2) && presenter.cpu_presents() == 1 && memcmp(video.data() + 10 * pitch, back + 10 * pitch, 2 * pitch) == 0);
+  // Once the engine is wedged it is not tried again (no wait for it each time), and the next presents go by the CPU.
+  memset(back + 12 * pitch, 0x78, pitch);
+  CHECK(presenter.present(12, 1) && presenter.cpu_presents() == 2 && presenter.dma_presents() == 1 && memcmp(video.data() + 12 * pitch, back + 12 * pitch, pitch) == 0);
+  // A picture of another size than the display's does not start.
+  amd_dce11::Presenter other(rig.alloc);
+  CHECK(!other.start(vega, video, pitch, height + 1) && !other.start(vega, video, 0, height) && !other.present(0, 1));
+  // Giving the screen back: what was drawn goes to the firmware's framebuffer.
+  memset(back, 0x99, pitch);
+  CHECK(presenter.present_all());
+  vega.disengage_display();
+  CHECK(rig.vram[0] == 0x99 && rig.vram[pitch - 1] == 0x99);
+}
+
 int main() {
   setvbuf(stdout, nullptr, _IONBF, 0);
   test_plan();
   test_bring_up();
+  test_transfer();
   test_failures();
   test_display();
+  test_present();
   printf(g_failed ? "AmdVegaMTest: %d FAILED\n" : "AmdVegaMTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }

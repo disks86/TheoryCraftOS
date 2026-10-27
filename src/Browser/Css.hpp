@@ -255,6 +255,7 @@ struct Style {
   Layout layout = Layout::Flow;
   bool inline_box = false;    // inline-block, inline-flex, inline-grid, inline-table: a box that sits in a line
   bool contents = false;      // display: contents (the element has no box of its own)
+  bool flow_root = false;     // display: flow-root (a block that starts a formatting context: it lays out as a block)
   // the pixel engine's box properties (not inherited)
   CornerRadius radius[4];                      // border-radius: top-left, top-right, bottom-right, bottom-left
   TextRef box_shadow;                          // the list as written (StyleSheet::shadows())
@@ -345,6 +346,7 @@ struct Style {
     s.layout = Layout::Flow;
     s.inline_box = false;
     s.contents = false;
+    s.flow_root = false;
     s.margin_top = s.margin_bottom = s.padding_top = s.padding_bottom = s.margin_left = s.padding_left = 0;
     s.width_px = s.height_px = 0;
     s.width_pct = 0;

@@ -295,6 +295,44 @@ bool AmdVegaM::submit_sdma(uint32_t instance, ArrayView<const uint32_t> commands
   return sdma_->submit_ib(instance, block_gpu_ + layout_.ib, count, timeout_us);
 }
 
+// The address the card is given for memory the CPU reaches at `p`. The only place a pointer becomes a number: by default the OS keeps its memory mapped at its own addresses
+// (UEFI's identity map), and the pointer is not dereferenced.
+static uint64_t physical_address(const ISystemAddresses* map, const void* p) { return map ? map->physical_address(p) : reinterpret_cast<uintptr_t>(p); }
+
+bool AmdVegaM::transfer(uint64_t system_address, uint64_t bytes, uint64_t offset, bool to_video, uint32_t instance, uint32_t timeout_us) {
+  const uint64_t area = layout_.framebuffer_bytes;
+  if (!up() || instance >= AmdSdma3::kInstances || sdma_->wedged(instance) || bytes == 0 || area == 0 || offset > area || bytes > area - offset) return false;
+  if (system_address > kAmdGmc8McMask || bytes > kAmdGmc8McMask + 1 - system_address) return false;   // (the end must be inside the 40 bits)
+  constexpr uint64_t kWindowBytes = uint64_t{kTransferPages} * kPageBytes;
+  const uint64_t video = block_gpu_ + layout_.framebuffer + offset;
+  for (uint64_t done = 0; done < bytes;) {
+    const uint64_t address = system_address + done;
+    const uint64_t in_page = address & (kPageBytes - 1);
+    const uint64_t length = bytes - done < kWindowBytes - in_page ? bytes - done : kWindowBytes - in_page;
+    const uint64_t pages = (in_page + length + kPageBytes - 1) / kPageBytes;
+    uint64_t table[kTransferPages];
+    for (uint64_t i = 0; i < pages; ++i) table[i] = (address - in_page) + i * kPageBytes;
+    if (!gmc_->map(0, ArrayView<const uint64_t>(table, pages), kAmdGmc8PteSystemPage)) return false;
+    const uint64_t window = gmc_->gart_address(0) + in_page;
+    amd_gmc8_flush_hdp(*inputs_.registers);
+    const bool ok = to_video ? sdma_->copy(instance, window, video + done, length, timeout_us) : sdma_->copy(instance, video + done, window, length, timeout_us);
+    if (!ok) {
+      if (!sdma_->wedged(instance)) gmc_->unmap(0, kTransferPages);   // (the engine did not take the copy: nothing can still be using the pages)
+      return false;
+    }
+    done += length;
+  }
+  return gmc_->unmap(0, kTransferPages);
+}
+
+bool AmdVegaM::upload(ConstByteView source, uint64_t offset, uint32_t instance, uint32_t timeout_us) {
+  return transfer(physical_address(inputs_.system_addresses, source.data()), source.size(), offset, true, instance, timeout_us);
+}
+
+bool AmdVegaM::download(ByteView destination, uint64_t offset, uint32_t instance, uint32_t timeout_us) {
+  return transfer(physical_address(inputs_.system_addresses, destination.data()), destination.size(), offset, false, instance, timeout_us);
+}
+
 bool AmdVegaM::engage_display(const amd_dce11::FirmwareFramebuffer& firmware, ByteView* memory) {
   if (!up() || layout_.framebuffer_bytes == 0 || !inputs_.allocator) return false;
   display_ = UniquePointer<amd_dce11::Display>();

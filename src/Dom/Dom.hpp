@@ -105,6 +105,9 @@ class Document {
   Node* root() const { return root_; }                  // the Document node
   // True for a page read without a doctype: it is laid out the way old pages expect (a table does not take its text alignment from what it is in).
   bool quirks_mode = false;
+  // The <!DOCTYPE> the page began with (document.doctype); a page without one has none.
+  bool has_doctype = false;
+  String doctype_name, doctype_public, doctype_system;
   // What contentType says when the document is not HTML ("application/xml" ...); empty for a page of HTML.
   String content_type;
   Node* document_element() const;                       // <html>
