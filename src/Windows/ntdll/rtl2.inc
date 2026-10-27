@@ -86,11 +86,18 @@ EXPORT void NTAPI RtlSecondsSince1980ToTime(ULONG seconds, LONGLONG *time) { *ti
 
 EXPORT BOOLEAN NTAPI RtlQueryPerformanceCounter(PLARGE_INTEGER counter) { LARGE_INTEGER f; NtQueryPerformanceCounter(counter, &f); return TRUE; }
 EXPORT BOOLEAN NTAPI RtlQueryPerformanceFrequency(PLARGE_INTEGER frequency) { LARGE_INTEGER c; NtQueryPerformanceCounter(&c, frequency); return TRUE; }
-EXPORT void NTAPI RtlQueryUnbiasedInterruptTime(ULONGLONG *time) {
+EXPORT BOOLEAN NTAPI RtlQueryUnbiasedInterruptTime(ULONGLONG *time) {
+  if (!time) { TEB_LAST_ERROR(NtCurrentTeb()) = 87; return FALSE; }      /* ERROR_INVALID_PARAMETER */
   LARGE_INTEGER c, f;
   NtQueryPerformanceCounter(&c, &f);
   const ULONGLONG hz = (ULONGLONG)f.QuadPart, ticks = (ULONGLONG)c.QuadPart;
   *time = hz ? (ticks / hz) * 10000000u + (ticks % hz) * 10000000u / hz : 0;
+  return TRUE;
+}
+EXPORT ULONG NTAPI NtGetTickCount(void) {
+  LARGE_INTEGER c, f;
+  NtQueryPerformanceCounter(&c, &f);
+  return f.QuadPart ? (ULONG)((ULONGLONG)c.QuadPart / ((ULONGLONG)f.QuadPart / 1000)) : 0;
 }
 
 /* ---- the thread error mode ------------------------------------------------------------------------------------------------------------------------------- */

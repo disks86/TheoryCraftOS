@@ -103,7 +103,7 @@ EXPORT DWORD WINAPI GetActiveProcessorCount(WORD group) {
 EXPORT DWORD WINAPI GetMaximumProcessorCount(WORD group) { return GetActiveProcessorCount(group); }
 EXPORT WORD WINAPI GetActiveProcessorGroupCount(void) { return 1; }
 EXPORT WORD WINAPI GetMaximumProcessorGroupCount(void) { return 1; }
-EXPORT BOOL WINAPI QueryUnbiasedInterruptTime(PULONGLONG t) { *t = GetTickCount64() * 10000; return TRUE; }
+EXPORT BOOL WINAPI QueryUnbiasedInterruptTime(PULONGLONG t) { if (!t) { set_error(ERROR_INVALID_PARAMETER); return FALSE; } *t = GetTickCount64() * 10000; return TRUE; }
 EXPORT DWORD WINAPI GetProcessIdOfThread(HANDLE thread) {
   BYTE info[48];
   if (!NT_SUCCESS(NtQueryInformationThread(thread, 0, info, sizeof(info), NULL))) { set_error(ERROR_INVALID_HANDLE); return 0; }

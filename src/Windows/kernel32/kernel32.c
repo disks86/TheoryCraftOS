@@ -50,6 +50,11 @@ IMPORT size_t_ wcslen(const WCHAR *);
 
 static void set_error(DWORD error) { TEB_LAST_ERROR(NtCurrentTeb()) = error; }
 /* Records the Win32 error of a failed NT call and returns FALSE. */
+#ifndef ERROR_PRIVILEGE_NOT_HELD
+#define ERROR_PRIVILEGE_NOT_HELD 1314
+#endif
+static int month_days(LONGLONG y, int m);
+EXPORT void WINAPI GetLocalTime(LPSYSTEMTIME st);
 static void complete_overlapped(LPOVERLAPPED overlapped, NTSTATUS status, ULONG_PTR bytes);
 static DWORD wait_result(NTSTATUS status);
 EXPORT BOOL WINAPI ReadFile(HANDLE h, LPVOID buffer, DWORD length, LPDWORD read, LPOVERLAPPED overlapped);
@@ -1806,7 +1811,7 @@ EXPORT BOOL WINAPI FileTimeToSystemTime(const FILETIME *ft, LPSYSTEMTIME st) {
   return TRUE;
 }
 EXPORT BOOL WINAPI SystemTimeToFileTime(const SYSTEMTIME *st, LPFILETIME ft) {
-  if (st->wMonth < 1 || st->wMonth > 12 || st->wDay < 1 || st->wDay > 31 || st->wHour > 23 || st->wMinute > 59 || st->wSecond > 59 || st->wMilliseconds > 999) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (st->wYear < 1601 || st->wYear > 30827 || st->wMonth < 1 || st->wMonth > 12 || st->wDay < 1 || st->wDay > month_days(st->wYear, st->wMonth) || st->wHour > 23 || st->wMinute > 59 || st->wSecond > 59 || st->wMilliseconds > 999) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
   const LONGLONG days = days_from_civil(st->wYear, st->wMonth, st->wDay) + 134774;
   const ULONGLONG ms = (ULONGLONG)days * 86400000ull + (ULONGLONG)st->wHour * 3600000ull + (ULONGLONG)st->wMinute * 60000ull + (ULONGLONG)st->wSecond * 1000ull + st->wMilliseconds;
   const ULONGLONG t = ms * 10000;
@@ -1815,10 +1820,6 @@ EXPORT BOOL WINAPI SystemTimeToFileTime(const SYSTEMTIME *st, LPFILETIME ft) {
   return TRUE;
 }
 EXPORT void WINAPI GetSystemTime(LPSYSTEMTIME st) { FILETIME ft; GetSystemTimeAsFileTime(&ft); FileTimeToSystemTime(&ft, st); }
-EXPORT void WINAPI GetLocalTime(LPSYSTEMTIME st) { GetSystemTime(st); }      /* the time zone is UTC */
-EXPORT BOOL WINAPI FileTimeToLocalFileTime(const FILETIME *in, LPFILETIME out) { *out = *in; return TRUE; }
-EXPORT BOOL WINAPI LocalFileTimeToFileTime(const FILETIME *in, LPFILETIME out) { *out = *in; return TRUE; }
-EXPORT DWORD WINAPI GetTimeZoneInformation(LPTIME_ZONE_INFORMATION tz) { memset(tz, 0, sizeof(*tz)); return 0; /* TIME_ZONE_ID_UNKNOWN */ }
 /* Exception handling lives in ntdll.dll (src/Windows/ntdll/except.inc); kernel32 gives programs the names they know. RtlUnwindEx, RtlVirtualUnwind and the others
  * are forwarded to ntdll by kernel32.def. */
 EXPORT LPTOP_LEVEL_EXCEPTION_FILTER WINAPI SetUnhandledExceptionFilter(LPTOP_LEVEL_EXCEPTION_FILTER filter) { return RtlSetUnhandledExceptionFilter(filter); }
@@ -3017,3 +3018,4 @@ EXPORT BOOL WINAPI DllMain(HANDLE module, DWORD reason, PVOID reserved) {
 #include "extra3.inc"
 #include "legacy.inc"
 #include "fmtmsg.inc"
+#include "time.inc"
