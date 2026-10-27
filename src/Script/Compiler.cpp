@@ -129,6 +129,7 @@ class Compiler {
 
   // Does a statement list begin with the "use strict" directive?
   static bool has_use_strict(const Node* list) {
+    while (list && list->kind == NodeKind::Var && (list->flags & kFlagPrologue)) list = list->next;   // (the unpacking of pattern parameters is not a statement of the body)
     for (const Node* s = list; s && s->kind == NodeKind::ExprStmt && s->a && s->a->kind == NodeKind::String; s = s->next)
       if (s->a->text.equals("use strict") && !(s->a->flags & kFlagParenthesized)) return true;
     return false;
@@ -195,8 +196,23 @@ class Compiler {
     while (cur_->bindings.count() > mark) cur_->bindings.remove_at(cur_->bindings.count() - 1);
     --cur_->scope_depth;
   }
+  // Early errors of strict mode code on a name: `eval` and `arguments` cannot be bound or assigned, and the words reserved for the future are not identifiers.
+  void strict_name(StringView name, uint32_t line, bool binding, bool force = false) {
+    if (!cur_ || !(cur_->code->strict || force) || library_ || name.empty() || name[0] == '%') return;
+    if (binding && (name.equals("eval") || name.equals("arguments"))) {
+      fail("Unexpected eval or arguments in strict mode", line ? line : line_);
+      return;
+    }
+    static const char* const kReserved[] = {"implements", "interface", "let", "package", "private", "protected", "public", "static", "yield"};
+    for (const char* word : kReserved)
+      if (name.equals(word)) {
+        fail("Unexpected strict mode reserved word", line ? line : line_);
+        return;
+      }
+  }
   // A variable of the current block (let / const) or of the function (var, parameters).
   uint32_t declare(StringView name) {
+    strict_name(name, 0, true);
     for (uint64_t i = cur_->bindings.count(); i > 0; --i) {
       if (cur_->bindings[i - 1].name.equals(name) && i - 1 >= (cur_->scope_marks.count() ? cur_->scope_marks[cur_->scope_marks.count() - 1] : 0)) return cur_->bindings[i - 1].slot;
     }
@@ -328,6 +344,7 @@ class Compiler {
     (void)nested;
   }
   void declare_var(StringView name) {
+    strict_name(name, 0, true);
     if (cur_->is_global) {
       emit(Opc::DeclareGlobal, static_cast<int32_t>(constant_string(name)));
       return;
@@ -369,6 +386,7 @@ class Compiler {
   void init_functions(Node* list) {
     for (Node* s = list; s; s = s->next) {
       if (s->kind != NodeKind::FunctionDecl) continue;
+      if (!(s->a->flags & kFlagExprBody)) strict_name(s->text, s->line, true, has_use_strict(s->a->a->list));   // (a function with the directive in its body is strict, and so is its name)
       function_value(s->a);
       store_name(s->text, s->line);
       emit(Opc::Pop);
@@ -408,6 +426,7 @@ class Compiler {
   bool with_applies(StringView name) const { return !withs_.empty() && !name.empty() && name[0] != '%' && name.find('.') == StringView::npos; }
 
   void load_name(StringView name, uint32_t line) {
+    strict_name(name, line, false);
     if (!with_applies(name)) return load_plain(name, line);
     List<uint32_t> ends(vm_.allocator());
     for (uint64_t i = withs_.count(); i > 0; --i) {
@@ -426,6 +445,7 @@ class Compiler {
     for (uint64_t i = 0; i < ends.count(); ++i) patch(ends[i]);
   }
   void store_name(StringView name, uint32_t line, bool initialize = false) {
+    if (!initialize) strict_name(name, line, true);
     if (!with_applies(name) || initialize) return store_plain(name, line, initialize);
     List<uint32_t> ends(vm_.allocator());
     for (uint64_t i = withs_.count(); i > 0; --i) {
@@ -521,6 +541,20 @@ class Compiler {
     fs.code->is_async = (fn->flags & kFlagAsync) != 0;
     fs.code->is_generator = (fn->flags & kFlagGenerator) != 0 && !(fn->flags & kFlagArrow);
     fs.code->name = !fn->text.empty() ? vm_.intern(fn->text) : !inferred.empty() ? vm_.intern(inferred) : nullptr;
+    {   // early errors of the parameter list
+      bool simple = !(fn->flags & kFlagRest);
+      for (Node* p = fn->list; p; p = p->next) simple = simple && !p->a && !(!p->text.empty() && p->text[0] == '%');
+      if (!simple && !(fn->flags & kFlagExprBody) && has_use_strict(fn->a->list)) fail("Illegal 'use strict' directive in function with non-simple parameter list", fn->line);
+      if (fs.code->strict || fs.code->is_arrow || !simple) {
+        for (Node* p = fn->list; p; p = p->next) {
+          if (!p->text.empty() && p->text[0] == '%') continue;
+          for (Node* q = fn->list; q != p; q = q->next)
+            if (q->text.equals(p->text)) fail("Duplicate parameter name not allowed in this context", p->line);
+        }
+      }
+      for (Node* p = fn->list; p; p = p->next) strict_name(p->text, p->line, true);
+      if ((fn->flags & kFlagExpression) && !fn->text.empty()) strict_name(fn->text, fn->line, true);
+    }
     uint32_t params = 0;
     bool counting = true;
     for (Node* p = fn->list; p; p = p->next) {
@@ -680,6 +714,10 @@ class Compiler {
         return;
       }
       case NodeKind::If: {
+        if (cur_->code->strict && !library_ && ((n->b && n->b->kind == NodeKind::FunctionDecl) || (n->c && n->c->kind == NodeKind::FunctionDecl))) {
+          fail("In strict mode code, functions can only be declared at top level or inside a block", n->line);
+          return;
+        }
         expression(n->a);
         const uint32_t to_else = emit(Opc::JumpIfFalse);
         statement(n->b);
@@ -785,6 +823,10 @@ class Compiler {
       case NodeKind::Switch: switch_statement(n); return;
       case NodeKind::Labeled: {
         const NodeKind k = n->a->kind;
+        if (k == NodeKind::FunctionDecl && cur_->code->strict && !library_) {
+          fail("In strict mode code, functions can only be declared at top level or inside a block", n->line);
+          return;
+        }
         if (k == NodeKind::For || k == NodeKind::ForIn || k == NodeKind::ForOf || k == NodeKind::While || k == NodeKind::DoWhile) {
           pending_label_ = n->text;
           statement(n->a);
@@ -1040,12 +1082,15 @@ class Compiler {
     line_ = n->line;
     switch (n->kind) {
       case NodeKind::Number: {
+        if ((n->flags & kFlagLegacyOctal) && cur_->code->strict && !library_) { fail("Octal literals are not allowed in strict mode", n->line); return; }
         const double d = n->number;
         if (d == static_cast<double>(static_cast<int32_t>(d)) && !(d == 0 && 1 / d < 0)) emit(Opc::PushInt, static_cast<int32_t>(d));
         else emit(Opc::PushNum, static_cast<int32_t>(constant_number(d)));
         return;
       }
-      case NodeKind::String: emit(Opc::PushStr, static_cast<int32_t>(constant_string(n->text))); return;
+      case NodeKind::String:
+        if ((n->flags & kFlagLegacyOctal) && cur_->code->strict && !library_) { fail("Octal escape sequences are not allowed in strict mode", n->line); return; }
+        emit(Opc::PushStr, static_cast<int32_t>(constant_string(n->text))); return;
       case NodeKind::Template: {
         bool first = true;
         for (Node* p = n->list; p; p = p->next) {
@@ -1249,6 +1294,10 @@ class Compiler {
   void unary(Node* n) {
     switch (n->op) {
       case Op::Delete:
+        if (n->a->kind == NodeKind::Ident && cur_->code->strict && !library_) {
+          fail("Delete of an unqualified identifier in strict mode", n->line);
+          return;
+        }
         if (n->a->kind == NodeKind::OptionalChain && (n->a->a->kind == NodeKind::Member || n->a->a->kind == NodeKind::Index)) {   // delete a?.b
           Node* link = n->a->a;
           const uint64_t first = chain_jumps_.count();
