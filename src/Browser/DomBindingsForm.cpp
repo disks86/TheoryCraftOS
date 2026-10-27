@@ -127,6 +127,7 @@ Value elements_value(DomBindings::Impl& c, dom::Node* form) {
       if (d->is_element() && dom::is_listed_control(d)) list.push_back(d);
   }
   JsObject* collection = make_collection(c, list);
+  if (form->is_tag("form")) set_interface(vm, collection, "HTMLFormControlsCollection");
   for (uint64_t i = 0; i < list.count(); ++i) {   // form.elements.name
     StringView v;
     for (const char* attribute : {"id", "name"}) {
