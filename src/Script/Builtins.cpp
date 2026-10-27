@@ -2839,7 +2839,7 @@ bool run_source(Vm& vm, StringView source, Value* result) {
   Node* program = parse_program(source, arena, &message);
   if (!program) return vm.throw_error(ErrorKind::SyntaxError, message.view());
   FunctionCode* code = nullptr;
-  if (!compile_program(vm, program, &code, &message)) return vm.throw_error(ErrorKind::SyntaxError, message.view());
+  if (!compile_program(vm, program, &code, &message, false, true)) return vm.throw_error(ErrorKind::SyntaxError, message.view());
   JsObject* fn = vm.new_function(code, nullptr, Value());
   return vm.call(Value::make_object(fn), Value::make_object(vm.global()), nullptr, 0, result);
 }
