@@ -297,6 +297,20 @@ Not done: the GFX configuration numbers that the driver takes from the video BIO
 the clock and power requests the video engines make are separate, nothing uses the rings yet (no command submission, no use of SDMA by the OS, interrupts are not dispatched), and the UVD engine's memory plan does not know about
 this block (it relies on the 128 MiB limit). Treat the first run on a 9575 as a bring-up.
 
+### Command buffers: indirect buffers and fences
+
+`AmdGfx8::submit_ib`, `AmdGfx8Compute::submit_ib` and `AmdSdma3::submit_ib` run an indirect buffer (a command buffer already in memory the engine reads) and wait for a fence, each ported from the driver's
+emit functions: the graphics ring gets `INDIRECT_BUFFER` (`gfx_v8_0_ring_emit_ib_gfx`) and the fence of `gfx_v8_0_ring_emit_fence_gfx` (two `EVENT_WRITE_EOP`, the first a workaround that writes the number below,
+the second the number; word 12 of the write-back page); a compute queue gets `INDIRECT_BUFFER` with the valid bit (`..._emit_ib_compute`) and `RELEASE_MEM` (`..._emit_fence_compute`; word 16 of the queue's
+write-back page); an SDMA engine gets the `INDIRECT` packet placed to end on an 8-dword boundary of the ring (`sdma_v3_0_ring_emit_ib`) and the fence/trap of the copy path. Buffers are padded as the driver pads them
+(`AmdGfx8::pad_ib`: NOPs to a multiple of 256 dwords; `AmdSdma3::pad_ib`: to 8, with a burst NOP where the engine has it). A fence that never comes wedges that ring until the engine is started again.
+`AmdVegaM::submit_graphics` / `submit_compute` / `submit_sdma` copy a command buffer into the block's 8 KiB staging area, pad it and run it, one at a time.
+
+The simulated engines run the buffers' packets (register writes, memory writes, copies, fences) and object to anything else (a buffer that is not packets, a compute buffer without the valid bit, a VMID, an
+IB that does not end on an 8-dword boundary), so the packets' framing is checked; what the real microcode does with these framings, and with caches (the driver's fence packets flush the GPU's caches before the write;
+the simulated ones do not model caches), has not been seen. No shaders are run (there is no compiler for the GCN4 instruction set), no draws are issued, VMIDs other than 0 and the hardware-queue
+priorities are not used, and nothing in the OS calls these yet.
+
 ## Radeon RX Vega M: UVD 6.3
 
 `src/Hardware/VideoCodec/AMD/AmdUvd6.*` is the start/stop of the Unified Video Decoder 6.3, ported from amdgpu (`uvd_v6_0.c`: `mc_resume`, `start`, `stop`, the clock-gating "ungate" path; `amdgpu_uvd.c`: the memory layout

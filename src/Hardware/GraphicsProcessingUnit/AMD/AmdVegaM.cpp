@@ -82,6 +82,7 @@ AmdVegaM::Layout AmdVegaM::plan(uint64_t smu_bytes, uint64_t gart_table_bytes, u
   l.compute = take(AmdGfx8Compute::block_bytes(compute_queues));
   l.sdma = take(AmdSdma3::kInstances * AmdSdma3::kSlotBytes);
   l.ih = take(kIhBytes);
+  l.ib = take(kIbBytes);
   at = align_up(at, kMiB);
   l.framebuffer = at;
   l.framebuffer_bytes = align_up(framebuffer_bytes, kMiB);
@@ -254,6 +255,44 @@ void AmdVegaM::shutdown() {
   if (gmc_) gmc_->stop();
   gmc_ = UniquePointer<AmdGmc8>();
   step_ = Step::None;
+}
+
+// Copies `count` dwords into the staging area (the padding is already in `words`).
+static void stage(const MmioRegion& area, const uint32_t* words, uint32_t count) {
+  for (uint32_t i = 0; i < count; ++i) area.write32(uint64_t{i} * 4, words[i]);
+}
+
+bool AmdVegaM::submit_graphics(ArrayView<const uint32_t> commands, uint32_t timeout_us) {
+  if (!up() || commands.size() == 0 || commands.size() > kIbDwords) return false;
+  uint32_t words[kIbDwords];
+  for (size_t i = 0; i < commands.size(); ++i) words[i] = commands[i];
+  const uint32_t count = AmdGfx8::pad_ib(ArrayView<uint32_t>(words, kIbDwords), static_cast<uint32_t>(commands.size()));
+  if (count == 0) return false;
+  stage(block_.subregion(layout_.ib, kIbBytes), words, count);
+  amd_gmc8_flush_hdp(*inputs_.registers);
+  return gfx_->submit_ib(block_gpu_ + layout_.ib, count, timeout_us);
+}
+
+bool AmdVegaM::submit_compute(uint32_t queue, ArrayView<const uint32_t> commands, uint32_t timeout_us) {
+  if (!up() || commands.size() == 0 || commands.size() > kIbDwords) return false;
+  uint32_t words[kIbDwords];
+  for (size_t i = 0; i < commands.size(); ++i) words[i] = commands[i];
+  const uint32_t count = AmdGfx8::pad_ib(ArrayView<uint32_t>(words, kIbDwords), static_cast<uint32_t>(commands.size()));
+  if (count == 0) return false;
+  stage(block_.subregion(layout_.ib, kIbBytes), words, count);
+  amd_gmc8_flush_hdp(*inputs_.registers);
+  return compute_->submit_ib(queue, block_gpu_ + layout_.ib, count, timeout_us);
+}
+
+bool AmdVegaM::submit_sdma(uint32_t instance, ArrayView<const uint32_t> commands, uint32_t timeout_us) {
+  if (!up() || commands.size() == 0 || commands.size() > kIbDwords) return false;
+  uint32_t words[kIbDwords];
+  for (size_t i = 0; i < commands.size(); ++i) words[i] = commands[i];
+  const uint32_t count = sdma_->pad_ib(instance, ArrayView<uint32_t>(words, kIbDwords), static_cast<uint32_t>(commands.size()));
+  if (count == 0) return false;
+  stage(block_.subregion(layout_.ib, kIbBytes), words, count);
+  amd_gmc8_flush_hdp(*inputs_.registers);
+  return sdma_->submit_ib(instance, block_gpu_ + layout_.ib, count, timeout_us);
 }
 
 bool AmdVegaM::engage_display(const amd_dce11::FirmwareFramebuffer& firmware, ByteView* memory) {

@@ -72,11 +72,14 @@ class AmdVegaM final : public amd_dce11::INativeDisplay {
   // The sizes of the pieces of the block, for a given microcode set, GART table and framebuffer.
   struct Layout {
     bool ok = false;
-    uint64_t dummy_page = 0, scratch_page = 0, gart_table = 0, smu = 0, gfx = 0, compute = 0, sdma = 0, ih = 0, framebuffer = 0;   // offsets in the block
+    uint64_t dummy_page = 0, scratch_page = 0, gart_table = 0, smu = 0, gfx = 0, compute = 0, sdma = 0, ih = 0, ib = 0, framebuffer = 0;   // offsets in the block
     uint64_t smu_bytes = 0, gart_table_bytes = 0, framebuffer_bytes = 0, total = 0;
   };
   static constexpr uint64_t kGfxBytes = AmdGfx8::kRingBytes + 4096 + 4096;   // the ring, the write-back page, the clear-state buffer
   static constexpr uint64_t kIhBytes = (AmdIh3::kRingBytes + AmdIh3::kWritebackBytes + kPageBytes - 1) / kPageBytes * kPageBytes;
+  // The staging area for the command buffers the submit functions below take (one at a time), in dwords.
+  static constexpr uint32_t kIbDwords = 2048;
+  static constexpr uint64_t kIbBytes = kIbDwords * 4;
   static Layout plan(uint64_t smu_bytes, uint64_t gart_table_bytes, uint32_t compute_queues, uint64_t framebuffer_bytes);
 
   enum class Step : uint8_t { None, MemoryMap, Firmware, Memory, MemoryController, InterruptHandler, Microcode, GraphicsEngine, Sdma, Done };
@@ -101,6 +104,13 @@ class AmdVegaM final : public amd_dce11::INativeDisplay {
   bool engage_display(const amd_dce11::FirmwareFramebuffer& firmware, ByteView* memory) override;
   bool display_engaged() const override { return display_ && display_->engaged(); }
   void disengage_display() override;
+
+  // Command buffers: the commands are copied into the block's staging area, padded the way the engine's driver pads (AmdGfx8::pad_ib, AmdSdma3::pad_ib), run as an indirect
+  // buffer, and waited for by a fence. One at a time (the call returns when the engine is done). `commands` are PM4 packets for the graphics ring and the compute queues, SDMA
+  // packets for the DMA engines; at most kIbDwords with the padding. False if the card is not up, the buffer does not fit, or the engine does not finish (see AmdGfx8::submit_ib).
+  bool submit_graphics(ArrayView<const uint32_t> commands, uint32_t timeout_us = 100000);
+  bool submit_compute(uint32_t queue, ArrayView<const uint32_t> commands, uint32_t timeout_us = 100000);
+  bool submit_sdma(uint32_t instance, ArrayView<const uint32_t> commands, uint32_t timeout_us = 100000);
 
   // For tests and diagnostics
   const AmdGmc8GartPlan& gart_plan() const { return gart_plan_; }

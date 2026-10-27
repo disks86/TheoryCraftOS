@@ -93,6 +93,15 @@ constexpr uint32_t kMap0 = 0, kMap3 = 3;
 constexpr uint32_t kMtypeNc = 1, kMtypeCc = 2, kMtypeUc = 3, kAddressModeHsa64 = 2, kAlignmentUnaligned = 3;
 constexpr uint32_t kDefaultShMemBases = 0x6000;   // DEFAULT_SH_MEM_BASES
 
+// The packets of an indirect buffer and its fence (vid.h): INDIRECT_BUFFER, EVENT_WRITE_EOP and the bits of its dwords.
+constexpr uint32_t kPacketIndirectBuffer = 0x3F, kPacketEventWriteEop = 0x47;
+constexpr uint32_t kEopTcWbActionEn = 1u << 15, kEopTcl1ActionEn = 1u << 16, kEopTcActionEn = 1u << 17;
+constexpr uint32_t kCacheFlushAndInvTsEvent = 0x14;   // gfx_8_0_enum.h
+constexpr uint32_t event_type(uint32_t x) { return x << 0; }
+constexpr uint32_t event_index(uint32_t x) { return x << 8; }
+constexpr uint32_t data_sel(uint32_t x) { return x << 29; }
+constexpr uint32_t int_sel(uint32_t x) { return x << 24; }
+
 constexpr uint32_t kTestInitial = 0xCAFEDEAD, kTestValue = 0xDEADBEEF;
 }  // namespace
 
@@ -575,6 +584,47 @@ bool AmdGfx8::test_ring(uint32_t timeout_us) {
   return false;
 }
 
+uint32_t AmdGfx8::pad_ib(ArrayView<uint32_t> words, uint32_t count) {
+  if (count > words.size()) return 0;
+  while (count & kAlignMask) {
+    if (count >= words.size()) return 0;
+    words[count++] = kRingNop;
+  }
+  return count;
+}
+
+// gfx_v8_0_ring_emit_ib_gfx (VMID 0, no constant engine) and gfx_v8_0_ring_emit_fence_gfx (32-bit, no interrupt)
+bool AmdGfx8::submit_ib(uint64_t ib_gpu_address, uint32_t dwords, uint32_t timeout_us) {
+  if (!running_ || wedged_ || dwords == 0 || dwords > kMaxIbDwords || (ib_gpu_address & 3) != 0 || (ib_gpu_address >> 48) != 0) return false;
+  const uint64_t fence_address = memory_.writeback_gpu_address + kFenceWordOffset;
+  const uint32_t sequence = ++fence_sequence_;
+  ring_write(packet3(kPacketIndirectBuffer, 2));
+  ring_write(static_cast<uint32_t>(ib_gpu_address) & 0xFFFFFFFC);
+  ring_write(static_cast<uint32_t>(ib_gpu_address >> 32) & 0xFFFF);
+  ring_write(dwords);   // (| vmid << 24, VMID 0)
+  // Workaround for cache flush problems. First send a dummy EOP event down the pipe with seq one below.
+  ring_write(packet3(kPacketEventWriteEop, 4));
+  ring_write(kEopTcl1ActionEn | kEopTcActionEn | kEopTcWbActionEn | event_type(kCacheFlushAndInvTsEvent) | event_index(5));
+  ring_write(static_cast<uint32_t>(fence_address) & 0xfffffffc);
+  ring_write((static_cast<uint32_t>(fence_address >> 32) & 0xffff) | data_sel(1) | int_sel(0));
+  ring_write(sequence - 1);
+  ring_write(0);
+  // Then send the real EOP event down the pipe: EVENT_WRITE_EOP - flush caches
+  ring_write(packet3(kPacketEventWriteEop, 4));
+  ring_write(kEopTcl1ActionEn | kEopTcActionEn | kEopTcWbActionEn | event_type(kCacheFlushAndInvTsEvent) | event_index(5));
+  ring_write(static_cast<uint32_t>(fence_address) & 0xfffffffc);
+  ring_write((static_cast<uint32_t>(fence_address >> 32) & 0xffff) | data_sel(1) | int_sel(0));
+  ring_write(sequence);
+  ring_write(0);
+  ring_commit();
+  const uint64_t begin = clock_.now_us();
+  do {
+    if (memory_.writeback.read32(kFenceWordOffset) == sequence) return true;
+  } while (clock_.now_us() - begin < timeout_us);
+  wedged_ = true;
+  return false;
+}
+
 AmdGfx8::Result AmdGfx8::start(const Memory& memory, uint32_t timeout_us) {
   if (!memory.ring.valid() || memory.ring.length() < kRingBytes || !memory.writeback.valid() || memory.writeback.length() < kWritebackBytes ||
       (memory.ring_gpu_address & 0xFF) != 0 || (memory.writeback_gpu_address & 3) != 0 || config_.shader_engines == 0 || config_.sh_per_se == 0 ||
@@ -583,6 +633,10 @@ AmdGfx8::Result AmdGfx8::start(const Memory& memory, uint32_t timeout_us) {
       memory.csb.length() < kClearStateBytes || (memory.csb_gpu_address & 3) != 0)
     return Result::BadArgument;
   memory_ = memory;
+  running_ = false;
+  wedged_ = false;
+  fence_sequence_ = 0;
+  memory_.writeback.write32(kFenceWordOffset, 0);
   // gfx_v8_0_hw_init
   program_golden_registers();
   constants_init();
@@ -600,10 +654,12 @@ AmdGfx8::Result AmdGfx8::start(const Memory& memory, uint32_t timeout_us) {
   if (!test_ring(timeout_us)) return Result::RingTestFailed;
   if (compute_ && compute_->test_rings(timeout_us) != AmdGfx8Compute::Result::Ok) return Result::ComputeFailed;
   gui_idle_interrupt(true);
+  running_ = true;
   return Result::Ok;
 }
 
 void AmdGfx8::stop() {
+  running_ = false;
   if (compute_ && compute_->attached()) compute_->disable_queues();   // gfx_v8_0_kcq_disable
   cp_gfx_enable(false);
   wr(mmCP_MEC_CNTL, CP_MEC_CNTL__MEC_ME1_HALT_MASK | CP_MEC_CNTL__MEC_ME2_HALT_MASK);   // gfx_v8_0_cp_compute_enable(false)

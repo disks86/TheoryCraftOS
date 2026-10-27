@@ -67,6 +67,10 @@ class Card final : public hardware::IVcnRegisters {
   bool stall[2] = {false, false};      // the engine never processes anything
   uint32_t executed[2] = {0, 0}, traps[2] = {0, 0}, protocol_errors = 0, copies = 0, fills = 0, writes_done = 0, fences = 0;
   std::vector<uint32_t> copy_sizes;
+  struct IbRun { uint64_t address; uint32_t dwords; };
+  std::vector<IbRun> ib_runs;     // every indirect buffer the engines ran
+  uint32_t ib_errors = 0;         // indirect packets the engine refused
+  bool ignore_fences = false;     // the engine runs everything but never writes a fence
 
   uint32_t reg(uint32_t r) const { auto at = regs_.find(r); return at == regs_.end() ? 0 : at->second; }
   void set_reg(uint32_t r, uint32_t v) { regs_[r] = v; }
@@ -113,23 +117,29 @@ class Card final : public hardware::IVcnRegisters {
   void run(uint32_t instance, uint32_t off, uint32_t wptr_bytes) {
     const uint64_t base = (uint64_t{reg(kRbBaseHi + off)} << 32 | reg(kRbBase + off)) << 8;
     const uint32_t ring_bytes = 4u << ((reg(kRbCntl + off) >> 1) & 0x1f);
-    uint32_t& rptr = rptr_[instance];
-    const uint32_t wptr = wptr_bytes & (ring_bytes - 1);
+    process(instance, base, &rptr_[instance], wptr_bytes & (ring_bytes - 1), ring_bytes, 0);
+    if (reg(kRbCntl + off) & 0x1000) put32(uint64_t{reg(kRptrAddrHi + off)} << 32 | reg(kRptrAddrLo + off), rptr_[instance]);
+  }
+
+  // Packets from `*rptr` to `wptr` (bytes) of a buffer at `base`, `size` bytes long and a power of two (the ring wraps; an indirect buffer is processed with a size too big to wrap).
+  void process(uint32_t instance, uint64_t base, uint32_t* rptr_ref, uint32_t wptr, uint32_t size, int depth) {
+    uint32_t& rptr = *rptr_ref;
     while (rptr != wptr) {
       const uint32_t h = get32(base + rptr);
       const uint32_t op = h & 0xFF;
-      auto dword = [&](uint32_t k) { return get32(base + ((rptr + 4 * k) & (ring_bytes - 1))); };
+      auto dword = [&](uint32_t k) { return get32(base + ((rptr + 4 * k) & (size - 1))); };
       uint32_t length = 1;   // dwords of the packet
       switch (op) {
         case 0: length = 1 + (h >> 16 & 0x3FFF); break;   // NOP: a burst count skips that many following dwords
         case 2: length = 4 + dword(3); break;             // WRITE linear: header, address (2), count, data
         case 1: length = 7; break;
+        case 4: length = 6; break;                        // INDIRECT: header, address lo, hi, size, two more
         case 5: length = 4; break;
         case 6: length = 2; break;
         case 11: length = 5; break;
         default: ++protocol_errors; rptr = wptr; return;
       }
-      if (length * 4 > ((wptr - rptr) & (ring_bytes - 1)) && !(wptr == rptr)) {
+      if (length * 4 > ((wptr - rptr) & (size - 1)) && !(wptr == rptr)) {
         // (the whole packet must be there: the driver commits whole packets)
         ++protocol_errors;
         rptr = wptr;
@@ -153,6 +163,16 @@ class Card final : public hardware::IVcnRegisters {
           copy_sizes.push_back(count);
           break;
         }
+        case 4: {
+          // The IB must end on an 8-dword boundary of the ring, start 32-byte aligned, and has no VMID (0).
+          const uint64_t address = uint64_t{dword(2)} << 32 | dword(1);
+          const uint32_t dwords = dword(3) & 0xFFFFF;
+          if (depth > 0 || ((rptr / 4 + 6) & 7) != 0 || (address & 31) != 0 || (h >> 16 & 0xF) != 0 || dwords == 0 || !host(address, uint64_t{dwords} * 4)) { ++ib_errors; break; }
+          uint32_t pos = 0;
+          ib_runs.push_back({address, dwords});
+          process(instance, address, &pos, dwords * 4, 0x80000000u, depth + 1);
+          break;
+        }
         case 11: {
           const uint64_t dst = uint64_t{dword(2)} << 32 | dword(1);
           const uint32_t value = dword(3), count = dword(4);
@@ -161,14 +181,13 @@ class Card final : public hardware::IVcnRegisters {
           ++fills;
           break;
         }
-        case 5: put32(uint64_t{dword(2)} << 32 | dword(1), dword(3)); ++fences; break;
+        case 5: if (!ignore_fences) put32(uint64_t{dword(2)} << 32 | dword(1), dword(3)); ++fences; break;
         case 6: ++traps[instance]; break;
         default: break;
       }
       ++executed[instance];
-      rptr = (rptr + 4 * length) & (ring_bytes - 1);
+      rptr = (rptr + 4 * length) & (size - 1);
     }
-    if (reg(kRbCntl + off) & 0x1000) put32(uint64_t{reg(kRptrAddrHi + off)} << 32 | reg(kRptrAddrLo + off), rptr);
   }
 
   std::map<uint32_t, uint32_t> regs_;

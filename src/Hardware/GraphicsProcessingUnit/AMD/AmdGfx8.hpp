@@ -99,7 +99,19 @@ class AmdGfx8 {
   // gfx_v8_0_ring_test_ring on its own, for later use.
   bool test_ring(uint32_t timeout_us = kDefaultTimeoutUs);
   uint32_t write_pointer() const { return wptr_; }
-  // The raster configuration the render back-ends were set up with (what the driver caches in rb_config[0][0]) and the number of back-ends found.
+
+  // Runs an indirect buffer on the graphics ring and waits for it (gfx_v8_0_ring_emit_ib_gfx, gfx_v8_0_ring_emit_fence_gfx): the buffer is `dwords` PM4 dwords at GPU address
+  // `ib_gpu_address` (4-byte aligned, below 2^48), already written to memory the engine reads, and padded by the caller to a multiple of 256 dwords with NOP packets (the driver's
+  // pad_ib; see pad_ib()). The ring gets the INDIRECT_BUFFER packet and then a fence: two EVENT_WRITE_EOP packets, the first a workaround that writes the number below, the
+  // second the number, to a word of the write-back page (offset 12). False for a bad argument or an engine that is not running, and on a timeout, after which the ring is wedged
+  // (nothing more is queued) until the engine is started again.
+  bool submit_ib(uint64_t ib_gpu_address, uint32_t dwords, uint32_t timeout_us = kDefaultTimeoutUs);
+  bool wedged() const { return wedged_; }
+  uint32_t fence_sequence() const { return fence_sequence_; }
+  // amdgpu_ring_generic_pad_ib: appends NOP packets to `words` (a buffer of `capacity` dwords holding `count`) up to a multiple of 256; returns the new count, or 0 if it does not fit.
+  static uint32_t pad_ib(ArrayView<uint32_t> words, uint32_t count);
+  static constexpr uint32_t kMaxIbDwords = 0xFFFFF;   // the length field of the packet
+  static constexpr uint32_t kFenceWordOffset = 12;     // in the write-back memory  // The raster configuration the render back-ends were set up with (what the driver caches in rb_config[0][0]) and the number of back-ends found.
   uint32_t raster_config() const { return raster_config_; }
   uint32_t raster_config_1() const { return raster_config_1_; }
   uint32_t active_render_backends() const { return active_rbs_; }
@@ -146,6 +158,8 @@ class AmdGfx8 {
   uint32_t wptr_ = 0;   // in dwords, modulo the ring
   uint32_t raster_config_ = 0, raster_config_1_ = 0, active_rbs_ = 0;
   AmdGfx8Compute* compute_ = nullptr;
+  bool running_ = false, wedged_ = false;
+  uint32_t fence_sequence_ = 0;
 };
 
 }  // namespace hardware
