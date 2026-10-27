@@ -89,12 +89,26 @@ void AmdGpu::engage() {
   firmware_bytes_ = bytes;
   native_memory_ = memory;
   native_pitch_ = pitch_bytes();
-  set_framebuffer(memory, width(), height(), native_pitch_, bgr());
+  // A card with a DMA engine path to its video memory gets the picture drawn in system memory and sent a run of rows at a time (amd_dce11::Presenter).
+  ByteView draw = memory;
+  if (native_display_ && context_.allocator) {
+    presenter_ = UniquePointer<amd_dce11::Presenter>::make(*context_.allocator, *context_.allocator);
+    if (presenter_ && presenter_->start(*native_display_, memory, native_pitch_, height())) draw = presenter_->buffer();
+    else presenter_ = UniquePointer<amd_dce11::Presenter>();
+  }
+  set_framebuffer(draw, width(), height(), native_pitch_, bgr());
+}
+
+// Gives the display engine back to the firmware's framebuffer, with everything drawn sent to video memory first.
+void AmdGpu::release_native_display() {
+  if (presenter_) presenter_->present_all();
+  presenter_ = UniquePointer<amd_dce11::Presenter>();
+  native_display_->disengage_display();
 }
 
 void AmdGpu::set_native_display(amd_dce11::INativeDisplay* display) {
   if (native_display_ && native_display_ != display && native_display_->display_engaged()) {
-    native_display_->disengage_display();
+    release_native_display();
     apply_current_mode();
   }
   native_display_ = display;
@@ -106,7 +120,7 @@ bool AmdGpu::set_mode(uint32_t index) {
   // The firmware changes the mode, so the display engine goes back to its framebuffer first and is taken over again afterwards.
   if (native_scanout()) {
     if (scanout_ && scanout_->engaged()) scanout_->disengage();
-    if (native_display_ && native_display_->display_engaged()) native_display_->disengage_display();
+    if (native_display_ && native_display_->display_engaged()) release_native_display();
     apply_current_mode();
   }
   const bool ok = UefiGopGpu::set_mode(index);
@@ -126,7 +140,7 @@ bool AmdGpu::framebuffer_range(uint64_t* base, uint64_t* bytes) const {
 void AmdGpu::shutdown() {
   if (native_scanout()) {
     if (scanout_ && scanout_->engaged()) scanout_->disengage();
-    if (native_display_ && native_display_->display_engaged()) native_display_->disengage_display();
+    if (native_display_ && native_display_->display_engaged()) release_native_display();
     apply_current_mode();
   }
   native_display_ = nullptr;
@@ -136,10 +150,15 @@ void AmdGpu::shutdown() {
 void AmdGpu::flush_dirty() {
   if (!native_scanout()) return;
   uint32_t x, y, w, h;
-  // (the Vega M's framebuffer is a mapped window of video memory: uncached, nothing to flush)
+  // (the Vega M's framebuffer is a mapped window of video memory: uncached, nothing to flush; its picture is in system memory and goes out in one run of rows)
   const bool flush = scanout_ && scanout_->engaged();
-  while (take_dirty(&x, &y, &w, &h))
+  uint32_t first_row = UINT32_MAX, end_row = 0;
+  while (take_dirty(&x, &y, &w, &h)) {
     if (flush) amd_dcn1::Scanout::flush(native_memory_, native_pitch_, x, y, w, h);
+    if (y < first_row) first_row = y;
+    if (y + h > end_row) end_row = y + h;
+  }
+  if (presenter_ && first_row < end_row) presenter_->present(first_row, end_row - first_row);
 }
 
 }  // namespace hardware

@@ -462,6 +462,68 @@ static void test_display() {
   CHECK(up2 && !vega.engage_display(big, &memory));
 }
 
+// The card's addresses for host memory: the low 40 bits of the pointer (the host's pointers are wider than the card's address space).
+struct LowBits final : ISystemAddresses {
+  uint64_t physical_address(const void* p) const override { return reinterpret_cast<uint64_t>(p) & 0xFFFFFFFFFFull; }
+};
+
+// The OS's picture in system memory sent to the display by Presenter: through the SDMA engine, and by the CPU when the engine cannot.
+static void test_present() {
+  Rig rig;
+  AmdVegaM vega(rig.alloc);
+  LowBits low;
+  AmdVegaM::Inputs in = rig.inputs();
+  in.system_addresses = &low;
+  CHECK(vega.bring_up(in));
+  const uint32_t width = 64, height = 16, pitch = width * 4;
+  amd_dce11::FirmwareFramebuffer fw;
+  fw.physical = reinterpret_cast<uint64_t>(rig.vram);
+  fw.bytes = pitch * height;
+  fw.width = width;
+  fw.height = height;
+  fw.pitch_pixels = width;
+  for (uint32_t i = 0; i < width * height; ++i) reinterpret_cast<uint32_t*>(rig.vram)[i] = 0xFF000000u | i;
+  rig.card.dce.crtc(1, kGpuBase, width);
+  fakedce::setup_aperture(rig.card.dce);
+  rig.card.dce.set(0x80d, kGpuBase >> 12);
+  rig.card.dce.set(0x80e, ((kGpuBase + kVideoMemory) >> 12) - 1);
+  ByteView video;
+  CHECK(vega.engage_display(fw, &video));
+  if (!vega.display_engaged()) return;
+  rig.card.sdma.gart_start = vega.gart_plan().gart_start;
+  rig.card.sdma.gart_size = vega.gart_plan().gart_size;
+  rig.card.sdma.gart_table = rig.vram + kRegion + vega.layout().gart_table;
+  amd_dce11::Presenter presenter(rig.alloc);
+  CHECK(presenter.start(vega, video, pitch, height) && presenter.buffer().size() == pitch * height && memcmp(presenter.buffer().data(), video.data(), pitch * height) == 0);
+  rig.card.sdma.system_by_high = true;
+  rig.card.sdma.system_high = reinterpret_cast<uint64_t>(presenter.buffer().data()) & ~0xFFFFFFFFFFull;
+  // Draw in the back buffer: video memory has not changed until the rows are presented.
+  uint8_t* back = presenter.buffer().data();
+  for (uint32_t y = 4; y < 8; ++y) memset(back + y * pitch, 0x30 + y, pitch);
+  CHECK(memcmp(video.data() + 4 * pitch, back + 4 * pitch, pitch) != 0);
+  const uint32_t copies = rig.card.sdma.copies;
+  CHECK(presenter.present(4, 4) && presenter.dma_presents() == 1 && presenter.cpu_presents() == 0 && rig.card.sdma.copies == copies + 1);
+  CHECK(memcmp(video.data() + 4 * pitch, back + 4 * pitch, 4 * pitch) == 0 && memcmp(video.data(), back, 4 * pitch) == 0);
+  CHECK(video.data()[3 * pitch] == back[3 * pitch] && video.data()[8 * pitch] == back[8 * pitch] && rig.card.sdma.gart_faults == 0);
+  // Rows outside the picture are refused.
+  CHECK(!presenter.present(16, 1) && !presenter.present(20, 1) && !presenter.present(15, 2) && !presenter.present(0, 0) && rig.card.sdma.copies == copies + 1);
+  // The engine stalls: the CPU copies instead, and the picture is still right.
+  rig.card.sdma.stall[0] = true;
+  memset(back + 10 * pitch, 0x77, 2 * pitch);
+  CHECK(presenter.present(10, 2) && presenter.cpu_presents() == 1 && memcmp(video.data() + 10 * pitch, back + 10 * pitch, 2 * pitch) == 0);
+  // Once the engine is wedged it is not tried again (no wait for it each time), and the next presents go by the CPU.
+  memset(back + 12 * pitch, 0x78, pitch);
+  CHECK(presenter.present(12, 1) && presenter.cpu_presents() == 2 && presenter.dma_presents() == 1 && memcmp(video.data() + 12 * pitch, back + 12 * pitch, pitch) == 0);
+  // A picture of another size than the display's does not start.
+  amd_dce11::Presenter other(rig.alloc);
+  CHECK(!other.start(vega, video, pitch, height + 1) && !other.start(vega, video, 0, height) && !other.present(0, 1));
+  // Giving the screen back: what was drawn goes to the firmware's framebuffer.
+  memset(back, 0x99, pitch);
+  CHECK(presenter.present_all());
+  vega.disengage_display();
+  CHECK(rig.vram[0] == 0x99 && rig.vram[pitch - 1] == 0x99);
+}
+
 int main() {
   setvbuf(stdout, nullptr, _IONBF, 0);
   test_plan();
@@ -469,6 +531,7 @@ int main() {
   test_transfer();
   test_failures();
   test_display();
+  test_present();
   printf(g_failed ? "AmdVegaMTest: %d FAILED\n" : "AmdVegaMTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }

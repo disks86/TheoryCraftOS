@@ -160,5 +160,30 @@ void Display::disengage() {
   memory_ = ByteView();
 }
 
+bool Presenter::start(INativeDisplay& display, ByteView video, uint32_t pitch_bytes, uint32_t height) {
+  const uint64_t bytes = uint64_t{pitch_bytes} * height;
+  if (pitch_bytes == 0 || height == 0 || video.size() != bytes) return false;
+  back_.clear();
+  display_ = nullptr;
+  if (!back_.put_zeros(bytes) || !back_.writable_view().copy_from(video)) return false;
+  display_ = &display;
+  video_ = video;
+  pitch_ = pitch_bytes;
+  height_ = height;
+  return true;
+}
+
+bool Presenter::present(uint32_t first_row, uint32_t rows) {
+  if (!display_ || rows == 0 || first_row >= height_ || rows > height_ - first_row) return false;
+  const uint64_t offset = uint64_t{first_row} * pitch_, length = uint64_t{rows} * pitch_;
+  const ConstByteView source = back_.view().subview(offset, length);
+  if (display_->upload_picture(source, offset)) {
+    ++dma_presents_;
+    return true;
+  }
+  ++cpu_presents_;
+  return video_.subview(offset, length).copy_from(source);
+}
+
 }  // namespace amd_dce11
 }  // namespace hardware

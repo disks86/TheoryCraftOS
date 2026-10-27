@@ -113,6 +113,8 @@ class AmdVegaM final : public amd_dce11::INativeDisplay {
   bool engage_display(const amd_dce11::FirmwareFramebuffer& firmware, ByteView* memory) override;
   bool display_engaged() const override { return display_ && display_->engaged(); }
   void disengage_display() override;
+  // The picture in system memory to the display's framebuffer through the SDMA engines (upload()).
+  bool upload_picture(ConstByteView pixels, uint64_t offset) override { return display_ && display_->engaged() && upload(pixels, offset); }
 
   // Command buffers: the commands are copied into the block's staging area, padded the way the engine's driver pads (AmdGfx8::pad_ib, AmdSdma3::pad_ib), run as an indirect
   // buffer, and waited for by a fence. One at a time (the call returns when the engine is done). `commands` are PM4 packets for the graphics ring and the compute queues, SDMA
