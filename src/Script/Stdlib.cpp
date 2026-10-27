@@ -122,6 +122,7 @@ const char kStdlib[] = R"JSLIB((function (g) {
   [['match', Symbol.match], ['matchAll', Symbol.matchAll], ['replace', Symbol.replace], ['search', Symbol.search], ['split', Symbol.split]].forEach(function (pair) {
     var name = pair[0], sym = pair[1], orig = SP[name];
     var wrapper = function (arg) {
+      if (new.target !== undefined) throw new TypeError('String.prototype.' + name + ' is not a constructor');
       if (arg !== null && arg !== undefined && typeof arg === 'object' && !(arg instanceof RegExp)) {
         var method = arg[sym];
         if (typeof method === 'function') return method.apply(arg, [this].concat(Array.prototype.slice.call(arguments, 1)));
@@ -135,7 +136,12 @@ const char kStdlib[] = R"JSLIB((function (g) {
   (function () {
     var orig = AP.concat, spread = Symbol.isConcatSpreadable;
     var wrapper = function (item) {
-      var args = [];
+      'use strict';
+      if (new.target !== undefined) throw new TypeError('Array.prototype.concat is not a constructor');
+      var args = [], base = this;
+      if (base === null || base === undefined) throw new TypeError('Array.prototype.concat called on null or undefined');
+      var flagged = typeof base === 'object' || typeof base === 'function' ? base[spread] : undefined;
+      if (!(flagged !== undefined ? flagged : Array.isArray(base))) base = [typeof base === 'object' || typeof base === 'function' ? base : Object(base)];   // (not spreadable: it is the first element)
       for (var i = 0; i < arguments.length; i++) {
         var a = arguments[i];
         if (a !== null && typeof a === 'object') {
@@ -144,7 +150,7 @@ const char kStdlib[] = R"JSLIB((function (g) {
         }
         args.push(a);
       }
-      return orig.apply(this, args);
+      return orig.apply(base, args);
     };
     Object.defineProperty(wrapper, 'name', { value: 'concat' });
     Object.defineProperty(wrapper, 'length', { value: 1 });
@@ -991,6 +997,31 @@ const char kStdlib[] = R"JSLIB((function (g) {
     };
     wrapped['@@asyncIterator'] = function () { return this; };
     return wrapped;
+  });
+  // Array.fromAsync: Array.from for async iterables (and iterables of promises, and array-likes): each element and each mapped value is awaited
+  def(Array, 'fromAsync', function fromAsync(items, mapfn, thisArg) {
+    if (new.target !== undefined) throw new TypeError('Array.fromAsync is not a constructor');
+    return (async function () {
+      if (mapfn !== undefined && typeof mapfn !== 'function') throw new TypeError(String(mapfn) + ' is not a function');
+      var out = [], index = 0;
+      var add = async function (value) { out.push(mapfn ? await mapfn.call(thisArg, value, index) : value); index++; };
+      if (items === null || items === undefined) throw new TypeError(String(items) + ' is not iterable');
+      if (typeof items[Symbol.asyncIterator] === 'function') { for await (var a of items) await add(a); }
+      else if (typeof items[Symbol.iterator] === 'function') { for (var v of items) await add(await v); }
+      else { var length = Number(items.length) || 0; for (var i = 0; i < length; i++) await add(await items[i]); }
+      return out;
+    }());
+  });
+  Object.defineProperty(Array.fromAsync, 'length', { value: 1 });
+  // the value properties of the global object cannot be changed, and neither can the prototype of a built-in constructor
+  ['NaN', 'Infinity', 'undefined'].forEach(function (n) {
+    var value = n === 'NaN' ? NaN : n === 'Infinity' ? Infinity : undefined;
+    Object.defineProperty(g, n, { value: value, writable: false, enumerable: false, configurable: false });
+  });
+  ['Object', 'Function', 'Array', 'String', 'Number', 'Boolean', 'Symbol', 'BigInt', 'Date', 'RegExp', 'Map', 'Set', 'WeakMap', 'WeakSet', 'WeakRef', 'Promise', 'Error', 'TypeError', 'RangeError', 'SyntaxError', 'ReferenceError',
+   'EvalError', 'URIError', 'ArrayBuffer', 'DataView', 'Int8Array', 'Uint8Array', 'Uint8ClampedArray', 'Int16Array', 'Uint16Array', 'Int32Array', 'Uint32Array', 'Float32Array', 'Float64Array'].forEach(function (n) {
+    var C = g[n];
+    if (typeof C === 'function' && C.prototype !== undefined) { try { Object.defineProperty(C, 'prototype', { writable: false, enumerable: false, configurable: false }); } catch (e) { } }
   });
 }(this));
 )JSLIB";

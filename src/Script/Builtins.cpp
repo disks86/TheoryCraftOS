@@ -747,6 +747,11 @@ NATIVE(object_to_string) {
       case ObjKind::Error: name = "[object Error]"; break;
       case ObjKind::RegExp: name = "[object RegExp]"; break;
       case ObjKind::Promise: name = "[object Promise]"; break;
+      case ObjKind::Plain: {
+        Value date;
+        if (vm.get_own(self.as_object(), vm.intern("__date"), &date) && date.is_bool()) name = "[object Date]";
+        break;
+      }
       case ObjKind::Primitive: {
         const Value p = self.as_object()->bound_this;
         name = p.is_number() ? "[object Number]" : p.is_bool() ? "[object Boolean]" : Vm::is_symbol(p) ? "[object Symbol]" : p.is_string() ? "[object String]" : "[object BigInt]";
@@ -2258,6 +2263,43 @@ NATIVE(function_protos) {
   return true;
 }
 
+// __htmldda(object): the object behaves like document.all (typeof undefined, falsy, == null)
+NATIVE(mark_htmldda) {
+  (void)self;
+  (void)result;
+  if (argc > 0 && args[0].is_object()) args[0].as_object()->htmldda = true;
+  return true;
+}
+
+// Object.prototype.__proto__: the prototype of the object (of the wrapper, for a primitive), and a way to set it
+NATIVE(proto_getter) {
+  (void)args;
+  (void)argc;
+  JsObject* proto = nullptr;
+  switch (self.tag) {
+    case Tag::Object: proto = self.as_object()->proto; break;
+    case Tag::String: proto = self.as_string()->symbol ? vm.symbol_proto() : vm.string_proto(); break;
+    case Tag::Number: proto = vm.number_proto(); break;
+    case Tag::Boolean: proto = vm.boolean_proto(); break;
+    default: return vm.throw_error(ErrorKind::TypeError, "Cannot convert undefined or null to object");
+  }
+  if (self.tag == Tag::Object && self.as_object()->okind == ObjKind::Proxy) {
+    if (!vm.get_prototype_op(self.as_object(), &proto)) return false;
+  }
+  *result = proto ? Value::make_object(proto) : Value::make_null();
+  return true;
+}
+
+NATIVE(proto_setter) {
+  if (self.is_nullish()) return vm.throw_error(ErrorKind::TypeError, "Object.prototype.__proto__ called on null or undefined");
+  *result = Value();
+  const Value proto = arg_at(args, argc, 0);
+  if (!self.is_object() || !(proto.is_object() || proto.is_null())) return true;
+  const Value forwarded[2] = {self, proto};
+  Value ignored;
+  return object_set_prototype_of(vm, Value(), forwarded, 2, &ignored);
+}
+
 NATIVE(primitive_of_native) {
   (void)self;
   *result = Vm::primitive_of(arg_at(args, argc, 0));
@@ -3222,6 +3264,9 @@ bool install_builtins(Vm& vm) {
   }
   vm.define_native(g, "__symbol_info", symbol_info, 2);
   vm.define_native(g, "__primitive_of", primitive_of_native, 1);
+  vm.define_native(g, "__htmldda", mark_htmldda, 1);
+  vm.define_native(g, "__proto_of", object_get_prototype_of, 1);
+  vm.define_accessor(vm.object_proto(), vm.intern("__proto__"), Value::make_object(vm.new_native(proto_getter, "get __proto__", 0)), Value::make_object(vm.new_native(proto_setter, "set __proto__", 1)), 0);
   vm.define_native(g, "__reflect_construct", reflect_construct, 3);
   vm.define_native(g, "__function_protos", function_protos, 0);
   vm.define_native(object, "getOwnPropertySymbols", object_get_own_property_symbols, 1);
