@@ -36,6 +36,9 @@ __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");
 /* The services that can end with STATUS_USER_APC are called through wrappers below that run the queued APCs first; these are the bare stubs. */
 #define NT_SERVICE_RAW(name)                                                                                                                                  \
   __asm__(".text\n.globl Raw" #name "\nRaw" #name ":\n mov %rcx, %r10\n mov $" _STR(NT_SERVICE_##name) ", %eax\n syscall\n ret\n.text\n")
+/* A Zw name of a service: in user mode it is the same call as the Nt one. */
+#define ZW_SERVICE(nt, zw)                                                                                                                                    \
+  __asm__(".text\n.globl " #zw "\n" #zw ":\n mov %rcx, %r10\n mov $" _STR(NT_SERVICE_##nt) ", %eax\n syscall\n ret\n.section .drectve\n.ascii \" -export:" #zw "\"\n.text\n")
 #define _STR(x) _STR2(x)
 #define _STR2(x) #x
 NT_SERVICE(NtReadFile);
@@ -120,6 +123,8 @@ NT_SERVICE(NtTerminateProcess);
 NT_SERVICE(NtYieldExecution);
 NT_SERVICE_RAW(NtDelayExecution);
 NT_SERVICE(NtQuerySystemTime);
+#include "services.inc"      /* the rest of the services: generated, the kernel answers STATUS_NOT_IMPLEMENTED for the ones it has no code for */
+#include "zw.inc"
 NT_SERVICE(NtAllocateVirtualMemory);
 NT_SERVICE(NtFreeVirtualMemory);
 NT_SERVICE(NtProtectVirtualMemory);

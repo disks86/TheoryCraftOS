@@ -777,42 +777,73 @@ if(TCOS_ARCH STREQUAL "x86_64")
   set(WINDOWS_DLL_FLAGS -O2 -Wall -Wextra -Wno-unused-parameter -ffreestanding -fno-builtin -fno-tree-loop-distribute-patterns -fno-stack-protector
       -fasynchronous-unwind-tables -nostdlib -shared -Wl,--entry=DllMain)
   file(GLOB WINDOWS_HEADERS ${CMAKE_SOURCE_DIR}/src/Windows/*.h)
+  set(WINDOWS_STUBS_C ${CMAKE_SOURCE_DIR}/src/Windows/stubs/stubs.c)
+  # The exports that are not implemented yet (src/Windows/stubs/<dll>.inc, see scripts/gen-windows-stubs.py) are compiled in as functions that do nothing: ntdll.dll's
+  # answer STATUS_NOT_IMPLEMENTED, the others' answer 0.
+  function(windows_stub_flags out dll result)
+    set(${out} -Wno-builtin-declaration-mismatch -DSTUB_FILE=${dll}.inc -DSTUB_RESULT=${result} ${WINDOWS_STUBS_C} PARENT_SCOPE)
+  endfunction()
+  windows_stub_flags(ntdll_stubs ntdll 0xC0000002u)
   add_custom_command(OUTPUT ${WINDOWS_DIR}/ntdll.dll ${WINDOWS_DIR}/libntdll.a
     COMMAND ${CMAKE_COMMAND} -E make_directory ${WINDOWS_DIR}
-    COMMAND ${CMAKE_C_COMPILER} ${WINDOWS_DLL_FLAGS} -Wl,--image-base=0x180000000 -Wl,--out-implib=${WINDOWS_DIR}/libntdll.a
+    COMMAND ${CMAKE_C_COMPILER} ${WINDOWS_DLL_FLAGS} ${ntdll_stubs} -Wl,--image-base=0x180000000 -Wl,--out-implib=${WINDOWS_DIR}/libntdll.a
             -o ${WINDOWS_DIR}/ntdll.dll ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/ntdll.c
-    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/ntdll.c ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/except.inc ${CMAKE_SOURCE_DIR}/src/Windows/libc_string.inc ${WINDOWS_HEADERS}
+    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/ntdll.c ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/except.inc ${CMAKE_SOURCE_DIR}/src/Windows/libc_string.inc ${WINDOWS_HEADERS} ${CMAKE_SOURCE_DIR}/src/Windows/stubs/ntdll.inc ${WINDOWS_STUBS_C} ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/services.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/zw.inc
     COMMENT "Building ntdll.dll")
+  windows_stub_flags(kernel32_stubs kernel32 0)
   add_custom_command(OUTPUT ${WINDOWS_DIR}/kernel32.dll
-    COMMAND ${CMAKE_C_COMPILER} ${WINDOWS_DLL_FLAGS} -Wl,--image-base=0x180200000 -o ${WINDOWS_DIR}/kernel32.dll
+    COMMAND ${CMAKE_C_COMPILER} ${WINDOWS_DLL_FLAGS} ${kernel32_stubs} -Wl,--image-base=0x180200000 -o ${WINDOWS_DIR}/kernel32.dll
             ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.c ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.def ${WINDOWS_DIR}/libntdll.a
-    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.c ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra2.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra3.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/console.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.def ${WINDOWS_DIR}/libntdll.a ${WINDOWS_HEADERS}
+    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.c ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra2.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra3.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/console.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.def ${WINDOWS_DIR}/libntdll.a ${WINDOWS_HEADERS} ${CMAKE_SOURCE_DIR}/src/Windows/stubs/kernel32.inc ${WINDOWS_STUBS_C}
     COMMENT "Building kernel32.dll")
+  windows_stub_flags(msvcrt_stubs msvcrt 0)
   add_custom_command(OUTPUT ${WINDOWS_DIR}/msvcrt.dll
-    COMMAND ${CMAKE_C_COMPILER} ${WINDOWS_DLL_FLAGS} -Wno-unused-value -Wl,--image-base=0x180400000 -o ${WINDOWS_DIR}/msvcrt.dll
+    COMMAND ${CMAKE_C_COMPILER} ${WINDOWS_DLL_FLAGS} ${msvcrt_stubs} -Wno-unused-value -Wl,--image-base=0x180400000 -o ${WINDOWS_DIR}/msvcrt.dll
             ${CMAKE_SOURCE_DIR}/src/Windows/msvcrt/msvcrt.c ${CMAKE_SOURCE_DIR}/src/Windows/msvcrt/msvcrt.def ${WINDOWS_DIR}/libntdll.a ${WINDOWS_DIR}/kernel32.dll
     DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/msvcrt/msvcrt.c ${CMAKE_SOURCE_DIR}/src/Windows/msvcrt/msvcrt.def ${CMAKE_SOURCE_DIR}/src/Windows/msvcrt/format.inc ${CMAKE_SOURCE_DIR}/src/Windows/libc_string.inc
-            ${WINDOWS_DIR}/libntdll.a ${WINDOWS_DIR}/kernel32.dll ${WINDOWS_HEADERS}
+            ${WINDOWS_DIR}/libntdll.a ${WINDOWS_DIR}/kernel32.dll ${WINDOWS_HEADERS} ${CMAKE_SOURCE_DIR}/src/Windows/stubs/msvcrt.inc ${WINDOWS_STUBS_C}
     COMMENT "Building msvcrt.dll")
+  windows_stub_flags(advapi32_stubs advapi32 0)
   add_custom_command(OUTPUT ${WINDOWS_DIR}/advapi32.dll
-    COMMAND ${CMAKE_C_COMPILER} ${WINDOWS_DLL_FLAGS} -Wl,--image-base=0x180600000 -o ${WINDOWS_DIR}/advapi32.dll
+    COMMAND ${CMAKE_C_COMPILER} ${WINDOWS_DLL_FLAGS} ${advapi32_stubs} -Wl,--image-base=0x180600000 -o ${WINDOWS_DIR}/advapi32.dll
             ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/advapi32.c ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/advapi32.def ${WINDOWS_DIR}/libntdll.a ${WINDOWS_DIR}/kernel32.dll
     DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/advapi32.c ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/advapi32.def
-            ${WINDOWS_DIR}/libntdll.a ${WINDOWS_DIR}/kernel32.dll ${WINDOWS_HEADERS}
+            ${WINDOWS_DIR}/libntdll.a ${WINDOWS_DIR}/kernel32.dll ${WINDOWS_HEADERS} ${CMAKE_SOURCE_DIR}/src/Windows/stubs/advapi32.inc ${WINDOWS_STUBS_C}
     COMMENT "Building advapi32.dll")
+  windows_stub_flags(ws2_32_stubs ws2_32 0)
   add_custom_command(OUTPUT ${WINDOWS_DIR}/ws2_32.dll
-    COMMAND ${CMAKE_C_COMPILER} ${WINDOWS_DLL_FLAGS} -Wl,--image-base=0x180800000 -o ${WINDOWS_DIR}/ws2_32.dll
+    COMMAND ${CMAKE_C_COMPILER} ${WINDOWS_DLL_FLAGS} ${ws2_32_stubs} -Wl,--image-base=0x180800000 -o ${WINDOWS_DIR}/ws2_32.dll
             ${CMAKE_SOURCE_DIR}/src/Windows/ws2_32/ws2_32.c ${CMAKE_SOURCE_DIR}/src/Windows/ws2_32/ws2_32.def ${WINDOWS_DIR}/libntdll.a ${WINDOWS_DIR}/kernel32.dll
     DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/ws2_32/ws2_32.c ${CMAKE_SOURCE_DIR}/src/Windows/ws2_32/ws2_32.def
-            ${WINDOWS_DIR}/libntdll.a ${WINDOWS_DIR}/kernel32.dll ${WINDOWS_HEADERS}
+            ${WINDOWS_DIR}/libntdll.a ${WINDOWS_DIR}/kernel32.dll ${WINDOWS_HEADERS} ${CMAKE_SOURCE_DIR}/src/Windows/stubs/ws2_32.inc ${WINDOWS_STUBS_C}
     COMMENT "Building ws2_32.dll")
-  add_custom_target(windows_dlls DEPENDS ${WINDOWS_DIR}/ntdll.dll ${WINDOWS_DIR}/kernel32.dll ${WINDOWS_DIR}/msvcrt.dll ${WINDOWS_DIR}/advapi32.dll ${WINDOWS_DIR}/ws2_32.dll)
+  # The other system libraries of Windows (user32.dll, gdi32.dll ...): files with every export in place, none of them implemented yet. They are only stubs (see above).
+  set(WINDOWS_STUB_LIBRARIES user32 gdi32 shell32 ole32 oleaut32 comctl32 comdlg32 rpcrt4 shlwapi winmm version imm32 secur32 crypt32 bcrypt ncrypt userenv setupapi iphlpapi
+      dbghelp psapi wininet winhttp wintrust netapi32 dwmapi uxtheme mswsock gdiplus msimg32 opengl32 glu32 dnsapi mpr wtsapi32 powrprof cfgmgr32 d3d9 d3d11 dxgi dwrite shcore
+      avrt winspool wevtapi pdh wldap32 urlmon msi propsys hid usp10 winscard odbc32 xinput1_4 dsound dinput8 d2d1 d3dcompiler_47 lz32 oleacc oledlg credui ntdsapi samlib
+      activeds normaliz sensapi)
+  set(WINDOWS_LIBRARIES ntdll kernel32 msvcrt advapi32 ws2_32 ${WINDOWS_STUB_LIBRARIES})
+  set(_stub_image_base 0x180A00000)
+  foreach(_library ${WINDOWS_STUB_LIBRARIES})
+    windows_stub_flags(_flags ${_library} 0)
+    add_custom_command(OUTPUT ${WINDOWS_DIR}/${_library}.dll
+      COMMAND ${CMAKE_COMMAND} -E make_directory ${WINDOWS_DIR}
+      COMMAND ${CMAKE_C_COMPILER} ${WINDOWS_DLL_FLAGS} ${_flags} -DSTUB_DLLMAIN -Wl,--image-base=${_stub_image_base} -o ${WINDOWS_DIR}/${_library}.dll
+      DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/stubs/${_library}.inc ${WINDOWS_STUBS_C}
+      COMMENT "Building ${_library}.dll")
+    math(EXPR _stub_image_base "${_stub_image_base}+0x100000" OUTPUT_FORMAT HEXADECIMAL)
+  endforeach()
+  set(WINDOWS_DLL_FILES "")
+  foreach(_library ${WINDOWS_LIBRARIES})
+    list(APPEND WINDOWS_DLL_FILES ${WINDOWS_DIR}/${_library}.dll)
+  endforeach()
+  add_custom_target(windows_dlls DEPENDS ${WINDOWS_DLL_FILES})
   if(TCOS_USERMODE_DEMO)
     # The demo runs on a RAM file system, not on the primary disk: it gets copies of the libraries inside the demo build and writes them to /Windows/Windows/System32 itself.
     set(_demo_libraries_s ".section .rdata,\"dr\"\n.balign 16\n")
     set(_demo_libraries_table "")
     set(_demo_library_index 0)
-    foreach(_library ntdll kernel32 msvcrt advapi32 ws2_32)
+    foreach(_library ${WINDOWS_LIBRARIES})
       string(APPEND _demo_libraries_s ".balign 16\ntcos_demo_library_${_demo_library_index}:\n.incbin \"${WINDOWS_DIR}/${_library}.dll\"\ntcos_demo_library_${_demo_library_index}_end:\ntcos_demo_library_name_${_demo_library_index}:\n.asciz \"${_library}.dll\"\n")
       string(APPEND _demo_libraries_table ".quad tcos_demo_library_name_${_demo_library_index}, tcos_demo_library_${_demo_library_index}, tcos_demo_library_${_demo_library_index}_end\n")
       math(EXPR _demo_library_index "${_demo_library_index}+1")
@@ -820,7 +851,7 @@ if(TCOS_ARCH STREQUAL "x86_64")
     string(APPEND _demo_libraries_s ".balign 8\n.global tcos_demo_libraries\ntcos_demo_libraries:\n${_demo_libraries_table}.global tcos_demo_library_count\ntcos_demo_library_count:\n.quad ${_demo_library_index}\n")
     file(WRITE ${WINDOWS_DIR}/demo_libraries.S "${_demo_libraries_s}")
     target_sources(BOOTX64 PRIVATE ${WINDOWS_DIR}/demo_libraries.S)
-    set_source_files_properties(${WINDOWS_DIR}/demo_libraries.S PROPERTIES OBJECT_DEPENDS "${WINDOWS_DIR}/ntdll.dll;${WINDOWS_DIR}/kernel32.dll;${WINDOWS_DIR}/msvcrt.dll;${WINDOWS_DIR}/advapi32.dll;${WINDOWS_DIR}/ws2_32.dll")
+    set_source_files_properties(${WINDOWS_DIR}/demo_libraries.S PROPERTIES OBJECT_DEPENDS "${WINDOWS_DLL_FILES}")
   endif()
 endif()
 
@@ -910,9 +941,14 @@ if(TCOS_ARCH STREQUAL "x86_64" AND MKFS_FAT AND TCOS_HOST_CXX)
     DEPENDS ${_primary_tool_inputs} ${CMAKE_SOURCE_DIR}/src/FileSystem/Fat/FatFileSystem.hpp
     COMMENT "Building the primary image tool")
   set(_system32 /Windows/Windows/System32)
+  set(_system32_files "")
+  foreach(_library ${WINDOWS_LIBRARIES})
+    list(APPEND _system32_files file:${_system32}/${_library}.dll=${WINDOWS_DIR}/${_library}.dll)
+  endforeach()
   add_custom_target(primary ALL
     COMMAND ${CMAKE_SOURCE_DIR}/scripts/make-primary-image.sh ${TCOS_PRIMARY_IMAGE} ${TCOS_PRIMARY_IMAGE_SIZE} ${_primary_tool}
-            file:${_system32}/ntdll.dll=${WINDOWS_DIR}/ntdll.dll file:${_system32}/kernel32.dll=${WINDOWS_DIR}/kernel32.dll file:${_system32}/msvcrt.dll=${WINDOWS_DIR}/msvcrt.dll file:${_system32}/advapi32.dll=${WINDOWS_DIR}/advapi32.dll file:${_system32}/ws2_32.dll=${WINDOWS_DIR}/ws2_32.dll
+           
+            ${_system32_files}
     DEPENDS ${_primary_tool}
     COMMENT "Filling the primary disk image")
   add_dependencies(primary windows_dlls)
