@@ -78,6 +78,7 @@ class Card final : public hardware::IVcnRegisters {
   bool cp_alive = true;                                  // it runs the packets once its microcode is loaded and not halted
   std::vector<Executed> executed;
   uint32_t protocol_errors = 0;
+  uint32_t user_backend_disable[4] = {0, 0, 0, 0};       // GC_USER_RB_BACKEND_DISABLE of each shader engine (banked by the GRBM_GFX_INDEX selection)
   uint32_t serdes_busy_reads = 0;                        // reads of the CU busy register that still show busy
 
   Card() {
@@ -117,6 +118,8 @@ class Card final : public hardware::IVcnRegisters {
       auto at = sram_.find(address);
       return at == sram_.end() ? 0 : at->second;
     }
+    if (r == 0x26df) return user_backend_disable[selected_se()];
+    if (r == 0xA0D4 || r == 0xA0D5) return raster_[selected_se()][r - 0xA0D4];
     if (r == kSerdesCuBusy && serdes_busy_reads > 0) {
       --serdes_busy_reads;
       return 1;
@@ -128,6 +131,12 @@ class Card final : public hardware::IVcnRegisters {
   void write(uint32_t r, uint32_t v) override {
     writes.push_back({r, v});
     write_times.push_back(clock ? clock->now_us() : 0);
+    if (r == 0xA0D4 || r == 0xA0D5) {
+      if (regs_[kGrbmGfxIndex] & 0x80000000u) for (auto& se : raster_) se[r - 0xA0D4] = v;
+      else raster_[selected_se()][r - 0xA0D4] = v;
+      regs_[r] = v;
+      return;
+    }
     if (r == kSmcMessage) {
       handle_message(static_cast<uint16_t>(v));
       return;
@@ -149,6 +158,11 @@ class Card final : public hardware::IVcnRegisters {
   }
 
  private:
+  uint32_t selected_se() {
+    const uint32_t index = regs_[kGrbmGfxIndex];
+    return (index & 0x80000000u) ? 0 : (index >> 16 & 0xFF) & 3;   // (a broadcast read shows the first engine)
+  }
+  uint32_t raster_[4][2] = {};
   void handle_message(uint16_t message) {
     const uint32_t arg = regs_[kSmcArg];
     messages.push_back({message, arg});

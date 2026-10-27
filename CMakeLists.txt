@@ -637,6 +637,7 @@ add_executable(BOOTX64
   src/Hardware/GraphicsProcessingUnit/AMD/AmdGfx8Firmware.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdSmu7Ucode.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdGfx8.cpp
+  src/Hardware/GraphicsProcessingUnit/AMD/AmdGmc8.cpp
   src/Hardware/VideoCodec/AMD/AmdUvd6Messages.cpp
   src/Hardware/VideoCodec/AMD/AmdUvd6AvcDecoder.cpp
   src/Hardware/VideoCodec/AMD/AmdUvd6HevcDecoder.cpp
