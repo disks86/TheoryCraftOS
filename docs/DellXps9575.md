@@ -383,7 +383,7 @@ polling, so these are counted (`uvd_encode_fences`, `vce_fences`) and shown to w
 video engines to the observer yet. `check_irq_port.py` also checks these ids and handlers and that both engines' start code still enables their sources.
 
 Nothing in the OS reacts to a hot plug yet: the connector cannot be re-detected (no AtomBIOS, no DDC/EDID over the card's own aux channels), so a plug or unplug is only counted and its state kept. Not done: the vline
-interrupt is not enabled (only classified and acknowledged), the audio and DP short-pulse (`DC_HPD_RX_INT`) interrupts; no ring reset or recovery after a fault (the engine has to be restarted).
+interrupt is not enabled (only classified and acknowledged), the audio and DP short-pulse (`DC_HPD_RX_INT`) interrupts; recovery from a fault is above.
 
 ### MSI: interrupts wake the CPU
 
@@ -399,6 +399,29 @@ when the counter moved (and once a second in case a message was lost); if not, M
 Host-tested: the capability programming (`PciMsiTest`: 32/64-bit, with and without per-vector masking, refusals, status bits never written, undone by the destructor) and that `Inputs::msi` changes only the ring's re-arm
 bit. Not tested: the handler and the loop (they need the kernel), and nothing has run on a real machine: whether the Kaby Lake-G's PCH/root port delivers the message, the APIC id format beyond 255 cores (refused),
 and the card's re-arm behaviour are unseen.
+
+### Recovery after a fault
+
+An engine that timed out on a fence or reported a fault is wedged (nothing is queued on it). `AmdVegaM::recover()` resets the ones that are and brings them back with empty rings; `Recovery` says whether graphics
+(with the compute queues) and the SDMA engines were reset and whether an engine did not come back. With `Inputs::auto_recover` (the desktop loop sets it) `service_interrupts()` does it by itself, at most
+`kMaxRecoveries` (8) times in a life of the card, so a card that keeps hanging is left alone; `recover()` by hand has no limit.
+- **Graphics and compute** (`AmdGfx8::recover`, from `gfx_v8_0_check_soft_reset` / `_pre_soft_reset` / `_soft_reset` / `_post_soft_reset`): the status registers decide what is reset (`GRBM_STATUS` busy bits: CP and GFX;
+  `GRBM_STATUS2`: the RLC, or CPF/CPC/CPG; `SRBM_STATUS`: pending GRBM requests, SEM); since a fence that never came shows nothing busy, the command processors are added when the status does not name them (the driver
+  would reset only what is busy; recovery from a wedged ring has to work whatever the status says). Pre: the RLC stopped, the graphics CP halted, every compute queue's hardware queue dequeued directly through its
+  registers (`gfx_v8_0_deactivate_hqd(adev, 2)`: the KIQ is not asked, it may be what hung) and the MEC halted. Reset: the memory controller's graphics clients stalled (`GMCON_DEBUG`), `GRBM_SOFT_RESET` and
+  `SRBM_SOFT_RESET` pulsed with the 50 us settling delays, the stall released. Post: the queues dequeued again, the KIQ and compute queues resumed and mapped (`kiq_resume`, `kcq_resume`), the graphics ring
+  programmed, all rings tested, the RLC started. The fence numbers start again (the write-back fence words are cleared so an old number cannot look like a new fence), the wedged state is gone, and the interrupt sources
+  the reset takes away (the CP's, ECC, SQ, the compute pipe's) are put back.
+- **SDMA** (`AmdSdma3::recover`, from `sdma_v3_0_pre_soft_reset` / `_soft_reset` / `_post_soft_reset`): context switching off and the engines halted, `SRBM_SOFT_RESET` for both engines pulsed, then `start()` again on the
+  same memory (the driver's `gfx_resume` and `rlc_resume`); both engines are reset together, as in the driver, and the trap interrupts are put back.
+- A fault of one compute queue resets all of them with the graphics engine, as the driver's soft reset of the IP does. An engine whose ring test fails after the reset is left stopped (`failed`); it counts as needing
+  recovery, so the next `recover()` tries it again.
+
+The simulated engines hang (`hung` for the command processor, `stall` for SDMA) until the reset pulse reaches them, unless told the reset does not work; the reset also takes their interrupt enables, hardware queues and
+doorbells away, so the ordering of the steps, the exact reset bits for each status, and what is restored are checked. `scripts/check_reset_port.py` compares the status bits, reset bits, pre/soft/post order, the reset pulses,
+the queue dequeue and the SDMA sequence with the kernel sources. Not done: a full reset of the card (the driver's PCI config reset or BACO, `vi_asic_reset`, which is what it falls back to when a soft reset does not
+help, and which would also need the memory controller, the interrupt ring and the display set up again), resetting the video engines (UVD/VCE), and the replay of the work that was lost: callers see the failure of their
+submission and must resubmit. Whether a real CP comes back from `GRBM_SOFT_RESET` with the microcode the SMC loaded is what the driver relies on and has not been seen here.
 
 ## Radeon RX Vega M: UVD 6.3
 

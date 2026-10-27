@@ -107,6 +107,10 @@ class Card final : public hardware::IVcnRegisters {
   std::vector<IbRun> ib_runs;
   uint32_t fence_writes = 0, write_data_packets = 0, ib_protocol_errors = 0;
   bool ignore_fences = false;    // the engine runs everything but never writes a fence
+  // A hung command processor (graphics and compute): it runs nothing until GRBM_SOFT_RESET resets the CP (unless reset_fails). The reset also takes the interrupt enables and the
+  // hardware queues away, as the real one does.
+  bool hung = false, reset_fails = false;
+  std::vector<uint32_t> grbm_resets, srbm_resets;   // every value written to GRBM_SOFT_RESET (0x2008) and SRBM_SOFT_RESET (0x398)
 
   void set_smc_header() { set_sram(0x20000 + 48, soft_registers); }   // SMU75_Firmware_Header.SoftRegisters
 
@@ -144,6 +148,7 @@ class Card final : public hardware::IVcnRegisters {
     if (r >= 0x3245 && r <= 0x3279) {
       poll_mec();
       auto& bank = banks_[bank_key()];
+      if (r == 0x3247) return bank.active ? 1 : 0;   // CP_HQD_ACTIVE (a queue the microcode mapped is active though nothing wrote the register)
       auto at = bank.regs.find(r);
       return at == bank.regs.end() ? 0 : at->second;
     }
@@ -181,6 +186,7 @@ class Card final : public hardware::IVcnRegisters {
       bank.regs[r] = v;
       if (r == 0x3247) bank.active = (v & 1) != 0;   // CP_HQD_ACTIVE
       if (r == 0x324f) bank.rptr = v;                // CP_HQD_PQ_RPTR
+      if (r == 0x325d && (v & 7)) { bank.active = false; bank.regs[0x3247] = 0; }   // CP_HQD_DEQUEUE_REQUEST: the queue is taken off the hardware
       return;
     }
     if (r == kSmcMessage) {
@@ -190,6 +196,19 @@ class Card final : public hardware::IVcnRegisters {
     if (r == kSmcData) {
       sram_[regs_[kSmcIndex]] = v;
       return;
+    }
+    if (r == 0x398) srbm_resets.push_back(v);
+    if (r == 0x2008) {
+      grbm_resets.push_back(v);
+      if ((v & 1) && !reset_fails) {   // SOFT_RESET_CP
+        hung = false;
+        rptr_ = 0;
+        regs_[kRb0Rptr] = 0;
+        banks_.clear();
+        if (doorbell_host) for (uint64_t i = 0; i < doorbell_bytes; ++i) doorbell_host[i] = 0;   // the doorbells the CP latched are gone with it (a ring of the same value would not look new)
+        for (uint32_t i : {0x3049u, 0x306au, 0x306bu, 0x306cu, 0x30b4u, 0x3085u, 0x3086u, 0x3087u, 0x3088u, 0x3089u, 0x308au, 0x308bu, 0x308cu}) regs_[i] = 0;   // the interrupt enables
+        regs_[0x2315] = 1;   // SQ_INTERRUPT_MSG_CTRL.STALL is the reset value
+      }
     }
     if (r == kRb0Wptr) {
       if (regs_[kRb0Cntl] & 0x80000000u) {   // RB_RPTR_WR_ENA: the pointers are being set
@@ -219,7 +238,7 @@ class Card final : public hardware::IVcnRegisters {
     return p[0] | (p[1] << 8) | (p[2] << 16) | (uint32_t{p[3]} << 24);
   }
   bool mec_ready() const {
-    return mec_alive && (reg(kCpMecCntl) & (kMecMe1Halt | kMecMe2Halt)) == 0 && (status() & (1u << 6)) != 0;   // MEC loaded by the SMC
+    return mec_alive && !hung && (reg(kCpMecCntl) & (kMecMe1Halt | kMecMe2Halt)) == 0 && (status() & (1u << 6)) != 0;   // MEC loaded by the SMC
   }
   bool is_kiq(uint32_t key) const {
     const uint32_t sched = reg(0xecaa);   // RLC_CP_SCHEDULERS: queue in bits 2:0, pipe 4:3, me 6:5, enable bit 7
@@ -384,7 +403,7 @@ class Card final : public hardware::IVcnRegisters {
 
   // The command processor: packets from the ring between its read and write pointers.
   void run_ring() {
-    if (!cp_alive) return;
+    if (!cp_alive || hung) return;
     if (!ready()) return;
     const uint64_t base = (uint64_t{regs_[kRb0BaseHi]} << 32 | regs_[kRb0Base]) << 8;
     const uint32_t dwords = 2u << (regs_[kRb0Cntl] & 0x3f);   // RB_BUFSZ: 2^n units of 8 bytes

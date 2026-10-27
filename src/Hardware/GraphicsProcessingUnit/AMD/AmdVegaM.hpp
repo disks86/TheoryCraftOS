@@ -78,6 +78,7 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
     MmioRegion doorbells;                         // the doorbell BAR (BAR 2), at least the first 8 KiB
     uint64_t max_framebuffer_bytes = 0;           // the largest picture the display could show (0: no display part)
     uint32_t hpd_pins = 0x3F;                     // the hot plug detect pins to watch (bit n: pin n); which pin a connector is on is in the video BIOS, so by default all of them
+    bool auto_recover = false;                    // service_interrupts() resets an engine that a fault or a timeout left wedged (at most kMaxRecoveries times in all)
     bool msi = false;                             // the card's MSI is on (PciMsi): the interrupt ring is told to re-arm it as the driver does (adev->irq.msi_enabled)
     const ISystemAddresses* system_addresses = nullptr;   // for upload() and download(); null: a pointer is its own address
   };
@@ -144,6 +145,18 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
   // Everything the interrupt ring delivers is also passed to `observer` (not owned; null to stop), after the card has dealt with it: how the video engines, which run on their own,
   // learn of their fences. Called from service_interrupts().
   void set_event_observer(AmdIrq::ISink* observer) { observer_ = observer; }
+  // Recovery. An engine that timed out on a fence or reported a fault is wedged: nothing more is queued on it. recover() resets the ones that are - the graphics engine with its
+  // compute queues (AmdGfx8::recover) if the graphics ring or a compute queue is wedged, and the SDMA engines (AmdSdma3::recover) if one is - and brings them back with empty
+  // rings. A fault of one compute queue resets all of them, as the driver's soft reset of the IP does. `failed` is set if an engine did not come back (its ring test failed): it is
+  // then stopped; recover() tries it again (an engine that is not running counts as needing it), and if that does not help either the card needs a full restart (shutdown and
+  // bring_up). Nothing is done for engines that are running and not wedged.
+  struct Recovery {
+    bool graphics = false, sdma = false, failed = false;
+  };
+  Recovery recover();
+  bool wedged() const;   // any engine is, or was left stopped by a recovery that did not work
+  uint32_t recoveries() const { return recoveries_; }
+  static constexpr uint32_t kMaxRecoveries = 8;   // what service_interrupts() will do by itself in one life of the card (a card that keeps hanging is left alone)
   // The vertical blank interrupt of the controller that shows the OS's framebuffer (it comes every frame, so it is off until asked for): counted per controller in irq()->vblank_count().
   // False if the display is not engaged. It is switched off again when the display is given back or the card stopped.
   bool set_vblank_interrupt(bool enable);
@@ -173,6 +186,7 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
   UniquePointer<AmdIrq> irq_;
   UniquePointer<amd_dce11::Interrupts> display_irq_;
   int vblank_crtc_ = -1;
+  uint32_t recoveries_ = 0;
   AmdIrq::ISink* observer_ = nullptr;
   UniquePointer<AmdGfx8Compute> compute_;
   UniquePointer<AmdGfx8> gfx_;

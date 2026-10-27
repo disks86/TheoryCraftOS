@@ -1052,6 +1052,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         inputs.aperture_bytes = aperture_bytes;
         inputs.doorbells = doorbells;
         inputs.max_framebuffer_bytes = largest;
+        inputs.auto_recover = true;   // an engine that hung or faulted is reset from the desktop loop (service_interrupts), a few times at most
         // MSI first, as the driver does (the interrupt ring is told it is on): the handler, then the message, to the core that runs this.
         const uint32_t apic_id = kernel::running() ? kernel::apic::this_apic_id() : 0xFFFF;
         if (apic_id <= 0xFF) {

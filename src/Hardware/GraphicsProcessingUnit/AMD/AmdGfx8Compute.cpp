@@ -467,6 +467,7 @@ bool AmdGfx8Compute::disable_queues(uint32_t timeout_us) {
 }
 
 bool AmdGfx8Compute::set_eop_interrupt(bool enable) {
+  eop_interrupt_ = enable;
   if (config_.compute_me != 1) return false;
   uint32_t reg;
   switch (config_.compute_pipe) {
@@ -479,6 +480,34 @@ bool AmdGfx8Compute::set_eop_interrupt(bool enable) {
   const uint32_t tmp = rd(reg);
   wr(reg, enable ? (tmp | CP_INT_CNTL_RING0__TIME_STAMP_INT_ENABLE_MASK) : (tmp & ~CP_INT_CNTL_RING0__TIME_STAMP_INT_ENABLE_MASK));
   return true;
+}
+
+// gfx_v8_0_deactivate_hqd(adev, 2) for each compute ring, each with its queue selected
+void AmdGfx8Compute::deactivate_queues(uint32_t timeout_us) {
+  for (uint32_t i = 1; i <= config_.queues && i <= kMaxQueues; ++i) {
+    const Queue& q = queues_[i];
+    srbm_select(q.me, q.pipe, q.queue, 0);
+    if (rd(mmCP_HQD_ACTIVE) & CP_HQD_ACTIVE__ACTIVE_MASK) {
+      wr(mmCP_HQD_DEQUEUE_REQUEST, (rd(mmCP_HQD_DEQUEUE_REQUEST) & ~CP_HQD_DEQUEUE_REQUEST__DEQUEUE_REQ_MASK) | (2u << CP_HQD_DEQUEUE_REQUEST__DEQUEUE_REQ__SHIFT));
+      const uint64_t begin = clock_.now_us();
+      while ((rd(mmCP_HQD_ACTIVE) & CP_HQD_ACTIVE__ACTIVE_MASK) && clock_.now_us() - begin < timeout_us) {}
+    }
+    wr(mmCP_HQD_DEQUEUE_REQUEST, 0);
+    wr(mmCP_HQD_PQ_RPTR, 0);
+    wr(mmCP_HQD_PQ_WPTR, 0);
+    srbm_select(0, 0, 0, 0);
+  }
+}
+
+void AmdGfx8Compute::clear_queue_state() {
+  ready_ = false;
+  failed_queue_ = -1;
+  for (uint32_t i = 0; i <= config_.queues && i <= kMaxQueues; ++i) {
+    Queue& q = queues_[i];
+    q.sequence = 0;
+    q.wedged = false;
+    q.wb.write32(kFenceWordOffset, 0);
+  }
 }
 
 bool AmdGfx8Compute::fault(uint32_t me, uint32_t pipe, uint32_t queue) {

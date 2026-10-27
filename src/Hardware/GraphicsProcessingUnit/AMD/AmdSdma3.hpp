@@ -93,6 +93,12 @@ class AmdSdma3 {
   static constexpr uint32_t kMaxIbDwords = 0xFFFFF;
   // sdma_v3_0_set_trap_irq_state for both engines: TRAP_ENABLE of SDMA0_CNTL, so the trap packet after each fence posts to the interrupt ring. Read-modify-write.
   void set_trap_interrupts(bool enable);
+  // Recovery after a hang or an illegal instruction: sdma_v3_0_pre_soft_reset (context switching off, the engines halted), sdma_v3_0_soft_reset (SRBM_SOFT_RESET for both engines
+  // pulsed, with the settling delays) and sdma_v3_0_post_soft_reset (the rings and the RLC queues resumed, here the whole of start() again on the same memory). Both engines are
+  // reset together, as the driver does; the rings are empty afterwards, fence numbers start again, the wedged state is gone, and the trap interrupts are put back if they were on.
+  // Needs start() to have worked once. The result is start()'s.
+  Result recover(uint32_t timeout_us = kDefaultTimeoutUs);
+  uint32_t recoveries() const { return recoveries_; }
   // The engine reported an illegal instruction (sdma_v3_0_process_illegal_inst_irq): nothing more is queued on it until it is started again.
   void fault(uint32_t instance) { if (instance < kInstances && running_) state_[instance].wedged = true; }
   bool wedged(uint32_t instance) const { return instance < kInstances && state_[instance].wedged; }
@@ -128,6 +134,8 @@ class AmdSdma3 {
   Memory memory_;
   State state_[kInstances];
   bool running_ = false;
+  bool trap_interrupts_ = false;
+  uint32_t recoveries_ = 0;
   int failed_instance_ = -1;
 };
 
