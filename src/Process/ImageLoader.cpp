@@ -148,12 +148,11 @@ LoadStatus map_stack(AddressSpace& space, uint64_t size, uint64_t* top) {
 }
 
 LoadStatus build_linux_stack(AddressSpace& space, uint64_t stack_top, const LoadedImage& image, ArrayView<const StringView> arguments,
-                             ArrayView<const StringView> environment, StringView executable, ConstByteView random, uint64_t* stack_pointer) {
+                             ArrayView<const StringView> environment, StringView executable, ConstByteView random, uint64_t* stack_pointer, StringView platform) {
   if (random.size() != 16 || arguments.size() > 4096 || environment.size() > 4096) return LoadStatus::Malformed;
   uint64_t string_bytes = 0;
   for (const StringView& s : arguments) string_bytes += s.size() + 1;      // each is bounded below, so the sum cannot wrap
   for (const StringView& s : environment) string_bytes += s.size() + 1;
-  const StringView platform = "x86_64";
   if (executable.size() > kMaxStartupStrings) return LoadStatus::Malformed;
   string_bytes += executable.size() + 1 + platform.size() + 1;
   if (string_bytes > kMaxStartupStrings) return LoadStatus::Malformed;

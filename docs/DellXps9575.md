@@ -331,7 +331,7 @@ memory with `INativeDisplay::upload_picture`, which `AmdVegaM` implements with `
 window, so the picture is always right. Before the display goes back to the firmware's framebuffer (mode change, shutdown) the whole back buffer is presented first.
 
 The Presenter is host-tested with the real `AmdVegaM` and the simulated SDMA engine (data in video memory, one copy per present, the CPU fallback, a wedged engine, rows outside the picture, the final present
-before disengaging). `AmdGpu`'s own use of it (the back buffer swap and the flush) is not host-tested: that needs the UEFI graphics classes. Decoded video frames are not routed this way yet: the video
+before disengaging). `AmdGpu`'s own use of it (the back buffer swap, the flush by rows, giving the screen back on a mode change, shutdown or taking the display away) is tested by `AmdGpuTest`, with a simulated UEFI graphics output (two modes) and a simulated display engine that keeps its own picture and takes rows by `upload_picture`; the sequence of drawing calls, the rows each sends (a character at a time for text), the CPU fallback when the upload fails, the whole-picture present before the disengage, a display that refuses or hands out video memory of the wrong size, and swapping one display for another are covered. Decoded video frames are not routed this way yet: the video
 player draws through the same GPU `blit`, so they take this path only as far as the player calls the GPU's drawing functions.
 
 ### Interrupts: dispatch by source
@@ -383,7 +383,7 @@ polling, so these are counted (`uvd_encode_fences`, `vce_fences`) and shown to w
 video engines to the observer yet. `check_irq_port.py` also checks these ids and handlers and that both engines' start code still enables their sources.
 
 Nothing in the OS reacts to a hot plug yet: the connector cannot be re-detected (no AtomBIOS, no DDC/EDID over the card's own aux channels), so a plug or unplug is only counted and its state kept. Not done: the vline
-interrupt is not enabled (only classified and acknowledged), the audio and DP short-pulse (`DC_HPD_RX_INT`) interrupts; no ring reset or recovery after a fault (the engine has to be restarted).
+interrupt is not enabled (only classified and acknowledged), the audio and DP short-pulse (`DC_HPD_RX_INT`) interrupts; recovery from a fault is above.
 
 ### MSI: interrupts wake the CPU
 
@@ -399,6 +399,47 @@ when the counter moved (and once a second in case a message was lost); if not, M
 Host-tested: the capability programming (`PciMsiTest`: 32/64-bit, with and without per-vector masking, refusals, status bits never written, undone by the destructor) and that `Inputs::msi` changes only the ring's re-arm
 bit. Not tested: the handler and the loop (they need the kernel), and nothing has run on a real machine: whether the Kaby Lake-G's PCH/root port delivers the message, the APIC id format beyond 255 cores (refused),
 and the card's re-arm behaviour are unseen.
+
+### Recovery after a fault
+
+An engine that timed out on a fence or reported a fault is wedged (nothing is queued on it). `AmdVegaM::recover()` resets the ones that are and brings them back with empty rings; `Recovery` says whether graphics
+(with the compute queues) and the SDMA engines were reset and whether an engine did not come back. With `Inputs::auto_recover` (the desktop loop sets it) `service_interrupts()` does it by itself, at most
+`kMaxRecoveries` (8) times in a life of the card, so a card that keeps hanging is left alone; `recover()` by hand has no limit.
+- **Graphics and compute** (`AmdGfx8::recover`, from `gfx_v8_0_check_soft_reset` / `_pre_soft_reset` / `_soft_reset` / `_post_soft_reset`): the status registers decide what is reset (`GRBM_STATUS` busy bits: CP and GFX;
+  `GRBM_STATUS2`: the RLC, or CPF/CPC/CPG; `SRBM_STATUS`: pending GRBM requests, SEM); since a fence that never came shows nothing busy, the command processors are added when the status does not name them (the driver
+  would reset only what is busy; recovery from a wedged ring has to work whatever the status says). Pre: the RLC stopped, the graphics CP halted, every compute queue's hardware queue dequeued directly through its
+  registers (`gfx_v8_0_deactivate_hqd(adev, 2)`: the KIQ is not asked, it may be what hung) and the MEC halted. Reset: the memory controller's graphics clients stalled (`GMCON_DEBUG`), `GRBM_SOFT_RESET` and
+  `SRBM_SOFT_RESET` pulsed with the 50 us settling delays, the stall released. Post: the queues dequeued again, the KIQ and compute queues resumed and mapped (`kiq_resume`, `kcq_resume`), the graphics ring
+  programmed, all rings tested, the RLC started. The fence numbers start again (the write-back fence words are cleared so an old number cannot look like a new fence), the wedged state is gone, and the interrupt sources
+  the reset takes away (the CP's, ECC, SQ, the compute pipe's) are put back.
+- **SDMA** (`AmdSdma3::recover`, from `sdma_v3_0_pre_soft_reset` / `_soft_reset` / `_post_soft_reset`): context switching off and the engines halted, `SRBM_SOFT_RESET` for both engines pulsed, then `start()` again on the
+  same memory (the driver's `gfx_resume` and `rlc_resume`); both engines are reset together, as in the driver, and the trap interrupts are put back.
+- A fault of one compute queue resets all of them with the graphics engine, as the driver's soft reset of the IP does. An engine whose ring test fails after the reset is left stopped (`failed`); it counts as needing
+  recovery, so the next `recover()` tries it again.
+
+The simulated engines hang (`hung` for the command processor, `stall` for SDMA) until the reset pulse reaches them, unless told the reset does not work; the reset also takes their interrupt enables, hardware queues and
+doorbells away, so the ordering of the steps, the exact reset bits for each status, and what is restored are checked. `scripts/check_reset_port.py` compares the status bits, reset bits, pre/soft/post order, the reset pulses,
+the queue dequeue and the SDMA sequence with the kernel sources. Not done: resetting the video engines (UVD/VCE), and the replay of the work that was lost: callers see the failure of their
+submission and must resubmit. Whether a real CP comes back from `GRBM_SOFT_RESET` with the microcode the SMC loaded is what the driver relies on and has not been seen here.
+
+### Full reset of the card
+
+When an engine does not come back from its soft reset, `AmdVegaM::recover()` can fall back to resetting the whole card (`Inputs::allow_asic_reset`, with `Inputs::pci` and `pci_address` saying where the card is;
+`Recovery::card_reset` and `asic_resets()` say it happened, at most `kMaxAsicResets` (2) times). `AmdAsicReset::pci_config_reset` is `vi_asic_reset` -> `vi_asic_pci_config_reset`: the BIOS scratch register's
+"graphics engine hung" flag is set, bus mastering is switched off, the magic value 0x39d5e86b is written to dword 0x7c of the card's PCI configuration space (`amdgpu_device_pci_config_reset`), after 100 us the card has
+`usec_timeout` (100 ms) to answer reads of `CONFIG_MEMSIZE` again (all ones while it is in reset), bus mastering is switched back on if it did (not if it did not), and the flag is cleared either way. The VEGAM has
+no other method: the driver's BACO (power-off through the SMU) is only for Fiji, Tonga, Polaris 10, 11 and 12 and Topaz. `reset_card()` does it with the rest around it: everything is stopped (the display
+gets the firmware's framebuffer back), the card is reset, and `bring_up` is run again with the same inputs; `status()` says what failed ("card reset: ..." if the card did not answer, "after a card reset: ..." if
+the bring-up failed afterwards).
+
+**What this does not do, and what that means on a real card.** After a hardware reset the driver marks the card as needing a POST and runs the video BIOS's init tables (the memory controller's training, the
+clocks, the display PLLs) through its AtomBIOS interpreter, then initialises every block. This OS has no interpreter, so a card that has been reset comes back quiet - no engine, no DMA, bus mastering on or off as
+above - but its video memory is not trained, `bring_up` is expected to fail, and everything in video memory (including the firmware's framebuffer) is gone. The reset is therefore a last resort, off by default, and
+`main.cpp` allows it only when the card does not drive the display (a dark screen on top of a dead card is no improvement over a hung engine); the benefit is a card that is known to be quiescent instead of one that
+is hung and may still be mastering the bus. Host tests (`AmdAsicResetTest`, `AmdVegaMTest::test_card_reset`) cover the step order and timing, a slow card, a card that never answers, the fallback conditions and the
+cap, a card that is brought up again, and one that cannot be (not POSTed); the simulated card has none of the real one's behaviour here. `scripts/check_asic_reset_port.py` checks the steps, the value, the
+dword, the scratch register and flag, `CONFIG_MEMSIZE` and that the VEGAM is not a BACO chip against the kernel sources. Not done: the AtomBIOS POST (which would make the reset recoverable), the PCI-level resets
+(function level reset, secondary bus reset) the driver also has for other cases, and BACO.
 
 ## Radeon RX Vega M: UVD 6.3
 

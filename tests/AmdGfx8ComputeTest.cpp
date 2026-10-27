@@ -474,9 +474,61 @@ static void test_eop_interrupt() {
   CHECK(!second.set_eop_interrupt(true) && rig.card.writes.size() == writes);
 }
 
+// Recovery with the compute queues (gfx_v8_0_pre_soft_reset / _post_soft_reset): a hung command processor wedges a queue; the queues are dequeued through their registers, the CP is
+// reset, and the KIQ and the queues are set up and mapped again.
+static void test_recover() {
+  Rig rig;
+  AmdGfx8Compute compute(rig.card, rig.clock);
+  CHECK(compute.attach(rig.compute_memory()) == AmdGfx8Compute::Result::Ok);
+  AmdGfx8 gfx(rig.card, rig.clock);
+  gfx.attach_compute(&compute);
+  CHECK(gfx.start(rig.memory()) == AmdGfx8::Result::Ok);
+  CHECK(compute.set_eop_interrupt(true) && (rig.card.reg(0x3085) & 0x04000000));
+  const uint64_t data_address = rig.ib_gpu + 8192;
+  const std::vector<uint32_t> ib = make_ib(0x1000, data_address, 0xABC00000);
+  for (size_t i = 0; i < ib.size(); ++i) rig.card.put32(rig.ib_gpu + i * 4, ib[i]);
+  CHECK(compute.submit_ib(1, rig.ib_gpu, 256) && compute.submit_ib(1, rig.ib_gpu, 256) && compute.fence_sequence(1) == 2);
+  const size_t mapped_before = rig.card.mapped.size();
+  CHECK(mapped_before == 8);
+  rig.card.hung = true;
+  CHECK(!compute.submit_ib(1, rig.ib_gpu, 256, 2000) && compute.queue_wedged(1) && !compute.queue_wedged(0) && !gfx.wedged());
+  const size_t writes_before = rig.card.writes.size();
+  CHECK(gfx.recover() == AmdGfx8::Result::Ok && gfx.running());
+  // Each of the eight queues was dequeued (CP_HQD_DEQUEUE_REQUEST 0x325d = 2: the CP is hung but the queues are active), directly through its registers, before the reset.
+  size_t dequeues = 0, first_dequeue = ~size_t{0}, grbm_set = ~size_t{0}, mec_halt = ~size_t{0};
+  for (size_t i = writes_before; i < rig.card.writes.size(); ++i) {
+    const uint32_t r = rig.card.writes[i].first, v = rig.card.writes[i].second;
+    if (r == 0x325d && v == 2) { ++dequeues; if (first_dequeue == ~size_t{0}) first_dequeue = i; }
+    if (r == 0x2008 && v != 0 && grbm_set == ~size_t{0}) grbm_set = i;
+    if (r == fakegfx::kCpMecCntl && (v & (fakegfx::kMecMe1Halt | fakegfx::kMecMe2Halt)) == (fakegfx::kMecMe1Halt | fakegfx::kMecMe2Halt) && mec_halt == ~size_t{0}) mec_halt = i;
+  }
+  size_t wptr_clears = 0;
+  for (size_t i = writes_before; i < rig.card.writes.size(); ++i) wptr_clears += rig.card.writes[i].first == 0x3255 && rig.card.writes[i].second == 0;   // CP_HQD_PQ_WPTR
+  CHECK(dequeues == 8 && first_dequeue < mec_halt && mec_halt < grbm_set && wptr_clears >= 16);
+  // The queues are mapped again (the KIQ's SET_RESOURCES and eight MAP_QUEUES), the software state is clean, the interrupt is back, and everything works.
+  CHECK(rig.card.mapped.size() == mapped_before + 8 && rig.card.compute_protocol_errors == 0);
+  CHECK(!compute.queue_wedged(1) && compute.fence_sequence(1) == 0 && compute.fence_sequence(0) == 0 && (rig.card.reg(0x3085) & 0x04000000));
+  for (uint32_t queue : {0u, 1u, 7u}) CHECK(compute.submit_ib(queue, rig.ib_gpu, 256) && compute.fence_sequence(queue) == 1 && rig.card.get32(rig.compute_gpu + (queue + 1) * kSlot + 4096 + 8192 + 4096 + 16) == 1);
+  CHECK(rig.card.ib_protocol_errors == 0);
+  // A reset that does not bring the CP back: the compute rings are not usable either.
+  Rig r2;
+  AmdGfx8Compute c2(r2.card, r2.clock);
+  CHECK(c2.attach(r2.compute_memory()) == AmdGfx8Compute::Result::Ok);
+  AmdGfx8 g2(r2.card, r2.clock);
+  g2.attach_compute(&c2);
+  CHECK(g2.start(r2.memory()) == AmdGfx8::Result::Ok);
+  r2.card.hung = true;
+  r2.card.reset_fails = true;
+  CHECK(!c2.submit_ib(0, r2.ib_gpu, 256, 2000) && c2.queue_wedged(0));
+  CHECK(g2.recover(2000) != AmdGfx8::Result::Ok && !g2.running());
+  const uint32_t stuck_wptr = c2.write_pointer(2);
+  CHECK(!c2.submit_ib(1, r2.ib_gpu, 256) && c2.write_pointer(2) == stuck_wptr && !c2.queue_wedged(1));   // (refused before anything is queued: the queues are not ready)
+}
+
 int main() {
   test_start();
   test_stop();
+  test_recover();
   test_eop_interrupt();
   test_fewer_queues();
   test_other_pipe_and_doorbells();

@@ -357,6 +357,53 @@ static void test_trap_interrupts() {
   CHECK(rig.card.reg(0x3404) == 0x40006 && rig.card.reg(0x3604) == 0x0);
 }
 
+// Recovery (sdma_v3_0_pre_soft_reset / _soft_reset / _post_soft_reset): a stalled engine wedges its ring; recover() halts both engines, pulses SRBM_SOFT_RESET for both and starts them
+// again.
+static void test_recover() {
+  Rig rig;
+  AmdSdma3 sdma(rig.card, rig.clock);
+  CHECK(sdma.recover() == AmdSdma3::Result::BadArgument);   // never started
+  CHECK(sdma.start(rig.memory()) == AmdSdma3::Result::Ok);
+  sdma.set_trap_interrupts(true);
+  for (int i = 0; i < 64; ++i) rig.card.put32(rig.data_gpu + i * 4, 0x01010101u * (i + 1));
+  CHECK(sdma.copy(0, rig.data_gpu, rig.dst_gpu, 64) && sdma.copy(1, rig.data_gpu, rig.dst_gpu + 64, 64));
+  rig.card.stall[0] = true;
+  CHECK(!sdma.copy(0, rig.data_gpu, rig.dst_gpu + 128, 64, 2000) && sdma.wedged(0) && !sdma.wedged(1));
+  const size_t before = rig.card.writes.size(), resets_before = rig.card.srbm_resets.size();
+  CHECK(sdma.recover() == AmdSdma3::Result::Ok);
+  CHECK(sdma.running() && !sdma.wedged(0) && !sdma.wedged(1) && sdma.recoveries() == 1 && !rig.card.stall[0]);
+  // Both engines in SRBM_SOFT_RESET (SOFT_RESET_SDMA 0x100000, SOFT_RESET_SDMA1 0x40), set then cleared.
+  CHECK(rig.card.srbm_resets.size() == resets_before + 2 && rig.card.srbm_resets[resets_before] == 0x100040 && rig.card.srbm_resets[resets_before + 1] == 0);
+  // The order: context switching off, the engines halted (as in stop()), then the reset, then the rings programmed again.
+  {
+    int ctx0 = -1, halt0 = -1, set = -1, clear = -1, rb_base = -1;
+    for (size_t i = before; i < rig.card.writes.size(); ++i) {
+      const uint32_t r = rig.card.writes[i].first, v = rig.card.writes[i].second;
+      if (r == 0x3404 && (v & 0x40002) == 0x2 && ctx0 < 0) ctx0 = static_cast<int>(i);   // (AUTO_CTXSW_ENABLE off, ATC_L1_ENABLE on; TRAP_ENABLE is whatever it was)
+      if (r == 0x3412 && v == 1 && halt0 < 0) halt0 = static_cast<int>(i);
+      if (r == 0x398 && v != 0) set = static_cast<int>(i);
+      if (r == 0x398 && v == 0) clear = static_cast<int>(i);
+      if (r == 0x3481 && clear >= 0 && rb_base < 0) rb_base = static_cast<int>(i);   // SDMA0_GFX_RB_BASE
+    }
+    CHECK(ctx0 >= 0 && ctx0 < halt0 && halt0 < set && set < clear && clear < rb_base);
+  }
+  // The reset took TRAP_ENABLE away; it is back. The engines copy again, from nothing, with fence numbers from 1.
+  CHECK((rig.card.reg(0x3404) & 1) && (rig.card.reg(0x3604) & 1));
+  CHECK(sdma.copy(0, rig.data_gpu, rig.dst_gpu + 192, 64) && sdma.copy(1, rig.data_gpu, rig.dst_gpu + 256, 64));
+  CHECK(rig.card.get32(rig.dst_gpu + 192 + 4) == 0x02020202 && rig.card.get32(rig.dst_gpu + 256 + 60) == 0x10101010 && rig.card.protocol_errors == 0);
+  // A fence that is never written wedges the other way; the reset is the same.
+  rig.card.ignore_fences = true;
+  CHECK(!sdma.copy(1, rig.data_gpu, rig.dst_gpu + 320, 64, 2000) && sdma.wedged(1));
+  CHECK(sdma.recover() == AmdSdma3::Result::Ok && !sdma.wedged(1) && !rig.card.ignore_fences && sdma.copy(1, rig.data_gpu, rig.dst_gpu + 320, 64));
+  // A reset that does not bring the engine back: the ring test fails, the engines are left stopped.
+  rig.card.stall[1] = true;
+  rig.card.reset_fails = true;
+  CHECK(!sdma.copy(1, rig.data_gpu, rig.dst_gpu + 384, 64, 2000) && sdma.wedged(1));
+  CHECK(sdma.recover(2000) == AmdSdma3::Result::RingTestFailed && !sdma.running() && !sdma.copy(0, rig.data_gpu, rig.dst_gpu + 384, 64));
+  rig.card.reset_fails = false;
+  CHECK(sdma.recover() == AmdSdma3::Result::Ok && sdma.running() && sdma.copy(1, rig.data_gpu, rig.dst_gpu + 384, 64) && sdma.recoveries() == 4);
+}
+
 int main() {
   test_start();
   test_copy_fill();
@@ -368,6 +415,7 @@ int main() {
   test_ring_space();
   test_stop();
   test_trap_interrupts();
+  test_recover();
   printf(g_failed ? "AmdSdma3Test: %d FAILED\n" : "AmdSdma3Test: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }

@@ -1,0 +1,173 @@
+/*
+ * TheoryCraftOS - a minimal UEFI x86_64 operating system.
+ * Copyright (C) 2026 Christopher Schaefer
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+#pragma once
+#include <stdint.h>
+#include "Emulation/GuestCpu.hpp"
+#include "Emulation/SoftFloatExt.hpp"
+
+namespace emulation {
+
+// An x86-64 user-mode interpreter: the integer instruction set (including the legacy prefixes, SIB/RIP-relative addressing, string instructions with REP, and
+// the 64-bit multiply and divide), SYSCALL, CPUID, and the SSE2 integer and move instructions compilers emit for memcpy and friends. Not covered: x87,
+// floating-point SSE arithmetic (the kernel has no floating point), AVX, and the system instructions; these stop the program with an invalid-opcode fault.
+//
+// Flags are computed eagerly after every instruction that sets them. Execution is one instruction per decode (no translation cache yet): the dispatch is a plain
+// switch, which keeps it simple enough to test against compiler output and leaves room for a block translator behind the same IGuestCpu interface.
+class X86_64Cpu final : public IGuestCpu {
+ public:
+  struct Xmm {
+    uint64_t lo = 0, hi = 0;
+  };
+  struct State {
+    uint64_t r[16] = {};
+    uint64_t rip = 0;
+    uint64_t rflags = 2;
+    uint64_t fs_base = 0, gs_base = 0;
+    Xmm xmm[17];      // XMM0..15 (the low halves of YMM0..15) and a scratch slot that the AVX code uses
+    Xmm ymm_high[16];      // bits 255:128 of YMM0..15
+    uint32_t mxcsr = 0x1F80;      // all exceptions masked, round to nearest
+    // x87: eight 80-bit registers used as a stack (physical registers; TOP is in bits 11..13 of the status word), the control and status words, and which
+    // physical registers hold a value (the others are "empty").
+    softfloat::Ext st[8];
+    uint16_t fpu_control = 0x37F, fpu_status = 0;
+    uint8_t fpu_valid = 0;
+  };
+  static constexpr uint64_t kCarry = 1, kParity = 4, kAdjust = 0x10, kZero = 0x40, kSign = 0x80, kDirection = 0x400, kOverflow = 0x800;
+
+  process::UserArch arch() const override { return process::UserArch::X86_64; }
+  void reset(const process::ProgramStart& start) override;
+  StopReason run(GuestMemory& memory, uint64_t max_instructions) override;
+  bool pending_syscall(process::SyscallAbi abi, process::SyscallRequest* out) const override;
+  void finish_syscall(uint64_t result) override { s_.r[0] = result; }
+  void set_thread_pointers(bool fs_changed, uint64_t fs, bool gs_changed, uint64_t gs) override {
+    if (fs_changed) s_.fs_base = fs;
+    if (gs_changed) s_.gs_base = gs;
+  }
+  const GuestFault& fault() const override { return fault_; }
+  uint64_t instructions() const override { return retired_; }
+  bool get_x86_context(process::X86Context* out) const override;
+  bool set_x86_context(const process::X86Context& context) override;
+  UniquePointer<IGuestCpu> clone_for_thread(allocators::IAllocator& allocator, uint64_t stack_pointer, bool set_tls, uint64_t tls) const override;
+
+  State& state() { return s_; }
+  const State& state() const { return s_; }
+
+ private:
+  enum class Step : uint8_t { Ok, Syscall, Fault };
+  // What the instruction being executed looks like so far.
+  struct Decoded {
+    uint8_t bytes[16] = {};
+    uint32_t available = 0, position = 0;
+    bool truncated = false;      // it needed more bytes than there were
+    bool rex_present = false, rex_w = false, rex_r = false, rex_x = false, rex_b = false;
+    bool operand16 = false, address32 = false, rep = false, repne = false;
+    uint8_t segment = 0;         // 0 none, 1 FS, 2 GS
+    uint8_t mod = 0;
+    uint8_t reg = 0, rm = 0;     // with the REX extensions applied
+    bool rip_relative = false;
+    int64_t displacement = 0;
+    uint64_t ea = 0;
+  };
+
+  uint8_t next_u8();
+  uint64_t next_imm(uint32_t bytes, bool sign_extend);
+  bool decode_modrm();
+  bool finish_decode();
+  uint64_t operand_size() const { return d_.rex_w ? 8 : d_.operand16 ? 2 : 4; }
+
+  uint64_t get_reg(uint32_t index, uint32_t size) const;
+  void set_reg(uint32_t index, uint32_t size, uint64_t value);
+  bool load(GuestMemory& m, uint64_t address, uint32_t size, uint64_t* out);
+  bool store(GuestMemory& m, uint64_t address, uint32_t size, uint64_t value);
+  uint64_t memory_address() const;
+  bool read_rm(GuestMemory& m, uint32_t size, uint64_t* out);
+  bool write_rm(GuestMemory& m, uint32_t size, uint64_t value);
+  bool read_xmm_rm(GuestMemory& m, Xmm* out);
+  bool write_xmm_rm(GuestMemory& m, const Xmm& value);
+  bool push(GuestMemory& m, uint64_t value);
+  bool pop(GuestMemory& m, uint64_t* out);
+  Step fail(uint8_t vector, uint64_t address = 0, uint32_t error = 0x10);      // (a page fault is by default an instruction fetch; data accesses say otherwise)
+
+  uint64_t alu(uint32_t op, uint64_t a, uint64_t b, uint32_t size);
+  uint64_t shift(uint32_t op, uint64_t value, uint32_t count, uint32_t size);
+  void set_logic_flags(uint64_t result, uint32_t size);
+  void set_result_flags(uint64_t result, uint32_t size);
+  bool condition(uint32_t code) const;
+  bool divide(bool is_signed, uint32_t size, uint64_t hi, uint64_t lo, uint64_t divisor, uint64_t* quotient, uint64_t* remainder);
+  Step string_instruction(GuestMemory& m, uint8_t opcode);
+  Step step(GuestMemory& m);
+  Step step_0f(GuestMemory& m);
+  Step step_sse(GuestMemory& m, uint8_t opcode);
+  // The floating-point SSE/SSE2 opcodes (soft-float); sets *handled false for an opcode that is not one of them.
+  Step step_float(GuestMemory& m, uint8_t opcode, bool* handled);
+  bool read_scalar(GuestMemory& m, uint32_t size, uint64_t* out);
+  Step step_group_f(GuestMemory& m, uint8_t opcode);
+  Step step_x87(GuestMemory& m, uint8_t opcode);      // D8..DF (X86_64X87.cpp)
+  // AVX/AVX2/FMA/BMI (X86_64Vex.cpp)
+  Step step_vex(GuestMemory& m, uint8_t first_byte);
+  Step vex_simd(GuestMemory& m, uint8_t opcode, uint32_t flags, bool wide, uint32_t vvvv);
+  Step vex_map2(GuestMemory& m, uint8_t opcode, bool wide, uint32_t vvvv);
+  Step vex_map3(GuestMemory& m, uint8_t opcode, bool wide, uint32_t vvvv);
+  Step legacy_sse_map(GuestMemory& m, uint32_t map, uint8_t opcode);      // SSSE3 / SSE4 without a VEX prefix (0F 38 and 0F 3A)
+  Step crc32_instruction(GuestMemory& m, uint8_t opcode);
+  Step crypto_map(GuestMemory& m, uint32_t map, uint8_t opcode, bool wide, uint32_t vvvv);      // X86_64Crypto.cpp: AES-NI, PCLMULQDQ, SHA
+  Step vex_gather(GuestMemory& m, uint8_t opcode, bool wide, uint32_t vvvv);
+  Step vex_fma(GuestMemory& m, uint8_t opcode, bool wide, uint32_t vvvv);
+  Step vex_bmi(GuestMemory& m, int map, uint8_t opcode, bool wide, uint32_t vvvv);
+  Step xsave_family(GuestMemory& m, uint32_t kind);
+  bool read_y(GuestMemory& m, uint32_t bytes, Xmm out[2]);      // the r/m operand of a VEX instruction: a register or memory, 16 or 32 bytes
+  struct VexState {
+    bool redirect = false;      // the register r/m operand of an SSE core is read from the scratch slot
+    uint32_t half = 0;          // 0 or 1: the 128-bit half being processed (memory operands move by 16 bytes)
+    bool active = false;
+    bool wide = false;          // VEX.L: 256-bit
+    uint32_t vvvv = 0;
+  } vex_;
+  // the x87 stack
+  uint32_t x87_top() const { return (s_.fpu_status >> 11) & 7; }
+  void x87_set_top(uint32_t top) { s_.fpu_status = static_cast<uint16_t>((s_.fpu_status & ~0x3800) | ((top & 7) << 11)); }
+  softfloat::Ext& x87_phys(uint32_t stack_index) { return s_.st[(x87_top() + stack_index) & 7]; }
+  const softfloat::Ext& x87_phys(uint32_t stack_index) const { return s_.st[(x87_top() + stack_index) & 7]; }
+  bool x87_empty(uint32_t stack_index) const { return !((s_.fpu_valid >> ((x87_top() + stack_index) & 7)) & 1); }
+  softfloat::Ext x87_read(uint32_t stack_index, softfloat::Env& env);
+  bool x87_push(const softfloat::Ext& value, softfloat::Env& env);
+  void x87_pop();
+  void x87_set_cc(bool c0, bool c1, bool c2, bool c3);
+  // The exception flags are sticky; C1 reports "rounded up" for an instruction that produced a result (unless it already set C1 for a stack overflow).
+  void x87_finish(const softfloat::Env& env) {
+    uint16_t status = static_cast<uint16_t>(s_.fpu_status | (env.flags & 0x3F));
+    if (!x87_c1_set_) status = static_cast<uint16_t>((status & ~0x0200) | ((env.flags & 0x20) && env.rounded_up ? 0x0200 : 0));
+    s_.fpu_status = status;
+  }
+  bool x87_c1_set_ = false;
+  bool x87_underflowed_ = false;      // an operand of the instruction being executed was an empty register (its result is the real indefinite)
+  uint16_t x87_tag_word() const;
+  void x87_reset();
+  bool x87_load_ext(GuestMemory& m, uint64_t address, softfloat::Ext* out);
+  bool x87_store_ext(GuestMemory& m, uint64_t address, const softfloat::Ext& value);
+  void save_fpu_image(uint8_t* image) const;      // the 512-byte FXSAVE layout
+  void load_fpu_image(const uint8_t* image);
+
+  State s_;
+  Decoded d_;
+  GuestFault fault_;
+  uint64_t retired_ = 0;
+  uint64_t instruction_start_ = 0;
+};
+
+}  // namespace emulation

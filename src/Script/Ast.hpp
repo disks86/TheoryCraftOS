@@ -53,6 +53,8 @@ enum NodeFlag : uint8_t {
   kFlagComputed = 2,     // Property: [key]: value
   kFlagShorthand = 4,    // Property: { name }
   kFlagOptional = 8,     // Member / Index / Call: ?.
+  kFlagLegacyOctal = 16, // Number / String: written as a legacy octal literal or with an octal escape (an error in strict mode code)
+  kFlagPrologue = 16,    // Var: unpacks a parameter that is a pattern (it comes before the directives of the body)
   kFlagPatternAssign = 64,   // Call: a lowered `pattern = value`; c is the original Assign, for when it turns out to be a nested pattern with a default
   kFlagArrow = 1,        // Function
   kFlagExprBody = 2,     // Function: arrow with an expression as its body

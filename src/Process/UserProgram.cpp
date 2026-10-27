@@ -238,7 +238,8 @@ LoadStatus UserProgram::load(ConstByteView file, ArrayView<const StringView> arg
     if (!bind_executable(elf, &binding)) return LoadStatus::Unsupported;
     LoadStatus status = load_elf(elf, file, space_, &image);
     if (status == LoadStatus::Ok) status = map_stack(space_, kDefaultStackBytes, &stack_top);
-    if (status == LoadStatus::Ok) status = build_linux_stack(space_, stack_top, image, arguments, environment, path, random, &stack_pointer);
+    if (status == LoadStatus::Ok) status = build_linux_stack(space_, stack_top, image, arguments, environment, path, random, &stack_pointer,
+                                                                       binding.arch == UserArch::AArch64 ? StringView("aarch64") : binding.arch == UserArch::RiscV64 ? StringView("riscv64") : StringView("x86_64"));
     if (status != LoadStatus::Ok) return status;
     if (!AddressSpace::round_up(image.end, &heap_start)) return LoadStatus::Malformed;
   } else if (kind == exe::ExecutableKind::Pe) {

@@ -2,8 +2,11 @@
 // (Copyright Advanced Micro Devices, Inc.; MIT license). Register numbers are dwords; *_BASE_IDX picks the segment base of the register block.
 // Do not edit by hand: change AmdGfx8Compute.cpp and run the script again.
 
+constexpr uint32_t CP_HQD_ACTIVE__ACTIVE_MASK = 0x00000001;
 constexpr uint32_t CP_HQD_CTX_SAVE_CONTROL__MTYPE_MASK = 0x00000006;
 constexpr uint32_t CP_HQD_CTX_SAVE_CONTROL__MTYPE__SHIFT = 0x00000001;
+constexpr uint32_t CP_HQD_DEQUEUE_REQUEST__DEQUEUE_REQ_MASK = 0x00000007;
+constexpr uint32_t CP_HQD_DEQUEUE_REQUEST__DEQUEUE_REQ__SHIFT = 0x00000000;
 constexpr uint32_t CP_HQD_EOP_CONTROL__EOP_SIZE_MASK = 0x0000003F;
 constexpr uint32_t CP_HQD_EOP_CONTROL__EOP_SIZE__SHIFT = 0x00000000;
 constexpr uint32_t CP_HQD_IB_CONTROL__MIN_IB_AVAIL_SIZE_MASK = 0x00300000;
@@ -63,6 +66,7 @@ constexpr uint32_t mmCP_HQD_CTX_SAVE_BASE_ADDR_HI = 0x00003271;
 constexpr uint32_t mmCP_HQD_CTX_SAVE_BASE_ADDR_LO = 0x00003270;
 constexpr uint32_t mmCP_HQD_CTX_SAVE_CONTROL = 0x00003272;
 constexpr uint32_t mmCP_HQD_CTX_SAVE_SIZE = 0x00003276;
+constexpr uint32_t mmCP_HQD_DEQUEUE_REQUEST = 0x0000325D;
 constexpr uint32_t mmCP_HQD_EOP_CONTROL = 0x0000326C;
 constexpr uint32_t mmCP_HQD_EOP_DONES = 0x0000327A;
 constexpr uint32_t mmCP_HQD_EOP_EVENTS = 0x0000326F;
@@ -76,6 +80,7 @@ constexpr uint32_t mmCP_HQD_PERSISTENT_STATE = 0x00003249;
 constexpr uint32_t mmCP_HQD_PQ_CONTROL = 0x00003256;
 constexpr uint32_t mmCP_HQD_PQ_DOORBELL_CONTROL = 0x00003254;
 constexpr uint32_t mmCP_HQD_PQ_RPTR = 0x0000324F;
+constexpr uint32_t mmCP_HQD_PQ_WPTR = 0x00003255;
 constexpr uint32_t mmCP_HQD_QUANTUM = 0x0000324C;
 constexpr uint32_t mmCP_HQD_VMID = 0x00003248;
 constexpr uint32_t mmCP_HQD_WG_STATE_OFFSET = 0x00003275;

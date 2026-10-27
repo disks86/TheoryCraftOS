@@ -41,6 +41,9 @@ struct ProgramRun {
   // The program's console, if the caller wants to feed its input and send Ctrl+C (push_input(), close_input(), interrupt()) from another thread. Without
   // one the program gets an empty input.
   ProgramHost* host = nullptr;
+  // Run the program on the in-kernel emulator even when it is for this machine's own CPU (to compare the two, or to run it without the CPU's user mode). A program for
+  // any other CPU is always emulated.
+  bool force_emulation = false;
 };
 
 enum class RunResult : uint8_t {
@@ -51,7 +54,8 @@ enum class RunResult : uint8_t {
 };
 
 // Runs the program in user mode and waits for it, passing its output on while it runs. The calling thread blocks; the program has the "/Linux" or "/Windows"
-// folder of the OS file system as its whole file system (the folders are made if missing). Only x86-64 can run programs so far.
+// folder of the OS file system as its whole file system (the folders are made if missing). A program built for this machine's CPU runs directly in user mode (x86-64
+// only so far); one built for another CPU runs on the emulator (src/Emulation), which can do x86-64 guests.
 RunResult run_program(const ProgramRun& run, uint32_t* exit_code, String* message);
 
 // The launcher the terminals use: runs programs with run_program() on the kernel's user mode, feeding them the terminal's input.

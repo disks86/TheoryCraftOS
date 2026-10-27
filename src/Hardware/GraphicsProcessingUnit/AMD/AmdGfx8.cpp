@@ -160,12 +160,14 @@ void AmdGfx8::wait_for_rlc_serdes(uint32_t timeout_us) {
 }
 
 void AmdGfx8::set_interrupts(bool enable) {
+  int_gfx_ = enable;
   const uint32_t bits = CP_INT_CNTL_RING0__TIME_STAMP_INT_ENABLE_MASK | CP_INT_CNTL_RING0__PRIV_REG_INT_ENABLE_MASK | CP_INT_CNTL_RING0__PRIV_INSTR_INT_ENABLE_MASK;
   const uint32_t tmp = rd(mmCP_INT_CNTL_RING0);
   wr(mmCP_INT_CNTL_RING0, enable ? (tmp | bits) : (tmp & ~bits));
 }
 
 void AmdGfx8::set_ecc_interrupts(bool enable) {
+  int_ecc_ = enable;
   struct Control { uint32_t reg, mask; };
   static const Control kControls[] = {
       {mmCP_INT_CNTL, CP_INT_CNTL__CP_ECC_ERROR_INT_ENABLE_MASK},
@@ -189,6 +191,7 @@ void AmdGfx8::set_ecc_interrupts(bool enable) {
 }
 
 void AmdGfx8::set_sq_interrupts(bool enable) {
+  int_sq_ = enable;
   const uint32_t tmp = rd(mmSQ_INTERRUPT_MSG_CTRL);
   wr(mmSQ_INTERRUPT_MSG_CTRL, enable ? (tmp & ~SQ_INTERRUPT_MSG_CTRL__STALL_MASK) : (tmp | SQ_INTERRUPT_MSG_CTRL__STALL_MASK));
 }
@@ -688,6 +691,119 @@ AmdGfx8::Result AmdGfx8::start(const Memory& memory, uint32_t timeout_us) {
   if (!test_ring(timeout_us)) return Result::RingTestFailed;
   if (compute_ && compute_->test_rings(timeout_us) != AmdGfx8Compute::Result::Ok) return Result::ComputeFailed;
   gui_idle_interrupt(true);
+  running_ = true;
+  return Result::Ok;
+}
+
+// The interrupt sources a reset takes away, as they were asked for.
+void AmdGfx8::apply_interrupts() {
+  if (int_gfx_) set_interrupts(true);
+  if (int_ecc_) set_ecc_interrupts(true);
+  if (int_sq_) set_sq_interrupts(true);
+  if (compute_ && compute_->eop_interrupt_wanted()) compute_->set_eop_interrupt(true);
+}
+
+// gfx_v8_0_check_soft_reset
+void AmdGfx8::check_soft_reset(uint32_t* grbm_soft_reset, uint32_t* srbm_soft_reset) {
+  uint32_t grbm = 0, srbm = 0;
+  /* GRBM_STATUS */
+  uint32_t tmp = rd(mmGRBM_STATUS);
+  if (tmp & (GRBM_STATUS__PA_BUSY_MASK | GRBM_STATUS__SC_BUSY_MASK | GRBM_STATUS__BCI_BUSY_MASK | GRBM_STATUS__SX_BUSY_MASK | GRBM_STATUS__TA_BUSY_MASK |
+             GRBM_STATUS__VGT_BUSY_MASK | GRBM_STATUS__DB_BUSY_MASK | GRBM_STATUS__CB_BUSY_MASK | GRBM_STATUS__GDS_BUSY_MASK | GRBM_STATUS__SPI_BUSY_MASK |
+             GRBM_STATUS__IA_BUSY_MASK | GRBM_STATUS__IA_BUSY_NO_DMA_MASK | GRBM_STATUS__CP_BUSY_MASK | GRBM_STATUS__CP_COHERENCY_BUSY_MASK)) {
+    grbm |= GRBM_SOFT_RESET__SOFT_RESET_CP_MASK | GRBM_SOFT_RESET__SOFT_RESET_GFX_MASK;
+    srbm |= SRBM_SOFT_RESET__SOFT_RESET_GRBM_MASK;
+  }
+  /* GRBM_STATUS2 */
+  tmp = rd(mmGRBM_STATUS2);
+  if (tmp & GRBM_STATUS2__RLC_BUSY_MASK) grbm |= GRBM_SOFT_RESET__SOFT_RESET_RLC_MASK;
+  if (tmp & (GRBM_STATUS2__CPF_BUSY_MASK | GRBM_STATUS2__CPC_BUSY_MASK | GRBM_STATUS2__CPG_BUSY_MASK)) {
+    grbm |= GRBM_SOFT_RESET__SOFT_RESET_CPF_MASK | GRBM_SOFT_RESET__SOFT_RESET_CPC_MASK | GRBM_SOFT_RESET__SOFT_RESET_CPG_MASK;
+    srbm |= SRBM_SOFT_RESET__SOFT_RESET_GRBM_MASK;
+  }
+  /* SRBM_STATUS */
+  tmp = rd(mmSRBM_STATUS);
+  if (tmp & SRBM_STATUS__GRBM_RQ_PENDING_MASK) srbm |= SRBM_SOFT_RESET__SOFT_RESET_GRBM_MASK;
+  if (tmp & SRBM_STATUS__SEM_BUSY_MASK) srbm |= SRBM_SOFT_RESET__SOFT_RESET_SEM_MASK;
+  *grbm_soft_reset = grbm;
+  *srbm_soft_reset = srbm;
+}
+
+AmdGfx8::Result AmdGfx8::recover(uint32_t timeout_us) {
+  if (!memory_.ring.valid()) return Result::BadArgument;   // never started
+  uint32_t grbm_soft_reset = 0, srbm_soft_reset = 0;
+  check_soft_reset(&grbm_soft_reset, &srbm_soft_reset);
+  const uint32_t command_processor_bits = GRBM_SOFT_RESET__SOFT_RESET_CP_MASK | GRBM_SOFT_RESET__SOFT_RESET_GFX_MASK | GRBM_SOFT_RESET__SOFT_RESET_CPF_MASK |
+                                          GRBM_SOFT_RESET__SOFT_RESET_CPC_MASK | GRBM_SOFT_RESET__SOFT_RESET_CPG_MASK;
+  if (!(grbm_soft_reset & command_processor_bits)) {
+    // (the status does not show the command processors busy: the hang is in what it does not show, e.g. a fence that was never written. The driver would reset only what is busy;
+    // recovering from a wedged ring has to reset them whatever the status says.)
+    grbm_soft_reset |= command_processor_bits;
+    srbm_soft_reset |= SRBM_SOFT_RESET__SOFT_RESET_GRBM_MASK;
+  }
+  const bool graphics = (grbm_soft_reset & (GRBM_SOFT_RESET__SOFT_RESET_CP_MASK | GRBM_SOFT_RESET__SOFT_RESET_GFX_MASK)) != 0;
+  const bool command_processors = (grbm_soft_reset & (GRBM_SOFT_RESET__SOFT_RESET_CP_MASK | GRBM_SOFT_RESET__SOFT_RESET_CPF_MASK | GRBM_SOFT_RESET__SOFT_RESET_CPC_MASK |
+                                                       GRBM_SOFT_RESET__SOFT_RESET_CPG_MASK)) != 0;
+  running_ = false;
+  ++recoveries_;
+
+  // gfx_v8_0_pre_soft_reset: stop the rlc, disable GFX parsing/prefetching, dequeue the compute queues and disable MEC parsing/prefetching
+  rlc_stop(timeout_us);
+  if (graphics) cp_gfx_enable(false);
+  if (command_processors) {
+    if (compute_ && compute_->attached()) compute_->deactivate_queues(timeout_us);
+    wr(mmCP_MEC_CNTL, CP_MEC_CNTL__MEC_ME1_HALT_MASK | CP_MEC_CNTL__MEC_ME2_HALT_MASK);   // gfx_v8_0_cp_compute_enable(false)
+    delay_us(50);
+  }
+
+  // gfx_v8_0_soft_reset: stall the memory controller's graphics clients, pulse the resets, let go
+  uint32_t tmp = rd(mmGMCON_DEBUG);
+  wr(mmGMCON_DEBUG, tmp | GMCON_DEBUG__GFX_STALL_MASK | GMCON_DEBUG__GFX_CLEAR_MASK);
+  delay_us(50);
+  if (grbm_soft_reset) {
+    tmp = rd(mmGRBM_SOFT_RESET);
+    tmp |= grbm_soft_reset;
+    wr(mmGRBM_SOFT_RESET, tmp);
+    tmp = rd(mmGRBM_SOFT_RESET);
+    delay_us(50);
+    tmp &= ~grbm_soft_reset;
+    wr(mmGRBM_SOFT_RESET, tmp);
+    tmp = rd(mmGRBM_SOFT_RESET);
+  }
+  if (srbm_soft_reset) {
+    tmp = rd(mmSRBM_SOFT_RESET);
+    tmp |= srbm_soft_reset;
+    wr(mmSRBM_SOFT_RESET, tmp);
+    tmp = rd(mmSRBM_SOFT_RESET);
+    delay_us(50);
+    tmp &= ~srbm_soft_reset;
+    wr(mmSRBM_SOFT_RESET, tmp);
+    tmp = rd(mmSRBM_SOFT_RESET);
+  }
+  tmp = rd(mmGMCON_DEBUG);
+  wr(mmGMCON_DEBUG, tmp & ~(GMCON_DEBUG__GFX_STALL_MASK | GMCON_DEBUG__GFX_CLEAR_MASK));
+  delay_us(50);   // wait a little for things to settle down
+
+  // gfx_v8_0_post_soft_reset: the rings start again from nothing
+  wedged_ = false;
+  fence_sequence_ = 0;
+  memory_.writeback.write32(kFenceWordOffset, 0);
+  if (compute_ && compute_->attached()) compute_->clear_queue_state();
+  gui_idle_interrupt(false);
+  if (command_processors) {
+    if (compute_ && compute_->attached()) {
+      compute_->deactivate_queues(timeout_us);
+      compute_->kiq_resume();
+      compute_->kcq_resume();
+    }
+  }
+  if (graphics) cp_resume_ring(memory_);
+  apply_interrupts();
+  // gfx_v8_0_cp_test_all_rings, then the RLC
+  if (!test_ring(timeout_us)) return Result::RingTestFailed;
+  if (compute_ && compute_->attached() && compute_->test_rings(timeout_us) != AmdGfx8Compute::Result::Ok) return Result::ComputeFailed;
+  gui_idle_interrupt(true);
+  rlc_start();
   running_ = true;
   return Result::Ok;
 }

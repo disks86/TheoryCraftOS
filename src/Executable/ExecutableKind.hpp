@@ -25,12 +25,19 @@ namespace exe {
 
 enum class ExecutableKind : uint8_t { None, Elf, Pe };
 
+// The CPU an executable was built for, as its header says. Other is a machine this OS has no name for (or a header too short to tell).
+enum class Architecture : uint8_t { Unknown, X86_64, AArch64, RiscV64, X86_32, Arm32, Other };
+
 // How many bytes from the start of a file identify it (the PE signature sits where the DOS header says, normally in the first few hundred bytes).
 constexpr uint64_t kIdentifyBytes = 4096;
 
 // Is this the start of an ELF or PE file? Looks at the magic numbers only (a PE needs its "PE\0\0" signature inside `head`), so it is cheap and
 // does not accept every file that happens to start with "MZ".
 ExecutableKind identify_executable(ConstByteView head);
+// The machine field of an ELF header or a PE file header, read from `head` alone (no parse, no allocation). A big-endian ELF is Other: the loader cannot run it on
+// any CPU this OS has. Unknown if `head` is neither an ELF nor a PE file.
+Architecture identify_architecture(ConstByteView head);
+StringView architecture_name(Architecture arch);      // "x86-64", "AArch64", "RISC-V 64", ...
 // Reads the start of the file at `path` and identifies it; None if it cannot be read.
 ExecutableKind identify_executable_file(filesystem::IFileSystem& fs, StringView path);
 StringView executable_kind_name(ExecutableKind kind);      // "ELF", "PE", ""

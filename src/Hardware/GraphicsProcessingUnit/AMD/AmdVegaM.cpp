@@ -366,7 +366,61 @@ bool AmdVegaM::download(ByteView destination, uint64_t offset, uint32_t instance
 
 uint32_t AmdVegaM::service_interrupts(uint32_t max_vectors) {
   if (!up() || !ih_ || !irq_) return 0;
-  return irq_->process(*ih_, this, max_vectors);
+  const uint32_t handled = irq_->process(*ih_, this, max_vectors);
+  if (inputs_.auto_recover && recoveries_ < kMaxRecoveries && wedged()) recover();
+  return handled;
+}
+
+bool AmdVegaM::wedged() const {
+  if (!up()) return false;
+  if (gfx_->wedged() || !gfx_->running() || sdma_->wedged(0) || sdma_->wedged(1) || !sdma_->running()) return true;   // (not running: an earlier recovery did not bring it back)
+  for (uint32_t queue = 0; queue < compute_->queue_count(); ++queue)
+    if (compute_->queue_wedged(queue)) return true;
+  return false;
+}
+
+AmdVegaM::Recovery AmdVegaM::recover() {
+  Recovery r;
+  if (!up()) return r;
+  bool compute_wedged = false;
+  for (uint32_t queue = 0; queue < compute_->queue_count(); ++queue) compute_wedged = compute_wedged || compute_->queue_wedged(queue);
+  if (gfx_->wedged() || !gfx_->running() || compute_wedged) {
+    ++recoveries_;
+    r.graphics = true;
+    if (gfx_->recover() != AmdGfx8::Result::Ok) r.failed = true;
+  }
+  if (sdma_->wedged(0) || sdma_->wedged(1) || !sdma_->running()) {
+    ++recoveries_;
+    r.sdma = true;
+    if (sdma_->recover() != AmdSdma3::Result::Ok) r.failed = true;
+  }
+  // The soft reset did not bring an engine back: the whole card, if that was allowed.
+  if (r.failed && inputs_.allow_asic_reset && inputs_.pci && asic_resets_ < kMaxAsicResets) {
+    r.card_reset = true;
+    r.failed = !reset_card();
+  }
+  return r;
+}
+
+bool AmdVegaM::reset_card() {
+  if (!inputs_.pci || !inputs_.registers || !inputs_.clock || !inputs_.allocator) return false;
+  ++asic_resets_;
+  const Inputs in = inputs_;
+  shutdown();   // (what can still be stopped is; the display gets the firmware's framebuffer back)
+  const AmdAsicReset::Result reset = AmdAsicReset::pci_config_reset(*in.registers, *in.clock, *in.pci, in.pci_address);
+  if (reset != AmdAsicReset::Result::Ok) {
+    status_.assign("card reset: ");
+    status_.append(StringView(AmdAsicReset::result_name(reset)));
+    return false;
+  }
+  if (!bring_up(in)) {
+    String text(*in.allocator);
+    text.assign("after a card reset: ");
+    text.append(StringView(status_.c_str()));
+    status_.assign(text.view());
+    return false;
+  }
+  return true;
 }
 
 // The driver's handlers for the faults hand the ring to the scheduler's timeout handling (drm_sched_fault); wedging the ring is that here.
