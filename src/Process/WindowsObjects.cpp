@@ -366,7 +366,8 @@ uint32_t nt_wait_for_multiple_objects(Process& p, const SyscallRequest& r) {
 
 uint32_t nt_duplicate_object(Process& p, const SyscallRequest& r) {
   uint64_t target_at = r.args[3], options = 0, attributes = 0;
-  if (!argument(p, r, 5, &attributes) || !argument(p, r, 6, &options)) return kAccessViolation;
+  uint64_t desired_access = 0;
+  if (!argument(p, r, 4, &desired_access) || !argument(p, r, 5, &attributes) || !argument(p, r, 6, &options)) return kAccessViolation;
   if (r.args[0] != kCurrentProcess || r.args[2] != kCurrentProcess) return kNotImplemented;      // other processes are not reachable
   if (r.args[1] == ~uint64_t{1}) {      // the pseudo handle of the calling thread becomes a real handle to it
     const uint64_t self = p.runtime() ? p.runtime()->current_thread_id() : p.id();
@@ -394,7 +395,7 @@ uint32_t nt_duplicate_object(Process& p, const SyscallRequest& r) {
   }
   {      // DUPLICATE_SAME_ACCESS keeps the rights; otherwise the copy has the ones asked for (the rights of a section are the ones MapViewOfFile checks)
     const uint32_t original = p.files().denied_access(slot);
-    p.files().set_denied_access(uint64_t(copy), (options & 2) ? original : (original | ~uint32_t(r.args[4])));
+    p.files().set_denied_access(uint64_t(copy), (options & 2) ? original : (original | ~uint32_t(desired_access)));
   }
   const bool same = (options & 4) != 0;      // DUPLICATE_SAME_ATTRIBUTES; otherwise the handle is inheritable if the attributes say OBJ_INHERIT
   p.files().set_handle_flags(uint64_t(copy), same ? p.files().inheritable(slot) : (attributes & 2) != 0, false);
@@ -548,11 +549,60 @@ uint32_t nt_create_section(Process& p, const SyscallRequest& r) {
   } else if (size == 0) {
     return kInvalidParameter;
   }
-  const ObjectManager::Created c = objects->create_section(StringView(name, name_size), size, page, fs, host.view());
+  constexpr uint32_t kSecFile = 0x800000, kSecImage = 0x1000000, kSecReserve = 0x4000000, kSecCommit = 0x8000000, kSecNoCache = 0x10000000, kSecWriteCombine = 0x40000000, kSecLargePages = 0x80000000u;
+  const uint32_t flags = uint32_t(attributes);
+  if ((flags & kSecLargePages) || ((flags & kSecReserve) && (flags & kSecCommit))) return kInvalidParameter;
+  if (flags & kSecImage) {      // image sections need a PE file (not supported yet), and take none of the other flags
+    if (flags & (kSecReserve | kSecCommit | kSecFile | kSecWriteCombine)) return kInvalidParameter;
+    return 0xC000007Bu;      // STATUS_INVALID_IMAGE_FORMAT
+  }
+  if ((flags & (kSecNoCache | kSecWriteCombine)) && !(flags & (kSecReserve | kSecCommit))) return kInvalidParameter;
+  if (flags & kSecFile) return kInvalidParameter;
+  uint32_t reported = flags & (kSecNoCache | kSecWriteCombine);
+  if (fs) reported |= kSecFile;
+  else reported |= (flags & kSecReserve) ? kSecReserve : kSecCommit;
+  const ObjectManager::Created c = objects->create_section(StringView(name, name_size), size, page, reported, fs, host.view());
   if (c.id == 0) return c.status;
   return give_handle(p, *objects, ObjectKind::Section, c.id, r.args[0], c.status, wants_inherit(p, r.args[2]));
 }
-uint32_t nt_open_section(Process& p, const SyscallRequest& r) { return open_object(p, r, ObjectKind::Section); }
+// The rights an access mask asks for, with the generic ones spelled out (a section: query 1, write 2, read 4, execute 8, extend size 0x10).
+uint32_t section_rights(uint32_t access) {
+  if (access & 0x02000000u) return 0xF001Fu;      // MAXIMUM_ALLOWED
+  if (access & 0x80000000u) access |= 0x20005u;   // GENERIC_READ
+  if (access & 0x40000000u) access |= 0x20002u;   // GENERIC_WRITE
+  if (access & 0x20000000u) access |= 0x20008u;   // GENERIC_EXECUTE
+  if (access & 0x10000000u) access |= 0xF001Fu;   // GENERIC_ALL
+  return access;
+}
+uint32_t nt_open_section(Process& p, const SyscallRequest& r) {
+  const uint32_t status = open_object(p, r, ObjectKind::Section);
+  uint64_t handle = 0, slot = 0;
+  if (status == kSuccess && p.read_user_u64(r.args[0], &handle) && slot_of(handle, &slot)) p.files().set_denied_access(slot, ~section_rights(uint32_t(r.args[1])));
+  return status;
+}
+
+// NtQuerySection(Section, SECTION_INFORMATION_CLASS, PVOID Buffer, SIZE_T Length, PSIZE_T ReturnLength): class 0, SECTION_BASIC_INFORMATION { BaseAddress; Attributes; Size }.
+uint32_t nt_query_section(Process& p, const SyscallRequest& r) {
+  uint64_t length = 0, returned_at = 0;
+  if (!argument(p, r, 3, &length) || !argument(p, r, 4, &returned_at)) return kAccessViolation;
+  ObjectManager* objects = system_objects();
+  if (!objects) return kNotImplemented;
+  const uint32_t id = object_of(p, r.args[0], DescriptorKind::Section);
+  if (!id) return kInvalidHandle;
+  uint64_t slot = 0;
+  if (slot_of(r.args[0], &slot) && (p.files().denied_access(slot) & 1)) return 0xC0000022u;      // SECTION_QUERY
+  if (uint32_t(r.args[1]) != 0) return 0xC0000003u;      // STATUS_INVALID_INFO_CLASS (image information is not supported yet)
+  if (length < 24) return 0xC0000004u;      // STATUS_INFO_LENGTH_MISMATCH
+  ObjectManager::SectionInfo info;
+  if (!objects->section_info(id, &info)) return kInvalidHandle;
+  uint8_t out[24] = {};
+  const uint64_t size = (info.size + 4095) & ~uint64_t{4095};
+  for (uint32_t i = 0; i < 4; ++i) out[8 + i] = uint8_t(info.attributes >> (8 * i));
+  for (uint32_t i = 0; i < 8; ++i) out[16 + i] = uint8_t(size >> (8 * i));
+  if (!p.write_user(r.args[2], ConstByteView(out, 24))) return kAccessViolation;
+  if (returned_at != 0 && !p.write_user_u64(returned_at, 24)) return kAccessViolation;
+  return kSuccess;
+}
 uint32_t nt_create_job_object(Process& p, const SyscallRequest& r) { return create_object(p, r, ObjectKind::Job, false, false, 0, 0); }
 uint32_t nt_open_job_object(Process& p, const SyscallRequest& r) { return open_object(p, r, ObjectKind::Job); }
 
@@ -583,7 +633,7 @@ uint32_t nt_map_view_of_section(Process& p, const SyscallRequest& r) {
     uint64_t handle_slot = 0;
     const uint32_t denied = slot_of(r.args[0], &handle_slot) ? p.files().denied_access(handle_slot) : 0;
     constexpr uint32_t kSectionMapWrite = 2, kSectionMapRead = 4, kSectionMapExecute = 8;
-    if (((wanted & 1) && (denied & kSectionMapRead)) || ((wanted & 2) && (denied & kSectionMapWrite)) || ((wanted & 4) && (denied & kSectionMapExecute))) return 0xC0000022u;
+    if (((wanted & 1) && (denied & kSectionMapRead)) || ((wanted & 2) && (denied & kSectionMapWrite)) || ((wanted & 4) && (denied & kSectionMapExecute) && (denied & 0x20))) return 0xC0000022u;
   }
   uint64_t offset = 0, view = 0, base = 0;
   if (offset_at != 0 && !p.read_user_u64(offset_at, &offset)) return kAccessViolation;

@@ -92,6 +92,10 @@ uint32_t vm_allocate(Process& target, uint64_t* base_io, uint64_t* size_io, uint
   if (!page_protection(protect, &prot)) return kStatusInvalidPageProtection;
   if (!space) return kStatusNoMemory;
   if (size == 0) return kStatusInvalidParameter;
+  if (protect == kPageWriteCopy || protect == kPageExecuteWriteCopy) {      // private memory is not copy-on-write; only a view can be (committing into a view is checked below)
+    PageAttributes existing;
+    if (base == 0 || !space->attributes_at(AddressSpace::round_down(base), &existing) || existing.type != PageAttributes::Mapped) return kStatusInvalidPageProtection;
+  }
   if (!(type & kMemCommit)) prot = 0;      // reserved memory cannot be touched until it is committed
   uint64_t rounded = 0;
   if (!AddressSpace::round_up(size, &rounded)) return kStatusInvalidParameter;
@@ -160,6 +164,10 @@ uint32_t vm_protect(Process& target, uint64_t* base_io, uint64_t* size_io, uint3
   if (!space) return kStatusNoMemory;
   uint64_t rounded = 0;
   const uint64_t base = AddressSpace::round_down(*base_io);
+  if (protect == kPageWriteCopy || protect == kPageExecuteWriteCopy) {      // only a view can be copy-on-write
+    PageAttributes existing;
+    if (!space->attributes_at(base, &existing) || existing.type != PageAttributes::Mapped) return kStatusInvalidPageProtection;
+  }
   if (*size_io == 0 || !AddressSpace::round_up(*size_io, &rounded)) return kStatusInvalidParameter;
   uint8_t old = 0;
   if (!space->protection_at(base, &old)) return kStatusConflictingAddresses;
@@ -340,7 +348,7 @@ uint32_t nt_protect_virtual_memory(Process& process, const SyscallRequest& r) {
   if (!argument(process, r, 4, &old_pointer)) return kStatusAccessViolation;
   const uint32_t resolved = resolve(process, r.args[0], &remote, &pid);
   if (resolved != kStatusSuccess) return resolved;
-  if (!process.read_user_u64(r.args[1], &base) || !process.read_user_u64(r.args[2], &size)) return kStatusAccessViolation;
+  if (!process.read_user_u64(r.args[1], &base) || !process.read_user_u64(r.args[2], &size) || old_pointer == 0) return kStatusAccessViolation;
   uint32_t old = 0, status;
   if (remote) {
     IProcessRuntime::RemoteOp op;

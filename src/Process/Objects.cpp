@@ -177,7 +177,7 @@ class ObjectManager::SectionRef final : public SharedMemory {
 
 struct ObjectManager::Section {
   bool used = false, writable = false, file_backed = false;
-  uint32_t page = 0;
+  uint32_t page = 0, attributes = 0;
   uint8_t* storage = nullptr;
   uint64_t size = 0, rounded = 0;
   int32_t mappings = 0;
@@ -570,7 +570,7 @@ void ObjectManager::section_count(uint32_t index, int32_t delta) {
   }
 }
 
-ObjectManager::Created ObjectManager::create_section(StringView name, uint64_t size, uint32_t page, filesystem::IFileSystem* fs, StringView host_path) {
+ObjectManager::Created ObjectManager::create_section(StringView name, uint64_t size, uint32_t page, uint32_t attributes, filesystem::IFileSystem* fs, StringView host_path) {
   Created result;
   if (!allocator_ || name.size() >= kNameBytes || host_path.size() >= 512) { result.status = !allocator_ ? 0xC0000002u : kInvalid; return result; }
   Locked hold(sync_);
@@ -623,6 +623,7 @@ ObjectManager::Created ObjectManager::create_section(StringView name, uint64_t s
     s.used = true;
     s.writable = page == 0x04 || page == 0x40;
     s.page = page;
+    s.attributes = attributes;
     s.file_backed = fs != nullptr;
     s.storage = storage;
     s.size = bytes;
@@ -659,6 +660,7 @@ bool ObjectManager::section_info(uint32_t id, SectionInfo* out) {
   out->size = s.size;
   out->writable = s.writable;
   out->page = s.page;
+  out->attributes = s.attributes;
   out->file_backed = s.file_backed;
   return true;
 }
