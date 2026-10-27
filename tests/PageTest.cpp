@@ -4808,7 +4808,7 @@ static void test_platform() {
       "var e = document.createElement('div'); e.ariaLabel = 'l'; e.role = 'button'; e.inert = true; out.push(e.getAttribute('aria-label') + e.getAttribute('role') + e.hasAttribute('inert') + e.translate);"
       "var pop = document.createElement('div'); pop.popover = 'auto'; document.body.appendChild(pop); pop.showPopover(); out.push('pop:' + pop.matches(':popover-open')); pop.hidePopover(); out.push(pop.matches(':popover-open'));"
       "setTimeout(function () { console.log(out.sort().join(' | ')) }, 50);",
-      "Netscape:Gecko:false:0:0:false:false:true | [object Window][object Document][object Location][object Navigator][object NodeList][object HTMLCollection] | battery:1 | cache:hi | clicktrue5 | clip:NotAllowedError | devices:0 | false | geo:1:true | lbuttontruetrue | lock:l:exclusive | locked:5 | media:NotFoundError | notify:denied:denied | perf:2:measure:true | perm:TypeError | perm:prompt:geolocation | pop:true | quota:true | xtext/plain"));
+      "Netscape:Gecko:false:0:0:false:false:true | [object Window][object HTMLDocument][object Location][object Navigator][object NodeList][object HTMLCollection] | battery:1 | cache:hi | clicktrue5 | clip:NotAllowedError | devices:0 | false | geo:1:true | lbuttontruetrue | lock:l:exclusive | locked:5 | media:NotFoundError | notify:denied:denied | perf:2:measure:true | perm:TypeError | perm:prompt:geolocation | pop:true | quota:true | xtext/plain"));
 }
 
 // --- fetch() and XMLHttpRequest in full ---------------------------------------------------------------------------------------------

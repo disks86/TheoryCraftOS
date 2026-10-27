@@ -290,6 +290,7 @@ Value attributes_value(DomBindings::Impl& c, dom::Node* n) {
   Value item;
   vm.get_named(Value::make_object(vm.global()), "__collection_item", &item);
   vm.define_named(list, "item", item, kWritable);
+  vm.define_named(list, "__owner", node_value(c, n), kWritable);   // (setNamedItem and removeNamedItem act on this element)
   set_interface(vm, list, "NamedNodeMap");
   return Value::make_object(list);
 }
