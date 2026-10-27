@@ -49,6 +49,14 @@ namespace hardware {
 // the interrupt ring is told it is not snooped.
 //
 // A step that fails stops the ones before it, in reverse, and leaves the card as the firmware had it as far as the pieces' own stop() does that; status() says which step.
+// How the CPU's pointers turn into the addresses the card is given for system memory (the page table entries of the GART). The OS keeps its memory mapped at its own
+// addresses, so the default is the pointer's value; a platform that maps differently (and a test that needs addresses inside the card's 40 bits) supplies this.
+class ISystemAddresses {
+ public:
+  virtual ~ISystemAddresses() = default;
+  virtual uint64_t physical_address(const void* p) const = 0;
+};
+
 class AmdVegaM final : public amd_dce11::INativeDisplay {
  public:
   // Where the block starts in video memory, and the most the whole block may reach: the visible part of video memory is 256 MiB without Resizable BAR, and the video engine's
@@ -68,15 +76,19 @@ class AmdVegaM final : public amd_dce11::INativeDisplay {
     uint64_t aperture_bytes = 0;
     MmioRegion doorbells;                         // the doorbell BAR (BAR 2), at least the first 8 KiB
     uint64_t max_framebuffer_bytes = 0;           // the largest picture the display could show (0: no display part)
+    const ISystemAddresses* system_addresses = nullptr;   // for upload() and download(); null: a pointer is its own address
   };
   // The sizes of the pieces of the block, for a given microcode set, GART table and framebuffer.
   struct Layout {
     bool ok = false;
-    uint64_t dummy_page = 0, scratch_page = 0, gart_table = 0, smu = 0, gfx = 0, compute = 0, sdma = 0, ih = 0, framebuffer = 0;   // offsets in the block
+    uint64_t dummy_page = 0, scratch_page = 0, gart_table = 0, smu = 0, gfx = 0, compute = 0, sdma = 0, ih = 0, ib = 0, framebuffer = 0;   // offsets in the block
     uint64_t smu_bytes = 0, gart_table_bytes = 0, framebuffer_bytes = 0, total = 0;
   };
   static constexpr uint64_t kGfxBytes = AmdGfx8::kRingBytes + 4096 + 4096;   // the ring, the write-back page, the clear-state buffer
   static constexpr uint64_t kIhBytes = (AmdIh3::kRingBytes + AmdIh3::kWritebackBytes + kPageBytes - 1) / kPageBytes * kPageBytes;
+  // The staging area for the command buffers the submit functions below take (one at a time), in dwords.
+  static constexpr uint32_t kIbDwords = 2048;
+  static constexpr uint64_t kIbBytes = kIbDwords * 4;
   static Layout plan(uint64_t smu_bytes, uint64_t gart_table_bytes, uint32_t compute_queues, uint64_t framebuffer_bytes);
 
   enum class Step : uint8_t { None, MemoryMap, Firmware, Memory, MemoryController, InterruptHandler, Microcode, GraphicsEngine, Sdma, Done };
@@ -102,6 +114,23 @@ class AmdVegaM final : public amd_dce11::INativeDisplay {
   bool display_engaged() const override { return display_ && display_->engaged(); }
   void disengage_display() override;
 
+  // Command buffers: the commands are copied into the block's staging area, padded the way the engine's driver pads (AmdGfx8::pad_ib, AmdSdma3::pad_ib), run as an indirect
+  // buffer, and waited for by a fence. One at a time (the call returns when the engine is done). `commands` are PM4 packets for the graphics ring and the compute queues, SDMA
+  // packets for the DMA engines; at most kIbDwords with the padding. False if the card is not up, the buffer does not fit, or the engine does not finish (see AmdGfx8::submit_ib).
+  bool submit_graphics(ArrayView<const uint32_t> commands, uint32_t timeout_us = 100000);
+  bool submit_compute(uint32_t queue, ArrayView<const uint32_t> commands, uint32_t timeout_us = 100000);
+  bool submit_sdma(uint32_t instance, ArrayView<const uint32_t> commands, uint32_t timeout_us = 100000);
+
+  // Copies between system memory and the block's framebuffer area (layout().framebuffer_bytes, the only part of the block meant for pictures and other data), through the
+  // GART: the system pages are mapped into a window of kTransferPages GART pages (as amdgpu_ttm_gart_bind does, snooped system pages), and the SDMA engine `instance` copies
+  // between the window and video memory, a window at a time. `offset` is in the framebuffer area. One call at a time; the call returns when the data has been copied. The
+  // memory is addressed through Inputs::system_addresses (by default a buffer's address is the address the card is given: the OS runs with its memory mapped at its own addresses).
+  // False if the card is not up, the range leaves the area, an address is beyond the card's 40 bits, or the engine does not finish (then the window stays mapped: the engine may
+  // still be using the pages, and the caller must not free the memory).
+  static constexpr uint32_t kTransferPages = 512;   // the first pages of the GART: 2 MiB a window
+  bool upload(ConstByteView source, uint64_t offset, uint32_t instance = 0, uint32_t timeout_us = 100000);
+  bool download(ByteView destination, uint64_t offset, uint32_t instance = 0, uint32_t timeout_us = 100000);
+
   // For tests and diagnostics
   const AmdGmc8GartPlan& gart_plan() const { return gart_plan_; }
   const Layout& layout() const { return layout_; }
@@ -112,6 +141,7 @@ class AmdVegaM final : public amd_dce11::INativeDisplay {
 
  private:
   bool fail(Step failed, const char* text);
+  bool transfer(uint64_t system_address, uint64_t bytes, uint64_t offset, bool to_video, uint32_t instance, uint32_t timeout_us);
 
   Step step_ = Step::None;
   String status_;

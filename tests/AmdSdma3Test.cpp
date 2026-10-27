@@ -264,6 +264,71 @@ static void test_ring_space() {
   CHECK(sdma.write_pointer(0) != wptr && rig.card.protocol_errors > 0);
 }
 
+
+// An indirect buffer: a linear write of one dword and a copy, padded to 8 dwords.
+static std::vector<uint32_t> make_ib(uint64_t write_address, uint32_t value, uint64_t src, uint64_t dst, uint32_t bytes) {
+  return {2, static_cast<uint32_t>(write_address), static_cast<uint32_t>(write_address >> 32), 1, value,
+          1, bytes, 0, static_cast<uint32_t>(src), static_cast<uint32_t>(src >> 32), static_cast<uint32_t>(dst), static_cast<uint32_t>(dst >> 32)};
+}
+
+static void test_submit_ib() {
+  Rig rig;
+  AmdSdma3::Config config;
+  config.burst_nop[0] = true;   // engine 0 pads with a burst NOP, engine 1 with plain ones
+  AmdSdma3 sdma(rig.card, rig.clock, config);
+  uint32_t words[32];
+  CHECK(!sdma.submit_ib(0, rig.data_gpu, 8));   // not running
+  CHECK(sdma.start(rig.memory()) == AmdSdma3::Result::Ok);
+  // The padding: 12 dwords become 16; the burst NOP covers the whole pad, plain NOPs otherwise.
+  std::vector<uint32_t> ib = make_ib(rig.dst_gpu + 64, 0xFEEDBEEF, rig.data_gpu + 8, rig.dst_gpu + 128, 32);
+  for (uint32_t i = 0; i < 32; ++i) words[i] = i < ib.size() ? ib[i] : 0xDEAD;
+  CHECK(sdma.pad_ib(0, ArrayView<uint32_t>(words, 32), 12) == 16 && words[12] == (0u | (3u << 16)) && words[13] == 0 && words[15] == 0 && words[16] == 0xDEAD);
+  for (uint32_t i = 0; i < 32; ++i) words[i] = i < ib.size() ? ib[i] : 0xDEAD;
+  CHECK(sdma.pad_ib(1, ArrayView<uint32_t>(words, 32), 12) == 16 && words[12] == 0 && words[15] == 0);
+  CHECK(sdma.pad_ib(0, ArrayView<uint32_t>(words, 32), 16) == 16 && sdma.pad_ib(0, ArrayView<uint32_t>(words, 32), 17) == 24 && sdma.pad_ib(0, ArrayView<uint32_t>(words, 15), 12) == 0 &&
+        sdma.pad_ib(0, ArrayView<uint32_t>(words, 14), 9) == 0 && sdma.pad_ib(2, ArrayView<uint32_t>(words, 32), 12) == 0 && sdma.pad_ib(0, ArrayView<uint32_t>(words, 3), 5) == 0);
+  // Put the buffer where the engine can read it: 32-byte aligned, in the first window.
+  for (int i = 0; i < 16; ++i) rig.card.put32(rig.data_gpu + 4096 + i * 4, words[i]);
+  uint8_t* src = rig.data.base + 8;
+  for (int i = 0; i < 32; ++i) src[i] = static_cast<uint8_t>(0x40 + i);
+  for (uint32_t instance : {0u, 1u}) {
+    const uint32_t wptr = sdma.write_pointer(instance);
+    CHECK(sdma.submit_ib(instance, rig.data_gpu + 4096, 16));
+    CHECK(rig.card.get32(rig.dst_gpu + 64) == 0xFEEDBEEF && memcmp(rig.data.base + kBig + 128, src, 32) == 0);
+    // The ring: padding up to a position that ends the 6-dword packet on an 8-dword boundary, the packet, then the fence.
+    const uint64_t ring = rig.gpu + instance * kSlot;
+    const uint32_t pad = (2 - wptr) & 7;
+    CHECK(rig.card.get32(ring + uint64_t{wptr + pad} * 4) == 4 && rig.card.get32(ring + uint64_t{wptr + pad + 1} * 4) == static_cast<uint32_t>(rig.data_gpu + 4096) &&
+          rig.card.get32(ring + uint64_t{wptr + pad + 2} * 4) == static_cast<uint32_t>((rig.data_gpu + 4096) >> 32) && rig.card.get32(ring + uint64_t{wptr + pad + 3} * 4) == 16 &&
+          rig.card.get32(ring + uint64_t{wptr + pad + 4} * 4) == 0 && rig.card.get32(ring + uint64_t{wptr + pad + 5} * 4) == 0);
+    CHECK(((wptr + pad + 6) & 7) == 0);
+    CHECK(rig.card.get32(ring + 8192 + 24) == 1);
+  }
+  CHECK(rig.card.ib_runs.size() == 2 && rig.card.ib_runs[0].address == rig.data_gpu + 4096 && rig.card.ib_runs[0].dwords == 16 && rig.card.ib_errors == 0 && rig.card.protocol_errors == 0);
+  // The padding in front of the packet is a burst NOP on the engine that has it.
+  // (engine 0 started at 16 dwords: pad = (2 - 16) & 7 = 2, a burst NOP of one dword following)
+  CHECK(rig.card.get32(rig.gpu + 16 * 4) == (0u | (1u << 16)) && rig.card.get32(rig.gpu + 17 * 4) == 0);
+  // Refused: no length, too long, unaligned, beyond 40 bits, an engine that does not exist.
+  const uint32_t wptr = sdma.write_pointer(0);
+  CHECK(!sdma.submit_ib(0, rig.data_gpu + 4096, 0) && !sdma.submit_ib(0, rig.data_gpu + 4096, 0x100000) && !sdma.submit_ib(0, rig.data_gpu + 4096 + 16, 16) &&
+        !sdma.submit_ib(0, 0x10000000000ull, 16) && !sdma.submit_ib(2, rig.data_gpu + 4096, 16) && sdma.write_pointer(0) == wptr);
+  // A stalled engine: timeout, wedged.
+  rig.card.stall[0] = true;
+  CHECK(!sdma.submit_ib(0, rig.data_gpu + 4096, 16, 2000) && sdma.wedged(0));
+}
+
+static void test_ib_faults() {
+  Rig rig;
+  AmdSdma3 sdma(rig.card, rig.clock);
+  CHECK(sdma.start(rig.memory()) == AmdSdma3::Result::Ok);
+  // An IB the engine cannot read, or that has a packet it does not know, is the engine's complaint: it objects, the ring goes on and the fence comes.
+  sdma.submit_ib(1, 0x3'0000'0000ull, 8);
+  CHECK(rig.card.ib_errors == 1);
+  for (int i = 0; i < 8; ++i) rig.card.put32(rig.data_gpu + 4096 + i * 4, 0x00000077);
+  sdma.submit_ib(1, rig.data_gpu + 4096, 8);
+  CHECK(rig.card.protocol_errors >= 1);
+}
+
 static void test_stop() {
   Rig rig;
   AmdSdma3 sdma(rig.card, rig.clock);
@@ -285,6 +350,8 @@ int main() {
   test_refusals();
   test_failures();
   test_fences();
+  test_submit_ib();
+  test_ib_faults();
   test_ring_space();
   test_stop();
   printf(g_failed ? "AmdSdma3Test: %d FAILED\n" : "AmdSdma3Test: all passed\n", g_failed);

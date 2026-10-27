@@ -48,7 +48,7 @@ constexpr GoldenRegister kGolden[] = {
 };
 
 // tonga_sdma_pkt_open.h: SDMA_PKT_HEADER_OP(op) | SDMA_PKT_HEADER_SUB_OP(sub_op) is op | sub_op << 8; SDMA_PKT_NOP_HEADER_COUNT(n) is n << 16.
-constexpr uint32_t kOpNop = 0, kOpCopy = 1, kOpWrite = 2, kOpFence = 5, kOpTrap = 6, kOpConstFill = 11;
+constexpr uint32_t kOpNop = 0, kOpCopy = 1, kOpWrite = 2, kOpIndirect = 4, kOpFence = 5, kOpTrap = 6, kOpConstFill = 11;
 constexpr uint32_t kSubopCopyLinear = 0, kSubopWriteLinear = 0;
 constexpr uint32_t header(uint32_t op, uint32_t sub_op) { return op | sub_op << 8; }
 constexpr uint32_t kNop = kOpNop;
@@ -314,6 +314,33 @@ bool AmdSdma3::finish(uint32_t instance, uint32_t timeout_us) {
   } while (clock_.now_us() - begin < timeout_us);
   s.wedged = true;
   return false;
+}
+
+// sdma_v3_0_ring_pad_ib
+uint32_t AmdSdma3::pad_ib(uint32_t instance, ArrayView<uint32_t> words, uint32_t count) const {
+  if (instance >= kInstances || count > words.size()) return 0;
+  const uint32_t pad = (8 - (count & 7)) & 7;
+  if (pad > words.size() - count) return 0;
+  uint32_t i = 0;
+  if (pad && config_.burst_nop[instance]) words[count + i++] = kNop | ((pad - 1) << 16);
+  for (; i < pad; ++i) words[count + i] = kNop;
+  return count + pad;
+}
+
+// sdma_v3_0_ring_emit_ib (VMID 0), then the fence
+bool AmdSdma3::submit_ib(uint32_t instance, uint64_t ib_gpu_address, uint32_t dwords, uint32_t timeout_us) {
+  if (dwords == 0 || dwords > kMaxIbDwords || (ib_gpu_address & 31) != 0 || ib_gpu_address > kAddressMask || !can_queue(instance, 7 + 6 + kFenceDwords)) return false;
+  State& s = state_[instance];
+  // IB packet must end on a 8 DW boundary
+  insert_nop(s, (2 - s.wptr) & 7, config_.burst_nop[instance]);
+  ring_write(s, header(kOpIndirect, 0));   // (| SDMA_PKT_INDIRECT_HEADER_VMID(0))
+  // base must be 32 byte aligned
+  ring_write(s, static_cast<uint32_t>(ib_gpu_address) & 0xffffffe0);
+  ring_write(s, static_cast<uint32_t>(ib_gpu_address >> 32));
+  ring_write(s, dwords);
+  ring_write(s, 0);
+  ring_write(s, 0);
+  return finish(instance, timeout_us);
 }
 
 bool AmdSdma3::copy(uint32_t instance, uint64_t source, uint64_t destination, uint64_t bytes, uint32_t timeout_us) {

@@ -37,6 +37,15 @@ constexpr uint32_t packet3(uint32_t opcode, uint32_t count) { return (3u << 30) 
 constexpr uint32_t kPacketNop = 0x10, kPacketSetUconfigReg = 0x79, kPacketSetResources = 0xA0, kPacketMapQueues = 0xA2, kPacketUnmapQueues = 0xA3;
 constexpr uint32_t kSetUconfigRegStart = 0xC000;
 constexpr uint32_t kRingNop = packet3(kPacketNop, 0x3FFF);
+// INDIRECT_BUFFER and RELEASE_MEM (vid.h) and the bits of their dwords
+constexpr uint32_t kPacketIndirectBuffer = 0x3F, kPacketReleaseMem = 0x49;
+constexpr uint32_t kIndirectBufferValid = 1u << 23, kMaxIbDwords = 0xFFFFF;
+constexpr uint32_t kEopTcWbActionEn = 1u << 15, kEopTcl1ActionEn = 1u << 16, kEopTcActionEn = 1u << 17;
+constexpr uint32_t kCacheFlushAndInvTsEvent = 0x14;   // gfx_8_0_enum.h
+constexpr uint32_t event_type(uint32_t x) { return x << 0; }
+constexpr uint32_t event_index(uint32_t x) { return x << 8; }
+constexpr uint32_t data_sel(uint32_t x) { return x << 29; }
+constexpr uint32_t int_sel(uint32_t x) { return x << 24; }
 constexpr uint32_t kTestInitial = 0xCAFEDEAD, kTestValue = 0xDEADBEEF;
 constexpr uint32_t kGpuPageSize = 4096;   // AMDGPU_GPU_PAGE_SIZE
 
@@ -85,6 +94,7 @@ void AmdGfx8Compute::srbm_select(uint32_t me, uint32_t pipe, uint32_t queue, uin
 
 AmdGfx8Compute::Result AmdGfx8Compute::attach(const Memory& memory) {
   attached_ = false;
+  ready_ = false;
   const Config& c = config_;
   if (c.queues == 0 || c.queues > kMaxQueues || c.kiq_me < 1 || c.kiq_me > 2 || c.kiq_pipe > 3 || c.kiq_queue > 7 || c.compute_me < 1 || c.compute_me > 2 || c.compute_pipe > 3 ||
       (c.kiq_me == c.compute_me && c.kiq_pipe == c.compute_pipe))
@@ -114,6 +124,9 @@ AmdGfx8Compute::Result AmdGfx8Compute::attach(const Memory& memory) {
     q.ring = memory.block.subregion(offset + kMqdArea, kRingArea);
     q.wb = memory.block.subregion(offset + kMqdArea + kRingArea + kEopArea, kWritebackArea);
     q.wptr = 0;
+    q.sequence = 0;
+    q.wedged = false;
+    q.wb.write32(kFenceWordOffset, 0);
     // gfx_v8_0_mec_init: the end-of-pipe buffers start zeroed
     const MmioRegion eop = memory.block.subregion(offset + kMqdArea + kRingArea, kEopArea);
     for (uint64_t o = 0; o < kEopArea; o += 4) eop.write32(o, 0);
@@ -399,11 +412,41 @@ AmdGfx8Compute::Result AmdGfx8Compute::test_rings(uint32_t timeout_us) {
     if (!test_ring(queues_[slot], timeout_us) && failed_queue_ < 0) failed_queue_ = static_cast<int>(slot);
     if (slot == 0 && failed_queue_ == 0) return Result::RingTestFailed;   // the compute queues are mapped by the KIQ: nothing to try without it
   }
+  ready_ = failed_queue_ < 0;
   return failed_queue_ < 0 ? Result::Ok : Result::RingTestFailed;
+}
+
+// gfx_v8_0_ring_emit_ib_compute (VMID 0) and gfx_v8_0_ring_emit_fence_compute (32-bit, no interrupt)
+bool AmdGfx8Compute::submit_ib(uint32_t queue, uint64_t ib_gpu_address, uint32_t dwords, uint32_t timeout_us) {
+  if (!ready_ || queue >= config_.queues || dwords == 0 || dwords > kMaxIbDwords || (ib_gpu_address & 3) != 0 || (ib_gpu_address >> 48) != 0) return false;
+  Queue& q = queues_[queue + 1];
+  if (q.wedged) return false;
+  const uint64_t fence_address = q.wb_gpu + kFenceWordOffset;
+  const uint32_t sequence = ++q.sequence;
+  ring_write(q, packet3(kPacketIndirectBuffer, 2));
+  ring_write(q, static_cast<uint32_t>(ib_gpu_address) & 0xFFFFFFFC);
+  ring_write(q, static_cast<uint32_t>(ib_gpu_address >> 32) & 0xFFFF);
+  ring_write(q, kIndirectBufferValid | dwords);   // (| vmid << 24, VMID 0)
+  // RELEASE_MEM - flush caches
+  ring_write(q, packet3(kPacketReleaseMem, 5));
+  ring_write(q, kEopTcl1ActionEn | kEopTcActionEn | kEopTcWbActionEn | event_type(kCacheFlushAndInvTsEvent) | event_index(5));
+  ring_write(q, data_sel(1) | int_sel(0));
+  ring_write(q, static_cast<uint32_t>(fence_address) & 0xfffffffc);
+  ring_write(q, static_cast<uint32_t>(fence_address >> 32));
+  ring_write(q, sequence);
+  ring_write(q, 0);
+  ring_commit(q);
+  const uint64_t begin = clock_.now_us();
+  do {
+    if (q.wb.read32(kFenceWordOffset) == sequence) return true;
+  } while (clock_.now_us() - begin < timeout_us);
+  q.wedged = true;
+  return false;
 }
 
 // gfx_v8_0_kcq_disable: RESET_QUEUES for each compute queue through the KIQ, then the ring test makes sure the KIQ has processed them.
 bool AmdGfx8Compute::disable_queues(uint32_t timeout_us) {
+  ready_ = false;
   if (!attached_) return false;
   Queue& kiq = queues_[0];
   for (uint32_t i = 0; i < config_.queues; i++) {

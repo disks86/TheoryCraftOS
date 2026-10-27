@@ -18,7 +18,7 @@
 
 /* Exports that exist so that a program finds them, but do nothing yet. The list of a DLL is stubs/<dll>.inc (see scripts/gen-windows-stubs.py), the build passes its file name as
  * STUB_FILE and the value the functions return as STUB_RESULT (STATUS_NOT_IMPLEMENTED for ntdll.dll, 0 - that is FALSE, NULL, ERROR_SUCCESS - for the others). A library
- * that is only stubs is built with STUB_DLLMAIN too, which adds its entry point; the other libraries have their own.
+ * that is only stubs, or has no entry point of its own, is built with STUB_DLLMAIN too, which adds a default one.
  * Every function takes no parameters and leaves the registers of its caller alone, so a call with any arguments is harmless. */
 #ifdef STUB_FILE
 #define STUB_STRING_(x) #x
@@ -28,7 +28,7 @@
 #endif
 
 #ifdef STUB_DLLMAIN
-int DllMain(void* module, unsigned reason, void* reserved) {
+__attribute__((weak)) int DllMain(void* module, unsigned reason, void* reserved) {
   (void)module;
   (void)reason;
   (void)reserved;

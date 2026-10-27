@@ -82,6 +82,14 @@ class AmdGfx8Compute {
   void kcq_resume();
   Result test_rings(uint32_t timeout_us = kDefaultTimeoutUs);   // KIQ first, then the compute queues (all of them are tried; the first failure is reported)
   bool disable_queues(uint32_t timeout_us = kDefaultTimeoutUs);
+  // Runs an indirect buffer on compute queue `queue` (0..queues-1) and waits for it (gfx_v8_0_ring_emit_ib_compute, gfx_v8_0_ring_emit_fence_compute): `dwords` PM4 dwords at
+  // GPU address `ib_gpu_address` (4-byte aligned, below 2^48), padded by the caller to a multiple of 256 dwords with NOPs (AmdGfx8::pad_ib), then a RELEASE_MEM that writes the
+  // fence number to a word of the queue's write-back page (offset 16). Only after the ring tests passed. False for a bad argument or a queue that is not ready; on a timeout the
+  // queue is wedged (nothing more is queued on it) until the queues are started again.
+  bool submit_ib(uint32_t queue, uint64_t ib_gpu_address, uint32_t dwords, uint32_t timeout_us = kDefaultTimeoutUs);
+  bool queue_wedged(uint32_t queue) const { return queue < kMaxQueues && queues_[queue + 1].wedged; }
+  uint32_t fence_sequence(uint32_t queue) const { return queue < kMaxQueues ? queues_[queue + 1].sequence : 0; }
+  static constexpr uint32_t kFenceWordOffset = 16;   // in a queue's write-back page
   int failed_queue() const { return failed_queue_; }            // -1 none, 0 the KIQ, i + 1 compute queue i
   uint32_t queue_count() const { return config_.queues; }
   uint32_t write_pointer(uint32_t slot) const { return slot < kMaxQueues + 1 ? queues_[slot].wptr : 0; }
@@ -92,6 +100,8 @@ class AmdGfx8Compute {
     uint64_t mqd_gpu = 0, ring_gpu = 0, eop_gpu = 0, wb_gpu = 0;
     MmioRegion mqd, ring, wb;
     uint32_t wptr = 0;
+    uint32_t sequence = 0;
+    bool wedged = false;
   };
   uint32_t rd(uint32_t reg) { return registers_.read(reg); }
   void wr(uint32_t reg, uint32_t value) { registers_.write(reg, value); }
@@ -113,7 +123,7 @@ class AmdGfx8Compute {
   Config config_;
   Memory memory_;
   Queue queues_[kMaxQueues + 1];
-  bool attached_ = false;
+  bool attached_ = false, ready_ = false;
   int failed_queue_ = -1;
 };
 

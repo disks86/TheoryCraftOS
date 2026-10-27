@@ -26,7 +26,7 @@
 #include "console.hpp"
 
 struct DemoFile { const char* name; const uint8_t* begin; const uint8_t* end; };
-#ifdef TCOS_USERMODE_DEMO
+#if defined(TCOS_USERMODE_DEMO) || defined(TCOS_WINE_TEST_PROGRAM)
 extern "C" const DemoFile tcos_demo_libraries[];      // ntdll.dll, kernel32.dll and msvcrt.dll (CMakeLists.txt)
 extern "C" const uint64_t tcos_demo_library_count;
 #endif
@@ -5755,3 +5755,72 @@ bool run_usermode_demo(allocators::IAllocator& allocator) {
   console::puts(ok ? "  user mode: ok\n" : "  user mode: FAILED\n");
   return ok;
 }
+
+#ifdef TCOS_WINE_TEST_PROGRAM
+extern "C" const uint8_t tcos_wine_test_program[];
+extern "C" const uint8_t tcos_wine_test_program_end[];
+extern "C" const DemoFile tcos_wine_test_files[];
+extern "C" const uint64_t tcos_wine_test_file_count;
+
+bool run_wine_test_program(allocators::IAllocator& allocator) {
+  console::puts("Windows test program:\n");
+  if (!kernel::usermode::init(allocator)) {
+    console::puts("  user mode is not available\n");
+    return false;
+  }
+  filesystem::RamFileSystem files(allocator);
+  g_files = &files;
+  bool ok = check(process::prepare_program_folders(files), "program folders");
+  for (uint64_t i = 0; i < tcos_demo_library_count; ++i) {
+    String path(allocator);
+    path.assign("/Windows/Windows/System32/");
+    path.append(StringView(tcos_demo_libraries[i].name));
+    UniquePointer<filesystem::IFile> f;
+    uint64_t n = 0;
+    const ConstByteView image(tcos_demo_libraries[i].begin, static_cast<uint64_t>(tcos_demo_libraries[i].end - tcos_demo_libraries[i].begin));
+    ok = check(files.open_file(path.view(), filesystem::OpenMode::CreateTruncate, &f) == filesystem::Status::Ok && f->write(0, image, &n) == filesystem::Status::Ok && n == image.size(), path.c_str()) && ok;
+  }
+  UniquePointer<filesystem::IFile> f;
+  uint64_t n = 0;
+  const ConstByteView file(tcos_wine_test_program, static_cast<uint64_t>(tcos_wine_test_program_end - tcos_wine_test_program));
+  const exe::ExecutableKind kind = exe::identify_executable(file.at_most(exe::kIdentifyBytes));
+  const char* path = "/Windows/Windows/System32/test.exe";
+  if (files.open_file(path, filesystem::OpenMode::CreateTruncate, &f) == filesystem::Status::Ok) f->write(0, file, &n);
+  f.reset();
+  for (uint64_t i = 0; i < tcos_wine_test_file_count; ++i) {
+    String extra(allocator);
+    extra.assign("/Windows/Windows/System32/");
+    extra.append(StringView(tcos_wine_test_files[i].name));
+    if (files.open_file(extra.view(), filesystem::OpenMode::CreateTruncate, &f) == filesystem::Status::Ok) f->write(0, ConstByteView(tcos_wine_test_files[i].begin, static_cast<uint64_t>(tcos_wine_test_files[i].end - tcos_wine_test_files[i].begin)), &n);
+    f.reset();
+  }
+  struct Show {
+    static void write(void*, StringView text) { console::puts(text); }
+  };
+  desktop::ProgramHost keyboard(allocator);
+  keyboard.close_input();
+  desktop::ProgramRun run;
+  run.allocator = &allocator;
+  run.files = &files;
+  run.path = path;
+  run.working_directory = "/Windows";
+  run.kind = kind;
+  run.output = &Show::write;
+  run.host = &keyboard;
+  uint32_t code = 0;
+  String message(allocator);
+  const desktop::RunResult result = desktop::run_program(run, &code, &message);
+  console::puts("  test program: result ");
+  console::put_dec(static_cast<int64_t>(result));
+  console::puts(", exit code ");
+  console::put_dec(code);
+  if (!message.empty()) {
+    console::puts(", ");
+    console::puts(message.view());
+  }
+  console::puts("\n");
+  ok &= check(result == desktop::RunResult::Exited, "the test program ran to completion");
+  console::puts(ok ? "  Windows test program: ran\n" : "  Windows test program: FAILED\n");
+  return ok;
+}
+#endif
