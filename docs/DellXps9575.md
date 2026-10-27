@@ -12,7 +12,7 @@ The internal panel is wired to the Intel GPU, so the Intel GPU is the boot displ
 
 ## Not done
 
-- **Polaris bring-up**: the SMC microcode load and the GFX 8 command processor start are written and so are the memory controller and GART (see "Radeon RX Vega M: graphics engine start-up" and "... memory controller and GART" below, simulation only). Still missing: SDMA, the interrupt handler, DCE 11.2 display, the rest of GFX 8 (tiling tables, clear-state buffer, compute queues).
+- **Polaris bring-up**: the SMC microcode load and the GFX 8 command processor start are written and so are the memory controller and GART (see "Radeon RX Vega M: graphics engine start-up" and "... memory controller and GART" below, simulation only). Still missing: SDMA, DCE 11.2 display, the rest of GFX 8. The interrupt handler ring is written ("... interrupt handler" below).
   None of it can be checked without the hardware.
 - **UVD 6.3 video decode** for the Vega M beyond H.264, H.265 (8 and 10 bit), MPEG-2, VC-1 (interlaced pictures untested against real data, see below) and MPEG-4 (the MPEG-4 tools listed below; the chip has no VP9), and any run of it on the card.
 - **VCE 3.4 video encode** on the Vega M beyond the start and stop (see the VCE section), and any run of it on the card.
@@ -235,6 +235,18 @@ The test's memory controller model reads the entries from the table and caches t
 from the bit positions in AMD's headers. Not done and assumed: VM faults (no interrupt handler; faults go to the dummy page), the VGA lockout (display block registers; the driver only does it with a display driver),
 the memory controller microcode (the driver does not load it for the VEGAM), per-process page tables (contexts 1-15 stay empty), and the assumption that the card's firmware left the controller in a state this can be
 layered on (it rewrites the system aperture to the same range the controller reports). Nothing here was run on a real 9575; a wrong aperture on a real card would hang it.
+
+## Radeon RX Vega M: interrupt handler
+
+Code: `src/Hardware/GraphicsProcessingUnit/AMD/AmdIh3.*` (+ generated `AmdIh3Registers.inc`), tests: `tests/AmdIh3Test.cpp` with `tests/FakeAmdIh3.hpp` (`tests/run_host_tests.sh AmdIh3Test`), checker:
+`scripts/check_ih3_port.py <tonga_ih.c>`. Ported from `tonga_ih.c` (the IH 3.0 the Polaris family and the VEGAM use): the 64 KiB ring of 16-byte vectors, its write pointer (register and
+a write-back word after the ring), the read pointer (the doorbell BAR, or `IH_RB_RPTR`), `tonga_ih_irq_init` / `_irq_disable` / `_get_wptr` (with the driver's ring overflow recovery: the read pointer
+moves to the write pointer + 16 and `WPTR_OVERFLOW_CLEAR` is pulsed) / `_decode_iv` (source id, 28-bit source data, ring id, VMID, PASID) / `_set_rptr`.
+
+`AmdIh3::drain()` returns the vectors that arrived; nothing dispatches them (the OS polls, and the card's interrupt line goes nowhere). Every block's own interrupt enable (`CP_INT_CNTL_RING0`, the compute
+pipes' EOP enables, the memory controller's fault interrupts) is a separate thing and is not switched on here. Not done and assumed: bus mastering (the PCI layer must set it before the ring is enabled),
+MSI (`Config::msi` only sets `RPTR_REARM`), the software ring (`ih_soft`), the ring in video memory (it expects memory the CPU can read and the card can write, e.g. system RAM mapped through the GART; the
+non-snooped bit is left clear as in the driver for system memory), and every check on a real card.
 
 ## Radeon RX Vega M: UVD 6.3
 
