@@ -82,10 +82,53 @@ class Card final : public hardware::IVcnRegisters {
     if (r == kRbRptr + 0x200) rptr_[1] = v;
   }
 
-  uint8_t* host(uint64_t gpu, uint64_t bytes) const {
+  // The GART (VM context 0): GPU addresses in [gart_start, gart_start + gart_size) go through the page table the driver wrote (8-byte entries; valid 1, system 2, address 39:12).
+  // A system page is a page of the test's own memory at the same address (the host addresses are the "physical" addresses); any other is video memory.
+  uint64_t gart_start = 0, gart_size = 0;
+  const uint8_t* gart_table = nullptr;
+  uint8_t* system_host = nullptr;   // system page addresses are offsets from system_base into this memory
+  uint64_t system_base = 0, system_bytes = 0;
+  uint32_t gart_faults = 0;
+  mutable uint64_t pte_and = ~0ull;   // the flags every page table entry the engines walked had in common
+
+  uint8_t* window_host(uint64_t gpu, uint64_t bytes) const {
     for (const Window& w : windows)
       if (gpu >= w.gpu && gpu - w.gpu <= w.size && bytes <= w.size - (gpu - w.gpu)) return w.host + (gpu - w.gpu);
     return nullptr;
+  }
+  uint8_t* host(uint64_t gpu, uint64_t bytes) const {
+    if (gart_size != 0 && gpu >= gart_start && gpu - gart_start < gart_size) {
+      const uint64_t index = (gpu - gart_start) >> 12, offset = gpu & 4095;
+      if (bytes > 4096 - offset) return nullptr;   // (a page at a time: the next page is somewhere else)
+      uint64_t pte = 0;
+      for (int k = 7; k >= 0; --k) pte = pte << 8 | gart_table[index * 8 + k];
+      if (!(pte & 1)) return nullptr;
+      pte_and &= pte;
+      const uint64_t page = pte & 0x000000FFFFFFF000ull;
+      if (!(pte & 2)) return window_host(page + offset, bytes);
+      if (!system_host || page < system_base || page - system_base >= system_bytes || offset + bytes > system_bytes - (page - system_base)) return nullptr;
+      return system_host + (page - system_base) + offset;
+    }
+    return window_host(gpu, bytes);
+  }
+  // A copy that may cross pages of the GART: piece by piece. False if any piece has no memory behind it.
+  bool copy_bytes(uint64_t dst, uint64_t src, uint64_t count) const {
+    while (count != 0) {
+      uint64_t piece = count;
+      if (gart_size != 0) {
+        const uint64_t to_src = 4096 - (src & 4095), to_dst = 4096 - (dst & 4095);
+        piece = piece < to_src ? piece : to_src;
+        piece = piece < to_dst ? piece : to_dst;
+      }
+      uint8_t* from = host(src, piece);
+      uint8_t* to = host(dst, piece);
+      if (!from || !to) return false;
+      memmove(to, from, piece);
+      src += piece;
+      dst += piece;
+      count -= piece;
+    }
+    return true;
   }
   uint32_t get32(uint64_t gpu) const {
     const uint8_t* p = host(gpu, 4);
@@ -155,10 +198,7 @@ class Card final : public hardware::IVcnRegisters {
         case 1: {
           const uint32_t count = dword(1) & 0x3FFFFF;
           const uint64_t src = uint64_t{dword(4)} << 32 | dword(3), dst = uint64_t{dword(6)} << 32 | dword(5);
-          uint8_t* from = host(src, count);
-          uint8_t* to = host(dst, count);
-          if (!from || !to || dword(2) != 0) { ++protocol_errors; break; }
-          memmove(to, from, count);
+          if (dword(2) != 0 || !copy_bytes(dst, src, count)) { ++protocol_errors; ++gart_faults; break; }
           ++copies;
           copy_sizes.push_back(count);
           break;

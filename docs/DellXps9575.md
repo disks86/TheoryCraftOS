@@ -311,6 +311,18 @@ IB that does not end on an 8-dword boundary), so the packets' framing is checked
 the simulated ones do not model caches), has not been seen. No shaders are run (there is no compiler for the GCN4 instruction set), no draws are issued, VMIDs other than 0 and the hardware-queue
 priorities are not used, and nothing in the OS calls these yet.
 
+### Copies between system memory and video memory
+
+`AmdVegaM::upload(source, offset)` and `download(destination, offset)` copy between a buffer in system RAM and the block's framebuffer area (the part of the block meant for data; `offset` is in it). The
+system pages are mapped into the first `kTransferPages` (512, 2 MiB) pages of the GART with `kAmdGmc8PteSystemPage` (valid, system, snooped, readable, writeable, executable: what `amdgpu_ttm_gart_bind` writes
+for ordinary memory), the SDMA engine (`instance`, default 0) copies between that window and video memory with `AmdSdma3::copy`, a window at a time, and the window is unmapped again. A buffer that
+starts inside a page is handled (the page offset is added to the window address). The card is given a buffer's address as it is (the OS keeps its memory mapped at its own addresses), or whatever
+`Inputs::system_addresses` (`ISystemAddresses`) returns; addresses beyond the card's 40 bits are refused. A call returns when the copy is done; one at a time. If the engine does not finish it is wedged, the
+window stays mapped (the engine may still use the pages, so the caller must not free the buffer) and the engine is given nothing more until it is started again. A copy the engine never took is unmapped.
+
+The simulated SDMA engine walks the GART table the driver wrote (a system page is a page of the test's own memory, a video page is video memory) and faults on an invalid entry, so the table's contents and
+flags are checked, as well as the data. Nothing in the OS calls these yet, and the real engine's behaviour with snooped system pages (cache coherency, the IOMMU if one is on) has not been seen.
+
 ## Radeon RX Vega M: UVD 6.3
 
 `src/Hardware/VideoCodec/AMD/AmdUvd6.*` is the start/stop of the Unified Video Decoder 6.3, ported from amdgpu (`uvd_v6_0.c`: `mc_resume`, `start`, `stop`, the clock-gating "ungate" path; `amdgpu_uvd.c`: the memory layout
