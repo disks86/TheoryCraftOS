@@ -441,8 +441,7 @@ segment pointer written to 0x30 from block 2 on), at most three, a block that ne
 is a module parameter, off). `AmdVegaM::read_edid(connector, &bytes)` does it for a connector; `main.cpp` reads the monitor on each new connection and at boot, parses it with the existing EDID parser, and the toast says
 "A display (DELL U2720Q 2560x1440) was connected to HDMI-A-1 of the Radeon RX Vega M". It takes the bus for some tens of milliseconds, so it runs from the desktop loop and not in the interrupt path.
 
-**Not done / not known:** DisplayPort and eDP connectors (most of what a laptop has) carry the EDID over the AUX channel (I2C over AUX), a transaction of the AtomBIOS (`ProcessAuxChannelTransaction`) and the DPCD, not GPIO
-pins - `read_edid` refuses them; the interpreter exists, the transaction does not. `amdgpu_i2c.c` (pre_xfer, post_xfer and the pad callbacks) and `i2c-algo-bit.c` were not at hand: the register choreography (outputs cleared, pins made
+**Not done / not known:** DisplayPort and eDP connectors carry the EDID over the AUX channel, not GPIO pins - see the next section. `amdgpu_i2c.c` (pre_xfer, post_xfer and the pad callbacks) and `i2c-algo-bit.c` were not at hand: the register choreography (outputs cleared, pins made
 inputs, pads masked for software, a pin "high" when its output is not enabled, released again afterwards) and the protocol are written from memory of them, so `check_i2c_port.py` checks the table and entry layout, which register
 is which, the id bits and the lookup against the driver but not the pad callbacks. Tested against a bit-level simulated bus (`tests/FakeI2cMonitor.hpp`: a monitor as an I2C slave, written independently; `AmdDdcTest`): the wire
 (addresses, offsets, segment pointers, one stop per transfer), the registers left as found, the pads masked while the pins are driven, pins left pulled low, retries, a damaged block, an absent monitor, clock stretching within and past
@@ -658,3 +657,22 @@ What it does not do, and what is needed before a Vega M decodes anything:
 - Still open on the video side: checking interlaced VC-1 pictures against real data, the MPEG-4 tools above, reading the feedback area back, and a run on a real card (a card whose engine stays unpowered makes the start time out; it is stopped and reported).
 - Encode rings, medium-grain clock gating, and the 3D side of the card (CP/RLC/SDMA microcode, memory controller and GART, display) are all untouched.
 - Not run on a Vega M.
+
+### Monitor EDID of DisplayPort and eDP over the AUX channel
+
+DisplayPort and eDP connectors (most of what a laptop has) have no DDC pins: their EDID is read as I2C over the AUX channel. The AUX transaction on the wire is done by the video BIOS: the AtomBIOS command table
+`ProcessAuxChannelTransaction` (index 78 of the master list; `AmdAux::kCommandTable`). `AmdAux` is the port of `amdgpu_atombios_dp_process_aux_ch` and `_aux_transfer`: the request (address, command and length
+bytes, then the payload) is written to the interpreter's scratch memory at byte 4, the table is run with the parameters of `PROCESS_AUX_CHANNEL_TRANSACTION_PARAMETERS_V2` (request pointer 4, data-out pointer 20, the
+connector's DDC id as the channel, the hot plug pin as `ucHPD_ID`), and the reply status (1 timeout, 2 busy, 3 error, otherwise the DisplayPort reply command in the high nibble) and the data length are read back with
+the payload from byte 20. The table takes at most 12 bytes of payload in a write (the request length is four bits) and 16 in a read. On top of it is the DRM helper's I2C-over-AUX adapter (`drm_dp_i2c_xfer`,
+`_drain_msg`, `_do_msg`): each message starts with an address-only request with the middle-of-transaction flag, the data goes in requests of at most 16 bytes (a short reply goes on from there), the transaction is closed
+with an address-only request without the flag; a native or I2C defer is waited out (500 us) and retried (7 runs, one more for each I2C defer up to 7), busy is retried, a timeout, an error and a NACK end it. It is an
+`II2cBus`, so the EDID is read by the same code as over the DDC pins (`i2c_edid::read`, split out of `AmdDdc`). `AmdVegaM::read_edid` uses it for DisplayPort and eDP connectors: it builds an `AtomBios` for the video BIOS
+(the interpreter used for the POST, with the same host) and needs the connector's DDC id to be in the GPIO table, as the driver does. `AmdAux::dpcd_read` reads the sink's DPCD with native requests (nothing uses it yet).
+
+**Not done / not known:** `amdgpu_atombios_dp.c` and `drm_dp_helper.c` were not at hand: the table's parameter layout and index are checked against `atombios.h` (`scripts/check_aux_port.py`) but the request
+framing (the length nibble, 3 for an address-only request and 4 plus the payload otherwise, 16 as 0), the limits of the table (12 and 16 bytes), the delay (0) and the retry rules are from memory. The panel's power of an
+eDP connector is not done (amdgpu switches it on through the transmitter control table before the first AUX access); a panel that is off does not answer, and the POST normally leaves it on. The DPCD is not used (no
+link training, sink capabilities or power state). Tested with a sink written independently from the AUX wire format (`tests/FakeAuxSink.hpp`, behind a video BIOS whose table 78 passes the request to the simulated
+card: `AmdAuxTest`, `AmdVegaMTest::test_read_edid`): the requests on the wire, the table's parameters, native reads and writes, the EDID with its extension blocks and segment pointer, defers, busy, timeouts, errors, NACKs,
+short replies, a table that reports more bytes than were asked for, an image without the table, and random replies under the sanitizers. Whether a real sink answers is unseen.

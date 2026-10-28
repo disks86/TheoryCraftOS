@@ -394,11 +394,42 @@ uint32_t AmdVegaM::service_interrupts(uint32_t max_vectors) {
   return handled;
 }
 
+namespace {
+// The card as the AtomBIOS interpreter sees it (amdgpu's cail_* callbacks): registers by dword; a discrete card has no memory controller or PLL access through the BIOS.
+class PostHost final : public IAtomHost {
+ public:
+  PostHost(IVcnRegisters& registers, const IClock& clock) : registers_(registers), clock_(clock) {}
+  uint32_t read_register(uint32_t reg) override { return registers_.read(reg); }
+  void write_register(uint32_t reg, uint32_t value) override { registers_.write(reg, value); }
+  uint32_t read_mc(uint32_t) override { return 0; }    // (cail_mc_read: "invalid MC read")
+  void write_mc(uint32_t, uint32_t) override {}
+  uint32_t read_pll(uint32_t) override { return 0; }   // (cail_pll_read)
+  void write_pll(uint32_t, uint32_t) override {}
+  void delay_us(uint32_t microseconds) override { wait(microseconds); }
+  void delay_ms(uint32_t milliseconds) override { wait(uint64_t{milliseconds} * 1000); }
+  uint64_t now_us() override { return clock_.now_us(); }
+
+ private:
+  void wait(uint64_t microseconds) {
+    const uint64_t begin = clock_.now_us();
+    while (clock_.now_us() - begin < microseconds) {}
+  }
+  IVcnRegisters& registers_;
+  const IClock& clock_;
+};
+}  // namespace
+
 bool AmdVegaM::read_edid(const AtomConnectors::Connector& connector, ByteBuffer* out) {
-  if (!up() || !inputs_.registers || !inputs_.clock || !connector.has_ddc || AtomConnectors::uses_aux(connector.type)) return false;
+  if (!up() || !inputs_.registers || !inputs_.clock || !connector.has_ddc) return false;
   const AtomI2c::Bus bus = AtomI2c::lookup(inputs_.vbios, connector.ddc_id);
   if (!bus.valid) return false;
-  return AmdDdc(*inputs_.registers, *inputs_.clock, bus).read_edid(out);
+  if (!AtomConnectors::uses_aux(connector.type)) return AmdDdc(*inputs_.registers, *inputs_.clock, bus).read_edid(out);
+  // DisplayPort and eDP: I2C over the AUX channel, which the video BIOS drives (ProcessAuxChannelTransaction)
+  if (!inputs_.allocator) return false;
+  PostHost host(*inputs_.registers, *inputs_.clock);
+  AtomBios bios(host, inputs_.vbios, *inputs_.allocator);
+  if (!bios.valid()) return false;
+  return AmdAux(host, bios, connector.ddc_id, connector.hpd_pin).read_edid(out);
 }
 
 uint32_t AmdVegaM::refresh_audio_pins() {
@@ -455,30 +486,6 @@ AmdVegaM::Recovery AmdVegaM::recover() {
   return r;
 }
 
-namespace {
-// The card as the AtomBIOS interpreter sees it (amdgpu's cail_* callbacks): registers by dword; a discrete card has no memory controller or PLL access through the BIOS.
-class PostHost final : public IAtomHost {
- public:
-  PostHost(IVcnRegisters& registers, const IClock& clock) : registers_(registers), clock_(clock) {}
-  uint32_t read_register(uint32_t reg) override { return registers_.read(reg); }
-  void write_register(uint32_t reg, uint32_t value) override { registers_.write(reg, value); }
-  uint32_t read_mc(uint32_t) override { return 0; }    // (cail_mc_read: "invalid MC read")
-  void write_mc(uint32_t, uint32_t) override {}
-  uint32_t read_pll(uint32_t) override { return 0; }   // (cail_pll_read)
-  void write_pll(uint32_t, uint32_t) override {}
-  void delay_us(uint32_t microseconds) override { wait(microseconds); }
-  void delay_ms(uint32_t milliseconds) override { wait(uint64_t{milliseconds} * 1000); }
-  uint64_t now_us() override { return clock_.now_us(); }
-
- private:
-  void wait(uint64_t microseconds) {
-    const uint64_t begin = clock_.now_us();
-    while (clock_.now_us() - begin < microseconds) {}
-  }
-  IVcnRegisters& registers_;
-  const IClock& clock_;
-};
-}  // namespace
 
 bool AmdVegaM::post(const Inputs& in) {
   if (!in.registers || !in.clock || !in.allocator || in.vbios.size() == 0) {
