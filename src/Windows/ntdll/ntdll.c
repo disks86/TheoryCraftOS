@@ -1336,7 +1336,8 @@ EXPORT NTSTATUS NTAPI LdrLoadDll(PWSTR search_path, PULONG flags, PUNICODE_STRIN
   }
   BOOLEAN bare = TRUE;
   for (USHORT i = 0; i < name->Length / 2; ++i) if (name->Buffer[i] == '\\' || name->Buffer[i] == '/' || name->Buffer[i] == ':') bare = FALSE;
-  if (!search_path && !bare && !absolute) {      /* a relative path is taken from the current folder */
+  const BOOLEAN drive_relative = name->Length >= 4 && name->Buffer[1] == ':' && !absolute;      /* ("C:name": the current folder of that drive) */
+  if (!bare && !absolute && (!search_path || drive_relative)) {      /* a relative path is taken from the current folder */
     WCHAR full[520], text[520];
     SIZE_T n = name->Length / 2;
     if (n >= 520) return STATUS_NAME_TOO_LONG_;
@@ -1362,7 +1363,12 @@ EXPORT NTSTATUS NTAPI LdrLoadDll(PWSTR search_path, PULONG flags, PUNICODE_STRIN
       if (full[n - 1] != '\\') full[n++] = '\\';
       for (USHORT i = 0; i < name->Length / 2; ++i) full[n++] = name->Buffer[i];
       full[n] = 0;
+      WCHAR expanded[520];
       UNICODE_STRING us = { (USHORT)(n * 2), (USHORT)(n * 2 + 2), full };
+      if (!(full[1] == ':' && full[2] == '\\') && full[0] != '\\') {      /* (a relative folder in the path: from the current folder) */
+        const ULONG got = RtlGetFullPathName_U(full, sizeof(expanded), expanded, NULL);
+        if (got != 0 && got < sizeof(expanded)) { us.Buffer = expanded; us.Length = (USHORT)got; us.MaximumLength = (USHORT)(got + 2); }
+      }
       const NTSTATUS status = ldr_load_one(flags, &us, handle);
       if (NT_SUCCESS(status)) return status;
       if (status != STATUS_DLL_NOT_FOUND && status != (NTSTATUS)0xC0000034 && status != (NTSTATUS)0xC000003A && !found) { found = TRUE; first_error = status; }
