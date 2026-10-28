@@ -73,10 +73,10 @@ output. Checked against an oracle for every arithmetic instruction (swizzles, mo
   declared as the position) goes through a spare temporary and `mul <position>, rT, c31` (the Y flip constant the device supplies). A program made from DXBC is first written as a
   Direct3D 9 stream (`D3d9Emit.cpp`, `emit_d3d9_tokens`: vs/ps_2_0, or 3.0 when it branches on a register) and then rewritten; instructions Direct3D 9 lacks (div, sqrt, seq / sne,
   floor / ceil / trunc / round, movc, dp2 in vertex shaders, discard, sin / cos) are built from the ones it has, checked by compiling the stream again and running it beside the
-  original. Refused: other models than 2.0 / 3.0, a vertex shader with no temporary left (vs_2_0 has 12) or its own `def c31`, a program that needs more than 22 constants.
+  original. Refused: other models than 1.1 (vertex) / 2.0 / 3.0, a vertex shader with no temporary left (vs_2_0 has 12) or its own `def c31`, a program that needs more than 22 constants.
   The device now also sets the push constants for pixel shaders and takes sampled textures (`kImageSampled` images with `write_pixels`, up to two units, nearest / linear, wrap / clamp,
-  no mipmaps) - written from the protocol as I remember it (texture states 8..12, surface hint 1<<1), no header was at hand; none of it ran on a VMware host. Still without: stencil,
-  mipmaps, vs_1_1 / ps_1_x, the R8G8B8A8 format, multiple render targets.
+  mip filter, level clamp and bias, mipmapped images with `write_mip_pixels` / `generate_mipmaps` made on the CPU) - written from the protocol as I remember it (texture states 8..12 and 21 / 22, surface hint 1<<1), no header was at hand; none of it ran on a VMware host. Vertex shaders of Shader Model 1.1 go too (the rewrite reads their instruction lengths from the opcodes). Still without: stencil,
+  ps_1_x, the R8G8B8A8 format, multiple render targets.
 - *Intel Gen9* has no compiler for its execution units. Its vertex stage already runs on the CPU, so it now takes a vertex shader as a function (any attributes up to four, the push
   constants, one varying handed to the pixel kernel); its pixel stage stays one of two fixed kernels, and `classify_fragment` says whether a pixel shader (D3D9 or DXBC) is exactly one:
   `mov oC0, v0` or a texture sample at a varying (unit 0, `texld`/`sample` into a temporary then moved, or straight into the output). Any other pixel shader is refused there. Tested

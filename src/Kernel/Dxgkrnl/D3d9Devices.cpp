@@ -76,7 +76,7 @@ FragmentKernel D3d9Program::classify_fragment(uint8_t* varying) const {
 
 NtStatus D3d9Program::emit_svga_tokens(ConstByteView original, List<uint32_t>* out) const {
   const bool vertex = stage_ == graphics::ShaderStage::Vertex;
-  if (!((major_ == 2 || major_ == 3) && minor_ == 0) || original.size() < 8 || original.size() % 4) return status::kNotSupported;   // (a DXBC program has major 4 or 5)
+  if (!(((major_ == 2 || major_ == 3) && minor_ == 0) || (major_ == 1 && minor_ == 1)) || original.size() < 8 || original.size() % 4) return status::kNotSupported;   // (a DXBC program has major 4 or 5)
   uint32_t temporaries = 0;
   for (const Instruction& ins : code_.view()) {
     if (ins.dst.type == kTemp && ins.dst.number + 1u > temporaries && d3d9_op_writes_register(ins.op)) temporaries = ins.dst.number + 1u;
@@ -107,7 +107,7 @@ NtStatus D3d9Program::emit_svga_tokens(ConstByteView original, List<uint32_t>* o
         if (major_ == 3 && position_register < 0) return status::kNotSupported;
         // (oPos in Shader Model 2, the declared output register in 3)
         const uint32_t destination = major_ == 3 ? 0xE00F0000u | static_cast<uint32_t>(position_register) : 0xC00F0000u;
-        const uint32_t extra[] = {kMul | (3u << 24), destination, 0x80E40000u | position_temp, 0xA0E4001Fu};
+        const uint32_t extra[] = {kMul | (major_ < 2 ? 0u : 3u << 24), destination, 0x80E40000u | position_temp, 0xA0E4001Fu};
         for (uint32_t w : extra)
           if (!put(w)) return status::kNoMemory;
       }
@@ -115,7 +115,14 @@ NtStatus D3d9Program::emit_svga_tokens(ConstByteView original, List<uint32_t>* o
       return status::kSuccess;
     }
     uint32_t words = (token >> 24) & 0xF;
-    if (op == kComment) words = (token >> 16) & 0x7FFF;
+    if (op == kComment) {
+      words = (token >> 16) & 0x7FFF;
+    } else if (major_ < 2) {
+      // (Shader Model 1 instructions say nothing of their length: it is the opcode's)
+      const int n = d3d9_op_parameter_tokens(op);
+      if (n < 0) return status::kInvalidParameter;
+      words = static_cast<uint32_t>(n);
+    }
     if (!put(token)) return status::kNoMemory;
     for (uint32_t i = 0; i < words; ++i) {
       uint32_t w = in.le32();

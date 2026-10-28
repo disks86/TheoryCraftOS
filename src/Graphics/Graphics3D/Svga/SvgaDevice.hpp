@@ -61,13 +61,17 @@ class SvgaDevice final : public IGraphicsDevice {
   // Surface transfers through the staging area. `write` copies guest -> host. For a 1D buffer surface `width` is bytes and `height` is 1.
   bool transfer(uint32_t surface, bool write, uint32_t x, uint32_t width, uint32_t height, uint32_t pitch, void* guest_data);
   // The same for writing from data that is not to be touched (a texture's pixels).
-  bool upload(uint32_t surface, uint32_t x, uint32_t width, uint32_t height, uint32_t pitch, const void* guest_data) { return move(surface, true, x, width, height, pitch, guest_data, nullptr); }
+  bool upload(uint32_t surface, uint32_t mip, uint32_t x, uint32_t width, uint32_t height, uint32_t pitch, const void* guest_data) {
+    return move(surface, mip, true, x, width, height, pitch, guest_data, nullptr);
+  }
+  // ... and reading a level of an image back.
+  bool download(uint32_t surface, uint32_t mip, uint32_t x, uint32_t width, uint32_t height, uint32_t pitch, void* out) { return move(surface, mip, false, x, width, height, pitch, nullptr, out); }
   uint32_t scratch_bytes() const { return scratch_bytes_; }
   hardware::VmwareSvgaGpu& gpu() { return gpu_; }
   allocators::IAllocator& allocator() { return allocator_; }
 
  private:
-  bool move(uint32_t surface, bool write, uint32_t start, uint32_t width, uint32_t height, uint32_t pitch, const void* source, void* destination);
+  bool move(uint32_t surface, uint32_t mip, bool write, uint32_t start, uint32_t width, uint32_t height, uint32_t pitch, const void* source, void* destination);
   hardware::VmwareSvgaGpu& gpu_;
   allocators::IAllocator& allocator_;
   uint8_t* scratch_ = nullptr;

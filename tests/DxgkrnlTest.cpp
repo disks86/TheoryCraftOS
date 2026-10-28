@@ -2601,10 +2601,12 @@ void test_device_forms() {
     // SVGA3D: a vertex shader's position goes through a temporary multiplied by c31; run through the interpreter with c31 defined, the result is the original with Y flipped.
     unsigned checked = 0, refused = 0, wrong = 0;
     static const uint32_t kOps[] = {1, 2, 5, 4, 8, 9, 10, 11, 18, 19, 20, 32, 34, 35, 88};
+    for (uint32_t version : {0xFFFE0200u, 0xFFFE0101u})
     for (uint32_t op : kOps)
       for (uint32_t n = 0; n < 24; ++n) {
         const uint32_t sources = op == 1 || op == 19 || op == 34 || op == 35 ? 1 : (op == 4 || op == 18 || op == 88) ? 3 : 2;
-        const Asm original = one_instruction(true, op, sources, n);
+        Asm original = one_instruction(true, op, sources, n);
+        original.t[0] = version;   // (vs_2_0, or vs_1_1: the same instructions, whose length the opcode gives)
         UniquePointer<D3d9Program> program;
         if (D3d9Program::compile(allocator, original.bytes(), &program) != status::kSuccess) continue;
         List<uint32_t> tokens(allocator);
@@ -2612,7 +2614,7 @@ void test_device_forms() {
           ++refused;
           continue;
         }
-        Asm rewritten(true, 2, 0);
+        Asm rewritten(true, 2, 0);   // (the version word is the rewritten stream's own)
         rewritten.t.clear();
         for (uint64_t i = 0; i < tokens.count(); ++i) rewritten.t.push_back(tokens[i]);
         // (insert `def c31, 1, -1, 1, 1` after the version token)
@@ -2642,7 +2644,7 @@ void test_device_forms() {
         ++checked;
       }
     printf("  svga tokens: %u vertex shaders rewritten and run, %u refused, %u wrong\n", checked, refused, wrong);
-    CHECK(checked > 100 && wrong == 0);
+    CHECK(checked > 200 && wrong == 0);
 
     // The declarations name the inputs the way the device's vertex declaration does: location 1 a colour, 2 and up texture coordinates.
     Asm vs(true, 2, 0);
@@ -2911,6 +2913,40 @@ void test_sm3_and_sm51() {
       CHECK(flips);
       List<uint32_t> ps_tokens(allocator);
       CHECK(p3->emit_svga_tokens(view_of(ps3), &ps_tokens) == status::kSuccess && ps_tokens.count() * 4 == ps3.size());
+    }
+
+    // Shader Model 1.1 (real bytecode, no instruction lengths): the same shader again, and on its way to SVGA3D.
+    {
+      const std::vector<uint8_t> vs1 = read_blob("vs_1_1.sm1");
+      UniquePointer<D3d9Program> v1;
+      CHECK(D3d9Program::compile(allocator, view_of(vs1), &v1) == status::kSuccess && v1 && v4);
+      List<uint32_t> tokens1(allocator);
+      CHECK(v1 && v1->emit_svga_tokens(view_of(vs1), &tokens1) == status::kSuccess);
+      if (v1 && v4 && tokens1.count()) {
+        Asm rewritten(true, 1, 1);
+        rewritten.t.clear();
+        for (uint64_t i = 0; i < tokens1.count(); ++i) rewritten.t.push_back(tokens1[i]);
+        const uint32_t def[] = {kOpDef | (5u << 24), Asm::dst(kRegConst, 31), __builtin_bit_cast(uint32_t, 1.0f), __builtin_bit_cast(uint32_t, -1.0f), __builtin_bit_cast(uint32_t, 1.0f),
+                                __builtin_bit_cast(uint32_t, 1.0f)};
+        rewritten.t.insert(rewritten.t.begin() + 1, def, def + 6);
+        UniquePointer<D3d9Program> flipped;
+        CHECK(D3d9Program::compile(allocator, rewritten.bytes(), &flipped) == status::kSuccess && flipped);
+        bool ok = flipped != nullptr;
+        for (unsigned set = 0; set < 4 && flipped; ++set) {
+          uint8_t constants[128];
+          for (unsigned i = 0; i < 8; ++i)
+            for (unsigned k = 0; k < 4; ++k) memcpy(constants + i * 16 + k * 4, &kConstants[set][i][k], 4);
+          graphics::Vec4 values[4];
+          for (unsigned i = 0; i < 4; ++i) values[i] = {kInputs[set][i][0], kInputs[set][i][1], kInputs[set][i][2], kInputs[set][i][3]};
+          graphics::ShaderIo x = {}, y = {}, reference = {};
+          v1->run_vertex(values, constants, &x);
+          flipped->run_vertex(values, constants, &y);
+          v4->run_vertex(values, constants, &reference);
+          ok = ok && same_vec(x.position, reference.position) && same_vec(x.varying[0], reference.varying[0]) && near_value(x.varying[2].x, reference.varying[2].x);
+          ok = ok && near_value(x.position.x, y.position.x) && near_value(x.position.y, -y.position.y) && near_value(x.position.z, y.position.z) && near_value(x.position.w, y.position.w);
+        }
+        CHECK(ok);
+      }
     }
 
     // A vs_3_0 whose position is not o0, with a texture coordinate where the device wants a colour.
