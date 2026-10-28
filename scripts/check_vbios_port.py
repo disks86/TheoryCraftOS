@@ -77,7 +77,7 @@ def main():
     if not order(dgpu, ['amdgpu_atrm_get_bios', 'amdgpu_acpi_vfct_bios', 'amdgpu_read_bios_from_vram', 'amdgpu_read_platform_bios', 'amdgpu_read_bios(adev)', 'amdgpu_read_bios_from_rom', 'amdgpu_read_disabled_bios']):
         fail('amdgpu_get_bios_dgpu changed its order')
     mine = body(cpp[cpp.index('AmdVbios::Source AmdVbios::find'):], 'AmdVbios::find') if False else squash(cpp[cpp.index('AmdVbios::Source AmdVbios::find'):])
-    if not order(mine, ['read_from_atrm', 'find_in_vfct', 'read_from_legacy_shadow', 'read_from_rom_bar', 'read_from_rom_registers']):
+    if not order(mine, ['read_from_atrm', 'find_in_vfct', 'read_from_vram', 'read_from_legacy_shadow', 'read_from_rom_bar', 'read_from_rom_registers']):
         fail('AmdVbios::find is not in the order of the sources')
     # the ATRM method: 256 KiB in pages of 4096, ATRM(offset, length), stopping at the first short page, then check_atom_bios
     if '#define ATRM_BIOS_PAGE 4096' not in bios_c or 'kAtrmBiosPage = 4096, kAtrmBiosBytes = 256 * 1024' not in hpp:
@@ -93,6 +93,18 @@ def main():
     if not order(mine_atrm, ['arguments[0].integer = uint64_t{page} * kAtrmBiosPage', 'arguments[1].integer = kAtrmBiosPage', 'aml.evaluate(method, arguments, 2, &result)',
                              'if (result.length < kAtrmBiosPage) break;', 'is_atom_bios(image.view())']) or 'page < kAtrmBiosBytes / kAtrmBiosPage' not in mine_atrm or "name[0] == 'A' && name[1] == 'T' && name[2] == 'R' && name[3] == 'M'" not in cpp:
         fail('read_from_atrm does not follow amdgpu_atrm_get_bios')
+    # the copy in video memory: 256 KiB at the start of BAR 0, only for a card that needs no POST (CIK and later: BIOS_SCRATCH_7 has ASIC_INIT_COMPLETE), then check_atom_bios
+    vram = body(bios_c, 'amdgpu_read_bios_from_vram')
+    if 'size = 256 * 1024' not in vram or not order(vram, ['amdgpu_device_need_post(adev)', 'pci_resource_len(adev->pdev, 0) == 0', 'vram_base = pci_resource_start(adev->pdev, 0)', 'ioremap_wc(vram_base, size)',
+                                                         'memcpy_fromio(adev->bios, bios, size)', 'check_atom_bios(adev->bios, size)']):
+        fail('amdgpu_read_bios_from_vram changed')
+    need = body(open(os.path.join(os.path.dirname(os.path.abspath(sys.argv[1])), 'amdgpu_atombios.c')).read(), 'amdgpu_atombios_scratch_need_asic_init') if os.path.exists(os.path.join(os.path.dirname(os.path.abspath(sys.argv[1])), 'amdgpu_atombios.c')) else None
+    if need is not None and ('RREG32(adev->bios_scratch_reg_offset + 7)' not in need or 'ATOM_S7_ASIC_INIT_COMPLETE_MASK' not in need):
+        fail('amdgpu_atombios_scratch_need_asic_init changed')
+    if define(atombios_h, 'ATOM_S7_ASIC_INIT_COMPLETE_MASK') != 0x200 or 'kAsicInitComplete = 0x200' not in hpp or 'kVramBiosBytes = 256 * 1024' not in hpp or 'kBiosScratch7 = 0x5d0' not in hpp:
+        fail('the video memory copy constants')
+    if not order(squash(cpp[cpp.index('bool AmdVbios::read_from_vram'):cpp.index('bool AmdVbios::read_from_legacy_shadow')]), ['kBiosScratch7', 'bar0_bytes < kVramBiosBytes', 'map_registers(bar0_physical, kVramBiosBytes', 'is_atom_bios(copy.view())']):
+        fail('read_from_vram does not follow amdgpu_read_bios_from_vram')
     # the platform ROM: the whole romlen (the PCI core's 0xC0000 and 0x20000 for the shadowed ROM of the boot display, arch/x86/pci/fixup.c, not in the files checked here), then check_atom_bios
     plat = body(bios_c, 'amdgpu_read_platform_bios')
     if not order(plat, ['ioremap(rom, romlen)', 'memcpy_fromio(adev->bios, bios, romlen)', 'check_atom_bios(adev->bios, romlen)']):

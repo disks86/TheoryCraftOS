@@ -1097,6 +1097,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
           sources.mapper = &register_mapper;
           sources.registers = &vega_registers;
           sources.allocator = &shared_allocator;
+          sources.bar0_physical = aperture_base;
+          sources.bar0_bytes = aperture_bytes;
           sources.function = d.address;
           sources.vendor_id = d.vendor_id;
           sources.device_id = d.device_id;
