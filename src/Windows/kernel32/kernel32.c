@@ -876,34 +876,31 @@ EXPORT BOOL WINAPI TlsSetValue(DWORD index, LPVOID value) {
   return TRUE;
 }
 
-#define FLS_SLOTS 128
-static PVOID g_fls_values[FLS_SLOTS];
-static BYTE g_fls_used[FLS_SLOTS];
+/* Fiber local storage lives in ntdll (per thread, with callbacks); a failure there is an invalid parameter or no room. */
+IMPORT NTSTATUS NTAPI RtlFlsAlloc(PFLS_CALLBACK_FUNCTION callback, PULONG index);
+IMPORT NTSTATUS NTAPI RtlFlsFree(ULONG index);
+IMPORT NTSTATUS NTAPI RtlFlsGetValue(ULONG index, PVOID *value);
+IMPORT NTSTATUS NTAPI RtlFlsSetValue(ULONG index, PVOID value);
 EXPORT DWORD WINAPI FlsAlloc(PFLS_CALLBACK_FUNCTION callback) {
-  (void)callback;      /* (callbacks run when a fiber ends: there are no fibers) */
-  for (DWORD i = 0; i < FLS_SLOTS; ++i) {
-    if (g_fls_used[i]) continue;
-    g_fls_used[i] = 1;
-    g_fls_values[i] = NULL;
-    return i;
-  }
-  set_error(ERROR_NO_MORE_ITEMS);
-  return TLS_OUT_OF_INDEXES;
+  ULONG index = 0;
+  const NTSTATUS status = RtlFlsAlloc(callback, &index);
+  if (!NT_SUCCESS(status)) { fail_nt(status); return 0xFFFFFFFFu; }
+  return index;
 }
 EXPORT BOOL WINAPI FlsFree(DWORD index) {
-  if (index >= FLS_SLOTS || !g_fls_used[index]) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
-  g_fls_used[index] = 0;
-  return TRUE;
+  const NTSTATUS status = RtlFlsFree(index);
+  return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
 EXPORT PVOID WINAPI FlsGetValue(DWORD index) {
-  if (index >= FLS_SLOTS || !g_fls_used[index]) { set_error(ERROR_INVALID_PARAMETER); return NULL; }
+  PVOID value = NULL;
+  const NTSTATUS status = RtlFlsGetValue(index, &value);
+  if (!NT_SUCCESS(status)) { fail_nt(status); return NULL; }
   set_error(ERROR_SUCCESS);
-  return g_fls_values[index];
+  return value;
 }
 EXPORT BOOL WINAPI FlsSetValue(DWORD index, PVOID value) {
-  if (index >= FLS_SLOTS || !g_fls_used[index]) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
-  g_fls_values[index] = value;
-  return TRUE;
+  const NTSTATUS status = RtlFlsSetValue(index, value);
+  return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
 
 /* ---- synchronization: one thread, so these count and never wait ------------------------------------------------------------------------------------------ */

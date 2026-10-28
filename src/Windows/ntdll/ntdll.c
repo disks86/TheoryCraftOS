@@ -393,19 +393,30 @@ static void notify_all_modules(DWORD reason, PVOID reserved, int forward) {
 }
 
 static volatile LONG g_process_ending;
+static void fls_destroy_current(int free_structure);
+static void fls_thread_begins(void);
 EXPORT void NTAPI RtlExitUserProcess(NTSTATUS status) {
-  if (__sync_bool_compare_and_swap(&g_process_ending, 0, 1)) notify_all_modules(DLL_PROCESS_DETACH, (PVOID)1, 0);      /* (1: the process is ending) */
+  if (__sync_bool_compare_and_swap(&g_process_ending, 0, 1)) {
+    fls_destroy_current(0);      /* (this thread's fiber local storage goes first) */
+    notify_all_modules(DLL_PROCESS_DETACH, (PVOID)1, 0);      /* (1: the process is ending) */
+  }
   for (;;) NtTerminateProcess(NtCurrentProcess(), status);
 }
 
+/* Is the process shutting down (ExitProcess has begun to tell the libraries)? */
+EXPORT BOOLEAN NTAPI RtlDllShutdownInProgress(void) { return g_process_ending != 0; }
+
 /* The thread ends (the libraries and the program are told); the process ends with its last thread. */
 EXPORT void NTAPI RtlExitUserThread(NTSTATUS status) {
+  fls_destroy_current(0);
   if (!g_process_ending) notify_all_modules(DLL_THREAD_DETACH, NULL, 0);
+  fls_destroy_current(1);
   for (;;) NtTerminateThread((HANDLE)(LONG_PTR)-2, status);
 }
 
 /* New threads begin here (the kernel passes the thread's function and parameter in the first two argument registers); the function's return value is the thread's exit code. */
 EXPORT void NTAPI TcosThreadStart(LPTHREAD_START_ROUTINE start, PVOID parameter) {
+  fls_thread_begins();
   notify_all_modules(DLL_THREAD_ATTACH, NULL, 1);
   RtlExitUserThread((NTSTATUS)start(parameter));
 }
@@ -852,6 +863,8 @@ static PVOID process_heap(void) {
 }
 EXPORT PVOID NTAPI RtlProcessHeap(void) { return process_heap(); }
 
+#include "fls.inc"
+
 #include "rtl.inc"
 #include "libc.inc"
 #include "rtl2.inc"
@@ -919,6 +932,7 @@ EXPORT void NTAPI RtlUserThreadStart(ProgramEntry entry, PVOID parameter) {
   PEB *peb = NtCurrentPeb();
   PEB_LDR_DATA *ldr = peb->Ldr;
   process_heap();
+  fls_thread_begins();
   if (ldr) {
     loader_lock();
     /* the libraries in the order they depend on each other, then the program's TLS callbacks, then the program */
