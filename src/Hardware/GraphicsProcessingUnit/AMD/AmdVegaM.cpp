@@ -18,6 +18,7 @@
 
 
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdVegaM.hpp"
+#include "Hardware/GraphicsProcessingUnit/AMD/AmdPanelPower.hpp"
 #include "Hardware/VideoCodec/AMD/AmdGmc8Memory.hpp"
 #include "Utility/ByteBuffer.hpp"
 
@@ -287,6 +288,7 @@ void AmdVegaM::shutdown() {
   }
   display_irq_ = UniquePointer<amd_dce11::Interrupts>();
   connected_pins_ = 0;
+  rx_pending_ = 0;
   audio_pins_ = 0;
   hotplug_head_ = hotplug_count_ = 0;
   display_ = UniquePointer<amd_dce11::Display>();   // (puts the firmware's framebuffer back)
@@ -394,16 +396,138 @@ uint32_t AmdVegaM::service_interrupts(uint32_t max_vectors) {
   return handled;
 }
 
+namespace {
+// The card as the AtomBIOS interpreter sees it (amdgpu's cail_* callbacks): registers by dword; a discrete card has no memory controller or PLL access through the BIOS.
+class PostHost final : public IAtomHost {
+ public:
+  PostHost(IVcnRegisters& registers, const IClock& clock) : registers_(registers), clock_(clock) {}
+  uint32_t read_register(uint32_t reg) override { return registers_.read(reg); }
+  void write_register(uint32_t reg, uint32_t value) override { registers_.write(reg, value); }
+  uint32_t read_mc(uint32_t) override { return 0; }    // (cail_mc_read: "invalid MC read")
+  void write_mc(uint32_t, uint32_t) override {}
+  uint32_t read_pll(uint32_t) override { return 0; }   // (cail_pll_read)
+  void write_pll(uint32_t, uint32_t) override {}
+  void delay_us(uint32_t microseconds) override { wait(microseconds); }
+  void delay_ms(uint32_t milliseconds) override { wait(uint64_t{milliseconds} * 1000); }
+  uint64_t now_us() override { return clock_.now_us(); }
+
+ private:
+  void wait(uint64_t microseconds) {
+    const uint64_t begin = clock_.now_us();
+    while (clock_.now_us() - begin < microseconds) {}
+  }
+  IVcnRegisters& registers_;
+  const IClock& clock_;
+};
+
+// The display engine's hot plug pins, for the wait on an eDP panel's power
+class DisplayHpdSense final : public IHpdSense {
+ public:
+  explicit DisplayHpdSense(amd_dce11::Interrupts* irq) : irq_(irq) {}
+  bool hpd_sense(uint32_t pin) override { return irq_ && irq_->hpd_sense(pin); }
+
+ private:
+  amd_dce11::Interrupts* irq_;
+};
+
+// The AUX channel of a DisplayPort or eDP connector with the interpreter that drives it
+struct AuxSession {
+  PostHost host;
+  AtomBios bios;
+  AmdAux aux;
+  AuxSession(IVcnRegisters& registers, const IClock& clock, ConstByteView vbios, allocators::IAllocator& allocator, const AtomConnectors::Connector& connector)
+      : host(registers, clock), bios(host, vbios, allocator), aux(host, bios, connector.ddc_id, connector.hpd_pin) {}
+};
+}  // namespace
+
+// An eDP panel does not answer on the AUX channel without power: the driver powers it up first and waits for the hot plug pin to show it. (If the wait times out the AUX channel is tried
+// anyway, as the driver does.)
+void AmdVegaM::power_up_panel(const AtomConnectors::Connector& connector, IAtomHost& host, AtomBios& bios) {
+  if (connector.type != AtomConnectors::Type::EmbeddedDisplayPort) return;
+  DisplayHpdSense sense(display_irq_.get());
+  AmdPanelPower::power_on(host, bios, sense, connector.hpd_pin);
+}
+
 bool AmdVegaM::read_edid(const AtomConnectors::Connector& connector, ByteBuffer* out) {
-  if (!up() || !inputs_.registers || !inputs_.clock || !connector.has_ddc || AtomConnectors::uses_aux(connector.type)) return false;
+  if (!up() || !inputs_.registers || !inputs_.clock || !connector.has_ddc) return false;
   const AtomI2c::Bus bus = AtomI2c::lookup(inputs_.vbios, connector.ddc_id);
   if (!bus.valid) return false;
-  return AmdDdc(*inputs_.registers, *inputs_.clock, bus).read_edid(out);
+  if (!AtomConnectors::uses_aux(connector.type)) return AmdDdc(*inputs_.registers, *inputs_.clock, bus).read_edid(out);
+  // DisplayPort and eDP: I2C over the AUX channel, which the video BIOS drives (ProcessAuxChannelTransaction)
+  if (!inputs_.allocator) return false;
+  AuxSession session(*inputs_.registers, *inputs_.clock, inputs_.vbios, *inputs_.allocator, connector);
+  if (!session.bios.valid()) return false;
+  power_up_panel(connector, session.host, session.bios);
+  return session.aux.read_edid(out);
+}
+
+bool AmdVegaM::read_dpcd(const AtomConnectors::Connector& connector, Dpcd::Capabilities* capabilities, Dpcd::LinkStatus* status) {
+  if (!up() || !inputs_.registers || !inputs_.clock || !inputs_.allocator || !connector.has_ddc || !AtomConnectors::uses_aux(connector.type)) return false;
+  if (!AtomI2c::lookup(inputs_.vbios, connector.ddc_id).valid) return false;
+  AuxSession session(*inputs_.registers, *inputs_.clock, inputs_.vbios, *inputs_.allocator, connector);
+  if (!session.bios.valid()) return false;
+  power_up_panel(connector, session.host, session.bios);
+  Dpcd::Capabilities caps;
+  if (!Dpcd::read_capabilities(session.aux, connector.type == AtomConnectors::Type::EmbeddedDisplayPort, &caps)) return false;
+  if (status && !Dpcd::read_link_status(session.aux, status)) return false;
+  *capabilities = caps;
+  return true;
+}
+
+uint32_t AmdVegaM::service_short_pulses(SinkEvent* out, uint32_t capacity) {
+  uint32_t count = 0;
+  if (!out) capacity = 0;
+  for (uint32_t pin = 0; pin < amd_dce11::Interrupts::kMaxHpd && count < capacity; ++pin) {
+    if (!(rx_pending_ >> pin & 1)) continue;
+    rx_pending_ &= ~(1u << pin);
+    SinkEvent e;
+    e.pin = pin;
+    if (const AtomConnectors::Connector* connector = AtomConnectors::find_pin(connectors(), pin)) {
+      e.has_connector = true;
+      e.connector = *connector;
+    }
+    if (up() && e.has_connector && inputs_.registers && inputs_.clock && inputs_.allocator && e.connector.has_ddc && AtomConnectors::uses_aux(e.connector.type)) {
+      AuxSession session(*inputs_.registers, *inputs_.clock, inputs_.vbios, *inputs_.allocator, e.connector);
+      if (session.bios.valid()) {      // (no panel power-up: a sink that is off does not pulse)
+        e.checked = true;
+        if (!Dpcd::read_lane_count(session.aux, &e.lanes) || !Dpcd::read_link_status(session.aux, &e.status)) {
+          e.read_failed = true;
+          e.lanes = 0;
+          e.status = Dpcd::LinkStatus();
+        } else {
+          e.link_lost = e.lanes > 0 && !e.status.channel_eq_ok(e.lanes);
+          e.test_request = e.status.automated_test_request();
+          e.content_protection = e.status.content_protection_irq();
+          e.sink_specific = e.status.sink_specific_irq();
+          if (!Dpcd::acknowledge_service_irq(session.aux, e.status.irq_vector, &e.acked)) e.handling_failed = true;
+          if (e.test_request) {
+            ByteBuffer edid(*inputs_.allocator);
+            bool ok = Dpcd::read_test_request(session.aux, &e.test_kind);
+            if (ok && e.test_kind == Dpcd::kTestEdidRead) session.aux.read_edid(&edid);     // (no EDID: the buffer stays empty, and the test is answered NAK)
+            ok = ok && Dpcd::answer_test_request(session.aux, e.test_kind, edid.view(), &e.test_response);
+            if (!ok) e.handling_failed = true;
+          }
+        }
+      }
+    }
+    out[count++] = e;
+  }
+  return count;
 }
 
 uint32_t AmdVegaM::refresh_audio_pins() {
   if (!up() || !inputs_.registers) return audio_pins_ = 0;
   return audio_pins_ = amd_dce11::AudioPins(*inputs_.registers).connected_mask(kAudioPins);
+}
+
+bool AmdVegaM::audio_pin_for(const AtomConnectors::Connector& connector, uint32_t* pin) const {
+  if (!AtomConnectors::carries_audio(connector.type) || AtomConnectors::afmt_instance(connector) == AtomConnectors::kNoDig) return false;
+  for (uint32_t i = 0; i < kAudioPins; ++i) {
+    if (!(audio_pins_ >> i & 1)) continue;
+    if (pin) *pin = i;
+    return true;
+  }
+  return false;
 }
 
 uint32_t AmdVegaM::audio_outputs(AtomConnectors::Connector* out, uint32_t capacity) const {
@@ -455,30 +579,6 @@ AmdVegaM::Recovery AmdVegaM::recover() {
   return r;
 }
 
-namespace {
-// The card as the AtomBIOS interpreter sees it (amdgpu's cail_* callbacks): registers by dword; a discrete card has no memory controller or PLL access through the BIOS.
-class PostHost final : public IAtomHost {
- public:
-  PostHost(IVcnRegisters& registers, const IClock& clock) : registers_(registers), clock_(clock) {}
-  uint32_t read_register(uint32_t reg) override { return registers_.read(reg); }
-  void write_register(uint32_t reg, uint32_t value) override { registers_.write(reg, value); }
-  uint32_t read_mc(uint32_t) override { return 0; }    // (cail_mc_read: "invalid MC read")
-  void write_mc(uint32_t, uint32_t) override {}
-  uint32_t read_pll(uint32_t) override { return 0; }   // (cail_pll_read)
-  void write_pll(uint32_t, uint32_t) override {}
-  void delay_us(uint32_t microseconds) override { wait(microseconds); }
-  void delay_ms(uint32_t milliseconds) override { wait(uint64_t{milliseconds} * 1000); }
-  uint64_t now_us() override { return clock_.now_us(); }
-
- private:
-  void wait(uint64_t microseconds) {
-    const uint64_t begin = clock_.now_us();
-    while (clock_.now_us() - begin < microseconds) {}
-  }
-  IVcnRegisters& registers_;
-  const IClock& clock_;
-};
-}  // namespace
 
 bool AmdVegaM::post(const Inputs& in) {
   if (!in.registers || !in.clock || !in.allocator || in.vbios.size() == 0) {
@@ -559,6 +659,7 @@ void AmdVegaM::on_event(const AmdIrq::Event& event) {
       ++hotplug_count_;
       break;
     }
+    case AmdIrq::Kind::DisplayHpdRx: rx_pending_ |= 1u << event.pin; break;
     default: break;
   }
   if (observer_) observer_->on_event(event);

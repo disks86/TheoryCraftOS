@@ -353,6 +353,7 @@ static void report_unhandled(const EXCEPTION_RECORD *record) {
 
 /* Nobody handled it: the top-level filter gets its say, then the process ends with the exception's code. */
 static __attribute__((noreturn, noinline)) void unhandled_exception(EXCEPTION_RECORD *record, CONTEXT *context) {
+  if (g_init_guard && g_init_guard_teb == NtCurrentTeb()) __builtin_longjmp(g_init_guard, 1);      /* (a library's entry point failed: see call_library_entry) */
   if (g_top_level_filter) {
     EXCEPTION_POINTERS pointers = {record, context};
     if (g_top_level_filter(&pointers) == EXCEPTION_CONTINUE_EXECUTION) NtContinue(context, FALSE);

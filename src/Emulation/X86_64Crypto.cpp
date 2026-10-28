@@ -136,7 +136,7 @@ uint32_t sub_word(uint32_t w) {
 }
 
 uint32_t rotate_right(uint32_t v, uint32_t n) { return (v >> n) | (v << (32 - n)); }
-uint32_t rotate_left(uint32_t v, uint32_t n) { return (v << n) | (v >> (32 - n)); }
+uint32_t rotate_left(uint32_t v, uint32_t n) { n &= 31; return n == 0 ? v : (v << n) | (v >> (32 - n)); }
 
 X86_64Cpu::Xmm aes_key_generation_assist(const X86_64Cpu::Xmm& src, uint8_t rcon) {
   const uint32_t x1 = static_cast<uint32_t>(src.lo >> 32), x3 = static_cast<uint32_t>(src.hi >> 32);
@@ -295,7 +295,8 @@ X86_64Cpu::Step X86_64Cpu::crypto_map(GuestMemory& m, uint32_t map, uint8_t op, 
   const uint32_t pp = d_.operand16 ? 1 : d_.rep ? 2 : d_.repne ? 3 : 0;
   const bool vex = vex_.active;
   if (vex && map == 2 && (op == 0xCB || op == 0xCC || op == 0xCD)) return sha512_instruction(m, op, vvvv);
-  if (vex && map == 2 && op == 0xDA) return sm4_instruction(m, vvvv);
+  if (vex && map == 2 && op == 0xDA) return d_.rep || d_.repne ? sm4_instruction(m, vvvv) : sm3_instruction(m, 2, op, vvvv);
+  if (vex && map == 3 && op == 0xDE) return sm3_instruction(m, 3, op, vvvv);
   const bool sha = (map == 2 && op >= 0xC8 && op <= 0xCD) || (map == 3 && op == 0xCC);
   if (sha && vex) return fail(6);      // (the SHA-1 and SHA-256 instructions have no VEX form)
   if (sha ? pp != 0 : pp != 1) return fail(6);
@@ -450,6 +451,70 @@ X86_64Cpu::Step X86_64Cpu::sm4_instruction(GuestMemory& m, uint32_t vvvv) {
   for (uint32_t h = 0; h < (wide ? 2u : 1u); ++h) out[h] = sm4_four_rounds(a[h], b[h], d_.rep);
   s_.xmm[d_.reg] = out[0];
   s_.ymm_high[d_.reg] = wide ? out[1] : Xmm();
+  s_.rip += d_.position;
+  return Step::Ok;
+}
+
+// SM3: VSM3MSG1 (VEX.128.0F38 DA), VSM3MSG2 (VEX.128.66.0F38 DA) and VSM3RNDS2 xmm1, xmm2, xmm3/m128, imm8 (VEX.128.66.0F3A DE). The register holds the words with the lowest index in
+// dword 0, except that the round instruction keeps A, B, E, F (and C, D, G, H) in dwords 3..0.
+X86_64Cpu::Step X86_64Cpu::sm3_instruction(GuestMemory& m, uint32_t map, uint8_t op, uint32_t vvvv) {
+  auto bad_decode = [&]() { return fail(d_.available < 15 ? 14 : 6, s_.rip + d_.available); };
+  const bool rounds = map == 3;
+  const bool second = d_.operand16;      // msg2 and rnds2 have the 66 prefix, msg1 has none
+  if (d_.rex_w || vex_.wide || d_.rep || d_.repne || (rounds && !second)) return fail(6);
+  if (!decode_modrm()) return bad_decode();
+  const uint32_t imm = rounds ? static_cast<uint32_t>(next_imm(1, false)) : 0;
+  if (!finish_decode()) return bad_decode();
+  Xmm b[2];
+  if (!read_y(m, 16, b)) return Step::Fault;
+  const Xmm dest = s_.xmm[d_.reg];
+  const Xmm a = s_.xmm[vvvv];
+  Xmm out;
+  auto p1 = [](uint32_t x) { return x ^ rotate_left(x, 15) ^ rotate_left(x, 23); };
+  if (rounds) {
+    auto p0 = [](uint32_t x) { return x ^ rotate_left(x, 9) ^ rotate_left(x, 17); };
+    uint32_t A = dword(a, 3), B = dword(a, 2), E = dword(a, 1), F = dword(a, 0);
+    uint32_t C = rotate_left(dword(dest, 3), 9), D = rotate_left(dword(dest, 2), 9), G = rotate_left(dword(dest, 1), 19), H = rotate_left(dword(dest, 0), 19);
+    const uint32_t w[8] = {dword(b[0], 0), dword(b[0], 1), 0, 0, dword(b[0], 2), dword(b[0], 3), 0, 0};
+    const uint32_t round = imm & 0x3E;
+    uint32_t k = rotate_left(round < 16 ? 0x79CC4519u : 0x7A879D8Au, round);
+    for (uint32_t i = 0; i < 2; ++i) {
+      const uint32_t a12 = rotate_left(A, 12);
+      const uint32_t ss1 = rotate_left(a12 + E + k, 7);
+      const uint32_t ss2 = ss1 ^ a12;
+      const uint32_t ff = round < 16 ? (A ^ B ^ C) : ((A & B) | (A & C) | (B & C));
+      const uint32_t gg = round < 16 ? (E ^ F ^ G) : ((E & F) | (~E & G));
+      const uint32_t tt1 = ff + D + ss2 + (w[i] ^ w[i + 4]);
+      const uint32_t tt2 = gg + H + ss1 + w[i];
+      D = C;
+      C = rotate_left(B, 9);
+      B = A;
+      A = tt1;
+      H = G;
+      G = rotate_left(F, 19);
+      F = E;
+      E = p0(tt2);
+      k = rotate_left(k, 1);
+    }
+    out = pack(A, B, E, F);
+  } else if (!second) {
+    // W0..W3 = src2, W7..W10 = destination, W13..W15 = src1: the first four words of the schedule without the term that depends on the word just computed
+    const uint32_t t0 = dword(dest, 0) ^ dword(b[0], 0) ^ rotate_left(dword(a, 0), 15);
+    const uint32_t t1 = dword(dest, 1) ^ dword(b[0], 1) ^ rotate_left(dword(a, 1), 15);
+    const uint32_t t2 = dword(dest, 2) ^ dword(b[0], 2) ^ rotate_left(dword(a, 2), 15);
+    const uint32_t t3 = dword(dest, 3) ^ dword(b[0], 3);
+    out = pack(p1(t3), p1(t2), p1(t1), p1(t0));
+  } else {
+    // W3..W6 = src1, W10..W13 = src2, the destination holds the msg1 result
+    const uint32_t w0 = rotate_left(dword(a, 0), 7) ^ dword(b[0], 0) ^ dword(dest, 0);
+    const uint32_t w1 = rotate_left(dword(a, 1), 7) ^ dword(b[0], 1) ^ dword(dest, 1);
+    const uint32_t w2 = rotate_left(dword(a, 2), 7) ^ dword(b[0], 2) ^ dword(dest, 2);
+    uint32_t w3 = rotate_left(dword(a, 3), 7) ^ dword(b[0], 3) ^ dword(dest, 3);
+    w3 ^= rotate_left(w0, 6) ^ rotate_left(w0, 15) ^ rotate_left(w0, 30);
+    out = pack(w3, w2, w1, w0);
+  }
+  s_.xmm[d_.reg] = out;
+  s_.ymm_high[d_.reg] = Xmm();
   s_.rip += d_.position;
   return Step::Ok;
 }

@@ -39,6 +39,8 @@ constexpr uint32_t kDeviceTv1 = 1u << 2, kDeviceCv = 1u << 8;   // ATOM_DEVICE_T
 constexpr uint32_t kObjectIdMask = 0x00FF, kObjectIdShift = 0, kEnumIdMask = 0x0700, kEnumIdShift = 8;
 constexpr uint32_t kHpdGpioRegister = 0x488d;                      // mmDC_GPIO_HPD_A (dce_v11_0_hpd_get_gpio_reg)
 constexpr uint32_t kMaxPaths = 255, kMaxRecords = 64;
+constexpr uint32_t kObjectTypeMask = 0x7000, kObjectTypeShift = 12, kGraphObjectTypeEncoder = 2;
+constexpr uint32_t kMaxGraphObjects = 8;                           // the object ids of a path walked (a path has the encoders from the GPU to the connector: one to three)
 
 // object_connector_convert, by connector object id; kUnknown for the ones that are not a connector with a name
 constexpr int kUnknown = -1;
@@ -154,6 +156,16 @@ uint32_t AtomConnectors::name(const Connector& connector, ArrayView<char> buffer
   return used;
 }
 
+uint8_t AtomConnectors::dig_encoder(const Connector& c) {
+  switch (encoder_id(c)) {
+    case kEncoderUniphy: return link_b(c) ? 1 : 0;
+    case kEncoderUniphy1: return link_b(c) ? 3 : 2;
+    case kEncoderUniphy2: return link_b(c) ? 5 : 4;
+    case kEncoderUniphy3: return 6;
+    default: return kNoDig;
+  }
+}
+
 uint32_t AtomConnectors::parse(ConstByteView bios, ArrayView<Connector> out) {
   const Image image{bios};
   uint16_t magic = 0;
@@ -190,6 +202,7 @@ uint32_t AtomConnectors::parse(ConstByteView bios, ArrayView<Connector> out) {
     uint16_t tag = 0, size = 0, conn_id = 0;
     if (!image.u16(path_at, &tag) || !image.u16(path_at + 2, &size) || !image.u16(path_at + 4, &conn_id)) break;
     if (size < kPathHeaderBytes) break;   // (the driver would parse the same path again)
+    const uint32_t this_path = path_at;
     path_at += size;
     if (!(device_support & tag)) continue;
     const uint32_t object_id = (conn_id & kObjectIdMask) >> kObjectIdShift;
@@ -218,10 +231,25 @@ uint32_t AtomConnectors::parse(ConstByteView bios, ArrayView<Connector> out) {
       }
     }
 
+    // The encoders of the path (amdgpu_atombios_get_connector_info_from_object_table: usGraphicObjIds, the objects of the encoder type): the first is the GPU's, a second one a bridge
+    uint16_t encoder = 0, bridge = 0;
+    const uint32_t objects_in_path = (size - kPathHeaderBytes) / 2 < kMaxGraphObjects ? (size - kPathHeaderBytes) / 2 : kMaxGraphObjects;
+    for (uint32_t k = 0; k < objects_in_path; ++k) {
+      uint16_t graph = 0;
+      if (!image.u16(this_path + kPathHeaderBytes + k * 2, &graph)) break;
+      if (((graph & kObjectTypeMask) >> kObjectTypeShift) != kGraphObjectTypeEncoder) continue;
+      if (!encoder) encoder = graph;
+      else if (!bridge) bridge = graph;
+    }
+
     uint32_t existing = 0;
     while (existing < count && conn_ids[existing] != conn_id) ++existing;
     if (existing < count) {   // amdgpu_connector_add: the connector is there already, with one more device
       out[existing].devices |= tag;
+      if (!out[existing].encoder_object) {
+        out[existing].encoder_object = encoder;
+        out[existing].bridge_object = bridge;
+      }
       if (out[existing].hpd_pin == kNoPin && pin != kNoPin) {
         out[existing].hpd_pin = pin;
         out[existing].plugged_state = plugged;
@@ -242,6 +270,8 @@ uint32_t AtomConnectors::parse(ConstByteView bios, ArrayView<Connector> out) {
     c.has_ddc = has_ddc;
     c.ddc_id = ddc_id;
     c.devices = tag;
+    c.encoder_object = encoder;
+    c.bridge_object = bridge;
     c.number = 1;
     for (uint32_t i = 0; i < count; ++i)
       if (out[i].type == c.type) ++c.number;

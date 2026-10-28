@@ -423,7 +423,7 @@ component video devices are skipped). Names are the kernel's: the type and the n
 merged, as `amdgpu_connector_add` does.
 
 Differences from the driver, because the image is untrusted bytes: every read is checked and a table that runs past the image ends the walk with what was found kept, the paths and records walked are bounded (255, 64),
-at most 16 connectors are kept, and the parts that are not about naming are left out (encoders and their capabilities, routers, the DDC lines). `AmdVegaM` parses the table at bring-up when `Inputs::vbios` is set
+at most 16 connectors are kept, and the parts that are not about naming are left out (the encoders' capabilities, routers; the encoder objects of a path are read, see "Encoder objects"). `AmdVegaM` parses the table at bring-up when `Inputs::vbios` is set
 (`connectors()`), and each `HotplugEvent` carries its connector (`has_connector`, `connector`); `main.cpp` writes the name in the toast, on the debug console and in the boot log.
 `scripts/check_connectors_port.py` checks the master list indexes, the layouts of the object header, path, object, record and GPIO entry, the pin masks and the connector type of each object id against the driver;
 `tests/AtomConnectorsTest.cpp` has a hand-assembled XPS-like board (eDP, HDMI, two DisplayPorts), all six pins and the GPIO entries that are not pins, the skipped devices and unnamed objects, records before and after the
@@ -441,8 +441,7 @@ segment pointer written to 0x30 from block 2 on), at most three, a block that ne
 is a module parameter, off). `AmdVegaM::read_edid(connector, &bytes)` does it for a connector; `main.cpp` reads the monitor on each new connection and at boot, parses it with the existing EDID parser, and the toast says
 "A display (DELL U2720Q 2560x1440) was connected to HDMI-A-1 of the Radeon RX Vega M". It takes the bus for some tens of milliseconds, so it runs from the desktop loop and not in the interrupt path.
 
-**Not done / not known:** DisplayPort and eDP connectors (most of what a laptop has) carry the EDID over the AUX channel (I2C over AUX), a transaction of the AtomBIOS (`ProcessAuxChannelTransaction`) and the DPCD, not GPIO
-pins - `read_edid` refuses them; the interpreter exists, the transaction does not. `amdgpu_i2c.c` (pre_xfer, post_xfer and the pad callbacks) and `i2c-algo-bit.c` were not at hand: the register choreography (outputs cleared, pins made
+**Not done / not known:** DisplayPort and eDP connectors carry the EDID over the AUX channel, not GPIO pins - see the next section. `amdgpu_i2c.c` (pre_xfer, post_xfer and the pad callbacks) and `i2c-algo-bit.c` were not at hand: the register choreography (outputs cleared, pins made
 inputs, pads masked for software, a pin "high" when its output is not enabled, released again afterwards) and the protocol are written from memory of them, so `check_i2c_port.py` checks the table and entry layout, which register
 is which, the id bits and the lookup against the driver but not the pad callbacks. Tested against a bit-level simulated bus (`tests/FakeI2cMonitor.hpp`: a monitor as an I2C slave, written independently; `AmdDdcTest`): the wire
 (addresses, offsets, segment pointers, one stop per transfer), the registers left as found, the pads masked while the pins are driven, pins left pulled low, retries, a damaged block, an absent monitor, clock stretching within and past
@@ -658,3 +657,87 @@ What it does not do, and what is needed before a Vega M decodes anything:
 - Still open on the video side: checking interlaced VC-1 pictures against real data, the MPEG-4 tools above, reading the feedback area back, and a run on a real card (a card whose engine stays unpowered makes the start time out; it is stopped and reported).
 - Encode rings, medium-grain clock gating, and the 3D side of the card (CP/RLC/SDMA microcode, memory controller and GART, display) are all untouched.
 - Not run on a Vega M.
+
+### Monitor EDID of DisplayPort and eDP over the AUX channel
+
+DisplayPort and eDP connectors (most of what a laptop has) have no DDC pins: their EDID is read as I2C over the AUX channel. The AUX transaction on the wire is done by the video BIOS: the AtomBIOS command table
+`ProcessAuxChannelTransaction` (index 78 of the master list; `AmdAux::kCommandTable`). `AmdAux` is the port of `amdgpu_atombios_dp_process_aux_ch` and `_aux_transfer`: the request (address, command and length
+bytes, then the payload) is written to the interpreter's scratch memory at byte 4, the table is run with the parameters of `PROCESS_AUX_CHANNEL_TRANSACTION_PARAMETERS_V2` (request pointer 4, data-out pointer 20, the
+connector's DDC id as the channel, the hot plug pin as `ucHPD_ID`), and the reply status (1 timeout, 2 busy, 3 error, otherwise the DisplayPort reply command in the high nibble) and the data length are read back with
+the payload from byte 20. The table takes at most 12 bytes of payload in a write (the request length is four bits) and 16 in a read. On top of it is the DRM helper's I2C-over-AUX adapter (`drm_dp_i2c_xfer`,
+`_drain_msg`, `_do_msg`): each message starts with an address-only request with the middle-of-transaction flag, the data goes in requests of at most 16 bytes (a short reply goes on from there), the transaction is closed
+with an address-only request without the flag; a native or I2C defer is waited out (500 us) and retried (7 runs, one more for each I2C defer up to 7), busy is retried, a timeout, an error and a NACK end it. It is an
+`II2cBus`, so the EDID is read by the same code as over the DDC pins (`i2c_edid::read`, split out of `AmdDdc`). `AmdVegaM::read_edid` uses it for DisplayPort and eDP connectors: it builds an `AtomBios` for the video BIOS
+(the interpreter used for the POST, with the same host) and needs the connector's DDC id to be in the GPIO table, as the driver does. `AmdAux::dpcd_read` reads the sink's DPCD with native requests (nothing uses it yet).
+
+**Not done / not known:** `amdgpu_atombios_dp.c` and `drm_dp_helper.c` were not at hand: the table's parameter layout and index are checked against `atombios.h` (`scripts/check_aux_port.py`) but the request
+framing (the length nibble, 3 for an address-only request and 4 plus the payload otherwise, 16 as 0), the limits of the table (12 and 16 bytes), the delay (0) and the retry rules are from memory. The panel's power of an
+eDP connector is switched on first (`AmdPanelPower`, below). The DPCD is not used (no link training, sink capabilities or power state). Tested with a sink written independently from the AUX wire format (`tests/FakeAuxSink.hpp`, behind a video BIOS whose table 78 passes the request to the simulated
+card: `AmdAuxTest`, `AmdVegaMTest::test_read_edid`): the requests on the wire, the table's parameters, native reads and writes, the EDID with its extension blocks and segment pointer, defers, busy, timeouts, errors, NACKs,
+short replies, a table that reports more bytes than were asked for, an image without the table, and random replies under the sanitizers. Whether a real sink answers is unseen.
+
+**eDP panel power.** A panel that is off does not answer on the AUX channel. `amdgpu_atombios_encoder_set_edp_panel_power` runs the command table `UNIPHYTransmitterControl` (= `DIG1TransmitterControl`, table 76; `DIG_TRANSMITTER_CONTROL_PARAMETERS`, 8 bytes: `usPixelClock`, `ucConfig`, `ucAction` in
+byte 3, four reserved) with `ucAction` = `ATOM_TRANSMITTER_ACTION_POWER_ON` (12) and then polls the connector's hot plug pin once per millisecond for up to 300 ms for the panel to show; on a timeout it logs and goes on.
+`AmdPanelPower::power_on` does the same (the pin is sensed through `IHpdSense`, here the display engine's `DC_HPD_INT_STATUS`; a connector without a pin does not wait; a timeout returns false), and
+`AmdVegaM::read_edid` runs it for eDP connectors before the first AUX access and tries the AUX channel whatever it returns. The panel is left on (`power_off` exists, nothing calls it: the driver switches the panel
+off with the display). The table index, the parameter layout and the two action values are checked against `atombios.h` by `scripts/check_aux_port.py`; `tests/AmdPanelPowerTest.cpp` (the action in the parameters, the wait
+to the millisecond and the 300th sense, a pin that never shows the panel, no pin, an image without the table) and `AmdVegaMTest::test_read_edid` (a panel that answers only after the power-up, which only eDP gets) cover it.
+The driver source for this function was not at hand: the 300 ms / 1 ms polling and the use of only `ucAction` are from memory. Also unseen on hardware: the time a real panel needs (the T1+T2 power sequencing is the table's).
+
+### Encoder objects: connector to DIG encoder to audio block
+
+The display path table lists, after the connector and GPU object ids of a path, the object ids of the encoders from the GPU to the connector (`usGraphicObjIds`). `AtomConnectors::parse` keeps the first object of the
+encoder type (type 2 in bits 14:12 of the id) as `Connector::encoder_object` (the GPU's own encoder, a UNIPHY transmitter) and a second one as `bridge_object` (a bridge chip such as NUTMEG or TRAVIS); at most eight ids of a
+path are walked, and a connector of several paths keeps the first path's encoders (a later path fills them in if the first had none). From the encoder object: the id (`encoder_id`, low byte), the enumeration (bits 10:8;
+2 means the transmitter's link B, `link_b`, as amdgpu's `dig->linkb`), and from those `dig_encoder()` = `dce_v11_0_pick_dig_encoder` (UNIPHY: 0 / 1 for links A / B, UNIPHY1: 2 / 3, UNIPHY2: 4 / 5, UNIPHY3: 6; `kNoDig`
+for any other encoder). `afmt_instance()` is `dce_v11_0_encoder_prepare`'s audio format block, `afmt[dig_encoder]`, only for the digital flat panel devices (DFP1..DFP6: HDMI and DisplayPort, not the internal LCD).
+`AmdVegaM::audio_pin_for(connector, &pin)` then gives the endpoint the driver would hand that block: `dce_v11_0_audio_get_pin`, the first connected endpoint (so the same one for every connector: the driver does not
+tell two displays apart, and neither does this; `AFMT_AUDIO_SRC_CONTROL` is not written here, there is no audio output to program yet).
+
+Checked by `scripts/check_encoder_port.py` against `dce_v11_0.c` and `atombios.h`: the UNIPHY-to-DIG table, the audio block rule, the DFP device mask, the path layout. **Not checked** (`ObjectID.h` was not at hand, the file
+was empty): the encoder object numbers (UNIPHY 0x1E, UNIPHY1 0x20, UNIPHY2 0x21, UNIPHY3 0x25, NUTMEG 0x22, TRAVIS 0x23), the id / enumeration / type masks, the walk of the path's ids in
+`amdgpu_atombios_get_connector_info_from_object_table`, and that enumeration 2 is link B. Not done: the encoder object table of the object header (capabilities of the encoders), the DIG's use for mode setting, and the
+bridge's own handling (`amdgpu_encoder_get_dp_bridge_encoder_id`). `tests/AtomConnectorsTest.cpp` (every transmitter and link, merged paths, the object id limit, bridges, device masks, the truncation and bit-flip sweeps
+over a board with encoders) and `AmdVegaMTest::test_audio_pins` (the XPS-like board's DIGs and the first-connected-endpoint rule as the endpoints change) cover it.
+
+### The sink's DPCD over the AUX channel
+
+A DisplayPort sink describes itself in the DisplayPort Configuration Data (DPCD), a register space read with native AUX requests (`AmdAux::dpcd_read`, up to 16 bytes at a time). `Dpcd` (behind the `IDpcdAux`
+interface that `AmdAux` implements) reads and parses two parts of it. **Capabilities** (`Dpcd::read_capabilities`): the receiver field 0x000..0x00F - the DPCD revision (0x10 is 1.0 .. 0x14 is 1.4), the fastest
+link rate per lane (`max_link_rate_code` in 0.27 Gbit/s units: 0x06, 0x0A, 0x14, 0x1E are RBR, HBR, HBR2, HBR3; `max_link_rate_kbps()`), the most lanes (1, 2 or 4) with the TPS3 and enhanced framing bits, the
+downspread and AUX-handshake bits, the number of receiver ports, the downstream port (a dongle's type, format conversion, port count, OUI support) and the 8b/10b coding bit - and for an eDP connector the panel's DPCD
+revision (0x700) and, from eDP 1.4, its own table of up to eight link rates (0x010.., 16-bit, 200 kHz units, ended by a zero). Bytes that are no DPCD (a revision below 1.0, no rate, a lane count other than 1, 2 or 4)
+are refused, so a bus that reads zeros or ones is not taken for a sink. **Link status** (`Dpcd::read_link_status`): 0x200..0x207 - the sink count (7 bits, the high one in bit 7), the service interrupt vector
+(automated test request, content protection, sink specific), the training status of each lane, the lane alignment and its link-status-updated and downstream-port-changed bits, the sink status and the adjust
+requests; `clock_recovery_ok(lanes)` and `channel_eq_ok(lanes)` are `drm_dp_clock_recovery_ok` / `drm_dp_channel_eq_ok`. This is what a driver reads before it trains the link and when the sink pulses its hot plug
+pin (the short pulse, see "Hot plug"). `AmdVegaM::read_dpcd(connector, &caps, &status)` reads them for DisplayPort and eDP connectors through the same AtomBIOS AUX session as `read_edid`, with the eDP panel
+power-up first (`power_up_panel`, shared).
+
+**Not checked:** all of the register addresses and bit meanings are from memory of the DisplayPort specification and the DRM helper's `drm_dp.h`, neither of which was at hand; there is no port-check script for this
+reason. Not done: writing the DPCD (link rate and lane count settings, training patterns, the sink's power state `DP_SET_POWER`), link training itself, the sink's OUI and the branch device's, the MST registers, the eDP backlight
+and PSR registers, and acting on the short pulse (reading the link status when it comes). `tests/DpcdTest.cpp` (hand-built images from the specification's register map: an HBR2 4-lane monitor, a dongle, an eDP 1.4 panel
+with its rate table, each flag and field alone, sinks that are no DPCD, reads that fail partway, every bit flip of the images and every truncation under the sanitizers) and `AmdVegaMTest::test_read_dpcd` (the XPS-like board's
+DisplayPort and eDP connectors through the video BIOS tables, with a panel that answers only after the power-up) cover it.
+
+### The DisplayPort short pulse: link status and test requests
+
+A DisplayPort sink pulses its hot plug pin briefly (the short pulse, source 42 data 6..11, see "Hot plug") to say that something changed that is not a plug: the link lost sync, a stream was lost, or it wants a test.
+The interrupt handler only takes note: `AmdVegaM::on_event` sets the pin's bit in `pending_short_pulses()` (a pulse whose status bit is not set never gets that far, `AmdIrq` drops it). Looking at the sink is the AUX
+channel's job, which takes some milliseconds, so `service_short_pulses(out, capacity)` does it from the desktop loop. For each pending pin, lowest first, up to `capacity` (the rest stay pending; a pin that pulsed
+twice is one entry), it finds the connector of the pin, and for a DisplayPort or eDP connector with an AUX channel reads `DP_LANE_COUNT_SET` (0x101, bits 4:0: the lanes the link was set up for, 0 while it is not
+trained) and the link status (`Dpcd::read_link_status`), and fills a `SinkEvent`: `link_lost` when the link was set up for lanes and does not pass `channel_eq_ok(lanes)` (clock recovery, equalization and symbol lock of each lane
+in use, and interlane alignment: the test the driver's short pulse handler retrains on), `test_request` (`DP_AUTOMATED_TEST_REQUEST` in the service interrupt vector), `content_protection` and `sink_specific` (the other
+two service interrupts), the whole `status` and `lanes`. A sink that does not answer is `read_failed` (it is gone or asleep); a pin that is no DisplayPort connector, or not in the video BIOS's table, is reported
+with `checked` false and nothing is asked. The panel's power is not switched on for this (a sink that is off does not pulse). Shutting down drops the pending pulses.
+
+**Acknowledging and answering.** After reading the status, `service_short_pulses` writes back the service interrupts it handles (`Dpcd::acknowledge_service_irq`: the automated test request 0x02, content protection 0x04 and
+sink specific 0x40 of `DP_DEVICE_SERVICE_IRQ_VECTOR`, 0x201: the sink clears a bit when a 1 is written to it) - first, as the driver's handler does, so a new request that arrives during the handling is not lost - and
+leaves the others (the MCCS bit and the MST message-ready bits) alone for whoever handles them; `SinkEvent::acked` has the bits written, none are written for a vector without such bits. For an automated test request it
+reads `DP_TEST_REQUEST` (0x218, `test_kind`) and answers in `DP_TEST_RESPONSE` (0x260, `test_response`): the **EDID read test** (request 0x04) is done - the EDID of the sink is read over the same AUX channel, the checksum
+byte of its last 128-byte block goes to `DP_TEST_EDID_CHECKSUM` (0x261) and the response is ACK with the checksum-write bit (0x05) - and every other test (link training 0x01, video pattern 0x02, PHY test pattern 0x08, no
+request, several bits, or an EDID that cannot be read) is answered NAK (0x02), because there is no trained link or pattern generator to run them on. A read or write that did not go through is `handling_failed`.
+`AmdAux::dpcd_write` (a native write, 12 bytes at a time) is what writes; `IDpcdAux` gained it.
+
+Not done: the retraining itself (there is no link training yet; the boot firmware's link is what is judged, and a card that has not trained one has `lanes` 0 and cannot lose it), the other tests (training, video pattern with the test timing
+registers 0x219.., PHY patterns), and the MST message and the downstream port changes. Addresses and bit meanings are from memory, like the rest of the DPCD. `AmdVegaMTest::test_short_pulse_status` (healthy link, a lost lane, a lane beyond the ones in use, an untrained link, lost alignment, each
+service interrupt, the eDP panel, a sink that times out or ends before the status, HDMI and an unknown pin, capacity and order, the dropped state) and `DpcdTest::test_lane_count` cover it.

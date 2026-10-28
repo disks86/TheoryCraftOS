@@ -215,6 +215,11 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
     depth_ = depth;
     window_id_ = parent->frame_window_id(frame_serial);
   }
+  // How much a script may run in one task (instructions) and hold (bytes of heap) before it is stopped; the defaults are for pages on the web. Before load().
+  void set_script_limits(uint64_t instructions, uint64_t memory_bytes) {
+    instruction_limit_ = instructions;
+    memory_limit_ = memory_bytes;
+  }
   void blur() { set_focus(nullptr); }
   // --- IFrameSource
   const HtmlDocument* frame_document(const dom::Node* iframe, uint32_t* tag) override;
@@ -375,8 +380,10 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   uint32_t window_id() override { return window_id_; }
   uint32_t parent_window_id() override { return parent_ ? parent_->window_id_ : 0; }
   uint32_t top_window_id() override { return root()->window_id_; }
+  void load_frames() override { sync_frames(); }
   uint32_t frame_window_id(uint32_t iframe_serial) override;
   bool post_window_message(uint32_t target_window, StringView target_origin, StringView payload, StringView ports) override;
+  bool window_request(uint32_t target_window, StringView request, String* reply) override;
   uint32_t new_port_pair() override;
   void move_port(uint32_t port, uint32_t window) override;
   void post_port_message(uint32_t port, StringView payload, StringView ports) override;
@@ -498,6 +505,7 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   List<Message> messages_;
   Page* parent_ = nullptr;
   uint32_t frame_serial_ = 0, depth_ = 0;
+  uint64_t instruction_limit_ = 8000000, memory_limit_ = 48u << 20;
   uint32_t window_id_ = 1, next_window_id_ = 2;           // (the top page numbers the windows of its frames)
   List<PortHome> frame_windows_;                           // (the window number of each <iframe>, by the node's serial, made when first asked for)
   uint32_t next_port_ = 1;

@@ -57,7 +57,8 @@ struct PageAttributes {
   uint8_t type = Private;
   bool reserved = false;      // reserved, not committed
   bool file_view = false;     // a view of a file (a view of plain memory can still be committed)
-  bool operator==(const PageAttributes& o) const { return protect == o.protect && allocation_protect == o.allocation_protect && type == o.type && reserved == o.reserved && file_view == o.file_view; }
+  bool copied = false;        // a copy-on-write page that was written to: it has a copy of its own
+  bool operator==(const PageAttributes& o) const { return protect == o.protect && allocation_protect == o.allocation_protect && type == o.type && reserved == o.reserved && file_view == o.file_view && copied == o.copied; }
 };
 
 class AddressSpace final : public IUserMemory {
@@ -90,6 +91,11 @@ class AddressSpace final : public IUserMemory {
   bool map_shared(uint64_t address, uint64_t size, uint8_t protection, uint8_t* storage, SharedMemory* owner);
   bool is_shared(uint64_t address) const;
   SharedMemory* shared_at(uint64_t address) const;
+  // The pieces of regions that map `owner`'s memory: where each lies and which bytes of the owner it shows. Returns how many there are (at most `capacity` are written).
+  struct ViewPart { uint64_t base = 0, size = 0; const uint8_t* storage = nullptr; };
+  uint32_t views_of(const SharedMemory* owner, ViewPart* out, uint32_t capacity) const;
+  // The bytes of the owner's memory that `address` shows (nullptr if it is not a shared page).
+  const uint8_t* storage_at(uint64_t address) const;
   // Unmaps whatever is mapped inside [address, address + size) (size rounded up); regions that stick out are cut. Gaps are fine. False for a bad range
   // or if cutting a region ran out of memory (nothing is unmapped then).
   bool unmap(uint64_t address, uint64_t size);

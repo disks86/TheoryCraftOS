@@ -1499,6 +1499,7 @@ int main(int argc, char** argv) {
   if (argc >= 19) test_x87_program(argv[17], argv[18], "AES/PCLMUL/SHA");
   if (argc >= 21) test_x87_program(argv[19], argv[20], "SHA-512/SM4");
   if (argc >= 23) test_x87_program(argv[21], argv[22], "AVX-512");
+  if (argc >= 25) test_x87_program(argv[23], argv[24], "AVX-512 FP16");
   if (argc >= 13) test_avx_program(argv[11], argv[12]);      // (the SSE3/SSSE3/SSE4 program: the same kind of check)
   test_threads_without_support();
   if (argc < 3) printf("(no guest program given: skipping the whole-program tests)\n");

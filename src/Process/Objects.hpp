@@ -126,12 +126,21 @@ class ObjectManager {
     bool writable = false, file_backed = false;
     uint32_t page = 0;      // the PAGE_* protection it was made with
     uint32_t attributes = 0;      // what NtQuerySection reports: SEC_COMMIT / SEC_RESERVE / SEC_FILE / SEC_NOCACHE ...
+    uint64_t reported_size = 0;   // an image section: the size NtQuerySection reports (0: the rounded size)
   };
   // `fs` / `host_path`: the file that backs it (nullptr: plain memory, zero at the start). A file is read into the section (its size or `size`, the bigger).
   Created create_section(StringView name, uint64_t size, uint32_t page, uint32_t attributes, filesystem::IFileSystem* fs, StringView host_path);
   // The memory of the section for AddressSpace::map_shared(); false if there is no such section.
   bool section_memory(uint32_t id, uint8_t** storage, uint64_t* size, SharedMemory** owner);
   bool section_info(uint32_t id, SectionInfo* out);
+  void section_set_reported_size(uint32_t id, uint64_t size);
+  // The lower-case name of the file behind the section (no folders, cut to 39 characters); false if it has no file.
+  bool section_file_name(uint32_t id, char (&out)[40]);
+  // SEC_RESERVE sections: which pages VirtualAlloc has committed. `owner` is what AddressSpace::map_shared() was given; `offset` counts from the start of the section.
+  bool section_reserved(const SharedMemory* owner);
+  uint64_t section_offset(const SharedMemory* owner, const uint8_t* pointer);
+  void section_commit_pages(const SharedMemory* owner, uint64_t offset, uint64_t length);
+  bool section_page_committed(const SharedMemory* owner, uint64_t offset);
   // Is there a section (a mapping handle or a view) of the file at this path in the OS file system? A file in that state cannot be truncated, deleted or renamed.
   // 0: none, 1: a data section, 2: an image section.
   uint32_t file_has_section(StringView host_path);
@@ -269,6 +278,7 @@ class ObjectManager {
   struct Section;
   class SectionRef;
   void write_section_locked(Section& s);
+  Section* section_of_owner(const SharedMemory* owner);      // (locked)
   void free_section_locked(Object& o);
   struct JobMember { uint64_t pid = 0; uint32_t kill = 0, code = 0; };
   struct Job {
