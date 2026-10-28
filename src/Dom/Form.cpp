@@ -17,6 +17,7 @@
  */
 
 #include "Dom/Form.hpp"
+#include "Dom/LegacyEncodings.hpp"
 #include "Utility/Move.hpp"
 
 namespace dom {
@@ -609,21 +610,62 @@ bool url_encode(StringView text, String* out) {
   return true;
 }
 
-bool encode_urlencoded(const List<Entry>& entries, String* out) {
+namespace {
+
+// Text (UTF-8) as the bytes of encoding `e`; what it cannot hold becomes "&#NNN;" (the form submission's own error mode).
+bool encode_in(Encoding e, StringView text, String* bytes) {
+  if (e == Encoding::Utf8) return bytes->append(text);
+  EncoderState state;
+  uint64_t at = 0;
+  while (at < text.size()) {
+    uint32_t cp = static_cast<uint8_t>(text[at]);
+    uint64_t len = 1;
+    if (cp >= 0xF0 && at + 3 < text.size()) len = 4;
+    else if (cp >= 0xE0 && at + 2 < text.size()) len = 3;
+    else if (cp >= 0xC0 && at + 1 < text.size()) len = 2;
+    if (len == 1) {
+      if (cp >= 0x80) cp = 0xFFFD;
+    } else {
+      cp &= len == 2 ? 0x1F : len == 3 ? 0x0F : 0x07;
+      for (uint64_t k = 1; k < len; ++k) cp = (cp << 6) | (static_cast<uint8_t>(text[at + k]) & 0x3F);
+    }
+    at += len;
+    uint32_t bad = 0;
+    if (encode_code_point(e, &state, cp, bytes, &bad)) continue;
+    char digits[12];
+    uint32_t n = 0;
+    for (uint32_t v = bad; v > 0; v /= 10) digits[n++] = static_cast<char>('0' + v % 10);
+    if (n == 0) digits[n++] = '0';
+    if (!bytes->append("&#")) return false;
+    while (n > 0)
+      if (!bytes->push_back(digits[--n])) return false;
+    if (!bytes->push_back(';')) return false;
+  }
+  encode_finish(e, &state, bytes);
+  return true;
+}
+
+}  // namespace
+
+bool encode_urlencoded(const List<Entry>& entries, Encoding encoding, String* out) {
   out->clear();
-  String tmp(out->allocator());
+  String tmp(out->allocator()), raw(out->allocator());
   for (uint64_t i = 0; i < entries.count(); ++i) {
     if (i > 0 && !out->push_back('&')) return false;
     tmp.clear();
+    raw.clear();
     normalize_newlines(entries[i].name.view(), true, &tmp);
-    if (!url_encode(tmp.view(), out) || !out->push_back('=')) return false;
+    if (!encode_in(encoding, tmp.view(), &raw) || !url_encode(raw.view(), out) || !out->push_back('=')) return false;
     tmp.clear();
+    raw.clear();
     if (entries[i].file) tmp.assign(entries[i].filename.view());
     else normalize_newlines(entries[i].value.view(), true, &tmp);
-    if (!url_encode(tmp.view(), out)) return false;
+    if (!encode_in(encoding, tmp.view(), &raw) || !url_encode(raw.view(), out)) return false;
   }
   return true;
 }
+
+bool encode_urlencoded(const List<Entry>& entries, String* out) { return encode_urlencoded(entries, Encoding::Utf8, out); }
 
 bool encode_multipart(const List<Entry>& entries, StringView boundary, String* out) {
   out->clear();
