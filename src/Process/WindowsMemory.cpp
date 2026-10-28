@@ -93,6 +93,32 @@ void set_private_attributes(AddressSpace& space, uint64_t base, uint64_t size, u
   space.set_attributes(base, size, attributes);
 }
 
+// Pages of a view of a SEC_RESERVE section were committed: the section remembers, and the other views of it in this address space show them committed too (with the
+// protection each view was made with).
+void commit_in_section(AddressSpace& space, uint64_t base, uint64_t size) {
+  ObjectManager* objects = system_objects();
+  SharedMemory* owner = space.shared_at(base);
+  const uint8_t* storage = space.storage_at(base);
+  if (!objects || !owner || !storage || !objects->section_reserved(owner)) return;
+  const uint64_t offset = objects->section_offset(owner, storage);
+  objects->section_commit_pages(owner, offset, size);
+  AddressSpace::ViewPart parts[16];
+  const uint32_t count = space.views_of(owner, parts, 16);
+  for (uint32_t i = 0; i < count && i < 16; ++i) {
+    const uint64_t part_offset = objects->section_offset(owner, parts[i].storage);
+    if (part_offset + parts[i].size <= offset || part_offset >= offset + size) continue;
+    if (parts[i].base <= base && base < parts[i].base + parts[i].size && parts[i].base + parts[i].size >= base + size && part_offset <= offset) continue;      // (the view that was committed)
+    const uint64_t from = part_offset > offset ? part_offset : offset;
+    const uint64_t to = part_offset + parts[i].size < offset + size ? part_offset + parts[i].size : offset + size;
+    const uint64_t at = parts[i].base + (from - part_offset);
+    PageAttributes attributes;
+    if (!space.attributes_at(at, &attributes) || !attributes.reserved) continue;
+    uint8_t prot = 0;
+    if (!page_protection(attributes.allocation_protect & 0xFF, &prot)) continue;
+    if (space.protect(at, to - from, prot)) space.set_page_protect(at, to - from, attributes.allocation_protect, false);
+  }
+}
+
 uint32_t vm_allocate(Process& target, uint64_t* base_io, uint64_t* size_io, uint32_t type, uint32_t protect) {
   if (type == (kMemReserve | 0x400000)) type = kMemReserve;      // MEM_PHYSICAL (address windowing): a plain reservation
   AddressSpace* space = target.address_space();
@@ -133,6 +159,7 @@ uint32_t vm_allocate(Process& target, uint64_t* base_io, uint64_t* size_io, uint
         protect |= existing.allocation_protect & 0x200;      // (a no-cache view stays so)
       }
       if (!space->protect(base, rounded, prot) || !space->set_page_protect(base, rounded, protect, false)) return kStatusConflictingAddresses;
+      if (existing.type == PageAttributes::Mapped) commit_in_section(*space, base, rounded);
     } else if (!space->map(base, rounded, prot)) {
       return kStatusConflictingAddresses;
     } else {

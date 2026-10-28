@@ -186,6 +186,8 @@ struct ObjectManager::Section {
   bool used = false, writable = false, file_backed = false;
   uint32_t page = 0, attributes = 0;
   bool image_mapped = false;
+  bool reserve = false;                     // SEC_RESERVE: its pages are committed by VirtualAlloc, in the section and so in every view
+  uint8_t committed[2048] = {};             // one bit a page of the section
   uint8_t* storage = nullptr;
   uint64_t size = 0, rounded = 0, reported_size = 0;
   int32_t mappings = 0;
@@ -707,6 +709,7 @@ ObjectManager::Created ObjectManager::create_section(StringView name, uint64_t s
     s.page = page;
     s.attributes = attributes;
     s.file_backed = fs != nullptr;
+    s.reserve = (attributes & 0x4000000u) != 0 && !fs;
     s.storage = storage;
     s.size = bytes;
     s.rounded = rounded;
@@ -732,6 +735,39 @@ bool ObjectManager::section_memory(uint32_t id, uint8_t** storage, uint64_t* siz
   *size = s.rounded;
   *owner = &s.ref;
   return true;
+}
+
+ObjectManager::Section* ObjectManager::section_of_owner(const SharedMemory* owner) {
+  if (!sections_) return nullptr;
+  for (uint32_t i = 0; i < kMaxSections; ++i) if (sections_[i].used && static_cast<const SharedMemory*>(&sections_[i].ref) == owner) return &sections_[i];
+  return nullptr;
+}
+
+bool ObjectManager::section_reserved(const SharedMemory* owner) {
+  Locked hold(sync_);
+  const Section* s = section_of_owner(owner);
+  return s && s->reserve;
+}
+
+uint64_t ObjectManager::section_offset(const SharedMemory* owner, const uint8_t* pointer) {
+  Locked hold(sync_);
+  const Section* s = section_of_owner(owner);
+  return s && pointer >= s->storage ? uint64_t(pointer - s->storage) : 0;
+}
+
+void ObjectManager::section_commit_pages(const SharedMemory* owner, uint64_t offset, uint64_t length) {
+  Locked hold(sync_);
+  Section* s = section_of_owner(owner);
+  if (!s || !s->reserve) return;
+  for (uint64_t page = offset / 4096; page * 4096 < offset + length && page < sizeof(s->committed) * 8; ++page) s->committed[page / 8] |= uint8_t(1u << (page % 8));
+}
+
+bool ObjectManager::section_page_committed(const SharedMemory* owner, uint64_t offset) {
+  Locked hold(sync_);
+  const Section* s = section_of_owner(owner);
+  if (!s || !s->reserve) return true;
+  const uint64_t page = offset / 4096;
+  return page < sizeof(s->committed) * 8 && (s->committed[page / 8] >> (page % 8)) & 1;
 }
 
 bool ObjectManager::section_note_image_view(uint32_t id) {
