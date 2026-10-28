@@ -32,6 +32,7 @@
 #include "Hardware/Printer/SystemPrinters.hpp"
 #include "Hardware/GraphicsProcessingUnit/Multi/GpuPool.hpp"
 #include "Hardware/GraphicsProcessingUnit/SystemGpu.hpp"
+#include "Hardware/Monitor/Edid.hpp"
 #include "Hardware/Monitor/MonitorDisplay.hpp"
 #include "Hardware/Monitor/SystemMonitors.hpp"
 #include "SystemInventory.hpp"
@@ -158,6 +159,29 @@ static kernel::Frame* on_vega_interrupt(kernel::Frame* frame, void*) {
   kernel::apic::eoi();
   __atomic_fetch_add(&g_vega_interrupts, 1, __ATOMIC_ACQ_REL);
   return frame;
+}
+
+// What is on a connector, from its monitor's EDID over the DDC lines: "DELL U2720Q 2560x1440", the maker's name where the monitor gives none, or nothing. False if the connector
+// cannot be read (no DDC line, DisplayPort) or nothing answered.
+static bool describe_vega_monitor(hardware::AmdVegaM& card, const hardware::AtomConnectors::Connector& connector, allocators::IAllocator& allocator, FixedString<64>* text) {
+  ByteBuffer raw(allocator);
+  if (!card.read_edid(connector, &raw)) return false;
+  hardware::EdidInfo info;
+  if (!hardware::parse_edid(raw.view(), &info)) return false;
+  text->assign("");
+  if (info.name[0]) {
+    text->append(StringView(info.name));
+  } else {
+    text->append(StringView(hardware::edid_vendor_name(info.manufacturer)));
+  }
+  hardware::EdidTiming best;
+  if (info.best_timing(&best) && best.width && best.height) {
+    text->append(StringView(" "));
+    text->append_uint(best.width);
+    text->append(StringView("x"));
+    text->append_uint(best.height);
+  }
+  return true;
 }
 #endif
 
@@ -1137,7 +1161,9 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
               if (connector) {
                 char connector_name[16];
                 hardware::AtomConnectors::name(*connector, ArrayView<char>(connector_name, sizeof connector_name));
-                Entry(Level::Info, "Vega M").text("  ").text(connector_name);
+                FixedString<64> monitor;
+                if (describe_vega_monitor(*vega_m, *connector, shared_allocator, &monitor)) Entry(Level::Info, "Vega M").text("  ").text(connector_name).text(": ").text(monitor.c_str());
+                else Entry(Level::Info, "Vega M").text("  ").text(connector_name);
               } else {
                 Entry(Level::Info, "Vega M").text("  output ").dec(pin + 1);
               }
@@ -1358,13 +1384,22 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
             where.assign("output ");
             where.append_uint(plug.pin + 1);
           }
-          FixedString<128> text;
+          FixedString<192> text;
           if (plug.throttled) {
             text.assign("Hot plug detection of ");
             text.append(where.c_str());
             text.append(" on the Radeon RX Vega M is switched off: it kept changing");
           } else {
-            text.assign(plug.connected ? "A display was connected to " : "A display was disconnected from ");
+            // (what the monitor says it is, when it is just connected and the connector has DDC lines to ask over)
+            FixedString<64> monitor;
+            const bool known = plug.connected && plug.has_connector && describe_vega_monitor(*vega_m, plug.connector, shared_allocator, &monitor);
+            text.assign(plug.connected ? "A display " : "A display was disconnected from ");
+            if (known) {
+              text.append("(");
+              text.append(monitor.c_str());
+              text.append(") ");
+            }
+            if (plug.connected) text.append("was connected to ");
             text.append(where.c_str());
             text.append(" of the Radeon RX Vega M");
           }

@@ -211,6 +211,34 @@ void test_records() {
   CHECK(AtomConnectors::parse(j.view(), ArrayView<AtomConnectors::Connector>(c, 8)) == 1 && c[0].hpd_pin == AtomConnectors::kNoPin);
 }
 
+void test_ddc() {
+  // the I2C record (type 1: id byte at +2, address at +3) gives the DDC line; the last one wins, as in the driver's loop; before or after the hot plug record; none: no DDC
+  Img i;
+  i.gpio(1, 0x488d, 0);
+  i.path(kDfp1, kHdmi); i.path(kDfp2, kDp1); i.path(kDfp3, kDp2); i.path(kDfp4, 0x1300 | 12);
+  i.object(kHdmi); i.record(1, 4, 0x91, 0); i.record(2, 4, 1, 1); i.end_records();
+  i.object(kDp1); i.record(2, 4, 1, 0); i.record(1, 4, 0x12, 0); i.record(1, 4, 0x13, 0); i.end_records();
+  i.object(kDp2); i.record(3, 4); i.end_records();
+  AtomConnectors::Connector c[8];
+  const uint32_t n = AtomConnectors::parse(i.view(), ArrayView<AtomConnectors::Connector>(c, 8));
+  CHECK(n == 4);
+  CHECK(c[0].has_ddc && c[0].ddc_id == 0x91 && c[0].hpd_pin == 0);
+  CHECK(c[1].has_ddc && c[1].ddc_id == 0x13 && c[1].hpd_pin == 0);
+  CHECK(!c[2].has_ddc && c[2].ddc_id == 0);
+  CHECK(!c[3].has_ddc);   // (no object at all)
+  // a connector reached by two paths takes the DDC line from whichever path has one
+  Img m;
+  m.path(kTv1 | kDfp1, kHdmi); m.path(kDfp2, kHdmi);
+  m.object(kHdmi); m.record(1, 4, 0x55, 0); m.end_records();
+  CHECK(AtomConnectors::parse(m.view(), ArrayView<AtomConnectors::Connector>(c, 8)) == 1 && c[0].has_ddc && c[0].ddc_id == 0x55);
+  // a record cut off by the end of the image has no id
+  Img t;
+  t.path(kDfp1, kHdmi);
+  t.object(kHdmi); t.record(1, 4, 0x91, 0);
+  const std::vector<uint8_t> cut(t.b.begin(), t.b.begin() + (kRecords + 2));
+  CHECK(AtomConnectors::parse(ConstByteView(cut.data(), cut.size()), ArrayView<AtomConnectors::Connector>(c, 8)) == 1 && !c[0].has_ddc);
+}
+
 void test_merging() {
   // one connector reached by two devices: merged, and the pin of whichever path has one
   Img i;
@@ -371,6 +399,7 @@ int main() {
   test_names_of_every_type();
   test_records();
   test_merging();
+  test_ddc();
   test_limits();
   test_names();
   test_damage();

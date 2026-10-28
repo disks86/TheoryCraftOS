@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Emulation/X86_64Cpu.hpp"
+#include "Emulation/HalfFloat.hpp"
 #include "Emulation/SoftFloat.hpp"
 #include "Emulation/Wide.hpp"
 
@@ -85,56 +86,8 @@ uint8_t byte_of(const Xmm& x, uint32_t i) { return static_cast<uint8_t>(lane_get
 void set_byte(Xmm* x, uint32_t i, uint64_t v) { lane_set(&x->lo, &x->hi, 8, i, v); }
 int64_t sx(uint64_t v, uint32_t bits) { return bits >= 64 ? static_cast<int64_t>(v) : static_cast<int64_t>(v << (64 - bits)) >> (64 - bits); }
 
-// half precision (F16C)
-uint32_t half_to_single(uint16_t h) {
-  const uint32_t sign = (h >> 15) & 1, exp = (h >> 10) & 31, man = h & 0x3FF;
-  if (exp == 0) {
-    if (man == 0) return sign << 31;
-    uint32_t e = 113, m = man;      // a denormal: normalize
-    while (!(m & 0x400)) { m <<= 1; --e; }
-    return (sign << 31) | (e << 23) | ((m & 0x3FF) << 13);
-  }
-  if (exp == 31) return (sign << 31) | 0x7F800000u | (man ? 0x400000u | (man << 13) : 0);
-  return (sign << 31) | ((exp + 112) << 23) | (man << 13);
-}
-
-uint16_t single_to_half(uint32_t bits, Rounding mode, uint32_t* flags) {
-  const uint32_t sign = bits >> 31, exp = (bits >> 23) & 255, man = bits & 0x7FFFFF;
-  const uint16_t s = static_cast<uint16_t>(sign << 15);
-  if (exp == 255) {
-    if (man && !(man & 0x400000)) *flags |= kInvalid;
-    return static_cast<uint16_t>(s | 0x7C00 | (man ? 0x200 | (man >> 13) : 0));
-  }
-  if (exp == 0 && man == 0) return s;
-  if (exp == 0) *flags |= kDenormal;
-  const int32_t e = static_cast<int32_t>(exp) - 127;
-  uint32_t m = man | (exp ? 0x800000u : 0);      // with the integer bit
-  int32_t he = e + 15;
-  uint32_t shift = 13;
-  if (he <= 0) {      // the half result is a denormal
-    shift = static_cast<uint32_t>(13 + 1 - he);
-    he = 0;
-  }
-  if (shift > 31) {      // far below the smallest denormal
-    *flags |= kInexact | kUnderflow;
-    return static_cast<uint16_t>(s | (((mode == Rounding::Up && !sign) || (mode == Rounding::Down && sign)) ? 1 : 0));
-  }
-  uint32_t kept = m >> shift;
-  const uint32_t rem = m & ((1u << shift) - 1), half = 1u << (shift - 1);
-  if (rem) *flags |= kInexact;
-  if (rem && he == 0) *flags |= kUnderflow;
-  bool inc = false;
-  switch (mode) {
-    case Rounding::NearestEven: inc = rem > half || (rem == half && (kept & 1)); break;
-    case Rounding::Down: inc = sign && rem; break;
-    case Rounding::Up: inc = !sign && rem; break;
-    default: break;
-  }
-  kept += inc ? 1 : 0;
-  uint32_t result = he == 0 ? kept : ((static_cast<uint32_t>(he) - 1) << 10) + kept;
-  if (he != 0 && (result >> 10) >= 31) { *flags |= kOverflow | kInexact; return static_cast<uint16_t>(s | ((mode == Rounding::TowardZero || (mode == Rounding::Down && !sign) || (mode == Rounding::Up && sign)) ? 0x7BFF : 0x7C00)); }
-  return static_cast<uint16_t>(s | result);
-}
+using half::half_to_single;
+using half::single_to_half;
 
 }  // namespace
 
@@ -185,10 +138,13 @@ X86_64Cpu::Step X86_64Cpu::step_vex(GuestMemory& m, uint8_t first) {
         s_.rip += d_.position;
         return Step::Ok;
       }
+      if (op == 0x41 || op == 0x42 || op == 0x44 || op == 0x45 || op == 0x46 || op == 0x47 || op == 0x4A || op == 0x4B || (op >= 0x90 && op <= 0x93) || op == 0x98 || op == 0x99) return kmask_instruction(m, 1, op, d_.rex_w || false, vvvv);
       return vex_simd(m, op, 0, wide, vvvv);
     }
     case 2: return vex_map2(m, op, d_.rex_w, vvvv);
-    case 3: return vex_map3(m, op, d_.rex_w, vvvv);
+    case 3:
+      if (op >= 0x30 && op <= 0x33) return kmask_instruction(m, 3, op, d_.rex_w, vvvv);
+      return vex_map3(m, op, d_.rex_w, vvvv);
     default: return fail(6);
   }
 }
@@ -521,7 +477,7 @@ X86_64Cpu::Step X86_64Cpu::vex_map2(GuestMemory& m, uint8_t op, bool wide_w, uin
   if (op >= 0x90 && op <= 0x93) return vex_gather(m, op, wide_w, vvvv);
   if ((op >= 0x96 && op <= 0x9F) || (op >= 0xA6 && op <= 0xAF) || (op >= 0xB6 && op <= 0xBF)) return vex_fma(m, op, wide_w, vvvv);
   if (op == 0xF2 || op == 0xF3 || op == 0xF5 || op == 0xF6 || op == 0xF7) return vex_bmi(m, 2, op, wide_w, vvvv);
-  if (op >= 0xDB && op <= 0xDF) return crypto_map(m, 2, op, wide_w, vvvv);
+  if ((op >= 0xDB && op <= 0xDF) || op == 0xCF || op == 0xCB || op == 0xCC || op == 0xCD || op == 0xDA) return crypto_map(m, 2, op, wide_w, vvvv);
   if (pp != 1) return fail(6);
   if (!decode_modrm() || !finish_decode()) return bad_decode();
   const uint32_t reg = d_.reg;
@@ -707,7 +663,7 @@ X86_64Cpu::Step X86_64Cpu::vex_map3(GuestMemory& m, uint8_t op, bool wide_w, uin
   const bool wide = vex_.wide;
   const uint32_t pp = d_.operand16 ? 1 : d_.rep ? 2 : d_.repne ? 3 : 0;
   if (op == 0xF0) return vex_bmi(m, 3, op, wide_w, vvvv);
-  if (op == 0x44 || op == 0xDF) return crypto_map(m, 3, op, wide_w, vvvv);
+  if (op == 0x44 || op == 0xDF || op == 0xCE || op == 0xCF) return crypto_map(m, 3, op, wide_w, vvvv);
   if (pp != 1) return fail(6);
   if (!decode_modrm()) return bad_decode();
   const uint32_t imm = static_cast<uint32_t>(next_imm(1, false));
@@ -968,10 +924,10 @@ X86_64Cpu::Step X86_64Cpu::legacy_sse_map(GuestMemory& m, uint32_t map, uint8_t 
     return Step::Ok;
   }
   bool allowed;
-  if (map == 2) allowed = op <= 0x0B || (op >= 0x1C && op <= 0x1E) || op == 0x17 || (op >= 0x20 && op <= 0x25) || (op >= 0x28 && op <= 0x2B) || (op >= 0x30 && op <= 0x35) || (op >= 0x37 && op <= 0x41) || (op >= 0xDB && op <= 0xDF);
-  else allowed = (op >= 0x08 && op <= 0x0F) || (op >= 0x14 && op <= 0x17) || (op >= 0x20 && op <= 0x22) || (op >= 0x40 && op <= 0x42) || (op >= 0x60 && op <= 0x63) || op == 0x44 || op == 0xDF;
+  if (map == 2) allowed = op <= 0x0B || (op >= 0x1C && op <= 0x1E) || op == 0x17 || (op >= 0x20 && op <= 0x25) || (op >= 0x28 && op <= 0x2B) || (op >= 0x30 && op <= 0x35) || (op >= 0x37 && op <= 0x41) || (op >= 0xDB && op <= 0xDF) || op == 0xCF;
+  else allowed = (op >= 0x08 && op <= 0x0F) || (op >= 0x14 && op <= 0x17) || (op >= 0x20 && op <= 0x22) || (op >= 0x40 && op <= 0x42) || (op >= 0x60 && op <= 0x63) || op == 0x44 || op == 0xDF || op == 0xCE || op == 0xCF;
   if (!allowed) return fail(6);
-  Xmm saved_high[16];
+  YmmHigh saved_high[16];
   for (uint32_t i = 0; i < 16; ++i) saved_high[i] = s_.ymm_high[i];
   const Step r = map == 2 ? vex_map2(m, op, d_.rex_w, reg) : vex_map3(m, op, d_.rex_w, reg);
   for (uint32_t i = 0; i < 16; ++i) s_.ymm_high[i] = saved_high[i];
@@ -1185,25 +1141,34 @@ X86_64Cpu::Step X86_64Cpu::vex_bmi(GuestMemory& m, int map, uint8_t op, bool wid
 X86_64Cpu::Step X86_64Cpu::xsave_family(GuestMemory& m, uint32_t kind) {
   const uint64_t address = memory_address();
   const uint64_t requested = (s_.r[0] & 0xFFFFFFFFu) | (s_.r[2] << 32);
-  const uint64_t features = requested & 7;      // XCR0: x87, SSE, AVX
-  uint8_t image[832] = {};
+  const uint64_t features = requested & 0xE7;      // XCR0: x87, SSE, AVX, opmask, ZMM_Hi256, Hi16_ZMM
+  uint8_t image[2688] = {};
+  auto put64 = [&](uint32_t at, uint64_t v) { for (uint32_t b = 0; b < 8; ++b) image[at + b] = static_cast<uint8_t>(v >> (8 * b)); };
+  auto get64 = [&](uint32_t at) { uint64_t v = 0; for (uint32_t b = 0; b < 8; ++b) v |= uint64_t{image[at + b]} << (8 * b); return v; };
+  const uint64_t bytes = (features & 0xE0) ? 2688 : (features & 4) ? 832 : 576;
   if (kind == 4) {      // xsave
     save_fpu_image(image);
-    for (uint32_t i = 0; i < 8; ++i) image[512 + i] = static_cast<uint8_t>(features >> (8 * i));      // XSTATE_BV: everything requested is in use
-    for (uint32_t r = 0; r < 16; ++r)
-      for (uint32_t b = 0; b < 8; ++b) {
-        image[576 + 16 * r + b] = static_cast<uint8_t>(s_.ymm_high[r].lo >> (8 * b));
-        image[584 + 16 * r + b] = static_cast<uint8_t>(s_.ymm_high[r].hi >> (8 * b));
-      }
-    const uint64_t bytes = (features & 4) ? 832 : 576;
+    put64(512, features);      // XSTATE_BV: everything requested is in use
+    for (uint32_t r = 0; r < 16; ++r) {
+      put64(576 + 16 * r, s_.ymm_high[r].lo);
+      put64(584 + 16 * r, s_.ymm_high[r].hi);
+      put64(1152 + 32 * r, s_.ymm_high[r].upper[0].lo);
+      put64(1160 + 32 * r, s_.ymm_high[r].upper[0].hi);
+      put64(1168 + 32 * r, s_.ymm_high[r].upper[1].lo);
+      put64(1176 + 32 * r, s_.ymm_high[r].upper[1].hi);
+    }
+    for (uint32_t k = 0; k < 8; ++k) put64(1088 + 8 * k, s_.k[k]);
+    for (uint32_t r = 0; r < 16; ++r) {
+      const Vec512 v = get_vec(16 + r);
+      for (uint32_t q = 0; q < 8; ++q) put64(1664 + 64 * r + 8 * q, v.q[q]);
+    }
     if (!m.write(address, ConstByteView(image, bytes))) return fail(14, address, 2);
     return Step::Ok;
   }
   // xrstor: components not marked present in the header are put in their initial state
   if (!m.read(address, ByteView(image, 576))) return fail(14, address, 0);
-  uint64_t bv = 0;
-  for (uint32_t i = 0; i < 8; ++i) bv |= uint64_t{image[512 + i]} << (8 * i);
-  if ((features & 4) && !m.read(address + 576, ByteView(image + 576, 256))) return fail(14, address + 576, 0);
+  const uint64_t bv = get64(512);
+  if (bytes > 576 && !m.read(address + 576, ByteView(image + 576, bytes - 576))) return fail(14, address + 576, 0);
   if (features & 1) {
     if (!(bv & 1)) { ByteView(image, 32).fill(0); image[0] = 0x7F; image[1] = 0x03; ByteView(image + 32, 128).fill(0); }
     if (!(bv & 2)) { ByteView(image + 160, 256).fill(0); }
@@ -1212,11 +1177,29 @@ X86_64Cpu::Step X86_64Cpu::xsave_family(GuestMemory& m, uint32_t kind) {
   if (features & 4) {
     for (uint32_t r = 0; r < 16; ++r) {
       s_.ymm_high[r] = Xmm();
-      if (bv & 4)
-        for (uint32_t b = 0; b < 8; ++b) {
-          s_.ymm_high[r].lo |= uint64_t{image[576 + 16 * r + b]} << (8 * b);
-          s_.ymm_high[r].hi |= uint64_t{image[584 + 16 * r + b]} << (8 * b);
-        }
+      if (bv & 4) {
+        s_.ymm_high[r].lo = get64(576 + 16 * r);
+        s_.ymm_high[r].hi = get64(584 + 16 * r);
+      }
+    }
+  }
+  if (features & 0x20) {
+    for (uint32_t k = 0; k < 8; ++k) s_.k[k] = (bv & 0x20) ? get64(1088 + 8 * k) : 0;
+  }
+  if (features & 0x40) {
+    for (uint32_t r = 0; r < 16; ++r) {
+      s_.ymm_high[r].upper[0].lo = (bv & 0x40) ? get64(1152 + 32 * r) : 0;
+      s_.ymm_high[r].upper[0].hi = (bv & 0x40) ? get64(1160 + 32 * r) : 0;
+      s_.ymm_high[r].upper[1].lo = (bv & 0x40) ? get64(1168 + 32 * r) : 0;
+      s_.ymm_high[r].upper[1].hi = (bv & 0x40) ? get64(1176 + 32 * r) : 0;
+    }
+  }
+  if (features & 0x80) {
+    for (uint32_t r = 0; r < 16; ++r) {
+      Vec512 v;
+      if (bv & 0x80)
+        for (uint32_t q = 0; q < 8; ++q) v.q[q] = get64(1664 + 64 * r + 8 * q);
+      set_vec(16 + r, v, 512);
     }
   }
   return Step::Ok;

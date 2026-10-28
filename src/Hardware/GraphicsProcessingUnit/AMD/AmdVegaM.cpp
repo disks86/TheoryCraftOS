@@ -394,6 +394,13 @@ uint32_t AmdVegaM::service_interrupts(uint32_t max_vectors) {
   return handled;
 }
 
+bool AmdVegaM::read_edid(const AtomConnectors::Connector& connector, ByteBuffer* out) {
+  if (!up() || !inputs_.registers || !inputs_.clock || !connector.has_ddc || AtomConnectors::uses_aux(connector.type)) return false;
+  const AtomI2c::Bus bus = AtomI2c::lookup(inputs_.vbios, connector.ddc_id);
+  if (!bus.valid) return false;
+  return AmdDdc(*inputs_.registers, *inputs_.clock, bus).read_edid(out);
+}
+
 uint32_t AmdVegaM::refresh_audio_pins() {
   if (!up() || !inputs_.registers) return audio_pins_ = 0;
   return audio_pins_ = amd_dce11::AudioPins(*inputs_.registers).connected_mask(kAudioPins);

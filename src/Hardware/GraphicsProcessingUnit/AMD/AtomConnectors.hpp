@@ -44,6 +44,8 @@ class AtomConnectors {
     uint8_t object_id = 0;            // the connector object's id (CONNECTOR_OBJECT_ID_*)
     uint8_t enum_id = 0;              // the enumeration of the object id: which of several of the same object
     uint8_t hpd_pin = kNoPin;         // the hot plug detect pin, 0 to 5, or kNoPin
+    uint8_t ddc_id = 0;               // the DDC line (ATOM_I2C_ID_CONFIG's access byte, from the connector's I2C record; see AtomI2c), valid with has_ddc
+    bool has_ddc = false;
     uint8_t plugged_state = 0;        // ATOM_HPD_INT_RECORD's ucPlugged_PinState: the level of the GPIO when something is plugged in
     uint16_t devices = 0;             // the ATOM_DEVICE_*_SUPPORT bits of the devices that end in this connector
   };
@@ -51,6 +53,8 @@ class AtomConnectors {
   // The connector's name as the kernel's DRM names it: "HDMI-A-1", "DP-2", "eDP-1". `buffer` gets the text and a terminating zero, cut short if it does not fit.
   // HDMI and DisplayPort carry audio with the picture (the others the connector reader knows - analogue, DVI, LVDS, eDP - do not, in the sense of the audio endpoints being used for them).
   static bool carries_audio(Type type) { return type == Type::HdmiA || type == Type::HdmiB || type == Type::DisplayPort; }
+  // DisplayPort connectors have no DDC lines in the sense of GPIO pins: their EDID comes over the AUX channel (I2C over AUX), which is a transaction of the AtomBIOS and of the DPCD.
+  static bool uses_aux(Type type) { return type == Type::DisplayPort || type == Type::EmbeddedDisplayPort; }
   static const char* type_name(Type type);
   static uint32_t name(const Connector& connector, ArrayView<char> buffer);
 

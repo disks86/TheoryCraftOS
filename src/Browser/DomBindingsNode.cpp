@@ -23,6 +23,7 @@
 #include "Browser/Url.hpp"
 #include "Dom/Entities.hpp"
 #include "Dom/HtmlBuilder.hpp"
+#include "Dom/LegacyEncodings.hpp"
 #include "Dom/Selector.hpp"
 #include "Utility/Move.hpp"
 
@@ -639,6 +640,35 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
       case Reflect::Url: {
         if (!present) { *out = str_value(vm, ""); return true; }
         String resolved(vm.allocator());
+        String recoded(vm.allocator());
+        if (n->owner->character_encoding != 0 && dom::output_encoding(static_cast<dom::Encoding>(n->owner->character_encoding)) != dom::Encoding::Utf8) {   // a page in another encoding: the query is made in it
+          const StringView written = v.trimmed();
+          const uint64_t q = written.find('?');
+          if (q != StringView::npos) {
+            const uint64_t hash = written.find('#');
+            const uint64_t end = hash == StringView::npos || hash < q ? written.size() : hash;
+            if (hash == StringView::npos || hash > q) {
+              const bool special = written.starts_with("http") || written.starts_with("ws") || written.starts_with("ftp") || written.starts_with("file") ||
+                                   (!written.contains(':') && (c.host.address().starts_with("http") || c.host.address().starts_with("ws") || c.host.address().starts_with("ftp") || c.host.address().starts_with("file")));
+              recoded.append(written.substr(0, q + 1));
+              dom::encode_url_query(static_cast<dom::Encoding>(n->owner->character_encoding), written.substr(q + 1, end - q - 1), special, &recoded);
+              recoded.append(written.substr(end));
+              v = recoded.view();
+            }
+          }
+        }
+        String escaped(vm.allocator());
+        bool non_ascii = false;
+        for (uint64_t i = 0; i < v.size() && !non_ascii; ++i) non_ascii = static_cast<uint8_t>(v[i]) >= 0x80;
+        if (non_ascii) {   // (an address with characters beyond ASCII is read as its UTF-8 bytes, percent-encoded)
+          static const char kHex[] = "0123456789ABCDEF";
+          for (const char ch : v) {
+            const uint8_t byte = static_cast<uint8_t>(ch);
+            if (byte < 0x80) escaped.push_back(ch);
+            else { escaped.push_back('%'); escaped.push_back(kHex[byte >> 4]); escaped.push_back(kHex[byte & 15]); }
+          }
+          v = escaped.view();
+        }
         if (!v.empty() && resolve_reference(vm.allocator(), c.host.address(), v, &resolved)) {
           const uint64_t hash = v.trimmed().find('#');   // (the address to fetch has no fragment; the property keeps the one that was written)
           if (hash != StringView::npos) {

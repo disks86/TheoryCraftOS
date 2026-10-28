@@ -431,6 +431,24 @@ hot plug record, merged paths, the capacity, the names, and every truncation, ev
 numbers are those of the Linux header from memory, checked only through `object_connector_convert`'s order), and no real Vega M video BIOS has been read. Not done: DDC lines and the encoder/router parts, and
 Atom firmware-info objects of the newer (Vega and later) `atomfirmware.h` layout, which differs.
 
+### Monitor EDID over the DDC lines
+
+The connector reader now also keeps each connector's DDC line (`Connector::ddc_id`, from the I2C record of its object: record type 1, the access byte at +2; the last record wins as in the driver). `AtomI2c::lookup` finds that
+id in the GPIO_I2C_Info data table (index 10; 27-byte entries: the clock's mask, enable, readback and output registers, the data pad's four, the id, the eight bit positions) and makes the bus record
+(`amdgpu_atombios_lookup_i2c_gpio`, `_get_bus_rec_for_i2c_gpio`). `AmdDdc` drives the two pads from software through those registers and reads the EDID: the i2c bit-banging algorithm with the 10 us bit time and 2.2 ms
+clock stretch limit amdgpu sets, then `drm_do_get_edid`'s sequence - offset 0 written to 0x50, a repeated start, 128 bytes read; the header and checksum checked, four tries per block; the extension blocks the same way (the
+segment pointer written to 0x30 from block 2 on), at most three, a block that never checks left out and the base block's count and checksum made true again. The driver's default is software DDC too (its hardware I2C engine
+is a module parameter, off). `AmdVegaM::read_edid(connector, &bytes)` does it for a connector; `main.cpp` reads the monitor on each new connection and at boot, parses it with the existing EDID parser, and the toast says
+"A display (DELL U2720Q 2560x1440) was connected to HDMI-A-1 of the Radeon RX Vega M". It takes the bus for some tens of milliseconds, so it runs from the desktop loop and not in the interrupt path.
+
+**Not done / not known:** DisplayPort and eDP connectors (most of what a laptop has) carry the EDID over the AUX channel (I2C over AUX), a transaction of the AtomBIOS (`ProcessAuxChannelTransaction`) and the DPCD, not GPIO
+pins - `read_edid` refuses them; the interpreter exists, the transaction does not. `amdgpu_i2c.c` (pre_xfer, post_xfer and the pad callbacks) and `i2c-algo-bit.c` were not at hand: the register choreography (outputs cleared, pins made
+inputs, pads masked for software, a pin "high" when its output is not enabled, released again afterwards) and the protocol are written from memory of them, so `check_i2c_port.py` checks the table and entry layout, which register
+is which, the id bits and the lookup against the driver but not the pad callbacks. Tested against a bit-level simulated bus (`tests/FakeI2cMonitor.hpp`: a monitor as an I2C slave, written independently; `AmdDdcTest`): the wire
+(addresses, offsets, segment pointers, one stop per transfer), the registers left as found, the pads masked while the pins are driven, pins left pulled low, retries, a damaged block, an absent monitor, clock stretching within and past
+the limit, the time taken, and every bit flip of the data; `AtomI2cTest`, `AtomConnectorsTest` and `AmdVegaMTest` (`test_read_edid`) cover the table, the record and the card. The simulated slave is not a real monitor: whether a real
+one, through this machine's pads, answers is unseen.
+
 ### MSI: interrupts wake the CPU
 
 `PciMsi` (`src/Hardware/Bus/Pci/PciMsi.*`) programs the MSI capability (id 0x05) of a PCI function as PCI Local Bus Specification 3.0 section 6.8.1 describes: message control cleared of enable and

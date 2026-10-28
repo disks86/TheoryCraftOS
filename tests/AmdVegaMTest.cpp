@@ -30,6 +30,7 @@
 #include "FileSystem/Ram/RamFileSystem.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdVegaM.hpp"
 #include "FakeAmdDce11.hpp"
+#include "FakeI2cMonitor.hpp"
 #include "FakeAmdGfx8.hpp"
 #include "FakeAmdGmc8.hpp"
 #include "FakeAmdIh3.hpp"
@@ -96,8 +97,10 @@ struct Card final : IVcnRegisters {
   std::function<void()> on_marker;   // called when the POST writes register 0x7777 (the simulated card then has its memory trained)
   uint32_t memsize_ones = 0;        // CONFIG_MEMSIZE reads all ones this many more times (the card is in reset)
   bool memsize_never = false;
+  FakeI2cMonitor* monitor = nullptr;   // a DDC bus on the pad registers 0x7000..0x7007
   static bool in(uint32_t r, uint32_t lo, uint32_t hi) { return r >= lo && r <= hi; }
   IVcnRegisters& owner(uint32_t r) {
+    if (monitor && in(r, 0x7000, 0x7007)) return *monitor;
     if (in(r, 0x3400, 0x37ff)) return sdma;
     if (in(r, 0xe30, 0xe4b) || r == 0x151a || r == 0x151b) return ih;
     if (in(r, 0x500, 0x57f) || in(r, 0x800, 0x82f) || in(r, 0xb00, 0xbff) || r == 0x394 || r == 0x1524 || r == 0x1528 || r == 0x150a) return gmc;
@@ -1439,6 +1442,7 @@ static std::vector<uint8_t> make_connector_vbios() {
   u8(0, 0x55); u8(1, 0xAA); u16(0x48, 0x100);
   memcpy(&b[0x104], "ATOM", 4);
   u16(0x120, 0x200);
+  u16(0x200 + 4 + 10 * 2, 0x600);   // GPIO_I2C_Info
   u16(0x200 + 4 + 12 * 2, 0x300);
   u16(0x200 + 4 + 22 * 2, 0x400);
   u16(0x300, 4 + 3 * 4);
@@ -1449,11 +1453,63 @@ static std::vector<uint8_t> make_connector_vbios() {
   u8(0x440, 3);
   for (uint32_t i = 0; i < 3; ++i) { u16(0x444 + i * 12, tags[i]); u16(0x446 + i * 12, 12); u16(0x448 + i * 12, ids[i]); }
   u8(0x500, 3);
+  const uint32_t ddc[3] = {0x92, 0x91, 0x93};
   for (uint32_t i = 0; i < 3; ++i) {
-    u16(0x504 + i * 8, ids[i]); u16(0x508 + i * 8, 0x180 + i * 6);
-    u8(0x580 + i * 6, 2); u8(0x581 + i * 6, 4); u8(0x582 + i * 6, i + 1); u8(0x583 + i * 6, 1);
+    u16(0x504 + i * 8, ids[i]); u16(0x508 + i * 8, 0x180 + i * 10);
+    u8(0x580 + i * 10, 1); u8(0x581 + i * 10, 4); u8(0x582 + i * 10, ddc[i]); u8(0x583 + i * 10, 0);                  // the I2C record: the DDC line
+    u8(0x584 + i * 10, 2); u8(0x585 + i * 10, 4); u8(0x586 + i * 10, i + 1); u8(0x587 + i * 10, 1);                  // the hot plug record
+  }
+  // GPIO_I2C_Info: three entries (27 bytes) for the lines 0x92, 0x91 and 0x93, all on the same pad registers (0x7000.., the simulated bus) and bits
+  u16(0x600, 4 + 3 * 27);
+  for (uint32_t i = 0; i < 3; ++i) {
+    const uint32_t at = 0x604 + i * 27;
+    const uint32_t regs[8] = {0x7000, 0x7001, 0x7002, 0x7003, 0x7004, 0x7005, 0x7006, 0x7007};   // clock: mask, enable, readback, output; data: the same
+    const uint8_t bits[8] = {3, 9, 13, 17, 5, 11, 15, 19};
+    for (int k = 0; k < 8; ++k) { u16(at + k * 2, regs[k]); u8(at + 17 + k, bits[k]); }
+    u8(at + 16, ddc[i]);
   }
   return b;
+}
+
+// The EDID of a monitor over the connector's DDC lines.
+static void test_read_edid() {
+  const std::vector<uint8_t> vbios = make_connector_vbios();   // eDP (DDC line 0x92), HDMI-A (0x91), DisplayPort (0x93)
+  Rig rig;
+  FakeI2cMonitor monitor;
+  monitor.edid = make_edid(1);
+  rig.card.monitor = &monitor;
+  AmdVegaM vega(rig.alloc);
+  AmdVegaM::Inputs in = rig.inputs();
+  in.vbios = ConstByteView(vbios.data(), vbios.size());
+  ByteBuffer out(rig.alloc);
+  AtomConnectors::Connector hdmi, edp, dp;
+  CHECK(!vega.read_edid(hdmi, &out) && monitor.writes == 0);   // (not up)
+  CHECK(vega.bring_up(in));
+  if (!vega.up()) return;
+  CHECK(vega.connectors().size() == 3);
+  edp = vega.connectors()[0];
+  hdmi = vega.connectors()[1];
+  dp = vega.connectors()[2];
+  CHECK(edp.has_ddc && edp.ddc_id == 0x92 && hdmi.has_ddc && hdmi.ddc_id == 0x91 && dp.has_ddc && dp.ddc_id == 0x93);
+  // HDMI: read over the pads of the bus the video BIOS names
+  CHECK(vega.read_edid(hdmi, &out) && out.size() == 256 && memcmp(out.view().data(), monitor.edid.data(), 256) == 0);
+  // DisplayPort and eDP: the AUX channel, not done; nothing is touched
+  const uint32_t writes = monitor.writes;
+  CHECK(!vega.read_edid(dp, &out) && !vega.read_edid(edp, &out) && monitor.writes == writes);
+  // no DDC line in the connector, or a line the GPIO table does not have
+  AtomConnectors::Connector no_ddc = hdmi;
+  no_ddc.has_ddc = false;
+  CHECK(!vega.read_edid(no_ddc, &out) && monitor.writes == writes);
+  AtomConnectors::Connector unknown = hdmi;
+  unknown.ddc_id = 0x77;
+  CHECK(!vega.read_edid(unknown, &out) && monitor.writes == writes);
+  // nothing connected: nothing answers
+  monitor.present = false;
+  CHECK(!vega.read_edid(hdmi, &out));
+  monitor.present = true;
+  // stopped: no
+  vega.shutdown();
+  CHECK(!vega.read_edid(hdmi, &out));
 }
 
 // The connectors in the hot plug events: named from the video BIOS's object table, absent without one or for a pin it does not list.
@@ -1594,6 +1650,7 @@ int main() {
   test_hpd_rx();
   test_hotplug_connectors();
   test_audio_pins();
+  test_read_edid();
   printf(g_failed ? "AmdVegaMTest: %d FAILED\n" : "AmdVegaMTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }

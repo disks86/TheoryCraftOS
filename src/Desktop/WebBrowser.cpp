@@ -844,14 +844,14 @@ void WebBrowser::show(Fetched& page) {
   // Text and files that cannot be shown are pages too: a <pre> of the text, a line of explanation
   String synthetic(allocator());
   String decoded(allocator());   // the page as text, read in the encoding it came in (the charset of the Content-Type, a byte order mark, a <meta>)
-  StringView charset = "UTF-8";
+  dom::Encoding charset = dom::Encoding::Utf8;
   StringView html = body;
   bool scripts = scripts_enabled_;
   if (is_html(page.type.view(), page.address.view(), body)) {
     dom::Encoding used = dom::Encoding::Utf8;
     dom::decode_document(page.body.view(), page.type.view(), &decoded, &used);
     html = decoded.view();
-    charset = dom::encoding_display_name(used);
+    charset = used;
   } else {
     scripts = false;
     if (is_text(page.type.view(), body)) {

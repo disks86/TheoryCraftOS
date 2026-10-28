@@ -44,6 +44,7 @@ def table(name, ctype, values):
         line += item
     w(line); w('};')
 
+table('kIndexIso2022JpKatakana', 'uint16_t', indexes['iso-2022-jp-katakana'])
 table('kIndexBig5', 'uint32_t', indexes['big5'])
 table('kIndexEucKr', 'uint16_t', indexes['euc-kr'])
 table('kIndexGb18030', 'uint16_t', indexes['gb18030'])
