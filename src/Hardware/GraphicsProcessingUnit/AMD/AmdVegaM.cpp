@@ -110,6 +110,13 @@ bool AmdVegaM::bring_up(const Inputs& in) {
   shutdown();
   status_.assign("");
   inputs_ = in;
+  // The video BIOS image is kept: the caller's buffer need not outlive the call, and reset_card runs the POST later.
+  const bool same_buffer = in.vbios.size() == vbios_.size() && in.vbios.size() != 0 && in.vbios.data() == vbios_.view().data();
+  if (!same_buffer) {
+    vbios_.clear();
+    if (in.vbios.size() != 0 && !vbios_.append(in.vbios)) return fail(Step::None, "out of memory");
+  }
+  inputs_.vbios = vbios_.view();
   if (!in.registers || !in.clock || !in.file_system || !in.allocator || !in.mapper || in.aperture_bytes == 0 || in.aperture_physical == 0 || !in.doorbells.valid() ||
       amd_gfx8_firmware_name(in.device_id, AmdGfx8Block::CpPfp) == nullptr)
     return fail(Step::None, "no access to the card (registers, memory BAR, doorbells or a Vega M device)");
@@ -402,6 +409,51 @@ AmdVegaM::Recovery AmdVegaM::recover() {
   return r;
 }
 
+namespace {
+// The card as the AtomBIOS interpreter sees it (amdgpu's cail_* callbacks): registers by dword; a discrete card has no memory controller or PLL access through the BIOS.
+class PostHost final : public IAtomHost {
+ public:
+  PostHost(IVcnRegisters& registers, const IClock& clock) : registers_(registers), clock_(clock) {}
+  uint32_t read_register(uint32_t reg) override { return registers_.read(reg); }
+  void write_register(uint32_t reg, uint32_t value) override { registers_.write(reg, value); }
+  uint32_t read_mc(uint32_t) override { return 0; }    // (cail_mc_read: "invalid MC read")
+  void write_mc(uint32_t, uint32_t) override {}
+  uint32_t read_pll(uint32_t) override { return 0; }   // (cail_pll_read)
+  void write_pll(uint32_t, uint32_t) override {}
+  void delay_us(uint32_t microseconds) override { wait(microseconds); }
+  void delay_ms(uint32_t milliseconds) override { wait(uint64_t{milliseconds} * 1000); }
+  uint64_t now_us() override { return clock_.now_us(); }
+
+ private:
+  void wait(uint64_t microseconds) {
+    const uint64_t begin = clock_.now_us();
+    while (clock_.now_us() - begin < microseconds) {}
+  }
+  IVcnRegisters& registers_;
+  const IClock& clock_;
+};
+}  // namespace
+
+bool AmdVegaM::post(const Inputs& in) {
+  if (!in.registers || !in.clock || !in.allocator || in.vbios.size() == 0) {
+    status_.assign("POST: no video BIOS image");
+    return false;
+  }
+  PostHost host(*in.registers, *in.clock);
+  AtomBios bios(host, in.vbios, *in.allocator);
+  if (!bios.valid()) {
+    status_.assign("POST: the video BIOS is not an AtomBIOS image");
+    return false;
+  }
+  const AtomBios::Status result = bios.asic_init();
+  if (result != AtomBios::Status::Ok) {
+    status_.assign("POST: ");
+    status_.append(StringView(AtomBios::status_name(result)));
+    return false;
+  }
+  return true;
+}
+
 bool AmdVegaM::reset_card() {
   if (!inputs_.pci || !inputs_.registers || !inputs_.clock || !inputs_.allocator) return false;
   ++asic_resets_;
@@ -411,6 +463,13 @@ bool AmdVegaM::reset_card() {
   if (reset != AmdAsicReset::Result::Ok) {
     status_.assign("card reset: ");
     status_.append(StringView(AmdAsicReset::result_name(reset)));
+    return false;
+  }
+  if (in.vbios.size() != 0 && !post(in)) {
+    String text(*in.allocator);
+    text.assign("after a card reset: ");
+    text.append(StringView(status_.c_str()));
+    status_.assign(text.view());
     return false;
   }
   if (!bring_up(in)) {

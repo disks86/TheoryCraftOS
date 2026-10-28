@@ -433,13 +433,46 @@ gets the firmware's framebuffer back), the card is reset, and `bring_up` is run 
 the bring-up failed afterwards).
 
 **What this does not do, and what that means on a real card.** After a hardware reset the driver marks the card as needing a POST and runs the video BIOS's init tables (the memory controller's training, the
-clocks, the display PLLs) through its AtomBIOS interpreter, then initialises every block. This OS has no interpreter, so a card that has been reset comes back quiet - no engine, no DMA, bus mastering on or off as
+clocks, the display PLLs) through its AtomBIOS interpreter, then initialises every block. This OS now has the interpreter (above) but no way yet to get the video BIOS image, so a card that has been reset comes back quiet - no engine, no DMA, bus mastering on or off as
 above - but its video memory is not trained, `bring_up` is expected to fail, and everything in video memory (including the firmware's framebuffer) is gone. The reset is therefore a last resort, off by default, and
 `main.cpp` allows it only when the card does not drive the display (a dark screen on top of a dead card is no improvement over a hung engine); the benefit is a card that is known to be quiescent instead of one that
 is hung and may still be mastering the bus. Host tests (`AmdAsicResetTest`, `AmdVegaMTest::test_card_reset`) cover the step order and timing, a slow card, a card that never answers, the fallback conditions and the
 cap, a card that is brought up again, and one that cannot be (not POSTed); the simulated card has none of the real one's behaviour here. `scripts/check_asic_reset_port.py` checks the steps, the value, the
-dword, the scratch register and flag, `CONFIG_MEMSIZE` and that the VEGAM is not a BACO chip against the kernel sources. Not done: the AtomBIOS POST (which would make the reset recoverable), the PCI-level resets
+dword, the scratch register and flag, `CONFIG_MEMSIZE` and that the VEGAM is not a BACO chip against the kernel sources. Not done: finding the video BIOS image (which, with the interpreter, would make the reset recoverable), the PCI-level resets
 (function level reset, secondary bus reset) the driver also has for other cases, and BACO.
+
+### AtomBIOS interpreter and the POST after a card reset
+
+`AtomBios` (`AtomBios.*`) is a port of the Linux driver's `atom.c`: the interpreter for the byte code in an AMD card's video BIOS, by which the card is POSTed (the memory controller trained, the clocks and PLLs set
+up) and, in the driver, modes are set. The image holds a ROM header, a list of command tables (small programs with a parameter space and a workspace) and a list of data tables. Operations have operands that are
+registers (memory-mapped, or reached by an indirect I/O program of the BIOS's own), the table's parameters or workspace, the BIOS's scratch memory, its data tables, immediates, and PLL and memory controller registers, as
+whole dwords or a byte or word of one; there are moves, arithmetic, masks, shifts, compares and jumps, a switch, delays and calls of other tables. `IAtomHost` is the driver's `card_info` plus the time: the registers,
+the memory controller and PLL (a discrete card has neither through the BIOS; the host returns zero, like `cail_mc_read`), delays and a clock. `asic_init()` is `amdgpu_atom_asic_init`: command table 0 with the firmware
+info's default engine and memory clocks as its first two parameters.
+
+The image is untrusted bytes, so where the driver reads through pointers this checks every read (a read beyond the image stops the run), checks the scratch memory exactly (the driver lets a read one dword past its
+end through), limits tables calling tables to 16 deep, limits the number of operations (50 million) as well as keeping the driver's rule that a loop which jumps back to the same place for 20 seconds is stuck, avoids C's
+undefined shifts by 32 or more, and keeps the workspace on the stack. Where the driver prints and carries on (a parameter or workspace index out of range, PCI or SYSIO register access, an indirect I/O method that does not
+exist) so does this, and `warnings()` counts them. One of the driver's oddities is ported as it is: a write through an indirect I/O port looks up the program with `io_mode & 0xFF`, a read with `io_mode & 0x7F`.
+Not ported: the name, date, part number and version strings, and the parsing of the other data tables.
+
+How it was checked, in three ways. `tests/AtomBiosTest.cpp` has hand-assembled images (`tests/AtomBiosImage.hpp`) for every operation with results worked out by hand, the alignments, the compare and jump conditions,
+switches, calls and parameter passing, the I/O ports, the scratch memory, the limits, the parser's refusals, and truncated and bit-flipped images under the sanitizers. `scripts/atom_differential/run.sh` compiles the
+Linux driver's own `atom.c` in user space (with stubs for the kernel headers) and runs random but well formed programs - every operation, operand kind and alignment, indirect I/O programs, switches, calls - through both
+interpreters against identical simulated cards, comparing the result, every register, memory controller and PLL access and delay in order, the parameters and the scratch memory: 30,000 programs and a million accesses agree.
+It found what the unit tests could not: the driver's negative parameter-space size for a callee of a callee, a null pointer dereference in its part-number parsing, undefined shifts in the indirect I/O code. `scripts/check_atom_port.py`
+checks the constants, the alignment tables, the generated opcode table (`scripts/gen_atom_ops.py` makes `AtomBiosOps.inc` from the driver's `opcode_table`) and the layout of the data tables.
+
+`AmdVegaM::post()` runs the POST with `Inputs::vbios`, and `reset_card()` does it between the reset and the bring-up when the image is given. The simulated card here is "trained" by a marker write in the video BIOS's table.
+**Where the video BIOS image comes from.** `AmdVbios` (`AmdVbios.*`) finds it, following `amdgpu_bios.c` in the order of `amdgpu_get_bios_dgpu`: (1) the ACPI VFCT table, which holds the firmware's copy of the
+video BIOS images of its AMD cards - `find_in_vfct` walks the images (28-byte headers: PCI bus, device, function, vendor and device ID, length) and takes the one for this function, as a view into the table;
+(2) the PCI expansion ROM - `read_from_rom_bar` probes the ROM base register for the window size, switches the ROM on at the base the firmware assigned (no base, no ROM), maps the window, copies it,
+switches it off, and trims the copy to the chained images (`rom_size` is the PCI core's `pci_get_rom_size`: each image gives its length in 512-byte units and whether it is the last); (3) the card's own ROM through the SMC's
+index and data registers (`vi_read_bios_from_rom`: header first, checked for 0xAA55 and the AMD string, then the length it names). Every image passes `check_atom_bios` (0xAA55, a header pointer at 0x48, "ATOM" or "MOTA" at
+its offset 4). `main.cpp` looks only when the card may be reset (otherwise nothing would use the image) and `AmdVegaM::bring_up` keeps its own copy, so the buffers need not outlive the call. Not done: the ACPI ATRM method
+(the other firmware route, which needs the AML interpreter run in the card's device), the legacy shadow at 0xC0000, the copy in video memory (SR-IOV) and the "disabled ROM" path that clears the card's ROM disable bits.
+Tested with a simulated VFCT table (several cards, truncations, bit flips in every header byte), an expansion ROM behind a working ROM base register, and the SMC pair (`AmdVbiosTest`), and `scripts/check_vbios_port.py` checks
+the signatures, the order, the VFCT layout and the register protocol against the kernel. **Still not seen:** the real machine's VFCT or ROM: whether this machine has a VFCT entry for the Vega M, and whether its table 0 trains the memory.
 
 ## Radeon RX Vega M: UVD 6.3
 

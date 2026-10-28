@@ -2778,9 +2778,9 @@ EXPORT BOOL WINAPI MoveFileExW(LPCWSTR from, LPCWSTR to, DWORD flags) {
   UNICODE_STRING source_name, target_name;
   OBJECT_ATTRIBUTES source, target;
   if (!nt_name(from, source_buffer, &source_name, &source) || !nt_name(to, target_buffer, &target_name, &target)) return FALSE;
-  if (source_name.Length == target_name.Length) {      /* a file moved onto itself (the spelling of the name may differ) stays where it is */
+  if (source_name.Length == target_name.Length) {      /* a file moved onto itself stays where it is (a different spelling of the name is a rename) */
     ULONG same = 1;
-    for (ULONG i = 0; i < source_name.Length / 2 && same; ++i) if (upper(source_name.Buffer[i]) != upper(target_name.Buffer[i])) same = 0;
+    for (ULONG i = 0; i < source_name.Length / 2 && same; ++i) if (source_name.Buffer[i] != target_name.Buffer[i]) same = 0;
     if (same && GetFileAttributesW(from) != INVALID_FILE_ATTRIBUTES) return TRUE;
   }
   HANDLE h = NULL;

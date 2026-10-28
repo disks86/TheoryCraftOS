@@ -22,6 +22,7 @@
 // the SMC, a graphics engine with eight compute queues, working SDMA engines, and a framebuffer the display can be switched to; every step that can fail must stop the earlier
 // ones. The pieces themselves are covered by their own tests; this checks the glue: the layout of the block, the firmware files, the addresses given to each piece, the order.
 #include <stdio.h>
+#include <functional>
 #include <stdlib.h>
 #include <string.h>
 #include <memory>
@@ -33,6 +34,7 @@
 #include "FakeAmdGmc8.hpp"
 #include "FakeAmdIh3.hpp"
 #include "FakeAmdSdma3.hpp"
+#include "AtomBiosImage.hpp"
 
 using namespace hardware;
 
@@ -91,6 +93,7 @@ struct Card final : IVcnRegisters {
   fakesdma::Card sdma;
   fakedce::FakeDisplay dce;
   size_t other_writes = 0;
+  std::function<void()> on_marker;   // called when the POST writes register 0x7777 (the simulated card then has its memory trained)
   uint32_t memsize_ones = 0;        // CONFIG_MEMSIZE reads all ones this many more times (the card is in reset)
   bool memsize_never = false;
   static bool in(uint32_t r, uint32_t lo, uint32_t hi) { return r >= lo && r <= hi; }
@@ -110,6 +113,7 @@ struct Card final : IVcnRegisters {
   }
   void write(uint32_t r, uint32_t v) override {
     owner(r).write(r, v);
+    if (r == 0x7777 && on_marker) on_marker();
     if (r == 0x398) sdma.write(r, v);   // SRBM_SOFT_RESET reaches both the graphics and the DMA engines
   }
   size_t writes() const { return gfx.writes.size() + gmc.writes.size() + ih.writes.size() + sdma.writes.size() + dce.writes.size(); }
@@ -1146,6 +1150,109 @@ static void test_card_reset() {
   }
 }
 
+// The POST after a card reset: the video BIOS's ASIC_Init table, run by the AtomBIOS interpreter, brings back what the reset took (here: the memory the card cannot be brought up without).
+static std::vector<uint8_t> make_vbios(bool with_clocks = true) {
+  using namespace atomimage;
+  Image img;
+  Code init;
+  init.move(REG, 0x7777, PS, 0);       // the default engine clock, the first parameter: the marker the simulated card waits for
+  init.move(REG, 0x7778, PS, 1);       // the default memory clock
+  init.eot();
+  img.tables.push_back({0, 0, 0, init});
+  img.sclk = with_clocks ? 0x1234 : 0;
+  img.mclk = 0x5678;
+  return img.build();
+}
+
+static void test_post_after_reset() {
+  const uint32_t nop[] = {0xC0001000};
+  const ArrayView<const uint32_t> ib(nop, 1);
+  const std::vector<uint8_t> vbios = make_vbios();
+  auto setup = [&](Rig& rig, FakePci& pci, AmdVegaM::Inputs& in) {
+    pci.needs_post = true;
+    in = rig.inputs();
+    in.pci = &pci;
+    in.allow_asic_reset = true;
+    // the simulated card is trained when the video BIOS writes the engine clock to 0x7777
+    rig.card.on_marker = [&rig]() { rig.card.gmc.set_reg(0x150a, 64); rig.card.gmc.set_reg(0x809, (7u << 16) | 4u); };
+  };
+  {
+    // Not POSTed after the reset, no video BIOS: down (as before).
+    Rig rig;
+    FakePci pci(rig);
+    AmdVegaM::Inputs in;
+    setup(rig, pci, in);
+    AmdVegaM vega(rig.alloc);
+    CHECK(vega.bring_up(in));
+    rig.card.gfx.hung = true;
+    rig.card.gfx.reset_fails = true;
+    CHECK(!vega.submit_graphics(ib, 2000));
+    const AmdVegaM::Recovery r = vega.recover();
+    CHECK(r.card_reset && r.failed && !vega.up() && strstr(vega.status(), "after a card reset: "));
+  }
+  {
+    // With the video BIOS: the card is reset, POSTed (the table gets the firmware info's clocks as its parameters), brought up, and works.
+    Rig rig;
+    FakePci pci(rig);
+    AmdVegaM::Inputs in;
+    setup(rig, pci, in);
+    std::vector<uint8_t> callers_copy = vbios;
+    in.vbios = ConstByteView(callers_copy.data(), callers_copy.size());
+    AmdVegaM vega(rig.alloc);
+    CHECK(vega.bring_up(in));
+    std::fill(callers_copy.begin(), callers_copy.end(), 0xFF);   // (the caller's buffer is gone: the card has its own copy of the image)
+    rig.card.gfx.hung = true;
+    rig.card.gfx.reset_fails = true;
+    CHECK(!vega.submit_graphics(ib, 2000));
+    size_t marker_at = ~size_t{0}, clock_at = ~size_t{0};
+    const AmdVegaM::Recovery r = vega.recover();
+    CHECK(r.graphics && r.card_reset && !r.failed && vega.up() && pci.resets == 1);
+    CHECK(vega.submit_graphics(ib) && vega.submit_compute(0, ib) && vega.submit_sdma(1, ib));
+    // the POST wrote the clocks it was given (0x1234 engine, 0x5678 memory) to the registers the table names, after the reset and before the bring-up
+    const auto& w = rig.card.gfx.writes;
+    for (size_t i = 0; i < w.size(); ++i) {
+      if (w[i].first == 0x7777 && w[i].second == 0x1234) marker_at = i;
+      if (w[i].first == 0x7778 && w[i].second == 0x5678) clock_at = i;
+    }
+    CHECK(marker_at != ~size_t{0} && clock_at == marker_at + 1);
+  }
+  {
+    // A video BIOS that is not an AtomBIOS image, or whose firmware info has no clocks: the card stays down and says why.
+    for (int variant = 0; variant < 3; ++variant) {
+      Rig rig;
+      FakePci pci(rig);
+      AmdVegaM::Inputs in;
+      setup(rig, pci, in);
+      std::vector<uint8_t> bad = variant == 0 ? std::vector<uint8_t>(vbios.size(), 0x5A) : variant == 1 ? make_vbios(false) : std::vector<uint8_t>(vbios.begin(), vbios.begin() + 0x200);
+      in.vbios = ConstByteView(bad.data(), bad.size());
+      AmdVegaM vega(rig.alloc);
+      CHECK(vega.bring_up(in));
+      rig.card.gfx.hung = true;
+      rig.card.gfx.reset_fails = true;
+      CHECK(!vega.submit_graphics(ib, 2000));
+      const AmdVegaM::Recovery r = vega.recover();
+      CHECK(r.card_reset && r.failed && !vega.up() && strstr(vega.status(), "after a card reset: POST: "));
+      if (variant == 1) CHECK(strstr(vega.status(), "no default clocks"));
+      else CHECK(strstr(vega.status(), "not an AtomBIOS image"));
+    }
+  }
+  {
+    // By hand, on a card that was not POSTed: post() alone, then the bring-up.
+    Rig rig;
+    FakePci pci(rig);
+    AmdVegaM::Inputs in;
+    setup(rig, pci, in);
+    rig.card.gmc.set_reg(0x150a, 0);   // not trained
+    rig.card.gmc.set_reg(0x809, 0);
+    AmdVegaM vega(rig.alloc);
+    CHECK(!vega.bring_up(in));
+    in.vbios = ConstByteView(vbios.data(), vbios.size());
+    CHECK(vega.post(in) && vega.bring_up(in) && vega.up());
+    in.vbios = ConstByteView();
+    CHECK(!vega.post(in) && strstr(vega.status(), "no video BIOS image"));
+  }
+}
+
 int main() {
   setvbuf(stdout, nullptr, _IONBF, 0);
   test_plan();
@@ -1166,6 +1273,7 @@ int main() {
   test_recovery_failure();
   test_recovery_failure_sdma();
   test_card_reset();
+  test_post_after_reset();
   printf(g_failed ? "AmdVegaMTest: %d FAILED\n" : "AmdVegaMTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }
