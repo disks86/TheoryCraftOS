@@ -1,0 +1,169 @@
+/*
+ * TheoryCraftOS - a minimal UEFI x86_64 operating system.
+ * Copyright (C) 2026 Christopher Schaefer
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+#include "Hardware/GraphicsProcessingUnit/AMD/AmdVbios.hpp"
+
+// Follows the Linux amdgpu driver (Copyright Advanced Micro Devices, Inc.; MIT license): amdgpu_bios.c (check_atom_bios, amdgpu_acpi_vfct_bios, amdgpu_read_bios,
+// amdgpu_read_bios_from_rom, amdgpu_get_bios_dgpu), vi.c (vi_read_bios_from_rom), atombios.h (UEFI_ACPI_VFCT, VFCT_IMAGE_HEADER), and the PCI core's pci_get_rom_size.
+// scripts/check_vbios_port.py checks the numbers against them.
+
+namespace hardware {
+
+namespace {
+constexpr char kVbiosSignature[] = " 761295520";   // AMD_VBIOS_SIGNATURE
+constexpr uint8_t kAtom[4] = {'A', 'T', 'O', 'M'}, kMota[4] = {'M', 'O', 'T', 'A'};
+constexpr uint8_t kSignatureBytes[10] = {' ', '7', '6', '1', '2', '9', '5', '5', '2', '0'};
+constexpr uint32_t kVfctHeaderBytes = 0x4C;         // sizeof(UEFI_ACPI_VFCT): the ACPI header (36), the UUID (16), the two image offsets and 16 reserved bytes
+constexpr uint32_t kVfctVbiosOffsetField = 0x34;    // VBIOSImageOffset
+constexpr uint32_t kVfctImageHeaderBytes = 28;      // sizeof(VFCT_IMAGE_HEADER)
+
+uint16_t le16(ConstByteView v, uint64_t at) { return static_cast<uint16_t>(v[at] | (v[at + 1] << 8)); }
+uint32_t le32(ConstByteView v, uint64_t at) { return v[at] | (v[at + 1] << 8) | (v[at + 2] << 16) | (uint32_t{v[at + 3]} << 24); }
+}  // namespace
+
+const char* AmdVbios::source_name(Source source) {
+  switch (source) {
+    case Source::None: return "none";
+    case Source::Vfct: return "ACPI VFCT";
+    case Source::RomBar: return "PCI expansion ROM";
+    case Source::RomRegisters: return "the card's ROM registers";
+  }
+  return "unknown";
+}
+
+bool AmdVbios::is_atom_bios(ConstByteView image) {
+  if (image.size() < 0x49) return false;                         // vbios mem is null or mem size is wrong
+  if (image[0] != 0x55 || image[1] != 0xAA) return false;        // BIOS signature incorrect
+  const uint32_t header = image[0x48] | (image[0x49] << 8);
+  if (header == 0) return false;                                 // Can't locate bios header
+  const uint64_t tmp = uint64_t{header} + 4;
+  if (image.size() < tmp) return false;                          // BIOS header is broken
+  if (image.size() - tmp < 4) return false;                      // (the driver compares 4 bytes at tmp whatever the size)
+  const ConstByteView magic = image.subview(tmp, 4);
+  return magic.equals(ConstByteView(kAtom, 4)) || magic.equals(ConstByteView(kMota, 4));
+}
+
+ConstByteView AmdVbios::find_in_vfct(ConstByteView table, PciAddress function, uint16_t vendor_id, uint16_t device_id) {
+  const uint64_t tbl_size = table.size();
+  if (tbl_size < kVfctHeaderBytes) return ConstByteView();     // present but broken (too short)
+  uint64_t offset = le32(table, kVfctVbiosOffsetField);
+  while (offset < tbl_size) {
+    const uint64_t header_at = offset;
+    offset += kVfctImageHeaderBytes;
+    if (offset > tbl_size) return ConstByteView();             // image header truncated
+    const uint32_t bus = le32(table, header_at), device = le32(table, header_at + 4), fn = le32(table, header_at + 8);
+    const uint16_t vendor = le16(table, header_at + 12), dev_id = le16(table, header_at + 14);
+    const uint32_t length = le32(table, header_at + 24);
+    offset += length;
+    if (offset > tbl_size) return ConstByteView();             // image truncated
+    if (length && bus == function.bus && device == function.device && fn == function.function && vendor == vendor_id && dev_id == device_id) {
+      const ConstByteView image = table.subview(offset - length, length);
+      return is_atom_bios(image) ? image : ConstByteView();
+    }
+  }
+  return ConstByteView();
+}
+
+uint64_t AmdVbios::rom_size(ConstByteView window) {
+  uint64_t size = 0, image = 0;
+  uint32_t length = 0;
+  bool last = false;
+  do {
+    if (image + 26 > window.size()) break;
+    if (le16(window, image) != 0xAA55) break;                  // Invalid PCI ROM header signature
+    const uint32_t pds = static_cast<uint32_t>(image) + le16(window, image + 24);
+    if (uint64_t{pds} + 22 > window.size()) break;
+    if (le32(window, pds) != 0x52494350) break;                // "PCIR": Invalid PCI ROM data signature
+    last = (window[pds + 21] & 0x80) != 0;
+    length = le16(window, pds + 16);
+    image += uint64_t{length} * 512;
+    size += uint64_t{length} * 512;
+  } while (length && !last && size < window.size());
+  return size < window.size() ? size : window.size();         // never more than the window
+}
+
+bool AmdVbios::read_from_rom_bar(IPciBus& pci, PciAddress function, IRegisterMapper& mapper, allocators::IAllocator& allocator, ByteBuffer* out) {
+  const uint32_t original = pci.read32(function, kRomAddressRegister);
+  const uint64_t base = original & kRomAddressMask;
+  if (base == 0) return false;                                 // no ROM base assigned
+  // The size: the bits of the base register that stick when it is written with ones (the usual probe), the register put back.
+  pci.write32(function, kRomAddressRegister, kRomAddressMask);
+  const uint32_t sized = pci.read32(function, kRomAddressRegister) & kRomAddressMask;
+  pci.write32(function, kRomAddressRegister, original & ~kRomEnable);
+  if (sized == 0) return false;
+  const uint64_t window_bytes = (~uint64_t{sized} + 1) & 0xFFFFFFFFull;
+  if (window_bytes == 0 || window_bytes > kMaxRomWindowBytes) return false;
+  MmioRegion region;
+  if (!mapper.map_registers(base, window_bytes, &region)) return false;
+  pci.write32(function, kRomAddressRegister, static_cast<uint32_t>(base) | kRomEnable);   // pci_enable_rom
+  ByteBuffer copy(allocator);
+  bool copied = true;
+  for (uint64_t at = 0; at < window_bytes && copied; at += 4) copied = copy.put32(region.read32(at));
+  pci.write32(function, kRomAddressRegister, static_cast<uint32_t>(base));               // pci_disable_rom
+  if (!copied) return false;
+  const uint64_t size = rom_size(copy.view());
+  if (size == 0) return false;
+  copy.truncate(size);
+  if (!is_atom_bios(copy.view())) return false;
+  out->clear();
+  return out->append(copy.view());
+}
+
+bool AmdVbios::read_from_rom_registers(IVcnRegisters& registers, allocators::IAllocator& allocator, ByteBuffer* out) {
+  // vi_read_bios_from_rom: set the ROM index to 0, then read the data register for the dwords in a row (the index advances by itself)
+  auto read = [&](uint32_t bytes, ByteBuffer* into) {
+    registers.write(kSmcIndex, kRomIndex);
+    registers.write(kSmcData, 0);
+    registers.write(kSmcIndex, kRomData);
+    const uint32_t dwords = (bytes + 3) / 4;
+    for (uint32_t i = 0; i < dwords; ++i)
+      if (!into->put32(registers.read(kSmcData))) return false;
+    return true;
+  };
+  // the header: AMD_VBIOS_SIGNATURE_END + 1 bytes
+  ByteBuffer header(allocator);
+  const uint32_t header_bytes = kSignatureOffset + sizeof(kVbiosSignature) + 1;
+  if (!read(header_bytes, &header)) return false;
+  const ConstByteView h = header.view();
+  if (h[0] != 0x55 || h[1] != 0xAA) return false;
+  if (!h.subview(kSignatureOffset, sizeof(kSignatureBytes)).equals(ConstByteView(kSignatureBytes, sizeof(kSignatureBytes)))) return false;
+  const uint32_t length = uint32_t{h[2]} << 9;
+  const uint32_t aligned = (length + 3) & ~3u;
+  if (aligned < 0x4A || aligned > kMaxImageBytes) return false;
+  ByteBuffer image(allocator);
+  if (!read(aligned, &image)) return false;
+  if (!is_atom_bios(image.view())) return false;
+  out->clear();
+  return out->append(image.view());
+}
+
+AmdVbios::Source AmdVbios::find(const Sources& s, ByteBuffer* out) {
+  if (s.vfct.size() != 0) {
+    const ConstByteView image = find_in_vfct(s.vfct, s.function, s.vendor_id, s.device_id);
+    if (image.size() != 0) {
+      out->clear();
+      if (out->append(image)) return Source::Vfct;
+    }
+  }
+  if (!s.allocator) return Source::None;
+  if (s.pci && s.mapper && read_from_rom_bar(*s.pci, s.function, *s.mapper, *s.allocator, out)) return Source::RomBar;
+  if (s.registers && read_from_rom_registers(*s.registers, *s.allocator, out)) return Source::RomRegisters;
+  return Source::None;
+}
+
+}  // namespace hardware

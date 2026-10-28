@@ -73,6 +73,8 @@
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdVegaM.hpp"
 #include "Hardware/VideoCodec/AMD/AmdGmc8Memory.hpp"
 #include "Hardware/Bus/Pci/PciMsi.hpp"
+#include "Hardware/GraphicsProcessingUnit/AMD/AmdVbios.hpp"
+#include "Hardware/Acpi/AcpiTables.hpp"
 #include "Kernel/Apic.hpp"
 #include "Kernel/Interrupts.hpp"
 #endif
@@ -966,6 +968,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   }
   graphics::IRenderer2D* renderer = gpu ? system_graphics.renderer_2d() : nullptr;
   if (renderer) {
+    // The desktop runs on a thread with a real stack: the page layout in the browser's tick would overflow the firmware's boot stack.
+    kernel::run_on_large_stack([&] {
     // The merged keyboard and mouse are always handed over, even when there are none yet: USB ones may be plugged in later.
     kernel::Clipboard clipboard(shared_allocator);  // copy and paste between the desktop's programs; outlives the desktop
     desktop::Desktop desktop(shared_allocator, *renderer, &input.keyboard(), &input.mouse());
@@ -1030,6 +1034,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
           break;
         }
         hardware::MmioVcnRegisters vega_registers(registers_window);
+        ByteBuffer vbios_image(shared_allocator);   // (AmdVegaM keeps its own copy)
         hardware::AmdGpu* display = system_gpu.amd_gpu();
         hardware::PciAddress display_location{};
         const bool drives_display = display && display->pci_location(&display_location) && display_location.bus == d.address.bus && display_location.device == d.address.device &&
@@ -1057,6 +1062,26 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         inputs.pci = &pci;
         inputs.pci_address = d.address;
         inputs.allow_asic_reset = !drives_display;
+        if (inputs.allow_asic_reset) {
+          // The card's video BIOS, for the POST after a reset: the ACPI VFCT table, the expansion ROM, the ROM registers (not read when a reset is not allowed: nothing would use it).
+          hardware::AcpiTables vfct_tables(st);
+          hardware::AmdVbios::Sources sources;
+          if (vfct_tables.initialize()) sources.vfct = vfct_tables.find("VFCT");
+          sources.pci = &pci;
+          sources.mapper = &register_mapper;
+          sources.registers = &vega_registers;
+          sources.allocator = &shared_allocator;
+          sources.function = d.address;
+          sources.vendor_id = d.vendor_id;
+          sources.device_id = d.device_id;
+          const hardware::AmdVbios::Source found = hardware::AmdVbios::find(sources, &vbios_image);
+          if (found != hardware::AmdVbios::Source::None) {
+            inputs.vbios = vbios_image.view();
+            Entry(Level::Ok, "Vega M").text("video BIOS: ").dec(vbios_image.size()).text(" bytes from ").text(hardware::AmdVbios::source_name(found));
+          } else {
+            Entry(Level::Info, "Vega M").text("video BIOS: not found (a card reset could not be POSTed)");
+          }
+        }
         inputs.auto_recover = true;   // an engine that hung or faulted is reset from the desktop loop (service_interrupts), a few times at most
         // MSI first, as the driver does (the interrupt ring is told it is on): the handler, then the message, to the core that runs this.
         const uint32_t apic_id = kernel::running() ? kernel::apic::this_apic_id() : 0xFFFF;
@@ -1277,6 +1302,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     guest.stop_service();  // (VirtualBox's resize requests touch the desktop)
     input.stop_service();  // (its notices touch the desktop)
     desktop.stop();  // before anything else draws on the screen: the render thread is the renderer's only user
+    });
   } else {
     console::puts("No desktop (no graphics display). Press any key to shut down.\n");
     wait_for_key(st, input, ~0ull >> 1);
