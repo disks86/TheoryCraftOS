@@ -1981,7 +1981,7 @@ bool install_media(DomBindings::Impl& c) {
   c.media_error_proto = vm.new_plain();
   {
     JsObject* f = vm.new_native([](Vm& v, const Value&, const Value*, uint32_t, Value*) { return v.throw_error(ErrorKind::TypeError, "Illegal constructor"); }, "MediaError", 0);
-    vm.define(f, vm.prototype_name(), Value::make_object(c.media_error_proto), 0);
+    vm.define(f, vm.prototype_name(), Value::make_object(c.media_error_proto), kNonConfigurable);
     vm.define(c.media_error_proto, vm.intern("constructor"), Value::make_object(f), kWritable);
     vm.define_named(g, "MediaError", Value::make_object(f), kWritable);
     const struct { const char* name; uint32_t value; } kCodes[] = {{"MEDIA_ERR_ABORTED", 1}, {"MEDIA_ERR_NETWORK", 2}, {"MEDIA_ERR_DECODE", 3}, {"MEDIA_ERR_SRC_NOT_SUPPORTED", 4}};
@@ -1996,7 +1996,7 @@ bool install_media(DomBindings::Impl& c) {
 
   auto make_class = [&](const char* name, NativeFn ctor, JsObject* proto, uint32_t arity) {
     JsObject* f = vm.new_native(ctor, name, arity);
-    vm.define(f, vm.prototype_name(), Value::make_object(proto), 0);
+    vm.define(f, vm.prototype_name(), Value::make_object(proto), kNonConfigurable);
     vm.define(proto, vm.intern("constructor"), Value::make_object(f), kWritable);
     vm.define_named(g, name, Value::make_object(f), kWritable);
     return f;

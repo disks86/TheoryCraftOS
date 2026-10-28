@@ -828,7 +828,7 @@ bool install_net(DomBindings::Impl& c) {
   vm.define_native(proto, "toString", url_to_string, 0);
   vm.define_native(proto, "toJSON", url_to_string, 0);
   JsObject* ctor = vm.new_native(url_constructor, "URL", 1);
-  vm.define(ctor, vm.prototype_name(), Value::make_object(proto), 0);
+  vm.define(ctor, vm.prototype_name(), Value::make_object(proto), kNonConfigurable);
   vm.define(proto, vm.intern("constructor"), Value::make_object(ctor), kWritable);
   vm.define_native(ctor, "canParse", url_can_parse, 1);
   vm.define_named(g, "URL", Value::make_object(ctor), kWritable);

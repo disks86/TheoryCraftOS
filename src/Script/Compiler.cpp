@@ -555,6 +555,11 @@ class Compiler {
             if (q->text.equals(p->text)) fail("Duplicate parameter name not allowed in this context", p->line);
         }
       }
+      if (!(fn->flags & kFlagExprBody))   // a name the patterns of the parameters bind is a parameter too
+        for (Node* v = fn->a->list; v && v->kind == NodeKind::Var && (v->flags & kFlagPrologue); v = v->next)
+          for (Node* d = v->list; d; d = d->next)
+            for (Node* p = fn->list; p; p = p->next)
+              if (p->text.equals(d->text)) fail("Duplicate parameter name not allowed in this context", d->line);
       for (Node* p = fn->list; p; p = p->next) strict_name(p->text, p->line, true);
       if ((fn->flags & kFlagExpression) && !fn->text.empty()) strict_name(fn->text, fn->line, true);
     }
