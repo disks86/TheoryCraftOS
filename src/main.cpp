@@ -966,6 +966,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   }
   graphics::IRenderer2D* renderer = gpu ? system_graphics.renderer_2d() : nullptr;
   if (renderer) {
+    // The desktop runs on a thread with a real stack: the page layout in the browser's tick would overflow the firmware's boot stack.
+    kernel::run_on_large_stack([&] {
     // The merged keyboard and mouse are always handed over, even when there are none yet: USB ones may be plugged in later.
     kernel::Clipboard clipboard(shared_allocator);  // copy and paste between the desktop's programs; outlives the desktop
     desktop::Desktop desktop(shared_allocator, *renderer, &input.keyboard(), &input.mouse());
@@ -1277,6 +1279,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     guest.stop_service();  // (VirtualBox's resize requests touch the desktop)
     input.stop_service();  // (its notices touch the desktop)
     desktop.stop();  // before anything else draws on the screen: the render thread is the renderer's only user
+    });
   } else {
     console::puts("No desktop (no graphics display). Press any key to shut down.\n");
     wait_for_key(st, input, ~0ull >> 1);
