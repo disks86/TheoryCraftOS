@@ -6502,6 +6502,100 @@ static void test_calendar_recurrence() {
   CHECK(a.live == 0);
 }
 
+// Holidays that move, and changes to a single occurrence of a repeating appointment, made with the form.
+static void test_calendar_floating_and_occurrences() {
+  TestAllocator a;
+  {
+    filesystem::RamFileSystem fs(a);
+    g_calendar_now = {2026, 3, 13, 22, 0};
+    Screen screen(a, 1000, 700);
+    desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+    d.set_clock_source(&calendar_clock, nullptr);
+    d.set_file_system(&fs);
+    desktop::Calendar* c = d.open_calendar();
+    auto* h = static_cast<gui::TabFrame*>(c->host());
+    put(h, {20, 20, 700, 560});
+    d.window().layout();
+    String text(a);
+
+    // The 4th Thursday of November every year; the last Monday of May; a day that is not the last Monday is refused.
+    c->select_date({2026, 11, 26});
+    c->title_box().set_text("Thanksgiving");
+    c->all_day_box().set_checked(true);
+    c->repeat_box().set_selected_index(4);   // Yearly
+    CHECK(c->by_box().enabled());
+    c->by_box().set_selected_index(1);       // The weekday
+    CHECK(c->add_event());
+    c->select_date({2027, 11, 25});
+    CHECK(c->event_count() == 1);
+    c->select_date({2027, 11, 26});
+    CHECK(c->event_count() == 0);
+    c->select_date({2026, 5, 18});
+    c->title_box().set_text("Memorial Day");
+    c->by_box().set_selected_index(2);       // The last weekday
+    CHECK(!c->add_event() && c->status().equals("That day is not the last of its weekday in the month.") && c->event_count() == 0);
+    c->select_date({2026, 5, 25});
+    CHECK(c->add_event());
+    c->select_date({2028, 5, 29});
+    CHECK(c->event_count() == 1);
+    CHECK(d.calendar_store().count() == 2);
+
+    // A weekly class; one Tuesday is moved to Wednesday evening.
+    c->all_day_box().set_checked(false);
+    c->by_box().set_selected_index(0);
+    c->repeat_box().set_selected_index(2);   // Weekly
+    c->select_date({2026, 10, 27});
+    c->title_box().set_text("Class");
+    c->hour_box().set_value(18);
+    c->minute_box().set_value(0);
+    CHECK(c->add_event() && c->event_count() == 1);
+    c->select_date({2026, 11, 3});
+    CHECK(c->event_count() == 1);
+    c->select_event(0);
+    CHECK(c->scope_box().enabled() && c->scope_box().selected_index() == desktop::Calendar::kAllOccurrences && !c->date_box().enabled() && !c->reset_button().enabled());
+    c->scope_box().set_selected_index(desktop::Calendar::kThisOccurrence);
+    CHECK(c->date_box().enabled() && !c->repeat_box().enabled() && !c->remind_box().enabled());
+    c->title_box().set_text("Class (moved)");
+    c->date_box().set_date({2026, 11, 4});
+    c->hour_box().set_value(19);
+    CHECK(c->update_event() && c->selected_date() == gui::Date({2026, 11, 4}) && c->event_count() == 1 && d.calendar_store().exception_count() == 1);
+    CHECK(c->list().item_text(0, 0, &text) && text.view().equals("19:00"));
+    CHECK(c->list().item_text(0, 1, &text) && text.view().equals("Class (moved)"));
+    CHECK(c->list().item_text(0, 2, &text) && text.view().equals("Changed"));
+    c->select_date({2026, 11, 3});
+    CHECK(c->event_count() == 0);
+    c->select_date({2026, 11, 10});
+    CHECK(c->event_count() == 1);
+    c->select_event(0);
+    CHECK(c->title_box().text().equals("Class"));
+
+    // The moved one is given back to the series.
+    c->select_date({2026, 11, 4});
+    c->select_event(0);
+    CHECK(c->reset_button().enabled() && c->scope_box().selected_index() == desktop::Calendar::kThisOccurrence);
+    CHECK(c->reset_event() && c->selected_date() == gui::Date({2026, 11, 3}) && c->event_count() == 1 && d.calendar_store().exception_count() == 0);
+
+    // One Tuesday is left out; the series goes on.
+    c->select_date({2026, 11, 10});
+    c->select_event(0);
+    c->scope_box().set_selected_index(desktop::Calendar::kThisOccurrence);
+    CHECK(c->delete_event() && c->event_count() == 0 && d.calendar_store().exception_count() == 1);
+    c->select_date({2026, 11, 17});
+    CHECK(c->event_count() == 1);
+
+    // Save for all occurrences keeps the changed ones, and moves the time of the rest.
+    c->select_event(0);
+    c->hour_box().set_value(17);
+    CHECK(c->update_event() && c->status().equals("Saved all occurrences."));
+    CHECK(c->list().item_text(0, 0, &text) && text.view().equals("17:00") && d.calendar_store().exception_count() == 1);
+    c->select_event(0);
+    CHECK(c->delete_event() && c->event_count() == 0);   // (all occurrences)
+    c->select_date({2026, 11, 24});
+    CHECK(c->event_count() == 0 && d.calendar_store().count() == 2);
+  }
+  CHECK(a.live == 0);
+}
+
 // The file explorer's Copy, Paste and Select All, and the properties window with the format-specific rows.
 static void put_bytes(filesystem::IFileSystem& fs, const char* path, ConstByteView bytes) {
   UniquePointer<filesystem::IFile> file;
@@ -7976,6 +8070,7 @@ int main() {
   test_calculator_session();
   test_calendar();
   test_calendar_recurrence();
+  test_calendar_floating_and_occurrences();
   test_media_player();
   if (g_failed) { printf("%d checks failed\n", g_failed); return 1; }
   printf("gui views: all checks passed\n");
