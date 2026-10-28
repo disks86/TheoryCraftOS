@@ -201,6 +201,7 @@ bool form_get(DomBindings::Impl& c, dom::Node* n, StringView k, Value* out) {
   }
   if (n->is_tag("iframe")) {
     if (IS("contentWindow")) {   // (a stand-in for the window of the page in the frame: postMessage goes to it; made by the page's built-in script)
+      c.host.load_frames();
       const uint32_t id = c.host.frame_window_id(n->serial);
       Value make;
       *out = Value::make_null();
@@ -214,8 +215,19 @@ bool form_get(DomBindings::Impl& c, dom::Node* n, StringView k, Value* out) {
       }
       return true;
     }
-    if (IS("contentDocument")) {   // (the page of a frame has a script engine of its own: its document is not reachable from here)
+    if (IS("contentDocument")) {   // (the page of a frame has a script engine of its own: the document comes through the built-in script's stand-in for it)
+      c.host.load_frames();
+      const uint32_t id = c.host.frame_window_id(n->serial);
+      Value make;
       *out = Value::make_null();
+      if (id && vm.get_named(Value::make_object(vm.global()), "__frame_document", &make) && Vm::is_callable(make)) {
+        const Value arg = num_value(id);
+        if (!vm.call(make, Value(), &arg, 1, out)) {
+          String ignored(vm.allocator());
+          vm.take_exception(&ignored);
+          *out = Value::make_null();
+        }
+      }
       return true;
     }
     return false;

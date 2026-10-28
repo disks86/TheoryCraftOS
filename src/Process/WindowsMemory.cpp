@@ -119,6 +119,7 @@ uint32_t vm_allocate(Process& target, uint64_t* base_io, uint64_t* size_io, uint
       // Committing pages that were reserved earlier.
       if (!(type & kMemCommit)) return kStatusConflictingAddresses;
       PageAttributes existing;
+      if (space->attributes_at(base, &existing) && existing.type == PageAttributes::Image) return kStatusAccessDenied;      // the pages of an image are never committed again
       if (space->attributes_at(base, &existing) && existing.type == PageAttributes::Mapped) {      // a view: a file's pages are already there; plain memory takes what the view allows
         if (existing.file_view) return kStatusAccessDenied;
         if (page_access(protect) & ~page_access(existing.allocation_protect)) return kStatusInvalidParameter;
@@ -320,7 +321,11 @@ uint32_t run_remote(Process& target, IProcessRuntime::RemoteOp& op) {
     case IProcessRuntime::RemoteOp::ThreadStatus: return thread_status_in(target, op.thread_id, &op.size);
     case IProcessRuntime::RemoteOp::TerminateThread: return terminate_thread_in(target, op.thread_id, uint32_t(op.size));
     case IProcessRuntime::RemoteOp::ResumeThread: return resume_thread_in(target, op.thread_id, &op.size);
+    case IProcessRuntime::RemoteOp::GetContext: return context_in(target, op.thread_id, false, op.context);
+    case IProcessRuntime::RemoteOp::SetContext: return context_in(target, op.thread_id, true, op.context);
     case IProcessRuntime::RemoteOp::Unmap: return unmap_view_in(target, op.address);
+    case IProcessRuntime::RemoteOp::MapView: return map_view_in(target, uint32_t(op.thread_id), op.argument, &op.address, &op.size, op.protect);
+    case IProcessRuntime::RemoteOp::Duplicate: return give_object_handle_in(target, op.type, op.argument, op.protect, op.suspended, &op.address);
     case IProcessRuntime::RemoteOp::ProcessInfo: {
       op.address = 0;
       target.read_user_u64(target.gs_base() + 0x60, &op.address);      // TEB.ProcessEnvironmentBlock

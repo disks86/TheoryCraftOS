@@ -101,7 +101,7 @@ LoadStatus load_pe(const exe::PeFile& pe, ConstByteView file, AddressSpace& spac
   return map_pe_image(pe, file, space, pe.image_base(), require_entry, out);
 }
 
-void describe_pe_image(const exe::PeFile& pe, uint64_t file_size, uint8_t (&out)[64]) {
+void describe_pe_image(const exe::PeFile& pe, uint64_t file_size, uint8_t (&out)[64], ConstByteView file) {
   for (uint8_t& b : out) b = 0;
   auto put = [&](uint32_t at, uint64_t value, uint32_t bytes) { for (uint32_t i = 0; i < bytes; ++i) out[at + i] = uint8_t(value >> (8 * i)); };
   put(0, pe.image_base() + pe.entry_rva(), 8);
@@ -118,8 +118,23 @@ void describe_pe_image(const exe::PeFile& pe, uint64_t file_size, uint8_t (&out)
   bool code = pe.entry_rva() != 0;
   for (const exe::PeSection& section : pe.sections().view()) if (section.characteristics & 0x20u) code = true;      // IMAGE_SCN_CNT_CODE
   put(50, code ? 1 : 0, 1);
-  put(51, (pe.dll_characteristics() & 0x40) ? 0x04 : 0, 1);      // ImageDynamicallyRelocated
-  put(52, pe.loader_flags(), 4);
+  uint32_t flags = (pe.dll_characteristics() & 0x40) ? 0x04 : 0;      // ImageDynamicallyRelocated
+  uint32_t com_rva = 0, com_size = 0;
+  const bool managed = pe.directory(14, &com_rva, &com_size) && com_rva != 0 && com_size != 0;      // IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR
+  uint64_t at = 0;
+  if (managed && pe.rva_to_offset(com_rva, &at) && at <= file.size() && file.size() - at >= 20) {      // IMAGE_COR20_HEADER: cb, version 2.5 or later, Flags at 16
+    const uint32_t major = file[at + 4] | (uint32_t(file[at + 5]) << 8), minor = file[at + 6] | (uint32_t(file[at + 7]) << 8);
+    const uint32_t cor_flags = file[at + 16] | (uint32_t(file[at + 17]) << 8) | (uint32_t(file[at + 18]) << 16) | (uint32_t(file[at + 19]) << 24);
+    if ((cor_flags & 1) && (major > 2 || (major == 2 && minor >= 5))) {      // COMIMAGE_FLAGS_ILONLY
+      flags |= 0x02;      // ComPlusILOnly
+      if (!pe.is_pe32_plus()) {
+        if (!(cor_flags & 2)) flags |= 0x01;      // ComPlusNativeReady (not 32BITREQUIRED)
+        if (cor_flags & 0x20000) flags |= 0x20;      // ComPlusPrefer32bit
+      }
+    }
+  }
+  put(51, flags, 1);
+  put(52, managed ? 1 : 0, 4);      // LoaderFlags
   put(56, file_size, 4);
   put(60, pe.checksum(), 4);
 }
@@ -134,29 +149,44 @@ LoadStatus map_pe_image(const exe::PeFile& pe, ConstByteView file, AddressSpace&
     return LoadStatus::Malformed;
 
   const uint64_t header_bytes = pe.size_of_headers() < file.size() ? pe.size_of_headers() : file.size();
-  if (header_bytes == 0 || header_bytes > image_size) return LoadStatus::Malformed;
+  if (header_bytes == 0 || header_bytes > image_pages) return LoadStatus::Malformed;      // (the last page of the image is whole whatever SizeOfImage says)
   if (!space.map(base, header_bytes, kProtRead)) return LoadStatus::OutOfMemory;
   if (!space.write_privileged(base, file.first(header_bytes))) return LoadStatus::Malformed;
 
   for (const exe::PeSection& section : pe.sections().view()) {
     const uint64_t span = section.virtual_size ? section.virtual_size : section.raw_size;
     if (span == 0) continue;
-    if (section.virtual_address % AddressSpace::kPageSize != 0 || section.virtual_address > image_size || span > image_size - section.virtual_address) return LoadStatus::Malformed;
+    if (section.virtual_address % AddressSpace::kPageSize != 0 || section.virtual_address > image_pages || span > image_pages - section.virtual_address) return LoadStatus::Malformed;
     const uint8_t protection = uint8_t(((section.characteristics & exe::kPeSectionRead) ? kProtRead : 0) | ((section.characteristics & exe::kPeSectionWrite) ? kProtWrite : 0) |
                                        ((section.characteristics & exe::kPeSectionExecute) ? kProtExecute : 0));
     if (!space.map(base + section.virtual_address, span, protection)) return LoadStatus::Malformed;      // overlaps the headers or another section
-    const uint64_t copy = section.raw_size < span ? section.raw_size : span;
+    // The file is mapped from the 512-byte boundary below the raw data, so a raw pointer that is not aligned shows the bytes in front of it too, and (then) the rest of the
+    // page is what the file has there rather than zeros.
+    const uint64_t delta = section.raw_offset & 511u;
+    const uint64_t from = section.raw_offset - delta;
+    uint64_t copy = section.raw_size < span ? section.raw_size : span;
+    uint64_t at = base + section.virtual_address;
+    uint64_t source = section.raw_offset;
+    if (delta != 0 && copy != 0 && from < file.size()) {
+      uint64_t page_end = 0;
+      if (!AddressSpace::round_up(delta + section.raw_size, &page_end)) return LoadStatus::Malformed;
+      uint64_t mapped = 0;
+      if (!AddressSpace::round_up(span, &mapped)) return LoadStatus::Malformed;
+      copy = page_end < mapped ? page_end : mapped;
+      if (copy > file.size() - from) copy = file.size() - from;
+      source = from;
+    }
     if (copy) {
-      if (!in_file(file, section.raw_offset, copy)) return LoadStatus::Malformed;
-      if (!space.write_privileged(base + section.virtual_address, file.subview(section.raw_offset, copy))) return LoadStatus::Malformed;
+      if (!in_file(file, source, copy)) return LoadStatus::Malformed;
+      if (!space.write_privileged(at, file.subview(source, copy))) return LoadStatus::Malformed;
     }
   }
-  if (pe.entry_rva() >= image_size || (require_entry && pe.entry_rva() == 0)) return LoadStatus::Malformed;
+  if (pe.entry_rva() >= image_pages || (require_entry && pe.entry_rva() == 0)) return LoadStatus::Malformed;
   LoadedImage image;
   image.base = base;
   image.end = base + image_pages;
   image.entry = pe.entry_rva() ? base + pe.entry_rva() : 0;
-  if (image.entry != 0 && !space.check(image.entry, 1, kProtExecute)) return LoadStatus::Malformed;
+  if (!pe.is_dll() && image.entry != 0 && !space.check(image.entry, 1, kProtExecute)) return LoadStatus::Malformed;      // (a library whose entry point cannot run fails when it is called)
   *out = image;
   return LoadStatus::Ok;
 }

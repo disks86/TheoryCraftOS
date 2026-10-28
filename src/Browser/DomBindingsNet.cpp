@@ -623,6 +623,18 @@ NATIVE(win_post_message) {
   *result = bool_value(impl(vm).host.post_window_message(static_cast<uint32_t>(target), origin.view(), payload.view(), ports.view()));
   return true;
 }
+// __window_request(window, request): the answer of the script of that window, or undefined if there is none
+NATIVE(win_request) {
+  double target;
+  String request(vm.allocator()), reply(vm.allocator());
+  if (!vm.to_number(arg_at(args, argc, 0), &target) || !arg_text(vm, arg_at(args, argc, 1), &request)) return false;
+  if (!impl(vm).host.window_request(static_cast<uint32_t>(target), request.view(), &reply)) {
+    *result = Value();
+    return true;
+  }
+  *result = str_value(vm, reply.view());
+  return true;
+}
 NATIVE(port_pair) { *result = num_value(impl(vm).host.new_port_pair()); return true; }
 NATIVE(port_move) {
   double port, window;
@@ -856,6 +868,7 @@ bool install_net(DomBindings::Impl& c) {
   vm.define_native(g, "__top_window_id", win_top_window_id, 0);
   vm.define_native(g, "__frame_window_id", win_frame_window_id, 1);
   vm.define_native(g, "__post_message", win_post_message, 4);
+  vm.define_native(g, "__window_request", win_request, 2);
   vm.define_native(g, "__port_pair", port_pair, 0);
   vm.define_native(g, "__port_move", port_move, 2);
   vm.define_native(g, "__port_post", port_post, 3);

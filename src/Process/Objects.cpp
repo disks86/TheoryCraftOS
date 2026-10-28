@@ -180,7 +180,7 @@ struct ObjectManager::Section {
   uint32_t page = 0, attributes = 0;
   bool image_mapped = false;
   uint8_t* storage = nullptr;
-  uint64_t size = 0, rounded = 0;
+  uint64_t size = 0, rounded = 0, reported_size = 0;
   int32_t mappings = 0;
   uint32_t object = 0;                      // its slot in objects_
   filesystem::IFileSystem* fs = nullptr;
@@ -757,7 +757,14 @@ bool ObjectManager::section_info(uint32_t id, SectionInfo* out) {
   out->page = s.page;
   out->attributes = s.attributes;
   out->file_backed = s.file_backed;
+  out->reported_size = s.reported_size;
   return true;
+}
+
+void ObjectManager::section_set_reported_size(uint32_t id, uint64_t size) {
+  Locked hold(sync_);
+  Object* o = at(id);
+  if (o && o->kind == ObjectKind::Section && o->section >= 0 && sections_) sections_[o->section].reported_size = size;
 }
 
 void ObjectManager::flush_section_at(uint32_t index) {

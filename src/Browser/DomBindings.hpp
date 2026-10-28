@@ -173,8 +173,12 @@ class IDomHost {
   virtual uint32_t window_id() = 0;
   virtual uint32_t parent_window_id() = 0;   // 0: none
   virtual uint32_t top_window_id() = 0;
+  virtual void load_frames() = 0;   // the pages of the <iframe>s that are in the document and not loaded yet are loaded now
   virtual uint32_t frame_window_id(uint32_t iframe_serial) = 0;   // the window of the page in that <iframe> (0: none)
   virtual bool post_window_message(uint32_t target_window, StringView target_origin, StringView payload, StringView ports) = 0;
+  // A request to the script of another window of the tab (a frame, the page around it): `request` is text made by the built-in script, which the script of that window
+  // answers in `reply`. False if there is no such window or it has no script.
+  virtual bool window_request(uint32_t target_window, StringView request, String* reply) = 0;
   // Message ports: a pair of ids is made (the second is the first plus one); a port lives in the window that has it; a message to a port goes to its window.
   virtual uint32_t new_port_pair() = 0;
   virtual void move_port(uint32_t port, uint32_t window) = 0;
