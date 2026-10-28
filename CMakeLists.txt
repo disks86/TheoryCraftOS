@@ -360,6 +360,9 @@ add_executable(BOOTX64
   src/Browser/HttpPageLoader.cpp
   src/Network/Tls/CaBundle.cpp
   src/Network/Tls/CaBundle.S
+  src/Graphics/Logo/Logo.cpp
+  src/Graphics/Logo/LogoData.cpp
+  src/Graphics/Logo/Logo.S
   src/Database/SqlText.cpp
   src/Database/Local/LocalCatalog.cpp
   src/Database/Local/LocalSql.cpp
@@ -783,6 +786,8 @@ add_executable(BOOTX64
 target_include_directories(BOOTX64 PRIVATE src)
 # The root certificates built into the image (.incbin looks for the file from the source folder).
 set_source_files_properties(src/Network/Tls/CaBundle.S PROPERTIES COMPILE_OPTIONS "-I${CMAKE_SOURCE_DIR}" OBJECT_DEPENDS ${CMAKE_SOURCE_DIR}/certs/ca-bundle.pem)
+# The logo built into the image (assets/logo.png).
+set_source_files_properties(src/Graphics/Logo/Logo.S PROPERTIES COMPILE_OPTIONS "-I${CMAKE_SOURCE_DIR}" OBJECT_DEPENDS ${CMAKE_SOURCE_DIR}/assets/logo.png)
 set_target_properties(BOOTX64 PROPERTIES SUFFIX ".efi")
 
 target_compile_options(BOOTX64 PRIVATE

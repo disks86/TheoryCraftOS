@@ -20,7 +20,7 @@
 
 void GraphicsConsole::attach(hardware::IGraphicsProcessingUnit* gpu) {
   gpu_ = gpu;
-  col_ = row_ = 0;
+  col_ = row_ = top_row_ = 0;
   cols_ = rows_ = 0;
   if (!gpu_) return;
   cols_ = gpu_->width() / gpu_->glyph_width();
@@ -32,12 +32,23 @@ void GraphicsConsole::attach(hardware::IGraphicsProcessingUnit* gpu) {
   gpu_->clear(kBackground);
 }
 
+void GraphicsConsole::show_banner(ArrayView<const uint32_t> pixels, uint32_t width, uint32_t height) {
+  if (!gpu_ || !width || !height || pixels.size() < uint64_t{width} * height) return;
+  const uint32_t gh = gpu_->glyph_height();
+  const uint32_t banner_rows = (height + gh - 1) / gh + 1;   // a row of air under it
+  if (banner_rows >= rows_ || width > gpu_->width()) return;   // no room for text beside it: leave the screen as it is
+  gpu_->clear(kBackground);
+  gpu_->blit(0, 0, width, height, pixels.data(), width);
+  top_row_ = row_ = banner_rows;
+  col_ = 0;
+}
+
 void GraphicsConsole::new_line() {
   col_ = 0;
   if (++row_ < rows_) return;
-  row_ = rows_ - 1;  // scroll up by one text row
+  row_ = rows_ - 1;  // scroll up by one text row, below the banner
   const uint32_t gh = gpu_->glyph_height();
-  gpu_->copy_rect(0, gh, 0, 0, gpu_->width(), (rows_ - 1) * gh);
+  gpu_->copy_rect(0, (top_row_ + 1) * gh, 0, top_row_ * gh, gpu_->width(), (rows_ - 1 - top_row_) * gh);
   gpu_->fill_rect(0, (rows_ - 1) * gh, gpu_->width(), gh, kBackground);
 }
 

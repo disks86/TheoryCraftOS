@@ -19,6 +19,7 @@
 #pragma once
 #include <stdint.h>
 #include "Hardware/GraphicsProcessingUnit/IGraphicsProcessingUnit.hpp"
+#include "Utility/ArrayView.hpp"
 
 // A scrolling text console drawn through an IGraphicsProcessingUnit. It only
 // uses the GPU interface (glyphs, fill and copy), so it works with every GPU
@@ -30,6 +31,9 @@ class GraphicsConsole {
   bool attached() const { return gpu_ != nullptr; }
 
   void put(char c);
+  // Draws a picture (0xAARRGGBB, alpha ignored, `width` pixels a row) at the top left and keeps the text below it: the cursor goes to the
+  // first row under the picture and scrolling leaves the picture alone. attach() takes the picture away again.
+  void show_banner(ArrayView<const uint32_t> pixels, uint32_t width, uint32_t height);
   // Text color for what is put next (0x00RRGGBB); 0 restores the default.
   void set_foreground(uint32_t color) { foreground_ = color ? color : kForeground; }
   // Shows what has been put so far on GPUs that need telling.
@@ -46,4 +50,5 @@ class GraphicsConsole {
   hardware::IGraphicsProcessingUnit* gpu_ = nullptr;
   uint32_t foreground_ = kForeground;
   uint32_t cols_ = 0, rows_ = 0, col_ = 0, row_ = 0;
+  uint32_t top_row_ = 0;   // the first row text goes to (below the banner)
 };
