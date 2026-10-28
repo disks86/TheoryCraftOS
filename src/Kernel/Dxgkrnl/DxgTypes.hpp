@@ -135,6 +135,9 @@ struct AdapterCaps {
   bool accelerated = false;   // a GPU draws (not the CPU)
   bool stencil = false;       // the devices accept a stencil plane
   bool mipmaps = false;
+  bool textures = false;             // sampled images (texture units; max_texture_units says how many pipelines may use)
+  bool programmable_vertex = false;  // a vertex shader of any program (as a function, TGSI or Direct3D 9 tokens), not only the device's fixed transform
+  bool programmable_pixel = false;   // the same for a pixel shader; false: the device has fixed pixel kernels (see D3d9Devices.cpp) and takes only shaders that are exactly one
   char name[64] = {};
 };
 

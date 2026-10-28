@@ -31,6 +31,7 @@
 #include "Kernel/Dxgkrnl/CommandStream.hpp"
 #include "Kernel/Dxgkrnl/DxgKernel.hpp"
 #include "Utility/ByteStream.hpp"
+#include "DxgkrnlDeviceSuite.hpp"
 
 using namespace dxgk;
 
@@ -1075,6 +1076,7 @@ void test_device_teardown() {
 // --- Direct3D 9 bytecode ---------------------------------------------------------------------------------------------------------------------------------------------
 
 constexpr uint32_t kRegTemp = 0, kRegInput = 1, kRegConst = 2, kRegTex = 3, kRegRastOut = 4, kRegAttrOut = 5, kRegTexOut = 6, kRegColorOut = 8, kRegSampler = 10, kRegBool = 14;
+constexpr uint32_t kOpCnd = 80, kOpCmp = 88;
 constexpr uint32_t kOpMov = 1, kOpAdd = 2, kOpMul = 5, kOpM4x4 = 20, kOpLoop = 27, kOpDcl = 31, kOpIf = 40, kOpElse = 42, kOpEndIf = 43, kOpDefB = 47, kOpTexLd = 66, kOpDef = 81;
 constexpr uint32_t kXyzw = 0xE4;
 constexpr uint32_t kOpTemp = 0, kOpInput = 1, kOpOut = 2, kOpConstantBuffer = 8;
@@ -1241,7 +1243,7 @@ void test_d3d9_bytecode() {
 
   // What is refused, and how.
   NtStatus s = 0;
-  { Asm a(false, 1, 1); a.end(); d3d9_shader(e, a, &s); CHECK(s == status::kNotSupported); }                                        // ps_1_1
+  { Asm a(false, 1, 1); a.op(71, {Asm::dst(kRegTex, 0), Asm::src(kRegTex, 1)}); a.end(); d3d9_shader(e, a, &s); CHECK(s == status::kNotSupported); }   // ps_1_1: texm3x2pad
   { Asm a(true, 2, 0); a.op(kOpLoop, {Asm::src(kRegConst, 0), Asm::src(kRegConst, 0)}); a.end(); d3d9_shader(e, a, &s); CHECK(s == status::kNotSupported); }
   { Asm a = color_vs(); a.t.back() = 0; d3d9_shader(e, a, &s); CHECK(s == status::kInvalidParameter); }                              // no end token
   { Asm a(true, 2, 0); a.op(kOpMov, {Asm::dst(kRegAttrOut, 0), Asm::src(kRegConst, 0)}); a.end(); d3d9_shader(e, a, &s); CHECK(s == status::kInvalidParameter); }   // never writes the position
@@ -1844,6 +1846,8 @@ class SpyDevice final : public graphics::IGraphicsDevice {
   uint64_t svga_tokens = 0;
   graphics::EuProgram eu_program = graphics::EuProgram::None;
   uint32_t eu_varying = 0;
+  graphics::QpuProgram qpu_program = graphics::QpuProgram::None;
+  bool qpu_rows = false;
   graphics::DeviceInfo info() const override { return inner_.info(); }
   graphics::IBuffer* create_buffer(uint64_t size, uint32_t usage) override { return inner_.create_buffer(size, usage); }
   void destroy_buffer(graphics::IBuffer* buffer) override { inner_.destroy_buffer(buffer); }
@@ -1855,6 +1859,8 @@ class SpyDevice final : public graphics::IGraphicsDevice {
     svga_tokens = desc.d3d9_tokens ? desc.d3d9_token_count : 0;
     eu_program = desc.eu_program;
     eu_varying = desc.eu_varying;
+    qpu_program = desc.qpu_program;
+    qpu_rows = desc.qpu_matrix_rows;
     return inner_.create_shader_module(desc);
   }
   void destroy_shader_module(graphics::IShaderModule* module) override { inner_.destroy_shader_module(module); }
@@ -2687,6 +2693,62 @@ void test_device_forms() {
     UniquePointer<D3d9Program> dx = compile_dxbc(allocator, blob);
     CHECK(dx && dx->emit_svga_tokens(ConstByteView(blob.data(), blob.size()), &none) == status::kNotSupported);
 
+    // The Raspberry Pi's vertex kernel: the matrix transform, as columns (the built-in shader) or rows (dp4), or neither.
+    {
+      uint8_t colour = 99;
+      Asm rows(true, 2, 0);   // m4x4 oPos, v0, c0 ; mov oD0, v1
+      rows.op(kOpM4x4, {Asm::dst(kRegRastOut, 0), Asm::src(kRegInput, 0), Asm::src(kRegConst, 0)});
+      rows.op(kOpMov, {Asm::dst(kRegAttrOut, 0), Asm::src(kRegInput, 1)});
+      rows.end();
+      CHECK(D3d9Program::compile(allocator, rows.bytes(), &program) == status::kSuccess && program->classify_vertex(&colour) == VertexKernel::MatrixRows && colour == 0);
+      Asm columns(true, 2, 0);   // mul r0, c0, v0.x ; mad r0, c1, v0.y, r0 ; mad r0, c2, v0.z, r0 ; add oPos, r0, c3 ; mov oT1, v1
+      columns.op(kOpMul, {Asm::dst(kRegTemp, 0), Asm::src(kRegConst, 0), Asm::src(kRegInput, 0, 0x00)});
+      columns.op(4, {Asm::dst(kRegTemp, 0), Asm::src(kRegConst, 1), Asm::src(kRegInput, 0, 0x55), Asm::src(kRegTemp, 0)});
+      columns.op(4, {Asm::dst(kRegTemp, 0), Asm::src(kRegConst, 2), Asm::src(kRegInput, 0, 0xAA), Asm::src(kRegTemp, 0)});
+      columns.op(kOpAdd, {Asm::dst(kRegRastOut, 0), Asm::src(kRegTemp, 0), Asm::src(kRegConst, 3)});
+      columns.op(kOpMov, {Asm::dst(kRegTexOut, 1), Asm::src(kRegInput, 1)});
+      columns.end();
+      CHECK(D3d9Program::compile(allocator, columns.bytes(), &program) == status::kSuccess && program->classify_vertex(&colour) == VertexKernel::MatrixColumns && colour == 3);
+      // The matrix the V3D device loads (kernel_matrix_words) makes the fixed kernel give what the shader gives, for both forms.
+      for (const Asm* shader : {&rows, &columns}) {
+        UniquePointer<D3d9Program> p;
+        CHECK(D3d9Program::compile(allocator, shader->bytes(), &p) == status::kSuccess);
+        const VertexKernel k = p->classify_vertex(&colour);
+        bool same = true;
+        uint32_t seed = 99;
+        for (int probe = 0; probe < 8; ++probe) {
+          uint8_t constants[128] = {};
+          uint32_t words[16];
+          for (uint32_t i = 0; i < 16; ++i) {
+            seed = seed * 1664525u + 1013904223u;
+            const float f = static_cast<float>(static_cast<int32_t>(seed >> 8) % 2001 - 1000) * 0.002f;
+            memcpy(constants + 4 * i, &f, 4);
+            words[i] = __builtin_bit_cast(uint32_t, f);
+          }
+          graphics::Vec4 attributes[4] = {{0.3f, -0.4f, 0.7f, 1.0f}, {0.1f, 0.2f, 0.3f, 0.4f}, {}, {}};
+          graphics::ShaderIo shader_out = {}, kernel_out = {};
+          p->run_vertex(attributes, constants, &shader_out);
+          graphics::kernel_matrix_words(words, k == VertexKernel::MatrixRows, true);
+          uint8_t kernel_constants[128] = {};
+          for (uint32_t i = 0; i < 16; ++i) memcpy(kernel_constants + 4 * i, &words[i], 4);
+          graphics::colored_vertex_shader().vertex_function(attributes, kernel_constants, &kernel_out);
+          same = same && near_value(shader_out.position.x, kernel_out.position.x) && near_value(shader_out.position.y, kernel_out.position.y) &&
+                 near_value(shader_out.position.z, kernel_out.position.z) && near_value(shader_out.position.w, kernel_out.position.w);
+        }
+        CHECK(same);
+      }
+      Asm other(true, 2, 0);   // the same plus a constant: not the kernel
+      other.op(kOpM4x4, {Asm::dst(kRegTemp, 0), Asm::src(kRegInput, 0), Asm::src(kRegConst, 0)});
+      other.op(kOpAdd, {Asm::dst(kRegRastOut, 0), Asm::src(kRegTemp, 0), Asm::src(kRegConst, 4)});
+      other.op(kOpMov, {Asm::dst(kRegAttrOut, 0), Asm::src(kRegInput, 1)});
+      other.end();
+      CHECK(D3d9Program::compile(allocator, other.bytes(), &program) == status::kSuccess && program->classify_vertex(&colour) == VertexKernel::None);
+      Asm tinted(true, 2, 0);   // the colour halved: not the kernel
+      tinted.op(kOpM4x4, {Asm::dst(kRegRastOut, 0), Asm::src(kRegInput, 0), Asm::src(kRegConst, 0)});
+      tinted.op(kOpMul, {Asm::dst(kRegAttrOut, 0), Asm::src(kRegInput, 1), Asm::src(kRegConst, 5)});
+      tinted.end();
+      CHECK(D3d9Program::compile(allocator, tinted.bytes(), &program) == status::kSuccess && program->classify_vertex(&colour) == VertexKernel::None);
+    }
     // Intel Gen9: which pixel shaders are one of its two kernels.
     uint8_t varying = 99;
     CHECK(D3d9Program::compile(allocator, ps.bytes(), &program) == status::kSuccess && program->classify_fragment(&varying) == FragmentKernel::Colored && varying == 0);
@@ -2739,7 +2801,7 @@ void test_device_forms() {
     const Asm vs = color_vs(), ps = color_ps();
     d.code = vs.bytes();
     CHECK(kernel.create_shader(kPid, device, d, &h) == status::kSuccess);
-    CHECK(spy.had_function && spy.svga_tokens > 8 && spy.eu_program == graphics::EuProgram::None);
+    CHECK(spy.had_function && spy.svga_tokens > 8 && spy.eu_program == graphics::EuProgram::None && spy.qpu_program == graphics::QpuProgram::None);   // (color_vs flips nothing the kernel does)
     d.code = ps.bytes();
     CHECK(kernel.create_shader(kPid, device, d, &h) == status::kSuccess);
     CHECK(spy.had_function && spy.svga_tokens == ps.t.size() && spy.eu_program == graphics::EuProgram::ColoredFragment && spy.eu_varying == 0);
@@ -2967,6 +3029,240 @@ void test_sm3_and_sm51() {
   CHECK(allocator.live == 0);
 }
 
+// --- Shader Model 1 pixel shaders ----------------------------------------------------------------------------------------------------------------------------------------
+
+void test_ps1() {
+  HostAllocator allocator;
+  {
+    TexSet textures;
+    // Run `a` on every input set; `expect` gives the colour (or null: killed) from the inputs and constants. The same program is checked as TGSI text and as SVGA tokens.
+    auto check = [&](const Asm& a, const char* what, auto expect) {
+      UniquePointer<D3d9Program> p;
+      const NtStatus st = D3d9Program::compile(allocator, a.bytes(), &p);
+      if (st != status::kSuccess || !p) {
+        printf("  ps_1_x %s: status %x\n", what, static_cast<unsigned>(st));
+        CHECK(false);
+        return;
+      }
+      String text(allocator);
+      CHECK(p->emit_tgsi(&text) == status::kSuccess);
+      List<uint32_t> tokens(allocator);
+      CHECK(p->emit_svga_tokens(a.bytes(), &tokens) == status::kSuccess && tokens.count() * 4 == a.t.size() * 4);
+      const std::string source(text.data(), text.size());
+      for (unsigned set = 0; set < 4; ++set) {
+        uint8_t constants[128];
+        for (unsigned i = 0; i < 8; ++i)
+          for (unsigned k = 0; k < 4; ++k) memcpy(constants + i * 16 + k * 4, &kConstants[set][i][k], 4);
+        graphics::Vec4 varyings[4];
+        for (unsigned i = 0; i < 4; ++i) varyings[i] = {kInputs[set][i][0], kInputs[set][i][1], kInputs[set][i][2], kInputs[set][i][3]};
+        graphics::Vec4 got = {};
+        const bool alive = p->run_fragment(varyings, constants, &textures, &got);
+        float want[4];
+        const bool expect_alive = expect(set, textures, want);
+        bool ok = alive == expect_alive;
+        if (alive && expect_alive) ok = ok && near_value(got.x, want[0]) && near_value(got.y, want[1]) && near_value(got.z, want[2]) && near_value(got.w, want[3]);
+        if (!ok) printf("  ps_1_x %s set %u: got %g %g %g %g (%s), expected %g %g %g %g (%s)\n", what, set, got.x, got.y, got.z, got.w, alive ? "alive" : "killed", want[0], want[1], want[2], want[3],
+                        expect_alive ? "alive" : "killed");
+        CHECK(ok);
+        TgsiMachine m;
+        m.textures = &textures;
+        for (unsigned i = 0; i < 8; ++i)
+          for (unsigned k = 0; k < 4; ++k) m.cst[i][k] = kConstants[set][i][k];
+        for (unsigned i = 0; i < 4; ++i)
+          for (unsigned k = 0; k < 4; ++k) m.in[i][k] = kInputs[set][i][k];
+        bool tok = m.run(source) && alive == !m.killed;
+        if (alive)
+          for (int k = 0; k < 4; ++k) tok = tok && near_value(m.out[0][k], k == 0 ? got.x : k == 1 ? got.y : k == 2 ? got.z : got.w);
+        if (!tok) printf("  ps_1_x %s tgsi mismatch:\n%s", what, source.c_str());
+        CHECK(tok);
+      }
+    };
+    auto in = [](unsigned set, unsigned i, unsigned k) { return kInputs[set][i][k]; };
+    auto cb = [](unsigned set, unsigned i, unsigned k) { return kConstants[set][i][k]; };
+
+    {   // tex t0 ; mul r0, t0, v0
+      Asm a(false, 1, 1);
+      a.op(66, {Asm::dst(kRegTex, 0)});
+      a.op(kOpMul, {Asm::dst(kRegTemp, 0), Asm::src(kRegTex, 0), Asm::src(kRegInput, 0)});
+      a.end();
+      check(a, "tex", [&](unsigned set, const TexSet& t, float* w) {
+        const graphics::Vec4 s = t.sample(0, in(set, 2, 0), in(set, 2, 1));
+        w[0] = s.x * in(set, 0, 0), w[1] = s.y * in(set, 0, 1), w[2] = s.z * in(set, 0, 2), w[3] = s.w * in(set, 0, 3);
+        return true;
+      });
+    }
+    {   // texcoord t1 ; mov r0, t1   (w is 1)
+      Asm a(false, 1, 0);
+      a.op(64, {Asm::dst(kRegTex, 1)});
+      a.op(kOpMov, {Asm::dst(kRegTemp, 0), Asm::src(kRegTex, 1)});
+      a.end();
+      check(a, "texcoord", [&](unsigned set, const TexSet&, float* w) {
+        w[0] = in(set, 3, 0), w[1] = in(set, 3, 1), w[2] = in(set, 3, 2), w[3] = 1.0f;
+        return true;
+      });
+    }
+    {   // texkill t0 ; mov r0, v0
+      Asm a(false, 1, 1);
+      a.op(65, {Asm::dst(kRegTex, 0)});
+      a.op(kOpMov, {Asm::dst(kRegTemp, 0), Asm::src(kRegInput, 0)});
+      a.end();
+      check(a, "texkill", [&](unsigned set, const TexSet&, float* w) {
+        for (int k = 0; k < 4; ++k) w[k] = in(set, 0, k);
+        return !(in(set, 2, 0) < 0 || in(set, 2, 1) < 0 || in(set, 2, 2) < 0);
+      });
+    }
+    {   // cnd r0, v0.a, v1, c0   (per component: v0.a > 0.5 ? v1 : c0)
+      Asm a(false, 1, 2);
+      a.op(kOpCnd, {Asm::dst(kRegTemp, 0), Asm::src(kRegInput, 0, 0xFF), Asm::src(kRegInput, 1), Asm::src(kRegConst, 0)});
+      a.end();
+      check(a, "cnd", [&](unsigned set, const TexSet&, float* w) {
+        for (int k = 0; k < 4; ++k) w[k] = in(set, 0, 3) > 0.5f ? in(set, 1, k) : cb(set, 0, k);
+        return true;
+      });
+    }
+    {   // cmp r0, v0, v1, c0   (per component: v0 >= 0 ? v1 : c0)
+      Asm a(false, 1, 2);
+      a.op(kOpCmp, {Asm::dst(kRegTemp, 0), Asm::src(kRegInput, 0), Asm::src(kRegInput, 1), Asm::src(kRegConst, 0)});
+      a.end();
+      check(a, "cmp", [&](unsigned set, const TexSet&, float* w) {
+        for (int k = 0; k < 4; ++k) w[k] = in(set, 0, k) >= 0 ? in(set, 1, k) : cb(set, 0, k);
+        return true;
+      });
+    }
+    {   // texld r0, t0 ; texcrd r1, t1 ; mul r0, r0, r1     (ps_1_4)
+      Asm a(false, 1, 4);
+      a.op(kOpTexLd, {Asm::dst(kRegTemp, 0), Asm::src(kRegTex, 0)});
+      a.op(64, {Asm::dst(kRegTemp, 1), Asm::src(kRegTex, 1)});
+      a.op(kOpMul, {Asm::dst(kRegTemp, 0), Asm::src(kRegTemp, 0), Asm::src(kRegTemp, 1)});
+      a.end();
+      check(a, "texld", [&](unsigned set, const TexSet& t, float* w) {
+        const graphics::Vec4 s = t.sample(0, in(set, 2, 0), in(set, 2, 1));
+        w[0] = s.x * in(set, 3, 0), w[1] = s.y * in(set, 3, 1), w[2] = s.z * in(set, 3, 2), w[3] = s.w;
+        return true;
+      });
+    }
+    {   // texld r1, r0_dw.xyw     (projective, from a temporary; stage 1)
+      Asm a(false, 1, 4);
+      a.op(kOpMov, {Asm::dst(kRegTemp, 0), Asm::src(kRegInput, 1)});
+      a.op(kOpTexLd, {Asm::dst(kRegTemp, 1), Asm::src(kRegTemp, 0, 0xC4, 10)});   // (swizzle x, y, w, w; the _dw modifier)
+      a.op(kOpMov, {Asm::dst(kRegTemp, 0), Asm::src(kRegTemp, 1)});
+      a.end();
+      check(a, "texld projective", [&](unsigned set, const TexSet& t, float* w) {
+        const float inv = in(set, 1, 3) == 0 ? 0.0f : 1.0f / in(set, 1, 3);
+        const graphics::Vec4 s = t.sample(1, in(set, 1, 0) * inv, in(set, 1, 1) * inv);
+        w[0] = s.x, w[1] = s.y, w[2] = s.z, w[3] = s.w;
+        return true;
+      });
+    }
+    {   // mul_x2_sat r0, v0, v1 ; and source modifiers: mad r0.rgb... = v0_bx2 * (1 - v1) + c0_x2
+      Asm a(false, 1, 1);
+      a.op(kOpMul, {Asm::dst(kRegTemp, 0, 0xF, 1) | (1u << 24), Asm::src(kRegInput, 0), Asm::src(kRegInput, 1)});
+      a.end();
+      check(a, "mul_x2_sat", [&](unsigned set, const TexSet&, float* w) {
+        for (int k = 0; k < 4; ++k) {
+          const float v = in(set, 0, k) * in(set, 1, k) * 2.0f;
+          w[k] = v > 0 ? (v < 1 ? v : 1.0f) : 0.0f;
+        }
+        return true;
+      });
+      Asm b(false, 1, 1);
+      b.op(4, {Asm::dst(kRegTemp, 0), Asm::src(kRegInput, 0, kXyzw, 4), Asm::src(kRegInput, 1, kXyzw, 6), Asm::src(kRegConst, 0, kXyzw, 7)});
+      b.end();
+      check(b, "source modifiers", [&](unsigned set, const TexSet&, float* w) {
+        for (int k = 0; k < 4; ++k) w[k] = 2.0f * (in(set, 0, k) - 0.5f) * (1.0f - in(set, 1, k)) + 2.0f * cb(set, 0, k);
+        return true;
+      });
+    }
+    {   // a real compiler's ps_1_4: lerp(c, d, k.a) * 0.5 + c * d
+      const std::vector<uint8_t> blob = read_blob("ps1_lerp_1_4.sm1");
+      UniquePointer<D3d9Program> p;
+      CHECK(!blob.empty() && D3d9Program::compile(allocator, view_of(blob), &p) == status::kSuccess && p);
+      if (p) {
+        bool ok = true;
+        for (unsigned set = 0; set < 4; ++set) {
+          uint8_t constants[128];
+          for (unsigned i = 0; i < 8; ++i)
+            for (unsigned k = 0; k < 4; ++k) memcpy(constants + i * 16 + k * 4, &kConstants[set][i][k], 4);
+          graphics::Vec4 varyings[4];
+          for (unsigned i = 0; i < 4; ++i) varyings[i] = {kInputs[set][i][0], kInputs[set][i][1], kInputs[set][i][2], kInputs[set][i][3]};
+          graphics::Vec4 c = {};
+          ok = ok && p->run_fragment(varyings, constants, nullptr, &c);
+          const float got[4] = {c.x, c.y, c.z, c.w};
+          for (int k = 0; k < 4; ++k) {
+            const float lerp = in(set, 0, k) + cb(set, 0, 3) * (in(set, 1, k) - in(set, 0, k));
+            ok = ok && near_value(got[k], lerp * 0.5f + in(set, 0, k) * in(set, 1, k));
+          }
+        }
+        CHECK(ok);
+        List<uint32_t> tokens(allocator);
+        CHECK(p->emit_svga_tokens(view_of(blob), &tokens) == status::kSuccess && tokens.count() * 4 == blob.size());
+      }
+    }
+    // Refusals, and truncated / bit-flipped streams.
+    {
+      NtStatus st = 0;
+      Asm refused(false, 1, 1);
+      refused.op(67, {Asm::dst(kRegTex, 1), Asm::src(kRegTex, 0)});   // texbem
+      refused.end();
+      UniquePointer<D3d9Program> p;
+      st = D3d9Program::compile(allocator, refused.bytes(), &p);
+      CHECK(st == status::kNotSupported);
+      Asm stage2(false, 1, 1);
+      stage2.op(66, {Asm::dst(kRegTex, 2)});
+      stage2.end();
+      CHECK(D3d9Program::compile(allocator, stage2.bytes(), &p) == status::kNotSupported);
+      Asm base(false, 1, 4);
+      base.op(kOpTexLd, {Asm::dst(kRegTemp, 0), Asm::src(kRegTex, 0)});
+      base.op(kOpCnd, {Asm::dst(kRegTemp, 1), Asm::src(kRegTemp, 0, 0xFF), Asm::src(kRegInput, 1), Asm::src(kRegConst, 0)});
+      base.op(kOpMul, {Asm::dst(kRegTemp, 0, 0xF, 1), Asm::src(kRegTemp, 0), Asm::src(kRegTemp, 1)});
+      base.end();
+      unsigned compiled = 0, refusals = 0;
+      uint32_t seed = 31337;
+      for (size_t cut = 1; cut < base.t.size(); ++cut) {
+        Asm t = base;
+        t.t.resize(cut);
+        D3d9Program::compile(allocator, t.bytes(), &p) == status::kSuccess ? ++compiled : ++refusals;
+      }
+      for (int i = 0; i < 4000; ++i) {
+        Asm t = base;
+        seed = seed * 1664525u + 1013904223u;
+        t.t[(seed >> 8) % t.t.size()] ^= 1u << ((seed >> 3) % 32);
+        if (D3d9Program::compile(allocator, t.bytes(), &p) == status::kSuccess) {
+          ++compiled;
+          String text(allocator);
+          p->emit_tgsi(&text);
+          graphics::Vec4 v[4] = {}, c;
+          uint8_t constants[128] = {};
+          p->run_fragment(v, constants, &textures, &c);
+        } else {
+          ++refusals;
+        }
+      }
+      printf("  ps_1_x fuzz: %u compiled, %u refused\n", compiled, refusals);
+      CHECK(compiled > 0 && refusals > 0);
+    }
+  }
+  CHECK(allocator.live == 0);
+}
+
+// The device suite (tests/DxgkrnlDeviceSuite.hpp) on the software device itself and on a device that passes everything through: the baseline of what other devices are held to.
+void test_device_suite() {
+  HostAllocator allocator;
+  {
+    FakeScreen screen(8, 6);
+    graphics::SoftwareDevice software(allocator, &screen);
+    SpyDevice spy(software);
+    CHECK(dxgk_suite::compare(allocator, software, &screen, "software", 0, 0) == 0);
+    CHECK(dxgk_suite::compare(allocator, spy, &screen, "spy", 0, 0) == 0);
+    // What the adapter says of the software device: everything.
+    Kernel kernel(allocator);
+    CHECK(kernel.add_adapter(software, AdapterConfig()) == 0);
+    const AdapterCaps& caps = kernel.adapter(0)->caps();
+    CHECK(caps.stencil && caps.mipmaps && caps.textures && caps.programmable_vertex && caps.programmable_pixel);
+  }
+  CHECK(allocator.live == 0);
+}
+
 }  // namespace
 
 int main() {
@@ -2994,6 +3290,8 @@ int main() {
   test_dxbc_real();
   test_device_forms();
   test_sm3_and_sm51();
+  test_ps1();
+  test_device_suite();
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);
     return 1;

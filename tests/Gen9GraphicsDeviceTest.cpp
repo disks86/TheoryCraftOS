@@ -27,6 +27,7 @@
 #include "Graphics/Graphics3D/BuiltinShaders.hpp"
 #include "Graphics/Graphics3D/IntelGen9/Gen9GraphicsDevice.hpp"
 #include "Graphics/Graphics3D/Software/SoftwareDevice.hpp"
+#include "DxgkrnlDeviceSuite.hpp"
 
 using namespace hardware;
 using namespace hardware::intel_gt;
@@ -425,6 +426,18 @@ static void test_programmable_vertex() {
   for (IShaderModule* m : {gvs, gfs, bad_vs, bad_fs}) p.gpu->destroy_shader_module(m);
   p.software.destroy_shader_module(svs);
   p.software.destroy_shader_module(sfs);
+}
+
+// The kernel-mode Direct3D driver on this device: a Direct3D 9 shader pair, a pipeline and a draw, compared with the same on the software device.
+static void test_direct3d_kernel() {
+  Pair p;
+  if (!p.gpu) { CHECK(false); return; }
+  CHECK(dxgk_suite::compare(p.alloc, *p.gpu, &p.display, "Intel Gen9", 6, 260) == 0);
+  // What the adapter says of this device: textures and a stencil plane, a vertex shader of any program (it runs on the CPU) but only the two fixed pixel kernels.
+  dxgk::Kernel kernel(p.alloc);
+  CHECK(kernel.add_adapter(*p.gpu, dxgk::AdapterConfig()) == 0);
+  const dxgk::AdapterCaps& caps = kernel.adapter(0)->caps();
+  CHECK(caps.textures && caps.stencil && caps.mipmaps && caps.programmable_vertex && !caps.programmable_pixel);
 }
 
 static void test_scenes() {
@@ -1149,6 +1162,7 @@ int main() {
   test_resources();
   test_scenes();
   test_programmable_vertex();
+  test_direct3d_kernel();
   test_textures();
   test_tiling_and_mipmaps();
   test_stencil();

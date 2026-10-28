@@ -17,11 +17,13 @@
  */
 
 #include "Graphics/SystemDxg.hpp"
+#include "Kernel/Dxgkrnl/SelfTest.hpp"
 
 namespace graphics {
 
-uint32_t register_dxg_adapters(dxgk::Kernel& kernel, GraphicsPool& pool) {
+uint32_t register_dxg_adapters(dxgk::Kernel& kernel, GraphicsPool& pool, allocators::IAllocator& allocator, uint32_t* fallbacks) {
   uint32_t added = 0;
+  if (fallbacks) *fallbacks = 0;
   for (uint32_t i = 0; i < pool.count(); ++i) {
     RenderNode* node = pool.render_node(i);
     if (!node) continue;
@@ -30,7 +32,16 @@ uint32_t register_dxg_adapters(dxgk::Kernel& kernel, GraphicsPool& pool) {
     uint64_t total = 0, used = 0;
     // The budget is the GPU's own memory when it says how much it has; the integrated and virtual GPUs use system memory, for which the default budget stands.
     if (config.display && config.display->video_memory(&total, &used) && total) config.local_memory_budget = total;
-    if (kernel.add_adapter(node->device(), config) != dxgk::kInvalidIndex) ++added;
+    IGraphicsDevice* device = &node->device();
+    if (node->accelerated()) {
+      // The device draws a Direct3D triangle on a kernel of its own first (nothing of it is left behind); if it cannot, the CPU renderer is this adapter's device.
+      dxgk::Kernel probe(allocator);
+      if (probe.add_adapter(*device, config) == dxgk::kInvalidIndex || !dxgk::self_test(allocator, probe, 0)) {
+        device = &node->software_device();
+        if (fallbacks) ++*fallbacks;
+      }
+    }
+    if (kernel.add_adapter(*device, config) != dxgk::kInvalidIndex) ++added;
   }
   return added;
 }
