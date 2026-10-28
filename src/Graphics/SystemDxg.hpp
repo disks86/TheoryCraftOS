@@ -24,7 +24,8 @@
 
 namespace graphics {
 
-// Adds the adapters; returns how many were added. The pool must outlive the kernel.
-uint32_t register_dxg_adapters(dxgk::Kernel& kernel, GraphicsPool& pool);
+// Adds the adapters; returns how many were added. The pool must outlive the kernel. An accelerated GPU is first held to the Direct3D self-test (dxgk::self_test): one whose device
+// cannot draw the Direct3D 9 triangle is given the CPU renderer for Direct3D instead (counted in `*fallbacks` when it is not null).
+uint32_t register_dxg_adapters(dxgk::Kernel& kernel, GraphicsPool& pool, allocators::IAllocator& allocator, uint32_t* fallbacks = nullptr);
 
 }  // namespace graphics

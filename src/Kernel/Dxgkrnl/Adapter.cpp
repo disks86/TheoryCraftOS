@@ -83,7 +83,8 @@ PipelineObject::~PipelineObject() {
 class Adapter::StreamRunner {
  public:
   StreamRunner(Adapter& adapter, ConstByteView commands, ArrayView<const SharedPointer<Allocation>> allocations)
-      : adapter_(adapter), mm_(adapter.vidmm_), commands_(commands), allocations_(allocations) {}
+      : adapter_(adapter), mm_(adapter.vidmm_), commands_(commands), allocations_(allocations), transient_(adapter.allocator_) {}
+  ~StreamRunner() { release_transient(); }
 
   NtStatus validate(IPipelineLookup& lookup, List<SharedPointer<PipelineObject>>& pipelines) {
     exec_ = false;
@@ -142,6 +143,7 @@ class Adapter::StreamRunner {
     const bool done = ended && adapter_.device_.submit(cb_);
     adapter_.device_.destroy_command_buffer(cb_);
     cb_ = nullptr;
+    release_transient();
     return done ? status::kSuccess : status::kInvalidDeviceState;
   }
 
@@ -172,6 +174,12 @@ class Adapter::StreamRunner {
       case Op::DrawIndexed: return draw(p, true);
       case Op::CopyRegion: return copy_region(p);
       case Op::GenerateMipmaps: return generate_mipmaps(p);
+      case Op::SetTopology: {
+        const uint32_t topology = p.le32();
+        if (!exact(p) || topology > static_cast<uint32_t>(Topology::TriangleFan)) return kBad;
+        topology_ = static_cast<Topology>(topology);
+        return status::kSuccess;
+      }
     }
     return kBad;
   }
@@ -272,7 +280,7 @@ class Adapter::StreamRunner {
 
   NtStatus push_constants(ByteReader& p) {
     const uint32_t count = p.le32();
-    if (!p.ok() || count == 0 || count > graphics::kMaxPushConstantBytes || count % 16) return kBad;
+    if (!p.ok() || count == 0 || count > adapter_.caps_.max_push_constant_bytes || count % 16) return kBad;
     ConstByteView data = p.take(count);
     if (!exact(p)) return kBad;
     if (!exec_) return status::kSuccess;
@@ -363,8 +371,11 @@ class Adapter::StreamRunner {
       ByteReader in(index_->backing());
       in.skip(index_offset_ + uint64_t{first} * index_bytes_);
       int64_t highest = -1;
+      const uint32_t restart = index_bytes_ == 4 ? 0xFFFFFFFFu : 0xFFFFu;
       for (uint32_t i = 0; i < count; ++i) {
-        const int64_t v = int64_t{index_bytes_ == 4 ? in.le32() : in.le16()} + vertex_offset;
+        const uint32_t raw = index_bytes_ == 4 ? in.le32() : in.le16();
+        if (topology_ != Topology::TriangleList && raw == restart) continue;   // (ends a strip: names no vertex)
+        const int64_t v = int64_t{raw} + vertex_offset;
         if (!in.ok() || v < 0) return kBad;
         if (v > highest) highest = v;
       }
@@ -372,9 +383,82 @@ class Adapter::StreamRunner {
     }
     const NtStatus s = ensure_cb();
     if (s != status::kSuccess) return s;
+    if (topology_ != Topology::TriangleList) return draw_expanded(indexed, count, first, vertex_offset);
+    if (indexed && index_rebind_) {   // (an expanded draw left its own indices bound)
+      cb_->bind_index_buffer(index_->buffer(), index_bytes_ == 4 ? graphics::IndexType::Uint32 : graphics::IndexType::Uint16, index_offset_);
+      index_rebind_ = false;
+    }
     if (indexed) cb_->draw_indexed(count, first, vertex_offset);
     else cb_->draw(count, first);
     return status::kSuccess;
+  }
+
+  // A strip or fan as a list: the triangles are worked out from the vertex numbers (or the indices) and drawn with a buffer of indices made for this draw, which lives until the
+  // commands run. The winding of every second triangle of a strip is turned so that all face one way.
+  NtStatus draw_expanded(bool indexed, uint32_t count, uint32_t first, int32_t vertex_offset) {
+    constexpr uint64_t kMaxExpandedIndices = 3u << 20;
+    const bool fan = topology_ == Topology::TriangleFan;
+    const uint32_t restart = index_bytes_ == 4 ? 0xFFFFFFFFu : 0xFFFFu;
+    ByteBuffer out(adapter_.allocator_);
+    uint32_t run[3];   // the vertices of the strip so far (for a fan: the first, the previous and the current)
+    uint32_t seen = 0;
+    ByteReader in(indexed ? index_->backing() : ConstByteView());
+    if (indexed) in.skip(index_offset_ + uint64_t{first} * index_bytes_);
+    uint64_t emitted = 0;
+    strip_triangle_ = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+      uint32_t v;
+      if (indexed) {
+        v = index_bytes_ == 4 ? in.le32() : in.le16();
+        if (!in.ok()) return kBad;
+        if (v == restart) {
+          seen = 0;
+          strip_triangle_ = 0;
+          continue;
+        }
+      } else {
+        v = first + i;
+      }
+      if (seen < 3) {
+        run[seen++] = v;
+        if (seen < 3) continue;
+      } else if (fan) {
+        run[1] = run[2], run[2] = v;
+      } else {
+        run[0] = run[1], run[1] = run[2], run[2] = v;
+      }
+      // (in a strip the triangle at an odd position has its first two vertices swapped, so that all face one way)
+      uint32_t a = run[0], b = run[1], c = run[2];
+      if (!fan && (strip_triangle_ & 1)) {
+        const uint32_t t = a;
+        a = b, b = t;
+      }
+      ++strip_triangle_;
+      if (emitted + 3 > kMaxExpandedIndices) return kBad;
+      if (!out.put32(a) || !out.put32(b) || !out.put32(c)) return status::kNoMemory;
+      emitted += 3;
+    }
+    strip_triangle_ = 0;
+    if (emitted == 0) return status::kSuccess;
+    graphics::IBuffer* buffer = adapter_.device_.create_buffer(out.size(), graphics::kBufferIndex);
+    if (!buffer) return status::kNoMemory;
+    if (!transient_.push_back(buffer)) {
+      adapter_.device_.destroy_buffer(buffer);
+      return status::kNoMemory;
+    }
+    ByteView mapped = buffer->map();
+    if (mapped.size() < out.size()) return status::kNoMemory;
+    mapped.first(out.size()).copy_from(out.view());
+    buffer->unmap();
+    cb_->bind_index_buffer(buffer, graphics::IndexType::Uint32, 0);
+    cb_->draw_indexed(static_cast<uint32_t>(emitted), 0, indexed ? vertex_offset : 0);
+    index_rebind_ = indexed || index_ != nullptr;
+    return status::kSuccess;
+  }
+
+  void release_transient() {
+    for (graphics::IBuffer* b : transient_.view()) adapter_.device_.destroy_buffer(b);
+    transient_.clear();
   }
 
   NtStatus copy_region(ByteReader& p) {
@@ -435,6 +519,10 @@ class Adapter::StreamRunner {
   Allocation* index_ = nullptr;
   uint64_t index_offset_ = 0;
   uint32_t index_bytes_ = 2;
+  Topology topology_ = Topology::TriangleList;
+  uint32_t strip_triangle_ = 0;      // the position of the triangle being made in its strip (for the winding)
+  bool index_rebind_ = false;        // the device's bound indices are a draw's own, not the stream's
+  List<graphics::IBuffer*> transient_;   // index buffers made for expanded draws, destroyed when the commands have run
   bool texture_bound_[graphics::kMaxTextureUnits] = {};
   const Allocation* texture_alloc_[graphics::kMaxTextureUnits] = {};
 };
@@ -448,7 +536,7 @@ Adapter::Adapter(allocators::IAllocator& allocator, graphics::IGraphicsDevice& d
   caps_.max_vertex_attributes = graphics::kMaxVertexAttributes;
   caps_.max_varyings = graphics::kMaxVaryings;
   caps_.max_texture_units = graphics::kMaxTextureUnits;
-  caps_.max_push_constant_bytes = graphics::kMaxPushConstantBytes;
+  caps_.max_push_constant_bytes = info.max_push_constant_bytes < graphics::kMaxPushConstantBytes ? info.max_push_constant_bytes : graphics::kMaxPushConstantBytes;
   caps_.max_vertex_stride = kMaxVertexStride;
   caps_.accelerated = info.accelerated;
   const char* name = config.name ? config.name : info.name;
@@ -471,6 +559,24 @@ Adapter::Adapter(allocators::IAllocator& allocator, graphics::IGraphicsDevice& d
   if (graphics::IImage* image = device.create_image(probe)) {
     caps_.mipmaps = true;
     device.destroy_image(image);
+  }
+  probe.mip_levels = 1;
+  if (graphics::IImage* image = device.create_image(probe)) {
+    caps_.textures = true;
+    device.destroy_image(image);
+  }
+  // Whether the device takes shaders that are not its own fixed ones: the built-in shader with the names of the fixed kernels taken away (what is left is the function, the TGSI text
+  // and the Direct3D 9 tokens, which a device may or may not understand).
+  graphics::ShaderModuleDesc vertex = graphics::colored_vertex_shader(), fragment = graphics::colored_fragment_shader();
+  vertex.qpu_program = graphics::QpuProgram::None, vertex.eu_program = graphics::EuProgram::None;
+  fragment.qpu_program = graphics::QpuProgram::None, fragment.eu_program = graphics::EuProgram::None;
+  if (graphics::IShaderModule* module = device.create_shader_module(vertex)) {
+    caps_.programmable_vertex = true;
+    device.destroy_shader_module(module);
+  }
+  if (graphics::IShaderModule* module = device.create_shader_module(fragment)) {
+    caps_.programmable_pixel = true;
+    device.destroy_shader_module(module);
   }
 }
 
@@ -516,6 +622,7 @@ NtStatus Adapter::create_shader(const ShaderDesc& desc, SharedPointer<ShaderObje
       UniquePointer<D3d9Program> program;
       const NtStatus s = desc.kind == ShaderKind::Dxbc ? D3d9Program::compile_dxbc(allocator_, desc.code, &program) : D3d9Program::compile(allocator_, desc.code, &program);
       if (s != status::kSuccess) return s;
+      if (program->constant_bytes() > caps_.max_push_constant_bytes) return status::kNotSupported;   // (more constants than this device is given)
       // A GPU device (virgl) takes the shader as TGSI text; the others run it through the interpreter's native function. Both are given: each device uses what it understands.
       // A shader the text cannot say (see D3d9Tgsi.cpp) is still fine for the interpreter.
       const graphics::ShaderStage stage = program->stage();
@@ -560,6 +667,16 @@ NtStatus Adapter::create_shader(const ShaderDesc& desc, SharedPointer<ShaderObje
         if (kernel != FragmentKernel::None) {
           md.eu_program = kernel == FragmentKernel::Colored ? graphics::EuProgram::ColoredFragment : graphics::EuProgram::TexturedFragment;
           md.eu_varying = varying;
+          if (kernel == FragmentKernel::Colored) md.qpu_program = graphics::QpuProgram::ColoredFragment;
+        }
+      } else {
+        // The Raspberry Pi's vertex kernel is the matrix transform of the built-in shader; a Direct3D 9 shader that is exactly that runs on it (the matrix as rows if it takes dp4s).
+        uint8_t colour = 0;
+        const VertexKernel kernel = program->classify_vertex(&colour);
+        if (kernel != VertexKernel::None) {
+          md.qpu_program = graphics::QpuProgram::ColoredVertex;
+          md.qpu_matrix_rows = kernel == VertexKernel::MatrixRows;
+          md.qpu_flip_y = true;
         }
       }
       const NtStatus b = shader->d3d9_.bind(util::move(program), &md);

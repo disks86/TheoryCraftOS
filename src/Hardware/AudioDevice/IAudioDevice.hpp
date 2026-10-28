@@ -57,6 +57,10 @@ class IAudioDevice : public IHardware {
 
   virtual AudioStatistics statistics() = 0;
 
+  // The device's output has to go somewhere else now (a graphics card's HDMI / DisplayPort audio, when displays come and go): chooses again and switches over, without interrupting what is
+  // playing. True if the output is set up again; false for the many devices that have only one place to go, and for a device that is not playing.
+  virtual bool retarget() { return false; }
+
   // The recording side of the same hardware, running from initialize() until
   // shutdown(); null when the device has no input (or none this OS can use).
   virtual IAudioCapture* capture() { return nullptr; }

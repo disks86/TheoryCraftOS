@@ -131,7 +131,7 @@ class Desktop {
   MediaPlayer& media_player() { return media_player_; }
   Graphics3DTest& graphics_test() { return graphics_test_; }
   // The machine's graphics for the 3D test window (nullptr: it says there is none). They must outlive the desktop.
-  void set_graphics(graphics::SystemGraphics* graphics) { graphics_test_.set_graphics(graphics); }
+  void set_graphics(dxgk::Kernel* kernel, graphics::SystemGraphics* graphics) { graphics_test_.set_graphics(kernel, graphics); }
   // Opens the 3D test window (a spinning cube with the frame rate and whether the GPU draws it), or brings it forward.
   void open_graphics_test();
   // The machine's sound mixer, video codecs and clock for the media player (any may be nullptr). They must outlive the desktop.

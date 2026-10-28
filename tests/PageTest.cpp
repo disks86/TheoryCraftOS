@@ -2668,7 +2668,7 @@ static void test_iframe() {
     const char* expected[] = {"?q=caf%E9+%26%238359%3B", "?q=caf%C3%A9+%E2%82%A7"};
     for (int k = 0; k < 2; ++k) {
       FakeEnvironment env(a);
-      env.files["http://example.com/answer.html"] = "<p>answer</p>";
+      env.files["http://example.com/answer.html?"] = "<p>answer</p>";
       MediaEnvironment media;
       Page page(a, env, "http://example.com/", media, true);
       page.set_character_set(dom::Encoding::Windows1252);
@@ -2679,6 +2679,45 @@ static void test_iframe() {
       page.load_frames_all();
       CHECK(page_log(page) == expected[k]);
       CHECK(env.navigations.empty());
+    }
+  }
+  CHECK(a.live == 0);
+  {   // a POST into a frame shows the answer there
+    FakeEnvironment env(a);
+    env.net.answers["POST http://example.com/answer"] = {200, "Content-Type: text/html\r\n", "<p id=r>posted</p>"};
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><iframe name=out></iframe><form id=f method=post action=/answer target=out><input name=q value=1></form><script>"
+              "var i = document.querySelector('iframe'); i.onload = function () { console.log(i.contentDocument.getElementById('r').textContent) }; document.getElementById('f').submit()</script></body></html>");
+    page.load_frames_all();
+    CHECK(page_log(page) == "posted");
+    CHECK(env.posts.empty() && env.navigations.empty());
+  }
+  CHECK(a.live == 0);
+  {   // targets: a sibling frame, the top page, the parent, a new window
+    struct Case {
+      const char* target;
+      const char* log;
+      const char* navigation;
+      const char* open;
+    } cases[] = {{"b", "b loaded answer", nullptr, nullptr},
+                 {"_top", "b loaded ", "http://example.com/answer.html?", nullptr},
+                 {"_parent", "b loaded ", "http://example.com/answer.html?", nullptr},
+                 {"_blank", "b loaded ", nullptr, "http://example.com/answer.html? [_blank]"},
+                 {"nowhere", "b loaded ", nullptr, "http://example.com/answer.html? [nowhere]"}};
+    for (const Case& c : cases) {
+      FakeEnvironment env(a);
+      env.files["http://example.com/answer.html?"] = "<p>answer</p>";
+      MediaEnvironment media;
+      Page page(a, env, "http://example.com/", media, true);
+      std::string source = std::string("<html><body><iframe id=a srcdoc=\"<form id=f action=/answer.html target=") + c.target +
+                           "></form><script>document.getElementById('f').submit()</script>\"></iframe><iframe id=b name=b></iframe><script>"
+                           "var b = document.getElementById('b'); b.onload = function () { console.log('b loaded', b.contentDocument.body.textContent) }</script></body></html>";
+      page.load(source.c_str());
+      page.load_frames_all();
+      CHECK(page_log(page) == c.log);
+      CHECK(env.navigations.size() == (c.navigation ? 1u : 0u) && (!c.navigation || env.navigations[0] == c.navigation));
+      CHECK(env.opens.size() == (c.open ? 1u : 0u) && (!c.open || env.opens[0] == c.open));
     }
   }
   CHECK(a.live == 0);

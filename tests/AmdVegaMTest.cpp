@@ -32,6 +32,7 @@
 #include "FakeAmdDce11.hpp"
 #include "FakeAuxSink.hpp"
 #include "FakeAzalia.hpp"
+#include "FakeHda.hpp"
 #include "FakeI2cMonitor.hpp"
 #include "FakeAmdGfx8.hpp"
 #include "FakeAmdGmc8.hpp"
@@ -1809,6 +1810,55 @@ static void test_audio_enable() {
   CHECK(!vega.enable_audio(hdmi, ConstByteView(edid.data(), edid.size())) && !vega.disable_audio(hdmi) && azalia.writes.empty());
 }
 
+// The display driver and the sound driver together: the graphics card's HDMI / DisplayPort codec (tests/FakeHda.hpp) reports presence detect on a pin when the display side has enabled its
+// endpoint (HOT_PLUG_CONTROL.AUDIO_ENABLED) and a valid ELD once the speaker allocation is programmed (the registers of tests/FakeAzalia.hpp), so the sound driver's pin is the endpoint that
+// enable_audio() chose, and playing goes to it.
+static void test_audio_end_to_end() {
+  const std::vector<uint8_t> vbios = make_connector_vbios();
+  Rig rig;
+  FakeAzalia azalia;
+  rig.card.azalia = &azalia;
+  azalia.connectivity[1] = 0;        // only endpoint 1 has a port
+  for (uint32_t pin = 0; pin < 3; ++pin) rig.card.gfx.set_reg(0x1898 + 8 * pin, 0x2);
+  AmdVegaM vega(rig.alloc);
+  AmdVegaM::Inputs in = rig.inputs();
+  in.hpd_pins = 0x0F;
+  in.vbios = ConstByteView(vbios.data(), vbios.size());
+  CHECK(vega.bring_up(in));
+  if (!vega.up()) return;
+  const AtomConnectors::Connector hdmi = vega.connectors()[1], dp = vega.connectors()[2];
+  const std::vector<uint8_t> plain = make_edid(0);
+  const ConstByteView edid(plain.data(), plain.size());
+  // the codec's pin n is the display engine's endpoint n: presence when the endpoint is enabled, an ELD once the speaker allocation is there
+  FakeHda hda;
+  hda.sense = [&](uint32_t n) -> uint32_t {
+    if (!(azalia.value(n, 0x54) & 0x80000000u)) return 0;
+    return (1u << 31) | (azalia.value(n, 0x25) ? 1u << 30 : 0u);
+  };
+  IntelHdaAudioDevice sound(hda, rig.alloc);
+  CHECK(sound.initialize());
+  CHECK(sound.output_pin() == FakeHda::kPins[0] && !sound.output_has_display());      // nothing enabled yet
+  // the display driver enables the HDMI connector's endpoint (the first connected one: 1); the sound driver follows it
+  CHECK(vega.enable_audio(hdmi, edid));
+  CHECK(sound.retarget() && sound.output_pin() == FakeHda::kPins[1] && sound.output_has_display() && sound.output_is_digital());
+  CHECK(hda.pins[1].control == 0x40 && hda.pins[1].dip_xmit == 0xC0 && hda.pins[0].control == 0 && hda.converters[0].stream == 0x10);
+  std::vector<uint8_t> pcm(2048, 0x33);
+  CHECK(sound.write(ConstByteView(pcm.data(), pcm.size())) == 2048 && sound.queued_bytes() == 2048);
+  // the HDMI disabled, the sound driver is back to the first pin; the same endpoint serves the DisplayPort connector
+  CHECK(vega.disable_audio(hdmi) && sound.retarget() && sound.output_pin() == FakeHda::kPins[0] && !sound.output_has_display());
+  CHECK(vega.enable_audio(dp, edid) && sound.retarget() && sound.output_pin() == FakeHda::kPins[1] && sound.output_has_display());
+  // endpoint 2 (the codec's DisplayPort pin) takes over when it is the connected one
+  azalia.connectivity[1] = 1;
+  azalia.connectivity[2] = 0;
+  CHECK(vega.disable_audio(dp));
+  CHECK(vega.enable_audio(hdmi, edid) && sound.retarget() && sound.output_pin() == FakeHda::kPins[2] && sound.output_has_display() && hda.pins[1].control == 0 && hda.pins[2].control == 0x40);
+  // the speaker allocation is what makes the ELD valid: presence without it is a display of lower preference
+  azalia.set(2, 0x25, 0);
+  CHECK(sound.retarget() && sound.output_pin() == FakeHda::kPins[2] && !sound.output_has_display());
+  sound.shutdown();
+  vega.shutdown();
+}
+
 // The audio clock, the packets in the blanking and the AVI InfoFrame of dce_v11_0_afmt_setmode, in the registers of the connector's audio format block (HDMI-A: DIG 2, at +0x200; DisplayPort: DIG 3, at
 // +0x300). Register numbers and field positions are literal (from the headers), the values worked out by hand from the registers' previous contents; the previous contents are not zero, so
 // the fields written alone are seen to be.
@@ -2306,6 +2356,7 @@ int main() {
   test_audio_select();
   test_audio_enable();
   test_audio_packets();
+  test_audio_end_to_end();
   test_read_dpcd();
   test_short_pulse_status();
   printf(g_failed ? "AmdVegaMTest: %d FAILED\n" : "AmdVegaMTest: all passed\n", g_failed);

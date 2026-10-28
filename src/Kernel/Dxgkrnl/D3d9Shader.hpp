@@ -45,19 +45,30 @@ namespace dxgk {
 // the interpolated varying (first two components) with unit 0.
 enum class FragmentKernel : uint8_t { None, Colored, Textured };
 
+// Whether a vertex shader is exactly the transform the fixed vertex kernel of such a device does (the built-in coloured vertex shader: clip = M * (position, 1), the second attribute
+// to a varying), and with the matrix as columns (c0..c3 are the columns: what the built-in shader takes) or as rows (c0..c3 are what dp4 takes: the transpose).
+enum class VertexKernel : uint8_t { None, MatrixColumns, MatrixRows };
+
 class D3d9Program {
  public:
   static constexpr uint32_t kMaxTokens = 8192;
   static constexpr uint32_t kMaxInstructions = 1024;
+  static constexpr uint32_t kMaxSteps = 1u << 20;   // instructions one run may execute
   static constexpr uint32_t kPushConstantRegisters = 8;
+  static constexpr uint32_t kMaxConstantRegisters = 256;   // 4096 bytes: a program made from DXBC may declare constant buffers up to this much in all
 
   // Decodes and checks the token stream (little-endian words). kInvalidParameter for a malformed stream, kNotSupported for one that is fine but uses something not supported.
   static NtStatus compile(allocators::IAllocator& allocator, ConstByteView tokens, UniquePointer<D3d9Program>* out);
 
   // The same for a DXBC container (Shader Model 4.0 / 4.1 / 5.0 vertex and pixel shaders), see D3d9Dxbc.cpp for what maps to what.
+  // Pixel shaders of Shader Model 1 (ps_1_0 .. ps_1_4), see D3d9Ps1.cpp; compile() hands them over.
+  static NtStatus compile_ps1(allocators::IAllocator& allocator, ConstByteView tokens, UniquePointer<D3d9Program>* out);
   static NtStatus compile_dxbc(allocators::IAllocator& allocator, ConstByteView container, UniquePointer<D3d9Program>* out);
 
   graphics::ShaderStage stage() const { return stage_; }
+  // How many bytes of push constants the program reads (a Direct3D 9 program: eight registers; a DXBC one: its constant buffers laid end to end in slot order). A device whose
+  // limit is lower cannot run it.
+  uint32_t constant_bytes() const { return constant_registers_ * 16; }
   bool uses_textures() const { return uses_textures_; }
 
   // Runs the program. `attributes` are the vertex attributes by location, `constants` the 128-byte push-constant block.
@@ -70,6 +81,9 @@ class D3d9Program {
   // what the text cannot say (see D3d9Tgsi.cpp), kNoMemory.
   NtStatus emit_tgsi(String* out) const;
 
+  // For a vertex shader: whether it is the matrix transform of the fixed vertex kernel, found by running it on test vectors against the built-in shader. `colour_varying` is the varying
+  // the colour attribute goes to.
+  VertexKernel classify_vertex(uint8_t* colour_varying) const;
   // For a pixel shader: the fixed kernel it is, and the varying that kernel reads (see D3d9Devices.cpp).
   FragmentKernel classify_fragment(uint8_t* varying) const;
   // The shader as the tokens the VMware SVGA3D device wants (the vs_2_0 / ps_2_0 token stream the host runs): from the Direct3D 9 stream the program was made of. A vertex shader gets
@@ -95,6 +109,7 @@ class D3d9Program {
   graphics::ShaderStage stage_ = graphics::ShaderStage::Vertex;
   uint32_t major_ = 0, minor_ = 0;
   bool uses_textures_ = false;
+  uint32_t constant_registers_ = kPushConstantRegisters;
   List<Instruction> code_;
   struct Def {
     uint16_t number;

@@ -23,6 +23,7 @@
 //  - VMware SVGA3D takes the Direct3D 9 token stream itself, made for its conventions: emit_svga_tokens() rewrites a shader of the D3D9 contract into them (a program made from
 //    DXBC is written as such a stream first, D3d9Emit.cpp).
 #include "Kernel/Dxgkrnl/D3d9Decoded.hpp"
+#include "Graphics/Graphics3D/BuiltinShaders.hpp"
 #include "Utility/ByteStream.hpp"
 
 namespace dxgk {
@@ -46,6 +47,74 @@ bool plain_sample(const D3d9Program::Instruction& a) {
 bool plain_color_write(const D3d9Program::Instruction::Dst& d) { return d.type == kColorOut && d.mask == 0xF && !d.saturate && d.shift == 0; }
 
 }  // namespace
+
+VertexKernel D3d9Program::classify_vertex(uint8_t* colour_varying) const {
+  if (stage_ != graphics::ShaderStage::Vertex) return VertexKernel::None;
+  const graphics::ShaderModuleDesc builtin = graphics::colored_vertex_shader();
+  if (!builtin.vertex_function) return VertexKernel::None;
+  // Test vectors from a small generator; the shader has to give the built-in result for every one (and only c0..c3 may matter).
+  uint32_t seed = 0x1234567u;
+  auto next = [&]() {
+    seed = seed * 1664525u + 1013904223u;
+    return static_cast<float>(static_cast<int32_t>(seed >> 8) % 20001 - 10000) * 0.0003f;   // -3 .. 3
+  };
+  bool columns = true, rows = true;
+  bool slot_ok[graphics::kMaxVaryings];
+  for (bool& ok : slot_ok) ok = true;
+  for (uint32_t probe = 0; probe < 12; ++probe) {
+    float matrix[16];
+    for (float& m : matrix) m = next();
+    float transposed[16];
+    for (uint32_t r = 0; r < 4; ++r)
+      for (uint32_t c = 0; c < 4; ++c) transposed[4 * c + r] = matrix[4 * r + c];
+    // (the built-in shader reads the push constants as the columns of M; a shader using the rows is given the transpose and must give the same result)
+    uint8_t as_columns[graphics::kMaxPushConstantBytes] = {}, as_rows[graphics::kMaxPushConstantBytes] = {};
+    for (uint32_t i = 0; i < 16; ++i) {
+      const uint32_t a = __builtin_bit_cast(uint32_t, matrix[i]), b = __builtin_bit_cast(uint32_t, transposed[i]);
+      for (uint32_t k = 0; k < 4; ++k) {
+        as_columns[4 * i + k] = static_cast<uint8_t>(a >> (8 * k));
+        as_rows[4 * i + k] = static_cast<uint8_t>(b >> (8 * k));
+      }
+    }
+    // c4..c7 get values too: a shader that depends on them is not the kernel.
+    for (uint32_t i = 16; i < 32; ++i) {
+      const uint32_t a = __builtin_bit_cast(uint32_t, next());
+      for (uint32_t k = 0; k < 4; ++k) {
+        as_columns[4 * i + k] = as_rows[4 * i + k] = static_cast<uint8_t>(a >> (8 * k));
+      }
+    }
+    graphics::Vec4 attributes[graphics::kMaxVertexAttributes];
+    for (graphics::Vec4& a : attributes) a = {next(), next(), next(), next()};
+    attributes[0].w = 1.0f;   // (a float3 position: the device supplies w = 1)
+    graphics::ShaderIo want = {}, got_columns = {}, got_rows = {};
+    builtin.vertex_function(attributes, as_columns, &want);
+    run_vertex(attributes, as_columns, &got_columns);
+    run_vertex(attributes, as_rows, &got_rows);
+    auto same = [](const graphics::Vec4& x, const graphics::Vec4& y) {
+      auto close = [](float p, float q) {
+        const float d = p > q ? p - q : q - p;
+        const float m = (p < 0 ? -p : p) + (q < 0 ? -q : q);
+        return d <= 1e-4f + 1e-4f * m;
+      };
+      return close(x.x, y.x) && close(x.y, y.y) && close(x.z, y.z) && close(x.w, y.w);
+    };
+    // The shader is written for Direct3D's clip space (+Y up) and run_vertex flips Y for the device, so its own result is that with Y back; the kernel is told to flip Y when it loads
+    // the matrix (qpu_flip_y). `want` was made from M given as columns; a shader written for rows sees the transpose and has to give the same.
+    const graphics::Vec4 own_columns = {got_columns.position.x, -got_columns.position.y, got_columns.position.z, got_columns.position.w};
+    const graphics::Vec4 own_rows = {got_rows.position.x, -got_rows.position.y, got_rows.position.z, got_rows.position.w};
+    columns = columns && same(own_columns, want.position);
+    rows = rows && same(own_rows, want.position);
+    for (uint32_t v = 0; v < graphics::kMaxVaryings; ++v) {
+      slot_ok[v] = slot_ok[v] && same(got_columns.varying[v], attributes[1]);
+    }
+  }
+  int slot = -1;
+  for (uint32_t v = 0; v < graphics::kMaxVaryings && slot < 0; ++v)
+    if (slot_ok[v]) slot = static_cast<int>(v);
+  if (slot < 0 || (!columns && !rows)) return VertexKernel::None;
+  *colour_varying = static_cast<uint8_t>(slot);
+  return columns ? VertexKernel::MatrixColumns : VertexKernel::MatrixRows;
+}
 
 FragmentKernel D3d9Program::classify_fragment(uint8_t* varying) const {
   if (stage_ != graphics::ShaderStage::Fragment) return FragmentKernel::None;
@@ -76,7 +145,15 @@ FragmentKernel D3d9Program::classify_fragment(uint8_t* varying) const {
 
 NtStatus D3d9Program::emit_svga_tokens(ConstByteView original, List<uint32_t>* out) const {
   const bool vertex = stage_ == graphics::ShaderStage::Vertex;
-  if (!(((major_ == 2 || major_ == 3) && minor_ == 0) || (major_ == 1 && minor_ == 1)) || original.size() < 8 || original.size() % 4) return status::kNotSupported;   // (a DXBC program has major 4 or 5)
+  if (!(((major_ == 2 || major_ == 3) && minor_ == 0) || (major_ == 1 && (vertex ? minor_ == 1 : minor_ <= 4))) || original.size() < 8 || original.size() % 4) return status::kNotSupported;   // (a DXBC program has major 4 or 5)
+  if (!vertex && major_ == 1) {
+    // (a ps_1_x stream goes as it is: the device takes the model as it takes the others, and a pixel shader needs no declarations of its own)
+    ByteReader all(original);
+    while (!all.at_end()) {
+      if (!out->push_back(all.le32())) return status::kNoMemory;
+    }
+    return status::kSuccess;
+  }
   uint32_t temporaries = 0;
   for (const Instruction& ins : code_.view()) {
     if (ins.dst.type == kTemp && ins.dst.number + 1u > temporaries && d3d9_op_writes_register(ins.op)) temporaries = ins.dst.number + 1u;

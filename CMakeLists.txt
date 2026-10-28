@@ -442,6 +442,8 @@ add_executable(BOOTX64
   src/Kernel/Dxgkrnl/D3d9Shader.cpp
   src/Kernel/Dxgkrnl/D3d9Tgsi.cpp
   src/Kernel/Dxgkrnl/D3d9Dxbc.cpp
+  src/Kernel/Dxgkrnl/D3d9Ps1.cpp
+  src/Kernel/Dxgkrnl/SelfTest.cpp
   src/Kernel/Dxgkrnl/D3d9Devices.cpp
   src/Kernel/Dxgkrnl/D3d9Emit.cpp
   src/Kernel/Dxgkrnl/Adapter.cpp
@@ -486,6 +488,7 @@ add_executable(BOOTX64
   src/Desktop/Paint.cpp
   src/Desktop/MediaPlayer.cpp
   src/Desktop/Graphics3DTest.cpp
+  src/Desktop/CubeRenderer.cpp
   src/SystemMonitor.cpp
   src/SystemInventory.cpp
   src/SystemNetworkDetails.cpp
