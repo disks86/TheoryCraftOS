@@ -44,6 +44,7 @@
 #include "Desktop/Desktop.hpp"
 #include "Graphics/Graphics3D/WebGlAccelerator.hpp"
 #include "Graphics/GraphicsPool.hpp"
+#include "Graphics/SystemDxg.hpp"
 #include "Graphics/SystemGraphics.hpp"
 #include "WebGl/Accelerator.hpp"
 #include "Hardware/ImageSignalProcessor/SystemImageSignalProcessor.hpp"
@@ -577,6 +578,11 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   graphics::GraphicsPool graphics_pool(gpu_pool, system_graphics, shared_allocator);
   if (graphics_pool.count() > 1)
     Entry(Level::Info, "Graphics").dec(graphics_pool.count()).text(" GPUs, ").dec(graphics_pool.accelerated_count()).text(" with a 3D engine");
+  // The kernel half of Direct3D (what a Windows program's D3D runtime reaches through the D3DKMT system calls): one adapter per GPU of the pool.
+  dxgk::Kernel dxg_kernel(shared_allocator);
+  const uint32_t dxg_adapters = graphics::register_dxg_adapters(dxg_kernel, graphics_pool);
+  dxgk::set_system_kernel(&dxg_kernel);
+  Entry(Level::Ok, "Direct3D").text("kernel mode driver: ").dec(dxg_adapters).text(" adapter(s)");
   // WebGL and WebGPU draw on the 3D hardware when there is some (and on the CPU rasterizer in src/WebGl when there is not, or for a draw the hardware cannot do).
   graphics::WebGlAccelerator web_accelerator(system_graphics.device(), shared_allocator);
   if (system_graphics.accelerated()) webgl::set_accelerator(&web_accelerator);

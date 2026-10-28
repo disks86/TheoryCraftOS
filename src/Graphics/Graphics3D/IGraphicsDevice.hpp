@@ -188,6 +188,9 @@ struct ShaderModuleDesc {
   QpuProgram qpu_program = QpuProgram::None;
   // The same for the Intel Gen9 device: the coloured-vertex pipeline of BuiltinShaders (the vertex transform runs on the CPU there).
   EuProgram eu_program = EuProgram::None;
+  // With a ColoredFragment / TexturedFragment eu_program: which of the vertex shader's varyings the kernel reads (the colour, or the texture coordinate in its first two components).
+  // A vertex shader with a vertex_function (and no eu_program) is run on the CPU by that device.
+  uint8_t eu_varying = 0;
 };
 
 class IShaderModule {
