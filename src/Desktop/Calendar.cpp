@@ -27,7 +27,7 @@ namespace {
 const char* const kMonths[12] = {"January", "February", "March",     "April",   "May",      "June",
                                  "July",    "August",   "September", "October", "November", "December"};
 const char* const kWeekdayNames[7] = {"Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"};
-constexpr int32_t kGap = 6, kRowHeight = 24, kLabelHeight = 22, kRightWidth = 300;
+constexpr int32_t kGap = 6, kRowHeight = 24, kLabelHeight = 22, kRightWidth = 330;
 
 Rect2D rect(int32_t x, int32_t y, int32_t width, int32_t height) {
   return {x, y, static_cast<uint32_t>(width > 0 ? width : 0), static_cast<uint32_t>(height > 0 ? height : 0)};
@@ -122,10 +122,11 @@ bool MonthGrid::on_key(const KeyArgs& args) {
 
 Calendar::Calendar(allocators::IAllocator& allocator)
     : Frame(allocator), day_label_(allocator), title_label_(allocator), time_label_(allocator), colon_label_(allocator), length_label_(allocator), remind_label_(allocator),
-      status_(allocator), grid_(allocator), list_(allocator), title_(allocator), hour_(allocator), minute_(allocator), length_(allocator), remind_(allocator), add_(allocator),
+      repeat_label_(allocator), every_label_(allocator), status_(allocator), grid_(allocator), list_(allocator), title_(allocator), hour_(allocator), minute_(allocator),
+      length_(allocator), remind_(allocator), every_(allocator), all_day_(allocator), until_check_(allocator), repeat_(allocator), until_(allocator), add_(allocator),
       update_(allocator), delete_(allocator), today_button_(allocator), ids_(allocator) {
   set_title("Calendar");
-  set_bounds({120, 70, 640, 420});
+  set_bounds({100, 40, 670, 500});
   set_padding(Insets::all(6));
   set_minimize_enabled(true);
 
@@ -134,6 +135,14 @@ Calendar::Calendar(allocators::IAllocator& allocator)
   colon_label_.set_text(":");
   length_label_.set_text("Length (minutes)");
   remind_label_.set_text("Remind (minutes before)");
+  repeat_label_.set_text("Repeat");
+  every_label_.set_text("every");
+  all_day_.set_text("All day");
+  until_check_.set_text("Until");
+  static const char* const kRepeatNames[] = {"Does not repeat", "Daily", "Weekly", "Monthly", "Yearly"};
+  for (const char* name : kRepeatNames) repeat_.add_item(name);
+  repeat_.set_selected_index(0);
+  every_.set_range(1, static_cast<int32_t>(Recurrence::kMaxEvery));
   add_.set_text("Add");
   update_.set_text("Save");
   delete_.set_text("Delete");
@@ -150,7 +159,8 @@ Calendar::Calendar(allocators::IAllocator& allocator)
   length_.set_value(60);
   remind_.set_value(10);
   list_.add_column("Time", 64);
-  list_.add_column("Title", 200);
+  list_.add_column("Title", 150);
+  list_.add_column("Repeats", 80);
   list_.set_view_mode(ViewMode::Details);
   list_.set_copy_enabled(false);
 
@@ -160,11 +170,44 @@ Calendar::Calendar(allocators::IAllocator& allocator)
   update_.on_click({&Calendar::on_update, this});
   delete_.on_click({&Calendar::on_delete, this});
   today_button_.on_click({&Calendar::on_today, this});
+  all_day_.on_changed({&Calendar::on_form_changed, this});
+  repeat_.on_selection_changed({&Calendar::on_form_changed, this});
+  until_check_.on_changed({&Calendar::on_form_changed, this});
 
   Control* const parts[] = {&grid_, &today_button_, &day_label_, &list_, &title_label_, &title_, &time_label_, &hour_, &colon_label_, &minute_,
-                            &length_label_, &length_, &remind_label_, &remind_, &add_, &update_, &delete_, &status_};
+                            &length_label_, &length_, &remind_label_, &remind_, &all_day_, &repeat_label_, &repeat_, &every_label_, &every_, &until_check_, &until_, &add_, &update_, &delete_, &status_};
   for (Control* part : parts) add(part);
+  update_form();
   select_date(grid_.selected());
+}
+
+void Calendar::update_form() {
+  const bool all_day = all_day_.checked(), repeats = repeat_.selected_index() > 0;
+  hour_.set_enabled(!all_day);
+  minute_.set_enabled(!all_day);
+  length_.set_enabled(!all_day);
+  every_.set_enabled(repeats);
+  until_check_.set_enabled(repeats);
+  until_.set_enabled(repeats && until_check_.checked());
+}
+
+void Calendar::on_form_changed(void* self, Control&) { static_cast<Calendar*>(self)->update_form(); }
+
+uint32_t Calendar::form_minutes() const { return all_day_.checked() ? static_cast<uint32_t>(kMinutesPerDay) : static_cast<uint32_t>(length_.value()); }
+
+bool Calendar::form_recurrence(Recurrence* out) {
+  const int32_t kind = repeat_.selected_index();
+  out->kind = kind > 0 && kind <= static_cast<int32_t>(Repeat::Yearly) ? static_cast<Repeat>(kind) : Repeat::None;
+  out->every = out->kind == Repeat::None ? 1 : static_cast<uint32_t>(every_.value());
+  out->until_day = -1;
+  if (out->kind != Repeat::None && until_check_.checked()) {
+    out->until_day = days_from_date(until_.date());
+    if (out->until_day < days_from_date(grid_.selected())) {
+      say("The last day is before the appointment.");
+      return false;
+    }
+  }
+  return true;
 }
 
 void Calendar::set_store(CalendarStore* store) {
@@ -221,8 +264,9 @@ void Calendar::refresh() {
       if (!store_->get(id, &e)) continue;
       const int32_t m = minute_of_day(e.start);
       const char time[6] = {static_cast<char>('0' + m / 600), static_cast<char>('0' + m / 60 % 10), ':', static_cast<char>('0' + m % 60 / 10), static_cast<char>('0' + m % 10), 0};
-      const StringView cells[2] = {StringView(time, 5), e.title.view()};
-      list_.add_item(cells, 2, ItemIcon::File);
+      static const char* const kRepeats[] = {"", "Daily", "Weekly", "Monthly", "Yearly"};
+      const StringView cells[3] = {e.all_day() ? StringView("All day") : StringView(time, 5), e.title.view(), StringView(kRepeats[static_cast<uint8_t>(e.recurrence.kind)])};
+      list_.add_item(cells, 3, ItemIcon::File);
     }
   }
   int32_t again = -1;
@@ -241,11 +285,17 @@ void Calendar::select_event(int32_t index) {
   const int32_t m = minute_of_day(e.start);
   hour_.set_value(m / 60);
   minute_.set_value(m % 60);
-  length_.set_value(static_cast<int32_t>(e.minutes));
+  length_.set_value(e.all_day() ? 60 : static_cast<int32_t>(e.minutes));
   remind_.set_value(static_cast<int32_t>(e.remind_before));
+  all_day_.set_checked(e.all_day());
+  repeat_.set_selected_index(static_cast<int32_t>(e.recurrence.kind));
+  every_.set_value(static_cast<int32_t>(e.recurrence.every));
+  until_check_.set_checked(e.recurrence.until_day >= 0);
+  if (e.recurrence.until_day >= 0) until_.set_date(date_from_days(e.recurrence.until_day));
+  update_form();
 }
 
-int64_t Calendar::form_start() const { return local_minutes(grid_.selected(), hour_.value(), minute_.value()); }
+int64_t Calendar::form_start() const { return all_day_.checked() ? local_minutes(grid_.selected(), 0, 0) : local_minutes(grid_.selected(), hour_.value(), minute_.value()); }
 
 bool Calendar::add_event() {
   UiGuard lock(this);
@@ -253,7 +303,9 @@ bool Calendar::add_event() {
     say(store_ ? "Give the appointment a title." : "There is no storage for appointments.");
     return false;
   }
-  if (!store_->add(form_start(), static_cast<uint32_t>(length_.value()), static_cast<uint32_t>(remind_.value()), title_.text())) {
+  Recurrence recurrence;
+  if (!form_recurrence(&recurrence)) return false;
+  if (!store_->add(form_start(), form_minutes(), static_cast<uint32_t>(remind_.value()), title_.text(), recurrence)) {
     say("The appointment could not be saved.");
     return false;
   }
@@ -270,7 +322,9 @@ bool Calendar::update_event() {
     say(!id ? "Choose an appointment first." : "Give the appointment a title.");
     return false;
   }
-  if (!store_->update(id, form_start(), static_cast<uint32_t>(length_.value()), static_cast<uint32_t>(remind_.value()), title_.text())) {
+  Recurrence recurrence;
+  if (!form_recurrence(&recurrence)) return false;
+  if (!store_->update(id, form_start(), form_minutes(), static_cast<uint32_t>(remind_.value()), title_.text(), recurrence)) {
     say("The appointment could not be saved.");
     return false;
   }
@@ -318,7 +372,7 @@ void Calendar::layout() {
   int32_t y = top;
   place(day_label_, rect(x, y, w, kLabelHeight));
   y += kLabelHeight + 2;
-  const int32_t form_height = 4 * (kRowHeight + 4) + 30 + kGap;
+  const int32_t form_height = 7 * (kRowHeight + 4) + 30 + kGap;
   const int32_t list_height = height - (y - top) - form_height;
   place(list_, rect(x, y, w, list_height > 60 ? list_height : 60));
   y += (list_height > 60 ? list_height : 60) + kGap;
@@ -335,6 +389,16 @@ void Calendar::layout() {
   y += kRowHeight + 4;
   place(remind_label_, rect(x, y, 23 * 8 + 8, kRowHeight));
   place(remind_, rect(x + 23 * 8 + 8, y, 76, kRowHeight));
+  y += kRowHeight + 4;
+  place(all_day_, rect(x + 48, y, 100, kRowHeight));
+  y += kRowHeight + 4;
+  place(repeat_label_, rect(x, y, 56, kRowHeight));
+  place(repeat_, rect(x + 56, y, 140, kRowHeight));
+  place(every_label_, rect(x + 204, y, 48, kRowHeight));
+  place(every_, rect(x + 252, y, 64, kRowHeight));
+  y += kRowHeight + 4;
+  place(until_check_, rect(x + 56, y, 64, kRowHeight));
+  place(until_, rect(x + 124, y, 140, kRowHeight));
   y += kRowHeight + 6;
   place(add_, rect(x, y, 80, 26));
   place(update_, rect(x + 86, y, 80, 26));

@@ -6427,6 +6427,65 @@ static void test_calendar() {
   CHECK(a.live == 0);
 }
 
+// Birthdays and holidays: all-day appointments that repeat, made with the form.
+static void test_calendar_recurrence() {
+  TestAllocator a;
+  {
+    filesystem::RamFileSystem fs(a);
+    g_calendar_now = {2026, 3, 13, 22, 0};
+    {
+      Screen screen(a, 1000, 700);
+      desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+      d.set_clock_source(&calendar_clock, nullptr);
+      d.set_file_system(&fs);
+      desktop::Calendar* c = d.open_calendar();
+      auto* h = static_cast<gui::TabFrame*>(c->host());
+      put(h, {20, 20, 700, 500});
+      d.window().layout();
+      CHECK(c->repeat_box().item_count() == 5 && !c->every_box().enabled() && c->hour_box().enabled());
+
+      c->select_date({2026, 3, 14});
+      c->title_box().set_text("Ada's birthday");
+      c->all_day_box().set_checked(true);
+      CHECK(!c->hour_box().enabled() && !c->minute_box().enabled() && !c->length_box().enabled());
+      c->repeat_box().set_selected_index(4);   // Yearly
+      CHECK(c->every_box().enabled() && c->until_check().enabled() && !c->until_box().enabled());
+      c->remind_box().set_value(0);
+      CHECK(c->add_event() && c->event_count() == 1);
+      String text(a);
+      CHECK(c->list().item_text(0, 0, &text) && text.view().equals("All day"));
+      CHECK(c->list().item_text(0, 2, &text) && text.view().equals("Yearly"));
+
+      // It is on that day in other years, and only that day.
+      c->select_date({2031, 3, 14});
+      CHECK(c->event_count() == 1);
+      c->select_date({2031, 3, 15});
+      CHECK(c->event_count() == 0);
+      c->select_date({2025, 3, 14});
+      CHECK(c->event_count() == 0);   // (before the first one)
+
+      // A last day before the appointment is refused; a weekly one with a last day stops there.
+      c->select_date({2026, 4, 1});
+      c->title_box().set_text("Class");
+      c->all_day_box().set_checked(false);
+      c->hour_box().set_value(18);
+      c->repeat_box().set_selected_index(2);   // Weekly
+      c->until_check().set_checked(true);
+      c->until_box().set_date({2026, 3, 1});
+      CHECK(!c->add_event() && c->status().equals("The last day is before the appointment.") && c->event_count() == 0);
+      c->until_box().set_date({2026, 4, 30});
+      CHECK(c->add_event() && c->event_count() == 1);
+      c->select_date({2026, 4, 29});
+      CHECK(c->event_count() == 1);
+      c->select_date({2026, 5, 6});
+      CHECK(c->event_count() == 0);
+      c->select_date({2026, 4, 30});
+      CHECK(c->event_count() == 0);   // (Wednesdays)
+    }
+  }
+  CHECK(a.live == 0);
+}
+
 // The file explorer's Copy, Paste and Select All, and the properties window with the format-specific rows.
 static void put_bytes(filesystem::IFileSystem& fs, const char* path, ConstByteView bytes) {
   UniquePointer<filesystem::IFile> file;
@@ -7900,6 +7959,7 @@ int main() {
   test_explorer_copy_paste_properties();
   test_calculator_session();
   test_calendar();
+  test_calendar_recurrence();
   test_media_player();
   if (g_failed) { printf("%d checks failed\n", g_failed); return 1; }
   printf("gui views: all checks passed\n");
