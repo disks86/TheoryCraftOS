@@ -15,7 +15,7 @@ named in [`src/FileSystem/SystemLayout.hpp`](../src/FileSystem/SystemLayout.hpp)
 | `/Desktop/Audio` | Default location for audio files such as music. |
 | `/Windows` | Root for Windows user-mode processes: they see its contents as `C:\`. `/Windows/Windows/System32` (`C:\Windows\System32`) holds the system libraries (`ntdll.dll`, `kernel32.dll`, `msvcrt.dll`, `advapi32.dll`, `ws2_32.dll` and stub-only user32, gdi32, ... see [WindowsUserMode.md](WindowsUserMode.md)), which the loader reads from there (the kernel does not carry them); any other DLL or program put there is found the same way. `/Windows/Windows/System32/config` (`C:\Windows\System32\config`) is where `advapi32.dll` keeps the registry, a directory per key and a file per value (see [WindowsUserMode.md](WindowsUserMode.md)). |
 | `/Linux` | Root for Linux processes: they see its contents as `/`. |
-| `/AppStore` | Where applications keep the files they need. Each application has its own sub-folder, e.g. the browser's cache is `/AppStore/Browser/Cache`. |
+| `/AppStore` | Where applications keep the files they need. Each application has its own sub-folder, e.g. the browser's cache is `/AppStore/Browser/Cache` and the calendar's appointments are `/AppStore/Calendar/calendar.db`. |
 
 ## Inside `/Windows` and `/Linux`
 

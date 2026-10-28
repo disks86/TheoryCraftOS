@@ -57,6 +57,9 @@ inline constexpr const char* kAppStore = "/AppStore";
 // The system database: where the OS and its programs keep their settings (the "System" application's folder in the AppStore).
 inline constexpr const char* kSystemDatabase = "/AppStore/System/system.db";
 
+// The calendar application's appointments (the "Calendar" application's folder in the AppStore).
+inline constexpr const char* kCalendarDatabase = "/AppStore/Calendar/calendar.db";
+
 // The name the EFI system partition is mounted under (the folder "/EFI").
 inline constexpr const char* kEfiMountName = "EFI";
 

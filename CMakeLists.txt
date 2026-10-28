@@ -444,6 +444,8 @@ add_executable(BOOTX64
   src/Desktop/Shell.cpp
   src/Desktop/Terminal.cpp
   src/Desktop/Calculator.cpp
+  src/Desktop/Calendar.cpp
+  src/Desktop/CalendarStore.cpp
   src/Desktop/FileProperties.cpp
   src/Desktop/CopyProgressDialog.cpp
   src/Desktop/DirectoryListing.cpp
