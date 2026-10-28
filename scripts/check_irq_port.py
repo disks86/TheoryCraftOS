@@ -89,7 +89,7 @@ def main():
             fail('AmdIrq.cpp lacks ' + expr)
 
     check_sq(gfx, gfx_d, gfx_m, cpp)
-    check_display(dce_c, vid_h, hpp, cpp)
+    check_display(dce_c, vid_h, hpp, cpp, ivs)
     check_video(ivs, uvd_c, vce_c, vce_d, vce_m, hpp, cpp)
     check_enables(gfx, sdma, gmc_c)
     check_ecc_and_sq_enables(gfx, gfx_m)
@@ -148,7 +148,7 @@ def check_video(ivs, uvd, vce, vce_d, vce_m, hpp, cpp):
         fail('AmdVce3.cpp does not enable the trap interrupt')
 
 
-def check_display(dce, vid, hpp, cpp):
+def check_display(dce, vid, hpp, cpp, ivs):
     """The display interrupts: source ids and data decoding of dce_v11_0.c against AmdIrq, the acknowledgements and pin set-up against AmdDce11.cpp (whose register numbers are generated
     from the headers), and the register block offsets of vid.h."""
     dcpp = open(os.path.join(ROOT, 'AmdDce11.cpp')).read()
@@ -159,6 +159,18 @@ def check_display(dce, vid, hpp, cpp):
     ours = {m.group(1): int(m.group(2)) for m in re.finditer(r'\b(kSrc\w+) = (\d+)', hpp)}
     if ours.get('kSrcDisplayCrtcFirst') != 1 or ours.get('kSrcPageFlipLast') != 18:
         fail('display source id range')
+    # the DisplayPort short pulse: source 42 with extended ids 6..11 (VISLANDS30_IV_SRCID_HPD_RX_A..F, EXTID_HPD_RX_A..F), classified as pins 0..5
+    for letter, n in zip('ABCDEF', range(6, 12)):
+        if define(ivs, 'VISLANDS30_IV_SRCID_HPD_RX_' + letter) != 42 or define(ivs, 'VISLANDS30_IV_EXTID_HPD_RX_' + letter) != n:
+            fail('HPD_RX_' + letter)
+    first = re.search(r'kDataHpdRxFirst = (\d+)', hpp)
+    if not first or int(first.group(1)) != 6 or 'vector.src_data - kDataHpdRxFirst' not in cpp:
+        fail('the short pulse decoding')
+    for field in ('DC_HPD_RX_INT_EN', 'DC_HPD_RX_INT_ACK'):
+        if 'DC_HPD_INT_CONTROL, ' + field not in dcpp:
+            fail(field + ' is not used with DC_HPD_INT_CONTROL')
+    if 'DC_HPD_INT_STATUS__DC_HPD_RX_INT_STATUS_MASK' not in dcpp:
+        fail('the short pulse status bit')
     # (the pageflip source ids start at VISLANDS30_IV_SRCID_D1_GRPH_PFLIP, the hot plug at HOTPLUG_DETECT_A: read from the ivsrcid header by the checks above for the others)
     crtc = function_body(dce, 'dce_v11_0_crtc_irq')
     if 'unsigned crtc = entry->src_id - 1;' not in crtc or 'case 0: /* vblank */' not in crtc or 'case 1: /* vline */' not in crtc:

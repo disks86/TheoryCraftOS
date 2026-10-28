@@ -156,6 +156,12 @@ class Interrupts {
   void hpd_fini(uint32_t pin);
   void hpd_set_interrupt(uint32_t pin, bool enable);   // DC_HPD_INT_EN alone (dce_v11_0_set_hpd_irq_state)
   bool hpd_sense(uint32_t pin);                        // dce_v11_0_hpd_sense: something is connected
+  // The short pulse of a DisplayPort sink (a status change that is not a plug: link loss, a request to retest): DC_HPD_INT_CONTROL.DC_HPD_RX_INT_EN, the pending state in
+  // DC_HPD_INT_STATUS.DC_HPD_RX_INT_STATUS and DC_HPD_INT_CONTROL.DC_HPD_RX_INT_ACK. (The kernel's own amdgpu display code, dce_v11_0, does not use it; the registers are the
+  // DC code's, see the documentation.) hpd_init does not switch it on, hpd_fini switches it off.
+  void hpd_rx_set_interrupt(uint32_t pin, bool enable);
+  bool hpd_rx_asserted(uint32_t pin);
+  void ack_hpd_rx(uint32_t pin);
   void hpd_set_polarity(uint32_t pin);                 // interrupt on the next change from what is sensed now
 
   // What a handler does with a vector: whether the interrupt was asserted (DISP_INTERRUPT_STATUS*), and the acknowledgement. False if the controller or pin does not exist.
