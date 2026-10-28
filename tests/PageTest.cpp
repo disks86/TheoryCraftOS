@@ -2663,6 +2663,25 @@ static void test_iframe() {
     CHECK(page_log(page) == "true true inner 2 3 | 42 42 true c true | changed T a,b true false | InvalidCharacterError true | from parent 7 true 0");
   }
   CHECK(a.live == 0);
+  {   // a form with a target submits into the frame of that name, in the encoding of the page (or of its accept-charset)
+    const char* accept[] = {"", " accept-charset=utf-8"};
+    const char* expected[] = {"?q=caf%E9+%26%238359%3B", "?q=caf%C3%A9+%E2%82%A7"};
+    for (int k = 0; k < 2; ++k) {
+      FakeEnvironment env(a);
+      env.files["http://example.com/answer.html"] = "<p>answer</p>";
+      MediaEnvironment media;
+      Page page(a, env, "http://example.com/", media, true);
+      page.set_character_set(dom::Encoding::Windows1252);
+      std::string source = std::string("<html><body><iframe name=out></iframe><form id=f action=/answer.html target=out") + accept[k] +
+                           "><input name=q value='caf\xC3\xA9 \xE2\x82\xA7'></form><script>var i = document.querySelector('iframe'); "
+                           "i.onload = function () { console.log(i.contentWindow.location.search) }; document.getElementById('f').submit()</script></body></html>";
+      page.load(source.c_str());
+      page.load_frames_all();
+      CHECK(page_log(page) == expected[k]);
+      CHECK(env.navigations.empty());
+    }
+  }
+  CHECK(a.live == 0);
   {   // following a link in a frame moves the frame
     FakeEnvironment env(a);
     env.files["http://example.com/next.html"] = "<p>the next page</p>";
@@ -6101,6 +6120,7 @@ static int run_real_wpt(const char* root, const char* file) {
     }
     page.load(html.c_str());
     for (int i = 0; i < 20000; ++i) {
+      page.load_frames_all();   // (what the desktop does when it draws: frames that were pointed somewhere load, and tell the page)
       double due;
       if (!page.next_timer(&due)) break;
       if (due > env.clock) env.clock = static_cast<uint64_t>(due);

@@ -226,6 +226,15 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
   // writes the select field: enabling the endpoint (the hot plug control's AUDIO_ENABLED), the ELD and the audio clock are not done.
   bool select_audio_pin(const AtomConnectors::Connector& connector);
   uint32_t select_audio_pins();
+  // dce_v11_0_afmt_setmode's audio part: the endpoint of the connector (audio_pin_for) is disabled, given the monitor's speaker allocation, selected by the connector's audio format block
+  // (select_audio_pin), given its Short Audio Descriptors and its lip sync latency (`interlaced`: the mode's), and enabled (HOT_PLUG_CONTROL.AUDIO_ENABLED) - the hardware makes the ELD that the
+  // sound driver reads from those. `edid` is the whole EDID of the monitor (a missing or CTA-less one gives stereo speakers and no descriptors, as the driver does). The variant without an
+  // EDID reads it over the connector's DDC or AUX channel (read_edid) and is false if that fails. False also when the connector has no audio block or no endpoint is connected: nothing is
+  // written then. Not done: the audio clock (the DTO), the audio packets and the infoframes of dce_v11_0_afmt_setmode, so the endpoint is enabled but no sound is sent yet.
+  bool enable_audio(const AtomConnectors::Connector& connector, ConstByteView edid, bool interlaced = false);
+  bool enable_audio(const AtomConnectors::Connector& connector, bool interlaced = false);
+  // dce_v11_0_audio_enable(pin, false) for the endpoint the connector's block has selected. False if the connector has no audio block.
+  bool disable_audio(const AtomConnectors::Connector& connector);
 
   // Recovery. An engine that timed out on a fence or reported a fault is wedged: nothing more is queued on it. recover() resets the ones that are - the graphics engine with its
   // compute queues (AmdGfx8::recover) if the graphics ring or a compute queue is wedged, and the SDMA engines (AmdSdma3::recover) if one is - and brings them back with empty

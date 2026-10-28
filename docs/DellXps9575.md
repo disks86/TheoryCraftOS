@@ -752,8 +752,31 @@ endpoints are read again (`refresh_audio_pins`, as `dce_v11_0_audio_get_pin` doe
 displays apart), and the field is written; false for a connector with no audio block (the eDP panel, a DIG 6 transmitter, no encoder in the table) or when no endpoint is connected, and then nothing is written.
 `select_audio_pins()` does it for every HDMI and DisplayPort connector with a display on its hot plug pin and returns how many. Nothing calls it by itself: a desktop that sets up audio calls it when a display appears.
 
-Not done, as in the driver's function alone: enabling the endpoint (`AZALIA_F0_CODEC_PIN_CONTROL_HOT_PLUG_CONTROL.AUDIO_ENABLED`, `dce_v11_0_audio_enable`), the audio clock and sample rate (`dce_v11_0_afmt_setmode`'s ACR and
-audio packets), the ELD from the EDID (speaker allocation, SADs, latency), and any audio output to play through. `scripts/check_afmt_port.py <dce_v11_0.c> <vid.h> <dce_11_2_d.h> <dce_11_2_sh_mask.h>` checks the
+Not done here (the next section does the endpoint): the audio clock and sample rate (`dce_v11_0_afmt_setmode`'s DTO and ACR), the audio packets and infoframes, and any audio output to play through. `scripts/check_afmt_port.py <dce_v11_0.c> <vid.h> <dce_11_2_d.h> <dce_11_2_sh_mask.h>` checks the
 read-modify-write against the driver's function, the register and field numbers (the generated `AmdDce11Registers.inc`), the DIG offsets, `afmt[i]->offset = dig_offsets[i]`, `num_dig` of CHIP_VEGAM and the pin ids. Tested
 by `AmdVegaMTest::test_audio_select` (the XPS-like board: HDMI on DIG 2 and DisplayPort on DIG 3 get the first connected endpoint with the other bits and blocks untouched, the eDP panel and a DIG 6 encoder get nothing,
 endpoints and displays that come and go, every block and endpoint, out-of-range blocks and endpoints, stopped).
+
+### Enabling the audio endpoint: the "ELD" from the EDID
+
+The DCE 11 hardware builds the ELD that the sound driver reads (HDMI/DP audio, the codec's ELD buffer) from registers of the endpoint, which the display driver fills from the monitor's EDID in `dce_v11_0_afmt_setmode`;
+there is no ELD buffer to write. `EdidAudio::parse(edid, &info)` finds in the CTA extension blocks (tag 0x02, revision 3 and up; the data blocks from byte 4 up to the offset in byte 2, 0 meaning 127) the
+Short Audio Descriptors of every audio data block (`drm_edid_to_sad`: the format, channels - 1, sample rate bits and byte 2 of each three-byte descriptor, at most 32), the speaker allocation data block (its three-byte
+payload; the first one) and, from the HDMI vendor block (OUI 00-0C-03, at least 5 bytes of payload; the first one), the lip sync latency fields (`drm_parse_hdmi_vsdb_audio`: present flags in bit 7 / 6 of byte 8, then video and
+audio latency for progressive and for interlaced modes). Everything in the EDID is checked: data blocks that run past the end of the data blocks, bad offsets, short blocks and blocks of other kinds are skipped (every bit flip and
+truncation of a rich EDID runs under the sanitizers in `EdidAudioTest`). All the extension blocks are read, as the current kernels do (older ones read the first only).
+
+`AudioPins` writes the endpoint's indexed registers (index at `0x17a8 + 4 * pin`, data next to it): `set_enabled` is `dce_v11_0_audio_enable` (`HOT_PLUG_CONTROL` = `AUDIO_ENABLED` or 0, the whole register), `write_speaker_allocation`
+(`CHANNEL_SPEAKER`: DisplayPort bit 0, HDMI bit 1 - for DisplayPort connectors too, as the driver does - and the monitor's allocation or 5, stereo), `write_sads` (the twelve descriptor registers for PCM, AC-3, MPEG-1, MP3, MPEG-2,
+AAC LC, DTS, ATRAC, E-AC-3, DTS-HD, MLP and WMA Pro: each holds the descriptor of that format with the most channels, for PCM the sample rates of all of them ORed into the stereo field, and for the other formats only the first
+descriptor; nothing at all for a monitor without descriptors) and `write_latency` (`RESPONSE_LIPSYNC`: the progressive or interlaced video and audio latency, 0 if the monitor gives none). `AmdVegaM::enable_audio(connector, edid,
+interlaced)` runs the driver's order: the endpoint (the first connected one, `audio_pin_for`) disabled, speaker allocation, the connector's audio format block selects the endpoint, descriptors, latency, endpoint enabled; the variant without
+an EDID reads it first (`read_edid`, over DDC or AUX) and fails with it. A monitor without a CTA extension, or an empty EDID, gives stereo speakers, untouched descriptor registers and no latency, as the driver. `disable_audio` is
+`dce_v11_0_audio_enable(pin, false)` for the endpoint the connector's block has selected. Nothing is written for a connector without an audio block or when no endpoint is connected. Nothing calls these by itself.
+
+**Difference from the driver:** `dce_v11_0_audio_write_latency_fields` computes the video latency and then the audio latency from zero again, so only the audio latency ever reaches the register; `write_latency` puts both in
+(the intended value). **Not done:** the audio clock (DTO) and the audio packets and infoframes of `dce_v11_0_afmt_setmode`, so the endpoint is enabled but no sound is sent; the audio output to play through; the ELD proper for
+a driver that wants the bytes (monitor name, manufacturer, connection type, SAD count). **Not checked:** `drm_edid.c` (the SAD, speaker and vendor block parsing is from memory) and the audio coding type numbers
+(`hdmi.h`); `scripts/check_audio_port.py <dce_v11_0.c> <dce_11_2_d.h> <dce_11_2_sh_mask.h>` checks the rest against the driver: the descriptor registers and their coding types, the SAD loop, the speaker allocation, the enable write, the
+latency fields, the register and field numbers, and the order of the steps in `dce_v11_0_afmt_setmode` against `enable_audio`. Tested by `EdidAudioTest` and `AmdVegaMTest::test_audio_enable` (a simulated endpoint with indexed registers,
+`tests/FakeAzalia.hpp`: the write order and every value of the rich EDID worked out by hand, the DDC-read variant, a monitor without audio data, endpoint changes, the driver's descriptor rules).

@@ -31,6 +31,7 @@
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdVegaM.hpp"
 #include "FakeAmdDce11.hpp"
 #include "FakeAuxSink.hpp"
+#include "FakeAzalia.hpp"
 #include "FakeI2cMonitor.hpp"
 #include "FakeAmdGfx8.hpp"
 #include "FakeAmdGmc8.hpp"
@@ -100,10 +101,12 @@ struct Card final : IVcnRegisters {
   bool memsize_never = false;
   FakeI2cMonitor* monitor = nullptr;   // a DDC bus on the pad registers 0x7000..0x7007
   FakeAuxCard* aux = nullptr;          // an AUX channel on the registers 0x7010..0x7033
+  FakeAzalia* azalia = nullptr;        // the audio endpoints on the registers 0x17a8..0x17c5
   static bool in(uint32_t r, uint32_t lo, uint32_t hi) { return r >= lo && r <= hi; }
   IVcnRegisters& owner(uint32_t r) {
     if (monitor && in(r, 0x7000, 0x7007)) return *monitor;
     if (aux && in(r, 0x7010, 0x7040)) return *aux;
+    if (azalia && FakeAzalia::owns(r)) return *azalia;
     if (in(r, 0x3400, 0x37ff)) return sdma;
     if (in(r, 0xe30, 0xe4b) || r == 0x151a || r == 0x151b) return ih;
     if (in(r, 0x500, 0x57f) || in(r, 0x800, 0x82f) || in(r, 0xb00, 0xbff) || r == 0x394 || r == 0x1524 || r == 0x1528 || r == 0x150a) return gmc;
@@ -1655,6 +1658,155 @@ static void test_audio_select() {
   CHECK(!vega.select_audio_pin(hdmi) && vega.select_audio_pins() == 0);
 }
 
+// Enabling an audio endpoint for a connector: dce_v11_0_afmt_setmode's audio part. The endpoint's indexed registers (HOT_PLUG_CONTROL 0x54, CHANNEL_SPEAKER 0x25, the descriptors 0x28.., the lip
+// sync 0x37) are literal, the values are worked out by hand from the EDID below.
+static void test_audio_enable() {
+  const std::vector<uint8_t> vbios = make_connector_vbios();   // eDP: DIG 0 (no audio block), HDMI-A: DIG 2, DisplayPort: DIG 3; on pins 0, 1, 2
+  // A monitor: PCM stereo (32/44.1/48 kHz, 16/20/24 bit), AC-3 6 channels, DTS 8 channels, PCM 8 channels (48/96/192 kHz); speakers 0x05; the HDMI block with latencies 30/40 progressive, 50/60 interlaced
+  const uint8_t cea[] = {0x2C, 0x09, 0x07, 0x07, 0x15, 0x07, 0x50, 0x3F, 0x1E, 0x18, 0x0F, 0x54, 0x07,
+                         0x83, 0x05, 0x00, 0x00,
+                         0x6C, 0x03, 0x0C, 0x00, 0x10, 0x00, 0x80, 0x00, 0xC0, 30, 40, 50, 60};
+  std::vector<uint8_t> edid = make_edid(1);
+  for (size_t i = 3; i < 127; ++i) edid[128 + i] = 0;
+  edid[128 + 2] = 4 + sizeof cea;
+  for (size_t i = 0; i < sizeof cea; ++i) edid[128 + 4 + i] = cea[i];
+  uint8_t sum = 0;
+  for (size_t i = 0; i < 127; ++i) sum = static_cast<uint8_t>(sum + edid[128 + i]);
+  edid[255] = static_cast<uint8_t>(0 - sum);
+  Rig rig;
+  FakeAzalia azalia;
+  FakeI2cMonitor monitor;
+  monitor.edid = edid;
+  rig.card.monitor = &monitor;
+  rig.card.azalia = &azalia;
+  azalia.connectivity[2] = 0;        // endpoints 2 and 3 have a port
+  azalia.connectivity[3] = 3;
+  for (uint32_t pin = 0; pin < 3; ++pin) rig.card.gfx.set_reg(0x1898 + 8 * pin, 0x2);
+  AmdVegaM vega(rig.alloc);
+  AmdVegaM::Inputs in = rig.inputs();
+  in.hpd_pins = 0x0F;
+  in.vbios = ConstByteView(vbios.data(), vbios.size());
+  const AtomConnectors::Connector none;
+  CHECK(!vega.enable_audio(none, ConstByteView(edid.data(), edid.size())) && !vega.enable_audio(none) && !vega.disable_audio(none));       // (not up)
+  CHECK(vega.bring_up(in));
+  if (!vega.up()) return;
+  const AtomConnectors::Connector edp = vega.connectors()[0], hdmi = vega.connectors()[1], dp = vega.connectors()[2];
+  azalia.writes.clear();
+  rig.card.gfx.set_reg(0x4c45, 0xAB000005u);
+  azalia.set(2, 0x25, 0xFFFFFFFFu);
+  CHECK(vega.enable_audio(hdmi, ConstByteView(edid.data(), edid.size())));
+  // the order of the writes: disabled, speakers, (the block selects the endpoint), the descriptors, the lip sync, enabled
+  const uint32_t order[] = {0x54, 0x25, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x31, 0x32, 0x33, 0x35, 0x37, 0x54};
+  CHECK(azalia.writes.size() == 16);
+  for (size_t i = 0; i < azalia.writes.size() && i < 16; ++i) CHECK(azalia.writes[i].pin == 2 && azalia.writes[i].index == order[i]);
+  CHECK(azalia.writes[0].value == 0 && azalia.writes[15].value == 0x80000000u);
+  CHECK(azalia.value(2, 0x25) == 0xFFFDFF85u);          // the DisplayPort bit cleared, the HDMI bit set, the speakers 5
+  CHECK(azalia.value(2, 0x28) == 0x57075407u);          // PCM: the 8 channel descriptor (7, 0x54 Hz bits, byte 2 0x07), the stereo rates of both (0x07 | 0x54)
+  CHECK(azalia.value(2, 0x29) == 0x00500705u);          // AC-3
+  CHECK(azalia.value(2, 0x2e) == 0x00181E07u);          // DTS
+  for (uint32_t reg : {0x2a, 0x2b, 0x2c, 0x2d, 0x2f, 0x31, 0x32, 0x33, 0x35}) CHECK(azalia.value(2, reg) == 0);
+  CHECK(azalia.value(2, 0x37) == 0x281Eu);              // lip sync, progressive: video 30, audio 40
+  CHECK(azalia.value(2, 0x54) == 0x80000000u && (rig.card.gfx.reg(0x4c45) & 7) == 2 && (rig.card.gfx.reg(0x4c45) & ~7u) == 0xAB000000u);      // enabled; the block takes endpoint 2
+  // interlaced: the other latencies
+  CHECK(vega.enable_audio(hdmi, ConstByteView(edid.data(), edid.size()), true) && azalia.value(2, 0x37) == 0x3C32u);
+  // the EDID read over the connector's DDC lines
+  azalia.writes.clear();
+  CHECK(vega.enable_audio(hdmi) && azalia.writes.size() == 16 && azalia.value(2, 0x29) == 0x00500705u);
+  CHECK(vega.enable_audio(hdmi, true) && azalia.value(2, 0x37) == 0x3C32u);
+  monitor.present = false;
+  azalia.writes.clear();
+  CHECK(!vega.enable_audio(hdmi) && azalia.writes.empty());          // (no EDID, nothing touched)
+  monitor.present = true;
+  // a monitor without a CTA extension: stereo speakers, no descriptors written (the old ones stay), no latency
+  const std::vector<uint8_t> plain = make_edid(0);
+  azalia.writes.clear();
+  azalia.set(2, 0x29, 0x1234);
+  CHECK(vega.enable_audio(hdmi, ConstByteView(plain.data(), plain.size())));
+  CHECK(azalia.writes.size() == 4 && azalia.writes[0].index == 0x54 && azalia.writes[1].index == 0x25 && azalia.writes[2].index == 0x37 && azalia.writes[3].index == 0x54);
+  CHECK((azalia.value(2, 0x25) & 0x7F) == 5 && azalia.value(2, 0x29) == 0x1234 && azalia.value(2, 0x37) == 0 && azalia.value(2, 0x54) == 0x80000000u);
+  CHECK(vega.enable_audio(hdmi, ConstByteView()) && azalia.writes.size() == 8);        // (and an empty one, as a driver without an EDID)
+  // the DisplayPort connector takes the same endpoint with its own block; the eDP panel has none: nothing written
+  azalia.writes.clear();
+  rig.card.gfx.set_reg(0x4d45, 0xAB000015u);
+  CHECK(vega.enable_audio(dp, ConstByteView(edid.data(), edid.size())) && azalia.writes.size() == 16 && (rig.card.gfx.reg(0x4d45) & 7) == 2);
+  azalia.writes.clear();
+  CHECK(!vega.enable_audio(edp, ConstByteView(edid.data(), edid.size())) && azalia.writes.empty());
+  // the first connected endpoint is read again: endpoint 2 loses its port, 3 takes over
+  azalia.connectivity[2] = 1;
+  azalia.writes.clear();
+  CHECK(vega.enable_audio(hdmi, ConstByteView(edid.data(), edid.size())) && azalia.writes.size() == 16 && azalia.writes[0].pin == 3 && azalia.value(3, 0x54) == 0x80000000u && (rig.card.gfx.reg(0x4c45) & 7) == 3);
+  // disabling: the endpoint the block has selected, whatever it is; a connector with no block
+  azalia.writes.clear();
+  CHECK(vega.disable_audio(hdmi) && azalia.writes.size() == 1 && azalia.writes[0].pin == 3 && azalia.writes[0].index == 0x54 && azalia.writes[0].value == 0 && azalia.value(3, 0x54) == 0);
+  rig.card.gfx.set_reg(0x4c45, 0xAB000007u);
+  azalia.writes.clear();
+  CHECK(vega.disable_audio(hdmi) && azalia.writes.size() == 1 && azalia.writes[0].pin == 7);
+  azalia.writes.clear();
+  CHECK(!vega.disable_audio(edp) && azalia.writes.empty());
+  // no endpoint connected: nothing written
+  for (uint32_t p = 0; p < 8; ++p) azalia.connectivity[p] = 1;
+  azalia.writes.clear();
+  CHECK(!vega.enable_audio(hdmi, ConstByteView(edid.data(), edid.size())) && azalia.writes.empty());
+  // the endpoint registers themselves: a pin that does not exist is refused and nothing is written
+  amd_dce11::AudioPins pins(*rig.inputs().registers);
+  EdidAudio::Info info;
+  EdidAudio::parse(ConstByteView(edid.data(), edid.size()), &info);
+  azalia.writes.clear();
+  CHECK(!pins.endpoint_write(8, 0x54, 1) && !pins.set_enabled(8, true) && !pins.write_speaker_allocation(8, info) && !pins.write_sads(8, info) && !pins.write_latency(8, info, false) && azalia.writes.empty());
+  CHECK(pins.set_enabled(5, true) && pins.enabled(5) && pins.set_enabled(5, false) && !pins.enabled(5) && !pins.enabled(8));
+  azalia.set(5, 0x54, 0x7FFFFFFFu);
+  CHECK(!pins.enabled(5));        // (only the enabled bit)
+  EdidAudio::Info empty;
+  azalia.writes.clear();
+  CHECK(!pins.write_sads(5, empty) && azalia.writes.empty());
+  // the descriptors by the driver's rules: the descriptor with the most channels of a format, the first of the formats other than PCM, the PCM rates ORed
+  EdidAudio::Info rules;
+  rules.sad_count = 5;
+  rules.sads[0] = {2, 1, 0x01, 0x11};      // AC-3 2 channels
+  rules.sads[1] = {2, 5, 0x02, 0x22};      // AC-3 6 channels: not looked at, the first one is the one
+  rules.sads[2] = {1, 3, 0x10, 0x01};      // PCM 4 channels
+  rules.sads[3] = {1, 3, 0x20, 0x02};      // PCM 4 channels again: not more channels, so the first stays, but the rates are ORed
+  rules.sads[4] = {1, 1, 0x40, 0x04};      // PCM 2 channels
+  CHECK(pins.write_sads(6, rules));
+  CHECK(azalia.value(6, 0x29) == (1u | 0x01u << 8 | 0x11u << 16) && azalia.value(6, 0x28) == (3u | 0x10u << 8 | 0x01u << 16 | 0x70u << 24));
+  // each audio coding type goes to its own register (descriptors 0 to 7, 9, 10, 11 and 13: PCM 1, AC-3 2, MPEG-1 3, MP3 4, MPEG-2 5, AAC LC 6, DTS 7, ATRAC 8, E-AC-3 10, DTS-HD 11, MLP 12, WMA Pro 14);
+  // the types with no register (0, 9 DSD, 13 DST, 15) go nowhere. A mono descriptor counts.
+  const struct { uint8_t format; uint32_t reg; } types[] = {{1, 0x28}, {2, 0x29}, {3, 0x2a}, {4, 0x2b}, {5, 0x2c}, {6, 0x2d}, {7, 0x2e}, {8, 0x2f}, {10, 0x31}, {11, 0x32}, {12, 0x33}, {14, 0x35},
+                                                        {0, 0}, {9, 0}, {13, 0}, {15, 0}};
+  for (const auto& t : types) {
+    EdidAudio::Info one;
+    one.sad_count = 1;
+    one.sads[0] = {t.format, 0, 0x03, 0x44};
+    for (uint32_t reg = 0x28; reg <= 0x35; ++reg) azalia.set(4, reg, 0xDEADBEEFu);
+    CHECK(pins.write_sads(4, one));
+    for (uint32_t reg = 0x28; reg <= 0x35; ++reg) {
+      const bool written = reg != 0x30 && reg != 0x34;
+      const uint32_t want = !written ? 0xDEADBEEFu : reg == t.reg ? (0u | 0x03u << 8 | 0x44u << 16 | (t.format == 1 ? 0x03u << 24 : 0u)) : 0u;
+      CHECK(azalia.value(4, reg) == want);
+    }
+  }
+  // a monitor that gives latency fields that it says are not there
+  EdidAudio::Info absent;
+  absent.video_latency[0] = absent.audio_latency[0] = 9;
+  absent.video_latency[1] = absent.audio_latency[1] = 9;
+  azalia.set(4, 0x37, 0x1234);
+  CHECK(pins.write_latency(4, absent, false) && azalia.value(4, 0x37) == 0 && pins.write_latency(4, absent, true) && azalia.value(4, 0x37) == 0);
+  // a speaker allocation block of the monitor: its first byte, 7 bits of it; and the lip sync of a monitor that gives none
+  rules.speaker_count = 3;
+  rules.speaker_allocation = 0xFF;
+  azalia.set(6, 0x25, 0);
+  CHECK(pins.write_speaker_allocation(6, rules) && azalia.value(6, 0x25) == (0x7Fu | 0x10000u));
+  CHECK(pins.write_latency(6, rules, false) && azalia.value(6, 0x37) == 0 && pins.write_latency(6, rules, true) && azalia.value(6, 0x37) == 0);
+  rules.latency_present[1] = true;
+  rules.video_latency[1] = 0xAB;
+  rules.audio_latency[1] = 0xCD;
+  CHECK(pins.write_latency(6, rules, true) && azalia.value(6, 0x37) == 0xCDABu && pins.write_latency(6, rules, false) && azalia.value(6, 0x37) == 0);
+  vega.shutdown();
+  azalia.connectivity[2] = 0;
+  azalia.writes.clear();
+  CHECK(!vega.enable_audio(hdmi, ConstByteView(edid.data(), edid.size())) && !vega.disable_audio(hdmi) && azalia.writes.empty());
+}
+
 // The sink's DPCD over the AUX channel of the DisplayPort and eDP connectors (through the video BIOS's table, with the panel power-up for the eDP one).
 static void test_read_dpcd() {
   const std::vector<uint8_t> vbios = make_connector_vbios();   // eDP (DDC line 0x92, pin 0), HDMI-A (0x91), DisplayPort (0x93, pin 2)
@@ -2038,6 +2190,7 @@ int main() {
   test_audio_pins();
   test_read_edid();
   test_audio_select();
+  test_audio_enable();
   test_read_dpcd();
   test_short_pulse_status();
   printf(g_failed ? "AmdVegaMTest: %d FAILED\n" : "AmdVegaMTest: all passed\n", g_failed);

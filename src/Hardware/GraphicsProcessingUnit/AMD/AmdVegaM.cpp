@@ -538,6 +538,35 @@ bool AmdVegaM::select_audio_pin(const AtomConnectors::Connector& connector) {
   return amd_dce11::AudioFormat(*inputs_.registers).select_pin(AtomConnectors::afmt_instance(connector), pin);
 }
 
+bool AmdVegaM::enable_audio(const AtomConnectors::Connector& connector, ConstByteView edid, bool interlaced) {
+  if (!inputs_.registers) return false;
+  refresh_audio_pins();       // (nothing is connected when the card is not up)
+  uint32_t pin = 0;
+  if (!audio_pin_for(connector, &pin)) return false;
+  amd_dce11::AudioPins pins(*inputs_.registers);
+  EdidAudio::Info info;
+  EdidAudio::parse(edid, &info);
+  pins.set_enabled(pin, false);                                 // disable audio prior to setting up hw
+  pins.write_speaker_allocation(pin, info);
+  amd_dce11::AudioFormat(*inputs_.registers).select_pin(AtomConnectors::afmt_instance(connector), pin);
+  pins.write_sads(pin, info);                                   // (a monitor without descriptors leaves the registers alone)
+  pins.write_latency(pin, info, interlaced);
+  pins.set_enabled(pin, true);                                  // enable audio after setting up hw
+  return true;
+}
+
+bool AmdVegaM::enable_audio(const AtomConnectors::Connector& connector, bool interlaced) {
+  if (!inputs_.allocator) return false;
+  ByteBuffer edid(*inputs_.allocator);
+  return read_edid(connector, &edid) && enable_audio(connector, edid.view(), interlaced);
+}
+
+bool AmdVegaM::disable_audio(const AtomConnectors::Connector& connector) {
+  if (!up() || !inputs_.registers || AtomConnectors::afmt_instance(connector) >= amd_dce11::AudioFormat::kBlocks) return false;
+  const uint32_t pin = amd_dce11::AudioFormat(*inputs_.registers).selected_pin(AtomConnectors::afmt_instance(connector));
+  return amd_dce11::AudioPins(*inputs_.registers).set_enabled(pin, false);
+}
+
 uint32_t AmdVegaM::select_audio_pins() {
   uint32_t n = 0;
   for (const AtomConnectors::Connector& c : connectors()) {
