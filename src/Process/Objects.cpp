@@ -726,6 +726,17 @@ bool ObjectManager::section_memory(uint32_t id, uint8_t** storage, uint64_t* siz
   return true;
 }
 
+uint32_t ObjectManager::file_has_section(StringView host_path) {
+  Locked hold(sync_);
+  uint32_t found = 0;
+  if (!sections_) return 0;
+  for (uint32_t i = 0; i < kMaxSections; ++i) {
+    const Section& s = sections_[i];
+    if (s.used && s.file_backed && s.path_size == host_path.size() && same_name(s.path, s.path_size, host_path)) { if (s.attributes & 0x1000000u) return 2; found = 1; }
+  }
+  return found;
+}
+
 bool ObjectManager::section_info(uint32_t id, SectionInfo* out) {
   Locked hold(sync_);
   Object* o = at(id);

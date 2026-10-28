@@ -141,5 +141,8 @@ bool unload_library(AddressSpace& space, ModuleSet* set, uint64_t base);
 
 // Applies the base relocations of a mapped image that was loaded `delta` (a wrapping difference) away from its preferred base.
 bool apply_relocations(AddressSpace& space, const exe::PeFile& pe, uint64_t base, uint64_t delta);
+// Records what Windows says about the pages of an image mapped at `base`: the image type, the protection of the headers and of each section (a writable one is copy-on-write),
+// and that they are all one allocation.
+void describe_image_pages(AddressSpace& space, const exe::PeFile& pe, uint64_t base);
 
 }  // namespace process

@@ -345,7 +345,7 @@ Frame* on_user_fault(Frame* frame) {
     irq_enable();
     task->mutex.lock();
     process::AddressSpace* space = task->program.process()->address_space();
-    const bool copied = space && space->break_copy_on_write(cow_address, 1) && task->sync_tables();
+    const bool copied = space && ((space->break_copy_on_write(cow_address, 1) && task->sync_tables()) || space->check(cow_address, 1, process::kProtWrite));      // (or another thread got there first)
     task->mutex.unlock();
     irq_disable();
     if (copied) return frame;
