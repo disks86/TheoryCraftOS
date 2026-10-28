@@ -443,6 +443,7 @@ add_executable(BOOTX64
   src/Kernel/Dxgkrnl/D3d9Tgsi.cpp
   src/Kernel/Dxgkrnl/D3d9Dxbc.cpp
   src/Kernel/Dxgkrnl/D3d9Devices.cpp
+  src/Kernel/Dxgkrnl/D3d9Emit.cpp
   src/Kernel/Dxgkrnl/Adapter.cpp
   src/Kernel/Dxgkrnl/DxgKernel.cpp
   src/Graphics/SystemGraphics.cpp

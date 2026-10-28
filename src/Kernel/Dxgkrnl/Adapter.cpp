@@ -17,6 +17,7 @@
  */
 
 #include "Kernel/Dxgkrnl/Adapter.hpp"
+#include "Utility/ByteBuffer.hpp"
 #include "Graphics/Graphics3D/BuiltinShaders.hpp"
 #include "Graphics/Graphics3D/Mipmaps.hpp"
 #include "Kernel/Dxgkrnl/CommandStream.hpp"
@@ -530,9 +531,22 @@ NtStatus Adapter::create_shader(const ShaderDesc& desc, SharedPointer<ShaderObje
       }
       md.stage = stage;
       // The devices without a shader compiler: SVGA3D takes the (rewritten) Direct3D 9 tokens, Intel Gen9 runs a vertex function and one of two fixed pixel kernels.
-      if (desc.kind == ShaderKind::D3d9Bytecode) {
+      {
         List<uint32_t> svga(allocator_);
-        if (program->emit_svga_tokens(desc.code, &svga) == status::kSuccess) {
+        bool have_svga = false;
+        if (desc.kind == ShaderKind::D3d9Bytecode) {
+          have_svga = program->emit_svga_tokens(desc.code, &svga) == status::kSuccess;
+        } else {
+          // (a program made from DXBC goes through the Direct3D 9 stream it can be written as)
+          List<uint32_t> d3d9(allocator_);
+          ByteBuffer bytes(allocator_);
+          UniquePointer<D3d9Program> second;
+          if (program->emit_d3d9_tokens(&d3d9) == status::kSuccess) {
+            for (uint64_t i = 0; i < d3d9.count(); ++i) bytes.put32(d3d9[i]);
+            have_svga = D3d9Program::compile(allocator_, bytes.view(), &second) == status::kSuccess && second->emit_svga_tokens(bytes.view(), &svga) == status::kSuccess;
+          }
+        }
+        if (have_svga) {
           shader->tokens_ = allocate_view<uint32_t>(allocator_, svga.count());
           if (shader->tokens_.empty()) return status::kNoMemory;
           for (uint64_t i = 0; i < svga.count(); ++i) shader->tokens_[i] = svga[i];

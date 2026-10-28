@@ -2021,6 +2021,51 @@ float apply_dx_modifier(float x, uint32_t modifier) {
   return x;
 }
 
+
+// A program made from DXBC, written out as Direct3D 9 tokens, compiled again and run beside the original on every input set. 0: the same; 1: not expressible; 2: they differ.
+// (A NaN of the original is not compared: sqrt of a negative number has none in the tokens.)
+int roundtrip_agrees(HostAllocator& allocator, const D3d9Program& original, const graphics::ITextureSet* textures) {
+  List<uint32_t> tokens(allocator);
+  if (original.emit_d3d9_tokens(&tokens) != status::kSuccess) return 1;
+  Asm a(false, 2, 0);
+  a.t.clear();
+  for (uint64_t i = 0; i < tokens.count(); ++i) a.t.push_back(tokens[i]);
+  UniquePointer<D3d9Program> again;
+  if (D3d9Program::compile(allocator, a.bytes(), &again) != status::kSuccess) {
+    printf("  emitted tokens do not compile:");
+    for (uint32_t t : a.t) printf(" %08x", t);
+    printf("\n");
+    return 2;
+  }
+  if (again->stage() != original.stage()) return 2;
+  for (unsigned set = 0; set < 4; ++set) {
+    uint8_t constants[128];
+    for (unsigned i = 0; i < 8; ++i)
+      for (unsigned k = 0; k < 4; ++k) memcpy(constants + i * 16 + k * 4, &kConstants[set][i][k], 4);
+    graphics::Vec4 values[4];
+    for (unsigned i = 0; i < 4; ++i) values[i] = {kInputs[set][i][0], kInputs[set][i][1], kInputs[set][i][2], kInputs[set][i][3]};
+    auto same = [](const graphics::Vec4& x, const graphics::Vec4& y) {
+      const float xs[4] = {x.x, x.y, x.z, x.w}, ys[4] = {y.x, y.y, y.z, y.w};
+      for (int k = 0; k < 4; ++k)
+        if (xs[k] == xs[k] && !near_value(xs[k], ys[k])) return false;
+      return true;
+    };
+    if (original.stage() == graphics::ShaderStage::Vertex) {
+      graphics::ShaderIo x = {}, y = {};
+      original.run_vertex(values, constants, &x);
+      again->run_vertex(values, constants, &y);
+      bool ok = same(x.position, y.position);
+      for (unsigned v = 0; v < 4; ++v) ok = ok && same(x.varying[v], y.varying[v]);
+      if (!ok) return 2;
+    } else {
+      graphics::Vec4 x = {}, y = {};
+      const bool alive_x = original.run_fragment(values, constants, textures, &x), alive_y = again->run_fragment(values, constants, textures, &y);
+      if (alive_x != alive_y || (alive_x && !same(x, y))) return 2;
+    }
+  }
+  return 0;
+}
+
 void test_dxbc() {
   HostAllocator allocator;
   {
@@ -2065,6 +2110,7 @@ void test_dxbc() {
     // (and the text of it: the machine runs it against the interpreter)
     String text(allocator);
     CHECK(pd && pd->emit_tgsi(&text) == status::kSuccess && text.size() > 100);
+    CHECK(pd && roundtrip_agrees(allocator, *pd, nullptr) == 0);
   }
 
   // Every arithmetic instruction against its definition, with swizzles, modifiers, write masks and saturate.
@@ -2133,6 +2179,15 @@ void test_dxbc() {
         String text(allocator);
         const bool have_text = p->emit_tgsi(&text) == status::kSuccess;
         const std::string source(text.data(), text.size());
+        {
+          TexSet no_textures;
+          const int rt = roundtrip_agrees(allocator, *p, &no_textures);
+          if (rt == 2 && alu.opcode != 75) {   // (sqrt of a negative number: NaN, or 0 once saturated; the tokens give the root of its magnitude)
+            if (wrong == 0) printf("  dxbc op %u variant %u: the Direct3D 9 tokens differ\n", alu.opcode, n);
+            ++wrong;
+          }
+          if (rt == 1) ++text_wrong;
+        }
         for (unsigned set = 0; set < 2; ++set) {
           uint8_t constants[128];
           for (unsigned i = 0; i < 8; ++i)
@@ -2203,6 +2258,11 @@ void test_dxbc() {
       graphics::Vec4 varyings[4];
       for (unsigned i = 0; i < 4; ++i) varyings[i] = {kInputs[set][i][0], kInputs[set][i][1], kInputs[set][i][2], kInputs[set][i][3]};
       *alive = p->run_fragment(varyings, constants, &textures, color);
+      if (set == 0) {
+        const int rt = roundtrip_agrees(allocator, *p, &textures);
+        if (rt != 0) printf("  dxbc round trip through Direct3D 9 tokens: %s\n", rt == 1 ? "not expressible" : "differs");
+        CHECK(rt == 0);
+      }
       if (!compare_text) return;
       String text(allocator);
       CHECK(p->emit_tgsi(&text) == status::kSuccess);
@@ -2417,6 +2477,11 @@ void test_dxbc_real() {
       CHECK(ok);
     };
 
+    for (const UniquePointer<D3d9Program>* program : {&vs, &color, &tex, &math}) {
+      const int rt = roundtrip_agrees(allocator, **program, &textures);
+      if (rt != 0) printf("  real dxbc round trip through Direct3D 9 tokens: %s\n", rt == 1 ? "not expressible" : "differs");
+      CHECK(rt == 0);
+    }
     for (unsigned set = 0; set < 4; ++set) {
       uint8_t constants[128];
       for (unsigned i = 0; i < 8; ++i)
@@ -2607,15 +2672,15 @@ void test_device_forms() {
     reads.op(kOpMul, {Asm::dst(kRegColorOut, 0), Asm::src(kRegInput, 0), Asm::src(kRegConst, 0)});
     reads.end();
     CHECK(D3d9Program::compile(allocator, reads.bytes(), &program) == status::kSuccess);
-    List<uint32_t> none(allocator);
-    CHECK(program->emit_svga_tokens(reads.bytes(), &none) == status::kNotSupported);
+    List<uint32_t> none(allocator), reads_tokens(allocator);
+    CHECK(program->emit_svga_tokens(reads.bytes(), &reads_tokens) == status::kSuccess && reads_tokens.count() == reads.t.size());   // (the device sets the push constants for pixel shaders too)
     Asm uses_c31(true, 2, 0);
     uses_c31.def(31, 1, 1, 1, 1);
     uses_c31.op(kOpMov, {Asm::dst(kRegRastOut, 0), Asm::src(kRegInput, 0)});
     uses_c31.end();
     CHECK(D3d9Program::compile(allocator, uses_c31.bytes(), &program) == status::kSuccess);
     CHECK(program->emit_svga_tokens(uses_c31.bytes(), &none) == status::kNotSupported);
-    // A DXBC program is not Direct3D 9 tokens.
+    // A DXBC program is not Direct3D 9 tokens (it is written as such first).
     const std::vector<uint8_t> blob = read_blob("ps_color.dxbc");
     UniquePointer<D3d9Program> dx = compile_dxbc(allocator, blob);
     CHECK(dx && dx->emit_svga_tokens(ConstByteView(blob.data(), blob.size()), &none) == status::kNotSupported);
@@ -2676,12 +2741,18 @@ void test_device_forms() {
     d.code = ps.bytes();
     CHECK(kernel.create_shader(kPid, device, d, &h) == status::kSuccess);
     CHECK(spy.had_function && spy.svga_tokens == ps.t.size() && spy.eu_program == graphics::EuProgram::ColoredFragment && spy.eu_varying == 0);
-    // A DXBC shader: functions and text; no SVGA tokens.
+    // A DXBC shader: functions, text, and the SVGA tokens of the Direct3D 9 stream it can be written as .
     const std::vector<uint8_t> blob = read_blob("ps_sample.dxbc");
     d.kind = ShaderKind::Dxbc;
     d.code = view_of(blob);
     CHECK(kernel.create_shader(kPid, device, d, &h) == status::kSuccess);
-    CHECK(spy.had_function && spy.svga_tokens == 0 && spy.eu_program == graphics::EuProgram::TexturedFragment && spy.eu_varying == 2 && spy.tgsi.rfind("FRAG\n", 0) == 0);
+    CHECK(spy.had_function && spy.svga_tokens > 8 && spy.eu_program == graphics::EuProgram::TexturedFragment && spy.eu_varying == 2 && spy.tgsi.rfind("FRAG\n", 0) == 0);
+    // The vertex shader of a real compiler: the SVGA tokens end with the position multiplied by c31.
+    {
+      const std::vector<uint8_t> vblob = read_blob("vs_5_1.dxbc");
+      d.code = view_of(vblob);
+      CHECK(kernel.create_shader(kPid, device, d, &h) == status::kSuccess && spy.svga_tokens > 16);
+    }
     // ... and a shader made through the escape ABI.
     const std::vector<uint8_t> vs_blob = read_blob("vs.dxbc");
     ByteBuffer request(allocator);

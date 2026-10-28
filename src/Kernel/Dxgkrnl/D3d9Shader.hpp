@@ -74,9 +74,12 @@ class D3d9Program {
   FragmentKernel classify_fragment(uint8_t* varying) const;
   // The shader as the tokens the VMware SVGA3D device wants (the vs_2_0 / ps_2_0 token stream the host runs): from the Direct3D 9 stream the program was made of. A vertex shader gets
   // the device's declarations (input 0 position, 1 colour, the rest texture coordinates) and its position multiplied by the constant c31 (1, -1, 1, 1) the device supplies, so that
-  // +Y comes out right. kNotSupported for what the device cannot run: other models than 2.0, a pixel shader that reads the push constants (that device sets constants for the
-  // vertex shader only) or samples, a vertex shader with no temporary left for the position, a `def c31`, a program made from DXBC.
+  // +Y comes out right. kNotSupported for what the device cannot run: other models than 2.0 / 3.0, a vertex shader with no temporary left for the position, a `def c31`, a program
+  // made from DXBC (write it with emit_d3d9_tokens first).
   NtStatus emit_svga_tokens(ConstByteView original, List<uint32_t>* out) const;
+  // A program made from DXBC as a Direct3D 9 token stream (vs_2_0 / ps_2_0, or the 3.0 versions when it branches on a register), in the contract above - see D3d9Emit.cpp.
+  // kNotSupported for a Direct3D 9 program, one that needs more temporaries or constants than the model has, or uses what cannot be written.
+  NtStatus emit_d3d9_tokens(List<uint32_t>* out) const;
 
   struct Instruction;
   explicit D3d9Program(allocators::IAllocator& allocator);
@@ -84,6 +87,7 @@ class D3d9Program {
 
  private:
   friend class TgsiEmitter;
+  friend class D3d9Writer;
   struct State;
   void execute(State& s) const;
 
