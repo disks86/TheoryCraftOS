@@ -152,6 +152,19 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
   // Everything the interrupt ring delivers is also passed to `observer` (not owned; null to stop), after the card has dealt with it: how the video engines, which run on their own,
   // learn of their fences. Called from service_interrupts().
   void set_event_observer(AmdIrq::ISink* observer) { observer_ = observer; }
+  // Hot plug. The pins the card watches (Inputs::hpd_pins) report a display being plugged in or pulled out through the interrupt ring (AmdIrq); service_interrupts() turns that into
+  // events for whoever wants to react, queued here (the oldest are dropped when more than kMaxHotplugEvents wait, and counted). `connected_pins()` is the state: bit n set when pin n
+  // senses a display, as of bring-up and the events since. Which connector a pin is on is in the video BIOS's object table, which is not read, so a pin is just a number.
+  struct HotplugEvent {
+    uint32_t pin = 0;
+    bool connected = false;
+    bool throttled = false;   // the pin interrupted so often that it was switched off (AmdIrq::kHotplugStormLimit): no more events from it
+  };
+  static constexpr uint32_t kMaxHotplugEvents = 16;
+  bool take_hotplug(HotplugEvent* out);
+  uint32_t connected_pins() const { return connected_pins_; }
+  uint32_t hotplug_events_dropped() const { return hotplug_dropped_; }
+
   // Recovery. An engine that timed out on a fence or reported a fault is wedged: nothing more is queued on it. recover() resets the ones that are - the graphics engine with its
   // compute queues (AmdGfx8::recover) if the graphics ring or a compute queue is wedged, and the SDMA engines (AmdSdma3::recover) if one is - and brings them back with empty
   // rings. A fault of one compute queue resets all of them, as the driver's soft reset of the IP does. `failed` is set if an engine did not come back (its ring test failed): it is
@@ -207,6 +220,8 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
   UniquePointer<amd_dce11::Interrupts> display_irq_;
   int vblank_crtc_ = -1;
   uint32_t recoveries_ = 0, asic_resets_ = 0;
+  HotplugEvent hotplug_[kMaxHotplugEvents];
+  uint32_t hotplug_head_ = 0, hotplug_count_ = 0, hotplug_dropped_ = 0, connected_pins_ = 0, throttle_reported_ = 0;
   AmdIrq::ISink* observer_ = nullptr;
   UniquePointer<AmdGfx8Compute> compute_;
   UniquePointer<AmdGfx8> gfx_;

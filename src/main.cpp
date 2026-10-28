@@ -1097,6 +1097,15 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         }
         const bool up = vega_m->bring_up(inputs);
         Entry(up ? Level::Ok : Level::Warning, "Vega M").text(up ? "started: " : "not started - ").text(vega_m->status());
+        if (up) {
+          const uint32_t connected = vega_m->connected_pins();
+          if (connected == 0) {
+            Entry(Level::Info, "Vega M").text("hot plug: no display on the outputs watched");
+          } else {
+            Entry(Level::Info, "Vega M").text("hot plug: display on output(s)");
+            for (uint32_t pin = 0; pin < 6; ++pin) if (connected >> pin & 1) Entry(Level::Info, "Vega M").text("  output ").dec(pin + 1);
+          }
+        }
         if (up && vega_msi) {
           // Try it out, as virtio-gpu does: a copy through the SDMA engine ends with a trap, which must come back as an interrupt. If it does not, polling stays.
           const uint32_t before = __atomic_load_n(&g_vega_interrupts, __ATOMIC_ACQUIRE);
@@ -1284,6 +1293,25 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
           vega_seen = arrived;
           vega_idle = 0;
           vega_m->service_interrupts();
+        }
+        // A display plugged into or pulled out of one of the card's outputs: say so, on the debug console and as a toast. (The card's outputs are not part of the desktop: it cannot show
+        // anything on them, so this is all there is to do about it.)
+        hardware::AmdVegaM::HotplugEvent plug;
+        while (vega_m->take_hotplug(&plug)) {
+          FixedString<112> text;
+          if (plug.throttled) {
+            text.assign("Output ");
+            text.append_uint(plug.pin + 1);
+            text.append(" of the Radeon RX Vega M keeps changing: its hot plug detection is switched off");
+          } else {
+            text.assign(plug.connected ? "A display was connected to output " : "A display was disconnected from output ");
+            text.append_uint(plug.pin + 1);
+            text.append(" of the Radeon RX Vega M");
+          }
+          console::debug_puts("Vega M: ");
+          console::debug_puts(StringView(text.c_str()));
+          console::debug_puts("\n");
+          desktop.notify(StringView("Display"), StringView(text.c_str()), plug.throttled ? gui::NoticeKind::Warning : gui::NoticeKind::Information);
         }
       }
 #endif

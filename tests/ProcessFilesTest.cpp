@@ -448,7 +448,7 @@ static void test_windows_files() {
   uint32_t st = rig.call(WindowsSyscallNumber::NtQueryDirectoryFile, o.handle, 0, 0, 0, {iosb, list, 4096, 3, 0, 0, 1});
   CHECK(st == 0);
   std::vector<std::string> names = both_names(rig, list);
-  CHECK(names.size() == 6 && names[0] == "." && names[1] == "..");
+  CHECK(names.size() == 4 && names[0] != "." && names[0] != "..");      // (the root of a drive has no "." and "..")
   bool has_hello = false, has_users = false;
   for (auto& n : names) { has_hello |= n == "hello.txt"; has_users |= n == "Users"; }
   CHECK(has_hello && has_users && rig.u64(iosb + 8) > 100);
@@ -460,9 +460,9 @@ static void test_windows_files() {
   CHECK(rig.call(WindowsSyscallNumber::NtQueryDirectoryFile, o.handle, 0, 0, 0, {iosb, list, 4096, 3, 0, 0, 0}) == 0x80000006u);
   CHECK(rig.call(WindowsSyscallNumber::NtQueryDirectoryFile, o.handle, 0, 0, 0, {iosb, list, 4096, 12, 1, rig.unicode("*"), 1}) == 0);      // FileNamesInformation, one entry
   CHECK(rig.u64(list) == 0 || rig.bytes(list, 1)[0] == 0);                                           // NextEntryOffset 0 = last
-  CHECK(wide(rig, list + 12, uint8_t(rig.bytes(list + 8, 1)[0])) == ".");
+  CHECK(wide(rig, list + 12, uint8_t(rig.bytes(list + 8, 1)[0])) != ".");
   CHECK(rig.call(WindowsSyscallNumber::NtQueryDirectoryFile, o.handle, 0, 0, 0, {iosb, list, 4096, 12, 1, 0, 0}) == 0);
-  CHECK(wide(rig, list + 12, uint8_t(rig.bytes(list + 8, 1)[0])) == "..");
+  CHECK(wide(rig, list + 12, uint8_t(rig.bytes(list + 8, 1)[0])) != "..");
   CHECK(rig.call(WindowsSyscallNumber::NtQueryDirectoryFile, o.handle, 0, 0, 0, {iosb, list, 20, 3, 1, 0, 1}) == 0x80000005u);          // buffer too small
   CHECK(rig.call(WindowsSyscallNumber::NtQueryDirectoryFile, o.handle, 0, 0, 0, {iosb, list, 4096, 77, 0, 0, 1}) == 0xC0000003u);
   CHECK(rig.call(WindowsSyscallNumber::NtQueryDirectoryFile, 0, 0, 0, 0, {iosb, list, 4096, 3, 0, 0, 1}) == 0xC0000008u);
@@ -476,7 +476,7 @@ static void test_windows_files() {
     if (st != 0) { CHECK(st == 0x80000006u); break; }
     total += both_names(rig, list).size();
   }
-  CHECK(total == 6);
+  CHECK(total == 4);
   rig.call(WindowsSyscallNumber::NtClose, o.handle);
   // a file is not a directory
   o = rig.create("\\??\\C:\\hello.txt", kGenericRead, 1, kOptions);

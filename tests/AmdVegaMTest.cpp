@@ -1253,6 +1253,72 @@ static void test_post_after_reset() {
   }
 }
 
+// Hot plug events as the OS sees them: the state at bring-up, an event for each plug and unplug in order, a bounded queue, the pin that interrupts too often reported once.
+static void test_hotplug_events() {
+  Rig rig;
+  rig.card.gfx.set_reg(0x1898 + 8, 0x2);        // pin 1 senses a display at bring-up
+  rig.card.gfx.set_reg(0x1898 + 8 * 5, 0x2);    // so does pin 5, which is not watched
+  AmdVegaM vega(rig.alloc);
+  AmdVegaM::Inputs in = rig.inputs();
+  in.hpd_pins = 0x0F;
+  CHECK(vega.bring_up(in));
+  if (!vega.up()) return;
+  AmdVegaM::HotplugEvent e;
+  CHECK(vega.connected_pins() == 0x2 && !vega.take_hotplug(&e) && vega.hotplug_events_dropped() == 0);
+  // A display plugged in on pin 0 (asserted in DISP_INTERRUPT_STATUS bit 17, the pin senses it now), then pulled out of pin 1 (DISP_INTERRUPT_STATUS_CONTINUE).
+  rig.card.gfx.set_reg(0x1857, 0x20000);
+  rig.card.gfx.set_reg(0x1898, 0x2);
+  rig.card.ih.post(42, 0, 0, 0, 0);
+  rig.card.gfx.set_reg(0x1858, 0x20000);
+  rig.card.gfx.set_reg(0x1898 + 8, 0x0);
+  rig.card.ih.post(42, 1, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 2);
+  CHECK(vega.connected_pins() == 0x1);
+  CHECK(vega.take_hotplug(&e) && e.pin == 0 && e.connected && !e.throttled);
+  CHECK(vega.take_hotplug(&e) && e.pin == 1 && !e.connected && !e.throttled);
+  CHECK(!vega.take_hotplug(&e) && vega.take_hotplug(nullptr) == false);
+  // An interrupt for a pin that is not asserted is not an event.
+  rig.card.gfx.set_reg(0x1859, 0);
+  rig.card.ih.post(42, 2, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && !vega.take_hotplug(&e) && vega.connected_pins() == 0x1);
+  // More events than the queue holds: the oldest go, and the number lost is counted. Pins 0, 1 and 2 take turns (three does not divide the queue's sixteen), so the survivors can be told
+  // from the first sixteen.
+  rig.card.gfx.set_reg(0x1857, 0x20000);
+  rig.card.gfx.set_reg(0x1858, 0x20000);
+  rig.card.gfx.set_reg(0x1859, 0x20000);
+  rig.card.gfx.set_reg(0x1898, 0x2);
+  rig.card.gfx.set_reg(0x1898 + 8, 0x2);
+  rig.card.gfx.set_reg(0x1898 + 16, 0x2);
+  for (uint32_t i = 0; i < 20; ++i) rig.card.ih.post(42, i % 3, 0, 0, 0);
+  CHECK(vega.service_interrupts(20) == 20);
+  CHECK(vega.hotplug_events_dropped() == 4);
+  for (uint32_t i = 4; i < 20; ++i) CHECK(vega.take_hotplug(&e) && e.pin == i % 3);
+  CHECK(!vega.take_hotplug(&e));
+  // The pin that will not stop: after AmdIrq::kHotplugStormLimit events it is switched off, and the event that does it says so, once.
+  const uint32_t before = vega.irq()->hotplug_count(2);
+  uint32_t throttled_events = 0, taken = 0;
+  for (uint32_t i = 0; i < AmdIrq::kHotplugStormLimit + 10; ++i) {
+    rig.card.ih.post(42, 2, 0, 0, 0);
+    vega.service_interrupts();
+    while (vega.take_hotplug(&e)) { ++taken; throttled_events += e.throttled; }
+  }
+  CHECK(taken == AmdIrq::kHotplugStormLimit + 10 && throttled_events == 1 && vega.irq()->hpd_throttled(2) && before + taken == vega.irq()->hotplug_count(2));
+  // Shutting down forgets all of it; a new bring-up starts from the pins as they are.
+  vega.shutdown();
+  CHECK(vega.connected_pins() == 0 && !vega.take_hotplug(&e));
+  memset(rig.doorbell_base, 0, 0x800 * 4);
+  rig.card.gfx.set_reg(0x1898 + 8, 0x0);
+  CHECK(vega.bring_up(in) && vega.connected_pins() == 0x1 + 0x4 && vega.hotplug_events_dropped() == 0);
+  // (a new life of the card reports a pin that stops interrupting once more)
+  throttled_events = 0;
+  for (uint32_t i = 0; i < AmdIrq::kHotplugStormLimit + 10; ++i) {
+    rig.card.ih.post(42, 2, 0, 0, 0);
+    vega.service_interrupts();
+    while (vega.take_hotplug(&e)) throttled_events += e.throttled;
+  }
+  CHECK(throttled_events == 1);
+}
+
 int main() {
   setvbuf(stdout, nullptr, _IONBF, 0);
   test_plan();
@@ -1274,6 +1340,7 @@ int main() {
   test_recovery_failure_sdma();
   test_card_reset();
   test_post_after_reset();
+  test_hotplug_events();
   printf(g_failed ? "AmdVegaMTest: %d FAILED\n" : "AmdVegaMTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }

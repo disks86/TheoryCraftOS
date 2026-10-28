@@ -382,8 +382,12 @@ and `AmdVce3::mc_resume` sets `VCE_SYS_INT_EN.VCE_SYS_INT_TRAP_INTERRUPT_EN` (`v
 polling, so these are counted (`uvd_encode_fences`, `vce_fences`) and shown to whoever asks: `AmdVegaM::set_event_observer(AmdIrq::ISink*)` passes every event on after the card has dealt with it. Nothing connects the
 video engines to the observer yet. `check_irq_port.py` also checks these ids and handlers and that both engines' start code still enables their sources.
 
-Nothing in the OS reacts to a hot plug yet: the connector cannot be re-detected (no AtomBIOS, no DDC/EDID over the card's own aux channels), so a plug or unplug is only counted and its state kept. Not done: the vline
-interrupt is not enabled (only classified and acknowledged), the audio and DP short-pulse (`DC_HPD_RX_INT`) interrupts; recovery from a fault is above.
+The OS reacts to hot plug events like this: `AmdVegaM` keeps the state of the pins it watches (`connected_pins()`: read from `DC_HPD_INT_STATUS.DC_HPD_SENSE` at bring-up, then updated by every event) and queues an event
+for each plug and unplug (`take_hotplug()`: the pin, whether a display is connected now, and a flag on the event that switches a bouncing pin off; the queue holds 16 and drops the oldest, counting them). The desktop loop
+drains the queue after `service_interrupts()` and, for each event, writes a line to the debug console and shows a toast ("A display was connected to output 3 of the Radeon RX Vega M"; "...keeps changing: its hot plug
+detection is switched off" as a warning); at boot the outputs that already have a display are logged. That is all there is to do about it for now: the card's outputs are not part of the desktop (the OS cannot put a
+picture on them: no mode setting without the AtomBIOS command tables for the encoders and PLLs, and no DDC/EDID read of the monitor on the other end), so a plug cannot add a monitor to the desktop's layout. A pin
+is only a number: which physical connector it is (HDMI, DisplayPort) is in the video BIOS's object table, which is not read. Not done: the vline interrupt is not enabled (only classified and acknowledged), the audio and DP short-pulse (`DC_HPD_RX_INT`) interrupts; recovery from a fault is above.
 
 ### MSI: interrupts wake the CPU
 
