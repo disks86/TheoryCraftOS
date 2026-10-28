@@ -33,8 +33,7 @@ namespace hardware {
 // expansion ROM, and the card's own ROM read through the SMC's ROM index and data registers (the Volcanic Islands cards' amdgpu_read_bios_from_rom). Every image found must pass
 // check_atom_bios: the 0xAA55 signature, a pointer at 0x48 to a header that has "ATOM" (or "MOTA") at offset 4.
 //
-// Not done: the copy in video memory (for SR-IOV), and the
-// "disabled ROM" path that clears the ROM disable bits of the card before reading it.
+// The last resort is the expansion ROM switched on again when the firmware left it disabled (read_from_disabled_rom). Not done: the copy in video memory (for SR-IOV).
 class AmdVbios {
  public:
   static constexpr uint32_t kSignatureOffset = 0x30;       // AMD_VBIOS_SIGNATURE_OFFSET
@@ -47,7 +46,7 @@ class AmdVbios {
   static constexpr uint32_t kSmcIndex = 0x1AC, kSmcData = 0x1AD;
   static constexpr uint32_t kRomIndex = 0xc0600010, kRomData = 0xc0600014;
 
-  enum class Source : uint8_t { None, Atrm, Vfct, LegacyShadow, RomBar, RomRegisters };
+  enum class Source : uint8_t { None, Atrm, Vfct, LegacyShadow, RomBar, RomRegisters, DisabledRom };
   static const char* source_name(Source source);
 
   // check_atom_bios
@@ -71,6 +70,13 @@ class AmdVbios {
   static constexpr uint64_t kLegacyShadowBase = 0xC0000, kLegacyShadowBytes = 0x20000;
   static bool read_from_legacy_shadow(IRegisterMapper& mapper, allocators::IAllocator& allocator, uint16_t vendor_id, uint16_t device_id, ByteBuffer* out);
 
+  // amdgpu_read_disabled_bios with vi_read_disabled_bios: a card whose firmware switched its ROM off. BUS_CNTL.BIOS_ROM_DIS is cleared, the VGA modes of the first two display controllers and
+  // VGA_RENDER_CONTROL's status select are cleared (only if the card has display controllers: `display_engine`), and ROM_CNTL (an SMC register) gets SCK_OVERWRITE, then the expansion
+  // ROM is read as read_from_rom_bar does and every register put back (the same order as the driver, whatever the result).
+  static constexpr uint32_t kBusCntl = 0x1508, kD1VgaControl = 0xcc, kD2VgaControl = 0xce, kVgaRenderControl = 0xc0, kRomCntl = 0xc0600000;
+  static constexpr uint32_t kBiosRomDis = 0x2, kVgaModeEnable = 0x1, kVgaTimingSelect = 0x100, kVgaVstatusCntl = 0x30000, kSckOverwrite = 0x2;
+  static bool read_from_disabled_rom(IVcnRegisters& registers, bool display_engine, IPciBus& pci, PciAddress function, IRegisterMapper& mapper, allocators::IAllocator& allocator, ByteBuffer* out);
+
   // The vendor and device ID in the PCI data structure of an expansion ROM image (false if it has none).
   static bool rom_ids(ConstByteView image, uint16_t* vendor_id, uint16_t* device_id);
 
@@ -90,7 +96,8 @@ class AmdVbios {
     ConstByteView vfct;                  // the VFCT table, if the machine has one
     IPciBus* pci = nullptr;              // for the expansion ROM
     IRegisterMapper* mapper = nullptr;
-    IVcnRegisters* registers = nullptr;  // the card's, for the ROM read through the SMC
+    IVcnRegisters* registers = nullptr;  // the card's, for the ROM read through the SMC and for the disabled ROM path
+    bool display_engine = true;          // the card has display controllers (the disabled ROM path clears their VGA modes)
     allocators::IAllocator* allocator = nullptr;   // for the copies made while reading (the ROM sources need it)
     PciAddress function{};
     uint16_t vendor_id = 0, device_id = 0;

@@ -647,6 +647,103 @@ static void test_legacy_shadow() {
   }
 }
 
+// --- The disabled ROM path ---------------------------------------------------------------------------------------------------------------------
+
+// A card whose ROM answers only when the registers the driver clears are cleared (BUS_CNTL bit 1, the VGA modes and timing select of the first two controllers, the VGA render status
+// select, and ROM_CNTL bit 1 set through the SMC index and data pair). All numbers are literal here.
+struct LockedCard final : IVcnRegisters {
+  std::map<uint32_t, uint32_t> regs;
+  std::vector<std::pair<uint32_t, uint32_t>> writes;    // by dword, in order (the SMC's ROM_CNTL as 0xc0600000)
+  uint32_t smc_index = 0;
+  uint32_t get(uint32_t r) const { auto it = regs.find(r); return it == regs.end() ? 0 : it->second; }
+  bool unlocked(bool display_engine) const {
+    if (get(0x1508) & 2) return false;
+    if (!(get(0xc0600000) & 2)) return false;
+    if (display_engine && ((get(0xcc) & 0x101) || (get(0xce) & 0x101) || (get(0xc0) & 0x30000))) return false;
+    return true;
+  }
+  uint32_t read(uint32_t r) override {
+    if (r == 0x1AD) return get(smc_index);
+    return get(r);
+  }
+  void write(uint32_t r, uint32_t v) override {
+    if (r == 0x1AC) { smc_index = v; return; }
+    if (r == 0x1AD) { writes.push_back({smc_index, v}); regs[smc_index] = v; return; }
+    writes.push_back({r, v});
+    regs[r] = v;
+  }
+};
+
+// The ROM window as the card shows it: the image while the card is unlocked at the time of the map and of every read, ones otherwise.
+struct LockedWindow final : IRegisterMapper {
+  LockedCard* card = nullptr;
+  bool display_engine = true;
+  std::vector<uint8_t> image, locked_view;
+  uint32_t maps = 0;
+  bool unlocked_at_map = false;
+  bool map_registers(uint64_t, uint64_t length, MmioRegion* region) override {
+    ++maps;
+    unlocked_at_map = card->unlocked(display_engine);
+    std::vector<uint8_t>& view = unlocked_at_map ? image : locked_view;
+    if (length > view.size()) return false;
+    *region = MmioRegion(reinterpret_cast<uint64_t>(view.data()), length);
+    return true;
+  }
+};
+
+static void test_disabled_rom() {
+  TestAllocator alloc;
+  const PciAddress fn{1, 0, 0};
+  std::vector<uint8_t> image = atom_image(8);
+  put16(image, 0x18, 0x40);
+  memcpy(&image[0x40], "PCIR", 4);
+  put16(image, 0x40 + 16, 8);
+  image[0x40 + 21] = 0x80;
+  for (int display = 0; display < 2; ++display) {
+    LockedCard card;
+    card.regs[0x1508] = 0xA3;          // ROM disabled (bit 1), and other bits
+    card.regs[0xcc] = 0x00010101;      // VGA mode and timing select on, a bit beside them
+    card.regs[0xce] = 0x00000101;
+    card.regs[0xc0] = 0x00030007;
+    card.regs[0xc0600000] = 0x00F0;    // (ROM_CNTL: bit 1 clear)
+    LockedWindow window;
+    window.card = &card;
+    window.display_engine = display != 0;
+    window.image.assign(128 * 1024, 0);
+    memcpy(window.image.data(), image.data(), image.size());
+    window.locked_view.assign(128 * 1024, 0xFF);
+    RomPci pci;
+    pci.rom_register = 0xE0000000;
+    pci.size_mask = 0xFFFE0000;
+    ByteBuffer out(alloc);
+    // Locked, the plain ROM read finds nothing; the path unlocks it, reads it, and puts every register back.
+    CHECK(!AmdVbios::read_from_rom_bar(pci, fn, window, alloc, &out));
+    const std::map<uint32_t, uint32_t> before = card.regs;
+    card.writes.clear();
+    CHECK(AmdVbios::read_from_disabled_rom(card, display != 0, pci, fn, window, alloc, &out));
+    CHECK(window.unlocked_at_map && out.view().equals(ConstByteView(image.data(), image.size())));
+    CHECK(card.regs == before);
+    // The writes, in order: the unlock (BUS_CNTL, the three display registers if the card has them, ROM_CNTL), then the restore in the same order.
+    std::vector<std::pair<uint32_t, uint32_t>> expect;
+    expect.push_back({0x1508, 0xA1});
+    if (display) { expect.push_back({0xcc, 0x00010000}); expect.push_back({0xce, 0}); expect.push_back({0xc0, 0x00000007}); }
+    expect.push_back({0xc0600000, 0x00F2});
+    expect.push_back({0x1508, 0xA3});
+    if (display) { expect.push_back({0xcc, 0x00010101}); expect.push_back({0xce, 0x101}); expect.push_back({0xc0, 0x00030007}); }
+    expect.push_back({0xc0600000, 0x00F0});
+    CHECK(card.writes == expect);
+    // A card without display controllers: their registers are neither read nor written.
+    if (!display) for (const auto& w : card.writes) CHECK(w.first != 0xcc && w.first != 0xce && w.first != 0xc0);
+    // The ROM does not come even then (no base assigned): nothing is found, and the registers are still put back.
+    RomPci unassigned;
+    unassigned.size_mask = 0xFFFE0000;
+    out.clear();
+    card.writes.clear();
+    CHECK(!AmdVbios::read_from_disabled_rom(card, display != 0, unassigned, fn, window, alloc, &out) && out.size() == 0 && card.regs == before);
+    CHECK(card.writes.size() == expect.size());
+  }
+}
+
 static void test_find_order() {
   TestAllocator alloc;
   const PciAddress fn{1, 0, 0};
@@ -728,6 +825,44 @@ static void test_find_order() {
     s.pci = &pci;
     s.device_id = 0x6860;
   }
+  // The disabled ROM is the last resort: only when the other sources give nothing, the ROM base is assigned, and the ROM answers once unlocked.
+  {
+    std::vector<uint8_t> rom_image = atom_image(8);
+    put16(rom_image, 0x18, 0x40);
+    memcpy(&rom_image[0x40], "PCIR", 4);
+    put16(rom_image, 0x40 + 16, 8);
+    rom_image[0x40 + 21] = 0x80;
+    rom_image[0x300] = 0x77;
+    LockedCard card;
+    card.regs[0x1508] = 2;
+    LockedWindow window;
+    window.card = &card;
+    window.image.assign(128 * 1024, 0);
+    memcpy(window.image.data(), rom_image.data(), rom_image.size());
+    window.locked_view.assign(128 * 1024, 0xFF);
+    RomPci locked_pci;
+    locked_pci.rom_register = 0xE0000000;
+    locked_pci.size_mask = 0xFFFE0000;
+    AmdVbios::Sources last;
+    last.allocator = &alloc;
+    last.pci = &locked_pci;
+    last.mapper = &window;
+    last.registers = &card;
+    last.function = fn;
+    last.vendor_id = 0x1002;
+    last.device_id = 0x6860;
+    CHECK(AmdVbios::find(last, &out) == AmdVbios::Source::DisabledRom && out.view()[0x300] == 0x77);
+    CHECK(card.regs[0x1508] == 2);   // (put back)
+    last.registers = nullptr;
+    out.clear();
+    CHECK(AmdVbios::find(last, &out) == AmdVbios::Source::None && out.size() == 0);
+    last.registers = &card;
+    last.pci = nullptr;
+    CHECK(AmdVbios::find(last, &out) == AmdVbios::Source::None);
+    last.pci = &locked_pci;
+    last.mapper = nullptr;
+    CHECK(AmdVbios::find(last, &out) == AmdVbios::Source::None);
+  }
   // Nothing: none, and the output is left empty-handed.
   AmdVbios::Sources none;
   none.allocator = &alloc;
@@ -738,7 +873,7 @@ static void test_find_order() {
   no_alloc.function = fn; no_alloc.vendor_id = 0x1002; no_alloc.device_id = 0x694C;
   // (the VFCT needs no allocator for the copy beyond the output's own)
   CHECK(AmdVbios::find(no_alloc, &o2) == AmdVbios::Source::Vfct);
-  CHECK(AmdVbios::source_name(AmdVbios::Source::None) && AmdVbios::source_name(AmdVbios::Source::Atrm) && AmdVbios::source_name(AmdVbios::Source::LegacyShadow) && AmdVbios::source_name(AmdVbios::Source::Vfct) && AmdVbios::source_name(AmdVbios::Source::RomBar) && AmdVbios::source_name(AmdVbios::Source::RomRegisters));
+  CHECK(AmdVbios::source_name(AmdVbios::Source::None) && AmdVbios::source_name(AmdVbios::Source::Atrm) && AmdVbios::source_name(AmdVbios::Source::LegacyShadow) && AmdVbios::source_name(AmdVbios::Source::DisabledRom) && AmdVbios::source_name(AmdVbios::Source::Vfct) && AmdVbios::source_name(AmdVbios::Source::RomBar) && AmdVbios::source_name(AmdVbios::Source::RomRegisters));
 }
 
 
@@ -749,6 +884,7 @@ int main() {
   test_rom_registers();
   test_rom_bar();
   test_legacy_shadow();
+  test_disabled_rom();
   test_find_order();
   test_atrm();
   printf(g_failed ? "AmdVbiosTest: %d FAILED\n" : "AmdVbiosTest: all passed\n", g_failed);

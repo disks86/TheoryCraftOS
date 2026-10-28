@@ -44,6 +44,7 @@ const char* AmdVbios::source_name(Source source) {
     case Source::LegacyShadow: return "legacy shadow at 0xC0000";
     case Source::RomBar: return "PCI expansion ROM";
     case Source::RomRegisters: return "the card's ROM registers";
+    case Source::DisabledRom: return "the expansion ROM, switched on again";
   }
   return "unknown";
 }
@@ -241,6 +242,47 @@ bool AmdVbios::read_from_atrm(acpi::AmlInterpreter& aml, PciAddress function, al
   return out->append(image.view());
 }
 
+bool AmdVbios::read_from_disabled_rom(IVcnRegisters& registers, bool display_engine, IPciBus& pci, PciAddress function, IRegisterMapper& mapper, allocators::IAllocator& allocator, ByteBuffer* out) {
+  auto smc_read = [&](uint32_t reg) {   // vi_smc_rreg
+    registers.write(kSmcIndex, reg);
+    return registers.read(kSmcData);
+  };
+  auto smc_write = [&](uint32_t reg, uint32_t value) {   // vi_smc_wreg
+    registers.write(kSmcIndex, reg);
+    registers.write(kSmcData, value);
+  };
+  const uint32_t bus_cntl = registers.read(kBusCntl);
+  uint32_t d1vga = 0, d2vga = 0, vga_render = 0;
+  if (display_engine) {
+    d1vga = registers.read(kD1VgaControl);
+    d2vga = registers.read(kD2VgaControl);
+    vga_render = registers.read(kVgaRenderControl);
+  }
+  const uint32_t rom_cntl = smc_read(kRomCntl);
+
+  // enable the rom
+  registers.write(kBusCntl, bus_cntl & ~kBiosRomDis);
+  if (display_engine) {
+    // Disable VGA mode
+    registers.write(kD1VgaControl, d1vga & ~(kVgaModeEnable | kVgaTimingSelect));
+    registers.write(kD2VgaControl, d2vga & ~(kVgaModeEnable | kVgaTimingSelect));
+    registers.write(kVgaRenderControl, vga_render & ~kVgaVstatusCntl);
+  }
+  smc_write(kRomCntl, rom_cntl | kSckOverwrite);
+
+  const bool found = read_from_rom_bar(pci, function, mapper, allocator, out);
+
+  // restore regs
+  registers.write(kBusCntl, bus_cntl);
+  if (display_engine) {
+    registers.write(kD1VgaControl, d1vga);
+    registers.write(kD2VgaControl, d2vga);
+    registers.write(kVgaRenderControl, vga_render);
+  }
+  smc_write(kRomCntl, rom_cntl);
+  return found;
+}
+
 AmdVbios::Source AmdVbios::find(const Sources& s, ByteBuffer* out) {
   if (s.aml && s.allocator && read_from_atrm(*s.aml, s.function, *s.allocator, out)) return Source::Atrm;
   if (s.vfct.size() != 0) {
@@ -254,6 +296,7 @@ AmdVbios::Source AmdVbios::find(const Sources& s, ByteBuffer* out) {
   if (s.mapper && read_from_legacy_shadow(*s.mapper, *s.allocator, s.vendor_id, s.device_id, out)) return Source::LegacyShadow;
   if (s.pci && s.mapper && read_from_rom_bar(*s.pci, s.function, *s.mapper, *s.allocator, out)) return Source::RomBar;
   if (s.registers && read_from_rom_registers(*s.registers, *s.allocator, out)) return Source::RomRegisters;
+  if (s.registers && s.pci && s.mapper && read_from_disabled_rom(*s.registers, s.display_engine, *s.pci, s.function, *s.mapper, *s.allocator, out)) return Source::DisabledRom;
   return Source::None;
 }
 
