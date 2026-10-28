@@ -25,6 +25,7 @@
 #include "Process/WindowsRegistry.hpp"
 #include "Process/WindowsPipes.hpp"
 #include "Process/WindowsSockets.hpp"
+#include "Process/WindowsProcess.hpp"
 
 namespace process::windowsabi {
 
@@ -720,7 +721,7 @@ uint32_t nt_map_view_of_section(Process& p, const SyscallRequest& r) {
   ObjectManager* objects = system_objects();
   AddressSpace* space = p.address_space();
   if (!objects || !space) return kNotImplemented;
-  if (r.args[1] != kCurrentProcess) return kNotImplemented;      // other processes are not reachable
+  if (!names_own_process(p, r.args[1])) return kNotImplemented;      // other processes are not reachable
   const uint32_t id = object_of(p, r.args[0], DescriptorKind::Section);
   if (!id) return kInvalidHandle;
   ObjectManager::SectionInfo info;
@@ -769,7 +770,7 @@ uint32_t nt_map_view_of_section(Process& p, const SyscallRequest& r) {
 uint32_t nt_unmap_view_of_section(Process& p, const SyscallRequest& r) {
   AddressSpace* space = p.address_space();
   if (!space) return kNotImplemented;
-  if (r.args[0] != kCurrentProcess) return kNotImplemented;
+  if (!names_own_process(p, r.args[0])) return kNotImplemented;
   uint64_t base = 0, size = 0;
   PageAttributes attributes;
   if (space->attributes_at(r.args[1], &attributes) && attributes.type == PageAttributes::Image) {      // an image goes with all its pieces
@@ -782,7 +783,7 @@ uint32_t nt_unmap_view_of_section(Process& p, const SyscallRequest& r) {
 // NtFlushVirtualMemory(Process, PVOID* BaseAddress, PSIZE_T RegionSize, PIO_STATUS_BLOCK): a view of a file goes back to the file.
 uint32_t nt_flush_virtual_memory(Process& p, const SyscallRequest& r) {
   AddressSpace* space = p.address_space();
-  if (!space || r.args[0] != kCurrentProcess) return kNotImplemented;
+  if (!space || !names_own_process(p, r.args[0])) return kNotImplemented;
   uint64_t base = 0;
   if (r.args[1] == 0 || !p.read_user_u64(r.args[1], &base)) return kAccessViolation;
   if (SharedMemory* shared = space->shared_at(base)) shared->flush();

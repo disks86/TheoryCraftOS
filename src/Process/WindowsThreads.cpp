@@ -161,6 +161,7 @@ uint32_t nt_create_thread_ex(Process& p, const SyscallRequest& r) {
     uint64_t pid = 0;
     ObjectManager* objects = system_objects();
     if (!objects || !process_handle_info(p, r.args[3], &exited, &code, &pid)) return kInvalidHandle;
+    if (pid == p.id() && p.threads_terminated()) return 0xC0000022u;      // STATUS_ACCESS_DENIED (the program is ending)
     if (pid != p.id()) {
       if (exited) return 0xC000010Au;      // STATUS_PROCESS_IS_TERMINATING
       IProcessRuntime::RemoteOp op;

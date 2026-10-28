@@ -142,6 +142,14 @@ bool process_handle_info(Process& p, uint64_t handle, bool* exited, uint32_t* co
   return objects->query_process(uint32_t(p.files().token(slot)), exited, code, pid);
 }
 
+bool names_own_process(Process& p, uint64_t handle) {
+  if (handle == ~uint64_t{0}) return true;
+  bool exited = false;
+  uint32_t code = 0;
+  uint64_t pid = 0;
+  return process_handle_info(p, handle, &exited, &code, &pid) && pid == p.id();
+}
+
 uint32_t terminate_process_handle(Process& p, uint64_t handle, uint32_t code, bool* handled) {
   bool exited = false;
   uint32_t old_code = 0;
