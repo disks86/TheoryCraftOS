@@ -17,6 +17,7 @@
  */
 #pragma once
 #include <stdint.h>
+#include "Executable/PeFile.hpp"
 #include "Process/Process.hpp"
 #include "Process/Syscall.hpp"
 
@@ -27,6 +28,8 @@ namespace process::windowsabi {
 uint32_t unmap_view_in(Process& target, uint64_t address);
 // The NTSTATUS the headers of a file call for when it is no image (STATUS_INVALID_IMAGE_NOT_MZ, _NE_FORMAT, _PROTECT ...); 0 if they look like a PE file.
 uint32_t image_header_status(ConstByteView file);
+// The same, one step further: the status NtCreateSection(SEC_IMAGE) answers (0: an image this CPU can map; `pe` is parsed).
+uint32_t image_section_status(ConstByteView file, exe::PeFile& pe);
 // A view of the (not image) section `id` in `target`; and a handle for an object the caller already holds a reference for (kind and token as in the descriptor table).
 uint32_t map_view_in(Process& target, uint32_t id, uint64_t offset, uint64_t* base_in_out, uint64_t* view_in_out, uint32_t view_page);
 uint32_t give_object_handle_in(Process& target, uint32_t kind, uint64_t token, uint32_t denied, bool inherit, uint64_t* handle);

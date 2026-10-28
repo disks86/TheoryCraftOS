@@ -1371,7 +1371,7 @@ EXPORT NTSTATUS NTAPI LdrLoadDll(PWSTR search_path, PULONG flags, PUNICODE_STRIN
         if (got != 0 && got < sizeof(expanded)) { us.Buffer = expanded; us.Length = (USHORT)got; us.MaximumLength = (USHORT)(got + 2); }
       }
       const NTSTATUS status = ldr_load_one(flags, &us, handle);
-      if (NT_SUCCESS(status)) return status;
+      if (NT_SUCCESS(status) || status == STATUS_DLL_INIT_FAILED || status == (NTSTATUS)0xC000007B || status == (NTSTATUS)0xC000012F || status == (NTSTATUS)0xC000011B || status == (NTSTATUS)0xC0000131 || status == (NTSTATUS)0xC0000130 || status == (NTSTATUS)0xC000035A) return status;      /* (a file that is no image of any kind, or a library that began to run, is the answer) */
       if (status != STATUS_DLL_NOT_FOUND && status != (NTSTATUS)0xC0000034 && status != (NTSTATUS)0xC000003A && !found) { found = TRUE; first_error = status; }
     }
     dir = *end ? end + 1 : end;

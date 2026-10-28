@@ -140,7 +140,17 @@ void describe_pe_image(const exe::PeFile& pe, uint64_t file_size, uint8_t (&out)
   put(60, pe.checksum(), 4);
 }
 
-LoadStatus map_pe_image(const exe::PeFile& pe, ConstByteView file, AddressSpace& space, uint64_t base, bool require_entry, LoadedImage* out) {
+namespace {
+// The pieces of an image that were mapped so far, to give back if the rest fails.
+struct MappedPieces {
+  static constexpr uint32_t kMax = 97;      // the headers and up to 96 sections
+  uint64_t base[kMax] = {}, size[kMax] = {};
+  uint32_t count = 0;
+  bool add(uint64_t at, uint64_t bytes) { if (count >= kMax) return false; base[count] = at; size[count++] = bytes; return true; }
+  void release(AddressSpace& space) { while (count > 0) { --count; space.unmap(base[count], size[count]); } }
+};
+
+LoadStatus map_pe_image_pieces(const exe::PeFile& pe, ConstByteView file, AddressSpace& space, uint64_t base, bool require_entry, LoadedImage* out, MappedPieces& pieces) {
   if (!pe.is_pe32_plus() || pe.machine() != exe::kPeMachineAmd64) return LoadStatus::Unsupported;
   if (pe.section_alignment() < AddressSpace::kPageSize) return LoadStatus::Unsupported;      // the old 512-byte layout shares pages between sections
   const uint64_t image_size = pe.size_of_image();
@@ -151,7 +161,9 @@ LoadStatus map_pe_image(const exe::PeFile& pe, ConstByteView file, AddressSpace&
 
   const uint64_t header_bytes = pe.size_of_headers() < file.size() ? pe.size_of_headers() : file.size();
   if (header_bytes == 0 || header_bytes > image_pages) return LoadStatus::Malformed;      // (the last page of the image is whole whatever SizeOfImage says)
+  if (pe.sections().count() > MappedPieces::kMax - 1) return LoadStatus::Malformed;
   if (!space.map(base, header_bytes, kProtRead)) return LoadStatus::OutOfMemory;
+  pieces.add(base, header_bytes);
   if (!space.write_privileged(base, file.first(header_bytes))) return LoadStatus::Malformed;
 
   for (const exe::PeSection& section : pe.sections().view()) {
@@ -161,6 +173,7 @@ LoadStatus map_pe_image(const exe::PeFile& pe, ConstByteView file, AddressSpace&
     const uint8_t protection = uint8_t(((section.characteristics & exe::kPeSectionRead) ? kProtRead : 0) | ((section.characteristics & exe::kPeSectionWrite) ? kProtWrite : 0) |
                                        ((section.characteristics & exe::kPeSectionExecute) ? kProtExecute : 0));
     if (!space.map(base + section.virtual_address, span, protection)) return LoadStatus::Malformed;      // overlaps the headers or another section
+    pieces.add(base + section.virtual_address, span);
     // The file is mapped from the 512-byte boundary below the raw data, so a raw pointer that is not aligned shows the bytes in front of it too, and (then) the rest of the
     // page is what the file has there rather than zeros.
     const uint64_t delta = section.raw_offset & 511u;
@@ -190,6 +203,14 @@ LoadStatus map_pe_image(const exe::PeFile& pe, ConstByteView file, AddressSpace&
   if (!pe.is_dll() && image.entry != 0 && !space.check(image.entry, 1, kProtExecute)) return LoadStatus::Malformed;      // (a library whose entry point cannot run fails when it is called)
   *out = image;
   return LoadStatus::Ok;
+}
+}  // namespace
+
+LoadStatus map_pe_image(const exe::PeFile& pe, ConstByteView file, AddressSpace& space, uint64_t base, bool require_entry, LoadedImage* out) {
+  MappedPieces pieces;
+  const LoadStatus status = map_pe_image_pieces(pe, file, space, base, require_entry, out, pieces);
+  if (status != LoadStatus::Ok) pieces.release(space);      // (what was mapped goes back: a failed load leaves nothing behind)
+  return status;
 }
 
 LoadStatus map_stack(AddressSpace& space, uint64_t size, uint64_t* top) {
