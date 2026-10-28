@@ -488,6 +488,7 @@ add_executable(BOOTX64
   src/Desktop/Paint.cpp
   src/Desktop/MediaPlayer.cpp
   src/Desktop/Graphics3DTest.cpp
+  src/Desktop/CubeRenderer.cpp
   src/SystemMonitor.cpp
   src/SystemInventory.cpp
   src/SystemNetworkDetails.cpp

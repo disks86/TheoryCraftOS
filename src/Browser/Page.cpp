@@ -47,10 +47,11 @@ class Page::FrameEnv final : public IPageEnvironment {
   UniquePointer<IVideoClip> open_video(UniquePointer<ByteBuffer> data) override { return owner_.env_.open_video(util::move(data)); }
   UniquePointer<IVideoClip> open_audio(UniquePointer<ByteBuffer> data) override { return owner_.env_.open_audio(util::move(data)); }
   void navigate(StringView address, bool) override { owner_.frame_navigate(serial_, address); }
-  void navigate_post(StringView address, StringView type, StringView body) override { owner_.env_.navigate_post(address, type, body); }
+  void navigate_post(StringView address, StringView type, StringView body) override { owner_.frame_post(serial_, address, type, body); }
   bool clipboard_get(String* text) override { return owner_.env_.clipboard_get(text); }
   void clipboard_set(StringView text) override { owner_.env_.clipboard_set(text); }
   void pick_file(uint32_t node_serial, bool multiple) override { owner_.frame_pick_file(serial_, node_serial, multiple); }
+  bool open_window(StringView address, StringView target, bool noopener) override { return owner_.env_.open_window(address, target, noopener); }
   void set_hash(StringView) override {}
   void reload() override {}
   void history_go(int32_t) override {}
@@ -92,9 +93,12 @@ class Page::FrameEnv final : public IPageEnvironment {
 };
 
 struct Page::Frame {
-  Frame(Page& owner, uint32_t node_serial, allocators::IAllocator& a) : serial(node_serial), key(a), doc(a), env(owner, node_serial) {}
+  Frame(Page& owner, uint32_t node_serial, allocators::IAllocator& a) : serial(node_serial), key(a), post_type(a), post_body(a), doc(a), env(owner, node_serial) {}
   uint32_t serial;
   String key;
+  bool reload = false;               // the frame was pointed somewhere again (also to the address it has)
+  bool post = false;                 // ... with a POST: post_type / post_body are the request
+  String post_type, post_body;
   HtmlDocument doc;
   FrameEnv env;
   UniquePointer<Page> page;
@@ -1774,16 +1778,7 @@ void Page::send_form(dom::Node* form, dom::Node* submitter) {
     if (!dom::encode_urlencoded(entries, encoding, &body)) return;
     target.push_back('?');
     target.append(body.view());
-    if (!named.empty() && !named.starts_with("_")) {   // a frame of this page with that name shows the answer
-      for (uint32_t serial = 1; serial <= doc_.node_count(); ++serial) {
-        dom::Node* n = doc_.by_serial(serial);
-        StringView name;
-        if (!n || !n->is_tag("iframe") || !dom::is_connected(n) || !dom::get_attribute(n, "name", &name) || !name.equals(named)) continue;
-        frame_navigate(n->serial, target.view());
-        return;
-      }
-    }
-    env_.navigate(target.view(), false);
+    if (!send_to_target(named, target.view(), nullptr, StringView())) env_.navigate(target.view(), false);
     return;
   }
   StringView type = "application/x-www-form-urlencoded";
@@ -1802,7 +1797,10 @@ void Page::send_form(dom::Node* form, dom::Node* submitter) {
   } else {
     ok = dom::encode_urlencoded(entries, encoding, &body);
   }
-  if (ok) env_.navigate_post(target.view(), type, body.view());
+  if (!ok) return;
+  String posted_type(allocator_);
+  posted_type.assign(type);
+  if (!send_to_target(named, target.view(), posted_type.c_str(), body.view())) env_.navigate_post(target.view(), type, body.view());
 }
 
 // Tab and Shift+Tab: the next control (or the one before), and out of the form after the last one.
@@ -2194,13 +2192,95 @@ void Page::file_chosen(uint32_t node_serial, StringView name, StringView type, C
   flush_errors();
 }
 
+// The Frame record of an <iframe> (made when there is none yet; it loads at the next sync_frames()).
+Page::Frame* Page::frame_record(uint32_t frame_serial) {
+  for (uint64_t i = 0; i < frames_.count(); ++i)
+    if (frames_[i]->serial == frame_serial) return frames_[i].get();
+  auto fresh = UniquePointer<Frame>::make(allocator_, *this, frame_serial, allocator_);
+  if (!fresh || !frames_.push_back(util::move(fresh))) return nullptr;
+  return frames_[frames_.count() - 1].get();
+}
+
 // Following a link in a frame: the frame shows the page.
 void Page::frame_navigate(uint32_t frame_serial, StringView address) {
   dom::Node* n = doc_.by_serial(frame_serial);
   if (!n) return;
+  if (Frame* f = frame_record(frame_serial)) {
+    f->reload = true;
+    f->post = false;
+  }
   dom::remove_attribute(n, "srcdoc");
   dom::set_attribute(n, "src", address);
   doc_.touch();
+}
+
+// A form posted into a frame: the frame shows the answer to the request.
+void Page::frame_post(uint32_t frame_serial, StringView address, StringView content_type, StringView body) {
+  dom::Node* n = doc_.by_serial(frame_serial);
+  Frame* f = n ? frame_record(frame_serial) : nullptr;
+  if (!f) return;
+  f->reload = true;
+  f->post = true;
+  f->post_type.assign(content_type);
+  f->post_body.assign(body);
+  dom::remove_attribute(n, "srcdoc");
+  dom::set_attribute(n, "src", address);
+  doc_.touch();
+}
+
+// The <iframe> named `name` in this page or the frames of it. False when there is none.
+bool Page::find_named_frame(StringView name, Page** owner, uint32_t* serial) {
+  for (uint32_t i = 1; i <= doc_.node_count(); ++i) {
+    dom::Node* n = doc_.by_serial(i);
+    StringView v;
+    if (n && n->is_tag("iframe") && dom::is_connected(n) && dom::get_attribute(n, "name", &v) && v.equals(name)) {
+      *owner = this;
+      *serial = n->serial;
+      return true;
+    }
+  }
+  for (uint64_t i = 0; i < frames_.count(); ++i)
+    if (frames_[i]->page && frames_[i]->page->find_named_frame(name, owner, serial)) return true;
+  return false;
+}
+
+// Where the answer of a form goes: the window the `target` names (a GET when `content_type` is null, else a POST of `body`). False when the browser could not open
+// the window that was asked for (the caller then goes there in this one).
+bool Page::send_to_target(StringView target, StringView address, const char* content_type, StringView body) {
+  const bool post = content_type != nullptr;
+  Page* owner = nullptr;
+  uint32_t serial = 0;
+  if (target.empty() || target.equals_ignore_case("_self")) {
+    owner = this;
+  } else if (target.equals_ignore_case("_top")) {
+    owner = root();
+  } else if (target.equals_ignore_case("_parent")) {
+    owner = parent_ ? parent_ : this;
+  } else if (target.equals_ignore_case("_blank")) {
+    return !post && env_.open_window(address, "_blank", false);
+  } else if (!root()->find_named_frame(target, &owner, &serial)) {
+    return !post && env_.open_window(address, target, false);   // (a window of that name)
+  }
+  if (serial == 0) {   // a whole window: the page itself, or the top of the frames
+    if (owner == this) {
+      if (post) env_.navigate_post(address, StringView(content_type), body);
+      else env_.navigate(address, false);
+    } else if (owner->parent_) {   // (a page that is itself a frame is shown by the page around it)
+      owner->parent_->deliver_frame(owner->frame_serial_, address, content_type, body);
+    } else if (post) {
+      owner->env_.navigate_post(address, StringView(content_type), body);
+    } else {
+      owner->env_.navigate(address, false);
+    }
+    return true;
+  }
+  owner->deliver_frame(serial, address, content_type, body);
+  return true;
+}
+
+void Page::deliver_frame(uint32_t frame_serial, StringView address, const char* content_type, StringView body) {
+  if (content_type) frame_post(frame_serial, address, StringView(content_type), body);
+  else frame_navigate(frame_serial, address);
 }
 
 // Makes the pages of the <iframe>s that are new or whose address changed, draws those that changed, forgets those that are gone.
@@ -2233,8 +2313,8 @@ bool Page::sync_frames() {
     Frame* f = nullptr;
     for (uint64_t i = 0; i < frames_.count(); ++i)
       if (frames_[i]->serial == n->serial) f = frames_[i].get();
-    if (f && f->key.view().equals(key.view())) {
-      if (f->page && f->page->changed()) f->page->render(&f->doc);
+    if (f && f->key.view().equals(key.view()) && !f->reload && f->page) {
+      if (f->page->changed()) f->page->render(&f->doc);
       continue;
     }
     if (depth_ >= 3) continue;
@@ -2244,6 +2324,7 @@ bool Page::sync_frames() {
       f = frames_[frames_.count() - 1].get();
     }
     f->page.reset();
+    f->reload = false;
     f->key.assign(key.view());
     if (key.view().starts_with("srcdoc:")) {
       html.assign(srcdoc);
@@ -2257,7 +2338,30 @@ bool Page::sync_frames() {
       address.assign("about:blank");
     } else {
       address.assign(key.view());
-      if (!fetch_text_via_sw(key.view(), "iframe", 1u << 20, &html)) {
+      bool got;
+      if (f->post) {   // the answer to a form that was posted into the frame
+        FetchOptions options;
+        options.method = "POST";
+        options.url = key.view();
+        String headers(allocator_);
+        headers.assign("Content-Type: ");
+        headers.append(f->post_type.view());
+        headers.append("\r\n");
+        options.headers = headers.view();
+        options.body = text_as_bytes(f->post_body.view());
+        options.mode = FetchOptions::Mode::Navigate;
+        options.credentials = FetchOptions::Credentials::Include;
+        options.page_address = address_.view();
+        options.now_ms = env_.now_ms();
+        NetResponse response(allocator_);
+        got = env_.http_request(options, &response) && response.status >= 200 && response.status < 400 && html.assign(StringView(response.body.view()));
+        if (got && !response.url.empty()) address.assign(response.url.view());
+      } else {
+        got = fetch_text_via_sw(key.view(), "iframe", 1u << 20, &html);
+      }
+      f->post = false;
+      f->post_body.clear();
+      if (!got) {
         html.assign("<p>This frame could not be loaded.</p>");
       } else {   // (the bytes are read the way a browser reads a page: by a byte order mark or a <meta>)
         String decoded(allocator_);

@@ -59,6 +59,9 @@ class SystemAudioDevices {
   IAudioDevice* at(uint32_t index) const;
   uint32_t id(uint32_t index) const;
   SharedPointer<IAudioDevice> share(uint32_t index) const;
+  // Every device that can send its output elsewhere chooses again (IAudioDevice::retarget): a graphics card's HDMI / DisplayPort audio follows the displays that come and go. The number
+  // of devices that did.
+  uint32_t retarget();
   // True for a device that is real hardware, false for the software fallback.
   bool is_hardware(uint32_t index) const;
 
