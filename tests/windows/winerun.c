@@ -48,7 +48,7 @@ int main(void) {
       const char *underscore = strchr(line, '_'), *dot = strrchr(line, '.');
       if (underscore && dot && dot > underscore + 1 && (size_t)(dot - underscore) < sizeof(test_name)) { memcpy(test_name, underscore + 1, (size_t)(dot - underscore - 1)); test_name[dot - underscore - 1] = 0; }
     }
-    snprintf(command, sizeof(command), "C:\\Windows\\System32\\%s%s%s", line, test_name[0] ? " " : "", test_name);
+    snprintf(command, sizeof(command), "C:\\Windows\\Tests\\%s%s%s", line, test_name[0] ? " " : "", test_name);
     STARTUPINFOA si;
     memset(&si, 0, sizeof(si));
     si.cb = sizeof(si);
@@ -56,7 +56,7 @@ int main(void) {
     memset(&pi, 0, sizeof(pi));
     printf("=== %s start\n", line);
     fflush(stdout);
-    if (!CreateProcessA(NULL, command, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
+    if (!CreateProcessA(NULL, command, NULL, NULL, TRUE, 0, NULL, "C:\\Windows\\Tests", &si, &pi)) {
       printf("=== %s did not start (error %lu)\n", line, GetLastError());
       continue;
     }

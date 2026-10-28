@@ -856,6 +856,7 @@ static HMODULE load_library_ex(LPCWSTR name, HANDLE file, DWORD flags) {
   } else if (find_file(name, dll, g_dll_directory, path)) {
     unicode_string(&us, path);
   } else {
+    path[0] = 0;      /* (find_file may have left a name behind that is not a file) */
     unicode_string(&us, name);
   }
   if ((flags & 0x32) && has_separator(name) && !path[0] && !search) { set_error(ERROR_FILE_NOT_FOUND); return NULL; }      /* (a file named with a folder has to be there) */
@@ -2935,6 +2936,7 @@ EXPORT BOOL WINAPI RemoveDirectoryW(LPCWSTR path) {
 }
 EXPORT BOOL WINAPI RemoveDirectoryA(LPCSTR path) { WCHAR *w = to_wide(path); const BOOL ok = w ? RemoveDirectoryW(w) : FALSE; free_wide(w); return ok; }
 
+VOID NTAPI TcosNoteFileRename(PCWSTR from, PCWSTR to);
 EXPORT BOOL WINAPI MoveFileExW(LPCWSTR from, LPCWSTR to, DWORD flags) {
   WCHAR source_buffer[PATH_CHARS + 8], target_buffer[PATH_CHARS + 8];
   UNICODE_STRING source_name, target_name;
@@ -2959,6 +2961,8 @@ EXPORT BOOL WINAPI MoveFileExW(LPCWSTR from, LPCWSTR to, DWORD flags) {
   RtlFreeHeap(heap(), 0, info);
   NtClose(h);
   if (!NT_SUCCESS(status)) return fail_nt(status);
+  WCHAR from_full[PATH_CHARS], to_full[PATH_CHARS];      /* (the loader follows a library whose file moved, to know it by its new name) */
+  if (full_path_w(from, from_full, PATH_CHARS) && full_path_w(to, to_full, PATH_CHARS)) TcosNoteFileRename(from_full, to_full);
   return TRUE;
 }
 EXPORT BOOL WINAPI MoveFileW(LPCWSTR from, LPCWSTR to) { return MoveFileExW(from, to, 0); }

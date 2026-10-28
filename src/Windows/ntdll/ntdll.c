@@ -495,6 +495,7 @@ EXPORT void NTAPI RtlExitUserThread(NTSTATUS status) {
 
 /* New threads begin here (the kernel passes the thread's function and parameter in the first two argument registers); the function's return value is the thread's exit code. */
 EXPORT void NTAPI TcosThreadStart(LPTHREAD_START_ROUTINE start, PVOID parameter) {
+  if (!TEB_TLS_POINTER(NtCurrentTeb())) TEB_TLS_POINTER(NtCurrentTeb()) = *(PVOID **)((BYTE *)NtCurrentTeb() + 0x1788);      /* (the kernel left the thread-local array where it could not be seen) */
   fls_thread_begins();
   notify_all_modules(DLL_THREAD_ATTACH, NULL, 1);
   RtlExitUserThread((NTSTATUS)start(parameter));
@@ -1378,6 +1379,45 @@ EXPORT NTSTATUS NTAPI LdrLoadDll(PWSTR search_path, PULONG flags, PUNICODE_STRIN
   return first_error;
 }
 
+/* Files that were moved while the process runs (MoveFile tells us): a library is known by the path it was loaded from, and the same file under its new name is the same library. */
+static WCHAR ldr_upper(WCHAR c);
+#define MAX_RENAMES 16
+static struct { WCHAR from[260], to[260]; } g_renames[MAX_RENAMES];
+static ULONG g_rename_count;
+EXPORT VOID NTAPI TcosNoteFileRename(PCWSTR from, PCWSTR to) {
+  const ULONG slot = g_rename_count++ % MAX_RENAMES;
+  SIZE_T i = 0;
+  for (; from[i] && i < 259; i++) g_renames[slot].from[i] = from[i];
+  g_renames[slot].from[i] = 0;
+  for (i = 0; to[i] && i < 259; i++) g_renames[slot].to[i] = to[i];
+  g_renames[slot].to[i] = 0;
+}
+static BOOLEAN wide_equal_nocase(const WCHAR *a, const WCHAR *b) {
+  for (; *a && *b; a++, b++) if (ldr_upper(*a) != ldr_upper(*b)) return FALSE;
+  return *a == *b;
+}
+/* Is `path` where the file of `module_path` is now, following the moves? */
+static BOOLEAN moved_to(const WCHAR *module_path, const WCHAR *path) {
+  WCHAR current[260];
+  SIZE_T n = 0;
+  for (; module_path[n] && n < 259; n++) current[n] = module_path[n];
+  current[n] = 0;
+  for (ULONG step = 0; step < MAX_RENAMES; step++) {
+    BOOLEAN moved = FALSE;
+    const ULONG first = g_rename_count > MAX_RENAMES ? g_rename_count - MAX_RENAMES : 0;
+    for (ULONG r = first; r < g_rename_count; r++) {
+      const ULONG slot = r % MAX_RENAMES;
+      if (wide_equal_nocase(g_renames[slot].from, current)) {
+        SIZE_T k = 0;
+        for (; g_renames[slot].to[k]; k++) current[k] = g_renames[slot].to[k];
+        current[k] = 0;
+        moved = TRUE;
+      }
+    }
+    if (!moved) break;
+  }
+  return wide_equal_nocase(current, path);
+}
 /* A loaded library by name, with or without ".dll", in any case; only the file name counts. */
 static WCHAR ldr_upper(WCHAR c) { return c >= 'a' && c <= 'z' ? (WCHAR)(c - 32) : c; }
 static LDR_DATA_TABLE_ENTRY *ldr_find_name(const UNICODE_STRING *name) {
@@ -1405,7 +1445,31 @@ EXPORT NTSTATUS NTAPI LdrGetDllHandleEx(ULONG flags, PWSTR path, PULONG characte
   if ((flags & ~7u) || (flags & 3) == 3) return STATUS_INVALID_PARAMETER;
   if (!name || !handle) return STATUS_INVALID_PARAMETER;
   loader_lock();
-  LDR_DATA_TABLE_ENTRY *m = ldr_find_name(name);
+  LDR_DATA_TABLE_ENTRY *m = NULL;
+  BOOLEAN has_folder = FALSE;
+  for (USHORT i = 0; i < name->Length / 2; i++) if (name->Buffer[i] == '\\' || name->Buffer[i] == '/') has_folder = TRUE;
+  if (has_folder) {      /* a name with a folder is a file: the library that was loaded from it, or from where it was before it moved */
+    WCHAR text[260], full[260];
+    const SIZE_T n = name->Length / 2;
+    if (n < 260) {
+      for (SIZE_T i = 0; i < n; i++) text[i] = name->Buffer[i];
+      text[n] = 0;
+      const ULONG got = RtlGetFullPathName_U(text, sizeof(full), full, NULL);
+      if (got != 0 && got < sizeof(full)) {
+        PEB_LDR_DATA *ldr = NtCurrentPeb()->Ldr;
+        for (LIST_ENTRY *e = ldr->InLoadOrderModuleList.Flink; e != &ldr->InLoadOrderModuleList && !m; e = e->Flink) {
+          LDR_DATA_TABLE_ENTRY *c = entry_of(e);
+          WCHAR path[260];
+          const SIZE_T length = c->FullDllName.Length / 2;
+          if (length >= 260) continue;
+          for (SIZE_T i = 0; i < length; i++) path[i] = c->FullDllName.Buffer[i];
+          path[length] = 0;
+          if (moved_to(path, full)) m = c;
+        }
+      }
+    }
+  }
+  if (!m) m = ldr_find_name(name);
   if (!m) { loader_unlock(); return STATUS_DLL_NOT_FOUND; }
   PVOID base = m->DllBase;
   if (!(flags & 1) && m->LoadCount != LDR_STATIC) {

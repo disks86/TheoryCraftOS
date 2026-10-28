@@ -19,11 +19,12 @@
 // The to-do application: a list of the things still to do, each assigned to Today, Tomorrow, This week, Next week or Someday. A line of text and the
 // bucket to put it in are added with "Add"; "Done" (or Enter or a double click on the item) marks the chosen item as completed, and it leaves the list.
 // "Show" narrows the list to one bucket, or shows the completed items instead (where "Restore" puts one back and "Clear completed" deletes them for
-// good). The items are kept in the TodoStore (the application's storage under /AppStore/Todo), so they are still there after a restart. Like every program
+// good). Right-clicking an item opens a menu to mark it complete (or put it back), move it to another bucket (Today to Tomorrow, say) or delete it. The items are kept in the TodoStore (the application's storage under /AppStore/Todo), so they are still there after a restart. Like every program
 // window it can be a tab of a tabbed window, dragged out into its own window and back.
 #pragma once
 #include "Desktop/TodoStore.hpp"
 #include "Gui/Controls/Button.hpp"
+#include "Gui/Controls/ContextMenu.hpp"
 #include "Gui/Controls/DropDown.hpp"
 #include "Gui/Controls/Label.hpp"
 #include "Gui/Controls/ListView.hpp"
@@ -47,6 +48,8 @@ class Todo : public gui::Frame {
   bool add_item();
   bool update_item();
   bool complete_item();
+  // Moves the chosen open item to another bucket (its place in the list then follows the bucket).
+  bool move_item(Bucket bucket);
   bool delete_item();
   uint32_t clear_completed();
   void set_filter(Filter filter);
@@ -69,6 +72,7 @@ class Todo : public gui::Frame {
   gui::Button& done_button() { return done_; }
   gui::Button& delete_button() { return delete_; }
   gui::Button& clear_button() { return clear_; }
+  gui::ContextMenu& item_menu() { return item_menu_; }
 
   void layout() override;
 
@@ -80,6 +84,8 @@ class Todo : public gui::Frame {
   static void on_done(void* self, gui::Control&);
   static void on_delete(void* self, gui::Control&);
   static void on_clear(void* self, gui::Control&);
+  static void on_menu_opening(void* self, gui::Control&);
+  static void on_menu_move(void* target, gui::Control&);
   void say(StringView text) { status_.set_text(text); }
   bool showing_completed() const { return show_.selected_index() == kShowCompleted; }
   void update_buttons();   // enables what applies to the chosen item, and names the Done button (Restore for a completed item)
@@ -89,6 +95,16 @@ class Todo : public gui::Frame {
   gui::TextBox text_;
   gui::DropDown show_, bucket_;
   gui::Button add_, save_, done_, delete_, clear_;
+  // What a "Move to" entry of the menu moves the chosen item to (the handler's context).
+  struct MoveTarget {
+    Todo* todo = nullptr;
+    Bucket bucket = Bucket::Today;
+  };
+  gui::ContextMenu item_menu_;
+  gui::MenuItem* menu_done_ = nullptr;
+  gui::MenuItem* menu_move_[kBucketCount] = {};
+  gui::MenuItem* menu_delete_ = nullptr;
+  MoveTarget move_targets_[kBucketCount];
   TodoStore* store_ = nullptr;
   List<TodoStore::Item> items_;   // the items on show, in list order
 };

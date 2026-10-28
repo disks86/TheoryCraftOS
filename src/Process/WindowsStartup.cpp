@@ -65,7 +65,9 @@ uint64_t tls_bytes_needed(const TlsTemplate* t, uint32_t n) {
   return total;
 }
 // Fills the array and the blocks at `area` (copying the templates) and points the TEB at the array. False if a template cannot be read.
-bool write_tls(Writer& w, AddressSpace& space, uint64_t teb, uint64_t area, const TlsTemplate* t, uint32_t n) {
+// With `deferred` the TEB's ThreadLocalStoragePointer stays empty (a thread that has not started has no thread-local storage yet): the array's address waits in the unused
+// DeallocationBStore slot, and the thread's first code (ntdll's TcosThreadStart) moves it.
+bool write_tls(Writer& w, AddressSpace& space, uint64_t teb, uint64_t area, const TlsTemplate* t, uint32_t n, bool deferred = false) {
   uint64_t block = area + kTlsArrayBytes;
   for (uint32_t i = 0; i < n; ++i) {
     w.u64(area + 8 * uint64_t{i}, block);
@@ -78,7 +80,7 @@ bool write_tls(Writer& w, AddressSpace& space, uint64_t teb, uint64_t area, cons
     }
     block += (t[i].bytes + t[i].zero_fill + 15) & ~uint64_t{15};
   }
-  w.u64(teb + 0x58, area);                           // ThreadLocalStoragePointer
+  w.u64(teb + (deferred ? 0x1788 : 0x58), area);     // ThreadLocalStoragePointer
   return true;
 }
 
@@ -307,7 +309,7 @@ LoadStatus build_windows_thread(AddressSpace& space, const WindowsThreadInput& i
   w.u64(teb + 0x48, input.thread_id);
   w.u64(teb + 0x60, input.peb);
   w.u64(teb + 0x1478, base);                        // DeallocationStack
-  if (!write_tls(w, space, teb, tls_area, input.tls, input.tls_count)) { space.unmap(base, total); return LoadStatus::Malformed; }
+  if (!write_tls(w, space, teb, tls_area, input.tls, input.tls_count, true)) { space.unmap(base, total); return LoadStatus::Malformed; }
   if (!w.ok()) { space.unmap(base, total); return LoadStatus::Malformed; }
   out->teb = teb;
   out->stack_top = stack_top;

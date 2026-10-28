@@ -472,6 +472,24 @@ Adapter::Adapter(allocators::IAllocator& allocator, graphics::IGraphicsDevice& d
     caps_.mipmaps = true;
     device.destroy_image(image);
   }
+  probe.mip_levels = 1;
+  if (graphics::IImage* image = device.create_image(probe)) {
+    caps_.textures = true;
+    device.destroy_image(image);
+  }
+  // Whether the device takes shaders that are not its own fixed ones: the built-in shader with the names of the fixed kernels taken away (what is left is the function, the TGSI text
+  // and the Direct3D 9 tokens, which a device may or may not understand).
+  graphics::ShaderModuleDesc vertex = graphics::colored_vertex_shader(), fragment = graphics::colored_fragment_shader();
+  vertex.qpu_program = graphics::QpuProgram::None, vertex.eu_program = graphics::EuProgram::None;
+  fragment.qpu_program = graphics::QpuProgram::None, fragment.eu_program = graphics::EuProgram::None;
+  if (graphics::IShaderModule* module = device.create_shader_module(vertex)) {
+    caps_.programmable_vertex = true;
+    device.destroy_shader_module(module);
+  }
+  if (graphics::IShaderModule* module = device.create_shader_module(fragment)) {
+    caps_.programmable_pixel = true;
+    device.destroy_shader_module(module);
+  }
 }
 
 Adapter::~Adapter() {
@@ -560,6 +578,16 @@ NtStatus Adapter::create_shader(const ShaderDesc& desc, SharedPointer<ShaderObje
         if (kernel != FragmentKernel::None) {
           md.eu_program = kernel == FragmentKernel::Colored ? graphics::EuProgram::ColoredFragment : graphics::EuProgram::TexturedFragment;
           md.eu_varying = varying;
+          if (kernel == FragmentKernel::Colored) md.qpu_program = graphics::QpuProgram::ColoredFragment;
+        }
+      } else {
+        // The Raspberry Pi's vertex kernel is the matrix transform of the built-in shader; a Direct3D 9 shader that is exactly that runs on it (the matrix as rows if it takes dp4s).
+        uint8_t colour = 0;
+        const VertexKernel kernel = program->classify_vertex(&colour);
+        if (kernel != VertexKernel::None) {
+          md.qpu_program = graphics::QpuProgram::ColoredVertex;
+          md.qpu_matrix_rows = kernel == VertexKernel::MatrixRows;
+          md.qpu_flip_y = true;
         }
       }
       const NtStatus b = shader->d3d9_.bind(util::move(program), &md);

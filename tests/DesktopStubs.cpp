@@ -16,20 +16,17 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// Stand-ins for the clock and the debug console, which the desktop's 3D test window uses, and the logo the boot image carries (Logo.S), so the desktop
-// compiles on the development machine. (The tests run from the repository's root.)
+// Stand-ins for the clock, the debug console and the embedded logo (an empty image; Logo.S holds it in the kernel), which the desktop's 3D test window uses, so the desktop compiles on the development machine.
 #include <stdint.h>
+#include "Graphics/Logo/Logo.hpp"
 #include "Utility/StringView.hpp"
-
-extern "C" {
-extern const uint8_t tcos_logo_start[];
-extern const uint8_t tcos_logo_end[];
-}
-asm(".section .rodata\n.global tcos_logo_start\n.global tcos_logo_end\ntcos_logo_start:\n.incbin \"assets/logo.png\"\ntcos_logo_end:\n.previous\n");
 
 namespace hardware {
 uint64_t uptime_us() { return 0; }
 }
 namespace console {
 void debug_puts(StringView) {}
+}
+namespace graphics {
+ConstByteView embedded_logo_png() { return {}; }
 }
