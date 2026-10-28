@@ -31,6 +31,7 @@
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdIh3.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdIrq.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdSdma3.hpp"
+#include "Hardware/GraphicsProcessingUnit/AMD/AtomBios.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdSmu7Ucode.hpp"
 #include "Hardware/Mmio.hpp"
 #include "Hardware/RegisterMapper.hpp"
@@ -82,6 +83,7 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
     uint32_t hpd_pins = 0x3F;                     // the hot plug detect pins to watch (bit n: pin n); which pin a connector is on is in the video BIOS, so by default all of them
     IPciBus* pci = nullptr;                       // where the card is, for the full reset (AmdAsicReset): its configuration space
     PciAddress pci_address{};
+    ConstByteView vbios;                          // the card's video BIOS image, for POSTing it after a card reset (AtomBios); empty: no POST
     bool allow_asic_reset = false;                // recover() falls back to a full reset of the card when an engine will not come back from its soft reset (read the warning at reset_card())
     bool auto_recover = false;                    // service_interrupts() resets an engine that a fault or a timeout left wedged (at most kMaxRecoveries times in all)
     bool msi = false;                             // the card's MSI is on (PciMsi): the interrupt ring is told to re-arm it as the driver does (adev->irq.msi_enabled)
@@ -165,6 +167,10 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
   // clocks up, and this OS has no interpreter for them. A real card that has been reset therefore comes back quiet (no engine, no DMA) but not usable, and bring_up is expected to
   // fail until the machine is restarted; the video memory, including the firmware's framebuffer, is gone with it. Needs Inputs::pci. At most kMaxAsicResets in all.
   bool reset_card();
+  // The POST (amdgpu_device_asic_init): runs the video BIOS's ASIC_Init command table with the AtomBIOS interpreter, which trains the memory and sets the clocks up. Done by
+  // reset_card() after the reset when Inputs::vbios holds the image; false (and status() says why) if the image is not an AtomBIOS image or its table fails. Can also be called by hand
+  // on a card the firmware did not POST (with the same inputs bring_up takes).
+  bool post(const Inputs& inputs);
   uint32_t asic_resets() const { return asic_resets_; }
   static constexpr uint32_t kMaxAsicResets = 2;
   bool wedged() const;   // any engine is, or was left stopped by a recovery that did not work
