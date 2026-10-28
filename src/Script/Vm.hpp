@@ -148,6 +148,20 @@ class Vm {
   void define_accessor(JsObject* object, JsString* key, const Value& getter, const Value& setter, uint8_t flags = kEnumerable);
   void define_named(JsObject* object, StringView name, const Value& value, uint8_t flags = kDefaultFlags) { define(object, intern(name), value, flags); }
   void define_native(JsObject* object, StringView name, NativeFn fn, uint32_t arity);
+  // Direct eval: the instruction before the Call of `eval(...)` leaves here where it was called from, and the eval function takes it (take_pending_eval).
+  struct PendingEval {
+    FunctionCode* code = nullptr;
+    uint32_t index = 0;
+    Env* env = nullptr;
+    Value this_value;
+  };
+  void set_eval_function(JsObject* f) { eval_function_ = f; }
+  bool take_pending_eval(PendingEval* out) {
+    if (!pending_eval_.code) return false;
+    *out = pending_eval_;
+    pending_eval_ = PendingEval();
+    return true;
+  }
   bool array_push(JsObject* array, const Value& value);
   // A bound function's arguments are kept in its items.
   bool array_push_bound(JsObject* bound, const Value& value);
@@ -417,6 +431,8 @@ class Vm {
   uint32_t interned_cap_ = 0, interned_count_ = 0;
   List<Cell*> gray_;
   List<FunctionCode*> codes_;
+  PendingEval pending_eval_;
+  JsObject* eval_function_ = nullptr;   // the real eval (a call of anything else is not a direct eval)
   bool halted_ = false, gc_wanted_ = false;
   Value receiver_;                       // the object a property is being read from, while get() looks for it (what a getter sees as `this`)
   bool has_receiver_ = false, getter_failed_ = false;
