@@ -65,6 +65,8 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
       calculator_(allocator),
       calendar_store_(UniquePointer<CalendarStore>::make(allocator, allocator, nullptr)),
       calendar_(allocator),
+      todo_store_(UniquePointer<TodoStore>::make(allocator, allocator, nullptr)),
+      todo_(allocator),
       file_properties_(allocator),
       media_player_(allocator),
       graphics_test_(allocator),
@@ -84,6 +86,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
       extra_terminals_(allocator),
       extra_calculators_(allocator),
       extra_calendars_(allocator),
+      extra_todos_(allocator),
       hosts_(allocator) {
   // Taskbar: Start at the left, the clock in a sunken tray at the right, the window switcher in between.
   taskbar_.set_style(PanelStyle::Raised);
@@ -106,6 +109,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   start_.menu().add_item("Terminal", {&Desktop::on_terminal, this});
   start_.menu().add_item("Calculator", {&Desktop::on_calculator, this});
   start_.menu().add_item("Calendar", {&Desktop::on_calendar, this});
+  start_.menu().add_item("To-Do", {&Desktop::on_todo, this});
   start_.menu().add_item("Paint", {&Desktop::on_paint, this});
   start_.menu().add_item("Media Player", {&Desktop::on_media_player, this});
   start_.menu().add_item("3D Test", {&Desktop::on_graphics_test, this});
@@ -158,6 +162,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   setup_terminal(terminal_);
   setup_calculator(calculator_);
   setup_calendar(calendar_);
+  setup_todo(todo_);
   setup_explorer(explorer_);
   copy_progress_.on_finished({&Desktop::on_copy_finished, this});
 
@@ -237,6 +242,13 @@ void Desktop::set_file_system(filesystem::IFileSystem* fs) {
       calendar_.set_store(store.get());
       for (auto& c : extra_calendars_) c->set_store(store.get());
       calendar_store_ = util::move(store);
+    }
+    // The to-do items live on it too (/AppStore/Todo), switched over the same way.
+    UniquePointer<TodoStore> items = UniquePointer<TodoStore>::make(allocator_, allocator_, fs);
+    if (items) {
+      todo_.set_store(items.get());
+      for (auto& t : extra_todos_) t->set_store(items.get());
+      todo_store_ = util::move(items);
     }
   });
   media_player_.set_file_system(fs);
@@ -364,6 +376,11 @@ void Desktop::setup_terminal(Terminal& terminal) {
 
 void Desktop::setup_calculator(Calculator& calculator) { calculator.set_app_kind(kAppCalculator); }
 
+void Desktop::setup_todo(Todo& todo) {
+  todo.set_app_kind(kAppTodo);
+  todo.set_store(todo_store_.get());
+}
+
 void Desktop::setup_calendar(Calendar& calendar) {
   calendar.set_app_kind(kAppCalendar);
   calendar.set_store(calendar_store_.get());
@@ -453,6 +470,7 @@ void Desktop::on_new_tab(void* self, Control& sender) {
     case kAppTerminal: d->open_terminal(host); break;
     case kAppCalculator: d->open_calculator(host); break;
     case kAppCalendar: d->open_calendar(host); break;
+    case kAppTodo: d->open_todo(host); break;
     case kAppMedia: d->open_media_player(host); break;
     default: d->open_explorer(host); break;
   }
@@ -495,6 +513,7 @@ void Desktop::reap_closed() {
     sweep(extra_terminals_);
     sweep(extra_calculators_);
     sweep(extra_calendars_);
+    sweep(extra_todos_);
     sweep(hosts_);
   });
 }
@@ -565,6 +584,20 @@ uint32_t Desktop::calendar_count() const {
   for (const auto& e : extra_calendars_) n += e->manager() ? 1 : 0;
   return n;
 }
+
+Todo* Desktop::open_todo(TabFrame* into) {
+  Todo* todo = open_instance(todo_, extra_todos_, &Desktop::setup_todo, into);
+  if (todo) todo->refresh();   // (another window may have changed the list)
+  return todo;
+}
+
+uint32_t Desktop::todo_count() const {
+  uint32_t n = todo_.manager() ? 1 : 0;
+  for (const auto& e : extra_todos_) n += e->manager() ? 1 : 0;
+  return n;
+}
+
+void Desktop::on_todo(void* self, Control&) { static_cast<Desktop*>(self)->open_todo(); }
 
 void Desktop::on_calendar(void* self, Control&) { static_cast<Desktop*>(self)->open_calendar(); }
 void Desktop::on_calendar_toast(void* self, Control&) { static_cast<Desktop*>(self)->open_calendar(); }
