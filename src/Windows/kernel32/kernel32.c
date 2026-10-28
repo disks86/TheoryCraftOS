@@ -665,8 +665,9 @@ static DWORD dos_error_of_load(NTSTATUS status) {
   }
 }
 EXPORT BOOL WINAPI GetModuleHandleExW(DWORD flags, LPCWSTR name, HMODULE *module) {
-  LDR_DATA_TABLE_ENTRY *m = (flags & 4) ? module_containing((PVOID)name) : (name ? module_by_name(name) : module_by_base(NtCurrentPeb()->ImageBaseAddress));
   if (module) *module = NULL;
+  if (!module || (flags & ~7u) || (flags & 3) == 3 || ((flags & 4) && !name)) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  LDR_DATA_TABLE_ENTRY *m = (flags & 4) ? module_containing((PVOID)name) : (name ? module_by_name(name) : module_by_base(NtCurrentPeb()->ImageBaseAddress));
   if (!m) { set_error(ERROR_MOD_NOT_FOUND); return FALSE; }
   if (!(flags & 2) || (flags & 1)) {      /* another use (a pin is a use that is never given back) */
     UNICODE_STRING base_name = m->BaseDllName;
@@ -705,9 +706,15 @@ EXPORT DWORD WINAPI GetModuleFileNameA(HMODULE module, LPSTR buffer, DWORD capac
   WCHAR wide[MAX_PATH * 2];
   const DWORD n = GetModuleFileNameW(module, wide, MAX_PATH * 2);
   if (n == 0) return 0;
-  const DWORD r = wide_result_to_ansi(wide, n, buffer, capacity);
-  if (r > capacity) { if (capacity) buffer[capacity - 1] = 0; set_error(ERROR_INSUFFICIENT_BUFFER); return capacity; }
-  return r;
+  if (n + 1 > capacity) {      /* too small: what fits, ended by a NUL, and the size of the buffer */
+    if (capacity) {
+      wide_result_to_ansi(wide, capacity - 1, buffer, capacity);
+      buffer[capacity - 1] = 0;
+    }
+    set_error(ERROR_INSUFFICIENT_BUFFER);
+    return capacity;
+  }
+  return wide_result_to_ansi(wide, n, buffer, capacity);
 }
 
 typedef struct { ULONG Characteristics, TimeDateStamp; USHORT MajorVersion, MinorVersion; ULONG Name, Base, NumberOfFunctions, NumberOfNames, AddressOfFunctions, AddressOfNames, AddressOfNameOrdinals; } ExportDirectory;
@@ -849,9 +856,11 @@ static HMODULE load_library_ex(LPCWSTR name, HANDLE file, DWORD flags) {
   } else if (find_file(name, dll, g_dll_directory, path)) {
     unicode_string(&us, path);
   } else {
+    path[0] = 0;      /* (find_file may have left a name behind that is not a file) */
     unicode_string(&us, name);
   }
-  if ((flags & 0x32) && (has_separator(name) || !GetModuleHandleW(path[0] ? path : name))) {      /* AS_DATAFILE 2, AS_DATAFILE_EXCLUSIVE 0x10, AS_IMAGE_RESOURCE 0x20: the file is only mapped (a loaded library is used as it is) */
+  if ((flags & 0x32) && has_separator(name) && !path[0] && !search) { set_error(ERROR_FILE_NOT_FOUND); return NULL; }      /* (a file named with a folder has to be there) */
+  if ((flags & 0x32) && !GetModuleHandleW(path[0] ? path : name)) {      /* AS_DATAFILE 2, AS_DATAFILE_EXCLUSIVE 0x10, AS_IMAGE_RESOURCE 0x20: the file is only mapped (a loaded library is used as it is) */
     if (!path[0]) { set_error(has_separator(name) ? ERROR_FILE_NOT_FOUND : ERROR_MOD_NOT_FOUND); return NULL; }
     HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
     if (f == INVALID_HANDLE_VALUE) return NULL;
@@ -896,7 +905,7 @@ EXPORT BOOL WINAPI FreeLibrary(HMODULE module) {
     if (!VirtualQuery(view, &info, sizeof(info)) || info.AllocationBase != view) { set_error(ERROR_BAD_EXE_FORMAT); return FALSE; }      /* (not the start of a view) */
     return UnmapViewOfFile(view);
   }      /* a data file or an image resource view */
-  if (!module_by_base(module)) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
+  if (!module_by_base(module)) { set_error(ERROR_MOD_NOT_FOUND); return FALSE; }
   const NTSTATUS status = LdrUnloadDll(module);
   return NT_SUCCESS(status) ? TRUE : (set_error(dos_error_of_load(status)), FALSE);
 }
@@ -1709,24 +1718,24 @@ static BOOL find_file(LPCWSTR name, LPCWSTR extension, LPCWSTR extra, WCHAR *out
   }
   return FALSE;
 }
-#define MAX_USER_DLL_DIRS 16
-static struct { WCHAR path[PATH_CHARS]; BOOL used; } g_user_dll_dirs[MAX_USER_DLL_DIRS];
+NTSTATUS NTAPI LdrAddDllDirectory(PUNICODE_STRING directory, PVOID *cookie);
+NTSTATUS NTAPI LdrRemoveDllDirectory(PVOID cookie);
+NTSTATUS NTAPI LdrGetDllPath(PCWSTR name, ULONG flags, PWSTR *path, PWSTR *unused);
+VOID NTAPI RtlReleasePath(PWSTR path);
 
 EXPORT PVOID WINAPI AddDllDirectory(LPCWSTR directory) {
-  if (!directory || wcslen(directory) >= PATH_CHARS || !(directory[0] && directory[1] == ':' && directory[2] == '\\') ) { set_error(ERROR_INVALID_PARAMETER); return NULL; }
-  for (int i = 0; i < MAX_USER_DLL_DIRS; i++) {
-    if (g_user_dll_dirs[i].used) continue;
-    lstrcpyW(g_user_dll_dirs[i].path, directory);
-    g_user_dll_dirs[i].used = TRUE;
-    return (PVOID)(ULONG_PTR)(i + 1);
-  }
-  set_error(ERROR_NOT_ENOUGH_MEMORY);
-  return NULL;
+  const BOOL device = directory && directory[0] == '\\' && directory[1] == '\\' && (directory[2] == '.' || directory[2] == '?') && directory[3] == '\\';
+  if (!directory || !((directory[0] && directory[1] == ':' && directory[2] == '\\') || directory[0] == '\\')) { set_error(ERROR_INVALID_PARAMETER); return NULL; }      /* (a full path) */
+  if (!device && GetFileAttributesW(directory) == INVALID_FILE_ATTRIBUTES) { set_error(ERROR_FILE_NOT_FOUND); return NULL; }
+  UNICODE_STRING text;
+  unicode_string(&text, directory);
+  PVOID cookie = NULL;
+  const NTSTATUS status = LdrAddDllDirectory(&text, &cookie);
+  if (!NT_SUCCESS(status)) { set_error(status == STATUS_NO_MEMORY ? ERROR_NOT_ENOUGH_MEMORY : ERROR_INVALID_PARAMETER); return NULL; }
+  return cookie;
 }
 EXPORT BOOL WINAPI RemoveDllDirectory(PVOID cookie) {
-  const ULONG_PTR i = (ULONG_PTR)cookie;
-  if (i < 1 || i > MAX_USER_DLL_DIRS || !g_user_dll_dirs[i - 1].used) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
-  g_user_dll_dirs[i - 1].used = FALSE;
+  if (!NT_SUCCESS(LdrRemoveDllDirectory(cookie))) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
   return TRUE;
 }
 EXPORT BOOL WINAPI SetDefaultDllDirectories(DWORD flags) {
@@ -1748,19 +1757,20 @@ static int find_library_restricted(LPCWSTR name, DWORD search, WCHAR *out) {
   if (length + 5 > MAX_PATH) return 0;
   memcpy(file, name, (length + 1) * 2);
   if (!has_extension) memcpy(file + length, dll, sizeof(dll));
-  if (absolute) return full_path_w(file, out, PATH_CHARS) != 0 && is_program_file(out) ? 1 : 0;
-  if (!has_separator(name) && search == 0x100) return -1;      /* (the folder of the library that is loaded needs a path to take it from) */
-  WCHAR directory[PATH_CHARS];
-  if (search & 0x200) {
-    DWORD n = GetModuleFileNameW(NULL, directory, PATH_CHARS);
-    while (n > 0 && directory[n - 1] != '\\') --n;
-    if (n > 0 && try_candidate(directory, n - 1, file, out)) return 1;
+  const BOOL rooted = name[0] == '\\' || (name[0] && name[1] == ':');      /* (rooted in the current drive, or a drive with its current folder) */
+  if (absolute || rooted) return full_path_w(file, out, PATH_CHARS) != 0 && is_program_file(out) ? 1 : 0;
+  if (search & 0x100) return -1;      /* (the folder of the library that is loaded needs a path to take it from) */
+  PWSTR list = NULL, unused = NULL;
+  if (!NT_SUCCESS(LdrGetDllPath(name, search, &list, &unused))) return -1;
+  int found = 0;
+  for (WCHAR *start = list; *start && !found;) {
+    WCHAR *end = start;
+    while (*end && *end != ';') ++end;
+    if (end > start && (size_t_)(end - start) < PATH_CHARS && try_candidate(start, (size_t_)(end - start), file, out)) found = 1;
+    start = *end ? end + 1 : end;
   }
-  if (search & 0x400) {
-    for (int i = 0; i < MAX_USER_DLL_DIRS; i++) if (g_user_dll_dirs[i].used && try_candidate(g_user_dll_dirs[i].path, wcslen(g_user_dll_dirs[i].path), file, out)) return 1;
-  }
-  if ((search & 0x800) && try_candidate(system32, wcslen(system32), file, out)) return 1;
-  return 0;
+  RtlReleasePath(list);
+  return found;
 }
 
 static BOOL find_program(LPCWSTR name, WCHAR *out) {
@@ -2926,6 +2936,7 @@ EXPORT BOOL WINAPI RemoveDirectoryW(LPCWSTR path) {
 }
 EXPORT BOOL WINAPI RemoveDirectoryA(LPCSTR path) { WCHAR *w = to_wide(path); const BOOL ok = w ? RemoveDirectoryW(w) : FALSE; free_wide(w); return ok; }
 
+VOID NTAPI TcosNoteFileRename(PCWSTR from, PCWSTR to);
 EXPORT BOOL WINAPI MoveFileExW(LPCWSTR from, LPCWSTR to, DWORD flags) {
   WCHAR source_buffer[PATH_CHARS + 8], target_buffer[PATH_CHARS + 8];
   UNICODE_STRING source_name, target_name;
@@ -2950,6 +2961,8 @@ EXPORT BOOL WINAPI MoveFileExW(LPCWSTR from, LPCWSTR to, DWORD flags) {
   RtlFreeHeap(heap(), 0, info);
   NtClose(h);
   if (!NT_SUCCESS(status)) return fail_nt(status);
+  WCHAR from_full[PATH_CHARS], to_full[PATH_CHARS];      /* (the loader follows a library whose file moved, to know it by its new name) */
+  if (full_path_w(from, from_full, PATH_CHARS) && full_path_w(to, to_full, PATH_CHARS)) TcosNoteFileRename(from_full, to_full);
   return TRUE;
 }
 EXPORT BOOL WINAPI MoveFileW(LPCWSTR from, LPCWSTR to) { return MoveFileExW(from, to, 0); }

@@ -538,6 +538,42 @@ bool AmdVegaM::select_audio_pin(const AtomConnectors::Connector& connector) {
   return amd_dce11::AudioFormat(*inputs_.registers).select_pin(AtomConnectors::afmt_instance(connector), pin);
 }
 
+bool AmdVegaM::enable_audio(const AtomConnectors::Connector& connector, ConstByteView edid, const AudioMode& mode) {
+  if (!inputs_.registers || mode.crtc >= amd_dce11::kMaxCrtcs) return false;
+  refresh_audio_pins();       // (nothing is connected when the card is not up)
+  uint32_t pin = 0;
+  if (!audio_pin_for(connector, &pin)) return false;
+  const uint32_t block = AtomConnectors::afmt_instance(connector);
+  amd_dce11::AudioPins pins(*inputs_.registers);
+  amd_dce11::AudioFormat format(*inputs_.registers);
+  EdidAudio::Info info;
+  EdidAudio::parse(edid, &info);
+  uint8_t avi[Hdmi::kAviBytes];
+  Hdmi::avi_infoframe(mode, ByteView(avi, sizeof avi));
+  pins.set_enabled(pin, false);                                 // disable audio prior to setting up hw
+  format.setup_packets(block, mode.crtc, mode.clock_khz, mode.bpc);
+  pins.write_speaker_allocation(pin, info);
+  format.enable_channels(block);
+  format.select_pin(block, pin);
+  pins.write_sads(pin, info);                                   // (a monitor without descriptors leaves the registers alone)
+  pins.write_latency(pin, info, mode.interlaced);
+  format.start(block, ConstByteView(avi, sizeof avi));
+  pins.set_enabled(pin, true);                                  // enable audio after setting up hw
+  return true;
+}
+
+bool AmdVegaM::enable_audio(const AtomConnectors::Connector& connector, const AudioMode& mode) {
+  if (!inputs_.allocator) return false;
+  ByteBuffer edid(*inputs_.allocator);
+  return read_edid(connector, &edid) && enable_audio(connector, edid.view(), mode);
+}
+
+bool AmdVegaM::disable_audio(const AtomConnectors::Connector& connector) {
+  if (!up() || !inputs_.registers || AtomConnectors::afmt_instance(connector) >= amd_dce11::AudioFormat::kBlocks) return false;
+  const uint32_t pin = amd_dce11::AudioFormat(*inputs_.registers).selected_pin(AtomConnectors::afmt_instance(connector));
+  return amd_dce11::AudioPins(*inputs_.registers).set_enabled(pin, false);
+}
+
 uint32_t AmdVegaM::select_audio_pins() {
   uint32_t n = 0;
   for (const AtomConnectors::Connector& c : connectors()) {

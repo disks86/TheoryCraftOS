@@ -381,6 +381,8 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   uint32_t parent_window_id() override { return parent_ ? parent_->window_id_ : 0; }
   uint32_t top_window_id() override { return root()->window_id_; }
   void load_frames() override { sync_frames(); }
+  // Loads the frames that were pointed somewhere, until none is left to load (a load handler can point one again). For a host that does not draw.
+  void load_frames_all() { for (int i = 0; i < 1000 && sync_frames(); ++i) {} }
   uint32_t frame_window_id(uint32_t iframe_serial) override;
   bool post_window_message(uint32_t target_window, StringView target_origin, StringView payload, StringView ports) override;
   bool window_request(uint32_t target_window, StringView request, String* reply) override;
@@ -417,7 +419,7 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   struct Frame;
   class FrameEnv;
   friend class FrameEnv;
-  void sync_frames();
+  bool sync_frames();   // true when a frame was loaded
   void frame_navigate(uint32_t frame_serial, StringView address);
   void frame_pick_file(uint32_t frame_serial, uint32_t node_serial, bool multiple);
   void paste_text(dom::Node* control, StringView text);

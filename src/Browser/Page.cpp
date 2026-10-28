@@ -1739,6 +1739,23 @@ void Page::send_form(dom::Node* form, dom::Node* submitter) {
     return;
   }
   const bool post = method.trimmed().equals_ignore_case("post");
+  // The encoding of the bodies: the first usable one of accept-charset, else that of the page.
+  dom::Encoding encoding = static_cast<dom::Encoding>(doc_.character_encoding);
+  StringView accept;
+  if (dom::get_attribute(form, "accept-charset", &accept)) {
+    StringView rest = accept, token;
+    while (rest.next_token(' ', &token)) {
+      dom::Encoding found;
+      if (!token.empty() && dom::find_encoding(token, &found)) {
+        encoding = found;
+        break;
+      }
+    }
+  }
+  encoding = dom::output_encoding(encoding);
+  StringView named;   // the frame (or window) the answer goes to
+  pick("formtarget", "target", &named);
+  named = named.trimmed();
   List<dom::Entry> entries(allocator_);
   if (!dom::form_entries(form, submitter, &entries)) return;
   String target(allocator_);
@@ -1754,9 +1771,18 @@ void Page::send_form(dom::Node* form, dom::Node* submitter) {
   if (!post) {
     const uint64_t query = target.view().find('?');
     if (query != StringView::npos) target.truncate(query);
-    if (!dom::encode_urlencoded(entries, &body)) return;
+    if (!dom::encode_urlencoded(entries, encoding, &body)) return;
     target.push_back('?');
     target.append(body.view());
+    if (!named.empty() && !named.starts_with("_")) {   // a frame of this page with that name shows the answer
+      for (uint32_t serial = 1; serial <= doc_.node_count(); ++serial) {
+        dom::Node* n = doc_.by_serial(serial);
+        StringView name;
+        if (!n || !n->is_tag("iframe") || !dom::is_connected(n) || !dom::get_attribute(n, "name", &name) || !name.equals(named)) continue;
+        frame_navigate(n->serial, target.view());
+        return;
+      }
+    }
     env_.navigate(target.view(), false);
     return;
   }
@@ -1774,7 +1800,7 @@ void Page::send_form(dom::Node* form, dom::Node* submitter) {
     ok = dom::encode_plain(entries, &body);
     type = "text/plain";
   } else {
-    ok = dom::encode_urlencoded(entries, &body);
+    ok = dom::encode_urlencoded(entries, encoding, &body);
   }
   if (ok) env_.navigate_post(target.view(), type, body.view());
 }
@@ -2178,7 +2204,7 @@ void Page::frame_navigate(uint32_t frame_serial, StringView address) {
 }
 
 // Makes the pages of the <iframe>s that are new or whose address changed, draws those that changed, forgets those that are gone.
-void Page::sync_frames() {
+bool Page::sync_frames() {
   List<dom::Node*> found(allocator_);
   for (uint32_t serial = 1; serial <= doc_.node_count() && found.count() < 8; ++serial) {
     dom::Node* n = doc_.by_serial(serial);
@@ -2255,6 +2281,7 @@ void Page::sync_frames() {
   }
   for (uint64_t i = 0; i < loaded.count(); ++i)
     if (dom::Node* n = doc_.by_serial(loaded[i])) fire(n, "load", false);
+  return loaded.count() > 0;
 }
 
 // --- Messages ----------------------------------------------------------------------------------------------------------------------
