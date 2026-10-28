@@ -115,8 +115,9 @@ void describe_pe_image(const exe::PeFile& pe, uint64_t file_size, uint8_t (&out)
   put(44, pe.characteristics(), 2);
   put(46, pe.dll_characteristics(), 2);
   put(48, pe.machine(), 2);
-  bool code = pe.entry_rva() != 0;
-  for (const exe::PeSection& section : pe.sections().view()) if (section.characteristics & 0x20u) code = true;      // IMAGE_SCN_CNT_CODE
+  // Windows: code if it has a size of code or an entry point; otherwise only an odd section alignment, or a single executable section, makes it code.
+  bool code = pe.entry_rva() != 0 || pe.size_of_code() != 0 || (pe.section_alignment() % 4096) != 0;
+  if (pe.sections().count() == 1 && (pe.sections().view()[0].characteristics & 0x20000000u)) code = true;      // IMAGE_SCN_MEM_EXECUTE
   put(50, code ? 1 : 0, 1);
   uint32_t flags = (pe.dll_characteristics() & 0x40) ? 0x04 : 0;      // ImageDynamicallyRelocated
   uint32_t com_rva = 0, com_size = 0;
