@@ -142,6 +142,14 @@ bool process_handle_info(Process& p, uint64_t handle, bool* exited, uint32_t* co
   return objects->query_process(uint32_t(p.files().token(slot)), exited, code, pid);
 }
 
+bool names_own_process(Process& p, uint64_t handle) {
+  if (handle == ~uint64_t{0}) return true;
+  bool exited = false;
+  uint32_t code = 0;
+  uint64_t pid = 0;
+  return process_handle_info(p, handle, &exited, &code, &pid) && pid == p.id();
+}
+
 uint32_t terminate_process_handle(Process& p, uint64_t handle, uint32_t code, bool* handled) {
   bool exited = false;
   uint32_t old_code = 0;
@@ -325,6 +333,16 @@ uint32_t nt_query_information_process(Process& p, const SyscallRequest& r) {
     if (!process_handle_info(p, r.args[0], &child_exited, &child_code, &child_pid)) return kInvalidHandle;
     self = child_pid == p.id();      // (OpenProcess on the own id gives a handle to this very process)
   }
+  uint64_t remote_peb = 0;
+  uint8_t remote_image[64] = {};
+  if (!self && !child_exited && p.runtime() && (info_class == 0 || info_class == 37)) {      // (another program's PEB and image are not ours to look into: it tells)
+    IProcessRuntime::RemoteOp op;
+    op.kind = IProcessRuntime::RemoteOp::ProcessInfo;
+    if (p.runtime()->remote_operation(child_pid, op) == kSuccess) {
+      remote_peb = op.address;
+      for (uint32_t i = 0; i < 64; ++i) remote_image[i] = op.image[i];
+    }
+  }
   Buffer b;
   uint32_t size = 0;
   IProcessRuntime* runtime = p.runtime();
@@ -332,11 +350,15 @@ uint32_t nt_query_information_process(Process& p, const SyscallRequest& r) {
     uint64_t peb = 0;
     if (self) p.read_user_u64(p.gs_base() + 0x60, &peb);      // (another process's address space is not ours to look into)
     b.put(0, self ? 259 : (child_exited ? child_code : 259u), 8);      // ExitStatus (STILL_ACTIVE)
-    b.put(8, peb, 8);                                                   // PebBaseAddress
+    b.put(8, self ? peb : remote_peb, 8);                               // PebBaseAddress
     b.put(16, runtime ? runtime->affinity(0) : 1, 8);                   // AffinityMask
     b.put(24, 8, 8);                                                    // BasePriority
     b.put(32, self ? p.id() : child_pid, 8);                            // UniqueProcessId
     size = 48;
+  } else if (info_class == 37) {      // ProcessImageInformation: SECTION_IMAGE_INFORMATION
+    const uint8_t(&image)[64] = self ? p.image_information() : remote_image;
+    for (uint32_t i = 0; i < 64; ++i) b.bytes[i] = image[i];
+    size = 64;
   } else if (!self) {
     return kInvalidInfoClass;
   } else {
@@ -431,7 +453,10 @@ uint32_t nt_set_information_process(Process& p, const SyscallRequest& r) {
     uint32_t code = 0;
     uint64_t pid = 0;
     if (!process_handle_info(p, r.args[0], &exited, &code, &pid)) return kInvalidHandle;
-    if (pid != p.id()) return kInvalidHandle;
+    if (pid != p.id()) {      // another program: its scheduling settings are accepted, not applied
+      if (exited && uint32_t(r.args[1]) == 21) return 0xC000010Au;      // STATUS_PROCESS_IS_TERMINATING (the affinity of a program that ended)
+      return uint32_t(r.args[1]) == 21 || uint32_t(r.args[1]) == 18 || uint32_t(r.args[1]) == 12 ? kSuccess : kInvalidInfoClass;
+    }
   }
   const uint32_t info_class = uint32_t(r.args[1]), length = uint32_t(r.args[3]);
   uint8_t in[8] = {};

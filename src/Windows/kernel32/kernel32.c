@@ -25,6 +25,8 @@ __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");
 /* From ntdll.dll (the NT services are declared in tcos_win.h). */
 IMPORT PVOID NTAPI RtlAllocateHeap(PVOID, ULONG, SIZE_T);
 IMPORT BOOLEAN NTAPI RtlFreeHeap(PVOID, ULONG, PVOID);
+IMPORT BOOLEAN NTAPI RtlLockHeap(PVOID);
+IMPORT BOOLEAN NTAPI RtlUnlockHeap(PVOID);
 IMPORT PVOID NTAPI RtlReAllocateHeap(PVOID, ULONG, PVOID, SIZE_T);
 IMPORT SIZE_T NTAPI RtlSizeHeap(PVOID, ULONG, PVOID);
 IMPORT PVOID NTAPI RtlCreateHeap(ULONG, PVOID, SIZE_T, SIZE_T, PVOID, PVOID);
@@ -280,8 +282,8 @@ EXPORT SIZE_T WINAPI HeapSize(HANDLE h, DWORD flags, LPCVOID memory) { return Rt
 EXPORT BOOL WINAPI HeapValidate(HANDLE h, DWORD flags, LPCVOID memory) { return RtlValidateHeap(h, flags, (PVOID)memory); }
 EXPORT BOOL WINAPI HeapSetInformation(HANDLE h, int info_class, PVOID info, SIZE_T length) { (void)h; (void)info_class; (void)info; (void)length; return TRUE; }
 EXPORT SIZE_T WINAPI HeapCompact(HANDLE h, DWORD flags) { (void)h; (void)flags; return 0; }
-EXPORT BOOL WINAPI HeapLock(HANDLE h) { (void)h; return TRUE; }
-EXPORT BOOL WINAPI HeapUnlock(HANDLE h) { (void)h; return TRUE; }
+EXPORT BOOL WINAPI HeapLock(HANDLE h) { return RtlLockHeap(h); }
+EXPORT BOOL WINAPI HeapUnlock(HANDLE h) { return RtlUnlockHeap(h); }
 #include "memory.inc"
 
 /* ---- the process: ids, command line, environment, modules, version ---------------------------------------------------------------------------------------- */

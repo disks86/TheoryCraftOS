@@ -231,6 +231,7 @@ LoadStatus UserProgram::load(ConstByteView file, ArrayView<const StringView> arg
   LoadedImage image;
   uint64_t stack_top = 0, stack_pointer = 0, heap_start = 0, fs_base = 0, gs_base = 0, argument = 0, argument2 = 0, dispatcher = 0, thread_thunk = 0, thread_teb = 0;
   Process::ThreadSupport thread_support;
+  uint8_t image_information[64] = {};
   UniquePointer<ModuleSet> loaded_modules;      // (kept by the program once everything worked)
   const StringView path = arguments.empty() ? StringView("") : arguments[0];
   if (kind == exe::ExecutableKind::Elf) {
@@ -247,9 +248,11 @@ LoadStatus UserProgram::load(ConstByteView file, ArrayView<const StringView> arg
     exe::PeFile pe(allocator_);
     if (!pe.parse(file)) return LoadStatus::Malformed;
     if (!bind_executable(pe, &binding)) return LoadStatus::Unsupported;
+    describe_pe_image(pe, file.size(), image_information);
     if (!pe.imports().empty() && !libraries_) return LoadStatus::NeedsLibraries;      // nothing resolves imports: it would jump to address 0
-    LoadStatus status = load_pe(pe, file, space_, &image);
+    LoadStatus status = load_pe(pe, file, space_, &image, false);
     if (status != LoadStatus::Ok) return status;
+    describe_image_pages(space_, pe, image.base);      // (the pages are an image, committed, whatever their access)
     const StringView program_file = path.empty() ? StringView("program.exe") : path.substr(path.rfind('\\') == StringView::npos ? 0 : path.rfind('\\') + 1);
     UniquePointer<ModuleSet> modules;
     if (libraries_) {
@@ -319,6 +322,7 @@ LoadStatus UserProgram::load(ConstByteView file, ArrayView<const StringView> arg
   }
   UniquePointer<Process> process = UniquePointer<Process>::make(allocator_, id_, binding, space_, host_);
   if (!process) return LoadStatus::OutOfMemory;
+  process->set_image_information(image_information);
   process->create_time = host_.realtime_ns() / 100 + 11644473600ull * 10000000ull;      // (FILETIME)
   process->attach_address_space(space_, heap_start);
   process->set_initial_thread_pointers(fs_base, gs_base);

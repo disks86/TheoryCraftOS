@@ -138,7 +138,7 @@ static void fls_destroy_current(int free_structure) {
     if (!value) continue;
     t->chunks[chunk][slot] = NULL;
     PFLS_CALLBACK_FUNCTION callback = g_fls_callbacks[index - 1];
-    if (callback && callback != (PFLS_CALLBACK_FUNCTION)(ULONG_PTR)-1) callback(value);
+    if (!free_structure && callback && callback != (PFLS_CALLBACK_FUNCTION)(ULONG_PTR)-1) callback(value);      /* (what a library stores while the thread detaches is dropped silently) */
   }
   for (ULONG c = 0; c < FLS_CHUNKS; ++c) if (t->chunks[c]) { RtlFreeHeap(process_heap(), 0, t->chunks[c]); t->chunks[c] = NULL; }
   if (free_structure) { TEB_FLS_SLOTS(NtCurrentTeb()) = NULL; RtlFreeHeap(process_heap(), 0, t); }

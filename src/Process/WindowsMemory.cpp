@@ -21,6 +21,7 @@
 #include "Process/WindowsFiles.hpp"
 #include "Process/WindowsProcess.hpp"
 #include "Process/WindowsThreads.hpp"
+#include "Process/WindowsObjects.hpp"
 
 namespace process::windowsabi {
 
@@ -319,6 +320,13 @@ uint32_t run_remote(Process& target, IProcessRuntime::RemoteOp& op) {
     case IProcessRuntime::RemoteOp::ThreadStatus: return thread_status_in(target, op.thread_id, &op.size);
     case IProcessRuntime::RemoteOp::TerminateThread: return terminate_thread_in(target, op.thread_id, uint32_t(op.size));
     case IProcessRuntime::RemoteOp::ResumeThread: return resume_thread_in(target, op.thread_id, &op.size);
+    case IProcessRuntime::RemoteOp::Unmap: return unmap_view_in(target, op.address);
+    case IProcessRuntime::RemoteOp::ProcessInfo: {
+      op.address = 0;
+      target.read_user_u64(target.gs_base() + 0x60, &op.address);      // TEB.ProcessEnvironmentBlock
+      for (uint32_t i = 0; i < 64; ++i) op.image[i] = target.image_information()[i];
+      return kStatusSuccess;
+    }
   }
   return kStatusInvalidParameter;
 }

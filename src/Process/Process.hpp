@@ -144,13 +144,14 @@ class IProcessRuntime {
   // Work on the memory and threads of another running program (by process id). The runtime takes that program's lock and gives up the caller's meanwhile; the work is done by
   // windowsabi::run_remote(). Returns an NTSTATUS.
   struct RemoteOp {
-    enum Kind : uint8_t { Read, Write, Allocate, Free, Protect, Query, CreateThread, ThreadStatus, TerminateThread, ResumeThread } kind = Read;
+    enum Kind : uint8_t { Read, Write, Allocate, Free, Protect, Query, CreateThread, ThreadStatus, TerminateThread, ResumeThread, Unmap, ProcessInfo } kind = Read;
     uint64_t address = 0, size = 0;       // Allocate/Free/Protect: in and out (as the NT services have them); Read/Write: the address; CreateThread: the start routine; thread calls: the thread id
     ByteView out;                         // Read: where the bytes go
     ConstByteView in;                     // Write: the bytes
     uint64_t done = 0;                    // Read/Write: how many bytes were copied
     uint32_t type = 0, protect = 0, old_protect = 0;
     uint8_t info[48] = {};                // Query: MEMORY_BASIC_INFORMATION
+    uint8_t image[64] = {};               // ProcessInfo: the SECTION_IMAGE_INFORMATION of the program; its PEB address comes back in `address`
     uint64_t argument = 0, stack_size = 0, thread_id = 0;      // CreateThread (thread_id comes back); ThreadStatus: exit code (STILL_ACTIVE if it runs) comes back in `size`
     bool suspended = false;
   };
@@ -291,6 +292,9 @@ class Process {
   ThreadRecord* find_thread(uint64_t id);
   // NtTerminateProcess(NULL) has ended every thread but the caller: no thread can be made any more.
   bool threads_terminated() const { return threads_terminated_; }
+  // What NtQueryInformationProcess(ProcessImageInformation) answers: set when the program is loaded.
+  const uint8_t (&image_information() const)[64] { return image_information_; }
+  void set_image_information(const uint8_t (&bytes)[64]) { for (uint32_t i = 0; i < 64; ++i) image_information_[i] = bytes[i]; }
   void set_threads_terminated() { threads_terminated_ = true; }
   static bool queue_apc(ThreadRecord& t, const ThreadRecord::Apc& apc) {
     if (t.apc_count >= ThreadRecord::kMaxApcs) return false;
@@ -360,6 +364,7 @@ class Process {
   uint32_t thread_counter_ = 0, thread_exit_code_ = 0;
   bool thread_exit_pending_ = false;
   bool threads_terminated_ = false;
+  uint8_t image_information_[64] = {};
   IModuleHost* module_host_ = nullptr;
   uint64_t fs_base_ = 0, gs_base_ = 0;
   bool fs_changed_ = false, gs_changed_ = false;
