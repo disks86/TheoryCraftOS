@@ -123,7 +123,19 @@ programs built with `-march=haswell` (or x86-64-v3) run. `X86_64Vex.cpp` holds a
   fused multiply-add) and the hardware's NaN selection order (multiplicand, multiplicand, addend).
 - **BMI1/BMI2**: `andn`, `bextr`, `blsi`, `blsmsk`, `blsr`, `bzhi`, `mulx`, `pdep`, `pext`, `rorx`, `sarx`, `shlx`, `shrx` (and `tzcnt`/`lzcnt`/`popcnt` that already existed).
 - **AES-NI, PCLMULQDQ, SHA** (`X86_64Crypto.cpp`): `aesenc/enclast/dec/declast`, `aesimc`, `aeskeygenassist`, `pclmulqdq` (all immediates), SHA-1 (`sha1rnds4`, `sha1nexte`, `sha1msg1/2`) and SHA-256 (`sha256rnds2`, `sha256msg1/2`), plus the VEX forms and the 256-bit VAES / VPCLMULQDQ. The S-box is computed at compile time. cpuid reports AES, PCLMULQDQ, SHA, VAES and VPCLMULQDQ. Tested by 125 more `AvxTest` cases against the host CPU (bit-exact), and by `tests/data/emulation/crypto.c` (FIPS-197 vector, key schedule, CTR, GHASH, SHA-256 and SHA-1 of "abc" with the published digests).
-- **Not implemented** (an invalid-instruction fault, never a wrong result): AVX-512, SHA-512/SM3/SM4, TSX, `xsaveopt`/`xsavec`, and the MMX registers (so the MMX forms of the SSSE3
+- **SHA-512 and SM4** (`X86_64Crypto.cpp`): `vsha512rnds2`/`msg1`/`msg2` and `vsm4key4`/`vsm4rnds4` (cpuid leaf 7 sub-leaf 1). No available CPU or emulator runs them (qemu's TCG does not), so
+  `tests/data/emulation/crypto2.c` checks them against the published SHA-512("abc") digest and the SM4 standard test vector instead. SM3 is not implemented and not advertised.
+- **AVX-512** (`X86_64Evex*.cpp`, table in `kEvexOps`): the EVEX prefix, 32 vector registers of 512 bits (`State::evex_lo/evex_hi` for 16..31, the upper halves in `YmmHigh::upper`; assigning an `Xmm`
+  to a `YmmHigh`, which is what every VEX write does, clears the upper halves like the hardware), the opmask registers `k0..k7` (the VEX-encoded `kmov`/`kand`/`kshift`/`kortest`/... in
+  `kmask_instruction`), merge and zeroing masking per element, embedded broadcast, embedded rounding and SAE, compressed disp8*N, and fault suppression for masked-off memory elements.
+  Covered: F, VL, BW, DQ, CD, VBMI, VBMI2, IFMA, VNNI, BITALG, VPOPCNTDQ, GFNI (legacy, VEX and EVEX forms), VAES and VPCLMULQDQ at 512 bits, and BF16: moves, integer arithmetic and logic,
+  shifts and rotates, compares into masks, `vpternlog`, packs/unpacks/shuffles/permutes (`vpermi2/t2`, `vshuf*x*`, `valign*`, `vpalignr`), insert/extract, blends, compress/expand,
+  broadcasts, zero/sign extension and the narrowing `vpmov*`, `vpmovm2*`/`vpmov*2m`, popcnt/lzcnt/conflict, `vdbpsadbw`, `vpmultishiftqb`, `vpshufbitqmb`, the double shifts, all the FP
+  arithmetic with SAE/rounding, FMA, compares, `vrndscale`, `vgetexp`/`vgetmant`/`vscalef`/`vfixupimm`/`vreduce`/`vrange`/`vfpclass`, every conversion between 32/64-bit integers and
+  single/double (and `vcvtph2ps`/`vcvtps2ph`), gathers and scatters, and `vucomis*`. XCR0 is 0xE7 and `xsave`/`xrstor` handle the opmask, ZMM_Hi256 and Hi16_ZMM components (standard
+  format, 2688 bytes). `vrcp14*`/`vrsqrt14*` return a correctly rounded value truncated to 14 bits: the architecture only promises a relative error below 2^-14, and the real tables differ
+  between Intel and AMD, so they are not compared with the host.
+- **Not implemented** (an invalid-instruction fault, never a wrong result): SM3, AVX-512 FP16 / 4FMAPS / VP2INTERSECT / the Xeon Phi parts, TSX, `xsaveopt`/`xsavec`, and the MMX registers (so the MMX forms of the SSSE3
   instructions, the ones without a 66 prefix, are invalid).
   Exceptions delivered to a Windows program save the XMM halves of vector state in the `CONTEXT` in memory, not the upper halves (the emulator keeps those itself).
 - **Checked against the real thing**: `tests/AvxTest.cpp` assembles about 1,400 instruction forms with `llvm-mc` (`tests/data/emulation/avx_cases_gen.py`), runs each on the host
@@ -239,3 +251,8 @@ one instruction with legal register groups, and compare every vector register, `
 per seed; several seeds of each match with no mismatch. `tests/data/emulation/rvv.c` (checked in as `rvv-riscv64.elf` with the qemu output in `rvv-expected.txt`) is a program of
 intrinsics loops and auto-vectorized code that `EmulationTest` runs. `EmulationTest` also feeds 80,000 random vector instructions under random valid configurations to the
 decoder under ASan/UBSan.
+
+`tests/run_host_tests.sh Avx512Test` runs the AVX-512 cases (`tests/data/emulation/avx512_cases_gen.py`, about 12,600 instruction forms assembled with llvm-mc: every vector length, masking,
+zeroing, broadcast, disp8*N, embedded rounding, registers 16..31) on the host CPU and on the emulator from the same random zmm, mask and general registers, and requires all 640 bytes of
+vector state, the mask registers, flags, MXCSR and the memory operand to match; it needs an AVX-512 host and skips otherwise (the truncation / bit-flip robustness cases always run, under
+the sanitizers). `avx512.c` is a program of intrinsics and auto-vectorized loops built with every AVX-512 -m flag and run natively and on the emulator.

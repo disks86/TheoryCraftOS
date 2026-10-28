@@ -368,11 +368,57 @@ uint32_t nt_wait_for_multiple_objects(Process& p, const SyscallRequest& r) {
   return wait_for(p, items, count, type == 0, timeout, (r.args[3] & 0xFF) != 0);
 }
 
+// The handle in source_slot of this process, given to another running program (a process object handle names it).
+uint32_t give_object_handle_in(Process& target, uint32_t kind, uint64_t token, uint32_t denied, bool inherit, uint64_t* handle) {
+  const int64_t copy = target.files().open_token(DescriptorKind(kind), token);
+  if (copy < 0) return kNoResources;
+  target.files().set_denied_access(uint64_t(copy), denied);
+  target.files().set_handle_flags(uint64_t(copy), inherit, false);
+  *handle = (uint64_t(copy) + 1) * 4;
+  return kSuccess;
+}
+
+namespace {
+
+// NtDuplicateObject into a program other than the caller (only the kinds of the object manager, which count their references).
+uint32_t duplicate_to_other(Process& p, const SyscallRequest& r, uint64_t target_at, uint64_t desired_access, uint64_t attributes, uint64_t options) {
+  bool exited = false;
+  uint32_t code = 0;
+  uint64_t pid = 0;
+  if (!process_handle_info(p, r.args[2], &exited, &code, &pid)) return kInvalidHandle;
+  if (exited) return 0xC000010Au;      // STATUS_PROCESS_IS_TERMINATING
+  if (!p.runtime()) return kNotImplemented;
+  uint64_t slot = 0;
+  if (!slot_of(r.args[1], &slot) || p.files().kind(slot) == DescriptorKind::Closed) return kInvalidHandle;
+  const DescriptorKind kind = p.files().kind(slot);
+  ObjectManager* objects = system_objects();
+  if (!is_object_kind(kind) || !objects) return kNotImplemented;
+  const uint32_t id = uint32_t(p.files().token(slot));
+  const uint32_t original = p.files().denied_access(slot);
+  IProcessRuntime::RemoteOp op;
+  op.kind = IProcessRuntime::RemoteOp::Duplicate;
+  op.type = uint32_t(kind);
+  op.argument = id;
+  op.protect = (options & 2) ? original : (original | ~uint32_t(desired_access));
+  op.suspended = (options & 4) ? p.files().inheritable(slot) : (attributes & 2) != 0;
+  objects->add_ref(id);
+  const uint32_t status = p.runtime()->remote_operation(pid, op);
+  if (status != kSuccess) { objects->release(id); return status; }
+  if (target_at != 0 && !p.write_user_u64(target_at, op.address)) return kAccessViolation;      // (the copy stays, as the handle was already made)
+  if (options & 1) p.close_descriptor(slot);      // DUPLICATE_CLOSE_SOURCE
+  return kSuccess;
+}
+
+}  // namespace
+
 uint32_t nt_duplicate_object(Process& p, const SyscallRequest& r) {
   uint64_t target_at = r.args[3], options = 0, attributes = 0;
   uint64_t desired_access = 0;
   if (!argument(p, r, 4, &desired_access) || !argument(p, r, 5, &attributes) || !argument(p, r, 6, &options)) return kAccessViolation;
-  if (r.args[0] != kCurrentProcess || r.args[2] != kCurrentProcess) return kNotImplemented;      // other processes are not reachable
+  const bool source_here = names_own_process(p, r.args[0]);
+  const bool target_here = names_own_process(p, r.args[2]);
+  if (!source_here) return kNotImplemented;      // (a handle of another program cannot be read from here)
+  if (!target_here) return duplicate_to_other(p, r, target_at, desired_access, attributes, options);
   if (r.args[1] == ~uint64_t{1}) {      // the pseudo handle of the calling thread becomes a real handle to it
     const uint64_t self = p.runtime() ? p.runtime()->current_thread_id() : p.id();
     if (!p.find_thread(self)) return kInvalidHandle;
@@ -703,7 +749,16 @@ uint32_t nt_map_view_of_section(Process& p, const SyscallRequest& r) {
   ObjectManager* objects = system_objects();
   AddressSpace* space = p.address_space();
   if (!objects || !space) return kNotImplemented;
-  if (!names_own_process(p, r.args[1])) return kNotImplemented;      // other processes are not reachable
+  bool remote = false;
+  uint64_t pid = 0;
+  if (!names_own_process(p, r.args[1])) {      // a process this one started (or another running program)
+    bool exited = false;
+    uint32_t code = 0;
+    if (!process_handle_info(p, r.args[1], &exited, &code, &pid)) return kInvalidHandle;
+    if (exited) return 0xC000010Au;      // STATUS_PROCESS_IS_TERMINATING
+    if (!p.runtime()) return kNotImplemented;
+    remote = true;
+  }
   const uint32_t id = object_of(p, r.args[0], DescriptorKind::Section);
   if (!id) return kInvalidHandle;
   ObjectManager::SectionInfo info;
@@ -723,10 +778,40 @@ uint32_t nt_map_view_of_section(Process& p, const SyscallRequest& r) {
     constexpr uint32_t kSectionMapWrite = 2, kSectionMapRead = 4, kSectionMapExecute = 8;
     if (((wanted & 1) && !(wanted & 2) && (denied & kSectionMapRead)) || ((wanted & 2) && (denied & kSectionMapWrite)) || ((wanted & 4) && (denied & kSectionMapExecute) && (denied & 0x20))) return 0xC0000022u;
   }
-  if (info.attributes & 0x1000000u) return map_image_view(p, r, id, size_at, storage, info.size);
+  if (info.attributes & 0x1000000u) return remote ? kNotImplemented : map_image_view(p, r, id, size_at, storage, info.size);
   uint64_t offset = 0, view = 0, base = 0;
   if (offset_at != 0 && !p.read_user_u64(offset_at, &offset)) return kAccessViolation;
   if (size_at == 0 || !p.read_user_u64(size_at, &view) || !p.read_user_u64(r.args[2], &base)) return kAccessViolation;
+  uint32_t status;
+  if (remote) {
+    IProcessRuntime::RemoteOp op;
+    op.kind = IProcessRuntime::RemoteOp::MapView;
+    op.address = base; op.size = view; op.argument = offset; op.thread_id = id; op.protect = view_page;
+    status = p.runtime()->remote_operation(pid, op);
+    base = op.address; view = op.size;
+  } else {
+    status = map_view_in(p, id, offset, &base, &view, view_page);
+  }
+  if (status != kSuccess) return status;
+  if (p.write_user_u64(r.args[2], base) && p.write_user_u64(size_at, view)) return kSuccess;
+  if (!remote) if (AddressSpace* own = p.address_space()) own->unmap(base, view);
+  return kAccessViolation;
+}
+
+// A view of the (not image) section `id` in `target`: *base 0 lets the system choose; *view 0 means up to the end of the section. Both come back as they are.
+uint32_t map_view_in(Process& target, uint32_t id, uint64_t offset, uint64_t* base_in_out, uint64_t* view_in_out, uint32_t view_page) {
+  ObjectManager* objects = system_objects();
+  AddressSpace* space = target.address_space();
+  if (!objects || !space) return kNotImplemented;
+  ObjectManager::SectionInfo info;
+  uint8_t* storage = nullptr;
+  uint64_t rounded = 0;
+  SharedMemory* owner = nullptr;
+  if (!objects->section_info(id, &info) || !objects->section_memory(id, &storage, &rounded, &owner)) return kInvalidHandle;
+  bool copy = false, valid = false;
+  const uint8_t prot = protection_of_page(view_page, &copy, &valid);
+  if (!valid) return kInvalidParameter;
+  uint64_t base = *base_in_out, view = *view_in_out;
   if (offset % 4096 != 0 || offset >= info.size) return kInvalidParameter;
   if (view == 0 || view > info.size - offset) view = info.size - offset;
   uint64_t bytes = 0;
@@ -743,8 +828,8 @@ uint32_t nt_map_view_of_section(Process& p, const SyscallRequest& r) {
   attributes.protect = attributes.allocation_protect = view_page;
   attributes.file_view = info.file_backed;
   space->set_attributes(base, bytes, attributes);
-  const bool ok = p.write_user_u64(r.args[2], base) && p.write_user_u64(size_at, bytes);
-  if (!ok) { space->unmap(base, bytes); return kAccessViolation; }
+  *base_in_out = base;
+  *view_in_out = bytes;
   return kSuccess;
 }
 

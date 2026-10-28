@@ -28,10 +28,30 @@ namespace emulation {
 //
 // Flags are computed eagerly after every instruction that sets them. Execution is one instruction per decode (no translation cache yet): the dispatch is a plain
 // switch, which keeps it simple enough to test against compiler output and leaves room for a block translator behind the same IGuestCpu interface.
+struct EvexOp;
+
 class X86_64Cpu final : public IGuestCpu {
  public:
   struct Xmm {
     uint64_t lo = 0, hi = 0;
+  };
+  // Bits 255:128 of a vector register, plus bits 511:256 for AVX-512. Assigning an Xmm (what every VEX-encoded write does) clears the upper half, as the architecture says;
+  // copying a YmmHigh keeps it all, and the EVEX code writes the fields directly.
+  struct YmmHigh : Xmm {
+    Xmm upper[2];
+    YmmHigh() = default;
+    YmmHigh(const YmmHigh&) = default;
+    YmmHigh& operator=(const YmmHigh&) = default;
+    YmmHigh& operator=(const Xmm& x) {
+      lo = x.lo;
+      hi = x.hi;
+      upper[0] = Xmm();
+      upper[1] = Xmm();
+      return *this;
+    }
+  };
+  struct Vec512 {
+    uint64_t q[8] = {};
   };
   struct State {
     uint64_t r[16] = {};
@@ -39,7 +59,10 @@ class X86_64Cpu final : public IGuestCpu {
     uint64_t rflags = 2;
     uint64_t fs_base = 0, gs_base = 0;
     Xmm xmm[17];      // XMM0..15 (the low halves of YMM0..15) and a scratch slot that the AVX code uses
-    Xmm ymm_high[16];      // bits 255:128 of YMM0..15
+    YmmHigh ymm_high[16];      // bits 255:128 of YMM0..15 (and 511:256 of ZMM0..15)
+    Xmm evex_lo[16];           // XMM16..31
+    YmmHigh evex_hi[16];       // bits 511:128 of ZMM16..31
+    uint64_t k[8] = {};        // the AVX-512 mask registers
     uint32_t mxcsr = 0x1F80;      // all exceptions masked, round to nearest
     // x87: eight 80-bit registers used as a stack (physical registers; TOP is in bits 11..13 of the status word), the control and status words, and which
     // physical registers hold a value (the others are "empty").
@@ -125,7 +148,30 @@ class X86_64Cpu final : public IGuestCpu {
   Step vex_map3(GuestMemory& m, uint8_t opcode, bool wide, uint32_t vvvv);
   Step legacy_sse_map(GuestMemory& m, uint32_t map, uint8_t opcode);      // SSSE3 / SSE4 without a VEX prefix (0F 38 and 0F 3A)
   Step crc32_instruction(GuestMemory& m, uint8_t opcode);
+  Step step_evex(GuestMemory& m);      // X86_64Evex.cpp: AVX-512 (the 0x62 prefix)
+  Step kmask_instruction(GuestMemory& m, uint32_t map, uint8_t opcode, bool wide, uint32_t vvvv);      // the VEX-encoded opmask instructions
+  struct EvexContext {
+    uint8_t map = 0, pp = 0, opcode = 0;
+    bool w = false, memory = false, bcst = false, z = false, er = false;      // er: embedded rounding or SAE (EVEX.b with a register operand)
+    uint32_t reg = 0, rm = 0, vvvv = 0, vl = 512, aaa = 0, imm = 0, rc = 0;
+    uint64_t kmask = ~uint64_t{0};
+    Vec512 old_dest;
+  } ev_;
+  bool ev_active(uint32_t i) const { return ((ev_.kmask >> (i & 63)) & 1) != 0; }
+  bool ev_read_rm(GuestMemory& m, Vec512* out, uint32_t elem_bits, bool allow_broadcast, bool suppress_faults = false);
+  void ev_write_masked(uint32_t dest, const Vec512& result, uint32_t elem_bits);
+  void ev_write_k(uint64_t bits, uint32_t count);
+  bool ev_store_vector(GuestMemory& m, const Vec512& v, uint32_t elem_bits, uint32_t bytes);
+  Step evex_int(GuestMemory& m, const EvexOp& def);
+  Step evex_misc(GuestMemory& m, const EvexOp& def);
+  Step evex_fp(GuestMemory& m, const EvexOp& def);
+  Step evex_ext(GuestMemory& m, const EvexOp& def);
+  Step evex_vsib(GuestMemory& m, const EvexOp& def);
+  Vec512 get_vec(uint32_t reg) const;
+  void set_vec(uint32_t reg, const Vec512& value, uint32_t vl_bits);
   Step crypto_map(GuestMemory& m, uint32_t map, uint8_t opcode, bool wide, uint32_t vvvv);      // X86_64Crypto.cpp: AES-NI, PCLMULQDQ, SHA
+  Step sha512_instruction(GuestMemory& m, uint8_t opcode, uint32_t vvvv);
+  Step sm4_instruction(GuestMemory& m, uint32_t vvvv);
   Step vex_gather(GuestMemory& m, uint8_t opcode, bool wide, uint32_t vvvv);
   Step vex_fma(GuestMemory& m, uint8_t opcode, bool wide, uint32_t vvvv);
   Step vex_bmi(GuestMemory& m, int map, uint8_t opcode, bool wide, uint32_t vvvv);
