@@ -23,6 +23,9 @@
 // The NT services for synchronization objects, waiting and handle duplication (WindowsSyscalls.cpp maps service numbers to these). Each returns an NTSTATUS.
 namespace process::windowsabi {
 
+// Unmaps the view (or image) that starts at `address` in the address space of `target`.
+uint32_t unmap_view_in(Process& target, uint64_t address);
+
 uint32_t nt_create_event(Process& p, const SyscallRequest& r);
 uint32_t nt_open_event(Process& p, const SyscallRequest& r);
 uint32_t nt_set_event(Process& p, const SyscallRequest& r);
