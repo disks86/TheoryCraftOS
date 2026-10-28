@@ -60,6 +60,9 @@ inline constexpr const char* kSystemDatabase = "/AppStore/System/system.db";
 // The calendar application's appointments (the "Calendar" application's folder in the AppStore).
 inline constexpr const char* kCalendarDatabase = "/AppStore/Calendar/calendar.db";
 
+// The to-do application's items (the "Todo" application's folder in the AppStore).
+inline constexpr const char* kTodoDatabase = "/AppStore/Todo/todo.db";
+
 // The name the EFI system partition is mounted under (the folder "/EFI").
 inline constexpr const char* kEfiMountName = "EFI";
 

@@ -119,7 +119,7 @@ X86_64Cpu::Step X86_64Cpu::evex_fp(GuestMemory& m, const EvexOp& defn) {
   const uint32_t elem = def->elem ? def->elem : (w ? 64 : 32);
   const Format fmt = format_of(elem);
   const bool scalar = def->kind == kFpScalar || def->kind == kCvtScalar || def->kind == kCvtToGpr || def->kind == kCvtFromGpr || (def->kind == kFpCmp && def->sub == 1) || def->kind == kComi ||
-                      (def->sub == 1 && (def->kind == kRound || def->kind == kGetExp || def->kind == kScalef || def->kind == kGetMant || def->kind == kFixup || def->kind == kReduce || def->kind == kRange || def->kind == kFpClass || def->kind == kRcp14 || def->kind == kRsqrt14)) || (def->kind == kFma && (def->opcode & 15) % 2 == 1 && (def->opcode & 15) >= 9);
+                      (def->sub == 1 && (def->kind == kRound || def->kind == kGetExp || def->kind == kScalef || def->kind == kGetMant || def->kind == kFixup || def->kind == kReduce || def->kind == kRange || def->kind == kFpClass || def->kind == kRcp14 || def->kind == kRsqrt14)) || (def->kind == kFma && (def->opcode & 15) % 2 == 1 && (def->opcode & 15) >= 9) || (def->kind == kFma4 && (def->sub & 1));
   if (scalar) vl = 128;
   Env env;
   // EVEX.b with a register operand is an embedded rounding mode for the arithmetic forms but only "suppress all exceptions" (the rounding comes from MXCSR or the immediate) for the
@@ -258,6 +258,50 @@ X86_64Cpu::Step X86_64Cpu::evex_fp(GuestMemory& m, const EvexOp& defn) {
         le.flags = 0;
         set_element(result, elem, i, fused_multiply_add(fmt, p, q, r, le));
         fold(le);
+      }
+      set_vec(reg, result, vl);
+      return commit();
+    }
+    case kFma4: {      // Xeon Phi 4FMAPS: dest += four products of the register group (vvvv & ~3 ..+3) with the four floats of the m128 operand, one fused multiply-add each
+      if (!memory || ev_.bcst || (!scalar && saved_vl != 512)) return fail(6);
+      uint64_t weights[4];
+      for (uint32_t j = 0; j < 4; ++j) {
+        if (!load(m, memory_address() + 4 * j, 4, &weights[j])) return Step::Fault;
+      }
+      const bool negate_product = def->sub & 2;
+      const uint64_t qb = quiet_bit_of(elem);
+      const Vec dest = ev_.old_dest;
+      Vec group[4];
+      for (uint32_t j = 0; j < 4; ++j) group[j] = get_vec((vvvv & ~3u) + j);
+      result = dest;
+      for (uint32_t i = 0; i < count; ++i) {
+        if (aaa != 0 && !active(i)) {
+          if (z) set_element(result, elem, i, 0);
+          continue;
+        }
+        uint64_t acc = element(dest, elem, i);
+        for (uint32_t j = 0; j < 4; ++j) {
+          uint64_t p = element(group[j], elem, i), q = weights[j];
+          const uint64_t vals[3] = {p, q, acc};
+          int pick = -1;
+          bool any_signaling = false;
+          for (int k = 0; k < 3; ++k) {
+            if (!is_nan(fmt, vals[k])) continue;
+            if (!(vals[k] & qb)) any_signaling = true;
+            if (pick < 0) pick = k;
+          }
+          if (pick >= 0) {
+            if (any_signaling) env.flags |= kInvalid;
+            acc = vals[pick] | qb;
+            continue;
+          }
+          if (negate_product) p = negate(fmt, p);
+          Env le = env;
+          le.flags = 0;
+          acc = fused_multiply_add(fmt, p, q, acc, le);
+          fold(le);
+        }
+        set_element(result, elem, i, acc);
       }
       set_vec(reg, result, vl);
       return commit();

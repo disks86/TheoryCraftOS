@@ -40,6 +40,7 @@
 #include "Desktop/FileDialog.hpp"
 #include "Desktop/MediaPlayer.hpp"
 #include "Desktop/Calculator.hpp"
+#include "Desktop/Todo.hpp"
 #include "Desktop/Calendar.hpp"
 #include "Desktop/FileProperties.hpp"
 #include "Desktop/Notepad.hpp"
@@ -2406,7 +2407,7 @@ static void test_display_settings_entry() {
     using desktop::HardwareGroup;
     Screen screen(a, 800, 600);
     desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
-    CHECK(d.start_button().menu().item_count() == 15);   // Explorer, Computer Manager, Text Editor, Spreadsheet, Database, Web Browser, Terminal, Calculator, Calendar, Paint, Media Player, 3D Test, About, a line, Shut Down
+    CHECK(d.start_button().menu().item_count() == 16);   // Explorer, Computer Manager, Text Editor, Spreadsheet, Database, Web Browser, Terminal, Calculator, Calendar, To-Do, Paint, Media Player, 3D Test, About, a line, Shut Down
     FakeInventory inv(a);
     inv.list.add(HardwareGroup::Displays, "Monitor A", "HDMI-1");
     d.set_hardware_inventory(&inv);
@@ -6337,6 +6338,119 @@ static void test_calculator_session() {
   CHECK(a.live == 0);
 }
 
+// The to-do list: items are added into buckets, completed ones leave the list, the list is kept in /AppStore/Todo across a restart, and the window has
+// the same tab behavior as the other programs (Start menu, "+", dragging out and between windows, session).
+static void test_todo() {
+  TestAllocator a;
+  {
+    filesystem::RamFileSystem fs(a);
+    database::local::LocalDatabase system_db(a, &fs, "/AppStore/System/system.db");
+    system_db.open();
+    database::local::SystemSettings settings(a, system_db);
+    uint32_t kept = 0;
+    {
+      Screen screen(a, 1000, 700);
+      desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+      d.set_file_system(&fs);
+      d.set_settings(&settings);
+      Window& w = d.window();
+      gui::WindowManager& m = d.windows();
+
+      desktop::Todo& t = d.todo();
+      CHECK(t.item_count() == 0 && t.filter() == desktop::Todo::kShowOpen && !t.done_button().enabled());
+      CHECK(!t.add_item() && !t.status().empty());   // nothing written
+      // Items go into the bucket chosen in the form.
+      t.text_box().set_text("Buy milk");
+      t.bucket_box().set_selected_index(static_cast<int32_t>(desktop::Bucket::Today));
+      CHECK(t.add_item() && t.text_box().text().empty() && t.item_count() == 1);
+      t.text_box().set_text("File taxes");
+      t.bucket_box().set_selected_index(static_cast<int32_t>(desktop::Bucket::NextWeek));
+      CHECK(t.add_item());
+      t.text_box().set_text("Learn Rust");
+      t.bucket_box().set_selected_index(static_cast<int32_t>(desktop::Bucket::Someday));
+      CHECK(t.add_item() && t.item_count() == 3 && d.todo_store().open_count() == 3);
+      String cell(a);
+      CHECK(t.list().item_text(0, 0, &cell) && cell.view().equals("Buy milk") && t.list().item_text(0, 1, &cell) && cell.view().equals("Today"));
+      CHECK(t.list().item_text(2, 1, &cell) && cell.view().equals("Someday"));   // (Today ... Someday)
+
+      // A bucket narrows the list.
+      t.set_filter(desktop::Todo::kShowNextWeek);
+      CHECK(t.item_count() == 1 && t.list().item_text(0, 0, &cell) && cell.view().equals("File taxes"));
+      t.set_filter(desktop::Todo::kShowOpen);
+
+      // Completing an item takes it off the list; it shows under Completed, where it can be restored.
+      t.select_item(0);
+      CHECK(t.selected_id() != 0 && t.done_button().enabled() && t.text_box().text().equals("Buy milk"));
+      CHECK(t.complete_item() && t.item_count() == 2 && d.todo_store().done_count() == 1);
+      for (uint32_t i = 0; i < t.item_count(); ++i) CHECK(!(t.list().item_text(i, 0, &cell) && cell.view().equals("Buy milk")));
+      t.set_filter(desktop::Todo::kShowCompleted);
+      CHECK(t.item_count() == 1 && t.done_button().text().equals("Restore") && t.clear_button().enabled());
+      t.select_item(0);
+      CHECK(t.complete_item() && t.item_count() == 0 && d.todo_store().done_count() == 0);   // (restored)
+      t.set_filter(desktop::Todo::kShowOpen);
+      CHECK(t.item_count() == 3);
+
+      // Changing an item and deleting one.
+      t.select_item(1);
+      t.text_box().set_text("File the taxes");
+      t.bucket_box().set_selected_index(static_cast<int32_t>(desktop::Bucket::ThisWeek));
+      CHECK(t.update_item() && t.list().item_text(1, 0, &cell) && cell.view().equals("File the taxes") && t.list().item_text(1, 1, &cell) && cell.view().equals("This week"));
+      t.select_item(2);
+      CHECK(t.delete_item() && t.item_count() == 2);
+      t.select_item(0);
+      kept = t.selected_id();
+      CHECK(t.complete_item() && t.item_count() == 1);   // ("Buy milk" is done again, "File the taxes" is open)
+
+      // Opening a window shows the list; its tab can be dragged out and back like the others.
+      desktop::Todo* t1 = d.open_todo();
+      CHECK(t1 == &d.todo() && d.todo_count() == 1 && t1->app_kind() == desktop::Desktop::kAppTodo);
+      auto* h1 = static_cast<gui::TabFrame*>(t1->host());
+      CHECK(h1 && t1->embedded() && h1->tab_count() == 1 && h1->title().equals("To-Do"));
+      put(h1, {20, 20, 520, 500});
+      w.layout();
+      const Rect2D plus = h1->new_tab_button_rect();
+      const Point po = h1->window_origin();
+      click(w, po.x + plus.x + 8, po.y + plus.y + 6);
+      CHECK(h1->tab_count() == 2 && d.todo_count() == 2 && m.window_count() == 1);
+      Frame* second = h1->tab_at(1);
+      CHECK(second->app_kind() == desktop::Desktop::kAppTodo && h1->selected() == second && static_cast<desktop::Todo*>(second)->item_count() == 1);
+
+      Point tp = tab_point(h1, 1);
+      w.mouse_move(tp.x, tp.y);
+      w.mouse_button(tp.x, tp.y, MouseButton::Left, true);
+      w.mouse_move(tp.x + 100, tp.y + 300);
+      CHECK(w.dragging());
+      w.mouse_button(tp.x + 100, tp.y + 300, MouseButton::Left, false);
+      CHECK(m.window_count() == 2 && h1->tab_count() == 1 && second->host() && second->host() != h1);
+      auto* h2 = static_cast<gui::TabFrame*>(second->host());
+      put(h2, {560, 20, 400, 500});
+      w.layout();
+      tp = tab_point(h2, 0);
+      w.mouse_move(tp.x, tp.y);
+      w.mouse_button(tp.x, tp.y, MouseButton::Left, true);
+      const Point strip = tab_point(h1, 0, 100);
+      w.mouse_move(strip.x + 40, strip.y);
+      w.mouse_move(strip.x, strip.y);
+      w.mouse_button(strip.x, strip.y, MouseButton::Left, false);
+      CHECK(h1->tab_count() == 2 && h1->tab_at(1) == second && m.window_count() == 1 && h2->manager() == nullptr);
+      CHECK(d.save_session() == 1);
+      d.step(1000000);
+    }
+    {
+      // After a restart the items (and the window) are as they were.
+      Screen screen(a, 800, 600);
+      desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+      d.set_file_system(&fs);
+      d.set_settings(&settings);
+      CHECK(d.todo_store().count() == 2 && d.todo_store().open_count() == 1 && d.todo_store().done_count() == 1);
+      CHECK(d.restore_session() == 1 && d.todo_count() == 2 && d.windows().window_count() == 1 && d.todo().item_count() == 1);
+      desktop::TodoStore::Item item(a);
+      CHECK(d.todo_store().get(kept, &item) && item.done);
+    }
+  }
+  CHECK(a.live == 0);
+}
+
 // The calendar: appointments are added and changed with the form, kept in /AppStore/Calendar across a restart, and announced as toasts when their time comes.
 static desktop::DateTime g_calendar_now;
 static bool calendar_clock(void*, desktop::DateTime* out) {
@@ -8068,6 +8182,7 @@ int main() {
   test_computer_manager_usermode();
   test_explorer_copy_paste_properties();
   test_calculator_session();
+  test_todo();
   test_calendar();
   test_calendar_recurrence();
   test_calendar_floating_and_occurrences();
