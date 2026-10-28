@@ -103,7 +103,7 @@ struct Card final : IVcnRegisters {
   static bool in(uint32_t r, uint32_t lo, uint32_t hi) { return r >= lo && r <= hi; }
   IVcnRegisters& owner(uint32_t r) {
     if (monitor && in(r, 0x7000, 0x7007)) return *monitor;
-    if (aux && in(r, 0x7010, 0x7033)) return *aux;
+    if (aux && in(r, 0x7010, 0x7040)) return *aux;
     if (in(r, 0x3400, 0x37ff)) return sdma;
     if (in(r, 0xe30, 0xe4b) || r == 0x151a || r == 0x151b) return ih;
     if (in(r, 0x500, 0x57f) || in(r, 0x800, 0x82f) || in(r, 0xb00, 0xbff) || r == 0x394 || r == 0x1524 || r == 0x1528 || r == 0x150a) return gmc;
@@ -1484,6 +1484,15 @@ static std::vector<uint8_t> make_connector_vbios() {
   aux.move(atomimage::PS, 1, atomimage::REG, FakeAuxCard::kStatus, atomimage::BYTE0, 1);
   aux.move(atomimage::PS, 1, atomimage::REG, FakeAuxCard::kLength, atomimage::BYTE0, 2);
   aux.eot();
+  // UNIPHYTransmitterControl (76): the parameters' first word to the card, which is the panel power
+  atomimage::Code panel;
+  panel.move(atomimage::REG, FakeAuxCard::kPanel, atomimage::PS, 0);
+  panel.eot();
+  u16(0x640 + 4 + 76 * 2, 0x780);
+  u16(0x780, 6 + static_cast<uint32_t>(panel.b.size()));
+  u8(0x784, 8);
+  u8(0x785, 8);
+  for (size_t i = 0; i < panel.b.size(); ++i) u8(0x786 + static_cast<uint32_t>(i), panel.b[i]);
   u16(0x640 + 4 + 78 * 2, 0x700);
   u16(0x700, 6 + static_cast<uint32_t>(aux.b.size()));
   u8(0x704, 8);
@@ -1525,10 +1534,28 @@ static void test_read_edid() {
   for (size_t i = 0; i < 127; ++i) sum = static_cast<uint8_t>(sum + auxcard.sink.edid[i]);
   auxcard.sink.edid[127] = static_cast<uint8_t>(0 - sum);
   CHECK(vega.read_edid(dp, &out) && out.size() == 256 && memcmp(out.view().data(), auxcard.sink.edid.data(), 256) == 0);
+  CHECK(auxcard.panel_writes == 0);       // (a DisplayPort connector has no panel to power)
   CHECK(!auxcard.sink.requests.empty() && auxcard.sink.requests.front().channel == 0x93 && auxcard.sink.requests.front().hpd == 2);
   auxcard.sink.requests.clear();
   CHECK(vega.read_edid(edp, &out) && out.size() == 256 && memcmp(out.view().data(), auxcard.sink.edid.data(), 256) == 0);
   CHECK(!auxcard.sink.requests.empty() && auxcard.sink.requests.front().channel == 0x92 && auxcard.sink.requests.front().hpd == 0);
+  CHECK(auxcard.panel_writes == 1 && auxcard.panel_params == 0x0C000000u && auxcard.panel_on);     // powered up (ucAction = POWER_ON) before the first AUX access
+  // The panel is off and does not answer on the AUX channel until the table powers it up; the hot plug pin of the connector (pin 0) shows it
+  auxcard.panel_on = false;
+  auxcard.unpowered_channel = 0x92;
+  auxcard.sink.requests.clear();
+  rig.card.gfx.set_reg(0x1898, 0x2);
+  uint64_t began = rig.clock.now;
+  CHECK(vega.read_edid(edp, &out) && out.size() == 256 && auxcard.panel_on && auxcard.panel_writes == 2);
+  CHECK(rig.clock.now - began < 100000);       // (no wait: the connector's pin shows the panel)
+  CHECK(!auxcard.sink.requests.empty());
+  // the pin never shows the panel: the wait runs out (300 sense reads), the AUX channel is tried anyway
+  auxcard.panel_on = false;
+  rig.card.gfx.set_reg(0x1898, 0);
+  began = rig.clock.now;
+  CHECK(vega.read_edid(edp, &out) && auxcard.panel_on && auxcard.panel_writes == 3);
+  CHECK(rig.clock.now - began >= 300000);      // (the 300 ms)
+  auxcard.unpowered_channel = 0;
   CHECK(auxcard.sink.malformed == 0 && auxcard.sink.outside_transaction == 0 && monitor.writes == writes);
   auxcard.sink.monitor_present = false;
   CHECK(!vega.read_edid(dp, &out));

@@ -34,8 +34,8 @@ namespace hardware {
 // The transaction limits of the table: a write has at most 12 payload bytes (the request length is 4 bits, header included), a read at most 16. The sink answers a request with an ACK,
 // NACK or DEFER in the native and the I2C reply (DP 1.2 2.7.7): a defer is waited out and retried (kTries, plus one more for each I2C defer, up to kTries of them), the others fail.
 //
-// Not done: the eDP panel's power (amdgpu powers it up through the transmitter control table before the first AUX access) and the DPCD (link training, sink capabilities), which the
-// native requests below can read and write but nothing uses yet.
+// Not done here: the eDP panel's power (AmdPanelPower, which AmdVegaM::read_edid runs before the first AUX access) and the DPCD (link training, sink capabilities), which the native
+// requests below can read and write but nothing uses yet.
 class AmdAux final : public II2cBus {
  public:
   static constexpr uint32_t kCommandTable = 78;           // GetIndexIntoMasterTable(COMMAND, ProcessAuxChannelTransaction)

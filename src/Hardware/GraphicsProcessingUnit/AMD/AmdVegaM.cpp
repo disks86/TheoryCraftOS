@@ -18,6 +18,7 @@
 
 
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdVegaM.hpp"
+#include "Hardware/GraphicsProcessingUnit/AMD/AmdPanelPower.hpp"
 #include "Hardware/VideoCodec/AMD/AmdGmc8Memory.hpp"
 #include "Utility/ByteBuffer.hpp"
 
@@ -417,6 +418,16 @@ class PostHost final : public IAtomHost {
   IVcnRegisters& registers_;
   const IClock& clock_;
 };
+
+// The display engine's hot plug pins, for the wait on an eDP panel's power
+class DisplayHpdSense final : public IHpdSense {
+ public:
+  explicit DisplayHpdSense(amd_dce11::Interrupts* irq) : irq_(irq) {}
+  bool hpd_sense(uint32_t pin) override { return irq_ && irq_->hpd_sense(pin); }
+
+ private:
+  amd_dce11::Interrupts* irq_;
+};
 }  // namespace
 
 bool AmdVegaM::read_edid(const AtomConnectors::Connector& connector, ByteBuffer* out) {
@@ -429,6 +440,12 @@ bool AmdVegaM::read_edid(const AtomConnectors::Connector& connector, ByteBuffer*
   PostHost host(*inputs_.registers, *inputs_.clock);
   AtomBios bios(host, inputs_.vbios, *inputs_.allocator);
   if (!bios.valid()) return false;
+  // An eDP panel does not answer on the AUX channel without power: the driver powers it up first and waits for the hot plug pin to show it. (If the wait times out the AUX channel
+  // is tried anyway, as the driver does.)
+  if (connector.type == AtomConnectors::Type::EmbeddedDisplayPort) {
+    DisplayHpdSense sense(display_irq_.get());
+    AmdPanelPower::power_on(host, bios, sense, connector.hpd_pin);
+  }
   return AmdAux(host, bios, connector.ddc_id, connector.hpd_pin).read_edid(out);
 }
 
