@@ -6247,6 +6247,22 @@ static void test_calculator() {
     c.press_backspace();
     CHECK(c.display().equals("0"));
 
+    // The numeric keypad types like the main keys (usages 0x59-0x61 are 1-9, 0x62 is 0, 0x63 is ".", 0x57 is +, 0x58 is Enter).
+    c.press_clear();
+    auto keypad = [&](std::initializer_list<uint8_t> usages) {
+      for (uint8_t usage : usages) {
+        KeyArgs args;
+        args.usage = usage;
+        args.character = hardware::key_to_ascii(usage, 0);
+        c.on_key(args);
+      }
+    };
+    keypad({0x59, 0x62, 0x57, 0x5B, 0x58});   // 10+3, Enter
+    CHECK(c.display().equals("13"));
+    c.press_clear();
+    keypad({0x5F, 0x63, 0x5D, 0x56, 0x5A, 0x55, 0x5B, 0x54, 0x5A, 0x58});   // 7.5-2*3/2 left to right
+    CHECK(c.display().equals("8.25"));
+
     // The Start menu opens a calculator; a second one opens a second window.
     desktop::Calculator* c1 = d.open_calculator();
     CHECK(c1 == &d.calculator() && d.calculator_count() == 1 && c1->app_kind() == desktop::Desktop::kAppCalculator);
