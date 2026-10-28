@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Process/WindowsModules.hpp"
+#include "Process/WindowsObjects.hpp"
 #include "Process/ModuleLoader.hpp"
 #include "Process/WindowsFiles.hpp"
 #include "Process/WindowsProcess.hpp"
@@ -47,6 +48,7 @@ uint32_t nt_load_module(Process& p, const SyscallRequest& r) {
   }
   ByteBuffer file(p.files().allocator());
   if (!read_program_file(p, path.view(), &file, &status)) return status == 0xC0000034u || status == 0xC000003Au ? kDllNotFound : status;
+  if (const uint32_t header = image_header_status(file.view())) return header;
   LoadedModule loaded[kMaxRecords];
   uint32_t count = 0;
   status = host->load_module(file.view(), canonical.view(), loaded, capacity, &count, (flags & 1) == 0);

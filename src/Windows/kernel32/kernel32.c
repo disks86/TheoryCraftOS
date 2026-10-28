@@ -658,9 +658,8 @@ static LDR_DATA_TABLE_ENTRY *module_containing(PVOID address) {
 static DWORD dos_error_of_load(NTSTATUS status) {
   switch ((ULONG)status) {
     case 0xC0000135u: return ERROR_MOD_NOT_FOUND;
-    case 0xC000007Bu: return ERROR_BAD_EXE_FORMAT;
+    case 0xC000007Bu: case 0xC000012Fu: case 0xC000011Bu: case 0xC0000131u: case 0xC0000130u: case 0xC000035Au: case 0xC00000BBu: return ERROR_BAD_EXE_FORMAT;      /* (a file that is no image this system can map) */
     case 0xC0000142u: return 1114;      /* ERROR_DLL_INIT_FAILED */
-    case 0xC00000BBu: return ERROR_NOT_SUPPORTED;
     case 0xC0000017u: return ERROR_NOT_ENOUGH_MEMORY;
     default: return RtlNtStatusToDosError(status);
   }
@@ -791,19 +790,38 @@ EXPORT DWORD WINAPI GetDllDirectoryA(DWORD capacity, LPSTR buffer) {
   return wide_result_to_ansi(g_dll_directory, n, buffer, capacity);
 }
 
+EXPORT HANDLE WINAPI CreateFileMappingW(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect, DWORD size_high, DWORD size_low, LPCWSTR name);
+EXPORT LPVOID WINAPI MapViewOfFile(HANDLE mapping, DWORD access, DWORD offset_high, DWORD offset_low, SIZE_T bytes);
+EXPORT BOOL WINAPI UnmapViewOfFile(LPCVOID base);
+#ifndef SEC_IMAGE
+#define SEC_IMAGE 0x1000000
+#endif
+
 /* LoadLibrary: a library the process has already (by its name) gets one more use; otherwise the file is looked for and ntdll maps it, with the libraries it imports, and
    calls their entry points. Libraries with thread-local data of their own (__declspec(thread) in a DLL) and the data-file modes are refused. */
 EXPORT HMODULE WINAPI LoadLibraryExW(LPCWSTR name, HANDLE file, DWORD flags) {
   (void)file;
   if (!name || !name[0]) { set_error(ERROR_INVALID_PARAMETER); return NULL; }
-  if (flags & 0x32) { set_error(ERROR_NOT_SUPPORTED); return NULL; }      /* AS_DATAFILE 2, AS_DATAFILE_EXCLUSIVE 0x10, AS_IMAGE_RESOURCE 0x20 */
   WCHAR path[PATH_CHARS];
   UNICODE_STRING us;
   /* The file, if there is one; otherwise the bare name (a library the process has already may be known by an alias, "api-ms-win-crt-runtime-l1-1-0.dll"): the kernel knows
      which libraries are loaded, and decides under the loader lock. */
   static const WCHAR dll[] = {'.', 'd', 'l', 'l', 0};
+  path[0] = 0;
   if (find_file(name, dll, g_dll_directory, path)) unicode_string(&us, path);
   else unicode_string(&us, name);
+  if ((flags & 0x32) && !GetModuleHandleW(path[0] ? path : name)) {      /* AS_DATAFILE 2, AS_DATAFILE_EXCLUSIVE 0x10, AS_IMAGE_RESOURCE 0x20: the file is only mapped (a loaded library is used as it is) */
+    if (!path[0]) { set_error(ERROR_MOD_NOT_FOUND); return NULL; }
+    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) return NULL;
+    HANDLE m = CreateFileMappingW(f, NULL, PAGE_READONLY | ((flags & 0x20) ? SEC_IMAGE : 0), 0, 0, NULL);
+    CloseHandle(f);
+    if (!m) return NULL;
+    LPVOID view = MapViewOfFile(m, 4 /* FILE_MAP_READ */, 0, 0, 0);
+    CloseHandle(m);
+    if (!view) return NULL;
+    return (HMODULE)((ULONG_PTR)view | ((flags & 0x20) ? 2 : 1));      /* (the low bits tell FreeLibrary and the resource functions what it is) */
+  }
   PVOID handle = NULL;
   ULONG ldr_flags = (flags & 1) ? 2 : 0;      /* DONT_RESOLVE_DLL_REFERENCES = LDR_DONT_RESOLVE_REFS */
   const NTSTATUS status = LdrLoadDll(NULL, &ldr_flags, &us, &handle);
@@ -826,9 +844,16 @@ EXPORT HMODULE WINAPI LoadLibraryExA(LPCSTR name, HANDLE file, DWORD flags) {
   return m;
 }
 EXPORT BOOL WINAPI FreeLibrary(HMODULE module) {
+  if (((ULONG_PTR)module & 3) == 1 || ((ULONG_PTR)module & 3) == 2) return UnmapViewOfFile((LPCVOID)((ULONG_PTR)module & ~(ULONG_PTR)3));      /* a data file or an image resource view */
   if (!module_by_base(module)) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
   const NTSTATUS status = LdrUnloadDll(module);
   return NT_SUCCESS(status) ? TRUE : (set_error(dos_error_of_load(status)), FALSE);
+}
+/* There are no packages here. */
+EXPORT HMODULE WINAPI LoadPackagedLibrary(LPCWSTR name, DWORD reserved) {
+  (void)name; (void)reserved;
+  set_error(15700);      /* APPMODEL_ERROR_NO_PACKAGE */
+  return NULL;
 }
 EXPORT void WINAPI FreeLibraryAndExitThread(HMODULE module, DWORD code) { FreeLibrary(module); ExitThread(code); }
 

@@ -382,6 +382,28 @@ static int is_program(const LDR_DATA_TABLE_ENTRY *m) { return NtCurrentPeb()->Im
 
 #define LDRP_MAPPED_ONLY 0x80000000u      /* loaded with DONT_RESOLVE_DLL_REFERENCES: no imports, no thread-local data, no entry point */
 #define LDRP_PROCESS_DETACH_CALLED 0x00080000u      /* the library has been told the process (or its use of it) ends: once only */
+/* The entry point of a library that is being attached runs under a guard: a fault nobody handles ends the call (the library failed to start) instead of the process. */
+static void **volatile g_init_guard;
+static volatile PVOID g_init_guard_teb;
+static BOOL call_library_entry(LDR_DATA_TABLE_ENTRY *m, DWORD reason, PVOID reserved) {
+  BOOL (WINAPI *entry)(PVOID, DWORD, PVOID) = (BOOL (WINAPI *)(PVOID, DWORD, PVOID))m->EntryPoint;
+  if (reason != DLL_PROCESS_ATTACH) return entry(m->DllBase, reason, reserved);
+  void *buffer[5];
+  void **const outer = g_init_guard;
+  PVOID const outer_teb = g_init_guard_teb;
+  if (__builtin_setjmp(buffer)) {      /* the entry point faulted */
+    g_init_guard = outer;
+    g_init_guard_teb = outer_teb;
+    return FALSE;
+  }
+  g_init_guard = buffer;
+  g_init_guard_teb = NtCurrentTeb();
+  const BOOL result = entry(m->DllBase, reason, reserved);
+  g_init_guard = outer;
+  g_init_guard_teb = outer_teb;
+  return result;
+}
+
 static BOOL notify_module(LDR_DATA_TABLE_ENTRY *m, DWORD reason, PVOID reserved) {
   if (m->Flags & LDRP_MAPPED_ONLY) return TRUE;
   if (reason == DLL_PROCESS_DETACH) {
@@ -401,7 +423,7 @@ static BOOL notify_module(LDR_DATA_TABLE_ENTRY *m, DWORD reason, PVOID reserved)
     const TlsCallback *callbacks = (const TlsCallback *)*(const ULONG64 *)(image + rva + 0x18);
     if (callbacks) for (; *callbacks; ++callbacks) (*callbacks)(m->DllBase, reason, reserved);
   }
-  if (!is_program(m) && m->EntryPoint) return ((BOOL (WINAPI *)(PVOID, DWORD, PVOID))m->EntryPoint)(m->DllBase, reason, reserved);
+  if (!is_program(m) && m->EntryPoint) return call_library_entry(m, reason, reserved);
   return TRUE;
 }
 
@@ -1167,8 +1189,7 @@ static void ldr_release(PVOID base, int detach) {
 }
 
 /* Loads the DLL file at `name` (a Win32 path; or just a library's name when it is loaded already) and what it imports; calls the entry points. */
-EXPORT NTSTATUS NTAPI LdrLoadDll(PWSTR search_path, PULONG flags, PUNICODE_STRING name, PVOID *handle) {
-  (void)search_path;
+static NTSTATUS ldr_load_one(PULONG flags, PUNICODE_STRING name, PVOID *handle) {
   const int mapped_only = flags && (*flags & 2);      /* LDR_DONT_RESOLVE_REFS */
   LoadRecord records[MAX_LOAD_RECORDS];
   ULONG count = 0;
@@ -1202,6 +1223,36 @@ EXPORT NTSTATUS NTAPI LdrLoadDll(PWSTR search_path, PULONG flags, PUNICODE_STRIN
   ldr_release(base, 0);
   loader_unlock();
   return listed == count ? STATUS_DLL_INIT_FAILED : STATUS_NO_MEMORY;
+}
+
+/* A bare file name is looked for in the directories of the search path (separated by ';'): a file that is found but cannot be loaded does not stop the search; if nothing
+ * loads, the answer is the error of the first file that was found (or "not found"). */
+EXPORT NTSTATUS NTAPI LdrLoadDll(PWSTR search_path, PULONG flags, PUNICODE_STRING name, PVOID *handle) {
+  BOOLEAN bare = TRUE;
+  for (USHORT i = 0; search_path && i < name->Length / 2; ++i) if (name->Buffer[i] == '\\' || name->Buffer[i] == '/' || name->Buffer[i] == ':') bare = FALSE;
+  if (!search_path || !bare || !search_path[0]) return ldr_load_one(flags, name, handle);
+  NTSTATUS first_error = STATUS_DLL_NOT_FOUND;
+  BOOLEAN found = FALSE;
+  const WCHAR *dir = search_path;
+  while (*dir) {
+    const WCHAR *end = dir;
+    while (*end && *end != ';') ++end;
+    const SIZE_T length = (SIZE_T)(end - dir);
+    WCHAR full[520];
+    if (length > 0 && length + 1 + name->Length / 2 + 1 <= 520) {
+      SIZE_T n = 0;
+      for (SIZE_T i = 0; i < length; ++i) full[n++] = dir[i];
+      if (full[n - 1] != '\\') full[n++] = '\\';
+      for (USHORT i = 0; i < name->Length / 2; ++i) full[n++] = name->Buffer[i];
+      full[n] = 0;
+      UNICODE_STRING us = { (USHORT)(n * 2), (USHORT)(n * 2 + 2), full };
+      const NTSTATUS status = ldr_load_one(flags, &us, handle);
+      if (NT_SUCCESS(status)) return status;
+      if (status != STATUS_DLL_NOT_FOUND && status != (NTSTATUS)0xC0000034 && status != (NTSTATUS)0xC000003A && !found) { found = TRUE; first_error = status; }
+    }
+    dir = *end ? end + 1 : end;
+  }
+  return first_error;
 }
 
 EXPORT NTSTATUS NTAPI LdrUnloadDll(PVOID base) {
