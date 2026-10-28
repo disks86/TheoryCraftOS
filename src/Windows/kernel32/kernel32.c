@@ -665,8 +665,9 @@ static DWORD dos_error_of_load(NTSTATUS status) {
   }
 }
 EXPORT BOOL WINAPI GetModuleHandleExW(DWORD flags, LPCWSTR name, HMODULE *module) {
-  LDR_DATA_TABLE_ENTRY *m = (flags & 4) ? module_containing((PVOID)name) : (name ? module_by_name(name) : module_by_base(NtCurrentPeb()->ImageBaseAddress));
   if (module) *module = NULL;
+  if (!module || (flags & ~7u) || (flags & 3) == 3 || ((flags & 4) && !name)) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  LDR_DATA_TABLE_ENTRY *m = (flags & 4) ? module_containing((PVOID)name) : (name ? module_by_name(name) : module_by_base(NtCurrentPeb()->ImageBaseAddress));
   if (!m) { set_error(ERROR_MOD_NOT_FOUND); return FALSE; }
   if (!(flags & 2) || (flags & 1)) {      /* another use (a pin is a use that is never given back) */
     UNICODE_STRING base_name = m->BaseDllName;
@@ -766,9 +767,15 @@ static BOOL find_file(LPCWSTR name, LPCWSTR extension, LPCWSTR extra, WCHAR *out
 static void unicode_string(UNICODE_STRING *s, LPCWSTR text);
 static WCHAR g_dll_directory[PATH_CHARS];      /* SetDllDirectory */
 
+NTSTATUS NTAPI LdrSetDllDirectory(PUNICODE_STRING directory);
+NTSTATUS NTAPI LdrGetDllDirectory(PUNICODE_STRING directory);
 EXPORT BOOL WINAPI SetDllDirectoryW(LPCWSTR directory) {
   if (directory && wcslen(directory) >= PATH_CHARS) { set_error(ERROR_FILENAME_EXCED_RANGE); return FALSE; }
   if (directory) lstrcpyW(g_dll_directory, directory); else g_dll_directory[0] = 0;
+  UNICODE_STRING text;
+  text.Buffer = g_dll_directory;
+  text.Length = text.MaximumLength = (USHORT)(wcslen(g_dll_directory) * 2);
+  LdrSetDllDirectory(&text);
   return TRUE;
 }
 EXPORT BOOL WINAPI SetDllDirectoryA(LPCSTR directory) {
@@ -780,13 +787,19 @@ EXPORT BOOL WINAPI SetDllDirectoryA(LPCSTR directory) {
 }
 EXPORT DWORD WINAPI GetDllDirectoryW(DWORD capacity, LPWSTR buffer) {
   const DWORD n = (DWORD)wcslen(g_dll_directory);
-  if (n + 1 > capacity) return n + 1;
+  if (n + 1 > capacity) {
+    if (capacity != 0 && buffer) buffer[0] = 0;
+    return n + 1;
+  }
   memcpy(buffer, g_dll_directory, (n + 1) * 2);
   return n;
 }
 EXPORT DWORD WINAPI GetDllDirectoryA(DWORD capacity, LPSTR buffer) {
   const DWORD n = (DWORD)wcslen(g_dll_directory);
-  if (n + 1 > capacity) return n + 1;
+  if (n + 1 > capacity) {
+    if (capacity != 0 && buffer) buffer[0] = 0;
+    return n + 1;
+  }
   return wide_result_to_ansi(g_dll_directory, n, buffer, capacity);
 }
 
@@ -799,19 +812,48 @@ EXPORT BOOL WINAPI UnmapViewOfFile(LPCVOID base);
 
 /* LoadLibrary: a library the process has already (by its name) gets one more use; otherwise the file is looked for and ntdll maps it, with the libraries it imports, and
    calls their entry points. Libraries with thread-local data of their own (__declspec(thread) in a DLL) and the data-file modes are refused. */
+static HMODULE load_library_ex(LPCWSTR name, HANDLE file, DWORD flags);
+static int find_library_restricted(LPCWSTR name, DWORD search, WCHAR *out);
+static DWORD g_default_dll_dirs;      /* SetDefaultDllDirectories */
+static BOOL has_separator(LPCWSTR name) { for (; *name; name++) if (*name == '\\' || *name == '/') return TRUE; return FALSE; }
 EXPORT HMODULE WINAPI LoadLibraryExW(LPCWSTR name, HANDLE file, DWORD flags) {
-  (void)file;
-  if (!name || !name[0]) { set_error(ERROR_INVALID_PARAMETER); return NULL; }
+  const DWORD saved = GetLastError();      /* (a call that works leaves the last error as it was) */
+  WCHAR trimmed[PATH_CHARS];
+  if (name && name[0] && wcslen(name) < PATH_CHARS) {      /* blanks at the end of a name do not count */
+    SIZE_T n = wcslen(name);
+    while (n > 1 && name[n - 1] == ' ') n--;
+    memcpy(trimmed, name, n * 2);
+    trimmed[n] = 0;
+    name = trimmed;
+  }
+  HMODULE m = load_library_ex(name, file, flags);
+  if (m) set_error(saved);
+  return m;
+}
+static HMODULE load_library_ex(LPCWSTR name, HANDLE file, DWORD flags) {
+  if (file || !name || !name[0]) { set_error(ERROR_INVALID_PARAMETER); return NULL; }      /* (the file handle is reserved) */
   WCHAR path[PATH_CHARS];
   UNICODE_STRING us;
   /* The file, if there is one; otherwise the bare name (a library the process has already may be known by an alias, "api-ms-win-crt-runtime-l1-1-0.dll"): the kernel knows
      which libraries are loaded, and decides under the loader lock. */
   static const WCHAR dll[] = {'.', 'd', 'l', 'l', 0};
   path[0] = 0;
-  if (find_file(name, dll, g_dll_directory, path)) unicode_string(&us, path);
-  else unicode_string(&us, name);
-  if ((flags & 0x32) && !GetModuleHandleW(path[0] ? path : name)) {      /* AS_DATAFILE 2, AS_DATAFILE_EXCLUSIVE 0x10, AS_IMAGE_RESOURCE 0x20: the file is only mapped (a loaded library is used as it is) */
-    if (!path[0]) { set_error(ERROR_MOD_NOT_FOUND); return NULL; }
+  DWORD search = flags & 0x1F00;      /* LOAD_LIBRARY_SEARCH_*: only the folders named are looked in */
+  if (search && (flags & 8)) { set_error(ERROR_INVALID_PARAMETER); return NULL; }      /* (LOAD_WITH_ALTERED_SEARCH_PATH excludes them) */
+  if (!search && g_default_dll_dirs && !has_separator(name)) search = g_default_dll_dirs;
+  if (search) {
+    const int found = find_library_restricted(name, search, path);
+    if (found < 0) { set_error(ERROR_INVALID_PARAMETER); return NULL; }
+    if (found > 0) unicode_string(&us, path);
+    else if (GetModuleHandleW(name)) unicode_string(&us, name);      /* (a library the process has already is not searched for) */
+    else { set_error(ERROR_MOD_NOT_FOUND); return NULL; }
+  } else if (find_file(name, dll, g_dll_directory, path)) {
+    unicode_string(&us, path);
+  } else {
+    unicode_string(&us, name);
+  }
+  if ((flags & 0x32) && (has_separator(name) || !GetModuleHandleW(path[0] ? path : name))) {      /* AS_DATAFILE 2, AS_DATAFILE_EXCLUSIVE 0x10, AS_IMAGE_RESOURCE 0x20: the file is only mapped (a loaded library is used as it is) */
+    if (!path[0]) { set_error(has_separator(name) ? ERROR_FILE_NOT_FOUND : ERROR_MOD_NOT_FOUND); return NULL; }
     HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
     if (f == INVALID_HANDLE_VALUE) return NULL;
     HANDLE m = CreateFileMappingW(f, NULL, PAGE_READONLY | ((flags & 0x20) ? SEC_IMAGE : 0), 0, 0, NULL);
@@ -821,6 +863,11 @@ EXPORT HMODULE WINAPI LoadLibraryExW(LPCWSTR name, HANDLE file, DWORD flags) {
     CloseHandle(m);
     if (!view) return NULL;
     return (HMODULE)((ULONG_PTR)view | ((flags & 0x20) ? 2 : 1));      /* (the low bits tell FreeLibrary and the resource functions what it is) */
+  }
+  if (path[0] && !GetModuleHandleW(path)) {      /* a file somebody holds open without sharing cannot be read by the loader */
+    HANDLE probe = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
+    if (probe == INVALID_HANDLE_VALUE) { if (GetLastError() == ERROR_SHARING_VIOLATION) return NULL; }
+    else CloseHandle(probe);
   }
   PVOID handle = NULL;
   ULONG ldr_flags = (flags & 1) ? 2 : 0;      /* DONT_RESOLVE_DLL_REFERENCES = LDR_DONT_RESOLVE_REFS */
@@ -844,8 +891,13 @@ EXPORT HMODULE WINAPI LoadLibraryExA(LPCSTR name, HANDLE file, DWORD flags) {
   return m;
 }
 EXPORT BOOL WINAPI FreeLibrary(HMODULE module) {
-  if (((ULONG_PTR)module & 3) == 1 || ((ULONG_PTR)module & 3) == 2) return UnmapViewOfFile((LPCVOID)((ULONG_PTR)module & ~(ULONG_PTR)3));      /* a data file or an image resource view */
-  if (!module_by_base(module)) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
+  if (((ULONG_PTR)module & 3) == 1 || ((ULONG_PTR)module & 3) == 2) {
+    MEMORY_BASIC_INFORMATION info;
+    const LPCVOID view = (LPCVOID)((ULONG_PTR)module & ~(ULONG_PTR)3);
+    if (!VirtualQuery(view, &info, sizeof(info)) || info.AllocationBase != view) { set_error(ERROR_BAD_EXE_FORMAT); return FALSE; }      /* (not the start of a view) */
+    return UnmapViewOfFile(view);
+  }      /* a data file or an image resource view */
+  if (!module_by_base(module)) { set_error(ERROR_MOD_NOT_FOUND); return FALSE; }
   const NTSTATUS status = LdrUnloadDll(module);
   return NT_SUCCESS(status) ? TRUE : (set_error(dos_error_of_load(status)), FALSE);
 }
@@ -1658,6 +1710,61 @@ static BOOL find_file(LPCWSTR name, LPCWSTR extension, LPCWSTR extra, WCHAR *out
   }
   return FALSE;
 }
+NTSTATUS NTAPI LdrAddDllDirectory(PUNICODE_STRING directory, PVOID *cookie);
+NTSTATUS NTAPI LdrRemoveDllDirectory(PVOID cookie);
+NTSTATUS NTAPI LdrGetDllPath(PCWSTR name, ULONG flags, PWSTR *path, PWSTR *unused);
+VOID NTAPI RtlReleasePath(PWSTR path);
+
+EXPORT PVOID WINAPI AddDllDirectory(LPCWSTR directory) {
+  const BOOL device = directory && directory[0] == '\\' && directory[1] == '\\' && (directory[2] == '.' || directory[2] == '?') && directory[3] == '\\';
+  if (!directory || !((directory[0] && directory[1] == ':' && directory[2] == '\\') || directory[0] == '\\')) { set_error(ERROR_INVALID_PARAMETER); return NULL; }      /* (a full path) */
+  if (!device && GetFileAttributesW(directory) == INVALID_FILE_ATTRIBUTES) { set_error(ERROR_FILE_NOT_FOUND); return NULL; }
+  UNICODE_STRING text;
+  unicode_string(&text, directory);
+  PVOID cookie = NULL;
+  const NTSTATUS status = LdrAddDllDirectory(&text, &cookie);
+  if (!NT_SUCCESS(status)) { set_error(status == STATUS_NO_MEMORY ? ERROR_NOT_ENOUGH_MEMORY : ERROR_INVALID_PARAMETER); return NULL; }
+  return cookie;
+}
+EXPORT BOOL WINAPI RemoveDllDirectory(PVOID cookie) {
+  if (!NT_SUCCESS(LdrRemoveDllDirectory(cookie))) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  return TRUE;
+}
+EXPORT BOOL WINAPI SetDefaultDllDirectories(DWORD flags) {
+  if (flags == 0 || (flags & ~0x1F00u) || (flags & 0x100)) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  g_default_dll_dirs = flags;
+  return TRUE;
+}
+
+/* The LOAD_LIBRARY_SEARCH_* lookup: a full path is taken as it is, anything else is looked for in the folders the flags name (application 0x200, user 0x400, System32 0x800).
+   Returns 1 found, 0 not found, -1 for flags that cannot work with this name. */
+static int find_library_restricted(LPCWSTR name, DWORD search, WCHAR *out) {
+  static const WCHAR dll[] = {'.', 'd', 'l', 'l', 0};
+  static const WCHAR system32[] = {'C', ':', '\\', 'W', 'i', 'n', 'd', 'o', 'w', 's', '\\', 'S', 'y', 's', 't', 'e', 'm', '3', '2', 0};
+  const BOOL absolute = (name[0] && name[1] == ':' && (name[2] == '\\' || name[2] == '/')) || (name[0] == '\\' && name[1] == '\\');
+  BOOL has_extension = FALSE;
+  for (LPCWSTR c = name; *c; ++c) { if (*c == '\\' || *c == '/' || *c == ':') has_extension = FALSE; else if (*c == '.') has_extension = TRUE; }
+  WCHAR file[MAX_PATH];
+  const size_t_ length = wcslen(name);
+  if (length + 5 > MAX_PATH) return 0;
+  memcpy(file, name, (length + 1) * 2);
+  if (!has_extension) memcpy(file + length, dll, sizeof(dll));
+  const BOOL rooted = name[0] == '\\';
+  if (absolute || rooted) return full_path_w(file, out, PATH_CHARS) != 0 && is_program_file(out) ? 1 : 0;
+  if (search & 0x100) return -1;      /* (the folder of the library that is loaded needs a path to take it from) */
+  PWSTR list = NULL, unused = NULL;
+  if (!NT_SUCCESS(LdrGetDllPath(name, search, &list, &unused))) return -1;
+  int found = 0;
+  for (WCHAR *start = list; *start && !found;) {
+    WCHAR *end = start;
+    while (*end && *end != ';') ++end;
+    if (end > start && (size_t_)(end - start) < PATH_CHARS && try_candidate(start, (size_t_)(end - start), file, out)) found = 1;
+    start = *end ? end + 1 : end;
+  }
+  RtlReleasePath(list);
+  return found;
+}
+
 static BOOL find_program(LPCWSTR name, WCHAR *out) {
   static const WCHAR exe[] = {'.', 'e', 'x', 'e', 0};
   return find_file(name, exe, NULL, out);
