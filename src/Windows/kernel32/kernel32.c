@@ -856,6 +856,7 @@ static HMODULE load_library_ex(LPCWSTR name, HANDLE file, DWORD flags) {
   } else if (find_file(name, dll, g_dll_directory, path)) {
     unicode_string(&us, path);
   } else {
+    path[0] = 0;      /* (find_file may have left a name behind that is not a file) */
     unicode_string(&us, name);
   }
   if ((flags & 0x32) && has_separator(name) && !path[0] && !search) { set_error(ERROR_FILE_NOT_FOUND); return NULL; }      /* (a file named with a folder has to be there) */
