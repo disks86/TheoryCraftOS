@@ -209,7 +209,7 @@ for t in "${WANTED[@]}"; do
                         src/Hardware/GraphicsProcessingUnit/Multi/GpuTopology.cpp src/Hardware/GraphicsProcessingUnit/Multi/GpuPowerPolicy.cpp src/Hardware/GraphicsProcessingUnit/Multi/GpuManager.cpp src/Hardware/GraphicsProcessingUnit/Multi/GpuPool.cpp \
                         src/Hardware/GraphicsProcessingUnit/AMD/AmdGpuGenerations.cpp src/Hardware/GraphicsProcessingUnit/Intel/IntelGpuGenerations.cpp src/Hardware/GraphicsProcessingUnit/NVIDIA/NvidiaGpuGenerations.cpp \
                         src/Graphics/RenderNode.cpp src/Graphics/Renderer2DSlot.cpp src/Graphics/GraphicsPool.cpp src/Graphics/Graphics2D/Software/*.cpp src/Graphics/Graphics2D/Device/*.cpp src/Graphics/Graphics3D/BuiltinShaders.cpp src/Graphics/Graphics3D/Software/*.cpp ;;
-    AmdVbiosTest) build_and_run AmdVbiosTest tests/AmdVbiosTest.cpp tests/KernelStubs.cpp src/Hardware/GraphicsProcessingUnit/AMD/AmdVbios.cpp ;;
+    AmdVbiosTest) build_and_run AmdVbiosTest tests/AmdVbiosTest.cpp tests/KernelStubs.cpp src/Hardware/GraphicsProcessingUnit/AMD/AmdVbios.cpp src/Hardware/Acpi/AmlInterpreter.cpp ;;
     AtomConnectorsTest) build_and_run AtomConnectorsTest tests/AtomConnectorsTest.cpp tests/KernelStubs.cpp src/Hardware/GraphicsProcessingUnit/AMD/AtomConnectors.cpp ;;
     AtomBiosTest) build_and_run AtomBiosTest tests/AtomBiosTest.cpp tests/KernelStubs.cpp src/Hardware/GraphicsProcessingUnit/AMD/AtomBios.cpp ;;
     AmdAsicResetTest) build_and_run AmdAsicResetTest tests/AmdAsicResetTest.cpp tests/KernelStubs.cpp src/Hardware/GraphicsProcessingUnit/AMD/AmdAsicReset.cpp ;;

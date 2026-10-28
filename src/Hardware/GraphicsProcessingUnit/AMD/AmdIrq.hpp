@@ -132,6 +132,7 @@ class AmdIrq {
   uint32_t vce_fences(uint32_t ring) const { return ring < 3 ? vce_[ring] : 0; }
   // The display interrupts, per controller and per pin.
   uint32_t vblank_count(uint32_t crtc) const { return crtc < amd_dce11::kMaxCrtcs ? vblanks_[crtc] : 0; }
+  uint32_t vline_count(uint32_t crtc) const { return crtc < amd_dce11::kMaxCrtcs ? vlines_[crtc] : 0; }
   uint32_t pageflip_count(uint32_t crtc) const { return crtc < amd_dce11::kMaxCrtcs ? pageflips_[crtc] : 0; }
   uint32_t hotplug_count(uint32_t pin) const { return pin < amd_dce11::Interrupts::kMaxHpd ? hotplugs_[pin] : 0; }
   bool hpd_connected(uint32_t pin) const { return pin < amd_dce11::Interrupts::kMaxHpd && (connected_ >> pin & 1); }   // as of the last hot plug on the pin
@@ -148,7 +149,7 @@ class AmdIrq {
   uint32_t unknown_[256] = {};
   uint32_t total_ = 0;
   amd_dce11::Interrupts display_;
-  uint32_t vblanks_[amd_dce11::kMaxCrtcs] = {}, pageflips_[amd_dce11::kMaxCrtcs] = {}, hotplugs_[amd_dce11::Interrupts::kMaxHpd] = {};
+  uint32_t vblanks_[amd_dce11::kMaxCrtcs] = {}, vlines_[amd_dce11::kMaxCrtcs] = {}, pageflips_[amd_dce11::kMaxCrtcs] = {}, hotplugs_[amd_dce11::Interrupts::kMaxHpd] = {};
   uint32_t uvd_encode_[2] = {}, vce_[3] = {};
   uint32_t connected_ = 0, throttled_ = 0;
   VmFaultInfo last_vm_fault_;

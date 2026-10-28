@@ -197,6 +197,10 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
   // The vertical blank interrupt of the controller that shows the OS's framebuffer (it comes every frame, so it is off until asked for): counted per controller in irq()->vblank_count().
   // False if the display is not engaged. It is switched off again when the display is given back or the card stopped.
   bool set_vblank_interrupt(bool enable);
+  // The vertical line interrupt of the same controller (LB_INTERRUPT_MASK.VLINE_INTERRUPT_MASK, as dce_v11_0_set_crtc_vline_interrupt_state does; the line it comes at is whatever the
+  // controller has: the driver programs none either), counted in irq()->vline_count(). Same rules as the vblank interrupt: false if the display is not engaged, off again when the
+  // display is given back or the card stopped, and it follows the controller if the display is engaged again on another.
+  bool set_vline_interrupt(bool enable);
 
   // For tests and diagnostics
   const AmdGmc8GartPlan& gart_plan() const { return gart_plan_; }
@@ -223,7 +227,7 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
   UniquePointer<AmdIh3> ih_;
   UniquePointer<AmdIrq> irq_;
   UniquePointer<amd_dce11::Interrupts> display_irq_;
-  int vblank_crtc_ = -1;
+  int vblank_crtc_ = -1, vline_crtc_ = -1;
   uint32_t recoveries_ = 0, asic_resets_ = 0;
   HotplugEvent hotplug_[kMaxHotplugEvents];
   AtomConnectors::Connector connectors_[AtomConnectors::kMaxConnectors];

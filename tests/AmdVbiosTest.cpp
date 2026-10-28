@@ -25,6 +25,7 @@
 #include <string.h>
 #include <map>
 #include <vector>
+#include "Hardware/Acpi/AmlInterpreter.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdVbios.hpp"
 #include "AtomBiosImage.hpp"
 
@@ -355,6 +356,221 @@ static void test_rom_bar() {
   CHECK(!AmdVbios::read_from_rom_bar(p4, fn, notatom, alloc, &out));
 }
 
+// --- The ATRM method: tables assembled byte by byte (a small AML assembler, as AmlTest has) ---------------------------------------------------------
+
+namespace aml_asm {
+typedef std::vector<uint8_t> Bytes;
+static Bytes cat(std::initializer_list<Bytes> parts) { Bytes r; for (const Bytes& p : parts) r.insert(r.end(), p.begin(), p.end()); return r; }
+static Bytes b(std::initializer_list<uint8_t> v) { return Bytes(v); }
+static Bytes path(const char* s) {
+  Bytes r;
+  if (*s == '\\') { r.push_back(0x5C); ++s; }
+  std::vector<Bytes> segs;
+  while (*s) {
+    Bytes sg(4, '_');
+    int n = 0;
+    while (*s && *s != '.') sg[n++] = static_cast<uint8_t>(*s++);
+    segs.push_back(sg);
+    if (*s == '.') ++s;
+  }
+  if (segs.size() == 2) r.push_back(0x2E);
+  else if (segs.size() > 2) { r.push_back(0x2F); r.push_back(static_cast<uint8_t>(segs.size())); }
+  for (const Bytes& sg : segs) r.insert(r.end(), sg.begin(), sg.end());
+  return r;
+}
+static Bytes pkg(const Bytes& body) {
+  Bytes r;
+  const uint32_t n = static_cast<uint32_t>(body.size());
+  if (n + 1 < 64) r.push_back(static_cast<uint8_t>(n + 1));
+  else if (n + 2 < 4096) { const uint32_t t = n + 2; r.push_back(static_cast<uint8_t>(0x40 | (t & 0xF))); r.push_back(static_cast<uint8_t>(t >> 4)); }
+  else { const uint32_t t = n + 3; r.push_back(static_cast<uint8_t>(0x80 | (t & 0xF))); r.push_back(static_cast<uint8_t>(t >> 4)); r.push_back(static_cast<uint8_t>(t >> 12)); }
+  r.insert(r.end(), body.begin(), body.end());
+  return r;
+}
+static Bytes num(uint64_t v) {
+  if (v == 0) return b({0x00});
+  if (v == 1) return b({0x01});
+  if (v <= 0xFF) return b({0x0A, static_cast<uint8_t>(v)});
+  if (v <= 0xFFFF) return b({0x0B, static_cast<uint8_t>(v), static_cast<uint8_t>(v >> 8)});
+  return b({0x0C, static_cast<uint8_t>(v), static_cast<uint8_t>(v >> 8), static_cast<uint8_t>(v >> 16), static_cast<uint8_t>(v >> 24)});
+}
+static Bytes name_def(const char* n, const Bytes& value) { return cat({b({0x08}), path(n), value}); }
+static Bytes method(const char* n, int argc, const Bytes& body) { return cat({b({0x14}), pkg(cat({path(n), b({static_cast<uint8_t>(argc)}), body}))}); }
+static Bytes device(const char* n, const Bytes& body) { return cat({b({0x5B, 0x82}), pkg(cat({path(n), body}))}); }
+static Bytes scope(const char* n, const Bytes& body) { return cat({b({0x10}), pkg(cat({path(n), body}))}); }
+static Bytes buffer(const Bytes& size, const Bytes& init) { return cat({b({0x11}), pkg(cat({size, init}))}); }
+static Bytes ret(const Bytes& v) { return cat({b({0xA4}), v}); }
+static Bytes if_(const Bytes& cond, const Bytes& body) { return cat({b({0xA0}), pkg(cat({cond, body}))}); }
+static Bytes lequal(const Bytes& a, const Bytes& c) { return cat({b({0x93}), a, c}); }
+static const Bytes kArg0 = b({0x68});
+static Bytes make_table(const char* signature, const Bytes& aml) {
+  Bytes t(36, 0);
+  memcpy(&t[0], signature, 4);
+  const uint32_t length = static_cast<uint32_t>(36 + aml.size());
+  for (int i = 0; i < 4; ++i) t[4 + i] = static_cast<uint8_t>(length >> (8 * i));
+  t[8] = 2;
+  t.insert(t.end(), aml.begin(), aml.end());
+  return t;
+}
+}  // namespace aml_asm
+
+struct NoRegions final : acpi::IAmlHost {
+  bool region_read(const acpi::RegionAccess&, uint64_t*) override { return false; }
+  bool region_write(const acpi::RegionAccess&, uint64_t) override { return false; }
+};
+
+// The contents of a device that serves `image` through its ATRM method in pages of 4096 bytes (the first two pages are all the test images need; any other offset gives an empty buffer,
+// and so does a request for other than 4096 bytes). `second` replaces the second page.
+static aml_asm::Bytes atrm_body(const std::vector<uint8_t>& image, const std::vector<uint8_t>* second = nullptr) {
+  using namespace aml_asm;
+  const size_t first = image.size() < 4096 ? image.size() : 4096;
+  const Bytes p0(image.begin(), image.begin() + first), p1 = second ? *second : Bytes(image.begin() + first, image.end());
+  return cat({
+      name_def("P0__", buffer(num(first), p0)),
+      name_def("P1__", buffer(num(p1.size()), p1)),
+      method("ATRM", 2, if_(lequal(b({0x69}), num(4096)),
+                            cat({if_(lequal(kArg0, num(0)), ret(path("P0__"))), if_(lequal(kArg0, num(4096)), ret(path("P1__")))}))),
+  });
+}
+
+static aml_asm::Bytes atrm_device(const char* name, uint32_t adr, const std::vector<uint8_t>& image, bool with_adr = true, const std::vector<uint8_t>* second = nullptr) {
+  using namespace aml_asm;
+  return device(name, cat({with_adr ? name_def("_ADR", num(adr)) : Bytes(), atrm_body(image, second)}));
+}
+
+static aml_asm::Bytes dsdt_of(std::initializer_list<aml_asm::Bytes> devices) {
+  using namespace aml_asm;
+  Bytes inner;
+  for (const Bytes& d : devices) inner.insert(inner.end(), d.begin(), d.end());
+  return make_table("DSDT", scope("\\_SB", device("PCI0", inner)));
+}
+
+static void test_atrm() {
+  TestAllocator alloc;
+  using namespace aml_asm;
+  const PciAddress card{1, 1, 0};   // _ADR 0x00010000
+  std::vector<uint8_t> small = atom_image(4);          // 2048 bytes: one short page
+  std::vector<uint8_t> big = atom_image(12);           // 6144 bytes: a page and a short one
+  big[0x1800 - 5] = 0x77;                              // (in the second page)
+  small[0x300] = 0x33;
+  big[0x300] = 0x44;
+  NoRegions host;
+  ByteBuffer out(alloc);
+  auto expect_image = [&](const std::vector<uint8_t>& image) {
+    if (out.size() != AmdVbios::kAtrmBiosBytes) return false;
+    for (size_t i = 0; i < image.size(); ++i) if (out.view()[i] != image[i]) return false;
+    for (size_t i = image.size(); i < out.size(); ++i) if (out.view()[i] != 0) return false;
+    return true;
+  };
+  {
+    // a short page, then a page and a short one; padded with zeros to the 256 KiB the driver allocates
+    for (const std::vector<uint8_t>* image : {&small, &big}) {
+      const Bytes table = dsdt_of({atrm_device("GFX0", 0x10000, *image)});
+      acpi::AmlInterpreter vm(alloc, host);
+      CHECK(vm.load_table(ConstByteView(table.data(), table.size())));
+      out.clear();
+      CHECK(AmdVbios::read_from_atrm(vm, card, alloc, &out) && expect_image(*image));
+    }
+  }
+  {
+    // two devices have the method: the one whose _ADR is the card's wins, whatever the order; a card with no match takes the first
+    std::vector<uint8_t> other = atom_image(4);
+    other[0x300] = 0x55;
+    const Bytes table = dsdt_of({atrm_device("IGP0", 0x20000, other), atrm_device("DGP0", 0x10000, small)});
+    acpi::AmlInterpreter vm(alloc, host);
+    CHECK(vm.load_table(ConstByteView(table.data(), table.size())));
+    out.clear();
+    CHECK(AmdVbios::read_from_atrm(vm, card, alloc, &out) && expect_image(small));
+    out.clear();
+    CHECK(AmdVbios::read_from_atrm(vm, PciAddress{1, 2, 0}, alloc, &out) && expect_image(other));
+    out.clear();
+    CHECK(AmdVbios::read_from_atrm(vm, PciAddress{1, 3, 0}, alloc, &out) && expect_image(other));   // (no match: the first)
+    out.clear();
+    CHECK(AmdVbios::read_from_atrm(vm, PciAddress{1, 1, 1}, alloc, &out) && expect_image(other));   // (the function counts)
+    // a device without an _ADR is only taken when nothing matches
+    const Bytes table2 = dsdt_of({atrm_device("NOAD", 0, other, false), atrm_device("DGP0", 0x10000, small)});
+    acpi::AmlInterpreter vm2(alloc, host);
+    CHECK(vm2.load_table(ConstByteView(table2.data(), table2.size())));
+    out.clear();
+    CHECK(AmdVbios::read_from_atrm(vm2, card, alloc, &out) && expect_image(small));
+    out.clear();
+    CHECK(AmdVbios::read_from_atrm(vm2, PciAddress{1, 5, 0}, alloc, &out) && expect_image(other));
+  }
+  {
+    // a name called ATRM in front of the real method is passed over; a device that has no _ADR of its own does not take its parent's; the second page is not read after a short one
+    std::vector<uint8_t> other = atom_image(4);
+    other[0x300] = 0x55;
+    const std::vector<uint8_t> extra(4, 0xEE);
+    const Bytes tables[] = {
+        dsdt_of({device("NAMD", cat({name_def("_ADR", num(0x10000)), name_def("ATRM", num(5))})), atrm_device("GFX0", 0x10000, small)}),
+        dsdt_of({device("PAR0", cat({name_def("_ADR", num(0x10000)), atrm_device("NOAD", 0, other, false)})), atrm_device("DGP0", 0x10000, small)}),
+        dsdt_of({atrm_device("GFX0", 0x10000, small, true, &extra)}),
+    };
+    for (const Bytes& table : tables) {
+      acpi::AmlInterpreter vm(alloc, host);
+      CHECK(vm.load_table(ConstByteView(table.data(), table.size())));
+      out.clear();
+      CHECK(AmdVbios::read_from_atrm(vm, card, alloc, &out) && expect_image(small));
+    }
+  }
+  {
+    // nothing to call: no method (a name called ATRM is not one), a method that fails, one that returns what is not a buffer, one that returns too much, a BIOS that is not one
+    using namespace aml_asm;
+    const std::vector<uint8_t> junk(2048, 0x5A);
+    const Bytes tables[] = {
+        dsdt_of({device("GFX0", cat({name_def("_ADR", num(0x10000)), name_def("ATRM", num(5))}))}),
+        dsdt_of({device("GFX0", cat({name_def("_ADR", num(0x10000)), method("ATRM", 2, ret(path("NOPE")))}))}),
+        dsdt_of({device("GFX0", cat({name_def("_ADR", num(0x10000)), method("ATRM", 2, ret(num(7)))}))}),
+        dsdt_of({device("GFX0", cat({name_def("_ADR", num(0x10000)), method("ATRM", 2, ret(buffer(num(8192), Bytes())))}))}),
+        dsdt_of({atrm_device("GFX0", 0x10000, junk)}),
+        make_table("DSDT", scope("\\_SB", device("PCI0", Bytes()))),
+        // (the method on something that is not a device: not found)
+        make_table("DSDT", scope("\\_SB", cat({device("PCI0", Bytes()), atrm_body(small)}))),
+    };
+    for (const Bytes& table : tables) {
+      acpi::AmlInterpreter vm(alloc, host);
+      CHECK(vm.load_table(ConstByteView(table.data(), table.size())));
+      out.clear();
+      CHECK(!AmdVbios::read_from_atrm(vm, card, alloc, &out) && out.size() == 0);
+    }
+    // a method that gives full pages for ever: 64 of them, and an image
+    std::vector<uint8_t> full = atom_image(8);   // 4096 bytes
+    const Bytes forever = make_table("DSDT", scope("\\_SB", device("PCI0", device("GFX0", cat({name_def("_ADR", num(0x10000)), name_def("P0__", buffer(num(4096), Bytes(full.begin(), full.end()))),
+                                                                                           method("ATRM", 2, ret(path("P0__")))})))));
+    acpi::AmlInterpreter vm(alloc, host);
+    CHECK(vm.load_table(ConstByteView(forever.data(), forever.size())));
+    out.clear();
+    CHECK(AmdVbios::read_from_atrm(vm, card, alloc, &out) && out.size() == AmdVbios::kAtrmBiosBytes);
+    for (size_t i = 0; i < full.size(); ++i) if (out.view()[i] != full[i]) { CHECK(false); break; }
+    for (size_t i = full.size(); i < out.size(); ++i) if (out.view()[i] != full[i % full.size()]) { CHECK(false); break; }
+    // no table at all
+    acpi::AmlInterpreter empty(alloc, host);
+    out.clear();
+    CHECK(!AmdVbios::read_from_atrm(empty, card, alloc, &out));
+  }
+  {
+    // damage: every truncation and flipped bit of the table that holds the method, and nothing is read out of bounds (and an image that does come out is one)
+    const Bytes table = dsdt_of({atrm_device("GFX0", 0x10000, small)});
+    for (size_t len = 0; len <= table.size(); len += 3) {
+      acpi::AmlInterpreter vm(alloc, host);
+      vm.load_table(ConstByteView(table.data(), len));
+      out.clear();
+      if (AmdVbios::read_from_atrm(vm, card, alloc, &out)) CHECK(AmdVbios::is_atom_bios(out.view()));
+    }
+    Bytes flipped = table;
+    for (size_t at = 0; at < 160 && at < flipped.size(); ++at) {
+      for (int bit = 0; bit < 8; ++bit) {
+        flipped[at] ^= static_cast<uint8_t>(1 << bit);
+        acpi::AmlInterpreter vm(alloc, host);
+        vm.load_table(ConstByteView(flipped.data(), flipped.size()));
+        out.clear();
+        if (AmdVbios::read_from_atrm(vm, card, alloc, &out)) CHECK(AmdVbios::is_atom_bios(out.view()));
+        flipped[at] ^= static_cast<uint8_t>(1 << bit);
+      }
+    }
+  }
+}
+
 static void test_find_order() {
   TestAllocator alloc;
   const PciAddress fn{1, 0, 0};
@@ -393,6 +609,30 @@ static void test_find_order() {
   s.mapper = &mapper;
   regs.writes.clear();
   CHECK(AmdVbios::find(s, &out) == AmdVbios::Source::RomBar && out.view()[0x300] == 0x22 && regs.writes.empty());
+  // The ATRM method comes first of all (the driver's order), when the machine has the tables for it.
+  {
+    NoRegions host;
+    using namespace aml_asm;
+    std::vector<uint8_t> via_atrm = atom_image(4);
+    via_atrm[0x300] = 0x66;
+    const Bytes dsdt = dsdt_of({atrm_device("DGP0", 0x00000000, via_atrm)});
+    acpi::AmlInterpreter vm(alloc, host);
+    CHECK(vm.load_table(ConstByteView(dsdt.data(), dsdt.size())));
+    s.aml = &vm;
+    s.pci = nullptr;
+    s.mapper = nullptr;
+    s.device_id = 0x694C;
+    regs.writes.clear();
+    CHECK(AmdVbios::find(s, &out) == AmdVbios::Source::Atrm && out.view()[0x300] == 0x66 && regs.writes.empty());
+    // a machine whose ATRM gives nothing falls through to the next source
+    acpi::AmlInterpreter none_vm(alloc, host);
+    s.aml = &none_vm;
+    CHECK(AmdVbios::find(s, &out) == AmdVbios::Source::Vfct && out.view()[0x300] == 0x11);
+    s.aml = nullptr;
+    s.pci = &pci;
+    s.mapper = &mapper;
+    s.device_id = 0x6860;
+  }
   // Nothing: none, and the output is left empty-handed.
   AmdVbios::Sources none;
   none.allocator = &alloc;
@@ -403,8 +643,9 @@ static void test_find_order() {
   no_alloc.function = fn; no_alloc.vendor_id = 0x1002; no_alloc.device_id = 0x694C;
   // (the VFCT needs no allocator for the copy beyond the output's own)
   CHECK(AmdVbios::find(no_alloc, &o2) == AmdVbios::Source::Vfct);
-  CHECK(AmdVbios::source_name(AmdVbios::Source::None) && AmdVbios::source_name(AmdVbios::Source::Vfct) && AmdVbios::source_name(AmdVbios::Source::RomBar) && AmdVbios::source_name(AmdVbios::Source::RomRegisters));
+  CHECK(AmdVbios::source_name(AmdVbios::Source::None) && AmdVbios::source_name(AmdVbios::Source::Atrm) && AmdVbios::source_name(AmdVbios::Source::Vfct) && AmdVbios::source_name(AmdVbios::Source::RomBar) && AmdVbios::source_name(AmdVbios::Source::RomRegisters));
 }
+
 
 int main() {
   test_is_atom_bios();
@@ -413,6 +654,7 @@ int main() {
   test_rom_registers();
   test_rom_bar();
   test_find_order();
+  test_atrm();
   printf(g_failed ? "AmdVbiosTest: %d FAILED\n" : "AmdVbiosTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }

@@ -150,6 +150,7 @@ class Interrupts {
 
   void set_pageflip(uint32_t crtc, bool enable);   // GRPH_INTERRUPT_CONTROL.GRPH_PFLIP_INT_MASK
   void set_vblank(uint32_t crtc, bool enable);     // LB_INTERRUPT_MASK.VBLANK_INTERRUPT_MASK
+  void set_vline(uint32_t crtc, bool enable);      // LB_INTERRUPT_MASK.VLINE_INTERRUPT_MASK (dce_v11_0_set_crtc_vline_interrupt_state)
   // A pin on: DC_HPD_EN, the toggle filter, the pending interrupt acknowledged, the polarity set to report the next change, then DC_HPD_INT_EN. Off: DC_HPD_EN and DC_HPD_INT_EN cleared.
   void hpd_init(uint32_t pin);
   void hpd_fini(uint32_t pin);
