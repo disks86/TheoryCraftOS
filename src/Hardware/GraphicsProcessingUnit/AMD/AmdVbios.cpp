@@ -41,8 +41,10 @@ const char* AmdVbios::source_name(Source source) {
     case Source::None: return "none";
     case Source::Atrm: return "ACPI ATRM method";
     case Source::Vfct: return "ACPI VFCT";
+    case Source::LegacyShadow: return "legacy shadow at 0xC0000";
     case Source::RomBar: return "PCI expansion ROM";
     case Source::RomRegisters: return "the card's ROM registers";
+    case Source::DisabledRom: return "the expansion ROM, switched on again";
   }
   return "unknown";
 }
@@ -78,6 +80,28 @@ ConstByteView AmdVbios::find_in_vfct(ConstByteView table, PciAddress function, u
     }
   }
   return ConstByteView();
+}
+
+bool AmdVbios::rom_ids(ConstByteView image, uint16_t* vendor_id, uint16_t* device_id) {
+  if (image.size() < 26 || le16(image, 0) != 0xAA55) return false;
+  const uint64_t pds = le16(image, 24);
+  if (pds + 8 > image.size() || le32(image, pds) != 0x52494350) return false;   // "PCIR"
+  *vendor_id = le16(image, pds + 4);
+  *device_id = le16(image, pds + 6);
+  return true;
+}
+
+bool AmdVbios::read_from_legacy_shadow(IRegisterMapper& mapper, allocators::IAllocator& allocator, uint16_t vendor_id, uint16_t device_id, ByteBuffer* out) {
+  MmioRegion region;
+  if (!mapper.map_registers(kLegacyShadowBase, kLegacyShadowBytes, &region)) return false;
+  ByteBuffer copy(allocator);
+  for (uint64_t at = 0; at < kLegacyShadowBytes; at += 4)
+    if (!copy.put32(region.read32(at))) return false;
+  uint16_t vendor = 0, device = 0;
+  if (!rom_ids(copy.view(), &vendor, &device) || vendor != vendor_id || device != device_id) return false;
+  if (!is_atom_bios(copy.view())) return false;
+  out->clear();
+  return out->append(copy.view());
 }
 
 uint64_t AmdVbios::rom_size(ConstByteView window) {
@@ -218,6 +242,47 @@ bool AmdVbios::read_from_atrm(acpi::AmlInterpreter& aml, PciAddress function, al
   return out->append(image.view());
 }
 
+bool AmdVbios::read_from_disabled_rom(IVcnRegisters& registers, bool display_engine, IPciBus& pci, PciAddress function, IRegisterMapper& mapper, allocators::IAllocator& allocator, ByteBuffer* out) {
+  auto smc_read = [&](uint32_t reg) {   // vi_smc_rreg
+    registers.write(kSmcIndex, reg);
+    return registers.read(kSmcData);
+  };
+  auto smc_write = [&](uint32_t reg, uint32_t value) {   // vi_smc_wreg
+    registers.write(kSmcIndex, reg);
+    registers.write(kSmcData, value);
+  };
+  const uint32_t bus_cntl = registers.read(kBusCntl);
+  uint32_t d1vga = 0, d2vga = 0, vga_render = 0;
+  if (display_engine) {
+    d1vga = registers.read(kD1VgaControl);
+    d2vga = registers.read(kD2VgaControl);
+    vga_render = registers.read(kVgaRenderControl);
+  }
+  const uint32_t rom_cntl = smc_read(kRomCntl);
+
+  // enable the rom
+  registers.write(kBusCntl, bus_cntl & ~kBiosRomDis);
+  if (display_engine) {
+    // Disable VGA mode
+    registers.write(kD1VgaControl, d1vga & ~(kVgaModeEnable | kVgaTimingSelect));
+    registers.write(kD2VgaControl, d2vga & ~(kVgaModeEnable | kVgaTimingSelect));
+    registers.write(kVgaRenderControl, vga_render & ~kVgaVstatusCntl);
+  }
+  smc_write(kRomCntl, rom_cntl | kSckOverwrite);
+
+  const bool found = read_from_rom_bar(pci, function, mapper, allocator, out);
+
+  // restore regs
+  registers.write(kBusCntl, bus_cntl);
+  if (display_engine) {
+    registers.write(kD1VgaControl, d1vga);
+    registers.write(kD2VgaControl, d2vga);
+    registers.write(kVgaRenderControl, vga_render);
+  }
+  smc_write(kRomCntl, rom_cntl);
+  return found;
+}
+
 AmdVbios::Source AmdVbios::find(const Sources& s, ByteBuffer* out) {
   if (s.aml && s.allocator && read_from_atrm(*s.aml, s.function, *s.allocator, out)) return Source::Atrm;
   if (s.vfct.size() != 0) {
@@ -228,8 +293,10 @@ AmdVbios::Source AmdVbios::find(const Sources& s, ByteBuffer* out) {
     }
   }
   if (!s.allocator) return Source::None;
+  if (s.mapper && read_from_legacy_shadow(*s.mapper, *s.allocator, s.vendor_id, s.device_id, out)) return Source::LegacyShadow;
   if (s.pci && s.mapper && read_from_rom_bar(*s.pci, s.function, *s.mapper, *s.allocator, out)) return Source::RomBar;
   if (s.registers && read_from_rom_registers(*s.registers, *s.allocator, out)) return Source::RomRegisters;
+  if (s.registers && s.pci && s.mapper && read_from_disabled_rom(*s.registers, s.display_engine, *s.pci, s.function, *s.mapper, *s.allocator, out)) return Source::DisabledRom;
   return Source::None;
 }
 
