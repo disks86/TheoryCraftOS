@@ -72,6 +72,7 @@ const EvexOp kEvexOps[] = {
     {3, 1, 0x3F, 0, kCmpImm, 1, 8, kFullMem}, {3, 1, 0x3F, 1, kCmpImm, 1, 16, kFullMem}, {3, 1, 0x3E, 0, kCmpImm, 0, 8, kFullMem}, {3, 1, 0x3E, 1, kCmpImm, 0, 16, kFullMem},
     {3, 1, 0x1F, 0, kCmpImm, 1, 32, kFull}, {3, 1, 0x1F, 1, kCmpImm, 1, 64, kFull}, {3, 1, 0x1E, 0, kCmpImm, 0, 32, kFull}, {3, 1, 0x1E, 1, kCmpImm, 0, 64, kFull},
     {2, 1, 0x26, 0, kTest, 0, 8, kFullMem}, {2, 1, 0x26, 1, kTest, 0, 16, kFullMem}, {2, 1, 0x27, 0, kTest, 0, 32, kFull}, {2, 1, 0x27, 1, kTest, 0, 64, kFull},
+    {2, 3, 0x68, -1, kVp2Intersect, 0, 0, kFull},
     {2, 2, 0x26, 0, kTest, 1, 8, kFullMem}, {2, 2, 0x26, 1, kTest, 1, 16, kFullMem}, {2, 2, 0x27, 0, kTest, 1, 32, kFull}, {2, 2, 0x27, 1, kTest, 1, 64, kFull},
     {3, 1, 0x25, 0, kTernlog, 0, 32, kFull}, {3, 1, 0x25, 1, kTernlog, 0, 64, kFull},
     // shuffles and permutes (sub of kShufImm: 0 vpshufd, 1 vpshufhw, 2 vpshuflw, 3 vpermilps, 4 vpermilpd, 5 vpermq/vpermpd by immediate)
@@ -576,7 +577,7 @@ X86_64Cpu::Step X86_64Cpu::step_evex(GuestMemory& m) {
   if (!finish_decode()) return bad_decode();
   ev_.old_dest = get_vec(ev_.reg);
   switch (def->kind) {
-    case kMove: case kIntBin: case kMulDq: case kLane: case kShiftCount: case kShiftImm: case kShiftVar: case kRotVar: case kCmpEq: case kCmpImm: case kTest: case kTernlog:
+    case kMove: case kIntBin: case kMulDq: case kLane: case kShiftCount: case kShiftImm: case kShiftVar: case kRotVar: case kCmpEq: case kCmpImm: case kTest: case kTernlog: case kVp2Intersect:
       return evex_int(m, *def);
     case kComi: case kFpBin: case kFpScalar: case kFpUnary: case kFma: case kFpCmp: case kCvt: case kCvtScalar: case kCvtToGpr: case kCvtFromGpr: case kRound: case kGetExp: case kGetMant:
     case kScalef: case kFixup: case kReduce: case kRange: case kFpClass: case kRcp14: case kRsqrt14:
@@ -882,6 +883,21 @@ X86_64Cpu::Step X86_64Cpu::evex_int(GuestMemory& m, const EvexOp& defn) {
         if (r) bits_out |= uint64_t{1} << i;
       }
       write_mask_register(bits_out, count);
+      return finish();
+    }
+    case kVp2Intersect: {      // vp2intersectd/q k, zmm, zmm/m: the destination is the mask pair (reg & 6, reg | 1); no write mask, no rounding
+      if (aaa != 0 || z || ev_.er) return fail(6);
+      if (!read_rm(&b, elem, true)) return Step::Fault;
+      uint64_t first = 0, second = 0;
+      for (uint32_t i = 0; i < count; ++i) {
+        for (uint32_t j = 0; j < count; ++j) {
+          if (element(a, elem, i) != element(b, elem, j)) continue;
+          first |= uint64_t{1} << i;
+          second |= uint64_t{1} << j;
+        }
+      }
+      s_.k[d_.reg & 6] = first;
+      s_.k[(d_.reg & 6) | 1] = second;
       return finish();
     }
     case kTernlog: {

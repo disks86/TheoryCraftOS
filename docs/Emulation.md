@@ -135,6 +135,9 @@ programs built with `-march=haswell` (or x86-64-v3) run. `X86_64Vex.cpp` holds a
   single/double (and `vcvtph2ps`/`vcvtps2ph`), gathers and scatters, and `vucomis*`. XCR0 is 0xE7 and `xsave`/`xrstor` handle the opmask, ZMM_Hi256 and Hi16_ZMM components (standard
   format, 2688 bytes). `vrcp14*`/`vrsqrt14*` return a correctly rounded value truncated to 14 bits: the architecture only promises a relative error below 2^-14, and the real tables differ
   between Intel and AMD, so they are not compared with the host.
+- **AVX512_VP2INTERSECT** (cpuid.7.0:EDX bit 8; `kVp2Intersect` in `X86_64Evex.cpp`): `vp2intersectd/q k, zmm, zmm/m/m{1toN}` writes the mask pair (`reg & 6`, `reg | 1`): bit i of the first when element i of
+  the first source equals any element of the second, bit j of the second when element j equals any element of the first; every other bit is cleared. A write mask, zeroing or embedded
+  rounding is #UD. `Vp2IntersectTest` checks it against a model written from that definition (the host has no VP2INTERSECT) and runs every truncation and bit flip of the encodings.
 - **AVX-512 FP16** (cpuid.7.0:EDX bit 23; `kEvexFp16Ops` in `X86_64EvexFp16.cpp`, EVEX maps 3, 5 and 6): half-precision `add/sub/mul/div/min/max/sqrt`, `fmadd/fmsub/fnmadd/fnmsub`
   in all three operand orders plus `fmaddsub/fmsubadd`, `vcmpph`/`vcomish`, `vrndscale`/`vreduce`/`vgetexp`/`vgetmant`/`vscalef`/`vfpclass`, `vrcpph`/`vrsqrtph`, every conversion to and from
   16/32/64-bit integers, `float`, `double` (packed and scalar, `vcvtsi2sh`/`vcvtsh2si` and the unsigned forms), `vmovsh`, `vmovw`, and the complex-number instructions
@@ -143,7 +146,7 @@ programs built with `-march=haswell` (or x86-64-v3) run. `X86_64Vex.cpp` holds a
   the format description). Half precision has no denormal exception and no DAZ/FTZ, so those never show. Two details are not known and are documented guesses: the complex instructions
   round as chained fused multiply-adds (`a.re*b.re`, then `-a.im*b.im` added with one rounding), and `vrcpph`/`vrsqrtph` return the correctly rounded value, which is inside the
   architecture's 2^-11 bound but is not what the hardware's table gives bit for bit.
-- **Not implemented** (an invalid-instruction fault, never a wrong result): AVX-512 4FMAPS / VP2INTERSECT / the Xeon Phi parts, TSX, `xsaveopt`/`xsavec`, and the MMX registers (so the MMX forms of the SSSE3
+- **Not implemented** (an invalid-instruction fault, never a wrong result): AVX-512 4FMAPS / the Xeon Phi parts, TSX, `xsaveopt`/`xsavec`, and the MMX registers (so the MMX forms of the SSSE3
   instructions, the ones without a 66 prefix, are invalid).
   Exceptions delivered to a Windows program save the XMM halves of vector state in the `CONTEXT` in memory, not the upper halves (the emulator keeps those itself).
 - **Checked against the real thing**: `tests/AvxTest.cpp` assembles about 1,400 instruction forms with `llvm-mc` (`tests/data/emulation/avx_cases_gen.py`), runs each on the host
