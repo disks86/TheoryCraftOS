@@ -194,6 +194,23 @@ class AudioPins {
   IVcnRegisters& r_;
 };
 
+// The audio format blocks of the display engine (dce_v11_0_afmt_init, dce_v11_0_afmt_audio_select_pin): DCE 11 has one per DIG encoder, at the DIG's register block, and each takes its
+// audio from one of the endpoints (AudioPins) - AFMT_AUDIO_SRC_CONTROL.AFMT_AUDIO_SRC_SELECT is that endpoint's number. The Vega M (CHIP_VEGAM, like Polaris 10) has 6 DIGs, so blocks 0 to 5:
+// the transmitter UNIPHY3 (DIG 6) has no audio block there.
+class AudioFormat {
+ public:
+  static constexpr uint32_t kBlocks = 6;
+  explicit AudioFormat(IVcnRegisters& registers) : r_(registers) {}
+  // The endpoint (0..AudioPins::kMaxPins - 1) block `block` takes its audio from: the field alone is written, the rest of the register is kept. False for a block or endpoint that does not exist.
+  bool select_pin(uint32_t block, uint32_t pin);
+  // The endpoint the block has selected, or kNoPin for a block that does not exist.
+  static constexpr uint32_t kNoPin = 0xFFFFFFFFu;
+  uint32_t selected_pin(uint32_t block);
+
+ private:
+  IVcnRegisters& r_;
+};
+
 // The OS's picture kept in system memory (cached, so reading and blending are fast; the mapped window of video memory is uncached and slow to read) and sent to the display's
 // framebuffer in video memory a run of rows at a time: by the card's DMA engines when the display offers them, else by the CPU. `video` is the picture in video memory as the
 // display gave it (Display::engage's `memory`).

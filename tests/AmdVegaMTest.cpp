@@ -1582,6 +1582,79 @@ static void test_read_edid() {
   CHECK(!vega.read_edid(hdmi, &out));
 }
 
+// AFMT_AUDIO_SRC_CONTROL: each audio format block (one per DIG encoder, 0 to 5 on this card; registers 0x4a45, 0x4b45, 0x4c45, 0x4d45, 0x4e45, 0x4f45, the field is bits 2:0) takes its audio from
+// the first connected endpoint; written for the connectors of the video BIOS's table that carry audio and have a display. (Register numbers are literal.)
+static void test_audio_select() {
+  const std::vector<uint8_t> vbios = make_connector_vbios();   // eDP: DIG 0 (no audio block), HDMI-A: DIG 2, DisplayPort: DIG 3; on pins 0, 1, 2
+  const uint32_t afmt[6] = {0x4a45, 0x4b45, 0x4c45, 0x4d45, 0x4e45, 0x4f45};
+  Rig rig;
+  // endpoints 2, 3 and 5 have a port
+  const uint32_t connectivity[8] = {1, 1, 0, 3, 1, 0, 1, 1};
+  for (uint32_t p = 0; p < 8; ++p) rig.card.gfx.set_reg(0x17a9 + 4 * p, (connectivity[p] << 30) | 0x00123456u);
+  for (uint32_t pin = 0; pin < 3; ++pin) rig.card.gfx.set_reg(0x1898 + 8 * pin, 0x2);   // displays on pins 0, 1 and 2
+  AmdVegaM vega(rig.alloc);
+  AmdVegaM::Inputs in = rig.inputs();
+  in.hpd_pins = 0x0F;
+  in.vbios = ConstByteView(vbios.data(), vbios.size());
+  const auto reset = [&] { for (uint32_t b = 0; b < 6; ++b) rig.card.gfx.set_reg(afmt[b], 0xAB000005u + b * 0x10); };
+  reset();
+  CHECK(!vega.select_audio_pin(AtomConnectors::Connector()) && vega.select_audio_pins() == 0);        // (not up)
+  CHECK(vega.bring_up(in));
+  if (!vega.up()) return;
+  CHECK(vega.audio_pins_connected() == 0x2C);
+  const AtomConnectors::Connector edp = vega.connectors()[0], hdmi = vega.connectors()[1], dp = vega.connectors()[2];
+  // one connector: only the field of its block changes, to the first connected endpoint (2); the others are as they were
+  CHECK(vega.select_audio_pin(hdmi));
+  CHECK(rig.card.gfx.reg(0x4c45) == 0xAB000022u && rig.card.gfx.reg(afmt[0]) == 0xAB000005u && rig.card.gfx.reg(afmt[1]) == 0xAB000015u && rig.card.gfx.reg(afmt[3]) == 0xAB000035u);
+  CHECK(!vega.select_audio_pin(edp) && rig.card.gfx.reg(afmt[0]) == 0xAB000005u);       // (the internal panel has no audio block)
+  reset();
+  CHECK(vega.select_audio_pin(dp) && rig.card.gfx.reg(afmt[3]) == (0xAB000035u & ~7u) + 2 && rig.card.gfx.reg(afmt[2]) == 0xAB000025u);
+  // all of them: the HDMI and the DisplayPort, not the eDP
+  reset();
+  CHECK(vega.select_audio_pins() == 2);
+  for (uint32_t b = 0; b < 6; ++b) CHECK(rig.card.gfx.reg(afmt[b]) == ((b == 2 || b == 3) ? ((0xAB000005u + b * 0x10) & ~7u) + 2 : 0xAB000005u + b * 0x10));
+  // the endpoints are read again each time: endpoint 2 loses its port, 3 is the first
+  rig.card.gfx.set_reg(0x17a9 + 4 * 2, 0x40000000);
+  CHECK(vega.select_audio_pin(hdmi) && (rig.card.gfx.reg(afmt[2]) & 7) == 3 && vega.audio_pins_connected() == 0x28);
+  // the display on the HDMI goes away: only the DisplayPort is selected
+  rig.card.gfx.set_reg(0x1857 + 1, 0x20000);
+  rig.card.gfx.set_reg(0x1898 + 8, 0);
+  rig.card.ih.post(42, 1, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1);
+  reset();
+  CHECK(vega.select_audio_pins() == 1 && rig.card.gfx.reg(afmt[2]) == 0xAB000025u && (rig.card.gfx.reg(afmt[3]) & 7) == 3);
+  // a DIG without a block (UNIPHY3 is DIG 6), a connector with no encoder, a type with no audio: nothing written
+  reset();
+  AtomConnectors::Connector dig6 = hdmi;
+  dig6.encoder_object = 0x2125;
+  AtomConnectors::Connector bare = hdmi;
+  bare.encoder_object = 0;
+  AtomConnectors::Connector lcd = hdmi;
+  lcd.devices = 0x2;
+  CHECK(!vega.select_audio_pin(dig6) && !vega.select_audio_pin(bare) && !vega.select_audio_pin(lcd) && !vega.select_audio_pin(edp));
+  uint32_t pin = 0;
+  CHECK(!vega.audio_pin_for(dig6, &pin));
+  for (uint32_t b = 0; b < 6; ++b) CHECK(rig.card.gfx.reg(afmt[b]) == 0xAB000005u + b * 0x10);       // (none of the blocks was written)
+  for (uint32_t b = 0; b < 6; ++b) rig.card.gfx.set_reg(0x17a9 + 4 * b, 0x40000000);
+  CHECK(!vega.select_audio_pin(dp) && vega.select_audio_pins() == 0);          // (no endpoint at all)
+  for (uint32_t b = 0; b < 6; ++b) CHECK(rig.card.gfx.reg(afmt[b]) == 0xAB000005u + b * 0x10);
+  // the blocks themselves
+  amd_dce11::AudioFormat blocks(*rig.inputs().registers);
+  reset();
+  for (uint32_t b = 0; b < 6; ++b) {
+    for (uint32_t p = 0; p < 8; ++p) {
+      CHECK(blocks.select_pin(b, p) && rig.card.gfx.reg(afmt[b]) == ((0xAB000005u + b * 0x10) & ~7u) + p && blocks.selected_pin(b) == p);
+    }
+  }
+  const size_t before = rig.card.gfx.writes.size();
+  CHECK(!blocks.select_pin(6, 0) && !blocks.select_pin(8, 0) && !blocks.select_pin(0xFFFFFFFFu, 0) && !blocks.select_pin(0, 8) && !blocks.select_pin(0, 0xFFFFFFFFu) && rig.card.gfx.writes.size() == before);
+  CHECK(blocks.selected_pin(6) == amd_dce11::AudioFormat::kNoPin && blocks.selected_pin(0xFFFFFFFFu) == amd_dce11::AudioFormat::kNoPin);
+  rig.card.gfx.set_reg(afmt[1], 0xFFFFFFFFu);
+  CHECK(blocks.selected_pin(1) == 7 && blocks.select_pin(1, 0) && rig.card.gfx.reg(afmt[1]) == 0xFFFFFFF8u);
+  vega.shutdown();
+  CHECK(!vega.select_audio_pin(hdmi) && vega.select_audio_pins() == 0);
+}
+
 // The sink's DPCD over the AUX channel of the DisplayPort and eDP connectors (through the video BIOS's table, with the panel power-up for the eDP one).
 static void test_read_dpcd() {
   const std::vector<uint8_t> vbios = make_connector_vbios();   // eDP (DDC line 0x92, pin 0), HDMI-A (0x91), DisplayPort (0x93, pin 2)
@@ -1964,6 +2037,7 @@ int main() {
   test_hotplug_connectors();
   test_audio_pins();
   test_read_edid();
+  test_audio_select();
   test_read_dpcd();
   test_short_pulse_status();
   printf(g_failed ? "AmdVegaMTest: %d FAILED\n" : "AmdVegaMTest: all passed\n", g_failed);

@@ -60,11 +60,14 @@ class SvgaDevice final : public IGraphicsDevice {
   bool command(uint32_t id, const uint32_t* body, uint32_t words);
   // Surface transfers through the staging area. `write` copies guest -> host. For a 1D buffer surface `width` is bytes and `height` is 1.
   bool transfer(uint32_t surface, bool write, uint32_t x, uint32_t width, uint32_t height, uint32_t pitch, void* guest_data);
+  // The same for writing from data that is not to be touched (a texture's pixels).
+  bool upload(uint32_t surface, uint32_t x, uint32_t width, uint32_t height, uint32_t pitch, const void* guest_data) { return move(surface, true, x, width, height, pitch, guest_data, nullptr); }
   uint32_t scratch_bytes() const { return scratch_bytes_; }
   hardware::VmwareSvgaGpu& gpu() { return gpu_; }
   allocators::IAllocator& allocator() { return allocator_; }
 
  private:
+  bool move(uint32_t surface, bool write, uint32_t start, uint32_t width, uint32_t height, uint32_t pitch, const void* source, void* destination);
   hardware::VmwareSvgaGpu& gpu_;
   allocators::IAllocator& allocator_;
   uint8_t* scratch_ = nullptr;
