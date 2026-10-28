@@ -663,7 +663,7 @@ X86_64Cpu::Step X86_64Cpu::vex_map3(GuestMemory& m, uint8_t op, bool wide_w, uin
   const bool wide = vex_.wide;
   const uint32_t pp = d_.operand16 ? 1 : d_.rep ? 2 : d_.repne ? 3 : 0;
   if (op == 0xF0) return vex_bmi(m, 3, op, wide_w, vvvv);
-  if (op == 0x44 || op == 0xDF || op == 0xCE || op == 0xCF) return crypto_map(m, 3, op, wide_w, vvvv);
+  if (op == 0x44 || op == 0xDF || op == 0xCE || op == 0xCF || op == 0xDE) return crypto_map(m, 3, op, wide_w, vvvv);
   if (pp != 1) return fail(6);
   if (!decode_modrm()) return bad_decode();
   const uint32_t imm = static_cast<uint32_t>(next_imm(1, false));

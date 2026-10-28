@@ -18,12 +18,12 @@
 #pragma once
 #include <stdint.h>
 
-// IEEE 754 binary32 and binary64 arithmetic in integer operations, with x86 SSE semantics (default NaN, NaN selection, MXCSR rounding modes and exception flags).
+// IEEE 754 binary16 (AVX-512 FP16), binary32 and binary64 arithmetic in integer operations, with x86 SSE semantics (default NaN, NaN selection, MXCSR rounding modes and exception flags).
 // The kernel cannot assume a floating-point unit (the AArch64 build forbids it), and the host's own float would not be bit-exact with an x86 anyway.
 namespace emulation {
 namespace softfloat {
 
-enum class Format : uint8_t { F32, F64 };
+enum class Format : uint8_t { F32, F64, F16 };      // (F16: IEEE binary16, in the low 16 bits)
 enum class Rounding : uint8_t { NearestEven = 0, Down = 1, Up = 2, TowardZero = 3, TieAway = 4 };      // 0..3 are the MXCSR.RC encoding; TieAway for conversions to integers and, with RISC-V's RMM, for arithmetic
 // MXCSR exception flag bits.
 constexpr uint32_t kInvalid = 1, kDenormal = 2, kDivideByZero = 4, kOverflow = 8, kUnderflow = 16, kInexact = 32;

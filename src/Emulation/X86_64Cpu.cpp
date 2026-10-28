@@ -1019,10 +1019,11 @@ X86_64Cpu::Step X86_64Cpu::step_0f(GuestMemory& m) {
         dx = (1u << 4) | (1u << 8) | (1u << 15) | (1u << 23) | (1u << 24) | (1u << 25) | (1u << 26);      // TSC, CX8, CMOV, MMX, FXSR, SSE, SSE2
         c = (1u << 0) | (1u << 9) | (1u << 12) | (1u << 19) | (1u << 20) | (1u << 22) | (1u << 23) | (1u << 26) | (1u << 27) | (1u << 28) | (1u << 29) | (1u << 1) | (1u << 25);      // SSE3, SSSE3, FMA, SSE4.1, SSE4.2, MOVBE, POPCNT, XSAVE, OSXSAVE, AVX, F16C, PCLMULQDQ, AES
       } else if (leaf == 7 && static_cast<uint32_t>(s_.r[1]) == 1) {
-        a = (1u << 0) | (1u << 2) | (1u << 5);      // SHA512, SM4 (SM3 is not implemented), AVX512_BF16
+        a = (1u << 0) | (1u << 1) | (1u << 2) | (1u << 5);      // SHA512, SM3, SM4, AVX512_BF16
       } else if (leaf == 7 && static_cast<uint32_t>(s_.r[1]) == 0) {
         b = (1u << 3) | (1u << 5) | (1u << 8) | (1u << 29) | (1u << 16) | (1u << 17) | (1u << 21) | (1u << 28) | (1u << 30) | (1u << 31);      // BMI1, AVX2, BMI2, SHA, AVX512F, DQ, IFMA, CD, BW, VL
         c = (1u << 1) | (1u << 6) | (1u << 8) | (1u << 9) | (1u << 10) | (1u << 11) | (1u << 12) | (1u << 14);      // VBMI, VBMI2, GFNI, VAES, VPCLMULQDQ, VNNI, BITALG, VPOPCNTDQ
+        dx = 1u << 23;      // AVX512_FP16
       } else if (leaf == 0xD) {
         const uint32_t sub = static_cast<uint32_t>(s_.r[1]);
         if (sub == 0) { a = 0xE7; b = 2688; c = 2688; }      // x87, SSE, AVX and the AVX-512 state; 512 + 64 + 256 + ... bytes

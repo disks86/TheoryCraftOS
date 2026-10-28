@@ -165,6 +165,7 @@ class X86_64Cpu final : public IGuestCpu {
   Step evex_int(GuestMemory& m, const EvexOp& def);
   Step evex_misc(GuestMemory& m, const EvexOp& def);
   Step evex_fp(GuestMemory& m, const EvexOp& def);
+  Step evex_fp16(GuestMemory& m, const EvexOp& def);
   Step evex_ext(GuestMemory& m, const EvexOp& def);
   Step evex_vsib(GuestMemory& m, const EvexOp& def);
   Vec512 get_vec(uint32_t reg) const;
@@ -172,6 +173,7 @@ class X86_64Cpu final : public IGuestCpu {
   Step crypto_map(GuestMemory& m, uint32_t map, uint8_t opcode, bool wide, uint32_t vvvv);      // X86_64Crypto.cpp: AES-NI, PCLMULQDQ, SHA
   Step sha512_instruction(GuestMemory& m, uint8_t opcode, uint32_t vvvv);
   Step sm4_instruction(GuestMemory& m, uint32_t vvvv);
+  Step sm3_instruction(GuestMemory& m, uint32_t map, uint8_t op, uint32_t vvvv);
   Step vex_gather(GuestMemory& m, uint8_t opcode, bool wide, uint32_t vvvv);
   Step vex_fma(GuestMemory& m, uint8_t opcode, bool wide, uint32_t vvvv);
   Step vex_bmi(GuestMemory& m, int map, uint8_t opcode, bool wide, uint32_t vvvv);
