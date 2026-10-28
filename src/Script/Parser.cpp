@@ -1354,7 +1354,11 @@ class Parser {
     in_async_ = is_async;
     in_generator_ = is_generator;
     in_async_generator_ = is_async && is_generator;   // (await becomes a yield the driver of the async generator understands)
+    const bool saved_eval = saw_eval_;
+    saw_eval_ = false;
     Node* b = block();
+    if (b && saw_eval_) b->flags |= kFlagHasEval;
+    saw_eval_ = saved_eval;
     check_this_ = saved_check;
     in_function_ = saved;
     in_async_ = saved_async;
@@ -2505,6 +2509,7 @@ class Parser {
         Node* c = make(NodeKind::Call);
         if (!c) return nullptr;
         c->a = e;
+        if (e->kind == NodeKind::Ident && e->text.equals("eval")) saw_eval_ = true;
         if (!arguments(c)) return nullptr;
         e = c;
       } else if (is(T::Backtick) && calls) {
@@ -2863,6 +2868,7 @@ class Parser {
   // modules
   bool module_ = false;
   bool strict_parse_ = false;
+  bool saw_eval_ = false;   // the function body being read has a call of eval(...)
   bool legacy_octal_ = false;   // the string being read has a legacy octal escape
   ModuleRequests* requests_ = nullptr;
   List<ExportEntry> exports_{arena_.allocator()};

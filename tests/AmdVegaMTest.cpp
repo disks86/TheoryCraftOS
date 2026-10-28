@@ -1253,6 +1253,145 @@ static void test_post_after_reset() {
   }
 }
 
+// Hot plug events as the OS sees them: the state at bring-up, an event for each plug and unplug in order, a bounded queue, the pin that interrupts too often reported once.
+static void test_hotplug_events() {
+  Rig rig;
+  rig.card.gfx.set_reg(0x1898 + 8, 0x2);        // pin 1 senses a display at bring-up
+  rig.card.gfx.set_reg(0x1898 + 8 * 5, 0x2);    // so does pin 5, which is not watched
+  AmdVegaM vega(rig.alloc);
+  AmdVegaM::Inputs in = rig.inputs();
+  in.hpd_pins = 0x0F;
+  CHECK(vega.bring_up(in));
+  if (!vega.up()) return;
+  AmdVegaM::HotplugEvent e;
+  CHECK(vega.connected_pins() == 0x2 && !vega.take_hotplug(&e) && vega.hotplug_events_dropped() == 0);
+  // A display plugged in on pin 0 (asserted in DISP_INTERRUPT_STATUS bit 17, the pin senses it now), then pulled out of pin 1 (DISP_INTERRUPT_STATUS_CONTINUE).
+  rig.card.gfx.set_reg(0x1857, 0x20000);
+  rig.card.gfx.set_reg(0x1898, 0x2);
+  rig.card.ih.post(42, 0, 0, 0, 0);
+  rig.card.gfx.set_reg(0x1858, 0x20000);
+  rig.card.gfx.set_reg(0x1898 + 8, 0x0);
+  rig.card.ih.post(42, 1, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 2);
+  CHECK(vega.connected_pins() == 0x1);
+  CHECK(vega.take_hotplug(&e) && e.pin == 0 && e.connected && !e.throttled);
+  CHECK(vega.take_hotplug(&e) && e.pin == 1 && !e.connected && !e.throttled);
+  CHECK(!vega.take_hotplug(&e) && vega.take_hotplug(nullptr) == false);
+  // An interrupt for a pin that is not asserted is not an event.
+  rig.card.gfx.set_reg(0x1859, 0);
+  rig.card.ih.post(42, 2, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && !vega.take_hotplug(&e) && vega.connected_pins() == 0x1);
+  // More events than the queue holds: the oldest go, and the number lost is counted. Pins 0, 1 and 2 take turns (three does not divide the queue's sixteen), so the survivors can be told
+  // from the first sixteen.
+  rig.card.gfx.set_reg(0x1857, 0x20000);
+  rig.card.gfx.set_reg(0x1858, 0x20000);
+  rig.card.gfx.set_reg(0x1859, 0x20000);
+  rig.card.gfx.set_reg(0x1898, 0x2);
+  rig.card.gfx.set_reg(0x1898 + 8, 0x2);
+  rig.card.gfx.set_reg(0x1898 + 16, 0x2);
+  for (uint32_t i = 0; i < 20; ++i) rig.card.ih.post(42, i % 3, 0, 0, 0);
+  CHECK(vega.service_interrupts(20) == 20);
+  CHECK(vega.hotplug_events_dropped() == 4);
+  for (uint32_t i = 4; i < 20; ++i) CHECK(vega.take_hotplug(&e) && e.pin == i % 3);
+  CHECK(!vega.take_hotplug(&e));
+  // The pin that will not stop: after AmdIrq::kHotplugStormLimit events it is switched off, and the event that does it says so, once.
+  const uint32_t before = vega.irq()->hotplug_count(2);
+  uint32_t throttled_events = 0, taken = 0;
+  for (uint32_t i = 0; i < AmdIrq::kHotplugStormLimit + 10; ++i) {
+    rig.card.ih.post(42, 2, 0, 0, 0);
+    vega.service_interrupts();
+    while (vega.take_hotplug(&e)) { ++taken; throttled_events += e.throttled; }
+  }
+  CHECK(taken == AmdIrq::kHotplugStormLimit + 10 && throttled_events == 1 && vega.irq()->hpd_throttled(2) && before + taken == vega.irq()->hotplug_count(2));
+  // Shutting down forgets all of it; a new bring-up starts from the pins as they are.
+  vega.shutdown();
+  CHECK(vega.connected_pins() == 0 && !vega.take_hotplug(&e));
+  memset(rig.doorbell_base, 0, 0x800 * 4);
+  rig.card.gfx.set_reg(0x1898 + 8, 0x0);
+  CHECK(vega.bring_up(in) && vega.connected_pins() == 0x1 + 0x4 && vega.hotplug_events_dropped() == 0);
+  // (a new life of the card reports a pin that stops interrupting once more)
+  throttled_events = 0;
+  for (uint32_t i = 0; i < AmdIrq::kHotplugStormLimit + 10; ++i) {
+    rig.card.ih.post(42, 2, 0, 0, 0);
+    vega.service_interrupts();
+    while (vega.take_hotplug(&e)) throttled_events += e.throttled;
+  }
+  CHECK(throttled_events == 1);
+}
+
+// A video BIOS image with the object table of a board with eDP on pin 0, HDMI on pin 1 and a DisplayPort on pin 2 (literal offsets: ROM header 0x100, master data table 0x200 with the
+// GPIO_Pin_LUT at 0x300 and the Object_Header at 0x400, the paths at 0x440, the connector objects at 0x500, their records at 0x580).
+static std::vector<uint8_t> make_connector_vbios() {
+  std::vector<uint8_t> b(0x700, 0);
+  auto u8 = [&](uint32_t at, uint32_t v) { b[at] = static_cast<uint8_t>(v); };
+  auto u16 = [&](uint32_t at, uint32_t v) { u8(at, v); u8(at + 1, v >> 8); };
+  u8(0, 0x55); u8(1, 0xAA); u16(0x48, 0x100);
+  memcpy(&b[0x104], "ATOM", 4);
+  u16(0x120, 0x200);
+  u16(0x200 + 4 + 12 * 2, 0x300);
+  u16(0x200 + 4 + 22 * 2, 0x400);
+  u16(0x300, 4 + 3 * 4);
+  const uint32_t shifts[3] = {0, 8, 16};
+  for (uint32_t i = 0; i < 3; ++i) { u16(0x304 + i * 4, 0x488d); u8(0x306 + i * 4, shifts[i]); u8(0x307 + i * 4, i + 1); }
+  u16(0x400, 0x20); u8(0x403, 2); u16(0x404, 0x0FFF); u16(0x406, 0x100); u16(0x40E, 0x40);
+  const uint32_t tags[3] = {0x2, 0x8, 0x80}, ids[3] = {0x1114, 0x110C, 0x1113};   // LCD1 eDP, DFP1 HDMI-A, DFP2 DisplayPort
+  u8(0x440, 3);
+  for (uint32_t i = 0; i < 3; ++i) { u16(0x444 + i * 12, tags[i]); u16(0x446 + i * 12, 12); u16(0x448 + i * 12, ids[i]); }
+  u8(0x500, 3);
+  for (uint32_t i = 0; i < 3; ++i) {
+    u16(0x504 + i * 8, ids[i]); u16(0x508 + i * 8, 0x180 + i * 6);
+    u8(0x580 + i * 6, 2); u8(0x581 + i * 6, 4); u8(0x582 + i * 6, i + 1); u8(0x583 + i * 6, 1);
+  }
+  return b;
+}
+
+// The connectors in the hot plug events: named from the video BIOS's object table, absent without one or for a pin it does not list.
+static void test_hotplug_connectors() {
+  const std::vector<uint8_t> vbios = make_connector_vbios();
+  Rig rig;
+  AmdVegaM vega(rig.alloc);
+  AmdVegaM::Inputs in = rig.inputs();
+  in.hpd_pins = 0x0F;
+  {
+    std::vector<uint8_t> callers_copy = vbios;
+    in.vbios = ConstByteView(callers_copy.data(), callers_copy.size());
+    CHECK(vega.bring_up(in));
+  }
+  if (!vega.up()) return;
+  CHECK(vega.connectors().size() == 3);
+  AmdVegaM::HotplugEvent e;
+  char name[16];
+  rig.card.gfx.set_reg(0x1857 + 1, 0x20000);
+  rig.card.gfx.set_reg(0x1898 + 8, 0x2);
+  rig.card.ih.post(42, 1, 0, 0, 0);
+  rig.card.gfx.set_reg(0x1857 + 2, 0x20000);
+  rig.card.gfx.set_reg(0x1898 + 16, 0x2);
+  rig.card.ih.post(42, 2, 0, 0, 0);
+  rig.card.gfx.set_reg(0x1857 + 3, 0x20000);
+  rig.card.gfx.set_reg(0x1898 + 24, 0x2);
+  rig.card.ih.post(42, 3, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 3);
+  CHECK(vega.take_hotplug(&e) && e.pin == 1 && e.connected && e.has_connector);
+  AtomConnectors::name(e.connector, ArrayView<char>(name, sizeof name));
+  CHECK(!strcmp(name, "HDMI-A-1"));
+  CHECK(vega.take_hotplug(&e) && e.pin == 2 && e.has_connector);
+  AtomConnectors::name(e.connector, ArrayView<char>(name, sizeof name));
+  CHECK(!strcmp(name, "DP-1"));
+  CHECK(vega.take_hotplug(&e) && e.pin == 3 && !e.has_connector);   // pin 3 is on no connector
+  // Without a video BIOS there are no connectors, and the events say so; a later bring-up with one has them again.
+  vega.shutdown();
+  memset(rig.doorbell_base, 0, 0x800 * 4);
+  in.vbios = ConstByteView();
+  CHECK(vega.bring_up(in) && vega.connectors().size() == 0);
+  rig.card.ih.post(42, 1, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && vega.take_hotplug(&e) && e.pin == 1 && !e.has_connector);
+  vega.shutdown();
+  memset(rig.doorbell_base, 0, 0x800 * 4);
+  std::vector<uint8_t> noise(vbios.size(), 0x5A);
+  in.vbios = ConstByteView(noise.data(), noise.size());
+  CHECK(vega.bring_up(in) && vega.connectors().size() == 0);
+}
+
 int main() {
   setvbuf(stdout, nullptr, _IONBF, 0);
   test_plan();
@@ -1274,6 +1413,8 @@ int main() {
   test_recovery_failure_sdma();
   test_card_reset();
   test_post_after_reset();
+  test_hotplug_events();
+  test_hotplug_connectors();
   printf(g_failed ? "AmdVegaMTest: %d FAILED\n" : "AmdVegaMTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }

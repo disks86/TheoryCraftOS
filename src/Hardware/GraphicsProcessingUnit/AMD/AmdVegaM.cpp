@@ -117,6 +117,7 @@ bool AmdVegaM::bring_up(const Inputs& in) {
     if (in.vbios.size() != 0 && !vbios_.append(in.vbios)) return fail(Step::None, "out of memory");
   }
   inputs_.vbios = vbios_.view();
+  connector_count_ = AtomConnectors::parse(inputs_.vbios, ArrayView<AtomConnectors::Connector>(connectors_, AtomConnectors::kMaxConnectors));
   if (!in.registers || !in.clock || !in.file_system || !in.allocator || !in.mapper || in.aperture_bytes == 0 || in.aperture_physical == 0 || !in.doorbells.valid() ||
       amd_gfx8_firmware_name(in.device_id, AmdGfx8Block::CpPfp) == nullptr)
     return fail(Step::None, "no access to the card (registers, memory BAR, doorbells or a Vega M device)");
@@ -255,6 +256,12 @@ bool AmdVegaM::bring_up(const Inputs& in) {
   for (uint32_t crtc = 0; crtc < amd_dce11::kMaxCrtcs; ++crtc) display_irq_->set_pageflip(crtc, true);
   for (uint32_t pin = 0; pin < amd_dce11::Interrupts::kMaxHpd; ++pin)
     if (in.hpd_pins >> pin & 1) display_irq_->hpd_init(pin);
+  // The state of the pins as they are now.
+  connected_pins_ = 0;
+  throttle_reported_ = 0;
+  hotplug_head_ = hotplug_count_ = hotplug_dropped_ = 0;
+  for (uint32_t pin = 0; pin < amd_dce11::Interrupts::kMaxHpd; ++pin)
+    if ((in.hpd_pins >> pin & 1) && display_irq_->hpd_sense(pin)) connected_pins_ |= 1u << pin;
   step_ = Step::Done;
 
   status_.assign("GART ");
@@ -273,6 +280,8 @@ void AmdVegaM::shutdown() {
     for (uint32_t crtc = 0; crtc < amd_dce11::kMaxCrtcs; ++crtc) display_irq_->set_pageflip(crtc, false);
   }
   display_irq_ = UniquePointer<amd_dce11::Interrupts>();
+  connected_pins_ = 0;
+  hotplug_head_ = hotplug_count_ = 0;
   display_ = UniquePointer<amd_dce11::Display>();   // (puts the firmware's framebuffer back)
   if (up()) {   // (amdgpu_irq_put in the blocks' hw_fini, before the engines stop)
     gmc_->set_fault_interrupts(false);
@@ -376,6 +385,14 @@ uint32_t AmdVegaM::service_interrupts(uint32_t max_vectors) {
   const uint32_t handled = irq_->process(*ih_, this, max_vectors);
   if (inputs_.auto_recover && recoveries_ < kMaxRecoveries && wedged()) recover();
   return handled;
+}
+
+bool AmdVegaM::take_hotplug(HotplugEvent* out) {
+  if (hotplug_count_ == 0) return false;
+  if (out) *out = hotplug_[hotplug_head_];
+  hotplug_head_ = (hotplug_head_ + 1) % kMaxHotplugEvents;
+  --hotplug_count_;
+  return true;
 }
 
 bool AmdVegaM::wedged() const {
@@ -491,6 +508,28 @@ void AmdVegaM::on_event(const AmdIrq::Event& event) {
       else if (event.me == 1 || event.me == 2) compute_->fault(event.me, event.pipe, event.queue);
       break;
     case AmdIrq::Kind::SdmaIllegalInstruction: sdma_->fault(event.engine); break;
+    case AmdIrq::Kind::DisplayHotplug: {
+      connected_pins_ = event.connected ? (connected_pins_ | 1u << event.pin) : (connected_pins_ & ~(1u << event.pin));
+      HotplugEvent e;
+      e.pin = event.pin;
+      e.connected = event.connected;
+      if (const AtomConnectors::Connector* connector = AtomConnectors::find_pin(connectors(), event.pin)) {
+        e.has_connector = true;
+        e.connector = *connector;
+      }
+      if (irq_->hpd_throttled(event.pin) && !(throttle_reported_ >> event.pin & 1)) {
+        e.throttled = true;
+        throttle_reported_ |= 1u << event.pin;
+      }
+      if (hotplug_count_ == kMaxHotplugEvents) {   // full: the oldest goes
+        hotplug_head_ = (hotplug_head_ + 1) % kMaxHotplugEvents;
+        --hotplug_count_;
+        ++hotplug_dropped_;
+      }
+      hotplug_[(hotplug_head_ + hotplug_count_) % kMaxHotplugEvents] = e;
+      ++hotplug_count_;
+      break;
+    }
     default: break;
   }
   if (observer_) observer_->on_event(event);

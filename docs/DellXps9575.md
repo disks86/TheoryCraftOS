@@ -365,8 +365,8 @@ The display engine's interrupts (`amd_dce11::Interrupts` in `AmdDce11.*`, from `
 - **Vertical blank** (sources 1..6, data 0; data 1 is the line interrupt): `LB_INTERRUPT_MASK.VBLANK_INTERRUPT_MASK`. It fires every frame, so it is off until `AmdVegaM::set_vblank_interrupt(true)`, which turns it on for
   the controller that shows the OS's framebuffer, and off again when the display is given back or the card stopped. The handler reads `DISP_INTERRUPT_STATUS*`, acknowledges with `LB_VBLANK_STATUS.VBLANK_ACK` when the bit is
   set and counts either way (`vblank_count`), like `dce_v11_0_crtc_irq`.
-- **Hot plug** (source 42, data: the pin): `dce_v11_0_hpd_init` for the pins in `Inputs::hpd_pins` (default all six; which pin a connector uses is in the video BIOS, which is not read, and the driver's exclusion of eDP and
-  LVDS cannot be made here): `DC_HPD_EN`, the toggle filter (50 ms connect, 10 ms disconnect), acknowledge, polarity from `DC_HPD_SENSE`, interrupt on. On an interrupt the pin's status bit must be set (else nothing is done,
+- **Hot plug** (source 42, data: the pin): `dce_v11_0_hpd_init` for the pins in `Inputs::hpd_pins` (default all six; which pin a connector uses is in the video BIOS's object table, `AtomConnectors`, but the driver's exclusion of eDP and
+  LVDS is not made: every pin in the mask is watched): `DC_HPD_EN`, the toggle filter (50 ms connect, 10 ms disconnect), acknowledge, polarity from `DC_HPD_SENSE`, interrupt on. On an interrupt the pin's status bit must be set (else nothing is done,
   as in `dce_v11_0_hpd_irq`); it is acknowledged, the polarity flipped to report the next change in the other direction (the driver's hotplug work does that when it detects the connector again), and the new state kept
   (`AmdIrq::hpd_connected`, `hotplug_count`). Because a pin that is not what it seems (the internal panel's) could interrupt forever, a pin that interrupts more than `kHotplugStormLimit` (256) times is switched off
   (`hpd_throttled`).
@@ -382,8 +382,30 @@ and `AmdVce3::mc_resume` sets `VCE_SYS_INT_EN.VCE_SYS_INT_TRAP_INTERRUPT_EN` (`v
 polling, so these are counted (`uvd_encode_fences`, `vce_fences`) and shown to whoever asks: `AmdVegaM::set_event_observer(AmdIrq::ISink*)` passes every event on after the card has dealt with it. Nothing connects the
 video engines to the observer yet. `check_irq_port.py` also checks these ids and handlers and that both engines' start code still enables their sources.
 
-Nothing in the OS reacts to a hot plug yet: the connector cannot be re-detected (no AtomBIOS, no DDC/EDID over the card's own aux channels), so a plug or unplug is only counted and its state kept. Not done: the vline
-interrupt is not enabled (only classified and acknowledged), the audio and DP short-pulse (`DC_HPD_RX_INT`) interrupts; recovery from a fault is above.
+The OS reacts to hot plug events like this: `AmdVegaM` keeps the state of the pins it watches (`connected_pins()`: read from `DC_HPD_INT_STATUS.DC_HPD_SENSE` at bring-up, then updated by every event) and queues an event
+for each plug and unplug (`take_hotplug()`: the pin, whether a display is connected now, and a flag on the event that switches a bouncing pin off; the queue holds 16 and drops the oldest, counting them). The desktop loop
+drains the queue after `service_interrupts()` and, for each event, writes a line to the debug console and shows a toast ("A display was connected to HDMI-A-1 of the Radeon RX Vega M"; "Hot plug detection of DP-1 on the Radeon RX Vega M is switched off: it
+kept changing" as a warning); at boot the outputs that already have a display are logged. That is all there is to do about it for now: the card's outputs are not part of the desktop (the OS cannot put a
+picture on them: no mode setting without the AtomBIOS command tables for the encoders and PLLs, and no DDC/EDID read of the monitor on the other end), so a plug cannot add a monitor to the desktop's layout. Which connector a pin is
+on comes from the video BIOS (next section); without one, or for a pin it does not list, the text says "output 2". Not done: the vline interrupt is not enabled (only classified and acknowledged), the audio and DP short-pulse (`DC_HPD_RX_INT`) interrupts; recovery from a fault is above.
+
+### Connector names from the video BIOS's object table
+
+`AtomConnectors` (`AtomConnectors.*`) reads what the card's outputs are: a port of the connector part of `amdgpu_atombios_get_connector_info_from_object_table` with `amdgpu_atombios_lookup_gpio` and
+`_get_hpd_info_from_gpio`. The Object_Header data table (revision 2 or later) has the display path table, one path for each device the board supports (a bit of the header's device vector), ending in a connector
+object; the connector table's object for it has records, the hot plug interrupt record names a GPIO, the GPIO_Pin_LUT data table says which register bit that GPIO is, and a bit of `DC_GPIO_HPD_A` (0x488d: bits 0, 8, 16,
+24, 26, 28) is hot plug pin 0 to 5. The connector object id gives the type as `object_connector_convert` does (DVI-I, DVI-D, VGA, Composite, SVIDEO, DIN, HDMI-A, HDMI-B, LVDS, DP, eDP; the others and the TV and
+component video devices are skipped). Names are the kernel's: the type and the number among connectors of that type (`HDMI-A-1`, `DP-2`, `eDP-1`). A connector that several paths end in is one connector with the devices
+merged, as `amdgpu_connector_add` does.
+
+Differences from the driver, because the image is untrusted bytes: every read is checked and a table that runs past the image ends the walk with what was found kept, the paths and records walked are bounded (255, 64),
+at most 16 connectors are kept, and the parts that are not about naming are left out (encoders and their capabilities, routers, the DDC lines). `AmdVegaM` parses the table at bring-up when `Inputs::vbios` is set
+(`connectors()`), and each `HotplugEvent` carries its connector (`has_connector`, `connector`); `main.cpp` writes the name in the toast, on the debug console and in the boot log.
+`scripts/check_connectors_port.py` checks the master list indexes, the layouts of the object header, path, object, record and GPIO entry, the pin masks and the connector type of each object id against the driver;
+`tests/AtomConnectorsTest.cpp` has a hand-assembled XPS-like board (eDP, HDMI, two DisplayPorts), all six pins and the GPIO entries that are not pins, the skipped devices and unnamed objects, records before and after the
+hot plug record, merged paths, the capacity, the names, and every truncation, every bit flip and 2000 noisy images under the sanitizers. Not checked against the real thing: `ObjectID.h` (the object id masks and the
+numbers are those of the Linux header from memory, checked only through `object_connector_convert`'s order), and no real Vega M video BIOS has been read. Not done: DDC lines and the encoder/router parts, and
+Atom firmware-info objects of the newer (Vega and later) `atomfirmware.h` layout, which differs.
 
 ### MSI: interrupts wake the CPU
 

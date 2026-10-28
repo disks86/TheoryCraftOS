@@ -1097,6 +1097,25 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         }
         const bool up = vega_m->bring_up(inputs);
         Entry(up ? Level::Ok : Level::Warning, "Vega M").text(up ? "started: " : "not started - ").text(vega_m->status());
+        if (up) {
+          const uint32_t connected = vega_m->connected_pins();
+          if (connected == 0) {
+            Entry(Level::Info, "Vega M").text("hot plug: no display on the outputs watched");
+          } else {
+            Entry(Level::Info, "Vega M").text("hot plug: display on output(s)");
+            for (uint32_t pin = 0; pin < 6; ++pin) {
+              if (!(connected >> pin & 1)) continue;
+              const hardware::AtomConnectors::Connector* connector = hardware::AtomConnectors::find_pin(vega_m->connectors(), pin);
+              if (connector) {
+                char connector_name[16];
+                hardware::AtomConnectors::name(*connector, ArrayView<char>(connector_name, sizeof connector_name));
+                Entry(Level::Info, "Vega M").text("  ").text(connector_name);
+              } else {
+                Entry(Level::Info, "Vega M").text("  output ").dec(pin + 1);
+              }
+            }
+          }
+        }
         if (up && vega_msi) {
           // Try it out, as virtio-gpu does: a copy through the SDMA engine ends with a trap, which must come back as an interrupt. If it does not, polling stays.
           const uint32_t before = __atomic_load_n(&g_vega_interrupts, __ATOMIC_ACQUIRE);
@@ -1284,6 +1303,35 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
           vega_seen = arrived;
           vega_idle = 0;
           vega_m->service_interrupts();
+        }
+        // A display plugged into or pulled out of one of the card's outputs: say so, on the debug console and as a toast. (The card's outputs are not part of the desktop: it cannot show
+        // anything on them, so this is all there is to do about it.)
+        hardware::AmdVegaM::HotplugEvent plug;
+        while (vega_m->take_hotplug(&plug)) {
+          // "HDMI-A-1" where the video BIOS says what the pin is, else "output 2"
+          FixedString<32> where;
+          if (plug.has_connector) {
+            char connector_name[16];
+            hardware::AtomConnectors::name(plug.connector, ArrayView<char>(connector_name, sizeof connector_name));
+            where.assign(connector_name);
+          } else {
+            where.assign("output ");
+            where.append_uint(plug.pin + 1);
+          }
+          FixedString<128> text;
+          if (plug.throttled) {
+            text.assign("Hot plug detection of ");
+            text.append(where.c_str());
+            text.append(" on the Radeon RX Vega M is switched off: it kept changing");
+          } else {
+            text.assign(plug.connected ? "A display was connected to " : "A display was disconnected from ");
+            text.append(where.c_str());
+            text.append(" of the Radeon RX Vega M");
+          }
+          console::debug_puts("Vega M: ");
+          console::debug_puts(StringView(text.c_str()));
+          console::debug_puts("\n");
+          desktop.notify(StringView("Display"), StringView(text.c_str()), plug.throttled ? gui::NoticeKind::Warning : gui::NoticeKind::Information);
         }
       }
 #endif

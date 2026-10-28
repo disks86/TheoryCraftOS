@@ -69,6 +69,7 @@ enum NodeFlag : uint8_t {
   kFlagParenthesized = 2,   // String: written in parentheses (so it is not a directive)
   kFlagHole = 32,        // Ident: the gap in an array literal `[1, , 3]`
   kFlagStrict = 64,      // Function / Block (a program): strict mode code (a module, a class body); a "use strict" directive is found by the compiler
+  kFlagHasEval = 128,    // Block (a function body): contains a call of eval(...) that is not inside a function of its own
   kFlagSuper = 128,      // Member / Index: super.name (the object the method is looked up on is the prototype of the parent class; `this` stays the receiver)
 };
 
