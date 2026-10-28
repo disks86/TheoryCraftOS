@@ -201,7 +201,10 @@ uint32_t vm_protect(Process& target, uint64_t* base_io, uint64_t* size_io, uint3
     if (protect == kPageWriteCopy) { protect = kPageReadWrite; prot = kProtRead | kProtWrite; }
     else if (protect == kPageExecuteWriteCopy) { protect = kPageExecuteReadWrite; prot = kProtRead | kProtWrite | kProtExecute; }
   }
-  if (attributes.type == PageAttributes::Image) {      // an image is never written through: asking for write gives copy-on-write
+  if (attributes.type == PageAttributes::Image && attributes.copied) {      // a page of an image that was written to has a copy of its own
+    if (protect == kPageWriteCopy) { protect = kPageReadWrite; prot = kProtRead | kProtWrite; }
+    else if (protect == kPageExecuteWriteCopy) { protect = kPageExecuteReadWrite; prot = kProtRead | kProtWrite | kProtExecute; }
+  } else if (attributes.type == PageAttributes::Image) {      // an image is never written through: asking for write gives copy-on-write
     if (protect == kPageReadWrite) { protect = kPageWriteCopy; prot = kProtRead; }
     else if (protect == kPageExecuteReadWrite) { protect = kPageExecuteWriteCopy; prot = kProtRead | kProtExecute; }
   }
