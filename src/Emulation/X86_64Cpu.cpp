@@ -1023,7 +1023,7 @@ X86_64Cpu::Step X86_64Cpu::step_0f(GuestMemory& m) {
       } else if (leaf == 7 && static_cast<uint32_t>(s_.r[1]) == 0) {
         b = (1u << 3) | (1u << 5) | (1u << 8) | (1u << 29) | (1u << 16) | (1u << 17) | (1u << 21) | (1u << 28) | (1u << 30) | (1u << 31);      // BMI1, AVX2, BMI2, SHA, AVX512F, DQ, IFMA, CD, BW, VL
         c = (1u << 1) | (1u << 6) | (1u << 8) | (1u << 9) | (1u << 10) | (1u << 11) | (1u << 12) | (1u << 14);      // VBMI, VBMI2, GFNI, VAES, VPCLMULQDQ, VNNI, BITALG, VPOPCNTDQ
-        dx = (1u << 3) | (1u << 8) | (1u << 23);      // AVX512_4FMAPS, AVX512_VP2INTERSECT, AVX512_FP16
+        dx = (1u << 2) | (1u << 3) | (1u << 8) | (1u << 23);      // AVX512_4VNNIW, AVX512_4FMAPS, AVX512_VP2INTERSECT, AVX512_FP16
       } else if (leaf == 0xD) {
         const uint32_t sub = static_cast<uint32_t>(s_.r[1]);
         if (sub == 0) { a = 0xE7; b = 2688; c = 2688; }      // x87, SSE, AVX and the AVX-512 state; 512 + 64 + 256 + ... bytes

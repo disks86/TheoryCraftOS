@@ -74,6 +74,7 @@ const EvexOp kEvexOps[] = {
     {2, 1, 0x26, 0, kTest, 0, 8, kFullMem}, {2, 1, 0x26, 1, kTest, 0, 16, kFullMem}, {2, 1, 0x27, 0, kTest, 0, 32, kFull}, {2, 1, 0x27, 1, kTest, 0, 64, kFull},
     {2, 3, 0x68, -1, kVp2Intersect, 0, 0, kFull},
     {2, 3, 0x9A, 0, kFma4, 0, 32, kTuple4}, {2, 3, 0xAA, 0, kFma4, 2, 32, kTuple4}, {2, 3, 0x9B, 0, kFma4, 1, 32, kTuple4}, {2, 3, 0xAB, 0, kFma4, 3, 32, kTuple4},      // Xeon Phi 4FMAPS
+    {2, 3, 0x52, 0, kVnni4, 0, 32, kTuple4}, {2, 3, 0x53, 0, kVnni4, 1, 32, kTuple4},      // Xeon Phi 4VNNIW
     {2, 2, 0x26, 0, kTest, 1, 8, kFullMem}, {2, 2, 0x26, 1, kTest, 1, 16, kFullMem}, {2, 2, 0x27, 0, kTest, 1, 32, kFull}, {2, 2, 0x27, 1, kTest, 1, 64, kFull},
     {3, 1, 0x25, 0, kTernlog, 0, 32, kFull}, {3, 1, 0x25, 1, kTernlog, 0, 64, kFull},
     // shuffles and permutes (sub of kShufImm: 0 vpshufd, 1 vpshufhw, 2 vpshuflw, 3 vpermilps, 4 vpermilpd, 5 vpermq/vpermpd by immediate)
@@ -578,7 +579,7 @@ X86_64Cpu::Step X86_64Cpu::step_evex(GuestMemory& m) {
   if (!finish_decode()) return bad_decode();
   ev_.old_dest = get_vec(ev_.reg);
   switch (def->kind) {
-    case kMove: case kIntBin: case kMulDq: case kLane: case kShiftCount: case kShiftImm: case kShiftVar: case kRotVar: case kCmpEq: case kCmpImm: case kTest: case kTernlog: case kVp2Intersect:
+    case kMove: case kIntBin: case kMulDq: case kLane: case kShiftCount: case kShiftImm: case kShiftVar: case kRotVar: case kCmpEq: case kCmpImm: case kTest: case kTernlog: case kVp2Intersect: case kVnni4:
       return evex_int(m, *def);
     case kComi: case kFpBin: case kFpScalar: case kFpUnary: case kFma: case kFpCmp: case kCvt: case kCvtScalar: case kCvtToGpr: case kCvtFromGpr: case kRound: case kGetExp: case kGetMant:
     case kScalef: case kFixup: case kReduce: case kRange: case kFpClass: case kRcp14: case kRsqrt14:
@@ -900,6 +901,30 @@ X86_64Cpu::Step X86_64Cpu::evex_int(GuestMemory& m, const EvexOp& defn) {
       }
       s_.k[d_.reg & 6] = first;
       s_.k[(d_.reg & 6) | 1] = second;
+      return finish();
+    }
+    case kVnni4: {      // Xeon Phi 4VNNIW: vp4dpwssd / vp4dpwssds, four vpdpwssd steps over the register group (vvvv & ~3 ..+3) with the dwords of the m128 operand as the word pairs
+      if (!memory || bcst || vl != 512) return fail(6);
+      int32_t pairs[4][2];
+      for (uint32_t j = 0; j < 4; ++j) {
+        uint64_t v;
+        if (!load(m, memory_address() + 4 * j, 4, &v)) return Step::Fault;
+        pairs[j][0] = static_cast<int16_t>(v);
+        pairs[j][1] = static_cast<int16_t>(v >> 16);
+      }
+      Vec group[4];
+      for (uint32_t j = 0; j < 4; ++j) group[j] = get_vec((vvvv & ~3u) + j);
+      for (uint32_t i = 0; i < count; ++i) {
+        int64_t acc = static_cast<int32_t>(element(old_dest, 32, i));
+        for (uint32_t j = 0; j < 4; ++j) {
+          const uint64_t x = element(group[j], 32, i);
+          acc += int64_t{static_cast<int16_t>(x)} * pairs[j][0] + int64_t{static_cast<int16_t>(x >> 16)} * pairs[j][1];
+          if (def->sub) acc = acc > INT32_MAX ? INT32_MAX : acc < INT32_MIN ? INT32_MIN : acc;
+          else acc = static_cast<int32_t>(static_cast<uint32_t>(acc));
+        }
+        set_element(result, 32, i, static_cast<uint32_t>(acc));
+      }
+      write_masked(reg, result, 32);
       return finish();
     }
     case kTernlog: {

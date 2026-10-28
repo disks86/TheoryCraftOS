@@ -59,7 +59,7 @@ enum Kind : uint8_t {
   kShufImm, kPermute, kPermute2, kInsert, kExtract, kBlend, kAlign, kShuf128, kIntUnary, kExtend, kNarrow, kMaskMove, kCompress, kExpand,
   kFpBin, kFpScalar, kFpUnary, kFma, kFpCmp, kCvt, kCvtScalar, kCvtToGpr, kCvtFromGpr, kRound, kGetExp, kGetMant, kScalef, kFixup, kReduce, kRange, kFpClass, kRcp14, kRsqrt14,
   kGather, kScatter, kMiscInt, kDup, kMovHL, kExtractElem, kInsertElem, kHalfConv,
-  kVnni, kMadd52, kMultishift, kShufBit, kShift2, kShift2Var, kCompressBW, kExpandBW, kGfAffine, kGfMul, kBf16, kAesNi, kClmul, kBroadcastMask, kDbpsadbw, kComi, kComplex, kVp2Intersect, kFma4
+  kVnni, kMadd52, kMultishift, kShufBit, kShift2, kShift2Var, kCompressBW, kExpandBW, kGfAffine, kGfMul, kBf16, kAesNi, kClmul, kBroadcastMask, kDbpsadbw, kComi, kComplex, kVp2Intersect, kFma4, kVnni4
 };
 
 enum IntOp : uint8_t { kAdd, kSub, kAdds, kAddus, kSubs, kSubus, kMullo, kMulhs, kMulhu, kMulhrs, kAvg, kMins, kMinu, kMaxs, kMaxu, kAnd, kAndn, kOr, kXor };
