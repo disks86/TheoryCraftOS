@@ -521,13 +521,30 @@ uint32_t AmdVegaM::refresh_audio_pins() {
 }
 
 bool AmdVegaM::audio_pin_for(const AtomConnectors::Connector& connector, uint32_t* pin) const {
-  if (!AtomConnectors::carries_audio(connector.type) || AtomConnectors::afmt_instance(connector) == AtomConnectors::kNoDig) return false;
+  if (!AtomConnectors::carries_audio(connector.type) || AtomConnectors::afmt_instance(connector) >= amd_dce11::AudioFormat::kBlocks) return false;     // (kNoDig is past them too)
   for (uint32_t i = 0; i < kAudioPins; ++i) {
     if (!(audio_pins_ >> i & 1)) continue;
     if (pin) *pin = i;
     return true;
   }
   return false;
+}
+
+bool AmdVegaM::select_audio_pin(const AtomConnectors::Connector& connector) {
+  if (!inputs_.registers) return false;
+  refresh_audio_pins();       // (nothing is connected when the card is not up)
+  uint32_t pin = 0;
+  if (!audio_pin_for(connector, &pin)) return false;
+  return amd_dce11::AudioFormat(*inputs_.registers).select_pin(AtomConnectors::afmt_instance(connector), pin);
+}
+
+uint32_t AmdVegaM::select_audio_pins() {
+  uint32_t n = 0;
+  for (const AtomConnectors::Connector& c : connectors()) {
+    if (!AtomConnectors::carries_audio(c.type) || c.hpd_pin >= amd_dce11::Interrupts::kMaxHpd || !(connected_pins_ >> c.hpd_pin & 1)) continue;
+    if (select_audio_pin(c)) ++n;
+  }
+  return n;
 }
 
 uint32_t AmdVegaM::audio_outputs(AtomConnectors::Connector* out, uint32_t capacity) const {

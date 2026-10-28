@@ -741,3 +741,19 @@ request, several bits, or an EDID that cannot be read) is answered NAK (0x02), b
 Not done: the retraining itself (there is no link training yet; the boot firmware's link is what is judged, and a card that has not trained one has `lanes` 0 and cannot lose it), the other tests (training, video pattern with the test timing
 registers 0x219.., PHY patterns), and the MST message and the downstream port changes. Addresses and bit meanings are from memory, like the rest of the DPCD. `AmdVegaMTest::test_short_pulse_status` (healthy link, a lost lane, a lane beyond the ones in use, an untrained link, lost alignment, each
 service interrupt, the eDP panel, a sink that times out or ends before the status, HDMI and an unknown pin, capacity and order, the dropped state) and `DpcdTest::test_lane_count` cover it.
+
+### Audio format blocks: selecting the endpoint
+
+DCE 11 has an audio format block (AFMT) for each DIG encoder, at the DIG's register block (`dig_offsets`: DIG0 at +0, DIG1 +0x100, DIG2 +0x200, DIG3 +0x300, DIG4 +0x400, DIG5 +0x500; the Vega M, like Polaris 10, has
+6 DIGs, so blocks 0 to 5 - UNIPHY3, DIG 6, has none), and each takes its audio from one of the eight endpoints (`AudioPins`): `AFMT_AUDIO_SRC_CONTROL` (0x4a45 + the DIG's offset), bits 2:0, `AFMT_AUDIO_SRC_SELECT`, is the
+endpoint's number. `amd_dce11::AudioFormat::select_pin(block, pin)` is `dce_v11_0_afmt_audio_select_pin`: a read-modify-write of that field alone (the rest of the register is kept), false for a block or endpoint that does not
+exist; `selected_pin(block)` reads it back. `AmdVegaM::select_audio_pin(connector)` ties it to the connector: the connector's encoder object gives the DIG (`AtomConnectors::afmt_instance`, HDMI and DisplayPort only), the
+endpoints are read again (`refresh_audio_pins`, as `dce_v11_0_audio_get_pin` does every time), `audio_pin_for` picks the first connected endpoint (the driver's rule: the same one for every block, it does not tell two
+displays apart), and the field is written; false for a connector with no audio block (the eDP panel, a DIG 6 transmitter, no encoder in the table) or when no endpoint is connected, and then nothing is written.
+`select_audio_pins()` does it for every HDMI and DisplayPort connector with a display on its hot plug pin and returns how many. Nothing calls it by itself: a desktop that sets up audio calls it when a display appears.
+
+Not done, as in the driver's function alone: enabling the endpoint (`AZALIA_F0_CODEC_PIN_CONTROL_HOT_PLUG_CONTROL.AUDIO_ENABLED`, `dce_v11_0_audio_enable`), the audio clock and sample rate (`dce_v11_0_afmt_setmode`'s ACR and
+audio packets), the ELD from the EDID (speaker allocation, SADs, latency), and any audio output to play through. `scripts/check_afmt_port.py <dce_v11_0.c> <vid.h> <dce_11_2_d.h> <dce_11_2_sh_mask.h>` checks the
+read-modify-write against the driver's function, the register and field numbers (the generated `AmdDce11Registers.inc`), the DIG offsets, `afmt[i]->offset = dig_offsets[i]`, `num_dig` of CHIP_VEGAM and the pin ids. Tested
+by `AmdVegaMTest::test_audio_select` (the XPS-like board: HDMI on DIG 2 and DisplayPort on DIG 3 get the first connected endpoint with the other bits and blocks untouched, the eDP panel and a DIG 6 encoder get nothing,
+endpoints and displays that come and go, every block and endpoint, out-of-range blocks and endpoints, stopped).
