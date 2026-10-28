@@ -288,6 +288,7 @@ void AmdVegaM::shutdown() {
   }
   display_irq_ = UniquePointer<amd_dce11::Interrupts>();
   connected_pins_ = 0;
+  rx_pending_ = 0;
   audio_pins_ = 0;
   hotplug_head_ = hotplug_count_ = 0;
   display_ = UniquePointer<amd_dce11::Display>();   // (puts the firmware's framebuffer back)
@@ -473,6 +474,39 @@ bool AmdVegaM::read_dpcd(const AtomConnectors::Connector& connector, Dpcd::Capab
   return true;
 }
 
+uint32_t AmdVegaM::service_short_pulses(SinkEvent* out, uint32_t capacity) {
+  uint32_t count = 0;
+  if (!out) capacity = 0;
+  for (uint32_t pin = 0; pin < amd_dce11::Interrupts::kMaxHpd && count < capacity; ++pin) {
+    if (!(rx_pending_ >> pin & 1)) continue;
+    rx_pending_ &= ~(1u << pin);
+    SinkEvent e;
+    e.pin = pin;
+    if (const AtomConnectors::Connector* connector = AtomConnectors::find_pin(connectors(), pin)) {
+      e.has_connector = true;
+      e.connector = *connector;
+    }
+    if (up() && e.has_connector && inputs_.registers && inputs_.clock && inputs_.allocator && e.connector.has_ddc && AtomConnectors::uses_aux(e.connector.type)) {
+      AuxSession session(*inputs_.registers, *inputs_.clock, inputs_.vbios, *inputs_.allocator, e.connector);
+      if (session.bios.valid()) {      // (no panel power-up: a sink that is off does not pulse)
+        e.checked = true;
+        if (!Dpcd::read_lane_count(session.aux, &e.lanes) || !Dpcd::read_link_status(session.aux, &e.status)) {
+          e.read_failed = true;
+          e.lanes = 0;
+          e.status = Dpcd::LinkStatus();
+        } else {
+          e.link_lost = e.lanes > 0 && !e.status.channel_eq_ok(e.lanes);
+          e.test_request = e.status.automated_test_request();
+          e.content_protection = e.status.content_protection_irq();
+          e.sink_specific = e.status.sink_specific_irq();
+        }
+      }
+    }
+    out[count++] = e;
+  }
+  return count;
+}
+
 uint32_t AmdVegaM::refresh_audio_pins() {
   if (!up() || !inputs_.registers) return audio_pins_ = 0;
   return audio_pins_ = amd_dce11::AudioPins(*inputs_.registers).connected_mask(kAudioPins);
@@ -617,6 +651,7 @@ void AmdVegaM::on_event(const AmdIrq::Event& event) {
       ++hotplug_count_;
       break;
     }
+    case AmdIrq::Kind::DisplayHpdRx: rx_pending_ |= 1u << event.pin; break;
     default: break;
   }
   if (observer_) observer_->on_event(event);

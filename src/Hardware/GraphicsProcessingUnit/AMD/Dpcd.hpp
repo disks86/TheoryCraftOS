@@ -45,7 +45,7 @@ class Dpcd {
   static constexpr uint32_t kRevision = 0x000, kMaxLinkRate = 0x001, kMaxLaneCount = 0x002, kMaxDownspread = 0x003, kNorp = 0x004, kDownstreamPortPresent = 0x005,
                             kMainLinkChannelCoding = 0x006, kDownstreamPortCount = 0x007;
   static constexpr uint32_t kSupportedLinkRates = 0x010;         // eDP 1.4: up to eight 16-bit rates
-  static constexpr uint32_t kSinkCount = 0x200, kLaneStatus = 0x202, kEdpRevision = 0x700;
+  static constexpr uint32_t kLaneCountSet = 0x101, kSinkCount = 0x200, kLaneStatus = 0x202, kEdpRevision = 0x700;
   static constexpr uint32_t kReceiverBytes = 0x10;               // 0x000..0x00F, the receiver capability field
   static constexpr uint32_t kStatusBytes = 8;                    // 0x200..0x207: sink count, service irq vector, lane status (2), alignment, sink status, adjust requests (2)
   static constexpr uint32_t kMaxEdpRates = 8;
@@ -104,6 +104,8 @@ class Dpcd {
   // The reads. `edp`: also the eDP revision and, from 1.4, the rate table.
   static bool read_capabilities(IDpcdAux& aux, bool edp, Capabilities* out);
   static bool read_link_status(IDpcdAux& aux, LinkStatus* out);
+  // DP_LANE_COUNT_SET: the lanes the source has set the link to (bits 4:0; 0 until the link has been trained), the number the link status is judged by.
+  static bool read_lane_count(IDpcdAux& aux, uint32_t* lanes);
 };
 
 }  // namespace hardware
