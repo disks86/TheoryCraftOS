@@ -318,6 +318,24 @@ uint32_t AudioPins::connected_mask(uint32_t pin_count) {
   return mask;
 }
 
+namespace {
+// DIGn_REGISTER_OFFSET (vid.h) for DIG 0 to 5: the register blocks of the DIG encoders, and with them of the audio format blocks (dig_offsets in dce_v11_0.c).
+constexpr uint32_t kDigOffsets[AudioFormat::kBlocks] = {0x4a00 - 0x4a00, 0x4b00 - 0x4a00, 0x4c00 - 0x4a00, 0x4d00 - 0x4a00, 0x4e00 - 0x4a00, 0x4f00 - 0x4a00};
+}  // namespace
+
+bool AudioFormat::select_pin(uint32_t block, uint32_t pin) {
+  if (block >= kBlocks || pin >= AudioPins::kMaxPins) return false;
+  uint32_t tmp = r_.read(mmAFMT_AUDIO_SRC_CONTROL + kDigOffsets[block]);
+  tmp = REG_SET_FIELD(tmp, AFMT_AUDIO_SRC_CONTROL, AFMT_AUDIO_SRC_SELECT, pin);
+  r_.write(mmAFMT_AUDIO_SRC_CONTROL + kDigOffsets[block], tmp);
+  return true;
+}
+
+uint32_t AudioFormat::selected_pin(uint32_t block) {
+  if (block >= kBlocks) return kNoPin;
+  return FIELD(r_.read(mmAFMT_AUDIO_SRC_CONTROL + kDigOffsets[block]), AFMT_AUDIO_SRC_CONTROL__AFMT_AUDIO_SRC_SELECT_MASK, AFMT_AUDIO_SRC_CONTROL__AFMT_AUDIO_SRC_SELECT__SHIFT);
+}
+
 bool Presenter::start(INativeDisplay& display, ByteView video, uint32_t pitch_bytes, uint32_t height) {
   const uint64_t bytes = uint64_t{pitch_bytes} * height;
   if (pitch_bytes == 0 || height == 0 || video.size() != bytes) return false;
