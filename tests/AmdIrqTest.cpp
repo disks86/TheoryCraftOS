@@ -38,7 +38,7 @@ static AmdIrq::Kind expected(uint32_t src, uint32_t ring, uint32_t data) {
     case 239: return AmdIrq::Kind::SqMessage;
     case 1: case 2: case 3: case 4: case 5: case 6: return data == 0 ? AmdIrq::Kind::DisplayVblank : data == 1 ? AmdIrq::Kind::DisplayVline : AmdIrq::Kind::Unknown;
     case 8: case 10: case 12: case 14: case 16: case 18: return AmdIrq::Kind::DisplayPageFlip;
-    case 42: return data < 6 ? AmdIrq::Kind::DisplayHotplug : AmdIrq::Kind::Unknown;
+    case 42: return data < 6 ? AmdIrq::Kind::DisplayHotplug : data < 12 ? AmdIrq::Kind::DisplayHpdRx : AmdIrq::Kind::Unknown;
     case 124: return AmdIrq::Kind::UvdFence;
     case 119: case 120: return AmdIrq::Kind::UvdEncodeFence;
     case 167: return data < 3 ? AmdIrq::Kind::VceFence : AmdIrq::Kind::Unknown;

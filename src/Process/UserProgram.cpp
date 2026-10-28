@@ -143,7 +143,7 @@ void take_tls(AddressSpace& space, Process& process, const Module& module) {
 
 }  // namespace
 
-uint32_t UserProgram::load_module(ConstByteView file, StringView canonical_name, LoadedModule* out, uint32_t capacity, uint32_t* count) {
+uint32_t UserProgram::load_module(ConstByteView file, StringView canonical_name, LoadedModule* out, uint32_t capacity, uint32_t* count, bool bind) {
   constexpr uint32_t kNoMemory = 0xC0000017u, kDllNotFound = 0xC0000135u, kBadImage = 0xC000007Bu, kNotSupported = 0xC00000BBu, kBufferTooSmall = 0xC0000023u, kInvalidParameter = 0xC000000Du;
   *count = 0;
   if (!modules_ || !process_) return kNotSupported;
@@ -151,9 +151,9 @@ uint32_t UserProgram::load_module(ConstByteView file, StringView canonical_name,
   const uint64_t first = modules_->count(), init_first = modules_->init_count();
   SingleFileProvider provider(canonical_name, file, libraries_);
   String detail(allocator_);
-  switch (load_additional_library(space_, allocator_, provider, modules_.get(), canonical_name, &detail)) {
+  switch (load_additional_library(space_, allocator_, provider, modules_.get(), canonical_name, &detail, bind)) {
     case LoadStatus::Ok: break;
-    case LoadStatus::OutOfMemory: return kNoMemory;
+    case LoadStatus::OutOfMemory: process_log(detail.view()); process_log(canonical_name); return kNoMemory;
     case LoadStatus::Unsupported: return kNotSupported;
     case LoadStatus::Malformed: return kBadImage;
     default: return kDllNotFound;
@@ -164,6 +164,7 @@ uint32_t UserProgram::load_module(ConstByteView file, StringView canonical_name,
     return kBufferTooSmall;
   }
   for (uint64_t i = first; i < modules_->count(); ++i) {      // thread-local data of their own
+    if (modules_->modules_[i]->no_bind) continue;
     if (!give_tls(space_, *process_, *modules_->modules_[i])) {
       for (uint64_t k = first; k < i; ++k) take_tls(space_, *process_, *modules_->modules_[k]);
       modules_->drop_from(space_, first);
@@ -230,6 +231,7 @@ LoadStatus UserProgram::load(ConstByteView file, ArrayView<const StringView> arg
   LoadedImage image;
   uint64_t stack_top = 0, stack_pointer = 0, heap_start = 0, fs_base = 0, gs_base = 0, argument = 0, argument2 = 0, dispatcher = 0, thread_thunk = 0, thread_teb = 0;
   Process::ThreadSupport thread_support;
+  uint8_t image_information[64] = {};
   UniquePointer<ModuleSet> loaded_modules;      // (kept by the program once everything worked)
   const StringView path = arguments.empty() ? StringView("") : arguments[0];
   if (kind == exe::ExecutableKind::Elf) {
@@ -246,9 +248,11 @@ LoadStatus UserProgram::load(ConstByteView file, ArrayView<const StringView> arg
     exe::PeFile pe(allocator_);
     if (!pe.parse(file)) return LoadStatus::Malformed;
     if (!bind_executable(pe, &binding)) return LoadStatus::Unsupported;
+    describe_pe_image(pe, file.size(), image_information);
     if (!pe.imports().empty() && !libraries_) return LoadStatus::NeedsLibraries;      // nothing resolves imports: it would jump to address 0
-    LoadStatus status = load_pe(pe, file, space_, &image);
+    LoadStatus status = load_pe(pe, file, space_, &image, false);
     if (status != LoadStatus::Ok) return status;
+    describe_image_pages(space_, pe, image.base);      // (the pages are an image, committed, whatever their access)
     const StringView program_file = path.empty() ? StringView("program.exe") : path.substr(path.rfind('\\') == StringView::npos ? 0 : path.rfind('\\') + 1);
     UniquePointer<ModuleSet> modules;
     if (libraries_) {
@@ -318,6 +322,7 @@ LoadStatus UserProgram::load(ConstByteView file, ArrayView<const StringView> arg
   }
   UniquePointer<Process> process = UniquePointer<Process>::make(allocator_, id_, binding, space_, host_);
   if (!process) return LoadStatus::OutOfMemory;
+  process->set_image_information(image_information);
   process->create_time = host_.realtime_ns() / 100 + 11644473600ull * 10000000ull;      // (FILETIME)
   process->attach_address_space(space_, heap_start);
   process->set_initial_thread_pointers(fs_base, gs_base);

@@ -912,6 +912,95 @@ static void test_ecc_and_sq_interrupts() {
   CHECK(rig.card.reg(0x2315) == 0x6);
 }
 
+// Recovery (gfx_v8_0_check_soft_reset / _pre_soft_reset / _soft_reset / _post_soft_reset): a hung command processor wedges the ring; recover() resets it and the ring works again.
+static void test_recover() {
+  GfxRig rig;
+  AmdGfx8 gfx(rig.card, rig.clock);
+  CHECK(gfx.recover() == AmdGfx8::Result::BadArgument);   // never started
+  CHECK(gfx.start(rig.memory()) == AmdGfx8::Result::Ok);
+  gfx.set_interrupts(true);
+  gfx.set_ecc_interrupts(true);
+  gfx.set_sq_interrupts(true);
+  rig.card.set_reg(0x2315, 0);
+  rig.put_ib(make_ib(0x1234, rig.ib_gpu + 8192, 0xCAFE0001));
+  CHECK(gfx.submit_ib(rig.ib_gpu, 256) && gfx.fence_sequence() == 1);
+  // The CP hangs: the next buffer times out and wedges the ring.
+  rig.card.hung = true;
+  CHECK(!gfx.submit_ib(rig.ib_gpu, 256, 2000) && gfx.wedged());
+  // Nothing shows busy in the status registers, so the CP, GFX, CPF, CPC and CPG are reset with the GRBM: GRBM_SOFT_RESET 0xF0001 set then cleared, SRBM_SOFT_RESET 0x100 set then cleared.
+  const size_t first = rig.card.writes.size(), grbm_before = rig.card.grbm_resets.size(), srbm_before = rig.card.srbm_resets.size();   // (start() pulsed the RLC reset already)
+  CHECK(gfx.recover() == AmdGfx8::Result::Ok);
+  CHECK(!gfx.wedged() && gfx.running() && gfx.fence_sequence() == 0 && gfx.recoveries() == 1 && !rig.card.hung);
+  CHECK(rig.card.grbm_resets.size() == grbm_before + 2 && rig.card.grbm_resets[grbm_before] == 0xF0001 && rig.card.grbm_resets[grbm_before + 1] == 0);
+  CHECK(rig.card.srbm_resets.size() == srbm_before + 2 && rig.card.srbm_resets[srbm_before] == 0x100 && rig.card.srbm_resets[srbm_before + 1] == 0);
+  // The order: the graphics CP halted before the memory controller's stall (GMCON_DEBUG 0xd5f, STALL | CLEAR), the stall around both resets, the ring programmed (CP_RB0_BASE) after.
+  {
+    int stall = -1, grbm_set = -1, grbm_clear = -1, srbm_set = -1, srbm_clear = -1, unstall = -1, halt = -1, rb_base = -1;
+    for (size_t i = first; i < rig.card.writes.size(); ++i) {
+      const uint32_t r = rig.card.writes[i].first, v = rig.card.writes[i].second;
+      if (r == 0xd5f && (v & 3) == 3 && stall < 0) stall = static_cast<int>(i);
+      if (r == 0xd5f && (v & 3) == 0) unstall = static_cast<int>(i);
+      if (r == 0x2008 && v != 0) grbm_set = static_cast<int>(i);
+      if (r == 0x2008 && v == 0) grbm_clear = static_cast<int>(i);
+      if (r == 0x398 && v != 0) srbm_set = static_cast<int>(i);
+      if (r == 0x398 && v == 0) srbm_clear = static_cast<int>(i);
+      if (r == fakegfx::kCpMeCntl && (v & (fakegfx::kMeHalt | fakegfx::kPfpHalt | fakegfx::kCeHalt)) && halt < 0) halt = static_cast<int>(i);
+      if (r == 0x3040 && rb_base < 0 && grbm_clear >= 0) rb_base = static_cast<int>(i);   // CP_RB0_BASE
+    }
+    CHECK(halt >= 0 && halt < stall && stall < grbm_set && grbm_set < grbm_clear && grbm_clear < srbm_set && srbm_set < srbm_clear && srbm_clear < unstall && unstall < rb_base);
+  }
+  // The reset took the interrupt enables away; they are back (CP_INT_CNTL_RING0 TIME_STAMP | PRIV_REG | PRIV_INSTR, the ECC bit in CP_INT_CNTL, SQ messages let through).
+  CHECK((rig.card.reg(0x306a) & 0x04C00000) == 0x04C00000 && (rig.card.reg(0x3049) & 0x4000) && (rig.card.reg(0x2315) & 1) == 0);
+  // The fence word was cleared with the numbers: the fence number of the old life (1) left in it does not make the first new submission look finished.
+  rig.card.ignore_fences = true;
+  CHECK(!gfx.submit_ib(rig.ib_gpu, 256, 2000) && gfx.wedged());
+  rig.card.ignore_fences = false;
+  CHECK(gfx.recover() == AmdGfx8::Result::Ok && !gfx.wedged() && gfx.recoveries() == 2);
+  // The ring works again from nothing, with fence numbers from 1.
+  rig.put_ib(make_ib(0x4321, rig.ib_gpu + 8192, 0xCAFE0002));
+  CHECK(gfx.submit_ib(rig.ib_gpu, 256) && gfx.fence_sequence() == 1 && rig.card.reg(fakegfx::kScratch0) == 0x4321 && rig.card.get32(rig.wb_gpu + 12) == 1);
+  CHECK(rig.card.protocol_errors == 0 && rig.card.ib_protocol_errors == 0);
+
+  // What the status shows busy decides what is reset: the CP busy: CP | GFX (0x10001) and the GRBM; RLC busy adds SOFT_RESET_RLC (4); the command processors busy in GRBM_STATUS2 give
+  // CPF | CPC | CPG; SEM busy in SRBM_STATUS adds SOFT_RESET_SEM (0x8000); a GRBM request pending adds the GRBM. When that leaves the command processors alone (the hang is not in the
+  // status) they are added, which the driver's check does not do, so that a wedged ring is always recovered from.
+  struct Case { uint32_t grbm_status, grbm_status2, srbm_status, grbm, srbm; };
+  const Case cases[] = {
+      {0x20000000, 0, 0, 0x10001, 0x100},
+      {0x00004000, 0, 0, 0x10001, 0x100},                    // a block of the graphics pipe busy (TA)
+      {0, 0x01000000, 0, 0xF0005, 0x100},                    // the RLC alone: the command processors with it
+      {0, 0x10000000, 0, 0xE0000, 0x100},                    // the CPF
+      {0, 0, 0x4000, 0xF0001, 0x100 | 0x8000},               // SEM busy alone: the command processors with it, and the SEM too
+      {0, 0, 0x20, 0xF0001, 0x100},                          // a request pending at the GRBM
+      {0x20000000, 0x01000000, 0x4000, 0x10005, 0x100 | 0x8000},
+      {0x20000000, 0x10000000, 0, 0xF0001, 0x100},           // CP and CPF both
+  };
+  for (const Case& c : cases) {
+    GfxRig r2;
+    AmdGfx8 g2(r2.card, r2.clock);
+    CHECK(g2.start(r2.memory()) == AmdGfx8::Result::Ok);
+    r2.card.set_reg(0x2004, c.grbm_status);
+    r2.card.set_reg(0x2002, c.grbm_status2);
+    r2.card.set_reg(0x394, c.srbm_status);
+    const size_t gb = r2.card.grbm_resets.size(), sb = r2.card.srbm_resets.size();   // (start() pulsed the RLC reset already)
+    CHECK(g2.recover() == AmdGfx8::Result::Ok);
+    CHECK(r2.card.grbm_resets.size() == gb + 2 && r2.card.grbm_resets[gb] == c.grbm && r2.card.grbm_resets[gb + 1] == 0);
+    CHECK(r2.card.srbm_resets.size() == sb + 2 && r2.card.srbm_resets[sb] == c.srbm && r2.card.srbm_resets[sb + 1] == 0);
+  }
+
+  // A reset that does not bring the CP back: the ring test fails, the engine is left stopped.
+  GfxRig r3;
+  AmdGfx8 g3(r3.card, r3.clock);
+  CHECK(g3.start(r3.memory()) == AmdGfx8::Result::Ok);
+  r3.card.hung = true;
+  r3.card.reset_fails = true;
+  CHECK(!g3.submit_ib(r3.ib_gpu, 256, 2000) && g3.wedged());
+  CHECK(g3.recover(2000) == AmdGfx8::Result::RingTestFailed && !g3.running() && !g3.submit_ib(r3.ib_gpu, 256));
+  // ...and when it can, a later try works.
+  r3.card.reset_fails = false;
+  CHECK(g3.recover() == AmdGfx8::Result::Ok && g3.running() && g3.recoveries() == 2);
+}
+
 int main() {
   if (!g_files.load()) {
     printf("the firmware files are missing (run from the repository root)\n");
@@ -939,6 +1028,7 @@ int main() {
   test_config_refusals();
   test_ring_wrap_and_stop();
   test_interrupt_sources();
+  test_recover();
   test_ecc_and_sq_interrupts();
   test_end_to_end();
   printf(g_failed ? "AmdGfx8Test: %d FAILED\n" : "AmdGfx8Test: all passed\n", g_failed);

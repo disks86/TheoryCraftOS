@@ -27,6 +27,10 @@ namespace script {
 
 // Compiles `program` (a Block node from parse_program). The code returns the value of the last expression statement. False with *error set when
 // the program cannot be compiled (too many nested functions, ...).
-bool compile_program(Vm& vm, Node* program, FunctionCode** out, String* error, bool library = false);
+bool compile_program(Vm& vm, Node* program, FunctionCode** out, String* error, bool library = false, bool local_scope = false);   // local_scope: strict code keeps its variables to itself (eval)
+
+// Compiles the program of a direct eval to run inside the variables described by `scope` (see Opc::EvalScope): the code is meant to be made into a closure
+// in the Env where the eval was called.
+bool compile_eval_program(Vm& vm, Node* program, const EvalScope& scope, FunctionCode** out, String* error);
 
 }  // namespace script

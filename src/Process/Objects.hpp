@@ -132,6 +132,11 @@ class ObjectManager {
   // The memory of the section for AddressSpace::map_shared(); false if there is no such section.
   bool section_memory(uint32_t id, uint8_t** storage, uint64_t* size, SharedMemory** owner);
   bool section_info(uint32_t id, SectionInfo* out);
+  // Is there a section (a mapping handle or a view) of the file at this path in the OS file system? A file in that state cannot be truncated, deleted or renamed.
+  // 0: none, 1: a data section, 2: an image section.
+  uint32_t file_has_section(StringView host_path);
+  // An image section gets a view: was there one before?
+  bool section_note_image_view(uint32_t id);
   void flush_section(uint32_t id);
   void flush_section_at(uint32_t index);      // (by its index among the sections)
   // How many views and handles keep the section alive (for the mapping side: see SharedMemory).
@@ -142,6 +147,18 @@ class ObjectManager {
   LockResult lock_range_locked(StringView path, const void* owner, uint64_t offset, uint64_t length, bool exclusive);      // (the lock must be held)
   bool unlock_range(StringView path, const void* owner, uint64_t offset, uint64_t length);
   void unlock_all(const void* owner);      // the open file is gone
+
+  // --- sharing of files (the access an open file has and the access it lets others have): a new open fails with a sharing violation if the access it wants is not shared by an
+  // open file of the same path, or if it shares less than the access an open file already has. `access` and `share` use ShareBits. Opens that want none of the three (attribute
+  // queries) neither conflict nor count.
+  static constexpr uint32_t kShareRead = 1, kShareWrite = 2, kShareDelete = 4;
+  enum class ShareResult { Granted, Violation, Full };
+  ShareResult share_acquire(StringView path, const void* owner, uint32_t access, uint32_t share);      // (owner null: only check)
+  // Would an open wanting `access` with everything shared be allowed? (Deleting a file, renaming it.) Takes the lock itself.
+  bool share_allows(StringView path, uint32_t access);
+  void share_release(const void* owner);      // the open file is gone
+  // The open files of `path` (at most `capacity` of them are written to `owners`); how many there are.
+  uint32_t share_owners(StringView path, const void** owners, uint32_t capacity);
 
   // --- job objects (kind Job: create() and open() make and find them). A job groups processes: its limits (active process count, kill on close, breakaway) are enforced and
   // its members can be ended together. A process belongs to at most one job; the processes it starts join the same job. Members are ended by a flag that they see themselves
@@ -266,7 +283,7 @@ class ObjectManager {
   void job_flag_all_locked(Job& j, uint32_t code);
   Pipe* pipe_of(uint32_t id);      // (locked)
   void free_pipe_locked(Object& o);
-  static constexpr uint32_t kMaxPipes = 128, kMaxSections = 64, kMaxLocks = 256;
+  static constexpr uint32_t kMaxPipes = 128, kMaxSections = 64, kMaxLocks = 256, kMaxShares = 1024;
 
   struct Watch {
     bool used = false;
@@ -289,6 +306,8 @@ class ObjectManager {
   Pipe* pipes_ = nullptr;      // kMaxPipes of them, made when the first pipe is
   struct RangeLock;
   RangeLock* locks_ = nullptr;      // kMaxLocks of them, made with the first
+  struct ShareEntry;
+  ShareEntry* shares_ = nullptr;      // kMaxShares of them, made with the first
   Section* sections_ = nullptr;      // kMaxSections, made with the first section
   Job* jobs_ = nullptr;              // kJobMaxJobs, made with the first job (never moved: job_kill_for() reads it without the lock)
   uint32_t pending_kills_ = 0;       // members flagged to end that have not ended yet (atomic)

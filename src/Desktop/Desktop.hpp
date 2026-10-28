@@ -18,7 +18,7 @@
 
 // The desktop shell: a full-screen root window holding the desktop surface - where the window manager
 // stacks application windows - and a taskbar along the bottom with the Start button (its menu opens
-// upwards), the window switcher in the space in between, and the clock. The Start menu offers "File Explorer", "Computer Manager", "Text Editor", "Terminal", "Calculator", "Paint", "Media Player", "3D Test",
+// upwards), the window switcher in the space in between, and the clock. The Start menu offers "File Explorer", "Computer Manager", "Text Editor", "Terminal", "Calculator", "Calendar", "Paint", "Media Player", "3D Test",
 // and "About" (ordinary windows; a second File Explorer, Text Editor or Paint opens a new window next to the first, as many as wanted,
 // and files can be dragged from one explorer to another or onto an editor) and "Shut Down...", which asks for confirmation in a modal dialog and then only
 // requests the shutdown (shutdown_requested()): the boot code owns the hardware and does the orderly
@@ -37,6 +37,8 @@
 #include "Desktop/Graphics3DTest.hpp"
 #include "Desktop/MediaPlayer.hpp"
 #include "Desktop/Calculator.hpp"
+#include "Desktop/Calendar.hpp"
+#include "Desktop/CalendarStore.hpp"
 #include "Desktop/Notepad.hpp"
 #include "Database/DatabaseManager.hpp"
 #include "Desktop/DatabaseQuery.hpp"
@@ -87,7 +89,7 @@ class Desktop {
  public:
   static constexpr int32_t kTaskbarHeight = 32;
   // What gui::Frame::app_kind() says about a program's windows.
-  enum AppKind : uint8_t { kAppNone, kAppExplorer, kAppEditor, kAppPaint, kAppTerminal, kAppMedia, kAppSheet, kAppDatabase, kAppBrowser, kAppCalculator };
+  enum AppKind : uint8_t { kAppNone, kAppExplorer, kAppEditor, kAppPaint, kAppTerminal, kAppMedia, kAppSheet, kAppDatabase, kAppBrowser, kAppCalculator, kAppCalendar };
 
   // The devices may be null (a machine without a mouse still shows the desktop).
   Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& renderer, hardware::IKeyboard* keyboard,
@@ -203,6 +205,15 @@ class Desktop {
   Calculator* open_calculator(gui::TabFrame* into = nullptr);
   Calculator& calculator() { return calculator_; }
   uint32_t calculator_count() const;
+  // Opens a calendar window: the first one is calendar() (when that is closed), further ones are made as needed and go away when closed.
+  Calendar* open_calendar(gui::TabFrame* into = nullptr);
+  Calendar& calendar() { return calendar_; }
+  uint32_t calendar_count() const;
+  // The appointments of the calendar, kept in /AppStore/Calendar once set_file_system() has been called (before that, in memory only).
+  CalendarStore& calendar_store() { return *calendar_store_; }
+  // Shows a toast for each appointment whose reminder is due at `now_minutes` (local minutes since 1970-01-01 00:00; see local_minutes()), once each. The desktop does
+  // this by itself every minute while its clock is known; returns how many toasts were posted.
+  uint32_t announce_calendar(int64_t now_minutes);
   ComputerManager& computer_manager() { return computer_manager_; }
   // The machine's figures for the computer manager (nullptr: none). It must outlive the desktop.
   void set_system_monitor(ISystemMonitor* monitor) { computer_manager_.set_monitor(monitor); }
@@ -290,6 +301,9 @@ class Desktop {
   static bool on_shortcut(void* self, const gui::KeyArgs& args);
   static void on_terminal(void* self, gui::Control&);
   static void on_calculator(void* self, gui::Control&);
+  static void on_calendar(void* self, gui::Control&);
+  static void on_calendar_toast(void* self, gui::Control&);
+  static int64_t calendar_time(void* self);
   static void on_explorer_properties(void* self, gui::Control&);
   static void on_new_terminal(void* self, gui::Control&);
   static void on_explorer_file(void* self, gui::Control&);
@@ -327,6 +341,7 @@ class Desktop {
   void setup_paint(Paint& paint);
   void setup_terminal(Terminal& terminal);
   void setup_calculator(Calculator& calculator);
+  void setup_calendar(Calendar& calendar);
   void reap_closed();
   // Opens a program window of kind `app` (a kApp... value) in `into` or a window of its own, showing `path` if that still exists.
   gui::Frame* open_app(uint8_t app, gui::TabFrame* into, StringView path);
@@ -374,6 +389,8 @@ class Desktop {
   DesktopRtcAudio rtc_audio_;   // the microphone and speaker for its pages' WebRTC (after the notifications: it asks its questions through them)
   Terminal terminal_;
   Calculator calculator_;
+  UniquePointer<CalendarStore> calendar_store_;   // (before the calendar windows, which show it)
+  Calendar calendar_;
   MediaPlayer media_player_;
   Graphics3DTest graphics_test_;
   gui::MessageDialog display_confirm_dialog_;   // "keep these display settings?"
@@ -395,6 +412,7 @@ class Desktop {
   UniquePointer<BrowserStore> browser_store_;
   uint64_t saved_cookie_version_ = 0, saved_storage_version_ = 0, saved_cache_version_ = 0, saved_worker_version_ = 0, last_browser_save_us_ = 0;
   bool browser_data_restored_ = false;
+  int64_t calendar_checked_ = -1;   // the minute the reminders were last looked at
   List<UniquePointer<FileExplorer>> extra_explorers_;
   List<UniquePointer<Notepad>> extra_notepads_;
   List<UniquePointer<Paint>> extra_paints_;
@@ -403,6 +421,7 @@ class Desktop {
   List<UniquePointer<WebBrowser>> extra_browsers_;
   List<UniquePointer<Terminal>> extra_terminals_;
   List<UniquePointer<Calculator>> extra_calculators_;
+  List<UniquePointer<Calendar>> extra_calendars_;
   List<UniquePointer<gui::TabFrame>> hosts_;   // the tabbed windows
   bool reap_needed_ = false;
   hardware::SystemMonitors* monitors_ = nullptr;

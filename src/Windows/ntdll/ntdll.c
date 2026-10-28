@@ -355,9 +355,41 @@ static void loader_lock(void) {
 }
 static void loader_unlock(void) { if (--g_loader_depth == 0) __sync_lock_release(&g_loader_owner); }
 
+/* LdrLockLoaderLock(flags, &disposition, &cookie): flag 1 raises on error, flag 2 only tries. Disposition 1: taken, 2: someone else holds it (try only). The cookie is
+ * what LdrUnlockLoaderLock wants back (it is the owner: a different thread may not release the lock). */
+EXPORT NTSTATUS NTAPI LdrLockLoaderLock(ULONG flags, ULONG *disposition, ULONG_PTR *cookie) {
+  if (disposition) *disposition = 0;
+  if (cookie) *cookie = 0;
+  if (flags & ~3u) return (NTSTATUS)0xC00000EF;
+  if (!cookie) return (NTSTATUS)0xC00000F1;
+  if ((flags & 2) && !disposition) return (NTSTATUS)0xC00000F0;
+  const ULONG_PTR me = TEB_CLIENT_THREAD(NtCurrentTeb());
+  if ((flags & 2) && g_loader_owner != 0 && g_loader_owner != me) { *disposition = 2; return STATUS_SUCCESS; }
+  loader_lock();
+  if (disposition) *disposition = 1;
+  *cookie = me | 1;
+  return STATUS_SUCCESS;
+}
+EXPORT NTSTATUS NTAPI LdrUnlockLoaderLock(ULONG flags, ULONG_PTR cookie) {
+  if (flags & ~1u) return (NTSTATUS)0xC00000EF;
+  if (cookie == 0) return STATUS_SUCCESS;
+  if (g_loader_owner != (cookie & ~(ULONG_PTR)1) || g_loader_depth == 0) return (NTSTATUS)0xC00000F0;
+  loader_unlock();
+  return STATUS_SUCCESS;
+}
+
 static int is_program(const LDR_DATA_TABLE_ENTRY *m) { return NtCurrentPeb()->ImageBaseAddress == m->DllBase; }
 
+#define LDRP_MAPPED_ONLY 0x80000000u      /* loaded with DONT_RESOLVE_DLL_REFERENCES: no imports, no thread-local data, no entry point */
+#define LDRP_PROCESS_DETACH_CALLED 0x00080000u      /* the library has been told the process (or its use of it) ends: once only */
 static BOOL notify_module(LDR_DATA_TABLE_ENTRY *m, DWORD reason, PVOID reserved) {
+  if (m->Flags & LDRP_MAPPED_ONLY) return TRUE;
+  if (reason == DLL_PROCESS_DETACH) {
+    if (m->Flags & LDRP_PROCESS_DETACH_CALLED) return TRUE;
+    m->Flags |= LDRP_PROCESS_DETACH_CALLED;
+  } else if (reason == DLL_PROCESS_ATTACH) {
+    m->Flags &= ~LDRP_PROCESS_DETACH_CALLED;
+  }
   const int about_threads = reason == DLL_THREAD_ATTACH || reason == DLL_THREAD_DETACH;
   if (about_threads && !is_program(m) && (m->Flags & LDRP_DONT_CALL_FOR_THREADS)) return TRUE;
   const BYTE *image = (const BYTE *)m->DllBase;
@@ -391,19 +423,57 @@ static void notify_all_modules(DWORD reason, PVOID reserved, int forward) {
 }
 
 static volatile LONG g_process_ending;
+static void fls_destroy_current(int free_structure);
+static volatile LONG g_heap_lock;
+static volatile LONG g_fls_lock;
+static void fls_thread_begins(void);
+/* The libraries are told the process is ending (once): this thread's fiber local storage goes first, then every library's entry point and TLS callbacks get
+ * DLL_PROCESS_DETACH with a non-NULL reserved. The libraries stay loaded; the process is not over. */
+EXPORT void NTAPI LdrShutdownProcess(void) {
+  if (__sync_bool_compare_and_swap(&g_process_ending, 0, 1)) {
+    fls_destroy_current(0);
+    notify_all_modules(DLL_PROCESS_DETACH, (PVOID)1, 0);
+  }
+}
+
+/* ExitProcess: the other threads end first (with the exit code), then the libraries are told, then the process goes. */
+/* The PEB lock (RtlAcquirePebLock): one recursive lock for the process-wide data. */
+static RTL_CRITICAL_SECTION g_peb_lock = { .LockCount = -1 };
+NTSTATUS NTAPI RtlEnterCriticalSection(PRTL_CRITICAL_SECTION cs);
+NTSTATUS NTAPI RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION cs);
+BOOLEAN NTAPI RtlTryEnterCriticalSection(PRTL_CRITICAL_SECTION cs);
+EXPORT void NTAPI RtlAcquirePebLock(void) { RtlEnterCriticalSection(&g_peb_lock); }
+EXPORT void NTAPI RtlReleasePebLock(void) { RtlLeaveCriticalSection(&g_peb_lock); }
+EXPORT BOOLEAN NTAPI RtlTryAcquirePebLock(void) { return RtlTryEnterCriticalSection(&g_peb_lock); }
+
+/* ExitProcess waits for whoever holds the PEB lock or the heap lock (a thread blocked inside either keeps the process alive), and keeps the PEB lock itself: the
+ * other threads are ended after that, so none of them can hold a lock the shutdown needs. */
 EXPORT void NTAPI RtlExitUserProcess(NTSTATUS status) {
-  if (__sync_bool_compare_and_swap(&g_process_ending, 0, 1)) notify_all_modules(DLL_PROCESS_DETACH, (PVOID)1, 0);      /* (1: the process is ending) */
+  if (!g_process_ending) {
+    RtlAcquirePebLock();
+    while (g_heap_lock) NtYieldExecution();
+    NtTerminateProcess(NULL, status);
+    g_heap_lock = 0;      /* (a thread that was ended inside the heap or the fiber storage cannot give its lock back; the process is going away) */
+    g_fls_lock = 0;
+  }
+  LdrShutdownProcess();
   for (;;) NtTerminateProcess(NtCurrentProcess(), status);
 }
 
+/* Is the process shutting down (ExitProcess has begun to tell the libraries)? */
+EXPORT BOOLEAN NTAPI RtlDllShutdownInProgress(void) { return g_process_ending != 0; }
+
 /* The thread ends (the libraries and the program are told); the process ends with its last thread. */
 EXPORT void NTAPI RtlExitUserThread(NTSTATUS status) {
+  fls_destroy_current(0);
   if (!g_process_ending) notify_all_modules(DLL_THREAD_DETACH, NULL, 0);
+  fls_destroy_current(1);
   for (;;) NtTerminateThread((HANDLE)(LONG_PTR)-2, status);
 }
 
 /* New threads begin here (the kernel passes the thread's function and parameter in the first two argument registers); the function's return value is the thread's exit code. */
 EXPORT void NTAPI TcosThreadStart(LPTHREAD_START_ROUTINE start, PVOID parameter) {
+  fls_thread_begins();
   notify_all_modules(DLL_THREAD_ATTACH, NULL, 1);
   RtlExitUserThread((NTSTATUS)start(parameter));
 }
@@ -615,9 +685,21 @@ EXPORT PVOID NTAPI RtlCreateHeap(ULONG flags, PVOID base, SIZE_T reserve, SIZE_T
 }
 
 /* The heaps are shared by the threads of the process: one spin lock (a waiting thread gives its time slice to the holder) covers all of them. */
-static volatile LONG g_heap_lock;
-static void heap_lock(void) { while (__sync_lock_test_and_set(&g_heap_lock, 1)) NtYieldExecution(); }
-static void heap_unlock(void) { __sync_lock_release(&g_heap_lock); }
+/* The heap lock is recursive (RtlLockHeap holds it across calls of the same thread). */
+static volatile ULONG_PTR g_heap_owner;
+static LONG g_heap_depth;
+static void heap_lock(void) {
+  const ULONG_PTR me = TEB_CLIENT_THREAD(NtCurrentTeb());
+  if (g_heap_lock && g_heap_owner == me) { ++g_heap_depth; return; }
+  while (__sync_lock_test_and_set(&g_heap_lock, 1)) NtYieldExecution();
+  g_heap_owner = me;
+  g_heap_depth = 1;
+}
+static void heap_unlock(void) {
+  if (--g_heap_depth > 0) return;
+  g_heap_owner = 0;
+  __sync_lock_release(&g_heap_lock);
+}
 
 static PVOID heap_alloc(PVOID heap, ULONG flags, SIZE_T bytes) {
   Heap *h = heap;
@@ -794,8 +876,8 @@ EXPORT PVOID NTAPI RtlDestroyHeap(PVOID heap) {
   return NULL;
 }
 
-EXPORT BOOLEAN NTAPI RtlLockHeap(PVOID heap) { (void)heap; return TRUE; }
-EXPORT BOOLEAN NTAPI RtlUnlockHeap(PVOID heap) { (void)heap; return TRUE; }
+EXPORT BOOLEAN NTAPI RtlLockHeap(PVOID heap) { (void)heap; heap_lock(); return TRUE; }
+EXPORT BOOLEAN NTAPI RtlUnlockHeap(PVOID heap) { (void)heap; if (g_heap_lock && g_heap_owner == TEB_CLIENT_THREAD(NtCurrentTeb())) heap_unlock(); return TRUE; }
 EXPORT ULONG NTAPI RtlCompactHeap(PVOID heap, ULONG flags) { (void)heap; (void)flags; return 0; }
 EXPORT NTSTATUS NTAPI RtlSetHeapInformation(PVOID heap, ULONG info_class, PVOID info, SIZE_T length) { (void)heap; (void)info_class; (void)info; (void)length; return STATUS_SUCCESS; }
 EXPORT NTSTATUS NTAPI RtlQueryHeapInformation(PVOID heap, ULONG info_class, PVOID info, SIZE_T length, PSIZE_T returned) {
@@ -849,6 +931,8 @@ static PVOID process_heap(void) {
   return peb->ProcessHeap;
 }
 EXPORT PVOID NTAPI RtlProcessHeap(void) { return process_heap(); }
+
+#include "fls.inc"
 
 #include "rtl.inc"
 #include "libc.inc"
@@ -917,6 +1001,7 @@ EXPORT void NTAPI RtlUserThreadStart(ProgramEntry entry, PVOID parameter) {
   PEB *peb = NtCurrentPeb();
   PEB_LDR_DATA *ldr = peb->Ldr;
   process_heap();
+  fls_thread_begins();
   if (ldr) {
     loader_lock();
     /* the libraries in the order they depend on each other, then the program's TLS callbacks, then the program */
@@ -957,7 +1042,12 @@ static void ldr_remove(LIST_ENTRY *e) {
 
 /* A loader entry for a library the kernel mapped: listed in the three module lists. `path` (a UNICODE_STRING) is the file the program asked for; a library that came in
  * because another imports it is in C:\Windows\System32. */
-static LDR_DATA_TABLE_ENTRY *ldr_add(const LoadRecord *record, const UNICODE_STRING *path) {
+static LDR_DATA_TABLE_ENTRY *ldr_add(const LoadRecord *record, const UNICODE_STRING *path, int mapped_only) {
+  {      /* a program image loaded as a library is only mapped, like a DONT_RESOLVE load */
+    const BYTE *image = (const BYTE *)(ULONG_PTR)record->base;
+    const ULONG nt = *(const ULONG *)(image + 0x3C);
+    if (!(*(const USHORT *)(image + nt + 22) & 0x2000)) mapped_only = 1;      /* IMAGE_FILE_DLL */
+  }
   static const WCHAR system32[] = {'C', ':', '\\', 'W', 'i', 'n', 'd', 'o', 'w', 's', '\\', 'S', 'y', 's', 't', 'e', 'm', '3', '2', '\\', 0};
   size_t_ base_length = strlen(record->name);
   size_t_ full_length = path ? path->Length / 2 : 20 + base_length;
@@ -986,15 +1076,71 @@ static LDR_DATA_TABLE_ENTRY *ldr_add(const LoadRecord *record, const UNICODE_STR
   e->BaseDllName.Buffer = full + (full_length - base_length);
   e->BaseDllName.Length = (USHORT)(base_length * 2);
   e->BaseDllName.MaximumLength = (USHORT)(base_length * 2 + 2);
-  e->Flags = 0x4;      /* LDRP_IMAGE_DLL */
+  e->Flags = 0x4 | (mapped_only ? LDRP_MAPPED_ONLY : 0);      /* LDRP_IMAGE_DLL */
   e->LoadCount = 1;
+  {      /* TlsIndex: -1 when the image has thread-local data that was set up */
+    const BYTE *image = (const BYTE *)e->DllBase;
+    const ULONG nt = *(const ULONG *)(image + 0x3C);
+    e->TlsIndex = (!mapped_only && *(const ULONG *)(image + nt + 24 + 0x70 + 9 * 8) != 0) ? 0xFFFF : 0;
+  }
+  if (mapped_only) e->EntryPoint = NULL;
   PEB_LDR_DATA *ldr = NtCurrentPeb()->Ldr;
   ldr_append(&ldr->InLoadOrderModuleList, &e->InLoadOrderLinks);
   ldr_append(&ldr->InMemoryOrderModuleList, &e->InMemoryOrderLinks);
   ldr_append(&ldr->InInitializationOrderModuleList, &e->InInitializationOrderLinks);
   return e;
 }
+/* DLL notifications (LdrRegisterDllNotification): the callbacks are told when a library is loaded or unloaded, with the loader lock held. */
+typedef struct { ULONG Flags; const UNICODE_STRING *FullDllName, *BaseDllName; PVOID DllBase; ULONG SizeOfImage; } LdrDllNotificationData;
+typedef void (NTAPI *LdrDllNotificationFunction)(ULONG reason, const LdrDllNotificationData *data, PVOID context);
+#define MAX_DLL_NOTIFICATIONS 16
+static struct { LdrDllNotificationFunction function; PVOID context; } g_dll_notifications[MAX_DLL_NOTIFICATIONS];
+static void notify_dll_event(ULONG reason, LDR_DATA_TABLE_ENTRY *e) {
+  LdrDllNotificationData data;
+  data.Flags = 0;
+  data.FullDllName = &e->FullDllName;
+  data.BaseDllName = &e->BaseDllName;
+  data.DllBase = e->DllBase;
+  data.SizeOfImage = e->SizeOfImage;
+  for (ULONG i = 0; i < MAX_DLL_NOTIFICATIONS; ++i) if (g_dll_notifications[i].function) g_dll_notifications[i].function(reason, &data, g_dll_notifications[i].context);
+}
+EXPORT NTSTATUS NTAPI LdrRegisterDllNotification(ULONG flags, LdrDllNotificationFunction function, PVOID context, PVOID *cookie) {
+  if (flags || !function || !cookie) return STATUS_INVALID_PARAMETER;
+  loader_lock();
+  for (ULONG i = 0; i < MAX_DLL_NOTIFICATIONS; ++i) {
+    if (g_dll_notifications[i].function) continue;
+    g_dll_notifications[i].function = function;
+    g_dll_notifications[i].context = context;
+    *cookie = &g_dll_notifications[i];
+    loader_unlock();
+    return STATUS_SUCCESS;
+  }
+  loader_unlock();
+  return STATUS_NO_MEMORY;
+}
+EXPORT NTSTATUS NTAPI LdrUnregisterDllNotification(PVOID cookie) {
+  loader_lock();
+  for (ULONG i = 0; i < MAX_DLL_NOTIFICATIONS; ++i) {
+    if (cookie != &g_dll_notifications[i] || !g_dll_notifications[i].function) continue;
+    g_dll_notifications[i].function = NULL;
+    loader_unlock();
+    return STATUS_SUCCESS;
+  }
+  loader_unlock();
+  return STATUS_INVALID_PARAMETER;
+}
+EXPORT NTSTATUS NTAPI LdrFindEntryForAddress(PVOID address, LDR_DATA_TABLE_ENTRY **entry) {
+  PEB_LDR_DATA *ldr = NtCurrentPeb()->Ldr;
+  if (!ldr) return STATUS_NO_MORE_ENTRIES;
+  for (LIST_ENTRY *e = ldr->InLoadOrderModuleList.Flink; e != &ldr->InLoadOrderModuleList; e = e->Flink) {
+    LDR_DATA_TABLE_ENTRY *m = (LDR_DATA_TABLE_ENTRY *)e;
+    if ((BYTE *)address >= (BYTE *)m->DllBase && (BYTE *)address < (BYTE *)m->DllBase + m->SizeOfImage) { *entry = m; return STATUS_SUCCESS; }
+  }
+  return STATUS_NO_MORE_ENTRIES;
+}
+
 static void ldr_forget(LDR_DATA_TABLE_ENTRY *e) {
+  notify_dll_event(2 /* LDR_DLL_NOTIFICATION_REASON_UNLOADED */, e);
   ldr_remove(&e->InLoadOrderLinks);
   ldr_remove(&e->InMemoryOrderLinks);
   ldr_remove(&e->InInitializationOrderLinks);
@@ -1019,12 +1165,13 @@ static void ldr_release(PVOID base, int detach) {
 
 /* Loads the DLL file at `name` (a Win32 path; or just a library's name when it is loaded already) and what it imports; calls the entry points. */
 EXPORT NTSTATUS NTAPI LdrLoadDll(PWSTR search_path, PULONG flags, PUNICODE_STRING name, PVOID *handle) {
-  (void)search_path; (void)flags;
+  (void)search_path;
+  const int mapped_only = flags && (*flags & 2);      /* LDR_DONT_RESOLVE_REFS */
   LoadRecord records[MAX_LOAD_RECORDS];
   ULONG count = 0;
   PVOID base = NULL;
   loader_lock();
-  NTSTATUS status = NtLoadModule(name, &base, records, MAX_LOAD_RECORDS, &count);
+  NTSTATUS status = NtLoadModule(name, &base, records, MAX_LOAD_RECORDS, &count, mapped_only ? 1 : 0);
   if (!NT_SUCCESS(status)) { loader_unlock(); return status; }
   if (count == 0) {      /* it was there: one more use (or a library the process started with) */
     *handle = base;
@@ -1034,12 +1181,13 @@ EXPORT NTSTATUS NTAPI LdrLoadDll(PWSTR search_path, PULONG flags, PUNICODE_STRIN
   LDR_DATA_TABLE_ENTRY *added[MAX_LOAD_RECORDS];
   ULONG listed = 0;
   for (; listed < count; ++listed) {
-    added[listed] = ldr_add(&records[listed], records[listed].base == (ULONG64)(ULONG_PTR)base ? name : NULL);
+    added[listed] = ldr_add(&records[listed], records[listed].base == (ULONG64)(ULONG_PTR)base ? name : NULL, mapped_only);
     if (!added[listed]) break;
   }
   ULONG attached = 0;
   if (listed == count) {
     for (; attached < count; ++attached) if (!notify_module(added[attached], DLL_PROCESS_ATTACH, NULL)) break;
+    if (attached == count) for (ULONG i = 0; i < count; ++i) notify_dll_event(1 /* LDR_DLL_NOTIFICATION_REASON_LOADED */, added[i]);
   }
   if (listed == count && attached == count) {
     *handle = base;
@@ -1058,7 +1206,7 @@ EXPORT NTSTATUS NTAPI LdrUnloadDll(PVOID base) {
   LDR_DATA_TABLE_ENTRY *e = ldr_find_base(base);
   NTSTATUS status = STATUS_SUCCESS;
   if (!e) status = STATUS_DLL_NOT_FOUND;
-  else if (e->LoadCount != LDR_STATIC) ldr_release(base, 1);
+  else if (e->LoadCount != LDR_STATIC && !g_process_ending) ldr_release(base, 1);      /* (nothing is unloaded while the process ends) */
   loader_unlock();
   return status;
 }

@@ -328,6 +328,7 @@ add_executable(BOOTX64
   src/Dom/Selector.cpp
   src/Dom/Form.cpp
   src/Dom/Entities.cpp
+  src/Dom/LegacyEncodings.cpp
   src/Dom/HtmlBuilder.cpp
   src/Regex/Regex.cpp
   src/Script/Number.cpp
@@ -360,6 +361,9 @@ add_executable(BOOTX64
   src/Browser/HttpPageLoader.cpp
   src/Network/Tls/CaBundle.cpp
   src/Network/Tls/CaBundle.S
+  src/Graphics/Logo/Logo.cpp
+  src/Graphics/Logo/LogoData.cpp
+  src/Graphics/Logo/Logo.S
   src/Database/SqlText.cpp
   src/Database/Local/LocalCatalog.cpp
   src/Database/Local/LocalSql.cpp
@@ -444,6 +448,8 @@ add_executable(BOOTX64
   src/Desktop/Shell.cpp
   src/Desktop/Terminal.cpp
   src/Desktop/Calculator.cpp
+  src/Desktop/Calendar.cpp
+  src/Desktop/CalendarStore.cpp
   src/Desktop/FileProperties.cpp
   src/Desktop/CopyProgressDialog.cpp
   src/Desktop/DirectoryListing.cpp
@@ -600,6 +606,7 @@ add_executable(BOOTX64
   src/Process/WindowsMailslots.cpp
   src/Process/WindowsRegistry.cpp
   src/Process/RegistryTree.cpp
+  src/Process/DosWildcard.cpp
   src/Process/Objects.cpp
   src/Process/ModuleLoader.cpp
   src/Process/LinuxSyscalls.cpp
@@ -666,6 +673,12 @@ add_executable(BOOTX64
   src/Hardware/GraphicsProcessingUnit/AMD/AmdGmc8.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdIh3.cpp
   src/Hardware/Bus/Pci/PciMsi.cpp
+  src/Hardware/GraphicsProcessingUnit/AMD/AmdVbios.cpp
+  src/Hardware/GraphicsProcessingUnit/AMD/AtomBios.cpp
+  src/Hardware/GraphicsProcessingUnit/AMD/AtomConnectors.cpp
+  src/Hardware/GraphicsProcessingUnit/AMD/AtomI2c.cpp
+  src/Hardware/GraphicsProcessingUnit/AMD/AmdDdc.cpp
+  src/Hardware/GraphicsProcessingUnit/AMD/AmdAsicReset.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdIrq.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdSdma3.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdDce11.cpp
@@ -780,6 +793,8 @@ add_executable(BOOTX64
 target_include_directories(BOOTX64 PRIVATE src)
 # The root certificates built into the image (.incbin looks for the file from the source folder).
 set_source_files_properties(src/Network/Tls/CaBundle.S PROPERTIES COMPILE_OPTIONS "-I${CMAKE_SOURCE_DIR}" OBJECT_DEPENDS ${CMAKE_SOURCE_DIR}/certs/ca-bundle.pem)
+# The logo built into the image (assets/logo.png).
+set_source_files_properties(src/Graphics/Logo/Logo.S PROPERTIES COMPILE_OPTIONS "-I${CMAKE_SOURCE_DIR}" OBJECT_DEPENDS ${CMAKE_SOURCE_DIR}/assets/logo.png)
 set_target_properties(BOOTX64 PROPERTIES SUFFIX ".efi")
 
 target_compile_options(BOOTX64 PRIVATE
@@ -846,7 +861,7 @@ if(TCOS_ARCH STREQUAL "x86_64")
     COMMAND ${CMAKE_COMMAND} -E make_directory ${WINDOWS_DIR}
     COMMAND ${CMAKE_C_COMPILER} ${WINDOWS_DLL_FLAGS} ${ntdll_stubs} -Wl,--image-base=0x180000000 -Wl,--out-implib=${WINDOWS_DIR}/libntdll.a
             -o ${WINDOWS_DIR}/ntdll.dll ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/ntdll.c
-    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/ntdll.c ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/except.inc ${CMAKE_SOURCE_DIR}/src/Windows/libc_string.inc ${WINDOWS_HEADERS} ${CMAKE_SOURCE_DIR}/src/Windows/stubs/ntdll.inc ${WINDOWS_STUBS_C} ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/services.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/zw.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/rtl.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/libc.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/rtl2.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/status.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/casetab.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/reg.inc
+    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/ntdll.c ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/except.inc ${CMAKE_SOURCE_DIR}/src/Windows/libc_string.inc ${WINDOWS_HEADERS} ${CMAKE_SOURCE_DIR}/src/Windows/stubs/ntdll.inc ${WINDOWS_STUBS_C} ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/services.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/zw.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/rtl.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/libc.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/rtl2.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/status.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/casetab.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/reg.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/fls.inc
     COMMENT "Building ntdll.dll")
   windows_stub_flags(kernel32_stubs kernel32 0)
   add_custom_command(OUTPUT ${WINDOWS_DIR}/kernel32.dll

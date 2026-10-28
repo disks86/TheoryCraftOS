@@ -33,6 +33,7 @@ constexpr uint8_t kTab = 0x2B;
 constexpr uint8_t kSpace = 0x2C;
 constexpr uint8_t kCapsLock = 0x39;
 constexpr uint8_t kDelete = 0x4C;
+constexpr uint8_t kKeypadEnter = 0x58;
 constexpr uint8_t kF1 = 0x3A;         // ... kF12 = 0x45
 constexpr uint8_t kRight = 0x4F;
 constexpr uint8_t kLeft = 0x50;

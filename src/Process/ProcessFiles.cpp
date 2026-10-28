@@ -144,11 +144,65 @@ void ProcessFiles::attach(allocators::IAllocator& allocator, filesystem::IFileSy
   root_prefix_ = root_prefix;
 }
 
+namespace {
+bool equal_ignoring_case(StringView a, StringView b) {
+  if (a.size() != b.size()) return false;
+  for (uint64_t i = 0; i < a.size(); ++i) {
+    const char x = a[i] >= 'A' && a[i] <= 'Z' ? static_cast<char>(a[i] + 32) : a[i], y = b[i] >= 'A' && b[i] <= 'Z' ? static_cast<char>(b[i] + 32) : b[i];
+    if (x != y) return false;
+  }
+  return true;
+}
+}  // namespace
+
+// Windows names do not care about case, the file systems underneath do: each component that is not there as written is looked for in its directory under any case, and
+// the name that is there replaces it. A name that is nowhere stays as written (a file about to be created).
+bool ProcessFiles::fold_case(String* path, uint64_t prefix_size) const {
+  DirectoryEntry probe;
+  if (fs_->stat(path->view(), &probe) != Status::NotFound) return true;      // there as written (or an error that spelling will not cure)
+  String result(*allocator_);
+  if (!result.assign(path->view().first(prefix_size))) return false;
+  uint64_t at = prefix_size;
+  const StringView whole = path->view();
+  while (at < whole.size()) {
+    if (whole[at] == '/') ++at;
+    uint64_t end = at;
+    while (end < whole.size() && whole[end] != '/') ++end;
+    const StringView name = whole.substr(at, end - at);
+    at = end;
+    if (name.empty()) continue;
+    String candidate(*allocator_);
+    if (!candidate.assign(result.view()) || !candidate.push_back('/') || !candidate.append(name)) return false;
+    if (fs_->stat(candidate.view(), &probe) != Status::NotFound) { result.assign(candidate.view()); continue; }
+    String directory_path(*allocator_);
+    if (!directory_path.assign(result.empty() ? StringView("/") : result.view())) return false;
+    UniquePointer<filesystem::IDirectory> directory;
+    bool found = false;
+    if (fs_->open_directory(directory_path.view(), &directory) == Status::Ok) {
+      DirectoryEntry entry;
+      while (directory->next(&entry) == Status::Ok) {
+        if (!equal_ignoring_case(entry.name.view(), name)) continue;
+        if (!result.push_back('/') || !result.append(entry.name.view())) return false;
+        found = true;
+        break;
+      }
+    }
+    if (!found) {      // nothing of that name: the rest stays as written
+      if (!result.push_back('/') || !result.append(name)) return false;
+      if (at < whole.size() && !result.append(whole.substr(at, whole.size() - at))) return false;
+      break;
+    }
+  }
+  return path->assign(result.view());
+}
+
 bool ProcessFiles::host_path(StringView virtual_path, String* out) const {
   if (!fs_ || !allocator_) return false;
   out->clear();
   if (!out->assign(root_prefix_)) return false;
-  return virtual_path == StringView("/") || out->append(virtual_path);
+  if (virtual_path == StringView("/")) return true;
+  if (!out->append(virtual_path)) return false;
+  return style_ != PathStyle::Windows || fold_case(out, root_prefix_.size());
 }
 
 int64_t ProcessFiles::free_slot(uint64_t minimum) const {
@@ -162,7 +216,7 @@ bool ProcessFiles::close(uint64_t slot) {
   closing.kind = slots_[slot].kind;
   closing.object = static_cast<SharedPointer<OpenObject>&&>(slots_[slot].object);
   slots_[slot] = Slot();
-  if (closing.object && closing.object.use_count() == 1) if (ObjectManager* objects = system_objects()) objects->unlock_all(closing.object.get());      // (its byte-range locks go with it)
+  if (closing.object && closing.object.use_count() == 1) if (ObjectManager* objects = system_objects()) { objects->unlock_all(closing.object.get()); objects->share_release(closing.object.get()); }      // (its byte-range locks and its share of the file go with it)
   if (closing.object && closing.object.use_count() == 1 && closing.object->change_watch != 0)
     if (ObjectManager* objects = system_objects()) objects->release(closing.object->change_watch);      // ReadDirectoryChangesW's own watch goes with the handle
   if (closing.object && closing.object.use_count() == 1 && closing.object->delete_on_close) {
@@ -285,11 +339,10 @@ Status ProcessFiles::open(StringView virtual_path, const OpenFlags& flags, uint3
       OpenMode mode = OpenMode::Read;
       if (flags.write) mode = OpenMode::ReadWrite;
       if (!exists) mode = OpenMode::CreateOrOpen;
-      else if (flags.create && flags.truncate) mode = OpenMode::CreateTruncate;
       status = fs_->open_file(path.view(), mode, &object->file);
       if (status != Status::Ok) return status;
       if (!exists && created) *created = true;
-      if (exists && flags.truncate && mode != OpenMode::CreateTruncate && object->file->resize(0) != Status::Ok) return Status::IoError;
+      if (exists && flags.truncate && object->file->resize(0) != Status::Ok) return Status::IoError;      // (truncated through the open file: the file system refuses to re-create a file that is open elsewhere)
       object->readable = flags.read;
       object->writable = flags.write;
       object->append = flags.append;
@@ -328,7 +381,14 @@ Status ProcessFiles::remove(StringView virtual_path) {
 Status ProcessFiles::rename(StringView from, StringView to) {
   if (!fs_) return Status::NotFound;
   String a(*allocator_), b(*allocator_);
-  if (!host_path(from, &a) || !host_path(to, &b)) return Status::NotFound;
+  if (!host_path(from, &a)) return Status::NotFound;
+  if (equal_ignoring_case(from, to)) {      // the same file under a new spelling: the directory stays, the last name changes
+    const uint64_t cut = a.view().rfind('/');
+    const uint64_t name_at = to.rfind('/');
+    if (cut == StringView::npos || name_at == StringView::npos || !b.assign(a.view().first(cut + 1)) || !b.append(to.substr(name_at + 1, to.size() - name_at - 1))) return Status::NotFound;
+  } else if (!host_path(to, &b)) {
+    return Status::NotFound;
+  }
   if (from == StringView("/")) return Status::Busy;
   return fs_->rename(a.view(), b.view());
 }
@@ -400,6 +460,7 @@ Status ProcessFiles::next_entry(OpenObject& object, DirectoryEntry* entry) {
     object.has_pending = false;
     return Status::Ok;
   }
+  if (object.directory_phase == 0 && style_ == PathStyle::Windows && object.path.view() == StringView("/")) object.directory_phase = 2;      // the root of a drive has no "." and ".."
   if (object.directory_phase < 2) {
     *entry = DirectoryEntry();
     entry->type = NodeType::Directory;
@@ -422,6 +483,19 @@ bool prepare_program_folders(filesystem::IFileSystem& fs) {
     }
     const Status status = fs.create_directory(folder);
     ok = ok && (status == Status::Ok || status == Status::AlreadyExists);
+  }
+  // The initialisation files old programs look for in the Windows directory.
+  static const struct { const char* path; const char* text; } kFiles[] = {
+    {"/Windows/Windows/win.ini", "; for 16-bit app support\r\n[fonts]\r\n[extensions]\r\n[mci extensions]\r\n[files]\r\n[Mail]\r\nMAPI=1\r\n"},
+    {"/Windows/Windows/system.ini", "; for 16-bit app support\r\n[386Enh]\r\n[drivers]\r\n[mci]\r\n"},
+  };
+  for (const auto& file : kFiles) {
+    DirectoryEntry entry;
+    if (fs.stat(file.path, &entry) == Status::Ok) continue;
+    UniquePointer<filesystem::IFile> handle;
+    if (fs.open_file(file.path, filesystem::OpenMode::CreateOrOpen, &handle) != Status::Ok) { ok = false; continue; }
+    uint64_t done = 0;
+    handle->write(0, StringView(file.text).bytes(), &done);
   }
   return ok;
 }

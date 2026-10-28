@@ -47,6 +47,7 @@ struct Token {
   bool newline_before = false;
   uint32_t line = 1;
   bool bigint = false;    // a number written 123n (text holds its digits)
+  bool legacy_octal = false;   // a number written 017 or 08, a string with \07 or \8 in it
 };
 
 bool is_ident_start(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c == '$' || static_cast<uint8_t>(c) >= 0x80; }
@@ -237,7 +238,18 @@ class Parser {
       case 'b': out->push_back('\b'); break;
       case 'f': out->push_back('\f'); break;
       case 'v': out->push_back('\v'); break;
-      case '0': out->push_back('\0'); break;
+      case '0': case '1': case '2': case '3': case '4': case '5': case '6': case '7': {   // \0 is NUL; \07, \1 .. \377 are the legacy octal escapes
+        uint32_t v = static_cast<uint32_t>(c - '0');
+        if (c != '0' || (peek() >= '0' && peek() <= '9')) legacy_octal_ = true;
+        const int more = c <= '3' ? 2 : 1;
+        for (int i = 0; i < more && peek() >= '0' && peek() <= '7'; ++i) {
+          v = v * 8 + static_cast<uint32_t>(peek() - '0');
+          ++pos_;
+        }
+        append_utf8(v, out);
+        break;
+      }
+      case '8': case '9': legacy_octal_ = true; out->push_back(c); break;
       case '\r': if (peek() == '\n') ++pos_; ++line_; break;
       case '\n': ++line_; break;
       case 'x': {
@@ -308,6 +320,7 @@ class Parser {
     } else if (c == '"' || c == '\'') {
       ++pos_;
       scratch_.clear();
+      legacy_octal_ = false;
       while (!at_end() && peek() != c) {
         if (peek() == '\n') {
           fail("Invalid or unexpected token");
@@ -324,6 +337,7 @@ class Parser {
       if (at_end()) fail("Invalid or unexpected token");
       ++pos_;
       t.kind = T::String;
+      t.legacy_octal = legacy_octal_;
       t.text = arena_.copy(scratch_.view());
     } else if (c == '`') {
       ++pos_;
@@ -358,6 +372,23 @@ class Parser {
         ++pos_;
       }
       return;
+    }
+    if (peek() == '0' && is_digit(peek(1))) {   // 017 is the legacy octal literal (15), 08 and 09 are decimal
+      t->legacy_octal = true;
+      uint64_t end = pos_;
+      bool octal = true;
+      while (end < src_.size() && is_digit(src_[end])) {
+        if (src_[end] > '7') octal = false;
+        ++end;
+      }
+      if (octal) {
+        double v = 0;
+        for (uint64_t i = pos_; i < end; ++i) v = v * 8 + static_cast<double>(src_[i] - '0');
+        pos_ = end;
+        t->number = v;
+        if (is_ident_start(peek())) fail("Invalid or unexpected token");
+        return;
+      }
     }
     auto digits = [&] { while (is_digit(peek()) || (peek() == '_' && is_digit(peek(1)))) ++pos_; };   // (1_000_000)
     digits();
@@ -1293,6 +1324,7 @@ class Parser {
         Node* v = make(NodeKind::Var);
         if (!v) return false;
         v->var_kind = VarKind::Let;
+        v->flags |= kFlagPrologue;
         v->list = sink.head;
         *prologue_tail = v;
         prologue_tail = &v->next;
@@ -1322,7 +1354,11 @@ class Parser {
     in_async_ = is_async;
     in_generator_ = is_generator;
     in_async_generator_ = is_async && is_generator;   // (await becomes a yield the driver of the async generator understands)
+    const bool saved_eval = saw_eval_;
+    saw_eval_ = false;
     Node* b = block();
+    if (b && saw_eval_) b->flags |= kFlagHasEval;
+    saw_eval_ = saved_eval;
     check_this_ = saved_check;
     in_function_ = saved;
     in_async_ = saved_async;
@@ -2473,6 +2509,7 @@ class Parser {
         Node* c = make(NodeKind::Call);
         if (!c) return nullptr;
         c->a = e;
+        if (e->kind == NodeKind::Ident && e->text.equals("eval")) saw_eval_ = true;
         if (!arguments(c)) return nullptr;
         e = c;
       } else if (is(T::Backtick) && calls) {
@@ -2499,6 +2536,7 @@ class Parser {
         Node* n = make(NodeKind::Number);
         if (!n) return nullptr;
         n->number = cur_.number;
+        if (cur_.legacy_octal) n->flags |= kFlagLegacyOctal;
         next();
         return n;
       }
@@ -2506,6 +2544,7 @@ class Parser {
         Node* n = make(NodeKind::String);
         if (!n) return nullptr;
         n->text = cur_.text;
+        if (cur_.legacy_octal) n->flags |= kFlagLegacyOctal;
         next();
         return n;
       }
@@ -2829,6 +2868,8 @@ class Parser {
   // modules
   bool module_ = false;
   bool strict_parse_ = false;
+  bool saw_eval_ = false;   // the function body being read has a call of eval(...)
+  bool legacy_octal_ = false;   // the string being read has a legacy octal escape
   ModuleRequests* requests_ = nullptr;
   List<ExportEntry> exports_{arena_.allocator()};
 };

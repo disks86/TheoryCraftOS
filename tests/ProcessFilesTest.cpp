@@ -389,7 +389,7 @@ static void test_windows_files() {
   const uint64_t info = rig.alloc(64);
   CHECK(rig.query(o.handle, info, 24, 5) == 0 && rig.u64(info + 8) == 12 && rig.bytes(info + 21, 1)[0] == 0);    // standard: EndOfFile, not a directory
   CHECK(rig.query(o.handle, info, 8, 14) == 0 && rig.u64(info) == 8);                           // position
-  CHECK(rig.query(o.handle, info, 40, 4) == 0 && rig.bytes(info + 32, 1)[0] == char(0x80));    // basic: FILE_ATTRIBUTE_NORMAL
+  CHECK(rig.query(o.handle, info, 40, 4) == 0 && rig.bytes(info + 32, 1)[0] == char(0x20));    // basic: FILE_ATTRIBUTE_NORMAL
   CHECK(rig.query(o.handle, info, 56, 34) == 0 && rig.u64(info + 40) == 12);                   // network open
   CHECK(rig.query(o.handle, info, 4, 5) == 0xC0000004u && rig.query(o.handle, info, 64, 99) == 0xC0000003u);
   CHECK(rig.query(o.handle, info, 64, 9) == 0 && rig.bytes(info, 1)[0] == 20 && wide(rig, info + 4, 20) == "\\hello.txt");     // FileNameInformation: the path on the volume
@@ -448,7 +448,7 @@ static void test_windows_files() {
   uint32_t st = rig.call(WindowsSyscallNumber::NtQueryDirectoryFile, o.handle, 0, 0, 0, {iosb, list, 4096, 3, 0, 0, 1});
   CHECK(st == 0);
   std::vector<std::string> names = both_names(rig, list);
-  CHECK(names.size() == 6 && names[0] == "." && names[1] == "..");
+  CHECK(names.size() == 4 && names[0] != "." && names[0] != "..");      // (the root of a drive has no "." and "..")
   bool has_hello = false, has_users = false;
   for (auto& n : names) { has_hello |= n == "hello.txt"; has_users |= n == "Users"; }
   CHECK(has_hello && has_users && rig.u64(iosb + 8) > 100);
@@ -460,9 +460,9 @@ static void test_windows_files() {
   CHECK(rig.call(WindowsSyscallNumber::NtQueryDirectoryFile, o.handle, 0, 0, 0, {iosb, list, 4096, 3, 0, 0, 0}) == 0x80000006u);
   CHECK(rig.call(WindowsSyscallNumber::NtQueryDirectoryFile, o.handle, 0, 0, 0, {iosb, list, 4096, 12, 1, rig.unicode("*"), 1}) == 0);      // FileNamesInformation, one entry
   CHECK(rig.u64(list) == 0 || rig.bytes(list, 1)[0] == 0);                                           // NextEntryOffset 0 = last
-  CHECK(wide(rig, list + 12, uint8_t(rig.bytes(list + 8, 1)[0])) == ".");
+  CHECK(wide(rig, list + 12, uint8_t(rig.bytes(list + 8, 1)[0])) != ".");
   CHECK(rig.call(WindowsSyscallNumber::NtQueryDirectoryFile, o.handle, 0, 0, 0, {iosb, list, 4096, 12, 1, 0, 0}) == 0);
-  CHECK(wide(rig, list + 12, uint8_t(rig.bytes(list + 8, 1)[0])) == "..");
+  CHECK(wide(rig, list + 12, uint8_t(rig.bytes(list + 8, 1)[0])) != "..");
   CHECK(rig.call(WindowsSyscallNumber::NtQueryDirectoryFile, o.handle, 0, 0, 0, {iosb, list, 20, 3, 1, 0, 1}) == 0x80000005u);          // buffer too small
   CHECK(rig.call(WindowsSyscallNumber::NtQueryDirectoryFile, o.handle, 0, 0, 0, {iosb, list, 4096, 77, 0, 0, 1}) == 0xC0000003u);
   CHECK(rig.call(WindowsSyscallNumber::NtQueryDirectoryFile, 0, 0, 0, 0, {iosb, list, 4096, 3, 0, 0, 1}) == 0xC0000008u);
@@ -476,7 +476,7 @@ static void test_windows_files() {
     if (st != 0) { CHECK(st == 0x80000006u); break; }
     total += both_names(rig, list).size();
   }
-  CHECK(total == 6);
+  CHECK(total == 4);
   rig.call(WindowsSyscallNumber::NtClose, o.handle);
   // a file is not a directory
   o = rig.create("\\??\\C:\\hello.txt", kGenericRead, 1, kOptions);
@@ -492,7 +492,7 @@ static void test_windows_files() {
 
   // attributes, delete, rename, delete-on-close
   const uint64_t basic = rig.alloc(40);
-  CHECK(rig.call(WindowsSyscallNumber::NtQueryAttributesFile, rig.attributes("\\??\\C:\\hello.txt"), basic) == 0 && rig.bytes(basic + 32, 1)[0] == char(0x80));
+  CHECK(rig.call(WindowsSyscallNumber::NtQueryAttributesFile, rig.attributes("\\??\\C:\\hello.txt"), basic) == 0 && rig.bytes(basic + 32, 1)[0] == char(0x20));
   CHECK(rig.call(WindowsSyscallNumber::NtQueryAttributesFile, rig.attributes("\\??\\C:\\Temp"), basic) == 0 && rig.bytes(basic + 32, 1)[0] == 0x10);
   CHECK(rig.call(WindowsSyscallNumber::NtQueryAttributesFile, rig.attributes("\\??\\C:\\nope"), basic) == 0xC0000034u);
   CHECK(rig.call(WindowsSyscallNumber::NtDeleteFile, rig.attributes("\\??\\C:\\Temp\\fresh.txt")) == 0 && read_file(fs, "/Windows/Temp/fresh.txt") == "<missing>");
@@ -501,6 +501,16 @@ static void test_windows_files() {
   o = rig.create("\\??\\C:\\Temp\\gone.txt", kGenericWrite | 0x10000, 2, kOptions | 0x1000);                // FILE_DELETE_ON_CLOSE
   CHECK(o.status == 0 && read_file(fs, "/Windows/Temp/gone.txt") == "");
   CHECK(rig.call(WindowsSyscallNumber::NtClose, o.handle) == 0 && read_file(fs, "/Windows/Temp/gone.txt") == "<missing>");
+  // names do not care about case: a file made as Case.Test is found as case.test, in a directory spelled differently too, and creating over it opens the same file
+  o = rig.create("\\??\\C:\\Temp\\Case.Test", kGenericWrite, 2, kOptions);
+  CHECK(o.status == 0 && read_file(fs, "/Windows/Temp/Case.Test") == "");
+  rig.call(WindowsSyscallNumber::NtClose, o.handle);
+  o = rig.create("\\??\\C:\\TEMP\\case.test", kGenericRead, 1, kOptions);
+  CHECK(o.status == 0);
+  rig.call(WindowsSyscallNumber::NtClose, o.handle);
+  o = rig.create("\\??\\C:\\temp\\CASE.TEST", kGenericWrite, 5, kOptions);      // FILE_OPEN_IF
+  CHECK(o.status == 0 && read_file(fs, "/Windows/Temp/CASE.TEST") == "<missing>" && read_file(fs, "/Windows/Temp/Case.Test") == "");
+  rig.call(WindowsSyscallNumber::NtClose, o.handle);
   o = rig.create("\\??\\C:\\Temp\\moved.txt", kGenericWrite | kGenericRead, 2, kOptions);
   rig.write(o.handle, "data", 0);
   // FILE_RENAME_INFORMATION: ReplaceIfExists, RootDirectory, FileNameLength, FileName

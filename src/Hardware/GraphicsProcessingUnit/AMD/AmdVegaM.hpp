@@ -22,6 +22,8 @@
 #include "Allocators/IAllocator.hpp"
 #include "FileSystem/IFileSystem.hpp"
 #include "Hardware/Clock/IClock.hpp"
+#include "Hardware/Bus/Pci/IPciBus.hpp"
+#include "Hardware/GraphicsProcessingUnit/AMD/AmdAsicReset.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdDce11.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdGfx8.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdGfx8Compute.hpp"
@@ -29,6 +31,10 @@
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdIh3.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdIrq.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdSdma3.hpp"
+#include "Hardware/GraphicsProcessingUnit/AMD/AtomBios.hpp"
+#include "Hardware/GraphicsProcessingUnit/AMD/AmdDdc.hpp"
+#include "Hardware/GraphicsProcessingUnit/AMD/AtomConnectors.hpp"
+#include "Hardware/GraphicsProcessingUnit/AMD/AtomI2c.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdSmu7Ucode.hpp"
 #include "Hardware/Mmio.hpp"
 #include "Hardware/RegisterMapper.hpp"
@@ -78,6 +84,11 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
     MmioRegion doorbells;                         // the doorbell BAR (BAR 2), at least the first 8 KiB
     uint64_t max_framebuffer_bytes = 0;           // the largest picture the display could show (0: no display part)
     uint32_t hpd_pins = 0x3F;                     // the hot plug detect pins to watch (bit n: pin n); which pin a connector is on is in the video BIOS, so by default all of them
+    IPciBus* pci = nullptr;                       // where the card is, for the full reset (AmdAsicReset): its configuration space
+    PciAddress pci_address{};
+    ConstByteView vbios;                          // the card's video BIOS image, for POSTing it after a card reset (AtomBios; AmdVbios finds it); copied by bring_up. Empty: no POST
+    bool allow_asic_reset = false;                // recover() falls back to a full reset of the card when an engine will not come back from its soft reset (read the warning at reset_card())
+    bool auto_recover = false;                    // service_interrupts() resets an engine that a fault or a timeout left wedged (at most kMaxRecoveries times in all)
     bool msi = false;                             // the card's MSI is on (PciMsi): the interrupt ring is told to re-arm it as the driver does (adev->irq.msi_enabled)
     const ISystemAddresses* system_addresses = nullptr;   // for upload() and download(); null: a pointer is its own address
   };
@@ -97,7 +108,7 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
   enum class Step : uint8_t { None, MemoryMap, Firmware, Memory, MemoryController, InterruptHandler, Microcode, GraphicsEngine, Sdma, Done };
   static const char* step_name(Step step);
 
-  explicit AmdVegaM(allocators::IAllocator& allocator) : status_(allocator) {}
+  explicit AmdVegaM(allocators::IAllocator& allocator) : status_(allocator), vbios_(allocator) {}
   ~AmdVegaM() { shutdown(); }
   AmdVegaM(const AmdVegaM&) = delete;
   AmdVegaM& operator=(const AmdVegaM&) = delete;
@@ -144,9 +155,66 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
   // Everything the interrupt ring delivers is also passed to `observer` (not owned; null to stop), after the card has dealt with it: how the video engines, which run on their own,
   // learn of their fences. Called from service_interrupts().
   void set_event_observer(AmdIrq::ISink* observer) { observer_ = observer; }
+  // Hot plug. The pins the card watches (Inputs::hpd_pins) report a display being plugged in or pulled out through the interrupt ring (AmdIrq); service_interrupts() turns that into
+  // events for whoever wants to react, queued here (the oldest are dropped when more than kMaxHotplugEvents wait, and counted). `connected_pins()` is the state: bit n set when pin n
+  // senses a display, as of bring-up and the events since. Which connector a pin is on is in the video BIOS's object table (AtomConnectors), read at bring-up when Inputs::vbios is set:
+  // an event carries the connector, so that it can say "HDMI-A-1" and not "output 2"; without a video BIOS, or for a pin the table does not list, `has_connector` is false.
+  struct HotplugEvent {
+    uint32_t pin = 0;
+    bool connected = false;
+    bool has_connector = false;
+    AtomConnectors::Connector connector;
+    bool throttled = false;   // the pin interrupted so often that it was switched off (AmdIrq::kHotplugStormLimit): no more events from it
+  };
+  static constexpr uint32_t kMaxHotplugEvents = 16;
+  bool take_hotplug(HotplugEvent* out);
+  uint32_t connected_pins() const { return connected_pins_; }
+  // The monitor's EDID over the connector's DDC lines (AmdDdc: the GPIO pins of the bus named by the connector's I2C record in the video BIOS, driven by software), into *out. False if the
+  // card is not up, the connector has no DDC line in the table or no GPIO entry, it is a DisplayPort connector (the AUX channel is not done), nothing answers, or the EDID never checked.
+  // It takes the bus for some tens of milliseconds, so it is for the desktop loop, not an interrupt path.
+  bool read_edid(const AtomConnectors::Connector& connector, ByteBuffer* out);
+  ArrayView<const AtomConnectors::Connector> connectors() const { return ArrayView<const AtomConnectors::Connector>(connectors_, connector_count_); }
+  uint32_t hotplug_events_dropped() const { return hotplug_dropped_; }
+  // The audio endpoints of the display engine (amd_dce11::AudioPins, dce_v11_0_audio_get_connected_pins): bit n of the mask is set when endpoint n has a port (its default configuration's
+  // port connectivity is not "none"), as read at bring-up and by refresh_audio_pins(). Which output an endpoint serves is not fixed (the driver hands an encoder the first connected one), so
+  // this says how many displays could have audio, not which. `audio_outputs` is the other side of it: the connectors that carry audio (HDMI, DisplayPort) and have a display on their hot plug
+  // pin now, from the video BIOS's table (up to `capacity`, in the table's order; the count).
+  static constexpr uint32_t kAudioPins = amd_dce11::AudioPins::kMaxPins;
+  uint32_t audio_pins_connected() const { return audio_pins_; }
+  uint32_t refresh_audio_pins();
+  uint32_t audio_outputs(AtomConnectors::Connector* out, uint32_t capacity) const;
+
+  // Recovery. An engine that timed out on a fence or reported a fault is wedged: nothing more is queued on it. recover() resets the ones that are - the graphics engine with its
+  // compute queues (AmdGfx8::recover) if the graphics ring or a compute queue is wedged, and the SDMA engines (AmdSdma3::recover) if one is - and brings them back with empty
+  // rings. A fault of one compute queue resets all of them, as the driver's soft reset of the IP does. `failed` is set if an engine did not come back (its ring test failed): it is
+  // then stopped; recover() tries it again (an engine that is not running counts as needing it), and if that does not help either the card needs a full restart (shutdown and
+  // bring_up). Nothing is done for engines that are running and not wedged.
+  struct Recovery {
+    bool graphics = false, sdma = false, failed = false;
+    bool card_reset = false;   // the soft reset did not help and the whole card was reset (reset_card); `failed` then says whether it is up again
+  };
+  Recovery recover();
+  // The full reset of the card (AmdAsicReset: the PCI configuration reset the driver falls back to): everything is stopped, the card is reset, and bring_up is run again with the same
+  // inputs. True if the card is up again. WARNING: the driver then POSTs the card (the video BIOS's init tables, through the AtomBIOS interpreter) to train the memory and set the
+  // clocks up, and this OS has no interpreter for them. A real card that has been reset therefore comes back quiet (no engine, no DMA) but not usable, and bring_up is expected to
+  // fail until the machine is restarted; the video memory, including the firmware's framebuffer, is gone with it. Needs Inputs::pci. At most kMaxAsicResets in all.
+  bool reset_card();
+  // The POST (amdgpu_device_asic_init): runs the video BIOS's ASIC_Init command table with the AtomBIOS interpreter, which trains the memory and sets the clocks up. Done by
+  // reset_card() after the reset when Inputs::vbios holds the image; false (and status() says why) if the image is not an AtomBIOS image or its table fails. Can also be called by hand
+  // on a card the firmware did not POST (with the same inputs bring_up takes).
+  bool post(const Inputs& inputs);
+  uint32_t asic_resets() const { return asic_resets_; }
+  static constexpr uint32_t kMaxAsicResets = 2;
+  bool wedged() const;   // any engine is, or was left stopped by a recovery that did not work
+  uint32_t recoveries() const { return recoveries_; }
+  static constexpr uint32_t kMaxRecoveries = 8;   // what service_interrupts() will do by itself in one life of the card (a card that keeps hanging is left alone)
   // The vertical blank interrupt of the controller that shows the OS's framebuffer (it comes every frame, so it is off until asked for): counted per controller in irq()->vblank_count().
   // False if the display is not engaged. It is switched off again when the display is given back or the card stopped.
   bool set_vblank_interrupt(bool enable);
+  // The vertical line interrupt of the same controller (LB_INTERRUPT_MASK.VLINE_INTERRUPT_MASK, as dce_v11_0_set_crtc_vline_interrupt_state does; the line it comes at is whatever the
+  // controller has: the driver programs none either), counted in irq()->vline_count(). Same rules as the vblank interrupt: false if the display is not engaged, off again when the
+  // display is given back or the card stopped, and it follows the controller if the display is engaged again on another.
+  bool set_vline_interrupt(bool enable);
 
   // For tests and diagnostics
   const AmdGmc8GartPlan& gart_plan() const { return gart_plan_; }
@@ -163,6 +231,7 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
 
   Step step_ = Step::None;
   String status_;
+  ByteBuffer vbios_;   // the copy of Inputs::vbios
   Inputs inputs_;
   AmdGmc8GartPlan gart_plan_;
   Layout layout_;
@@ -172,7 +241,13 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
   UniquePointer<AmdIh3> ih_;
   UniquePointer<AmdIrq> irq_;
   UniquePointer<amd_dce11::Interrupts> display_irq_;
-  int vblank_crtc_ = -1;
+  int vblank_crtc_ = -1, vline_crtc_ = -1;
+  uint32_t recoveries_ = 0, asic_resets_ = 0;
+  HotplugEvent hotplug_[kMaxHotplugEvents];
+  AtomConnectors::Connector connectors_[AtomConnectors::kMaxConnectors];
+  uint32_t connector_count_ = 0;
+  uint32_t audio_pins_ = 0;
+  uint32_t hotplug_head_ = 0, hotplug_count_ = 0, hotplug_dropped_ = 0, connected_pins_ = 0, throttle_reported_ = 0;
   AmdIrq::ISink* observer_ = nullptr;
   UniquePointer<AmdGfx8Compute> compute_;
   UniquePointer<AmdGfx8> gfx_;

@@ -98,6 +98,13 @@ class PeFile {
   uint16_t subsystem() const { return subsystem_; }
   uint16_t dll_characteristics() const { return dll_characteristics_; }
   uint32_t checksum() const { return checksum_; }
+  uint16_t os_major() const { return os_major_; }
+  uint16_t os_minor() const { return os_minor_; }
+  uint16_t subsystem_major() const { return subsystem_major_; }
+  uint16_t subsystem_minor() const { return subsystem_minor_; }
+  uint64_t stack_reserve() const { return stack_reserve_; }
+  uint64_t stack_commit() const { return stack_commit_; }
+  uint32_t loader_flags() const { return loader_flags_; }
 
   // The data directories the file has (the index is IMAGE_DIRECTORY_ENTRY_*: 0 exports, 1 imports, 2 resources, ...).
   uint32_t directory_count() const { return directory_count_; }
@@ -129,7 +136,9 @@ class PeFile {
   bool plus_ = false;
   uint16_t machine_ = 0, characteristics_ = 0, subsystem_ = 0, dll_characteristics_ = 0;
   uint32_t timestamp_ = 0, entry_rva_ = 0, section_alignment_ = 0, file_alignment_ = 0, size_of_image_ = 0, size_of_headers_ = 0, checksum_ = 0;
-  uint64_t image_base_ = 0;
+  uint64_t image_base_ = 0, stack_reserve_ = 0, stack_commit_ = 0;
+  uint16_t os_major_ = 0, os_minor_ = 0, subsystem_major_ = 0, subsystem_minor_ = 0;
+  uint32_t loader_flags_ = 0;
   uint32_t directory_count_ = 0;
   uint32_t directory_rva_[kMaxDirectories] = {};
   uint32_t directory_size_[kMaxDirectories] = {};

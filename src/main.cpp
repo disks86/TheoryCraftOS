@@ -32,12 +32,15 @@
 #include "Hardware/Printer/SystemPrinters.hpp"
 #include "Hardware/GraphicsProcessingUnit/Multi/GpuPool.hpp"
 #include "Hardware/GraphicsProcessingUnit/SystemGpu.hpp"
+#include "Hardware/Monitor/Edid.hpp"
 #include "Hardware/Monitor/MonitorDisplay.hpp"
 #include "Hardware/Monitor/SystemMonitors.hpp"
 #include "SystemInventory.hpp"
 #include "SystemNetworkDetails.hpp"
 #include "SystemWirelessDetails.hpp"
 #include "BootLog.hpp"
+#include "Graphics/Logo/Logo.hpp"
+#include "Utility/AllocatedView.hpp"
 #include "Desktop/Desktop.hpp"
 #include "Graphics/Graphics3D/WebGlAccelerator.hpp"
 #include "Graphics/GraphicsPool.hpp"
@@ -73,6 +76,8 @@
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdVegaM.hpp"
 #include "Hardware/VideoCodec/AMD/AmdGmc8Memory.hpp"
 #include "Hardware/Bus/Pci/PciMsi.hpp"
+#include "Hardware/GraphicsProcessingUnit/AMD/AmdVbios.hpp"
+#include "Hardware/Acpi/AcpiTables.hpp"
 #include "Kernel/Apic.hpp"
 #include "Kernel/Interrupts.hpp"
 #endif
@@ -155,9 +160,42 @@ static kernel::Frame* on_vega_interrupt(kernel::Frame* frame, void*) {
   __atomic_fetch_add(&g_vega_interrupts, 1, __ATOMIC_ACQ_REL);
   return frame;
 }
+
+// What is on a connector, from its monitor's EDID over the DDC lines: "DELL U2720Q 2560x1440", the maker's name where the monitor gives none, or nothing. False if the connector
+// cannot be read (no DDC line, DisplayPort) or nothing answered.
+static bool describe_vega_monitor(hardware::AmdVegaM& card, const hardware::AtomConnectors::Connector& connector, allocators::IAllocator& allocator, FixedString<64>* text) {
+  ByteBuffer raw(allocator);
+  if (!card.read_edid(connector, &raw)) return false;
+  hardware::EdidInfo info;
+  if (!hardware::parse_edid(raw.view(), &info)) return false;
+  text->assign("");
+  if (info.name[0]) {
+    text->append(StringView(info.name));
+  } else {
+    text->append(StringView(hardware::edid_vendor_name(info.manufacturer)));
+  }
+  hardware::EdidTiming best;
+  if (info.best_timing(&best) && best.width && best.height) {
+    text->append(StringView(" "));
+    text->append_uint(best.width);
+    text->append(StringView("x"));
+    text->append_uint(best.height);
+  }
+  return true;
+}
 #endif
 
 // Waits up to `microseconds` for a key press (any keyboard we have, else the firmware's input).
+// The logo at the top left of the boot screen, the log below it. Skipped quietly if it cannot be decoded or there is no memory for it.
+static void show_boot_logo(allocators::IAllocator& allocator) {
+  constexpr uint32_t kSize = 128, kBackground = 0x101018;   // (the console's own background)
+  graphics::Logo logo(allocator);
+  ArrayView<uint32_t> pixels = allocate_view<uint32_t>(allocator, uint64_t{kSize} * kSize);
+  if (!pixels.empty() && logo.load(graphics::embedded_logo_png()) && logo.render(kSize, kBackground, pixels))
+    console::show_banner(ArrayView<const uint32_t>(pixels.data(), pixels.size()), kSize, kSize);
+  release_view(allocator, pixels);
+}
+
 static void wait_for_key(efi::SystemTable* st, hardware::SystemInput& input, uint64_t microseconds) {
   const uint64_t start = hardware::uptime_us();
   while (hardware::uptime_us() - start < microseconds) {
@@ -459,6 +497,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       if (gpu->mode_info(i, &m) && m.width == 1024 && m.height == 768 && gpu->set_mode(i)) break;
     }
     console::use_gpu(gpu);
+    show_boot_logo(shared_allocator);
     console::puts("TheoryCraftOS: initializing hardware\n");
     bootlog::replay();  // the mode change cleared what was logged so far
     Entry(Level::Ok, "GPU").text(gpu->name()).text(", ").dec(gpu->width()).text("x").dec(gpu->height()).text(", ").dec(gpu->mode_count()).text(" modes");
@@ -966,6 +1005,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   }
   graphics::IRenderer2D* renderer = gpu ? system_graphics.renderer_2d() : nullptr;
   if (renderer) {
+    // The desktop runs on a thread with a real stack: the page layout in the browser's tick would overflow the firmware's boot stack.
+    kernel::run_on_large_stack([&] {
     // The merged keyboard and mouse are always handed over, even when there are none yet: USB ones may be plugged in later.
     kernel::Clipboard clipboard(shared_allocator);  // copy and paste between the desktop's programs; outlives the desktop
     desktop::Desktop desktop(shared_allocator, *renderer, &input.keyboard(), &input.mouse());
@@ -1030,6 +1071,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
           break;
         }
         hardware::MmioVcnRegisters vega_registers(registers_window);
+        ByteBuffer vbios_image(shared_allocator);   // (AmdVegaM keeps its own copy)
         hardware::AmdGpu* display = system_gpu.amd_gpu();
         hardware::PciAddress display_location{};
         const bool drives_display = display && display->pci_location(&display_location) && display_location.bus == d.address.bus && display_location.device == d.address.device &&
@@ -1052,6 +1094,47 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         inputs.aperture_bytes = aperture_bytes;
         inputs.doorbells = doorbells;
         inputs.max_framebuffer_bytes = largest;
+        // The full reset of the card as the last resort when an engine will not come back from its soft reset. This OS cannot POST a card afterwards (no AtomBIOS interpreter), so the
+        // card would stay down and whatever it shows would go dark: only allowed when the card does not drive the display.
+        inputs.pci = &pci;
+        inputs.pci_address = d.address;
+        inputs.allow_asic_reset = !drives_display;
+        if (inputs.allow_asic_reset) {
+          // The card's video BIOS, for the POST after a reset: the ACPI ATRM method, the ACPI VFCT table, the expansion ROM, the ROM registers (not read when a reset is not allowed:
+          // nothing would use it). The ATRM method is AML of the machine's tables, so they are loaded into an interpreter of their own for the look (it is gone again afterwards).
+          hardware::AcpiTables vfct_tables(st);
+          hardware::SystemAcpiHost atrm_host(&pci, paging_ok ? &mmio : nullptr);
+          acpi::AmlInterpreter atrm_aml(shared_allocator, atrm_host);
+          hardware::AmdVbios::Sources sources;
+          if (vfct_tables.initialize()) {
+            sources.vfct = vfct_tables.find("VFCT");
+            const ConstByteView dsdt = vfct_tables.dsdt();
+            if (!dsdt.empty()) atrm_aml.load_table(dsdt);
+            for (uint32_t n = 0; n < 32; ++n) {
+              const ConstByteView ssdt = vfct_tables.find_nth("SSDT", n);
+              if (ssdt.empty()) break;
+              atrm_aml.load_table(ssdt);
+            }
+            sources.aml = &atrm_aml;
+          }
+          sources.pci = &pci;
+          sources.mapper = &register_mapper;
+          sources.registers = &vega_registers;
+          sources.allocator = &shared_allocator;
+          sources.bar0_physical = aperture_base;
+          sources.bar0_bytes = aperture_bytes;
+          sources.function = d.address;
+          sources.vendor_id = d.vendor_id;
+          sources.device_id = d.device_id;
+          const hardware::AmdVbios::Source found = hardware::AmdVbios::find(sources, &vbios_image);
+          if (found != hardware::AmdVbios::Source::None) {
+            inputs.vbios = vbios_image.view();
+            Entry(Level::Ok, "Vega M").text("video BIOS: ").dec(vbios_image.size()).text(" bytes from ").text(hardware::AmdVbios::source_name(found));
+          } else {
+            Entry(Level::Info, "Vega M").text("video BIOS: not found (a card reset could not be POSTed)");
+          }
+        }
+        inputs.auto_recover = true;   // an engine that hung or faulted is reset from the desktop loop (service_interrupts), a few times at most
         // MSI first, as the driver does (the interrupt ring is told it is on): the handler, then the message, to the core that runs this.
         const uint32_t apic_id = kernel::running() ? kernel::apic::this_apic_id() : 0xFFFF;
         if (apic_id <= 0xFF) {
@@ -1066,6 +1149,39 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         }
         const bool up = vega_m->bring_up(inputs);
         Entry(up ? Level::Ok : Level::Warning, "Vega M").text(up ? "started: " : "not started - ").text(vega_m->status());
+        if (up) {
+          const uint32_t connected = vega_m->connected_pins();
+          if (connected == 0) {
+            Entry(Level::Info, "Vega M").text("hot plug: no display on the outputs watched");
+          } else {
+            Entry(Level::Info, "Vega M").text("hot plug: display on output(s)");
+            for (uint32_t pin = 0; pin < 6; ++pin) {
+              if (!(connected >> pin & 1)) continue;
+              const hardware::AtomConnectors::Connector* connector = hardware::AtomConnectors::find_pin(vega_m->connectors(), pin);
+              if (connector) {
+                char connector_name[16];
+                hardware::AtomConnectors::name(*connector, ArrayView<char>(connector_name, sizeof connector_name));
+                FixedString<64> monitor;
+                if (describe_vega_monitor(*vega_m, *connector, shared_allocator, &monitor)) Entry(Level::Info, "Vega M").text("  ").text(connector_name).text(": ").text(monitor.c_str());
+                else Entry(Level::Info, "Vega M").text("  ").text(connector_name);
+              } else {
+                Entry(Level::Info, "Vega M").text("  output ").dec(pin + 1);
+              }
+            }
+          }
+          // The audio endpoints with a port (how many displays could have sound), and the outputs that carry audio and have a display: which endpoint serves which output is not fixed.
+          const uint32_t audio_mask = vega_m->audio_pins_connected();
+          uint32_t audio_count = 0;
+          for (uint32_t pin = 0; pin < hardware::AmdVegaM::kAudioPins; ++pin) audio_count += audio_mask >> pin & 1;
+          Entry(Level::Info, "Vega M").text("audio: ").dec(audio_count).text(" of ").dec(hardware::AmdVegaM::kAudioPins).text(" endpoints with a port");
+          hardware::AtomConnectors::Connector audio_outputs[hardware::AtomConnectors::kMaxConnectors];
+          const uint32_t audio_output_count = vega_m->audio_outputs(audio_outputs, hardware::AtomConnectors::kMaxConnectors);
+          for (uint32_t i = 0; i < audio_output_count; ++i) {
+            char connector_name[16];
+            hardware::AtomConnectors::name(audio_outputs[i], ArrayView<char>(connector_name, sizeof connector_name));
+            Entry(Level::Info, "Vega M").text("  audio output with a display: ").text(connector_name);
+          }
+        }
         if (up && vega_msi) {
           // Try it out, as virtio-gpu does: a copy through the SDMA engine ends with a trap, which must come back as an interrupt. If it does not, polling stays.
           const uint32_t before = __atomic_load_n(&g_vega_interrupts, __ATOMIC_ACQUIRE);
@@ -1254,6 +1370,44 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
           vega_idle = 0;
           vega_m->service_interrupts();
         }
+        // A display plugged into or pulled out of one of the card's outputs: say so, on the debug console and as a toast. (The card's outputs are not part of the desktop: it cannot show
+        // anything on them, so this is all there is to do about it.)
+        hardware::AmdVegaM::HotplugEvent plug;
+        while (vega_m->take_hotplug(&plug)) {
+          // "HDMI-A-1" where the video BIOS says what the pin is, else "output 2"
+          FixedString<32> where;
+          if (plug.has_connector) {
+            char connector_name[16];
+            hardware::AtomConnectors::name(plug.connector, ArrayView<char>(connector_name, sizeof connector_name));
+            where.assign(connector_name);
+          } else {
+            where.assign("output ");
+            where.append_uint(plug.pin + 1);
+          }
+          FixedString<192> text;
+          if (plug.throttled) {
+            text.assign("Hot plug detection of ");
+            text.append(where.c_str());
+            text.append(" on the Radeon RX Vega M is switched off: it kept changing");
+          } else {
+            // (what the monitor says it is, when it is just connected and the connector has DDC lines to ask over)
+            FixedString<64> monitor;
+            const bool known = plug.connected && plug.has_connector && describe_vega_monitor(*vega_m, plug.connector, shared_allocator, &monitor);
+            text.assign(plug.connected ? "A display " : "A display was disconnected from ");
+            if (known) {
+              text.append("(");
+              text.append(monitor.c_str());
+              text.append(") ");
+            }
+            if (plug.connected) text.append("was connected to ");
+            text.append(where.c_str());
+            text.append(" of the Radeon RX Vega M");
+          }
+          console::debug_puts("Vega M: ");
+          console::debug_puts(StringView(text.c_str()));
+          console::debug_puts("\n");
+          desktop.notify(StringView("Display"), StringView(text.c_str()), plug.throttled ? gui::NoticeKind::Warning : gui::NoticeKind::Information);
+        }
       }
 #endif
       uint32_t tools_width, tools_height;
@@ -1271,6 +1425,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     guest.stop_service();  // (VirtualBox's resize requests touch the desktop)
     input.stop_service();  // (its notices touch the desktop)
     desktop.stop();  // before anything else draws on the screen: the render thread is the renderer's only user
+    });
   } else {
     console::puts("No desktop (no graphics display). Press any key to shut down.\n");
     wait_for_key(st, input, ~0ull >> 1);

@@ -331,7 +331,7 @@ memory with `INativeDisplay::upload_picture`, which `AmdVegaM` implements with `
 window, so the picture is always right. Before the display goes back to the firmware's framebuffer (mode change, shutdown) the whole back buffer is presented first.
 
 The Presenter is host-tested with the real `AmdVegaM` and the simulated SDMA engine (data in video memory, one copy per present, the CPU fallback, a wedged engine, rows outside the picture, the final present
-before disengaging). `AmdGpu`'s own use of it (the back buffer swap and the flush) is not host-tested: that needs the UEFI graphics classes. Decoded video frames are not routed this way yet: the video
+before disengaging). `AmdGpu`'s own use of it (the back buffer swap, the flush by rows, giving the screen back on a mode change, shutdown or taking the display away) is tested by `AmdGpuTest`, with a simulated UEFI graphics output (two modes) and a simulated display engine that keeps its own picture and takes rows by `upload_picture`; the sequence of drawing calls, the rows each sends (a character at a time for text), the CPU fallback when the upload fails, the whole-picture present before the disengage, a display that refuses or hands out video memory of the wrong size, and swapping one display for another are covered. Decoded video frames are not routed this way yet: the video
 player draws through the same GPU `blit`, so they take this path only as far as the player calls the GPU's drawing functions.
 
 ### Interrupts: dispatch by source
@@ -365,8 +365,8 @@ The display engine's interrupts (`amd_dce11::Interrupts` in `AmdDce11.*`, from `
 - **Vertical blank** (sources 1..6, data 0; data 1 is the line interrupt): `LB_INTERRUPT_MASK.VBLANK_INTERRUPT_MASK`. It fires every frame, so it is off until `AmdVegaM::set_vblank_interrupt(true)`, which turns it on for
   the controller that shows the OS's framebuffer, and off again when the display is given back or the card stopped. The handler reads `DISP_INTERRUPT_STATUS*`, acknowledges with `LB_VBLANK_STATUS.VBLANK_ACK` when the bit is
   set and counts either way (`vblank_count`), like `dce_v11_0_crtc_irq`.
-- **Hot plug** (source 42, data: the pin): `dce_v11_0_hpd_init` for the pins in `Inputs::hpd_pins` (default all six; which pin a connector uses is in the video BIOS, which is not read, and the driver's exclusion of eDP and
-  LVDS cannot be made here): `DC_HPD_EN`, the toggle filter (50 ms connect, 10 ms disconnect), acknowledge, polarity from `DC_HPD_SENSE`, interrupt on. On an interrupt the pin's status bit must be set (else nothing is done,
+- **Hot plug** (source 42, data: the pin): `dce_v11_0_hpd_init` for the pins in `Inputs::hpd_pins` (default all six; which pin a connector uses is in the video BIOS's object table, `AtomConnectors`, but the driver's exclusion of eDP and
+  LVDS is not made: every pin in the mask is watched): `DC_HPD_EN`, the toggle filter (50 ms connect, 10 ms disconnect), acknowledge, polarity from `DC_HPD_SENSE`, interrupt on. On an interrupt the pin's status bit must be set (else nothing is done,
   as in `dce_v11_0_hpd_irq`); it is acknowledged, the polarity flipped to report the next change in the other direction (the driver's hotplug work does that when it detects the connector again), and the new state kept
   (`AmdIrq::hpd_connected`, `hotplug_count`). Because a pin that is not what it seems (the internal panel's) could interrupt forever, a pin that interrupts more than `kHotplugStormLimit` (256) times is switched off
   (`hpd_throttled`).
@@ -382,8 +382,72 @@ and `AmdVce3::mc_resume` sets `VCE_SYS_INT_EN.VCE_SYS_INT_TRAP_INTERRUPT_EN` (`v
 polling, so these are counted (`uvd_encode_fences`, `vce_fences`) and shown to whoever asks: `AmdVegaM::set_event_observer(AmdIrq::ISink*)` passes every event on after the card has dealt with it. Nothing connects the
 video engines to the observer yet. `check_irq_port.py` also checks these ids and handlers and that both engines' start code still enables their sources.
 
-Nothing in the OS reacts to a hot plug yet: the connector cannot be re-detected (no AtomBIOS, no DDC/EDID over the card's own aux channels), so a plug or unplug is only counted and its state kept. Not done: the vline
-interrupt is not enabled (only classified and acknowledged), the audio and DP short-pulse (`DC_HPD_RX_INT`) interrupts; no ring reset or recovery after a fault (the engine has to be restarted).
+The OS reacts to hot plug events like this: `AmdVegaM` keeps the state of the pins it watches (`connected_pins()`: read from `DC_HPD_INT_STATUS.DC_HPD_SENSE` at bring-up, then updated by every event) and queues an event
+for each plug and unplug (`take_hotplug()`: the pin, whether a display is connected now, and a flag on the event that switches a bouncing pin off; the queue holds 16 and drops the oldest, counting them). The desktop loop
+drains the queue after `service_interrupts()` and, for each event, writes a line to the debug console and shows a toast ("A display was connected to HDMI-A-1 of the Radeon RX Vega M"; "Hot plug detection of DP-1 on the Radeon RX Vega M is switched off: it
+kept changing" as a warning); at boot the outputs that already have a display are logged. That is all there is to do about it for now: the card's outputs are not part of the desktop (the OS cannot put a
+picture on them: no mode setting without the AtomBIOS command tables for the encoders and PLLs, and no DDC/EDID read of the monitor on the other end), so a plug cannot add a monitor to the desktop's layout. Which connector a pin is
+on comes from the video BIOS (next section); without one, or for a pin it does not list, the text says "output 2". Not done: the audio interrupts; recovery from a fault is above.
+
+The vertical line interrupt is enabled like the vertical blank: `AmdVegaM::set_vline_interrupt(true)` sets `LB_INTERRUPT_MASK.VLINE_INTERRUPT_MASK` (bit 4, `dce_v11_0_set_crtc_vline_interrupt_state`; `amd_dce11::Interrupts::set_vline`) of the
+controller that shows the OS's framebuffer, and only that one; it is refused without an engaged display, independent of the vblank bit (neither touches the other), and switched off when the display is given back or the card
+stopped. The handler acknowledges with `LB_VLINE_STATUS.VLINE_ACK` when `DISP_INTERRUPT_STATUS*` says it is pending, and counts per controller (`AmdIrq::vline_count`). Like the driver, nothing programs which line it comes at.
+It has no user in the OS yet (nothing needs a mid-frame callback); a test (`test_vline_interrupt`) covers enable, bits kept, independence from vblank, ack, counting and the off paths.
+
+The DisplayPort short pulse (a sink's status change that is not a plug: link loss, a request to retest) arrives as source 42 with data 6..11 (`VISLANDS30_IV_EXTID_HPD_RX_A..F`, pins 0..5), `AmdIrq::Kind::DisplayHpdRx`.
+`AmdVegaM::bring_up` switches it on for the watched pins after `hpd_init` (`DC_HPD_INT_CONTROL.DC_HPD_RX_INT_EN`, a stale pulse acknowledged first) and `hpd_fini` off. A vector counts when `DC_HPD_INT_STATUS.DC_HPD_RX_INT_STATUS`
+says it is pending; it is acknowledged (`DC_HPD_RX_INT_ACK`), counted per pin (`AmdIrq::hpd_rx_count`), shown to the event observer, and is not a hot plug (no `HotplugEvent`, `connected_pins` unchanged). A pin that pulses more
+than `kHpdRxStormLimit` (256) times has the interrupt switched off (`hpd_rx_throttled`). **Provenance:** the ids come from `ivsrcid_vislands30.h`, the bits from `dce_11_2_sh_mask.h` (both checked by
+`check_irq_port.py`), but the kernel's `dce_v11_0.c` never uses the pulse; the way to enable, read and acknowledge it is that of the DC display code (`dce110_irq_service.c`), written here from memory of it, not checked
+against its source. **What is not done with it:** a real handler reads the sink's DPCD over the AUX channel (link status, automated test request) and retrains; there is no AUX channel or mode setting here, so the pulse is only
+counted.
+
+### Audio endpoints
+
+`amd_dce11::AudioPins` (`dce_v11_0_audio_endpt_rreg`, `dce_v11_0_audio_get_connected_pins`) reads the display engine's eight audio endpoints (CHIP_VEGAM, like Polaris 10): each has an index/data register pair
+(`AZALIA_F0_CODEC_ENDPOINT_INDEX`/`DATA`, 0x17a8/0x17a9 plus 4 per endpoint) and, at index 0x56, its default pin configuration, whose port connectivity field (bits 31:30) is 1 when the endpoint has no physical
+connection; any other value counts as connected, as in the driver. `AmdVegaM::audio_pins_connected()` is that mask as of bring-up (`refresh_audio_pins()` reads again). **Which output an endpoint serves is not fixed:** the driver
+hands an encoder the first connected endpoint (`dce_v11_0_audio_get_pin`), and the encoder-to-endpoint link is made only when a mode is set, which this OS does not do. So the mask says how many displays could have audio
+and the connector names come from the other side: `audio_outputs()` lists the connectors that carry audio (HDMI-A, HDMI-B, DisplayPort; `AtomConnectors::carries_audio`) and have a display on their hot plug pin now. The boot
+log shows both ("audio: 5 of 8 endpoints with a port", "audio output with a display: HDMI-A-1"). This is a reading of the hardware's state, not an audio path: nothing here drives the endpoints (the card's HD Audio function is
+a separate PCI device, polled by the HD Audio driver). `scripts/check_irq_port.py` checks the endpoint count, offsets, register pair order and the connected rule; `test_audio_pins` covers the mask, the names, a display leaving,
+refresh, shutdown, no video BIOS and out-of-range endpoints under the sanitizers. Nothing seen on the real machine: the endpoints' default configuration may read as "connected" for all eight until a mode is set.
+
+### Connector names from the video BIOS's object table
+
+`AtomConnectors` (`AtomConnectors.*`) reads what the card's outputs are: a port of the connector part of `amdgpu_atombios_get_connector_info_from_object_table` with `amdgpu_atombios_lookup_gpio` and
+`_get_hpd_info_from_gpio`. The Object_Header data table (revision 2 or later) has the display path table, one path for each device the board supports (a bit of the header's device vector), ending in a connector
+object; the connector table's object for it has records, the hot plug interrupt record names a GPIO, the GPIO_Pin_LUT data table says which register bit that GPIO is, and a bit of `DC_GPIO_HPD_A` (0x488d: bits 0, 8, 16,
+24, 26, 28) is hot plug pin 0 to 5. The connector object id gives the type as `object_connector_convert` does (DVI-I, DVI-D, VGA, Composite, SVIDEO, DIN, HDMI-A, HDMI-B, LVDS, DP, eDP; the others and the TV and
+component video devices are skipped). Names are the kernel's: the type and the number among connectors of that type (`HDMI-A-1`, `DP-2`, `eDP-1`). A connector that several paths end in is one connector with the devices
+merged, as `amdgpu_connector_add` does.
+
+Differences from the driver, because the image is untrusted bytes: every read is checked and a table that runs past the image ends the walk with what was found kept, the paths and records walked are bounded (255, 64),
+at most 16 connectors are kept, and the parts that are not about naming are left out (encoders and their capabilities, routers, the DDC lines). `AmdVegaM` parses the table at bring-up when `Inputs::vbios` is set
+(`connectors()`), and each `HotplugEvent` carries its connector (`has_connector`, `connector`); `main.cpp` writes the name in the toast, on the debug console and in the boot log.
+`scripts/check_connectors_port.py` checks the master list indexes, the layouts of the object header, path, object, record and GPIO entry, the pin masks and the connector type of each object id against the driver;
+`tests/AtomConnectorsTest.cpp` has a hand-assembled XPS-like board (eDP, HDMI, two DisplayPorts), all six pins and the GPIO entries that are not pins, the skipped devices and unnamed objects, records before and after the
+hot plug record, merged paths, the capacity, the names, and every truncation, every bit flip and 2000 noisy images under the sanitizers. Not checked against the real thing: `ObjectID.h` (the object id masks and the
+numbers are those of the Linux header from memory, checked only through `object_connector_convert`'s order), and no real Vega M video BIOS has been read. Not done: DDC lines and the encoder/router parts, and
+Atom firmware-info objects of the newer (Vega and later) `atomfirmware.h` layout, which differs.
+
+### Monitor EDID over the DDC lines
+
+The connector reader now also keeps each connector's DDC line (`Connector::ddc_id`, from the I2C record of its object: record type 1, the access byte at +2; the last record wins as in the driver). `AtomI2c::lookup` finds that
+id in the GPIO_I2C_Info data table (index 10; 27-byte entries: the clock's mask, enable, readback and output registers, the data pad's four, the id, the eight bit positions) and makes the bus record
+(`amdgpu_atombios_lookup_i2c_gpio`, `_get_bus_rec_for_i2c_gpio`). `AmdDdc` drives the two pads from software through those registers and reads the EDID: the i2c bit-banging algorithm with the 10 us bit time and 2.2 ms
+clock stretch limit amdgpu sets, then `drm_do_get_edid`'s sequence - offset 0 written to 0x50, a repeated start, 128 bytes read; the header and checksum checked, four tries per block; the extension blocks the same way (the
+segment pointer written to 0x30 from block 2 on), at most three, a block that never checks left out and the base block's count and checksum made true again. The driver's default is software DDC too (its hardware I2C engine
+is a module parameter, off). `AmdVegaM::read_edid(connector, &bytes)` does it for a connector; `main.cpp` reads the monitor on each new connection and at boot, parses it with the existing EDID parser, and the toast says
+"A display (DELL U2720Q 2560x1440) was connected to HDMI-A-1 of the Radeon RX Vega M". It takes the bus for some tens of milliseconds, so it runs from the desktop loop and not in the interrupt path.
+
+**Not done / not known:** DisplayPort and eDP connectors (most of what a laptop has) carry the EDID over the AUX channel (I2C over AUX), a transaction of the AtomBIOS (`ProcessAuxChannelTransaction`) and the DPCD, not GPIO
+pins - `read_edid` refuses them; the interpreter exists, the transaction does not. `amdgpu_i2c.c` (pre_xfer, post_xfer and the pad callbacks) and `i2c-algo-bit.c` were not at hand: the register choreography (outputs cleared, pins made
+inputs, pads masked for software, a pin "high" when its output is not enabled, released again afterwards) and the protocol are written from memory of them, so `check_i2c_port.py` checks the table and entry layout, which register
+is which, the id bits and the lookup against the driver but not the pad callbacks. Tested against a bit-level simulated bus (`tests/FakeI2cMonitor.hpp`: a monitor as an I2C slave, written independently; `AmdDdcTest`): the wire
+(addresses, offsets, segment pointers, one stop per transfer), the registers left as found, the pads masked while the pins are driven, pins left pulled low, retries, a damaged block, an absent monitor, clock stretching within and past
+the limit, the time taken, and every bit flip of the data; `AtomI2cTest`, `AtomConnectorsTest` and `AmdVegaMTest` (`test_read_edid`) cover the table, the record and the card. The simulated slave is not a real monitor: whether a real
+one, through this machine's pads, answers is unseen.
 
 ### MSI: interrupts wake the CPU
 
@@ -399,6 +463,94 @@ when the counter moved (and once a second in case a message was lost); if not, M
 Host-tested: the capability programming (`PciMsiTest`: 32/64-bit, with and without per-vector masking, refusals, status bits never written, undone by the destructor) and that `Inputs::msi` changes only the ring's re-arm
 bit. Not tested: the handler and the loop (they need the kernel), and nothing has run on a real machine: whether the Kaby Lake-G's PCH/root port delivers the message, the APIC id format beyond 255 cores (refused),
 and the card's re-arm behaviour are unseen.
+
+### Recovery after a fault
+
+An engine that timed out on a fence or reported a fault is wedged (nothing is queued on it). `AmdVegaM::recover()` resets the ones that are and brings them back with empty rings; `Recovery` says whether graphics
+(with the compute queues) and the SDMA engines were reset and whether an engine did not come back. With `Inputs::auto_recover` (the desktop loop sets it) `service_interrupts()` does it by itself, at most
+`kMaxRecoveries` (8) times in a life of the card, so a card that keeps hanging is left alone; `recover()` by hand has no limit.
+- **Graphics and compute** (`AmdGfx8::recover`, from `gfx_v8_0_check_soft_reset` / `_pre_soft_reset` / `_soft_reset` / `_post_soft_reset`): the status registers decide what is reset (`GRBM_STATUS` busy bits: CP and GFX;
+  `GRBM_STATUS2`: the RLC, or CPF/CPC/CPG; `SRBM_STATUS`: pending GRBM requests, SEM); since a fence that never came shows nothing busy, the command processors are added when the status does not name them (the driver
+  would reset only what is busy; recovery from a wedged ring has to work whatever the status says). Pre: the RLC stopped, the graphics CP halted, every compute queue's hardware queue dequeued directly through its
+  registers (`gfx_v8_0_deactivate_hqd(adev, 2)`: the KIQ is not asked, it may be what hung) and the MEC halted. Reset: the memory controller's graphics clients stalled (`GMCON_DEBUG`), `GRBM_SOFT_RESET` and
+  `SRBM_SOFT_RESET` pulsed with the 50 us settling delays, the stall released. Post: the queues dequeued again, the KIQ and compute queues resumed and mapped (`kiq_resume`, `kcq_resume`), the graphics ring
+  programmed, all rings tested, the RLC started. The fence numbers start again (the write-back fence words are cleared so an old number cannot look like a new fence), the wedged state is gone, and the interrupt sources
+  the reset takes away (the CP's, ECC, SQ, the compute pipe's) are put back.
+- **SDMA** (`AmdSdma3::recover`, from `sdma_v3_0_pre_soft_reset` / `_soft_reset` / `_post_soft_reset`): context switching off and the engines halted, `SRBM_SOFT_RESET` for both engines pulsed, then `start()` again on the
+  same memory (the driver's `gfx_resume` and `rlc_resume`); both engines are reset together, as in the driver, and the trap interrupts are put back.
+- A fault of one compute queue resets all of them with the graphics engine, as the driver's soft reset of the IP does. An engine whose ring test fails after the reset is left stopped (`failed`); it counts as needing
+  recovery, so the next `recover()` tries it again.
+
+The simulated engines hang (`hung` for the command processor, `stall` for SDMA) until the reset pulse reaches them, unless told the reset does not work; the reset also takes their interrupt enables, hardware queues and
+doorbells away, so the ordering of the steps, the exact reset bits for each status, and what is restored are checked. `scripts/check_reset_port.py` compares the status bits, reset bits, pre/soft/post order, the reset pulses,
+the queue dequeue and the SDMA sequence with the kernel sources. Not done: resetting the video engines (UVD/VCE), and the replay of the work that was lost: callers see the failure of their
+submission and must resubmit. Whether a real CP comes back from `GRBM_SOFT_RESET` with the microcode the SMC loaded is what the driver relies on and has not been seen here.
+
+### Full reset of the card
+
+When an engine does not come back from its soft reset, `AmdVegaM::recover()` can fall back to resetting the whole card (`Inputs::allow_asic_reset`, with `Inputs::pci` and `pci_address` saying where the card is;
+`Recovery::card_reset` and `asic_resets()` say it happened, at most `kMaxAsicResets` (2) times). `AmdAsicReset::pci_config_reset` is `vi_asic_reset` -> `vi_asic_pci_config_reset`: the BIOS scratch register's
+"graphics engine hung" flag is set, bus mastering is switched off, the magic value 0x39d5e86b is written to dword 0x7c of the card's PCI configuration space (`amdgpu_device_pci_config_reset`), after 100 us the card has
+`usec_timeout` (100 ms) to answer reads of `CONFIG_MEMSIZE` again (all ones while it is in reset), bus mastering is switched back on if it did (not if it did not), and the flag is cleared either way. The VEGAM has
+no other method: the driver's BACO (power-off through the SMU) is only for Fiji, Tonga, Polaris 10, 11 and 12 and Topaz. `reset_card()` does it with the rest around it: everything is stopped (the display
+gets the firmware's framebuffer back), the card is reset, and `bring_up` is run again with the same inputs; `status()` says what failed ("card reset: ..." if the card did not answer, "after a card reset: ..." if
+the bring-up failed afterwards).
+
+**What this does not do, and what that means on a real card.** After a hardware reset the driver marks the card as needing a POST and runs the video BIOS's init tables (the memory controller's training, the
+clocks, the display PLLs) through its AtomBIOS interpreter, then initialises every block. This OS now has the interpreter (above) but no way yet to get the video BIOS image, so a card that has been reset comes back quiet - no engine, no DMA, bus mastering on or off as
+above - but its video memory is not trained, `bring_up` is expected to fail, and everything in video memory (including the firmware's framebuffer) is gone. The reset is therefore a last resort, off by default, and
+`main.cpp` allows it only when the card does not drive the display (a dark screen on top of a dead card is no improvement over a hung engine); the benefit is a card that is known to be quiescent instead of one that
+is hung and may still be mastering the bus. Host tests (`AmdAsicResetTest`, `AmdVegaMTest::test_card_reset`) cover the step order and timing, a slow card, a card that never answers, the fallback conditions and the
+cap, a card that is brought up again, and one that cannot be (not POSTed); the simulated card has none of the real one's behaviour here. `scripts/check_asic_reset_port.py` checks the steps, the value, the
+dword, the scratch register and flag, `CONFIG_MEMSIZE` and that the VEGAM is not a BACO chip against the kernel sources. Not done: finding the video BIOS image (which, with the interpreter, would make the reset recoverable), the PCI-level resets
+(function level reset, secondary bus reset) the driver also has for other cases, and BACO.
+
+### AtomBIOS interpreter and the POST after a card reset
+
+`AtomBios` (`AtomBios.*`) is a port of the Linux driver's `atom.c`: the interpreter for the byte code in an AMD card's video BIOS, by which the card is POSTed (the memory controller trained, the clocks and PLLs set
+up) and, in the driver, modes are set. The image holds a ROM header, a list of command tables (small programs with a parameter space and a workspace) and a list of data tables. Operations have operands that are
+registers (memory-mapped, or reached by an indirect I/O program of the BIOS's own), the table's parameters or workspace, the BIOS's scratch memory, its data tables, immediates, and PLL and memory controller registers, as
+whole dwords or a byte or word of one; there are moves, arithmetic, masks, shifts, compares and jumps, a switch, delays and calls of other tables. `IAtomHost` is the driver's `card_info` plus the time: the registers,
+the memory controller and PLL (a discrete card has neither through the BIOS; the host returns zero, like `cail_mc_read`), delays and a clock. `asic_init()` is `amdgpu_atom_asic_init`: command table 0 with the firmware
+info's default engine and memory clocks as its first two parameters.
+
+The image is untrusted bytes, so where the driver reads through pointers this checks every read (a read beyond the image stops the run), checks the scratch memory exactly (the driver lets a read one dword past its
+end through), limits tables calling tables to 16 deep, limits the number of operations (50 million) as well as keeping the driver's rule that a loop which jumps back to the same place for 20 seconds is stuck, avoids C's
+undefined shifts by 32 or more, and keeps the workspace on the stack. Where the driver prints and carries on (a parameter or workspace index out of range, PCI or SYSIO register access, an indirect I/O method that does not
+exist) so does this, and `warnings()` counts them. One of the driver's oddities is ported as it is: a write through an indirect I/O port looks up the program with `io_mode & 0xFF`, a read with `io_mode & 0x7F`.
+Not ported: the name, date, part number and version strings, and the parsing of the other data tables.
+
+How it was checked, in three ways. `tests/AtomBiosTest.cpp` has hand-assembled images (`tests/AtomBiosImage.hpp`) for every operation with results worked out by hand, the alignments, the compare and jump conditions,
+switches, calls and parameter passing, the I/O ports, the scratch memory, the limits, the parser's refusals, and truncated and bit-flipped images under the sanitizers. `scripts/atom_differential/run.sh` compiles the
+Linux driver's own `atom.c` in user space (with stubs for the kernel headers) and runs random but well formed programs - every operation, operand kind and alignment, indirect I/O programs, switches, calls - through both
+interpreters against identical simulated cards, comparing the result, every register, memory controller and PLL access and delay in order, the parameters and the scratch memory: 30,000 programs and a million accesses agree.
+It found what the unit tests could not: the driver's negative parameter-space size for a callee of a callee, a null pointer dereference in its part-number parsing, undefined shifts in the indirect I/O code. `scripts/check_atom_port.py`
+checks the constants, the alignment tables, the generated opcode table (`scripts/gen_atom_ops.py` makes `AtomBiosOps.inc` from the driver's `opcode_table`) and the layout of the data tables.
+
+`AmdVegaM::post()` runs the POST with `Inputs::vbios`, and `reset_card()` does it between the reset and the bring-up when the image is given. The simulated card here is "trained" by a marker write in the video BIOS's table.
+**Where the video BIOS image comes from.** `AmdVbios` (`AmdVbios.*`) finds it, following `amdgpu_bios.c` in the order of `amdgpu_get_bios_dgpu`: (0) the ACPI ATRM method, an AML method (`ATRM(offset, length)`, returning a buffer of the ROM's bytes) of the card's device in the firmware's tables,
+called for pages of 4096 bytes from offset 0 until one comes back short, into a 256 KiB image (`read_from_atrm`; see below); (1) the ACPI VFCT table, which holds the firmware's copy of the
+video BIOS images of its AMD cards - `find_in_vfct` walks the images (28-byte headers: PCI bus, device, function, vendor and device ID, length) and takes the one for this function, as a view into the table;
+(1a) the copy at the start of video memory (`read_from_vram`, `amdgpu_read_bios_from_vram`): a card that has been POSTed has its video BIOS image at the start of the memory BAR, 256 KiB of it (the driver's own guess at
+the size). Only tried when the card needs no POST (`amdgpu_device_need_post` for CIK and later is `BIOS_SCRATCH_7` having `ATOM_S7_ASIC_INIT_COMPLETE`, 0x200 of register 0x5d0, which the register header gives) and the BAR is at
+least 256 KiB (the driver maps that much whatever the BAR says); (1b) the legacy shadow at 0xC0000 (`read_from_legacy_shadow`, `amdgpu_read_platform_bios`: 128 KiB copied, the driver's `pdev->rom`/`romlen` that the PCI core sets for the boot display's shadowed ROM) - but the driver
+knows from the PCI core that the shadow is the card's and this does not, so the image must name the card in its PCI data structure (vendor and device ID, `rom_ids`); the integrated graphics' shadow, which is what a laptop with
+two cards normally has there, is refused; (2) the PCI expansion ROM - `read_from_rom_bar` probes the ROM base register for the window size, switches the ROM on at the base the firmware assigned (no base, no ROM), maps the window, copies it,
+switches it off, and trims the copy to the chained images (`rom_size` is the PCI core's `pci_get_rom_size`: each image gives its length in 512-byte units and whether it is the last); (3) the card's own ROM through the SMC's
+index and data registers (`vi_read_bios_from_rom`: header first, checked for 0xAA55 and the AMD string, then the length it names). Every image passes `check_atom_bios` (0xAA55, a header pointer at 0x48, "ATOM" or "MOTA" at
+its offset 4). `main.cpp` looks only when the card may be reset (otherwise nothing would use the image) and `AmdVegaM::bring_up` keeps its own copy, so the buffers need not outlive the call. **The ATRM method** runs on the repository's AML interpreter (`acpi::AmlInterpreter`) with the DSDT and SSDTs loaded; `main.cpp` makes one for the look and drops it afterwards (the machine's
+operation regions are reached through `SystemAcpiHost`, as for the battery). The driver takes the first display device on the PCI bus whose ACPI node has an `ATRM`; the namespace here has no PCI enumeration, so
+the device is found by walking it: first a device that has an `ATRM` method of its own and whose own `_ADR` is the card's (`device << 16 | function`), then, as the driver would, the first device that has one. The walk is
+bounded (4096 nodes, 16 deep). Where the driver copies whatever length the method returns, a page that is not a buffer or is longer than the 4096 asked for ends the reading; the image is checked with `check_atom_bios` as
+the driver does. Not done: the `_INI` methods are not run before the call, and the method is not given the PCI bus (the `_ADR` match cannot tell two cards at the same device and function on different buses apart).
+**The disabled ROM** is the last resort (`read_from_disabled_rom`, `vi_read_disabled_bios` then `amdgpu_read_bios`): for a card whose firmware switched its expansion ROM off, `BUS_CNTL.BIOS_ROM_DIS` is cleared,
+the VGA mode and timing select of the first two display controllers (`D1VGA_CONTROL`, `D2VGA_CONTROL`) and `VGA_RENDER_CONTROL`'s status select are cleared (only if the card has display controllers,
+`Sources::display_engine`, true for the Vega M), `ROM_CNTL` (an SMC register, through the index/data pair) gets `SCK_OVERWRITE`, the expansion ROM is read as in (2), and every register is put back in the same order,
+found or not. It needs the register BAR, the PCI function (a ROM base must have been assigned) and the mapper. `scripts/check_vbios_port.py` (with the three optional register headers) checks the order of the writes and the
+register numbers and masks against `vi.c` and the headers; the test has a card whose ROM answers only once all of it is unlocked (a fake that is stricter than hardware may be, on purpose), checks the exact writes with and
+without display controllers, the restore after a failure, and the place in the order. Every source of `amdgpu_get_bios_dgpu` is now there. **Still unseen:** whether any of this machine's sources is the one that works.
+Tested with hand-assembled AML for the ATRM method (a short page, a page and a short one, two devices told apart by `_ADR`, a name that is not a method, a method on something that is not a device, failing and wrong-typed methods, an endless supply of pages, every truncation and flipped bit of the table), a simulated VFCT table (several cards, truncations, bit flips in every header byte), an expansion ROM behind a working ROM base register, and the SMC pair (`AmdVbiosTest`), and `scripts/check_vbios_port.py` checks
+the signatures, the order, the VFCT layout and the register protocol against the kernel. **Still not seen:** the real machine's VFCT or ROM: whether this machine has a VFCT entry for the Vega M, and whether its table 0 trains the memory.
 
 ## Radeon RX Vega M: UVD 6.3
 

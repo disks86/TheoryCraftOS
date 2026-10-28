@@ -178,6 +178,7 @@ class ObjectManager::SectionRef final : public SharedMemory {
 struct ObjectManager::Section {
   bool used = false, writable = false, file_backed = false;
   uint32_t page = 0, attributes = 0;
+  bool image_mapped = false;
   uint8_t* storage = nullptr;
   uint64_t size = 0, rounded = 0;
   int32_t mappings = 0;
@@ -228,6 +229,7 @@ ObjectManager::~ObjectManager() {
   }
   if (jobs_ && allocator_) allocator_->deallocate(jobs_);
   if (locks_ && allocator_) allocator_->deallocate(locks_);
+  if (shares_ && allocator_) allocator_->deallocate(shares_);
   if (sections_) {
     for (uint32_t i = 0; i < kMaxSections; ++i) if (sections_[i].storage && allocator_) allocator_->deallocate(sections_[i].storage);
     if (allocator_) allocator_->deallocate(sections_);
@@ -472,9 +474,11 @@ struct ObjectManager::RangeLock {
 };
 
 namespace {
+// Byte ranges [offset, offset + length) up to the end of the 64-bit space; a range of no bytes locks nothing and conflicts with nothing.
 bool ranges_overlap(uint64_t a, uint64_t alen, uint64_t b, uint64_t blen) {
-  const uint64_t aend = a + alen < a ? ~uint64_t{0} : a + alen, bend = b + blen < b ? ~uint64_t{0} : b + blen;
-  return a < bend && b < aend;
+  if (alen == 0 || blen == 0) return false;
+  const uint64_t alast = alen - 1 > ~uint64_t{0} - a ? ~uint64_t{0} : a + (alen - 1), blast = blen - 1 > ~uint64_t{0} - b ? ~uint64_t{0} : b + (blen - 1);
+  return a <= blast && b <= alast;
 }
 }  // namespace
 
@@ -489,6 +493,7 @@ ObjectManager::LockResult ObjectManager::lock_range_locked(StringView path, cons
   for (uint32_t i = 0; i < kMaxLocks; ++i) {
     const RangeLock& l = locks_[i];
     if (!l.used || !same_name(l.path, l.path_size, path) || !ranges_overlap(l.offset, l.length, offset, length)) continue;
+    if (l.owner == owner) { if (exclusive) return LockResult::Conflict; continue; }      // (an open file does not lock itself out, except with an exclusive lock over its own)
     if (l.exclusive || exclusive) return LockResult::Conflict;      // (two shared locks may overlap, even of one file; anything with an exclusive one may not)
   }
   for (uint32_t i = 0; i < kMaxLocks; ++i) {
@@ -510,14 +515,84 @@ ObjectManager::LockResult ObjectManager::lock_range_locked(StringView path, cons
 bool ObjectManager::unlock_range(StringView path, const void* owner, uint64_t offset, uint64_t length) {
   Locked hold(sync_);
   if (!locks_) return false;
-  for (uint32_t i = 0; i < kMaxLocks; ++i) {
-    RangeLock& l = locks_[i];
-    if (!l.used || l.owner != owner || l.offset != offset || l.length != length || !same_name(l.path, l.path_size, path)) continue;
-    l.used = false;
-    sync_.notify_all();      // whoever waits for the range looks again
-    return true;
+  for (int pass = 0; pass < 2; ++pass) {      // an exclusive lock of exactly this range goes before a shared one
+    for (uint32_t i = 0; i < kMaxLocks; ++i) {
+      RangeLock& l = locks_[i];
+      if (!l.used || l.owner != owner || l.offset != offset || l.length != length || !same_name(l.path, l.path_size, path) || l.exclusive != (pass == 0)) continue;
+      l.used = false;
+      sync_.notify_all();      // whoever waits for the range looks again
+      return true;
+    }
   }
   return false;
+}
+
+struct ObjectManager::ShareEntry {
+  bool used = false;
+  const void* owner = nullptr;
+  uint32_t access = 0, share = 0;
+  char path[260] = {};
+  uint32_t path_size = 0;
+};
+
+ObjectManager::ShareResult ObjectManager::share_acquire(StringView path, const void* owner, uint32_t access, uint32_t share) {
+  Locked hold(sync_);
+  if (!allocator_ || path.size() >= 260) return ShareResult::Full;
+  if (!shares_) {
+    void* memory = allocator_->allocate(sizeof(ShareEntry) * kMaxShares);
+    if (!memory) return ShareResult::Full;
+    shares_ = static_cast<ShareEntry*>(memory);
+    for (uint32_t i = 0; i < kMaxShares; ++i) new (&shares_[i]) ShareEntry();
+  }
+  access &= kShareRead | kShareWrite | kShareDelete;
+  if (access == 0) return ShareResult::Granted;      // (nothing to conflict with, and nothing to remember)
+  for (uint32_t i = 0; i < kMaxShares; ++i) {
+    const ShareEntry& e = shares_[i];
+    if (!e.used || !same_name(e.path, e.path_size, path)) continue;
+    if ((access & ~e.share) != 0 || (e.access & ~share) != 0) return ShareResult::Violation;
+  }
+  if (!owner) return ShareResult::Granted;      // only asked whether it would be allowed
+  for (uint32_t i = 0; i < kMaxShares; ++i) {
+    ShareEntry& e = shares_[i];
+    if (e.used) continue;
+    e.used = true;
+    e.owner = owner;
+    e.access = access;
+    e.share = share & (kShareRead | kShareWrite | kShareDelete);
+    for (uint32_t k = 0; k < path.size(); ++k) e.path[k] = path[k];
+    e.path_size = static_cast<uint32_t>(path.size());
+    return ShareResult::Granted;
+  }
+  return ShareResult::Full;
+}
+
+bool ObjectManager::share_allows(StringView path, uint32_t access) {
+  Locked hold(sync_);
+  if (!shares_) return true;
+  for (uint32_t i = 0; i < kMaxShares; ++i) {
+    const ShareEntry& e = shares_[i];
+    if (e.used && same_name(e.path, e.path_size, path) && (access & ~e.share) != 0) return false;
+  }
+  return true;
+}
+
+uint32_t ObjectManager::share_owners(StringView path, const void** owners, uint32_t capacity) {
+  Locked hold(sync_);
+  uint32_t count = 0;
+  if (!shares_) return 0;
+  for (uint32_t i = 0; i < kMaxShares; ++i) {
+    const ShareEntry& e = shares_[i];
+    if (!e.used || !same_name(e.path, e.path_size, path)) continue;
+    if (count < capacity) owners[count] = e.owner;
+    ++count;
+  }
+  return count;
+}
+
+void ObjectManager::share_release(const void* owner) {
+  Locked hold(sync_);
+  if (!shares_) return;
+  for (uint32_t i = 0; i < kMaxShares; ++i) if (shares_[i].used && shares_[i].owner == owner) shares_[i].used = false;
 }
 
 void ObjectManager::unlock_all(const void* owner) {
@@ -650,6 +725,26 @@ bool ObjectManager::section_memory(uint32_t id, uint8_t** storage, uint64_t* siz
   *size = s.rounded;
   *owner = &s.ref;
   return true;
+}
+
+bool ObjectManager::section_note_image_view(uint32_t id) {
+  Locked hold(sync_);
+  Object* o = at(id);
+  if (!o || o->kind != ObjectKind::Section || o->section < 0 || !sections_) return false;
+  const bool before = sections_[o->section].image_mapped;
+  sections_[o->section].image_mapped = true;
+  return before;
+}
+
+uint32_t ObjectManager::file_has_section(StringView host_path) {
+  Locked hold(sync_);
+  uint32_t found = 0;
+  if (!sections_) return 0;
+  for (uint32_t i = 0; i < kMaxSections; ++i) {
+    const Section& s = sections_[i];
+    if (s.used && s.file_backed && s.path_size == host_path.size() && same_name(s.path, s.path_size, host_path)) { if (s.attributes & 0x1000000u) return 2; found = 1; }
+  }
+  return found;
 }
 
 bool ObjectManager::section_info(uint32_t id, SectionInfo* out) {

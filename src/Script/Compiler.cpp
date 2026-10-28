@@ -66,6 +66,9 @@ struct FuncState {
   List<Patch> patches;
   List<EnvScope> envs;          // the block Envs that are open here, outermost first
   bool is_global = false;
+  bool arrow = false;        // a function seen from a direct eval has no code of its own: this says whether it is an arrow
+  bool frozen = false;       // ... and it cannot get an `arguments` variable any more
+  bool is_program = false;   // the code of the whole source (a strict eval is one that is not global: its variables are its own)
   uint32_t scope_depth = 0;     // blocks entered (0: the function's own top level)
   int32_t completion_slot = -1;
   uint32_t next_ctx_id = 1;
@@ -73,19 +76,69 @@ struct FuncState {
 
 class Compiler {
  public:
-  Compiler(Vm& vm, String* error, bool library) : vm_(vm), error_(error), library_(library), withs_(vm.allocator()) {}
+  Compiler(Vm& vm, String* error, bool library, bool local_scope) : vm_(vm), error_(error), library_(library), local_scope_(local_scope), withs_(vm.allocator()) {}
+
+  // The program of a direct eval: compiled as a function inside the functions that were around the call, so that it reads and writes their variables.
+  bool eval_program(Node* block, const EvalScope& scope, FunctionCode** out) {
+    allocators::IAllocator& a = vm_.allocator();
+    List<FuncState*> chain(a);
+    for (uint64_t f = 0; f < scope.frames.count(); ++f) {
+      const EvalFrame& frame = scope.frames[f];
+      void* mem = a.allocate(sizeof(FuncState));
+      if (!mem) return fail("Out of memory", 0);
+      FuncState* fs = new (mem) FuncState(a);
+      chain.push_back(fs);
+      fs->arrow = frame.arrow;
+      fs->frozen = true;
+      fs->is_global = frame.global;
+      for (uint32_t k = 0; k < frame.env_count; ++k) fs->envs.push_back(EnvScope{0, 0, 0});
+      for (uint32_t k = 0; k < frame.count; ++k) {
+        const EvalBinding& e = scope.bindings[frame.first + k];
+        Binding b{scope.text.view().substr(e.name_at, e.name_len), e.slot, scope.text.view().substr(e.import_at, e.import_len)};
+        b.lexical = e.lexical;
+        b.is_const = e.is_const;
+        b.level = e.level;
+        fs->bindings.push_back(b);
+      }
+      if (f > 0) chain[f - 1]->parent = fs;
+    }
+    eval_parent_ = chain.count() ? chain[0] : nullptr;
+    for (uint64_t f = chain.count(); f > 0; --f) {   // the objects that hold the variables other evals declared (outermost first: the innermost is looked in first)
+      FuncState* fs = chain[f - 1];
+      for (uint64_t i = 0; i < fs->bindings.count(); ++i)
+        if (fs->bindings[i].name.starts_with("%ev")) {
+          withs_.push_back(WithCtx{fs, 0, fs->bindings[i].name, true});
+          if (f == 1) eval_dynamic_ = fs->bindings[i].name;
+        }
+    }
+    eval_strict_ = scope.frames.count() && scope.frames[0].strict;
+    const bool ok = program(block, out);
+    for (uint64_t i = 0; i < chain.count(); ++i) {
+      chain[i]->~FuncState();
+      a.deallocate(chain[i]);
+    }
+    return ok;
+  }
 
   bool program(Node* block, FunctionCode** out) {
     FuncState fs(vm_.allocator());
     fs.code = vm_.new_code();
     if (!fs.code) return fail("Out of memory", 0);
-    fs.is_global = true;
     fs.code->library = library_;
     fs.code->strict = (block->flags & kFlagStrict) != 0 || has_use_strict(block->list);
+    fs.is_program = true;
+    fs.is_global = !(local_scope_ && fs.code->strict);
+    if (eval_parent_) {   // a direct eval: the code is a closure made where the eval is called
+      fs.parent = eval_parent_;
+      fs.is_global = false;
+      fs.code->is_arrow = true;
+      fs.code->strict = fs.code->strict || eval_strict_;
+    }
     cur_ = &fs;
     fs.completion_slot = static_cast<int32_t>(new_slot());
     check_redeclarations(block->list);
     hoist_globals(block->list);
+    declare_lexicals(block->list);   // (nothing for a global program: its let and const are globals)
     init_functions(block->list);
     for (Node* s = block->list; s && !failed_; s = s->next) statement(s);
     emit(Opc::GetVar, fs.completion_slot, fn_hops(), 0);
@@ -129,6 +182,7 @@ class Compiler {
 
   // Does a statement list begin with the "use strict" directive?
   static bool has_use_strict(const Node* list) {
+    while (list && list->kind == NodeKind::Var && (list->flags & kFlagPrologue)) list = list->next;   // (the unpacking of pattern parameters is not a statement of the body)
     for (const Node* s = list; s && s->kind == NodeKind::ExprStmt && s->a && s->a->kind == NodeKind::String; s = s->next)
       if (s->a->text.equals("use strict") && !(s->a->flags & kFlagParenthesized)) return true;
     return false;
@@ -195,8 +249,23 @@ class Compiler {
     while (cur_->bindings.count() > mark) cur_->bindings.remove_at(cur_->bindings.count() - 1);
     --cur_->scope_depth;
   }
+  // Early errors of strict mode code on a name: `eval` and `arguments` cannot be bound or assigned, and the words reserved for the future are not identifiers.
+  void strict_name(StringView name, uint32_t line, bool binding, bool force = false) {
+    if (!cur_ || !(cur_->code->strict || force) || library_ || name.empty() || name[0] == '%') return;
+    if (binding && (name.equals("eval") || name.equals("arguments"))) {
+      fail("Unexpected eval or arguments in strict mode", line ? line : line_);
+      return;
+    }
+    static const char* const kReserved[] = {"implements", "interface", "let", "package", "private", "protected", "public", "static", "yield"};
+    for (const char* word : kReserved)
+      if (name.equals(word)) {
+        fail("Unexpected strict mode reserved word", line ? line : line_);
+        return;
+      }
+  }
   // A variable of the current block (let / const) or of the function (var, parameters).
   uint32_t declare(StringView name) {
+    strict_name(name, 0, true);
     for (uint64_t i = cur_->bindings.count(); i > 0; --i) {
       if (cur_->bindings[i - 1].name.equals(name) && i - 1 >= (cur_->scope_marks.count() ? cur_->scope_marks[cur_->scope_marks.count() - 1] : 0)) return cur_->bindings[i - 1].slot;
     }
@@ -277,7 +346,7 @@ class Compiler {
           return true;
         }
       }
-      if (name.equals("arguments") && !fs->is_global && !fs->code->is_arrow) {
+      if (name.equals("arguments") && !fs->is_global && !fs->is_program && !fs->frozen && !(fs->code ? fs->code->is_arrow : fs->arrow)) {
         FuncState* saved = cur_;
         cur_ = fs;
         const uint32_t s = new_slot();
@@ -328,6 +397,21 @@ class Compiler {
     (void)nested;
   }
   void declare_var(StringView name) {
+    strict_name(name, 0, true);
+    if (!eval_dynamic_.empty() && cur_->is_program && cur_->parent == eval_parent_ && !cur_->code->strict) {   // sloppy direct eval: a var is a variable of the calling function
+      uint32_t d, s;
+      if (resolve(name, &d, &s) && resolved_funcs_ == 1) return;   // (the function has it: nothing to declare)
+      emit(Opc::PushStr, static_cast<int32_t>(constant_string(name)));
+      load_plain(eval_dynamic_, 0);
+      emit(binary_opcode(Op::In));
+      const uint32_t has = emit(Opc::JumpIfTrue);
+      load_plain(eval_dynamic_, 0);
+      emit(Opc::PushUndef);
+      emit(Opc::SetProp, static_cast<int32_t>(constant_string(name)));
+      emit(Opc::Pop);
+      patch(has);
+      return;
+    }
     if (cur_->is_global) {
       emit(Opc::DeclareGlobal, static_cast<int32_t>(constant_string(name)));
       return;
@@ -369,6 +453,7 @@ class Compiler {
   void init_functions(Node* list) {
     for (Node* s = list; s; s = s->next) {
       if (s->kind != NodeKind::FunctionDecl) continue;
+      if (!(s->a->flags & kFlagExprBody)) strict_name(s->text, s->line, true, has_use_strict(s->a->a->list));   // (a function with the directive in its body is strict, and so is its name)
       function_value(s->a);
       store_name(s->text, s->line);
       emit(Opc::Pop);
@@ -391,6 +476,7 @@ class Compiler {
     FuncState* fs;
     uint64_t mark;    // the bindings of fs from here on were declared inside the body (they shadow the object)
     StringView var;   // the hidden variable that holds the object
+    bool whole = false;   // the object of a function that calls eval: the names of the whole function are bound inside it
   };
   // Is `name` bound inside the with statement (by a let, a parameter or a variable of a function in the body)?
   bool bound_inside(const WithCtx& ctx, StringView name) {
@@ -408,6 +494,7 @@ class Compiler {
   bool with_applies(StringView name) const { return !withs_.empty() && !name.empty() && name[0] != '%' && name.find('.') == StringView::npos; }
 
   void load_name(StringView name, uint32_t line) {
+    strict_name(name, line, false);
     if (!with_applies(name)) return load_plain(name, line);
     List<uint32_t> ends(vm_.allocator());
     for (uint64_t i = withs_.count(); i > 0; --i) {
@@ -426,6 +513,7 @@ class Compiler {
     for (uint64_t i = 0; i < ends.count(); ++i) patch(ends[i]);
   }
   void store_name(StringView name, uint32_t line, bool initialize = false) {
+    if (!initialize) strict_name(name, line, true);
     if (!with_applies(name) || initialize) return store_plain(name, line, initialize);
     List<uint32_t> ends(vm_.allocator());
     for (uint64_t i = withs_.count(); i > 0; --i) {
@@ -521,6 +609,25 @@ class Compiler {
     fs.code->is_async = (fn->flags & kFlagAsync) != 0;
     fs.code->is_generator = (fn->flags & kFlagGenerator) != 0 && !(fn->flags & kFlagArrow);
     fs.code->name = !fn->text.empty() ? vm_.intern(fn->text) : !inferred.empty() ? vm_.intern(inferred) : nullptr;
+    {   // early errors of the parameter list
+      bool simple = !(fn->flags & kFlagRest);
+      for (Node* p = fn->list; p; p = p->next) simple = simple && !p->a && !(!p->text.empty() && p->text[0] == '%');
+      if (!simple && !(fn->flags & kFlagExprBody) && has_use_strict(fn->a->list)) fail("Illegal 'use strict' directive in function with non-simple parameter list", fn->line);
+      if (fs.code->strict || fs.code->is_arrow || !simple) {
+        for (Node* p = fn->list; p; p = p->next) {
+          if (!p->text.empty() && p->text[0] == '%') continue;
+          for (Node* q = fn->list; q != p; q = q->next)
+            if (q->text.equals(p->text)) fail("Duplicate parameter name not allowed in this context", p->line);
+        }
+      }
+      if (!(fn->flags & kFlagExprBody))   // a name the patterns of the parameters bind is a parameter too
+        for (Node* v = fn->a->list; v && v->kind == NodeKind::Var && (v->flags & kFlagPrologue); v = v->next)
+          for (Node* d = v->list; d; d = d->next)
+            for (Node* p = fn->list; p; p = p->next)
+              if (p->text.equals(d->text)) fail("Duplicate parameter name not allowed in this context", d->line);
+      for (Node* p = fn->list; p; p = p->next) strict_name(p->text, p->line, true);
+      if ((fn->flags & kFlagExpression) && !fn->text.empty()) strict_name(fn->text, fn->line, true);
+    }
     uint32_t params = 0;
     bool counting = true;
     for (Node* p = fn->list; p; p = p->next) {
@@ -549,6 +656,23 @@ class Compiler {
     }
     if (!(fn->flags & kFlagExprBody)) hoist_vars(fn->a->list, false);
     if (!(fn->flags & kFlagExprBody)) bind_imports(fn->a->list);
+    bool has_dynamic = false;
+    if (!(fn->flags & kFlagExprBody) && (fn->a->flags & kFlagHasEval) && !fs.code->strict && !library_) {   // eval(...) here may declare variables: they live in an object that the names of the function look in
+      String text(vm_.allocator());
+      text.append("%ev");
+      text.append_uint(++with_counter_);
+      const StringView var = vm_.intern(text.view())->view();
+      emit(Opc::NewObject, 0, 0, fn->line);
+      emit(Opc::PushNull);
+      emit(Opc::SetLiteralProto);
+      const uint32_t slot = new_slot();
+      cur_->bindings.insert(function_level_count_, Binding{var, slot});
+      ++function_level_count_;
+      store_plain(var, fn->line, true);
+      emit(Opc::Pop);
+      withs_.push_back(WithCtx{cur_, 0, var, true});
+      has_dynamic = true;
+    }
     // default values of parameters
     uint32_t index = 0;
     for (Node* p = fn->list; p; p = p->next, ++index) {
@@ -577,6 +701,7 @@ class Compiler {
       emit(Opc::PushUndef);
       emit(Opc::Return);
     }
+    if (has_dynamic) withs_.remove_at(withs_.count() - 1);
     cur_ = saved;
     function_level_count_ = saved_level;
     return failed_ ? nullptr : fs.code;
@@ -661,7 +786,7 @@ class Compiler {
       case NodeKind::FunctionDecl: return;   // (made when its list began)
       case NodeKind::ExprStmt:
         expression(n->a);
-        if (cur_->is_global && cur_->parent == nullptr && cur_->completion_slot >= 0) {
+        if (cur_->is_program && cur_->completion_slot >= 0) {
           emit(Opc::SetVar, cur_->completion_slot, fn_hops(), n->line);
         }
         emit(Opc::Pop);
@@ -680,6 +805,10 @@ class Compiler {
         return;
       }
       case NodeKind::If: {
+        if (cur_->code->strict && !library_ && ((n->b && n->b->kind == NodeKind::FunctionDecl) || (n->c && n->c->kind == NodeKind::FunctionDecl))) {
+          fail("In strict mode code, functions can only be declared at top level or inside a block", n->line);
+          return;
+        }
         expression(n->a);
         const uint32_t to_else = emit(Opc::JumpIfFalse);
         statement(n->b);
@@ -708,7 +837,7 @@ class Compiler {
         ++function_level_count_;
         for (uint64_t m = 0; m < cur_->scope_marks.count(); ++m) ++cur_->scope_marks[m];
         for (uint64_t k = 0; k < withs_.count(); ++k)
-          if (withs_[k].fs == cur_) ++withs_[k].mark;
+          if (withs_[k].fs == cur_ && !withs_[k].whole) ++withs_[k].mark;
         store_plain(var, n->line, true);
         emit(Opc::Pop);
         withs_.push_back(WithCtx{cur_, cur_->bindings.count(), var});
@@ -785,6 +914,10 @@ class Compiler {
       case NodeKind::Switch: switch_statement(n); return;
       case NodeKind::Labeled: {
         const NodeKind k = n->a->kind;
+        if (k == NodeKind::FunctionDecl && cur_->code->strict && !library_) {
+          fail("In strict mode code, functions can only be declared at top level or inside a block", n->line);
+          return;
+        }
         if (k == NodeKind::For || k == NodeKind::ForIn || k == NodeKind::ForOf || k == NodeKind::While || k == NodeKind::DoWhile) {
           pending_label_ = n->text;
           statement(n->a);
@@ -1040,12 +1173,15 @@ class Compiler {
     line_ = n->line;
     switch (n->kind) {
       case NodeKind::Number: {
+        if ((n->flags & kFlagLegacyOctal) && cur_->code->strict && !library_) { fail("Octal literals are not allowed in strict mode", n->line); return; }
         const double d = n->number;
         if (d == static_cast<double>(static_cast<int32_t>(d)) && !(d == 0 && 1 / d < 0)) emit(Opc::PushInt, static_cast<int32_t>(d));
         else emit(Opc::PushNum, static_cast<int32_t>(constant_number(d)));
         return;
       }
-      case NodeKind::String: emit(Opc::PushStr, static_cast<int32_t>(constant_string(n->text))); return;
+      case NodeKind::String:
+        if ((n->flags & kFlagLegacyOctal) && cur_->code->strict && !library_) { fail("Octal escape sequences are not allowed in strict mode", n->line); return; }
+        emit(Opc::PushStr, static_cast<int32_t>(constant_string(n->text))); return;
       case NodeKind::Template: {
         bool first = true;
         for (Node* p = n->list; p; p = p->next) {
@@ -1249,6 +1385,10 @@ class Compiler {
   void unary(Node* n) {
     switch (n->op) {
       case Op::Delete:
+        if (n->a->kind == NodeKind::Ident && cur_->code->strict && !library_) {
+          fail("Delete of an unqualified identifier in strict mode", n->line);
+          return;
+        }
         if (n->a->kind == NodeKind::OptionalChain && (n->a->a->kind == NodeKind::Member || n->a->a->kind == NodeKind::Index)) {   // delete a?.b
           Node* link = n->a->a;
           const uint64_t first = chain_jumps_.count();
@@ -1278,12 +1418,29 @@ class Compiler {
         return;
       case Op::TypeOf: {
         uint32_t depth, slot;
+        List<uint32_t> ends(vm_.allocator());
+        if (n->a->kind == NodeKind::Ident && with_applies(n->a->text)) {   // typeof name, where a with object or the variables of an eval may have it
+          for (uint64_t i = withs_.count(); i > 0; --i) {
+            const WithCtx ctx = withs_[i - 1];
+            if (bound_inside(ctx, n->a->text)) break;
+            emit(Opc::PushStr, static_cast<int32_t>(constant_string(n->a->text)), 0, n->line);
+            load_plain(ctx.var, n->line);
+            emit(binary_opcode(Op::In), 0, 0, n->line);
+            const uint32_t no = emit(Opc::JumpIfFalse);
+            load_plain(ctx.var, n->line);
+            emit(Opc::GetProp, static_cast<int32_t>(constant_string(n->a->text)), 0, n->line);
+            emit(Opc::Typeof);
+            ends.push_back(emit(Opc::Jump));
+            patch(no);
+          }
+        }
         if (n->a->kind == NodeKind::Ident && !resolve(n->a->text, &depth, &slot) && !n->a->text.equals("undefined")) {
           emit(Opc::TypeofGlobal, static_cast<int32_t>(constant_string(n->a->text)), 0, n->line);
         } else {
           expression(n->a);
           emit(Opc::Typeof);
         }
+        for (uint64_t i = 0; i < ends.count(); ++i) patch(ends[i]);
         return;
       }
       case Op::Void:
@@ -1502,6 +1659,7 @@ class Compiler {
     }
     uint32_t count;
     const bool plain = arguments(n->list, &count);
+    if (plain && !is_new && callee->kind == NodeKind::Ident && callee->text.equals("eval") && count < 250 && !library_) emit_eval_scope(count, n->line);
     if (plain) emit(is_new ? Opc::New : Opc::Call, static_cast<int32_t>(count), 0, n->line);
     else emit(is_new ? Opc::NewSpread : Opc::CallSpread, 0, 0, n->line);
     if (optional_call) {
@@ -1530,6 +1688,36 @@ class Compiler {
     }
   }
 
+  // eval(...): remembers the variables that can be seen from here, for the case that the function called is the real eval (a direct eval runs in them).
+  void emit_eval_scope(uint32_t argc, uint32_t line) {
+    uint32_t d, s;
+    resolve(StringView("arguments"), &d, &s);   // (the function that encloses the call gets its `arguments` now: the eval cannot add a variable to it later)
+    allocators::IAllocator& a = vm_.allocator();
+    void* mem = a.allocate(sizeof(EvalScope));
+    if (!mem) { fail("Out of memory", line); return; }
+    EvalScope* scope = new (mem) EvalScope(a);
+    if (!cur_->code->eval_scopes.push_back(scope) || cur_->code->eval_scopes.count() > 60000) { fail("Out of memory", line); return; }
+    auto text_of = [&](StringView v, uint32_t* at, uint32_t* len) {
+      *at = static_cast<uint32_t>(scope->text.size());
+      *len = static_cast<uint32_t>(v.size());
+      scope->text.append(v);
+    };
+    for (FuncState* fs = cur_; fs; fs = fs->parent) {
+      EvalFrame frame{static_cast<uint32_t>(scope->bindings.count()), 0, static_cast<uint32_t>(fs->envs.count()), fs->code ? fs->code->strict : false, fs->code ? fs->code->is_arrow : fs->arrow, fs->is_global};
+      for (uint64_t i = 0; i < fs->bindings.count(); ++i) {
+        const Binding& b = fs->bindings[i];
+        EvalBinding e{};
+        text_of(b.name, &e.name_at, &e.name_len);
+        text_of(b.import_name, &e.import_at, &e.import_len);
+        e.slot = b.slot; e.level = b.level; e.lexical = b.lexical; e.is_const = b.is_const;
+        scope->bindings.push_back(e);
+        ++frame.count;
+      }
+      scope->frames.push_back(frame);
+    }
+    emit(Opc::EvalScope, static_cast<int32_t>(cur_->code->eval_scopes.count() - 1), static_cast<uint8_t>(argc), line);
+  }
+
   static constexpr uint32_t kNoJump = 0xFFFFFFFFu;
 
   // With the object on the stack, jumps (to be patched) when it is nullish; the object stays on the stack.
@@ -1545,6 +1733,10 @@ class Compiler {
   FuncState* cur_ = nullptr;
   bool failed_ = false;
   bool library_ = false;
+  bool local_scope_ = false;
+  StringView eval_dynamic_;   // direct eval: the variable that holds the object for the `var`s of a sloppy eval (the calling function's)
+  FuncState* eval_parent_ = nullptr;   // direct eval: the innermost of the functions around the call
+  bool eval_strict_ = false;
   uint32_t resolved_funcs_ = 0;   // set by resolve(): how many functions out the name was found
   bool resolved_lexical_ = false, resolved_const_ = false;   // set by resolve(): the binding is let / const / class, or const
   StringView resolved_import_;   // set by resolve(): the export an import binding reads (empty for any other)
@@ -1562,8 +1754,13 @@ class Compiler {
 
 }  // namespace
 
-bool compile_program(Vm& vm, Node* program, FunctionCode** out, String* error, bool library) {
-  Compiler compiler(vm, error, library);
+bool compile_eval_program(Vm& vm, Node* program, const EvalScope& scope, FunctionCode** out, String* error) {
+  Compiler compiler(vm, error, false, true);
+  return compiler.eval_program(program, scope, out);
+}
+
+bool compile_program(Vm& vm, Node* program, FunctionCode** out, String* error, bool library, bool local_scope) {
+  Compiler compiler(vm, error, library, local_scope);
   return compiler.program(program, out);
 }
 

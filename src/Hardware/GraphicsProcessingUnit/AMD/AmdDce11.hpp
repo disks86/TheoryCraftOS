@@ -150,11 +150,18 @@ class Interrupts {
 
   void set_pageflip(uint32_t crtc, bool enable);   // GRPH_INTERRUPT_CONTROL.GRPH_PFLIP_INT_MASK
   void set_vblank(uint32_t crtc, bool enable);     // LB_INTERRUPT_MASK.VBLANK_INTERRUPT_MASK
+  void set_vline(uint32_t crtc, bool enable);      // LB_INTERRUPT_MASK.VLINE_INTERRUPT_MASK (dce_v11_0_set_crtc_vline_interrupt_state)
   // A pin on: DC_HPD_EN, the toggle filter, the pending interrupt acknowledged, the polarity set to report the next change, then DC_HPD_INT_EN. Off: DC_HPD_EN and DC_HPD_INT_EN cleared.
   void hpd_init(uint32_t pin);
   void hpd_fini(uint32_t pin);
   void hpd_set_interrupt(uint32_t pin, bool enable);   // DC_HPD_INT_EN alone (dce_v11_0_set_hpd_irq_state)
   bool hpd_sense(uint32_t pin);                        // dce_v11_0_hpd_sense: something is connected
+  // The short pulse of a DisplayPort sink (a status change that is not a plug: link loss, a request to retest): DC_HPD_INT_CONTROL.DC_HPD_RX_INT_EN, the pending state in
+  // DC_HPD_INT_STATUS.DC_HPD_RX_INT_STATUS and DC_HPD_INT_CONTROL.DC_HPD_RX_INT_ACK. (The kernel's own amdgpu display code, dce_v11_0, does not use it; the registers are the
+  // DC code's, see the documentation.) hpd_init does not switch it on, hpd_fini switches it off.
+  void hpd_rx_set_interrupt(uint32_t pin, bool enable);
+  bool hpd_rx_asserted(uint32_t pin);
+  void ack_hpd_rx(uint32_t pin);
   void hpd_set_polarity(uint32_t pin);                 // interrupt on the next change from what is sensed now
 
   // What a handler does with a vector: whether the interrupt was asserted (DISP_INTERRUPT_STATUS*), and the acknowledgement. False if the controller or pin does not exist.
@@ -165,6 +172,23 @@ class Interrupts {
   bool vline_asserted(uint32_t crtc);
   bool ack_pageflip(uint32_t crtc);   // clears GRPH_PFLIP_INT_OCCURRED if it is set; true if it was
   void ack_hpd(uint32_t pin);
+
+ private:
+  IVcnRegisters& r_;
+};
+
+// The audio endpoints of the display engine (dce_v11_0_audio_endpt_rreg and dce_v11_0_audio_get_connected_pins): an indexed register pair per endpoint, and in it the pin's default
+// configuration, whose port connectivity field says whether the endpoint has a physical connection (1 means none). The Vega M (CHIP_VEGAM, like Polaris 10) has 8 endpoints. Which output
+// an endpoint serves is not fixed: the driver gives an encoder the first connected one it finds (dce_v11_0_audio_get_pin).
+class AudioPins {
+ public:
+  static constexpr uint32_t kMaxPins = 8;
+  static constexpr uint32_t kPortConnectivityNone = 1;
+  explicit AudioPins(IVcnRegisters& registers) : r_(registers) {}
+  uint32_t endpoint_read(uint32_t pin, uint32_t reg);   // 0 for a pin that does not exist
+  uint32_t port_connectivity(uint32_t pin);              // the field of the default configuration (0 connector, 1 none, 2 fixed function, 3 both)
+  bool connected(uint32_t pin);                          // port connectivity is not "none"
+  uint32_t connected_mask(uint32_t pin_count = kMaxPins); // bit n: pin n
 
  private:
   IVcnRegisters& r_;

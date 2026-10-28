@@ -157,14 +157,27 @@ bool PeFile::parse_all(ConstByteView file) {
     }
     section_alignment_ = o.le32();
     file_alignment_ = o.le32();
-    o.skip(2 * 6 + 4);      // OS, image and subsystem versions, Win32VersionValue
+    os_major_ = o.le16();
+    os_minor_ = o.le16();
+    o.skip(2 * 2);      // image version
+    subsystem_major_ = o.le16();
+    subsystem_minor_ = o.le16();
+    o.skip(4);      // Win32VersionValue
     size_of_image_ = o.le32();
     size_of_headers_ = o.le32();
     checksum_ = o.le32();
     subsystem_ = o.le16();
     dll_characteristics_ = o.le16();
-    o.skip(plus_ ? 4 * 8 : 4 * 4);      // stack and heap reserve/commit
-    o.le32();      // LoaderFlags
+    if (plus_) {
+      stack_reserve_ = o.le64();
+      stack_commit_ = o.le64();
+      o.skip(2 * 8);      // heap reserve and commit
+    } else {
+      stack_reserve_ = o.le32();
+      stack_commit_ = o.le32();
+      o.skip(2 * 4);
+    }
+    loader_flags_ = o.le32();
     const uint32_t declared = o.le32();
     if (!o.ok()) return false;
     // Only the directories that fit in the header count (a lying NumberOfRvaAndSizes is clipped, not trusted).

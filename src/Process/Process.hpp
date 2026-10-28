@@ -59,11 +59,16 @@ struct LoadedModule {
   char name[40] = {};                           // canonical ("msvcrt.dll"), NUL-terminated
 };
 // What loads and unloads libraries in a Windows process after it has started (the user-program layer implements it; the process does not know how libraries are found).
+// Where diagnostics of the process layer go (the kernel points it at the debug console; host tests leave it unset).
+extern void (*g_process_log)(const char* text);
+void process_log(StringView text);
+
 class IModuleHost {
  public:
   // Loads the library in `file` under `canonical_name` and the libraries it imports that are missing, and says in `out` (at most `capacity`) which libraries are new, in the
   // order their entry points must run. Returns an NTSTATUS; nothing stays loaded on failure.
-  virtual uint32_t load_module(ConstByteView file, StringView canonical_name, LoadedModule* out, uint32_t capacity, uint32_t* count) = 0;
+  // With `bind` false only the library itself is mapped: its imports are not loaded or resolved and it gets no thread-local data (LOAD_LIBRARY DONT_RESOLVE_DLL_REFERENCES).
+  virtual uint32_t load_module(ConstByteView file, StringView canonical_name, LoadedModule* out, uint32_t capacity, uint32_t* count, bool bind = true) = 0;
   // LoadLibrary of a library that is loaded already (by this canonical name): one more use. False if there is none.
   virtual bool reference_module(StringView canonical_name, uint64_t* base) = 0;
   // FreeLibrary: one use less. The libraries that nobody uses any more are listed in `out` (at most `capacity`) in the order their entry points have to be called with
@@ -139,13 +144,14 @@ class IProcessRuntime {
   // Work on the memory and threads of another running program (by process id). The runtime takes that program's lock and gives up the caller's meanwhile; the work is done by
   // windowsabi::run_remote(). Returns an NTSTATUS.
   struct RemoteOp {
-    enum Kind : uint8_t { Read, Write, Allocate, Free, Protect, Query, CreateThread, ThreadStatus, TerminateThread, ResumeThread } kind = Read;
+    enum Kind : uint8_t { Read, Write, Allocate, Free, Protect, Query, CreateThread, ThreadStatus, TerminateThread, ResumeThread, Unmap, ProcessInfo } kind = Read;
     uint64_t address = 0, size = 0;       // Allocate/Free/Protect: in and out (as the NT services have them); Read/Write: the address; CreateThread: the start routine; thread calls: the thread id
     ByteView out;                         // Read: where the bytes go
     ConstByteView in;                     // Write: the bytes
     uint64_t done = 0;                    // Read/Write: how many bytes were copied
     uint32_t type = 0, protect = 0, old_protect = 0;
     uint8_t info[48] = {};                // Query: MEMORY_BASIC_INFORMATION
+    uint8_t image[64] = {};               // ProcessInfo: the SECTION_IMAGE_INFORMATION of the program; its PEB address comes back in `address`
     uint64_t argument = 0, stack_size = 0, thread_id = 0;      // CreateThread (thread_id comes back); ThreadStatus: exit code (STILL_ACTIVE if it runs) comes back in `size`
     bool suspended = false;
   };
@@ -284,6 +290,12 @@ class Process {
   void set_thread_support(const ThreadSupport& support) { thread_support_ = support; }
   const ThreadSupport& thread_support() const { return thread_support_; }
   ThreadRecord* find_thread(uint64_t id);
+  // NtTerminateProcess(NULL) has ended every thread but the caller: no thread can be made any more.
+  bool threads_terminated() const { return threads_terminated_; }
+  // What NtQueryInformationProcess(ProcessImageInformation) answers: set when the program is loaded.
+  const uint8_t (&image_information() const)[64] { return image_information_; }
+  void set_image_information(const uint8_t (&bytes)[64]) { for (uint32_t i = 0; i < 64; ++i) image_information_[i] = bytes[i]; }
+  void set_threads_terminated() { threads_terminated_ = true; }
   static bool queue_apc(ThreadRecord& t, const ThreadRecord::Apc& apc) {
     if (t.apc_count >= ThreadRecord::kMaxApcs) return false;
     t.apcs[t.apc_count++] = apc;
@@ -351,6 +363,8 @@ class Process {
   ThreadSupport thread_support_;
   uint32_t thread_counter_ = 0, thread_exit_code_ = 0;
   bool thread_exit_pending_ = false;
+  bool threads_terminated_ = false;
+  uint8_t image_information_[64] = {};
   IModuleHost* module_host_ = nullptr;
   uint64_t fs_base_ = 0, gs_base_ = 0;
   bool fs_changed_ = false, gs_changed_ = false;

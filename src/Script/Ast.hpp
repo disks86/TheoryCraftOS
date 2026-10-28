@@ -53,6 +53,8 @@ enum NodeFlag : uint8_t {
   kFlagComputed = 2,     // Property: [key]: value
   kFlagShorthand = 4,    // Property: { name }
   kFlagOptional = 8,     // Member / Index / Call: ?.
+  kFlagLegacyOctal = 16, // Number / String: written as a legacy octal literal or with an octal escape (an error in strict mode code)
+  kFlagPrologue = 16,    // Var: unpacks a parameter that is a pattern (it comes before the directives of the body)
   kFlagPatternAssign = 64,   // Call: a lowered `pattern = value`; c is the original Assign, for when it turns out to be a nested pattern with a default
   kFlagArrow = 1,        // Function
   kFlagExprBody = 2,     // Function: arrow with an expression as its body
@@ -67,6 +69,7 @@ enum NodeFlag : uint8_t {
   kFlagParenthesized = 2,   // String: written in parentheses (so it is not a directive)
   kFlagHole = 32,        // Ident: the gap in an array literal `[1, , 3]`
   kFlagStrict = 64,      // Function / Block (a program): strict mode code (a module, a class body); a "use strict" directive is found by the compiler
+  kFlagHasEval = 128,    // Block (a function body): contains a call of eval(...) that is not inside a function of its own
   kFlagSuper = 128,      // Member / Index: super.name (the object the method is looked up on is the prototype of the parent class; `this` stays the receiver)
 };
 

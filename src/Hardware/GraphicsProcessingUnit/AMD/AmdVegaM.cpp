@@ -110,6 +110,14 @@ bool AmdVegaM::bring_up(const Inputs& in) {
   shutdown();
   status_.assign("");
   inputs_ = in;
+  // The video BIOS image is kept: the caller's buffer need not outlive the call, and reset_card runs the POST later.
+  const bool same_buffer = in.vbios.size() == vbios_.size() && in.vbios.size() != 0 && in.vbios.data() == vbios_.view().data();
+  if (!same_buffer) {
+    vbios_.clear();
+    if (in.vbios.size() != 0 && !vbios_.append(in.vbios)) return fail(Step::None, "out of memory");
+  }
+  inputs_.vbios = vbios_.view();
+  connector_count_ = AtomConnectors::parse(inputs_.vbios, ArrayView<AtomConnectors::Connector>(connectors_, AtomConnectors::kMaxConnectors));
   if (!in.registers || !in.clock || !in.file_system || !in.allocator || !in.mapper || in.aperture_bytes == 0 || in.aperture_physical == 0 || !in.doorbells.valid() ||
       amd_gfx8_firmware_name(in.device_id, AmdGfx8Block::CpPfp) == nullptr)
     return fail(Step::None, "no access to the card (registers, memory BAR, doorbells or a Vega M device)");
@@ -247,7 +255,18 @@ bool AmdVegaM::bring_up(const Inputs& in) {
   if (!display_irq_) return fail(Step::Sdma, "out of memory");
   for (uint32_t crtc = 0; crtc < amd_dce11::kMaxCrtcs; ++crtc) display_irq_->set_pageflip(crtc, true);
   for (uint32_t pin = 0; pin < amd_dce11::Interrupts::kMaxHpd; ++pin)
-    if (in.hpd_pins >> pin & 1) display_irq_->hpd_init(pin);
+    if (in.hpd_pins >> pin & 1) {
+      display_irq_->hpd_init(pin);
+      display_irq_->ack_hpd_rx(pin);               // the short pulses of a DisplayPort sink on the pin: a stale one is dropped, then they are counted (irq()->hpd_rx_count)
+      display_irq_->hpd_rx_set_interrupt(pin, true);
+    }
+  // The state of the pins as they are now.
+  connected_pins_ = 0;
+  throttle_reported_ = 0;
+  hotplug_head_ = hotplug_count_ = hotplug_dropped_ = 0;
+  for (uint32_t pin = 0; pin < amd_dce11::Interrupts::kMaxHpd; ++pin)
+    if ((in.hpd_pins >> pin & 1) && display_irq_->hpd_sense(pin)) connected_pins_ |= 1u << pin;
+  audio_pins_ = amd_dce11::AudioPins(*in.registers).connected_mask(kAudioPins);   // (dce_v11_0_audio_get_connected_pins)
   step_ = Step::Done;
 
   status_.assign("GART ");
@@ -260,12 +279,16 @@ bool AmdVegaM::bring_up(const Inputs& in) {
 
 void AmdVegaM::shutdown() {
   set_vblank_interrupt(false);
+  set_vline_interrupt(false);
   if (display_irq_) {   // (dce_v11_0_hw_fini: the hot plug pins and the page flip interrupts)
     for (uint32_t pin = 0; pin < amd_dce11::Interrupts::kMaxHpd; ++pin)
       if (inputs_.hpd_pins >> pin & 1) display_irq_->hpd_fini(pin);
     for (uint32_t crtc = 0; crtc < amd_dce11::kMaxCrtcs; ++crtc) display_irq_->set_pageflip(crtc, false);
   }
   display_irq_ = UniquePointer<amd_dce11::Interrupts>();
+  connected_pins_ = 0;
+  audio_pins_ = 0;
+  hotplug_head_ = hotplug_count_ = 0;
   display_ = UniquePointer<amd_dce11::Display>();   // (puts the firmware's framebuffer back)
   if (up()) {   // (amdgpu_irq_put in the blocks' hw_fini, before the engines stop)
     gmc_->set_fault_interrupts(false);
@@ -366,7 +389,143 @@ bool AmdVegaM::download(ByteView destination, uint64_t offset, uint32_t instance
 
 uint32_t AmdVegaM::service_interrupts(uint32_t max_vectors) {
   if (!up() || !ih_ || !irq_) return 0;
-  return irq_->process(*ih_, this, max_vectors);
+  const uint32_t handled = irq_->process(*ih_, this, max_vectors);
+  if (inputs_.auto_recover && recoveries_ < kMaxRecoveries && wedged()) recover();
+  return handled;
+}
+
+bool AmdVegaM::read_edid(const AtomConnectors::Connector& connector, ByteBuffer* out) {
+  if (!up() || !inputs_.registers || !inputs_.clock || !connector.has_ddc || AtomConnectors::uses_aux(connector.type)) return false;
+  const AtomI2c::Bus bus = AtomI2c::lookup(inputs_.vbios, connector.ddc_id);
+  if (!bus.valid) return false;
+  return AmdDdc(*inputs_.registers, *inputs_.clock, bus).read_edid(out);
+}
+
+uint32_t AmdVegaM::refresh_audio_pins() {
+  if (!up() || !inputs_.registers) return audio_pins_ = 0;
+  return audio_pins_ = amd_dce11::AudioPins(*inputs_.registers).connected_mask(kAudioPins);
+}
+
+uint32_t AmdVegaM::audio_outputs(AtomConnectors::Connector* out, uint32_t capacity) const {
+  uint32_t n = 0;
+  for (const AtomConnectors::Connector& c : connectors()) {
+    if (!AtomConnectors::carries_audio(c.type) || c.hpd_pin >= amd_dce11::Interrupts::kMaxHpd || !(connected_pins_ >> c.hpd_pin & 1)) continue;
+    if (n < capacity) out[n] = c;
+    ++n;
+  }
+  return n < capacity ? n : capacity;
+}
+
+bool AmdVegaM::take_hotplug(HotplugEvent* out) {
+  if (hotplug_count_ == 0) return false;
+  if (out) *out = hotplug_[hotplug_head_];
+  hotplug_head_ = (hotplug_head_ + 1) % kMaxHotplugEvents;
+  --hotplug_count_;
+  return true;
+}
+
+bool AmdVegaM::wedged() const {
+  if (!up()) return false;
+  if (gfx_->wedged() || !gfx_->running() || sdma_->wedged(0) || sdma_->wedged(1) || !sdma_->running()) return true;   // (not running: an earlier recovery did not bring it back)
+  for (uint32_t queue = 0; queue < compute_->queue_count(); ++queue)
+    if (compute_->queue_wedged(queue)) return true;
+  return false;
+}
+
+AmdVegaM::Recovery AmdVegaM::recover() {
+  Recovery r;
+  if (!up()) return r;
+  bool compute_wedged = false;
+  for (uint32_t queue = 0; queue < compute_->queue_count(); ++queue) compute_wedged = compute_wedged || compute_->queue_wedged(queue);
+  if (gfx_->wedged() || !gfx_->running() || compute_wedged) {
+    ++recoveries_;
+    r.graphics = true;
+    if (gfx_->recover() != AmdGfx8::Result::Ok) r.failed = true;
+  }
+  if (sdma_->wedged(0) || sdma_->wedged(1) || !sdma_->running()) {
+    ++recoveries_;
+    r.sdma = true;
+    if (sdma_->recover() != AmdSdma3::Result::Ok) r.failed = true;
+  }
+  // The soft reset did not bring an engine back: the whole card, if that was allowed.
+  if (r.failed && inputs_.allow_asic_reset && inputs_.pci && asic_resets_ < kMaxAsicResets) {
+    r.card_reset = true;
+    r.failed = !reset_card();
+  }
+  return r;
+}
+
+namespace {
+// The card as the AtomBIOS interpreter sees it (amdgpu's cail_* callbacks): registers by dword; a discrete card has no memory controller or PLL access through the BIOS.
+class PostHost final : public IAtomHost {
+ public:
+  PostHost(IVcnRegisters& registers, const IClock& clock) : registers_(registers), clock_(clock) {}
+  uint32_t read_register(uint32_t reg) override { return registers_.read(reg); }
+  void write_register(uint32_t reg, uint32_t value) override { registers_.write(reg, value); }
+  uint32_t read_mc(uint32_t) override { return 0; }    // (cail_mc_read: "invalid MC read")
+  void write_mc(uint32_t, uint32_t) override {}
+  uint32_t read_pll(uint32_t) override { return 0; }   // (cail_pll_read)
+  void write_pll(uint32_t, uint32_t) override {}
+  void delay_us(uint32_t microseconds) override { wait(microseconds); }
+  void delay_ms(uint32_t milliseconds) override { wait(uint64_t{milliseconds} * 1000); }
+  uint64_t now_us() override { return clock_.now_us(); }
+
+ private:
+  void wait(uint64_t microseconds) {
+    const uint64_t begin = clock_.now_us();
+    while (clock_.now_us() - begin < microseconds) {}
+  }
+  IVcnRegisters& registers_;
+  const IClock& clock_;
+};
+}  // namespace
+
+bool AmdVegaM::post(const Inputs& in) {
+  if (!in.registers || !in.clock || !in.allocator || in.vbios.size() == 0) {
+    status_.assign("POST: no video BIOS image");
+    return false;
+  }
+  PostHost host(*in.registers, *in.clock);
+  AtomBios bios(host, in.vbios, *in.allocator);
+  if (!bios.valid()) {
+    status_.assign("POST: the video BIOS is not an AtomBIOS image");
+    return false;
+  }
+  const AtomBios::Status result = bios.asic_init();
+  if (result != AtomBios::Status::Ok) {
+    status_.assign("POST: ");
+    status_.append(StringView(AtomBios::status_name(result)));
+    return false;
+  }
+  return true;
+}
+
+bool AmdVegaM::reset_card() {
+  if (!inputs_.pci || !inputs_.registers || !inputs_.clock || !inputs_.allocator) return false;
+  ++asic_resets_;
+  const Inputs in = inputs_;
+  shutdown();   // (what can still be stopped is; the display gets the firmware's framebuffer back)
+  const AmdAsicReset::Result reset = AmdAsicReset::pci_config_reset(*in.registers, *in.clock, *in.pci, in.pci_address);
+  if (reset != AmdAsicReset::Result::Ok) {
+    status_.assign("card reset: ");
+    status_.append(StringView(AmdAsicReset::result_name(reset)));
+    return false;
+  }
+  if (in.vbios.size() != 0 && !post(in)) {
+    String text(*in.allocator);
+    text.assign("after a card reset: ");
+    text.append(StringView(status_.c_str()));
+    status_.assign(text.view());
+    return false;
+  }
+  if (!bring_up(in)) {
+    String text(*in.allocator);
+    text.assign("after a card reset: ");
+    text.append(StringView(status_.c_str()));
+    status_.assign(text.view());
+    return false;
+  }
+  return true;
 }
 
 // The driver's handlers for the faults hand the ring to the scheduler's timeout handling (drm_sched_fault); wedging the ring is that here.
@@ -378,6 +537,28 @@ void AmdVegaM::on_event(const AmdIrq::Event& event) {
       else if (event.me == 1 || event.me == 2) compute_->fault(event.me, event.pipe, event.queue);
       break;
     case AmdIrq::Kind::SdmaIllegalInstruction: sdma_->fault(event.engine); break;
+    case AmdIrq::Kind::DisplayHotplug: {
+      connected_pins_ = event.connected ? (connected_pins_ | 1u << event.pin) : (connected_pins_ & ~(1u << event.pin));
+      HotplugEvent e;
+      e.pin = event.pin;
+      e.connected = event.connected;
+      if (const AtomConnectors::Connector* connector = AtomConnectors::find_pin(connectors(), event.pin)) {
+        e.has_connector = true;
+        e.connector = *connector;
+      }
+      if (irq_->hpd_throttled(event.pin) && !(throttle_reported_ >> event.pin & 1)) {
+        e.throttled = true;
+        throttle_reported_ |= 1u << event.pin;
+      }
+      if (hotplug_count_ == kMaxHotplugEvents) {   // full: the oldest goes
+        hotplug_head_ = (hotplug_head_ + 1) % kMaxHotplugEvents;
+        --hotplug_count_;
+        ++hotplug_dropped_;
+      }
+      hotplug_[(hotplug_head_ + hotplug_count_) % kMaxHotplugEvents] = e;
+      ++hotplug_count_;
+      break;
+    }
     default: break;
   }
   if (observer_) observer_->on_event(event);
@@ -395,7 +576,21 @@ bool AmdVegaM::engage_display(const amd_dce11::FirmwareFramebuffer& firmware, By
 
 void AmdVegaM::disengage_display() {
   set_vblank_interrupt(false);
+  set_vline_interrupt(false);
   display_ = UniquePointer<amd_dce11::Display>();
+}
+
+bool AmdVegaM::set_vline_interrupt(bool enable) {
+  if (!enable) {
+    if (vline_crtc_ >= 0 && display_irq_) display_irq_->set_vline(static_cast<uint32_t>(vline_crtc_), false);
+    vline_crtc_ = -1;
+    return true;
+  }
+  if (!display_irq_ || !display_ || !display_->engaged()) return false;
+  set_vline_interrupt(false);
+  vline_crtc_ = static_cast<int>(display_->plane().crtc());
+  display_irq_->set_vline(static_cast<uint32_t>(vline_crtc_), true);
+  return true;
 }
 
 bool AmdVegaM::set_vblank_interrupt(bool enable) {

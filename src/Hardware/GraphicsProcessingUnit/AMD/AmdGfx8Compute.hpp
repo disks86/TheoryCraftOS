@@ -82,6 +82,13 @@ class AmdGfx8Compute {
   void kcq_resume();
   Result test_rings(uint32_t timeout_us = kDefaultTimeoutUs);   // KIQ first, then the compute queues (all of them are tried; the first failure is reported)
   bool disable_queues(uint32_t timeout_us = kDefaultTimeoutUs);
+  // The compute part of recovery after a hang of the command processor (gfx_v8_0_pre_soft_reset / _post_soft_reset): every compute queue's hardware queue is dequeued directly
+  // through its registers (gfx_v8_0_deactivate_hqd(adev, 2): the KIQ cannot be asked, it may be what hung), and the queues' software state (fence numbers, wedged) is cleared for the
+  // resume that follows. The queue memory is rewritten by kiq_resume / kcq_resume.
+  void deactivate_queues(uint32_t timeout_us = kDefaultTimeoutUs);
+  void clear_queue_state();
+  // Whether the end-of-pipe interrupt was asked for (set_eop_interrupt), so recovery can put it back.
+  bool eop_interrupt_wanted() const { return eop_interrupt_; }
   // Runs an indirect buffer on compute queue `queue` (0..queues-1) and waits for it (gfx_v8_0_ring_emit_ib_compute, gfx_v8_0_ring_emit_fence_compute): `dwords` PM4 dwords at
   // GPU address `ib_gpu_address` (4-byte aligned, below 2^48), padded by the caller to a multiple of 256 dwords with NOPs (AmdGfx8::pad_ib), then a RELEASE_MEM that writes the
   // fence number to a word of the queue's write-back page (offset 16). Only after the ring tests passed. False for a bad argument or a queue that is not ready; on a timeout the
@@ -128,6 +135,7 @@ class AmdGfx8Compute {
   Config config_;
   Memory memory_;
   Queue queues_[kMaxQueues + 1];
+  bool eop_interrupt_ = false;
   bool attached_ = false, ready_ = false;
   int failed_queue_ = -1;
 };

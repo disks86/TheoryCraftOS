@@ -96,9 +96,32 @@ LoadStatus load_elf(const exe::ElfFile& elf, ConstByteView file, AddressSpace& s
   return LoadStatus::Ok;
 }
 
-LoadStatus load_pe(const exe::PeFile& pe, ConstByteView file, AddressSpace& space, LoadedImage* out) {
+LoadStatus load_pe(const exe::PeFile& pe, ConstByteView file, AddressSpace& space, LoadedImage* out, bool require_entry) {
   if (!pe.is_pe32_plus() || pe.is_dll()) return LoadStatus::Unsupported;
-  return map_pe_image(pe, file, space, pe.image_base(), true, out);
+  return map_pe_image(pe, file, space, pe.image_base(), require_entry, out);
+}
+
+void describe_pe_image(const exe::PeFile& pe, uint64_t file_size, uint8_t (&out)[64]) {
+  for (uint8_t& b : out) b = 0;
+  auto put = [&](uint32_t at, uint64_t value, uint32_t bytes) { for (uint32_t i = 0; i < bytes; ++i) out[at + i] = uint8_t(value >> (8 * i)); };
+  put(0, pe.image_base() + pe.entry_rva(), 8);
+  put(16, pe.stack_reserve(), 8);
+  put(24, pe.stack_commit(), 8);
+  put(32, pe.subsystem(), 4);
+  put(36, pe.subsystem_minor(), 2);
+  put(38, pe.subsystem_major(), 2);
+  put(40, pe.os_major(), 2);
+  put(42, pe.os_minor(), 2);
+  put(44, pe.characteristics(), 2);
+  put(46, pe.dll_characteristics(), 2);
+  put(48, pe.machine(), 2);
+  bool code = pe.entry_rva() != 0;
+  for (const exe::PeSection& section : pe.sections().view()) if (section.characteristics & 0x20u) code = true;      // IMAGE_SCN_CNT_CODE
+  put(50, code ? 1 : 0, 1);
+  put(51, (pe.dll_characteristics() & 0x40) ? 0x04 : 0, 1);      // ImageDynamicallyRelocated
+  put(52, pe.loader_flags(), 4);
+  put(56, file_size, 4);
+  put(60, pe.checksum(), 4);
 }
 
 LoadStatus map_pe_image(const exe::PeFile& pe, ConstByteView file, AddressSpace& space, uint64_t base, bool require_entry, LoadedImage* out) {

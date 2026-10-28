@@ -22,6 +22,7 @@
 // the SMC, a graphics engine with eight compute queues, working SDMA engines, and a framebuffer the display can be switched to; every step that can fail must stop the earlier
 // ones. The pieces themselves are covered by their own tests; this checks the glue: the layout of the block, the firmware files, the addresses given to each piece, the order.
 #include <stdio.h>
+#include <functional>
 #include <stdlib.h>
 #include <string.h>
 #include <memory>
@@ -29,10 +30,12 @@
 #include "FileSystem/Ram/RamFileSystem.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdVegaM.hpp"
 #include "FakeAmdDce11.hpp"
+#include "FakeI2cMonitor.hpp"
 #include "FakeAmdGfx8.hpp"
 #include "FakeAmdGmc8.hpp"
 #include "FakeAmdIh3.hpp"
 #include "FakeAmdSdma3.hpp"
+#include "AtomBiosImage.hpp"
 
 using namespace hardware;
 
@@ -91,16 +94,31 @@ struct Card final : IVcnRegisters {
   fakesdma::Card sdma;
   fakedce::FakeDisplay dce;
   size_t other_writes = 0;
+  std::function<void()> on_marker;   // called when the POST writes register 0x7777 (the simulated card then has its memory trained)
+  uint32_t memsize_ones = 0;        // CONFIG_MEMSIZE reads all ones this many more times (the card is in reset)
+  bool memsize_never = false;
+  FakeI2cMonitor* monitor = nullptr;   // a DDC bus on the pad registers 0x7000..0x7007
   static bool in(uint32_t r, uint32_t lo, uint32_t hi) { return r >= lo && r <= hi; }
   IVcnRegisters& owner(uint32_t r) {
+    if (monitor && in(r, 0x7000, 0x7007)) return *monitor;
     if (in(r, 0x3400, 0x37ff)) return sdma;
     if (in(r, 0xe30, 0xe4b) || r == 0x151a || r == 0x151b) return ih;
     if (in(r, 0x500, 0x57f) || in(r, 0x800, 0x82f) || in(r, 0xb00, 0xbff) || r == 0x394 || r == 0x1524 || r == 0x1528 || r == 0x150a) return gmc;
     if (in(r, 0x1a00, 0x1fff) || in(r, 0x4000, 0x47ff)) return dce;
     return gfx;
   }
-  uint32_t read(uint32_t r) override { return owner(r).read(r); }
-  void write(uint32_t r, uint32_t v) override { owner(r).write(r, v); }
+  uint32_t read(uint32_t r) override {
+    if (r == 0x150a && (memsize_never || memsize_ones > 0)) {
+      if (memsize_ones > 0) --memsize_ones;
+      return 0xFFFFFFFFu;
+    }
+    return owner(r).read(r);
+  }
+  void write(uint32_t r, uint32_t v) override {
+    owner(r).write(r, v);
+    if (r == 0x7777 && on_marker) on_marker();
+    if (r == 0x398) sdma.write(r, v);   // SRBM_SOFT_RESET reaches both the graphics and the DMA engines
+  }
   size_t writes() const { return gfx.writes.size() + gmc.writes.size() + ih.writes.size() + sdma.writes.size() + dce.writes.size(); }
 };
 
@@ -695,7 +713,7 @@ static void test_display_interrupts() {
   // The pins asked for: DC_HPD_EN (bit 28), the filter (connect 50 ms, disconnect 10 ms << 20), the interrupt on with the polarity for the next change; the others untouched.
   for (uint32_t p = 0; p < 4; ++p) {
     const uint32_t polarity = p == 1 ? 0 : 0x100;   // pin 1 is connected: the next change is a disconnect
-    CHECK(rig.card.gfx.reg(0x189a + 8 * p) == 0x10000000 && rig.card.gfx.reg(0x189c + 8 * p) == (50u | 10u << 20) && rig.card.gfx.reg(0x1899 + 8 * p) == (0x10000 | polarity | 1));
+    CHECK(rig.card.gfx.reg(0x189a + 8 * p) == 0x10000000 && rig.card.gfx.reg(0x189c + 8 * p) == (50u | 10u << 20) && rig.card.gfx.reg(0x1899 + 8 * p) == (0x10000 | polarity | 1 | 0x1000000 | 0x100000));   // (and the short pulse of the pin on, its stale one acknowledged)
   }
   for (uint32_t p = 4; p < 6; ++p) CHECK(rig.card.gfx.reg(0x189a + 8 * p) == 0 && rig.card.gfx.reg(0x1899 + 8 * p) == 0 && rig.card.gfx.reg(0x189c + 8 * p) == 0);
   // The order for a pin: enable, filter, acknowledge, polarity, interrupt on.
@@ -731,7 +749,7 @@ static void test_display_interrupts() {
   rig.card.ih.post(42, 0, 0, 0, 0);
   CHECK(vega.service_interrupts() == 1 && irq.hotplug_count(0) == 2 && !irq.hpd_connected(0) && (rig.card.gfx.reg(0x1899) & 0x100));
   // A pin that does not exist.
-  rig.card.ih.post(42, 6, 0, 0, 0);
+  rig.card.ih.post(42, 12, 0, 0, 0);
   CHECK(vega.service_interrupts() == 1 && irq.count(AmdIrq::Kind::DisplayHotplug) == 2 && irq.count(AmdIrq::Kind::Unknown) == 1);
 
   // A pin that keeps interrupting is switched off after kHotplugStormLimit events (pin 2: DISP_INTERRUPT_STATUS_CONTINUE2 bit 17).
@@ -793,6 +811,57 @@ static void test_vblank_interrupt() {
   CHECK(!(rig.card.dce.get(0x1ac8 + 0x400) & 1));
 }
 
+// The vertical line interrupt: the same rules as the vertical blank, on its own bit (LB_INTERRUPT_MASK bit 4, literal here), counted on its own.
+static void test_vline_interrupt() {
+  Rig rig;
+  AmdVegaM vega(rig.alloc);
+  CHECK(vega.bring_up(rig.inputs()));
+  const uint32_t width = 64, height = 8;
+  amd_dce11::FirmwareFramebuffer fw;
+  fw.physical = reinterpret_cast<uint64_t>(rig.vram);
+  fw.bytes = width * height * 4;
+  fw.width = width;
+  fw.height = height;
+  fw.pitch_pixels = width;
+  rig.card.dce.crtc(2, kGpuBase, width);
+  fakedce::setup_aperture(rig.card.dce);
+  rig.card.dce.set(0x80d, kGpuBase >> 12);
+  rig.card.dce.set(0x80e, ((kGpuBase + kVideoMemory) >> 12) - 1);
+  // not without a display, and nothing is written for it
+  CHECK(!vega.set_vline_interrupt(true) && vega.set_vline_interrupt(false) && rig.card.dce.get(0x1ac8 + 0x400) == 0);
+  ByteView memory;
+  CHECK(vega.engage_display(fw, &memory) && vega.display_engaged());
+  const AmdIrq& irq = *vega.irq();
+  rig.card.dce.set(0x1ac8 + 0x400, 0x101);   // (the vblank bit and another are set already: kept)
+  CHECK(vega.set_vline_interrupt(true) && rig.card.dce.get(0x1ac8 + 0x400) == 0x111 && rig.card.dce.get(0x1ac8) == 0 && rig.card.dce.get(0x1ac8 + 0x200) == 0);
+  CHECK(vega.set_vline_interrupt(true) && rig.card.dce.get(0x1ac8 + 0x400) == 0x111);
+  // The vertical blank bit is not touched by the line's, nor the line's by the blank's.
+  CHECK(vega.set_vblank_interrupt(true) && rig.card.dce.get(0x1ac8 + 0x400) == 0x111);
+  CHECK(vega.set_vblank_interrupt(false) && rig.card.dce.get(0x1ac8 + 0x400) == 0x110);
+  CHECK(vega.set_vblank_interrupt(true) && rig.card.dce.get(0x1ac8 + 0x400) == 0x111);
+  // A line interrupt of controller 2 (source 3, data 1) with the status (DISP_INTERRUPT_STATUS_CONTINUE2, bit 2) set: acknowledged (LB_VLINE_STATUS.VLINE_ACK), counted for the line only.
+  rig.card.gfx.set_reg(0x1859, 0x4);
+  rig.card.ih.post(3, 1, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && irq.vline_count(2) == 1 && irq.vline_count(1) == 0 && irq.vblank_count(2) == 0 && rig.card.dce.get(0x1ac9 + 0x400) == 0x10);
+  // The status does not say so: counted, not acknowledged.
+  rig.card.dce.set(0x1ac9 + 0x400, 0);
+  rig.card.gfx.set_reg(0x1859, 0);
+  rig.card.ih.post(3, 1, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && irq.vline_count(2) == 2 && rig.card.dce.get(0x1ac9 + 0x400) == 0 && irq.vline_count(6) == 0);
+  // Off on its own, with the blank left on.
+  CHECK(vega.set_vline_interrupt(false) && rig.card.dce.get(0x1ac8 + 0x400) == 0x101);
+  rig.card.dce.set(0x1ac8 + 0x400, 0x111);   // (switched on behind its back: asking for off again has nothing to switch off)
+  CHECK(vega.set_vline_interrupt(false) && rig.card.dce.get(0x1ac8 + 0x400) == 0x111);
+  rig.card.dce.set(0x1ac8 + 0x400, 0x101);
+  // Giving the display back or stopping the card switches it off.
+  CHECK(vega.set_vline_interrupt(true) && (rig.card.dce.get(0x1ac8 + 0x400) & 0x10));
+  vega.disengage_display();
+  CHECK(!(rig.card.dce.get(0x1ac8 + 0x400) & 0x10) && !vega.set_vline_interrupt(true));
+  CHECK(vega.engage_display(fw, &memory) && vega.set_vline_interrupt(true) && (rig.card.dce.get(0x1ac8 + 0x400) & 0x10));
+  vega.shutdown();
+  CHECK(!(rig.card.dce.get(0x1ac8 + 0x400) & 0x10));
+}
+
 // The video engines' fences: UVD's decode ring (124), its two encode rings (119, 120) and VCE's three rings (167, data 0..2) are classified and counted; a VCE fence is acknowledged in
 // VCE_SYS_INT_STATUS (bit 3) before anything else; an observer sees every event, in order, after the card dealt with it.
 static void test_video_engine_interrupts() {
@@ -832,6 +901,729 @@ static void test_video_engine_interrupts() {
   CHECK(vega.service_interrupts() == 1 && rec.events.size() == 8);
 }
 
+// Recovery of the whole card: a fault or a timeout wedges a ring, recover() resets the engines that are wedged and only those.
+static void test_recovery() {
+  Rig rig;
+  AmdVegaM vega(rig.alloc);
+  CHECK(vega.bring_up(rig.inputs()));
+  if (!vega.up()) return;
+  const uint32_t nop[] = {0xC0001000};
+  const ArrayView<const uint32_t> ib(nop, 1);
+  // Nothing wedged: nothing is done.
+  const size_t writes = rig.card.writes();
+  AmdVegaM::Recovery r = vega.recover();
+  CHECK(!vega.wedged() && !r.graphics && !r.sdma && !r.failed && rig.card.writes() == writes && vega.recoveries() == 0);
+  // A privileged-register fault on the graphics ring: wedged; recovering resets graphics (and the compute queues with it) and not the DMA engines.
+  rig.card.ih.post(184, 0, 0, 0, 0);
+  vega.service_interrupts();
+  CHECK(vega.wedged() && !vega.submit_graphics(ib));
+  auto sdma_resets = [&]() { size_t n = 0; for (uint32_t v : rig.card.sdma.srbm_resets) n += (v & 0x100040) != 0; return n; };   // (SRBM_SOFT_RESET reaches both fakes: count the SDMA bits)
+  const size_t sdma_before = sdma_resets();
+  r = vega.recover();
+  CHECK(r.graphics && !r.sdma && !r.failed && vega.recoveries() == 1 && !vega.wedged() && sdma_resets() == sdma_before);
+  CHECK(vega.submit_graphics(ib) && vega.submit_compute(3, ib) && vega.submit_sdma(1, ib));
+  // The interrupt sources the reset took are back: the graphics ring's, the compute pipe's, ECC and SQ.
+  CHECK((rig.card.gfx.reg(0x306a) & 0x04C00000) == 0x04C00000 && (rig.card.gfx.reg(0x3085) & 0x04000000) && (rig.card.gfx.reg(0x3049) & 0x4000) && !(rig.card.gfx.reg(0x2315) & 1));
+  // A fault of one compute queue: all the compute queues are reset with the graphics engine, as the driver's soft reset of the IP does.
+  const size_t mapped = rig.card.gfx.mapped.size();
+  rig.card.ih.post(185, 0, (2u << 4) | (1u << 2), 0, 0);   // ME 1, pipe 0, queue 2
+  vega.service_interrupts();
+  CHECK(vega.wedged() && !vega.submit_compute(2, ib) && vega.submit_compute(3, ib));
+  r = vega.recover();
+  CHECK(r.graphics && !r.sdma && vega.recoveries() == 2 && rig.card.gfx.mapped.size() == mapped + 8 && vega.submit_compute(2, ib));
+  // An SDMA illegal instruction: the DMA engines are reset (both), the graphics engine is left alone, TRAP_ENABLE is back.
+  const size_t gfx_resets = rig.card.gfx.grbm_resets.size();
+  rig.card.ih.post(241, 0, 1, 0, 0);
+  vega.service_interrupts();
+  CHECK(vega.wedged() && !vega.submit_sdma(1, ib));
+  r = vega.recover();
+  CHECK(!r.graphics && r.sdma && !r.failed && vega.recoveries() == 3 && rig.card.gfx.grbm_resets.size() == gfx_resets && sdma_resets() == sdma_before + 1);
+  CHECK(vega.submit_sdma(1, ib) && vega.submit_sdma(0, ib) && (rig.card.sdma.reg(0x3404) & 1) && (rig.card.sdma.reg(0x3604) & 1));
+  // Both at once.
+  rig.card.ih.post(184, 0, 0, 0, 0);
+  rig.card.ih.post(247, 0, 0, 0, 0);
+  vega.service_interrupts();
+  r = vega.recover();
+  CHECK(r.graphics && r.sdma && !r.failed && vega.recoveries() == 5 && !vega.wedged());
+  // service_interrupts() does not recover by itself unless asked to (Inputs::auto_recover).
+  rig.card.ih.post(184, 0, 0, 0, 0);
+  vega.service_interrupts();
+  CHECK(vega.wedged());
+  vega.recover();
+  // The card is shut down: nothing to recover.
+  vega.shutdown();
+  r = vega.recover();
+  CHECK(!r.graphics && !r.sdma && !vega.wedged());
+}
+
+static void test_auto_recovery() {
+  Rig rig;
+  AmdVegaM vega(rig.alloc);
+  AmdVegaM::Inputs in = rig.inputs();
+  in.auto_recover = true;
+  CHECK(vega.bring_up(in));
+  if (!vega.up()) return;
+  const uint32_t nop[] = {0xC0001000};
+  const ArrayView<const uint32_t> ib(nop, 1);
+  // A fault is dealt with in the same pass.
+  rig.card.ih.post(184, 0, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && !vega.wedged() && vega.recoveries() == 1 && vega.submit_graphics(ib));
+  rig.card.ih.post(241, 0, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && !vega.wedged() && vega.recoveries() == 2 && vega.submit_sdma(0, ib));
+  // A card that keeps hanging is left alone after kMaxRecoveries.
+  for (uint32_t i = 2; i < AmdVegaM::kMaxRecoveries; ++i) {
+    rig.card.ih.post(184, 0, 0, 0, 0);
+    vega.service_interrupts();
+  }
+  CHECK(vega.recoveries() == AmdVegaM::kMaxRecoveries && !vega.wedged());
+  rig.card.ih.post(184, 0, 0, 0, 0);
+  vega.service_interrupts();
+  CHECK(vega.wedged() && vega.recoveries() == AmdVegaM::kMaxRecoveries && !vega.submit_graphics(ib));
+  // Asking for it by hand still works.
+  const AmdVegaM::Recovery r = vega.recover();
+  CHECK(r.graphics && !r.failed && !vega.wedged() && vega.recoveries() == AmdVegaM::kMaxRecoveries + 1 && vega.submit_graphics(ib));
+}
+
+static void test_recovery_failure() {
+  Rig rig;
+  AmdVegaM vega(rig.alloc);
+  CHECK(vega.bring_up(rig.inputs()));
+  if (!vega.up()) return;
+  const uint32_t nop[] = {0xC0001000};
+  const ArrayView<const uint32_t> ib(nop, 1);
+  // The command processor hangs and the reset does not help: the engine comes back stopped and the card says so.
+  rig.card.gfx.hung = true;
+  rig.card.gfx.reset_fails = true;
+  CHECK(!vega.submit_graphics(ib, 2000) && vega.wedged());
+  AmdVegaM::Recovery r = vega.recover();
+  CHECK(r.graphics && r.failed && !vega.graphics()->running() && !vega.submit_graphics(ib));
+  // The DMA engines are independent: a stalled one resets fine, and the graphics engine is tried again (it is stopped, not wedged) and stays down.
+  rig.card.sdma.stall[0] = true;
+  CHECK(!vega.submit_sdma(0, ib, 2000) && vega.wedged());
+  r = vega.recover();
+  CHECK(r.graphics && r.sdma && r.failed && !vega.graphics()->running() && vega.sdma()->running() && vega.submit_sdma(0, ib));
+  // When the hardware lets the reset work, the next recovery brings the graphics engine back.
+  rig.card.gfx.reset_fails = false;
+  CHECK(vega.wedged());
+  r = vega.recover();
+  CHECK(r.graphics && !r.sdma && !r.failed && !vega.wedged() && vega.graphics()->running() && vega.submit_graphics(ib) && vega.submit_compute(0, ib));
+}
+
+static void test_recovery_failure_sdma() {
+  Rig rig;
+  AmdVegaM vega(rig.alloc);
+  CHECK(vega.bring_up(rig.inputs()));
+  if (!vega.up()) return;
+  const uint32_t nop[] = {0xC0001000};
+  const ArrayView<const uint32_t> ib(nop, 1);
+  // A DMA engine whose reset does not work: failed (and only the DMA engines were reset), tried again next time.
+  rig.card.sdma.stall[1] = true;
+  rig.card.sdma.reset_fails = true;
+  CHECK(!vega.submit_sdma(1, ib, 2000));
+  AmdVegaM::Recovery r = vega.recover();
+  CHECK(!r.graphics && r.sdma && r.failed && !vega.sdma()->running() && vega.wedged());
+  r = vega.recover();   // (stopped, so tried again - and fails again)
+  CHECK(!r.graphics && r.sdma && r.failed && vega.recoveries() == 2);
+  rig.card.sdma.reset_fails = false;
+  r = vega.recover();
+  CHECK(!r.graphics && r.sdma && !r.failed && vega.sdma()->running() && !vega.wedged() && vega.submit_sdma(0, ib) && vega.submit_sdma(1, ib));
+  // Nothing wedged and running: nothing to do.
+  r = vega.recover();
+  CHECK(!r.graphics && !r.sdma && !r.failed);
+}
+
+// The card that reset itself: the PCI configuration reset, the way the card sees it from its configuration space.
+struct FakePci final : IPciBus {
+  Rig& rig;
+  uint32_t command = 0x0407, status = 0x0010, resets = 0, bm_off = 0;
+  bool needs_post = false;      // after the reset the video memory is not trained: the memory controller's registers read as they do at power on
+  bool never_returns = false;   // the card does not answer after the reset
+  bool clears_hang = true;      // the reset brings a hung engine back
+  explicit FakePci(Rig& r) : rig(r) {}
+  const char* name() const override { return "pci"; }
+  bool initialize() override { return true; }
+  void shutdown() override {}
+  uint32_t device_count() const override { return 1; }
+  bool pci_device(uint32_t, PciDeviceInfo*) const override { return false; }
+  uint32_t read32(PciAddress, uint16_t offset) const override { return offset == 4 ? (command | (status << 16)) : 0; }
+  void write32(PciAddress, uint16_t offset, uint32_t value) const override {
+    FakePci& self = const_cast<FakePci&>(*this);   // (the interface's writes are const; the fake keeps state)
+    if (offset == 4) {
+      if ((command & 4) && !(value & 4)) ++self.bm_off;
+      self.command = value & 0xFFFF;
+    } else if (offset == 0x7c && value == 0x39d5e86b) {
+      ++self.resets;
+      rig.card.memsize_ones = 4;
+      rig.card.memsize_never = never_returns;
+      if (clears_hang) {
+        rig.card.gfx.hung = false;
+        rig.card.gfx.reset_fails = false;
+        rig.card.sdma.stall[0] = rig.card.sdma.stall[1] = false;
+        rig.card.sdma.reset_fails = false;
+        rig.card.sdma.ignore_fences = false;
+      }
+      memset(rig.doorbell_base, 0, 0x800 * 4);   // (the doorbell BAR is part of the card)
+      if (needs_post) {
+        rig.card.gmc.set_reg(0x150a, 0);
+        rig.card.gmc.set_reg(0x809, 0);
+      }
+    }
+  }
+  uint64_t memory_bar(PciAddress, uint8_t) const override { return 0; }
+  uint16_t find_capability(PciAddress, uint8_t) const override { return 0; }
+};
+
+// The full reset as the fallback when the soft reset does not bring an engine back.
+static void test_card_reset() {
+  const uint32_t nop[] = {0xC0001000};
+  const ArrayView<const uint32_t> ib(nop, 1);
+  {
+    // A command processor that hangs and does not come back from its soft reset: the card is reset and brought up again, and everything works.
+    Rig rig;
+    FakePci pci(rig);
+    AmdVegaM vega(rig.alloc);
+    AmdVegaM::Inputs in = rig.inputs();
+    in.pci = &pci;
+    in.pci_address = PciAddress{1, 0, 0};
+    in.allow_asic_reset = true;
+    CHECK(vega.bring_up(in));
+    rig.card.gfx.hung = true;
+    rig.card.gfx.reset_fails = true;
+    CHECK(!vega.submit_graphics(ib, 2000) && vega.wedged());
+    const AmdVegaM::Recovery r = vega.recover();
+    CHECK(r.graphics && r.card_reset && !r.failed && vega.up() && pci.resets == 1 && vega.asic_resets() == 1 && !vega.wedged());
+    CHECK(pci.bm_off == 1 && (pci.command & 4) && pci.status == 0x0010);   // (bus mastering off for the reset, on again after)
+    CHECK(vega.submit_graphics(ib) && vega.submit_compute(1, ib) && vega.submit_sdma(0, ib) && vega.submit_sdma(1, ib));
+    // It does not try again for a card that is fine.
+    CHECK(!vega.recover().card_reset && pci.resets == 1);
+  }
+  {
+    // Not allowed (the default): the soft reset's failure is the answer, and the card's PCI configuration is not touched.
+    Rig rig;
+    FakePci pci(rig);
+    AmdVegaM vega(rig.alloc);
+    AmdVegaM::Inputs in = rig.inputs();
+    in.pci = &pci;
+    CHECK(vega.bring_up(in));
+    rig.card.gfx.hung = true;
+    rig.card.gfx.reset_fails = true;
+    CHECK(!vega.submit_graphics(ib, 2000));
+    const AmdVegaM::Recovery r = vega.recover();
+    CHECK(r.graphics && !r.card_reset && r.failed && pci.resets == 0 && vega.up() && vega.asic_resets() == 0);
+  }
+  {
+    // Allowed but nowhere to write: the same.
+    Rig rig;
+    AmdVegaM vega(rig.alloc);
+    AmdVegaM::Inputs in = rig.inputs();
+    in.allow_asic_reset = true;
+    CHECK(vega.bring_up(in));
+    rig.card.gfx.hung = true;
+    rig.card.gfx.reset_fails = true;
+    CHECK(!vega.submit_graphics(ib, 2000));
+    const AmdVegaM::Recovery r = vega.recover();
+    CHECK(r.failed && !r.card_reset && !vega.reset_card() && vega.asic_resets() == 0);
+  }
+  {
+    // A card that needs its video BIOS to POST it (what a real one does): the reset works, the card answers, but it cannot be brought up. The card is left down and says why.
+    Rig rig;
+    FakePci pci(rig);
+    pci.needs_post = true;
+    AmdVegaM vega(rig.alloc);
+    AmdVegaM::Inputs in = rig.inputs();
+    in.pci = &pci;
+    in.allow_asic_reset = true;
+    CHECK(vega.bring_up(in));
+    rig.card.gfx.hung = true;
+    rig.card.gfx.reset_fails = true;
+    CHECK(!vega.submit_graphics(ib, 2000));
+    const AmdVegaM::Recovery r = vega.recover();
+    CHECK(r.card_reset && r.failed && !vega.up() && pci.resets == 1 && strstr(vega.status(), "after a card reset: "));
+    CHECK((pci.command & 4) && !vega.submit_graphics(ib) && !vega.wedged() && !vega.recover().graphics);
+  }
+  {
+    // A card that does not answer after the reset: down, bus mastering left off.
+    Rig rig;
+    FakePci pci(rig);
+    pci.never_returns = true;
+    AmdVegaM vega(rig.alloc);
+    AmdVegaM::Inputs in = rig.inputs();
+    in.pci = &pci;
+    in.allow_asic_reset = true;
+    CHECK(vega.bring_up(in));
+    rig.card.gfx.hung = true;
+    rig.card.gfx.reset_fails = true;
+    CHECK(!vega.submit_graphics(ib, 2000));
+    const AmdVegaM::Recovery r = vega.recover();
+    CHECK(r.card_reset && r.failed && !vega.up() && !(pci.command & 4) && strstr(vega.status(), "card reset: the card did not answer"));
+  }
+  {
+    // The reset that does not help either: tried at most kMaxAsicResets times, then left alone.
+    Rig rig;
+    FakePci pci(rig);
+    pci.clears_hang = false;
+    AmdVegaM vega(rig.alloc);
+    AmdVegaM::Inputs in = rig.inputs();
+    in.pci = &pci;
+    in.allow_asic_reset = true;
+    CHECK(vega.bring_up(in));
+    rig.card.gfx.hung = true;
+    rig.card.gfx.reset_fails = true;
+    CHECK(!vega.submit_graphics(ib, 2000));
+    AmdVegaM::Recovery r = vega.recover();
+    CHECK(r.card_reset && r.failed && !vega.up() && pci.resets == 1);   // (brought up again, but the ring test of the still hung card fails: down)
+    // Bring it up by hand for the next try; the engine hangs again.
+    rig.card.gfx.hung = false;
+    rig.card.gfx.reset_fails = false;
+    memset(rig.doorbell_base, 0, 0x800 * 4);   // (a new life of the card starts with clean doorbells)
+    CHECK(vega.bring_up(in));
+    rig.card.gfx.hung = true;
+    rig.card.gfx.reset_fails = true;
+    CHECK(!vega.submit_graphics(ib, 2000));
+    r = vega.recover();
+    CHECK(r.card_reset && pci.resets == 2 && vega.asic_resets() == 2);
+    rig.card.gfx.hung = false;
+    rig.card.gfx.reset_fails = false;
+    memset(rig.doorbell_base, 0, 0x800 * 4);   // (a new life of the card starts with clean doorbells)
+    CHECK(vega.bring_up(in));
+    rig.card.gfx.hung = true;
+    rig.card.gfx.reset_fails = true;
+    CHECK(!vega.submit_graphics(ib, 2000));
+    r = vega.recover();
+    CHECK(r.failed && !r.card_reset && pci.resets == 2 && vega.asic_resets() == AmdVegaM::kMaxAsicResets);
+  }
+  {
+    // By hand, on a healthy card: reset and brought up again.
+    Rig rig;
+    FakePci pci(rig);
+    AmdVegaM vega(rig.alloc);
+    AmdVegaM::Inputs in = rig.inputs();
+    in.pci = &pci;
+    CHECK(vega.bring_up(in));
+    CHECK(vega.reset_card() && vega.up() && pci.resets == 1 && vega.submit_graphics(ib) && vega.submit_sdma(1, ib));
+  }
+}
+
+// The POST after a card reset: the video BIOS's ASIC_Init table, run by the AtomBIOS interpreter, brings back what the reset took (here: the memory the card cannot be brought up without).
+static std::vector<uint8_t> make_vbios(bool with_clocks = true) {
+  using namespace atomimage;
+  Image img;
+  Code init;
+  init.move(REG, 0x7777, PS, 0);       // the default engine clock, the first parameter: the marker the simulated card waits for
+  init.move(REG, 0x7778, PS, 1);       // the default memory clock
+  init.eot();
+  img.tables.push_back({0, 0, 0, init});
+  img.sclk = with_clocks ? 0x1234 : 0;
+  img.mclk = 0x5678;
+  return img.build();
+}
+
+static void test_post_after_reset() {
+  const uint32_t nop[] = {0xC0001000};
+  const ArrayView<const uint32_t> ib(nop, 1);
+  const std::vector<uint8_t> vbios = make_vbios();
+  auto setup = [&](Rig& rig, FakePci& pci, AmdVegaM::Inputs& in) {
+    pci.needs_post = true;
+    in = rig.inputs();
+    in.pci = &pci;
+    in.allow_asic_reset = true;
+    // the simulated card is trained when the video BIOS writes the engine clock to 0x7777
+    rig.card.on_marker = [&rig]() { rig.card.gmc.set_reg(0x150a, 64); rig.card.gmc.set_reg(0x809, (7u << 16) | 4u); };
+  };
+  {
+    // Not POSTed after the reset, no video BIOS: down (as before).
+    Rig rig;
+    FakePci pci(rig);
+    AmdVegaM::Inputs in;
+    setup(rig, pci, in);
+    AmdVegaM vega(rig.alloc);
+    CHECK(vega.bring_up(in));
+    rig.card.gfx.hung = true;
+    rig.card.gfx.reset_fails = true;
+    CHECK(!vega.submit_graphics(ib, 2000));
+    const AmdVegaM::Recovery r = vega.recover();
+    CHECK(r.card_reset && r.failed && !vega.up() && strstr(vega.status(), "after a card reset: "));
+  }
+  {
+    // With the video BIOS: the card is reset, POSTed (the table gets the firmware info's clocks as its parameters), brought up, and works.
+    Rig rig;
+    FakePci pci(rig);
+    AmdVegaM::Inputs in;
+    setup(rig, pci, in);
+    std::vector<uint8_t> callers_copy = vbios;
+    in.vbios = ConstByteView(callers_copy.data(), callers_copy.size());
+    AmdVegaM vega(rig.alloc);
+    CHECK(vega.bring_up(in));
+    std::fill(callers_copy.begin(), callers_copy.end(), 0xFF);   // (the caller's buffer is gone: the card has its own copy of the image)
+    rig.card.gfx.hung = true;
+    rig.card.gfx.reset_fails = true;
+    CHECK(!vega.submit_graphics(ib, 2000));
+    size_t marker_at = ~size_t{0}, clock_at = ~size_t{0};
+    const AmdVegaM::Recovery r = vega.recover();
+    CHECK(r.graphics && r.card_reset && !r.failed && vega.up() && pci.resets == 1);
+    CHECK(vega.submit_graphics(ib) && vega.submit_compute(0, ib) && vega.submit_sdma(1, ib));
+    // the POST wrote the clocks it was given (0x1234 engine, 0x5678 memory) to the registers the table names, after the reset and before the bring-up
+    const auto& w = rig.card.gfx.writes;
+    for (size_t i = 0; i < w.size(); ++i) {
+      if (w[i].first == 0x7777 && w[i].second == 0x1234) marker_at = i;
+      if (w[i].first == 0x7778 && w[i].second == 0x5678) clock_at = i;
+    }
+    CHECK(marker_at != ~size_t{0} && clock_at == marker_at + 1);
+  }
+  {
+    // A video BIOS that is not an AtomBIOS image, or whose firmware info has no clocks: the card stays down and says why.
+    for (int variant = 0; variant < 3; ++variant) {
+      Rig rig;
+      FakePci pci(rig);
+      AmdVegaM::Inputs in;
+      setup(rig, pci, in);
+      std::vector<uint8_t> bad = variant == 0 ? std::vector<uint8_t>(vbios.size(), 0x5A) : variant == 1 ? make_vbios(false) : std::vector<uint8_t>(vbios.begin(), vbios.begin() + 0x200);
+      in.vbios = ConstByteView(bad.data(), bad.size());
+      AmdVegaM vega(rig.alloc);
+      CHECK(vega.bring_up(in));
+      rig.card.gfx.hung = true;
+      rig.card.gfx.reset_fails = true;
+      CHECK(!vega.submit_graphics(ib, 2000));
+      const AmdVegaM::Recovery r = vega.recover();
+      CHECK(r.card_reset && r.failed && !vega.up() && strstr(vega.status(), "after a card reset: POST: "));
+      if (variant == 1) CHECK(strstr(vega.status(), "no default clocks"));
+      else CHECK(strstr(vega.status(), "not an AtomBIOS image"));
+    }
+  }
+  {
+    // By hand, on a card that was not POSTed: post() alone, then the bring-up.
+    Rig rig;
+    FakePci pci(rig);
+    AmdVegaM::Inputs in;
+    setup(rig, pci, in);
+    rig.card.gmc.set_reg(0x150a, 0);   // not trained
+    rig.card.gmc.set_reg(0x809, 0);
+    AmdVegaM vega(rig.alloc);
+    CHECK(!vega.bring_up(in));
+    in.vbios = ConstByteView(vbios.data(), vbios.size());
+    CHECK(vega.post(in) && vega.bring_up(in) && vega.up());
+    in.vbios = ConstByteView();
+    CHECK(!vega.post(in) && strstr(vega.status(), "no video BIOS image"));
+  }
+}
+
+// Hot plug events as the OS sees them: the state at bring-up, an event for each plug and unplug in order, a bounded queue, the pin that interrupts too often reported once.
+static void test_hotplug_events() {
+  Rig rig;
+  rig.card.gfx.set_reg(0x1898 + 8, 0x2);        // pin 1 senses a display at bring-up
+  rig.card.gfx.set_reg(0x1898 + 8 * 5, 0x2);    // so does pin 5, which is not watched
+  AmdVegaM vega(rig.alloc);
+  AmdVegaM::Inputs in = rig.inputs();
+  in.hpd_pins = 0x0F;
+  CHECK(vega.bring_up(in));
+  if (!vega.up()) return;
+  AmdVegaM::HotplugEvent e;
+  CHECK(vega.connected_pins() == 0x2 && !vega.take_hotplug(&e) && vega.hotplug_events_dropped() == 0);
+  // A display plugged in on pin 0 (asserted in DISP_INTERRUPT_STATUS bit 17, the pin senses it now), then pulled out of pin 1 (DISP_INTERRUPT_STATUS_CONTINUE).
+  rig.card.gfx.set_reg(0x1857, 0x20000);
+  rig.card.gfx.set_reg(0x1898, 0x2);
+  rig.card.ih.post(42, 0, 0, 0, 0);
+  rig.card.gfx.set_reg(0x1858, 0x20000);
+  rig.card.gfx.set_reg(0x1898 + 8, 0x0);
+  rig.card.ih.post(42, 1, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 2);
+  CHECK(vega.connected_pins() == 0x1);
+  CHECK(vega.take_hotplug(&e) && e.pin == 0 && e.connected && !e.throttled);
+  CHECK(vega.take_hotplug(&e) && e.pin == 1 && !e.connected && !e.throttled);
+  CHECK(!vega.take_hotplug(&e) && vega.take_hotplug(nullptr) == false);
+  // An interrupt for a pin that is not asserted is not an event.
+  rig.card.gfx.set_reg(0x1859, 0);
+  rig.card.ih.post(42, 2, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && !vega.take_hotplug(&e) && vega.connected_pins() == 0x1);
+  // More events than the queue holds: the oldest go, and the number lost is counted. Pins 0, 1 and 2 take turns (three does not divide the queue's sixteen), so the survivors can be told
+  // from the first sixteen.
+  rig.card.gfx.set_reg(0x1857, 0x20000);
+  rig.card.gfx.set_reg(0x1858, 0x20000);
+  rig.card.gfx.set_reg(0x1859, 0x20000);
+  rig.card.gfx.set_reg(0x1898, 0x2);
+  rig.card.gfx.set_reg(0x1898 + 8, 0x2);
+  rig.card.gfx.set_reg(0x1898 + 16, 0x2);
+  for (uint32_t i = 0; i < 20; ++i) rig.card.ih.post(42, i % 3, 0, 0, 0);
+  CHECK(vega.service_interrupts(20) == 20);
+  CHECK(vega.hotplug_events_dropped() == 4);
+  for (uint32_t i = 4; i < 20; ++i) CHECK(vega.take_hotplug(&e) && e.pin == i % 3);
+  CHECK(!vega.take_hotplug(&e));
+  // The pin that will not stop: after AmdIrq::kHotplugStormLimit events it is switched off, and the event that does it says so, once.
+  const uint32_t before = vega.irq()->hotplug_count(2);
+  uint32_t throttled_events = 0, taken = 0;
+  for (uint32_t i = 0; i < AmdIrq::kHotplugStormLimit + 10; ++i) {
+    rig.card.ih.post(42, 2, 0, 0, 0);
+    vega.service_interrupts();
+    while (vega.take_hotplug(&e)) { ++taken; throttled_events += e.throttled; }
+  }
+  CHECK(taken == AmdIrq::kHotplugStormLimit + 10 && throttled_events == 1 && vega.irq()->hpd_throttled(2) && before + taken == vega.irq()->hotplug_count(2));
+  // Shutting down forgets all of it; a new bring-up starts from the pins as they are.
+  vega.shutdown();
+  CHECK(vega.connected_pins() == 0 && !vega.take_hotplug(&e));
+  memset(rig.doorbell_base, 0, 0x800 * 4);
+  rig.card.gfx.set_reg(0x1898 + 8, 0x0);
+  CHECK(vega.bring_up(in) && vega.connected_pins() == 0x1 + 0x4 && vega.hotplug_events_dropped() == 0);
+  // (a new life of the card reports a pin that stops interrupting once more)
+  throttled_events = 0;
+  for (uint32_t i = 0; i < AmdIrq::kHotplugStormLimit + 10; ++i) {
+    rig.card.ih.post(42, 2, 0, 0, 0);
+    vega.service_interrupts();
+    while (vega.take_hotplug(&e)) throttled_events += e.throttled;
+  }
+  CHECK(throttled_events == 1);
+}
+
+// The DisplayPort short pulse (source 42, data 6..11 for pins 0..5): switched on for the watched pins (DC_HPD_INT_CONTROL bit 24), pending in DC_HPD_INT_STATUS bit 8, acknowledged with
+// DC_HPD_INT_CONTROL bit 20, counted per pin, not a hot plug; a pin that will not stop has it switched off; off at shutdown. (Register bits are literal.)
+static void test_hpd_rx() {
+  Rig rig;
+  AmdVegaM vega(rig.alloc);
+  AmdVegaM::Inputs in = rig.inputs();
+  in.hpd_pins = 0x0F;
+  CHECK(vega.bring_up(in));
+  if (!vega.up()) return;
+  const AmdIrq& irq = *vega.irq();
+  for (uint32_t pin = 0; pin < 6; ++pin) CHECK(((rig.card.gfx.reg(0x1899 + 8 * pin) & 0x1000000) != 0) == (pin < 4));
+  // The classification: data 6..11 are the pulses of pins 0..5, 0..5 the plugs, the rest nothing.
+  for (uint32_t data = 0; data < 14; ++data) {
+    AmdIh3::Vector v;
+    v.src_id = 42;
+    v.src_data = data;
+    const AmdIrq::Event e = AmdIrq::classify(v);
+    if (data < 6) CHECK(e.kind == AmdIrq::Kind::DisplayHotplug && e.pin == data);
+    else if (data < 12) CHECK(e.kind == AmdIrq::Kind::DisplayHpdRx && e.pin == data - 6);
+    else CHECK(e.kind == AmdIrq::Kind::Unknown);
+  }
+  for (uint32_t pin = 0; pin < 4; ++pin) rig.card.gfx.set_reg(0x1899 + 8 * pin, rig.card.gfx.reg(0x1899 + 8 * pin) & ~0x100000u);   // (the stale acknowledge of bring-up is not what is looked for)
+  // A pulse on pin 2 with the status bit set: acknowledged (bit 20 of that pin's control register only), counted for that pin, no hot plug event.
+  rig.card.gfx.set_reg(0x1898 + 16, 0x100);
+  rig.card.ih.post(42, 8, 0, 0, 0);
+  AmdVegaM::HotplugEvent e;
+  CHECK(vega.service_interrupts() == 1 && irq.hpd_rx_count(2) == 1 && irq.count(AmdIrq::Kind::DisplayHpdRx) == 1 && !vega.take_hotplug(&e));
+  CHECK((rig.card.gfx.reg(0x1899 + 16) & 0x100000) && !(rig.card.gfx.reg(0x1899 + 8) & 0x100000) && !(rig.card.gfx.reg(0x1899) & 0x100000));
+  CHECK(irq.hpd_rx_count(0) == 0 && irq.hpd_rx_count(1) == 0 && irq.hotplug_count(2) == 0 && vega.connected_pins() == 0);
+  // The status bit is not set: nothing is counted or acknowledged.
+  rig.card.gfx.set_reg(0x1898 + 8, 0);
+  rig.card.ih.post(42, 7, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && irq.hpd_rx_count(1) == 0 && !(rig.card.gfx.reg(0x1899 + 8) & 0x100000));
+  // A plug on the same pin is still a plug (it needs the other status bit), and the short pulse's bit does not make it one.
+  rig.card.ih.post(42, 2, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && irq.hotplug_count(2) == 0 && !vega.take_hotplug(&e));
+  // A pulse on a pin that does not exist is nothing (data 12 and up).
+  rig.card.ih.post(42, 12, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && irq.count(AmdIrq::Kind::DisplayHpdRx) == 1);
+  // The pin that will not stop: switched off after kHpdRxStormLimit pulses, once, the others untouched; the count stops there.
+  rig.card.gfx.set_reg(0x1898 + 24, 0x100);
+  for (uint32_t i = 0; i < AmdIrq::kHpdRxStormLimit; ++i) {
+    rig.card.ih.post(42, 9, 0, 0, 0);
+    vega.service_interrupts();
+  }
+  CHECK(!irq.hpd_rx_throttled(3) && (rig.card.gfx.reg(0x1899 + 24) & 0x1000000));   // (the limit itself is allowed)
+  rig.card.ih.post(42, 9, 0, 0, 0);
+  vega.service_interrupts();
+  CHECK(irq.hpd_rx_throttled(3) && !(rig.card.gfx.reg(0x1899 + 24) & 0x1000000));
+  for (uint32_t i = 0; i < 9; ++i) {
+    rig.card.ih.post(42, 9, 0, 0, 0);
+    vega.service_interrupts();
+  }
+  CHECK(irq.hpd_rx_throttled(3) && !irq.hpd_rx_throttled(2) && !(rig.card.gfx.reg(0x1899 + 24) & 0x1000000) && (rig.card.gfx.reg(0x1899 + 16) & 0x1000000));
+  CHECK(irq.hpd_rx_count(3) == AmdIrq::kHpdRxStormLimit + 10);
+  // Shutting down switches the rest off.
+  vega.shutdown();
+  for (uint32_t pin = 0; pin < 4; ++pin) CHECK(!(rig.card.gfx.reg(0x1899 + 8 * pin) & 0x1000000));
+}
+
+// A video BIOS image with the object table of a board with eDP on pin 0, HDMI on pin 1 and a DisplayPort on pin 2 (literal offsets: ROM header 0x100, master data table 0x200 with the
+// GPIO_Pin_LUT at 0x300 and the Object_Header at 0x400, the paths at 0x440, the connector objects at 0x500, their records at 0x580).
+static std::vector<uint8_t> make_connector_vbios() {
+  std::vector<uint8_t> b(0x700, 0);
+  auto u8 = [&](uint32_t at, uint32_t v) { b[at] = static_cast<uint8_t>(v); };
+  auto u16 = [&](uint32_t at, uint32_t v) { u8(at, v); u8(at + 1, v >> 8); };
+  u8(0, 0x55); u8(1, 0xAA); u16(0x48, 0x100);
+  memcpy(&b[0x104], "ATOM", 4);
+  u16(0x120, 0x200);
+  u16(0x200 + 4 + 10 * 2, 0x600);   // GPIO_I2C_Info
+  u16(0x200 + 4 + 12 * 2, 0x300);
+  u16(0x200 + 4 + 22 * 2, 0x400);
+  u16(0x300, 4 + 3 * 4);
+  const uint32_t shifts[3] = {0, 8, 16};
+  for (uint32_t i = 0; i < 3; ++i) { u16(0x304 + i * 4, 0x488d); u8(0x306 + i * 4, shifts[i]); u8(0x307 + i * 4, i + 1); }
+  u16(0x400, 0x20); u8(0x403, 2); u16(0x404, 0x0FFF); u16(0x406, 0x100); u16(0x40E, 0x40);
+  const uint32_t tags[3] = {0x2, 0x8, 0x80}, ids[3] = {0x1114, 0x110C, 0x1113};   // LCD1 eDP, DFP1 HDMI-A, DFP2 DisplayPort
+  u8(0x440, 3);
+  for (uint32_t i = 0; i < 3; ++i) { u16(0x444 + i * 12, tags[i]); u16(0x446 + i * 12, 12); u16(0x448 + i * 12, ids[i]); }
+  u8(0x500, 3);
+  const uint32_t ddc[3] = {0x92, 0x91, 0x93};
+  for (uint32_t i = 0; i < 3; ++i) {
+    u16(0x504 + i * 8, ids[i]); u16(0x508 + i * 8, 0x180 + i * 10);
+    u8(0x580 + i * 10, 1); u8(0x581 + i * 10, 4); u8(0x582 + i * 10, ddc[i]); u8(0x583 + i * 10, 0);                  // the I2C record: the DDC line
+    u8(0x584 + i * 10, 2); u8(0x585 + i * 10, 4); u8(0x586 + i * 10, i + 1); u8(0x587 + i * 10, 1);                  // the hot plug record
+  }
+  // GPIO_I2C_Info: three entries (27 bytes) for the lines 0x92, 0x91 and 0x93, all on the same pad registers (0x7000.., the simulated bus) and bits
+  u16(0x600, 4 + 3 * 27);
+  for (uint32_t i = 0; i < 3; ++i) {
+    const uint32_t at = 0x604 + i * 27;
+    const uint32_t regs[8] = {0x7000, 0x7001, 0x7002, 0x7003, 0x7004, 0x7005, 0x7006, 0x7007};   // clock: mask, enable, readback, output; data: the same
+    const uint8_t bits[8] = {3, 9, 13, 17, 5, 11, 15, 19};
+    for (int k = 0; k < 8; ++k) { u16(at + k * 2, regs[k]); u8(at + 17 + k, bits[k]); }
+    u8(at + 16, ddc[i]);
+  }
+  return b;
+}
+
+// The EDID of a monitor over the connector's DDC lines.
+static void test_read_edid() {
+  const std::vector<uint8_t> vbios = make_connector_vbios();   // eDP (DDC line 0x92), HDMI-A (0x91), DisplayPort (0x93)
+  Rig rig;
+  FakeI2cMonitor monitor;
+  monitor.edid = make_edid(1);
+  rig.card.monitor = &monitor;
+  AmdVegaM vega(rig.alloc);
+  AmdVegaM::Inputs in = rig.inputs();
+  in.vbios = ConstByteView(vbios.data(), vbios.size());
+  ByteBuffer out(rig.alloc);
+  AtomConnectors::Connector hdmi, edp, dp;
+  CHECK(!vega.read_edid(hdmi, &out) && monitor.writes == 0);   // (not up)
+  CHECK(vega.bring_up(in));
+  if (!vega.up()) return;
+  CHECK(vega.connectors().size() == 3);
+  edp = vega.connectors()[0];
+  hdmi = vega.connectors()[1];
+  dp = vega.connectors()[2];
+  CHECK(edp.has_ddc && edp.ddc_id == 0x92 && hdmi.has_ddc && hdmi.ddc_id == 0x91 && dp.has_ddc && dp.ddc_id == 0x93);
+  // HDMI: read over the pads of the bus the video BIOS names
+  CHECK(vega.read_edid(hdmi, &out) && out.size() == 256 && memcmp(out.view().data(), monitor.edid.data(), 256) == 0);
+  // DisplayPort and eDP: the AUX channel, not done; nothing is touched
+  const uint32_t writes = monitor.writes;
+  CHECK(!vega.read_edid(dp, &out) && !vega.read_edid(edp, &out) && monitor.writes == writes);
+  // no DDC line in the connector, or a line the GPIO table does not have
+  AtomConnectors::Connector no_ddc = hdmi;
+  no_ddc.has_ddc = false;
+  CHECK(!vega.read_edid(no_ddc, &out) && monitor.writes == writes);
+  AtomConnectors::Connector unknown = hdmi;
+  unknown.ddc_id = 0x77;
+  CHECK(!vega.read_edid(unknown, &out) && monitor.writes == writes);
+  // nothing connected: nothing answers
+  monitor.present = false;
+  CHECK(!vega.read_edid(hdmi, &out));
+  monitor.present = true;
+  // stopped: no
+  vega.shutdown();
+  CHECK(!vega.read_edid(hdmi, &out));
+}
+
+// The connectors in the hot plug events: named from the video BIOS's object table, absent without one or for a pin it does not list.
+static void test_hotplug_connectors() {
+  const std::vector<uint8_t> vbios = make_connector_vbios();
+  Rig rig;
+  AmdVegaM vega(rig.alloc);
+  AmdVegaM::Inputs in = rig.inputs();
+  in.hpd_pins = 0x0F;
+  {
+    std::vector<uint8_t> callers_copy = vbios;
+    in.vbios = ConstByteView(callers_copy.data(), callers_copy.size());
+    CHECK(vega.bring_up(in));
+  }
+  if (!vega.up()) return;
+  CHECK(vega.connectors().size() == 3);
+  AmdVegaM::HotplugEvent e;
+  char name[16];
+  rig.card.gfx.set_reg(0x1857 + 1, 0x20000);
+  rig.card.gfx.set_reg(0x1898 + 8, 0x2);
+  rig.card.ih.post(42, 1, 0, 0, 0);
+  rig.card.gfx.set_reg(0x1857 + 2, 0x20000);
+  rig.card.gfx.set_reg(0x1898 + 16, 0x2);
+  rig.card.ih.post(42, 2, 0, 0, 0);
+  rig.card.gfx.set_reg(0x1857 + 3, 0x20000);
+  rig.card.gfx.set_reg(0x1898 + 24, 0x2);
+  rig.card.ih.post(42, 3, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 3);
+  CHECK(vega.take_hotplug(&e) && e.pin == 1 && e.connected && e.has_connector);
+  AtomConnectors::name(e.connector, ArrayView<char>(name, sizeof name));
+  CHECK(!strcmp(name, "HDMI-A-1"));
+  CHECK(vega.take_hotplug(&e) && e.pin == 2 && e.has_connector);
+  AtomConnectors::name(e.connector, ArrayView<char>(name, sizeof name));
+  CHECK(!strcmp(name, "DP-1"));
+  CHECK(vega.take_hotplug(&e) && e.pin == 3 && !e.has_connector);   // pin 3 is on no connector
+  // Without a video BIOS there are no connectors, and the events say so; a later bring-up with one has them again.
+  vega.shutdown();
+  memset(rig.doorbell_base, 0, 0x800 * 4);
+  in.vbios = ConstByteView();
+  CHECK(vega.bring_up(in) && vega.connectors().size() == 0);
+  rig.card.ih.post(42, 1, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && vega.take_hotplug(&e) && e.pin == 1 && !e.has_connector);
+  vega.shutdown();
+  memset(rig.doorbell_base, 0, 0x800 * 4);
+  std::vector<uint8_t> noise(vbios.size(), 0x5A);
+  in.vbios = ConstByteView(noise.data(), noise.size());
+  CHECK(vega.bring_up(in) && vega.connectors().size() == 0);
+}
+// The audio endpoints (8 of them, indexed register pairs 4 apart from 0x17a8/0x17a9): connected unless the port connectivity of the default configuration (index 0x56, bits 31:30) is 1;
+// the connectors that carry audio and have a display, named from the video BIOS. (Register numbers and bit positions are literal.)
+static void test_audio_pins() {
+  const std::vector<uint8_t> vbios = make_connector_vbios();   // eDP on pin 0, HDMI-A on pin 1, DisplayPort on pin 2
+  Rig rig;
+  // port connectivity per endpoint: 0 connector, 1 none, 2 fixed function, 3 both; only 1 is not connected
+  const uint32_t connectivity[8] = {0, 1, 2, 3, 1, 0, 1, 1};
+  for (uint32_t p = 0; p < 8; ++p) rig.card.gfx.set_reg(0x17a9 + 4 * p, (connectivity[p] << 30) | (0x00123456u & 0x3FFFFFFFu));
+  rig.card.gfx.set_reg(0x1898 + 8, 0x2);   // a display on pin 1 (the HDMI connector)
+  rig.card.gfx.set_reg(0x1898 + 16, 0x2);  // and on pin 2 (the DisplayPort)
+  rig.card.gfx.set_reg(0x1898, 0x2);       // and on pin 0 (the internal panel)
+  AmdVegaM vega(rig.alloc);
+  AmdVegaM::Inputs in = rig.inputs();
+  in.hpd_pins = 0x0F;
+  in.vbios = ConstByteView(vbios.data(), vbios.size());
+  CHECK(vega.bring_up(in));
+  if (!vega.up()) return;
+  // pins 0, 2, 3, 5 are connected: 0b00101101
+  CHECK(vega.audio_pins_connected() == 0x2D);
+  // each was asked for the default configuration (index 0x56)
+  for (uint32_t p = 0; p < 8; ++p) CHECK(rig.card.gfx.reg(0x17a8 + 4 * p) == 0x56);
+  // The outputs that carry audio with a display: the HDMI (pin 1) and the DisplayPort (pin 2), not the eDP on pin 0.
+  AtomConnectors::Connector outs[4];
+  char name[16];
+  CHECK(vega.audio_outputs(outs, 4) == 2);
+  AtomConnectors::name(outs[0], ArrayView<char>(name, sizeof name));
+  CHECK(!strcmp(name, "HDMI-A-1"));
+  AtomConnectors::name(outs[1], ArrayView<char>(name, sizeof name));
+  CHECK(!strcmp(name, "DP-1"));
+  CHECK(vega.audio_outputs(outs, 1) == 1 && vega.audio_outputs(nullptr, 0) == 0);
+  // The HDMI display goes away (pin 1 interrupt): only the DisplayPort is left. And the endpoints are read again on request.
+  rig.card.gfx.set_reg(0x1857 + 1, 0x20000);
+  rig.card.gfx.set_reg(0x1898 + 8, 0);
+  rig.card.ih.post(42, 1, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && vega.audio_outputs(outs, 4) == 1);
+  AtomConnectors::name(outs[0], ArrayView<char>(name, sizeof name));
+  CHECK(!strcmp(name, "DP-1"));
+  rig.card.gfx.set_reg(0x17a9 + 4 * 1, 0);   // endpoint 1 gets a port
+  CHECK(vega.audio_pins_connected() == 0x2D && vega.refresh_audio_pins() == 0x2F && vega.audio_pins_connected() == 0x2F);
+  // The endpoints themselves: a pin that does not exist reads zero and touches nothing, and the mask never goes past the eighth.
+  {
+    Rig plain;
+    for (uint32_t p = 0; p < 8; ++p) plain.card.gfx.set_reg(0x17a9 + 4 * p, 0x40000000);
+    amd_dce11::AudioPins pins(*plain.inputs().registers);
+    const size_t writes = plain.card.gfx.writes.size();
+    CHECK(pins.endpoint_read(8, 0x56) == 0 && pins.endpoint_read(100, 0x56) == 0 && pins.port_connectivity(8) == 0 && !pins.connected(8) && !pins.connected(0xFFFFFFFFu));
+    CHECK(plain.card.gfx.writes.size() == writes);
+    CHECK(pins.connected_mask(100) == 0 && pins.connected_mask(0) == 0);
+    CHECK(pins.port_connectivity(3) == 1 && pins.endpoint_read(3, 0x56) == 0x40000000);
+    for (uint32_t p = 0; p < 8; ++p) plain.card.gfx.set_reg(0x17a9 + 4 * p, 0);
+    CHECK(pins.connected_mask(100) == 0xFF && pins.connected_mask(3) == 0x7);
+  }
+  // Stopped: nothing.
+  vega.shutdown();
+  CHECK(vega.audio_pins_connected() == 0 && vega.refresh_audio_pins() == 0 && vega.audio_outputs(outs, 4) == 0);
+  // Without a video BIOS: the endpoints, but no names.
+  AmdVegaM bare(rig.alloc);
+  AmdVegaM::Inputs bare_in = rig.inputs();
+  memset(rig.doorbell_base, 0, 0x800 * 4);
+  CHECK(bare.bring_up(bare_in) && bare.audio_pins_connected() == 0x2F && bare.audio_outputs(outs, 4) == 0);
+  CHECK(AtomConnectors::carries_audio(AtomConnectors::Type::HdmiA) && AtomConnectors::carries_audio(AtomConnectors::Type::HdmiB) && AtomConnectors::carries_audio(AtomConnectors::Type::DisplayPort));
+  CHECK(!AtomConnectors::carries_audio(AtomConnectors::Type::EmbeddedDisplayPort) && !AtomConnectors::carries_audio(AtomConnectors::Type::Vga) && !AtomConnectors::carries_audio(AtomConnectors::Type::Lvds) &&
+        !AtomConnectors::carries_audio(AtomConnectors::Type::DviD));
+}
+
+
 int main() {
   setvbuf(stdout, nullptr, _IONBF, 0);
   test_plan();
@@ -846,7 +1638,19 @@ int main() {
   test_sq_messages();
   test_display_interrupts();
   test_vblank_interrupt();
+  test_vline_interrupt();
   test_video_engine_interrupts();
+  test_recovery();
+  test_auto_recovery();
+  test_recovery_failure();
+  test_recovery_failure_sdma();
+  test_card_reset();
+  test_post_after_reset();
+  test_hotplug_events();
+  test_hpd_rx();
+  test_hotplug_connectors();
+  test_audio_pins();
+  test_read_edid();
   printf(g_failed ? "AmdVegaMTest: %d FAILED\n" : "AmdVegaMTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }

@@ -23,6 +23,8 @@
 //
 // Each frame is drawn from paint(), which runs on the window's render thread - the only thread that uses the 3D device - so the cube needs no
 // thread or lock of its own. The picture is read back from the device (small, so that reading it back is cheap) and shown like any image.
+// Each face of the cube shows the OS logo as a texture, which exercises the sampler as well as the vertices and colors; a check box turns that
+// off for flat per-face colors, and a device that cannot sample textures falls back to them by itself.
 // "FPS" is how many of those frames are finished per second; "render" is the time the device and the readback took for the last one.
 #pragma once
 #include "Allocators/IAllocator.hpp"
@@ -47,6 +49,9 @@ class CubeView : public gui::Control {
   // Whether the cube is drawn on the GPU device (when there is one) or on the CPU one.
   void set_use_gpu(bool use_gpu);
   bool use_gpu() const { return use_gpu_; }
+  // Whether the faces show the logo (when the device can sample it) or flat colors.
+  void set_use_texture(bool use_texture);
+  bool use_texture() const { return use_texture_; }
   bool gpu_available() const { return graphics_ && graphics_->accelerated(); }
 
   // The measurements, for the status line and for tests.
@@ -54,6 +59,10 @@ class CubeView : public gui::Control {
   uint64_t frame_microseconds() const { return frame_us_; }
   uint64_t frames() const { return total_frames_; }
   bool accelerated() const { return active_accelerated_; }
+  // Whether the last frame was drawn with the logo on the faces.
+  bool textured() const { return active_textured_; }
+  // Whether the device in use could be given the logo (known once a frame has been drawn).
+  bool texture_available() const { return texture_available_; }
   // Why the GPU is not in use (empty when it is, or when the check box chose software).
   const char* software_reason() const { return graphics_ ? graphics_->software_reason() : ""; }
 
@@ -72,6 +81,9 @@ class CubeView : public gui::Control {
   Resources* resources_ = nullptr;
   graphics::IGraphicsDevice* resources_device_ = nullptr;
   bool use_gpu_ = true;
+  bool use_texture_ = true;
+  bool active_textured_ = false;
+  bool texture_available_ = false;
   bool active_accelerated_ = false;
   bool failed_ = false;
   FixedString<48> device_name_;
@@ -86,13 +98,16 @@ class Graphics3DTest : public gui::Frame {
   void set_graphics(graphics::SystemGraphics* graphics);
   CubeView& view() { return view_; }
   gui::CheckBox& gpu_box() { return gpu_box_; }
+  gui::CheckBox& texture_box() { return texture_box_; }
 
  private:
   static void on_gpu_changed(void* self, gui::Control&);
+  static void on_texture_changed(void* self, gui::Control&);
 
   CubeView view_;
   gui::Panel bar_;
   gui::CheckBox gpu_box_;
+  gui::CheckBox texture_box_;
 };
 
 }  // namespace desktop

@@ -682,3 +682,69 @@ EXPORT PSLIST_ENTRY NTAPI RtlInterlockedFlushSList(PSLIST_HEADER head) {
   slist_unlock();
   return top;
 }
+
+/* ---- PE image helpers ------------------------------------------------------------------------------------------------------------------------------------ */
+
+/* The headers of an image mapped at `base` (a base with the low bit set is a file mapped as data). Raw offsets: the e_lfanew at 0x3C; the signature, file header (6 sections count,
+ * 20 optional header size) and optional header (PE32+: data directories from 112) follow it. */
+static BYTE *image_nt_headers(PVOID base) {
+  BYTE *image = (BYTE *)((ULONG_PTR)base & ~(ULONG_PTR)1);
+  if (!image || image[0] != 'M' || image[1] != 'Z') return NULL;
+  const LONG lfanew = *(const LONG *)(image + 0x3C);
+  if (lfanew < 0 || lfanew > 0x10000000) return NULL;
+  BYTE *nt = image + lfanew;
+  if (nt[0] != 'P' || nt[1] != 'E' || nt[2] != 0 || nt[3] != 0) return NULL;
+  return nt;
+}
+EXPORT PVOID NTAPI RtlImageNtHeader(PVOID base) { return image_nt_headers(base); }
+EXPORT NTSTATUS NTAPI RtlImageNtHeaderEx(ULONG flags, PVOID base, ULONGLONG size, PVOID *headers) {
+  if (!headers) return STATUS_INVALID_PARAMETER;
+  *headers = NULL;
+  if (flags & ~(ULONG)1) return STATUS_INVALID_PARAMETER;
+  if (!base || base == (PVOID)(ULONG_PTR)-1) return STATUS_INVALID_PARAMETER;
+  BYTE *image = (BYTE *)((ULONG_PTR)base & ~(ULONG_PTR)1);
+  if (!(flags & 1) && size < 0x40) return (NTSTATUS)0xC000007Bu;
+  BYTE *nt = image_nt_headers(base);
+  if (!nt) return (NTSTATUS)0xC000007Bu;
+  if (!(flags & 1) && (ULONGLONG)(nt - image) + 0x108 > size) return (NTSTATUS)0xC000007Bu;
+  *headers = nt;
+  return STATUS_SUCCESS;
+}
+EXPORT PVOID NTAPI RtlImageRvaToSection(PVOID nt_headers, PVOID base, ULONG rva) {
+  (void)base;
+  BYTE *nt = nt_headers;
+  const USHORT count = *(const USHORT *)(nt + 6), optional_size = *(const USHORT *)(nt + 20);
+  BYTE *section = nt + 24 + optional_size;
+  for (USHORT i = 0; i < count; ++i, section += 40) {
+    const ULONG virtual_size = *(const ULONG *)(section + 8), raw_size = *(const ULONG *)(section + 16), address = *(const ULONG *)(section + 12);
+    const ULONG span = virtual_size > raw_size ? virtual_size : raw_size;
+    if (rva >= address && rva - address < span) return section;
+  }
+  return NULL;
+}
+EXPORT PVOID NTAPI RtlImageRvaToVa(PVOID nt_headers, PVOID base, ULONG rva, PVOID *last_section) {
+  BYTE *section = NULL;
+  if (last_section) section = *last_section;
+  if (section) {      /* the section the last answer came from, if the address is in it too */
+    const ULONG virtual_size = *(const ULONG *)(section + 8), raw_size = *(const ULONG *)(section + 16), address = *(const ULONG *)(section + 12);
+    if (!(rva >= address && rva - address < (virtual_size > raw_size ? virtual_size : raw_size))) section = NULL;
+  }
+  if (!section) section = RtlImageRvaToSection(nt_headers, base, rva);
+  if (!section) return NULL;
+  if (last_section) *last_section = section;
+  return (BYTE *)base + (rva - *(const ULONG *)(section + 12)) + *(const ULONG *)(section + 20);
+}
+EXPORT PVOID NTAPI RtlImageDirectoryEntryToData(PVOID base, BOOLEAN mapped_as_image, USHORT directory, PULONG size) {
+  BYTE *nt = image_nt_headers(base);
+  if (!nt) return NULL;
+  const USHORT magic = *(const USHORT *)(nt + 24);
+  if (magic != 0x20B) return NULL;      /* only PE32+ here */
+  const ULONG count = *(const ULONG *)(nt + 24 + 108);
+  if (directory >= count || directory >= 16) return NULL;
+  const ULONG rva = *(const ULONG *)(nt + 24 + 112 + directory * 8), length = *(const ULONG *)(nt + 24 + 112 + directory * 8 + 4);
+  if (!rva) return NULL;
+  if (size) *size = length;
+  BYTE *image = (BYTE *)((ULONG_PTR)base & ~(ULONG_PTR)1);
+  if (mapped_as_image || rva < *(const ULONG *)(nt + 24 + 60)) return image + rva;      /* (inside the headers: the same either way) */
+  return RtlImageRvaToVa(nt, image, rva, NULL);
+}

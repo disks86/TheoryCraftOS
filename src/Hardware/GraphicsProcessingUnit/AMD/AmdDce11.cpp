@@ -193,6 +193,13 @@ void Interrupts::set_vblank(uint32_t crtc, bool enable) {
   r_.write(mmLB_INTERRUPT_MASK + kCrtcOffsets[crtc], mask);
 }
 
+void Interrupts::set_vline(uint32_t crtc, bool enable) {
+  if (crtc >= kMaxCrtcs) return;
+  uint32_t mask = r_.read(mmLB_INTERRUPT_MASK + kCrtcOffsets[crtc]);
+  mask = REG_SET_FIELD(mask, LB_INTERRUPT_MASK, VLINE_INTERRUPT_MASK, enable ? 1 : 0);
+  r_.write(mmLB_INTERRUPT_MASK + kCrtcOffsets[crtc], mask);
+}
+
 bool Interrupts::hpd_sense(uint32_t pin) {
   return pin < kMaxHpd && (r_.read(mmDC_HPD_INT_STATUS + kHpdOffsets[pin]) & DC_HPD_INT_STATUS__DC_HPD_SENSE_MASK) != 0;
 }
@@ -219,6 +226,24 @@ void Interrupts::hpd_set_interrupt(uint32_t pin, bool enable) {
   r_.write(mmDC_HPD_INT_CONTROL + kHpdOffsets[pin], tmp);
 }
 
+void Interrupts::hpd_rx_set_interrupt(uint32_t pin, bool enable) {
+  if (pin >= kMaxHpd) return;
+  uint32_t tmp = r_.read(mmDC_HPD_INT_CONTROL + kHpdOffsets[pin]);
+  tmp = REG_SET_FIELD(tmp, DC_HPD_INT_CONTROL, DC_HPD_RX_INT_EN, enable ? 1 : 0);
+  r_.write(mmDC_HPD_INT_CONTROL + kHpdOffsets[pin], tmp);
+}
+
+bool Interrupts::hpd_rx_asserted(uint32_t pin) {
+  return pin < kMaxHpd && (r_.read(mmDC_HPD_INT_STATUS + kHpdOffsets[pin]) & DC_HPD_INT_STATUS__DC_HPD_RX_INT_STATUS_MASK) != 0;
+}
+
+void Interrupts::ack_hpd_rx(uint32_t pin) {
+  if (pin >= kMaxHpd) return;
+  uint32_t tmp = r_.read(mmDC_HPD_INT_CONTROL + kHpdOffsets[pin]);
+  tmp = REG_SET_FIELD(tmp, DC_HPD_INT_CONTROL, DC_HPD_RX_INT_ACK, 1);
+  r_.write(mmDC_HPD_INT_CONTROL + kHpdOffsets[pin], tmp);
+}
+
 void Interrupts::hpd_init(uint32_t pin) {
   if (pin >= kMaxHpd) return;
   uint32_t tmp = r_.read(mmDC_HPD_CONTROL + kHpdOffsets[pin]);
@@ -241,6 +266,7 @@ void Interrupts::hpd_fini(uint32_t pin) {
   tmp = REG_SET_FIELD(tmp, DC_HPD_CONTROL, DC_HPD_EN, 0);
   r_.write(mmDC_HPD_CONTROL + kHpdOffsets[pin], tmp);
   hpd_set_interrupt(pin, false);   // (amdgpu_irq_put)
+  hpd_rx_set_interrupt(pin, false);
 }
 
 bool Interrupts::vblank_asserted(uint32_t crtc) { return crtc < kMaxCrtcs && (r_.read(kInterruptStatus[crtc].reg) & kInterruptStatus[crtc].vblank) != 0; }
@@ -266,6 +292,30 @@ bool Interrupts::ack_pageflip(uint32_t crtc) {
   if (!(r_.read(mmGRPH_INTERRUPT_STATUS + kCrtcOffsets[crtc]) & GRPH_INTERRUPT_STATUS__GRPH_PFLIP_INT_OCCURRED_MASK)) return false;
   r_.write(mmGRPH_INTERRUPT_STATUS + kCrtcOffsets[crtc], GRPH_INTERRUPT_STATUS__GRPH_PFLIP_INT_CLEAR_MASK);
   return true;
+}
+
+namespace {
+constexpr uint32_t kAudioPinOffsets[AudioPins::kMaxPins] = {0x17a8 - 0x17a8, 0x17ac - 0x17a8, 0x17b0 - 0x17a8, 0x17b4 - 0x17a8, 0x17b8 - 0x17a8, 0x17bc - 0x17a8, 0x17c0 - 0x17a8, 0x17c4 - 0x17a8};
+}  // namespace
+
+uint32_t AudioPins::endpoint_read(uint32_t pin, uint32_t reg) {
+  if (pin >= kMaxPins) return 0;
+  r_.write(mmAZALIA_F0_CODEC_ENDPOINT_INDEX + kAudioPinOffsets[pin], reg);
+  return r_.read(mmAZALIA_F0_CODEC_ENDPOINT_DATA + kAudioPinOffsets[pin]);
+}
+
+uint32_t AudioPins::port_connectivity(uint32_t pin) {
+  const uint32_t tmp = endpoint_read(pin, ixAZALIA_F0_CODEC_PIN_CONTROL_RESPONSE_CONFIGURATION_DEFAULT);
+  return FIELD(tmp, AZALIA_F0_CODEC_PIN_CONTROL_RESPONSE_CONFIGURATION_DEFAULT__PORT_CONNECTIVITY_MASK, AZALIA_F0_CODEC_PIN_CONTROL_RESPONSE_CONFIGURATION_DEFAULT__PORT_CONNECTIVITY__SHIFT);
+}
+
+bool AudioPins::connected(uint32_t pin) { return pin < kMaxPins && port_connectivity(pin) != kPortConnectivityNone; }
+
+uint32_t AudioPins::connected_mask(uint32_t pin_count) {
+  uint32_t mask = 0;
+  for (uint32_t pin = 0; pin < pin_count && pin < kMaxPins; ++pin)
+    if (connected(pin)) mask |= 1u << pin;
+  return mask;
 }
 
 bool Presenter::start(INativeDisplay& display, ByteView video, uint32_t pitch_bytes, uint32_t height) {

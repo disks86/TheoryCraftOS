@@ -36,7 +36,10 @@ void lowercase_into(StringView in, String* out) {
 
 // --- Document ----------------------------------------------------------------------------------------------------
 
-Document::Document(allocators::IAllocator& allocator) : doctype_name(allocator), doctype_public(allocator), doctype_system(allocator), content_type(allocator), allocator_(allocator), nodes_(allocator), log_(allocator), watched_(allocator) { root_ = make(NodeType::Document, "#document"); }
+Document::Document(allocators::IAllocator& allocator) : doctype_name(allocator), doctype_public(allocator), doctype_system(allocator), content_type(allocator), character_set(allocator), allocator_(allocator), nodes_(allocator), log_(allocator), watched_(allocator) {
+  character_set.assign("UTF-8");
+  root_ = make(NodeType::Document, "#document");
+}
 
 Document::~Document() {
   for (uint64_t i = 0; i < nodes_.count(); ++i) {
@@ -76,6 +79,14 @@ Node* Document::create_comment(StringView data) {
   return n;
 }
 
+Node* Document::create_doctype(StringView name, StringView public_id, StringView system_id) {
+  Node* n = create_comment(public_id);
+  if (!n) return nullptr;
+  n->dom_type = 10;
+  n->name.assign(name);
+  n->qname.assign(system_id);
+  return n;
+}
 Node* Document::create_fragment() { return make(NodeType::Fragment, "#document-fragment"); }
 
 Node* Document::document_element() const {
@@ -221,11 +232,66 @@ void detach(Node* node) {
   unlink(node);
 }
 
+static bool is_doctype(const Node* n) { return n->type == NodeType::Comment && n->dom_type == 10; }
+
+// "Ensure pre-insertion validity" (and the checks of replacing): can `node` go into `parent` before `reference` (or in place of `replaced`)? The checks are made in the order of
+// the standard, which is what decides the exception when several things are wrong.
+static DomError check_insertion(const Node* parent, const Node* node, const Node* reference, const Node* replaced) {
+  if (parent->type != NodeType::Document && parent->type != NodeType::Fragment && parent->type != NodeType::Element) return DomError::HierarchyRequest;
+  for (const Node* p = parent; p; p = p->parent ? p->parent : p->shadow_host)   // (node is an inclusive ancestor of parent, a shadow host counted)
+    if (p == node) return DomError::HierarchyRequest;
+  const Node* child = replaced ? replaced : reference;
+  if (child && child->parent != parent) return DomError::NotFound;
+  if (node->type == NodeType::Document) return DomError::HierarchyRequest;
+  if (node->type == NodeType::Text && parent->type == NodeType::Document) return DomError::HierarchyRequest;
+  if (is_doctype(node) && parent->type != NodeType::Document) return DomError::HierarchyRequest;
+  if (parent->type != NodeType::Document) return DomError::None;
+  auto has_element_other_than = [&](const Node* except) {
+    for (const Node* c = parent->first_child; c; c = c->next)
+      if (c->is_element() && c != except) return true;
+    return false;
+  };
+  auto doctype_after = [&](const Node* n) {   // a doctype after n among the children
+    for (const Node* c = n->next; c; c = c->next)
+      if (is_doctype(c)) return true;
+    return false;
+  };
+  auto element_preceding = [&](const Node* before) {
+    for (const Node* c = parent->first_child; c && c != before; c = c->next)
+      if (c->is_element()) return true;
+    return false;
+  };
+  if (node->type == NodeType::Fragment) {
+    uint32_t elements = 0;
+    for (const Node* c = node->first_child; c; c = c->next) {
+      if (c->is_element()) ++elements;
+      else if (c->type == NodeType::Text) return DomError::HierarchyRequest;
+    }
+    if (elements > 1) return DomError::HierarchyRequest;
+    if (elements == 1) {
+      if (has_element_other_than(replaced)) return DomError::HierarchyRequest;
+      if (replaced ? doctype_after(replaced) : reference && (is_doctype(reference) || doctype_after(reference))) return DomError::HierarchyRequest;
+    }
+    return DomError::None;
+  }
+  if (node->is_element()) {
+    if (has_element_other_than(replaced)) return DomError::HierarchyRequest;
+    if (replaced) return doctype_after(replaced) ? DomError::HierarchyRequest : DomError::None;
+    if (reference && (is_doctype(reference) || doctype_after(reference))) return DomError::HierarchyRequest;
+    return DomError::None;
+  }
+  if (is_doctype(node)) {
+    for (const Node* c = parent->first_child; c; c = c->next)
+      if (is_doctype(c) && c != replaced) return DomError::HierarchyRequest;
+    if (replaced) return element_preceding(replaced) ? DomError::HierarchyRequest : DomError::None;
+    if (reference) return element_preceding(reference) ? DomError::HierarchyRequest : DomError::None;
+    return has_element_other_than(nullptr) ? DomError::HierarchyRequest : DomError::None;
+  }
+  return DomError::None;
+}
+
 DomError insert_before(Node* parent, Node* child, Node* reference) {
-  if (!can_have_children(parent) || child->type == NodeType::Document) return DomError::HierarchyRequest;
-  if (reference && reference->parent != parent) return DomError::NotFound;
-  if (contains(child, parent)) return DomError::HierarchyRequest;   // (into itself or below itself)
-  if (child->type == NodeType::Text && parent->type == NodeType::Document) return DomError::HierarchyRequest;
+  if (const DomError e = check_insertion(parent, child, reference, nullptr); e != DomError::None) return e;
   if (reference == child) reference = child->next;
   if (child->type == NodeType::Fragment) {
     while (Node* c = child->first_child) {
@@ -251,13 +317,20 @@ DomError remove_child(Node* parent, Node* child) {
 }
 
 DomError replace_child(Node* parent, Node* child, Node* old_child) {
-  if (old_child->parent != parent) return DomError::NotFound;
+  if (const DomError e = check_insertion(parent, child, nullptr, old_child); e != DomError::None) return e;
   if (child == old_child) return DomError::None;
-  Node* after = old_child->next;
-  if (after == child) after = child->next;
-  const DomError e = insert_before(parent, child, old_child);
-  if (e != DomError::None) return e;
+  Node* reference = old_child->next == child ? child->next : old_child->next;
+  if (child->type == NodeType::Fragment) {
+    while (Node* c = child->first_child) {
+      unlink(c);
+      link_before(parent, c, reference);
+    }
+  } else {
+    unlink(child);
+    link_before(parent, child, reference);
+  }
   unlink(old_child);
+  touch(parent);
   return DomError::None;
 }
 
@@ -287,7 +360,7 @@ Node* clone_into(Document& doc, Node* node, bool deep) {
       }
       break;
     case NodeType::Text: copy = doc.create_text(node->data.view()); if (copy) { copy->dom_type = node->dom_type; if (node->dom_type) copy->name.assign(node->name.view()); } break;
-    case NodeType::Comment: copy = doc.create_comment(node->data.view()); if (copy) { copy->dom_type = node->dom_type; if (node->dom_type) copy->name.assign(node->name.view()); } break;
+    case NodeType::Comment: copy = doc.create_comment(node->data.view()); if (copy) { copy->dom_type = node->dom_type; if (node->dom_type) copy->name.assign(node->name.view()); if (node->dom_type == 10) copy->qname.assign(node->qname.view()); } break;
     case NodeType::Fragment: copy = doc.create_fragment(); break;
     case NodeType::Document: return nullptr;
   }
@@ -553,6 +626,12 @@ void serialize(const Node* n, String* out, uint32_t depth) {
       return;
     }
     case NodeType::Comment:
+      if (n->dom_type == 10) {
+        out->append("<!DOCTYPE ");
+        out->append(n->name.view());
+        out->push_back('>');
+        return;
+      }
       if (n->dom_type == 7) {
         out->append("<?");
         out->append(n->name.view());

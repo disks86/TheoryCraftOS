@@ -345,7 +345,7 @@ Frame* on_user_fault(Frame* frame) {
     irq_enable();
     task->mutex.lock();
     process::AddressSpace* space = task->program.process()->address_space();
-    const bool copied = space && space->break_copy_on_write(cow_address, 1) && task->sync_tables();
+    const bool copied = space && ((space->break_copy_on_write(cow_address, 1) && task->sync_tables()) || space->check(cow_address, 1, process::kProtWrite));      // (or another thread got there first)
     task->mutex.unlock();
     irq_disable();
     if (copied) return frame;
@@ -425,6 +425,7 @@ bool ready() { return g.ready; }
 ArrayView<const process::AddressRange> reserved_ranges() { return ArrayView<const process::AddressRange>(g.ranges, g.range_count); }
 
 bool init(allocators::IAllocator& allocator) {
+  process::g_process_log = [](const char* text) { console::puts(text); };
   if (g.ready) return true;
   if (!running()) return false;
   uint32_t eax = 0x80000001, ebx, ecx = 0, edx;

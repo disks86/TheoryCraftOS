@@ -18,6 +18,7 @@
 
 #pragma once
 #include <stdint.h>
+#include <type_traits>
 #include "Allocators/IAllocator.hpp"
 #include "Hardware/CentralProcessingUnit/ICentralProcessingUnit.hpp"
 #include "Kernel/Interrupts.hpp"
@@ -108,6 +109,22 @@ inline void sleep_ms(uint64_t ms) { sleep_us(ms * 1000); }
 bool join(Thread* thread, uint64_t timeout_us = 0);
 // The thread cleans itself up when it finishes.
 void detach(Thread* thread);
+
+// Runs `work` to its end on a new thread with a full-size stack, on the calling core (so it may still call firmware), and waits for it. The boot thread runs on the firmware's
+// stack, which is small (128 KiB under EDK2) and has the firmware's own memory below it: a page layout or anything else deep in there writes past its end into the firmware's pool
+// and breaks it (the next firmware call then faults, which was the hang at shutdown). Runs `work` right here when threads are not running or cannot be started.
+uint32_t current_core();
+template <typename Work>
+void run_on_large_stack(Work&& work) {
+  using Callable = std::remove_reference_t<Work>;
+  Callable* callable = &work;
+  Thread* thread = running() ? spawn([](void* context) { (*static_cast<Callable*>(context))(); }, callable, "main", static_cast<int32_t>(current_core())) : nullptr;
+  if (!thread) {
+    work();
+    return;
+  }
+  join(thread);
+}
 
 // Frees the stacks of detached threads that have finished. Done automatically by
 // idle cores and by spawn(); call it to have the memory back at a known point.

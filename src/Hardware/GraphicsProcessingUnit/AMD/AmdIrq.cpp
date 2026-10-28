@@ -59,6 +59,7 @@ const char* AmdIrq::kind_name(Kind kind) {
     case Kind::DisplayVline: return "display vline";
     case Kind::DisplayPageFlip: return "display page flip";
     case Kind::DisplayHotplug: return "display hot plug";
+    case Kind::DisplayHpdRx: return "display DisplayPort short pulse";
     case Kind::UvdFence: return "UVD fence";
     case Kind::UvdEncodeFence: return "UVD encode fence";
     case Kind::VceFence: return "VCE fence";
@@ -119,6 +120,9 @@ AmdIrq::Event AmdIrq::classify(const AmdIh3::Vector& vector) {
   } else if (vector.src_id == kSrcHotplugDetect && vector.src_data < amd_dce11::Interrupts::kMaxHpd) {
     e.pin = vector.src_data;
     e.kind = Kind::DisplayHotplug;
+  } else if (vector.src_id == kSrcHotplugDetect && vector.src_data >= kDataHpdRxFirst && vector.src_data < kDataHpdRxFirst + amd_dce11::Interrupts::kMaxHpd) {
+    e.pin = vector.src_data - kDataHpdRxFirst;
+    e.kind = Kind::DisplayHpdRx;
   }
   return e;
 }
@@ -192,6 +196,7 @@ uint32_t AmdIrq::process(AmdIh3& ih, ISink* sink, uint32_t max_vectors) {
       case Kind::DisplayVline:
         event.asserted = display_.vline_asserted(event.crtc);
         if (event.asserted) display_.ack_vline(event.crtc);
+        ++vlines_[event.crtc];
         break;
       case Kind::DisplayPageFlip:
         display_.ack_pageflip(event.crtc);
@@ -206,6 +211,14 @@ uint32_t AmdIrq::process(AmdIh3& ih, ISink* sink, uint32_t max_vectors) {
         if (++hotplugs_[event.pin] > kHotplugStormLimit && !(throttled_ >> event.pin & 1)) {
           display_.hpd_set_interrupt(event.pin, false);
           throttled_ |= 1u << event.pin;
+        }
+        break;
+      case Kind::DisplayHpdRx:
+        if (!display_.hpd_rx_asserted(event.pin)) continue;   // (nothing pending: not a pulse)
+        display_.ack_hpd_rx(event.pin);
+        if (++hpd_rxs_[event.pin] > kHpdRxStormLimit && !(rx_throttled_ >> event.pin & 1)) {
+          display_.hpd_rx_set_interrupt(event.pin, false);
+          rx_throttled_ |= 1u << event.pin;
         }
         break;
       default: break;
