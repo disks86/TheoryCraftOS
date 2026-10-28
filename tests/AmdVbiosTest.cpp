@@ -277,9 +277,11 @@ struct RomMapper final : IRegisterMapper {
   uint64_t asked_physical = 0, asked_length = 0;
   RomPci* pci = nullptr;
   bool enabled_when_mapped = false;
+  uint64_t only_at = 0;             // if not 0, the only physical address that can be mapped
   bool map_registers(uint64_t physical, uint64_t length, MmioRegion* region) override {
     asked_physical = physical;
     asked_length = length;
+    if (only_at && physical != only_at) return false;
     enabled_when_mapped = pci && (pci->rom_register & 1);
     if (refuse || length > memory.size()) return false;
     *region = MmioRegion(reinterpret_cast<uint64_t>(memory.data()), length);
@@ -571,6 +573,80 @@ static void test_atrm() {
   }
 }
 
+// An image of the shape a shadowed legacy ROM has: 128 KiB, the video BIOS first, its PCI data structure naming the card.
+static std::vector<uint8_t> shadow_memory(uint16_t vendor, uint16_t device, uint8_t marker = 0) {
+  std::vector<uint8_t> memory(0x20000, 0);
+  const std::vector<uint8_t> image = atom_image(8);
+  memcpy(memory.data(), image.data(), image.size());
+  put16(memory, 0x18, 0x40);
+  memcpy(&memory[0x40], "PCIR", 4);
+  put16(memory, 0x44, vendor);
+  put16(memory, 0x46, device);
+  put16(memory, 0x40 + 16, 8);
+  memory[0x40 + 21] = 0x80;
+  memory[0x300] = marker;
+  return memory;
+}
+
+static void test_legacy_shadow() {
+  TestAllocator alloc;
+  ByteBuffer out(alloc);
+  RomMapper mapper;
+  mapper.only_at = 0xC0000;
+  mapper.memory = shadow_memory(0x1002, 0x694C, 0x99);
+  // The card's own image: the whole 128 KiB, as the driver copies romlen bytes.
+  CHECK(AmdVbios::read_from_legacy_shadow(mapper, alloc, 0x1002, 0x694C, &out) && out.size() == 0x20000 && out.view()[0x300] == 0x99);
+  CHECK(mapper.asked_physical == 0xC0000 && mapper.asked_length == 0x20000);
+  CHECK(out.view().equals(ConstByteView(mapper.memory.data(), mapper.memory.size())));
+  // Someone else's: the integrated graphics' image is no use, whichever of the two IDs differs.
+  out.clear();
+  CHECK(!AmdVbios::read_from_legacy_shadow(mapper, alloc, 0x1002, 0x6860, &out) && out.size() == 0);
+  CHECK(!AmdVbios::read_from_legacy_shadow(mapper, alloc, 0x8086, 0x694C, &out) && out.size() == 0);
+  CHECK(!AmdVbios::read_from_legacy_shadow(mapper, alloc, 0x1003, 0x694D, &out) && out.size() == 0);
+  // A range that cannot be mapped, or that is smaller.
+  mapper.refuse = true;
+  CHECK(!AmdVbios::read_from_legacy_shadow(mapper, alloc, 0x1002, 0x694C, &out));
+  mapper.refuse = false;
+  mapper.only_at = 0xD0000;
+  CHECK(!AmdVbios::read_from_legacy_shadow(mapper, alloc, 0x1002, 0x694C, &out));
+  mapper.only_at = 0xC0000;
+  // No shadow at all (all ones, as a bus with nothing answers; zeros), no PCI data structure, one that points out of the window, one that is not "PCIR", not an AtomBIOS image.
+  const std::vector<uint8_t> good = shadow_memory(0x1002, 0x694C);
+  for (int variant = 0; variant < 7; ++variant) {
+    mapper.memory = good;
+    switch (variant) {
+      case 0: mapper.memory.assign(0x20000, 0xFF); break;
+      case 1: mapper.memory.assign(0x20000, 0); break;
+      case 2: put16(mapper.memory, 0x18, 0); break;
+      case 3: put16(mapper.memory, 0x18, 0xFFFF); break;
+      case 4: mapper.memory[0x40] = 'X'; break;
+      case 5: mapper.memory[0x48] = 0; mapper.memory[0x49] = 0; break;   // (the BIOS header pointer)
+      case 6: mapper.memory[0] = 0x54; break;
+    }
+    out.clear();
+    CHECK(!AmdVbios::read_from_legacy_shadow(mapper, alloc, 0x1002, 0x694C, &out) && out.size() == 0);
+  }
+  // rom_ids: the two IDs, and the refusals
+  uint16_t vendor = 0, device = 0;
+  CHECK(AmdVbios::rom_ids(ConstByteView(good.data(), good.size()), &vendor, &device) && vendor == 0x1002 && device == 0x694C);
+  CHECK(!AmdVbios::rom_ids(ConstByteView(good.data(), 25), &vendor, &device) && !AmdVbios::rom_ids(ConstByteView(), &vendor, &device));
+  CHECK(!AmdVbios::rom_ids(ConstByteView(good.data(), 0x47), &vendor, &device) && AmdVbios::rom_ids(ConstByteView(good.data(), 0x48), &vendor, &device));
+  std::vector<uint8_t> unsigned_rom = good;
+  unsigned_rom[1] = 0xAB;
+  CHECK(!AmdVbios::rom_ids(ConstByteView(unsigned_rom.data(), unsigned_rom.size()), &vendor, &device));
+  // Damage to the first bytes, every bit: no crash under the sanitizers, and what is accepted still is an image of this card.
+  std::vector<uint8_t> flipped = good;
+  for (size_t at = 0; at < 0x60; ++at) {
+    for (int bit = 0; bit < 8; ++bit) {
+      flipped[at] ^= static_cast<uint8_t>(1 << bit);
+      mapper.memory = flipped;
+      out.clear();
+      if (AmdVbios::read_from_legacy_shadow(mapper, alloc, 0x1002, 0x694C, &out)) CHECK(AmdVbios::is_atom_bios(out.view()));
+      flipped[at] ^= static_cast<uint8_t>(1 << bit);
+    }
+  }
+}
+
 static void test_find_order() {
   TestAllocator alloc;
   const PciAddress fn{1, 0, 0};
@@ -633,6 +709,25 @@ static void test_find_order() {
     s.mapper = &mapper;
     s.device_id = 0x6860;
   }
+  // The legacy shadow comes after the VFCT and before the expansion ROM: a card the VFCT does not know, with a shadow that names it, is read from the shadow; a shadow that names
+  // another card is not read.
+  {
+    RomMapper shadow;
+    shadow.only_at = 0xC0000;
+    shadow.memory = shadow_memory(0x1002, 0x6860, 0x88);
+    s.mapper = &shadow;
+    s.pci = nullptr;
+    s.device_id = 0x6860;
+    regs.writes.clear();
+    CHECK(AmdVbios::find(s, &out) == AmdVbios::Source::LegacyShadow && out.view()[0x300] == 0x88 && regs.writes.empty());
+    s.device_id = 0x694C;   // (the VFCT has this one)
+    CHECK(AmdVbios::find(s, &out) == AmdVbios::Source::Vfct);
+    s.device_id = 0x6861;   // (the shadow is of another card: the ROM registers)
+    CHECK(AmdVbios::find(s, &out) == AmdVbios::Source::RomRegisters);
+    s.mapper = &mapper;
+    s.pci = &pci;
+    s.device_id = 0x6860;
+  }
   // Nothing: none, and the output is left empty-handed.
   AmdVbios::Sources none;
   none.allocator = &alloc;
@@ -643,7 +738,7 @@ static void test_find_order() {
   no_alloc.function = fn; no_alloc.vendor_id = 0x1002; no_alloc.device_id = 0x694C;
   // (the VFCT needs no allocator for the copy beyond the output's own)
   CHECK(AmdVbios::find(no_alloc, &o2) == AmdVbios::Source::Vfct);
-  CHECK(AmdVbios::source_name(AmdVbios::Source::None) && AmdVbios::source_name(AmdVbios::Source::Atrm) && AmdVbios::source_name(AmdVbios::Source::Vfct) && AmdVbios::source_name(AmdVbios::Source::RomBar) && AmdVbios::source_name(AmdVbios::Source::RomRegisters));
+  CHECK(AmdVbios::source_name(AmdVbios::Source::None) && AmdVbios::source_name(AmdVbios::Source::Atrm) && AmdVbios::source_name(AmdVbios::Source::LegacyShadow) && AmdVbios::source_name(AmdVbios::Source::Vfct) && AmdVbios::source_name(AmdVbios::Source::RomBar) && AmdVbios::source_name(AmdVbios::Source::RomRegisters));
 }
 
 
@@ -653,6 +748,7 @@ int main() {
   test_rom_size();
   test_rom_registers();
   test_rom_bar();
+  test_legacy_shadow();
   test_find_order();
   test_atrm();
   printf(g_failed ? "AmdVbiosTest: %d FAILED\n" : "AmdVbiosTest: all passed\n", g_failed);

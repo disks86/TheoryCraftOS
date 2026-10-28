@@ -41,6 +41,7 @@ const char* AmdVbios::source_name(Source source) {
     case Source::None: return "none";
     case Source::Atrm: return "ACPI ATRM method";
     case Source::Vfct: return "ACPI VFCT";
+    case Source::LegacyShadow: return "legacy shadow at 0xC0000";
     case Source::RomBar: return "PCI expansion ROM";
     case Source::RomRegisters: return "the card's ROM registers";
   }
@@ -78,6 +79,28 @@ ConstByteView AmdVbios::find_in_vfct(ConstByteView table, PciAddress function, u
     }
   }
   return ConstByteView();
+}
+
+bool AmdVbios::rom_ids(ConstByteView image, uint16_t* vendor_id, uint16_t* device_id) {
+  if (image.size() < 26 || le16(image, 0) != 0xAA55) return false;
+  const uint64_t pds = le16(image, 24);
+  if (pds + 8 > image.size() || le32(image, pds) != 0x52494350) return false;   // "PCIR"
+  *vendor_id = le16(image, pds + 4);
+  *device_id = le16(image, pds + 6);
+  return true;
+}
+
+bool AmdVbios::read_from_legacy_shadow(IRegisterMapper& mapper, allocators::IAllocator& allocator, uint16_t vendor_id, uint16_t device_id, ByteBuffer* out) {
+  MmioRegion region;
+  if (!mapper.map_registers(kLegacyShadowBase, kLegacyShadowBytes, &region)) return false;
+  ByteBuffer copy(allocator);
+  for (uint64_t at = 0; at < kLegacyShadowBytes; at += 4)
+    if (!copy.put32(region.read32(at))) return false;
+  uint16_t vendor = 0, device = 0;
+  if (!rom_ids(copy.view(), &vendor, &device) || vendor != vendor_id || device != device_id) return false;
+  if (!is_atom_bios(copy.view())) return false;
+  out->clear();
+  return out->append(copy.view());
 }
 
 uint64_t AmdVbios::rom_size(ConstByteView window) {
@@ -228,6 +251,7 @@ AmdVbios::Source AmdVbios::find(const Sources& s, ByteBuffer* out) {
     }
   }
   if (!s.allocator) return Source::None;
+  if (s.mapper && read_from_legacy_shadow(*s.mapper, *s.allocator, s.vendor_id, s.device_id, out)) return Source::LegacyShadow;
   if (s.pci && s.mapper && read_from_rom_bar(*s.pci, s.function, *s.mapper, *s.allocator, out)) return Source::RomBar;
   if (s.registers && read_from_rom_registers(*s.registers, *s.allocator, out)) return Source::RomRegisters;
   return Source::None;

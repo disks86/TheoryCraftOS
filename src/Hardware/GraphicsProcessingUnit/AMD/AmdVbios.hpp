@@ -29,11 +29,11 @@
 namespace hardware {
 
 // Finding the video BIOS image of an AMD card, for the AtomBIOS interpreter (AtomBios) that POSTs it. The sources and their checks follow the Linux amdgpu driver's amdgpu_bios.c, in
-// the order of amdgpu_get_bios_dgpu: the card's ACPI ATRM method (an AML method of the card's device that returns the ROM a page at a time), the ACPI VFCT table (the firmware's copy of the images of the video BIOSes of its AMD cards, what most laptops with a discrete card use), the PCI
+// the order of amdgpu_get_bios_dgpu: the card's ACPI ATRM method (an AML method of the card's device that returns the ROM a page at a time), the ACPI VFCT table (the firmware's copy of the images of the video BIOSes of its AMD cards, what most laptops with a discrete card use), the legacy shadow at 0xC0000, the PCI
 // expansion ROM, and the card's own ROM read through the SMC's ROM index and data registers (the Volcanic Islands cards' amdgpu_read_bios_from_rom). Every image found must pass
 // check_atom_bios: the 0xAA55 signature, a pointer at 0x48 to a header that has "ATOM" (or "MOTA") at offset 4.
 //
-// Not done: the copy in video memory (for SR-IOV), the legacy ROM shadow at 0xC0000 (the driver takes it from the PCI core, which sets it for the boot display; whether a UEFI machine has it is another matter), and the
+// Not done: the copy in video memory (for SR-IOV), and the
 // "disabled ROM" path that clears the ROM disable bits of the card before reading it.
 class AmdVbios {
  public:
@@ -47,7 +47,7 @@ class AmdVbios {
   static constexpr uint32_t kSmcIndex = 0x1AC, kSmcData = 0x1AD;
   static constexpr uint32_t kRomIndex = 0xc0600010, kRomData = 0xc0600014;
 
-  enum class Source : uint8_t { None, Atrm, Vfct, RomBar, RomRegisters };
+  enum class Source : uint8_t { None, Atrm, Vfct, LegacyShadow, RomBar, RomRegisters };
   static const char* source_name(Source source);
 
   // check_atom_bios
@@ -63,6 +63,16 @@ class AmdVbios {
   // whatever its length). False if there is no such method or the image is no good. `aml` has the tables loaded.
   static constexpr uint32_t kAtrmBiosPage = 4096, kAtrmBiosBytes = 256 * 1024;
   static bool read_from_atrm(acpi::AmlInterpreter& aml, PciAddress function, allocators::IAllocator& allocator, ByteBuffer* out);
+
+  // amdgpu_read_platform_bios: the video BIOS the firmware shadowed at the legacy address 0xC0000, 128 KiB of it (what the PCI core sets as the ROM of the boot display, `pdev->rom` and
+  // `pdev->romlen`, in pci_fixup_video). The driver relies on the PCI core to say that this is the card's; there is no such knowledge here, so the image must also say it is this card's:
+  // the PCI data structure it points to at 0x18 has the vendor and device ID asked for. That is stricter than the driver, and a shadow of another card (the integrated graphics, which is
+  // normally the boot display of a laptop with a second card) is refused. False if the range cannot be mapped or the image is no good.
+  static constexpr uint64_t kLegacyShadowBase = 0xC0000, kLegacyShadowBytes = 0x20000;
+  static bool read_from_legacy_shadow(IRegisterMapper& mapper, allocators::IAllocator& allocator, uint16_t vendor_id, uint16_t device_id, ByteBuffer* out);
+
+  // The vendor and device ID in the PCI data structure of an expansion ROM image (false if it has none).
+  static bool rom_ids(ConstByteView image, uint16_t* vendor_id, uint16_t* device_id);
 
   // pci_get_rom_size: how much of an expansion ROM window is images - the images are chained, each says how long it is in 512 byte units and whether it is the last. 0 if the first is not an image.
   static uint64_t rom_size(ConstByteView window);

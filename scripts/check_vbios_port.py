@@ -69,12 +69,12 @@ def main():
         fail('the valid signature')
     if '#define AMD_VBIOS_LENGTH(p) ((p)[2] << 9)' not in bios_c or 'uint32_t length = uint32_t{h[2]} << 9;' not in cpp:
         fail('the image length byte')
-    # the order of the sources for a discrete card: ATRM, VFCT, VRAM (not ported), platform (not ported), ROM BAR, ROM registers
+    # the order of the sources for a discrete card: ATRM, VFCT, VRAM (not ported), platform, ROM BAR, ROM registers
     dgpu = body(bios_c, 'amdgpu_get_bios_dgpu')
     if not order(dgpu, ['amdgpu_atrm_get_bios', 'amdgpu_acpi_vfct_bios', 'amdgpu_read_bios_from_vram', 'amdgpu_read_platform_bios', 'amdgpu_read_bios(adev)', 'amdgpu_read_bios_from_rom', 'amdgpu_read_disabled_bios']):
         fail('amdgpu_get_bios_dgpu changed its order')
     mine = body(cpp[cpp.index('AmdVbios::Source AmdVbios::find'):], 'AmdVbios::find') if False else squash(cpp[cpp.index('AmdVbios::Source AmdVbios::find'):])
-    if not order(mine, ['read_from_atrm', 'find_in_vfct', 'read_from_rom_bar', 'read_from_rom_registers']):
+    if not order(mine, ['read_from_atrm', 'find_in_vfct', 'read_from_legacy_shadow', 'read_from_rom_bar', 'read_from_rom_registers']):
         fail('AmdVbios::find is not in the order of the sources')
     # the ATRM method: 256 KiB in pages of 4096, ATRM(offset, length), stopping at the first short page, then check_atom_bios
     if '#define ATRM_BIOS_PAGE 4096' not in bios_c or 'kAtrmBiosPage = 4096, kAtrmBiosBytes = 256 * 1024' not in hpp:
@@ -90,6 +90,12 @@ def main():
     if not order(mine_atrm, ['arguments[0].integer = uint64_t{page} * kAtrmBiosPage', 'arguments[1].integer = kAtrmBiosPage', 'aml.evaluate(method, arguments, 2, &result)',
                              'if (result.length < kAtrmBiosPage) break;', 'is_atom_bios(image.view())']) or 'page < kAtrmBiosBytes / kAtrmBiosPage' not in mine_atrm or "name[0] == 'A' && name[1] == 'T' && name[2] == 'R' && name[3] == 'M'" not in cpp:
         fail('read_from_atrm does not follow amdgpu_atrm_get_bios')
+    # the platform ROM: the whole romlen (the PCI core's 0xC0000 and 0x20000 for the shadowed ROM of the boot display, arch/x86/pci/fixup.c, not in the files checked here), then check_atom_bios
+    plat = body(bios_c, 'amdgpu_read_platform_bios')
+    if not order(plat, ['ioremap(rom, romlen)', 'memcpy_fromio(adev->bios, bios, romlen)', 'check_atom_bios(adev->bios, romlen)']):
+        fail('amdgpu_read_platform_bios changed')
+    if 'kLegacyShadowBase = 0xC0000, kLegacyShadowBytes = 0x20000' not in hpp or not order(squash(cpp[cpp.index('bool AmdVbios::read_from_legacy_shadow'):]), ['map_registers(kLegacyShadowBase, kLegacyShadowBytes', 'rom_ids(copy.view()', 'is_atom_bios(copy.view())']):
+        fail('read_from_legacy_shadow does not follow amdgpu_read_platform_bios')
     # check_atom_bios
     chk = body(bios_c, 'check_atom_bios')
     for token in ('size < 0x49', 'bios[0x48] | (bios[0x49] << 8)', 'tmp = bios_header_start + 4', '"ATOM"', '"MOTA"'):
