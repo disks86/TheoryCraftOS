@@ -632,9 +632,17 @@ static LDR_DATA_TABLE_ENTRY *module_by_name(LPCWSTR name) {
   }
   return NULL;
 }
+PVOID NTAPI TcosFindModuleByFile(PCWSTR path);
+static BOOL has_separator(LPCWSTR name);
+static DWORD full_path_w(LPCWSTR in, WCHAR *out, DWORD capacity);
 EXPORT HMODULE WINAPI GetModuleHandleW(LPCWSTR name) {
   if (!name) return NtCurrentPeb()->ImageBaseAddress;
   LDR_DATA_TABLE_ENTRY *m = module_by_name(name);
+  if (!m && has_separator(name)) {      /* a file: the library loaded from it, under whatever name */
+    WCHAR full[PATH_CHARS];
+    PVOID base;
+    if (full_path_w(name, full, PATH_CHARS) && (base = TcosFindModuleByFile(full)) != NULL) return base;
+  }
   if (!m) { set_error(ERROR_MOD_NOT_FOUND); return NULL; }
   return m->DllBase;
 }
@@ -858,6 +866,11 @@ static HMODULE load_library_ex(LPCWSTR name, HANDLE file, DWORD flags) {
   } else {
     path[0] = 0;      /* (find_file may have left a name behind that is not a file) */
     unicode_string(&us, name);
+  }
+  if (path[0] && !(flags & 0x32)) {      /* the file of a library that is loaded already (under another name, or moved): one more use of it */
+    PVOID loaded = TcosFindModuleByFile(path);
+    LDR_DATA_TABLE_ENTRY *entry = loaded ? module_by_base(loaded) : NULL;
+    if (entry) us = entry->FullDllName;
   }
   if ((flags & 0x32) && has_separator(name) && !path[0] && !search) { set_error(ERROR_FILE_NOT_FOUND); return NULL; }      /* (a file named with a folder has to be there) */
   if ((flags & 0x32) && !GetModuleHandleW(path[0] ? path : name)) {      /* AS_DATAFILE 2, AS_DATAFILE_EXCLUSIVE 0x10, AS_IMAGE_RESOURCE 0x20: the file is only mapped (a loaded library is used as it is) */
