@@ -134,6 +134,8 @@ class ObjectManager {
   bool section_memory(uint32_t id, uint8_t** storage, uint64_t* size, SharedMemory** owner);
   bool section_info(uint32_t id, SectionInfo* out);
   void section_set_reported_size(uint32_t id, uint64_t size);
+  // The lower-case name of the file behind the section (no folders, cut to 39 characters); false if it has no file.
+  bool section_file_name(uint32_t id, char (&out)[40]);
   // Is there a section (a mapping handle or a view) of the file at this path in the OS file system? A file in that state cannot be truncated, deleted or renamed.
   // 0: none, 1: a data section, 2: an image section.
   uint32_t file_has_section(StringView host_path);
