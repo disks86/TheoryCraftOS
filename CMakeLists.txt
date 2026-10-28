@@ -681,6 +681,7 @@ add_executable(BOOTX64
   src/Hardware/GraphicsProcessingUnit/AMD/AmdDdc.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/I2cEdid.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdAux.cpp
+  src/Hardware/GraphicsProcessingUnit/AMD/AmdPanelPower.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdAsicReset.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdIrq.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdSdma3.cpp

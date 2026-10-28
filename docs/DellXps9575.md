@@ -672,7 +672,14 @@ with an address-only request without the flag; a native or I2C defer is waited o
 
 **Not done / not known:** `amdgpu_atombios_dp.c` and `drm_dp_helper.c` were not at hand: the table's parameter layout and index are checked against `atombios.h` (`scripts/check_aux_port.py`) but the request
 framing (the length nibble, 3 for an address-only request and 4 plus the payload otherwise, 16 as 0), the limits of the table (12 and 16 bytes), the delay (0) and the retry rules are from memory. The panel's power of an
-eDP connector is not done (amdgpu switches it on through the transmitter control table before the first AUX access); a panel that is off does not answer, and the POST normally leaves it on. The DPCD is not used (no
-link training, sink capabilities or power state). Tested with a sink written independently from the AUX wire format (`tests/FakeAuxSink.hpp`, behind a video BIOS whose table 78 passes the request to the simulated
+eDP connector is switched on first (`AmdPanelPower`, below). The DPCD is not used (no link training, sink capabilities or power state). Tested with a sink written independently from the AUX wire format (`tests/FakeAuxSink.hpp`, behind a video BIOS whose table 78 passes the request to the simulated
 card: `AmdAuxTest`, `AmdVegaMTest::test_read_edid`): the requests on the wire, the table's parameters, native reads and writes, the EDID with its extension blocks and segment pointer, defers, busy, timeouts, errors, NACKs,
 short replies, a table that reports more bytes than were asked for, an image without the table, and random replies under the sanitizers. Whether a real sink answers is unseen.
+
+**eDP panel power.** A panel that is off does not answer on the AUX channel. `amdgpu_atombios_encoder_set_edp_panel_power` runs the command table `UNIPHYTransmitterControl` (= `DIG1TransmitterControl`, table 76; `DIG_TRANSMITTER_CONTROL_PARAMETERS`, 8 bytes: `usPixelClock`, `ucConfig`, `ucAction` in
+byte 3, four reserved) with `ucAction` = `ATOM_TRANSMITTER_ACTION_POWER_ON` (12) and then polls the connector's hot plug pin once per millisecond for up to 300 ms for the panel to show; on a timeout it logs and goes on.
+`AmdPanelPower::power_on` does the same (the pin is sensed through `IHpdSense`, here the display engine's `DC_HPD_INT_STATUS`; a connector without a pin does not wait; a timeout returns false), and
+`AmdVegaM::read_edid` runs it for eDP connectors before the first AUX access and tries the AUX channel whatever it returns. The panel is left on (`power_off` exists, nothing calls it: the driver switches the panel
+off with the display). The table index, the parameter layout and the two action values are checked against `atombios.h` by `scripts/check_aux_port.py`; `tests/AmdPanelPowerTest.cpp` (the action in the parameters, the wait
+to the millisecond and the 300th sense, a pin that never shows the panel, no pin, an image without the table) and `AmdVegaMTest::test_read_edid` (a panel that answers only after the power-up, which only eDP gets) cover it.
+The driver source for this function was not at hand: the 300 ms / 1 ms polling and the use of only `ucAction` are from memory. Also unseen on hardware: the time a real panel needs (the T1+T2 power sequencing is the table's).
