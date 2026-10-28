@@ -162,6 +162,10 @@ typedef struct _OVERLAPPED { ULONG_PTR Internal, InternalHigh; union { struct { 
 #define ERROR_DISK_FULL 112
 #define ERROR_ENVVAR_NOT_FOUND 203
 #define ERROR_NOACCESS 998
+#define ERROR_IO_INCOMPLETE 996
+#ifndef STATUS_PENDING
+#define STATUS_PENDING ((NTSTATUS)0x00000103)
+#endif
 #define ERROR_NOT_LOCKED 158
 #define ERROR_DISCARDED 157
 #ifndef NO_ERROR

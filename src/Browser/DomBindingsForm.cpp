@@ -1034,7 +1034,7 @@ bool install_forms(DomBindings::Impl& c) {
   vm.define_native(proto, "values", formdata_values, 0);
   vm.define_native(proto, "forEach", formdata_for_each, 1);
   JsObject* ctor = vm.new_native(formdata_constructor, "FormData", 0);
-  vm.define(ctor, vm.prototype_name(), Value::make_object(proto), 0);
+  vm.define(ctor, vm.prototype_name(), Value::make_object(proto), kNonConfigurable);
   vm.define(proto, vm.intern("constructor"), Value::make_object(ctor), kWritable);
   vm.define_named(vm.global(), "FormData", Value::make_object(ctor), kWritable);
   return !vm.halted();

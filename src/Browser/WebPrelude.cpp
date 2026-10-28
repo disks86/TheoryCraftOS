@@ -11976,11 +11976,9 @@ const char kFinishPrelude[] = R"JSPRELUDE((function (g) {
 
   (function () {   // HTMLDocument is the interface of the document of a page: it inherits from Document
     var HD = g.HTMLDocument, D = g.Document;
-    if (typeof HD !== 'function' || typeof D !== 'function' || HD.prototype !== D.prototype) return;
-    var p = Object.create(D.prototype);
-    def(p, 'constructor', HD);
-    Object.defineProperty(p, Symbol.toStringTag, { value: 'HTMLDocument', configurable: true });
-    try { Object.defineProperty(HD, 'prototype', { value: p, writable: true }); Object.setPrototypeOf(HD, D); Object.setPrototypeOf(g.document, p); } catch (e) { }
+    if (typeof HD !== 'function' || typeof D !== 'function' || HD.prototype === D.prototype) return;
+    Object.defineProperty(HD.prototype, Symbol.toStringTag, { value: 'HTMLDocument', configurable: true });
+    try { Object.setPrototypeOf(HD, D); Object.setPrototypeOf(g.document, HD.prototype); } catch (e) { }
   }());
 
   // GPU adapters and audio

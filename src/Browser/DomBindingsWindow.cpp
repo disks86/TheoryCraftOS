@@ -1219,7 +1219,7 @@ bool install_window(DomBindings::Impl& c) {
   vm.define_native(c.storage_proto, "key", storage_key, 1);
   {
     JsObject* storage_ctor = vm.new_native([](Vm& v, const Value&, const Value*, uint32_t, Value*) { return v.throw_error(ErrorKind::TypeError, "Illegal constructor"); }, "Storage", 0);
-    vm.define(storage_ctor, vm.prototype_name(), Value::make_object(c.storage_proto), 0);
+    vm.define(storage_ctor, vm.prototype_name(), Value::make_object(c.storage_proto), kNonConfigurable);
     vm.define(c.storage_proto, vm.intern("constructor"), Value::make_object(storage_ctor), kWritable);
     vm.define_named(g, "Storage", Value::make_object(storage_ctor), kWritable);
   }
@@ -1336,7 +1336,7 @@ bool install_window(DomBindings::Impl& c) {
     vm.define_native(proto, "disconnect", win_do_nothing, 0);
     vm.define_native(proto, "takeRecords", empty_array_native, 0);
     JsObject* f = vm.new_native(observer_constructor, name, 1);
-    vm.define(f, vm.prototype_name(), Value::make_object(proto), 0);
+    vm.define(f, vm.prototype_name(), Value::make_object(proto), kNonConfigurable);
     vm.define(proto, vm.intern("constructor"), Value::make_object(f), kWritable);
     vm.define_named(g, name, Value::make_object(f), kWritable);
   }

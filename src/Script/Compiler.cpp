@@ -66,6 +66,7 @@ struct FuncState {
   List<Patch> patches;
   List<EnvScope> envs;          // the block Envs that are open here, outermost first
   bool is_global = false;
+  bool is_program = false;   // the code of the whole source (a strict eval is one that is not global: its variables are its own)
   uint32_t scope_depth = 0;     // blocks entered (0: the function's own top level)
   int32_t completion_slot = -1;
   uint32_t next_ctx_id = 1;
@@ -73,19 +74,21 @@ struct FuncState {
 
 class Compiler {
  public:
-  Compiler(Vm& vm, String* error, bool library) : vm_(vm), error_(error), library_(library), withs_(vm.allocator()) {}
+  Compiler(Vm& vm, String* error, bool library, bool local_scope) : vm_(vm), error_(error), library_(library), local_scope_(local_scope), withs_(vm.allocator()) {}
 
   bool program(Node* block, FunctionCode** out) {
     FuncState fs(vm_.allocator());
     fs.code = vm_.new_code();
     if (!fs.code) return fail("Out of memory", 0);
-    fs.is_global = true;
     fs.code->library = library_;
     fs.code->strict = (block->flags & kFlagStrict) != 0 || has_use_strict(block->list);
+    fs.is_program = true;
+    fs.is_global = !(local_scope_ && fs.code->strict);
     cur_ = &fs;
     fs.completion_slot = static_cast<int32_t>(new_slot());
     check_redeclarations(block->list);
     hoist_globals(block->list);
+    declare_lexicals(block->list);   // (nothing for a global program: its let and const are globals)
     init_functions(block->list);
     for (Node* s = block->list; s && !failed_; s = s->next) statement(s);
     emit(Opc::GetVar, fs.completion_slot, fn_hops(), 0);
@@ -293,7 +296,7 @@ class Compiler {
           return true;
         }
       }
-      if (name.equals("arguments") && !fs->is_global && !fs->code->is_arrow) {
+      if (name.equals("arguments") && !fs->is_global && !fs->is_program && !fs->code->is_arrow) {
         FuncState* saved = cur_;
         cur_ = fs;
         const uint32_t s = new_slot();
@@ -552,6 +555,11 @@ class Compiler {
             if (q->text.equals(p->text)) fail("Duplicate parameter name not allowed in this context", p->line);
         }
       }
+      if (!(fn->flags & kFlagExprBody))   // a name the patterns of the parameters bind is a parameter too
+        for (Node* v = fn->a->list; v && v->kind == NodeKind::Var && (v->flags & kFlagPrologue); v = v->next)
+          for (Node* d = v->list; d; d = d->next)
+            for (Node* p = fn->list; p; p = p->next)
+              if (p->text.equals(d->text)) fail("Duplicate parameter name not allowed in this context", d->line);
       for (Node* p = fn->list; p; p = p->next) strict_name(p->text, p->line, true);
       if ((fn->flags & kFlagExpression) && !fn->text.empty()) strict_name(fn->text, fn->line, true);
     }
@@ -695,7 +703,7 @@ class Compiler {
       case NodeKind::FunctionDecl: return;   // (made when its list began)
       case NodeKind::ExprStmt:
         expression(n->a);
-        if (cur_->is_global && cur_->parent == nullptr && cur_->completion_slot >= 0) {
+        if (cur_->is_program && cur_->parent == nullptr && cur_->completion_slot >= 0) {
           emit(Opc::SetVar, cur_->completion_slot, fn_hops(), n->line);
         }
         emit(Opc::Pop);
@@ -1594,6 +1602,7 @@ class Compiler {
   FuncState* cur_ = nullptr;
   bool failed_ = false;
   bool library_ = false;
+  bool local_scope_ = false;
   uint32_t resolved_funcs_ = 0;   // set by resolve(): how many functions out the name was found
   bool resolved_lexical_ = false, resolved_const_ = false;   // set by resolve(): the binding is let / const / class, or const
   StringView resolved_import_;   // set by resolve(): the export an import binding reads (empty for any other)
@@ -1611,8 +1620,8 @@ class Compiler {
 
 }  // namespace
 
-bool compile_program(Vm& vm, Node* program, FunctionCode** out, String* error, bool library) {
-  Compiler compiler(vm, error, library);
+bool compile_program(Vm& vm, Node* program, FunctionCode** out, String* error, bool library, bool local_scope) {
+  Compiler compiler(vm, error, library, local_scope);
   return compiler.program(program, out);
 }
 

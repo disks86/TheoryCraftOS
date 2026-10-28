@@ -389,7 +389,7 @@ static void test_windows_files() {
   const uint64_t info = rig.alloc(64);
   CHECK(rig.query(o.handle, info, 24, 5) == 0 && rig.u64(info + 8) == 12 && rig.bytes(info + 21, 1)[0] == 0);    // standard: EndOfFile, not a directory
   CHECK(rig.query(o.handle, info, 8, 14) == 0 && rig.u64(info) == 8);                           // position
-  CHECK(rig.query(o.handle, info, 40, 4) == 0 && rig.bytes(info + 32, 1)[0] == char(0x80));    // basic: FILE_ATTRIBUTE_NORMAL
+  CHECK(rig.query(o.handle, info, 40, 4) == 0 && rig.bytes(info + 32, 1)[0] == char(0x20));    // basic: FILE_ATTRIBUTE_NORMAL
   CHECK(rig.query(o.handle, info, 56, 34) == 0 && rig.u64(info + 40) == 12);                   // network open
   CHECK(rig.query(o.handle, info, 4, 5) == 0xC0000004u && rig.query(o.handle, info, 64, 99) == 0xC0000003u);
   CHECK(rig.query(o.handle, info, 64, 9) == 0 && rig.bytes(info, 1)[0] == 20 && wide(rig, info + 4, 20) == "\\hello.txt");     // FileNameInformation: the path on the volume
@@ -492,7 +492,7 @@ static void test_windows_files() {
 
   // attributes, delete, rename, delete-on-close
   const uint64_t basic = rig.alloc(40);
-  CHECK(rig.call(WindowsSyscallNumber::NtQueryAttributesFile, rig.attributes("\\??\\C:\\hello.txt"), basic) == 0 && rig.bytes(basic + 32, 1)[0] == char(0x80));
+  CHECK(rig.call(WindowsSyscallNumber::NtQueryAttributesFile, rig.attributes("\\??\\C:\\hello.txt"), basic) == 0 && rig.bytes(basic + 32, 1)[0] == char(0x20));
   CHECK(rig.call(WindowsSyscallNumber::NtQueryAttributesFile, rig.attributes("\\??\\C:\\Temp"), basic) == 0 && rig.bytes(basic + 32, 1)[0] == 0x10);
   CHECK(rig.call(WindowsSyscallNumber::NtQueryAttributesFile, rig.attributes("\\??\\C:\\nope"), basic) == 0xC0000034u);
   CHECK(rig.call(WindowsSyscallNumber::NtDeleteFile, rig.attributes("\\??\\C:\\Temp\\fresh.txt")) == 0 && read_file(fs, "/Windows/Temp/fresh.txt") == "<missing>");
@@ -501,6 +501,16 @@ static void test_windows_files() {
   o = rig.create("\\??\\C:\\Temp\\gone.txt", kGenericWrite | 0x10000, 2, kOptions | 0x1000);                // FILE_DELETE_ON_CLOSE
   CHECK(o.status == 0 && read_file(fs, "/Windows/Temp/gone.txt") == "");
   CHECK(rig.call(WindowsSyscallNumber::NtClose, o.handle) == 0 && read_file(fs, "/Windows/Temp/gone.txt") == "<missing>");
+  // names do not care about case: a file made as Case.Test is found as case.test, in a directory spelled differently too, and creating over it opens the same file
+  o = rig.create("\\??\\C:\\Temp\\Case.Test", kGenericWrite, 2, kOptions);
+  CHECK(o.status == 0 && read_file(fs, "/Windows/Temp/Case.Test") == "");
+  rig.call(WindowsSyscallNumber::NtClose, o.handle);
+  o = rig.create("\\??\\C:\\TEMP\\case.test", kGenericRead, 1, kOptions);
+  CHECK(o.status == 0);
+  rig.call(WindowsSyscallNumber::NtClose, o.handle);
+  o = rig.create("\\??\\C:\\temp\\CASE.TEST", kGenericWrite, 5, kOptions);      // FILE_OPEN_IF
+  CHECK(o.status == 0 && read_file(fs, "/Windows/Temp/CASE.TEST") == "<missing>" && read_file(fs, "/Windows/Temp/Case.Test") == "");
+  rig.call(WindowsSyscallNumber::NtClose, o.handle);
   o = rig.create("\\??\\C:\\Temp\\moved.txt", kGenericWrite | kGenericRead, 2, kOptions);
   rig.write(o.handle, "data", 0);
   // FILE_RENAME_INFORMATION: ReplaceIfExists, RootDirectory, FileNameLength, FileName
