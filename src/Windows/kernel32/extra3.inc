@@ -1035,3 +1035,24 @@ EXPORT BOOL WINAPI SetInformationJobObject(HANDLE job, int info_class, LPVOID in
   const NTSTATUS s = NtSetInformationJobObject(job, (ULONG)info_class, info, length);
   return NT_SUCCESS(s) ? TRUE : fail_nt(s);
 }
+
+/* Debugging another program is not possible: a program cannot attach to itself, and with nothing attached there are no events. As on Windows, the first failed attach
+ * leaves a debug object behind, which makes WaitForDebugEvent time out instead of failing on the handle. */
+static int g_debug_object_made;
+EXPORT BOOL WINAPI DebugActiveProcess(DWORD id) {
+  (void)id;
+  g_debug_object_made = 1;
+  SetLastError(ERROR_ACCESS_DENIED);
+  return FALSE;
+}
+EXPORT BOOL WINAPI DebugActiveProcessStop(DWORD id) {
+  (void)id;
+  SetLastError(ERROR_ACCESS_DENIED);
+  return FALSE;
+}
+EXPORT BOOL WINAPI WaitForDebugEvent(LPVOID event, DWORD milliseconds) {
+  (void)event; (void)milliseconds;
+  SetLastError(g_debug_object_made ? 121 : ERROR_INVALID_HANDLE);
+  return FALSE;
+}
+EXPORT BOOL WINAPI WaitForDebugEventEx(LPVOID event, DWORD milliseconds) { return WaitForDebugEvent(event, milliseconds); }

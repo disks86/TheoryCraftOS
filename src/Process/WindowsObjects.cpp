@@ -25,6 +25,7 @@
 #include "Process/WindowsRegistry.hpp"
 #include "Process/WindowsPipes.hpp"
 #include "Process/WindowsSockets.hpp"
+#include "Process/WindowsProcess.hpp"
 
 namespace process::windowsabi {
 
@@ -609,26 +610,8 @@ uint32_t query_image_information(Process& p, const SyscallRequest& r, uint32_t i
   if (!objects->section_memory(id, &storage, &rounded, &owner)) return kInvalidHandle;
   exe::PeFile pe(p.files().allocator());
   if (!pe.parse(ConstByteView(storage, info.size))) return 0xC000007Bu;
-  uint8_t out[64] = {};
-  auto put = [&](uint32_t at, uint64_t value, uint32_t bytes) { for (uint32_t i = 0; i < bytes; ++i) out[at + i] = uint8_t(value >> (8 * i)); };
-  put(0, pe.image_base() + pe.entry_rva(), 8);
-  put(16, pe.stack_reserve(), 8);
-  put(24, pe.stack_commit(), 8);
-  put(32, pe.subsystem(), 4);
-  put(36, pe.subsystem_minor(), 2);
-  put(38, pe.subsystem_major(), 2);
-  put(40, pe.os_major(), 2);
-  put(42, pe.os_minor(), 2);
-  put(44, pe.characteristics(), 2);
-  put(46, pe.dll_characteristics(), 2);
-  put(48, pe.machine(), 2);
-  bool code = pe.entry_rva() != 0;
-  for (const exe::PeSection& section : pe.sections().view()) if (section.characteristics & 0x20u) code = true;      // IMAGE_SCN_CNT_CODE
-  put(50, code ? 1 : 0, 1);
-  put(51, (pe.dll_characteristics() & 0x40) ? 0x04 : 0, 1);      // ImageDynamicallyRelocated
-  put(52, pe.loader_flags(), 4);
-  put(56, info.size, 4);
-  put(60, pe.checksum(), 4);
+  uint8_t out[64];
+  describe_pe_image(pe, info.size, out);
   if (!p.write_user(r.args[2], ConstByteView(out, 64))) return kAccessViolation;
   if (returned_at != 0 && !p.write_user_u64(returned_at, 64)) return kAccessViolation;
   return kSuccess;
@@ -720,7 +703,7 @@ uint32_t nt_map_view_of_section(Process& p, const SyscallRequest& r) {
   ObjectManager* objects = system_objects();
   AddressSpace* space = p.address_space();
   if (!objects || !space) return kNotImplemented;
-  if (r.args[1] != kCurrentProcess) return kNotImplemented;      // other processes are not reachable
+  if (!names_own_process(p, r.args[1])) return kNotImplemented;      // other processes are not reachable
   const uint32_t id = object_of(p, r.args[0], DescriptorKind::Section);
   if (!id) return kInvalidHandle;
   ObjectManager::SectionInfo info;
@@ -765,24 +748,38 @@ uint32_t nt_map_view_of_section(Process& p, const SyscallRequest& r) {
   return kSuccess;
 }
 
-// NtUnmapViewOfSection(Process, BaseAddress): the whole view that starts at BaseAddress.
-uint32_t nt_unmap_view_of_section(Process& p, const SyscallRequest& r) {
-  AddressSpace* space = p.address_space();
+// The whole view that starts at `address` in `target`'s address space.
+uint32_t unmap_view_in(Process& target, uint64_t address) {
+  AddressSpace* space = target.address_space();
   if (!space) return kNotImplemented;
-  if (r.args[0] != kCurrentProcess) return kNotImplemented;
   uint64_t base = 0, size = 0;
   PageAttributes attributes;
-  if (space->attributes_at(r.args[1], &attributes) && attributes.type == PageAttributes::Image) {      // an image goes with all its pieces
-    return space->allocation_base(r.args[1], &base) && base == r.args[1] && space->unmap_allocation(base) ? kSuccess : kStatusNotMappedView;
+  if (space->attributes_at(address, &attributes) && attributes.type == PageAttributes::Image) {      // an image goes with all its pieces
+    return space->allocation_base(address, &base) && space->unmap_allocation(base) ? kSuccess : kStatusNotMappedView;      // (any address of an image unmaps all of it)
   }
-  if (!space->allocation_extent(r.args[1], &base, &size) || base != r.args[1]) return kStatusNotMappedView;
+  if (!space->allocation_extent(address, &base, &size) || base != address) return kStatusNotMappedView;
   return space->unmap(base, size) ? kSuccess : kStatusNotMappedView;
+}
+
+// NtUnmapViewOfSection(Process, BaseAddress): the whole view that starts at BaseAddress (in this process or in one it started).
+uint32_t nt_unmap_view_of_section(Process& p, const SyscallRequest& r) {
+  if (names_own_process(p, r.args[0])) return unmap_view_in(p, r.args[1]);
+  bool exited = false;
+  uint32_t code = 0;
+  uint64_t pid = 0;
+  if (!process_handle_info(p, r.args[0], &exited, &code, &pid)) return kInvalidHandle;
+  if (exited) return 0xC000010Au;      // STATUS_PROCESS_IS_TERMINATING
+  if (!p.runtime()) return kNotImplemented;
+  IProcessRuntime::RemoteOp op;
+  op.kind = IProcessRuntime::RemoteOp::Unmap;
+  op.address = r.args[1];
+  return p.runtime()->remote_operation(pid, op);
 }
 
 // NtFlushVirtualMemory(Process, PVOID* BaseAddress, PSIZE_T RegionSize, PIO_STATUS_BLOCK): a view of a file goes back to the file.
 uint32_t nt_flush_virtual_memory(Process& p, const SyscallRequest& r) {
   AddressSpace* space = p.address_space();
-  if (!space || r.args[0] != kCurrentProcess) return kNotImplemented;
+  if (!space || !names_own_process(p, r.args[0])) return kNotImplemented;
   uint64_t base = 0;
   if (r.args[1] == 0 || !p.read_user_u64(r.args[1], &base)) return kAccessViolation;
   if (SharedMemory* shared = space->shared_at(base)) shared->flush();

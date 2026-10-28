@@ -29,7 +29,7 @@
 namespace hardware {
 
 // Finding the video BIOS image of an AMD card, for the AtomBIOS interpreter (AtomBios) that POSTs it. The sources and their checks follow the Linux amdgpu driver's amdgpu_bios.c, in
-// the order of amdgpu_get_bios_dgpu: the card's ACPI ATRM method (an AML method of the card's device that returns the ROM a page at a time), the ACPI VFCT table (the firmware's copy of the images of the video BIOSes of its AMD cards, what most laptops with a discrete card use), the legacy shadow at 0xC0000, the PCI
+// the order of amdgpu_get_bios_dgpu: the card's ACPI ATRM method (an AML method of the card's device that returns the ROM a page at a time), the ACPI VFCT table (the firmware's copy of the images of the video BIOSes of its AMD cards, what most laptops with a discrete card use), the copy at the start of video memory, the legacy shadow at 0xC0000, the PCI
 // expansion ROM, and the card's own ROM read through the SMC's ROM index and data registers (the Volcanic Islands cards' amdgpu_read_bios_from_rom). Every image found must pass
 // check_atom_bios: the 0xAA55 signature, a pointer at 0x48 to a header that has "ATOM" (or "MOTA") at offset 4.
 //
@@ -46,7 +46,7 @@ class AmdVbios {
   static constexpr uint32_t kSmcIndex = 0x1AC, kSmcData = 0x1AD;
   static constexpr uint32_t kRomIndex = 0xc0600010, kRomData = 0xc0600014;
 
-  enum class Source : uint8_t { None, Atrm, Vfct, LegacyShadow, RomBar, RomRegisters, DisabledRom };
+  enum class Source : uint8_t { None, Atrm, Vfct, Vram, LegacyShadow, RomBar, RomRegisters, DisabledRom };
   static const char* source_name(Source source);
 
   // check_atom_bios
@@ -62,6 +62,13 @@ class AmdVbios {
   // whatever its length). False if there is no such method or the image is no good. `aml` has the tables loaded.
   static constexpr uint32_t kAtrmBiosPage = 4096, kAtrmBiosBytes = 256 * 1024;
   static bool read_from_atrm(acpi::AmlInterpreter& aml, PciAddress function, allocators::IAllocator& allocator, ByteBuffer* out);
+
+  // amdgpu_read_bios_from_vram: a card that has been POSTed has the video BIOS image at the start of video memory (the memory BAR, BAR 0), 256 KiB of it (the driver's guess at the size). Only
+  // read when the card needs no POST (amdgpu_device_need_post for CIK and later is amdgpu_atombios_scratch_need_asic_init: BIOS_SCRATCH_7 has ATOM_S7_ASIC_INIT_COMPLETE), as a card that
+  // has not been POSTed has nothing there. Needs a BAR of at least the size (the driver maps 256 KiB whatever the BAR says). False if not, the range cannot be mapped or the image is no good.
+  static constexpr uint32_t kBiosScratch7 = 0x5d0, kAsicInitComplete = 0x200;   // mmBIOS_SCRATCH_7, ATOM_S7_ASIC_INIT_COMPLETE_MASK
+  static constexpr uint32_t kVramBiosBytes = 256 * 1024;
+  static bool read_from_vram(IVcnRegisters& registers, IRegisterMapper& mapper, uint64_t bar0_physical, uint64_t bar0_bytes, allocators::IAllocator& allocator, ByteBuffer* out);
 
   // amdgpu_read_platform_bios: the video BIOS the firmware shadowed at the legacy address 0xC0000, 128 KiB of it (what the PCI core sets as the ROM of the boot display, `pdev->rom` and
   // `pdev->romlen`, in pci_fixup_video). The driver relies on the PCI core to say that this is the card's; there is no such knowledge here, so the image must also say it is this card's:
@@ -97,6 +104,7 @@ class AmdVbios {
     IPciBus* pci = nullptr;              // for the expansion ROM
     IRegisterMapper* mapper = nullptr;
     IVcnRegisters* registers = nullptr;  // the card's, for the ROM read through the SMC and for the disabled ROM path
+    uint64_t bar0_physical = 0, bar0_bytes = 0;   // the card's memory BAR, for the copy in video memory
     bool display_engine = true;          // the card has display controllers (the disabled ROM path clears their VGA modes)
     allocators::IAllocator* allocator = nullptr;   // for the copies made while reading (the ROM sources need it)
     PciAddress function{};

@@ -161,6 +161,7 @@ uint32_t nt_create_thread_ex(Process& p, const SyscallRequest& r) {
     uint64_t pid = 0;
     ObjectManager* objects = system_objects();
     if (!objects || !process_handle_info(p, r.args[3], &exited, &code, &pid)) return kInvalidHandle;
+    if (pid == p.id() && p.threads_terminated()) return 0xC0000022u;      // STATUS_ACCESS_DENIED (the program is ending)
     if (pid != p.id()) {
       if (exited) return 0xC000010Au;      // STATUS_PROCESS_IS_TERMINATING
       IProcessRuntime::RemoteOp op;
@@ -474,6 +475,8 @@ uint32_t nt_query_information_thread(Process& p, const SyscallRequest& r) {
 // NtSetInformationThread(Thread, Class, Buffer, Length): priority (2, 3: the value is kept for the program to read back), affinity (4), ideal processor (13, which
 // only has to name a core that exists), and hiding from a debugger (17: nothing to hide from).
 uint32_t nt_set_information_thread(Process& p, const SyscallRequest& r) {
+  uint64_t remote_id = 0;
+  if (remote_thread_handle(p, r.args[0], &remote_id)) return kSuccess;      // (the scheduling of another program's thread is that program's own: accepted, not applied)
   Process::ThreadRecord* record = thread_of(p, r.args[0]);
   if (!record) return kInvalidHandle;
   const uint32_t info_class = uint32_t(r.args[1]), length = uint32_t(r.args[3]);

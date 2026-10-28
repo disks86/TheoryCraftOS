@@ -2,6 +2,8 @@
 // (Copyright Advanced Micro Devices, Inc.; MIT license). Register numbers are dwords; *_BASE_IDX picks the segment base of the register block.
 // Do not edit by hand: change AmdDce11.cpp and run the script again.
 
+constexpr uint32_t AZALIA_F0_CODEC_PIN_CONTROL_RESPONSE_CONFIGURATION_DEFAULT__PORT_CONNECTIVITY_MASK = 0xC0000000;
+constexpr uint32_t AZALIA_F0_CODEC_PIN_CONTROL_RESPONSE_CONFIGURATION_DEFAULT__PORT_CONNECTIVITY__SHIFT = 0x0000001E;
 constexpr uint32_t CRTC_CONTROL__CRTC_MASTER_EN_MASK = 0x00000001;
 constexpr uint32_t DC_HPD_CONTROL__DC_HPD_EN_MASK = 0x10000000;
 constexpr uint32_t DC_HPD_CONTROL__DC_HPD_EN__SHIFT = 0x0000001C;
@@ -61,6 +63,9 @@ constexpr uint32_t LB_VBLANK_STATUS__VBLANK_ACK_MASK = 0x00000010;
 constexpr uint32_t LB_VBLANK_STATUS__VBLANK_ACK__SHIFT = 0x00000004;
 constexpr uint32_t LB_VLINE_STATUS__VLINE_ACK_MASK = 0x00000010;
 constexpr uint32_t LB_VLINE_STATUS__VLINE_ACK__SHIFT = 0x00000004;
+constexpr uint32_t ixAZALIA_F0_CODEC_PIN_CONTROL_RESPONSE_CONFIGURATION_DEFAULT = 0x00000056;
+constexpr uint32_t mmAZALIA_F0_CODEC_ENDPOINT_DATA = 0x000017A9;
+constexpr uint32_t mmAZALIA_F0_CODEC_ENDPOINT_INDEX = 0x000017A8;
 constexpr uint32_t mmCRTC_CONTROL = 0x00001B9C;
 constexpr uint32_t mmDC_HPD_CONTROL = 0x0000189A;
 constexpr uint32_t mmDC_HPD_INT_CONTROL = 0x00001899;

@@ -52,7 +52,11 @@ constexpr uint64_t kElfPieBase = 0x0000555555554000ull;
 LoadStatus load_elf(const exe::ElfFile& elf, ConstByteView file, AddressSpace& space, LoadedImage* out);
 // Maps the headers and sections of a PE32+ executable at its preferred image base (the space is the program's own, so the base is always free: no
 // relocation is needed). Imports are not resolved here. On failure `space` may hold part of the image: discard it.
-LoadStatus load_pe(const exe::PeFile& pe, ConstByteView file, AddressSpace& space, LoadedImage* out);
+// `require_entry` false lets a program without an entry point load (it is created; running it would fault, as on Windows).
+LoadStatus load_pe(const exe::PeFile& pe, ConstByteView file, AddressSpace& space, LoadedImage* out, bool require_entry = true);
+
+// SECTION_IMAGE_INFORMATION (64 bytes) of a PE image as NtQuerySection and NtQueryInformationProcess(ProcessImageInformation) report it. `file_size` is the size of the file.
+void describe_pe_image(const exe::PeFile& pe, uint64_t file_size, uint8_t (&out)[64]);
 
 // The mapping step of load_pe() at an address of the caller's choosing, for DLLs too (an entry point is then optional unless `require_entry`). Does not apply
 // relocations or bind imports (see ModuleLoader.hpp). The headers and sections are mapped at base + their RVAs.

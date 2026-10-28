@@ -41,6 +41,8 @@ uint32_t nt_open_process(Process& p, const SyscallRequest& r);
 bool read_program_file(Process& p, StringView path, ByteBuffer* out, uint32_t* status);
 // A handle to a process created by this system (or 0 if the handle names something else), and what it is.
 bool process_handle_info(Process& p, uint64_t handle, bool* exited, uint32_t* code, uint64_t* pid);
+// True for the pseudo handle (-1) and for a handle opened on this process's own id.
+bool names_own_process(Process& p, uint64_t handle);
 // NtTerminateProcess / NtResumeThread on a handle from nt_create_user_process; `handled` is false if the handle is not one.
 uint32_t terminate_process_handle(Process& p, uint64_t handle, uint32_t code, bool* handled);
 // The kernel scheduler's absolute priority (0..31) for a thread whose process has the Win32 priority class `win32_class` (one of the *_PRIORITY_CLASS constants) and whose

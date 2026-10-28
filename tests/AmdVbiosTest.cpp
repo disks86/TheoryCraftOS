@@ -744,6 +744,77 @@ static void test_disabled_rom() {
   }
 }
 
+// --- The copy in video memory ------------------------------------------------------------------------------------------------------------------
+
+static void test_vram() {
+  TestAllocator alloc;
+  std::vector<uint8_t> memory(0x40000, 0);
+  const std::vector<uint8_t> image = atom_image(8);
+  memcpy(memory.data(), image.data(), image.size());
+  memory[0x300] = 0x5A;
+  memory[0x3FFFC] = 0xC3;   // (the last dword of the 256 KiB)
+  LockedCard card;
+  card.regs[0x5d0] = 0x200 | 0x1;   // BIOS_SCRATCH_7: ASIC_INIT_COMPLETE
+  RomMapper mapper;
+  mapper.only_at = 0xD0000000;
+  mapper.memory = memory;
+  ByteBuffer out(alloc);
+  CHECK(AmdVbios::read_from_vram(card, mapper, 0xD0000000, 256ull << 20, alloc, &out) && out.size() == 0x40000 && out.view().equals(ConstByteView(memory.data(), memory.size())));
+  CHECK(mapper.asked_physical == 0xD0000000 && mapper.asked_length == 0x40000);
+  CHECK(card.writes.empty());   // (nothing written to the card)
+  // The card has not been POSTed (the bit is clear): nothing is read, not even mapped.
+  for (uint32_t scratch : {0u, 0x1u, 0x100u, 0x400u, 0xFFFFFDFFu}) {
+    card.regs[0x5d0] = scratch;
+    mapper.asked_physical = 0;
+    out.clear();
+    CHECK(!AmdVbios::read_from_vram(card, mapper, 0xD0000000, 256ull << 20, alloc, &out) && out.size() == 0 && mapper.asked_physical == 0);
+  }
+  card.regs[0x5d0] = 0x200;
+  // No memory BAR, a BAR smaller than the 256 KiB, one of exactly that size, a range that cannot be mapped.
+  CHECK(!AmdVbios::read_from_vram(card, mapper, 0, 256ull << 20, alloc, &out));
+  {
+    RomMapper anywhere;   // (one that would map address 0 too)
+    anywhere.memory = memory;
+    CHECK(!AmdVbios::read_from_vram(card, anywhere, 0, 256ull << 20, alloc, &out) && anywhere.asked_length == 0);
+    CHECK(AmdVbios::read_from_vram(card, anywhere, 0x1000, 256ull << 20, alloc, &out));
+  }
+  CHECK(!AmdVbios::read_from_vram(card, mapper, 0xD0000000, 0, alloc, &out));
+  CHECK(!AmdVbios::read_from_vram(card, mapper, 0xD0000000, 0x40000 - 1, alloc, &out));
+  CHECK(AmdVbios::read_from_vram(card, mapper, 0xD0000000, 0x40000, alloc, &out));
+  mapper.only_at = 0xE0000000;
+  CHECK(!AmdVbios::read_from_vram(card, mapper, 0xD0000000, 256ull << 20, alloc, &out));
+  mapper.only_at = 0xD0000000;
+  mapper.refuse = true;
+  CHECK(!AmdVbios::read_from_vram(card, mapper, 0xD0000000, 256ull << 20, alloc, &out));
+  mapper.refuse = false;
+  // Video memory with nothing in it (zeros after a power-up, ones from a dead bus), or a damaged image: not an AtomBIOS image.
+  for (int variant = 0; variant < 5; ++variant) {
+    mapper.memory = memory;
+    switch (variant) {
+      case 0: mapper.memory.assign(0x40000, 0); break;
+      case 1: mapper.memory.assign(0x40000, 0xFF); break;
+      case 2: mapper.memory[0] = 0; break;
+      case 3: mapper.memory[0x48] = 0; mapper.memory[0x49] = 0; break;
+      case 4: mapper.memory[(mapper.memory[0x48] | (mapper.memory[0x49] << 8)) + 4] = 'X'; break;   // ("ATOM" in the header the pointer names)
+    }
+    out.clear();
+    const bool atom = AmdVbios::is_atom_bios(ConstByteView(mapper.memory.data(), mapper.memory.size()));
+    CHECK(AmdVbios::read_from_vram(card, mapper, 0xD0000000, 256ull << 20, alloc, &out) == atom);
+    CHECK(!atom);
+  }
+  // Every bit of the first 0x60 bytes: no crash, and what is accepted still is an image.
+  std::vector<uint8_t> flipped = memory;
+  for (size_t at = 0; at < 0x60; ++at) {
+    for (int bit = 0; bit < 8; ++bit) {
+      flipped[at] ^= static_cast<uint8_t>(1 << bit);
+      mapper.memory = flipped;
+      out.clear();
+      if (AmdVbios::read_from_vram(card, mapper, 0xD0000000, 256ull << 20, alloc, &out)) CHECK(AmdVbios::is_atom_bios(out.view()));
+      flipped[at] ^= static_cast<uint8_t>(1 << bit);
+    }
+  }
+}
+
 static void test_find_order() {
   TestAllocator alloc;
   const PciAddress fn{1, 0, 0};
@@ -825,6 +896,35 @@ static void test_find_order() {
     s.pci = &pci;
     s.device_id = 0x6860;
   }
+  // The copy in video memory comes after the VFCT and before the shadow and the expansion ROM, and only for a card that has been POSTed.
+  {
+    std::vector<uint8_t> vram_image(0x40000, 0);
+    const std::vector<uint8_t> atom = atom_image(8);
+    memcpy(vram_image.data(), atom.data(), atom.size());
+    vram_image[0x300] = 0x31;
+    LockedCard card;
+    card.regs[0x5d0] = 0x200;
+    RomMapper vram;
+    vram.only_at = 0xD0000000;
+    vram.memory = vram_image;
+    AmdVbios::Sources v;
+    v.allocator = &alloc;
+    v.registers = &card;
+    v.mapper = &vram;
+    v.bar0_physical = 0xD0000000;
+    v.bar0_bytes = 256ull << 20;
+    v.function = fn;
+    v.vendor_id = 0x1002;
+    v.device_id = 0x6860;
+    CHECK(AmdVbios::find(v, &out) == AmdVbios::Source::Vram && out.size() == 0x40000 && out.view()[0x300] == 0x31);
+    v.vfct = ConstByteView(table.data(), table.size());
+    v.device_id = 0x694C;   // the VFCT has this card: it wins
+    CHECK(AmdVbios::find(v, &out) == AmdVbios::Source::Vfct);
+    v.vfct = ConstByteView();
+    card.regs[0x5d0] = 0;   // not POSTed: not from video memory
+    CHECK(AmdVbios::find(v, &out) == AmdVbios::Source::None);
+    CHECK(AmdVbios::source_name(AmdVbios::Source::Vram) != nullptr);
+  }
   // The disabled ROM is the last resort: only when the other sources give nothing, the ROM base is assigned, and the ROM answers once unlocked.
   {
     std::vector<uint8_t> rom_image = atom_image(8);
@@ -885,6 +985,7 @@ int main() {
   test_rom_bar();
   test_legacy_shadow();
   test_disabled_rom();
+  test_vram();
   test_find_order();
   test_atrm();
   printf(g_failed ? "AmdVbiosTest: %d FAILED\n" : "AmdVbiosTest: all passed\n", g_failed);

@@ -41,6 +41,7 @@ const char* AmdVbios::source_name(Source source) {
     case Source::None: return "none";
     case Source::Atrm: return "ACPI ATRM method";
     case Source::Vfct: return "ACPI VFCT";
+    case Source::Vram: return "the copy in video memory";
     case Source::LegacyShadow: return "legacy shadow at 0xC0000";
     case Source::RomBar: return "PCI expansion ROM";
     case Source::RomRegisters: return "the card's ROM registers";
@@ -89,6 +90,19 @@ bool AmdVbios::rom_ids(ConstByteView image, uint16_t* vendor_id, uint16_t* devic
   *vendor_id = le16(image, pds + 4);
   *device_id = le16(image, pds + 6);
   return true;
+}
+
+bool AmdVbios::read_from_vram(IVcnRegisters& registers, IRegisterMapper& mapper, uint64_t bar0_physical, uint64_t bar0_bytes, allocators::IAllocator& allocator, ByteBuffer* out) {
+  if (!(registers.read(kBiosScratch7) & kAsicInitComplete)) return false;   // the card needs a POST: nothing is there
+  if (bar0_physical == 0 || bar0_bytes < kVramBiosBytes) return false;     // FB BAR not enabled
+  MmioRegion region;
+  if (!mapper.map_registers(bar0_physical, kVramBiosBytes, &region)) return false;
+  ByteBuffer copy(allocator);
+  for (uint64_t at = 0; at < kVramBiosBytes; at += 4)
+    if (!copy.put32(region.read32(at))) return false;
+  if (!is_atom_bios(copy.view())) return false;
+  out->clear();
+  return out->append(copy.view());
 }
 
 bool AmdVbios::read_from_legacy_shadow(IRegisterMapper& mapper, allocators::IAllocator& allocator, uint16_t vendor_id, uint16_t device_id, ByteBuffer* out) {
@@ -293,6 +307,7 @@ AmdVbios::Source AmdVbios::find(const Sources& s, ByteBuffer* out) {
     }
   }
   if (!s.allocator) return Source::None;
+  if (s.registers && s.mapper && read_from_vram(*s.registers, *s.mapper, s.bar0_physical, s.bar0_bytes, *s.allocator, out)) return Source::Vram;
   if (s.mapper && read_from_legacy_shadow(*s.mapper, *s.allocator, s.vendor_id, s.device_id, out)) return Source::LegacyShadow;
   if (s.pci && s.mapper && read_from_rom_bar(*s.pci, s.function, *s.mapper, *s.allocator, out)) return Source::RomBar;
   if (s.registers && read_from_rom_registers(*s.registers, *s.allocator, out)) return Source::RomRegisters;

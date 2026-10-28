@@ -402,6 +402,17 @@ than `kHpdRxStormLimit` (256) times has the interrupt switched off (`hpd_rx_thro
 against its source. **What is not done with it:** a real handler reads the sink's DPCD over the AUX channel (link status, automated test request) and retrains; there is no AUX channel or mode setting here, so the pulse is only
 counted.
 
+### Audio endpoints
+
+`amd_dce11::AudioPins` (`dce_v11_0_audio_endpt_rreg`, `dce_v11_0_audio_get_connected_pins`) reads the display engine's eight audio endpoints (CHIP_VEGAM, like Polaris 10): each has an index/data register pair
+(`AZALIA_F0_CODEC_ENDPOINT_INDEX`/`DATA`, 0x17a8/0x17a9 plus 4 per endpoint) and, at index 0x56, its default pin configuration, whose port connectivity field (bits 31:30) is 1 when the endpoint has no physical
+connection; any other value counts as connected, as in the driver. `AmdVegaM::audio_pins_connected()` is that mask as of bring-up (`refresh_audio_pins()` reads again). **Which output an endpoint serves is not fixed:** the driver
+hands an encoder the first connected endpoint (`dce_v11_0_audio_get_pin`), and the encoder-to-endpoint link is made only when a mode is set, which this OS does not do. So the mask says how many displays could have audio
+and the connector names come from the other side: `audio_outputs()` lists the connectors that carry audio (HDMI-A, HDMI-B, DisplayPort; `AtomConnectors::carries_audio`) and have a display on their hot plug pin now. The boot
+log shows both ("audio: 5 of 8 endpoints with a port", "audio output with a display: HDMI-A-1"). This is a reading of the hardware's state, not an audio path: nothing here drives the endpoints (the card's HD Audio function is
+a separate PCI device, polled by the HD Audio driver). `scripts/check_irq_port.py` checks the endpoint count, offsets, register pair order and the connected rule; `test_audio_pins` covers the mask, the names, a display leaving,
+refresh, shutdown, no video BIOS and out-of-range endpoints under the sanitizers. Nothing seen on the real machine: the endpoints' default configuration may read as "connected" for all eight until a mode is set.
+
 ### Connector names from the video BIOS's object table
 
 `AtomConnectors` (`AtomConnectors.*`) reads what the card's outputs are: a port of the connector part of `amdgpu_atombios_get_connector_info_from_object_table` with `amdgpu_atombios_lookup_gpio` and
@@ -419,6 +430,24 @@ at most 16 connectors are kept, and the parts that are not about naming are left
 hot plug record, merged paths, the capacity, the names, and every truncation, every bit flip and 2000 noisy images under the sanitizers. Not checked against the real thing: `ObjectID.h` (the object id masks and the
 numbers are those of the Linux header from memory, checked only through `object_connector_convert`'s order), and no real Vega M video BIOS has been read. Not done: DDC lines and the encoder/router parts, and
 Atom firmware-info objects of the newer (Vega and later) `atomfirmware.h` layout, which differs.
+
+### Monitor EDID over the DDC lines
+
+The connector reader now also keeps each connector's DDC line (`Connector::ddc_id`, from the I2C record of its object: record type 1, the access byte at +2; the last record wins as in the driver). `AtomI2c::lookup` finds that
+id in the GPIO_I2C_Info data table (index 10; 27-byte entries: the clock's mask, enable, readback and output registers, the data pad's four, the id, the eight bit positions) and makes the bus record
+(`amdgpu_atombios_lookup_i2c_gpio`, `_get_bus_rec_for_i2c_gpio`). `AmdDdc` drives the two pads from software through those registers and reads the EDID: the i2c bit-banging algorithm with the 10 us bit time and 2.2 ms
+clock stretch limit amdgpu sets, then `drm_do_get_edid`'s sequence - offset 0 written to 0x50, a repeated start, 128 bytes read; the header and checksum checked, four tries per block; the extension blocks the same way (the
+segment pointer written to 0x30 from block 2 on), at most three, a block that never checks left out and the base block's count and checksum made true again. The driver's default is software DDC too (its hardware I2C engine
+is a module parameter, off). `AmdVegaM::read_edid(connector, &bytes)` does it for a connector; `main.cpp` reads the monitor on each new connection and at boot, parses it with the existing EDID parser, and the toast says
+"A display (DELL U2720Q 2560x1440) was connected to HDMI-A-1 of the Radeon RX Vega M". It takes the bus for some tens of milliseconds, so it runs from the desktop loop and not in the interrupt path.
+
+**Not done / not known:** DisplayPort and eDP connectors (most of what a laptop has) carry the EDID over the AUX channel (I2C over AUX), a transaction of the AtomBIOS (`ProcessAuxChannelTransaction`) and the DPCD, not GPIO
+pins - `read_edid` refuses them; the interpreter exists, the transaction does not. `amdgpu_i2c.c` (pre_xfer, post_xfer and the pad callbacks) and `i2c-algo-bit.c` were not at hand: the register choreography (outputs cleared, pins made
+inputs, pads masked for software, a pin "high" when its output is not enabled, released again afterwards) and the protocol are written from memory of them, so `check_i2c_port.py` checks the table and entry layout, which register
+is which, the id bits and the lookup against the driver but not the pad callbacks. Tested against a bit-level simulated bus (`tests/FakeI2cMonitor.hpp`: a monitor as an I2C slave, written independently; `AmdDdcTest`): the wire
+(addresses, offsets, segment pointers, one stop per transfer), the registers left as found, the pads masked while the pins are driven, pins left pulled low, retries, a damaged block, an absent monitor, clock stretching within and past
+the limit, the time taken, and every bit flip of the data; `AtomI2cTest`, `AtomConnectorsTest` and `AmdVegaMTest` (`test_read_edid`) cover the table, the record and the card. The simulated slave is not a real monitor: whether a real
+one, through this machine's pads, answers is unseen.
 
 ### MSI: interrupts wake the CPU
 
@@ -502,7 +531,9 @@ checks the constants, the alignment tables, the generated opcode table (`scripts
 **Where the video BIOS image comes from.** `AmdVbios` (`AmdVbios.*`) finds it, following `amdgpu_bios.c` in the order of `amdgpu_get_bios_dgpu`: (0) the ACPI ATRM method, an AML method (`ATRM(offset, length)`, returning a buffer of the ROM's bytes) of the card's device in the firmware's tables,
 called for pages of 4096 bytes from offset 0 until one comes back short, into a 256 KiB image (`read_from_atrm`; see below); (1) the ACPI VFCT table, which holds the firmware's copy of the
 video BIOS images of its AMD cards - `find_in_vfct` walks the images (28-byte headers: PCI bus, device, function, vendor and device ID, length) and takes the one for this function, as a view into the table;
-(1b) the legacy shadow at 0xC0000 (`read_from_legacy_shadow`, `amdgpu_read_platform_bios`: 128 KiB copied, the driver's `pdev->rom`/`romlen` that the PCI core sets for the boot display's shadowed ROM) - but the driver
+(1a) the copy at the start of video memory (`read_from_vram`, `amdgpu_read_bios_from_vram`): a card that has been POSTed has its video BIOS image at the start of the memory BAR, 256 KiB of it (the driver's own guess at
+the size). Only tried when the card needs no POST (`amdgpu_device_need_post` for CIK and later is `BIOS_SCRATCH_7` having `ATOM_S7_ASIC_INIT_COMPLETE`, 0x200 of register 0x5d0, which the register header gives) and the BAR is at
+least 256 KiB (the driver maps that much whatever the BAR says); (1b) the legacy shadow at 0xC0000 (`read_from_legacy_shadow`, `amdgpu_read_platform_bios`: 128 KiB copied, the driver's `pdev->rom`/`romlen` that the PCI core sets for the boot display's shadowed ROM) - but the driver
 knows from the PCI core that the shadow is the card's and this does not, so the image must name the card in its PCI data structure (vendor and device ID, `rom_ids`); the integrated graphics' shadow, which is what a laptop with
 two cards normally has there, is refused; (2) the PCI expansion ROM - `read_from_rom_bar` probes the ROM base register for the window size, switches the ROM on at the base the firmware assigned (no base, no ROM), maps the window, copies it,
 switches it off, and trims the copy to the chained images (`rom_size` is the PCI core's `pci_get_rom_size`: each image gives its length in 512-byte units and whether it is the last); (3) the card's own ROM through the SMC's
@@ -517,7 +548,7 @@ the VGA mode and timing select of the first two display controllers (`D1VGA_CONT
 `Sources::display_engine`, true for the Vega M), `ROM_CNTL` (an SMC register, through the index/data pair) gets `SCK_OVERWRITE`, the expansion ROM is read as in (2), and every register is put back in the same order,
 found or not. It needs the register BAR, the PCI function (a ROM base must have been assigned) and the mapper. `scripts/check_vbios_port.py` (with the three optional register headers) checks the order of the writes and the
 register numbers and masks against `vi.c` and the headers; the test has a card whose ROM answers only once all of it is unlocked (a fake that is stricter than hardware may be, on purpose), checks the exact writes with and
-without display controllers, the restore after a failure, and the place in the order. Not done: the copy in video memory (SR-IOV). **Still unseen:** whether any of this machine's sources is the one that works.
+without display controllers, the restore after a failure, and the place in the order. Every source of `amdgpu_get_bios_dgpu` is now there. **Still unseen:** whether any of this machine's sources is the one that works.
 Tested with hand-assembled AML for the ATRM method (a short page, a page and a short one, two devices told apart by `_ADR`, a name that is not a method, a method on something that is not a device, failing and wrong-typed methods, an endless supply of pages, every truncation and flipped bit of the table), a simulated VFCT table (several cards, truncations, bit flips in every header byte), an expansion ROM behind a working ROM base register, and the SMC pair (`AmdVbiosTest`), and `scripts/check_vbios_port.py` checks
 the signatures, the order, the VFCT layout and the register protocol against the kernel. **Still not seen:** the real machine's VFCT or ROM: whether this machine has a VFCT entry for the Vega M, and whether its table 0 trains the memory.
 

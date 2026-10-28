@@ -381,8 +381,15 @@ EXPORT NTSTATUS NTAPI LdrUnlockLoaderLock(ULONG flags, ULONG_PTR cookie) {
 static int is_program(const LDR_DATA_TABLE_ENTRY *m) { return NtCurrentPeb()->ImageBaseAddress == m->DllBase; }
 
 #define LDRP_MAPPED_ONLY 0x80000000u      /* loaded with DONT_RESOLVE_DLL_REFERENCES: no imports, no thread-local data, no entry point */
+#define LDRP_PROCESS_DETACH_CALLED 0x00080000u      /* the library has been told the process (or its use of it) ends: once only */
 static BOOL notify_module(LDR_DATA_TABLE_ENTRY *m, DWORD reason, PVOID reserved) {
   if (m->Flags & LDRP_MAPPED_ONLY) return TRUE;
+  if (reason == DLL_PROCESS_DETACH) {
+    if (m->Flags & LDRP_PROCESS_DETACH_CALLED) return TRUE;
+    m->Flags |= LDRP_PROCESS_DETACH_CALLED;
+  } else if (reason == DLL_PROCESS_ATTACH) {
+    m->Flags &= ~LDRP_PROCESS_DETACH_CALLED;
+  }
   const int about_threads = reason == DLL_THREAD_ATTACH || reason == DLL_THREAD_DETACH;
   if (about_threads && !is_program(m) && (m->Flags & LDRP_DONT_CALL_FOR_THREADS)) return TRUE;
   const BYTE *image = (const BYTE *)m->DllBase;
@@ -430,8 +437,21 @@ EXPORT void NTAPI LdrShutdownProcess(void) {
 }
 
 /* ExitProcess: the other threads end first (with the exit code), then the libraries are told, then the process goes. */
+/* The PEB lock (RtlAcquirePebLock): one recursive lock for the process-wide data. */
+static RTL_CRITICAL_SECTION g_peb_lock = { .LockCount = -1 };
+NTSTATUS NTAPI RtlEnterCriticalSection(PRTL_CRITICAL_SECTION cs);
+NTSTATUS NTAPI RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION cs);
+BOOLEAN NTAPI RtlTryEnterCriticalSection(PRTL_CRITICAL_SECTION cs);
+EXPORT void NTAPI RtlAcquirePebLock(void) { RtlEnterCriticalSection(&g_peb_lock); }
+EXPORT void NTAPI RtlReleasePebLock(void) { RtlLeaveCriticalSection(&g_peb_lock); }
+EXPORT BOOLEAN NTAPI RtlTryAcquirePebLock(void) { return RtlTryEnterCriticalSection(&g_peb_lock); }
+
+/* ExitProcess waits for whoever holds the PEB lock or the heap lock (a thread blocked inside either keeps the process alive), and keeps the PEB lock itself: the
+ * other threads are ended after that, so none of them can hold a lock the shutdown needs. */
 EXPORT void NTAPI RtlExitUserProcess(NTSTATUS status) {
   if (!g_process_ending) {
+    RtlAcquirePebLock();
+    while (g_heap_lock) NtYieldExecution();
     NtTerminateProcess(NULL, status);
     g_heap_lock = 0;      /* (a thread that was ended inside the heap or the fiber storage cannot give its lock back; the process is going away) */
     g_fls_lock = 0;
@@ -665,8 +685,21 @@ EXPORT PVOID NTAPI RtlCreateHeap(ULONG flags, PVOID base, SIZE_T reserve, SIZE_T
 }
 
 /* The heaps are shared by the threads of the process: one spin lock (a waiting thread gives its time slice to the holder) covers all of them. */
-static void heap_lock(void) { while (__sync_lock_test_and_set(&g_heap_lock, 1)) NtYieldExecution(); }
-static void heap_unlock(void) { __sync_lock_release(&g_heap_lock); }
+/* The heap lock is recursive (RtlLockHeap holds it across calls of the same thread). */
+static volatile ULONG_PTR g_heap_owner;
+static LONG g_heap_depth;
+static void heap_lock(void) {
+  const ULONG_PTR me = TEB_CLIENT_THREAD(NtCurrentTeb());
+  if (g_heap_lock && g_heap_owner == me) { ++g_heap_depth; return; }
+  while (__sync_lock_test_and_set(&g_heap_lock, 1)) NtYieldExecution();
+  g_heap_owner = me;
+  g_heap_depth = 1;
+}
+static void heap_unlock(void) {
+  if (--g_heap_depth > 0) return;
+  g_heap_owner = 0;
+  __sync_lock_release(&g_heap_lock);
+}
 
 static PVOID heap_alloc(PVOID heap, ULONG flags, SIZE_T bytes) {
   Heap *h = heap;
@@ -843,8 +876,8 @@ EXPORT PVOID NTAPI RtlDestroyHeap(PVOID heap) {
   return NULL;
 }
 
-EXPORT BOOLEAN NTAPI RtlLockHeap(PVOID heap) { (void)heap; return TRUE; }
-EXPORT BOOLEAN NTAPI RtlUnlockHeap(PVOID heap) { (void)heap; return TRUE; }
+EXPORT BOOLEAN NTAPI RtlLockHeap(PVOID heap) { (void)heap; heap_lock(); return TRUE; }
+EXPORT BOOLEAN NTAPI RtlUnlockHeap(PVOID heap) { (void)heap; if (g_heap_lock && g_heap_owner == TEB_CLIENT_THREAD(NtCurrentTeb())) heap_unlock(); return TRUE; }
 EXPORT ULONG NTAPI RtlCompactHeap(PVOID heap, ULONG flags) { (void)heap; (void)flags; return 0; }
 EXPORT NTSTATUS NTAPI RtlSetHeapInformation(PVOID heap, ULONG info_class, PVOID info, SIZE_T length) { (void)heap; (void)info_class; (void)info; (void)length; return STATUS_SUCCESS; }
 EXPORT NTSTATUS NTAPI RtlQueryHeapInformation(PVOID heap, ULONG info_class, PVOID info, SIZE_T length, PSIZE_T returned) {
@@ -1173,7 +1206,7 @@ EXPORT NTSTATUS NTAPI LdrUnloadDll(PVOID base) {
   LDR_DATA_TABLE_ENTRY *e = ldr_find_base(base);
   NTSTATUS status = STATUS_SUCCESS;
   if (!e) status = STATUS_DLL_NOT_FOUND;
-  else if (e->LoadCount != LDR_STATIC) ldr_release(base, 1);
+  else if (e->LoadCount != LDR_STATIC && !g_process_ending) ldr_release(base, 1);      /* (nothing is unloaded while the process ends) */
   loader_unlock();
   return status;
 }
