@@ -197,6 +197,19 @@ bool UserProgram::set_standard_handles(const uint64_t handles[3]) {
   return true;
 }
 
+bool UserProgram::module_name_at(uint64_t address, char (&name)[40]) const {
+  if (!modules_) return false;
+  for (uint64_t i = 0; i < modules_->count(); ++i) {
+    const Module& m = modules_->at(i);
+    if (address < m.base || address - m.base >= m.size) continue;
+    uint32_t n = 0;
+    for (; n < 39 && n < m.name.size(); ++n) { const char c = m.name.view()[n]; name[n] = c >= 'A' && c <= 'Z' ? char(c + 32) : c; }
+    name[n] = 0;
+    return true;
+  }
+  return false;
+}
+
 bool UserProgram::reference_module(StringView canonical_name, uint64_t* base) { return modules_ && reference_library(modules_.get(), canonical_name, base); }
 
 uint32_t UserProgram::release_module(uint64_t base, LoadedModule* out, uint32_t capacity, uint32_t* count) {

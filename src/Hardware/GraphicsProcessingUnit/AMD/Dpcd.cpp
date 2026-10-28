@@ -24,6 +24,7 @@ namespace {
 constexpr uint8_t kLaneCrDone = 0x1, kLaneEqDone = 0x2, kLaneSymbolLocked = 0x4;
 constexpr uint8_t kAlignDone = 0x01;
 constexpr uint8_t kMinRevision = 0x10;
+constexpr uint32_t kEdidBlockBytes = 128;
 constexpr uint32_t kEdpRateUnitKhz = 200;       // DP_SUPPORTED_LINK_RATES: 200 kHz units
 }  // namespace
 
@@ -119,6 +120,36 @@ bool Dpcd::read_lane_count(IDpcdAux& aux, uint32_t* lanes) {
   uint8_t value = 0;
   if (!aux.dpcd_read(kLaneCountSet, ByteView(&value, 1))) return false;
   *lanes = value & 0x1F;
+  return true;
+}
+
+bool Dpcd::acknowledge_service_irq(IDpcdAux& aux, uint8_t vector, uint8_t* acked) {
+  *acked = 0;
+  const uint8_t bits = vector & kIrqHandled;
+  if (bits == 0) return true;
+  if (!aux.dpcd_write(kDeviceServiceIrqVector, ConstByteView(&bits, 1))) return false;
+  *acked = bits;
+  return true;
+}
+
+bool Dpcd::read_test_request(IDpcdAux& aux, uint8_t* request) {
+  *request = 0;
+  uint8_t value = 0;
+  if (!aux.dpcd_read(kTestRequest, ByteView(&value, 1))) return false;
+  *request = value;
+  return true;
+}
+
+bool Dpcd::answer_test_request(IDpcdAux& aux, uint8_t request, ConstByteView edid, uint8_t* response) {
+  *response = 0;
+  uint8_t answer = kTestNak;
+  if (request == kTestEdidRead && edid.size() >= kEdidBlockBytes && edid.size() % kEdidBlockBytes == 0) {
+    const uint8_t checksum = edid[edid.size() - 1];
+    if (!aux.dpcd_write(kTestEdidChecksum, ConstByteView(&checksum, 1))) return false;
+    answer = kTestAck | kTestEdidChecksumWrite;
+  }
+  if (!aux.dpcd_write(kTestResponse, ConstByteView(&answer, 1))) return false;
+  *response = answer;
   return true;
 }
 

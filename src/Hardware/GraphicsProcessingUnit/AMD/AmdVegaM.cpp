@@ -499,6 +499,14 @@ uint32_t AmdVegaM::service_short_pulses(SinkEvent* out, uint32_t capacity) {
           e.test_request = e.status.automated_test_request();
           e.content_protection = e.status.content_protection_irq();
           e.sink_specific = e.status.sink_specific_irq();
+          if (!Dpcd::acknowledge_service_irq(session.aux, e.status.irq_vector, &e.acked)) e.handling_failed = true;
+          if (e.test_request) {
+            ByteBuffer edid(*inputs_.allocator);
+            bool ok = Dpcd::read_test_request(session.aux, &e.test_kind);
+            if (ok && e.test_kind == Dpcd::kTestEdidRead) session.aux.read_edid(&edid);     // (no EDID: the buffer stays empty, and the test is answered NAK)
+            ok = ok && Dpcd::answer_test_request(session.aux, e.test_kind, edid.view(), &e.test_response);
+            if (!ok) e.handling_failed = true;
+          }
         }
       }
     }

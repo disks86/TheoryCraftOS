@@ -163,6 +163,23 @@ bool AmdAux::dpcd_read(uint32_t address, ByteView out) {
   return true;
 }
 
+bool AmdAux::dpcd_write(uint32_t address, ConstByteView data) {
+  uint32_t done = 0;
+  while (done < data.size()) {
+    const uint32_t chunk = data.size() - done < kMaxWritePayload ? static_cast<uint32_t>(data.size()) - done : kMaxWritePayload;
+    uint8_t payload[kMaxWritePayload] = {};
+    ByteView(payload, chunk).copy_from(data.subview(done, chunk));
+    Msg msg;
+    msg.request = kNativeWrite;
+    msg.address = address + done;
+    msg.buffer = ByteView(payload, chunk);
+    const int32_t put = do_msg(&msg);
+    if (put <= 0) return false;
+    done += static_cast<uint32_t>(put) < chunk ? static_cast<uint32_t>(put) : chunk;
+  }
+  return true;
+}
+
 // drm_dp_i2c_xfer
 bool AmdAux::transfer(ArrayView<Message> messages) {
   if (messages.size() == 0) return false;
