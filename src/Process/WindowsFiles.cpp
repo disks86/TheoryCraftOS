@@ -202,6 +202,26 @@ uint32_t open_by_attributes(Process& p, uint64_t object_attributes, uint32_t acc
     }
   }
   if (!files.attached()) return kObjectPathNotFound;
+  {      // \\??\\NUL, the device that swallows what is written to it
+    uint64_t name_at = 0;
+    String text(files.allocator());
+    if (object_attributes != 0 && p.read_user_u64(object_attributes + 16, &name_at) && name_at != 0 && read_unicode_string(p, name_at, &text) == kSuccess) {
+      static const char* const names[] = {"\\??\\nul", "\\device\\null"};
+      for (const char* device : names) {
+        uint64_t n = 0;
+        while (device[n]) ++n;
+        if (text.size() != n) continue;
+        bool same = true;
+        for (uint64_t i = 0; same && i < n; ++i) same = (text.view()[i] >= 'A' && text.view()[i] <= 'Z' ? char(text.view()[i] + 32) : text.view()[i]) == device[i];
+        if (!same) continue;
+        const int64_t slot = files.open_device(DescriptorKind::Null);
+        if (slot < 0) return kTooManyOpenedFiles;
+        *handle = (uint64_t(slot) + 1) * 4;
+        *information = kFileOpened;
+        return kSuccess;
+      }
+    }
+  }
   String virtual_path(files.allocator());
   const uint32_t named = object_path(p, object_attributes, &virtual_path);
   if (named != kSuccess) return named;
@@ -295,6 +315,10 @@ uint32_t file_io(Process& p, const SyscallRequest& r, bool write) {
   if (length > kMaxIoBytes) length = kMaxIoBytes;
   if (kind == DescriptorKind::Pipe) return pipe_io(p, slot, write, status_block, buffer, length);
   if (kind == DescriptorKind::Mailslot) return mailslot_io(p, slot, write, status_block, buffer, length);
+  if (kind == DescriptorKind::Null) {      // the NUL device takes everything and has nothing to read
+    const uint32_t status = write ? kSuccess : kEndOfFile;
+    return store_io_status(p, status_block, status, write ? length : 0) ? status : kAccessViolation;
+  }
 
   if (kind == DescriptorKind::ConsoleInput || kind == DescriptorKind::ConsoleOutput || kind == DescriptorKind::ConsoleError) {
     if (write) {
@@ -923,6 +947,11 @@ uint32_t nt_query_volume_information_file(Process& p, const SyscallRequest& r) {
   if (!handle_slot(r.args[0], &slot)) return kInvalidHandle;
   const DescriptorKind kind = p.files().kind(slot);
   if (kind == DescriptorKind::Closed) return kInvalidHandle;
+  switch (kind) {      // an event, a section, a thread ... is not a file
+    case DescriptorKind::Event: case DescriptorKind::Mutex: case DescriptorKind::Semaphore: case DescriptorKind::Process: case DescriptorKind::Thread: case DescriptorKind::Timer:
+    case DescriptorKind::Section: case DescriptorKind::Job: case DescriptorKind::Key: case DescriptorKind::ChangeNotification: return 0xC0000024u;      // STATUS_OBJECT_TYPE_MISMATCH
+    default: break;
+  }
   const uint32_t volume_class = static_cast<uint32_t>(info_class);      // (a ULONG: the upper half of the argument is not defined)
   if (volume_class == 1 || volume_class == 3 || volume_class == 5 || volume_class == 7) {      // volume, size, attribute and full size information: what the file system underneath says
     if (!p.files().attached() || !p.files().file_system()) return kInvalidDeviceRequest;
@@ -960,7 +989,7 @@ uint32_t nt_query_volume_information_file(Process& p, const SyscallRequest& r) {
   if ((r.args[3] & 0xFFFFFFFFu) < 8) return kInfoLengthMismatch;
   const bool console = kind == DescriptorKind::ConsoleInput || kind == DescriptorKind::ConsoleOutput || kind == DescriptorKind::ConsoleError;
   uint8_t b[8] = {};
-  put(ByteView(b, 8), 0, console ? 0x50 : (kind == DescriptorKind::Pipe ? 0x11 : 7), 4);      // DeviceType: FILE_DEVICE_CONSOLE / FILE_DEVICE_NAMED_PIPE / FILE_DEVICE_DISK
+  put(ByteView(b, 8), 0, console ? 0x50 : (kind == DescriptorKind::Pipe ? 0x11 : kind == DescriptorKind::Null ? 0x15 : kind == DescriptorKind::Mailslot ? 0x0c : 7), 4);      // DeviceType: FILE_DEVICE_CONSOLE / FILE_DEVICE_NAMED_PIPE / FILE_DEVICE_DISK
   if (!p.write_user(r.args[2], ConstByteView(b, 8))) return kAccessViolation;
   return store_io_status(p, r.args[1], kSuccess, 8) ? kSuccess : kAccessViolation;
 }

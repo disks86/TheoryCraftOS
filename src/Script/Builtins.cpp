@@ -2878,10 +2878,27 @@ NATIVE(compile_module) {
 }
 
 NATIVE(global_eval) {
+  Vm::PendingEval direct;
+  const bool is_direct = vm.take_pending_eval(&direct);   // (the instruction before the call said this is a direct eval)
   const Value code = arg_at(args, argc, 0);
   if (!code.is_string()) {
     *result = code;
     return true;
+  }
+  bool at_top = false;   // an eval in the code of a script itself, with no block variables around it, is the same as an indirect one: the variables it declares are globals
+  if (is_direct && direct.code && direct.index < direct.code->eval_scopes.count()) {
+    const EvalScope& s = *direct.code->eval_scopes[direct.index];
+    at_top = s.frames.count() == 1 && s.frames[0].global && s.frames[0].count == 0 && s.frames[0].env_count == 0;
+  }
+  if (is_direct && !at_top && direct.code && direct.index < direct.code->eval_scopes.count()) {   // a direct eval: it runs in the variables of the caller
+    Arena arena(vm.allocator());
+    String message(vm.allocator());
+    Node* program = parse_program(code.as_string()->view(), arena, &message);
+    if (!program) return vm.throw_error(ErrorKind::SyntaxError, message.view());
+    FunctionCode* compiled = nullptr;
+    if (!compile_eval_program(vm, program, *direct.code->eval_scopes[direct.index], &compiled, &message)) return vm.throw_error(ErrorKind::SyntaxError, message.view());
+    JsObject* fn = vm.new_function(compiled, direct.env, direct.this_value);
+    return vm.call(Value::make_object(fn), direct.this_value, nullptr, 0, result);
   }
   return run_source(vm, code.as_string()->view(), result);
 }
@@ -3204,6 +3221,10 @@ bool install_builtins(Vm& vm) {
   vm.define_native(g, "isFinite", global_is_finite, 1);
   vm.define_native(g, "alert", global_alert, 1);
   vm.define_native(g, "eval", global_eval, 1);
+  {
+    Value eval_value;
+    if (vm.get_named(Value::make_object(g), "eval", &eval_value) && eval_value.is_object()) vm.set_eval_function(eval_value.as_object());
+  }
   vm.define_native(g, "__compile_module", compile_module, 1);
   vm.define_native(g, "setTimeout", set_timeout, 2);
   vm.define_native(g, "setInterval", set_interval, 2);

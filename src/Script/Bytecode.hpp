@@ -20,6 +20,7 @@
 // nested functions, and what the VM needs to set up a call (how many variable slots, which hold the parameters).
 #pragma once
 #include "ObjectContainer/List.hpp"
+#include "Utility/String.hpp"
 #include "Script/Value.hpp"
 
 namespace script {
@@ -61,6 +62,9 @@ enum class Opc : uint8_t {
   PushEnv, PopEnv, CopyEnv,
   // [] -> [value]: what the iterator that just finished returned (the value of `yield*`)
   IterReturn,
+  // before the Call of `eval(...)` (b = argument count): if the function about to be called is the real eval, the call is a direct eval of the scope in
+  // eval_scopes[a]: the source is compiled to run in the variables of the function that calls it
+  EvalScope,
 };
 
 // What the 16 spare bits of GetVar / SetVar say: 0 plain; kConstAssign (SetVar of a const: a TypeError); n >= kChecked: the variable is let / const / class and
@@ -74,12 +78,40 @@ struct Instr {
   int32_t a;
 };
 
+// The variables a direct eval can see: the functions that enclose the call (innermost first) with their bindings, as the compiler had them at the call.
+struct EvalBinding {
+  uint32_t name_at, name_len, import_at, import_len;   // into EvalScope::text
+  uint32_t slot, level;
+  bool lexical, is_const;
+};
+struct EvalFrame {
+  uint32_t first, count;   // the bindings
+  uint32_t env_count;      // how many block Envs were open
+  bool strict, arrow, global;
+};
+struct EvalScope {
+  explicit EvalScope(allocators::IAllocator& a) : frames(a), bindings(a), text(a) {}
+  List<EvalFrame> frames;
+  List<EvalBinding> bindings;
+  String text;
+};
+
 struct FunctionCode {
-  explicit FunctionCode(allocators::IAllocator& allocator) : code(allocator), lines(allocator), constants(allocator), children(allocator) {}
+  explicit FunctionCode(allocators::IAllocator& a) : allocator(a), code(a), lines(a), constants(a), children(a), eval_scopes(a) {}
+  ~FunctionCode() {
+    for (uint64_t i = 0; i < eval_scopes.count(); ++i) {
+      eval_scopes[i]->~EvalScope();
+      allocator.deallocate(eval_scopes[i]);
+    }
+  }
+  FunctionCode(const FunctionCode&) = delete;
+  FunctionCode& operator=(const FunctionCode&) = delete;
+  allocators::IAllocator& allocator;
   List<Instr> code;
   List<uint32_t> lines;                 // the source line of each instruction
   List<Value> constants;                // numbers and (interned) strings
   List<FunctionCode*> children;         // the functions made inside this one
+  List<EvalScope*> eval_scopes;         // the calls of eval(...) in it (see Opc::EvalScope)
   uint32_t slot_count = 0;              // variables (parameters first)
   uint32_t param_count = 0;
   uint32_t expected_args = 0;           // the function's length: the parameters before the first default value or rest parameter

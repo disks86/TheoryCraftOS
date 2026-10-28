@@ -1294,6 +1294,9 @@ void Vm::collect() {
   mark(rejections_);
   for (JsObject* o : {global_, object_proto_, function_proto_, array_proto_, string_proto_, number_proto_, boolean_proto_, symbol_proto_, error_proto_, iterator_proto_, sentinel_}) mark(o);
   for (int i = 0; i < 5; ++i) mark(error_protos_[i]);
+  mark(eval_function_);
+  mark(pending_eval_.env);
+  mark_value(pending_eval_.this_value);
   for (JsString* s : {empty_, length_, prototype_, name_, message_, constructor_, to_string_, value_of_, undefined_text_, null_text_, true_text_, false_text_}) mark(s);
   for (uint64_t i = 0; i < codes_.count(); ++i) {
     FunctionCode* code = codes_[i];
@@ -3039,6 +3042,17 @@ reload:
       case Opc::PushStr: PUSH(code->constants[static_cast<uint32_t>(in.a)]); break;
       case Opc::PushInt: PUSH(Value::make_number(in.a)); break;
       case Opc::PushThis: PUSH(fp->this_value); break;
+      case Opc::EvalScope: {   // [eval, this, args...]: when the function is the real eval the call that follows is a direct eval
+        const Value& callee = stack_[sp_ - 2 - in.b];
+        pending_eval_ = PendingEval();
+        if (callee.is_object() && callee.as_object() == eval_function_ && eval_function_) {
+          pending_eval_.code = code;
+          pending_eval_.index = static_cast<uint32_t>(in.a);
+          pending_eval_.env = fp->env;
+          pending_eval_.this_value = fp->this_value;
+        }
+        break;
+      }
       case Opc::NewTarget: {
         Value target;
         if (fp->construct && fp->callee) {
