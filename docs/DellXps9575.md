@@ -464,10 +464,15 @@ It found what the unit tests could not: the driver's negative parameter-space si
 checks the constants, the alignment tables, the generated opcode table (`scripts/gen_atom_ops.py` makes `AtomBiosOps.inc` from the driver's `opcode_table`) and the layout of the data tables.
 
 `AmdVegaM::post()` runs the POST with `Inputs::vbios`, and `reset_card()` does it between the reset and the bring-up when the image is given. The simulated card here is "trained" by a marker write in the video BIOS's table.
-**Not done, and what stops this from working on a real card yet:** nothing hands the OS the card's video BIOS image. The driver reads it from the PCI expansion ROM, from the ACPI VFCT table (what most laptops with a
-discrete card use) or through the card's ROM registers; this OS reads none of them, so `main.cpp` passes no image and a reset card stays down as before. The interpreter has not run a real ASIC_Init: whether the
-Kaby Lake-G's table, run against the real card, trains its memory is what the driver does and has not been seen here. Command tables other than 0 (mode setting, clocks, voltage, the display) can be run with `execute_table`
-but nothing uses them yet.
+**Where the video BIOS image comes from.** `AmdVbios` (`AmdVbios.*`) finds it, following `amdgpu_bios.c` in the order of `amdgpu_get_bios_dgpu`: (1) the ACPI VFCT table, which holds the firmware's copy of the
+video BIOS images of its AMD cards - `find_in_vfct` walks the images (28-byte headers: PCI bus, device, function, vendor and device ID, length) and takes the one for this function, as a view into the table;
+(2) the PCI expansion ROM - `read_from_rom_bar` probes the ROM base register for the window size, switches the ROM on at the base the firmware assigned (no base, no ROM), maps the window, copies it,
+switches it off, and trims the copy to the chained images (`rom_size` is the PCI core's `pci_get_rom_size`: each image gives its length in 512-byte units and whether it is the last); (3) the card's own ROM through the SMC's
+index and data registers (`vi_read_bios_from_rom`: header first, checked for 0xAA55 and the AMD string, then the length it names). Every image passes `check_atom_bios` (0xAA55, a header pointer at 0x48, "ATOM" or "MOTA" at
+its offset 4). `main.cpp` looks only when the card may be reset (otherwise nothing would use the image) and `AmdVegaM::bring_up` keeps its own copy, so the buffers need not outlive the call. Not done: the ACPI ATRM method
+(the other firmware route, which needs the AML interpreter run in the card's device), the legacy shadow at 0xC0000, the copy in video memory (SR-IOV) and the "disabled ROM" path that clears the card's ROM disable bits.
+Tested with a simulated VFCT table (several cards, truncations, bit flips in every header byte), an expansion ROM behind a working ROM base register, and the SMC pair (`AmdVbiosTest`), and `scripts/check_vbios_port.py` checks
+the signatures, the order, the VFCT layout and the register protocol against the kernel. **Still not seen:** the real machine's VFCT or ROM: whether this machine has a VFCT entry for the Vega M, and whether its table 0 trains the memory.
 
 ## Radeon RX Vega M: UVD 6.3
 

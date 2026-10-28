@@ -110,6 +110,13 @@ bool AmdVegaM::bring_up(const Inputs& in) {
   shutdown();
   status_.assign("");
   inputs_ = in;
+  // The video BIOS image is kept: the caller's buffer need not outlive the call, and reset_card runs the POST later.
+  const bool same_buffer = in.vbios.size() == vbios_.size() && in.vbios.size() != 0 && in.vbios.data() == vbios_.view().data();
+  if (!same_buffer) {
+    vbios_.clear();
+    if (in.vbios.size() != 0 && !vbios_.append(in.vbios)) return fail(Step::None, "out of memory");
+  }
+  inputs_.vbios = vbios_.view();
   if (!in.registers || !in.clock || !in.file_system || !in.allocator || !in.mapper || in.aperture_bytes == 0 || in.aperture_physical == 0 || !in.doorbells.valid() ||
       amd_gfx8_firmware_name(in.device_id, AmdGfx8Block::CpPfp) == nullptr)
     return fail(Step::None, "no access to the card (registers, memory BAR, doorbells or a Vega M device)");

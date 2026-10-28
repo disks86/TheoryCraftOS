@@ -83,7 +83,7 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
     uint32_t hpd_pins = 0x3F;                     // the hot plug detect pins to watch (bit n: pin n); which pin a connector is on is in the video BIOS, so by default all of them
     IPciBus* pci = nullptr;                       // where the card is, for the full reset (AmdAsicReset): its configuration space
     PciAddress pci_address{};
-    ConstByteView vbios;                          // the card's video BIOS image, for POSTing it after a card reset (AtomBios); empty: no POST
+    ConstByteView vbios;                          // the card's video BIOS image, for POSTing it after a card reset (AtomBios; AmdVbios finds it); copied by bring_up. Empty: no POST
     bool allow_asic_reset = false;                // recover() falls back to a full reset of the card when an engine will not come back from its soft reset (read the warning at reset_card())
     bool auto_recover = false;                    // service_interrupts() resets an engine that a fault or a timeout left wedged (at most kMaxRecoveries times in all)
     bool msi = false;                             // the card's MSI is on (PciMsi): the interrupt ring is told to re-arm it as the driver does (adev->irq.msi_enabled)
@@ -105,7 +105,7 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
   enum class Step : uint8_t { None, MemoryMap, Firmware, Memory, MemoryController, InterruptHandler, Microcode, GraphicsEngine, Sdma, Done };
   static const char* step_name(Step step);
 
-  explicit AmdVegaM(allocators::IAllocator& allocator) : status_(allocator) {}
+  explicit AmdVegaM(allocators::IAllocator& allocator) : status_(allocator), vbios_(allocator) {}
   ~AmdVegaM() { shutdown(); }
   AmdVegaM(const AmdVegaM&) = delete;
   AmdVegaM& operator=(const AmdVegaM&) = delete;
@@ -195,6 +195,7 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
 
   Step step_ = Step::None;
   String status_;
+  ByteBuffer vbios_;   // the copy of Inputs::vbios
   Inputs inputs_;
   AmdGmc8GartPlan gart_plan_;
   Layout layout_;

@@ -1196,9 +1196,11 @@ static void test_post_after_reset() {
     FakePci pci(rig);
     AmdVegaM::Inputs in;
     setup(rig, pci, in);
-    in.vbios = ConstByteView(vbios.data(), vbios.size());
+    std::vector<uint8_t> callers_copy = vbios;
+    in.vbios = ConstByteView(callers_copy.data(), callers_copy.size());
     AmdVegaM vega(rig.alloc);
     CHECK(vega.bring_up(in));
+    std::fill(callers_copy.begin(), callers_copy.end(), 0xFF);   // (the caller's buffer is gone: the card has its own copy of the image)
     rig.card.gfx.hung = true;
     rig.card.gfx.reset_fails = true;
     CHECK(!vega.submit_graphics(ib, 2000));
