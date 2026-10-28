@@ -81,6 +81,17 @@ EXPORT void NTAPI RtlFreeUnicodeString(PUNICODE_STRING s) {
   s->Length = s->MaximumLength = 0;
   s->Buffer = NULL;
 }
+EXPORT BOOLEAN NTAPI RtlCreateUnicodeStringFromAsciiz(PUNICODE_STRING dst, PCSTR src) {
+  const SIZE_T n = strlen(src);
+  if (n > 0x7FFE) return FALSE;
+  WCHAR *buffer = rtl_alloc((n + 1) * 2);
+  if (!buffer) return FALSE;
+  for (SIZE_T i = 0; i <= n; i++) buffer[i] = (unsigned char)src[i];
+  dst->Buffer = buffer;
+  dst->Length = (USHORT)(n * 2);
+  dst->MaximumLength = (USHORT)(n * 2 + 2);
+  return TRUE;
+}
 EXPORT void NTAPI RtlFreeAnsiString(PANSI_STRING s) {
   if (s->Buffer) RtlFreeHeap(NtCurrentPeb()->ProcessHeap, 0, s->Buffer);
   s->Length = s->MaximumLength = 0;
