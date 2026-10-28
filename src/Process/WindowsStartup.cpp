@@ -86,6 +86,16 @@ bool utf16(StringView text, ByteBuffer* out) { return util::append_utf16le(out, 
 
 }  // namespace
 
+// The two lowest pages of a stack are never committed (a stack that grows into them has overflowed; see windowsabi::guard_fault).
+static void reserve_stack_floor(AddressSpace& space, uint64_t base) {
+  constexpr uint64_t kFloor = 2 * AddressSpace::kPageSize;
+  PageAttributes attributes;
+  attributes.allocation_protect = 0x04;      // PAGE_READWRITE
+  attributes.protect = 0x01;                 // PAGE_NOACCESS
+  attributes.reserved = true;
+  if (space.protect(base, kFloor, 0)) space.set_attributes(base, kFloor, attributes);
+}
+
 LoadStatus build_windows_startup(AddressSpace& space, const exe::PeFile& pe, const LoadedImage& image, const WindowsStartupInput& input, WindowsStartup* out) {
   if (!input.allocator || input.stack_top < input.stack_size) return LoadStatus::Malformed;
   allocators::IAllocator& allocator = *input.allocator;
@@ -149,6 +159,7 @@ LoadStatus build_windows_startup(AddressSpace& space, const exe::PeFile& pe, con
   total = kPebSize + kTebSize + parameters_bytes + tls_bytes + ldr_bytes;
   uint64_t base = 0;
   if (!space.find_free(total, kPlacementHint, &base) || !space.map(base, total, kProtRead | kProtWrite)) return LoadStatus::OutOfMemory;
+  if (input.stack_size > 4 * AddressSpace::kPageSize) reserve_stack_floor(space, input.stack_top - input.stack_size);
   const uint64_t peb = base, teb = base + kPebSize, parameters = teb + kTebSize, tls_area = parameters + parameters_bytes, ldr = tls_area + tls_bytes;
   const uint64_t tls_block = tls_count ? tls_area + kTlsArrayBytes : 0;
 
@@ -286,6 +297,7 @@ LoadStatus build_windows_thread(AddressSpace& space, const WindowsThreadInput& i
   uint64_t base = 0;
   if (!space.find_free(total, kPlacement, &base) || !space.map(base, total, kProtRead | kProtWrite)) return LoadStatus::OutOfMemory;
   const uint64_t stack_top = base + stack, teb = stack_top, tls_area = teb + kTebSize;
+  if (stack > 4 * AddressSpace::kPageSize) reserve_stack_floor(space, base);
   Writer w(space);
   w.u64(teb + 0x00, ~uint64_t{0});
   w.u64(teb + 0x08, stack_top);                     // StackBase
