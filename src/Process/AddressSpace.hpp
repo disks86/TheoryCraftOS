@@ -57,7 +57,8 @@ struct PageAttributes {
   uint8_t type = Private;
   bool reserved = false;      // reserved, not committed
   bool file_view = false;     // a view of a file (a view of plain memory can still be committed)
-  bool operator==(const PageAttributes& o) const { return protect == o.protect && allocation_protect == o.allocation_protect && type == o.type && reserved == o.reserved && file_view == o.file_view; }
+  bool copied = false;        // a copy-on-write page that was written to: it has a copy of its own
+  bool operator==(const PageAttributes& o) const { return protect == o.protect && allocation_protect == o.allocation_protect && type == o.type && reserved == o.reserved && file_view == o.file_view && copied == o.copied; }
 };
 
 class AddressSpace final : public IUserMemory {

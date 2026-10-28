@@ -412,7 +412,23 @@ EXPORT BOOL WINAPI ReadProcessMemory(HANDLE process, LPCVOID base, LPVOID buffer
 }
 EXPORT BOOL WINAPI WriteProcessMemory(HANDLE process, LPVOID base, LPCVOID buffer, SIZE_T size, SIZE_T *done) {
   SIZE_T got = 0;
-  const NTSTATUS status = NtWriteVirtualMemory(process, base, (PVOID)buffer, size, &got);
+  NTSTATUS status = NtWriteVirtualMemory(process, base, (PVOID)buffer, size, &got);
+  if (status == (NTSTATUS)0x8000000D && got == 0 && size != 0) {      /* the first page cannot be written: code pages are made writable for the copy, anything else is refused */
+    MEMORY_BASIC_INFORMATION info;
+    if (VirtualQueryEx(process, base, &info, sizeof(info)) == sizeof(info) && info.State == MEM_COMMIT) {
+      if (info.Protect == PAGE_EXECUTE_READ || info.Protect == PAGE_EXECUTE) {
+        DWORD old = 0;
+        if (VirtualProtectEx(process, base, size, PAGE_EXECUTE_READWRITE, &old)) {
+          status = NtWriteVirtualMemory(process, base, (PVOID)buffer, size, &got);
+          DWORD again = 0;
+          VirtualProtectEx(process, base, size, old, &again);
+        }
+      } else if (info.Protect == PAGE_READONLY || info.Protect == PAGE_NOACCESS) {
+        set_error(ERROR_NOACCESS);
+        return FALSE;
+      }
+    }
+  }
   if (done) *done = got;
   return NT_SUCCESS(status) && status != (NTSTATUS)0x8000000D ? TRUE : fail_nt(status);
 }

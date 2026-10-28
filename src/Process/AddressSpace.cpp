@@ -231,6 +231,7 @@ bool AddressSpace::break_copy_on_write(uint64_t address, uint64_t size) {
     }
     r.protection |= kProtWrite;
     r.attributes.protect = protect == 0x08 ? 0x04 : 0x40;
+    r.attributes.copied = true;
     any = true;
   }
   if (any) ++generation_;
