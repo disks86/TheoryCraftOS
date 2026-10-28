@@ -32,7 +32,9 @@
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdIrq.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdSdma3.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AtomBios.hpp"
+#include "Hardware/GraphicsProcessingUnit/AMD/AmdDdc.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AtomConnectors.hpp"
+#include "Hardware/GraphicsProcessingUnit/AMD/AtomI2c.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdSmu7Ucode.hpp"
 #include "Hardware/Mmio.hpp"
 #include "Hardware/RegisterMapper.hpp"
@@ -167,6 +169,10 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
   static constexpr uint32_t kMaxHotplugEvents = 16;
   bool take_hotplug(HotplugEvent* out);
   uint32_t connected_pins() const { return connected_pins_; }
+  // The monitor's EDID over the connector's DDC lines (AmdDdc: the GPIO pins of the bus named by the connector's I2C record in the video BIOS, driven by software), into *out. False if the
+  // card is not up, the connector has no DDC line in the table or no GPIO entry, it is a DisplayPort connector (the AUX channel is not done), nothing answers, or the EDID never checked.
+  // It takes the bus for some tens of milliseconds, so it is for the desktop loop, not an interrupt path.
+  bool read_edid(const AtomConnectors::Connector& connector, ByteBuffer* out);
   ArrayView<const AtomConnectors::Connector> connectors() const { return ArrayView<const AtomConnectors::Connector>(connectors_, connector_count_); }
   uint32_t hotplug_events_dropped() const { return hotplug_dropped_; }
   // The audio endpoints of the display engine (amd_dce11::AudioPins, dce_v11_0_audio_get_connected_pins): bit n of the mask is set when endpoint n has a port (its default configuration's

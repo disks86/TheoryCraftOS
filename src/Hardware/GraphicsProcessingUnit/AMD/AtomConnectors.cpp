@@ -33,7 +33,7 @@ constexpr uint32_t kObjDeviceSupport = 4, kObjConnectorTable = 6, kObjPathTable 
 constexpr uint32_t kPathTableHeaderBytes = 4;                      // ATOM_DISPLAY_OBJECT_PATH_TABLE: count, version, 2 padding
 constexpr uint32_t kPathHeaderBytes = 8;                           // ATOM_DISPLAY_OBJECT_PATH without its object ids: tag, size, connector, GPU
 constexpr uint32_t kObjectTableHeaderBytes = 4, kObjectBytes = 8;  // ATOM_OBJECT_TABLE, ATOM_OBJECT
-constexpr uint8_t kHpdIntRecord = 2, kMaxRecordType = 22;          // ATOM_HPD_INT_RECORD_TYPE, ATOM_MAX_OBJECT_RECORD_NUMBER
+constexpr uint8_t kI2cRecord = 1, kHpdIntRecord = 2, kMaxRecordType = 22;          // ATOM_HPD_INT_RECORD_TYPE, ATOM_MAX_OBJECT_RECORD_NUMBER
 constexpr uint32_t kGpioPinBytes = 4;                              // ATOM_GPIO_PIN_ASSIGNMENT
 constexpr uint32_t kDeviceTv1 = 1u << 2, kDeviceCv = 1u << 8;   // ATOM_DEVICE_TV1_SUPPORT, ATOM_DEVICE_CV_SUPPORT
 constexpr uint32_t kObjectIdMask = 0x00FF, kObjectIdShift = 0, kEnumIdMask = 0x0700, kEnumIdShift = 8;
@@ -92,17 +92,33 @@ uint8_t hpd_pin_of_gpio(const Image& image, uint32_t data_table_at, uint8_t id) 
   return AtomConnectors::kNoPin;
 }
 
-// The records of a connector object: the hot plug interrupt record, if there is one
-bool find_hpd_record(const Image& image, uint32_t records, uint8_t* gpio_id, uint8_t* plugged_state) {
+// The records of a connector object: the DDC line of its I2C record and the hot plug interrupt record, the last of each as the driver's loop leaves them
+struct ConnectorRecords {
+  bool has_hpd = false, has_ddc = false;
+  uint8_t gpio_id = 0, plugged_state = 0, ddc_id = 0;
+};
+void walk_records(const Image& image, uint32_t records, ConnectorRecords* out) {
   uint32_t at = records;
   for (uint32_t i = 0; i < kMaxRecords; ++i) {
     uint8_t type = 0, size = 0;
-    if (!image.u8(at, &type) || !image.u8(at + 1, &size)) return false;
-    if (size == 0 || type == 0 || type > kMaxRecordType) return false;
-    if (type == kHpdIntRecord) return image.u8(at + 2, gpio_id) && image.u8(at + 3, plugged_state);
+    if (!image.u8(at, &type) || !image.u8(at + 1, &size)) return;
+    if (size == 0 || type == 0 || type > kMaxRecordType) return;
+    if (type == kI2cRecord) {
+      uint8_t id = 0;
+      if (image.u8(at + 2, &id)) {
+        out->ddc_id = id;
+        out->has_ddc = true;
+      }
+    } else if (type == kHpdIntRecord) {
+      uint8_t gpio = 0, plugged = 0;
+      if (image.u8(at + 2, &gpio) && image.u8(at + 3, &plugged)) {
+        out->gpio_id = gpio;
+        out->plugged_state = plugged;
+        out->has_hpd = true;
+      }
+    }
     at += size;
   }
-  return false;
 }
 }  // namespace
 
@@ -182,15 +198,22 @@ uint32_t AtomConnectors::parse(ConstByteView bios, ArrayView<Connector> out) {
     const int type = kConnectorOfObject[object_id];
     if (type == kUnknown) continue;
 
-    uint8_t pin = kNoPin, plugged = 0;
+    uint8_t pin = kNoPin, plugged = 0, ddc_id = 0;
+    bool has_ddc = false;
     if ((tag & (kDeviceTv1 | kDeviceCv)) == 0 && have_objects) {
       for (uint32_t j = 0; j < object_count; ++j) {
         const uint32_t object = connectors_at + kObjectTableHeaderBytes + j * kObjectBytes;
         uint16_t id = 0, record_offset = 0;
         if (!image.u16(object, &id) || !image.u16(object + 4, &record_offset)) break;
         if (id != conn_id) continue;
-        uint8_t gpio = 0;
-        if (find_hpd_record(image, uint32_t{header} + record_offset, &gpio, &plugged)) pin = hpd_pin_of_gpio(image, data_table_at, gpio);
+        ConnectorRecords records;
+        walk_records(image, uint32_t{header} + record_offset, &records);
+        if (records.has_hpd) {
+          pin = hpd_pin_of_gpio(image, data_table_at, records.gpio_id);
+          plugged = records.plugged_state;
+        }
+        ddc_id = records.ddc_id;
+        has_ddc = records.has_ddc;
         break;
       }
     }
@@ -203,6 +226,10 @@ uint32_t AtomConnectors::parse(ConstByteView bios, ArrayView<Connector> out) {
         out[existing].hpd_pin = pin;
         out[existing].plugged_state = plugged;
       }
+      if (!out[existing].has_ddc && has_ddc) {
+        out[existing].has_ddc = true;
+        out[existing].ddc_id = ddc_id;
+      }
       continue;
     }
     if (count >= capacity) continue;
@@ -212,6 +239,8 @@ uint32_t AtomConnectors::parse(ConstByteView bios, ArrayView<Connector> out) {
     c.enum_id = static_cast<uint8_t>((conn_id & kEnumIdMask) >> kEnumIdShift);
     c.hpd_pin = pin;
     c.plugged_state = plugged;
+    c.has_ddc = has_ddc;
+    c.ddc_id = ddc_id;
     c.devices = tag;
     c.number = 1;
     for (uint32_t i = 0; i < count; ++i)
