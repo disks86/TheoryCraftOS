@@ -865,7 +865,15 @@ bool Engine::run_here(StringView source, String* error, String* result, Value* o
 
 uint32_t Engine::call_guarded(const Value& fn, const Value* args, uint32_t argc, String* error) {
   vm_.reset_instruction_count();
-  vm_.set_extra_root(fn);   // (recover() may collect, and a timer that has run is no longer in the list: nothing else holds the function)
+  // recover() may collect, and a timer that has run is no longer in the list: nothing else holds the function or the objects it is to be called with
+  JsObject* held = argc ? vm_.new_array(argc + 1) : nullptr;
+  if (held) {
+    vm_.array_push(held, fn);
+    for (uint32_t i = 0; i < argc; ++i) vm_.array_push(held, args[i]);
+    vm_.set_extra_root(Value::make_object(held));
+  } else {
+    vm_.set_extra_root(fn);
+  }
   vm_.recover();
   Value ignored;
   const bool ok = vm_.call(fn, Value::make_object(vm_.global()), args, argc, &ignored);

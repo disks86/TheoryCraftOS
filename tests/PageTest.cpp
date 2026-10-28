@@ -26,6 +26,7 @@
 #include <string>
 #include <vector>
 #include "Browser/Page.hpp"
+#include "Dom/LegacyEncodings.hpp"
 #include "Browser/CacheStore.hpp"
 #include "Browser/ServiceWorker.hpp"
 #include "Browser/WebPush.hpp"
@@ -6038,6 +6039,22 @@ static int run_real_wpt(const char* root, const char* file) {
     FakeEnvironment env(a);
     MediaEnvironment media;
     Page page(a, env, (std::string("https://app.example/") + path).c_str(), media, true);
+    // the bytes of the file are read the way a browser reads a page: by the charset of its Content-Type (the .headers file next to it), a byte order mark or a <meta>
+    const std::string headers = read_all(std::string(root) + "/" + path + ".headers");
+    std::string content_type;
+    for (size_t at = 0; at < headers.size();) {
+      size_t end = headers.find('\n', at);
+      if (end == std::string::npos) end = headers.size();
+      if (headers.compare(at, 13, "Content-Type:") == 0) content_type = headers.substr(at + 13, end - at - 13);
+      at = end + 1;
+    }
+    if (ends(".html") || ends(".htm")) {
+      String decoded{a};
+      dom::Encoding used;
+      dom::decode_document(ConstByteView(reinterpret_cast<const uint8_t*>(html.data()), html.size()), StringView(content_type.data(), content_type.size()), &decoded, &used);
+      html.assign(decoded.view().data(), decoded.view().size());
+      page.set_character_set(dom::encoding_display_name(used));
+    }
     page.load(html.c_str());
     for (int i = 0; i < 20000; ++i) {
       double due;

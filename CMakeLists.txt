@@ -328,6 +328,7 @@ add_executable(BOOTX64
   src/Dom/Selector.cpp
   src/Dom/Form.cpp
   src/Dom/Entities.cpp
+  src/Dom/LegacyEncodings.cpp
   src/Dom/HtmlBuilder.cpp
   src/Regex/Regex.cpp
   src/Script/Number.cpp
