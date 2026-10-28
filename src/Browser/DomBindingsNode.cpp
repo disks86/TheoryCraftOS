@@ -427,7 +427,7 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
       *out = str_value(vm, jar.view());
       return true;
     }
-    if (IS("characterSet") || IS("charset") || IS("inputEncoding")) { *out = str_value(vm, "UTF-8"); return true; }
+    if (IS("characterSet") || IS("charset") || IS("inputEncoding")) { *out = str_value(vm, n->owner->character_set.view()); return true; }
     if (IS("contentType")) { *out = str_value(vm, n->owner->content_type.empty() ? StringView("text/html") : n->owner->content_type.view()); return true; }
     if (IS("compatMode")) { *out = str_value(vm, n->owner->quirks_mode ? "BackCompat" : "CSS1Compat"); return true; }
     if (IS("doctype")) {   // the doctype node among the children of the document

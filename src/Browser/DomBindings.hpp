@@ -33,6 +33,9 @@
 
 namespace browser {
 
+// __encoding_label and __decode_legacy: the legacy text encodings for TextDecoder (the main page and the workers both define them).
+void install_text_encoding_natives(script::Vm& vm);
+
 class PageObjects;
 class CacheStore;
 class ServiceWorkerHub;

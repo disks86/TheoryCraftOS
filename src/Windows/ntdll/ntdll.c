@@ -355,6 +355,29 @@ static void loader_lock(void) {
 }
 static void loader_unlock(void) { if (--g_loader_depth == 0) __sync_lock_release(&g_loader_owner); }
 
+/* LdrLockLoaderLock(flags, &disposition, &cookie): flag 1 raises on error, flag 2 only tries. Disposition 1: taken, 2: someone else holds it (try only). The cookie is
+ * what LdrUnlockLoaderLock wants back (it is the owner: a different thread may not release the lock). */
+EXPORT NTSTATUS NTAPI LdrLockLoaderLock(ULONG flags, ULONG *disposition, ULONG_PTR *cookie) {
+  if (disposition) *disposition = 0;
+  if (cookie) *cookie = 0;
+  if (flags & ~3u) return (NTSTATUS)0xC00000EF;
+  if (!cookie) return (NTSTATUS)0xC00000F1;
+  if ((flags & 2) && !disposition) return (NTSTATUS)0xC00000F0;
+  const ULONG_PTR me = TEB_CLIENT_THREAD(NtCurrentTeb());
+  if ((flags & 2) && g_loader_owner != 0 && g_loader_owner != me) { *disposition = 2; return STATUS_SUCCESS; }
+  loader_lock();
+  if (disposition) *disposition = 1;
+  *cookie = me | 1;
+  return STATUS_SUCCESS;
+}
+EXPORT NTSTATUS NTAPI LdrUnlockLoaderLock(ULONG flags, ULONG_PTR cookie) {
+  if (flags & ~1u) return (NTSTATUS)0xC00000EF;
+  if (cookie == 0) return STATUS_SUCCESS;
+  if (g_loader_owner != (cookie & ~(ULONG_PTR)1) || g_loader_depth == 0) return (NTSTATUS)0xC00000F0;
+  loader_unlock();
+  return STATUS_SUCCESS;
+}
+
 static int is_program(const LDR_DATA_TABLE_ENTRY *m) { return NtCurrentPeb()->ImageBaseAddress == m->DllBase; }
 
 #define LDRP_MAPPED_ONLY 0x80000000u      /* loaded with DONT_RESOLVE_DLL_REFERENCES: no imports, no thread-local data, no entry point */
@@ -394,12 +417,26 @@ static void notify_all_modules(DWORD reason, PVOID reserved, int forward) {
 
 static volatile LONG g_process_ending;
 static void fls_destroy_current(int free_structure);
+static volatile LONG g_heap_lock;
+static volatile LONG g_fls_lock;
 static void fls_thread_begins(void);
-EXPORT void NTAPI RtlExitUserProcess(NTSTATUS status) {
+/* The libraries are told the process is ending (once): this thread's fiber local storage goes first, then every library's entry point and TLS callbacks get
+ * DLL_PROCESS_DETACH with a non-NULL reserved. The libraries stay loaded; the process is not over. */
+EXPORT void NTAPI LdrShutdownProcess(void) {
   if (__sync_bool_compare_and_swap(&g_process_ending, 0, 1)) {
-    fls_destroy_current(0);      /* (this thread's fiber local storage goes first) */
-    notify_all_modules(DLL_PROCESS_DETACH, (PVOID)1, 0);      /* (1: the process is ending) */
+    fls_destroy_current(0);
+    notify_all_modules(DLL_PROCESS_DETACH, (PVOID)1, 0);
   }
+}
+
+/* ExitProcess: the other threads end first (with the exit code), then the libraries are told, then the process goes. */
+EXPORT void NTAPI RtlExitUserProcess(NTSTATUS status) {
+  if (!g_process_ending) {
+    NtTerminateProcess(NULL, status);
+    g_heap_lock = 0;      /* (a thread that was ended inside the heap or the fiber storage cannot give its lock back; the process is going away) */
+    g_fls_lock = 0;
+  }
+  LdrShutdownProcess();
   for (;;) NtTerminateProcess(NtCurrentProcess(), status);
 }
 
@@ -628,7 +665,6 @@ EXPORT PVOID NTAPI RtlCreateHeap(ULONG flags, PVOID base, SIZE_T reserve, SIZE_T
 }
 
 /* The heaps are shared by the threads of the process: one spin lock (a waiting thread gives its time slice to the holder) covers all of them. */
-static volatile LONG g_heap_lock;
 static void heap_lock(void) { while (__sync_lock_test_and_set(&g_heap_lock, 1)) NtYieldExecution(); }
 static void heap_unlock(void) { __sync_lock_release(&g_heap_lock); }
 

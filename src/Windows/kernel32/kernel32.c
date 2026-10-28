@@ -288,6 +288,7 @@ EXPORT BOOL WINAPI HeapUnlock(HANDLE h) { (void)h; return TRUE; }
 
 EXPORT void WINAPI ExitProcess(UINT code) { RtlExitUserProcess((NTSTATUS)code); }
 EXPORT BOOL WINAPI TerminateProcess(HANDLE process, UINT code) {
+  if (!process) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
   if (process != NtCurrentProcess()) {
     const NTSTATUS status = NtTerminateProcess(process, (NTSTATUS)code);
     return NT_SUCCESS(status) ? TRUE : fail_nt(status);

@@ -110,6 +110,8 @@ class Document {
   String doctype_name, doctype_public, doctype_system;
   // What contentType says when the document is not HTML ("application/xml" ...); empty for a page of HTML.
   String content_type;
+  // The encoding the page arrived in (document.characterSet): "UTF-8" unless the page said otherwise.
+  String character_set;
   Node* document_element() const;                       // <html>
   Node* head() const;
   Node* body() const;

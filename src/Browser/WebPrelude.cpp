@@ -313,11 +313,6 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
     }
     return { read: read, written: written };
   });
-  var CP1252 = [0x20AC, 0x81, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x8D, 0x017D, 0x8F, 0x90, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014, 0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x9D, 0x017E, 0x0178];
-  var ENCODING_LABELS = { 'utf-8': 'utf-8', utf8: 'utf-8', 'unicode-1-1-utf-8': 'utf-8', 'unicode11utf8': 'utf-8', 'x-unicode20utf8': 'utf-8', 'utf-16le': 'utf-16le', 'utf-16': 'utf-16le', 'ucs-2': 'utf-16le',
-    'unicode': 'utf-16le', 'csunicode': 'utf-16le', 'iso-10646-ucs-2': 'utf-16le', 'unicodefeff': 'utf-16le', 'utf-16be': 'utf-16be', 'unicodefffe': 'utf-16be', latin1: 'windows-1252', ascii: 'windows-1252',
-    'us-ascii': 'windows-1252', 'windows-1252': 'windows-1252', 'iso-8859-1': 'windows-1252', 'iso8859-1': 'windows-1252', 'iso_8859-1': 'windows-1252', 'l1': 'windows-1252', 'cp1252': 'windows-1252',
-    'x-cp1252': 'windows-1252', 'ansi_x3.4-1968': 'windows-1252' };
   function utf8Of(cp) {
     if (cp < 0x80) return String.fromCharCode(cp);
     var b;
@@ -338,49 +333,27 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
   }
   function TextDecoder(label, options) {
     if (!(this instanceof TextDecoder)) throw typeError("construct 'TextDecoder'", "Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
-    label = label === undefined ? 'utf-8' : lower(String(label).trim());
-    var encoding = ENCODING_LABELS[label];
-    if (!encoding) throw new RangeError("Failed to construct 'TextDecoder': The encoding label provided ('" + label + "') is invalid.");
-    hide(this, '__d', { encoding: encoding, pending: '', started: false });
+    label = label === undefined ? 'utf-8' : String(label);
+    var encoding = __encoding_label(label);   // (the name of the encoding the label names, if there is one)
+    if (!encoding || encoding === 'replacement') throw new RangeError("Failed to construct 'TextDecoder': The encoding label provided ('" + label + "') is invalid.");
+    hide(this, '__d', { encoding: encoding, pending: '', started: false, state: null });
     this.encoding = encoding;
     this.fatal = !!(options && options.fatal);
     this.ignoreBOM = !!(options && options.ignoreBOM);
   }
   method(TextDecoder.prototype, 'decode', function (input, options) {
     var d = this.__d, stream = !!(options && options.stream);
-    var bytes = input === undefined || input === null ? '' : __bytes_to_string(input instanceof ArrayBuffer ? new Uint8Array(input) : input);
-    var data = d.pending + bytes, out = '', i;
-    d.pending = '';
-    if (d.encoding === 'windows-1252') {
-      for (i = 0; i < data.length; i++) { var c = data.charCodeAt(i); out += c >= 0x80 && c <= 0x9F ? utf8Of(CP1252[c - 0x80]) : String.fromCharCode(c); }
-    } else if (d.encoding === 'utf-8') {
-      if (stream) { var cut = utf8Incomplete(data); d.pending = data.slice(data.length - cut); data = data.slice(0, data.length - cut); }
-      if (!d.started && !this.ignoreBOM && data.charCodeAt(0) === 0xEF && data.charCodeAt(1) === 0xBB && data.charCodeAt(2) === 0xBF) data = data.slice(3);
-      out = __utf8_clean(data);
-      if (this.fatal && out !== data) { d.started = false; throw new TypeError("Failed to execute 'decode' on 'TextDecoder': The encoded data was not valid for encoding utf-8"); }
-    } else {   // UTF-16
-      var be = d.encoding === 'utf-16be', pos = 0;
-      if (stream && data.length % 2 === 1) { d.pending = data.slice(data.length - 1); data = data.slice(0, data.length - 1); }
-      if (!d.started && !this.ignoreBOM && data.length >= 2) {
-        var b0 = data.charCodeAt(0), b1 = data.charCodeAt(1);
-        if ((!be && b0 === 0xFF && b1 === 0xFE) || (be && b0 === 0xFE && b1 === 0xFF)) pos = 2;
-      }
-      var high = 0, unit = function (at) { return be ? (data.charCodeAt(at) << 8) | data.charCodeAt(at + 1) : (data.charCodeAt(at + 1) << 8) | data.charCodeAt(at); };
-      for (; pos + 1 < data.length; pos += 2) {
-        var u = unit(pos);
-        if (high) {
-          if (u >= 0xDC00 && u <= 0xDFFF) { out += utf8Of(0x10000 + ((high - 0xD800) << 10) + (u - 0xDC00)); high = 0; continue; }
-          if (this.fatal) throw new TypeError("Failed to execute 'decode' on 'TextDecoder': The encoded data was not valid for encoding " + d.encoding);
-          out += utf8Of(0xFFFD); high = 0;
-        }
-        if (u >= 0xD800 && u <= 0xDBFF) high = u;
-        else if (u >= 0xDC00 && u <= 0xDFFF) { if (this.fatal) throw new TypeError("Failed to execute 'decode' on 'TextDecoder': The encoded data was not valid for encoding " + d.encoding); out += utf8Of(0xFFFD); }
-        else out += utf8Of(u);
-      }
-      if (high) { if (stream) d.pending = (be ? String.fromCharCode(high >> 8) : String.fromCharCode(high & 255)); out += stream ? '' : utf8Of(0xFFFD); }
-      if (!stream && data.length % 2 === 1) out += utf8Of(0xFFFD);
+    var view = input === undefined || input === null ? new Uint8Array(0) : input instanceof ArrayBuffer ? new Uint8Array(input) : ArrayBuffer.isView(input) ? new Uint8Array(input.buffer, input.byteOffset, input.byteLength) : null;
+    if (!view) throw typeError("execute 'decode' on 'TextDecoder'", "The provided value is not of type '(ArrayBuffer or ArrayBufferView)'.");
+    if (!d.state) d.state = new Uint32Array(12);   // (the decoder keeps what it has read of an incomplete character here)
+    var out = __decode_legacy(d.encoding, view, !stream, this.fatal, d.state);
+    if (out === null) { d.started = false; throw new TypeError("Failed to execute 'decode' on 'TextDecoder': The encoded data was not valid for encoding " + d.encoding); }
+    if (!stream) d.state = null;
+    var unicode = d.encoding === 'utf-8' || d.encoding === 'utf-16le' || d.encoding === 'utf-16be';
+    if (unicode && !d.started && out.length) {   // the byte order mark at the start is not part of the text
+      d.started = true;
+      if (!this.ignoreBOM && out.charCodeAt(0) === 0xFEFF) out = out.slice(1);
     }
-    if (out.length || bytes.length) d.started = true;
     if (!stream) d.started = false;
     return out;
   });
