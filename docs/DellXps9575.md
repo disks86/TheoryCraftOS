@@ -718,3 +718,19 @@ reason. Not done: writing the DPCD (link rate and lane count settings, training 
 and PSR registers, and acting on the short pulse (reading the link status when it comes). `tests/DpcdTest.cpp` (hand-built images from the specification's register map: an HBR2 4-lane monitor, a dongle, an eDP 1.4 panel
 with its rate table, each flag and field alone, sinks that are no DPCD, reads that fail partway, every bit flip of the images and every truncation under the sanitizers) and `AmdVegaMTest::test_read_dpcd` (the XPS-like board's
 DisplayPort and eDP connectors through the video BIOS tables, with a panel that answers only after the power-up) cover it.
+
+### The DisplayPort short pulse: link status and test requests
+
+A DisplayPort sink pulses its hot plug pin briefly (the short pulse, source 42 data 6..11, see "Hot plug") to say that something changed that is not a plug: the link lost sync, a stream was lost, or it wants a test.
+The interrupt handler only takes note: `AmdVegaM::on_event` sets the pin's bit in `pending_short_pulses()` (a pulse whose status bit is not set never gets that far, `AmdIrq` drops it). Looking at the sink is the AUX
+channel's job, which takes some milliseconds, so `service_short_pulses(out, capacity)` does it from the desktop loop. For each pending pin, lowest first, up to `capacity` (the rest stay pending; a pin that pulsed
+twice is one entry), it finds the connector of the pin, and for a DisplayPort or eDP connector with an AUX channel reads `DP_LANE_COUNT_SET` (0x101, bits 4:0: the lanes the link was set up for, 0 while it is not
+trained) and the link status (`Dpcd::read_link_status`), and fills a `SinkEvent`: `link_lost` when the link was set up for lanes and does not pass `channel_eq_ok(lanes)` (clock recovery, equalization and symbol lock of each lane
+in use, and interlane alignment: the test the driver's short pulse handler retrains on), `test_request` (`DP_AUTOMATED_TEST_REQUEST` in the service interrupt vector), `content_protection` and `sink_specific` (the other
+two service interrupts), the whole `status` and `lanes`. A sink that does not answer is `read_failed` (it is gone or asleep); a pin that is no DisplayPort connector, or not in the video BIOS's table, is reported
+with `checked` false and nothing is asked. The panel's power is not switched on for this (a sink that is off does not pulse). Shutting down drops the pending pulses.
+
+Not done: acknowledging (writing 1 to the bits of `DP_DEVICE_SERVICE_IRQ_VECTOR` that were handled, which clears the sink's request), answering the automated test request (`DP_TEST_REQUEST` 0x218 and the response at 0x260),
+the retraining itself (there is no link training yet; the boot firmware's link is what is judged, and a card that has not trained one has `lanes` 0 and cannot lose it), and the MST message and the downstream port
+changes. Addresses and bit meanings are from memory, like the rest of the DPCD. `AmdVegaMTest::test_short_pulse_status` (healthy link, a lost lane, a lane beyond the ones in use, an untrained link, lost alignment, each
+service interrupt, the eDP panel, a sink that times out or ends before the status, HDMI and an unknown pin, capacity and order, the dropped state) and `DpcdTest::test_lane_count` cover it.

@@ -180,6 +180,27 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
   // capabilities, and for `status` (optional) the link status. False if the connector is not a DisplayPort one, nothing answers, or what answers is no DPCD. Like read_edid it takes the AUX
   // channel for some milliseconds, so it is for the desktop loop (or the handler of a hot plug), not an interrupt path.
   bool read_dpcd(const AtomConnectors::Connector& connector, Dpcd::Capabilities* capabilities, Dpcd::LinkStatus* status = nullptr);
+  // The short pulse of a DisplayPort sink (a status change that is not a plug: the link was lost, or the sink asks for a test) is taken by the interrupt handler as a pin to look at
+  // (`pending_short_pulses()`: bit n for pin n). The look is the AUX channel's, which takes some milliseconds, so it is not done there: service_short_pulses() does it, from the desktop loop.
+  // For each pending pin, lowest first, up to `capacity` of them, it reads the sink's link configuration (DP_LANE_COUNT_SET) and status (the lane training status, the alignment, the service
+  // interrupt vector) and reports what a driver's short pulse handler decides on: the link is lost when it was set up for lanes and does not pass drm_dp_channel_eq_ok for them (retrain),
+  // an automated test request is made when the sink asks for one. The returned events are in `out`; pins past `capacity` stay pending. Not done: the acknowledging write to the service
+  // interrupt vector, the test request itself (DP_TEST_REQUEST and the response), the retraining.
+  struct SinkEvent {
+    uint32_t pin = 0;
+    bool has_connector = false;
+    AtomConnectors::Connector connector;
+    bool checked = false;             // the sink's status was read (the pin is a DisplayPort or eDP connector of the video BIOS's table with an AUX channel)
+    bool read_failed = false;         // checked, but the AUX channel did not answer (the sink is gone or asleep)
+    uint32_t lanes = 0;               // DP_LANE_COUNT_SET: 0 if the link has not been trained
+    Dpcd::LinkStatus status;
+    bool link_lost = false;           // lanes were set up and the status says they are not in sync
+    bool test_request = false;        // DP_AUTOMATED_TEST_REQUEST in the service interrupt vector
+    bool content_protection = false;  // DP_CP_IRQ
+    bool sink_specific = false;       // DP_SINK_SPECIFIC_IRQ
+  };
+  uint32_t pending_short_pulses() const { return rx_pending_; }
+  uint32_t service_short_pulses(SinkEvent* out, uint32_t capacity);
   ArrayView<const AtomConnectors::Connector> connectors() const { return ArrayView<const AtomConnectors::Connector>(connectors_, connector_count_); }
   uint32_t hotplug_events_dropped() const { return hotplug_dropped_; }
   // The audio endpoints of the display engine (amd_dce11::AudioPins, dce_v11_0_audio_get_connected_pins): bit n of the mask is set when endpoint n has a port (its default configuration's
@@ -259,6 +280,7 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
   uint32_t connector_count_ = 0;
   void power_up_panel(const AtomConnectors::Connector& connector, IAtomHost& host, AtomBios& bios);   // an eDP panel's power, before its AUX channel is used
   uint32_t audio_pins_ = 0;
+  uint32_t rx_pending_ = 0;
   uint32_t hotplug_head_ = 0, hotplug_count_ = 0, hotplug_dropped_ = 0, connected_pins_ = 0, throttle_reported_ = 0;
   AmdIrq::ISink* observer_ = nullptr;
   UniquePointer<AmdGfx8Compute> compute_;

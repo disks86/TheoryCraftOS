@@ -38,9 +38,16 @@ constexpr uint32_t kPageNoAccess = 0x01, kPageReadOnly = 0x02, kPageReadWrite = 
 constexpr uint64_t kAllocationGranularity = 0x10000;
 constexpr uint64_t kChunk = 2048;      // how much of another process's memory is moved at a time
 
-// PAGE_* -> our permission bits. Modifier flags (guard, no-cache, write-combine) are not supported.
+// PAGE_* -> our permission bits. The no-cache and write-combine modifiers are not supported.
 bool page_protection(uint32_t page, uint8_t* out) {
   if (page & ~uint32_t{0x7FF}) return false;
+  if (page & 0x100) {      // PAGE_GUARD: the first access gets the page back with its protection and raises an exception (see guard_fault); until then nothing may touch it
+    if ((page & 0xFF) == kPageNoAccess || (page & 0x600)) return false;
+    uint8_t base = 0;
+    if (!page_protection(page & 0xFF, &base)) return false;
+    *out = 0;
+    return true;
+  }
   switch (page & 0xFF) {
     case kPageNoAccess: *out = 0; return true;
     case kPageReadOnly: *out = kProtRead; return true;
@@ -333,6 +340,47 @@ uint32_t resolve(Process& p, uint64_t handle, bool* remote, uint64_t* pid) {
 }
 
 }  // namespace
+
+GuardResult guard_fault(Process& process, uint64_t teb, uint64_t address, bool write, ExceptionInfo* info) {
+  AddressSpace* space = process.address_space();
+  if (!space) return GuardResult::NotGuard;
+  const uint64_t page = AddressSpace::round_down(address);
+  PageAttributes attributes;
+  if (!space->attributes_at(page, &attributes) || attributes.reserved || !(attributes.protect & 0x100)) return GuardResult::NotGuard;
+  const uint32_t base_protect = attributes.protect & ~uint32_t{0x100};
+  uint8_t prot = 0;
+  if (!page_protection(base_protect, &prot) || !space->protect(page, AddressSpace::kPageSize, prot) || !space->set_page_protect(page, AddressSpace::kPageSize, base_protect, false)) return GuardResult::NotGuard;
+  // The guard page of a thread's stack: the stack grows by one page, the page below becomes the guard.
+  uint8_t tib[0x20] = {};
+  uint8_t dealloc_bytes[8] = {};
+  uint64_t stack_base = 0, deallocation = 0;
+  if (teb != 0 && space->read_privileged(teb, ByteView(tib, sizeof(tib))) && space->read_privileged(teb + 0x1478, ByteView(dealloc_bytes, 8))) {
+    for (uint32_t i = 0; i < 8; ++i) { stack_base |= uint64_t{tib[8 + i]} << (8 * i); deallocation |= uint64_t{dealloc_bytes[i]} << (8 * i); }
+  }
+  if (deallocation != 0 && page >= deallocation && page < stack_base) {
+    constexpr uint64_t kReserve = 2 * AddressSpace::kPageSize;      // the lowest pages of the stack are never committed: running into them is a stack overflow
+    if (page < deallocation + kReserve) {
+      *info = ExceptionInfo();
+      info->code = 0xC00000FDu;      // STATUS_STACK_OVERFLOW
+      return GuardResult::Exception;
+    }
+    const uint64_t next = page - AddressSpace::kPageSize;
+    PageAttributes below;
+    if (next >= deallocation + kReserve && space->attributes_at(next, &below) && below.reserved) {
+      if (space->protect(next, AddressSpace::kPageSize, 0)) space->set_page_protect(next, AddressSpace::kPageSize, base_protect | 0x100, false);      // (the guard page itself is committed but inaccessible)
+    }
+    uint8_t limit[8];
+    for (uint32_t i = 0; i < 8; ++i) limit[i] = uint8_t(page >> (8 * i));
+    space->write_privileged(teb + 0x10, ConstByteView(limit, 8));      // StackLimit
+    return GuardResult::Retry;
+  }
+  *info = ExceptionInfo();
+  info->code = 0x80000001u;      // STATUS_GUARD_PAGE_VIOLATION
+  info->count = 2;
+  info->information[0] = write ? 1 : 0;
+  info->information[1] = address;
+  return GuardResult::Exception;
+}
 
 uint32_t run_remote(Process& target, IProcessRuntime::RemoteOp& op) {
   if (target.exited()) return kStatusProcessIsTerminating;

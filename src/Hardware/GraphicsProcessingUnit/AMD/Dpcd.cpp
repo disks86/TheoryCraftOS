@@ -114,4 +114,12 @@ bool Dpcd::read_link_status(IDpcdAux& aux, LinkStatus* out) {
   return parse_link_status(ConstByteView(status, sizeof status), out);
 }
 
+bool Dpcd::read_lane_count(IDpcdAux& aux, uint32_t* lanes) {
+  *lanes = 0;
+  uint8_t value = 0;
+  if (!aux.dpcd_read(kLaneCountSet, ByteView(&value, 1))) return false;
+  *lanes = value & 0x1F;
+  return true;
+}
+
 }  // namespace hardware

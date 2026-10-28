@@ -339,6 +339,22 @@ Frame* on_user_fault(Frame* frame) {
     irq_disable();
     return frame;
   }
+  // A guard page (PAGE_GUARD) gives way on its first access: a stack grows by a page, anything else raises STATUS_GUARD_PAGE_VIOLATION once.
+  int guard = 0;
+  process::ExceptionInfo guard_info;
+  if ((frame->vector & 0xFF) == 14 && task->program.process()->abi() == process::SyscallAbi::Windows) {
+    const uint64_t guard_address = read_cr2();
+    uint32_t low = 0, high = 0;
+    __asm__ volatile("rdmsr" : "=a"(low), "=d"(high) : "c"(0xC0000102u));      // (the program's GS base, the TEB, is parked in KERNEL_GS_BASE while we run)
+    irq_enable();
+    task->mutex.lock();
+    const process::windowsabi::GuardResult result = process::windowsabi::guard_fault(*task->program.process(), (uint64_t{high} << 32) | low, guard_address, (frame->error & 2) != 0, &guard_info);
+    if (result != process::windowsabi::GuardResult::NotGuard) task->sync_tables();
+    task->mutex.unlock();
+    irq_disable();
+    if (result == process::windowsabi::GuardResult::Retry) return frame;
+    if (result == process::windowsabi::GuardResult::Exception) guard = 1;
+  }
   // A write to a copy-on-write page (PAGE_WRITECOPY) is not a fault: the page gets its own copy and the instruction runs again.
   if ((frame->vector & 0xFF) == 14 && (frame->error & 3) == 3 && task->program.process()->abi() == process::SyscallAbi::Windows) {
     const uint64_t cow_address = read_cr2();
@@ -359,7 +375,7 @@ Frame* on_user_fault(Frame* frame) {
     const uint64_t vector = frame->vector & 0xFF;
     const uint64_t address = vector == 14 ? read_cr2() : 0;
     bool delivered = false;
-    if (process::fault_to_exception(vector, frame->error, address, &at, &info)) {
+    if (guard ? (info = guard_info, true) : process::fault_to_exception(vector, frame->error, address, &at, &info)) {
       irq_enable();      // (the frame is saved) the program's lock may have to be waited for: writing on its stack looks at its address space
       task->mutex.lock();
       delivered = process::dispatch_exception(*process, at, info, process->exception_dispatcher(), &entry);

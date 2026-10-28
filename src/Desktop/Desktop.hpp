@@ -18,7 +18,7 @@
 
 // The desktop shell: a full-screen root window holding the desktop surface - where the window manager
 // stacks application windows - and a taskbar along the bottom with the Start button (its menu opens
-// upwards), the window switcher in the space in between, and the clock. The Start menu offers "File Explorer", "Computer Manager", "Text Editor", "Terminal", "Calculator", "Calendar", "Paint", "Media Player", "3D Test",
+// upwards), the window switcher in the space in between, and the clock. The Start menu offers "File Explorer", "Computer Manager", "Text Editor", "Terminal", "Calculator", "Calendar", "To-Do", "Paint", "Media Player", "3D Test",
 // and "About" (ordinary windows; a second File Explorer, Text Editor or Paint opens a new window next to the first, as many as wanted,
 // and files can be dragged from one explorer to another or onto an editor) and "Shut Down...", which asks for confirmation in a modal dialog and then only
 // requests the shutdown (shutdown_requested()): the boot code owns the hardware and does the orderly
@@ -39,6 +39,8 @@
 #include "Desktop/Calculator.hpp"
 #include "Desktop/Calendar.hpp"
 #include "Desktop/CalendarStore.hpp"
+#include "Desktop/Todo.hpp"
+#include "Desktop/TodoStore.hpp"
 #include "Desktop/Notepad.hpp"
 #include "Database/DatabaseManager.hpp"
 #include "Desktop/DatabaseQuery.hpp"
@@ -89,7 +91,7 @@ class Desktop {
  public:
   static constexpr int32_t kTaskbarHeight = 32;
   // What gui::Frame::app_kind() says about a program's windows.
-  enum AppKind : uint8_t { kAppNone, kAppExplorer, kAppEditor, kAppPaint, kAppTerminal, kAppMedia, kAppSheet, kAppDatabase, kAppBrowser, kAppCalculator, kAppCalendar };
+  enum AppKind : uint8_t { kAppNone, kAppExplorer, kAppEditor, kAppPaint, kAppTerminal, kAppMedia, kAppSheet, kAppDatabase, kAppBrowser, kAppCalculator, kAppCalendar, kAppTodo };
 
   // The devices may be null (a machine without a mouse still shows the desktop).
   Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& renderer, hardware::IKeyboard* keyboard,
@@ -214,6 +216,12 @@ class Desktop {
   // Shows a toast for each appointment whose reminder is due at `now_minutes` (local minutes since 1970-01-01 00:00; see local_minutes()), once each. The desktop does
   // this by itself every minute while its clock is known; returns how many toasts were posted.
   uint32_t announce_calendar(int64_t now_minutes);
+  // Opens a to-do window: the first one is todo() (when that is closed), further ones are made as needed and go away when closed.
+  Todo* open_todo(gui::TabFrame* into = nullptr);
+  Todo& todo() { return todo_; }
+  uint32_t todo_count() const;
+  // The to-do items, kept in /AppStore/Todo once set_file_system() has been called (before that, in memory only).
+  TodoStore& todo_store() { return *todo_store_; }
   ComputerManager& computer_manager() { return computer_manager_; }
   // The machine's figures for the computer manager (nullptr: none). It must outlive the desktop.
   void set_system_monitor(ISystemMonitor* monitor) { computer_manager_.set_monitor(monitor); }
@@ -303,6 +311,7 @@ class Desktop {
   static void on_calculator(void* self, gui::Control&);
   static void on_calendar(void* self, gui::Control&);
   static void on_calendar_toast(void* self, gui::Control&);
+  static void on_todo(void* self, gui::Control&);
   static int64_t calendar_time(void* self);
   static void on_explorer_properties(void* self, gui::Control&);
   static void on_new_terminal(void* self, gui::Control&);
@@ -342,6 +351,7 @@ class Desktop {
   void setup_terminal(Terminal& terminal);
   void setup_calculator(Calculator& calculator);
   void setup_calendar(Calendar& calendar);
+  void setup_todo(Todo& todo);
   void reap_closed();
   // Opens a program window of kind `app` (a kApp... value) in `into` or a window of its own, showing `path` if that still exists.
   gui::Frame* open_app(uint8_t app, gui::TabFrame* into, StringView path);
@@ -391,6 +401,8 @@ class Desktop {
   Calculator calculator_;
   UniquePointer<CalendarStore> calendar_store_;   // (before the calendar windows, which show it)
   Calendar calendar_;
+  UniquePointer<TodoStore> todo_store_;   // (before the to-do windows, which show it)
+  Todo todo_;
   MediaPlayer media_player_;
   Graphics3DTest graphics_test_;
   gui::MessageDialog display_confirm_dialog_;   // "keep these display settings?"
@@ -422,6 +434,7 @@ class Desktop {
   List<UniquePointer<Terminal>> extra_terminals_;
   List<UniquePointer<Calculator>> extra_calculators_;
   List<UniquePointer<Calendar>> extra_calendars_;
+  List<UniquePointer<Todo>> extra_todos_;
   List<UniquePointer<gui::TabFrame>> hosts_;   // the tabbed windows
   bool reap_needed_ = false;
   hardware::SystemMonitors* monitors_ = nullptr;

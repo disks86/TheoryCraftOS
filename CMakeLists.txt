@@ -450,6 +450,8 @@ add_executable(BOOTX64
   src/Desktop/Calculator.cpp
   src/Desktop/Calendar.cpp
   src/Desktop/CalendarStore.cpp
+  src/Desktop/Todo.cpp
+  src/Desktop/TodoStore.cpp
   src/Desktop/FileProperties.cpp
   src/Desktop/CopyProgressDialog.cpp
   src/Desktop/DirectoryListing.cpp

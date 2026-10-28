@@ -227,6 +227,19 @@ void test_link_status() {
   CHECK(Dpcd::parse_link_status(ConstByteView(eight, 8), &l) && l.sink_count_raw == 1 && l.irq_vector == 2 && l.lane_status[0] == 3 && l.lane_status[1] == 4 && l.align == 5 && l.sink_status == 6 && l.adjust[0] == 7 && l.adjust[1] == 8);
 }
 
+void test_lane_count() {
+  Sink s;
+  uint32_t lanes = 99;
+  CHECK(Dpcd::read_lane_count(s, &lanes) && lanes == 0);
+  for (uint32_t v = 0; v < 256; ++v) {
+    s.dpcd[0x101] = static_cast<uint8_t>(v);
+    CHECK(Dpcd::read_lane_count(s, &lanes) && lanes == (v & 0x1F));
+  }
+  s.failing.push_back(0x101);
+  lanes = 99;
+  CHECK(!Dpcd::read_lane_count(s, &lanes) && lanes == 0);
+}
+
 void test_flips() {
   // every bit of the receiver field, the eDP revision and rates, and the status, flipped: never a crash, and valid exactly when the three essentials are
   Sink base;
@@ -268,6 +281,7 @@ int main() {
   test_not_a_dpcd();
   test_edp();
   test_link_status();
+  test_lane_count();
   test_flips();
   printf(g_failed ? "DpcdTest: %d FAILED\n" : "DpcdTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
