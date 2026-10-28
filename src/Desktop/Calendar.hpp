@@ -21,9 +21,16 @@
 // it is announced), to change the one chosen in the list, or to delete it. The appointments are kept in the CalendarStore (the application's storage under
 // /AppStore/Calendar); the desktop announces them as toasts when their time comes, whether this window is open or not. Like every program window it can be
 // a tab of a tabbed window.
+//
+// An appointment can last the whole day ("All day": the way to keep a birthday or a holiday) and can repeat: every day, week, month or year (or every
+// second, third, ... one), for ever or until a last date. The list shows the appointments that occur on the chosen day, repeating ones included,
+// and the marks in the month show them too. Changing a repeating appointment changes all of its occurrences.
 #pragma once
 #include "Desktop/CalendarStore.hpp"
 #include "Gui/Controls/Button.hpp"
+#include "Gui/Controls/CheckBox.hpp"
+#include "Gui/Controls/DatePicker.hpp"
+#include "Gui/Controls/DropDown.hpp"
 #include "Gui/Controls/Label.hpp"
 #include "Gui/Controls/ListView.hpp"
 #include "Gui/Controls/SpinBox.hpp"
@@ -104,6 +111,11 @@ class Calendar : public gui::Frame {
   MonthGrid& grid() { return grid_; }
   gui::ListView& list() { return list_; }
   gui::TextBox& title_box() { return title_; }
+  gui::CheckBox& all_day_box() { return all_day_; }
+  gui::DropDown& repeat_box() { return repeat_; }
+  gui::SpinBox& every_box() { return every_; }
+  gui::CheckBox& until_check() { return until_check_; }
+  gui::DatePicker& until_box() { return until_; }
   gui::SpinBox& hour_box() { return hour_; }
   gui::SpinBox& minute_box() { return minute_; }
   gui::SpinBox& length_box() { return length_; }
@@ -122,14 +134,22 @@ class Calendar : public gui::Frame {
   static void on_update(void* self, gui::Control&);
   static void on_delete(void* self, gui::Control&);
   static void on_today(void* self, gui::Control&);
+  static void on_form_changed(void* self, gui::Control&);
+  // The form's repeat settings; false (and the status says why) if the end date is before the chosen day.
+  bool form_recurrence(Recurrence* out);
+  uint32_t form_minutes() const;
+  void update_form();   // enables what applies to the form as it is (no time for an all-day appointment, no "every" for one that does not repeat)
   void say(StringView text) { status_.set_text(text); }
   int64_t form_start() const;
 
-  gui::Label day_label_, title_label_, time_label_, colon_label_, length_label_, remind_label_, status_;
+  gui::Label day_label_, title_label_, time_label_, colon_label_, length_label_, remind_label_, repeat_label_, every_label_, status_;
   MonthGrid grid_;
   gui::ListView list_;
   gui::TextBox title_;
-  gui::SpinBox hour_, minute_, length_, remind_;
+  gui::SpinBox hour_, minute_, length_, remind_, every_;
+  gui::CheckBox all_day_, until_check_;
+  gui::DropDown repeat_;
+  gui::DatePicker until_;
   gui::Button add_, update_, delete_, today_button_;
   CalendarStore* store_ = nullptr;
   TimeSource time_ = nullptr;
