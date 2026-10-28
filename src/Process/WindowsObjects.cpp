@@ -430,6 +430,20 @@ uint32_t nt_duplicate_object(Process& p, const SyscallRequest& r) {
     }
     return kSuccess;
   }
+  if (r.args[1] == ~uint64_t{0}) {      // the pseudo handle of this process becomes a real handle to it
+    ObjectManager* objects = system_objects();
+    if (!objects) return kNotImplemented;
+    const ObjectManager::Created c = objects->open_process(p.id(), true);
+    if (c.id == 0) return c.status;
+    const int64_t slot_for_process = p.files().open_token(DescriptorKind::Process, c.id);
+    if (slot_for_process < 0) { objects->release(c.id); return kNoResources; }
+    if (target_at != 0 && !p.write_user_u64(target_at, (uint64_t(slot_for_process) + 1) * 4)) {
+      p.close_descriptor(uint64_t(slot_for_process));
+      return kAccessViolation;
+    }
+    p.files().set_handle_flags(uint64_t(slot_for_process), (attributes & 2) != 0, false);
+    return kSuccess;
+  }
   uint64_t slot = 0;
   if (!slot_of(r.args[1], &slot) || p.files().kind(slot) == DescriptorKind::Closed) return kInvalidHandle;
   const int64_t copy = p.files().duplicate(slot, 0);
@@ -604,15 +618,19 @@ uint32_t nt_create_section(Process& p, const SyscallRequest& r) {
   if (r.args[3] != 0 && !p.read_user_u64(r.args[3], &size)) return kAccessViolation;
   filesystem::IFileSystem* fs = nullptr;
   String host(p.files().allocator());
+  uint64_t file_size = 0;
   if (file_handle != 0 && file_handle != ~uint64_t{0}) {
     uint64_t slot = 0;
     if (!slot_of(file_handle, &slot) || p.files().kind(slot) != DescriptorKind::File) return kInvalidHandle;
     OpenObject* file = p.files().object(slot);
     if (!file || !p.files().host_path_of(file->path.view(), &host)) return kInvalidHandle;
     fs = p.files().file_system();
-    if (!file->readable) return 0xC0000022u;      // a file that cannot be read cannot be mapped
+    if (!file->readable || file->no_data_access) return 0xC0000022u;      // a file that cannot be read cannot be mapped
     if (!file->writable && (page == kPageReadWrite || page == kPageExecuteReadWrite || page == kPageExecuteRead || page == kPageExecuteWriteCopy)) return 0xC0000022u;      // STATUS_ACCESS_DENIED
-    if (size > p.files().size_of(*file) && !file->writable && !(uint32_t(attributes) & 0x1000000u)) return 0xC000004Eu;
+    file_size = p.files().size_of(*file);
+    const bool section_writes = page == kPageReadWrite || page == kPageExecuteReadWrite;      // only a section that can be written grows the file
+    if (size > file_size && !section_writes && !(uint32_t(attributes) & 0x1000000u)) return file->writable ? 0xC0000040u /* STATUS_SECTION_TOO_BIG */ : kStatusSectionProtection;
+    if (size == 0 && file_size == 0) return (uint32_t(attributes) & 0x1000000u) ? 0xC0000020u /* STATUS_INVALID_FILE_FOR_SECTION */ : 0xC000011Eu /* STATUS_MAPPED_FILE_SIZE_ZERO */;
   } else if (size == 0) {
     return kInvalidParameter;
   }
@@ -630,6 +648,7 @@ uint32_t nt_create_section(Process& p, const SyscallRequest& r) {
   else reported |= (flags & kSecReserve) ? kSecReserve : kSecCommit;
   const ObjectManager::Created c = objects->create_section(StringView(name, name_size), (flags & kSecImage) ? 0 : size, page, reported, fs, host.view());
   if (c.id == 0) return c.status;
+  if (fs && !(flags & kSecImage)) objects->section_set_reported_size(c.id, size != 0 ? size : file_size);      // (a section of a file has the size it was asked for, not the pages')
   if (flags & kSecImage) {      // the file has to be a PE image this OS can run
     uint8_t* image = nullptr;
     uint64_t image_size = 0;
@@ -672,8 +691,8 @@ uint32_t nt_open_section(Process& p, const SyscallRequest& r) {
 namespace {
 // SECTION_IMAGE_INFORMATION (64 bytes) of an image section: what the PE headers say, as NtQuerySection answers it.
 uint32_t query_image_information(Process& p, const SyscallRequest& r, uint32_t id, const ObjectManager::SectionInfo& info, uint64_t length, uint64_t returned_at) {
-  if (!(info.attributes & 0x1000000u)) return 0xC000004Fu;      // STATUS_SECTION_NOT_IMAGE
   if (length < 64) return 0xC0000004u;
+  if (!(info.attributes & 0x1000000u)) return length > (uint64_t{1} << 32) ? kAccessViolation : 0xC000004Fu;      // STATUS_SECTION_NOT_IMAGE
   ObjectManager* objects = system_objects();
   uint8_t* storage = nullptr;
   uint64_t rounded = 0;
@@ -838,6 +857,8 @@ uint32_t map_view_in(Process& target, uint32_t id, uint64_t offset, uint64_t* ba
   if (!valid) return kInvalidParameter;
   uint64_t base = *base_in_out, view = *view_in_out;
   if (offset % 4096 != 0 || offset >= info.size) return kInvalidParameter;
+  const uint64_t limit = info.reported_size != 0 && info.reported_size < info.size ? info.reported_size : info.size;
+  if (view > limit - (offset < limit ? offset : limit) && info.reported_size != 0) return 0xC000001Fu;      // STATUS_INVALID_VIEW_SIZE
   if (view == 0 || view > info.size - offset) view = info.size - offset;
   uint64_t bytes = 0;
   if (!AddressSpace::round_up(view, &bytes)) return kInvalidParameter;
@@ -864,10 +885,11 @@ uint32_t unmap_view_in(Process& target, uint64_t address) {
   if (!space) return kNotImplemented;
   uint64_t base = 0, size = 0;
   PageAttributes attributes;
+  if (!space->attributes_at(address, &attributes) || attributes.type == PageAttributes::Private) return kStatusNotMappedView;      // (plain memory is not a view)
   if (space->attributes_at(address, &attributes) && attributes.type == PageAttributes::Image) {      // an image goes with all its pieces
     return space->allocation_base(address, &base) && space->unmap_allocation(base) ? kSuccess : kStatusNotMappedView;      // (any address of an image unmaps all of it)
   }
-  if (!space->allocation_extent(address, &base, &size) || base != address) return kStatusNotMappedView;
+  if (!space->allocation_extent(address, &base, &size)) return kStatusNotMappedView;      // (any address inside the view names it)
   return space->unmap(base, size) ? kSuccess : kStatusNotMappedView;
 }
 
@@ -884,6 +906,21 @@ uint32_t nt_unmap_view_of_section(Process& p, const SyscallRequest& r) {
   op.kind = IProcessRuntime::RemoteOp::Unmap;
   op.address = r.args[1];
   return p.runtime()->remote_operation(pid, op);
+}
+
+// NtAreMappedFilesTheSame(Address1, Address2): both have to lie in a view; the answer is yes for two addresses of one view and NOT_SAME_DEVICE for any other pair.
+uint32_t nt_are_mapped_files_the_same(Process& p, const SyscallRequest& r) {
+  constexpr uint32_t kInvalidAddress = 0xC0000141u, kConflictingAddresses = 0xC0000018u, kNotSameDevice = 0xC00000D4u;
+  AddressSpace* space = p.address_space();
+  if (!space) return kNotImplemented;
+  if (r.args[0] == 0 || r.args[1] == 0) return kInvalidAddress;
+  uint64_t base[2] = {};
+  for (uint32_t i = 0; i < 2; ++i) {
+    PageAttributes attributes;
+    if (!space->attributes_at(AddressSpace::round_down(r.args[i]), &attributes) || (attributes.type != PageAttributes::Mapped && attributes.type != PageAttributes::Image)) return kConflictingAddresses;
+    if (!space->allocation_base(AddressSpace::round_down(r.args[i]), &base[i])) return kConflictingAddresses;
+  }
+  return base[0] == base[1] ? kSuccess : kNotSameDevice;
 }
 
 // NtFlushVirtualMemory(Process, PVOID* BaseAddress, PSIZE_T RegionSize, PIO_STATUS_BLOCK): a view of a file goes back to the file.

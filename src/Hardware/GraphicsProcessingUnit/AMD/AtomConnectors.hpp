@@ -48,7 +48,26 @@ class AtomConnectors {
     bool has_ddc = false;
     uint8_t plugged_state = 0;        // ATOM_HPD_INT_RECORD's ucPlugged_PinState: the level of the GPIO when something is plugged in
     uint16_t devices = 0;             // the ATOM_DEVICE_*_SUPPORT bits of the devices that end in this connector
+    // The encoder objects of the display path (the ids after the connector and the GPU in ATOM_DISPLAY_OBJECT_PATH, from the GPU to the connector), as full object ids (type << 12,
+    // enumeration << 8, id): the first is the GPU's own encoder (a UNIPHY transmitter of a DIG), a second one is a bridge chip between it and the connector (NUTMEG, TRAVIS). 0: none.
+    uint16_t encoder_object = 0;
+    uint16_t bridge_object = 0;
   };
+
+  // ENCODER_OBJECT_ID_* (ObjectID.h): the ones that matter for a DCE 11 DIG, and the DisplayPort bridges
+  static constexpr uint8_t kEncoderNone = 0x00, kEncoderUniphy = 0x1E, kEncoderUniphy1 = 0x20, kEncoderUniphy2 = 0x21, kEncoderNutmeg = 0x22, kEncoderTravis = 0x23, kEncoderUniphy3 = 0x25;
+  static constexpr uint8_t kNoDig = 0xFF;
+  // ATOM_DEVICE_DFP_SUPPORT: DFP1..DFP6 (the digital flat panels: not the LCD, the CRTs, the TV and the CV)
+  static constexpr uint16_t kDfpDevices = 0x8 | 0x80 | 0x200 | 0x400 | 0x800 | 0x40;
+  static uint8_t encoder_id(const Connector& c) { return static_cast<uint8_t>(c.encoder_object); }
+  static uint8_t encoder_enum(const Connector& c) { return static_cast<uint8_t>(c.encoder_object >> 8 & 7); }
+  // amdgpu_encoder_atom_dig::linkb: the enumeration of the encoder object is 2 (the transmitter's link B)
+  static bool link_b(const Connector& c) { return encoder_enum(c) == 2; }
+  // dce_v11_0_pick_dig_encoder: the DIG encoder (0..6) of the connector's encoder: UNIPHY, UNIPHY1 and UNIPHY2 serve two (links A and B), UNIPHY3 one. kNoDig for any other encoder or none.
+  static uint8_t dig_encoder(const Connector& c);
+  // dce_v11_0_encoder_prepare: the audio format block (AFMT) of the DIG, which has the same number, only for digital flat panel devices (HDMI and DisplayPort, not the internal panel).
+  // Which audio endpoint it takes is the endpoint select in its AFMT_AUDIO_SRC_CONTROL; the driver gives it the first connected one (AmdVegaM::audio_pin_for).
+  static uint8_t afmt_instance(const Connector& c) { return (c.devices & kDfpDevices) ? dig_encoder(c) : kNoDig; }
 
   // The connector's name as the kernel's DRM names it: "HDMI-A-1", "DP-2", "eDP-1". `buffer` gets the text and a terminating zero, cut short if it does not fit.
   // HDMI and DisplayPort carry audio with the picture (the others the connector reader knows - analogue, DVI, LVDS, eDP - do not, in the sense of the audio endpoints being used for them).

@@ -290,6 +290,9 @@ uint32_t open_by_attributes(Process& p, uint64_t object_attributes, uint32_t acc
     files.set_metadata(virtual_path.view(), change);
   }
   if (files.kind(slot) == DescriptorKind::File) {
+    if (OpenObject* opened = files.object(slot)) opened->no_data_access = !(access & (kGenericRead | kGenericWrite | kGenericAll | kFileReadData | kFileWriteData | kFileAppendData | 0x20 | 0x20000000u));
+  }
+  if (files.kind(slot) == DescriptorKind::File) {
     OpenObject* opened = files.object(slot);
     opened->granted_access = access;
     opened->writable = (access & (kGenericAll | kGenericWrite | kFileWriteData | kFileAppendData)) != 0;      // (an overwrite writes through the file system's own handle, not the program's)
