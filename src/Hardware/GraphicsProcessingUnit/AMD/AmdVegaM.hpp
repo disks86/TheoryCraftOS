@@ -226,13 +226,28 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
   // writes the select field: enabling the endpoint (the hot plug control's AUDIO_ENABLED), the ELD and the audio clock are not done.
   bool select_audio_pin(const AtomConnectors::Connector& connector);
   uint32_t select_audio_pins();
-  // dce_v11_0_afmt_setmode's audio part: the endpoint of the connector (audio_pin_for) is disabled, given the monitor's speaker allocation, selected by the connector's audio format block
-  // (select_audio_pin), given its Short Audio Descriptors and its lip sync latency (`interlaced`: the mode's), and enabled (HOT_PLUG_CONTROL.AUDIO_ENABLED) - the hardware makes the ELD that the
-  // sound driver reads from those. `edid` is the whole EDID of the monitor (a missing or CTA-less one gives stereo speakers and no descriptors, as the driver does). The variant without an
-  // EDID reads it over the connector's DDC or AUX channel (read_edid) and is false if that fails. False also when the connector has no audio block or no endpoint is connected: nothing is
-  // written then. Not done: the audio clock (the DTO), the audio packets and the infoframes of dce_v11_0_afmt_setmode, so the endpoint is enabled but no sound is sent yet.
-  bool enable_audio(const AtomConnectors::Connector& connector, ConstByteView edid, bool interlaced = false);
-  bool enable_audio(const AtomConnectors::Connector& connector, bool interlaced = false);
+  // The mode the audio is set up for (dce_v11_0_afmt_setmode's drm_display_mode and the controller and depth of the encoder's crtc): the pixel clock for the audio clock and the N and CTS, the
+  // timing for the AVI InfoFrame, the controller whose timing the audio clock follows, and the bits per colour component (8, or 10 and 12 for deep colour). The default is 1920x1080 at 60 Hz.
+  struct AudioMode : HdmiMode {
+    uint32_t crtc = 0;
+    uint32_t bpc = 8;
+    AudioMode() {
+      clock_khz = 148500;
+      hdisplay = 1920;
+      vdisplay = 1080;
+      htotal = 2200;
+      vtotal = 1125;
+    }
+  };
+  // dce_v11_0_afmt_setmode, with the audio parts of it all: the endpoint of the connector (audio_pin_for) is disabled; the audio clock, the packets in the blanking and the audio clock
+  // regeneration are set up for the mode (amd_dce11::AudioFormat::setup_packets); the endpoint gets the monitor's speaker allocation, all eight channels are enabled, the connector's audio format
+  // block selects the endpoint (select_audio_pin), the endpoint gets its Short Audio Descriptors and its lip sync latency (the mode's: progressive or interlaced); the AVI InfoFrame of the mode is
+  // sent and the audio samples with it (AudioFormat::start); and the endpoint is enabled (HOT_PLUG_CONTROL.AUDIO_ENABLED). The hardware makes the ELD that the sound driver reads from the
+  // endpoint's registers. `edid` is the whole EDID of the monitor (a missing or CTA-less one gives stereo speakers and no descriptors, as the driver does). The variant without an EDID reads it
+  // over the connector's DDC or AUX channel (read_edid) and is false if that fails. False also when the connector has no audio block, no endpoint is connected, or the mode's controller does not
+  // exist: nothing is written then. Not done: an audio source - the audio samples come from the sound driver through the Azalia controller, which is not set up here.
+  bool enable_audio(const AtomConnectors::Connector& connector, ConstByteView edid, const AudioMode& mode = AudioMode());
+  bool enable_audio(const AtomConnectors::Connector& connector, const AudioMode& mode = AudioMode());
   // dce_v11_0_audio_enable(pin, false) for the endpoint the connector's block has selected. False if the connector has no audio block.
   bool disable_audio(const AtomConnectors::Connector& connector);
 

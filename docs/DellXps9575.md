@@ -772,11 +772,38 @@ AAC LC, DTS, ATRAC, E-AC-3, DTS-HD, MLP and WMA Pro: each holds the descriptor o
 descriptor; nothing at all for a monitor without descriptors) and `write_latency` (`RESPONSE_LIPSYNC`: the progressive or interlaced video and audio latency, 0 if the monitor gives none). `AmdVegaM::enable_audio(connector, edid,
 interlaced)` runs the driver's order: the endpoint (the first connected one, `audio_pin_for`) disabled, speaker allocation, the connector's audio format block selects the endpoint, descriptors, latency, endpoint enabled; the variant without
 an EDID reads it first (`read_edid`, over DDC or AUX) and fails with it. A monitor without a CTA extension, or an empty EDID, gives stereo speakers, untouched descriptor registers and no latency, as the driver. `disable_audio` is
-`dce_v11_0_audio_enable(pin, false)` for the endpoint the connector's block has selected. Nothing is written for a connector without an audio block or when no endpoint is connected. Nothing calls these by itself.
+`dce_v11_0_audio_enable(pin, false)` for the endpoint the connector's block has selected. Nothing is written for a connector without an audio block or when no endpoint is connected. Nothing calls these by itself. (The audio clock and the packets are the next section's: `enable_audio` does them too now.)
 
 **Difference from the driver:** `dce_v11_0_audio_write_latency_fields` computes the video latency and then the audio latency from zero again, so only the audio latency ever reaches the register; `write_latency` puts both in
-(the intended value). **Not done:** the audio clock (DTO) and the audio packets and infoframes of `dce_v11_0_afmt_setmode`, so the endpoint is enabled but no sound is sent; the audio output to play through; the ELD proper for
+(the intended value). **Not done:** the audio output to play through; the ELD proper for
 a driver that wants the bytes (monitor name, manufacturer, connection type, SAD count). **Not checked:** `drm_edid.c` (the SAD, speaker and vendor block parsing is from memory) and the audio coding type numbers
 (`hdmi.h`); `scripts/check_audio_port.py <dce_v11_0.c> <dce_11_2_d.h> <dce_11_2_sh_mask.h>` checks the rest against the driver: the descriptor registers and their coding types, the SAD loop, the speaker allocation, the enable write, the
 latency fields, the register and field numbers, and the order of the steps in `dce_v11_0_afmt_setmode` against `enable_audio`. Tested by `EdidAudioTest` and `AmdVegaMTest::test_audio_enable` (a simulated endpoint with indexed registers,
 `tests/FakeAzalia.hpp`: the write order and every value of the rich EDID worked out by hand, the DDC-read variant, a monitor without audio data, endpoint changes, the driver's descriptor rules).
+
+### The audio clock, the packets and the AVI InfoFrame
+
+For the endpoint to carry sound the display engine has to send the audio in the blanking of the picture and a clock the sink can regenerate it from. `AmdVegaM::enable_audio(connector, edid, mode)` does all of
+`dce_v11_0_afmt_setmode`'s audio parts now, in the driver's order (`scripts/check_hdmi_port.py` compares the register-by-register sequence with the driver's function): the endpoint is disabled, then
+`AudioFormat::setup_packets(block, crtc, clock_khz, bpc)` does the audio clock - `dce_v11_0_audio_set_dto`: `DCCG_AUDIO_DTO_SOURCE.DCCG_AUDIO_DTO0_SOURCE_SEL` is the display controller whose timing it follows, `DCCG_AUDIO_DTO0_PHASE`
+24000 and `DCCG_AUDIO_DTO0_MODULE` the pixel clock in kHz, i.e. 24 MHz / pixel clock as a ratio - and the packets of the audio format block (null packets; the general control packet every frame, with deep colour for 10 and
+12 bits per component, off for 0, 6, 8, 16 and anything else; the audio info frame every frame; the audio packet delay; the 60958 channel status update and the channel numbers 1 to 8; the audio clock regeneration packet
+with the software CTS value unless there is deep colour, sent automatically); then the speaker allocation, `enable_channels` (all eight channels), the block's endpoint selection, the descriptors and the lip sync latency;
+then `AudioFormat::start`, which writes the AVI InfoFrame into `AFMT_AVI_INFO0..3` and sends it every frame on line 2, sends the audio samples and sets the ramp test registers; and the endpoint is enabled last.
+Nothing is written for a controller that does not exist (`mode.crtc` 6 and up) or when the connector has no audio block or no endpoint is connected.
+
+`Hdmi::acr(clock_khz)` is `amdgpu_afmt_acr`: the N and CTS of the audio clock regeneration packet for 32, 44.1 and 48 kHz audio: the driver's predefined rows for 25.175, 25.2, 27, 27.027, 54, 54.054, 74.176,
+74.25, 148.352 and 148.5 MHz, otherwise calculated as `amdgpu_afmt_calc_cts` does (the fraction 128 fs / clock in lowest terms, N scaled up to the first value at or above 128 fs / 1000: 4096 / 65000, 7056 / 81250 and
+6144 / 65000 for 65 MHz). `Hdmi::vic(mode)` is `drm_match_cea_mode` for the CEA modes that matter (the 640x480 to 3840x2160 modes with their active size, scan, double clock and nominal refresh within half a percent;
+4:3 and 16:9 twins by `picture_aspect`, the first otherwise), and `Hdmi::avi_infoframe(mode, out)` the 17 bytes `hdmi_avi_infoframe_pack` makes for what `drm_hdmi_avi_infoframe_from_display_mode` fills in: RGB, no
+bars, the active format "as the picture" (A0 and active aspect 8), the picture aspect, the VIC (0 for no CEA mode) and the pixel repeat of a double clocked mode, with the checksum. The mode is the caller's
+(`AmdVegaM::AudioMode`: the timing, the controller and the bits per component; the default is 1920x1080 at 60 Hz on controller 0, 8 bits).
+
+**Checked** against `dce_v11_0.c` by `scripts/check_hdmi_port.py`: the order of the register writes, the constants (CRC control 0x1000, the ramp registers, the DTO phase, the info frame line, the audio packets per line,
+the channel enable mask and numbers, the deep colour settings, the software CTS rule) and the AVI words. `HdmiInfoframeTest` checks the predefined N/CTS rows against the HDMI formula (CTS = clock N / (128 fs) within 0.02 %),
+the calculated values by hand (13.5, 65 MHz, edge cases), the mode matching with the standard timings, its tolerance, and the InfoFrame bytes with their checksum; `AmdVegaMTest::test_audio_packets` checks the registers
+of the HDMI-A (DIG 2) and DisplayPort (DIG 3) blocks for 1080p60 and 480i with values worked out by hand from the previous contents of the registers (fields written alone leave the rest). **Not checked:**
+`amdgpu_afmt.c` itself (its rows are from memory, but the formula check would catch a wrong one), `drm_edid.c`'s CEA mode table and `hdmi.c`'s packing (the VIC table and the InfoFrame bytes are from memory of
+them; the VIC is information for the sink, a wrong one does not stop the audio). **Not done:** a source for the audio samples - they come from the sound driver through the Azalia controller (HD Audio), which is not set up
+here, so the endpoint now announces what it can do and is ready, but plays nothing; the audio InfoFrame (the hardware builds it), HDMI vendor InfoFrames (4K, 3D), the DisplayPort audio secondary data packets (the driver sets
+DisplayPort up as HDMI too, and so does this).

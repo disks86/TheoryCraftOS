@@ -1708,11 +1708,13 @@ static void test_audio_enable() {
   CHECK(azalia.value(2, 0x37) == 0x281Eu);              // lip sync, progressive: video 30, audio 40
   CHECK(azalia.value(2, 0x54) == 0x80000000u && (rig.card.gfx.reg(0x4c45) & 7) == 2 && (rig.card.gfx.reg(0x4c45) & ~7u) == 0xAB000000u);      // enabled; the block takes endpoint 2
   // interlaced: the other latencies
-  CHECK(vega.enable_audio(hdmi, ConstByteView(edid.data(), edid.size()), true) && azalia.value(2, 0x37) == 0x3C32u);
+  AmdVegaM::AudioMode interlaced;
+  interlaced.interlaced = true;
+  CHECK(vega.enable_audio(hdmi, ConstByteView(edid.data(), edid.size()), interlaced) && azalia.value(2, 0x37) == 0x3C32u);
   // the EDID read over the connector's DDC lines
   azalia.writes.clear();
   CHECK(vega.enable_audio(hdmi) && azalia.writes.size() == 16 && azalia.value(2, 0x29) == 0x00500705u);
-  CHECK(vega.enable_audio(hdmi, true) && azalia.value(2, 0x37) == 0x3C32u);
+  CHECK(vega.enable_audio(hdmi, interlaced) && azalia.value(2, 0x37) == 0x3C32u);
   monitor.present = false;
   azalia.writes.clear();
   CHECK(!vega.enable_audio(hdmi) && azalia.writes.empty());          // (no EDID, nothing touched)
@@ -1805,6 +1807,118 @@ static void test_audio_enable() {
   azalia.connectivity[2] = 0;
   azalia.writes.clear();
   CHECK(!vega.enable_audio(hdmi, ConstByteView(edid.data(), edid.size())) && !vega.disable_audio(hdmi) && azalia.writes.empty());
+}
+
+// The audio clock, the packets in the blanking and the AVI InfoFrame of dce_v11_0_afmt_setmode, in the registers of the connector's audio format block (HDMI-A: DIG 2, at +0x200; DisplayPort: DIG 3, at
+// +0x300). Register numbers and field positions are literal (from the headers), the values worked out by hand from the registers' previous contents; the previous contents are not zero, so
+// the fields written alone are seen to be.
+static void test_audio_packets() {
+  const std::vector<uint8_t> vbios = make_connector_vbios();
+  Rig rig;
+  FakeAzalia azalia;
+  rig.card.azalia = &azalia;
+  azalia.connectivity[2] = 0;
+  for (uint32_t pin = 0; pin < 3; ++pin) rig.card.gfx.set_reg(0x1898 + 8 * pin, 0x2);
+  AmdVegaM vega(rig.alloc);
+  AmdVegaM::Inputs in = rig.inputs();
+  in.hpd_pins = 0x0F;
+  in.vbios = ConstByteView(vbios.data(), vbios.size());
+  CHECK(vega.bring_up(in));
+  if (!vega.up()) return;
+  const AtomConnectors::Connector hdmi = vega.connectors()[1], dp = vega.connectors()[2];
+  const std::vector<uint8_t> plain = make_edid(0);
+  const ConstByteView edid(plain.data(), plain.size());
+  // the registers of block `n` (at +0x100 * n from DIG 0's) with the contents they had before
+  const auto prefill = [&](uint32_t off) {
+    const struct { uint32_t reg, value; } pre[] = {{0x4a09, 0x0F0F0F0Fu}, {0x4a0b, 0xFFFFFFFFu}, {0x4a0c, 0}, {0x4a0d, 0xA5A5A5A5u}, {0x4a0e, 0}, {0x4a0f, 0xC0C0C0C0u}, {0x4a13, 0xFFFFFFFFu},
+                                                   {0x4a14, 0}, {0x4a1e, 0xFFFFFFFFu}, {0x4a1f, 0xFFFFFFFFu}, {0x4a20, 0xFFFFFFFFu}, {0x4a21, 0xFFFFFFFFu}, {0x4a2e, 0xFFFFFFFFu},
+                                                   {0x4a2f, 0xFFFFFFFFu}, {0x4a30, 0xFFFFFFFFu}, {0x4a31, 0xFFFFFFFFu}, {0x4a32, 0xFFFFFFFFu}, {0x4a33, 0xFFFFFFFFu}, {0x4a38, 0},
+                                                   {0x4a39, 0}, {0x4a3a, 0xFFFFFFFFu}, {0x4a3b, 0xFFFFFFFFu}, {0x4a3c, 0xFFFFFFFFu}, {0x4a3d, 0xFFFFFFFFu}, {0x4a3e, 0xFFFFFFFFu},
+                                                   {0x4a3f, 0}, {0x4a42, 0}, {0x4a44, 0}};
+    for (const auto& r : pre) rig.card.gfx.set_reg(r.reg + off, r.value);
+  };
+  const auto reg = [&](uint32_t r) { return rig.card.gfx.reg(r); };
+  prefill(0x200);
+  rig.card.gfx.set_reg(0x16b, 0xFFFFFFFFu);
+  AmdVegaM::AudioMode mode;           // 1920x1080 at 60 Hz, 148.5 MHz, 8 bits
+  mode.crtc = 3;
+  CHECK(vega.enable_audio(hdmi, edid, mode));
+  // the audio clock: DTO 0 follows controller 3, 24 MHz over the pixel clock
+  CHECK(reg(0x16b) == 0xFFFFFFFBu && reg(0x16c) == 24000 && reg(0x16d) == 148500);
+  // the packets
+  CHECK(reg(0x4c0d) == 0xA5A5A5B5u);          // HDMI_VBI_PACKET_CONTROL: null packets (bit 0), general control (bit 4), every frame (bit 5)
+  CHECK(reg(0x4c3a) == 0x1000);               // AFMT_AUDIO_CRC_CONTROL
+  CHECK(reg(0x4c09) == 0x0E0F0F0Fu);          // HDMI_CONTROL: no deep colour (bit 24 and bits 29:28 cleared)
+  CHECK(reg(0x4c0e) == 0x33);                 // HDMI_INFOFRAME_CONTROL0: audio info send and cont (0x30), AVI info send and cont (0x03)
+  CHECK(reg(0x4c44) == 0x80);                 // AFMT_INFOFRAME_CONTROL0: audio info update
+  CHECK(reg(0x4c0f) == 0xC0C0C2C2u);          // HDMI_INFOFRAME_CONTROL1: audio info line (bits 13:8) and AVI info line (5:0) 2
+  CHECK(reg(0x4c13) == 0);                    // HDMI_GC: no AVMUTE
+  CHECK(reg(0x4c0b) == 0xFFE3FFDFu);          // HDMI_AUDIO_PACKET_CONTROL: delay enable (5:4) 1, packets per line (20:16) 3
+  CHECK(reg(0x4c42) == 0x04000001u);          // AFMT_AUDIO_PACKET_CONTROL: 60958 channel status update (bit 26), audio samples sent (bit 0)
+  CHECK(reg(0x4c0c) == 0x1100);               // HDMI_ACR_PACKET_CONTROL: the software CTS (bit 8) and automatic sending (bit 12)
+  // the audio clock regeneration: the table's row for 148.5 MHz: N 4096 / CTS 148500 at 32 kHz, 6272 / 165000 at 44.1, 6144 / 148500 at 48 (CTS in bits 31:12, N in 19:0)
+  CHECK(reg(0x4c2e) == 0x24414FFFu && reg(0x4c2f) == 0xFFF01000u && reg(0x4c30) == 0x28488FFFu && reg(0x4c31) == 0xFFF01880u && reg(0x4c32) == 0x24414FFFu && reg(0x4c33) == 0xFFF01800u);
+  // the channel status: channel numbers 1 and 2 (bits 23:20 of 60958_0 and _1), 3 to 8 in the nibbles of 60958_2
+  CHECK(reg(0x4c38) == 0x00100000u && reg(0x4c39) == 0x00200000u && reg(0x4c3f) == 0x00876543u);
+  CHECK(reg(0x4c14) == 0xFF00);               // all eight channels enabled
+  // the AVI InfoFrame of 1080p60: VIC 16, 16:9 (checksum 0x27, PB1 0x10, PB2 0x28, PB4 16), version 2
+  CHECK(reg(0x4c1e) == 0x00281027u && reg(0x4c1f) == 0x00000010u && reg(0x4c20) == 0 && reg(0x4c21) == 0x02000000u);
+  CHECK(reg(0x4c3b) == 0x00FFFFFFu && reg(0x4c3c) == 0x007FFFFFu && reg(0x4c3d) == 1 && reg(0x4c3e) == 1);       // the ramp test registers
+  CHECK((reg(0x4c45) & 7) == 2);              // the endpoint selected
+  CHECK(azalia.value(2, 0x54) == 0x80000000u && azalia.writes.back().index == 0x54 && azalia.writes.back().value == 0x80000000u);   // and enabled last
+  // the other block is not touched
+  CHECK(reg(0x4d09) == 0 && reg(0x4d0d) == 0 && reg(0x4d1e) == 0 && reg(0x4b0d) == 0);
+  // deep colour: 10 bits, and 12; the software CTS only without deep colour
+  mode.bpc = 10;
+  prefill(0x200);
+  CHECK(vega.enable_audio(hdmi, edid, mode) && reg(0x4c09) == 0x1F0F0F0Fu && reg(0x4c0c) == 0x1000);
+  mode.bpc = 12;
+  prefill(0x200);
+  CHECK(vega.enable_audio(hdmi, edid, mode) && reg(0x4c09) == 0x2F0F0F0Fu && reg(0x4c0c) == 0x1000);
+  for (uint32_t bpc : {0u, 6u, 8u, 16u, 7u, 11u}) {
+    mode.bpc = bpc;
+    prefill(0x200);
+    CHECK(vega.enable_audio(hdmi, edid, mode) && reg(0x4c09) == 0x0E0F0F0Fu && reg(0x4c0c) == (bpc > 8 ? 0x1000u : 0x1100u));
+  }
+  // another mode: 720x480 interlaced, double clocked, 13.5 MHz, 4:3 (VIC 6), on the DisplayPort connector's block (DIG 3, +0x300) and controller 1; the odd pixel clock is calculated
+  AmdVegaM::AudioMode ntsc;
+  ntsc.clock_khz = 13500;
+  ntsc.hdisplay = 720;
+  ntsc.vdisplay = 480;
+  ntsc.htotal = 858;
+  ntsc.vtotal = 525;
+  ntsc.interlaced = true;
+  ntsc.double_clock = true;
+  ntsc.crtc = 1;
+  prefill(0x300);
+  CHECK(vega.enable_audio(dp, edid, ntsc));
+  CHECK(reg(0x16c) == 24000 && reg(0x16d) == 13500 && (reg(0x16b) & 7) == 1);
+  // PB1 0x10, PB2 4:3 (1 << 4) | 8 = 0x18, PB4 VIC 6, PB5 pixel repeat 1: checksum 256 - (0x82 + 2 + 13 + 0x10 + 0x18 + 6 + 1) = 256 - 0xC0 = 0x40
+  CHECK(reg(0x4d1e) == (0x40u | 0x10u << 8 | 0x18u << 16) && reg(0x4d1f) == (6u | 1u << 8) && reg(0x4d21) == 0x02000000u);
+  // 13.5 MHz is not in the table, so it is calculated: 128 * 32000 / 13500000 = 1024 / 3375 in lowest terms, scaled by 4 to N >= 4096: 4096 / 13500; 44.1 kHz: 784 / 1875, scaled by 8 to
+  // N >= 5644: 6272 / 15000; 48 kHz: 512 / 1125, scaled by 12 to N >= 6144: 6144 / 13500
+  CHECK(reg(0x4d2e) == (13500u << 12 | 0xFFFu) && reg(0x4d2f) == 0xFFF01000u);
+  CHECK(reg(0x4d30) == (15000u << 12 | 0xFFFu) && reg(0x4d31) == 0xFFF01880u && reg(0x4d32) == (13500u << 12 | 0xFFFu) && reg(0x4d33) == 0xFFF01800u);
+  // the AVI words of a frame with every byte different (the InfoFrames made by Hdmi have zeros in the bar bytes): header 0x82 at [0], version at [1]; the checksum and the data from [3] go into
+  // INFO0..2 four bytes each, the last two data bytes and the version into INFO3
+  uint8_t frame[17];
+  for (uint32_t i = 0; i < 17; ++i) frame[i] = static_cast<uint8_t>(0x10 + i);
+  amd_dce11::AudioFormat blocks(*rig.inputs().registers);
+  CHECK(blocks.start(2, ConstByteView(frame, 17)));
+  CHECK(reg(0x4c1e) == 0x16151413u && reg(0x4c1f) == 0x1A191817u && reg(0x4c20) == 0x1E1D1C1Bu && reg(0x4c21) == 0x1100201Fu);
+  // a short frame, a block or controller that does not exist: nothing is written
+  const size_t before = rig.card.gfx.writes.size();
+  CHECK(!blocks.start(2, ConstByteView(frame, 16)) && !blocks.start(6, ConstByteView(frame, 17)) && !blocks.setup_packets(6, 0, 148500, 8) && !blocks.setup_packets(2, 6, 148500, 8) &&
+        !blocks.setup_packets(2, 0xFFFFFFFFu, 148500, 8) && !blocks.enable_channels(6) && !blocks.enable_channels(0xFFFFFFFFu));
+  CHECK(rig.card.gfx.writes.size() == before);
+  // a controller that does not exist: nothing is written
+  const size_t writes = rig.card.gfx.writes.size();
+  const size_t endpoint_writes = azalia.writes.size();
+  AmdVegaM::AudioMode bad;
+  bad.crtc = 6;
+  CHECK(!vega.enable_audio(hdmi, edid, bad) && !vega.enable_audio(dp, edid, bad));
+  CHECK(azalia.writes.size() == endpoint_writes && rig.card.gfx.writes.size() == writes);
+  vega.shutdown();
 }
 
 // The sink's DPCD over the AUX channel of the DisplayPort and eDP connectors (through the video BIOS's table, with the panel power-up for the eDP one).
@@ -2191,6 +2305,7 @@ int main() {
   test_read_edid();
   test_audio_select();
   test_audio_enable();
+  test_audio_packets();
   test_read_dpcd();
   test_short_pulse_status();
   printf(g_failed ? "AmdVegaMTest: %d FAILED\n" : "AmdVegaMTest: all passed\n", g_failed);
