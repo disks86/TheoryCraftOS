@@ -387,12 +387,20 @@ for each plug and unplug (`take_hotplug()`: the pin, whether a display is connec
 drains the queue after `service_interrupts()` and, for each event, writes a line to the debug console and shows a toast ("A display was connected to HDMI-A-1 of the Radeon RX Vega M"; "Hot plug detection of DP-1 on the Radeon RX Vega M is switched off: it
 kept changing" as a warning); at boot the outputs that already have a display are logged. That is all there is to do about it for now: the card's outputs are not part of the desktop (the OS cannot put a
 picture on them: no mode setting without the AtomBIOS command tables for the encoders and PLLs, and no DDC/EDID read of the monitor on the other end), so a plug cannot add a monitor to the desktop's layout. Which connector a pin is
-on comes from the video BIOS (next section); without one, or for a pin it does not list, the text says "output 2". Not done: the audio and DP short-pulse (`DC_HPD_RX_INT`) interrupts; recovery from a fault is above.
+on comes from the video BIOS (next section); without one, or for a pin it does not list, the text says "output 2". Not done: the audio interrupts; recovery from a fault is above.
 
 The vertical line interrupt is enabled like the vertical blank: `AmdVegaM::set_vline_interrupt(true)` sets `LB_INTERRUPT_MASK.VLINE_INTERRUPT_MASK` (bit 4, `dce_v11_0_set_crtc_vline_interrupt_state`; `amd_dce11::Interrupts::set_vline`) of the
 controller that shows the OS's framebuffer, and only that one; it is refused without an engaged display, independent of the vblank bit (neither touches the other), and switched off when the display is given back or the card
 stopped. The handler acknowledges with `LB_VLINE_STATUS.VLINE_ACK` when `DISP_INTERRUPT_STATUS*` says it is pending, and counts per controller (`AmdIrq::vline_count`). Like the driver, nothing programs which line it comes at.
 It has no user in the OS yet (nothing needs a mid-frame callback); a test (`test_vline_interrupt`) covers enable, bits kept, independence from vblank, ack, counting and the off paths.
+
+The DisplayPort short pulse (a sink's status change that is not a plug: link loss, a request to retest) arrives as source 42 with data 6..11 (`VISLANDS30_IV_EXTID_HPD_RX_A..F`, pins 0..5), `AmdIrq::Kind::DisplayHpdRx`.
+`AmdVegaM::bring_up` switches it on for the watched pins after `hpd_init` (`DC_HPD_INT_CONTROL.DC_HPD_RX_INT_EN`, a stale pulse acknowledged first) and `hpd_fini` off. A vector counts when `DC_HPD_INT_STATUS.DC_HPD_RX_INT_STATUS`
+says it is pending; it is acknowledged (`DC_HPD_RX_INT_ACK`), counted per pin (`AmdIrq::hpd_rx_count`), shown to the event observer, and is not a hot plug (no `HotplugEvent`, `connected_pins` unchanged). A pin that pulses more
+than `kHpdRxStormLimit` (256) times has the interrupt switched off (`hpd_rx_throttled`). **Provenance:** the ids come from `ivsrcid_vislands30.h`, the bits from `dce_11_2_sh_mask.h` (both checked by
+`check_irq_port.py`), but the kernel's `dce_v11_0.c` never uses the pulse; the way to enable, read and acknowledge it is that of the DC display code (`dce110_irq_service.c`), written here from memory of it, not checked
+against its source. **What is not done with it:** a real handler reads the sink's DPCD over the AUX channel (link status, automated test request) and retrains; there is no AUX channel or mode setting here, so the pulse is only
+counted.
 
 ### Connector names from the video BIOS's object table
 
@@ -494,7 +502,9 @@ checks the constants, the alignment tables, the generated opcode table (`scripts
 **Where the video BIOS image comes from.** `AmdVbios` (`AmdVbios.*`) finds it, following `amdgpu_bios.c` in the order of `amdgpu_get_bios_dgpu`: (0) the ACPI ATRM method, an AML method (`ATRM(offset, length)`, returning a buffer of the ROM's bytes) of the card's device in the firmware's tables,
 called for pages of 4096 bytes from offset 0 until one comes back short, into a 256 KiB image (`read_from_atrm`; see below); (1) the ACPI VFCT table, which holds the firmware's copy of the
 video BIOS images of its AMD cards - `find_in_vfct` walks the images (28-byte headers: PCI bus, device, function, vendor and device ID, length) and takes the one for this function, as a view into the table;
-(2) the PCI expansion ROM - `read_from_rom_bar` probes the ROM base register for the window size, switches the ROM on at the base the firmware assigned (no base, no ROM), maps the window, copies it,
+(1b) the legacy shadow at 0xC0000 (`read_from_legacy_shadow`, `amdgpu_read_platform_bios`: 128 KiB copied, the driver's `pdev->rom`/`romlen` that the PCI core sets for the boot display's shadowed ROM) - but the driver
+knows from the PCI core that the shadow is the card's and this does not, so the image must name the card in its PCI data structure (vendor and device ID, `rom_ids`); the integrated graphics' shadow, which is what a laptop with
+two cards normally has there, is refused; (2) the PCI expansion ROM - `read_from_rom_bar` probes the ROM base register for the window size, switches the ROM on at the base the firmware assigned (no base, no ROM), maps the window, copies it,
 switches it off, and trims the copy to the chained images (`rom_size` is the PCI core's `pci_get_rom_size`: each image gives its length in 512-byte units and whether it is the last); (3) the card's own ROM through the SMC's
 index and data registers (`vi_read_bios_from_rom`: header first, checked for 0xAA55 and the AMD string, then the length it names). Every image passes `check_atom_bios` (0xAA55, a header pointer at 0x48, "ATOM" or "MOTA" at
 its offset 4). `main.cpp` looks only when the card may be reset (otherwise nothing would use the image) and `AmdVegaM::bring_up` keeps its own copy, so the buffers need not outlive the call. **The ATRM method** runs on the repository's AML interpreter (`acpi::AmlInterpreter`) with the DSDT and SSDTs loaded; `main.cpp` makes one for the look and drops it afterwards (the machine's
@@ -502,7 +512,12 @@ operation regions are reached through `SystemAcpiHost`, as for the battery). The
 the device is found by walking it: first a device that has an `ATRM` method of its own and whose own `_ADR` is the card's (`device << 16 | function`), then, as the driver would, the first device that has one. The walk is
 bounded (4096 nodes, 16 deep). Where the driver copies whatever length the method returns, a page that is not a buffer or is longer than the 4096 asked for ends the reading; the image is checked with `check_atom_bios` as
 the driver does. Not done: the `_INI` methods are not run before the call, and the method is not given the PCI bus (the `_ADR` match cannot tell two cards at the same device and function on different buses apart).
-Not done also: the legacy shadow at 0xC0000, the copy in video memory (SR-IOV) and the "disabled ROM" path that clears the card's ROM disable bits.
+**The disabled ROM** is the last resort (`read_from_disabled_rom`, `vi_read_disabled_bios` then `amdgpu_read_bios`): for a card whose firmware switched its expansion ROM off, `BUS_CNTL.BIOS_ROM_DIS` is cleared,
+the VGA mode and timing select of the first two display controllers (`D1VGA_CONTROL`, `D2VGA_CONTROL`) and `VGA_RENDER_CONTROL`'s status select are cleared (only if the card has display controllers,
+`Sources::display_engine`, true for the Vega M), `ROM_CNTL` (an SMC register, through the index/data pair) gets `SCK_OVERWRITE`, the expansion ROM is read as in (2), and every register is put back in the same order,
+found or not. It needs the register BAR, the PCI function (a ROM base must have been assigned) and the mapper. `scripts/check_vbios_port.py` (with the three optional register headers) checks the order of the writes and the
+register numbers and masks against `vi.c` and the headers; the test has a card whose ROM answers only once all of it is unlocked (a fake that is stricter than hardware may be, on purpose), checks the exact writes with and
+without display controllers, the restore after a failure, and the place in the order. Not done: the copy in video memory (SR-IOV). **Still unseen:** whether any of this machine's sources is the one that works.
 Tested with hand-assembled AML for the ATRM method (a short page, a page and a short one, two devices told apart by `_ADR`, a name that is not a method, a method on something that is not a device, failing and wrong-typed methods, an endless supply of pages, every truncation and flipped bit of the table), a simulated VFCT table (several cards, truncations, bit flips in every header byte), an expansion ROM behind a working ROM base register, and the SMC pair (`AmdVbiosTest`), and `scripts/check_vbios_port.py` checks
 the signatures, the order, the VFCT layout and the register protocol against the kernel. **Still not seen:** the real machine's VFCT or ROM: whether this machine has a VFCT entry for the Vega M, and whether its table 0 trains the memory.
 

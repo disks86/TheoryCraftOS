@@ -25,6 +25,8 @@ namespace process::windowsabi {
 
 uint32_t nt_create_thread_ex(Process& p, const SyscallRequest& r);
 uint32_t nt_terminate_thread(Process& p, const SyscallRequest& r);
+// NtTerminateProcess(NULL, code): every thread of the process but the caller ends with `code`, and no thread can be made afterwards.
+uint32_t terminate_other_threads(Process& p, uint32_t code);
 uint32_t nt_resume_thread(Process& p, const SyscallRequest& r);
 uint32_t nt_suspend_thread(Process& p, const SyscallRequest& r);
 uint32_t nt_get_context_thread(Process& p, const SyscallRequest& r);

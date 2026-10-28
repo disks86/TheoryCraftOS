@@ -54,16 +54,17 @@ class AmdIrq {
     DisplayVline,               // dce_v11_0_crtc_irq, data 1
     DisplayPageFlip,            // dce_v11_0_pageflip_irq
     DisplayHotplug,             // dce_v11_0_hpd_irq
+    DisplayHpdRx,               // source 42, data 6..11: the short pulse of a DisplayPort sink on pin 0..5 (VISLANDS30_IV_EXTID_HPD_RX_A..F)
     UvdFence,                   // uvd_v6_0_process_interrupt, 124
     UvdEncodeFence,             // uvd_v6_0_process_interrupt, 119 and 120
     VceFence,                   // vce_v3_0_process_interrupt
   };
-  static constexpr uint32_t kKinds = 17;
+  static constexpr uint32_t kKinds = 18;
   static const char* kind_name(Kind kind);
 
   // The source ids (ivsrcid_vislands30.h; the SDMA illegal instruction has a bare 241 in sdma_v3_0_sw_init).
   static constexpr uint32_t kSrcCpEndOfPipe = 181, kSrcCpPrivRegFault = 184, kSrcCpPrivInstrFault = 185, kSrcCpEccError = 197, kSrcSqInterruptMsg = 239;
-  static constexpr uint32_t kSrcDisplayCrtcFirst = 1, kSrcPageFlipFirst = 8, kSrcPageFlipLast = 18, kSrcHotplugDetect = 42;
+  static constexpr uint32_t kSrcDisplayCrtcFirst = 1, kSrcPageFlipFirst = 8, kSrcPageFlipLast = 18, kSrcHotplugDetect = 42, kDataHpdRxFirst = 6;
   static constexpr uint32_t kSrcUvdEncodeFirst = 119, kSrcUvdSystemMessage = 124, kSrcVceTrap = 167;
   static constexpr uint32_t kSrcSdmaTrap = 224, kSrcSdmaIllegalInstruction = 241, kSrcSdmaSrbmWrite = 247;
   static constexpr uint32_t kSrcGfxPageInvFault = 146, kSrcGfxMemProtFault = 147;
@@ -138,6 +139,10 @@ class AmdIrq {
   bool hpd_connected(uint32_t pin) const { return pin < amd_dce11::Interrupts::kMaxHpd && (connected_ >> pin & 1); }   // as of the last hot plug on the pin
   // A pin that interrupted more than kHotplugStormLimit times is switched off (a connector that bounces, or a pin that is not what it seems, would otherwise keep the CPU busy).
   static constexpr uint32_t kHotplugStormLimit = 256;
+  // The short pulses, per pin; a pin that pulses more than kHpdRxStormLimit times has its short pulse interrupt switched off (the same guard).
+  static constexpr uint32_t kHpdRxStormLimit = 256;
+  uint32_t hpd_rx_count(uint32_t pin) const { return pin < amd_dce11::Interrupts::kMaxHpd ? hpd_rxs_[pin] : 0; }
+  bool hpd_rx_throttled(uint32_t pin) const { return pin < amd_dce11::Interrupts::kMaxHpd && (rx_throttled_ >> pin & 1); }
   bool hpd_throttled(uint32_t pin) const { return pin < amd_dce11::Interrupts::kMaxHpd && (throttled_ >> pin & 1); }
 
  private:
@@ -149,9 +154,9 @@ class AmdIrq {
   uint32_t unknown_[256] = {};
   uint32_t total_ = 0;
   amd_dce11::Interrupts display_;
-  uint32_t vblanks_[amd_dce11::kMaxCrtcs] = {}, vlines_[amd_dce11::kMaxCrtcs] = {}, pageflips_[amd_dce11::kMaxCrtcs] = {}, hotplugs_[amd_dce11::Interrupts::kMaxHpd] = {};
+  uint32_t vblanks_[amd_dce11::kMaxCrtcs] = {}, vlines_[amd_dce11::kMaxCrtcs] = {}, pageflips_[amd_dce11::kMaxCrtcs] = {}, hotplugs_[amd_dce11::Interrupts::kMaxHpd] = {}, hpd_rxs_[amd_dce11::Interrupts::kMaxHpd] = {};
   uint32_t uvd_encode_[2] = {}, vce_[3] = {};
-  uint32_t connected_ = 0, throttled_ = 0;
+  uint32_t connected_ = 0, throttled_ = 0, rx_throttled_ = 0;
   VmFaultInfo last_vm_fault_;
   SqInfo last_sq_;
 };

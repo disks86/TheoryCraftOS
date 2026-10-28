@@ -226,6 +226,24 @@ void Interrupts::hpd_set_interrupt(uint32_t pin, bool enable) {
   r_.write(mmDC_HPD_INT_CONTROL + kHpdOffsets[pin], tmp);
 }
 
+void Interrupts::hpd_rx_set_interrupt(uint32_t pin, bool enable) {
+  if (pin >= kMaxHpd) return;
+  uint32_t tmp = r_.read(mmDC_HPD_INT_CONTROL + kHpdOffsets[pin]);
+  tmp = REG_SET_FIELD(tmp, DC_HPD_INT_CONTROL, DC_HPD_RX_INT_EN, enable ? 1 : 0);
+  r_.write(mmDC_HPD_INT_CONTROL + kHpdOffsets[pin], tmp);
+}
+
+bool Interrupts::hpd_rx_asserted(uint32_t pin) {
+  return pin < kMaxHpd && (r_.read(mmDC_HPD_INT_STATUS + kHpdOffsets[pin]) & DC_HPD_INT_STATUS__DC_HPD_RX_INT_STATUS_MASK) != 0;
+}
+
+void Interrupts::ack_hpd_rx(uint32_t pin) {
+  if (pin >= kMaxHpd) return;
+  uint32_t tmp = r_.read(mmDC_HPD_INT_CONTROL + kHpdOffsets[pin]);
+  tmp = REG_SET_FIELD(tmp, DC_HPD_INT_CONTROL, DC_HPD_RX_INT_ACK, 1);
+  r_.write(mmDC_HPD_INT_CONTROL + kHpdOffsets[pin], tmp);
+}
+
 void Interrupts::hpd_init(uint32_t pin) {
   if (pin >= kMaxHpd) return;
   uint32_t tmp = r_.read(mmDC_HPD_CONTROL + kHpdOffsets[pin]);
@@ -248,6 +266,7 @@ void Interrupts::hpd_fini(uint32_t pin) {
   tmp = REG_SET_FIELD(tmp, DC_HPD_CONTROL, DC_HPD_EN, 0);
   r_.write(mmDC_HPD_CONTROL + kHpdOffsets[pin], tmp);
   hpd_set_interrupt(pin, false);   // (amdgpu_irq_put)
+  hpd_rx_set_interrupt(pin, false);
 }
 
 bool Interrupts::vblank_asserted(uint32_t crtc) { return crtc < kMaxCrtcs && (r_.read(kInterruptStatus[crtc].reg) & kInterruptStatus[crtc].vblank) != 0; }

@@ -255,7 +255,11 @@ bool AmdVegaM::bring_up(const Inputs& in) {
   if (!display_irq_) return fail(Step::Sdma, "out of memory");
   for (uint32_t crtc = 0; crtc < amd_dce11::kMaxCrtcs; ++crtc) display_irq_->set_pageflip(crtc, true);
   for (uint32_t pin = 0; pin < amd_dce11::Interrupts::kMaxHpd; ++pin)
-    if (in.hpd_pins >> pin & 1) display_irq_->hpd_init(pin);
+    if (in.hpd_pins >> pin & 1) {
+      display_irq_->hpd_init(pin);
+      display_irq_->ack_hpd_rx(pin);               // the short pulses of a DisplayPort sink on the pin: a stale one is dropped, then they are counted (irq()->hpd_rx_count)
+      display_irq_->hpd_rx_set_interrupt(pin, true);
+    }
   // The state of the pins as they are now.
   connected_pins_ = 0;
   throttle_reported_ = 0;

@@ -203,6 +203,7 @@ class WindowsSyscalls final : public ISyscallInterface {
       case WindowsSyscallNumber::NtSetContextThread: return windowsabi::nt_set_context_thread(process, r);
       case WindowsSyscallNumber::NtRaiseException: return nt_raise_exception_final(process, r);
       case WindowsSyscallNumber::NtTerminateProcess:
+        if (r.args[0] == 0) return windowsabi::terminate_other_threads(process, uint32_t(r.args[1]));
         if (r.args[0] != kCurrentProcess) {      // a process this one created
           bool handled = false;
           const uint32_t status = windowsabi::terminate_process_handle(process, r.args[0], uint32_t(r.args[1]), &handled);

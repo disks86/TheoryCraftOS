@@ -289,6 +289,9 @@ class Process {
   void set_thread_support(const ThreadSupport& support) { thread_support_ = support; }
   const ThreadSupport& thread_support() const { return thread_support_; }
   ThreadRecord* find_thread(uint64_t id);
+  // NtTerminateProcess(NULL) has ended every thread but the caller: no thread can be made any more.
+  bool threads_terminated() const { return threads_terminated_; }
+  void set_threads_terminated() { threads_terminated_ = true; }
   static bool queue_apc(ThreadRecord& t, const ThreadRecord::Apc& apc) {
     if (t.apc_count >= ThreadRecord::kMaxApcs) return false;
     t.apcs[t.apc_count++] = apc;
@@ -356,6 +359,7 @@ class Process {
   ThreadSupport thread_support_;
   uint32_t thread_counter_ = 0, thread_exit_code_ = 0;
   bool thread_exit_pending_ = false;
+  bool threads_terminated_ = false;
   IModuleHost* module_host_ = nullptr;
   uint64_t fs_base_ = 0, gs_base_ = 0;
   bool fs_changed_ = false, gs_changed_ = false;

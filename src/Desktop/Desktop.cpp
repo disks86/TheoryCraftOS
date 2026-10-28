@@ -63,6 +63,8 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
       rtc_audio_(allocator, web_notifications_),
       terminal_(allocator),
       calculator_(allocator),
+      calendar_store_(UniquePointer<CalendarStore>::make(allocator, allocator, nullptr)),
+      calendar_(allocator),
       file_properties_(allocator),
       media_player_(allocator),
       graphics_test_(allocator),
@@ -81,6 +83,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
       extra_browsers_(allocator),
       extra_terminals_(allocator),
       extra_calculators_(allocator),
+      extra_calendars_(allocator),
       hosts_(allocator) {
   // Taskbar: Start at the left, the clock in a sunken tray at the right, the window switcher in between.
   taskbar_.set_style(PanelStyle::Raised);
@@ -102,6 +105,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   start_.menu().add_item("Web Browser", {&Desktop::on_web_browser, this});
   start_.menu().add_item("Terminal", {&Desktop::on_terminal, this});
   start_.menu().add_item("Calculator", {&Desktop::on_calculator, this});
+  start_.menu().add_item("Calendar", {&Desktop::on_calendar, this});
   start_.menu().add_item("Paint", {&Desktop::on_paint, this});
   start_.menu().add_item("Media Player", {&Desktop::on_media_player, this});
   start_.menu().add_item("3D Test", {&Desktop::on_graphics_test, this});
@@ -153,6 +157,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   service_workers_.set_host(&web_browser_.environment());
   setup_terminal(terminal_);
   setup_calculator(calculator_);
+  setup_calendar(calendar_);
   setup_explorer(explorer_);
   copy_progress_.on_finished({&Desktop::on_copy_finished, this});
 
@@ -226,6 +231,13 @@ void Desktop::set_file_system(filesystem::IFileSystem* fs) {
     for (auto& q : extra_queries_) q->set_file_system(fs);
     for (auto& b : extra_browsers_) b->set_file_system(fs);
     for (auto& t : extra_terminals_) t->set_file_system(fs);
+    // The calendar's appointments live on this filesystem (/AppStore/Calendar). The windows are pointed at the new store first, so none is left with the old one.
+    UniquePointer<CalendarStore> store = UniquePointer<CalendarStore>::make(allocator_, allocator_, fs);
+    if (store) {
+      calendar_.set_store(store.get());
+      for (auto& c : extra_calendars_) c->set_store(store.get());
+      calendar_store_ = util::move(store);
+    }
   });
   media_player_.set_file_system(fs);
   file_dialog_.set_file_system(fs);
@@ -352,6 +364,12 @@ void Desktop::setup_terminal(Terminal& terminal) {
 
 void Desktop::setup_calculator(Calculator& calculator) { calculator.set_app_kind(kAppCalculator); }
 
+void Desktop::setup_calendar(Calendar& calendar) {
+  calendar.set_app_kind(kAppCalendar);
+  calendar.set_store(calendar_store_.get());
+  calendar.set_time_source(&Desktop::calendar_time, this);
+}
+
 void Desktop::setup_paint(Paint& paint) {
   paint.set_app_kind(kAppPaint);
   paint.set_notices(&notice_dialog_);
@@ -434,6 +452,7 @@ void Desktop::on_new_tab(void* self, Control& sender) {
     case kAppBrowser: d->open_web_browser(host); break;
     case kAppTerminal: d->open_terminal(host); break;
     case kAppCalculator: d->open_calculator(host); break;
+    case kAppCalendar: d->open_calendar(host); break;
     case kAppMedia: d->open_media_player(host); break;
     default: d->open_explorer(host); break;
   }
@@ -475,6 +494,7 @@ void Desktop::reap_closed() {
     sweep(extra_browsers_);
     sweep(extra_terminals_);
     sweep(extra_calculators_);
+    sweep(extra_calendars_);
     sweep(hosts_);
   });
 }
@@ -533,6 +553,77 @@ uint32_t Desktop::calculator_count() const {
 }
 
 void Desktop::on_calculator(void* self, Control&) { static_cast<Desktop*>(self)->open_calculator(); }
+
+Calendar* Desktop::open_calendar(TabFrame* into) {
+  Calendar* calendar = open_instance(calendar_, extra_calendars_, &Desktop::setup_calendar, into);
+  if (calendar) calendar->go_to_today();   // (the clock may have become known since the window was made)
+  return calendar;
+}
+
+uint32_t Desktop::calendar_count() const {
+  uint32_t n = calendar_.manager() ? 1 : 0;
+  for (const auto& e : extra_calendars_) n += e->manager() ? 1 : 0;
+  return n;
+}
+
+void Desktop::on_calendar(void* self, Control&) { static_cast<Desktop*>(self)->open_calendar(); }
+void Desktop::on_calendar_toast(void* self, Control&) { static_cast<Desktop*>(self)->open_calendar(); }
+
+// The taskbar clock as local minutes (see local_minutes()); -1 without a clock.
+int64_t Desktop::calendar_time(void* self) {
+  auto* d = static_cast<Desktop*>(self);
+  DateTime t;
+  if (!d->clock_source_ || !d->clock_source_(d->clock_context_, &t)) return -1;
+  const gui::Date date{t.year, t.month, t.day};
+  return gui::is_valid(date) ? local_minutes(date, t.hour, t.minute) : -1;
+}
+
+uint32_t Desktop::announce_calendar(int64_t now_minutes) {
+  List<CalendarStore::Due> due(allocator_);
+  calendar_store_->take_due(now_minutes, &due);
+  uint32_t posted = 0;
+  for (const CalendarStore::Due& announcement : due) {
+    CalendarStore::Event e(allocator_);
+    if (!calendar_store_->get(announcement.id, &e)) continue;
+    const int64_t start = announcement.start;   // (this occurrence: a repeating appointment's own start is only its first)
+    // "Today 14:30, in 10 minutes" / "Today 14:30, now" / "Today 14:30, started 3 minutes ago" (an appointment on another day also says which).
+    String text(allocator_);
+    const int64_t away = start - now_minutes;
+    const int32_t m = minute_of_day(start);
+    char clock[6] = {static_cast<char>('0' + m / 600), static_cast<char>('0' + m / 60 % 10), ':', static_cast<char>('0' + m % 60 / 10), static_cast<char>('0' + m % 10), 0};
+    if (day_of(start) == day_of(now_minutes)) {
+      text.assign("Today ");
+    } else {
+      char date[11];
+      gui::format_date(gui::date_from_days(day_of(start)), date);
+      text.assign(StringView(date, 10));
+      text.push_back(' ');
+    }
+    if (e.all_day()) text.append("(all day)");
+    else text.append(StringView(clock, 5));
+    if (e.all_day()) {
+      // (nothing about minutes: the day itself is the appointment)
+    } else if (away > 0) {
+      text.append(", in ");
+      if (away >= 120) {
+        text.append_uint(static_cast<uint64_t>(away / 60));
+        text.append(" hours");
+      } else {
+        text.append_uint(static_cast<uint64_t>(away));
+        text.append(away == 1 ? " minute" : " minutes");
+      }
+    } else if (away == 0) {
+      text.append(", now");
+    } else {
+      text.append(", started ");
+      text.append_uint(static_cast<uint64_t>(-away));
+      text.append(away == -1 ? " minute ago" : " minutes ago");
+    }
+    // (it stays until it is clicked or for a minute, whichever: a reminder must not be missed by looking away for a few seconds)
+    if (notify(e.title.view(), text.view(), gui::NoticeKind::Information, 60000, {&Desktop::on_calendar_toast, this})) ++posted;
+  }
+  return posted;
+}
 
 void Desktop::on_terminal(void* self, Control&) { static_cast<Desktop*>(self)->open_terminal(); }
 void Desktop::on_new_terminal(void* self, Control&) { static_cast<Desktop*>(self)->open_terminal(); }
@@ -993,6 +1084,13 @@ void Desktop::pump(uint64_t uptime_us) {
     if (computer_manager_.manager()) computer_manager_.update(uptime_us);
     DateTime now;
     const bool ok = clock_source_ && clock_source_(clock_context_, &now);
+    if (ok) {   // the appointments whose reminder time has come (looked at when the minute changes)
+      const int64_t minutes = calendar_time(this);
+      if (minutes >= 0 && minutes != calendar_checked_) {
+        calendar_checked_ = minutes;
+        announce_calendar(minutes);
+      }
+    }
     // The label only changes when the minute does; ~0 stands for "no time".
     const uint64_t packed = ok ? ((((uint64_t{now.year} * 13 + now.month) * 32 + now.day) * 24 + now.hour) * 60 + now.minute) : ~0ull - 1;
     if (packed != shown_) {

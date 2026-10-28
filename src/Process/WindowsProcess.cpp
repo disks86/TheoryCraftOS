@@ -317,11 +317,14 @@ uint32_t nt_query_information_process(Process& p, const SyscallRequest& r) {
   uint64_t returned = 0;
   if (!argument(p, r, 4, &returned)) return kAccessViolation;
   const uint32_t info_class = uint32_t(r.args[1]), length = uint32_t(r.args[3]);      // (ULONGs: the upper halves of the arguments are not defined)
-  const bool self = r.args[0] == kCurrentProcessHandle;
   bool child_exited = false;
   uint32_t child_code = 0;
   uint64_t child_pid = 0;
-  if (!self && !process_handle_info(p, r.args[0], &child_exited, &child_code, &child_pid)) return kInvalidHandle;
+  bool self = r.args[0] == kCurrentProcessHandle;
+  if (!self) {
+    if (!process_handle_info(p, r.args[0], &child_exited, &child_code, &child_pid)) return kInvalidHandle;
+    self = child_pid == p.id();      // (OpenProcess on the own id gives a handle to this very process)
+  }
   Buffer b;
   uint32_t size = 0;
   IProcessRuntime* runtime = p.runtime();
@@ -423,7 +426,13 @@ uint32_t nt_open_process(Process& p, const SyscallRequest& r) {
 }
 
 uint32_t nt_set_information_process(Process& p, const SyscallRequest& r) {
-  if (r.args[0] != kCurrentProcessHandle) return kInvalidHandle;
+  if (r.args[0] != kCurrentProcessHandle) {
+    bool exited = false;
+    uint32_t code = 0;
+    uint64_t pid = 0;
+    if (!process_handle_info(p, r.args[0], &exited, &code, &pid)) return kInvalidHandle;
+    if (pid != p.id()) return kInvalidHandle;
+  }
   const uint32_t info_class = uint32_t(r.args[1]), length = uint32_t(r.args[3]);
   uint8_t in[8] = {};
   switch (info_class) {
