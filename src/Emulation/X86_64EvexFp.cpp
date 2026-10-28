@@ -25,12 +25,12 @@ using namespace softfloat;
 namespace {
 
 // Conversion operand types
-enum Type : uint32_t { tF32, tF64, tI32, tU32, tI64, tU64 };
-uint32_t type_bits(uint32_t t) { return (t == tF32 || t == tI32 || t == tU32) ? 32 : 64; }
-bool type_is_float(uint32_t t) { return t <= tF64; }
-Format format_of(uint32_t bits) { return bits == 32 ? Format::F32 : Format::F64; }
+enum Type : uint32_t { tF32, tF64, tI32, tU32, tI64, tU64, tF16, tI16, tU16 };
+uint32_t type_bits(uint32_t t) { return (t == tF16 || t == tI16 || t == tU16) ? 16 : (t == tF32 || t == tI32 || t == tU32) ? 32 : 64; }
+bool type_is_float(uint32_t t) { return t == tF32 || t == tF64 || t == tF16; }
+Format format_of(uint32_t bits) { return bits == 16 ? Format::F16 : bits == 32 ? Format::F32 : Format::F64; }
 
-uint64_t quiet_bit_of(uint32_t w) { return w == 64 ? uint64_t{1} << 51 : uint64_t{1} << 22; }
+uint64_t quiet_bit_of(uint32_t w) { return w == 64 ? uint64_t{1} << 51 : w == 32 ? uint64_t{1} << 22 : uint64_t{1} << 9; }
 
 // One element of a conversion; `bits` is the width of the integer side.
 uint64_t convert_element(uint32_t src, uint32_t dst, uint64_t v, bool truncate, Env& env) {
@@ -38,7 +38,7 @@ uint64_t convert_element(uint32_t src, uint32_t dst, uint64_t v, bool truncate, 
   if (type_is_float(src)) {
     const Format f = format_of(type_bits(src));
     const uint32_t bits = type_bits(dst);
-    if (dst == tI32 || dst == tI64) return static_cast<uint64_t>(to_int(f, v, bits, truncate, env));
+    if (dst == tI16 || dst == tI32 || dst == tI64) return static_cast<uint64_t>(to_int(f, v, bits, truncate, env));
     // unsigned: out of range, NaN and negative values give all ones
     Env e2 = env;
     e2.flags = 0;
@@ -52,7 +52,7 @@ uint64_t convert_element(uint32_t src, uint32_t dst, uint64_t v, bool truncate, 
   }
   const Format f = format_of(type_bits(dst));
   const uint32_t bits = type_bits(src);
-  if (src == tI32 || src == tI64) return from_int(f, signed_of(v, bits), env);
+  if (src == tI16 || src == tI32 || src == tI64) return from_int(f, signed_of(v, bits), env);
   return from_integer(f, v & width_mask(bits), false, 0, env);
 }
 
@@ -62,12 +62,21 @@ struct FloatFields {
   int32_t bias;
   uint64_t mant_mask, exp_max;
 };
-FloatFields fields_of(uint32_t elem) { return elem == 64 ? FloatFields{52, 11, 1023, (uint64_t{1} << 52) - 1, 0x7FF} : FloatFields{23, 8, 127, (uint64_t{1} << 23) - 1, 0xFF}; }
+FloatFields fields_of(uint32_t elem) {
+  if (elem == 16) return FloatFields{10, 5, 15, (uint64_t{1} << 10) - 1, 0x1F};
+  return elem == 64 ? FloatFields{52, 11, 1023, (uint64_t{1} << 52) - 1, 0x7FF} : FloatFields{23, 8, 127, (uint64_t{1} << 23) - 1, 0xFF};
+}
 uint64_t build(uint32_t elem, bool negative, uint64_t exponent, uint64_t mantissa) {
   const FloatFields f = fields_of(elem);
   return (uint64_t{negative} << (f.mant_bits + f.exp_bits)) | (exponent << f.mant_bits) | mantissa;
 }
-uint64_t default_nan(uint32_t elem) { return elem == 64 ? 0xFFF8000000000000ull : 0xFFC00000u; }
+uint64_t default_nan(uint32_t elem) { return elem == 64 ? 0xFFF8000000000000ull : elem == 32 ? 0xFFC00000u : 0xFE00u; }
+// 2^e as a bit pattern (e down to the smallest denormal)
+uint64_t power_of_two(uint32_t elem, int32_t e) {
+  const FloatFields f = fields_of(elem);
+  if (e + f.bias >= 1) return build(elem, false, static_cast<uint64_t>(e + f.bias), 0);
+  return uint64_t{1} << (e + f.bias - 1 + static_cast<int32_t>(f.mant_bits));
+}
 
 // x * 2^k with at most one rounding in the common cases
 uint64_t scale_by_power_of_two(Format fmt, uint32_t elem, uint64_t x, int64_t k, Env& env) {
@@ -110,10 +119,16 @@ X86_64Cpu::Step X86_64Cpu::evex_fp(GuestMemory& m, const EvexOp& defn) {
   const uint32_t elem = def->elem ? def->elem : (w ? 64 : 32);
   const Format fmt = format_of(elem);
   const bool scalar = def->kind == kFpScalar || def->kind == kCvtScalar || def->kind == kCvtToGpr || def->kind == kCvtFromGpr || (def->kind == kFpCmp && def->sub == 1) || def->kind == kComi ||
-                      (def->sub == 1 && (def->kind == kRound || def->kind == kGetExp || def->kind == kScalef || def->kind == kGetMant || def->kind == kFixup || def->kind == kReduce || def->kind == kRange || def->kind == kFpClass || def->kind == kRcp14 || def->kind == kRsqrt14)) || (def->kind == kFma && (def->opcode & 15) % 2 == 1 && (def->opcode & 15) >= 9);
+                      (def->sub == 1 && (def->kind == kRound || def->kind == kGetExp || def->kind == kScalef || def->kind == kGetMant || def->kind == kFixup || def->kind == kReduce || def->kind == kRange || def->kind == kFpClass || def->kind == kRcp14 || def->kind == kRsqrt14)) || (def->kind == kFma && (def->opcode & 15) % 2 == 1 && (def->opcode & 15) >= 9) || (def->kind == kFma4 && (def->sub & 1));
   if (scalar) vl = 128;
   Env env;
-  env.mode = er ? static_cast<Rounding>(ev_.rc) : static_cast<Rounding>((s_.mxcsr >> 13) & 3);
+  // EVEX.b with a register operand is an embedded rounding mode for the arithmetic forms but only "suppress all exceptions" (the rounding comes from MXCSR or the immediate) for the
+  // minimum / maximum, comparisons, rndscale / reduce / getexp / getmant / range / fixup, and the truncating or exact conversions.
+  const bool sae_only = def->kind == kFpCmp || def->kind == kComi || def->kind == kRound || def->kind == kReduce || def->kind == kGetExp || def->kind == kGetMant || def->kind == kRange ||
+                        def->kind == kFixup || (def->kind == kFpBin && (def->sub == 0x5D || def->sub == 0x5F)) || (def->kind == kFpScalar && (def->sub == 0x5D || def->sub == 0x5F)) ||
+                        (def->kind == kCvtToGpr && (def->sub & 0x40)) ||
+                        ((def->kind == kCvt || def->kind == kCvtScalar) && ((def->sub & 0x40) || (type_is_float(def->sub & 7) && type_is_float((def->sub >> 3) & 7) && type_bits(def->sub & 7) < type_bits((def->sub >> 3) & 7))));
+  env.mode = er && !sae_only ? static_cast<Rounding>(ev_.rc) : static_cast<Rounding>((s_.mxcsr >> 13) & 3);
   auto active = [&](uint32_t i) { return ev_active(i); };
   auto commit = [&]() {
     if (!er) s_.mxcsr |= env.flags;
@@ -122,7 +137,7 @@ X86_64Cpu::Step X86_64Cpu::evex_fp(GuestMemory& m, const EvexOp& defn) {
   };
   // flags of one element: an invalid operation takes precedence over the denormal flag
   auto fold = [&](Env& le) {
-    if (le.flags & kInvalid) le.flags &= ~kDenormal;
+    if (le.flags & kInvalid || elem == 16) le.flags &= ~kDenormal;      // (FP16 has no denormal exception)
     env.flags |= le.flags;
   };
   const uint32_t count = scalar ? 1 : vl / elem;
@@ -247,6 +262,50 @@ X86_64Cpu::Step X86_64Cpu::evex_fp(GuestMemory& m, const EvexOp& defn) {
       set_vec(reg, result, vl);
       return commit();
     }
+    case kFma4: {      // Xeon Phi 4FMAPS: dest += four products of the register group (vvvv & ~3 ..+3) with the four floats of the m128 operand, one fused multiply-add each
+      if (!memory || ev_.bcst || (!scalar && saved_vl != 512)) return fail(6);
+      uint64_t weights[4];
+      for (uint32_t j = 0; j < 4; ++j) {
+        if (!load(m, memory_address() + 4 * j, 4, &weights[j])) return Step::Fault;
+      }
+      const bool negate_product = def->sub & 2;
+      const uint64_t qb = quiet_bit_of(elem);
+      const Vec dest = ev_.old_dest;
+      Vec group[4];
+      for (uint32_t j = 0; j < 4; ++j) group[j] = get_vec((vvvv & ~3u) + j);
+      result = dest;
+      for (uint32_t i = 0; i < count; ++i) {
+        if (aaa != 0 && !active(i)) {
+          if (z) set_element(result, elem, i, 0);
+          continue;
+        }
+        uint64_t acc = element(dest, elem, i);
+        for (uint32_t j = 0; j < 4; ++j) {
+          uint64_t p = element(group[j], elem, i), q = weights[j];
+          const uint64_t vals[3] = {p, q, acc};
+          int pick = -1;
+          bool any_signaling = false;
+          for (int k = 0; k < 3; ++k) {
+            if (!is_nan(fmt, vals[k])) continue;
+            if (!(vals[k] & qb)) any_signaling = true;
+            if (pick < 0) pick = k;
+          }
+          if (pick >= 0) {
+            if (any_signaling) env.flags |= kInvalid;
+            acc = vals[pick] | qb;
+            continue;
+          }
+          if (negate_product) p = negate(fmt, p);
+          Env le = env;
+          le.flags = 0;
+          acc = fused_multiply_add(fmt, p, q, acc, le);
+          fold(le);
+        }
+        set_element(result, elem, i, acc);
+      }
+      set_vec(reg, result, vl);
+      return commit();
+    }
     case kFpCmp: {
       if (scalar) {
         if (memory) {
@@ -307,7 +366,6 @@ X86_64Cpu::Step X86_64Cpu::evex_fp(GuestMemory& m, const EvexOp& defn) {
       }
       const uint32_t imm = ev_.imm, scale = imm >> 4;
       Rounding mode = (imm & 4) ? static_cast<Rounding>((s_.mxcsr >> 13) & 3) : static_cast<Rounding>(imm & 3);
-      if (er) mode = (imm & 4) ? env.mode : mode;
       result = scalar ? a : Vec();
       for (uint32_t i = 0; i < count; ++i) {
         if (aaa != 0 && !active(i)) {
@@ -324,12 +382,12 @@ X86_64Cpu::Step X86_64Cpu::evex_fp(GuestMemory& m, const EvexOp& defn) {
           r = x | quiet_bit_of(elem);
         } else if (scale == 0) {
           r = round_to_integral(fmt, x, mode, !(imm & 8), le);
-        } else if (static_cast<int32_t>((x >> (elem == 64 ? 52 : 23)) & (elem == 64 ? 0x7FF : 0xFF)) - (elem == 64 ? 1023 : 127) >= static_cast<int32_t>(elem == 64 ? 52 : 23) - static_cast<int32_t>(scale)) {
+        } else if (static_cast<int32_t>((x >> fields_of(elem).mant_bits) & fields_of(elem).exp_max) - fields_of(elem).bias >= static_cast<int32_t>(fields_of(elem).mant_bits) - static_cast<int32_t>(scale)) {
           r = x;      // no bit below the 2^-scale position: already a multiple of it
         } else {
           // scale by 2^scale, round, scale back (exact for the ranges involved)
-          const uint64_t p2 = elem == 64 ? (uint64_t{1023} + scale) << 52 : static_cast<uint64_t>(127 + scale) << 23;
-          const uint64_t p2inv = elem == 64 ? (uint64_t{1023} - scale) << 52 : static_cast<uint64_t>(127 - scale) << 23;
+          const uint64_t p2 = power_of_two(elem, static_cast<int32_t>(scale));
+          const uint64_t p2inv = power_of_two(elem, -static_cast<int32_t>(scale));
           Env e2 = le;
           e2.flags = 0;
           const uint64_t scaled = mul(fmt, x, p2, e2);
@@ -348,12 +406,16 @@ X86_64Cpu::Step X86_64Cpu::evex_fp(GuestMemory& m, const EvexOp& defn) {
       return commit();
     }
     case kCvt: {
-      const uint32_t src = def->sub & 7, dst = (def->sub >> 3) & 7;
+      uint32_t src = def->sub & 7, dst = (def->sub >> 3) & 7;
+      if (def->sub & 0x80) {      // the 16-bit integer side is unsigned (vcvtph2uw, vcvtuw2ph)
+        if (src == tI16) src = tU16;
+        if (dst == tI16) dst = tU16;
+      }
       const bool truncate = def->sub & 0x40;
       const uint32_t sw = type_bits(src), dw = type_bits(dst);
       const uint32_t n = vl / (sw > dw ? sw : dw);
       ev_.vl = n * sw;
-      if (ev_.vl < 64) ev_.vl = 64;
+      if (ev_.vl < 32) ev_.vl = 32;
       if (!ev_read_rm(m, &b, sw, true, false)) {
         ev_.vl = saved_vl;
         return Step::Fault;
@@ -367,7 +429,7 @@ X86_64Cpu::Step X86_64Cpu::evex_fp(GuestMemory& m, const EvexOp& defn) {
         Env le = env;
         le.flags = 0;
         const uint64_t r = convert_element(src, dst, element(b, sw, i), truncate, le);
-        if (!type_is_float(dst) || !type_is_float(src)) le.flags &= ~kDenormal;
+        if (!type_is_float(dst) || !type_is_float(src) || src == tF16) le.flags &= ~kDenormal;
         fold(le);
         set_element(result, dw, i, r);
       }
@@ -388,6 +450,7 @@ X86_64Cpu::Step X86_64Cpu::evex_fp(GuestMemory& m, const EvexOp& defn) {
         Env le = env;
         le.flags = 0;
         const uint64_t r = convert_element(src, dst, v, false, le);
+        if (src == tF16) le.flags &= ~kDenormal;
         fold(le);
         set_element(result, type_bits(dst), 0, r);
       } else {
@@ -501,9 +564,18 @@ X86_64Cpu::Step X86_64Cpu::evex_fp(GuestMemory& m, const EvexOp& defn) {
               e2.mode = Rounding::NearestEven;
               e2.flags = 0;
               const uint64_t one = build(elem, false, static_cast<uint64_t>(f.bias), 0);
-              uint64_t v = def->kind == kRcp14 ? softfloat::div(fmt, one, x, e2) : softfloat::div(fmt, one, sqrt(fmt, x, e2), e2);
-              const uint32_t drop = f.mant_bits - 14;      // keep 14 bits of the significand
-              if (((v >> f.mant_bits) & f.exp_max) != 0 && ((v >> f.mant_bits) & f.exp_max) != f.exp_max) v &= ~((uint64_t{1} << drop) - 1);
+              uint64_t v;
+              if (elem == 16 && def->kind == kRsqrt14) {      // 1/sqrt in double precision, then one rounding to half (two roundings in half would be off by an ulp now and then)
+                const uint64_t x64 = convert(Format::F16, Format::F64, x, e2);
+                const uint64_t q = softfloat::div(Format::F64, 0x3FF0000000000000ull, sqrt(Format::F64, x64, e2), e2);
+                v = convert(Format::F64, Format::F16, q, e2);
+              } else {
+                v = def->kind == kRcp14 ? softfloat::div(fmt, one, x, e2) : softfloat::div(fmt, one, sqrt(fmt, x, e2), e2);
+              }
+              if (elem != 16) {      // keep 14 bits of the significand (the half-precision forms keep the correctly rounded value, which is within their 2^-11 bound)
+                const uint32_t drop = f.mant_bits - 14;
+                if (((v >> f.mant_bits) & f.exp_max) != 0 && ((v >> f.mant_bits) & f.exp_max) != f.exp_max) v &= ~((uint64_t{1} << drop) - 1);
+              }
               r = v;
               le.flags |= e2.flags & kOverflow;
             }
@@ -536,7 +608,7 @@ X86_64Cpu::Step X86_64Cpu::evex_fp(GuestMemory& m, const EvexOp& defn) {
               e2.flags = 0;
               int64_t k;
               const int32_t y_unbiased = ye == 0 ? -f.bias : static_cast<int32_t>(ye) - f.bias;
-              if (y_unbiased >= 20) k = y_negative ? -(1 << 20) : (1 << 20);
+              if (y_unbiased >= (elem == 16 ? 7 : 20)) k = y_negative ? -(1 << 20) : (1 << 20);
               else {
                 Env e3 = le;
                 e3.flags = 0;
@@ -592,7 +664,7 @@ X86_64Cpu::Step X86_64Cpu::evex_fp(GuestMemory& m, const EvexOp& defn) {
             } else if (scale == 0) {
               rounded = round_to_integral(fmt, x, mode, false, e2);
             } else {
-              const uint64_t p2 = build(elem, false, static_cast<uint64_t>(f.bias + static_cast<int32_t>(scale)), 0), p2inv = build(elem, false, static_cast<uint64_t>(f.bias - static_cast<int32_t>(scale)), 0);
+              const uint64_t p2 = power_of_two(elem, static_cast<int32_t>(scale)), p2inv = power_of_two(elem, -static_cast<int32_t>(scale));
               Env e3 = e2;
               const uint64_t scaled = mul(fmt, x, p2, e3);
               Env e4 = e2;

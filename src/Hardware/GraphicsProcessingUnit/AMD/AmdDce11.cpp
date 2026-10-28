@@ -309,6 +309,79 @@ uint32_t AudioPins::port_connectivity(uint32_t pin) {
   return FIELD(tmp, AZALIA_F0_CODEC_PIN_CONTROL_RESPONSE_CONFIGURATION_DEFAULT__PORT_CONNECTIVITY_MASK, AZALIA_F0_CODEC_PIN_CONTROL_RESPONSE_CONFIGURATION_DEFAULT__PORT_CONNECTIVITY__SHIFT);
 }
 
+bool AudioPins::endpoint_write(uint32_t pin, uint32_t reg, uint32_t value) {
+  if (pin >= kMaxPins) return false;
+  r_.write(mmAZALIA_F0_CODEC_ENDPOINT_INDEX + kAudioPinOffsets[pin], reg);
+  r_.write(mmAZALIA_F0_CODEC_ENDPOINT_DATA + kAudioPinOffsets[pin], value);
+  return true;
+}
+
+bool AudioPins::set_enabled(uint32_t pin, bool enable) {
+  return endpoint_write(pin, ixAZALIA_F0_CODEC_PIN_CONTROL_HOT_PLUG_CONTROL, enable ? AZALIA_F0_CODEC_PIN_CONTROL_HOT_PLUG_CONTROL__AUDIO_ENABLED_MASK : 0);
+}
+
+bool AudioPins::enabled(uint32_t pin) {
+  return (endpoint_read(pin, ixAZALIA_F0_CODEC_PIN_CONTROL_HOT_PLUG_CONTROL) & AZALIA_F0_CODEC_PIN_CONTROL_HOT_PLUG_CONTROL__AUDIO_ENABLED_MASK) != 0;
+}
+
+bool AudioPins::write_speaker_allocation(uint32_t pin, const EdidAudio::Info& info) {
+  if (pin >= kMaxPins) return false;
+  uint32_t tmp = endpoint_read(pin, ixAZALIA_F0_CODEC_PIN_CONTROL_CHANNEL_SPEAKER);
+  tmp = REG_SET_FIELD(tmp, AZALIA_F0_CODEC_PIN_CONTROL_CHANNEL_SPEAKER, DP_CONNECTION, 0);
+  tmp = REG_SET_FIELD(tmp, AZALIA_F0_CODEC_PIN_CONTROL_CHANNEL_SPEAKER, HDMI_CONNECTION, 1);
+  tmp = REG_SET_FIELD(tmp, AZALIA_F0_CODEC_PIN_CONTROL_CHANNEL_SPEAKER, SPEAKER_ALLOCATION, info.speaker_count ? info.speaker_allocation : kStereoSpeakers);
+  return endpoint_write(pin, ixAZALIA_F0_CODEC_PIN_CONTROL_CHANNEL_SPEAKER, tmp);
+}
+
+namespace {
+// eld_reg_to_type of dce_v11_0.c: the descriptor register of each audio coding type (HDMI_AUDIO_CODING_TYPE_*) the endpoint has one for
+struct DescriptorRegister {
+  uint32_t reg;
+  uint8_t format;
+};
+constexpr uint8_t kFormatPcm = 1;
+const DescriptorRegister kDescriptorRegisters[] = {
+    {ixAZALIA_F0_CODEC_PIN_CONTROL_AUDIO_DESCRIPTOR0, kFormatPcm}, {ixAZALIA_F0_CODEC_PIN_CONTROL_AUDIO_DESCRIPTOR1, 2},   {ixAZALIA_F0_CODEC_PIN_CONTROL_AUDIO_DESCRIPTOR2, 3},
+    {ixAZALIA_F0_CODEC_PIN_CONTROL_AUDIO_DESCRIPTOR3, 4},          {ixAZALIA_F0_CODEC_PIN_CONTROL_AUDIO_DESCRIPTOR4, 5},   {ixAZALIA_F0_CODEC_PIN_CONTROL_AUDIO_DESCRIPTOR5, 6},
+    {ixAZALIA_F0_CODEC_PIN_CONTROL_AUDIO_DESCRIPTOR6, 7},          {ixAZALIA_F0_CODEC_PIN_CONTROL_AUDIO_DESCRIPTOR7, 8},   {ixAZALIA_F0_CODEC_PIN_CONTROL_AUDIO_DESCRIPTOR9, 10},
+    {ixAZALIA_F0_CODEC_PIN_CONTROL_AUDIO_DESCRIPTOR10, 11},        {ixAZALIA_F0_CODEC_PIN_CONTROL_AUDIO_DESCRIPTOR11, 12}, {ixAZALIA_F0_CODEC_PIN_CONTROL_AUDIO_DESCRIPTOR13, 14},
+};
+}  // namespace
+
+bool AudioPins::write_sads(uint32_t pin, const EdidAudio::Info& info) {
+  if (pin >= kMaxPins || info.sad_count == 0) return false;
+  for (const DescriptorRegister& d : kDescriptorRegisters) {
+    uint32_t tmp = 0;
+    uint32_t stereo_freqs = 0;
+    int max_channels = -1;
+    for (uint32_t j = 0; j < info.sad_count && j < EdidAudio::kMaxSads; ++j) {
+      const Sad& sad = info.sads[j];
+      if (sad.format != d.format) continue;
+      if (sad.channels > max_channels) {
+        tmp = REG_SET_FIELD(tmp, AZALIA_F0_CODEC_PIN_CONTROL_AUDIO_DESCRIPTOR0, MAX_CHANNELS, sad.channels);
+        tmp = REG_SET_FIELD(tmp, AZALIA_F0_CODEC_PIN_CONTROL_AUDIO_DESCRIPTOR0, DESCRIPTOR_BYTE_2, sad.byte2);
+        tmp = REG_SET_FIELD(tmp, AZALIA_F0_CODEC_PIN_CONTROL_AUDIO_DESCRIPTOR0, SUPPORTED_FREQUENCIES, sad.freq);
+        max_channels = sad.channels;
+      }
+      if (sad.format == kFormatPcm) stereo_freqs |= sad.freq;
+      else break;     // (of the other formats the first descriptor is the one)
+    }
+    tmp = REG_SET_FIELD(tmp, AZALIA_F0_CODEC_PIN_CONTROL_AUDIO_DESCRIPTOR0, SUPPORTED_FREQUENCIES_STEREO, stereo_freqs);
+    endpoint_write(pin, d.reg, tmp);
+  }
+  return true;
+}
+
+bool AudioPins::write_latency(uint32_t pin, const EdidAudio::Info& info, bool interlaced) {
+  const uint32_t which = interlaced ? 1 : 0;
+  uint32_t tmp = 0;
+  if (info.latency_present[which]) {
+    tmp = REG_SET_FIELD(tmp, AZALIA_F0_CODEC_PIN_CONTROL_RESPONSE_LIPSYNC, VIDEO_LIPSYNC, info.video_latency[which]);
+    tmp = REG_SET_FIELD(tmp, AZALIA_F0_CODEC_PIN_CONTROL_RESPONSE_LIPSYNC, AUDIO_LIPSYNC, info.audio_latency[which]);
+  }
+  return endpoint_write(pin, ixAZALIA_F0_CODEC_PIN_CONTROL_RESPONSE_LIPSYNC, tmp);
+}
+
 bool AudioPins::connected(uint32_t pin) { return pin < kMaxPins && port_connectivity(pin) != kPortConnectivityNone; }
 
 uint32_t AudioPins::connected_mask(uint32_t pin_count) {
@@ -316,6 +389,24 @@ uint32_t AudioPins::connected_mask(uint32_t pin_count) {
   for (uint32_t pin = 0; pin < pin_count && pin < kMaxPins; ++pin)
     if (connected(pin)) mask |= 1u << pin;
   return mask;
+}
+
+namespace {
+// DIGn_REGISTER_OFFSET (vid.h) for DIG 0 to 5: the register blocks of the DIG encoders, and with them of the audio format blocks (dig_offsets in dce_v11_0.c).
+constexpr uint32_t kDigOffsets[AudioFormat::kBlocks] = {0x4a00 - 0x4a00, 0x4b00 - 0x4a00, 0x4c00 - 0x4a00, 0x4d00 - 0x4a00, 0x4e00 - 0x4a00, 0x4f00 - 0x4a00};
+}  // namespace
+
+bool AudioFormat::select_pin(uint32_t block, uint32_t pin) {
+  if (block >= kBlocks || pin >= AudioPins::kMaxPins) return false;
+  uint32_t tmp = r_.read(mmAFMT_AUDIO_SRC_CONTROL + kDigOffsets[block]);
+  tmp = REG_SET_FIELD(tmp, AFMT_AUDIO_SRC_CONTROL, AFMT_AUDIO_SRC_SELECT, pin);
+  r_.write(mmAFMT_AUDIO_SRC_CONTROL + kDigOffsets[block], tmp);
+  return true;
+}
+
+uint32_t AudioFormat::selected_pin(uint32_t block) {
+  if (block >= kBlocks) return kNoPin;
+  return FIELD(r_.read(mmAFMT_AUDIO_SRC_CONTROL + kDigOffsets[block]), AFMT_AUDIO_SRC_CONTROL__AFMT_AUDIO_SRC_SELECT_MASK, AFMT_AUDIO_SRC_CONTROL__AFMT_AUDIO_SRC_SELECT__SHIFT);
 }
 
 bool Presenter::start(INativeDisplay& display, ByteView video, uint32_t pitch_bytes, uint32_t height) {

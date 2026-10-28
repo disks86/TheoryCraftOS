@@ -412,7 +412,23 @@ EXPORT BOOL WINAPI ReadProcessMemory(HANDLE process, LPCVOID base, LPVOID buffer
 }
 EXPORT BOOL WINAPI WriteProcessMemory(HANDLE process, LPVOID base, LPCVOID buffer, SIZE_T size, SIZE_T *done) {
   SIZE_T got = 0;
-  const NTSTATUS status = NtWriteVirtualMemory(process, base, (PVOID)buffer, size, &got);
+  NTSTATUS status = NtWriteVirtualMemory(process, base, (PVOID)buffer, size, &got);
+  if (status == (NTSTATUS)0x8000000D && got == 0 && size != 0) {      /* the first page cannot be written: code pages are made writable for the copy, anything else is refused */
+    MEMORY_BASIC_INFORMATION info;
+    if (VirtualQueryEx(process, base, &info, sizeof(info)) == sizeof(info) && info.State == MEM_COMMIT) {
+      if (info.Protect == PAGE_EXECUTE_READ || info.Protect == PAGE_EXECUTE) {
+        DWORD old = 0;
+        if (VirtualProtectEx(process, base, size, PAGE_EXECUTE_READWRITE, &old)) {
+          status = NtWriteVirtualMemory(process, base, (PVOID)buffer, size, &got);
+          DWORD again = 0;
+          VirtualProtectEx(process, base, size, old, &again);
+        }
+      } else if (info.Protect == PAGE_READONLY || info.Protect == PAGE_NOACCESS) {
+        set_error(ERROR_NOACCESS);
+        return FALSE;
+      }
+    }
+  }
   if (done) *done = got;
   return NT_SUCCESS(status) && status != (NTSTATUS)0x8000000D ? TRUE : fail_nt(status);
 }
@@ -1056,3 +1072,49 @@ EXPORT BOOL WINAPI WaitForDebugEvent(LPVOID event, DWORD milliseconds) {
   return FALSE;
 }
 EXPORT BOOL WINAPI WaitForDebugEventEx(LPVOID event, DWORD milliseconds) { return WaitForDebugEvent(event, milliseconds); }
+
+/* ---- delay-loaded imports -------------------------------------------------------------------------------------------------------------------------- */
+
+typedef struct {
+  ULONG Size;
+  const void *DelayloadDescriptor;
+  ULONG64 *ThunkAddress;
+  LPCSTR TargetDllName;
+  ULONG ImportDescribedByName;
+  ULONG64 Description;      /* the name pointer, or the ordinal */
+  PVOID TargetModuleBase;
+  PVOID Unused;
+  ULONG LastError;
+} DelayLoadInfo;
+
+/* ResolveDelayLoadedAPI(base, descriptor, dll failure hook, system failure hook, thunk, flags): loads the library the descriptor names (once: its handle is kept in the image),
+ * finds the function the thunk stands for and stores its address in the thunk. A function that is not there goes to the hooks: the DLL hook first, then the system one. */
+EXPORT PVOID WINAPI ResolveDelayLoadedAPI(PVOID parent, const void *descriptor, PVOID (WINAPI *dll_hook)(ULONG, DelayLoadInfo *), PVOID (WINAPI *system_hook)(LPCSTR, LPCSTR), ULONG64 *thunk, ULONG flags) {
+  (void)flags;
+  const ULONG *d = (const ULONG *)descriptor;      /* Attributes, DllNameRVA, ModuleHandleRVA, ImportAddressTableRVA, ImportNameTableRVA, ... */
+  const BYTE *base = (const BYTE *)parent;
+  LPCSTR dll = (LPCSTR)(base + d[1]);
+  HMODULE *handle = (HMODULE *)(base + d[2]);
+  const ULONG64 *names = (const ULONG64 *)(base + d[4]);
+  const ULONG64 index = (ULONG64)(thunk - (const ULONG64 *)(base + d[3]));
+  const ULONG64 entry = names[index];
+  const BOOL by_ordinal = (entry >> 63) != 0;
+  HMODULE module = *handle;
+  if (!module) {
+    module = LoadLibraryA(dll);
+    if (module) *handle = module;
+  }
+  DelayLoadInfo info = { sizeof(info), descriptor, thunk, dll, by_ordinal ? 0 : 1, by_ordinal ? (entry & 0xFFFF) : (ULONG64)(ULONG_PTR)(base + (entry & 0x7FFFFFFF) + 2), module, NULL, 0 };
+  PVOID address = NULL;
+  if (module) address = (PVOID)GetProcAddress(module, by_ordinal ? (LPCSTR)(ULONG_PTR)(entry & 0xFFFF) : (LPCSTR)(base + (entry & 0x7FFFFFFF) + 2));
+  info.LastError = GetLastError();
+  if (!address) {
+    if (dll_hook) address = dll_hook(4 /* DELAYLOAD_GPA_FAILURE */, &info);
+    if (!address && system_hook) address = system_hook(dll, by_ordinal ? (LPCSTR)(ULONG_PTR)(entry & 0xFFFF) : (LPCSTR)(base + (entry & 0x7FFFFFFF) + 2));
+  }
+  if (address) *thunk = (ULONG64)(ULONG_PTR)address;
+  return address;
+}
+
+VOID NTAPI NtFlushProcessWriteBuffers(void);
+EXPORT VOID WINAPI FlushProcessWriteBuffers(void) { NtFlushProcessWriteBuffers(); }

@@ -97,6 +97,23 @@ void Process::terminate(uint32_t code) {
   }
 }
 
+void Process::note_view_file(uint64_t base, const char (&name)[40]) {
+  ViewFile* slot = nullptr;
+  for (ViewFile& v : view_files_) if (v.base == base) slot = &v;
+  if (!slot) { slot = &view_files_[view_file_next_]; view_file_next_ = (view_file_next_ + 1) % 32; }
+  slot->base = base;
+  for (uint32_t i = 0; i < 40; ++i) slot->name[i] = name[i];
+}
+
+bool Process::view_file_name(uint64_t base, char (&out)[40]) const {
+  for (const ViewFile& v : view_files_) {
+    if (v.base != base || base == 0) continue;
+    for (uint32_t i = 0; i < 40; ++i) out[i] = v.name[i];
+    return true;
+  }
+  return false;
+}
+
 void Process::register_main_thread(uint64_t id, uint64_t teb) {
   ThreadRecord* t = add_thread(id);
   if (!t) return;

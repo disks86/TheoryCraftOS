@@ -56,7 +56,7 @@ LoadStatus load_elf(const exe::ElfFile& elf, ConstByteView file, AddressSpace& s
 LoadStatus load_pe(const exe::PeFile& pe, ConstByteView file, AddressSpace& space, LoadedImage* out, bool require_entry = true);
 
 // SECTION_IMAGE_INFORMATION (64 bytes) of a PE image as NtQuerySection and NtQueryInformationProcess(ProcessImageInformation) report it. `file_size` is the size of the file.
-void describe_pe_image(const exe::PeFile& pe, uint64_t file_size, uint8_t (&out)[64]);
+void describe_pe_image(const exe::PeFile& pe, uint64_t file_size, uint8_t (&out)[64], ConstByteView file = ConstByteView());
 
 // The mapping step of load_pe() at an address of the caller's choosing, for DLLs too (an entry point is then optional unless `require_entry`). Does not apply
 // relocations or bind imports (see ModuleLoader.hpp). The headers and sections are mapped at base + their RVAs.

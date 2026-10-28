@@ -34,6 +34,7 @@
 #pragma once
 #include <stdint.h>
 #include "Hardware/Clock/IClock.hpp"
+#include "Hardware/GraphicsProcessingUnit/AMD/EdidAudio.hpp"
 #include "Hardware/Mmio.hpp"
 #include "Hardware/VideoCodec/AMD/AmdVcn1.hpp"
 #include "Allocators/IAllocator.hpp"
@@ -184,11 +185,45 @@ class AudioPins {
  public:
   static constexpr uint32_t kMaxPins = 8;
   static constexpr uint32_t kPortConnectivityNone = 1;
+  static constexpr uint32_t kStereoSpeakers = 5;     // the speaker allocation the driver writes for a monitor that gives none
   explicit AudioPins(IVcnRegisters& registers) : r_(registers) {}
   uint32_t endpoint_read(uint32_t pin, uint32_t reg);   // 0 for a pin that does not exist
   uint32_t port_connectivity(uint32_t pin);              // the field of the default configuration (0 connector, 1 none, 2 fixed function, 3 both)
   bool connected(uint32_t pin);                          // port connectivity is not "none"
   uint32_t connected_mask(uint32_t pin_count = kMaxPins); // bit n: pin n
+
+  // What the driver programs into an endpoint when a display is set up (dce_v11_0_afmt_setmode and the functions it calls). The hardware makes the ELD that the sound driver reads out of
+  // these: there is no ELD buffer to fill. All of them are false for a pin that does not exist.
+  // dce_v11_0_audio_endpt_wreg: the indexed register `reg` of the endpoint
+  bool endpoint_write(uint32_t pin, uint32_t reg, uint32_t value);
+  // dce_v11_0_audio_enable: HOT_PLUG_CONTROL is written as AUDIO_ENABLED or as zero (the whole register, as the driver does)
+  bool set_enabled(uint32_t pin, bool enable);
+  bool enabled(uint32_t pin);
+  // dce_v11_0_audio_write_speaker_allocation: CHANNEL_SPEAKER with the DisplayPort connection bit cleared, the HDMI one set (always, as the driver does), and the speaker allocation: the monitor's
+  // (EdidAudio::Info::speaker_allocation) when it has a speaker allocation data block, else kStereoSpeakers (5, stereo: the driver's default).
+  bool write_speaker_allocation(uint32_t pin, const EdidAudio::Info& info);
+  // dce_v11_0_audio_write_sad_regs: the descriptor registers for PCM, AC-3, MPEG-1, MP3, MPEG-2, AAC LC, DTS, ATRAC, E-AC-3, DTS-HD, MLP and WMA Pro, each from the monitor's Short Audio
+  // Descriptors of that format (the one with the most channels; for PCM the sample rates of all of them also go to the stereo field). Nothing is written (false) for a monitor without any.
+  bool write_sads(uint32_t pin, const EdidAudio::Info& info);
+  // dce_v11_0_audio_write_latency_fields: the lip sync latencies of the mode (progressive or interlaced) if the monitor gives them, else zero.
+  bool write_latency(uint32_t pin, const EdidAudio::Info& info, bool interlaced);
+
+ private:
+  IVcnRegisters& r_;
+};
+
+// The audio format blocks of the display engine (dce_v11_0_afmt_init, dce_v11_0_afmt_audio_select_pin): DCE 11 has one per DIG encoder, at the DIG's register block, and each takes its
+// audio from one of the endpoints (AudioPins) - AFMT_AUDIO_SRC_CONTROL.AFMT_AUDIO_SRC_SELECT is that endpoint's number. The Vega M (CHIP_VEGAM, like Polaris 10) has 6 DIGs, so blocks 0 to 5:
+// the transmitter UNIPHY3 (DIG 6) has no audio block there.
+class AudioFormat {
+ public:
+  static constexpr uint32_t kBlocks = 6;
+  explicit AudioFormat(IVcnRegisters& registers) : r_(registers) {}
+  // The endpoint (0..AudioPins::kMaxPins - 1) block `block` takes its audio from: the field alone is written, the rest of the register is kept. False for a block or endpoint that does not exist.
+  bool select_pin(uint32_t block, uint32_t pin);
+  // The endpoint the block has selected, or kNoPin for a block that does not exist.
+  static constexpr uint32_t kNoPin = 0xFFFFFFFFu;
+  uint32_t selected_pin(uint32_t block);
 
  private:
   IVcnRegisters& r_;

@@ -56,7 +56,14 @@ void ObjectManager::notify() {
 
 ObjectManager::Object* ObjectManager::find_locked(StringView name) {
   if (name.empty()) return nullptr;
-  for (Object& o : objects_) if (o.kind != ObjectKind::None && o.name_size != 0 && same_name(o.name, o.name_size, name)) return &o;
+  for (Object& o : objects_) {
+    if (o.kind == ObjectKind::None || o.name_size == 0) continue;
+    if (o.kind == ObjectKind::Section) {      // (the names of file mappings are matched exactly; the other objects' ignore case)
+      if (o.name_size == name.size() && StringView(o.name, o.name_size) == name) return &o;
+    } else if (same_name(o.name, o.name_size, name)) {
+      return &o;
+    }
+  }
   return nullptr;
 }
 
@@ -179,8 +186,10 @@ struct ObjectManager::Section {
   bool used = false, writable = false, file_backed = false;
   uint32_t page = 0, attributes = 0;
   bool image_mapped = false;
+  bool reserve = false;                     // SEC_RESERVE: its pages are committed by VirtualAlloc, in the section and so in every view
+  uint8_t committed[2048] = {};             // one bit a page of the section
   uint8_t* storage = nullptr;
-  uint64_t size = 0, rounded = 0;
+  uint64_t size = 0, rounded = 0, reported_size = 0;
   int32_t mappings = 0;
   uint32_t object = 0;                      // its slot in objects_
   filesystem::IFileSystem* fs = nullptr;
@@ -700,6 +709,7 @@ ObjectManager::Created ObjectManager::create_section(StringView name, uint64_t s
     s.page = page;
     s.attributes = attributes;
     s.file_backed = fs != nullptr;
+    s.reserve = (attributes & 0x4000000u) != 0 && !fs;
     s.storage = storage;
     s.size = bytes;
     s.rounded = rounded;
@@ -727,6 +737,39 @@ bool ObjectManager::section_memory(uint32_t id, uint8_t** storage, uint64_t* siz
   return true;
 }
 
+ObjectManager::Section* ObjectManager::section_of_owner(const SharedMemory* owner) {
+  if (!sections_) return nullptr;
+  for (uint32_t i = 0; i < kMaxSections; ++i) if (sections_[i].used && static_cast<const SharedMemory*>(&sections_[i].ref) == owner) return &sections_[i];
+  return nullptr;
+}
+
+bool ObjectManager::section_reserved(const SharedMemory* owner) {
+  Locked hold(sync_);
+  const Section* s = section_of_owner(owner);
+  return s && s->reserve;
+}
+
+uint64_t ObjectManager::section_offset(const SharedMemory* owner, const uint8_t* pointer) {
+  Locked hold(sync_);
+  const Section* s = section_of_owner(owner);
+  return s && pointer >= s->storage ? uint64_t(pointer - s->storage) : 0;
+}
+
+void ObjectManager::section_commit_pages(const SharedMemory* owner, uint64_t offset, uint64_t length) {
+  Locked hold(sync_);
+  Section* s = section_of_owner(owner);
+  if (!s || !s->reserve) return;
+  for (uint64_t page = offset / 4096; page * 4096 < offset + length && page < sizeof(s->committed) * 8; ++page) s->committed[page / 8] |= uint8_t(1u << (page % 8));
+}
+
+bool ObjectManager::section_page_committed(const SharedMemory* owner, uint64_t offset) {
+  Locked hold(sync_);
+  const Section* s = section_of_owner(owner);
+  if (!s || !s->reserve) return true;
+  const uint64_t page = offset / 4096;
+  return page < sizeof(s->committed) * 8 && (s->committed[page / 8] >> (page % 8)) & 1;
+}
+
 bool ObjectManager::section_note_image_view(uint32_t id) {
   Locked hold(sync_);
   Object* o = at(id);
@@ -734,6 +777,20 @@ bool ObjectManager::section_note_image_view(uint32_t id) {
   const bool before = sections_[o->section].image_mapped;
   sections_[o->section].image_mapped = true;
   return before;
+}
+
+bool ObjectManager::section_file_name(uint32_t id, char (&out)[40]) {
+  Locked hold(sync_);
+  out[0] = 0;
+  const Object* o = at(id);
+  if (!o || o->kind != ObjectKind::Section || o->section < 0 || !sections_ || !sections_[o->section].file_backed) return false;
+  const Section& s = sections_[o->section];
+  uint32_t start = 0;
+  for (uint32_t i = 0; i < s.path_size; ++i) if (s.path[i] == '/' || s.path[i] == '\\') start = i + 1;
+  uint32_t n = 0;
+  for (uint32_t i = start; i < s.path_size && n < 39; ++i) out[n++] = lower(s.path[i]);
+  out[n] = 0;
+  return n != 0;
 }
 
 uint32_t ObjectManager::file_has_section(StringView host_path) {
@@ -757,7 +814,14 @@ bool ObjectManager::section_info(uint32_t id, SectionInfo* out) {
   out->page = s.page;
   out->attributes = s.attributes;
   out->file_backed = s.file_backed;
+  out->reported_size = s.reported_size;
   return true;
+}
+
+void ObjectManager::section_set_reported_size(uint32_t id, uint64_t size) {
+  Locked hold(sync_);
+  Object* o = at(id);
+  if (o && o->kind == ObjectKind::Section && o->section >= 0 && sections_) sections_[o->section].reported_size = size;
 }
 
 void ObjectManager::flush_section_at(uint32_t index) {

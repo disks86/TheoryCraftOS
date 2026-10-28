@@ -35,6 +35,7 @@
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdAux.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdDdc.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AtomConnectors.hpp"
+#include "Hardware/GraphicsProcessingUnit/AMD/Dpcd.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AtomI2c.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdSmu7Ucode.hpp"
 #include "Hardware/Mmio.hpp"
@@ -175,6 +176,36 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
   // card is not up, the connector has no DDC line in the table or no GPIO entry, nothing answers, or the EDID never checked. (An eDP panel that is not powered does not answer: the panel power is not done.)
   // It takes the bus for some tens of milliseconds, so it is for the desktop loop, not an interrupt path.
   bool read_edid(const AtomConnectors::Connector& connector, ByteBuffer* out);
+  // The DisplayPort configuration data of the sink on a DisplayPort or eDP connector, read over the AUX channel (the same way, with the same eDP panel power-up, as read_edid): the receiver's
+  // capabilities, and for `status` (optional) the link status. False if the connector is not a DisplayPort one, nothing answers, or what answers is no DPCD. Like read_edid it takes the AUX
+  // channel for some milliseconds, so it is for the desktop loop (or the handler of a hot plug), not an interrupt path.
+  bool read_dpcd(const AtomConnectors::Connector& connector, Dpcd::Capabilities* capabilities, Dpcd::LinkStatus* status = nullptr);
+  // The short pulse of a DisplayPort sink (a status change that is not a plug: the link was lost, or the sink asks for a test) is taken by the interrupt handler as a pin to look at
+  // (`pending_short_pulses()`: bit n for pin n). The look is the AUX channel's, which takes some milliseconds, so it is not done there: service_short_pulses() does it, from the desktop loop.
+  // For each pending pin, lowest first, up to `capacity` of them, it reads the sink's link configuration (DP_LANE_COUNT_SET) and status (the lane training status, the alignment, the service
+  // interrupt vector) and reports what a driver's short pulse handler decides on: the link is lost when it was set up for lanes and does not pass drm_dp_channel_eq_ok for them (retrain),
+  // an automated test request is made when the sink asks for one. The returned events are in `out`; pins past `capacity` stay pending. Not done: the retraining.
+  struct SinkEvent {
+    uint32_t pin = 0;
+    bool has_connector = false;
+    AtomConnectors::Connector connector;
+    bool checked = false;             // the sink's status was read (the pin is a DisplayPort or eDP connector of the video BIOS's table with an AUX channel)
+    bool read_failed = false;         // checked, but the AUX channel did not answer (the sink is gone or asleep)
+    uint32_t lanes = 0;               // DP_LANE_COUNT_SET: 0 if the link has not been trained
+    Dpcd::LinkStatus status;
+    bool link_lost = false;           // lanes were set up and the status says they are not in sync
+    bool test_request = false;        // DP_AUTOMATED_TEST_REQUEST in the service interrupt vector
+    bool content_protection = false;  // DP_CP_IRQ
+    bool sink_specific = false;       // DP_SINK_SPECIFIC_IRQ
+    // What was done about it. The handled service interrupts (Dpcd::kIrqHandled) are acknowledged first, as the driver does; an automated test request is read (DP_TEST_REQUEST) and
+    // answered (DP_TEST_RESPONSE): the EDID read test with the checksum of the last block of the sink's EDID, every other test with a NAK.
+    uint8_t acked = 0;                // the bits written back to DP_DEVICE_SERVICE_IRQ_VECTOR
+    uint8_t test_kind = 0;            // DP_TEST_REQUEST
+    uint8_t test_response = 0;        // DP_TEST_RESPONSE as written (Dpcd::kTestAck | kTestEdidChecksumWrite, or kTestNak); 0 if none was given
+    bool handling_failed = false;     // a read or write of the above did not go through
+  };
+  uint32_t pending_short_pulses() const { return rx_pending_; }
+  uint32_t service_short_pulses(SinkEvent* out, uint32_t capacity);
   ArrayView<const AtomConnectors::Connector> connectors() const { return ArrayView<const AtomConnectors::Connector>(connectors_, connector_count_); }
   uint32_t hotplug_events_dropped() const { return hotplug_dropped_; }
   // The audio endpoints of the display engine (amd_dce11::AudioPins, dce_v11_0_audio_get_connected_pins): bit n of the mask is set when endpoint n has a port (its default configuration's
@@ -185,6 +216,25 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
   uint32_t audio_pins_connected() const { return audio_pins_; }
   uint32_t refresh_audio_pins();
   uint32_t audio_outputs(AtomConnectors::Connector* out, uint32_t capacity) const;
+  // The endpoint the driver would give the connector's audio: the connector's encoder (from the video BIOS's display path) is a DIG with an audio format block (AtomConnectors::afmt_instance:
+  // HDMI and DisplayPort, not the internal panel), and dce_v11_0_audio_get_pin hands it the first connected endpoint. False if the connector has no such encoder, or no endpoint is connected.
+  // (The same endpoint for every connector: the driver's choice, which does not tell two displays apart.)
+  bool audio_pin_for(const AtomConnectors::Connector& connector, uint32_t* pin) const;
+  // dce_v11_0_afmt_audio_select_pin: the endpoint audio_pin_for gives the connector goes into its audio format block's AFMT_AUDIO_SRC_CONTROL (amd_dce11::AudioFormat), after the endpoints
+  // are read again (refresh_audio_pins) as the driver does each time. `select_audio_pin` is for one connector; false if the connector has no audio block (HDMI and DisplayPort on a DIG
+  // of 0 to 5), no endpoint is connected, or the card is not up. `select_audio_pins` does it for every audio connector with a display on its pin now; the count. Like the driver, it only
+  // writes the select field: enabling the endpoint (the hot plug control's AUDIO_ENABLED), the ELD and the audio clock are not done.
+  bool select_audio_pin(const AtomConnectors::Connector& connector);
+  uint32_t select_audio_pins();
+  // dce_v11_0_afmt_setmode's audio part: the endpoint of the connector (audio_pin_for) is disabled, given the monitor's speaker allocation, selected by the connector's audio format block
+  // (select_audio_pin), given its Short Audio Descriptors and its lip sync latency (`interlaced`: the mode's), and enabled (HOT_PLUG_CONTROL.AUDIO_ENABLED) - the hardware makes the ELD that the
+  // sound driver reads from those. `edid` is the whole EDID of the monitor (a missing or CTA-less one gives stereo speakers and no descriptors, as the driver does). The variant without an
+  // EDID reads it over the connector's DDC or AUX channel (read_edid) and is false if that fails. False also when the connector has no audio block or no endpoint is connected: nothing is
+  // written then. Not done: the audio clock (the DTO), the audio packets and the infoframes of dce_v11_0_afmt_setmode, so the endpoint is enabled but no sound is sent yet.
+  bool enable_audio(const AtomConnectors::Connector& connector, ConstByteView edid, bool interlaced = false);
+  bool enable_audio(const AtomConnectors::Connector& connector, bool interlaced = false);
+  // dce_v11_0_audio_enable(pin, false) for the endpoint the connector's block has selected. False if the connector has no audio block.
+  bool disable_audio(const AtomConnectors::Connector& connector);
 
   // Recovery. An engine that timed out on a fence or reported a fault is wedged: nothing more is queued on it. recover() resets the ones that are - the graphics engine with its
   // compute queues (AmdGfx8::recover) if the graphics ring or a compute queue is wedged, and the SDMA engines (AmdSdma3::recover) if one is - and brings them back with empty
@@ -248,7 +298,9 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
   HotplugEvent hotplug_[kMaxHotplugEvents];
   AtomConnectors::Connector connectors_[AtomConnectors::kMaxConnectors];
   uint32_t connector_count_ = 0;
+  void power_up_panel(const AtomConnectors::Connector& connector, IAtomHost& host, AtomBios& bios);   // an eDP panel's power, before its AUX channel is used
   uint32_t audio_pins_ = 0;
+  uint32_t rx_pending_ = 0;
   uint32_t hotplug_head_ = 0, hotplug_count_ = 0, hotplug_dropped_ = 0, connected_pins_ = 0, throttle_reported_ = 0;
   AmdIrq::ISink* observer_ = nullptr;
   UniquePointer<AmdGfx8Compute> compute_;

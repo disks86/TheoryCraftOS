@@ -116,6 +116,7 @@ struct Task final : process::IProcessRuntime {
   uint32_t processor_count() override;
   void memory_status(uint64_t* total_bytes, uint64_t* free_bytes) override;
   bool set_affinity(uint64_t thread_id, uint64_t mask) override;
+  void flush_write_buffers() override;
   bool set_priority(uint64_t thread_id, int32_t absolute_priority) override;
   uint64_t affinity(uint64_t thread_id) override;
   bool cpu_time(uint64_t thread_id, uint64_t* hundred_ns) override;

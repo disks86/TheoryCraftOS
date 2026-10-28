@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Checks the AUX channel port (src/Hardware/GraphicsProcessingUnit/AMD/AmdAux.*) against the Linux driver's atombios.h.
+"""Checks the AUX channel port (src/Hardware/GraphicsProcessingUnit/AMD/AmdAux.*, and AmdPanelPower.* for the eDP panel power) against the Linux driver's atombios.h.
 
   check_aux_port.py path/to/atombios.h
 
@@ -66,6 +66,29 @@ def main():
     # the comments on the hot plug id in atombios.h: 0 = HPD1 ... 5 = HPD6
     if not re.search(r'ucHPD_ID;\s*//=0: HPD1, =1: HPD2, =2: HPD3, =3: HPD4, =4: HPD5, =5: HPD6', h):
         fail('the hot plug id comment changed')
+
+    # the eDP panel power: UNIPHYTransmitterControl is DIG1TransmitterControl, DIG_TRANSMITTER_CONTROL_PARAMETERS has ucAction in byte 3, POWER_ON / POWER_OFF are 12 / 13
+    panel_hpp = open(os.path.join(ROOT, 'AmdPanelPower.hpp')).read()
+    panel_cpp = open(os.path.join(ROOT, 'AmdPanelPower.cpp')).read()
+    if not re.search(r'#define UNIPHYTransmitterControl\s+DIG1TransmitterControl', h):
+        fail('UNIPHYTransmitterControl is no longer DIG1TransmitterControl')
+    k = re.search(r'kCommandTable = (\d+)', panel_hpp)
+    if not k or names.index('DIG1TransmitterControl') != int(k.group(1)):
+        fail('DIG1TransmitterControl index %d, ours %s' % (names.index('DIG1TransmitterControl'), k.group(1) if k else None))
+    m = re.search(r'typedef struct _DIG_TRANSMITTER_CONTROL_PARAMETERS\s*\{(.*?)\}\s*DIG_TRANSMITTER_CONTROL_PARAMETERS;', h, re.S)
+    body = re.sub(r'//[^\n]*', '', m.group(1))
+    u = re.search(r'union\s*\{(.*?)\};', body, re.S)
+    at = max(2 if t == 'USHORT' else 2 if t == 'ATOM_DP_VS_MODE' else 1 for t in re.findall(r'(USHORT|ATOM_DP_VS_MODE|UCHAR)\s+\w+\s*;', u.group(1)))
+    at_action = at + 1       # ucConfig follows the union, ucAction after it
+    if at_action != 3 or not re.search(r'UCHAR\s+ucConfig;.*?UCHAR\s+ucAction;', body, re.S):
+        fail('ucAction is at byte %d, expected 3' % at_action)
+    if not re.search(r'uint32_t\{action\} << 24', panel_cpp):
+        fail('ucAction is not put in byte 3')
+    for n, v in (('kActionPowerOn', 12), ('kActionPowerOff', 13)):
+        g = re.search(r'\b' + n + r' = (\d+)', panel_hpp)
+        d = re.search(r'#define ATOM_TRANSMITTER_ACTION_POWER_%s\s+(\d+)' % ('ON' if v == 12 else 'OFF'), h)
+        if not g or not d or int(g.group(1)) != int(d.group(1)):
+            fail('%s is %s, atombios.h says %s' % (n, g.group(1) if g else None, d.group(1) if d else None))
 
     # DisplayPort (DP 1.2 section 2.7.7, and the DRM helper's defines)
     codes = {'kI2cWrite': 0x0, 'kI2cRead': 0x1, 'kI2cWriteStatusUpdate': 0x2, 'kI2cMot': 0x4, 'kNativeWrite': 0x8, 'kNativeRead': 0x9,

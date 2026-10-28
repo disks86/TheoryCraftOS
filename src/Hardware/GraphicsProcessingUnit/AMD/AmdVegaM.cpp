@@ -18,6 +18,7 @@
 
 
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdVegaM.hpp"
+#include "Hardware/GraphicsProcessingUnit/AMD/AmdPanelPower.hpp"
 #include "Hardware/VideoCodec/AMD/AmdGmc8Memory.hpp"
 #include "Utility/ByteBuffer.hpp"
 
@@ -287,6 +288,7 @@ void AmdVegaM::shutdown() {
   }
   display_irq_ = UniquePointer<amd_dce11::Interrupts>();
   connected_pins_ = 0;
+  rx_pending_ = 0;
   audio_pins_ = 0;
   hotplug_head_ = hotplug_count_ = 0;
   display_ = UniquePointer<amd_dce11::Display>();   // (puts the firmware's framebuffer back)
@@ -417,7 +419,34 @@ class PostHost final : public IAtomHost {
   IVcnRegisters& registers_;
   const IClock& clock_;
 };
+
+// The display engine's hot plug pins, for the wait on an eDP panel's power
+class DisplayHpdSense final : public IHpdSense {
+ public:
+  explicit DisplayHpdSense(amd_dce11::Interrupts* irq) : irq_(irq) {}
+  bool hpd_sense(uint32_t pin) override { return irq_ && irq_->hpd_sense(pin); }
+
+ private:
+  amd_dce11::Interrupts* irq_;
+};
+
+// The AUX channel of a DisplayPort or eDP connector with the interpreter that drives it
+struct AuxSession {
+  PostHost host;
+  AtomBios bios;
+  AmdAux aux;
+  AuxSession(IVcnRegisters& registers, const IClock& clock, ConstByteView vbios, allocators::IAllocator& allocator, const AtomConnectors::Connector& connector)
+      : host(registers, clock), bios(host, vbios, allocator), aux(host, bios, connector.ddc_id, connector.hpd_pin) {}
+};
 }  // namespace
+
+// An eDP panel does not answer on the AUX channel without power: the driver powers it up first and waits for the hot plug pin to show it. (If the wait times out the AUX channel is tried
+// anyway, as the driver does.)
+void AmdVegaM::power_up_panel(const AtomConnectors::Connector& connector, IAtomHost& host, AtomBios& bios) {
+  if (connector.type != AtomConnectors::Type::EmbeddedDisplayPort) return;
+  DisplayHpdSense sense(display_irq_.get());
+  AmdPanelPower::power_on(host, bios, sense, connector.hpd_pin);
+}
 
 bool AmdVegaM::read_edid(const AtomConnectors::Connector& connector, ByteBuffer* out) {
   if (!up() || !inputs_.registers || !inputs_.clock || !connector.has_ddc) return false;
@@ -426,15 +455,125 @@ bool AmdVegaM::read_edid(const AtomConnectors::Connector& connector, ByteBuffer*
   if (!AtomConnectors::uses_aux(connector.type)) return AmdDdc(*inputs_.registers, *inputs_.clock, bus).read_edid(out);
   // DisplayPort and eDP: I2C over the AUX channel, which the video BIOS drives (ProcessAuxChannelTransaction)
   if (!inputs_.allocator) return false;
-  PostHost host(*inputs_.registers, *inputs_.clock);
-  AtomBios bios(host, inputs_.vbios, *inputs_.allocator);
-  if (!bios.valid()) return false;
-  return AmdAux(host, bios, connector.ddc_id, connector.hpd_pin).read_edid(out);
+  AuxSession session(*inputs_.registers, *inputs_.clock, inputs_.vbios, *inputs_.allocator, connector);
+  if (!session.bios.valid()) return false;
+  power_up_panel(connector, session.host, session.bios);
+  return session.aux.read_edid(out);
+}
+
+bool AmdVegaM::read_dpcd(const AtomConnectors::Connector& connector, Dpcd::Capabilities* capabilities, Dpcd::LinkStatus* status) {
+  if (!up() || !inputs_.registers || !inputs_.clock || !inputs_.allocator || !connector.has_ddc || !AtomConnectors::uses_aux(connector.type)) return false;
+  if (!AtomI2c::lookup(inputs_.vbios, connector.ddc_id).valid) return false;
+  AuxSession session(*inputs_.registers, *inputs_.clock, inputs_.vbios, *inputs_.allocator, connector);
+  if (!session.bios.valid()) return false;
+  power_up_panel(connector, session.host, session.bios);
+  Dpcd::Capabilities caps;
+  if (!Dpcd::read_capabilities(session.aux, connector.type == AtomConnectors::Type::EmbeddedDisplayPort, &caps)) return false;
+  if (status && !Dpcd::read_link_status(session.aux, status)) return false;
+  *capabilities = caps;
+  return true;
+}
+
+uint32_t AmdVegaM::service_short_pulses(SinkEvent* out, uint32_t capacity) {
+  uint32_t count = 0;
+  if (!out) capacity = 0;
+  for (uint32_t pin = 0; pin < amd_dce11::Interrupts::kMaxHpd && count < capacity; ++pin) {
+    if (!(rx_pending_ >> pin & 1)) continue;
+    rx_pending_ &= ~(1u << pin);
+    SinkEvent e;
+    e.pin = pin;
+    if (const AtomConnectors::Connector* connector = AtomConnectors::find_pin(connectors(), pin)) {
+      e.has_connector = true;
+      e.connector = *connector;
+    }
+    if (up() && e.has_connector && inputs_.registers && inputs_.clock && inputs_.allocator && e.connector.has_ddc && AtomConnectors::uses_aux(e.connector.type)) {
+      AuxSession session(*inputs_.registers, *inputs_.clock, inputs_.vbios, *inputs_.allocator, e.connector);
+      if (session.bios.valid()) {      // (no panel power-up: a sink that is off does not pulse)
+        e.checked = true;
+        if (!Dpcd::read_lane_count(session.aux, &e.lanes) || !Dpcd::read_link_status(session.aux, &e.status)) {
+          e.read_failed = true;
+          e.lanes = 0;
+          e.status = Dpcd::LinkStatus();
+        } else {
+          e.link_lost = e.lanes > 0 && !e.status.channel_eq_ok(e.lanes);
+          e.test_request = e.status.automated_test_request();
+          e.content_protection = e.status.content_protection_irq();
+          e.sink_specific = e.status.sink_specific_irq();
+          if (!Dpcd::acknowledge_service_irq(session.aux, e.status.irq_vector, &e.acked)) e.handling_failed = true;
+          if (e.test_request) {
+            ByteBuffer edid(*inputs_.allocator);
+            bool ok = Dpcd::read_test_request(session.aux, &e.test_kind);
+            if (ok && e.test_kind == Dpcd::kTestEdidRead) session.aux.read_edid(&edid);     // (no EDID: the buffer stays empty, and the test is answered NAK)
+            ok = ok && Dpcd::answer_test_request(session.aux, e.test_kind, edid.view(), &e.test_response);
+            if (!ok) e.handling_failed = true;
+          }
+        }
+      }
+    }
+    out[count++] = e;
+  }
+  return count;
 }
 
 uint32_t AmdVegaM::refresh_audio_pins() {
   if (!up() || !inputs_.registers) return audio_pins_ = 0;
   return audio_pins_ = amd_dce11::AudioPins(*inputs_.registers).connected_mask(kAudioPins);
+}
+
+bool AmdVegaM::audio_pin_for(const AtomConnectors::Connector& connector, uint32_t* pin) const {
+  if (!AtomConnectors::carries_audio(connector.type) || AtomConnectors::afmt_instance(connector) >= amd_dce11::AudioFormat::kBlocks) return false;     // (kNoDig is past them too)
+  for (uint32_t i = 0; i < kAudioPins; ++i) {
+    if (!(audio_pins_ >> i & 1)) continue;
+    if (pin) *pin = i;
+    return true;
+  }
+  return false;
+}
+
+bool AmdVegaM::select_audio_pin(const AtomConnectors::Connector& connector) {
+  if (!inputs_.registers) return false;
+  refresh_audio_pins();       // (nothing is connected when the card is not up)
+  uint32_t pin = 0;
+  if (!audio_pin_for(connector, &pin)) return false;
+  return amd_dce11::AudioFormat(*inputs_.registers).select_pin(AtomConnectors::afmt_instance(connector), pin);
+}
+
+bool AmdVegaM::enable_audio(const AtomConnectors::Connector& connector, ConstByteView edid, bool interlaced) {
+  if (!inputs_.registers) return false;
+  refresh_audio_pins();       // (nothing is connected when the card is not up)
+  uint32_t pin = 0;
+  if (!audio_pin_for(connector, &pin)) return false;
+  amd_dce11::AudioPins pins(*inputs_.registers);
+  EdidAudio::Info info;
+  EdidAudio::parse(edid, &info);
+  pins.set_enabled(pin, false);                                 // disable audio prior to setting up hw
+  pins.write_speaker_allocation(pin, info);
+  amd_dce11::AudioFormat(*inputs_.registers).select_pin(AtomConnectors::afmt_instance(connector), pin);
+  pins.write_sads(pin, info);                                   // (a monitor without descriptors leaves the registers alone)
+  pins.write_latency(pin, info, interlaced);
+  pins.set_enabled(pin, true);                                  // enable audio after setting up hw
+  return true;
+}
+
+bool AmdVegaM::enable_audio(const AtomConnectors::Connector& connector, bool interlaced) {
+  if (!inputs_.allocator) return false;
+  ByteBuffer edid(*inputs_.allocator);
+  return read_edid(connector, &edid) && enable_audio(connector, edid.view(), interlaced);
+}
+
+bool AmdVegaM::disable_audio(const AtomConnectors::Connector& connector) {
+  if (!up() || !inputs_.registers || AtomConnectors::afmt_instance(connector) >= amd_dce11::AudioFormat::kBlocks) return false;
+  const uint32_t pin = amd_dce11::AudioFormat(*inputs_.registers).selected_pin(AtomConnectors::afmt_instance(connector));
+  return amd_dce11::AudioPins(*inputs_.registers).set_enabled(pin, false);
+}
+
+uint32_t AmdVegaM::select_audio_pins() {
+  uint32_t n = 0;
+  for (const AtomConnectors::Connector& c : connectors()) {
+    if (!AtomConnectors::carries_audio(c.type) || c.hpd_pin >= amd_dce11::Interrupts::kMaxHpd || !(connected_pins_ >> c.hpd_pin & 1)) continue;
+    if (select_audio_pin(c)) ++n;
+  }
+  return n;
 }
 
 uint32_t AmdVegaM::audio_outputs(AtomConnectors::Connector* out, uint32_t capacity) const {
@@ -566,6 +705,7 @@ void AmdVegaM::on_event(const AmdIrq::Event& event) {
       ++hotplug_count_;
       break;
     }
+    case AmdIrq::Kind::DisplayHpdRx: rx_pending_ |= 1u << event.pin; break;
     default: break;
   }
   if (observer_) observer_->on_event(event);

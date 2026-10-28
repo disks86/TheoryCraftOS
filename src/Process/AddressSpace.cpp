@@ -126,6 +126,23 @@ SharedMemory* AddressSpace::shared_at(uint64_t address) const {
   return i < regions_.count() && regions_[i]->base <= address ? regions_[i]->shared : nullptr;
 }
 
+uint32_t AddressSpace::views_of(const SharedMemory* owner, ViewPart* out, uint32_t capacity) const {
+  uint32_t found = 0;
+  for (uint64_t i = 0; i < regions_.count(); ++i) {
+    const Region& r = *regions_[i];
+    if (r.shared != owner || owner == nullptr) continue;
+    if (found < capacity) { out[found].base = r.base; out[found].size = r.size; out[found].storage = r.storage; }
+    ++found;
+  }
+  return found;
+}
+
+const uint8_t* AddressSpace::storage_at(uint64_t address) const {
+  const uint64_t i = first_ending_after(address);
+  if (i >= regions_.count() || regions_[i]->base > address || !regions_[i]->shared) return nullptr;
+  return regions_[i]->storage + (address - regions_[i]->base);
+}
+
 bool AddressSpace::is_shared(uint64_t address) const {
   const uint64_t i = first_ending_after(address);
   return i < regions_.count() && regions_[i]->base <= address && regions_[i]->shared != nullptr;
@@ -231,6 +248,7 @@ bool AddressSpace::break_copy_on_write(uint64_t address, uint64_t size) {
     }
     r.protection |= kProtWrite;
     r.attributes.protect = protect == 0x08 ? 0x04 : 0x40;
+    r.attributes.copied = true;
     any = true;
   }
   if (any) ++generation_;

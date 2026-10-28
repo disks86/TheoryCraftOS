@@ -437,6 +437,15 @@ add_executable(BOOTX64
   src/Graphics/RenderNodeAccel.cpp
   src/Graphics/Renderer2DSlot.cpp
   src/Graphics/GraphicsPool.cpp
+  src/Graphics/SystemDxg.cpp
+  src/Kernel/Dxgkrnl/VidMm.cpp
+  src/Kernel/Dxgkrnl/D3d9Shader.cpp
+  src/Kernel/Dxgkrnl/D3d9Tgsi.cpp
+  src/Kernel/Dxgkrnl/D3d9Dxbc.cpp
+  src/Kernel/Dxgkrnl/D3d9Devices.cpp
+  src/Kernel/Dxgkrnl/D3d9Emit.cpp
+  src/Kernel/Dxgkrnl/Adapter.cpp
+  src/Kernel/Dxgkrnl/DxgKernel.cpp
   src/Graphics/SystemGraphics.cpp
   src/BootLog.cpp
   src/Desktop/Desktop.cpp
@@ -450,6 +459,8 @@ add_executable(BOOTX64
   src/Desktop/Calculator.cpp
   src/Desktop/Calendar.cpp
   src/Desktop/CalendarStore.cpp
+  src/Desktop/Todo.cpp
+  src/Desktop/TodoStore.cpp
   src/Desktop/FileProperties.cpp
   src/Desktop/CopyProgressDialog.cpp
   src/Desktop/DirectoryListing.cpp
@@ -630,6 +641,7 @@ add_executable(BOOTX64
   src/Emulation/X86_64Evex.cpp
   src/Emulation/X86_64EvexMisc.cpp
   src/Emulation/X86_64EvexFp.cpp
+  src/Emulation/X86_64EvexFp16.cpp
   src/Emulation/X86_64EvexExt.cpp
   src/Emulation/AArch64Cpu.cpp
   src/Emulation/AArch64Fp.cpp
@@ -680,10 +692,13 @@ add_executable(BOOTX64
   src/Hardware/GraphicsProcessingUnit/AMD/AmdDdc.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/I2cEdid.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdAux.cpp
+  src/Hardware/GraphicsProcessingUnit/AMD/AmdPanelPower.cpp
+  src/Hardware/GraphicsProcessingUnit/AMD/Dpcd.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdAsicReset.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdIrq.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdSdma3.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdDce11.cpp
+  src/Hardware/GraphicsProcessingUnit/AMD/EdidAudio.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdVegaM.cpp
   src/Hardware/VideoCodec/AMD/AmdUvd6Messages.cpp
   src/Hardware/VideoCodec/AMD/AmdUvd6AvcDecoder.cpp
@@ -896,7 +911,7 @@ if(TCOS_ARCH STREQUAL "x86_64")
   set(WINDOWS_STUB_LIBRARIES user32 gdi32 shell32 ole32 oleaut32 comctl32 comdlg32 rpcrt4 shlwapi winmm version imm32 secur32 crypt32 bcrypt ncrypt userenv setupapi iphlpapi
       dbghelp psapi wininet winhttp wintrust netapi32 dwmapi uxtheme mswsock gdiplus msimg32 opengl32 glu32 dnsapi mpr wtsapi32 powrprof cfgmgr32 d3d9 d3d11 dxgi dwrite shcore
       avrt winspool wevtapi pdh wldap32 urlmon msi propsys hid usp10 winscard odbc32 xinput1_4 dsound dinput8 d2d1 d3dcompiler_47 lz32 oleacc oledlg credui ntdsapi samlib
-      activeds normaliz sensapi)
+      activeds normaliz sensapi authz rasapi32)
   # win32u.dll holds the system-call stubs of win32k (NtUser*, NtGdi*: src/Windows/win32u/services.inc).
   add_custom_command(OUTPUT ${WINDOWS_DIR}/win32u.dll
     COMMAND ${CMAKE_COMMAND} -E make_directory ${WINDOWS_DIR}

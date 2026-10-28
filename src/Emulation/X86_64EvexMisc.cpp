@@ -83,12 +83,12 @@ X86_64Cpu::Step X86_64Cpu::evex_misc(GuestMemory& m, const EvexOp& defn) {
         set_vec(reg, result, 128);
         return finish();
       }
-      if (def->sub == 2) {      // vmovq xmm <- xmm/m64
+      if (def->sub == 2) {      // vmovq xmm <- xmm/m64, vmovw xmm <- xmm/m16
         uint64_t v;
         if (memory) {
-          if (!load(m, memory_address(), 8, &v)) return Step::Fault;
+          if (!load(m, memory_address(), e / 8, &v)) return Step::Fault;
         } else {
-          v = get_vec(rm_reg).q[0];
+          v = get_vec(rm_reg).q[0] & width_mask(e);
         }
         result.q[0] = v;
         set_vec(reg, result, 128);
@@ -99,7 +99,7 @@ X86_64Cpu::Step X86_64Cpu::evex_misc(GuestMemory& m, const EvexOp& defn) {
         if (memory) {
           if (!store(m, memory_address(), e / 8, v)) return Step::Fault;
         } else {
-          set_reg(d_.rm, e / 8, v);
+          set_reg(d_.rm, e < 32 ? 4 : e / 8, v);      // (vmovw zero-extends into the 32-bit register)
         }
       } else if (memory) {      // vmovq xmm/m64 <- xmm
         if (!store(m, memory_address(), 8, v)) return Step::Fault;

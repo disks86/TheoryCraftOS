@@ -39,6 +39,8 @@ struct FakeAuxSink {
   };
 
   std::vector<Request> requests;
+  struct DpcdWrite { uint32_t address; std::vector<uint8_t> bytes; };
+  std::vector<DpcdWrite> dpcd_writes;      // the native writes the sink took, in order
   // the sink
   std::vector<uint8_t> edid, dpcd;
   bool monitor_present = true;
@@ -52,6 +54,7 @@ struct FakeAuxSink {
   bool random_replies = false;
   uint8_t native_reply_extra = 0;      // bits ORed into the status of every answer to a native request (the I2C reply bits mean nothing there)
   bool native_odd_reply = false;       // native requests are answered with a reply command that does not exist
+  uint32_t nack_write_at = 0xFFFFFFFFu;  // native writes to this address are NACKed
   bool zero_reads = false;             // reads are acknowledged with no data
   uint32_t rng = 12345;
 
@@ -109,8 +112,13 @@ struct FakeAuxSink {
       for (uint32_t i = 0; i < count && !zero_reads; ++i) data.push_back(dpcd[address + i]);
       return finish(native_odd_reply ? 0x30 : native_reply_extra, data);
     } else if (command == 8) {
-      if (address + count > dpcd.size()) return finish(0x10);
-      for (uint32_t i = 0; i < count; ++i) dpcd[address + i] = req.bytes[4 + i];
+      if (address + count > dpcd.size() || address == nack_write_at) return finish(0x10);
+      std::vector<uint8_t> written(req.bytes.begin() + 4, req.bytes.begin() + 4 + count);
+      dpcd_writes.push_back({address, written});
+      for (uint32_t i = 0; i < count; ++i) {
+        if (address + i == 0x201) dpcd[address + i] &= static_cast<uint8_t>(~req.bytes[4 + i]);       // the service interrupt bits clear when a 1 is written to them
+        else dpcd[address + i] = req.bytes[4 + i];
+      }
       return finish(native_odd_reply ? 0x30 : native_reply_extra);
     } else {
       const bool mot = command & 4, read = is_read;
@@ -142,6 +150,12 @@ struct FakeAuxSink {
 // (scratch words 1 to 5) to 0x7021..0x7025, then 0x7010 as the doorbell; the answer is read back from 0x7012 (reply status), 0x7013 (length) and 0x7030..0x7033 (the data, 16 bytes).
 struct FakeAuxCard final : IVcnRegisters {
   static constexpr uint32_t kDoorbell = 0x7010, kParams1 = 0x7011, kStatus = 0x7012, kLength = 0x7013, kRequest = 0x7020, kData = 0x7030;
+  // The panel power of an eDP connector, for a video BIOS whose UNIPHYTransmitterControl table writes its first parameter word (ucAction in byte 3: 12 power on, 13 power off) to kPanel.
+  // With unpowered_channel set, the AUX channel of that DDC line does not answer (the reply status says timeout) while the panel is off.
+  static constexpr uint32_t kPanel = 0x7040;
+  uint32_t panel_writes = 0, panel_params = 0;
+  bool panel_on = false;
+  uint8_t unpowered_channel = 0;
   FakeAuxSink sink;
   uint32_t params1 = 0, status = 0, length = 0, request[6] = {}, data[4] = {};
   uint32_t doorbells = 0;
@@ -153,9 +167,20 @@ struct FakeAuxCard final : IVcnRegisters {
   }
   void write(uint32_t r, uint32_t v) override {
     if (r == kParams1) params1 = v;
+    if (r == kPanel) {
+      ++panel_writes;
+      panel_params = v;
+      if (v >> 24 == 12) panel_on = true;
+      if (v >> 24 == 13) panel_on = false;
+    }
     if (r > kRequest && r < kRequest + 6) request[r - kRequest] = v;
     if (r != kDoorbell) return;
     ++doorbells;
+    if (unpowered_channel && (params1 & 0xFF) == unpowered_channel && !panel_on) {
+      status = 1;     // timeout: nobody answers
+      length = 0;
+      return;
+    }
     uint8_t bytes[20];
     for (uint32_t i = 0; i < 20; ++i) bytes[i] = static_cast<uint8_t>(request[1 + i / 4] >> (i % 4 * 8));
     const FakeAuxSink::Answer a = sink.handle(bytes, params1, v & 0xFFFF, v >> 16);

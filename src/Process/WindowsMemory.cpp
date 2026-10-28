@@ -38,9 +38,16 @@ constexpr uint32_t kPageNoAccess = 0x01, kPageReadOnly = 0x02, kPageReadWrite = 
 constexpr uint64_t kAllocationGranularity = 0x10000;
 constexpr uint64_t kChunk = 2048;      // how much of another process's memory is moved at a time
 
-// PAGE_* -> our permission bits. Modifier flags (guard, no-cache, write-combine) are not supported.
+// PAGE_* -> our permission bits. The no-cache and write-combine modifiers are not supported.
 bool page_protection(uint32_t page, uint8_t* out) {
   if (page & ~uint32_t{0x7FF}) return false;
+  if (page & 0x100) {      // PAGE_GUARD: the first access gets the page back with its protection and raises an exception (see guard_fault); until then nothing may touch it
+    if ((page & 0xFF) == kPageNoAccess || (page & 0x600)) return false;
+    uint8_t base = 0;
+    if (!page_protection(page & 0xFF, &base)) return false;
+    *out = 0;
+    return true;
+  }
   switch (page & 0xFF) {
     case kPageNoAccess: *out = 0; return true;
     case kPageReadOnly: *out = kProtRead; return true;
@@ -86,6 +93,32 @@ void set_private_attributes(AddressSpace& space, uint64_t base, uint64_t size, u
   space.set_attributes(base, size, attributes);
 }
 
+// Pages of a view of a SEC_RESERVE section were committed: the section remembers, and the other views of it in this address space show them committed too (with the
+// protection each view was made with).
+void commit_in_section(AddressSpace& space, uint64_t base, uint64_t size) {
+  ObjectManager* objects = system_objects();
+  SharedMemory* owner = space.shared_at(base);
+  const uint8_t* storage = space.storage_at(base);
+  if (!objects || !owner || !storage || !objects->section_reserved(owner)) return;
+  const uint64_t offset = objects->section_offset(owner, storage);
+  objects->section_commit_pages(owner, offset, size);
+  AddressSpace::ViewPart parts[16];
+  const uint32_t count = space.views_of(owner, parts, 16);
+  for (uint32_t i = 0; i < count && i < 16; ++i) {
+    const uint64_t part_offset = objects->section_offset(owner, parts[i].storage);
+    if (part_offset + parts[i].size <= offset || part_offset >= offset + size) continue;
+    if (parts[i].base <= base && base < parts[i].base + parts[i].size && parts[i].base + parts[i].size >= base + size && part_offset <= offset) continue;      // (the view that was committed)
+    const uint64_t from = part_offset > offset ? part_offset : offset;
+    const uint64_t to = part_offset + parts[i].size < offset + size ? part_offset + parts[i].size : offset + size;
+    const uint64_t at = parts[i].base + (from - part_offset);
+    PageAttributes attributes;
+    if (!space.attributes_at(at, &attributes) || !attributes.reserved) continue;
+    uint8_t prot = 0;
+    if (!page_protection(attributes.allocation_protect & 0xFF, &prot)) continue;
+    if (space.protect(at, to - from, prot)) space.set_page_protect(at, to - from, attributes.allocation_protect, false);
+  }
+}
+
 uint32_t vm_allocate(Process& target, uint64_t* base_io, uint64_t* size_io, uint32_t type, uint32_t protect) {
   if (type == (kMemReserve | 0x400000)) type = kMemReserve;      // MEM_PHYSICAL (address windowing): a plain reservation
   AddressSpace* space = target.address_space();
@@ -108,7 +141,7 @@ uint32_t vm_allocate(Process& target, uint64_t* base_io, uint64_t* size_io, uint
   if (size == 0) return kStatusInvalidParameter;
   if ((protect & 0xFF) == kPageWriteCopy || (protect & 0xFF) == kPageExecuteWriteCopy) {      // private memory is not copy-on-write; only a view can be (committing into a view is checked below)
     PageAttributes existing;
-    if (base == 0 || !space->attributes_at(AddressSpace::round_down(base), &existing) || existing.type != PageAttributes::Mapped) return kStatusInvalidPageProtection;
+    if (base == 0 || !space->attributes_at(AddressSpace::round_down(base), &existing) || (existing.type != PageAttributes::Mapped && existing.type != PageAttributes::Image)) return kStatusInvalidPageProtection;
   }
   if (!(type & kMemCommit)) prot = 0;      // reserved memory cannot be touched until it is committed
   uint64_t rounded = 0;
@@ -119,11 +152,14 @@ uint32_t vm_allocate(Process& target, uint64_t* base_io, uint64_t* size_io, uint
       // Committing pages that were reserved earlier.
       if (!(type & kMemCommit)) return kStatusConflictingAddresses;
       PageAttributes existing;
+      if (space->attributes_at(base, &existing) && existing.type == PageAttributes::Image) return kStatusAccessDenied;      // the pages of an image are never committed again
       if (space->attributes_at(base, &existing) && existing.type == PageAttributes::Mapped) {      // a view: a file's pages are already there; plain memory takes what the view allows
         if (existing.file_view) return kStatusAccessDenied;
         if (page_access(protect) & ~page_access(existing.allocation_protect)) return kStatusInvalidParameter;
+        protect |= existing.allocation_protect & 0x200;      // (a no-cache view stays so)
       }
       if (!space->protect(base, rounded, prot) || !space->set_page_protect(base, rounded, protect, false)) return kStatusConflictingAddresses;
+      if (existing.type == PageAttributes::Mapped) commit_in_section(*space, base, rounded);
     } else if (!space->map(base, rounded, prot)) {
       return kStatusConflictingAddresses;
     } else {
@@ -162,6 +198,8 @@ uint32_t vm_free(Process& target, uint64_t* base_io, uint64_t* size_io, uint32_t
     uint64_t rounded = 0;
     base = AddressSpace::round_down(base);
     if (size == 0 || !AddressSpace::round_up(size, &rounded)) return kStatusInvalidParameter;
+    PageAttributes existing;
+    if (space->attributes_at(base, &existing) && existing.type != PageAttributes::Private) return kStatusInvalidParameter;      // the pages of a view stay committed
     if (!space->protect(base, rounded, 0)) return kStatusUnableToFreeVm;      // decommitted pages become inaccessible (their contents are not cleared)
     space->set_page_protect(base, rounded, kPageNoAccess, true);
     *base_io = base;
@@ -200,10 +238,14 @@ uint32_t vm_protect(Process& target, uint64_t* base_io, uint64_t* size_io, uint3
     if (protect == kPageWriteCopy) { protect = kPageReadWrite; prot = kProtRead | kProtWrite; }
     else if (protect == kPageExecuteWriteCopy) { protect = kPageExecuteReadWrite; prot = kProtRead | kProtWrite | kProtExecute; }
   }
-  if (attributes.type == PageAttributes::Image) {      // an image is never written through: asking for write gives copy-on-write
+  if (attributes.type == PageAttributes::Image && attributes.copied) {      // a page of an image that was written to has a copy of its own
+    if (protect == kPageWriteCopy) { protect = kPageReadWrite; prot = kProtRead | kProtWrite; }
+    else if (protect == kPageExecuteWriteCopy) { protect = kPageExecuteReadWrite; prot = kProtRead | kProtWrite | kProtExecute; }
+  } else if (attributes.type == PageAttributes::Image) {      // an image is never written through: asking for write gives copy-on-write
     if (protect == kPageReadWrite) { protect = kPageWriteCopy; prot = kProtRead; }
     else if (protect == kPageExecuteReadWrite) { protect = kPageExecuteWriteCopy; prot = kProtRead | kProtExecute; }
   }
+  if (attributes.type == PageAttributes::Mapped) protect |= attributes.allocation_protect & 0x200;
   if (!space->protect(base, rounded, prot) || !space->set_page_protect(base, rounded, protect, false)) return kStatusConflictingAddresses;
   *base_io = base;
   *size_io = rounded;
@@ -279,11 +321,32 @@ uint32_t vm_read(Process& target, uint64_t address, ByteView out, uint64_t* done
   return n == out.size() ? kStatusSuccess : kStatusPartialCopy;
 }
 
+// How many bytes from `address` on lie in pages that a write may change (read-write, copy-on-write, or the executable versions of those).
+uint64_t writable_prefix(AddressSpace& space, uint64_t address, uint64_t size) {
+  uint64_t done = 0;
+  while (done < size) {
+    const uint64_t at = address + done;
+    if (at < address || at >= AddressSpace::kUserTop) break;
+    PageAttributes attributes;
+    if (!space.attributes_at(AddressSpace::round_down(at), &attributes)) break;
+    if (attributes.protect != 0 && !attributes.reserved) {
+      const uint32_t page = attributes.protect & 0xFF;
+      if (page != kPageReadWrite && page != kPageWriteCopy && page != kPageExecuteReadWrite && page != kPageExecuteWriteCopy) break;
+    } else {
+      uint8_t protection = 0;
+      if (!space.protection_at(at, &protection) || !(protection & kProtWrite)) break;
+    }
+    const uint64_t to_page_end = AddressSpace::kPageSize - (at & (AddressSpace::kPageSize - 1));
+    done += to_page_end < size - done ? to_page_end : size - done;
+  }
+  return done;
+}
+
 uint32_t vm_write(Process& target, uint64_t address, ConstByteView in, uint64_t* done) {
   AddressSpace* space = target.address_space();
   *done = 0;
   if (!space) return kStatusNoMemory;
-  const uint64_t n = committed_prefix(*space, address, in.size());
+  const uint64_t n = writable_prefix(*space, address, in.size());
   if (n > 0 && !space->write_privileged(address, in.first(n))) return kStatusAccessViolation;
   *done = n;
   return n == in.size() ? kStatusSuccess : kStatusPartialCopy;
@@ -306,6 +369,47 @@ uint32_t resolve(Process& p, uint64_t handle, bool* remote, uint64_t* pid) {
 }
 
 }  // namespace
+
+GuardResult guard_fault(Process& process, uint64_t teb, uint64_t address, bool write, ExceptionInfo* info) {
+  AddressSpace* space = process.address_space();
+  if (!space) return GuardResult::NotGuard;
+  const uint64_t page = AddressSpace::round_down(address);
+  PageAttributes attributes;
+  if (!space->attributes_at(page, &attributes) || attributes.reserved || !(attributes.protect & 0x100)) return GuardResult::NotGuard;
+  const uint32_t base_protect = attributes.protect & ~uint32_t{0x100};
+  uint8_t prot = 0;
+  if (!page_protection(base_protect, &prot) || !space->protect(page, AddressSpace::kPageSize, prot) || !space->set_page_protect(page, AddressSpace::kPageSize, base_protect, false)) return GuardResult::NotGuard;
+  // The guard page of a thread's stack: the stack grows by one page, the page below becomes the guard.
+  uint8_t tib[0x20] = {};
+  uint8_t dealloc_bytes[8] = {};
+  uint64_t stack_base = 0, deallocation = 0;
+  if (teb != 0 && space->read_privileged(teb, ByteView(tib, sizeof(tib))) && space->read_privileged(teb + 0x1478, ByteView(dealloc_bytes, 8))) {
+    for (uint32_t i = 0; i < 8; ++i) { stack_base |= uint64_t{tib[8 + i]} << (8 * i); deallocation |= uint64_t{dealloc_bytes[i]} << (8 * i); }
+  }
+  if (deallocation != 0 && page >= deallocation && page < stack_base) {
+    constexpr uint64_t kReserve = 2 * AddressSpace::kPageSize;      // the lowest pages of the stack are never committed: running into them is a stack overflow
+    if (page < deallocation + kReserve) {
+      *info = ExceptionInfo();
+      info->code = 0xC00000FDu;      // STATUS_STACK_OVERFLOW
+      return GuardResult::Exception;
+    }
+    const uint64_t next = page - AddressSpace::kPageSize;
+    PageAttributes below;
+    if (next >= deallocation + kReserve && space->attributes_at(next, &below) && below.reserved) {
+      if (space->protect(next, AddressSpace::kPageSize, 0)) space->set_page_protect(next, AddressSpace::kPageSize, base_protect | 0x100, false);      // (the guard page itself is committed but inaccessible)
+    }
+    uint8_t limit[8];
+    for (uint32_t i = 0; i < 8; ++i) limit[i] = uint8_t(page >> (8 * i));
+    space->write_privileged(teb + 0x10, ConstByteView(limit, 8));      // StackLimit
+    return GuardResult::Retry;
+  }
+  *info = ExceptionInfo();
+  info->code = 0x80000001u;      // STATUS_GUARD_PAGE_VIOLATION
+  info->count = 2;
+  info->information[0] = write ? 1 : 0;
+  info->information[1] = address;
+  return GuardResult::Exception;
+}
 
 uint32_t run_remote(Process& target, IProcessRuntime::RemoteOp& op) {
   if (target.exited()) return kStatusProcessIsTerminating;
@@ -450,7 +554,36 @@ uint32_t move_memory(Process& process, const SyscallRequest& r, bool write) {
   const uint64_t remote_address = r.args[1], local_address = r.args[2], size = r.args[3];
   uint32_t status = kStatusSuccess;
   uint8_t buffer[kChunk];
-  while (copied < size && status == kStatusSuccess) {
+  if (!write && size > 0) {      // memory that cannot be read in full is not read at all
+    uint64_t at = remote_address;
+    const uint64_t end = remote_address + size;
+    if (end < remote_address) status = kStatusPartialCopy;
+    while (status == kStatusSuccess && at < end) {
+      uint8_t info[48];
+      if (remote) {
+        IProcessRuntime::RemoteOp op;
+        op.kind = IProcessRuntime::RemoteOp::Query;
+        op.address = at;
+        if (process.runtime()->remote_operation(pid, op) != kStatusSuccess) { status = kStatusPartialCopy; break; }
+        for (uint32_t i = 0; i < 48; ++i) info[i] = op.info[i];
+      } else {
+        vm_query(process, at, info);
+      }
+      uint64_t region = 0, base = 0;
+      uint32_t state = 0, protect = 0;
+      for (uint32_t i = 0; i < 8; ++i) { region |= uint64_t{info[24 + i]} << (8 * i); base |= uint64_t{info[i]} << (8 * i); }
+      for (uint32_t i = 0; i < 4; ++i) { state |= uint32_t{info[32 + i]} << (8 * i); protect |= uint32_t{info[36 + i]} << (8 * i); }
+      if (state != 0x1000 || protect == 0 || (protect & 0x101) != 0 || region == 0) { status = kStatusPartialCopy; break; }
+      at = base + region;
+    }
+  }
+  if (write && status == kStatusSuccess) {      // a buffer that cannot be read in full is not written at all
+    for (uint64_t at = 0; at < size; at += kChunk) {
+      const uint64_t n = size - at < kChunk ? size - at : kChunk;
+      if (!process.read_user(local_address + at, ByteView(buffer, n))) { status = kStatusPartialCopy; break; }
+    }
+  }
+  while (status == kStatusSuccess && copied < size && status == kStatusSuccess) {
     const uint64_t n = size - copied < kChunk ? size - copied : kChunk;
     if (remote_address + copied < remote_address) { status = kStatusPartialCopy; break; }
     uint64_t done = 0;
@@ -475,7 +608,18 @@ uint32_t move_memory(Process& process, const SyscallRequest& r, bool write) {
       } else {
         status = vm_read(process, remote_address + copied, ByteView(buffer, n), &done);
       }
-      if (done > 0 && !process.write_user(local_address + copied, ConstByteView(buffer, done))) { status = kStatusAccessViolation; }
+      if (done > 0 && !process.write_user(local_address + copied, ConstByteView(buffer, done))) {      // the local buffer ends in unwritable pages: what fits in the pages before them is delivered
+        uint64_t fits = 0;
+        while (fits < done) {
+          const uint64_t at = local_address + copied + fits;
+          const uint64_t to_page_end = AddressSpace::kPageSize - (at & (AddressSpace::kPageSize - 1));
+          const uint64_t part = to_page_end < done - fits ? to_page_end : done - fits;
+          if (!process.write_user(at, ConstByteView(buffer + fits, part))) break;
+          fits += part;
+        }
+        done = fits;
+        status = kStatusPartialCopy;
+      }
     }
     copied += done;
     if (status == kStatusPartialCopy || done < n) break;
