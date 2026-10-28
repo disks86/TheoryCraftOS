@@ -570,6 +570,22 @@ uint8_t protection_of_page(uint32_t page, bool* private_copy, bool* valid = null
 
 }  // namespace
 
+// What NtCreateSection says about a file that is no image this OS can map: the status the headers call for (0 if the headers are fine).
+uint32_t image_header_status(ConstByteView file) {
+  auto le16 = [&](uint64_t at) -> uint32_t { return at <= file.size() && file.size() - at >= 2 ? uint32_t(file[at]) | (uint32_t(file[at + 1]) << 8) : 0; };
+  auto le32 = [&](uint64_t at) -> uint64_t { return at <= file.size() && file.size() - at >= 4 ? uint64_t(le16(at)) | (uint64_t(le16(at + 2)) << 16) : ~uint64_t{0}; };
+  if (file.size() < 0x40 || file[0] != 'M' || file[1] != 'Z') return 0xC000012Fu;      // STATUS_INVALID_IMAGE_NOT_MZ
+  const uint64_t nt = le32(0x3C);
+  if (nt > file.size() || file.size() - nt < 4) return 0xC0000130u;      // STATUS_INVALID_IMAGE_PROTECT
+  if (le16(nt) == 0x454E) {      // "NE": a 16-bit program
+    if (nt + 54 >= file.size()) return 0xC000011Bu;
+    const uint8_t type = file[nt + 54];      // ne_exetyp
+    return type == 2 ? 0xC0000131u : type == 5 ? 0xC0000130u : 0xC000011Bu;      // WIN_16, PROTECT (DOS 4), NE_FORMAT
+  }
+  if (le32(nt) != 0x4550) return 0xC0000130u;
+  return 0;
+}
+
 // NtCreateSection(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PLARGE_INTEGER MaximumSize, ULONG PageProtection, ULONG AllocationAttributes, HANDLE FileHandle): memory to map into
 // address spaces, shared by name; with a file handle it is the file's contents (written back by FlushViewOfFile, when the last view goes and when the section does).
 uint32_t nt_create_section(Process& p, const SyscallRequest& r) {
@@ -596,7 +612,7 @@ uint32_t nt_create_section(Process& p, const SyscallRequest& r) {
     fs = p.files().file_system();
     if (!file->readable) return 0xC0000022u;      // a file that cannot be read cannot be mapped
     if (!file->writable && (page == kPageReadWrite || page == kPageExecuteReadWrite || page == kPageExecuteRead || page == kPageExecuteWriteCopy)) return 0xC0000022u;      // STATUS_ACCESS_DENIED
-    if (size > p.files().size_of(*file) && !file->writable) return 0xC000004Eu;
+    if (size > p.files().size_of(*file) && !file->writable && !(uint32_t(attributes) & 0x1000000u)) return 0xC000004Eu;
   } else if (size == 0) {
     return kInvalidParameter;
   }
@@ -620,11 +636,20 @@ uint32_t nt_create_section(Process& p, const SyscallRequest& r) {
     SharedMemory* owner = nullptr;
     exe::PeFile pe(p.files().allocator());
     ObjectManager::SectionInfo info;
-    if (!objects->section_memory(c.id, &image, &image_size, &owner) || !objects->section_info(c.id, &info) || !pe.parse(ConstByteView(image, info.size)) || !pe.is_pe32_plus() ||
-        pe.machine() != exe::kPeMachineAmd64) {
-      objects->release(c.id);
-      return 0xC000007Bu;
+    if (!objects->section_memory(c.id, &image, &image_size, &owner) || !objects->section_info(c.id, &info)) { objects->release(c.id); return 0xC000007Bu; }
+    uint32_t header = image_header_status(ConstByteView(image, info.size));
+    if (header == 0) {
+      const bool parsed = pe.parse(ConstByteView(image, info.size));
+      const bool good_pair = parsed && ((pe.is_pe32_plus() && pe.machine() == exe::kPeMachineAmd64) || (!pe.is_pe32_plus() && pe.machine() == 0x14C));      // PE32+ for x86-64, PE32 for i386
+      if (!good_pair) header = 0xC000007Bu;
     }
+    if (header != 0) {
+      objects->release(c.id);
+      return header;
+    }
+    uint64_t image_rounded = 0;
+    if (!AddressSpace::round_up(pe.size_of_image(), &image_rounded) || size > image_rounded) { objects->release(c.id); return 0xC0000040u; }      // STATUS_SECTION_TOO_BIG
+    objects->section_set_reported_size(c.id, size != 0 ? size : image_rounded);
   }
   return give_handle(p, *objects, ObjectKind::Section, c.id, r.args[0], c.status, wants_inherit(p, r.args[2]));
 }
@@ -657,7 +682,7 @@ uint32_t query_image_information(Process& p, const SyscallRequest& r, uint32_t i
   exe::PeFile pe(p.files().allocator());
   if (!pe.parse(ConstByteView(storage, info.size))) return 0xC000007Bu;
   uint8_t out[64];
-  describe_pe_image(pe, info.size, out);
+  describe_pe_image(pe, info.size, out, ConstByteView(storage, info.size));
   if (!p.write_user(r.args[2], ConstByteView(out, 64))) return kAccessViolation;
   if (returned_at != 0 && !p.write_user_u64(returned_at, 64)) return kAccessViolation;
   return kSuccess;
@@ -681,7 +706,7 @@ uint32_t nt_query_section(Process& p, const SyscallRequest& r) {
   if (information_class == 1) return query_image_information(p, r, id, info, length, returned_at);      // SectionImageInformation
   if (length < 24) return 0xC0000004u;      // STATUS_INFO_LENGTH_MISMATCH
   uint8_t out[24] = {};
-  const uint64_t size = (info.size + 4095) & ~uint64_t{4095};
+  const uint64_t size = info.reported_size != 0 ? info.reported_size : (info.size + 4095) & ~uint64_t{4095};
   for (uint32_t i = 0; i < 4; ++i) out[8 + i] = uint8_t(info.attributes >> (8 * i));
   for (uint32_t i = 0; i < 8; ++i) out[16 + i] = uint8_t(size >> (8 * i));
   if (!p.write_user(r.args[2], ConstByteView(out, 24))) return kAccessViolation;

@@ -119,6 +119,7 @@ uint32_t vm_allocate(Process& target, uint64_t* base_io, uint64_t* size_io, uint
       // Committing pages that were reserved earlier.
       if (!(type & kMemCommit)) return kStatusConflictingAddresses;
       PageAttributes existing;
+      if (space->attributes_at(base, &existing) && existing.type == PageAttributes::Image) return kStatusAccessDenied;      // the pages of an image are never committed again
       if (space->attributes_at(base, &existing) && existing.type == PageAttributes::Mapped) {      // a view: a file's pages are already there; plain memory takes what the view allows
         if (existing.file_view) return kStatusAccessDenied;
         if (page_access(protect) & ~page_access(existing.allocation_protect)) return kStatusInvalidParameter;
