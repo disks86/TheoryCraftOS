@@ -497,7 +497,8 @@ X86_64Cpu::Step X86_64Cpu::step(GuestMemory& m) {
   auto advance = [&]() { s_.rip += d_.position; };
   auto bad_decode = [&]() { return fail(d_.available < 15 ? 14 : 6, s_.rip + d_.available); };
 
-  if (op == 0xC4 || op == 0xC5) return step_vex(m, op);      // (in 64-bit mode these are always the VEX prefix)
+  if (op == 0xC4 || op == 0xC5) return step_vex(m, op);
+  if (op == 0x62) return step_evex(m);      // (in 64-bit mode this is always the EVEX prefix)      // (in 64-bit mode these are always the VEX prefix)
   if (op == 0x0F) {
     result = step_0f(m);
     return result;
@@ -956,7 +957,7 @@ X86_64Cpu::Step X86_64Cpu::step_0f(GuestMemory& m) {
       if (!decode_modrm() || !finish_decode()) return bad_decode();
       if (d_.mod != 3 || (d_.reg & 7) != 2 || (d_.rm & 7) != 0) return fail(6);
       if (static_cast<uint32_t>(s_.r[1]) != 0) return fail(13);
-      s_.r[0] = 7;
+      s_.r[0] = 0xE7;      // x87, SSE, AVX, opmask, ZMM_Hi256 and Hi16_ZMM state
       s_.r[2] = 0;
       advance();
       return Step::Ok;
@@ -1017,13 +1018,18 @@ X86_64Cpu::Step X86_64Cpu::step_0f(GuestMemory& m) {
         a = 0x00000F00u;
         dx = (1u << 4) | (1u << 8) | (1u << 15) | (1u << 23) | (1u << 24) | (1u << 25) | (1u << 26);      // TSC, CX8, CMOV, MMX, FXSR, SSE, SSE2
         c = (1u << 0) | (1u << 9) | (1u << 12) | (1u << 19) | (1u << 20) | (1u << 22) | (1u << 23) | (1u << 26) | (1u << 27) | (1u << 28) | (1u << 29) | (1u << 1) | (1u << 25);      // SSE3, SSSE3, FMA, SSE4.1, SSE4.2, MOVBE, POPCNT, XSAVE, OSXSAVE, AVX, F16C, PCLMULQDQ, AES
+      } else if (leaf == 7 && static_cast<uint32_t>(s_.r[1]) == 1) {
+        a = (1u << 0) | (1u << 2) | (1u << 5);      // SHA512, SM4 (SM3 is not implemented), AVX512_BF16
       } else if (leaf == 7 && static_cast<uint32_t>(s_.r[1]) == 0) {
-        b = (1u << 3) | (1u << 5) | (1u << 8) | (1u << 29);      // BMI1, AVX2, BMI2, SHA
-        c = (1u << 9) | (1u << 10);      // VAES, VPCLMULQDQ
+        b = (1u << 3) | (1u << 5) | (1u << 8) | (1u << 29) | (1u << 16) | (1u << 17) | (1u << 21) | (1u << 28) | (1u << 30) | (1u << 31);      // BMI1, AVX2, BMI2, SHA, AVX512F, DQ, IFMA, CD, BW, VL
+        c = (1u << 1) | (1u << 6) | (1u << 8) | (1u << 9) | (1u << 10) | (1u << 11) | (1u << 12) | (1u << 14);      // VBMI, VBMI2, GFNI, VAES, VPCLMULQDQ, VNNI, BITALG, VPOPCNTDQ
       } else if (leaf == 0xD) {
         const uint32_t sub = static_cast<uint32_t>(s_.r[1]);
-        if (sub == 0) { a = 7; b = 832; c = 832; }      // x87, SSE and AVX state; 512 + 64 + 256 bytes
+        if (sub == 0) { a = 0xE7; b = 2688; c = 2688; }      // x87, SSE, AVX and the AVX-512 state; 512 + 64 + 256 + ... bytes
         else if (sub == 2) { a = 256; b = 576; }      // the AVX component: 256 bytes at offset 576
+        else if (sub == 5) { a = 64; b = 1088; }      // opmask registers
+        else if (sub == 6) { a = 512; b = 1152; }      // the upper halves of ZMM0..15
+        else if (sub == 7) { a = 1024; b = 1664; }      // ZMM16..31
       } else if (leaf == 0x80000000u) {
         a = 0x80000001u;
       } else if (leaf == 0x80000001u) {

@@ -598,4 +598,211 @@ void decode_document(ConstByteView bytes, StringView content_type, String* text,
   decode_legacy(e, &state, ConstByteView(bytes.data() + skip, bytes.size() - skip), true, false, text);
 }
 
+namespace {
+
+// The first pointer of `table` (of `count` entries) that holds `cp`, from `from`; -1 for none.
+template <typename T>
+int64_t first_pointer(const T* table, uint32_t count, uint32_t cp, uint32_t from = 0) {
+  for (uint32_t i = from; i < count; ++i)
+    if (table[i] == cp) return i;
+  return -1;
+}
+template <typename T>
+int64_t last_pointer(const T* table, uint32_t count, uint32_t cp) {
+  for (uint32_t i = count; i > 0; --i)
+    if (table[i - 1] == cp) return i - 1;
+  return -1;
+}
+constexpr uint32_t count_of_big5 = sizeof(kIndexBig5) / sizeof(kIndexBig5[0]);
+constexpr uint32_t count_of_euc_kr = sizeof(kIndexEucKr) / sizeof(kIndexEucKr[0]);
+constexpr uint32_t count_of_gb18030 = sizeof(kIndexGb18030) / sizeof(kIndexGb18030[0]);
+constexpr uint32_t count_of_jis0208 = sizeof(kIndexJis0208) / sizeof(kIndexJis0208[0]);
+
+// The index jis0208 pointer for cp, not counting the pointers in [skip_from, skip_to] (Shift_JIS leaves out 8272 to 8835).
+int64_t jis0208_pointer(uint32_t cp, uint32_t skip_from = 1, uint32_t skip_to = 0) {
+  for (uint32_t i = 0; i < count_of_jis0208; ++i) {
+    if (i >= skip_from && i <= skip_to) continue;
+    if (kIndexJis0208[i] == cp) return i;
+  }
+  return -1;
+}
+
+void put(String* bytes, uint32_t b) { bytes->push_back(static_cast<char>(b)); }
+
+}  // namespace
+
+Encoding output_encoding(Encoding e) { return e == Encoding::Utf16Be || e == Encoding::Utf16Le || e == Encoding::Replacement ? Encoding::Utf8 : e; }
+
+bool encode_code_point(Encoding e, EncoderState* state, uint32_t cp, String* bytes, uint32_t* unencodable) {
+  *unencodable = cp;
+  e = output_encoding(e);
+  if (e == Encoding::Utf8) {
+    if (cp >= 0xD800 && cp <= 0xDFFF) cp = 0xFFFD;
+    append_utf8(cp, bytes);
+    return true;
+  }
+  if (e == Encoding::Iso2022Jp) {
+    enum : uint32_t { kA, kRoman, kJis };
+    for (;;) {   // (a code point that is "restored" is looked at again after the bytes that change the character set)
+      if ((state->mode == kA || state->mode == kRoman) && (cp == 0x0E || cp == 0x0F || cp == 0x1B)) { *unencodable = 0xFFFD; return false; }
+      if (state->mode == kA && cp <= 0x7F) { put(bytes, cp); return true; }
+      if (state->mode == kRoman && ((cp <= 0x7F && cp != 0x5C && cp != 0x7E) || cp == 0xA5 || cp == 0x203E)) {
+        put(bytes, cp == 0xA5 ? 0x5C : cp == 0x203E ? 0x7E : cp);
+        return true;
+      }
+      if (cp <= 0x7F && state->mode != kA) { state->mode = kA; put(bytes, 0x1B); put(bytes, 0x28); put(bytes, 0x42); continue; }
+      if ((cp == 0xA5 || cp == 0x203E) && state->mode != kRoman) { state->mode = kRoman; put(bytes, 0x1B); put(bytes, 0x28); put(bytes, 0x4A); continue; }
+      if (cp == 0x2212) cp = 0xFF0D;
+      uint32_t looked = cp;
+      if (cp >= 0xFF61 && cp <= 0xFF9F) looked = kIndexIso2022JpKatakana[cp - 0xFF61];
+      const int64_t pointer = jis0208_pointer(looked);
+      if (pointer < 0) {
+        if (state->mode == kJis) { state->mode = kA; put(bytes, 0x1B); put(bytes, 0x28); put(bytes, 0x42); continue; }
+        *unencodable = cp;
+        return false;
+      }
+      if (state->mode != kJis) { state->mode = kJis; put(bytes, 0x1B); put(bytes, 0x24); put(bytes, 0x42); continue; }
+      put(bytes, static_cast<uint32_t>(pointer) / 94 + 0x21);
+      put(bytes, static_cast<uint32_t>(pointer) % 94 + 0x21);
+      return true;
+    }
+  }
+  if (e == Encoding::Gbk || e == Encoding::Gb18030) {
+    if (cp <= 0x7F) { put(bytes, cp); return true; }
+    if (cp == 0xE5E5) return false;
+    if (e == Encoding::Gbk && cp == 0x20AC) { put(bytes, 0x80); return true; }
+    static const struct { uint16_t cp, bytes; } kCompat[] = {   // (what GB18030-2005 had: the decoder gives other characters for these bytes now)
+        {0xE78D, 0xA6D9}, {0xE78E, 0xA6DA}, {0xE78F, 0xA6DB}, {0xE790, 0xA6DC}, {0xE791, 0xA6DD}, {0xE792, 0xA6DE}, {0xE793, 0xA6DF}, {0xE794, 0xA6EC}, {0xE795, 0xA6ED},
+        {0xE796, 0xA6F3}, {0xE81E, 0xFE59}, {0xE826, 0xFE61}, {0xE82B, 0xFE66}, {0xE82C, 0xFE67}, {0xE832, 0xFE6D}, {0xE843, 0xFE7E}, {0xE854, 0xFE90}, {0xE864, 0xFEA0}};
+    for (const auto& row : kCompat)
+      if (row.cp == cp) { put(bytes, row.bytes >> 8); put(bytes, row.bytes & 0xFF); return true; }
+    const int64_t pointer = cp > 0xFFFF ? -1 : first_pointer(kIndexGb18030, count_of_gb18030, cp);
+    if (pointer >= 0) {
+      const uint32_t trail = static_cast<uint32_t>(pointer) % 190;
+      put(bytes, static_cast<uint32_t>(pointer) / 190 + 0x81);
+      put(bytes, trail + (trail < 0x3F ? 0x40 : 0x41));
+      return true;
+    }
+    if (e == Encoding::Gbk) return false;
+    uint32_t range_pointer = 0;
+    if (cp == 0xE7C7) range_pointer = 7457;
+    else {
+      uint32_t offset = 0, pointer_offset = 0;
+      for (const Gb18030Range& range : kGb18030Ranges) {
+        if (range.code_point > cp) break;
+        offset = range.code_point;
+        pointer_offset = range.pointer;
+      }
+      range_pointer = pointer_offset + cp - offset;
+    }
+    put(bytes, range_pointer / (10 * 126 * 10) + 0x81);
+    put(bytes, range_pointer % (10 * 126 * 10) / (10 * 126) + 0x30);
+    put(bytes, range_pointer % (10 * 126) / 10 + 0x81);
+    put(bytes, range_pointer % 10 + 0x30);
+    return true;
+  }
+  if (e == Encoding::Big5) {
+    if (cp <= 0x7F) { put(bytes, cp); return true; }
+    const uint32_t floor = (0xA1 - 0x81) * 157;   // (the pointers below are not used to encode)
+    int64_t pointer = -1;
+    if (cp == 0x2550 || cp == 0x255E || cp == 0x2561 || cp == 0x256A || cp == 0x5341 || cp == 0x5345) {
+      pointer = last_pointer(kIndexBig5, count_of_big5, cp);
+      if (pointer < static_cast<int64_t>(floor)) pointer = -1;
+    } else {
+      pointer = first_pointer(kIndexBig5, count_of_big5, cp, floor);
+    }
+    if (pointer < 0) return false;
+    const uint32_t trail = static_cast<uint32_t>(pointer) % 157;
+    put(bytes, static_cast<uint32_t>(pointer) / 157 + 0x81);
+    put(bytes, trail + (trail < 0x3F ? 0x40 : 0x62));
+    return true;
+  }
+  if (e == Encoding::EucJp) {
+    if (cp <= 0x7F) { put(bytes, cp); return true; }
+    if (cp == 0xA5) { put(bytes, 0x5C); return true; }
+    if (cp == 0x203E) { put(bytes, 0x7E); return true; }
+    if (cp >= 0xFF61 && cp <= 0xFF9F) { put(bytes, 0x8E); put(bytes, cp - 0xFF61 + 0xA1); return true; }
+    if (cp == 0x2212) cp = 0xFF0D;
+    const int64_t pointer = jis0208_pointer(cp);
+    if (pointer < 0) return false;
+    put(bytes, static_cast<uint32_t>(pointer) / 94 + 0xA1);
+    put(bytes, static_cast<uint32_t>(pointer) % 94 + 0xA1);
+    return true;
+  }
+  if (e == Encoding::ShiftJis) {
+    if (cp <= 0x80) { put(bytes, cp); return true; }
+    if (cp == 0xA5) { put(bytes, 0x5C); return true; }
+    if (cp == 0x203E) { put(bytes, 0x7E); return true; }
+    if (cp >= 0xFF61 && cp <= 0xFF9F) { put(bytes, cp - 0xFF61 + 0xA1); return true; }
+    if (cp == 0x2212) cp = 0xFF0D;
+    const int64_t pointer = jis0208_pointer(cp, 8272, 8835);
+    if (pointer < 0) return false;
+    const uint32_t lead = static_cast<uint32_t>(pointer) / 188, trail = static_cast<uint32_t>(pointer) % 188;
+    put(bytes, lead + (lead < 0x1F ? 0x81 : 0xC1));
+    put(bytes, trail + (trail < 0x3F ? 0x40 : 0x41));
+    return true;
+  }
+  if (e == Encoding::EucKr) {
+    if (cp <= 0x7F) { put(bytes, cp); return true; }
+    const int64_t pointer = cp > 0xFFFF ? -1 : first_pointer(kIndexEucKr, count_of_euc_kr, cp);
+    if (pointer < 0) return false;
+    put(bytes, static_cast<uint32_t>(pointer) / 190 + 0x81);
+    put(bytes, static_cast<uint32_t>(pointer) % 190 + 0x41);
+    return true;
+  }
+  if (e == Encoding::XUserDefined) {
+    if (cp <= 0x7F) { put(bytes, cp); return true; }
+    if (cp >= 0xF780 && cp <= 0xF7FF) { put(bytes, cp - 0xF780 + 0x80); return true; }
+    return false;
+  }
+  // the single byte encodings
+  if (cp <= 0x7F) { put(bytes, cp); return true; }
+  const int row = kSingleByteRowOf[static_cast<int>(e)];
+  if (row < 0 || cp > 0xFFFF) return false;
+  const int64_t pointer = first_pointer(kSingleByteRows[row], 128, cp);
+  if (pointer < 0) return false;
+  put(bytes, static_cast<uint32_t>(pointer) + 0x80);
+  return true;
+}
+
+void encode_finish(Encoding e, EncoderState* state, String* bytes) {
+  if (output_encoding(e) == Encoding::Iso2022Jp && state->mode != 0) {
+    state->mode = 0;
+    put(bytes, 0x1B); put(bytes, 0x28); put(bytes, 0x42);
+  }
+}
+
+void encode_url_query(Encoding e, StringView text, bool special, String* out) {
+  static const char kHex[] = "0123456789ABCDEF";
+  auto push_byte = [&](uint32_t b) {   // percent-encode with the query set
+    const bool in_set = b <= 0x20 || b == '"' || b == '#' || b == '<' || b == '>' || b > 0x7E || (special && b == '\'');
+    if (in_set) {
+      out->push_back('%');
+      out->push_back(kHex[b >> 4]);
+      out->push_back(kHex[b & 15]);
+    } else {
+      out->push_back(static_cast<char>(b));
+    }
+  };
+  EncoderState state;
+  for (uint64_t at = 0; at < text.size();) {
+    const uint32_t cp = next_code_point(text, &at);
+    String chunk(out->allocator());
+    uint32_t bad = 0;
+    if (encode_code_point(e, &state, cp, &chunk, &bad)) {
+      for (const char c : chunk.view()) push_byte(static_cast<uint8_t>(c));
+    } else {
+      for (const char c : chunk.view()) push_byte(static_cast<uint8_t>(c));   // (bytes that came before the refusal, such as a switch to ASCII)
+      out->append("%26%23");
+      String number(out->allocator());
+      number.append_uint(bad);
+      out->append(number.view());
+      out->append("%3B");
+    }
+  }
+  String tail(out->allocator());
+  encode_finish(e, &state, &tail);
+  for (const char c : tail.view()) push_byte(static_cast<uint8_t>(c));
+}
+
 }  // namespace dom

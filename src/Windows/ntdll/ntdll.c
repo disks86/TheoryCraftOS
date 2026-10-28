@@ -961,7 +961,10 @@ EXPORT NTSTATUS NTAPI RtlEnterCriticalSection(PRTL_CRITICAL_SECTION cs) {
     ++cs->LockCount;
     return STATUS_SUCCESS;
   }
-  while (!__sync_bool_compare_and_swap(&cs->LockCount, -1, 0)) NtYieldExecution();
+  while (!__sync_bool_compare_and_swap(&cs->LockCount, -1, 0)) {
+    if (g_process_ending) { cs->LockCount = 0; break; }      /* (the other threads are gone: a section one of them held is taken over rather than waited for) */
+    NtYieldExecution();
+  }
   cs->OwningThread = me;
   cs->RecursionCount = 1;
   return STATUS_SUCCESS;

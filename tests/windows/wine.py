@@ -203,6 +203,15 @@ def do_build(out, names):
         libs = ["-l" + i for i in imports + [dll] + COMMON_LIBS]
         libs = [l for i, l in enumerate(libs) if l not in libs[:i]]
         libs = available(libs) + [guids]
+        # Wine links its tests against more libraries than a plain link would import (a test that looks for a library in its own process needs it there): force_imports.txt has
+        # lines "<test>: <symbol> ..." whose symbols are kept as undefined so that the import is made.
+        forced = {}
+        fi = os.path.join(src, "force_imports.txt")
+        if os.path.exists(fi):
+            for line in open(fi):
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    forced[k.strip()] = ["-Wl,-u," + x for x in v.split()]
         # lets the link of a test see its DLL's import library first
         for s, o, names_in in tests:
             others = [t[1] for t in tests if t[1] != o]
@@ -219,7 +228,7 @@ def do_build(out, names):
                 exe = os.path.join(OUT, "%s_%s.exe" % (dll, name))
                 # the test, the helper files, and (if it needs them) the other tests of the DLL, which are kept out of the link by --gc-sections
                 for extra in ([], helpers, helpers + others):
-                    r = run([CC, "-o", exe, tlo, o, shim_obj] + extra + ["-Wl,--gc-sections"] + libs)
+                    r = run([CC, "-o", exe, tlo, o, shim_obj] + extra + ["-Wl,--gc-sections"] + forced.get(name, []) + libs)
                     if r.returncode == 0:
                         break
                 if r.returncode:
