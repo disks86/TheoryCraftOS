@@ -98,6 +98,16 @@ struct FakeClip final : IVideoClip {
   }
 };
 
+// The results of a real web-platform-tests file (testharness.js) as lines of the log: "WPT <status> <name> :: <message>" per test, "WPTDONE <status> <message>" at the end.
+static const char kWptReporter[] = R"JS(
+(function () {
+  var names = ['PASS', 'FAIL', 'TIMEOUT', 'NOTRUN', 'PRECONDITION_FAILED'];
+  var clean = function (s) { return String(s).replace(/[\r\n]+/g, ' ').slice(0, 300); };
+  add_result_callback(function (t) { console.log('WPT ' + names[t.status] + ' ' + clean(t.name) + ' :: ' + clean(t.message || '')); });
+  add_completion_callback(function (tests, status) { console.log('WPTDONE ' + status.status + ' ' + clean(status.message || '')); });
+}());
+)JS";
+
 // A network that hands out canned answers keyed by "METHOD url" (404 for anything else) and remembers what was sent.
 struct FakeNet final : IPageLoader {
   struct Answer {
@@ -119,14 +129,23 @@ struct FakeNet final : IPageLoader {
     if (it != answers.end()) a = it->second;
     else a.status = 404;
     if (it == answers.end() && getenv("PROBE_ROOT") && key.find("GET https://app.example/") == 0) {   // (PROBE: files of a directory are the site)
-      const std::string path = std::string(getenv("PROBE_ROOT")) + "/" + key.substr(strlen("GET https://app.example/"));
-      if (FILE* f = fopen(path.c_str(), "rb")) {
+      std::string rel = key.substr(strlen("GET https://app.example/"));
+      const size_t cut = rel.find_first_of("?#");
+      if (cut != std::string::npos) rel.resize(cut);
+      const std::string path = std::string(getenv("PROBE_ROOT")) + "/" + rel;
+      if (getenv("WPT_REAL_FILE") && rel == "resources/testharnessreport.js") {   // (the real WPT runs: the results of the harness go to the log)
+        a.status = 200;
+        a.headers = "Content-Type: application/javascript\r\n";
+        a.body = kWptReporter;
+      } else if (FILE* f = fopen(path.c_str(), "rb")) {
         a.status = 200;
         a.body.clear();
         int c;
         while ((c = fgetc(f)) != EOF) a.body.push_back(static_cast<char>(c));
         fclose(f);
-        a.headers = path.size() > 3 && path.substr(path.size() - 3) == ".js" ? "Content-Type: application/javascript\r\n" : "Content-Type: text/html\r\n";
+        auto ends = [&](const char* suffix) { const size_t n = strlen(suffix); return path.size() >= n && path.compare(path.size() - n, n, suffix) == 0; };
+        a.headers = ends(".js") || ends(".mjs") ? "Content-Type: application/javascript\r\n" : ends(".json") ? "Content-Type: application/json\r\n" : ends(".svg") ? "Content-Type: image/svg+xml\r\n"
+                  : ends(".xml") ? "Content-Type: application/xml\r\n" : ends(".css") ? "Content-Type: text/css\r\n" : ends(".txt") ? "Content-Type: text/plain\r\n" : ends(".xhtml") ? "Content-Type: application/xhtml+xml\r\n" : "Content-Type: text/html\r\n";
       }
     }
     if (request.headers.contains("If-None-Match")) {   // a revalidation: the answer "<key>#304" if the test has one
@@ -283,6 +302,23 @@ struct FakeEnvironment final : IPageEnvironment {
   bool fetch_text(StringView address, uint64_t, String* text) override {
     fetched.push_back(std::string(address.data(), address.size()));
     auto it = files.find(fetched.back());
+    if (it == files.end() && getenv("WPT_REAL_FILE") && fetched.back().compare(0, 20, "https://app.example/") == 0) {   // (a real web-platform-tests run: the checkout is the site)
+      std::string rel = fetched.back().substr(20);
+      const size_t cut = rel.find_first_of("?#");
+      if (cut != std::string::npos) rel.resize(cut);
+      if (rel == "resources/testharnessreport.js") {
+        text->assign(StringView(kWptReporter, strlen(kWptReporter)));
+        return true;
+      }
+      if (FILE* f = fopen((std::string(getenv("PROBE_ROOT")) + "/" + rel).c_str(), "rb")) {
+        std::string body;
+        int c;
+        while ((c = fgetc(f)) != EOF) body.push_back(static_cast<char>(c));
+        fclose(f);
+        text->assign(StringView(body.data(), body.size()));
+        return true;
+      }
+    }
     if (it == files.end()) return false;
     text->assign(StringView(it->second.data(), it->second.size()));
     return true;
@@ -5976,7 +6012,51 @@ static void test_wpt() {
   }
 }
 
+// WPT_ROOT=<checkout> WPT_REAL_FILE=<path in it>: one test file of the real web-platform-tests is loaded as https://app.example/<path> (the checkout is the site) and its
+// harness results are printed as "WPT ..." lines. .html and .htm are pages; .window.js and .any.js get the page that wpt serves for them (META: script lines included).
+static int run_real_wpt(const char* root, const char* file) {
+  auto read_all = [](const std::string& path) { std::string s; if (FILE* f = fopen(path.c_str(), "rb")) { int c; while ((c = fgetc(f)) != EOF) s.push_back(static_cast<char>(c)); fclose(f); } return s; };
+  const std::string path = file, source = read_all(std::string(root) + "/" + path);
+  if (source.empty()) { printf("WPTDONE MISSING no such file\n"); return 1; }
+  auto ends = [&](const char* suffix) { const size_t n = strlen(suffix); return path.size() >= n && path.compare(path.size() - n, n, suffix) == 0; };
+  std::string html = source;
+  if (ends(".window.js") || ends(".any.js")) {
+    html = "<!doctype html><meta charset=utf-8><script src=\"/resources/testharness.js\"></script><script src=\"/resources/testharnessreport.js\"></script>";
+    for (size_t at = 0; at < source.size();) {
+      size_t end = source.find('\n', at);
+      if (end == std::string::npos) end = source.size();
+      const std::string line = source.substr(at, end - at);
+      if (line.compare(0, 16, "// META: script=") == 0) html += "<script src=\"" + line.substr(16) + "\"></script>";
+      else if (line.compare(0, 2, "//") != 0 && !line.empty()) break;
+      at = end + 1;
+    }
+    html += "<script src=\"" + path.substr(path.rfind('/') == std::string::npos ? 0 : path.rfind('/') + 1) + "\"></script>";   // (the file is next to the page)
+  }
+  setenv("PROBE_ROOT", root, 1);
+  TestAllocator a;
+  {
+    FakeEnvironment env(a);
+    MediaEnvironment media;
+    Page page(a, env, (std::string("https://app.example/") + path).c_str(), media, true);
+    page.load(html.c_str());
+    for (int i = 0; i < 20000; ++i) {
+      double due;
+      if (!page.next_timer(&due)) break;
+      if (due > env.clock) env.clock = static_cast<uint64_t>(due);
+      page.run_due_timers(env.clock);
+      const std::string log(page.log().data(), page.log().size());
+      if (log.find("WPTDONE") != std::string::npos) break;
+    }
+    const std::string log(page.log().data(), page.log().size());
+    printf("%s", log.c_str());
+    if (log.find("WPTDONE") == std::string::npos) printf("WPTDONE NOFINISH the harness did not finish\n");
+  }
+  fflush(stdout);
+  _Exit(0);   // (no leak check, no teardown: the runs are for the list of results)
+}
+
 int main(int argc, char** argv) {
+  if (const char* real = getenv("WPT_REAL_FILE")) return run_real_wpt(getenv("WPT_ROOT") ? getenv("WPT_ROOT") : ".", real);
   if (const char* probe = getenv("PROBE")) {   // runs script files (comma separated: one document after the other) and prints what they logged (for looking at what an API has)
     std::vector<Visit> list;
     std::string names = probe;

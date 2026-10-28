@@ -696,6 +696,7 @@ EXPORT DWORD WINAPI GetModuleFileNameW(HMODULE module, LPWSTR buffer, DWORD capa
   }
   memcpy(buffer, m->FullDllName.Buffer, length * 2);
   buffer[length] = 0;
+  set_error(ERROR_SUCCESS);
   return length;
 }
 EXPORT DWORD WINAPI GetModuleFileNameA(HMODULE module, LPSTR buffer, DWORD capacity) {
@@ -801,7 +802,8 @@ EXPORT HMODULE WINAPI LoadLibraryExW(LPCWSTR name, HANDLE file, DWORD flags) {
   if (find_file(name, dll, g_dll_directory, path)) unicode_string(&us, path);
   else unicode_string(&us, name);
   PVOID handle = NULL;
-  const NTSTATUS status = LdrLoadDll(NULL, NULL, &us, &handle);
+  ULONG ldr_flags = (flags & 1) ? 2 : 0;      /* DONT_RESOLVE_DLL_REFERENCES = LDR_DONT_RESOLVE_REFS */
+  const NTSTATUS status = LdrLoadDll(NULL, &ldr_flags, &us, &handle);
   if (!NT_SUCCESS(status)) { set_error(dos_error_of_load(status)); return NULL; }
   return (HMODULE)handle;
 }

@@ -27,6 +27,12 @@ constexpr char kPlain[] = "abcdefghijklmnopqrstuvwxyz1234567890\n\x1b\b\t -=[]\\
 constexpr char kShifted[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()\n\x1b\b\t _+{}|~:\"~<>?";
 constexpr uint8_t kFirst = 0x04;
 constexpr uint8_t kLast = 0x38;
+
+// The numeric keypad, usages 0x54..0x63: / * - + enter 1-9 0 .
+constexpr uint8_t kKeypadFirst = 0x54;
+constexpr uint8_t kKeypadLast = 0x63;
+constexpr char kKeypad[] = "/*-+\n1234567890.";
+static_assert(sizeof(kKeypad) - 1 == kKeypadLast - kKeypadFirst + 1, "one character per keypad usage");
 }  // namespace
 
 namespace {
@@ -99,6 +105,7 @@ uint8_t usage_from_linux_key(uint16_t code) {
 }
 
 char key_to_ascii(uint8_t usage, uint8_t modifiers) {
+  if (usage >= kKeypadFirst && usage <= kKeypadLast) return ArrayView<const char>(kKeypad)[usage - kKeypadFirst];   // (the keypad types the same whatever Shift says)
   if (usage < kFirst || usage > kLast) return 0;
   const bool shift = modifiers & modifier::kShift;
   return ArrayView<const char>(shift ? kShifted : kPlain)[usage - kFirst];  // checked: usage is in range, the tables hold kFirst..kLast

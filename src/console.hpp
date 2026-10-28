@@ -19,6 +19,7 @@
 #pragma once
 #include <stdint.h>
 #include "Hardware/GraphicsProcessingUnit/IGraphicsProcessingUnit.hpp"
+#include "Utility/ArrayView.hpp"
 #include "Utility/StringView.hpp"
 #include "uefi.hpp"
 
@@ -29,6 +30,9 @@ void init(efi::SystemTable* st);
 // Routes screen output through `gpu` (clearing it). Call again after changing
 // the GPU's mode. nullptr returns to the firmware text console.
 void use_gpu(hardware::IGraphicsProcessingUnit* gpu);
+// Draws a picture at the top left of a graphics screen and keeps the text below it (see GraphicsConsole::show_banner). Does nothing on the
+// firmware text console.
+void show_banner(ArrayView<const uint32_t> pixels, uint32_t width, uint32_t height);
 // Color of the text that follows on a graphics screen (0x00RRGGBB, 0 = default); ignored by the
 // firmware text console and the debug console.
 void set_color(uint32_t rgb);

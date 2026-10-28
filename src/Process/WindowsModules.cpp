@@ -28,8 +28,8 @@ constexpr uint32_t kRecordBytes = 64, kMaxRecords = 32;
 }  // namespace
 
 uint32_t nt_load_module(Process& p, const SyscallRequest& r) {
-  uint64_t count_at = 0;
-  if (!argument(p, r, 4, &count_at)) return kAccessViolation;
+  uint64_t count_at = 0, flags = 0;
+  if (!argument(p, r, 4, &count_at) || !argument(p, r, 5, &flags)) return kAccessViolation;
   IModuleHost* host = p.module_host();
   if (!host || !p.files().attached()) return kNotImplemented;
   const uint32_t capacity = uint32_t(r.args[3]);
@@ -49,7 +49,7 @@ uint32_t nt_load_module(Process& p, const SyscallRequest& r) {
   if (!read_program_file(p, path.view(), &file, &status)) return status == 0xC0000034u || status == 0xC000003Au ? kDllNotFound : status;
   LoadedModule loaded[kMaxRecords];
   uint32_t count = 0;
-  status = host->load_module(file.view(), canonical.view(), loaded, capacity, &count);
+  status = host->load_module(file.view(), canonical.view(), loaded, capacity, &count, (flags & 1) == 0);
   if (status != kSuccess) return status;
   uint8_t records[kMaxRecords * kRecordBytes] = {};
   uint64_t base = 0;

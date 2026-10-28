@@ -135,6 +135,8 @@ class ObjectManager {
   // Is there a section (a mapping handle or a view) of the file at this path in the OS file system? A file in that state cannot be truncated, deleted or renamed.
   // 0: none, 1: a data section, 2: an image section.
   uint32_t file_has_section(StringView host_path);
+  // An image section gets a view: was there one before?
+  bool section_note_image_view(uint32_t id);
   void flush_section(uint32_t id);
   void flush_section_at(uint32_t index);      // (by its index among the sections)
   // How many views and handles keep the section alive (for the mapping side: see SharedMemory).

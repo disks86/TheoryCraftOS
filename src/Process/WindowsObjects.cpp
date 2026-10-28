@@ -666,7 +666,7 @@ namespace {
 
 // A view of an image section: the PE file laid out as the loader would, at its preferred base if that is free, else somewhere else with its relocations applied (then the answer
 // is STATUS_IMAGE_NOT_AT_BASE, a success). Every view has pages of its own, copy-on-write where the sections are writable.
-uint32_t map_image_view(Process& p, const SyscallRequest& r, uint64_t size_at, const uint8_t* file_bytes, uint64_t file_size) {
+uint32_t map_image_view(Process& p, const SyscallRequest& r, uint32_t section_id, uint64_t size_at, const uint8_t* file_bytes, uint64_t file_size) {
   AddressSpace* space = p.address_space();
   exe::PeFile pe(p.files().allocator());
   if (!pe.parse(ConstByteView(file_bytes, file_size)) || !pe.is_pe32_plus()) return 0xC000007Bu;
@@ -702,8 +702,11 @@ uint32_t map_image_view(Process& p, const SyscallRequest& r, uint64_t size_at, c
   }
   if (moved && !apply_relocations(*space, pe, chosen, chosen - pe.image_base())) { space->unmap(chosen, rounded); return 0xC000007Bu; }
   describe_image_pages(*space, pe, chosen);
+  if (moved && (pe.dll_characteristics() & 0x40)) record_image_base(*space, chosen);
   if (!p.write_user_u64(r.args[2], chosen) || !p.write_user_u64(size_at, rounded)) { space->unmap_allocation(chosen); return kAccessViolation; }
-  return moved ? 0x40000003u : kSuccess;      // STATUS_IMAGE_NOT_AT_BASE
+  // The first view of an image that may be moved (dynamic base) is simply a success wherever it lands; any other that is not at the preferred base says so.
+  const bool seen_before = system_objects()->section_note_image_view(section_id);
+  return moved && (seen_before || !(pe.dll_characteristics() & 0x40)) ? 0x40000003u : kSuccess;      // STATUS_IMAGE_NOT_AT_BASE
 }
 
 }  // namespace
@@ -737,7 +740,7 @@ uint32_t nt_map_view_of_section(Process& p, const SyscallRequest& r) {
     constexpr uint32_t kSectionMapWrite = 2, kSectionMapRead = 4, kSectionMapExecute = 8;
     if (((wanted & 1) && !(wanted & 2) && (denied & kSectionMapRead)) || ((wanted & 2) && (denied & kSectionMapWrite)) || ((wanted & 4) && (denied & kSectionMapExecute) && (denied & 0x20))) return 0xC0000022u;
   }
-  if (info.attributes & 0x1000000u) return map_image_view(p, r, size_at, storage, info.size);
+  if (info.attributes & 0x1000000u) return map_image_view(p, r, id, size_at, storage, info.size);
   uint64_t offset = 0, view = 0, base = 0;
   if (offset_at != 0 && !p.read_user_u64(offset_at, &offset)) return kAccessViolation;
   if (size_at == 0 || !p.read_user_u64(size_at, &view) || !p.read_user_u64(r.args[2], &base)) return kAccessViolation;

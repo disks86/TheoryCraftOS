@@ -66,7 +66,7 @@ struct DomBindings::Impl {
   IDomHost& host;
   DomBindings& owner;
 
-  script::JsObject *node_proto = nullptr, *element_proto = nullptr, *html_proto = nullptr, *character_data_proto = nullptr, *text_proto = nullptr, *comment_proto = nullptr, *document_proto = nullptr,
+  script::JsObject *node_proto = nullptr, *element_proto = nullptr, *html_proto = nullptr, *character_data_proto = nullptr, *text_proto = nullptr, *comment_proto = nullptr, *document_type_proto = nullptr, *document_proto = nullptr,
                    *fragment_proto = nullptr, *event_proto = nullptr, *token_list_proto = nullptr, *style_proto = nullptr, *computed_proto = nullptr,
                    *storage_proto = nullptr, *location_proto = nullptr, *history_proto = nullptr, *media_query_proto = nullptr, *exception_proto = nullptr,
                    *canvas_context_proto = nullptr, *gradient_proto = nullptr, *pattern_proto = nullptr, *path2d_proto = nullptr, *typed_array_proto = nullptr,

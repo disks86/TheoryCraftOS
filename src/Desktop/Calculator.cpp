@@ -191,7 +191,7 @@ void Calculator::press_negate() {
 bool Calculator::on_key(const KeyArgs& args) {
   namespace key = hardware::key;
   if (!(args.modifiers & hardware::modifier::kControl)) {
-    if (args.usage == key::kEnter) { press_equals(); return true; }
+    if (args.usage == key::kEnter || args.usage == key::kKeypadEnter) { press_equals(); return true; }
     if (args.usage == key::kBackspace) { press_backspace(); return true; }
     if (args.usage == key::kEscape || args.usage == key::kDelete) { press_clear(); return true; }
     const char c = args.character;

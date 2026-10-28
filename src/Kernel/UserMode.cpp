@@ -425,6 +425,7 @@ bool ready() { return g.ready; }
 ArrayView<const process::AddressRange> reserved_ranges() { return ArrayView<const process::AddressRange>(g.ranges, g.range_count); }
 
 bool init(allocators::IAllocator& allocator) {
+  process::g_process_log = [](const char* text) { console::puts(text); };
   if (g.ready) return true;
   if (!running()) return false;
   uint32_t eax = 0x80000001, ebx, ecx = 0, edx;
