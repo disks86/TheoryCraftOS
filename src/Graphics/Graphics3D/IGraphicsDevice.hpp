@@ -39,7 +39,8 @@ namespace graphics {
 
 constexpr uint32_t kMaxVertexAttributes = 4;
 constexpr uint32_t kMaxVaryings = 4;
-constexpr uint32_t kMaxPushConstantBytes = 128;
+// The most a command buffer may carry as shader constants; what a device really takes is DeviceInfo::max_push_constant_bytes (most take 128: eight vec4s).
+constexpr uint32_t kMaxPushConstantBytes = 4096;
 constexpr uint32_t kMaxTextureUnits = 2;
 
 // --- Resources ---------------------------------------------------------------
@@ -307,6 +308,7 @@ struct DeviceInfo {
   const char* name;
   DeviceKind kind;
   bool accelerated;  // rendering is done by a GPU, not by the CPU
+  uint32_t max_push_constant_bytes = 128;   // what push_constants() may be given (a multiple of 16, up to kMaxPushConstantBytes)
 };
 
 class IGraphicsDevice {

@@ -35,6 +35,11 @@ enum Opcode : uint16_t {
   // Instructions of Shader Model 4 (DXBC, see D3d9Dxbc.cpp) that Direct3D 9 has no token for. Booleans are 1.0 / 0.0 here, not all-ones masks: the front end only takes shaders that use
   // them to select (movc, if, discard).
   kDiv = 0x1000, kSqrt, kSeq, kSne, kDp2, kFloor, kCeil, kTrunc, kRoundNe, kSin, kCos, kSelect, kIfNz, kIfZ, kDiscardNz, kDiscardZ,
+  // Integer and bitwise instructions: the 32 bits of a register component are the integer (the interpreter keeps them in the float's bits), comparisons give all ones or zero.
+  kIAdd = 0x1100, kINeg, kIMul, kIMad, kIMin, kIMax, kUMin, kUMax, kUMul, kUMad, kUDiv, kURem, kIShl, kIShr, kUShr, kAnd, kOr, kXor, kNot, kFtoI, kFtoU, kItoF, kUtoF, kIEq, kINe, kILt, kIGe, kULt, kUGe,
+  kIntegerFirst = kIAdd, kIntegerLast = kUGe,
+  // Loops (Shader Model 4): `target` of a loop is the instruction after its endloop, of an endloop the one after its loop; break leaves, continue goes to the endloop.
+  kLoopBegin = 0x1200, kLoopEnd, kBreak0, kBreakNz, kBreakZ, kContinue0, kContinueNz, kContinueZ,
 };
 
 enum RegType : uint8_t { kTemp = 0, kInput = 1, kConst = 2, kAddrTex = 3, kRastOut = 4, kAttrOut = 5, kTexCrdOut = 6, kColorOut = 8, kDepthOut = 9, kSampler = 10, kConstBool = 14 };
@@ -63,6 +68,8 @@ struct D3d9Program::Instruction {
     uint8_t modifier = kModNone;
     bool relative = false;
     uint8_t relative_component = 0;
+    int8_t relative_temp = -1;     // the temporary whose component (an integer) is added to the register number; -1: a0 (Direct3D 9)
+    uint16_t relative_limit = 0;   // with a relative address: the register number it must stay below (a constant buffer's end); 0: no such check
   };
   struct Dst {
     uint8_t type = 0;
@@ -74,6 +81,7 @@ struct D3d9Program::Instruction {
   };
   uint16_t op = kNop;
   uint8_t control = 0;
+  bool mask_result = false;   // seq / sne / slt / sge of a Shader Model 4 shader: all ones for true (not 1.0), as its integer instructions and movc read them
   bool vector = false;   // rsq / exp / log of a Shader Model 4 shader: per component, not from x
   uint8_t tex_swizzle[4] = {0, 1, 2, 3};   // texld: which texel component each result component takes
   Dst dst;

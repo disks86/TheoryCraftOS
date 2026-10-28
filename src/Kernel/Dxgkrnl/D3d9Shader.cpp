@@ -40,6 +40,21 @@ float floor_(float x) {
 float sqrt_(float x) { return static_cast<float>(fmath::sqrt(x)); }
 float rcp_(float x) { return 1.0f / x; }   // (a zero gives infinity, as in Direct3D)
 float sat_(float x) { return x > 0 ? (x < 1 ? x : 1.0f) : 0.0f; }
+uint32_t bits_of(float f) { return __builtin_bit_cast(uint32_t, f); }
+float from_bits(uint32_t u) { return __builtin_bit_cast(float, u); }
+// A comparison's result: 1.0 / 0.0, or all ones / zero for a program made from DXBC.
+float truth(bool t, bool mask) { return mask ? from_bits(t ? 0xFFFFFFFFu : 0u) : (t ? 1.0f : 0.0f); }
+int32_t float_to_int(float x) {
+  if (!(x == x)) return 0;
+  if (x >= 2147483648.0f) return 2147483647;
+  if (x <= -2147483648.0f) return -2147483647 - 1;
+  return static_cast<int32_t>(x);
+}
+uint32_t float_to_uint(float x) {
+  if (!(x == x) || x <= 0) return 0;
+  if (x >= 4294967296.0f) return 0xFFFFFFFFu;
+  return static_cast<uint32_t>(x);
+}
 
 }  // namespace
 
@@ -397,7 +412,7 @@ void D3d9Program::execute(State& s) const {
   using Instr = Instruction;
   auto push_constant = [&](uint32_t index) {
     Q q = {{0, 0, 0, 0}};
-    if (index < kPushConstantRegisters && s.constants) __builtin_memcpy(q.f, s.constants + index * 16, 16);
+    if (index < constant_registers_ && s.constants) __builtin_memcpy(q.f, s.constants + index * 16, 16);
     return q;
   };
   auto constant = [&](uint32_t index) {
@@ -405,6 +420,7 @@ void D3d9Program::execute(State& s) const {
       if (d.number == index) return Q{{d.value[0], d.value[1], d.value[2], d.value[3]}};
     return push_constant(index);
   };
+  bool int_mode = false;   // the instruction being run works on integers: negate and abs of its sources are integer ones
   auto fetch = [&](const Instr::Src& src, uint32_t offset) {
     Q v = {{0, 0, 0, 0}};
     switch (src.type) {
@@ -425,15 +441,30 @@ void D3d9Program::execute(State& s) const {
         break;
       case kConst: {
         int64_t index = int64_t{src.number} + offset;
-        if (src.relative) index += static_cast<int64_t>(floor_(s.a0.f[src.relative_component]));
-        v = index < 0 ? Q{{0, 0, 0, 0}} : constant(static_cast<uint32_t>(index > 4095 ? 4095 : index));
+        bool in_range = true;
+        if (src.relative) {
+          if (src.relative_temp >= 0) index += __builtin_bit_cast(int32_t, s.r[src.relative_temp].f[src.relative_component]);   // (an integer register)
+          else index += static_cast<int64_t>(floor_(s.a0.f[src.relative_component]));
+          in_range = !src.relative_limit || (index >= 0 && index < src.relative_limit);   // (past the end of a constant buffer: zero)
+        }
+        v = (index < 0 || !in_range) ? Q{{0, 0, 0, 0}} : constant(static_cast<uint32_t>(index > 0x7FFF ? 0x7FFF : index));
         break;
       }
       default: break;
     }
     Q r = {{v.f[src.swizzle[0]], v.f[src.swizzle[1]], v.f[src.swizzle[2]], v.f[src.swizzle[3]]}};
-    if (src.modifier != kModNone)
-      for (float& c : r.f) c = apply_modifier(src.modifier, c);
+    if (src.modifier != kModNone) {
+      for (float& c : r.f) {
+        if (int_mode && (src.modifier == kModNeg || src.modifier == kModAbs || src.modifier == kModAbsNeg)) {
+          int32_t x = __builtin_bit_cast(int32_t, c);
+          if (src.modifier != kModNeg && x < 0) x = static_cast<int32_t>(0u - static_cast<uint32_t>(x));
+          if (src.modifier != kModAbs) x = static_cast<int32_t>(0u - static_cast<uint32_t>(x));
+          c = __builtin_bit_cast(float, x);
+        } else {
+          c = apply_modifier(src.modifier, c);
+        }
+      }
+    }
     return r;
   };
   auto store = [&](const Instr::Dst& d, Q v) {
@@ -474,8 +505,11 @@ void D3d9Program::execute(State& s) const {
   };
 
   const uint64_t count = code_.count();
+  uint32_t steps = 0;   // (a loop that never ends stops the program, not the machine)
   for (uint64_t pc = 0; pc < count;) {
+    if (++steps > kMaxSteps) return;
     const Instr& ins = code_[pc++];
+    int_mode = ins.op >= kIntegerFirst && ins.op <= kIntegerLast;
     Q a = {{0, 0, 0, 0}}, b = a, c = a, r = a;
     if (ins.src_count > 0 && ins.op != kM4x4 && ins.op != kM4x3 && ins.op != kM3x4 && ins.op != kM3x3 && ins.op != kM3x2) a = fetch(ins.src[0], 0);
     switch (ins.op) {
@@ -492,15 +526,24 @@ void D3d9Program::execute(State& s) const {
         if (!compare(ins.control & 7, a.f[0], b.f[0])) pc = ins.target;
         break;
       }
+      case kBreakNz: case kContinueNz:
+        if (bits_of(a.f[0]) != 0) pc = ins.target;
+        break;
+      case kBreakZ: case kContinueZ:
+        if (bits_of(a.f[0]) == 0) pc = ins.target;
+        break;
+      case kBreak0: case kContinue0: case kLoopEnd:
+        pc = ins.target;
+        break;
       case kIfNz:
-        if (!(a.f[0] != 0)) pc = ins.target;
+        if (bits_of(a.f[0]) == 0) pc = ins.target;
         break;
       case kIfZ:
-        if (a.f[0] != 0) pc = ins.target;
+        if (bits_of(a.f[0]) != 0) pc = ins.target;
         break;
       case kDiscardNz:
       case kDiscardZ:
-        if ((a.f[0] != 0) == (ins.op == kDiscardNz)) {
+        if ((bits_of(a.f[0]) != 0) == (ins.op == kDiscardNz)) {
           s.killed = true;
           return;
         }
@@ -517,8 +560,8 @@ void D3d9Program::execute(State& s) const {
       case kLrp: b = fetch(ins.src[1], 0); c = fetch(ins.src[2], 0); for (int i = 0; i < 4; ++i) r.f[i] = c.f[i] + a.f[i] * (b.f[i] - c.f[i]); store(ins.dst, r); break;
       case kMin: b = fetch(ins.src[1], 0); for (int i = 0; i < 4; ++i) r.f[i] = a.f[i] < b.f[i] ? a.f[i] : b.f[i]; store(ins.dst, r); break;
       case kMax: b = fetch(ins.src[1], 0); for (int i = 0; i < 4; ++i) r.f[i] = a.f[i] > b.f[i] ? a.f[i] : b.f[i]; store(ins.dst, r); break;
-      case kSlt: b = fetch(ins.src[1], 0); for (int i = 0; i < 4; ++i) r.f[i] = a.f[i] < b.f[i] ? 1.0f : 0.0f; store(ins.dst, r); break;
-      case kSge: b = fetch(ins.src[1], 0); for (int i = 0; i < 4; ++i) r.f[i] = a.f[i] >= b.f[i] ? 1.0f : 0.0f; store(ins.dst, r); break;
+      case kSlt: b = fetch(ins.src[1], 0); for (int i = 0; i < 4; ++i) r.f[i] = truth(a.f[i] < b.f[i], ins.mask_result); store(ins.dst, r); break;
+      case kSge: b = fetch(ins.src[1], 0); for (int i = 0; i < 4; ++i) r.f[i] = truth(a.f[i] >= b.f[i], ins.mask_result); store(ins.dst, r); break;
       case kCmp: b = fetch(ins.src[1], 0); c = fetch(ins.src[2], 0); for (int i = 0; i < 4; ++i) r.f[i] = a.f[i] >= 0 ? b.f[i] : c.f[i]; store(ins.dst, r); break;
       case kRcp: store(ins.dst, splat(rcp_(a.f[0]))); break;
       case kRsq:
@@ -544,8 +587,8 @@ void D3d9Program::execute(State& s) const {
         break;
       case kDiv: b = fetch(ins.src[1], 0); for (int i = 0; i < 4; ++i) r.f[i] = a.f[i] / b.f[i]; store(ins.dst, r); break;
       case kSqrt: for (int i = 0; i < 4; ++i) r.f[i] = a.f[i] < 0 ? __builtin_nanf("") : sqrt_(a.f[i]); store(ins.dst, r); break;
-      case kSeq: b = fetch(ins.src[1], 0); for (int i = 0; i < 4; ++i) r.f[i] = a.f[i] == b.f[i] ? 1.0f : 0.0f; store(ins.dst, r); break;
-      case kSne: b = fetch(ins.src[1], 0); for (int i = 0; i < 4; ++i) r.f[i] = a.f[i] != b.f[i] ? 1.0f : 0.0f; store(ins.dst, r); break;
+      case kSeq: b = fetch(ins.src[1], 0); for (int i = 0; i < 4; ++i) r.f[i] = truth(a.f[i] == b.f[i], ins.mask_result); store(ins.dst, r); break;
+      case kSne: b = fetch(ins.src[1], 0); for (int i = 0; i < 4; ++i) r.f[i] = truth(a.f[i] != b.f[i], ins.mask_result); store(ins.dst, r); break;
       case kDp2: b = fetch(ins.src[1], 0); store(ins.dst, splat(dot(a, b, 2))); break;
       case kFloor: for (int i = 0; i < 4; ++i) r.f[i] = floor_(a.f[i]); store(ins.dst, r); break;
       case kCeil: for (int i = 0; i < 4; ++i) r.f[i] = -floor_(-a.f[i]); store(ins.dst, r); break;
@@ -559,7 +602,7 @@ void D3d9Program::execute(State& s) const {
         break;
       case kSin: for (int i = 0; i < 4; ++i) r.f[i] = static_cast<float>(fmath::sin(a.f[i])); store(ins.dst, r); break;
       case kCos: for (int i = 0; i < 4; ++i) r.f[i] = static_cast<float>(fmath::cos(a.f[i])); store(ins.dst, r); break;
-      case kSelect: b = fetch(ins.src[1], 0); c = fetch(ins.src[2], 0); for (int i = 0; i < 4; ++i) r.f[i] = a.f[i] != 0 ? b.f[i] : c.f[i]; store(ins.dst, r); break;
+      case kSelect: b = fetch(ins.src[1], 0); c = fetch(ins.src[2], 0); for (int i = 0; i < 4; ++i) r.f[i] = bits_of(a.f[i]) != 0 ? b.f[i] : c.f[i]; store(ins.dst, r); break;
       case kFrc: for (int i = 0; i < 4; ++i) r.f[i] = a.f[i] - floor_(a.f[i]); store(ins.dst, r); break;
       case kAbs: for (int i = 0; i < 4; ++i) r.f[i] = fabs_(a.f[i]); store(ins.dst, r); break;
       case kSgn: for (int i = 0; i < 4; ++i) r.f[i] = a.f[i] > 0 ? 1.0f : a.f[i] < 0 ? -1.0f : 0.0f; store(ins.dst, r); break;
@@ -602,6 +645,49 @@ void D3d9Program::execute(State& s) const {
         const uint32_t width = ins.op == kM4x4 || ins.op == kM4x3 ? 4 : 3;
         a = fetch(ins.src[0], 0);
         for (uint32_t i = 0; i < rows; ++i) r.f[i] = dot(a, fetch(ins.src[1], i), width);
+        store(ins.dst, r);
+        break;
+      }
+      case kIAdd: case kINeg: case kIMul: case kIMad: case kIMin: case kIMax: case kUMin: case kUMax: case kUMul: case kUMad: case kUDiv: case kURem: case kIShl: case kIShr: case kUShr:
+      case kAnd: case kOr: case kXor: case kNot: case kFtoI: case kFtoU: case kItoF: case kUtoF: case kIEq: case kINe: case kILt: case kIGe: case kULt: case kUGe: {
+        if (ins.src_count > 1) b = fetch(ins.src[1], 0);
+        if (ins.src_count > 2) c = fetch(ins.src[2], 0);
+        for (int i = 0; i < 4; ++i) {
+          const uint32_t x = bits_of(a.f[i]), y = bits_of(b.f[i]), z = bits_of(c.f[i]);
+          const int32_t sx = static_cast<int32_t>(x), sy = static_cast<int32_t>(y);
+          uint32_t out = 0;
+          switch (ins.op) {
+            case kIAdd: out = x + y; break;
+            case kINeg: out = 0u - x; break;
+            case kIMul: case kUMul: out = x * y; break;
+            case kIMad: case kUMad: out = x * y + z; break;
+            case kIMin: out = static_cast<uint32_t>(sx < sy ? sx : sy); break;
+            case kIMax: out = static_cast<uint32_t>(sx > sy ? sx : sy); break;
+            case kUMin: out = x < y ? x : y; break;
+            case kUMax: out = x > y ? x : y; break;
+            case kUDiv: out = y ? x / y : 0xFFFFFFFFu; break;
+            case kURem: out = y ? x % y : 0xFFFFFFFFu; break;
+            case kIShl: out = x << (y & 31); break;
+            case kIShr: out = static_cast<uint32_t>(sx >> (y & 31)); break;   // (arithmetic)
+            case kUShr: out = x >> (y & 31); break;
+            case kAnd: out = x & y; break;
+            case kOr: out = x | y; break;
+            case kXor: out = x ^ y; break;
+            case kNot: out = ~x; break;
+            case kFtoI: out = static_cast<uint32_t>(float_to_int(a.f[i])); break;
+            case kFtoU: out = float_to_uint(a.f[i]); break;
+            case kItoF: r.f[i] = static_cast<float>(sx); continue;
+            case kUtoF: r.f[i] = static_cast<float>(x); continue;
+            case kIEq: out = x == y ? 0xFFFFFFFFu : 0; break;
+            case kINe: out = x != y ? 0xFFFFFFFFu : 0; break;
+            case kILt: out = sx < sy ? 0xFFFFFFFFu : 0; break;
+            case kIGe: out = sx >= sy ? 0xFFFFFFFFu : 0; break;
+            case kULt: out = x < y ? 0xFFFFFFFFu : 0; break;
+            case kUGe: out = x >= y ? 0xFFFFFFFFu : 0; break;
+            default: break;
+          }
+          r.f[i] = from_bits(out);
+        }
         store(ins.dst, r);
         break;
       }

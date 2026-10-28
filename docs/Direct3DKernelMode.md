@@ -96,6 +96,30 @@ or ordered with a context's work (`signal_sync_gpu` / `wait_sync_gpu`). A contex
 count), its queue is dropped but the fence signals still happen, and destroying a context does the same, so nobody waits forever. `present()` flips a `kAllocPresent`
 allocation to the screen (`IGraphicsDevice::present`) or blits a region into one and shows that.
 
+## Direct3D 10 and 11
+
+The kernel-mode driver is the D3DKMT layer, which Direct3D 9, 10, 11 and 12 all sit on; nothing in the services (adapters, allocations, residency, fences, contexts, queues, `render`,
+`present`, `escape`) is specific to a Direct3D version. What decides how much of Direct3D 10 a program gets is the shader front end and the command stream.
+
+- **Shaders:** DXBC (the Direct3D 10 / 11 shader container, Shader Model 4.0 - 5.1) is the format of `ShaderKind::Dxbc`: vertex and pixel shaders, float and integer arithmetic and
+  bitwise instructions (integers live in the register's 32 bits, comparisons give all ones or zero, negate / abs of an integer source are integer ones), `movc`, `if` / `else`,
+  `loop` / `endloop` with `break` / `breakc` / `continue` / `continuec` (a run stops after 2^20 instructions, so a loop with no exit cannot hang the machine), `discard`, `sample`,
+  conversions (`ftoi`, `ftou`, `itof`, `utof`, saturating), `sincos`, the rounding and reciprocal family, `imul` / `umul` low words and `udiv`.
+- **Constant buffers:** `cb0..cb13`, any size up to 256 vec4s in all. The push-constant block is the declared buffers laid end to end in slot order (the user-mode driver sees the
+  same `dcl_constant_buffer`s, so it builds the block), `cb[n][r1.x + 3]` indexes by an integer register (past the end of the buffer reads zero), and the immediate constant buffer
+  (`icb[...]`, up to 512 vec4s) is part of the program. A device says how many bytes of constants it takes (`DeviceInfo::max_push_constant_bytes`: 4096 for the software device, 128
+  for the others); a shader that reads more is refused on a device that takes less (`kNotSupported`).
+- **Topologies:** `SetTopology` in the command stream selects triangle list, strip or fan (restart index 0xFFFF / 0xFFFFFFFF in strips); a strip or fan is expanded to a list of
+  triangles by the kernel with an index buffer made for the draw, so every device draws them.
+- **Formats:** R8G8B8A8 / B8G8R8A8 colour (`A8B8G8R8` / `A8R8G8B8`), D32 and D24S8 depth - what the D3D10 swap chain and back buffers use.
+- **Where the interpreter is the only back end:** integer and bitwise instructions, loops with integer tests, indexing constant buffers by a register and constant blocks above 128 bytes
+  do not become TGSI text, Direct3D 9 tokens or a fixed kernel (they are refused there with `kNotSupported` - the adapter keeps the function for the software device). Loops over floats
+  do become TGSI (`BGNLOOP` / `BRK`).
+- **Not done for Direct3D 10:** geometry shaders and stream output, `ld` / `sample_l` / `sample_b` / `sample_c` / derivatives / `resinfo` (the texture sampler has no texel fetch or level
+  control), `SV_Position` / `SV_VertexID` / `SV_InstanceID` inputs, instancing, more than four vertex attributes, more than four varyings, line and point topologies, texture arrays, cube
+  and 3D textures, multiple render targets, multisampling, queries and predication, per-render-target blend state, sRGB and 16-bit / float formats, compute shaders and UAVs
+  (Direct3D 11). Most of these need a larger `IGraphicsDevice` (and the devices below it), not more kernel.
+
 ## The GPUs
 
 Every 3D device (`graphics::IGraphicsDevice`) is a miniport. `register_dxg_adapters` (SystemDxg.cpp) makes one adapter per GPU of the graphics pool from the pool's device, and an

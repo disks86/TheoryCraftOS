@@ -173,6 +173,10 @@ D3d9Writer::S D3d9Writer::source(const Instr::Src& in) {
       else s.type = kAddrTex, s.number = static_cast<uint16_t>(in.slot - 2);
       break;
     case kConst: {
+      if (in.relative || p_.constant_registers_ > D3d9Program::kPushConstantRegisters) {   // (c0..c7 are all the device's constants; no relative addressing by an integer)
+        unsupported_ = true;
+        break;
+      }
       if (in.number < D3d9Program::kPushConstantRegisters) {
         s.type = kConst, s.number = in.number;
         break;
