@@ -1254,7 +1254,7 @@ static struct { WCHAR path[520]; BOOLEAN used; ULONG sequence; } g_user_dll_dirs
 static ULONG g_user_dll_sequence;
 EXPORT NTSTATUS NTAPI LdrAddDllDirectory(PUNICODE_STRING directory, PVOID *cookie) {
   const USHORT n = directory->Length / 2;
-  if (n >= 520 || n < 3 || directory->Buffer[1] != ':' || directory->Buffer[2] != '\\') return STATUS_INVALID_PARAMETER;
+  if (n >= 520 || n < 1) return STATUS_INVALID_PARAMETER;
   for (int i = 0; i < MAX_USER_DLL_DIRS; i++) {
     if (g_user_dll_dirs[i].used) continue;
     for (USHORT k = 0; k < n; k++) g_user_dll_dirs[i].path[k] = directory->Buffer[k];
@@ -1277,6 +1277,7 @@ static BOOLEAN search_flags_path(ULONG flags, WCHAR *out, SIZE_T capacity) {
   static const WCHAR system32[] = {'C', ':', '\\', 'W', 'i', 'n', 'd', 'o', 'w', 's', '\\', 'S', 'y', 's', 't', 'e', 'm', '3', '2', 0};
   SIZE_T n = 0;
   out[0] = 0;
+  if (flags & 0x1000) flags |= 0xE00;      /* LOAD_LIBRARY_SEARCH_DEFAULT_DIRS: application, user and System32 folders */
   if (flags & 0x200) {      /* the folder of the program: ImagePathName of the process parameters, without the file */
     const UNICODE_STRING *image = (const UNICODE_STRING *)(*(const BYTE *const *)(*(const BYTE *const *)((const BYTE *)NtCurrentTeb() + 0x60) + 0x20) + 0x60);
     SIZE_T length = image->Length / 2;
@@ -1369,6 +1370,54 @@ EXPORT NTSTATUS NTAPI LdrLoadDll(PWSTR search_path, PULONG flags, PUNICODE_STRIN
     dir = *end ? end + 1 : end;
   }
   return first_error;
+}
+
+/* A loaded library by name, with or without ".dll", in any case; only the file name counts. */
+static WCHAR ldr_upper(WCHAR c) { return c >= 'a' && c <= 'z' ? (WCHAR)(c - 32) : c; }
+static LDR_DATA_TABLE_ENTRY *ldr_find_name(const UNICODE_STRING *name) {
+  PEB_LDR_DATA *ldr = NtCurrentPeb()->Ldr;
+  const WCHAR *text = name->Buffer;
+  SIZE_T length = name->Length / 2;
+  for (SIZE_T i = 0; i < length; ++i) if (text[i] == '\\' || text[i] == '/') { text += i + 1; length -= i + 1; i = (SIZE_T)-1; }
+  const BOOLEAN has_extension = length >= 4 && text[length - 4] == '.';
+  for (LIST_ENTRY *e = ldr->InLoadOrderModuleList.Flink; e != &ldr->InLoadOrderModuleList; e = e->Flink) {
+    LDR_DATA_TABLE_ENTRY *m = entry_of(e);
+    const SIZE_T base_length = m->BaseDllName.Length / 2;
+    const WCHAR *base = m->BaseDllName.Buffer;
+    SIZE_T compare = base_length;
+    if (!has_extension && base_length >= 4 && base[base_length - 4] == '.') compare = base_length - 4;
+    if (compare != length) continue;
+    SIZE_T i = 0;
+    while (i < length && ldr_upper(base[i]) == ldr_upper(text[i])) ++i;
+    if (i == length) return m;
+  }
+  return NULL;
+}
+/* flags: UNCHANGED_REFCOUNT 1, PIN 2 (never unloaded); without the first the library has one more use. */
+EXPORT NTSTATUS NTAPI LdrGetDllHandleEx(ULONG flags, PWSTR path, PULONG characteristics, PUNICODE_STRING name, PVOID *handle) {
+  (void)path; (void)characteristics;
+  if ((flags & ~7u) || (flags & 3) == 3) return STATUS_INVALID_PARAMETER;
+  if (!name || !handle) return STATUS_INVALID_PARAMETER;
+  loader_lock();
+  LDR_DATA_TABLE_ENTRY *m = ldr_find_name(name);
+  if (!m) { loader_unlock(); return STATUS_DLL_NOT_FOUND; }
+  PVOID base = m->DllBase;
+  if (!(flags & 1) && m->LoadCount != LDR_STATIC) {
+    UNICODE_STRING base_name = m->BaseDllName;
+    PVOID again = NULL;
+    loader_unlock();
+    const NTSTATUS status = LdrLoadDll(NULL, NULL, &base_name, &again);
+    if (!NT_SUCCESS(status)) return status;
+    loader_lock();
+    m = ldr_find_base(base);
+  }
+  if (m && (flags & 2)) m->LoadCount = LDR_STATIC;
+  loader_unlock();
+  *handle = base;
+  return STATUS_SUCCESS;
+}
+EXPORT NTSTATUS NTAPI LdrGetDllHandle(PWSTR path, ULONG characteristics, PUNICODE_STRING name, PVOID *handle) {
+  return LdrGetDllHandleEx(1, path, NULL, name, handle);
 }
 
 EXPORT NTSTATUS NTAPI LdrUnloadDll(PVOID base) {

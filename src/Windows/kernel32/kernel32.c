@@ -665,8 +665,9 @@ static DWORD dos_error_of_load(NTSTATUS status) {
   }
 }
 EXPORT BOOL WINAPI GetModuleHandleExW(DWORD flags, LPCWSTR name, HMODULE *module) {
-  LDR_DATA_TABLE_ENTRY *m = (flags & 4) ? module_containing((PVOID)name) : (name ? module_by_name(name) : module_by_base(NtCurrentPeb()->ImageBaseAddress));
   if (module) *module = NULL;
+  if (!module || (flags & ~7u) || (flags & 3) == 3 || ((flags & 4) && !name)) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  LDR_DATA_TABLE_ENTRY *m = (flags & 4) ? module_containing((PVOID)name) : (name ? module_by_name(name) : module_by_base(NtCurrentPeb()->ImageBaseAddress));
   if (!m) { set_error(ERROR_MOD_NOT_FOUND); return FALSE; }
   if (!(flags & 2) || (flags & 1)) {      /* another use (a pin is a use that is never given back) */
     UNICODE_STRING base_name = m->BaseDllName;
@@ -896,7 +897,7 @@ EXPORT BOOL WINAPI FreeLibrary(HMODULE module) {
     if (!VirtualQuery(view, &info, sizeof(info)) || info.AllocationBase != view) { set_error(ERROR_BAD_EXE_FORMAT); return FALSE; }      /* (not the start of a view) */
     return UnmapViewOfFile(view);
   }      /* a data file or an image resource view */
-  if (!module_by_base(module)) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
+  if (!module_by_base(module)) { set_error(ERROR_MOD_NOT_FOUND); return FALSE; }
   const NTSTATUS status = LdrUnloadDll(module);
   return NT_SUCCESS(status) ? TRUE : (set_error(dos_error_of_load(status)), FALSE);
 }
@@ -1715,7 +1716,9 @@ NTSTATUS NTAPI LdrGetDllPath(PCWSTR name, ULONG flags, PWSTR *path, PWSTR *unuse
 VOID NTAPI RtlReleasePath(PWSTR path);
 
 EXPORT PVOID WINAPI AddDllDirectory(LPCWSTR directory) {
-  if (!directory) { set_error(ERROR_INVALID_PARAMETER); return NULL; }
+  const BOOL device = directory && directory[0] == '\\' && directory[1] == '\\' && (directory[2] == '.' || directory[2] == '?') && directory[3] == '\\';
+  if (!directory || !((directory[0] && directory[1] == ':' && directory[2] == '\\') || directory[0] == '\\')) { set_error(ERROR_INVALID_PARAMETER); return NULL; }      /* (a full path) */
+  if (!device && GetFileAttributesW(directory) == INVALID_FILE_ATTRIBUTES) { set_error(ERROR_FILE_NOT_FOUND); return NULL; }
   UNICODE_STRING text;
   unicode_string(&text, directory);
   PVOID cookie = NULL;
