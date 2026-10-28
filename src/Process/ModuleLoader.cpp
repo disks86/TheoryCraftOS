@@ -42,6 +42,9 @@ bool starts_with(StringView text, const char* prefix) {
 
 bool canonical_library_name(StringView name, String* out) {
   out->clear();
+  const uint64_t slash = name.rfind('\\'), slash2 = name.rfind('/');      // a library named with a path is known by its file name
+  if (slash != StringView::npos) name = name.without_prefix(slash + 1);
+  if (slash2 != StringView::npos && name.rfind('/') != StringView::npos) name = name.without_prefix(name.rfind('/') + 1);
   if (name.empty() || name.size() > 100) return false;
   for (char c : name) if (!out->push_back(lower(c))) return false;
   if (out->view().rfind('.') == StringView::npos && !out->append(".dll")) return false;
@@ -145,6 +148,8 @@ struct Context {
   ModuleSet& set;
   String* detail;
   uint64_t next_base = kDllHint;
+  bool allow_program = false;      // the library asked for by name may be a program image (it is then only mapped)
+  bool bind = true;      // false: only the library itself is mapped (no imports, no dependencies)
 };
 
 }  // namespace
@@ -171,6 +176,15 @@ bool apply_relocations(AddressSpace& space, const exe::PeFile& pe, uint64_t base
     }
   }
   return true;
+}
+
+void record_image_base(AddressSpace& space, uint64_t base) {
+  uint8_t raw[4];
+  if (!space.read_privileged(base + 0x3C, ByteView(raw, 4))) return;
+  const uint64_t nt = raw[0] | (uint64_t{raw[1]} << 8) | (uint64_t{raw[2]} << 16) | (uint64_t{raw[3]} << 24);
+  uint8_t value[8];
+  for (uint32_t i = 0; i < 8; ++i) value[i] = uint8_t(base >> (8 * i));
+  space.write_privileged(base + nt + 24 + 24, ConstByteView(value, 8));      // OptionalHeader.ImageBase
 }
 
 // What Windows says about the pages of a mapped image: one allocation of type image, the headers read-only, each section with the protection its characteristics ask for (a
@@ -204,6 +218,28 @@ void say(Context& c, StringView a, StringView b = StringView()) {
 }
 
 // Loads the library (if not loaded yet) and, first, the libraries it imports and forwards to.
+// The load configuration of an image names a security cookie; one that still has the compiler's default (or none) gets a value of its own, written even into a read-only page.
+void initialise_security_cookie(AddressSpace& space, const exe::PeFile& pe, uint64_t base) {
+  static uint64_t counter = 0x9E3779B97F4A7C15ull;
+  uint32_t rva = 0, size = 0;
+  if (!pe.directory(10, &rva, &size) || size < 0x60 || rva == 0) return;      // IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG; the cookie is at 0x58
+  uint8_t raw[8];
+  if (!space.read_privileged(base + rva + 0x58, ByteView(raw, 8))) return;
+  uint64_t address = 0;
+  for (uint32_t i = 0; i < 8; ++i) address |= uint64_t{raw[i]} << (8 * i);
+  if (address < base || address - base > pe.size_of_image() || pe.size_of_image() - (address - base) < 8) return;
+  if (!space.read_privileged(address, ByteView(raw, 8))) return;
+  uint64_t current = 0;
+  for (uint32_t i = 0; i < 8; ++i) current |= uint64_t{raw[i]} << (8 * i);
+  constexpr uint64_t kDefault = 0x00002B992DDFA232ull;
+  if (current != kDefault && current != 0) return;
+  counter = counter * 6364136223846793005ull + 1442695040888963407ull + base;
+  uint64_t value = (counter ^ (counter >> 29) ^ (base << 17)) & 0x0000FFFFFFFFFFFFull;
+  if (value == 0 || value == kDefault) value = kDefault + 1;
+  for (uint32_t i = 0; i < 8; ++i) raw[i] = uint8_t(value >> (8 * i));
+  space.write_privileged(address, ConstByteView(raw, 8));
+}
+
 LoadStatus ensure_loaded(Context& c, StringView canonical, uint32_t depth, Module** result) {
   if (Module* have = c.set.find(canonical)) {
     *result = have;
@@ -218,7 +254,7 @@ LoadStatus ensure_loaded(Context& c, StringView canonical, uint32_t depth, Modul
   if (!c.provider.find(canonical, &file)) return LoadStatus::Ok;      // not available: its imports become stubs
   UniquePointer<Module> module = UniquePointer<Module>::make(c.allocator, c.allocator);
   if (!module || !module->name.assign(canonical)) return LoadStatus::OutOfMemory;
-  if (!module->owned.parse(file) || !module->owned.is_dll() || !module->owned.is_pe32_plus() || module->owned.machine() != exe::kPeMachineAmd64) {
+  if (!module->owned.parse(file) || !module->owned.is_pe32_plus() || module->owned.machine() != exe::kPeMachineAmd64 || (!module->owned.is_dll() && !(c.allow_program && depth == 1))) {
     say(c, canonical, " is not a 64-bit x86 DLL");
     return LoadStatus::Malformed;
   }
@@ -232,10 +268,13 @@ LoadStatus ensure_loaded(Context& c, StringView canonical, uint32_t depth, Modul
   LoadedImage image;
   bool relocate = false;
   if (base == 0 || base % 0x10000 != 0 || !c.space.find_free(size, base, &base) || base != pe.image_base()) {
-    uint64_t at = 0;
-    if (!c.space.find_free(size, c.next_base, &at)) return LoadStatus::OutOfMemory;
-    base = (at + 0xFFFF) & ~uint64_t{0xFFFF};
-    if (!c.space.find_free(size, base, &at) || at != base) return LoadStatus::OutOfMemory;
+    uint64_t at = 0, hint = c.next_base;
+    for (uint32_t attempt = 0;; ++attempt) {      // a free place that starts on a 64 KiB boundary (the holes between libraries do not)
+      if (attempt >= 256 || !c.space.find_free(size, hint, &at)) { say(c, "no room for ", canonical); return LoadStatus::OutOfMemory; }
+      base = (at + 0xFFFF) & ~uint64_t{0xFFFF};
+      if (base == at) break;
+      hint = base;
+    }
     c.next_base = base + ((size + 0xFFFF) & ~uint64_t{0xFFFF});
     relocate = true;
   }
@@ -253,14 +292,18 @@ LoadStatus ensure_loaded(Context& c, StringView canonical, uint32_t depth, Modul
     say(c, canonical, " has damaged relocations");
     return LoadStatus::Malformed;
   }
+  initialise_security_cookie(c.space, pe, base);
+  if (relocate && (pe.dll_characteristics() & 0x40)) record_image_base(c.space, base);
   describe_image_pages(c.space, pe, base);
   module->base = base;
   module->size = size;
-  module->entry = image.entry;
+  module->no_bind = !c.bind || !pe.is_dll();      // (a program image loaded as a library is only mapped)
+  module->entry = pe.is_dll() ? image.entry : 0;
   Module* raw = module.get();
   if (!c.set.modules_.push_back(static_cast<UniquePointer<Module>&&>(module))) return LoadStatus::OutOfMemory;
   *result = raw;
 
+  if (raw->no_bind) return LoadStatus::Ok;
   // Its own dependencies: imported libraries, and the libraries its forwarded exports name.
   String name(c.allocator);
   for (const exe::PeImport& imp : raw->pe->imports().view()) {
@@ -391,8 +434,10 @@ void doom(const ModuleSet& set, allocators::IAllocator& allocator, Module& modul
 }
 }  // namespace
 
-LoadStatus load_additional_library(AddressSpace& space, allocators::IAllocator& allocator, ILibraryProvider& provider, ModuleSet* set, StringView canonical_name, String* detail) {
+LoadStatus load_additional_library(AddressSpace& space, allocators::IAllocator& allocator, ILibraryProvider& provider, ModuleSet* set, StringView canonical_name, String* detail, bool bind) {
   Context c{space, allocator, provider, *set, detail};
+  c.bind = bind;
+  c.allow_program = true;
   const uint64_t first = set->count();
   const uint64_t init_first = set->init_count();
   (void)init_first;
@@ -400,7 +445,7 @@ LoadStatus load_additional_library(AddressSpace& space, allocators::IAllocator& 
   Module* requested = nullptr;
   LoadStatus status = ensure_loaded(c, canonical_name, 1, &requested);
   if (status == LoadStatus::Ok && !requested) { say(c, canonical_name, " was not found"); status = LoadStatus::NeedsLibraries; }
-  for (uint64_t i = first; i < set->count() && status == LoadStatus::Ok; ++i) status = bind_imports(c, *set->modules_[i]);
+  for (uint64_t i = first; i < set->count() && status == LoadStatus::Ok; ++i) if (!set->modules_[i]->no_bind) status = bind_imports(c, *set->modules_[i]);
   if (status == LoadStatus::Ok) order(c, *requested, 0);
   if (status == LoadStatus::Ok) {      // the uses: one for the caller, one for each import of a new library
     ++requested->refs;

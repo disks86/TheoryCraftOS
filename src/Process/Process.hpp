@@ -59,11 +59,16 @@ struct LoadedModule {
   char name[40] = {};                           // canonical ("msvcrt.dll"), NUL-terminated
 };
 // What loads and unloads libraries in a Windows process after it has started (the user-program layer implements it; the process does not know how libraries are found).
+// Where diagnostics of the process layer go (the kernel points it at the debug console; host tests leave it unset).
+extern void (*g_process_log)(const char* text);
+void process_log(StringView text);
+
 class IModuleHost {
  public:
   // Loads the library in `file` under `canonical_name` and the libraries it imports that are missing, and says in `out` (at most `capacity`) which libraries are new, in the
   // order their entry points must run. Returns an NTSTATUS; nothing stays loaded on failure.
-  virtual uint32_t load_module(ConstByteView file, StringView canonical_name, LoadedModule* out, uint32_t capacity, uint32_t* count) = 0;
+  // With `bind` false only the library itself is mapped: its imports are not loaded or resolved and it gets no thread-local data (LOAD_LIBRARY DONT_RESOLVE_DLL_REFERENCES).
+  virtual uint32_t load_module(ConstByteView file, StringView canonical_name, LoadedModule* out, uint32_t capacity, uint32_t* count, bool bind = true) = 0;
   // LoadLibrary of a library that is loaded already (by this canonical name): one more use. False if there is none.
   virtual bool reference_module(StringView canonical_name, uint64_t* base) = 0;
   // FreeLibrary: one use less. The libraries that nobody uses any more are listed in `out` (at most `capacity`) in the order their entry points have to be called with

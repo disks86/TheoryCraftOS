@@ -24,6 +24,17 @@
 
 namespace process {
 
+void (*g_process_log)(const char* text) = nullptr;
+void process_log(StringView text) {
+  if (!g_process_log) return;
+  char line[256];
+  uint64_t n = 0;
+  for (; n < text.size() && n + 2 < sizeof(line); ++n) line[n] = text[n];
+  line[n++] = '\n';
+  line[n] = 0;
+  g_process_log(line);
+}
+
 namespace {
 constexpr uint64_t kChunk = 1024;
 constexpr uint64_t kUnknownLinux = ~uint64_t{37};      // -ENOSYS

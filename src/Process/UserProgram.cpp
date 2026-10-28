@@ -143,7 +143,7 @@ void take_tls(AddressSpace& space, Process& process, const Module& module) {
 
 }  // namespace
 
-uint32_t UserProgram::load_module(ConstByteView file, StringView canonical_name, LoadedModule* out, uint32_t capacity, uint32_t* count) {
+uint32_t UserProgram::load_module(ConstByteView file, StringView canonical_name, LoadedModule* out, uint32_t capacity, uint32_t* count, bool bind) {
   constexpr uint32_t kNoMemory = 0xC0000017u, kDllNotFound = 0xC0000135u, kBadImage = 0xC000007Bu, kNotSupported = 0xC00000BBu, kBufferTooSmall = 0xC0000023u, kInvalidParameter = 0xC000000Du;
   *count = 0;
   if (!modules_ || !process_) return kNotSupported;
@@ -151,9 +151,9 @@ uint32_t UserProgram::load_module(ConstByteView file, StringView canonical_name,
   const uint64_t first = modules_->count(), init_first = modules_->init_count();
   SingleFileProvider provider(canonical_name, file, libraries_);
   String detail(allocator_);
-  switch (load_additional_library(space_, allocator_, provider, modules_.get(), canonical_name, &detail)) {
+  switch (load_additional_library(space_, allocator_, provider, modules_.get(), canonical_name, &detail, bind)) {
     case LoadStatus::Ok: break;
-    case LoadStatus::OutOfMemory: return kNoMemory;
+    case LoadStatus::OutOfMemory: process_log(detail.view()); process_log(canonical_name); return kNoMemory;
     case LoadStatus::Unsupported: return kNotSupported;
     case LoadStatus::Malformed: return kBadImage;
     default: return kDllNotFound;
@@ -164,6 +164,7 @@ uint32_t UserProgram::load_module(ConstByteView file, StringView canonical_name,
     return kBufferTooSmall;
   }
   for (uint64_t i = first; i < modules_->count(); ++i) {      // thread-local data of their own
+    if (modules_->modules_[i]->no_bind) continue;
     if (!give_tls(space_, *process_, *modules_->modules_[i])) {
       for (uint64_t k = first; k < i; ++k) take_tls(space_, *process_, *modules_->modules_[k]);
       modules_->drop_from(space_, first);
