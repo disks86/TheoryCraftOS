@@ -201,7 +201,7 @@ def check_display(dce, vid, hpp, cpp):
             fail(fn)
     if 'GRPH_INTERRUPT_STATUS__GRPH_PFLIP_INT_CLEAR_MASK' not in function_body(dce, 'dce_v11_0_pageflip_irq') or 'GRPH_PFLIP_INT_CLEAR_MASK' not in dcpp:
         fail('page flip acknowledgement')
-    for fn, field in (('dce_v11_0_set_pageflip_irq_state', 'GRPH_PFLIP_INT_MASK_MASK'), ('dce_v11_0_set_crtc_vblank_interrupt_state', 'VBLANK_INTERRUPT_MASK'),
+    for fn, field in (('dce_v11_0_set_pageflip_irq_state', 'GRPH_PFLIP_INT_MASK_MASK'), ('dce_v11_0_set_crtc_vblank_interrupt_state', 'VBLANK_INTERRUPT_MASK'), ('dce_v11_0_set_crtc_vline_interrupt_state', 'VLINE_INTERRUPT_MASK'),
                       ('dce_v11_0_set_hpd_irq_state', 'DC_HPD_INT_EN')):
         if field not in function_body(dce, fn) or field not in dcpp:
             fail(fn)

@@ -193,6 +193,13 @@ void Interrupts::set_vblank(uint32_t crtc, bool enable) {
   r_.write(mmLB_INTERRUPT_MASK + kCrtcOffsets[crtc], mask);
 }
 
+void Interrupts::set_vline(uint32_t crtc, bool enable) {
+  if (crtc >= kMaxCrtcs) return;
+  uint32_t mask = r_.read(mmLB_INTERRUPT_MASK + kCrtcOffsets[crtc]);
+  mask = REG_SET_FIELD(mask, LB_INTERRUPT_MASK, VLINE_INTERRUPT_MASK, enable ? 1 : 0);
+  r_.write(mmLB_INTERRUPT_MASK + kCrtcOffsets[crtc], mask);
+}
+
 bool Interrupts::hpd_sense(uint32_t pin) {
   return pin < kMaxHpd && (r_.read(mmDC_HPD_INT_STATUS + kHpdOffsets[pin]) & DC_HPD_INT_STATUS__DC_HPD_SENSE_MASK) != 0;
 }

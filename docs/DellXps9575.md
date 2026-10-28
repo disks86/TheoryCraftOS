@@ -387,7 +387,12 @@ for each plug and unplug (`take_hotplug()`: the pin, whether a display is connec
 drains the queue after `service_interrupts()` and, for each event, writes a line to the debug console and shows a toast ("A display was connected to HDMI-A-1 of the Radeon RX Vega M"; "Hot plug detection of DP-1 on the Radeon RX Vega M is switched off: it
 kept changing" as a warning); at boot the outputs that already have a display are logged. That is all there is to do about it for now: the card's outputs are not part of the desktop (the OS cannot put a
 picture on them: no mode setting without the AtomBIOS command tables for the encoders and PLLs, and no DDC/EDID read of the monitor on the other end), so a plug cannot add a monitor to the desktop's layout. Which connector a pin is
-on comes from the video BIOS (next section); without one, or for a pin it does not list, the text says "output 2". Not done: the vline interrupt is not enabled (only classified and acknowledged), the audio and DP short-pulse (`DC_HPD_RX_INT`) interrupts; recovery from a fault is above.
+on comes from the video BIOS (next section); without one, or for a pin it does not list, the text says "output 2". Not done: the audio and DP short-pulse (`DC_HPD_RX_INT`) interrupts; recovery from a fault is above.
+
+The vertical line interrupt is enabled like the vertical blank: `AmdVegaM::set_vline_interrupt(true)` sets `LB_INTERRUPT_MASK.VLINE_INTERRUPT_MASK` (bit 4, `dce_v11_0_set_crtc_vline_interrupt_state`; `amd_dce11::Interrupts::set_vline`) of the
+controller that shows the OS's framebuffer, and only that one; it is refused without an engaged display, independent of the vblank bit (neither touches the other), and switched off when the display is given back or the card
+stopped. The handler acknowledges with `LB_VLINE_STATUS.VLINE_ACK` when `DISP_INTERRUPT_STATUS*` says it is pending, and counts per controller (`AmdIrq::vline_count`). Like the driver, nothing programs which line it comes at.
+It has no user in the OS yet (nothing needs a mid-frame callback); a test (`test_vline_interrupt`) covers enable, bits kept, independence from vblank, ack, counting and the off paths.
 
 ### Connector names from the video BIOS's object table
 

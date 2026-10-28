@@ -808,6 +808,57 @@ static void test_vblank_interrupt() {
   CHECK(!(rig.card.dce.get(0x1ac8 + 0x400) & 1));
 }
 
+// The vertical line interrupt: the same rules as the vertical blank, on its own bit (LB_INTERRUPT_MASK bit 4, literal here), counted on its own.
+static void test_vline_interrupt() {
+  Rig rig;
+  AmdVegaM vega(rig.alloc);
+  CHECK(vega.bring_up(rig.inputs()));
+  const uint32_t width = 64, height = 8;
+  amd_dce11::FirmwareFramebuffer fw;
+  fw.physical = reinterpret_cast<uint64_t>(rig.vram);
+  fw.bytes = width * height * 4;
+  fw.width = width;
+  fw.height = height;
+  fw.pitch_pixels = width;
+  rig.card.dce.crtc(2, kGpuBase, width);
+  fakedce::setup_aperture(rig.card.dce);
+  rig.card.dce.set(0x80d, kGpuBase >> 12);
+  rig.card.dce.set(0x80e, ((kGpuBase + kVideoMemory) >> 12) - 1);
+  // not without a display, and nothing is written for it
+  CHECK(!vega.set_vline_interrupt(true) && vega.set_vline_interrupt(false) && rig.card.dce.get(0x1ac8 + 0x400) == 0);
+  ByteView memory;
+  CHECK(vega.engage_display(fw, &memory) && vega.display_engaged());
+  const AmdIrq& irq = *vega.irq();
+  rig.card.dce.set(0x1ac8 + 0x400, 0x101);   // (the vblank bit and another are set already: kept)
+  CHECK(vega.set_vline_interrupt(true) && rig.card.dce.get(0x1ac8 + 0x400) == 0x111 && rig.card.dce.get(0x1ac8) == 0 && rig.card.dce.get(0x1ac8 + 0x200) == 0);
+  CHECK(vega.set_vline_interrupt(true) && rig.card.dce.get(0x1ac8 + 0x400) == 0x111);
+  // The vertical blank bit is not touched by the line's, nor the line's by the blank's.
+  CHECK(vega.set_vblank_interrupt(true) && rig.card.dce.get(0x1ac8 + 0x400) == 0x111);
+  CHECK(vega.set_vblank_interrupt(false) && rig.card.dce.get(0x1ac8 + 0x400) == 0x110);
+  CHECK(vega.set_vblank_interrupt(true) && rig.card.dce.get(0x1ac8 + 0x400) == 0x111);
+  // A line interrupt of controller 2 (source 3, data 1) with the status (DISP_INTERRUPT_STATUS_CONTINUE2, bit 2) set: acknowledged (LB_VLINE_STATUS.VLINE_ACK), counted for the line only.
+  rig.card.gfx.set_reg(0x1859, 0x4);
+  rig.card.ih.post(3, 1, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && irq.vline_count(2) == 1 && irq.vline_count(1) == 0 && irq.vblank_count(2) == 0 && rig.card.dce.get(0x1ac9 + 0x400) == 0x10);
+  // The status does not say so: counted, not acknowledged.
+  rig.card.dce.set(0x1ac9 + 0x400, 0);
+  rig.card.gfx.set_reg(0x1859, 0);
+  rig.card.ih.post(3, 1, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && irq.vline_count(2) == 2 && rig.card.dce.get(0x1ac9 + 0x400) == 0 && irq.vline_count(6) == 0);
+  // Off on its own, with the blank left on.
+  CHECK(vega.set_vline_interrupt(false) && rig.card.dce.get(0x1ac8 + 0x400) == 0x101);
+  rig.card.dce.set(0x1ac8 + 0x400, 0x111);   // (switched on behind its back: asking for off again has nothing to switch off)
+  CHECK(vega.set_vline_interrupt(false) && rig.card.dce.get(0x1ac8 + 0x400) == 0x111);
+  rig.card.dce.set(0x1ac8 + 0x400, 0x101);
+  // Giving the display back or stopping the card switches it off.
+  CHECK(vega.set_vline_interrupt(true) && (rig.card.dce.get(0x1ac8 + 0x400) & 0x10));
+  vega.disengage_display();
+  CHECK(!(rig.card.dce.get(0x1ac8 + 0x400) & 0x10) && !vega.set_vline_interrupt(true));
+  CHECK(vega.engage_display(fw, &memory) && vega.set_vline_interrupt(true) && (rig.card.dce.get(0x1ac8 + 0x400) & 0x10));
+  vega.shutdown();
+  CHECK(!(rig.card.dce.get(0x1ac8 + 0x400) & 0x10));
+}
+
 // The video engines' fences: UVD's decode ring (124), its two encode rings (119, 120) and VCE's three rings (167, data 0..2) are classified and counted; a VCE fence is acknowledged in
 // VCE_SYS_INT_STATUS (bit 3) before anything else; an observer sees every event, in order, after the card dealt with it.
 static void test_video_engine_interrupts() {
@@ -1406,6 +1457,7 @@ int main() {
   test_sq_messages();
   test_display_interrupts();
   test_vblank_interrupt();
+  test_vline_interrupt();
   test_video_engine_interrupts();
   test_recovery();
   test_auto_recovery();

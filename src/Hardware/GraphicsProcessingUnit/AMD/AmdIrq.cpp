@@ -192,6 +192,7 @@ uint32_t AmdIrq::process(AmdIh3& ih, ISink* sink, uint32_t max_vectors) {
       case Kind::DisplayVline:
         event.asserted = display_.vline_asserted(event.crtc);
         if (event.asserted) display_.ack_vline(event.crtc);
+        ++vlines_[event.crtc];
         break;
       case Kind::DisplayPageFlip:
         display_.ack_pageflip(event.crtc);

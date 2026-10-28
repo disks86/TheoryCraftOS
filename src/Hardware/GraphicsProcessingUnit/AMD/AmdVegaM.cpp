@@ -274,6 +274,7 @@ bool AmdVegaM::bring_up(const Inputs& in) {
 
 void AmdVegaM::shutdown() {
   set_vblank_interrupt(false);
+  set_vline_interrupt(false);
   if (display_irq_) {   // (dce_v11_0_hw_fini: the hot plug pins and the page flip interrupts)
     for (uint32_t pin = 0; pin < amd_dce11::Interrupts::kMaxHpd; ++pin)
       if (inputs_.hpd_pins >> pin & 1) display_irq_->hpd_fini(pin);
@@ -547,7 +548,21 @@ bool AmdVegaM::engage_display(const amd_dce11::FirmwareFramebuffer& firmware, By
 
 void AmdVegaM::disengage_display() {
   set_vblank_interrupt(false);
+  set_vline_interrupt(false);
   display_ = UniquePointer<amd_dce11::Display>();
+}
+
+bool AmdVegaM::set_vline_interrupt(bool enable) {
+  if (!enable) {
+    if (vline_crtc_ >= 0 && display_irq_) display_irq_->set_vline(static_cast<uint32_t>(vline_crtc_), false);
+    vline_crtc_ = -1;
+    return true;
+  }
+  if (!display_irq_ || !display_ || !display_->engaged()) return false;
+  set_vline_interrupt(false);
+  vline_crtc_ = static_cast<int>(display_->plane().crtc());
+  display_irq_->set_vline(static_cast<uint32_t>(vline_crtc_), true);
+  return true;
 }
 
 bool AmdVegaM::set_vblank_interrupt(bool enable) {
