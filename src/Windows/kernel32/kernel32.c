@@ -706,9 +706,15 @@ EXPORT DWORD WINAPI GetModuleFileNameA(HMODULE module, LPSTR buffer, DWORD capac
   WCHAR wide[MAX_PATH * 2];
   const DWORD n = GetModuleFileNameW(module, wide, MAX_PATH * 2);
   if (n == 0) return 0;
-  const DWORD r = wide_result_to_ansi(wide, n, buffer, capacity);
-  if (r > capacity) { if (capacity) buffer[capacity - 1] = 0; set_error(ERROR_INSUFFICIENT_BUFFER); return capacity; }
-  return r;
+  if (n + 1 > capacity) {      /* too small: what fits, ended by a NUL, and the size of the buffer */
+    if (capacity) {
+      wide_result_to_ansi(wide, capacity - 1, buffer, capacity);
+      buffer[capacity - 1] = 0;
+    }
+    set_error(ERROR_INSUFFICIENT_BUFFER);
+    return capacity;
+  }
+  return wide_result_to_ansi(wide, n, buffer, capacity);
 }
 
 typedef struct { ULONG Characteristics, TimeDateStamp; USHORT MajorVersion, MinorVersion; ULONG Name, Base, NumberOfFunctions, NumberOfNames, AddressOfFunctions, AddressOfNames, AddressOfNameOrdinals; } ExportDirectory;
@@ -850,9 +856,11 @@ static HMODULE load_library_ex(LPCWSTR name, HANDLE file, DWORD flags) {
   } else if (find_file(name, dll, g_dll_directory, path)) {
     unicode_string(&us, path);
   } else {
+    path[0] = 0;      /* (find_file may have left a name behind that is not a file) */
     unicode_string(&us, name);
   }
-  if ((flags & 0x32) && (has_separator(name) || !GetModuleHandleW(path[0] ? path : name))) {      /* AS_DATAFILE 2, AS_DATAFILE_EXCLUSIVE 0x10, AS_IMAGE_RESOURCE 0x20: the file is only mapped (a loaded library is used as it is) */
+  if ((flags & 0x32) && has_separator(name) && !path[0] && !search) { set_error(ERROR_FILE_NOT_FOUND); return NULL; }      /* (a file named with a folder has to be there) */
+  if ((flags & 0x32) && !GetModuleHandleW(path[0] ? path : name)) {      /* AS_DATAFILE 2, AS_DATAFILE_EXCLUSIVE 0x10, AS_IMAGE_RESOURCE 0x20: the file is only mapped (a loaded library is used as it is) */
     if (!path[0]) { set_error(has_separator(name) ? ERROR_FILE_NOT_FOUND : ERROR_MOD_NOT_FOUND); return NULL; }
     HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
     if (f == INVALID_HANDLE_VALUE) return NULL;
@@ -1749,7 +1757,7 @@ static int find_library_restricted(LPCWSTR name, DWORD search, WCHAR *out) {
   if (length + 5 > MAX_PATH) return 0;
   memcpy(file, name, (length + 1) * 2);
   if (!has_extension) memcpy(file + length, dll, sizeof(dll));
-  const BOOL rooted = name[0] == '\\';
+  const BOOL rooted = name[0] == '\\' || (name[0] && name[1] == ':');      /* (rooted in the current drive, or a drive with its current folder) */
   if (absolute || rooted) return full_path_w(file, out, PATH_CHARS) != 0 && is_program_file(out) ? 1 : 0;
   if (search & 0x100) return -1;      /* (the folder of the library that is loaded needs a path to take it from) */
   PWSTR list = NULL, unused = NULL;
@@ -2928,6 +2936,7 @@ EXPORT BOOL WINAPI RemoveDirectoryW(LPCWSTR path) {
 }
 EXPORT BOOL WINAPI RemoveDirectoryA(LPCSTR path) { WCHAR *w = to_wide(path); const BOOL ok = w ? RemoveDirectoryW(w) : FALSE; free_wide(w); return ok; }
 
+VOID NTAPI TcosNoteFileRename(PCWSTR from, PCWSTR to);
 EXPORT BOOL WINAPI MoveFileExW(LPCWSTR from, LPCWSTR to, DWORD flags) {
   WCHAR source_buffer[PATH_CHARS + 8], target_buffer[PATH_CHARS + 8];
   UNICODE_STRING source_name, target_name;
@@ -2952,6 +2961,8 @@ EXPORT BOOL WINAPI MoveFileExW(LPCWSTR from, LPCWSTR to, DWORD flags) {
   RtlFreeHeap(heap(), 0, info);
   NtClose(h);
   if (!NT_SUCCESS(status)) return fail_nt(status);
+  WCHAR from_full[PATH_CHARS], to_full[PATH_CHARS];      /* (the loader follows a library whose file moved, to know it by its new name) */
+  if (full_path_w(from, from_full, PATH_CHARS) && full_path_w(to, to_full, PATH_CHARS)) TcosNoteFileRename(from_full, to_full);
   return TRUE;
 }
 EXPORT BOOL WINAPI MoveFileW(LPCWSTR from, LPCWSTR to) { return MoveFileExW(from, to, 0); }

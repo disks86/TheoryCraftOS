@@ -5789,8 +5789,13 @@ bool run_wine_test_program(allocators::IAllocator& allocator) {
   f.reset();
   for (uint64_t i = 0; i < tcos_wine_test_file_count; ++i) {
     String extra(allocator);
-    extra.assign("/Windows/Windows/System32/");
-    extra.append(StringView(tcos_wine_test_files[i].name));
+    // The test programs (<dll>_<test>.exe) live in a folder of their own, as they would in a build tree; the rest (winerun.txt, winver.exe) is in System32.
+    const StringView test_name(tcos_wine_test_files[i].name);
+    const uint64_t underscore = test_name.find('_');
+    const bool is_test = underscore != StringView::npos && underscore > 0 && test_name.size() > 4 && test_name.substr(test_name.size() - 4) == StringView(".exe");
+    if (is_test) files.create_directory("/Windows/Windows/Tests");
+    extra.assign(is_test ? "/Windows/Windows/Tests/" : "/Windows/Windows/System32/");
+    extra.append(test_name);
     if (files.open_file(extra.view(), filesystem::OpenMode::CreateTruncate, &f) == filesystem::Status::Ok) f->write(0, ConstByteView(tcos_wine_test_files[i].begin, static_cast<uint64_t>(tcos_wine_test_files[i].end - tcos_wine_test_files[i].begin)), &n);
     f.reset();
   }

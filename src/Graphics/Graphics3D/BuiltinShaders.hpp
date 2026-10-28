@@ -18,6 +18,22 @@ struct ColoredConstants {
   Mat4 mvp;
 };
 
+// The matrix of a fixed vertex kernel (the built-in coloured vertex shader: the 16 push-constant words are the columns of M) made from what a Direct3D 9 vertex shader takes in
+// c0..c3: its rows when `rows` (transposed), and the sign of the Y row flipped when `flip_y` (Direct3D's +Y up to the device's +Y down).
+inline void kernel_matrix_words(uint32_t mvp[16], bool rows, bool flip_y) {
+  if (rows) {
+    for (uint32_t r = 0; r < 4; ++r)
+      for (uint32_t c = r + 1; c < 4; ++c) {
+        const uint32_t t = mvp[4 * r + c];
+        mvp[4 * r + c] = mvp[4 * c + r];
+        mvp[4 * c + r] = t;
+      }
+  }
+  if (flip_y) {
+    for (uint32_t c = 0; c < 4; ++c) mvp[4 * c + 1] ^= 0x80000000u;
+  }
+}
+
 ShaderModuleDesc colored_vertex_shader();
 ShaderModuleDesc colored_fragment_shader();
 // Fills in the vertex layout of ColoredVertex (shaders left for the caller).

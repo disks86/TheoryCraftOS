@@ -442,6 +442,8 @@ add_executable(BOOTX64
   src/Kernel/Dxgkrnl/D3d9Shader.cpp
   src/Kernel/Dxgkrnl/D3d9Tgsi.cpp
   src/Kernel/Dxgkrnl/D3d9Dxbc.cpp
+  src/Kernel/Dxgkrnl/D3d9Ps1.cpp
+  src/Kernel/Dxgkrnl/SelfTest.cpp
   src/Kernel/Dxgkrnl/D3d9Devices.cpp
   src/Kernel/Dxgkrnl/D3d9Emit.cpp
   src/Kernel/Dxgkrnl/Adapter.cpp
@@ -699,6 +701,7 @@ add_executable(BOOTX64
   src/Hardware/GraphicsProcessingUnit/AMD/AmdSdma3.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdDce11.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/EdidAudio.cpp
+  src/Hardware/GraphicsProcessingUnit/AMD/HdmiInfoframe.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdVegaM.cpp
   src/Hardware/VideoCodec/AMD/AmdUvd6Messages.cpp
   src/Hardware/VideoCodec/AMD/AmdUvd6AvcDecoder.cpp

@@ -186,6 +186,10 @@ struct ShaderModuleDesc {
   uint32_t d3d9_token_count = 0;
   // The QPU program of the V3D device that does what this module does; None for a module that has none (the V3D device then cannot run it).
   QpuProgram qpu_program = QpuProgram::None;
+  // With QpuProgram::ColoredVertex: the matrix is given as rows (the transpose of what the built-in shader takes), as a Direct3D 9 vertex shader that ends in dp4s uses it.
+  bool qpu_matrix_rows = false;
+  // ... and the program is written for Direct3D's clip space (+Y up): the device flips the Y row of the matrix.
+  bool qpu_flip_y = false;
   // The same for the Intel Gen9 device: the coloured-vertex pipeline of BuiltinShaders (the vertex transform runs on the CPU there).
   EuProgram eu_program = EuProgram::None;
   // With a ColoredFragment / TexturedFragment eu_program: which of the vertex shader's varyings the kernel reads (the colour, or the texture coordinate in its first two components).
