@@ -1227,6 +1227,28 @@ static NTSTATUS ldr_load_one(PULONG flags, PUNICODE_STRING name, PVOID *handle) 
 
 /* A bare file name is looked for in the directories of the search path (separated by ';'): a file that is found but cannot be loaded does not stop the search; if nothing
  * loads, the answer is the error of the first file that was found (or "not found"). */
+/* The folder SetDllDirectory names (searched by LoadLibrary after the program's own). */
+static WCHAR g_dll_directory_text[520];
+static USHORT g_dll_directory_chars;
+EXPORT NTSTATUS NTAPI LdrSetDllDirectory(PUNICODE_STRING directory) {
+  const USHORT n = directory ? (USHORT)(directory->Length / 2) : 0;
+  if (n >= 520) return 0xC0000106;      /* STATUS_NAME_TOO_LONG */
+  for (USHORT i = 0; i < n; i++) g_dll_directory_text[i] = directory->Buffer[i];
+  g_dll_directory_text[n] = 0;
+  g_dll_directory_chars = n;
+  return 0;
+}
+EXPORT NTSTATUS NTAPI LdrGetDllDirectory(PUNICODE_STRING directory) {
+  const ULONG need = ((ULONG)g_dll_directory_chars + 1) * 2;
+  if (directory->MaximumLength < need) {
+    if (directory->MaximumLength >= 2 && directory->Buffer) directory->Buffer[0] = 0;
+    directory->Length = (USHORT)need;
+    return 0xC0000023;      /* STATUS_BUFFER_TOO_SMALL */
+  }
+  for (USHORT i = 0; i <= g_dll_directory_chars; i++) directory->Buffer[i] = g_dll_directory_text[i];
+  directory->Length = (USHORT)(g_dll_directory_chars * 2);
+  return 0;
+}
 EXPORT NTSTATUS NTAPI LdrLoadDll(PWSTR search_path, PULONG flags, PUNICODE_STRING name, PVOID *handle) {
   BOOLEAN bare = TRUE;
   for (USHORT i = 0; search_path && i < name->Length / 2; ++i) if (name->Buffer[i] == '\\' || name->Buffer[i] == '/' || name->Buffer[i] == ':') bare = FALSE;
