@@ -804,6 +804,36 @@ the channel enable mask and numbers, the deep colour settings, the software CTS 
 the calculated values by hand (13.5, 65 MHz, edge cases), the mode matching with the standard timings, its tolerance, and the InfoFrame bytes with their checksum; `AmdVegaMTest::test_audio_packets` checks the registers
 of the HDMI-A (DIG 2) and DisplayPort (DIG 3) blocks for 1080p60 and 480i with values worked out by hand from the previous contents of the registers (fields written alone leave the rest). **Not checked:**
 `amdgpu_afmt.c` itself (its rows are from memory, but the formula check would catch a wrong one), `drm_edid.c`'s CEA mode table and `hdmi.c`'s packing (the VIC table and the InfoFrame bytes are from memory of
-them; the VIC is information for the sink, a wrong one does not stop the audio). **Not done:** a source for the audio samples - they come from the sound driver through the Azalia controller (HD Audio), which is not set up
-here, so the endpoint now announces what it can do and is ready, but plays nothing; the audio InfoFrame (the hardware builds it), HDMI vendor InfoFrames (4K, 3D), the DisplayPort audio secondary data packets (the driver sets
+them; the VIC is information for the sink, a wrong one does not stop the audio). **Not done here (the next section does the sound driver's side):** the audio InfoFrame (the hardware builds it), HDMI vendor InfoFrames (4K, 3D), the DisplayPort audio secondary data packets (the driver sets
 DisplayPort up as HDMI too, and so does this).
+
+### The sound driver: the graphics card's HD Audio controller
+
+The card's audio function (PCI class 0x0403, the second function of the GPU) is a High Definition Audio controller with one HDMI / DisplayPort codec, and the system's HD Audio driver (`IntelHdaAudioDevice`, which takes any
+controller of that class) plays to it: CORB/RIRB command rings, a cyclic buffer of eight 8 KiB entries through a buffer descriptor list, output stream 0, 48 kHz 16-bit stereo. What the codec adds to an analog one, and
+what the driver now does about it:
+
+- **Which pin.** The codec's pins are the display engine's endpoints (pin *n* is endpoint *n*): a pin reports *presence detect* (`GET_PIN_SENSE` bit 31) when its endpoint is enabled for a connected display
+  (`AmdVegaM::enable_audio`, `HOT_PLUG_CONTROL.AUDIO_ENABLED`) and *ELD valid* (bit 30) once the speaker allocation and descriptors are programmed. The driver prefers, as it always did, a line out, speaker or headphone pin;
+  then a digital pin (pin capabilities HDMI bit 7 or DisplayPort bit 24) with presence and a valid ELD, then one with presence only; then any output pin - a digital one with no display, which carries sound as soon as one
+  comes (the device exists and plays into the void until then). Pins whose configuration default says "no physical connection" are skipped.
+- **What a digital pin needs.** On top of the analog setup (power, connection select, pin control `OUT_EN`, stream tag and format on the converter): the converter's digital output (`SET_DIGI_CONVERT_1`, `DIGEN`), its channel
+  count (`SET_CVT_CHAN_COUNT`, 2 - 1), and the audio InfoFrame (type 0x84, version 1, ten data bytes, checksum, channel count - 1 in the first data byte, the rest "refer to stream header") written through the pin's
+  DIP buffer (`SET_HDMI_DIP_INDEX` packet 0 byte 0, `SET_HDMI_DIP_DATA` fourteen bytes, `SET_HDMI_DIP_XMIT` stopped while writing and then sent every frame).
+- **Following the displays.** `IAudioDevice::retarget()` (default: false; `SystemAudioDevices::retarget()` calls it on every device) makes `IntelHdaAudioDevice` look at the pins again, silence the old path (no InfoFrame, digital
+  output off, pin output off, converter off the stream) and set the new one up, with the stream running on. Nothing calls it by itself: a desktop that drives the card's outputs calls `AmdVegaM::enable_audio(connector)`
+  when a display with audio appears, `disable_audio` when it goes, and `SystemAudioDevices::retarget()` after either. (The desktop in `main.cpp` does not drive the card's outputs - they show nothing - so it does not do
+  this; and an HDMI link carries audio only while it carries video.)
+- **The register seam.** The driver reached the controller through volatile casts; it now goes through `IHdaRegisters` (`PhysicalHdaRegisters` is the memory-mapped one, the only place with the casts), so that a simulated
+  controller can stand in: `IntelHdaAudioDevice(IHdaRegisters&, allocator)` is the constructor without PCI.
+
+**Tested** by `IntelHdaTest` against `tests/FakeHda.hpp`, a controller simulated at the register level (reset handshakes, the CORB read from the driver's memory and the RIRB written to it, the stream descriptor) with a
+graphics card's codec (converters 2, 4, 6, pins 3, 5, 7 each taking any converter, an optional line out), written from the HD Audio specification and independent of the driver: the pin choice over nine combinations of presence,
+ELD and connectivity, an analog pin winning, every verb a digital pin gets (and the order of the InfoFrame's), the stream descriptor, the buffer list entries, playing through the ring with the stream position, retargeting
+(the old pin silenced, the new one set up, playback going on, a pin that is gone), the failures and a restart; and by `AmdVegaMTest::test_audio_end_to_end`, where the codec's pin sense follows the display side's
+endpoint registers (`FakeAzalia`): the sound driver's pin is the endpoint `enable_audio` chose, and follows it between the HDMI and DisplayPort connectors and between endpoints.
+
+**Not checked:** all the HD Audio verbs and parameters are from the High Definition Audio specification and from memory of the Linux `patch_hdmi.c` / `hda_verbs.h` (not at hand): the DIP buffer protocol (index byte, auto-increment
+of the data verb, the xmit codes 0x00 and 0xC0), `SET_DIGI_CONVERT_1` and `SET_CVT_CHAN_COUNT` on an HDMI converter, and the pin sense bits. **Not done:** the vendor-specific verbs of the ATI codecs (channel allocation, down-mix
+info, HBR control, the multi-channel remap), more than two channels or other formats (the stream is 48 kHz 16-bit stereo), the ELD read back from the pin (`GET_HDMI_ELDD`) to check what the display side programmed,
+unsolicited events for display changes (the driver is polled: someone calls `retarget()`), DisplayPort MST (device select), and anything on real hardware.

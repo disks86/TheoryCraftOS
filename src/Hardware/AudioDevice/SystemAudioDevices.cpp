@@ -58,6 +58,14 @@ void SystemAudioDevices::adopt(SharedPointer<IAudioDevice> device, bool hardware
   if (report) pending_.push_back(util::move(event));
 }
 
+uint32_t SystemAudioDevices::retarget() {
+  kernel::ScopedMutex guard(mutex_);
+  uint32_t moved = 0;
+  for (const Entry& e : devices_.view())
+    if (e.device->present() && e.device->retarget()) ++moved;
+  return moved;
+}
+
 bool SystemAudioDevices::has_output() const {
   for (const Entry& e : devices_.view())
     if (e.device->has_output() && e.device->present()) return true;
