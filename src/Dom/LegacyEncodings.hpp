@@ -54,6 +54,21 @@ struct DecoderState {
 // (the state is reset). `last`: no more bytes follow, so a character that is not complete is an error. The state carries over to the next call when it is not.
 bool decode_legacy(Encoding e, DecoderState* state, ConstByteView in, bool last, bool fatal, String* out);
 
+// What an encoder keeps between two characters (only ISO-2022-JP has any: which of its three character sets is selected).
+struct EncoderState {
+  uint32_t mode = 0;
+};
+// Appends the bytes of one code point to *bytes (raw bytes in a String). False when the encoding has no character for it: *unencodable is then the code point to report
+// (the code point itself, U+FFFD for the few that an encoder refuses). `e` is not UTF-16 or replacement (the standard's "get an output encoding" makes those UTF-8).
+bool encode_code_point(Encoding e, EncoderState* state, uint32_t code_point, String* bytes, uint32_t* unencodable);
+// The end of the text: ISO-2022-JP goes back to ASCII.
+void encode_finish(Encoding e, EncoderState* state, String* bytes);
+// The encoding that output is made in (the encoding itself, UTF-8 for UTF-16 and the replacement encoding).
+Encoding output_encoding(Encoding e);
+// A piece of a URL query (UTF-8) as it is in a URL of a page in encoding `e`: encoded, then percent-encoded with the query's set (`special`: also the apostrophe); what the
+// encoding cannot hold becomes the percent-encoded "&#NNN;". Appends ASCII to *out.
+void encode_url_query(Encoding e, StringView text, bool special, String* out);
+
 // The text of a document that arrived as bytes: the encoding is that of a byte order mark, else the charset of the Content-Type header, else a <meta charset> (or
 // http-equiv Content-Type) in the first 1024 bytes, else UTF-8. The text is UTF-8 without the byte order mark; *used is the encoding that was found.
 void decode_document(ConstByteView bytes, StringView content_type, String* text, Encoding* used);

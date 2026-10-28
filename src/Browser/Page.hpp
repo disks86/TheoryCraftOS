@@ -37,6 +37,7 @@
 #include "Browser/Objects.hpp"
 #include "Browser/Renderer.hpp"
 #include "Dom/Dom.hpp"
+#include "Dom/LegacyEncodings.hpp"
 #include "ObjectContainer/Dictionary.hpp"
 #include "Font/FontSet.hpp"
 #include "Script/Engine.hpp"
@@ -165,7 +166,10 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   // Reads the page: the tree, the scripts (when enabled), then readyState "interactive", DOMContentLoaded, "complete" and load. False if memory ran out.
   bool load(StringView html);
   // The name of the encoding the page's bytes were read in (document.characterSet); call before load().
-  void set_character_set(StringView name) { doc_.character_set.assign(name); }
+  void set_character_set(dom::Encoding e) {
+    doc_.character_set.assign(dom::encoding_display_name(e));
+    doc_.character_encoding = static_cast<uint8_t>(e);
+  }
   // Fetches the style sheets the page links to that have not been fetched, and draws the page into `out`.
   bool render(HtmlDocument* out);
   // The same as render(), as pixels: lays the page out for the display's width in CSS pixels (media().width) with `fonts` and builds what is painted into `out`.

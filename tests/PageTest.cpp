@@ -830,6 +830,30 @@ static void test_clicks_and_resize() {
   CHECK(a.live == 0);
 }
 
+// A page in another encoding: document.characterSet, and the query of a URL it writes is made in that encoding.
+static void test_document_encoding() {
+  TestAllocator a;
+  auto run = [&](dom::Encoding e, const char* script) {
+    std::string out;
+    {
+      FakeEnvironment env(a);
+      MediaEnvironment media;
+      Page page(a, env, "https://example.com/dir/page.html", media, true);
+      page.set_character_set(e);
+      page.load((std::string("<html><body><script>") + script + "</script></body></html>").c_str());
+      out = std::string(page.log().data(), page.log().size());
+      if (!out.empty() && out.back() == '\n') out.pop_back();
+    }
+    return out;
+  };
+  const char* probe = "var a = document.createElement('a'); a.href = '/x?q=\u3000\u2603&r=ab#\u3000'; console.log(document.characterSet, document.inputEncoding, a.search, a.hash, a.pathname)";
+  CHECK(run(dom::Encoding::Big5, probe) == "Big5 Big5 ?q=%A1@%26%239731%3B&r=ab #%E3%80%80 /x");
+  CHECK(run(dom::Encoding::Utf8, probe) == "UTF-8 UTF-8 ?q=%E3%80%80%E2%98%83&r=ab #%E3%80%80 /x");
+  CHECK(run(dom::Encoding::Utf16Le, probe).find("?q=%E3%80%80") != std::string::npos);   // (a page in UTF-16 makes URLs in UTF-8)
+  CHECK(run(dom::Encoding::ShiftJis, "var l = document.createElement('a'); l.href = '?\u3053'; console.log(l.search, new URL('http://x/?\u3053').search)") == "?%82%B1 ?%E3%81%93");   // (the URL API always uses UTF-8)
+  CHECK(a.live == 0);
+}
+
 static void test_external_and_errors() {
   TestAllocator a;
   {
@@ -6053,7 +6077,7 @@ static int run_real_wpt(const char* root, const char* file) {
       dom::Encoding used;
       dom::decode_document(ConstByteView(reinterpret_cast<const uint8_t*>(html.data()), html.size()), StringView(content_type.data(), content_type.size()), &decoded, &used);
       html.assign(decoded.view().data(), decoded.view().size());
-      page.set_character_set(dom::encoding_display_name(used));
+      page.set_character_set(used);
     }
     page.load(html.c_str());
     for (int i = 0; i < 20000; ++i) {
@@ -6066,7 +6090,7 @@ static int run_real_wpt(const char* root, const char* file) {
     }
     const std::string log(page.log().data(), page.log().size());
     printf("%s", log.c_str());
-    if (log.find("WPTDONE") == std::string::npos) printf("WPTDONE NOFINISH the harness did not finish\n");
+    if (log.find("WPTDONE") == std::string::npos) printf("WPTDONE NOFINISH the harness did not finish (%u script errors, clock %llu)\n", page.errors(), static_cast<unsigned long long>(env.clock));
   }
   fflush(stdout);
   _Exit(0);   // (no leak check, no teardown: the runs are for the list of results)
@@ -6152,6 +6176,7 @@ int main(int argc, char** argv) {
   test_page_rendering();
   test_clicks_and_resize();
   test_external_and_errors();
+  test_document_encoding();
   test_modules();
   test_images();
   test_picture_paint();

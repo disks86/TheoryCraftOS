@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string>
 #include <vector>
+#include "Dom/Entities.hpp"
 #include "Dom/LegacyEncodings.hpp"
 
 void bounds_violation(const char*, uint64_t, uint64_t) { abort(); }
@@ -132,6 +133,67 @@ int main() {
   CHECK(document("<p>\xC3\xA9", "") == "<p>\xC3\xA9|utf-8");
   CHECK(document("<p>\xE9", "text/html; charset=bogus") == "<p>\xEF\xBF\xBD|utf-8");
   CHECK(document("<meta charset=big5><p>\xA7\x41", "text/html; charset=utf-8") == "<meta charset=big5><p>\xEF\xBF\xBD" "A|utf-8");   // (the header wins)
+
+  // encoders: the bytes of a character, the characters that are refused, the query of a URL
+  auto encode = [&](Encoding enc, const char* utf8) {
+    dom::EncoderState state;
+    String bytes(a);
+    uint32_t bad = 0;
+    bool all = true;
+    for (uint64_t at = 0; at < StringView(utf8).size();) {
+      const uint32_t cp = dom::next_code_point(StringView(utf8), &at);
+      if (!dom::encode_code_point(enc, &state, cp, &bytes, &bad)) all = false;
+    }
+    dom::encode_finish(enc, &state, &bytes);
+    return std::string(bytes.view().data(), bytes.view().size()) + (all ? "" : "!");
+  };
+  CHECK(encode(Encoding::Gbk, "\xE4\xBD\xA0\xE5\xA5\xBD") == "\xC4\xE3\xBA\xC3");
+  CHECK(encode(Encoding::Big5, "\xE4\xBD\xA0\xE5\xA5\xBD") == "\xA7\x41\xA6\x6E");
+  CHECK(encode(Encoding::ShiftJis, "\xE3\x81\x93\xEF\xBD\xB1") == "\x82\xB1\xB1");
+  CHECK(encode(Encoding::EucJp, "\xE3\x81\x93\xEF\xBD\xB1") == "\xA4\xB3\x8E\xB1");
+  CHECK(encode(Encoding::EucKr, "\xEA\xB0\x80") == "\xB0\xA1");
+  CHECK(encode(Encoding::Iso2022Jp, "\xE3\x81\x93" "A") == "\x1B\x24\x42\x24\x33\x1B\x28\x42" "A");
+  CHECK(encode(Encoding::Iso2022Jp, "\xC2\xA5") == "\x1B\x28\x4A\x5C\x1B\x28\x42");
+  CHECK(encode(Encoding::Windows1252, "\xE2\x82\xAC\xC3\xA9") == "\x80\xE9");
+  CHECK(encode(Encoding::Gb18030, "\xF0\x90\x80\x80") == "\x90\x30\x81\x30");   // U+10000: a four byte sequence
+  CHECK(encode(Encoding::Gbk, "\xF0\x90\x80\x80") == "!");                        // GBK has none
+  CHECK(encode(Encoding::Gbk, "\xE2\x82\xAC") == "\x80");
+  CHECK(encode(Encoding::Gb18030, "\xEE\x9E\x8D") == "\xA6\xD9");                 // U+E78D, the old private use character
+  CHECK(encode(Encoding::Big5, "\xE2\x98\x83") == "!");                           // U+2603 is not in Big5
+  CHECK(encode(Encoding::Big5, "\xE2\x95\x90") == "\xF9\xF9");                    // U+2550: the last pointer
+  CHECK(encode(Encoding::XUserDefined, "\xEF\x9E\x80") == "\x80");
+  CHECK(dom::output_encoding(Encoding::Utf16Le) == Encoding::Utf8 && dom::output_encoding(Encoding::Replacement) == Encoding::Utf8 && dom::output_encoding(Encoding::Gbk) == Encoding::Gbk);
+  auto query = [&](Encoding enc, const char* utf8, bool special = true) {
+    String out(a);
+    dom::encode_url_query(enc, StringView(utf8), special, &out);
+    return std::string(out.view().data(), out.view().size());
+  };
+  CHECK(query(Encoding::Big5, "ab") == "ab");
+  CHECK(query(Encoding::Big5, "\xE3\x80\x80") == "%A1@");                                    // '@' is not in the set
+  CHECK(query(Encoding::Big5, "\xE2\x98\x83") == "%26%239731%3B");                           // refused: the numeric character reference, percent-encoded
+  CHECK(query(Encoding::ShiftJis, "a b\"<>#") == "a%20b%22%3C%3E%23");
+  CHECK(query(Encoding::ShiftJis, "'") == "%27" && query(Encoding::ShiftJis, "'", false) == "'");
+  CHECK(query(Encoding::Iso2022Jp, "\xE3\x81\x93") == "%1B$B$3%1B(B");
+  // a round trip: what the encoder makes, the decoder reads
+  for (uint32_t k = 0; k < static_cast<uint32_t>(Encoding::XUserDefined) + 1; ++k) {
+    const Encoding enc = static_cast<Encoding>(k);
+    if (enc == Encoding::Replacement || dom::output_encoding(enc) != enc) continue;
+    for (uint32_t cp = 0x80; cp < 0x3000; cp += 7) {
+      String text(a);
+      dom::append_utf8(cp, &text);
+      dom::EncoderState state;
+      String bytes(a);
+      uint32_t bad = 0;
+      if (!dom::encode_code_point(enc, &state, cp, &bytes, &bad)) continue;
+      dom::encode_finish(enc, &state, &bytes);
+      dom::DecoderState decoder;
+      String back(a);
+      dom::decode_legacy(enc, &decoder, ConstByteView(reinterpret_cast<const uint8_t*>(bytes.view().data()), bytes.view().size()), true, false, &back);
+      if (cp == 0xE5E5 || (cp >= 0xE78D && cp <= 0xE796) || cp == 0x2212 || cp == 0xA5 || cp == 0x203E || (cp >= 0xFF61 && cp <= 0xFF9F)) continue;   // (these are encoded as other characters)
+      if (enc == Encoding::Gbk && cp == 0x20AC) continue;
+      CHECK(back.view().equals(text.view()));
+    }
+  }
 
   printf(g_failed ? "%d check(s) failed\n" : "encoding tests passed\n", g_failed);
   return g_failed ? 1 : 0;

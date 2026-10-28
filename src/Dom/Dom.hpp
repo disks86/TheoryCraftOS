@@ -112,6 +112,7 @@ class Document {
   String content_type;
   // The encoding the page arrived in (document.characterSet): "UTF-8" unless the page said otherwise.
   String character_set;
+  uint8_t character_encoding = 0;   // the same as an Encoding (LegacyEncodings.hpp); 0 is UTF-8
   Node* document_element() const;                       // <html>
   Node* head() const;
   Node* body() const;
