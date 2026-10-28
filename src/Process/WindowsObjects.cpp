@@ -692,7 +692,7 @@ namespace {
 // SECTION_IMAGE_INFORMATION (64 bytes) of an image section: what the PE headers say, as NtQuerySection answers it.
 uint32_t query_image_information(Process& p, const SyscallRequest& r, uint32_t id, const ObjectManager::SectionInfo& info, uint64_t length, uint64_t returned_at) {
   if (length < 64) return 0xC0000004u;
-  if (!(info.attributes & 0x1000000u)) return length > (uint64_t{1} << 32) ? kAccessViolation : 0xC000004Fu;      // STATUS_SECTION_NOT_IMAGE
+  if (!(info.attributes & 0x1000000u)) return length > (uint64_t{1} << 32) ? kAccessViolation : 0xC0000049u;      // STATUS_SECTION_NOT_IMAGE
   ObjectManager* objects = system_objects();
   uint8_t* storage = nullptr;
   uint64_t rounded = 0;
