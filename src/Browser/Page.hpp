@@ -421,6 +421,11 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   friend class FrameEnv;
   bool sync_frames();   // true when a frame was loaded
   void frame_navigate(uint32_t frame_serial, StringView address);
+  void frame_post(uint32_t frame_serial, StringView address, StringView content_type, StringView body);
+  void deliver_frame(uint32_t frame_serial, StringView address, const char* content_type, StringView body);
+  Frame* frame_record(uint32_t frame_serial);
+  bool find_named_frame(StringView name, Page** owner, uint32_t* serial);
+  bool send_to_target(StringView target, StringView address, const char* content_type, StringView body);
   void frame_pick_file(uint32_t frame_serial, uint32_t node_serial, bool multiple);
   void paste_text(dom::Node* control, StringView text);
   // Messages for this window (from windows and message ports) wait here until the next turn of the event loop.
