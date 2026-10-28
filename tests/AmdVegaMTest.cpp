@@ -103,7 +103,7 @@ struct Card final : IVcnRegisters {
   static bool in(uint32_t r, uint32_t lo, uint32_t hi) { return r >= lo && r <= hi; }
   IVcnRegisters& owner(uint32_t r) {
     if (monitor && in(r, 0x7000, 0x7007)) return *monitor;
-    if (aux && in(r, 0x7010, 0x7033)) return *aux;
+    if (aux && in(r, 0x7010, 0x7040)) return *aux;
     if (in(r, 0x3400, 0x37ff)) return sdma;
     if (in(r, 0xe30, 0xe4b) || r == 0x151a || r == 0x151b) return ih;
     if (in(r, 0x500, 0x57f) || in(r, 0x800, 0x82f) || in(r, 0xb00, 0xbff) || r == 0x394 || r == 0x1524 || r == 0x1528 || r == 0x150a) return gmc;
@@ -1457,7 +1457,8 @@ static std::vector<uint8_t> make_connector_vbios() {
   u16(0x400, 0x20); u8(0x403, 2); u16(0x404, 0x0FFF); u16(0x406, 0x100); u16(0x40E, 0x40);
   const uint32_t tags[3] = {0x2, 0x8, 0x80}, ids[3] = {0x1114, 0x110C, 0x1113};   // LCD1 eDP, DFP1 HDMI-A, DFP2 DisplayPort
   u8(0x440, 3);
-  for (uint32_t i = 0; i < 3; ++i) { u16(0x444 + i * 12, tags[i]); u16(0x446 + i * 12, 12); u16(0x448 + i * 12, ids[i]); }
+  const uint32_t encoders[3] = {0x211E, 0x2120, 0x2220};   // the display paths' encoders: UNIPHY link A (eDP), UNIPHY1 link A (HDMI-A), UNIPHY1 link B (DisplayPort)
+  for (uint32_t i = 0; i < 3; ++i) { u16(0x444 + i * 12, tags[i]); u16(0x446 + i * 12, 12); u16(0x448 + i * 12, ids[i]); u16(0x44C + i * 12, encoders[i]); }
   u8(0x500, 3);
   const uint32_t ddc[3] = {0x92, 0x91, 0x93};
   for (uint32_t i = 0; i < 3; ++i) {
@@ -1484,6 +1485,15 @@ static std::vector<uint8_t> make_connector_vbios() {
   aux.move(atomimage::PS, 1, atomimage::REG, FakeAuxCard::kStatus, atomimage::BYTE0, 1);
   aux.move(atomimage::PS, 1, atomimage::REG, FakeAuxCard::kLength, atomimage::BYTE0, 2);
   aux.eot();
+  // UNIPHYTransmitterControl (76): the parameters' first word to the card, which is the panel power
+  atomimage::Code panel;
+  panel.move(atomimage::REG, FakeAuxCard::kPanel, atomimage::PS, 0);
+  panel.eot();
+  u16(0x640 + 4 + 76 * 2, 0x780);
+  u16(0x780, 6 + static_cast<uint32_t>(panel.b.size()));
+  u8(0x784, 8);
+  u8(0x785, 8);
+  for (size_t i = 0; i < panel.b.size(); ++i) u8(0x786 + static_cast<uint32_t>(i), panel.b[i]);
   u16(0x640 + 4 + 78 * 2, 0x700);
   u16(0x700, 6 + static_cast<uint32_t>(aux.b.size()));
   u8(0x704, 8);
@@ -1525,10 +1535,28 @@ static void test_read_edid() {
   for (size_t i = 0; i < 127; ++i) sum = static_cast<uint8_t>(sum + auxcard.sink.edid[i]);
   auxcard.sink.edid[127] = static_cast<uint8_t>(0 - sum);
   CHECK(vega.read_edid(dp, &out) && out.size() == 256 && memcmp(out.view().data(), auxcard.sink.edid.data(), 256) == 0);
+  CHECK(auxcard.panel_writes == 0);       // (a DisplayPort connector has no panel to power)
   CHECK(!auxcard.sink.requests.empty() && auxcard.sink.requests.front().channel == 0x93 && auxcard.sink.requests.front().hpd == 2);
   auxcard.sink.requests.clear();
   CHECK(vega.read_edid(edp, &out) && out.size() == 256 && memcmp(out.view().data(), auxcard.sink.edid.data(), 256) == 0);
   CHECK(!auxcard.sink.requests.empty() && auxcard.sink.requests.front().channel == 0x92 && auxcard.sink.requests.front().hpd == 0);
+  CHECK(auxcard.panel_writes == 1 && auxcard.panel_params == 0x0C000000u && auxcard.panel_on);     // powered up (ucAction = POWER_ON) before the first AUX access
+  // The panel is off and does not answer on the AUX channel until the table powers it up; the hot plug pin of the connector (pin 0) shows it
+  auxcard.panel_on = false;
+  auxcard.unpowered_channel = 0x92;
+  auxcard.sink.requests.clear();
+  rig.card.gfx.set_reg(0x1898, 0x2);
+  uint64_t began = rig.clock.now;
+  CHECK(vega.read_edid(edp, &out) && out.size() == 256 && auxcard.panel_on && auxcard.panel_writes == 2);
+  CHECK(rig.clock.now - began < 100000);       // (no wait: the connector's pin shows the panel)
+  CHECK(!auxcard.sink.requests.empty());
+  // the pin never shows the panel: the wait runs out (300 sense reads), the AUX channel is tried anyway
+  auxcard.panel_on = false;
+  rig.card.gfx.set_reg(0x1898, 0);
+  began = rig.clock.now;
+  CHECK(vega.read_edid(edp, &out) && auxcard.panel_on && auxcard.panel_writes == 3);
+  CHECK(rig.clock.now - began >= 300000);      // (the 300 ms)
+  auxcard.unpowered_channel = 0;
   CHECK(auxcard.sink.malformed == 0 && auxcard.sink.outside_transaction == 0 && monitor.writes == writes);
   auxcard.sink.monitor_present = false;
   CHECK(!vega.read_edid(dp, &out));
@@ -1552,6 +1580,73 @@ static void test_read_edid() {
   // stopped: no
   vega.shutdown();
   CHECK(!vega.read_edid(hdmi, &out));
+}
+
+// The sink's DPCD over the AUX channel of the DisplayPort and eDP connectors (through the video BIOS's table, with the panel power-up for the eDP one).
+static void test_read_dpcd() {
+  const std::vector<uint8_t> vbios = make_connector_vbios();   // eDP (DDC line 0x92, pin 0), HDMI-A (0x91), DisplayPort (0x93, pin 2)
+  Rig rig;
+  FakeI2cMonitor monitor;
+  FakeAuxCard auxcard;
+  rig.card.monitor = &monitor;
+  AmdVegaM vega(rig.alloc);
+  AmdVegaM::Inputs in = rig.inputs();
+  in.vbios = ConstByteView(vbios.data(), vbios.size());
+  Dpcd::Capabilities caps;
+  Dpcd::LinkStatus status;
+  CHECK(!vega.read_dpcd(AtomConnectors::Connector(), &caps));       // (not up)
+  CHECK(vega.bring_up(in));
+  if (!vega.up()) return;
+  const AtomConnectors::Connector edp = vega.connectors()[0], hdmi = vega.connectors()[1], dp = vega.connectors()[2];
+  rig.card.aux = &auxcard;
+  std::vector<uint8_t>& dpcd = auxcard.sink.dpcd;
+  dpcd.assign(0x800, 0);
+  const uint8_t dp_caps[8] = {0x12, 0x14, 0xC4, 0x01, 0x00, 0x00, 0x01, 0x00};
+  for (size_t i = 0; i < 8; ++i) dpcd[i] = dp_caps[i];
+  const uint8_t dp_status[8] = {0x01, 0x00, 0x77, 0x77, 0x81, 0x01, 0x00, 0x00};
+  for (size_t i = 0; i < 8; ++i) dpcd[0x200 + i] = dp_status[i];
+  // DisplayPort: capabilities, then the link status as well; the table is told the connector's line and pin; no panel power
+  CHECK(vega.read_dpcd(dp, &caps) && caps.valid && caps.revision == 0x12 && caps.max_lanes == 4 && caps.max_link_rate_kbps() == 5400000 && caps.edp_revision == Dpcd::kNoEdp);
+  CHECK(!auxcard.sink.requests.empty() && auxcard.sink.requests.front().channel == 0x93 && auxcard.sink.requests.front().hpd == 2 && auxcard.panel_writes == 0);
+  CHECK(auxcard.sink.requests.front().bytes.size() == 4 && auxcard.sink.requests.front().bytes[2] == 0x90);       // a native read (9) of address 0
+  CHECK(vega.read_dpcd(dp, &caps, &status) && status.link_status_updated() && status.channel_eq_ok(4) && status.sink_count() == 1);
+  // eDP: powered up first (the panel answers only then), the panel's own rate table
+  dpcd[0x700] = 0x03;
+  dpcd[0x10] = 0xA4; dpcd[0x11] = 0x1F;       // 8100: 1.62 Gbit/s
+  dpcd[0x12] = 0x30; dpcd[0x13] = 0x2A;       // 10800: 2.16 Gbit/s
+  auxcard.unpowered_channel = 0x92;
+  rig.card.gfx.set_reg(0x1898, 0x2);
+  CHECK(!auxcard.panel_on && vega.read_dpcd(edp, &caps, &status) && auxcard.panel_on && auxcard.panel_writes == 1 && auxcard.panel_params == 0x0C000000u);
+  CHECK(caps.edp_revision == 3 && caps.edp_rate_count == 2 && caps.edp_rates_khz[0] == 1620000 && caps.edp_rates_khz[1] == 2160000);
+  CHECK(auxcard.sink.requests.back().channel == 0x92 && auxcard.sink.requests.back().hpd == 0);
+  auxcard.unpowered_channel = 0;
+  // a DisplayPort connector does not read the eDP registers
+  const size_t before = auxcard.sink.requests.size();
+  CHECK(vega.read_dpcd(dp, &caps) && caps.edp_revision == Dpcd::kNoEdp && auxcard.sink.requests.size() == before + 1);
+  // not a DisplayPort connector, no DDC line, an unknown line: nothing is asked
+  const size_t asked = auxcard.sink.requests.size();
+  AtomConnectors::Connector no_ddc = dp;
+  no_ddc.has_ddc = false;
+  AtomConnectors::Connector unknown = dp;
+  unknown.ddc_id = 0x77;
+  CHECK(!vega.read_dpcd(hdmi, &caps) && !vega.read_dpcd(no_ddc, &caps) && !vega.read_dpcd(unknown, &caps) && auxcard.sink.requests.size() == asked);
+  // nothing answers / not a DPCD / a link status that does not come: caps are left alone
+  caps = Dpcd::Capabilities();
+  auxcard.sink.monitor_present = true;
+  auxcard.sink.timeouts = 1000;
+  CHECK(!vega.read_dpcd(dp, &caps) && !caps.valid);
+  auxcard.sink.timeouts = 0;
+  dpcd[1] = 0;
+  CHECK(!vega.read_dpcd(dp, &caps) && !caps.valid);
+  dpcd[1] = 0x14;
+  CHECK(vega.read_dpcd(dp, &caps) && caps.valid);
+  dpcd.resize(0x203);       // (a short DPCD: the status read is outside it)
+  caps = Dpcd::Capabilities();
+  CHECK(!vega.read_dpcd(dp, &caps, &status) && !caps.valid);
+  CHECK(vega.read_dpcd(dp, &caps) && caps.valid);
+  CHECK(auxcard.sink.malformed == 0);
+  vega.shutdown();
+  CHECK(!vega.read_dpcd(dp, &caps));
 }
 
 // The connectors in the hot plug events: named from the video BIOS's object table, absent without one or for a pin it does not list.
@@ -1630,6 +1725,20 @@ static void test_audio_pins() {
   AtomConnectors::name(outs[1], ArrayView<char>(name, sizeof name));
   CHECK(!strcmp(name, "DP-1"));
   CHECK(vega.audio_outputs(outs, 1) == 1 && vega.audio_outputs(nullptr, 0) == 0);
+  // The DIG encoders from the video BIOS's display paths: eDP on UNIPHY link A (DIG 0, no audio block), HDMI on UNIPHY1 link A (DIG 2), DisplayPort on UNIPHY1 link B (DIG 3). The driver gives
+  // the audio blocks the first connected endpoint (pin 0 of 0, 2, 3, 5).
+  const ArrayView<const AtomConnectors::Connector> all = vega.connectors();
+  CHECK(all.size() == 3 && AtomConnectors::dig_encoder(all[0]) == 0 && AtomConnectors::afmt_instance(all[0]) == AtomConnectors::kNoDig);
+  CHECK(AtomConnectors::afmt_instance(all[1]) == 2 && AtomConnectors::afmt_instance(all[2]) == 3);
+  uint32_t pin = 99;
+  CHECK(!vega.audio_pin_for(all[0], &pin) && pin == 99);
+  CHECK(vega.audio_pin_for(all[1], &pin) && pin == 0);
+  AtomConnectors::Connector no_encoder = all[1];
+  pin = 99;
+  no_encoder.encoder_object = 0;      // (an HDMI connector the video BIOS gives no encoder)
+  CHECK(!vega.audio_pin_for(no_encoder, &pin) && pin == 99);
+  pin = 99;
+  CHECK(vega.audio_pin_for(all[2], &pin) && pin == 0 && vega.audio_pin_for(all[2], nullptr));
   // The HDMI display goes away (pin 1 interrupt): only the DisplayPort is left. And the endpoints are read again on request.
   rig.card.gfx.set_reg(0x1857 + 1, 0x20000);
   rig.card.gfx.set_reg(0x1898 + 8, 0);
@@ -1639,6 +1748,24 @@ static void test_audio_pins() {
   CHECK(!strcmp(name, "DP-1"));
   rig.card.gfx.set_reg(0x17a9 + 4 * 1, 0);   // endpoint 1 gets a port
   CHECK(vega.audio_pins_connected() == 0x2D && vega.refresh_audio_pins() == 0x2F && vega.audio_pins_connected() == 0x2F);
+  // the first connected endpoint follows the endpoints: pin 0 loses its port, pin 1 (just given one) is the first
+  rig.card.gfx.set_reg(0x17a9, 0x40000000);
+  CHECK(vega.refresh_audio_pins() == 0x2E && vega.audio_pin_for(vega.connectors()[1], &pin) && pin == 1);
+  rig.card.gfx.set_reg(0x17a9 + 4 * 1, 0x40000000);
+  CHECK(vega.refresh_audio_pins() == 0x2C && vega.audio_pin_for(vega.connectors()[1], &pin) && pin == 2);
+  rig.card.gfx.set_reg(0x17a9 + 4 * 1, 0);
+  rig.card.gfx.set_reg(0x17a9, 0);
+  rig.card.gfx.set_reg(0x17a9 + 4 * 2, 0x40000000);
+  rig.card.gfx.set_reg(0x17a9 + 4 * 3, 0x40000000);
+  rig.card.gfx.set_reg(0x17a9 + 4 * 5, 0x40000000);
+  CHECK(vega.refresh_audio_pins() == 0x03 && vega.audio_pin_for(vega.connectors()[1], &pin) && pin == 0);
+  for (uint32_t p = 0; p < 8; ++p) rig.card.gfx.set_reg(0x17a9 + 4 * p, 0x40000000);
+  CHECK(vega.refresh_audio_pins() == 0 && !vega.audio_pin_for(vega.connectors()[1], &pin));     // no endpoint at all
+  {
+    const uint32_t back[8] = {0, 0, 2, 3, 1, 0, 1, 1};     // (as it was: the endpoints below expect the mask 0x2F)
+    for (uint32_t p = 0; p < 8; ++p) rig.card.gfx.set_reg(0x17a9 + 4 * p, (back[p] << 30) | 0x00123456u);
+    CHECK(vega.refresh_audio_pins() == 0x2F);
+  }
   // The endpoints themselves: a pin that does not exist reads zero and touches nothing, and the mask never goes past the eighth.
   {
     Rig plain;
@@ -1693,6 +1820,7 @@ int main() {
   test_hotplug_connectors();
   test_audio_pins();
   test_read_edid();
+  test_read_dpcd();
   printf(g_failed ? "AmdVegaMTest: %d FAILED\n" : "AmdVegaMTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }

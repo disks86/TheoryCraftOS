@@ -630,6 +630,7 @@ add_executable(BOOTX64
   src/Emulation/X86_64Evex.cpp
   src/Emulation/X86_64EvexMisc.cpp
   src/Emulation/X86_64EvexFp.cpp
+  src/Emulation/X86_64EvexFp16.cpp
   src/Emulation/X86_64EvexExt.cpp
   src/Emulation/AArch64Cpu.cpp
   src/Emulation/AArch64Fp.cpp
@@ -680,6 +681,8 @@ add_executable(BOOTX64
   src/Hardware/GraphicsProcessingUnit/AMD/AmdDdc.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/I2cEdid.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdAux.cpp
+  src/Hardware/GraphicsProcessingUnit/AMD/AmdPanelPower.cpp
+  src/Hardware/GraphicsProcessingUnit/AMD/Dpcd.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdAsicReset.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdIrq.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdSdma3.cpp

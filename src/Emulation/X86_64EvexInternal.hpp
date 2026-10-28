@@ -59,7 +59,7 @@ enum Kind : uint8_t {
   kShufImm, kPermute, kPermute2, kInsert, kExtract, kBlend, kAlign, kShuf128, kIntUnary, kExtend, kNarrow, kMaskMove, kCompress, kExpand,
   kFpBin, kFpScalar, kFpUnary, kFma, kFpCmp, kCvt, kCvtScalar, kCvtToGpr, kCvtFromGpr, kRound, kGetExp, kGetMant, kScalef, kFixup, kReduce, kRange, kFpClass, kRcp14, kRsqrt14,
   kGather, kScatter, kMiscInt, kDup, kMovHL, kExtractElem, kInsertElem, kHalfConv,
-  kVnni, kMadd52, kMultishift, kShufBit, kShift2, kShift2Var, kCompressBW, kExpandBW, kGfAffine, kGfMul, kBf16, kAesNi, kClmul, kBroadcastMask, kDbpsadbw, kComi
+  kVnni, kMadd52, kMultishift, kShufBit, kShift2, kShift2Var, kCompressBW, kExpandBW, kGfAffine, kGfMul, kBf16, kAesNi, kClmul, kBroadcastMask, kDbpsadbw, kComi, kComplex, kVp2Intersect
 };
 
 enum IntOp : uint8_t { kAdd, kSub, kAdds, kAddus, kSubs, kSubus, kMullo, kMulhs, kMulhu, kMulhrs, kAvg, kMins, kMinu, kMaxs, kMaxu, kAnd, kAndn, kOr, kXor };
@@ -77,6 +77,8 @@ struct EvexOp {
 
 extern const EvexOp kEvexOps[];
 extern const uint32_t kEvexOpCount;
+extern const EvexOp kEvexFp16Ops[];      // X86_64EvexFp16.cpp
+extern const uint32_t kEvexFp16OpCount;
 
 uint64_t evex_integer_op(uint32_t sub, uint32_t w, uint64_t a, uint64_t b);
 uint64_t evex_saturate_signed(int64_t v, uint32_t w);

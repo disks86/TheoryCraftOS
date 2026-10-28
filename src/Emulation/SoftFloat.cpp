@@ -37,8 +37,8 @@ struct Fmt {
   uint64_t default_nan() const { return sign_bit() | (uint64_t{exp_max()} << man_bits) | quiet_bit(); }
   uint64_t max_finite(bool sign) const { return (sign ? sign_bit() : 0) | (uint64_t{exp_max() - 1} << man_bits) | man_mask(); }
 };
-constexpr Fmt kF32{8, 23}, kF64{11, 52};
-const Fmt& fmt_of(Format f) { return f == Format::F32 ? kF32 : kF64; }
+constexpr Fmt kF16{5, 10}, kF32{8, 23}, kF64{11, 52};
+const Fmt& fmt_of(Format f) { return f == Format::F16 ? kF16 : f == Format::F32 ? kF32 : kF64; }
 
 enum Class : uint8_t { kZero, kFinite, kInf, kQuietNan, kSignalingNan };
 
@@ -350,7 +350,7 @@ bool round_up_integer(Rounding mode, bool sign, uint64_t mag, bool round_bit, bo
 
 int64_t to_int(Format fm, uint64_t a, uint32_t bits, bool truncate, Env& env) {
   const Fmt& f = fmt_of(fm);
-  const int64_t indefinite = bits == 32 ? static_cast<int64_t>(INT32_MIN) : INT64_MIN;
+  const int64_t indefinite = bits == 16 ? static_cast<int64_t>(INT16_MIN) : bits == 32 ? static_cast<int64_t>(INT32_MIN) : INT64_MIN;
   const Unpacked u = unpack(f, a, env);
   if (u.cls == kQuietNan || u.cls == kSignalingNan || u.cls == kInf) {
     env.flags |= kInvalid;

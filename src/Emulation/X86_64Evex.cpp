@@ -72,6 +72,7 @@ const EvexOp kEvexOps[] = {
     {3, 1, 0x3F, 0, kCmpImm, 1, 8, kFullMem}, {3, 1, 0x3F, 1, kCmpImm, 1, 16, kFullMem}, {3, 1, 0x3E, 0, kCmpImm, 0, 8, kFullMem}, {3, 1, 0x3E, 1, kCmpImm, 0, 16, kFullMem},
     {3, 1, 0x1F, 0, kCmpImm, 1, 32, kFull}, {3, 1, 0x1F, 1, kCmpImm, 1, 64, kFull}, {3, 1, 0x1E, 0, kCmpImm, 0, 32, kFull}, {3, 1, 0x1E, 1, kCmpImm, 0, 64, kFull},
     {2, 1, 0x26, 0, kTest, 0, 8, kFullMem}, {2, 1, 0x26, 1, kTest, 0, 16, kFullMem}, {2, 1, 0x27, 0, kTest, 0, 32, kFull}, {2, 1, 0x27, 1, kTest, 0, 64, kFull},
+    {2, 3, 0x68, -1, kVp2Intersect, 0, 0, kFull},
     {2, 2, 0x26, 0, kTest, 1, 8, kFullMem}, {2, 2, 0x26, 1, kTest, 1, 16, kFullMem}, {2, 2, 0x27, 0, kTest, 1, 32, kFull}, {2, 2, 0x27, 1, kTest, 1, 64, kFull},
     {3, 1, 0x25, 0, kTernlog, 0, 32, kFull}, {3, 1, 0x25, 1, kTernlog, 0, 64, kFull},
     // shuffles and permutes (sub of kShufImm: 0 vpshufd, 1 vpshufhw, 2 vpshuflw, 3 vpermilps, 4 vpermilpd, 5 vpermq/vpermpd by immediate)
@@ -179,9 +180,9 @@ const EvexOp kEvexOps[] = {
     {1, 3, 0x7A, 1, kCvt, 5, 64, kFull},
     {1, 2, 0x5A, 0, kCvtScalar, 8, 32, kS4}, {1, 3, 0x5A, 1, kCvtScalar, 1, 64, kS8},
     {1, 2, 0x2C, -1, kCvtToGpr, 64, 32, kS4}, {1, 2, 0x2D, -1, kCvtToGpr, 0, 32, kS4}, {1, 2, 0x78, -1, kCvtToGpr, 192, 32, kS4}, {1, 2, 0x79, -1, kCvtToGpr, 128, 32, kS4},
-    {1, 2, 0x2A, -1, kCvtFromGpr, 0, 32, kS4}, {1, 2, 0x7B, -1, kCvtFromGpr, 128, 32, kS4},
+    {1, 2, 0x2A, -1, kCvtFromGpr, 0, 0, kScalar}, {1, 2, 0x7B, -1, kCvtFromGpr, 128, 0, kScalar},
     {1, 3, 0x2C, -1, kCvtToGpr, 65, 64, kS8}, {1, 3, 0x2D, -1, kCvtToGpr, 1, 64, kS8}, {1, 3, 0x78, -1, kCvtToGpr, 193, 64, kS8}, {1, 3, 0x79, -1, kCvtToGpr, 129, 64, kS8},
-    {1, 3, 0x2A, -1, kCvtFromGpr, 1, 64, kS4}, {1, 3, 0x7B, -1, kCvtFromGpr, 129, 64, kS4},
+    {1, 3, 0x2A, -1, kCvtFromGpr, 1, 0, kScalar}, {1, 3, 0x7B, -1, kCvtFromGpr, 129, 0, kScalar},
     // more F: duplicates, high/low moves, single elements, half conversions, gathers and scatters
     {1, 3, 0x12, 1, kDup, 6, 64, kFullMem}, {1, 2, 0x12, 0, kDup, 7, 32, kFullMem}, {1, 2, 0x16, 0, kDup, 8, 32, kFullMem},
     {1, 0, 0x12, 0, kMovHL, 0, 32, kS8}, {1, 1, 0x12, 1, kMovHL, 0, 64, kS8}, {1, 0, 0x13, 0, kMovHL, 1, 32, kS8}, {1, 1, 0x13, 1, kMovHL, 1, 64, kS8},
@@ -479,8 +480,8 @@ X86_64Cpu::Step X86_64Cpu::step_evex(GuestMemory& m) {
   const uint8_t p0 = next_u8(), p1 = next_u8(), p2 = next_u8();
   const uint8_t opcode = next_u8();
   if (d_.truncated) return bad_decode();
-  if ((p0 & 0x0C) != 0 || !(p1 & 4)) return fail(6);
-  const uint32_t map = p0 & 3;
+  if ((p0 & 0x08) != 0 || !(p1 & 4)) return fail(6);
+  const uint32_t map = p0 & 7;
   if (map == 0) return fail(6);
   const bool w = p1 >> 7;
   const uint32_t pp = p1 & 3, vvvv_low = (~(p1 >> 3)) & 15;
@@ -507,6 +508,10 @@ X86_64Cpu::Step X86_64Cpu::step_evex(GuestMemory& m) {
       def = &o;
       break;
     }
+  }
+  for (uint32_t i = 0; !def && i < kEvexFp16OpCount; ++i) {
+    const EvexOp& o = kEvexFp16Ops[i];
+    if (o.map == map && o.pp == pp && o.opcode == opcode && (o.w < 0 || o.w == static_cast<int>(w))) def = &o;
   }
   if (!def) return fail(6);
   const uint32_t elem = def->elem ? def->elem : (w ? 64 : 32);
@@ -547,9 +552,9 @@ X86_64Cpu::Step X86_64Cpu::step_evex(GuestMemory& m) {
     const uint32_t vb = vl / 8;
     switch (def->tuple) {
       case kFullMem: n = (def->kind == kDup && def->sub == 6 && vl == 128) ? 8 : vb; break;
-      case kFull: n = ev_.bcst ? (def->kind == kCvt ? elem / 8 : (w ? 8 : 4)) : vb; break;
-      case kHalf: n = ev_.bcst ? (def->kind == kCvt ? elem / 8 : (w ? 8 : 4)) : vb / 2; break;
-      case kQuarter: n = vb / 4; break;
+      case kFull: n = ev_.bcst ? (def->kind == kCvt || def->map >= 5 || (elem == 16 && def->kind >= kFpBin && def->kind <= kRsqrt14) ? elem / 8 : (w ? 8 : 4)) : vb; break;
+      case kHalf: n = ev_.bcst ? (def->kind == kCvt || def->map >= 5 || (elem == 16 && def->kind >= kFpBin && def->kind <= kRsqrt14) ? elem / 8 : (w ? 8 : 4)) : vb / 2; break;
+      case kQuarter: n = ev_.bcst ? elem / 8 : vb / 4; break;
       case kEighth: n = vb / 8; break;
       case kScalar: n = elem / 8; break;
       case kMem128: n = 16; break;
@@ -572,11 +577,12 @@ X86_64Cpu::Step X86_64Cpu::step_evex(GuestMemory& m) {
   if (!finish_decode()) return bad_decode();
   ev_.old_dest = get_vec(ev_.reg);
   switch (def->kind) {
-    case kMove: case kIntBin: case kMulDq: case kLane: case kShiftCount: case kShiftImm: case kShiftVar: case kRotVar: case kCmpEq: case kCmpImm: case kTest: case kTernlog:
+    case kMove: case kIntBin: case kMulDq: case kLane: case kShiftCount: case kShiftImm: case kShiftVar: case kRotVar: case kCmpEq: case kCmpImm: case kTest: case kTernlog: case kVp2Intersect:
       return evex_int(m, *def);
     case kComi: case kFpBin: case kFpScalar: case kFpUnary: case kFma: case kFpCmp: case kCvt: case kCvtScalar: case kCvtToGpr: case kCvtFromGpr: case kRound: case kGetExp: case kGetMant:
     case kScalef: case kFixup: case kReduce: case kRange: case kFpClass: case kRcp14: case kRsqrt14:
       return evex_fp(m, *def);
+    case kComplex: return evex_fp16(m, *def);
     case kVnni: case kMadd52: case kMultishift: case kShufBit: case kShift2: case kShift2Var: case kGfAffine: case kGfMul: case kBf16: case kAesNi: case kClmul: case kBroadcastMask: case kDbpsadbw:
       return evex_ext(m, *def);
     default: return evex_misc(m, *def);
@@ -877,6 +883,21 @@ X86_64Cpu::Step X86_64Cpu::evex_int(GuestMemory& m, const EvexOp& defn) {
         if (r) bits_out |= uint64_t{1} << i;
       }
       write_mask_register(bits_out, count);
+      return finish();
+    }
+    case kVp2Intersect: {      // vp2intersectd/q k, zmm, zmm/m: the destination is the mask pair (reg & 6, reg | 1); no write mask, no rounding
+      if (aaa != 0 || z || ev_.er) return fail(6);
+      if (!read_rm(&b, elem, true)) return Step::Fault;
+      uint64_t first = 0, second = 0;
+      for (uint32_t i = 0; i < count; ++i) {
+        for (uint32_t j = 0; j < count; ++j) {
+          if (element(a, elem, i) != element(b, elem, j)) continue;
+          first |= uint64_t{1} << i;
+          second |= uint64_t{1} << j;
+        }
+      }
+      s_.k[d_.reg & 6] = first;
+      s_.k[(d_.reg & 6) | 1] = second;
       return finish();
     }
     case kTernlog: {

@@ -123,8 +123,8 @@ programs built with `-march=haswell` (or x86-64-v3) run. `X86_64Vex.cpp` holds a
   fused multiply-add) and the hardware's NaN selection order (multiplicand, multiplicand, addend).
 - **BMI1/BMI2**: `andn`, `bextr`, `blsi`, `blsmsk`, `blsr`, `bzhi`, `mulx`, `pdep`, `pext`, `rorx`, `sarx`, `shlx`, `shrx` (and `tzcnt`/`lzcnt`/`popcnt` that already existed).
 - **AES-NI, PCLMULQDQ, SHA** (`X86_64Crypto.cpp`): `aesenc/enclast/dec/declast`, `aesimc`, `aeskeygenassist`, `pclmulqdq` (all immediates), SHA-1 (`sha1rnds4`, `sha1nexte`, `sha1msg1/2`) and SHA-256 (`sha256rnds2`, `sha256msg1/2`), plus the VEX forms and the 256-bit VAES / VPCLMULQDQ. The S-box is computed at compile time. cpuid reports AES, PCLMULQDQ, SHA, VAES and VPCLMULQDQ. Tested by 125 more `AvxTest` cases against the host CPU (bit-exact), and by `tests/data/emulation/crypto.c` (FIPS-197 vector, key schedule, CTR, GHASH, SHA-256 and SHA-1 of "abc" with the published digests).
-- **SHA-512 and SM4** (`X86_64Crypto.cpp`): `vsha512rnds2`/`msg1`/`msg2` and `vsm4key4`/`vsm4rnds4` (cpuid leaf 7 sub-leaf 1). No available CPU or emulator runs them (qemu's TCG does not), so
-  `tests/data/emulation/crypto2.c` checks them against the published SHA-512("abc") digest and the SM4 standard test vector instead. SM3 is not implemented and not advertised.
+- **SHA-512, SM3 and SM4** (`X86_64Crypto.cpp`): `vsha512rnds2`/`msg1`/`msg2`, `vsm3msg1`/`msg2`/`rnds2` and `vsm4key4`/`vsm4rnds4` (cpuid leaf 7 sub-leaf 1). No available CPU or emulator runs them (qemu's TCG does not), so
+  `tests/data/emulation/crypto2.c` checks them against the published SHA-512("abc") digest, the SM4 standard test vector and SM3("abc") (the full 64-round compression built from the three instructions, equal to OpenSSL's digest) instead. The SM3 operand layout was taken from the ASM-DUDE reference of the Intel pseudocode; a correct digest is only possible if that layout is right, so the digest check covers it.
 - **AVX-512** (`X86_64Evex*.cpp`, table in `kEvexOps`): the EVEX prefix, 32 vector registers of 512 bits (`State::evex_lo/evex_hi` for 16..31, the upper halves in `YmmHigh::upper`; assigning an `Xmm`
   to a `YmmHigh`, which is what every VEX write does, clears the upper halves like the hardware), the opmask registers `k0..k7` (the VEX-encoded `kmov`/`kand`/`kshift`/`kortest`/... in
   `kmask_instruction`), merge and zeroing masking per element, embedded broadcast, embedded rounding and SAE, compressed disp8*N, and fault suppression for masked-off memory elements.
@@ -135,7 +135,18 @@ programs built with `-march=haswell` (or x86-64-v3) run. `X86_64Vex.cpp` holds a
   single/double (and `vcvtph2ps`/`vcvtps2ph`), gathers and scatters, and `vucomis*`. XCR0 is 0xE7 and `xsave`/`xrstor` handle the opmask, ZMM_Hi256 and Hi16_ZMM components (standard
   format, 2688 bytes). `vrcp14*`/`vrsqrt14*` return a correctly rounded value truncated to 14 bits: the architecture only promises a relative error below 2^-14, and the real tables differ
   between Intel and AMD, so they are not compared with the host.
-- **Not implemented** (an invalid-instruction fault, never a wrong result): SM3, AVX-512 FP16 / 4FMAPS / VP2INTERSECT / the Xeon Phi parts, TSX, `xsaveopt`/`xsavec`, and the MMX registers (so the MMX forms of the SSSE3
+- **AVX512_VP2INTERSECT** (cpuid.7.0:EDX bit 8; `kVp2Intersect` in `X86_64Evex.cpp`): `vp2intersectd/q k, zmm, zmm/m/m{1toN}` writes the mask pair (`reg & 6`, `reg | 1`): bit i of the first when element i of
+  the first source equals any element of the second, bit j of the second when element j equals any element of the first; every other bit is cleared. A write mask, zeroing or embedded
+  rounding is #UD. `Vp2IntersectTest` checks it against a model written from that definition (the host has no VP2INTERSECT) and runs every truncation and bit flip of the encodings.
+- **AVX-512 FP16** (cpuid.7.0:EDX bit 23; `kEvexFp16Ops` in `X86_64EvexFp16.cpp`, EVEX maps 3, 5 and 6): half-precision `add/sub/mul/div/min/max/sqrt`, `fmadd/fmsub/fnmadd/fnmsub`
+  in all three operand orders plus `fmaddsub/fmsubadd`, `vcmpph`/`vcomish`, `vrndscale`/`vreduce`/`vgetexp`/`vgetmant`/`vscalef`/`vfpclass`, `vrcpph`/`vrsqrtph`, every conversion to and from
+  16/32/64-bit integers, `float`, `double` (packed and scalar, `vcvtsi2sh`/`vcvtsh2si` and the unsigned forms), `vmovsh`, `vmovw`, and the complex-number instructions
+  (`vfmulcph`/`vfcmulcph`/`vfmaddcph`/`vfcmaddcph` and the scalar forms, which raise #UD when the destination is also a source). The elements are handled by the same handler as the single
+  and double forms (`evex_fp`), which was generalized to 16-bit elements, on top of a new `softfloat::Format::F16` (IEEE binary16: the generic packing code of `SoftFloat.cpp` needed only
+  the format description). Half precision has no denormal exception and no DAZ/FTZ, so those never show. Two details are not known and are documented guesses: the complex instructions
+  round as chained fused multiply-adds (`a.re*b.re`, then `-a.im*b.im` added with one rounding), and `vrcpph`/`vrsqrtph` return the correctly rounded value, which is inside the
+  architecture's 2^-11 bound but is not what the hardware's table gives bit for bit.
+- **Not implemented** (an invalid-instruction fault, never a wrong result): AVX-512 4FMAPS / the Xeon Phi parts, TSX, `xsaveopt`/`xsavec`, and the MMX registers (so the MMX forms of the SSSE3
   instructions, the ones without a 66 prefix, are invalid).
   Exceptions delivered to a Windows program save the XMM halves of vector state in the `CONTEXT` in memory, not the upper halves (the emulator keeps those itself).
 - **Checked against the real thing**: `tests/AvxTest.cpp` assembles about 1,400 instruction forms with `llvm-mc` (`tests/data/emulation/avx_cases_gen.py`), runs each on the host
@@ -256,3 +267,12 @@ decoder under ASan/UBSan.
 zeroing, broadcast, disp8*N, embedded rounding, registers 16..31) on the host CPU and on the emulator from the same random zmm, mask and general registers, and requires all 640 bytes of
 vector state, the mask registers, flags, MXCSR and the memory operand to match; it needs an AVX-512 host and skips otherwise (the truncation / bit-flip robustness cases always run, under
 the sanitizers). `avx512.c` is a program of intrinsics and auto-vectorized loops built with every AVX-512 -m flag and run natively and on the emulator.
+
+No CPU that runs the tests has AVX512_FP16, so `Fp16Test` checks against models written in the test instead: add, subtract, multiply, divide, square root and fused multiply-add are
+computed exactly in 128-bit integers and rounded in every rounding mode with all the exception flags; the rest uses the host's `_Float16`/float/double. Every instruction runs with
+random registers 0..31, all vector lengths, merge/zero masking, memory (compressed disp8), broadcast and embedded rounding/SAE, and all 32 vector registers, the mask registers, flags
+and MXCSR are compared. The soft-float half arithmetic was also compared with `_Float16` on 180 million random operand sets, and the unary instructions (`vrndscalesh`, `vreducesh`,
+`vgetexpsh`, `vgetmantsh`, `vrcpsh`, `vrsqrtsh`, `vsqrtsh`) run on all 65,536 half values (`FP16_SCAN=1`). `tests/data/emulation/fp16_check_encodings.py` checks the encodings the test uses
+against llvm-mc (`FP16_DUMP=1 Fp16Test | python3 -I fp16_check_encodings.py`). `fp16.c` is a program built twice, with `-mavx512fp16` (run on the emulator) and without (the compiler's own
+half arithmetic, run natively): the printed hashes of its add/sub/mul/div/min/max/sqrt/conversion/compare loops must be identical, and its intrinsics section (fma, roundscale, getexp, scalef,
+masked add, complex multiply, fpclass, sqrt, cvtph2w) counts disagreements with scalar computations, which must be zero.

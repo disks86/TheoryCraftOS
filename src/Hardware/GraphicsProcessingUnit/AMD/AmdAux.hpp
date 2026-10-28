@@ -20,6 +20,7 @@
 
 #include <stdint.h>
 #include "Hardware/GraphicsProcessingUnit/AMD/AtomBios.hpp"
+#include "Hardware/GraphicsProcessingUnit/AMD/Dpcd.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/I2cEdid.hpp"
 #include "Utility/ArrayView.hpp"
 #include "Utility/ByteBuffer.hpp"
@@ -34,9 +35,8 @@ namespace hardware {
 // The transaction limits of the table: a write has at most 12 payload bytes (the request length is 4 bits, header included), a read at most 16. The sink answers a request with an ACK,
 // NACK or DEFER in the native and the I2C reply (DP 1.2 2.7.7): a defer is waited out and retried (kTries, plus one more for each I2C defer, up to kTries of them), the others fail.
 //
-// Not done: the eDP panel's power (amdgpu powers it up through the transmitter control table before the first AUX access) and the DPCD (link training, sink capabilities), which the
-// native requests below can read and write but nothing uses yet.
-class AmdAux final : public II2cBus {
+// The eDP panel's power is AmdPanelPower's (which AmdVegaM runs before the first AUX access); the sink's DPCD is read through dpcd_read (Dpcd). Not done: writing the DPCD (link training).
+class AmdAux final : public II2cBus, public IDpcdAux {
  public:
   static constexpr uint32_t kCommandTable = 78;           // GetIndexIntoMasterTable(COMMAND, ProcessAuxChannelTransaction)
   static constexpr uint8_t kNoHpd = 0xFF;
@@ -69,7 +69,7 @@ class AmdAux final : public II2cBus {
   int32_t do_msg(Msg* msg);
 
   // The sink's DPCD (a native read), up to kMaxPayload bytes at a time: false unless every byte came.
-  bool dpcd_read(uint32_t address, ByteView out);
+  bool dpcd_read(uint32_t address, ByteView out) override;
 
   // The whole EDID of the sink (I2C over AUX).
   bool read_edid(ByteBuffer* out) { return i2c_edid::read(*this, out); }
