@@ -1709,24 +1709,22 @@ static BOOL find_file(LPCWSTR name, LPCWSTR extension, LPCWSTR extra, WCHAR *out
   }
   return FALSE;
 }
-#define MAX_USER_DLL_DIRS 16
-static struct { WCHAR path[PATH_CHARS]; BOOL used; } g_user_dll_dirs[MAX_USER_DLL_DIRS];
+NTSTATUS NTAPI LdrAddDllDirectory(PUNICODE_STRING directory, PVOID *cookie);
+NTSTATUS NTAPI LdrRemoveDllDirectory(PVOID cookie);
+NTSTATUS NTAPI LdrGetDllPath(PCWSTR name, ULONG flags, PWSTR *path, PWSTR *unused);
+VOID NTAPI RtlReleasePath(PWSTR path);
 
 EXPORT PVOID WINAPI AddDllDirectory(LPCWSTR directory) {
-  if (!directory || wcslen(directory) >= PATH_CHARS || !(directory[0] && directory[1] == ':' && directory[2] == '\\') ) { set_error(ERROR_INVALID_PARAMETER); return NULL; }
-  for (int i = 0; i < MAX_USER_DLL_DIRS; i++) {
-    if (g_user_dll_dirs[i].used) continue;
-    lstrcpyW(g_user_dll_dirs[i].path, directory);
-    g_user_dll_dirs[i].used = TRUE;
-    return (PVOID)(ULONG_PTR)(i + 1);
-  }
-  set_error(ERROR_NOT_ENOUGH_MEMORY);
-  return NULL;
+  if (!directory) { set_error(ERROR_INVALID_PARAMETER); return NULL; }
+  UNICODE_STRING text;
+  unicode_string(&text, directory);
+  PVOID cookie = NULL;
+  const NTSTATUS status = LdrAddDllDirectory(&text, &cookie);
+  if (!NT_SUCCESS(status)) { set_error(status == STATUS_NO_MEMORY ? ERROR_NOT_ENOUGH_MEMORY : ERROR_INVALID_PARAMETER); return NULL; }
+  return cookie;
 }
 EXPORT BOOL WINAPI RemoveDllDirectory(PVOID cookie) {
-  const ULONG_PTR i = (ULONG_PTR)cookie;
-  if (i < 1 || i > MAX_USER_DLL_DIRS || !g_user_dll_dirs[i - 1].used) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
-  g_user_dll_dirs[i - 1].used = FALSE;
+  if (!NT_SUCCESS(LdrRemoveDllDirectory(cookie))) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
   return TRUE;
 }
 EXPORT BOOL WINAPI SetDefaultDllDirectories(DWORD flags) {
@@ -1748,19 +1746,20 @@ static int find_library_restricted(LPCWSTR name, DWORD search, WCHAR *out) {
   if (length + 5 > MAX_PATH) return 0;
   memcpy(file, name, (length + 1) * 2);
   if (!has_extension) memcpy(file + length, dll, sizeof(dll));
-  if (absolute) return full_path_w(file, out, PATH_CHARS) != 0 && is_program_file(out) ? 1 : 0;
-  if (!has_separator(name) && search == 0x100) return -1;      /* (the folder of the library that is loaded needs a path to take it from) */
-  WCHAR directory[PATH_CHARS];
-  if (search & 0x200) {
-    DWORD n = GetModuleFileNameW(NULL, directory, PATH_CHARS);
-    while (n > 0 && directory[n - 1] != '\\') --n;
-    if (n > 0 && try_candidate(directory, n - 1, file, out)) return 1;
+  const BOOL rooted = name[0] == '\\';
+  if (absolute || rooted) return full_path_w(file, out, PATH_CHARS) != 0 && is_program_file(out) ? 1 : 0;
+  if (search & 0x100) return -1;      /* (the folder of the library that is loaded needs a path to take it from) */
+  PWSTR list = NULL, unused = NULL;
+  if (!NT_SUCCESS(LdrGetDllPath(name, search, &list, &unused))) return -1;
+  int found = 0;
+  for (WCHAR *start = list; *start && !found;) {
+    WCHAR *end = start;
+    while (*end && *end != ';') ++end;
+    if (end > start && (size_t_)(end - start) < PATH_CHARS && try_candidate(start, (size_t_)(end - start), file, out)) found = 1;
+    start = *end ? end + 1 : end;
   }
-  if (search & 0x400) {
-    for (int i = 0; i < MAX_USER_DLL_DIRS; i++) if (g_user_dll_dirs[i].used && try_candidate(g_user_dll_dirs[i].path, wcslen(g_user_dll_dirs[i].path), file, out)) return 1;
-  }
-  if ((search & 0x800) && try_candidate(system32, wcslen(system32), file, out)) return 1;
-  return 0;
+  RtlReleasePath(list);
+  return found;
 }
 
 static BOOL find_program(LPCWSTR name, WCHAR *out) {

@@ -1249,10 +1249,104 @@ EXPORT NTSTATUS NTAPI LdrGetDllDirectory(PUNICODE_STRING directory) {
   directory->Length = (USHORT)(g_dll_directory_chars * 2);
   return 0;
 }
+#define MAX_USER_DLL_DIRS 16
+static struct { WCHAR path[520]; BOOLEAN used; ULONG sequence; } g_user_dll_dirs[MAX_USER_DLL_DIRS];
+static ULONG g_user_dll_sequence;
+EXPORT NTSTATUS NTAPI LdrAddDllDirectory(PUNICODE_STRING directory, PVOID *cookie) {
+  const USHORT n = directory->Length / 2;
+  if (n >= 520 || n < 3 || directory->Buffer[1] != ':' || directory->Buffer[2] != '\\') return STATUS_INVALID_PARAMETER;
+  for (int i = 0; i < MAX_USER_DLL_DIRS; i++) {
+    if (g_user_dll_dirs[i].used) continue;
+    for (USHORT k = 0; k < n; k++) g_user_dll_dirs[i].path[k] = directory->Buffer[k];
+    g_user_dll_dirs[i].path[n] = 0;
+    g_user_dll_dirs[i].used = TRUE;
+    g_user_dll_dirs[i].sequence = ++g_user_dll_sequence;
+    *cookie = (PVOID)(ULONG_PTR)(i + 1);
+    return STATUS_SUCCESS;
+  }
+  return STATUS_NO_MEMORY;
+}
+EXPORT NTSTATUS NTAPI LdrRemoveDllDirectory(PVOID cookie) {
+  const ULONG_PTR i = (ULONG_PTR)cookie;
+  if (i < 1 || i > MAX_USER_DLL_DIRS || !g_user_dll_dirs[i - 1].used) return STATUS_INVALID_PARAMETER;
+  g_user_dll_dirs[i - 1].used = FALSE;
+  return STATUS_SUCCESS;
+}
+/* The folders a set of LOAD_LIBRARY_SEARCH_* flags names, separated by ';' (application 0x200, System32 0x800; the user folders belong to kernel32). */
+static BOOLEAN search_flags_path(ULONG flags, WCHAR *out, SIZE_T capacity) {
+  static const WCHAR system32[] = {'C', ':', '\\', 'W', 'i', 'n', 'd', 'o', 'w', 's', '\\', 'S', 'y', 's', 't', 'e', 'm', '3', '2', 0};
+  SIZE_T n = 0;
+  out[0] = 0;
+  if (flags & 0x200) {      /* the folder of the program: ImagePathName of the process parameters, without the file */
+    const UNICODE_STRING *image = (const UNICODE_STRING *)(*(const BYTE *const *)(*(const BYTE *const *)((const BYTE *)NtCurrentTeb() + 0x60) + 0x20) + 0x60);
+    SIZE_T length = image->Length / 2;
+    while (length > 0 && image->Buffer[length - 1] != '\\') --length;
+    if (length > 1 && length < capacity) {
+      for (SIZE_T i = 0; i + 1 < length; ++i) out[n++] = image->Buffer[i];
+      out[n++] = ';';
+    }
+  }
+  if (flags & 0x800) {
+    for (SIZE_T i = 0; system32[i] && n + 1 < capacity; ++i) out[n++] = system32[i];
+    out[n++] = ';';
+  }
+  if (flags & 0x400) {      /* the folders AddDllDirectory added, the newest first, then the one SetDllDirectory named */
+    BOOLEAN done[MAX_USER_DLL_DIRS] = {0};
+    for (;;) {
+      int best = -1;
+      for (int i = 0; i < MAX_USER_DLL_DIRS; i++) if (g_user_dll_dirs[i].used && !done[i] && (best < 0 || g_user_dll_dirs[i].sequence > g_user_dll_dirs[best].sequence)) best = i;
+      if (best < 0) break;
+      done[best] = TRUE;
+      for (SIZE_T i = 0; g_user_dll_dirs[best].path[i] && n + 2 < capacity; ++i) out[n++] = g_user_dll_dirs[best].path[i];
+      out[n++] = ';';
+    }
+    for (SIZE_T i = 0; i < g_dll_directory_chars && n + 2 < capacity; ++i) out[n++] = g_dll_directory_text[i];
+    if (g_dll_directory_chars) out[n++] = ';';
+  }
+  if (n > 0) --n;
+  out[n] = 0;
+  return TRUE;
+}
+EXPORT ULONG NTAPI RtlGetFullPathName_U(PCWSTR name, ULONG size, PWSTR buffer, PWSTR *file_part);
+EXPORT NTSTATUS NTAPI LdrGetDllPath(PCWSTR name, ULONG flags, PWSTR *path, PWSTR *unused) {
+  (void)name;
+  WCHAR text[1040];
+  if ((flags & 8) && (flags & 0x1F00)) return STATUS_INVALID_PARAMETER;
+  search_flags_path(flags ? flags : 0xA00, text, 1040);
+  SIZE_T n = 0;
+  while (text[n]) ++n;
+  PWSTR copy = RtlAllocateHeap(process_heap(), 0, (n + 1) * 2);
+  if (!copy) return STATUS_NO_MEMORY;
+  for (SIZE_T i = 0; i <= n; ++i) copy[i] = text[i];
+  *path = copy;
+  if (unused) *unused = NULL;
+  return STATUS_SUCCESS;
+}
+EXPORT VOID NTAPI RtlReleasePath(PWSTR path) { if (path) RtlFreeHeap(process_heap(), 0, path); }
 EXPORT NTSTATUS NTAPI LdrLoadDll(PWSTR search_path, PULONG flags, PUNICODE_STRING name, PVOID *handle) {
+  WCHAR coded[1040];
+  BOOLEAN absolute = name->Length >= 6 && name->Buffer[1] == ':' && (name->Buffer[2] == '\\' || name->Buffer[2] == '/');
+  if (name->Length >= 2 && name->Buffer[0] == '\\') absolute = TRUE;      /* (\\server\share, or rooted in the current drive) */
+  if ((ULONG_PTR)search_path <= 0xFFFF && ((ULONG_PTR)search_path & 1)) {      /* LOAD_LIBRARY_SEARCH_* flags in place of a path */
+    const ULONG search = (ULONG)(ULONG_PTR)search_path & ~1u;
+    if (((search & 8) && (search & 0x1F00)) || ((search & 0x100) && !absolute)) return STATUS_INVALID_PARAMETER;
+    search_flags_path(search, coded, 1040);
+    search_path = coded;
+  }
   BOOLEAN bare = TRUE;
-  for (USHORT i = 0; search_path && i < name->Length / 2; ++i) if (name->Buffer[i] == '\\' || name->Buffer[i] == '/' || name->Buffer[i] == ':') bare = FALSE;
-  if (!search_path || !bare || !search_path[0]) return ldr_load_one(flags, name, handle);
+  for (USHORT i = 0; i < name->Length / 2; ++i) if (name->Buffer[i] == '\\' || name->Buffer[i] == '/' || name->Buffer[i] == ':') bare = FALSE;
+  if (!search_path && !bare && !absolute) {      /* a relative path is taken from the current folder */
+    WCHAR full[520], text[520];
+    SIZE_T n = name->Length / 2;
+    if (n >= 520) return STATUS_NAME_TOO_LONG_;
+    for (SIZE_T i = 0; i < n; ++i) text[i] = name->Buffer[i];
+    text[n] = 0;
+    const ULONG length = RtlGetFullPathName_U(text, sizeof(full), full, NULL);
+    if (length == 0 || length >= sizeof(full)) return STATUS_DLL_NOT_FOUND;
+    UNICODE_STRING us = { (USHORT)length, (USHORT)(length + 2), full };
+    return ldr_load_one(flags, &us, handle);
+  }
+  if (!search_path || absolute || !search_path[0]) return ldr_load_one(flags, name, handle);
   NTSTATUS first_error = STATUS_DLL_NOT_FOUND;
   BOOLEAN found = FALSE;
   const WCHAR *dir = search_path;
