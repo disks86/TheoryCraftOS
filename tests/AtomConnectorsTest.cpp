@@ -22,6 +22,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <initializer_list>
 #include <vector>
 #include "Hardware/GraphicsProcessingUnit/AMD/AtomConnectors.hpp"
 
@@ -67,6 +68,14 @@ struct Img {
     path_at += 8 + extra;
     u8(kPaths, ++path_count);
   }
+  // a path with the object ids after the connector and the GPU written out
+  void path_ids(uint32_t tag, uint32_t conn_id, std::initializer_list<uint32_t> ids) {
+    u16(path_at, tag); u16(path_at + 2, 8 + 2 * static_cast<uint32_t>(ids.size())); u16(path_at + 4, conn_id);
+    uint32_t at = path_at + 8;
+    for (uint32_t id : ids) { u16(at, id); at += 2; }
+    path_at = at;
+    u8(kPaths, ++path_count);
+  }
   // a connector object whose records begin where the last one left off; returns where the records start so the caller can write them
   uint32_t object(uint32_t conn_id) {
     u16(object_at, conn_id); u16(object_at + 4, record_at - kHeader);
@@ -90,7 +99,7 @@ constexpr uint32_t kLcd1 = 0x0002, kDfp1 = 0x0008, kDfp2 = 0x0080, kDfp3 = 0x020
 Img xps_board() {
   Img i;
   i.gpio(1, 0x488d, 0); i.gpio(2, 0x488d, 8); i.gpio(3, 0x488d, 16); i.gpio(4, 0x488d, 24); i.gpio(5, 0x488d, 26); i.gpio(6, 0x488d, 28);
-  i.path(kLcd1, kEdp); i.path(kDfp1, kHdmi); i.path(kDfp2, kDp1); i.path(kDfp3, kDp2);
+  i.path_ids(kLcd1, kEdp, {0x211E, 0}); i.path_ids(kDfp1, kHdmi, {0x2120, 0x3000}); i.path_ids(kDfp2, kDp1, {0x2220, 0}); i.path_ids(kDfp3, kDp2, {0x2125, 0x2123});
   i.hpd(kEdp, 1); i.hpd(kHdmi, 2); i.hpd(kDp1, 3); i.hpd(kDp2, 5);
   return i;
 }
@@ -113,6 +122,69 @@ void test_board() {
   CHECK(found == &c[2]);
   CHECK(AtomConnectors::find_pin(ArrayView<const AtomConnectors::Connector>(c, n), 3) == nullptr);
   CHECK(AtomConnectors::find_pin(ArrayView<const AtomConnectors::Connector>(c, n), AtomConnectors::kNoPin) == nullptr);
+}
+
+// The encoder objects of the display paths: written as the numbers of ObjectID.h (type 2 << 12, enumeration << 8, id), not the parser's constants.
+void test_encoders() {
+  Img i;
+  i.gpio(1, 0x488d, 0); i.gpio(2, 0x488d, 8); i.gpio(3, 0x488d, 16); i.gpio(4, 0x488d, 24);
+  // eDP on UNIPHY (0x1E) link A; HDMI on UNIPHY1 (0x20) link A; DP-1 on UNIPHY1 link B, after something that is no encoder, with a bridge (TRAVIS 0x23) after it; DP-2 on UNIPHY3 (0x25)
+  i.path_ids(kLcd1, kEdp, {0x211E});
+  i.path_ids(kDfp1, kHdmi, {0x2120, kHdmi});
+  i.path_ids(kDfp2, kDp1, {0x3000 | 0x100 | 5, 0x2220, 0x2123});
+  i.path_ids(kDfp3, kDp2, {0x2125});
+  i.hpd(kEdp, 1); i.hpd(kHdmi, 2); i.hpd(kDp1, 3); i.hpd(kDp2, 4);
+  AtomConnectors::Connector c[8];
+  CHECK(AtomConnectors::parse(i.view(), ArrayView<AtomConnectors::Connector>(c, 8)) == 4);
+  CHECK(c[0].encoder_object == 0x211E && c[0].bridge_object == 0 && AtomConnectors::encoder_id(c[0]) == 0x1E && AtomConnectors::encoder_enum(c[0]) == 1);
+  CHECK(AtomConnectors::dig_encoder(c[0]) == 0 && AtomConnectors::afmt_instance(c[0]) == AtomConnectors::kNoDig);      // (the internal panel has no audio format block)
+  CHECK(c[1].encoder_object == 0x2120 && c[1].bridge_object == 0 && !AtomConnectors::link_b(c[1]) && AtomConnectors::dig_encoder(c[1]) == 2 && AtomConnectors::afmt_instance(c[1]) == 2);
+  CHECK(c[2].encoder_object == 0x2220 && c[2].bridge_object == 0x2123 && AtomConnectors::link_b(c[2]) && AtomConnectors::dig_encoder(c[2]) == 3 && AtomConnectors::afmt_instance(c[2]) == 3);
+  CHECK(c[3].encoder_object == 0x2125 && AtomConnectors::dig_encoder(c[3]) == 6 && AtomConnectors::afmt_instance(c[3]) == 6);
+  // every transmitter and link
+  const struct { uint32_t object; uint8_t dig; } digs[] = {
+      {0x211E, 0}, {0x221E, 1}, {0x2120, 2}, {0x2220, 3}, {0x2121, 4}, {0x2221, 5}, {0x2125, 6}, {0x2225, 6},
+      {0x2122, AtomConnectors::kNoDig}, {0x2123, AtomConnectors::kNoDig}, {0x211D, AtomConnectors::kNoDig}, {0x211F, AtomConnectors::kNoDig}, {0x2124, AtomConnectors::kNoDig}, {0x2126, AtomConnectors::kNoDig}, {0, AtomConnectors::kNoDig}};
+  for (const auto& d : digs) {
+    AtomConnectors::Connector k;
+    k.encoder_object = static_cast<uint16_t>(d.object);
+    CHECK(AtomConnectors::dig_encoder(k) == d.dig);
+  }
+  // a connector of several paths keeps the first path's encoders; one without gets them from a later one
+  Img m;
+  m.path_ids(kDfp1, kHdmi, {0x2121});
+  m.path_ids(kDfp2, kHdmi, {0x2220});
+  m.path_ids(kDfp3, kDp1, {});
+  m.path_ids(kDfp4, kDp1, {0x2125, 0x2123});
+  AtomConnectors::Connector n[4];
+  CHECK(AtomConnectors::parse(m.view(), ArrayView<AtomConnectors::Connector>(n, 4)) == 2);
+  CHECK(n[0].encoder_object == 0x2121 && n[0].bridge_object == 0 && n[0].devices == (kDfp1 | kDfp2));
+  CHECK(n[1].encoder_object == 0x2125 && n[1].bridge_object == 0x2123);
+  // the audio block is for the digital flat panels only: DFP1 to DFP6 (0x8, 0x80, 0x200, 0x400, 0x800, 0x40), not the CRTs, the LCDs, the TV or the CV
+  for (uint32_t bit = 0; bit < 12; ++bit) {
+    AtomConnectors::Connector k;
+    k.encoder_object = 0x2120;
+    k.devices = static_cast<uint16_t>(1u << bit);
+    const bool dfp = bit == 3 || bit == 7 || bit == 9 || bit == 10 || bit == 11 || bit == 6;
+    CHECK(AtomConnectors::afmt_instance(k) == (dfp ? 2 : AtomConnectors::kNoDig));
+  }
+  // three encoders on a path: the first is the GPU's, the second the bridge
+  Img t;
+  t.path_ids(kDfp1, kDp1, {0x2120, 0x2123, 0x2125});
+  AtomConnectors::Connector u[2];
+  CHECK(AtomConnectors::parse(t.view(), ArrayView<AtomConnectors::Connector>(u, 2)) == 1 && u[0].encoder_object == 0x2120 && u[0].bridge_object == 0x2123);
+  // the eighth object id is still walked
+  Img e;
+  e.path_ids(kDfp1, kHdmi, {0x3101, 0x3102, 0x3103, 0x3104, 0x3105, 0x3106, 0x3107, 0x2121});
+  AtomConnectors::Connector w[2];
+  CHECK(AtomConnectors::parse(e.view(), ArrayView<AtomConnectors::Connector>(w, 2)) == 1 && w[0].encoder_object == 0x2121);
+  // more object ids than a path can have are not walked past; a path with only non-encoder objects has no encoder
+  Img q;
+  q.path_ids(kDfp1, kHdmi, {0x3101, 0x3102, 0x3103, 0x3104, 0x3105, 0x3106, 0x3107, 0x3108, 0x2120});
+  q.path_ids(kDfp2, kDp1, {0x3101, 0x1001});
+  AtomConnectors::Connector r[4];
+  CHECK(AtomConnectors::parse(q.view(), ArrayView<AtomConnectors::Connector>(r, 4)) == 2);
+  CHECK(r[0].encoder_object == 0 && r[1].encoder_object == 0);
 }
 
 void test_pins() {
@@ -393,6 +465,7 @@ void test_damage() {
 }  // namespace
 
 int main() {
+  test_encoders();
   test_board();
   test_pins();
   test_skips();

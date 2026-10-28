@@ -423,7 +423,7 @@ component video devices are skipped). Names are the kernel's: the type and the n
 merged, as `amdgpu_connector_add` does.
 
 Differences from the driver, because the image is untrusted bytes: every read is checked and a table that runs past the image ends the walk with what was found kept, the paths and records walked are bounded (255, 64),
-at most 16 connectors are kept, and the parts that are not about naming are left out (encoders and their capabilities, routers, the DDC lines). `AmdVegaM` parses the table at bring-up when `Inputs::vbios` is set
+at most 16 connectors are kept, and the parts that are not about naming are left out (the encoders' capabilities, routers; the encoder objects of a path are read, see "Encoder objects"). `AmdVegaM` parses the table at bring-up when `Inputs::vbios` is set
 (`connectors()`), and each `HotplugEvent` carries its connector (`has_connector`, `connector`); `main.cpp` writes the name in the toast, on the debug console and in the boot log.
 `scripts/check_connectors_port.py` checks the master list indexes, the layouts of the object header, path, object, record and GPIO entry, the pin masks and the connector type of each object id against the driver;
 `tests/AtomConnectorsTest.cpp` has a hand-assembled XPS-like board (eDP, HDMI, two DisplayPorts), all six pins and the GPIO entries that are not pins, the skipped devices and unnamed objects, records before and after the
@@ -683,3 +683,19 @@ byte 3, four reserved) with `ucAction` = `ATOM_TRANSMITTER_ACTION_POWER_ON` (12)
 off with the display). The table index, the parameter layout and the two action values are checked against `atombios.h` by `scripts/check_aux_port.py`; `tests/AmdPanelPowerTest.cpp` (the action in the parameters, the wait
 to the millisecond and the 300th sense, a pin that never shows the panel, no pin, an image without the table) and `AmdVegaMTest::test_read_edid` (a panel that answers only after the power-up, which only eDP gets) cover it.
 The driver source for this function was not at hand: the 300 ms / 1 ms polling and the use of only `ucAction` are from memory. Also unseen on hardware: the time a real panel needs (the T1+T2 power sequencing is the table's).
+
+### Encoder objects: connector to DIG encoder to audio block
+
+The display path table lists, after the connector and GPU object ids of a path, the object ids of the encoders from the GPU to the connector (`usGraphicObjIds`). `AtomConnectors::parse` keeps the first object of the
+encoder type (type 2 in bits 14:12 of the id) as `Connector::encoder_object` (the GPU's own encoder, a UNIPHY transmitter) and a second one as `bridge_object` (a bridge chip such as NUTMEG or TRAVIS); at most eight ids of a
+path are walked, and a connector of several paths keeps the first path's encoders (a later path fills them in if the first had none). From the encoder object: the id (`encoder_id`, low byte), the enumeration (bits 10:8;
+2 means the transmitter's link B, `link_b`, as amdgpu's `dig->linkb`), and from those `dig_encoder()` = `dce_v11_0_pick_dig_encoder` (UNIPHY: 0 / 1 for links A / B, UNIPHY1: 2 / 3, UNIPHY2: 4 / 5, UNIPHY3: 6; `kNoDig`
+for any other encoder). `afmt_instance()` is `dce_v11_0_encoder_prepare`'s audio format block, `afmt[dig_encoder]`, only for the digital flat panel devices (DFP1..DFP6: HDMI and DisplayPort, not the internal LCD).
+`AmdVegaM::audio_pin_for(connector, &pin)` then gives the endpoint the driver would hand that block: `dce_v11_0_audio_get_pin`, the first connected endpoint (so the same one for every connector: the driver does not
+tell two displays apart, and neither does this; `AFMT_AUDIO_SRC_CONTROL` is not written here, there is no audio output to program yet).
+
+Checked by `scripts/check_encoder_port.py` against `dce_v11_0.c` and `atombios.h`: the UNIPHY-to-DIG table, the audio block rule, the DFP device mask, the path layout. **Not checked** (`ObjectID.h` was not at hand, the file
+was empty): the encoder object numbers (UNIPHY 0x1E, UNIPHY1 0x20, UNIPHY2 0x21, UNIPHY3 0x25, NUTMEG 0x22, TRAVIS 0x23), the id / enumeration / type masks, the walk of the path's ids in
+`amdgpu_atombios_get_connector_info_from_object_table`, and that enumeration 2 is link B. Not done: the encoder object table of the object header (capabilities of the encoders), the DIG's use for mode setting, and the
+bridge's own handling (`amdgpu_encoder_get_dp_bridge_encoder_id`). `tests/AtomConnectorsTest.cpp` (every transmitter and link, merged paths, the object id limit, bridges, device masks, the truncation and bit-flip sweeps
+over a board with encoders) and `AmdVegaMTest::test_audio_pins` (the XPS-like board's DIGs and the first-connected-endpoint rule as the endpoints change) cover it.

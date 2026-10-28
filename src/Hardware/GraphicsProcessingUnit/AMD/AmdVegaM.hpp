@@ -185,6 +185,10 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
   uint32_t audio_pins_connected() const { return audio_pins_; }
   uint32_t refresh_audio_pins();
   uint32_t audio_outputs(AtomConnectors::Connector* out, uint32_t capacity) const;
+  // The endpoint the driver would give the connector's audio: the connector's encoder (from the video BIOS's display path) is a DIG with an audio format block (AtomConnectors::afmt_instance:
+  // HDMI and DisplayPort, not the internal panel), and dce_v11_0_audio_get_pin hands it the first connected endpoint. False if the connector has no such encoder, or no endpoint is connected.
+  // (The same endpoint for every connector: the driver's choice, which does not tell two displays apart.)
+  bool audio_pin_for(const AtomConnectors::Connector& connector, uint32_t* pin) const;
 
   // Recovery. An engine that timed out on a fence or reported a fault is wedged: nothing more is queued on it. recover() resets the ones that are - the graphics engine with its
   // compute queues (AmdGfx8::recover) if the graphics ring or a compute queue is wedged, and the SDMA engines (AmdSdma3::recover) if one is - and brings them back with empty

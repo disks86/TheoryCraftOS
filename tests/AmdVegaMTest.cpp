@@ -1457,7 +1457,8 @@ static std::vector<uint8_t> make_connector_vbios() {
   u16(0x400, 0x20); u8(0x403, 2); u16(0x404, 0x0FFF); u16(0x406, 0x100); u16(0x40E, 0x40);
   const uint32_t tags[3] = {0x2, 0x8, 0x80}, ids[3] = {0x1114, 0x110C, 0x1113};   // LCD1 eDP, DFP1 HDMI-A, DFP2 DisplayPort
   u8(0x440, 3);
-  for (uint32_t i = 0; i < 3; ++i) { u16(0x444 + i * 12, tags[i]); u16(0x446 + i * 12, 12); u16(0x448 + i * 12, ids[i]); }
+  const uint32_t encoders[3] = {0x211E, 0x2120, 0x2220};   // the display paths' encoders: UNIPHY link A (eDP), UNIPHY1 link A (HDMI-A), UNIPHY1 link B (DisplayPort)
+  for (uint32_t i = 0; i < 3; ++i) { u16(0x444 + i * 12, tags[i]); u16(0x446 + i * 12, 12); u16(0x448 + i * 12, ids[i]); u16(0x44C + i * 12, encoders[i]); }
   u8(0x500, 3);
   const uint32_t ddc[3] = {0x92, 0x91, 0x93};
   for (uint32_t i = 0; i < 3; ++i) {
@@ -1657,6 +1658,20 @@ static void test_audio_pins() {
   AtomConnectors::name(outs[1], ArrayView<char>(name, sizeof name));
   CHECK(!strcmp(name, "DP-1"));
   CHECK(vega.audio_outputs(outs, 1) == 1 && vega.audio_outputs(nullptr, 0) == 0);
+  // The DIG encoders from the video BIOS's display paths: eDP on UNIPHY link A (DIG 0, no audio block), HDMI on UNIPHY1 link A (DIG 2), DisplayPort on UNIPHY1 link B (DIG 3). The driver gives
+  // the audio blocks the first connected endpoint (pin 0 of 0, 2, 3, 5).
+  const ArrayView<const AtomConnectors::Connector> all = vega.connectors();
+  CHECK(all.size() == 3 && AtomConnectors::dig_encoder(all[0]) == 0 && AtomConnectors::afmt_instance(all[0]) == AtomConnectors::kNoDig);
+  CHECK(AtomConnectors::afmt_instance(all[1]) == 2 && AtomConnectors::afmt_instance(all[2]) == 3);
+  uint32_t pin = 99;
+  CHECK(!vega.audio_pin_for(all[0], &pin) && pin == 99);
+  CHECK(vega.audio_pin_for(all[1], &pin) && pin == 0);
+  AtomConnectors::Connector no_encoder = all[1];
+  pin = 99;
+  no_encoder.encoder_object = 0;      // (an HDMI connector the video BIOS gives no encoder)
+  CHECK(!vega.audio_pin_for(no_encoder, &pin) && pin == 99);
+  pin = 99;
+  CHECK(vega.audio_pin_for(all[2], &pin) && pin == 0 && vega.audio_pin_for(all[2], nullptr));
   // The HDMI display goes away (pin 1 interrupt): only the DisplayPort is left. And the endpoints are read again on request.
   rig.card.gfx.set_reg(0x1857 + 1, 0x20000);
   rig.card.gfx.set_reg(0x1898 + 8, 0);
@@ -1666,6 +1681,24 @@ static void test_audio_pins() {
   CHECK(!strcmp(name, "DP-1"));
   rig.card.gfx.set_reg(0x17a9 + 4 * 1, 0);   // endpoint 1 gets a port
   CHECK(vega.audio_pins_connected() == 0x2D && vega.refresh_audio_pins() == 0x2F && vega.audio_pins_connected() == 0x2F);
+  // the first connected endpoint follows the endpoints: pin 0 loses its port, pin 1 (just given one) is the first
+  rig.card.gfx.set_reg(0x17a9, 0x40000000);
+  CHECK(vega.refresh_audio_pins() == 0x2E && vega.audio_pin_for(vega.connectors()[1], &pin) && pin == 1);
+  rig.card.gfx.set_reg(0x17a9 + 4 * 1, 0x40000000);
+  CHECK(vega.refresh_audio_pins() == 0x2C && vega.audio_pin_for(vega.connectors()[1], &pin) && pin == 2);
+  rig.card.gfx.set_reg(0x17a9 + 4 * 1, 0);
+  rig.card.gfx.set_reg(0x17a9, 0);
+  rig.card.gfx.set_reg(0x17a9 + 4 * 2, 0x40000000);
+  rig.card.gfx.set_reg(0x17a9 + 4 * 3, 0x40000000);
+  rig.card.gfx.set_reg(0x17a9 + 4 * 5, 0x40000000);
+  CHECK(vega.refresh_audio_pins() == 0x03 && vega.audio_pin_for(vega.connectors()[1], &pin) && pin == 0);
+  for (uint32_t p = 0; p < 8; ++p) rig.card.gfx.set_reg(0x17a9 + 4 * p, 0x40000000);
+  CHECK(vega.refresh_audio_pins() == 0 && !vega.audio_pin_for(vega.connectors()[1], &pin));     // no endpoint at all
+  {
+    const uint32_t back[8] = {0, 0, 2, 3, 1, 0, 1, 1};     // (as it was: the endpoints below expect the mask 0x2F)
+    for (uint32_t p = 0; p < 8; ++p) rig.card.gfx.set_reg(0x17a9 + 4 * p, (back[p] << 30) | 0x00123456u);
+    CHECK(vega.refresh_audio_pins() == 0x2F);
+  }
   // The endpoints themselves: a pin that does not exist reads zero and touches nothing, and the mask never goes past the eighth.
   {
     Rig plain;

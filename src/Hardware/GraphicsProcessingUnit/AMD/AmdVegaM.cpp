@@ -454,6 +454,16 @@ uint32_t AmdVegaM::refresh_audio_pins() {
   return audio_pins_ = amd_dce11::AudioPins(*inputs_.registers).connected_mask(kAudioPins);
 }
 
+bool AmdVegaM::audio_pin_for(const AtomConnectors::Connector& connector, uint32_t* pin) const {
+  if (!AtomConnectors::carries_audio(connector.type) || AtomConnectors::afmt_instance(connector) == AtomConnectors::kNoDig) return false;
+  for (uint32_t i = 0; i < kAudioPins; ++i) {
+    if (!(audio_pins_ >> i & 1)) continue;
+    if (pin) *pin = i;
+    return true;
+  }
+  return false;
+}
+
 uint32_t AmdVegaM::audio_outputs(AtomConnectors::Connector* out, uint32_t capacity) const {
   uint32_t n = 0;
   for (const AtomConnectors::Connector& c : connectors()) {
