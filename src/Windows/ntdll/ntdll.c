@@ -1336,7 +1336,8 @@ EXPORT NTSTATUS NTAPI LdrLoadDll(PWSTR search_path, PULONG flags, PUNICODE_STRIN
   }
   BOOLEAN bare = TRUE;
   for (USHORT i = 0; i < name->Length / 2; ++i) if (name->Buffer[i] == '\\' || name->Buffer[i] == '/' || name->Buffer[i] == ':') bare = FALSE;
-  if (!search_path && !bare && !absolute) {      /* a relative path is taken from the current folder */
+  const BOOLEAN drive_relative = name->Length >= 4 && name->Buffer[1] == ':' && !absolute;      /* ("C:name": the current folder of that drive) */
+  if (!bare && !absolute && (!search_path || drive_relative)) {      /* a relative path is taken from the current folder */
     WCHAR full[520], text[520];
     SIZE_T n = name->Length / 2;
     if (n >= 520) return STATUS_NAME_TOO_LONG_;
@@ -1362,7 +1363,12 @@ EXPORT NTSTATUS NTAPI LdrLoadDll(PWSTR search_path, PULONG flags, PUNICODE_STRIN
       if (full[n - 1] != '\\') full[n++] = '\\';
       for (USHORT i = 0; i < name->Length / 2; ++i) full[n++] = name->Buffer[i];
       full[n] = 0;
+      WCHAR expanded[520];
       UNICODE_STRING us = { (USHORT)(n * 2), (USHORT)(n * 2 + 2), full };
+      if (!(full[1] == ':' && full[2] == '\\') && full[0] != '\\') {      /* (a relative folder in the path: from the current folder) */
+        const ULONG got = RtlGetFullPathName_U(full, sizeof(expanded), expanded, NULL);
+        if (got != 0 && got < sizeof(expanded)) { us.Buffer = expanded; us.Length = (USHORT)got; us.MaximumLength = (USHORT)(got + 2); }
+      }
       const NTSTATUS status = ldr_load_one(flags, &us, handle);
       if (NT_SUCCESS(status)) return status;
       if (status != STATUS_DLL_NOT_FOUND && status != (NTSTATUS)0xC0000034 && status != (NTSTATUS)0xC000003A && !found) { found = TRUE; first_error = status; }
@@ -1418,6 +1424,78 @@ EXPORT NTSTATUS NTAPI LdrGetDllHandleEx(ULONG flags, PWSTR path, PULONG characte
 }
 EXPORT NTSTATUS NTAPI LdrGetDllHandle(PWSTR path, ULONG characteristics, PUNICODE_STRING name, PVOID *handle) {
   return LdrGetDllHandleEx(1, path, NULL, name, handle);
+}
+
+EXPORT NTSTATUS NTAPI LdrGetDllFullName(PVOID module, PUNICODE_STRING name) {
+  loader_lock();
+  LDR_DATA_TABLE_ENTRY *m = ldr_find_base(module ? module : NtCurrentPeb()->ImageBaseAddress);
+  if (!m) { loader_unlock(); return STATUS_DLL_NOT_FOUND; }
+  const ULONG need = (ULONG)m->FullDllName.Length + 2;
+  const BYTE *from = (const BYTE *)m->FullDllName.Buffer;
+  BYTE *to = (BYTE *)name->Buffer;
+  NTSTATUS status = STATUS_SUCCESS;
+  USHORT copied = (USHORT)need;
+  if (name->MaximumLength < need) { copied = name->MaximumLength; status = 0xC0000023; }      /* STATUS_BUFFER_TOO_SMALL: what fits is copied */
+  for (USHORT i = 0; i < copied; i++) to[i] = i < m->FullDllName.Length ? from[i] : 0;
+  name->Length = status ? copied : m->FullDllName.Length;
+  loader_unlock();
+  return status;
+}
+
+/* API sets: the contracts this system answers for (name without the version, the highest version that exists). */
+static const struct { const char *base; int maximum; int hidden; } g_api_sets[] = {
+  {"api-ms-win-core-console-l1-1-", 0, 0}, {"api-ms-win-core-file-l1-1-", 0, 0}, {"api-ms-win-core-handle-l1-1-", 0, 0}, {"api-ms-win-core-heap-l1-1-", 0, 0},
+  {"api-ms-win-core-libraryloader-l1-1-", 0, 0}, {"api-ms-win-core-memory-l1-1-", 0, 0}, {"api-ms-win-core-processthreads-l1-1-", 0, 0}, {"api-ms-win-core-synch-l1-1-", 0, 0},
+  {"api-ms-win-core-sysinfo-l1-1-", 0, 0}, {"api-ms-win-core-string-l1-1-", 0, 0}, {"api-ms-win-core-errorhandling-l1-1-", 0, 0}, {"api-ms-win-core-localization-l1-1-", 0, 0},
+  {"ext-ms-win-gdi-draw-l1-1-", 1, 0}, {"api-ms-win-deprecated-apis-advapi-l1-1-", 0, 1},
+};
+static WCHAR ascii_lower(WCHAR c) { return c >= 'A' && c <= 'Z' ? (WCHAR)(c + 32) : c; }
+/* Splits "api-ms-win-core-console-l1-1-0" (not null-terminated, no ".dll") into the contract and its last number. STATUS_INVALID_PARAMETER for anything else. */
+static NTSTATUS api_set_lookup(const UNICODE_STRING *name, BOOLEAN strip_extension, BOOLEAN *present_in_table, BOOLEAN *in_schema, BOOLEAN *implemented, BOOLEAN *visible) {
+  SIZE_T n = name->Length / 2;
+  char text[128];
+  if (n == 0 || n >= sizeof(text)) return STATUS_INVALID_PARAMETER;
+  for (SIZE_T i = 0; i < n; i++) {
+    if (name->Buffer[i] == '.' && strip_extension) { n = i; break; }
+    if (name->Buffer[i] == '.' || name->Buffer[i] > 127) return STATUS_INVALID_PARAMETER;
+    text[i] = (char)ascii_lower(name->Buffer[i]);
+  }
+  text[n] = 0;
+  const BOOLEAN api = text[0] == 'a' && text[1] == 'p' && text[2] == 'i' && text[3] == '-';
+  const BOOLEAN ext = text[0] == 'e' && text[1] == 'x' && text[2] == 't' && text[3] == '-';
+  if (!api && !ext) return STATUS_INVALID_PARAMETER;
+  *present_in_table = *in_schema = *implemented = *visible = FALSE;
+  for (SIZE_T k = 0; k < sizeof(g_api_sets) / sizeof(g_api_sets[0]); k++) {
+    SIZE_T l = 0;
+    while (g_api_sets[k].base[l] && g_api_sets[k].base[l] == text[l]) l++;
+    if (g_api_sets[k].base[l] || l == 0) continue;
+    int version = 0;
+    SIZE_T i = l;
+    if (!text[i]) return STATUS_SUCCESS;      /* (no version: not a contract name) */
+    for (; text[i] >= '0' && text[i] <= '9'; i++) version = version * 10 + (text[i] - '0');
+    if (text[i] || i == l) return STATUS_SUCCESS;
+    *present_in_table = TRUE;
+    *visible = !g_api_sets[k].hidden;
+    *in_schema = TRUE;
+    *implemented = version <= g_api_sets[k].maximum && !g_api_sets[k].hidden;
+    if (version > g_api_sets[k].maximum && !g_api_sets[k].hidden) *in_schema = FALSE;
+    return STATUS_SUCCESS;
+  }
+  return STATUS_SUCCESS;
+}
+EXPORT NTSTATUS NTAPI ApiSetQueryApiSetPresence(const UNICODE_STRING *name, BOOLEAN *present) {
+  BOOLEAN known, schema, implemented, visible;
+  *present = FALSE;
+  if (api_set_lookup(name, TRUE, &known, &schema, &implemented, &visible) == STATUS_SUCCESS) *present = known && visible;      /* (the contract exists in some version; a ".dll" is ignored) */
+  return STATUS_SUCCESS;
+}
+EXPORT NTSTATUS NTAPI ApiSetQueryApiSetPresenceEx(const UNICODE_STRING *name, BOOLEAN *in_schema, BOOLEAN *present) {
+  BOOLEAN known, schema, implemented, visible;
+  const NTSTATUS status = api_set_lookup(name, FALSE, &known, &schema, &implemented, &visible);
+  if (status) return status;
+  *in_schema = schema;
+  *present = implemented;
+  return STATUS_SUCCESS;
 }
 
 EXPORT NTSTATUS NTAPI LdrUnloadDll(PVOID base) {

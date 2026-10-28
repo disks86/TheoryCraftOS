@@ -6408,6 +6408,33 @@ static void test_todo() {
       CHECK(h1 && t1->embedded() && h1->tab_count() == 1 && h1->title().equals("To-Do"));
       put(h1, {20, 20, 520, 500});
       w.layout();
+
+      // Right-clicking an item opens its menu: move it to another bucket, mark it complete, put it back.
+      {
+        Rect2D row;
+        CHECK(t1->list().item_rect(0, &row));
+        const Point lo = t1->list().window_origin();
+        const int32_t rx = lo.x + row.x + 10, ry = lo.y + row.y + 4;
+        gui::ContextMenu& menu = t1->item_menu();
+        CHECK(t1->list().context_menu() == &menu);
+        right_click(w, rx, ry);
+        CHECK(menu.open() && menu.find_item("Move to This week")->checked() && !menu.find_item("Move to This week")->enabled());
+        CHECK(menu.find_item("Move to Tomorrow")->enabled() && menu.find_item("Mark Complete")->text.view().equals("Mark Complete"));
+        w.close_popup();
+        CHECK(choose_context(w, menu, rx, ry, "Move to Tomorrow") && t1->item_count() == 1 && d.todo_store().open_count(desktop::Bucket::Tomorrow) == 1);
+        CHECK(d.todo_store().open_count(desktop::Bucket::ThisWeek) == 0 && t1->bucket_box().selected_index() == static_cast<int32_t>(desktop::Bucket::Tomorrow));
+        CHECK(choose_context(w, menu, rx, ry, "Move to This week") && d.todo_store().open_count(desktop::Bucket::ThisWeek) == 1);
+        CHECK(choose_context(w, menu, rx, ry, "Mark Complete") && t1->item_count() == 0 && d.todo_store().done_count() == 2);
+        t1->set_filter(desktop::Todo::kShowCompleted);
+        CHECK(t1->item_count() == 2 && t1->list().item_rect(0, &row));
+        const int32_t cy = lo.y + row.y + 4;
+        right_click(w, rx, cy);
+        CHECK(menu.open() && menu.find_item("Restore") && !menu.find_item("Move to Today")->enabled());
+        w.close_popup();
+        CHECK(choose_context(w, menu, rx, cy, "Restore") && d.todo_store().done_count() == 1);
+        t1->set_filter(desktop::Todo::kShowOpen);
+        CHECK(t1->item_count() == 1);
+      }
       const Rect2D plus = h1->new_tab_button_rect();
       const Point po = h1->window_origin();
       click(w, po.x + plus.x + 8, po.y + plus.y + 6);

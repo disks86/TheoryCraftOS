@@ -16,8 +16,9 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// Stand-ins for the clock and the debug console, which the desktop's 3D test window uses, so the desktop compiles on the development machine.
+// Stand-ins for the clock, the debug console and the embedded logo (an empty image; Logo.S holds it in the kernel), which the desktop's 3D test window uses, so the desktop compiles on the development machine.
 #include <stdint.h>
+#include "Graphics/Logo/Logo.hpp"
 #include "Utility/StringView.hpp"
 
 namespace hardware {
@@ -25,4 +26,7 @@ uint64_t uptime_us() { return 0; }
 }
 namespace console {
 void debug_puts(StringView) {}
+}
+namespace graphics {
+ConstByteView embedded_logo_png() { return {}; }
 }
