@@ -45,6 +45,23 @@ struct Sink final : IDpcdAux {
     for (size_t i = 0; i < out.size(); ++i) out[i] = dpcd[address + i];
     return true;
   }
+  struct Write { uint32_t address; std::vector<uint8_t> bytes; };
+  std::vector<Write> writes;
+  std::vector<uint32_t> failing_writes;     // addresses whose writes fail
+  bool dpcd_write(uint32_t address, ConstByteView data) override {
+    for (uint32_t f : failing_writes)
+      if (f == address) return false;
+    if (address + data.size() > dpcd.size()) return false;
+    Write w{address, {}};
+    for (size_t i = 0; i < data.size(); ++i) w.bytes.push_back(data[i]);
+    writes.push_back(w);
+    if (address == 0x201) {      // (the service interrupt bits are cleared by writing a 1)
+      for (size_t i = 0; i < data.size(); ++i) dpcd[address + i] &= static_cast<uint8_t>(~data[i]);
+    } else {
+      for (size_t i = 0; i < data.size(); ++i) dpcd[address + i] = data[i];
+    }
+    return true;
+  }
 };
 
 void set(Sink& s, uint32_t at, std::initializer_list<uint8_t> bytes) {
@@ -240,6 +257,66 @@ void test_lane_count() {
   CHECK(!Dpcd::read_lane_count(s, &lanes) && lanes == 0);
 }
 
+void test_ack_and_test_response() {
+  Sink s;
+  uint8_t acked = 99;
+  // only the bits a source handles are written, and only if there are any
+  CHECK(Dpcd::acknowledge_service_irq(s, 0x00, &acked) && acked == 0 && s.writes.empty());
+  CHECK(Dpcd::acknowledge_service_irq(s, 0xB9, &acked) && acked == 0 && s.writes.empty());          // (the MCCS and MST bits and the reserved ones are not ours)
+  s.dpcd[0x201] = 0x46;
+  CHECK(Dpcd::acknowledge_service_irq(s, 0x46, &acked) && acked == 0x46 && s.writes.size() == 1 && s.writes[0].address == 0x201 && s.writes[0].bytes.size() == 1 && s.writes[0].bytes[0] == 0x46 && s.dpcd[0x201] == 0);
+  const struct { uint8_t vector, acked; } cases[] = {{0x02, 0x02}, {0x04, 0x04}, {0x40, 0x40}, {0x06, 0x06}, {0xFF, 0x46}, {0x3E, 0x06}, {0x48, 0x40}};
+  for (const auto& c : cases) {
+    s.writes.clear();
+    s.dpcd[0x201] = c.vector;
+    CHECK(Dpcd::acknowledge_service_irq(s, c.vector, &acked) && acked == c.acked && s.writes.size() == 1 && s.writes[0].bytes[0] == c.acked && s.dpcd[0x201] == (c.vector & ~c.acked));
+  }
+  s.failing_writes.push_back(0x201);
+  acked = 99;
+  CHECK(!Dpcd::acknowledge_service_irq(s, 0x02, &acked) && acked == 0);
+  CHECK(Dpcd::acknowledge_service_irq(s, 0x00, &acked));     // (nothing to write, so nothing fails)
+  s.failing_writes.clear();
+  // the request
+  uint8_t request = 99;
+  s.dpcd[0x218] = 0x04;
+  CHECK(Dpcd::read_test_request(s, &request) && request == 0x04);
+  s.failing.push_back(0x218);
+  CHECK(!Dpcd::read_test_request(s, &request) && request == 0);
+  s.failing.clear();
+  // the EDID read test: the checksum of the last block, ACK with the checksum-write bit
+  std::vector<uint8_t> edid(256, 0x11);
+  edid[127] = 0x77;
+  edid[255] = 0xA5;
+  uint8_t response = 99;
+  s.writes.clear();
+  CHECK(Dpcd::answer_test_request(s, 0x04, ConstByteView(edid.data(), edid.size()), &response) && response == 0x05);
+  CHECK(s.writes.size() == 2 && s.writes[0].address == 0x261 && s.writes[0].bytes.size() == 1 && s.writes[0].bytes[0] == 0xA5 && s.writes[1].address == 0x260 && s.writes[1].bytes.size() == 1 && s.writes[1].bytes[0] == 0x05);
+  CHECK(s.dpcd[0x261] == 0xA5 && s.dpcd[0x260] == 0x05);
+  s.writes.clear();
+  CHECK(Dpcd::answer_test_request(s, 0x04, ConstByteView(edid.data(), 128), &response) && response == 0x05 && s.writes[0].bytes[0] == 0x77);
+  // every other test, no EDID, a partial EDID: NAK, and the checksum is not written
+  const uint8_t others[] = {0x00, 0x01, 0x02, 0x08, 0x10, 0x20, 0x40, 0x80, 0x05, 0x06, 0x0C, 0xFF};
+  for (uint8_t o : others) {
+    s.writes.clear();
+    response = 99;
+    CHECK(Dpcd::answer_test_request(s, o, ConstByteView(edid.data(), edid.size()), &response) && response == 0x02 && s.writes.size() == 1 && s.writes[0].address == 0x260 && s.writes[0].bytes[0] == 0x02);
+  }
+  const size_t sizes[] = {0, 1, 127, 129, 255};
+  for (size_t n : sizes) {
+    s.writes.clear();
+    response = 99;
+    CHECK(Dpcd::answer_test_request(s, 0x04, ConstByteView(edid.data(), n), &response) && response == 0x02 && s.writes.size() == 1 && s.writes[0].address == 0x260);
+  }
+  // writes that fail: no answer
+  s.failing_writes.push_back(0x261);
+  response = 99;
+  CHECK(!Dpcd::answer_test_request(s, 0x04, ConstByteView(edid.data(), 256), &response) && response == 0);
+  s.failing_writes.clear();
+  s.failing_writes.push_back(0x260);
+  CHECK(!Dpcd::answer_test_request(s, 0x04, ConstByteView(edid.data(), 256), &response) && response == 0);
+  CHECK(!Dpcd::answer_test_request(s, 0x01, ConstByteView(), &response) && response == 0);
+}
+
 void test_flips() {
   // every bit of the receiver field, the eDP revision and rates, and the status, flipped: never a crash, and valid exactly when the three essentials are
   Sink base;
@@ -282,6 +359,7 @@ int main() {
   test_edp();
   test_link_status();
   test_lane_count();
+  test_ack_and_test_response();
   test_flips();
   printf(g_failed ? "DpcdTest: %d FAILED\n" : "DpcdTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;

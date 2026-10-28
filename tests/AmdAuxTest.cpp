@@ -383,6 +383,47 @@ static void test_random_replies() {
   }
 }
 
+// dpcd_write: native writes of at most 12 bytes at a time, in order, each taken whole; nothing for an empty write; a NACK, a timeout or a short answer ends it.
+static void test_dpcd_write() {
+  Rig r;
+  AmdAux aux(r.world, *r.bios, 0x92, 3);
+  uint8_t data[30];
+  for (size_t i = 0; i < sizeof data; ++i) data[i] = static_cast<uint8_t>(0xC0 + i);
+  CHECK(aux.dpcd_write(0x100, ConstByteView(data, sizeof data)));
+  CHECK(r.world.dpcd_writes.size() == 3);
+  CHECK(r.world.dpcd_writes[0].address == 0x100 && r.world.dpcd_writes[0].bytes.size() == 12 && r.world.dpcd_writes[1].address == 0x10C && r.world.dpcd_writes[1].bytes.size() == 12);
+  CHECK(r.world.dpcd_writes[2].address == 0x118 && r.world.dpcd_writes[2].bytes.size() == 6);
+  bool same_bytes = true;
+  for (size_t i = 0; i < sizeof data; ++i) same_bytes = same_bytes && r.world.dpcd[0x100 + i] == data[i];
+  CHECK(same_bytes && r.world.dpcd[0x11E] == static_cast<uint8_t>(0x11E ^ 0x5A) && r.world.dpcd[0x0FF] == static_cast<uint8_t>(0x0FF ^ 0x5A));     // (the bytes around the run are untouched)
+  // one byte, and exactly 12
+  r.world.dpcd_writes.clear();
+  CHECK(aux.dpcd_write(0x201, ConstByteView(data, 1)) && r.world.dpcd_writes.size() == 1 && r.world.dpcd_writes[0].bytes.size() == 1);
+  r.world.dpcd_writes.clear();
+  CHECK(aux.dpcd_write(0x200, ConstByteView(data, 12)) && r.world.dpcd_writes.size() == 1 && r.world.dpcd_writes[0].bytes.size() == 12);
+  // nothing to write: no request
+  const size_t requests = r.world.requests.size();
+  CHECK(aux.dpcd_write(0x100, ConstByteView()) && r.world.requests.size() == requests);
+  // the request on the wire: native write (8), the address, length - 1 and the bytes
+  r.world.requests.clear();
+  r.world.dpcd.resize(0x30000);
+  CHECK(aux.dpcd_write(0x20102, ConstByteView(data, 3)) && r.world.requests.size() == 1);
+  CHECK(r.world.requests[0].bytes == bytes({0x02, 0x01, 0x82, 0x72, 0xC0, 0xC1, 0xC2}));      // native write (8), address bits 19:16 in the low nibble, 3 bytes: length - 1 = 2 with 7 on the wire in the high nibble
+  // a NACK, a timeout; a write outside the DPCD is a NACK
+  r.world.dpcd_writes.clear();
+  r.world.native_nacks = 100;
+  CHECK(!aux.dpcd_write(0x100, ConstByteView(data, 4)) && r.world.dpcd_writes.empty());
+  r.world.native_nacks = 0;
+  r.world.timeouts = 100;
+  CHECK(!aux.dpcd_write(0x100, ConstByteView(data, 4)));
+  r.world.timeouts = 0;
+  CHECK(!aux.dpcd_write(0x2FFFE, ConstByteView(data, 4)));
+  // the second chunk fails: false, the first was written
+  r.world.dpcd_writes.clear();
+  CHECK(aux.dpcd_write(0x2FFF4, ConstByteView(data, 12)) && !aux.dpcd_write(0x2FFF4, ConstByteView(data, 24)));
+  CHECK(r.world.malformed == 0);
+}
+
 int main() {
   setvbuf(stdout, nullptr, _IONBF, 0);
   test_native_requests();
@@ -393,6 +434,7 @@ int main() {
   test_short_and_long_replies();
   test_replies_and_sizes();
   test_random_replies();
+  test_dpcd_write();
   if (g_failed == 0) printf("AmdAuxTest: all passed\n");
   return g_failed ? 1 : 0;
 }
