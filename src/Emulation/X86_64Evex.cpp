@@ -73,6 +73,7 @@ const EvexOp kEvexOps[] = {
     {3, 1, 0x1F, 0, kCmpImm, 1, 32, kFull}, {3, 1, 0x1F, 1, kCmpImm, 1, 64, kFull}, {3, 1, 0x1E, 0, kCmpImm, 0, 32, kFull}, {3, 1, 0x1E, 1, kCmpImm, 0, 64, kFull},
     {2, 1, 0x26, 0, kTest, 0, 8, kFullMem}, {2, 1, 0x26, 1, kTest, 0, 16, kFullMem}, {2, 1, 0x27, 0, kTest, 0, 32, kFull}, {2, 1, 0x27, 1, kTest, 0, 64, kFull},
     {2, 3, 0x68, -1, kVp2Intersect, 0, 0, kFull},
+    {2, 3, 0x9A, 0, kFma4, 0, 32, kTuple4}, {2, 3, 0xAA, 0, kFma4, 2, 32, kTuple4}, {2, 3, 0x9B, 0, kFma4, 1, 32, kTuple4}, {2, 3, 0xAB, 0, kFma4, 3, 32, kTuple4},      // Xeon Phi 4FMAPS
     {2, 2, 0x26, 0, kTest, 1, 8, kFullMem}, {2, 2, 0x26, 1, kTest, 1, 16, kFullMem}, {2, 2, 0x27, 0, kTest, 1, 32, kFull}, {2, 2, 0x27, 1, kTest, 1, 64, kFull},
     {3, 1, 0x25, 0, kTernlog, 0, 32, kFull}, {3, 1, 0x25, 1, kTernlog, 0, 64, kFull},
     // shuffles and permutes (sub of kShufImm: 0 vpshufd, 1 vpshufhw, 2 vpshuflw, 3 vpermilps, 4 vpermilpd, 5 vpermq/vpermpd by immediate)
@@ -583,6 +584,7 @@ X86_64Cpu::Step X86_64Cpu::step_evex(GuestMemory& m) {
     case kScalef: case kFixup: case kReduce: case kRange: case kFpClass: case kRcp14: case kRsqrt14:
       return evex_fp(m, *def);
     case kComplex: return evex_fp16(m, *def);
+    case kFma4: return evex_fp(m, *def);
     case kVnni: case kMadd52: case kMultishift: case kShufBit: case kShift2: case kShift2Var: case kGfAffine: case kGfMul: case kBf16: case kAesNi: case kClmul: case kBroadcastMask: case kDbpsadbw:
       return evex_ext(m, *def);
     default: return evex_misc(m, *def);
