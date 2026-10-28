@@ -39,8 +39,8 @@ constexpr uint32_t kGuestFramebuffer = 0xFFFFFFFEu;                    // "guest
 constexpr uint32_t kInvalidId = 0xFFFFFFFFu;
 
 // Render states.
-constexpr uint32_t kRsZEnable = 1, kRsZWriteEnable = 2, kRsBlendEnable = 5, kRsSrcBlend = 32, kRsDstBlend = 33, kRsBlendEquation = 34,
-                   kRsCullMode = 35, kRsZFunc = 36, kRsFrontWinding = 43;
+constexpr uint32_t kRsZEnable = 1, kRsZWriteEnable = 2, kRsBlendEnable = 5, kRsStencilEnable = 8, kRsStencilRef = 13, kRsStencilMask = 14, kRsStencilWriteMask = 15, kRsSrcBlend = 32, kRsDstBlend = 33, kRsBlendEquation = 34,
+                   kRsCullMode = 35, kRsZFunc = 36, kRsStencilFunc = 38, kRsStencilFail = 39, kRsStencilZFail = 40, kRsStencilPass = 41, kRsFrontWinding = 43;
 constexpr uint32_t kFaceNone = 1, kFaceFront = 2, kFaceBack = 3, kWindingCw = 1, kWindingCcw = 2;
 constexpr uint32_t kBlendSrcAlpha = 5, kBlendInvSrcAlpha = 6, kBlendEquationAdd = 1, kCompareLessEqual = 4, kCompareAlways = 8;
 
@@ -51,7 +51,7 @@ constexpr uint32_t kTsBindTexture = 1, kTsAddressU = 8, kTsAddressV = 9, kTsMipF
 constexpr uint32_t kAddressWrap = 1, kAddressClamp = 3;
 constexpr uint32_t kFilterNone = 0, kFilterPoint = 1, kFilterLinear = 2;
 constexpr uint32_t kRenderTargetDepth = 0, kRenderTargetColor0 = 2;
-constexpr uint32_t kClearColor = 1, kClearDepth = 2;
+constexpr uint32_t kClearColor = 1, kClearDepth = 2, kClearStencil = 4;
 constexpr uint32_t kPrimitiveTriangleList = 1;
 constexpr uint32_t kUsagePosition = 0, kUsageTexCoord = 5, kUsageColor = 10;
 constexpr uint32_t kFlipConstant = 31;
@@ -144,6 +144,7 @@ class SvgaImage final : public IImage {
   Extent2D extent() const override { return desc_.extent; }
   Format format() const override { return desc_.format; }
   uint32_t usage() const { return desc_.usage; }
+  bool has_stencil() const { return desc_.stencil; }   // (the depth surface is depth 24 / stencil 8: the plane is there, this says the image was made for it)
 
   // A texture's pixels (0xAARRGGBB, rows top to bottom), a band of rows at a time.
   bool write_pixels(ArrayView<const uint32_t> pixels) override { return write_mip_pixels(0, pixels); }
@@ -332,7 +333,7 @@ IBuffer* SvgaDevice::create_buffer(uint64_t size, uint32_t usage) {
 void SvgaDevice::destroy_buffer(IBuffer* buffer) { destroy(allocator_, static_cast<SvgaBuffer*>(buffer)); }
 
 IImage* SvgaDevice::create_image(const ImageDesc& desc) {
-  if (desc.stencil) return nullptr;   // (no stencil plane on this device)
+  if (desc.stencil && (desc.format != Format::D32Float || !(desc.usage & kImageDepthAttachment))) return nullptr;   // (a stencil plane goes with a depth image)
   if (desc.mip_levels == 0 || desc.mip_levels > kMaxMipLevels || desc.mip_levels > mip_level_limit(desc.extent)) return nullptr;
   if (desc.mip_levels > 1 && (desc.format == Format::D32Float || desc.usage != kImageSampled)) return nullptr;   // (only a texture has levels)
   if (!desc.extent.width || !desc.extent.height || desc.format == Format::Undefined || desc.format == Format::R8G8B8A8Unorm) return nullptr;
@@ -358,7 +359,6 @@ void SvgaDevice::destroy_shader_module(IShaderModule* module) { destroy(allocato
 
 IPipeline* SvgaDevice::create_graphics_pipeline(const GraphicsPipelineDesc& desc) {
   if (desc.texture_count > kMaxTextureUnits || desc.fragment_shader == nullptr) return nullptr;
-  if (desc.stencil.enable) return nullptr;   // (no stencil test on this device)
   if (!desc.vertex_shader || !desc.fragment_shader || desc.attribute_count > kMaxVertexAttributes || desc.varying_count > kMaxVaryings) return nullptr;
   if (desc.vertex_shader->stage() != ShaderStage::Vertex || desc.fragment_shader->stage() != ShaderStage::Fragment) return nullptr;
   return make<SvgaPipeline>(allocator_, desc);
@@ -417,11 +417,12 @@ bool SvgaDevice::submit(ICommandBuffer* commands) {
         uint32_t flags = 0;
         if (cmd.pass.clear_color) flags |= kClearColor;
         if (depth && cmd.pass.clear_depth) flags |= kClearDepth;
+        if (depth && depth->has_stencil() && cmd.pass.clear_stencil) flags |= kClearStencil;
         if (flags) {
           auto channel = [](float f) { return static_cast<uint32_t>((f < 0 ? 0 : f > 1 ? 1 : f) * 255.0f + 0.5f); };
           const Vec4& c = cmd.pass.clear_color_value;
           const uint32_t argb = (channel(c.w) << 24) | (channel(c.x) << 16) | (channel(c.y) << 8) | channel(c.z);
-          const uint32_t clear[] = {cid, flags, argb, float_bits(cmd.pass.clear_depth_value), 0, 0, 0, e.width, e.height};
+          const uint32_t clear[] = {cid, flags, argb, float_bits(cmd.pass.clear_depth_value), cmd.pass.clear_stencil_value, 0, 0, e.width, e.height};
           command(kCmdClear, clear, 9);
         }
         pipeline = nullptr;
@@ -450,6 +451,21 @@ bool SvgaDevice::submit(ICommandBuffer* commands) {
             kRsFrontWinding, d.front_face == FrontFace::CounterClockwise ? kWindingCcw : kWindingCw,
         };
         command(kCmdSetRenderState, states, sizeof states / 4);
+        // The stencil test: the pipeline's, on a depth image that has the plane. (A stencil operation is the API's order, 1-based; so is a comparison.)
+        const StencilState& st = d.stencil;
+        if (st.enable && !(depth && depth->has_stencil())) return false;
+        const uint32_t stencil_states[] = {
+            cid,
+            kRsStencilEnable, st.enable ? 1u : 0u,
+            kRsStencilRef, st.reference,
+            kRsStencilMask, st.compare_mask,
+            kRsStencilWriteMask, st.write_mask,
+            kRsStencilFunc, static_cast<uint32_t>(st.compare) + 1,
+            kRsStencilFail, static_cast<uint32_t>(st.fail_op) + 1,
+            kRsStencilZFail, static_cast<uint32_t>(st.depth_fail_op) + 1,
+            kRsStencilPass, static_cast<uint32_t>(st.pass_op) + 1,
+        };
+        command(kCmdSetRenderState, stencil_states, sizeof stencil_states / 4);
         const uint32_t vs[] = {cid, kShaderVertex, pipeline->vertex_shader()};
         const uint32_t ps[] = {cid, kShaderPixel, pipeline->fragment_shader()};
         command(kCmdSetShader, vs, 3);

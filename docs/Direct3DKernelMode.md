@@ -58,6 +58,12 @@ together with `def`s, a constant beyond 1e9, a read of a0) still works on the in
 and compares it with the interpreter on every instruction with varied sources, swizzles, modifiers, masks and result modifiers (about 3,000 programs), plus control flow,
 texture sampling, texkill, relative addressing and truncated / bit-flipped streams. The text was **not** run through a real TGSI parser or virglrenderer.
 
+**Shader Model 1 pixel shaders** (`D3d9Ps1.cpp`, ps_1_0 .. ps_1_4) work on every back end through the same instruction form. Their model is the texture stage: the result is r0, `tex t0` turns
+the texture register into the sample of stage 0 at coordinate set 0, 1.4 has `texld` / `texcrd` with temporaries. Mapping: t0 / t1 are TEXCOORD0 / 1 until written, then temporaries; cnd
+is "0.5 < a" and a select; the source and result modifiers (`_bx2`, `_x2`, `_sat`, ...) and coissue are taken. Not taken: texbem, texreg2*, texm3x*, texdp3*, texdepth, bem, stages 2 and 3
+(the devices have two units and two coordinate sets). The fixed-point ranges of the model (registers clamped to [-1, 1]) are not imitated. Checked on hand-written programs for each
+instruction group against their definitions, as TGSI text, and with a ps_1_4 shader from Wine's HLSL compiler (it cannot make `tex` for 1.1 - 1.3).
+
 **DXBC** (`ShaderKind::Dxbc`, `D3d9Dxbc.cpp`): the container the Direct3D 10/11 runtimes pass a driver, Shader Model 4.0 / 4.1 / 5.0 / 5.1 vertex and pixel shaders (5.1 declares constant buffers, textures and samplers as ranges with a space: `cb[ID][index][element]`, `t[ID][index]`; only space 0, single-register ranges, `b0` as the push constants and `t0`/`t1` are taken). The container is
 checked, the SHDR / SHEX program and the ISGN / OSGN signatures are read, and the program is decoded into the same instruction form, so the interpreter, the TGSI text and the
 device forms below all apply. Registers map as in Direct3D 9 (`vN` = attribute location N, outputs and pixel inputs by COLOR0/1 and TEXCOORD0/1, SV_Position, `cb0[0..7]` the push
@@ -75,8 +81,8 @@ output. Checked against an oracle for every arithmetic instruction (swizzles, mo
   floor / ceil / trunc / round, movc, dp2 in vertex shaders, discard, sin / cos) are built from the ones it has, checked by compiling the stream again and running it beside the
   original. Refused: other models than 1.1 (vertex) / 2.0 / 3.0, a vertex shader with no temporary left (vs_2_0 has 12) or its own `def c31`, a program that needs more than 22 constants.
   The device now also sets the push constants for pixel shaders and takes sampled textures (`kImageSampled` images with `write_pixels`, up to two units, nearest / linear, wrap / clamp,
-  mip filter, level clamp and bias, mipmapped images with `write_mip_pixels` / `generate_mipmaps` made on the CPU) - written from the protocol as I remember it (texture states 8..12 and 21 / 22, surface hint 1<<1), no header was at hand; none of it ran on a VMware host. Vertex shaders of Shader Model 1.1 go too (the rewrite reads their instruction lengths from the opcodes). Still without: stencil,
-  ps_1_x, the R8G8B8A8 format, multiple render targets.
+  mip filter, level clamp and bias, mipmapped images with `write_mip_pixels` / `generate_mipmaps` made on the CPU) - written from the protocol as I remember it (texture states 8..12 and 21 / 22, surface hint 1<<1), no header was at hand; none of it ran on a VMware host. Vertex shaders of Shader Model 1.1 go too (the rewrite reads their instruction lengths from the opcodes). Pixel shaders of Shader Model 1 (ps_1_0 .. ps_1_4) are decoded too (`D3d9Ps1.cpp`) and go to the device as they are. The stencil test works too (render states 8, 13..15, 38..41 and the stencil clear; the numbers follow the enumeration whose other members the device already used, still from memory). Still without:
+  the R8G8B8A8 format, multiple render targets.
 - *Intel Gen9* has no compiler for its execution units. Its vertex stage already runs on the CPU, so it now takes a vertex shader as a function (any attributes up to four, the push
   constants, one varying handed to the pixel kernel); its pixel stage stays one of two fixed kernels, and `classify_fragment` says whether a pixel shader (D3D9 or DXBC) is exactly one:
   `mov oC0, v0` or a texture sample at a varying (unit 0, `texld`/`sample` into a temporary then moved, or straight into the output). Any other pixel shader is refused there. Tested
@@ -90,6 +96,29 @@ or ordered with a context's work (`signal_sync_gpu` / `wait_sync_gpu`). A contex
 count), its queue is dropped but the fence signals still happen, and destroying a context does the same, so nobody waits forever. `present()` flips a `kAllocPresent`
 allocation to the screen (`IGraphicsDevice::present`) or blits a region into one and shows that.
 
+## The GPUs
+
+Every 3D device (`graphics::IGraphicsDevice`) is a miniport. `register_dxg_adapters` (SystemDxg.cpp) makes one adapter per GPU of the graphics pool from the pool's device, and an
+accelerated one first draws the Direct3D self-test (`SelfTest.cpp`: the vs_2_0 / ps_2_0 first triangle, through the same services an application uses) on a throw-away kernel; a device that
+fails it is replaced by the CPU renderer for Direct3D and boot says so. What each device takes (`Adapter::create_shader` offers every form in the module description, a device uses what it
+understands):
+
+| Device | Shaders | Notes |
+|---|---|---|
+| Software (CPU) | the interpreter's functions | everything: textures, mipmaps, stencil, any program. |
+| virgl (QEMU) | TGSI text | from D3D9 / SM1 pixel / SM2-5.1; never run against a real virglrenderer. |
+| VMware SVGA3D | Direct3D 9 tokens (D3D9 rewritten, DXBC written out first) | textures, mipmaps, stencil written from memory of the protocol; not run on a host. |
+| Intel Gen9 | a vertex function on the CPU + its two fixed pixel kernels | pixel shaders must be exactly a colour or one texture sample (`classify_fragment`); simulated engine in the host tests, picture matches the software device. |
+| Raspberry Pi V3D | its fixed vertex and pixel programs | a vertex shader that is exactly the matrix transform (`classify_vertex`, tested by running it on vectors against the built-in shader; rows or columns, Y flipped for Direct3D) and a `mov oC0, v0` pixel shader; no textures or stencil. The device is not yet in the render nodes (only the Pi session's tests make one), so a Pi has no accelerated Direct3D until it is. |
+| AMD (in progress) | - | no `IGraphicsDevice` exists yet; the Vega / Raven work is hardware drivers only. |
+
+`AdapterCaps` says what the adapter found by trying (`stencil`, `mipmaps`, `textures`, `programmable_vertex`, `programmable_pixel`), so a user-mode driver can pick shaders and formats the
+device takes. **A new device, the AMD one included, is done when**: `create_image` takes a colour target (B8G8R8A8) and a D32Float depth image and `read_pixels` works; it takes the
+built-in shader pair or any of the module forms of `ShaderModuleDesc` (function, `tgsi`, `d3d9_tokens`, or a fixed-kernel name plus `eu_varying` / `qpu_*`) for the Direct3D 9 pair
+of the self-test; `create_graphics_pipeline` accepts position float3 at location 0 and colour float4 at location 1; and the host suite (`tests/DxgkrnlDeviceSuite.hpp`:
+`dxgk_suite::compare(allocator, device, display, name, tolerance, allowed_bad)`) draws the same picture as the software device. Nothing in the kernel is vendor specific: once the
+device is in the render node, Direct3D has it (and the self-test falls back to the CPU renderer until it draws correctly).
+
 ## Not done
 
 - **The user-mode half and the system-call glue**: no `NtGdiDdDDI*` services in `src/Process/Windows*.cpp` / `win32u`, no d3d9 / dxgi / d3d11 DLLs. `lock()` returns a view of
@@ -101,4 +130,4 @@ allocation to the screen (`IGraphicsDevice::present`) or blits a region into one
 - Sync objects cannot be shared between processes. No timeout detection and recovery (a hung device cannot be reset), no vblank / scan line, gamma, overlays or VidPN topology
   (multi-monitor); display mode listing and switching go straight to the GPU driver.
 - Video memory is accounted per adapter but there is no per-process budget or priority-based paging between processes.
-- Tested on the software rasterizer only; the accelerated devices (virgl, SVGA3D, Intel Gen9) go through the same interface but were not run here. One lock covers the kernel.
+- Run through the kernel: the software rasterizer (everything) and the simulated Intel Gen9 engine (the self-test picture matches the software device). virgl, SVGA3D and the V3D hardware were not run here (V3D has no host simulation of its rasterizer; its matrix handling is checked numerically). One lock covers the kernel.

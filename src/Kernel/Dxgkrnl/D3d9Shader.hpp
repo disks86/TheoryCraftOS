@@ -45,6 +45,10 @@ namespace dxgk {
 // the interpolated varying (first two components) with unit 0.
 enum class FragmentKernel : uint8_t { None, Colored, Textured };
 
+// Whether a vertex shader is exactly the transform the fixed vertex kernel of such a device does (the built-in coloured vertex shader: clip = M * (position, 1), the second attribute
+// to a varying), and with the matrix as columns (c0..c3 are the columns: what the built-in shader takes) or as rows (c0..c3 are what dp4 takes: the transpose).
+enum class VertexKernel : uint8_t { None, MatrixColumns, MatrixRows };
+
 class D3d9Program {
  public:
   static constexpr uint32_t kMaxTokens = 8192;
@@ -55,6 +59,8 @@ class D3d9Program {
   static NtStatus compile(allocators::IAllocator& allocator, ConstByteView tokens, UniquePointer<D3d9Program>* out);
 
   // The same for a DXBC container (Shader Model 4.0 / 4.1 / 5.0 vertex and pixel shaders), see D3d9Dxbc.cpp for what maps to what.
+  // Pixel shaders of Shader Model 1 (ps_1_0 .. ps_1_4), see D3d9Ps1.cpp; compile() hands them over.
+  static NtStatus compile_ps1(allocators::IAllocator& allocator, ConstByteView tokens, UniquePointer<D3d9Program>* out);
   static NtStatus compile_dxbc(allocators::IAllocator& allocator, ConstByteView container, UniquePointer<D3d9Program>* out);
 
   graphics::ShaderStage stage() const { return stage_; }
@@ -70,6 +76,9 @@ class D3d9Program {
   // what the text cannot say (see D3d9Tgsi.cpp), kNoMemory.
   NtStatus emit_tgsi(String* out) const;
 
+  // For a vertex shader: whether it is the matrix transform of the fixed vertex kernel, found by running it on test vectors against the built-in shader. `colour_varying` is the varying
+  // the colour attribute goes to.
+  VertexKernel classify_vertex(uint8_t* colour_varying) const;
   // For a pixel shader: the fixed kernel it is, and the varying that kernel reads (see D3d9Devices.cpp).
   FragmentKernel classify_fragment(uint8_t* varying) const;
   // The shader as the tokens the VMware SVGA3D device wants (the vs_2_0 / ps_2_0 token stream the host runs): from the Direct3D 9 stream the program was made of. A vertex shader gets

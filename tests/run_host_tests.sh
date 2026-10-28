@@ -253,7 +253,7 @@ for t in "${WANTED[@]}"; do
                           src/Hardware/GraphicsProcessingUnit/Intel/IntelLrc.cpp src/Hardware/GraphicsProcessingUnit/Intel/IntelExeclist.cpp src/Hardware/GraphicsProcessingUnit/Intel/IntelForcewake.cpp \
                           src/Hardware/GraphicsProcessingUnit/Intel/IntelVcsDriver.cpp src/Hardware/GraphicsProcessingUnit/Intel/IntelRenderCommands.cpp src/Hardware/GraphicsProcessingUnit/Intel/IntelGen9Setup.cpp \
                           -pthread ;;
-    Gen9GraphicsDeviceTest) build_and_run Gen9GraphicsDeviceTest tests/Gen9GraphicsDeviceTest.cpp tests/KernelStubs.cpp src/Math/FloatMath.cpp src/Hardware/GraphicsProcessingUnit/Font8x16.cpp src/Graphics/Graphics2D/Software/*.cpp src/Graphics/Graphics2D/Device/*.cpp src/Graphics/Graphics3D/BuiltinShaders.cpp \
+    Gen9GraphicsDeviceTest) build_and_run Gen9GraphicsDeviceTest tests/Gen9GraphicsDeviceTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Kernel/Dxgkrnl/*.cpp src/Math/FloatMath.cpp src/Hardware/GraphicsProcessingUnit/Font8x16.cpp src/Graphics/Graphics2D/Software/*.cpp src/Graphics/Graphics2D/Device/*.cpp src/Graphics/Graphics3D/BuiltinShaders.cpp \
                           src/Graphics/Graphics3D/Software/*.cpp src/Graphics/Graphics3D/IntelGen9/Gen9GraphicsDevice.cpp src/Hardware/GraphicsProcessingUnit/Intel/IntelGtt.cpp \
                           src/Hardware/GraphicsProcessingUnit/Intel/IntelLrc.cpp src/Hardware/GraphicsProcessingUnit/Intel/IntelExeclist.cpp src/Hardware/GraphicsProcessingUnit/Intel/IntelForcewake.cpp \
                           src/Hardware/GraphicsProcessingUnit/Intel/IntelVcsDriver.cpp src/Hardware/GraphicsProcessingUnit/Intel/IntelRenderCommands.cpp src/Hardware/GraphicsProcessingUnit/Intel/IntelGen9Setup.cpp \

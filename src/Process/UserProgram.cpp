@@ -95,6 +95,7 @@ bool give_tls(AddressSpace& space, Process& process, Module& module) {
     Process::ThreadRecord* thread = process.thread_at(t);
     if (!thread->used || thread->finished || thread->teb == 0) continue;
     uint64_t array = read_u64(space, thread->teb + 0x58, &ok), at = 0;
+    if (ok && array == 0) array = read_u64(space, thread->teb + 0x1788, &ok);      // (a thread that has not started: see write_tls)
     if (!ok || array == 0 || !space.find_free(block_size, 0x00007FF000000000ull, &at) || !space.map(at, block_size, kProtRead | kProtWrite)) { failed = true; break; }
     uint8_t chunk[256];
     for (uint64_t copied = 0; copied < bytes && !failed;) {

@@ -114,6 +114,7 @@ NtStatus D3d9Program::compile(allocators::IAllocator& allocator, ConstByteView b
   const uint32_t kind = version >> 16;
   if (kind != 0xFFFE && kind != 0xFFFF) return status::kInvalidParameter;
   const bool vertex = kind == 0xFFFE;
+  if (!vertex && ((version >> 8) & 0xFF) == 1) return compile_ps1(allocator, bytes, out);
   program->stage_ = vertex ? graphics::ShaderStage::Vertex : graphics::ShaderStage::Fragment;
   const uint32_t major = (version >> 8) & 0xFF, minor = version & 0xFF;
   program->major_ = major;
