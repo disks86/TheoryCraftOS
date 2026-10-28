@@ -283,11 +283,32 @@ uint32_t vm_read(Process& target, uint64_t address, ByteView out, uint64_t* done
   return n == out.size() ? kStatusSuccess : kStatusPartialCopy;
 }
 
+// How many bytes from `address` on lie in pages that a write may change (read-write, copy-on-write, or the executable versions of those).
+uint64_t writable_prefix(AddressSpace& space, uint64_t address, uint64_t size) {
+  uint64_t done = 0;
+  while (done < size) {
+    const uint64_t at = address + done;
+    if (at < address || at >= AddressSpace::kUserTop) break;
+    PageAttributes attributes;
+    if (!space.attributes_at(AddressSpace::round_down(at), &attributes)) break;
+    if (attributes.protect != 0 && !attributes.reserved) {
+      const uint32_t page = attributes.protect & 0xFF;
+      if (page != kPageReadWrite && page != kPageWriteCopy && page != kPageExecuteReadWrite && page != kPageExecuteWriteCopy) break;
+    } else {
+      uint8_t protection = 0;
+      if (!space.protection_at(at, &protection) || !(protection & kProtWrite)) break;
+    }
+    const uint64_t to_page_end = AddressSpace::kPageSize - (at & (AddressSpace::kPageSize - 1));
+    done += to_page_end < size - done ? to_page_end : size - done;
+  }
+  return done;
+}
+
 uint32_t vm_write(Process& target, uint64_t address, ConstByteView in, uint64_t* done) {
   AddressSpace* space = target.address_space();
   *done = 0;
   if (!space) return kStatusNoMemory;
-  const uint64_t n = committed_prefix(*space, address, in.size());
+  const uint64_t n = writable_prefix(*space, address, in.size());
   if (n > 0 && !space->write_privileged(address, in.first(n))) return kStatusAccessViolation;
   *done = n;
   return n == in.size() ? kStatusSuccess : kStatusPartialCopy;
@@ -454,7 +475,36 @@ uint32_t move_memory(Process& process, const SyscallRequest& r, bool write) {
   const uint64_t remote_address = r.args[1], local_address = r.args[2], size = r.args[3];
   uint32_t status = kStatusSuccess;
   uint8_t buffer[kChunk];
-  while (copied < size && status == kStatusSuccess) {
+  if (!write && size > 0) {      // memory that cannot be read in full is not read at all
+    uint64_t at = remote_address;
+    const uint64_t end = remote_address + size;
+    if (end < remote_address) status = kStatusPartialCopy;
+    while (status == kStatusSuccess && at < end) {
+      uint8_t info[48];
+      if (remote) {
+        IProcessRuntime::RemoteOp op;
+        op.kind = IProcessRuntime::RemoteOp::Query;
+        op.address = at;
+        if (process.runtime()->remote_operation(pid, op) != kStatusSuccess) { status = kStatusPartialCopy; break; }
+        for (uint32_t i = 0; i < 48; ++i) info[i] = op.info[i];
+      } else {
+        vm_query(process, at, info);
+      }
+      uint64_t region = 0, base = 0;
+      uint32_t state = 0, protect = 0;
+      for (uint32_t i = 0; i < 8; ++i) { region |= uint64_t{info[24 + i]} << (8 * i); base |= uint64_t{info[i]} << (8 * i); }
+      for (uint32_t i = 0; i < 4; ++i) { state |= uint32_t{info[32 + i]} << (8 * i); protect |= uint32_t{info[36 + i]} << (8 * i); }
+      if (state != 0x1000 || protect == 0 || (protect & 0x101) != 0 || region == 0) { status = kStatusPartialCopy; break; }
+      at = base + region;
+    }
+  }
+  if (write && status == kStatusSuccess) {      // a buffer that cannot be read in full is not written at all
+    for (uint64_t at = 0; at < size; at += kChunk) {
+      const uint64_t n = size - at < kChunk ? size - at : kChunk;
+      if (!process.read_user(local_address + at, ByteView(buffer, n))) { status = kStatusPartialCopy; break; }
+    }
+  }
+  while (status == kStatusSuccess && copied < size && status == kStatusSuccess) {
     const uint64_t n = size - copied < kChunk ? size - copied : kChunk;
     if (remote_address + copied < remote_address) { status = kStatusPartialCopy; break; }
     uint64_t done = 0;
@@ -479,7 +529,18 @@ uint32_t move_memory(Process& process, const SyscallRequest& r, bool write) {
       } else {
         status = vm_read(process, remote_address + copied, ByteView(buffer, n), &done);
       }
-      if (done > 0 && !process.write_user(local_address + copied, ConstByteView(buffer, done))) { status = kStatusAccessViolation; }
+      if (done > 0 && !process.write_user(local_address + copied, ConstByteView(buffer, done))) {      // the local buffer ends in unwritable pages: what fits in the pages before them is delivered
+        uint64_t fits = 0;
+        while (fits < done) {
+          const uint64_t at = local_address + copied + fits;
+          const uint64_t to_page_end = AddressSpace::kPageSize - (at & (AddressSpace::kPageSize - 1));
+          const uint64_t part = to_page_end < done - fits ? to_page_end : done - fits;
+          if (!process.write_user(at, ConstByteView(buffer + fits, part))) break;
+          fits += part;
+        }
+        done = fits;
+        status = kStatusPartialCopy;
+      }
     }
     copied += done;
     if (status == kStatusPartialCopy || done < n) break;

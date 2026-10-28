@@ -430,6 +430,20 @@ uint32_t nt_duplicate_object(Process& p, const SyscallRequest& r) {
     }
     return kSuccess;
   }
+  if (r.args[1] == ~uint64_t{0}) {      // the pseudo handle of this process becomes a real handle to it
+    ObjectManager* objects = system_objects();
+    if (!objects) return kNotImplemented;
+    const ObjectManager::Created c = objects->open_process(p.id(), true);
+    if (c.id == 0) return c.status;
+    const int64_t slot_for_process = p.files().open_token(DescriptorKind::Process, c.id);
+    if (slot_for_process < 0) { objects->release(c.id); return kNoResources; }
+    if (target_at != 0 && !p.write_user_u64(target_at, (uint64_t(slot_for_process) + 1) * 4)) {
+      p.close_descriptor(uint64_t(slot_for_process));
+      return kAccessViolation;
+    }
+    p.files().set_handle_flags(uint64_t(slot_for_process), (attributes & 2) != 0, false);
+    return kSuccess;
+  }
   uint64_t slot = 0;
   if (!slot_of(r.args[1], &slot) || p.files().kind(slot) == DescriptorKind::Closed) return kInvalidHandle;
   const int64_t copy = p.files().duplicate(slot, 0);
