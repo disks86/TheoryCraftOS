@@ -66,6 +66,7 @@ static BOOL con_input_ready(void);
 static BOOL con_is_input(HANDLE h);
 static BOOL pipe_nt_name(LPCWSTR name, WCHAR *buffer, UNICODE_STRING *us, OBJECT_ATTRIBUTES *attributes, BOOL inherit);
 EXPORT HANDLE WINAPI CreateFileW(LPCWSTR path, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD disposition, DWORD flags, HANDLE template_file);
+static BOOL is_dos_device_name(const WCHAR *name);
 EXPORT BOOL WINAPI CloseHandle(HANDLE h);
 EXPORT BOOL WINAPI GetFileAttributesExW(LPCWSTR path, int level, LPVOID data);
 static BOOL fail_nt(NTSTATUS status) { set_error(RtlNtStatusToDosError(status)); return FALSE; }
@@ -1860,10 +1861,12 @@ static int device_type(HANDLE h) {
   return info[0] | (info[1] << 8);
 }
 EXPORT DWORD WINAPI GetFileType(HANDLE h) {
+  if ((ULONG_PTR)h >= 0xFFFFFFF4u && (ULONG_PTR)h <= 0xFFFFFFF6u) h = GetStdHandle((DWORD)(ULONG_PTR)h);      /* STD_INPUT_HANDLE and the others */
   const int type = device_type(h);
   if (type < 0) { set_error(ERROR_INVALID_HANDLE); return FILE_TYPE_UNKNOWN; }
   set_error(ERROR_SUCCESS);
-  return type == 0x50 ? FILE_TYPE_CHAR : type == 0x11 ? FILE_TYPE_PIPE : FILE_TYPE_DISK;
+  if (type == 0x0c) return FILE_TYPE_UNKNOWN;      /* a mailslot */
+  return (type == 0x50 || type == 0x15) ? FILE_TYPE_CHAR : type == 0x11 ? FILE_TYPE_PIPE : FILE_TYPE_DISK;
 }
 
 EXPORT BOOL WINAPI WriteFile(HANDLE h, LPCVOID buffer, DWORD length, LPDWORD written, LPOVERLAPPED overlapped) {
@@ -2480,8 +2483,25 @@ EXPORT HANDLE WINAPI CreateFileW(LPCWSTR path, DWORD access, DWORD share, LPSECU
     for (; path[i] && i < 299; ++i) normal[i] = path[i] == '/' ? '\\' : path[i];
     normal[i] = 0;
     if (!pipe_nt_name(normal, buffer, &name, &attributes, FALSE)) return INVALID_HANDLE_VALUE;
-  } else if (!nt_name(path, buffer, &name, &attributes)) {
-    return INVALID_HANDLE_VALUE;
+  } else {
+    /* A DOS device name (in any directory) is the device: NUL is the one that exists here, the others are not there. */
+    size_t_ last = wcslen(path);
+    while (last > 0 && path[last - 1] != '\\' && path[last - 1] != '/' && !(last == 2 && path[1] == ':')) --last;
+    if (path[last] && is_dos_device_name(path + last)) {
+      WCHAR first = upper(path[last]);
+      if (first != 'N') { set_error(ERROR_FILE_NOT_FOUND); return INVALID_HANDLE_VALUE; }
+      static const WCHAR nul_name[] = {'\\', '?', '?', '\\', 'N', 'U', 'L', 0};
+      memcpy(buffer, nul_name, sizeof(nul_name));
+      name.Buffer = buffer;
+      name.Length = 7 * 2;
+      name.MaximumLength = sizeof(nul_name);
+      memset(&attributes, 0, sizeof(attributes));
+      attributes.Length = sizeof(attributes);
+      attributes.ObjectName = &name;
+      attributes.Attributes = 0x40;      /* OBJ_CASE_INSENSITIVE */
+    } else if (!nt_name(path, buffer, &name, &attributes)) {
+      return INVALID_HANDLE_VALUE;
+    }
   }
   if (sa && sa->bInheritHandle) attributes.Attributes |= 2;      /* OBJ_INHERIT */
   if (disposition == TRUNCATE_EXISTING && !(access & GENERIC_WRITE)) { set_error(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE; }      /* (it has to be able to write) */
@@ -2914,10 +2934,24 @@ typedef struct {
   WCHAR pattern[MAX_PATH];
 } FindState;
 
+/* Is this the name of a DOS device (NUL, CON, PRN, AUX, COM1..9, LPT1..9, with or without an extension)? */
+static BOOL is_dos_device_name(const WCHAR *name) {
+  WCHAR base[8];
+  size_t_ n = 0;
+  while (name[n] && name[n] != '.' && name[n] != ':' && n < 7) { base[n] = upper(name[n]); ++n; }
+  if (name[n] && name[n] != '.' && name[n] != ':') return FALSE;      /* (too long to be one) */
+  while (n > 0 && base[n - 1] == ' ') --n;
+  base[n] = 0;
+  if (n == 3 && ((base[0] == 'N' && base[1] == 'U' && base[2] == 'L') || (base[0] == 'C' && base[1] == 'O' && base[2] == 'N') || (base[0] == 'P' && base[1] == 'R' && base[2] == 'N') ||
+                 (base[0] == 'A' && base[1] == 'U' && base[2] == 'X'))) return TRUE;
+  if (n == 4 && ((base[0] == 'C' && base[1] == 'O' && base[2] == 'M') || (base[0] == 'L' && base[1] == 'P' && base[2] == 'T')) && base[3] >= '1' && base[3] <= '9') return TRUE;
+  return FALSE;
+}
+
 /* The next record (FILE_BOTH_DIRECTORY_INFORMATION) of the listing; NULL at the end. */
 static const BYTE *find_record(FindState *f) {
   while (f->offset >= f->used) {
-    if (f->finished) return NULL;
+    if (f->finished) { set_error(ERROR_NO_MORE_FILES); return NULL; }
     IO_STATUS_BLOCK iosb;
     UNICODE_STRING pattern;
     pattern.Buffer = f->pattern;
@@ -2984,8 +3018,16 @@ EXPORT HANDLE WINAPI FindFirstFileW(LPCWSTR path, LPWIN32_FIND_DATAW data) {
   const NTSTATUS status = NtOpenFile(&f->directory, FILE_LIST_DIRECTORY_ | SYNCHRONIZE, &attributes, &iosb, 7, FILE_DIRECTORY_FILE_ | FILE_SYNCHRONOUS_IO_NONALERT_);
   if (!NT_SUCCESS(status)) {
     RtlFreeHeap(heap(), 0, f);
-    set_error(status == STATUS_OBJECT_NAME_NOT_FOUND ? ERROR_PATH_NOT_FOUND : RtlNtStatusToDosError(status));
+    set_error(status == STATUS_OBJECT_NAME_NOT_FOUND ? ERROR_PATH_NOT_FOUND : status == STATUS_NOT_A_DIRECTORY ? ERROR_DIRECTORY : RtlNtStatusToDosError(status));
     return INVALID_HANDLE_VALUE;
+  }
+  if (is_dos_device_name(f->pattern)) {      /* a device is found by its name, as an empty file */
+    memset(data, 0, sizeof(*data));
+    data->dwFileAttributes = FILE_ATTRIBUTE_ARCHIVE;
+    memcpy(data->cFileName, f->pattern, (wcslen(f->pattern) + 1) * 2);
+    f->finished = TRUE;
+    f->offset = f->used = 0;
+    return f;
   }
   const BYTE *record = find_record(f);
   if (!record) {

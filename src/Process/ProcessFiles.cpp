@@ -460,6 +460,7 @@ Status ProcessFiles::next_entry(OpenObject& object, DirectoryEntry* entry) {
     object.has_pending = false;
     return Status::Ok;
   }
+  if (object.directory_phase == 0 && style_ == PathStyle::Windows && object.path.view() == StringView("/")) object.directory_phase = 2;      // the root of a drive has no "." and ".."
   if (object.directory_phase < 2) {
     *entry = DirectoryEntry();
     entry->type = NodeType::Directory;
@@ -482,6 +483,19 @@ bool prepare_program_folders(filesystem::IFileSystem& fs) {
     }
     const Status status = fs.create_directory(folder);
     ok = ok && (status == Status::Ok || status == Status::AlreadyExists);
+  }
+  // The initialisation files old programs look for in the Windows directory.
+  static const struct { const char* path; const char* text; } kFiles[] = {
+    {"/Windows/Windows/win.ini", "; for 16-bit app support\r\n[fonts]\r\n[extensions]\r\n[mci extensions]\r\n[files]\r\n[Mail]\r\nMAPI=1\r\n"},
+    {"/Windows/Windows/system.ini", "; for 16-bit app support\r\n[386Enh]\r\n[drivers]\r\n[mci]\r\n"},
+  };
+  for (const auto& file : kFiles) {
+    DirectoryEntry entry;
+    if (fs.stat(file.path, &entry) == Status::Ok) continue;
+    UniquePointer<filesystem::IFile> handle;
+    if (fs.open_file(file.path, filesystem::OpenMode::CreateOrOpen, &handle) != Status::Ok) { ok = false; continue; }
+    uint64_t done = 0;
+    handle->write(0, StringView(file.text).bytes(), &done);
   }
   return ok;
 }
