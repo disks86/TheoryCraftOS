@@ -808,6 +808,57 @@ static void test_vblank_interrupt() {
   CHECK(!(rig.card.dce.get(0x1ac8 + 0x400) & 1));
 }
 
+// The vertical line interrupt: the same rules as the vertical blank, on its own bit (LB_INTERRUPT_MASK bit 4, literal here), counted on its own.
+static void test_vline_interrupt() {
+  Rig rig;
+  AmdVegaM vega(rig.alloc);
+  CHECK(vega.bring_up(rig.inputs()));
+  const uint32_t width = 64, height = 8;
+  amd_dce11::FirmwareFramebuffer fw;
+  fw.physical = reinterpret_cast<uint64_t>(rig.vram);
+  fw.bytes = width * height * 4;
+  fw.width = width;
+  fw.height = height;
+  fw.pitch_pixels = width;
+  rig.card.dce.crtc(2, kGpuBase, width);
+  fakedce::setup_aperture(rig.card.dce);
+  rig.card.dce.set(0x80d, kGpuBase >> 12);
+  rig.card.dce.set(0x80e, ((kGpuBase + kVideoMemory) >> 12) - 1);
+  // not without a display, and nothing is written for it
+  CHECK(!vega.set_vline_interrupt(true) && vega.set_vline_interrupt(false) && rig.card.dce.get(0x1ac8 + 0x400) == 0);
+  ByteView memory;
+  CHECK(vega.engage_display(fw, &memory) && vega.display_engaged());
+  const AmdIrq& irq = *vega.irq();
+  rig.card.dce.set(0x1ac8 + 0x400, 0x101);   // (the vblank bit and another are set already: kept)
+  CHECK(vega.set_vline_interrupt(true) && rig.card.dce.get(0x1ac8 + 0x400) == 0x111 && rig.card.dce.get(0x1ac8) == 0 && rig.card.dce.get(0x1ac8 + 0x200) == 0);
+  CHECK(vega.set_vline_interrupt(true) && rig.card.dce.get(0x1ac8 + 0x400) == 0x111);
+  // The vertical blank bit is not touched by the line's, nor the line's by the blank's.
+  CHECK(vega.set_vblank_interrupt(true) && rig.card.dce.get(0x1ac8 + 0x400) == 0x111);
+  CHECK(vega.set_vblank_interrupt(false) && rig.card.dce.get(0x1ac8 + 0x400) == 0x110);
+  CHECK(vega.set_vblank_interrupt(true) && rig.card.dce.get(0x1ac8 + 0x400) == 0x111);
+  // A line interrupt of controller 2 (source 3, data 1) with the status (DISP_INTERRUPT_STATUS_CONTINUE2, bit 2) set: acknowledged (LB_VLINE_STATUS.VLINE_ACK), counted for the line only.
+  rig.card.gfx.set_reg(0x1859, 0x4);
+  rig.card.ih.post(3, 1, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && irq.vline_count(2) == 1 && irq.vline_count(1) == 0 && irq.vblank_count(2) == 0 && rig.card.dce.get(0x1ac9 + 0x400) == 0x10);
+  // The status does not say so: counted, not acknowledged.
+  rig.card.dce.set(0x1ac9 + 0x400, 0);
+  rig.card.gfx.set_reg(0x1859, 0);
+  rig.card.ih.post(3, 1, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && irq.vline_count(2) == 2 && rig.card.dce.get(0x1ac9 + 0x400) == 0 && irq.vline_count(6) == 0);
+  // Off on its own, with the blank left on.
+  CHECK(vega.set_vline_interrupt(false) && rig.card.dce.get(0x1ac8 + 0x400) == 0x101);
+  rig.card.dce.set(0x1ac8 + 0x400, 0x111);   // (switched on behind its back: asking for off again has nothing to switch off)
+  CHECK(vega.set_vline_interrupt(false) && rig.card.dce.get(0x1ac8 + 0x400) == 0x111);
+  rig.card.dce.set(0x1ac8 + 0x400, 0x101);
+  // Giving the display back or stopping the card switches it off.
+  CHECK(vega.set_vline_interrupt(true) && (rig.card.dce.get(0x1ac8 + 0x400) & 0x10));
+  vega.disengage_display();
+  CHECK(!(rig.card.dce.get(0x1ac8 + 0x400) & 0x10) && !vega.set_vline_interrupt(true));
+  CHECK(vega.engage_display(fw, &memory) && vega.set_vline_interrupt(true) && (rig.card.dce.get(0x1ac8 + 0x400) & 0x10));
+  vega.shutdown();
+  CHECK(!(rig.card.dce.get(0x1ac8 + 0x400) & 0x10));
+}
+
 // The video engines' fences: UVD's decode ring (124), its two encode rings (119, 120) and VCE's three rings (167, data 0..2) are classified and counted; a VCE fence is acknowledged in
 // VCE_SYS_INT_STATUS (bit 3) before anything else; an observer sees every event, in order, after the card dealt with it.
 static void test_video_engine_interrupts() {
@@ -1319,6 +1370,79 @@ static void test_hotplug_events() {
   CHECK(throttled_events == 1);
 }
 
+// A video BIOS image with the object table of a board with eDP on pin 0, HDMI on pin 1 and a DisplayPort on pin 2 (literal offsets: ROM header 0x100, master data table 0x200 with the
+// GPIO_Pin_LUT at 0x300 and the Object_Header at 0x400, the paths at 0x440, the connector objects at 0x500, their records at 0x580).
+static std::vector<uint8_t> make_connector_vbios() {
+  std::vector<uint8_t> b(0x700, 0);
+  auto u8 = [&](uint32_t at, uint32_t v) { b[at] = static_cast<uint8_t>(v); };
+  auto u16 = [&](uint32_t at, uint32_t v) { u8(at, v); u8(at + 1, v >> 8); };
+  u8(0, 0x55); u8(1, 0xAA); u16(0x48, 0x100);
+  memcpy(&b[0x104], "ATOM", 4);
+  u16(0x120, 0x200);
+  u16(0x200 + 4 + 12 * 2, 0x300);
+  u16(0x200 + 4 + 22 * 2, 0x400);
+  u16(0x300, 4 + 3 * 4);
+  const uint32_t shifts[3] = {0, 8, 16};
+  for (uint32_t i = 0; i < 3; ++i) { u16(0x304 + i * 4, 0x488d); u8(0x306 + i * 4, shifts[i]); u8(0x307 + i * 4, i + 1); }
+  u16(0x400, 0x20); u8(0x403, 2); u16(0x404, 0x0FFF); u16(0x406, 0x100); u16(0x40E, 0x40);
+  const uint32_t tags[3] = {0x2, 0x8, 0x80}, ids[3] = {0x1114, 0x110C, 0x1113};   // LCD1 eDP, DFP1 HDMI-A, DFP2 DisplayPort
+  u8(0x440, 3);
+  for (uint32_t i = 0; i < 3; ++i) { u16(0x444 + i * 12, tags[i]); u16(0x446 + i * 12, 12); u16(0x448 + i * 12, ids[i]); }
+  u8(0x500, 3);
+  for (uint32_t i = 0; i < 3; ++i) {
+    u16(0x504 + i * 8, ids[i]); u16(0x508 + i * 8, 0x180 + i * 6);
+    u8(0x580 + i * 6, 2); u8(0x581 + i * 6, 4); u8(0x582 + i * 6, i + 1); u8(0x583 + i * 6, 1);
+  }
+  return b;
+}
+
+// The connectors in the hot plug events: named from the video BIOS's object table, absent without one or for a pin it does not list.
+static void test_hotplug_connectors() {
+  const std::vector<uint8_t> vbios = make_connector_vbios();
+  Rig rig;
+  AmdVegaM vega(rig.alloc);
+  AmdVegaM::Inputs in = rig.inputs();
+  in.hpd_pins = 0x0F;
+  {
+    std::vector<uint8_t> callers_copy = vbios;
+    in.vbios = ConstByteView(callers_copy.data(), callers_copy.size());
+    CHECK(vega.bring_up(in));
+  }
+  if (!vega.up()) return;
+  CHECK(vega.connectors().size() == 3);
+  AmdVegaM::HotplugEvent e;
+  char name[16];
+  rig.card.gfx.set_reg(0x1857 + 1, 0x20000);
+  rig.card.gfx.set_reg(0x1898 + 8, 0x2);
+  rig.card.ih.post(42, 1, 0, 0, 0);
+  rig.card.gfx.set_reg(0x1857 + 2, 0x20000);
+  rig.card.gfx.set_reg(0x1898 + 16, 0x2);
+  rig.card.ih.post(42, 2, 0, 0, 0);
+  rig.card.gfx.set_reg(0x1857 + 3, 0x20000);
+  rig.card.gfx.set_reg(0x1898 + 24, 0x2);
+  rig.card.ih.post(42, 3, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 3);
+  CHECK(vega.take_hotplug(&e) && e.pin == 1 && e.connected && e.has_connector);
+  AtomConnectors::name(e.connector, ArrayView<char>(name, sizeof name));
+  CHECK(!strcmp(name, "HDMI-A-1"));
+  CHECK(vega.take_hotplug(&e) && e.pin == 2 && e.has_connector);
+  AtomConnectors::name(e.connector, ArrayView<char>(name, sizeof name));
+  CHECK(!strcmp(name, "DP-1"));
+  CHECK(vega.take_hotplug(&e) && e.pin == 3 && !e.has_connector);   // pin 3 is on no connector
+  // Without a video BIOS there are no connectors, and the events say so; a later bring-up with one has them again.
+  vega.shutdown();
+  memset(rig.doorbell_base, 0, 0x800 * 4);
+  in.vbios = ConstByteView();
+  CHECK(vega.bring_up(in) && vega.connectors().size() == 0);
+  rig.card.ih.post(42, 1, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && vega.take_hotplug(&e) && e.pin == 1 && !e.has_connector);
+  vega.shutdown();
+  memset(rig.doorbell_base, 0, 0x800 * 4);
+  std::vector<uint8_t> noise(vbios.size(), 0x5A);
+  in.vbios = ConstByteView(noise.data(), noise.size());
+  CHECK(vega.bring_up(in) && vega.connectors().size() == 0);
+}
+
 int main() {
   setvbuf(stdout, nullptr, _IONBF, 0);
   test_plan();
@@ -1333,6 +1457,7 @@ int main() {
   test_sq_messages();
   test_display_interrupts();
   test_vblank_interrupt();
+  test_vline_interrupt();
   test_video_engine_interrupts();
   test_recovery();
   test_auto_recovery();
@@ -1341,6 +1466,7 @@ int main() {
   test_card_reset();
   test_post_after_reset();
   test_hotplug_events();
+  test_hotplug_connectors();
   printf(g_failed ? "AmdVegaMTest: %d FAILED\n" : "AmdVegaMTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }

@@ -357,7 +357,9 @@ static void loader_unlock(void) { if (--g_loader_depth == 0) __sync_lock_release
 
 static int is_program(const LDR_DATA_TABLE_ENTRY *m) { return NtCurrentPeb()->ImageBaseAddress == m->DllBase; }
 
+#define LDRP_MAPPED_ONLY 0x80000000u      /* loaded with DONT_RESOLVE_DLL_REFERENCES: no imports, no thread-local data, no entry point */
 static BOOL notify_module(LDR_DATA_TABLE_ENTRY *m, DWORD reason, PVOID reserved) {
+  if (m->Flags & LDRP_MAPPED_ONLY) return TRUE;
   const int about_threads = reason == DLL_THREAD_ATTACH || reason == DLL_THREAD_DETACH;
   if (about_threads && !is_program(m) && (m->Flags & LDRP_DONT_CALL_FOR_THREADS)) return TRUE;
   const BYTE *image = (const BYTE *)m->DllBase;
@@ -957,7 +959,12 @@ static void ldr_remove(LIST_ENTRY *e) {
 
 /* A loader entry for a library the kernel mapped: listed in the three module lists. `path` (a UNICODE_STRING) is the file the program asked for; a library that came in
  * because another imports it is in C:\Windows\System32. */
-static LDR_DATA_TABLE_ENTRY *ldr_add(const LoadRecord *record, const UNICODE_STRING *path) {
+static LDR_DATA_TABLE_ENTRY *ldr_add(const LoadRecord *record, const UNICODE_STRING *path, int mapped_only) {
+  {      /* a program image loaded as a library is only mapped, like a DONT_RESOLVE load */
+    const BYTE *image = (const BYTE *)(ULONG_PTR)record->base;
+    const ULONG nt = *(const ULONG *)(image + 0x3C);
+    if (!(*(const USHORT *)(image + nt + 22) & 0x2000)) mapped_only = 1;      /* IMAGE_FILE_DLL */
+  }
   static const WCHAR system32[] = {'C', ':', '\\', 'W', 'i', 'n', 'd', 'o', 'w', 's', '\\', 'S', 'y', 's', 't', 'e', 'm', '3', '2', '\\', 0};
   size_t_ base_length = strlen(record->name);
   size_t_ full_length = path ? path->Length / 2 : 20 + base_length;
@@ -986,15 +993,71 @@ static LDR_DATA_TABLE_ENTRY *ldr_add(const LoadRecord *record, const UNICODE_STR
   e->BaseDllName.Buffer = full + (full_length - base_length);
   e->BaseDllName.Length = (USHORT)(base_length * 2);
   e->BaseDllName.MaximumLength = (USHORT)(base_length * 2 + 2);
-  e->Flags = 0x4;      /* LDRP_IMAGE_DLL */
+  e->Flags = 0x4 | (mapped_only ? LDRP_MAPPED_ONLY : 0);      /* LDRP_IMAGE_DLL */
   e->LoadCount = 1;
+  {      /* TlsIndex: -1 when the image has thread-local data that was set up */
+    const BYTE *image = (const BYTE *)e->DllBase;
+    const ULONG nt = *(const ULONG *)(image + 0x3C);
+    e->TlsIndex = (!mapped_only && *(const ULONG *)(image + nt + 24 + 0x70 + 9 * 8) != 0) ? 0xFFFF : 0;
+  }
+  if (mapped_only) e->EntryPoint = NULL;
   PEB_LDR_DATA *ldr = NtCurrentPeb()->Ldr;
   ldr_append(&ldr->InLoadOrderModuleList, &e->InLoadOrderLinks);
   ldr_append(&ldr->InMemoryOrderModuleList, &e->InMemoryOrderLinks);
   ldr_append(&ldr->InInitializationOrderModuleList, &e->InInitializationOrderLinks);
   return e;
 }
+/* DLL notifications (LdrRegisterDllNotification): the callbacks are told when a library is loaded or unloaded, with the loader lock held. */
+typedef struct { ULONG Flags; const UNICODE_STRING *FullDllName, *BaseDllName; PVOID DllBase; ULONG SizeOfImage; } LdrDllNotificationData;
+typedef void (NTAPI *LdrDllNotificationFunction)(ULONG reason, const LdrDllNotificationData *data, PVOID context);
+#define MAX_DLL_NOTIFICATIONS 16
+static struct { LdrDllNotificationFunction function; PVOID context; } g_dll_notifications[MAX_DLL_NOTIFICATIONS];
+static void notify_dll_event(ULONG reason, LDR_DATA_TABLE_ENTRY *e) {
+  LdrDllNotificationData data;
+  data.Flags = 0;
+  data.FullDllName = &e->FullDllName;
+  data.BaseDllName = &e->BaseDllName;
+  data.DllBase = e->DllBase;
+  data.SizeOfImage = e->SizeOfImage;
+  for (ULONG i = 0; i < MAX_DLL_NOTIFICATIONS; ++i) if (g_dll_notifications[i].function) g_dll_notifications[i].function(reason, &data, g_dll_notifications[i].context);
+}
+EXPORT NTSTATUS NTAPI LdrRegisterDllNotification(ULONG flags, LdrDllNotificationFunction function, PVOID context, PVOID *cookie) {
+  if (flags || !function || !cookie) return STATUS_INVALID_PARAMETER;
+  loader_lock();
+  for (ULONG i = 0; i < MAX_DLL_NOTIFICATIONS; ++i) {
+    if (g_dll_notifications[i].function) continue;
+    g_dll_notifications[i].function = function;
+    g_dll_notifications[i].context = context;
+    *cookie = &g_dll_notifications[i];
+    loader_unlock();
+    return STATUS_SUCCESS;
+  }
+  loader_unlock();
+  return STATUS_NO_MEMORY;
+}
+EXPORT NTSTATUS NTAPI LdrUnregisterDllNotification(PVOID cookie) {
+  loader_lock();
+  for (ULONG i = 0; i < MAX_DLL_NOTIFICATIONS; ++i) {
+    if (cookie != &g_dll_notifications[i] || !g_dll_notifications[i].function) continue;
+    g_dll_notifications[i].function = NULL;
+    loader_unlock();
+    return STATUS_SUCCESS;
+  }
+  loader_unlock();
+  return STATUS_INVALID_PARAMETER;
+}
+EXPORT NTSTATUS NTAPI LdrFindEntryForAddress(PVOID address, LDR_DATA_TABLE_ENTRY **entry) {
+  PEB_LDR_DATA *ldr = NtCurrentPeb()->Ldr;
+  if (!ldr) return STATUS_NO_MORE_ENTRIES;
+  for (LIST_ENTRY *e = ldr->InLoadOrderModuleList.Flink; e != &ldr->InLoadOrderModuleList; e = e->Flink) {
+    LDR_DATA_TABLE_ENTRY *m = (LDR_DATA_TABLE_ENTRY *)e;
+    if ((BYTE *)address >= (BYTE *)m->DllBase && (BYTE *)address < (BYTE *)m->DllBase + m->SizeOfImage) { *entry = m; return STATUS_SUCCESS; }
+  }
+  return STATUS_NO_MORE_ENTRIES;
+}
+
 static void ldr_forget(LDR_DATA_TABLE_ENTRY *e) {
+  notify_dll_event(2 /* LDR_DLL_NOTIFICATION_REASON_UNLOADED */, e);
   ldr_remove(&e->InLoadOrderLinks);
   ldr_remove(&e->InMemoryOrderLinks);
   ldr_remove(&e->InInitializationOrderLinks);
@@ -1019,12 +1082,13 @@ static void ldr_release(PVOID base, int detach) {
 
 /* Loads the DLL file at `name` (a Win32 path; or just a library's name when it is loaded already) and what it imports; calls the entry points. */
 EXPORT NTSTATUS NTAPI LdrLoadDll(PWSTR search_path, PULONG flags, PUNICODE_STRING name, PVOID *handle) {
-  (void)search_path; (void)flags;
+  (void)search_path;
+  const int mapped_only = flags && (*flags & 2);      /* LDR_DONT_RESOLVE_REFS */
   LoadRecord records[MAX_LOAD_RECORDS];
   ULONG count = 0;
   PVOID base = NULL;
   loader_lock();
-  NTSTATUS status = NtLoadModule(name, &base, records, MAX_LOAD_RECORDS, &count);
+  NTSTATUS status = NtLoadModule(name, &base, records, MAX_LOAD_RECORDS, &count, mapped_only ? 1 : 0);
   if (!NT_SUCCESS(status)) { loader_unlock(); return status; }
   if (count == 0) {      /* it was there: one more use (or a library the process started with) */
     *handle = base;
@@ -1034,12 +1098,13 @@ EXPORT NTSTATUS NTAPI LdrLoadDll(PWSTR search_path, PULONG flags, PUNICODE_STRIN
   LDR_DATA_TABLE_ENTRY *added[MAX_LOAD_RECORDS];
   ULONG listed = 0;
   for (; listed < count; ++listed) {
-    added[listed] = ldr_add(&records[listed], records[listed].base == (ULONG64)(ULONG_PTR)base ? name : NULL);
+    added[listed] = ldr_add(&records[listed], records[listed].base == (ULONG64)(ULONG_PTR)base ? name : NULL, mapped_only);
     if (!added[listed]) break;
   }
   ULONG attached = 0;
   if (listed == count) {
     for (; attached < count; ++attached) if (!notify_module(added[attached], DLL_PROCESS_ATTACH, NULL)) break;
+    if (attached == count) for (ULONG i = 0; i < count; ++i) notify_dll_event(1 /* LDR_DLL_NOTIFICATION_REASON_LOADED */, added[i]);
   }
   if (listed == count && attached == count) {
     *handle = base;

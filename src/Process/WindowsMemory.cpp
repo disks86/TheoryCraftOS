@@ -179,7 +179,7 @@ uint32_t vm_protect(Process& target, uint64_t* base_io, uint64_t* size_io, uint3
   const uint64_t base = AddressSpace::round_down(*base_io);
   if ((protect & 0xFF) == kPageWriteCopy || (protect & 0xFF) == kPageExecuteWriteCopy) {      // only a view can be copy-on-write
     PageAttributes existing;
-    if (!space->attributes_at(base, &existing) || existing.type != PageAttributes::Mapped) return kStatusInvalidPageProtection;
+    if (!space->attributes_at(base, &existing) || existing.type == PageAttributes::Private) return kStatusInvalidPageProtection;
   }
   if (*size_io == 0 || !AddressSpace::round_up(*size_io, &rounded)) return kStatusInvalidParameter;
   uint8_t old = 0;
@@ -199,6 +199,10 @@ uint32_t vm_protect(Process& target, uint64_t* base_io, uint64_t* size_io, uint3
     if (protect == kPageWriteCopy) { protect = kPageReadWrite; prot = kProtRead | kProtWrite; }
     else if (protect == kPageExecuteWriteCopy) { protect = kPageExecuteReadWrite; prot = kProtRead | kProtWrite | kProtExecute; }
   }
+  if (attributes.type == PageAttributes::Image) {      // an image is never written through: asking for write gives copy-on-write
+    if (protect == kPageReadWrite) { protect = kPageWriteCopy; prot = kProtRead; }
+    else if (protect == kPageExecuteReadWrite) { protect = kPageExecuteWriteCopy; prot = kProtRead | kProtExecute; }
+  }
   if (!space->protect(base, rounded, prot) || !space->set_page_protect(base, rounded, protect, false)) return kStatusConflictingAddresses;
   *base_io = base;
   *size_io = rounded;
@@ -215,7 +219,7 @@ void vm_query(Process& target, uint64_t address, uint8_t* out) {
   uint8_t protection = 0;
   if (space && space->region_extent(page, &base, &size) && space->protection_at(page, &protection)) {
     uint64_t allocation = 0, allocation_size = 0;
-    if (!space->allocation_extent(page, &allocation, &allocation_size)) allocation = base;
+    if (!space->allocation_base(page, &allocation) && !space->allocation_extent(page, &allocation, &allocation_size)) allocation = base;
     PageAttributes attributes;
     const bool known = space->attributes_at(page, &attributes) && attributes.protect != 0;
     const uint32_t current = known ? attributes.protect : page_constant(protection);

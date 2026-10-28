@@ -178,6 +178,7 @@ class ObjectManager::SectionRef final : public SharedMemory {
 struct ObjectManager::Section {
   bool used = false, writable = false, file_backed = false;
   uint32_t page = 0, attributes = 0;
+  bool image_mapped = false;
   uint8_t* storage = nullptr;
   uint64_t size = 0, rounded = 0;
   int32_t mappings = 0;
@@ -724,6 +725,26 @@ bool ObjectManager::section_memory(uint32_t id, uint8_t** storage, uint64_t* siz
   *size = s.rounded;
   *owner = &s.ref;
   return true;
+}
+
+bool ObjectManager::section_note_image_view(uint32_t id) {
+  Locked hold(sync_);
+  Object* o = at(id);
+  if (!o || o->kind != ObjectKind::Section || o->section < 0 || !sections_) return false;
+  const bool before = sections_[o->section].image_mapped;
+  sections_[o->section].image_mapped = true;
+  return before;
+}
+
+uint32_t ObjectManager::file_has_section(StringView host_path) {
+  Locked hold(sync_);
+  uint32_t found = 0;
+  if (!sections_) return 0;
+  for (uint32_t i = 0; i < kMaxSections; ++i) {
+    const Section& s = sections_[i];
+    if (s.used && s.file_backed && s.path_size == host_path.size() && same_name(s.path, s.path_size, host_path)) { if (s.attributes & 0x1000000u) return 2; found = 1; }
+  }
+  return found;
 }
 
 bool ObjectManager::section_info(uint32_t id, SectionInfo* out) {

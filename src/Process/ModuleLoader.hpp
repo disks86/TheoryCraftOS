@@ -84,6 +84,7 @@ struct Module {
   // Library lifetime: how many times it was asked for (LoadLibrary) plus how many loaded libraries import it. Libraries loaded when the program started are pinned.
   uint32_t refs = 0;
   bool pinned = false, doomed = false;
+  bool no_bind = false;                 // mapped only: no imports bound, no dependencies, no thread-local data (an image that is not a DLL, or DONT_RESOLVE_DLL_REFERENCES)
   int32_t tls_index = -1;               // the slot of its thread-local data in every thread's array (a library loaded after start-up), or -1
 };
 
@@ -130,7 +131,7 @@ LoadStatus load_windows_modules(AddressSpace& space, allocators::IAllocator& all
 // After start-up: loads one more library (the file `provider` has for `canonical_name`) and the libraries it imports that are not loaded yet, into the process that `set` describes,
 // and binds their imports. What was loaded is appended to `set` (modules_ and, in the order their entry points must run, order_): the caller reads set->count() and set->init_count()
 // from before the call. On failure nothing stays loaded. (A library's thread-local data is the caller's business: see UserProgram::load_module().)
-LoadStatus load_additional_library(AddressSpace& space, allocators::IAllocator& allocator, ILibraryProvider& provider, ModuleSet* set, StringView canonical_name, String* detail);
+LoadStatus load_additional_library(AddressSpace& space, allocators::IAllocator& allocator, ILibraryProvider& provider, ModuleSet* set, StringView canonical_name, String* detail, bool bind = true);
 // LoadLibrary of a library that is loaded already: counts one more use. False if no such library is there (or it is on its way out).
 bool reference_library(ModuleSet* set, StringView canonical_name, uint64_t* base);
 // FreeLibrary: counts one use less. The libraries nobody uses any more (the one at `base`, then what only it kept alive) are marked and appended to `out` in the order their
@@ -141,5 +142,10 @@ bool unload_library(AddressSpace& space, ModuleSet* set, uint64_t base);
 
 // Applies the base relocations of a mapped image that was loaded `delta` (a wrapping difference) away from its preferred base.
 bool apply_relocations(AddressSpace& space, const exe::PeFile& pe, uint64_t base, uint64_t delta);
+// Records what Windows says about the pages of an image mapped at `base`: the image type, the protection of the headers and of each section (a writable one is copy-on-write),
+// and that they are all one allocation.
+void describe_image_pages(AddressSpace& space, const exe::PeFile& pe, uint64_t base);
+// A relocated image (dynamic base) says in its headers where it really is.
+void record_image_base(AddressSpace& space, uint64_t base);
 
 }  // namespace process

@@ -47,11 +47,12 @@ Checks that failed (Wine commit f343ca6), before the implementation of the libra
 | ntdll reg (NT registry services) | 133 | about 90 (needs an in-kernel registry: done; registry links, RtlQueryRegistryValues not) |
 | advapi32 registry | not run | 166, runs to the end |
 | kernel32 atom | 9422 (hung) | 0 (needed user32 wsprintf, now in src/Windows/user32) |
-| kernel32 virtual | 10983 | 625, of which about 520 are the SEC_IMAGE pass (no image sections yet); also missing: cross-process read/write rules, SEC_RESERVE sections, NtAreMappedFilesTheSame, guard pages |
+| kernel32 virtual | 10983 | 514 (image sections work now); missing: cross-process read/write rules, SEC_RESERVE sections, NtAreMappedFilesTheSame, guard pages |
 | kernel32 heap | 3463 (hung) | about 285 before test_heap_sizes (Global/Local memory done; HeapWalk regions, HeapQueryInformation, heap flags/debug heap and Windows' internal sub-heap sizes are not) |
 | kernel32 file | 2754 | the first 2,400 lines of the test (create/delete/read-only/copy/overlapped/share modes) pass apart from mapped-file cases; FindFirstFile wildcards now match all 88 rows of Wine's table (src/Process/DosWildcard.cpp); LockFile/LockFileEx pass; case-insensitive names, DOS device names, the drive root and GetFileType now pass; still failing: handle access of the reopen tests, mapped-file rules (ERROR_USER_MAPPED_FILE). Counts vary from run to run: the run stops printing (the console is slow) and often hits the 120 s limit |
+| kernel32 loader | 5231 | about 400: runs through import resolution, TLS, security cookie, forwarder chains and DLL notifications; then test_ExitProcess fails (its children read TEB->FlsSlots); still failing: CreateProcess of a fake image, hardlink/short-path module identity, AS_DATAFILE |
 | kernel32 environ / module / file | crashed or hung | run to the end |
 
 Everything else was measured once and has not been worked on: ntdll alpc 1684, directory 784, file 354, sync 246, threadpool 244, reg 133 (the NT registry services), path 279;
-kernel32 loader 5231 (needs image sections), comm 763, version 92 (needs manifest-based version emulation); debugger, sync and thread tests hang or crash the machine; shlwapi url/istream/shreg/assoc; mpr 211, psapi 123, userenv 68, secur32 53. Most of those are
+comm 763, version 92 (needs manifest-based version emulation); debugger, sync and thread tests hang or crash the machine; shlwapi url/istream/shreg/assoc; mpr 211, psapi 123, userenv 68, secur32 53. Most of those are
 missing system services (the NT registry, object namespace, ALPC, thread pools, `NtQuerySystemInformation` classes) rather than missing library code.

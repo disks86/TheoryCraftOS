@@ -237,6 +237,37 @@ bool AddressSpace::break_copy_on_write(uint64_t address, uint64_t size) {
   return any;
 }
 
+bool AddressSpace::join_allocation(uint64_t address, uint64_t size, uint64_t with) {
+  const uint64_t target = first_ending_after(with);
+  if (target >= regions_.count() || regions_[target]->base > with) return false;
+  const uint64_t id = regions_[target]->allocation;
+  uint64_t end = 0;
+  if (!prepare_range(address, size, &end)) return false;
+  for (uint64_t i = first_ending_after(address); i < regions_.count() && regions_[i]->base < end; ++i) regions_[i]->allocation = id;
+  return true;
+}
+
+bool AddressSpace::unmap_allocation(uint64_t address) {
+  const uint64_t i = first_ending_after(address);
+  if (i >= regions_.count() || regions_[i]->base > address) return false;
+  const uint64_t id = regions_[i]->allocation;
+  for (uint64_t k = regions_.count(); k > 0; --k) {
+    if (regions_[k - 1]->allocation != id) continue;
+    mapped_bytes_ -= regions_[k - 1]->size;
+    regions_.remove_at(k - 1);
+  }
+  ++generation_;
+  return true;
+}
+
+bool AddressSpace::allocation_base(uint64_t address, uint64_t* base) const {
+  const uint64_t i = first_ending_after(address);
+  if (i >= regions_.count() || regions_[i]->base > address) return false;
+  const uint64_t id = regions_[i]->allocation;
+  for (uint64_t k = 0; k <= i; ++k) if (regions_[k]->allocation == id) { *base = regions_[k]->base; return true; }
+  return false;
+}
+
 bool AddressSpace::attributes_at(uint64_t address, PageAttributes* out) const {
   const uint64_t i = first_ending_after(address);
   if (i >= regions_.count() || regions_[i]->base > address) return false;

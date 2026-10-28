@@ -245,6 +245,7 @@ LoadStatus build_windows_startup(AddressSpace& space, const exe::PeFile& pe, con
       w.unicode_string(entry + 0x58, strings, base_name.size(), base_name.size() + 2);                               // BaseDllName
       w.u32(entry + 0x68, m.main ? 0x20 : 0x4);        // Flags: LDRP_IMAGE_DLL
       w.u16(entry + 0x6C, 0xFFFF);                     // LoadCount: static
+      w.u16(entry + 0x6E, m.tls_rva ? 0xFFFF : 0);     // TlsIndex: -1 for a module with thread-local data
     }
     w.u64(peb + 0x18, ldr);                            // PEB.Ldr
   }

@@ -71,7 +71,7 @@ class UserProgram final : public IModuleHost {
   void set_processor_count(uint32_t count) { processor_count_ = count ? count : 1; }
 
   // IModuleHost: LoadLibrary and FreeLibrary of a Windows program.
-  uint32_t load_module(ConstByteView file, StringView canonical_name, LoadedModule* out, uint32_t capacity, uint32_t* count) override;
+  uint32_t load_module(ConstByteView file, StringView canonical_name, LoadedModule* out, uint32_t capacity, uint32_t* count, bool bind) override;
   bool reference_module(StringView canonical_name, uint64_t* base) override;
   uint32_t release_module(uint64_t base, LoadedModule* out, uint32_t capacity, uint32_t* count) override;
   uint32_t unload_module(uint64_t base) override;
