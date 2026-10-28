@@ -141,6 +141,12 @@ class AddressSpace final : public IUserMemory {
   // The Windows attributes of [address, address + size), which must be mapped; the regions are cut at its ends.
   bool set_attributes(uint64_t address, uint64_t size, const PageAttributes& attributes);
   bool attributes_at(uint64_t address, PageAttributes* out) const;
+  // Makes the regions of [address, address + size) part of the allocation the region at `with` belongs to (an image is mapped piece by piece and is one allocation).
+  bool join_allocation(uint64_t address, uint64_t size, uint64_t with);
+  // The lowest address of the allocation that contains `address`, wherever its pieces lie.
+  bool allocation_base(uint64_t address, uint64_t* base) const;
+  // Unmaps every region of the allocation that contains `address`.
+  bool unmap_allocation(uint64_t address);
   // Changes only the PAGE_* constant and the reserved flag of [address, address + size), keeping the rest of each region's attributes.
   // A write to copy-on-write pages (PAGE_WRITECOPY, PAGE_EXECUTE_WRITECOPY) of [address, address + size): each such page gets a copy of its own (a view of a section stops
   // sharing it), becomes writable and is PAGE_READWRITE / PAGE_EXECUTE_READWRITE from then on. False if the range holds no such page or memory ran out.

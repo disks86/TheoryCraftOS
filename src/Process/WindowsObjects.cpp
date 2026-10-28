@@ -17,6 +17,8 @@
  */
 #include "Process/WindowsObjects.hpp"
 #include "Process/WindowsMemory.hpp"
+#include "Process/ModuleLoader.hpp"
+#include "Executable/PeFile.hpp"
 #include "Process/Objects.hpp"
 #include "Process/WindowsFiles.hpp"
 #include "Process/WindowsMailslots.hpp"
@@ -554,17 +556,29 @@ uint32_t nt_create_section(Process& p, const SyscallRequest& r) {
   constexpr uint32_t kSecFile = 0x800000, kSecImage = 0x1000000, kSecReserve = 0x4000000, kSecCommit = 0x8000000, kSecNoCache = 0x10000000, kSecWriteCombine = 0x40000000, kSecLargePages = 0x80000000u;
   const uint32_t flags = uint32_t(attributes);
   if ((flags & kSecLargePages) || ((flags & kSecReserve) && (flags & kSecCommit))) return kInvalidParameter;
-  if (flags & kSecImage) {      // image sections need a PE file (not supported yet), and take none of the other flags
+  if (flags & kSecImage) {      // an image section is a PE file; it takes none of the other flags
     if (flags & (kSecReserve | kSecCommit | kSecFile | kSecWriteCombine)) return kInvalidParameter;
-    return 0xC000007Bu;      // STATUS_INVALID_IMAGE_FORMAT
+    if (!fs) return 0xC000007Bu;      // STATUS_INVALID_IMAGE_FORMAT: there is no file
   }
   if ((flags & (kSecNoCache | kSecWriteCombine)) && !(flags & (kSecReserve | kSecCommit))) return kInvalidParameter;
   if (flags & kSecFile) return kInvalidParameter;
-  uint32_t reported = flags & (kSecNoCache | kSecWriteCombine);
+  uint32_t reported = flags & (kSecNoCache | kSecWriteCombine | kSecImage);
   if (fs) reported |= kSecFile;
   else reported |= (flags & kSecReserve) ? kSecReserve : kSecCommit;
-  const ObjectManager::Created c = objects->create_section(StringView(name, name_size), size, page, reported, fs, host.view());
+  const ObjectManager::Created c = objects->create_section(StringView(name, name_size), (flags & kSecImage) ? 0 : size, page, reported, fs, host.view());
   if (c.id == 0) return c.status;
+  if (flags & kSecImage) {      // the file has to be a PE image this OS can run
+    uint8_t* image = nullptr;
+    uint64_t image_size = 0;
+    SharedMemory* owner = nullptr;
+    exe::PeFile pe(p.files().allocator());
+    ObjectManager::SectionInfo info;
+    if (!objects->section_memory(c.id, &image, &image_size, &owner) || !objects->section_info(c.id, &info) || !pe.parse(ConstByteView(image, info.size)) || !pe.is_pe32_plus() ||
+        pe.machine() != exe::kPeMachineAmd64) {
+      objects->release(c.id);
+      return 0xC000007Bu;
+    }
+  }
   return give_handle(p, *objects, ObjectKind::Section, c.id, r.args[0], c.status, wants_inherit(p, r.args[2]));
 }
 // The rights an access mask asks for, with the generic ones spelled out (a section: query 1, write 2, read 4, execute 8, extend size 0x10).
@@ -583,6 +597,44 @@ uint32_t nt_open_section(Process& p, const SyscallRequest& r) {
   return status;
 }
 
+namespace {
+// SECTION_IMAGE_INFORMATION (64 bytes) of an image section: what the PE headers say, as NtQuerySection answers it.
+uint32_t query_image_information(Process& p, const SyscallRequest& r, uint32_t id, const ObjectManager::SectionInfo& info, uint64_t length, uint64_t returned_at) {
+  if (!(info.attributes & 0x1000000u)) return 0xC000004Fu;      // STATUS_SECTION_NOT_IMAGE
+  if (length < 64) return 0xC0000004u;
+  ObjectManager* objects = system_objects();
+  uint8_t* storage = nullptr;
+  uint64_t rounded = 0;
+  SharedMemory* owner = nullptr;
+  if (!objects->section_memory(id, &storage, &rounded, &owner)) return kInvalidHandle;
+  exe::PeFile pe(p.files().allocator());
+  if (!pe.parse(ConstByteView(storage, info.size))) return 0xC000007Bu;
+  uint8_t out[64] = {};
+  auto put = [&](uint32_t at, uint64_t value, uint32_t bytes) { for (uint32_t i = 0; i < bytes; ++i) out[at + i] = uint8_t(value >> (8 * i)); };
+  put(0, pe.image_base() + pe.entry_rva(), 8);
+  put(16, pe.stack_reserve(), 8);
+  put(24, pe.stack_commit(), 8);
+  put(32, pe.subsystem(), 4);
+  put(36, pe.subsystem_minor(), 2);
+  put(38, pe.subsystem_major(), 2);
+  put(40, pe.os_major(), 2);
+  put(42, pe.os_minor(), 2);
+  put(44, pe.characteristics(), 2);
+  put(46, pe.dll_characteristics(), 2);
+  put(48, pe.machine(), 2);
+  bool code = pe.entry_rva() != 0;
+  for (const exe::PeSection& section : pe.sections().view()) if (section.characteristics & 0x20u) code = true;      // IMAGE_SCN_CNT_CODE
+  put(50, code ? 1 : 0, 1);
+  put(51, (pe.dll_characteristics() & 0x40) ? 0x04 : 0, 1);      // ImageDynamicallyRelocated
+  put(52, pe.loader_flags(), 4);
+  put(56, info.size, 4);
+  put(60, pe.checksum(), 4);
+  if (!p.write_user(r.args[2], ConstByteView(out, 64))) return kAccessViolation;
+  if (returned_at != 0 && !p.write_user_u64(returned_at, 64)) return kAccessViolation;
+  return kSuccess;
+}
+}  // namespace
+
 // NtQuerySection(Section, SECTION_INFORMATION_CLASS, PVOID Buffer, SIZE_T Length, PSIZE_T ReturnLength): class 0, SECTION_BASIC_INFORMATION { BaseAddress; Attributes; Size }.
 uint32_t nt_query_section(Process& p, const SyscallRequest& r) {
   uint64_t length = 0, returned_at = 0;
@@ -593,10 +645,12 @@ uint32_t nt_query_section(Process& p, const SyscallRequest& r) {
   if (!id) return kInvalidHandle;
   uint64_t slot = 0;
   if (slot_of(r.args[0], &slot) && (p.files().denied_access(slot) & 1)) return 0xC0000022u;      // SECTION_QUERY
-  if (uint32_t(r.args[1]) != 0) return 0xC0000003u;      // STATUS_INVALID_INFO_CLASS (image information is not supported yet)
-  if (length < 24) return 0xC0000004u;      // STATUS_INFO_LENGTH_MISMATCH
+  const uint32_t information_class = uint32_t(r.args[1]);
+  if (information_class > 1) return 0xC0000003u;      // STATUS_INVALID_INFO_CLASS
   ObjectManager::SectionInfo info;
   if (!objects->section_info(id, &info)) return kInvalidHandle;
+  if (information_class == 1) return query_image_information(p, r, id, info, length, returned_at);      // SectionImageInformation
+  if (length < 24) return 0xC0000004u;      // STATUS_INFO_LENGTH_MISMATCH
   uint8_t out[24] = {};
   const uint64_t size = (info.size + 4095) & ~uint64_t{4095};
   for (uint32_t i = 0; i < 4; ++i) out[8 + i] = uint8_t(info.attributes >> (8 * i));
@@ -607,6 +661,52 @@ uint32_t nt_query_section(Process& p, const SyscallRequest& r) {
 }
 uint32_t nt_create_job_object(Process& p, const SyscallRequest& r) { return create_object(p, r, ObjectKind::Job, false, false, 0, 0); }
 uint32_t nt_open_job_object(Process& p, const SyscallRequest& r) { return open_object(p, r, ObjectKind::Job); }
+
+namespace {
+
+// A view of an image section: the PE file laid out as the loader would, at its preferred base if that is free, else somewhere else with its relocations applied (then the answer
+// is STATUS_IMAGE_NOT_AT_BASE, a success). Every view has pages of its own, copy-on-write where the sections are writable.
+uint32_t map_image_view(Process& p, const SyscallRequest& r, uint64_t size_at, const uint8_t* file_bytes, uint64_t file_size) {
+  AddressSpace* space = p.address_space();
+  exe::PeFile pe(p.files().allocator());
+  if (!pe.parse(ConstByteView(file_bytes, file_size)) || !pe.is_pe32_plus()) return 0xC000007Bu;
+  uint64_t base = 0, rounded = 0;
+  if (size_at == 0 || !p.read_user_u64(r.args[2], &base)) return kAccessViolation;
+  if (!AddressSpace::round_up(pe.size_of_image(), &rounded) || rounded == 0) return 0xC000007Bu;
+  uint64_t chosen = base;
+  bool moved = false;
+  if (base != 0) {
+    if (base % 65536 != 0) return kInvalidParameter;
+    moved = base != pe.image_base();
+  } else {
+    chosen = pe.image_base();
+    if (chosen == 0 || chosen % 65536 != 0 || chosen >= AddressSpace::kUserTop || !space->find_free(rounded, chosen, &chosen) || chosen != pe.image_base()) {
+      uint64_t hint = 0x00007FF500000000ull, at = 0;
+      for (uint32_t attempt = 0; attempt < 64; ++attempt) {      // a place that is free and on a 64 KiB boundary
+        if (!space->find_free(rounded, hint, &at)) return kNoResources;
+        const uint64_t aligned = (at + 0xFFFF) & ~uint64_t{0xFFFF};
+        if (aligned == at) break;
+        hint = aligned;
+      }
+      if (at % 65536 != 0) return kNoResources;
+      chosen = at;
+      moved = true;
+    }
+  }
+  if (moved && (!pe.relocations_ok() || (pe.relocations().count() == 0 && !(pe.dll_characteristics() & 0x40)))) return kStatusConflictingAddresses;      // it cannot be moved
+  LoadedImage image;
+  const LoadStatus loaded = map_pe_image(pe, ConstByteView(file_bytes, file_size), *space, chosen, false, &image);
+  if (loaded != LoadStatus::Ok) {
+    space->unmap_allocation(chosen);
+    return loaded == LoadStatus::OutOfMemory ? kNoResources : (loaded == LoadStatus::Malformed ? kStatusConflictingAddresses : 0xC000007Bu);
+  }
+  if (moved && !apply_relocations(*space, pe, chosen, chosen - pe.image_base())) { space->unmap(chosen, rounded); return 0xC000007Bu; }
+  describe_image_pages(*space, pe, chosen);
+  if (!p.write_user_u64(r.args[2], chosen) || !p.write_user_u64(size_at, rounded)) { space->unmap_allocation(chosen); return kAccessViolation; }
+  return moved ? 0x40000003u : kSuccess;      // STATUS_IMAGE_NOT_AT_BASE
+}
+
+}  // namespace
 
 // NtMapViewOfSection(Section, Process, PVOID* BaseAddress, ULONG_PTR ZeroBits, SIZE_T CommitSize, PLARGE_INTEGER SectionOffset, PSIZE_T ViewSize, SECTION_INHERIT, ULONG AllocationType,
 // ULONG Protect)
@@ -637,6 +737,7 @@ uint32_t nt_map_view_of_section(Process& p, const SyscallRequest& r) {
     constexpr uint32_t kSectionMapWrite = 2, kSectionMapRead = 4, kSectionMapExecute = 8;
     if (((wanted & 1) && !(wanted & 2) && (denied & kSectionMapRead)) || ((wanted & 2) && (denied & kSectionMapWrite)) || ((wanted & 4) && (denied & kSectionMapExecute) && (denied & 0x20))) return 0xC0000022u;
   }
+  if (info.attributes & 0x1000000u) return map_image_view(p, r, size_at, storage, info.size);
   uint64_t offset = 0, view = 0, base = 0;
   if (offset_at != 0 && !p.read_user_u64(offset_at, &offset)) return kAccessViolation;
   if (size_at == 0 || !p.read_user_u64(size_at, &view) || !p.read_user_u64(r.args[2], &base)) return kAccessViolation;
@@ -667,6 +768,10 @@ uint32_t nt_unmap_view_of_section(Process& p, const SyscallRequest& r) {
   if (!space) return kNotImplemented;
   if (r.args[0] != kCurrentProcess) return kNotImplemented;
   uint64_t base = 0, size = 0;
+  PageAttributes attributes;
+  if (space->attributes_at(r.args[1], &attributes) && attributes.type == PageAttributes::Image) {      // an image goes with all its pieces
+    return space->allocation_base(r.args[1], &base) && base == r.args[1] && space->unmap_allocation(base) ? kSuccess : kStatusNotMappedView;
+  }
   if (!space->allocation_extent(r.args[1], &base, &size) || base != r.args[1]) return kStatusNotMappedView;
   return space->unmap(base, size) ? kSuccess : kStatusNotMappedView;
 }

@@ -45,7 +45,7 @@ constexpr uint64_t kUseFilePointer = 0xFFFFFFFFFFFFFFFEull, kWriteToEnd = 0xFFFF
 // NtCreateFile dispositions, options, access bits, Information results
 constexpr uint32_t kSupersede = 0, kOpen = 1, kCreate = 2, kOpenIf = 3, kOverwrite = 4, kOverwriteIf = 5;
 constexpr uint32_t kDirectoryFile = 1, kNonDirectoryFile = 0x40, kDeleteOnClose = 0x1000;
-constexpr uint32_t kCannotDelete = 0xC0000121u;
+constexpr uint32_t kCannotDelete = 0xC0000121u, kUserMappedFile = 0xC0000243u;
 constexpr uint32_t kGenericRead = 0x80000000u, kGenericWrite = 0x40000000u, kGenericAll = 0x10000000u, kFileReadData = 1, kFileWriteData = 2, kFileAppendData = 4;
 constexpr uint64_t kFileSuperseded = 0, kFileOpened = 1, kFileCreated = 2, kFileOverwritten = 3;
 constexpr uint32_t kAttributeReadOnly = 1, kAttributeDirectory = 0x10, kAttributeNormal = 0x80, kAttributeArchive = 0x20, kAttributeReparsePoint = 0x400;
@@ -185,6 +185,14 @@ uint32_t status_for(ProcessFiles& files, Status status, StringView virtual_path)
 }
 
 // Opens (or creates) what the OBJECT_ATTRIBUTES name. On success *handle and *information (FILE_OPENED, ...) are set.
+// Is the file (by its virtual path) the file of a section: mapped, or held by a mapping handle?
+// 0: no, 1: a data section, 2: an image section.
+uint32_t file_is_mapped(ProcessFiles& files, StringView virtual_path) {
+  ObjectManager* objects = system_objects();
+  String host(files.allocator());
+  return objects && files.host_path_of(virtual_path, &host) ? objects->file_has_section(host.view()) : 0;
+}
+
 uint32_t open_by_attributes(Process& p, uint64_t object_attributes, uint32_t access, uint32_t disposition, uint32_t options, uint64_t* information, uint64_t* handle, uint32_t share = 7, uint32_t file_attributes = 0) {
   ProcessFiles& files = p.files();
   {
@@ -261,6 +269,11 @@ uint32_t open_by_attributes(Process& p, uint64_t object_attributes, uint32_t acc
       if (before.read_only) return kCannotDelete;
     }
     if (sharing && wanted && sharing->share_acquire(virtual_path.view(), nullptr, wanted, share) == ObjectManager::ShareResult::Violation) return kSharingViolation;
+    if (f.truncate || (options & kDeleteOnClose)) {      // a mapped file cannot be overwritten; a mapped image cannot be deleted either
+      const uint32_t mapped = file_is_mapped(files, virtual_path.view());
+      if (mapped && f.truncate) return mapped == 2 ? kSharingViolation : kUserMappedFile;
+      if (mapped == 2) return kAccessDenied;
+    }
   } else if ((options & kDeleteOnClose) && !(access & (kGenericAll | 0x10000))) {
     return kAccessDenied;
   }
@@ -633,6 +646,7 @@ uint32_t nt_set_information_file(Process& p, const SyscallRequest& r) {
       if (length < 8) return kInfoLengthMismatch;
       if (!p.read_user_u64(address, &value)) return kAccessViolation;
       if (int64_t(value) < 0) return kInvalidParameter;
+      if (value < files.size_of(*object) && file_is_mapped(files, object->path.view())) return kUserMappedFile;      // (a mapped file cannot be made shorter)
       status = nt_status(files.resize(*object, value));
       break;
     case kFileAllocationInformation: break;      // nothing to change: sizes are exact
@@ -674,6 +688,7 @@ uint32_t nt_set_information_file(Process& p, const SyscallRequest& r) {
       if (!util::append_utf8_from_utf16le(&name, ConstByteView(units, name_bytes))) return kNoMemory;
       if (files.resolve(name.view(), &target) != PathResult::Ok) return kObjectNameInvalid;
       DirectoryEntry existing;
+      if (file_is_mapped(files, object->path.view())) return kSharingViolation;      // (a mapped file stays where it is)
       auto same_ignoring_case = [](StringView a, StringView b) {
         if (a.size() != b.size()) return false;
         for (uint64_t i = 0; i < a.size(); ++i) {
@@ -829,6 +844,7 @@ uint32_t nt_delete_file(Process& p, const SyscallRequest& r) {
   if (virtual_path.view() == StringView("/")) return kAccessDenied;
   if (ObjectManager* sharing = system_objects()) {
     if (!sharing->share_allows(virtual_path.view(), ObjectManager::kShareDelete)) return kSharingViolation;
+    if (file_is_mapped(files, virtual_path.view())) return kCannotDelete;
     // Files that are open (and share deletion) go away when the last of them is closed.
     const void* owners[8];
     const uint32_t open_count = sharing->share_owners(virtual_path.view(), owners, 8);

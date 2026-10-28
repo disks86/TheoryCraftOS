@@ -173,6 +173,28 @@ bool apply_relocations(AddressSpace& space, const exe::PeFile& pe, uint64_t base
   return true;
 }
 
+// What Windows says about the pages of a mapped image: one allocation of type image, the headers read-only, each section with the protection its characteristics ask for (a
+// writable one is copy-on-write: the first write gives that page a copy of its own).
+void describe_image_pages(AddressSpace& space, const exe::PeFile& pe, uint64_t base) {
+  PageAttributes attributes;
+  attributes.type = PageAttributes::Image;
+  attributes.allocation_protect = 0x80;      // PAGE_EXECUTE_WRITECOPY
+  const uint64_t header_bytes = pe.size_of_headers() < pe.size_of_image() ? pe.size_of_headers() : pe.size_of_image();
+  attributes.protect = 0x02;
+  space.set_attributes(base, header_bytes, attributes);
+  for (const exe::PeSection& section : pe.sections().view()) {
+    const uint64_t span = section.virtual_size ? section.virtual_size : section.raw_size;
+    if (span == 0) continue;
+    const bool r = section.characteristics & exe::kPeSectionRead, w = section.characteristics & exe::kPeSectionWrite, x = section.characteristics & exe::kPeSectionExecute;
+    attributes.protect = !(r || w || x) ? 0x01 : w ? (x ? 0x80 : 0x08) : x ? (r ? 0x20 : 0x10) : 0x02;
+    const uint64_t at = base + section.virtual_address;
+    space.set_attributes(at, span, attributes);
+    space.protect(at, span, uint8_t(((r || w) ? kProtRead : 0) | (x ? kProtExecute : 0)));      // (a writable section is read-only until it is written to)
+    space.join_allocation(at, span, base);
+  }
+  space.join_allocation(base, header_bytes, base);
+}
+
 namespace {
 
 void say(Context& c, StringView a, StringView b = StringView()) {
@@ -231,6 +253,7 @@ LoadStatus ensure_loaded(Context& c, StringView canonical, uint32_t depth, Modul
     say(c, canonical, " has damaged relocations");
     return LoadStatus::Malformed;
   }
+  describe_image_pages(c.space, pe, base);
   module->base = base;
   module->size = size;
   module->entry = image.entry;
