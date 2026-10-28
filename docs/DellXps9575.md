@@ -730,7 +730,14 @@ in use, and interlane alignment: the test the driver's short pulse handler retra
 two service interrupts), the whole `status` and `lanes`. A sink that does not answer is `read_failed` (it is gone or asleep); a pin that is no DisplayPort connector, or not in the video BIOS's table, is reported
 with `checked` false and nothing is asked. The panel's power is not switched on for this (a sink that is off does not pulse). Shutting down drops the pending pulses.
 
-Not done: acknowledging (writing 1 to the bits of `DP_DEVICE_SERVICE_IRQ_VECTOR` that were handled, which clears the sink's request), answering the automated test request (`DP_TEST_REQUEST` 0x218 and the response at 0x260),
-the retraining itself (there is no link training yet; the boot firmware's link is what is judged, and a card that has not trained one has `lanes` 0 and cannot lose it), and the MST message and the downstream port
-changes. Addresses and bit meanings are from memory, like the rest of the DPCD. `AmdVegaMTest::test_short_pulse_status` (healthy link, a lost lane, a lane beyond the ones in use, an untrained link, lost alignment, each
+**Acknowledging and answering.** After reading the status, `service_short_pulses` writes back the service interrupts it handles (`Dpcd::acknowledge_service_irq`: the automated test request 0x02, content protection 0x04 and
+sink specific 0x40 of `DP_DEVICE_SERVICE_IRQ_VECTOR`, 0x201: the sink clears a bit when a 1 is written to it) - first, as the driver's handler does, so a new request that arrives during the handling is not lost - and
+leaves the others (the MCCS bit and the MST message-ready bits) alone for whoever handles them; `SinkEvent::acked` has the bits written, none are written for a vector without such bits. For an automated test request it
+reads `DP_TEST_REQUEST` (0x218, `test_kind`) and answers in `DP_TEST_RESPONSE` (0x260, `test_response`): the **EDID read test** (request 0x04) is done - the EDID of the sink is read over the same AUX channel, the checksum
+byte of its last 128-byte block goes to `DP_TEST_EDID_CHECKSUM` (0x261) and the response is ACK with the checksum-write bit (0x05) - and every other test (link training 0x01, video pattern 0x02, PHY test pattern 0x08, no
+request, several bits, or an EDID that cannot be read) is answered NAK (0x02), because there is no trained link or pattern generator to run them on. A read or write that did not go through is `handling_failed`.
+`AmdAux::dpcd_write` (a native write, 12 bytes at a time) is what writes; `IDpcdAux` gained it.
+
+Not done: the retraining itself (there is no link training yet; the boot firmware's link is what is judged, and a card that has not trained one has `lanes` 0 and cannot lose it), the other tests (training, video pattern with the test timing
+registers 0x219.., PHY patterns), and the MST message and the downstream port changes. Addresses and bit meanings are from memory, like the rest of the DPCD. `AmdVegaMTest::test_short_pulse_status` (healthy link, a lost lane, a lane beyond the ones in use, an untrained link, lost alignment, each
 service interrupt, the eDP panel, a sink that times out or ends before the status, HDMI and an unknown pin, capacity and order, the dropped state) and `DpcdTest::test_lane_count` cover it.

@@ -140,6 +140,8 @@ programs built with `-march=haswell` (or x86-64-v3) run. `X86_64Vex.cpp` holds a
   `vvvv & ~3`. The operand must be memory (no register form, no broadcast, packed form 512-bit only: #UD). Rounding comes from MXCSR (no embedded rounding); the flags of all the
   steps accumulate. Whether the hardware rounds each step (as here) is not documented in anything the emulator was checked against. `Fma4Test` compares with the host's own `vfmadd` chain
   (values, NaNs, flags, masks, all four rounding modes), except underflow: the host being AMD detects tininess after rounding, Intel and the emulator before.
+- **AVX512_4VNNIW** (Xeon Phi; cpuid.7.0:EDX bit 2; `kVnni4` in `X86_64Evex.cpp`): `vp4dpwssd/vp4dpwssds zmm1{k}, zmm2+3, m128`: four chained `vpdpwssd` (wrapping) or `vpdpwssds` (saturating) steps over the
+  register group at `vvvv & ~3`, step j using dword j of the memory operand as the word pair. Memory operand only, 512-bit only (else #UD). `Vnni4Test` compares with four host `vpdpwssd[s]`.
 - **AVX512_VP2INTERSECT** (cpuid.7.0:EDX bit 8; `kVp2Intersect` in `X86_64Evex.cpp`): `vp2intersectd/q k, zmm, zmm/m/m{1toN}` writes the mask pair (`reg & 6`, `reg | 1`): bit i of the first when element i of
   the first source equals any element of the second, bit j of the second when element j equals any element of the first; every other bit is cleared. A write mask, zeroing or embedded
   rounding is #UD. `Vp2IntersectTest` checks it against a model written from that definition (the host has no VP2INTERSECT) and runs every truncation and bit flip of the encodings.
@@ -151,7 +153,7 @@ programs built with `-march=haswell` (or x86-64-v3) run. `X86_64Vex.cpp` holds a
   the format description). Half precision has no denormal exception and no DAZ/FTZ, so those never show. Two details are not known and are documented guesses: the complex instructions
   round as chained fused multiply-adds (`a.re*b.re`, then `-a.im*b.im` added with one rounding), and `vrcpph`/`vrsqrtph` return the correctly rounded value, which is inside the
   architecture's 2^-11 bound but is not what the hardware's table gives bit for bit.
-- **Not implemented** (an invalid-instruction fault, never a wrong result): AVX-512 4VNNIW and the other Xeon Phi parts, TSX, `xsaveopt`/`xsavec`, and the MMX registers (so the MMX forms of the SSSE3
+- **Not implemented** (an invalid-instruction fault, never a wrong result): the Xeon Phi parts beyond 4FMAPS and 4VNNIW (the 4-register gather/scatter prefetches), TSX, `xsaveopt`/`xsavec`, and the MMX registers (so the MMX forms of the SSSE3
   instructions, the ones without a 66 prefix, are invalid).
   Exceptions delivered to a Windows program save the XMM halves of vector state in the `CONTEXT` in memory, not the upper halves (the emulator keeps those itself).
 - **Checked against the real thing**: `tests/AvxTest.cpp` assembles about 1,400 instruction forms with `llvm-mc` (`tests/data/emulation/avx_cases_gen.py`), runs each on the host

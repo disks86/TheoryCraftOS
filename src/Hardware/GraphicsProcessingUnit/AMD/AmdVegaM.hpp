@@ -184,8 +184,7 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
   // (`pending_short_pulses()`: bit n for pin n). The look is the AUX channel's, which takes some milliseconds, so it is not done there: service_short_pulses() does it, from the desktop loop.
   // For each pending pin, lowest first, up to `capacity` of them, it reads the sink's link configuration (DP_LANE_COUNT_SET) and status (the lane training status, the alignment, the service
   // interrupt vector) and reports what a driver's short pulse handler decides on: the link is lost when it was set up for lanes and does not pass drm_dp_channel_eq_ok for them (retrain),
-  // an automated test request is made when the sink asks for one. The returned events are in `out`; pins past `capacity` stay pending. Not done: the acknowledging write to the service
-  // interrupt vector, the test request itself (DP_TEST_REQUEST and the response), the retraining.
+  // an automated test request is made when the sink asks for one. The returned events are in `out`; pins past `capacity` stay pending. Not done: the retraining.
   struct SinkEvent {
     uint32_t pin = 0;
     bool has_connector = false;
@@ -198,6 +197,12 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
     bool test_request = false;        // DP_AUTOMATED_TEST_REQUEST in the service interrupt vector
     bool content_protection = false;  // DP_CP_IRQ
     bool sink_specific = false;       // DP_SINK_SPECIFIC_IRQ
+    // What was done about it. The handled service interrupts (Dpcd::kIrqHandled) are acknowledged first, as the driver does; an automated test request is read (DP_TEST_REQUEST) and
+    // answered (DP_TEST_RESPONSE): the EDID read test with the checksum of the last block of the sink's EDID, every other test with a NAK.
+    uint8_t acked = 0;                // the bits written back to DP_DEVICE_SERVICE_IRQ_VECTOR
+    uint8_t test_kind = 0;            // DP_TEST_REQUEST
+    uint8_t test_response = 0;        // DP_TEST_RESPONSE as written (Dpcd::kTestAck | kTestEdidChecksumWrite, or kTestNak); 0 if none was given
+    bool handling_failed = false;     // a read or write of the above did not go through
   };
   uint32_t pending_short_pulses() const { return rx_pending_; }
   uint32_t service_short_pulses(SinkEvent* out, uint32_t capacity);

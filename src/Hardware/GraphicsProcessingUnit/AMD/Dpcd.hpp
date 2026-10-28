@@ -28,6 +28,8 @@ class IDpcdAux {
  public:
   // `out.size()` bytes from `address`; false unless every byte came.
   virtual bool dpcd_read(uint32_t address, ByteView out) = 0;
+  // `data` to `address` (a native write); false unless every byte was taken.
+  virtual bool dpcd_write(uint32_t address, ConstByteView data) = 0;
 
  protected:
   IDpcdAux() = default;
@@ -45,7 +47,13 @@ class Dpcd {
   static constexpr uint32_t kRevision = 0x000, kMaxLinkRate = 0x001, kMaxLaneCount = 0x002, kMaxDownspread = 0x003, kNorp = 0x004, kDownstreamPortPresent = 0x005,
                             kMainLinkChannelCoding = 0x006, kDownstreamPortCount = 0x007;
   static constexpr uint32_t kSupportedLinkRates = 0x010;         // eDP 1.4: up to eight 16-bit rates
-  static constexpr uint32_t kLaneCountSet = 0x101, kSinkCount = 0x200, kLaneStatus = 0x202, kEdpRevision = 0x700;
+  static constexpr uint32_t kLaneCountSet = 0x101, kSinkCount = 0x200, kDeviceServiceIrqVector = 0x201, kLaneStatus = 0x202, kEdpRevision = 0x700;
+  static constexpr uint32_t kTestRequest = 0x218, kTestResponse = 0x260, kTestEdidChecksum = 0x261;
+  // DP_DEVICE_SERVICE_IRQ_VECTOR: the bits a source handles here (the others are the MCCS and the MST message bits, left for whoever does those)
+  static constexpr uint8_t kIrqAutomatedTest = 0x02, kIrqContentProtection = 0x04, kIrqSinkSpecific = 0x40, kIrqHandled = 0x46;
+  // DP_TEST_REQUEST (one bit per kind of test; a request is one of them) and DP_TEST_RESPONSE
+  static constexpr uint8_t kTestLinkTraining = 0x01, kTestVideoPattern = 0x02, kTestEdidRead = 0x04, kTestPhyPattern = 0x08;
+  static constexpr uint8_t kTestAck = 0x01, kTestNak = 0x02, kTestEdidChecksumWrite = 0x04;
   static constexpr uint32_t kReceiverBytes = 0x10;               // 0x000..0x00F, the receiver capability field
   static constexpr uint32_t kStatusBytes = 8;                    // 0x200..0x207: sink count, service irq vector, lane status (2), alignment, sink status, adjust requests (2)
   static constexpr uint32_t kMaxEdpRates = 8;
@@ -104,6 +112,14 @@ class Dpcd {
   // The reads. `edp`: also the eDP revision and, from 1.4, the rate table.
   static bool read_capabilities(IDpcdAux& aux, bool edp, Capabilities* out);
   static bool read_link_status(IDpcdAux& aux, LinkStatus* out);
+  // Acknowledges the service interrupts a source handles (kIrqHandled) that are set in `vector`, the value read from DP_DEVICE_SERVICE_IRQ_VECTOR: the sink clears a bit when a 1 is
+  // written to it. Nothing is written for a vector without such bits. `acked` gets the bits written.
+  static bool acknowledge_service_irq(IDpcdAux& aux, uint8_t vector, uint8_t* acked);
+  // The automated test request (DP_TEST_REQUEST) of a sink, and the answer to it (DP_TEST_RESPONSE). Of the tests only the EDID read can be done without a trained link: the checksum of the
+  // last block of the EDID (`edid`, the whole EDID the source read, a multiple of 128 bytes; may be empty) goes to DP_TEST_EDID_CHECKSUM and the answer is ACK with the checksum-write bit.
+  // Anything else - link training, video pattern, PHY test pattern, no request, several bits, an EDID that is not there - is answered NAK. False if a read or write failed (no answer given).
+  static bool read_test_request(IDpcdAux& aux, uint8_t* request);
+  static bool answer_test_request(IDpcdAux& aux, uint8_t request, ConstByteView edid, uint8_t* response);
   // DP_LANE_COUNT_SET: the lanes the source has set the link to (bits 4:0; 0 until the link has been trained), the number the link status is judged by.
   static bool read_lane_count(IDpcdAux& aux, uint32_t* lanes);
 };

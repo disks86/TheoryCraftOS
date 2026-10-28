@@ -1707,6 +1707,61 @@ static void test_short_pulse_status() {
   dpcd[0x201] = 0x40;
   CHECK(pulse(2) == 1 && vega.service_short_pulses(ev, 8) == 1 && !ev[0].test_request && !ev[0].content_protection && ev[0].sink_specific);
   dpcd[0x201] = 0;
+  // Acknowledged and answered. The service interrupts we handle are cleared by writing them back (the sink clears the bits written), the others are left; an EDID read test gets the checksum of
+  // the last block of the sink's EDID and ACK with the checksum-write bit, any other test a NAK.
+  auxcard.sink.edid = make_edid(1);
+  const uint8_t last_checksum = auxcard.sink.edid[255];
+  dpcd[0x201] = 0x46 | 0x10;      // test request, content protection, sink specific, and an MST message ready
+  dpcd[0x218] = 0x04;             // the EDID read test
+  auxcard.sink.dpcd_writes.clear();
+  CHECK(pulse(2) == 1 && vega.service_short_pulses(ev, 8) == 1 && ev[0].acked == 0x46 && ev[0].test_request && ev[0].test_kind == 0x04 && ev[0].test_response == 0x05 && !ev[0].handling_failed);
+  CHECK(auxcard.sink.dpcd_writes.size() == 3 && auxcard.sink.dpcd_writes[0].address == 0x201 && auxcard.sink.dpcd_writes[0].bytes == std::vector<uint8_t>{0x46});       // (acknowledged first)
+  CHECK(auxcard.sink.dpcd_writes[1].address == 0x261 && auxcard.sink.dpcd_writes[1].bytes == std::vector<uint8_t>{last_checksum} && auxcard.sink.dpcd_writes[2].address == 0x260 && auxcard.sink.dpcd_writes[2].bytes == std::vector<uint8_t>{0x05});
+  CHECK(dpcd[0x201] == 0x10 && dpcd[0x260] == 0x05);       // (the MST bit is still there: not ours)
+  // the status the event shows is what was read before the acknowledgement
+  CHECK(ev[0].status.irq_vector == 0x56 && ev[0].content_protection && ev[0].sink_specific);
+  // the other tests: NAK, no checksum
+  dpcd[0x201] = 0x02;
+  const uint8_t tests[] = {0x01, 0x02, 0x08, 0x00, 0x06};
+  for (uint8_t t : tests) {
+    dpcd[0x218] = t;
+    dpcd[0x201] = 0x02;
+    auxcard.sink.dpcd_writes.clear();
+    CHECK(pulse(2) == 1 && vega.service_short_pulses(ev, 8) == 1 && ev[0].test_kind == t && ev[0].test_response == 0x02 && !ev[0].handling_failed);
+    CHECK(auxcard.sink.dpcd_writes.size() == 2 && auxcard.sink.dpcd_writes[0].address == 0x201 && auxcard.sink.dpcd_writes[1].address == 0x260 && auxcard.sink.dpcd_writes[1].bytes[0] == 0x02);
+  }
+  // an EDID read test of a sink with no EDID: NAK
+  dpcd[0x218] = 0x04;
+  dpcd[0x201] = 0x02;
+  auxcard.sink.monitor_present = false;
+  auxcard.sink.dpcd_writes.clear();
+  CHECK(pulse(2) == 1 && vega.service_short_pulses(ev, 8) == 1 && ev[0].test_kind == 0x04 && ev[0].test_response == 0x02 && !ev[0].handling_failed && auxcard.sink.dpcd_writes.size() == 2);
+  auxcard.sink.monitor_present = true;
+  // no test request, no test: only the acknowledgement, and none at all without handled bits
+  dpcd[0x201] = 0x04;
+  auxcard.sink.dpcd_writes.clear();
+  CHECK(pulse(2) == 1 && vega.service_short_pulses(ev, 8) == 1 && ev[0].acked == 0x04 && !ev[0].test_request && ev[0].test_kind == 0 && ev[0].test_response == 0 && auxcard.sink.dpcd_writes.size() == 1);
+  dpcd[0x201] = 0x38;
+  auxcard.sink.dpcd_writes.clear();
+  CHECK(pulse(2) == 1 && vega.service_short_pulses(ev, 8) == 1 && ev[0].acked == 0 && auxcard.sink.dpcd_writes.empty() && dpcd[0x201] == 0x38);
+  dpcd[0x201] = 0;
+  CHECK(pulse(2) == 1 && vega.service_short_pulses(ev, 8) == 1 && ev[0].acked == 0 && auxcard.sink.dpcd_writes.empty());
+  // a write that is not taken (the DPCD ends before the response): reported, the rest of the event is still there
+  dpcd[0x201] = 0x02;
+  dpcd[0x218] = 0x04;
+  dpcd.resize(0x260);
+  CHECK(pulse(2) == 1 && vega.service_short_pulses(ev, 8) == 1 && ev[0].test_request && ev[0].acked == 0x02 && ev[0].test_response == 0 && ev[0].handling_failed);
+  dpcd.resize(0x800);
+  dpcd[0x201] = 0;
+  dpcd[0x218] = 0;
+  // the acknowledgement is not taken: reported, nothing acknowledged, the test is answered all the same
+  dpcd[0x201] = 0x02;
+  dpcd[0x218] = 0x04;
+  auxcard.sink.nack_write_at = 0x201;
+  CHECK(pulse(2) == 1 && vega.service_short_pulses(ev, 8) == 1 && ev[0].acked == 0 && ev[0].handling_failed && ev[0].test_response == 0x05 && dpcd[0x201] == 0x02);
+  auxcard.sink.nack_write_at = 0xFFFFFFFFu;
+  dpcd[0x201] = 0;
+  dpcd[0x218] = 0;
   // The eDP panel (pin 0): looked at too, without switching the panel's power
   CHECK(pulse(0) == 1 && vega.service_short_pulses(ev, 8) == 1 && ev[0].pin == 0 && ev[0].checked && ev[0].connector.type == AtomConnectors::Type::EmbeddedDisplayPort && ev[0].lanes == 4);
   CHECK(auxcard.sink.requests.back().channel == 0x92 && auxcard.panel_writes == 0);
