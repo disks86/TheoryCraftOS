@@ -659,6 +659,14 @@ bool Task::set_priority(uint64_t thread_id, int32_t absolute_priority) {
   return true;
 }
 
+void Task::flush_write_buffers() {
+  CoreMask all;
+  const uint64_t online = online_core_mask();
+  for (uint32_t i = 0; i < 64; ++i) if ((online >> i) & 1) all.add(i);
+  wait_for_kernel_entry(all);      // (an interrupt drains the store buffer of the core it lands on)
+  __atomic_thread_fence(__ATOMIC_SEQ_CST);
+}
+
 bool Task::set_affinity(uint64_t thread_id, uint64_t mask) {
   const uint64_t online = online_core_mask();
   if (!(mask & online)) return false;

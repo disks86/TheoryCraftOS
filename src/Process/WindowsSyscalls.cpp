@@ -159,6 +159,7 @@ class WindowsSyscalls final : public ISyscallInterface {
       case WindowsSyscallNumber::NtMapViewOfSection: return windowsabi::nt_map_view_of_section(process, r);
       case WindowsSyscallNumber::NtUnmapViewOfSection: return windowsabi::nt_unmap_view_of_section(process, r);
       case WindowsSyscallNumber::NtAreMappedFilesTheSame: return windowsabi::nt_are_mapped_files_the_same(process, r);
+      case WindowsSyscallNumber::NtFlushProcessWriteBuffers: if (process.runtime()) process.runtime()->flush_write_buffers(); return 0;
       case WindowsSyscallNumber::NtFlushVirtualMemory: return windowsabi::nt_flush_virtual_memory(process, r);
       case WindowsSyscallNumber::NtLockFile: return windowsabi::nt_lock_file(process, r);
       case WindowsSyscallNumber::NtUnlockFile: return windowsabi::nt_unlock_file(process, r);
