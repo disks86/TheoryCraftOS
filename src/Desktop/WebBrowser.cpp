@@ -23,6 +23,7 @@
 #include "Browser/Fetcher.hpp"
 #include "Browser/Url.hpp"
 #include "Browser/WebUrl.hpp"
+#include "Dom/LegacyEncodings.hpp"
 #include "Media/ImageCodecs.hpp"
 #include "Desktop/FileStatus.hpp"
 #include "Gui/Window.hpp"
@@ -842,12 +843,21 @@ void WebBrowser::show(Fetched& page) {
   }
   // Text and files that cannot be shown are pages too: a <pre> of the text, a line of explanation
   String synthetic(allocator());
+  String decoded(allocator());   // the page as text, read in the encoding it came in (the charset of the Content-Type, a byte order mark, a <meta>)
+  StringView charset = "UTF-8";
   StringView html = body;
   bool scripts = scripts_enabled_;
-  if (!is_html(page.type.view(), page.address.view(), body)) {
+  if (is_html(page.type.view(), page.address.view(), body)) {
+    dom::Encoding used = dom::Encoding::Utf8;
+    dom::decode_document(page.body.view(), page.type.view(), &decoded, &used);
+    html = decoded.view();
+    charset = dom::encoding_display_name(used);
+  } else {
     scripts = false;
     if (is_text(page.type.view(), body)) {
-      text_as_html(body, &synthetic);
+      dom::Encoding used = dom::Encoding::Utf8;
+      dom::decode_document(page.body.view(), page.type.view(), &decoded, &used);
+      text_as_html(decoded.view(), &synthetic);
     } else {
       String note(allocator());
       note.append("This kind of file (");
@@ -870,6 +880,7 @@ void WebBrowser::show(Fetched& page) {
     String referrer(allocator());
     visible_referrer(allocator(), referrer_.view(), page.address.view(), &referrer);
     live_->set_referrer(referrer.view());
+    live_->set_character_set(charset);
     if (scripts) say("Reading the page and running its scripts...");
     else say("Reading the page...");
     ok = live_->load(html) && live_->render_picture(picture.get(), layout_fonts());

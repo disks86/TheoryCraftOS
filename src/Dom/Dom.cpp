@@ -36,7 +36,10 @@ void lowercase_into(StringView in, String* out) {
 
 // --- Document ----------------------------------------------------------------------------------------------------
 
-Document::Document(allocators::IAllocator& allocator) : doctype_name(allocator), doctype_public(allocator), doctype_system(allocator), content_type(allocator), allocator_(allocator), nodes_(allocator), log_(allocator), watched_(allocator) { root_ = make(NodeType::Document, "#document"); }
+Document::Document(allocators::IAllocator& allocator) : doctype_name(allocator), doctype_public(allocator), doctype_system(allocator), content_type(allocator), character_set(allocator), allocator_(allocator), nodes_(allocator), log_(allocator), watched_(allocator) {
+  character_set.assign("UTF-8");
+  root_ = make(NodeType::Document, "#document");
+}
 
 Document::~Document() {
   for (uint64_t i = 0; i < nodes_.count(); ++i) {

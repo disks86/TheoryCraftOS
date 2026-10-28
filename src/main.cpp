@@ -1097,6 +1097,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
           sources.mapper = &register_mapper;
           sources.registers = &vega_registers;
           sources.allocator = &shared_allocator;
+          sources.bar0_physical = aperture_base;
+          sources.bar0_bytes = aperture_bytes;
           sources.function = d.address;
           sources.vendor_id = d.vendor_id;
           sources.device_id = d.device_id;
@@ -1140,6 +1142,18 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
                 Entry(Level::Info, "Vega M").text("  output ").dec(pin + 1);
               }
             }
+          }
+          // The audio endpoints with a port (how many displays could have sound), and the outputs that carry audio and have a display: which endpoint serves which output is not fixed.
+          const uint32_t audio_mask = vega_m->audio_pins_connected();
+          uint32_t audio_count = 0;
+          for (uint32_t pin = 0; pin < hardware::AmdVegaM::kAudioPins; ++pin) audio_count += audio_mask >> pin & 1;
+          Entry(Level::Info, "Vega M").text("audio: ").dec(audio_count).text(" of ").dec(hardware::AmdVegaM::kAudioPins).text(" endpoints with a port");
+          hardware::AtomConnectors::Connector audio_outputs[hardware::AtomConnectors::kMaxConnectors];
+          const uint32_t audio_output_count = vega_m->audio_outputs(audio_outputs, hardware::AtomConnectors::kMaxConnectors);
+          for (uint32_t i = 0; i < audio_output_count; ++i) {
+            char connector_name[16];
+            hardware::AtomConnectors::name(audio_outputs[i], ArrayView<char>(connector_name, sizeof connector_name));
+            Entry(Level::Info, "Vega M").text("  audio output with a display: ").text(connector_name);
           }
         }
         if (up && vega_msi) {

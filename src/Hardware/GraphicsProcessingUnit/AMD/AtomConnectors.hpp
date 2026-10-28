@@ -49,6 +49,8 @@ class AtomConnectors {
   };
 
   // The connector's name as the kernel's DRM names it: "HDMI-A-1", "DP-2", "eDP-1". `buffer` gets the text and a terminating zero, cut short if it does not fit.
+  // HDMI and DisplayPort carry audio with the picture (the others the connector reader knows - analogue, DVI, LVDS, eDP - do not, in the sense of the audio endpoints being used for them).
+  static bool carries_audio(Type type) { return type == Type::HdmiA || type == Type::HdmiB || type == Type::DisplayPort; }
   static const char* type_name(Type type);
   static uint32_t name(const Connector& connector, ArrayView<char> buffer);
 

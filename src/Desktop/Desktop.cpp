@@ -579,27 +579,29 @@ int64_t Desktop::calendar_time(void* self) {
 }
 
 uint32_t Desktop::announce_calendar(int64_t now_minutes) {
-  List<uint32_t> due(allocator_);
+  List<CalendarStore::Due> due(allocator_);
   calendar_store_->take_due(now_minutes, &due);
   uint32_t posted = 0;
-  for (uint32_t id : due) {
-    CalendarStore::Event e(allocator_);
-    if (!calendar_store_->get(id, &e)) continue;
+  for (const CalendarStore::Due& announcement : due) {
+    const int64_t start = announcement.start;   // (this occurrence: a repeating appointment's own start is only its first)
     // "Today 14:30, in 10 minutes" / "Today 14:30, now" / "Today 14:30, started 3 minutes ago" (an appointment on another day also says which).
     String text(allocator_);
-    const int64_t away = e.start - now_minutes;
-    const int32_t m = minute_of_day(e.start);
+    const int64_t away = start - now_minutes;
+    const int32_t m = minute_of_day(start);
     char clock[6] = {static_cast<char>('0' + m / 600), static_cast<char>('0' + m / 60 % 10), ':', static_cast<char>('0' + m % 60 / 10), static_cast<char>('0' + m % 10), 0};
-    if (day_of(e.start) == day_of(now_minutes)) {
+    if (day_of(start) == day_of(now_minutes)) {
       text.assign("Today ");
     } else {
       char date[11];
-      gui::format_date(gui::date_from_days(day_of(e.start)), date);
+      gui::format_date(gui::date_from_days(day_of(start)), date);
       text.assign(StringView(date, 10));
       text.push_back(' ');
     }
-    text.append(StringView(clock, 5));
-    if (away > 0) {
+    if (announcement.all_day()) text.append("(all day)");
+    else text.append(StringView(clock, 5));
+    if (announcement.all_day()) {
+      // (nothing about minutes: the day itself is the appointment)
+    } else if (away > 0) {
       text.append(", in ");
       if (away >= 120) {
         text.append_uint(static_cast<uint64_t>(away / 60));
@@ -616,7 +618,7 @@ uint32_t Desktop::announce_calendar(int64_t now_minutes) {
       text.append(away == -1 ? " minute ago" : " minutes ago");
     }
     // (it stays until it is clicked or for a minute, whichever: a reminder must not be missed by looking away for a few seconds)
-    if (notify(e.title.view(), text.view(), gui::NoticeKind::Information, 60000, {&Desktop::on_calendar_toast, this})) ++posted;
+    if (notify(announcement.title.view(), text.view(), gui::NoticeKind::Information, 60000, {&Desktop::on_calendar_toast, this})) ++posted;
   }
   return posted;
 }

@@ -26,6 +26,7 @@
 #include "Script/TypedArray.hpp"
 #include "Utility/ByteText.hpp"
 #include "Browser/WebUrl.hpp"
+#include "Dom/LegacyEncodings.hpp"
 #include "Utility/ByteBuffer.hpp"
 
 namespace browser {
@@ -79,6 +80,40 @@ NATIVE(net_utf8_clean) {
     }
   }
   *result = str_value(vm, clean.view());
+  return true;
+}
+
+// __encoding_label(label): the name of the encoding the label names (lowercase, "gbk", "shift_jis" ...), or undefined.
+NATIVE(encoding_label) {
+  JsString* label;
+  if (!vm.to_string(arg_at(args, argc, 0), &label)) return false;
+  dom::Encoding e;
+  *result = dom::find_encoding(label->view(), &e) ? Value::make_string(vm.intern(dom::encoding_name(e))) : Value();
+  return true;
+}
+
+// __decode_legacy(encoding, bytes, last, fatal, state): the text of the bytes (UTF-8), or null when `fatal` and a byte was not valid. `state` is a Uint32Array of twelve that
+// keeps what the decoder has read of an incomplete character between two calls.
+NATIVE(decode_legacy) {
+  JsString* name;
+  ArrayView<uint8_t> bytes, state_bytes;
+  dom::Encoding e;
+  if (!vm.to_string(arg_at(args, argc, 0), &name)) return false;
+  if (!dom::find_encoding(name->view(), &e)) return vm.throw_error(ErrorKind::TypeError, "Unknown encoding");
+  if (!script::typed_array_bytes(arg_at(args, argc, 1), &bytes) || !script::typed_array_bytes(arg_at(args, argc, 4), &state_bytes) || state_bytes.size() < 48)
+    return vm.throw_error(ErrorKind::TypeError, "The provided value is not a byte array.");
+  dom::DecoderState state;
+  uint32_t* fields[11] = {&state.v[0], &state.v[1], &state.v[2], &state.v[3], &state.v[4], &state.v[5], &state.back[0], &state.back[1], &state.back[2], &state.back[3], &state.backs};
+  for (uint32_t i = 0; i < 11; ++i) {   // (little endian, as the typed array holds them)
+    uint32_t v = 0;
+    for (uint32_t k = 0; k < 4; ++k) v |= static_cast<uint32_t>(state_bytes[i * 4 + k]) << (8 * k);
+    *fields[i] = v;
+  }
+  String text(vm.allocator());
+  const bool ok = dom::decode_legacy(e, &state, ConstByteView(bytes.data(), bytes.size()), Vm::to_boolean(arg_at(args, argc, 2)), Vm::to_boolean(arg_at(args, argc, 3)), &text);
+  for (uint32_t i = 0; i < 11; ++i)
+    for (uint32_t k = 0; k < 4; ++k) state_bytes[i * 4 + k] = static_cast<uint8_t>(*fields[i] >> (8 * k));
+  *result = ok ? Value::make_string(vm.new_string(text.view())) : Value::make_null();
   return true;
 }
 
@@ -795,6 +830,7 @@ bool install_net(DomBindings::Impl& c) {
   vm.define_native(g, "__net_send_sync", net_send_sync, 1);
   vm.define_native(g, "__utf8_clean", net_utf8_clean, 1);
   vm.define_native(g, "__bytes_to_string", net_bytes_to_string, 1);
+  install_text_encoding_natives(vm);
   vm.define_native(g, "__text_bytes", net_text_bytes, 1);
   vm.define_native(g, "__decode_audio", net_decode_audio, 1);
   vm.define_native(g, "__string_to_bytes", net_string_to_bytes, 1);
@@ -836,4 +872,12 @@ bool install_net(DomBindings::Impl& c) {
 }
 
 }  // namespace bind
+
+// The natives of the legacy text encodings (TextDecoder): also defined in the engine of a worker.
+void install_text_encoding_natives(script::Vm& vm) {
+  script::JsObject* g = vm.global();
+  vm.define_native(g, "__encoding_label", bind::encoding_label, 1);
+  vm.define_native(g, "__decode_legacy", bind::decode_legacy, 5);
+}
+
 }  // namespace browser

@@ -294,6 +294,30 @@ bool Interrupts::ack_pageflip(uint32_t crtc) {
   return true;
 }
 
+namespace {
+constexpr uint32_t kAudioPinOffsets[AudioPins::kMaxPins] = {0x17a8 - 0x17a8, 0x17ac - 0x17a8, 0x17b0 - 0x17a8, 0x17b4 - 0x17a8, 0x17b8 - 0x17a8, 0x17bc - 0x17a8, 0x17c0 - 0x17a8, 0x17c4 - 0x17a8};
+}  // namespace
+
+uint32_t AudioPins::endpoint_read(uint32_t pin, uint32_t reg) {
+  if (pin >= kMaxPins) return 0;
+  r_.write(mmAZALIA_F0_CODEC_ENDPOINT_INDEX + kAudioPinOffsets[pin], reg);
+  return r_.read(mmAZALIA_F0_CODEC_ENDPOINT_DATA + kAudioPinOffsets[pin]);
+}
+
+uint32_t AudioPins::port_connectivity(uint32_t pin) {
+  const uint32_t tmp = endpoint_read(pin, ixAZALIA_F0_CODEC_PIN_CONTROL_RESPONSE_CONFIGURATION_DEFAULT);
+  return FIELD(tmp, AZALIA_F0_CODEC_PIN_CONTROL_RESPONSE_CONFIGURATION_DEFAULT__PORT_CONNECTIVITY_MASK, AZALIA_F0_CODEC_PIN_CONTROL_RESPONSE_CONFIGURATION_DEFAULT__PORT_CONNECTIVITY__SHIFT);
+}
+
+bool AudioPins::connected(uint32_t pin) { return pin < kMaxPins && port_connectivity(pin) != kPortConnectivityNone; }
+
+uint32_t AudioPins::connected_mask(uint32_t pin_count) {
+  uint32_t mask = 0;
+  for (uint32_t pin = 0; pin < pin_count && pin < kMaxPins; ++pin)
+    if (connected(pin)) mask |= 1u << pin;
+  return mask;
+}
+
 bool Presenter::start(INativeDisplay& display, ByteView video, uint32_t pitch_bytes, uint32_t height) {
   const uint64_t bytes = uint64_t{pitch_bytes} * height;
   if (pitch_bytes == 0 || height == 0 || video.size() != bytes) return false;

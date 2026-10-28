@@ -2439,6 +2439,7 @@ uint32_t Page::worker_start(StringView source, StringView url, StringView name, 
     if (w->page.env_.fetch_text(address->view(), 1u << 20, &text)) *result = Value::make_string(v.new_string(text.view()));
     return true;
   }, 1);
+  install_text_encoding_natives(vm);
   vm.define_native(vm.global(), "__bytes_to_string", [](script::Vm& v, const Value&, const Value* args, uint32_t argc, Value* result) {   // (TextDecoder)
     ArrayView<uint8_t> bytes;
     if (argc == 0 || !script::typed_array_bytes(args[0], &bytes)) return v.throw_error(script::ErrorKind::TypeError, "The provided value is not a byte array.");

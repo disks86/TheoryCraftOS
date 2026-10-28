@@ -177,6 +177,23 @@ class Interrupts {
   IVcnRegisters& r_;
 };
 
+// The audio endpoints of the display engine (dce_v11_0_audio_endpt_rreg and dce_v11_0_audio_get_connected_pins): an indexed register pair per endpoint, and in it the pin's default
+// configuration, whose port connectivity field says whether the endpoint has a physical connection (1 means none). The Vega M (CHIP_VEGAM, like Polaris 10) has 8 endpoints. Which output
+// an endpoint serves is not fixed: the driver gives an encoder the first connected one it finds (dce_v11_0_audio_get_pin).
+class AudioPins {
+ public:
+  static constexpr uint32_t kMaxPins = 8;
+  static constexpr uint32_t kPortConnectivityNone = 1;
+  explicit AudioPins(IVcnRegisters& registers) : r_(registers) {}
+  uint32_t endpoint_read(uint32_t pin, uint32_t reg);   // 0 for a pin that does not exist
+  uint32_t port_connectivity(uint32_t pin);              // the field of the default configuration (0 connector, 1 none, 2 fixed function, 3 both)
+  bool connected(uint32_t pin);                          // port connectivity is not "none"
+  uint32_t connected_mask(uint32_t pin_count = kMaxPins); // bit n: pin n
+
+ private:
+  IVcnRegisters& r_;
+};
+
 // The OS's picture kept in system memory (cached, so reading and blending are fast; the mapped window of video memory is uncached and slow to read) and sent to the display's
 // framebuffer in video memory a run of rows at a time: by the card's DMA engines when the display offers them, else by the CPU. `video` is the picture in video memory as the
 // display gave it (Display::engage's `memory`).

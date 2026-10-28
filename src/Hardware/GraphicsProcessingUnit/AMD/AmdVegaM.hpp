@@ -169,6 +169,14 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
   uint32_t connected_pins() const { return connected_pins_; }
   ArrayView<const AtomConnectors::Connector> connectors() const { return ArrayView<const AtomConnectors::Connector>(connectors_, connector_count_); }
   uint32_t hotplug_events_dropped() const { return hotplug_dropped_; }
+  // The audio endpoints of the display engine (amd_dce11::AudioPins, dce_v11_0_audio_get_connected_pins): bit n of the mask is set when endpoint n has a port (its default configuration's
+  // port connectivity is not "none"), as read at bring-up and by refresh_audio_pins(). Which output an endpoint serves is not fixed (the driver hands an encoder the first connected one), so
+  // this says how many displays could have audio, not which. `audio_outputs` is the other side of it: the connectors that carry audio (HDMI, DisplayPort) and have a display on their hot plug
+  // pin now, from the video BIOS's table (up to `capacity`, in the table's order; the count).
+  static constexpr uint32_t kAudioPins = amd_dce11::AudioPins::kMaxPins;
+  uint32_t audio_pins_connected() const { return audio_pins_; }
+  uint32_t refresh_audio_pins();
+  uint32_t audio_outputs(AtomConnectors::Connector* out, uint32_t capacity) const;
 
   // Recovery. An engine that timed out on a fence or reported a fault is wedged: nothing more is queued on it. recover() resets the ones that are - the graphics engine with its
   // compute queues (AmdGfx8::recover) if the graphics ring or a compute queue is wedged, and the SDMA engines (AmdSdma3::recover) if one is - and brings them back with empty
@@ -232,6 +240,7 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
   HotplugEvent hotplug_[kMaxHotplugEvents];
   AtomConnectors::Connector connectors_[AtomConnectors::kMaxConnectors];
   uint32_t connector_count_ = 0;
+  uint32_t audio_pins_ = 0;
   uint32_t hotplug_head_ = 0, hotplug_count_ = 0, hotplug_dropped_ = 0, connected_pins_ = 0, throttle_reported_ = 0;
   AmdIrq::ISink* observer_ = nullptr;
   UniquePointer<AmdGfx8Compute> compute_;
