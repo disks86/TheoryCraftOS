@@ -97,6 +97,13 @@ bool d3d9_op_writes_register(uint16_t op) {
   return info && info->dst != 0;
 }
 
+int d3d9_op_parameter_tokens(uint16_t op) {
+  if (op == kDcl) return 2;
+  if (op == kDef) return 5;
+  const OpInfo* info = find_op(op);
+  return info ? info->dst + info->src : -1;
+}
+
 NtStatus D3d9Program::compile(allocators::IAllocator& allocator, ConstByteView bytes, UniquePointer<D3d9Program>* out) {
   using Instr = Instruction;
   if (bytes.size() < 8 || bytes.size() % 4 || bytes.size() / 4 > kMaxTokens) return status::kInvalidParameter;

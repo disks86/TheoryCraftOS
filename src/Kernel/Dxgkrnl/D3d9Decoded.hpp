@@ -50,6 +50,8 @@ using namespace d3d9;
 
 // Does the Direct3D 9 instruction write the register named by its first parameter?
 bool d3d9_op_writes_register(uint16_t op);
+// How many parameter tokens an instruction of a Shader Model 1 stream has (they carry no length): -1 for an opcode this decoder does not know.
+int d3d9_op_parameter_tokens(uint16_t op);
 
 // One decoded instruction: sources and destination with their register slot already worked out, so running does not look anything up.
 struct D3d9Program::Instruction {
