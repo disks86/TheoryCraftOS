@@ -103,6 +103,14 @@ class Compiler {
       if (f > 0) chain[f - 1]->parent = fs;
     }
     eval_parent_ = chain.count() ? chain[0] : nullptr;
+    for (uint64_t f = chain.count(); f > 0; --f) {   // the objects that hold the variables other evals declared (outermost first: the innermost is looked in first)
+      FuncState* fs = chain[f - 1];
+      for (uint64_t i = 0; i < fs->bindings.count(); ++i)
+        if (fs->bindings[i].name.starts_with("%ev")) {
+          withs_.push_back(WithCtx{fs, 0, fs->bindings[i].name, true});
+          if (f == 1) eval_dynamic_ = fs->bindings[i].name;
+        }
+    }
     eval_strict_ = scope.frames.count() && scope.frames[0].strict;
     const bool ok = program(block, out);
     for (uint64_t i = 0; i < chain.count(); ++i) {
@@ -390,6 +398,20 @@ class Compiler {
   }
   void declare_var(StringView name) {
     strict_name(name, 0, true);
+    if (!eval_dynamic_.empty() && cur_->is_program && cur_->parent == eval_parent_ && !cur_->code->strict) {   // sloppy direct eval: a var is a variable of the calling function
+      uint32_t d, s;
+      if (resolve(name, &d, &s) && resolved_funcs_ == 1) return;   // (the function has it: nothing to declare)
+      emit(Opc::PushStr, static_cast<int32_t>(constant_string(name)));
+      load_plain(eval_dynamic_, 0);
+      emit(binary_opcode(Op::In));
+      const uint32_t has = emit(Opc::JumpIfTrue);
+      load_plain(eval_dynamic_, 0);
+      emit(Opc::PushUndef);
+      emit(Opc::SetProp, static_cast<int32_t>(constant_string(name)));
+      emit(Opc::Pop);
+      patch(has);
+      return;
+    }
     if (cur_->is_global) {
       emit(Opc::DeclareGlobal, static_cast<int32_t>(constant_string(name)));
       return;
@@ -454,6 +476,7 @@ class Compiler {
     FuncState* fs;
     uint64_t mark;    // the bindings of fs from here on were declared inside the body (they shadow the object)
     StringView var;   // the hidden variable that holds the object
+    bool whole = false;   // the object of a function that calls eval: the names of the whole function are bound inside it
   };
   // Is `name` bound inside the with statement (by a let, a parameter or a variable of a function in the body)?
   bool bound_inside(const WithCtx& ctx, StringView name) {
@@ -633,6 +656,23 @@ class Compiler {
     }
     if (!(fn->flags & kFlagExprBody)) hoist_vars(fn->a->list, false);
     if (!(fn->flags & kFlagExprBody)) bind_imports(fn->a->list);
+    bool has_dynamic = false;
+    if (!(fn->flags & kFlagExprBody) && (fn->a->flags & kFlagHasEval) && !fs.code->strict && !library_) {   // eval(...) here may declare variables: they live in an object that the names of the function look in
+      String text(vm_.allocator());
+      text.append("%ev");
+      text.append_uint(++with_counter_);
+      const StringView var = vm_.intern(text.view())->view();
+      emit(Opc::NewObject, 0, 0, fn->line);
+      emit(Opc::PushNull);
+      emit(Opc::SetLiteralProto);
+      const uint32_t slot = new_slot();
+      cur_->bindings.insert(function_level_count_, Binding{var, slot});
+      ++function_level_count_;
+      store_plain(var, fn->line, true);
+      emit(Opc::Pop);
+      withs_.push_back(WithCtx{cur_, 0, var, true});
+      has_dynamic = true;
+    }
     // default values of parameters
     uint32_t index = 0;
     for (Node* p = fn->list; p; p = p->next, ++index) {
@@ -661,6 +701,7 @@ class Compiler {
       emit(Opc::PushUndef);
       emit(Opc::Return);
     }
+    if (has_dynamic) withs_.remove_at(withs_.count() - 1);
     cur_ = saved;
     function_level_count_ = saved_level;
     return failed_ ? nullptr : fs.code;
@@ -796,7 +837,7 @@ class Compiler {
         ++function_level_count_;
         for (uint64_t m = 0; m < cur_->scope_marks.count(); ++m) ++cur_->scope_marks[m];
         for (uint64_t k = 0; k < withs_.count(); ++k)
-          if (withs_[k].fs == cur_) ++withs_[k].mark;
+          if (withs_[k].fs == cur_ && !withs_[k].whole) ++withs_[k].mark;
         store_plain(var, n->line, true);
         emit(Opc::Pop);
         withs_.push_back(WithCtx{cur_, cur_->bindings.count(), var});
@@ -1377,12 +1418,29 @@ class Compiler {
         return;
       case Op::TypeOf: {
         uint32_t depth, slot;
+        List<uint32_t> ends(vm_.allocator());
+        if (n->a->kind == NodeKind::Ident && with_applies(n->a->text)) {   // typeof name, where a with object or the variables of an eval may have it
+          for (uint64_t i = withs_.count(); i > 0; --i) {
+            const WithCtx ctx = withs_[i - 1];
+            if (bound_inside(ctx, n->a->text)) break;
+            emit(Opc::PushStr, static_cast<int32_t>(constant_string(n->a->text)), 0, n->line);
+            load_plain(ctx.var, n->line);
+            emit(binary_opcode(Op::In), 0, 0, n->line);
+            const uint32_t no = emit(Opc::JumpIfFalse);
+            load_plain(ctx.var, n->line);
+            emit(Opc::GetProp, static_cast<int32_t>(constant_string(n->a->text)), 0, n->line);
+            emit(Opc::Typeof);
+            ends.push_back(emit(Opc::Jump));
+            patch(no);
+          }
+        }
         if (n->a->kind == NodeKind::Ident && !resolve(n->a->text, &depth, &slot) && !n->a->text.equals("undefined")) {
           emit(Opc::TypeofGlobal, static_cast<int32_t>(constant_string(n->a->text)), 0, n->line);
         } else {
           expression(n->a);
           emit(Opc::Typeof);
         }
+        for (uint64_t i = 0; i < ends.count(); ++i) patch(ends[i]);
         return;
       }
       case Op::Void:
@@ -1676,6 +1734,7 @@ class Compiler {
   bool failed_ = false;
   bool library_ = false;
   bool local_scope_ = false;
+  StringView eval_dynamic_;   // direct eval: the variable that holds the object for the `var`s of a sloppy eval (the calling function's)
   FuncState* eval_parent_ = nullptr;   // direct eval: the innermost of the functions around the call
   bool eval_strict_ = false;
   uint32_t resolved_funcs_ = 0;   // set by resolve(): how many functions out the name was found
