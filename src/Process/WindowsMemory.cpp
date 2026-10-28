@@ -130,6 +130,7 @@ uint32_t vm_allocate(Process& target, uint64_t* base_io, uint64_t* size_io, uint
       if (space->attributes_at(base, &existing) && existing.type == PageAttributes::Mapped) {      // a view: a file's pages are already there; plain memory takes what the view allows
         if (existing.file_view) return kStatusAccessDenied;
         if (page_access(protect) & ~page_access(existing.allocation_protect)) return kStatusInvalidParameter;
+        protect |= existing.allocation_protect & 0x200;      // (a no-cache view stays so)
       }
       if (!space->protect(base, rounded, prot) || !space->set_page_protect(base, rounded, protect, false)) return kStatusConflictingAddresses;
     } else if (!space->map(base, rounded, prot)) {
@@ -217,6 +218,7 @@ uint32_t vm_protect(Process& target, uint64_t* base_io, uint64_t* size_io, uint3
     if (protect == kPageReadWrite) { protect = kPageWriteCopy; prot = kProtRead; }
     else if (protect == kPageExecuteReadWrite) { protect = kPageExecuteWriteCopy; prot = kProtRead | kProtExecute; }
   }
+  if (attributes.type == PageAttributes::Mapped) protect |= attributes.allocation_protect & 0x200;
   if (!space->protect(base, rounded, prot) || !space->set_page_protect(base, rounded, protect, false)) return kStatusConflictingAddresses;
   *base_io = base;
   *size_io = rounded;

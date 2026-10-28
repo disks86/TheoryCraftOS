@@ -882,7 +882,7 @@ uint32_t map_view_in(Process& target, uint32_t id, uint64_t offset, uint64_t* ba
   if (!space->map_shared(base, bytes, prot, storage + offset, owner)) return kStatusConflictingAddresses;
   PageAttributes attributes;
   attributes.type = PageAttributes::Mapped;
-  attributes.protect = attributes.allocation_protect = view_page;
+  attributes.protect = attributes.allocation_protect = view_page | ((info.attributes & 0x10000000u) ? 0x200u : 0u);      // (SEC_NOCACHE shows as PAGE_NOCACHE)
   attributes.file_view = info.file_backed;
   space->set_attributes(base, bytes, attributes);
   *base_in_out = base;
