@@ -437,6 +437,14 @@ add_executable(BOOTX64
   src/Graphics/RenderNodeAccel.cpp
   src/Graphics/Renderer2DSlot.cpp
   src/Graphics/GraphicsPool.cpp
+  src/Graphics/SystemDxg.cpp
+  src/Kernel/Dxgkrnl/VidMm.cpp
+  src/Kernel/Dxgkrnl/D3d9Shader.cpp
+  src/Kernel/Dxgkrnl/D3d9Tgsi.cpp
+  src/Kernel/Dxgkrnl/D3d9Dxbc.cpp
+  src/Kernel/Dxgkrnl/D3d9Devices.cpp
+  src/Kernel/Dxgkrnl/Adapter.cpp
+  src/Kernel/Dxgkrnl/DxgKernel.cpp
   src/Graphics/SystemGraphics.cpp
   src/BootLog.cpp
   src/Desktop/Desktop.cpp
