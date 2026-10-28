@@ -20,6 +20,7 @@
 #include <stdint.h>
 #include "Process/Process.hpp"
 #include "Process/Syscall.hpp"
+#include "Process/WindowsException.hpp"
 
 namespace process::windowsabi {
 
@@ -47,6 +48,11 @@ uint32_t nt_protect_virtual_memory(Process& p, const SyscallRequest& r);
 uint32_t nt_query_virtual_memory(Process& p, const SyscallRequest& r);
 uint32_t nt_read_virtual_memory(Process& p, const SyscallRequest& r);
 uint32_t nt_write_virtual_memory(Process& p, const SyscallRequest& r);
+
+// A page fault on a PAGE_GUARD page: the page gets its protection back. In a thread's stack (`teb` says where it is) the stack grows by a page and the guard moves down (Retry);
+// elsewhere, and when the stack is used up, an exception is raised (STATUS_GUARD_PAGE_VIOLATION, STATUS_STACK_OVERFLOW) described by `info`.
+enum class GuardResult { NotGuard, Retry, Exception };
+GuardResult guard_fault(Process& process, uint64_t teb, uint64_t address, bool write, ExceptionInfo* info);
 
 // What a remote operation does, on the process it was asked of (its lock is held by the caller).
 uint32_t run_remote(Process& target, IProcessRuntime::RemoteOp& op);
