@@ -387,7 +387,7 @@ for each plug and unplug (`take_hotplug()`: the pin, whether a display is connec
 drains the queue after `service_interrupts()` and, for each event, writes a line to the debug console and shows a toast ("A display was connected to output 3 of the Radeon RX Vega M"; "...keeps changing: its hot plug
 detection is switched off" as a warning); at boot the outputs that already have a display are logged. That is all there is to do about it for now: the card's outputs are not part of the desktop (the OS cannot put a
 picture on them: no mode setting without the AtomBIOS command tables for the encoders and PLLs, and no DDC/EDID read of the monitor on the other end), so a plug cannot add a monitor to the desktop's layout. A pin
-is only a number: which physical connector it is (HDMI, DisplayPort) is in the video BIOS's object table, which is not read.
+is only a number: which physical connector it is (HDMI, DisplayPort) is in the video BIOS's object table, which is not read. Not done: the vline interrupt is not enabled (only classified and acknowledged), the audio and DP short-pulse (`DC_HPD_RX_INT`) interrupts; recovery from a fault is above.
 
 ### MSI: interrupts wake the CPU
 
