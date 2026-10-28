@@ -180,7 +180,7 @@ JsObject* DomBindings::wrap(dom::Node* node) {
   JsObject* proto = c.html_proto;
   switch (node->type) {
     case dom::NodeType::Text: proto = c.text_proto; break;
-    case dom::NodeType::Comment: proto = c.comment_proto; break;
+    case dom::NodeType::Comment: proto = node->dom_type == 10 && c.document_type_proto ? c.document_type_proto : c.comment_proto; break;
     case dom::NodeType::Document: proto = c.document_proto; break;
     case dom::NodeType::Fragment: proto = node->shadow_host && c.shadow_root_proto ? c.shadow_root_proto : c.fragment_proto; break;
     default:
@@ -216,7 +216,7 @@ bool DomBindings::install() {
   // The prototypes and objects that only this code holds are kept alive by a hidden global: a collection before the page first used one would free them.
   if (ok) {
     JsObject* kept = vm_.new_array();
-    for (JsObject* o : {c.svg_proto, c.svg_tag_protos, c.node_proto, c.element_proto, c.html_proto, c.character_data_proto, c.text_proto, c.comment_proto, c.document_proto, c.fragment_proto, c.event_proto,
+    for (JsObject* o : {c.svg_proto, c.svg_tag_protos, c.node_proto, c.element_proto, c.html_proto, c.character_data_proto, c.text_proto, c.comment_proto, c.document_type_proto, c.document_proto, c.fragment_proto, c.event_proto,
                         c.token_list_proto, c.style_proto, c.computed_proto, c.storage_proto, c.location_proto, c.history_proto, c.media_query_proto, c.exception_proto,
                         c.canvas_context_proto, c.gradient_proto, c.pattern_proto, c.path2d_proto, c.typed_array_proto, c.image_data_proto, c.text_metrics_proto,
                         c.thenable_proto, c.time_ranges_proto, c.media_error_proto, c.shadow_root_proto, c.tag_protos, c.window_listeners, c.location, c.local_storage, c.session_storage})
