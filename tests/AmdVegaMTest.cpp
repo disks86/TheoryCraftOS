@@ -710,7 +710,7 @@ static void test_display_interrupts() {
   // The pins asked for: DC_HPD_EN (bit 28), the filter (connect 50 ms, disconnect 10 ms << 20), the interrupt on with the polarity for the next change; the others untouched.
   for (uint32_t p = 0; p < 4; ++p) {
     const uint32_t polarity = p == 1 ? 0 : 0x100;   // pin 1 is connected: the next change is a disconnect
-    CHECK(rig.card.gfx.reg(0x189a + 8 * p) == 0x10000000 && rig.card.gfx.reg(0x189c + 8 * p) == (50u | 10u << 20) && rig.card.gfx.reg(0x1899 + 8 * p) == (0x10000 | polarity | 1));
+    CHECK(rig.card.gfx.reg(0x189a + 8 * p) == 0x10000000 && rig.card.gfx.reg(0x189c + 8 * p) == (50u | 10u << 20) && rig.card.gfx.reg(0x1899 + 8 * p) == (0x10000 | polarity | 1 | 0x1000000 | 0x100000));   // (and the short pulse of the pin on, its stale one acknowledged)
   }
   for (uint32_t p = 4; p < 6; ++p) CHECK(rig.card.gfx.reg(0x189a + 8 * p) == 0 && rig.card.gfx.reg(0x1899 + 8 * p) == 0 && rig.card.gfx.reg(0x189c + 8 * p) == 0);
   // The order for a pin: enable, filter, acknowledge, polarity, interrupt on.
@@ -746,7 +746,7 @@ static void test_display_interrupts() {
   rig.card.ih.post(42, 0, 0, 0, 0);
   CHECK(vega.service_interrupts() == 1 && irq.hotplug_count(0) == 2 && !irq.hpd_connected(0) && (rig.card.gfx.reg(0x1899) & 0x100));
   // A pin that does not exist.
-  rig.card.ih.post(42, 6, 0, 0, 0);
+  rig.card.ih.post(42, 12, 0, 0, 0);
   CHECK(vega.service_interrupts() == 1 && irq.count(AmdIrq::Kind::DisplayHotplug) == 2 && irq.count(AmdIrq::Kind::Unknown) == 1);
 
   // A pin that keeps interrupting is switched off after kHotplugStormLimit events (pin 2: DISP_INTERRUPT_STATUS_CONTINUE2 bit 17).
@@ -1370,6 +1370,66 @@ static void test_hotplug_events() {
   CHECK(throttled_events == 1);
 }
 
+// The DisplayPort short pulse (source 42, data 6..11 for pins 0..5): switched on for the watched pins (DC_HPD_INT_CONTROL bit 24), pending in DC_HPD_INT_STATUS bit 8, acknowledged with
+// DC_HPD_INT_CONTROL bit 20, counted per pin, not a hot plug; a pin that will not stop has it switched off; off at shutdown. (Register bits are literal.)
+static void test_hpd_rx() {
+  Rig rig;
+  AmdVegaM vega(rig.alloc);
+  AmdVegaM::Inputs in = rig.inputs();
+  in.hpd_pins = 0x0F;
+  CHECK(vega.bring_up(in));
+  if (!vega.up()) return;
+  const AmdIrq& irq = *vega.irq();
+  for (uint32_t pin = 0; pin < 6; ++pin) CHECK(((rig.card.gfx.reg(0x1899 + 8 * pin) & 0x1000000) != 0) == (pin < 4));
+  // The classification: data 6..11 are the pulses of pins 0..5, 0..5 the plugs, the rest nothing.
+  for (uint32_t data = 0; data < 14; ++data) {
+    AmdIh3::Vector v;
+    v.src_id = 42;
+    v.src_data = data;
+    const AmdIrq::Event e = AmdIrq::classify(v);
+    if (data < 6) CHECK(e.kind == AmdIrq::Kind::DisplayHotplug && e.pin == data);
+    else if (data < 12) CHECK(e.kind == AmdIrq::Kind::DisplayHpdRx && e.pin == data - 6);
+    else CHECK(e.kind == AmdIrq::Kind::Unknown);
+  }
+  for (uint32_t pin = 0; pin < 4; ++pin) rig.card.gfx.set_reg(0x1899 + 8 * pin, rig.card.gfx.reg(0x1899 + 8 * pin) & ~0x100000u);   // (the stale acknowledge of bring-up is not what is looked for)
+  // A pulse on pin 2 with the status bit set: acknowledged (bit 20 of that pin's control register only), counted for that pin, no hot plug event.
+  rig.card.gfx.set_reg(0x1898 + 16, 0x100);
+  rig.card.ih.post(42, 8, 0, 0, 0);
+  AmdVegaM::HotplugEvent e;
+  CHECK(vega.service_interrupts() == 1 && irq.hpd_rx_count(2) == 1 && irq.count(AmdIrq::Kind::DisplayHpdRx) == 1 && !vega.take_hotplug(&e));
+  CHECK((rig.card.gfx.reg(0x1899 + 16) & 0x100000) && !(rig.card.gfx.reg(0x1899 + 8) & 0x100000) && !(rig.card.gfx.reg(0x1899) & 0x100000));
+  CHECK(irq.hpd_rx_count(0) == 0 && irq.hpd_rx_count(1) == 0 && irq.hotplug_count(2) == 0 && vega.connected_pins() == 0);
+  // The status bit is not set: nothing is counted or acknowledged.
+  rig.card.gfx.set_reg(0x1898 + 8, 0);
+  rig.card.ih.post(42, 7, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && irq.hpd_rx_count(1) == 0 && !(rig.card.gfx.reg(0x1899 + 8) & 0x100000));
+  // A plug on the same pin is still a plug (it needs the other status bit), and the short pulse's bit does not make it one.
+  rig.card.ih.post(42, 2, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && irq.hotplug_count(2) == 0 && !vega.take_hotplug(&e));
+  // A pulse on a pin that does not exist is nothing (data 12 and up).
+  rig.card.ih.post(42, 12, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && irq.count(AmdIrq::Kind::DisplayHpdRx) == 1);
+  // The pin that will not stop: switched off after kHpdRxStormLimit pulses, once, the others untouched; the count stops there.
+  rig.card.gfx.set_reg(0x1898 + 24, 0x100);
+  for (uint32_t i = 0; i < AmdIrq::kHpdRxStormLimit; ++i) {
+    rig.card.ih.post(42, 9, 0, 0, 0);
+    vega.service_interrupts();
+  }
+  CHECK(!irq.hpd_rx_throttled(3) && (rig.card.gfx.reg(0x1899 + 24) & 0x1000000));   // (the limit itself is allowed)
+  rig.card.ih.post(42, 9, 0, 0, 0);
+  vega.service_interrupts();
+  CHECK(irq.hpd_rx_throttled(3) && !(rig.card.gfx.reg(0x1899 + 24) & 0x1000000));
+  for (uint32_t i = 0; i < 9; ++i) {
+    rig.card.ih.post(42, 9, 0, 0, 0);
+    vega.service_interrupts();
+  }
+  CHECK(irq.hpd_rx_throttled(3) && !irq.hpd_rx_throttled(2) && !(rig.card.gfx.reg(0x1899 + 24) & 0x1000000) && (rig.card.gfx.reg(0x1899 + 16) & 0x1000000));
+  CHECK(irq.hpd_rx_count(3) == AmdIrq::kHpdRxStormLimit + 10);
+  // Shutting down switches the rest off.
+  vega.shutdown();
+  for (uint32_t pin = 0; pin < 4; ++pin) CHECK(!(rig.card.gfx.reg(0x1899 + 8 * pin) & 0x1000000));
+}
+
 // A video BIOS image with the object table of a board with eDP on pin 0, HDMI on pin 1 and a DisplayPort on pin 2 (literal offsets: ROM header 0x100, master data table 0x200 with the
 // GPIO_Pin_LUT at 0x300 and the Object_Header at 0x400, the paths at 0x440, the connector objects at 0x500, their records at 0x580).
 static std::vector<uint8_t> make_connector_vbios() {
@@ -1466,6 +1526,7 @@ int main() {
   test_card_reset();
   test_post_after_reset();
   test_hotplug_events();
+  test_hpd_rx();
   test_hotplug_connectors();
   printf(g_failed ? "AmdVegaMTest: %d FAILED\n" : "AmdVegaMTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;

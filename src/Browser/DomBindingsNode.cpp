@@ -21,6 +21,7 @@
 #include "Browser/DomBindingsInternal.hpp"
 #include "Browser/Renderer.hpp"
 #include "Browser/Url.hpp"
+#include "Dom/Entities.hpp"
 #include "Dom/HtmlBuilder.hpp"
 #include "Dom/Selector.hpp"
 #include "Utility/Move.hpp"
@@ -156,9 +157,9 @@ dom::Node* nodes_to_fragment(Vm& vm, const Value* args, uint32_t argc) {
       }
       continue;
     }
-    String text(vm.allocator());
-    if (!arg_text(vm, args[i], &text)) return nullptr;
-    dom::Node* t = doc.create_text(text.view());
+    JsString* text = nullptr;
+    if (!vm.to_string(args[i], &text)) return nullptr;   // (null is "null")
+    dom::Node* t = doc.create_text(text->view());
     if (!t || dom::append_child(fragment, t) != dom::DomError::None) {
       throw_dom_error(vm, dom::DomError::OutOfMemory);
       return nullptr;
@@ -304,16 +305,21 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
   // --- every node
   if (IS("nodeType")) { *out = num_value(n->dom_type ? n->dom_type : static_cast<int>(n->type)); return true; }
   if (IS("target") && n->dom_type == 7) { *out = str_value(vm, n->name.view()); return true; }
+  if (n->dom_type == 10) {   // a doctype
+    if (IS("name")) { *out = str_value(vm, n->name.view()); return true; }
+    if (IS("publicId")) { *out = str_value(vm, n->data.view()); return true; }
+    if (IS("systemId")) { *out = str_value(vm, n->qname.view()); return true; }
+  }
   if (IS("nodeName")) {
     *out = element ? tag_name_value(vm, n) : str_value(vm, n->name.view());
     return true;
   }
   if (IS("nodeValue")) {
-    *out = n->is_text() || n->type == dom::NodeType::Comment ? str_value(vm, n->data.view()) : Value::make_null();
+    *out = (n->is_text() || n->type == dom::NodeType::Comment) && n->dom_type != 10 ? str_value(vm, n->data.view()) : Value::make_null();
     return true;
   }
   if (IS("textContent")) {
-    if (document) *out = Value::make_null();
+    if (document || n->dom_type == 10) *out = Value::make_null();
     else {
       String text(vm.allocator());
       dom::text_content(n, &text);
@@ -395,8 +401,8 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
     *out = str_value(vm, all.view());
     return true;
   }
-  if ((n->is_text() || n->type == dom::NodeType::Comment) && IS("length")) { *out = num_value(static_cast<double>(utf16_length(n->data.view()))); return true; }
-  if ((n->is_text() || n->type == dom::NodeType::Comment) && IS("data")) { *out = str_value(vm, n->data.view()); return true; }
+  if ((n->is_text() || n->type == dom::NodeType::Comment) && n->dom_type != 10 && IS("length")) { *out = num_value(static_cast<double>(utf16_length(n->data.view()))); return true; }
+  if ((n->is_text() || n->type == dom::NodeType::Comment) && n->dom_type != 10 && IS("data")) { *out = str_value(vm, n->data.view()); return true; }
   // --- documents
   if (document) {
     if (IS("documentElement")) { *out = node_value(c, n->owner->document_element()); return true; }
@@ -424,19 +430,10 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
     if (IS("characterSet") || IS("charset") || IS("inputEncoding")) { *out = str_value(vm, "UTF-8"); return true; }
     if (IS("contentType")) { *out = str_value(vm, n->owner->content_type.empty() ? StringView("text/html") : n->owner->content_type.view()); return true; }
     if (IS("compatMode")) { *out = str_value(vm, n->owner->quirks_mode ? "BackCompat" : "CSS1Compat"); return true; }
-    if (IS("doctype")) {   // a page that began with <!DOCTYPE ...> has one: the built-in script makes the object
+    if (IS("doctype")) {   // the doctype node among the children of the document
       *out = Value::make_null();
-      Value make;
-      if ((n->owner->has_doctype || !n->owner->quirks_mode) && (n->owner->content_type.empty() || n->owner->content_type.view() == StringView("text/html")) && vm.get_named(Value::make_object(vm.global()), "__doctype_of", &make) && Vm::is_callable(make)) {
-        const Value arg[3] = {node_value(c, n), n->owner->has_doctype ? str_value(vm, n->owner->doctype_name.view()) : str_value(vm, "html"), n->owner->has_doctype ? str_value(vm, n->owner->doctype_public.view()) : str_value(vm, "")};
-        const Value sys = n->owner->has_doctype ? str_value(vm, n->owner->doctype_system.view()) : str_value(vm, "");
-        const Value all[4] = {arg[0], arg[1], arg[2], sys};
-        if (!vm.call(make, Value(), all, 4, out)) {
-          String ignored(vm.allocator());
-          vm.take_exception(&ignored);
-          *out = Value::make_null();
-        }
-      }
+      for (dom::Node* d = n->first_child; d; d = d->next)
+        if (d->dom_type == 10) { *out = node_value(c, d); break; }
       return true;
     }
     if (IS("defaultView")) { *out = n->owner == &c.doc ? Value::make_object(vm.global()) : Value::make_null(); return true; }   // (a document made by DOMParser or createHTMLDocument has no window)
@@ -895,7 +892,7 @@ NATIVE(node_compare_position) {
   while (ra->parent) ra = ra->parent;
   while (rb->parent) rb = rb->parent;
   if (a == b) mask = 0;
-  else if (ra != rb) mask = 1 | 32;
+  else if (ra != rb) mask = 1 | 32 | (ra < rb ? 2 : 4);   // (disconnected: an order that is the same every time)
   else if (dom::contains(a, b)) mask = 16 | 4;
   else if (dom::contains(b, a)) mask = 8 | 2;
   else mask = dom::compare_order(a, b) < 0 ? 4 : 2;
@@ -1295,12 +1292,19 @@ NATIVE(collection_named) {
 
 // --- Methods: documents ----------------------------------------------------------------------------------------------------
 
+// The Name production of XML: what a name of an element or an attribute is made of (the start characters, then also digits, '-', '.', and the combining marks).
+bool name_start_char(uint32_t c) {
+  return c == ':' || (c >= 'A' && c <= 'Z') || c == '_' || (c >= 'a' && c <= 'z') || (c >= 0xC0 && c <= 0xD6) || (c >= 0xD8 && c <= 0xF6) || (c >= 0xF8 && c <= 0x2FF) ||
+         (c >= 0x370 && c <= 0x37D) || (c >= 0x37F && c <= 0x1FFF) || (c >= 0x200C && c <= 0x200D) || (c >= 0x2070 && c <= 0x218F) || (c >= 0x2C00 && c <= 0x2FEF) ||
+         (c >= 0x3001 && c <= 0xD7FF) || (c >= 0xF900 && c <= 0xFDCF) || (c >= 0xFDF0 && c <= 0xFFFD) || (c >= 0x10000 && c <= 0xEFFFF);
+}
+bool name_char(uint32_t c) { return name_start_char(c) || c == '-' || c == '.' || (c >= '0' && c <= '9') || c == 0xB7 || (c >= 0x300 && c <= 0x36F) || (c >= 0x203F && c <= 0x2040); }
 bool valid_tag_name(StringView t) {
   if (t.empty()) return false;
-  for (uint64_t i = 0; i < t.size(); ++i) {
-    const char ch = t[i];
-    const bool ok = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9' && i > 0) || ch == '-' || ch == '_' || ch == '.' || ch == ':';
-    if (!ok) return false;
+  for (uint64_t i = 0; i < t.size();) {
+    const bool first = i == 0;
+    const uint32_t cp = dom::next_code_point(t, &i);
+    if (first ? !name_start_char(cp) : !name_char(cp)) return false;
   }
   return true;
 }
@@ -1308,7 +1312,9 @@ bool valid_tag_name(StringView t) {
 NATIVE(doc_create_element) {
   dom::Node* d = this_node(vm, self);
   String tag(vm.allocator());
-  if (!d || !arg_text(vm, arg_at(args, argc, 0), &tag)) return false;
+  JsString* tag_text = nullptr;
+  if (!d || !vm.to_string(arg_at(args, argc, 0), &tag_text)) return false;   // (null is "null" and undefined is "undefined": both are names)
+  tag.assign(tag_text->view());
   if (!valid_tag_name(tag.view())) return throw_dom(vm, "InvalidCharacterError", "The tag name provided is not a valid name.");
   dom::Node* e = d->owner->create_element(tag.view());
   if (!e) return throw_dom_error(vm, dom::DomError::OutOfMemory);
@@ -1449,6 +1455,33 @@ NATIVE(illegal_constructor) { return vm.throw_error(ErrorKind::TypeError, "Illeg
 NATIVE(event_target_constructor) {
   if (!self.is_object() || self.as_object() == vm.global() || node_of(self)) return vm.throw_error(ErrorKind::TypeError, "Failed to construct 'EventTarget': Please use the 'new' operator.");
   *result = self;
+  return true;
+}
+
+// new Text(data), new Comment(data), new DocumentFragment(): nodes of the document of the page
+NATIVE(text_constructor) {
+  DomBindings::Impl& c = impl(vm);
+  JsString* data = nullptr;
+  if (argc > 0 && !args[0].is_undefined() && !vm.to_string(args[0], &data)) return false;
+  dom::Node* t = c.doc.create_text(data ? data->view() : StringView());
+  if (!t) return throw_dom_error(vm, dom::DomError::OutOfMemory);
+  *result = node_value(c, t);
+  return true;
+}
+NATIVE(comment_constructor) {
+  DomBindings::Impl& c = impl(vm);
+  JsString* data = nullptr;
+  if (argc > 0 && !args[0].is_undefined() && !vm.to_string(args[0], &data)) return false;
+  dom::Node* t = c.doc.create_comment(data ? data->view() : StringView());
+  if (!t) return throw_dom_error(vm, dom::DomError::OutOfMemory);
+  *result = node_value(c, t);
+  return true;
+}
+NATIVE(fragment_constructor) {
+  DomBindings::Impl& c = impl(vm);
+  dom::Node* f = c.doc.create_fragment();
+  if (!f) return throw_dom_error(vm, dom::DomError::OutOfMemory);
+  *result = node_value(c, f);
   return true;
 }
 
@@ -1794,6 +1827,7 @@ bool install_nodes(DomBindings::Impl& c) {
   c.character_data_proto = vm.new_object(c.node_proto);   // (CharacterData: what Text and Comment are)
   c.text_proto = vm.new_object(c.character_data_proto);
   c.comment_proto = vm.new_object(c.character_data_proto);
+  c.document_type_proto = vm.new_object(c.node_proto);
   c.document_proto = vm.new_object(c.node_proto);
   c.fragment_proto = vm.new_object(c.node_proto);
   vm.define_named(g, "__event_target_proto", Value::make_object(event_target), 0);
@@ -1871,8 +1905,8 @@ bool install_nodes(DomBindings::Impl& c) {
   static const struct {
     const char* name;
     int value;
-  } kConstants[] = {{"ELEMENT_NODE", 1}, {"ATTRIBUTE_NODE", 2}, {"TEXT_NODE", 3}, {"CDATA_SECTION_NODE", 4}, {"PROCESSING_INSTRUCTION_NODE", 7}, {"COMMENT_NODE", 8},
-                    {"DOCUMENT_NODE", 9}, {"DOCUMENT_TYPE_NODE", 10}, {"DOCUMENT_FRAGMENT_NODE", 11}, {"DOCUMENT_POSITION_DISCONNECTED", 1}, {"DOCUMENT_POSITION_PRECEDING", 2},
+  } kConstants[] = {{"ELEMENT_NODE", 1}, {"ATTRIBUTE_NODE", 2}, {"TEXT_NODE", 3}, {"CDATA_SECTION_NODE", 4}, {"ENTITY_REFERENCE_NODE", 5}, {"ENTITY_NODE", 6}, {"PROCESSING_INSTRUCTION_NODE", 7}, {"COMMENT_NODE", 8},
+                    {"DOCUMENT_NODE", 9}, {"DOCUMENT_TYPE_NODE", 10}, {"DOCUMENT_FRAGMENT_NODE", 11}, {"NOTATION_NODE", 12}, {"DOCUMENT_POSITION_DISCONNECTED", 1}, {"DOCUMENT_POSITION_PRECEDING", 2},
                     {"DOCUMENT_POSITION_FOLLOWING", 4}, {"DOCUMENT_POSITION_CONTAINS", 8}, {"DOCUMENT_POSITION_CONTAINED_BY", 16}, {"DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC", 32}};
   for (const auto& k : kConstants) {
     vm.define_named(node_ctor, k.name, num_value(k.value), 0);
@@ -1950,13 +1984,14 @@ bool install_nodes(DomBindings::Impl& c) {
     }
   }
   make_class(c, "CharacterData", illegal_constructor, c.character_data_proto);
-  make_class(c, "Text", illegal_constructor, c.text_proto);
+  make_class(c, "Text", text_constructor, c.text_proto);
   make_class(c, "CDATASection", illegal_constructor, vm.new_object(c.text_proto));
   make_class(c, "ProcessingInstruction", illegal_constructor, vm.new_object(c.character_data_proto));
-  make_class(c, "Comment", illegal_constructor, c.comment_proto);
+  make_class(c, "Comment", comment_constructor, c.comment_proto);
+  make_class(c, "DocumentType", illegal_constructor, c.document_type_proto);
   make_class(c, "Document", illegal_constructor, dp);
   make_class(c, "HTMLDocument", illegal_constructor, vm.new_object(dp));   // (the interface of the document of a page: it inherits from Document)
-  make_class(c, "DocumentFragment", illegal_constructor, c.fragment_proto);
+  make_class(c, "DocumentFragment", fragment_constructor, c.fragment_proto);
   c.shadow_root_proto = vm.new_object(c.fragment_proto);
   make_class(c, "ShadowRoot", illegal_constructor, c.shadow_root_proto);
   {

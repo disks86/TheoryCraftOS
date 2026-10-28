@@ -117,6 +117,8 @@ class Document {
   Node* create_element(StringView tag);                 // (the name is lowercased)
   Node* create_text(StringView data);
   Node* create_comment(StringView data);
+  // A doctype: a comment node with dom_type 10 (name is the doctype's name, data its public identifier, qname its system identifier).
+  Node* create_doctype(StringView name, StringView public_id, StringView system_id);
   Node* create_fragment();
   Node* by_serial(uint32_t serial) const { return serial >= 1 && serial <= nodes_.count() ? nodes_[serial - 1] : nullptr; }
   uint32_t node_count() const { return static_cast<uint32_t>(nodes_.count()); }

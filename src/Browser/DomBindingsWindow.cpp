@@ -886,10 +886,16 @@ NATIVE(make_node) {
   (void)self;
   dom::Node* d = node_of(arg_at(args, argc, 0));
   double kind = 0;
-  String name(vm.allocator()), data(vm.allocator());
-  if (!vm.to_number(arg_at(args, argc, 1), &kind) || !arg_text(vm, arg_at(args, argc, 2), &name) || !arg_text(vm, arg_at(args, argc, 3), &data)) return false;
+  String name(vm.allocator()), data(vm.allocator()), system(vm.allocator());
+  if (!vm.to_number(arg_at(args, argc, 1), &kind) || !arg_text(vm, arg_at(args, argc, 2), &name) || !arg_text(vm, arg_at(args, argc, 3), &data) || !arg_text(vm, arg_at(args, argc, 4), &system)) return false;
   *result = Value::make_null();
   if (!d) return true;
+  if (kind == 10) {   // a doctype: name, public identifier (data), system identifier
+    dom::Node* t = d->owner->create_doctype(name.view(), data.view(), system.view());
+    if (!t) return throw_dom_error(vm, dom::DomError::OutOfMemory);
+    *result = node_value(impl(vm), t);
+    return true;
+  }
   dom::Node* n = kind == 7 ? d->owner->create_comment(data.view()) : d->owner->create_text(data.view());
   if (!n) return throw_dom_error(vm, dom::DomError::OutOfMemory);
   n->dom_type = kind == 7 ? 7 : 4;
@@ -1165,7 +1171,7 @@ bool install_window(DomBindings::Impl& c) {
   vm.define_native(g, "__set_content_type", set_content_type, 2);
   vm.define_native(g, "__detach_buffer", detach_buffer, 1);
   vm.define_native(g, "__set_attr_ns", set_attr_ns, 4);
-  vm.define_native(g, "__make_node", make_node, 4);
+  vm.define_native(g, "__make_node", make_node, 5);
   vm.define_native(g, "__attr_ns", attr_ns, 2);
   vm.define_native(g, "__cookie_details", cookie_details, 1);
   vm.define_native(g, "__cookie_write", cookie_write, 1);

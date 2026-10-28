@@ -387,12 +387,20 @@ for each plug and unplug (`take_hotplug()`: the pin, whether a display is connec
 drains the queue after `service_interrupts()` and, for each event, writes a line to the debug console and shows a toast ("A display was connected to HDMI-A-1 of the Radeon RX Vega M"; "Hot plug detection of DP-1 on the Radeon RX Vega M is switched off: it
 kept changing" as a warning); at boot the outputs that already have a display are logged. That is all there is to do about it for now: the card's outputs are not part of the desktop (the OS cannot put a
 picture on them: no mode setting without the AtomBIOS command tables for the encoders and PLLs, and no DDC/EDID read of the monitor on the other end), so a plug cannot add a monitor to the desktop's layout. Which connector a pin is
-on comes from the video BIOS (next section); without one, or for a pin it does not list, the text says "output 2". Not done: the audio and DP short-pulse (`DC_HPD_RX_INT`) interrupts; recovery from a fault is above.
+on comes from the video BIOS (next section); without one, or for a pin it does not list, the text says "output 2". Not done: the audio interrupts; recovery from a fault is above.
 
 The vertical line interrupt is enabled like the vertical blank: `AmdVegaM::set_vline_interrupt(true)` sets `LB_INTERRUPT_MASK.VLINE_INTERRUPT_MASK` (bit 4, `dce_v11_0_set_crtc_vline_interrupt_state`; `amd_dce11::Interrupts::set_vline`) of the
 controller that shows the OS's framebuffer, and only that one; it is refused without an engaged display, independent of the vblank bit (neither touches the other), and switched off when the display is given back or the card
 stopped. The handler acknowledges with `LB_VLINE_STATUS.VLINE_ACK` when `DISP_INTERRUPT_STATUS*` says it is pending, and counts per controller (`AmdIrq::vline_count`). Like the driver, nothing programs which line it comes at.
 It has no user in the OS yet (nothing needs a mid-frame callback); a test (`test_vline_interrupt`) covers enable, bits kept, independence from vblank, ack, counting and the off paths.
+
+The DisplayPort short pulse (a sink's status change that is not a plug: link loss, a request to retest) arrives as source 42 with data 6..11 (`VISLANDS30_IV_EXTID_HPD_RX_A..F`, pins 0..5), `AmdIrq::Kind::DisplayHpdRx`.
+`AmdVegaM::bring_up` switches it on for the watched pins after `hpd_init` (`DC_HPD_INT_CONTROL.DC_HPD_RX_INT_EN`, a stale pulse acknowledged first) and `hpd_fini` off. A vector counts when `DC_HPD_INT_STATUS.DC_HPD_RX_INT_STATUS`
+says it is pending; it is acknowledged (`DC_HPD_RX_INT_ACK`), counted per pin (`AmdIrq::hpd_rx_count`), shown to the event observer, and is not a hot plug (no `HotplugEvent`, `connected_pins` unchanged). A pin that pulses more
+than `kHpdRxStormLimit` (256) times has the interrupt switched off (`hpd_rx_throttled`). **Provenance:** the ids come from `ivsrcid_vislands30.h`, the bits from `dce_11_2_sh_mask.h` (both checked by
+`check_irq_port.py`), but the kernel's `dce_v11_0.c` never uses the pulse; the way to enable, read and acknowledge it is that of the DC display code (`dce110_irq_service.c`), written here from memory of it, not checked
+against its source. **What is not done with it:** a real handler reads the sink's DPCD over the AUX channel (link status, automated test request) and retrains; there is no AUX channel or mode setting here, so the pulse is only
+counted.
 
 ### Connector names from the video BIOS's object table
 

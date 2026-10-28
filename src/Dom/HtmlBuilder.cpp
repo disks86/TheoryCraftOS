@@ -1852,6 +1852,7 @@ class TreeBuilder {
     doc_.doctype_name.assign(t.name.view());
     doc_.doctype_public.assign(pub);
     doc_.doctype_system.assign(sys);
+    if (Node* dt = doc_.create_doctype(t.name.view(), pub, sys)) put(doc_.root(), nullptr, dt);
   }
 
   void mode_initial(Token& t) {

@@ -40,6 +40,7 @@
 #include "Desktop/FileDialog.hpp"
 #include "Desktop/MediaPlayer.hpp"
 #include "Desktop/Calculator.hpp"
+#include "Desktop/Calendar.hpp"
 #include "Desktop/FileProperties.hpp"
 #include "Desktop/Notepad.hpp"
 #include "Media/AudioData.hpp"
@@ -2342,7 +2343,7 @@ static void test_start_menu_search() {
     CHECK(d.start_button().open());
     type_char(w, 'C');
     type_char(w, 'A');
-    type_char(w, 'L');                                       // "Calculator" is the first (and only) match
+    type_char(w, 'L');                                       // "Calculator" is the first match ("Calendar" is the other)
     const uint32_t before = d.calculator_count();
     press(w, hardware::key::kEnter);
     CHECK(!d.start_button().open() && d.calculator_count() == before + 1);
@@ -2405,7 +2406,7 @@ static void test_display_settings_entry() {
     using desktop::HardwareGroup;
     Screen screen(a, 800, 600);
     desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
-    CHECK(d.start_button().menu().item_count() == 14);   // Explorer, Computer Manager, Text Editor, Spreadsheet, Database, Web Browser, Terminal, Calculator, Paint, Media Player, 3D Test, About, a line, Shut Down
+    CHECK(d.start_button().menu().item_count() == 15);   // Explorer, Computer Manager, Text Editor, Spreadsheet, Database, Web Browser, Terminal, Calculator, Calendar, Paint, Media Player, 3D Test, About, a line, Shut Down
     FakeInventory inv(a);
     inv.list.add(HardwareGroup::Displays, "Monitor A", "HDMI-1");
     d.set_hardware_inventory(&inv);
@@ -3980,7 +3981,7 @@ static void test_desktop_file_dialog() {
     d.window().layout();
     {
       Rect2D row;
-      CHECK(d.file_dialog().list().item_rect(0, &row));   // "sub", the only folder
+      CHECK(d.file_dialog().list().item_rect(1, &row));   // "sub", after "AppStore" (the desktop keeps the calendar there)
       const Point o = d.file_dialog().list().window_origin();
       click(d.window(), o.x + row.x + 30, o.y + row.y + 5);
       CHECK(d.file_dialog().folder().equals("/"));        // one click only selects it
@@ -6246,6 +6247,22 @@ static void test_calculator() {
     c.press_backspace();
     CHECK(c.display().equals("0"));
 
+    // The numeric keypad types like the main keys (usages 0x59-0x61 are 1-9, 0x62 is 0, 0x63 is ".", 0x57 is +, 0x58 is Enter).
+    c.press_clear();
+    auto keypad = [&](std::initializer_list<uint8_t> usages) {
+      for (uint8_t usage : usages) {
+        KeyArgs args;
+        args.usage = usage;
+        args.character = hardware::key_to_ascii(usage, 0);
+        c.on_key(args);
+      }
+    };
+    keypad({0x59, 0x62, 0x57, 0x5B, 0x58});   // 10+3, Enter
+    CHECK(c.display().equals("13"));
+    c.press_clear();
+    keypad({0x5F, 0x63, 0x5D, 0x56, 0x5A, 0x55, 0x5B, 0x54, 0x5A, 0x58});   // 7.5-2*3/2 left to right
+    CHECK(c.display().equals("8.25"));
+
     // The Start menu opens a calculator; a second one opens a second window.
     desktop::Calculator* c1 = d.open_calculator();
     CHECK(c1 == &d.calculator() && d.calculator_count() == 1 && c1->app_kind() == desktop::Desktop::kAppCalculator);
@@ -6315,6 +6332,112 @@ static void test_calculator_session() {
       d.set_file_system(&fs);
       d.set_settings(&settings);
       CHECK(d.restore_session() == 1 && d.calculator_count() == 2 && d.windows().window_count() == 1);
+    }
+  }
+  CHECK(a.live == 0);
+}
+
+// The calendar: appointments are added and changed with the form, kept in /AppStore/Calendar across a restart, and announced as toasts when their time comes.
+static desktop::DateTime g_calendar_now;
+static bool calendar_clock(void*, desktop::DateTime* out) {
+  *out = g_calendar_now;
+  return true;
+}
+
+static void test_calendar() {
+  TestAllocator a;
+  {
+    filesystem::RamFileSystem fs(a);
+    g_calendar_now = {2026, 10, 27, 14, 5};
+    {
+      Screen screen(a, 1000, 700);
+      desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+      d.set_clock_source(&calendar_clock, nullptr);
+      d.set_file_system(&fs);
+      desktop::Calendar* c = d.open_calendar();
+      CHECK(c == &d.calendar() && d.calendar_count() == 1 && c->app_kind() == desktop::Desktop::kAppCalendar);
+      auto* h = static_cast<gui::TabFrame*>(c->host());
+      CHECK(h && h->title().equals("Calendar"));
+      put(h, {20, 20, 700, 460});
+      d.window().layout();
+      CHECK(c->selected_date() == gui::Date({2026, 10, 27}) && c->event_count() == 0);
+
+      // A day is chosen with the mouse.
+      const gui::Rect2D cell = c->grid().cell_of({2026, 10, 28});
+      CHECK(cell.width > 0);
+      gui::MouseArgs click;
+      click.x = cell.x + 4;
+      click.y = cell.y + 4;
+      click.button = MouseButton::Left;
+      c->grid().on_mouse_down(click);
+      CHECK(c->selected_date() == gui::Date({2026, 10, 28}));
+      c->go_to_today();
+      CHECK(c->selected_date() == gui::Date({2026, 10, 27}));
+
+      // The form: nothing is added without a title.
+      CHECK(!c->add_event() && c->event_count() == 0);
+      c->title_box().set_text("Dentist");
+      c->hour_box().set_value(14);
+      c->minute_box().set_value(30);
+      c->length_box().set_value(45);
+      c->remind_box().set_value(10);
+      CHECK(c->add_event() && c->event_count() == 1 && c->list().item_count() == 1 && c->status().equals("Added."));
+      String cell_text(a);
+      CHECK(c->list().item_text(0, 0, &cell_text) && cell_text.view().equals("14:30"));
+      CHECK(c->list().item_text(0, 1, &cell_text) && cell_text.view().equals("Dentist"));
+      CHECK(c->selected_event() == 0 && c->title_box().text().equals(""));   // (the form is empty again for the next one)
+      c->select_event(0);
+      CHECK(c->title_box().text().equals("Dentist") && c->hour_box().value() == 14 && c->minute_box().value() == 30 && c->length_box().value() == 45 && c->remind_box().value() == 10);
+      c->title_box().set_text("Dentist (moved)");
+      c->hour_box().set_value(15);
+      CHECK(c->update_event() && c->event_count() == 1);
+      CHECK(c->list().item_text(0, 0, &cell_text) && cell_text.view().equals("15:30"));
+      CHECK(d.calendar_store().count() == 1);
+
+      // Other days have their own list.
+      c->select_date({2026, 10, 28});
+      CHECK(c->event_count() == 0 && !c->delete_event() && c->status().equals("Choose an appointment first."));
+      c->select_date({2026, 10, 27});
+      CHECK(c->event_count() == 1);
+      c->select_event(0);
+
+      // Announcements: not before the reminder time, then once.
+      const int64_t start = desktop::local_minutes({2026, 10, 27}, 15, 30);
+      CHECK(d.announce_calendar(start - 11) == 0 && d.toasts().count() == 0);
+      CHECK(d.announce_calendar(start - 10) == 1 && d.toasts().count() == 1);
+      CHECK(d.announce_calendar(start - 9) == 0 && d.toasts().count() == 1);
+    }
+    {
+      // After a restart the appointment is still there, and it is not announced a second time.
+      Screen screen(a, 1000, 700);
+      desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+      g_calendar_now = {2026, 10, 27, 15, 25};
+      d.set_clock_source(&calendar_clock, nullptr);
+      d.set_file_system(&fs);
+      CHECK(d.calendar_store().count() == 1);
+      d.step(1000000);
+      CHECK(d.toasts().count() == 0);
+      desktop::Calendar* c = d.open_calendar();
+      CHECK(c->event_count() == 1);
+      c->select_event(0);
+      CHECK(c->delete_event() && c->event_count() == 0 && d.calendar_store().count() == 0);
+
+      // The desktop looks at the clock by itself: an appointment ten minutes away is announced when the minute comes.
+      c->title_box().set_text("Call");
+      c->hour_box().set_value(15);
+      c->minute_box().set_value(40);
+      c->length_box().set_value(0);
+      c->remind_box().set_value(15);
+      CHECK(c->add_event());
+      g_calendar_now = {2026, 10, 27, 15, 26};
+      d.step(2000000);
+      CHECK(d.toasts().count() == 1);
+    }
+    {
+      Screen screen(a, 1000, 700);
+      desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+      d.set_file_system(&fs);
+      CHECK(d.calendar_store().count() == 1);
     }
   }
   CHECK(a.live == 0);
@@ -7792,6 +7915,7 @@ int main() {
   test_computer_manager_usermode();
   test_explorer_copy_paste_properties();
   test_calculator_session();
+  test_calendar();
   test_media_player();
   if (g_failed) { printf("%d checks failed\n", g_failed); return 1; }
   printf("gui views: all checks passed\n");

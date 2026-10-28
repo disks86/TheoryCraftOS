@@ -38,6 +38,8 @@
 #include "SystemNetworkDetails.hpp"
 #include "SystemWirelessDetails.hpp"
 #include "BootLog.hpp"
+#include "Graphics/Logo/Logo.hpp"
+#include "Utility/AllocatedView.hpp"
 #include "Desktop/Desktop.hpp"
 #include "Graphics/Graphics3D/WebGlAccelerator.hpp"
 #include "Graphics/GraphicsPool.hpp"
@@ -160,6 +162,16 @@ static kernel::Frame* on_vega_interrupt(kernel::Frame* frame, void*) {
 #endif
 
 // Waits up to `microseconds` for a key press (any keyboard we have, else the firmware's input).
+// The logo at the top left of the boot screen, the log below it. Skipped quietly if it cannot be decoded or there is no memory for it.
+static void show_boot_logo(allocators::IAllocator& allocator) {
+  constexpr uint32_t kSize = 128, kBackground = 0x101018;   // (the console's own background)
+  graphics::Logo logo(allocator);
+  ArrayView<uint32_t> pixels = allocate_view<uint32_t>(allocator, uint64_t{kSize} * kSize);
+  if (!pixels.empty() && logo.load(graphics::embedded_logo_png()) && logo.render(kSize, kBackground, pixels))
+    console::show_banner(ArrayView<const uint32_t>(pixels.data(), pixels.size()), kSize, kSize);
+  release_view(allocator, pixels);
+}
+
 static void wait_for_key(efi::SystemTable* st, hardware::SystemInput& input, uint64_t microseconds) {
   const uint64_t start = hardware::uptime_us();
   while (hardware::uptime_us() - start < microseconds) {
@@ -461,6 +473,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       if (gpu->mode_info(i, &m) && m.width == 1024 && m.height == 768 && gpu->set_mode(i)) break;
     }
     console::use_gpu(gpu);
+    show_boot_logo(shared_allocator);
     console::puts("TheoryCraftOS: initializing hardware\n");
     bootlog::replay();  // the mode change cleared what was logged so far
     Entry(Level::Ok, "GPU").text(gpu->name()).text(", ").dec(gpu->width()).text("x").dec(gpu->height()).text(", ").dec(gpu->mode_count()).text(" modes");

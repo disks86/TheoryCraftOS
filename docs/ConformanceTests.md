@@ -28,6 +28,24 @@ PageTest binary (`PAGETEST=path`); the console log of a page is capped at 16 KB,
 | `web_apis_behavior.js` | WPT `geometry`, `encoding`, `WebCryptoAPI`, `hr-time`, `user-timing`, `FileAPI`, `IndexedDB`, `workers`, `eventsource`, `html/semantics` | DOMMatrix/DOMRect, TextEncoder/Decoder, atob/btoa, SubtleCrypto, performance, EventTarget, AbortSignal, Blob/File, Web Storage, Worker, IndexedDB, EventSource, popover, dialog, custom elements, canvas 2D |
 | `dom_nodes.js` … `messaging_streams.js` | WPT `dom`, `url`, `fetch`, `html`, `streams`, … | the earlier suites (see `tests/data/wpt/`) |
 
+## The real web-platform-tests
+
+`tests/run_real_wpt.sh <wpt checkout> <out dir> <dirs...>` runs files of the real [web-platform-tests](https://github.com/web-platform-tests/wpt) (the unmodified
+`testharness.js`, one process per file, 60 seconds each) in `PageTest` (`WPT_ROOT=<checkout> WPT_REAL_FILE=<path>` runs one file and prints `WPT PASS|FAIL <name> :: <message>`
+lines). The checkout can be sparse (`resources common dom url encoding html/dom`). Pages, `.window.js` and `.any.js` files run (not manual, https-only, crash or idlharness files).
+A frame is a page of its own with its own script engine, so tests that reach into `iframe.contentDocument`/`contentWindow` (a large share of the failures below) cannot work
+yet; XML documents and `Document.URL` of foreign documents come from frames in many tests.
+
+Baseline of 2026-10-27 (subtests passed / failed, files that did not finish): `dom/nodes` 2979 / 984 (47), `dom/events` 358 / 317 (10), `dom/ranges` 1741 / 624 (16),
+`dom/traversal` 331 / 39 (2), `dom/collections` 23 / 31, `dom/lists` 31 / 98, `dom/abort` 33 / 4, `url` 1236 / 483 (10), `encoding` 335 / 3231 (76).
+The biggest causes found: no legacy encodings in `TextDecoder`/`TextEncoder` (everything but UTF-8 and UTF-16 fails the `encoding` directory), frames without a reachable
+document, processing instructions (`processing-instruction-attributes`, `Document-createProcessingInstruction`), XML documents (namespaces of `createElement` in them),
+`Document.cloneNode`, `moveBefore`, mutation observer record details, `HTMLCollection` indexed writes in strict mode, attribute name validation.
+Fixed with it: `compareDocumentPosition` of disconnected nodes, `new Text()`/`new Comment()`/`new DocumentFragment()`, element names by the XML `Name` production, `null` in
+`before()`/`after()`/`append()`, the CharacterData methods' argument checks, `Node.ENTITY_NODE` and the other constants, doctypes as real nodes (`document.childNodes`,
+`createDocumentType`, `Document.implementation` of every document, `cloneNode`, serialization) and the order of the checks in `insertBefore`/`replaceChild` ("ensure
+pre-insertion validity", including the rules for a document's doctype and element).
+
 ## Known gaps
 
 A test for something the engines do not do yet is listed with `xfail("name")` before the test. It must still fail; when it starts to pass the

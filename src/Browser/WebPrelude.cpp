@@ -4102,20 +4102,7 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
   method(DP, 'createAttributeNS', function (ns, name) { return makeAttr(String(name), '', null, ns); });
 
   // ------------------------------------------------------------------------------------------------------------------ CharacterData
-  var CD = [TP, Comment.prototype];
-  CD.forEach(function (P) {
-    method(P, 'substringData', function (offset, count) {
-      if (offset > this.data.length) throw dom("Failed to execute 'substringData' on 'CharacterData': The offset " + offset + ' is greater than the node\'s length (' + this.data.length + ').', 'IndexSizeError');
-      return this.data.substr(offset, count);
-    });
-    method(P, 'replaceData', function (offset, count, text) {
-      if (offset > this.data.length) throw dom("Failed to execute 'replaceData' on 'CharacterData': The offset " + offset + ' is greater than the node\'s length (' + this.data.length + ').', 'IndexSizeError');
-      this.data = this.data.slice(0, offset) + String(text) + this.data.slice(offset + count);
-    });
-    method(P, 'appendData', function (text) { this.data = this.data + String(text); });
-    method(P, 'insertData', function (offset, text) { this.replaceData(offset, 0, text); });
-    method(P, 'deleteData', function (offset, count) { this.replaceData(offset, count, ''); });
-  });
+  // (substringData, replaceData and the rest of the data editing methods are on CharacterData.prototype: the finish prelude makes them)
 
   // ------------------------------------------------------------------------------------------------------------------ NodeFilter, TreeWalker, NodeIterator
   var NodeFilter = {
@@ -4513,7 +4500,12 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
       return d;
     },
     createDocument: function (ns, name) { return new DOMParser().parseFromString(name ? '<' + name + '></' + name + '>' : '', 'application/xml'); },
-    createDocumentType: function (name, publicId, systemId) { return { nodeType: 10, name: name, publicId: publicId, systemId: systemId }; }
+    createDocumentType: function (name, publicId, systemId) {
+      if (arguments.length < 3) throw new TypeError("Failed to execute 'createDocumentType' on 'DOMImplementation': 3 arguments required, but only " + arguments.length + ' present.');
+      name = String(name);
+      if (/[\s>\u0000]/.test(name)) throw new DOMException("Failed to execute 'createDocumentType' on 'DOMImplementation': The qualified name provided ('" + name + "') contains the invalid character.", 'InvalidCharacterError');
+      return __make_node((this && this.__doc) || document, 10, name, String(publicId), String(systemId));
+    }
   };
   try { if (doc.implementation === undefined) hide(doc, 'implementation', implementation); } catch (e) { }
   function XMLSerializer() {}
@@ -9434,6 +9426,7 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
       var d = emptyDocument(type);
       try {
         var tree = readXml(src);
+        if (tree.doctype) d.appendChild(d.implementation.createDocumentType(tree.doctype.name, '', ''));
         tree.doc.forEach(function (s) { d.appendChild(build(d, s, {}, type)); });
       } catch (e) {
         if (!(e instanceof ParseError)) throw e;
@@ -9472,6 +9465,7 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
       if (arguments.length < 2) throw typeErr("execute 'createDocument' on 'DOMImplementation'", '2 arguments required, but only ' + arguments.length + ' present.');
       var type = ns === XHTML ? 'application/xhtml+xml' : ns === SVG ? 'image/svg+xml' : 'application/xml';
       var d = emptyDocument(type);
+      if (doctype !== null && doctype !== undefined) d.appendChild(doctype);
       if (qname !== null && qname !== undefined && String(qname) !== '') d.appendChild(d.createElementNS(ns === null || ns === undefined || ns === '' ? null : String(ns), String(qname)));
       return d;
     });
@@ -11771,20 +11765,16 @@ const char kFinishPrelude[] = R"JSPRELUDE((function (g) {
     return new g.DOMParser().parseFromString(String(html), 'text/html');
   });
 
-  // DocumentType: what createDocumentType and document.doctype give is a node of that interface
-  (function () {
-    var DT = need('DocumentType', 'Node');
-    var DI = g.DOMImplementation && g.DOMImplementation.prototype;
-    if (!DI || !DI.createDocumentType || DI.createDocumentType.__dt) return;
-    var create = DI.createDocumentType;
-    var wrapped = function (name, publicId, systemId) {
-      var t = create.apply(this, arguments);
-      if (t && typeof t === 'object' && Object.getPrototypeOf(t) === Object.prototype) Object.setPrototypeOf(t, DT.prototype);
-      return t;
-    };
-    wrapped.__dt = true;
-    def(DI, 'createDocumentType', wrapped);
-    ['name', 'publicId', 'systemId'].forEach(function (n) { G(DT, n, function () { return undefined; }); });
+  ['name', 'publicId', 'systemId'].forEach(function (n) { G(need('DocumentType', 'Node'), n, function () { return undefined; }); });   // (the node answers for them itself)
+
+  (function () {   // every document has an implementation (the one of the page is a property of its document)
+    var DIp = g.DOMImplementation && g.DOMImplementation.prototype, cache = new WeakMap();
+    if (!DIp) return;
+    Object.defineProperty(g.Document.prototype, 'implementation', { get: function () {
+      var i = cache.get(this);
+      if (!i) { i = Object.create(DIp); Object.defineProperty(i, '__doc', { value: this }); cache.set(this, i); }
+      return i;
+    }, enumerable: true, configurable: true });
   }());
 
   // collections: HTMLAllCollection.namedItem, the form and select collections as interfaces over HTMLCollection
