@@ -1649,6 +1649,95 @@ static void test_read_dpcd() {
   CHECK(!vega.read_dpcd(dp, &caps));
 }
 
+// The short pulse of a DisplayPort sink: queued by the interrupt handler, looked at over the AUX channel by service_short_pulses (link lost when the link set up for lanes is not in sync,
+// an automated test request, the other service interrupts, a sink that does not answer, pins that are no DisplayPort connectors).
+static void test_short_pulse_status() {
+  const std::vector<uint8_t> vbios = make_connector_vbios();   // eDP (DDC line 0x92, pin 0), HDMI-A (0x91, pin 1), DisplayPort (0x93, pin 2)
+  Rig rig;
+  FakeAuxCard auxcard;
+  AmdVegaM vega(rig.alloc);
+  AmdVegaM::Inputs in = rig.inputs();
+  in.hpd_pins = 0x3F;
+  in.vbios = ConstByteView(vbios.data(), vbios.size());
+  CHECK(vega.bring_up(in));
+  if (!vega.up()) return;
+  rig.card.aux = &auxcard;
+  std::vector<uint8_t>& dpcd = auxcard.sink.dpcd;
+  dpcd.assign(0x800, 0);
+  dpcd[0x101] = 0x84;       // 4 lanes (the enhanced framing bit above the count is not part of it)
+  dpcd[0x202] = dpcd[0x203] = 0x77;
+  dpcd[0x204] = 0x81;
+  for (uint32_t pin = 0; pin < 6; ++pin) rig.card.gfx.set_reg(0x1899 + 8 * pin, rig.card.gfx.reg(0x1899 + 8 * pin) & ~0x100000u);
+  auto pulse = [&](uint32_t pin) {
+    rig.card.gfx.set_reg(0x1898 + 8 * pin, 0x100);
+    rig.card.ih.post(42, 6 + pin, 0, 0, 0);
+    return vega.service_interrupts();
+  };
+  AmdVegaM::SinkEvent ev[8];
+  CHECK(vega.pending_short_pulses() == 0 && vega.service_short_pulses(ev, 8) == 0 && auxcard.doorbells == 0);
+  // A healthy link: nothing to report but the status
+  CHECK(pulse(2) == 1 && vega.pending_short_pulses() == 4);
+  CHECK(vega.service_short_pulses(ev, 8) == 1 && vega.pending_short_pulses() == 0);
+  CHECK(ev[0].pin == 2 && ev[0].has_connector && ev[0].connector.type == AtomConnectors::Type::DisplayPort && ev[0].checked && !ev[0].read_failed);
+  CHECK(ev[0].lanes == 4 && !ev[0].link_lost && !ev[0].test_request && !ev[0].content_protection && !ev[0].sink_specific && ev[0].status.link_status_updated());
+  CHECK(auxcard.sink.requests.back().channel == 0x93 && auxcard.sink.requests.back().hpd == 2);
+  // Link lost: lane 2 lost its clock recovery
+  dpcd[0x203] = 0x70;
+  CHECK(pulse(2) == 1 && vega.service_short_pulses(ev, 8) == 1 && ev[0].checked && ev[0].link_lost && ev[0].lanes == 4 && !ev[0].test_request);
+  // ... but only for the lanes set up: with 2 lanes the lost lane 2 does not matter, with 3 it does, and a link that was never set up (0 lanes) is not lost
+  dpcd[0x101] = 2;
+  CHECK(pulse(2) == 1 && vega.service_short_pulses(ev, 8) == 1 && !ev[0].link_lost && ev[0].lanes == 2);
+  dpcd[0x101] = 3;
+  CHECK(pulse(2) == 1 && vega.service_short_pulses(ev, 8) == 1 && ev[0].link_lost && ev[0].lanes == 3);
+  dpcd[0x101] = 0;
+  dpcd[0x204] = 0;       // (and a status that would fail any lane: no lanes, nothing to lose)
+  CHECK(pulse(2) == 1 && vega.service_short_pulses(ev, 8) == 1 && !ev[0].link_lost && ev[0].lanes == 0 && ev[0].checked);
+  dpcd[0x204] = 0x81;
+  dpcd[0x101] = 4;
+  dpcd[0x203] = 0x77;
+  // Not aligned: lost
+  dpcd[0x204] = 0x80;
+  CHECK(pulse(2) == 1 && vega.service_short_pulses(ev, 8) == 1 && ev[0].link_lost);
+  dpcd[0x204] = 0x81;
+  // The service interrupts: an automated test request, content protection, sink specific; the link is fine
+  dpcd[0x201] = 0x02;
+  CHECK(pulse(2) == 1 && vega.service_short_pulses(ev, 8) == 1 && ev[0].test_request && !ev[0].content_protection && !ev[0].sink_specific && !ev[0].link_lost);
+  dpcd[0x201] = 0x04;
+  CHECK(pulse(2) == 1 && vega.service_short_pulses(ev, 8) == 1 && !ev[0].test_request && ev[0].content_protection && !ev[0].sink_specific);
+  dpcd[0x201] = 0x40;
+  CHECK(pulse(2) == 1 && vega.service_short_pulses(ev, 8) == 1 && !ev[0].test_request && !ev[0].content_protection && ev[0].sink_specific);
+  dpcd[0x201] = 0;
+  // The eDP panel (pin 0): looked at too, without switching the panel's power
+  CHECK(pulse(0) == 1 && vega.service_short_pulses(ev, 8) == 1 && ev[0].pin == 0 && ev[0].checked && ev[0].connector.type == AtomConnectors::Type::EmbeddedDisplayPort && ev[0].lanes == 4);
+  CHECK(auxcard.sink.requests.back().channel == 0x92 && auxcard.panel_writes == 0);
+  // A sink that does not answer: reported as such, nothing else in the event
+  auxcard.sink.timeouts = 1000;
+  CHECK(pulse(2) == 1 && vega.service_short_pulses(ev, 8) == 1 && ev[0].checked && ev[0].read_failed && ev[0].lanes == 0 && !ev[0].link_lost && !ev[0].test_request);
+  auxcard.sink.timeouts = 0;
+  // ... also when only the status does not come (the DPCD ends before it)
+  dpcd.resize(0x203);
+  CHECK(pulse(2) == 1 && vega.service_short_pulses(ev, 8) == 1 && ev[0].read_failed && ev[0].lanes == 0 && ev[0].status.align == 0);
+  dpcd.resize(0x800);
+  // HDMI (pin 1) is no DisplayPort sink, pin 4 is not in the video BIOS's table: reported, not looked at
+  const size_t asked = auxcard.sink.requests.size();
+  CHECK(pulse(1) == 1 && vega.service_short_pulses(ev, 8) == 1 && ev[0].pin == 1 && ev[0].has_connector && !ev[0].checked && !ev[0].read_failed);
+  CHECK(pulse(4) == 1 && vega.service_short_pulses(ev, 8) == 1 && ev[0].pin == 4 && !ev[0].has_connector && !ev[0].checked);
+  CHECK(auxcard.sink.requests.size() == asked);
+  // Several pending: lowest pin first, as many as there is room for, the rest stays pending; a pin twice is once
+  CHECK(pulse(3) == 1 && pulse(2) == 1 && pulse(0) == 1 && pulse(2) == 1 && vega.pending_short_pulses() == 0xD);
+  CHECK(vega.service_short_pulses(nullptr, 4) == 0 && vega.service_short_pulses(ev, 0) == 0 && vega.pending_short_pulses() == 0xD);
+  CHECK(vega.service_short_pulses(ev, 2) == 2 && ev[0].pin == 0 && ev[1].pin == 2 && vega.pending_short_pulses() == 0x8);
+  CHECK(vega.service_short_pulses(ev, 2) == 1 && ev[0].pin == 3 && vega.pending_short_pulses() == 0);
+  // A pulse whose status bit is not set is no pulse; shutting down drops what is pending
+  rig.card.gfx.set_reg(0x1898 + 16, 0);
+  rig.card.ih.post(42, 8, 0, 0, 0);
+  CHECK(vega.service_interrupts() == 1 && vega.pending_short_pulses() == 0);
+  CHECK(pulse(2) == 1 && vega.pending_short_pulses() == 4);
+  vega.shutdown();
+  CHECK(vega.pending_short_pulses() == 0 && vega.service_short_pulses(ev, 8) == 0);
+  CHECK(auxcard.sink.malformed == 0);
+}
+
 // The connectors in the hot plug events: named from the video BIOS's object table, absent without one or for a pin it does not list.
 static void test_hotplug_connectors() {
   const std::vector<uint8_t> vbios = make_connector_vbios();
@@ -1821,6 +1910,7 @@ int main() {
   test_audio_pins();
   test_read_edid();
   test_read_dpcd();
+  test_short_pulse_status();
   printf(g_failed ? "AmdVegaMTest: %d FAILED\n" : "AmdVegaMTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }
