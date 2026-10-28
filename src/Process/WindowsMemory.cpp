@@ -163,6 +163,8 @@ uint32_t vm_free(Process& target, uint64_t* base_io, uint64_t* size_io, uint32_t
     uint64_t rounded = 0;
     base = AddressSpace::round_down(base);
     if (size == 0 || !AddressSpace::round_up(size, &rounded)) return kStatusInvalidParameter;
+    PageAttributes existing;
+    if (space->attributes_at(base, &existing) && existing.type != PageAttributes::Private) return kStatusInvalidParameter;      // the pages of a view stay committed
     if (!space->protect(base, rounded, 0)) return kStatusUnableToFreeVm;      // decommitted pages become inaccessible (their contents are not cleared)
     space->set_page_protect(base, rounded, kPageNoAccess, true);
     *base_io = base;

@@ -624,7 +624,7 @@ uint32_t nt_create_section(Process& p, const SyscallRequest& r) {
     OpenObject* file = p.files().object(slot);
     if (!file || !p.files().host_path_of(file->path.view(), &host)) return kInvalidHandle;
     fs = p.files().file_system();
-    if (!file->readable) return 0xC0000022u;      // a file that cannot be read cannot be mapped
+    if (!file->readable || file->no_data_access) return 0xC0000022u;      // a file that cannot be read cannot be mapped
     if (!file->writable && (page == kPageReadWrite || page == kPageExecuteReadWrite || page == kPageExecuteRead || page == kPageExecuteWriteCopy)) return 0xC0000022u;      // STATUS_ACCESS_DENIED
     if (size > p.files().size_of(*file) && !file->writable && !(uint32_t(attributes) & 0x1000000u)) return 0xC000004Eu;
   } else if (size == 0) {
@@ -878,6 +878,7 @@ uint32_t unmap_view_in(Process& target, uint64_t address) {
   if (!space) return kNotImplemented;
   uint64_t base = 0, size = 0;
   PageAttributes attributes;
+  if (!space->attributes_at(address, &attributes) || attributes.type == PageAttributes::Private) return kStatusNotMappedView;      // (plain memory is not a view)
   if (space->attributes_at(address, &attributes) && attributes.type == PageAttributes::Image) {      // an image goes with all its pieces
     return space->allocation_base(address, &base) && space->unmap_allocation(base) ? kSuccess : kStatusNotMappedView;      // (any address of an image unmaps all of it)
   }
