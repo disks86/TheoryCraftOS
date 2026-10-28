@@ -30,6 +30,7 @@
 #include "FileSystem/Ram/RamFileSystem.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdVegaM.hpp"
 #include "FakeAmdDce11.hpp"
+#include "FakeAuxSink.hpp"
 #include "FakeI2cMonitor.hpp"
 #include "FakeAmdGfx8.hpp"
 #include "FakeAmdGmc8.hpp"
@@ -98,9 +99,11 @@ struct Card final : IVcnRegisters {
   uint32_t memsize_ones = 0;        // CONFIG_MEMSIZE reads all ones this many more times (the card is in reset)
   bool memsize_never = false;
   FakeI2cMonitor* monitor = nullptr;   // a DDC bus on the pad registers 0x7000..0x7007
+  FakeAuxCard* aux = nullptr;          // an AUX channel on the registers 0x7010..0x7033
   static bool in(uint32_t r, uint32_t lo, uint32_t hi) { return r >= lo && r <= hi; }
   IVcnRegisters& owner(uint32_t r) {
     if (monitor && in(r, 0x7000, 0x7007)) return *monitor;
+    if (aux && in(r, 0x7010, 0x7033)) return *aux;
     if (in(r, 0x3400, 0x37ff)) return sdma;
     if (in(r, 0xe30, 0xe4b) || r == 0x151a || r == 0x151b) return ih;
     if (in(r, 0x500, 0x57f) || in(r, 0x800, 0x82f) || in(r, 0xb00, 0xbff) || r == 0x394 || r == 0x1524 || r == 0x1528 || r == 0x150a) return gmc;
@@ -1436,12 +1439,15 @@ static void test_hpd_rx() {
 // A video BIOS image with the object table of a board with eDP on pin 0, HDMI on pin 1 and a DisplayPort on pin 2 (literal offsets: ROM header 0x100, master data table 0x200 with the
 // GPIO_Pin_LUT at 0x300 and the Object_Header at 0x400, the paths at 0x440, the connector objects at 0x500, their records at 0x580).
 static std::vector<uint8_t> make_connector_vbios() {
-  std::vector<uint8_t> b(0x700, 0);
+  std::vector<uint8_t> b(0x800, 0);
   auto u8 = [&](uint32_t at, uint32_t v) { b[at] = static_cast<uint8_t>(v); };
   auto u16 = [&](uint32_t at, uint32_t v) { u8(at, v); u8(at + 1, v >> 8); };
   u8(0, 0x55); u8(1, 0xAA); u16(0x48, 0x100);
   memcpy(&b[0x104], "ATOM", 4);
+  memcpy(&b[0x30], " 761295520", 10);   // (the ATI signature the interpreter checks)
   u16(0x120, 0x200);
+  u16(0x11E, 0x640);                // the command tables (master list at 0x640): ProcessAuxChannelTransaction, table 78, at 0x700
+  u16(0x200 + 4 + 23 * 2, 0x5C0);   // the indirect I/O programs: none
   u16(0x200 + 4 + 10 * 2, 0x600);   // GPIO_I2C_Info
   u16(0x200 + 4 + 12 * 2, 0x300);
   u16(0x200 + 4 + 22 * 2, 0x400);
@@ -1468,6 +1474,21 @@ static std::vector<uint8_t> make_connector_vbios() {
     for (int k = 0; k < 8; ++k) { u16(at + k * 2, regs[k]); u8(at + 17 + k, bits[k]); }
     u8(at + 16, ddc[i]);
   }
+  // ProcessAuxChannelTransaction: the parameters and the request (scratch words 1 to 5) to the card's registers, the doorbell, then the reply (scratch words 5 to 8, the status and the
+  // length into the second parameter word) back from them; 8 bytes of parameters (PS 0 and 1), as the real table
+  atomimage::Code aux;
+  aux.move(atomimage::REG, FakeAuxCard::kParams1, atomimage::PS, 1);
+  for (uint32_t w = 1; w <= 5; ++w) aux.move(atomimage::REG, FakeAuxCard::kRequest + w, atomimage::FB, w);
+  aux.move(atomimage::REG, FakeAuxCard::kDoorbell, atomimage::PS, 0);
+  for (uint32_t k = 0; k < 4; ++k) aux.move(atomimage::FB, 5 + k, atomimage::REG, FakeAuxCard::kData + k);
+  aux.move(atomimage::PS, 1, atomimage::REG, FakeAuxCard::kStatus, atomimage::BYTE0, 1);
+  aux.move(atomimage::PS, 1, atomimage::REG, FakeAuxCard::kLength, atomimage::BYTE0, 2);
+  aux.eot();
+  u16(0x640 + 4 + 78 * 2, 0x700);
+  u16(0x700, 6 + static_cast<uint32_t>(aux.b.size()));
+  u8(0x704, 8);
+  u8(0x705, 8);
+  for (size_t i = 0; i < aux.b.size(); ++i) u8(0x706 + static_cast<uint32_t>(i), aux.b[i]);
   return b;
 }
 
@@ -1476,6 +1497,7 @@ static void test_read_edid() {
   const std::vector<uint8_t> vbios = make_connector_vbios();   // eDP (DDC line 0x92), HDMI-A (0x91), DisplayPort (0x93)
   Rig rig;
   FakeI2cMonitor monitor;
+  FakeAuxCard auxcard;
   monitor.edid = make_edid(1);
   rig.card.monitor = &monitor;
   AmdVegaM vega(rig.alloc);
@@ -1493,9 +1515,25 @@ static void test_read_edid() {
   CHECK(edp.has_ddc && edp.ddc_id == 0x92 && hdmi.has_ddc && hdmi.ddc_id == 0x91 && dp.has_ddc && dp.ddc_id == 0x93);
   // HDMI: read over the pads of the bus the video BIOS names
   CHECK(vega.read_edid(hdmi, &out) && out.size() == 256 && memcmp(out.view().data(), monitor.edid.data(), 256) == 0);
-  // DisplayPort and eDP: the AUX channel, not done; nothing is touched
+  // DisplayPort and eDP: I2C over the AUX channel, through the video BIOS's table; the DDC pads are not touched, and the table is told the connector's line and hot plug pin
   const uint32_t writes = monitor.writes;
-  CHECK(!vega.read_edid(dp, &out) && !vega.read_edid(edp, &out) && monitor.writes == writes);
+  CHECK(!vega.read_edid(dp, &out) && !vega.read_edid(edp, &out) && auxcard.doorbells == 0);   // (no sink on the AUX registers yet: the table's reads give zeros)
+  rig.card.aux = &auxcard;
+  auxcard.sink.edid = make_edid(1);
+  auxcard.sink.edid[20] ^= 0x55;     // (a different monitor, so that the answers can be told apart)
+  uint8_t sum = 0;
+  for (size_t i = 0; i < 127; ++i) sum = static_cast<uint8_t>(sum + auxcard.sink.edid[i]);
+  auxcard.sink.edid[127] = static_cast<uint8_t>(0 - sum);
+  CHECK(vega.read_edid(dp, &out) && out.size() == 256 && memcmp(out.view().data(), auxcard.sink.edid.data(), 256) == 0);
+  CHECK(!auxcard.sink.requests.empty() && auxcard.sink.requests.front().channel == 0x93 && auxcard.sink.requests.front().hpd == 2);
+  auxcard.sink.requests.clear();
+  CHECK(vega.read_edid(edp, &out) && out.size() == 256 && memcmp(out.view().data(), auxcard.sink.edid.data(), 256) == 0);
+  CHECK(!auxcard.sink.requests.empty() && auxcard.sink.requests.front().channel == 0x92 && auxcard.sink.requests.front().hpd == 0);
+  CHECK(auxcard.sink.malformed == 0 && auxcard.sink.outside_transaction == 0 && monitor.writes == writes);
+  auxcard.sink.monitor_present = false;
+  CHECK(!vega.read_edid(dp, &out));
+  auxcard.sink.monitor_present = true;
+  CHECK(vega.read_edid(dp, &out));
   // no DDC line in the connector, or a line the GPIO table does not have
   AtomConnectors::Connector no_ddc = hdmi;
   no_ddc.has_ddc = false;
@@ -1503,6 +1541,10 @@ static void test_read_edid() {
   AtomConnectors::Connector unknown = hdmi;
   unknown.ddc_id = 0x77;
   CHECK(!vega.read_edid(unknown, &out) && monitor.writes == writes);
+  AtomConnectors::Connector unknown_dp = dp;
+  unknown_dp.ddc_id = 0x77;
+  const size_t aux_requests = auxcard.sink.requests.size();
+  CHECK(!vega.read_edid(unknown_dp, &out) && auxcard.sink.requests.size() == aux_requests);
   // nothing connected: nothing answers
   monitor.present = false;
   CHECK(!vega.read_edid(hdmi, &out));

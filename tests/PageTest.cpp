@@ -2646,6 +2646,23 @@ static void test_iframe() {
     CHECK(page_text(page, 60).find("quiet") != std::string::npos);
   }
   CHECK(a.live == 0);
+  {   // the document and window of a frame, reached from the page around it (and the other way)
+    FakeEnvironment env(a);
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><iframe id=f srcdoc=\"<p id=p class=c>inner</p><ul><li>a<li>b</ul><script>window.answer = 42; function twice(x) { return x * 2 }</script>\"></iframe><script>"
+              "var f = document.getElementById('f'), d = f.contentDocument, w = f.contentWindow;"
+              "console.log(d !== null, d === f.contentDocument, d.getElementById('p').textContent, d.querySelectorAll('li').length, d.body.children.length);"
+              "console.log(w.answer, w.twice(21), w.document === d, d.getElementById('p').className, d.defaultView === w);"
+              "d.getElementById('p').textContent = 'changed'; d.title = 'T';"
+              "console.log(d.getElementById('p').textContent, d.title, [].map.call(d.querySelectorAll('li'), function(e) { return e.textContent }).join(), 'answer' in w, 'nope' in w);"
+              "try { d.createElement('') } catch (e) { console.log(e.name, e instanceof DOMException) }"
+              "w.callback = function(x) { return 'from parent ' + x };"
+              "console.log(w.eval('callback(7)'), w.parent === window, Object.keys(d.getElementById('p').dataset).length);"
+              "</script></body></html>");
+    CHECK(page_log(page) == "true true inner 2 3 | 42 42 true c true | changed T a,b true false | InvalidCharacterError true | from parent 7 true 0");
+  }
+  CHECK(a.live == 0);
   {   // following a link in a frame moves the frame
     FakeEnvironment env(a);
     env.files["http://example.com/next.html"] = "<p>the next page</p>";
@@ -6041,7 +6058,8 @@ static void test_wpt() {
 // harness results are printed as "WPT ..." lines. .html and .htm are pages; .window.js and .any.js get the page that wpt serves for them (META: script lines included).
 static int run_real_wpt(const char* root, const char* file) {
   auto read_all = [](const std::string& path) { std::string s; if (FILE* f = fopen(path.c_str(), "rb")) { int c; while ((c = fgetc(f)) != EOF) s.push_back(static_cast<char>(c)); fclose(f); } return s; };
-  const std::string path = file, source = read_all(std::string(root) + "/" + path);
+  const std::string whole = file;   // (a variant of the test is named as file?query: the file is read without the query, the page has it)
+  const std::string path = whole.substr(0, whole.find('?')), source = read_all(std::string(root) + "/" + path);
   if (source.empty()) { printf("WPTDONE MISSING no such file\n"); return 1; }
   auto ends = [&](const char* suffix) { const size_t n = strlen(suffix); return path.size() >= n && path.compare(path.size() - n, n, suffix) == 0; };
   std::string html = source;
@@ -6062,7 +6080,9 @@ static int run_real_wpt(const char* root, const char* file) {
   {
     FakeEnvironment env(a);
     MediaEnvironment media;
-    Page page(a, env, (std::string("https://app.example/") + path).c_str(), media, true);
+    Page page(a, env, (std::string("https://app.example/") + whole).c_str(), media, true);
+    // a conformance page may build tens of thousands of tests (WPT_BUDGET: millions of instructions, WPT_MEMORY: megabytes)
+    page.set_script_limits(static_cast<uint64_t>(getenv("WPT_BUDGET") ? atof(getenv("WPT_BUDGET")) : 200) * 1000000, static_cast<uint64_t>(getenv("WPT_MEMORY") ? atof(getenv("WPT_MEMORY")) : 768) * (1u << 20));
     // the bytes of the file are read the way a browser reads a page: by the charset of its Content-Type (the .headers file next to it), a byte order mark or a <meta>
     const std::string headers = read_all(std::string(root) + "/" + path + ".headers");
     std::string content_type;
@@ -6085,10 +6105,11 @@ static int run_real_wpt(const char* root, const char* file) {
       if (!page.next_timer(&due)) break;
       if (due > env.clock) env.clock = static_cast<uint64_t>(due);
       page.run_due_timers(env.clock);
-      const std::string log(page.log().data(), page.log().size());
-      if (log.find("WPTDONE") != std::string::npos) break;
+      if (!env.console_lines.empty() && env.console_lines.back().compare(0, 7, "WPTDONE") == 0) break;
     }
-    const std::string log(page.log().data(), page.log().size());
+    // (the page keeps only the start of its log: what the reporter wrote is read from the console)
+    std::string log;
+    for (const std::string& line : env.console_lines) log += line + "\n";
     printf("%s", log.c_str());
     if (log.find("WPTDONE") == std::string::npos) printf("WPTDONE NOFINISH the harness did not finish (%u script errors, clock %llu)\n", page.errors(), static_cast<unsigned long long>(env.clock));
   }

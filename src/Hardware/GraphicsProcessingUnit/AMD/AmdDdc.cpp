@@ -24,19 +24,6 @@
 
 namespace hardware {
 
-namespace {
-constexpr uint8_t kEdidHeader[8] = {0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00};
-constexpr uint32_t kExtensionCountAt = 126;
-
-bool block_ok(ConstByteView block, bool base) {
-  if (block.size() != AmdDdc::kBlockBytes) return false;
-  if (base && !block.first(8).equals(ConstByteView(kEdidHeader, sizeof kEdidHeader))) return false;
-  uint8_t sum = 0;
-  for (uint8_t b : block) sum = static_cast<uint8_t>(sum + b);
-  return sum == 0;
-}
-}  // namespace
-
 void AmdDdc::delay_us(uint32_t us) {
   const uint64_t start = clock_.now_us();
   while (clock_.now_us() - start < us) {
@@ -189,57 +176,9 @@ bool AmdDdc::transfer(ArrayView<Message> messages) {
   return ok;
 }
 
-bool AmdDdc::read_block(uint32_t block, ByteView out) {
-  // drm_do_probe_ddc_edid: the segment pointer (for blocks from 2 on, a segment is two blocks), the offset within it, then the read
-  uint8_t segment = static_cast<uint8_t>(block / 2);
-  uint8_t offset = static_cast<uint8_t>(block % 2 * kBlockBytes);
-  Message messages[3];
-  uint32_t count = 0;
-  if (block > 1) {
-    messages[count].address = kSegmentAddress;
-    messages[count].data = ByteView(&segment, 1);
-    ++count;
-  }
-  messages[count].address = kEdidAddress;
-  messages[count].data = ByteView(&offset, 1);
-  ++count;
-  messages[count].address = kEdidAddress;
-  messages[count].read = true;
-  messages[count].data = out;
-  ++count;
-  return transfer(ArrayView<Message>(messages, count));
-}
-
 bool AmdDdc::read_edid(ByteBuffer* out) {
   if (!bus_.valid) return false;
-  uint8_t base[kBlockBytes] = {};
-  bool have_base = false;
-  for (uint32_t attempt = 0; attempt < kTries && !have_base; ++attempt)
-    have_base = read_block(0, ByteView(base, kBlockBytes)) && block_ok(ConstByteView(base, kBlockBytes), true);
-  if (!have_base) return false;
-  out->clear();
-  if (!out->append(ConstByteView(base, kBlockBytes))) return false;
-  const uint32_t extensions = base[kExtensionCountAt] < kMaxExtensions ? base[kExtensionCountAt] : kMaxExtensions;
-  uint32_t kept = 0;
-  for (uint32_t block = 1; block <= extensions; ++block) {
-    uint8_t data[kBlockBytes] = {};
-    bool good = false;
-    for (uint32_t attempt = 0; attempt < kTries && !good; ++attempt)
-      good = read_block(block, ByteView(data, kBlockBytes)) && block_ok(ConstByteView(data, kBlockBytes), false);
-    if (good) {
-      if (!out->append(ConstByteView(data, kBlockBytes))) return false;
-      ++kept;
-    }
-  }
-  // The base block says how many extensions follow: made true (and its checksum with it) when blocks were left out or not asked for, as drm_do_get_edid does.
-  if (kept != base[kExtensionCountAt]) {
-    const ByteView first = out->writable_view().first(kBlockBytes);
-    first[kExtensionCountAt] = static_cast<uint8_t>(kept);
-    uint8_t sum = 0;
-    for (uint32_t i = 0; i + 1 < kBlockBytes; ++i) sum = static_cast<uint8_t>(sum + first[i]);
-    first[kBlockBytes - 1] = static_cast<uint8_t>(0 - sum);
-  }
-  return true;
+  return i2c_edid::read(*this, out);
 }
 
 }  // namespace hardware

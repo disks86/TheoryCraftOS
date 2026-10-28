@@ -3702,17 +3702,139 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
   }
   function windowProxy(id) {
     if (id === windowId) return g;
-    if (proxies[id]) return proxies[id];
-    var p = {};
-    hide(p, '__window', id);
-    p.closed = false;
-    method(p, 'postMessage', function (message, second, third) {
-      if (arguments.length < 1) throw typeError("execute 'postMessage' on 'Window'", "1 argument required, but only 0 present.");
-      postMessageTo(id, message, second, third);
-    });
-    proxies[id] = p;
+    return remoteObject(id, 0, 'o');
+  }
+
+  // ------------------------------------------------------------------------------------------------------------------- objects of other windows
+  // Every window (the page, each of its frames) has a script engine of its own. An object of another window is reached through a stand-in (a Proxy) whose
+  // operations are sent to that window's script as text (__window_request) and done there on the real object. Values cross as [kind, ...]: primitives by value,
+  // objects and functions as [kind, handle, window]. The objects handed out stay in a table for as long as the page.
+  var served = [g], servedIds = new Map(), remotes = new Map(), infoKey = '\u0001window-object';   // (a stand-in tells what it stands for when asked for this key: a WeakMap keyed by one would run its traps)
+  var wellKnown = ['iterator', 'toPrimitive', 'toStringTag', 'hasInstance', 'asyncIterator', 'isConcatSpreadable', 'species'];
+  function handleOf(o) {
+    var h = servedIds.get(o);
+    if (h === undefined && (o === g.window || o === g.self || o === g.globalThis)) h = 0;   // (the global object under its other names)
+    if (h === undefined) { h = served.length; served.push(o); servedIds.set(o, h); }
+    return h;
+  }
+  function keyOut(k) {
+    if (typeof k !== 'symbol') return String(k);
+    for (var i = 0; i < wellKnown.length; i++) if (Symbol[wellKnown[i]] === k) return '@@' + wellKnown[i];
+    return null;
+  }
+  function keyIn(k) { return k.length > 2 && k.charAt(0) === '@' && k.charAt(1) === '@' && wellKnown.indexOf(k.slice(2)) >= 0 ? Symbol[k.slice(2)] : k; }
+  function crossOut(v) {
+    switch (typeof v) {
+      case 'undefined': case 'symbol': return ['u'];
+      case 'boolean': return ['b', v];
+      case 'number': return ['d', Object.is(v, -0) ? '-0' : String(v)];
+      case 'bigint': return ['i', String(v)];
+      case 'string': return ['s', v];
+    }
+    if (v === null) return ['n'];
+    var info = v[infoKey];
+    if (info && typeof info.window === 'number') return [info.kind, info.handle, info.window];
+    return [typeof v === 'function' ? 'f' : 'o', handleOf(v), windowId];
+  }
+  function crossIn(a) {
+    switch (a[0]) {
+      case 'u': return undefined;
+      case 'n': return null;
+      case 'b': case 's': return a[1];
+      case 'd': return Number(a[1]);
+      case 'i': return BigInt(a[1]);
+      case 'k': return a[1];
+    }
+    return a[2] === windowId ? served[a[1]] : remoteObject(a[2], a[1], a[0]);
+  }
+  function remoteFailure(r) {
+    var e;
+    if (r[1] === 'DOMException') e = new DOMException(r[2], r[3]);
+    else { var C = g[r[1]]; e = typeof C === 'function' && /Error$/.test(r[1]) ? new C(r[2]) : new Error(r[2]); }
+    return e;
+  }
+  function ask(window, request) {
+    var text = __window_request(window, JSON.stringify(request));
+    if (text === undefined) return undefined;
+    var r = JSON.parse(text);
+    if (r[0] === 'x') throw remoteFailure(r);
+    return r;
+  }
+  function remoteCall(info, op, k, args) {
+    var r = ask(info.window, [op, info.handle, k, args || []]);
+    return r === undefined ? ['u'] : r;
+  }
+  function remoteHandler(kind) {   // (one handler for all stand-ins of a kind: the target of a stand-in holds what it stands for, so a page with thousands of them stays small)
+    return {
+      get: function (t, k) {
+        var info = t.info;
+        if (k === infoKey) return info;
+        if (typeof k === 'symbol' && keyOut(k) === null) return undefined;
+        if (info.handle === 0 && k === 'postMessage') return info.post;
+        return crossIn(remoteCall(info, 'get', keyOut(k)));
+      },
+      set: function (t, k, v) { var key = keyOut(k); if (key !== null) remoteCall(t.info, 'set', key, [crossOut(v)]); return true; },
+      has: function (t, k) { var key = keyOut(k); return key === null ? false : crossIn(remoteCall(t.info, 'has', key)); },
+      deleteProperty: function (t, k) { var key = keyOut(k); return key === null ? true : crossIn(remoteCall(t.info, 'delete', key)); },
+      ownKeys: function (t) {
+        var names = crossIn(remoteCall(t.info, 'keys', ''));
+        if (kind === 'f' && names.indexOf('prototype') < 0) names.push('prototype');
+        return names;
+      },
+      getOwnPropertyDescriptor: function (t, k) {
+        if (kind === 'f' && k === 'prototype') return Object.getOwnPropertyDescriptor(t, k);
+        var key = keyOut(k);
+        if (key === null || !crossIn(remoteCall(t.info, 'has', key))) return undefined;
+        return { value: crossIn(remoteCall(t.info, 'get', key)), writable: true, enumerable: true, configurable: true };
+      },
+      apply: function (t, self, args) { return crossIn(remoteCall(t.info, 'call', '', [crossOut(self)].concat(args.map(crossOut)))); },
+      construct: function (t, args) { return crossIn(remoteCall(t.info, 'new', '', args.map(crossOut))); }
+    };
+  }
+  var remoteHandlers = { o: null, f: null };
+  function remoteObject(window, handle, kind) {
+    var key = window + ':' + handle;
+    var have = remotes.get(key);
+    if (have) return have;
+    var info = { window: window, handle: handle, kind: kind, post: null };
+    if (handle === 0) {   // the window itself: postMessage is ours to send
+      info.post = function (message, second, third) {
+        if (arguments.length < 1) throw typeError("execute 'postMessage' on 'Window'", "1 argument required, but only 0 present.");
+        postMessageTo(window, message, second, third);
+      };
+    }
+    var target = kind === 'f' ? function () {} : {};
+    target.info = info;
+    if (!remoteHandlers[kind]) remoteHandlers[kind] = remoteHandler(kind);
+    var p = new Proxy(target, remoteHandlers[kind]);
+    remotes.set(key, p);
     return p;
   }
+  hide(g, '__window_serve', function (text) {
+    var req = JSON.parse(text), op = req[0], target = served[req[1]], key = req[2] === '' ? '' : keyIn(req[2]), args = req[3].map(crossIn), out;
+    try {
+      switch (op) {
+        case 'get': out = crossOut(target[key]); break;
+        case 'set': target[key] = args[0]; out = ['u']; break;
+        case 'has': out = ['b', key in Object(target)]; break;
+        case 'delete': out = ['b', delete target[key]]; break;
+        case 'keys': out = ['k', Object.keys(Object(target))]; break;
+        case 'call': out = crossOut(Function.prototype.apply.call(target, args[0], args.slice(1))); break;
+        case 'new': out = crossOut(Reflect.construct(target, args)); break;
+        default: out = ['u'];
+      }
+    } catch (e) {
+      var isObj = e !== null && (typeof e === 'object' || typeof e === 'function');
+      out = ['x', isObj && e.constructor && e.constructor.name || 'Error', isObj && 'message' in e ? String(e.message) : String(e), isObj && e.name ? String(e.name) : 'Error'];
+    }
+    return JSON.stringify(out);
+  });
+  hide(g, '__frame_document', function (id) {
+    var r;
+    try { r = ask(id, ['get', 0, 'document', []]); } catch (e) { return null; }
+    var d = r === undefined ? null : crossIn(r);
+    return d === undefined ? null : d;
+  });
   hide(g, '__window_proxy', windowProxy);
   hide(g, 'postMessage', function (message, second, third) {
     if (arguments.length < 1) throw typeError("execute 'postMessage' on 'Window'", "1 argument required, but only 0 present.");

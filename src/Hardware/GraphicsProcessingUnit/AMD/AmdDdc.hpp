@@ -21,6 +21,7 @@
 #include "Allocators/IAllocator.hpp"
 #include "Hardware/Clock/IClock.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AtomI2c.hpp"
+#include "Hardware/GraphicsProcessingUnit/AMD/I2cEdid.hpp"
 #include "Hardware/VideoCodec/AMD/AmdVcn1.hpp"
 #include "Utility/ArrayView.hpp"
 #include "Utility/ByteBuffer.hpp"
@@ -32,28 +33,23 @@ namespace hardware {
 // algorithm (i2c-algo-bit.c) with a 10 us bit time and the 2.2 ms clock stretching limit that amdgpu sets (VESA's). The EDID is read as drm_do_get_edid does: block 0 at address 0x50 offset
 // 0 (a write of the offset, a repeated start, a read), checked (header and checksum, four tries), then its extension blocks (the segment pointer at 0x30 for blocks from 2 on).
 //
-// Not the DisplayPort connectors': their "DDC" is the AUX channel (I2C over AUX, with the AtomBIOS command table ProcessAuxChannelTransaction), which is not done.
+// Not the DisplayPort connectors': their "DDC" is the AUX channel (I2C over AUX, with the AtomBIOS command table ProcessAuxChannelTransaction): AmdAux.
 // And differences, because the lines are an untrusted device's: the extension blocks are limited to kMaxExtensions, a block that never checks is left out rather than kept, and no wait is
 // longer than the stretch limit.
-class AmdDdc {
+class AmdDdc final : public II2cBus {
  public:
   static constexpr uint32_t kHalfPeriodUs = 5;            // i2c-algo-bit: (udelay + 1) / 2 with amdgpu's udelay of 10
   static constexpr uint32_t kStretchTimeoutUs = 2200;     // bit.timeout = usecs_to_jiffies(2200), "from VESA"
-  static constexpr uint8_t kEdidAddress = 0x50, kSegmentAddress = 0x30;
-  static constexpr uint32_t kBlockBytes = 128, kTries = 4, kMaxExtensions = 3;
+  static constexpr uint8_t kEdidAddress = i2c_edid::kEdidAddress, kSegmentAddress = i2c_edid::kSegmentAddress;
+  static constexpr uint32_t kBlockBytes = i2c_edid::kBlockBytes, kTries = i2c_edid::kTries, kMaxExtensions = i2c_edid::kMaxExtensions;
 
   AmdDdc(IVcnRegisters& registers, const IClock& clock, const AtomI2c::Bus& bus) : r_(registers), clock_(clock), bus_(bus) {}
 
   // The whole EDID (the base block and the extension blocks that checked) into *out, replacing it. False if the bus is not valid or block 0 never checked.
   bool read_edid(ByteBuffer* out);
 
-  // The bus level: one message of an I2C transfer. Messages follow each other with a repeated start; the transfer ends with a stop (also when it fails).
-  struct Message {
-    uint8_t address = 0;      // 7 bits
-    bool read = false;
-    ByteView data;            // what to write, or where to read to
-  };
-  bool transfer(ArrayView<Message> messages);
+  // The bus level: one transfer of messages (II2cBus). The transfer ends with a stop (also when it fails).
+  bool transfer(ArrayView<Message> messages) override;
 
  private:
   void pre_xfer();
@@ -72,7 +68,6 @@ class AmdDdc {
   void stop();
   bool send_byte(uint8_t value);      // true if acknowledged
   uint8_t receive_byte(bool acknowledge);
-  bool read_block(uint32_t block, ByteView out);
 
   IVcnRegisters& r_;
   const IClock& clock_;
