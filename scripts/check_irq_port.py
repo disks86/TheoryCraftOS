@@ -148,10 +148,21 @@ def check_video(ivs, uvd, vce, vce_d, vce_m, hpp, cpp):
         fail('AmdVce3.cpp does not enable the trap interrupt')
 
 
+def ordered(text, needles):
+    at = 0
+    for n in needles:
+        i = text.find(n, at)
+        if i < 0:
+            return False
+        at = i + len(n)
+    return True
+
+
 def check_display(dce, vid, hpp, cpp, ivs):
     """The display interrupts: source ids and data decoding of dce_v11_0.c against AmdIrq, the acknowledgements and pin set-up against AmdDce11.cpp (whose register numbers are generated
     from the headers), and the register block offsets of vid.h."""
     dcpp = open(os.path.join(ROOT, 'AmdDce11.cpp')).read()
+    hpp_dce = open(os.path.join(ROOT, 'AmdDce11.hpp')).read()
     sw = function_body(dce, 'dce_v11_0_sw_init')
     if 'AMDGPU_IRQ_CLIENTID_LEGACY, i + 1, &adev->crtc_irq' not in sw or 'i = VISLANDS30_IV_SRCID_D1_GRPH_PFLIP; i < 20; i += 2' not in sw or \
             'VISLANDS30_IV_SRCID_HOTPLUG_DETECT_A, &adev->hpd_irq' not in sw:
@@ -171,6 +182,22 @@ def check_display(dce, vid, hpp, cpp, ivs):
             fail(field + ' is not used with DC_HPD_INT_CONTROL')
     if 'DC_HPD_INT_STATUS__DC_HPD_RX_INT_STATUS_MASK' not in dcpp:
         fail('the short pulse status bit')
+    # the audio endpoints: eight for CHIP_VEGAM, the offsets of vid.h, the index/data pair, the rule for "connected"
+    audio_init = function_body(dce, 'dce_v11_0_audio_init')
+    if not re.search(r'case CHIP_POLARIS10:\s*case CHIP_VEGAM:\s*adev->mode_info.audio.num_pins = 8;', audio_init) or 'kMaxPins = 8' not in hpp_dce:
+        fail('the number of audio endpoints')
+    offsets = [int(a, 16) - 0x17a8 for a in re.findall(r'AUD\d_REGISTER_OFFSET\s+\(0x([0-9a-f]+) - 0x17a8\)', vid)]
+    mine = [int(a, 16) - 0x17a8 for a in re.findall(r'0x([0-9a-f]+) - 0x17a8', re.search(r'kAudioPinOffsets\[[^\]]*\] = \{([^}]*)\}', dcpp).group(1))]
+    if offsets != mine or len(offsets) != 8:
+        fail('audio endpoint offsets')
+    rd = function_body(dce, 'dce_v11_0_audio_endpt_rreg')
+    if not ordered(rd, ['WREG32(mmAZALIA_F0_CODEC_ENDPOINT_INDEX + block_offset, reg)', 'RREG32(mmAZALIA_F0_CODEC_ENDPOINT_DATA + block_offset)']) or \
+            not ordered(re.sub(r'\s+', ' ', dcpp[dcpp.index('uint32_t AudioPins::endpoint_read'):]), ['mmAZALIA_F0_CODEC_ENDPOINT_INDEX + kAudioPinOffsets[pin], reg', 'mmAZALIA_F0_CODEC_ENDPOINT_DATA + kAudioPinOffsets[pin]']):
+        fail('the audio endpoint register pair')
+    con = function_body(dce, 'dce_v11_0_audio_get_connected_pins')
+    if 'ixAZALIA_F0_CODEC_PIN_CONTROL_RESPONSE_CONFIGURATION_DEFAULT' not in con or ') == 1)' not in con or 'connected = false' not in con or 'ixAZALIA_F0_CODEC_PIN_CONTROL_RESPONSE_CONFIGURATION_DEFAULT' not in dcpp or \
+            'kPortConnectivityNone = 1' not in hpp_dce or 'port_connectivity(pin) != kPortConnectivityNone' not in dcpp:
+        fail('the connected rule of the audio endpoints')
     # (the pageflip source ids start at VISLANDS30_IV_SRCID_D1_GRPH_PFLIP, the hot plug at HOTPLUG_DETECT_A: read from the ivsrcid header by the checks above for the others)
     crtc = function_body(dce, 'dce_v11_0_crtc_irq')
     if 'unsigned crtc = entry->src_id - 1;' not in crtc or 'case 0: /* vblank */' not in crtc or 'case 1: /* vline */' not in crtc:

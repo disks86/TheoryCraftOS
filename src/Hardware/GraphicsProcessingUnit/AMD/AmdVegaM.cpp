@@ -266,6 +266,7 @@ bool AmdVegaM::bring_up(const Inputs& in) {
   hotplug_head_ = hotplug_count_ = hotplug_dropped_ = 0;
   for (uint32_t pin = 0; pin < amd_dce11::Interrupts::kMaxHpd; ++pin)
     if ((in.hpd_pins >> pin & 1) && display_irq_->hpd_sense(pin)) connected_pins_ |= 1u << pin;
+  audio_pins_ = amd_dce11::AudioPins(*in.registers).connected_mask(kAudioPins);   // (dce_v11_0_audio_get_connected_pins)
   step_ = Step::Done;
 
   status_.assign("GART ");
@@ -286,6 +287,7 @@ void AmdVegaM::shutdown() {
   }
   display_irq_ = UniquePointer<amd_dce11::Interrupts>();
   connected_pins_ = 0;
+  audio_pins_ = 0;
   hotplug_head_ = hotplug_count_ = 0;
   display_ = UniquePointer<amd_dce11::Display>();   // (puts the firmware's framebuffer back)
   if (up()) {   // (amdgpu_irq_put in the blocks' hw_fini, before the engines stop)
@@ -390,6 +392,21 @@ uint32_t AmdVegaM::service_interrupts(uint32_t max_vectors) {
   const uint32_t handled = irq_->process(*ih_, this, max_vectors);
   if (inputs_.auto_recover && recoveries_ < kMaxRecoveries && wedged()) recover();
   return handled;
+}
+
+uint32_t AmdVegaM::refresh_audio_pins() {
+  if (!up() || !inputs_.registers) return audio_pins_ = 0;
+  return audio_pins_ = amd_dce11::AudioPins(*inputs_.registers).connected_mask(kAudioPins);
+}
+
+uint32_t AmdVegaM::audio_outputs(AtomConnectors::Connector* out, uint32_t capacity) const {
+  uint32_t n = 0;
+  for (const AtomConnectors::Connector& c : connectors()) {
+    if (!AtomConnectors::carries_audio(c.type) || c.hpd_pin >= amd_dce11::Interrupts::kMaxHpd || !(connected_pins_ >> c.hpd_pin & 1)) continue;
+    if (n < capacity) out[n] = c;
+    ++n;
+  }
+  return n < capacity ? n : capacity;
 }
 
 bool AmdVegaM::take_hotplug(HotplugEvent* out) {

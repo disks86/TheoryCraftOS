@@ -402,6 +402,17 @@ than `kHpdRxStormLimit` (256) times has the interrupt switched off (`hpd_rx_thro
 against its source. **What is not done with it:** a real handler reads the sink's DPCD over the AUX channel (link status, automated test request) and retrains; there is no AUX channel or mode setting here, so the pulse is only
 counted.
 
+### Audio endpoints
+
+`amd_dce11::AudioPins` (`dce_v11_0_audio_endpt_rreg`, `dce_v11_0_audio_get_connected_pins`) reads the display engine's eight audio endpoints (CHIP_VEGAM, like Polaris 10): each has an index/data register pair
+(`AZALIA_F0_CODEC_ENDPOINT_INDEX`/`DATA`, 0x17a8/0x17a9 plus 4 per endpoint) and, at index 0x56, its default pin configuration, whose port connectivity field (bits 31:30) is 1 when the endpoint has no physical
+connection; any other value counts as connected, as in the driver. `AmdVegaM::audio_pins_connected()` is that mask as of bring-up (`refresh_audio_pins()` reads again). **Which output an endpoint serves is not fixed:** the driver
+hands an encoder the first connected endpoint (`dce_v11_0_audio_get_pin`), and the encoder-to-endpoint link is made only when a mode is set, which this OS does not do. So the mask says how many displays could have audio
+and the connector names come from the other side: `audio_outputs()` lists the connectors that carry audio (HDMI-A, HDMI-B, DisplayPort; `AtomConnectors::carries_audio`) and have a display on their hot plug pin now. The boot
+log shows both ("audio: 5 of 8 endpoints with a port", "audio output with a display: HDMI-A-1"). This is a reading of the hardware's state, not an audio path: nothing here drives the endpoints (the card's HD Audio function is
+a separate PCI device, polled by the HD Audio driver). `scripts/check_irq_port.py` checks the endpoint count, offsets, register pair order and the connected rule; `test_audio_pins` covers the mask, the names, a display leaving,
+refresh, shutdown, no video BIOS and out-of-range endpoints under the sanitizers. Nothing seen on the real machine: the endpoints' default configuration may read as "connected" for all eight until a mode is set.
+
 ### Connector names from the video BIOS's object table
 
 `AtomConnectors` (`AtomConnectors.*`) reads what the card's outputs are: a port of the connector part of `amdgpu_atombios_get_connector_info_from_object_table` with `amdgpu_atombios_lookup_gpio` and
