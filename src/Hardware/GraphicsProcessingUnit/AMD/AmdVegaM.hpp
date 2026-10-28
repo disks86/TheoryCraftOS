@@ -32,6 +32,7 @@
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdIrq.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdSdma3.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AtomBios.hpp"
+#include "Hardware/GraphicsProcessingUnit/AMD/AtomConnectors.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdSmu7Ucode.hpp"
 #include "Hardware/Mmio.hpp"
 #include "Hardware/RegisterMapper.hpp"
@@ -154,15 +155,19 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
   void set_event_observer(AmdIrq::ISink* observer) { observer_ = observer; }
   // Hot plug. The pins the card watches (Inputs::hpd_pins) report a display being plugged in or pulled out through the interrupt ring (AmdIrq); service_interrupts() turns that into
   // events for whoever wants to react, queued here (the oldest are dropped when more than kMaxHotplugEvents wait, and counted). `connected_pins()` is the state: bit n set when pin n
-  // senses a display, as of bring-up and the events since. Which connector a pin is on is in the video BIOS's object table, which is not read, so a pin is just a number.
+  // senses a display, as of bring-up and the events since. Which connector a pin is on is in the video BIOS's object table (AtomConnectors), read at bring-up when Inputs::vbios is set:
+  // an event carries the connector, so that it can say "HDMI-A-1" and not "output 2"; without a video BIOS, or for a pin the table does not list, `has_connector` is false.
   struct HotplugEvent {
     uint32_t pin = 0;
     bool connected = false;
+    bool has_connector = false;
+    AtomConnectors::Connector connector;
     bool throttled = false;   // the pin interrupted so often that it was switched off (AmdIrq::kHotplugStormLimit): no more events from it
   };
   static constexpr uint32_t kMaxHotplugEvents = 16;
   bool take_hotplug(HotplugEvent* out);
   uint32_t connected_pins() const { return connected_pins_; }
+  ArrayView<const AtomConnectors::Connector> connectors() const { return ArrayView<const AtomConnectors::Connector>(connectors_, connector_count_); }
   uint32_t hotplug_events_dropped() const { return hotplug_dropped_; }
 
   // Recovery. An engine that timed out on a fence or reported a fault is wedged: nothing more is queued on it. recover() resets the ones that are - the graphics engine with its
@@ -221,6 +226,8 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
   int vblank_crtc_ = -1;
   uint32_t recoveries_ = 0, asic_resets_ = 0;
   HotplugEvent hotplug_[kMaxHotplugEvents];
+  AtomConnectors::Connector connectors_[AtomConnectors::kMaxConnectors];
+  uint32_t connector_count_ = 0;
   uint32_t hotplug_head_ = 0, hotplug_count_ = 0, hotplug_dropped_ = 0, connected_pins_ = 0, throttle_reported_ = 0;
   AmdIrq::ISink* observer_ = nullptr;
   UniquePointer<AmdGfx8Compute> compute_;

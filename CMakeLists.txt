@@ -665,6 +665,7 @@ add_executable(BOOTX64
   src/Hardware/Bus/Pci/PciMsi.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdVbios.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AtomBios.cpp
+  src/Hardware/GraphicsProcessingUnit/AMD/AtomConnectors.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdAsicReset.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdIrq.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdSdma3.cpp

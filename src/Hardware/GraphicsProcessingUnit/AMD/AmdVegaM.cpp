@@ -117,6 +117,7 @@ bool AmdVegaM::bring_up(const Inputs& in) {
     if (in.vbios.size() != 0 && !vbios_.append(in.vbios)) return fail(Step::None, "out of memory");
   }
   inputs_.vbios = vbios_.view();
+  connector_count_ = AtomConnectors::parse(inputs_.vbios, ArrayView<AtomConnectors::Connector>(connectors_, AtomConnectors::kMaxConnectors));
   if (!in.registers || !in.clock || !in.file_system || !in.allocator || !in.mapper || in.aperture_bytes == 0 || in.aperture_physical == 0 || !in.doorbells.valid() ||
       amd_gfx8_firmware_name(in.device_id, AmdGfx8Block::CpPfp) == nullptr)
     return fail(Step::None, "no access to the card (registers, memory BAR, doorbells or a Vega M device)");
@@ -512,6 +513,10 @@ void AmdVegaM::on_event(const AmdIrq::Event& event) {
       HotplugEvent e;
       e.pin = event.pin;
       e.connected = event.connected;
+      if (const AtomConnectors::Connector* connector = AtomConnectors::find_pin(connectors(), event.pin)) {
+        e.has_connector = true;
+        e.connector = *connector;
+      }
       if (irq_->hpd_throttled(event.pin) && !(throttle_reported_ >> event.pin & 1)) {
         e.throttled = true;
         throttle_reported_ |= 1u << event.pin;

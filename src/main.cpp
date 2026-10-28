@@ -1103,7 +1103,17 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
             Entry(Level::Info, "Vega M").text("hot plug: no display on the outputs watched");
           } else {
             Entry(Level::Info, "Vega M").text("hot plug: display on output(s)");
-            for (uint32_t pin = 0; pin < 6; ++pin) if (connected >> pin & 1) Entry(Level::Info, "Vega M").text("  output ").dec(pin + 1);
+            for (uint32_t pin = 0; pin < 6; ++pin) {
+              if (!(connected >> pin & 1)) continue;
+              const hardware::AtomConnectors::Connector* connector = hardware::AtomConnectors::find_pin(vega_m->connectors(), pin);
+              if (connector) {
+                char connector_name[16];
+                hardware::AtomConnectors::name(*connector, ArrayView<char>(connector_name, sizeof connector_name));
+                Entry(Level::Info, "Vega M").text("  ").text(connector_name);
+              } else {
+                Entry(Level::Info, "Vega M").text("  output ").dec(pin + 1);
+              }
+            }
           }
         }
         if (up && vega_msi) {
@@ -1298,14 +1308,24 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         // anything on them, so this is all there is to do about it.)
         hardware::AmdVegaM::HotplugEvent plug;
         while (vega_m->take_hotplug(&plug)) {
-          FixedString<112> text;
-          if (plug.throttled) {
-            text.assign("Output ");
-            text.append_uint(plug.pin + 1);
-            text.append(" of the Radeon RX Vega M keeps changing: its hot plug detection is switched off");
+          // "HDMI-A-1" where the video BIOS says what the pin is, else "output 2"
+          FixedString<32> where;
+          if (plug.has_connector) {
+            char connector_name[16];
+            hardware::AtomConnectors::name(plug.connector, ArrayView<char>(connector_name, sizeof connector_name));
+            where.assign(connector_name);
           } else {
-            text.assign(plug.connected ? "A display was connected to output " : "A display was disconnected from output ");
-            text.append_uint(plug.pin + 1);
+            where.assign("output ");
+            where.append_uint(plug.pin + 1);
+          }
+          FixedString<128> text;
+          if (plug.throttled) {
+            text.assign("Hot plug detection of ");
+            text.append(where.c_str());
+            text.append(" on the Radeon RX Vega M is switched off: it kept changing");
+          } else {
+            text.assign(plug.connected ? "A display was connected to " : "A display was disconnected from ");
+            text.append(where.c_str());
             text.append(" of the Radeon RX Vega M");
           }
           console::debug_puts("Vega M: ");
