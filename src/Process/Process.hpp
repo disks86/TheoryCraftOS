@@ -71,6 +71,8 @@ class IModuleHost {
   virtual uint32_t load_module(ConstByteView file, StringView canonical_name, LoadedModule* out, uint32_t capacity, uint32_t* count, bool bind = true) = 0;
   // LoadLibrary of a library that is loaded already (by this canonical name): one more use. False if there is none.
   virtual bool reference_module(StringView canonical_name, uint64_t* base) = 0;
+  // The canonical name of the library whose image holds `address`; false if there is none.
+  virtual bool module_name_at(uint64_t address, char (&name)[40]) const { (void)address; (void)name; return false; }
   // FreeLibrary: one use less. The libraries that nobody uses any more are listed in `out` (at most `capacity`) in the order their entry points have to be called with
   // DLL_PROCESS_DETACH; they stay mapped until unload_module(). Returns an NTSTATUS.
   virtual uint32_t release_module(uint64_t base, LoadedModule* out, uint32_t capacity, uint32_t* count) = 0;
@@ -280,6 +282,9 @@ class Process {
   IProcessRuntime* runtime() { return runtime_; }
   // The thread the process started with.
   void register_main_thread(uint64_t id, uint64_t teb);
+  // The file behind a view of a section (its base address and the lower-case file name), for NtAreMappedFilesTheSame. The table keeps the latest 32.
+  void note_view_file(uint64_t base, const char (&name)[40]);
+  bool view_file_name(uint64_t base, char (&out)[40]) const;
   // The Windows startup data a new thread needs: the PEB, the image's static TLS template (see build_windows_thread), and the ntdll function new threads begin in.
   struct ThreadSupport {
     uint64_t peb = 0, start_thunk = 0;
@@ -365,6 +370,9 @@ class Process {
   uint32_t thread_counter_ = 0, thread_exit_code_ = 0;
   bool thread_exit_pending_ = false;
   bool threads_terminated_ = false;
+  struct ViewFile { uint64_t base = 0; char name[40] = {}; };
+  ViewFile view_files_[32];
+  uint32_t view_file_next_ = 0;
   uint8_t image_information_[64] = {};
   IModuleHost* module_host_ = nullptr;
   uint64_t fs_base_ = 0, gs_base_ = 0;

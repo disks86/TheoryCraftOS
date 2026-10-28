@@ -743,6 +743,20 @@ bool ObjectManager::section_note_image_view(uint32_t id) {
   return before;
 }
 
+bool ObjectManager::section_file_name(uint32_t id, char (&out)[40]) {
+  Locked hold(sync_);
+  out[0] = 0;
+  const Object* o = at(id);
+  if (!o || o->kind != ObjectKind::Section || o->section < 0 || !sections_ || !sections_[o->section].file_backed) return false;
+  const Section& s = sections_[o->section];
+  uint32_t start = 0;
+  for (uint32_t i = 0; i < s.path_size; ++i) if (s.path[i] == '/' || s.path[i] == '\\') start = i + 1;
+  uint32_t n = 0;
+  for (uint32_t i = start; i < s.path_size && n < 39; ++i) out[n++] = lower(s.path[i]);
+  out[n] = 0;
+  return n != 0;
+}
+
 uint32_t ObjectManager::file_has_section(StringView host_path) {
   Locked hold(sync_);
   uint32_t found = 0;

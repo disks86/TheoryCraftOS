@@ -822,7 +822,14 @@ uint32_t nt_map_view_of_section(Process& p, const SyscallRequest& r) {
     constexpr uint32_t kSectionMapWrite = 2, kSectionMapRead = 4, kSectionMapExecute = 8;
     if (((wanted & 1) && !(wanted & 2) && (denied & kSectionMapRead)) || ((wanted & 2) && (denied & kSectionMapWrite)) || ((wanted & 4) && (denied & kSectionMapExecute) && (denied & 0x20))) return 0xC0000022u;
   }
-  if (info.attributes & 0x1000000u) return remote ? kNotImplemented : map_image_view(p, r, id, size_at, storage, info.size);
+  if (info.attributes & 0x1000000u) {
+    if (remote) return kNotImplemented;
+    const uint32_t mapped = map_image_view(p, r, id, size_at, storage, info.size);
+    uint64_t at = 0;
+    char file[40];
+    if ((mapped == kSuccess || mapped == 0x40000003u) && objects->section_file_name(id, file) && p.read_user_u64(r.args[2], &at)) p.note_view_file(at, file);
+    return mapped;
+  }
   uint64_t offset = 0, view = 0, base = 0;
   if (offset_at != 0 && !p.read_user_u64(offset_at, &offset)) return kAccessViolation;
   if (size_at == 0 || !p.read_user_u64(size_at, &view) || !p.read_user_u64(r.args[2], &base)) return kAccessViolation;
@@ -837,6 +844,10 @@ uint32_t nt_map_view_of_section(Process& p, const SyscallRequest& r) {
     status = map_view_in(p, id, offset, &base, &view, view_page);
   }
   if (status != kSuccess) return status;
+  if (!remote) {
+    char file[40];
+    if (objects->section_file_name(id, file)) p.note_view_file(base, file);
+  }
   if (p.write_user_u64(r.args[2], base) && p.write_user_u64(size_at, view)) return kSuccess;
   if (!remote) if (AddressSpace* own = p.address_space()) own->unmap(base, view);
   return kAccessViolation;
@@ -915,12 +926,24 @@ uint32_t nt_are_mapped_files_the_same(Process& p, const SyscallRequest& r) {
   if (!space) return kNotImplemented;
   if (r.args[0] == 0 || r.args[1] == 0) return kInvalidAddress;
   uint64_t base[2] = {};
+  bool image[2] = {};
+  char name[2][40] = {};
+  bool named[2] = {};
   for (uint32_t i = 0; i < 2; ++i) {
     PageAttributes attributes;
     if (!space->attributes_at(AddressSpace::round_down(r.args[i]), &attributes) || (attributes.type != PageAttributes::Mapped && attributes.type != PageAttributes::Image)) return kConflictingAddresses;
     if (!space->allocation_base(AddressSpace::round_down(r.args[i]), &base[i])) return kConflictingAddresses;
+    image[i] = attributes.type == PageAttributes::Image;
+    named[i] = p.view_file_name(base[i], name[i]) || (image[i] && p.module_host() && p.module_host()->module_name_at(r.args[i], name[i]));
   }
-  return base[0] == base[1] ? kSuccess : kNotSameDevice;
+  if (base[0] == base[1]) return kSuccess;
+  // An image can be compared with any view of a file; a view of data only with itself.
+  if (image[0] && named[0] && named[1]) {
+    uint32_t k = 0;
+    while (name[0][k] != 0 && name[0][k] == name[1][k]) ++k;
+    if (name[0][k] == 0 && name[1][k] == 0) return kSuccess;
+  }
+  return kNotSameDevice;
 }
 
 // NtFlushVirtualMemory(Process, PVOID* BaseAddress, PSIZE_T RegionSize, PIO_STATUS_BLOCK): a view of a file goes back to the file.
