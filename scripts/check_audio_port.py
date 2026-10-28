@@ -128,9 +128,9 @@ def main():
     at = [setmode.find(x) for x in steps]
     if -1 in at or at != sorted(at):
         fail('the audio steps of dce_v11_0_afmt_setmode are not in the expected order: %s' % at)
-    body = re.search(r'bool AmdVegaM::enable_audio\(const AtomConnectors::Connector& connector, ConstByteView edid, bool interlaced\) \{(.*?)\n\}\n', vega, re.S).group(1)
-    mine = ['pins.set_enabled(pin, false)', 'pins.write_speaker_allocation(pin, info)', '.select_pin(AtomConnectors::afmt_instance(connector), pin)', 'pins.write_sads(pin, info)',
-            'pins.write_latency(pin, info, interlaced)', 'pins.set_enabled(pin, true)']
+    body = re.search(r'bool AmdVegaM::enable_audio\(const AtomConnectors::Connector& connector, ConstByteView edid, const AudioMode& mode\) \{(.*?)\n\}\n', vega, re.S).group(1)
+    mine = ['pins.set_enabled(pin, false)', 'pins.write_speaker_allocation(pin, info)', 'format.select_pin(block, pin)', 'pins.write_sads(pin, info)',
+            'pins.write_latency(pin, info, mode.interlaced)', 'pins.set_enabled(pin, true)']       # (the packets and the InfoFrame in between are scripts/check_hdmi_port.py's)
     at = [body.find(x) for x in mine]
     if -1 in at or at != sorted(at):
         fail('enable_audio\'s steps are not in the driver\'s order: %s' % at)

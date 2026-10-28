@@ -32,7 +32,7 @@ Rect2D rect(int32_t x, int32_t y, int32_t width, int32_t height) {
 
 Todo::Todo(allocators::IAllocator& allocator)
     : Frame(allocator), show_label_(allocator), text_label_(allocator), bucket_label_(allocator), status_(allocator), list_(allocator), text_(allocator), show_(allocator),
-      bucket_(allocator), add_(allocator), save_(allocator), done_(allocator), delete_(allocator), clear_(allocator), items_(allocator) {
+      bucket_(allocator), add_(allocator), save_(allocator), done_(allocator), delete_(allocator), clear_(allocator), item_menu_(allocator), items_(allocator) {
   set_title("To-Do");
   set_bounds({140, 40, 520, 500});
   set_padding(Insets::all(6));
@@ -68,6 +68,21 @@ Todo::Todo(allocators::IAllocator& allocator)
   done_.on_click({&Todo::on_done, this});
   delete_.on_click({&Todo::on_delete, this});
   clear_.on_click({&Todo::on_clear, this});
+
+  // The menu of an item: complete it (or put it back), move it to another bucket, delete it.
+  menu_done_ = item_menu_.add_item("Mark Complete", {&Todo::on_done, this}, "Enter");
+  item_menu_.add_separator();
+  for (uint32_t b = 0; b < kBucketCount; ++b) {
+    String label(allocator);
+    label.assign("Move to ");
+    label.append(bucket_name(static_cast<Bucket>(b)));
+    move_targets_[b] = {this, static_cast<Bucket>(b)};
+    menu_move_[b] = item_menu_.add_item(label.view(), {&Todo::on_menu_move, &move_targets_[b]});
+  }
+  item_menu_.add_separator();
+  menu_delete_ = item_menu_.add_item("Delete", {&Todo::on_delete, this});
+  item_menu_.on_opening(Handler::immediate(&Todo::on_menu_opening, this));
+  list_.set_context_menu(&item_menu_);
 
   Control* const parts[] = {&show_label_, &show_, &list_, &text_label_, &text_, &bucket_label_, &bucket_, &add_, &save_, &done_, &delete_, &clear_, &status_};
   for (Control* part : parts) add(part);
@@ -193,6 +208,27 @@ bool Todo::complete_item() {
   return true;
 }
 
+bool Todo::move_item(Bucket bucket) {
+  UiGuard lock(this);
+  const uint32_t id = selected_id();
+  if (!store_ || !id || showing_completed()) {
+    say("Choose an item to move.");
+    return false;
+  }
+  if (!store_->set_bucket(id, bucket)) {
+    say("The change could not be saved.");
+    return false;
+  }
+  refresh();
+  if (list_.selected_item() >= 0) select_item(list_.selected_item());   // (the form follows the item to its new bucket)
+  String text(allocator());
+  text.assign("Moved to ");
+  text.append(bucket_name(bucket));
+  text.append(".");
+  say(text.view());
+  return true;
+}
+
 bool Todo::delete_item() {
   UiGuard lock(this);
   const uint32_t id = selected_id();
@@ -229,6 +265,26 @@ void Todo::on_save(void* self, Control&) { static_cast<Todo*>(self)->update_item
 void Todo::on_done(void* self, Control&) { static_cast<Todo*>(self)->complete_item(); }
 void Todo::on_delete(void* self, Control&) { static_cast<Todo*>(self)->delete_item(); }
 void Todo::on_clear(void* self, Control&) { static_cast<Todo*>(self)->clear_completed(); }
+
+// Enables what applies to the chosen item: a completed one can be put back or deleted, an open one moved to any bucket but its own.
+void Todo::on_menu_opening(void* self, Control&) {
+  auto* t = static_cast<Todo*>(self);
+  const bool chosen = t->selected_id() != 0, completed = t->showing_completed();
+  TodoStore::Item item(t->allocator());
+  const bool known = chosen && t->store_ && t->store_->get(t->selected_id(), &item);
+  t->menu_done_->text.assign(completed ? "Restore" : "Mark Complete");
+  t->menu_done_->set_enabled(chosen);
+  t->menu_delete_->set_enabled(chosen);
+  for (uint32_t b = 0; b < kBucketCount; ++b) {
+    const bool current = known && static_cast<uint32_t>(item.bucket) == b;
+    t->menu_move_[b]->set_checked(current);
+    t->menu_move_[b]->set_enabled(known && !completed && !current);
+  }
+}
+void Todo::on_menu_move(void* target, Control&) {
+  auto* move = static_cast<MoveTarget*>(target);
+  move->todo->move_item(move->bucket);
+}
 
 void Todo::layout() {
   Frame::layout();

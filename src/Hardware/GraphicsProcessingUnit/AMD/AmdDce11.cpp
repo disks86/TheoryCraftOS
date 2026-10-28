@@ -404,6 +404,155 @@ bool AudioFormat::select_pin(uint32_t block, uint32_t pin) {
   return true;
 }
 
+namespace {
+// dce_v11_0_afmt_setmode's constants
+constexpr uint32_t kAudioCrcControl = 0x1000;
+constexpr uint32_t kRamp0 = 0x00FFFFFF, kRamp1 = 0x007FFFFF, kRamp2 = 1, kRamp3 = 1;
+constexpr uint32_t kDtoPhase = 24 * 1000;
+constexpr uint32_t kInfoframeLine = 2, kAudioPacketsPerLine = 3;
+}  // namespace
+
+bool AudioFormat::setup_packets(uint32_t block, uint32_t crtc, uint32_t clock_khz, uint32_t bpc) {
+  if (block >= kBlocks || crtc >= kMaxCrtcs) return false;
+  const uint32_t off = kDigOffsets[block];
+  uint32_t tmp;
+  // dce_v11_0_audio_set_dto
+  tmp = r_.read(mmDCCG_AUDIO_DTO_SOURCE);
+  tmp = REG_SET_FIELD(tmp, DCCG_AUDIO_DTO_SOURCE, DCCG_AUDIO_DTO0_SOURCE_SEL, crtc);
+  r_.write(mmDCCG_AUDIO_DTO_SOURCE, tmp);
+  r_.write(mmDCCG_AUDIO_DTO0_PHASE, kDtoPhase);
+  r_.write(mmDCCG_AUDIO_DTO0_MODULE, clock_khz);
+
+  tmp = r_.read(mmHDMI_VBI_PACKET_CONTROL + off);
+  tmp = REG_SET_FIELD(tmp, HDMI_VBI_PACKET_CONTROL, HDMI_NULL_SEND, 1);      // send null packets when required
+  r_.write(mmHDMI_VBI_PACKET_CONTROL + off, tmp);
+
+  r_.write(mmAFMT_AUDIO_CRC_CONTROL + off, kAudioCrcControl);
+
+  tmp = r_.read(mmHDMI_CONTROL + off);
+  switch (bpc) {
+    case 10:
+      tmp = REG_SET_FIELD(tmp, HDMI_CONTROL, HDMI_DEEP_COLOR_ENABLE, 1);
+      tmp = REG_SET_FIELD(tmp, HDMI_CONTROL, HDMI_DEEP_COLOR_DEPTH, 1);
+      break;
+    case 12:
+      tmp = REG_SET_FIELD(tmp, HDMI_CONTROL, HDMI_DEEP_COLOR_ENABLE, 1);
+      tmp = REG_SET_FIELD(tmp, HDMI_CONTROL, HDMI_DEEP_COLOR_DEPTH, 2);
+      break;
+    default:      // 0, 6, 8, 16 and anything else: no deep colour
+      tmp = REG_SET_FIELD(tmp, HDMI_CONTROL, HDMI_DEEP_COLOR_ENABLE, 0);
+      tmp = REG_SET_FIELD(tmp, HDMI_CONTROL, HDMI_DEEP_COLOR_DEPTH, 0);
+      break;
+  }
+  r_.write(mmHDMI_CONTROL + off, tmp);
+
+  tmp = r_.read(mmHDMI_VBI_PACKET_CONTROL + off);
+  tmp = REG_SET_FIELD(tmp, HDMI_VBI_PACKET_CONTROL, HDMI_NULL_SEND, 1);
+  tmp = REG_SET_FIELD(tmp, HDMI_VBI_PACKET_CONTROL, HDMI_GC_SEND, 1);        // send general control packets
+  tmp = REG_SET_FIELD(tmp, HDMI_VBI_PACKET_CONTROL, HDMI_GC_CONT, 1);        // every frame
+  r_.write(mmHDMI_VBI_PACKET_CONTROL + off, tmp);
+
+  tmp = r_.read(mmHDMI_INFOFRAME_CONTROL0 + off);
+  tmp = REG_SET_FIELD(tmp, HDMI_INFOFRAME_CONTROL0, HDMI_AUDIO_INFO_SEND, 1);   // enable audio info frames (frames won't be sent until audio is enabled)
+  tmp = REG_SET_FIELD(tmp, HDMI_INFOFRAME_CONTROL0, HDMI_AUDIO_INFO_CONT, 1);   // required for audio info values to be updated
+  r_.write(mmHDMI_INFOFRAME_CONTROL0 + off, tmp);
+
+  tmp = r_.read(mmAFMT_INFOFRAME_CONTROL0 + off);
+  tmp = REG_SET_FIELD(tmp, AFMT_INFOFRAME_CONTROL0, AFMT_AUDIO_INFO_UPDATE, 1);
+  r_.write(mmAFMT_INFOFRAME_CONTROL0 + off, tmp);
+
+  tmp = r_.read(mmHDMI_INFOFRAME_CONTROL1 + off);
+  tmp = REG_SET_FIELD(tmp, HDMI_INFOFRAME_CONTROL1, HDMI_AUDIO_INFO_LINE, kInfoframeLine);     // anything other than 0
+  r_.write(mmHDMI_INFOFRAME_CONTROL1 + off, tmp);
+
+  r_.write(mmHDMI_GC + off, 0);          // unset HDMI_GC_AVMUTE
+
+  tmp = r_.read(mmHDMI_AUDIO_PACKET_CONTROL + off);
+  tmp = REG_SET_FIELD(tmp, HDMI_AUDIO_PACKET_CONTROL, HDMI_AUDIO_DELAY_EN, 1);                  // the default audio delay
+  tmp = REG_SET_FIELD(tmp, HDMI_AUDIO_PACKET_CONTROL, HDMI_AUDIO_PACKETS_PER_LINE, kAudioPacketsPerLine);
+  r_.write(mmHDMI_AUDIO_PACKET_CONTROL + off, tmp);
+
+  tmp = r_.read(mmAFMT_AUDIO_PACKET_CONTROL + off);
+  tmp = REG_SET_FIELD(tmp, AFMT_AUDIO_PACKET_CONTROL, AFMT_60958_CS_UPDATE, 1);          // allow 60958 channel status fields to be updated
+  r_.write(mmAFMT_AUDIO_PACKET_CONTROL + off, tmp);
+
+  tmp = r_.read(mmHDMI_ACR_PACKET_CONTROL + off);
+  tmp = REG_SET_FIELD(tmp, HDMI_ACR_PACKET_CONTROL, HDMI_ACR_SOURCE, bpc > 8 ? 0 : 1);   // the software CTS value, but not with deep colour
+  tmp = REG_SET_FIELD(tmp, HDMI_ACR_PACKET_CONTROL, HDMI_ACR_AUTO_SEND, 1);               // allow the hardware to send ACR packets when required
+  r_.write(mmHDMI_ACR_PACKET_CONTROL + off, tmp);
+
+  // dce_v11_0_afmt_update_ACR
+  const Hdmi::Acr acr = Hdmi::acr(clock_khz);
+  tmp = r_.read(mmHDMI_ACR_32_0 + off);
+  tmp = REG_SET_FIELD(tmp, HDMI_ACR_32_0, HDMI_ACR_CTS_32, acr.cts_32khz);
+  r_.write(mmHDMI_ACR_32_0 + off, tmp);
+  tmp = r_.read(mmHDMI_ACR_32_1 + off);
+  tmp = REG_SET_FIELD(tmp, HDMI_ACR_32_1, HDMI_ACR_N_32, acr.n_32khz);
+  r_.write(mmHDMI_ACR_32_1 + off, tmp);
+  tmp = r_.read(mmHDMI_ACR_44_0 + off);
+  tmp = REG_SET_FIELD(tmp, HDMI_ACR_44_0, HDMI_ACR_CTS_44, acr.cts_44_1khz);
+  r_.write(mmHDMI_ACR_44_0 + off, tmp);
+  tmp = r_.read(mmHDMI_ACR_44_1 + off);
+  tmp = REG_SET_FIELD(tmp, HDMI_ACR_44_1, HDMI_ACR_N_44, acr.n_44_1khz);
+  r_.write(mmHDMI_ACR_44_1 + off, tmp);
+  tmp = r_.read(mmHDMI_ACR_48_0 + off);
+  tmp = REG_SET_FIELD(tmp, HDMI_ACR_48_0, HDMI_ACR_CTS_48, acr.cts_48khz);
+  r_.write(mmHDMI_ACR_48_0 + off, tmp);
+  tmp = r_.read(mmHDMI_ACR_48_1 + off);
+  tmp = REG_SET_FIELD(tmp, HDMI_ACR_48_1, HDMI_ACR_N_48, acr.n_48khz);
+  r_.write(mmHDMI_ACR_48_1 + off, tmp);
+
+  // the channel status: channel numbers 1 to 8
+  tmp = r_.read(mmAFMT_60958_0 + off);
+  tmp = REG_SET_FIELD(tmp, AFMT_60958_0, AFMT_60958_CS_CHANNEL_NUMBER_L, 1);
+  r_.write(mmAFMT_60958_0 + off, tmp);
+  tmp = r_.read(mmAFMT_60958_1 + off);
+  tmp = REG_SET_FIELD(tmp, AFMT_60958_1, AFMT_60958_CS_CHANNEL_NUMBER_R, 2);
+  r_.write(mmAFMT_60958_1 + off, tmp);
+  tmp = r_.read(mmAFMT_60958_2 + off);
+  tmp = REG_SET_FIELD(tmp, AFMT_60958_2, AFMT_60958_CS_CHANNEL_NUMBER_2, 3);
+  tmp = REG_SET_FIELD(tmp, AFMT_60958_2, AFMT_60958_CS_CHANNEL_NUMBER_3, 4);
+  tmp = REG_SET_FIELD(tmp, AFMT_60958_2, AFMT_60958_CS_CHANNEL_NUMBER_4, 5);
+  tmp = REG_SET_FIELD(tmp, AFMT_60958_2, AFMT_60958_CS_CHANNEL_NUMBER_5, 6);
+  tmp = REG_SET_FIELD(tmp, AFMT_60958_2, AFMT_60958_CS_CHANNEL_NUMBER_6, 7);
+  tmp = REG_SET_FIELD(tmp, AFMT_60958_2, AFMT_60958_CS_CHANNEL_NUMBER_7, 8);
+  r_.write(mmAFMT_60958_2 + off, tmp);
+  return true;
+}
+
+bool AudioFormat::enable_channels(uint32_t block) {
+  if (block >= kBlocks) return false;
+  r_.write(mmAFMT_AUDIO_PACKET_CONTROL2 + kDigOffsets[block], 0xffu << AFMT_AUDIO_PACKET_CONTROL2__AFMT_AUDIO_CHANNEL_ENABLE__SHIFT);
+  return true;
+}
+
+bool AudioFormat::start(uint32_t block, ConstByteView avi) {
+  if (block >= kBlocks || avi.size() < Hdmi::kAviBytes) return false;
+  const uint32_t off = kDigOffsets[block];
+  // dce_v11_0_afmt_update_avi_infoframe: the frame without its header from the checksum on (avi[3], the data bytes after it), the version from the header
+  const auto word = [&](uint32_t first) { return uint32_t{avi[first]} | uint32_t{avi[first + 1]} << 8 | uint32_t{avi[first + 2]} << 16 | uint32_t{avi[first + 3]} << 24; };
+  r_.write(mmAFMT_AVI_INFO0 + off, word(3));
+  r_.write(mmAFMT_AVI_INFO1 + off, word(7));
+  r_.write(mmAFMT_AVI_INFO2 + off, word(11));
+  r_.write(mmAFMT_AVI_INFO3 + off, uint32_t{avi[15]} | uint32_t{avi[16]} << 8 | uint32_t{avi[1]} << 24);
+
+  uint32_t tmp = r_.read(mmHDMI_INFOFRAME_CONTROL0 + off);
+  tmp = REG_SET_FIELD(tmp, HDMI_INFOFRAME_CONTROL0, HDMI_AVI_INFO_SEND, 1);     // enable AVI info frames
+  tmp = REG_SET_FIELD(tmp, HDMI_INFOFRAME_CONTROL0, HDMI_AVI_INFO_CONT, 1);     // required for audio info values to be updated
+  r_.write(mmHDMI_INFOFRAME_CONTROL0 + off, tmp);
+  tmp = r_.read(mmHDMI_INFOFRAME_CONTROL1 + off);
+  tmp = REG_SET_FIELD(tmp, HDMI_INFOFRAME_CONTROL1, HDMI_AVI_INFO_LINE, kInfoframeLine);
+  r_.write(mmHDMI_INFOFRAME_CONTROL1 + off, tmp);
+  tmp = r_.read(mmAFMT_AUDIO_PACKET_CONTROL + off);
+  tmp = REG_SET_FIELD(tmp, AFMT_AUDIO_PACKET_CONTROL, AFMT_AUDIO_SAMPLE_SEND, 1);   // send audio packets
+  r_.write(mmAFMT_AUDIO_PACKET_CONTROL + off, tmp);
+  r_.write(mmAFMT_RAMP_CONTROL0 + off, kRamp0);
+  r_.write(mmAFMT_RAMP_CONTROL1 + off, kRamp1);
+  r_.write(mmAFMT_RAMP_CONTROL2 + off, kRamp2);
+  r_.write(mmAFMT_RAMP_CONTROL3 + off, kRamp3);
+  return true;
+}
+
 uint32_t AudioFormat::selected_pin(uint32_t block) {
   if (block >= kBlocks) return kNoPin;
   return FIELD(r_.read(mmAFMT_AUDIO_SRC_CONTROL + kDigOffsets[block]), AFMT_AUDIO_SRC_CONTROL__AFMT_AUDIO_SRC_SELECT_MASK, AFMT_AUDIO_SRC_CONTROL__AFMT_AUDIO_SRC_SELECT__SHIFT);

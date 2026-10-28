@@ -35,6 +35,7 @@
 #include <stdint.h>
 #include "Hardware/Clock/IClock.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/EdidAudio.hpp"
+#include "Hardware/GraphicsProcessingUnit/AMD/HdmiInfoframe.hpp"
 #include "Hardware/Mmio.hpp"
 #include "Hardware/VideoCodec/AMD/AmdVcn1.hpp"
 #include "Allocators/IAllocator.hpp"
@@ -224,6 +225,17 @@ class AudioFormat {
   // The endpoint the block has selected, or kNoPin for a block that does not exist.
   static constexpr uint32_t kNoPin = 0xFFFFFFFFu;
   uint32_t selected_pin(uint32_t block);
+
+  // dce_v11_0_afmt_setmode, the part before the endpoint's speaker allocation: the audio clock (dce_v11_0_audio_set_dto: DTO 0 takes the display controller `crtc`'s timing, phase 24 MHz over
+  // the pixel clock `clock_khz`), the packets in the blanking (null packets, general control for deep colour by `bpc`: 8 and 6, 16 or none off, 10 and 12 on; audio info frames; the audio packet
+  // delay, the 60958 channel status update, the audio clock regeneration packet with the N and CTS of Hdmi::acr, and the channel numbers of the channel status). False for a block or controller
+  // that does not exist (nothing is written).
+  bool setup_packets(uint32_t block, uint32_t crtc, uint32_t clock_khz, uint32_t bpc);
+  // the part after it: all eight audio channels enabled (AFMT_AUDIO_PACKET_CONTROL2)
+  bool enable_channels(uint32_t block);
+  // and the last part, after the endpoint's selection and descriptors: the AVI InfoFrame (`avi`, Hdmi::avi_infoframe's kAviBytes bytes) into AFMT_AVI_INFO0..3 and sent every frame on line 2,
+  // the audio samples sent, the ramp test registers the driver sets. False for a block that does not exist or a short frame.
+  bool start(uint32_t block, ConstByteView avi);
 
  private:
   IVcnRegisters& r_;
