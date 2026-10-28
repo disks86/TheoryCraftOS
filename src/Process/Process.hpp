@@ -133,6 +133,8 @@ class IProcessRuntime {
   // Which cores a thread (id 0: every thread of the process, and the ones made later) may run on: bit n is core n. False if the mask names no core that exists.
   virtual bool set_affinity(uint64_t thread_id, uint64_t mask) { (void)thread_id; (void)mask; return mask == 1; }
   virtual uint64_t affinity(uint64_t thread_id) { (void)thread_id; return 1; }
+  // FlushProcessWriteBuffers: every core has drained its store buffers when this returns (the other cores are interrupted).
+  virtual void flush_write_buffers() {}
   // The thread's priority in the kernel scheduler: 0 (lowest) .. 31 (highest); a thread always runs ahead of every lower one, round-robin among equals. False if the
   // thread is unknown. (Windows' SetThreadPriority is relative to the process's priority class; windowsabi works that out before calling this.)
   virtual bool set_priority(uint64_t thread_id, int32_t absolute_priority) { (void)thread_id; (void)absolute_priority; return false; }

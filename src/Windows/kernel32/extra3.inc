@@ -1115,3 +1115,6 @@ EXPORT PVOID WINAPI ResolveDelayLoadedAPI(PVOID parent, const void *descriptor, 
   if (address) *thunk = (ULONG64)(ULONG_PTR)address;
   return address;
 }
+
+VOID NTAPI NtFlushProcessWriteBuffers(void);
+EXPORT VOID WINAPI FlushProcessWriteBuffers(void) { NtFlushProcessWriteBuffers(); }
