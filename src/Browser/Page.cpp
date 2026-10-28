@@ -160,7 +160,7 @@ bool Page::start_engine() {
   if (!scripts_enabled_ || engine_failed_) return false;
   engine_ = UniquePointer<script::Engine>::make(allocator_, allocator_, static_cast<script::IHost*>(this));
   if (engine_ && engine_->ok()) {
-    engine_->set_limits(8000000, 48u << 20);
+    engine_->set_limits(instruction_limit_, memory_limit_);
     bindings_ = UniquePointer<DomBindings>::make(allocator_, engine_->vm(), doc_, static_cast<IDomHost&>(*this));
     if (bindings_ && bindings_->install()) {
       String prelude_error(allocator_);
@@ -2193,6 +2193,7 @@ void Page::sync_frames() {
   for (uint64_t k = 0; k < found.count(); ++k) {
     dom::Node* n = found[k];
     String key(allocator_), html(allocator_), address(allocator_);
+    dom::Encoding frame_charset = dom::Encoding::Utf8;
     StringView srcdoc, src;
     if (dom::get_attribute(n, "srcdoc", &srcdoc)) {
       key.assign("srcdoc:");
@@ -2230,7 +2231,13 @@ void Page::sync_frames() {
       address.assign("about:blank");
     } else {
       address.assign(key.view());
-      if (!fetch_text_via_sw(key.view(), "iframe", 1u << 20, &html)) html.assign("<p>This frame could not be loaded.</p>");
+      if (!fetch_text_via_sw(key.view(), "iframe", 1u << 20, &html)) {
+        html.assign("<p>This frame could not be loaded.</p>");
+      } else {   // (the bytes are read the way a browser reads a page: by a byte order mark or a <meta>)
+        String decoded(allocator_);
+        dom::decode_document(text_as_bytes(html.view()), StringView(), &decoded, &frame_charset);
+        html = util::move(decoded);
+      }
     }
     StringView sandbox;
     const bool sandboxed = dom::get_attribute(n, "sandbox", &sandbox) && !sandbox.contains("allow-scripts");
@@ -2238,8 +2245,10 @@ void Page::sync_frames() {
     if (frame_media.width > 16 * 8 * 2) frame_media.width -= 6 * 8;
     f->page = UniquePointer<Page>::make(allocator_, allocator_, f->env, address.view(), frame_media, scripts_enabled_ && !sandboxed);
     if (!f->page) continue;
+    f->page->set_script_limits(instruction_limit_, memory_limit_);
     f->page->set_parent(this, n->serial, depth_ + 1);
     f->page->set_visible(!hidden_);
+    f->page->set_character_set(frame_charset);
     f->page->load(html.view());
     f->page->render(&f->doc);
     loaded.push_back(n->serial);
@@ -2695,6 +2704,15 @@ bool Page::post_window_message(uint32_t target_window, StringView target_origin,
   claim_ports(ports, target->window_id_);
   target->queue_window_message(payload, mine.view(), window_id_, ports);
   return true;
+}
+
+bool Page::window_request(uint32_t target_window, StringView request, String* reply) {
+  Page* target = root()->find_window(target_window);
+  if (!target || target == this || !target->start_engine() || !target->bindings_) return false;   // (a page without scripts of its own has no engine until something asks)
+  const DomBindings::HookArg args[1] = {DomBindings::HookArg::of(request)};
+  reply->clear();
+  target->engine_->vm().reset_instruction_count();   // (each request is a task of its own for the script that answers it)
+  return target->bindings_->call_hook("__window_serve", args, 1, reply) && !reply->empty();
 }
 
 void Page::queue_window_message(StringView payload, StringView origin, uint32_t source, StringView ports) {

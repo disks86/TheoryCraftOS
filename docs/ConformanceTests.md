@@ -33,11 +33,20 @@ PageTest binary (`PAGETEST=path`); the console log of a page is capped at 16 KB,
 `tests/run_real_wpt.sh <wpt checkout> <out dir> <dirs...>` runs files of the real [web-platform-tests](https://github.com/web-platform-tests/wpt) (the unmodified
 `testharness.js`, one process per file, 60 seconds each) in `PageTest` (`WPT_ROOT=<checkout> WPT_REAL_FILE=<path>` runs one file and prints `WPT PASS|FAIL <name> :: <message>`
 lines). The checkout can be sparse (`resources common dom url encoding html/dom`). Pages, `.window.js` and `.any.js` files run (not manual, https-only, crash or idlharness files).
-A frame is a page of its own with its own script engine, so tests that reach into `iframe.contentDocument`/`contentWindow` (a large share of the failures below) cannot work
-yet; XML documents and `Document.URL` of foreign documents come from frames in many tests.
+A page with `<meta name="variant" content="?1-1000">` lines runs once per variant (the page address has the variant; the output file is named after it), and the runner's
+limits are far above a page's (`WPT_BUDGET` millions of instructions per task, default 200; `WPT_MEMORY` megabytes, default 768; `Page::set_script_limits`). The results are read
+from the console, not from the page's log (which keeps only its first 16 KB).
 
-Baseline of 2026-10-27 (subtests passed / failed, files that did not finish): `dom/nodes` 2979 / 984 (47), `dom/events` 358 / 317 (10), `dom/ranges` 1741 / 624 (16),
-`dom/traversal` 331 / 39 (2), `dom/collections` 23 / 31, `dom/lists` 31 / 98, `dom/abort` 33 / 4, `url` 1300 / 546 (10), `encoding` 6008 / 285 (73; was 335 / 3231 before the legacy encodings).
+A frame is a page of its own with its own script engine. What the page around it gets as `iframe.contentDocument` / `contentWindow` (and what a frame gets as `parent`,
+`top`, `event.source`) is a Proxy whose operations are sent to the other window's script as text (`__window_request` / `__window_serve` in the built-in script): the real
+objects stay where they are, values cross as primitives or as handles (`[kind, handle, window]`), a function of one window can be called from the other, and an exception
+comes back as an exception of the same kind. Frames are loaded when `contentDocument` / `contentWindow` is read (as a browser does), and a frame without scripts of its own
+gets its engine then. Limits: every operation is a round trip (a loop over thousands of nodes of a frame costs seconds), the stand-ins and their handles are kept for as long
+as the pages, a stand-in is not `instanceof` the other window's classes, no `frameElement`, and a form cannot be submitted into a frame by `target`.
+
+Baseline of 2026-10-28, with variants, the larger limits and frames reachable (subtests passed / failed, files that did not finish): `dom/nodes` 7181 / 1606 (37),
+`dom/events` 381 / 339 (9), `dom/ranges` 4407 / 538 (8), `dom/traversal` 805 / 39 (1), `encoding` 418067 / 68 (30; the `encode-*`/`decode` pages of the legacy encodings now run
+every variant). (The numbers before this change were smaller mostly because a page counted only what fit in its 16 KB log and ran no variants.)
 The biggest causes found: frames without a reachable
 document, processing instructions (`processing-instruction-attributes`, `Document-createProcessingInstruction`), XML documents (namespaces of `createElement` in them),
 `Document.cloneNode`, `moveBefore`, mutation observer record details, `HTMLCollection` indexed writes in strict mode, attribute name validation.
@@ -57,7 +66,7 @@ which. `tests/EncodingTest.cpp` has vectors, every split of the input, every pre
 query of a URL the way the URL standard does ("percent-encode after encoding": the bytes percent-encoded with the query set, a character the encoding cannot hold as the
 percent-encoded `&#NNN;`). A page in another encoding (`Page::set_character_set(Encoding)`) makes the query of the URLs it writes (`a.href`, `img.src`, `form.action` ...) in
 it; `new URL()` and `fetch()` always use UTF-8. The real `encoding/legacy-mb-*` `encode-href-*` pages run (the encoder and reference tests of every legacy encoding pass).
-Not done: the query of a form that is submitted from such a page (the `encode-form-*` pages need frames), `TextDecoderStream` for the legacy encodings, SharedArrayBuffer as
+Not done: the query of a form that is submitted from such a page (the `encode-form-*` pages submit into a frame by `target`), `TextDecoderStream` for the legacy encodings, SharedArrayBuffer as
 the input of `decode()`, the `decode` pages (they read text out of an `<iframe>`), and the big `encode-href-errors-*` pages, which fill lists of a million code points in
 script before they test anything and so use more instructions than a page may (they report what they get to).
 

@@ -14,14 +14,26 @@ mkdir -p "$out"; out=$(cd "$out" && pwd)
 export root out PAGETEST=${PAGETEST:-build/PageTest}
 cd "$root"
 for t in "$@"; do find "$t" -type f \( -name '*.html' -o -name '*.htm' -o -name '*.window.js' -o -name '*.any.js' \); done \
-  | grep -v -e '/resources/' -e '-manual' -e 'support/' -e '\.https\.' -e 'crashtests' -e '\-ref\.' -e '/reference/' -e 'idlharness' | sort > "$out/files.txt"
-cat "$out/files.txt" | xargs -P "${JOBS:-12}" -I{} bash -c 'f={}; o=$out/$(echo $f | tr / _).txt; WPT_ROOT=$root WPT_REAL_FILE=$f timeout 60 $PAGETEST > $o 2>&1; echo "RC $?" >> $o' || true
+  | grep -v -e '/resources/' -e '-manual' -e 'support/' -e '\.https\.' -e 'crashtests' -e '\-ref\.' -e '/reference/' -e 'idlharness' | sort > "$out/pages.txt"
+# a page with <meta name=variant content="?1-1000"> is run once per variant (the page address has the variant)
+python3 - "$out" <<'PY'
+import sys, re
+out = sys.argv[1]
+rows = []
+for name in open(out + '/pages.txt').read().split('\n'):
+    if not name: continue
+    variants = re.findall(r'<meta\s+name=["\']variant["\']\s+content=["\']([^"\']*)["\']', open(name, errors='replace').read()) if name.endswith(('.html', '.htm')) else []
+    kept = [v for v in variants if v and v[0] in '?#']
+    rows.extend([name + v for v in kept] if kept else [name])
+open(out + '/files.txt', 'w').write('\n'.join(rows) + '\n')
+PY
+tr '\n' '\0' < "$out/files.txt" | xargs -0 -P "${JOBS:-12}" -I{} bash -c 'f=$1; o=$out/$(echo "$f" | tr "/?&=#" "_____").txt; WPT_ROOT=$root WPT_REAL_FILE=$f timeout 60 $PAGETEST > $o 2>&1; echo "RC $?" >> $o' _ {} || true
 python3 - "$out" <<'PY'
 import sys, os, glob
 out = sys.argv[1]
 rows = []
 for f in sorted(glob.glob(out + '/*.txt')):
-    if os.path.basename(f) in ('files.txt', 'summary.txt'): continue
+    if os.path.basename(f) in ('files.txt', 'pages.txt', 'summary.txt'): continue
     passed = failed = 0
     lines = open(f, errors='replace').read().splitlines()
     for l in lines:
