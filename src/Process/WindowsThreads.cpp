@@ -154,6 +154,7 @@ uint32_t nt_create_thread_ex(Process& p, const SyscallRequest& r) {
   AddressSpace* space = p.address_space();
   const Process::ThreadSupport& support = p.thread_support();
   if (!runtime || !space || support.start_thunk == 0) return kNotImplemented;      // a process of one thread
+  if (p.threads_terminated() && r.args[3] == ~uint64_t{0}) return 0xC000010Au;      // STATUS_PROCESS_IS_TERMINATING
   if (r.args[3] != ~uint64_t{0}) {      // a thread in another program: the handle names it by its id and can be waited for
     bool exited = false;
     uint32_t code = 0;
@@ -272,6 +273,20 @@ uint32_t nt_terminate_thread(Process& p, const SyscallRequest& r) {
   if (!p.runtime()) return kNotImplemented;
   p.runtime()->request_terminate(record->id, code);
   if (ObjectManager* objects = system_objects()) objects->notify();      // (a thread waiting inside the kernel looks again and finds it is to end)
+  return kSuccess;
+}
+
+uint32_t terminate_other_threads(Process& p, uint32_t code) {
+  if (!p.runtime()) return kNotImplemented;
+  const uint64_t self = p.runtime()->current_thread_id();
+  p.set_threads_terminated();
+  for (uint32_t i = 0; i < Process::kMaxThreads; ++i) {
+    Process::ThreadRecord* record = p.thread_at(i);
+    if (!record || !record->used || record->finished || record->id == self) continue;
+    if (!record->started) { end_thread(p, *record, code); continue; }
+    p.runtime()->request_terminate(record->id, code);
+  }
+  if (ObjectManager* objects = system_objects()) objects->notify();
   return kSuccess;
 }
 

@@ -27,7 +27,6 @@ typedef struct FlsThread { LIST_ENTRY link; void **chunks[FLS_CHUNKS]; } FlsThre
 
 static PFLS_CALLBACK_FUNCTION g_fls_callbacks[FLS_MAX_INDEXES];
 static LIST_ENTRY g_fls_list;
-static volatile LONG g_fls_lock;
 static void fls_lock(void) { while (__sync_lock_test_and_set(&g_fls_lock, 1)) NtYieldExecution(); }
 static void fls_unlock(void) { __sync_lock_release(&g_fls_lock); }
 static void fls_list_init(void) { if (!g_fls_list.Flink) { g_fls_list.Flink = g_fls_list.Blink = &g_fls_list; } }
