@@ -19,6 +19,7 @@
 #pragma once
 #include <stdint.h>
 #include "Allocators/IAllocator.hpp"
+#include "Hardware/Acpi/AmlInterpreter.hpp"
 #include "Hardware/Bus/Pci/IPciBus.hpp"
 #include "Hardware/RegisterMapper.hpp"
 #include "Hardware/VideoCodec/AMD/AmdVcn1.hpp"
@@ -28,12 +29,11 @@
 namespace hardware {
 
 // Finding the video BIOS image of an AMD card, for the AtomBIOS interpreter (AtomBios) that POSTs it. The sources and their checks follow the Linux amdgpu driver's amdgpu_bios.c, in
-// the order of amdgpu_get_bios_dgpu: the ACPI VFCT table (the firmware's copy of the images of the video BIOSes of its AMD cards, what most laptops with a discrete card use), the PCI
+// the order of amdgpu_get_bios_dgpu: the card's ACPI ATRM method (an AML method of the card's device that returns the ROM a page at a time), the ACPI VFCT table (the firmware's copy of the images of the video BIOSes of its AMD cards, what most laptops with a discrete card use), the PCI
 // expansion ROM, and the card's own ROM read through the SMC's ROM index and data registers (the Volcanic Islands cards' amdgpu_read_bios_from_rom). Every image found must pass
 // check_atom_bios: the 0xAA55 signature, a pointer at 0x48 to a header that has "ATOM" (or "MOTA") at offset 4.
 //
-// Not done: the ACPI ATRM method (an AML method of the card's device that returns the ROM, which needs the AML interpreter running with the card's device), the copy in video memory (for
-// SR-IOV), the legacy ROM shadow at 0xC0000 (the driver takes it from the PCI core, which sets it for the boot display; whether a UEFI machine has it is another matter), and the
+// Not done: the copy in video memory (for SR-IOV), the legacy ROM shadow at 0xC0000 (the driver takes it from the PCI core, which sets it for the boot display; whether a UEFI machine has it is another matter), and the
 // "disabled ROM" path that clears the ROM disable bits of the card before reading it.
 class AmdVbios {
  public:
@@ -47,7 +47,7 @@ class AmdVbios {
   static constexpr uint32_t kSmcIndex = 0x1AC, kSmcData = 0x1AD;
   static constexpr uint32_t kRomIndex = 0xc0600010, kRomData = 0xc0600014;
 
-  enum class Source : uint8_t { None, Vfct, RomBar, RomRegisters };
+  enum class Source : uint8_t { None, Atrm, Vfct, RomBar, RomRegisters };
   static const char* source_name(Source source);
 
   // check_atom_bios
@@ -56,6 +56,13 @@ class AmdVbios {
   // amdgpu_acpi_vfct_bios: `table` is the whole VFCT table. Returns the image of the card at `function` with this vendor and device ID, as a view into the table (empty if there is none,
   // the table is broken, or the image is not an AtomBIOS image).
   static ConstByteView find_in_vfct(ConstByteView table, PciAddress function, uint16_t vendor_id, uint16_t device_id);
+
+  // amdgpu_atrm_get_bios: the ATRM method (ATRM(offset, length) returns a buffer of the ROM's bytes) of a device in the ACPI namespace, called for 4096 byte pages from 0 until one comes back
+  // short, into an image of kAtrmBiosBytes (zeros where nothing came). The driver takes the first display device that has the method; this prefers the device whose _ADR is the card's
+  // (device << 16 | function) and then takes any, in the order of the namespace. A page that comes back longer than asked, or not a buffer, ends the reading (the driver copies it
+  // whatever its length). False if there is no such method or the image is no good. `aml` has the tables loaded.
+  static constexpr uint32_t kAtrmBiosPage = 4096, kAtrmBiosBytes = 256 * 1024;
+  static bool read_from_atrm(acpi::AmlInterpreter& aml, PciAddress function, allocators::IAllocator& allocator, ByteBuffer* out);
 
   // pci_get_rom_size: how much of an expansion ROM window is images - the images are chained, each says how long it is in 512 byte units and whether it is the last. 0 if the first is not an image.
   static uint64_t rom_size(ConstByteView window);
@@ -69,6 +76,7 @@ class AmdVbios {
   static bool read_from_rom_registers(IVcnRegisters& registers, allocators::IAllocator& allocator, ByteBuffer* out);
 
   struct Sources {
+    acpi::AmlInterpreter* aml = nullptr; // the machine's ACPI tables loaded, for the ATRM method
     ConstByteView vfct;                  // the VFCT table, if the machine has one
     IPciBus* pci = nullptr;              // for the expansion ROM
     IRegisterMapper* mapper = nullptr;

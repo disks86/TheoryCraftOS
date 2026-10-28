@@ -69,13 +69,27 @@ def main():
         fail('the valid signature')
     if '#define AMD_VBIOS_LENGTH(p) ((p)[2] << 9)' not in bios_c or 'uint32_t length = uint32_t{h[2]} << 9;' not in cpp:
         fail('the image length byte')
-    # the order of the sources for a discrete card: ATRM (not ported), VFCT, VRAM (not ported), platform (not ported), ROM BAR, ROM registers
+    # the order of the sources for a discrete card: ATRM, VFCT, VRAM (not ported), platform (not ported), ROM BAR, ROM registers
     dgpu = body(bios_c, 'amdgpu_get_bios_dgpu')
     if not order(dgpu, ['amdgpu_atrm_get_bios', 'amdgpu_acpi_vfct_bios', 'amdgpu_read_bios_from_vram', 'amdgpu_read_platform_bios', 'amdgpu_read_bios(adev)', 'amdgpu_read_bios_from_rom', 'amdgpu_read_disabled_bios']):
         fail('amdgpu_get_bios_dgpu changed its order')
     mine = body(cpp[cpp.index('AmdVbios::Source AmdVbios::find'):], 'AmdVbios::find') if False else squash(cpp[cpp.index('AmdVbios::Source AmdVbios::find'):])
-    if not order(mine, ['find_in_vfct', 'read_from_rom_bar', 'read_from_rom_registers']):
+    if not order(mine, ['read_from_atrm', 'find_in_vfct', 'read_from_rom_bar', 'read_from_rom_registers']):
         fail('AmdVbios::find is not in the order of the sources')
+    # the ATRM method: 256 KiB in pages of 4096, ATRM(offset, length), stopping at the first short page, then check_atom_bios
+    if '#define ATRM_BIOS_PAGE 4096' not in bios_c or 'kAtrmBiosPage = 4096, kAtrmBiosBytes = 256 * 1024' not in hpp:
+        fail('the ATRM page and image sizes')
+    atrm = body(bios_c, 'amdgpu_atrm_get_bios')
+    call = body(bios_c, 'amdgpu_atrm_call')
+    if 'int size = 256 * 1024;' not in atrm or 'for (i = 0; i < size / ATRM_BIOS_PAGE; i++)' not in atrm or 'if (ret < ATRM_BIOS_PAGE) break;' not in atrm or \
+            not order(atrm, ['amdgpu_atrm_call(atrm_handle, adev->bios, (i * ATRM_BIOS_PAGE), ATRM_BIOS_PAGE)', 'check_atom_bios(adev->bios, size)']) or 'acpi_get_handle(dhandle, "ATRM", &atrm_handle)' not in atrm:
+        fail('amdgpu_atrm_get_bios changed')
+    if not order(call, ['atrm_arg_elements[0].integer.value = offset', 'atrm_arg_elements[1].integer.value = len', 'acpi_evaluate_object(atrm_handle, NULL, &atrm_arg, &buffer)', 'memcpy(bios+offset, obj->buffer.pointer, obj->buffer.length)']):
+        fail('amdgpu_atrm_call changed')
+    mine_atrm = squash(cpp[cpp.index('bool AmdVbios::read_from_atrm'):cpp.index('AmdVbios::Source AmdVbios::find')])
+    if not order(mine_atrm, ['arguments[0].integer = uint64_t{page} * kAtrmBiosPage', 'arguments[1].integer = kAtrmBiosPage', 'aml.evaluate(method, arguments, 2, &result)',
+                             'if (result.length < kAtrmBiosPage) break;', 'is_atom_bios(image.view())']) or 'page < kAtrmBiosBytes / kAtrmBiosPage' not in mine_atrm or "name[0] == 'A' && name[1] == 'T' && name[2] == 'R' && name[3] == 'M'" not in cpp:
+        fail('read_from_atrm does not follow amdgpu_atrm_get_bios')
     # check_atom_bios
     chk = body(bios_c, 'check_atom_bios')
     for token in ('size < 0x49', 'bios[0x48] | (bios[0x49] << 8)', 'tmp = bios_header_start + 4', '"ATOM"', '"MOTA"'):

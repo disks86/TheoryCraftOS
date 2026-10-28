@@ -1063,10 +1063,23 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         inputs.pci_address = d.address;
         inputs.allow_asic_reset = !drives_display;
         if (inputs.allow_asic_reset) {
-          // The card's video BIOS, for the POST after a reset: the ACPI VFCT table, the expansion ROM, the ROM registers (not read when a reset is not allowed: nothing would use it).
+          // The card's video BIOS, for the POST after a reset: the ACPI ATRM method, the ACPI VFCT table, the expansion ROM, the ROM registers (not read when a reset is not allowed:
+          // nothing would use it). The ATRM method is AML of the machine's tables, so they are loaded into an interpreter of their own for the look (it is gone again afterwards).
           hardware::AcpiTables vfct_tables(st);
+          hardware::SystemAcpiHost atrm_host(&pci, paging_ok ? &mmio : nullptr);
+          acpi::AmlInterpreter atrm_aml(shared_allocator, atrm_host);
           hardware::AmdVbios::Sources sources;
-          if (vfct_tables.initialize()) sources.vfct = vfct_tables.find("VFCT");
+          if (vfct_tables.initialize()) {
+            sources.vfct = vfct_tables.find("VFCT");
+            const ConstByteView dsdt = vfct_tables.dsdt();
+            if (!dsdt.empty()) atrm_aml.load_table(dsdt);
+            for (uint32_t n = 0; n < 32; ++n) {
+              const ConstByteView ssdt = vfct_tables.find_nth("SSDT", n);
+              if (ssdt.empty()) break;
+              atrm_aml.load_table(ssdt);
+            }
+            sources.aml = &atrm_aml;
+          }
           sources.pci = &pci;
           sources.mapper = &register_mapper;
           sources.registers = &vega_registers;

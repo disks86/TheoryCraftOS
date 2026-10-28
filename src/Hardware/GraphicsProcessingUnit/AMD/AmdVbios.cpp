@@ -18,7 +18,7 @@
 
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdVbios.hpp"
 
-// Follows the Linux amdgpu driver (Copyright Advanced Micro Devices, Inc.; MIT license): amdgpu_bios.c (check_atom_bios, amdgpu_acpi_vfct_bios, amdgpu_read_bios,
+// Follows the Linux amdgpu driver (Copyright Advanced Micro Devices, Inc.; MIT license): amdgpu_bios.c (check_atom_bios, amdgpu_atrm_get_bios, amdgpu_acpi_vfct_bios, amdgpu_read_bios,
 // amdgpu_read_bios_from_rom, amdgpu_get_bios_dgpu), vi.c (vi_read_bios_from_rom), atombios.h (UEFI_ACPI_VFCT, VFCT_IMAGE_HEADER), and the PCI core's pci_get_rom_size.
 // scripts/check_vbios_port.py checks the numbers against them.
 
@@ -39,6 +39,7 @@ uint32_t le32(ConstByteView v, uint64_t at) { return v[at] | (v[at + 1] << 8) | 
 const char* AmdVbios::source_name(Source source) {
   switch (source) {
     case Source::None: return "none";
+    case Source::Atrm: return "ACPI ATRM method";
     case Source::Vfct: return "ACPI VFCT";
     case Source::RomBar: return "PCI expansion ROM";
     case Source::RomRegisters: return "the card's ROM registers";
@@ -152,7 +153,73 @@ bool AmdVbios::read_from_rom_registers(IVcnRegisters& registers, allocators::IAl
   return out->append(image.view());
 }
 
+namespace {
+constexpr uint32_t kMaxAtrmWalk = 4096, kMaxAtrmDepth = 16;
+
+// A device of the namespace with a method called ATRM of its own
+acpi::Node* atrm_method_of(acpi::AmlInterpreter& aml, acpi::Node* device) {
+  for (acpi::Node* n = aml.first_child(device); n; n = aml.next_sibling(n)) {
+    const char* name = aml.name_of(n);
+    if (aml.is_method(n) && name[0] == 'A' && name[1] == 'T' && name[2] == 'R' && name[3] == 'M') return n;
+  }
+  return nullptr;
+}
+
+// The ATRM method of the first device (in namespace order) that has one and, if `adr` is given, whose _ADR is it
+acpi::Node* find_atrm(acpi::AmlInterpreter& aml, acpi::Node* node, uint32_t depth, bool match_adr, uint64_t adr, uint32_t* visited) {
+  for (acpi::Node* n = aml.first_child(node); n; n = aml.next_sibling(n)) {
+    if (++*visited > kMaxAtrmWalk) return nullptr;
+    if (!aml.is_device(n)) {
+      if (depth < kMaxAtrmDepth) {   // (scopes hold devices too)
+        if (acpi::Node* found = find_atrm(aml, n, depth + 1, match_adr, adr, visited)) return found;
+      }
+      continue;
+    }
+    if (acpi::Node* method = atrm_method_of(aml, n)) {
+      uint64_t device_adr = 0;
+      acpi::Node* adr_node = aml.find("_ADR", n);
+      const bool has_adr = adr_node && aml.parent(adr_node) == n && aml.evaluate_integer(adr_node, &device_adr);
+      if (!match_adr || (has_adr && device_adr == adr)) return method;
+    }
+    if (depth < kMaxAtrmDepth) {
+      if (acpi::Node* found = find_atrm(aml, n, depth + 1, match_adr, adr, visited)) return found;
+    }
+  }
+  return nullptr;
+}
+}  // namespace
+
+bool AmdVbios::read_from_atrm(acpi::AmlInterpreter& aml, PciAddress function, allocators::IAllocator& allocator, ByteBuffer* out) {
+  uint32_t visited = 0;
+  const uint64_t adr = (uint64_t{function.device} << 16) | function.function;
+  acpi::Node* method = find_atrm(aml, aml.root(), 0, true, adr, &visited);
+  if (!method) {
+    visited = 0;
+    method = find_atrm(aml, aml.root(), 0, false, 0, &visited);
+  }
+  if (!method) return false;
+  ByteBuffer image(allocator);
+  if (!image.put_zeros(kAtrmBiosBytes)) return false;
+  const ByteView bytes = image.writable_view();
+  for (uint32_t page = 0; page < kAtrmBiosBytes / kAtrmBiosPage; ++page) {
+    acpi::Value arguments[2];
+    arguments[0].kind = acpi::ValueKind::Integer;
+    arguments[0].integer = uint64_t{page} * kAtrmBiosPage;
+    arguments[1].kind = acpi::ValueKind::Integer;
+    arguments[1].integer = kAtrmBiosPage;
+    acpi::Value result;
+    if (!aml.evaluate(method, arguments, 2, &result)) break;                     // failed to evaluate ATRM
+    if (result.kind != acpi::ValueKind::Buffer || result.length > kAtrmBiosPage) break;
+    if (result.length != 0) bytes.subview(uint64_t{page} * kAtrmBiosPage, result.length).copy_from(ConstByteView(result.bytes, result.length));
+    if (result.length < kAtrmBiosPage) break;
+  }
+  if (!is_atom_bios(image.view())) return false;
+  out->clear();
+  return out->append(image.view());
+}
+
 AmdVbios::Source AmdVbios::find(const Sources& s, ByteBuffer* out) {
+  if (s.aml && s.allocator && read_from_atrm(*s.aml, s.function, *s.allocator, out)) return Source::Atrm;
   if (s.vfct.size() != 0) {
     const ConstByteView image = find_in_vfct(s.vfct, s.function, s.vendor_id, s.device_id);
     if (image.size() != 0) {
