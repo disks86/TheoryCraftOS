@@ -54,6 +54,7 @@ uint32_t nt_query_section(Process& p, const SyscallRequest& r);
 uint32_t nt_open_section(Process& p, const SyscallRequest& r);
 uint32_t nt_map_view_of_section(Process& p, const SyscallRequest& r);
 uint32_t nt_unmap_view_of_section(Process& p, const SyscallRequest& r);
+uint32_t nt_are_mapped_files_the_same(Process& p, const SyscallRequest& r);
 uint32_t nt_flush_virtual_memory(Process& p, const SyscallRequest& r);
 // NtQueryObject(Handle, Class, Buffer, Length, ReturnLength) and NtSetInformationObject(Handle, Class, Buffer, Length): basic information, the type name and the
 // handle flags (inherit, protect from close).

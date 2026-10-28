@@ -886,6 +886,21 @@ uint32_t nt_unmap_view_of_section(Process& p, const SyscallRequest& r) {
   return p.runtime()->remote_operation(pid, op);
 }
 
+// NtAreMappedFilesTheSame(Address1, Address2): both have to lie in a view; the answer is yes for two addresses of one view and NOT_SAME_DEVICE for any other pair.
+uint32_t nt_are_mapped_files_the_same(Process& p, const SyscallRequest& r) {
+  constexpr uint32_t kInvalidAddress = 0xC0000141u, kConflictingAddresses = 0xC0000018u, kNotSameDevice = 0xC00000D4u;
+  AddressSpace* space = p.address_space();
+  if (!space) return kNotImplemented;
+  if (r.args[0] == 0 || r.args[1] == 0) return kInvalidAddress;
+  uint64_t base[2] = {};
+  for (uint32_t i = 0; i < 2; ++i) {
+    PageAttributes attributes;
+    if (!space->attributes_at(AddressSpace::round_down(r.args[i]), &attributes) || (attributes.type != PageAttributes::Mapped && attributes.type != PageAttributes::Image)) return kConflictingAddresses;
+    if (!space->allocation_base(AddressSpace::round_down(r.args[i]), &base[i])) return kConflictingAddresses;
+  }
+  return base[0] == base[1] ? kSuccess : kNotSameDevice;
+}
+
 // NtFlushVirtualMemory(Process, PVOID* BaseAddress, PSIZE_T RegionSize, PIO_STATUS_BLOCK): a view of a file goes back to the file.
 uint32_t nt_flush_virtual_memory(Process& p, const SyscallRequest& r) {
   AddressSpace* space = p.address_space();

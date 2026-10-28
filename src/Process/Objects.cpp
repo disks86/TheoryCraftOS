@@ -56,7 +56,14 @@ void ObjectManager::notify() {
 
 ObjectManager::Object* ObjectManager::find_locked(StringView name) {
   if (name.empty()) return nullptr;
-  for (Object& o : objects_) if (o.kind != ObjectKind::None && o.name_size != 0 && same_name(o.name, o.name_size, name)) return &o;
+  for (Object& o : objects_) {
+    if (o.kind == ObjectKind::None || o.name_size == 0) continue;
+    if (o.kind == ObjectKind::Section) {      // (the names of file mappings are matched exactly; the other objects' ignore case)
+      if (o.name_size == name.size() && StringView(o.name, o.name_size) == name) return &o;
+    } else if (same_name(o.name, o.name_size, name)) {
+      return &o;
+    }
+  }
   return nullptr;
 }
 

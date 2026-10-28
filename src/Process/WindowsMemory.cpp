@@ -108,7 +108,7 @@ uint32_t vm_allocate(Process& target, uint64_t* base_io, uint64_t* size_io, uint
   if (size == 0) return kStatusInvalidParameter;
   if ((protect & 0xFF) == kPageWriteCopy || (protect & 0xFF) == kPageExecuteWriteCopy) {      // private memory is not copy-on-write; only a view can be (committing into a view is checked below)
     PageAttributes existing;
-    if (base == 0 || !space->attributes_at(AddressSpace::round_down(base), &existing) || existing.type != PageAttributes::Mapped) return kStatusInvalidPageProtection;
+    if (base == 0 || !space->attributes_at(AddressSpace::round_down(base), &existing) || (existing.type != PageAttributes::Mapped && existing.type != PageAttributes::Image)) return kStatusInvalidPageProtection;
   }
   if (!(type & kMemCommit)) prot = 0;      // reserved memory cannot be touched until it is committed
   uint64_t rounded = 0;
