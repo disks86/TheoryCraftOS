@@ -84,6 +84,11 @@ void init(efi::SystemTable* st) {
 
 void use_gpu(hardware::IGraphicsProcessingUnit* gpu) { g_graphics.attach(gpu); }
 
+void show_banner(ArrayView<const uint32_t> pixels, uint32_t width, uint32_t height) {
+  Guard guard;
+  g_graphics.show_banner(pixels, width, height);
+}
+
 void set_debug_output(bool enabled) {
   Guard guard;
   g_debug_enabled = enabled;
