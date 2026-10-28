@@ -650,7 +650,16 @@ uint32_t nt_set_information_file(Process& p, const SyscallRequest& r) {
       if (!util::append_utf8_from_utf16le(&name, ConstByteView(units, name_bytes))) return kNoMemory;
       if (files.resolve(name.view(), &target) != PathResult::Ok) return kObjectNameInvalid;
       DirectoryEntry existing;
-      if (files.stat(target.view(), &existing) == Status::Ok) {
+      auto same_ignoring_case = [](StringView a, StringView b) {
+        if (a.size() != b.size()) return false;
+        for (uint64_t i = 0; i < a.size(); ++i) {
+          const char x = a[i] >= 'A' && a[i] <= 'Z' ? char(a[i] + 32) : a[i], y = b[i] >= 'A' && b[i] <= 'Z' ? char(b[i] + 32) : b[i];
+          if (x != y) return false;
+        }
+        return true;
+      };
+      const bool respelled = same_ignoring_case(object->path.view(), target.view()) && object->path.view() != target.view();
+      if (!respelled && files.stat(target.view(), &existing) == Status::Ok) {
         if (!header[0]) return kObjectNameCollision;
         status = nt_status(files.remove(target.view()));
       }

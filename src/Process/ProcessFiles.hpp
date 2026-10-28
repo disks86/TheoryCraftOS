@@ -159,6 +159,7 @@ class ProcessFiles {
     bool inherit = false, protect = false;      // Windows handle flags: a child process gets the handle (CreateProcess with bInheritHandles); it cannot be closed
   };
   bool host_path(StringView virtual_path, String* out) const;
+  bool fold_case(String* path, uint64_t prefix_size) const;
 
  public:
   // The path in the OS file system of a path inside this process's tree (what the file system underneath is asked for).
