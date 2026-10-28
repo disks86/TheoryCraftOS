@@ -282,6 +282,131 @@ int main() {
       if (round == 0) CHECK(store.add(local_minutes(kDay, 11, 0), 0, 0, "New") == 8);   // (numbers go on after the old ones)
     }
   }
+  {
+    // Holidays that move: the 4th Thursday of November, the last Monday of May, the 1st Monday of every month.
+    auto day = [](int32_t y, int32_t m, int32_t d) { return gui::days_from_date({y, m, d}); };
+    Recurrence thanksgiving, memorial, first_monday, fifth_friday;
+    thanksgiving.kind = Repeat::Yearly;
+    thanksgiving.on = On::NthWeekday;
+    memorial.kind = Repeat::Yearly;
+    memorial.on = On::LastWeekday;
+    first_monday.kind = Repeat::Monthly;
+    first_monday.on = On::NthWeekday;
+    fifth_friday = first_monday;
+    CHECK(recurrence_fits(day(2026, 11, 26), thanksgiving));
+    CHECK(recurrence_fits(day(2026, 5, 25), memorial) && !recurrence_fits(day(2026, 5, 18), memorial));                    // not the last Monday
+    CHECK(!recurrence_fits(day(2026, 5, 25), Recurrence{Repeat::Weekly, 1, -1, On::LastWeekday}));                         // only months and years
+    int found = 0;
+    for (int32_t year = 2027; year <= 2090; ++year) {
+      const int64_t t = next_occurrence_day(day(2026, 11, 26), thanksgiving, day(year, 1, 1));
+      const gui::Date d = gui::date_from_days(t);
+      CHECK(d.year == year && d.month == 11 && gui::weekday(d) == 4 && (d.day - 1) / 7 == 3);   // Thursday, the 4th
+      const gui::Date m = gui::date_from_days(next_occurrence_day(day(2026, 5, 25), memorial, day(year, 1, 1)));
+      CHECK(m.year == year && m.month == 5 && gui::weekday(m) == 1 && m.day + 7 > gui::days_in_month(year, 5));   // Monday, the last
+      found += d.year == year && m.year == year;
+    }
+    CHECK(found == 64);
+    CHECK(gui::date_from_days(next_occurrence_day(day(2026, 11, 26), thanksgiving, day(2027, 1, 1))) == Date({2027, 11, 25}));
+    CHECK(gui::date_from_days(next_occurrence_day(day(2026, 11, 26), thanksgiving, day(2028, 1, 1))) == Date({2028, 11, 23}));
+    CHECK(gui::date_from_days(next_occurrence_day(day(2026, 5, 25), memorial, day(2027, 1, 1))) == Date({2027, 5, 31}));
+    // Every month's first Monday (2026-10-05 is one); the days between are skipped.
+    CHECK(gui::date_from_days(next_occurrence_day(day(2026, 10, 5), first_monday, day(2026, 10, 6))) == Date({2026, 11, 2}));
+    CHECK(gui::date_from_days(next_occurrence_day(day(2026, 10, 5), first_monday, day(2026, 12, 1))) == Date({2026, 12, 7}));
+    // A 5th Friday is the last one: July 31st 2026 -> August 28th.
+    CHECK(recurrence_fits(day(2026, 7, 31), fifth_friday));
+    CHECK(gui::date_from_days(next_occurrence_day(day(2026, 7, 31), fifth_friday, day(2026, 8, 1))) == Date({2026, 8, 28}));
+
+    filesystem::RamFileSystem files(a);
+    uint32_t id = 0;
+    {
+      CalendarStore store(a, &files);
+      CHECK(store.add(local_minutes({2026, 5, 18}, 0, 0), 1440, 0, "Not the last Monday", memorial) == 0);   // refused
+      id = store.add(local_minutes({2026, 11, 26}, 0, 0), 1440, 0, "Thanksgiving", thanksgiving);
+      CHECK(id != 0 && store.has_events_on(day(2027, 11, 25)) && !store.has_events_on(day(2027, 11, 26)));
+    }
+    {
+      CalendarStore store(a, &files);   // (kept as it was saved)
+      CalendarStore::Event e(a);
+      CHECK(store.get(id, &e) && e.recurrence.kind == Repeat::Yearly && e.recurrence.on == On::NthWeekday && e.all_day());
+      CHECK(store.has_events_on(day(2028, 11, 23)));
+      List<CalendarStore::Due> due(a);
+      store.take_due(local_minutes({2027, 11, 25}, 0, 0), &due);
+      CHECK(due.count() == 1 && due[0].start == local_minutes({2027, 11, 25}, 0, 0) && due[0].all_day() && due[0].title.view().equals("Thanksgiving"));
+    }
+  }
+  {
+    // One occurrence at a time: moved, retitled, cancelled, brought back.
+    auto day = [](int32_t y, int32_t m, int32_t d) { return gui::days_from_date({y, m, d}); };
+    filesystem::RamFileSystem files(a);
+    uint32_t id = 0;
+    const Recurrence weekly{Repeat::Weekly, 1, -1};
+    {
+      CalendarStore store(a, &files);
+      id = store.add(local_minutes({2026, 10, 27}, 18, 0), 60, 10, "Class", weekly);
+      CHECK(id && store.exception_count() == 0);
+      CHECK(!store.change_occurrence(id, day(2026, 10, 28), local_minutes({2026, 10, 28}, 9, 0), 30, "x"));   // not a day of the rule
+      CHECK(!store.change_occurrence(999, day(2026, 11, 3), local_minutes({2026, 11, 3}, 9, 0), 30, "x"));
+      CHECK(!store.change_occurrence(id, day(2026, 11, 3), local_minutes({2026, 11, 3}, 9, 0), 30, ""));
+      CHECK(store.change_occurrence(id, day(2026, 11, 3), local_minutes({2026, 11, 4}, 19, 0), 90, "Class (moved)"));
+      CHECK(store.exception_count() == 1);
+
+      List<CalendarStore::Occurrence> list(a);
+      store.occurrences_on(day(2026, 11, 3), &list);
+      CHECK(list.count() == 0 && !store.has_events_on(day(2026, 11, 3)));   // moved away
+      store.occurrences_on(day(2026, 11, 4), &list);
+      CHECK(list.count() == 1 && list[0].id == id && list[0].changed && list[0].original_day == day(2026, 11, 3) && list[0].start == local_minutes({2026, 11, 4}, 19, 0) &&
+            list[0].minutes == 90 && list[0].title.view().equals("Class (moved)") && store.has_events_on(day(2026, 11, 4)));
+      list.clear();
+      store.occurrences_on(day(2026, 11, 10), &list);
+      CHECK(list.count() == 1 && !list[0].changed && list[0].title.view().equals("Class") && list[0].start == local_minutes({2026, 11, 10}, 18, 0));
+
+      CHECK(store.cancel_occurrence(id, day(2026, 11, 10)) && !store.has_events_on(day(2026, 11, 10)) && store.has_events_on(day(2026, 11, 17)));
+      CHECK(!store.cancel_occurrence(id, day(2026, 11, 11)));
+      CHECK(store.exception_count() == 2);
+      CHECK(store.change_occurrence(id, day(2026, 11, 3), local_minutes({2026, 11, 3}, 20, 0), 90, "Class (again)"));   // a change can be changed
+      CHECK(store.exception_count() == 2);
+    }
+    {
+      CalendarStore store(a, &files);   // the restart keeps them
+      CHECK(store.exception_count() == 2 && !store.has_events_on(day(2026, 11, 10)) && store.has_events_on(day(2026, 11, 3)));
+      List<CalendarStore::Occurrence> list(a);
+      store.occurrences_on(day(2026, 11, 3), &list);
+      CHECK(list.count() == 1 && list[0].title.view().equals("Class (again)") && list[0].start == local_minutes({2026, 11, 3}, 20, 0));
+
+      // Reminders: the series skips what has an exception; a changed occurrence has its own.
+      List<CalendarStore::Due> due(a);
+      store.take_due(local_minutes({2026, 11, 3}, 17, 50), &due);
+      CHECK(due.count() == 0);   // 18:00 was moved to 20:00
+      store.take_due(local_minutes({2026, 11, 3}, 19, 50), &due);
+      CHECK(due.count() == 1 && due[0].start == local_minutes({2026, 11, 3}, 20, 0) && due[0].minutes == 90 && due[0].title.view().equals("Class (again)"));
+      due.clear();
+      store.take_due(local_minutes({2026, 11, 3}, 19, 55), &due);
+      CHECK(due.count() == 0);   // once
+      store.take_due(local_minutes({2026, 11, 10}, 17, 50), &due);
+      CHECK(due.count() == 0);   // cancelled
+      store.take_due(local_minutes({2026, 11, 17}, 17, 50), &due);
+      CHECK(due.count() == 1 && due[0].start == local_minutes({2026, 11, 17}, 18, 0) && due[0].title.view().equals("Class"));
+    }
+    {
+      CalendarStore store(a, &files);
+      CHECK(store.exception_count() == 2);
+      List<CalendarStore::Due> due(a);
+      store.take_due(local_minutes({2026, 11, 3}, 19, 58), &due);
+      CHECK(due.count() == 0);   // the restart did not announce the changed one again
+      CHECK(store.restore_occurrence(id, day(2026, 11, 10)) && store.has_events_on(day(2026, 11, 10)) && !store.restore_occurrence(id, day(2026, 11, 10)));
+      CHECK(store.exception_count() == 1);
+
+      // Changing only the title or time of the series keeps the exceptions; changing the days drops them.
+      CHECK(store.update(id, local_minutes({2026, 10, 27}, 17, 0), 60, 10, "Course", weekly) && store.exception_count() == 1);
+      CHECK(store.update(id, local_minutes({2026, 10, 28}, 17, 0), 60, 10, "Course", weekly) && store.exception_count() == 0 && store.has_events_on(day(2026, 11, 4)));
+      CHECK(store.change_occurrence(id, day(2026, 11, 4), local_minutes({2026, 11, 4}, 12, 0), 30, "Lunch"));
+      CHECK(store.remove(id) && store.exception_count() == 0 && !store.has_events_on(day(2026, 11, 4)));
+    }
+    {
+      CalendarStore store(a, &files);
+      CHECK(store.count() == 0 && store.exception_count() == 0);
+    }
+  }
   CHECK(a.live == 0);
   if (g_failed) {
     printf("CalendarStoreTest: %d FAILED\n", g_failed);
