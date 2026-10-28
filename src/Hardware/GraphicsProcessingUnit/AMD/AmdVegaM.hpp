@@ -35,6 +35,7 @@
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdAux.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdDdc.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AtomConnectors.hpp"
+#include "Hardware/GraphicsProcessingUnit/AMD/Dpcd.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AtomI2c.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdSmu7Ucode.hpp"
 #include "Hardware/Mmio.hpp"
@@ -175,6 +176,10 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
   // card is not up, the connector has no DDC line in the table or no GPIO entry, nothing answers, or the EDID never checked. (An eDP panel that is not powered does not answer: the panel power is not done.)
   // It takes the bus for some tens of milliseconds, so it is for the desktop loop, not an interrupt path.
   bool read_edid(const AtomConnectors::Connector& connector, ByteBuffer* out);
+  // The DisplayPort configuration data of the sink on a DisplayPort or eDP connector, read over the AUX channel (the same way, with the same eDP panel power-up, as read_edid): the receiver's
+  // capabilities, and for `status` (optional) the link status. False if the connector is not a DisplayPort one, nothing answers, or what answers is no DPCD. Like read_edid it takes the AUX
+  // channel for some milliseconds, so it is for the desktop loop (or the handler of a hot plug), not an interrupt path.
+  bool read_dpcd(const AtomConnectors::Connector& connector, Dpcd::Capabilities* capabilities, Dpcd::LinkStatus* status = nullptr);
   ArrayView<const AtomConnectors::Connector> connectors() const { return ArrayView<const AtomConnectors::Connector>(connectors_, connector_count_); }
   uint32_t hotplug_events_dropped() const { return hotplug_dropped_; }
   // The audio endpoints of the display engine (amd_dce11::AudioPins, dce_v11_0_audio_get_connected_pins): bit n of the mask is set when endpoint n has a port (its default configuration's
@@ -252,6 +257,7 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
   HotplugEvent hotplug_[kMaxHotplugEvents];
   AtomConnectors::Connector connectors_[AtomConnectors::kMaxConnectors];
   uint32_t connector_count_ = 0;
+  void power_up_panel(const AtomConnectors::Connector& connector, IAtomHost& host, AtomBios& bios);   // an eDP panel's power, before its AUX channel is used
   uint32_t audio_pins_ = 0;
   uint32_t hotplug_head_ = 0, hotplug_count_ = 0, hotplug_dropped_ = 0, connected_pins_ = 0, throttle_reported_ = 0;
   AmdIrq::ISink* observer_ = nullptr;

@@ -1582,6 +1582,73 @@ static void test_read_edid() {
   CHECK(!vega.read_edid(hdmi, &out));
 }
 
+// The sink's DPCD over the AUX channel of the DisplayPort and eDP connectors (through the video BIOS's table, with the panel power-up for the eDP one).
+static void test_read_dpcd() {
+  const std::vector<uint8_t> vbios = make_connector_vbios();   // eDP (DDC line 0x92, pin 0), HDMI-A (0x91), DisplayPort (0x93, pin 2)
+  Rig rig;
+  FakeI2cMonitor monitor;
+  FakeAuxCard auxcard;
+  rig.card.monitor = &monitor;
+  AmdVegaM vega(rig.alloc);
+  AmdVegaM::Inputs in = rig.inputs();
+  in.vbios = ConstByteView(vbios.data(), vbios.size());
+  Dpcd::Capabilities caps;
+  Dpcd::LinkStatus status;
+  CHECK(!vega.read_dpcd(AtomConnectors::Connector(), &caps));       // (not up)
+  CHECK(vega.bring_up(in));
+  if (!vega.up()) return;
+  const AtomConnectors::Connector edp = vega.connectors()[0], hdmi = vega.connectors()[1], dp = vega.connectors()[2];
+  rig.card.aux = &auxcard;
+  std::vector<uint8_t>& dpcd = auxcard.sink.dpcd;
+  dpcd.assign(0x800, 0);
+  const uint8_t dp_caps[8] = {0x12, 0x14, 0xC4, 0x01, 0x00, 0x00, 0x01, 0x00};
+  for (size_t i = 0; i < 8; ++i) dpcd[i] = dp_caps[i];
+  const uint8_t dp_status[8] = {0x01, 0x00, 0x77, 0x77, 0x81, 0x01, 0x00, 0x00};
+  for (size_t i = 0; i < 8; ++i) dpcd[0x200 + i] = dp_status[i];
+  // DisplayPort: capabilities, then the link status as well; the table is told the connector's line and pin; no panel power
+  CHECK(vega.read_dpcd(dp, &caps) && caps.valid && caps.revision == 0x12 && caps.max_lanes == 4 && caps.max_link_rate_kbps() == 5400000 && caps.edp_revision == Dpcd::kNoEdp);
+  CHECK(!auxcard.sink.requests.empty() && auxcard.sink.requests.front().channel == 0x93 && auxcard.sink.requests.front().hpd == 2 && auxcard.panel_writes == 0);
+  CHECK(auxcard.sink.requests.front().bytes.size() == 4 && auxcard.sink.requests.front().bytes[2] == 0x90);       // a native read (9) of address 0
+  CHECK(vega.read_dpcd(dp, &caps, &status) && status.link_status_updated() && status.channel_eq_ok(4) && status.sink_count() == 1);
+  // eDP: powered up first (the panel answers only then), the panel's own rate table
+  dpcd[0x700] = 0x03;
+  dpcd[0x10] = 0xA4; dpcd[0x11] = 0x1F;       // 8100: 1.62 Gbit/s
+  dpcd[0x12] = 0x30; dpcd[0x13] = 0x2A;       // 10800: 2.16 Gbit/s
+  auxcard.unpowered_channel = 0x92;
+  rig.card.gfx.set_reg(0x1898, 0x2);
+  CHECK(!auxcard.panel_on && vega.read_dpcd(edp, &caps, &status) && auxcard.panel_on && auxcard.panel_writes == 1 && auxcard.panel_params == 0x0C000000u);
+  CHECK(caps.edp_revision == 3 && caps.edp_rate_count == 2 && caps.edp_rates_khz[0] == 1620000 && caps.edp_rates_khz[1] == 2160000);
+  CHECK(auxcard.sink.requests.back().channel == 0x92 && auxcard.sink.requests.back().hpd == 0);
+  auxcard.unpowered_channel = 0;
+  // a DisplayPort connector does not read the eDP registers
+  const size_t before = auxcard.sink.requests.size();
+  CHECK(vega.read_dpcd(dp, &caps) && caps.edp_revision == Dpcd::kNoEdp && auxcard.sink.requests.size() == before + 1);
+  // not a DisplayPort connector, no DDC line, an unknown line: nothing is asked
+  const size_t asked = auxcard.sink.requests.size();
+  AtomConnectors::Connector no_ddc = dp;
+  no_ddc.has_ddc = false;
+  AtomConnectors::Connector unknown = dp;
+  unknown.ddc_id = 0x77;
+  CHECK(!vega.read_dpcd(hdmi, &caps) && !vega.read_dpcd(no_ddc, &caps) && !vega.read_dpcd(unknown, &caps) && auxcard.sink.requests.size() == asked);
+  // nothing answers / not a DPCD / a link status that does not come: caps are left alone
+  caps = Dpcd::Capabilities();
+  auxcard.sink.monitor_present = true;
+  auxcard.sink.timeouts = 1000;
+  CHECK(!vega.read_dpcd(dp, &caps) && !caps.valid);
+  auxcard.sink.timeouts = 0;
+  dpcd[1] = 0;
+  CHECK(!vega.read_dpcd(dp, &caps) && !caps.valid);
+  dpcd[1] = 0x14;
+  CHECK(vega.read_dpcd(dp, &caps) && caps.valid);
+  dpcd.resize(0x203);       // (a short DPCD: the status read is outside it)
+  caps = Dpcd::Capabilities();
+  CHECK(!vega.read_dpcd(dp, &caps, &status) && !caps.valid);
+  CHECK(vega.read_dpcd(dp, &caps) && caps.valid);
+  CHECK(auxcard.sink.malformed == 0);
+  vega.shutdown();
+  CHECK(!vega.read_dpcd(dp, &caps));
+}
+
 // The connectors in the hot plug events: named from the video BIOS's object table, absent without one or for a pin it does not list.
 static void test_hotplug_connectors() {
   const std::vector<uint8_t> vbios = make_connector_vbios();
@@ -1753,6 +1820,7 @@ int main() {
   test_hotplug_connectors();
   test_audio_pins();
   test_read_edid();
+  test_read_dpcd();
   printf(g_failed ? "AmdVegaMTest: %d FAILED\n" : "AmdVegaMTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }

@@ -428,7 +428,24 @@ class DisplayHpdSense final : public IHpdSense {
  private:
   amd_dce11::Interrupts* irq_;
 };
+
+// The AUX channel of a DisplayPort or eDP connector with the interpreter that drives it
+struct AuxSession {
+  PostHost host;
+  AtomBios bios;
+  AmdAux aux;
+  AuxSession(IVcnRegisters& registers, const IClock& clock, ConstByteView vbios, allocators::IAllocator& allocator, const AtomConnectors::Connector& connector)
+      : host(registers, clock), bios(host, vbios, allocator), aux(host, bios, connector.ddc_id, connector.hpd_pin) {}
+};
 }  // namespace
+
+// An eDP panel does not answer on the AUX channel without power: the driver powers it up first and waits for the hot plug pin to show it. (If the wait times out the AUX channel is tried
+// anyway, as the driver does.)
+void AmdVegaM::power_up_panel(const AtomConnectors::Connector& connector, IAtomHost& host, AtomBios& bios) {
+  if (connector.type != AtomConnectors::Type::EmbeddedDisplayPort) return;
+  DisplayHpdSense sense(display_irq_.get());
+  AmdPanelPower::power_on(host, bios, sense, connector.hpd_pin);
+}
 
 bool AmdVegaM::read_edid(const AtomConnectors::Connector& connector, ByteBuffer* out) {
   if (!up() || !inputs_.registers || !inputs_.clock || !connector.has_ddc) return false;
@@ -437,16 +454,23 @@ bool AmdVegaM::read_edid(const AtomConnectors::Connector& connector, ByteBuffer*
   if (!AtomConnectors::uses_aux(connector.type)) return AmdDdc(*inputs_.registers, *inputs_.clock, bus).read_edid(out);
   // DisplayPort and eDP: I2C over the AUX channel, which the video BIOS drives (ProcessAuxChannelTransaction)
   if (!inputs_.allocator) return false;
-  PostHost host(*inputs_.registers, *inputs_.clock);
-  AtomBios bios(host, inputs_.vbios, *inputs_.allocator);
-  if (!bios.valid()) return false;
-  // An eDP panel does not answer on the AUX channel without power: the driver powers it up first and waits for the hot plug pin to show it. (If the wait times out the AUX channel
-  // is tried anyway, as the driver does.)
-  if (connector.type == AtomConnectors::Type::EmbeddedDisplayPort) {
-    DisplayHpdSense sense(display_irq_.get());
-    AmdPanelPower::power_on(host, bios, sense, connector.hpd_pin);
-  }
-  return AmdAux(host, bios, connector.ddc_id, connector.hpd_pin).read_edid(out);
+  AuxSession session(*inputs_.registers, *inputs_.clock, inputs_.vbios, *inputs_.allocator, connector);
+  if (!session.bios.valid()) return false;
+  power_up_panel(connector, session.host, session.bios);
+  return session.aux.read_edid(out);
+}
+
+bool AmdVegaM::read_dpcd(const AtomConnectors::Connector& connector, Dpcd::Capabilities* capabilities, Dpcd::LinkStatus* status) {
+  if (!up() || !inputs_.registers || !inputs_.clock || !inputs_.allocator || !connector.has_ddc || !AtomConnectors::uses_aux(connector.type)) return false;
+  if (!AtomI2c::lookup(inputs_.vbios, connector.ddc_id).valid) return false;
+  AuxSession session(*inputs_.registers, *inputs_.clock, inputs_.vbios, *inputs_.allocator, connector);
+  if (!session.bios.valid()) return false;
+  power_up_panel(connector, session.host, session.bios);
+  Dpcd::Capabilities caps;
+  if (!Dpcd::read_capabilities(session.aux, connector.type == AtomConnectors::Type::EmbeddedDisplayPort, &caps)) return false;
+  if (status && !Dpcd::read_link_status(session.aux, status)) return false;
+  *capabilities = caps;
+  return true;
 }
 
 uint32_t AmdVegaM::refresh_audio_pins() {

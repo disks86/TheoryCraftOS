@@ -699,3 +699,22 @@ was empty): the encoder object numbers (UNIPHY 0x1E, UNIPHY1 0x20, UNIPHY2 0x21,
 `amdgpu_atombios_get_connector_info_from_object_table`, and that enumeration 2 is link B. Not done: the encoder object table of the object header (capabilities of the encoders), the DIG's use for mode setting, and the
 bridge's own handling (`amdgpu_encoder_get_dp_bridge_encoder_id`). `tests/AtomConnectorsTest.cpp` (every transmitter and link, merged paths, the object id limit, bridges, device masks, the truncation and bit-flip sweeps
 over a board with encoders) and `AmdVegaMTest::test_audio_pins` (the XPS-like board's DIGs and the first-connected-endpoint rule as the endpoints change) cover it.
+
+### The sink's DPCD over the AUX channel
+
+A DisplayPort sink describes itself in the DisplayPort Configuration Data (DPCD), a register space read with native AUX requests (`AmdAux::dpcd_read`, up to 16 bytes at a time). `Dpcd` (behind the `IDpcdAux`
+interface that `AmdAux` implements) reads and parses two parts of it. **Capabilities** (`Dpcd::read_capabilities`): the receiver field 0x000..0x00F - the DPCD revision (0x10 is 1.0 .. 0x14 is 1.4), the fastest
+link rate per lane (`max_link_rate_code` in 0.27 Gbit/s units: 0x06, 0x0A, 0x14, 0x1E are RBR, HBR, HBR2, HBR3; `max_link_rate_kbps()`), the most lanes (1, 2 or 4) with the TPS3 and enhanced framing bits, the
+downspread and AUX-handshake bits, the number of receiver ports, the downstream port (a dongle's type, format conversion, port count, OUI support) and the 8b/10b coding bit - and for an eDP connector the panel's DPCD
+revision (0x700) and, from eDP 1.4, its own table of up to eight link rates (0x010.., 16-bit, 200 kHz units, ended by a zero). Bytes that are no DPCD (a revision below 1.0, no rate, a lane count other than 1, 2 or 4)
+are refused, so a bus that reads zeros or ones is not taken for a sink. **Link status** (`Dpcd::read_link_status`): 0x200..0x207 - the sink count (7 bits, the high one in bit 7), the service interrupt vector
+(automated test request, content protection, sink specific), the training status of each lane, the lane alignment and its link-status-updated and downstream-port-changed bits, the sink status and the adjust
+requests; `clock_recovery_ok(lanes)` and `channel_eq_ok(lanes)` are `drm_dp_clock_recovery_ok` / `drm_dp_channel_eq_ok`. This is what a driver reads before it trains the link and when the sink pulses its hot plug
+pin (the short pulse, see "Hot plug"). `AmdVegaM::read_dpcd(connector, &caps, &status)` reads them for DisplayPort and eDP connectors through the same AtomBIOS AUX session as `read_edid`, with the eDP panel
+power-up first (`power_up_panel`, shared).
+
+**Not checked:** all of the register addresses and bit meanings are from memory of the DisplayPort specification and the DRM helper's `drm_dp.h`, neither of which was at hand; there is no port-check script for this
+reason. Not done: writing the DPCD (link rate and lane count settings, training patterns, the sink's power state `DP_SET_POWER`), link training itself, the sink's OUI and the branch device's, the MST registers, the eDP backlight
+and PSR registers, and acting on the short pulse (reading the link status when it comes). `tests/DpcdTest.cpp` (hand-built images from the specification's register map: an HBR2 4-lane monitor, a dongle, an eDP 1.4 panel
+with its rate table, each flag and field alone, sinks that are no DPCD, reads that fail partway, every bit flip of the images and every truncation under the sanitizers) and `AmdVegaMTest::test_read_dpcd` (the XPS-like board's
+DisplayPort and eDP connectors through the video BIOS tables, with a panel that answers only after the power-up) cover it.
