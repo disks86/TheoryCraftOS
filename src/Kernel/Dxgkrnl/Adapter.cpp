@@ -84,7 +84,7 @@ PipelineObject::~PipelineObject() {
 class Adapter::StreamRunner {
  public:
   StreamRunner(Adapter& adapter, ConstByteView commands, ArrayView<const SharedPointer<Allocation>> allocations)
-      : adapter_(adapter), mm_(adapter.vidmm_), commands_(commands), allocations_(allocations), transient_(adapter.allocator_) {}
+      : adapter_(adapter), mm_(adapter.vidmm_), commands_(commands), allocations_(allocations), pending_(adapter.allocator_), transient_(adapter.allocator_) {}
   ~StreamRunner() { release_transient(); }
 
   NtStatus validate(IPipelineLookup& lookup, List<SharedPointer<PipelineObject>>& pipelines) {
@@ -152,11 +152,28 @@ class Adapter::StreamRunner {
   NtStatus flush() {
     if (!cb_) return status::kSuccess;
     const bool ended = cb_->end();
-    const bool done = ended && adapter_.device_.submit(cb_);
+    bool done = ended && adapter_.device_.submit(cb_);
+    if (done) done = store_query_results();
     adapter_.device_.destroy_command_buffer(cb_);
     cb_ = nullptr;
+    pending_.clear();
+    next_slot_ = 0;
     release_transient();
     return done ? status::kSuccess : status::kInvalidDeviceState;
+  }
+
+  // Writes the counts of the queries the device ran into the allocations they name (the CPU's copy: these allocations never go to the GPU).
+  bool store_query_results() {
+    for (uint64_t i = 0; i < pending_.count(); ++i) {
+      const PendingQuery& q = pending_[i];
+      uint64_t samples = 0;
+      ByteView where;
+      if (!cb_->occlusion_result(q.slot, &samples) || !q.allocation->writable_backing().try_subview(q.offset, 8, &where)) return false;
+      ByteWriter out(where);
+      out.le64(samples);
+      mm_.note_cpu_write(*q.allocation);
+    }
+    return true;
   }
 
   NtStatus resident(Allocation& a) { return mm_.make_resident(a); }
@@ -170,7 +187,7 @@ class Adapter::StreamRunner {
     switch (op) {
       case Op::BeginPass: return begin_pass(p);
       case Op::EndPass: {
-        if (!exact(p) || !in_pass_) return kBad;
+        if (!exact(p) || !in_pass_ || query_open_) return kBad;
         in_pass_ = false;
         if (exec_) cb_->end_render_pass();
         return status::kSuccess;
@@ -188,6 +205,8 @@ class Adapter::StreamRunner {
       case Op::DrawIndexedInstanced: return draw(p, true, true);
       case Op::CopyRegion: return copy_region(p);
       case Op::GenerateMipmaps: return generate_mipmaps(p);
+      case Op::BeginQuery: return begin_query(p);
+      case Op::EndQuery: return end_query(p);
       case Op::SetTopology: {
         const uint32_t topology = p.le32();
         if (!exact(p) || topology > static_cast<uint32_t>(Topology::PointList)) return kBad;
@@ -196,6 +215,29 @@ class Adapter::StreamRunner {
       }
     }
     return kBad;
+  }
+
+  NtStatus begin_query(ByteReader& p) {
+    const uint32_t index = p.le32(), offset = p.le32();
+    if (!exact(p) || !in_pass_ || query_open_ || !(adapter_.caps_.features & graphics::kFeatureOcclusionQueries)) return kBad;
+    Allocation* a = alloc(index);
+    if (!a || !a->is_query_result() || offset % 8 || offset > a->desc().size - 8) return kBad;
+    if (queries_in_stream_ >= graphics::kMaxOcclusionQueries) return kBad;
+    ++queries_in_stream_;
+    query_open_ = true;
+    if (!exec_) return status::kSuccess;
+    const NtStatus s = ensure_cb();
+    if (s != status::kSuccess) return s;
+    if (!pending_.push_back({a, offset, next_slot_})) return status::kNoMemory;
+    cb_->begin_occlusion_query(next_slot_++);
+    return status::kSuccess;
+  }
+
+  NtStatus end_query(ByteReader& p) {
+    if (!exact(p) || !query_open_) return kBad;
+    query_open_ = false;
+    if (exec_) cb_->end_occlusion_query();
+    return status::kSuccess;
   }
 
   NtStatus begin_pass(ByteReader& p) {
@@ -581,6 +623,15 @@ class Adapter::StreamRunner {
   graphics::ICommandBuffer* cb_ = nullptr;
   // The state a stream builds up, to check the draws.
   bool in_pass_ = false;
+  struct PendingQuery {
+    Allocation* allocation;
+    uint64_t offset;
+    uint32_t slot;
+  };
+  bool query_open_ = false;
+  uint32_t queries_in_stream_ = 0;       // the queries begun so far (at most kMaxOcclusionQueries in a stream)
+  uint32_t next_slot_ = 0;               // the slot of the next query in the command buffer being recorded
+  List<PendingQuery> pending_;           // the queries recorded in it: where their counts go
   const Allocation* pass_color_ = nullptr;
   const Allocation* pass_extra_[graphics::kMaxColorTargets - 1] = {};
   uint32_t pass_target_count_ = 1;

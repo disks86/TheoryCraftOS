@@ -3016,12 +3016,215 @@ static void test_draw_on_card() {
   CHECK(!AmdVegaDraw::draw(vega, req, 4096, ByteView(staging, staging_bytes), ByteView(pixels, pixel_bytes)));
 }
 
+// The back end on the card: a 1D tiled colour buffer, alpha blending, a depth plane and a stencil plane (less, write, increment), and a tiled texture sampled through descriptors in the
+// table, all through the same path (SDMA in, PM4 on the graphics ring, SDMA out).
+static void test_back_end_on_card() {
+  Rig rig;
+  AmdVegaM vega(rig.alloc);
+  Pool pool(8u << 20);
+  AmdVegaM::Inputs in = rig.inputs();
+  in.system_addresses = &pool;
+  CHECK(vega.bring_up(in));
+  if (!vega.up()) return;
+  const AmdVegaM::Layout& l = vega.layout();
+  rig.card.sdma.gart_start = vega.gart_plan().gart_start;
+  rig.card.sdma.gart_size = vega.gart_plan().gart_size;
+  rig.card.sdma.gart_table = rig.vram + kRegion + l.gart_table;
+  rig.card.sdma.system_host = pool.memory.data();
+  rig.card.sdma.system_base = Pool::kBase;
+  rig.card.sdma.system_bytes = pool.memory.size();
+
+  static const char* kVertexText =
+      "VERT\nDCL IN[0]\nDCL IN[1]\nDCL OUT[0], POSITION\nDCL OUT[1], GENERIC[0]\nDCL CONST[0..3]\nDCL TEMP[0]\n"
+      "  0: MUL TEMP[0], CONST[0], IN[0].xxxx\n  1: MAD TEMP[0], CONST[1], IN[0].yyyy, TEMP[0]\n  2: MAD TEMP[0], CONST[2], IN[0].zzzz, TEMP[0]\n  3: ADD OUT[0], TEMP[0], CONST[3]\n  4: MOV OUT[1], IN[1]\n  5: END\n";
+  List<uint32_t> vs(rig.alloc), ps(rig.alloc), tps(rig.alloc);
+  VegaDrawRequest req;
+  gcn::ShaderInfo tex_info;
+  CHECK(compile_gcn(rig.alloc, kVertexText, vs, &req.vertex_info) &&
+        compile_gcn(rig.alloc, "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\n  0: MOV OUT[0], IN[0]\n  1: END\n", ps, &req.pixel_info) &&
+        compile_gcn(rig.alloc, "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\nDCL SAMP[0]\nDCL SVIEW[0], 2D, FLOAT\n  0: TEX OUT[0], IN[0], SAMP[0], 2D\n  1: END\n", tps, &tex_info));
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  // the far layer (z 0.5, red, alpha 0.5) and the near layer (z -0.5, green, alpha 0.5), each a triangle that covers the target
+  static const float layers[42] = {-1, -1, 0.5f, 1, 0, 0, 0.5f, 3, -1, 0.5f, 1, 0, 0, 0.5f, -1, 3, 0.5f, 1, 0, 0, 0.5f,
+                                   -1, -1, -0.5f, 0, 1, 0, 0.5f, 3, -1, -0.5f, 0, 1, 0, 0.5f, -1, 3, -0.5f, 0, 1, 0, 0.5f};
+  req.vertex_code = ArrayView<const uint32_t>(vs.view().data(), vs.count());
+  req.pixel_code = ArrayView<const uint32_t>(ps.view().data(), ps.count());
+  req.vertex_constants = ArrayView<const float>(identity, 16);
+  req.vertex_data = ArrayView<const uint32_t>(reinterpret_cast<const uint32_t*>(layers), 42);       // (floats are 32 bit words)
+  req.vertex_stride = 28;
+  req.attributes[0] = {3, 0};
+  req.attributes[1] = {4, 12};
+  req.vertex_count = 6;
+  req.width = 37;
+  req.height = 29;
+  req.clear[0] = 0; req.clear[1] = 0; req.clear[2] = 1; req.clear[3] = 1;
+  req.target_tile_index = 9;
+  req.blend.enable = true; req.blend.color_src = 4; req.blend.color_dst = 5;
+  req.depth_stencil.depth_test = true; req.depth_stencil.depth_write = true; req.depth_stencil.depth_func = 1;
+  req.depth_stencil.stencil_test = true; req.depth_stencil.stencil_func = 7; req.depth_stencil.zpass_op = 5;
+  req.clear_depth = 1.0f;
+  req.clear_stencil = 0;
+
+  VramMemory memory;
+  memory.vram = rig.vram;
+  gcn::CommandProcessorModel::Result last = gcn::CommandProcessorModel::Result::Ok;
+  uint32_t draws = 0;
+  rig.card.gfx.graphics_ib_hook = [&](uint64_t address, uint32_t dwords) {
+    if (!memory.in_range(address, dwords * 4ull)) return false;
+    gcn::CommandProcessorModel cp(rig.alloc, memory);
+    last = cp.execute(ArrayView<const uint32_t>(reinterpret_cast<const uint32_t*>(rig.vram + (address - kGpuBase)), dwords));
+    draws += cp.draws();
+    return last == gcn::CommandProcessorModel::Result::Ok;
+  };
+
+  const uint64_t staging_bytes = AmdVegaDraw::area_bytes(req);
+  uint8_t* staging = pool.memory.data() + 4096;
+  uint8_t* pixels = pool.memory.data() + (3u << 20);
+  uint8_t* depth = pool.memory.data() + (5u << 20);
+  uint8_t* stencil = pool.memory.data() + (6u << 20);
+  CHECK(staging_bytes > 0 && AmdVegaDraw::target_bytes(req) == 40ull * 32 * 16 && AmdVegaDraw::depth_bytes(req) == 40ull * 32 * 4 && AmdVegaDraw::stencil_bytes(req) == 40ull * 32);
+  const bool ok = AmdVegaDraw::draw(vega, req, 4096, ByteView(staging, staging_bytes), ByteView(pixels, AmdVegaDraw::target_bytes(req)), ByteView(depth, AmdVegaDraw::depth_bytes(req)),
+                                    ByteView(stencil, AmdVegaDraw::stencil_bytes(req)));
+  if (!ok) printf("  draw failed (model: %s)\n", gcn::CommandProcessorModel::result_name(last));
+  CHECK(ok && draws == 1 && rig.card.gfx.ib_protocol_errors == 0);
+  // by hand: the far layer over blue (0.5, 0, 0.5, 0.75), the near layer over that (0.25, 0.5, 0.25, 0.625), depth 0.25, stencil 2 -- everywhere in the target, nothing in the padding
+  uint32_t wrong = 0, padding_wrong = 0;
+  for (uint32_t y = 0; y < 32; ++y)
+    for (uint32_t x = 0; x < 40; ++x) {
+      const bool inside = x < req.width && y < req.height;
+      const float want_color[4] = {inside ? 0.25f : 0.0f, inside ? 0.5f : 0.0f, inside ? 0.25f : 1.0f, inside ? 0.625f : 1.0f};
+      const float want_depth = inside ? 0.25f : 1.0f;
+      const uint8_t want_stencil = inside ? 2 : 0;
+      uint32_t bad = 0;
+      for (uint32_t k = 0; k < 4; ++k) {
+        float got;
+        memcpy(&got, pixels + AmdVegaDraw::pixel_offset(req, x, y) + 4 * k, 4);
+        if (got != want_color[k]) ++bad;
+      }
+      float z;
+      memcpy(&z, depth + AmdVegaDraw::depth_offset(req, x, y), 4);
+      if (z != want_depth) ++bad;
+      if (stencil[AmdVegaDraw::stencil_offset(req, x, y)] != want_stencil) ++bad;
+      (inside ? wrong : padding_wrong) += bad;
+    }
+  CHECK(wrong == 0 && padding_wrong == 0);
+  // the same scene with everything 2D tiled: the colour buffer (entry 10), the depth plane (entry 2, 256 byte split) and the stencil plane (entry 0, 64 byte split); the area must start at
+  // the alignment those layouts want
+  {
+    VegaDrawRequest t2 = req;
+    t2.target_tile_index = 10;
+    t2.depth_tile_index = 2;
+    t2.stencil_tile_index = 0;
+    const uint64_t align = AmdVegaDraw::area_alignment(t2);
+    CHECK(align >= 262144 && (align & (align - 1)) == 0);
+    CHECK(AmdVegaDraw::target_pitch(t2) == 128 && AmdVegaDraw::plane_pitch(t2) == 256);
+    const uint64_t offset = align;                                                    // (a multiple of it)
+    const bool ok2 = AmdVegaDraw::draw(vega, t2, offset, ByteView(staging, AmdVegaDraw::area_bytes(t2)), ByteView(pixels, AmdVegaDraw::target_bytes(t2)), ByteView(depth, AmdVegaDraw::depth_bytes(t2)),
+                                       ByteView(stencil, AmdVegaDraw::stencil_bytes(t2)));
+    if (!ok2) printf("  2D draw failed (model: %s)\n", gcn::CommandProcessorModel::result_name(last));
+    CHECK(ok2);
+    CHECK(!AmdVegaDraw::draw(vega, t2, offset + 256, ByteView(staging, AmdVegaDraw::area_bytes(t2)), ByteView(pixels, AmdVegaDraw::target_bytes(t2))));      // not at the alignment
+    uint32_t wrong2 = 0, pad2 = 0;
+    for (uint32_t y = 0; y < 29; ++y)
+      for (uint32_t x = 0; x < 40; ++x) {
+        const bool inside = x < 37;
+        const float want[4] = {inside ? 0.25f : 0.0f, inside ? 0.5f : 0.0f, inside ? 0.25f : 1.0f, inside ? 0.625f : 1.0f};
+        uint32_t bad = 0;
+        for (uint32_t k = 0; k < 4; ++k) {
+          float got;
+          memcpy(&got, pixels + AmdVegaDraw::pixel_offset(t2, x, y) + 4 * k, 4);
+          if (got != want[k]) ++bad;
+        }
+        float z;
+        memcpy(&z, depth + AmdVegaDraw::depth_offset(t2, x, y), 4);
+        if (z != (inside ? 0.25f : 1.0f)) ++bad;
+        if (stencil[AmdVegaDraw::stencil_offset(t2, x, y)] != (inside ? 2 : 0)) ++bad;
+        (inside ? wrong2 : pad2) += bad;
+      }
+    CHECK(wrong2 == 0 && pad2 == 0);
+  }
+  // the pixels of the tiled buffer are not where a linear buffer would have them (it is the tiled layout that came back)
+  CHECK(AmdVegaDraw::pixel_offset(req, 1, 0) == 32 && AmdVegaDraw::pixel_offset(req, 2, 0) == 64 && AmdVegaDraw::pixel_offset(req, 0, 1) == 16 && AmdVegaDraw::pixel_offset(req, 8, 0) == 64 * 16);   // (128 bit display order: y0 x0 x1 x2 y1 y2)
+  // the same draw into a linear buffer without the tests: the near layer blended over the far one over the clear, as the emulator gives directly
+  VegaDrawRequest plain = req;
+  plain.target_tile_index = 8;
+  plain.depth_stencil = gcn::DepthStencilState();
+  CHECK(AmdVegaDraw::draw(vega, plain, 4096, ByteView(staging, AmdVegaDraw::area_bytes(plain)), ByteView(pixels, AmdVegaDraw::target_bytes(plain))) && draws == 3);
+  gcn::Framebuffer fb(rig.alloc, plain.width, plain.height);
+  fb.clear(0, 0, 1, 1);
+  gcn::DrawCall c;
+  c.vertex_code = plain.vertex_code;
+  c.pixel_code = plain.pixel_code;
+  c.vertex_info = plain.vertex_info;
+  c.pixel_info = plain.pixel_info;
+  c.vertex_constants = plain.vertex_constants;
+  c.vertex_data = plain.vertex_data;
+  c.vertex_stride = 28;
+  c.attributes[0] = {3, 0};
+  c.attributes[1] = {4, 12};
+  const uint32_t idx[6] = {0, 1, 2, 3, 4, 5};
+  c.indices = ArrayView<const uint32_t>(idx, 6);
+  c.blend = plain.blend;
+  CHECK(gcn::draw(rig.alloc, c, fb) == gcn::DrawStatus::Ok);
+  uint32_t different = 0;
+  for (uint32_t y = 0; y < plain.height; ++y)
+    for (uint32_t x = 0; x < plain.width; ++x)
+      for (uint32_t k = 0; k < 4; ++k) {
+        float got;
+        memcpy(&got, pixels + AmdVegaDraw::pixel_offset(plain, x, y) + 4 * k, 4);
+        if (got != fb.pixel(x, y)[k]) ++different;
+      }
+  CHECK(different == 0);
+
+  // a texture: 2 by 2 (red, green / blue, white), tiled for display, point sampled; one triangle over the target with (u, v) as its colour attribute
+  static const uint8_t texels[16] = {255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255};
+  static const float uv_triangle[21] = {-1, -1, 0, 0, 1, 0, 1, 3, -1, 0, 2, 1, 0, 1, -1, 3, 0, 0, -1, 0, 1};
+  VegaDrawRequest tex;
+  tex.vertex_code = req.vertex_code;
+  tex.pixel_code = ArrayView<const uint32_t>(tps.view().data(), tps.count());
+  tex.vertex_info = req.vertex_info;
+  tex.pixel_info = tex_info;
+  tex.vertex_constants = req.vertex_constants;
+  tex.vertex_data = ArrayView<const uint32_t>(reinterpret_cast<const uint32_t*>(uv_triangle), 21);
+  tex.vertex_stride = 28;
+  tex.attributes[0] = {3, 0};
+  tex.attributes[1] = {4, 12};
+  tex.vertex_count = 3;
+  tex.width = 32;
+  tex.height = 32;
+  tex.textures[0].width = 2;
+  tex.textures[0].height = 2;
+  tex.textures[0].texels = ConstByteView(texels, 16);
+  for (const uint32_t tile : {8u, 9u}) {
+    tex.textures[0].tile_index = tile;
+    CHECK(AmdVegaDraw::draw(vega, tex, 4096, ByteView(staging, AmdVegaDraw::area_bytes(tex)), ByteView(pixels, AmdVegaDraw::target_bytes(tex))));
+    auto is = [&](uint32_t x, uint32_t y, float r, float g, float b) {
+      float v[4];
+      memcpy(v, pixels + AmdVegaDraw::pixel_offset(tex, x, y), 16);
+      return v[0] == r && v[1] == g && v[2] == b && v[3] == 1.0f;
+    };
+    CHECK(is(4, 4, 1, 0, 0) && is(28, 4, 0, 1, 0) && is(4, 28, 0, 0, 1) && is(28, 28, 1, 1, 1));
+  }
+  // refused before anything is submitted: texels that are not the size of the texture, a texture in a layout that is not implemented, a plane layout the registers cannot name
+  const uint32_t calls = draws;
+  VegaDrawRequest bad = tex;
+  bad.textures[0].texels = ConstByteView(texels, 12);
+  CHECK(AmdVegaDraw::area_bytes(bad) == 0);
+  bad = tex; bad.textures[0].tile_index = 11;
+  CHECK(AmdVegaDraw::area_bytes(bad) == 0);
+  bad = tex; bad.target_tile_index = 11;
+  CHECK(AmdVegaDraw::area_bytes(bad) == 0);
+  CHECK(draws == calls);
+  vega.shutdown();
+}
+
 int main() {
   setvbuf(stdout, nullptr, _IONBF, 0);
   test_plan();
   test_bring_up();
   test_transfer();
   test_draw_on_card();
+  test_back_end_on_card();
   test_failures();
   test_display();
   test_present();

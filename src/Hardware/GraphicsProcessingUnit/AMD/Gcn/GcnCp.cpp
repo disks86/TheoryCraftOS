@@ -17,6 +17,7 @@
  */
 
 #include "Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnCp.hpp"
+#include "Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnTiling.hpp"
 
 namespace gcn {
 
@@ -44,6 +45,62 @@ bool fill(List<uint32_t>& list, uint64_t count) {
     if (!list.push_back(0u)) return false;
   return true;
 }
+
+constexpr uint64_t kMaxSurfaceBytes = 80ull << 20;
+
+// The texture unit reads the same memory as everything else
+class TexelAdapter final : public ITexelMemory {
+ public:
+  explicit TexelAdapter(IGpuMemory& memory) : memory_(memory) {}
+  bool read32(uint64_t address, uint32_t* out) override { return memory_.read(address, ArrayView<uint32_t>(out, 1)); }
+
+ private:
+  IGpuMemory& memory_;
+};
+
+// A surface read from memory as dwords, and addressed by pixel through its layout. The extent is what the layout needs: a linear surface up to the end of its last row, a tiled one
+// whole tiles.
+class Surface {
+ public:
+  explicit Surface(allocators::IAllocator& allocator) : words_(allocator) {}
+
+  CommandProcessorModel::Result load(IGpuMemory& memory, uint64_t base, const TileLayout& layout, uint32_t bytes, uint32_t pitch, uint32_t width, uint32_t height) {
+    layout_ = layout;
+    bytes_ = bytes;
+    pitch_ = pitch;
+    base_ = base;
+    if (!surface_valid(layout, bytes, pitch) || width == 0 || height == 0 || width > pitch) return CommandProcessorModel::Result::Unsupported;
+    if (base % surface_base_align(layout, bytes) != 0) return CommandProcessorModel::Result::Unsupported;
+    height_ = height;
+    const uint64_t extent = layout.kind == TileLayout::Kind::Linear ? ((static_cast<uint64_t>(height) - 1) * pitch + width) * bytes : surface_bytes(layout, bytes, pitch, height);
+    if (extent > kMaxSurfaceBytes) return CommandProcessorModel::Result::Unsupported;
+    // both ends mapped before anything is allocated for it
+    uint32_t probe;
+    if (!memory.read(base, ArrayView<uint32_t>(&probe, 1)) || !memory.read(base + (extent + 3) / 4 * 4 - 4, ArrayView<uint32_t>(&probe, 1))) return CommandProcessorModel::Result::MemoryFault;
+    if (!fill(words_, (extent + 3) / 4)) return CommandProcessorModel::Result::OutOfMemory;
+    return memory.read(base, words_.view()) ? CommandProcessorModel::Result::Ok : CommandProcessorModel::Result::MemoryFault;
+  }
+  bool store(IGpuMemory& memory) const { return memory.write(base_, ArrayView<const uint32_t>(words_.view().data(), words_.count())); }
+
+  // dword `c` of the pixel (the colour's four components, or the one dword of a depth value)
+  uint32_t get32(uint32_t x, uint32_t y, uint32_t c = 0) const { return words_[surface_offset(layout_, bytes_, pitch_, x, y, height_) / 4 + c]; }
+  void set32(uint32_t x, uint32_t y, uint32_t v, uint32_t c = 0) { words_[surface_offset(layout_, bytes_, pitch_, x, y, height_) / 4 + c] = v; }
+  uint8_t get8(uint32_t x, uint32_t y) const {
+    const uint64_t off = surface_offset(layout_, bytes_, pitch_, x, y, height_);
+    return static_cast<uint8_t>(words_[off / 4] >> ((off & 3) * 8));
+  }
+  void set8(uint32_t x, uint32_t y, uint8_t v) {
+    const uint64_t off = surface_offset(layout_, bytes_, pitch_, x, y, height_);
+    const uint32_t shift = (off & 3) * 8;
+    words_[off / 4] = (words_[off / 4] & ~(0xFFu << shift)) | (static_cast<uint32_t>(v) << shift);
+  }
+
+ private:
+  List<uint32_t> words_;
+  TileLayout layout_;
+  uint32_t bytes_ = 0, pitch_ = 0, height_ = 0;
+  uint64_t base_ = 0;
+};
 
 uint64_t join(uint32_t lo, uint32_t hi) { return static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32); }
 
@@ -101,19 +158,91 @@ CommandProcessorModel::Result CommandProcessorModel::draw(bool indexed, const Pm
 
   // fixed function state this model knows
   if (uconfig_reg(mmVGT_PRIMITIVE_TYPE) != kDI_PT_TRILIST || context_reg(mmVGT_SHADER_STAGES_EN) != 0) return R::Unsupported;
-  if ((context_reg(mmCB_BLEND0_CONTROL) >> CB_BLEND0_CONTROL__ENABLE__SHIFT & 1) != 0) return R::Unsupported;
-  if (context_reg(mmDB_DEPTH_CONTROL) != 0 || context_reg(mmCB_TARGET_MASK) != 0xF || context_reg(mmCB_SHADER_MASK) != 0xF) return R::Unsupported;
   const uint32_t cb_info = context_reg(mmCB_COLOR0_INFO);
   if (field(cb_info, CB_COLOR0_INFO__FORMAT_MASK, CB_COLOR0_INFO__FORMAT__SHIFT) != kCOLOR_32_32_32_32 ||
       field(cb_info, CB_COLOR0_INFO__NUMBER_TYPE_MASK, CB_COLOR0_INFO__NUMBER_TYPE__SHIFT) != kNUMBER_FLOAT ||
       field(cb_info, CB_COLOR0_INFO__COMP_SWAP_MASK, CB_COLOR0_INFO__COMP_SWAP__SHIFT) != kSWAP_STD ||
       field(cb_info, CB_COLOR0_INFO__ENDIAN_MASK, CB_COLOR0_INFO__ENDIAN__SHIFT) != kENDIAN_NONE)
     return R::Unsupported;
-  if (field(context_reg(mmCB_COLOR_CONTROL), CB_COLOR_CONTROL__MODE_MASK, CB_COLOR_CONTROL__MODE__SHIFT) != kCB_NORMAL) return R::Unsupported;
+  const uint32_t color_control = context_reg(mmCB_COLOR_CONTROL);
+  if (field(color_control, CB_COLOR_CONTROL__MODE_MASK, CB_COLOR_CONTROL__MODE__SHIFT) != kCB_NORMAL || field(color_control, CB_COLOR_CONTROL__ROP3_MASK, CB_COLOR_CONTROL__ROP3__SHIFT) != 0xCC)
+    return R::Unsupported;
+  if (context_reg(mmCB_SHADER_MASK) != 0xF || (context_reg(mmCB_TARGET_MASK) & ~0xFu) != 0) return R::Unsupported;
   if (context_reg(mmSPI_PS_INPUT_ENA) != abi::kPsInputEnablePerspCenter || context_reg(mmSPI_PS_INPUT_ADDR) != abi::kPsInputEnablePerspCenter) return R::Unsupported;
   if (field(context_reg(mmSPI_SHADER_POS_FORMAT), SPI_SHADER_POS_FORMAT__POS0_EXPORT_FORMAT_MASK, SPI_SHADER_POS_FORMAT__POS0_EXPORT_FORMAT__SHIFT) != kSPI_SHADER_4COMP ||
       field(context_reg(mmSPI_SHADER_COL_FORMAT), SPI_SHADER_COL_FORMAT__COL0_EXPORT_FORMAT_MASK, SPI_SHADER_COL_FORMAT__COL0_EXPORT_FORMAT__SHIFT) != kSPI_SHADER_32_ABGR)
     return R::Unsupported;
+
+  DrawCall call;
+  // blending (the blend bypass bit of the target turns it off whatever the blend register says)
+  const uint32_t blend_reg = context_reg(mmCB_BLEND0_CONTROL);
+  BlendState& blend = call.blend;
+  blend.write_mask = static_cast<uint8_t>(context_reg(mmCB_TARGET_MASK) & 0xF);
+  blend.enable = (blend_reg >> CB_BLEND0_CONTROL__ENABLE__SHIFT & 1) != 0 && (cb_info >> CB_COLOR0_INFO__BLEND_BYPASS__SHIFT & 1) == 0;
+  if (blend.enable) {
+    blend.color_src = static_cast<uint8_t>(blend_reg >> CB_BLEND0_CONTROL__COLOR_SRCBLEND__SHIFT & 0x1F);
+    blend.color_op = static_cast<uint8_t>(blend_reg >> CB_BLEND0_CONTROL__COLOR_COMB_FCN__SHIFT & 7);
+    blend.color_dst = static_cast<uint8_t>(blend_reg >> CB_BLEND0_CONTROL__COLOR_DESTBLEND__SHIFT & 0x1F);
+    blend.separate_alpha = (blend_reg >> CB_BLEND0_CONTROL__SEPARATE_ALPHA_BLEND__SHIFT & 1) != 0;
+    blend.alpha_src = static_cast<uint8_t>(blend_reg >> CB_BLEND0_CONTROL__ALPHA_SRCBLEND__SHIFT & 0x1F);
+    blend.alpha_op = static_cast<uint8_t>(blend_reg >> CB_BLEND0_CONTROL__ALPHA_COMB_FCN__SHIFT & 7);
+    blend.alpha_dst = static_cast<uint8_t>(blend_reg >> CB_BLEND0_CONTROL__ALPHA_DESTBLEND__SHIFT & 0x1F);
+    if (!blend.separate_alpha) {
+      blend.alpha_src = blend.color_src;
+      blend.alpha_op = blend.color_op;
+      blend.alpha_dst = blend.color_dst;
+    }
+    if (!BlendState::supported_factor(blend.color_src) || !BlendState::supported_factor(blend.color_dst) || !BlendState::supported_factor(blend.alpha_src) ||
+        !BlendState::supported_factor(blend.alpha_dst) || blend.color_op > 4 || blend.alpha_op > 4)
+      return R::Unsupported;
+    for (uint32_t c = 0; c < 4; ++c) blend.constant[c] = bits_float(context_reg(mmCB_BLEND_RED + c));
+  }
+
+  // depth and stencil
+  const uint32_t depth_control = context_reg(mmDB_DEPTH_CONTROL);
+  const uint32_t unsupported_depth_bits = (1u << DB_DEPTH_CONTROL__ENABLE_COLOR_WRITES_ON_DEPTH_FAIL__SHIFT) | (1u << DB_DEPTH_CONTROL__DISABLE_COLOR_WRITES_ON_DEPTH_PASS__SHIFT);
+  const uint32_t mode = context_reg(mmPA_SU_SC_MODE_CNTL);
+  if ((mode & ~(1u << PA_SU_SC_MODE_CNTL__FACE__SHIFT)) != 0) return R::Unsupported;                    // (no culling, filled polygons, no offset)
+  if ((depth_control & unsupported_depth_bits) != 0 || context_reg(mmDB_RENDER_CONTROL) != 0 || context_reg(mmDB_SHADER_CONTROL) != 0 || context_reg(mmDB_DEPTH_VIEW) != 0) return R::Unsupported;
+  DepthStencilState& ds = call.depth_stencil;
+  ds.stencil_test = (depth_control >> DB_DEPTH_CONTROL__STENCIL_ENABLE__SHIFT & 1) != 0;
+  ds.depth_test = (depth_control >> DB_DEPTH_CONTROL__Z_ENABLE__SHIFT & 1) != 0;
+  ds.depth_write = ds.depth_test && (depth_control >> DB_DEPTH_CONTROL__Z_WRITE_ENABLE__SHIFT & 1) != 0;
+  ds.depth_bounds = (depth_control >> DB_DEPTH_CONTROL__DEPTH_BOUNDS_ENABLE__SHIFT & 1) != 0;
+  ds.front_clockwise = (mode >> PA_SU_SC_MODE_CNTL__FACE__SHIFT & 1) != 0;
+  if (ds.depth_bounds) {
+    ds.bounds_min = bits_float(context_reg(mmDB_DEPTH_BOUNDS_MIN));
+    ds.bounds_max = bits_float(context_reg(mmDB_DEPTH_BOUNDS_MAX));
+  }
+  ds.depth_func = static_cast<uint8_t>(depth_control >> DB_DEPTH_CONTROL__ZFUNC__SHIFT & 7);
+  ds.stencil_func = static_cast<uint8_t>(depth_control >> DB_DEPTH_CONTROL__STENCILFUNC__SHIFT & 7);
+  if (ds.stencil_test) {
+    const uint32_t ops = context_reg(mmDB_STENCIL_CONTROL), refmask = context_reg(mmDB_STENCILREFMASK);
+    ds.fail_op = static_cast<uint8_t>(ops >> DB_STENCIL_CONTROL__STENCILFAIL__SHIFT & 0xF);
+    ds.zpass_op = static_cast<uint8_t>(ops >> DB_STENCIL_CONTROL__STENCILZPASS__SHIFT & 0xF);
+    ds.zfail_op = static_cast<uint8_t>(ops >> DB_STENCIL_CONTROL__STENCILZFAIL__SHIFT & 0xF);
+    if (ds.fail_op > 9 || ds.zpass_op > 9 || ds.zfail_op > 9) return R::Unsupported;
+    ds.stencil_ref = static_cast<uint8_t>(refmask >> DB_STENCILREFMASK__STENCILTESTVAL__SHIFT);
+    ds.stencil_mask = static_cast<uint8_t>(refmask >> DB_STENCILREFMASK__STENCILMASK__SHIFT);
+    ds.stencil_write_mask = static_cast<uint8_t>(refmask >> DB_STENCILREFMASK__STENCILWRITEMASK__SHIFT);
+    ds.stencil_op_value = static_cast<uint8_t>(refmask >> DB_STENCILREFMASK__STENCILOPVAL__SHIFT);
+    ds.two_sided = (depth_control >> DB_DEPTH_CONTROL__BACKFACE_ENABLE__SHIFT & 1) != 0;
+    if (ds.two_sided) {
+      const uint32_t bf = context_reg(mmDB_STENCILREFMASK_BF);
+      StencilFace& b = ds.back;
+      b.func = static_cast<uint8_t>(depth_control >> DB_DEPTH_CONTROL__STENCILFUNC_BF__SHIFT & 7);
+      b.fail_op = static_cast<uint8_t>(ops >> DB_STENCIL_CONTROL__STENCILFAIL_BF__SHIFT & 0xF);
+      b.zpass_op = static_cast<uint8_t>(ops >> DB_STENCIL_CONTROL__STENCILZPASS_BF__SHIFT & 0xF);
+      b.zfail_op = static_cast<uint8_t>(ops >> DB_STENCIL_CONTROL__STENCILZFAIL_BF__SHIFT & 0xF);
+      if (b.fail_op > 9 || b.zpass_op > 9 || b.zfail_op > 9) return R::Unsupported;
+      b.ref = static_cast<uint8_t>(bf >> DB_STENCILREFMASK_BF__STENCILTESTVAL_BF__SHIFT);
+      b.mask = static_cast<uint8_t>(bf >> DB_STENCILREFMASK_BF__STENCILMASK_BF__SHIFT);
+      b.write_mask = static_cast<uint8_t>(bf >> DB_STENCILREFMASK_BF__STENCILWRITEMASK_BF__SHIFT);
+      b.op_value = static_cast<uint8_t>(bf >> DB_STENCILREFMASK_BF__STENCILOPVAL_BF__SHIFT);
+    }
+  }
+  const bool depth_used = ds.depth_test || ds.stencil_test || ds.depth_bounds;
+  const bool needs_z = ds.depth_test || ds.depth_bounds;
 
   // the target
   const uint64_t color_base = static_cast<uint64_t>(context_reg(mmCB_COLOR0_BASE)) << 8;
@@ -123,7 +252,6 @@ CommandProcessorModel::Result CommandProcessorModel::draw(bool indexed, const Pm
   const uint32_t height = field(screen_br, PA_SC_SCREEN_SCISSOR_BR__BR_Y_MASK, PA_SC_SCREEN_SCISSOR_BR__BR_Y__SHIFT);
   if (width == 0 || height == 0 || width > pitch || width > 16384 || height > 16384 || static_cast<uint64_t>(width) * height > kMaxTargetPixels) return R::Unsupported;
 
-  DrawCall call;
   // shaders
   List<uint32_t> vs_code(allocator_), ps_code(allocator_);
   R r = read_code(join(sh_reg(mmSPI_SHADER_PGM_LO_VS), sh_reg(mmSPI_SHADER_PGM_HI_VS)) << 8, vs_code);
@@ -245,6 +373,8 @@ CommandProcessorModel::Result CommandProcessorModel::draw(bool indexed, const Pm
   call.viewport.x_offset = bits_float(context_reg(mmPA_CL_VPORT_XOFFSET));
   call.viewport.y_scale = bits_float(context_reg(mmPA_CL_VPORT_YSCALE));
   call.viewport.y_offset = bits_float(context_reg(mmPA_CL_VPORT_YOFFSET));
+  call.viewport.z_scale = (vte >> PA_CL_VTE_CNTL__VPORT_Z_SCALE_ENA__SHIFT & 1) ? bits_float(context_reg(mmPA_CL_VPORT_ZSCALE)) : 1.0f;
+  call.viewport.z_offset = (vte >> PA_CL_VTE_CNTL__VPORT_Z_OFFSET_ENA__SHIFT & 1) ? bits_float(context_reg(mmPA_CL_VPORT_ZOFFSET)) : 0.0f;
   const uint32_t tl_regs[4] = {mmPA_SC_SCREEN_SCISSOR_TL, mmPA_SC_WINDOW_SCISSOR_TL, mmPA_SC_GENERIC_SCISSOR_TL, mmPA_SC_VPORT_SCISSOR_0_TL};
   const uint32_t br_regs[4] = {mmPA_SC_SCREEN_SCISSOR_BR, mmPA_SC_WINDOW_SCISSOR_BR, mmPA_SC_GENERIC_SCISSOR_BR, mmPA_SC_VPORT_SCISSOR_0_BR};
   call.scissor.set = true;
@@ -261,28 +391,89 @@ CommandProcessorModel::Result CommandProcessorModel::draw(bool indexed, const Pm
     if (b < call.scissor.bottom) call.scissor.bottom = b;
   }
 
-  // the target's current contents, drawn on, and written back
+  // the textures: the T# and S# in the descriptor table that name a resource, sampled from the same memory
+  TexelAdapter texels(memory_);
+  for (uint32_t u = 0; u < abi::kMaxSamplers; ++u) {
+    const uint32_t* image = &table[(abi::kImageOffset + u * abi::kImageBytes) / 4];
+    if ((image[3] >> 28) == 0) continue;
+    call.descriptors_set |= 1u << u;
+    for (uint32_t k = 0; k < 8; ++k) call.image_words[u][k] = image[k];
+    for (uint32_t k = 0; k < 4; ++k) call.sampler_words[u][k] = table[(abi::kSamplerOffset + u * abi::kSamplerBytes) / 4 + k];
+  }
+  call.texel_memory = &texels;
+  call.textures = textures_;
+
+  // the colour target's current contents, drawn on, and written back
+  TileLayout color_layout;
+  if (!resolve_tile_index(field(context_reg(mmCB_COLOR0_ATTRIB), CB_COLOR0_ATTRIB__TILE_MODE_INDEX_MASK, CB_COLOR0_ATTRIB__TILE_MODE_INDEX__SHIFT), &color_layout)) return R::Unsupported;
+  Surface color(allocator_);
+  r = color.load(memory_, color_base, color_layout, 16, pitch, width, height);
+  if (r != R::Ok) return r;
   Framebuffer fb(allocator_, width, height);
   if (!fb.valid()) return R::OutOfMemory;
-  List<uint32_t> row(allocator_);
-  if (!fill(row, static_cast<uint64_t>(width) * 4)) return R::OutOfMemory;
-  for (uint32_t y = 0; y < height; ++y) {
-    if (!memory_.read(color_base + static_cast<uint64_t>(y) * pitch * 16, row.view())) return R::MemoryFault;
+  for (uint32_t y = 0; y < height; ++y)
     for (uint32_t x = 0; x < width; ++x)
-      for (uint32_t c = 0; c < 4; ++c) fb.pixel(x, y)[c] = bits_float(row[x * 4 + c]);
+      for (uint32_t c = 0; c < 4; ++c) fb.pixel(x, y)[c] = bits_float(color.get32(x, y, c));
+
+  // the depth and stencil planes the tests use
+  DepthBuffer depth(allocator_, depth_used ? width : 1, depth_used ? height : 1);
+  Surface z_plane(allocator_), s_plane(allocator_);
+  if (depth_used) {
+    if (!depth.valid()) return R::OutOfMemory;
+    const uint32_t z_info = context_reg(mmDB_Z_INFO), s_info = context_reg(mmDB_STENCIL_INFO), size = context_reg(mmDB_DEPTH_SIZE);
+    const uint32_t d_pitch = (field(size, DB_DEPTH_SIZE__PITCH_TILE_MAX_MASK, DB_DEPTH_SIZE__PITCH_TILE_MAX__SHIFT) + 1) * 8;
+    const uint32_t d_rows = (field(size, DB_DEPTH_SIZE__HEIGHT_TILE_MAX_MASK, DB_DEPTH_SIZE__HEIGHT_TILE_MAX__SHIFT) + 1) * 8;
+    if (d_pitch < width || d_rows < height || (z_info >> DB_Z_INFO__TILE_SURFACE_ENABLE__SHIFT & 1) != 0) return R::Unsupported;
+    if (needs_z) {
+      TileLayout layout;
+      const uint64_t base = static_cast<uint64_t>(context_reg(mmDB_Z_READ_BASE)) << 8;
+      if (field(z_info, DB_Z_INFO__FORMAT_MASK, DB_Z_INFO__FORMAT__SHIFT) != kZ_32_FLOAT || context_reg(mmDB_Z_WRITE_BASE) != context_reg(mmDB_Z_READ_BASE) ||
+          !resolve_tile_index(field(z_info, DB_Z_INFO__TILE_MODE_INDEX_MASK, DB_Z_INFO__TILE_MODE_INDEX__SHIFT), &layout))
+        return R::Unsupported;
+      r = z_plane.load(memory_, base, layout, 4, d_pitch, width, height);
+      if (r != R::Ok) return r;
+      for (uint32_t y = 0; y < height; ++y)
+        for (uint32_t x = 0; x < width; ++x) depth.depth(x, y) = bits_float(z_plane.get32(x, y));
+    }
+    if (ds.stencil_test) {
+      TileLayout layout;
+      const uint64_t base = static_cast<uint64_t>(context_reg(mmDB_STENCIL_READ_BASE)) << 8;
+      if (field(s_info, DB_STENCIL_INFO__FORMAT_MASK, DB_STENCIL_INFO__FORMAT__SHIFT) != kSTENCIL_8 || context_reg(mmDB_STENCIL_WRITE_BASE) != context_reg(mmDB_STENCIL_READ_BASE) ||
+          !resolve_tile_index(field(s_info, DB_STENCIL_INFO__TILE_MODE_INDEX_MASK, DB_STENCIL_INFO__TILE_MODE_INDEX__SHIFT), &layout))
+        return R::Unsupported;
+      r = s_plane.load(memory_, base, layout, 1, d_pitch, width, height);
+      if (r != R::Ok) return r;
+      for (uint32_t y = 0; y < height; ++y)
+        for (uint32_t x = 0; x < width; ++x) depth.stencil(x, y) = s_plane.get8(x, y);
+    }
+    call.depth = &depth;
   }
-  call.textures = textures_;
+
   const DrawStatus st = gcn::draw(allocator_, call, fb, &last_stats_);
   if (st == DrawStatus::OutOfMemory) return R::OutOfMemory;
   if (st != DrawStatus::Ok) return st == DrawStatus::BadInput ? R::BadPacket : R::ShaderFault;
-  for (uint32_t y = 0; y < height; ++y) {
+
+  for (uint32_t y = 0; y < height; ++y)
     for (uint32_t x = 0; x < width; ++x)
       for (uint32_t c = 0; c < 4; ++c) {
         union { float f; uint32_t u; } cv;
         cv.f = fb.pixel(x, y)[c];
-        row[x * 4 + c] = cv.u;
+        color.set32(x, y, cv.u, c);
       }
-    if (!memory_.write(color_base + static_cast<uint64_t>(y) * pitch * 16, row.view())) return R::MemoryFault;
+  if (!color.store(memory_)) return R::MemoryFault;
+  if (ds.depth_test && ds.depth_write) {
+    for (uint32_t y = 0; y < height; ++y)
+      for (uint32_t x = 0; x < width; ++x) {
+        union { float f; uint32_t u; } cv;
+        cv.f = depth.depth(x, y);
+        z_plane.set32(x, y, cv.u);
+      }
+    if (!z_plane.store(memory_)) return R::MemoryFault;
+  }
+  if (ds.stencil_test) {
+    for (uint32_t y = 0; y < height; ++y)
+      for (uint32_t x = 0; x < width; ++x) s_plane.set8(x, y, depth.stencil(x, y));
+    if (!s_plane.store(memory_)) return R::MemoryFault;
   }
   ++draws_;
   return R::Ok;
