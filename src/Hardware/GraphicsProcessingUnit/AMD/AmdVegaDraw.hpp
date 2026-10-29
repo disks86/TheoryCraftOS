@@ -20,16 +20,30 @@
 // block by the SDMA engines (AmdVegaM::upload), the draw is submitted as an indirect buffer on the graphics ring (GcnState's packets), and the colour buffer is copied back. Compile
 // the shaders with GcnCompiler (TGSI in, the GCN3 code and its ShaderInfo out); GcnCp models what the ring does with the stream.
 //
+// The back end: the colour buffer may be linear or 1D tiled (tile mode index 8 or 9), the draw may blend, and may test and write a depth plane (32 bit float) and a stencil plane (8 bit),
+// which are cleared to the request's values before the draw and handed back after it, in their layout (`pixel_offset` and friends say where a pixel is). Up to eight textures are given
+// as tightly packed rows of texels; they are put in the area in their tile mode (linear or 1D tiled) and the image and sampler descriptors go in the descriptor table.
+//
 // The area is laid out from `area_offset` in this order, each piece 256 byte aligned: vertex code, pixel code, vertex constants, pixel constants, the descriptor table, the vertices, the
-// indices, the colour buffer. Not validated on a real card (see GcnState.hpp for what the stream leaves out).
+// indices, the colour buffer, the depth plane, the stencil plane, the textures. Not validated on a real card (see GcnState.hpp for what the stream leaves out).
 #pragma once
 
 #include <stdint.h>
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdVegaM.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnDraw.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnState.hpp"
+#include "Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnTexture.hpp"
+#include "Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnTiling.hpp"
 
 namespace hardware {
+
+struct VegaTexture {
+  gcn::TexelFormat format = gcn::TexelFormat::Rgba8Unorm;
+  uint32_t width = 0, height = 0;
+  uint32_t tile_index = 8;                                          // 8 linear, 9 1D tiled (display)
+  ConstByteView texels;                                             // width * height texels, rows tightly packed
+  gcn::SamplerDescriptor sampler;
+};
 
 struct VegaDrawRequest {
   ArrayView<const uint32_t> vertex_code, pixel_code;
@@ -43,21 +57,37 @@ struct VegaDrawRequest {
   uint8_t ps_param[16] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
   uint32_t width = 0, height = 0;
   float clear[4] = {0, 0, 0, 0};                                    // what the colour buffer holds before the draw
+  uint32_t target_tile_index = 8;                                   // 8 linear, 9 1D tiled (display)
+  gcn::BlendState blend;
+  gcn::DepthStencilState depth_stencil;                             // a depth plane is used when depth_test or depth_write is set, a stencil plane when stencil_test is
+  float clear_depth = 1.0f;
+  uint8_t clear_stencil = 0;
+  VegaTexture textures[gcn::abi::kMaxSamplers];                     // texture i is the shader's SAMP[i] / SVIEW[i]; one with no texels is not bound
 };
 
 class AmdVegaDraw {
  public:
   static constexpr uint64_t kAlignment = 256;
+  static constexpr uint32_t kDepthTileIndex = gcn::DepthTarget::kTiled1DThinTileIndex;
   static uint32_t pitch_pixels(uint32_t width) { return (width + 7) / 8 * 8; }
-  // Bytes of the colour buffer as AmdVegaDraw::draw() returns them: float RGBA, rows of pitch_pixels(width) pixels.
-  static uint64_t target_bytes(const VegaDrawRequest& r) { return static_cast<uint64_t>(pitch_pixels(r.width)) * r.height * gcn::ColorTarget::kPixelBytes; }
+  // Bytes of the colour buffer as AmdVegaDraw::draw() returns them: float RGBA in the target's layout, rows of pitch_pixels(width) pixels (a tiled one is padded to whole tiles).
+  static uint64_t target_bytes(const VegaDrawRequest& r);
+  // The depth plane (4 bytes a pixel) and the stencil plane (1 byte a pixel) in their layout; 0 if the request does not use the plane.
+  static bool uses_depth(const VegaDrawRequest& r) { return r.depth_stencil.depth_test || r.depth_stencil.depth_write; }
+  static bool uses_stencil(const VegaDrawRequest& r) { return r.depth_stencil.stencil_test; }
+  static uint64_t depth_bytes(const VegaDrawRequest& r);
+  static uint64_t stencil_bytes(const VegaDrawRequest& r);
+  // Where pixel (x, y) is in the buffers draw() returns (byte offsets; 0 for a layout that is not implemented)
+  static uint64_t pixel_offset(const VegaDrawRequest& r, uint32_t x, uint32_t y);
+  static uint64_t depth_offset(const VegaDrawRequest& r, uint32_t x, uint32_t y);
+  static uint64_t stencil_offset(const VegaDrawRequest& r, uint32_t x, uint32_t y);
   // The bytes the area needs for the request (0 if it is not expressible), and so the size `staging` must have.
   static uint64_t area_bytes(const VegaDrawRequest& r);
 
   // Runs the draw. `staging` is system memory the card can reach (the memory upload() copies from), at least area_bytes() long; `pixels` receives the colour buffer (target_bytes() long;
-  // system memory the card can reach). `area_offset` is a multiple of 256 in the framebuffer area. False if the request is not expressible, does not fit the area, a transfer or the
-  // graphics ring fails; the colour buffer is then not valid.
-  static bool draw(AmdVegaM& card, const VegaDrawRequest& request, uint64_t area_offset, ByteView staging, ByteView pixels);
+  // system memory the card can reach), `depth` and `stencil` the planes the request uses (depth_bytes() and stencil_bytes() long; an empty view is not filled). `area_offset` is a
+  // multiple of 256 in the framebuffer area. False if the request is not expressible, does not fit the area, a transfer or the graphics ring fails; the buffers are then not valid.
+  static bool draw(AmdVegaM& card, const VegaDrawRequest& request, uint64_t area_offset, ByteView staging, ByteView pixels, ByteView depth = ByteView(), ByteView stencil = ByteView());
 };
 
 }  // namespace hardware
