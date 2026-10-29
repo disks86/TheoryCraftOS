@@ -62,7 +62,7 @@ class AmdDpSource final : public IDpSource {
   IAtomHost& host_;
   AmdModeSet set_;
   ModeSetOutput out_;
-  DisplayMode mode_;
+  CrtcMode mode_;
 };
 
 }  // namespace hardware

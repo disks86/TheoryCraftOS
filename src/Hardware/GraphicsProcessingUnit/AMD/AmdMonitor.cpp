@@ -97,6 +97,40 @@ bool parse_monitor_info(ConstByteView edid, MonitorInfo* out) {
   return true;
 }
 
+bool edid_detailed_timing(ConstByteView edid, uint32_t index, CrtcMode* out) {
+  if (index > 3 || edid.size() < 128) return false;
+  const uint32_t at = 54 + index * 18;
+  uint8_t d[18];
+  for (uint32_t i = 0; i < 18; ++i) d[i] = edid[at + i];
+  const uint32_t clock_10khz = d[0] | (d[1] << 8);
+  if (clock_10khz == 0) return false;             // a monitor descriptor
+  const uint32_t h_active = d[2] | ((d[4] >> 4) << 8), h_blank = d[3] | ((d[4] & 0xF) << 8);
+  const uint32_t v_active = d[5] | ((d[7] >> 4) << 8), v_blank = d[6] | ((d[7] & 0xF) << 8);
+  const uint32_t h_offset = d[8] | (((d[11] >> 6) & 3) << 8), h_width = d[9] | (((d[11] >> 4) & 3) << 8);
+  const uint32_t v_offset = (d[10] >> 4) | (((d[11] >> 2) & 3) << 4), v_width = (d[10] & 0xF) | ((d[11] & 3) << 4);
+  const uint8_t flags = d[17];
+  if (h_active == 0 || v_active == 0 || (flags & 0x20)) return false;        // stereo modes are not supported
+  if (!(flags & 0x18)) return false;                                         // (DRM_EDID_PT_SEPARATE_SYNC: neither bit is an analog sync timing)
+  if (!h_width || !v_width) return false;                                    // a sync width of zero is incorrect
+  if (h_active + h_blank > 0xFFFF || v_active + v_blank > 0xFFFF) return false;
+  CrtcMode m;
+  m.pixel_clock_khz = clock_10khz * 10;
+  m.h_display = static_cast<uint16_t>(h_active);
+  m.h_sync_start = static_cast<uint16_t>(h_active + h_offset);
+  m.h_total = static_cast<uint16_t>(h_active + h_blank);
+  m.h_sync_end = static_cast<uint16_t>(m.h_sync_start + h_width > m.h_total ? m.h_total : m.h_sync_start + h_width);      // (bogus sync ends are cut at the total)
+  m.v_display = static_cast<uint16_t>(v_active);
+  m.v_sync_start = static_cast<uint16_t>(v_active + v_offset);
+  m.v_total = static_cast<uint16_t>(v_active + v_blank);
+  m.v_sync_end = static_cast<uint16_t>(m.v_sync_start + v_width > m.v_total ? m.v_total : m.v_sync_start + v_width);
+  m.interlaced = (flags & 0x80) != 0;
+  m.h_sync_negative = !(flags & 0x02);
+  m.v_sync_negative = !(flags & 0x04);
+  if (m.interlaced) m.v_total |= 1;               // (the mode's values are per field; the total is odd)
+  *out = m;
+  return true;
+}
+
 uint32_t monitor_bpc(AtomConnectors::Type type, bool use_digital, bool dp_sink, const MonitorInfo& info, uint32_t mode_clock_khz, bool deep_color, uint32_t panel_bpc) {
   using Type = AtomConnectors::Type;
   uint32_t bpc = 8;

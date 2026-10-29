@@ -20,6 +20,7 @@
 #pragma once
 
 #include <stdint.h>
+#include "Hardware/GraphicsProcessingUnit/AMD/AmdModeSet.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AtomConnectors.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/Dpcd.hpp"
 
@@ -39,6 +40,10 @@ struct MonitorInfo {
 
 // update_display_info: false if the bytes are not an EDID base block (no header or a bad checksum). A sink that is not digital, or older than 1.3, gets nothing but `digital` false.
 bool parse_monitor_info(ConstByteView edid, MonitorInfo* out);
+
+// The detailed timing descriptor `index` (0 to 3) of the EDID's base block as the CRTC wants it (drm_mode_detailed and drm_mode_set_crtcinfo: the vertical values of an interlaced mode
+// are per field, the total odd). False if the slot is not a timing (a monitor descriptor), is a stereo or analog sync one, or has no size. The first slot is the preferred mode.
+bool edid_detailed_timing(ConstByteView edid, uint32_t index, CrtcMode* out);
 
 // amdgpu_connector_get_monitor_bpc: 8 unless the sink says otherwise; HDMI is clamped to 12 and to what the TMDS clock allows for the mode (12 falls to 10 or 8, 10 to 8; deep colour
 // without a TMDS limit is 8), and above 8 only if `deep_color` (the module parameter amdgpu.deep_color, which is 0 by default). `dp_sink`: the DisplayPort connector's sink is a

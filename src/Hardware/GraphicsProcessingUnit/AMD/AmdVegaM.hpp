@@ -36,6 +36,7 @@
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdDdc.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdDpSource.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdModeSet.hpp"
+#include "Hardware/GraphicsProcessingUnit/AMD/AmdMonitor.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AtomConnectors.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/Dpcd.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AtomI2c.hpp"
@@ -86,6 +87,7 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
     uint64_t aperture_physical = 0;               // the memory BAR (BAR 0): where video memory shows for the CPU
     uint64_t aperture_bytes = 0;
     MmioRegion doorbells;                         // the doorbell BAR (BAR 2), at least the first 8 KiB
+    uint64_t output_framebuffer_bytes = 0;        // room in the block for the picture of one more output (light_up); 0: none
     uint64_t max_framebuffer_bytes = 0;           // the largest picture the display could show (0: no display part)
     amd_dce11::WatermarkClocks display_clocks;    // the engine and memory clocks the display watermarks are computed for (the driver's current / DPM sclk and mclk); all zero: the watermarks are not touched
     uint32_t hpd_pins = 0x3F;                     // the hot plug detect pins to watch (bit n: pin n); which pin a connector is on is in the video BIOS, so by default all of them
@@ -224,11 +226,31 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
   // left as it is.
   // `hdmi_edid`: for an HDMI output the monitor's EDID (what enable_audio makes the endpoint's descriptors of): given, the audio is set up in the encoder's mode set as the driver does
   // (dce_v11_0_afmt_enable and _afmt_setmode, stage `Audio`); empty, it is not. (DisplayPort audio is not part of the driver's modeset.)
-  bool set_mode(const AtomConnectors::Connector& connector, uint8_t crtc, const DisplayMode& mode, uint32_t bpc, ModeSetResult* out, uint8_t pll = AmdModeSet::kPllInvalid,
+  bool set_mode(const AtomConnectors::Connector& connector, uint8_t crtc, const CrtcMode& mode, uint32_t bpc, ModeSetResult* out, uint8_t pll = AmdModeSet::kPllInvalid,
                 const amd_dce11::ScanoutSurface* surface = nullptr, ConstByteView hdmi_edid = ConstByteView());
   // The disable path (dce_v11_0_encoder_disable and _crtc_disable): the encoder off, the CRTC blanked and disabled, its power gating on, and its PLL switched off unless another CRTC set
   // up by set_mode still uses it; the graphics plane is switched off after the CRTC, as the driver does. False if a table fails (the rest is still done).
   bool disable_mode(const AtomConnectors::Connector& connector, uint8_t crtc);
+  // Lights an output up on its own: the monitor's EDID is read, its detailed timings tried in order (the first is the preferred mode) for one the connector accepts (mode_valid: the link
+  // can carry it, the TMDS clock is within the limits) and whose picture fits the room Inputs::output_framebuffer_bytes gives (4 bytes per pixel), the monitor's colour depth chosen
+  // (monitor_bpc; deep colour is off as in the driver's default), the picture filled with a test pattern (a grey ramp with a white border, so a lit output shows that it works), and
+  // set_mode run on `crtc` (0xFF: the lowest one the card is not using and the boot display is not on) with the picture as the scanout surface and, for HDMI, the EDID for the audio.
+  // The picture stays in the block; there is one such picture (a second light_up replaces the first). What it does not do: put the output into the desktop's layout (the desktop does
+  // not draw on it), so the picture is the pattern until something writes to `picture()`.
+  enum class LightUpStage : uint8_t { Done, NotReady, NoRoom, NotConnected, Edid, NoMode, ModeSet };
+  struct LightUp {
+    LightUpStage failed = LightUpStage::NotReady;
+    uint8_t crtc = 0;
+    CrtcMode mode;
+    uint32_t bpc = 8;
+    uint32_t width = 0, height = 0;
+    ModeSetResult set;
+    MonitorInfo monitor;
+  };
+  bool light_up(const AtomConnectors::Connector& connector, uint8_t crtc, LightUp* out);
+  // The CPU's window onto the picture light_up made (not valid if none): width x height pixels of 4 bytes, rows `width` pixels apart.
+  MmioRegion picture() const { return picture_; }
+
   // The short pulse of a DisplayPort sink (a status change that is not a plug: the link was lost, or the sink asks for a test) is taken by the interrupt handler as a pin to look at
   // (`pending_short_pulses()`: bit n for pin n). The look is the AUX channel's, which takes some milliseconds, so it is not done there: service_short_pulses() does it, from the desktop loop.
   // For each pending pin, lowest first, up to `capacity` of them, it reads the sink's link configuration (DP_LANE_COUNT_SET) and status (the lane training status, the alignment, the service
@@ -375,6 +397,7 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
   };
   amd_dce11::WatermarkHead heads_[AmdModeSet::kMaxCrtcs];     // the CRTCs the watermarks are computed for
   void update_watermarks();
+  MmioRegion picture_;              // the picture of light_up, in the block's output area
   uint32_t crtc_active_ = 0;       // bit n: CRTC n was enabled by set_mode (the driver's amdgpu_crtc->enabled)
   uint8_t crtc_pll_[AmdModeSet::kMaxCrtcs] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};      // the PLL each CRTC was set up with by set_mode (0xFF: none)
   Trained trained_[amd_dce11::Interrupts::kMaxHpd];
