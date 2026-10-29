@@ -625,15 +625,36 @@ bool Compiler::tex(const TgsiInst& i) {
   const bool bias = i.op == TgsiOp::Txb, lod = i.op == TgsiOp::Txl;
   scratch_used_ = kStage;       // (all of the intermediate registers are taken: the sample reads and writes them in place)
   uint32_t at = base;
-  // layout: image_sample_b: [bias, x, y]; image_sample_l: [x, y, lod]; image_sample: [x, y]
+  // layout: image_sample_b: [bias, coordinates]; image_sample_l: [coordinates, lod]; image_sample: [coordinates]. The coordinates are x, y for a 2D image; x, y, z for 3D (z the depth);
+  // x, y, layer for an array; for a cube the face coordinates and the face: (sc / |ma| + 1.5, tc / |ma| + 1.5, id) from v_cubesc, v_cubetc, v_cubema and v_cubeid of the direction.
+  const uint8_t target = s_.sampler_target[i.sampler];
   Mimg op = Mimg::image_sample;
   if (bias) {
     v_mov(at++, operand(i.src[0], 3));
     op = Mimg::image_sample_b;
   }
-  const Opd x = operand(i.src[0], 0), y = operand(i.src[0], 1);
-  v_mov(at++, x);
-  v_mov(at++, y);
+  if (target == TgsiShader::kTargetCube) {
+    // (the direction is copied to registers first: the cube instructions take no constants or literals; the registers base + 4 .. 7 are the result's, free until the sample)
+    const uint32_t sc = at, tc = at + 1, face = at + 2;
+    v_mov(base + 5, operand(i.src[0], 0));
+    v_mov(base + 6, operand(i.src[0], 1));
+    v_mov(base + 7, operand(i.src[0], 2));
+    f3(Vop3::v_cubeid_f32, face, vreg_operand(base + 5), vreg_operand(base + 6), vreg_operand(base + 7));
+    f3(Vop3::v_cubesc_f32, sc, vreg_operand(base + 5), vreg_operand(base + 6), vreg_operand(base + 7));
+    f3(Vop3::v_cubetc_f32, tc, vreg_operand(base + 5), vreg_operand(base + 6), vreg_operand(base + 7));
+    f3(Vop3::v_cubema_f32, base + 4, vreg_operand(base + 5), vreg_operand(base + 6), vreg_operand(base + 7));
+    Opd ma = vreg_operand(base + 4);
+    ma.abs = true;
+    f1(Vop1::v_rcp_f32, base + 4, ma);
+    v_mov(base + 5, constant(1.5f));
+    f3(Vop3::v_mad_f32, sc, vreg_operand(sc), vreg_operand(base + 4), vreg_operand(base + 5));
+    f3(Vop3::v_mad_f32, tc, vreg_operand(tc), vreg_operand(base + 4), vreg_operand(base + 5));
+    at += 3;
+  } else {
+    v_mov(at++, operand(i.src[0], 0));
+    v_mov(at++, operand(i.src[0], 1));
+    if (target != TgsiShader::kTarget2D) v_mov(at++, operand(i.src[0], 2));
+  }
   if (lod) {
     v_mov(at++, operand(i.src[0], 3));
     op = Mimg::image_sample_l;
