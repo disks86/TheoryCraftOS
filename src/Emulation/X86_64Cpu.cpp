@@ -517,6 +517,7 @@ X86_64Cpu::Step X86_64Cpu::step(GuestMemory& m) {
   auto bad_decode = [&]() { return fail(d_.available < 15 ? 14 : 6, s_.rip + d_.available); };
 
   if (op == 0xC4 || op == 0xC5) return step_vex(m, op);
+  if (op == 0x8F && d_.position < d_.available && (d_.bytes[d_.position] & 8)) return step_vex(m, op);      // (the XOP prefix: a pop has 0 in the modrm reg field)
   if (op == 0x62) return step_evex(m);      // (in 64-bit mode this is always the EVEX prefix)      // (in 64-bit mode these are always the VEX prefix)
   if (op == 0x0F) {
     result = step_0f(m);
@@ -1142,7 +1143,7 @@ X86_64Cpu::Step X86_64Cpu::step_0f(GuestMemory& m) {
       } else if (leaf == 0x80000000u) {
         a = 0x80000001u;
       } else if (leaf == 0x80000001u) {
-        c = (1u << 0) | (1u << 5);      // LAHF/SAHF, LZCNT
+        c = (1u << 0) | (1u << 5) | (1u << 11) | (1u << 16) | (1u << 21);      // LAHF/SAHF, LZCNT, XOP, FMA4, TBM
         dx = (1u << 11) | (1u << 20) | (1u << 27) | (1u << 29);      // SYSCALL, NX, RDTSCP, long mode
       }
       s_.r[0] = a;

@@ -181,6 +181,8 @@ class X86_64Cpu final : public IGuestCpu {
   Step sm3_instruction(GuestMemory& m, uint32_t map, uint8_t op, uint32_t vvvv);
   Step vex_gather(GuestMemory& m, uint8_t opcode, bool wide, uint32_t vvvv);
   Step vex_fma(GuestMemory& m, uint8_t opcode, bool wide, uint32_t vvvv);
+  Step fma4_instruction(GuestMemory& m, uint8_t opcode, bool wide, uint32_t vvvv);      // AMD FMA4 (VEX map 3)
+  Step xop_instruction(GuestMemory& m, uint32_t map, uint8_t opcode, uint32_t vvvv);      // AMD XOP and TBM (the 8F prefix)
   Step vex_bmi(GuestMemory& m, int map, uint8_t opcode, bool wide, uint32_t vvvv);
   Step xsave_family(GuestMemory& m, uint32_t kind);
   // X86_64Misc.cpp: the instructions that are neither SSE nor AVX nor x87 and did not fit the main switch

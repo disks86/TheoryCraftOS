@@ -191,8 +191,12 @@ programs built with `-march=haswell` (or x86-64-v3) run. `X86_64Vex.cpp` holds a
   denormals flushed; fp16 denormal inputs are kept). XCR0 (`xgetbv`) gains bits 17 and 18, `xsave` / `xsavec` / `xrstor` handle TILECFG (offset 2752) and TILEDATA (2816) and keep them out of XSTATE_BV while
   unconfigured, and cpuid reports AMX-TILE, INT8, BF16, FP16 and COMPLEX plus leaves 0xD (17, 18), 0x1D and 0x1E. There is no hardware to compare with here: the tests (`tests/AmxTest.cpp`) check against models
   written from the definition, so the operand order of the complex forms, the fp16 denormal rule and the #GP-vs-#UD choices for odd configurations are unverified.
+- **AMD FMA4, XOP and TBM** (`src/Emulation/X86_64Xop.cpp`; cpuid 0x80000001 ECX bits 16, 11, 21): all twenty FMA4 forms (VEX map 3; VEX.W swaps the r/m operand and the register in imm8[7:4]; a scalar result
+  zeroes the rest of the destination, which is unverified), and from the 8F prefix: the integer multiply-accumulates (`vpmacs*`, `vpmadcs*`), `vpcmov`, `vpperm`, `vprot`, `vpshl`, `vpsha`, `vpcom` / `vpcomu`,
+  the horizontal `vphadd*` / `vphsub*` and `vfrcz`, plus TBM (`blcfill`, `blci`, `blcic`, `blcmsk`, `blcs`, `blsfill`, `blsic`, `t1mskc`, `tzmsk`, `bextr` with an immediate). `8F /0` is still `pop`. Checked against
+  models only (`tests/XopTest.cpp`). Not implemented: `vpermil2ps/pd` and LWP.
 - **Not implemented** (an invalid-instruction fault, never a wrong result): APX (REX2, the 32 general registers, the EVEX-promoted legacy instructions), the AVX10.2
-  additions, XOP and FMA4 (AMD Bulldozer-era), CET shadow-stack instructions beyond the no-op forms, `xsaves`/`xrstors` and `xgetbv` with ECX=1.
+  additions, `vpermil2ps/pd` and LWP, CET shadow-stack instructions beyond the no-op forms, `xsaves`/`xrstors` and `xgetbv` with ECX=1.
   Exceptions delivered to a Windows program save the XMM halves of vector state in the `CONTEXT` in memory, not the upper halves (the emulator keeps those itself).
 - **Checked against the real thing**: `tests/AvxTest.cpp` assembles about 1,400 instruction forms with `llvm-mc` (`tests/data/emulation/avx_cases_gen.py`), runs each on the host
   and on the emulator from the same random state (80,000+ comparisons per run: all vector registers, written general registers, flags, MXCSR flags except DE, the memory operand)

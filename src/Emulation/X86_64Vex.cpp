@@ -119,6 +119,7 @@ X86_64Cpu::Step X86_64Cpu::step_vex(GuestMemory& m, uint8_t first) {
     wide = (b2 >> 2) & 1;
     pp = b2 & 3;
   }
+  if (first == 0x8F && (pp != 0 || map < 8)) return fail(6);
   d_.operand16 = pp == 1;
   d_.rep = pp == 2;
   d_.repne = pp == 3;
@@ -142,6 +143,7 @@ X86_64Cpu::Step X86_64Cpu::step_vex(GuestMemory& m, uint8_t first) {
       return vex_simd(m, op, 0, wide, vvvv);
     }
     case 2: return vex_map2(m, op, d_.rex_w, vvvv);
+    case 8: case 9: case 10: return first == 0x8F ? xop_instruction(m, map, op, vvvv) : fail(6);
     case 3:
       if (op >= 0x30 && op <= 0x33) return kmask_instruction(m, 3, op, d_.rex_w, vvvv);
       return vex_map3(m, op, d_.rex_w, vvvv);
@@ -670,6 +672,7 @@ X86_64Cpu::Step X86_64Cpu::vex_map3(GuestMemory& m, uint8_t op, bool wide_w, uin
   if (op == 0xF0) return vex_bmi(m, 3, op, wide_w, vvvv);
   if (op == 0x44 || op == 0xDF || op == 0xCE || op == 0xCF || op == 0xDE) return crypto_map(m, 3, op, wide_w, vvvv);
   if (pp != 1) return fail(6);
+  if ((op >= 0x5C && op <= 0x5F) || (op >= 0x68 && op <= 0x6F) || (op >= 0x78 && op <= 0x7F)) return fma4_instruction(m, op, wide_w, vvvv);
   if (!decode_modrm()) return bad_decode();
   const uint32_t imm = static_cast<uint32_t>(next_imm(1, false));
   if (!finish_decode()) return bad_decode();
