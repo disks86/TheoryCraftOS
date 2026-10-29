@@ -1639,11 +1639,35 @@ EXPORT DWORD WINAPI WaitForMultipleObjects(DWORD count, const HANDLE *handles, B
 /* ---- threads ------------------------------------------------------------------------------------------------------------------------------------------------- */
 
 #define STACK_SIZE_PARAM_IS_A_RESERVATION 0x10000
+IMPORT NTSTATUS NTAPI RtlGetActiveActivationContext(PVOID *);
+IMPORT NTSTATUS NTAPI RtlActivateActivationContext(ULONG, PVOID, ULONG_PTR *);
+IMPORT VOID NTAPI RtlReleaseActivationContext(PVOID);
+/* A thread starts with the activation context that was active in the thread that made it. */
+typedef struct ActThreadStart { LPTHREAD_START_ROUTINE start; LPVOID parameter; PVOID context; } ActThreadStart;
+static DWORD WINAPI actctx_thread_start(LPVOID p) {
+  ActThreadStart a = *(ActThreadStart *)p;
+  RtlFreeHeap(heap(), 0, p);
+  ULONG_PTR cookie;
+  RtlActivateActivationContext(0, a.context, &cookie);
+  RtlReleaseActivationContext(a.context);      /* (the frame keeps its own use of it) */
+  return a.start(a.parameter);
+}
 EXPORT HANDLE WINAPI CreateThread(LPSECURITY_ATTRIBUTES sa, SIZE_T stack, LPTHREAD_START_ROUTINE start, LPVOID parameter, DWORD flags, LPDWORD id) {
   (void)sa;
   HANDLE thread = NULL;
+  PVOID active = NULL;
+  RtlGetActiveActivationContext(&active);
+  if (active) {
+    ActThreadStart *a = RtlAllocateHeap(heap(), 0, sizeof(*a));
+    if (a) { a->start = start; a->parameter = parameter; a->context = active; start = actctx_thread_start; parameter = a; }
+    else { RtlReleaseActivationContext(active); active = NULL; }
+  }
   const NTSTATUS status = NtCreateThreadEx(&thread, 0x1FFFFF, NULL, NtCurrentProcess(), (PVOID)start, parameter, (flags & CREATE_SUSPENDED) ? 1 : 0, 0, stack, stack, NULL);
-  if (!NT_SUCCESS(status)) { set_error(status == STATUS_NOT_IMPLEMENTED ? ERROR_NOT_SUPPORTED : RtlNtStatusToDosError(status)); return NULL; }
+  if (!NT_SUCCESS(status)) {
+    if (active) { RtlReleaseActivationContext(active); RtlFreeHeap(heap(), 0, parameter); }
+    set_error(status == STATUS_NOT_IMPLEMENTED ? ERROR_NOT_SUPPORTED : RtlNtStatusToDosError(status));
+    return NULL;
+  }
   if (id) {
     ULONG64 info[6];
     *id = NT_SUCCESS(NtQueryInformationThread(thread, 0, info, sizeof(info), NULL)) ? (DWORD)info[3] : 0;

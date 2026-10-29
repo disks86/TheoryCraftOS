@@ -213,12 +213,15 @@ typedef struct Fiber {
   BOOL thread_fiber;
   DWORD magic;
   PVOID fls;                       /* the fiber's fiber local storage (TEB->FlsSlots while it runs) */
+  PVOID actctx_stack;              /* its stack of activation contexts (TEB->ActivationContextStackPointer while it runs; a new fiber has none until it activates one) */
 } Fiber;
 #define FIBER_MAGIC 0x46494252u
 #define TEB_FIBER_DATA(teb) (*(Fiber **)TEB_BYTE(teb, 0x20))
 #define TEB_STACK_BASE(teb) (*(PVOID *)TEB_BYTE(teb, 0x08))
 #define TEB_STACK_LIMIT(teb) (*(PVOID *)TEB_BYTE(teb, 0x10))
 #define TEB_FLS_SLOTS_PTR(teb) (*(PVOID *)TEB_BYTE(teb, 0x17c8))
+#define TEB_ACTCTX_STACK_PTR(teb) (*(PVOID *)TEB_BYTE(teb, 0x2c8))
+IMPORT void NTAPI RtlFreeActivationContextStack(PVOID stack);
 #define TEB_SAME_FLAGS(teb) (*(USHORT *)TEB_BYTE(teb, 0x17ee))      /* bit 2: HasFiberData */
 IMPORT void NTAPI RtlProcessFlsData(PVOID data, ULONG flags);
 
@@ -260,6 +263,7 @@ EXPORT PVOID WINAPI ConvertThreadToFiberEx(PVOID parameter, DWORD flags) {
   f->thread_fiber = TRUE;
   f->magic = FIBER_MAGIC;
   f->fls = TEB_FLS_SLOTS_PTR(NtCurrentTeb());
+  f->actctx_stack = TEB_ACTCTX_STACK_PTR(NtCurrentTeb());
   TEB_FIBER_DATA(NtCurrentTeb()) = f;
   TEB_SAME_FLAGS(NtCurrentTeb()) |= 4;
   return f;
@@ -267,11 +271,13 @@ EXPORT PVOID WINAPI ConvertThreadToFiberEx(PVOID parameter, DWORD flags) {
 EXPORT PVOID WINAPI ConvertThreadToFiber(PVOID parameter) { return ConvertThreadToFiberEx(parameter, 0); }
 EXPORT BOOL WINAPI ConvertFiberToThread(void) {
   Fiber *f = current_fiber();
-  if (!f || !f->thread_fiber) { set_error(1281 /* ERROR_ALREADY_THREAD */); return FALSE; }
+  if (!f) { set_error(1281 /* ERROR_ALREADY_THREAD */); return FALSE; }
   TEB_FIBER_DATA(NtCurrentTeb()) = NULL;
   TEB_SAME_FLAGS(NtCurrentTeb()) &= (USHORT)~4;
-  f->magic = 0;
-  HeapFree(heap(), 0, f);
+  if (f->thread_fiber) {      /* (from another fiber the thread's own stays as it is: it can be switched to, and deleted, later) */
+    f->magic = 0;
+    HeapFree(heap(), 0, f);
+  }
   return TRUE;
 }
 EXPORT BOOL WINAPI IsThreadAFiber(void) { return current_fiber() != NULL; }
@@ -309,6 +315,8 @@ EXPORT void WINAPI SwitchToFiber(PVOID target) {
   if (to == from) return;
   from->fls = TEB_FLS_SLOTS_PTR(NtCurrentTeb());
   TEB_FLS_SLOTS_PTR(NtCurrentTeb()) = to->fls;
+  from->actctx_stack = TEB_ACTCTX_STACK_PTR(NtCurrentTeb());
+  TEB_ACTCTX_STACK_PTR(NtCurrentTeb()) = to->actctx_stack;
   TEB_FIBER_DATA(NtCurrentTeb()) = to;
   TEB_STACK_BASE(NtCurrentTeb()) = to->stack_base;
   TEB_STACK_LIMIT(NtCurrentTeb()) = to->stack_limit;
@@ -322,6 +330,7 @@ EXPORT void WINAPI DeleteFiber(PVOID fiber) {
     ExitThread(0);
   }
   f->magic = 0;
+  if (f->actctx_stack && !f->thread_fiber) RtlFreeActivationContextStack(f->actctx_stack);
   if (f->fls && !f->thread_fiber) RtlProcessFlsData(f->fls, 3);      /* (the fiber's values: the callbacks run, then the memory goes) */
   if (f->allocation) VirtualFree(f->allocation, 0, MEM_RELEASE);
   HeapFree(heap(), 0, f);

@@ -522,6 +522,7 @@ static void fls_destroy_current(int free_structure);
 static volatile LONG g_heap_lock;
 static volatile LONG g_fls_lock;
 static void fls_thread_begins(void);
+EXPORT void NTAPI RtlFreeThreadActivationContextStack(void);
 /* The libraries are told the process is ending (once): this thread's fiber local storage goes first, then every library's entry point and TLS callbacks get
  * DLL_PROCESS_DETACH with a non-NULL reserved. The libraries stay loaded; the process is not over. */
 EXPORT void NTAPI LdrShutdownProcess(void) {
@@ -563,6 +564,7 @@ EXPORT void NTAPI RtlExitUserThread(NTSTATUS status) {
   fls_destroy_current(0);
   if (!g_process_ending) notify_all_modules(DLL_THREAD_DETACH, NULL, 0);
   fls_destroy_current(1);
+  RtlFreeThreadActivationContextStack();
   for (;;) NtTerminateThread((HANDLE)(LONG_PTR)-2, status);
 }
 
