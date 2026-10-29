@@ -150,6 +150,17 @@ struct GetCapsetInfo {
   uint32_t index, padding;
 };
 
+struct GetCapset {
+  ControlHeader header;
+  uint32_t capset_id, capset_version;
+};
+
+// The answer: the header and the capability set (the start of virgl_caps_v1 is what the driver reads).
+struct RespCapset {
+  ControlHeader header;
+  uint8_t data[512];
+};
+
 struct RespCapsetInfo {
   ControlHeader header;
   uint32_t capset_id, max_version, max_size, padding;

@@ -94,6 +94,7 @@ enum AllocationFlags : uint32_t {
   kAllocPresent = 1u << 5,       // may be put on the screen (a back buffer or the primary)
   kAllocStaging = 1u << 6,
   kAllocShared = 1u << 7,        // may be shared with other processes (Kernel::share_allocation)
+  kAllocUnorderedAccess = 1u << 9,   // a buffer compute shaders read and write (BindUav; the adapter's kFeatureCompute); may also be a vertex or index buffer
   kAllocQueryResult = 1u << 8,   // a buffer the results of occlusion queries are written to (CommandStream.hpp BeginQuery); system memory only, never resident, read by locking it
 };
 
@@ -194,6 +195,7 @@ struct ShaderDesc {
 
 struct PipelineDesc {
   Handle vertex_shader = 0, fragment_shader = 0;
+  Handle compute_shader = 0;   // not 0: a compute pipeline of that shader (stage Compute), and nothing else of the description is used; needs kFeatureCompute
   uint32_t vertex_stride = 0;
   graphics::VertexAttribute attributes[graphics::kMaxVertexAttributes] = {};
   uint32_t attribute_count = 0;

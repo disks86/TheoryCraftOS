@@ -2722,7 +2722,8 @@ void test_dxbc_real() {
         CHECK(p->emit_tgsi(&text) == status::kSuccess && strstr(std::string(text.view().data(), text.size()).c_str(), k.name));
       }
     }
-    for (const std::vector<uint8_t>* blob : {&vs_blob, &color_blob, &tex_blob, &math_blob, &volume_blob, &array_blob, &cube_blob}) {
+    const std::vector<uint8_t> compute_blob = read_blob("cs_fill.dxbc");
+    for (const std::vector<uint8_t>* blob : {&vs_blob, &color_blob, &tex_blob, &math_blob, &volume_blob, &array_blob, &cube_blob, &compute_blob}) {
       for (size_t cut = 0; cut < blob->size(); cut += 3) {
         std::vector<uint8_t> t(blob->begin(), blob->begin() + static_cast<long>(cut));
         UniquePointer<D3d9Program> p = compile_dxbc(allocator, t, &st);
@@ -2742,6 +2743,12 @@ void test_dxbc_real() {
           p->run_fragment(v, constants, &textures, col);
           graphics::ShaderIo io;
           p->run_vertex(v, constants, &io);
+          // (a compute shader, on buffers that are a little too small for what it does)
+          uint8_t storage[4][64] = {};
+          graphics::ComputeContext context;
+          for (uint32_t k = 0; k < graphics::kMaxStorageBuffers; ++k) context.buffers[k] = ByteView(storage[k], sizeof storage[k]);
+          context.dispatch_id[0] = context.dispatch_id[1] = 5;
+          p->run_compute(context, constants);
         } else {
           ++refused;
         }
@@ -3698,6 +3705,179 @@ void test_independent_blend() {
   CHECK(kernel.create_pipeline(kPid, dev, pd, &out) == status::kNotSupported);
 }
 
+// A compute shader written token by token (the HLSL compiler at hand has no ByteAddressBuffer methods): ld_raw, store_raw and an immediate atomic on a raw buffer.
+void test_compute() {
+  HostAllocator allocator;
+  std::vector<uint32_t> t;
+  auto put = [&](std::initializer_list<uint32_t> words) { for (uint32_t w : words) t.push_back(w); };
+  const uint32_t kUav = 0x0011E000, kUavMaskX = 0x0011E012, kUavXXXX = 0x0011E006, kTempX = 0x00100012, kTempSel = 0x0010000A, kThreadX = 0x0002000A, kImm = 0x00004001;
+  t.push_back(0x00050050);   // cs_5_0
+  t.push_back(0);            // (the length, below)
+  put({157u | (3u << 24), kUav, 0});                       // dcl_uav_raw u0
+  put({104u | (2u << 24), 3});                             // dcl_temps 3
+  put({155u | (4u << 24), 16, 1, 1});                      // dcl_thread_group 16, 1, 1
+  put({95u | (2u << 24), 0x00020012});                     // dcl_input vThreadID.x
+  put({41u | (6u << 24), kTempX, 0, kThreadX, kImm, 2});   // ishl r0.x, vThreadID.x, l(2)
+  put({166u | (6u << 24), kUavMaskX, 0, kTempSel, 0, kThreadX});   // store_raw u0.x, r0.x, vThreadID.x
+  put({165u | (7u << 24), kTempX, 1, kTempSel, 0, kUavXXXX, 0});   // ld_raw r1.x, r0.x, u0.xxxx
+  put({30u | (7u << 24), kTempX, 1, kTempSel, 1, kImm, 100});      // iadd r1.x, r1.x, l(100)
+  put({166u | (7u << 24), kUavMaskX, 0, kTempSel, 0, kTempSel, 1});   // store_raw u0.x, r0.x, r1.x
+  put({180u | (9u << 24), kTempX, 2, kUav, 0, kImm, 64, kImm, 1});   // imm_atomic_iadd r2.x, u0, l(64), l(1)
+  put({62u | (1u << 24)});                                 // ret
+  t[1] = static_cast<uint32_t>(t.size());
+  std::vector<uint8_t> blob = {'D', 'X', 'B', 'C'};
+  auto put32 = [&](uint32_t v) { for (int i = 0; i < 4; ++i) blob.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+  blob.insert(blob.end(), 16, 0);
+  const uint32_t body = static_cast<uint32_t>(t.size() * 4);
+  put32(1), put32(36 + 8 + body), put32(1), put32(36);
+  blob.push_back('S'), blob.push_back('H'), blob.push_back('E'), blob.push_back('X');
+  put32(body);
+  for (uint32_t w : t) put32(w);
+
+  UniquePointer<D3d9Program> program;
+  CHECK(D3d9Program::compile_dxbc(allocator, ConstByteView(blob.data(), blob.size()), &program) == status::kSuccess && program);
+  CHECK(program->stage() == graphics::ShaderStage::Compute && program->thread_group(0) == 16 && program->thread_group(1) == 1);
+  CHECK(program->storage_kind(0) == D3d9Program::BufferKind::Raw && program->storage_kind(1) == D3d9Program::BufferKind::None);
+  CHECK((program->required_features() & graphics::kFeatureCompute) != 0);
+  uint8_t storage[128] = {};
+  graphics::ComputeContext context;
+  context.buffers[0] = ByteView(storage, sizeof storage);
+  for (uint32_t tid = 0; tid < 16; ++tid) {
+    context.thread_id[0] = context.dispatch_id[0] = tid;
+    program->run_compute(context, nullptr);
+  }
+  ByteReader in{ConstByteView(storage, sizeof storage)};
+  for (uint32_t tid = 0; tid < 16; ++tid) CHECK(in.le32() == tid + 100);   // (each thread: its number, read back, plus 100)
+  CHECK(in.le32() == 16);                                                  // (the sixteen atomic adds)
+  // A buffer smaller than the shader assumes: the writes outside it are dropped, the reads give zero, nothing is touched past it.
+  uint8_t small[40] = {};
+  context.buffers[0] = ByteView(small, sizeof small);
+  for (uint32_t tid = 0; tid < 16; ++tid) {
+    context.dispatch_id[0] = tid;
+    program->run_compute(context, nullptr);
+  }
+  ByteReader small_in{ConstByteView(small, sizeof small)};
+  for (uint32_t tid = 0; tid < 10; ++tid) CHECK(small_in.le32() == tid + 100);
+  // No buffer bound: the instructions do nothing.
+  context.buffers[0] = ByteView();
+  program->run_compute(context, nullptr);
+  // The same text for the GPU: the buffer, the thread numbers and the atomic.
+  String text(allocator);
+  CHECK(program->emit_tgsi(&text) == status::kSuccess);
+  const std::string tgsi(text.view().data(), text.size());
+  CHECK(tgsi.find("COMP") == 0 && tgsi.find("PROPERTY CS_FIXED_BLOCK_WIDTH 16") != std::string::npos && tgsi.find("DCL BUFFER[0]") != std::string::npos && tgsi.find("ATOMUADD") != std::string::npos &&
+        tgsi.find("STORE BUFFER[0]") != std::string::npos && tgsi.find("LOAD ") != std::string::npos && tgsi.find("OUT[") == std::string::npos);
+  // Truncated and bit-flipped.
+  uint32_t seed = 99;
+  for (size_t cut = 0; cut < blob.size(); cut += 2) {
+    UniquePointer<D3d9Program> p;
+    D3d9Program::compile_dxbc(allocator, ConstByteView(blob.data(), cut), &p);
+  }
+  for (int i = 0; i < 4000; ++i) {
+    std::vector<uint8_t> flipped = blob;
+    seed = seed * 1664525u + 1013904223u;
+    flipped[(seed >> 8) % flipped.size()] ^= static_cast<uint8_t>(1u << ((seed >> 3) % 8));
+    UniquePointer<D3d9Program> p;
+    if (D3d9Program::compile_dxbc(allocator, ConstByteView(flipped.data(), flipped.size()), &p) == status::kSuccess) {
+      uint8_t mem[64] = {};
+      graphics::ComputeContext c;
+      c.buffers[0] = c.buffers[1] = ByteView(mem, sizeof mem);
+      p->run_compute(c, nullptr);
+      String ignored(allocator);
+      p->emit_tgsi(&ignored);
+    }
+  }
+}
+
+// The kernel's side of compute: storage allocations, the stream's BindUav and Dispatch, and what it refuses.
+void test_compute_kernel() {
+  Env e;
+  namespace b = conformance_blobs;
+  Handle cs = 0, cs_pipe = 0;
+  ShaderDesc sd;
+  sd.kind = ShaderKind::Dxbc, sd.stage = graphics::ShaderStage::Compute, sd.code = ConstByteView(b::k_cs_fill, sizeof b::k_cs_fill);
+  CHECK(e.kernel.create_shader(kPid, e.dev, sd, &cs) == status::kSuccess);
+  PipelineDesc pd;
+  pd.compute_shader = cs;
+  CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &cs_pipe) == status::kSuccess);
+  pd.compute_shader = 0x7777;
+  Handle bogus = 0;
+  CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &bogus) == status::kInvalidHandle);
+  auto storage = [&](uint64_t size, uint32_t flags = kAllocUnorderedAccess) {
+    AllocationDesc d;
+    d.flags = flags, d.size = size;
+    Handle out = 0;
+    return e.kernel.create_allocation(kPid, e.dev, d, &out) == status::kSuccess ? out : Handle{0};
+  };
+  Handle picture = storage(4096), structured = storage(16384), counters = storage(16), plain = e.buffer(kAllocVertexBuffer, 4096);
+  CHECK(picture && structured && counters);
+  // Flags that do not go with it, and sizes.
+  AllocationDesc d;
+  d.flags = kAllocUnorderedAccess | kAllocTexture, d.size = 64;
+  Handle none = 0;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, d, &none) == status::kInvalidParameter);
+  d.flags = kAllocUnorderedAccess, d.size = 0;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, d, &none) == status::kInvalidParameter);
+
+  const uint32_t constants[4] = {0x00102030u, 0, 0, 0};
+  auto run = [&](auto build) {
+    CommandWriter w(e.allocator);
+    build(w);
+    return w.ok() ? e.render(w, {picture, structured, counters, plain}) : status::kNoMemory;
+  };
+  auto bind_all = [&](CommandWriter& w) {
+    w.bind_pipeline(cs_pipe);
+    w.push_constants(ConstByteView(reinterpret_cast<const uint8_t*>(constants), 16));
+    w.bind_uav(0, 0, 0, 4096), w.bind_uav(1, 1, 0, 16384), w.bind_uav(2, 2, 0, 16);
+  };
+  // The first dispatch: the CPU reads what the shader wrote through lock().
+  CHECK(run([&](CommandWriter& w) { bind_all(w); w.dispatch(4, 8, 1); }) == status::kSuccess);
+  CHECK(e.pixel(picture, 0, 0) == 0xFF102030u);
+  LockResult lock;
+  CHECK(e.kernel.lock(kPid, counters, kLockReadOnly, 0, &lock) == status::kSuccess);
+  ByteReader counter_in(lock.data);
+  CHECK(counter_in.le32() == 1024 && counter_in.le32() == 1024);
+  e.kernel.unlock(kPid, counters);
+  // A second dispatch adds to the counters (the shader and the buffers are kept).
+  CHECK(run([&](CommandWriter& w) { bind_all(w); w.dispatch(4, 8, 1); w.dispatch(1, 1, 1); }) == status::kSuccess);
+  CHECK(e.kernel.lock(kPid, counters, kLockReadOnly, 0, &lock) == status::kSuccess);
+  ByteReader again(lock.data);
+  CHECK(again.le32() == 1024 + 1024 + 32 && again.le32() == 1024 + 1024 + 32);
+  e.kernel.unlock(kPid, counters);
+  // An empty dispatch is fine.
+  CHECK(run([&](CommandWriter& w) { bind_all(w); w.dispatch(0, 4, 4); }) == status::kSuccess);
+
+  // Refused: a dispatch without a pipeline, with a slot unbound, inside a pass, too large; a UAV that is not one, misaligned, out of range, in a pass; a compute pipeline in a pass.
+  CHECK(run([&](CommandWriter& w) { w.dispatch(1); }) == status::kInvalidParameter);
+  CHECK(run([&](CommandWriter& w) { w.bind_pipeline(cs_pipe); w.bind_uav(0, 0, 0, 4096); w.dispatch(1); }) == status::kInvalidParameter);
+  CHECK(run([&](CommandWriter& w) { bind_all(w); w.dispatch(65536); }) == status::kInvalidParameter);
+  CHECK(run([&](CommandWriter& w) { bind_all(w); w.dispatch(65535, 65535, 65535); }) == status::kInvalidParameter);
+  CHECK(run([&](CommandWriter& w) { bind_all(w); w.begin_pass(kNoAllocation, kNoAllocation, 0, {}, 1, 0); w.dispatch(1); }) == status::kInvalidParameter);
+  CHECK(run([&](CommandWriter& w) { w.bind_pipeline(cs_pipe); w.bind_uav(0, 3, 0, 4096); }) == status::kInvalidParameter);   // (a vertex buffer)
+  CHECK(run([&](CommandWriter& w) { w.bind_uav(0, 0, 2, 64); }) == status::kInvalidParameter);                                 // (offset not a multiple of 4)
+  CHECK(run([&](CommandWriter& w) { w.bind_uav(0, 0, 0, 62); }) == status::kInvalidParameter);
+  CHECK(run([&](CommandWriter& w) { w.bind_uav(0, 0, 4092, 8); }) == status::kInvalidParameter);                               // (past the end)
+  CHECK(run([&](CommandWriter& w) { w.bind_uav(0, 0, 0xFFFFFFFCu, 8); }) == status::kInvalidParameter);
+  CHECK(run([&](CommandWriter& w) { w.bind_uav(0, 0, 0, 0); }) == status::kInvalidParameter);
+  CHECK(run([&](CommandWriter& w) { w.bind_uav(graphics::kMaxStorageBuffers, 0, 0, 64); }) == status::kInvalidParameter);
+  CHECK(run([&](CommandWriter& w) { w.begin_pass(0, kNoAllocation, 0, {}, 1, 0); w.bind_uav(0, 0, 0, 64); w.end_pass(); }) == status::kInvalidParameter);
+
+  // A device without the feature: no storage allocations, no compute shaders.
+  FakeScreen screen(8, 6);
+  graphics::SoftwareDevice software(e.allocator, &screen);
+  SpyDevice limited(software);
+  limited.feature_mask = 0;
+  Kernel kernel(e.allocator);
+  AdapterConfig c;
+  c.display = &screen;
+  kernel.add_adapter(limited, c);
+  Handle adapter = 0, dev = 0, refused = 0;
+  CHECK(kernel.open_process(kPid) == status::kSuccess && kernel.open_adapter_from_index(kPid, 0, &adapter) == status::kSuccess && kernel.create_device(kPid, adapter, &dev) == status::kSuccess);
+  d.flags = kAllocUnorderedAccess, d.size = 64;
+  CHECK(kernel.create_allocation(kPid, dev, d, &refused) == status::kNotSupported);
+  CHECK(kernel.create_shader(kPid, dev, sd, &refused) == status::kNotSupported);
+}
+
 void test_conformance() {
   test_half_floats();
   HostAllocator allocator;
@@ -3751,6 +3931,18 @@ void test_conformance() {
       };
       CHECK(near(r.device_picture[16 * 32 + 12] & 0xFFFFFF, 0xb49a81) && near(r.device_picture[16 * 32 + 13] & 0xFFFFFF, 0x4d661a));
       CHECK(near(r.device_picture[28 * 32 + 8] & 0xFFFFFF, 0x9a3434) && near(r.device_picture[28 * 32 + 9] & 0xFFFFFF, 0x1a1a80));
+    }
+    if (__builtin_strstr(r.name, "compute shader")) {
+      // Every pixel from the formula of cs_fill.hlsl (the thread of x, y is number (y % 4) * 8 + x % 8 of group x / 8, y / 4).
+      uint32_t wrong = 0;
+      for (uint32_t y = 0; y < 32; ++y)
+        for (uint32_t x = 0; x < 32; ++x) {
+          const uint32_t gi = (y % 4) * 8 + x % 8;
+          const uint32_t v = 0xFF000000u | ((x * 8) << 16) | ((y * 8) << 8) | (((x / 8) * 40 + gi) & 0xFF);
+          const uint32_t want = v ^ 0x00102030u ^ ((x ^ y) & 0xF);
+          if (r.device_picture[y * 32 + x] != want) ++wrong;
+        }
+      CHECK(wrong == 0);
     }
     if (__builtin_strstr(r.name, "occlusion queries")) {
       // The stripes: all 256 pixels of the open quad (red 255), half of them for the one half behind the near quad (about 128), none for the one wholly behind it.
@@ -4858,6 +5050,8 @@ int main() {
   test_occlusion_queries();
   test_texture_kinds();
   test_independent_blend();
+  test_compute();
+  test_compute_kernel();
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);
     return 1;

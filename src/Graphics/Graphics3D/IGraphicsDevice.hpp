@@ -50,6 +50,7 @@ constexpr uint32_t kMaxColorTargets = 4;
 enum BufferUsage : uint32_t {
   kBufferVertex = 1u << 0,
   kBufferIndex = 1u << 1,
+  kBufferStorage = 1u << 2,   // kFeatureCompute: read and written by compute shaders (bind_storage_buffer)
 };
 
 class IBuffer {
@@ -58,6 +59,8 @@ class IBuffer {
   // CPU access to the contents. Write, then unmap() before a submit that reads it.
   virtual ByteView map() = 0;
   virtual void unmap() = 0;
+  // After a submit() in which the GPU may have written the buffer (a storage buffer a compute shader wrote): brings what it holds into map(). True if the contents are current.
+  virtual bool read_back() { return true; }
 
  protected:
   constexpr IBuffer() = default;
@@ -142,7 +145,7 @@ class IImage {
 
 // --- Shaders -----------------------------------------------------------------
 
-enum class ShaderStage : uint8_t { Vertex, Fragment };
+enum class ShaderStage : uint8_t { Vertex, Fragment, Compute };
 
 // --- Textures ----------------------------------------------------------------
 
@@ -233,6 +236,23 @@ struct FragmentContext {
 using VertexShaderFnEx = void (*)(const Vec4* attributes, const uint8_t* constants, const VertexContext& context, ShaderIo* out);
 using FragmentShaderFnEx = bool (*)(const Vec4* varyings, const FragmentContext& context, const uint8_t* constants, const ITextureSet& textures, Vec4* color);
 
+// Compute shaders (kFeatureCompute). A software compute shader is called once per thread; the device runs the groups of a dispatch one after the other and the threads of a group
+// in order (no barriers or group-shared memory: a module that needs them is not given a function). `buffers` are the storage buffers bound at the time (empty views for slots
+// that are not bound); a read or write outside a buffer must be dropped or read as zero by the shader.
+constexpr uint32_t kMaxStorageBuffers = 4;
+struct ComputeContext {
+  uint32_t group_id[3] = {};      // SV_GroupID
+  uint32_t thread_id[3] = {};     // SV_GroupThreadID
+  uint32_t dispatch_id[3] = {};   // SV_DispatchThreadID: group_id * thread group size + thread_id
+  uint32_t group_index = 0;       // SV_GroupIndex: the thread's number in its group
+  ByteView buffers[kMaxStorageBuffers];
+};
+using ComputeShaderFn = void (*)(const ComputeContext& context, const uint8_t* constants);
+// Most threads in a group and most groups (in each dimension) of a dispatch.
+constexpr uint32_t kMaxThreadsPerGroup = 1024;
+constexpr uint32_t kMaxDispatchGroups = 65535;
+constexpr uint64_t kMaxDispatchThreads = 1ull << 24;
+
 // The QPU programs the Raspberry Pi's V3D device has for the built-in shaders (there is no shader compiler for the QPUs, so a module names a program it ships
 // with instead of carrying code): the coloured-vertex pipeline of BuiltinShaders.
 enum class QpuProgram : uint8_t { None, ColoredVertex, ColoredFragment };
@@ -250,6 +270,9 @@ struct ShaderModuleDesc {
   // The same with system values: a device with kFeatureSystemInputs runs these when a module has them (and any of the others otherwise).
   VertexShaderFnEx vertex_function_ex = nullptr;
   FragmentShaderFnEx fragment_function_ex = nullptr;
+  // A compute shader (stage Compute): the function for the software device, TGSI text for virgl, and the size of a thread group either way.
+  ComputeShaderFn compute_function = nullptr;
+  uint32_t thread_group[3] = {1, 1, 1};
   // TGSI text for the GPU device. Inputs are the vertex attributes (vertex stage) or the
   // varyings as GENERIC[n] (fragment stage); push constants are CONST[0..7] (vec4 each).
   // Clip-space z is 0..1 and the first color output is the pixel.
@@ -397,6 +420,13 @@ class ICommandBuffer {
   // What the vertices of the draws that follow make (kFeatureLines for lines and points; the default is a list of triangles).
   virtual void set_primitive_topology(PrimitiveTopology topology) = 0;
   virtual void end_render_pass() = 0;
+  // Compute (kFeatureCompute), outside a render pass: bind_compute_pipeline makes the pipeline of create_compute_pipeline current for the dispatches that follow, bind_storage_buffer
+  // puts `size` bytes of a kBufferStorage buffer from `offset` in slot 0 .. kMaxStorageBuffers - 1, and dispatch runs x * y * z thread groups. A device without the feature ignores all three.
+  virtual void bind_compute_pipeline(const IPipeline* pipeline) { (void)pipeline; }
+  virtual void bind_storage_buffer(uint32_t slot, IBuffer* buffer, uint64_t offset, uint64_t size) {
+    (void)slot, (void)buffer, (void)offset, (void)size;
+  }
+  virtual void dispatch(uint32_t groups_x, uint32_t groups_y, uint32_t groups_z) { (void)groups_x, (void)groups_y, (void)groups_z; }
   // Occlusion queries (kFeatureOcclusionQueries), inside a render pass: from begin to end, the fragments that pass the stencil and depth tests (and that the shader did not
   // discard) are counted - one per pixel, however many targets the pipeline writes and whatever the blending or write masks do. `slot` (below kMaxOcclusionQueries) names the result; one query is open at a time and
   // it ends before the pass does. A device without the feature ignores both.
@@ -427,6 +457,7 @@ enum DeviceFeature : uint32_t {
   kFeatureInstancing = 1u << 3,    // draw(..., instance_count, first_instance) and VertexAttribute::per_instance
   kFeatureLines = 1u << 4,         // set_primitive_topology: lines and points
   kFeatureFloatFormats = 1u << 6,      // Format::R16G16B16A16Float / R32G32B32A32Float images: colour attachments (also several at once) and sampled textures, without mipmaps; read_pixels_float / write_pixels_float
+  kFeatureCompute = 1u << 10,          // compute shaders: create_compute_pipeline, kBufferStorage buffers, ICommandBuffer::dispatch
   kFeatureIndependentBlend = 1u << 9,  // GraphicsPipelineDesc::independent_blend / target_blend
   kFeatureTextureKinds = 1u << 8,      // ImageDesc::kind other than Texture2D, layer_count / write_layer_pixels / read_layer_pixels, ITextureSet::sample_volume
   kFeatureOcclusionQueries = 1u << 7,  // ICommandBuffer::begin_occlusion_query / end_occlusion_query / occlusion_result
@@ -454,6 +485,11 @@ class IGraphicsDevice {
   virtual IShaderModule* create_shader_module(const ShaderModuleDesc& desc) = 0;
   virtual void destroy_shader_module(IShaderModule* module) = 0;
   virtual IPipeline* create_graphics_pipeline(const GraphicsPipelineDesc& desc) = 0;
+  // A pipeline that runs a compute shader module (kFeatureCompute); nullptr when the device has none or the module is not one it can run. Freed with destroy_pipeline.
+  virtual IPipeline* create_compute_pipeline(const IShaderModule* shader) {
+    (void)shader;
+    return nullptr;
+  }
   virtual void destroy_pipeline(IPipeline* pipeline) = 0;
   virtual ICommandBuffer* create_command_buffer() = 0;
   virtual void destroy_command_buffer(ICommandBuffer* commands) = 0;

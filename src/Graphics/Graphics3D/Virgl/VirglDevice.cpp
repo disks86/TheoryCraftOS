@@ -115,6 +115,7 @@ class VirglBuffer final : public IBuffer {
     uint32_t bind = extra_bind;
     if (usage & kBufferVertex) bind |= virgl::kBindVertexBuffer;
     if (usage & kBufferIndex) bind |= virgl::kBindIndexBuffer;
+    if (usage & kBufferStorage) bind |= virgl::kBindShaderBuffer;
     ResourceCreate3d create{header(kCmdResourceCreate3d), id_, virgl::kTargetBuffer, virgl::kFormatR8Unorm, bind,
                             static_cast<uint32_t>(size), 1, 1, 1, 0, 0, 0, 0};
     ResourceAttachBacking attach{header(kCmdResourceAttachBacking), id_, 1,
@@ -143,6 +144,11 @@ class VirglBuffer final : public IBuffer {
     TransferHost3d transfer{header(kCmdTransferToHost3d), {0, 0, 0, static_cast<uint32_t>(memory_.size()), 1, 1}, 0,
                             id_, 0, 0, 0};
     device_.gpu().command(as_bytes(transfer));
+  }
+  // What a compute shader wrote lives on the host: pull it into the guest memory.
+  bool read_back() override {
+    TransferHost3d transfer{header(kCmdTransferFromHost3d), {0, 0, 0, static_cast<uint32_t>(memory_.size()), 1, 1}, 0, id_, 0, 0, 0};
+    return device_.gpu().command(as_bytes(transfer));
   }
 
  private:
@@ -325,6 +331,7 @@ class VirglImage final : public IImage {
 class VirglShaderModule final : public IShaderModule {
  public:
   VirglShaderModule(VirglDevice& device, const ShaderModuleDesc& desc) : stage_(desc.stage) {
+    for (uint32_t k = 0; k < 3; ++k) thread_group_[k] = desc.thread_group[k];
     handle_ = device.new_handle();
     const uint32_t length = string_length(desc.tgsi) + 1;  // with the terminating NUL
     const uint32_t text_dwords = (length + 3) / 4;
@@ -334,7 +341,7 @@ class VirglShaderModule final : public IShaderModule {
     if (!cmd) return;
     cmd[0] = virgl::header(virgl::kCreateObject, virgl::kObjectShader, 5 + text_dwords);
     cmd[1] = handle_;
-    cmd[2] = desc.stage == ShaderStage::Vertex ? virgl::kShaderVertex : virgl::kShaderFragment;
+    cmd[2] = desc.stage == ShaderStage::Vertex ? virgl::kShaderVertex : desc.stage == ShaderStage::Compute ? virgl::kShaderCompute : virgl::kShaderFragment;
     cmd[3] = length;                         // total text length (no continuation bit: it all fits)
     cmd[4] = length < 300 ? 300 : length;    // upper bound on the TGSI token count the host reserves
     cmd[5] = 0;                              // no stream output
@@ -346,17 +353,45 @@ class VirglShaderModule final : public IShaderModule {
   bool valid() const { return ok_; }
   ShaderStage stage() const override { return stage_; }
   uint32_t handle() const { return handle_; }
+  uint32_t thread_group(uint32_t axis) const { return thread_group_[axis]; }
 
  private:
+  uint32_t thread_group_[3] = {1, 1, 1};
   ShaderStage stage_;
   uint32_t handle_ = 0;
   bool ok_ = false;
 };
 
-class VirglPipeline final : public IPipeline {
+// Both kinds of pipeline, so that destroy_pipeline can tell them apart.
+class VirglPipelineBase : public IPipeline {
+ public:
+  bool compute() const { return compute_; }
+
+ protected:
+  explicit VirglPipelineBase(bool compute) : compute_(compute) {}
+  ~VirglPipelineBase() = default;
+
+ private:
+  bool compute_;
+};
+
+class VirglComputePipeline final : public VirglPipelineBase {
+ public:
+  explicit VirglComputePipeline(const VirglShaderModule& shader) : VirglPipelineBase(true), shader_(shader.handle()) {
+    for (uint32_t k = 0; k < 3; ++k) group_[k] = shader.thread_group(k);
+  }
+  uint32_t shader() const { return shader_; }
+  uint32_t group(uint32_t axis) const { return group_[axis]; }
+
+ private:
+  uint32_t shader_;
+  uint32_t group_[3];
+};
+
+class VirglPipeline final : public VirglPipelineBase {
  public:
   VirglPipeline(VirglDevice& device, const GraphicsPipelineDesc& desc)
-      : device_(device), desc_(desc), vs_(static_cast<const VirglShaderModule*>(desc.vertex_shader)->handle()),
+      : VirglPipelineBase(false), device_(device), desc_(desc), vs_(static_cast<const VirglShaderModule*>(desc.vertex_shader)->handle()),
         fs_(static_cast<const VirglShaderModule*>(desc.fragment_shader)->handle()) {
     blend_ = device.new_handle();
     dsa_ = device.new_handle();
@@ -575,7 +610,15 @@ IPipeline* VirglDevice::create_graphics_pipeline(const GraphicsPipelineDesc& des
   }
   return p;
 }
-void VirglDevice::destroy_pipeline(IPipeline* pipeline) { destroy(gpu_.allocator(), static_cast<VirglPipeline*>(pipeline)); }
+void VirglDevice::destroy_pipeline(IPipeline* pipeline) {
+  if (static_cast<VirglPipelineBase*>(pipeline)->compute()) destroy(gpu_.allocator(), static_cast<VirglComputePipeline*>(pipeline));
+  else destroy(gpu_.allocator(), static_cast<VirglPipeline*>(pipeline));
+}
+
+IPipeline* VirglDevice::create_compute_pipeline(const IShaderModule* shader) {
+  if (!shader || shader->stage() != ShaderStage::Compute) return nullptr;
+  return make<VirglComputePipeline>(gpu_.allocator(), *static_cast<const VirglShaderModule*>(shader));
+}
 
 ICommandBuffer* VirglDevice::create_command_buffer() { return make<CommandRecorder>(gpu_.allocator(), gpu_.allocator()); }
 void VirglDevice::destroy_command_buffer(ICommandBuffer* commands) {
@@ -625,6 +668,12 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
   bool constants_dirty = false;
   bool in_pass = false;
   PrimitiveTopology topology = PrimitiveTopology::TriangleList;
+  const VirglComputePipeline* compute = nullptr;
+  struct StorageBinding {
+    VirglBuffer* buffer = nullptr;
+    uint64_t offset = 0, size = 0;
+  } storage[kMaxStorageBuffers];
+  bool storage_dirty = false, compute_constants_dirty = false;
   const ConstByteView pool = recorder.constants();
 
   auto flush = [&]() {
@@ -720,6 +769,56 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         if (queries.open != kMaxOcclusionQueries) return false;
         in_pass = false;
         break;
+      case RecordedCommand::Type::BindComputePipeline: {
+        compute = static_cast<const VirglComputePipeline*>(cmd.pipeline);
+        if (in_pass || !compute) return false;
+        stream.command(virgl::kBindShader, 0, 2);
+        stream.put(compute->shader());
+        stream.put(virgl::kShaderCompute);
+        compute_constants_dirty = constants_dwords != 0;
+        break;
+      }
+      case RecordedCommand::Type::BindStorageBuffer:
+        if (in_pass || cmd.unit >= kMaxStorageBuffers || !cmd.buffer) return false;
+        storage[cmd.unit] = {static_cast<VirglBuffer*>(cmd.buffer), cmd.offset, cmd.count};
+        storage_dirty = true;
+        break;
+      case RecordedCommand::Type::Dispatch: {
+        if (in_pass || !compute) return false;
+        uint32_t slots = 0;   // (bound slots are a prefix: the host takes them from slot 0 up to the last)
+        for (uint32_t k = 0; k < kMaxStorageBuffers; ++k)
+          if (storage[k].buffer) slots = k + 1;
+        if (storage_dirty && slots) {
+          stream.command(virgl::kSetShaderBuffers, 0, 2 + 3 * slots);
+          stream.put(virgl::kShaderCompute);
+          stream.put(0);
+          for (uint32_t k = 0; k < slots; ++k) {
+            stream.put(static_cast<uint32_t>(storage[k].offset));
+            stream.put(static_cast<uint32_t>(storage[k].size));
+            stream.put(storage[k].buffer ? storage[k].buffer->id() : 0);
+          }
+          storage_dirty = false;
+        }
+        if (compute_constants_dirty) {
+          stream.command(virgl::kSetConstantBuffer, 0, 2 + constants_dwords);
+          stream.put(virgl::kShaderCompute);
+          stream.put(0);
+          for (uint32_t k = 0; k < constants_dwords; ++k) stream.put(constants[k]);
+          compute_constants_dirty = false;
+        }
+        stream.command(virgl::kLaunchGrid, 0, 8);
+        stream.put(compute->group(0));
+        stream.put(compute->group(1));
+        stream.put(compute->group(2));
+        stream.put(cmd.count);
+        stream.put(cmd.first);
+        stream.put(cmd.instance_count);
+        stream.put(0);   // not indirect
+        stream.put(0);
+        stream.command(virgl::kMemoryBarrier, 0, 1);
+        stream.put(0xFFFFFFFFu);
+        break;
+      }
       case RecordedCommand::Type::BeginQuery: {
         if (!in_pass || queries.open != kMaxOcclusionQueries || cmd.unit >= kMaxOcclusionQueries || queries.used[cmd.unit]) return false;
         queries.results[cmd.unit] = make<VirglBuffer>(gpu_.allocator(), *this, 16, 0, virgl::kBindCustom);
@@ -790,6 +889,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         for (uint32_t k = 0; k < block.size(); ++k) reinterpret_cast<uint8_t*>(constants)[k] = block[k];
         constants_dwords = cmd.constants_size / 4;
         constants_dirty = true;
+        compute_constants_dirty = true;
         break;
       }
       case RecordedCommand::Type::SetViewport:

@@ -40,7 +40,7 @@ backing: their contents are lost on eviction, and they cannot be locked. Formats
 ## The command stream
 
 Packets of little-endian words, `op | size << 16` then the payload (full layout in `CommandStream.hpp`): `BeginPass`, `EndPass`, `BindPipeline`, `BindVertexBuffer`,
-`BindIndexBuffer`, `PushConstants`, `BindTexture`, `SetViewport`, `SetScissor`, `Draw`, `DrawIndexed`, `CopyRegion`, `GenerateMipmaps`, `BeginQuery`, `EndQuery`. Allocations are named by index into
+`BindIndexBuffer`, `PushConstants`, `BindTexture`, `SetViewport`, `SetScissor`, `Draw`, `DrawIndexed`, `CopyRegion`, `GenerateMipmaps`, `BeginQuery`, `EndQuery`, `BindUav`, `Dispatch`. Allocations are named by index into
 the allocation list passed with the stream, pipelines by handle. `render()` copies the stream, **validates all of it** (packet sizes, indices, flags, finite floats, pass /
 pipeline / buffer / texture state, ranges of draws against buffer sizes, a pass never draws into a bound texture, copies inside the images) and queues it; nothing is queued if
 it is wrong. When it runs, index values are checked against the vertex buffer (the buffer can change after the stream was checked); a failure there loses the context.
@@ -132,16 +132,16 @@ The kernel-mode driver is the D3DKMT layer, which Direct3D 9, 10, 11 and 12 all 
   per-instance input) from Wine's HLSL compiler run through the kernel on the software device with the expected pictures.
 - **Not done for Direct3D 10:** geometry shaders and stream output, `sample_b` / `sample_c` / derivatives, more than four vertex attributes, more than four varyings (and semantics
   beyond COLOR0/1 and TEXCOORD0/1), more than one vertex buffer slot, multisampling, predication and queries other than occlusion counts (`D3D10_QUERY_OCCLUSION`; `OCCLUSION_PREDICATE` and `SO_STATISTICS` etc. are not done), depth bias and wireframe fill, texture arrays
-  with mipmaps, mipmapped / filtered-across-faces cube and 3D textures, `Load` / `SampleLevel` / `GetDimensions` on them, cube arrays, sRGB and the integer / 16-bit unorm / packed formats (float and half-float colour formats are done), compute shaders and UAVs (Direct3D 11). The other devices (virgl, SVGA3D, Intel Gen9, V3D) have none of the features above, so
+  with mipmaps, mipmapped / filtered-across-faces cube and 3D textures, `Load` / `SampleLevel` / `GetDimensions` on them, cube arrays, sRGB and the integer / 16-bit unorm / packed formats (float and half-float colour formats are done), UAV textures, typed UAV loads and stores, append / consume buffers, group-shared memory and barriers, indirect dispatch (Direct3D 11 compute without those). The other devices (virgl, SVGA3D, Intel Gen9, V3D) have none of the features above, so
   they run the Direct3D 9 level only.
 
 ## Conformance on a real GPU
 
-`Conformance.cpp` (`dxgk::run_conformance`) draws 34 small scenes through the services on one adapter and on the CPU renderer and compares the 32 x 32 pictures: Direct3D 9 vertex colours, Shader
+`Conformance.cpp` (`dxgk::run_conformance`) draws 35 small scenes through the services on one adapter and on the CPU renderer and compares the 32 x 32 pictures: Direct3D 9 vertex colours, Shader
 Model 1 and 3 bytecode, depth, alpha blend, indexed draws, viewport and scissor, culling and winding (into a target, a texture and a back buffer), copies; Direct3D 10 constant buffers
 (also 1 KiB, indexed by an integer register), point and linear textures, pixel shader arithmetic, `Load` / `SampleLevel` / `GetDimensions` with `SV_Position` and `SV_IsFrontFace` (into a
 texture and into a back buffer, whose rows are stored the other way up), strips, blend state, depth comparison, stencil, lines and points, per-instance attributes, `SV_InstanceID` /
-`SV_VertexID`, two render targets (`SV_Target0` / `SV_Target1`, the render pass takes up to four colour images: `kFeatureMultipleTargets`, `CommandWriter::begin_pass_targets`, `PipelineDesc::color_target_count`); half-float and float render targets that are then sampled (`A16B16G16R16F` / `A32B32G32R32F`, additive blending that exceeds 1.0; `kFeatureFloatFormats` on the CPU renderer and virgl, one mip level, no present; the memory manager converts the backing to and from `Vec4`); occlusion queries (a near quad, then three queried quads: in the open, half behind it, wholly behind it - the counts 256 / 128 / 0 are drawn as the colour of three stripes); independent blend per render target (target 0 adds, target 1 does not blend; `kFeatureIndependentBlend`, `PipelineDesc::independent_blend` / `target_blend`, the escape ABI's trailing words); a volume, an array and a cube texture sampled by `Texture3D` / `Texture2DArray` / `TextureCube` pixel shaders (`kFeatureTextureKinds`); Direct3D 11 render to texture. A scene is *Same*, *Differs*, *Refused* (the device says `kNotSupported`: a program can fall back) or *Broken* (a step failed or the context was
+`SV_VertexID`, two render targets (`SV_Target0` / `SV_Target1`, the render pass takes up to four colour images: `kFeatureMultipleTargets`, `CommandWriter::begin_pass_targets`, `PipelineDesc::color_target_count`); half-float and float render targets that are then sampled (`A16B16G16R16F` / `A32B32G32R32F`, additive blending that exceeds 1.0; `kFeatureFloatFormats` on the CPU renderer and virgl, one mip level, no present; the memory manager converts the backing to and from `Vec4`); occlusion queries (a near quad, then three queried quads: in the open, half behind it, wholly behind it - the counts 256 / 128 / 0 are drawn as the colour of three stripes); a compute shader with unordered access views (`cs_fill`: 4 x 8 groups of 8 x 4 threads fill a 32 x 32 picture in a structured buffer from `SV_DispatchThreadID` / `SV_GroupID` / `SV_GroupIndex`, with atomic counters that must reach 1024); independent blend per render target (target 0 adds, target 1 does not blend; `kFeatureIndependentBlend`, `PipelineDesc::independent_blend` / `target_blend`, the escape ABI's trailing words); a volume, an array and a cube texture sampled by `Texture3D` / `Texture2DArray` / `TextureCube` pixel shaders (`kFeatureTextureKinds`); Direct3D 11 render to texture. A scene is *Same*, *Differs*, *Refused* (the device says `kNotSupported`: a program can fall back) or *Broken* (a step failed or the context was
 lost); a scene in which the reference draws nothing is Broken too. The system runs it at boot on each accelerated GPU and logs one line per scene (`Direct3D: ...`); the host test runs it on
 two software adapters (all the same) and on a device that is told it has no Direct3D 10 features (those scenes are refused). The DXBC fixtures are compiled by Wine's d3dcompiler
 (`tests/data/dxbc/*.hlsl`, `scripts/gen_conformance_blobs.py` writes `ConformanceBlobs.hpp`).
@@ -196,6 +196,22 @@ by a linear filter, clamped), an array's is the layer (rounded, clamped), a cube
 layers staged one at a time through a one-layer backing (transfer box `z` = the layer), the sampler's wrap R is clamped, the view's last layer is `layers - 1` for arrays and cubes and 0 for a volume. The 33 scenes
 pass on virglrenderer; pixel centres on exact texel boundaries are avoided in the array scene (devices round ties either way).
 
+## Compute shaders and unordered access views
+
+`cs_5_0` DXBC compute shaders run through `ShaderKind::Dxbc` with `ShaderStage::Compute` (the escape ABI's `CreateShader` stage 2). A compute pipeline has no state: `PipelineDesc::compute_shader`
+(or `EscapeOp::CreateComputePipeline`) with the shader's handle. Buffers are `kAllocUnorderedAccess` allocations (vertex / index flags may be added; the adapter needs `kFeatureCompute`).
+A stream binds them outside a pass with `BindUav slot, allocation, offset, size` (slots below `kMaxStorageBuffers` = 4, offset and size multiples of 4), binds the pipeline with `BindPipeline`
+(a compute pipeline leaves the graphics one alone), sets constants with `PushConstants` (cb0) and runs `Dispatch x, y, z` (each at most 65535, at most 2^24 threads in all; every slot the shader
+declared must be bound). The GPU's writes come back to the CPU like a render target's: `lock()` reads them. Taken: `dcl_thread_group`, `dcl_uav_raw` / `dcl_uav_structured`, `SV_DispatchThreadID`,
+`SV_GroupID`, `SV_GroupThreadID`, `SV_GroupIndex`, `ld_raw` / `store_raw` / `ld_structured` / `store_structured` (a write outside the buffer is dropped, a read there is zero) and the atomics (add, and,
+or, xor, min, max, exchange, with and without the old value) on either kind of buffer, plus all the integer and float arithmetic, loops and branches. The software device runs the groups one after the
+other and the threads of a group in order (`ComputeContext`, `ComputeShaderFn`), so atomics are trivially atomic. virgl gets TGSI (`COMP`, `PROPERTY CS_FIXED_BLOCK_*`, `DCL SV BLOCK_ID /
+THREAD_ID`, `DCL BUFFER[n]`, `LOAD` / `STORE` / `ATOM*` with byte addresses; the dispatch number and group index are worked out in a prologue; the system values must be read with three-component swizzles
+because the host's are `uvec3`s), `SET_SHADER_BUFFERS`, `LAUNCH_GRID` and a memory barrier; storage buffers are created with `VIRGL_BIND_SHADER_BUFFER` (1 << 14), and `IBuffer::read_back()`
+transfers what the shader wrote. The device claims `kFeatureCompute` only when the host's capability set says GLSL 4.30 or later (`VirtioGpu::virgl_has_compute()`). The HLSL compiler at hand
+(Wine's) has no `ByteAddressBuffer` methods, so the raw-buffer path is tested with a shader written token by token (`test_compute`); the conformance shader uses structured buffers.
+The conformance run on virglrenderer is the only check of the TGSI path against a real host.
+
 ## Not done
 
 - **The user-mode half and the system-call glue**: no `NtGdiDdDDI*` services in `src/Process/Windows*.cpp` / `win32u`, no d3d9 / dxgi / d3d11 DLLs. `lock()` returns a view of
@@ -203,7 +219,7 @@ pass on virglrenderer; pixel centres on exact texel boundaries are avoided in th
 - **Shaders**: SM2 / SM3 / SM4 / SM5.0 / SM5.1 vertex and pixel shaders (no geometry / tessellation / compute shaders, no 5.1 register spaces or arrays of resources). The pixel stage of Intel Gen9 is two fixed kernels, so a general pixel
   shader runs there only on the software, virgl (as unvalidated TGSI) and SVGA3D (unvalidated) paths. No loops, calls, predication, ps_1_x, constants above c7 (push constants are
   128 bytes), depth output, fog / point size, cube and volume samplers. Pipeline state is limited to what `IGraphicsDevice` offers (one colour target, 2 textures, alpha blend on/off, depth and stencil).
-- No GPU writes to buffers (stream-out, UAVs), no compute, no multisampling, no mipmapped / render-target / float cube, volume or array textures, no sRGB / integer / 16-bit unorm formats.
+- No stream-out, no UAV textures, no group-shared memory or barriers (a compute shader that needs `sync` or `dcl_tgsm` is refused), no multisampling, no mipmapped / render-target / float cube, volume or array textures, no sRGB / integer / 16-bit unorm formats.
 - Sync objects cannot be shared between processes. No timeout detection and recovery (a hung device cannot be reset), no vblank / scan line, gamma, overlays or VidPN topology
   (multi-monitor); display mode listing and switching go straight to the GPU driver.
 - Video memory is accounted per adapter but there is no per-process budget or priority-based paging between processes.

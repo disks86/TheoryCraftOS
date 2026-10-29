@@ -62,7 +62,8 @@ class IWaitHook {
 //                    write mask, per-instance bits of the attributes, then the number of colour outputs, then for independent blending a flag and the nine words
 //                    (custom, enable, four factors, two ops, write mask) of the blend state of each of targets 1 .. 3 - one word each)
 //   DestroyShader / DestroyPipeline   handle
-enum class EscapeOp : uint32_t { CreateShader = 1, CreatePipeline = 2, DestroyShader = 3, DestroyPipeline = 4 };
+//   CreateComputePipeline   shader (a Compute stage shader)                                                                           reply: handle
+enum class EscapeOp : uint32_t { CreateShader = 1, CreatePipeline = 2, DestroyShader = 3, DestroyPipeline = 4, CreateComputePipeline = 5 };
 
 class Kernel {
  public:

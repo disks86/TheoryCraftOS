@@ -190,6 +190,19 @@ class SoftwareShaderModule final : public IShaderModule {
   ShaderModuleDesc desc_;
 };
 
+class SoftwareComputePipeline final : public IPipeline {
+ public:
+  SoftwareComputePipeline(ComputeShaderFn function, const uint32_t group[3]) : function_(function) {
+    for (uint32_t i = 0; i < 3; ++i) group_[i] = group[i];
+  }
+  ComputeShaderFn function() const { return function_; }
+  uint32_t group(uint32_t axis) const { return group_[axis]; }
+
+ private:
+  ComputeShaderFn function_;
+  uint32_t group_[3];
+};
+
 class SoftwarePipeline final : public IPipeline {
  public:
   SoftwarePipeline(const GraphicsPipelineDesc& desc, VertexShaderFn vs, FragmentShaderFn fs, TexturedFragmentShaderFn textured, VertexShaderFnEx vs_ex, FragmentShaderFnEx fs_ex)
@@ -900,11 +913,27 @@ IImage* SoftwareDevice::create_image(const ImageDesc& desc) {
 void SoftwareDevice::destroy_image(IImage* image) { destroy(allocator_, static_cast<SoftwareImage*>(image)); }
 
 IShaderModule* SoftwareDevice::create_shader_module(const ShaderModuleDesc& desc) {
+  if (desc.stage == ShaderStage::Compute) {
+    if (!desc.compute_function) return nullptr;
+    uint64_t threads = 1;
+    for (uint32_t axis : desc.thread_group) {
+      if (axis == 0 || axis > kMaxThreadsPerGroup) return nullptr;
+      threads *= axis;
+    }
+    if (threads > kMaxThreadsPerGroup) return nullptr;
+    return make<SoftwareShaderModule>(allocator_, desc);
+  }
   if (desc.stage == ShaderStage::Vertex ? !(desc.vertex_function || desc.vertex_function_ex) : !(desc.fragment_function_ex || (!desc.fragment_function) != (!desc.textured_fragment_function))) return nullptr;   // (a fragment shader is one or the other)
   return make<SoftwareShaderModule>(allocator_, desc);
 }
 void SoftwareDevice::destroy_shader_module(IShaderModule* module) {
   destroy(allocator_, static_cast<SoftwareShaderModule*>(module));
+}
+
+IPipeline* SoftwareDevice::create_compute_pipeline(const IShaderModule* shader) {
+  if (!shader || shader->stage() != ShaderStage::Compute) return nullptr;
+  const SoftwareShaderModule* module = static_cast<const SoftwareShaderModule*>(shader);
+  return make<SoftwareComputePipeline>(allocator_, module->desc().compute_function, module->desc().thread_group);
 }
 
 IPipeline* SoftwareDevice::create_graphics_pipeline(const GraphicsPipelineDesc& desc) {
@@ -934,6 +963,8 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
   if (!commands) return false;
   CommandRecorder& recorder = *static_cast<CommandRecorder*>(commands);
   DrawState s;
+  const SoftwareComputePipeline* compute = nullptr;
+  ByteView storage[kMaxStorageBuffers];
   uint64_t query_samples = 0;
   uint32_t query_slot = 0;
   bool query_open = false;
@@ -995,6 +1026,41 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
         if (query_open) return false;
         in_pass = false;
         break;
+      case RecordedCommand::Type::BindComputePipeline:
+        if (in_pass) return false;
+        compute = static_cast<const SoftwareComputePipeline*>(cmd.pipeline);
+        break;
+      case RecordedCommand::Type::BindStorageBuffer: {
+        if (in_pass || cmd.unit >= kMaxStorageBuffers || !cmd.buffer) return false;
+        ByteView whole = cmd.buffer->map(), part;
+        if (!whole.try_subview(cmd.offset, cmd.count, &part)) return false;
+        storage[cmd.unit] = part;
+        break;
+      }
+      case RecordedCommand::Type::Dispatch: {
+        if (in_pass || !compute) return false;
+        const uint32_t gx = cmd.count, gy = cmd.first, gz = cmd.instance_count;
+        if (gx > kMaxDispatchGroups || gy > kMaxDispatchGroups || gz > kMaxDispatchGroups) return false;
+        const uint64_t threads_per_group = uint64_t{compute->group(0)} * compute->group(1) * compute->group(2);
+        if (uint64_t{gx} * gy * gz * threads_per_group > kMaxDispatchThreads) return false;
+        ComputeContext context;
+        for (uint32_t k = 0; k < kMaxStorageBuffers; ++k) context.buffers[k] = storage[k];
+        for (uint32_t z = 0; z < gz; ++z)
+          for (uint32_t y = 0; y < gy; ++y)
+            for (uint32_t x = 0; x < gx; ++x) {
+              context.group_id[0] = x, context.group_id[1] = y, context.group_id[2] = z;
+              uint32_t index = 0;
+              for (uint32_t tz = 0; tz < compute->group(2); ++tz)
+                for (uint32_t ty = 0; ty < compute->group(1); ++ty)
+                  for (uint32_t tx = 0; tx < compute->group(0); ++tx, ++index) {
+                    context.thread_id[0] = tx, context.thread_id[1] = ty, context.thread_id[2] = tz;
+                    context.dispatch_id[0] = x * compute->group(0) + tx, context.dispatch_id[1] = y * compute->group(1) + ty, context.dispatch_id[2] = z * compute->group(2) + tz;
+                    context.group_index = index;
+                    compute->function()(context, s.constants);
+                  }
+            }
+        break;
+      }
       case RecordedCommand::Type::BeginQuery:
         if (!in_pass || query_open) return false;
         query_open = true;

@@ -38,6 +38,7 @@ class LockedDevice final : public IGraphicsDevice {
   IShaderModule* create_shader_module(const ShaderModuleDesc& desc) override { kernel::ScopedMutex g(lock_); return inner_.create_shader_module(desc); }
   void destroy_shader_module(IShaderModule* module) override { kernel::ScopedMutex g(lock_); inner_.destroy_shader_module(module); }
   IPipeline* create_graphics_pipeline(const GraphicsPipelineDesc& desc) override { kernel::ScopedMutex g(lock_); return inner_.create_graphics_pipeline(desc); }
+  IPipeline* create_compute_pipeline(const IShaderModule* shader) override { kernel::ScopedMutex g(lock_); return inner_.create_compute_pipeline(shader); }
   void destroy_pipeline(IPipeline* pipeline) override { kernel::ScopedMutex g(lock_); inner_.destroy_pipeline(pipeline); }
   ICommandBuffer* create_command_buffer() override { kernel::ScopedMutex g(lock_); return inner_.create_command_buffer(); }
   void destroy_command_buffer(ICommandBuffer* commands) override { kernel::ScopedMutex g(lock_); inner_.destroy_command_buffer(commands); }

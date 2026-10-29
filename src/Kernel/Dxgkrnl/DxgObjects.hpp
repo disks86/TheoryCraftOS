@@ -77,6 +77,8 @@ class ShaderObject {
   ByteView text_;                 // the TGSI text the device may keep pointing at (NUL terminated)
   ArrayView<uint32_t> tokens_;    // the Direct3D 9 tokens
   graphics::TextureKind texture_kinds_[graphics::kMaxTextureUnits] = {};   // what a DXBC pixel shader declared for its units
+  uint32_t thread_group_[3] = {1, 1, 1};     // a compute shader's thread group
+  uint32_t storage_mask_ = 0;                // ... and the storage buffer slots it uses (bit n: u<n>)
   D3d9Binding d3d9_;              // Direct3D 9 bytecode being interpreted (the module's function finds the program through it)
 };
 
@@ -91,6 +93,10 @@ class PipelineObject {
   uint32_t attribute_count() const { return attribute_count_; }
   uint32_t texture_count() const { return texture_count_; }
   uint32_t color_target_count() const { return color_target_count_; }
+  // A compute pipeline (Adapter::create_compute_pipeline): dispatched, not drawn with. It says its thread group and which storage buffer slots (bit n: u<n>) it reads or writes.
+  bool compute() const { return compute_; }
+  uint32_t thread_group(uint32_t axis) const { return axis < 3 ? thread_group_[axis] : 1; }
+  uint32_t storage_mask() const { return storage_mask_; }
   bool has_per_instance() const { return per_instance_; }
   // The kind of texture the pixel shader declared for a unit (2D when it does not say: only a DXBC program does).
   graphics::TextureKind texture_kind(uint32_t unit) const { return unit < graphics::kMaxTextureUnits ? texture_kinds_[unit] : graphics::TextureKind::Texture2D; }
@@ -100,6 +106,9 @@ class PipelineObject {
   graphics::IGraphicsDevice& device_;
   graphics::IPipeline* pipeline_ = nullptr;
   bool per_instance_ = false;
+  bool compute_ = false;
+  uint32_t thread_group_[3] = {1, 1, 1};
+  uint32_t storage_mask_ = 0;
   SharedPointer<ShaderObject> vertex_, fragment_;   // (kept alive for as long as the pipeline is)
   graphics::TextureKind texture_kinds_[graphics::kMaxTextureUnits] = {};
   uint32_t stride_ = 0, attribute_count_ = 0, texture_count_ = 0, color_target_count_ = 1;

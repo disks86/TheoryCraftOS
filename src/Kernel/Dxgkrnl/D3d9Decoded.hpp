@@ -42,12 +42,17 @@ enum Opcode : uint16_t {
   // Texture access of Shader Model 4: ld (src[0] the integer coordinates, x y in the first two components and the level in the last; src[1] the unit), sample_l (src[0] the
   // coordinate, src[1] the unit, src[2] the level), resinfo (src[0] the level, src[1] the unit; control: 0 floats, 1 reciprocals, 2 unsigned integers).
   kTexFetch = 0x1300, kTexLod, kTexSize,
+  // Storage buffers (compute shaders, Shader Model 5): kBufLoad (dst; src[0] the byte address or the structure index, src[1] the byte offset in the structure; tex_swizzle picks the loaded
+  // words), kBufStore (dst.mask: how many words; src[2] the value), kBufAtomic / kBufImmAtomic (src[0] the address, src[1] the operand; the second also writes the old value to dst). The
+  // buffer is `uav`; `stride` is 0 for a raw buffer (byte address) and the structure size for a structured one; an atomic's kind is `control` (AtomicKind).
+  kBufLoad = 0x1400, kBufStore, kBufAtomic, kBufImmAtomic,
   kLoopBegin = 0x1200, kLoopEnd, kBreak0, kBreakNz, kBreakZ, kContinue0, kContinueNz, kContinueZ,
 };
 
 enum RegType : uint8_t { kTemp = 0, kInput = 1, kConst = 2, kAddrTex = 3, kRastOut = 4, kAttrOut = 5, kTexCrdOut = 6, kColorOut = 8, kDepthOut = 9, kSampler = 10, kConstBool = 14,
                kSysValue = 20 /* (not in a token stream: a Shader Model 4 system value; number: kSysPosition ...) */ };
-enum SysValue : uint8_t { kSysPosition = 0, kSysFrontFacing, kSysPrimitiveId, kSysVertexId, kSysInstanceId, kSysValueCount };
+enum SysValue : uint8_t { kSysPosition = 0, kSysFrontFacing, kSysPrimitiveId, kSysVertexId, kSysInstanceId, kSysDispatchThreadId, kSysGroupId, kSysGroupThreadId, kSysGroupIndex, kSysValueCount };
+enum AtomicKind : uint8_t { kAtomicAdd = 0, kAtomicAnd, kAtomicOr, kAtomicXor, kAtomicIMax, kAtomicIMin, kAtomicUMax, kAtomicUMin, kAtomicExchange };
 enum Usage : uint8_t { kUsagePosition = 0, kUsageTexCoord = 5, kUsageColor = 10 };
 enum Modifier : uint8_t { kModNone, kModNeg, kModBias, kModBiasNeg, kModSign, kModSignNeg, kModComp, kModX2, kModX2Neg, kModDz, kModDw, kModAbs, kModAbsNeg, kModNot };
 
@@ -88,6 +93,8 @@ struct D3d9Program::Instruction {
   uint8_t control = 0;
   bool mask_result = false;   // seq / sne / slt / sge of a Shader Model 4 shader: all ones for true (not 1.0), as its integer instructions and movc read them
   bool vector = false;   // rsq / exp / log of a Shader Model 4 shader: per component, not from x
+  uint8_t uav = 0;       // kBufLoad ..: the storage buffer slot
+  uint32_t stride = 0;
   uint8_t tex_swizzle[4] = {0, 1, 2, 3};   // texld: which texel component each result component takes
   Dst dst;
   Src src[3];

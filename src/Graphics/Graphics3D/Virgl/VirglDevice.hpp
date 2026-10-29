@@ -33,7 +33,8 @@ class VirglDevice final : public IGraphicsDevice {
   ~VirglDevice();
 
   DeviceInfo info() const override {
-    return {"virgl (virtio-gpu)", DeviceKind::VirtualGpu, true, kMaxPushConstantBytes, kFeatureBlendState | kFeatureTexelAccess | kFeatureSystemInputs | kFeatureInstancing | kFeatureLines | kFeatureMultipleTargets | kFeatureFloatFormats | kFeatureOcclusionQueries | kFeatureTextureKinds | kFeatureIndependentBlend};
+    // (compute only when the host says it has it: a compute shader on a host without loses the whole context)
+    return {"virgl (virtio-gpu)", DeviceKind::VirtualGpu, true, kMaxPushConstantBytes, kFeatureBlendState | kFeatureTexelAccess | kFeatureSystemInputs | kFeatureInstancing | kFeatureLines | kFeatureMultipleTargets | kFeatureFloatFormats | kFeatureOcclusionQueries | kFeatureTextureKinds | kFeatureIndependentBlend | (gpu_.virgl_has_compute() ? kFeatureCompute : 0u)};
   }
 
   IBuffer* create_buffer(uint64_t size, uint32_t usage) override;
@@ -43,6 +44,7 @@ class VirglDevice final : public IGraphicsDevice {
   IShaderModule* create_shader_module(const ShaderModuleDesc& desc) override;
   void destroy_shader_module(IShaderModule* module) override;
   IPipeline* create_graphics_pipeline(const GraphicsPipelineDesc& desc) override;
+  IPipeline* create_compute_pipeline(const IShaderModule* shader) override;
   void destroy_pipeline(IPipeline* pipeline) override;
   ICommandBuffer* create_command_buffer() override;
   void destroy_command_buffer(ICommandBuffer* commands) override;
