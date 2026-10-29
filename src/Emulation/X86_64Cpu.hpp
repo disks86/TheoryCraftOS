@@ -87,6 +87,14 @@ class X86_64Cpu final : public IGuestCpu {
   bool set_x86_context(const process::X86Context& context) override;
   UniquePointer<IGuestCpu> clone_for_thread(allocators::IAllocator& allocator, uint64_t stack_pointer, bool set_tls, uint64_t tls) const override;
 
+  // CET shadow stacks (user mode) and ENQCMD: see X86_64Cet.cpp. Off until the host enables them.
+  void enable_shadow_stack(uint64_t shadow_stack_pointer, bool allow_wrss) { cet_.enabled = true; cet_.wrss = allow_wrss; cet_.ssp = shadow_stack_pointer; }
+  void disable_shadow_stack() { cet_ = Cet(); }
+  bool shadow_stack_enabled() const { return cet_.enabled; }
+  uint64_t shadow_stack_pointer() const { return cet_.ssp; }
+  void set_pasid(uint32_t pasid) { pasid_ = pasid & 0xFFFFF; }
+  void clear_pasid() { pasid_ = -1; }
+
   State& state() { return s_; }
   const State& state() const { return s_; }
 
@@ -194,6 +202,12 @@ class X86_64Cpu final : public IGuestCpu {
   Step sm3_instruction(GuestMemory& m, uint32_t map, uint8_t op, uint32_t vvvv);
   Step vex_gather(GuestMemory& m, uint8_t opcode, bool wide, uint32_t vvvv);
   Step vex_fma(GuestMemory& m, uint8_t opcode, bool wide, uint32_t vvvv);
+  bool cet_push(GuestMemory& m, uint64_t value);
+  bool cet_check_return(GuestMemory& m, uint64_t target);
+  Step rdssp_instruction();
+  Step incssp_instruction(GuestMemory& m);
+  Step wrss_instruction(GuestMemory& m, bool user);
+  Step enqcmd_instruction(GuestMemory& m, bool supervisor);
   Step lwp_instruction(GuestMemory& m, uint32_t map, uint32_t vvvv);      // AMD LWP: llwpcb, slwpcb (XOP map 9), lwpins, lwpval (map A)
   bool lwp_flush(GuestMemory& m);
   bool lwp_insert(GuestMemory& m, uint8_t event_id, uint16_t flags, uint32_t data1, uint64_t data2, bool* full);
@@ -287,6 +301,9 @@ class X86_64Cpu final : public IGuestCpu {
     int32_t counter = 0, interval = 0;
   };
   Lwp lwp_;
+  struct Cet { bool enabled = false, wrss = false; uint64_t ssp = 0; };
+  Cet cet_;
+  int64_t pasid_ = -1;      // IA32_PASID: the PASID, or -1 while its valid bit is clear
   uint16_t selector_[6] = {0x2B, 0x33, 0x2B, 0x2B, 0x2B, 0x2B};      // es cs ss ds fs gs
   State s_;
   Decoded d_;

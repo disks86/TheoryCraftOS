@@ -22,8 +22,8 @@
 // Almost every promoted instruction does what the legacy instruction does, so it is run by the legacy code: the prefix bits are turned into the same decoder state a REX2 prefix would give, the legacy
 // handler for the opcode (possibly a different one: tzcnt moved from 0F BC to map 4 F4) executes, and then the results are rearranged. NF restores the flags afterwards. An NDD form snapshots the
 // legacy destination (a register, or the memory operand), lets the legacy instruction write it, moves the result to the new destination register, zeroed above the operand size, and puts the old
-// destination value back. The promoted legacy map 2 instructions (adcx, adox, crc32, movbe, movdiri, movdir64b, aadd, aand, aor, axor) are run the same way. Not promoted: enqcmd, wrss / wruss
-// (shadow stacks), invept / invvpid / invpcid and urdmsr / uwrmsr (privileged, or hardware that does not exist here: #UD). The EVEX extension of the existing EVEX instructions (R16..R31 as
+// destination value back. The promoted legacy map 2 instructions (adcx, adox, crc32, movbe, movdiri, movdir64b, aadd, aand, aor, axor) are run the same way, and so are wrss, wruss, enqcmd and
+// enqcmds (X86_64Cet.cpp). Not promoted: invept / invvpid / invpcid and urdmsr / uwrmsr (privileged, or hardware that does not exist here) are #UD. The EVEX extension of the existing EVEX instructions (R16..R31 as
 // memory base or index, GPR r/m and cvt-to-GPR destination) is in X86_64Evex.cpp; the promoted VEX instructions are at the end of this file.
 #include "Emulation/X86_64Cpu.hpp"
 
@@ -111,8 +111,18 @@ X86_64Cpu::Step X86_64Cpu::apx_map4(GuestMemory& m, uint8_t p0, uint8_t p1, uint
   }
 
   // --- the promoted legacy map 2 instructions ---
-  if (op == 0x66 || op == 0xF0 || op == 0xF1 || op == 0x60 || op == 0x61 || op == 0xF9 || op == 0xF8 || op == 0xFC) {
+  if (op == 0x66 || op == 0xF0 || op == 0xF1 || op == 0x60 || op == 0x61 || op == 0xF9 || op == 0xF8 || op == 0xFC || op == 0x65) {
     if (nf || (op != 0x66 && (nd || v != 0))) return fail(6);
+    if (op == 0x65) {      // wruss (66)
+      if (pp != 1) return fail(6);
+      d_.operand16 = false;
+      return wrss_instruction(m, true);
+    }
+    if (op == 0x66 && pp == 0) return wrss_instruction(m, false);      // wrss (NP)
+    if (op == 0xF8 && (pp == 2 || pp == 3)) {      // enqcmds (F3), enqcmd (F2)
+      d_.operand16 = false;
+      return enqcmd_instruction(m, pp == 2);
+    }
     if (op == 0x66) {      // adcx (66), adox (F3), with an optional new destination
       if (pp != 1 && pp != 2) return fail(6);
       if (!nd && v != 0) return fail(6);

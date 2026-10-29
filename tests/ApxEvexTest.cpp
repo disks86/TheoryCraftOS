@@ -560,9 +560,10 @@ static void test_map2() {
     { Evex e = base; e.pp = 0; CHECK(ud(e, 0xF8, 6)); }      // movdir64b needs 66
     { Evex e = base; e.pp = 1; CHECK(ud(e, 0xFC, 0xC3)); }      // aand needs memory
     { Evex e = base; e.pp = 1; CHECK(ud(e, 0xF8, 0xC3)); }
-    // (enqcmd, wrss, invept and the like are not promoted)
-    { Evex e = base; e.pp = 3; CHECK(ud(e, 0xF8, 6)); }
-    { Evex e = base; e.pp = 2; CHECK(ud(e, 0xF8, 6)); }
+    // (enqcmd and enqcmds are promoted, see CetTest: without a PASID, or at CPL 3, they are #GP; invept and the like are not promoted)
+    { Evex e = base; e.pp = 3; Bytes b = e.bytes(0xF8); b.push_back(6); Machine m(with_end(b)); CHECK(m.run() == StopReason::Fault && m.cpu.fault().vector == 13); }
+    { Evex e = base; e.pp = 2; Bytes b = e.bytes(0xF8); b.push_back(6); Machine m(with_end(b)); CHECK(m.run() == StopReason::Fault && m.cpu.fault().vector == 13); }
+    { Evex e = base; e.pp = 0; CHECK(ud(e, 0xF8, 6)); }
   }
   {      // the legacy encodings of aadd and the rest: no register form, and r8..r15 as the source
     Machine m(with_end({0x4C, 0x0F, 0x38, 0xFC, 0x06}));      // aadd [rsi], r8   (REX.R)

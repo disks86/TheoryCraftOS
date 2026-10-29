@@ -151,7 +151,14 @@ programs built with `-march=haswell` (or x86-64-v3) run. `X86_64Vex.cpp` holds a
   runs `punpckl*`, and the pack instructions put the second source in the high half. About 400 MMX forms are compared with the host (generic opcodes in register and memory form, every SSSE3 operation, the shift immediates, `palignr`, `pshufw`, conversions); a mutation of `pmulhrsw` fails it.
 - **SSE4a** (`extrq`, `insertq` in the immediate and register forms, `movntss`, `movntsd`): compared with the host where the CPU has it; the upper quadword of the destination is cleared as on Zen.
 - **Packed decimal**: `fbld` and `fbstp` (eighteen digits and a sign; anything larger stores the packed-decimal indefinite and raises invalid), compared with the host by `X87Test` in every rounding mode.
-- **CET**: `endbr64`/`endbr32`, `rdsspd`/`rdsspq` and `incssp` execute as no-ops (shadow stacks are not enabled).
+- **CET** (`src/Emulation/X86_64Cet.cpp`, `tests/CetTest.cpp`): `endbr64`/`endbr32` are nops. Shadow stacks are off until the host calls `enable_shadow_stack(ssp, allow_wrss)`; while off, `rdsspd`/`rdsspq` and
+  `incsspd`/`incsspq` do nothing and `wrss`/`wruss` are #UD, as on a processor with CET disabled. While on, every near `call` also pushes the return address on the shadow stack (ordinary guest memory,
+  8 bytes down) and every near `ret` compares its target with the shadow stack top and pops it, raising #CP (vector 21, error code 1) on a mismatch with the data stack left as it was; `rdssp` reads the
+  pointer, `incssp` adds count x 8 (Q) or count x 4 (D, unverified) after reading the last entry skipped, `wrss` stores to an operand-size aligned address (#GP(0) otherwise; #UD unless WRSS was allowed),
+  and `wruss` is #GP(0) at CPL 3. Not modelled: the shadow stack page type, far calls and returns, `iret`, interrupts, the restore-token instructions and indirect branch tracking. The map 4 forms of
+  `wrss`, `wruss`, `enqcmd` and `enqcmds` are there too.
+- **ENQCMD / ENQCMDS** (cpuid 7.0 ECX bit 29): `enqcmd` reads the 64-byte command at the memory operand, replaces its first dword with the PASID, writes it to the 64-byte aligned address in the register
+  and clears ZF (ordinary memory always accepts). It is #GP(0) until the host sets a PASID with `set_pasid()` (IA32_PASID valid bit), as on a machine whose OS has not; `enqcmds` is #GP(0) at CPL 3.
 - **AVX-VNNI, AVX-IFMA, AVX-VNNI-INT8, AVX-VNNI-INT16, AVX-NE-CONVERT** (`tests/VexNewTest.cpp`, against models written from the definitions, 16 dot-product instructions at 300 cases each,
   both vector lengths, memory and register): the VEX encodings of `vpdpbusd[s]`/`vpdpwssd[s]`/`vpmadd52luq`/`vpmadd52huq` and `vcvtneps2bf16` are run by the EVEX code from a context with no mask and no broadcast
   (`vex_via_evex`); the INT8 / INT16 dot products (`kDot`: signed, unsigned or mixed operands; the all-unsigned forms accumulate and saturate as unsigned) exist in both encodings; `vbcstnebf162ps`,
@@ -236,7 +243,7 @@ programs built with `-march=haswell` (or x86-64-v3) run. `X86_64Vex.cpp` holds a
   and are not implemented. cpuid reports AVX10 version 2.
 - **xgetbv with ECX=1** returns XINUSE (the components that are not in their initial state; cpuid 0xD.1 EAX bit 2). `xsaves` / `xrstors` are #GP(0): they are supervisor-state instructions and the emulator only
   runs CPL 3 code.
-- **Not implemented** (an invalid-instruction fault, never a wrong result): CET shadow-stack instructions beyond the no-op forms (`wrss`, `wruss`), `enqcmd` / `enqcmds`, and the privileged map 4 instructions.
+- **Not implemented** (an invalid-instruction fault, never a wrong result): the restore-token CET instructions (`rstorssp`, `saveprevssp`, `setssbsy`, `clrssbsy`) and the privileged map 4 instructions (`invept`, `invvpid`, `invpcid`, `urdmsr`, `uwrmsr`).
   Exceptions delivered to a Windows program save the XMM halves of vector state in the `CONTEXT` in memory, not the upper halves (the emulator keeps those itself).
 - **Checked against the real thing**: `tests/AvxTest.cpp` assembles about 1,400 instruction forms with `llvm-mc` (`tests/data/emulation/avx_cases_gen.py`), runs each on the host
   and on the emulator from the same random state (80,000+ comparisons per run: all vector registers, written general registers, flags, MXCSR flags except DE, the memory operand)
