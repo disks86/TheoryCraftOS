@@ -42,6 +42,8 @@ constexpr uint32_t kMaxVaryings = 4;
 // The most a command buffer may carry as shader constants; what a device really takes is DeviceInfo::max_push_constant_bytes (most take 128: eight vec4s).
 constexpr uint32_t kMaxPushConstantBytes = 4096;
 constexpr uint32_t kMaxTextureUnits = 2;
+// The colour images one render pass can draw into at once (kFeatureMultipleTargets): RenderPassBegin::color and up to three more.
+constexpr uint32_t kMaxColorTargets = 4;
 
 // --- Resources ---------------------------------------------------------------
 
@@ -90,6 +92,16 @@ class IImage {
   // Replaces the contents of a color image (extent.width * extent.height values, 0xAARRGGBB, rows top to bottom) - how a texture is filled. False if the device cannot (the
   // default), the image is not a color image or `pixels` is the wrong size. Not synchronised with a submit() that uses the image: an image belongs to one user at a time.
   virtual bool write_pixels(ArrayView<const uint32_t> pixels) {
+    (void)pixels;
+    return false;
+  }
+  // The same for the float formats (kFeatureFloatFormats; Format::R16G16B16A16Float / R32G32B32A32Float): extent.width * extent.height colours, rows top to bottom, not clamped. Half-float images
+  // round what they are given to half precision. False for another format, a wrong size, or a device without float formats.
+  virtual bool read_pixels_float(ArrayView<Vec4> out) {
+    (void)out;
+    return false;
+  }
+  virtual bool write_pixels_float(ArrayView<const Vec4> pixels) {
     (void)pixels;
     return false;
   }
@@ -177,6 +189,7 @@ struct ShaderIo {
 using VertexShaderFn = void (*)(const Vec4* attributes, const uint8_t* constants, ShaderIo* out);
 using FragmentShaderFn = bool (*)(const Vec4* varyings, const uint8_t* constants, Vec4* color);
 // The same for a fragment shader that reads the pipeline's textures.
+// (A fragment shader is handed room for kMaxColorTargets colours, all zero; the first is the colour of target 0, and shaders that write more only run on devices with kFeatureMultipleTargets.)
 using TexturedFragmentShaderFn = bool (*)(const Vec4* varyings, const uint8_t* constants, const ITextureSet& textures, Vec4* color);
 
 // The same with the system values of Direct3D 10 (kFeatureSystemInputs). A vertex shader is told which vertex of which instance it is shading; a fragment shader where the pixel is
@@ -295,6 +308,7 @@ struct GraphicsPipelineDesc {
   StencilState stencil;
   BlendState blend;                                   // kFeatureBlendState
   CompareOp depth_compare = CompareOp::LessEqual;     // kFeatureBlendState: what depth_test compares with (a device without it always uses LessEqual)
+  uint32_t color_target_count = 1;                    // kFeatureMultipleTargets: how many colour outputs the fragment shader writes (the render pass must have at least as many images); blend state applies to each
 };
 
 class IPipeline {
@@ -318,6 +332,9 @@ struct Viewport {
 
 struct RenderPassBegin {
   IImage* color = nullptr;
+  // Further colour images (kFeatureMultipleTargets): target n (1..3) is extra_colors[n - 1], and a gap ends the list. All have the extent of `color`, none is bound as a texture
+  // in the pass, and a fragment shader writes target n to colour output n. clear_color_value clears every target.
+  IImage* extra_colors[kMaxColorTargets - 1] = {};
   IImage* depth = nullptr;  // optional
   bool clear_color = true;
   Vec4 clear_color_value;
@@ -366,6 +383,8 @@ enum DeviceFeature : uint32_t {
   kFeatureSystemInputs = 1u << 2,  // ShaderModuleDesc::vertex_function_ex / fragment_function_ex
   kFeatureInstancing = 1u << 3,    // draw(..., instance_count, first_instance) and VertexAttribute::per_instance
   kFeatureLines = 1u << 4,         // set_primitive_topology: lines and points
+  kFeatureFloatFormats = 1u << 6,      // Format::R16G16B16A16Float / R32G32B32A32Float images: colour attachments (also several at once) and sampled textures, without mipmaps; read_pixels_float / write_pixels_float
+  kFeatureMultipleTargets = 1u << 5,   // RenderPassBegin::extra_colors and GraphicsPipelineDesc::color_target_count
 };
 
 

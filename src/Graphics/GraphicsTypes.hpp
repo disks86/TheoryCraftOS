@@ -40,9 +40,51 @@ enum class Format : uint8_t {
   B8G8R8A8Unorm,  // 32-bit; memory order B, G, R, A (the common display layout)
   R8G8B8A8Unorm,  // 32-bit; memory order R, G, B, A
   D32Float,       // depth only
+  R16G16B16A16Float,   // 64-bit half floats, memory order R, G, B, A (kFeatureFloatFormats); values are not clamped
+  R32G32B32A32Float,   // 128-bit floats, memory order R, G, B, A (kFeatureFloatFormats)
 };
 
-constexpr uint32_t bytes_per_pixel(Format f) { return f == Format::Undefined ? 0 : 4; }
+constexpr bool is_float_format(Format f) { return f == Format::R16G16B16A16Float || f == Format::R32G32B32A32Float; }
+constexpr uint32_t bytes_per_pixel(Format f) { return f == Format::Undefined ? 0 : f == Format::R16G16B16A16Float ? 8 : f == Format::R32G32B32A32Float ? 16 : 4; }
+
+// IEEE half floats (1 sign, 5 exponent, 10 fraction bits) to and from float; to_half rounds to nearest even, saturates to infinity, and keeps NaN.
+inline float half_to_float(uint16_t h) {
+  const uint32_t sign = uint32_t{h & 0x8000u} << 16;
+  uint32_t exponent = (h >> 10) & 0x1F, fraction = h & 0x3FF;
+  uint32_t bits;
+  if (exponent == 0) {
+    if (fraction == 0) {
+      bits = sign;
+    } else {   // a subnormal half is a normal float
+      exponent = 127 - 15 + 1;
+      while (!(fraction & 0x400)) fraction <<= 1, --exponent;
+      bits = sign | (exponent << 23) | ((fraction & 0x3FF) << 13);
+    }
+  } else if (exponent == 31) {
+    bits = sign | 0x7F800000u | (fraction << 13);
+  } else {
+    bits = sign | ((exponent + 127 - 15) << 23) | (fraction << 13);
+  }
+  return __builtin_bit_cast(float, bits);
+}
+inline uint16_t float_to_half(float f) {
+  const uint32_t bits = __builtin_bit_cast(uint32_t, f);
+  const uint16_t sign = static_cast<uint16_t>((bits >> 16) & 0x8000u);
+  const uint32_t exponent = (bits >> 23) & 0xFF, fraction = bits & 0x7FFFFF;
+  if (exponent == 0xFF) return static_cast<uint16_t>(sign | 0x7C00u | (fraction ? 0x200u | (fraction >> 13) : 0u));
+  const int32_t e = static_cast<int32_t>(exponent) - 127 + 15;
+  if (e >= 31) return static_cast<uint16_t>(sign | 0x7C00u);
+  if (e <= 0) {
+    if (e < -10) return sign;
+    const uint32_t shift = static_cast<uint32_t>(14 - e);   // bits dropped from the 24-bit significand
+    const uint32_t full = fraction | 0x800000u, kept = full >> shift, rest = full & ((1u << shift) - 1), half = 1u << (shift - 1);
+    return static_cast<uint16_t>(sign | (kept + ((rest > half || (rest == half && (kept & 1))) ? 1u : 0u)));
+  }
+  uint32_t out = (static_cast<uint32_t>(e) << 10) | (fraction >> 13);
+  const uint32_t rest = fraction & 0x1FFF;
+  if (rest > 0x1000 || (rest == 0x1000 && (out & 1))) ++out;   // (a carry out of the fraction bumps the exponent, up to infinity: correct)
+  return static_cast<uint16_t>(sign | out);
+}
 
 struct Vec2 {
   float x = 0, y = 0;
@@ -150,11 +192,13 @@ inline uint32_t pack_color(Vec4 c) {
 // swaps the red and blue bytes).
 struct Surface {
   ArrayView<uint32_t> pixels;
+  ArrayView<Vec4> floats;   // the pixels of a float format (then `pixels` is empty and `pitch` counts these)
   uint32_t width = 0, height = 0;
   uint32_t pitch = 0;  // in pixels
   Format format = Format::B8G8R8A8Unorm;
 
-  bool valid() const { return width && height && pitch >= width && pixels.size() >= uint64_t{pitch} * height; }
+  bool valid() const { return width && height && pitch >= width && (pixels.size() >= uint64_t{pitch} * height || floats.size() >= uint64_t{pitch} * height); }
+  Vec4* float_row(uint32_t y) const { return floats.data() + uint64_t{y} * pitch; }
   uint32_t* row(uint32_t y) const { return pixels.data() + uint64_t{y} * pitch; }
   // 0xAARRGGBB <-> storage.
   uint32_t encode(uint32_t argb) const {

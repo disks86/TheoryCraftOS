@@ -29,6 +29,8 @@
 #include <vector>
 #include "FileSystem/Ram/RamFileSystem.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdVegaM.hpp"
+#include "Hardware/GraphicsProcessingUnit/AMD/AmdVegaDraw.hpp"
+#include "Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnCp.hpp"
 #include "FakeAmdDce11.hpp"
 #include "FakeAuxSink.hpp"
 #include "FakeAzalia.hpp"
@@ -2869,11 +2871,157 @@ static void test_audio_pins() {
 }
 
 
+// A draw through the whole path: shaders compiled by the GCN compiler, staged in system memory, copied into the card's block by SDMA, the PM4 stream submitted on the graphics ring, the
+// ring's indirect buffer run by a model of the command processor (GcnCp, reading the simulated video memory), and the colour buffer copied back; it must equal the same draw done directly
+// on the emulator.
+struct VramMemory final : gcn::IGpuMemory {
+  uint8_t* vram;
+  bool in_range(uint64_t address, uint64_t bytes) const { return address >= kGpuBase && address - kGpuBase <= kVideoMemory && bytes <= kVideoMemory - (address - kGpuBase) && (address & 3) == 0; }
+  bool read(uint64_t address, ArrayView<uint32_t> out) override {
+    if (!in_range(address, out.size() * 4)) return false;
+    memcpy(out.data(), vram + (address - kGpuBase), out.size() * 4);
+    return true;
+  }
+  bool write(uint64_t address, ArrayView<const uint32_t> data) override {
+    if (!in_range(address, data.size() * 4)) return false;
+    memcpy(vram + (address - kGpuBase), data.data(), data.size() * 4);
+    return true;
+  }
+};
+
+static bool compile_gcn(allocators::IAllocator& alloc, const char* text, List<uint32_t>& words, gcn::ShaderInfo* info) {
+  gcn::TgsiShader sh(alloc);
+  const char* error = nullptr;
+  uint32_t line = 0;
+  if (!gcn::parse_tgsi(alloc, StringView(text), &sh, &error, &line)) return false;
+  gcn::Code code(alloc);
+  if (!gcn::compile_tgsi(sh, code, info, &error)) return false;
+  for (const uint32_t w : code.words()) words.push_back(w);
+  return true;
+}
+
+static void test_draw_on_card() {
+  Rig rig;
+  AmdVegaM vega(rig.alloc);
+  Pool pool(8u << 20);
+  AmdVegaM::Inputs in = rig.inputs();
+  in.system_addresses = &pool;
+  CHECK(vega.bring_up(in));
+  if (!vega.up()) return;
+  const AmdVegaM::Layout& l = vega.layout();
+  rig.card.sdma.gart_start = vega.gart_plan().gart_start;
+  rig.card.sdma.gart_size = vega.gart_plan().gart_size;
+  rig.card.sdma.gart_table = rig.vram + kRegion + l.gart_table;
+  rig.card.sdma.system_host = pool.memory.data();
+  rig.card.sdma.system_base = Pool::kBase;
+  rig.card.sdma.system_bytes = pool.memory.size();
+
+  List<uint32_t> vs(rig.alloc), ps(rig.alloc);
+  VegaDrawRequest req;
+  CHECK(compile_gcn(rig.alloc,
+                    "VERT\nDCL IN[0]\nDCL IN[1]\nDCL OUT[0], POSITION\nDCL OUT[1], GENERIC[0]\nDCL CONST[0..3]\nDCL TEMP[0]\n"
+                    "  0: MUL TEMP[0], CONST[0], IN[0].xxxx\n  1: MAD TEMP[0], CONST[1], IN[0].yyyy, TEMP[0]\n  2: MAD TEMP[0], CONST[2], IN[0].zzzz, TEMP[0]\n  3: ADD OUT[0], TEMP[0], CONST[3]\n  4: MOV OUT[1], IN[1]\n  5: END\n",
+                    vs, &req.vertex_info) &&
+        compile_gcn(rig.alloc, "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\n  0: MOV OUT[0], IN[0]\n  1: END\n", ps, &req.pixel_info));
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  const float triangle[21] = {-0.8f, -0.7f, 0.5f, 1, 0, 0, 1, 0.9f, -0.5f, 0.5f, 0, 1, 0, 0.5f, -0.1f, 0.8f, 0.5f, 0, 0, 1, 0.25f};
+  req.vertex_code = ArrayView<const uint32_t>(vs.view().data(), vs.count());
+  req.pixel_code = ArrayView<const uint32_t>(ps.view().data(), ps.count());
+  req.vertex_constants = ArrayView<const float>(identity, 16);
+  req.vertex_data = ArrayView<const uint32_t>(reinterpret_cast<const uint32_t*>(triangle), 21);      // (floats are 32 bit words)
+  req.vertex_stride = 28;
+  req.attributes[0] = {3, 0};
+  req.attributes[1] = {4, 12};
+  req.vertex_count = 3;
+  req.width = 37;
+  req.height = 29;
+  req.clear[0] = req.clear[1] = req.clear[2] = req.clear[3] = -1.0f;
+
+  VramMemory memory;
+  memory.vram = rig.vram;
+  uint32_t hook_calls = 0, draws = 0;
+  gcn::CommandProcessorModel::Result last = gcn::CommandProcessorModel::Result::Ok;
+  rig.card.gfx.graphics_ib_hook = [&](uint64_t address, uint32_t dwords) {
+    ++hook_calls;
+    if (!memory.in_range(address, dwords * 4ull)) return false;
+    gcn::CommandProcessorModel cp(rig.alloc, memory);
+    last = cp.execute(ArrayView<const uint32_t>(reinterpret_cast<const uint32_t*>(rig.vram + (address - kGpuBase)), dwords));
+    draws += cp.draws();
+    return last == gcn::CommandProcessorModel::Result::Ok;
+  };
+
+  const uint64_t staging_bytes = AmdVegaDraw::area_bytes(req), pixel_bytes = AmdVegaDraw::target_bytes(req);
+  CHECK(staging_bytes > 0 && staging_bytes % 256 == 0 && pixel_bytes == 40ull * 29 * 16);
+  uint8_t* staging = pool.memory.data() + 4096;
+  uint8_t* pixels = pool.memory.data() + 4096 + ((staging_bytes + 8191) / 4096) * 4096;
+  const bool ok = AmdVegaDraw::draw(vega, req, 4096, ByteView(staging, staging_bytes), ByteView(pixels, pixel_bytes));
+  if (!ok) printf("  draw failed (model: %s)\n", gcn::CommandProcessorModel::result_name(last));
+  CHECK(ok && hook_calls == 1 && draws == 1 && rig.card.gfx.ib_protocol_errors == 0);
+
+  // the same draw on the emulator
+  gcn::Framebuffer fb(rig.alloc, req.width, req.height);
+  fb.clear(-1, -1, -1, -1);
+  gcn::DrawCall c;
+  c.vertex_code = req.vertex_code;
+  c.pixel_code = req.pixel_code;
+  c.vertex_info = req.vertex_info;
+  c.pixel_info = req.pixel_info;
+  c.vertex_constants = req.vertex_constants;
+  c.vertex_data = req.vertex_data;
+  c.vertex_stride = 28;
+  c.attributes[0] = {3, 0};
+  c.attributes[1] = {4, 12};
+  const uint32_t idx[3] = {0, 1, 2};
+  c.indices = ArrayView<const uint32_t>(idx, 3);
+  CHECK(gcn::draw(rig.alloc, c, fb) == gcn::DrawStatus::Ok);
+  uint32_t different = 0, covered = 0;
+  for (uint32_t y = 0; y < req.height; ++y)
+    for (uint32_t x = 0; x < req.width; ++x)
+      for (uint32_t k = 0; k < 4; ++k) {
+        float got;
+        memcpy(&got, pixels + (static_cast<uint64_t>(y) * 40 + x) * 16 + 4 * k, 4);
+        if (got != fb.pixel(x, y)[k]) ++different;
+        if (k == 0 && got != -1.0f) ++covered;
+      }
+  CHECK(different == 0 && covered > 100);
+  // the padding columns of the pitch were cleared, not drawn on
+  float pad;
+  memcpy(&pad, pixels + (5ull * 40 + 38) * 16, 4);
+  CHECK(pad == -1.0f);
+  // indexed draw (32 bit indices staged with the vertices)
+  const uint32_t order[3] = {0, 2, 1};
+  req.indices = ArrayView<const uint32_t>(order, 3);
+  CHECK(AmdVegaDraw::draw(vega, req, 4096, ByteView(staging, AmdVegaDraw::area_bytes(req)), ByteView(pixels, pixel_bytes)) && hook_calls == 2 && draws == 2);
+  uint32_t covered2 = 0;
+  for (uint32_t y = 0; y < req.height; ++y)
+    for (uint32_t x = 0; x < req.width; ++x) {
+      float v;
+      memcpy(&v, pixels + (static_cast<uint64_t>(y) * 40 + x) * 16, 4);
+      if (v != -1.0f) ++covered2;
+    }
+  CHECK(covered2 == covered);          // (the other winding fills the same pixels)
+  // what is refused before anything is submitted
+  const uint32_t calls = hook_calls;
+  CHECK(!AmdVegaDraw::draw(vega, req, 4096 + 16, ByteView(staging, staging_bytes), ByteView(pixels, pixel_bytes)));                          // misaligned
+  CHECK(!AmdVegaDraw::draw(vega, req, l.framebuffer_bytes - 256, ByteView(staging, staging_bytes), ByteView(pixels, pixel_bytes)));          // does not fit the area
+  CHECK(!AmdVegaDraw::draw(vega, req, 4096, ByteView(staging, 256), ByteView(pixels, pixel_bytes)));                                         // staging too small
+  CHECK(!AmdVegaDraw::draw(vega, req, 4096, ByteView(staging, staging_bytes), ByteView(pixels, 16)));                                        // pixels too small
+  VegaDrawRequest bad = req;
+  bad.width = 0;
+  CHECK(AmdVegaDraw::area_bytes(bad) == 0);
+  bad = req; bad.vertex_count = 4; bad.indices = ArrayView<const uint32_t>();
+  CHECK(!AmdVegaDraw::draw(vega, bad, 4096, ByteView(staging, staging_bytes), ByteView(pixels, pixel_bytes)));                               // not whole triangles
+  CHECK(hook_calls == calls);
+  vega.shutdown();
+  CHECK(!AmdVegaDraw::draw(vega, req, 4096, ByteView(staging, staging_bytes), ByteView(pixels, pixel_bytes)));
+}
+
 int main() {
   setvbuf(stdout, nullptr, _IONBF, 0);
   test_plan();
   test_bring_up();
   test_transfer();
+  test_draw_on_card();
   test_failures();
   test_display();
   test_present();

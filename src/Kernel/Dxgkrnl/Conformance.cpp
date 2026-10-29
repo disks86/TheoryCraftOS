@@ -699,6 +699,82 @@ struct Entry {
   bool edges_vary = false;   // lines and points: which pixels a line covers is up to the rasterizer, so a pixel may also match any of its neighbours
 };
 
+// Two render targets (SV_Target0 / SV_Target1 of ps_mrt.dxbc): the first holds the vertex colour, the second the same with red and blue swapped. The picture compared is
+// the first target in the even columns and the second in the odd ones, so a target the device did not fill (or filled with the other's output) shows.
+void scene_multiple_targets(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureMultipleTargets)) return void(rig.step("multiple render targets", status::kNotSupported));
+  namespace b = conformance_blobs;
+  const Vertex v[3] = {{-0.9f, -0.9f, 0.5f, 1, 0.2f, 0, 1}, {0.9f, -0.9f, 0.5f, 0, 1, 0.3f, 1}, {0.0f, 0.9f, 0.5f, 0.1f, 0.2f, 1, 1}};
+  Handle vs = rig.vertex_shader(bytes_of(b::k_vs, sizeof b::k_vs));
+  Handle ps = rig.pixel_shader(bytes_of(b::k_ps_mrt, sizeof b::k_ps_mrt));
+  PipelineDesc pd = colour_pipeline_desc(vs, ps);
+  pd.varying_count = 3;
+  pd.color_target_count = 2;
+  Handle pipe = rig.pipeline(pd);
+  Handle first = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize), second = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  CommandWriter w(rig.allocator());
+  w.begin_pass_targets(0, {1}, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1.0f, 0);
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(2);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(3);
+  w.end_pass();
+  rig.render(w, {first, second, vb});
+  ArrayView<uint32_t> other = allocate_view<uint32_t>(rig.allocator(), uint64_t{kSize} * kSize);
+  if (other.empty()) return void(rig.step("memory", status::kNoMemory));
+  rig.read(first, out);
+  rig.read(second, other);
+  for (uint32_t i = 1; i < kSize * kSize; i += 2) out[i] = other[i];
+  release_view(rig.allocator(), other);
+}
+
+// A float render target (half or single precision): two triangles are added into it (One + One), so where they overlap the colour is above 1 - which a clamping target would lose - and
+// the target is then sampled as a texture, scaled by 0.4 (ps_scale.dxbc), into an ordinary target.
+void float_target_scene(Rig& rig, ArrayView<uint32_t> out, Format format) {
+  if (!rig.has(graphics::kFeatureFloatFormats | graphics::kFeatureBlendState)) return void(rig.step("float formats", status::kNotSupported));
+  namespace b = conformance_blobs;
+  const Vertex tri[6] = {{-0.8f, -0.8f, 0.5f, 1.5f, 0.25f, 0.1f, 1.0f}, {0.8f, -0.8f, 0.5f, 1.5f, 0.25f, 0.1f, 1.0f}, {0.0f, 0.8f, 0.5f, 1.5f, 0.25f, 0.1f, 1.0f},
+                         {-0.8f, 0.6f, 0.5f, 1.0f, 0.75f, 0.4f, 0.5f}, {0.8f, 0.6f, 0.5f, 1.0f, 0.75f, 0.4f, 0.5f}, {0.0f, -0.9f, 0.5f, 1.0f, 0.75f, 0.4f, 0.5f}};
+  Handle vs = rig.vertex_shader(bytes_of(kVertexTokens, sizeof kVertexTokens), ShaderKind::D3d9Bytecode);
+  Handle ps = rig.pixel_shader(bytes_of(kPixelTokens, sizeof kPixelTokens), ShaderKind::D3d9Bytecode);
+  PipelineDesc add = colour_pipeline_desc(vs, ps);
+  add.blend.custom = add.blend.enable = true;
+  add.blend.src_color = add.blend.dst_color = add.blend.src_alpha = add.blend.dst_alpha = graphics::BlendFactor::One;
+  Handle first = rig.pipeline(add);
+  Handle second = dxbc_pipeline(rig, b::k_vs, sizeof b::k_vs, b::k_ps_scale, sizeof b::k_ps_scale, 1);
+  Handle texture = rig.image(kAllocRenderTarget | kAllocTexture, format, kSize, kSize);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle tvb = rig.buffer(kAllocVertexBuffer, bytes_of(tri, sizeof tri));
+  CommandWriter w(rig.allocator());
+  begin(w, 0, kNoAllocation, {0, 0, 0, 0});
+  w.bind_pipeline(first);
+  w.bind_vertex_buffer(2);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(6);
+  w.end_pass();
+  rig.render(w, {texture, target, tvb});
+  // (the vertex shader makes the texture coordinate from the colour: u / 2, v / 2)
+  auto vert = [](float x, float y, float u, float v) { return Vertex{x, y, 0.5f, u / 2, v / 2, 1, 1}; };
+  const Vertex quad[6] = {vert(-1, -1, 0, 0), vert(1, -1, 1, 0), vert(-1, 1, 0, 1), vert(-1, 1, 0, 1), vert(1, -1, 1, 0), vert(1, 1, 1, 1)};
+  Handle qvb = rig.buffer(kAllocVertexBuffer, bytes_of(quad, sizeof quad));
+  graphics::SamplerDesc sampler;
+  sampler.filter = graphics::Filter::Nearest;
+  sampler.address_u = sampler.address_v = graphics::AddressMode::ClampToEdge;
+  CommandWriter w2(rig.allocator());
+  begin(w2, 0, kNoAllocation, {0, 0, 0, 1});
+  w2.bind_pipeline(second);
+  w2.bind_vertex_buffer(1);
+  w2.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w2.bind_texture(0, 2, sampler);
+  w2.draw(6);
+  w2.end_pass();
+  rig.render(w2, {target, qvb, texture});
+  rig.read(target, out);
+}
+void scene_half_float_target(Rig& rig, ArrayView<uint32_t> out) { float_target_scene(rig, out, Format::A16B16G16R16F); }
+void scene_float_target(Rig& rig, ArrayView<uint32_t> out) { float_target_scene(rig, out, Format::A32B32G32R32F); }
+
 const Entry kScenes[] = {
     {"Direct3D 9 vertex colours", scene_vertex_colours},
     {"Direct3D 9 Shader Model 3", scene_sm3},
@@ -726,6 +802,9 @@ const Entry kScenes[] = {
     {"Direct3D 10 lines and points", scene_lines_points, true},
     {"Direct3D 10 per-instance attribute", scene_instanced_colour},
     {"Direct3D 10 instancing", scene_instancing},
+    {"Direct3D 10 multiple render targets (DXBC)", scene_multiple_targets},
+    {"Direct3D 10 half-float render target and texture", scene_half_float_target},
+    {"Direct3D 10 float render target and texture", scene_float_target},
 };
 
 bool channels_close(uint32_t a, uint32_t b) {

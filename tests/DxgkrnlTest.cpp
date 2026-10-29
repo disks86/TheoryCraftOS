@@ -1274,7 +1274,9 @@ void test_d3d9_bytecode() {
         UniquePointer<D3d9Program> p;
         if (D3d9Program::compile(e.allocator, ConstByteView(t.data(), t.size()), &p) == status::kSuccess) {
           ++compiled;
-          graphics::Vec4 attrs[4] = {}, vary[4] = {}, color;
+          graphics::Vec4 attrs[4] = {}, vary[4] = {};
+          graphics::Vec4 color_room[graphics::kMaxColorTargets] = {};
+          graphics::Vec4& color = color_room[0];
           alignas(16) uint8_t constants[128] = {};
           graphics::ShaderIo io;
           if (p->stage() == graphics::ShaderStage::Vertex) p->run_vertex(attrs, constants, &io);
@@ -1755,7 +1757,8 @@ struct TgsiCheck {
           varyings[i] = {kInputs[set][i][0], kInputs[set][i][1], kInputs[set][i][2], kInputs[set][i][3]};
           for (unsigned k = 0; k < 4; ++k) m.in[i][k] = kInputs[set][i][k];
         }
-        graphics::Vec4 color = {};
+        graphics::Vec4 color_room[graphics::kMaxColorTargets] = {};
+        graphics::Vec4& color = color_room[0];
         const bool alive = program->run_fragment(varyings, constants, &textures, &color);
         if (!m.run(source)) same = false;
         else {
@@ -2329,7 +2332,8 @@ void test_dxbc() {
             for (unsigned k = 0; k < 4; ++k) memcpy(constants + i * 16 + k * 4, &kConstants[set][i][k], 4);
           graphics::Vec4 varyings[4];
           for (unsigned i = 0; i < 4; ++i) varyings[i] = {kInputs[set][i][0], kInputs[set][i][1], kInputs[set][i][2], kInputs[set][i][3]};
-          graphics::Vec4 color = {};
+          graphics::Vec4 color_room[graphics::kMaxColorTargets] = {};
+          graphics::Vec4& color = color_room[0];
           p->run_fragment(varyings, constants, nullptr, &color);
           const float got[4] = {color.x, color.y, color.z, color.w};
           // The oracle.
@@ -2546,9 +2550,9 @@ void test_dxbc() {
           ++compiled;
           String text(allocator);
           p->emit_tgsi(&text);
-          graphics::Vec4 varyings[4] = {}, color;
+          graphics::Vec4 varyings[4] = {}, color[graphics::kMaxColorTargets];
           uint8_t constants[128] = {};
-          p->run_fragment(varyings, constants, &textures, &color);
+          p->run_fragment(varyings, constants, &textures, color);
         } else {
           ++refused;
         }
@@ -2713,9 +2717,9 @@ void test_dxbc_real() {
           ++compiled;
           String text(allocator);
           p->emit_tgsi(&text);
-          graphics::Vec4 v[4] = {}, col;
+          graphics::Vec4 v[4] = {}, col[graphics::kMaxColorTargets];
           uint8_t constants[128] = {};
-          p->run_fragment(v, constants, &textures, &col);
+          p->run_fragment(v, constants, &textures, col);
           graphics::ShaderIo io;
           p->run_vertex(v, constants, &io);
         } else {
@@ -3382,7 +3386,23 @@ struct ConformanceLog {
   bool print_each = false;
 };
 
+void test_half_floats() {
+  // Every half survives the trip to float and back (NaNs stay NaNs), and conversions round to nearest even.
+  for (uint32_t h = 0; h < 0x10000; ++h) {
+    const float f = graphics::half_to_float(static_cast<uint16_t>(h));
+    const uint16_t back = graphics::float_to_half(f);
+    if ((h & 0x7C00) == 0x7C00 && (h & 0x3FF)) CHECK((back & 0x7C00) == 0x7C00 && (back & 0x3FF));
+    else CHECK(back == h);
+  }
+  CHECK(graphics::float_to_half(1.0f) == 0x3C00 && graphics::float_to_half(-2.0f) == 0xC000 && graphics::float_to_half(65504.0f) == 0x7BFF);
+  CHECK(graphics::float_to_half(1e9f) == 0x7C00 && graphics::float_to_half(-1e9f) == 0xFC00 && graphics::float_to_half(1e-9f) == 0);
+  CHECK(graphics::float_to_half(1.0f + 1.0f / 2048.0f) == 0x3C00);          // (a tie goes to the even fraction)
+  CHECK(graphics::float_to_half(1.0f + 3.0f / 2048.0f) == 0x3C02);
+  CHECK(graphics::half_to_float(0x0001) == 5.9604645e-8f);                    // (the smallest subnormal)
+}
+
 void test_conformance() {
+  test_half_floats();
   HostAllocator allocator;
   FakeScreen screen(8, 6);
   graphics::SoftwareDevice device(allocator, &screen), reference(allocator, &screen);
@@ -3400,6 +3420,30 @@ void test_conformance() {
       case SceneVerdict::Broken: ++l.broken; printf("  conformance: %s broken at %s: %x\n", r.name, r.step, static_cast<unsigned>(r.status)); break;
     }
     CHECK(r.device_picture && r.reference_picture && !r.reference_failed);
+    if (__builtin_strstr(r.name, "float render target")) {
+      // Where the two triangles overlap the target holds 2.5 in red (x 0.4 = 1.0); a clamping target would hold 1.0 there (x 0.4 = 0.4). One triangle alone gives 1.5 (x 0.4 = 0.6).
+      uint32_t bright = 0, single = 0;
+      for (uint32_t i = 0; i < 32 * 32; ++i) {
+        const uint32_t red = (r.device_picture[i] >> 16) & 0xFF;
+        if (red >= 240) ++bright;
+        if (red >= 140 && red <= 165) ++single;
+      }
+      CHECK(bright >= 20 && single >= 20);
+    }
+    if (__builtin_strstr(r.name, "multiple render targets")) {
+      // Even columns come from target 0 (the vertex colour), odd ones from target 1 (red and blue swapped): across a pair of neighbours the red of one is the blue of the other.
+      uint32_t swapped = 0, strong = 0;
+      for (uint32_t y = 0; y < 32; ++y)
+        for (uint32_t x = 0; x < 32; x += 2) {
+          const uint32_t a = r.device_picture[y * 32 + x], b = r.device_picture[y * 32 + x + 1];
+          auto ch = [](uint32_t v, uint32_t shift) { return static_cast<int32_t>((v >> shift) & 0xFF); };
+          auto near = [](int32_t u, int32_t v) { return (u > v ? u - v : v - u) <= 40; };
+          if (!(a & 0xFFFFFF) || !(b & 0xFFFFFF)) continue;
+          if (near(ch(a, 16), ch(b, 0)) && near(ch(a, 0), ch(b, 16)) && near(ch(a, 8), ch(b, 8))) ++swapped;
+          if (ch(a, 16) - ch(a, 0) > 100 || ch(a, 0) - ch(a, 16) > 100) ++strong;
+        }
+      CHECK(swapped >= 100 && strong >= 5);
+    }
   }, &log);
   // The software renderer takes every scene, and draws the same picture as itself.
   CHECK(bad == 0 && log.differs == 0 && log.broken == 0 && log.refused == 0 && log.same >= 20);
@@ -4030,7 +4074,7 @@ void test_d3d10_state() {
     std::vector<uint32_t> a = picture(via_escape, [](CommandWriter& w) { w.draw(3); });
     CHECK(!a.empty() && a == picture(pipe, [](CommandWriter& w) { w.draw(3); }));
     // A malformed trailer is refused.
-    req.put32(1);
+    req.put32(0);   // (no colour outputs)
     CHECK(e.kernel.escape(kPid, e.dev, req.view(), ByteView(reply, sizeof reply), &reply_bytes) == status::kInvalidParameter);
   }
 
@@ -4333,7 +4377,8 @@ void test_dxbc_system_values() {
           graphics::FragmentContext context;
           context.position = {x, 9.5f, 0.25f, 0.8f};
           context.front_facing = front;
-          graphics::Vec4 color = {};
+          graphics::Vec4 color_room[graphics::kMaxColorTargets] = {};
+          graphics::Vec4& color = color_room[0];
           uint8_t constants[128] = {};
           const bool alive = psp->run_fragment_ex(varyings, context, constants, &texels, &color);
           TgsiMachine m;
@@ -4369,7 +4414,8 @@ void test_dxbc_system_values() {
           graphics::Vec4 varyings[4] = {};
           varyings[0] = {0.5f, 0.25f, 0.75f, 1.0f};
           varyings[2] = {x, y, 0, 0};
-          graphics::Vec4 color = {};
+          graphics::Vec4 color_room[graphics::kMaxColorTargets] = {};
+          graphics::Vec4& color = color_room[0];
           CHECK(cp->run_fragment_ex(varyings, graphics::FragmentContext(), constants, nullptr, &color));
           TgsiMachine m = base;
           m.in[0][0] = 0.5f, m.in[0][1] = 0.25f, m.in[0][2] = 0.75f, m.in[0][3] = 1.0f;
@@ -4428,7 +4474,9 @@ void test_dxbc_system_values() {
         UniquePointer<D3d9Program> p = compile_dxbc(allocator, t, &st);
         if (st == status::kSuccess) {
           ++compiled;
-          graphics::Vec4 v[4] = {}, color;
+          graphics::Vec4 v[4] = {};
+          graphics::Vec4 color_room[graphics::kMaxColorTargets] = {};
+          graphics::Vec4& color = color_room[0];
           uint8_t constants[128] = {};
           graphics::ShaderIo io;
           p->run_vertex_ex(v, constants, graphics::VertexContext(), &io);

@@ -19,6 +19,7 @@
 #include "Kernel/Dxgkrnl/VidMm.hpp"
 #include "Graphics/Graphics3D/Mipmaps.hpp"
 #include "Utility/AllocatedView.hpp"
+#include "Utility/ByteStream.hpp"
 
 namespace dxgk {
 
@@ -26,10 +27,10 @@ namespace {
 
 constexpr uint32_t kKnownFlags = kAllocVertexBuffer | kAllocIndexBuffer | kAllocTexture | kAllocRenderTarget | kAllocDepthStencil | kAllocPresent | kAllocStaging | kAllocShared;
 
-// The bytes of all levels of a w x h image of 4-byte pixels; false if the description's levels are not possible. (w and h are at most kMaxTextureDimension, so nothing overflows.)
-bool image_bytes(uint32_t w, uint32_t h, uint32_t levels, uint64_t* total) {
+// The bytes of all levels of a w x h image of `pixel`-byte pixels; false if the description's levels are not possible. (w and h are at most kMaxTextureDimension, so nothing overflows.)
+bool image_bytes(uint32_t w, uint32_t h, uint32_t levels, uint32_t pixel, uint64_t* total) {
   uint64_t sum = 0;
-  for (uint32_t l = 0; l < levels; ++l) sum += uint64_t{graphics::mip_extent(w, l)} * graphics::mip_extent(h, l) * 4;
+  for (uint32_t l = 0; l < levels; ++l) sum += uint64_t{graphics::mip_extent(w, l)} * graphics::mip_extent(h, l) * pixel;
   *total = sum;
   return true;
 }
@@ -48,9 +49,10 @@ bool Allocation::level_range(uint32_t level, uint64_t* offset, uint64_t* bytes) 
   }
   if (level >= desc_.mip_levels) return false;
   uint64_t start = 0;
-  for (uint32_t l = 0; l < level; ++l) start += uint64_t{graphics::mip_extent(desc_.width, l)} * graphics::mip_extent(desc_.height, l) * 4;
+  const uint32_t pixel = pixel_bytes(desc_.format);
+  for (uint32_t l = 0; l < level; ++l) start += uint64_t{graphics::mip_extent(desc_.width, l)} * graphics::mip_extent(desc_.height, l) * pixel;
   *offset = start;
-  *bytes = uint64_t{graphics::mip_extent(desc_.width, level)} * graphics::mip_extent(desc_.height, level) * 4;
+  *bytes = uint64_t{graphics::mip_extent(desc_.width, level)} * graphics::mip_extent(desc_.height, level) * pixel;
   return true;
 }
 
@@ -94,9 +96,13 @@ NtStatus VidMm::create(const AllocationDesc& desc, SharedPointer<Allocation>* ou
       return status::kInvalidParameter;
     }
     if (depth_flag && (desc.flags & ~(kAllocDepthStencil | kAllocShared))) return status::kInvalidParameter;
+    if (dxgk::is_float(desc.format)) {
+      if (desc.mip_levels != 1 || (desc.flags & kAllocPresent)) return status::kInvalidParameter;
+      if (!(desc.flags & kAllocStaging) && !(device_.info().features & graphics::kFeatureFloatFormats)) return status::kNotSupported;
+    }
     if (desc.mip_levels > 1 && (desc.flags & ~(kAllocTexture | kAllocShared))) return status::kInvalidParameter;
     uint64_t total = 0;
-    image_bytes(desc.width, desc.height, desc.mip_levels, &total);
+    image_bytes(desc.width, desc.height, desc.mip_levels, pixel_bytes(desc.format), &total);
     if (depth_flag) {
       device_bytes = uint64_t{desc.width} * desc.height * (desc.format == Format::D24S8 ? 5 : 4);
     } else {
@@ -158,7 +164,9 @@ bool VidMm::create_device_object(Allocation& a) {
     a.image_ = device_.create_image(id);
     return a.image_ != nullptr;
   }
-  id.format = is_rgba_order(d.format) ? graphics::Format::R8G8B8A8Unorm : graphics::Format::B8G8R8A8Unorm;
+  id.format = d.format == Format::A16B16G16R16F ? graphics::Format::R16G16B16A16Float
+              : d.format == Format::A32B32G32R32F ? graphics::Format::R32G32B32A32Float
+              : is_rgba_order(d.format) ? graphics::Format::R8G8B8A8Unorm : graphics::Format::B8G8R8A8Unorm;
   id.usage = 0;
   if (d.flags & kAllocRenderTarget) id.usage |= graphics::kImageColorAttachment;
   if (d.flags & kAllocPresent) id.usage |= graphics::kImagePresent;
@@ -189,6 +197,24 @@ bool VidMm::upload(Allocation& a) {
     return true;
   }
   const Format f = a.desc_.format;
+  if (dxgk::is_float(f)) {
+    ArrayView<graphics::Vec4> pixels;
+    scratch_.clear();
+    if (!scratch_.put_zeros(uint64_t{a.desc_.width} * a.desc_.height * sizeof(graphics::Vec4)) || !scratch_.writable_view().try_cast<graphics::Vec4>(&pixels)) return false;
+    ByteReader in(ConstByteView(a.cpu_));
+    for (graphics::Vec4& c : pixels) {
+      if (f == Format::A16B16G16R16F) {
+        c = {graphics::half_to_float(static_cast<uint16_t>(in.le16())), graphics::half_to_float(static_cast<uint16_t>(in.le16())), graphics::half_to_float(static_cast<uint16_t>(in.le16())),
+             graphics::half_to_float(static_cast<uint16_t>(in.le16()))};
+      } else {
+        c = {__builtin_bit_cast(float, in.le32()), __builtin_bit_cast(float, in.le32()), __builtin_bit_cast(float, in.le32()), __builtin_bit_cast(float, in.le32())};
+      }
+    }
+    if (!in.ok()) return false;
+    if (!a.image_->write_pixels_float(ArrayView<const graphics::Vec4>(pixels.data(), pixels.size())) && a.cpu_written_) return false;
+    a.device_stale_ = false;
+    return true;
+  }
   const bool convert = f != Format::A8R8G8B8;
   for (uint32_t level = 0; level < a.desc_.mip_levels; ++level) {
     uint64_t offset = 0, bytes = 0;
@@ -221,6 +247,23 @@ bool VidMm::read_back(Allocation& a) {
     return true;
   }
   const Format f = a.desc_.format;
+  if (dxgk::is_float(f)) {
+    ArrayView<graphics::Vec4> pixels;
+    scratch_.clear();
+    if (!scratch_.put_zeros(uint64_t{a.desc_.width} * a.desc_.height * sizeof(graphics::Vec4)) || !scratch_.writable_view().try_cast<graphics::Vec4>(&pixels)) return false;
+    if (!a.image_->read_pixels_float(pixels)) return false;
+    ByteWriter out(a.cpu_.first(uint64_t{a.desc_.width} * a.desc_.height * pixel_bytes(f)));
+    for (const graphics::Vec4& c : pixels) {
+      if (f == Format::A16B16G16R16F) {
+        out.le16(graphics::float_to_half(c.x)), out.le16(graphics::float_to_half(c.y)), out.le16(graphics::float_to_half(c.z)), out.le16(graphics::float_to_half(c.w));
+      } else {
+        out.le32(__builtin_bit_cast(uint32_t, c.x)), out.le32(__builtin_bit_cast(uint32_t, c.y)), out.le32(__builtin_bit_cast(uint32_t, c.z)), out.le32(__builtin_bit_cast(uint32_t, c.w));
+      }
+    }
+    if (!out.ok()) return false;
+    a.gpu_newer_ = false;
+    return true;
+  }
   ArrayView<uint32_t> backing;
   if (!as_words(a.cpu_.first(uint64_t{a.desc_.width} * a.desc_.height * 4), &backing)) return false;
   if (f == Format::A8R8G8B8) {

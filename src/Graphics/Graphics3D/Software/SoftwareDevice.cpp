@@ -70,19 +70,23 @@ class SoftwareImage final : public IImage {
     if (desc.format == Format::D32Float) {
       depth_ = allocate_view<float>(allocator, count);
       if (desc.stencil) stencil_ = allocate_view<uint8_t>(allocator, count);
+    } else if (is_float_format(desc.format)) {
+      if (desc.mip_levels == 1) hdr_ = allocate_view<Vec4>(allocator, count);
     } else if (desc.format != Format::Undefined) {
       color_ = allocate_view<uint32_t>(allocator, total);
     }
     for (float& d : depth_) d = 1.0f;
     for (uint32_t& c : color_) c = 0;
+    for (Vec4& c : hdr_) c = {0, 0, 0, 0};
     for (uint8_t& v : stencil_) v = 0;
   }
   ~SoftwareImage() {
     release_view(allocator_, color_);
+    release_view(allocator_, hdr_);
     release_view(allocator_, depth_);
     release_view(allocator_, stencil_);
   }
-  bool valid() const { return (!color_.empty() || !depth_.empty()) && (!desc_.stencil || !stencil_.empty()); }
+  bool valid() const { return (!color_.empty() || !hdr_.empty() || !depth_.empty()) && (!desc_.stencil || !stencil_.empty()); }
   uint32_t mip_levels() const override { return desc_.mip_levels; }
   Extent2D extent() const override { return desc_.extent; }
   Format format() const override { return desc_.format; }
@@ -95,6 +99,21 @@ class SoftwareImage final : public IImage {
     return true;
   }
   bool write_pixels(ArrayView<const uint32_t> pixels) override { return write_mip_pixels(0, pixels); }
+  bool read_pixels_float(ArrayView<Vec4> out) override {
+    if (hdr_.empty() || out.size() < hdr_.size()) return false;
+    for (uint64_t i = 0; i < hdr_.size(); ++i) out[i] = hdr_[i];
+    return true;
+  }
+  bool write_pixels_float(ArrayView<const Vec4> pixels) override {
+    if (hdr_.empty() || pixels.size() != hdr_.size()) return false;
+    for (uint64_t i = 0; i < hdr_.size(); ++i) hdr_[i] = store_float(pixels[i]);
+    return true;
+  }
+  // What a pixel of this image keeps of a colour: half-float images round to half precision.
+  Vec4 store_float(Vec4 c) const {
+    if (desc_.format != Format::R16G16B16A16Float) return c;
+    return {half_to_float(float_to_half(c.x)), half_to_float(float_to_half(c.y)), half_to_float(float_to_half(c.z)), half_to_float(float_to_half(c.w))};
+  }
   bool write_mip_pixels(uint32_t level, ArrayView<const uint32_t> pixels) override {
     if (color_.empty() || level >= desc_.mip_levels) return false;
     const Surface s = surface(level);
@@ -126,7 +145,8 @@ class SoftwareImage final : public IImage {
     const uint64_t offset = level == 0 ? 0 : level_offset_[level];
     s.width = mip_extent(desc_.extent.width, level);
     s.height = mip_extent(desc_.extent.height, level);
-    s.pixels = color_.subview(offset, uint64_t{s.width} * s.height);
+    if (!hdr_.empty()) s.floats = hdr_;
+    else s.pixels = color_.subview(offset, uint64_t{s.width} * s.height);
     s.pitch = s.width;
     s.format = desc_.format;
     return s;
@@ -138,6 +158,7 @@ class SoftwareImage final : public IImage {
   allocators::IAllocator& allocator_;
   ImageDesc desc_;
   ArrayView<uint32_t> color_;
+  ArrayView<Vec4> hdr_;   // the pixels of a float format
   ArrayView<float> depth_;
   ArrayView<uint8_t> stencil_;
   uint64_t level_offset_[kMaxMipLevels] = {};   // (in pixels, from the start of level 0)
@@ -318,6 +339,7 @@ class TextureSet final : public ITextureSet {
     return i < 0 ? 0 : (i >= size ? size - 1 : i);
   }
   static Vec4 texel(const Surface& surface, int64_t x, int64_t y) {
+    if (!surface.floats.empty()) return surface.float_row(static_cast<uint32_t>(y))[x];
     const uint32_t argb = surface.decode(surface.row(static_cast<uint32_t>(y))[x]);
     constexpr float k = 1.0f / 255.0f;
     return {static_cast<float>((argb >> 16) & 0xFF) * k, static_cast<float>((argb >> 8) & 0xFF) * k, static_cast<float>(argb & 0xFF) * k, static_cast<float>(argb >> 24) * k};
@@ -360,6 +382,7 @@ struct ScreenVertex {
 struct DrawState {
   const SoftwarePipeline* pipeline = nullptr;
   SoftwareImage* color = nullptr;
+  SoftwareImage* extra_colors[kMaxColorTargets - 1] = {};
   SoftwareImage* depth = nullptr;
   Viewport viewport;
   Rect2D scissor;  // already clamped to the target
@@ -461,10 +484,32 @@ uint32_t blend_pixel(const BlendState& b, uint32_t source, uint32_t destination)
   return (destination & ~mask) | (blended & mask);
 }
 
+// The same for a float target: no clamping anywhere, and `destination` is returned with only the write mask's channels changed.
+Vec4 blend_float(const BlendState& b, bool over, Vec4 source, Vec4 destination) {
+  const float s[4] = {source.x, source.y, source.z, source.w}, d[4] = {destination.x, destination.y, destination.z, destination.w};
+  float out[4];
+  for (uint32_t c = 0; c < 4; ++c) {
+    if (!b.custom) {   // (the pipeline's plain source-over, or no blending)
+      out[c] = over ? (c == 3 ? s[3] + d[3] * (1.0f - s[3]) : s[c] * s[3] + d[c] * (1.0f - s[3])) : s[c];
+      continue;
+    }
+    const bool alpha = c == 3;
+    const BlendOp op = alpha ? b.alpha_op : b.color_op;
+    const float sf = blend_factor(alpha ? b.src_alpha : b.src_color, s, d, c), df = blend_factor(alpha ? b.dst_alpha : b.dst_color, s, d, c);
+    if (!b.enable) out[c] = s[c];
+    else if (op == BlendOp::Add) out[c] = s[c] * sf + d[c] * df;
+    else if (op == BlendOp::Subtract) out[c] = s[c] * sf - d[c] * df;
+    else if (op == BlendOp::ReverseSubtract) out[c] = d[c] * df - s[c] * sf;
+    else if (op == BlendOp::Min) out[c] = s[c] < d[c] ? s[c] : d[c];
+    else out[c] = s[c] > d[c] ? s[c] : d[c];
+  }
+  const uint32_t mask = b.custom ? b.write_mask : 0xFu;
+  return {(mask & 1) ? out[0] : d[0], (mask & 2) ? out[1] : d[1], (mask & 4) ? out[2] : d[2], (mask & 8) ? out[3] : d[3]};
+}
+
 // Stencil test, depth write, blend and store of a shaded fragment of the pixel (x, y); depth_ok is the depth test's verdict.
-void write_fragment(const DrawState& s, int32_t x, int32_t y, float z, bool depth_ok, Vec4 color) {
+void write_fragment(const DrawState& s, int32_t x, int32_t y, float z, bool depth_ok, const Vec4* colors) {
   const GraphicsPipelineDesc& pd = s.pipeline->desc();
-  const Surface target = s.color->surface();
   const ArrayView<float> depth = s.depth ? s.depth->depth() : ArrayView<float>();
   const ArrayView<uint8_t> stencil = s.depth ? s.depth->stencil() : ArrayView<uint8_t>();
   const bool stencil_on = pd.stencil.enable && !stencil.empty();
@@ -480,11 +525,21 @@ void write_fragment(const DrawState& s, int32_t x, int32_t y, float z, bool dept
   } else if (!depth_ok) {
     return;
   }
-  uint32_t out = pack_color(color);
-  uint32_t* pixel = target.row(static_cast<uint32_t>(y)) + x;
-  if (pd.blend.custom) out = blend_pixel(pd.blend, out, target.decode(*pixel));
-  else if (pd.alpha_blend) out = blend_over(out, target.decode(*pixel));
-  *pixel = target.encode(out);
+  for (uint32_t n = 0; n < pd.color_target_count && n < kMaxColorTargets; ++n) {
+    const SoftwareImage* image = n == 0 ? s.color : s.extra_colors[n - 1];
+    if (!image) break;
+    const Surface surface = image->surface();
+    if (!surface.floats.empty()) {
+      Vec4* pixel = surface.float_row(static_cast<uint32_t>(y)) + x;
+      *pixel = image->store_float(blend_float(pd.blend, !pd.blend.custom && pd.alpha_blend, colors[n], *pixel));
+      continue;
+    }
+    uint32_t out = pack_color(colors[n]);
+    uint32_t* pixel = surface.row(static_cast<uint32_t>(y)) + x;
+    if (pd.blend.custom) out = blend_pixel(pd.blend, out, surface.decode(*pixel));
+    else if (pd.alpha_blend) out = blend_over(out, surface.decode(*pixel));
+    *pixel = surface.encode(out);
+  }
   if (pd.depth_write && !depth.empty()) depth[index] = z;
 }
 
@@ -588,7 +643,7 @@ void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVert
                       (v0->varying[i].z * p0 + v1->varying[i].z * p1 + v2->varying[i].z * p2) * norm,
                       (v0->varying[i].w * p0 + v1->varying[i].w * p1 + v2->varying[i].w * p2) * norm};
       }
-      Vec4 color;
+      Vec4 color[kMaxColorTargets];
       if (lod_pass) {
         // The level of detail comes from the 2 x 2 quad the pixel is in: the shader is run for the quad's upper left, right and lower pixels with the lookups only recorded.
         const int32_t qx = x & ~1, qy = y & ~1;
@@ -599,13 +654,13 @@ void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVert
         for (int k = 0; k < 3; ++k) {
           Vec4 quad_varying[kMaxVaryings];
           varyings_at(xs[k], ys[k], quad_varying);
-          Vec4 ignored;
+          Vec4 ignored[kMaxColorTargets];
           FragmentContext quad_context;
           quad_context.position = {xs[k], ys[k], z, 1.0f};
           quad_context.front_facing = front;
           quad_context.primitive_id = s.primitive_id;
           s.textures.start_recording();
-          run_fragment_shader(s, quad_varying, quad_context, &ignored);
+          run_fragment_shader(s, quad_varying, quad_context, ignored);
           s.textures.stop_recording();
           for (uint32_t unit = 0; unit < kMaxTextureUnits; ++unit) have[k][unit] = s.textures.recorded(unit, &coord[k][unit][0], &coord[k][unit][1]);
         }
@@ -617,7 +672,7 @@ void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVert
       context.position = {px, py, z, b0 * v0->inv_w + b1 * v1->inv_w + b2 * v2->inv_w};
       context.front_facing = front;
       context.primitive_id = s.primitive_id;
-      if (!run_fragment_shader(s, varying, context, &color)) continue;
+      if (!run_fragment_shader(s, varying, context, color)) continue;
       write_fragment(s, x, y, z, depth_ok, color);
     }
   }
@@ -638,8 +693,8 @@ void fragment_at(const DrawState& s, int32_t x, int32_t y, float z, float inv_w,
   context.position = {static_cast<float>(x) + 0.5f, static_cast<float>(y) + 0.5f, z, inv_w};
   context.front_facing = true;
   context.primitive_id = s.primitive_id;
-  Vec4 color;
-  if (!run_fragment_shader(s, varying, context, &color)) return;
+  Vec4 color[kMaxColorTargets];
+  if (!run_fragment_shader(s, varying, context, color)) return;
   write_fragment(s, x, y, z, depth_ok, color);
 }
 
@@ -831,11 +886,28 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
         if (s.depth && s.depth->format() != Format::D32Float) return false;
         const Extent2D e = s.color->extent();
         if (s.depth && (s.depth->extent().width != e.width || s.depth->extent().height != e.height)) return false;
+        for (SoftwareImage*& extra : s.extra_colors) extra = nullptr;
+        for (uint32_t n = 0; n + 1 < kMaxColorTargets && cmd.pass.extra_colors[n]; ++n) {
+          SoftwareImage* image = static_cast<SoftwareImage*>(cmd.pass.extra_colors[n]);
+          if (!(image->usage() & kImageColorAttachment) || image->format() == Format::D32Float || image == s.color || image == s.depth) return false;
+          if (image->extent().width != e.width || image->extent().height != e.height) return false;
+          for (uint32_t k = 0; k < n; ++k)
+            if (s.extra_colors[k] == image) return false;
+          s.extra_colors[n] = image;
+        }
         if (cmd.pass.clear_color) {
-          const Surface surface = s.color->surface();
-          const uint32_t v = surface.encode(pack_color(cmd.pass.clear_color_value));
-          for (uint32_t y = 0; y < e.height; ++y)
-            for (uint32_t x = 0; x < e.width; ++x) surface.row(y)[x] = v;
+          for (uint32_t n = 0; n < kMaxColorTargets; ++n) {
+            const SoftwareImage* image = n == 0 ? s.color : s.extra_colors[n - 1];
+            if (!image) break;
+            const Surface surface = image->surface();
+            if (!surface.floats.empty()) {
+              for (Vec4& c : surface.floats) c = image->store_float(cmd.pass.clear_color_value);
+              continue;
+            }
+            const uint32_t v = surface.encode(pack_color(cmd.pass.clear_color_value));
+            for (uint32_t y = 0; y < e.height; ++y)
+              for (uint32_t x = 0; x < e.width; ++x) surface.row(y)[x] = v;
+          }
         }
         if (s.depth && cmd.pass.clear_depth)
           for (float& d : s.depth->depth()) d = cmd.pass.clear_depth_value;
@@ -902,7 +974,10 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
         for (uint32_t unit = 0; unit < pd.texture_count; ++unit) {
           const SoftwareImage* bound = s.textures.image(unit);
           if (!bound || bound == s.color || bound == s.depth) return false;
+          for (const SoftwareImage* extra : s.extra_colors)
+            if (bound == extra) return false;
         }
+        if (pd.color_target_count == 0 || pd.color_target_count > kMaxColorTargets || (pd.color_target_count > 1 && !s.extra_colors[pd.color_target_count - 2])) return false;
         const ConstByteView vertices = ConstByteView(vertex_buffer->map());
         const ConstByteView indices = indexed ? ConstByteView(index_buffer->map()) : ConstByteView();
         const uint32_t index_size = index_type == IndexType::Uint16 ? 2 : 4;

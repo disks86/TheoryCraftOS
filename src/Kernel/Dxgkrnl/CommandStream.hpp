@@ -23,7 +23,7 @@
 // Allocations are named by an index into the allocation list passed with the stream (never by address: the kernel decides where memory is), pipelines by their handle.
 // State (pass, pipeline, buffers, textures) does not carry over from one stream to the next.
 //
-//   BeginPass        color_index, depth_index (kNoAllocation: none), flags, clear r, g, b, a (floats), clear depth (float), clear stencil
+//   BeginPass        color_index, depth_index (kNoAllocation: none), flags, clear r, g, b, a (floats), clear depth (float), clear stencil, [up to three more colour indices (kFeatureMultipleTargets)]
 //   EndPass
 //   BindPipeline     pipeline handle
 //   BindVertexBuffer allocation_index, offset
@@ -86,6 +86,13 @@ class CommandWriter {
 
   void begin_pass(uint32_t color, uint32_t depth, uint32_t flags, graphics::Vec4 clear_color, float clear_depth, uint32_t clear_stencil) {
     packet(Op::BeginPass, {color, depth, flags, float_bits(clear_color.x), float_bits(clear_color.y), float_bits(clear_color.z), float_bits(clear_color.w), float_bits(clear_depth), clear_stencil});
+  }
+  // A pass with several colour targets (the adapter's kFeatureMultipleTargets): `extra` are the allocation indices of targets 1 .. n (at most three).
+  void begin_pass_targets(uint32_t color, std::initializer_list<uint32_t> extra, uint32_t depth, uint32_t flags, graphics::Vec4 clear_color, float clear_depth, uint32_t clear_stencil) {
+    ok_ &= bytes_.put32(static_cast<uint32_t>(Op::BeginPass) | ((10 + static_cast<uint32_t>(extra.size())) << 16));
+    for (uint32_t w : {color, depth, flags, float_bits(clear_color.x), float_bits(clear_color.y), float_bits(clear_color.z), float_bits(clear_color.w), float_bits(clear_depth), clear_stencil})
+      ok_ &= bytes_.put32(w);
+    for (uint32_t w : extra) ok_ &= bytes_.put32(w);
   }
   void end_pass() { packet(Op::EndPass, {}); }
   void bind_pipeline(Handle pipeline) { packet(Op::BindPipeline, {pipeline}); }
