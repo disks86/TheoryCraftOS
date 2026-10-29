@@ -463,13 +463,19 @@ static void test_sse() {
     m.r(RSI) = kData;
     CHECK(m.run() == StopReason::Syscall);
     CHECK(m.read64(kData) == 0x37F && m.r(RAX) == 0);
-    Machine n({0xDF, 0x27});      // fbld [rdi]: packed decimal is not emulated
-    CHECK(n.run() == StopReason::Fault && n.cpu.fault().vector == 6);
   }
-  {      // packed decimal (fbld) is the part of x87 that is not emulated: an invalid opcode, not a wrong answer
-    Machine m({0xDF, 0x27});      // fbld [rdi]
+  {      // packed decimal: fbld of -1234 (digits in the low bytes, the sign in byte 9), fbstp back to another place, fistp as an integer
+    Machine m({0xDF, 0x27,                    // fbld [rdi]
+               0xD9, 0xC0,                    // fld st(0)
+               0xDF, 0x77, 0x10,              // fbstp [rdi+16]
+               0xDF, 0x7F, 0x20,              // fistp qword [rdi+32]
+               0x0F, 0x05});
     m.r(RDI) = kData;
-    CHECK(m.run() == StopReason::Fault && m.cpu.fault().vector == 6);
+    const uint8_t bcd[10] = {0x34, 0x12, 0, 0, 0, 0, 0, 0, 0, 0x80};
+    m.space.write_privileged(kData, ConstByteView(bcd, 10));
+    CHECK(m.run() == StopReason::Syscall);
+    CHECK(m.read64(kData + 32) == static_cast<uint64_t>(-1234));
+    CHECK((m.read64(kData + 16) & 0xFFFF) == 0x1234 && (m.read64(kData + 24) & 0xFFFF) == 0x8000);
   }
 }
 

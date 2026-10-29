@@ -272,9 +272,11 @@ static void test_basics() {
     m.space.write(0x20000, ConstByteView(text, 16));
     CHECK(m.run() == StopReason::Syscall && m.cpu.state().r[8] == 5);
   }
-  {      // the MMX forms (no 66 prefix) and VEX-only opcodes without a VEX prefix are invalid instructions
-    Machine a({0x0F, 0x38, 0x00, 0xC1});      // pshufb mm0, mm1
-    CHECK(a.run() == StopReason::Fault && a.cpu.fault().vector == 6);
+  {      // the MMX forms (no 66 prefix) are valid, and VEX-only opcodes without a VEX prefix are invalid instructions
+    Machine a(with_syscall({0x0F, 0x38, 0x00, 0xC1}));      // pshufb mm0, mm1
+    CHECK(a.run() == StopReason::Syscall);
+    Machine mmx_ud({0x0F, 0x38, 0x18, 0x07});      // vbroadcastss's opcode without a prefix is not an MMX instruction either
+    CHECK(mmx_ud.run() == StopReason::Fault && mmx_ud.cpu.fault().vector == 6);
     Machine b({0x66, 0x0F, 0x38, 0x18, 0x07});      // vbroadcastss without VEX
     CHECK(b.run() == StopReason::Fault && b.cpu.fault().vector == 6);
     Machine c({0x66, 0x0F, 0x3A, 0x38, 0x07, 0x01});      // vinserti128 without VEX

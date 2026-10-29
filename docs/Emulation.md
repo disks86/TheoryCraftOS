@@ -40,9 +40,9 @@ An interpreter, one instruction per decode, flags computed eagerly.
   CVTPS2PD / CVTPD2PS, CVTSI2SS/SD, CVT(T)SS/SD2SI, CVTDQ2PS/PD, CVT(T)PS/PD2DQ, UNPCK*, SHUFPS/PD, MOVMSKPS/PD, LDMXCSR/STMXCSR. The arithmetic is
   `emulation::softfloat` (`SoftFloat.cpp`): IEEE 754 binary32/64 done in integer operations (the kernel cannot assume an FPU and the host's float would not be
   bit-exact), with x86 semantics: the default NaN, first-NaN propagation, all four MXCSR rounding modes, and the MXCSR exception flags (exceptions are always masked, so
-  none traps). MXCSR.DAZ and FTZ are modelled (see below). Not modelled: RCPPS/RSQRTPS (the hardware approximations).
+  none traps). MXCSR.DAZ and FTZ are modelled (see below). `RCPPS`/`RSQRTPS` (and the scalar forms) return the correctly rounded value, within the architecture's 1.5 * 2^-12 but not the hardware's table values.
 - **Faults** are reported as x86 vectors (0, 3, 6, 13, 14 with the address), restartable (`rip` stays at the instruction).
-- **Not implemented** (each is an invalid-opcode fault, never a wrong result): packed-decimal x87 (`fbld`/`fbstp`), AVX-512, FXSAVE/XSAVE, RCL/RCR, segment registers, the system instructions.
+- **Not implemented** (each is an invalid-opcode fault, never a wrong result): segment register loads and far transfers (`mov ds`, `lss`, `call far`, `retf`, `int n`, `iret`), and the system instructions (privileged ones, `rdmsr`, the control and debug registers, `lgdt`, ...). See the x86-64 section for the full list of what exists beyond the base set.
 
 ## The AArch64 guest (`AArch64Cpu`)
 
@@ -135,6 +135,30 @@ programs built with `-march=haswell` (or x86-64-v3) run. `X86_64Vex.cpp` holds a
   single/double (and `vcvtph2ps`/`vcvtps2ph`), gathers and scatters, and `vucomis*`. XCR0 is 0xE7 and `xsave`/`xrstor` handle the opmask, ZMM_Hi256 and Hi16_ZMM components (standard
   format, 2688 bytes). `vrcp14*`/`vrsqrt14*` return a correctly rounded value truncated to 14 bits: the architecture only promises a relative error below 2^-14, and the real tables differ
   between Intel and AMD, so they are not compared with the host.
+- **The rest of the base set and its extensions** (all in `X86_64Misc.cpp`, `X86_64Mmx.cpp` and the main switch, each compared with the host by `tests/X86IntTest.cpp`, 590 instruction forms over 236,000
+  random runs: registers, defined flags, memory, MM and XMM state, MXCSR): `rcl`/`rcr` (every size, by 1, immediate or CL; OF only for a count of one), `cmpxchg8b`/`cmpxchg16b` (16-byte alignment, the
+  always-write), `adcx`/`adox`, `sahf`/`lahf`, `movnti`, `enter`, `xlat`, `loop`/`loope`/`loopne` (also with the address-size prefix), `push`/`pop fs`/`gs` (a zero selector; the base is not reloaded). With no
+  oracle, checked against the architecture's rules: `rdrand`/`rdseed` (a counter-seeded generator, not cryptographic; CF=1 always), `rdpid`/`rdtscp` (TSC_AUX is 0), `rdfsbase`/`wrfsbase`/`rdgsbase`/`wrgsbase`
+  (a non-canonical base is #GP), `movdiri`, `movdir64b`, `xtest`, `xend`.
+- **Transactional memory (RTM)**: `xbegin` always aborts at once (EAX=0, jump to the fallback), `xabort` outside a transaction is a no-op, `xtest` says "not in a transaction" and `xend` outside one is #GP. That is
+  legal (a processor may abort any transaction), and cpuid says so with RTM_ALWAYS_ABORT (leaf 7 EDX bit 11) rather than the RTM bit, so software takes its fallback. The HLE prefixes were already ignored.
+- **XSAVE**: `xsave`, `xsaveopt` (which writes everything, as `xsave`), `xsavec` (the compacted format: XCOMP_BV bit 63, the present components packed from offset 576) and `xrstor` of both formats, for x87, SSE,
+  AVX, the opmask registers and ZMM_Hi256 / Hi16_ZMM. Checked by saving, clearing and restoring all vector state in each variant and by the layout of the compacted image.
+- **MMX**: MM0..MM7 are the significands of the x87 registers. Any MMX instruction makes every x87 register valid and TOP zero, a written register gets an all-ones sign and exponent, and `emms` empties the
+  tags. All the prefix-less 0F integer opcodes, `pshufw`, `pextrw`/`pinsrw`, `pmovmskb`, `movntq`, `maskmovq`, `movd`/`movq`, `movq2dq`/`movdq2q`, the SSSE3 forms (`0F 38`/`0F 3A` without a prefix) and
+  `cvtpi2ps`/`cvtpi2pd`/`cvt(t)ps2pi`/`cvt(t)pd2pi` exist. The integer operations are the SSE ones (`sse_integer_core`) on a 64-bit value in the low half; `punpckh*` shifts both operands right by 32 and
+  runs `punpckl*`, and the pack instructions put the second source in the high half. About 400 MMX forms are compared with the host (generic opcodes in register and memory form, every SSSE3 operation, the shift immediates, `palignr`, `pshufw`, conversions); a mutation of `pmulhrsw` fails it.
+- **SSE4a** (`extrq`, `insertq` in the immediate and register forms, `movntss`, `movntsd`): compared with the host where the CPU has it; the upper quadword of the destination is cleared as on Zen.
+- **Packed decimal**: `fbld` and `fbstp` (eighteen digits and a sign; anything larger stores the packed-decimal indefinite and raises invalid), compared with the host by `X87Test` in every rounding mode.
+- **CET**: `endbr64`/`endbr32`, `rdsspd`/`rdsspq` and `incssp` execute as no-ops (shadow stacks are not enabled).
+- **AVX-VNNI, AVX-IFMA, AVX-VNNI-INT8, AVX-VNNI-INT16, AVX-NE-CONVERT** (`tests/VexNewTest.cpp`, against models written from the definitions, 16 dot-product instructions at 300 cases each,
+  both vector lengths, memory and register): the VEX encodings of `vpdpbusd[s]`/`vpdpwssd[s]`/`vpmadd52luq`/`vpmadd52huq` and `vcvtneps2bf16` are run by the EVEX code from a context with no mask and no broadcast
+  (`vex_via_evex`); the INT8 / INT16 dot products (`kDot`: signed, unsigned or mixed operands; the all-unsigned forms accumulate and saturate as unsigned) exist in both encodings; `vbcstnebf162ps`,
+  `vbcstnesh2ps`, `vcvtne[eo]bf162ps` and `vcvtne[eo]ph2ps` convert exactly (bfloat16 by a shift, half precision to single with a quieted signaling NaN). The unsigned-accumulator rule and the exactness of
+  the bfloat16 conversion are not checked against hardware.
+- **AVX-512 ER and PF** (Knights Landing; `tests/ErTest.cpp`): `vexp2ps/pd` (2^x in binary64 by its Taylor series), `vrcp28ps/pd/ss/sd` and `vrsqrt28ps/pd/ss/sd` (correctly rounded; the architecture promises 2^-23 and
+  2^-28), with denormal inputs as zeros, denormal results flushed, round to nearest, and `{sae}` suppressing the flags. The gather / scatter prefetches (`vgatherpf0/1d/qps/pd`, `vscatterpf0/1`) decode and do nothing.
+- **AVX10.1** is advertised (cpuid 7.1 EDX bit 19, leaf 0x24: version 1, 128 / 256 / 512-bit vectors): the emulator has every AVX-512 instruction set it requires. The AVX10.2 additions are not implemented.
 - **MXCSR.DAZ / FTZ** (`Env::daz` / `Env::ftz` in `SoftFloat`, set from MXCSR bits 6 and 15 by every x86 float handler): with DAZ a denormal operand is a zero of its sign and raises no denormal flag (also for
   `min`/`max`, `sqrt`, rounding, comparisons, conversions and the single-to-half conversion); with FTZ a tiny result (detected before rounding, even when exact) becomes a zero of its sign and raises underflow
   and inexact. A sum with a zero and an FMA with a zero product hand the other operand back, so those paths flush it too. The AVX-512 special functions follow the hardware: `vscalef` flushes only the final
@@ -160,8 +184,8 @@ programs built with `-march=haswell` (or x86-64-v3) run. `X86_64Vex.cpp` holds a
   the format description). Half precision has no denormal exception and no DAZ/FTZ, so those never show. Two details are not known and are documented guesses: the complex instructions
   round as chained fused multiply-adds (`a.re*b.re`, then `-a.im*b.im` added with one rounding), and `vrcpph`/`vrsqrtph` return the correctly rounded value, which is inside the
   architecture's 2^-11 bound but is not what the hardware's table gives bit for bit.
-- **Not implemented** (an invalid-instruction fault, never a wrong result): the Xeon Phi parts beyond 4FMAPS and 4VNNIW (the 4-register gather/scatter prefetches), TSX, `xsaveopt`/`xsavec`, and the MMX registers (so the MMX forms of the SSSE3
-  instructions, the ones without a 66 prefix, are invalid).
+- **Not implemented** (an invalid-instruction fault, never a wrong result): Intel AMX (tile registers), APX (REX2, the 32 general registers, the EVEX-promoted legacy instructions), the AVX10.2
+  additions, XOP and FMA4 (AMD Bulldozer-era), CET shadow-stack instructions beyond the no-op forms, `xsaves`/`xrstors` and `xgetbv` with ECX=1.
   Exceptions delivered to a Windows program save the XMM halves of vector state in the `CONTEXT` in memory, not the upper halves (the emulator keeps those itself).
 - **Checked against the real thing**: `tests/AvxTest.cpp` assembles about 1,400 instruction forms with `llvm-mc` (`tests/data/emulation/avx_cases_gen.py`), runs each on the host
   and on the emulator from the same random state (80,000+ comparisons per run: all vector registers, written general registers, flags, MXCSR flags except DE, the memory operand)
@@ -177,7 +201,7 @@ programs built with `-march=haswell` (or x86-64-v3) run. `X86_64Vex.cpp` holds a
 - **SSSE3 and SSE4.1/4.2 with the `0F 38` / `0F 3A` escapes** (`legacy_sse_map` in `X86_64Vex.cpp`): these are the same instructions as the VEX ones with the destination
   also the first source, so `0F 38 xx` and `0F 3A xx` hand the opcode to `vex_map2`/`vex_map3` as a 128-bit operation with `vvvv = reg`, and the upper halves of the YMM registers
   are put back afterwards (legacy SSE leaves them alone). An allow list names the opcodes that exist without a prefix, so a VEX-only opcode (`vbroadcastss`, `vinserti128`,
-  ...) is still an invalid instruction without one. Only the 66-prefixed (XMM) forms exist; the MMX ones fault.
+  ...) is still an invalid instruction without one. The 66-prefixed (XMM) forms go through this path; the prefix-less ones are the MMX forms (`X86_64Mmx.cpp`, below).
 - **What was written new** (shared by the VEX and legacy forms): `dpps`/`dppd` (products rounded one by one, summed as (p0+p1)+(p2+p3)), `mpsadbw`, `phminposuw`,
   `pcmpestri/m` and `pcmpistri/m` (all four aggregations, both polarities, bytes or words, signed or unsigned; the flags and ECX/XMM0 results as the SDM defines them; explicit
   lengths from RAX/RDX honoring REX.W), `crc32` (CRC-32C, 8/16/32/64-bit sources), and the legacy-only `blendvps/pd` and `pblendvb` (the selector is XMM0).

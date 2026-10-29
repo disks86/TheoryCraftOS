@@ -205,6 +205,7 @@ static void test_instructions_against_host(int iterations) {
   ops.push_back({"fld m32", {0xD9}, 0, true}); ops.push_back({"fst m32", {0xD9}, 2, true}); ops.push_back({"fstp m32", {0xD9}, 3, true});
   ops.push_back({"fild m32", {0xDB}, 0, true}); ops.push_back({"fisttp m32", {0xDB}, 1, true}); ops.push_back({"fist m32", {0xDB}, 2, true}); ops.push_back({"fistp m32", {0xDB}, 3, true});
   ops.push_back({"fld m80", {0xDB}, 5, true}); ops.push_back({"fstp m80", {0xDB}, 7, true});
+  ops.push_back({"fbld m80", {0xDF}, 4, true}); ops.push_back({"fbstp m80", {0xDF}, 6, true});
   ops.push_back({"fld m64", {0xDD}, 0, true}); ops.push_back({"fisttp m64", {0xDD}, 1, true}); ops.push_back({"fst m64", {0xDD}, 2, true}); ops.push_back({"fstp m64", {0xDD}, 3, true});
   ops.push_back({"fild m16", {0xDF}, 0, true}); ops.push_back({"fisttp m16", {0xDF}, 1, true}); ops.push_back({"fist m16", {0xDF}, 2, true}); ops.push_back({"fistp m16", {0xDF}, 3, true});
   ops.push_back({"fild m64", {0xDF}, 5, true}); ops.push_back({"fistp m64", {0xDF}, 7, true});
@@ -225,11 +226,19 @@ static void test_instructions_against_host(int iterations) {
     memcpy(data + 0x340, &operand, 8);
     Ext m80 = rnd_ext(0); if (bad_operand(m80)) m80 = Ext{0x8000000000000000ull, 0x3FFF};
     if (op.mem && op.enc[0] == 0xDB && op.reg == 5) { memcpy(data + 0x340, &m80.mant, 8); memcpy(data + 0x348, &m80.se, 2); }
+    if (op.mem && op.enc[0] == 0xDF && op.reg == 4) {      // fbld: valid packed decimal (eighteen digits, with leading zeros often), then the sign byte
+      const int digits = (rnd() & 1) ? 18 : int(rnd() % 19);
+      for (int b = 0; b < 9; ++b) {
+        const int lo = 2 * b < digits ? int(rnd() % 10) : 0, hi = 2 * b + 1 < digits ? int(rnd() % 10) : 0;
+        data[0x340 + b] = uint8_t(lo | (hi << 4));
+      }
+      data[0x349] = (rnd() & 1) ? 0x80 : 0;
+    }
     Bytes code;
     emit_setup(code, depth);
     if (op.mem) {
       const bool store_op = (op.enc[0] == 0xD9 && (op.reg == 2 || op.reg == 3)) || (op.enc[0] == 0xDB && (op.reg == 1 || op.reg == 2 || op.reg == 3 || op.reg == 7)) ||
-                            (op.enc[0] == 0xDD && (op.reg == 1 || op.reg == 2 || op.reg == 3)) || (op.enc[0] == 0xDF && (op.reg == 1 || op.reg == 2 || op.reg == 3 || op.reg == 7));
+                            (op.enc[0] == 0xDD && (op.reg == 1 || op.reg == 2 || op.reg == 3)) || (op.enc[0] == 0xDF && (op.reg == 1 || op.reg == 2 || op.reg == 3 || op.reg == 6 || op.reg == 7));
       mem_op(code, {op.enc[0]}, op.reg, store_op ? kOut : 0x340);
     } else {
       for (uint8_t b : op.enc) code.push_back(b);

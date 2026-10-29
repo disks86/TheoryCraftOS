@@ -75,6 +75,12 @@ const EvexOp kEvexOps[] = {
     {2, 3, 0x68, -1, kVp2Intersect, 0, 0, kFull},
     {2, 3, 0x9A, 0, kFma4, 0, 32, kTuple4}, {2, 3, 0xAA, 0, kFma4, 2, 32, kTuple4}, {2, 3, 0x9B, 0, kFma4, 1, 32, kTuple4}, {2, 3, 0xAB, 0, kFma4, 3, 32, kTuple4},      // Xeon Phi 4FMAPS
     {2, 3, 0x52, 0, kVnni4, 0, 32, kTuple4}, {2, 3, 0x53, 0, kVnni4, 1, 32, kTuple4},      // Xeon Phi 4VNNIW
+    // AVX-512 ER (Xeon Phi): vexp2, vrcp28, vrsqrt28
+    {2, 1, 0xC8, 0, kEr, 0, 32, kFull}, {2, 1, 0xC8, 1, kEr, 0, 64, kFull}, {2, 1, 0xCA, 0, kEr, 1, 32, kFull}, {2, 1, 0xCA, 1, kEr, 1, 64, kFull}, {2, 1, 0xCB, 0, kEr, 1, 32, kScalar}, {2, 1, 0xCB, 1, kEr, 1, 64, kScalar},
+    {2, 1, 0xCC, 0, kEr, 2, 32, kFull}, {2, 1, 0xCC, 1, kEr, 2, 64, kFull}, {2, 1, 0xCD, 0, kEr, 2, 32, kScalar}, {2, 1, 0xCD, 1, kEr, 2, 64, kScalar},
+    // AVX-VNNI-INT8 / INT16 (sub: bit 4 = 16-bit elements, bit 3 = src1 signed, bit 2 = src2 signed, bit 0 = saturate)
+    {2, 3, 0x50, 0, kDot, 12, 32, kFull}, {2, 3, 0x51, 0, kDot, 13, 32, kFull}, {2, 2, 0x50, 0, kDot, 8, 32, kFull}, {2, 2, 0x51, 0, kDot, 9, 32, kFull}, {2, 0, 0x50, 0, kDot, 0, 32, kFull}, {2, 0, 0x51, 0, kDot, 1, 32, kFull},
+    {2, 2, 0xD2, 0, kDot, 24, 32, kFull}, {2, 2, 0xD3, 0, kDot, 25, 32, kFull}, {2, 1, 0xD2, 0, kDot, 20, 32, kFull}, {2, 1, 0xD3, 0, kDot, 21, 32, kFull}, {2, 0, 0xD2, 0, kDot, 16, 32, kFull}, {2, 0, 0xD3, 0, kDot, 17, 32, kFull},
     {2, 2, 0x26, 0, kTest, 1, 8, kFullMem}, {2, 2, 0x26, 1, kTest, 1, 16, kFullMem}, {2, 2, 0x27, 0, kTest, 1, 32, kFull}, {2, 2, 0x27, 1, kTest, 1, 64, kFull},
     {3, 1, 0x25, 0, kTernlog, 0, 32, kFull}, {3, 1, 0x25, 1, kTernlog, 0, 64, kFull},
     // shuffles and permutes (sub of kShufImm: 0 vpshufd, 1 vpshufhw, 2 vpshuflw, 3 vpermilps, 4 vpermilpd, 5 vpermq/vpermpd by immediate)
@@ -515,6 +521,14 @@ X86_64Cpu::Step X86_64Cpu::step_evex(GuestMemory& m) {
     const EvexOp& o = kEvexFp16Ops[i];
     if (o.map == map && o.pp == pp && o.opcode == opcode && (o.w < 0 || o.w == static_cast<int>(w))) def = &o;
   }
+  if (!def && map == 2 && pp == 1 && (opcode == 0xC6 || opcode == 0xC7)) {      // AVX-512 PF: vgather/vscatterpf0/1 d/q ps/pd: prefetch hints, they do nothing and cannot fault
+    if (!decode_modrm()) return bad_decode();
+    const uint32_t kind = d_.reg & 7;
+    if (!finish_decode()) return bad_decode();
+    if (d_.mod == 3 || (kind != 1 && kind != 2 && kind != 5 && kind != 6) || vl != 512) return fail(6);
+    s_.rip += d_.position;
+    return Step::Ok;
+  }
   if (!def) return fail(6);
   const uint32_t elem = def->elem ? def->elem : (w ? 64 : 32);
 
@@ -586,7 +600,8 @@ X86_64Cpu::Step X86_64Cpu::step_evex(GuestMemory& m) {
       return evex_fp(m, *def);
     case kComplex: return evex_fp16(m, *def);
     case kFma4: return evex_fp(m, *def);
-    case kVnni: case kMadd52: case kMultishift: case kShufBit: case kShift2: case kShift2Var: case kGfAffine: case kGfMul: case kBf16: case kAesNi: case kClmul: case kBroadcastMask: case kDbpsadbw:
+    case kEr: return evex_er(m, *def);
+    case kDot: case kVnni: case kMadd52: case kMultishift: case kShufBit: case kShift2: case kShift2Var: case kGfAffine: case kGfMul: case kBf16: case kAesNi: case kClmul: case kBroadcastMask: case kDbpsadbw:
       return evex_ext(m, *def);
     default: return evex_misc(m, *def);
   }

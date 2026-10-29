@@ -632,7 +632,39 @@ X86_64Cpu::Step X86_64Cpu::step_x87(GuestMemory& m, uint8_t op) {
             x87_pop();
             return done();
           }
-          default: return fail(6);      // fbld and fbstp (packed decimal) are not emulated
+          case 4: {      // fbld m80: eighteen packed decimal digits and a sign byte
+            uint8_t raw[10];
+            if (!m.read(memory_address(), ByteView(raw, 10))) return fail(14, memory_address(), 0);
+            uint64_t value = 0;
+            for (int b = 8; b >= 0; --b) value = value * 100 + (raw[b] >> 4) * 10 + (raw[b] & 15);
+            const bool negative = (raw[9] & 0x80) != 0;
+            Ext loaded = from_integer(static_cast<int64_t>(value));
+            if (negative) loaded.se |= 0x8000;
+            x87_push(loaded, env);
+            return done();
+          }
+          case 6: {      // fbstp m80: the integer nearest per the rounding mode, as at most eighteen decimal digits; anything larger stores the "packed decimal indefinite"
+            const Ext a = x87_read(0, env);
+            int64_t out = 0;
+            const bool ok = to_integer(a, 64, env.mode, env, &out);
+            uint8_t raw[10] = {};
+            const uint64_t magnitude = out < 0 ? uint64_t{0} - static_cast<uint64_t>(out) : static_cast<uint64_t>(out);
+            if (!ok || magnitude > 999999999999999999ull) {
+              env.flags |= softfloat::kInvalid;
+              raw[7] = 0xC0; raw[8] = 0xFF; raw[9] = 0xFF;
+            } else {
+              uint64_t rest = magnitude;
+              for (int b = 0; b < 9; ++b) {
+                raw[b] = static_cast<uint8_t>((rest % 10) | (((rest / 10) % 10) << 4));
+                rest /= 100;
+              }
+              if (a.sign()) raw[9] = 0x80;
+            }
+            if (!m.write(memory_address(), ConstByteView(raw, 10))) return fail(14, memory_address(), 2);
+            x87_pop();
+            return done();
+          }
+          default: return fail(6);
         }
       }
       switch (reg) {
