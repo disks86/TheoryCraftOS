@@ -57,6 +57,7 @@ struct ShaderInfo {
   uint32_t ps_input_enable = 0;                // pixel shader: SPI_PS_INPUT_ENA
   uint32_t attributes_used = 0;                // vertex shader: bit i when attribute i is fetched
   uint32_t samplers_used = 0;                  // pixel shader: bit i when sampler i is used
+  uint32_t color_outputs = 1;                  // pixel shader: the colours it exports, 1 (COLOR[0]) or 2 (COLOR[1] too: the second source of dual source blending)
   uint32_t const_rows = 0;                     // the constant rows read (the highest + 1)
   bool kills = false;
   uint32_t code_dwords = 0;

@@ -70,6 +70,7 @@ static const char* kVertex =
     "VERT\nDCL IN[0]\nDCL IN[1]\nDCL OUT[0], POSITION\nDCL OUT[1], GENERIC[0]\nDCL CONST[0..3]\nDCL TEMP[0]\n"
     "  0: MUL TEMP[0], CONST[0], IN[0].xxxx\n  1: MAD TEMP[0], CONST[1], IN[0].yyyy, TEMP[0]\n  2: MAD TEMP[0], CONST[2], IN[0].zzzz, TEMP[0]\n  3: ADD OUT[0], TEMP[0], CONST[3]\n  4: MOV OUT[1], IN[1]\n  5: END\n";
 static const char* kTexFragment = "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\nDCL SAMP[0]\nDCL SVIEW[0], 2D, FLOAT\n  0: TEX OUT[0], IN[0], SAMP[0], 2D\n  1: END\n";
+static const char* kDualFragment = "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\nDCL OUT[1], COLOR[1]\nDCL CONST[0]\n  0: MOV OUT[0], IN[0]\n  1: MOV OUT[1], CONST[0]\n  2: END\n";
 static const char* kFragment = "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\n  0: MOV OUT[0], IN[0]\n  1: END\n";
 
 struct Program {
@@ -91,14 +92,17 @@ static void compile(allocators::IAllocator& alloc, const char* text, Program* ou
 }
 
 constexpr uint64_t kVsAddr = 0x100000, kPsAddr = 0x101000, kVsConst = 0x200000, kPsConst = 0x200400, kTable = 0x300000, kVertices = 0x400000, kIndices = 0x500000, kFence = 0x600000;
+constexpr uint64_t kPsAddr3 = 0x103000;
 constexpr uint64_t kTarget = 0x1000000, kDepthPlane = 0x2000000, kStencilPlane = 0x3000000, kTexture = 0x4000000, kPsAddr2 = 0x102000;
 constexpr uint32_t kWidth = 40, kHeight = 30, kPitch = 48, kPaddedHeight = 32;
 
 struct Rig {
   TestAllocator alloc;
-  Program vs, ps, tps;
+  Program vs, ps, tps, dps;
   Memory mem;
-  Rig() : vs(alloc), ps(alloc), tps(alloc) {
+  Rig() : vs(alloc), ps(alloc), tps(alloc), dps(alloc) {
+    compile(alloc, kDualFragment, &dps);
+    mem.put(kPsAddr3, ArrayView<const uint32_t>(dps.words.view().data(), dps.words.count()));
     compile(alloc, kVertex, &vs);
     compile(alloc, kFragment, &ps);
     compile(alloc, kTexFragment, &tps);
@@ -594,6 +598,67 @@ static void test_faces_and_bounds(Rig& rig) {
   CHECK(cp2.execute(ArrayView<const uint32_t>(buf, n + extra.count())) == CommandProcessorModel::Result::Unsupported);
 }
 
+// Dual source blending through the registers: the shader's second colour export, COL1 in SPI_SHADER_COL_FORMAT, both colours in CB_SHADER_MASK, the SRC1 factors in CB_BLEND0_CONTROL
+static void test_dual_source(Rig& rig) {
+  const float v[21] = {-1, -1, 0, 1, 0, 0, 0.25f, 3, -1, 0, 1, 0, 0, 0.25f, -1, 3, 0, 1, 0, 0, 0.25f};
+  rig.set_vertices(v, 3);
+  const float second[4] = {0.5f, 0.25f, 0.75f, 0.4f};
+  for (int k = 0; k < 4; ++k) { uint32_t b; memcpy(&b, &second[k], 4); rig.mem.words[kPsConst + 4 * k] = b; }
+  const float clear[4] = {0, 0, 1, 1};
+  for (uint32_t y = 0; y < kPaddedHeight; ++y)
+    for (uint32_t x = 0; x < kPitch; ++x)
+      for (uint32_t c = 0; c < 4; ++c) { uint32_t b; memcpy(&b, &clear[c], 4); rig.mem.words[kTarget + (static_cast<uint64_t>(y) * kPitch + x) * 16 + 4 * c] = b; }
+  DrawState s = rig.state(3);
+  s.pixel.address = kPsAddr3;
+  s.pixel.info = rig.dps.info;
+  s.blend.enable = true;
+  s.blend.color_src = 1;
+  s.blend.color_dst = 16;                     // 1 - src1 colour
+  uint32_t buf[512];
+  bool ok;
+  const uint32_t n = build(s, buf, 512, &ok);
+  CHECK(ok);
+  CommandProcessorModel cp(rig.alloc, rig.mem);
+  const auto res = cp.execute(ArrayView<const uint32_t>(buf, n));
+  if (res != CommandProcessorModel::Result::Ok) printf("result: %s\n", CommandProcessorModel::result_name(res));
+  CHECK(res == CommandProcessorModel::Result::Ok);
+  CHECK(cp.context_reg(0xa1c5) == (9u | (9u << 4)) && cp.context_reg(0xa08f) == 0xFF && cp.context_reg(0xa08e) == 0xF);
+  CHECK((cp.context_reg(0xa1e0) & 0x1F) == 1 && ((cp.context_reg(0xa1e0) >> 8) & 0x1F) == 16);
+  // red 1 + 0, green 0, blue 0 + 1 * (1 - 0.75), alpha 0.25 + 1 * (1 - 0.4)
+  CHECK(rig.pixel(10, 10, 0) == 1.0f && rig.pixel(10, 10, 1) == 0.0f && rig.pixel(10, 10, 2) == 0.25f && rig.pixel(10, 10, 3) == 0.25f + 0.6f);
+  // every prefix and every flipped bit of the stream: a result, no crash
+  for (uint32_t cut = 0; cut <= n; ++cut) { CommandProcessorModel c2(rig.alloc, rig.mem); (void)c2.execute(ArrayView<const uint32_t>(buf, cut)); }
+  for (uint32_t i = 0; i < n; ++i)
+    for (uint32_t bit = 0; bit < 32; ++bit) {
+      uint32_t copy[512];
+      memcpy(copy, buf, n * 4);
+      copy[i] ^= 1u << bit;
+      CommandProcessorModel c2(rig.alloc, rig.mem);
+      (void)c2.execute(ArrayView<const uint32_t>(copy, n));
+    }
+  // the single colour shader with the same blend is refused when the state is built; the model refuses a missing second colour format, and dual factors with one colour enabled
+  DrawState single = rig.state(3);
+  single.blend = s.blend;
+  CHECK(refused(single));
+  // the same registers with the second colour's format dropped: refused
+  { uint32_t b2[600];
+    bool ok2;
+    const uint32_t m = build(s, b2, 512, &ok2);
+    Pm4Writer w(ArrayView<uint32_t>(b2 + m, 600 - m));
+    w.set_context_reg(0xa1c5, 9);
+    w.draw_index_auto(3);
+    CommandProcessorModel cp3(rig.alloc, rig.mem);
+    CHECK(ok2 && w.ok() && cp3.execute(ArrayView<const uint32_t>(b2, m + w.count())) == CommandProcessorModel::Result::Unsupported); }
+  { uint32_t b2[600];
+    bool ok2;
+    const uint32_t m = build(s, b2, 512, &ok2);
+    Pm4Writer w(ArrayView<uint32_t>(b2 + m, 600 - m));
+    w.set_context_reg(0xa08f, 0xF);                           // one colour enabled, but dual source factors in the blend
+    w.draw_index_auto(3);
+    CommandProcessorModel cp3(rig.alloc, rig.mem);
+    CHECK(ok2 && w.ok() && cp3.execute(ArrayView<const uint32_t>(b2, m + w.count())) == CommandProcessorModel::Result::Unsupported); }
+}
+
 // every prefix of the stream, and every bit of every dword flipped: a result each time, no crash and no sanitizer report
 static void test_damage(Rig& rig) {
   rig.set_vertices(kTriangle, 3);
@@ -626,7 +691,7 @@ static void test_damage(Rig& rig) {
 
 int main() {
   Rig rig;
-  if (!rig.vs.ok || !rig.ps.ok || !rig.tps.ok) { printf("FAILED: the shaders did not compile\n"); return 1; }
+  if (!rig.vs.ok || !rig.ps.ok || !rig.tps.ok || !rig.dps.ok) { printf("FAILED: the shaders did not compile\n"); return 1; }
   test_registers(rig);
   { Rig r; test_indexed_and_scissor(r); }
   { Rig r; test_refusals(r); }
@@ -634,6 +699,7 @@ int main() {
   { Rig r; test_backend(r); }
   { Rig r; test_texture(r); }
   { Rig r; test_faces_and_bounds(r); }
+  { Rig r; test_dual_source(r); }
   { Rig r; test_damage_backend(r); }
   printf(g_failed ? "GcnCpTest: %d FAILED\n" : "GcnCpTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
