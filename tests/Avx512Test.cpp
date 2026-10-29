@@ -74,6 +74,26 @@ static void gpr_dump(Bytes& b) {
   mem(b, {0x0F, 0xAE}, 3, kMxcsrOut);
 }
 
+
+// MXCSR.DAZ / FTZ coverage: half of the cases run with each of those bits set, and the data is often rich in denormals and tiny numbers (NO_DAZFTZ=1 turns this off).
+static bool daz_ftz_enabled() { static const bool on = getenv("NO_DAZFTZ") == nullptr; return on; }
+static void denormalize(uint8_t* p, size_t bytes) {
+  for (size_t i = 0; i + 8 <= bytes; i += 8) {
+    uint64_t v;
+    memcpy(&v, p + i, 8);
+    const uint64_t r = rnd(), sign = rnd();
+    switch (rnd() % 6) {
+      case 0: v = ((sign & 1) << 31) | (r & 0x7FFFFF); v |= (((sign >> 1) & 1) << 63) | ((r >> 32) & 0x7FFFFF) << 32; break;      // two denormal floats
+      case 1: v = ((sign & 1) << 63) | (r & 0xFFFFFFFFFFFFFull); break;                                                            // a denormal double
+      case 2: v = ((sign & 1) << 31) | ((1 + r % 30) << 23) | ((r >> 8) & 0x7FFFFF); v |= (((sign >> 1) & 1) << 63) | ((1 + (r >> 40) % 30) << 23 | ((r >> 16) & 0x7FFFFF)) << 32; break;  // tiny floats
+      case 3: v = ((sign & 1) << 63) | ((1 + r % 40) << 52) | ((r >> 12) & 0xFFFFFFFFFFFFFull); break;                             // tiny doubles
+      case 4: v = ((sign & 1) << 31) | ((124 + r % 6) << 23) | ((r >> 8) & 0x7FFFFF); v |= (((sign >> 1) & 1) << 63) | ((124 + (r >> 40) % 6) << 23 | ((r >> 16) & 0x7FFFFF)) << 32; break;  // floats near 1
+      default: break;
+    }
+    memcpy(p + i, &v, 8);
+  }
+}
+
 static void fill_state(uint8_t* data, const Case& c) {
   memset(data, 0, 0x1000);
   for (int i = 0; i < 0x100; ++i) data[i] = uint8_t(rnd());
@@ -98,7 +118,12 @@ static void fill_state(uint8_t* data, const Case& c) {
     memcpy(data + kKin + 8 * i, &v, 8);
   }
   for (int i = 0; i < 3; ++i) { uint64_t v = rnd(); if (rnd() & 1) v &= 0xFF; if ((rnd() & 7) == 0) v = (rnd() & 1) ? ~0ull : 0; memcpy(data + kGpr + 8 * i, &v, 8); }
-  const uint32_t mxcsr = 0x1F80 | uint32_t((rnd() & 3) << 13);
+  uint32_t mxcsr = 0x1F80 | uint32_t((rnd() & 3) << 13);
+  if (daz_ftz_enabled()) {
+    mxcsr |= uint32_t((rnd() & 1) << 6) | uint32_t((rnd() & 1) << 15);
+    denormalize(data + kZin, 10 * 64);
+    if (rnd() & 1) denormalize(data, 0x100);
+  }
   memcpy(data + kMxcsrIn, &mxcsr, 4);
   for (int i = 0; i < 0x200; ++i) data[kTable + i] = uint8_t(rnd());
   // gathers and scatters: small indices in zmm2 and zmm18 (32-bit for the d forms, 64-bit for the q forms), so every address stays inside the table
@@ -230,6 +255,7 @@ static void test_state() {
 }
 
 int main(int argc, char** argv) {
+  if (getenv("AVX_SEED")) seed = strtoull(getenv("AVX_SEED"), nullptr, 0) | 1;
   test_state();
   test_robustness();
   const int rounds = argc > 1 ? atoi(argv[1]) : 4;
@@ -304,7 +330,7 @@ int main(int argc, char** argv) {
       if (!ok) {
         ++failures;
         static const char* last_reported = nullptr;
-        if (reported < 80 && last_reported != c.text) {
+        if (reported < (getenv("AVX_REPORT") ? 100000 : 80) && last_reported != c.text) {
           last_reported = c.text;
           ++reported;
           printf("%s%s\n", c.text, faulted ? "  [emulator fault]" : "");
@@ -314,7 +340,8 @@ int main(int argc, char** argv) {
             printf("   zmm%d host ", kRegs[i]); for (int b = 63; b >= 0; --b) printf("%02x", host[kZout + 64 * i + b]);
             printf("\n        emu  "); for (int b = 63; b >= 0; --b) printf("%02x", emu[kZout + 64 * i + b]); printf("\n");
             if (getenv("AVX_LANES")) { for (int l = 0; l < 16; ++l) { uint32_t h, e; memcpy(&h, host + kZout + 64 * i + 4 * l, 4); memcpy(&e, emu + kZout + 64 * i + 4 * l, 4); if (h == e) continue; printf("      lane %2d host %08x emu %08x  in:", l, h, e); for (int s = 0; s < 4; ++s) { uint32_t v; memcpy(&v, host + kZin + 64 * s + 4 * l, 4); printf(" z%d=%08x", kRegs[s], v); } printf("\n"); } }
-            if (getenv("AVX_VERBOSE")) { for (int s = 0; s < 4; ++s) { printf("        in zmm%d ", kRegs[s]); for (int b = 63; b >= 0; --b) printf("%02x", host[kZin + 64 * s + b]); printf("\n"); } }
+            if (getenv("AVX_VERBOSE")) { uint32_t mi; memcpy(&mi, host + kMxcsrIn, 4); printf("   mxcsr in %x\n", mi); }
+            if (getenv("AVX_VERBOSE")) { for (int s = 0; s < 10; ++s) { printf("        in zmm%d ", kRegs[s]); for (int b = 63; b >= 0; --b) printf("%02x", host[kZin + 64 * s + b]); printf("\n"); } }
           }
           for (int i = 0; i < 8; ++i) {
             uint64_t hk, ek; memcpy(&hk, host + kKout + 8 * i, 8); memcpy(&ek, emu + kKout + 8 * i, 8);
@@ -322,7 +349,7 @@ int main(int argc, char** argv) {
           }
           if ((hf & 0x8C5) != (ef & 0x8C5)) printf("   flags host %llx emu %llx\n", (unsigned long long)(hf & 0x8C5), (unsigned long long)(ef & 0x8C5));
           if (memcmp(host + kRegsOut, emu + kRegsOut, 24) != 0) { uint64_t h3[3], e3[3]; memcpy(h3, host + kRegsOut, 24); memcpy(e3, emu + kRegsOut, 24); printf("   gpr host %llx %llx %llx emu %llx %llx %llx\n", (unsigned long long)h3[0], (unsigned long long)h3[1], (unsigned long long)h3[2], (unsigned long long)e3[0], (unsigned long long)e3[1], (unsigned long long)e3[2]); }
-          if ((hm & flag_mask) != (em & flag_mask)) printf("   mxcsr host %x emu %x\n", hm & 0x3F, em & 0x3F);
+          if ((hm & flag_mask) != (em & flag_mask)) { uint32_t mi; memcpy(&mi, host + kMxcsrIn, 4); printf("   mxcsr host %x emu %x (in %x)\n", hm & 0x3F, em & 0x3F, mi); }
           if (memcmp(host, emu, 0x100) != 0) printf("   memory operand differs\n");
         }
       }

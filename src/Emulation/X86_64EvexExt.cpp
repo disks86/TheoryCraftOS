@@ -162,9 +162,8 @@ X86_64Cpu::Step X86_64Cpu::evex_ext(GuestMemory& m, const EvexOp& defn) {
           for (uint32_t kk = 0; kk < 2; ++kk) {
             const uint32_t k = 1 - kk;      // (the odd bf16 pair member is accumulated first)
             const uint64_t x = bfloat_to_float(static_cast<uint16_t>(element(a, 16, 2 * i + k))), y = bfloat_to_float(static_cast<uint16_t>(element(b, 16, 2 * i + k)));
-            const uint64_t prod = softfloat::mul(softfloat::Format::F32, x, y, env);
             if ((acc & 0x7F800000u) == 0) acc &= 0x80000000u;      // (denormals are flushed on input and output)
-            acc = softfloat::add(softfloat::Format::F32, acc, prod, env);
+            acc = softfloat::fused_multiply_add(softfloat::Format::F32, x, y, acc, env);      // (the product is not rounded to binary32 first: a huge one does not overflow before it is added)
             if ((acc & 0x7F800000u) == 0) acc &= 0x80000000u;
           }
           set_element(result, 32, i, acc);
