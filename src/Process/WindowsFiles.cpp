@@ -908,11 +908,17 @@ uint32_t nt_notify_change_directory_file(Process& p, const SyscallRequest& r) {
   }
   const uint32_t watch_id = object->change_watch;
   length &= 0xFFFFFFFFu;
-  if (buffer == 0 || length == 0) return kInvalidParameter;
+  if (r.args[1] == 2) {      // kernel32 starting an overlapped request: the watch is made, and what changed while nobody asked is forgotten
+    ObjectManager::WatchRecord stale[ObjectManager::kMaxWatchRecords];
+    uint32_t dropped = 0;
+    objects->take_watch_records(watch_id, stale, ObjectManager::kMaxWatchRecords, &dropped);
+    return kSuccess;
+  }
   ObjectManager::WatchRecord records[ObjectManager::kMaxWatchRecords];
   uint32_t taken = 0;
-  const uint32_t status = wait_until(p, ~uint64_t{0}, [&]() -> uint64_t {
-    if (!objects->take_watch_records(watch_id, records, ObjectManager::kMaxWatchRecords, &taken) || taken == 0) return kWaitPending;
+  // Event == 1 (kernel32's helper threads for overlapped requests): wait a tenth of a second and answer STATUS_TIMEOUT, so that the thread comes back to look whether its handle is still open.
+  const uint32_t status = wait_until(p, r.args[1] == 1 ? 100000000ull : ~uint64_t{0}, [&]() -> uint64_t {
+    if (!objects->take_watch_records_locked(watch_id, records, ObjectManager::kMaxWatchRecords, &taken) || taken == 0) return kWaitPending;
     return kSuccess;
   });
   if (status != kSuccess) return store_io_status(p, status_block, status, 0) ? status : kAccessViolation;
@@ -920,7 +926,7 @@ uint32_t nt_notify_change_directory_file(Process& p, const SyscallRequest& r) {
   // longword-aligned (like NtQueryDirectoryFile's own record chaining); a buffer too small to hold every record this call drained loses the rest (real Windows
   // instead keeps them for ERROR_MORE_DATA/the next overlapped completion - not implemented, acceptable given a bounded 32-pending-record cap per watch anyway).
   uint8_t record[12 + 2 * (ObjectManager::kWatchNameBytes)];
-  uint64_t used = 0, last_header = 0;
+  uint64_t used = 0, last_header = 0, last_size = 0;
   uint32_t written = 0;
   for (uint32_t i = 0; i < taken; ++i) {
     const uint64_t name_bytes = to_utf16(StringView(records[i].name, records[i].name_size), record + 12, sizeof(record) - 12);
@@ -937,10 +943,12 @@ uint32_t nt_notify_change_directory_file(Process& p, const SyscallRequest& r) {
     }
     if (!p.write_user(buffer + used, ConstByteView(record, size))) return kAccessViolation;
     last_header = used;
+    last_size = size;
     used += used + padded > length ? size : padded;
     ++written;
   }
-  return store_io_status(p, status_block, kSuccess, used) ? kSuccess : kAccessViolation;
+  if (written == 0) return store_io_status(p, status_block, 0x10Cu, 0) ? 0x10Cu : kAccessViolation;      // STATUS_NOTIFY_ENUM_DIR: not even one change fits; look at the directory
+  return store_io_status(p, status_block, kSuccess, last_header + last_size) ? kSuccess : kAccessViolation;
 }
 
 uint32_t nt_flush_buffers_file(Process& p, const SyscallRequest& r) {

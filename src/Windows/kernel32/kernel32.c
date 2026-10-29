@@ -1344,14 +1344,49 @@ EXPORT BOOL WINAPI WriteFileEx(HANDLE h, LPCVOID buffer, DWORD length, LPOVERLAP
 
 /* ReadDirectoryChangesW: done at once (there is no real asynchronous I/O here either) over NtNotifyChangeDirectoryFile; an overlapped call's event is set and its
  * completion routine, if any, queued as an ordinary APC exactly like ReadFileEx/WriteFileEx above. */
+EXPORT BOOL WINAPI DuplicateHandle(HANDLE sp, HANDLE source, HANDLE tp, HANDLE *target, DWORD access, BOOL inherit, DWORD options);
+EXPORT HANDLE WINAPI CreateThread(LPSECURITY_ATTRIBUTES sa, SIZE_T stack, LPTHREAD_START_ROUTINE start, LPVOID parameter, DWORD flags, LPDWORD id);
+typedef struct { HANDLE directory, caller; LPVOID buffer; DWORD length; BOOLEAN subtree; DWORD filter; LPOVERLAPPED overlapped; LPOVERLAPPED_COMPLETION_ROUTINE_ routine; } DirectoryRequest;
+/* An overlapped request waits for a change in a thread of its own (the kernel's calls are synchronous); when one comes the buffer, the overlapped structure and the event are
+   completed, and a completion routine runs as an APC of the thread that asked. */
+static DWORD WINAPI directory_request_thread(LPVOID parameter) {
+  DirectoryRequest request = *(DirectoryRequest *)parameter;
+  RtlFreeHeap(heap(), 0, parameter);
+  IO_STATUS_BLOCK iosb;
+  iosb.Information = 0;
+  NTSTATUS status;
+  do {      /* (waits a tenth of a second at a time: when the handle is closed the call fails and the thread ends) */
+    iosb.Information = 0;
+    status = NtNotifyChangeDirectoryFile(request.directory, (HANDLE)1, NULL, NULL, &iosb, request.buffer, request.length, request.filter, request.subtree);
+  } while (status == (NTSTATUS)0x102);
+  complete_overlapped(request.overlapped, status, iosb.Information);
+  if (request.routine) NtQueueApcThread(request.caller, (PVOID)completion_apc, (ULONG_PTR)request.routine, (ULONG_PTR)request.overlapped, 0);
+  else NtClose(request.caller);
+  return 0;
+}
 EXPORT BOOL WINAPI ReadDirectoryChangesW(HANDLE h, LPVOID buffer, DWORD length, BOOL watch_subtree, DWORD filter, LPDWORD bytes_returned, LPOVERLAPPED overlapped,
                                          LPOVERLAPPED_COMPLETION_ROUTINE_ routine) {
   IO_STATUS_BLOCK iosb;
+  if (filter == 0 || (filter & ~0x1FFu) || (!overlapped && (!buffer || length == 0))) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (overlapped) {
+    { const NTSTATUS registered = NtNotifyChangeDirectoryFile(h, (HANDLE)2, NULL, NULL, &iosb, NULL, 0, filter, (BOOLEAN)watch_subtree); if (!NT_SUCCESS(registered)) return fail_nt(registered); }      /* (this only makes the watch, so that changes from now on are kept) */
+    DirectoryRequest *request = RtlAllocateHeap(heap(), 0, sizeof(*request));
+    if (!request) { set_error(ERROR_NOT_ENOUGH_MEMORY); return FALSE; }
+    HANDLE caller = NULL;
+    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &caller, 0, FALSE, 2 /* DUPLICATE_SAME_ACCESS */)) { RtlFreeHeap(heap(), 0, request); return FALSE; }
+    request->directory = h; request->caller = caller; request->buffer = buffer; request->length = length; request->subtree = (BOOLEAN)watch_subtree;
+    request->filter = filter; request->overlapped = overlapped; request->routine = routine;
+    overlapped->Internal = (ULONG_PTR)STATUS_PENDING;
+    if (overlapped->hEvent) NtResetEvent((HANDLE)((ULONG_PTR)overlapped->hEvent & ~(ULONG_PTR)1), NULL);
+    HANDLE thread = CreateThread(NULL, 0, directory_request_thread, request, 0, NULL);
+    if (!thread) { NtClose(caller); RtlFreeHeap(heap(), 0, request); return FALSE; }
+    (void)thread;      /* the handle is not closed here: see the thread */
+    if (bytes_returned) *bytes_returned = 0;
+    return TRUE;
+  }
   const NTSTATUS status = NtNotifyChangeDirectoryFile(h, NULL, NULL, NULL, &iosb, buffer, length, filter, (BOOLEAN)watch_subtree);
-  complete_overlapped(overlapped, status, iosb.Information);
   if (!NT_SUCCESS(status)) { if (bytes_returned) *bytes_returned = 0; return fail_nt(status); }
   if (bytes_returned) *bytes_returned = (DWORD)iosb.Information;
-  if (overlapped && routine) NtQueueApcThread(NtCurrentThread(), (PVOID)completion_apc, (ULONG_PTR)routine, (ULONG_PTR)overlapped, 0);
   return TRUE;
 }
 
