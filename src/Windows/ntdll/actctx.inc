@@ -1343,6 +1343,20 @@ static SIZE_T write_dll_redirect(ActCtx *ctx, ActBlob *b, const ActEntry *e, ULO
   return blob_add(b, rec, 20);
 }
 
+/* The assembly section: a record per assembly, keyed by its encoded identity (the manifest's path and the flags follow the header). */
+static SIZE_T write_assembly(ActCtx *ctx, ActBlob *b, const ActEntry *e, ULONG *len) {
+  const ActAssembly *a = act_vec_at(&ctx->assemblies, e->assembly);
+  const SIZE_T at = blob_add(b, NULL, 20);
+  SIZE_T pb = 0;
+  const SIZE_T path_at = blob_wstr(b, a->manifest_path, &pb);
+  blob_put32(b, at, 20);
+  blob_put32(b, at + 4, a->flags);
+  blob_put32(b, at + 8, (ULONG)pb);
+  blob_put32(b, at + 12, (ULONG)(path_at - at));
+  *len = (ULONG)(b->len - at);
+  return at;
+}
+
 static SIZE_T write_wndclass(ActCtx *ctx, ActBlob *b, const ActEntry *e, ULONG *len) {
   const ActAssembly *a = act_vec_at(&ctx->assemblies, e->assembly);
   const ActWndClass *w = act_vec_at(&a->wndclasses, e->item);
@@ -1605,6 +1619,7 @@ static NTSTATUS act_build_string_section_g(ActCtx *ctx, int kind, ActVec *entrie
 }
 
 static NTSTATUS act_build_sections(ActCtx *ctx) {
+  ActVec asm_info = { 0, 0, 0, sizeof(ActEntry) };
   ActVec dll = { 0, 0, 0, sizeof(ActEntry) }, wnd = { 0, 0, 0, sizeof(ActEntry) }, win = { 0, 0, 0, sizeof(ActEntry) }, prog = { 0, 0, 0, sizeof(ActEntry) };
   ActVec com = { 0, 0, 0, sizeof(ActGEntry) }, ips = { 0, 0, 0, sizeof(ActGEntry) }, tlb = { 0, 0, 0, sizeof(ActGEntry) }, sur = { 0, 0, 0, sizeof(ActGEntry) };
   ActVec aliases = { 0, 0, 0, sizeof(ActGuid) };
@@ -1613,6 +1628,7 @@ static NTSTATUS act_build_sections(ActCtx *ctx) {
 #define ADD(vec, type, ...) do { type *e_ = act_vec_add(&vec); if (!e_) { status = SXS_CANT_GEN_ACTCTX; goto out; } *e_ = (type){ __VA_ARGS__ }; } while (0)
   for (ULONG i = 0; i < ctx->assemblies.count; ++i) {
     const ActAssembly *a = act_vec_at(&ctx->assemblies, i);
+    if (a->encoded) ADD(asm_info, ActEntry, a->encoded, i + 1, i, 0);
     for (ULONG k = 0; k < a->files.count; ++k) ADD(dll, ActEntry, ((ActFile *)act_vec_at(&a->files, k))->name, i + 1, i, k);
     for (ULONG k = 0; k < a->wndclasses.count; ++k) ADD(wnd, ActEntry, ((ActWndClass *)act_vec_at(&a->wndclasses, k))->name, i + 1, i, k);
     for (ULONG k = 0; k < a->winrts.count; ++k) ADD(win, ActEntry, ((ActWinrt *)act_vec_at(&a->winrts, k))->name, i + 1, i, k);
@@ -1640,7 +1656,8 @@ static NTSTATUS act_build_sections(ActCtx *ctx) {
     for (ULONG k = 0; k < a->surrogates.count; ++k) ADD(sur, ActGEntry, ((ActSurrogate *)act_vec_at(&a->surrogates, k))->clsid, i + 1, i, k, -1, NULL, 0);
   }
 #undef ADD
-  if (dll.count) status = act_build_string_section(ctx, ACT_SECTION_DLL_REDIRECTION, &dll, write_dll_redirect);
+  if (asm_info.count) status = act_build_string_section(ctx, ACT_SECTION_ASSEMBLY_INFORMATION, &asm_info, write_assembly);
+  if (!status && dll.count) status = act_build_string_section(ctx, ACT_SECTION_DLL_REDIRECTION, &dll, write_dll_redirect);
   if (!status && wnd.count) status = act_build_string_section(ctx, ACT_SECTION_WINDOW_CLASS, &wnd, write_wndclass);
   if (!status && win.count) { static const BYTE zero[8]; status = act_build_string_section_g(ctx, ACT_SECTION_WINRT_CLASSES, &win, write_winrt, zero, sizeof(zero), 0); }
   if (!status && prog.count) status = act_build_string_section_g(ctx, ACT_SECTION_COM_PROGID, &prog, write_progid, aliases.data, (SIZE_T)aliases.count * 16, 1);
@@ -1649,7 +1666,7 @@ static NTSTATUS act_build_sections(ActCtx *ctx) {
   if (!status && tlb.count) status = act_build_guid_section(ctx, ACT_SECTION_COM_TYPELIB, &tlb, write_typelib, 1, 0);
   if (!status && sur.count) status = act_build_guid_section(ctx, ACT_SECTION_CLR_SURROGATES, &sur, write_surrogate, 0, 0);
 out:
-  act_free(dll.data); act_free(wnd.data); act_free(win.data); act_free(prog.data);
+  act_free(asm_info.data); act_free(dll.data); act_free(wnd.data); act_free(win.data); act_free(prog.data);
   act_free(com.data); act_free(ips.data); act_free(tlb.data); act_free(sur.data); act_free(aliases.data);
   return status;
 }

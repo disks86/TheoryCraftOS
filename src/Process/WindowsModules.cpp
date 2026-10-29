@@ -41,6 +41,13 @@ uint32_t nt_load_module(Process& p, const SyscallRequest& r) {
   const uint64_t slash = path.view().rfind('\\');
   String canonical(p.files().allocator());
   if (!canonical_library_name(slash == StringView::npos ? path.view() : path.view().without_prefix(slash + 1), &canonical)) return kInvalidParameter;
+  if ((flags & 4) != 0) {      // a library of an activation context (an assembly's own copy): known by its file as well as its name, so two files of one name are two libraries
+    uint32_t hash = 2166136261u;
+    for (char c : path.view()) hash = (hash ^ uint8_t(c >= 'A' && c <= 'Z' ? c + 32 : c)) * 16777619u;
+    if (canonical.size() > 24 && !canonical.assign(canonical.view().first(24))) return kInvalidParameter;
+    if (!canonical.push_back('#')) return kInvalidParameter;
+    for (int shift = 28; shift >= 0; shift -= 4) if (!canonical.push_back("0123456789abcdef"[(hash >> shift) & 15])) return kInvalidParameter;
+  }
   uint64_t existing = 0;
   if (host->reference_module(canonical.view(), &existing)) {      // loaded already: one more use
     const uint8_t none[4] = {};

@@ -674,9 +674,15 @@ static LDR_DATA_TABLE_ENTRY *module_by_base(PVOID base) {
   return NULL;
 }
 /* A library by name, with or without ".dll", in any case ("KERNEL32", "kernel32.dll"). */
+static BOOL actctx_redirect(LPCWSTR name, WCHAR *out, DWORD capacity);
 static LDR_DATA_TABLE_ENTRY *module_by_name(LPCWSTR name) {
   PEB_LDR_DATA *ldr = NtCurrentPeb()->Ldr;
   if (!ldr) return NULL;
+  /* a bare name that the active activation context redirects is the library of that file; otherwise the libraries of contexts are not seen under their names */
+  WCHAR redirected[PATH_CHARS];
+  BOOL bare = TRUE;
+  for (const WCHAR *c = name; *c; ++c) if (*c == '\\' || *c == '/') bare = FALSE;
+  const BOOL has_redirect = bare && actctx_redirect(name, redirected, PATH_CHARS);
   size_t_ length = wcslen(name);
   /* A path: only the file name counts. */
   for (size_t_ i = 0; i < length; ++i) if (name[i] == '\\' || name[i] == '/') { name += i + 1; length -= i + 1; i = (size_t_)-1; }
@@ -691,7 +697,15 @@ static LDR_DATA_TABLE_ENTRY *module_by_name(LPCWSTR name) {
     if (compare != length) continue;
     size_t_ i = 0;
     while (i < length && upper(base[i]) == upper(name[i])) ++i;
-    if (i == length) return m;
+    if (i != length) continue;
+    if (has_redirect) {      /* only the library of that file */
+      const WCHAR *full = m->FullDllName.Buffer;
+      size_t_ k = 0;
+      const size_t_ full_length = m->FullDllName.Length / 2;
+      while (k < full_length && redirected[k] && upper(full[k]) == upper(redirected[k])) ++k;
+      if (!(m->Flags & 0x10000000) || k != full_length || redirected[k]) continue;
+    } else if (m->Flags & 0x10000000) continue;
+    return m;
   }
   return NULL;
 }
@@ -920,6 +934,14 @@ static HMODULE load_library_ex(LPCWSTR name, HANDLE file, DWORD flags) {
   if (file || !name || !name[0]) { set_error(ERROR_INVALID_PARAMETER); return NULL; }      /* (the file handle is reserved) */
   WCHAR path[PATH_CHARS];
   UNICODE_STRING us;
+  if (!(flags & 0x62) && !has_separator(name) && actctx_redirect(name, path, PATH_CHARS)) {      /* a library of the active activation context: that file, as a library of its own */
+    PVOID handle = NULL;
+    ULONG ldr_flags = ((flags & 1) ? 2 : 0) | 0x40000000;
+    unicode_string(&us, path);
+    const NTSTATUS status = LdrLoadDll(NULL, &ldr_flags, &us, &handle);
+    if (!NT_SUCCESS(status)) { set_error(dos_error_of_load(status)); return NULL; }
+    return (HMODULE)handle;
+  }
   /* The file, if there is one; otherwise the bare name (a library the process has already may be known by an alias, "api-ms-win-crt-runtime-l1-1-0.dll"): the kernel knows
      which libraries are loaded, and decides under the loader lock. */
   static const WCHAR dll[] = {'.', 'd', 'l', 'l', 0};

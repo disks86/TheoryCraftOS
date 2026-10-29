@@ -1151,7 +1151,7 @@ static void ldr_remove(LIST_ENTRY *e) {
 
 /* A loader entry for a library the kernel mapped: listed in the three module lists. `path` (a UNICODE_STRING) is the file the program asked for; a library that came in
  * because another imports it is in C:\Windows\System32. */
-static LDR_DATA_TABLE_ENTRY *ldr_add(const LoadRecord *record, const UNICODE_STRING *path, int mapped_only) {
+static LDR_DATA_TABLE_ENTRY *ldr_add(const LoadRecord *record, const UNICODE_STRING *path, int mapped_only, ULONG extra_flags) {
   {      /* a program image loaded as a library is only mapped, like a DONT_RESOLVE load */
     const BYTE *image = (const BYTE *)(ULONG_PTR)record->base;
     const ULONG nt = *(const ULONG *)(image + 0x3C);
@@ -1185,7 +1185,7 @@ static LDR_DATA_TABLE_ENTRY *ldr_add(const LoadRecord *record, const UNICODE_STR
   e->BaseDllName.Buffer = full + (full_length - base_length);
   e->BaseDllName.Length = (USHORT)(base_length * 2);
   e->BaseDllName.MaximumLength = (USHORT)(base_length * 2 + 2);
-  e->Flags = 0x4 | (mapped_only ? LDRP_MAPPED_ONLY : 0);      /* LDRP_IMAGE_DLL */
+  e->Flags = 0x4 | (mapped_only ? LDRP_MAPPED_ONLY : 0) | extra_flags;      /* LDRP_IMAGE_DLL */
   e->LoadCount = 1;
   {      /* TlsIndex: -1 when the image has thread-local data that was set up */
     const BYTE *image = (const BYTE *)e->DllBase;
@@ -1275,11 +1275,12 @@ static void ldr_release(PVOID base, int detach) {
 /* Loads the DLL file at `name` (a Win32 path; or just a library's name when it is loaded already) and what it imports; calls the entry points. */
 static NTSTATUS ldr_load_one(PULONG flags, PUNICODE_STRING name, PVOID *handle) {
   const int mapped_only = flags && (*flags & 2);      /* LDR_DONT_RESOLVE_REFS */
+  const int redirected = flags && (*flags & 0x40000000);      /* (ours) a library of an activation context: its own copy, whatever else of that name is loaded */
   LoadRecord records[MAX_LOAD_RECORDS];
   ULONG count = 0;
   PVOID base = NULL;
   loader_lock();
-  NTSTATUS status = NtLoadModule(name, &base, records, MAX_LOAD_RECORDS, &count, mapped_only ? 1 : 0);
+  NTSTATUS status = NtLoadModule(name, &base, records, MAX_LOAD_RECORDS, &count, (mapped_only ? 1 : 0) | (redirected ? 4 : 0));
   if (!NT_SUCCESS(status)) { loader_unlock(); return status; }
   if (count == 0) {      /* it was there: one more use (or a library the process started with) */
     *handle = base;
@@ -1289,7 +1290,7 @@ static NTSTATUS ldr_load_one(PULONG flags, PUNICODE_STRING name, PVOID *handle) 
   LDR_DATA_TABLE_ENTRY *added[MAX_LOAD_RECORDS];
   ULONG listed = 0;
   for (; listed < count; ++listed) {
-    added[listed] = ldr_add(&records[listed], records[listed].base == (ULONG64)(ULONG_PTR)base ? name : NULL, mapped_only);
+    added[listed] = ldr_add(&records[listed], records[listed].base == (ULONG64)(ULONG_PTR)base ? name : NULL, mapped_only, records[listed].base == (ULONG64)(ULONG_PTR)base && redirected ? 0x10000000u : 0);
     if (!added[listed]) break;
   }
   ULONG attached = 0;

@@ -92,7 +92,6 @@ EXPORT HANDLE WINAPI CreateActCtxW(const ActCtxW *param) {
   if ((p.dwFlags & ACTCTX_APPNAME_VALID) && need < 48) need = 48;
   if ((p.dwFlags & ACTCTX_HMODULE_VALID) && need < 56) need = 56;
   if (param->cbSize < need || (p.dwFlags & ~0xBFu) || ((p.dwFlags & ACTCTX_RESOURCE_VALID) && !p.lpResourceName)) { set_error(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE; }
-  if ((p.dwFlags & ACTCTX_HMODULE_VALID) && !(p.dwFlags & ACTCTX_RESOURCE_VALID)) { set_error(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE; }
   if (!p.lpSource && !(p.dwFlags & ACTCTX_HMODULE_VALID)) { set_error(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE; }
 
   WCHAR full[MAX_PATH], search_dir[MAX_PATH], app_dir[MAX_PATH];
@@ -104,20 +103,38 @@ EXPORT HANDLE WINAPI CreateActCtxW(const ActCtxW *param) {
   const WCHAR *dir = (p.dwFlags & ACTCTX_DIR_VALID) ? p.lpAssemblyDirectory : NULL;
   if (dir && !dir[0]) dir = NULL;
 
-  if (p.dwFlags & ACTCTX_RESOURCE_VALID) {      /* the manifest is a resource of a module (RT_MANIFEST = 24) */
+  /* a source that is an image (and no resource named) is used as a module too: its manifest has one of the well-known ids */
+  int image_source = 0;
+  if (!(p.dwFlags & (ACTCTX_RESOURCE_VALID | ACTCTX_HMODULE_VALID)) && p.lpSource) {
+    HANDLE probe = CreateFileW(p.lpSource, 0x80000000u, 7, NULL, 3, 0x80, NULL);
+    if (probe != INVALID_HANDLE_VALUE) {
+      BYTE head[2] = { 0, 0 };
+      DWORD got = 0;
+      if (ReadFile(probe, head, 2, &got, NULL) && got == 2 && head[0] == 'M' && head[1] == 'Z') image_source = 1;
+      CloseHandle(probe);
+    }
+  }
+  if ((p.dwFlags & (ACTCTX_RESOURCE_VALID | ACTCTX_HMODULE_VALID)) || image_source) {      /* the manifest is a resource of a module (RT_MANIFEST = 24) */
     HMODULE module = (p.dwFlags & ACTCTX_HMODULE_VALID) ? p.hModule : NULL;
     if (!module) {
       if (!p.lpSource) { set_error(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE; }
       module = loaded = LoadLibraryExW(p.lpSource, NULL, 0x2 /* LOAD_LIBRARY_AS_DATAFILE */);
       if (!module) return INVALID_HANDLE_VALUE;
     }
-    HRSRC r = FindResourceW(module, p.lpResourceName, (LPCWSTR)(ULONG_PTR)24);
+    HRSRC r = NULL;
+    if (p.dwFlags & ACTCTX_RESOURCE_VALID) r = FindResourceW(module, p.lpResourceName, (LPCWSTR)(ULONG_PTR)24);
+    else for (ULONG_PTR id = 1; id <= 3 && !r; ++id) r = FindResourceW(module, (LPCWSTR)id, (LPCWSTR)(ULONG_PTR)24);      /* (1, 2 or 3: the well-known ids) */
     if (r) {
       HGLOBAL g = LoadResource(module, r);
       manifest = g ? LockResource(g) : NULL;
       size = SizeofResource(module, r);
     }
-    if (!manifest) { const DWORD e = GetLastError(); if (loaded) FreeLibrary(loaded); set_error(e ? e : 1814); return INVALID_HANDLE_VALUE; }
+    if (!manifest) {
+      const DWORD e = (p.dwFlags & ACTCTX_RESOURCE_VALID) ? GetLastError() : 1813 /* ERROR_RESOURCE_TYPE_NOT_FOUND: none of the well-known ids is there */;
+      if (loaded) FreeLibrary(loaded);
+      set_error(e ? e : 1814);
+      return INVALID_HANDLE_VALUE;
+    }
     if (p.lpSource) GetFullPathNameW(p.lpSource, MAX_PATH, full, NULL);
     else GetModuleFileNameW(module, full, MAX_PATH);
     if (!dir) actctx_dir_of(full, search_dir, MAX_PATH);
@@ -224,4 +241,38 @@ EXPORT BOOL WINAPI FindActCtxSectionGuid(DWORD flags, const void *ext, ULONG kin
 EXPORT BOOL WINAPI QueryActCtxSettingsW(DWORD flags, HANDLE h, LPCWSTR ns, LPCWSTR name, LPWSTR buffer, SIZE_T size, SIZE_T *written) {
   const NTSTATUS s = RtlQueryActivationContextApplicationSettings(flags, h, ns, name, buffer, size, written);
   return NT_SUCCESS(s) ? TRUE : fail_nt(s);
+}
+
+/* The path a bare library name is redirected to by the active activation context (the process default when none is active): the directory of the assembly that has the file,
+ * and the file's name. */
+static BOOL actctx_redirect(LPCWSTR name, WCHAR *out, DWORD capacity) {
+  if (!name || !name[0]) return FALSE;
+  const SIZE_T n = wcslen(name);
+  WCHAR key[PATH_CHARS];
+  if (n + 5 > PATH_CHARS) return FALSE;
+  memcpy(key, name, (n + 1) * 2);
+  BOOL has_dot = FALSE;
+  for (SIZE_T i = 0; i < n; ++i) if (name[i] == '.') has_dot = TRUE;
+  if (!has_dot) { memcpy(key + n, L".dll", 10); }
+  struct { ULONG size, version; PVOID data; ULONG length; PVOID global; ULONG global_length; PVOID base; ULONG total; PVOID context; ULONG roster; } keyed;
+  memset(&keyed, 0, sizeof(keyed));
+  keyed.size = sizeof(keyed);
+  UNICODE_STRING us;
+  RtlInitUnicodeString(&us, key);
+  if (!NT_SUCCESS(RtlFindActivationContextSectionString(0, NULL, 2 /* ACTIVATION_CONTEXT_SECTION_DLL_REDIRECTION */, &us, &keyed))) return FALSE;
+  BYTE info[1024 + 120];
+  SIZE_T needed = 0;
+  ULONG roster = keyed.roster - 1;
+  (void)roster;
+  const ULONG index = keyed.roster;
+  if (!NT_SUCCESS(RtlQueryInformationActivationContext(4 /* USE_ACTIVE */, NULL, (PVOID)&index, 3, info, sizeof(info), &needed))) return FALSE;
+  const WCHAR *manifest = *(const WCHAR **)(info + 72);      /* lpAssemblyManifestPath */
+  if (!manifest) return FALSE;
+  SIZE_T dir = wcslen(manifest);
+  while (dir && manifest[dir - 1] != '\\' && manifest[dir - 1] != '/') --dir;
+  const SIZE_T file = wcslen(key);
+  if (dir + file + 1 > capacity) return FALSE;
+  memcpy(out, manifest, dir * 2);
+  memcpy(out + dir, key, (file + 1) * 2);
+  return TRUE;
 }
