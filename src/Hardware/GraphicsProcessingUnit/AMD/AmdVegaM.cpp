@@ -438,6 +438,41 @@ struct AuxSession {
   AuxSession(IVcnRegisters& registers, const IClock& clock, ConstByteView vbios, allocators::IAllocator& allocator, const AtomConnectors::Connector& connector)
       : host(registers, clock), bios(host, vbios, allocator), aux(host, bios, connector.ddc_id, connector.hpd_pin) {}
 };
+
+// amdgpu_atombios_dp_get_panel_mode: an eDP panel (or a DP bridge chip) whose DP_EDP_CONFIGURATION_CAP has the alternate scrambler reset bit is in the internal DP2 mode; the NUTMEG and
+// TRAVIS bridges without it are DP1; everything else is an external DP.
+uint8_t panel_mode_of(const AtomConnectors::Connector& connector, IDpcdAux& aux) {
+  uint8_t tmp = 0;
+  const uint8_t bridge = connector.bridge_object ? static_cast<uint8_t>(connector.bridge_object) : AtomConnectors::kEncoderNone;
+  if (bridge != AtomConnectors::kEncoderNone) {
+    if (!aux.dpcd_read(Dpcd::kEdpConfigurationCap, ByteView(&tmp, 1))) return AmdModeSet::kPanelModeExternalDp;
+    if (tmp & 1) return AmdModeSet::kPanelModeInternalDp2;
+    if (bridge == AtomConnectors::kEncoderNutmeg || bridge == AtomConnectors::kEncoderTravis) return AmdModeSet::kPanelModeInternalDp1;
+    return AmdModeSet::kPanelModeExternalDp;
+  }
+  if (connector.type == AtomConnectors::Type::EmbeddedDisplayPort && aux.dpcd_read(Dpcd::kEdpConfigurationCap, ByteView(&tmp, 1)) && (tmp & 1)) return AmdModeSet::kPanelModeInternalDp2;
+  return AmdModeSet::kPanelModeExternalDp;
+}
+
+// The training of a link in a session: the transmitter and encoder of the connector driven by AmdDpSource, the alternate scrambler for the internal DP2 panel mode.
+bool train_with(AuxSession& session, const AtomConnectors::Connector& connector, const Dpcd::Capabilities& caps, const DpLinkConfig& config, uint32_t pixel_clock_khz, uint32_t bpc,
+                uint8_t pll, uint8_t panel_mode, AmdVegaM::LinkTraining* result) {
+  DpSourceConfig source;
+  source.dig_encoder = AtomConnectors::dig_encoder(connector);
+  source.link_b = AtomConnectors::link_b(connector);
+  source.lanes = config.lanes;
+  source.rate_khz = config.rate_khz;
+  source.pixel_clock_khz = pixel_clock_khz;
+  source.connector_object_id = connector.object_id;
+  source.hpd = connector.hpd_pin;
+  source.bits_per_color = bpc;
+  source.pll = pll;
+  AmdDpSource dp(session.host, session.bios, source);
+  result->caps = caps;
+  result->config = config;
+  result->outcome = DpLinkTrainer::train(session.aux, dp, caps, config.bandwidth_code(), config.lanes, config.rate_index, panel_mode == AmdModeSet::kPanelModeInternalDp2);
+  return result->outcome.trained();
+}
 }  // namespace
 
 // An eDP panel does not answer on the AUX channel without power: the driver powers it up first and waits for the hot plug pin to show it. (If the wait times out the AUX channel is tried
@@ -474,7 +509,7 @@ bool AmdVegaM::read_dpcd(const AtomConnectors::Connector& connector, Dpcd::Capab
   return true;
 }
 
-bool AmdVegaM::train_link(const AtomConnectors::Connector& connector, uint32_t pixel_clock_khz, uint32_t bpc, LinkTraining* out) {
+bool AmdVegaM::train_link(const AtomConnectors::Connector& connector, uint32_t pixel_clock_khz, uint32_t bpc, LinkTraining* out, uint8_t pll) {
   if (!up() || !inputs_.registers || !inputs_.clock || !inputs_.allocator || !connector.has_ddc || !AtomConnectors::uses_aux(connector.type)) return false;
   const uint8_t dig = AtomConnectors::dig_encoder(connector);
   if (dig >= amd_dce11::AudioFormat::kBlocks) return false;          // (the DIGs of this card: the same six as the audio format blocks)
@@ -483,27 +518,188 @@ bool AmdVegaM::train_link(const AtomConnectors::Connector& connector, uint32_t p
   power_up_panel(connector, session.host, session.bios);
   LinkTraining result;
   if (!Dpcd::read_capabilities(session.aux, connector.type == AtomConnectors::Type::EmbeddedDisplayPort, &result.caps)) return false;
-  result.config = DpLinkConfig::choose(result.caps, pixel_clock_khz, bpc * 3);
-  DpSourceConfig source;
-  source.dig_encoder = dig;
-  source.link_b = AtomConnectors::link_b(connector);
-  source.lanes = result.config.lanes;
-  source.rate_khz = result.config.rate_khz;
-  source.pixel_clock_khz = pixel_clock_khz;
-  source.connector_object_id = connector.object_id;
-  source.hpd = connector.hpd_pin;
-  source.bits_per_color = bpc == 6 ? 1 : bpc == 10 ? 3 : bpc == 12 ? 4 : bpc == 16 ? 5 : 2;
-  AmdDpSource dp(session.host, session.bios, source);
-  result.outcome = DpLinkTrainer::train(session.aux, dp, result.caps, result.config.bandwidth_code(), result.config.lanes);
+  const DpLinkConfig config = DpLinkConfig::choose(result.caps, pixel_clock_khz, bpc * 3);
+  const uint8_t panel_mode = panel_mode_of(connector, session.aux);
+  const bool trained = train_with(session, connector, result.caps, config, pixel_clock_khz, bpc, pll, panel_mode, &result);
   if (out) *out = result;
   if (connector.hpd_pin < amd_dce11::Interrupts::kMaxHpd) {
     Trained& memory = trained_[connector.hpd_pin];
-    memory.valid = result.outcome.trained();
+    memory.valid = trained;
     memory.pixel_clock_khz = pixel_clock_khz;
     memory.bpc = bpc;
+    memory.pll = pll;
     memory.retrains = 0;
   }
-  return result.outcome.trained();
+  return trained;
+}
+
+namespace {
+// The video BIOS with the mode setting tables
+struct ModeSession {
+  PostHost host;
+  AtomBios bios;
+  AmdModeSet set;
+  ModeSession(IVcnRegisters& registers, const IClock& clock, ConstByteView vbios, allocators::IAllocator& allocator) : host(registers, clock), bios(host, vbios, allocator), set(host, bios) {}
+  // (a table the BIOS does not have is skipped, as the driver does by running a table that does not exist; one that is there must work)
+  bool optional(uint32_t table) { uint8_t frev = 0, crev = 0; return !bios.cmd_table_header(table, &frev, &crev); }
+};
+
+bool encoder_mode_of(AtomConnectors::Type type, uint8_t* mode) {
+  switch (type) {
+    case AtomConnectors::Type::DisplayPort:
+    case AtomConnectors::Type::EmbeddedDisplayPort: *mode = AmdModeSet::kModeDp; return true;
+    case AtomConnectors::Type::HdmiA:
+    case AtomConnectors::Type::HdmiB: *mode = AmdModeSet::kModeHdmi; return true;
+    case AtomConnectors::Type::DviD:
+    case AtomConnectors::Type::DviI: *mode = AmdModeSet::kModeDvi; return true;
+    case AtomConnectors::Type::Lvds: *mode = AmdModeSet::kModeLvds; return true;
+    default: return false;      // (analog outputs and TV are not DIG outputs)
+  }
+}
+
+ModeSetOutput output_of(const AtomConnectors::Connector& connector, uint8_t crtc, uint8_t encoder_mode, uint32_t bpc, uint8_t pll) {
+  ModeSetOutput o;
+  o.crtc = crtc;
+  o.pll = pll;
+  o.encoder_id = AtomConnectors::encoder_id(connector);
+  o.dig_encoder = AtomConnectors::dig_encoder(connector);
+  o.link_b = AtomConnectors::link_b(connector);
+  o.connector_object_id = connector.object_id;
+  o.hpd = connector.hpd_pin;
+  o.encoder_mode = encoder_mode;
+  o.dfp = encoder_mode != AmdModeSet::kModeLvds;
+  o.bits_per_color = bpc;
+  return o;
+}
+// amdgpu_atombios_encoder_setup_dig(ATOM_DISABLE): DisplayPort video off, the sink to D3, the transmitter disabled, the eDP panel off. (`aux`: the DisplayPort sink's AUX session, if any.)
+bool dig_off(ModeSession& session, AuxSession* aux, const AtomConnectors::Connector& connector, const ModeSetOutput& o, const DisplayMode& mode) {
+  AmdModeSet& set = session.set;
+  const bool dp = o.encoder_mode == AmdModeSet::kModeDp;
+  bool ok = true;
+  if (dp) ok = set.encoder(o, mode, AmdModeSet::kEncoderDpVideoOff) && ok;
+  if (dp && aux) {
+    Dpcd::Capabilities caps;
+    if (Dpcd::read_capabilities(aux->aux, connector.type == AtomConnectors::Type::EmbeddedDisplayPort, &caps) && caps.revision >= 0x11) {
+      const uint8_t d3 = Dpcd::kPowerD3;
+      aux->aux.dpcd_write(Dpcd::kSetPower, ConstByteView(&d3, 1));
+      session.host.delay_us(1000);
+    }
+  }
+  ok = set.transmitter(o, mode, AmdModeSet::kTransmitterDisable) && ok;
+  if (dp && connector.type == AtomConnectors::Type::EmbeddedDisplayPort) AmdPanelPower::power_off(session.bios);
+  return ok;
+}
+
+}  // namespace
+
+bool AmdVegaM::set_mode(const AtomConnectors::Connector& connector, uint8_t crtc, const DisplayMode& mode, uint32_t bpc, ModeSetResult* out, uint8_t pll) {
+  ModeSetResult result;
+  const auto finish = [&](ModeSetStage stage) {
+    result.failed = stage;
+    if (out) *out = result;
+    return stage == ModeSetStage::Done;
+  };
+  if (!up() || !inputs_.registers || !inputs_.clock || !inputs_.allocator) return finish(ModeSetStage::NotReady);
+  uint8_t encoder_mode = 0;
+  const uint8_t dig = AtomConnectors::dig_encoder(connector);
+  if (!encoder_mode_of(connector.type, &encoder_mode) || dig >= amd_dce11::AudioFormat::kBlocks || crtc >= AmdModeSet::kMaxCrtcs || mode.pixel_clock_khz == 0) return finish(ModeSetStage::Unsupported);
+  const bool dp = encoder_mode == AmdModeSet::kModeDp;
+  const bool edp = connector.type == AtomConnectors::Type::EmbeddedDisplayPort;
+  if (pll == AmdModeSet::kPllInvalid) pll = dp ? AmdModeSet::kPpll0 : (crtc & 1 ? AmdModeSet::kPpll2 : AmdModeSet::kPpll1);
+  result.pll = pll;
+  ModeSession session(*inputs_.registers, *inputs_.clock, inputs_.vbios, *inputs_.allocator);
+  if (!session.bios.valid()) return finish(ModeSetStage::Unsupported);
+  ModeSetOutput o = output_of(connector, crtc, encoder_mode, bpc, pll);
+  o.dual_link = encoder_mode == AmdModeSet::kModeDvi && mode.pixel_clock_khz > 165000;
+  AmdModeSet& set = session.set;
+  // the DisplayPort sink over its AUX channel
+  UniquePointer<AuxSession> aux;
+  Dpcd::Capabilities caps;
+  DpLinkConfig config;
+  // dce_v11_0_crtc_prepare: power gating off, the CRTC locked, then dpms off (blanked and disabled)
+  if ((!session.optional(AmdModeSet::kEnableDispPowerGating) && !set.powergate_crtc(crtc, false)) || (!session.optional(AmdModeSet::kUpdateDoubleBuffer) && !set.lock_crtc(crtc, true)) ||
+      !set.blank_crtc(crtc, true) || !set.enable_crtc(crtc, false)) return finish(ModeSetStage::Prepare);
+  // dce_v11_0_encoder_prepare: the eDP panel on, the CRTC's source; (before them the link configuration, which the driver made when the mode was fixed up)
+  if (dp) {
+    if (!connector.has_ddc) return finish(ModeSetStage::SinkCapabilities);
+    aux = UniquePointer<AuxSession>::make(*inputs_.allocator, *inputs_.registers, *inputs_.clock, inputs_.vbios, *inputs_.allocator, connector);
+    if (!aux || !aux->bios.valid()) return finish(ModeSetStage::SinkCapabilities);
+    power_up_panel(connector, aux->host, aux->bios);
+    if (!Dpcd::read_capabilities(aux->aux, edp, &caps)) return finish(ModeSetStage::SinkCapabilities);
+    config = DpLinkConfig::choose(caps, mode.pixel_clock_khz, bpc * 3);
+    if (config.lanes == 0) return finish(ModeSetStage::SinkCapabilities);
+    o.lanes = config.lanes;
+    o.link_rate_khz = config.rate_khz;
+    result.link.caps = caps;
+    result.link.config = config;
+    result.panel_mode = panel_mode_of(connector, aux->aux);
+  }
+  if (!set.select_crtc_source(o)) return finish(ModeSetStage::CrtcSource);
+  // dce_v11_0_crtc_mode_set: the pixel clock, the timing, (the base: the caller's), the overscan and the scaler
+  if (!set.set_pixel_clock(o, mode)) return finish(ModeSetStage::PixelClock);
+  if (!set.set_dtd_timing(o, mode)) return finish(ModeSetStage::Timing);
+  if (!session.optional(AmdModeSet::kSetCrtcOverscan) && !set.overscan_setup(o)) return finish(ModeSetStage::Overscan);
+  if (!session.optional(AmdModeSet::kEnableScaler) && !set.scaler_setup(o)) return finish(ModeSetStage::Scaler);
+  crtc_pll_[crtc] = pll;
+  // dce_v11_0_encoder_mode_set: the encoder off (setup_dig(ATOM_DISABLE))
+  if (!dig_off(session, aux.get(), connector, o, mode)) return finish(ModeSetStage::EncoderOff);
+  // dce_v11_0_crtc_commit: dpms on (enabled, unblanked), unlocked
+  if (!set.enable_crtc(crtc, true)) return finish(ModeSetStage::CrtcEnable);
+  if (!set.blank_crtc(crtc, false) || (!session.optional(AmdModeSet::kUpdateDoubleBuffer) && !set.lock_crtc(crtc, false))) return finish(ModeSetStage::Unblank);
+  // dce_v11_0_encoder_commit: setup_dig(ATOM_ENABLE)
+  if (!set.encoder(o, mode, AmdModeSet::kEncoderSetup)) return finish(ModeSetStage::EncoderSetup);
+  if (!set.encoder(o, mode, AmdModeSet::kEncoderSetupPanelMode, dp ? result.panel_mode : AmdModeSet::kPanelModeExternalDp)) return finish(ModeSetStage::PanelMode);
+  if (dp && edp) power_up_panel(connector, session.host, session.bios);
+  if (!set.transmitter(o, mode, AmdModeSet::kTransmitterEnable)) return finish(ModeSetStage::TransmitterEnable);
+  if (dp) {
+    const bool trained = train_with(*aux, connector, caps, config, mode.pixel_clock_khz, bpc, pll, result.panel_mode, &result.link);
+    if (connector.hpd_pin < amd_dce11::Interrupts::kMaxHpd) {
+      Trained& memory = trained_[connector.hpd_pin];
+      memory.valid = trained;
+      memory.pixel_clock_khz = mode.pixel_clock_khz;
+      memory.bpc = bpc;
+      memory.pll = pll;
+      memory.retrains = 0;
+    }
+    if (!trained) return finish(ModeSetStage::LinkTraining);
+    if (!set.encoder(o, mode, AmdModeSet::kEncoderDpVideoOn)) return finish(ModeSetStage::VideoOn);
+  }
+  return finish(ModeSetStage::Done);
+}
+
+bool AmdVegaM::disable_mode(const AtomConnectors::Connector& connector, uint8_t crtc) {
+  if (!up() || !inputs_.registers || !inputs_.clock || !inputs_.allocator || crtc >= AmdModeSet::kMaxCrtcs) return false;
+  uint8_t encoder_mode = 0;
+  if (!encoder_mode_of(connector.type, &encoder_mode) || AtomConnectors::dig_encoder(connector) >= amd_dce11::AudioFormat::kBlocks) return false;
+  ModeSession session(*inputs_.registers, *inputs_.clock, inputs_.vbios, *inputs_.allocator);
+  if (!session.bios.valid()) return false;
+  const uint8_t pll = crtc_pll_[crtc];
+  ModeSetOutput o = output_of(connector, crtc, encoder_mode, 8, pll);
+  const DisplayMode mode;
+  AmdModeSet& set = session.set;
+  UniquePointer<AuxSession> aux;
+  if (encoder_mode == AmdModeSet::kModeDp && connector.has_ddc && AtomI2c::lookup(inputs_.vbios, connector.ddc_id).valid)
+    aux = UniquePointer<AuxSession>::make(*inputs_.allocator, *inputs_.registers, *inputs_.clock, inputs_.vbios, *inputs_.allocator, connector);
+  if (aux && !aux->bios.valid()) aux = UniquePointer<AuxSession>();
+  // dce_v11_0_encoder_disable: dpms off; dce_v11_0_crtc_disable: dpms off (blanked, disabled), power gating on, the PLL off if no other CRTC uses it
+  bool ok = dig_off(session, aux.get(), connector, o, mode);
+  ok = set.blank_crtc(crtc, true) && ok;
+  ok = set.enable_crtc(crtc, false) && ok;
+  if (!session.optional(AmdModeSet::kEnableDispPowerGating)) ok = set.powergate_crtc(crtc, true) && ok;
+  crtc_pll_[crtc] = 0xFF;
+  if (pll != AmdModeSet::kPllInvalid) {
+    bool shared = false;
+    for (uint32_t i = 0; i < AmdModeSet::kMaxCrtcs; ++i) shared = shared || (i != crtc && crtc_pll_[i] == pll);
+    if (!shared) {
+      ModeSetOutput off;
+      off.crtc = crtc;
+      off.pll = pll;
+      off.encoder_mode = 0;
+      ok = set.set_pixel_clock(off, DisplayMode()) && ok;
+    }
+  }
+  if (connector.hpd_pin < amd_dce11::Interrupts::kMaxHpd) trained_[connector.hpd_pin] = Trained();
+  return ok;
 }
 
 uint32_t AmdVegaM::service_short_pulses(SinkEvent* out, uint32_t capacity) {
@@ -550,7 +746,8 @@ uint32_t AmdVegaM::service_short_pulses(SinkEvent* out, uint32_t capacity) {
               e.retrained = true;
               const uint32_t retrains = memory.retrains;
               const uint32_t clock = memory.pixel_clock_khz, bpc = memory.bpc;
-              const bool ok = train_link(e.connector, clock, bpc, &e.retrain);      // (forgets the count and, if it fails, the training)
+              const uint8_t memory_pll = memory.pll;
+              const bool ok = train_link(e.connector, clock, bpc, &e.retrain, memory_pll);      // (forgets the count and, if it fails, the training)
               if (trained_[pin].valid || ok) trained_[pin].retrains = retrains;
             }
           }

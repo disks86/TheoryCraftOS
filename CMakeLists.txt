@@ -699,6 +699,7 @@ add_executable(BOOTX64
   src/Hardware/GraphicsProcessingUnit/AMD/Dpcd.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/DpLinkTrain.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdDpSource.cpp
+  src/Hardware/GraphicsProcessingUnit/AMD/AmdModeSet.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdAsicReset.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdIrq.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdSdma3.cpp

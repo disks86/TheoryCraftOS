@@ -160,7 +160,7 @@ static void test_clean_training() {
     for (const std::string& s : r.log) printf("  %s\\n", s.c_str());
   }
   // the delays: 1 ms for the sink to wake, 400 us before clock recovery, then the default intervals (100 us, 400 us)
-  CHECK(r.delays == std::vector<uint32_t>({1000, 400, 100, 400}));
+  CHECK(r.delays == std::vector<uint32_t>({1000, 400, 100, 400, 400}));
   CHECK(o.train_set[0] == 0 && o.train_set[3] == 0);
 }
 
@@ -177,13 +177,13 @@ static void test_options() {
   CHECK(o.trained());
   CHECK(index_of(r.log, "w 0600=01") == r.log.size() && index_of(r.log, "w 0107=00") < r.log.size() && index_of(r.log, "w 0101=02") < r.log.size() && index_of(r.log, "w 0100=06") < r.log.size());
   CHECK(index_of(r.log, "pattern 02") < r.log.size() && index_of(r.log, "pattern 03") == r.log.size() && index_of(r.log, "w 0103=0000") < r.log.size());
-  CHECK(r.delays == std::vector<uint32_t>({400, 100, 400}));       // (no 1 ms after a power state write)
+  CHECK(r.delays == std::vector<uint32_t>({400, 100, 400, 400}));       // (no 1 ms after a power state write)
   // the read interval: 3 means 12 ms between the steps, both loops
   Rig s;
   caps = sink_caps();
   caps.training_read_interval = 3;
   CHECK(DpLinkTrainer::train(s, s, caps, 0x0A, 4).trained());
-  CHECK(s.delays == std::vector<uint32_t>({1000, 400, 12000, 12000}));
+  CHECK(s.delays == std::vector<uint32_t>({1000, 400, 12000, 12000, 400}));
   // one lane
   // exactly DPCD 1.1 has the power state
   Rig v11;
@@ -360,53 +360,133 @@ static void test_failures() {
 
 static void test_link_config() {
   Dpcd::Capabilities c = sink_caps();
-  // 1080p60 (148.5 MHz) at 24 bits: 2.7 Gbit/s on two lanes carries 270000 * 2 * 8 / 24 = 180000: the sink has four lanes, so two at 2.7
+  // amdgpu_atombios_dp_get_dp_link_config: the lowest rate first, then the fewest lanes. 1080p60 (148.5 MHz) at 24 bits: 1.62 Gbit/s carries 54000 per lane: four lanes (216000)
   DpLinkConfig k = DpLinkConfig::choose(c, 148500, 24);
-  CHECK(k.lanes == 2 && k.rate_khz == 270000 && k.bandwidth_code() == 10);
-  // 640x480 (25.175 MHz): one lane at 2.7 (90000 >= 25175)
+  CHECK(k.lanes == 4 && k.rate_khz == 162000 && k.bandwidth_code() == 6);
+  // 640x480 (25.175 MHz): one lane at 1.62
   k = DpLinkConfig::choose(c, 25175, 24);
-  CHECK(k.lanes == 1 && k.rate_khz == 270000);
-  // 4K60 (594 MHz): not at 2.7 on four lanes (360000): the first rate that does in the second loop: 5.4 on four lanes is 720000 >= 594000, at 5.4 on two lanes it is 360000: four
+  CHECK(k.lanes == 1 && k.rate_khz == 162000);
+  // 4K60 (594 MHz): 2.7 on four lanes is 360000, 5.4 on two lanes 360000, on four 720000
   k = DpLinkConfig::choose(c, 594000, 24);
   CHECK(k.lanes == 4 && k.rate_khz == 540000 && k.bandwidth_code() == 20);
-  // 4K30 (297 MHz): 5.4 on two lanes is 360000 >= 297000, but 2.7 on four lanes is 360000 as well, and comes first
+  // 4K30 (297 MHz): 2.7 on four lanes is 360000 and comes before 5.4
   k = DpLinkConfig::choose(c, 297000, 24);
   CHECK(k.lanes == 4 && k.rate_khz == 270000);
-  // a sink of two lanes: the first loop looks at one lane only
+  // 180 MHz: 1.62 on four lanes is 216000
+  k = DpLinkConfig::choose(c, 216000, 24);
+  CHECK(k.lanes == 4 && k.rate_khz == 162000);
+  k = DpLinkConfig::choose(c, 216001, 24);
+  CHECK(k.lanes == 4 && k.rate_khz == 270000);
+  // a sink of two lanes: 1.62 on two lanes is 108000, 2.7 on one lane 90000, on two 180000
   c.max_lanes = 2;
   k = DpLinkConfig::choose(c, 148500, 24);
   CHECK(k.lanes == 2 && k.rate_khz == 270000);
   k = DpLinkConfig::choose(c, 90000, 24);
-  CHECK(k.lanes == 1 && k.rate_khz == 270000);
-  // a one lane sink does not try the first loop: the lowest rate that carries it
+  CHECK(k.lanes == 2 && k.rate_khz == 162000);
+  // a one lane sink: the lowest rate that carries it
   c.max_lanes = 1;
   k = DpLinkConfig::choose(c, 25175, 24);
   CHECK(k.lanes == 1 && k.rate_khz == 162000);
   k = DpLinkConfig::choose(c, 100000, 24);
   CHECK(k.lanes == 1 && k.rate_khz == 540000);
-  // the carrying capacity is enough when it equals the clock: 90000 on one lane at 2.7 (first loop), and 54000 on one lane at 1.62 (second loop)
-  c = sink_caps();
-  k = DpLinkConfig::choose(c, 90000, 24);
-  CHECK(k.lanes == 1 && k.rate_khz == 270000);
-  c.max_lanes = 1;
+  // the carrying capacity is enough when it equals the clock: 54000 on one lane at 1.62, 54001 needs 2.7
   k = DpLinkConfig::choose(c, 54000, 24);
   CHECK(k.lanes == 1 && k.rate_khz == 162000);
   k = DpLinkConfig::choose(c, 54001, 24);
   CHECK(k.lanes == 1 && k.rate_khz == 270000);
-  // the sink's rate limits it: 1.62 Gbit/s on one lane carries 54000 (at 24 bits)
+  // the sink's rate limits it
   c = sink_caps();
   c.max_link_rate_code = 0x06;
   k = DpLinkConfig::choose(c, 148500, 24);
-  CHECK(k.lanes == 4 && k.rate_khz == 162000);       // (the sink cannot do 2.7, so the first loop is not tried: 4 * 54000 = 216000 carries it)
-  // nothing carries it: four lanes at the lowest rate
+  CHECK(k.lanes == 4 && k.rate_khz == 162000);
+  // nothing carries it: no lanes (the driver's -EINVAL, which sets the lane count and clock to 0)
   c = sink_caps();
   k = DpLinkConfig::choose(c, 2000000, 24);
-  CHECK(k.lanes == 4 && k.rate_khz == 162000);
-  // deeper colour needs more: 30 bits for 148.5 MHz is 270000 * 2 * 8 / 30 = 144000 < 148500: the first loop finds nothing, and in the second the lowest rate with four lanes is enough
+  CHECK(k.lanes == 0 && k.rate_khz == 0);
+  c.max_link_rate_code = 0x06;
+  k = DpLinkConfig::choose(c, 594000, 24);
+  CHECK(k.lanes == 0 && k.rate_khz == 0);
+  // deeper colour needs more: 30 bits for 148.5 MHz on four lanes at 1.62 is 172800
   k = DpLinkConfig::choose(sink_caps(), 148500, 30);
   CHECK(k.lanes == 4 && k.rate_khz == 162000);
+  k = DpLinkConfig::choose(sink_caps(), 200000, 30);
+  CHECK(k.lanes == 4 && k.rate_khz == 270000);
   // bits per pixel 0 is taken as 24
-  CHECK(DpLinkConfig::choose(sink_caps(), 148500, 0).lanes == 2);
+  CHECK(DpLinkConfig::choose(sink_caps(), 148500, 0).lanes == 4);
+  // training with no lanes is refused
+  Rig r;
+  CHECK(DpLinkTrainer::train(r, r, sink_caps(), 0, 0).result == DpLinkTrainer::Result::SinkSetup);
+}
+
+static void test_edp_rate_table() {
+  // an eDP 1.4 panel: rates 2.16 (not one the encoder takes), 1.62, 2.7, 5.4 in an unsorted table; two lanes
+  Dpcd::Capabilities c = sink_caps();
+  c.edp_revision = Dpcd::kEdp14;
+  c.max_lanes = 2;
+  c.edp_rate_count = 4;
+  c.edp_rates_khz[0] = 216000; c.edp_rates_khz[1] = 270000; c.edp_rates_khz[2] = 162000; c.edp_rates_khz[3] = 540000;
+  // 1080p60 at 24 bits: 1.62 needs 4 lanes, 2.7 two lanes (180000 >= 148500): the lowest rate that works is 2.7 (index 1), one lane is 90000
+  DpLinkConfig k = DpLinkConfig::choose(c, 148500, 24);
+  CHECK(k.lanes == 2 && k.rate_khz == 270000 && k.rate_index == 1 && k.bandwidth_code() == 0);
+  // a small mode: the lowest rate (index 2), one lane
+  k = DpLinkConfig::choose(c, 25175, 24);
+  CHECK(k.lanes == 1 && k.rate_khz == 162000 && k.rate_index == 2);
+  // 4K60 needs 5.4 on four lanes: not there (two lanes), so the highest rate on the lanes there are
+  k = DpLinkConfig::choose(c, 594000, 24);
+  CHECK(k.lanes == 2 && k.rate_khz == 540000 && k.rate_index == 3);
+  // a revision before 1.4, no table, or a table of rates the encoder cannot take: the usual choice, no index
+  Dpcd::Capabilities old = c;
+  old.edp_revision = 0x02;
+  CHECK(DpLinkConfig::choose(old, 148500, 24).rate_index == DpLinkConfig::kNoRateIndex);
+  old = c;
+  old.edp_rate_count = 0;
+  CHECK(DpLinkConfig::choose(old, 148500, 24).rate_index == DpLinkConfig::kNoRateIndex);
+  old = c;
+  old.edp_rate_count = 1;
+  old.edp_rates_khz[0] = 216000;
+  k = DpLinkConfig::choose(old, 148500, 24);
+  CHECK(k.rate_index == DpLinkConfig::kNoRateIndex && k.rate_khz == 270000);
+  CHECK(DpLinkConfig::choose(sink_caps(), 148500, 24).rate_index == DpLinkConfig::kNoRateIndex);      // (a DisplayPort sink: edp_revision is kNoEdp)
+  // training by the index: LINK_BW_SET 0, then LINK_RATE_SET with the index, after the lane count
+  Rig r;
+  r.lanes = 2;
+  const DpLinkTrainer::Outcome o = DpLinkTrainer::train(r, r, c, 0, 2, 1);
+  CHECK(o.trained() && o.rate_index == 1 && o.bandwidth_code == 0);
+  const size_t lane_count = index_of(r.log, "w 0101=82"), bw = index_of(r.log, "w 0100=00"), rate = index_of(r.log, "w 0115=01"), start = index_of(r.log, "start");
+  CHECK(lane_count < bw && bw < rate && rate < start && start < r.log.size());
+  // without an index no write to the rate set
+  Rig plain;
+  plain.lanes = 2;
+  CHECK(DpLinkTrainer::train(plain, plain, sink_caps(), 0x0A, 2).trained() && index_of(plain.log, "w 0115=00") == plain.log.size() && plain.dpcd[0x115] == 0);
+  // the write of the rate index failing
+  Rig f;
+  f.lanes = 2;
+  f.fail_write_address = 0x115;
+  f.fail_write_nth = 1;
+  CHECK(DpLinkTrainer::train(f, f, c, 0, 2, 1).result == DpLinkTrainer::Result::SinkSetup);
+}
+
+static void test_assr_and_delays() {
+  // the internal DP2 panel mode: DP_EDP_CONFIGURATION_SET gets 1 after the downspread and before the lane count
+  Rig r;
+  CHECK(DpLinkTrainer::train(r, r, sink_caps(), 0x0A, 4, DpLinkConfig::kNoRateIndex, true).trained());
+  const size_t spread = index_of(r.log, "w 0107=10"), assr = index_of(r.log, "w 010A=01"), lanes = index_of(r.log, "w 0101=84");
+  CHECK(spread < assr && assr < lanes && lanes < r.log.size() && r.dpcd[0x10A] == 1);
+  Rig plain;
+  CHECK(DpLinkTrainer::train(plain, plain, sink_caps(), 0x0A, 4).trained() && index_of(plain.log, "w 010A=01") == plain.log.size());
+  Rig f;
+  f.fail_write_address = 0x10A;
+  f.fail_write_nth = 1;
+  CHECK(DpLinkTrainer::train(f, f, sink_caps(), 0x0A, 4, DpLinkConfig::kNoRateIndex, true).result == DpLinkTrainer::Result::SinkSetup);
+  // a sink of DPCD 1.4 gets 100 us in the clock recovery whatever its read interval is, and the channel equalization wait is still the interval's
+  Rig d;
+  Dpcd::Capabilities c = sink_caps();
+  c.revision = 0x14;
+  c.training_read_interval = 3;
+  CHECK(DpLinkTrainer::train(d, d, c, 0x0A, 4).trained() && d.delays == std::vector<uint32_t>({1000, 400, 100, 12000, 400}));
+  Rig e;
+  c.revision = 0x12;
+  CHECK(DpLinkTrainer::train(e, e, c, 0x0A, 4).trained() && e.delays == std::vector<uint32_t>({1000, 400, 12000, 12000, 400}));
 }
 
 int main() {
@@ -418,6 +498,8 @@ int main() {
   test_patterns();
   test_failures();
   test_link_config();
+  test_edp_rate_table();
+  test_assr_and_delays();
   printf(g_failed ? "DpLinkTrainTest: %d FAILED\n" : "DpLinkTrainTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }
