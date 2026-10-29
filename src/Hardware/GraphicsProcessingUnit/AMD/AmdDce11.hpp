@@ -142,6 +142,53 @@ class Scanout {
   IVcnRegisters& r_;
 };
 
+// One display controller as the watermark calculation sees it (the CRTC's mode, drm's crtc_* values).
+struct WatermarkHead {
+  bool enabled = false;
+  uint32_t hdisplay = 0, htotal = 0, clock_khz = 0;
+  bool interlaced = false;
+};
+
+// The engine and memory clocks the watermarks are computed for, in kHz: at the highest and the lowest power state (the same while there is no dynamic power management: the current ones).
+struct WatermarkClocks {
+  uint32_t sclk_high_khz = 0, sclk_low_khz = 0, mclk_high_khz = 0, mclk_low_khz = 0;
+  bool apu = false;
+};
+
+// dce_v11_0_bandwidth_update: the line buffer split between the display controllers (dce_v11_0_line_buffer_adjust: memory configuration by display width, DMIF buffers, waiting for the
+// allocation) and the urgency watermarks of each (dce_v11_0_program_watermarks, with the driver's 20.12 fixed point arithmetic): wm A for the high clocks, wm B for the low, the high
+// watermark the line time. Pictures are taken as 4 bytes per pixel, unscaled (vertical scale ratio 1, one vertical tap), as the driver does without a scaler.
+class Watermarks {
+ public:
+  Watermarks(IVcnRegisters& registers, const IClock& clock) : r_(registers), clock_(clock) {}
+  // `heads`: kMaxCrtcs entries. Returns false only if a DMIF allocation never completed (the watermarks are programmed all the same).
+  bool update(const WatermarkHead* heads, const WatermarkClocks& clocks);
+  // The values for the last update, as the driver saves them for power management.
+  struct Result {
+    uint32_t line_time = 0, wm_high = 0, wm_low = 0, lb_vblank_lead_lines = 0;
+  };
+  const Result& result(uint32_t crtc) const { return results_[crtc]; }
+  // The number of DRAM channels from MC_SHARED_CHMAP.NOOFCHAN (cik_get_number_of_dram_channels)
+  static uint32_t dram_channels(uint32_t chmap);
+  // The pieces of the calculation, in the driver's units (MB/s, ns); exposed for testing.
+  struct Params {
+    uint32_t dram_channels = 1, yclk = 0, sclk = 0, disp_clk = 0, src_width = 0, active_time = 0, blank_time = 0, vsc_full = 1u << 12, num_heads = 1, bytes_per_pixel = 4, lb_size = 0, vtaps = 1;
+    bool interlaced = false;
+  };
+  static uint32_t latency_watermark(const Params& wm);
+  static uint32_t available_bandwidth(const Params& wm);
+  static uint32_t average_bandwidth(const Params& wm);
+  static uint32_t dram_bandwidth(const Params& wm);
+
+ private:
+  uint32_t line_buffer_adjust(uint32_t crtc, const WatermarkHead& head, const WatermarkClocks& clocks, bool* complete);
+  void program(uint32_t crtc, const WatermarkHead& head, const WatermarkClocks& clocks, uint32_t lb_size, uint32_t num_heads);
+
+  IVcnRegisters& r_;
+  const IClock& clock_;
+  Result results_[kMaxCrtcs];
+};
+
 // The firmware's framebuffer as the UEFI graphics output describes the current mode.
 struct FirmwareFramebuffer {
   uint64_t physical = 0;     // the CPU's address of its first byte (the OS runs identity mapped)

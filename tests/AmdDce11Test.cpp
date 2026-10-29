@@ -440,6 +440,94 @@ static void test_fmt() {
   CHECK(!scan.vga_enable(6, true) && !scan.set_interleave(6, true) && !scan.program_fmt(6, 8, false));
 }
 
+// The watermarks (dce_v11_0_bandwidth_update): the arithmetic against values computed independently with the driver's 20.12 fixed point (a separate script), the line buffer split, the
+// registers, one head and two.
+static void test_watermarks() {
+  using P = Watermarks::Params;
+  // the DRAM channel counts of MC_SHARED_CHMAP.NOOFCHAN (bits 15:12)
+  const uint32_t channels[] = {1, 2, 4, 8, 3, 6, 10, 12, 16, 1, 1};
+  for (uint32_t i = 0; i < 11; ++i) CHECK(Watermarks::dram_channels((i << 12) | 0x0FFF) == channels[i]);
+  // 1080p60: 148.5 MHz, 1920 / 2200: active 12929 ns, line 14814 ns, blank 1885 ns; four channels
+  const auto params = [](uint32_t clock, uint32_t hd, uint32_t ht, uint32_t sclk, uint32_t yclk, uint32_t heads) {
+    P p;
+    p.dram_channels = 4; p.yclk = yclk; p.sclk = sclk; p.disp_clk = clock; p.src_width = hd; p.num_heads = heads;
+    p.active_time = static_cast<uint32_t>(uint64_t{hd} * 1000000 / clock);
+    p.blank_time = static_cast<uint32_t>(uint64_t{ht} * 1000000 / clock) - p.active_time;
+    p.lb_size = 3840;
+    return p;
+  };
+  P p = params(148500, 1920, 2200, 1200000, 800000, 1);
+  CHECK(Watermarks::dram_bandwidth(p) == 8959 && Watermarks::available_bandwidth(p) == 3801 && Watermarks::average_bandwidth(p) == 518 && Watermarks::latency_watermark(p) == 17486);
+  p = params(148500, 1920, 2200, 300000, 150000, 1);
+  CHECK(Watermarks::dram_bandwidth(p) == 1679 && Watermarks::available_bandwidth(p) == 1679 && Watermarks::latency_watermark(p) == 20380);
+  CHECK(Watermarks::latency_watermark(params(148500, 1920, 2200, 1200000, 800000, 2)) == 18697);
+  CHECK(Watermarks::latency_watermark(params(148500, 1920, 2200, 300000, 150000, 2)) == 23123);
+  p = params(25175, 640, 800, 1200000, 800000, 1);
+  CHECK(Watermarks::available_bandwidth(p) == 644 && Watermarks::average_bandwidth(p) == 80 && Watermarks::latency_watermark(p) == 42831);
+  p = params(594000, 3840, 4400, 1200000, 800000, 1);
+  CHECK(Watermarks::available_bandwidth(p) == 3876 && Watermarks::average_bandwidth(p) == 2073 && Watermarks::latency_watermark(p) == 10776);
+  p = params(594000, 3840, 4400, 300000, 150000, 1);
+  CHECK(Watermarks::latency_watermark(p) == 19082);
+  // no heads: no watermark; zero clocks do not divide by zero
+  p.num_heads = 0;
+  CHECK(Watermarks::latency_watermark(p) == 0);
+  (void)Watermarks::latency_watermark(P());         // (all zero clocks: no division by zero)
+  // an interlaced mode with a vertical scale of two uses four source lines; vertical taps do too
+  p = params(148500, 1920, 2200, 1200000, 800000, 1);
+  const uint32_t base = Watermarks::latency_watermark(p);
+  P q = p;
+  q.vtaps = 5;
+  CHECK(Watermarks::latency_watermark(q) > base);
+  q = p; q.vsc_full = 2u << 12; q.interlaced = true;
+  CHECK(Watermarks::latency_watermark(q) > base);
+
+  // programming: CRTC 1 shows 1080p60, the others are off; the DMIF allocation completes
+  FakeClock clock;
+  FakeDisplay d;
+  for (uint32_t i = 0; i < 6; ++i) d.set(0x321 + i, 0x10);
+  d.set(0x801, 2u << 12);                 // four channels
+  d.set(0x1ac1 + (0x1d9c - 0x1b9c), 0x00F0000F);      // LB memory control with other bits
+  d.set(0x1b32 + (0x1d9c - 0x1b9c), 0x00000A55);
+  WatermarkHead heads[6];
+  heads[1] = {true, 1920, 2200, 148500, false};
+  WatermarkClocks clocks;
+  clocks.sclk_high_khz = 1200000; clocks.mclk_high_khz = 800000; clocks.sclk_low_khz = 300000; clocks.mclk_low_khz = 150000;
+  Watermarks wm(d, clock);
+  CHECK(wm.update(heads, clocks));
+  const uint32_t off1 = 0x1d9c - 0x1b9c;
+  // 1920 wide: memory config 2, two DMIF buffers, line buffer 2560 * 2; the others have no line buffer: config 1, no buffers
+  CHECK(((d.get(0x1ac1 + off1) >> 20) & 3) == 2 && (d.get(0x1ac1 + off1) & ~0x300000u) == 0x00C0000Fu && (d.get(0x322) & 7) == 2 && (d.get(0x321) & 7) == 0);
+  CHECK(((d.get(0x1ac1) >> 20) & 3) == 1);
+  // wm A and wm B written with the selection restored; the high watermark is the line time
+  uint32_t urgency[2] = {0xFFFFFFFFu, 0xFFFFFFFFu};
+  uint32_t selects[2] = {0, 0}, n = 0;
+  for (size_t i = 0; i < d.writes.size(); ++i) {
+    if (d.writes[i].first == 0x1b32 + off1 && n < 2) selects[n] = d.writes[i].second;
+    if (d.writes[i].first == 0x1b33 + off1 && n < 2) urgency[n++] = d.writes[i].second;
+  }
+  // (the first latency is for the high clocks: wm A = 17486, wm B = 20380, line time 14814)
+  CHECK(urgency[0] == (17486u | 14814u << 16) && urgency[1] == (20380u | 14814u << 16));
+  CHECK(((selects[0] >> 8) & 7) == 1 && ((selects[1] >> 8) & 7) == 2 && (selects[0] & ~0x700u) == 0x855u && d.get(0x1b32 + off1) == 0x00000A55);
+  CHECK(wm.result(1).line_time == 14814 && wm.result(1).wm_high == 17486 && wm.result(1).wm_low == 20380 && wm.result(1).lb_vblank_lead_lines == (5120 + 1919) / 1920);
+  // a disabled head: watermarks zero and the line time zero
+  CHECK(wm.result(0).line_time == 0 && wm.result(0).wm_high == 0 && d.get(0x1b33) == 0);
+  // two heads: the second wide enough for the 2560 .. 4095 split on a discrete card (four buffers), an APU gets two
+  heads[3] = {true, 3840, 4400, 594000, false};
+  CHECK(wm.update(heads, clocks) && (d.get(0x321 + 3) & 7) == 4 && ((d.get(0x1ac1 + 0x419c - 0x1b9c) >> 20) & 3) == 0);
+  clocks.apu = true;
+  CHECK(wm.update(heads, clocks) && (d.get(0x321 + 3) & 7) == 2);
+  CHECK(wm.result(1).wm_high == Watermarks::latency_watermark([&] { P x = params(148500, 1920, 2200, 1200000, 800000, 2); x.lb_size = 2560 * 2; return x; }()));
+  // below 1920: memory config 1
+  heads[3] = {true, 1280, 1650, 74250, false};
+  CHECK(wm.update(heads, clocks) && ((d.get(0x1ac1 + 0x419c - 0x1b9c) >> 20) & 3) == 1);
+  // a DMIF allocation that never completes: reported, the watermarks are programmed all the same
+  FakeDisplay e;
+  e.set(0x801, 0);
+  Watermarks stuck(e, clock);
+  heads[3].enabled = false;
+  CHECK(!stuck.update(heads, clocks) && stuck.result(1).wm_high != 0);
+}
+
 int main() {
   test_probe();
   test_flip();
@@ -449,6 +537,7 @@ int main() {
   test_scanout();
   test_scanout_formats();
   test_fmt();
+  test_watermarks();
   printf(g_failed ? "AmdDce11Test: %d FAILED\n" : "AmdDce11Test: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }

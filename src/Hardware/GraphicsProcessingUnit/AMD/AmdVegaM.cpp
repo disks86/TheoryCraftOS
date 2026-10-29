@@ -653,6 +653,8 @@ bool AmdVegaM::set_mode(const AtomConnectors::Connector& connector, uint8_t crtc
   if (!set.set_pixel_clock(o, mode)) return finish(ModeSetStage::PixelClock);
   if (!set.set_dtd_timing(o, mode)) return finish(ModeSetStage::Timing);
   if (surface && !display.set(crtc, *surface)) return finish(ModeSetStage::Scanout);
+  heads_[crtc] = {true, mode.h_display, mode.h_total, mode.pixel_clock_khz, mode.interlaced};
+  update_watermarks();           // (dce_v11_0_crtc_do_set_base ends with the bandwidth update)
   if (!session.optional(AmdModeSet::kSetCrtcOverscan) && !set.overscan_setup(o)) return finish(ModeSetStage::Overscan);
   if (!session.optional(AmdModeSet::kEnableScaler) && !set.scaler_setup(o)) return finish(ModeSetStage::Scaler);
   crtc_pll_[crtc] = pll;
@@ -687,6 +689,12 @@ bool AmdVegaM::set_mode(const AtomConnectors::Connector& connector, uint8_t crtc
   return finish(ModeSetStage::Done);
 }
 
+void AmdVegaM::update_watermarks() {
+  const amd_dce11::WatermarkClocks& c = inputs_.display_clocks;
+  if (!inputs_.registers || !inputs_.clock || (c.sclk_high_khz == 0 && c.mclk_high_khz == 0 && c.sclk_low_khz == 0 && c.mclk_low_khz == 0)) return;
+  amd_dce11::Watermarks(*inputs_.registers, *inputs_.clock).update(heads_, c);
+}
+
 bool AmdVegaM::disable_mode(const AtomConnectors::Connector& connector, uint8_t crtc) {
   if (!up() || !inputs_.registers || !inputs_.clock || !inputs_.allocator || crtc >= AmdModeSet::kMaxCrtcs) return false;
   uint8_t encoder_mode = 0;
@@ -706,6 +714,8 @@ bool AmdVegaM::disable_mode(const AtomConnectors::Connector& connector, uint8_t 
   amd_dce11::Scanout display(*inputs_.registers);
   ok = crtc_dpms_off(session, display, crtc, (crtc_active_ >> crtc & 1) != 0) && ok;
   crtc_active_ &= ~(1u << crtc);
+  heads_[crtc] = amd_dce11::WatermarkHead();
+  update_watermarks();
   ok = display.disable(crtc) && ok;       // dce_v11_0_grph_enable(false)
   if (!session.optional(AmdModeSet::kEnableDispPowerGating)) ok = set.powergate_crtc(crtc, true) && ok;
   crtc_pll_[crtc] = 0xFF;
