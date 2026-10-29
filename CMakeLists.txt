@@ -710,6 +710,9 @@ add_executable(BOOTX64
   src/Hardware/GraphicsProcessingUnit/AMD/Gcn/TgsiParse.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnCompiler.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnDraw.cpp
+  src/Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnPm4.cpp
+  src/Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnState.cpp
+  src/Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnCp.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdAsicReset.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdIrq.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdSdma3.cpp
