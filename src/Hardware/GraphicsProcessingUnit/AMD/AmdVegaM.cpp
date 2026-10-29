@@ -474,6 +474,38 @@ bool AmdVegaM::read_dpcd(const AtomConnectors::Connector& connector, Dpcd::Capab
   return true;
 }
 
+bool AmdVegaM::train_link(const AtomConnectors::Connector& connector, uint32_t pixel_clock_khz, uint32_t bpc, LinkTraining* out) {
+  if (!up() || !inputs_.registers || !inputs_.clock || !inputs_.allocator || !connector.has_ddc || !AtomConnectors::uses_aux(connector.type)) return false;
+  const uint8_t dig = AtomConnectors::dig_encoder(connector);
+  if (dig >= amd_dce11::AudioFormat::kBlocks) return false;          // (the DIGs of this card: the same six as the audio format blocks)
+  AuxSession session(*inputs_.registers, *inputs_.clock, inputs_.vbios, *inputs_.allocator, connector);
+  if (!session.bios.valid()) return false;
+  power_up_panel(connector, session.host, session.bios);
+  LinkTraining result;
+  if (!Dpcd::read_capabilities(session.aux, connector.type == AtomConnectors::Type::EmbeddedDisplayPort, &result.caps)) return false;
+  result.config = DpLinkConfig::choose(result.caps, pixel_clock_khz, bpc * 3);
+  DpSourceConfig source;
+  source.dig_encoder = dig;
+  source.link_b = AtomConnectors::link_b(connector);
+  source.lanes = result.config.lanes;
+  source.rate_khz = result.config.rate_khz;
+  source.pixel_clock_khz = pixel_clock_khz;
+  source.connector_object_id = connector.object_id;
+  source.hpd = connector.hpd_pin;
+  source.bits_per_color = bpc == 6 ? 1 : bpc == 10 ? 3 : bpc == 12 ? 4 : bpc == 16 ? 5 : 2;
+  AmdDpSource dp(session.host, session.bios, source);
+  result.outcome = DpLinkTrainer::train(session.aux, dp, result.caps, result.config.bandwidth_code(), result.config.lanes);
+  if (out) *out = result;
+  if (connector.hpd_pin < amd_dce11::Interrupts::kMaxHpd) {
+    Trained& memory = trained_[connector.hpd_pin];
+    memory.valid = result.outcome.trained();
+    memory.pixel_clock_khz = pixel_clock_khz;
+    memory.bpc = bpc;
+    memory.retrains = 0;
+  }
+  return result.outcome.trained();
+}
+
 uint32_t AmdVegaM::service_short_pulses(SinkEvent* out, uint32_t capacity) {
   uint32_t count = 0;
   if (!out) capacity = 0;
@@ -492,6 +524,7 @@ uint32_t AmdVegaM::service_short_pulses(SinkEvent* out, uint32_t capacity) {
         e.checked = true;
         if (!Dpcd::read_lane_count(session.aux, &e.lanes) || !Dpcd::read_link_status(session.aux, &e.status)) {
           e.read_failed = true;
+          trained_[pin] = Trained();      // (the sink is gone: what was trained is not there to retrain)
           e.lanes = 0;
           e.status = Dpcd::LinkStatus();
         } else {
@@ -506,6 +539,20 @@ uint32_t AmdVegaM::service_short_pulses(SinkEvent* out, uint32_t capacity) {
             if (ok && e.test_kind == Dpcd::kTestEdidRead) session.aux.read_edid(&edid);     // (no EDID: the buffer stays empty, and the test is answered NAK)
             ok = ok && Dpcd::answer_test_request(session.aux, e.test_kind, edid.view(), &e.test_response);
             if (!ok) e.handling_failed = true;
+          }
+          Trained& memory = trained_[pin];
+          if (!e.link_lost) memory.retrains = 0;
+          else if (memory.valid) {
+            if (memory.retrains >= kMaxRetrains) {
+              e.retrain_limit = true;
+            } else {
+              ++memory.retrains;
+              e.retrained = true;
+              const uint32_t retrains = memory.retrains;
+              const uint32_t clock = memory.pixel_clock_khz, bpc = memory.bpc;
+              const bool ok = train_link(e.connector, clock, bpc, &e.retrain);      // (forgets the count and, if it fails, the training)
+              if (trained_[pin].valid || ok) trained_[pin].retrains = retrains;
+            }
           }
         }
       }

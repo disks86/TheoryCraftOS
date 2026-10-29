@@ -88,11 +88,13 @@ class PipelineObject {
   uint32_t vertex_stride() const { return stride_; }
   uint32_t attribute_count() const { return attribute_count_; }
   uint32_t texture_count() const { return texture_count_; }
+  bool has_per_instance() const { return per_instance_; }
 
  private:
   friend class Adapter;
   graphics::IGraphicsDevice& device_;
   graphics::IPipeline* pipeline_ = nullptr;
+  bool per_instance_ = false;
   SharedPointer<ShaderObject> vertex_, fragment_;   // (kept alive for as long as the pipeline is)
   uint32_t stride_ = 0, attribute_count_ = 0, texture_count_ = 0;
 };

@@ -172,6 +172,8 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
 
   // What the input and output registers are.
   int8_t in_slot[16], out_slot[16];
+  int8_t in_sys[16];   // an input register that is a system value (SysValue), or -1
+  for (int8_t& s : in_sys) s = -1;
   for (int8_t& s : in_slot) s = kSlotNone;
   for (int8_t& s : out_slot) s = kSlotNone;
   SigElement elements[16];
@@ -273,6 +275,11 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         s->type = kTemp, s->number = static_cast<uint16_t>(o.index[0]);
         return status::kSuccess;
       case kOpInput: {
+        if (o.dims == 1 && o.index[0] < 16 && in_sys[o.index[0]] >= 0) {
+          s->type = kSysValue, s->number = static_cast<uint16_t>(in_sys[o.index[0]]);
+          program->uses_system_values_ = true;
+          return status::kSuccess;
+        }
         if (o.dims != 1 || o.index[0] >= 16 || in_slot[o.index[0]] < 0) return status::kNotSupported;
         s->type = kInput, s->number = static_cast<uint16_t>(o.index[0]), s->slot = in_slot[o.index[0]];
         return status::kSuccess;
@@ -496,8 +503,21 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         Operand o;
         s = read_operand(p, &o);
         if (s != status::kSuccess) return s;
-        if ((o.type != kOpInput && o.type != kOpOutput) || o.dims != 1 || o.index[0] >= 16) return status::kNotSupported;   // (vertex id, depth and the like)
-        // The meaning comes from the signature; what the declaration adds (an interpolation mode, the system value) changes nothing for the registers that are used.
+        if ((o.type != kOpInput && o.type != kOpOutput) || o.dims != 1 || o.index[0] >= 16) return status::kNotSupported;   // (depth and the like)
+        // An input that is a system value says which in its declaration (a name after the operand); the rest take their meaning from the signature.
+        if (o.type == kOpInput && (opcode == kDclInputSgv4 || opcode == kDclInputSiv4 || opcode == kDclInputPsSgv4 || opcode == kDclInputPsSiv4)) {
+          const uint32_t name = p.le32() & 0xFFFF;
+          if (!p.ok()) return status::kInvalidParameter;
+          int sys = -1;
+          if (!vertex && name == 1) sys = kSysPosition;            // SV_Position
+          else if (!vertex && name == 9) sys = kSysFrontFacing;    // SV_IsFrontFace
+          else if (!vertex && name == 7) sys = kSysPrimitiveId;    // SV_PrimitiveID
+          else if (vertex && name == 6) sys = kSysVertexId;        // SV_VertexID
+          else if (vertex && name == 8) sys = kSysInstanceId;      // SV_InstanceID
+          if (sys < 0) return status::kNotSupported;
+          in_sys[o.index[0]] = static_cast<int8_t>(sys);
+          continue;
+        }
         if (o.type == kOpInput && vertex && o.index[0] >= graphics::kMaxVertexAttributes) return status::kNotSupported;
         continue;
       }
@@ -579,6 +599,42 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       }
       if (!p.at_end()) return status::kInvalidParameter;
       continue;
+    } else if (opcode == 45 || opcode == 72 || opcode == 61) {
+      // ld (dst, integer address, resource), sample_l (dst, coordinate, resource, sampler, level), resinfo (dst, level, resource): Shader Model 4 texture access beyond sample.
+      if (vertex) return status::kNotSupported;
+      Operand d, address, resource, sampler, lod;
+      if ((s = read_operand(p, &d)) != status::kSuccess || (s = read_operand(p, &address)) != status::kSuccess || (s = read_operand(p, &resource)) != status::kSuccess) return s;
+      if (opcode == 72 && ((s = read_operand(p, &sampler)) != status::kSuccess || (s = read_operand(p, &lod)) != status::kSuccess)) return s;
+      uint32_t unit = resource.index[0];
+      if (v51) {
+        if (resource.type != kOpResource || resource.dims != 2 || resource.index[0] >= 8 || texture_register[resource.index[0]] < 0 || resource.index[1] != static_cast<uint32_t>(texture_register[resource.index[0]]))
+          return status::kNotSupported;
+        unit = resource.index[1];
+      } else if (resource.type != kOpResource || resource.dims != 1) {
+        return status::kNotSupported;
+      }
+      if (resource.type != kOpResource || unit >= graphics::kMaxTextureUnits || (opcode == 72 && sampler.type != kOpSampler)) return status::kNotSupported;
+      ins.op = opcode == 45 ? kTexFetch : opcode == 72 ? kTexLod : kTexSize;
+      if (opcode == 61) {
+        const uint32_t mode = (token >> 11) & 3;
+        if (mode > 2) return status::kNotSupported;
+        ins.control = static_cast<uint8_t>(mode);
+      }
+      s = to_dst(d, &ins.dst);
+      if (s != status::kSuccess) return s;
+      s = to_src(address, &ins.src[0]);
+      if (s != status::kSuccess) return s;
+      ins.src[1].type = kSampler, ins.src[1].number = static_cast<uint16_t>(unit);
+      ins.src_count = 2;
+      if (opcode == 72) {
+        s = to_src(lod, &ins.src[2]);
+        if (s != status::kSuccess) return s;
+        ins.src_count = 3;
+      }
+      if (resource.components == 2)
+        for (uint32_t k = 0; k < 4; ++k) ins.tex_swizzle[k] = resource.swizzle[k];
+      program->uses_textures_ = true;
+      program->uses_texel_access_ = true;
     } else if (opcode == kSample4) {
       if (vertex) return status::kNotSupported;   // (no textures in the vertex stage)
       Operand d, coordinate, resource, sampler;

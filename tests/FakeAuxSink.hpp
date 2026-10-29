@@ -21,6 +21,7 @@
 // requests, a check that they are well formed, and a script of replies that go wrong.
 #pragma once
 #include <stdint.h>
+#include <functional>
 #include <vector>
 #include "Hardware/VideoCodec/AMD/AmdVcn1.hpp"
 
@@ -41,6 +42,7 @@ struct FakeAuxSink {
   std::vector<Request> requests;
   struct DpcdWrite { uint32_t address; std::vector<uint8_t> bytes; };
   std::vector<DpcdWrite> dpcd_writes;      // the native writes the sink took, in order
+  std::function<void(uint32_t address, const std::vector<uint8_t>& bytes)> after_write;      // called after each native write has taken effect (a sink that reacts to what it is told)
   // the sink
   std::vector<uint8_t> edid, dpcd;
   bool monitor_present = true;
@@ -119,6 +121,7 @@ struct FakeAuxSink {
         if (address + i == 0x201) dpcd[address + i] &= static_cast<uint8_t>(~req.bytes[4 + i]);       // the service interrupt bits clear when a 1 is written to them
         else dpcd[address + i] = req.bytes[4 + i];
       }
+      if (after_write) after_write(address, written);
       return finish(native_odd_reply ? 0x30 : native_reply_extra);
     } else {
       const bool mot = command & 4, read = is_read;
@@ -153,6 +156,14 @@ struct FakeAuxCard final : IVcnRegisters {
   // The panel power of an eDP connector, for a video BIOS whose UNIPHYTransmitterControl table writes its first parameter word (ucAction in byte 3: 12 power on, 13 power off) to kPanel.
   // With unpowered_channel set, the AUX channel of that DDC line does not answer (the reply status says timeout) while the panel is off.
   static constexpr uint32_t kPanel = 0x7040;
+  // The DisplayPort link training tables: UNIPHYTransmitterControl's three parameter words are kPanel, +1, +2 (the call is complete when +2 is written); DIG1EncoderControl's two are
+  // 0x7050 and 0x7051, DIG2EncoderControl's 0x7060 and 0x7061. Each call is logged with the table (0 encoder 1, 1 encoder 2, 2 transmitter) and its words.
+  struct DigCall {
+    uint32_t table;
+    uint32_t words[3];
+  };
+  std::vector<DigCall> dig_calls;
+  uint32_t dig_words[3][3] = {};
   uint32_t panel_writes = 0, panel_params = 0;
   bool panel_on = false;
   uint8_t unpowered_channel = 0;
@@ -167,13 +178,24 @@ struct FakeAuxCard final : IVcnRegisters {
   }
   void write(uint32_t r, uint32_t v) override {
     if (r == kParams1) params1 = v;
-    if (r == kPanel) {
+    if (r == kPanel && (v >> 24 == 12 || v >> 24 == 13)) {       // (the power actions; the table is the transmitter control table, which the training's drive also calls)
       ++panel_writes;
       panel_params = v;
-      if (v >> 24 == 12) panel_on = true;
-      if (v >> 24 == 13) panel_on = false;
+      panel_on = v >> 24 == 12;
     }
     if (r > kRequest && r < kRequest + 6) request[r - kRequest] = v;
+    if (r >= kPanel + 1 && r <= kPanel + 2) {
+      dig_words[2][r - kPanel] = v;
+      if (r == kPanel + 2) dig_calls.push_back({2, {dig_words[2][0], dig_words[2][1], dig_words[2][2]}});
+    }
+    if (r == kPanel) dig_words[2][0] = v;
+    for (uint32_t t = 0; t < 2; ++t) {
+      if (r == 0x7050 + t * 0x10) dig_words[t][0] = v;
+      if (r == 0x7051 + t * 0x10) {
+        dig_words[t][1] = v;
+        dig_calls.push_back({t, {dig_words[t][0], dig_words[t][1], 0}});
+      }
+    }
     if (r != kDoorbell) return;
     ++doorbells;
     if (unpowered_channel && (params1 & 0xFF) == unpowered_channel && !panel_on) {

@@ -29,7 +29,7 @@ namespace graphics {
 struct RecordedCommand {
   enum class Type : uint8_t {
     BeginRenderPass, BindPipeline, BindVertexBuffer, BindIndexBuffer, PushConstants, BindTexture, SetViewport, SetScissor,
-    Draw, DrawIndexed, EndRenderPass,
+    Draw, DrawIndexed, EndRenderPass, SetTopology,
   };
   Type type = Type::Draw;
   RenderPassBegin pass;
@@ -42,6 +42,8 @@ struct RecordedCommand {
   Rect2D scissor;
   uint32_t count = 0, first = 0;
   int32_t vertex_offset = 0;
+  uint32_t instance_count = 1, first_instance = 0;
+  PrimitiveTopology topology = PrimitiveTopology::TriangleList;   // SetTopology
   uint32_t unit = 0;       // BindTexture
   IImage* image = nullptr;
   SamplerDesc sampler;
@@ -120,19 +122,29 @@ class CommandRecorder : public ICommandBuffer {
     c.scissor = scissor;
     add(c);
   }
-  void draw(uint32_t vertex_count, uint32_t first_vertex) override {
+  void draw(uint32_t vertex_count, uint32_t first_vertex, uint32_t instance_count, uint32_t first_instance) override {
     RecordedCommand c;
     c.type = RecordedCommand::Type::Draw;
     c.count = vertex_count;
     c.first = first_vertex;
+    c.instance_count = instance_count;
+    c.first_instance = first_instance;
     add(c);
   }
-  void draw_indexed(uint32_t index_count, uint32_t first_index, int32_t vertex_offset) override {
+  void draw_indexed(uint32_t index_count, uint32_t first_index, int32_t vertex_offset, uint32_t instance_count, uint32_t first_instance) override {
     RecordedCommand c;
     c.type = RecordedCommand::Type::DrawIndexed;
     c.count = index_count;
     c.first = first_index;
     c.vertex_offset = vertex_offset;
+    c.instance_count = instance_count;
+    c.first_instance = first_instance;
+    add(c);
+  }
+  void set_primitive_topology(PrimitiveTopology topology) override {
+    RecordedCommand c;
+    c.type = RecordedCommand::Type::SetTopology;
+    c.topology = topology;
     add(c);
   }
   void end_render_pass() override {

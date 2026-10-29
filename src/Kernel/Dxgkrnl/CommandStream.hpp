@@ -58,11 +58,13 @@ enum class Op : uint16_t {
   CopyRegion,
   GenerateMipmaps,
   SetTopology,
+  DrawInstanced,
+  DrawIndexedInstanced,
 };
 
 // How the vertices (or indices) of a draw make triangles (D3D10 IASetPrimitiveTopology / D3D9 primitive types); the default is a list. A strip or fan is expanded to a list of
 // triangles by the kernel, so any device draws it; with an index buffer the index 0xFFFF (0xFFFFFFFF for 32-bit indices) ends a strip and starts the next.
-enum class Topology : uint32_t { TriangleList = 0, TriangleStrip = 1, TriangleFan = 2 };
+enum class Topology : uint32_t { TriangleList = 0, TriangleStrip = 1, TriangleFan = 2, LineList = 3, LineStrip = 4, PointList = 5 };   // (lines and points: kFeatureLines of the adapter)
 
 constexpr uint32_t kNoAllocation = 0xFFFFFFFFu;
 constexpr uint32_t kMaxPacketWords = 64;           // (PushConstants is the longest: 2 + 32)
@@ -104,6 +106,11 @@ class CommandWriter {
   void set_scissor(const graphics::Rect2D& r) { packet(Op::SetScissor, {static_cast<uint32_t>(r.x), static_cast<uint32_t>(r.y), r.width, r.height}); }
   void set_topology(Topology topology) { packet(Op::SetTopology, {static_cast<uint32_t>(topology)}); }
   void draw(uint32_t vertex_count, uint32_t first_vertex = 0) { packet(Op::Draw, {vertex_count, first_vertex}); }
+  // Several instances (the adapter's kFeatureInstancing): the draw is made instance_count times, numbered from first_instance; per-instance attributes step with them.
+  void draw_instanced(uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex = 0, uint32_t first_instance = 0) { packet(Op::DrawInstanced, {vertex_count, first_vertex, instance_count, first_instance}); }
+  void draw_indexed_instanced(uint32_t index_count, uint32_t instance_count, uint32_t first_index = 0, int32_t vertex_offset = 0, uint32_t first_instance = 0) {
+    packet(Op::DrawIndexedInstanced, {index_count, first_index, static_cast<uint32_t>(vertex_offset), instance_count, first_instance});
+  }
   void draw_indexed(uint32_t index_count, uint32_t first_index = 0, int32_t vertex_offset = 0) { packet(Op::DrawIndexed, {index_count, first_index, static_cast<uint32_t>(vertex_offset)}); }
   void copy_region(uint32_t dst, uint32_t dst_x, uint32_t dst_y, uint32_t src, uint32_t src_x, uint32_t src_y, uint32_t width, uint32_t height) {
     packet(Op::CopyRegion, {dst, dst_x, dst_y, src, src_x, src_y, width, height});

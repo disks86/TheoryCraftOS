@@ -58,6 +58,8 @@ class IWaitHook {
 //   CreatePipeline   vertex_shader, fragment_shader, vertex_stride, attribute_count, varying_count, texture_count, cull, front_face, flags (1 depth test, 2 depth write,
 //                    4 blend), then per attribute (4 of them): location, format, offset; then stencil: enable, compare, fail_op, depth_fail_op, pass_op, masks (compare,
 //                    write, reference: one word each)                                                                                       reply: handle
+//                    (optionally, after that: depth_compare, blend custom, enable, source colour, destination colour, source alpha, destination alpha factors, colour op, alpha op,
+//                    write mask, per-instance bits of the attributes - one word each)
 //   DestroyShader / DestroyPipeline   handle
 enum class EscapeOp : uint32_t { CreateShader = 1, CreatePipeline = 2, DestroyShader = 3, DestroyPipeline = 4 };
 

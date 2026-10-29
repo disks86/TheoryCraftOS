@@ -171,7 +171,10 @@ class WebBrowser : public gui::Frame {
 
   // window.open() from a page: the handler opens `address` in another tab / window (and may call set_opened_by_script() on it). Called on the page's thread.
   // `content_type` and `body` are those of the request when a form was posted into the window (content_type empty: a GET of `address`).
-  using OpenWindowFn = bool (*)(void* context, WebBrowser& from, StringView address, StringView content_type, StringView body);
+  using OpenWindowFn = bool (*)(void* context, WebBrowser& from, StringView address, StringView target, StringView content_type, StringView body);
+  // The name of this window (what a link or form with that target, or window.open() of it, shows its page in); empty for one without. Set by the handler.
+  void set_window_name(StringView name) { window_name_.assign(name); }
+  StringView window_name() const { return window_name_.view(); }
   void set_open_window_handler(OpenWindowFn handler, void* context) {
     open_fn_ = handler;
     open_ctx_ = context;
@@ -222,7 +225,7 @@ class WebBrowser : public gui::Frame {
     void set_navigation_state(StringView json, bool has_state) override;
     void history_go_to_key(uint64_t key) override;
     bool open_window(StringView address, StringView target, bool noopener) override;
-    bool open_window_post(StringView address, StringView target, StringView content_type, StringView body) override;
+    bool open_window_post(StringView address, StringView target, StringView content_type, StringView body, bool noopener) override;
     void close_window() override;
     int notification_prompt(StringView origin) override { return owner_.notification_sink_ ? owner_.notification_sink_->prompt(origin) : 0; }
     uint32_t notification_show(StringView origin, StringView title, StringView body, bool sticky, StringView actions) override {
@@ -351,6 +354,8 @@ class WebBrowser : public gui::Frame {
   uint64_t refresh_due_ms_ = 0;
   String refresh_target_;
   List<String> defer_opens_;        // window.open() addresses to hand to the desktop
+  String window_name_;
+  List<String> defer_open_targets_;
   List<String> defer_open_types_, defer_open_bodies_;   // (for each: the content type and body when a form was posted into the new window)
   bool want_close_ = false, opened_by_script_ = false;
   // WebRTC: the peer connections of this window's pages, made when the first page asks and the network can do UDP.

@@ -62,6 +62,7 @@ struct Code {
 struct Table {
   uint32_t index, ws, ps;
   Code code;
+  uint8_t frev = 0, crev = 0;     // the table's format and content revisions (the header bytes 2 and 3)
 };
 
 struct Iio {
@@ -124,6 +125,8 @@ struct Image {
     for (const Table& table : tables) {
       w16(kCmd + 4 + 2 * table.index, t);
       w16(t, 6 + static_cast<uint32_t>(table.code.b.size()));
+      w8(t + 2, table.frev);
+      w8(t + 3, table.crev);
       w8(t + 4, table.ws);
       w8(t + 5, table.ps);
       for (size_t i = 0; i < table.code.b.size(); ++i) w8(t + 6 + static_cast<uint32_t>(i), table.code.b[i]);
