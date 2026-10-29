@@ -5,6 +5,7 @@ RtlRestoreContext = ntdll.RtlRestoreContext
 RtlLookupFunctionEntry = ntdll.RtlLookupFunctionEntry
 RtlVirtualUnwind = ntdll.RtlVirtualUnwind
 RtlUnwind = ntdll.RtlUnwind
+VerSetConditionMask = ntdll.VerSetConditionMask
 RtlUnwindEx = ntdll.RtlUnwindEx
 RtlPcToFileHeader = ntdll.RtlPcToFileHeader
 RtlAddFunctionTable = ntdll.RtlAddFunctionTable

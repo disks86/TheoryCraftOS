@@ -475,26 +475,21 @@ EXPORT BOOL WINAPI VerifyVersionInfoA(OSVERSIONINFOEXA *info, DWORD type_mask, U
   if (!info) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
   OSVERSIONINFOEXW wide;
   memset(&wide, 0, sizeof(wide));
-  wide.dwOSVersionInfoSize = info->dwOSVersionInfoSize == sizeof(OSVERSIONINFOEXA) ? sizeof(OSVERSIONINFOEXW) : sizeof(OSVERSIONINFOW);
+  wide.dwOSVersionInfoSize = sizeof(wide);
   wide.dwMajorVersion = info->dwMajorVersion;
   wide.dwMinorVersion = info->dwMinorVersion;
   wide.dwBuildNumber = info->dwBuildNumber;
   wide.dwPlatformId = info->dwPlatformId;
-  if (info->dwOSVersionInfoSize == sizeof(OSVERSIONINFOEXA)) {
-    wide.wServicePackMajor = info->wServicePackMajor;
-    wide.wServicePackMinor = info->wServicePackMinor;
-    wide.wSuiteMask = info->wSuiteMask;
-    wide.wProductType = info->wProductType;
-  } else if (info->dwOSVersionInfoSize != sizeof(OSVERSIONINFOA)) {
-    set_error(ERROR_INVALID_PARAMETER);
-    return FALSE;
-  }
+  wide.wServicePackMajor = info->wServicePackMajor;      /* (the structure is taken to be the extended one whatever its size says) */
+  wide.wServicePackMinor = info->wServicePackMinor;
+  wide.wSuiteMask = info->wSuiteMask;
+  wide.wProductType = info->wProductType;
   return VerifyVersionInfoW(&wide, type_mask, condition_mask);
 }
 /* The product of a Windows version: before Vista there is none (FALSE, 0, the last error left alone), else this system is Windows 10 Pro. */
 EXPORT BOOL WINAPI GetProductInfo(DWORD major, DWORD minor, DWORD sp_major, DWORD sp_minor, PDWORD type) {
   (void)minor; (void)sp_major; (void)sp_minor;
-  if (!type) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (!type) return FALSE;      /* (the last error is left alone) */
   if (major < 6) { *type = 0; return FALSE; }
   *type = 0x30;      /* PRODUCT_PROFESSIONAL */
   return TRUE;

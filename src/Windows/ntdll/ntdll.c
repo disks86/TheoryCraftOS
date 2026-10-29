@@ -378,33 +378,34 @@ EXPORT NTSTATUS NTAPI RtlVerifyVersionInfo(const RTL_OSVERSIONINFOEXW *info, ULO
   now.dwOSVersionInfoSize = sizeof(now);
   if (!info || !types) return STATUS_INVALID_PARAMETER;
   if (!(types & 0xFF)) return STATUS_INVALID_PARAMETER;
-  if (info->dwOSVersionInfoSize != sizeof(RTL_OSVERSIONINFOW) && info->dwOSVersionInfoSize != sizeof(RTL_OSVERSIONINFOEXW)) return STATUS_INVALID_PARAMETER;
   RtlGetVersion((RTL_OSVERSIONINFOW *)&now);
-  const BOOLEAN extended = info->dwOSVersionInfoSize == sizeof(RTL_OSVERSIONINFOEXW);
+  const BOOLEAN extended = TRUE;      /* (the size in the structure is not looked at: the caller is trusted to have room for the fields it asks about) */
   #define COND(bit) ((UCHAR)((mask >> ((bit) * 3)) & 7))
   if (types & 0x80) { if (!extended || !version_compare(now.wProductType, info->wProductType, COND(7))) return STATUS_REVISION_MISMATCH; }
   if (types & 0x40) {      /* VER_SUITENAME: VER_AND needs every bit, VER_OR any */
     const UCHAR c = COND(6);
     if (!extended) return STATUS_REVISION_MISMATCH;
     if (c == 6 /* VER_AND */) { if ((info->wSuiteMask & now.wSuiteMask) != info->wSuiteMask) return STATUS_REVISION_MISMATCH; }
-    else if (c == 7 /* VER_OR */) { if (!(info->wSuiteMask & now.wSuiteMask)) return STATUS_REVISION_MISMATCH; }
+    else if (c == 7 /* VER_OR */) { if (info->wSuiteMask && !(info->wSuiteMask & now.wSuiteMask)) return STATUS_REVISION_MISMATCH; }      /* (asking for none is met) */
     else return STATUS_INVALID_PARAMETER;
   }
   if ((types & 8) && !version_compare(now.dwPlatformId, info->dwPlatformId, COND(3))) return STATUS_REVISION_MISMATCH;
   if ((types & 4) && !version_compare(now.dwBuildNumber, info->dwBuildNumber, COND(2))) return STATUS_REVISION_MISMATCH;
   if (types & 0x33) {
-    NTSTATUS status = STATUS_SUCCESS;
-    BOOLEAN next = TRUE;
+    /* Major, minor, service pack major and minor are one chain. The first field whose values differ decides. While they are equal the next field is looked at; a condition
+       of EQUAL gives way to the next field's own condition, any other condition carries on to the fields after it. */
     struct { ULONG bit_type; int bit; ULONG have, want; } chain[4] = {
       {2, 1, now.dwMajorVersion, info->dwMajorVersion}, {1, 0, now.dwMinorVersion, info->dwMinorVersion},
       {0x20, 5, now.wServicePackMajor, extended ? info->wServicePackMajor : 0}, {0x10, 4, now.wServicePackMinor, extended ? info->wServicePackMinor : 0}};
-    for (int i = 0; i < 4 && next; i++) {
+    UCHAR c = 0;
+    BOOLEAN have_condition = FALSE, result = TRUE;
+    for (int i = 0; i < 4; i++) {
       if (!(types & chain[i].bit_type)) continue;
-      const UCHAR c = COND(chain[i].bit);
-      status = version_compare(chain[i].have, chain[i].want, c) ? STATUS_SUCCESS : STATUS_REVISION_MISMATCH;
-      next = chain[i].have == chain[i].want && (c == 1 || c == 3 || c == 5);
+      if (!have_condition || c == 1) { c = COND(chain[i].bit); have_condition = TRUE; }
+      result = version_compare(chain[i].have, chain[i].want, c);
+      if (chain[i].have != chain[i].want) break;
     }
-    if (status) return status;
+    if (!result) return STATUS_REVISION_MISMATCH;
   }
   #undef COND
   return STATUS_SUCCESS;
