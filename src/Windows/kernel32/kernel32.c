@@ -71,6 +71,8 @@ static BOOL mailslot_nt_name(LPCWSTR name, WCHAR *buffer, UNICODE_STRING *us, OB
 EXPORT HANDLE WINAPI CreateFileW(LPCWSTR path, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD disposition, DWORD flags, HANDLE template_file);
 static BOOL is_dos_device_name(const WCHAR *name);
 EXPORT BOOL WINAPI CloseHandle(HANDLE h);
+static void port_note(HANDLE file, LPOVERLAPPED overlapped, ULONG_PTR bytes);      /* (extra3.inc: a finished overlapped call is queued at the port its file is tied to) */
+static void port_unlink(HANDLE file);
 EXPORT BOOL WINAPI GetFileAttributesExW(LPCWSTR path, int level, LPVOID data);
 static BOOL fail_nt(NTSTATUS status) { set_error(RtlNtStatusToDosError(status)); return FALSE; }
 static PVOID heap(void) { return RtlProcessHeap(); }
@@ -2011,6 +2013,7 @@ EXPORT UINT WINAPI WinExec(LPCSTR command_line, UINT show) {
 
 EXPORT BOOL WINAPI CloseHandle(HANDLE h) {
   if ((ULONG_PTR)h == 0x4B4F54) return TRUE;      /* (advapi32's token "handle": there is nothing behind it) */
+  port_unlink(h);
   const NTSTATUS status = NtClose(h);
   return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
@@ -2149,6 +2152,7 @@ EXPORT BOOL WINAPI WriteFile(HANDLE h, LPCVOID buffer, DWORD length, LPDWORD wri
   if (!NT_SUCCESS(status)) { complete_overlapped(overlapped, status, 0); return fail_nt(status); }
   if (written) *written = (DWORD)iosb.Information;
   complete_overlapped(overlapped, status, iosb.Information);
+  port_note(h, overlapped, iosb.Information);
   return TRUE;
 }
 /* An asynchronous operation's result is in the OVERLAPPED: Internal is its status (STATUS_PENDING until it is done), InternalHigh the bytes moved. While it is pending the
@@ -2213,7 +2217,9 @@ EXPORT HANDLE WINAPI CreateNamedPipeW(LPCWSTR name, DWORD open_mode, DWORD pipe_
   WCHAR buffer[300];
   UNICODE_STRING us;
   OBJECT_ATTRIBUTES attributes;
-  if (!name || !pipe_nt_name(name, buffer, &us, &attributes, sa && sa->bInheritHandle)) return INVALID_HANDLE_VALUE;
+  if (!name) { set_error(ERROR_PATH_NOT_FOUND); return INVALID_HANDLE_VALUE; }
+  if (!pipe_nt_name(name, buffer, &us, &attributes, sa && sa->bInheritHandle)) return INVALID_HANDLE_VALUE;
+  if ((pipe_mode & 2) && !(pipe_mode & 4)) { set_error(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE; }      /* (a byte pipe cannot be read as messages) */
   /* PIPE_ACCESS_INBOUND 1 (the server reads: clients may write), OUTBOUND 2, DUPLEX 3; the NT share access says what clients may do */
   const ULONG share = (open_mode & 3) == 1 ? 2 : (open_mode & 3) == 2 ? 1 : (open_mode & 3) == 3 ? 3 : 0;
   if (share == 0) { set_error(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE; }
@@ -2229,7 +2235,7 @@ EXPORT HANDLE WINAPI CreateNamedPipeW(LPCWSTR name, DWORD open_mode, DWORD pipe_
 }
 EXPORT HANDLE WINAPI CreateNamedPipeA(LPCSTR name, DWORD open_mode, DWORD pipe_mode, DWORD max_instances, DWORD out_size, DWORD in_size, DWORD timeout_ms, LPSECURITY_ATTRIBUTES sa) {
   WCHAR *w = name ? to_wide(name) : NULL;
-  if (!w) { if (name) return INVALID_HANDLE_VALUE; set_error(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE; }
+  if (!w) { if (name) return INVALID_HANDLE_VALUE; set_error(ERROR_PATH_NOT_FOUND); return INVALID_HANDLE_VALUE; }
   HANDLE h = CreateNamedPipeW(w, open_mode, pipe_mode, max_instances, out_size, in_size, timeout_ms, sa);
   free_wide(w);
   return h;
@@ -2241,7 +2247,45 @@ EXPORT HANDLE WINAPI CreateNamedPipeA(LPCSTR name, DWORD open_mode, DWORD pipe_m
 #define FSCTL_PIPE_WAIT_ 0x110018
 #define FSCTL_PIPE_TRANSCEIVE_ 0x11C017
 
+/* An overlapped call on a named pipe that has to wait (nothing to read yet, nobody connected yet) is carried out by a thread of its own, as the kernel's calls are
+ * synchronous; the thread completes the OVERLAPPED (and so its event) when the call returns. A call that can be answered at once is done in line, as without a thread. */
+typedef struct { int op; HANDLE pipe; LPVOID buffer; DWORD length; LPOVERLAPPED overlapped; } PipeRequest;      /* op: 0 read, 1 write, 2 connect */
+static DWORD WINAPI pipe_request_thread(LPVOID parameter) {
+  PipeRequest request = *(PipeRequest *)parameter;
+  RtlFreeHeap(heap(), 0, parameter);
+  IO_STATUS_BLOCK iosb;
+  iosb.Information = 0;
+  NTSTATUS status;
+  if (request.op == 0) status = NtReadFile(request.pipe, NULL, NULL, NULL, &iosb, request.buffer, request.length, NULL, NULL);
+  else if (request.op == 1) status = NtWriteFile(request.pipe, NULL, NULL, NULL, &iosb, request.buffer, request.length, NULL, NULL);
+  else status = NtFsControlFile(request.pipe, NULL, NULL, NULL, &iosb, FSCTL_PIPE_LISTEN_, NULL, 0, NULL, 0);
+  complete_overlapped(request.overlapped, status == STATUS_PENDING ? STATUS_SUCCESS : status, iosb.Information);
+  port_note(request.pipe, request.overlapped, iosb.Information);
+  return 0;
+}
+/* True (with ERROR_IO_PENDING set) if the call was handed to a thread. */
+static BOOL pipe_start_overlapped(int op, HANDLE h, LPVOID buffer, DWORD length, LPOVERLAPPED overlapped) {
+  if (!overlapped || device_type(h) != 0x11) return FALSE;
+  IO_STATUS_BLOCK iosb;
+  BYTE probe[16];
+  iosb.Information = 0;
+  const NTSTATUS peek = NtFsControlFile(h, NULL, NULL, NULL, &iosb, FSCTL_PIPE_PEEK_, NULL, 0, probe, sizeof(probe));
+  if (op == 0 && !(NT_SUCCESS(peek) && get32(probe + 4) == 0)) return FALSE;      /* (data, or an error, is answered now) */
+  if (op == 2 && peek != (NTSTATUS)0xC00000ADu) return FALSE;      /* (already connected) */
+  if (op == 1) return FALSE;
+  PipeRequest *request = RtlAllocateHeap(heap(), 0, sizeof(*request));
+  if (!request) return FALSE;
+  request->op = op; request->pipe = h; request->buffer = buffer; request->length = length; request->overlapped = overlapped;
+  overlapped->Internal = (ULONG_PTR)STATUS_PENDING;
+  if (overlapped->hEvent) NtResetEvent((HANDLE)((ULONG_PTR)overlapped->hEvent & ~(ULONG_PTR)1), NULL);
+  HANDLE thread = CreateThread(NULL, 0, pipe_request_thread, request, 0, NULL);
+  if (!thread) { RtlFreeHeap(heap(), 0, request); return FALSE; }
+  NtClose(thread);
+  set_error(997);      /* ERROR_IO_PENDING */
+  return TRUE;
+}
 EXPORT BOOL WINAPI ConnectNamedPipe(HANDLE h, LPOVERLAPPED overlapped) {
+  if (pipe_start_overlapped(2, h, NULL, 0, overlapped)) return FALSE;
   IO_STATUS_BLOCK iosb;
   const NTSTATUS status = NtFsControlFile(h, NULL, NULL, NULL, &iosb, FSCTL_PIPE_LISTEN_, NULL, 0, NULL, 0);
   complete_overlapped(overlapped, status, 0);
@@ -2459,6 +2503,8 @@ static void complete_overlapped(LPOVERLAPPED overlapped, NTSTATUS status, ULONG_
   if (overlapped->hEvent) NtSetEvent((HANDLE)((ULONG_PTR)overlapped->hEvent & ~(ULONG_PTR)1), NULL);
 }
 EXPORT BOOL WINAPI ReadFile(HANDLE h, LPVOID buffer, DWORD length, LPDWORD read, LPOVERLAPPED overlapped) {
+  if (read) *read = 0;
+  if (pipe_start_overlapped(0, h, buffer, length, overlapped)) return FALSE;
   if (!overlapped) { BOOL handled; const BOOL result = console_read_hook(h, buffer, length, read, &handled); if (handled) return result; }
   IO_STATUS_BLOCK iosb;
   LARGE_INTEGER offset;
@@ -2475,6 +2521,7 @@ EXPORT BOOL WINAPI ReadFile(HANDLE h, LPVOID buffer, DWORD length, LPDWORD read,
   if (!NT_SUCCESS(status)) { complete_overlapped(overlapped, status, 0); return fail_nt(status); }
   if (read) *read = (DWORD)iosb.Information;
   complete_overlapped(overlapped, status, iosb.Information);
+  port_note(h, overlapped, iosb.Information);
   return TRUE;
 }
 #include "console.inc"

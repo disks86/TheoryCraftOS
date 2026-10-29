@@ -166,7 +166,7 @@ uint32_t put_previous(Process& p, uint64_t address, int32_t value) {
 
 // What can be waited for.
 struct Waitable {
-  enum Type { Invalid, Thread, Object, Mailslot } type = Invalid;
+  enum Type { Invalid, Thread, Object, Mailslot, Never } type = Invalid;
   uint64_t thread = 0;      // (Mailslot: the descriptor slot)
   uint32_t object = 0;
 };
@@ -176,6 +176,7 @@ bool resolve(Process& p, uint64_t handle, Waitable* w) {
   if (!slot_of(handle, &slot)) return false;
   const DescriptorKind k = p.files().kind(slot);
   if (k == DescriptorKind::Thread) { w->type = Waitable::Thread; w->thread = p.files().token(slot); return true; }
+  if (k == DescriptorKind::Pipe) { w->type = Waitable::Never; return true; }      // (a pipe handle is never signalled here)
   if (k == DescriptorKind::Mailslot) { w->type = Waitable::Mailslot; w->thread = slot; return true; }
   if (is_object_kind(k)) { w->type = Waitable::Object; w->object = uint32_t(p.files().token(slot)); return true; }
   return false;
@@ -208,6 +209,7 @@ uint32_t wait_for(Process& p, const Waitable* items, uint32_t count, bool all, u
       Process::ThreadRecord* t = p.find_thread(items[i].thread);
       return !t || t->finished;
     }
+    if (items[i].type == Waitable::Never) return false;
     if (items[i].type == Waitable::Mailslot) return mailslot_read_ready_locked(p, items[i].thread);
     return objects->ready_locked(items[i].object, waiter);
   };

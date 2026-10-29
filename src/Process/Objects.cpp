@@ -205,7 +205,7 @@ struct ObjectManager::Pipe {
   uint8_t* data[2] = {};            // data[d]: what end d wrote and the other end has not read yet
   uint32_t capacity[2] = {}, head[2] = {}, count[2] = {};
   uint32_t end_refs[2] = {};
-  bool anonymous = false, connected = false, listening = false, client_seen = false;
+  bool anonymous = false, connected = false, listening = false, client_seen = false, disconnected = false;
   uint32_t access = 0, max_instances = 0, generation = 0;
   // The end an end_code names; false for a client end of an earlier connection.
   bool end_of(uint32_t code, uint32_t* end) const {
@@ -281,6 +281,7 @@ ObjectManager::Created ObjectManager::create_pipe(StringView name, uint32_t out_
       if (o.kind != ObjectKind::Pipe || o.name_size == 0 || !same_name(o.name, o.name_size, name)) continue;
       ++instances;
       const Pipe& other = pipes_[o.pipe];
+      if (other.access != access) { result.status = 0xC0000022u; return result; }      // (every instance of a pipe has the same access)
       if (other.max_instances != 0 && instances >= other.max_instances) { result.status = kPipeBusy; return result; }
     }
     if (max_instances != 0 && instances >= max_instances) { result.status = kPipeBusy; return result; }
@@ -334,10 +335,11 @@ ObjectManager::Created ObjectManager::connect_pipe(StringView name, bool want_re
     if (o.kind != ObjectKind::Pipe || o.name_size == 0 || !same_name(o.name, o.name_size, name)) continue;
     found = true;
     Pipe& p = pipes_[o.pipe];
-    if (p.connected || p.end_refs[0] == 0) continue;
+    if (p.connected || p.disconnected || p.end_refs[0] == 0) continue;      // (an instance its server disconnected takes no client until it listens again)
     if ((want_read && !(p.access & kPipeOutbound)) || (want_write && !(p.access & kPipeInbound))) { result.status = 0xC0000022u; return result; }
     p.connected = true;
     p.client_seen = true;
+    p.disconnected = false;
     p.end_refs[1] = 1;
     ++p.generation;
     ++o.references;
@@ -379,10 +381,10 @@ ObjectManager::PipeResult ObjectManager::pipe_read_locked(uint32_t id, uint32_t 
   Pipe* p = pipe_of(id);
   uint32_t end = 0;
   if (!p || !p->end_of(end_code, &end)) return PipeResult::Broken;
-  if (end == 1 && !p->connected) return PipeResult::Broken;
+  if (end == 1 && !p->connected) return p->disconnected ? PipeResult::NotConnected : PipeResult::Broken;
   const uint32_t q = 1 - end;      // the queue the other end writes
   if (available) *available = p->count[q];
-  if (end == 0 && !p->connected) return p->client_seen ? PipeResult::Broken : PipeResult::NotConnected;
+  if (end == 0 && !p->connected) return p->client_seen ? PipeResult::Broken : (p->disconnected ? PipeResult::NotConnected : PipeResult::Listening);
   if (p->count[q] == 0) return p->end_refs[1 - end] == 0 || (end == 0 && !p->connected) ? PipeResult::Broken : PipeResult::WouldBlock;
   uint32_t n = p->count[q] < capacity ? p->count[q] : capacity;
   for (uint32_t i = 0; i < n; ++i) out[i] = p->data[q][(p->head[q] + i) % p->capacity[q]];
@@ -400,7 +402,10 @@ ObjectManager::PipeResult ObjectManager::pipe_write_locked(uint32_t id, uint32_t
   Pipe* p = pipe_of(id);
   uint32_t end = 0;
   if (!p || !p->end_of(end_code, &end)) return PipeResult::Closing;
-  if (!p->connected) return end == 0 ? (p->client_seen ? PipeResult::Closing : PipeResult::NotConnected) : PipeResult::Closing;
+  if (!p->connected) {
+    if (p->disconnected) return PipeResult::NotConnected;
+    return end == 0 ? (p->client_seen ? PipeResult::Closing : PipeResult::Listening) : PipeResult::Closing;
+  }
   if (p->end_refs[1 - end] == 0) return PipeResult::Closing;
   const uint32_t q = end;
   if (!p->data[q] || p->capacity[q] == 0) return PipeResult::Broken;
@@ -419,14 +424,17 @@ ObjectManager::PipeResult ObjectManager::pipe_listen_locked(uint32_t id) {
   if (!p) return PipeResult::Broken;
   if (p->connected) return PipeResult::Ok;
   p->listening = true;
+  p->disconnected = false;
   return PipeResult::WouldBlock;
 }
 
-void ObjectManager::pipe_disconnect(uint32_t id) {
+bool ObjectManager::pipe_disconnect(uint32_t id) {
   Locked hold(sync_);
   Object* o = at(id);
   Pipe* p = pipe_of(id);
-  if (!o || !p || p->anonymous) return;
+  if (!o || !p || p->anonymous) return false;
+  const bool already = p->disconnected;      // (a second disconnect is an error; one after the client has gone is not)
+  p->disconnected = true;
   if (p->connected) {
     p->connected = false;
     o->references = o->references > p->end_refs[1] ? o->references - p->end_refs[1] : 0;
@@ -437,6 +445,7 @@ void ObjectManager::pipe_disconnect(uint32_t id) {
   p->count[0] = p->count[1] = 0;
   p->head[0] = p->head[1] = 0;
   sync_.notify_all();
+  return !already;
 }
 
 uint32_t ObjectManager::pipe_pending_locked(uint32_t id, uint32_t end_code) {
@@ -446,11 +455,16 @@ uint32_t ObjectManager::pipe_pending_locked(uint32_t id, uint32_t end_code) {
   return p->count[end];
 }
 
+bool ObjectManager::pipe_name_exists_locked(StringView name) {
+  for (Object& o : objects_) if (o.kind == ObjectKind::Pipe && o.name_size != 0 && same_name(o.name, o.name_size, name)) return true;
+  return false;
+}
+
 bool ObjectManager::pipe_name_available_locked(StringView name) {
   for (Object& o : objects_) {
     if (o.kind != ObjectKind::Pipe || o.name_size == 0 || !same_name(o.name, o.name_size, name)) continue;
     const Pipe& p = pipes_[o.pipe];
-    if (!p.connected && p.end_refs[0] != 0) return true;
+    if (!p.connected && !p.disconnected && p.end_refs[0] != 0) return true;
   }
   return false;
 }
