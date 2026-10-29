@@ -691,11 +691,16 @@ static Heap *heap_new(ULONG flags, SIZE_T commit) {
   return h;
 }
 
-static int heap_ok(Heap *h) { return h && h->magic == HEAP_MAGIC; }
-
-/* Every heap of the process, in the order they were made (the process heap first): RtlGetProcessHeaps and the Toolhelp heap lists. */
 #define MAX_HEAPS 128
 static Heap *g_heaps[MAX_HEAPS];
+/* A heap handle is good if it is one of the heaps made (a destroyed heap's memory is gone: its header is not looked at). */
+static int heap_ok(Heap *h) {
+  if (!h) return 0;
+  for (int i = 0; i < MAX_HEAPS; ++i) if (g_heaps[i] == h) return h->magic == HEAP_MAGIC;
+  return 0;
+}
+
+/* Every heap of the process, in the order they were made (the process heap first): RtlGetProcessHeaps and the Toolhelp heap lists. */
 static volatile LONG g_heaps_lock;
 static void heaps_lock(void) { while (__sync_lock_test_and_set(&g_heaps_lock, 1)) NtYieldExecution(); }
 static void heaps_unlock(void) { __sync_lock_release(&g_heaps_lock); }
