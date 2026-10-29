@@ -2148,17 +2148,17 @@ static void test_set_mode() {
   // enabled, the link trained (start, pattern 1, the drive, pattern 3, complete) and the video on
   CHECK(vega.set_mode(dp, 1, m, 8, &r) && r.failed == AmdVegaM::ModeSetStage::Done && r.pll == AmdModeSet::kDpDto && r.link.config.lanes == 4 && r.link.config.rate_khz == 162000 &&
         r.link.outcome.trained() && r.panel_mode == 0);
-  const std::vector<uint32_t> want_order = {13, 44, 34, 35, 42, 12, 49, 40, 33, 4, 76, 35, 34, 44, 4, 4, 76, 4, 4, 76, 4, 4, 4};
+  const std::vector<uint32_t> want_order = {13, 44, 35, 42, 12, 49, 40, 33, 4, 76, 35, 34, 44, 4, 4, 76, 4, 4, 76, 4, 4, 4};       // (a CRTC that was never enabled is not blanked first)
   CHECK(auxcard.table_order == want_order);
   if (auxcard.table_order != want_order) { for (uint32_t t : auxcard.table_order) printf(" %u", t); printf(" stage %d\n", int(r.failed)); }
   const auto& mc = auxcard.mode_calls;
-  CHECK(mc.size() == 12 && mc[0].table == 13 && mc[0].words == std::vector<uint32_t>({1u}) && mc[1].table == 44 && mc[1].words == std::vector<uint32_t>({1u | 1u << 8}));
-  CHECK(mc[2].words == std::vector<uint32_t>({1u | 1u << 8, 0}) && mc[3].words == std::vector<uint32_t>({1u}));
-  CHECK(mc[4].table == 42 && mc[4].words[0] == (1u | 0x0Bu << 8 | 0u << 16 | 2u << 24));
-  CHECK(mc[5].table == 12 && mc[5].words[0] == 1485000 && (mc[5].words[1] & 0xFF) == 11 && ((mc[5].words[1] >> 16) & 0xFF) == 0 && mc[5].words[2] == 1);
-  CHECK(mc[6].table == 49 && mc[6].words[0] == (1920u | 280u << 16) && mc[6].words[5] == 1);
-  CHECK(mc[7].table == 40 && mc[7].words[2] == 1 && mc[8].table == 33 && mc[8].words[0] == 1);
-  CHECK(mc[9].table == 35 && mc[9].words[0] == (1u | 1u << 8) && mc[10].table == 34 && mc[10].words[0] == 1u && mc[11].table == 44 && mc[11].words[0] == 1u);
+  CHECK(mc.size() == 11 && mc[0].table == 13 && mc[0].words == std::vector<uint32_t>({1u}) && mc[1].table == 44 && mc[1].words == std::vector<uint32_t>({1u | 1u << 8}));
+  CHECK(mc[2].table == 35 && mc[2].words == std::vector<uint32_t>({1u}));
+  CHECK(mc[3].table == 42 && mc[3].words[0] == (1u | 0x0Bu << 8 | 0u << 16 | 2u << 24));
+  CHECK(mc[4].table == 12 && mc[4].words[0] == 1485000 && (mc[4].words[1] & 0xFF) == 11 && ((mc[4].words[1] >> 16) & 0xFF) == 0 && mc[4].words[2] == 1);
+  CHECK(mc[5].table == 49 && mc[5].words[0] == (1920u | 280u << 16) && mc[5].words[5] == 1);
+  CHECK(mc[6].table == 40 && mc[6].words[2] == 1 && mc[7].table == 33 && mc[7].words[0] == 1);
+  CHECK(mc[8].table == 35 && mc[8].words[0] == (1u | 1u << 8) && mc[9].table == 34 && mc[9].words[0] == 1u && mc[10].table == 44 && mc[10].words[0] == 1u);
   // the encoder: video off and the transmitter off first, then setup (DIG 3, four lanes, the pixel clock, 8 bits, 1.62 GHz = 6 x 270 MHz), the panel mode (external DP), the transmitter
   const auto& dc = auxcard.dig_calls;
   CHECK(dc.size() == 11 && ((dc[0].words[0] >> 8) & 0xFF) == 0x0C && dc[1].table == 2 && (dc[1].words[0] >> 24) == 0);
@@ -2174,8 +2174,8 @@ static void test_set_mode() {
   auxcard.dig_calls.clear();
   const size_t doorbells = auxcard.doorbells;
   CHECK(vega.set_mode(hdmi, 3, m, 10, &r) && r.pll == AmdModeSet::kComboPhyPll0 + 2 && auxcard.doorbells == doorbells);
-  CHECK(auxcard.table_order == std::vector<uint32_t>({13, 44, 34, 35, 42, 12, 49, 40, 33, 76, 35, 34, 44, 4, 4, 76}));
-  CHECK(mc.size() == 12 && mc[5].words[2] == (3u | 1u << 8) && ((mc[5].words[1] >> 16) & 0xFF) == 3 && (mc[5].words[1] & 0xFF) == 22);
+  CHECK(auxcard.table_order == std::vector<uint32_t>({13, 44, 35, 42, 12, 49, 40, 33, 76, 35, 34, 44, 4, 4, 76}));
+  CHECK(mc.size() == 11 && mc[4].words[2] == (3u | 1u << 8) && ((mc[4].words[1] >> 16) & 0xFF) == 3 && (mc[4].words[1] & 0xFF) == 22);
   CHECK(dc[0].table == 2 && (dc[0].words[0] >> 24) == 0 && dc[1].words[0] == (2u | 0x0Fu << 8 | 3u << 16 | 4u << 24) && dc[1].words[1] == 14850 && dc[1].words[2] == 3u);
   // with a surface: the graphics plane of the CRTC (3: block offset 0x2600) is pointed at it between the timing and the overscan; a bad surface is the Scanout stage
   amd_dce11::ScanoutSurface surface;
@@ -2189,6 +2189,21 @@ static void test_set_mode() {
   CHECK(rig.card.dce.get(0x1a00 + 0x2600) == 1 && rig.card.dce.get(0x1a06 + 0x2600) == 1920 && rig.card.dce.get(0x1a0d + 0x2600) == 1920 && rig.card.dce.get(0x1a01 + 0x2600) == 2);
   surface.address = 0x100001;
   CHECK(!vega.set_mode(hdmi, 3, m, 8, &r, AmdModeSet::kPllInvalid, &surface) && r.failed == AmdVegaM::ModeSetStage::Scanout);
+  // HDMI is a flat panel device with a FMT block: 8 bits truncated (enable, depth 1), 6 bits depth 0, 12 bits nothing; an interlaced mode turns the interleave on; the VGA mode is off after the unblank
+  CHECK(rig.card.dce.get(0x1bf2 + 0x2600) == (1u | 1u << 4) && (rig.card.dce.get(0x1ac0 + 0x2600) & 8) == 0 && (rig.card.dce.get(0xf9) & 1) == 0);
+  {
+    DisplayMode interlaced = m;
+    interlaced.interlaced = true;
+    CHECK(vega.set_mode(hdmi, 3, interlaced, 8, &r) && (rig.card.dce.get(0x1ac0 + 0x2600) & 8) != 0 && rig.card.dce.get(0x1bf2 + 0x2600) == (1u | 1u << 4));
+    CHECK(vega.set_mode(hdmi, 3, m, 6, &r) && (rig.card.dce.get(0x1ac0 + 0x2600) & 8) == 0 && rig.card.dce.get(0x1bf2 + 0x2600) == 1u);
+    CHECK(vega.set_mode(hdmi, 3, m, 12, &r) && rig.card.dce.get(0x1bf2 + 0x2600) == 0u);
+    // the CRTC was enabled, so the next preparation blanks it (with the VGA mode on around the blank)
+    auxcard.mode_calls.clear();
+    CHECK(vega.set_mode(hdmi, 3, m, 8, &r) && auxcard.mode_calls[2].table == 34 && auxcard.mode_calls[2].words[0] == (3u | 1u << 8) && auxcard.mode_calls[3].table == 35);
+    auxcard.table_order.clear();
+    auxcard.mode_calls.clear();
+    auxcard.dig_calls.clear();
+  }
   // eDP on CRTC 0: the panel powered up (it answers only then) before its capabilities are read, off for the encoder's mode set and on again for the commit
   auxcard.unpowered_channel = 0x92;
   auxcard.table_order.clear();

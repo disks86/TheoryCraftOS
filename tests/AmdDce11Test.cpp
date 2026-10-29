@@ -414,6 +414,32 @@ static void test_scanout_formats() {
   (void)written;
 }
 
+// The VGA mode switch, the interleave bit and the FMT block's truncation and dither.
+static void test_fmt() {
+  FakeDisplay d;
+  Scanout scan(d);
+  const uint32_t vga[6] = {0xcc, 0xce, 0xf8, 0xf9, 0xfa, 0xfb};
+  for (uint32_t crtc = 0; crtc < 6; ++crtc) {
+    d.set(vga[crtc], 0x10);
+    CHECK(scan.vga_enable(crtc, true) && d.get(vga[crtc]) == 0x11 && scan.vga_enable(crtc, false) && d.get(vga[crtc]) == 0x10);
+  }
+  const uint32_t off = 0x1f9c - 0x1b9c;    // CRTC 2
+  d.set(0x1ac0 + off, 0x5);
+  CHECK(scan.set_interleave(2, true) && d.get(0x1ac0 + off) == 0xD && scan.set_interleave(2, false) && d.get(0x1ac0 + off) == 0x5);
+  // truncation: enable | depth << 4 (6 bits 0, 8 bits 1, 10 bits 2); dither: frame and high pass random, spatial enable and depth << 11, and for 8 and 10 bits the RGB random too
+  const struct { uint32_t bpc; bool dither; uint32_t value; } rows[] = {
+      {6, false, 0x01}, {8, false, 0x11}, {10, false, 0x21}, {12, false, 0}, {16, false, 0},
+      {6, true, (1u << 13) | (1u << 15) | (1u << 8) | (0u << 11)}, {8, true, (1u << 13) | (1u << 14) | (1u << 15) | (1u << 8) | (1u << 11)},
+      {10, true, (1u << 13) | (1u << 14) | (1u << 15) | (1u << 8) | (2u << 11)}, {12, true, 0}};
+  for (const auto& r : rows) {
+    d.set(0x1bf2 + off, 0xFFFFFFFFu);
+    CHECK(scan.program_fmt(2, r.bpc, r.dither) && d.get(0x1bf2 + off) == r.value);
+  }
+  d.set(0x1bf2 + off, 0x1234);
+  CHECK(scan.program_fmt(2, 0, false) && d.get(0x1bf2 + off) == 0x1234);       // (an unknown depth leaves it)
+  CHECK(!scan.vga_enable(6, true) && !scan.set_interleave(6, true) && !scan.program_fmt(6, 8, false));
+}
+
 int main() {
   test_probe();
   test_flip();
@@ -422,6 +448,7 @@ int main() {
   test_display();
   test_scanout();
   test_scanout_formats();
+  test_fmt();
   printf(g_failed ? "AmdDce11Test: %d FAILED\n" : "AmdDce11Test: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }

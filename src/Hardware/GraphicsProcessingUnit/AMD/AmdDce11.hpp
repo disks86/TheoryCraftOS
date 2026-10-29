@@ -130,6 +130,13 @@ class Scanout {
   // dce_v11_0_crtc_load_lut: the colour pipeline set to pass the plane through the table (no input CSC, no prescale, no degamma, gamut remap or regamma, no output CSC, cursor alpha
   // blending on) and the 256 entries written, 10 bits per colour (entry 0 first). With a null table the identity ramp.
   bool load_lut(uint32_t crtc, const LutEntry* table256);
+  // dce_v11_0_vga_enable: the CRTC's VGA mode on or off (the driver turns it on around the unblank and off after).
+  bool vga_enable(uint32_t crtc, bool enable);
+  // dce_v11_0_set_interleave: LB_DATA_FORMAT.INTERLEAVE_EN for an interlaced mode.
+  bool set_interleave(uint32_t crtc, bool interlaced);
+  // dce_v11_0_program_fmt: the FMT block's truncation or dither for `bpc` bits per colour (6, 8, 10; other depths are not touched, as in the driver). `dither`: spatial dither with the random
+  // generators instead of truncation. False for a CRTC that does not exist.
+  bool program_fmt(uint32_t crtc, uint32_t bpc, bool dither);
 
  private:
   IVcnRegisters& r_;

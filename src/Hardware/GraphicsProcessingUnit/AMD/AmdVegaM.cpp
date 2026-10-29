@@ -571,6 +571,17 @@ ModeSetOutput output_of(const AtomConnectors::Connector& connector, uint8_t crtc
   o.bits_per_color = bpc;
   return o;
 }
+// dce_v11_0_crtc_dpms(DRM_MODE_DPMS_OFF): if the CRTC was enabled it is blanked (with the VGA mode on around it), then it is disabled
+bool crtc_dpms_off(ModeSession& session, amd_dce11::Scanout& display, uint8_t crtc, bool was_enabled) {
+  bool ok = true;
+  if (was_enabled) {
+    display.vga_enable(crtc, true);
+    ok = session.set.blank_crtc(crtc, true);
+    display.vga_enable(crtc, false);
+  }
+  return session.set.enable_crtc(crtc, false) && ok;
+}
+
 // amdgpu_atombios_encoder_setup_dig(ATOM_DISABLE): DisplayPort video off, the sink to D3, the transmitter disabled, the eDP panel off. (`aux`: the DisplayPort sink's AUX session, if any.)
 bool dig_off(ModeSession& session, AuxSession* aux, const AtomConnectors::Connector& connector, const ModeSetOutput& o, const DisplayMode& mode) {
   AmdModeSet& set = session.set;
@@ -618,8 +629,9 @@ bool AmdVegaM::set_mode(const AtomConnectors::Connector& connector, uint8_t crtc
   Dpcd::Capabilities caps;
   DpLinkConfig config;
   // dce_v11_0_crtc_prepare: power gating off, the CRTC locked, then dpms off (blanked and disabled)
+  amd_dce11::Scanout display(*inputs_.registers);
   if ((!session.optional(AmdModeSet::kEnableDispPowerGating) && !set.powergate_crtc(crtc, false)) || (!session.optional(AmdModeSet::kUpdateDoubleBuffer) && !set.lock_crtc(crtc, true)) ||
-      !set.blank_crtc(crtc, true) || !set.enable_crtc(crtc, false)) return finish(ModeSetStage::Prepare);
+      !crtc_dpms_off(session, display, crtc, (crtc_active_ >> crtc & 1) != 0)) return finish(ModeSetStage::Prepare);
   // dce_v11_0_encoder_prepare: the eDP panel on, the CRTC's source; (before them the link configuration, which the driver made when the mode was fixed up)
   if (dp) {
     if (!connector.has_ddc) return finish(ModeSetStage::SinkCapabilities);
@@ -636,18 +648,24 @@ bool AmdVegaM::set_mode(const AtomConnectors::Connector& connector, uint8_t crtc
     result.panel_mode = panel_mode_of(connector, aux->aux);
   }
   if (!set.select_crtc_source(o)) return finish(ModeSetStage::CrtcSource);
+  if (o.dfp && !edp && !display.program_fmt(crtc, bpc, false)) return finish(ModeSetStage::CrtcSource);       // (the FMT block; an LCD panel's is set up by the BIOS)
   // dce_v11_0_crtc_mode_set: the pixel clock, the timing, (the base: the caller's), the overscan and the scaler
   if (!set.set_pixel_clock(o, mode)) return finish(ModeSetStage::PixelClock);
   if (!set.set_dtd_timing(o, mode)) return finish(ModeSetStage::Timing);
-  if (surface && !amd_dce11::Scanout(*inputs_.registers).set(crtc, *surface)) return finish(ModeSetStage::Scanout);
+  if (surface && !display.set(crtc, *surface)) return finish(ModeSetStage::Scanout);
   if (!session.optional(AmdModeSet::kSetCrtcOverscan) && !set.overscan_setup(o)) return finish(ModeSetStage::Overscan);
   if (!session.optional(AmdModeSet::kEnableScaler) && !set.scaler_setup(o)) return finish(ModeSetStage::Scaler);
   crtc_pll_[crtc] = pll;
   // dce_v11_0_encoder_mode_set: the encoder off (setup_dig(ATOM_DISABLE))
   if (!dig_off(session, aux.get(), connector, o, mode)) return finish(ModeSetStage::EncoderOff);
+  display.set_interleave(crtc, mode.interlaced);        // (a scaler setup clears it on some chips)
   // dce_v11_0_crtc_commit: dpms on (enabled, unblanked), unlocked
   if (!set.enable_crtc(crtc, true)) return finish(ModeSetStage::CrtcEnable);
-  if (!set.blank_crtc(crtc, false) || (!session.optional(AmdModeSet::kUpdateDoubleBuffer) && !set.lock_crtc(crtc, false))) return finish(ModeSetStage::Unblank);
+  crtc_active_ |= 1u << crtc;
+  display.vga_enable(crtc, true);
+  const bool unblanked = set.blank_crtc(crtc, false);
+  display.vga_enable(crtc, false);
+  if (!unblanked || (!session.optional(AmdModeSet::kUpdateDoubleBuffer) && !set.lock_crtc(crtc, false))) return finish(ModeSetStage::Unblank);
   // dce_v11_0_encoder_commit: setup_dig(ATOM_ENABLE)
   if (!set.encoder(o, mode, AmdModeSet::kEncoderSetup)) return finish(ModeSetStage::EncoderSetup);
   if (!set.encoder(o, mode, AmdModeSet::kEncoderSetupPanelMode, dp ? result.panel_mode : AmdModeSet::kPanelModeExternalDp)) return finish(ModeSetStage::PanelMode);
@@ -685,9 +703,10 @@ bool AmdVegaM::disable_mode(const AtomConnectors::Connector& connector, uint8_t 
   if (aux && !aux->bios.valid()) aux = UniquePointer<AuxSession>();
   // dce_v11_0_encoder_disable: dpms off; dce_v11_0_crtc_disable: dpms off (blanked, disabled), power gating on, the PLL off if no other CRTC uses it
   bool ok = dig_off(session, aux.get(), connector, o, mode);
-  ok = set.blank_crtc(crtc, true) && ok;
-  ok = set.enable_crtc(crtc, false) && ok;
-  ok = amd_dce11::Scanout(*inputs_.registers).disable(crtc) && ok;       // dce_v11_0_grph_enable(false)
+  amd_dce11::Scanout display(*inputs_.registers);
+  ok = crtc_dpms_off(session, display, crtc, (crtc_active_ >> crtc & 1) != 0) && ok;
+  crtc_active_ &= ~(1u << crtc);
+  ok = display.disable(crtc) && ok;       // dce_v11_0_grph_enable(false)
   if (!session.optional(AmdModeSet::kEnableDispPowerGating)) ok = set.powergate_crtc(crtc, true) && ok;
   crtc_pll_[crtc] = 0xFF;
   const bool combo = pll >= AmdModeSet::kComboPhyPll0 && pll < AmdModeSet::kComboPhyPll0 + 6;
