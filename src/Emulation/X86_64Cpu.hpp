@@ -54,7 +54,7 @@ class X86_64Cpu final : public IGuestCpu {
     uint64_t q[8] = {};
   };
   struct State {
-    uint64_t r[16] = {};
+    uint64_t r[32] = {};      // RAX..R15, and R16..R31 (Intel APX; the context image and cpuid only know the first 16 unless xsave component 19 is used)
     uint64_t rip = 0;
     uint64_t rflags = 2;
     uint64_t fs_base = 0, gs_base = 0;
@@ -98,6 +98,10 @@ class X86_64Cpu final : public IGuestCpu {
     uint32_t available = 0, position = 0;
     bool truncated = false;      // it needed more bytes than there were
     bool rex_present = false, rex_w = false, rex_r = false, rex_x = false, rex_b = false;
+    bool rex_r4 = false, rex_x4 = false, rex_b4 = false;      // the APX REX2 bits that name registers 16..31
+    bool rex2 = false;
+    uint32_t ext_b() const { return (rex_b ? 8u : 0u) | (rex_b4 ? 16u : 0u); }      // the bits that REX.B / B4 add to a register number in an opcode or modrm.rm field
+    bool apx_high() const { return rex_r4 || rex_x4 || rex_b4; }
     bool operand16 = false, address32 = false, rep = false, repne = false;
     uint8_t segment = 0;         // 0 none, 1 FS, 2 GS
     uint8_t mod = 0;
@@ -137,6 +141,9 @@ class X86_64Cpu final : public IGuestCpu {
   Step string_instruction(GuestMemory& m, uint8_t opcode);
   Step step(GuestMemory& m);
   Step step_0f(GuestMemory& m);
+  Step step_0f_op(GuestMemory& m, uint8_t opcode);      // (the opcode byte after 0F already read)
+  Step step_op(GuestMemory& m, uint8_t opcode);         // (a one-byte-map opcode, prefixes decoded)
+  Step apx_map4(GuestMemory& m, uint8_t p0, uint8_t p1, uint8_t p2, uint8_t opcode);      // Intel APX: EVEX map 4, the promoted legacy instructions
   Step step_sse(GuestMemory& m, uint8_t opcode);
   static bool sse_integer_valid(uint8_t op);
   static bool sse_integer_core(uint8_t op, Xmm& dst, const Xmm& src);
@@ -171,7 +178,10 @@ class X86_64Cpu final : public IGuestCpu {
   Step evex_fp(GuestMemory& m, const EvexOp& def);
   Step evex_fp16(GuestMemory& m, const EvexOp& def);
   Step evex_ext(GuestMemory& m, const EvexOp& def);
-  Step evex_er(GuestMemory& m, const EvexOp& def);      // X86_64Misc.cpp: AVX-512 ER
+  Step evex_er(GuestMemory& m, const EvexOp& def);
+  Step evex_bf16(GuestMemory& m, const EvexOp& def);
+  Step evex_minmax(GuestMemory& m, const EvexOp& def);
+  Step evex_avx102(GuestMemory& m, const EvexOp& def);      // X86_64EvexBf16.cpp: AVX10.2 vdpphps, vmpsadbw and the saturating conversions      // X86_64EvexBf16.cpp: AVX10.2 vminmax and vcomx / vucomx      // X86_64EvexBf16.cpp: AVX10.2 bfloat16 arithmetic      // X86_64Misc.cpp: AVX-512 ER
   Step evex_vsib(GuestMemory& m, const EvexOp& def);
   Vec512 get_vec(uint32_t reg) const;
   void set_vec(uint32_t reg, const Vec512& value, uint32_t vl_bits);
@@ -181,6 +191,8 @@ class X86_64Cpu final : public IGuestCpu {
   Step sm3_instruction(GuestMemory& m, uint32_t map, uint8_t op, uint32_t vvvv);
   Step vex_gather(GuestMemory& m, uint8_t opcode, bool wide, uint32_t vvvv);
   Step vex_fma(GuestMemory& m, uint8_t opcode, bool wide, uint32_t vvvv);
+  Step fma4_instruction(GuestMemory& m, uint8_t opcode, bool wide, uint32_t vvvv);      // AMD FMA4 (VEX map 3)
+  Step xop_instruction(GuestMemory& m, uint32_t map, uint8_t opcode, uint32_t vvvv);      // AMD XOP and TBM (the 8F prefix)
   Step vex_bmi(GuestMemory& m, int map, uint8_t opcode, bool wide, uint32_t vvvv);
   Step xsave_family(GuestMemory& m, uint32_t kind);
   // X86_64Misc.cpp: the instructions that are neither SSE nor AVX nor x87 and did not fit the main switch
@@ -194,6 +206,14 @@ class X86_64Cpu final : public IGuestCpu {
   uint32_t tile_rows(uint32_t t) const { return tiles_.config[48 + t]; }
   uint32_t tile_colsb(uint32_t t) const { return tiles_.config[16 + 2 * t] | (uint32_t{tiles_.config[17 + 2 * t]} << 8); }
   bool tiles_configured() const { return tiles_.config[0] != 0; }
+  // Segment registers and far transfers (X86_64Segment.cpp).
+  Step segment_move(GuestMemory& m, uint8_t opcode);
+  Step far_pointer_load(GuestMemory& m, uint8_t opcode);
+  Step far_branch(GuestMemory& m, bool is_call);
+  Step far_return(GuestMemory& m, uint8_t opcode);
+  Step interrupt_return(GuestMemory& m);
+  bool push_sized(GuestMemory& m, uint64_t value, uint32_t size);
+  bool load_selector(uint32_t segment, uint16_t selector);
   Step system_0f01(GuestMemory& m);                     // 0F 01 with a register operand: xgetbv, xend, xtest, rdtscp
   Step adx_instruction(GuestMemory& m, bool overflow);  // adcx (66 0F 38 F6) and adox (F3 0F 38 F6)
   Step fsgsbase_instruction(GuestMemory& m);            // F3 0F AE /0../3 with a register operand (already decoded): rdfsbase, rdgsbase, wrfsbase, wrgsbase
@@ -251,6 +271,7 @@ class X86_64Cpu final : public IGuestCpu {
     uint8_t data[8][1024] = {};
   };
   Tiles tiles_;
+  uint16_t selector_[6] = {0x2B, 0x33, 0x2B, 0x2B, 0x2B, 0x2B};      // es cs ss ds fs gs
   State s_;
   Decoded d_;
   GuestFault fault_;

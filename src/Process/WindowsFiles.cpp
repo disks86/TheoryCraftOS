@@ -556,7 +556,7 @@ uint32_t nt_query_information_file(Process& p, const SyscallRequest& r) {
   }
   if (kind == DescriptorKind::Pipe) {
     const uint32_t pipe_class = static_cast<uint32_t>(info_class);      // (a ULONG: the upper half of the stack slot is not defined)
-    if (pipe_class == 23 || pipe_class == 24) return pipe_query_information(p, slot, pipe_class, r.args[1], r.args[2], uint32_t(r.args[3]));
+    if (pipe_class == 8 || pipe_class == 23 || pipe_class == 24) return pipe_query_information(p, slot, pipe_class, r.args[1], r.args[2], uint32_t(r.args[3]));
   }
   if (kind == DescriptorKind::Mailslot) {
     const uint32_t mailslot_class = static_cast<uint32_t>(info_class);

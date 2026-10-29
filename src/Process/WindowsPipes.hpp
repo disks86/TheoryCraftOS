@@ -46,6 +46,8 @@ uint32_t pipe_set_information(Process& p, uint64_t slot, uint32_t info_class, ui
 // NtFlushBuffersFile: waits until the other end has read everything.
 uint32_t pipe_flush(Process& p, uint64_t slot);
 // What closing, duplicating or inheriting a pipe handle does to the pipe's ends (the token is the descriptor's).
+// A client end of a pipe whose server disconnected it is not signalled (the system lock held).
+bool pipe_handle_gone_locked(Process& p, uint64_t slot);
 void pipe_token_add(uint64_t token);
 void pipe_token_release(uint64_t token);
 

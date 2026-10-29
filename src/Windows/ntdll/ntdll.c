@@ -586,30 +586,31 @@ static ULONG run_apcs(void) {
   ULONG count = 0;
   ULONG64 apc[4];
   while (NtDequeueApc(apc) == STATUS_SUCCESS) {
+    if (!apc[0]) continue;      /* (an APC with no routine only ends the wait) */
     ((void (NTAPI *)(ULONG_PTR, ULONG_PTR, ULONG_PTR))apc[0])((ULONG_PTR)apc[1], (ULONG_PTR)apc[2], (ULONG_PTR)apc[3]);
     ++count;
   }
   return count;
 }
-EXPORT NTSTATUS NTAPI NtTestAlert(void) { return run_apcs() ? STATUS_ALERTED : STATUS_SUCCESS; }
+EXPORT NTSTATUS NTAPI NtTestAlert(void) { run_apcs(); return STATUS_SUCCESS; }
 EXPORT NTSTATUS NTAPI NtWaitForSingleObject(HANDLE h, BOOLEAN alertable, PLARGE_INTEGER timeout) {
   const NTSTATUS status = RawNtWaitForSingleObject(h, alertable, timeout);
-  if (status == STATUS_USER_APC) run_apcs();
+  if (status == STATUS_USER_APC && !run_apcs()) return STATUS_SUCCESS;      /* (only routine-less ones) */
   return status;
 }
 EXPORT NTSTATUS NTAPI NtWaitForMultipleObjects(ULONG count, const HANDLE *handles, ULONG type, BOOLEAN alertable, PLARGE_INTEGER timeout) {
   const NTSTATUS status = RawNtWaitForMultipleObjects(count, handles, type, alertable, timeout);
-  if (status == STATUS_USER_APC) run_apcs();
+  if (status == STATUS_USER_APC && !run_apcs()) return STATUS_SUCCESS;      /* (only routine-less ones) */
   return status;
 }
 EXPORT NTSTATUS NTAPI NtDelayExecution(BOOLEAN alertable, PLARGE_INTEGER interval) {
   const NTSTATUS status = RawNtDelayExecution(alertable, interval);
-  if (status == STATUS_USER_APC) run_apcs();
+  if (status == STATUS_USER_APC && !run_apcs()) return STATUS_SUCCESS;      /* (only routine-less ones) */
   return status;
 }
 EXPORT NTSTATUS NTAPI NtSignalAndWaitForSingleObject(HANDLE signal, HANDLE wait, BOOLEAN alertable, PLARGE_INTEGER timeout) {
   const NTSTATUS status = RawNtSignalAndWaitForSingleObject(signal, wait, alertable, timeout);
-  if (status == STATUS_USER_APC) run_apcs();
+  if (status == STATUS_USER_APC && !run_apcs()) return STATUS_SUCCESS;      /* (only routine-less ones) */
   return status;
 }
 

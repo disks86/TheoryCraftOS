@@ -405,8 +405,7 @@ uint32_t nt_queue_apc_thread(Process& p, const SyscallRequest& r) {
   if (!windowsabi::argument(p, r, 4, &arg3)) return kAccessViolation;
   Process::ThreadRecord* record = thread_of(p, r.args[0]);
   if (!record) return kInvalidHandle;
-  if (record->finished) return 0xC000004Bu;      // STATUS_THREAD_IS_TERMINATING
-  if (r.args[1] == 0) return kInvalidParameter;
+  if (record->finished) return 0xC0000001u;      // STATUS_UNSUCCESSFUL (the thread has ended)
   if (!Process::queue_apc(*record, Process::ThreadRecord::Apc{r.args[1], r.args[2], r.args[3], arg3})) return kInsufficientResources;
   if (p.runtime()) p.runtime()->notify();
   if (ObjectManager* objects = system_objects()) objects->notify();

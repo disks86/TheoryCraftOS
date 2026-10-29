@@ -179,10 +179,10 @@ static void test_names_between_processes() {
     Prog a(1), b(2);
     uint64_t ha = 0, hb = 0, hc = 0;
     CHECK(a.make_event("Shared", true, false, &ha) == 0);
-    CHECK(b.make_event("shared", true, true, &hb) == 0x40000000u);      // the name exists (names ignore case): the same object, the state of the first
+    CHECK(b.make_event("Shared", true, true, &hb) == 0x40000000u);      // the name exists (names are case sensitive): the same object, the state of the first
     CHECK(a.wait(ha, 0) == 0x102 && b.wait(hb, 0) == 0x102);
     CHECK(a.call(WindowsSyscallNumber::NtSetEvent, ha) == 0 && b.wait(hb, 0) == 0);      // set by one, seen by the other
-    CHECK(b.call(WindowsSyscallNumber::NtOpenEvent, kBase + 0x100, 0x1F0003, b.attributes("SHARED")) == 0);
+    CHECK(b.call(WindowsSyscallNumber::NtOpenEvent, kBase + 0x100, 0x1F0003, b.attributes("Shared")) == 0);
     const uint64_t opened = b.out();
     CHECK(b.wait(opened, 0) == 0 && b.call(WindowsSyscallNumber::NtClose, opened) == 0);
     CHECK(b.call(WindowsSyscallNumber::NtOpenEvent, kBase + 0x100, 0x1F0003, b.attributes("nothere")) == 0xC0000034u);
@@ -415,7 +415,7 @@ static void test_jobs() {
     CHECK(!objects.job_kill_for(1, &code));
     CHECK(p.call(WindowsSyscallNumber::NtQueryInformationJobObject, job, 1, buffer, 48, returned) == 0 && get32(p.memory, buffer + 40) == 0 && get32(p.memory, buffer + 44) == 2 && get32(p.memory, buffer + 36) == 2);
     // a named job is found again; kill on close
-    CHECK(p.call(WindowsSyscallNumber::NtOpenJobObject, kBase + 0x100, 0x1F001F, p.attributes("job1")) == 0);
+    CHECK(p.call(WindowsSyscallNumber::NtOpenJobObject, kBase + 0x100, 0x1F001F, p.attributes("Job1")) == 0);
     const uint64_t again = p.out();
     CHECK(again != job && p.call(WindowsSyscallNumber::NtOpenJobObject, kBase + 0x100, 0x1F001F, p.attributes("nojob")) == 0xC0000034u);
     CHECK(p.call(WindowsSyscallNumber::NtClose, job) == 0 && p.call(WindowsSyscallNumber::NtClose, again) == 0);

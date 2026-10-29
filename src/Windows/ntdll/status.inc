@@ -306,7 +306,7 @@ static const struct { ULONG status, error; } status_table[] = {
   {0xC00000ACu, 231},
   {0xC00000ADu, 230},
   {0xC00000AEu, 231},
-  {0xC00000AFu, 1},
+  {0xC00000AFu, 535},
   {0xC00000B0u, 233},
   {0xC00000B1u, 232},
   {0xC00000B2u, 535},

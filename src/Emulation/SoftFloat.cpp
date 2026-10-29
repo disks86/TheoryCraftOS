@@ -37,8 +37,8 @@ struct Fmt {
   uint64_t default_nan() const { return sign_bit() | (uint64_t{exp_max()} << man_bits) | quiet_bit(); }
   uint64_t max_finite(bool sign) const { return (sign ? sign_bit() : 0) | (uint64_t{exp_max() - 1} << man_bits) | man_mask(); }
 };
-constexpr Fmt kF16{5, 10}, kF32{8, 23}, kF64{11, 52};
-const Fmt& fmt_of(Format f) { return f == Format::F16 ? kF16 : f == Format::F32 ? kF32 : kF64; }
+constexpr Fmt kF16{5, 10}, kF32{8, 23}, kF64{11, 52}, kBF16{8, 7};
+const Fmt& fmt_of(Format f) { return f == Format::F16 ? kF16 : f == Format::BF16 ? kBF16 : f == Format::F32 ? kF32 : kF64; }
 
 enum Class : uint8_t { kZero, kFinite, kInf, kQuietNan, kSignalingNan };
 

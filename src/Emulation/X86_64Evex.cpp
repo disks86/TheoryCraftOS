@@ -30,7 +30,7 @@ const EvexOp kEvexOps[] = {
     {1, 1, 0xE7, 0, kMove, 1, 32, kFullMem}, {1, 0, 0x2B, 0, kMove, 1, 32, kFullMem}, {1, 1, 0x2B, 1, kMove, 1, 64, kFullMem}, {2, 1, 0x2A, 0, kMove, 0, 32, kFullMem},
     {1, 2, 0x10, 0, kMoveScalar, 0, 32, kS4}, {1, 2, 0x11, 0, kMoveScalar, 1, 32, kS4}, {1, 3, 0x10, 1, kMoveScalar, 0, 64, kS8}, {1, 3, 0x11, 1, kMoveScalar, 1, 64, kS8},
     {1, 1, 0x6E, 0, kMoveGpr, 0, 32, kS4}, {1, 1, 0x6E, 1, kMoveGpr, 0, 64, kS8}, {1, 1, 0x7E, 0, kMoveGpr, 1, 32, kS4}, {1, 1, 0x7E, 1, kMoveGpr, 1, 64, kS8},
-    {1, 2, 0x7E, 1, kMoveGpr, 2, 64, kS8}, {1, 1, 0xD6, 1, kMoveGpr, 3, 64, kS8},
+    {1, 2, 0x7E, 1, kMoveGpr, 2, 64, kS8}, {1, 1, 0xD6, 1, kMoveGpr, 3, 64, kS8}, {1, 2, 0x7E, 0, kMoveGpr, 2, 32, kS4}, {1, 1, 0xD6, 0, kMoveGpr, 3, 32, kS4},
     // broadcasts (sub: source bytes; 0x80: memory source only; 0x40: 512-bit only)
     {2, 1, 0x18, 0, kBroadcast, 4, 32, kS4}, {2, 1, 0x19, 1, kBroadcast, 8, 64, kS8}, {2, 1, 0x19, 0, kBroadcast, 8, 32, kS8},
     {2, 1, 0x1A, 0, kBroadcast, 16 | 0x80, 32, kS16}, {2, 1, 0x1A, 1, kBroadcast, 16 | 0x80, 64, kS16}, {2, 1, 0x1B, 0, kBroadcast, 32 | 0x80 | 0x40, 32, kS32}, {2, 1, 0x1B, 1, kBroadcast, 32 | 0x80, 64, kS32},
@@ -488,6 +488,7 @@ X86_64Cpu::Step X86_64Cpu::step_evex(GuestMemory& m) {
   const uint8_t p0 = next_u8(), p1 = next_u8(), p2 = next_u8();
   const uint8_t opcode = next_u8();
   if (d_.truncated) return bad_decode();
+  if ((p0 & 7) == 4) return apx_map4(m, p0, p1, p2, opcode);      // Intel APX: the promoted legacy instructions
   if ((p0 & 0x08) != 0 || !(p1 & 4)) return fail(6);
   const uint32_t map = p0 & 7;
   if (map == 0) return fail(6);
@@ -519,6 +520,10 @@ X86_64Cpu::Step X86_64Cpu::step_evex(GuestMemory& m) {
   }
   for (uint32_t i = 0; !def && i < kEvexFp16OpCount; ++i) {
     const EvexOp& o = kEvexFp16Ops[i];
+    if (o.map == map && o.pp == pp && o.opcode == opcode && (o.w < 0 || o.w == static_cast<int>(w))) def = &o;
+  }
+  for (uint32_t i = 0; !def && i < kEvexBf16OpCount; ++i) {
+    const EvexOp& o = kEvexBf16Ops[i];
     if (o.map == map && o.pp == pp && o.opcode == opcode && (o.w < 0 || o.w == static_cast<int>(w))) def = &o;
   }
   if (!def && map == 2 && pp == 1 && (opcode == 0xC6 || opcode == 0xC7)) {      // AVX-512 PF: vgather/vscatterpf0/1 d/q ps/pd: prefetch hints, they do nothing and cannot fault
@@ -568,8 +573,8 @@ X86_64Cpu::Step X86_64Cpu::step_evex(GuestMemory& m) {
     const uint32_t vb = vl / 8;
     switch (def->tuple) {
       case kFullMem: n = (def->kind == kDup && def->sub == 6 && vl == 128) ? 8 : vb; break;
-      case kFull: n = ev_.bcst ? (def->kind == kCvt || def->map >= 5 || (elem == 16 && def->kind >= kFpBin && def->kind <= kRsqrt14) ? elem / 8 : (w ? 8 : 4)) : vb; break;
-      case kHalf: n = ev_.bcst ? (def->kind == kCvt || def->map >= 5 || (elem == 16 && def->kind >= kFpBin && def->kind <= kRsqrt14) ? elem / 8 : (w ? 8 : 4)) : vb / 2; break;
+      case kFull: n = ev_.bcst ? (def->kind == kCvt || def->map >= 5 || (elem == 16 && def->kind >= kFpBin && def->kind <= kRsqrt14) || def->kind == kBfloat ? elem / 8 : (w ? 8 : 4)) : vb; break;
+      case kHalf: n = ev_.bcst ? (def->kind == kCvt || def->map >= 5 || (elem == 16 && def->kind >= kFpBin && def->kind <= kRsqrt14) || def->kind == kBfloat ? elem / 8 : (w ? 8 : 4)) : vb / 2; break;
       case kQuarter: n = ev_.bcst ? elem / 8 : vb / 4; break;
       case kEighth: n = vb / 8; break;
       case kScalar: n = elem / 8; break;
@@ -601,6 +606,9 @@ X86_64Cpu::Step X86_64Cpu::step_evex(GuestMemory& m) {
     case kComplex: return evex_fp16(m, *def);
     case kFma4: return evex_fp(m, *def);
     case kEr: return evex_er(m, *def);
+    case kBfloat: return evex_bf16(m, *def);
+    case kMinMax: case kComx: return evex_minmax(m, *def);
+    case kDpPh: case kMpsadbw: case kSatCvt: return evex_avx102(m, *def);
     case kDot: case kVnni: case kMadd52: case kMultishift: case kShufBit: case kShift2: case kShift2Var: case kGfAffine: case kGfMul: case kBf16: case kAesNi: case kClmul: case kBroadcastMask: case kDbpsadbw:
       return evex_ext(m, *def);
     default: return evex_misc(m, *def);

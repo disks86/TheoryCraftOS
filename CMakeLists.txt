@@ -646,6 +646,10 @@ add_executable(BOOTX64
   src/Emulation/X86_64Misc.cpp
   src/Emulation/X86_64Mmx.cpp
   src/Emulation/X86_64Amx.cpp
+  src/Emulation/X86_64Xop.cpp
+  src/Emulation/X86_64Segment.cpp
+  src/Emulation/X86_64Apx.cpp
+  src/Emulation/X86_64EvexBf16.cpp
   src/Emulation/X86_64Evex.cpp
   src/Emulation/X86_64EvexMisc.cpp
   src/Emulation/X86_64EvexFp.cpp
@@ -711,6 +715,8 @@ add_executable(BOOTX64
   src/Hardware/GraphicsProcessingUnit/AMD/Gcn/TgsiParse.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnCompiler.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnDraw.cpp
+  src/Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnTexture.cpp
+  src/Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnTiling.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnPm4.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnState.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnCp.cpp

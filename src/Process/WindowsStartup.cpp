@@ -200,6 +200,7 @@ LoadStatus build_windows_startup(AddressSpace& space, const exe::PeFile& pe, con
   w.u64(teb + 0x00, ~uint64_t{0});                  // ExceptionList (unused on x64)
   w.u64(teb + 0x08, input.stack_top);               // StackBase
   w.u64(teb + 0x10, input.stack_top - input.stack_size);      // StackLimit
+  w.u64(teb + 0x20, 0x1e00);                        // FiberData / Version: a thread that is not a fiber has the version here
   w.u64(teb + 0x30, teb);                           // Self
   w.u64(teb + 0x40, input.process_id);              // ClientId.UniqueProcess
   w.u64(teb + 0x48, input.thread_id);               // ClientId.UniqueThread
@@ -304,6 +305,7 @@ LoadStatus build_windows_thread(AddressSpace& space, const WindowsThreadInput& i
   w.u64(teb + 0x00, ~uint64_t{0});
   w.u64(teb + 0x08, stack_top);                     // StackBase
   w.u64(teb + 0x10, base);                          // StackLimit
+  w.u64(teb + 0x20, 0x1e00);                        // FiberData / Version
   w.u64(teb + 0x30, teb);                           // Self
   w.u64(teb + 0x40, input.process_id);              // ClientId
   w.u64(teb + 0x48, input.thread_id);

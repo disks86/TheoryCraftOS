@@ -17,7 +17,7 @@
 
 /* Runs the test programs listed in C:\Windows\System32\winerun.txt (one name per line) one after the other, each in a process of its own with this process's standard
  * handles, and prints "=== <name> exit <code>" (or "timeout") after each. The last line is "WINERUN DONE", which scripts/winetest.sh waits for. A program that does not end
- * within 120 s is terminated. */
+ * within 120 s (or WINERUN_TIMEOUT_MS) is terminated. */
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
@@ -60,7 +60,9 @@ int main(void) {
       printf("=== %s did not start (error %lu)\n", line, GetLastError());
       continue;
     }
-    const DWORD waited = WaitForSingleObject(pi.hProcess, 120000);
+    DWORD limit = 120000;      /* (WINERUN_TIMEOUT_MS in the environment of the run - "name@WINERUN_TIMEOUT_MS=600000" for one test - for tests that are long and silent) */
+    { char text[32]; if (GetEnvironmentVariableA("WINERUN_TIMEOUT_MS", text, sizeof(text)) > 0) limit = (DWORD)strtoul(text, NULL, 10); }
+    const DWORD waited = WaitForSingleObject(pi.hProcess, limit);
     DWORD code = 0;
     if (waited != WAIT_OBJECT_0) {
       /* Where is it stuck? The thread's registers and the top of its stack (symbolize with objdump). */

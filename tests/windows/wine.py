@@ -117,7 +117,8 @@ def generate_headers(gen):
 
 
 def compile_one(source, obj, dll_gen=None):
-    return run([CC] + flags(dll_gen=dll_gen) + ["-c", "-o", obj, source])
+    # __FILE__ is the file name alone, as in Wine's own build (a test may use it in the name of an object, which has a length limit)
+    return run([CC] + flags(dll_gen=dll_gen) + ["-fmacro-prefix-map=%s/=" % os.path.dirname(source), "-c", "-o", obj, source])
 
 
 def test_headers(tests, gen):
