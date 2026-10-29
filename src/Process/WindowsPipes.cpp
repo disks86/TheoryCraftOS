@@ -32,7 +32,9 @@ constexpr uint64_t kUnixToNt = 11644473600ull * 10000000ull;
 constexpr uint64_t kPending = kWaitPending;
 
 // The token of a pipe descriptor: bits 0..31 the object, 32..55 the end code, 60 read, 61 write, 62 non-blocking, 63 the pipe folder itself.
-constexpr uint64_t kRead = 1ull << 60, kWrite = 1ull << 61, kNoWait = 1ull << 62, kFolder = 1ull << 63;
+constexpr uint32_t kCancelled = 0xC0000120u;      // STATUS_CANCELLED
+constexpr uint32_t kMoreData = 0x80000005u;      // STATUS_BUFFER_OVERFLOW (ERROR_MORE_DATA): part of a message was read
+constexpr uint64_t kMessageRead = 1ull << 59, kRead = 1ull << 60, kWrite = 1ull << 61, kNoWait = 1ull << 62, kFolder = 1ull << 63;
 uint64_t make_token(uint32_t id, uint32_t end_code, bool read, bool write) { return id | (uint64_t{end_code} << 32) | (read ? kRead : 0) | (write ? kWrite : 0); }
 uint32_t token_id(uint64_t token) { return uint32_t(token); }
 uint32_t token_end(uint64_t token) { return uint32_t((token >> 32) & 0xFFFFFF); }
@@ -73,6 +75,7 @@ uint32_t result_status(ObjectManager::PipeResult r, bool server, bool write) {
     case ObjectManager::PipeResult::Ok: return kSuccess;
     case ObjectManager::PipeResult::Broken: return kPipeBroken;
     case ObjectManager::PipeResult::Closing: return kPipeClosing;
+    case ObjectManager::PipeResult::MoreData: return kMoreData;
     case ObjectManager::PipeResult::Listening: return 0xC00000B3u;      // STATUS_PIPE_LISTENING
     case ObjectManager::PipeResult::NotConnected: (void)server; (void)write; return kPipeDisconnected;
     default: return kPipeEmpty;
@@ -93,6 +96,12 @@ bool wants_inherit(Process& p, uint64_t attributes) {
 }
 
 }  // namespace
+
+bool pipe_handle_gone_locked(Process& p, uint64_t slot) {
+  ObjectManager* objects = system_objects();
+  const uint64_t token = p.files().token(slot);
+  return objects && !(token & kFolder) && objects->pipe_client_gone_locked(token_id(token), token_end(token));
+}
 
 void pipe_token_add(uint64_t token) {
   if (token & kFolder) return;
@@ -123,23 +132,27 @@ uint32_t nt_create_pipe(Process& p, const SyscallRequest& r) {
 }
 
 uint32_t nt_create_named_pipe_file(Process& p, const SyscallRequest& r) {
-  uint64_t status_block = 0, share = 0, max_instances = 0, in_quota = 0, out_quota = 0;
-  if (!argument(p, r, 3, &status_block) || !argument(p, r, 4, &share) || !argument(p, r, 10, &max_instances) || !argument(p, r, 11, &in_quota) || !argument(p, r, 12, &out_quota))
+  uint64_t status_block = 0, share = 0, max_instances = 0, in_quota = 0, out_quota = 0, pipe_type = 0, read_mode = 0, completion = 0;
+  if (!argument(p, r, 3, &status_block) || !argument(p, r, 4, &share) || !argument(p, r, 7, &pipe_type) || !argument(p, r, 8, &read_mode) || !argument(p, r, 9, &completion) || !argument(p, r, 10, &max_instances) || !argument(p, r, 11, &in_quota) || !argument(p, r, 12, &out_quota))
     return kAccessViolation;
   ObjectManager* objects = system_objects();
   if (!objects) return kNotImplemented;
   String name(p.files().allocator());
-  if (!pipe_name(p, r.args[2], &name) || name.empty() || name.view().contains('\\')) return 0xC0000033u;      // STATUS_OBJECT_NAME_INVALID
+  if (!pipe_name(p, r.args[2], &name) || name.empty()) return 0xC0000033u;
+  { uint64_t slashes = 0; for (const char ch : name.view()) if (ch == '\\') ++slashes; if (slashes > 1 || (slashes == 1 && name.view()[name.size() - 1] != '\\')) return 0xC0000033u; }      // (a trailing backslash is part of the name; no other folders)      // STATUS_OBJECT_NAME_INVALID
   const uint32_t direction = uint32_t(share) & 3;      // FILE_SHARE_READ: clients read (the server writes); FILE_SHARE_WRITE: clients write (the server reads)
   uint32_t access = 0;
   if (direction == 1) access = ObjectManager::kPipeOutbound;
   else if (direction == 2) access = ObjectManager::kPipeInbound;
   else if (direction == 3) access = ObjectManager::kPipeDuplex;
   else return kInvalidParameter;
-  const ObjectManager::Created c = objects->create_pipe(name.view(), uint32_t(out_quota), uint32_t(in_quota), uint32_t(max_instances) == 0xFFFFFFFFu ? 0 : uint32_t(max_instances), access);
+  const ObjectManager::Created c = objects->create_pipe(name.view(), uint32_t(out_quota), uint32_t(in_quota), uint32_t(max_instances) == 0xFFFFFFFFu ? 0 : uint32_t(max_instances), access, (pipe_type & 1) != 0);
   if (c.id == 0) return c.status;
   uint64_t handle = 0;
-  uint32_t status = give_pipe_handle(p, make_token(c.id, 0, (access & ObjectManager::kPipeInbound) != 0, (access & ObjectManager::kPipeOutbound) != 0), wants_inherit(p, r.args[2]), &handle);
+  uint64_t server_token = make_token(c.id, 0, (access & ObjectManager::kPipeInbound) != 0, (access & ObjectManager::kPipeOutbound) != 0);
+  if ((pipe_type & 1) && (read_mode & 1)) server_token |= kMessageRead;
+  if (completion & 1) server_token |= kNoWait;
+  uint32_t status = give_pipe_handle(p, server_token, wants_inherit(p, r.args[2]), &handle);
   if (status != kSuccess) { objects->release_pipe_end(c.id, 0); return status; }
   if (!p.write_user_u64(r.args[0], handle)) { p.close_descriptor(handle / 4 - 1); return kAccessViolation; }
   uint8_t iosb[16] = {};
@@ -177,7 +190,13 @@ uint32_t pipe_io(Process& p, uint64_t slot, bool write, uint64_t status_block, u
   uint8_t chunk[8192];
   uint64_t done = 0;
   uint32_t status = kSuccess;
-  if (write) {
+  if (write && length == 0) {      // (an empty write still tells a broken pipe from a good one)
+    status = wait_until(p, 0, [&]() -> uint64_t {
+      uint32_t moved = 0;
+      const ObjectManager::PipeResult res = objects->pipe_write_locked(id, end, chunk, 0, &moved);
+      return res == ObjectManager::PipeResult::WouldBlock ? kPending : result_status(res, false, true);
+    });
+  } else if (write) {
     uint32_t failure = kSuccess;
     while (done < length && failure == kSuccess) {
       const uint32_t n = uint32_t(length - done < sizeof(chunk) ? length - done : sizeof(chunk));
@@ -198,21 +217,45 @@ uint32_t pipe_io(Process& p, uint64_t slot, bool write, uint64_t status_block, u
     }
     status = done > 0 ? kSuccess : failure;      // (some of it went: the caller sees how much)
   } else if (length != 0) {
-    const uint32_t want = uint32_t(length < sizeof(chunk) ? length : sizeof(chunk));
+    uint32_t generation = 0;
+    objects->sync().lock();
+    generation = objects->pipe_cancel_generation_locked(id);
+    objects->sync().unlock();
+    bool first = true;
+    while (done < length) {      // (what is there now, up to the length: only the first read waits)
+      const uint32_t want = uint32_t(length - done < sizeof(chunk) ? length - done : sizeof(chunk));
+      uint32_t got = 0;
+      const uint32_t s = wait_until(p, (no_wait || !first) ? 0 : ~uint64_t{0}, [&]() -> uint64_t {
+        if (objects->pipe_cancel_generation_locked(id) != generation) return kCancelled;
+        const ObjectManager::PipeResult res = objects->pipe_read_locked(id, end, chunk, want, &got, false, nullptr, (token & kMessageRead) != 0);
+        if (res == ObjectManager::PipeResult::WouldBlock) return kPending;
+        return result_status(res, false, false);
+      });
+      if (s != kSuccess && s != kMoreData) {
+        if (first) status = s == kTimeout ? kPipeEmpty : s;
+        break;
+      }
+      if (!p.write_user(buffer + done, ConstByteView(chunk, got))) return kAccessViolation;
+      done += got;
+      first = false;
+      if (s == kMoreData) { status = kMoreData; break; }
+      if (got == 0 || (token & kMessageRead)) break;      // (one message)
+    }
+  } else {      // a read of no bytes: waits for something to read (or for the pipe to break) and takes nothing
     uint32_t got = 0;
     status = wait_until(p, no_wait ? 0 : ~uint64_t{0}, [&]() -> uint64_t {
-      const ObjectManager::PipeResult res = objects->pipe_read_locked(id, end, chunk, want, &got);
+      const ObjectManager::PipeResult res = objects->pipe_read_locked(id, end, chunk, 0, &got, true, nullptr, (token & kMessageRead) != 0);
       if (res == ObjectManager::PipeResult::WouldBlock) return kPending;
-      return result_status(res, false, false);
+      return res == ObjectManager::PipeResult::MoreData ? kSuccess : result_status(res, false, false);
     });
     if (status == kTimeout) status = kPipeEmpty;
-    if (status == kSuccess) {
-      if (!p.write_user(buffer, ConstByteView(chunk, got))) return kAccessViolation;
-      done = got;
-    }
   }
   if (status != kSuccess) {
-    if (status_block != 0) { uint8_t iosb[16] = {uint8_t(status), uint8_t(status >> 8), uint8_t(status >> 16), uint8_t(status >> 24)}; p.write_user(status_block, ConstByteView(iosb, 16)); }
+    if (status_block != 0) {
+      uint8_t iosb[16] = {uint8_t(status), uint8_t(status >> 8), uint8_t(status >> 16), uint8_t(status >> 24)};
+      if (status == kMoreData) for (uint32_t i = 0; i < 8; ++i) iosb[8 + i] = uint8_t(done >> (8 * i));      // (the part that was read)
+      p.write_user(status_block, ConstByteView(iosb, 16));
+    }
     return status;
   }
   uint8_t iosb[16] = {};
@@ -238,8 +281,29 @@ uint32_t pipe_query_information(Process& p, uint64_t slot, uint32_t info_class, 
   uint8_t out[40] = {};
   auto put32 = [&](uint32_t at, uint32_t v) { for (uint32_t i = 0; i < 4; ++i) out[at + i] = uint8_t(v >> (8 * i)); };
   uint32_t size = 0;
-  if (info_class == 23) {      // FILE_PIPE_INFORMATION { ReadMode, CompletionMode }
-    put32(0, 0);
+  if (info_class == 8) {      // FileAccessInformation: what the handle may do, as the end and the pipe's direction give it
+    constexpr uint32_t kReadSet = 0x20000 | 0x80 | 0x8 | 0x1, kWriteSet = 0x20000 | 0x100 | 0x10 | 0x4 | 0x2;      // READ_CONTROL+RA+RE+RD / READ_CONTROL+WA+WE+AD+WD
+    uint32_t mask = 0x100000;      // SYNCHRONIZE
+    ObjectManager::PipeInfo info;
+    if (!(token & kFolder) && !objects->pipe_info(token_id(token), &info)) return kInvalidHandle;
+    if (token & kFolder) mask |= 0x80 | 0x20000;
+    else if (info.anonymous) mask |= (token & kRead) ? (kReadSet | 0x100) : (kWriteSet | 0x80);
+    else {
+      const bool read = (token & kRead) != 0, write = (token & kWrite) != 0;
+      if (token_end(token) & 1) {      // a client: what it asked for (nothing but the attributes if it asked for nothing)
+        mask |= write ? kWriteSet : 0;
+        mask |= read && write ? kReadSet : 0;
+        if (!write) mask |= 0x80;
+        if (write && !read) mask |= 0;
+      } else {
+        if (read) mask |= kReadSet;
+        if (write) mask |= kWriteSet;
+      }
+    }
+    put32(0, mask);
+    size = 4;
+  } else if (info_class == 23) {      // FILE_PIPE_INFORMATION { ReadMode, CompletionMode }
+    put32(0, (token & kMessageRead) ? 1 : 0);
     put32(4, (token & kNoWait) ? 1 : 0);
     size = 8;
   } else if (info_class == 24) {      // FILE_PIPE_LOCAL_INFORMATION
@@ -252,16 +316,21 @@ uint32_t pipe_query_information(Process& p, uint64_t slot, uint32_t info_class, 
     objects->sync().lock();
     objects->pipe_read_locked(token_id(token), token_end(token), probe, 1, &got, true, &available);
     objects->sync().unlock();
-    put32(0, 0);                                           // NamedPipeType: byte stream
+    put32(0, info.message_type ? 1 : 0);                   // NamedPipeType: byte stream / message
     put32(4, info.anonymous ? 1 : (info.access == ObjectManager::kPipeInbound ? 0 : info.access == ObjectManager::kPipeOutbound ? 1 : 2));      // NamedPipeConfiguration (inbound 0, outbound 1, duplex 2)
-    put32(8, info.max_instances ? info.max_instances : 255);
+    put32(8, info.anonymous ? 1 : (info.max_instances ? info.max_instances : 255));
     put32(12, info.instances);
-    put32(16, info.in_size);
+    put32(16, info.anonymous ? info.out_size : info.in_size);
     put32(20, available);
     put32(24, info.out_size);
-    put32(28, info.out_size);
+    {      // WriteQuotaAvailable
+      objects->sync().lock();
+      const uint32_t room = objects->pipe_room_locked(token_id(token), token_end(token));
+      objects->sync().unlock();
+      put32(28, room);
+    }
     put32(32, info.connected ? 3 : 2);                     // NamedPipeState: FILE_PIPE_CONNECTED_STATE / LISTENING
-    put32(36, end == 0 ? 1 : 0);                           // NamedPipeEnd: 1 server, 0 client
+    put32(36, (info.anonymous ? end == 1 : end == 0) ? 1 : 0);      // NamedPipeEnd: 1 server, 0 client (an anonymous pipe's read end counts as the server's)
     size = 40;
   } else {
     return kInvalidInfoClass;
@@ -282,6 +351,13 @@ uint32_t pipe_set_information(Process& p, uint64_t slot, uint32_t info_class, ui
   uint8_t raw[8];
   if (!p.read_user(buffer, ByteView(raw, 8))) return kAccessViolation;
   uint64_t token = p.files().token(slot);
+  if (raw[0] > 1 || raw[4] > 1) return kInvalidParameter;
+  if (raw[0]) {      // message read mode: only a message-type pipe has messages
+    ObjectManager* objects = system_objects();
+    ObjectManager::PipeInfo info;
+    if (!objects || !objects->pipe_info(token_id(token), &info) || !info.message_type) return kInvalidParameter;
+  }
+  token = raw[0] ? (token | kMessageRead) : (token & ~kMessageRead);
   token = raw[4] ? (token | kNoWait) : (token & ~kNoWait);      // CompletionMode: FILE_PIPE_COMPLETE_OPERATION (1) fails instead of waiting
   p.files().set_token(slot, token);
   return kSuccess;
@@ -307,8 +383,19 @@ uint32_t nt_fs_control_file(Process& p, const SyscallRequest& r) {
     case 0x110008: {      // FSCTL_PIPE_LISTEN: wait for a client
       if (token & kFolder) break;
       if (token_end(token) & 1) { status = kInvalidDeviceRequest; break; }
+      if (input_length == 4) {      // (the library's own: only say that the server listens, without waiting for the client)
+        objects->sync().lock();
+        const ObjectManager::PipeResult res = objects->pipe_listen_locked(id);
+        objects->sync().unlock();
+        status = res == ObjectManager::PipeResult::Ok ? kSuccess : 0x103u;
+        break;
+      }
       bool first = true;
+      objects->sync().lock();
+      const uint32_t generation = objects->pipe_cancel_generation_locked(id);
+      objects->sync().unlock();
       status = wait_until(p, ~uint64_t{0}, [&]() -> uint64_t {
+        if (objects->pipe_cancel_generation_locked(id) != generation) return kCancelled;
         const ObjectManager::PipeResult res = objects->pipe_listen_locked(id);
         const bool was_connected = first;
         first = false;
@@ -318,6 +405,10 @@ uint32_t nt_fs_control_file(Process& p, const SyscallRequest& r) {
       });
       break;
     }
+    case 0x11FFFC:      // (the library's own) CancelIo: the calls waiting on this pipe end
+      objects->pipe_cancel(id);
+      status = kSuccess;
+      break;
     case 0x110004:      // FSCTL_PIPE_DISCONNECT
       if ((token & kFolder) || (token_end(token) & 1)) break;
       status = objects->pipe_disconnect(id) ? kSuccess : kPipeDisconnected;
@@ -327,13 +418,13 @@ uint32_t nt_fs_control_file(Process& p, const SyscallRequest& r) {
       if (output_length < 16) { status = kInfoLengthMismatch; break; }
       uint8_t data[8192];
       const uint32_t room = uint32_t(output_length - 16 < sizeof(data) ? output_length - 16 : sizeof(data));
-      uint32_t got = 0, available = 0;
+      uint32_t got = 0, available = 0, message_length = 0;
       objects->sync().lock();
-      const ObjectManager::PipeResult res = objects->pipe_read_locked(id, end, data, room, &got, true, &available);
+      const ObjectManager::PipeResult res = objects->pipe_read_locked(id, end, data, room, &got, true, &available, false, &message_length);
       objects->sync().unlock();
       uint8_t head[16] = {};
       const uint32_t state = res == ObjectManager::PipeResult::Broken ? 4u : res == ObjectManager::PipeResult::NotConnected ? 2u : 3u;      // closing / listening / connected
-      for (uint32_t i = 0; i < 4; ++i) { head[i] = uint8_t(state >> (8 * i)); head[4 + i] = uint8_t(available >> (8 * i)); head[12 + i] = uint8_t(got >> (8 * i)); }
+      for (uint32_t i = 0; i < 4; ++i) { head[i] = uint8_t(state >> (8 * i)); head[4 + i] = uint8_t(available >> (8 * i)); head[12 + i] = uint8_t(message_length >> (8 * i)); }
       head[8] = available ? 1 : 0;
       if (res == ObjectManager::PipeResult::Broken && available == 0) { status = kPipeBroken; break; }
       if (res == ObjectManager::PipeResult::Listening || (res == ObjectManager::PipeResult::NotConnected && !(end & 1))) { status = 0xC00000ADu; break; }      // STATUS_INVALID_PIPE_STATE (ERROR_BAD_PIPE): the server end has no connection

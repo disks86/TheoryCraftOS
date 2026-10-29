@@ -78,7 +78,7 @@ class ObjectManager {
   void set_allocator(allocators::IAllocator* allocator) { allocator_ = allocator; }
   static constexpr uint32_t kPipeInbound = 1, kPipeOutbound = 2, kPipeDuplex = 3;      // the server's direction (PIPE_ACCESS_*); anonymous pipes are outbound
   // `name` empty: an anonymous pipe, already connected. Otherwise a new instance of the pipe of that name (up to `max_instances` of them, 0: no limit), not connected.
-  Created create_pipe(StringView name, uint32_t out_size, uint32_t in_size, uint32_t max_instances, uint32_t access);
+  Created create_pipe(StringView name, uint32_t out_size, uint32_t in_size, uint32_t max_instances, uint32_t access, bool message_type = false);
   // A client connects to an instance of the named pipe that is not connected yet (status 0xC0000034 if no pipe has the name, 0xC00000AE if all are connected).
   // `want_read` / `want_write`: what the client asks for; an instance whose direction does not allow it is refused (0xC0000022) and stays unconnected.
   Created connect_pipe(StringView name, bool want_read, bool want_write);
@@ -86,19 +86,24 @@ class ObjectManager {
   // ended cannot be mistaken for the next client.
   void add_pipe_end(uint32_t id, uint32_t end_code);
   void release_pipe_end(uint32_t id, uint32_t end_code);
-  enum class PipeResult { Ok, WouldBlock, Broken, Closing, NotConnected, Listening };      // (Listening: the server end has not had a client yet; NotConnected: the server disconnected it)
+  enum class PipeResult { Ok, WouldBlock, Broken, Closing, NotConnected, Listening, MoreData };      // MoreData: a message was read in part (the data moved is valid)      // (Listening: the server end has not had a client yet; NotConnected: the server disconnected it)
   // The lock must be held (sync().lock()) for the _locked calls. Read/write move what fits (at least one byte) or say why not.
-  PipeResult pipe_read_locked(uint32_t id, uint32_t end_code, uint8_t* out, uint32_t capacity, uint32_t* got, bool peek = false, uint32_t* available = nullptr);
+  PipeResult pipe_read_locked(uint32_t id, uint32_t end_code, uint8_t* out, uint32_t capacity, uint32_t* got, bool peek = false, uint32_t* available = nullptr, bool message_mode = false, uint32_t* message_length = nullptr);
+  // (A message-type pipe keeps what each write wrote as a message. message_mode reads one message at a time; message_length gets the length of the first one, 0 for a byte pipe.)
   PipeResult pipe_write_locked(uint32_t id, uint32_t end_code, const uint8_t* data, uint32_t count, uint32_t* done);
   // The server end listens: Ok if a client is connected (already or now), WouldBlock otherwise.
   PipeResult pipe_listen_locked(uint32_t id);
   // How much this end wrote that the other end has not read yet (0 when the other end is gone).
+  uint32_t pipe_room_locked(uint32_t id, uint32_t end_code);      // how much more this end can write before the pipe is full
   uint32_t pipe_pending_locked(uint32_t id, uint32_t end_code);
   bool pipe_disconnect(uint32_t id);      // false if nothing was connected      // the server ends the connection (the instance can listen again)
+  uint32_t pipe_cancel_generation_locked(uint32_t id);      // changes when CancelIo is called for the pipe: a call that waits compares it with what it saw at the start
+  void pipe_cancel(uint32_t id);
+  bool pipe_client_gone_locked(uint32_t id, uint32_t end_code);      // a client end whose server disconnected it
   bool pipe_name_exists_locked(StringView name);      // some instance of the pipe exists (listening or not)
   bool pipe_name_available_locked(StringView name);      // some instance of the named pipe is not connected
   struct PipeInfo {
-    bool anonymous = false, connected = false;
+    bool anonymous = false, connected = false, message_type = false;
     uint32_t access = 0, out_size = 0, in_size = 0, max_instances = 0, instances = 0;
   };
   bool pipe_info(uint32_t id, PipeInfo* out);
