@@ -48,6 +48,13 @@ class Dpcd {
                             kMainLinkChannelCoding = 0x006, kDownstreamPortCount = 0x007;
   static constexpr uint32_t kSupportedLinkRates = 0x010;         // eDP 1.4: up to eight 16-bit rates
   static constexpr uint32_t kLaneCountSet = 0x101, kSinkCount = 0x200, kDeviceServiceIrqVector = 0x201, kLaneStatus = 0x202, kEdpRevision = 0x700;
+  // Link training (DP 1.2 2.9.3.3 / drm_dp.h): the link settings, the training pattern, the per-lane voltage swing and pre-emphasis, the downspread and the sink's power
+  static constexpr uint32_t kLinkBwSet = 0x100, kTrainingPatternSet = 0x102, kTrainingLane0Set = 0x103, kDownspreadCtrl = 0x107, kSetPower = 0x600, kTrainingAuxRdInterval = 0x00E;
+  static constexpr uint8_t kLaneCountEnhancedFraming = 0x80, kSpreadAmp05 = 0x10, kPowerD0 = 1, kPowerD3 = 2;
+  static constexpr uint8_t kTrainingPatternDisable = 0, kTrainingPattern1 = 1, kTrainingPattern2 = 2, kTrainingPattern3 = 3;
+  // DP_TRAINING_LANEx_SET: voltage swing in bits 1:0 (levels 0..3), max swing reached bit 2, pre-emphasis in bits 4:3 (levels 0..3 as 0, 8, 16, 24), max pre-emphasis reached bit 5
+  static constexpr uint8_t kTrainVoltageMask = 0x03, kTrainMaxSwingReached = 0x04, kTrainPreEmphasisMask = 0x18, kTrainPreEmphasisShift = 3, kTrainMaxPreEmphasisReached = 0x20;
+  static constexpr uint8_t kVoltageMax = 3, kPreEmphasisMax = 3 << 3;
   static constexpr uint32_t kTestRequest = 0x218, kTestResponse = 0x260, kTestEdidChecksum = 0x261;
   // DP_DEVICE_SERVICE_IRQ_VECTOR: the bits a source handles here (the others are the MCCS and the MST message bits, left for whoever does those)
   static constexpr uint8_t kIrqAutomatedTest = 0x02, kIrqContentProtection = 0x04, kIrqSinkSpecific = 0x40, kIrqHandled = 0x46;
@@ -69,6 +76,7 @@ class Dpcd {
     bool enhanced_framing = false;         // DP_ENHANCED_FRAME_CAP
     bool max_downspread = false;           // 0.5 % spread supported
     bool no_aux_handshake = false;         // DP_NO_AUX_HANDSHAKE_LINK_TRAINING: the sink needs no AUX handshake in training
+    uint8_t training_read_interval = 0;    // DP_TRAINING_AUX_RD_INTERVAL (0x00E) bits 6:0: 0 for the default delays, else the wait between training steps in units of 4 ms
     uint8_t receiver_ports = 0;            // DP_NORP + 1: 1 or 2
     bool downstream_port_present = false;  // a branch device (a dongle or hub)
     uint8_t downstream_type = 0;           // 0 DisplayPort, 1 analog, 2 DVI/HDMI, 3 other
@@ -80,6 +88,7 @@ class Dpcd {
     uint32_t edp_rate_count = 0;           // the eDP panel's own link rates (eDP 1.4), the ones listed before the first zero
     uint32_t edp_rates_khz[kMaxEdpRates] = {};   // each a link rate per lane in kHz (the register's 200 kHz units times 200): 162000, 270000, 540000, ...
 
+    uint32_t max_link_rate_khz() const { return uint32_t{max_link_rate_code} * 27000; }          // the link clock the DRM helpers use: 162000, 270000, 540000, 810000
     uint32_t max_link_rate_kbps() const { return uint32_t{max_link_rate_code} * 270000; }    // per lane, raw bits per second / 1000 (0x0A: 2 700 000)
   };
 
@@ -100,6 +109,9 @@ class Dpcd {
     bool downstream_port_status_changed() const { return align & 0x40; }
     bool interlane_aligned() const { return align & 0x01; }
     // drm_dp_clock_recovery_ok / drm_dp_channel_eq_ok for the first `lanes` lanes (1..4; more is 4, 0 is true)
+    // drm_dp_get_adjust_request_voltage / _pre_emphasis: what the sink asks lane `lane` (0..3) to be set to, as a DP_TRAINING_LANEx_SET value (voltage swing in bits 1:0, pre-emphasis in 4:3)
+    uint8_t adjust_voltage(uint32_t lane) const;
+    uint8_t adjust_pre_emphasis(uint32_t lane) const;
     bool clock_recovery_ok(uint32_t lanes) const;
     bool channel_eq_ok(uint32_t lanes) const;
   };

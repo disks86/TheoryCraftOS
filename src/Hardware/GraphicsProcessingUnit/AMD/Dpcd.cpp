@@ -28,6 +28,16 @@ constexpr uint32_t kEdidBlockBytes = 128;
 constexpr uint32_t kEdpRateUnitKhz = 200;       // DP_SUPPORTED_LINK_RATES: 200 kHz units
 }  // namespace
 
+uint8_t Dpcd::LinkStatus::adjust_voltage(uint32_t lane) const {
+  if (lane > 3) lane = 3;
+  return static_cast<uint8_t>(adjust[lane / 2] >> (lane % 2 * 4) & kTrainVoltageMask);         // (the adjust request: voltage in the nibble's bits 1:0)
+}
+
+uint8_t Dpcd::LinkStatus::adjust_pre_emphasis(uint32_t lane) const {
+  if (lane > 3) lane = 3;
+  return static_cast<uint8_t>((adjust[lane / 2] >> (lane % 2 * 4 + 2) & 0x03) << kTrainPreEmphasisShift);     // (and the pre-emphasis in bits 3:2)
+}
+
 bool Dpcd::LinkStatus::clock_recovery_ok(uint32_t lanes) const {
   if (lanes > 4) lanes = 4;
   for (uint32_t lane = 0; lane < lanes; ++lane)
@@ -56,6 +66,7 @@ bool Dpcd::parse_capabilities(ConstByteView receiver, uint8_t edp_revision, Cons
   c.enhanced_framing = receiver[kMaxLaneCount] & 0x80;
   c.max_downspread = receiver[kMaxDownspread] & 0x01;
   c.no_aux_handshake = receiver[kMaxDownspread] & 0x40;
+  c.training_read_interval = receiver[kTrainingAuxRdInterval] & 0x7F;
   c.receiver_ports = static_cast<uint8_t>((receiver[kNorp] & 0x01) + 1);
   c.downstream_port_present = receiver[kDownstreamPortPresent] & 0x01;
   c.downstream_type = receiver[kDownstreamPortPresent] >> 1 & 0x03;

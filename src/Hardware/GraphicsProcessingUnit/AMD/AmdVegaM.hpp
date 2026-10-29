@@ -34,6 +34,7 @@
 #include "Hardware/GraphicsProcessingUnit/AMD/AtomBios.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdAux.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdDdc.hpp"
+#include "Hardware/GraphicsProcessingUnit/AMD/AmdDpSource.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AtomConnectors.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/Dpcd.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AtomI2c.hpp"
@@ -180,6 +181,17 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
   // capabilities, and for `status` (optional) the link status. False if the connector is not a DisplayPort one, nothing answers, or what answers is no DPCD. Like read_edid it takes the AUX
   // channel for some milliseconds, so it is for the desktop loop (or the handler of a hot plug), not an interrupt path.
   bool read_dpcd(const AtomConnectors::Connector& connector, Dpcd::Capabilities* capabilities, Dpcd::LinkStatus* status = nullptr);
+  // DisplayPort link training of a DisplayPort or eDP connector's link through the video BIOS (amdgpu_atombios_dp_link_train): the sink's capabilities are read (the eDP panel powered up
+  // first), the lane count and rate chosen for the mode (DpLinkConfig::choose: `pixel_clock_khz` at `bpc` bits per colour), and the link trained by DpLinkTrainer with the connector's DIG
+  // encoder and UNIPHY transmitter driven by AmdDpSource. `out` gets what was chosen and the outcome whether or not it worked. False if the connector is not a DisplayPort one with an
+  // AUX channel and a DIG encoder of this card (0 to 5), nothing answers, or the training fails. It takes the AUX channel and the video BIOS for as long as the sink needs (tens of
+  // milliseconds), so it is for the desktop loop. Not done: setting up the PLL and the encoder for the mode first (the training runs on the clocks the firmware left), and the stream.
+  struct LinkTraining {
+    Dpcd::Capabilities caps;
+    DpLinkConfig config;
+    DpLinkTrainer::Outcome outcome;
+  };
+  bool train_link(const AtomConnectors::Connector& connector, uint32_t pixel_clock_khz, uint32_t bpc, LinkTraining* out);
   // The short pulse of a DisplayPort sink (a status change that is not a plug: the link was lost, or the sink asks for a test) is taken by the interrupt handler as a pin to look at
   // (`pending_short_pulses()`: bit n for pin n). The look is the AUX channel's, which takes some milliseconds, so it is not done there: service_short_pulses() does it, from the desktop loop.
   // For each pending pin, lowest first, up to `capacity` of them, it reads the sink's link configuration (DP_LANE_COUNT_SET) and status (the lane training status, the alignment, the service

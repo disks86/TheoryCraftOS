@@ -106,7 +106,7 @@ struct Card final : IVcnRegisters {
   static bool in(uint32_t r, uint32_t lo, uint32_t hi) { return r >= lo && r <= hi; }
   IVcnRegisters& owner(uint32_t r) {
     if (monitor && in(r, 0x7000, 0x7007)) return *monitor;
-    if (aux && in(r, 0x7010, 0x7040)) return *aux;
+    if (aux && in(r, 0x7010, 0x7061)) return *aux;
     if (azalia && FakeAzalia::owns(r)) return *azalia;
     if (in(r, 0x3400, 0x37ff)) return sdma;
     if (in(r, 0xe30, 0xe4b) || r == 0x151a || r == 0x151b) return ih;
@@ -1489,15 +1489,34 @@ static std::vector<uint8_t> make_connector_vbios() {
   aux.move(atomimage::PS, 1, atomimage::REG, FakeAuxCard::kStatus, atomimage::BYTE0, 1);
   aux.move(atomimage::PS, 1, atomimage::REG, FakeAuxCard::kLength, atomimage::BYTE0, 2);
   aux.eot();
-  // UNIPHYTransmitterControl (76): the parameters' first word to the card, which is the panel power
+  // UNIPHYTransmitterControl (76), revision 1.5: the parameters (12 bytes) to the card; the first word is the panel power's action (in its top byte as in the V4 layout) and the training's
+  // SETUP_VSEMPH. DIG1EncoderControl (74) and DIG2EncoderControl (75), revision 1.4: 8 bytes of parameters each to their registers.
   atomimage::Code panel;
   panel.move(atomimage::REG, FakeAuxCard::kPanel, atomimage::PS, 0);
+  panel.move(atomimage::REG, FakeAuxCard::kPanel + 1, atomimage::PS, 1);
+  panel.move(atomimage::REG, FakeAuxCard::kPanel + 2, atomimage::PS, 2);
   panel.eot();
   u16(0x640 + 4 + 76 * 2, 0x780);
   u16(0x780, 6 + static_cast<uint32_t>(panel.b.size()));
-  u8(0x784, 8);
-  u8(0x785, 8);
+  u8(0x782, 1);
+  u8(0x783, 5);
+  u8(0x784, 12);
+  u8(0x785, 12);
   for (size_t i = 0; i < panel.b.size(); ++i) u8(0x786 + static_cast<uint32_t>(i), panel.b[i]);
+  for (uint32_t t = 0; t < 2; ++t) {
+    atomimage::Code enc;
+    enc.move(atomimage::REG, 0x7050 + t * 0x10, atomimage::PS, 0);
+    enc.move(atomimage::REG, 0x7051 + t * 0x10, atomimage::PS, 1);
+    enc.eot();
+    const uint32_t at = 0x7A0 + t * 0x20;
+    u16(0x640 + 4 + (74 + t) * 2, at);
+    u16(at, 6 + static_cast<uint32_t>(enc.b.size()));
+    u8(at + 2, 1);
+    u8(at + 3, 4);
+    u8(at + 4, 8);
+    u8(at + 5, 8);
+    for (size_t i = 0; i < enc.b.size(); ++i) u8(at + 6 + static_cast<uint32_t>(i), enc.b[i]);
+  }
   u16(0x640 + 4 + 78 * 2, 0x700);
   u16(0x700, 6 + static_cast<uint32_t>(aux.b.size()));
   u8(0x704, 8);
@@ -1971,6 +1990,100 @@ static void test_audio_packets() {
   vega.shutdown();
 }
 
+// DisplayPort link training through the video BIOS: the sink's DPCD is read, the link configured for the mode, the DPCD written and the encoder and transmitter tables called in the order
+// of the training (start, pattern 1, the drive, pattern 3 for a sink that has it, complete), for the DisplayPort connector (DIG 3, link B) and the eDP panel (DIG 0, link A, powered up).
+static void test_train_link() {
+  const std::vector<uint8_t> vbios = make_connector_vbios();   // eDP (0x92, pin 0, DIG 0), HDMI-A (0x91, DIG 2), DisplayPort (0x93, pin 2, DIG 3 link B; object id 19)
+  Rig rig;
+  FakeAuxCard auxcard;
+  rig.card.aux = &auxcard;
+  AmdVegaM vega(rig.alloc);
+  AmdVegaM::Inputs in = rig.inputs();
+  in.vbios = ConstByteView(vbios.data(), vbios.size());
+  AmdVegaM::LinkTraining t;
+  CHECK(!vega.train_link(AtomConnectors::Connector(), 148500, 8, &t));          // (not up)
+  CHECK(vega.bring_up(in));
+  if (!vega.up()) return;
+  const AtomConnectors::Connector edp = vega.connectors()[0], hdmi = vega.connectors()[1], dp = vega.connectors()[2];
+  std::vector<uint8_t>& dpcd = auxcard.sink.dpcd;
+  dpcd.assign(0x800, 0);
+  // an HBR2 four lane sink with TPS3, enhanced framing and downspread, that has the clock and the equalization at once
+  const uint8_t caps[8] = {0x12, 0x14, 0xC4, 0x01, 0x00, 0x00, 0x01, 0x00};
+  for (size_t i = 0; i < 8; ++i) dpcd[i] = caps[i];
+  dpcd[0x202] = dpcd[0x203] = 0x77;
+  dpcd[0x204] = 0x01;
+  const auto actions = [&](uint32_t table) {
+    std::vector<uint32_t> a;
+    for (const FakeAuxCard::DigCall& c : auxcard.dig_calls)
+      if (c.table == table && (table == 2 ? (c.words[0] >> 24) == 11 : true)) a.push_back(c.words[0] >> 24);
+    return a;
+  };
+  // 1080p60 at 8 bits: two lanes at 2.7 Gbit/s (bandwidth code 0x0A)
+  auxcard.sink.dpcd_writes.clear();
+  CHECK(vega.train_link(dp, 148500, 8, &t));
+  CHECK(t.outcome.trained() && t.config.lanes == 2 && t.config.rate_khz == 270000 && t.outcome.bandwidth_code == 0x0A && t.caps.max_lanes == 4 && t.caps.tps3);
+  // the DPCD writes: power, downspread, lane count with enhanced framing, rate, pattern off, pattern 1, the drive of two lanes, pattern 3, pattern off
+  const auto& w = auxcard.sink.dpcd_writes;
+  const struct { uint32_t address; std::vector<uint8_t> bytes; } want[] = {{0x600, {0x01}}, {0x107, {0x10}}, {0x101, {0x82}}, {0x100, {0x0A}}, {0x102, {0x00}}, {0x102, {0x01}},
+                                                                            {0x103, {0x00, 0x00}}, {0x102, {0x03}}, {0x102, {0x00}}};
+  CHECK(w.size() == 9);
+  for (size_t i = 0; i < w.size() && i < 9; ++i) CHECK(w[i].address == want[i].address && w[i].bytes == want[i].bytes);
+  // DIG 3 is on DIG2EncoderControl (table 1): start 0x08, pattern 1 0x09, pattern 3 0x13, complete 0x0B; with the pixel clock (14850), config (2.7 GHz | DIG 3 << 4), two lanes, 8 bits, HPD id 3
+  CHECK(actions(1) == std::vector<uint32_t>({0x08, 0x09, 0x13, 0x0B}) && actions(0).empty());
+  for (const FakeAuxCard::DigCall& c : auxcard.dig_calls)
+    if (c.table == 1) CHECK((c.words[0] & 0x00FFFFFF) == (14850u | 0x31u << 16) && c.words[1] == (0u | 2u << 8 | 2u << 16 | 3u << 24));
+  // the transmitter (V1.5): one drive of 0: symbol clock 27000, PHY id 3, action 11; two lanes, connector object 19, DP mode, HPD3 sel 0x30; DIG 3 front end, the lane set 0
+  CHECK(actions(2) == std::vector<uint32_t>({11}));
+  for (const FakeAuxCard::DigCall& c : auxcard.dig_calls)
+    if (c.table == 2 && (c.words[0] >> 24) == 11) CHECK(c.words[0] == (27000u | 3u << 16 | 11u << 24) && c.words[1] == (2u | 19u << 8 | 0x30u << 24) && c.words[2] == (1u << 3));
+  CHECK(auxcard.panel_writes == 0);     // (a DisplayPort connector has no panel)
+  // 4K60: four lanes at 5.4 Gbit/s
+  auxcard.dig_calls.clear();
+  auxcard.sink.dpcd_writes.clear();
+  CHECK(vega.train_link(dp, 594000, 8, &t) && t.config.lanes == 4 && t.config.rate_khz == 540000 && t.outcome.bandwidth_code == 0x14);
+  CHECK(w[2].address == 0x101 && w[2].bytes == std::vector<uint8_t>({0x84}) && w[3].bytes == std::vector<uint8_t>({0x14}) && w[6].address == 0x103 && w[6].bytes.size() == 4);
+  // the eDP panel: powered first (it answers only then), DIG 0 on DIG1EncoderControl (table 0), link A
+  dpcd[0x700] = 0x02;
+  auxcard.unpowered_channel = 0x92;
+  auxcard.dig_calls.clear();
+  rig.card.gfx.set_reg(0x1898, 0x2);
+  CHECK(vega.train_link(edp, 148500, 8, &t) && auxcard.panel_on && t.outcome.trained());
+  CHECK(actions(0) == std::vector<uint32_t>({0x08, 0x09, 0x13, 0x0B}) && actions(1).empty());
+  auxcard.unpowered_channel = 0;
+  // not trained: the sink never shows the clock (lane status zero): the training fails and the outcome says how, the cleanup done
+  dpcd[0x202] = dpcd[0x203] = 0x00;
+  auxcard.dig_calls.clear();
+  auxcard.sink.dpcd_writes.clear();
+  t = AmdVegaM::LinkTraining();
+  CHECK(!vega.train_link(dp, 148500, 8, &t) && t.outcome.result == DpLinkTrainer::Result::ClockRecoveryTries && t.config.lanes == 2 && !t.outcome.trained());
+  CHECK(actions(1).back() == 0x0B && w.back().address == 0x102 && w.back().bytes == std::vector<uint8_t>({0x00}));
+  dpcd[0x202] = dpcd[0x203] = 0x77;
+  // refused: an HDMI connector, a connector without a DIG encoder in the table, one on a DIG the card does not have (UNIPHY3 is DIG 6), a sink that is no DPCD, a card not up
+  auxcard.dig_calls.clear();
+  AtomConnectors::Connector no_encoder = dp;
+  no_encoder.encoder_object = 0;
+  AtomConnectors::Connector dig6 = dp;
+  dig6.encoder_object = 0x2125;
+  CHECK(!vega.train_link(hdmi, 148500, 8, &t) && !vega.train_link(no_encoder, 148500, 8, &t) && !vega.train_link(dig6, 148500, 8, &t) && auxcard.dig_calls.empty());
+  dpcd[1] = 0;
+  CHECK(!vega.train_link(dp, 148500, 8, &t) && auxcard.dig_calls.empty());
+  dpcd[1] = 0x14;
+  // other bits per colour: the table's code (6 bit 1, 8 bit 2, 10 bit 3, 12 bit 4, 16 bit 5; others 8 bit)
+  const struct { uint32_t bpc, code; } depths[] = {{6, 1}, {8, 2}, {10, 3}, {12, 4}, {16, 5}, {7, 2}, {0, 2}};
+  for (const auto& d : depths) {
+    auxcard.dig_calls.clear();
+    CHECK(vega.train_link(dp, 148500, d.bpc, &t));
+    // (the lanes and rate the depth needs for 148.5 MHz: 18 bits two lanes at 2.7, 24 bits two lanes at 2.7, 30 bits four at 1.62, 36 bits four at 2.7, 48 bits four at 2.7)
+    if (d.bpc == 6 || d.bpc == 8) CHECK(t.config.lanes == 2 && t.config.rate_khz == 270000);
+    if (d.bpc == 10) CHECK(t.config.lanes == 4 && t.config.rate_khz == 162000);
+    if (d.bpc == 12 || d.bpc == 16) CHECK(t.config.lanes == 4 && t.config.rate_khz == 270000);
+    CHECK(!auxcard.dig_calls.empty() && auxcard.dig_calls[0].table == 1 && ((auxcard.dig_calls[0].words[1] >> 16) & 0xFF) == d.code);
+  }
+  CHECK(vega.train_link(dp, 148500, 8, nullptr));
+  vega.shutdown();
+  CHECK(!vega.train_link(dp, 148500, 8, &t));
+}
+
 // The sink's DPCD over the AUX channel of the DisplayPort and eDP connectors (through the video BIOS's table, with the panel power-up for the eDP one).
 static void test_read_dpcd() {
   const std::vector<uint8_t> vbios = make_connector_vbios();   // eDP (DDC line 0x92, pin 0), HDMI-A (0x91), DisplayPort (0x93, pin 2)
@@ -2358,6 +2471,7 @@ int main() {
   test_audio_packets();
   test_audio_end_to_end();
   test_read_dpcd();
+  test_train_link();
   test_short_pulse_status();
   printf(g_failed ? "AmdVegaMTest: %d FAILED\n" : "AmdVegaMTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;

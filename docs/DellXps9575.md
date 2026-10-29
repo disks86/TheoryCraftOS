@@ -837,3 +837,42 @@ endpoint registers (`FakeAzalia`): the sound driver's pin is the endpoint `enabl
 of the data verb, the xmit codes 0x00 and 0xC0), `SET_DIGI_CONVERT_1` and `SET_CVT_CHAN_COUNT` on an HDMI converter, and the pin sense bits. **Not done:** the vendor-specific verbs of the ATI codecs (channel allocation, down-mix
 info, HBR control, the multi-channel remap), more than two channels or other formats (the stream is 48 kHz 16-bit stereo), the ELD read back from the pin (`GET_HDMI_ELDD`) to check what the display side programmed,
 unsolicited events for display changes (the driver is polled: someone calls `retarget()`), DisplayPort MST (device select), and anything on real hardware.
+
+### DisplayPort link training through the video BIOS
+
+Before a DisplayPort sink shows a picture the source and the sink agree on a link: the lane count and rate, and for each lane the voltage swing and pre-emphasis the sink can still read the clock and the data
+at. `DpLinkTrainer` (`DpLinkTrain.*`) is `amdgpu_atombios_dp_link_train`; the hardware side is `AmdDpSource` (`AmdDpSource.*`), the encoder and the transmitter driven through the AtomBIOS command tables, and
+`AmdVegaM::train_link(connector, pixel_clock_khz, bpc, &out)` ties them to a connector.
+
+- **Choosing the link.** `DpLinkConfig::choose(caps, pixel_clock_khz, bits_per_pixel)` is `amdgpu_atombios_dp_get_dp_link_config`: if the sink can do 2.7 Gbit/s and has more lanes than needed, the fewest lanes at 2.7
+  that carry the pixel clock (lanes x rate x 8 / bpp >= clock); else, rate by rate from 1.62 up to the sink's maximum, the fewest lanes at that rate; if nothing does, four lanes at 1.62. (The driver does not ask
+  whether the sink can do 2.7 before the first rule; this does.) `bandwidth_code()` is `DP_LINK_BW_SET` (rate / 27 MHz: 6, 10, 20).
+- **The training**, in the driver's order: the sink to D0 (`DP_SET_POWER` 0x600 = 1, for DPCD 1.1 and up, 1 ms to wake), downspread (`DP_DOWNSPREAD_CTRL` 0x107 = 0x10 if the sink supports 0.5 %, else 0),
+  `DP_LANE_COUNT_SET` 0x101 (the lanes, with bit 7 for enhanced framing if the sink has it) and `DP_LINK_BW_SET` 0x100; the encoder told to start (`ATOM_ENCODER_CMD_DP_LINK_TRAINING_START`) and the pattern off on the sink
+  (`DP_TRAINING_PATTERN_SET` 0x102 = 0). **Clock recovery:** pattern 1 on the source (`..._PATTERN1`) and then on the sink, the drive (voltage 0, pre-emphasis 0) on the transmitter (`SETUP_VSEMPH`, all lanes at once from the
+  first lane's value) and on the sink (`DP_TRAINING_LANE0_SET` 0x103, one byte per lane), 400 us; then until `drm_dp_clock_recovery_ok` (the clock recovery done bit of every lane in use): wait (the sink's
+  `DP_TRAINING_AUX_RD_INTERVAL` 0x00E: 100 us if 0, else 4 ms per unit), read the link status (0x202..0x207), and if the clock is not there give up when every lane is already at the maximum swing (the 'max reached' flag) or when
+  the sink has asked for the same voltage five times in a row, else set the drive to the highest voltage swing and pre-emphasis any lane's adjust request (0x206/0x207) asks for, on every lane, with the 'max
+  reached' flags (0x04, 0x20) once level 3 is asked. **Channel equalization:** pattern 3 if the sink has it (`TPS3_SUPPORTED`), else 2, the same way; until `drm_dp_channel_eq_ok` (clock recovery, equalization and symbol lock
+  of every lane in use, and interlane alignment), with the waits 400 us or the interval, up to six adjustments (seven status reads). **Finish:** pattern off on the sink and `..._COMPLETE` on the encoder. The outcome (`Result`)
+  says where it failed, and the finish is done whatever happened; one difference from the driver: after a failed clock recovery the equalization is not tried.
+- **The tables.** The encoder is `DIG1EncoderControl` (74) for DIG 0 and `DIG2EncoderControl` (75) for the others, revision 1.3 or 1.4 (eight bytes: pixel clock in 10 kHz, the configuration with the link rate in bits 1:0
+  - 1.62, 2.70, 5.40, 3.24 GHz, the last two from revision 4 - and the DIG in bits 6:4, the action, DP mode, lanes, bits per colour, and in revision 4 the hot plug id 1..6); the transmitter is `UNIPHYTransmitterControl` (76),
+  revision 1.4 (lane select 0 for all lanes, the lane set, the configuration with the UNIPHY pair, reference clock, front end and link, the action, the lanes) or 1.5 (symbol clock = link rate / 10 in 10 kHz units, the PHY id
+  - the same number as the DIG on this card - the action, lanes, the connector object id, DP mode, the configuration with the hot plug select and PLL, the DIG front end as a bit per DIG, the lane set). Other
+  revisions, rates a revision does not have and DIGs that do not exist are refused (`false`), nothing is run. The table index, the layouts (computed from `atombios.h` with its bit fields and unions) and the action numbers are checked
+  by `scripts/check_dplink_port.py`.
+- **`train_link`** reads the sink's capabilities (the eDP panel is powered up first), chooses the link, and trains; the connector's encoder object gives the DIG (0..5: the Vega M's six) and the link; the hot plug pin, the
+  connector object id and the bits per colour (6, 8, 10, 12, 16; anything else 8) go into the tables.
+
+**Tested** by `DpLinkTrainTest` (the algorithm against a sink and source that log everything in order: the exact write sequence of a clean training, the options of the sink, adjusting to levels the sink asks for - the
+highest of several lanes, the flags at the top level, lanes not in use ignored - the clock recovery giving up after five repeats or at the maximum swing, the equalization after one to seven reads, pattern 2 or 3, the
+delays by the read interval, every write and read and each source step failing in turn, the link configuration over twelve cases), `AmdDpSourceTest` (an AtomBIOS image whose three tables hand their parameter words to the
+card: every word for each action, rate, DIG and revision, and the refusals), and `AmdVegaMTest::test_train_link` (the DisplayPort connector on DIG 3 link B and the eDP panel on DIG 0, with the DPCD writes and the table calls
+of the whole training for 1080p60 and 4K60, failure, and the refusals).
+
+**Not checked:** `amdgpu_atombios_dp.c`, `atombios_encoders.c`, `drm_dp.h` and `drm_dp_helper.c` were not at hand: the training algorithm and its limits (five repeats, six adjustments, the delays), what the driver puts
+in the tables' parameters, which table and revision a Polaris-class BIOS has (the encoder control 1.4 and transmitter control 1.5 are what I believe a DCE 11.2 BIOS has; the other handled revisions are for older ones),
+the DPCD registers and bits, and whether the sink wants the scrambling-disable bit with the pattern (this writes the plain pattern number). **Not done:** the PLL and the encoder setup for the mode before training (it runs
+on the clocks the firmware left), enabling the stream after it, eDP's alternate scrambler reset and panel mode, the eDP 1.4 link rate table (`DP_LINK_RATE_SET`), 8.1 Gbit/s, link retraining when a short pulse reports
+loss (`service_short_pulses` reports it, nothing calls `train_link` yet), and everything on real hardware.

@@ -474,6 +474,31 @@ bool AmdVegaM::read_dpcd(const AtomConnectors::Connector& connector, Dpcd::Capab
   return true;
 }
 
+bool AmdVegaM::train_link(const AtomConnectors::Connector& connector, uint32_t pixel_clock_khz, uint32_t bpc, LinkTraining* out) {
+  if (!up() || !inputs_.registers || !inputs_.clock || !inputs_.allocator || !connector.has_ddc || !AtomConnectors::uses_aux(connector.type)) return false;
+  const uint8_t dig = AtomConnectors::dig_encoder(connector);
+  if (dig >= amd_dce11::AudioFormat::kBlocks) return false;          // (the DIGs of this card: the same six as the audio format blocks)
+  AuxSession session(*inputs_.registers, *inputs_.clock, inputs_.vbios, *inputs_.allocator, connector);
+  if (!session.bios.valid()) return false;
+  power_up_panel(connector, session.host, session.bios);
+  LinkTraining result;
+  if (!Dpcd::read_capabilities(session.aux, connector.type == AtomConnectors::Type::EmbeddedDisplayPort, &result.caps)) return false;
+  result.config = DpLinkConfig::choose(result.caps, pixel_clock_khz, bpc * 3);
+  DpSourceConfig source;
+  source.dig_encoder = dig;
+  source.link_b = AtomConnectors::link_b(connector);
+  source.lanes = result.config.lanes;
+  source.rate_khz = result.config.rate_khz;
+  source.pixel_clock_khz = pixel_clock_khz;
+  source.connector_object_id = connector.object_id;
+  source.hpd = connector.hpd_pin;
+  source.bits_per_color = bpc == 6 ? 1 : bpc == 10 ? 3 : bpc == 12 ? 4 : bpc == 16 ? 5 : 2;
+  AmdDpSource dp(session.host, session.bios, source);
+  result.outcome = DpLinkTrainer::train(session.aux, dp, result.caps, result.config.bandwidth_code(), result.config.lanes);
+  if (out) *out = result;
+  return result.outcome.trained();
+}
+
 uint32_t AmdVegaM::service_short_pulses(SinkEvent* out, uint32_t capacity) {
   uint32_t count = 0;
   if (!out) capacity = 0;
