@@ -945,6 +945,7 @@ static HMODULE load_library_ex(LPCWSTR name, HANDLE file, DWORD flags) {
     if (entry) us = entry->FullDllName;
   }
   if ((flags & 0x62) && has_separator(name) && !path[0] && !search) { set_error(ERROR_FILE_NOT_FOUND); return NULL; }      /* (a file named with a folder has to be there) */
+  if ((flags & 0x62) && GetModuleHandleW(path[0] ? path : name) == (HMODULE)NtCurrentPeb()->ImageBaseAddress) return (HMODULE)NtCurrentPeb()->ImageBaseAddress;      /* (the program is not loaded a second time) */
   if ((flags & 0x62) && !GetModuleHandleW(path[0] ? path : name)) {      /* AS_DATAFILE 2, AS_DATAFILE_EXCLUSIVE 0x40, AS_IMAGE_RESOURCE 0x20: the file is only mapped (a loaded library is used as it is) */
     if (!path[0]) { set_error(has_separator(name) ? ERROR_FILE_NOT_FOUND : ERROR_MOD_NOT_FOUND); return NULL; }
     const BOOL exclusive = (flags & 0x40) != 0;      /* AS_DATAFILE_EXCLUSIVE: nobody else may write the file while it is loaded */
@@ -3554,3 +3555,4 @@ EXPORT BOOL WINAPI DllMain(HANDLE module, DWORD reason, PVOID reserved) {
 #include "fmtmsg.inc"
 #include "time.inc"
 #include "nls.inc"
+#include "actctx.inc"

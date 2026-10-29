@@ -752,13 +752,30 @@ EXPORT BOOL WINAPI WriteProfileStringA(LPCSTR section, LPCSTR key, LPCSTR value)
 typedef struct { DWORD Name, OffsetToData; } ResourceEntry;
 typedef struct { DWORD Characteristics, TimeDateStamp; WORD MajorVersion, MinorVersion, NumberOfNamedEntries, NumberOfIdEntries; } ResourceDirectory;
 typedef struct { DWORD OffsetToData, Size, CodePage, Reserved; } ResourceData;
+/* A library loaded only for its data is a mapped view with a tag in the low bits of the handle: 1 for the file as it is (a relative address has to be turned into a file
+ * offset through the section table), 2 for the file mapped as an image (relative addresses are good as they are). */
+static const BYTE *resource_base(HMODULE module) { return module ? (const BYTE *)((ULONG_PTR)module & ~(ULONG_PTR)3) : (const BYTE *)NtCurrentPeb()->ImageBaseAddress; }
+static const BYTE *resource_address(HMODULE module, DWORD rva) {
+  const BYTE *base = resource_base(module);
+  if (((ULONG_PTR)module & 3) != 1) return base + rva;
+  const ULONG pe = *(const ULONG *)(base + 0x3C);
+  const WORD sections = *(const WORD *)(base + pe + 6), optional = *(const WORD *)(base + pe + 20);
+  const BYTE *table = base + pe + 24 + optional;
+  for (unsigned i = 0; i < sections; ++i) {
+    const BYTE *sec = table + 40u * i;
+    const DWORD virtual_size = *(const DWORD *)(sec + 8), va = *(const DWORD *)(sec + 12), raw_size = *(const DWORD *)(sec + 16), raw = *(const DWORD *)(sec + 20);
+    const DWORD span = virtual_size > raw_size ? virtual_size : raw_size;
+    if (rva >= va && rva - va < span) return base + raw + (rva - va);
+  }
+  return base + rva;
+}
 static const ResourceDirectory *resource_root(HMODULE module, DWORD *size) {
-  const BYTE *base = module ? (const BYTE *)module : (const BYTE *)NtCurrentPeb()->ImageBaseAddress;
+  const BYTE *base = resource_base(module);
   const ULONG pe = *(const ULONG *)(base + 0x3C);
   const ULONG rva = *(const ULONG *)(base + pe + 0x18 + 0x70 + 2 * 8), bytes = *(const ULONG *)(base + pe + 0x18 + 0x70 + 2 * 8 + 4);
   if (!rva) return NULL;
   *size = bytes;
-  return (const ResourceDirectory *)(base + rva);
+  return (const ResourceDirectory *)resource_address(module, rva);
 }
 /* An entry of a directory by id or by name (NULL if none). */
 static const ResourceEntry *resource_find(const ResourceDirectory *root, const ResourceDirectory *dir, LPCWSTR name) {
@@ -809,9 +826,8 @@ EXPORT HRSRC WINAPI FindResourceExA(HMODULE module, LPCSTR type, LPCSTR name, WO
 }
 EXPORT HRSRC WINAPI FindResourceA(HMODULE module, LPCSTR name, LPCSTR type) { return FindResourceExA(module, type, name, 0); }
 EXPORT HGLOBAL WINAPI LoadResource(HMODULE module, HRSRC resource) {
-  const BYTE *base = module ? (const BYTE *)module : (const BYTE *)NtCurrentPeb()->ImageBaseAddress;
   if (!resource) { set_error(ERROR_INVALID_PARAMETER); return NULL; }
-  return (HGLOBAL)(base + ((const ResourceData *)resource)->OffsetToData);
+  return (HGLOBAL)resource_address(module, ((const ResourceData *)resource)->OffsetToData);
 }
 EXPORT DWORD WINAPI SizeofResource(HMODULE module, HRSRC resource) { (void)module; return resource ? ((const ResourceData *)resource)->Size : 0; }
 EXPORT LPVOID WINAPI LockResource(HGLOBAL resource) { return resource; }

@@ -1091,6 +1091,7 @@ EXPORT NTSTATUS NTAPI RtlDeleteCriticalSection(PRTL_CRITICAL_SECTION cs) { cs->L
 /* ---- exceptions: unwinding, dispatching, __C_specific_handler ----------------------------------------------------------------------------------------------- */
 
 #include "except.inc"
+#include "actctx.inc"
 EXPORT ULONG DbgPrint(const char *format, ...) { (void)format; return 0; }
 /* SSE and SSE2 are there (PF_XMMI_INSTRUCTIONS_AVAILABLE = 6, PF_XMMI64_INSTRUCTIONS_AVAILABLE = 10); nothing newer is reported. */
 EXPORT BOOLEAN NTAPI RtlIsProcessorFeaturePresent(ULONG feature) { return feature == 6 || feature == 10; }
@@ -1107,6 +1108,7 @@ EXPORT void NTAPI RtlUserThreadStart(ProgramEntry entry, PVOID parameter) {
   PEB_LDR_DATA *ldr = peb->Ldr;
   process_heap();
   fls_thread_begins();
+  act_init_process();
   if (ldr) {
     loader_lock();
     /* the libraries in the order they depend on each other, then the program's TLS callbacks, then the program */

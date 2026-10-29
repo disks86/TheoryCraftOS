@@ -190,6 +190,14 @@ def do_build(out, names):
         with ThreadPoolExecutor(8) as ex:
             results = list(ex.map(comp, files))
         objs, tests, helpers = [], [], []
+        # resources (the manifests and menus some tests look for in their own image) go into every program of the DLL
+        resources = []
+        for rc in sorted(glob.glob(os.path.join(src, "*.rc"))):
+            ro = os.path.join(objdir, os.path.basename(rc)[:-3] + "_rc.o")
+            r = run([CC.replace("gcc", "windres"), "-I", os.path.join(HERE, "include"), "-I", src, "-I", os.path.join(OUT, "gen"), "-D__WINESRC__", "--preprocessor-arg=-w",
+                     "-O", "coff", "-o", ro, rc])
+            if r.returncode == 0:
+                resources.append(ro)
         for s, r in results:
             if r.returncode:
                 report["compile_failed"].append("%s/%s" % (dll, os.path.basename(s)))
@@ -229,7 +237,7 @@ def do_build(out, names):
                 exe = os.path.join(OUT, "%s_%s.exe" % (dll, name))
                 # the test, the helper files, and (if it needs them) the other tests of the DLL, which are kept out of the link by --gc-sections
                 for extra in ([], helpers, helpers + others):
-                    r = run([CC, "-o", exe, tlo, o, shim_obj] + extra + ["-Wl,--gc-sections"] + forced.get(name, []) + libs)
+                    r = run([CC, "-o", exe, tlo, o, shim_obj] + extra + resources + ["-Wl,--gc-sections"] + forced.get(name, []) + libs)
                     if r.returncode == 0:
                         break
                 if r.returncode:
