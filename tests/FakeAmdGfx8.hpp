@@ -106,6 +106,8 @@ class Card final : public hardware::IVcnRegisters {
   struct IbRun { uint64_t address; uint32_t dwords; bool compute; };
   std::vector<IbRun> ib_runs;
   uint32_t fence_writes = 0, write_data_packets = 0, ib_protocol_errors = 0;
+  // When set, an indirect buffer on the graphics ring is handed to this (GPU address, dwords) instead of being run packet by packet: a test's model of the command processor. False: it objected.
+  std::function<bool(uint64_t, uint32_t)> graphics_ib_hook;
   bool ignore_fences = false;    // the engine runs everything but never writes a fence
   // A hung command processor (graphics and compute): it runs nothing until GRBM_SOFT_RESET resets the CP (unless reset_fails). The reset also takes the interrupt enables and the
   // hardware queues away, as the real one does.
@@ -475,6 +477,10 @@ class Card final : public hardware::IVcnRegisters {
     const uint32_t dwords = d[2] & 0xFFFFF, vmid = d[2] >> 24 & 0xF;
     if (vmid != 0 || compute != ((d[2] >> 23 & 1) != 0) || dwords == 0 || !translate(address, uint64_t{dwords} * 4)) { ++ib_protocol_errors; return; }
     ib_runs.push_back({address, dwords, compute});
+    if (!compute && graphics_ib_hook) {
+      if (!graphics_ib_hook(address, dwords)) ++ib_protocol_errors;
+      return;
+    }
     for (uint32_t pos = 0; pos < dwords;) {
       const uint32_t h = get32(address + uint64_t{pos} * 4);
       const uint32_t opcode = h >> 8 & 0xFF, count = h >> 16 & 0x3FFF;
