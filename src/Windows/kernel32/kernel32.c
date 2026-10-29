@@ -452,8 +452,11 @@ EXPORT BOOL WINAPI SetEnvironmentVariableA(LPCSTR name, LPCSTR value) {
   free_wide(v);
   return ok;
 }
+/* What fits is copied as the real one does it: a variable's value goes in whole or not at all (after one that does not fit only the end mark is written), plain text goes
+   in up to capacity - 1 characters; the end mark follows only when the whole result fits. The result is the size needed, with the end mark. */
 EXPORT DWORD WINAPI ExpandEnvironmentStringsW(LPCWSTR source, LPWSTR dest, DWORD capacity) {
   DWORD needed = 0;
+  BOOL stopped = FALSE;      /* a variable did not fit: nothing more is written */
   for (const WCHAR *s = source; *s;) {
     const WCHAR *close = NULL;
     if (*s == '%') for (const WCHAR *e = s + 1; *e; ++e) if (*e == '%') { close = e; break; }
@@ -469,26 +472,44 @@ EXPORT DWORD WINAPI ExpandEnvironmentStringsW(LPCWSTR source, LPWSTR dest, DWORD
       }
     }
     if (value) {
-      if (needed + length < capacity && dest) memcpy(dest + needed, value, length * 2);
+      if (dest && !stopped) {
+        if (needed + length < capacity) {
+          memcpy(dest + needed, value, length * 2);
+          dest[needed + length] = 0;      /* (the end mark waits where the next character goes) */
+        } else {
+          if (capacity > 0) dest[needed] = 0;
+          stopped = TRUE;
+        }
+      }
       needed += (DWORD)length;
       s = close + 1;
     } else {
-      if (needed + 1 < capacity && dest) dest[needed] = *s;
+      if (dest && !stopped && needed + 1 < capacity) dest[needed] = *s;
       ++needed;
       ++s;
     }
   }
-  if (dest && needed < capacity) dest[needed] = 0;
+  if (dest && !stopped && needed < capacity) dest[needed] = 0;
   return needed + 1;
 }
+/* The ANSI function converts what the wide one produced, and needs a byte more than that: when the buffer is not bigger than the size needed nothing of the result is copied,
+   the buffer is made an empty string and the size needed plus one is returned. */
 EXPORT DWORD WINAPI ExpandEnvironmentStringsA(LPCSTR source, LPSTR dest, DWORD capacity) {
   WCHAR *w = to_wide(source);
   if (!w) return 0;
-  WCHAR wide[1024];
-  const DWORD n = ExpandEnvironmentStringsW(w, wide, 1024);
+  const DWORD needed = ExpandEnvironmentStringsW(w, NULL, 0);
+  if (capacity <= needed) {
+    free_wide(w);
+    if (dest) dest[0] = 0;
+    return needed + 1;
+  }
+  WCHAR *wide = RtlAllocateHeap(heap(), 0, (size_t_)needed * 2 + 2);
+  if (!wide) { free_wide(w); return 0; }
+  ExpandEnvironmentStringsW(w, wide, needed);
   free_wide(w);
-  if (n > 1024) return 0;
-  return wide_result_to_ansi(wide, n - 1, dest, capacity) + 1;
+  for (DWORD i = 0; i < needed; i++) dest[i] = (char)wide[i];      /* (ASCII: a character is a byte) */
+  RtlFreeHeap(heap(), 0, wide);
+  return needed;
 }
 
 EXPORT void WINAPI GetStartupInfoW(LPSTARTUPINFOW info) {
