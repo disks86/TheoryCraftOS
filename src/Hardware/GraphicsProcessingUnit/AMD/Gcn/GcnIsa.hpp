@@ -97,6 +97,8 @@ class Code {
   void vop3_of(Vop2 op, uint32_t vdst, Src src0, Src src1, Mods mods = Mods());
   void vop3_of(Vopc op, uint32_t sdst, Src src0, Src src1, Mods mods = Mods());                 // the result mask goes to the SGPR pair `sdst`
   void vop3_of(Vop2 op, uint32_t vdst, Src src0, Src src1, Src carry_or_select, Mods mods = Mods());       // v_cndmask_b32 with an SGPR pair as the select
+  // The VOP3b form of the carry-out instructions (v_add_u32, v_sub_u32, v_subrev_u32): the carry mask goes to the SGPR pair `sdst`
+  void vop3b_of(Vop2 op, uint32_t vdst, uint32_t sdst, Src src0, Src src1);
   void vintrp(Vintrp op, uint32_t vdst, uint32_t vsrc, uint32_t attr, uint32_t chan);             // vsrc: the VGPR with i or j; for v_interp_mov_f32 the parameter (0 = P10, 1 = P20, 2 = P0)
   // Export: `enable` is a 4 bit mask of the sources; with `compressed` the sources are two packed 16 bit pairs in vsrc0 and vsrc1
   void exp(uint32_t target, uint32_t enable, uint32_t vsrc0, uint32_t vsrc1, uint32_t vsrc2, uint32_t vsrc3, bool done, bool valid_mask, bool compressed = false);

@@ -156,6 +156,7 @@ enum class Vopc : uint16_t {
   v_cmp_neq_f32 = 0x4D,
   v_cmp_nlt_f32 = 0x4E,
   v_cmp_tru_f32 = 0x4F,
+  v_cmp_class_f32 = 0x10,
   v_cmp_f_i32 = 0xC0,
   v_cmp_f_u32 = 0xC8,
   v_cmp_lt_i32 = 0xC1,
