@@ -101,8 +101,8 @@ X86_64Cpu::Step X86_64Cpu::evex_misc(GuestMemory& m, const EvexOp& defn) {
         } else {
           set_reg(d_.rm, e < 32 ? 4 : e / 8, v);      // (vmovw zero-extends into the 32-bit register)
         }
-      } else if (memory) {      // vmovq xmm/m64 <- xmm
-        if (!store(m, memory_address(), 8, v)) return Step::Fault;
+      } else if (memory) {      // vmovq xmm/m64 <- xmm (vmovd xmm/m32 <- xmm)
+        if (!store(m, memory_address(), e / 8, v)) return Step::Fault;
       } else {
         result.q[0] = v;
         set_vec(rm_reg, result, 128);

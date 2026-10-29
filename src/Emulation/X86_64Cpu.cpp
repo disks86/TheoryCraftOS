@@ -54,6 +54,8 @@ uint32_t popcount64(uint64_t v) {
 
 void X86_64Cpu::reset(const process::ProgramStart& start) {
   s_ = State();
+  selector_[0] = selector_[2] = selector_[3] = selector_[4] = selector_[5] = 0x2B;
+  selector_[1] = 0x33;
   s_.rip = start.entry;
   s_.r[4] = start.stack_pointer;
   // Native Windows entry gets the first two arguments in RCX and RDX (RtlUserThreadStart); Linux programs start with zeroed registers.
@@ -94,10 +96,10 @@ uint64_t X86_64Cpu::next_imm(uint32_t bytes, bool sign_extend_it) {
 bool X86_64Cpu::decode_modrm() {
   const uint8_t modrm = next_u8();
   d_.mod = modrm >> 6;
-  d_.reg = static_cast<uint8_t>(((modrm >> 3) & 7) | (d_.rex_r ? 8 : 0));
+  d_.reg = static_cast<uint8_t>(((modrm >> 3) & 7) | (d_.rex_r ? 8 : 0) | (d_.rex_r4 ? 16 : 0));
   uint8_t rm = modrm & 7;
   if (d_.mod == 3) {
-    d_.rm = static_cast<uint8_t>(rm | (d_.rex_b ? 8 : 0));
+    d_.rm = static_cast<uint8_t>(rm | d_.ext_b());
     if (vex_.redirect) d_.rm = 16;      // (an AVX instruction run in halves: its register operand has been copied to the scratch slot)
     return !d_.truncated;
   }
@@ -106,11 +108,11 @@ bool X86_64Cpu::decode_modrm() {
   if (rm == 4) {
     const uint8_t sib = next_u8();
     const uint32_t scale = sib >> 6;
-    const uint32_t index = ((sib >> 3) & 7) | (d_.rex_x ? 8 : 0);
-    const uint32_t base = (sib & 7) | (d_.rex_b ? 8 : 0);
+    const uint32_t index = ((sib >> 3) & 7) | (d_.rex_x ? 8 : 0) | (d_.rex_x4 ? 16 : 0);
+    const uint32_t base = (sib & 7) | d_.ext_b();
     if ((sib & 7) == 5 && d_.mod == 0) have_base = false;
     else address = s_.r[base];
-    if (index != 4) {
+    if (index != 4) {      // (r12 and r20 can be indexes: only the plain 4 means none)
       d_.sib_index = true;
       d_.index_offset = s_.r[index] << scale;
       address += d_.index_offset;
@@ -119,7 +121,7 @@ bool X86_64Cpu::decode_modrm() {
     have_base = false;
     d_.rip_relative = true;
   } else {
-    address = s_.r[rm | (d_.rex_b ? 8 : 0)];
+    address = s_.r[rm | d_.ext_b()];
   }
   int64_t disp = 0;
   if (d_.mod == 1) disp = sign_extend(next_u8(), 1);
@@ -502,7 +504,30 @@ X86_64Cpu::Step X86_64Cpu::step(GuestMemory& m) {
     }
     if (!prefix) break;
   }
-  if ((op & 0xF0) == 0x40) {
+  if (op == 0xD5) {      // REX2 (Intel APX): M0 R4 X4 B4 W R3 X3 B3, then an opcode of the one-byte map or (M0) the 0F map
+    const uint8_t payload = next_u8();
+    if (d_.truncated) return fail(d_.available < 15 ? 14 : 6, s_.rip + d_.available);
+    d_.rex2 = true;
+    d_.rex_present = true;
+    d_.rex_r4 = payload & 0x40;
+    d_.rex_x4 = payload & 0x20;
+    d_.rex_b4 = payload & 0x10;
+    d_.rex_w = payload & 8;
+    d_.rex_r = payload & 4;
+    d_.rex_x = payload & 2;
+    d_.rex_b = payload & 1;
+    if (payload & 0x80) return step_0f(m);
+    op = next_u8();
+    if (d_.truncated) return fail(d_.available < 15 ? 14 : 6, s_.rip + d_.available);
+    if (op == 0xA1) {      // jmpabs imm64 (REX2 with no payload bits)
+      if (payload != 0) return fail(6);
+      const uint64_t target = next_imm(8, false);
+      if (d_.truncated) return fail(d_.available < 15 ? 14 : 6, s_.rip + d_.available);
+      s_.rip = target;
+      return Step::Ok;
+    }
+    if ((op & 0xF0) == 0x40 || op == 0xC4 || op == 0xC5 || op == 0x62 || op == 0xD5 || op == 0x0F || op == 0x66 || op == 0x67 || op == 0xF2 || op == 0xF3 || op == 0xF0 || op == 0x64 || op == 0x65 || op == 0x2E || op == 0x36 || op == 0x3E || op == 0x26) return fail(6);
+  } else if ((op & 0xF0) == 0x40) {
     d_.rex_present = true;
     d_.rex_w = op & 8;
     d_.rex_r = op & 4;
@@ -511,12 +536,18 @@ X86_64Cpu::Step X86_64Cpu::step(GuestMemory& m) {
     op = next_u8();
   }
   if (d_.truncated) return fail(d_.available < 15 ? 14 : 6, s_.rip + d_.available);
+  return step_op(m, op);
+}
+
+// The instruction whose (one-byte map) opcode is `op`, with its prefixes decoded into d_.
+X86_64Cpu::Step X86_64Cpu::step_op(GuestMemory& m, uint8_t op) {
   Step result = Step::Ok;
   const uint32_t osize = static_cast<uint32_t>(operand_size());
   auto advance = [&]() { s_.rip += d_.position; };
   auto bad_decode = [&]() { return fail(d_.available < 15 ? 14 : 6, s_.rip + d_.available); };
 
   if (op == 0xC4 || op == 0xC5) return step_vex(m, op);
+  if (op == 0x8F && d_.position < d_.available && (d_.bytes[d_.position] & 8)) return step_vex(m, op);      // (the XOP prefix: a pop has 0 in the modrm reg field)
   if (op == 0x62) return step_evex(m);      // (in 64-bit mode this is always the EVEX prefix)      // (in 64-bit mode these are always the VEX prefix)
   if (op == 0x0F) {
     result = step_0f(m);
@@ -555,7 +586,7 @@ X86_64Cpu::Step X86_64Cpu::step(GuestMemory& m) {
   switch (op) {
     case 0x50: case 0x51: case 0x52: case 0x53: case 0x54: case 0x55: case 0x56: case 0x57: {      // push r64
       if (!finish_decode()) return bad_decode();
-      const uint64_t v = s_.r[(op & 7) | (d_.rex_b ? 8 : 0)];
+      const uint64_t v = s_.r[(op & 7) | d_.ext_b()];
       if (!push(m, v)) return Step::Fault;
       advance();
       return Step::Ok;
@@ -564,7 +595,7 @@ X86_64Cpu::Step X86_64Cpu::step(GuestMemory& m) {
       if (!finish_decode()) return bad_decode();
       uint64_t v = 0;
       if (!pop(m, &v)) return Step::Fault;
-      s_.r[(op & 7) | (d_.rex_b ? 8 : 0)] = v;
+      s_.r[(op & 7) | d_.ext_b()] = v;
       advance();
       return Step::Ok;
     }
@@ -656,20 +687,7 @@ X86_64Cpu::Step X86_64Cpu::step(GuestMemory& m) {
       advance();
       return Step::Ok;
     }
-    case 0x8C: case 0x8E: {      // mov r/m16, Sreg and mov Sreg, r/m16: the segment registers hold the user selectors; loading one has no effect here
-      if (!decode_modrm() || !finish_decode()) return bad_decode();
-      const uint32_t sreg = d_.reg & 7;
-      if (sreg > 5) return fail(6);
-      if (op == 0x8C) {
-        static const uint16_t selectors[6] = {0x2B, 0x33, 0x2B, 0x2B, 0x2B, 0x2B};      // es cs ss ds fs gs
-        if (!write_rm(m, d_.mod == 3 ? osize : 2, selectors[sreg])) return Step::Fault;
-      } else {
-        uint64_t v = 0;
-        if (!read_rm(m, 2, &v)) return Step::Fault;
-      }
-      advance();
-      return Step::Ok;
-    }
+    case 0x8C: case 0x8E: return segment_move(m, op);      // mov r/m16, Sreg and mov Sreg, r/m16
     case 0x8D: {      // lea
       if (!decode_modrm() || !finish_decode()) return bad_decode();
       if (d_.mod == 3) return fail(6);
@@ -700,7 +718,7 @@ X86_64Cpu::Step X86_64Cpu::step(GuestMemory& m) {
       return Step::Ok;
     case 0x91: case 0x92: case 0x93: case 0x94: case 0x95: case 0x96: case 0x97: {      // xchg rax, r
       if (!finish_decode()) return bad_decode();
-      const uint32_t r = (op & 7) | (d_.rex_b ? 8 : 0);
+      const uint32_t r = (op & 7) | d_.ext_b();
       const uint64_t a = get_reg(0, osize), b = get_reg(r, osize);
       set_reg(0, osize, b);
       set_reg(r, osize, a);
@@ -817,14 +835,14 @@ X86_64Cpu::Step X86_64Cpu::step(GuestMemory& m) {
     case 0xB0: case 0xB1: case 0xB2: case 0xB3: case 0xB4: case 0xB5: case 0xB6: case 0xB7: {      // mov r8, imm8
       const uint64_t v = next_imm(1, false);
       if (!finish_decode()) return bad_decode();
-      set_reg((op & 7) | (d_.rex_b ? 8 : 0), 1, v);
+      set_reg((op & 7) | d_.ext_b(), 1, v);
       advance();
       return Step::Ok;
     }
     case 0xB8: case 0xB9: case 0xBA: case 0xBB: case 0xBC: case 0xBD: case 0xBE: case 0xBF: {      // mov r, imm
       const uint64_t v = next_imm(osize, false);
       if (!finish_decode()) return bad_decode();
-      set_reg((op & 7) | (d_.rex_b ? 8 : 0), osize, v);
+      set_reg((op & 7) | d_.ext_b(), osize, v);
       advance();
       return Step::Ok;
     }
@@ -887,6 +905,14 @@ X86_64Cpu::Step X86_64Cpu::step(GuestMemory& m) {
     }
     case 0xCC:
       return fail(3);
+    case 0xCA: case 0xCB: return far_return(m, op);
+    case 0xCF: return interrupt_return(m);
+    case 0xCD: {      // int n: there is no interrupt table to deliver it through; int3 is a breakpoint, anything else a general-protection fault
+      const uint64_t n = next_imm(1, false);
+      if (!finish_decode()) return bad_decode();
+      return fail(n == 3 ? 3 : 13);
+    }
+    case 0xF1: return fail(1);      // int1 (icebp): a debug exception
     case 0xE3: {      // jrcxz
       const uint64_t rel = next_imm(1, true);
       if (!finish_decode()) return bad_decode();
@@ -910,6 +936,7 @@ X86_64Cpu::Step X86_64Cpu::step(GuestMemory& m) {
       advance();
       return Step::Ok;
     case 0xD8: case 0xD9: case 0xDA: case 0xDB: case 0xDC: case 0xDD: case 0xDE: case 0xDF:
+      if (d_.apx_high()) return fail(6);
       return step_x87(m, op);
     case 0xF4:      // hlt is privileged
       return fail(13);
@@ -950,6 +977,7 @@ X86_64Cpu::Step X86_64Cpu::step_group_f(GuestMemory& m, uint8_t op) {
     s_.rip = v;
     return Step::Ok;
   }
+  if (op == 0xFF && (kind == 3 || kind == 5)) return far_branch(m, kind == 3);
   if (op == 0xFF && kind == 6) {      // push r/m64
     if (!read_rm(m, 8, &v) || !push(m, v)) return Step::Fault;
     s_.rip += d_.position;
@@ -1029,12 +1057,19 @@ X86_64Cpu::Step X86_64Cpu::step_group_f(GuestMemory& m, uint8_t op) {
 
 // --- the 0F opcode map -----------------------------------------------------------------------------------------------------------------------
 
-X86_64Cpu::Step X86_64Cpu::step_0f(GuestMemory& m) {
+X86_64Cpu::Step X86_64Cpu::step_0f(GuestMemory& m) { return step_0f_op(m, next_u8()); }
+
+X86_64Cpu::Step X86_64Cpu::step_0f_op(GuestMemory& m, uint8_t op) {
   const uint32_t osize = static_cast<uint32_t>(operand_size());
-  const uint8_t op = next_u8();
   auto bad_decode = [&]() { return fail(d_.available < 15 ? 14 : 6, s_.rip + d_.available); };
   auto advance = [&]() { s_.rip += d_.position; };
   if (d_.truncated) return bad_decode();
+  if (d_.apx_high()) {      // only the instructions that work on general registers may name R16..R31
+    const bool general = (op >= 0x40 && op <= 0x4F) || (op >= 0x90 && op <= 0x9F) || (op >= 0xC8 && op <= 0xCF) || op == 0x38 || op == 0x1F || (op >= 0x18 && op <= 0x1E) || op == 0xA3 ||
+                         op == 0xAB || op == 0xB3 || op == 0xBB || op == 0xBA || op == 0xA4 || op == 0xA5 || op == 0xAC || op == 0xAD || op == 0xAF || op == 0xB0 || op == 0xB1 ||
+                         op == 0xB6 || op == 0xB7 || op == 0xBE || op == 0xBF || op == 0xC0 || op == 0xC1 || op == 0xBC || op == 0xBD || op == 0xB8 || op == 0xC3 || op == 0xC7 || op == 0xAE;
+    if (!general) return fail(6);
+  }
 
   switch (op) {
     case 0x01: return system_0f01(m);
@@ -1042,6 +1077,7 @@ X86_64Cpu::Step X86_64Cpu::step_0f(GuestMemory& m) {
     case 0xC3: return movnti(m);
     case 0x38: {      // 0F 38 F0 / F1: movbe
       const uint8_t second = next_u8();
+      if (d_.apx_high() && second != 0xF0 && second != 0xF1 && second != 0xF6 && second != 0xF8 && second != 0xF9) return fail(6);
       if (d_.truncated) return bad_decode();
       if ((second == 0xF0 || second == 0xF1) && d_.repne) return crc32_instruction(m, second);
       if (second == 0xF6 && (d_.operand16 || d_.rep) && !d_.repne) return adx_instruction(m, d_.rep);
@@ -1064,24 +1100,31 @@ X86_64Cpu::Step X86_64Cpu::step_0f(GuestMemory& m) {
     }
     case 0x3A: {      // 0F 3A: SSSE3 / SSE4 instructions with an immediate
       const uint8_t second = next_u8();
+      if (d_.apx_high()) return fail(6);
       if (d_.truncated) return bad_decode();
       if (!d_.operand16 && !d_.rep && !d_.repne && second == 0xCC) return crypto_map(m, 3, second, false, 0);      // sha1rnds4
       if (mmx_ssse3_opcode(3, second)) return mmx_ssse3(m, 3, second);
       return legacy_sse_map(m, 3, second);
     }
-    case 0xA0: case 0xA8: {      // push fs / push gs: the selector (zero here)
+    case 0xA0: case 0xA8: {      // push fs / push gs: the selector
       if (!finish_decode()) return bad_decode();
-      if (!push(m, 0)) return Step::Fault;
+      if (!push(m, selector_[op == 0xA0 ? 4 : 5])) return Step::Fault;
       advance();
       return Step::Ok;
     }
-    case 0xA1: case 0xA9: {      // pop fs / pop gs: the selector is dropped (the base is not reloaded from a descriptor table)
+    case 0xA1: case 0xA9: {      // pop fs / pop gs: the selector is kept (the base is not reloaded from a descriptor table)
       if (!finish_decode()) return bad_decode();
-      uint64_t ignored = 0;
-      if (!pop(m, &ignored)) return Step::Fault;
+      const uint64_t before = s_.r[4];
+      uint64_t v = 0;
+      if (!pop(m, &v)) return Step::Fault;
+      if (!load_selector(op == 0xA1 ? 4 : 5, static_cast<uint16_t>(v))) {
+        s_.r[4] = before;
+        return fail(13);
+      }
       advance();
       return Step::Ok;
     }
+    case 0xB2: case 0xB4: case 0xB5: return far_pointer_load(m, op);      // lss, lfs, lgs
     case 0x05:      // syscall
       if (!finish_decode()) return bad_decode();
       s_.rip += d_.position;
@@ -1115,21 +1158,22 @@ X86_64Cpu::Step X86_64Cpu::step_0f(GuestMemory& m) {
         c = (1u << 0) | (1u << 9) | (1u << 12) | (1u << 19) | (1u << 20) | (1u << 22) | (1u << 23) | (1u << 26) | (1u << 27) | (1u << 28) | (1u << 29) | (1u << 1) | (1u << 25) | (1u << 13) | (1u << 30);      // SSE3, SSSE3, FMA, CMPXCHG16B, SSE4.1, SSE4.2, MOVBE, POPCNT, XSAVE, OSXSAVE, AVX, F16C, RDRAND, PCLMULQDQ, AES
       } else if (leaf == 7 && static_cast<uint32_t>(s_.r[1]) == 1) {
         a = (1u << 0) | (1u << 1) | (1u << 2) | (1u << 4) | (1u << 5) | (1u << 21) | (1u << 23);      // SHA512, SM3, SM4, AVX-VNNI, AVX512_BF16, AMX-FP16, AVX-IFMA
-        dx = (1u << 4) | (1u << 5) | (1u << 8) | (1u << 10) | (1u << 19);      // AVX-VNNI-INT8, AVX-NE-CONVERT, AVX-VNNI-INT16, AVX10
+        dx = (1u << 4) | (1u << 5) | (1u << 8) | (1u << 10) | (1u << 19) | (1u << 21);      // AVX-VNNI-INT8, AVX-NE-CONVERT, AVX-VNNI-INT16, APX_F, AVX10
       } else if (leaf == 7 && static_cast<uint32_t>(s_.r[1]) == 0) {
         b = (1u << 0) | (1u << 3) | (1u << 5) | (1u << 8) | (1u << 18) | (1u << 19) | (1u << 23) | (1u << 24) | (1u << 26) | (1u << 27) | (1u << 29) | (1u << 16) | (1u << 17) | (1u << 21) | (1u << 28) | (1u << 30) | (1u << 31);      // BMI1, AVX2, BMI2, SHA, AVX512F, DQ, IFMA, CD, BW, VL
         c = (1u << 1) | (1u << 6) | (1u << 8) | (1u << 9) | (1u << 10) | (1u << 11) | (1u << 12) | (1u << 14) | (1u << 22) | (1u << 27) | (1u << 28);      // VBMI, VBMI2, GFNI, VAES, VPCLMULQDQ, VNNI, BITALG, VPOPCNTDQ, RDPID, MOVDIRI, MOVDIR64B
         dx = (1u << 2) | (1u << 3) | (1u << 8) | (1u << 11) | (1u << 22) | (1u << 23) | (1u << 24) | (1u << 25);      // AVX512_4VNNIW, AVX512_4FMAPS, AVX512_VP2INTERSECT, RTM_ALWAYS_ABORT, AMX-BF16, AVX512_FP16, AMX-TILE, AMX-INT8
       } else if (leaf == 0xD) {
         const uint32_t sub = static_cast<uint32_t>(s_.r[1]);
-        if (sub == 0) { a = 0x600E7; b = 10752; c = 10752; }      // x87, SSE, AVX and the AVX-512 state; 512 + 64 + 256 + ... bytes
-        else if (sub == 1) { a = 3; b = 10688; }      // XSAVEOPT, XSAVEC; the compacted size of all the components
+        if (sub == 0) { a = 0xE00E7; b = 11136; c = 11136; }      // x87, SSE, AVX and the AVX-512 state; 512 + 64 + 256 + ... bytes
+        else if (sub == 1) { a = 3; b = 10816; }      // XSAVEOPT, XSAVEC; the compacted size of all the components
         else if (sub == 2) { a = 256; b = 576; }      // the AVX component: 256 bytes at offset 576
         else if (sub == 5) { a = 64; b = 1088; }      // opmask registers
         else if (sub == 6) { a = 512; b = 1152; }      // the upper halves of ZMM0..15
         else if (sub == 7) { a = 1024; b = 1664; }      // ZMM16..31
         else if (sub == 17) { a = 64; b = 2752; c = 2; }      // TILECFG (64-byte aligned in the compacted format)
         else if (sub == 18) { a = 8192; b = 2816; c = 2; }      // TILEDATA
+        else if (sub == 19) { a = 128; b = 11008; }      // APX: R16..R31
       } else if (leaf == 0x1D) {      // AMX tile palettes: one, with 8 tiles of 16 rows of 64 bytes
         const uint32_t sub = static_cast<uint32_t>(s_.r[1]);
         if (sub == 0) a = 1;
@@ -1142,7 +1186,7 @@ X86_64Cpu::Step X86_64Cpu::step_0f(GuestMemory& m) {
       } else if (leaf == 0x80000000u) {
         a = 0x80000001u;
       } else if (leaf == 0x80000001u) {
-        c = (1u << 0) | (1u << 5);      // LAHF/SAHF, LZCNT
+        c = (1u << 0) | (1u << 5) | (1u << 11) | (1u << 16) | (1u << 21);      // LAHF/SAHF, LZCNT, XOP, FMA4, TBM
         dx = (1u << 11) | (1u << 20) | (1u << 27) | (1u << 29);      // SYSCALL, NX, RDTSCP, long mode
       }
       s_.r[0] = a;
@@ -1328,7 +1372,7 @@ X86_64Cpu::Step X86_64Cpu::step_0f(GuestMemory& m) {
     }
     case 0xC8: case 0xC9: case 0xCA: case 0xCB: case 0xCC: case 0xCD: case 0xCE: case 0xCF: {      // bswap
       if (!finish_decode()) return bad_decode();
-      const uint32_t r = (op & 7) | (d_.rex_b ? 8 : 0);
+      const uint32_t r = (op & 7) | d_.ext_b();
       uint64_t v = get_reg(r, osize), out = 0;
       for (uint32_t i = 0; i < osize; ++i) out = (out << 8) | ((v >> (8 * i)) & 0xFF);
       set_reg(r, osize, out);
@@ -1370,6 +1414,7 @@ X86_64Cpu::Step X86_64Cpu::step_0f(GuestMemory& m) {
       return Step::Ok;
     }
     default:
+      if (d_.apx_high()) return fail(6);
       return step_sse(m, op);
   }
 }
