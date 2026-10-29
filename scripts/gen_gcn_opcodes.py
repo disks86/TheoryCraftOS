@@ -55,6 +55,7 @@ for m in VOP1: add(m, 'VOP1', (m if m == 'v_nop' else ('%s s0, v1' % m if m == '
 for m in VOP2: add(m, 'VOP2', ('%s v0, vcc, v1, v2' % m) if m in ('v_add_u32', 'v_sub_u32', 'v_subrev_u32') else '%s v0, v1, v2' % m + (', vcc' if m == 'v_cndmask_b32' else ''))
 for m in VOP2_LIT: add(m, 'VOP2', '%s v0, v1, 0x3f800000, v2' % m if m == 'v_madmk_f32' else '%s v0, v1, v2, 0x3f800000' % m)
 for c in CMP_F: add('v_cmp_%s_f32' % c, 'VOPC', 'v_cmp_%s_f32 vcc, v1, v2' % c)
+add('v_cmp_class_f32', 'VOPC', 'v_cmp_class_f32 vcc, v1, v2')
 for c in CMP_I:
     add('v_cmp_%s_i32' % c, 'VOPC', 'v_cmp_%s_i32 vcc, v1, v2' % c)
     add('v_cmp_%s_u32' % c, 'VOPC', 'v_cmp_%s_u32 vcc, v1, v2' % c)
