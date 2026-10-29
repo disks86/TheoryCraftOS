@@ -25,7 +25,7 @@
 namespace hardware {
 
 // A mode as the CRTC wants it (drm_display_mode's crtc_* values: already halved for interlace and doubled for double scan).
-struct DisplayMode {
+struct CrtcMode {
   uint32_t pixel_clock_khz = 0;
   uint16_t h_display = 0, h_sync_start = 0, h_sync_end = 0, h_total = 0;
   uint16_t v_display = 0, v_sync_start = 0, v_sync_end = 0, v_total = 0;
@@ -70,8 +70,8 @@ class AmdModeSet {
 
   AmdModeSet(IAtomHost& host, AtomBios& bios) : host_(host), bios_(bios) {}
 
-  bool set_pixel_clock(const ModeSetOutput& out, const DisplayMode& mode);                 // amdgpu_atombios_crtc_program_pll (V7: the card computes the PLL)
-  bool set_dtd_timing(const ModeSetOutput& out, const DisplayMode& mode);                  // amdgpu_atombios_crtc_set_dtd_timing (no borders)
+  bool set_pixel_clock(const ModeSetOutput& out, const CrtcMode& mode);                 // amdgpu_atombios_crtc_program_pll (V7: the card computes the PLL)
+  bool set_dtd_timing(const ModeSetOutput& out, const CrtcMode& mode);                  // amdgpu_atombios_crtc_set_dtd_timing (no borders)
   bool overscan_setup(const ModeSetOutput& out);                                          // ... _overscan_setup with RMX off: all zero
   bool scaler_setup(const ModeSetOutput& out);                                            // ... _scaler_setup with RMX off: disabled
   bool select_crtc_source(const ModeSetOutput& out);                                      // amdgpu_atombios_encoder_set_crtc_source (V2 / V3)
@@ -80,9 +80,9 @@ class AmdModeSet {
   bool lock_crtc(uint8_t crtc, bool lock);
   bool powergate_crtc(uint8_t crtc, bool enable);                                         // EnableDispPowerGating
   // amdgpu_atombios_encoder_setup_dig_encoder: the DIGx encoder control with an action (kEncoderSetup, the panel mode with `panel_mode`, the training commands of AmdDpSource, DP video on / off)
-  bool encoder(const ModeSetOutput& out, const DisplayMode& mode, uint8_t action, uint8_t panel_mode = 0);
+  bool encoder(const ModeSetOutput& out, const CrtcMode& mode, uint8_t action, uint8_t panel_mode = 0);
   // amdgpu_atombios_encoder_setup_dig_transmitter: the UNIPHY transmitter control with an action (kTransmitterEnable, kTransmitterDisable, SETUP_VSEMPH with `lane_set` for all lanes)
-  bool transmitter(const ModeSetOutput& out, const DisplayMode& mode, uint8_t action, uint8_t lane_num = 0, uint8_t lane_set = 0);
+  bool transmitter(const ModeSetOutput& out, const CrtcMode& mode, uint8_t action, uint8_t lane_num = 0, uint8_t lane_set = 0);
 
   // dce_v11_0_pick_pll for Polaris and VEGAM: DisplayPort uses the DP DTO (ATOM_DP_DTO); the other outputs a combo PHY PLL by their UNIPHY (UNIPHY 0/1/2: PLL 0/2/4, link B one higher). The
   // encoder id is AtomConnectors::encoder_id; kPllInvalid for any other encoder.

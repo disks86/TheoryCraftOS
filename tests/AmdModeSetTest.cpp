@@ -124,8 +124,8 @@ struct Rig {
   }
 };
 
-static DisplayMode mode_1080p() {
-  DisplayMode m;
+static CrtcMode mode_1080p() {
+  CrtcMode m;
   m.pixel_clock_khz = 148500;
   m.h_display = 1920; m.h_sync_start = 2008; m.h_sync_end = 2052; m.h_total = 2200;
   m.v_display = 1080; m.v_sync_start = 1084; m.v_sync_end = 1089; m.v_total = 1125;
@@ -150,7 +150,7 @@ static ModeSetOutput output(uint8_t encoder_mode) {
 static void test_pixel_clock() {
   Rig r;
   AmdModeSet s(r.card, *r.bios);
-  DisplayMode m = mode_1080p();
+  CrtcMode m = mode_1080p();
   ModeSetOutput o = output(AmdModeSet::kModeDp);
   CHECK(s.set_pixel_clock(o, m));
   // 148.5 MHz in 100 Hz units; PPLL1, encoder 0x1E, mode DP, no misc; CRTC 2, no deep colour
@@ -177,7 +177,7 @@ static void test_pixel_clock() {
   off.crtc = 4;
   off.pll = AmdModeSet::kPpll2;
   r.card.calls.clear();
-  CHECK(s.set_pixel_clock(off, DisplayMode()) && r.card.calls[0].words == std::vector<uint32_t>({0, 1u, 4u, 0}));
+  CHECK(s.set_pixel_clock(off, CrtcMode()) && r.card.calls[0].words == std::vector<uint32_t>({0, 1u, 4u, 0}));
   // refused: a CRTC the card does not have, a clock that does not fit
   r.card.calls.clear();
   o.crtc = 6;
@@ -197,7 +197,7 @@ static void test_pixel_clock() {
 static void test_crtc_timing() {
   Rig r;
   AmdModeSet s(r.card, *r.bios);
-  DisplayMode m = mode_1080p();
+  CrtcMode m = mode_1080p();
   ModeSetOutput o = output(AmdModeSet::kModeDp);
   CHECK(s.set_dtd_timing(o, m));
   // H size, H blanking (to the total: 2200 - 1920), V size, V blanking, H sync offset (2008 - 1920) and width (44), V sync offset (4) and width (5), the misc flags, the border bytes, the CRTC
@@ -214,10 +214,10 @@ static void test_crtc_timing() {
   CHECK(s.set_dtd_timing(o, m) && r.card.calls[4].words[4] == 0x1C6);
   // refused: totals below the display, a sync before the display or ending before it starts, a CRTC that does not exist
   const size_t n = r.card.calls.size();
-  const struct { uint16_t DisplayMode::*field; uint16_t value; } bad[] = {{&DisplayMode::h_total, 1919}, {&DisplayMode::v_total, 1079}, {&DisplayMode::h_sync_start, 1919}, {&DisplayMode::v_sync_start, 1079},
-                                                                         {&DisplayMode::h_sync_end, 2007}, {&DisplayMode::v_sync_end, 1083}};
+  const struct { uint16_t CrtcMode::*field; uint16_t value; } bad[] = {{&CrtcMode::h_total, 1919}, {&CrtcMode::v_total, 1079}, {&CrtcMode::h_sync_start, 1919}, {&CrtcMode::v_sync_start, 1079},
+                                                                         {&CrtcMode::h_sync_end, 2007}, {&CrtcMode::v_sync_end, 1083}};
   for (const auto& b : bad) {
-    DisplayMode x = mode_1080p();
+    CrtcMode x = mode_1080p();
     x.*(b.field) = b.value;
     CHECK(!s.set_dtd_timing(o, x));
   }
@@ -280,7 +280,7 @@ static void test_crtc_controls() {
 }
 
 static void test_encoder() {
-  const DisplayMode m = mode_1080p();
+  const CrtcMode m = mode_1080p();
   {
     // V4: DP on DIG 3: pixel clock 14850, link rate 2.7 GHz (1) | DIG 3 << 4, action 0x0F; mode DP, two lanes, 8 bits, HPD 3
     Rig r(4, 4);
@@ -360,7 +360,7 @@ static void test_encoder() {
 }
 
 static void test_transmitter() {
-  const DisplayMode m = mode_1080p();
+  const CrtcMode m = mode_1080p();
   {
     // V1.5: DP on DIG 3: symbol clock = link rate / 10 = 27000, DIG 3 as the PHY id, action; two lanes, connector 19, mode DP, config (HPD3 sel 0x30 | coherent 2 | PLL1 << 2 = 0 for
     // PPLL1... the PLL id is the PHY's clock source); DIG 3 select bit
@@ -455,9 +455,9 @@ static void test_pick_pll() {
   ModeSetOutput off;
   off.crtc = 0xFF;
   off.pll = 22;
-  CHECK(s.set_pixel_clock(off, DisplayMode()) && r.card.calls[0].words == std::vector<uint32_t>({0u, 22u, 0xFFu, 0u}));
+  CHECK(s.set_pixel_clock(off, CrtcMode()) && r.card.calls[0].words == std::vector<uint32_t>({0u, 22u, 0xFFu, 0u}));
   off.crtc = 7;
-  CHECK(!s.set_pixel_clock(off, DisplayMode()));
+  CHECK(!s.set_pixel_clock(off, CrtcMode()));
 }
 
 int main() {

@@ -77,7 +77,7 @@ static bool put_file(filesystem::RamFileSystem& fs, const char* name) {
 }
 
 // A mapper that hands out the simulated video memory: the memory BAR starts at kAperture.
-constexpr uint64_t kVideoMemory = 64ull << 20, kGpuBase = 64ull << 20;   // the memory controller puts video memory at 64 MiB of the GPU's address space   // (the memory BAR is at the simulated memory's own address: the OS runs identity mapped, and the firmware's framebuffer is reached through it)
+constexpr uint64_t kVideoMemory = 96ull << 20, kGpuBase = 64ull << 20;   // the memory controller puts video memory at 64 MiB of the GPU's address space   // (the memory BAR is at the simulated memory's own address: the OS runs identity mapped, and the firmware's framebuffer is reached through it)
 struct Mapper final : IRegisterMapper {
   uint8_t* host = nullptr;
   bool refuse = false;
@@ -160,8 +160,8 @@ struct Rig {
     uint8_t* db = reinterpret_cast<uint8_t*>((reinterpret_cast<uintptr_t>(doorbells.data()) + 4095) & ~uintptr_t{4095});
     doorbell_base = db;
     // the memory controller as the firmware left it: 64 MiB at GPU address 0
-    card.gmc.set_reg(0x150a, 64);
-    card.gmc.set_reg(0x809, (7u << 16) | 4u);   // MC_VM_FB_LOCATION: base 4 * 16 MiB, top 7
+    card.gmc.set_reg(0x150a, 96);
+    card.gmc.set_reg(0x809, (9u << 16) | 4u);   // MC_VM_FB_LOCATION: base 4 * 16 MiB, top 7
     const fakegmc::Window w{kGpuBase, vram, kVideoMemory};
     card.gmc.windows.push_back(w);
     card.gfx.windows.push_back({kGpuBase, vram, kVideoMemory});
@@ -423,6 +423,7 @@ static void test_failures() {
     CHECK(!vega.bring_up(in) && strstr(vega.status(), "does not fit") && rig.card.writes() == 0);
     Rig small;   // video memory smaller than the block reaches (the memory BAR is not)
     small.card.gmc.set_reg(0x150a, 52);
+    small.card.gmc.set_reg(0x809, (7u << 16) | 4u);
     AmdVegaM v2(small.alloc);
     CHECK(!v2.bring_up(small.inputs()) && strstr(v2.status(), "too small") && small.card.writes() == 0);
     rig.mapper.refuse = true;
@@ -1235,7 +1236,7 @@ static void test_post_after_reset() {
     in.pci = &pci;
     in.allow_asic_reset = true;
     // the simulated card is trained when the video BIOS writes the engine clock to 0x7777
-    rig.card.on_marker = [&rig]() { rig.card.gmc.set_reg(0x150a, 64); rig.card.gmc.set_reg(0x809, (7u << 16) | 4u); };
+    rig.card.on_marker = [&rig]() { rig.card.gmc.set_reg(0x150a, 96); rig.card.gmc.set_reg(0x809, (9u << 16) | 4u); };
   };
   {
     // Not POSTed after the reset, no video BIOS: down (as before).
@@ -2129,7 +2130,7 @@ static void test_set_mode() {
   AmdVegaM::Inputs in = rig.inputs();
   in.vbios = ConstByteView(vbios.data(), vbios.size());
   in.display_clocks.sclk_high_khz = 1200000; in.display_clocks.mclk_high_khz = 800000; in.display_clocks.sclk_low_khz = 300000; in.display_clocks.mclk_low_khz = 150000;
-  DisplayMode m;
+  CrtcMode m;
   m.pixel_clock_khz = 148500;
   m.h_display = 1920; m.h_sync_start = 2008; m.h_sync_end = 2052; m.h_total = 2200;
   m.v_display = 1080; m.v_sync_start = 1084; m.v_sync_end = 1089; m.v_total = 1125;
@@ -2196,7 +2197,7 @@ static void test_set_mode() {
   // HDMI is a flat panel device with a FMT block: 8 bits truncated (enable, depth 1), 6 bits depth 0, 12 bits nothing; an interlaced mode turns the interleave on; the VGA mode is off after the unblank
   CHECK(rig.card.dce.get(0x1bf2 + 0x2600) == (1u | 1u << 4) && (rig.card.dce.get(0x1ac0 + 0x2600) & 8) == 0 && (rig.card.dce.get(0xf9) & 1) == 0);
   {
-    DisplayMode interlaced = m;
+    CrtcMode interlaced = m;
     interlaced.interlaced = true;
     CHECK(vega.set_mode(hdmi, 3, interlaced, 8, &r) && (rig.card.dce.get(0x1ac0 + 0x2600) & 8) != 0 && rig.card.dce.get(0x1bf2 + 0x2600) == (1u | 1u << 4));
     CHECK(vega.set_mode(hdmi, 3, m, 6, &r) && (rig.card.dce.get(0x1ac0 + 0x2600) & 8) == 0 && rig.card.dce.get(0x1bf2 + 0x2600) == 1u);
@@ -2233,7 +2234,7 @@ static void test_set_mode() {
   auxcard.unpowered_channel = 0;
   // failures name their stage: a mode that is no mode, a connector that is no digital output, a sink that has no DPCD or no lanes for the mode, a link that does not train
   CHECK(!vega.set_mode(dp, 6, m, 8, &r) && r.failed == AmdVegaM::ModeSetStage::Unsupported);
-  DisplayMode empty;
+  CrtcMode empty;
   CHECK(!vega.set_mode(dp, 0, empty, 8, &r) && r.failed == AmdVegaM::ModeSetStage::Unsupported);
   AtomConnectors::Connector vga = dp;
   vga.type = AtomConnectors::Type::Vga;
@@ -2244,11 +2245,11 @@ static void test_set_mode() {
   dpcd[1] = 0;
   CHECK(!vega.set_mode(dp, 0, m, 8, &r) && r.failed == AmdVegaM::ModeSetStage::SinkCapabilities);
   dpcd[1] = 0x0A;
-  DisplayMode huge = m;
+  CrtcMode huge = m;
   huge.pixel_clock_khz = 2000000;
   CHECK(!vega.set_mode(dp, 0, huge, 8, &r) && r.failed == AmdVegaM::ModeSetStage::SinkCapabilities);
   dpcd[1] = 0x14;
-  DisplayMode crooked = m;
+  CrtcMode crooked = m;
   crooked.h_sync_end = crooked.h_sync_start - 1;
   CHECK(!vega.set_mode(hdmi, 0, crooked, 8, &r) && r.failed == AmdVegaM::ModeSetStage::Timing);
   dpcd[0x202] = dpcd[0x203] = 0;
@@ -2306,7 +2307,7 @@ static void test_set_mode_audio() {
   CHECK(vega.bring_up(in));
   if (!vega.up()) return;
   const AtomConnectors::Connector hdmi = vega.connectors()[1], dp = vega.connectors()[2];
-  DisplayMode m;
+  CrtcMode m;
   m.pixel_clock_khz = 148500;
   m.h_display = 1920; m.h_sync_start = 2008; m.h_sync_end = 2052; m.h_total = 2200;
   m.v_display = 1080; m.v_sync_start = 1084; m.v_sync_end = 1089; m.v_total = 1125;
@@ -2333,6 +2334,90 @@ static void test_set_mode_audio() {
   azalia.connectivity[3] = 1;
   CHECK(!vega.set_mode(hdmi, 3, m, 8, &r, AmdModeSet::kPllInvalid, nullptr, ConstByteView(edid.data(), edid.size())) && r.failed == AmdVegaM::ModeSetStage::Audio);
   vega.shutdown();
+}
+
+// An output lit up on its own: the EDID read (over DDC for HDMI, over AUX for DisplayPort), the first detailed timing the connector accepts and the room holds, the picture, the mode set.
+static std::vector<uint8_t> edid_with_timings(const std::vector<std::vector<uint8_t>>& dtds, bool hdmi_block = false) {
+  std::vector<uint8_t> e(hdmi_block ? 256 : 128, 0);
+  const uint8_t header[8] = {0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0};
+  memcpy(e.data(), header, 8);
+  e[18] = 1; e[19] = 3; e[20] = 0x80;
+  for (size_t i = 0; i < dtds.size() && i < 4; ++i) memcpy(&e[54 + i * 18], dtds[i].data(), 18);
+  if (hdmi_block) {
+    e[126] = 1;
+    e[128] = 0x02; e[129] = 3; e[130] = 4 + 8; e[132] = 3 << 5 | 7; e[133] = 0x03; e[134] = 0x0C; e[135] = 0x00; e[136] = 0x10; e[137] = 0x00; e[138] = 0x00; e[139] = 68;
+    uint8_t sum = 0;
+    for (int i = 128; i < 255; ++i) sum = static_cast<uint8_t>(sum + e[i]);
+    e[255] = static_cast<uint8_t>(0 - sum);
+  }
+  uint8_t sum = 0;
+  for (int i = 0; i < 127; ++i) sum = static_cast<uint8_t>(sum + e[i]);
+  e[127] = static_cast<uint8_t>(0 - sum);
+  return e;
+}
+
+static void test_light_up() {
+  const std::vector<uint8_t> vbios = make_connector_vbios();   // eDP (0x92, pin 0, DIG 0), HDMI-A (0x91, pin 1, DIG 2), DisplayPort (0x93, pin 2, DIG 3)
+  // 1080p60 (148.5 MHz, 1920 + 88 + 44 + 148 / 1080 + 4 + 5 + 36, + sync) and 4K60 (594 MHz) timings
+  const std::vector<uint8_t> t1080 = {0x02, 0x3A, 0x80, 0x18, 0x71, 0x38, 0x2D, 0x40, 0x58, 0x2C, 0x45, 0x00, 0, 0, 0, 0, 0, 0x1E};
+  const std::vector<uint8_t> t4k = {0x28, 0xE8, 0x00, 0x30, 0xF0, 0x70, 0x2C, 0x80, 0x30, 0x20, 0x36, 0x00, 0, 0, 0, 0, 0, 0x18};
+  const std::vector<uint8_t> t720 = {0x01, 0x1D, 0x00, 0x72, 0x51, 0xD0, 0x1E, 0x20, 0x6E, 0x28, 0x55, 0x00, 0, 0, 0, 0, 0, 0x1E};
+  Rig rig;
+  FakeI2cMonitor monitor;
+  FakeAuxCard auxcard;
+  rig.card.monitor = &monitor;
+  rig.card.aux = &auxcard;
+  for (uint32_t pin = 0; pin < 3; ++pin) rig.card.gfx.set_reg(0x1898 + 8 * pin, 0x2);
+  for (uint32_t i = 0; i < 6; ++i) rig.card.gfx.set_reg(0x321 + i, 0x10);
+  AmdVegaM vega(rig.alloc);
+  AmdVegaM::Inputs in = rig.inputs();
+  in.hpd_pins = 0x3F;
+  in.vbios = ConstByteView(vbios.data(), vbios.size());
+  in.output_framebuffer_bytes = 9ull << 20;
+  in.display_clocks.sclk_high_khz = 1200000; in.display_clocks.mclk_high_khz = 800000; in.display_clocks.sclk_low_khz = 300000; in.display_clocks.mclk_low_khz = 150000;
+  AmdVegaM::LightUp lu;
+  CHECK(!vega.light_up(AtomConnectors::Connector(), 0xFF, &lu) && lu.failed == AmdVegaM::LightUpStage::NotReady);
+  CHECK(vega.bring_up(in));
+  if (!vega.up()) return;
+  const AtomConnectors::Connector hdmi = vega.connectors()[1], dp = vega.connectors()[2];
+  // HDMI (a plain DVI-style EDID here): the 4K timing first is refused (HDMI-A above 165 MHz needs an HDMI block, and 4K does not fit 16 MiB either), the 1080p one is taken
+  monitor.edid = edid_with_timings({t4k, t1080});
+  CHECK(vega.light_up(hdmi, 0xFF, &lu));
+  CHECK(lu.failed == AmdVegaM::LightUpStage::Done && lu.crtc == 0 && lu.width == 1920 && lu.height == 1080 && lu.mode.pixel_clock_khz == 148500 && lu.mode.h_total == 2200 && lu.mode.h_sync_start == 2008 &&
+        lu.mode.h_sync_end == 2052 && lu.mode.v_total == 1125 && lu.mode.v_sync_start == 1084 && lu.mode.v_sync_end == 1089 && !lu.mode.h_sync_negative && !lu.mode.v_sync_negative && lu.bpc == 8);
+  // the picture: a white border and a grey ramp between; the plane enabled on CRTC 0 with its address inside the block's output area, 1920 pixels a row
+  CHECK(lu.set.failed == AmdVegaM::ModeSetStage::Done && rig.card.dce.get(0x1a00) == 1 && rig.card.dce.get(0x1a06) == 1920 && rig.card.dce.get(0x1a0e) == 1080);
+  const MmioRegion pic = vega.picture();
+  CHECK(pic.valid() && pic.length() == 1920ull * 1080 * 4 && pic.read32(0) == 0xFFFFFFFFu && pic.read32((540ull * 1920 + 960) * 4) == (0xFF000000u | 127u << 16 | 127u << 8 | 127u) && pic.read32((540ull * 1920 + 10) * 4) == (0xFF000000u | 1u << 16 | 1u << 8 | 1u));
+  CHECK(pic.read32((1079ull * 1920 + 1919) * 4) == 0xFFFFFFFFu);
+  // a second output goes on the next CRTC; the first stays
+  monitor.edid = edid_with_timings({t720});
+  CHECK(vega.light_up(hdmi, 0xFF, &lu) && lu.crtc == 1 && lu.width == 1280 && lu.height == 720 && lu.mode.v_total == 750);
+  // DisplayPort over AUX: the EDID, the link config from the sink, and a 4K timing that the link cannot carry is skipped for the next
+  auxcard.sink.edid = edid_with_timings({t4k, t1080});
+  std::vector<uint8_t>& dpcd = auxcard.sink.dpcd;
+  dpcd.assign(0x800, 0);
+  const uint8_t caps[8] = {0x12, 0x0A, 0xC4, 0x01, 0x00, 0x00, 0x01, 0x00};      // HBR, four lanes
+  for (size_t i = 0; i < 8; ++i) dpcd[i] = caps[i];
+  dpcd[0x202] = dpcd[0x203] = 0x77;
+  dpcd[0x204] = 0x01;
+  CHECK(vega.light_up(dp, 2, &lu) && lu.crtc == 2 && lu.width == 1920 && lu.set.link.outcome.trained() && lu.set.link.config.lanes == 4);
+  // refused: nothing plugged in the pin, no timing the connector accepts, no EDID, an interlaced mode needs no special care, no room
+  AtomConnectors::Connector unplugged = hdmi;
+  unplugged.hpd_pin = 5;
+  CHECK(!vega.light_up(unplugged, 0xFF, &lu) && lu.failed == AmdVegaM::LightUpStage::NotConnected);
+  monitor.edid = edid_with_timings({t4k});
+  CHECK(!vega.light_up(hdmi, 0xFF, &lu) && lu.failed == AmdVegaM::LightUpStage::NoMode);
+  monitor.edid = std::vector<uint8_t>(128, 0);
+  CHECK(!vega.light_up(hdmi, 0xFF, &lu) && lu.failed == AmdVegaM::LightUpStage::Edid);
+  vega.shutdown();
+  Rig plain;
+  AmdVegaM none(plain.alloc);
+  AmdVegaM::Inputs no_room = plain.inputs();
+  no_room.vbios = ConstByteView(vbios.data(), vbios.size());
+  plain.card.gfx.set_reg(0x1898, 0x2);
+  CHECK(none.bring_up(no_room) && !none.light_up(none.connectors()[1], 0xFF, &lu) && lu.failed == AmdVegaM::LightUpStage::NoRoom);
+  none.shutdown();
 }
 
 // The sink's DPCD over the AUX channel of the DisplayPort and eDP connectors (through the video BIOS's table, with the panel power-up for the eDP one).
@@ -2819,6 +2904,7 @@ int main() {
   test_train_link();
   test_set_mode();
   test_set_mode_audio();
+  test_light_up();
   test_short_pulse_status();
   test_retrain_on_short_pulse();
   printf(g_failed ? "AmdVegaMTest: %d FAILED\n" : "AmdVegaMTest: all passed\n", g_failed);

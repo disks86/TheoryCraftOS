@@ -251,10 +251,42 @@ static void test_mode_valid() {
   CHECK(mode_valid(c) == ModeStatus::ClockHigh);
 }
 
+static void test_detailed_timing() {
+  // 1080p60: pixel clock 148.5 MHz, 1920 + 280 / 1080 + 45, sync offsets 88 / 4, widths 44 / 5, positive syncs
+  std::vector<uint8_t> e = edid(3, 0x80);
+  const uint8_t t1080[18] = {0x02, 0x3A, 0x80, 0x18, 0x71, 0x38, 0x2D, 0x40, 0x58, 0x2C, 0x45, 0x00, 0, 0, 0, 0, 0, 0x1E};
+  memcpy(&e[54], t1080, 18);
+  CrtcMode m;
+  CHECK(edid_detailed_timing(ConstByteView(e.data(), e.size()), 0, &m));
+  CHECK(m.pixel_clock_khz == 148500 && m.h_display == 1920 && m.h_sync_start == 2008 && m.h_sync_end == 2052 && m.h_total == 2200 && m.v_display == 1080 && m.v_sync_start == 1084 &&
+        m.v_sync_end == 1089 && m.v_total == 1125 && !m.h_sync_negative && !m.v_sync_negative && !m.interlaced);
+  // negative syncs (flags without the polarity bits); interlaced (1080i: 1920 x 540 per field, the total odd)
+  e[54 + 17] = 0x18;
+  CHECK(edid_detailed_timing(ConstByteView(e.data(), e.size()), 0, &m) && m.h_sync_negative && m.v_sync_negative);
+  e[54 + 17] = 0x9E;
+  e[54 + 5] = 0x1C; e[54 + 6] = 0x16; e[54 + 7] = 0x20;       // 540 active (0x21C), 22 blank
+  CHECK(edid_detailed_timing(ConstByteView(e.data(), e.size()), 0, &m) && m.interlaced && m.v_display == 540 && m.v_total == (562 | 1));
+  // monitor descriptors (clock 0), stereo, analog sync, no sync width, a slot past the fourth
+  e[54 + 17] = 0x1E; e[54 + 5] = 0x38; e[54 + 6] = 0x2D; e[54 + 7] = 0x40;
+  CHECK(!edid_detailed_timing(ConstByteView(e.data(), e.size()), 1, &m) && !edid_detailed_timing(ConstByteView(e.data(), e.size()), 4, &m));
+  e[54 + 17] = 0x3E;
+  CHECK(!edid_detailed_timing(ConstByteView(e.data(), e.size()), 0, &m));
+  e[54 + 17] = 0x06;
+  CHECK(!edid_detailed_timing(ConstByteView(e.data(), e.size()), 0, &m));
+  e[54 + 17] = 0x1E; e[54 + 9] = 0;
+  CHECK(!edid_detailed_timing(ConstByteView(e.data(), e.size()), 0, &m));
+  e[54 + 9] = 0x2C;
+  // a sync that ends after the total is cut at it
+  e[54 + 9] = 0xFF; e[54 + 11] = 0x30;      // width 0x3FF
+  CHECK(edid_detailed_timing(ConstByteView(e.data(), e.size()), 0, &m) && m.h_sync_end == m.h_total);
+  CHECK(!edid_detailed_timing(ConstByteView(e.data(), 100), 0, &m));
+}
+
 int main() {
   test_parse();
   test_bpc();
   test_mode_valid();
+  test_detailed_timing();
   printf(g_failed ? "AmdMonitorTest: %d FAILED\n" : "AmdMonitorTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }
