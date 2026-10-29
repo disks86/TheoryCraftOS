@@ -140,16 +140,18 @@ void Code::vopc(Vopc op, Src src0, uint32_t vsrc1) {
   src_literal(src0);
 }
 
+namespace {
+// the VOP3 opcode of a VOP1 / VOP2 / VOPC instruction
+constexpr uint32_t kVop3OfVop2 = 0x100, kVop3OfVop1 = 0x140;
+}  // namespace
+
 void Code::vop3(Vop3 op, uint32_t vdst, Src src0, Src src1, Src src2, Mods mods) {
   if (vdst > 255 || src0.literal || src1.literal || src2.literal || src0.code > 511 || src1.code > 511 || src2.code > 511 || mods.neg > 7 || mods.abs > 7 || mods.omod > 3) bad();
   put(0xD0000000u | (static_cast<uint32_t>(op) << 16) | (mods.clamp ? 1u << 15 : 0u) | (static_cast<uint32_t>(mods.abs & 7) << 8) | vdst);
   put((src0.code & 0x1FF) | ((src1.code & 0x1FFu) << 9) | ((src2.code & 0x1FFu) << 18) | (static_cast<uint32_t>(mods.omod & 3) << 27) | (static_cast<uint32_t>(mods.neg & 7) << 29));
 }
 
-namespace {
-// the VOP3 opcode of a VOP1 / VOP2 / VOPC instruction
-constexpr uint32_t kVop3OfVop2 = 0x100, kVop3OfVop1 = 0x140;
-}  // namespace
+
 
 void Code::vop3_of(Vop1 op, uint32_t vdst, Src src0, Mods mods) {
   vop3(static_cast<Vop3>(kVop3OfVop1 + static_cast<uint32_t>(op)), vdst, src0, Src{}, Src{}, mods);
@@ -165,6 +167,12 @@ void Code::vop3_of(Vop2 op, uint32_t vdst, Src src0, Src src1, Src carry_or_sele
 
 void Code::vop3_of(Vopc op, uint32_t sdst, Src src0, Src src1, Mods mods) {
   vop3(static_cast<Vop3>(static_cast<uint32_t>(op)), sdst, src0, src1, Src{}, mods);
+}
+
+void Code::vop3b_of(Vop2 op, uint32_t vdst, uint32_t sdst, Src src0, Src src1) {
+  if (vdst > 255 || sdst > 127 || src0.literal || src1.literal || src0.code > 511 || src1.code > 511) bad();
+  put(0xD0000000u | ((kVop3OfVop2 + static_cast<uint32_t>(op)) << 16) | (sdst << 8) | vdst);
+  put((src0.code & 0x1FF) | ((src1.code & 0x1FFu) << 9));
 }
 
 void Code::vintrp(Vintrp op, uint32_t vdst, uint32_t vsrc, uint32_t attr, uint32_t chan) {

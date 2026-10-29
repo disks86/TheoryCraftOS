@@ -14,7 +14,7 @@ MC = sys.argv[1] if len(sys.argv) > 1 else 'llvm-mc'
 
 # (format, mnemonic, a sample line that assembles to that format)
 SOP1 = ['s_mov_b32', 's_not_b32', 's_cmov_b32']
-SOP1_64 = ['s_mov_b64', 's_not_b64', 's_and_saveexec_b64', 's_or_saveexec_b64', 's_xor_saveexec_b64', 's_andn2_saveexec_b64', 's_orn2_saveexec_b64', 's_nand_saveexec_b64']
+SOP1_64 = ['s_mov_b64', 's_not_b64', 's_and_saveexec_b64', 's_or_saveexec_b64', 's_xor_saveexec_b64', 's_andn2_saveexec_b64', 's_orn2_saveexec_b64', 's_nand_saveexec_b64', 's_wqm_b64']
 SOP2 = ['s_add_u32', 's_sub_u32', 's_add_i32', 's_sub_i32', 's_addc_u32', 's_subb_u32', 's_min_i32', 's_min_u32', 's_max_i32', 's_max_u32', 's_and_b32', 's_or_b32', 's_xor_b32',
         's_andn2_b32', 's_orn2_b32', 's_nand_b32', 's_nor_b32', 's_lshl_b32', 's_lshr_b32', 's_ashr_i32', 's_mul_i32', 's_cselect_b32']
 SOP2_64 = ['s_and_b64', 's_or_b64', 's_xor_b64', 's_andn2_b64', 's_orn2_b64', 's_nand_b64', 's_nor_b64', 's_cselect_b64']
@@ -55,6 +55,7 @@ for m in VOP1: add(m, 'VOP1', (m if m == 'v_nop' else ('%s s0, v1' % m if m == '
 for m in VOP2: add(m, 'VOP2', ('%s v0, vcc, v1, v2' % m) if m in ('v_add_u32', 'v_sub_u32', 'v_subrev_u32') else '%s v0, v1, v2' % m + (', vcc' if m == 'v_cndmask_b32' else ''))
 for m in VOP2_LIT: add(m, 'VOP2', '%s v0, v1, 0x3f800000, v2' % m if m == 'v_madmk_f32' else '%s v0, v1, v2, 0x3f800000' % m)
 for c in CMP_F: add('v_cmp_%s_f32' % c, 'VOPC', 'v_cmp_%s_f32 vcc, v1, v2' % c)
+add('v_cmp_class_f32', 'VOPC', 'v_cmp_class_f32 vcc, v1, v2')
 for c in CMP_I:
     add('v_cmp_%s_i32' % c, 'VOPC', 'v_cmp_%s_i32 vcc, v1, v2' % c)
     add('v_cmp_%s_u32' % c, 'VOPC', 'v_cmp_%s_u32 vcc, v1, v2' % c)

@@ -18,6 +18,8 @@
 
 // Host-side tests for the page: the DOM as scripts see it (the tree, attributes, styles, class lists, markup, selectors, events with their phases, timers,
 // location and storage, matchMedia, getComputedStyle), pages that change after they are drawn, and clicks, resizes and timers delivered to a loaded page.
+#include <malloc.h>
+#include <sys/resource.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -47,9 +49,16 @@ static int g_failed = 0;
 
 struct TestAllocator final : allocators::IAllocator {
   int live = 0;
-  void* allocate(uint64_t size) override { ++live; return malloc(size); }
+  uint64_t bytes = 0, peak = 0;   // (what is held now and the most it was: the PROBE_HTML runs print them)
+  void* allocate(uint64_t size) override {
+    ++live;
+    void* p = malloc(size);
+    bytes += malloc_usable_size(p);
+    if (bytes > peak) peak = bytes;
+    return p;
+  }
   void* allocate_aligned(uint64_t size, uint64_t) override { return allocate(size); }
-  void deallocate(void* p) override { if (p) { --live; free(p); } }
+  void deallocate(void* p) override { if (p) { --live; bytes -= malloc_usable_size(p); free(p); } }
 };
 
 // A video for the tests: 64 x 48, two seconds, a picture that changes with the position.
@@ -303,7 +312,7 @@ struct FakeEnvironment final : IPageEnvironment {
   bool fetch_text(StringView address, uint64_t, String* text) override {
     fetched.push_back(std::string(address.data(), address.size()));
     auto it = files.find(fetched.back());
-    if (it == files.end() && getenv("WPT_REAL_FILE") && fetched.back().compare(0, 20, "https://app.example/") == 0) {   // (a real web-platform-tests run: the checkout is the site)
+    if (it == files.end() && (getenv("WPT_REAL_FILE") || getenv("PROBE_HTML")) && fetched.back().compare(0, 20, "https://app.example/") == 0) {   // (a real web-platform-tests run: the checkout is the site)
       std::string rel = fetched.back().substr(20);
       const size_t cut = rel.find_first_of("?#");
       if (cut != std::string::npos) rel.resize(cut);
@@ -859,6 +868,31 @@ static void test_document_encoding() {
 }
 
 static void test_external_and_errors() {
+  {   // as many scripts as a real page has (a Next.js home page loads about 40), and the handler properties scripts wrap are accessors of their interface
+    TestAllocator a;
+    {
+      FakeEnvironment env(a);
+      std::string head;
+      for (int i = 0; i < 40; ++i) {
+        const std::string name = "s" + std::to_string(i) + ".js";
+        env.files["http://example.com/" + name] = "window.count = (window.count || 0) + 1;";
+        head += "<script async src=" + name + "></script>";
+      }
+      MediaEnvironment media;
+      Page page(a, env, "http://example.com/", media, true);
+      page.load((std::string("<html><head>") + head + "</head><body><script>console.log(window.count)</script></body></html>").c_str());
+      CHECK(env.fetched.size() == 40);
+    }
+    {
+      FakeEnvironment env(a);
+      MediaEnvironment media;
+      Page page(a, env, "http://example.com/", media, true);
+      page.load("<html><body><script>var d = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'onerror'); var x = Object.getOwnPropertyDescriptor(XMLHttpRequestEventTarget.prototype, 'onload');"
+                "var s = document.createElement('script'); var f = function () {}; d.set.call(s, f);"
+                "console.log(typeof d.get, typeof d.set, typeof x.set, typeof Object.getOwnPropertyDescriptor(XMLHttpRequest.prototype, 'onreadystatechange').set, s.onerror === f, document.createElement('p').onclick);</script></body></html>");
+      CHECK(std::string(page.log().data(), page.log().size()) == "function function function function true null\n");
+    }
+  }
   TestAllocator a;
   {
     FakeEnvironment env(a);
@@ -6212,6 +6246,43 @@ static int run_real_wpt(const char* root, const char* file) {
 
 int main(int argc, char** argv) {
   if (const char* real = getenv("WPT_REAL_FILE")) return run_real_wpt(getenv("WPT_ROOT") ? getenv("WPT_ROOT") : ".", real);
+  if (const char* html_file = getenv("PROBE_HTML")) {   // loads a saved page as the document at https://app.example/ (PROBE_ROOT serves its files) and prints the log
+    std::string html;
+    if (FILE* f = fopen(html_file, "rb")) { int c; while ((c = fgetc(f)) != EOF) html.push_back(static_cast<char>(c)); fclose(f); }
+    TestAllocator a;
+    {
+      FakeEnvironment env(a);
+      MediaEnvironment media;
+      media.width = 1280;
+      media.height = 800;
+      Page page(a, env, "https://app.example/", media, true);
+      struct rusage r0, r1;
+      getrusage(RUSAGE_SELF, &r0);
+      const bool loaded = page.load(html.c_str()); (void)loaded;
+      getrusage(RUSAGE_SELF, &r1);
+      printf("heap after load %llu KiB (peak %llu)\nload returned %d\nrss start %ld KiB, after load %ld KiB\n", (unsigned long long)(a.bytes >> 10), (unsigned long long)(a.peak >> 10), loaded ? 1 : 0, r0.ru_maxrss, r1.ru_maxrss);
+      settle_page(page, env, 20000);
+      if (getenv("PROBE_RENDER")) {
+        struct rusage before;
+        getrusage(RUSAGE_SELF, &before);
+        printf("before render: peak rss %ld KiB\n", before.ru_maxrss);
+        font::FontSet fonts(a);
+        fonts.add_bundled_fonts();
+        PagePicture picture(a);
+        const bool ok = page.render_picture(&picture, fonts);
+        struct rusage ru;
+        getrusage(RUSAGE_SELF, &ru);
+        printf("render_picture %d, peak rss %ld KiB, heap now %llu KiB peak %llu KiB\n", ok ? 1 : 0, ru.ru_maxrss, (unsigned long long)(a.bytes >> 10), (unsigned long long)(a.peak >> 10));
+      }
+      printf("%.*s\nerrors: %u\n", static_cast<int>(page.log().size()), page.log().data(), page.errors());
+      printf("fetched %zu, console %zu\n", env.fetched.size(), env.console_lines.size());
+      for (const std::string& f : env.fetched) printf("fetched: %.120s\n", f.c_str());
+      for (const std::string& l : env.console_lines) printf("console: %.300s\n", l.c_str());
+      for (const std::string& r : env.net.sent) printf("sent: %.*s\n", static_cast<int>(r.find('\n')), r.c_str());
+      fflush(stdout);
+      _Exit(0);
+    }
+  }
   if (const char* probe = getenv("PROBE")) {   // runs script files (comma separated: one document after the other) and prints what they logged (for looking at what an API has)
     std::vector<Visit> list;
     std::string names = probe;

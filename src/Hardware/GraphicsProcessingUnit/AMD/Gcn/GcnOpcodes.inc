@@ -11,6 +11,7 @@ enum class Sop1 : uint16_t {
   s_andn2_saveexec_b64 = 0x23,
   s_orn2_saveexec_b64 = 0x24,
   s_nand_saveexec_b64 = 0x25,
+  s_wqm_b64 = 0x7,
 };
 enum class Sop2 : uint16_t {
   s_add_u32 = 0x0,
@@ -156,6 +157,7 @@ enum class Vopc : uint16_t {
   v_cmp_neq_f32 = 0x4D,
   v_cmp_nlt_f32 = 0x4E,
   v_cmp_tru_f32 = 0x4F,
+  v_cmp_class_f32 = 0x10,
   v_cmp_f_i32 = 0xC0,
   v_cmp_f_u32 = 0xC8,
   v_cmp_lt_i32 = 0xC1,

@@ -11823,6 +11823,22 @@ const char kFinishPrelude[] = R"JSPRELUDE((function (g) {
         enumerable: false, configurable: true });
     });
   });
+  // Event handler properties are accessors on the prototype of their interface (scripts read their descriptors to wrap the setters); setting one makes it an own value,
+  // which is where the dispatch looks for it.
+  var handlerAccessors = function (C, names) {
+    if (typeof C !== 'function' || !C.prototype) return;
+    var proto = C.prototype;
+    names.forEach(function (n) {
+      if (Object.prototype.hasOwnProperty.call(proto, n) && typeof Object.getOwnPropertyDescriptor(proto, n).set === 'function') return;
+      Object.defineProperty(proto, n, {
+        get: function () { return this === proto ? undefined : null; },
+        set: function (v) { if (this === proto) throw new TypeError('Illegal invocation'); Object.defineProperty(this, n, { value: v, writable: true, enumerable: true, configurable: true }); },
+        enumerable: true, configurable: true });
+    });
+  };
+  handlerAccessors(g.HTMLElement, Object.getOwnPropertyNames(Element.prototype).filter(function (n) { return /^on[a-z]+$/.test(n); }));
+  handlerAccessors(g.XMLHttpRequestEventTarget, ['onloadstart', 'onprogress', 'onabort', 'onerror', 'onload', 'ontimeout', 'onloadend']);
+  handlerAccessors(g.XMLHttpRequest, ['onreadystatechange']);
   ['HTMLStyleElement', 'HTMLLinkElement'].forEach(function (name) {   // `disabled` of a style or link element is the flag of its style sheet
     if (!g[name] || !g.__sheet_of) return;
     Object.defineProperty(g[name].prototype, 'disabled', { get: function () { var sh = g.__sheet_of(this); return sh ? sh.disabled : false; },
