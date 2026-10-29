@@ -315,6 +315,8 @@ Frame* on_syscall(Frame* frame, void*) {
 
 // An exception in user mode ends that program only.
 Frame* on_user_fault(Frame* frame) {
+  // CR2 is read first, with interrupts still off: once they are on, a thread switch can bring another fault to this core, which changes CR2.
+  const uint64_t page_fault_address = (frame->vector & 0xFF) == 14 ? read_cr2() : 0;
   Task* task = current_task();
   if (!task) panic("fault in user mode on a thread that is not a user program", frame);
   if ((kill_pending(task) || task->program.process()->exited()) && (frame->vector & 0xFF) == 14 && frame->rip == 0) {      // the end on_user_tick() arranged: not a fault of the program's
@@ -343,7 +345,7 @@ Frame* on_user_fault(Frame* frame) {
   int guard = 0;
   process::ExceptionInfo guard_info;
   if ((frame->vector & 0xFF) == 14 && task->program.process()->abi() == process::SyscallAbi::Windows) {
-    const uint64_t guard_address = read_cr2();
+    const uint64_t guard_address = page_fault_address;
     uint32_t low = 0, high = 0;
     __asm__ volatile("rdmsr" : "=a"(low), "=d"(high) : "c"(0xC0000102u));      // (the program's GS base, the TEB, is parked in KERNEL_GS_BASE while we run)
     irq_enable();
@@ -358,7 +360,7 @@ Frame* on_user_fault(Frame* frame) {
   // A page the program may use but the CPU does not have in the tables it runs with (another thread, or a parent changing this program's memory, rebuilt them since): the
   // tables are rebuilt and the instruction runs again. A fault at the same place a few times in a row is real.
   if ((frame->vector & 0xFF) == 14 && !(frame->error & 1) && task->program.process()->abi() == process::SyscallAbi::Windows) {
-    const uint64_t stale_address = read_cr2();
+    const uint64_t stale_address = page_fault_address;
     process::AddressSpace* space = task->program.process()->address_space();
     UserThread* self = current_user_thread();
     if (space && self && stale_address < 0x0000800000000000ull) {
@@ -377,7 +379,7 @@ Frame* on_user_fault(Frame* frame) {
   }
   // A write to a copy-on-write page (PAGE_WRITECOPY) is not a fault: the page gets its own copy and the instruction runs again.
   if ((frame->vector & 0xFF) == 14 && (frame->error & 3) == 3 && task->program.process()->abi() == process::SyscallAbi::Windows) {
-    const uint64_t cow_address = read_cr2();
+    const uint64_t cow_address = page_fault_address;
     irq_enable();
     task->mutex.lock();
     process::AddressSpace* space = task->program.process()->address_space();
@@ -393,7 +395,7 @@ Frame* on_user_fault(Frame* frame) {
     frame_to_context(*frame, &at);
     process::ExceptionInfo info;
     const uint64_t vector = frame->vector & 0xFF;
-    const uint64_t address = vector == 14 ? read_cr2() : 0;
+    const uint64_t address = vector == 14 ? page_fault_address : 0;
     bool delivered = false;
     if (guard ? (info = guard_info, true) : process::fault_to_exception(vector, frame->error, address, &at, &info)) {
       irq_enable();      // (the frame is saved) the program's lock may have to be waited for: writing on its stack looks at its address space
@@ -410,7 +412,7 @@ Frame* on_user_fault(Frame* frame) {
   task->faulted = true;
   task->fault_vector = frame->vector & 0xFF;
   task->fault_rip = frame->rip;
-  task->fault_address = (frame->vector & 0xFF) == 14 ? read_cr2() : 0;
+  task->fault_address = page_fault_address;
   console::puts("user program stopped: vector ");
   console::put_hex(task->fault_vector);
   console::puts(" error ");
@@ -1008,7 +1010,8 @@ uint32_t remote_operation(uint64_t pid, process::IProcessRuntime::RemoteOp& op) 
     ScopedMutex hold(task->mutex);
     const uint32_t status = process::windowsabi::run_remote(*task->program.process(), op);
     // The layout may have changed: the page tables are rebuilt and given to the threads of that program (on whatever cores they run), as at the end of one of its own system calls.
-    const bool layout = op.kind == process::IProcessRuntime::RemoteOp::Allocate || op.kind == process::IProcessRuntime::RemoteOp::Free || op.kind == process::IProcessRuntime::RemoteOp::Protect;
+    using Op = process::IProcessRuntime::RemoteOp;
+    const bool layout = op.kind == Op::Allocate || op.kind == Op::Free || op.kind == Op::Protect || op.kind == Op::MapView || op.kind == Op::Unmap;      // (a view that came or went changes the layout too)
     if (layout && status == 0 && !task->sync_tables()) return 0xC0000017u;
     return status;
   }

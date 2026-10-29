@@ -25,6 +25,8 @@ namespace {
 struct AcrRow {
   uint32_t clock, n32, cts32, n44, cts44, n48, cts48;
 };
+// (amdgpu_afmt.c v6.12 has {74176, 4096, 74176, 5733, 75335, 6144, 74176} and {148352, 4096, 148352, 5733, 150670, 6144, 148352} for the two 1.001 rows, which are off from the HDMI
+// formula by 0.1 %; the values here are the specification's, as in radeon's table.)
 const AcrRow kPredefined[] = {
     {25175, 4096, 25175, 28224, 125875, 6144, 25175},     // 25.20 / 1.001 MHz
     {25200, 4096, 25200, 6272, 28000, 6144, 25200},       // 25.20 MHz

@@ -25,6 +25,7 @@ if(NOT CMAKE_TOOLCHAIN_FILE)
 endif()
 
 project(TheoryCraftOS LANGUAGES C CXX ASM)
+set(TCOS_SMP 4 CACHE STRING "Cores of the QEMU machine of the run targets")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -700,6 +701,12 @@ add_executable(BOOTX64
   src/Hardware/GraphicsProcessingUnit/AMD/Dpcd.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/DpLinkTrain.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdDpSource.cpp
+  src/Hardware/GraphicsProcessingUnit/AMD/AmdModeSet.cpp
+  src/Hardware/GraphicsProcessingUnit/AMD/AmdMonitor.cpp
+  src/Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnIsa.cpp
+  src/Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnEmu.cpp
+  src/Hardware/GraphicsProcessingUnit/AMD/Gcn/TgsiParse.cpp
+  src/Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnCompiler.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdAsicReset.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdIrq.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdSdma3.cpp
@@ -1097,7 +1104,7 @@ if(QEMU AND OVMF_CODE AND OVMF_VARS)
   endif()
   message(STATUS "QEMU audio backend: ${QEMU_AUDIO_DRIVER}")
   set(QEMU_COMMON
-    ${QEMU} -machine q35 -smp 4 -m 8G -netdev user,id=net0 -device virtio-net-pci,netdev=net0
+    ${QEMU} -machine q35 -smp ${TCOS_SMP} -m 8G -netdev user,id=net0 -device virtio-net-pci,netdev=net0
     -rtc base=localtime  # the taskbar clock shows local time
     # An absolute pointer for the desktop (no click-to-grab; relative PS/2 grabbing is unreliable under Wayland).
     -device virtio-tablet-pci

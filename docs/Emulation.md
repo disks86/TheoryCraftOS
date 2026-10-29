@@ -40,7 +40,7 @@ An interpreter, one instruction per decode, flags computed eagerly.
   CVTPS2PD / CVTPD2PS, CVTSI2SS/SD, CVT(T)SS/SD2SI, CVTDQ2PS/PD, CVT(T)PS/PD2DQ, UNPCK*, SHUFPS/PD, MOVMSKPS/PD, LDMXCSR/STMXCSR. The arithmetic is
   `emulation::softfloat` (`SoftFloat.cpp`): IEEE 754 binary32/64 done in integer operations (the kernel cannot assume an FPU and the host's float would not be
   bit-exact), with x86 semantics: the default NaN, first-NaN propagation, all four MXCSR rounding modes, and the MXCSR exception flags (exceptions are always masked, so
-  none traps). Not modelled: denormals-are-zero / flush-to-zero, RCPPS/RSQRTPS (the hardware approximations), AVX.
+  none traps). MXCSR.DAZ and FTZ are modelled (see below). Not modelled: RCPPS/RSQRTPS (the hardware approximations).
 - **Faults** are reported as x86 vectors (0, 3, 6, 13, 14 with the address), restartable (`rip` stays at the instruction).
 - **Not implemented** (each is an invalid-opcode fault, never a wrong result): packed-decimal x87 (`fbld`/`fbstp`), AVX-512, FXSAVE/XSAVE, RCL/RCR, segment registers, the system instructions.
 
@@ -135,6 +135,13 @@ programs built with `-march=haswell` (or x86-64-v3) run. `X86_64Vex.cpp` holds a
   single/double (and `vcvtph2ps`/`vcvtps2ph`), gathers and scatters, and `vucomis*`. XCR0 is 0xE7 and `xsave`/`xrstor` handle the opmask, ZMM_Hi256 and Hi16_ZMM components (standard
   format, 2688 bytes). `vrcp14*`/`vrsqrt14*` return a correctly rounded value truncated to 14 bits: the architecture only promises a relative error below 2^-14, and the real tables differ
   between Intel and AMD, so they are not compared with the host.
+- **MXCSR.DAZ / FTZ** (`Env::daz` / `Env::ftz` in `SoftFloat`, set from MXCSR bits 6 and 15 by every x86 float handler): with DAZ a denormal operand is a zero of its sign and raises no denormal flag (also for
+  `min`/`max`, `sqrt`, rounding, comparisons, conversions and the single-to-half conversion); with FTZ a tiny result (detected before rounding, even when exact) becomes a zero of its sign and raises underflow
+  and inexact. A sum with a zero and an FMA with a zero product hand the other operand back, so those paths flush it too. The AVX-512 special functions follow the hardware: `vscalef` flushes only the final
+  result, `vreduce` flushes the final difference with the inexact flag but no underflow, `vrndscale` and `vreduce` scale in unflushed intermediate steps, `vfixupimm` classifies the DAZ'd operand but leaves its integer
+  table alone, and the bfloat16 `vdpbf16ps` accumulates each pair with one fused multiply-add. Half precision has neither. `AvxTest` and `Avx512Test` run half their cases with DAZ and FTZ set on denormal-rich data
+  against the host (`NO_DAZFTZ=1` turns that off, `AVX_SEED=<n>` varies the data), and `AvxTest` has hand-written checks. One known difference: tininess is detected before rounding (Intel), an AMD host detects
+  it after rounding, so a result that rounds up to the smallest normal number can differ in the underflow flag.
 - **AVX512_4FMAPS** (Xeon Phi; cpuid.7.0:EDX bit 3; `kFma4` in `X86_64EvexFp.cpp`): `v4fmaddps/v4fnmaddps zmm1{k}, zmm2+3, m128` and the scalar `v4fmaddss/v4fnmaddss`. Per lane the accumulator
   starts at the destination and takes four fused multiply-adds, `acc = fma(group[j][lane], mem[j], acc)` (product negated for the fnmadd forms), where the group is the four registers from
   `vvvv & ~3`. The operand must be memory (no register form, no broadcast, packed form 512-bit only: #UD). Rounding comes from MXCSR (no embedded rounding); the flags of all the

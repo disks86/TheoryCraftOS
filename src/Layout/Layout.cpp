@@ -273,6 +273,11 @@ BlockOutcome LayoutContext::layout_block(BoxId id, LayoutUnit cb_width, const Wi
   child_cb_height_known_ = saved_cb_known;
   child_cb_height_ = saved_cb_height;
   if (!replaced) {
+    if (height_auto && s.aspect_ratio_x1000 > 0 && !request.has_forced_height) {   // (a box with a preferred ratio and no height takes it from the width, at least as tall as its content)
+      const LayoutUnit box_width = s.sizing == BoxSizing::BorderBox ? content_width + bp_h : content_width;
+      const LayoutUnit from_ratio = box_width.scaled(1000, static_cast<int32_t>(s.aspect_ratio_x1000 > 2000000000u ? 2000000000u : s.aspect_ratio_x1000));
+      content_height = max(content_height, s.sizing == BoxSizing::BorderBox ? max(from_ratio - bp_v, LayoutUnit()) : from_ratio);
+    }
     if (!height_auto) {
       const LayoutUnit given = s.sizing == BoxSizing::BorderBox ? max(specified_height - bp_v, LayoutUnit()) : specified_height;
       // (the height of a table or a table cell is the least it has: they grow with their rows and content)

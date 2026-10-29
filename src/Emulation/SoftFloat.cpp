@@ -66,6 +66,12 @@ uint64_t shift_right_jam(uint64_t x, uint32_t n) {
   return x != 0 ? 1 : 0;
 }
 
+// With MXCSR.DAZ a denormal operand is a zero of its sign, also for the operations that hand an operand back (min, max, round, sqrt of a zero).
+uint64_t flush_denormal(const Fmt& f, uint64_t bits, const Env& env) {
+  if (env.daz && ((bits >> f.man_bits) & f.exp_max()) == 0) return bits & f.sign_bit();
+  return bits;
+}
+
 Unpacked unpack(const Fmt& f, uint64_t bits, Env& env) {
   Unpacked u;
   u.sign = (bits & f.sign_bit()) != 0;
@@ -76,7 +82,7 @@ Unpacked unpack(const Fmt& f, uint64_t bits, Env& env) {
     return u;
   }
   if (be == 0) {
-    if (man == 0) return u;
+    if (man == 0 || env.daz) return u;
     env.flags |= kDenormal;
     const uint32_t p = 63 - count_leading_zeros(man);      // highest set bit
     u.cls = kFinite;
@@ -97,6 +103,10 @@ uint64_t round_pack(const Fmt& f, bool sign, int32_t exp, uint64_t sig, Env& env
   bool tiny = false;
   if (be <= 0) {
     tiny = true;
+    if (env.ftz) {
+      env.flags |= kUnderflow | kInexact;
+      return sign ? f.sign_bit() : 0;
+    }
     if (be == 0 && env.tininess_after) {      // a value that rounds up to the smallest normal number (with an unbounded exponent range) is not tiny
       const uint64_t rem0 = sig & ((uint64_t{1} << round_bits) - 1), half0 = uint64_t{1} << (round_bits - 1), kept0 = sig >> round_bits;
       bool up = false;
@@ -170,8 +180,16 @@ uint64_t add_sub(const Fmt& f, uint64_t a, uint64_t b, bool subtract, Env& env) 
     return ua.cls == kInf ? f.inf(ua.sign) : f.inf(sb);
   }
   if (ua.cls == kZero && ub.cls == kZero) return f.zero(ua.sign == sb ? ua.sign : env.mode == Rounding::Down);
-  if (ua.cls == kZero) return (b & ~f.sign_bit()) | (sb ? f.sign_bit() : 0);
-  if (ub.cls == kZero) return a;
+  // (a sum with a zero is the other operand as it is; with MXCSR.FTZ a denormal one is tiny and flushed)
+  auto exact = [&](uint64_t bits) {
+    if (env.ftz && ((bits >> f.man_bits) & f.exp_max()) == 0) {
+      env.flags |= kUnderflow | kInexact;
+      return bits & f.sign_bit();
+    }
+    return bits;
+  };
+  if (ua.cls == kZero) return exact((b & ~f.sign_bit()) | (sb ? f.sign_bit() : 0));
+  if (ub.cls == kZero) return exact(a);
   Unpacked x = ua, y = ub;
   y.sign = sb;
   if (y.exp > x.exp) { const Unpacked t = x; x = y; y = t; }
@@ -256,6 +274,7 @@ uint64_t div(Format fm, uint64_t a, uint64_t b, Env& env) {
 
 uint64_t sqrt(Format fm, uint64_t a, Env& env) {
   const Fmt& f = fmt_of(fm);
+  a = flush_denormal(f, a, env);
   const Unpacked ua = unpack(f, a, env);
   if (is_nan(ua.cls)) return propagate_nan(f, a, ua.cls, a, ua.cls, env);
   if (ua.cls == kZero) return a;
@@ -423,6 +442,7 @@ uint64_t from_integer(Format fm, uint64_t magnitude, bool negative, uint32_t fbi
 
 uint64_t round_to_integral(Format fm, uint64_t a, Rounding mode, bool exact, Env& env) {
   const Fmt& f = fmt_of(fm);
+  a = flush_denormal(f, a, env);
   const Unpacked u = unpack(f, a, env);
   if (u.cls == kSignalingNan) {
     env.flags |= kInvalid;
@@ -458,8 +478,18 @@ Order compare(Format fm, uint64_t a, uint64_t b, bool signaling, Env& env) {
   return (a_smaller != sa) ? Order::Less : Order::Greater;
 }
 
-uint64_t minimum(Format fm, uint64_t a, uint64_t b, Env& env) { return compare(fm, a, b, true, env) == Order::Less ? a : b; }
-uint64_t maximum(Format fm, uint64_t a, uint64_t b, Env& env) { return compare(fm, a, b, true, env) == Order::Greater ? a : b; }
+uint64_t minimum(Format fm, uint64_t a, uint64_t b, Env& env) {
+  const Fmt& f = fmt_of(fm);
+  a = flush_denormal(f, a, env);
+  b = flush_denormal(f, b, env);
+  return compare(fm, a, b, true, env) == Order::Less ? a : b;
+}
+uint64_t maximum(Format fm, uint64_t a, uint64_t b, Env& env) {
+  const Fmt& f = fmt_of(fm);
+  a = flush_denormal(f, a, env);
+  b = flush_denormal(f, b, env);
+  return compare(fm, a, b, true, env) == Order::Greater ? a : b;
+}
 
 }  // namespace softfloat
 }  // namespace emulation
@@ -514,6 +544,10 @@ uint64_t fused_multiply_add(Format fm, uint64_t a, uint64_t b, uint64_t c, Env& 
   const bool product_zero = ua.cls == kZero || ub.cls == kZero;
   if (product_zero) {
     if (uc.cls == kZero) return f.zero(sp == uc.sign ? sp : env.mode == Rounding::Down);
+    if (env.ftz && ((c >> f.man_bits) & f.exp_max()) == 0) {      // (an exact denormal sum is tiny too)
+      env.flags |= kUnderflow | kInexact;
+      return c & f.sign_bit();
+    }
     return c;
   }
   unsigned __int128 x;
@@ -578,6 +612,8 @@ uint64_t arm_minmax(Format fm, uint64_t a, uint64_t b, bool is_max, bool number,
   if (o == Order::Equal) return a;
   return (is_max ? o == Order::Greater : o == Order::Less) ? a : b;
 }
+
+uint64_t flush_denormal(Format fm, uint64_t bits, const Env& env) { return flush_denormal(fmt_of(fm), bits, env); }
 
 }  // namespace softfloat
 }  // namespace emulation

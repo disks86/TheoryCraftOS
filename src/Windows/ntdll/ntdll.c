@@ -328,13 +328,86 @@ EXPORT ULONG NTAPI RtlNtStatusToDosError(NTSTATUS status) {
   }
 }
 
+#define STATUS_REVISION_MISMATCH ((NTSTATUS)0xC0000059)
+/* The operating system calls itself Windows 10 (10.0, build 19045), a workstation without a service pack. */
 EXPORT NTSTATUS NTAPI RtlGetVersion(RTL_OSVERSIONINFOW *info) {
-  if (!info) return STATUS_INVALID_PARAMETER;
+  if (!info || (info->dwOSVersionInfoSize != sizeof(RTL_OSVERSIONINFOW) && info->dwOSVersionInfoSize != sizeof(RTL_OSVERSIONINFOEXW))) return STATUS_INVALID_PARAMETER;
   info->dwMajorVersion = 10;
   info->dwMinorVersion = 0;
   info->dwBuildNumber = 19045;
   info->dwPlatformId = 2;
   info->szCSDVersion[0] = 0;
+  if (info->dwOSVersionInfoSize == sizeof(RTL_OSVERSIONINFOEXW)) {
+    RTL_OSVERSIONINFOEXW *ex = (RTL_OSVERSIONINFOEXW *)info;
+    ex->wServicePackMajor = ex->wServicePackMinor = 0;
+    ex->wSuiteMask = 0x0100;      /* VER_SUITE_SINGLEUSERTS */
+    ex->wProductType = 1;         /* VER_NT_WORKSTATION */
+    ex->wReserved = 0;
+  }
+  return STATUS_SUCCESS;
+}
+EXPORT VOID NTAPI RtlGetNtVersionNumbers(ULONG *major, ULONG *minor, ULONG *build) {
+  if (major) *major = 10;
+  if (minor) *minor = 0;
+  if (build) *build = 19045 | 0xF0000000u;      /* (the top bits say it is a free build) */
+}
+EXPORT ULONGLONG NTAPI VerSetConditionMask(ULONGLONG mask, ULONG type, UCHAR condition) {
+  if (type == 0) return mask;
+  static const ULONG kTypes[] = {1, 2, 4, 8, 0x10, 0x20, 0x40, 0x80};      /* minor, major, build, platform, SP minor, SP major, suite, product type */
+  for (int bit = 0; bit < 8; bit++) {
+    if (!(type & kTypes[bit])) continue;
+    mask &= ~((ULONGLONG)7 << (bit * 3));
+    mask |= (ULONGLONG)(condition & 7) << (bit * 3);
+  }
+  return mask;
+}
+static BOOLEAN version_compare(ULONG have, ULONG want, UCHAR condition) {
+  switch (condition) {
+    case 1: return have == want;      /* VER_EQUAL */
+    case 2: return have > want;       /* VER_GREATER */
+    case 3: return have >= want;      /* VER_GREATER_EQUAL */
+    case 4: return have < want;       /* VER_LESS */
+    case 5: return have <= want;      /* VER_LESS_EQUAL */
+    default: return FALSE;
+  }
+}
+/* Does this system meet the version asked for? The conditions are three bits per field in `mask`. Major, minor and the service pack numbers are one chain: a later field is
+   looked at only if the earlier one was equal (and its condition allows equality). STATUS_REVISION_MISMATCH if not. */
+EXPORT NTSTATUS NTAPI RtlVerifyVersionInfo(const RTL_OSVERSIONINFOEXW *info, ULONG types, ULONGLONG mask) {
+  RTL_OSVERSIONINFOEXW now;
+  now.dwOSVersionInfoSize = sizeof(now);
+  if (!info || !types) return STATUS_INVALID_PARAMETER;
+  if (!(types & 0xFF)) return STATUS_INVALID_PARAMETER;
+  RtlGetVersion((RTL_OSVERSIONINFOW *)&now);
+  const BOOLEAN extended = TRUE;      /* (the size in the structure is not looked at: the caller is trusted to have room for the fields it asks about) */
+  #define COND(bit) ((UCHAR)((mask >> ((bit) * 3)) & 7))
+  if (types & 0x80) { if (!extended || !version_compare(now.wProductType, info->wProductType, COND(7))) return STATUS_REVISION_MISMATCH; }
+  if (types & 0x40) {      /* VER_SUITENAME: VER_AND needs every bit, VER_OR any */
+    const UCHAR c = COND(6);
+    if (!extended) return STATUS_REVISION_MISMATCH;
+    if (c == 6 /* VER_AND */) { if ((info->wSuiteMask & now.wSuiteMask) != info->wSuiteMask) return STATUS_REVISION_MISMATCH; }
+    else if (c == 7 /* VER_OR */) { if (info->wSuiteMask && !(info->wSuiteMask & now.wSuiteMask)) return STATUS_REVISION_MISMATCH; }      /* (asking for none is met) */
+    else return STATUS_INVALID_PARAMETER;
+  }
+  if ((types & 8) && !version_compare(now.dwPlatformId, info->dwPlatformId, COND(3))) return STATUS_REVISION_MISMATCH;
+  if ((types & 4) && !version_compare(now.dwBuildNumber, info->dwBuildNumber, COND(2))) return STATUS_REVISION_MISMATCH;
+  if (types & 0x33) {
+    /* Major, minor, service pack major and minor are one chain. The first field whose values differ decides. While they are equal the next field is looked at; a condition
+       of EQUAL gives way to the next field's own condition, any other condition carries on to the fields after it. */
+    struct { ULONG bit_type; int bit; ULONG have, want; } chain[4] = {
+      {2, 1, now.dwMajorVersion, info->dwMajorVersion}, {1, 0, now.dwMinorVersion, info->dwMinorVersion},
+      {0x20, 5, now.wServicePackMajor, extended ? info->wServicePackMajor : 0}, {0x10, 4, now.wServicePackMinor, extended ? info->wServicePackMinor : 0}};
+    UCHAR c = 0;
+    BOOLEAN have_condition = FALSE, result = TRUE;
+    for (int i = 0; i < 4; i++) {
+      if (!(types & chain[i].bit_type)) continue;
+      if (!have_condition || c == 1) { c = COND(chain[i].bit); have_condition = TRUE; }
+      result = version_compare(chain[i].have, chain[i].want, c);
+      if (chain[i].have != chain[i].want) break;
+    }
+    if (!result) return STATUS_REVISION_MISMATCH;
+  }
+  #undef COND
   return STATUS_SUCCESS;
 }
 
@@ -691,11 +764,16 @@ static Heap *heap_new(ULONG flags, SIZE_T commit) {
   return h;
 }
 
-static int heap_ok(Heap *h) { return h && h->magic == HEAP_MAGIC; }
-
-/* Every heap of the process, in the order they were made (the process heap first): RtlGetProcessHeaps and the Toolhelp heap lists. */
 #define MAX_HEAPS 128
 static Heap *g_heaps[MAX_HEAPS];
+/* A heap handle is good if it is one of the heaps made (a destroyed heap's memory is gone: its header is not looked at). */
+static int heap_ok(Heap *h) {
+  if (!h) return 0;
+  for (int i = 0; i < MAX_HEAPS; ++i) if (g_heaps[i] == h) return h->magic == HEAP_MAGIC;
+  return 0;
+}
+
+/* Every heap of the process, in the order they were made (the process heap first): RtlGetProcessHeaps and the Toolhelp heap lists. */
 static volatile LONG g_heaps_lock;
 static void heaps_lock(void) { while (__sync_lock_test_and_set(&g_heaps_lock, 1)) NtYieldExecution(); }
 static void heaps_unlock(void) { __sync_lock_release(&g_heaps_lock); }

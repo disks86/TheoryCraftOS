@@ -20,52 +20,49 @@
 #pragma once
 
 #include <stdint.h>
+#include "Hardware/GraphicsProcessingUnit/AMD/AmdModeSet.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AtomBios.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/DpLinkTrain.hpp"
 
 namespace hardware {
 
-// The source side of DisplayPort link training of a DIG encoder and its UNIPHY transmitter, through the video BIOS: the encoder control table (DIG1EncoderControl or DIG2EncoderControl)
-// with the actions DP_LINK_TRAINING_START, _PATTERN1, _PATTERN2, _PATTERN3 and _COMPLETE, and the transmitter control table (UNIPHYTransmitterControl) with SETUP_VSEMPH. Port of
-// amdgpu_atombios_encoder_setup_dig_encoder and _setup_dig_transmitter (atombios_encoders.c; Copyright Advanced Micro Devices, Inc.; MIT license) for the table revisions they handle that a
-// DCE 11 card has: the encoder control V3 and V4 (frev 1, crev 3 and 4: 8 bytes of parameters), the transmitter control V4 and V1.5 (crev 4 and 5). Any other revision is refused.
-//
-// The layouts are checked against atombios.h by scripts/check_dplink_port.py; the values the driver puts in them are from memory (atombios_encoders.c was not at hand).
+// The source side of DisplayPort link training of a DIG encoder and its UNIPHY transmitter, through the video BIOS: the DIGx encoder control table with the actions
+// DP_LINK_TRAINING_START, _PATTERN1, _PATTERN2, _PATTERN3 and _COMPLETE, and the transmitter control table (UNIPHYTransmitterControl) with SETUP_VSEMPH. The tables' parameters are
+// built by AmdModeSet (amdgpu_atombios_encoder_setup_dig_encoder / _setup_dig_transmitter).
 struct DpSourceConfig {
   uint8_t dig_encoder = 0;              // 0..6: the DIG (AtomConnectors::dig_encoder); the UNIPHY and its link follow from it on DCE 11
   bool link_b = false;                  // the transmitter's link B (AtomConnectors::link_b)
   uint32_t lanes = 4;                   // 1, 2 or 4
   uint32_t rate_khz = 270000;           // per lane: 162000, 270000, 540000 (or 324000)
-  uint32_t pixel_clock_khz = 0;         // of the mode (the table wants it)
-  uint8_t connector_object_id = 0;      // CONNECTOR_OBJECT_ID_*, for the transmitter V1.5
+  uint32_t pixel_clock_khz = 0;         // of the mode (the encoder table wants it)
+  uint8_t connector_object_id = 0;      // CONNECTOR_OBJECT_ID_*, for the transmitter V1.5 and V1.6
   uint8_t hpd = 0xFF;                   // the hot plug pin 0..5 or 0xFF (the tables want 1..6, or 0 for none)
-  uint8_t bits_per_color = 2;           // the table's ucBitPerColor: 1 6 bit, 2 8 bit, 3 10 bit, 4 12 bit
-  uint8_t reference_clock_source = 0;   // the transmitter's PLL: V4 bits 5:4 (PPLL1 0, PPLL2 1, DCPLL 2), V1.5 bits 3:2 (P1PLL 0, P2PLL 1, P0PLL 2)
+  uint32_t bits_per_color = 8;          // 6, 8, 10, 12 or 16
+  uint8_t pll = AmdModeSet::kPllInvalid;       // the CRTC's PLL (ATOM_PPLL*): the transmitter V1.5 takes it as the PHY's clock source; V4 uses the display clock PLL for DisplayPort
 };
 
 class AmdDpSource final : public IDpSource {
  public:
-  static constexpr uint32_t kEncoder1Table = 74, kEncoder2Table = 75, kTransmitterTable = 76;       // GetIndexIntoMasterTable(COMMAND, DIG1EncoderControl / DIG2EncoderControl / UNIPHYTransmitterControl)
-  // ATOM_ENCODER_CMD_DP_LINK_TRAINING_*
-  static constexpr uint8_t kCmdStart = 0x08, kCmdPattern1 = 0x09, kCmdPattern2 = 0x0A, kCmdPattern3 = 0x13, kCmdComplete = 0x0B;
-  static constexpr uint8_t kActionSetupVsEmph = 11;       // ATOM_TRANSMITTER_ACTION_SETUP_VSEMPH
-  static constexpr uint8_t kEncoderModeDp = 0, kDigModeDp = 0;
+  static constexpr uint8_t kEncoderModeDp = 0;
 
-  AmdDpSource(IAtomHost& host, AtomBios& bios, const DpSourceConfig& config) : host_(host), bios_(bios), config_(config) {}
+  AmdDpSource(IAtomHost& host, AtomBios& bios, const DpSourceConfig& config);
 
   bool start_training() override { return encoder(kCmdStart); }
   bool set_pattern(uint8_t pattern) override;
   bool complete_training() override { return encoder(kCmdComplete); }
-  bool set_drive(uint8_t lane_set) override { return transmitter(lane_set); }
+  bool set_drive(uint8_t lane_set) override { return set_.transmitter(out_, mode_, AmdModeSet::kTransmitterSetupVsEmph, 0, lane_set); }
   void delay_us(uint32_t microseconds) override { host_.delay_us(microseconds); }
 
+  // ATOM_ENCODER_CMD_DP_LINK_TRAINING_*
+  static constexpr uint8_t kCmdStart = 0x08, kCmdPattern1 = 0x09, kCmdPattern2 = 0x0A, kCmdPattern3 = 0x13, kCmdComplete = 0x0B;
+
  private:
-  bool encoder(uint8_t action);
-  bool transmitter(uint8_t lane_set);
+  bool encoder(uint8_t action) { return set_.encoder(out_, mode_, action); }
 
   IAtomHost& host_;
-  AtomBios& bios_;
-  DpSourceConfig config_;
+  AmdModeSet set_;
+  ModeSetOutput out_;
+  CrtcMode mode_;
 };
 
 }  // namespace hardware

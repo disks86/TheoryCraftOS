@@ -696,6 +696,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
 #ifdef TCOS_AMD_VEGAM
   UniquePointer<hardware::AmdVegaM> vega_m;   // the Radeon RX Vega M's memory controller, engines and display (opt-in, below)
   UniquePointer<hardware::PciMsi> vega_msi;   // its MSI, when the machine delivers it
+  uint8_t vega_lit_crtc[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};   // the CRTC light_up() put each hot plug pin's output on (0xFF: none)
   bool vega_msi_working = false;              // the interrupt arrived in the self-test: the desktop loop looks at the ring only when one comes
 #endif
 #ifdef TCOS_AMD_UVD
@@ -1128,6 +1129,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         inputs.aperture_bytes = aperture_bytes;
         inputs.doorbells = doorbells;
         inputs.max_framebuffer_bytes = largest;
+        inputs.output_framebuffer_bytes = 16ull << 20;     // room for the picture of one external output that light_up() lights (1920x1200 at most)
         // The full reset of the card as the last resort when an engine will not come back from its soft reset. This OS cannot POST a card afterwards (no AtomBIOS interpreter), so the
         // card would stay down and whatever it shows would go dark: only allowed when the card does not drive the display.
         inputs.pci = &pci;
@@ -1198,6 +1200,14 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
                 FixedString<64> monitor;
                 if (describe_vega_monitor(*vega_m, *connector, shared_allocator, &monitor)) Entry(Level::Info, "Vega M").text("  ").text(connector_name).text(": ").text(monitor.c_str());
                 else Entry(Level::Info, "Vega M").text("  ").text(connector_name);
+                // lit with the mode the monitor prefers and a test picture (the desktop is not drawn on it)
+                hardware::AmdVegaM::LightUp lit;
+                if (vega_m->light_up(*connector, 0xFF, &lit)) {
+                  vega_lit_crtc[pin] = lit.crtc;
+                  Entry(Level::Ok, "Vega M").text("  ").text(connector_name).text(" lit: ").dec(lit.width).text("x").dec(lit.height);
+                } else {
+                  Entry(Level::Warning, "Vega M").text("  ").text(connector_name).text(" not lit (step ").dec(static_cast<uint32_t>(lit.failed)).text(", mode set stage ").dec(static_cast<uint32_t>(lit.set.failed)).text(")");
+                }
               } else {
                 Entry(Level::Info, "Vega M").text("  output ").dec(pin + 1);
               }
@@ -1404,8 +1414,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
           vega_idle = 0;
           vega_m->service_interrupts();
         }
-        // A display plugged into or pulled out of one of the card's outputs: say so, on the debug console and as a toast. (The card's outputs are not part of the desktop: it cannot show
-        // anything on them, so this is all there is to do about it.)
+        // A display plugged into or pulled out of one of the card's outputs: say so, on the debug console and as a toast, and light it up / switch it off. (The card's outputs are not part
+        // of the desktop layout: the lit output shows the test picture.)
         hardware::AmdVegaM::HotplugEvent plug;
         while (vega_m->take_hotplug(&plug)) {
           // "HDMI-A-1" where the video BIOS says what the pin is, else "output 2"
@@ -1436,6 +1446,28 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
             if (plug.connected) text.append("was connected to ");
             text.append(where.c_str());
             text.append(" of the Radeon RX Vega M");
+          }
+          // A display plugged in: lit up with the mode it prefers and a test picture (the desktop is not drawn on it); one pulled out: switched off.
+          if (plug.has_connector && !plug.throttled && plug.pin < 6) {
+            if (plug.connected && vega_lit_crtc[plug.pin] == 0xFF) {
+              hardware::AmdVegaM::LightUp lit;
+              if (vega_m->light_up(plug.connector, 0xFF, &lit)) {
+                vega_lit_crtc[plug.pin] = lit.crtc;
+                text.append(": lit ");
+                text.append_uint(lit.width);
+                text.append("x");
+                text.append_uint(lit.height);
+              } else {
+                text.append(": not lit (step ");
+                text.append_uint(static_cast<uint32_t>(lit.failed));
+                text.append(", mode set stage ");
+                text.append_uint(static_cast<uint32_t>(lit.set.failed));
+                text.append(")");
+              }
+            } else if (!plug.connected && vega_lit_crtc[plug.pin] != 0xFF) {
+              vega_m->disable_mode(plug.connector, vega_lit_crtc[plug.pin]);
+              vega_lit_crtc[plug.pin] = 0xFF;
+            }
           }
           console::debug_puts("Vega M: ");
           console::debug_puts(StringView(text.c_str()));

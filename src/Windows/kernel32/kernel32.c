@@ -67,6 +67,7 @@ static BOOL console_read_hook(HANDLE h, LPVOID buffer, DWORD length, LPDWORD rea
 static BOOL con_input_ready(void);
 static BOOL con_is_input(HANDLE h);
 static BOOL pipe_nt_name(LPCWSTR name, WCHAR *buffer, UNICODE_STRING *us, OBJECT_ATTRIBUTES *attributes, BOOL inherit);
+static BOOL mailslot_nt_name(LPCWSTR name, WCHAR *buffer, UNICODE_STRING *us, OBJECT_ATTRIBUTES *attributes, BOOL inherit);
 EXPORT HANDLE WINAPI CreateFileW(LPCWSTR path, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD disposition, DWORD flags, HANDLE template_file);
 static BOOL is_dos_device_name(const WCHAR *name);
 EXPORT BOOL WINAPI CloseHandle(HANDLE h);
@@ -410,7 +411,30 @@ EXPORT DWORD WINAPI GetEnvironmentVariableA(LPCSTR name, LPSTR buffer, DWORD cap
   const WCHAR *value = find_variable(parameters()->Environment, w, &length);
   free_wide(w);
   if (!value) { set_error(ERROR_ENVVAR_NOT_FOUND); return 0; }
+  if (length == 0) {      /* a variable with an empty value: no error, the size with the end mark is 1 */
+    if (capacity == 0) return 1;
+    buffer[0] = 0;
+    return 0;
+  }
   return wide_result_to_ansi(value, (DWORD)length, buffer, capacity);
+}
+/* The whole block of the process is replaced by `block` (NAME=value entries ended by an empty one); an entry needs a name before its first '='. */
+EXPORT BOOL WINAPI SetEnvironmentStringsW(LPWSTR block) {
+  if (!block) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  size_t_ units = 0;
+  for (const WCHAR *e = block; *e; e += wcslen(e) + 1) {
+    const WCHAR *eq = e + 1;      /* (a name may start with '=': "=C:=C:\") */
+    while (*eq && *eq != '=') ++eq;
+    if (!*eq || eq == e) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+    units += wcslen(e) + 1;
+  }
+  WCHAR *fresh = RtlAllocateHeap(heap(), 0, (units + 2) * 2);
+  if (!fresh) { set_error(ERROR_NOT_ENOUGH_MEMORY); return FALSE; }
+  memcpy(fresh, block, units * 2);
+  fresh[units] = 0;
+  fresh[units + 1] = 0;
+  parameters()->Environment = fresh;
+  return TRUE;
 }
 /* Builds a new block with NAME set (or removed when value is NULL) and points the process parameters at it. */
 EXPORT BOOL WINAPI SetEnvironmentVariableW(LPCWSTR name, LPCWSTR value) {
@@ -452,8 +476,11 @@ EXPORT BOOL WINAPI SetEnvironmentVariableA(LPCSTR name, LPCSTR value) {
   free_wide(v);
   return ok;
 }
+/* What fits is copied as the real one does it: a variable's value goes in whole or not at all (after one that does not fit only the end mark is written), plain text goes
+   in up to capacity - 1 characters; the end mark follows only when the whole result fits. The result is the size needed, with the end mark. */
 EXPORT DWORD WINAPI ExpandEnvironmentStringsW(LPCWSTR source, LPWSTR dest, DWORD capacity) {
   DWORD needed = 0;
+  BOOL stopped = FALSE;      /* a variable did not fit: nothing more is written */
   for (const WCHAR *s = source; *s;) {
     const WCHAR *close = NULL;
     if (*s == '%') for (const WCHAR *e = s + 1; *e; ++e) if (*e == '%') { close = e; break; }
@@ -469,26 +496,44 @@ EXPORT DWORD WINAPI ExpandEnvironmentStringsW(LPCWSTR source, LPWSTR dest, DWORD
       }
     }
     if (value) {
-      if (needed + length < capacity && dest) memcpy(dest + needed, value, length * 2);
+      if (dest && !stopped) {
+        if (needed + length < capacity) {
+          memcpy(dest + needed, value, length * 2);
+          dest[needed + length] = 0;      /* (the end mark waits where the next character goes) */
+        } else {
+          if (capacity > 0) dest[needed] = 0;
+          stopped = TRUE;
+        }
+      }
       needed += (DWORD)length;
       s = close + 1;
     } else {
-      if (needed + 1 < capacity && dest) dest[needed] = *s;
+      if (dest && !stopped && needed + 1 < capacity) dest[needed] = *s;
       ++needed;
       ++s;
     }
   }
-  if (dest && needed < capacity) dest[needed] = 0;
+  if (dest && !stopped && needed < capacity) dest[needed] = 0;
   return needed + 1;
 }
+/* The ANSI function converts what the wide one produced, and needs a byte more than that: when the buffer is not bigger than the size needed nothing of the result is copied,
+   the buffer is made an empty string and the size needed plus one is returned. */
 EXPORT DWORD WINAPI ExpandEnvironmentStringsA(LPCSTR source, LPSTR dest, DWORD capacity) {
   WCHAR *w = to_wide(source);
   if (!w) return 0;
-  WCHAR wide[1024];
-  const DWORD n = ExpandEnvironmentStringsW(w, wide, 1024);
+  const DWORD needed = ExpandEnvironmentStringsW(w, NULL, 0);
+  if (capacity <= needed) {
+    free_wide(w);
+    if (dest) dest[0] = 0;
+    return needed + 1;
+  }
+  WCHAR *wide = RtlAllocateHeap(heap(), 0, (size_t_)needed * 2 + 2);
+  if (!wide) { free_wide(w); return 0; }
+  ExpandEnvironmentStringsW(w, wide, needed);
   free_wide(w);
-  if (n > 1024) return 0;
-  return wide_result_to_ansi(wide, n - 1, dest, capacity) + 1;
+  for (DWORD i = 0; i < needed; i++) dest[i] = (char)wide[i];      /* (ASCII: a character is a byte) */
+  RtlFreeHeap(heap(), 0, wide);
+  return needed;
 }
 
 EXPORT void WINAPI GetStartupInfoW(LPSTARTUPINFOW info) {
@@ -509,12 +554,28 @@ EXPORT void WINAPI GetStartupInfoA(LPSTARTUPINFOA info) {
 }
 
 EXPORT DWORD WINAPI GetVersion(void) { return (19045u << 16) | (0u << 8) | 10u; }
+NTSTATUS NTAPI RtlGetVersion(RTL_OSVERSIONINFOW *info);
+/* GetVersionEx: the size says which structure; any other size is ERROR_INSUFFICIENT_BUFFER. The extended fields come from ntdll. */
 EXPORT BOOL WINAPI GetVersionExW(LPOSVERSIONINFOW v) {
-  v->dwMajorVersion = 10; v->dwMinorVersion = 0; v->dwBuildNumber = 19045; v->dwPlatformId = 2; v->szCSDVersion[0] = 0;
+  if (!v || (v->dwOSVersionInfoSize != sizeof(OSVERSIONINFOW) && v->dwOSVersionInfoSize != sizeof(OSVERSIONINFOEXW))) { set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+  RTL_OSVERSIONINFOEXW info;
+  memset(&info, 0, sizeof(info));
+  info.dwOSVersionInfoSize = v->dwOSVersionInfoSize;
+  if (!NT_SUCCESS(RtlGetVersion((RTL_OSVERSIONINFOW *)&info))) { set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+  memcpy(v, &info, v->dwOSVersionInfoSize == sizeof(OSVERSIONINFOEXW) ? sizeof(OSVERSIONINFOEXW) : sizeof(OSVERSIONINFOW));
   return TRUE;
 }
 EXPORT BOOL WINAPI GetVersionExA(LPOSVERSIONINFOA v) {
-  v->dwMajorVersion = 10; v->dwMinorVersion = 0; v->dwBuildNumber = 19045; v->dwPlatformId = 2; v->szCSDVersion[0] = 0;
+  if (!v || (v->dwOSVersionInfoSize != sizeof(OSVERSIONINFOA) && v->dwOSVersionInfoSize != sizeof(OSVERSIONINFOEXA))) { set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+  RTL_OSVERSIONINFOEXW info;
+  memset(&info, 0, sizeof(info));
+  info.dwOSVersionInfoSize = sizeof(info);
+  RtlGetVersion((RTL_OSVERSIONINFOW *)&info);
+  v->dwMajorVersion = info.dwMajorVersion; v->dwMinorVersion = info.dwMinorVersion; v->dwBuildNumber = info.dwBuildNumber; v->dwPlatformId = info.dwPlatformId; v->szCSDVersion[0] = 0;
+  if (v->dwOSVersionInfoSize == sizeof(OSVERSIONINFOEXA)) {
+    OSVERSIONINFOEXA *ex = (OSVERSIONINFOEXA *)v;
+    ex->wServicePackMajor = info.wServicePackMajor; ex->wServicePackMinor = info.wServicePackMinor; ex->wSuiteMask = info.wSuiteMask; ex->wProductType = info.wProductType; ex->wReserved = 0;
+  }
   return TRUE;
 }
 static ULONGLONG get64(const BYTE *p) { ULONGLONG v; memcpy(&v, p, 8); return v; }
@@ -587,13 +648,13 @@ EXPORT BOOL WINAPI GetPhysicallyInstalledSystemMemory(ULONGLONG *kilobytes) {
 EXPORT BOOL WINAPI IsProcessorFeaturePresent(DWORD feature) { return feature == 6 || feature == 10; }
 EXPORT BOOL WINAPI GetComputerNameW(LPWSTR name, LPDWORD size) {
   static const WCHAR kName[] = {'T', 'C', 'O', 'S', 0};
-  if (*size < 5) { *size = 5; set_error(ERROR_MORE_DATA); return FALSE; }
+  if (*size < 5) { *size = 5; set_error(111 /* ERROR_BUFFER_OVERFLOW */); return FALSE; }
   memcpy(name, kName, sizeof(kName));
   *size = 4;
   return TRUE;
 }
 EXPORT BOOL WINAPI GetComputerNameA(LPSTR name, LPDWORD size) {
-  if (*size < 5) { *size = 5; set_error(ERROR_MORE_DATA); return FALSE; }
+  if (*size < 5) { *size = 5; set_error(111 /* ERROR_BUFFER_OVERFLOW */); return FALSE; }
   memcpy(name, "TCOS", 5);
   *size = 4;
   return TRUE;
@@ -1284,14 +1345,49 @@ EXPORT BOOL WINAPI WriteFileEx(HANDLE h, LPCVOID buffer, DWORD length, LPOVERLAP
 
 /* ReadDirectoryChangesW: done at once (there is no real asynchronous I/O here either) over NtNotifyChangeDirectoryFile; an overlapped call's event is set and its
  * completion routine, if any, queued as an ordinary APC exactly like ReadFileEx/WriteFileEx above. */
+EXPORT BOOL WINAPI DuplicateHandle(HANDLE sp, HANDLE source, HANDLE tp, HANDLE *target, DWORD access, BOOL inherit, DWORD options);
+EXPORT HANDLE WINAPI CreateThread(LPSECURITY_ATTRIBUTES sa, SIZE_T stack, LPTHREAD_START_ROUTINE start, LPVOID parameter, DWORD flags, LPDWORD id);
+typedef struct { HANDLE directory, caller; LPVOID buffer; DWORD length; BOOLEAN subtree; DWORD filter; LPOVERLAPPED overlapped; LPOVERLAPPED_COMPLETION_ROUTINE_ routine; } DirectoryRequest;
+/* An overlapped request waits for a change in a thread of its own (the kernel's calls are synchronous); when one comes the buffer, the overlapped structure and the event are
+   completed, and a completion routine runs as an APC of the thread that asked. */
+static DWORD WINAPI directory_request_thread(LPVOID parameter) {
+  DirectoryRequest request = *(DirectoryRequest *)parameter;
+  RtlFreeHeap(heap(), 0, parameter);
+  IO_STATUS_BLOCK iosb;
+  iosb.Information = 0;
+  NTSTATUS status;
+  do {      /* (waits a tenth of a second at a time: when the handle is closed the call fails and the thread ends) */
+    iosb.Information = 0;
+    status = NtNotifyChangeDirectoryFile(request.directory, (HANDLE)1, NULL, NULL, &iosb, request.buffer, request.length, request.filter, request.subtree);
+  } while (status == (NTSTATUS)0x102);
+  complete_overlapped(request.overlapped, status, iosb.Information);
+  if (request.routine) NtQueueApcThread(request.caller, (PVOID)completion_apc, (ULONG_PTR)request.routine, (ULONG_PTR)request.overlapped, 0);
+  else NtClose(request.caller);
+  return 0;
+}
 EXPORT BOOL WINAPI ReadDirectoryChangesW(HANDLE h, LPVOID buffer, DWORD length, BOOL watch_subtree, DWORD filter, LPDWORD bytes_returned, LPOVERLAPPED overlapped,
                                          LPOVERLAPPED_COMPLETION_ROUTINE_ routine) {
   IO_STATUS_BLOCK iosb;
+  if (filter == 0 || (filter & ~0x1FFu) || (!overlapped && (!buffer || length == 0))) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (overlapped) {
+    { const NTSTATUS registered = NtNotifyChangeDirectoryFile(h, (HANDLE)2, NULL, NULL, &iosb, NULL, 0, filter, (BOOLEAN)watch_subtree); if (!NT_SUCCESS(registered)) return fail_nt(registered); }      /* (this only makes the watch, so that changes from now on are kept) */
+    DirectoryRequest *request = RtlAllocateHeap(heap(), 0, sizeof(*request));
+    if (!request) { set_error(ERROR_NOT_ENOUGH_MEMORY); return FALSE; }
+    HANDLE caller = NULL;
+    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &caller, 0, FALSE, 2 /* DUPLICATE_SAME_ACCESS */)) { RtlFreeHeap(heap(), 0, request); return FALSE; }
+    request->directory = h; request->caller = caller; request->buffer = buffer; request->length = length; request->subtree = (BOOLEAN)watch_subtree;
+    request->filter = filter; request->overlapped = overlapped; request->routine = routine;
+    overlapped->Internal = (ULONG_PTR)STATUS_PENDING;
+    if (overlapped->hEvent) NtResetEvent((HANDLE)((ULONG_PTR)overlapped->hEvent & ~(ULONG_PTR)1), NULL);
+    HANDLE thread = CreateThread(NULL, 0, directory_request_thread, request, 0, NULL);
+    if (!thread) { NtClose(caller); RtlFreeHeap(heap(), 0, request); return FALSE; }
+    (void)thread;      /* the handle is not closed here: see the thread */
+    if (bytes_returned) *bytes_returned = 0;
+    return TRUE;
+  }
   const NTSTATUS status = NtNotifyChangeDirectoryFile(h, NULL, NULL, NULL, &iosb, buffer, length, filter, (BOOLEAN)watch_subtree);
-  complete_overlapped(overlapped, status, iosb.Information);
   if (!NT_SUCCESS(status)) { if (bytes_returned) *bytes_returned = 0; return fail_nt(status); }
   if (bytes_returned) *bytes_returned = (DWORD)iosb.Information;
-  if (overlapped && routine) NtQueueApcThread(NtCurrentThread(), (PVOID)completion_apc, (ULONG_PTR)routine, (ULONG_PTR)overlapped, 0);
   return TRUE;
 }
 
@@ -1914,6 +2010,7 @@ EXPORT UINT WINAPI WinExec(LPCSTR command_line, UINT show) {
 /* ---- handles, time --------------------------------------------------------------------------------------------------------------------------------------- */
 
 EXPORT BOOL WINAPI CloseHandle(HANDLE h) {
+  if ((ULONG_PTR)h == 0x4B4F54) return TRUE;      /* (advapi32's token "handle": there is nothing behind it) */
   const NTSTATUS status = NtClose(h);
   return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
@@ -2311,10 +2408,11 @@ EXPORT HANDLE WINAPI CreateMailslotW(LPCWSTR name, DWORD max_message_size, DWORD
   WCHAR buffer[300];
   UNICODE_STRING us;
   OBJECT_ATTRIBUTES attributes;
-  if (!name || !mailslot_nt_name(name, buffer, &us, &attributes, sa && sa->bInheritHandle)) return INVALID_HANDLE_VALUE;
+  if (!name) { set_error(ERROR_PATH_NOT_FOUND); return INVALID_HANDLE_VALUE; }
+  if (!mailslot_nt_name(name, buffer, &us, &attributes, sa && sa->bInheritHandle)) return INVALID_HANDLE_VALUE;
   LARGE_INTEGER timeout;
   const BOOL forever = read_timeout_ms == MAILSLOT_WAIT_FOREVER_;
-  timeout.QuadPart = forever ? 0 : -10000ll * (LONGLONG)read_timeout_ms;
+  timeout.QuadPart = forever ? -1 : (read_timeout_ms ? -10000ll * (LONGLONG)read_timeout_ms : 0);
   HANDLE h = NULL;
   IO_STATUS_BLOCK iosb;
   const NTSTATUS status = NtCreateMailslotFile(&h, 0xC0100000u /* GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE */, &attributes, &iosb, 0, 0, max_message_size,
@@ -2324,7 +2422,7 @@ EXPORT HANDLE WINAPI CreateMailslotW(LPCWSTR name, DWORD max_message_size, DWORD
 }
 EXPORT HANDLE WINAPI CreateMailslotA(LPCSTR name, DWORD max_message_size, DWORD read_timeout_ms, LPSECURITY_ATTRIBUTES sa) {
   WCHAR *w = name ? to_wide(name) : NULL;
-  if (!w) { if (name) return INVALID_HANDLE_VALUE; set_error(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE; }
+  if (!w) { if (name) return INVALID_HANDLE_VALUE; set_error(ERROR_PATH_NOT_FOUND); return INVALID_HANDLE_VALUE; }
   HANDLE h = CreateMailslotW(w, max_message_size, read_timeout_ms, sa);
   free_wide(w);
   return h;
@@ -2338,15 +2436,15 @@ EXPORT BOOL WINAPI GetMailslotInfo(HANDLE h, LPDWORD max_message_size, LPDWORD n
   if (next_size) *next_size = get32(info + 8);
   if (message_count) *message_count = get32(info + 12);
   if (read_timeout_ms) {
-    const LONGLONG hundred_ns = *(const LONGLONG *)(info + 16);
-    *read_timeout_ms = hundred_ns == 0 ? MAILSLOT_WAIT_FOREVER_ : (DWORD)(-hundred_ns / 10000);
+    const ULONGLONG hundred_ns = *(const ULONGLONG *)(info + 16);      /* (a count of 100 ns; all ones is forever) */
+    *read_timeout_ms = hundred_ns == ~0ull ? MAILSLOT_WAIT_FOREVER_ : (DWORD)(hundred_ns / 10000);
   }
   return TRUE;
 }
 EXPORT BOOL WINAPI SetMailslotInfo(HANDLE h, DWORD read_timeout_ms) {
   IO_STATUS_BLOCK iosb;
   BYTE info[8];
-  const LONGLONG hundred_ns = read_timeout_ms == MAILSLOT_WAIT_FOREVER_ ? 0 : -10000ll * (LONGLONG)read_timeout_ms;
+  const LONGLONG hundred_ns = read_timeout_ms == MAILSLOT_WAIT_FOREVER_ ? -1 : -10000ll * (LONGLONG)read_timeout_ms;
   memcpy(info, &hundred_ns, 8);
   const NTSTATUS status = NtSetInformationFile(h, &iosb, info, sizeof(info), 27 /* FileMailslotSetInformation */);
   return NT_SUCCESS(status) ? TRUE : fail_nt(status);
@@ -2650,6 +2748,14 @@ EXPORT HANDLE WINAPI CreateFileW(LPCWSTR path, DWORD access, DWORD share, LPSECU
     for (; path[i] && i < 299; ++i) normal[i] = path[i] == '/' ? '\\' : path[i];
     normal[i] = 0;
     if (!pipe_nt_name(normal, buffer, &name, &attributes, FALSE)) return INVALID_HANDLE_VALUE;
+  } else if ((path[0] == '\\' || path[0] == '/') && (path[1] == '\\' || path[1] == '/') && path[2] == '.' && (path[3] == '\\' || path[3] == '/') && (path[4] | 0x20) == 'm' && (path[5] | 0x20) == 'a' &&
+             (path[6] | 0x20) == 'i' && (path[7] | 0x20) == 'l' && (path[8] | 0x20) == 's' && (path[9] | 0x20) == 'l' && (path[10] | 0x20) == 'o' && (path[11] | 0x20) == 't' &&
+             (path[12] == '\\' || path[12] == '/')) {      /* \\.\mailslot\: the writer's end of a mailslot */
+    WCHAR normal[300];
+    size_t_ i = 0;
+    for (; path[i] && i < 299; ++i) normal[i] = path[i] == '/' ? '\\' : path[i];
+    normal[i] = 0;
+    if (!mailslot_nt_name(normal, buffer, &name, &attributes, FALSE)) return INVALID_HANDLE_VALUE;
   } else {
     /* A DOS device name (in any directory) is the device: NUL is the one that exists here, the others are not there. */
     size_t_ last = wcslen(path);
@@ -3067,6 +3173,10 @@ EXPORT UINT WINAPI GetTempFileNameW(LPCWSTR dir, LPCWSTR prefix, UINT unique, LP
   WCHAR full[PATH_CHARS];
   const DWORD n = full_path_w(dir, full, PATH_CHARS - 24);
   if (n == 0) return 0;
+  {      /* the folder has to be there */
+    const DWORD attributes = GetFileAttributesW(full);
+    if (attributes == INVALID_FILE_ATTRIBUTES || !(attributes & FILE_ATTRIBUTE_DIRECTORY)) { set_error(ERROR_DIRECTORY); return 0; }
+  }
   for (UINT attempt = 0; attempt < 0x10000; ++attempt) {
     const UINT id = unique ? unique : (GetTickCount() + ++counter) & 0xFFFF;
     DWORD length = n;
@@ -3077,13 +3187,14 @@ EXPORT UINT WINAPI GetTempFileNameW(LPCWSTR dir, LPCWSTR prefix, UINT unique, LP
     if (unique) { memcpy(result, full, (length + 1) * 2); return unique; }
     HANDLE h = CreateFileW(full, GENERIC_WRITE, 0, NULL, CREATE_NEW, 0, NULL);
     if (h != INVALID_HANDLE_VALUE) { CloseHandle(h); memcpy(result, full, (length + 1) * 2); return id; }
+    if (GetLastError() != ERROR_FILE_EXISTS && GetLastError() != ERROR_ALREADY_EXISTS) return 0;      /* (only a name that is taken is tried again) */
   }
   return 0;
 }
 EXPORT UINT WINAPI GetTempFileNameA(LPCSTR dir, LPCSTR prefix, UINT unique, LPSTR result) {
-  WCHAR *d = to_wide(dir), *p = to_wide(prefix);
+  WCHAR *d = to_wide(dir), *p = prefix ? to_wide(prefix) : NULL;
   WCHAR wide[PATH_CHARS];
-  const UINT id = d && p ? GetTempFileNameW(d, p, unique, wide) : 0;
+  const UINT id = d && (p || !prefix) ? GetTempFileNameW(d, p, unique, wide) : 0;
   free_wide(d);
   free_wide(p);
   if (!id) return 0;

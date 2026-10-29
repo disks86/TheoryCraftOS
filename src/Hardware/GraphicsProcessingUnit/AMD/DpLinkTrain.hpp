@@ -39,9 +39,9 @@ class IDpSource {
   ~IDpSource() = default;
 };
 
-// The lanes and the link rate for a mode (amdgpu_atombios_dp_get_dp_link_config, which radeon_dp_get_dp_link_config it is the same as): the fewest lanes that carry the pixel clock at
-// 2.7 Gbit/s per lane if the sink has more lanes than that (and can do 2.7: the radeon / amdgpu code does not ask), else the lowest rate and fewest lanes of the sink's that do; 4 lanes
-// at 1.62 Gbit/s if nothing does.
+// The lanes and the link rate for a mode (amdgpu_atombios_dp_get_dp_link_config): the lowest rate of 1.62, 2.7 and 5.4 Gbit/s per lane (up to the sink's) and then the fewest lanes
+// (1, 2, 4 up to the sink's) that carry the pixel clock; no lanes (0) if nothing does. (The driver treats a NUTMEG bridge as 2.7 Gbit/s only: not done.) An eDP 1.4 panel's own rate
+// table, which the driver does not use, is used here when it has one.
 struct DpLinkConfig {
   uint32_t lanes = 0;
   uint32_t rate_khz = 0;        // per lane: 162000, 270000 or 540000, or any rate of an eDP 1.4 panel's own table
@@ -60,9 +60,10 @@ struct DpLinkConfig {
 // DisplayPort link training as amdgpu_atombios_dp_link_train does it: power up the sink, downspread, the lane count (with enhanced framing if the sink has it) and the link rate on the
 // sink, the encoder started; clock recovery with training pattern 1 (the drive set to what the sink asks for until every lane has recovered its clock, the voltage unchanged five
 // times in a row or the maximum reached on every lane gives up); channel equalization with pattern 3 if the sink has it else 2 (up to six adjustments); the pattern off on the sink and
-// the encoder told that training is complete. The waits between the steps are the sink's DP_TRAINING_AUX_RD_INTERVAL (100 us and 400 us for 0, else 4 ms per unit).
+// the encoder told that training is complete. The waits between the steps are the sink's DP_TRAINING_AUX_RD_INTERVAL (100 us and 400 us for 0, else 4 ms per unit; 100 us in the clock recovery for a DPCD 1.4 sink).
 //
-// Written from memory of amdgpu_atombios_dp.c (not at hand). One difference: if the clock recovery fails, channel equalization is not tried.
+// Follows amdgpu's atombios_dp.c and drm_dp_helper.c (v6.12); channel equalization is not tried after a failed clock recovery (as there). One difference: the driver ignores a failed
+// DPCD write, here it ends the training with the result that names it. The wait before the pattern is switched off at the end is 400 us.
 class DpLinkTrainer {
  public:
   enum class Result : uint8_t {
@@ -93,8 +94,9 @@ class DpLinkTrainer {
   };
 
   // `caps`: what the sink can do (the lane count and rate are the caller's choice within it, DpLinkConfig::choose). `lanes` 1, 2 or 4.
+  // `alternate_scrambler`: the sink is an eDP panel in the internal DP2 mode (its DP_EDP_CONFIGURATION_SET gets the alternate scrambler seed, DP_PANEL_MODE_INTERNAL_DP2_MODE).
   // `rate_index`: not kNoRateIndex for a rate set by the eDP 1.4 table (`bandwidth_code` is then 0 and written as such, followed by DP_LINK_RATE_SET).
-  static Outcome train(IDpcdAux& aux, IDpSource& source, const Dpcd::Capabilities& caps, uint8_t bandwidth_code, uint32_t lanes, uint8_t rate_index = DpLinkConfig::kNoRateIndex);
+  static Outcome train(IDpcdAux& aux, IDpSource& source, const Dpcd::Capabilities& caps, uint8_t bandwidth_code, uint32_t lanes, uint8_t rate_index = DpLinkConfig::kNoRateIndex, bool alternate_scrambler = false);
 };
 
 }  // namespace hardware

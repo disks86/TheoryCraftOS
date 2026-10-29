@@ -209,6 +209,8 @@ X86_64Cpu::Step X86_64Cpu::vex_simd(GuestMemory& m, uint8_t op, uint32_t, bool w
     if (!decode_modrm() || !finish_decode()) return bad_decode();
     Env env;
     env.mode = static_cast<Rounding>((s_.mxcsr >> 13) & 3);
+    env.daz = (s_.mxcsr & 0x40) != 0;
+    env.ftz = (s_.mxcsr & 0x8000) != 0;
     Xmm in[2];
     const bool widening = (op == 0x5A && pp2 == 0) || (op == 0xE6 && pp2 == 2);      // 128-bit source, up to 256-bit result
     if (!read_y(m, widening ? 16 : (wide ? 32 : 16), in)) return Step::Fault;
@@ -674,6 +676,8 @@ X86_64Cpu::Step X86_64Cpu::vex_map3(GuestMemory& m, uint8_t op, bool wide_w, uin
   Xmm b[2], out[2];
   Env env;
   env.mode = static_cast<Rounding>((s_.mxcsr >> 13) & 3);
+  env.daz = (s_.mxcsr & 0x40) != 0;
+  env.ftz = (s_.mxcsr & 0x8000) != 0;
   auto finish_dest = [&]() {
     s_.xmm[reg] = out[0];
     s_.ymm_high[reg] = wide ? out[1] : Xmm();
@@ -716,6 +720,8 @@ X86_64Cpu::Step X86_64Cpu::vex_map3(GuestMemory& m, uint8_t op, bool wide_w, uin
       Rounding mode = (imm & 4) ? env.mode : static_cast<Rounding>(imm & 3);
       Env e2;
       e2.mode = env.mode;
+      e2.daz = env.daz;
+      e2.ftz = env.ftz;
       auto round_one = [&](uint64_t v) { return round_to_integral(f, v, mode, !(imm & 8), e2); };
       if (scalar) {
         Xmm r = a[0];
@@ -771,7 +777,11 @@ X86_64Cpu::Step X86_64Cpu::vex_map3(GuestMemory& m, uint8_t op, bool wide_w, uin
       Xmm half_values;
       uint32_t conv_flags = 0;
       const Xmm src[2] = {s_.xmm[reg], s_.ymm_high[reg]};
-      for (uint32_t i = 0; i < n; ++i) put_el(&half_values, 16, i, single_to_half(static_cast<uint32_t>(el(src[i / 4], 32, i % 4)), mode, &conv_flags));
+      for (uint32_t i = 0; i < n; ++i) {
+        uint32_t bits = static_cast<uint32_t>(el(src[i / 4], 32, i % 4));
+        if (env.daz && (bits & 0x7F800000u) == 0) bits &= 0x80000000u;      // (MXCSR.DAZ: a denormal single is a zero)
+        put_el(&half_values, 16, i, single_to_half(bits, mode, &conv_flags));
+      }
       s_.mxcsr |= conv_flags;
       if (d_.mod == 3) {
         s_.xmm[d_.rm & 15] = half_values;
@@ -822,6 +832,8 @@ X86_64Cpu::Step X86_64Cpu::vex_map3(GuestMemory& m, uint8_t op, bool wide_w, uin
       const uint32_t w = is_double ? 64 : 32, n = 128 / w;
       Env e2;
       e2.mode = env.mode;
+      e2.daz = env.daz;
+      e2.ftz = env.ftz;
       for (uint32_t h = 0; h < halves; ++h) {
         uint64_t term[4] = {0, 0, 0, 0};
         for (uint32_t i = 0; i < n; ++i) {
@@ -965,6 +977,8 @@ X86_64Cpu::Step X86_64Cpu::vex_fma(GuestMemory& m, uint8_t op, bool wide_w, uint
   Xmm out[2] = {da[0], da[1]};
   Env env;
   env.mode = static_cast<Rounding>((s_.mxcsr >> 13) & 3);
+  env.daz = (s_.mxcsr & 0x40) != 0;
+  env.ftz = (s_.mxcsr & 0x8000) != 0;
   const bool negate_product = low == 0xC || low == 0xD || low == 0xE || low == 0xF;
   const bool negate_addend = low == 0xA || low == 0xB || low == 0xE || low == 0xF;
   for (uint32_t h = 0; h < (wide ? 2u : 1u); ++h)

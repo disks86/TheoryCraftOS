@@ -118,7 +118,7 @@ bool decode_data_url(allocators::IAllocator& allocator, StringView url, ByteBuff
 class PageObjects final : public IObjectSource, public IObjectPainter {
  public:
   static constexpr uint32_t kMaxImages = 64, kMaxVideos = 8;
-  static constexpr uint64_t kMaxImageBytes = 24u << 20, kMaxVideoBytes = 96u << 20, kMaxImagePixels = 16u << 20, kMaxCanvasPixels = 96u << 20;
+  static constexpr uint64_t kMaxImageBytes = 24u << 20, kMaxVideoBytes = 96u << 20, kMaxImagePixels = 16u << 20, kMaxTotalImagePixels = 24u << 20, kMaxCanvasPixels = 96u << 20;
 
   explicit PageObjects(allocators::IAllocator& allocator);
   ~PageObjects();
@@ -374,6 +374,7 @@ class PageObjects final : public IObjectSource, public IObjectPainter {
   bool fetch_blob(StringView url, ByteBuffer* out);   // (a blob: address)
   uint64_t canvas_pixels_ = 0, now_ms_ = 0;
   uint32_t fetched_images_ = 0;
+  uint64_t image_pixels_ = 0;   // the decoded pixels of the pictures kept (frames counted): a page of many photos stays under kMaxTotalImagePixels
   bool dirty_ = false, accelerated_ = false;
 };
 

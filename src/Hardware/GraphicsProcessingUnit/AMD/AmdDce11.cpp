@@ -131,6 +131,352 @@ bool Plane::flip(uint64_t address, uint32_t timeout_us) {
   return taken;
 }
 
+// The registers of the graphics plane that the surface setup writes (dce_11_2_d.h, offset by the CRTC's block), and the VGA control registers (bit 0 is the VGA mode enable).
+namespace {
+constexpr uint32_t kGrphEnable = 0x1a00, kGrphControl = 0x1a01, kGrphLut10BitBypass = 0x1a02, kGrphSwapCntl = 0x1a03, kGrphPrimaryAddress = 0x1a04, kGrphSecondaryAddress = 0x1a05,
+                   kGrphPitch = 0x1a06, kGrphPrimaryAddressHigh = 0x1a07, kGrphSecondaryAddressHigh = 0x1a08, kGrphSurfaceOffsetX = 0x1a09, kGrphSurfaceOffsetY = 0x1a0a,
+                   kGrphXStart = 0x1a0b, kGrphYStart = 0x1a0c, kGrphXEnd = 0x1a0d, kGrphYEnd = 0x1a0e, kGrphFlipControl = 0x1a12, kLbDesktopHeight = 0x1ac3,
+                   kViewportStart = 0x1b5c, kViewportSize = 0x1b5d, kCrtcMasterUpdateMode = 0x1bbe;
+constexpr uint32_t kVgaControl[kMaxCrtcs] = {0xcc, 0xce, 0xf8, 0xf9, 0xfa, 0xfb};
+constexpr uint32_t kFlipHRetraceEnable = 0x1, kLut10BitBypassEnable = 0x100;
+// GRPH_CONTROL fields: depth 1:0, num banks 3:2, bank width 7:6, format 10:8, bank height 12:11, tile split 15:13, macro tile aspect 19:18, array mode 23:20, pipe config 28:24, micro tile mode 30:29
+constexpr uint32_t kShiftNumBanks = 2, kShiftBankWidth = 6, kShiftFormat = 8, kShiftBankHeight = 11, kShiftTileSplit = 13, kShiftMacroTileAspect = 18, kShiftArrayMode = 20, kShiftPipeConfig = 24,
+                   kShiftMicroTileMode = 29;
+// GRPH_SWAP_CNTL crossbars: red 5:4, green 7:6, blue 9:8, alpha 11:10 (2 selects the blue / red input)
+constexpr uint32_t kSwapRedCrossbarBlue = 2u << 4, kSwapBlueCrossbarRed = 2u << 8;
+// the colour pipeline of dce_v11_0_crtc_load_lut
+constexpr uint32_t kInputCscControl = 0x1a35, kPrescaleGrphControl = 0x1a2d, kInputGammaControl = 0x1a10, kDcLutControl = 0x1a80, kDcLutBlackBlue = 0x1a81, kDcLutBlackGreen = 0x1a82,
+                   kDcLutBlackRed = 0x1a83, kDcLutWhiteBlue = 0x1a84, kDcLutWhiteGreen = 0x1a85, kDcLutWhiteRed = 0x1a86, kDcLutRwMode = 0x1a78, kDcLutWriteEnMask = 0x1a7e,
+                   kDcLutRwIndex = 0x1a79, kDcLut30Color = 0x1a7c, kDegammaControl = 0x1a58, kGamutRemapControl = 0x1a59, kRegammaControl = 0x1aa0, kOutputCscControl = 0x1a3c,
+                   kDenormControl = 0x1a50, kAlphaControl = 0x1abc;
+constexpr uint32_t kFmtBitDepthControl = 0x1bf2, kLbDataFormat = 0x1ac0, kInterleaveEnable = 0x8;
+// FMT_BIT_DEPTH_CONTROL: truncate enable bit 0, truncate depth 5:4, spatial dither enable bit 8, spatial dither depth 12:11, frame random bit 13, RGB random bit 14, high pass random bit 15
+constexpr uint32_t kFmtTruncateEnable = 1u << 0, kFmtTruncateDepthShift = 4, kFmtSpatialDitherEnable = 1u << 8, kFmtSpatialDitherDepthShift = 11, kFmtFrameRandom = 1u << 13, kFmtRgbRandom = 1u << 14,
+                   kFmtHighpassRandom = 1u << 15;
+constexpr uint32_t kInputCscGrphModeMask = 0x3, kPrescaleBypass = 0x10, kInputGammaModeMask = 0x1, kDegammaModeMask = 0x3 | 0x300 | 0x3000, kGamutModeMask = 0x3, kRegammaModeMask = 0x7,
+                   kOutputCscModeMask = 0x7, kCursorAlphaBlend = 0x2;
+
+struct FormatBits {
+  uint32_t depth, format, swap;
+  bool bypass_lut;
+};
+bool format_bits(ScanoutFormat f, FormatBits* out) {
+  switch (f) {
+    case ScanoutFormat::Indexed8: *out = {0, 0, 0, false}; return true;
+    case ScanoutFormat::Argb4444: *out = {1, 2, 0, false}; return true;
+    case ScanoutFormat::Argb1555: *out = {1, 0, 0, false}; return true;
+    case ScanoutFormat::Bgra5551: *out = {1, 5, 0, false}; return true;
+    case ScanoutFormat::Rgb565: *out = {1, 1, 0, false}; return true;
+    case ScanoutFormat::Argb8888: *out = {2, 0, 0, false}; return true;
+    case ScanoutFormat::Argb2101010: *out = {2, 1, 0, true}; return true;     // (more than 8 bits per colour bypasses the table to keep the precision)
+    case ScanoutFormat::Bgra1010102: *out = {2, 4, 0, true}; return true;
+    case ScanoutFormat::Abgr8888: *out = {2, 0, kSwapRedCrossbarBlue | kSwapBlueCrossbarRed, false}; return true;
+  }
+  return false;
+}
+}  // namespace
+
+bool Scanout::set(uint32_t crtc, const ScanoutSurface& s) {
+  FormatBits fb;
+  const ScanoutTiling& t = s.tiling;
+  if (crtc >= kMaxCrtcs || (s.address & (kSurfaceAlignment - 1)) != 0 || s.width == 0 || s.height == 0 || s.pitch_pixels < s.width || s.viewport_width == 0 || s.viewport_height == 0 ||
+      !format_bits(s.format, &fb) || (t.mode != ScanoutTiling::Mode::Linear && t.mode != ScanoutTiling::Mode::Tiled1D && t.mode != ScanoutTiling::Mode::Tiled2D) || t.pipe_config > 0x1F ||
+      t.num_banks > 3 || t.bank_width > 3 || t.bank_height > 3 || t.macro_tile_aspect > 3 || t.tile_split > 7)
+    return false;
+  uint32_t control = fb.depth | (fb.format << kShiftFormat);
+  if (t.mode == ScanoutTiling::Mode::Tiled2D) {
+    control |= (uint32_t{t.num_banks} << kShiftNumBanks) | (uint32_t{4} << kShiftArrayMode) | (uint32_t{t.tile_split} << kShiftTileSplit) | (uint32_t{t.bank_width} << kShiftBankWidth) |
+               (uint32_t{t.bank_height} << kShiftBankHeight) | (uint32_t{t.macro_tile_aspect} << kShiftMacroTileAspect) | (0u << kShiftMicroTileMode);       // ADDR_SURF_MICRO_TILING_DISPLAY
+  } else if (t.mode == ScanoutTiling::Mode::Tiled1D) {
+    control |= uint32_t{2} << kShiftArrayMode;
+  }
+  control |= uint32_t{t.pipe_config} << kShiftPipeConfig;
+  const uint32_t off = kCrtcOffsets[crtc];
+  r_.write(kVgaControl[crtc], r_.read(kVgaControl[crtc]) & ~1u);                                  // dce_v11_0_vga_enable(false)
+  // the surface address is taken at vertical blank, not horizontal
+  r_.write(kGrphFlipControl + off, r_.read(kGrphFlipControl + off) & ~kFlipHRetraceEnable);
+  r_.write(kGrphPrimaryAddressHigh + off, static_cast<uint32_t>(s.address >> 32));
+  r_.write(kGrphSecondaryAddressHigh + off, static_cast<uint32_t>(s.address >> 32));
+  r_.write(kGrphPrimaryAddress + off, static_cast<uint32_t>(s.address) & GRPH_PRIMARY_SURFACE_ADDRESS__GRPH_PRIMARY_SURFACE_ADDRESS_MASK);
+  r_.write(kGrphSecondaryAddress + off, static_cast<uint32_t>(s.address) & GRPH_PRIMARY_SURFACE_ADDRESS__GRPH_PRIMARY_SURFACE_ADDRESS_MASK);
+  r_.write(kGrphControl + off, control);
+  r_.write(kGrphSwapCntl + off, fb.swap);                                                        // no endian swap (little endian)
+  const uint32_t bypass = r_.read(kGrphLut10BitBypass + off);
+  r_.write(kGrphLut10BitBypass + off, fb.bypass_lut ? (bypass | kLut10BitBypassEnable) : (bypass & ~kLut10BitBypassEnable));
+  r_.write(kGrphSurfaceOffsetX + off, 0);
+  r_.write(kGrphSurfaceOffsetY + off, 0);
+  r_.write(kGrphXStart + off, 0);
+  r_.write(kGrphYStart + off, 0);
+  r_.write(kGrphXEnd + off, s.width);
+  r_.write(kGrphYEnd + off, s.height);
+  r_.write(kGrphPitch + off, s.pitch_pixels);
+  r_.write(kGrphEnable + off, 1);                                                                // dce_v11_0_grph_enable(true)
+  r_.write(kLbDesktopHeight + off, s.height);
+  r_.write(kViewportStart + off, ((s.x & ~3u) << 16) | (s.y & ~1u));
+  r_.write(kViewportSize + off, (s.viewport_width << 16) | ((s.viewport_height + 1) & ~1u));
+  r_.write(kCrtcMasterUpdateMode + off, 0);                                                      // the flip may happen anywhere in the vertical blank interval
+  return true;
+}
+
+bool Scanout::load_lut(uint32_t crtc, const LutEntry* table) {
+  if (crtc >= kMaxCrtcs) return false;
+  const uint32_t off = kCrtcOffsets[crtc];
+  auto modify = [&](uint32_t reg, uint32_t clear, uint32_t set) { r_.write(reg + off, (r_.read(reg + off) & ~clear) | set); };
+  modify(kInputCscControl, kInputCscGrphModeMask, 0);
+  modify(kPrescaleGrphControl, kPrescaleBypass, kPrescaleBypass);
+  modify(kInputGammaControl, kInputGammaModeMask, 0);
+  r_.write(kDcLutControl + off, 0);
+  r_.write(kDcLutBlackBlue + off, 0);
+  r_.write(kDcLutBlackGreen + off, 0);
+  r_.write(kDcLutBlackRed + off, 0);
+  r_.write(kDcLutWhiteBlue + off, 0xffff);
+  r_.write(kDcLutWhiteGreen + off, 0xffff);
+  r_.write(kDcLutWhiteRed + off, 0xffff);
+  r_.write(kDcLutRwMode + off, 0);
+  r_.write(kDcLutWriteEnMask + off, 0x7);
+  r_.write(kDcLutRwIndex + off, 0);
+  for (uint32_t i = 0; i < 256; ++i) {
+    const uint32_t r = table ? table[i].red : i << 8 | i, g = table ? table[i].green : i << 8 | i, b = table ? table[i].blue : i << 8 | i;
+    r_.write(kDcLut30Color + off, ((r & 0xffc0) << 14) | ((g & 0xffc0) << 4) | (b >> 6));
+  }
+  modify(kDegammaControl, kDegammaModeMask, 0);
+  modify(kGamutRemapControl, kGamutModeMask, 0);
+  modify(kRegammaControl, kRegammaModeMask, 0);
+  modify(kOutputCscControl, kOutputCscModeMask, 0);
+  r_.write(kDenormControl + off, 0);
+  modify(kAlphaControl, 0, kCursorAlphaBlend);
+  return true;
+}
+
+bool Scanout::vga_enable(uint32_t crtc, bool enable) {
+  if (crtc >= kMaxCrtcs) return false;
+  const uint32_t control = r_.read(kVgaControl[crtc]) & ~1u;
+  r_.write(kVgaControl[crtc], enable ? control | 1u : control);
+  return true;
+}
+
+bool Scanout::set_interleave(uint32_t crtc, bool interlaced) {
+  if (crtc >= kMaxCrtcs) return false;
+  const uint32_t tmp = r_.read(kLbDataFormat + kCrtcOffsets[crtc]) & ~kInterleaveEnable;
+  r_.write(kLbDataFormat + kCrtcOffsets[crtc], interlaced ? tmp | kInterleaveEnable : tmp);
+  return true;
+}
+
+bool Scanout::program_fmt(uint32_t crtc, uint32_t bpc, bool dither) {
+  if (crtc >= kMaxCrtcs) return false;
+  if (bpc == 0) return true;       // (the driver returns before writing when the monitor's depth is unknown)
+  uint32_t tmp = 0;
+  const uint32_t depth = bpc == 6 ? 0 : bpc == 8 ? 1 : 2;
+  switch (bpc) {
+    case 6:
+    case 8:
+    case 10:
+      if (dither) {
+        tmp |= kFmtFrameRandom | kFmtHighpassRandom | kFmtSpatialDitherEnable | (depth << kFmtSpatialDitherDepthShift);
+        if (bpc != 6) tmp |= kFmtRgbRandom;
+      } else {
+        tmp |= kFmtTruncateEnable | (depth << kFmtTruncateDepthShift);
+      }
+      break;
+    default:
+      break;       // not needed: the register is written zero
+  }
+  r_.write(kFmtBitDepthControl + kCrtcOffsets[crtc], tmp);
+  return true;
+}
+
+
+// ---- Watermarks (dce_v11_0.c: line_buffer_adjust, the bandwidth functions, program_watermarks, bandwidth_update) ----
+
+namespace {
+constexpr uint32_t kLbMemoryCtrl = 0x1ac1, kPipe0DmifBufferControl = 0x321, kMcSharedChmap = 0x801, kDpgWatermarkMaskControl = 0x1b32, kDpgPipeUrgencyControl = 0x1b33;
+constexpr uint32_t kLbMemoryConfigShift = 20, kLbMemoryConfigMask = 0x300000, kDmifBuffersAllocatedMask = 0x7, kDmifBuffersAllocationCompleted = 0x10, kNoOfChanShift = 12, kNoOfChanMask = 0xf000,
+                   kUrgencyWatermarkMaskShift = 8, kUrgencyWatermarkMaskMask = 0x700;
+constexpr uint32_t kAllocationTimeoutUs = 100000;        // AMDGPU_MAX_USEC_TIMEOUT
+
+// drm_fixed.h fixed20_12
+inline uint32_t fx_const(uint32_t a) { return a << 12; }
+inline uint32_t fx_mul(uint32_t a, uint32_t b) { return static_cast<uint32_t>((uint64_t{a} * b + 2048) >> 12); }
+inline uint32_t fx_div(uint32_t a, uint32_t b) {
+  if (b == 0) return 0xFFFFFFFFu;      // (the driver would divide by zero)
+  uint64_t tmp = uint64_t{a} << 13;
+  tmp /= b;
+  tmp += 1;
+  tmp /= 2;
+  return static_cast<uint32_t>(tmp);
+}
+inline uint32_t fx_trunc(uint32_t a) { return a >> 12; }
+inline uint32_t min32(uint32_t a, uint32_t b) { return a < b ? a : b; }
+}  // namespace
+
+uint32_t Watermarks::dram_channels(uint32_t chmap) {
+  switch ((chmap & kNoOfChanMask) >> kNoOfChanShift) {
+    case 1: return 2;
+    case 2: return 4;
+    case 3: return 8;
+    case 4: return 3;
+    case 5: return 6;
+    case 6: return 10;
+    case 7: return 12;
+    case 8: return 16;
+    default: return 1;
+  }
+}
+
+uint32_t Watermarks::dram_bandwidth(const Params& wm) {
+  const uint32_t yclk = fx_div(fx_const(wm.yclk), fx_const(1000));
+  const uint32_t channels = fx_const(wm.dram_channels * 4);
+  const uint32_t efficiency = fx_div(fx_const(7), fx_const(10));       // 0.7
+  return fx_trunc(fx_mul(fx_mul(channels, yclk), efficiency));
+}
+
+// (The driver's dram_bandwidth_for_display, average-vs-available and latency hiding checks only decide whether to log "force priority to high", which changes nothing: not ported.)
+
+static uint32_t data_return_bandwidth(const Watermarks::Params& wm) {
+  const uint32_t sclk = fx_div(fx_const(wm.sclk), fx_const(1000));
+  const uint32_t efficiency = fx_div(fx_const(8), fx_const(10));       // 0.8
+  return fx_trunc(fx_mul(fx_mul(fx_const(32), sclk), efficiency));
+}
+
+static uint32_t dmif_request_bandwidth(const Watermarks::Params& wm) {
+  const uint32_t disp_clk = fx_div(fx_const(wm.disp_clk), fx_const(1000));
+  const uint32_t b = fx_mul(fx_const(32), disp_clk);
+  const uint32_t efficiency = fx_div(fx_const(8), fx_const(10));       // 0.8
+  return fx_trunc(fx_mul(b, efficiency));
+}
+
+uint32_t Watermarks::available_bandwidth(const Params& wm) {
+  return min32(dram_bandwidth(wm), min32(data_return_bandwidth(wm), dmif_request_bandwidth(wm)));
+}
+
+uint32_t Watermarks::average_bandwidth(const Params& wm) {
+  const uint32_t line_time = fx_div(fx_const(wm.active_time + wm.blank_time), fx_const(1000));
+  uint32_t bandwidth = fx_mul(fx_const(wm.src_width), fx_const(wm.bytes_per_pixel));
+  bandwidth = fx_mul(bandwidth, wm.vsc_full);
+  bandwidth = fx_div(bandwidth, line_time);
+  return fx_trunc(bandwidth);
+}
+
+uint32_t Watermarks::latency_watermark(const Params& wm) {
+  const uint32_t mc_latency = 2000;       // ns
+  uint32_t available = available_bandwidth(wm);
+  if (available == 0) available = 1;       // (the driver divides by it)
+  const uint32_t worst_chunk_return_time = (512 * 8 * 1000) / available;
+  const uint32_t cursor_line_pair_return_time = (128 * 4 * 1000) / available;
+  const uint32_t dc_latency = wm.disp_clk ? 40000000 / wm.disp_clk : 0;       // dc pipe latency
+  const uint32_t other_heads_data_return_time = ((wm.num_heads + 1) * worst_chunk_return_time) + (wm.num_heads * cursor_line_pair_return_time);
+  const uint32_t latency = mc_latency + other_heads_data_return_time + dc_latency;
+  const uint32_t dmif_size = 12288;
+  if (wm.num_heads == 0) return 0;
+  const uint32_t two = fx_const(2), one = fx_const(1);
+  uint32_t max_src_lines_per_dst_line;
+  if (wm.vsc_full > two || (wm.vsc_full > one && wm.vtaps >= 3) || wm.vtaps >= 5 || (wm.vsc_full >= two && wm.interlaced)) max_src_lines_per_dst_line = 4;
+  else max_src_lines_per_dst_line = 2;
+  const uint32_t a = fx_div(fx_const(available), fx_const(wm.num_heads));
+  uint32_t tmp = static_cast<uint32_t>(uint64_t{dmif_size} * wm.disp_clk / (mc_latency + 512));
+  tmp = min32(fx_trunc(a), tmp);
+  const uint32_t lb_fill_bw = min32(tmp, wm.disp_clk * wm.bytes_per_pixel / 1000);
+  const uint32_t lines = fx_const(max_src_lines_per_dst_line * wm.src_width * wm.bytes_per_pixel);
+  const uint32_t b = fx_div(fx_const(lb_fill_bw), fx_const(1000));
+  const uint32_t line_fill_time = fx_trunc(fx_div(lines, b));
+  if (line_fill_time < wm.active_time) return latency;
+  return latency + (line_fill_time - wm.active_time);
+}
+
+uint32_t Watermarks::line_buffer_adjust(uint32_t crtc, const WatermarkHead& head, const WatermarkClocks& clocks, bool* complete) {
+  uint32_t mem_cfg, buffer_alloc;
+  const bool on = head.enabled;
+  if (on) {
+    if (head.hdisplay < 1920) {
+      mem_cfg = 1;
+      buffer_alloc = 2;
+    } else if (head.hdisplay < 2560) {
+      mem_cfg = 2;
+      buffer_alloc = 2;
+    } else {       // (4096 and wider is too big for the line buffer: the driver goes on with this too)
+      mem_cfg = 0;
+      buffer_alloc = clocks.apu ? 2 : 4;
+    }
+  } else {
+    mem_cfg = 1;
+    buffer_alloc = 0;
+  }
+  const uint32_t off = kCrtcOffsets[crtc];
+  uint32_t tmp = r_.read(kLbMemoryCtrl + off);
+  r_.write(kLbMemoryCtrl + off, (tmp & ~kLbMemoryConfigMask) | (mem_cfg << kLbMemoryConfigShift));
+  tmp = r_.read(kPipe0DmifBufferControl + crtc);
+  r_.write(kPipe0DmifBufferControl + crtc, (tmp & ~kDmifBuffersAllocatedMask) | buffer_alloc);
+  *complete = false;
+  const uint64_t begin = clock_.now_us();
+  do {
+    if (r_.read(kPipe0DmifBufferControl + crtc) & kDmifBuffersAllocationCompleted) {
+      *complete = true;
+      break;
+    }
+  } while (clock_.now_us() - begin < kAllocationTimeoutUs);
+  if (!on) return 0;       // controller not enabled, so no lb used
+  switch (mem_cfg) {
+    case 1: return 1920 * 2;
+    case 2: return 2560 * 2;
+    default: return 4096 * 2;
+  }
+}
+
+void Watermarks::program(uint32_t crtc, const WatermarkHead& head, const WatermarkClocks& clocks, uint32_t lb_size, uint32_t num_heads) {
+  uint32_t line_time = 0, wm_a = 0, wm_b = 0, lead_lines = 0;
+  if (head.enabled && num_heads && head.clock_khz) {
+    const uint32_t active_time = static_cast<uint32_t>(uint64_t{head.hdisplay} * 1000000 / head.clock_khz);
+    line_time = static_cast<uint32_t>(uint64_t{head.htotal} * 1000000 / head.clock_khz);
+    if (line_time > 65535) line_time = 65535;
+    Params wm;
+    wm.disp_clk = head.clock_khz;
+    wm.src_width = head.hdisplay;
+    wm.active_time = active_time;
+    wm.blank_time = line_time - active_time;       // (the driver computes it the same way)
+    wm.interlaced = head.interlaced;
+    wm.lb_size = lb_size;
+    wm.dram_channels = dram_channels(r_.read(kMcSharedChmap));
+    wm.num_heads = num_heads;
+    wm.yclk = clocks.mclk_high_khz;
+    wm.sclk = clocks.sclk_high_khz;
+    wm_a = min32(latency_watermark(wm), 65535);
+    wm.yclk = clocks.mclk_low_khz;
+    wm.sclk = clocks.sclk_low_khz;
+    wm_b = min32(latency_watermark(wm), 65535);
+    lead_lines = (lb_size + head.hdisplay - 1) / head.hdisplay;
+  }
+  const uint32_t off = kCrtcOffsets[crtc];
+  const uint32_t mask = r_.read(kDpgWatermarkMaskControl + off);
+  const auto select = [&](uint32_t which) { r_.write(kDpgWatermarkMaskControl + off, (mask & ~kUrgencyWatermarkMaskMask) | (which << kUrgencyWatermarkMaskShift)); };
+  const auto set_urgency = [&](uint32_t low) { r_.write(kDpgPipeUrgencyControl + off, (low & 0xFFFF) | (line_time << 16)); };
+  select(1);       // wm A
+  set_urgency(wm_a);
+  select(2);       // wm B
+  set_urgency(wm_b);
+  r_.write(kDpgWatermarkMaskControl + off, mask);      // restore the original selection
+  results_[crtc] = {line_time, wm_a, wm_b, lead_lines};
+}
+
+bool Watermarks::update(const WatermarkHead* heads, const WatermarkClocks& clocks) {
+  uint32_t num_heads = 0;
+  for (uint32_t i = 0; i < kMaxCrtcs; ++i)
+    if (heads[i].enabled) ++num_heads;
+  bool all = true;
+  for (uint32_t i = 0; i < kMaxCrtcs; ++i) {
+    bool complete = false;
+    const uint32_t lb_size = line_buffer_adjust(i, heads[i], clocks, &complete);
+    all = all && complete;
+    program(i, heads[i], clocks, lb_size, num_heads);
+  }
+  return all;
+}
+
+bool Scanout::disable(uint32_t crtc) {
+  if (crtc >= kMaxCrtcs) return false;
+  r_.write(kGrphEnable + kCrtcOffsets[crtc], 0);
+  return true;
+}
+
 bool Plane::set_surface(uint64_t address, uint64_t bytes, uint32_t timeout_us) {
   if (!active_ || (address & (kSurfaceAlignment - 1)) != 0 || !in_aperture(address, bytes)) return false;
   const uint64_t previous = surface();

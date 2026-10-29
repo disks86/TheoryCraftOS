@@ -85,6 +85,110 @@ class Plane {
   uint64_t aperture_low_ = 0, aperture_high_ = 0;
 };
 
+// The pixel formats of dce_v11_0_crtc_do_set_base (DRM names, little endian; the alpha of the X formats is ignored by the display).
+enum class ScanoutFormat : uint8_t { Argb8888, Abgr8888, Rgb565, Argb1555, Argb4444, Bgra5551, Argb2101010, Bgra1010102, Indexed8 };
+
+// The surface layout of a tiled picture (the tiling flags of the buffer): GRPH_ARRAY_MODE and for the 2D mode the bank and tile parameters; the pipe configuration is for both.
+struct ScanoutTiling {
+  enum class Mode : uint8_t { Linear = 0, Tiled1D = 2, Tiled2D = 4 };       // ARRAY_LINEAR_GENERAL, ARRAY_1D_TILED_THIN1, ARRAY_2D_TILED_THIN1
+  Mode mode = Mode::Linear;
+  uint8_t pipe_config = 0;         // 5 bits
+  uint8_t num_banks = 0;           // 2 bits (2D only, as the fields below)
+  uint8_t bank_width = 0;          // 2 bits
+  uint8_t bank_height = 0;         // 2 bits
+  uint8_t macro_tile_aspect = 0;   // 2 bits
+  uint8_t tile_split = 0;          // 3 bits
+};
+
+// A picture for a CRTC's graphics plane to scan out.
+struct ScanoutSurface {
+  uint64_t address = 0;            // the GPU's address of the first pixel (256 byte aligned)
+  uint32_t width = 0, height = 0;  // in pixels
+  uint32_t pitch_pixels = 0;       // pixels from one row to the next (at least width)
+  uint32_t viewport_width = 0;     // the mode's horizontal display
+  uint32_t viewport_height = 0;    // the mode's vertical display
+  uint32_t x = 0, y = 0;           // the top left of the viewport in the picture (x rounded down to a multiple of 4, y to even)
+  ScanoutFormat format = ScanoutFormat::Argb8888;
+  ScanoutTiling tiling;
+};
+
+// One look-up table entry: 16 bit red, green and blue (only the top 10 bits are used).
+struct LutEntry {
+  uint16_t red = 0, green = 0, blue = 0;
+};
+
+// dce_v11_0_crtc_do_set_base for a surface at (0, 0): the graphics plane of a CRTC pointed at a picture, with the VGA mode off, the surface update at vertical blank, the pixel format and
+// tiling in the control register, the look-up table bypassed for 10 bit formats, the window and viewport and the plane enabled; and dce_v11_0_crtc_load_lut. Not done: the bandwidth update
+// (dce_v11_0_bandwidth_update), the cursor.
+class Scanout {
+ public:
+  explicit Scanout(IVcnRegisters& registers) : r_(registers) {}
+  // False if the CRTC does not exist or the surface is misaligned, empty, has a pitch below its width or a tiling field out of range.
+  bool set(uint32_t crtc, const ScanoutSurface& surface);
+  // The graphics plane off (dce_v11_0_grph_enable(false)).
+  bool disable(uint32_t crtc);
+  // dce_v11_0_crtc_load_lut: the colour pipeline set to pass the plane through the table (no input CSC, no prescale, no degamma, gamut remap or regamma, no output CSC, cursor alpha
+  // blending on) and the 256 entries written, 10 bits per colour (entry 0 first). With a null table the identity ramp.
+  bool load_lut(uint32_t crtc, const LutEntry* table256);
+  // dce_v11_0_vga_enable: the CRTC's VGA mode on or off (the driver turns it on around the unblank and off after).
+  bool vga_enable(uint32_t crtc, bool enable);
+  // dce_v11_0_set_interleave: LB_DATA_FORMAT.INTERLEAVE_EN for an interlaced mode.
+  bool set_interleave(uint32_t crtc, bool interlaced);
+  // dce_v11_0_program_fmt: the FMT block's truncation or dither for `bpc` bits per colour (6, 8, 10; other depths are not touched, as in the driver). `dither`: spatial dither with the random
+  // generators instead of truncation. False for a CRTC that does not exist.
+  bool program_fmt(uint32_t crtc, uint32_t bpc, bool dither);
+
+ private:
+  IVcnRegisters& r_;
+};
+
+// One display controller as the watermark calculation sees it (the CRTC's mode, drm's crtc_* values).
+struct WatermarkHead {
+  bool enabled = false;
+  uint32_t hdisplay = 0, htotal = 0, clock_khz = 0;
+  bool interlaced = false;
+};
+
+// The engine and memory clocks the watermarks are computed for, in kHz: at the highest and the lowest power state (the same while there is no dynamic power management: the current ones).
+struct WatermarkClocks {
+  uint32_t sclk_high_khz = 0, sclk_low_khz = 0, mclk_high_khz = 0, mclk_low_khz = 0;
+  bool apu = false;
+};
+
+// dce_v11_0_bandwidth_update: the line buffer split between the display controllers (dce_v11_0_line_buffer_adjust: memory configuration by display width, DMIF buffers, waiting for the
+// allocation) and the urgency watermarks of each (dce_v11_0_program_watermarks, with the driver's 20.12 fixed point arithmetic): wm A for the high clocks, wm B for the low, the high
+// watermark the line time. Pictures are taken as 4 bytes per pixel, unscaled (vertical scale ratio 1, one vertical tap), as the driver does without a scaler.
+class Watermarks {
+ public:
+  Watermarks(IVcnRegisters& registers, const IClock& clock) : r_(registers), clock_(clock) {}
+  // `heads`: kMaxCrtcs entries. Returns false only if a DMIF allocation never completed (the watermarks are programmed all the same).
+  bool update(const WatermarkHead* heads, const WatermarkClocks& clocks);
+  // The values for the last update, as the driver saves them for power management.
+  struct Result {
+    uint32_t line_time = 0, wm_high = 0, wm_low = 0, lb_vblank_lead_lines = 0;
+  };
+  const Result& result(uint32_t crtc) const { return results_[crtc]; }
+  // The number of DRAM channels from MC_SHARED_CHMAP.NOOFCHAN (cik_get_number_of_dram_channels)
+  static uint32_t dram_channels(uint32_t chmap);
+  // The pieces of the calculation, in the driver's units (MB/s, ns); exposed for testing.
+  struct Params {
+    uint32_t dram_channels = 1, yclk = 0, sclk = 0, disp_clk = 0, src_width = 0, active_time = 0, blank_time = 0, vsc_full = 1u << 12, num_heads = 1, bytes_per_pixel = 4, lb_size = 0, vtaps = 1;
+    bool interlaced = false;
+  };
+  static uint32_t latency_watermark(const Params& wm);
+  static uint32_t available_bandwidth(const Params& wm);
+  static uint32_t average_bandwidth(const Params& wm);
+  static uint32_t dram_bandwidth(const Params& wm);
+
+ private:
+  uint32_t line_buffer_adjust(uint32_t crtc, const WatermarkHead& head, const WatermarkClocks& clocks, bool* complete);
+  void program(uint32_t crtc, const WatermarkHead& head, const WatermarkClocks& clocks, uint32_t lb_size, uint32_t num_heads);
+
+  IVcnRegisters& r_;
+  const IClock& clock_;
+  Result results_[kMaxCrtcs];
+};
+
 // The firmware's framebuffer as the UEFI graphics output describes the current mode.
 struct FirmwareFramebuffer {
   uint64_t physical = 0;     // the CPU's address of its first byte (the OS runs identity mapped)

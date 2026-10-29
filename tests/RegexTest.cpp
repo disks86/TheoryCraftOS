@@ -61,6 +61,7 @@ static_assert("(?<=a)b"_re.contains("ab") && !"(?<=a)b"_re.contains("cb") && "(?
 static_assert(compile<"(?<=foo|ba)x">().contains("bax") && compile<"(?<=\\d{2})x">().contains("12x") && !compile<"(?<=\\d{2})x">().contains("1x"));
 static_assert(compile<"\\p{Lu}\\p{Ll}+", Flags::Utf8 | Flags::Unicode>().matches("Hello") && !compile<"\\p{Lu}", Flags::Utf8 | Flags::Unicode>().contains("hello"));
 static_assert(compile<"[\\P{L}]", Flags::Utf8 | Flags::Unicode>().matches("1") && !compile<"[\\P{L}]", Flags::Utf8 | Flags::Unicode>().matches("a"));
+static_assert(compile<"[^\\p{White_Space}\\p{Pattern_Syntax}]+", Flags::Utf8 | Flags::Unicode>().matches("abc") && !compile<"[^\\p{White_Space}\\p{Pattern_Syntax}]+", Flags::Utf8 | Flags::Unicode>().matches("a-c"));
 static_assert(try_compile<"\\p{Nope}", Flags::Utf8 | Flags::Unicode>().error() == Error::BadProperty);
 static_assert(compile<"(?<year>\\d+)-(?<month>\\d+)">().group_index("month") == 2);
 static_assert(compile<"(a)(b)(c)">().group_count() == 4);

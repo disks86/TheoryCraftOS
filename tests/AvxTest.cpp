@@ -74,6 +74,26 @@ static void gpr_dump(Bytes& b) {
   mem(b, {0x0F, 0xAE}, 3, kMxcsrOut);     // stmxcsr
 }
 
+
+// MXCSR.DAZ / FTZ coverage: half of the cases run with each of those bits set, and the data is often rich in denormals and tiny numbers (NO_DAZFTZ=1 turns this off).
+static bool daz_ftz_enabled() { static const bool on = getenv("NO_DAZFTZ") == nullptr; return on; }
+static void denormalize(uint8_t* p, size_t bytes) {
+  for (size_t i = 0; i + 8 <= bytes; i += 8) {
+    uint64_t v;
+    memcpy(&v, p + i, 8);
+    const uint64_t r = rnd(), sign = rnd();
+    switch (rnd() % 6) {
+      case 0: v = ((sign & 1) << 31) | (r & 0x7FFFFF); v |= (((sign >> 1) & 1) << 63) | ((r >> 32) & 0x7FFFFF) << 32; break;      // two denormal floats
+      case 1: v = ((sign & 1) << 63) | (r & 0xFFFFFFFFFFFFFull); break;                                                            // a denormal double
+      case 2: v = ((sign & 1) << 31) | ((1 + r % 30) << 23) | ((r >> 8) & 0x7FFFFF); v |= (((sign >> 1) & 1) << 63) | ((1 + (r >> 40) % 30) << 23 | ((r >> 16) & 0x7FFFFF)) << 32; break;  // tiny floats
+      case 3: v = ((sign & 1) << 63) | ((1 + r % 40) << 52) | ((r >> 12) & 0xFFFFFFFFFFFFFull); break;                             // tiny doubles
+      case 4: v = ((sign & 1) << 31) | ((124 + r % 6) << 23) | ((r >> 8) & 0x7FFFFF); v |= (((sign >> 1) & 1) << 63) | ((124 + (r >> 40) % 6) << 23 | ((r >> 16) & 0x7FFFFF)) << 32; break;  // floats near 1
+      default: break;
+    }
+    memcpy(p + i, &v, 8);
+  }
+}
+
 static void fill_state(uint8_t* data, const Case& c) {
   memset(data, 0, 0x800);
   for (int r = 0; r < 8; ++r) {
@@ -89,7 +109,12 @@ static void fill_state(uint8_t* data, const Case& c) {
     }
   }
   for (int i = 0; i < 3; ++i) { uint64_t v = rnd(); if (rnd() & 1) v &= 0xFF; if ((rnd() & 7) == 0) v = (rnd() & 1) ? ~0ull : 0; memcpy(data + kGpr + 8 * i, &v, 8); }
-  const uint32_t mxcsr = 0x1F80 | uint32_t((rnd() & 3) << 13);
+  uint32_t mxcsr = 0x1F80 | uint32_t((rnd() & 3) << 13);
+  if (daz_ftz_enabled()) {
+    mxcsr |= uint32_t((rnd() & 1) << 6) | uint32_t((rnd() & 1) << 15);
+    denormalize(data + kYmm, 8 * 32);
+    if (rnd() & 1) denormalize(data, 0x40);
+  }
   memcpy(data + kMxcsrIn, &mxcsr, 4);
   for (int i = 0; i < 0x200; ++i) data[kTable + i] = uint8_t(rnd());
   if (strstr(c.text, "pcmp") && strstr(c.text, "str")) {
@@ -134,6 +159,38 @@ struct Machine {
   StopReason run() { GuestMemory m(space); return cpu.run(m, 10000); }
 };
 static Bytes with_syscall(Bytes b) { b.push_back(0x0F); b.push_back(0x05); return b; }
+
+// MXCSR.DAZ and FTZ by hand (the comparison with the host needs no AVX here): the expected values and flags are the architecture's own rules.
+static void test_daz_ftz() {
+  auto run_ps = [&](uint8_t op, uint32_t a, uint32_t b, uint32_t mxcsr, uint32_t* out, uint32_t* flags) {
+    Machine m(with_syscall({0x0F, op, 0xC1}));      // op xmm0, xmm1
+    m.cpu.state().xmm[0] = {a, 0};
+    m.cpu.state().xmm[1] = {b, 0};
+    m.cpu.state().mxcsr = mxcsr;
+    CHECK(m.run() == StopReason::Syscall);
+    *out = static_cast<uint32_t>(m.cpu.state().xmm[0].lo);
+    *flags = m.cpu.state().mxcsr & 0x3F;
+  };
+  uint32_t r, f;
+  run_ps(0x58, 0x00000001, 0, 0x1F80, &r, &f);      // addps: a denormal plus zero is the denormal, with the denormal-operand flag
+  CHECK(r == 1 && f == 2);
+  run_ps(0x58, 0x00000001, 0, 0x1FC0, &r, &f);      // DAZ: it is a zero and raises nothing
+  CHECK(r == 0 && f == 0);
+  run_ps(0x58, 0x80000001, 0x80000000, 0x1FC0, &r, &f);      // (the sign of the zero is kept: -0 + -0)
+  CHECK(r == 0x80000000 && f == 0);
+  run_ps(0x59, 0x00800000, 0x3F000000, 0x1F80, &r, &f);      // mulps: the smallest normal times a half is an exact denormal: no flags
+  CHECK(r == 0x00400000 && f == 0);
+  run_ps(0x59, 0x00800000, 0x3F000000, 0x9F80, &r, &f);      // FTZ: it is flushed to zero, with underflow and inexact
+  CHECK(r == 0 && f == 0x30);
+  run_ps(0x59, 0x80800000, 0x3F000000, 0x9F80, &r, &f);
+  CHECK(r == 0x80000000 && f == 0x30);
+  run_ps(0x59, 0x3F800000, 0x3F800000, 0x9FC0, &r, &f);      // normal results are untouched
+  CHECK(r == 0x3F800000 && f == 0);
+  run_ps(0x5F, 0x00000001, 0x80000000, 0x1FC0, &r, &f);      // maxps: with DAZ the denormal is a zero (+0 vs -0 gives the second operand)
+  CHECK(r == 0x80000000);
+  run_ps(0x51, 0x00000001, 0x00000001, 0x1FC0, &r, &f);      // sqrtps of a DAZ'd denormal is zero
+  CHECK(r == 0 && f == 0);
+}
 
 static void test_basics() {
   {      // xgetbv: x87, SSE, AVX and AVX-512 state are enabled
@@ -261,7 +318,9 @@ static void test_robustness() {
 }
 
 int main(int argc, char** argv) {
+  if (getenv("AVX_SEED")) seed = strtoull(getenv("AVX_SEED"), nullptr, 0) | 1;
   test_basics();
+  test_daz_ftz();
   test_robustness();
   const int rounds = argc > 1 ? atoi(argv[1]) : 6;
   int total = 0, failures = 0, reported = 0;
@@ -349,7 +408,7 @@ int main(int argc, char** argv) {
           if (getenv("AVX_VERBOSE")) { for (int r = 1; r <= 3; ++r) { printf("   in ymm%d ", r); for (int b = 31; b >= 0; --b) printf("%02x", host[kYmm + 32 * r + b]); printf("\n"); } printf("   in mem  "); for (int b = 31; b >= 0; --b) printf("%02x", host[b]); printf("\n"); }
           if ((hf & 0x8C5) != (ef & 0x8C5)) printf("   flags host %llx emu %llx\n", (unsigned long long)(hf & 0x8C5), (unsigned long long)(ef & 0x8C5));
           if (memcmp(host + kRegsOut, emu + kRegsOut, 24) != 0) { uint64_t h3[3], e3[3]; memcpy(h3, host + kRegsOut, 24); memcpy(e3, emu + kRegsOut, 24); printf("   gpr host %llx %llx %llx emu %llx %llx %llx\n", (unsigned long long)h3[0], (unsigned long long)h3[1], (unsigned long long)h3[2], (unsigned long long)e3[0], (unsigned long long)e3[1], (unsigned long long)e3[2]); }
-          if ((hm & flag_mask) != (em & flag_mask)) printf("   mxcsr host %x emu %x\n", hm & 0x3F, em & 0x3F);
+          if ((hm & flag_mask) != (em & flag_mask)) { uint32_t mi; memcpy(&mi, host + kMxcsrIn, 4); printf("   mxcsr host %x emu %x (in %x)\n", hm & 0x3F, em & 0x3F, mi); }
           if (memcmp(host, emu, 0x40) != 0) printf("   memory operand differs\n");
         }
       }

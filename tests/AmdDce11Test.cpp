@@ -261,12 +261,283 @@ static void test_display() {
   }
 }
 
+// The graphics plane set up for a picture of its own (dce_v11_0_crtc_do_set_base): the registers the driver writes, with their values, for each CRTC; the VGA mode off, the other bits of the
+// registers it reads and modifies left alone, and the refusals.
+static void test_scanout() {
+  const uint32_t offsets[6] = {0x1b9c - 0x1b9c, 0x1d9c - 0x1b9c, 0x1f9c - 0x1b9c, 0x419c - 0x1b9c, 0x439c - 0x1b9c, 0x459c - 0x1b9c};
+  const uint32_t vga[6] = {0xcc, 0xce, 0xf8, 0xf9, 0xfa, 0xfb};
+  for (uint32_t crtc = 0; crtc < 6; ++crtc) {
+    FakeDisplay d;
+    const uint32_t off = offsets[crtc];
+    d.set(vga[crtc], 0x00010001);              // VGA mode on, another bit set
+    d.set(0x1a12 + off, 0x00000011);           // flip control: H_RETRACE_EN and another bit
+    d.set(0x1a02 + off, 0x00000123);           // LUT bypass: enable and other bits
+    ScanoutSurface s;
+    s.address = 0x0000000123456700ull;
+    s.width = 1920;
+    s.height = 1080;
+    s.pitch_pixels = 2048;
+    s.viewport_width = 1920;
+    s.viewport_height = 1080;
+    Scanout scan(d);
+    CHECK(scan.set(crtc, s));
+    CHECK(d.get(vga[crtc]) == 0x00010000);
+    CHECK(d.get(0x1a12 + off) == 0x00000010);
+    // (the fake holds the primary address back as a pending flip: the log has what was written)
+    const auto written = [&](uint32_t reg) { uint32_t v = 0xDEADBEEFu; for (const auto& w : d.writes) if (w.first == reg) v = w.second; return v; };
+    CHECK(written(0x1a07 + off) == 1 && written(0x1a08 + off) == 1);
+    CHECK(written(0x1a04 + off) == 0x23456700 && written(0x1a05 + off) == 0x23456700);
+    CHECK(d.get(0x1a01 + off) == 2 && d.get(0x1a03 + off) == 0);
+    CHECK(d.get(0x1a02 + off) == 0x00000023);
+    CHECK(d.get(0x1a09 + off) == 0 && d.get(0x1a0a + off) == 0 && d.get(0x1a0b + off) == 0 && d.get(0x1a0c + off) == 0);
+    CHECK(d.get(0x1a0d + off) == 1920 && d.get(0x1a0e + off) == 1080 && d.get(0x1a06 + off) == 2048);
+    CHECK(d.get(0x1a00 + off) == 1 && d.get(0x1ac3 + off) == 1080 && d.get(0x1b5c + off) == 0);
+    CHECK(d.get(0x1b5d + off) == ((1920u << 16) | 1080u) && d.get(0x1bbe + off) == 0);
+    CHECK(scan.disable(crtc) && d.get(0x1a00 + off) == 0);
+  }
+  // an odd height rounds the viewport up to even
+  FakeDisplay d;
+  Scanout scan(d);
+  ScanoutSurface s;
+  s.address = 0x1000;
+  s.width = 800;
+  s.height = 601;
+  s.pitch_pixels = 800;
+  s.viewport_width = 800;
+  s.viewport_height = 601;
+  CHECK(scan.set(0, s) && d.get(0x1b5d) == ((800u << 16) | 602u));
+  // refused, nothing written: a CRTC that does not exist, a misaligned address, an empty picture, a pitch below the width, an empty viewport
+  const size_t writes = d.writes.size();
+  ScanoutSurface bad = s;
+  CHECK(!scan.set(6, s) && !scan.disable(6));
+  bad.address = 0x1001;
+  CHECK(!scan.set(0, bad));
+  bad = s; bad.width = 0;
+  CHECK(!scan.set(0, bad));
+  bad = s; bad.height = 0;
+  CHECK(!scan.set(0, bad));
+  bad = s; bad.pitch_pixels = 799;
+  CHECK(!scan.set(0, bad));
+  bad = s; bad.viewport_width = 0;
+  CHECK(!scan.set(0, bad));
+  bad = s; bad.viewport_height = 0;
+  CHECK(!scan.set(0, bad));
+  CHECK(d.writes.size() == writes);
+}
+
+// The pixel formats, tiling and viewport position of a surface, and the look-up table.
+static void test_scanout_formats() {
+  const auto written = [](FakeDisplay& d, uint32_t reg) { uint32_t v = 0xDEADBEEFu; for (const auto& w : d.writes) if (w.first == reg) v = w.second; return v; };
+  ScanoutSurface base;
+  base.address = 0x4000;
+  base.width = 640;
+  base.height = 480;
+  base.pitch_pixels = 640;
+  base.viewport_width = 640;
+  base.viewport_height = 480;
+  // the DRM formats: depth | format << 8, the crossbars of ABGR, the table bypass of the 10 bit formats
+  const struct { ScanoutFormat f; uint32_t control, swap; bool bypass; } formats[] = {
+      {ScanoutFormat::Indexed8, 0x000, 0, false}, {ScanoutFormat::Argb4444, 0x201, 0, false}, {ScanoutFormat::Argb1555, 0x001, 0, false}, {ScanoutFormat::Bgra5551, 0x501, 0, false},
+      {ScanoutFormat::Rgb565, 0x101, 0, false},   {ScanoutFormat::Argb8888, 0x002, 0, false}, {ScanoutFormat::Argb2101010, 0x102, 0, true}, {ScanoutFormat::Bgra1010102, 0x402, 0, true},
+      {ScanoutFormat::Abgr8888, 0x002, (2u << 4) | (2u << 8), false}};
+  for (const auto& f : formats) {
+    FakeDisplay d;
+    d.set(0x1a02, 0x00000023);
+    ScanoutSurface s = base;
+    s.format = f.f;
+    Scanout scan(d);
+    CHECK(scan.set(0, s) && d.get(0x1a01) == f.control && d.get(0x1a03) == f.swap && d.get(0x1a02) == (f.bypass ? 0x123u : 0x023u));
+  }
+  // tiling: 1D is the array mode and the pipe configuration; 2D adds the banks, tile split, bank size and macro tile aspect (micro tile mode 0, display)
+  {
+    FakeDisplay d;
+    ScanoutSurface s = base;
+    s.tiling.mode = ScanoutTiling::Mode::Tiled1D;
+    s.tiling.pipe_config = 0x12;
+    s.tiling.num_banks = 3;         // (ignored in 1D)
+    Scanout scan(d);
+    CHECK(scan.set(0, s) && d.get(0x1a01) == (2u | (2u << 20) | (0x12u << 24)));
+    s.tiling.mode = ScanoutTiling::Mode::Tiled2D;
+    s.tiling.num_banks = 3; s.tiling.bank_width = 1; s.tiling.bank_height = 2; s.tiling.macro_tile_aspect = 3; s.tiling.tile_split = 5;
+    CHECK(scan.set(0, s) && d.get(0x1a01) == (2u | (3u << 2) | (1u << 6) | (2u << 11) | (5u << 13) | (3u << 18) | (4u << 20) | (0x12u << 24)));
+    // out of range fields
+    const size_t n = d.writes.size();
+    ScanoutSurface bad = s;
+    bad.tiling.pipe_config = 0x20;
+    CHECK(!scan.set(0, bad));
+    bad = s; bad.tiling.num_banks = 4;
+    CHECK(!scan.set(0, bad));
+    bad = s; bad.tiling.tile_split = 8;
+    CHECK(!scan.set(0, bad));
+    bad = s; bad.tiling.mode = static_cast<ScanoutTiling::Mode>(3);
+    CHECK(!scan.set(0, bad));
+    bad = s; bad.format = static_cast<ScanoutFormat>(99);
+    CHECK(!scan.set(0, bad) && d.writes.size() == n);
+  }
+  // the viewport position: x down to a multiple of 4, y to even
+  {
+    FakeDisplay d;
+    ScanoutSurface s = base;
+    s.x = 7;
+    s.y = 5;
+    s.width = 800;
+    s.pitch_pixels = 800;
+    Scanout scan(d);
+    CHECK(scan.set(2, s) && d.get(0x1b5c + 0x1f9c - 0x1b9c) == ((4u << 16) | 4u));
+  }
+  // the look-up table: the colour pipeline passed through, 256 entries of 10 bit colour from the top bits, the identity ramp for none
+  {
+    FakeDisplay d;
+    const uint32_t off = 0x1d9c - 0x1b9c;       // CRTC 1
+    d.set(0x1a35 + off, 0x7); d.set(0x1a2d + off, 0x0); d.set(0x1a10 + off, 0x3); d.set(0x1a58 + off, 0xFFFF); d.set(0x1a59 + off, 0x7); d.set(0x1aa0 + off, 0xF); d.set(0x1a3c + off, 0xF);
+    d.set(0x1a50 + off, 0x5); d.set(0x1abc + off, 0x1);
+    Scanout scan(d);
+    LutEntry table[256];
+    for (uint32_t i = 0; i < 256; ++i) table[i] = {static_cast<uint16_t>(i << 8), static_cast<uint16_t>(0xFFFF - (i << 8)), static_cast<uint16_t>(i * 257)};
+    CHECK(scan.load_lut(1, table) && !scan.load_lut(6, table));
+    CHECK(d.get(0x1a35 + off) == 0x4 && d.get(0x1a2d + off) == 0x10 && d.get(0x1a10 + off) == 0x2 && d.get(0x1a58 + off) == 0xCCFC && d.get(0x1a59 + off) == 0x4 && d.get(0x1aa0 + off) == 0x8 &&
+          d.get(0x1a3c + off) == 0x8 && d.get(0x1a50 + off) == 0 && d.get(0x1abc + off) == 0x3);
+    CHECK(d.get(0x1a80 + off) == 0 && d.get(0x1a81 + off) == 0 && d.get(0x1a82 + off) == 0 && d.get(0x1a83 + off) == 0 && d.get(0x1a84 + off) == 0xffff && d.get(0x1a85 + off) == 0xffff &&
+          d.get(0x1a86 + off) == 0xffff && d.get(0x1a78 + off) == 0 && d.get(0x1a7e + off) == 7 && d.get(0x1a79 + off) == 0);
+    std::vector<uint32_t> colors;
+    for (const auto& w : d.writes) if (w.first == 0x1a7c + off) colors.push_back(w.second);
+    CHECK(colors.size() == 256);
+    for (uint32_t i = 0; i < colors.size() && i < 256; ++i)
+      CHECK(colors[i] == (((i << 8 & 0xffc0u) << 14) | (((0xFFFFu - (i << 8)) & 0xffc0u) << 4) | (uint32_t(i * 257) >> 6)));
+    FakeDisplay e;
+    Scanout ramp(e);
+    CHECK(ramp.load_lut(0, nullptr));
+    std::vector<uint32_t> identity;
+    for (const auto& w : e.writes) if (w.first == 0x1a7c) identity.push_back(w.second);
+    CHECK(identity.size() == 256 && identity[0] == 0 && identity[255] == ((0xffc0u << 14) | (0xffc0u << 4) | (0xffffu >> 6)));
+  }
+  (void)written;
+}
+
+// The VGA mode switch, the interleave bit and the FMT block's truncation and dither.
+static void test_fmt() {
+  FakeDisplay d;
+  Scanout scan(d);
+  const uint32_t vga[6] = {0xcc, 0xce, 0xf8, 0xf9, 0xfa, 0xfb};
+  for (uint32_t crtc = 0; crtc < 6; ++crtc) {
+    d.set(vga[crtc], 0x10);
+    CHECK(scan.vga_enable(crtc, true) && d.get(vga[crtc]) == 0x11 && scan.vga_enable(crtc, false) && d.get(vga[crtc]) == 0x10);
+  }
+  const uint32_t off = 0x1f9c - 0x1b9c;    // CRTC 2
+  d.set(0x1ac0 + off, 0x5);
+  CHECK(scan.set_interleave(2, true) && d.get(0x1ac0 + off) == 0xD && scan.set_interleave(2, false) && d.get(0x1ac0 + off) == 0x5);
+  // truncation: enable | depth << 4 (6 bits 0, 8 bits 1, 10 bits 2); dither: frame and high pass random, spatial enable and depth << 11, and for 8 and 10 bits the RGB random too
+  const struct { uint32_t bpc; bool dither; uint32_t value; } rows[] = {
+      {6, false, 0x01}, {8, false, 0x11}, {10, false, 0x21}, {12, false, 0}, {16, false, 0},
+      {6, true, (1u << 13) | (1u << 15) | (1u << 8) | (0u << 11)}, {8, true, (1u << 13) | (1u << 14) | (1u << 15) | (1u << 8) | (1u << 11)},
+      {10, true, (1u << 13) | (1u << 14) | (1u << 15) | (1u << 8) | (2u << 11)}, {12, true, 0}};
+  for (const auto& r : rows) {
+    d.set(0x1bf2 + off, 0xFFFFFFFFu);
+    CHECK(scan.program_fmt(2, r.bpc, r.dither) && d.get(0x1bf2 + off) == r.value);
+  }
+  d.set(0x1bf2 + off, 0x1234);
+  CHECK(scan.program_fmt(2, 0, false) && d.get(0x1bf2 + off) == 0x1234);       // (an unknown depth leaves it)
+  CHECK(!scan.vga_enable(6, true) && !scan.set_interleave(6, true) && !scan.program_fmt(6, 8, false));
+}
+
+// The watermarks (dce_v11_0_bandwidth_update): the arithmetic against values computed independently with the driver's 20.12 fixed point (a separate script), the line buffer split, the
+// registers, one head and two.
+static void test_watermarks() {
+  using P = Watermarks::Params;
+  // the DRAM channel counts of MC_SHARED_CHMAP.NOOFCHAN (bits 15:12)
+  const uint32_t channels[] = {1, 2, 4, 8, 3, 6, 10, 12, 16, 1, 1};
+  for (uint32_t i = 0; i < 11; ++i) CHECK(Watermarks::dram_channels((i << 12) | 0x0FFF) == channels[i]);
+  // 1080p60: 148.5 MHz, 1920 / 2200: active 12929 ns, line 14814 ns, blank 1885 ns; four channels
+  const auto params = [](uint32_t clock, uint32_t hd, uint32_t ht, uint32_t sclk, uint32_t yclk, uint32_t heads) {
+    P p;
+    p.dram_channels = 4; p.yclk = yclk; p.sclk = sclk; p.disp_clk = clock; p.src_width = hd; p.num_heads = heads;
+    p.active_time = static_cast<uint32_t>(uint64_t{hd} * 1000000 / clock);
+    p.blank_time = static_cast<uint32_t>(uint64_t{ht} * 1000000 / clock) - p.active_time;
+    p.lb_size = 3840;
+    return p;
+  };
+  P p = params(148500, 1920, 2200, 1200000, 800000, 1);
+  CHECK(Watermarks::dram_bandwidth(p) == 8959 && Watermarks::available_bandwidth(p) == 3801 && Watermarks::average_bandwidth(p) == 518 && Watermarks::latency_watermark(p) == 17486);
+  p = params(148500, 1920, 2200, 300000, 150000, 1);
+  CHECK(Watermarks::dram_bandwidth(p) == 1679 && Watermarks::available_bandwidth(p) == 1679 && Watermarks::latency_watermark(p) == 20380);
+  CHECK(Watermarks::latency_watermark(params(148500, 1920, 2200, 1200000, 800000, 2)) == 18697);
+  CHECK(Watermarks::latency_watermark(params(148500, 1920, 2200, 300000, 150000, 2)) == 23123);
+  p = params(25175, 640, 800, 1200000, 800000, 1);
+  CHECK(Watermarks::available_bandwidth(p) == 644 && Watermarks::average_bandwidth(p) == 80 && Watermarks::latency_watermark(p) == 42831);
+  p = params(594000, 3840, 4400, 1200000, 800000, 1);
+  CHECK(Watermarks::available_bandwidth(p) == 3876 && Watermarks::average_bandwidth(p) == 2073 && Watermarks::latency_watermark(p) == 10776);
+  p = params(594000, 3840, 4400, 300000, 150000, 1);
+  CHECK(Watermarks::latency_watermark(p) == 19082);
+  // no heads: no watermark; zero clocks do not divide by zero
+  p.num_heads = 0;
+  CHECK(Watermarks::latency_watermark(p) == 0);
+  (void)Watermarks::latency_watermark(P());         // (all zero clocks: no division by zero)
+  // an interlaced mode with a vertical scale of two uses four source lines; vertical taps do too
+  p = params(148500, 1920, 2200, 1200000, 800000, 1);
+  const uint32_t base = Watermarks::latency_watermark(p);
+  P q = p;
+  q.vtaps = 5;
+  CHECK(Watermarks::latency_watermark(q) > base);
+  q = p; q.vsc_full = 2u << 12; q.interlaced = true;
+  CHECK(Watermarks::latency_watermark(q) > base);
+
+  // programming: CRTC 1 shows 1080p60, the others are off; the DMIF allocation completes
+  FakeClock clock;
+  FakeDisplay d;
+  for (uint32_t i = 0; i < 6; ++i) d.set(0x321 + i, 0x10);
+  d.set(0x801, 2u << 12);                 // four channels
+  d.set(0x1ac1 + (0x1d9c - 0x1b9c), 0x00F0000F);      // LB memory control with other bits
+  d.set(0x1b32 + (0x1d9c - 0x1b9c), 0x00000A55);
+  WatermarkHead heads[6];
+  heads[1] = {true, 1920, 2200, 148500, false};
+  WatermarkClocks clocks;
+  clocks.sclk_high_khz = 1200000; clocks.mclk_high_khz = 800000; clocks.sclk_low_khz = 300000; clocks.mclk_low_khz = 150000;
+  Watermarks wm(d, clock);
+  CHECK(wm.update(heads, clocks));
+  const uint32_t off1 = 0x1d9c - 0x1b9c;
+  // 1920 wide: memory config 2, two DMIF buffers, line buffer 2560 * 2; the others have no line buffer: config 1, no buffers
+  CHECK(((d.get(0x1ac1 + off1) >> 20) & 3) == 2 && (d.get(0x1ac1 + off1) & ~0x300000u) == 0x00C0000Fu && (d.get(0x322) & 7) == 2 && (d.get(0x321) & 7) == 0);
+  CHECK(((d.get(0x1ac1) >> 20) & 3) == 1);
+  // wm A and wm B written with the selection restored; the high watermark is the line time
+  uint32_t urgency[2] = {0xFFFFFFFFu, 0xFFFFFFFFu};
+  uint32_t selects[2] = {0, 0}, n = 0;
+  for (size_t i = 0; i < d.writes.size(); ++i) {
+    if (d.writes[i].first == 0x1b32 + off1 && n < 2) selects[n] = d.writes[i].second;
+    if (d.writes[i].first == 0x1b33 + off1 && n < 2) urgency[n++] = d.writes[i].second;
+  }
+  // (the first latency is for the high clocks: wm A = 17486, wm B = 20380, line time 14814)
+  CHECK(urgency[0] == (17486u | 14814u << 16) && urgency[1] == (20380u | 14814u << 16));
+  CHECK(((selects[0] >> 8) & 7) == 1 && ((selects[1] >> 8) & 7) == 2 && (selects[0] & ~0x700u) == 0x855u && d.get(0x1b32 + off1) == 0x00000A55);
+  CHECK(wm.result(1).line_time == 14814 && wm.result(1).wm_high == 17486 && wm.result(1).wm_low == 20380 && wm.result(1).lb_vblank_lead_lines == (5120 + 1919) / 1920);
+  // a disabled head: watermarks zero and the line time zero
+  CHECK(wm.result(0).line_time == 0 && wm.result(0).wm_high == 0 && d.get(0x1b33) == 0);
+  // two heads: the second wide enough for the 2560 .. 4095 split on a discrete card (four buffers), an APU gets two
+  heads[3] = {true, 3840, 4400, 594000, false};
+  CHECK(wm.update(heads, clocks) && (d.get(0x321 + 3) & 7) == 4 && ((d.get(0x1ac1 + 0x419c - 0x1b9c) >> 20) & 3) == 0);
+  clocks.apu = true;
+  CHECK(wm.update(heads, clocks) && (d.get(0x321 + 3) & 7) == 2);
+  CHECK(wm.result(1).wm_high == Watermarks::latency_watermark([&] { P x = params(148500, 1920, 2200, 1200000, 800000, 2); x.lb_size = 2560 * 2; return x; }()));
+  // below 1920: memory config 1
+  heads[3] = {true, 1280, 1650, 74250, false};
+  CHECK(wm.update(heads, clocks) && ((d.get(0x1ac1 + 0x419c - 0x1b9c) >> 20) & 3) == 1);
+  // a DMIF allocation that never completes: reported, the watermarks are programmed all the same
+  FakeDisplay e;
+  e.set(0x801, 0);
+  Watermarks stuck(e, clock);
+  heads[3].enabled = false;
+  CHECK(!stuck.update(heads, clocks) && stuck.result(1).wm_high != 0);
+}
+
 int main() {
   test_probe();
   test_flip();
   test_not_taken();
   test_refusals();
   test_display();
+  test_scanout();
+  test_scanout_formats();
+  test_fmt();
+  test_watermarks();
   printf(g_failed ? "AmdDce11Test: %d FAILED\n" : "AmdDce11Test: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }
