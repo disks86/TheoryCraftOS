@@ -553,6 +553,10 @@ void test_texture_copy_mips() {
 void test_stream_fuzz() {
   Env e;
   Handle rt = e.alloc(kTarget, Format::A8R8G8B8, 8, 8), vb = e.buffer(kAllocVertexBuffer, 3 * 28), ib = e.buffer(kAllocIndexBuffer, 64), tex = e.alloc(kTexture, Format::A8R8G8B8, 4, 4);
+  AllocationDesc query_desc;
+  query_desc.flags = kAllocQueryResult, query_desc.size = 16;
+  Handle queries = 0;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, query_desc, &queries) == status::kSuccess);
   Handle pipe = make_colored_pipeline(e);
   CHECK(write_triangle(e, vb, 1, 1, 0));
   const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
@@ -564,14 +568,16 @@ void test_stream_fuzz() {
   w.push_constants(floats(identity, 16));
   w.set_viewport({0, 0, 8, 8, 0, 1});
   w.set_scissor({0, 0, 8, 8});
+  w.begin_query(4, 8);
   w.draw(3);
+  w.end_query();
   w.draw_indexed(3);
   w.end_pass();
   w.copy_region(3, 0, 0, 3, 1, 1, 2, 2);
   w.generate_mipmaps(3);
   CHECK(w.ok());
   std::vector<uint8_t> good(w.view().data(), w.view().data() + w.view().size());
-  std::vector<Handle> list = {rt, vb, ib, tex};
+  std::vector<Handle> list = {rt, vb, ib, tex, queries};
   auto try_stream = [&](const std::vector<uint8_t>& bytes) {
     Handle ctx = 0;
     e.kernel.create_context(kPid, e.dev, ContextPriority::Normal, &ctx);
@@ -3401,6 +3407,151 @@ void test_half_floats() {
   CHECK(graphics::half_to_float(0x0001) == 5.9604645e-8f);                    // (the smallest subnormal)
 }
 
+// The count an occlusion query left in a result buffer (~0 when it cannot be read).
+uint64_t query_count(Env& e, Handle results, uint32_t index) {
+  LockResult r;
+  if (e.kernel.lock(kPid, results, kLockReadOnly, 0, &r) != status::kSuccess) return ~uint64_t{0};
+  ByteReader in(r.data);
+  in.skip(uint64_t{index} * 8);
+  const uint64_t v = in.le64();
+  e.kernel.unlock(kPid, results);
+  return in.ok() ? v : ~uint64_t{0};
+}
+
+void test_occlusion_queries() {
+  Env e;
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  Handle rt = e.alloc(kTarget, Format::A8R8G8B8, 16, 16), rt2 = e.alloc(kTarget, Format::A8R8G8B8, 16, 16), ds = e.alloc(kAllocDepthStencil, Format::D32Float, 16, 16);
+  Handle vb = e.buffer(kAllocVertexBuffer, 3 * 28), far_vb = e.buffer(kAllocVertexBuffer, 3 * 28);
+  AllocationDesc rd;
+  rd.flags = kAllocQueryResult, rd.size = 64;
+  Handle results = 0;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, rd, &results) == status::kSuccess);
+  // A query buffer is system memory only: nothing else can be combined with it, and it needs room for a count.
+  AllocationDesc bad = rd;
+  bad.flags = kAllocQueryResult | kAllocVertexBuffer;
+  Handle none = 0;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, bad, &none) == status::kInvalidParameter);
+  bad = rd, bad.size = 4;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, bad, &none) == status::kInvalidParameter);
+  bad = rd, bad.size = 0;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, bad, &none) == status::kInvalidParameter);
+
+  Handle vs = 0, fs = 0, pipe = 0;
+  CHECK(e.kernel.create_shader(kPid, e.dev, {ShaderKind::ColoredVertex, graphics::ShaderStage::Vertex, {}}, &vs) == status::kSuccess);
+  CHECK(e.kernel.create_shader(kPid, e.dev, {ShaderKind::ColoredFragment, graphics::ShaderStage::Fragment, {}}, &fs) == status::kSuccess);
+  graphics::GraphicsPipelineDesc gd;
+  graphics::describe_colored_pipeline(&gd);
+  PipelineDesc pd;
+  pd.vertex_shader = vs, pd.fragment_shader = fs, pd.vertex_stride = gd.vertex_stride, pd.attribute_count = 2, pd.varying_count = 1;
+  pd.attributes[0] = gd.attributes[0], pd.attributes[1] = gd.attributes[1];
+  pd.cull_mode = graphics::CullMode::None;
+  pd.depth_test = pd.depth_write = true;
+  CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &pipe) == status::kSuccess);
+  CHECK(write_triangle(e, vb, 0, 1, 0));   // (depth 0.5, covers the whole 16 x 16 target)
+  const float far_v[21] = {-1, -1, 0.9f, 0, 0, 1, 1, 3, -1, 0.9f, 0, 0, 1, 1, -1, 3, 0.9f, 0, 0, 1, 1};
+  CHECK(e.write(far_vb, floats(far_v, 21)));
+
+  // List: rt 0, rt2 1, ds 2, vb 3, far_vb 4, results 5.
+  // The triangle covers all 256 pixels; the same one again behind nothing (equal depth passes) under a scissor of half the width counts 128; the farther one fails the depth test;
+  // an empty query counts nothing.
+  CommandWriter w(e.allocator);
+  w.begin_pass(0, 2, kPassClearColor | kPassClearDepth, {0, 0, 0, 1}, 1, 0);
+  w.bind_pipeline(pipe);
+  w.push_constants(floats(identity, 16));
+  w.begin_query(5, 0);
+  w.bind_vertex_buffer(3);
+  w.draw(3);
+  w.end_query();
+  w.begin_query(5, 8);
+  w.bind_vertex_buffer(4);
+  w.draw(3);
+  w.end_query();
+  w.begin_query(5, 16);
+  w.end_query();
+  w.set_scissor({0, 0, 8, 16});
+  w.begin_query(5, 24);
+  w.bind_vertex_buffer(3);
+  w.draw(3);
+  w.end_query();
+  w.end_pass();
+  CHECK(w.ok() && e.render(w, {rt, rt2, ds, vb, far_vb, results}) == status::kSuccess);
+  CHECK(query_count(e, results, 0) == 256 && query_count(e, results, 1) == 0 && query_count(e, results, 2) == 0 && query_count(e, results, 3) == 128 && query_count(e, results, 4) == 0);
+
+  // A copy in the middle of the stream runs what was recorded before it: the second pass's query is a new one and lands where it says.
+  CommandWriter w2(e.allocator);
+  w2.begin_pass(0, 2, kPassClearColor | kPassClearDepth, {0, 0, 0, 1}, 1, 0);
+  w2.bind_pipeline(pipe);
+  w2.push_constants(floats(identity, 16));
+  w2.bind_vertex_buffer(3);
+  w2.begin_query(5, 32);
+  w2.draw(3);
+  w2.end_query();
+  w2.end_pass();
+  w2.copy_region(1, 0, 0, 0, 0, 0, 16, 16);
+  w2.begin_pass(1, 2, kPassClearColor | kPassClearDepth, {0, 0, 0, 1}, 1, 0);
+  w2.bind_pipeline(pipe);
+  w2.push_constants(floats(identity, 16));
+  w2.bind_vertex_buffer(3);
+  w2.set_scissor({0, 0, 16, 4});
+  w2.begin_query(5, 40);
+  w2.draw(3);
+  w2.end_query();
+  w2.end_pass();
+  CHECK(w2.ok() && e.render(w2, {rt, rt2, ds, vb, far_vb, results}) == status::kSuccess);
+  CHECK(query_count(e, results, 4) == 256 && query_count(e, results, 5) == 64 && query_count(e, results, 6) == 0);
+
+  // What the kernel refuses (nothing runs, and the results stay as they were).
+  auto refused = [&](auto build) {
+    CommandWriter c(e.allocator);
+    build(c);
+    return c.ok() && e.render(c, {rt, rt2, ds, vb, far_vb, results}) == status::kInvalidParameter;
+  };
+  CHECK(refused([&](CommandWriter& c) { c.begin_query(5, 0); }));                                                  // outside a pass
+  CHECK(refused([&](CommandWriter& c) { c.begin_pass(0, kNoAllocation, 0, {}, 1, 0); c.end_query(); c.end_pass(); }));       // never begun
+  CHECK(refused([&](CommandWriter& c) { c.begin_pass(0, kNoAllocation, 0, {}, 1, 0); c.begin_query(5, 0); c.end_pass(); }));   // still open at the end of the pass
+  CHECK(refused([&](CommandWriter& c) { c.begin_pass(0, kNoAllocation, 0, {}, 1, 0); c.begin_query(5, 0); c.begin_query(5, 8); c.end_query(); c.end_pass(); }));   // two at once
+  CHECK(refused([&](CommandWriter& c) { c.begin_pass(0, kNoAllocation, 0, {}, 1, 0); c.begin_query(5, 4); c.end_query(); c.end_pass(); }));       // not a multiple of 8
+  CHECK(refused([&](CommandWriter& c) { c.begin_pass(0, kNoAllocation, 0, {}, 1, 0); c.begin_query(5, 64); c.end_query(); c.end_pass(); }));      // past the end
+  CHECK(refused([&](CommandWriter& c) { c.begin_pass(0, kNoAllocation, 0, {}, 1, 0); c.begin_query(5, 0xFFFFFFF8u); c.end_query(); c.end_pass(); }));
+  CHECK(refused([&](CommandWriter& c) { c.begin_pass(0, kNoAllocation, 0, {}, 1, 0); c.begin_query(3, 0); c.end_query(); c.end_pass(); }));       // a vertex buffer
+  CHECK(refused([&](CommandWriter& c) { c.begin_pass(0, kNoAllocation, 0, {}, 1, 0); c.begin_query(0, 0); c.end_query(); c.end_pass(); }));       // an image
+  CHECK(refused([&](CommandWriter& c) { c.begin_pass(0, kNoAllocation, 0, {}, 1, 0); c.begin_query(9, 0); c.end_query(); c.end_pass(); }));       // no such allocation
+  // The limit: 64 queries are fine, a 65th is not.
+  {
+    CommandWriter c(e.allocator);
+    c.begin_pass(0, kNoAllocation, 0, {}, 1, 0);
+    for (uint32_t i = 0; i < graphics::kMaxOcclusionQueries; ++i) c.begin_query(5, 56), c.end_query();
+    c.end_pass();
+    CHECK(c.ok() && e.render(c, {rt, rt2, ds, vb, far_vb, results}) == status::kSuccess);
+    CommandWriter c2(e.allocator);
+    c2.begin_pass(0, kNoAllocation, 0, {}, 1, 0);
+    for (uint32_t i = 0; i <= graphics::kMaxOcclusionQueries; ++i) c2.begin_query(5, 56), c2.end_query();
+    c2.end_pass();
+    CHECK(c2.ok() && e.render(c2, {rt, rt2, ds, vb, far_vb, results}) == status::kInvalidParameter);
+  }
+  // (a query buffer cannot be bound as a vertex buffer, whatever its size)
+  CommandWriter bound(e.allocator);
+  bound.begin_pass(0, kNoAllocation, 0, {}, 1, 0);
+  bound.bind_vertex_buffer(5);
+  bound.end_pass();
+  CHECK(e.render(bound, {rt, rt2, ds, vb, far_vb, results}) == status::kInvalidParameter);
+
+  // A device without the feature refuses the buffer and the stream.
+  FakeScreen screen(8, 6);
+  graphics::SoftwareDevice software(e.allocator, &screen);
+  SpyDevice plain(software);
+  plain.feature_mask = 0;
+  Kernel kernel(e.allocator);
+  AdapterConfig c;
+  c.display = &screen;
+  kernel.add_adapter(plain, c);
+  Handle adapter = 0, dev = 0;
+  CHECK(kernel.open_process(kPid) == status::kSuccess && kernel.open_adapter_from_index(kPid, 0, &adapter) == status::kSuccess && kernel.create_device(kPid, adapter, &dev) == status::kSuccess);
+  Handle r2 = 0;
+  CHECK(kernel.create_allocation(kPid, dev, rd, &r2) == status::kNotSupported);
+}
+
 void test_conformance() {
   test_half_floats();
   HostAllocator allocator;
@@ -3429,6 +3580,12 @@ void test_conformance() {
         if (red >= 140 && red <= 165) ++single;
       }
       CHECK(bright >= 20 && single >= 20);
+    }
+    if (__builtin_strstr(r.name, "occlusion queries")) {
+      // The stripes: all 256 pixels of the open quad (red 255), half of them for the one half behind the near quad (about 128), none for the one wholly behind it.
+      const uint32_t row = 8 * 32;
+      const uint32_t open = (r.device_picture[row + 4] >> 16) & 0xFF, half = (r.device_picture[row + 16] >> 16) & 0xFF, none = (r.device_picture[row + 28] >> 16) & 0xFF;
+      CHECK(open >= 250 && half >= 124 && half <= 132 && none <= 4);
     }
     if (__builtin_strstr(r.name, "multiple render targets")) {
       // Even columns come from target 0 (the vertex colour), odd ones from target 1 (red and blue swapped): across a pair of neighbours the red of one is the blue of the other.
@@ -4527,6 +4684,7 @@ int main() {
   test_ps1();
   test_device_suite();
   test_conformance();
+  test_occlusion_queries();
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);
     return 1;

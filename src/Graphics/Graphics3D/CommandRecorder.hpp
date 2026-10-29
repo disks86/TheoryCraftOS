@@ -29,7 +29,7 @@ namespace graphics {
 struct RecordedCommand {
   enum class Type : uint8_t {
     BeginRenderPass, BindPipeline, BindVertexBuffer, BindIndexBuffer, PushConstants, BindTexture, SetViewport, SetScissor,
-    Draw, DrawIndexed, EndRenderPass, SetTopology,
+    Draw, DrawIndexed, EndRenderPass, SetTopology, BeginQuery, EndQuery,
   };
   Type type = Type::Draw;
   RenderPassBegin pass;
@@ -44,7 +44,7 @@ struct RecordedCommand {
   int32_t vertex_offset = 0;
   uint32_t instance_count = 1, first_instance = 0;
   PrimitiveTopology topology = PrimitiveTopology::TriangleList;   // SetTopology
-  uint32_t unit = 0;       // BindTexture
+  uint32_t unit = 0;       // BindTexture; the slot of BeginQuery
   IImage* image = nullptr;
   SamplerDesc sampler;
 };
@@ -56,6 +56,7 @@ class CommandRecorder : public ICommandBuffer {
   void begin() override {
     commands_.clear();
     constants_.clear();
+    for (bool& done : result_done_) done = false;
     ok_ = true;
   }
   void begin_render_pass(const RenderPassBegin& pass) override {
@@ -152,6 +153,32 @@ class CommandRecorder : public ICommandBuffer {
     c.type = RecordedCommand::Type::EndRenderPass;
     add(c);
   }
+  void begin_occlusion_query(uint32_t slot) override {
+    if (slot >= kMaxOcclusionQueries) {
+      ok_ = false;
+      return;
+    }
+    RecordedCommand c;
+    c.type = RecordedCommand::Type::BeginQuery;
+    c.unit = slot;
+    add(c);
+  }
+  void end_occlusion_query() override {
+    RecordedCommand c;
+    c.type = RecordedCommand::Type::EndQuery;
+    add(c);
+  }
+  bool occlusion_result(uint32_t slot, uint64_t* samples) const override {
+    if (slot >= kMaxOcclusionQueries || !result_done_[slot]) return false;
+    *samples = results_[slot];
+    return true;
+  }
+  // For the device that ran the commands: what the query of `slot` counted.
+  void set_occlusion_result(uint32_t slot, uint64_t samples) {
+    if (slot >= kMaxOcclusionQueries) return;
+    results_[slot] = samples;
+    result_done_[slot] = true;
+  }
   bool end() override { return ok_; }
 
   const List<RecordedCommand>& commands() const { return commands_; }
@@ -164,6 +191,8 @@ class CommandRecorder : public ICommandBuffer {
 
   List<RecordedCommand> commands_;
   List<uint8_t> constants_;
+  uint64_t results_[kMaxOcclusionQueries] = {};
+  bool result_done_[kMaxOcclusionQueries] = {};
   bool ok_ = true;
 };
 

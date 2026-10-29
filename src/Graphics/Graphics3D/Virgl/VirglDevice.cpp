@@ -100,17 +100,19 @@ class Stream {
   bool overflow_ = false;
 };
 
+constexpr uint32_t kQueryPolls = 5000;   // how many empty commands to wait for the host's query results with
+
 // --- Objects -------------------------------------------------------------------
 
 class VirglBuffer final : public IBuffer {
  public:
-  VirglBuffer(VirglDevice& device, uint64_t size, uint32_t usage) : device_(device) {
+  VirglBuffer(VirglDevice& device, uint64_t size, uint32_t usage, uint32_t extra_bind = 0) : device_(device) {
     hardware::VirtioGpu& gpu = device.gpu();
     memory_ = allocate_dma_view<uint8_t>(gpu.allocator(), size, 4096);
     if (memory_.empty()) return;
     memory_.fill(0);
     id_ = gpu.allocate_resource_id();
-    uint32_t bind = 0;
+    uint32_t bind = extra_bind;
     if (usage & kBufferVertex) bind |= virgl::kBindVertexBuffer;
     if (usage & kBufferIndex) bind |= virgl::kBindIndexBuffer;
     ResourceCreate3d create{header(kCmdResourceCreate3d), id_, virgl::kTargetBuffer, virgl::kFormatR8Unorm, bind,
@@ -546,9 +548,26 @@ void VirglDevice::destroy_command_buffer(ICommandBuffer* commands) {
 
 bool VirglDevice::submit(ICommandBuffer* commands) {
   if (!commands) return false;
-  const CommandRecorder& recorder = *static_cast<CommandRecorder*>(commands);
+  CommandRecorder& recorder = *static_cast<CommandRecorder*>(commands);
   Stream stream(gpu_.allocator());
   if (!stream.valid()) return false;
+
+  // Occlusion queries: one host query object per slot, each with a buffer of its own for its result (16 bytes: state, size, the count) that the host fills in when asked for
+  // it after the commands have run. (The host takes no offset into a shared buffer: two queries on one buffer overwrite each other.)
+  struct Queries {
+    explicit Queries(VirglDevice& d) : device(d) {}
+    ~Queries() {
+      for (uint32_t handle : objects)
+        if (handle) device.destroy_object(handle);
+      for (VirglBuffer* buffer : results)
+        if (buffer) destroy(device.gpu().allocator(), buffer);
+    }
+    VirglDevice& device;
+    VirglBuffer* results[kMaxOcclusionQueries] = {};
+    uint32_t objects[kMaxOcclusionQueries] = {};
+    bool used[kMaxOcclusionQueries] = {};
+    uint32_t open = kMaxOcclusionQueries;   // the slot between begin and end
+  } queries(*this);
 
   const VirglPipeline* pipeline = nullptr;
   VirglImage* color = nullptr;
@@ -662,7 +681,31 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         topology = cmd.topology;
         break;
       case RecordedCommand::Type::EndRenderPass:
+        if (queries.open != kMaxOcclusionQueries) return false;
         in_pass = false;
+        break;
+      case RecordedCommand::Type::BeginQuery: {
+        if (!in_pass || queries.open != kMaxOcclusionQueries || cmd.unit >= kMaxOcclusionQueries || queries.used[cmd.unit]) return false;
+        queries.results[cmd.unit] = make<VirglBuffer>(gpu_.allocator(), *this, 16, 0, virgl::kBindCustom);
+        if (!queries.results[cmd.unit] || !queries.results[cmd.unit]->valid()) return false;
+        const uint32_t handle = new_handle();
+        stream.command(virgl::kCreateObject, virgl::kObjectQuery, 4);
+        stream.put(handle);
+        stream.put(virgl::kQueryOcclusionCounter);
+        stream.put(0);
+        stream.put(queries.results[cmd.unit]->id());
+        stream.command(virgl::kBeginQuery, 0, 1);
+        stream.put(handle);
+        queries.objects[cmd.unit] = handle;
+        queries.used[cmd.unit] = true;
+        queries.open = cmd.unit;
+        break;
+      }
+      case RecordedCommand::Type::EndQuery:
+        if (queries.open == kMaxOcclusionQueries) return false;
+        stream.command(virgl::kEndQuery, 0, 1);
+        stream.put(queries.objects[queries.open]);
+        queries.open = kMaxOcclusionQueries;
         break;
       case RecordedCommand::Type::BindPipeline: {
         pipeline = static_cast<const VirglPipeline*>(cmd.pipeline);
@@ -798,7 +841,41 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
     if (stream.overflow()) return false;
     if (stream.count() > Stream::kCapacity - 512 && !flush()) return false;  // leave room for the next command
   }
-  return !in_pass && flush();
+  if (in_pass || !flush()) return false;
+  // Ask the host for each query's count (waiting for the draws), then read what it wrote into the buffer.
+  bool asked = false;
+  for (uint32_t slot = 0; slot < kMaxOcclusionQueries; ++slot) {
+    if (!queries.used[slot]) continue;
+    stream.command(virgl::kGetQueryResult, 0, 2);
+    stream.put(queries.objects[slot]);
+    stream.put(1);
+    asked = true;
+  }
+  if (asked && !flush()) return false;
+  // (the host writes each result - state, size, count - straight into the buffer's guest memory when its GL says the query is complete. It checks as it polls, which it does while
+  // commands with fences are coming in: so keep it busy with empty ones until every state reads DONE. Pulling a buffer from the host would overwrite what it wrote.)
+  for (uint32_t attempt = 0; asked; ++attempt) {
+    bool pending = false;
+    for (uint32_t slot = 0; slot < kMaxOcclusionQueries; ++slot) {
+      if (!queries.used[slot]) continue;
+      ByteReader in(queries.results[slot]->map());
+      if (in.le32() != virgl::kQueryStateDone) pending = true;
+    }
+    if (!pending) break;
+    const uint32_t nop = 0;
+    if (attempt > kQueryPolls || !send_commands(&nop, 1)) return false;
+  }
+  for (uint32_t slot = 0; slot < kMaxOcclusionQueries; ++slot) {
+    if (!queries.used[slot]) continue;
+    ByteReader in(queries.results[slot]->map());
+    in.le32();   // (the state, DONE)
+    in.le32();   // (the size of the result: 4 for a sample count, 8 for a time)
+    const uint64_t low = in.le32();
+    const uint64_t high = in.le32();
+    if (!in.ok()) return false;
+    recorder.set_occlusion_result(slot, low | (high << 32));
+  }
+  return true;
 }
 
 bool VirglDevice::present(IImage* image) {

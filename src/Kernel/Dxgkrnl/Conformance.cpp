@@ -85,6 +85,11 @@ class Rig {
     step("create_allocation (image)", ok() ? kernel_.create_allocation(kProcess, device_, d, &out) : status_);
     return out;
   }
+  Handle create(const AllocationDesc& d) {
+    Handle out = 0;
+    step("create_allocation", ok() ? kernel_.create_allocation(kProcess, device_, d, &out) : status_);
+    return out;
+  }
   Handle buffer(uint32_t flags, ConstByteView contents) {
     AllocationDesc d;
     d.flags = flags, d.size = contents.size();
@@ -114,6 +119,17 @@ class Rig {
     }
     kernel_.unlock(kProcess, a);
     step("read", good ? status::kSuccess : status::kInvalidParameter);
+  }
+  // Reads the little-endian 64-bit number `index` of a buffer.
+  uint64_t read_u64(Handle a, uint32_t index) {
+    LockResult lock;
+    if (!step("lock (read numbers)", ok() ? kernel_.lock(kProcess, a, kLockReadOnly, 0, &lock) : status_)) return 0;
+    ByteReader in(ConstByteView(lock.data.data(), lock.data.size()));
+    in.skip(uint64_t{index} * 8);
+    const uint64_t value = in.le64();
+    kernel_.unlock(kProcess, a);
+    step("read numbers", in.ok() ? status::kSuccess : status::kInvalidParameter);
+    return value;
   }
   // Runs a stream; the context is checked afterwards (a stream the device cannot run loses it).
   void render(const CommandWriter& commands, std::initializer_list<Handle> list) {
@@ -775,6 +791,60 @@ void float_target_scene(Rig& rig, ArrayView<uint32_t> out, Format format) {
 void scene_half_float_target(Rig& rig, ArrayView<uint32_t> out) { float_target_scene(rig, out, Format::A16B16G16R16F); }
 void scene_float_target(Rig& rig, ArrayView<uint32_t> out) { float_target_scene(rig, out, Format::A32B32G32R32F); }
 
+// Occlusion queries: a quad on the right half is drawn first (near), then three queried quads behind it - one in the open (16 x 16 pixels), one half behind the near quad (128 pixels
+// show) and one wholly behind it (none). The counts are then drawn as the colour of three stripes, so that a wrong count shows in the picture.
+void scene_occlusion_query(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureOcclusionQueries)) return void(rig.step("occlusion queries", status::kNotSupported));
+  auto quad = [](Vertex* v, float x0, float y0, float x1, float y1, float z, float r, float g, float b) {
+    v[0] = {x0, y0, z, r, g, b, 1}, v[1] = {x1, y0, z, r, g, b, 1}, v[2] = {x0, y1, z, r, g, b, 1};
+    v[3] = {x0, y1, z, r, g, b, 1}, v[4] = {x1, y0, z, r, g, b, 1}, v[5] = {x1, y1, z, r, g, b, 1};
+  };
+  Vertex v[24];
+  quad(v + 0, 0.0f, -1.0f, 1.0f, 1.0f, 0.2f, 0, 0, 0);          // near, right half
+  quad(v + 6, -1.0f, -1.0f, 0.0f, 0.0f, 0.5f, 0, 0, 0);         // in the open: 16 x 16 pixels
+  quad(v + 12, -0.5f, 0.0f, 0.5f, 1.0f, 0.5f, 0, 0, 0);         // half behind the near quad: 8 x 16 pixels show
+  quad(v + 18, 0.25f, -1.0f, 0.75f, 0.0f, 0.5f, 0, 0, 0);       // wholly behind it
+  Handle pipe = d3d9_pipeline(rig, true, false);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle depth = rig.image(kAllocDepthStencil, Format::D32Float, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  AllocationDesc rd;
+  rd.flags = kAllocQueryResult, rd.size = 3 * 8;
+  Handle results = rig.create(rd);
+  CommandWriter w(rig.allocator());
+  begin(w, 0, 1, {0, 0, 0, 1});
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(2);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(6);
+  for (uint32_t q = 0; q < 3; ++q) {
+    w.begin_query(3, q * 8);
+    w.draw(6, 6 + q * 6);
+    w.end_query();
+  }
+  w.end_pass();
+  rig.render(w, {target, depth, vb, results});
+  uint64_t counts[3];
+  for (uint32_t q = 0; q < 3; ++q) counts[q] = rig.read_u64(results, q);
+  // (the stripes: pixels 0 .. 8, 12 .. 20 and 24 .. 32)
+  Vertex s[18];
+  for (uint32_t q = 0; q < 3; ++q) {
+    const float shade = counts[q] >= 256 ? 1.0f : static_cast<float>(counts[q]) / 256.0f;
+    quad(s + q * 6, -1.0f + 0.75f * static_cast<float>(q), -1.0f, -0.5f + 0.75f * static_cast<float>(q), 1.0f, 0.5f, shade, 0.25f, 0.25f);
+  }
+  Handle svb = rig.buffer(kAllocVertexBuffer, bytes_of(s, sizeof s));
+  Handle flat = d3d9_pipeline(rig, false, false);
+  CommandWriter w2(rig.allocator());
+  begin(w2, 0, kNoAllocation, {0, 0, 0, 1});
+  w2.bind_pipeline(flat);
+  w2.bind_vertex_buffer(1);
+  w2.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w2.draw(18);
+  w2.end_pass();
+  rig.render(w2, {target, svb});
+  rig.read(target, out);
+}
+
 const Entry kScenes[] = {
     {"Direct3D 9 vertex colours", scene_vertex_colours},
     {"Direct3D 9 Shader Model 3", scene_sm3},
@@ -805,6 +875,7 @@ const Entry kScenes[] = {
     {"Direct3D 10 multiple render targets (DXBC)", scene_multiple_targets},
     {"Direct3D 10 half-float render target and texture", scene_half_float_target},
     {"Direct3D 10 float render target and texture", scene_float_target},
+    {"Direct3D 10 occlusion queries", scene_occlusion_query},
 };
 
 bool channels_close(uint32_t a, uint32_t b) {

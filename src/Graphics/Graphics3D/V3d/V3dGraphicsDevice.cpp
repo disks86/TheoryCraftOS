@@ -483,6 +483,9 @@ bool V3dGraphicsDevice::submit(ICommandBuffer* commands) {
         if (!draws.push_back(d)) return false;
         break;
       }
+      case RecordedCommand::Type::BeginQuery:
+      case RecordedCommand::Type::EndQuery:
+        return false;   // (no occlusion queries: DeviceInfo::features says so)
       case RecordedCommand::Type::SetTopology:
         if (cmd.topology != PrimitiveTopology::TriangleList) return false;   // (no lines or points here: DeviceInfo::features says so)
         break;

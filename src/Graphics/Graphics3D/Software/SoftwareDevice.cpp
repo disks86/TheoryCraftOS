@@ -390,6 +390,7 @@ struct DrawState {
   const uint8_t* constants = nullptr;
   uint8_t constants_storage[kMaxPushConstantBytes] = {};
   uint32_t primitive_id = 0;   // the primitive of the draw being rasterized (SV_PrimitiveID)
+  uint64_t* samples = nullptr; // the open occlusion query's count: one more for every fragment that passes the stencil and depth tests
 };
 
 float read_float(ConstByteView bytes, uint64_t offset) {
@@ -525,6 +526,7 @@ void write_fragment(const DrawState& s, int32_t x, int32_t y, float z, bool dept
   } else if (!depth_ok) {
     return;
   }
+  if (s.samples) ++*s.samples;
   for (uint32_t n = 0; n < pd.color_target_count && n < kMaxColorTargets; ++n) {
     const SoftwareImage* image = n == 0 ? s.color : s.extra_colors[n - 1];
     if (!image) break;
@@ -863,8 +865,11 @@ void SoftwareDevice::destroy_command_buffer(ICommandBuffer* commands) {
 
 bool SoftwareDevice::submit(ICommandBuffer* commands) {
   if (!commands) return false;
-  const CommandRecorder& recorder = *static_cast<CommandRecorder*>(commands);
+  CommandRecorder& recorder = *static_cast<CommandRecorder*>(commands);
   DrawState s;
+  uint64_t query_samples = 0;
+  uint32_t query_slot = 0;
+  bool query_open = false;
   IBuffer* vertex_buffer = nullptr;
   uint64_t vertex_offset = 0;
   IBuffer* index_buffer = nullptr;
@@ -920,7 +925,21 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
         break;
       }
       case RecordedCommand::Type::EndRenderPass:
+        if (query_open) return false;
         in_pass = false;
+        break;
+      case RecordedCommand::Type::BeginQuery:
+        if (!in_pass || query_open) return false;
+        query_open = true;
+        query_slot = cmd.unit;
+        query_samples = 0;
+        s.samples = &query_samples;
+        break;
+      case RecordedCommand::Type::EndQuery:
+        if (!query_open) return false;
+        query_open = false;
+        s.samples = nullptr;
+        recorder.set_occlusion_result(query_slot, query_samples);
         break;
       case RecordedCommand::Type::BindPipeline:
         s.pipeline = static_cast<const SoftwarePipeline*>(cmd.pipeline);

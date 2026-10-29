@@ -25,7 +25,8 @@ namespace dxgk {
 
 namespace {
 
-constexpr uint32_t kKnownFlags = kAllocVertexBuffer | kAllocIndexBuffer | kAllocTexture | kAllocRenderTarget | kAllocDepthStencil | kAllocPresent | kAllocStaging | kAllocShared;
+constexpr uint64_t kMaxQueryResultBytes = 1 << 20;
+constexpr uint32_t kKnownFlags = kAllocVertexBuffer | kAllocIndexBuffer | kAllocTexture | kAllocRenderTarget | kAllocDepthStencil | kAllocPresent | kAllocStaging | kAllocShared | kAllocQueryResult;
 
 // The bytes of all levels of a w x h image of `pixel`-byte pixels; false if the description's levels are not possible. (w and h are at most kMaxTextureDimension, so nothing overflows.)
 bool image_bytes(uint32_t w, uint32_t h, uint32_t levels, uint32_t pixel, uint64_t* total) {
@@ -78,9 +79,15 @@ uint32_t VidMm::from_logical(Format f, uint32_t pixel) {
 
 NtStatus VidMm::create(const AllocationDesc& desc, SharedPointer<Allocation>* out) {
   if (desc.flags == 0 || (desc.flags & ~kKnownFlags)) return status::kInvalidParameter;
-  const bool buffer = (desc.flags & (kAllocVertexBuffer | kAllocIndexBuffer)) != 0;
+  const bool buffer = (desc.flags & (kAllocVertexBuffer | kAllocIndexBuffer | kAllocQueryResult)) != 0;
   uint64_t cpu_bytes = 0, device_bytes = 0;
-  if (buffer) {
+  if (desc.flags & kAllocQueryResult) {
+    // (results are written into system memory by the CPU: no device object)
+    if (desc.flags & ~(kAllocQueryResult | kAllocShared)) return status::kInvalidParameter;
+    if (!(device_.info().features & graphics::kFeatureOcclusionQueries)) return status::kNotSupported;
+    if (desc.size < 8 || desc.size > kMaxQueryResultBytes) return status::kInvalidParameter;
+    cpu_bytes = desc.size;
+  } else if (buffer) {
     if (desc.flags & (kAllocTexture | kAllocRenderTarget | kAllocDepthStencil | kAllocPresent | kAllocStaging)) return status::kInvalidParameter;
     if (desc.size == 0 || desc.size > kMaxBufferBytes) return status::kInvalidParameter;
     cpu_bytes = device_bytes = desc.size;

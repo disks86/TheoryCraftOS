@@ -330,6 +330,9 @@ struct Viewport {
   float min_depth = 0, max_depth = 1;
 };
 
+// The occlusion queries one command buffer can hold (kFeatureOcclusionQueries): slots 0 .. kMaxOcclusionQueries - 1.
+constexpr uint32_t kMaxOcclusionQueries = 64;
+
 struct RenderPassBegin {
   IImage* color = nullptr;
   // Further colour images (kFeatureMultipleTargets): target n (1..3) is extra_colors[n - 1], and a gap ends the list. All have the extent of `color`, none is bound as a texture
@@ -364,6 +367,16 @@ class ICommandBuffer {
   // What the vertices of the draws that follow make (kFeatureLines for lines and points; the default is a list of triangles).
   virtual void set_primitive_topology(PrimitiveTopology topology) = 0;
   virtual void end_render_pass() = 0;
+  // Occlusion queries (kFeatureOcclusionQueries), inside a render pass: from begin to end, the fragments that pass the stencil and depth tests (and that the shader did not
+  // discard) are counted - one per pixel, however many targets the pipeline writes and whatever the blending or write masks do. `slot` (below kMaxOcclusionQueries) names the result; one query is open at a time and
+  // it ends before the pass does. A device without the feature ignores both.
+  virtual void begin_occlusion_query(uint32_t slot) { (void)slot; }
+  virtual void end_occlusion_query() {}
+  // After submit(): the count of a query that was begun and ended (false for a slot that was not).
+  virtual bool occlusion_result(uint32_t slot, uint64_t* samples) const {
+    (void)slot, (void)samples;
+    return false;
+  }
   // False if recording failed (out of memory, or a command used a resource wrongly).
   virtual bool end() = 0;
 
@@ -384,6 +397,7 @@ enum DeviceFeature : uint32_t {
   kFeatureInstancing = 1u << 3,    // draw(..., instance_count, first_instance) and VertexAttribute::per_instance
   kFeatureLines = 1u << 4,         // set_primitive_topology: lines and points
   kFeatureFloatFormats = 1u << 6,      // Format::R16G16B16A16Float / R32G32B32A32Float images: colour attachments (also several at once) and sampled textures, without mipmaps; read_pixels_float / write_pixels_float
+  kFeatureOcclusionQueries = 1u << 7,  // ICommandBuffer::begin_occlusion_query / end_occlusion_query / occlusion_result
   kFeatureMultipleTargets = 1u << 5,   // RenderPassBegin::extra_colors and GraphicsPipelineDesc::color_target_count
 };
 
