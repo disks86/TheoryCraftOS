@@ -806,13 +806,16 @@ EXPORT HRSRC WINAPI FindResourceExW(HMODULE module, LPCWSTR type, LPCWSTR name, 
   const ResourceEntry *ne = resource_find(root, names, name);
   if (!ne || !(ne->OffsetToData & 0x80000000u)) { set_error(1814 /* ERROR_RESOURCE_NAME_NOT_FOUND */); return NULL; }
   const ResourceDirectory *languages = (const ResourceDirectory *)((const BYTE *)root + (ne->OffsetToData & 0x7FFFFFFF));
+  /* the language asked for; a neutral request takes the first there is; a language with no entry of its own falls back to the same primary language, then to the neutral one */
   const ResourceEntry *le = language ? resource_find(root, languages, (LPCWSTR)(ULONG_PTR)language) : NULL;
-  if (!le) {      /* the language asked for, else any (neutral first) */
-    const ResourceEntry *all = (const ResourceEntry *)(languages + 1);
-    const unsigned count = languages->NumberOfNamedEntries + languages->NumberOfIdEntries;
-    le = count ? &all[0] : NULL;
-    if (!le) { set_error(1815 /* ERROR_RESOURCE_LANG_NOT_FOUND */); return NULL; }
+  const ResourceEntry *all = (const ResourceEntry *)(languages + 1);
+  const unsigned count = languages->NumberOfNamedEntries + languages->NumberOfIdEntries;
+  if (!le && !language && count) le = &all[0];
+  if (!le && language) {
+    for (unsigned i = 0; i < count && !le; ++i) if (!(all[i].Name & 0x80000000u) && (all[i].Name & 0x3FF) == (language & 0x3FF) && (all[i].Name & 0xFFFF) != 0) le = &all[i];
+    if (!le) le = resource_find(root, languages, (LPCWSTR)(ULONG_PTR)0);
   }
+  if (!le) { set_error(1815 /* ERROR_RESOURCE_LANG_NOT_FOUND */); return NULL; }
   if (le->OffsetToData & 0x80000000u) { set_error(1815); return NULL; }
   return (HRSRC)((const BYTE *)root + le->OffsetToData);
 }

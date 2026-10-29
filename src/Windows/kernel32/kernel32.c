@@ -3580,3 +3580,4 @@ EXPORT BOOL WINAPI DllMain(HANDLE module, DWORD reason, PVOID reserved) {
 #include "time.inc"
 #include "nls.inc"
 #include "actctx.inc"
+#include "rsrcupdate.inc"
