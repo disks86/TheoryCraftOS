@@ -21,6 +21,7 @@
 // requests, a check that they are well formed, and a script of replies that go wrong.
 #pragma once
 #include <stdint.h>
+#include <functional>
 #include <vector>
 #include "Hardware/VideoCodec/AMD/AmdVcn1.hpp"
 
@@ -41,6 +42,7 @@ struct FakeAuxSink {
   std::vector<Request> requests;
   struct DpcdWrite { uint32_t address; std::vector<uint8_t> bytes; };
   std::vector<DpcdWrite> dpcd_writes;      // the native writes the sink took, in order
+  std::function<void(uint32_t address, const std::vector<uint8_t>& bytes)> after_write;      // called after each native write has taken effect (a sink that reacts to what it is told)
   // the sink
   std::vector<uint8_t> edid, dpcd;
   bool monitor_present = true;
@@ -119,6 +121,7 @@ struct FakeAuxSink {
         if (address + i == 0x201) dpcd[address + i] &= static_cast<uint8_t>(~req.bytes[4 + i]);       // the service interrupt bits clear when a 1 is written to them
         else dpcd[address + i] = req.bytes[4 + i];
       }
+      if (after_write) after_write(address, written);
       return finish(native_odd_reply ? 0x30 : native_reply_extra);
     } else {
       const bool mot = command & 4, read = is_read;
@@ -153,6 +156,26 @@ struct FakeAuxCard final : IVcnRegisters {
   // The panel power of an eDP connector, for a video BIOS whose UNIPHYTransmitterControl table writes its first parameter word (ucAction in byte 3: 12 power on, 13 power off) to kPanel.
   // With unpowered_channel set, the AUX channel of that DDC line does not answer (the reply status says timeout) while the panel is off.
   static constexpr uint32_t kPanel = 0x7040;
+  // The DisplayPort link training tables: UNIPHYTransmitterControl's three parameter words are kPanel, +1, +2 (the call is complete when +2 is written); DIGxEncoderControl (revision 1.5)
+  // has three, 0x7050 to 0x7052. Each call is logged with the table (0 encoder, 2 transmitter) and its words.
+  struct DigCall {
+    uint32_t table;
+    uint32_t words[3];
+  };
+  std::vector<DigCall> dig_calls;
+  // The mode setting tables (SetPixelClock 12 -> slot 0 with 4 words, BlankCRTC 34 -> 1 with 2, EnableCRTC 35 -> 2 with 1, SetCRTC_UsingDTDTiming 49 -> 3 with 6, SelectCRTC_Source 42 -> 4
+  // with 1, UpdateCRTC_DoubleBufferRegisters 44 -> 5 with 1, EnableDispPowerGating 13 -> 6 with 1, SetCRTC_OverScan 40 -> 7 with 3, EnableScaler 33 -> 8 with 1): word i of slot k is
+  // register kModeSet + 0x10 * k + i; a call is logged when its last word is written. `table_order` has the table index of every mode setting call and every encoder / transmitter call,
+  // in order.
+  static constexpr uint32_t kModeSet = 0x7100;
+  struct ModeCall {
+    uint32_t table;
+    std::vector<uint32_t> words;
+  };
+  std::vector<ModeCall> mode_calls;
+  std::vector<uint32_t> table_order;
+  uint32_t mode_words[9][6] = {};
+  uint32_t dig_words[3][3] = {};
   uint32_t panel_writes = 0, panel_params = 0;
   bool panel_on = false;
   uint8_t unpowered_channel = 0;
@@ -167,13 +190,35 @@ struct FakeAuxCard final : IVcnRegisters {
   }
   void write(uint32_t r, uint32_t v) override {
     if (r == kParams1) params1 = v;
-    if (r == kPanel) {
+    if (r == kPanel && (v >> 24 == 12 || v >> 24 == 13)) {       // (the power actions; the table is the transmitter control table, which the training's drive also calls)
       ++panel_writes;
       panel_params = v;
-      if (v >> 24 == 12) panel_on = true;
-      if (v >> 24 == 13) panel_on = false;
+      panel_on = v >> 24 == 12;
+    }
+    if (r >= kModeSet && r < kModeSet + 0x90) {
+      static constexpr uint32_t kIndex[9] = {12, 34, 35, 49, 42, 44, 13, 40, 33}, kCount[9] = {4, 2, 1, 6, 1, 1, 1, 3, 1};
+      const uint32_t slot = (r - kModeSet) / 0x10, word = (r - kModeSet) % 0x10;
+      if (word < 6) mode_words[slot][word] = v;
+      if (word == kCount[slot] - 1) {
+        ModeCall c{kIndex[slot], {}};
+        for (uint32_t i = 0; i < kCount[slot]; ++i) c.words.push_back(mode_words[slot][i]);
+        mode_calls.push_back(c);
+        table_order.push_back(kIndex[slot]);
+      }
     }
     if (r > kRequest && r < kRequest + 6) request[r - kRequest] = v;
+    if (r >= kPanel + 1 && r <= kPanel + 2) {
+      dig_words[2][r - kPanel] = v;
+      if (r == kPanel + 2) { dig_calls.push_back({2, {dig_words[2][0], dig_words[2][1], dig_words[2][2]}}); table_order.push_back(76); }
+    }
+    if (r == kPanel) dig_words[2][0] = v;
+    if (r >= 0x7050 && r <= 0x7052) {
+      dig_words[0][r - 0x7050] = v;
+      if (r == 0x7052) {
+        dig_calls.push_back({0, {dig_words[0][0], dig_words[0][1], dig_words[0][2]}});
+        table_order.push_back(4);
+      }
+    }
     if (r != kDoorbell) return;
     ++doorbells;
     if (unpowered_channel && (params1 & 0xFF) == unpowered_channel && !panel_on) {

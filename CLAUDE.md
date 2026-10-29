@@ -42,3 +42,23 @@ Do the work directly instead when the task needs design judgement, touches sever
 Use ComfyUI (the `mcp__comfyui__*` tools, e.g. `generate_image`, or `create_workflow` and `enqueue_workflow` for audio) to generate any images or audio the work needs, such as test assets, sample media, and icons.
 
 ComfyUI output defaults to `/mnt/shared`. Look there for generated files, and copy only the ones the project needs into the repository (for example under `tests/data`). Generation is asynchronous, so poll the queue or history until the job finishes before using the result.
+
+## Autonomous Implementation Policy
+
+- For substantial tasks, own the implementation from investigation through verification.
+- Do not stop after producing a plan. Start implementing immediately after sufficient investigation.
+- Do not ask for approval between routine steps.
+- Break large tasks into internal milestones and continue through them autonomously.
+- Use subagents when they can independently investigate or review separate parts of the task.
+- Build and test after meaningful changes and fix failures before proceeding.
+- If a test fails, investigate the underlying cause rather than merely reporting the failure.
+- Keep a short progress checklist and update it as milestones are completed.
+- Make reasonable, reversible decisions without asking me to choose between minor implementation details.
+- Ask questions only for genuinely blocking ambiguity, destructive operations, or decisions with significant architectural consequences.
+- Never claim success without verifying the result.
+- Before stopping, review the diff, run relevant tests, and list any incomplete work and its cause.
+- Once completed, automatically commit the changes to the main branch.
+
+## Completion Criteria
+
+A task is complete only when the requested functionality is implemented, integrated, and validated to the extent possible in the current environment.

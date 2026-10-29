@@ -441,8 +441,8 @@ segment pointer written to 0x30 from block 2 on), at most three, a block that ne
 is a module parameter, off). `AmdVegaM::read_edid(connector, &bytes)` does it for a connector; `main.cpp` reads the monitor on each new connection and at boot, parses it with the existing EDID parser, and the toast says
 "A display (DELL U2720Q 2560x1440) was connected to HDMI-A-1 of the Radeon RX Vega M". It takes the bus for some tens of milliseconds, so it runs from the desktop loop and not in the interrupt path.
 
-**Not done / not known:** DisplayPort and eDP connectors carry the EDID over the AUX channel, not GPIO pins - see the next section. `amdgpu_i2c.c` (pre_xfer, post_xfer and the pad callbacks) and `i2c-algo-bit.c` were not at hand: the register choreography (outputs cleared, pins made
-inputs, pads masked for software, a pin "high" when its output is not enabled, released again afterwards) and the protocol are written from memory of them, so `check_i2c_port.py` checks the table and entry layout, which register
+**Not done / not known:** DisplayPort and eDP connectors carry the EDID over the AUX channel, not GPIO pins - see the next section. `amdgpu_i2c.c` (pre_xfer, post_xfer and the pad callbacks) was compared with v6.12 afterwards (outputs cleared, pins made
+inputs, pads masked for software with a read-back, a pin "high" when its output is not enabled, released again afterwards, and for a hardware capable line bit 16 of the clock mask register cleared first: added then; udelay 10 and the 2200 us timeout match); `i2c-algo-bit.c` is followed from memory, so `check_i2c_port.py` checks the table and entry layout, which register
 is which, the id bits and the lookup against the driver but not the pad callbacks. Tested against a bit-level simulated bus (`tests/FakeI2cMonitor.hpp`: a monitor as an I2C slave, written independently; `AmdDdcTest`): the wire
 (addresses, offsets, segment pointers, one stop per transfer), the registers left as found, the pads masked while the pins are driven, pins left pulled low, retries, a damaged block, an absent monitor, clock stretching within and past
 the limit, the time taken, and every bit flip of the data; `AtomI2cTest`, `AtomConnectorsTest` and `AmdVegaMTest` (`test_read_edid`) cover the table, the record and the card. The simulated slave is not a real monitor: whether a real
@@ -738,7 +738,12 @@ byte of its last 128-byte block goes to `DP_TEST_EDID_CHECKSUM` (0x261) and the 
 request, several bits, or an EDID that cannot be read) is answered NAK (0x02), because there is no trained link or pattern generator to run them on. A read or write that did not go through is `handling_failed`.
 `AmdAux::dpcd_write` (a native write, 12 bytes at a time) is what writes; `IDpcdAux` gained it.
 
-Not done: the retraining itself (there is no link training yet; the boot firmware's link is what is judged, and a card that has not trained one has `lanes` 0 and cannot lose it), the other tests (training, video pattern with the test timing
+Retraining: `train_link` remembers a link it trained (by hot plug pin, with the pixel clock and bits per colour), and `service_short_pulses` trains it again for the same mode when the check says
+the link is lost (`SinkEvent::retrained`, with the new `LinkTraining` in `retrain`). A link `train_link` never trained is only reported (the boot firmware's link is judged, and a card that has not trained
+one has `lanes` 0 and cannot lose it). The memory is dropped when the sink stops answering, when a retraining fails, or when a `train_link` fails; at most `kMaxRetrains` (4) retrainings in a row are made
+(`retrain_limit`), a healthy check starts the count again. `AmdVegaMTest::test_retrain_on_short_pulse` (a sink that recovers its clock when pattern 1 starts, `FakeAuxSink::after_write`) covers it.
+
+Not done: the other tests (training, video pattern with the test timing
 registers 0x219.., PHY patterns), and the MST message and the downstream port changes. Addresses and bit meanings are from memory, like the rest of the DPCD. `AmdVegaMTest::test_short_pulse_status` (healthy link, a lost lane, a lane beyond the ones in use, an untrained link, lost alignment, each
 service interrupt, the eDP panel, a sink that times out or ends before the status, HDMI and an unknown pin, capacity and order, the dropped state) and `DpcdTest::test_lane_count` cover it.
 
@@ -837,3 +842,69 @@ endpoint registers (`FakeAzalia`): the sound driver's pin is the endpoint `enabl
 of the data verb, the xmit codes 0x00 and 0xC0), `SET_DIGI_CONVERT_1` and `SET_CVT_CHAN_COUNT` on an HDMI converter, and the pin sense bits. **Not done:** the vendor-specific verbs of the ATI codecs (channel allocation, down-mix
 info, HBR control, the multi-channel remap), more than two channels or other formats (the stream is 48 kHz 16-bit stereo), the ELD read back from the pin (`GET_HDMI_ELDD`) to check what the display side programmed,
 unsolicited events for display changes (the driver is polled: someone calls `retarget()`), DisplayPort MST (device select), and anything on real hardware.
+
+### DisplayPort link training through the video BIOS
+
+Before a DisplayPort sink shows a picture the source and the sink agree on a link: the lane count and rate, and for each lane the voltage swing and pre-emphasis the sink can still read the clock and the data
+at. `DpLinkTrainer` (`DpLinkTrain.*`) is `amdgpu_atombios_dp_link_train`; the hardware side is `AmdDpSource` (`AmdDpSource.*`), the encoder and the transmitter driven through the AtomBIOS command tables, and
+`AmdVegaM::train_link(connector, pixel_clock_khz, bpc, &out)` ties them to a connector.
+
+- **Choosing the link.** `DpLinkConfig::choose(caps, pixel_clock_khz, bits_per_pixel)` is `amdgpu_atombios_dp_get_dp_link_config`: rate by rate from 1.62 up to the sink's maximum, the fewest lanes at that rate
+  that carry the pixel clock (lanes x rate x 8 / bpp >= clock); if nothing does, no lanes (the driver's -EINVAL; training refuses). (An earlier version of this code, written from memory, had radeon's
+  "fewest lanes at 2.7 first" rule, which amdgpu does not have; the source was fetched later and the code corrected.) `bandwidth_code()` is `DP_LINK_BW_SET` (rate / 27 MHz: 6, 10, 20).
+- **The training**, in the driver's order: the sink to D0 (`DP_SET_POWER` 0x600 = 1, for DPCD 1.1 and up, 1 ms to wake), downspread (`DP_DOWNSPREAD_CTRL` 0x107 = 0x10 if the sink supports 0.5 %, else 0),
+  `DP_LANE_COUNT_SET` 0x101 (the lanes, with bit 7 for enhanced framing if the sink has it) and `DP_LINK_BW_SET` 0x100; the encoder told to start (`ATOM_ENCODER_CMD_DP_LINK_TRAINING_START`) and the pattern off on the sink
+  (`DP_TRAINING_PATTERN_SET` 0x102 = 0). **Clock recovery:** pattern 1 on the source (`..._PATTERN1`) and then on the sink, the drive (voltage 0, pre-emphasis 0) on the transmitter (`SETUP_VSEMPH`, all lanes at once from the
+  first lane's value) and on the sink (`DP_TRAINING_LANE0_SET` 0x103, one byte per lane), 400 us; then until `drm_dp_clock_recovery_ok` (the clock recovery done bit of every lane in use): wait (the sink's
+  `DP_TRAINING_AUX_RD_INTERVAL` 0x00E: 100 us if 0, else 4 ms per unit), read the link status (0x202..0x207), and if the clock is not there give up when every lane is already at the maximum swing (the 'max reached' flag) or when
+  the sink has asked for the same voltage five times in a row, else set the drive to the highest voltage swing and pre-emphasis any lane's adjust request (0x206/0x207) asks for, on every lane, with the 'max
+  reached' flags (0x04, 0x20) once level 3 is asked. **Channel equalization:** pattern 3 if the sink has it (`TPS3_SUPPORTED`), else 2, the same way; until `drm_dp_channel_eq_ok` (clock recovery, equalization and symbol lock
+  of every lane in use, and interlane alignment), with the waits 400 us or the interval, up to six adjustments (seven status reads). **Finish:** pattern off on the sink and `..._COMPLETE` on the encoder. The outcome (`Result`)
+  says where it failed, and the finish is done whatever happened (after the driver's 400 us wait). After a failed clock recovery the equalization is not tried, as in the driver; the driver ignores a failed DPCD
+  write, here it ends the training with the result that names it. For an eDP panel (or a DP bridge) whose `DP_EDP_CONFIGURATION_CAP` (0x00D) has bit 0 - the internal DP2 panel mode - `DP_EDP_CONFIGURATION_SET`
+  (0x10A) is written 1 after the downspread (the alternate scrambler seed); the encoder is told the panel mode (`ATOM_ENCODER_CMD_SETUP_PANEL_MODE`) by the mode set. A sink of DPCD 1.4 gets 100 us in the clock recovery.
+- **The tables.** The encoder is the **DIGx encoder control table (index 4)** for every DIG - the DIG number is in the parameters (revisions 1.2 to 1.4: eight bytes, pixel clock in 10 kHz, the configuration with the link rate
+  and the DIG in bits 6:4, the action, mode, lanes, bits per colour, in 1.4 the hot plug id; revision 1.5: a union of the command (DIG, action), stream setup, link setup and panel mode parameters); an earlier version
+  of this code used DIG1EncoderControl (74) and DIG2EncoderControl (75) by DIG, which the Linux driver does not do for these chips. The transmitter is `UNIPHYTransmitterControl` (76), revision 1.4, 1.5 or 1.6
+  (1.5: symbol clock = link rate / 10 in 10 kHz units, the PHY id - the same number as the DIG on this card - the action, lanes, the connector object id, the encoder mode, the configuration with the hot plug select and
+  the CRTC's PLL as the PHY's clock source, the DIG front end as a bit per DIG, the lane set). The parameters are built by `AmdModeSet::encoder` / `transmitter` (see "Mode setting"), which `AmdDpSource` calls.
+  Other revisions and DIGs that do not exist are refused (`false`), nothing is run. The table indexes, layouts, constants and the driver's conditions are checked by `scripts/check_modeset_port.py` against
+  `atombios.h`, `atombios_crtc.c` and `atombios_encoders.c`, and the DPCD addresses and bits and the algorithm's constants by `scripts/check_dplink_port.py` against `drm_dp.h`, `atombios_dp.c` and `drm_dp_helper.c`
+  (kernel v6.12; the AMD sources are `drivers/gpu/drm/amd/amdgpu/atombios_*.c`, without the `amdgpu_` prefix).
+- **`train_link`** reads the sink's capabilities (the eDP panel is powered up first), chooses the link, and trains; the connector's encoder object gives the DIG (0..5: the Vega M's six) and the link; the hot plug pin, the
+  connector object id and the bits per colour (6, 8, 10, 12, 16; anything else 8) go into the tables.
+
+**Tested** by `DpLinkTrainTest` (the algorithm against a sink and source that log everything in order: the exact write sequence of a clean training, the options of the sink, adjusting to levels the sink asks for - the
+highest of several lanes, the flags at the top level, lanes not in use ignored - the clock recovery giving up after five repeats or at the maximum swing, the equalization after one to seven reads, pattern 2 or 3, the
+delays by the read interval, every write and read and each source step failing in turn, the link configuration over twelve cases), `AmdDpSourceTest` (an AtomBIOS image whose three tables hand their parameter words to the
+card: every word for each action, rate, DIG and revision, and the refusals), and `AmdVegaMTest::test_train_link` (the DisplayPort connector on DIG 3 link B and the eDP panel on DIG 0, with the DPCD writes and the table calls
+of the whole training for 1080p60 and 4K60, failure, and the refusals).
+
+**Checked** against the driver's sources (v6.12) as above. **Not checked / not done:** which table revisions a real Polaris video BIOS has (1.5 encoder control and 1.5 transmitter control are what I believe; 1.3, 1.4 and 1.6
+are handled too), NUTMEG's 2.7-only rule, 8.1 Gbit/s, and everything on real hardware.
+
+**eDP 1.4 rate table and retraining (done after the above):** a panel of eDP revision 1.4 that lists rates (`Capabilities::edp_rates_khz`) is trained by table index: `DpLinkConfig::choose` takes the lowest listed rate (any order) that
+the encoder control can be told (1.62, 2.7, 3.24, 5.4 GHz; 2.16 and the like are skipped) with the fewest lanes, writes `DP_LINK_BW_SET` 0 and `DP_LINK_RATE_SET` (0x115) with the index after the lane count. `service_short_pulses`
+retrains a lost link that `train_link` trained (see the short pulse section). Tests: `DpLinkTrainTest::test_edp_rate_table`, `AmdVegaMTest::test_train_link`, `test_retrain_on_short_pulse`. `DP_LINK_RATE_SET` (0x115) is in `drm_dp.h` but the amdgpu AtomBIOS path never uses it (it works from `DP_MAX_LINK_RATE`), so this is an addition of ours for eDP 1.4 panels, which has not been seen to work.
+
+### Mode setting through the video BIOS
+
+`AmdModeSet` (`AmdModeSet.*`) calls the BIOS tables that set a mode with the parameters amdgpu gives them (`atombios_crtc.c` and `atombios_encoders.c`, v6.12, which an earlier version of this section had from
+memory - the comparison corrected the encoder control table index, the CRTC timing table and the sequence): SetPixelClock 1.7 (the clock in 100 Hz units - on Polaris/VEGAM the card computes the PLL from it - the PLL,
+encoder id, mode, CRTC, HDMI deep colour ratio 5:4 / 3:2 / 2:1, dual link DVI above 165 MHz), SetCRTC_UsingDTDTiming (display size and blanking to the total, sync offset and width, polarity / composite / interlace /
+double clock flags), SetCRTC_OverScan and EnableScaler (RMX off: all zero, scaler disabled), SelectCRTC_Source 1.2 / 1.3 (the DIG as ASIC_INT_DIGn_ENCODER_ID, mode, panel colour depth), EnableCRTC, BlankCRTC,
+UpdateCRTC_DoubleBufferRegisters (the lock), EnableDispPowerGating, the DIGx encoder control (1.2 to 1.5) and the UNIPHY transmitter control (1.4, 1.5, 1.6).
+
+`AmdVegaM::set_mode(connector, crtc, mode, bpc, &result[, pll])` is the DRM modeset of `dce_v11_0.c` in order: **crtc prepare** (power gating off, lock, blank and disable), the DisplayPort sink's capabilities and the lane /
+rate choice, **encoder prepare** (eDP panel on, the CRTC's source), **crtc mode set** (pixel clock - DisplayPort on PPLL0, the others on PPLL1 for even CRTCs and PPLL2 for odd unless named - DTD timing, overscan,
+scaler), **encoder mode set** (the encoder off: DP video off, the sink to D3, the transmitter disabled, the eDP panel off), **crtc commit** (enable, unblank, unlock), **encoder commit** (encoder setup, the panel mode,
+the eDP panel on, the transmitter enabled, for DisplayPort the link trained - sink to D0, ASSR for the internal DP2 panel mode - and the video on). `ModeSetResult::failed` names the step that failed; tables the BIOS
+does not have (power gating, lock, overscan, scaler) are skipped as the driver does by running nothing. `disable_mode` is `dce_v11_0_encoder_disable` and `_crtc_disable`: the encoder off, the CRTC blanked and disabled,
+power gating on, and the CRTC's PLL off unless another CRTC set up by `set_mode` still uses it. The retraining after a short pulse remembers the PLL.
+
+Tests: `tests/AmdModeSetTest.cpp` (every word of every table for every revision handled, the refusals), `AmdVegaMTest::test_set_mode` (the order and words for DisplayPort, HDMI and the eDP panel, the panel power
+sequence, the internal DP2 panel mode with ASSR, each failing stage, switching off with the shared PLL), `scripts/check_modeset_port.py`.
+
+**Not done:** the scanout surface (GRPH: `amd_dce11::Plane` is the caller's, between prepare and commit in the driver), the VGA enable writes around the unblank, the FMT block (dither / truncation) and
+interleave setup, the audio setup of an HDMI output (`enable_audio` / `AudioFormat`, separate calls), spread spectrum (the driver reads the BIOS's SS info; none is programmed here), the pixel clock limit checks,
+the PLL choice from the PLLs in use (`dce_v11_0_pick_pll`), a DP bridge chip's DP1 panel mode, external encoders, backlight; nothing in `main.cpp` calls `set_mode`; real hardware.
