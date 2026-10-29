@@ -2177,6 +2177,18 @@ static void test_set_mode() {
   CHECK(auxcard.table_order == std::vector<uint32_t>({13, 44, 34, 35, 42, 12, 49, 40, 33, 76, 35, 34, 44, 4, 4, 76}));
   CHECK(mc.size() == 12 && mc[5].words[2] == (3u | 1u << 8) && ((mc[5].words[1] >> 16) & 0xFF) == 3 && (mc[5].words[1] & 0xFF) == 1);
   CHECK(dc[0].table == 2 && (dc[0].words[0] >> 24) == 0 && dc[1].words[0] == (2u | 0x0Fu << 8 | 3u << 16 | 4u << 24) && dc[1].words[1] == 14850 && dc[1].words[2] == 3u);
+  // with a surface: the graphics plane of the CRTC (3: block offset 0x2600) is pointed at it between the timing and the overscan; a bad surface is the Scanout stage
+  amd_dce11::ScanoutSurface surface;
+  surface.address = 0x100000;
+  surface.width = 1920;
+  surface.height = 1080;
+  surface.pitch_pixels = 1920;
+  surface.viewport_width = 1920;
+  surface.viewport_height = 1080;
+  CHECK(vega.set_mode(hdmi, 3, m, 8, &r, AmdModeSet::kPllInvalid, &surface));
+  CHECK(rig.card.dce.get(0x1a00 + 0x2600) == 1 && rig.card.dce.get(0x1a06 + 0x2600) == 1920 && rig.card.dce.get(0x1a0d + 0x2600) == 1920 && rig.card.dce.get(0x1a01 + 0x2600) == 2);
+  surface.address = 0x100001;
+  CHECK(!vega.set_mode(hdmi, 3, m, 8, &r, AmdModeSet::kPllInvalid, &surface) && r.failed == AmdVegaM::ModeSetStage::Scanout);
   // eDP on CRTC 0: the panel powered up (it answers only then) before its capabilities are read, off for the encoder's mode set and on again for the commit
   auxcard.unpowered_channel = 0x92;
   auxcard.table_order.clear();
@@ -2241,7 +2253,7 @@ static void test_set_mode() {
   CHECK(auxcard.table_order == std::vector<uint32_t>({4, 76, 76, 34, 35, 13, 12}) && mc.back().words == std::vector<uint32_t>({0u, 2u, 0u, 0u}));
   CHECK(!auxcard.panel_on);
   // a connector without an AUX session (HDMI) just goes off; a CRTC that does not exist or a connector that is no output is refused
-  CHECK(vega.disable_mode(hdmi, 3));
+  CHECK(vega.disable_mode(hdmi, 3) && rig.card.dce.get(0x1a00 + 0x2600) == 0);
   CHECK(!vega.disable_mode(dp, 6) && !vega.disable_mode(vga, 0));
   vega.shutdown();
   CHECK(!vega.disable_mode(dp, 0) && !vega.set_mode(dp, 0, m, 8, &r) && r.failed == AmdVegaM::ModeSetStage::NotReady);

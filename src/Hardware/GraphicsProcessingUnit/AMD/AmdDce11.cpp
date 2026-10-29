@@ -131,6 +131,50 @@ bool Plane::flip(uint64_t address, uint32_t timeout_us) {
   return taken;
 }
 
+// The registers of the graphics plane that the surface setup writes (dce_11_2_d.h, offset by the CRTC's block), and the VGA control registers (bit 0 is the VGA mode enable).
+namespace {
+constexpr uint32_t kGrphEnable = 0x1a00, kGrphControl = 0x1a01, kGrphLut10BitBypass = 0x1a02, kGrphSwapCntl = 0x1a03, kGrphPrimaryAddress = 0x1a04, kGrphSecondaryAddress = 0x1a05,
+                   kGrphPitch = 0x1a06, kGrphPrimaryAddressHigh = 0x1a07, kGrphSecondaryAddressHigh = 0x1a08, kGrphSurfaceOffsetX = 0x1a09, kGrphSurfaceOffsetY = 0x1a0a,
+                   kGrphXStart = 0x1a0b, kGrphYStart = 0x1a0c, kGrphXEnd = 0x1a0d, kGrphYEnd = 0x1a0e, kGrphFlipControl = 0x1a12, kLbDesktopHeight = 0x1ac3,
+                   kViewportStart = 0x1b5c, kViewportSize = 0x1b5d, kCrtcMasterUpdateMode = 0x1bbe;
+constexpr uint32_t kVgaControl[kMaxCrtcs] = {0xcc, 0xce, 0xf8, 0xf9, 0xfa, 0xfb};
+constexpr uint32_t kFlipHRetraceEnable = 0x1, kLut10BitBypassEnable = 0x100, kGrphControlArgb8888 = 2;       // GRPH_DEPTH 2 (32 bit), GRPH_FORMAT 0 (ARGB8888), linear, pipe config 0
+}  // namespace
+
+bool Scanout::set(uint32_t crtc, const ScanoutSurface& s) {
+  if (crtc >= kMaxCrtcs || (s.address & (kSurfaceAlignment - 1)) != 0 || s.width == 0 || s.height == 0 || s.pitch_pixels < s.width || s.viewport_width == 0 || s.viewport_height == 0) return false;
+  const uint32_t off = kCrtcOffsets[crtc];
+  r_.write(kVgaControl[crtc], r_.read(kVgaControl[crtc]) & ~1u);                                  // dce_v11_0_vga_enable(false)
+  // the surface address is taken at vertical blank, not horizontal
+  r_.write(kGrphFlipControl + off, r_.read(kGrphFlipControl + off) & ~kFlipHRetraceEnable);
+  r_.write(kGrphPrimaryAddressHigh + off, static_cast<uint32_t>(s.address >> 32));
+  r_.write(kGrphSecondaryAddressHigh + off, static_cast<uint32_t>(s.address >> 32));
+  r_.write(kGrphPrimaryAddress + off, static_cast<uint32_t>(s.address) & GRPH_PRIMARY_SURFACE_ADDRESS__GRPH_PRIMARY_SURFACE_ADDRESS_MASK);
+  r_.write(kGrphSecondaryAddress + off, static_cast<uint32_t>(s.address) & GRPH_PRIMARY_SURFACE_ADDRESS__GRPH_PRIMARY_SURFACE_ADDRESS_MASK);
+  r_.write(kGrphControl + off, kGrphControlArgb8888);
+  r_.write(kGrphSwapCntl + off, 0);                                                              // no endian swap, no crossbar
+  r_.write(kGrphLut10BitBypass + off, r_.read(kGrphLut10BitBypass + off) & ~kLut10BitBypassEnable);       // (an 8 bit picture goes through the look-up table)
+  r_.write(kGrphSurfaceOffsetX + off, 0);
+  r_.write(kGrphSurfaceOffsetY + off, 0);
+  r_.write(kGrphXStart + off, 0);
+  r_.write(kGrphYStart + off, 0);
+  r_.write(kGrphXEnd + off, s.width);
+  r_.write(kGrphYEnd + off, s.height);
+  r_.write(kGrphPitch + off, s.pitch_pixels);
+  r_.write(kGrphEnable + off, 1);                                                                // dce_v11_0_grph_enable(true)
+  r_.write(kLbDesktopHeight + off, s.height);
+  r_.write(kViewportStart + off, 0);
+  r_.write(kViewportSize + off, (s.viewport_width << 16) | ((s.viewport_height + 1) & ~1u));
+  r_.write(kCrtcMasterUpdateMode + off, 0);                                                      // the flip may happen anywhere in the vertical blank interval
+  return true;
+}
+
+bool Scanout::disable(uint32_t crtc) {
+  if (crtc >= kMaxCrtcs) return false;
+  r_.write(kGrphEnable + kCrtcOffsets[crtc], 0);
+  return true;
+}
+
 bool Plane::set_surface(uint64_t address, uint64_t bytes, uint32_t timeout_us) {
   if (!active_ || (address & (kSurfaceAlignment - 1)) != 0 || !in_aperture(address, bytes)) return false;
   const uint64_t previous = surface();
