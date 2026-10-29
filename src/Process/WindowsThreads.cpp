@@ -138,6 +138,19 @@ uint32_t terminate_thread_in(Process& target, uint64_t thread_id, uint32_t code)
   return kSuccess;
 }
 
+uint32_t suspend_thread_in(Process& target, uint64_t thread_id, uint64_t* previous_count) {
+  Process::ThreadRecord* record = target.find_thread(thread_id);
+  if (!record || !target.runtime()) return kInvalidHandle;
+  if (record->finished) return 0xC000004Bu;      // STATUS_THREAD_IS_TERMINATING
+  if (record->suspend_count >= 127) return 0xC000004Cu;      // STATUS_SUSPEND_COUNT_EXCEEDED
+  *previous_count = uint32_t(record->suspend_count++);
+  if (*previous_count == 0 && record->started) {
+    target.runtime()->request_suspend(record->id);
+    if (ObjectManager* objects = system_objects()) objects->notify();
+  }
+  return kSuccess;
+}
+
 uint32_t resume_thread_in(Process& target, uint64_t thread_id, uint64_t* previous_count) {
   Process::ThreadRecord* record = target.find_thread(thread_id);
   if (!record || !target.runtime()) return kInvalidHandle;
@@ -305,6 +318,21 @@ uint32_t terminate_other_threads(Process& p, uint32_t code) {
 
 // NtSuspendThread(HANDLE Thread, PULONG PreviousSuspendCount)
 uint32_t nt_suspend_thread(Process& p, const SyscallRequest& r) {
+  {      // a thread of another program: one made by CreateRemoteThread, or the main thread whose handle CreateProcess gave out
+    uint64_t remote_id = 0, pid = 0;
+    bool exited = false;
+    uint32_t code = 0;
+    const bool remote = remote_thread_handle(p, r.args[0], &remote_id);
+    if (remote || (process_handle_info(p, r.args[0], &exited, &code, &pid) && pid != p.id())) {
+      if (!remote && exited) return 0xC000004Bu;
+      IProcessRuntime::RemoteOp op;
+      op.kind = IProcessRuntime::RemoteOp::SuspendThread;
+      op.thread_id = remote ? remote_id : pid;      // (the main thread of a program has the program's id)
+      const uint32_t status = p.runtime() ? p.runtime()->remote_operation(remote ? (remote_id & (kRemoteThreadIdLimit - 1)) : pid, op) : kNotImplemented;
+      if (status == kSuccess && r.args[1] != 0 && !put32(p, r.args[1], uint32_t(op.size))) return kAccessViolation;
+      return status == 0xC000010Au ? 0xC000004Bu : status;
+    }
+  }
   Process::ThreadRecord* record = thread_of(p, r.args[0]);
   if (!record) return kInvalidHandle;
   if (record->finished) return 0xC000004Bu;      // STATUS_THREAD_IS_TERMINATING
