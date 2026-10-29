@@ -443,17 +443,20 @@ bool Compiler::epilogue() {
   Export list[2 + TgsiShader::kMaxOutputs];
   uint32_t count = 0;
   if (s_.fragment) {
-    bool color = false;
+    int color[2] = {-1, -1};
     for (uint32_t k = 0; k < s_.outputs; ++k) {
       if (s_.output_semantic[k] == TgsiSemantic::Color) {
-        if (s_.output_semantic_index[k] != 0 || color) return fail("only one colour output is supported");
-        list[count++] = {kExpMrt0, out_reg(k, 0)};
-        color = true;
+        const uint32_t index = s_.output_semantic_index[k];
+        if (index > 1 || color[index] >= 0) return fail("at most two colour outputs, COLOR[0] and COLOR[1], are supported");
+        color[index] = static_cast<int>(k);
       } else if (s_.output_semantic[k] == TgsiSemantic::Position) {
         return fail("depth output is not supported");
       }
     }
-    if (!color) return fail("no colour output");
+    if (color[0] < 0) return fail(color[1] >= 0 ? "COLOR[1] without a COLOR[0] colour output" : "no colour output");
+    list[count++] = {kExpMrt0, out_reg(static_cast<uint32_t>(color[0]), 0)};
+    if (color[1] >= 0) list[count++] = {kExpMrt0 + 1, out_reg(static_cast<uint32_t>(color[1]), 0)};
+    info_->color_outputs = color[1] >= 0 ? 2 : 1;
   } else {
     bool position = false;
     uint32_t param = 0;
@@ -633,7 +636,9 @@ bool Compiler::tex(const TgsiInst& i) {
     v_mov(at++, operand(i.src[0], 3));
     op = Mimg::image_sample_b;
   }
-  if (target == TgsiShader::kTargetCube) {
+  const bool cube = target == TgsiShader::kTargetCube || target == TgsiShader::kTargetCubeArray;
+  if (target == TgsiShader::kTargetCubeArray && (bias || lod)) return fail("a cube array takes TEX only (its layer is the fourth component, there is no room for a bias or lod)");
+  if (cube) {
     // (the direction is copied to registers first: the cube instructions take no constants or literals; the registers base + 4 .. 7 are the result's, free until the sample)
     const uint32_t sc = at, tc = at + 1, face = at + 2;
     v_mov(base + 5, operand(i.src[0], 0));
@@ -649,7 +654,18 @@ bool Compiler::tex(const TgsiInst& i) {
     v_mov(base + 5, constant(1.5f));
     f3(Vop3::v_mad_f32, sc, vreg_operand(sc), vreg_operand(base + 4), vreg_operand(base + 5));
     f3(Vop3::v_mad_f32, tc, vreg_operand(tc), vreg_operand(base + 4), vreg_operand(base + 5));
+    if (target == TgsiShader::kTargetCubeArray) {
+      // the face index plus 8 for each layer (the fourth component of the coordinate)
+      v_mov(base + 5, operand(i.src[0], 3));
+      v_mov(base + 6, constant(8.0f));
+      f3(Vop3::v_mad_f32, face, vreg_operand(base + 5), vreg_operand(base + 6), vreg_operand(face));
+    }
     at += 3;
+  } else if (target == TgsiShader::kTarget1D) {
+    v_mov(at++, operand(i.src[0], 0));
+  } else if (target == TgsiShader::kTarget1DArray) {
+    v_mov(at++, operand(i.src[0], 0));
+    v_mov(at++, operand(i.src[0], 1));
   } else {
     v_mov(at++, operand(i.src[0], 0));
     v_mov(at++, operand(i.src[0], 1));

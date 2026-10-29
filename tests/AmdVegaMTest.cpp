@@ -3254,8 +3254,33 @@ static void test_back_end_on_card() {
     VegaDrawRequest bad_mip = mip;
     bad_mip.textures[0].texels = ConstByteView(mip_texels, 64 * 4);
     CHECK(AmdVegaDraw::area_bytes(bad_mip) == 0);
-    bad_mip = mip; bad_mip.textures[0].tile_index = 8;
-    CHECK(AmdVegaDraw::area_bytes(bad_mip) == 0);                // levels need the 1D tiled layout
+    bad_mip = mip; bad_mip.textures[0].tile_index = 11;
+    CHECK(AmdVegaDraw::area_bytes(bad_mip) == 0);                // a layout that is not implemented (PRT)
+  }
+  // dual source blending on the card: a second colour output (constant row 0 of the pixel shader), src + dst * (1 - src1 colour) over the cleared target
+  {
+    List<uint32_t> dual_ps(rig.alloc);
+    gcn::ShaderInfo dual_info;
+    CHECK(compile_gcn(rig.alloc, "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\nDCL OUT[1], COLOR[1]\nDCL CONST[0]\n  0: MOV OUT[0], IN[0]\n  1: MOV OUT[1], CONST[0]\n  2: END\n", dual_ps, &dual_info));
+    static const float src1[4] = {0.5f, 0.25f, 0.75f, 0.4f};
+    static const float cover[21] = {-1, -1, 0, 1, 0, 0, 0.25f, 3, -1, 0, 1, 0, 0, 0.25f, -1, 3, 0, 1, 0, 0, 0.25f};
+    VegaDrawRequest dr = tex;
+    dr.textures[0] = VegaTexture();
+    dr.pixel_code = ArrayView<const uint32_t>(dual_ps.view().data(), dual_ps.count());
+    dr.pixel_info = dual_info;
+    dr.pixel_constants = ArrayView<const float>(src1, 4);
+    dr.vertex_data = ArrayView<const uint32_t>(reinterpret_cast<const uint32_t*>(cover), 21);
+    dr.clear[0] = 0; dr.clear[1] = 0; dr.clear[2] = 1; dr.clear[3] = 1;
+    dr.blend.enable = true; dr.blend.color_src = 1; dr.blend.color_dst = 16;
+    CHECK(AmdVegaDraw::draw(vega, dr, 4096, ByteView(staging, AmdVegaDraw::area_bytes(dr)), ByteView(pixels, AmdVegaDraw::target_bytes(dr))));
+    float v[4];
+    memcpy(v, pixels + AmdVegaDraw::pixel_offset(dr, 5, 5), 16);
+    CHECK(v[0] == 1.0f && v[1] == 0.0f && v[2] == 0.25f && v[3] == 0.25f + 0.6f);
+    // the dual factors with a shader of one colour are not expressible
+    VegaDrawRequest one_colour = dr;
+    one_colour.pixel_code = req.pixel_code;
+    one_colour.pixel_info = req.pixel_info;
+    CHECK(!AmdVegaDraw::draw(vega, one_colour, 4096, ByteView(staging, AmdVegaDraw::area_bytes(one_colour)), ByteView(pixels, AmdVegaDraw::target_bytes(one_colour))));
   }
   // refused before anything is submitted: texels that are not the size of the texture, a texture in a layout that is not implemented, a plane layout the registers cannot name
   const uint32_t calls = draws;

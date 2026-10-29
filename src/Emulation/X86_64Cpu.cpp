@@ -67,6 +67,8 @@ void X86_64Cpu::reset(const process::ProgramStart& start) {
   fault_ = GuestFault();
   retired_ = 0;
   lwp_ = Lwp();
+  cet_ = Cet();
+  pasid_ = -1;
 }
 
 bool X86_64Cpu::pending_syscall(process::SyscallAbi abi, process::SyscallRequest* out) const {
@@ -867,6 +869,10 @@ X86_64Cpu::Step X86_64Cpu::step_op(GuestMemory& m, uint8_t op) {
       if (!finish_decode()) return bad_decode();
       uint64_t target = 0;
       if (!pop(m, &target)) return Step::Fault;
+      if (cet_.enabled && !cet_check_return(m, target)) {
+        s_.r[4] -= 8;
+        return Step::Fault;
+      }
       s_.r[4] += extra;
       s_.rip = target;
       return Step::Ok;
@@ -929,6 +935,11 @@ X86_64Cpu::Step X86_64Cpu::step_op(GuestMemory& m, uint8_t op) {
         s_.rip = instruction_start_;
         return Step::Fault;
       }
+      if (op == 0xE8 && cet_.enabled && !cet_push(m, s_.rip)) {
+        s_.r[4] += 8;
+        s_.rip = instruction_start_;
+        return Step::Fault;
+      }
       s_.rip += rel;
       return Step::Ok;
     }
@@ -972,6 +983,11 @@ X86_64Cpu::Step X86_64Cpu::step_group_f(GuestMemory& m, uint8_t op) {
     if (!read_rm(m, 8, &v)) return Step::Fault;
     s_.rip += d_.position;
     if (kind == 2 && !push(m, s_.rip)) {
+      s_.rip = instruction_start_;
+      return Step::Fault;
+    }
+    if (kind == 2 && cet_.enabled && !cet_push(m, s_.rip)) {
+      s_.r[4] += 8;
       s_.rip = instruction_start_;
       return Step::Fault;
     }
@@ -1082,6 +1098,9 @@ X86_64Cpu::Step X86_64Cpu::step_0f_op(GuestMemory& m, uint8_t op) {
       if (d_.truncated) return bad_decode();
       if ((second == 0xF0 || second == 0xF1) && d_.repne) return crc32_instruction(m, second);
       if (second == 0xF6 && (d_.operand16 || d_.rep) && !d_.repne) return adx_instruction(m, d_.rep);
+      if (second == 0xF6 && !d_.operand16 && !d_.rep && !d_.repne) return wrss_instruction(m, false);
+      if (second == 0xF5 && d_.operand16 && !d_.rep && !d_.repne) return wrss_instruction(m, true);
+      if (second == 0xF8 && (d_.rep != d_.repne)) return enqcmd_instruction(m, d_.rep);
       if (second == 0xFC && !(d_.rep && d_.repne)) return rao_instruction(m, d_.repne ? 2 : d_.rep ? 3 : d_.operand16 ? 1 : 0);
       if ((second == 0xF9 && !d_.operand16 && !d_.rep && !d_.repne) || (second == 0xF8 && d_.operand16 && !d_.rep && !d_.repne)) return direct_store(m, second);
       if (!d_.operand16 && !d_.rep && !d_.repne && second >= 0xC8 && second <= 0xCD) return crypto_map(m, 2, second, false, 0);      // the SHA extensions
@@ -1137,6 +1156,7 @@ X86_64Cpu::Step X86_64Cpu::step_0f_op(GuestMemory& m, uint8_t op) {
       return fail(6);
     case 0x0D: case 0x18: case 0x19: case 0x1A: case 0x1B: case 0x1C: case 0x1D: case 0x1E: case 0x1F:      // prefetch, multi-byte nop
       if (!decode_modrm() || !finish_decode()) return bad_decode();
+      if (op == 0x1E && d_.rep && d_.mod == 3 && (d_.reg & 7) == 1) return rdssp_instruction();      // rdsspd / rdsspq
       advance();
       return Step::Ok;
     case 0x31:      // rdtsc: the instruction count stands in for a clock
@@ -1163,7 +1183,7 @@ X86_64Cpu::Step X86_64Cpu::step_0f_op(GuestMemory& m, uint8_t op) {
         dx = (1u << 4) | (1u << 5) | (1u << 8) | (1u << 10) | (1u << 19) | (1u << 21);      // AVX-VNNI-INT8, AVX-NE-CONVERT, AVX-VNNI-INT16, APX_F, AVX10
       } else if (leaf == 7 && static_cast<uint32_t>(s_.r[1]) == 0) {
         b = (1u << 0) | (1u << 3) | (1u << 5) | (1u << 8) | (1u << 18) | (1u << 19) | (1u << 23) | (1u << 24) | (1u << 26) | (1u << 27) | (1u << 29) | (1u << 16) | (1u << 17) | (1u << 21) | (1u << 28) | (1u << 30) | (1u << 31);      // BMI1, AVX2, BMI2, SHA, AVX512F, DQ, IFMA, CD, BW, VL
-        c = (1u << 1) | (1u << 6) | (1u << 8) | (1u << 9) | (1u << 10) | (1u << 11) | (1u << 12) | (1u << 14) | (1u << 22) | (1u << 27) | (1u << 28);      // VBMI, VBMI2, GFNI, VAES, VPCLMULQDQ, VNNI, BITALG, VPOPCNTDQ, RDPID, MOVDIRI, MOVDIR64B
+        c = (1u << 1) | (1u << 6) | (1u << 8) | (1u << 9) | (1u << 10) | (1u << 11) | (1u << 12) | (1u << 14) | (1u << 22) | (1u << 27) | (1u << 28) | (1u << 29);      // VBMI, VBMI2, GFNI, VAES, VPCLMULQDQ, VNNI, BITALG, VPOPCNTDQ, RDPID, MOVDIRI, MOVDIR64B, ENQCMD
         dx = (1u << 2) | (1u << 3) | (1u << 8) | (1u << 11) | (1u << 22) | (1u << 23) | (1u << 24) | (1u << 25);      // AVX512_4VNNIW, AVX512_4FMAPS, AVX512_VP2INTERSECT, RTM_ALWAYS_ABORT, AMX-BF16, AVX512_FP16, AMX-TILE, AMX-INT8
       } else if (leaf == 0xD) {
         const uint32_t sub = static_cast<uint32_t>(s_.r[1]);
@@ -1392,6 +1412,7 @@ X86_64Cpu::Step X86_64Cpu::step_0f_op(GuestMemory& m, uint8_t op) {
       const uint32_t kind = d_.reg & 7;
       if (d_.mod == 3) {
         if (kind < 4 && d_.rep) return fsgsbase_instruction(m);
+        if (kind == 5 && d_.rep) return incssp_instruction(m);      // incsspd / incsspq
         if (kind < 5) return fail(6);
       } else if (kind == 0 || kind == 1) {      // fxsave, fxrstor (the 16-byte alignment is not enforced)
         uint8_t image[512];

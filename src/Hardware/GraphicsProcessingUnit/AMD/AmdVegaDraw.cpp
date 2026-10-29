@@ -48,8 +48,8 @@ ImageDescriptor image_of(const VegaTexture& t, uint64_t address) {
   image.type = t.type;
   image.depth = t.depth;
   image.levels = t.levels;
-  const bool chain = t.levels > 1 || t.type != ImageType::Image2D;
-  image.pitch_pixels = chain ? image_pitch(t.width, t.levels)
+  const bool chain = !(t.levels == 1 && t.depth == 1 && (t.type == ImageType::Image2D || t.type == ImageType::Image1D));
+  image.pitch_pixels = chain ? image_pitch(t.width, t.height, t.levels, texel_bytes(t.format), t.tile_index)
                              : (layout_of(t.tile_index, &layout) ? static_cast<uint32_t>(align_to(t.width, surface_pitch_align(layout, texel_bytes(t.format)))) : 0);
   return image;
 }
@@ -114,7 +114,7 @@ bool make_plan(const VegaDrawRequest& r, Plan* p) {
     if (!bound(r.textures[i])) continue;
     TileLayout tl;
     layout_of(r.textures[i].tile_index, &tl);
-    p->textures[i] = place(image_bytes(image_of(r.textures[i], 0)), surface_base_align(tl, texel_bytes(r.textures[i].format)));
+    p->textures[i] = place(image_bytes(image_of(r.textures[i], 0)), image_base_align(image_of(r.textures[i], 0)));
   }
   p->total = at;
   return at <= (1ull << 31);

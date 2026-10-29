@@ -661,7 +661,7 @@ static ImageDescriptor tex_image(const BigTexMem& m, uint32_t w, uint32_t h, uin
   d.address = m.base;
   d.width = w;
   d.height = h;
-  d.pitch_pixels = image_pitch(w, levels);
+  d.pitch_pixels = image_pitch(w, h, levels, 4, 9);
   d.tile_index = 9;
   d.levels = levels;
   d.type = type;
@@ -745,6 +745,102 @@ static void test_more_textures() {
   }
 }
 
+// Dual source blending: the pixel shader exports its colour and a second one (a constant here), and the factors name the second as a source
+static void test_dual_source() {
+  Fixture f;
+  Compiled dual(f.alloc);
+  compile(f.alloc, "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\nDCL OUT[1], COLOR[1]\nDCL CONST[0]\n  0: MOV OUT[0], IN[0]\n  1: MOV OUT[1], CONST[0]\n  2: END\n", &dual);
+  CHECK(dual.ok && dual.info.color_outputs == 2 && f.fs.info.color_outputs == 1);
+  if (!dual.ok) return;
+  const float src[4] = {1, 0, 0, 0.25f}, second[4] = {0.5f, 0.25f, 0.75f, 0.4f};
+  Layers one(0.0f, src, 0.0f, src);
+  Framebuffer fb(f.alloc, 16, 16);
+  auto run = [&](const BlendState& b, uint32_t tris, float r, float g, float bl, float a) {
+    fb.clear(0, 0, 1, 1);
+    DrawCall c = make_call(f, dual, kIdentity, as_words(one.v), 42, 28, 4, one.idx, tris * 3);
+    c.pixel_constants = ArrayView<const float>(second, 4);
+    c.blend = b;
+    const DrawStatus st = draw(f.alloc, c, fb);
+    return st == DrawStatus::Ok && is_color(fb, 8, 8, r, g, bl, a) && is_color(fb, 0, 0, r, g, bl, a);
+  };
+  BlendState b;
+  b.enable = true;
+  b.color_src = 1; b.color_dst = 16;                      // src + dst * (1 - src1 colour)
+  CHECK(run(b, 1, 1, 0, 0.25f, 0.25f + 0.6f));
+  b.color_src = 15; b.color_dst = 0;                      // src * src1 colour
+  CHECK(run(b, 1, 0.5f, 0, 0, 0.25f * 0.4f));
+  b.color_src = 17; b.color_dst = 18;                     // src * src1 alpha + dst * (1 - src1 alpha)
+  CHECK(run(b, 1, 0.4f, 0, 0.6f, 0.25f * 0.4f + 0.6f));
+  b.color_src = 15; b.color_dst = 16;                     // src * src1 + dst * (1 - src1)
+  CHECK(run(b, 1, 0.5f, 0, 0.25f, 0.25f * 0.4f + 0.6f));
+  b.separate_alpha = true; b.alpha_src = 1; b.alpha_dst = 0;     // the alpha its own
+  CHECK(run(b, 1, 0.5f, 0, 0.25f, 0.25f));
+  BlendState mix = b;                                      // the first source alone, with the second only named by the alpha factors
+  mix.color_src = 1; mix.color_dst = 0; mix.alpha_src = 17; mix.alpha_dst = 0;
+  CHECK(run(mix, 1, 1, 0, 0, 0.25f * 0.4f));
+  // two layers: the second sees the first's result
+  b.separate_alpha = false;
+  b.color_src = 1; b.color_dst = 16;
+  CHECK(run(b, 2, 1.5f, 0, 0.25f * 0.25f, 0.25f + (0.25f + 0.6f) * 0.6f));
+  // factors that are not dual source work with the dual shader as before (the second export is ignored)
+  BlendState plain;
+  plain.enable = true; plain.color_src = 4; plain.color_dst = 5;
+  CHECK(run(plain, 1, 0.25f, 0, 0.75f, 0.25f * 0.25f + 0.75f));
+  // refused: dual source factors with a shader that exports one colour
+  fb.clear(0, 0, 1, 1);
+  DrawCall c = make_call(f, f.fs, kIdentity, as_words(one.v), 42, 28, 4, one.idx, 3);
+  c.blend = b;
+  CHECK(draw(f.alloc, c, fb) == DrawStatus::BadInput);
+}
+
+// 1D images, arrays of them and cube arrays through compiled shaders
+static void test_one_d_and_cube_array() {
+  Fixture f;
+  Compiled one(f.alloc), one_lod(f.alloc), one_arr(f.alloc), cube_arr(f.alloc);
+  compile(f.alloc, sampling_fragment("TEX", "1D").c_str(), &one);
+  compile(f.alloc, sampling_fragment("TXL", "1D").c_str(), &one_lod);
+  compile(f.alloc, sampling_fragment("TEX", "1D_ARRAY").c_str(), &one_arr);
+  compile(f.alloc, sampling_fragment("TEX", "CUBE_ARRAY").c_str(), &cube_arr);
+  CHECK(one.ok && one_lod.ok && one_arr.ok && cube_arr.ok);
+  if (!(one.ok && one_lod.ok && one_arr.ok && cube_arr.ok)) return;
+  // a cube array cannot take a bias or lod
+  {
+    Compiled bad(f.alloc);
+    compile(f.alloc, sampling_fragment("TXL", "CUBE_ARRAY").c_str(), &bad);
+    CHECK(!bad.ok);
+  }
+  auto near_to = [](float a, float want) { return a > want - 0.6f && a < want + 0.6f; };
+  {
+    BigTexMem m;
+    ImageDescriptor d = tex_image(m, 8, 1, 2, ImageType::Image1D, 1);
+    d.pitch_pixels = image_pitch(8, 1, 2, 4, 9);
+    for (uint32_t k = 0; k < 2; ++k) fill_slice_level(m, d, k, 0, static_cast<uint8_t>(70 * (k + 1)));
+    SamplerDescriptor s;
+    s.mip_filter = 1;
+    const float a[4] = {0.5f, 0.9f, 0, 1.0f}, b[4] = {0.5f, 0.1f, 0, 0.0f};
+    CHECK(near_to(draw_sampled(f, one_lod, m, d, s, a), 140) && near_to(draw_sampled(f, one_lod, m, d, s, b), 70));
+    CHECK(near_to(draw_sampled(f, one, m, d, s, a), 70));
+  }
+  {
+    BigTexMem m;
+    ImageDescriptor d = tex_image(m, 8, 1, 1, ImageType::Array1D, 3);
+    d.pitch_pixels = image_pitch(8, 1, 1, 4, 9);
+    for (uint32_t z = 0; z < 3; ++z) fill_slice_level(m, d, 0, z, static_cast<uint8_t>(50 * z));
+    SamplerDescriptor s;
+    const float l0[4] = {0.5f, 0.0f, 0, 0}, l2[4] = {0.5f, 2.0f, 0, 0}, l1[4] = {0.5f, 0.8f, 0, 0};
+    CHECK(near_to(draw_sampled(f, one_arr, m, d, s, l0), 0) && near_to(draw_sampled(f, one_arr, m, d, s, l2), 100) && near_to(draw_sampled(f, one_arr, m, d, s, l1), 50));
+  }
+  {
+    BigTexMem m;
+    ImageDescriptor d = tex_image(m, 4, 4, 1, ImageType::Cube, 12);
+    for (uint32_t z = 0; z < 12; ++z) fill_slice_level(m, d, 0, z, static_cast<uint8_t>(10 * z));
+    SamplerDescriptor s;
+    // +x of layer 0 (slice 0), -y of layer 1 (face 3: slice 9), +z of layer 1 (face 4: slice 10)
+    const float a[4] = {1, 0.1f, 0, 0}, b[4] = {0.2f, -1, 0.1f, 1}, c[4] = {0.1f, 0.1f, 1, 1};
+    CHECK(near_to(draw_sampled(f, cube_arr, m, d, s, a), 0) && near_to(draw_sampled(f, cube_arr, m, d, s, b), 90) && near_to(draw_sampled(f, cube_arr, m, d, s, c), 100));
+  }
+}
+
 int main() {
   Fixture f;
   if (!f.vs.ok || !f.fs.ok || !f.tfs.ok || !f.kfs.ok) { printf("FAILED: the shaders did not compile\n"); return 1; }
@@ -760,6 +856,8 @@ int main() {
   test_descriptor_textures(f);
   test_faces_and_bounds(f);
   test_more_textures();
+  test_dual_source();
+  test_one_d_and_cube_array();
   printf(g_failed ? "GcnDrawTest: %d FAILED\n" : "GcnDrawTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }

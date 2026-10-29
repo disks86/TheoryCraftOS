@@ -87,7 +87,7 @@ uint8_t stencil_update(const StencilFace& d, uint32_t op, uint8_t old) {
 bool factor_ok(uint32_t f) { return BlendState::supported_factor(f); }
 
 // the blend factor of channel `ch` (3 is alpha)
-float blend_factor(uint32_t f, const float s[4], const float d[4], const float c[4], uint32_t ch) {
+float blend_factor(uint32_t f, const float s[4], const float d[4], const float c[4], const float s1[4], uint32_t ch) {
   switch (f) {
     case 0: return 0.0f;
     case 1: return 1.0f;
@@ -102,6 +102,10 @@ float blend_factor(uint32_t f, const float s[4], const float d[4], const float c
     case 10: return ch == 3 ? 1.0f : (s[3] < 1.0f - d[3] ? s[3] : 1.0f - d[3]);
     case 13: return c[ch];
     case 14: return 1.0f - c[ch];
+    case 15: return s1[ch];
+    case 16: return 1.0f - s1[ch];
+    case 17: return s1[3];
+    case 18: return 1.0f - s1[3];
     case 19: return c[3];
     case 20: return 1.0f - c[3];
     default: return 0.0f;
@@ -148,7 +152,33 @@ class Machine final : public IEnvironment {
   ITexelMemory* texel_memory_ = nullptr;
   const BlendState* blend_ = nullptr;
   uint64_t exported_ = 0;                  // the lanes of the pixel wave that wrote a colour
+  float src0_[kWaveSize][4] = {};          // the colours the wave exported (COLOR[0], and COLOR[1] as the second source)
+  float src1_[kWaveSize][4] = {};
+  uint32_t enable0_ = 0;
   bool fault_ = false;
+
+  // blends and writes the colours of the lanes that exported one (after the wave)
+  void resolve(uint32_t count) {
+    const BlendState& b = *blend_;
+    for (uint32_t lane = 0; lane < count; ++lane) {
+      if (!(exported_ >> lane & 1)) continue;
+      float* px = target_->pixel(pixel_x_[lane], pixel_y_[lane]);
+      if (!px) continue;
+      float src[4] = {src0_[lane][0], src0_[lane][1], src0_[lane][2], src0_[lane][3]};
+      if (b.enable) {
+        const float dst[4] = {px[0], px[1], px[2], px[3]};
+        float out[4];
+        for (uint32_t c = 0; c < 4; ++c) {
+          const bool alpha = c == 3 && b.separate_alpha;
+          const uint32_t sf = alpha ? b.alpha_src : b.color_src, df = alpha ? b.alpha_dst : b.color_dst, op = alpha ? b.alpha_op : b.color_op;
+          out[c] = blend_combine(op, src[c], blend_factor(sf, src, dst, b.constant, src1_[lane], c), dst[c], blend_factor(df, src, dst, b.constant, src1_[lane], c));
+        }
+        for (uint32_t c = 0; c < 4; ++c) src[c] = out[c];
+      }
+      for (uint32_t c = 0; c < 4; ++c)
+        if ((enable0_ >> c & 1) && (b.write_mask >> c & 1)) px[c] = src[c];
+    }
+  }
 
   Region* find(uint64_t address) {
     Region* all[4] = {&vertex_const_, &pixel_const_, &table_, &vertices_};
@@ -181,7 +211,7 @@ class Machine final : public IEnvironment {
     result[0] = result[1] = result[2] = result[3] = 0.0f;
     // the address registers: the bias (image_sample_b), the coordinates of the image's type, the level of detail (image_sample_l)
     const uint32_t type = image[3] >> 28;
-    const uint32_t dims = type == 10 || type == 11 || type == 13 ? 3 : 2;
+    const uint32_t dims = type == 10 || type == 11 || type == 13 ? 3 : type == 8 ? 1 : 2;       // 1D: 1, 1D array: 2 (its layer), 2D: 2, 3D, cube and 2D array: 3
     SampleRequest r;
     uint32_t at = 0;
     if (op == Mimg::image_sample_b && at < count) r.bias = coords[at++];
@@ -203,28 +233,17 @@ class Machine final : public IEnvironment {
   void export_data(uint32_t target, uint32_t enable, bool compressed, const uint32_t values[kWaveSize][4], uint64_t lanes, bool) override {
     if (compressed) return;
     if (pixel_stage_) {
-      if (target != kExpMrt0) return;
+      // the colours wait for the end of the wave: the blend needs both when the shader exports a second one
+      if (target != kExpMrt0 && target != kExpMrt0 + 1) return;
+      const bool second = target != kExpMrt0;
       for (uint32_t lane = 0; lane < kWaveSize; ++lane) {
         if (!(lanes >> lane & 1)) continue;
-        float* px = target_->pixel(pixel_x_[lane], pixel_y_[lane]);
-        if (!px) continue;
-        exported_ |= uint64_t{1} << lane;
-        float src[4];
-        for (uint32_t c = 0; c < 4; ++c) src[c] = enable >> c & 1 ? bits_to_float(values[lane][c]) : 0.0f;
-        const BlendState& b = *blend_;
-        if (b.enable) {
-          const float dst[4] = {px[0], px[1], px[2], px[3]};
-          float out[4];
-          for (uint32_t c = 0; c < 4; ++c) {
-            const bool alpha = c == 3 && b.separate_alpha;
-            const uint32_t sf = alpha ? b.alpha_src : b.color_src, df = alpha ? b.alpha_dst : b.color_dst, op = alpha ? b.alpha_op : b.color_op;
-            out[c] = blend_combine(op, src[c], blend_factor(sf, src, dst, b.constant, c), dst[c], blend_factor(df, src, dst, b.constant, c));
-          }
-          for (uint32_t c = 0; c < 4; ++c) src[c] = out[c];
-        }
-        for (uint32_t c = 0; c < 4; ++c)
-          if ((enable >> c & 1) && (b.write_mask >> c & 1)) px[c] = src[c];
+        if (!second && !target_->pixel(pixel_x_[lane], pixel_y_[lane])) continue;
+        if (!second) exported_ |= uint64_t{1} << lane;
+        float* dst = second ? src1_[lane] : src0_[lane];
+        for (uint32_t c = 0; c < 4; ++c) dst[c] = enable >> c & 1 ? bits_to_float(values[lane][c]) : 0.0f;
       }
+      if (!second) enable0_ = enable;
       return;
     }
     float* out = nullptr;
@@ -291,6 +310,7 @@ DrawStatus draw(allocators::IAllocator& allocator, const DrawCall& call, Framebu
   const BlendState& bl = call.blend;
   const DepthStencilState& ds = call.depth_stencil;
   const bool depth_used = ds.depth_test || ds.depth_write || ds.stencil_test || ds.depth_bounds;
+  if (bl.uses_second_source() && call.pixel_info.color_outputs < 2) return DrawStatus::BadInput;           // (dual source factors need the shader's second colour)
   if (!factor_ok(bl.color_src) || !factor_ok(bl.color_dst) || !factor_ok(bl.alpha_src) || !factor_ok(bl.alpha_dst) || bl.color_op > 4 || bl.alpha_op > 4 || (bl.write_mask & ~0xFu) != 0)
     return DrawStatus::BadInput;
   const StencilFace& bk = ds.back;
@@ -398,6 +418,7 @@ DrawStatus draw(allocators::IAllocator& allocator, const DrawCall& call, Framebu
     }
     m.exported_ = 0;
     const bool ok = w.run(call.pixel_code, m) == Status::Done && !m.fault_;
+    if (ok) m.resolve(pending);
     // the pixels that wrote a colour pass: the stencil operation for passing and the depth
     for (uint32_t l = 0; l < pending; ++l) {
       if (!(m.exported_ >> l & 1)) continue;

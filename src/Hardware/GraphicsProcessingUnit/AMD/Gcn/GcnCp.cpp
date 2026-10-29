@@ -167,10 +167,13 @@ CommandProcessorModel::Result CommandProcessorModel::draw(bool indexed, const Pm
   const uint32_t color_control = context_reg(mmCB_COLOR_CONTROL);
   if (field(color_control, CB_COLOR_CONTROL__MODE_MASK, CB_COLOR_CONTROL__MODE__SHIFT) != kCB_NORMAL || field(color_control, CB_COLOR_CONTROL__ROP3_MASK, CB_COLOR_CONTROL__ROP3__SHIFT) != 0xCC)
     return R::Unsupported;
-  if (context_reg(mmCB_SHADER_MASK) != 0xF || (context_reg(mmCB_TARGET_MASK) & ~0xFu) != 0) return R::Unsupported;
+  // one colour (shader mask 0xF) or two, the second the source of dual source blending (0xFF); only target 0 is written
+  const bool dual = context_reg(mmCB_SHADER_MASK) == 0xFF;
+  if ((context_reg(mmCB_SHADER_MASK) != 0xF && !dual) || (context_reg(mmCB_TARGET_MASK) & ~0xFu) != 0) return R::Unsupported;
   if (context_reg(mmSPI_PS_INPUT_ENA) != abi::kPsInputEnablePerspCenter || context_reg(mmSPI_PS_INPUT_ADDR) != abi::kPsInputEnablePerspCenter) return R::Unsupported;
   if (field(context_reg(mmSPI_SHADER_POS_FORMAT), SPI_SHADER_POS_FORMAT__POS0_EXPORT_FORMAT_MASK, SPI_SHADER_POS_FORMAT__POS0_EXPORT_FORMAT__SHIFT) != kSPI_SHADER_4COMP ||
-      field(context_reg(mmSPI_SHADER_COL_FORMAT), SPI_SHADER_COL_FORMAT__COL0_EXPORT_FORMAT_MASK, SPI_SHADER_COL_FORMAT__COL0_EXPORT_FORMAT__SHIFT) != kSPI_SHADER_32_ABGR)
+      field(context_reg(mmSPI_SHADER_COL_FORMAT), SPI_SHADER_COL_FORMAT__COL0_EXPORT_FORMAT_MASK, SPI_SHADER_COL_FORMAT__COL0_EXPORT_FORMAT__SHIFT) != kSPI_SHADER_32_ABGR ||
+      field(context_reg(mmSPI_SHADER_COL_FORMAT), SPI_SHADER_COL_FORMAT__COL1_EXPORT_FORMAT_MASK, SPI_SHADER_COL_FORMAT__COL1_EXPORT_FORMAT__SHIFT) != (dual ? kSPI_SHADER_32_ABGR : 0u))
     return R::Unsupported;
 
   DrawCall call;
@@ -196,6 +199,7 @@ CommandProcessorModel::Result CommandProcessorModel::draw(bool indexed, const Pm
         !BlendState::supported_factor(blend.alpha_dst) || blend.color_op > 4 || blend.alpha_op > 4)
       return R::Unsupported;
     for (uint32_t c = 0; c < 4; ++c) blend.constant[c] = bits_float(context_reg(mmCB_BLEND_RED + c));
+    if (blend.uses_second_source() && !dual) return R::Unsupported;                        // (the shader exports no second colour)
   }
 
   // depth and stencil
@@ -266,6 +270,7 @@ CommandProcessorModel::Result CommandProcessorModel::draw(bool indexed, const Pm
   call.vertex_info.fragment = false;
   call.vertex_info.param_exports = field(context_reg(mmSPI_VS_OUT_CONFIG), SPI_VS_OUT_CONFIG__VS_EXPORT_COUNT_MASK, SPI_VS_OUT_CONFIG__VS_EXPORT_COUNT__SHIFT) + 1;
   call.pixel_info.fragment = true;
+  call.pixel_info.color_outputs = dual ? 2 : 1;
   call.pixel_info.ps_inputs = field(context_reg(mmSPI_PS_IN_CONTROL), SPI_PS_IN_CONTROL__NUM_INTERP_MASK, SPI_PS_IN_CONTROL__NUM_INTERP__SHIFT);
   if (call.pixel_info.ps_inputs > 16) return R::Unsupported;
   for (uint32_t k = 0; k < call.pixel_info.ps_inputs; ++k) {
