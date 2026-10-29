@@ -21,14 +21,15 @@
 // the pixel shader's v_interp instructions), and the pixel shader runs 64 covered pixels to a wave. The shaders see the OS's own ABI (GcnCompiler.hpp): the constants, a table
 // of buffer / image / sampler descriptors and the vertex buffer live in a small flat GPU address space of the harness.
 //
-// The back end is modelled too: blending of the colour into the target (the factors and functions of CB_BLEND0_CONTROL, a constant colour, a write mask), a depth buffer (32 bit
+// The back end is modelled too: blending of the colour into the target (the factors and functions of CB_BLEND0_CONTROL, a constant colour, a write mask, and with a second pixel shader
+// colour output the dual source factors), a depth buffer (32 bit
 // float, the test functions of DB_DEPTH_CONTROL) and an 8 bit stencil with the test, the three operations and the masks of DB_STENCIL_CONTROL / DB_STENCILREFMASK. Pixels are tested
 // before the pixel shader runs (the stencil test, then the depth test, each with its fail operation) and the depth and the stencil pass operation are written for the pixels that
 // exported a colour, so a pixel the shader discards changes neither. Triangles are drawn in order, so blending and the tests see the earlier triangles' pixels. Textures come
 // either from an ITextureSource by unit (the shader's T# is then a unit number) or from real T# / S# descriptors read through `texel_memory` (GcnTexture.hpp).
 //
-// Not done: clipping against the frustum (a triangle with a vertex at w <= 0 is dropped; a pixel whose depth is outside 0 to 1 is not drawn), dual
-// source blending, logic ops, flat interpolation, 2x2 quads (nothing here takes derivatives), and the pixel shader's input k reads the vertex shader's parameter `ps_param[k]`
+// Not done: clipping against the frustum (a triangle with a vertex at w <= 0 is dropped; a pixel whose depth is outside 0 to 1 is not drawn), logic
+// ops (a float target has none), flat interpolation, 2x2 quads (nothing here takes derivatives), and the pixel shader's input k reads the vertex shader's parameter `ps_param[k]`
 // (SPI_PS_INPUT_CNTL_k.OFFSET; the parameter of the same number by default).
 #pragma once
 
@@ -93,13 +94,16 @@ class DepthBuffer {
 struct BlendState {
   bool enable = false;
   uint8_t color_src = 1, color_dst = 0, color_op = 0;           // factors: 0 zero, 1 one, 2 src colour, 3 1 - src colour, 4 src alpha, 5 1 - src alpha, 6 dst alpha, 7 1 - dst alpha,
-                                                                 // 8 dst colour, 9 1 - dst colour, 10 src alpha saturate, 13 constant colour, 14 1 - constant colour,
+                                                                 // 8 dst colour, 9 1 - dst colour, 10 src alpha saturate, 13 constant colour, 14 1 - constant colour, 15 src1 colour, 16 1 - src1 colour,
+                                                                 // 17 src1 alpha, 18 1 - src1 alpha (dual source: the pixel shader's second colour output),
                                                                  // 19 constant alpha, 20 1 - constant alpha; operations: 0 src + dst, 1 src - dst, 2 min, 3 max, 4 dst - src
   bool separate_alpha = false;                                  // else the alpha uses the colour's factors and operation
   uint8_t alpha_src = 1, alpha_dst = 0, alpha_op = 0;
   float constant[4] = {0, 0, 0, 0};                             // CB_BLEND_RED .. ALPHA
   uint8_t write_mask = 0xF;                                     // the colour channels written (CB_TARGET_MASK for target 0): bit 0 red .. bit 3 alpha
-  static bool supported_factor(uint32_t f) { return f <= 10 || f == 13 || f == 14 || f == 19 || f == 20; }
+  static bool supported_factor(uint32_t f) { return f <= 10 || f == 13 || f == 14 || (f >= 15 && f <= 20); }
+  static bool is_dual_source_factor(uint32_t f) { return f >= 15 && f <= 18; }
+  bool uses_second_source() const { return enable && (is_dual_source_factor(color_src) || is_dual_source_factor(color_dst) || (separate_alpha && (is_dual_source_factor(alpha_src) || is_dual_source_factor(alpha_dst)))); }
 };
 
 struct StencilFace {

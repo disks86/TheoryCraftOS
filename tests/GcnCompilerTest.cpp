@@ -392,7 +392,9 @@ static void test_refusals() {
       {"kill in vertex shader", "VERT\nDCL IN[0]\nDCL OUT[0], POSITION\n  0: KILL\n  1: MOV OUT[0], IN[0]\n  2: END\n", "discard"},
       {"unbalanced if", "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\n  0: IF IN[0].xxxx\n  1: MOV OUT[0], IN[0]\n  2: END\n", "ENDIF"},
       {"too deep", "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\n  0: IF IN[0].xxxx\n  1: IF IN[0].xxxx\n  2: IF IN[0].xxxx\n  3: IF IN[0].xxxx\n  4: IF IN[0].xxxx\n  5: IF IN[0].xxxx\n  6: IF IN[0].xxxx\n  7: IF IN[0].xxxx\n  8: IF IN[0].xxxx\n  9: MOV OUT[0], IN[0]\n  10: ENDIF\n  11: ENDIF\n  12: ENDIF\n  13: ENDIF\n  14: ENDIF\n  15: ENDIF\n  16: ENDIF\n  17: ENDIF\n  18: ENDIF\n  19: END\n", "deeply"},
-      {"two colours", "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\nDCL OUT[1], COLOR[1]\n  0: MOV OUT[0], IN[0]\n  1: MOV OUT[1], IN[0]\n  2: END\n", "one colour"},
+      {"three colours", "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\nDCL OUT[1], COLOR[1]\nDCL OUT[2], COLOR[2]\n  0: MOV OUT[0], IN[0]\n  1: MOV OUT[1], IN[0]\n  2: MOV OUT[2], IN[0]\n  3: END\n", "two colour"},
+      {"the same colour twice", "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\nDCL OUT[1], COLOR\n  0: MOV OUT[0], IN[0]\n  1: MOV OUT[1], IN[0]\n  2: END\n", "two colour"},
+      {"only the second colour", "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR[1]\n  0: MOV OUT[0], IN[0]\n  1: END\n", "COLOR[1]"},
   };
   TestAllocator alloc;
   for (const Case& c : cases) {
@@ -405,9 +407,31 @@ static void test_refusals() {
     const bool ok = compile_tgsi(sh, code, &info, &error);
     if (ok || !error || !strstr(error, c.error_part)) { printf("FAILED %s: %s\n", c.name, ok ? "compiled" : error); ++g_failed; }
   }
+  // two colour outputs: both exported (mrt0 then mrt1), the second declared first or last
+  for (int order = 0; order < 2; ++order) {
+    TgsiShader sh(alloc);
+    const char* error = nullptr;
+    uint32_t line = 0;
+    const char* texts[2] = {"FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\nDCL OUT[1], COLOR[1]\n  0: MOV OUT[0], IN[0]\n  1: ADD OUT[1], IN[0], IN[0]\n  2: END\n",
+                            "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR[1]\nDCL OUT[1], COLOR\n  0: ADD OUT[0], IN[0], IN[0]\n  1: MOV OUT[1], IN[0]\n  2: END\n"};
+    Code code(alloc);
+    ShaderInfo info;
+    CHECK(parse_tgsi(alloc, StringView(texts[order]), &sh, &error, &line) && compile_tgsi(sh, code, &info, &error) && info.color_outputs == 2);
+  }
+  // the targets of sampler views are kept
+  {
+    TgsiShader sh(alloc);
+    const char* error = nullptr;
+    uint32_t line = 0;
+    const char* text = "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\nDCL SAMP[0..2]\nDCL SVIEW[0], CUBE, FLOAT\nDCL SVIEW[1], 3D, FLOAT\nDCL SVIEW[2], 2D_ARRAY, FLOAT\n  0: TEX OUT[0], IN[0], SAMP[1], 3D\n  1: END\n";
+    CHECK(parse_tgsi(alloc, StringView(text), &sh, &error, &line) && sh.sampler_target[0] == TgsiShader::kTargetCube && sh.sampler_target[1] == TgsiShader::kTarget3D &&
+          sh.sampler_target[2] == TgsiShader::kTarget2DArray);
+  }
   // the parser's refusals
   const char* bad[] = {"", "VERT\n", "FRAG\nDCL OUT[0], COLOR\n  0: FOO OUT[0], IN[0]\n  1: END\n", "FRAG\n  0: MOV OUT[0], IN[0]\n  1: END\n  2: MOV OUT[0], IN[0]\n", "FRAG\nDCL IN[0]\n  0: MOV OUT[0] IN[0]\n  1: END\n",
-                       "FRAG\nDCL OUT[0], COLOR\n  0: MOV OUT[0], CONST[\n  1: END\n", "FRAG\nIMM[1] FLT32 {1, 2, 3, 4}\n  0: END\n", "GEOM\n", "FRAG\nDCL TEMP[0..999]\n  0: END\n"};
+                       "FRAG\nDCL OUT[0], COLOR\n  0: MOV OUT[0], CONST[\n  1: END\n", "FRAG\nIMM[1] FLT32 {1, 2, 3, 4}\n  0: END\n", "GEOM\n", "FRAG\nDCL TEMP[0..999]\n  0: END\n",
+                       "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\nDCL SAMP[0]\nDCL SVIEW[0], 1D, FLOAT\n  0: TEX OUT[0], IN[0], SAMP[0], 1D\n  1: END\n",                  // a target there is not
+                       "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\nDCL SAMP[0]\nDCL SVIEW[0], CUBE, FLOAT\n  0: TEX OUT[0], IN[0], SAMP[0], 2D\n  1: END\n"};   // not the declared one
   for (const char* t : bad) {
     TgsiShader sh(alloc);
     const char* error = nullptr;

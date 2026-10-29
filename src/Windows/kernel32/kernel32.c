@@ -1241,11 +1241,10 @@ EXPORT HANDLE WINAPI CreateEventA(LPSECURITY_ATTRIBUTES sa, BOOL manual, BOOL in
 EXPORT HANDLE WINAPI CreateEventExW(LPSECURITY_ATTRIBUTES sa, LPCWSTR name, DWORD flags, DWORD access) { (void)access; return CreateEventW(sa, (flags & 1) ? TRUE : FALSE, (flags & 2) ? TRUE : FALSE, name); }
 EXPORT HANDLE WINAPI CreateEventExA(LPSECURITY_ATTRIBUTES sa, LPCSTR name, DWORD flags, DWORD access) { (void)access; return CreateEventA(sa, (flags & 1) ? TRUE : FALSE, (flags & 2) ? TRUE : FALSE, name); }
 EXPORT HANDLE WINAPI OpenEventW(DWORD access, BOOL inherit, LPCWSTR name) {
-  (void)access;
   NamedAttributes n;
   const BOOL inherit_handle = inherit;
   HANDLE h = NULL;
-  { const NTSTATUS status = NtOpenEvent(&h, 0x1F0003, named_attributes(&n, name, inherit_handle)); return opened(status, h); }
+  { const NTSTATUS status = NtOpenEvent(&h, access, named_attributes(&n, name, inherit_handle)); return opened(status, h); }
 }
 EXPORT HANDLE WINAPI OpenEventA(DWORD access, BOOL inherit, LPCSTR name) {
   WCHAR *w = name ? to_wide(name) : NULL;
@@ -1272,11 +1271,10 @@ EXPORT HANDLE WINAPI CreateMutexA(LPSECURITY_ATTRIBUTES sa, BOOL owned, LPCSTR n
 EXPORT HANDLE WINAPI CreateMutexExW(LPSECURITY_ATTRIBUTES sa, LPCWSTR name, DWORD flags, DWORD access) { (void)access; return CreateMutexW(sa, (flags & 1) ? TRUE : FALSE, name); }
 EXPORT HANDLE WINAPI CreateMutexExA(LPSECURITY_ATTRIBUTES sa, LPCSTR name, DWORD flags, DWORD access) { (void)access; return CreateMutexA(sa, (flags & 1) ? TRUE : FALSE, name); }
 EXPORT HANDLE WINAPI OpenMutexW(DWORD access, BOOL inherit, LPCWSTR name) {
-  (void)access;
   NamedAttributes n;
   const BOOL inherit_handle = inherit;
   HANDLE h = NULL;
-  { const NTSTATUS status = NtOpenMutant(&h, 0x1F0001, named_attributes(&n, name, inherit_handle)); return opened(status, h); }
+  { const NTSTATUS status = NtOpenMutant(&h, access, named_attributes(&n, name, inherit_handle)); return opened(status, h); }
 }
 EXPORT HANDLE WINAPI OpenMutexA(DWORD access, BOOL inherit, LPCSTR name) {
   WCHAR *w = name ? to_wide(name) : NULL;
@@ -1300,11 +1298,10 @@ EXPORT HANDLE WINAPI CreateSemaphoreA(LPSECURITY_ATTRIBUTES sa, LONG initial, LO
 }
 EXPORT HANDLE WINAPI CreateSemaphoreExW(LPSECURITY_ATTRIBUTES sa, LONG initial, LONG maximum, LPCWSTR name, DWORD flags, DWORD access) { (void)flags; (void)access; return CreateSemaphoreW(sa, initial, maximum, name); }
 EXPORT HANDLE WINAPI OpenSemaphoreW(DWORD access, BOOL inherit, LPCWSTR name) {
-  (void)access;
   NamedAttributes n;
   const BOOL inherit_handle = inherit;
   HANDLE h = NULL;
-  { const NTSTATUS status = NtOpenSemaphore(&h, 0x1F0003, named_attributes(&n, name, inherit_handle)); return opened(status, h); }
+  { const NTSTATUS status = NtOpenSemaphore(&h, access, named_attributes(&n, name, inherit_handle)); return opened(status, h); }
 }
 EXPORT HANDLE WINAPI OpenSemaphoreA(DWORD access, BOOL inherit, LPCSTR name) {
   WCHAR *w = name ? to_wide(name) : NULL;
@@ -1456,10 +1453,9 @@ EXPORT HANDLE WINAPI CreateWaitableTimerExA(LPSECURITY_ATTRIBUTES sa, LPCSTR nam
   return h;
 }
 EXPORT HANDLE WINAPI OpenWaitableTimerW(DWORD access, BOOL inherit, LPCWSTR name) {
-  (void)access;
   NamedAttributes n;
   HANDLE h = NULL;
-  const NTSTATUS status = NtOpenTimer(&h, 0x1F0003, named_attributes(&n, name, inherit));
+  const NTSTATUS status = NtOpenTimer(&h, access, named_attributes(&n, name, inherit));
   if (!NT_SUCCESS(status)) { fail_nt(status); return NULL; }
   return h;
 }

@@ -1137,3 +1137,50 @@ EXPORT PVOID WINAPI ResolveDelayLoadedAPI(PVOID parent, const void *descriptor, 
 
 VOID NTAPI NtFlushProcessWriteBuffers(void);
 EXPORT VOID WINAPI FlushProcessWriteBuffers(void) { NtFlushProcessWriteBuffers(); }
+
+/* BindIoCompletionCallback: the file is tied to a port of the process's own, which a thread of ours empties, calling the routine that was given with the file (the key). */
+typedef void (WINAPI *IO_COMPLETION_ROUTINE_)(DWORD error, DWORD bytes, LPOVERLAPPED overlapped);
+static HANDLE g_bind_port;
+static HANDLE g_bound_files[64];
+static DWORD WINAPI bind_dispatcher(LPVOID unused) {
+  (void)unused;
+  for (;;) {
+    DWORD bytes = 0;
+    ULONG_PTR key = 0;
+    LPOVERLAPPED overlapped = NULL;
+    if (!GetQueuedCompletionStatus(g_bind_port, &bytes, &key, &overlapped, INFINITE) && !overlapped) continue;
+    if (overlapped && key) ((IO_COMPLETION_ROUTINE_)key)(RtlNtStatusToDosError((NTSTATUS)overlapped->Internal), bytes, overlapped);
+  }
+  return 0;
+}
+EXPORT BOOL WINAPI BindIoCompletionCallback(HANDLE file, IO_COMPLETION_ROUTINE_ routine, ULONG flags) {
+  (void)flags;
+  if (!file || file == INVALID_HANDLE_VALUE) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
+  ULONG mode = 0;
+  IO_STATUS_BLOCK iosb;
+  const NTSTATUS s = NtQueryInformationFile(file, &iosb, &mode, sizeof(mode), 16 /* FileModeInformation */);
+  if (!NT_SUCCESS(s)) return fail_nt(s);
+  if (!routine || (mode & 0x30)) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }      /* (a file not opened for overlapped use, or no routine) */
+  atom_lock();
+  int free_slot = -1;
+  for (int i = 0; i < 64; ++i) {
+    if (g_bound_files[i] == file) { LeaveCriticalSection(&g_atom_lock); set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+    if (!g_bound_files[i] && free_slot < 0) free_slot = i;
+  }
+  LeaveCriticalSection(&g_atom_lock);
+  if (free_slot < 0) { set_error(ERROR_NOT_ENOUGH_MEMORY); return FALSE; }
+  if (!g_bind_port) {
+    HANDLE port = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
+    if (!port) return FALSE;
+    if (__sync_val_compare_and_swap(&g_bind_port, (HANDLE)NULL, port) != NULL) CloseHandle(port);
+    else {
+      HANDLE t = CreateThread(NULL, 0, bind_dispatcher, NULL, 0, NULL);
+      if (t) CloseHandle(t);
+    }
+  }
+  if (!CreateIoCompletionPort(file, g_bind_port, (ULONG_PTR)routine, 0)) return FALSE;
+  atom_lock();
+  g_bound_files[free_slot] = file;
+  LeaveCriticalSection(&g_atom_lock);
+  return TRUE;
+}
