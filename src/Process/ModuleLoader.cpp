@@ -254,7 +254,9 @@ LoadStatus ensure_loaded(Context& c, StringView canonical, uint32_t depth, Modul
   if (!c.provider.find(canonical, &file)) return LoadStatus::Ok;      // not available: its imports become stubs
   UniquePointer<Module> module = UniquePointer<Module>::make(c.allocator, c.allocator);
   if (!module || !module->name.assign(canonical)) return LoadStatus::OutOfMemory;
-  if (!module->owned.parse(file) || !module->owned.is_pe32_plus() || module->owned.machine() != exe::kPeMachineAmd64 || (!module->owned.is_dll() && !(c.allow_program && depth == 1))) {
+  const bool parsed_ok = module->owned.parse(file);
+  const bool data_only_32bit = parsed_ok && !module->owned.is_pe32_plus() && module->owned.machine() == 0x14C && !pe_image_contains_code(module->owned);
+  if (!parsed_ok || !(data_only_32bit || (module->owned.is_pe32_plus() && module->owned.machine() == exe::kPeMachineAmd64)) || (!module->owned.is_dll() && !(c.allow_program && depth == 1))) {
     say(c, canonical, " is not a 64-bit x86 DLL");
     return LoadStatus::Malformed;
   }
@@ -297,7 +299,7 @@ LoadStatus ensure_loaded(Context& c, StringView canonical, uint32_t depth, Modul
   describe_image_pages(c.space, pe, base);
   module->base = base;
   module->size = size;
-  module->no_bind = !c.bind || !pe.is_dll();      // (a program image loaded as a library is only mapped)
+  module->no_bind = !c.bind || !pe.is_dll() || !pe.is_pe32_plus();      // (a program image loaded as a library is only mapped)
   module->entry = pe.is_dll() ? image.entry : 0;
   Module* raw = module.get();
   if (!c.set.modules_.push_back(static_cast<UniquePointer<Module>&&>(module))) return LoadStatus::OutOfMemory;

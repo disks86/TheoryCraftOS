@@ -40,6 +40,21 @@ float floor_(float x) {
 float sqrt_(float x) { return static_cast<float>(fmath::sqrt(x)); }
 float rcp_(float x) { return 1.0f / x; }   // (a zero gives infinity, as in Direct3D)
 float sat_(float x) { return x > 0 ? (x < 1 ? x : 1.0f) : 0.0f; }
+uint32_t bits_of(float f) { return __builtin_bit_cast(uint32_t, f); }
+float from_bits(uint32_t u) { return __builtin_bit_cast(float, u); }
+// A comparison's result: 1.0 / 0.0, or all ones / zero for a program made from DXBC.
+float truth(bool t, bool mask) { return mask ? from_bits(t ? 0xFFFFFFFFu : 0u) : (t ? 1.0f : 0.0f); }
+int32_t float_to_int(float x) {
+  if (!(x == x)) return 0;
+  if (x >= 2147483648.0f) return 2147483647;
+  if (x <= -2147483648.0f) return -2147483647 - 1;
+  return static_cast<int32_t>(x);
+}
+uint32_t float_to_uint(float x) {
+  if (!(x == x) || x <= 0) return 0;
+  if (x >= 4294967296.0f) return 0xFFFFFFFFu;
+  return static_cast<uint32_t>(x);
+}
 
 }  // namespace
 
@@ -54,6 +69,7 @@ struct D3d9Program::State {
   const graphics::Vec4* varyings = nullptr;
   const uint8_t* constants = nullptr;
   const graphics::ITextureSet* textures = nullptr;
+  Q sys[kSysValueCount] = {};
   bool killed = false;
 };
 
@@ -91,6 +107,10 @@ int8_t semantic_slot(uint32_t usage, uint32_t index) {
 }
 
 }  // namespace
+
+uint32_t D3d9Program::required_features() const {
+  return (uses_system_values_ ? graphics::kFeatureSystemInputs : 0u) | (uses_texel_access_ ? graphics::kFeatureTexelAccess : 0u);
+}
 
 bool d3d9_op_writes_register(uint16_t op) {
   const OpInfo* info = find_op(op);
@@ -397,7 +417,7 @@ void D3d9Program::execute(State& s) const {
   using Instr = Instruction;
   auto push_constant = [&](uint32_t index) {
     Q q = {{0, 0, 0, 0}};
-    if (index < kPushConstantRegisters && s.constants) __builtin_memcpy(q.f, s.constants + index * 16, 16);
+    if (index < constant_registers_ && s.constants) __builtin_memcpy(q.f, s.constants + index * 16, 16);
     return q;
   };
   auto constant = [&](uint32_t index) {
@@ -405,10 +425,12 @@ void D3d9Program::execute(State& s) const {
       if (d.number == index) return Q{{d.value[0], d.value[1], d.value[2], d.value[3]}};
     return push_constant(index);
   };
+  bool int_mode = false;   // the instruction being run works on integers: negate and abs of its sources are integer ones
   auto fetch = [&](const Instr::Src& src, uint32_t offset) {
     Q v = {{0, 0, 0, 0}};
     switch (src.type) {
       case kTemp: v = s.r[src.number]; break;
+      case kSysValue: if (src.number < kSysValueCount) v = s.sys[src.number]; break;
       case kInput:
         if (src.slot >= 0) {
           const graphics::Vec4 a = s.attributes ? s.attributes[src.slot] : s.varyings[src.slot];
@@ -425,15 +447,30 @@ void D3d9Program::execute(State& s) const {
         break;
       case kConst: {
         int64_t index = int64_t{src.number} + offset;
-        if (src.relative) index += static_cast<int64_t>(floor_(s.a0.f[src.relative_component]));
-        v = index < 0 ? Q{{0, 0, 0, 0}} : constant(static_cast<uint32_t>(index > 4095 ? 4095 : index));
+        bool in_range = true;
+        if (src.relative) {
+          if (src.relative_temp >= 0) index += __builtin_bit_cast(int32_t, s.r[src.relative_temp].f[src.relative_component]);   // (an integer register)
+          else index += static_cast<int64_t>(floor_(s.a0.f[src.relative_component]));
+          in_range = !src.relative_limit || (index >= 0 && index < src.relative_limit);   // (past the end of a constant buffer: zero)
+        }
+        v = (index < 0 || !in_range) ? Q{{0, 0, 0, 0}} : constant(static_cast<uint32_t>(index > 0x7FFF ? 0x7FFF : index));
         break;
       }
       default: break;
     }
     Q r = {{v.f[src.swizzle[0]], v.f[src.swizzle[1]], v.f[src.swizzle[2]], v.f[src.swizzle[3]]}};
-    if (src.modifier != kModNone)
-      for (float& c : r.f) c = apply_modifier(src.modifier, c);
+    if (src.modifier != kModNone) {
+      for (float& c : r.f) {
+        if (int_mode && (src.modifier == kModNeg || src.modifier == kModAbs || src.modifier == kModAbsNeg)) {
+          int32_t x = __builtin_bit_cast(int32_t, c);
+          if (src.modifier != kModNeg && x < 0) x = static_cast<int32_t>(0u - static_cast<uint32_t>(x));
+          if (src.modifier != kModAbs) x = static_cast<int32_t>(0u - static_cast<uint32_t>(x));
+          c = __builtin_bit_cast(float, x);
+        } else {
+          c = apply_modifier(src.modifier, c);
+        }
+      }
+    }
     return r;
   };
   auto store = [&](const Instr::Dst& d, Q v) {
@@ -474,8 +511,11 @@ void D3d9Program::execute(State& s) const {
   };
 
   const uint64_t count = code_.count();
+  uint32_t steps = 0;   // (a loop that never ends stops the program, not the machine)
   for (uint64_t pc = 0; pc < count;) {
+    if (++steps > kMaxSteps) return;
     const Instr& ins = code_[pc++];
+    int_mode = ins.op >= kIntegerFirst && ins.op <= kIntegerLast;
     Q a = {{0, 0, 0, 0}}, b = a, c = a, r = a;
     if (ins.src_count > 0 && ins.op != kM4x4 && ins.op != kM4x3 && ins.op != kM3x4 && ins.op != kM3x3 && ins.op != kM3x2) a = fetch(ins.src[0], 0);
     switch (ins.op) {
@@ -492,15 +532,24 @@ void D3d9Program::execute(State& s) const {
         if (!compare(ins.control & 7, a.f[0], b.f[0])) pc = ins.target;
         break;
       }
+      case kBreakNz: case kContinueNz:
+        if (bits_of(a.f[0]) != 0) pc = ins.target;
+        break;
+      case kBreakZ: case kContinueZ:
+        if (bits_of(a.f[0]) == 0) pc = ins.target;
+        break;
+      case kBreak0: case kContinue0: case kLoopEnd:
+        pc = ins.target;
+        break;
       case kIfNz:
-        if (!(a.f[0] != 0)) pc = ins.target;
+        if (bits_of(a.f[0]) == 0) pc = ins.target;
         break;
       case kIfZ:
-        if (a.f[0] != 0) pc = ins.target;
+        if (bits_of(a.f[0]) != 0) pc = ins.target;
         break;
       case kDiscardNz:
       case kDiscardZ:
-        if ((a.f[0] != 0) == (ins.op == kDiscardNz)) {
+        if ((bits_of(a.f[0]) != 0) == (ins.op == kDiscardNz)) {
           s.killed = true;
           return;
         }
@@ -517,8 +566,8 @@ void D3d9Program::execute(State& s) const {
       case kLrp: b = fetch(ins.src[1], 0); c = fetch(ins.src[2], 0); for (int i = 0; i < 4; ++i) r.f[i] = c.f[i] + a.f[i] * (b.f[i] - c.f[i]); store(ins.dst, r); break;
       case kMin: b = fetch(ins.src[1], 0); for (int i = 0; i < 4; ++i) r.f[i] = a.f[i] < b.f[i] ? a.f[i] : b.f[i]; store(ins.dst, r); break;
       case kMax: b = fetch(ins.src[1], 0); for (int i = 0; i < 4; ++i) r.f[i] = a.f[i] > b.f[i] ? a.f[i] : b.f[i]; store(ins.dst, r); break;
-      case kSlt: b = fetch(ins.src[1], 0); for (int i = 0; i < 4; ++i) r.f[i] = a.f[i] < b.f[i] ? 1.0f : 0.0f; store(ins.dst, r); break;
-      case kSge: b = fetch(ins.src[1], 0); for (int i = 0; i < 4; ++i) r.f[i] = a.f[i] >= b.f[i] ? 1.0f : 0.0f; store(ins.dst, r); break;
+      case kSlt: b = fetch(ins.src[1], 0); for (int i = 0; i < 4; ++i) r.f[i] = truth(a.f[i] < b.f[i], ins.mask_result); store(ins.dst, r); break;
+      case kSge: b = fetch(ins.src[1], 0); for (int i = 0; i < 4; ++i) r.f[i] = truth(a.f[i] >= b.f[i], ins.mask_result); store(ins.dst, r); break;
       case kCmp: b = fetch(ins.src[1], 0); c = fetch(ins.src[2], 0); for (int i = 0; i < 4; ++i) r.f[i] = a.f[i] >= 0 ? b.f[i] : c.f[i]; store(ins.dst, r); break;
       case kRcp: store(ins.dst, splat(rcp_(a.f[0]))); break;
       case kRsq:
@@ -544,8 +593,8 @@ void D3d9Program::execute(State& s) const {
         break;
       case kDiv: b = fetch(ins.src[1], 0); for (int i = 0; i < 4; ++i) r.f[i] = a.f[i] / b.f[i]; store(ins.dst, r); break;
       case kSqrt: for (int i = 0; i < 4; ++i) r.f[i] = a.f[i] < 0 ? __builtin_nanf("") : sqrt_(a.f[i]); store(ins.dst, r); break;
-      case kSeq: b = fetch(ins.src[1], 0); for (int i = 0; i < 4; ++i) r.f[i] = a.f[i] == b.f[i] ? 1.0f : 0.0f; store(ins.dst, r); break;
-      case kSne: b = fetch(ins.src[1], 0); for (int i = 0; i < 4; ++i) r.f[i] = a.f[i] != b.f[i] ? 1.0f : 0.0f; store(ins.dst, r); break;
+      case kSeq: b = fetch(ins.src[1], 0); for (int i = 0; i < 4; ++i) r.f[i] = truth(a.f[i] == b.f[i], ins.mask_result); store(ins.dst, r); break;
+      case kSne: b = fetch(ins.src[1], 0); for (int i = 0; i < 4; ++i) r.f[i] = truth(a.f[i] != b.f[i], ins.mask_result); store(ins.dst, r); break;
       case kDp2: b = fetch(ins.src[1], 0); store(ins.dst, splat(dot(a, b, 2))); break;
       case kFloor: for (int i = 0; i < 4; ++i) r.f[i] = floor_(a.f[i]); store(ins.dst, r); break;
       case kCeil: for (int i = 0; i < 4; ++i) r.f[i] = -floor_(-a.f[i]); store(ins.dst, r); break;
@@ -559,7 +608,7 @@ void D3d9Program::execute(State& s) const {
         break;
       case kSin: for (int i = 0; i < 4; ++i) r.f[i] = static_cast<float>(fmath::sin(a.f[i])); store(ins.dst, r); break;
       case kCos: for (int i = 0; i < 4; ++i) r.f[i] = static_cast<float>(fmath::cos(a.f[i])); store(ins.dst, r); break;
-      case kSelect: b = fetch(ins.src[1], 0); c = fetch(ins.src[2], 0); for (int i = 0; i < 4; ++i) r.f[i] = a.f[i] != 0 ? b.f[i] : c.f[i]; store(ins.dst, r); break;
+      case kSelect: b = fetch(ins.src[1], 0); c = fetch(ins.src[2], 0); for (int i = 0; i < 4; ++i) r.f[i] = bits_of(a.f[i]) != 0 ? b.f[i] : c.f[i]; store(ins.dst, r); break;
       case kFrc: for (int i = 0; i < 4; ++i) r.f[i] = a.f[i] - floor_(a.f[i]); store(ins.dst, r); break;
       case kAbs: for (int i = 0; i < 4; ++i) r.f[i] = fabs_(a.f[i]); store(ins.dst, r); break;
       case kSgn: for (int i = 0; i < 4; ++i) r.f[i] = a.f[i] > 0 ? 1.0f : a.f[i] < 0 ? -1.0f : 0.0f; store(ins.dst, r); break;
@@ -605,6 +654,49 @@ void D3d9Program::execute(State& s) const {
         store(ins.dst, r);
         break;
       }
+      case kIAdd: case kINeg: case kIMul: case kIMad: case kIMin: case kIMax: case kUMin: case kUMax: case kUMul: case kUMad: case kUDiv: case kURem: case kIShl: case kIShr: case kUShr:
+      case kAnd: case kOr: case kXor: case kNot: case kFtoI: case kFtoU: case kItoF: case kUtoF: case kIEq: case kINe: case kILt: case kIGe: case kULt: case kUGe: {
+        if (ins.src_count > 1) b = fetch(ins.src[1], 0);
+        if (ins.src_count > 2) c = fetch(ins.src[2], 0);
+        for (int i = 0; i < 4; ++i) {
+          const uint32_t x = bits_of(a.f[i]), y = bits_of(b.f[i]), z = bits_of(c.f[i]);
+          const int32_t sx = static_cast<int32_t>(x), sy = static_cast<int32_t>(y);
+          uint32_t out = 0;
+          switch (ins.op) {
+            case kIAdd: out = x + y; break;
+            case kINeg: out = 0u - x; break;
+            case kIMul: case kUMul: out = x * y; break;
+            case kIMad: case kUMad: out = x * y + z; break;
+            case kIMin: out = static_cast<uint32_t>(sx < sy ? sx : sy); break;
+            case kIMax: out = static_cast<uint32_t>(sx > sy ? sx : sy); break;
+            case kUMin: out = x < y ? x : y; break;
+            case kUMax: out = x > y ? x : y; break;
+            case kUDiv: out = y ? x / y : 0xFFFFFFFFu; break;
+            case kURem: out = y ? x % y : 0xFFFFFFFFu; break;
+            case kIShl: out = x << (y & 31); break;
+            case kIShr: out = static_cast<uint32_t>(sx >> (y & 31)); break;   // (arithmetic)
+            case kUShr: out = x >> (y & 31); break;
+            case kAnd: out = x & y; break;
+            case kOr: out = x | y; break;
+            case kXor: out = x ^ y; break;
+            case kNot: out = ~x; break;
+            case kFtoI: out = static_cast<uint32_t>(float_to_int(a.f[i])); break;
+            case kFtoU: out = float_to_uint(a.f[i]); break;
+            case kItoF: r.f[i] = static_cast<float>(sx); continue;
+            case kUtoF: r.f[i] = static_cast<float>(x); continue;
+            case kIEq: out = x == y ? 0xFFFFFFFFu : 0; break;
+            case kINe: out = x != y ? 0xFFFFFFFFu : 0; break;
+            case kILt: out = sx < sy ? 0xFFFFFFFFu : 0; break;
+            case kIGe: out = sx >= sy ? 0xFFFFFFFFu : 0; break;
+            case kULt: out = x < y ? 0xFFFFFFFFu : 0; break;
+            case kUGe: out = x >= y ? 0xFFFFFFFFu : 0; break;
+            default: break;
+          }
+          r.f[i] = from_bits(out);
+        }
+        store(ins.dst, r);
+        break;
+      }
       case kTexLd: {
         b = {{0, 0, 0, 0}};
         const uint32_t unit = ins.src[1].number;
@@ -615,6 +707,31 @@ void D3d9Program::execute(State& s) const {
         }
         if (s.textures) {
           const graphics::Vec4 t = s.textures->sample(unit, u, v);
+          const float texel[4] = {t.x, t.y, t.z, t.w};
+          b = {{texel[ins.tex_swizzle[0]], texel[ins.tex_swizzle[1]], texel[ins.tex_swizzle[2]], texel[ins.tex_swizzle[3]]}};
+        }
+        store(ins.dst, b);
+        break;
+      }
+      case kTexFetch: case kTexLod: case kTexSize: {
+        b = {{0, 0, 0, 0}};
+        const uint32_t unit = ins.src[1].number;
+        if (s.textures) {
+          graphics::Vec4 t = {0, 0, 0, 0};
+          if (ins.op == kTexFetch) {
+            t = s.textures->fetch(unit, __builtin_bit_cast(int32_t, a.f[0]), __builtin_bit_cast(int32_t, a.f[1]), bits_of(a.f[3]));
+          } else if (ins.op == kTexLod) {
+            const Q lod = fetch(ins.src[2], 0);
+            t = s.textures->sample_lod(unit, a.f[0], a.f[1], lod.f[0]);
+          } else {
+            uint32_t w = 0, h = 0, levels = 0;
+            if (s.textures->size(unit, bits_of(a.f[0]), &w, &h, &levels) && bits_of(a.f[0]) < levels) {
+              const uint32_t mode = ins.control;
+              t = mode == 2 ? graphics::Vec4{from_bits(w), from_bits(h), 0.0f, from_bits(levels)}
+                            : mode == 1 ? graphics::Vec4{1.0f / static_cast<float>(w), 1.0f / static_cast<float>(h), 0.0f, 1.0f / static_cast<float>(levels)}
+                                        : graphics::Vec4{static_cast<float>(w), static_cast<float>(h), 0.0f, static_cast<float>(levels)};
+            }
+          }
           const float texel[4] = {t.x, t.y, t.z, t.w};
           b = {{texel[ins.tex_swizzle[0]], texel[ins.tex_swizzle[1]], texel[ins.tex_swizzle[2]], texel[ins.tex_swizzle[3]]}};
         }
@@ -635,20 +752,32 @@ void D3d9Program::execute(State& s) const {
   }
 }
 
-void D3d9Program::run_vertex(const graphics::Vec4* attributes, const uint8_t* constants, graphics::ShaderIo* out) const {
+void D3d9Program::run_vertex(const graphics::Vec4* attributes, const uint8_t* constants, graphics::ShaderIo* out) const { run_vertex_ex(attributes, constants, graphics::VertexContext(), out); }
+
+void D3d9Program::run_vertex_ex(const graphics::Vec4* attributes, const uint8_t* constants, const graphics::VertexContext& context, graphics::ShaderIo* out) const {
   State s = {};
   s.attributes = attributes;
   s.constants = constants;
+  s.sys[kSysVertexId].f[0] = from_bits(context.vertex_id);
+  s.sys[kSysInstanceId].f[0] = from_bits(context.instance_id);
   execute(s);
   out->position = {s.pos.f[0], -s.pos.f[1], s.pos.f[2], s.pos.f[3]};   // (Direct3D's +Y up to the device's +Y down)
   for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) out->varying[i] = {s.var[i].f[0], s.var[i].f[1], s.var[i].f[2], s.var[i].f[3]};
 }
 
 bool D3d9Program::run_fragment(const graphics::Vec4* varyings, const uint8_t* constants, const graphics::ITextureSet* textures, graphics::Vec4* color) const {
+  return run_fragment_ex(varyings, graphics::FragmentContext(), constants, textures, color);
+}
+
+bool D3d9Program::run_fragment_ex(const graphics::Vec4* varyings, const graphics::FragmentContext& context, const uint8_t* constants, const graphics::ITextureSet* textures,
+                                  graphics::Vec4* color) const {
   State s = {};
   s.varyings = varyings;
   s.constants = constants;
   s.textures = textures;
+  s.sys[kSysPosition] = {{context.position.x, context.position.y, context.position.z, context.position.w}};
+  s.sys[kSysFrontFacing].f[0] = from_bits(context.front_facing ? 0xFFFFFFFFu : 0u);
+  s.sys[kSysPrimitiveId].f[0] = from_bits(context.primitive_id);
   execute(s);
   if (s.killed) return false;
   *color = {s.color.f[0], s.color.f[1], s.color.f[2], s.color.f[3]};
@@ -663,6 +792,8 @@ constexpr uint32_t kSlots = 32;
 const D3d9Program* g_vertex[kSlots];
 const D3d9Program* g_fragment[kSlots];
 const D3d9Program* g_textured[kSlots];
+const D3d9Program* g_vertex_ex[kSlots];
+const D3d9Program* g_fragment_ex[kSlots];
 
 template <uint32_t N>
 void vertex_trampoline(const graphics::Vec4* attributes, const uint8_t* constants, graphics::ShaderIo* out) {
@@ -677,8 +808,19 @@ bool textured_trampoline(const graphics::Vec4* varyings, const uint8_t* constant
   return g_textured[N]->run_fragment(varyings, constants, &textures, color);
 }
 
+template <uint32_t N>
+void vertex_ex_trampoline(const graphics::Vec4* attributes, const uint8_t* constants, const graphics::VertexContext& context, graphics::ShaderIo* out) {
+  g_vertex_ex[N]->run_vertex_ex(attributes, constants, context, out);
+}
+template <uint32_t N>
+bool fragment_ex_trampoline(const graphics::Vec4* varyings, const graphics::FragmentContext& context, const uint8_t* constants, const graphics::ITextureSet& textures, graphics::Vec4* color) {
+  return g_fragment_ex[N]->run_fragment_ex(varyings, context, constants, &textures, color);
+}
+
 template <uint32_t... I>
 struct Trampolines {
+  static constexpr graphics::VertexShaderFnEx vertex_ex[sizeof...(I)] = {&vertex_ex_trampoline<I>...};
+  static constexpr graphics::FragmentShaderFnEx fragment_ex[sizeof...(I)] = {&fragment_ex_trampoline<I>...};
   static constexpr graphics::VertexShaderFn vertex[sizeof...(I)] = {&vertex_trampoline<I>...};
   static constexpr graphics::FragmentShaderFn fragment[sizeof...(I)] = {&fragment_trampoline<I>...};
   static constexpr graphics::TexturedFragmentShaderFn textured[sizeof...(I)] = {&textured_trampoline<I>...};
@@ -705,6 +847,18 @@ NtStatus D3d9Binding::bind(UniquePointer<D3d9Program> program, graphics::ShaderM
   if (kind_ == 0) desc->vertex_function = decltype(kTrampolines)::vertex[slot];
   else if (kind_ == 1) desc->fragment_function = decltype(kTrampolines)::fragment[slot];
   else desc->textured_fragment_function = decltype(kTrampolines)::textured[slot];
+  if (program->uses_system_values() || program->required_features()) {
+    // (a second function for the devices that pass system values and answer texel access)
+    const D3d9Program** table_ex = kind_ == 0 ? g_vertex_ex : g_fragment_ex;
+    uint32_t slot_ex = 0;
+    while (slot_ex < kSlots && table_ex[slot_ex]) ++slot_ex;
+    if (slot_ex < kSlots) {
+      table_ex[slot_ex] = program.get();
+      slot_ex_ = static_cast<int32_t>(slot_ex);
+      if (kind_ == 0) desc->vertex_function_ex = decltype(kTrampolines)::vertex_ex[slot_ex];
+      else desc->fragment_function_ex = decltype(kTrampolines)::fragment_ex[slot_ex];
+    }
+  }
   program_ = util::move(program);
   return status::kSuccess;
 }
@@ -714,6 +868,10 @@ void D3d9Binding::release() {
     const D3d9Program** table = kind_ == 0 ? g_vertex : kind_ == 1 ? g_fragment : g_textured;
     table[slot_] = nullptr;
     slot_ = -1;
+  }
+  if (slot_ex_ >= 0) {
+    (kind_ == 0 ? g_vertex_ex : g_fragment_ex)[slot_ex_] = nullptr;
+    slot_ex_ = -1;
   }
   program_.reset();
 }

@@ -114,6 +114,10 @@ struct Entry {
 };
 // What submitting `form` with `submitter` (a button, or nullptr) sends. False if memory ran out.
 bool form_entries(const Node* form, const Node* submitter, List<Entry>* out);
+// The name of the window a link or form shows its page in: the element's own `target`, else that of the first <base target> of the document ("" for neither).
+StringView browsing_target(const Node* element);
+// Whether the window a link or form opens has no opener: rel has noopener or noreferrer, or (without rel=opener) the target is _blank.
+bool opens_without_opener(const Node* element);
 bool encode_urlencoded(const List<Entry>& entries, String* out);
 bool encode_urlencoded(const List<Entry>& entries, Encoding encoding, String* out);   // the bytes in that encoding ("&#NNN;" for what it cannot hold)                              // name=value&name=value, as application/x-www-form-urlencoded
 bool encode_multipart(const List<Entry>& entries, StringView boundary, String* out);          // multipart/form-data

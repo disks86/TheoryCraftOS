@@ -248,7 +248,7 @@ String TgsiEmitter::operand(const Instr::Src& s, uint32_t offset, uint32_t slot,
     case kConst: {
       const uint32_t reg = s.number + offset;
       if (s.relative) {
-        if (p_.defs_.count() != 0 || s.relative_component != 0) {
+        if (p_.defs_.count() != 0 || s.relative_component != 0 || s.relative_temp >= 0) {
           unsupported_ = true;
           break;
         }
@@ -265,7 +265,7 @@ String TgsiEmitter::operand(const Instr::Src& s, uint32_t offset, uint32_t slot,
         break;
       }
       if (!found) {
-        if (reg >= D3d9Program::kPushConstantRegisters) {
+        if (reg >= p_.constant_registers_) {
           unsupported_ = true;
           break;
         }
@@ -406,9 +406,24 @@ bool TgsiEmitter::instruction(const Instr& ins) {
       line("IF", &cond);
       return true;
     }
-    case kIfNz: {
-      const String a = operand(ins.src[0], 0, 0, nullptr, true);
-      line("IF", &a);
+    case kLoopBegin: line("BGNLOOP"); return true;
+    case kLoopEnd: line("ENDLOOP"); return true;
+    case kBreak0: line("BRK"); return true;
+    case kContinue0: line("CONT"); return true;
+    case kBreakNz: case kBreakZ: case kContinueNz: case kContinueZ: {
+      const String a = operand(ins.src[0], 0, 0, nullptr, true), z = zero(), w = temp(kWork3, ".x");
+      line(op == kBreakNz || op == kContinueNz ? "SNE" : "SEQ", &w, &a, &z);
+      const String test = temp(kWork3, ".xxxx");
+      line("IF", &test);
+      line(op == kBreakNz || op == kBreakZ ? "BRK" : "CONT");
+      line("ENDIF");
+      return true;
+    }
+    case kIfNz: {   // (SNE first: the test value may be all ones, a NaN as a float)
+      const String a = operand(ins.src[0], 0, 0, nullptr, true), z = zero(), w = temp(kWork3, ".x");
+      line("SNE", &w, &a, &z);
+      const String test = temp(kWork3, ".xxxx");
+      line("IF", &test);
       return true;
     }
     case kIfZ: case kDiscardNz: case kDiscardZ: {
@@ -491,6 +506,12 @@ bool TgsiEmitter::instruction(const Instr& ins) {
     case kTrunc: simple = "TRUNC", sources = 1; break;
     case kRoundNe: simple = "ROUND", sources = 1; break;
     default: break;
+  }
+  if (simple && ins.mask_result) {   // (a Shader Model 4 comparison is all ones for true: TGSI's FS comparisons)
+    if (op == kSeq) simple = "FSEQ";
+    else if (op == kSne) simple = "FSNE";
+    else if (op == kSlt) simple = "FSLT";
+    else if (op == kSge) simple = "FSGE";
   }
   if (simple) {
     t = begin_result(ins, false, &direct);
@@ -729,7 +750,7 @@ void TgsiEmitter::assemble(String* out) {
     }
   }
   add(*out, "DCL CONST[0..");
-  add_uint(*out, D3d9Program::kPushConstantRegisters - 1);
+  add_uint(*out, p_.constant_registers_ - 1);
   add(*out, "]\n");
   if (addr_used_) add(*out, "DCL ADDR[0]\n");
   add(*out, "DCL TEMP[0..");

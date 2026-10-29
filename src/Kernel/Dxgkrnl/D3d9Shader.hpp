@@ -53,7 +53,9 @@ class D3d9Program {
  public:
   static constexpr uint32_t kMaxTokens = 8192;
   static constexpr uint32_t kMaxInstructions = 1024;
+  static constexpr uint32_t kMaxSteps = 1u << 20;   // instructions one run may execute
   static constexpr uint32_t kPushConstantRegisters = 8;
+  static constexpr uint32_t kMaxConstantRegisters = 256;   // 4096 bytes: a program made from DXBC may declare constant buffers up to this much in all
 
   // Decodes and checks the token stream (little-endian words). kInvalidParameter for a malformed stream, kNotSupported for one that is fine but uses something not supported.
   static NtStatus compile(allocators::IAllocator& allocator, ConstByteView tokens, UniquePointer<D3d9Program>* out);
@@ -64,7 +66,18 @@ class D3d9Program {
   static NtStatus compile_dxbc(allocators::IAllocator& allocator, ConstByteView container, UniquePointer<D3d9Program>* out);
 
   graphics::ShaderStage stage() const { return stage_; }
+  // How many bytes of push constants the program reads (a Direct3D 9 program: eight registers; a DXBC one: its constant buffers laid end to end in slot order). A device whose
+  // limit is lower cannot run it.
+  uint32_t constant_bytes() const { return constant_registers_ * 16; }
   bool uses_textures() const { return uses_textures_; }
+
+  // What a device must have for the program to run as written (graphics::DeviceFeature bits): a program that reads system values needs kFeatureSystemInputs (without it they read as
+  // zero), one that fetches texels, samples at a level or asks the size of a texture kFeatureTexelAccess.
+  uint32_t required_features() const;
+  bool uses_system_values() const { return uses_system_values_; }
+  // The same with the system values (D3d9Binding hands these to the device beside the others).
+  void run_vertex_ex(const graphics::Vec4* attributes, const uint8_t* constants, const graphics::VertexContext& context, graphics::ShaderIo* out) const;
+  bool run_fragment_ex(const graphics::Vec4* varyings, const graphics::FragmentContext& context, const uint8_t* constants, const graphics::ITextureSet* textures, graphics::Vec4* color) const;
 
   // Runs the program. `attributes` are the vertex attributes by location, `constants` the 128-byte push-constant block.
   void run_vertex(const graphics::Vec4* attributes, const uint8_t* constants, graphics::ShaderIo* out) const;
@@ -104,6 +117,8 @@ class D3d9Program {
   graphics::ShaderStage stage_ = graphics::ShaderStage::Vertex;
   uint32_t major_ = 0, minor_ = 0;
   bool uses_textures_ = false;
+  bool uses_system_values_ = false, uses_texel_access_ = false;
+  uint32_t constant_registers_ = kPushConstantRegisters;
   List<Instruction> code_;
   struct Def {
     uint16_t number;
@@ -125,14 +140,14 @@ class D3d9Binding {
   D3d9Binding(const D3d9Binding&) = delete;
   D3d9Binding& operator=(const D3d9Binding&) = delete;
 
-  // Takes the program and fills in the function of `desc` (vertex_function, fragment_function or textured_fragment_function) and its stage. kInsufficientResources when
-  // all slots are used.
+  // Takes the program and fills in the function of `desc` (vertex_function, fragment_function or textured_fragment_function) and its stage - and for a program that reads system
+  // values the vertex_function_ex / fragment_function_ex too. kInsufficientResources when all slots are used.
   NtStatus bind(UniquePointer<D3d9Program> program, graphics::ShaderModuleDesc* desc);
   void release();
 
  private:
   UniquePointer<D3d9Program> program_;
-  int32_t slot_ = -1;
+  int32_t slot_ = -1, slot_ex_ = -1;
   uint8_t kind_ = 0;
 };
 

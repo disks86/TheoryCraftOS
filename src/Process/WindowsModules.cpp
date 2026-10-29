@@ -48,10 +48,14 @@ uint32_t nt_load_module(Process& p, const SyscallRequest& r) {
   }
   ByteBuffer file(p.files().allocator());
   if (!read_program_file(p, path.view(), &file, &status)) return status == 0xC0000034u || status == 0xC000003Au ? kDllNotFound : status;
-  if (const uint32_t header = image_header_status(file.view())) return header;
+  {
+    exe::PeFile checked(p.files().allocator());
+    if (const uint32_t header = image_section_status(file.view(), checked)) return header;
+  }
   LoadedModule loaded[kMaxRecords];
   uint32_t count = 0;
   status = host->load_module(file.view(), canonical.view(), loaded, capacity, &count, (flags & 1) == 0);
+  if (status == 0xC000007Bu) status = 0xC00000BBu;      // a good image that this process cannot run (a 32-bit library): the caller may try the next file of its path
   if (status != kSuccess) return status;
   uint8_t records[kMaxRecords * kRecordBytes] = {};
   uint64_t base = 0;

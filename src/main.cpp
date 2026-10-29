@@ -581,10 +581,12 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   // The kernel half of Direct3D (what a Windows program's D3D runtime reaches through the D3DKMT system calls): one adapter per GPU of the pool.
   dxgk::Kernel dxg_kernel(shared_allocator);
   uint32_t dxg_fallbacks = 0;
-  const uint32_t dxg_adapters = graphics::register_dxg_adapters(dxg_kernel, graphics_pool, shared_allocator, &dxg_fallbacks);
+  uint32_t dxg_adapters = graphics::register_dxg_adapters(dxg_kernel, graphics_pool, shared_allocator, &dxg_fallbacks);
+  // The CPU renderer as an adapter of its own (Windows has its "WARP" one) next to the display GPU's, so the 3D test can draw on either and compare.
+  if (system_graphics.accelerated() && dxg_kernel.add_adapter(system_graphics.software_device(), dxgk::AdapterConfig()) != dxgk::kInvalidIndex) ++dxg_adapters;
   dxgk::set_system_kernel(&dxg_kernel);
-  Entry(dxg_fallbacks ? Level::Warn : Level::Ok, "Direct3D").text("kernel mode driver: ").dec(dxg_adapters).text(" adapter(s)");
-  if (dxg_fallbacks) Entry(Level::Warn, "Direct3D").dec(dxg_fallbacks).text(" GPU(s) failed the Direct3D self-test and use the CPU renderer");
+  Entry(dxg_fallbacks ? Level::Warning : Level::Ok, "Direct3D").text("kernel mode driver: ").dec(dxg_adapters).text(" adapter(s)");
+  if (dxg_fallbacks) Entry(Level::Warning, "Direct3D").dec(dxg_fallbacks).text(" GPU(s) failed the Direct3D self-test and use the CPU renderer");
   // WebGL and WebGPU draw on the 3D hardware when there is some (and on the CPU rasterizer in src/WebGl when there is not, or for a draw the hardware cannot do).
   graphics::WebGlAccelerator web_accelerator(system_graphics.device(), shared_allocator);
   if (system_graphics.accelerated()) webgl::set_accelerator(&web_accelerator);
@@ -1305,7 +1307,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     SystemPrintService print_service(shared_allocator, printers);
     desktop.set_print_service(&print_service);
     desktop.set_monitors(&monitors);
-    desktop.set_graphics(&system_graphics);
+    desktop.set_graphics(&dxg_kernel, &system_graphics);
     VBoxDisplayContext vbox_display{&monitors, &desktop};
     guest.set_display_request_handler(on_vbox_display_request, &vbox_display);
     desktop.set_display_changer(&DisplayPipeline::apply, &display_pipeline);

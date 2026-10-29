@@ -96,6 +96,45 @@ or ordered with a context's work (`signal_sync_gpu` / `wait_sync_gpu`). A contex
 count), its queue is dropped but the fence signals still happen, and destroying a context does the same, so nobody waits forever. `present()` flips a `kAllocPresent`
 allocation to the screen (`IGraphicsDevice::present`) or blits a region into one and shows that.
 
+## Direct3D 10 and 11
+
+The kernel-mode driver is the D3DKMT layer, which Direct3D 9, 10, 11 and 12 all sit on; nothing in the services (adapters, allocations, residency, fences, contexts, queues, `render`,
+`present`, `escape`) is specific to a Direct3D version. What decides how much of Direct3D 10 a program gets is the shader front end and the command stream.
+
+- **Shaders:** DXBC (the Direct3D 10 / 11 shader container, Shader Model 4.0 - 5.1) is the format of `ShaderKind::Dxbc`: vertex and pixel shaders, float and integer arithmetic and
+  bitwise instructions (integers live in the register's 32 bits, comparisons give all ones or zero, negate / abs of an integer source are integer ones), `movc`, `if` / `else`,
+  `loop` / `endloop` with `break` / `breakc` / `continue` / `continuec` (a run stops after 2^20 instructions, so a loop with no exit cannot hang the machine), `discard`, `sample`,
+  conversions (`ftoi`, `ftou`, `itof`, `utof`, saturating), `sincos`, the rounding and reciprocal family, `imul` / `umul` low words and `udiv`.
+- **Constant buffers:** `cb0..cb13`, any size up to 256 vec4s in all. The push-constant block is the declared buffers laid end to end in slot order (the user-mode driver sees the
+  same `dcl_constant_buffer`s, so it builds the block), `cb[n][r1.x + 3]` indexes by an integer register (past the end of the buffer reads zero), and the immediate constant buffer
+  (`icb[...]`, up to 512 vec4s) is part of the program. A device says how many bytes of constants it takes (`DeviceInfo::max_push_constant_bytes`: 4096 for the software device, 128
+  for the others); a shader that reads more is refused on a device that takes less (`kNotSupported`).
+- **Topologies:** `SetTopology` in the command stream selects triangle list, strip or fan (restart index 0xFFFF / 0xFFFFFFFF in strips); a strip or fan is expanded to a list of
+  triangles by the kernel with an index buffer made for the draw, so every device draws them.
+- **Formats:** R8G8B8A8 / B8G8R8A8 colour (`A8B8G8R8` / `A8R8G8B8`), D32 and D24S8 depth - what the D3D10 swap chain and back buffers use.
+- **Where the interpreter is the only back end:** integer and bitwise instructions, loops with integer tests, indexing constant buffers by a register and constant blocks above 128 bytes
+  do not become TGSI text, Direct3D 9 tokens or a fixed kernel (they are refused there with `kNotSupported` - the adapter keeps the function for the software device). Loops over floats
+  do become TGSI (`BGNLOOP` / `BRK`).
+- **The device interface (`DeviceInfo::features`):** the base `IGraphicsDevice` stays small; a device lists the extras it has as feature bits and the adapter copies them to
+  `AdapterCaps::features`. The kernel refuses (`kNotSupported`, or an invalid stream) state, shaders and draws that need a feature the device lacks, instead of drawing something else.
+  Only the software device has them so far:
+  - `kFeatureBlendState`: `GraphicsPipelineDesc::blend` (factors, ops and write mask for the colour and the alpha on their own, `custom` selects it over `alpha_blend`) and
+    `depth_compare` (any of the eight comparisons).
+  - `kFeatureTexelAccess`: `ITextureSet::fetch` (Load), `sample_lod` (SampleLevel), `size` (GetDimensions); DXBC `ld`, `sample_l`, `resinfo`.
+  - `kFeatureSystemInputs`: `VertexShaderFnEx` / `FragmentShaderFnEx` carry `SV_VertexID`, `SV_InstanceID`, `SV_Position` (pixel centre, depth, 1/w), `SV_IsFrontFace` and
+    `SV_PrimitiveID`; the DXBC front end reads them from the declarations (`dcl_input_sgv` / `siv`), and a program that uses them needs the feature.
+  - `kFeatureInstancing`: `draw(..., instance_count, first_instance)` and `VertexAttribute::per_instance` (the element numbered by the instance, in the same buffer at the same stride);
+    the command stream has `DrawInstanced` / `DrawIndexedInstanced`.
+  - `kFeatureLines`: `set_primitive_topology` for line lists and point lists, one pixel wide (a step per pixel along the longer axis, perspective-correct varyings); the stream's
+    `Topology::LineList`, `LineStrip` (expanded to a list) and `PointList`.
+  The escape ABI's `CreatePipeline` takes the blend state, the depth comparison and the per-instance bits as optional trailing words.
+- **Checked against a real compiler:** `ps_texel` (Load, SampleLevel, GetDimensions, SV_Position, SV_IsFrontFace, SV_PrimitiveID) and `vs_ids` (SV_VertexID, SV_InstanceID with a
+  per-instance input) from Wine's HLSL compiler run through the kernel on the software device with the expected pictures.
+- **Not done for Direct3D 10:** geometry shaders and stream output, `sample_b` / `sample_c` / derivatives, more than four vertex attributes, more than four varyings (and semantics
+  beyond COLOR0/1 and TEXCOORD0/1), more than one vertex buffer slot, multiple render targets, multisampling, queries and predication, depth bias and wireframe fill, texture arrays,
+  cube and 3D textures, sRGB and 16-bit / float formats, compute shaders and UAVs (Direct3D 11). The other devices (virgl, SVGA3D, Intel Gen9, V3D) have none of the features above, so
+  they run the Direct3D 9 level only.
+
 ## The GPUs
 
 Every 3D device (`graphics::IGraphicsDevice`) is a miniport. `register_dxg_adapters` (SystemDxg.cpp) makes one adapter per GPU of the graphics pool from the pool's device, and an
@@ -105,7 +144,7 @@ understands):
 
 | Device | Shaders | Notes |
 |---|---|---|
-| Software (CPU) | the interpreter's functions | everything: textures, mipmaps, stencil, any program. |
+| Software (CPU) | the interpreter's functions | everything: textures, mipmaps, stencil, any program, and all the Direct3D 10 features above. |
 | virgl (QEMU) | TGSI text | from D3D9 / SM1 pixel / SM2-5.1; never run against a real virglrenderer. |
 | VMware SVGA3D | Direct3D 9 tokens (D3D9 rewritten, DXBC written out first) | textures, mipmaps, stencil written from memory of the protocol; not run on a host. |
 | Intel Gen9 | a vertex function on the CPU + its two fixed pixel kernels | pixel shaders must be exactly a colour or one texture sample (`classify_fragment`); simulated engine in the host tests, picture matches the software device. |

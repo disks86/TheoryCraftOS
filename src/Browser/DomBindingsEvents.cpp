@@ -19,6 +19,7 @@
 // Events: the Event objects and their constructors, addEventListener and friends, dispatching with a capture phase, a target phase and a bubble phase,
 // on* handlers (properties and attributes), and what a click does when no listener stopped it.
 #include <initializer_list>
+#include "Dom/Form.hpp"
 #include "Browser/DomBindingsInternal.hpp"
 #include "Browser/Url.hpp"
 #include "Utility/Move.hpp"
@@ -586,7 +587,7 @@ void DomBindings::activate(dom::Node* node) {
       if (href.starts_with('#')) {
         c.host.set_hash(href);
       } else if (resolve_reference(vm_.allocator(), c.host.address(), href, &target)) {
-        c.host.navigate(target.view(), false);
+        c.host.navigate_target(target.view(), dom::browsing_target(n), dom::opens_without_opener(n));
       }
       return;
     }

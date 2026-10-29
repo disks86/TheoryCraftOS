@@ -176,7 +176,7 @@ struct Env {
 };
 
 // Creates the colored pipeline of BuiltinShaders (no culling) on the environment's device.
-Handle make_colored_pipeline(Env& e, bool textured = false) {
+Handle make_colored_pipeline(Env& e, bool textured = false, graphics::CullMode cull = graphics::CullMode::None, graphics::FrontFace front = graphics::FrontFace::CounterClockwise) {
   Handle vs = 0, fs = 0, pipe = 0;
   CHECK(e.kernel.create_shader(kPid, e.dev, {textured ? ShaderKind::TexturedVertex : ShaderKind::ColoredVertex, graphics::ShaderStage::Vertex, {}}, &vs) == status::kSuccess);
   CHECK(e.kernel.create_shader(kPid, e.dev, {textured ? ShaderKind::TexturedFragment : ShaderKind::ColoredFragment, graphics::ShaderStage::Fragment, {}}, &fs) == status::kSuccess);
@@ -187,7 +187,8 @@ Handle make_colored_pipeline(Env& e, bool textured = false) {
   pd.vertex_shader = vs, pd.fragment_shader = fs;
   pd.vertex_stride = d.vertex_stride, pd.attribute_count = d.attribute_count, pd.varying_count = d.varying_count, pd.texture_count = d.texture_count;
   for (uint32_t i = 0; i < d.attribute_count; ++i) pd.attributes[i] = d.attributes[i];
-  pd.cull_mode = graphics::CullMode::None;
+  pd.cull_mode = cull;
+  pd.front_face = front;
   CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &pipe) == status::kSuccess);
   return pipe;
 }
@@ -1362,6 +1363,8 @@ class TgsiMachine {
       }
     }
     if (!stack.empty()) return false;
+    std::vector<size_t> loops;
+    uint32_t steps = 0;
     for (size_t pc = 0; pc < body.size();) {
       const std::string& l = body[pc];
       const size_t sp = l.find(' ');
@@ -1396,6 +1399,36 @@ class TgsiMachine {
         continue;
       }
       if (op == "ENDIF") continue;
+      if (++steps > 100000) return false;
+      if (op == "BGNLOOP") {
+        loops.push_back(pc);
+        continue;
+      }
+      if (op == "ENDLOOP") {
+        if (loops.empty()) return false;
+        pc = loops.back();
+        continue;
+      }
+      if (op == "BRK" || op == "CONT") {
+        size_t e = pc;
+        int depth = 0;
+        for (; e < body.size(); ++e) {
+          const std::string o = body[e].substr(0, body[e].find(' '));
+          if (o == "BGNLOOP") ++depth;
+          if (o == "ENDLOOP") {
+            if (!depth) break;
+            --depth;
+          }
+        }
+        if (e >= body.size() || loops.empty()) return false;
+        if (op == "BRK") {
+          loops.pop_back();
+          pc = e + 1;
+        } else {
+          pc = e;   // (the ENDLOOP takes it back to the top)
+        }
+        continue;
+      }
       if (op == "IF") {
         float c[4];
         if (!fetch(args.at(0), c)) return false;
@@ -1526,6 +1559,10 @@ class TgsiMachine {
       else if (op == "SLT") r[i] = a[i] < b[i] ? 1.0f : 0.0f;
       else if (op == "SGE") r[i] = a[i] >= b[i] ? 1.0f : 0.0f;
       else if (op == "SEQ") r[i] = a[i] == b[i] ? 1.0f : 0.0f;
+      else if (op == "FSEQ") r[i] = __builtin_bit_cast(float, a[i] == b[i] ? 0xFFFFFFFFu : 0u);
+      else if (op == "FSNE") r[i] = __builtin_bit_cast(float, a[i] != b[i] ? 0xFFFFFFFFu : 0u);
+      else if (op == "FSLT") r[i] = __builtin_bit_cast(float, a[i] < b[i] ? 0xFFFFFFFFu : 0u);
+      else if (op == "FSGE") r[i] = __builtin_bit_cast(float, a[i] >= b[i] ? 0xFFFFFFFFu : 0u);
       else if (op == "SNE") r[i] = a[i] != b[i] ? 1.0f : 0.0f;
       else if (op == "CMP") r[i] = a[i] < 0 ? b[i] : c[i];
       else if (op == "FRC") r[i] = a[i] - floorf(a[i]);
@@ -1848,7 +1885,14 @@ class SpyDevice final : public graphics::IGraphicsDevice {
   uint32_t eu_varying = 0;
   graphics::QpuProgram qpu_program = graphics::QpuProgram::None;
   bool qpu_rows = false;
-  graphics::DeviceInfo info() const override { return inner_.info(); }
+  uint32_t limit = 0;   // 0: the inner device's push constant limit
+  uint32_t feature_mask = 0xFFFFFFFFu;   // the features the device lets through
+  graphics::DeviceInfo info() const override {
+    graphics::DeviceInfo i = inner_.info();
+    i.features &= feature_mask;
+    if (limit) i.max_push_constant_bytes = limit;
+    return i;
+  }
   graphics::IBuffer* create_buffer(uint64_t size, uint32_t usage) override { return inner_.create_buffer(size, usage); }
   void destroy_buffer(graphics::IBuffer* buffer) override { inner_.destroy_buffer(buffer); }
   graphics::IImage* create_image(const graphics::ImageDesc& desc) override { return inner_.create_image(desc); }
@@ -1948,6 +1992,7 @@ struct DxbcAsm {
   };
   std::vector<Element> inputs, outputs;
   uint32_t version_major = 4;
+  uint32_t constant_buffer = 8;   // size of the cb0 the program declares, in vec4s (0: none)
 
   DxbcAsm& ins(uint32_t opcode, std::initializer_list<Tokens> operands, uint32_t bits = 0) {
     size_t words = 1;
@@ -1979,7 +2024,12 @@ struct DxbcAsm {
   }
   std::vector<uint8_t> build() const {
     std::vector<uint8_t> shader;
-    put(shader, ((vertex ? 1u : 0u) << 16) | (version_major << 4)), put(shader, static_cast<uint32_t>(code.size() + 2));
+    // (cb0 declared with `constant_buffer` vec4s, as the compiler does)
+    const uint32_t declaration[4] = {0x04000059, 0x208E46, 0, constant_buffer};
+    const size_t extra = constant_buffer ? 4 : 0;
+    put(shader, ((vertex ? 1u : 0u) << 16) | (version_major << 4)), put(shader, static_cast<uint32_t>(code.size() + extra + 2));
+    if (constant_buffer)
+      for (uint32_t w : declaration) put(shader, w);
     for (uint32_t w : code) put(shader, w);
     struct Chunk {
       uint32_t fourcc;
@@ -2133,10 +2183,10 @@ void test_dxbc() {
         {14, 2, [](float a, float b, float) { return a / b; }},
         {51, 2, [](float a, float b, float) { return a < b ? a : b; }},
         {52, 2, [](float a, float b, float) { return a > b ? a : b; }},
-        {24, 2, [](float a, float b, float) { return a == b ? 1.0f : 0.0f; }},
-        {57, 2, [](float a, float b, float) { return a != b ? 1.0f : 0.0f; }},
-        {49, 2, [](float a, float b, float) { return a < b ? 1.0f : 0.0f; }},
-        {29, 2, [](float a, float b, float) { return a >= b ? 1.0f : 0.0f; }},
+        {24, 2, [](float a, float b, float) { return __builtin_bit_cast(float, a == b ? 0xFFFFFFFFu : 0u); }},   // (comparisons: all ones for true)
+        {57, 2, [](float a, float b, float) { return __builtin_bit_cast(float, a != b ? 0xFFFFFFFFu : 0u); }},
+        {49, 2, [](float a, float b, float) { return __builtin_bit_cast(float, a < b ? 0xFFFFFFFFu : 0u); }},
+        {29, 2, [](float a, float b, float) { return __builtin_bit_cast(float, a >= b ? 0xFFFFFFFFu : 0u); }},
         {55, 3, [](float a, float b, float c) { return a != 0 ? b : c; }},
         {26, 1, [](float a, float, float) { return a - floorf(a); }},
         {75, 1, [](float a, float, float) { return sqrtf(a); }},
@@ -2188,7 +2238,8 @@ void test_dxbc() {
         {
           TexSet no_textures;
           const int rt = roundtrip_agrees(allocator, *p, &no_textures);
-          if (rt == 2 && alu.opcode != 75) {   // (sqrt of a negative number: NaN, or 0 once saturated; the tokens give the root of its magnitude)
+          const bool comparison = alu.opcode == 24 || alu.opcode == 57 || alu.opcode == 49 || alu.opcode == 29;   // (all ones in the original, 1.0 in the tokens: only movc, if and discard read them alike)
+          if (rt == 2 && alu.opcode != 75 && !comparison) {   // (sqrt of a negative number: NaN, or 0 once saturated; the tokens give the root of its magnitude)
             if (wrong == 0) printf("  dxbc op %u variant %u: the Direct3D 9 tokens differ\n", alu.opcode, n);
             ++wrong;
           }
@@ -2361,12 +2412,12 @@ void test_dxbc() {
     NtStatus st = 0;
     {
       DxbcAsm a = dx_pixel_shader();
-      a.ins(30, {dx_dst(kOpTemp, 0, 0xF), dx_src(kOpTemp, 0), dx_src(kOpTemp, 1)});   // iadd
+      a.ins(45, {dx_dst(kOpTemp, 0, 0xF), dx_src(kOpTemp, 0), dx_src(kOpTemp, 1)});   // ld
       a.ins(62, {});
       compile_dxbc(allocator, a.build(), &st);
       CHECK(st == status::kNotSupported);
       DxbcAsm loop = dx_pixel_shader();
-      loop.ins(48, {});   // loop
+      loop.ins(76, {dx_src(kOpTemp, 0)});   // switch
       compile_dxbc(allocator, loop.build(), &st);
       CHECK(st == status::kNotSupported);
       compile_dxbc(allocator, std::vector<uint8_t>(8, 0), &st);
@@ -3263,6 +3314,897 @@ void test_device_suite() {
   CHECK(allocator.live == 0);
 }
 
+// --- Direct3D 10 constant buffers ----------------------------------------------------------------------------------------------------------------------------------------
+
+Tokens dx_scalar_imm(uint32_t bits) { return {0x4001u, bits}; }
+// cb<slot>[<element> + r<temp>.<component>]
+Tokens dx_cb_relative(uint32_t slot, uint32_t element, uint32_t temp, uint32_t component) {
+  return {2u | (1u << 2) | (0xE4u << 4) | (8u << 12) | (2u << 20) | (3u << 25), slot, element, 2u | (2u << 2) | (component << 4) | (1u << 20), temp};
+}
+// icb[r<temp>.<component>]
+Tokens dx_icb_relative(uint32_t temp, uint32_t component) { return {2u | (1u << 2) | (0xE4u << 4) | (9u << 12) | (1u << 20) | (2u << 22), 2u | (2u << 2) | (component << 4) | (1u << 20), temp}; }
+Tokens dx_icb(uint32_t index) { return {2u | (1u << 2) | (0xE4u << 4) | (9u << 12) | (1u << 20), index}; }
+
+void test_dxbc_constant_buffers() {
+  HostAllocator allocator;
+  {
+    // cb0[2] and cb1[4] are laid end to end: cb1[3] is register 5 of the constant block.
+    auto program_for = [&](uint32_t index_bits) {
+      DxbcAsm a = dx_pixel_shader();
+      a.constant_buffer = 2;
+      a.raw({0x04000059, 0x208E46, 1, 4});   // dcl_constant_buffer cb1[4]
+      a.ins(54, {dx_dst(kOpTemp, 0, 1), dx_scalar_imm(index_bits)});
+      a.ins(54, {dx_dst(kOpOut, 0, 0xF), dx_cb_relative(1, 1, 0, 0)});   // mov o0, cb1[r0.x + 1]
+      a.ins(62, {});
+      NtStatus st = 0;
+      UniquePointer<D3d9Program> p = compile_dxbc(allocator, a.build(), &st);
+      CHECK(st == status::kSuccess && p && p->constant_bytes() == 96);
+      return p;
+    };
+    for (int32_t index : {2, 0, -1, 3, 100, -50}) {   // (1 + index is the element: 3 and 0 are in range, 4 and above or below 0 are not)
+      UniquePointer<D3d9Program> p = program_for(static_cast<uint32_t>(index));
+      if (!p) continue;
+      for (unsigned set = 0; set < 4; ++set) {
+        uint8_t constants[128];
+        for (unsigned i = 0; i < 8; ++i)
+          for (unsigned k = 0; k < 4; ++k) memcpy(constants + i * 16 + k * 4, &kConstants[set][i][k], 4);
+        graphics::Vec4 varyings[4] = {}, c = {};
+        p->run_fragment(varyings, constants, nullptr, &c);
+        const int element = 1 + index;
+        const bool inside = element >= 0 && element < 4;
+        const float* want = kConstants[set][2 + (inside ? element : 0)];
+        const bool ok = inside ? (near_value(c.x, want[0]) && near_value(c.y, want[1]) && near_value(c.z, want[2]) && near_value(c.w, want[3])) : (c.x == 0 && c.y == 0 && c.z == 0 && c.w == 0);
+        if (!ok) printf("  cb1[r0.x + 1] with r0.x = %d: got %g %g %g %g\n", index, c.x, c.y, c.z, c.w);
+        CHECK(ok);
+      }
+    }
+    // The program as TGSI: not expressible (the register is an integer), and a device that is given 128 bytes cannot run a program that reads 256.
+    {
+      UniquePointer<D3d9Program> p = program_for(2);
+      String text(allocator);
+      CHECK(p && p->emit_tgsi(&text) == status::kNotSupported);
+    }
+    // The immediate constant buffer.
+    {
+      DxbcAsm a = dx_pixel_shader();
+      a.constant_buffer = 0;
+      const uint32_t icb_data[] = {53u | (3u << 11), 2 + 16, __builtin_bit_cast(uint32_t, 0.0f), __builtin_bit_cast(uint32_t, 0.0f), __builtin_bit_cast(uint32_t, 0.0f), __builtin_bit_cast(uint32_t, 1.0f),
+                                   __builtin_bit_cast(uint32_t, 1.0f), __builtin_bit_cast(uint32_t, 2.0f), __builtin_bit_cast(uint32_t, 3.0f), __builtin_bit_cast(uint32_t, 1.0f),
+                                   __builtin_bit_cast(uint32_t, 2.0f), __builtin_bit_cast(uint32_t, 4.0f), __builtin_bit_cast(uint32_t, 6.0f), __builtin_bit_cast(uint32_t, 1.0f),
+                                   __builtin_bit_cast(uint32_t, 3.0f), __builtin_bit_cast(uint32_t, 6.0f), __builtin_bit_cast(uint32_t, 9.0f), __builtin_bit_cast(uint32_t, 1.0f)};
+      a.code.insert(a.code.end(), icb_data, icb_data + 18);
+      a.ins(54, {dx_dst(kOpTemp, 0, 1), dx_scalar_imm(3)});
+      a.ins(0, {dx_dst(kOpOut, 0, 0xF), dx_icb_relative(0, 0), dx_icb(1)});   // add o0, icb[r0.x], icb[1]
+      a.ins(62, {});
+      NtStatus st = 0;
+      UniquePointer<D3d9Program> p = compile_dxbc(allocator, a.build(), &st);
+      CHECK(st == status::kSuccess && p);
+      if (p) {
+        uint8_t constants[128] = {};
+        graphics::Vec4 varyings[4] = {}, c = {};
+        p->run_fragment(varyings, constants, nullptr, &c);
+        CHECK(c.x == 3.0f + 1.0f && c.y == 6.0f + 2.0f && c.z == 9.0f + 3.0f && c.w == 2.0f);
+      }
+    }
+    // Declared sizes are checked: too big, a constant read past the end, a buffer that is not declared.
+    {
+      NtStatus st = 0;
+      DxbcAsm big = dx_pixel_shader();
+      big.constant_buffer = 200;
+      big.raw({0x04000059, 0x208E46, 1, 100});   // 300 vec4s in all: more than 256
+      big.ins(54, {dx_dst(kOpOut, 0, 0xF), dx_cb(0, 1)});
+      big.ins(62, {});
+      compile_dxbc(allocator, big.build(), &st);
+      CHECK(st == status::kNotSupported);
+      DxbcAsm past = dx_pixel_shader();
+      past.constant_buffer = 2;
+      past.ins(54, {dx_dst(kOpOut, 0, 0xF), dx_cb(0, 2)});   // cb0[2] of a cb0[2]
+      past.ins(62, {});
+      compile_dxbc(allocator, past.build(), &st);
+      CHECK(st == status::kNotSupported);
+      DxbcAsm undeclared = dx_pixel_shader();
+      undeclared.ins(54, {dx_dst(kOpOut, 0, 0xF), dx_cb(3, 0)});
+      undeclared.ins(62, {});
+      compile_dxbc(allocator, undeclared.build(), &st);
+      CHECK(st == status::kNotSupported);
+    }
+    // A device that takes 128 bytes of constants refuses a shader that reads 256; one that takes 4096 does not.
+    {
+      FakeScreen screen(8, 6);
+      graphics::SoftwareDevice software(allocator, &screen);
+      SpyDevice small(software);
+      small.limit = 128;
+      DxbcAsm a = dx_pixel_shader();
+      a.constant_buffer = 16;
+      a.ins(54, {dx_dst(kOpOut, 0, 0xF), dx_cb(0, 15)});
+      a.ins(62, {});
+      const std::vector<uint8_t> blob = a.build();
+      for (SpyDevice* device : {&small}) {
+        Kernel kernel(allocator);
+        AdapterConfig c;
+        c.display = &screen;
+        kernel.add_adapter(*device, c);
+        Handle adapter = 0, dev = 0, h = 0;
+        CHECK(kernel.open_process(kPid) == status::kSuccess && kernel.open_adapter_from_index(kPid, 0, &adapter) == status::kSuccess && kernel.create_device(kPid, adapter, &dev) == status::kSuccess);
+        ShaderDesc d;
+        d.kind = ShaderKind::Dxbc;
+        d.stage = graphics::ShaderStage::Fragment;
+        d.code = view_of(blob);
+        CHECK(kernel.create_shader(kPid, dev, d, &h) == status::kNotSupported);
+        kernel.close_process(kPid);
+      }
+      Kernel kernel(allocator);
+      AdapterConfig c;
+      c.display = &screen;
+      kernel.add_adapter(software, c);
+      Handle adapter = 0, dev = 0, h = 0;
+      CHECK(kernel.open_process(kPid) == status::kSuccess && kernel.open_adapter_from_index(kPid, 0, &adapter) == status::kSuccess && kernel.create_device(kPid, adapter, &dev) == status::kSuccess);
+      ShaderDesc d;
+      d.kind = ShaderKind::Dxbc;
+      d.stage = graphics::ShaderStage::Fragment;
+      d.code = view_of(blob);
+      CHECK(kernel.create_shader(kPid, dev, d, &h) == status::kSuccess);
+      AdapterCaps caps;
+      CHECK(kernel.query_adapter_caps(kPid, adapter, &caps) == status::kSuccess && caps.max_push_constant_bytes == 4096);
+      kernel.close_process(kPid);
+    }
+  }
+  CHECK(allocator.live == 0);
+}
+
+// --- Direct3D 10 integer and bitwise instructions --------------------------------------------------------------------------------------------------------------------------
+
+Tokens dx_imm_bits(uint32_t a, uint32_t b, uint32_t c, uint32_t d) { return {0x4002u, a, b, c, d}; }
+
+void test_dxbc_integers() {
+  HostAllocator allocator;
+  {
+    struct Op {
+      uint32_t opcode, sources;
+      uint32_t (*f)(uint32_t, uint32_t, uint32_t);
+    };
+    auto s32 = [](uint32_t v) { return static_cast<int32_t>(v); };
+    (void)s32;
+    static const Op kOps[] = {
+        {30, 2, [](uint32_t x, uint32_t y, uint32_t) { return x + y; }},
+        {40, 1, [](uint32_t x, uint32_t, uint32_t) { return 0u - x; }},
+        {35, 3, [](uint32_t x, uint32_t y, uint32_t z) { return x * y + z; }},
+        {36, 2, [](uint32_t x, uint32_t y, uint32_t) { return static_cast<int32_t>(x) > static_cast<int32_t>(y) ? x : y; }},
+        {37, 2, [](uint32_t x, uint32_t y, uint32_t) { return static_cast<int32_t>(x) < static_cast<int32_t>(y) ? x : y; }},
+        {83, 2, [](uint32_t x, uint32_t y, uint32_t) { return x > y ? x : y; }},
+        {84, 2, [](uint32_t x, uint32_t y, uint32_t) { return x < y ? x : y; }},
+        {82, 3, [](uint32_t x, uint32_t y, uint32_t z) { return x * y + z; }},
+        {41, 2, [](uint32_t x, uint32_t y, uint32_t) { return x << (y & 31); }},
+        {42, 2, [](uint32_t x, uint32_t y, uint32_t) { return static_cast<uint32_t>(static_cast<int32_t>(x) >> (y & 31)); }},
+        {85, 2, [](uint32_t x, uint32_t y, uint32_t) { return x >> (y & 31); }},
+        {1, 2, [](uint32_t x, uint32_t y, uint32_t) { return x & y; }},
+        {60, 2, [](uint32_t x, uint32_t y, uint32_t) { return x | y; }},
+        {87, 2, [](uint32_t x, uint32_t y, uint32_t) { return x ^ y; }},
+        {59, 1, [](uint32_t x, uint32_t, uint32_t) { return ~x; }},
+        {32, 2, [](uint32_t x, uint32_t y, uint32_t) { return x == y ? 0xFFFFFFFFu : 0u; }},
+        {39, 2, [](uint32_t x, uint32_t y, uint32_t) { return x != y ? 0xFFFFFFFFu : 0u; }},
+        {34, 2, [](uint32_t x, uint32_t y, uint32_t) { return static_cast<int32_t>(x) < static_cast<int32_t>(y) ? 0xFFFFFFFFu : 0u; }},
+        {33, 2, [](uint32_t x, uint32_t y, uint32_t) { return static_cast<int32_t>(x) >= static_cast<int32_t>(y) ? 0xFFFFFFFFu : 0u; }},
+        {79, 2, [](uint32_t x, uint32_t y, uint32_t) { return x < y ? 0xFFFFFFFFu : 0u; }},
+        {80, 2, [](uint32_t x, uint32_t y, uint32_t) { return x >= y ? 0xFFFFFFFFu : 0u; }},
+    };
+    // Four lanes each of three sources: small, negative, large, shift counts past 31.
+    const uint32_t x[4] = {7, 0xFFFFFFF9u, 0x80000000u, 0x12345678u}, y[4] = {3, 5, 0x7FFFFFFFu, 33}, z[4] = {100, 0xFFFFFF00u, 1, 0xDEADBEEFu};
+    unsigned compared = 0, wrong = 0;
+    for (const Op& op : kOps)
+      for (unsigned variant = 0; variant < 3; ++variant) {
+        DxbcAsm a = dx_pixel_shader();
+        a.ins(54, {dx_dst(kOpTemp, 1, 0xF), dx_imm_bits(x[0], x[1], x[2], x[3])});
+        a.ins(54, {dx_dst(kOpTemp, 2, 0xF), dx_imm_bits(y[0], y[1], y[2], y[3])});
+        a.ins(54, {dx_dst(kOpTemp, 3, 0xF), dx_imm_bits(z[0], z[1], z[2], z[3])});
+        // variant 0: as they are; 1: the first source negated (integer negation); 2: the first source's absolute value
+        const uint32_t modifier = variant == 1 ? 1 : variant == 2 ? 2 : 0;
+        std::vector<Tokens> operands = {dx_dst(kOpTemp, 0, 0xF), dx_src(kOpTemp, 1, 0xE4, modifier)};
+        if (op.sources > 1) operands.push_back(dx_src(kOpTemp, 2));
+        if (op.sources > 2) operands.push_back(dx_src(kOpTemp, 3));
+        Tokens flat;
+        for (const Tokens& t : operands) flat.insert(flat.end(), t.begin(), t.end());
+        a.code.push_back(op.opcode | (static_cast<uint32_t>(flat.size() + 1) << 24));
+        a.code.insert(a.code.end(), flat.begin(), flat.end());
+        a.ins(54, {dx_dst(kOpOut, 0, 0xF), dx_src(kOpTemp, 0)});
+        a.ins(62, {});
+        NtStatus st = 0;
+        UniquePointer<D3d9Program> p = compile_dxbc(allocator, a.build(), &st);
+        if (st != status::kSuccess || !p) {
+          printf("  integer op %u: status %x\n", op.opcode, static_cast<unsigned>(st));
+          ++wrong;
+          continue;
+        }
+        uint8_t constants[128] = {};
+        graphics::Vec4 varyings[4] = {}, c = {};
+        p->run_fragment(varyings, constants, nullptr, &c);
+        const float got_f[4] = {c.x, c.y, c.z, c.w};
+        bool ok = true;
+        for (int k = 0; k < 4; ++k) {
+          uint32_t first = x[k];
+          if (modifier == 1) first = 0u - first;
+          if (modifier == 2) first = static_cast<int32_t>(first) < 0 ? 0u - first : first;
+          ok = ok && __builtin_bit_cast(uint32_t, got_f[k]) == op.f(first, y[k], z[k]);
+        }
+        if (!ok) {
+          printf("  integer op %u variant %u wrong: %08x %08x %08x %08x\n", op.opcode, variant, __builtin_bit_cast(uint32_t, got_f[0]), __builtin_bit_cast(uint32_t, got_f[1]),
+                 __builtin_bit_cast(uint32_t, got_f[2]), __builtin_bit_cast(uint32_t, got_f[3]));
+          ++wrong;
+        }
+        // (not expressible in TGSI text or Direct3D 9 tokens)
+        String text(allocator);
+        CHECK(p->emit_tgsi(&text) == status::kNotSupported);
+        ++compared;
+      }
+    printf("  dxbc integers: %u programs, %u wrong\n", compared, wrong);
+    CHECK(wrong == 0 && compared == sizeof(kOps) / sizeof(kOps[0]) * 3);
+
+    // Conversions: ftoi / ftou saturate, itof / utof.
+    {
+      NtStatus st = 0;
+      // (dcl_temps comes first in a real program: put the declaration before the code)
+      DxbcAsm b = dx_pixel_shader();
+      b.code.clear();
+      b.ins(104, {{8}});
+      b.ins(54, {dx_dst(kOpTemp, 1, 0xF), dx_imm(-2.7f, 3.9f, 3.0e10f, -3.0e10f)});
+      b.ins(27, {dx_dst(kOpTemp, 2, 0xF), dx_src(kOpTemp, 1)});
+      b.ins(28, {dx_dst(kOpTemp, 3, 0xF), dx_src(kOpTemp, 1)});
+      b.ins(43, {dx_dst(kOpTemp, 4, 0xF), dx_src(kOpTemp, 2)});
+      b.ins(86, {dx_dst(kOpTemp, 5, 0xF), dx_src(kOpTemp, 3)});
+      b.ins(54, {dx_dst(kOpOut, 0, 0xF), dx_src(kOpTemp, 4)});
+      b.ins(54, {dx_dst(kOpOut, 0, 0x0), dx_src(kOpTemp, 5)});
+      b.ins(62, {});
+      UniquePointer<D3d9Program> p = compile_dxbc(allocator, b.build(), &st);
+      CHECK(st == status::kSuccess && p);
+      if (p) {
+        uint8_t constants[128] = {};
+        graphics::Vec4 varyings[4] = {}, c = {};
+        p->run_fragment(varyings, constants, nullptr, &c);
+        // ftoi: -2 3 INT_MAX INT_MIN, back as floats
+        CHECK(c.x == -2.0f && c.y == 3.0f && c.z == 2147483648.0f && c.w == -2147483648.0f);
+      }
+    }
+    // The idiom of a comparison turned into 1.0: `lt r1, v0, cb0[0]` ; `and r0, r1, l(1.0f)`.
+    {
+      DxbcAsm a = dx_pixel_shader();
+      a.ins(49, {dx_dst(kOpTemp, 1, 0xF), dx_src(kOpInput, 0), dx_cb(0, 0)});
+      a.ins(1, {dx_dst(kOpTemp, 0, 0xF), dx_src(kOpTemp, 1), dx_imm_bits(0x3F800000, 0x3F800000, 0x3F800000, 0x3F800000)});
+      a.ins(54, {dx_dst(kOpOut, 0, 0xF), dx_src(kOpTemp, 0)});
+      a.ins(62, {});
+      NtStatus st = 0;
+      UniquePointer<D3d9Program> p = compile_dxbc(allocator, a.build(), &st);
+      CHECK(st == status::kSuccess && p);
+      for (unsigned set = 0; set < 4 && p; ++set) {
+        uint8_t constants[128];
+        for (unsigned i = 0; i < 8; ++i)
+          for (unsigned k = 0; k < 4; ++k) memcpy(constants + i * 16 + k * 4, &kConstants[set][i][k], 4);
+        graphics::Vec4 varyings[4], c = {};
+        for (unsigned i = 0; i < 4; ++i) varyings[i] = {kInputs[set][i][0], kInputs[set][i][1], kInputs[set][i][2], kInputs[set][i][3]};
+        p->run_fragment(varyings, constants, nullptr, &c);
+        const float got[4] = {c.x, c.y, c.z, c.w};
+        bool ok = true;
+        for (int k = 0; k < 4; ++k) ok = ok && got[k] == (kInputs[set][0][k] < kConstants[set][0][k] ? 1.0f : 0.0f);
+        CHECK(ok);
+      }
+    }
+    // Two destinations: udiv (quotient, remainder) with a null one, umul's low word, a division by zero.
+    {
+      DxbcAsm a = dx_pixel_shader();
+      a.ins(54, {dx_dst(kOpTemp, 1, 0xF), dx_imm_bits(100, 7, 0xFFFFFFFFu, 9)});
+      a.ins(54, {dx_dst(kOpTemp, 2, 0xF), dx_imm_bits(7, 7, 2, 0)});
+      a.ins(78, {dx_dst(kOpTemp, 3, 0xF), dx_dst(kOpTemp, 4, 0xF), dx_src(kOpTemp, 1), dx_src(kOpTemp, 2)});   // udiv r3 (quotient), r4 (remainder)
+      a.ins(81, {dx_null(), dx_dst(kOpTemp, 5, 0xF), dx_src(kOpTemp, 1), dx_src(kOpTemp, 2)});                  // umul null, r5, ...
+      a.ins(54, {dx_dst(kOpOut, 0, 0xF), dx_src(kOpTemp, 3)});
+      a.ins(62, {});
+      NtStatus st = 0;
+      DxbcAsm b = a;
+      b.code.insert(b.code.begin(), {104u | (2u << 24), 8u});
+      UniquePointer<D3d9Program> p = compile_dxbc(allocator, b.build(), &st);
+      CHECK(st == status::kSuccess && p);
+      if (p) {
+        uint8_t constants[128] = {};
+        graphics::Vec4 varyings[4] = {}, c = {};
+        p->run_fragment(varyings, constants, nullptr, &c);
+        const uint32_t got[4] = {__builtin_bit_cast(uint32_t, c.x), __builtin_bit_cast(uint32_t, c.y), __builtin_bit_cast(uint32_t, c.z), __builtin_bit_cast(uint32_t, c.w)};
+        CHECK(got[0] == 100 / 7 && got[1] == 1 && got[2] == 0xFFFFFFFFu / 2 && got[3] == 0xFFFFFFFFu);   // (x / 0 is all ones)
+      }
+      DxbcAsm high = dx_pixel_shader();
+      high.ins(81, {dx_dst(kOpTemp, 5, 0xF), dx_dst(kOpTemp, 6, 0xF), dx_src(kOpTemp, 1), dx_src(kOpTemp, 2)});   // the high word of a product is not taken
+      high.ins(62, {});
+      compile_dxbc(allocator, high.build(), &st);
+      CHECK(st == status::kNotSupported);
+    }
+  }
+  CHECK(allocator.live == 0);
+}
+
+// --- Direct3D 10 loops -----------------------------------------------------------------------------------------------------------------------------------------------------
+
+void test_dxbc_loops() {
+  HostAllocator allocator;
+  {
+    auto run = [&](const DxbcAsm& a, graphics::Vec4* out, bool* tgsi_ok, bool check_text) {
+      NtStatus st = 0;
+      UniquePointer<D3d9Program> p = compile_dxbc(allocator, a.build(), &st);
+      CHECK(st == status::kSuccess && p);
+      if (!p) return;
+      uint8_t constants[128] = {};
+      graphics::Vec4 varyings[4] = {};
+      p->run_fragment(varyings, constants, nullptr, out);
+      if (!check_text) return;
+      String text(allocator);
+      const bool emitted = p->emit_tgsi(&text) == status::kSuccess;
+      *tgsi_ok = emitted;
+      if (!emitted) return;
+      TgsiMachine m;
+      const std::string source(text.data(), text.size());
+      bool ok = m.run(source);
+      const float want[4] = {out->x, out->y, out->z, out->w};
+      for (int k = 0; k < 4; ++k) ok = ok && near_value(m.out[0][k], want[k]);
+      if (!ok) printf("  loop tgsi mismatch:\n%s", source.c_str());
+      CHECK(ok);
+    };
+    // Integers: count to 5, add 1.5 each time round, skipping the pass where the counter is 3.
+    {
+      DxbcAsm a = dx_pixel_shader();
+      a.ins(104, {{2}});
+      a.ins(54, {dx_dst(kOpTemp, 0, 0xF), dx_imm_bits(0, 0, 0, 0)});
+      a.ins(48, {});                                                                                      // loop
+      a.ins(33, {dx_dst(kOpTemp, 1, 1), dx_src(kOpTemp, 0, 0x00), dx_scalar_imm(5)});                     //   ige r1.x, r0.x, 5
+      a.ins(3, {dx_scalar(kOpTemp, 1, 0)}, 1u << 18);                                                      //   breakc_nz r1.x
+      a.ins(30, {dx_dst(kOpTemp, 0, 1), dx_src(kOpTemp, 0, 0x00), dx_scalar_imm(1)});                     //   iadd r0.x, r0.x, 1
+      a.ins(32, {dx_dst(kOpTemp, 1, 2), dx_src(kOpTemp, 0, 0x00), dx_scalar_imm(3)});                     //   ieq r1.y, r0.x, 3
+      a.ins(8, {dx_scalar(kOpTemp, 1, 1)}, 1u << 18);                                                      //   continuec_nz r1.y
+      a.ins(0, {dx_dst(kOpTemp, 0, 2), dx_src(kOpTemp, 0, 0x55), dx_imm(1.5f, 1.5f, 1.5f, 1.5f)});        //   add r0.y, r0.y, 1.5
+      a.ins(22, {});                                                                                      // endloop
+      a.ins(54, {dx_dst(kOpOut, 0, 0xF), dx_src(kOpTemp, 0)});
+      a.ins(62, {});
+      graphics::Vec4 c = {};
+      bool tgsi_ok = true;
+      run(a, &c, &tgsi_ok, true);
+      CHECK(__builtin_bit_cast(uint32_t, c.x) == 5 && c.y == 4 * 1.5f);   // (the counter is 5; the pass of 3 added nothing)
+      CHECK(!tgsi_ok);   // (integer instructions are not TGSI text)
+    }
+    // Floats only: a loop TGSI text can say. Count to 4 in steps of 1.0, 0.5 more each time round; a nested loop and an if with a break inside it.
+    {
+      DxbcAsm a = dx_pixel_shader();
+      a.ins(104, {{2}});
+      a.ins(54, {dx_dst(kOpTemp, 0, 0xF), dx_imm(0, 0, 0, 0)});
+      a.ins(48, {});                                                                                      // loop
+      a.ins(29, {dx_dst(kOpTemp, 1, 1), dx_src(kOpTemp, 0, 0x00), dx_scalar_imm(__builtin_bit_cast(uint32_t, 4.0f))});   //   ge r1.x, r0.x, 4.0
+      a.ins(3, {dx_scalar(kOpTemp, 1, 0)}, 1u << 18);                                                      //   breakc_nz r1.x
+      a.ins(0, {dx_dst(kOpTemp, 0, 1), dx_src(kOpTemp, 0, 0x00), dx_imm(1.0f, 1.0f, 1.0f, 1.0f)});        //   add r0.x, r0.x, 1
+      a.ins(0, {dx_dst(kOpTemp, 0, 2), dx_src(kOpTemp, 0, 0x55), dx_imm(0.5f, 0.5f, 0.5f, 0.5f)});        //   add r0.y, r0.y, 0.5
+      a.ins(48, {});                                                                                      //   loop
+      a.ins(0, {dx_dst(kOpTemp, 0, 4), dx_src(kOpTemp, 0, 0xAA), dx_imm(0.25f, 0.25f, 0.25f, 0.25f)});   //     add r0.z, r0.z, 0.25
+      a.ins(2, {});                                                                                       //     break
+      a.ins(22, {});                                                                                      //   endloop
+      a.ins(22, {});                                                                                      // endloop
+      a.ins(54, {dx_dst(kOpOut, 0, 0xF), dx_src(kOpTemp, 0)});
+      a.ins(62, {});
+      graphics::Vec4 c = {};
+      bool tgsi_ok = false;
+      run(a, &c, &tgsi_ok, true);
+      CHECK(c.x == 4.0f && c.y == 2.0f && c.z == 1.0f);   // (the inner loop runs once a pass)
+      CHECK(tgsi_ok);
+    }
+    // A loop with no way out stops after the step limit instead of hanging.
+    {
+      DxbcAsm a = dx_pixel_shader();
+      a.ins(48, {});
+      a.ins(22, {});
+      a.ins(54, {dx_dst(kOpOut, 0, 0xF), dx_imm(1, 1, 1, 1)});
+      a.ins(62, {});
+      graphics::Vec4 c = {};
+      bool tgsi_ok = false;
+      run(a, &c, &tgsi_ok, false);
+      CHECK(c.x == 0 && c.w == 0);
+    }
+    // Malformed nesting.
+    {
+      NtStatus st = 0;
+      DxbcAsm stray = dx_pixel_shader();
+      stray.ins(2, {});   // break outside a loop
+      stray.ins(62, {});
+      compile_dxbc(allocator, stray.build(), &st);
+      CHECK(st == status::kInvalidParameter);
+      DxbcAsm straddle = dx_pixel_shader();
+      straddle.ins(48, {});
+      straddle.ins(31, {dx_scalar(kOpTemp, 0, 0)}, 1u << 18);
+      straddle.ins(22, {});   // endloop inside an if
+      straddle.ins(21, {});
+      straddle.ins(62, {});
+      compile_dxbc(allocator, straddle.build(), &st);
+      CHECK(st == status::kInvalidParameter);
+    }
+  }
+  CHECK(allocator.live == 0);
+}
+
+// --- Primitive topologies --------------------------------------------------------------------------------------------------------------------------------------------------
+
+void test_topologies() {
+  Env e;
+  Handle rt = e.alloc(kTarget, Format::A8R8G8B8, 16, 16), vb = e.buffer(kAllocVertexBuffer, 12 * 28), ib = e.buffer(kAllocIndexBuffer, 64);
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  auto vertices = [&](std::initializer_list<std::pair<float, float>> points) {
+    std::vector<float> v;
+    for (auto& p : points) {
+      const float shade = 0.2f + (p.first > 0 ? 0.3f : 0.0f) + (p.second > 0 ? 0.2f : 0.0f);   // (a vertex has its colour wherever it is repeated)
+      v.insert(v.end(), {p.first, p.second, 0.5f, shade, 1.0f - shade, 0.5f, 1.0f});
+    }
+    CHECK(e.write(vb, floats(v.data(), static_cast<uint32_t>(v.size()))));
+  };
+  auto picture = [&](Handle pipeline, auto commands) {
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    w.bind_pipeline(pipeline);
+    w.bind_vertex_buffer(1);
+    w.push_constants(floats(identity, 16));
+    commands(w);
+    w.end_pass();
+    const NtStatus rendered = e.render(w, {rt, vb, ib});
+    if (rendered != status::kSuccess) printf("  topology render: %x\n", static_cast<unsigned>(rendered));
+    CHECK(w.ok() && rendered == status::kSuccess);
+    std::vector<uint32_t> out;
+    for (uint32_t y = 0; y < 16; ++y)
+      for (uint32_t x = 0; x < 16; ++x) out.push_back(e.pixel(rt, x, y));
+    return out;
+  };
+  auto lit = [](const std::vector<uint32_t>& p) {
+    unsigned n = 0;
+    for (uint32_t v : p) n += v != 0xFF000000u;
+    return n;
+  };
+  auto write_indices16 = [&](std::initializer_list<uint16_t> list) {
+    std::vector<uint16_t> idx(list);
+    idx.resize(32, 0);
+    CHECK(e.write(ib, ConstByteView(reinterpret_cast<const uint8_t*>(idx.data()), idx.size() * 2)));
+  };
+
+  // A strip of four vertices is the two triangles of a list, with every second one turned; with back faces culled both survive, or neither does.
+  vertices({{-0.8f, -0.8f}, {0.8f, -0.8f}, {-0.8f, 0.8f}, {0.8f, 0.8f}});
+  for (graphics::FrontFace front : {graphics::FrontFace::CounterClockwise, graphics::FrontFace::Clockwise}) {
+    Handle pipe = make_colored_pipeline(e, false, graphics::CullMode::Back, front);
+    const std::vector<uint32_t> strip = picture(pipe, [](CommandWriter& w) { w.set_topology(Topology::TriangleStrip); w.draw(4); });
+    vertices({{-0.8f, -0.8f}, {0.8f, -0.8f}, {-0.8f, 0.8f}, {-0.8f, 0.8f}, {0.8f, -0.8f}, {0.8f, 0.8f}});   // (v0 v1 v2, then v2 v1 v3 written out)
+    const std::vector<uint32_t> list = picture(pipe, [](CommandWriter& w) { w.draw(6); });
+    vertices({{-0.8f, -0.8f}, {0.8f, -0.8f}, {-0.8f, 0.8f}, {0.8f, 0.8f}});
+    CHECK(strip == list);
+    // (the first triangle is on screen for one front face and culled for the other; its twin goes with it)
+    const unsigned n = lit(strip);
+    CHECK(n == 0 || n > 100);
+    if (front == graphics::FrontFace::CounterClockwise) CHECK(n != 0 || lit(picture(make_colored_pipeline(e, false, graphics::CullMode::Back, graphics::FrontFace::Clockwise), [](CommandWriter& w) { w.set_topology(Topology::TriangleStrip); w.draw(4); })) > 100);
+  }
+
+  // A fan: the first vertex is in every triangle.
+  {
+    Handle pipe = make_colored_pipeline(e);
+    const std::pair<float, float> fan[5] = {{0.0f, 0.0f}, {0.8f, 0.0f}, {0.5f, 0.6f}, {-0.3f, 0.8f}, {-0.8f, 0.1f}};
+    vertices({fan[0], fan[1], fan[2], fan[3], fan[4]});
+    const std::vector<uint32_t> as_fan = picture(pipe, [](CommandWriter& w) { w.set_topology(Topology::TriangleFan); w.draw(5); });
+    vertices({fan[0], fan[1], fan[2], fan[0], fan[2], fan[3], fan[0], fan[3], fan[4]});
+    const std::vector<uint32_t> as_list = picture(pipe, [](CommandWriter& w) { w.draw(9); });
+    CHECK(as_fan == as_list && lit(as_fan) > 30);
+  }
+
+  // An indexed strip with a restart: a quad, then a triangle; the vertex offset shifts the indices.
+  {
+    Handle pipe = make_colored_pipeline(e);
+    const std::pair<float, float> p[7] = {{-0.9f, -0.9f}, {-0.1f, -0.9f}, {-0.9f, -0.1f}, {-0.1f, -0.1f}, {0.1f, 0.1f}, {0.9f, 0.1f}, {0.5f, 0.9f}};
+    vertices({p[0], p[1], p[2], p[3], p[4], p[5], p[6]});
+    write_indices16({0, 1, 2, 3, 0xFFFF, 4, 5, 6});
+    const std::vector<uint32_t> strip = picture(pipe, [](CommandWriter& w) { w.bind_index_buffer(2, graphics::IndexType::Uint16); w.set_topology(Topology::TriangleStrip); w.draw_indexed(8); });
+    vertices({p[0], p[1], p[2], p[2], p[1], p[3], p[4], p[5], p[6]});
+    const std::vector<uint32_t> list = picture(pipe, [](CommandWriter& w) { w.draw(9); });
+    CHECK(strip == list && lit(strip) > 40);
+    // After a strip, a list draw with the stream's own indices is drawn from them again.
+    write_indices16({0, 1, 2, 4, 5, 6});
+    vertices({p[0], p[1], p[2], p[3], p[4], p[5], p[6]});
+    const std::vector<uint32_t> mixed = picture(pipe, [](CommandWriter& w) {
+      w.bind_index_buffer(2, graphics::IndexType::Uint16);
+      w.set_topology(Topology::TriangleStrip);
+      w.draw_indexed(3);   // (0 1 2)
+      w.set_topology(Topology::TriangleList);
+      w.draw_indexed(3, 3);   // (4 5 6)
+    });
+    vertices({p[0], p[1], p[2], p[4], p[5], p[6]});
+    const std::vector<uint32_t> expected = picture(pipe, [](CommandWriter& w) { w.draw(6); });
+    CHECK(mixed == expected && lit(mixed) > 20);
+    // Fewer than three vertices draw nothing; a bad topology is refused.
+    vertices({p[0], p[1], p[2]});
+    CHECK(lit(picture(pipe, [](CommandWriter& w) { w.set_topology(Topology::TriangleStrip); w.draw(2); })) == 0);
+    CommandWriter bad(e.allocator);
+    bad.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    bad.set_topology(static_cast<Topology>(7));
+    bad.end_pass();
+    CHECK(e.render(bad, {rt, vb, ib}) == status::kInvalidParameter);
+  }
+}
+
+// --- Direct3D 10 pipeline state, instancing, lines and points -------------------------------------------------------------------------------------------------------------
+
+bool close8(uint32_t a, uint32_t b, uint32_t tolerance = 2) { return (a > b ? a - b : b - a) <= tolerance; }
+
+void test_d3d10_state() {
+  Env e;
+  AdapterCaps caps;
+  CHECK(e.kernel.query_adapter_caps(kPid, e.adapter, &caps) == status::kSuccess);
+  const uint32_t all = graphics::kFeatureBlendState | graphics::kFeatureTexelAccess | graphics::kFeatureSystemInputs | graphics::kFeatureInstancing | graphics::kFeatureLines;
+  CHECK((caps.features & all) == all);
+
+  Handle rt = e.alloc(kTarget, Format::A8R8G8B8, 16, 16), vb = e.buffer(kAllocVertexBuffer, 256);
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  auto picture = [&](Handle pipe, auto commands) {
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0.2f, 0.4f, 0.6f, 1.0f}, 1, 0);
+    w.bind_pipeline(pipe);
+    w.bind_vertex_buffer(1);
+    w.push_constants(floats(identity, 16));
+    commands(w);
+    w.end_pass();
+    const NtStatus s = e.render(w, {rt, vb});
+    CHECK(w.ok());
+    std::vector<uint32_t> out;
+    if (s != status::kSuccess) {
+      printf("  d3d10 render: %x\n", static_cast<unsigned>(s));
+      return out;
+    }
+    for (uint32_t y = 0; y < 16; ++y)
+      for (uint32_t x = 0; x < 16; ++x) out.push_back(e.pixel(rt, x, y));
+    return out;
+  };
+  auto pipeline_for = [&](PipelineDesc pd, NtStatus* status_out = nullptr) {
+    Handle vs = 0, fs = 0, pipe = 0;
+    CHECK(e.kernel.create_shader(kPid, e.dev, {ShaderKind::ColoredVertex, graphics::ShaderStage::Vertex, {}}, &vs) == status::kSuccess);
+    CHECK(e.kernel.create_shader(kPid, e.dev, {ShaderKind::ColoredFragment, graphics::ShaderStage::Fragment, {}}, &fs) == status::kSuccess);
+    graphics::GraphicsPipelineDesc d;
+    graphics::describe_colored_pipeline(&d);
+    pd.vertex_shader = vs, pd.fragment_shader = fs;
+    pd.vertex_stride = d.vertex_stride, pd.attribute_count = d.attribute_count, pd.varying_count = d.varying_count;
+    for (uint32_t i = 0; i < d.attribute_count; ++i) pd.attributes[i] = d.attributes[i];
+    pd.cull_mode = graphics::CullMode::None;
+    const NtStatus s = e.kernel.create_pipeline(kPid, e.dev, pd, &pipe);
+    if (status_out) *status_out = s;
+    else CHECK(s == status::kSuccess);
+    return pipe;
+  };
+  // A big triangle of one colour at half alpha.
+  const float quad[21] = {-1, -1, 0.5f, 1, 0.5f, 0, 0.5f, 3, -1, 0.5f, 1, 0.5f, 0, 0.5f, -1, 3, 0.5f, 1, 0.5f, 0, 0.5f};
+  CHECK(e.write(vb, floats(quad, 21)));
+
+  // Blend state: additive, through the pipeline; and the same through the escape ABI's optional words.
+  PipelineDesc add;
+  add.blend.custom = add.blend.enable = true;
+  add.blend.src_color = add.blend.dst_color = add.blend.src_alpha = add.blend.dst_alpha = graphics::BlendFactor::One;
+  Handle pipe = pipeline_for(add);
+  std::vector<uint32_t> img = picture(pipe, [](CommandWriter& w) { w.draw(3); });
+  CHECK(!img.empty() && close8(img[40] >> 16 & 0xFF, 255) && close8(img[40] >> 8 & 0xFF, 0x66 + 0x80 > 255 ? 255 : 0x66 + 0x80) && close8(img[40] & 0xFF, 0x99));
+  PipelineDesc mask_green;
+  mask_green.blend.custom = true;
+  mask_green.blend.write_mask = 0x2;
+  img = picture(pipeline_for(mask_green), [](CommandWriter& w) { w.draw(3); });
+  CHECK(!img.empty() && close8(img[40] >> 16 & 0xFF, 0x33) && close8(img[40] >> 8 & 0xFF, 0x80) && close8(img[40] & 0xFF, 0x99));   // (only green stored)
+  {
+    Handle vs = 0, fs = 0, via_escape = 0;
+    CHECK(e.kernel.create_shader(kPid, e.dev, {ShaderKind::ColoredVertex, graphics::ShaderStage::Vertex, {}}, &vs) == status::kSuccess);
+    CHECK(e.kernel.create_shader(kPid, e.dev, {ShaderKind::ColoredFragment, graphics::ShaderStage::Fragment, {}}, &fs) == status::kSuccess);
+    ByteBuffer req(e.allocator);
+    req.put32(static_cast<uint32_t>(EscapeOp::CreatePipeline)), req.put32(vs), req.put32(fs), req.put32(28), req.put32(2), req.put32(1), req.put32(0);
+    req.put32(2), req.put32(0), req.put32(0);   // cull none, front face, flags
+    const uint32_t attributes[12] = {0, 2, 0, 1, 3, 12, 0, 0, 0, 0, 0, 0};
+    for (uint32_t w : attributes) req.put32(w);
+    for (uint32_t w : {0u, 7u, 0u, 0u, 0u, 255u, 255u, 0u}) req.put32(w);   // stencil off
+    for (uint32_t w : {7u, 1u, 1u, 1u, 1u, 1u, 1u, 0u, 0u, 15u, 0u}) req.put32(w);   // depth compare Always, additive, no per-instance attributes
+    uint8_t reply[16];
+    uint32_t reply_bytes = 0;
+    const NtStatus st = e.kernel.escape(kPid, e.dev, req.view(), ByteView(reply, sizeof reply), &reply_bytes);
+    CHECK(st == status::kSuccess && reply_bytes == 4);
+    via_escape = ByteReader(ConstByteView(reply, 4)).le32();
+    std::vector<uint32_t> a = picture(via_escape, [](CommandWriter& w) { w.draw(3); });
+    CHECK(!a.empty() && a == picture(pipe, [](CommandWriter& w) { w.draw(3); }));
+    // A malformed trailer is refused.
+    req.put32(1);
+    CHECK(e.kernel.escape(kPid, e.dev, req.view(), ByteView(reply, sizeof reply), &reply_bytes) == status::kInvalidParameter);
+  }
+
+  // Lines and points through the stream.
+  {
+    Handle plain = pipeline_for(PipelineDesc());
+    const float line[14] = {-1, 0, 0.5f, 1, 1, 1, 1, 1, 0, 0.5f, 1, 1, 1, 1};
+    CHECK(e.write(vb, floats(line, 14)));
+    auto lit = [](const std::vector<uint32_t>& p) {
+      unsigned n = 0;
+      for (uint32_t v : p) n += v != 0xFF336699u;
+      return n;
+    };
+    img = picture(plain, [](CommandWriter& w) { w.set_topology(Topology::LineList); w.draw(2); });
+    CHECK(lit(img) >= 16 && lit(img) <= 18);
+    const float strip[21] = {-1, -0.5f, 0.5f, 1, 1, 1, 1, 0, 0.5f, 0.5f, 1, 1, 1, 1, 0.9f, -0.5f, 0.5f, 1, 1, 1, 1};
+    CHECK(e.write(vb, floats(strip, 21)));
+    const std::vector<uint32_t> as_strip = picture(plain, [](CommandWriter& w) { w.set_topology(Topology::LineStrip); w.draw(3); });
+    const float list[28] = {-1, -0.5f, 0.5f, 1, 1, 1, 1, 0, 0.5f, 0.5f, 1, 1, 1, 1, 0, 0.5f, 0.5f, 1, 1, 1, 1, 0.9f, -0.5f, 0.5f, 1, 1, 1, 1};
+    CHECK(e.write(vb, floats(list, 28)));
+    const std::vector<uint32_t> as_list = picture(plain, [](CommandWriter& w) { w.set_topology(Topology::LineList); w.draw(4); });
+    if (as_strip != as_list) printf("  line strip: %zu pixels vs %zu; lit %u vs %u\n", as_strip.size(), as_list.size(), lit(as_strip), lit(as_list));
+    CHECK(as_strip == as_list && lit(as_strip) > 12);
+    const float points[14] = {-0.5f, -0.5f, 0.5f, 1, 1, 1, 1, 0.5f, 0.5f, 0.5f, 1, 1, 1, 1};
+    CHECK(e.write(vb, floats(points, 14)));
+    img = picture(plain, [](CommandWriter& w) { w.set_topology(Topology::PointList); w.draw(2); });
+    CHECK(lit(img) == 2);
+    // Back to triangles: the topology of the stream decides, not what the device last had.
+    CHECK(e.write(vb, floats(quad, 21)));
+    img = picture(plain, [](CommandWriter& w) {
+      w.set_topology(Topology::PointList);
+      w.draw(1);
+      w.set_topology(Topology::TriangleList);
+      w.draw(3);
+    });
+    CHECK(lit(img) == 256);
+  }
+
+  // Instancing: the per-instance attribute (location 1, two floats) shifts a small triangle; a vs_2_0 does the adding.
+  {
+    Asm vs(true, 2, 0);
+    vs.dcl(0, 0, kRegInput, 0).dcl(5, 0, kRegInput, 1);
+    vs.def(4, 0, 0, 0, 1);
+    vs.op(kOpAdd, {Asm::dst(kRegRastOut, 0, 0x7), Asm::src(kRegInput, 0), Asm::src(kRegInput, 1)});
+    vs.op(kOpMov, {Asm::dst(kRegRastOut, 0, 0x8), Asm::src(kRegConst, 4)});
+    vs.def(5, 1, 1, 1, 1);
+    vs.op(kOpMov, {Asm::dst(kRegAttrOut, 0), Asm::src(kRegConst, 5)});
+    vs.end();
+    Handle vsh = d3d9_shader(e, vs), psh = d3d9_shader(e, color_ps());
+    PipelineDesc pd;
+    pd.vertex_shader = vsh, pd.fragment_shader = psh, pd.vertex_stride = 20, pd.attribute_count = 2, pd.varying_count = 1;
+    pd.attributes[0] = {0, graphics::VertexFormat::Float3, 0};
+    pd.attributes[1] = {1, graphics::VertexFormat::Float2, 12, true};
+    pd.cull_mode = graphics::CullMode::None;
+    Handle instanced = 0;
+    CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &instanced) == status::kSuccess);
+    // elements 0, 1, 2: the triangle's three vertices AND the offsets of instances 0, 1, 2
+    const float data[15] = {-1.0f, -1.0f, 0.5f, 0.0f, 0.0f, -0.7f, -1.0f, 0.5f, 1.0f, 0.0f, -1.0f, -0.7f, 0.5f, 0.0f, 1.0f};
+    CHECK(e.write(vb, floats(data, 15)));
+    img = picture(instanced, [](CommandWriter& w) { w.draw_instanced(3, 3); });
+    unsigned lit = 0;
+    for (uint32_t v : img) lit += v == 0xFFFFFFFFu;
+    CHECK(!img.empty() && lit >= 3);   // (three small triangles; each covers a pixel or two)
+    // instance 1 is at +1.0 in x: a lit pixel in the right half, instance 2 at +1.0 in y: one in the lower half
+    bool right = false, lower = false;
+    for (uint32_t y = 0; y < 16; ++y)
+      for (uint32_t x = 0; x < 16; ++x)
+        if (img[y * 16 + x] == 0xFFFFFFFFu) {
+          right = right || x >= 8;
+          lower = lower || y >= 8;
+        }
+    CHECK(right && lower);
+    // A range that reaches past the vertex buffer's elements is refused when the stream is checked.
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    w.bind_pipeline(instanced);
+    w.bind_vertex_buffer(1);
+    w.draw_instanced(3, 100);
+    w.end_pass();
+    CHECK(e.render(w, {rt, vb}) == status::kInvalidParameter);
+  }
+
+  // A device without the features refuses the state and the draws rather than drawing something else.
+  {
+    FakeScreen screen(8, 6);
+    graphics::SoftwareDevice software(e.allocator, &screen);
+    SpyDevice plain_device(software);
+    plain_device.feature_mask = 0;
+    Kernel kernel(e.allocator);
+    AdapterConfig c;
+    c.display = &screen;
+    kernel.add_adapter(plain_device, c);
+    Handle adapter = 0, dev = 0, vsh = 0, fsh = 0, ctx = 0;
+    CHECK(kernel.open_process(kPid) == status::kSuccess && kernel.open_adapter_from_index(kPid, 0, &adapter) == status::kSuccess && kernel.create_device(kPid, adapter, &dev) == status::kSuccess);
+    CHECK(kernel.create_context(kPid, dev, ContextPriority::Normal, &ctx) == status::kSuccess);
+    CHECK(kernel.create_shader(kPid, dev, {ShaderKind::ColoredVertex, graphics::ShaderStage::Vertex, {}}, &vsh) == status::kSuccess);
+    CHECK(kernel.create_shader(kPid, dev, {ShaderKind::ColoredFragment, graphics::ShaderStage::Fragment, {}}, &fsh) == status::kSuccess);
+    graphics::GraphicsPipelineDesc d;
+    graphics::describe_colored_pipeline(&d);
+    auto make = [&](PipelineDesc pd, Handle* out) {
+      pd.vertex_shader = vsh, pd.fragment_shader = fsh;
+      pd.vertex_stride = d.vertex_stride, pd.attribute_count = d.attribute_count, pd.varying_count = d.varying_count;
+      for (uint32_t i = 0; i < d.attribute_count; ++i) pd.attributes[i] = d.attributes[i];
+      return kernel.create_pipeline(kPid, dev, pd, out);
+    };
+    Handle h = 0;
+    PipelineDesc blend, depth, instance;
+    blend.blend.custom = true;
+    depth.depth_compare = graphics::CompareOp::Greater;
+    CHECK(make(blend, &h) == status::kNotSupported && make(depth, &h) == status::kNotSupported);
+    CHECK(make(PipelineDesc(), &h) == status::kSuccess);
+    AllocationDesc rd;
+    rd.flags = kAllocRenderTarget, rd.format = Format::A8R8G8B8, rd.width = 8, rd.height = 8;
+    Handle target = 0, buffer = 0;
+    CHECK(kernel.create_allocation(kPid, dev, rd, &target) == status::kSuccess);
+    AllocationDesc vd;
+    vd.flags = kAllocVertexBuffer, vd.size = 256;
+    CHECK(kernel.create_allocation(kPid, dev, vd, &buffer) == status::kSuccess);
+    auto stream = [&](auto commands) {
+      CommandWriter w(e.allocator);
+      w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+      w.bind_pipeline(h);
+      w.bind_vertex_buffer(1);
+      commands(w);
+      w.end_pass();
+      const Handle list[2] = {target, buffer};
+      return kernel.render(kPid, ctx, w.view(), ArrayView<const Handle>(list, 2));
+    };
+    CHECK(stream([](CommandWriter& w) { w.draw(3); }) == status::kSuccess);
+    CHECK(stream([](CommandWriter& w) { w.draw_instanced(3, 2); }) == status::kInvalidParameter);
+    CHECK(stream([](CommandWriter& w) { w.set_topology(Topology::LineList); w.draw(2); }) == status::kInvalidParameter);
+    CHECK(stream([](CommandWriter& w) { w.set_topology(Topology::TriangleStrip); w.draw(3); }) == status::kSuccess);   // (strips are expanded: any device)
+    kernel.close_process(kPid);
+  }
+}
+
+// --- Direct3D 10 system values and texel access (shaders from a real compiler) ------------------------------------------------------------------------------------------------
+
+void test_dxbc_system_values() {
+  Env e;
+  const std::vector<uint8_t> ps_blob = read_blob("ps_texel.dxbc"), vs_blob = read_blob("vs_ids.dxbc");
+  CHECK(!ps_blob.empty() && !vs_blob.empty());
+  Handle rt = e.alloc(kTarget, Format::A8R8G8B8, 16, 16), vb = e.buffer(kAllocVertexBuffer, 256);
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  auto dxbc_shader = [&](const std::vector<uint8_t>& blob, graphics::ShaderStage stage, NtStatus* st = nullptr) {
+    Handle h = 0;
+    ShaderDesc d;
+    d.kind = ShaderKind::Dxbc;
+    d.stage = stage;
+    d.code = view_of(blob);
+    const NtStatus s = e.kernel.create_shader(kPid, e.dev, d, &h);
+    if (st) *st = s;
+    else CHECK(s == status::kSuccess);
+    return h;
+  };
+
+  // --- ps_texel: Load, SampleLevel, GetDimensions, SV_Position, SV_IsFrontFace and SV_PrimitiveID of one texture and one triangle.
+  {
+    Asm vs(true, 2, 0);   // mov oPos, v0 ; mov oT0, v1   (the uv)
+    vs.dcl(0, 0, kRegInput, 0).dcl(5, 0, kRegInput, 1);
+    vs.op(kOpMov, {Asm::dst(kRegRastOut, 0), Asm::src(kRegInput, 0)});
+    vs.op(kOpMov, {Asm::dst(kRegTexOut, 0), Asm::src(kRegInput, 1)});
+    vs.end();
+    Handle texture = e.alloc(kTexture, Format::A8R8G8B8, 8, 8, 4);
+    for (uint32_t level = 0; level < 4; ++level) {
+      const uint32_t n = 8u >> level;
+      std::vector<uint32_t> pixels(n * n);
+      for (uint32_t y = 0; y < n; ++y)
+        for (uint32_t x = 0; x < n; ++x) pixels[y * n + x] = level == 0 ? 0xFF000000u | (x * 20) << 16 | (y * 20) << 8 : 0xFF000000u | (100 + x * 10) << 16 | (50 + y * 10) << 8 | 40;
+      CHECK(e.write(texture, ConstByteView(reinterpret_cast<const uint8_t*>(pixels.data()), pixels.size() * 4), kLockDiscard, level));
+    }
+    Handle vsh = d3d9_shader(e, vs), psh = dxbc_shader(ps_blob, graphics::ShaderStage::Fragment);
+    PipelineDesc pd;
+    pd.vertex_shader = vsh, pd.fragment_shader = psh, pd.vertex_stride = 20, pd.attribute_count = 2, pd.varying_count = 3, pd.texture_count = 1;
+    pd.attributes[0] = {0, graphics::VertexFormat::Float3, 0};
+    pd.attributes[1] = {1, graphics::VertexFormat::Float2, 12};
+    pd.cull_mode = graphics::CullMode::None;
+    Handle pipe = 0;
+    CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &pipe) == status::kSuccess);
+    auto draw = [&](const float* v) {
+      CHECK(e.write(vb, floats(v, 15)));
+      CommandWriter w(e.allocator);
+      w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+      w.bind_pipeline(pipe);
+      w.bind_vertex_buffer(1);
+      graphics::SamplerDesc sampler;
+      sampler.mip_filter = graphics::MipFilter::Nearest;
+      w.bind_texture(0, 2, sampler);
+      w.draw(3);
+      w.end_pass();
+      CHECK(e.render(w, {rt, vb, texture}) == status::kSuccess);
+    };
+    const float ccw[15] = {-1, -1, 0.5f, 0.5f, 0.5f, 3, -1, 0.5f, 0.5f, 0.5f, -1, 3, 0.5f, 0.5f, 0.5f};
+    const float cw[15] = {-1, -1, 0.5f, 0.5f, 0.5f, -1, 3, 0.5f, 0.5f, 0.5f, 3, -1, 0.5f, 0.5f, 0.5f};
+    draw(ccw);
+    const uint32_t a = e.pixel(rt, 5, 3);
+    draw(cw);
+    const uint32_t b = e.pixel(rt, 5, 3);
+    // a = Load(2, 1, 0): (40, 20, 0); b = SampleLevel(0.5, 0.5, 1.0): level 1 texel (2, 2) = (120, 70, 40); the rest: (5.5/16, 3.5/16, facing, 0) + (1, 1, 0.5, 0)
+    auto expected = [&](uint32_t channel_index, bool front) {
+      const float load[3] = {40.0f / 255, 20.0f / 255, 0.0f}, level[3] = {120.0f / 255, 70.0f / 255, 40.0f / 255};
+      const float extra[3] = {5.5f / 16 + 1.0f, 3.5f / 16 + 1.0f, (front ? 1.0f : 0.0f) + 0.5f};
+      float v = load[channel_index] * 0.5f + level[channel_index] * 0.25f + extra[channel_index];
+      return static_cast<uint32_t>((v < 0 ? 0 : v > 1 ? 1 : v) * 255.0f + 0.5f);
+    };
+    // (red and green saturate at 1 here; blue tells the facing)
+    const bool a_front = close8(a & 0xFF, expected(2, true), 3);
+    const bool b_front = close8(b & 0xFF, expected(2, true), 3);
+    CHECK(a_front != b_front);   // the two windings face opposite ways
+    CHECK(close8(a & 0xFF, expected(2, a_front), 3) && close8(b & 0xFF, expected(2, b_front), 3));
+    CHECK((a >> 16 & 0xFF) == 255 && (a >> 8 & 0xFF) == 255);
+  }
+
+  // --- vs_ids: SV_VertexID and SV_InstanceID, with per-instance attributes
+  {
+    Handle vsh = dxbc_shader(vs_blob, graphics::ShaderStage::Vertex), psh = d3d9_shader(e, color_ps());
+    PipelineDesc pd;
+    pd.vertex_shader = vsh, pd.fragment_shader = psh, pd.vertex_stride = 20, pd.attribute_count = 2, pd.varying_count = 1;
+    pd.attributes[0] = {0, graphics::VertexFormat::Float3, 0};
+    pd.attributes[1] = {1, graphics::VertexFormat::Float2, 12, true};
+    pd.cull_mode = graphics::CullMode::None;
+    Handle pipe = 0;
+    CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &pipe) == status::kSuccess);
+    const float data[15] = {-1.0f, -1.0f, 0.5f, 0.0f, 0.0f, -0.4f, -1.0f, 0.5f, 1.0f, 0.0f, -1.0f, -0.4f, 0.5f, 1.8f, 0.0f};
+    CHECK(e.write(vb, floats(data, 15)));
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    w.bind_pipeline(pipe);
+    w.bind_vertex_buffer(1);
+    w.draw_instanced(3, 3);
+    w.end_pass();
+    CHECK(e.render(w, {rt, vb}) == status::kSuccess);
+    uint32_t red_by_band[3] = {0, 0, 0};
+    for (uint32_t y = 0; y < 16; ++y)
+      for (uint32_t x = 0; x < 16; ++x) {
+        const uint32_t p = e.pixel(rt, x, y);
+        if (p == 0xFF000000u) continue;
+        const uint32_t band = x < 4 ? 0 : x < 12 ? 1 : 2;
+        if ((p >> 16 & 0xFF) > red_by_band[band]) red_by_band[band] = p >> 16 & 0xFF;
+      }
+    // instance 0: red 0; instance 1 (offset +1.0 clip = +8 pixels): red 0.1 = 26; instance 2 (+1.8 = +14.4 pixels): red 0.2 = 51
+    CHECK(red_by_band[0] <= 2 && close8(red_by_band[1], 26, 2) && close8(red_by_band[2], 51, 2));
+  }
+
+  // A device without system values or texel access does not get these shaders (they would read zeros).
+  {
+    FakeScreen screen(8, 6);
+    graphics::SoftwareDevice software(e.allocator, &screen);
+    SpyDevice plain_device(software);
+    plain_device.feature_mask = 0;
+    Kernel kernel(e.allocator);
+    AdapterConfig c;
+    c.display = &screen;
+    kernel.add_adapter(plain_device, c);
+    Handle adapter = 0, dev = 0, h = 0;
+    CHECK(kernel.open_process(kPid) == status::kSuccess && kernel.open_adapter_from_index(kPid, 0, &adapter) == status::kSuccess && kernel.create_device(kPid, adapter, &dev) == status::kSuccess);
+    ShaderDesc d;
+    d.kind = ShaderKind::Dxbc;
+    d.stage = graphics::ShaderStage::Fragment;
+    d.code = view_of(ps_blob);
+    CHECK(kernel.create_shader(kPid, dev, d, &h) == status::kNotSupported);
+    d.stage = graphics::ShaderStage::Vertex;
+    d.code = view_of(vs_blob);
+    CHECK(kernel.create_shader(kPid, dev, d, &h) == status::kNotSupported);
+    kernel.close_process(kPid);
+  }
+
+  // Truncations and bit flips of the two blobs.
+  {
+    HostAllocator allocator;
+    unsigned compiled = 0, refused = 0;
+    uint32_t seed = 2024;
+    NtStatus st = 0;
+    for (const std::vector<uint8_t>* blob : {&ps_blob, &vs_blob}) {
+      for (size_t cut = 0; cut < blob->size(); cut += 3) {
+        compile_dxbc(allocator, std::vector<uint8_t>(blob->begin(), blob->begin() + static_cast<long>(cut)), &st);
+        st == status::kSuccess ? ++compiled : ++refused;
+      }
+      for (int i = 0; i < 3000; ++i) {
+        std::vector<uint8_t> t = *blob;
+        seed = seed * 1664525u + 1013904223u;
+        t[(seed >> 8) % t.size()] ^= static_cast<uint8_t>(1u << ((seed >> 3) % 8));
+        UniquePointer<D3d9Program> p = compile_dxbc(allocator, t, &st);
+        if (st == status::kSuccess) {
+          ++compiled;
+          graphics::Vec4 v[4] = {}, color;
+          uint8_t constants[128] = {};
+          graphics::ShaderIo io;
+          p->run_vertex_ex(v, constants, graphics::VertexContext(), &io);
+          TexSet textures;
+          p->run_fragment_ex(v, graphics::FragmentContext(), constants, &textures, &color);
+        } else {
+          ++refused;
+        }
+      }
+    }
+    printf("  dxbc system value fuzz: %u compiled, %u refused\n", compiled, refused);
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -3288,6 +4230,12 @@ int main() {
   test_d3d9_tgsi_reaches_device();
   test_dxbc();
   test_dxbc_real();
+  test_dxbc_constant_buffers();
+  test_dxbc_integers();
+  test_dxbc_loops();
+  test_topologies();
+  test_d3d10_state();
+  test_dxbc_system_values();
   test_device_forms();
   test_sm3_and_sm51();
   test_ps1();

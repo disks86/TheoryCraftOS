@@ -83,7 +83,8 @@ PipelineObject::~PipelineObject() {
 class Adapter::StreamRunner {
  public:
   StreamRunner(Adapter& adapter, ConstByteView commands, ArrayView<const SharedPointer<Allocation>> allocations)
-      : adapter_(adapter), mm_(adapter.vidmm_), commands_(commands), allocations_(allocations) {}
+      : adapter_(adapter), mm_(adapter.vidmm_), commands_(commands), allocations_(allocations), transient_(adapter.allocator_) {}
+  ~StreamRunner() { release_transient(); }
 
   NtStatus validate(IPipelineLookup& lookup, List<SharedPointer<PipelineObject>>& pipelines) {
     exec_ = false;
@@ -132,6 +133,7 @@ class Adapter::StreamRunner {
     if (cb_) return status::kSuccess;
     cb_ = adapter_.device_.create_command_buffer();
     if (!cb_) return status::kNoMemory;
+    device_topology_ = graphics::PrimitiveTopology::TriangleList;
     cb_->begin();
     return status::kSuccess;
   }
@@ -142,6 +144,7 @@ class Adapter::StreamRunner {
     const bool done = ended && adapter_.device_.submit(cb_);
     adapter_.device_.destroy_command_buffer(cb_);
     cb_ = nullptr;
+    release_transient();
     return done ? status::kSuccess : status::kInvalidDeviceState;
   }
 
@@ -168,10 +171,18 @@ class Adapter::StreamRunner {
       case Op::BindTexture: return bind_texture(p);
       case Op::SetViewport: return set_viewport(p);
       case Op::SetScissor: return set_scissor(p);
-      case Op::Draw: return draw(p, false);
-      case Op::DrawIndexed: return draw(p, true);
+      case Op::Draw: return draw(p, false, false);
+      case Op::DrawIndexed: return draw(p, true, false);
+      case Op::DrawInstanced: return draw(p, false, true);
+      case Op::DrawIndexedInstanced: return draw(p, true, true);
       case Op::CopyRegion: return copy_region(p);
       case Op::GenerateMipmaps: return generate_mipmaps(p);
+      case Op::SetTopology: {
+        const uint32_t topology = p.le32();
+        if (!exact(p) || topology > static_cast<uint32_t>(Topology::PointList)) return kBad;
+        topology_ = static_cast<Topology>(topology);
+        return status::kSuccess;
+      }
     }
     return kBad;
   }
@@ -272,7 +283,7 @@ class Adapter::StreamRunner {
 
   NtStatus push_constants(ByteReader& p) {
     const uint32_t count = p.le32();
-    if (!p.ok() || count == 0 || count > graphics::kMaxPushConstantBytes || count % 16) return kBad;
+    if (!p.ok() || count == 0 || count > adapter_.caps_.max_push_constant_bytes || count % 16) return kBad;
     ConstByteView data = p.take(count);
     if (!exact(p)) return kBad;
     if (!exec_) return status::kSuccess;
@@ -338,10 +349,17 @@ class Adapter::StreamRunner {
 
   // The reads a draw does must stay inside the buffers bound: the vertices [first, first + count) of the vertex buffer, and for an indexed draw the indices and (when
   // replaying, as the buffer can change after the stream was checked) the vertices they name.
-  NtStatus draw(ByteReader& p, bool indexed) {
+  NtStatus draw(ByteReader& p, bool indexed, bool instanced) {
     const uint32_t count = p.le32(), first = p.le32();
     const int32_t vertex_offset = indexed ? static_cast<int32_t>(p.le32()) : 0;
+    uint32_t instance_count = 1, first_instance = 0;
+    if (instanced) {
+      instance_count = p.le32();
+      first_instance = p.le32();
+    }
     if (!exact(p) || !in_pass_ || !pipeline_) return kBad;
+    if (instanced && (!(adapter_.caps_.features & graphics::kFeatureInstancing) || instance_count == 0 || instance_count > (1u << 20))) return kBad;
+    if (topology_ >= Topology::LineList && !(adapter_.caps_.features & graphics::kFeatureLines)) return kBad;
     for (uint32_t u = 0; u < pipeline_->texture_count(); ++u)
       if (!texture_bound_[u]) return kBad;
     const bool vertices = pipeline_->attribute_count() > 0;
@@ -355,6 +373,11 @@ class Adapter::StreamRunner {
       const uint64_t end = uint64_t{first} + count;   // (times a stride of at most 2048: < 2^44)
       if (vertex_offset_ + end * stride > vertex_->desc().size) return kBad;
     }
+    // The per-instance attributes are read from the instances' elements of the vertex buffer.
+    if (pipeline_->has_per_instance()) {
+      const uint64_t end = uint64_t{first_instance} + instance_count;
+      if (vertex_offset_ + end * stride > vertex_->desc().size) return kBad;
+    }
     if (count == 0) return status::kSuccess;
     if (!exec_) return status::kSuccess;
 
@@ -363,8 +386,11 @@ class Adapter::StreamRunner {
       ByteReader in(index_->backing());
       in.skip(index_offset_ + uint64_t{first} * index_bytes_);
       int64_t highest = -1;
+      const uint32_t restart = index_bytes_ == 4 ? 0xFFFFFFFFu : 0xFFFFu;
       for (uint32_t i = 0; i < count; ++i) {
-        const int64_t v = int64_t{index_bytes_ == 4 ? in.le32() : in.le16()} + vertex_offset;
+        const uint32_t raw = index_bytes_ == 4 ? in.le32() : in.le16();
+        if (topology_ != Topology::TriangleList && topology_ != Topology::LineList && topology_ != Topology::PointList && raw == restart) continue;   // (ends a strip: names no vertex)
+        const int64_t v = int64_t{raw} + vertex_offset;
         if (!in.ok() || v < 0) return kBad;
         if (v > highest) highest = v;
       }
@@ -372,9 +398,104 @@ class Adapter::StreamRunner {
     }
     const NtStatus s = ensure_cb();
     if (s != status::kSuccess) return s;
-    if (indexed) cb_->draw_indexed(count, first, vertex_offset);
-    else cb_->draw(count, first);
+    if (topology_ == Topology::TriangleStrip || topology_ == Topology::TriangleFan || topology_ == Topology::LineStrip) return draw_expanded(indexed, count, first, vertex_offset, instance_count, first_instance);
+    set_device_topology(topology_ == Topology::LineList ? graphics::PrimitiveTopology::LineList : topology_ == Topology::PointList ? graphics::PrimitiveTopology::PointList : graphics::PrimitiveTopology::TriangleList);
+    if (indexed && index_rebind_) {   // (an expanded draw left its own indices bound)
+      cb_->bind_index_buffer(index_->buffer(), index_bytes_ == 4 ? graphics::IndexType::Uint32 : graphics::IndexType::Uint16, index_offset_);
+      index_rebind_ = false;
+    }
+    if (indexed) cb_->draw_indexed(count, first, vertex_offset, instance_count, first_instance);
+    else cb_->draw(count, first, instance_count, first_instance);
     return status::kSuccess;
+  }
+
+  void set_device_topology(graphics::PrimitiveTopology topology) {
+    if (topology == device_topology_) return;
+    cb_->set_primitive_topology(topology);
+    device_topology_ = topology;
+  }
+
+  // A strip or fan as a list: the triangles (or, for a line strip, the lines) are worked out from the vertex numbers (or the indices) and drawn with a buffer of indices made for
+  // this draw, which lives until the commands run. The winding of every second triangle of a strip is turned so that all face one way.
+  NtStatus draw_expanded(bool indexed, uint32_t count, uint32_t first, int32_t vertex_offset, uint32_t instance_count, uint32_t first_instance) {
+    constexpr uint64_t kMaxExpandedIndices = 3u << 20;
+    const bool fan = topology_ == Topology::TriangleFan;
+    const bool lines = topology_ == Topology::LineStrip;
+    const uint32_t restart = index_bytes_ == 4 ? 0xFFFFFFFFu : 0xFFFFu;
+    ByteBuffer out(adapter_.allocator_);
+    uint32_t run[3];   // the vertices of the strip so far (for a fan: the first, the previous and the current)
+    uint32_t seen = 0;
+    ByteReader in(indexed ? index_->backing() : ConstByteView());
+    if (indexed) in.skip(index_offset_ + uint64_t{first} * index_bytes_);
+    uint64_t emitted = 0;
+    strip_triangle_ = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+      uint32_t v;
+      if (indexed) {
+        v = index_bytes_ == 4 ? in.le32() : in.le16();
+        if (!in.ok()) return kBad;
+        if (v == restart) {
+          seen = 0;
+          strip_triangle_ = 0;
+          continue;
+        }
+      } else {
+        v = first + i;
+      }
+      if (lines) {
+        // (a line from each vertex to the next)
+        if (seen == 0) {
+          run[0] = v;
+          seen = 1;
+          continue;
+        }
+        if (emitted + 2 > kMaxExpandedIndices) return kBad;
+        if (!out.put32(run[0]) || !out.put32(v)) return status::kNoMemory;
+        emitted += 2;
+        run[0] = v;
+        continue;
+      }
+      if (seen < 3) {
+        run[seen++] = v;
+        if (seen < 3) continue;
+      } else if (fan) {
+        run[1] = run[2], run[2] = v;
+      } else {
+        run[0] = run[1], run[1] = run[2], run[2] = v;
+      }
+      // (in a strip the triangle at an odd position has its first two vertices swapped, so that all face one way)
+      uint32_t a = run[0], b = run[1], c = run[2];
+      if (!fan && (strip_triangle_ & 1)) {
+        const uint32_t t = a;
+        a = b, b = t;
+      }
+      ++strip_triangle_;
+      if (emitted + 3 > kMaxExpandedIndices) return kBad;
+      if (!out.put32(a) || !out.put32(b) || !out.put32(c)) return status::kNoMemory;
+      emitted += 3;
+    }
+    strip_triangle_ = 0;
+    if (emitted == 0) return status::kSuccess;
+    graphics::IBuffer* buffer = adapter_.device_.create_buffer(out.size(), graphics::kBufferIndex);
+    if (!buffer) return status::kNoMemory;
+    if (!transient_.push_back(buffer)) {
+      adapter_.device_.destroy_buffer(buffer);
+      return status::kNoMemory;
+    }
+    ByteView mapped = buffer->map();
+    if (mapped.size() < out.size()) return status::kNoMemory;
+    mapped.first(out.size()).copy_from(out.view());
+    buffer->unmap();
+    set_device_topology(lines ? graphics::PrimitiveTopology::LineList : graphics::PrimitiveTopology::TriangleList);
+    cb_->bind_index_buffer(buffer, graphics::IndexType::Uint32, 0);
+    cb_->draw_indexed(static_cast<uint32_t>(emitted), 0, indexed ? vertex_offset : 0, instance_count, first_instance);
+    index_rebind_ = indexed || index_ != nullptr;
+    return status::kSuccess;
+  }
+
+  void release_transient() {
+    for (graphics::IBuffer* b : transient_.view()) adapter_.device_.destroy_buffer(b);
+    transient_.clear();
   }
 
   NtStatus copy_region(ByteReader& p) {
@@ -435,6 +556,11 @@ class Adapter::StreamRunner {
   Allocation* index_ = nullptr;
   uint64_t index_offset_ = 0;
   uint32_t index_bytes_ = 2;
+  Topology topology_ = Topology::TriangleList;
+  graphics::PrimitiveTopology device_topology_ = graphics::PrimitiveTopology::TriangleList;   // what the recorded commands have set so far
+  uint32_t strip_triangle_ = 0;      // the position of the triangle being made in its strip (for the winding)
+  bool index_rebind_ = false;        // the device's bound indices are a draw's own, not the stream's
+  List<graphics::IBuffer*> transient_;   // index buffers made for expanded draws, destroyed when the commands have run
   bool texture_bound_[graphics::kMaxTextureUnits] = {};
   const Allocation* texture_alloc_[graphics::kMaxTextureUnits] = {};
 };
@@ -448,9 +574,10 @@ Adapter::Adapter(allocators::IAllocator& allocator, graphics::IGraphicsDevice& d
   caps_.max_vertex_attributes = graphics::kMaxVertexAttributes;
   caps_.max_varyings = graphics::kMaxVaryings;
   caps_.max_texture_units = graphics::kMaxTextureUnits;
-  caps_.max_push_constant_bytes = graphics::kMaxPushConstantBytes;
+  caps_.max_push_constant_bytes = info.max_push_constant_bytes < graphics::kMaxPushConstantBytes ? info.max_push_constant_bytes : graphics::kMaxPushConstantBytes;
   caps_.max_vertex_stride = kMaxVertexStride;
   caps_.accelerated = info.accelerated;
+  caps_.features = info.features;
   const char* name = config.name ? config.name : info.name;
   for (uint32_t i = 0; name && name[i] && i + 1 < sizeof(caps_.name); ++i) caps_.name[i] = name[i];
 
@@ -534,6 +661,8 @@ NtStatus Adapter::create_shader(const ShaderDesc& desc, SharedPointer<ShaderObje
       UniquePointer<D3d9Program> program;
       const NtStatus s = desc.kind == ShaderKind::Dxbc ? D3d9Program::compile_dxbc(allocator_, desc.code, &program) : D3d9Program::compile(allocator_, desc.code, &program);
       if (s != status::kSuccess) return s;
+      if (program->constant_bytes() > caps_.max_push_constant_bytes) return status::kNotSupported;
+      if (program->required_features() & ~caps_.features) return status::kNotSupported;   // (system values, texel access: the device must have them)   // (more constants than this device is given)
       // A GPU device (virgl) takes the shader as TGSI text; the others run it through the interpreter's native function. Both are given: each device uses what it understands.
       // A shader the text cannot say (see D3d9Tgsi.cpp) is still fine for the interpreter.
       const graphics::ShaderStage stage = program->stage();
@@ -619,6 +748,14 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
       static_cast<uint32_t>(st.depth_fail_op) > 7 || static_cast<uint32_t>(st.pass_op) > 7)
     return status::kInvalidParameter;
   if (st.enable && !caps_.stencil) return status::kNotSupported;
+  // The state beyond the base interface, for the devices that have it.
+  const graphics::BlendState& bs = d.blend;
+  if (static_cast<uint32_t>(d.depth_compare) > 7 || static_cast<uint32_t>(bs.src_color) > 10 || static_cast<uint32_t>(bs.dst_color) > 10 || static_cast<uint32_t>(bs.src_alpha) > 10 ||
+      static_cast<uint32_t>(bs.dst_alpha) > 10 || static_cast<uint32_t>(bs.color_op) > 4 || static_cast<uint32_t>(bs.alpha_op) > 4 || bs.write_mask > 0xF)
+    return status::kInvalidParameter;
+  if ((bs.custom || d.depth_compare != graphics::CompareOp::LessEqual) && !(caps_.features & graphics::kFeatureBlendState)) return status::kNotSupported;
+  for (uint32_t i = 0; i < d.attribute_count; ++i)
+    if (d.attributes[i].per_instance && !(caps_.features & graphics::kFeatureInstancing)) return status::kNotSupported;
 
   graphics::GraphicsPipelineDesc pd;
   pd.vertex_shader = vertex->module();
@@ -634,6 +771,8 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   pd.depth_write = d.depth_write;
   pd.alpha_blend = d.alpha_blend;
   pd.stencil = st;
+  pd.blend = bs;
+  pd.depth_compare = d.depth_compare;
 
   SharedPointer<PipelineObject> pipeline = SharedPointer<PipelineObject>::make(allocator_, device_);
   if (!pipeline) return status::kNoMemory;
@@ -642,6 +781,7 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   pipeline->vertex_ = vertex;
   pipeline->fragment_ = fragment;
   pipeline->stride_ = d.vertex_stride;
+  for (uint32_t i = 0; i < d.attribute_count; ++i) pipeline->per_instance_ = pipeline->per_instance_ || d.attributes[i].per_instance;
   pipeline->attribute_count_ = d.attribute_count;
   pipeline->texture_count_ = d.texture_count;
   *out = pipeline;

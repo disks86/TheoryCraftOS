@@ -848,6 +848,21 @@ NtStatus Kernel::escape(ProcessId pid, Handle device, ConstByteView request, Byt
       }
       const uint32_t enable = in.le32(), compare = in.le32(), fail = in.le32(), depth_fail = in.le32(), pass = in.le32();
       const uint32_t compare_mask = in.le32(), write_mask = in.le32(), reference = in.le32();
+      // Optional trailing words (the state of Direct3D 10): depth_compare, then blend custom, enable, the four factors, the two ops, the write mask, and a bit per attribute for
+      // per_instance. Their absence is the base state.
+      if (!in.ok()) return status::kInvalidParameter;
+      if (!in.at_end()) {
+        const uint32_t depth_compare = in.le32(), custom = in.le32(), blend_enable = in.le32(), sc = in.le32(), dc = in.le32(), sa = in.le32(), da = in.le32(), cop = in.le32(), aop = in.le32(),
+                       mask = in.le32(), instance_bits = in.le32();
+        if (!in.ok() || depth_compare > 7 || custom > 1 || blend_enable > 1 || sc > 10 || dc > 10 || sa > 10 || da > 10 || cop > 4 || aop > 4 || mask > 15 || instance_bits > 15) return status::kInvalidParameter;
+        desc.depth_compare = static_cast<graphics::CompareOp>(depth_compare);
+        desc.blend.custom = custom != 0, desc.blend.enable = blend_enable != 0;
+        desc.blend.src_color = static_cast<graphics::BlendFactor>(sc), desc.blend.dst_color = static_cast<graphics::BlendFactor>(dc);
+        desc.blend.src_alpha = static_cast<graphics::BlendFactor>(sa), desc.blend.dst_alpha = static_cast<graphics::BlendFactor>(da);
+        desc.blend.color_op = static_cast<graphics::BlendOp>(cop), desc.blend.alpha_op = static_cast<graphics::BlendOp>(aop);
+        desc.blend.write_mask = static_cast<uint8_t>(mask);
+        for (uint32_t i = 0; i < graphics::kMaxVertexAttributes; ++i) desc.attributes[i].per_instance = (instance_bits >> i) & 1;
+      }
       if (!in.ok() || !in.at_end() || cull > 2 || front > 1 || compare > 7 || fail > 7 || depth_fail > 7 || pass > 7 || compare_mask > 255 || write_mask > 255 || reference > 255 || enable > 1)
         return status::kInvalidParameter;
       if (reply.size() < 4) return status::kBufferTooSmall;
