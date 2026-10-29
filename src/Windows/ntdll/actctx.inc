@@ -59,6 +59,8 @@ typedef struct ActFrameExtended { SIZE_T size; ULONG format; ActFrame frame; PVO
 static ULONG rd32(const BYTE *p) { ULONG v; memcpy(&v, p, 4); return v; }
 static struct ActCtx *g_process_ctx;      /* the context of the program's own manifest (the process default) */
 
+static const BYTE *act_image_manifest(const BYTE *base, SIZE_T size, int flat, ULONG only_id, SIZE_T *out_size);
+
 /* ---- small helpers ------------------------------------------------------------------------------------------------------------------------------------- */
 
 static void *act_alloc(SIZE_T n) { return RtlAllocateHeap(process_heap(), HEAP_ZERO_MEMORY, n ? n : 1); }
@@ -1204,6 +1206,58 @@ static NTSTATUS act_load_builtin(ActBuild *b, const ActIdentity *want) {
   return SXS_CANT_GEN_ACTCTX;
 }
 
+
+/* The file at path as a source of the assembly: a manifest file, or a library with a manifest resource. SXS_ASSEMBLY_NOT_FOUND means there is nothing usable there; any
+ * other failure (a manifest that is wrong, or for another assembly) ends the search. */
+static NTSTATUS act_try_candidate(ActBuild *b, const WCHAR *path, const ActIdentity *want, int is_library) {
+  SIZE_T size = 0;
+  BYTE *data = act_read_file(path, &size);
+  if (!data) return SXS_ASSEMBLY_NOT_FOUND;
+  const BYTE *xml = data;
+  SIZE_T xml_size = size;
+  if (is_library) {
+    xml = act_image_manifest(data, size, 1, 0, &xml_size);
+    if (!xml) { act_free(data); return SXS_ASSEMBLY_NOT_FOUND; }
+  }
+  XNode *root = xml_parse(xml, xml_size);
+  act_free(data);
+  if (!root) return SXS_CANT_GEN_ACTCTX;
+  b->depth++;
+  const NTSTATUS s = act_add_manifest(b, root, path, 0, want);
+  b->depth--;
+  xml_free(root);
+  return s;
+}
+
+/* Private assemblies are looked for under a directory (the one given for the context, then the application's) as the library or manifest named like the assembly, in the
+ * directory itself or in one with the assembly's name; an assembly with a language is looked for only in the folder of that language. */
+static NTSTATUS act_probe_assembly(ActBuild *b, const ActIdentity *want) {
+  const WCHAR *dirs[2] = { b->search_dir, b->app_dir };
+  const SIZE_T name_len = wcslen(want->name);
+  const int by_language = want->language && want->language[0] && want->language[0] != '*';
+  const SIZE_T lang_len = by_language ? wcslen(want->language) : 0;
+  for (int d = 0; d < 2; ++d) {
+    if (!dirs[d] || (d == 1 && b->search_dir && act_ieq(dirs[0], dirs[1]))) continue;
+    const SIZE_T dir_len = wcslen(dirs[d]);
+    WCHAR *path = act_alloc((dir_len + lang_len + 2 * name_len + 32) * 2);
+    if (!path) return SXS_CANT_GEN_ACTCTX;
+    for (int variant = 0; variant < 4; ++variant) {      /* name.dll, name.manifest, name\name.dll, name\name.manifest */
+      SIZE_T o = dir_len;
+      memcpy(path, dirs[d], dir_len * 2);
+      if (o && path[o - 1] != '\\' && path[o - 1] != '/') path[o++] = '\\';
+      if (by_language) { memcpy(path + o, want->language, lang_len * 2); o += lang_len; path[o++] = '\\'; }
+      if (variant >= 2) { memcpy(path + o, want->name, name_len * 2); o += name_len; path[o++] = '\\'; }
+      memcpy(path + o, want->name, name_len * 2);
+      o += name_len;
+      wcscpy(path + o, (variant & 1) ? L".manifest" : L".dll");
+      const NTSTATUS s = act_try_candidate(b, path, want, !(variant & 1));
+      if (s != SXS_ASSEMBLY_NOT_FOUND) { act_free(path); return s; }
+    }
+    act_free(path);
+  }
+  return SXS_ASSEMBLY_NOT_FOUND;
+}
+
 /* The assembly dependencies: <dependency><dependentAssembly><assemblyIdentity/></dependentAssembly></dependency>. Each is looked for next to the application (the
  * application directory, then a folder with its name) as a manifest file; one that cannot be found fails the context unless the dependency may be bound later. */
 static NTSTATUS act_load_dependencies(ActBuild *b, ULONG assembly_index, const XNode *root) {
@@ -1226,36 +1280,7 @@ static NTSTATUS act_load_dependencies(ActBuild *b, ULONG assembly_index, const X
         if (a->has_id && act_identity_matches(&want, &a->id) && act_ieq(want.name, a->id.name)) have = 1;
       }
       NTSTATUS status = have ? STATUS_SUCCESS : SXS_CANT_GEN_ACTCTX;
-      if (!have && b->depth < 8) {
-        const WCHAR *dirs[2] = { b->search_dir, b->app_dir };
-        for (int d = 0; d < 2 && status != STATUS_SUCCESS; ++d) {
-          if (!dirs[d] || (d == 1 && b->search_dir && act_ieq(dirs[0], dirs[1]))) continue;
-          const SIZE_T dir_len = wcslen(dirs[d]), name_len = wcslen(want.name);
-          WCHAR *path = act_alloc((dir_len + 2 * name_len + 24) * 2);
-          if (!path) break;
-          for (int attempt = 0; attempt < 2 && status != STATUS_SUCCESS; ++attempt) {
-            memcpy(path, dirs[d], dir_len * 2);
-            SIZE_T o = dir_len;
-            if (o && path[o - 1] != '\\' && path[o - 1] != '/') path[o++] = '\\';
-            if (attempt == 1) { memcpy(path + o, want.name, name_len * 2); o += name_len; path[o++] = '\\'; }
-            memcpy(path + o, want.name, name_len * 2);
-            o += name_len;
-            wcscpy(path + o, L".manifest");
-            SIZE_T size = 0;
-            BYTE *data = act_read_file(path, &size);
-            if (!data) continue;
-            XNode *dr = xml_parse(data, size);
-            act_free(data);
-            if (!dr) { status = SXS_CANT_GEN_ACTCTX; break; }
-            b->depth++;
-            status = act_add_manifest(b, dr, path, 0, &want);
-            b->depth--;
-            xml_free(dr);
-            if (status) break;
-          }
-          act_free(path);
-        }
-      }
+      if (!have && b->depth < 8) status = act_probe_assembly(b, &want);
       if (status && !have) status = act_load_builtin(b, &want);
       act_identity_free(&want);
       if (status && !may_bind_later) return status;
@@ -1665,28 +1690,84 @@ EXPORT NTSTATUS NTAPI TcosCreateActivationContext(const BYTE *buf, SIZE_T size, 
 }
 
 
-/* The manifest of the program: the file <program>.manifest next to it, else its resource 1 of type RT_MANIFEST. Windows makes this the process default context. */
-static const BYTE *act_image_manifest(const BYTE *base, SIZE_T *size) {
+/* The manifest of a PE image: the RT_MANIFEST resource with the smallest numeric id (names are not looked at), or only the id `only_id` (when it is not 0); of the
+ * languages that resource has, the first of neutral, the system language, its primary language, American English and language 1, else the first there is. The image is a
+ * mapped one (relative addresses are addresses) or the file as it is (they are turned into file offsets through the section table). */
+static const BYTE *act_resource_address(const BYTE *base, SIZE_T size, int flat, ULONG rva) {
+  if (!flat) return base + rva;
   const ULONG pe = rd32(base + 0x3C);
-  const ULONG rva = rd32(base + pe + 0x18 + 0x70 + 16);
-  if (!rva) return NULL;
-  const BYTE *root = base + rva;
-  const BYTE *dir = root;
-  const ULONG want[2] = { 24, 1 };
-  for (int level = 0; level < 2; ++level) {
-    const ULONG named = *(const USHORT *)(dir + 12), ids = *(const USHORT *)(dir + 14);
-    const BYTE *e = dir + 16 + (SIZE_T)named * 8, *found = NULL;
-    for (ULONG i = 0; i < ids && !found; ++i, e += 8) if (!(rd32(e) & 0x80000000u) && rd32(e) == want[level]) found = e;
-    if (!found || !(rd32(found + 4) & 0x80000000u)) return NULL;
-    dir = root + (rd32(found + 4) & 0x7FFFFFFF);
+  if (pe > size || size - pe < 24) return NULL;
+  const ULONG sections = *(const USHORT *)(base + pe + 6), optional = *(const USHORT *)(base + pe + 20);
+  const SIZE_T table = (SIZE_T)pe + 24 + optional;
+  if (sections > 96 || table > size || size - table < (SIZE_T)sections * 40) return NULL;
+  for (ULONG i = 0; i < sections; ++i) {
+    const BYTE *h = base + table + (SIZE_T)i * 40;
+    const ULONG vsize = rd32(h + 8), va = rd32(h + 12), raw = rd32(h + 16), ptr = rd32(h + 20);
+    const ULONG span = vsize > raw ? vsize : raw;
+    if (rva >= va && rva - va < span && rva - va < raw) {
+      const SIZE_T at = (SIZE_T)ptr + (rva - va);
+      return at < size ? base + at : NULL;
+    }
   }
-  const ULONG named = *(const USHORT *)(dir + 12), ids = *(const USHORT *)(dir + 14);
-  if (!named && !ids) return NULL;
-  const BYTE *leaf = dir + 16;
-  if (rd32(leaf + 4) & 0x80000000u) return NULL;
-  const BYTE *data = root + rd32(leaf + 4);
-  *size = rd32(data + 4);
-  return base + rd32(data);
+  return NULL;
+}
+
+static const BYTE *act_image_manifest(const BYTE *base, SIZE_T size, int flat, ULONG only_id, SIZE_T *out_size) {
+  if (!flat) size = ACT_MAX_SIZE;
+  if (size < 0x100 || base[0] != 'M' || base[1] != 'Z') return NULL;
+  const ULONG pe = rd32(base + 0x3C);
+  if (pe > size || size - pe < 0x90 || memcmp(base + pe, "PE\0\0", 4) != 0) return NULL;
+  const WORD magic = *(const WORD *)(base + pe + 24);
+  const SIZE_T dirs = (SIZE_T)pe + 24 + (magic == 0x20b ? 112 : 96);
+  if (dirs + 24 > size) return NULL;
+  const ULONG rva = rd32(base + dirs + 16);
+  if (!rva) return NULL;
+  const BYTE *root = act_resource_address(base, size, flat, rva);
+  if (!root) return NULL;
+  const SIZE_T room = flat ? (size - (SIZE_T)(root - base)) : ACT_MAX_SIZE;
+  #define DIR_OK(d) ((SIZE_T)((d) - root) + 16 <= room)
+  #define ENTRIES(d) (((ULONG)*(const USHORT *)((d) + 12)) + *(const USHORT *)((d) + 14))
+  if (!DIR_OK(root)) return NULL;
+  /* the type RT_MANIFEST (24) */
+  const BYTE *dir = NULL;
+  for (ULONG i = 0, n = ENTRIES(root); i < n; ++i) {
+    const BYTE *e = root + 16 + (SIZE_T)i * 8;
+    if ((SIZE_T)(e - root) + 8 > room) return NULL;
+    if (!(rd32(e) & 0x80000000u) && rd32(e) == 24 && (rd32(e + 4) & 0x80000000u)) { dir = root + (rd32(e + 4) & 0x7FFFFFFF); break; }
+  }
+  if (!dir || !DIR_OK(dir)) return NULL;
+  /* the smallest numeric id (or the one asked for) */
+  const BYTE *lang_dir = NULL;
+  ULONG best = 0xFFFFFFFFu;
+  for (ULONG i = 0, n = ENTRIES(dir); i < n; ++i) {
+    const BYTE *e = dir + 16 + (SIZE_T)i * 8;
+    if ((SIZE_T)(e - root) + 8 > room) return NULL;
+    const ULONG id = rd32(e);
+    if ((id & 0x80000000u) || !(rd32(e + 4) & 0x80000000u) || id >= best || (only_id && id != only_id)) continue;
+    best = id;
+    lang_dir = root + (rd32(e + 4) & 0x7FFFFFFF);
+  }
+  if (!lang_dir || !DIR_OK(lang_dir)) return NULL;
+  static const ULONG precedence[] = { 0, 0x409, 0x09, 0x01 };
+  const BYTE *leaf = NULL;
+  const ULONG n = ENTRIES(lang_dir);
+  for (ULONG k = 0; k < sizeof(precedence) / sizeof(precedence[0]) && !leaf; ++k)
+    for (ULONG i = 0; i < n && !leaf; ++i) {
+      const BYTE *e = lang_dir + 16 + (SIZE_T)i * 8;
+      if ((SIZE_T)(e - root) + 8 > room) return NULL;
+      if (!(rd32(e) & 0x80000000u) && rd32(e) == precedence[k]) leaf = e;
+    }
+  if (!leaf && n) leaf = lang_dir + 16;
+  if (!leaf || (SIZE_T)(leaf - root) + 8 > room || (rd32(leaf + 4) & 0x80000000u)) return NULL;
+  const BYTE *data_entry = root + rd32(leaf + 4);
+  if ((SIZE_T)(data_entry - root) + 16 > room) return NULL;
+  const ULONG data_size = rd32(data_entry + 4);
+  const BYTE *data = act_resource_address(base, size, flat, rd32(data_entry));
+  if (!data || (flat && (SIZE_T)(data - base) > size - 0 - 0) || (flat && data_size > size - (SIZE_T)(data - base))) return NULL;
+  #undef DIR_OK
+  #undef ENTRIES
+  *out_size = data_size;
+  return data;
 }
 
 static void act_init_process(void) {
@@ -1711,7 +1792,7 @@ static void act_init_process(void) {
     act_create(data, size, path, dir, dir, 0, &ctx);
     act_free(data);
   } else {
-    const BYTE *res = act_image_manifest((const BYTE *)peb->ImageBaseAddress, &size);
+    const BYTE *res = act_image_manifest((const BYTE *)peb->ImageBaseAddress, 0, 0, 1, &size);
     path[n] = 0;
     if (res) act_create(res, size, path, dir, dir, 0, &ctx);
   }
