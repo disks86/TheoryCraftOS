@@ -661,7 +661,7 @@ static ImageDescriptor tex_image(const BigTexMem& m, uint32_t w, uint32_t h, uin
   d.address = m.base;
   d.width = w;
   d.height = h;
-  d.pitch_pixels = image_pitch(w, h, levels, 4);
+  d.pitch_pixels = image_pitch(w, h, levels, 4, 9);
   d.tile_index = 9;
   d.levels = levels;
   d.type = type;
@@ -793,6 +793,54 @@ static void test_dual_source() {
   CHECK(draw(f.alloc, c, fb) == DrawStatus::BadInput);
 }
 
+// 1D images, arrays of them and cube arrays through compiled shaders
+static void test_one_d_and_cube_array() {
+  Fixture f;
+  Compiled one(f.alloc), one_lod(f.alloc), one_arr(f.alloc), cube_arr(f.alloc);
+  compile(f.alloc, sampling_fragment("TEX", "1D").c_str(), &one);
+  compile(f.alloc, sampling_fragment("TXL", "1D").c_str(), &one_lod);
+  compile(f.alloc, sampling_fragment("TEX", "1D_ARRAY").c_str(), &one_arr);
+  compile(f.alloc, sampling_fragment("TEX", "CUBE_ARRAY").c_str(), &cube_arr);
+  CHECK(one.ok && one_lod.ok && one_arr.ok && cube_arr.ok);
+  if (!(one.ok && one_lod.ok && one_arr.ok && cube_arr.ok)) return;
+  // a cube array cannot take a bias or lod
+  {
+    Compiled bad(f.alloc);
+    compile(f.alloc, sampling_fragment("TXL", "CUBE_ARRAY").c_str(), &bad);
+    CHECK(!bad.ok);
+  }
+  auto near_to = [](float a, float want) { return a > want - 0.6f && a < want + 0.6f; };
+  {
+    BigTexMem m;
+    ImageDescriptor d = tex_image(m, 8, 1, 2, ImageType::Image1D, 1);
+    d.pitch_pixels = image_pitch(8, 1, 2, 4, 9);
+    for (uint32_t k = 0; k < 2; ++k) fill_slice_level(m, d, k, 0, static_cast<uint8_t>(70 * (k + 1)));
+    SamplerDescriptor s;
+    s.mip_filter = 1;
+    const float a[4] = {0.5f, 0.9f, 0, 1.0f}, b[4] = {0.5f, 0.1f, 0, 0.0f};
+    CHECK(near_to(draw_sampled(f, one_lod, m, d, s, a), 140) && near_to(draw_sampled(f, one_lod, m, d, s, b), 70));
+    CHECK(near_to(draw_sampled(f, one, m, d, s, a), 70));
+  }
+  {
+    BigTexMem m;
+    ImageDescriptor d = tex_image(m, 8, 1, 1, ImageType::Array1D, 3);
+    d.pitch_pixels = image_pitch(8, 1, 1, 4, 9);
+    for (uint32_t z = 0; z < 3; ++z) fill_slice_level(m, d, 0, z, static_cast<uint8_t>(50 * z));
+    SamplerDescriptor s;
+    const float l0[4] = {0.5f, 0.0f, 0, 0}, l2[4] = {0.5f, 2.0f, 0, 0}, l1[4] = {0.5f, 0.8f, 0, 0};
+    CHECK(near_to(draw_sampled(f, one_arr, m, d, s, l0), 0) && near_to(draw_sampled(f, one_arr, m, d, s, l2), 100) && near_to(draw_sampled(f, one_arr, m, d, s, l1), 50));
+  }
+  {
+    BigTexMem m;
+    ImageDescriptor d = tex_image(m, 4, 4, 1, ImageType::Cube, 12);
+    for (uint32_t z = 0; z < 12; ++z) fill_slice_level(m, d, 0, z, static_cast<uint8_t>(10 * z));
+    SamplerDescriptor s;
+    // +x of layer 0 (slice 0), -y of layer 1 (face 3: slice 9), +z of layer 1 (face 4: slice 10)
+    const float a[4] = {1, 0.1f, 0, 0}, b[4] = {0.2f, -1, 0.1f, 1}, c[4] = {0.1f, 0.1f, 1, 1};
+    CHECK(near_to(draw_sampled(f, cube_arr, m, d, s, a), 0) && near_to(draw_sampled(f, cube_arr, m, d, s, b), 90) && near_to(draw_sampled(f, cube_arr, m, d, s, c), 100));
+  }
+}
+
 int main() {
   Fixture f;
   if (!f.vs.ok || !f.fs.ok || !f.tfs.ok || !f.kfs.ok) { printf("FAILED: the shaders did not compile\n"); return 1; }
@@ -809,6 +857,7 @@ int main() {
   test_faces_and_bounds(f);
   test_more_textures();
   test_dual_source();
+  test_one_d_and_cube_array();
   printf(g_failed ? "GcnDrawTest: %d FAILED\n" : "GcnDrawTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }

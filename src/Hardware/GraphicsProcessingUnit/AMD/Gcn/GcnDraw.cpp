@@ -211,7 +211,7 @@ class Machine final : public IEnvironment {
     result[0] = result[1] = result[2] = result[3] = 0.0f;
     // the address registers: the bias (image_sample_b), the coordinates of the image's type, the level of detail (image_sample_l)
     const uint32_t type = image[3] >> 28;
-    const uint32_t dims = type == 10 || type == 11 || type == 13 ? 3 : 2;
+    const uint32_t dims = type == 10 || type == 11 || type == 13 ? 3 : type == 8 ? 1 : 2;       // 1D: 1, 1D array: 2 (its layer), 2D: 2, 3D, cube and 2D array: 3
     SampleRequest r;
     uint32_t at = 0;
     if (op == Mimg::image_sample_b && at < count) r.bias = coords[at++];

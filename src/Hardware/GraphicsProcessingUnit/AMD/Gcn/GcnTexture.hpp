@@ -27,16 +27,18 @@
 // linear mip filtering and trilinear filtering of 3D images between slices. There are no derivatives here (no 2x2 quads), so a plain image_sample has level of detail 0 plus the
 // sampler's bias: the hardware's choice of level from the screen-space gradient is not modelled.
 //
-// Layouts: an image with several levels, slices (3D, array, cube) is laid out as AMD's address library does for the 1D tiled layout (GcnTiling.hpp), and only in it: the levels are
-// stored one after the other (each starting at a multiple of 256 bytes) with the slices of a level together; the base level is padded to a power of two when there is more than one level
-// (the pitch of the descriptor is that padded pitch), a level's pitch is the base pitch shifted down and padded to 8 pixels, its height likewise, and its slices count up to a power of two
-// (a cube's 6 faces to 8), and a level's pitch is widened until its slice is a multiple of 256 bytes. A single level 2D image may be linear or 2D tiled as before. A cube is sampled with the coordinates v_cubesc / v_cubetc / v_cubema give (the face coordinates
-// plus 1.5 after the division by the major axis, and the face index); its bilinear filter needs DISABLE_CUBE_WRAP in the sampler since filtering across the edges of faces is not done.
-// Not done: 1D and 1D array images, arrays of cubes, mip levels or slices in the linear and 2D tiled layouts, anisotropy, depth compare, sRGB, the other formats, the border colour
-// register, texel caches. Anything outside that is refused (Unsupported), not approximated.
+// Layouts: any of the three (linear aligned, 1D tiled, 2D tiled) holds levels and slices, laid out as AMD's address library does: the levels one after the other, each starting at a
+// multiple of the alignment its layout wants (offset_256B of Mesa's surface levels: align(end of the previous level, baseAlign)), the slices of a level together; with more than one
+// level the base level is padded to a power of two (the descriptor's pitch is the padded pitch), level k is the base pitch shifted down, padded to a power of two and then to what the
+// layout needs (surface_pad), its slices count up to a power of two (a cube's 6 faces to 8). A level of a 2D tiled image smaller than a macro tile is 1D tiled (level_layout). The slices
+// of a 2D tiled level rotate the banks. A cube is sampled with the coordinates v_cubesc / v_cubetc / v_cubema give (the face coordinates plus 1.5 after the division by the major axis,
+// and the face index, plus 8 for each layer of a cube array); its bilinear filter needs DISABLE_CUBE_WRAP in the sampler since filtering across the edges of faces is not done. A 1D
+// image is a row (height 1); a 1D array takes its layer from the second coordinate.
+// Not done: anisotropy, depth compare, sRGB, the other formats, the border colour register, texel caches. Anything outside that is refused (Unsupported), not approximated.
 #pragma once
 
 #include <stdint.h>
+#include "Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnTiling.hpp"
 #include "Utility/ArrayView.hpp"
 
 namespace gcn {
@@ -54,17 +56,17 @@ class ITexelMemory {
 enum class TexelFormat : uint8_t { R8Unorm, Rgba8Unorm, Rgba32Float };
 uint32_t texel_bytes(TexelFormat format);
 
-enum class ImageType : uint8_t { Image2D, Image3D, Cube, Array2D };
+enum class ImageType : uint8_t { Image2D, Image3D, Cube, Array2D, Image1D, Array1D };           // Cube: 6 faces, or 6 * n for a cube array
 
 struct ImageDescriptor {
   uint64_t address = 0;                // 256 byte aligned, 40 bits
   uint32_t width = 0, height = 0;      // 1 to 16384
-  uint32_t pitch_pixels = 0;           // at least the width; a multiple of 8 for a tiled image; a power of two when there is more than one level (see `image_pitch`)
+  uint32_t pitch_pixels = 0;           // at least the width; what the layout needs (GcnTiling.hpp); with several levels or slices exactly `image_pitch`
   TexelFormat format = TexelFormat::Rgba8Unorm;
   uint32_t tile_index = 8;             // the GB_TILE_MODE entry: 8 linear, 9 1D tiled for display
   uint8_t dst_sel[4] = {4, 5, 6, 7};   // what each result component takes: 0 zero, 1 one, 4..7 the image's x, y, z, w
   ImageType type = ImageType::Image2D;
-  uint32_t depth = 1;                  // 3D: the depth; array: the layers; cube: 6 (the faces); 2D: 1
+  uint32_t depth = 1;                  // 3D: the depth; array: the layers; cube: 6 * the cube layers (the faces); 2D and 1D: 1
   uint32_t levels = 1;                 // mip levels, the base level first
 };
 
@@ -82,9 +84,11 @@ struct SamplerDescriptor {
   float lod_bias = 0.0f;                       // signed 6.8 fixed point in the descriptor
 };
 
-// The pitch (in pixels) of the base level of an image of this size, texel size and number of levels (or slices) in the 1D tiled layout: the width padded to 8, or to a power of two first
-// when there are several levels, and then widened by 8 until a slice is a whole number of 256 byte units (the library does so: an 8 bit image is at least 32 pixels wide).
-uint32_t image_pitch(uint32_t width, uint32_t height, uint32_t levels, uint32_t texel_bytes);
+// The pitch (in pixels) of the base level of an image of this size, texel size, number of levels and layout, when it has several levels or slices: the base level padded to a power of
+// two when there is more than one level, then padded as the address library pads a surface of the layout (surface_pad in GcnTiling.hpp; 0 if the layout cannot hold it).
+uint32_t image_pitch(uint32_t width, uint32_t height, uint32_t levels, uint32_t texel_bytes, uint32_t tile_index);
+// The address an image must be aligned to: the largest alignment its levels' layouts want.
+uint64_t image_base_align(const ImageDescriptor& image);
 
 // False if the description does not fit the descriptor (a size or address out of range, a misaligned address) or is outside what is implemented.
 bool make_image_descriptor(ArrayView<uint32_t> out, const ImageDescriptor& image);
@@ -93,8 +97,9 @@ bool decode_image_descriptor(ArrayView<const uint32_t> words, ImageDescriptor* o
 bool decode_sampler_descriptor(ArrayView<const uint32_t> words, SamplerDescriptor* out);
 
 // Where a mip level of an image is: its offset from the image's address, the size of the level, its padded pitch and rows, the bytes of one slice and the slices the level takes
-// (padded). False for a level the image does not have or an image whose layout does not allow levels.
+// (padded), and the layout it really has (a small level of a 2D tiled image is 1D tiled). False for a level the image does not have.
 struct LevelLayout {
+  TileLayout layout;
   uint64_t offset = 0;
   uint32_t width = 0, height = 0, depth = 0;      // the level's size (depth: slices that exist)
   uint32_t pitch = 0, rows = 0;                   // padded

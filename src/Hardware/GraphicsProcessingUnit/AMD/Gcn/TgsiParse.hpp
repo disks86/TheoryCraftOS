@@ -77,8 +77,8 @@ struct TgsiShader {
   TgsiSemantic output_semantic[kMaxOutputs] = {};
   uint8_t output_semantic_index[kMaxOutputs] = {};
   bool input_flat[kMaxInputs] = {};
-  uint8_t sampler_target[kMaxSamplers] = {};           // DCL SVIEW: 0 2D, 1 3D, 2 CUBE, 3 2D_ARRAY
-  static constexpr uint8_t kTarget2D = 0, kTarget3D = 1, kTargetCube = 2, kTarget2DArray = 3;
+  uint8_t sampler_target[kMaxSamplers] = {};           // DCL SVIEW: 0 2D, 1 3D, 2 CUBE, 3 2D_ARRAY, 4 1D, 5 1D_ARRAY, 6 CUBE_ARRAY
+  static constexpr uint8_t kTarget2D = 0, kTarget3D = 1, kTargetCube = 2, kTarget2DArray = 3, kTarget1D = 4, kTarget1DArray = 5, kTargetCubeArray = 6;
   List<TgsiInst> instructions;
   List<TgsiImmediate> immediates;
 };
