@@ -57,7 +57,7 @@ ComfyUI output defaults to `/mnt/shared`. Look there for generated files, and co
 - Ask questions only for genuinely blocking ambiguity, destructive operations, or decisions with significant architectural consequences.
 - Never claim success without verifying the result.
 - Before stopping, review the diff, run relevant tests, and list any incomplete work and its cause.
-- Once verified, commit the changes to the main branch.
+- Once completed, automatically commit the changes to the main branch.
 
 ## Completion Criteria
 
