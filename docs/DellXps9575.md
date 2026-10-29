@@ -884,3 +884,18 @@ on the clocks the firmware left), enabling the stream after it, eDP's alternate 
 **eDP 1.4 rate table and retraining (done after the above):** a panel of eDP revision 1.4 that lists rates (`Capabilities::edp_rates_khz`) is trained by table index: `DpLinkConfig::choose` takes the lowest listed rate (any order) that
 the encoder control can be told (1.62, 2.7, 3.24, 5.4 GHz; 2.16 and the like are skipped) with the fewest lanes, writes `DP_LINK_BW_SET` 0 and `DP_LINK_RATE_SET` (0x115) with the index after the lane count. `service_short_pulses`
 retrains a lost link that `train_link` trained (see the short pulse section). Tests: `DpLinkTrainTest::test_edp_rate_table`, `AmdVegaMTest::test_train_link`, `test_retrain_on_short_pulse`. The 0x115 address is from memory.
+
+### Mode setting through the video BIOS
+
+`AmdModeSet` (`AmdModeSet.*`) calls the BIOS tables that set a mode with the parameters the driver gives them (amdgpu_atombios_crtc.c / _encoder.c, from memory): SetPixelClock 1.7 (pixel clock in 100 Hz units, PLL,
+encoder id, mode, CRTC, HDMI deep colour ratio 5:4 / 3:2, dual link DVI above 165 MHz), SetCRTC_Timing (totals, display, sync start and width, polarity / interlace / double clock flags), SelectCRTC_Source 1.2 / 1.3 (the DIG
+as ASIC_INT_DIGn_ENCODER_ID, mode, colour depth), EnableCRTC, BlankCRTC, UpdateCRTC_DoubleBufferRegisters, and the DIG encoder (1.3 / 1.4) and UNIPHY transmitter (1.4 / 1.5) controls for setup, enable, output, DP video on / off
+and disable. `AmdVegaM::set_mode(connector, crtc, mode, bpc, &result[, pll])` runs them in the driver's order: CRTC blanked and disabled; for DisplayPort the sink's capabilities read (eDP panel powered up) and the lanes and
+rate chosen (`DpLinkConfig::choose`, so an eDP 1.4 rate table applies); pixel clock (DisplayPort on PPLL0, the rest on PPLL1 / PPLL2 by CRTC parity unless named), timing, source, encoder setup, transmitter setup and enable;
+the link trained (`train_link`) and DP video on; the transmitter output enabled; the CRTC enabled and unblanked. `ModeSetResult::failed` names the stage that failed. `disable_mode` switches an output off. Checked by
+`scripts/check_modeset_port.py` (indexes, parameter layouts, constants, the packing; atombios.h v6.12) and `tests/AmdModeSetTest.cpp` (every word of every table, revisions, refusals) and `AmdVegaMTest::test_set_mode` (the
+order and words for DisplayPort, HDMI and the eDP panel, each failing stage, switching off); mutants of the PLL choice, the deep colour ratio, the coherent bit, the symbol clock and the video-on step are killed.
+
+**Not checked / not done:** amdgpu_atombios_crtc.c and amdgpu_atombios_encoder.c were not at hand (which PLL the driver picks, which fields it sets for LVDS, spread spectrum, the order of enable and output enable); eDP alternate
+scrambler and panel mode; LVDS panel specifics; the scanout surface and audio (separate calls: `amd_dce11::Plane`, `enable_audio`); nothing in `main.cpp` calls `set_mode`; real hardware.
+

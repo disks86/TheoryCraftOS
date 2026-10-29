@@ -197,4 +197,5 @@ def main():
     print('check_dplink_port: ok')
 
 
-main()
+if __name__ == "__main__":
+    main()

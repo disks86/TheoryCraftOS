@@ -35,6 +35,7 @@
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdAux.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdDdc.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdDpSource.hpp"
+#include "Hardware/GraphicsProcessingUnit/AMD/AmdModeSet.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AtomConnectors.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/Dpcd.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AtomI2c.hpp"
@@ -197,6 +198,24 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
   // (a healthy status check starts the count again).
   static constexpr uint32_t kMaxRetrains = 4;
   bool link_trained(uint32_t pin) const { return pin < amd_dce11::Interrupts::kMaxHpd && trained_[pin].valid; }
+  // Mode setting of one output through the video BIOS (AmdModeSet), in the order of the driver's mode set and DPMS on: the CRTC blanked and disabled; for DisplayPort the sink's
+  // capabilities read (eDP panel powered up) and the lanes and rate chosen for the mode; the pixel clock programmed (SetPixelClock: DisplayPort on PPLL0, the rest on PPLL1 for even CRTCs
+  // and PPLL2 for odd, unless `pll` names one), the CRTC timing, the CRTC's source selected (the connector's DIG encoder), the DIG encoder set up and the transmitter set up and enabled;
+  // for DisplayPort the link trained (train_link) and the video turned on; the transmitter's output enabled; the CRTC enabled and unblanked. `bpc` is the bits per colour (6, 8, 10, 12).
+  // `out->failed` names the step that failed (Done: none); a failure leaves the output as that step left it (call disable_mode()). What is not done: the scanout surface (amd_dce11::Plane
+  // is the caller's), audio (enable_audio), spread spectrum, the alternate scrambler and panel mode of eDP, and the PLL choice the driver makes from the PLLs in use. The mode, the CRTC
+  // and the connector's DIG encoder must be what the caller wants; the CRTC is 0 to 5. Like train_link it takes the video BIOS for milliseconds: for the desktop loop.
+  enum class ModeSetStage : uint8_t {
+    Done, NotReady, Unsupported, Blank, SinkCapabilities, PixelClock, Timing, Source, EncoderSetup, TransmitterSetup, TransmitterEnable, LinkTraining, VideoOn, OutputEnable, CrtcEnable, Unblank,
+  };
+  struct ModeSetResult {
+    ModeSetStage failed = ModeSetStage::NotReady;
+    uint8_t pll = AmdModeSet::kPllInvalid;       // what was used
+    LinkTraining link;                           // DisplayPort: what was chosen and trained
+  };
+  bool set_mode(const AtomConnectors::Connector& connector, uint8_t crtc, const DisplayMode& mode, uint32_t bpc, ModeSetResult* out, uint8_t pll = AmdModeSet::kPllInvalid);
+  // DPMS off: DisplayPort video off, the transmitter's output and the transmitter disabled, the encoder disabled, the CRTC blanked and disabled. False if a table fails (the rest is still done).
+  bool disable_mode(const AtomConnectors::Connector& connector, uint8_t crtc);
   // The short pulse of a DisplayPort sink (a status change that is not a plug: the link was lost, or the sink asks for a test) is taken by the interrupt handler as a pin to look at
   // (`pending_short_pulses()`: bit n for pin n). The look is the AUX channel's, which takes some milliseconds, so it is not done there: service_short_pulses() does it, from the desktop loop.
   // For each pending pin, lowest first, up to `capacity` of them, it reads the sink's link configuration (DP_LANE_COUNT_SET) and status (the lane training status, the alignment, the service

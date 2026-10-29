@@ -163,6 +163,17 @@ struct FakeAuxCard final : IVcnRegisters {
     uint32_t words[3];
   };
   std::vector<DigCall> dig_calls;
+  // The mode setting tables (SetPixelClock 12 -> slot 0 with 4 words, BlankCRTC 34 -> 1 with 2, EnableCRTC 35 -> 2 with 1, SetCRTC_Timing 39 -> 3 with 6, SelectCRTC_Source 42 -> 4 with 1,
+  // UpdateCRTC_DoubleBufferRegisters 44 -> 5 with 1): word i of slot k is register kModeSet + 0x10 * k + i; a call is logged when its last word is written. `table_order` has the table index
+  // of every mode setting call and every encoder / transmitter call, in order.
+  static constexpr uint32_t kModeSet = 0x7100;
+  struct ModeCall {
+    uint32_t table;
+    std::vector<uint32_t> words;
+  };
+  std::vector<ModeCall> mode_calls;
+  std::vector<uint32_t> table_order;
+  uint32_t mode_words[6][6] = {};
   uint32_t dig_words[3][3] = {};
   uint32_t panel_writes = 0, panel_params = 0;
   bool panel_on = false;
@@ -183,10 +194,21 @@ struct FakeAuxCard final : IVcnRegisters {
       panel_params = v;
       panel_on = v >> 24 == 12;
     }
+    if (r >= kModeSet && r < kModeSet + 0x60) {
+      static constexpr uint32_t kIndex[6] = {12, 34, 35, 39, 42, 44}, kCount[6] = {4, 2, 1, 6, 1, 1};
+      const uint32_t slot = (r - kModeSet) / 0x10, word = (r - kModeSet) % 0x10;
+      if (word < 6) mode_words[slot][word] = v;
+      if (word == kCount[slot] - 1) {
+        ModeCall c{kIndex[slot], {}};
+        for (uint32_t i = 0; i < kCount[slot]; ++i) c.words.push_back(mode_words[slot][i]);
+        mode_calls.push_back(c);
+        table_order.push_back(kIndex[slot]);
+      }
+    }
     if (r > kRequest && r < kRequest + 6) request[r - kRequest] = v;
     if (r >= kPanel + 1 && r <= kPanel + 2) {
       dig_words[2][r - kPanel] = v;
-      if (r == kPanel + 2) dig_calls.push_back({2, {dig_words[2][0], dig_words[2][1], dig_words[2][2]}});
+      if (r == kPanel + 2) { dig_calls.push_back({2, {dig_words[2][0], dig_words[2][1], dig_words[2][2]}}); table_order.push_back(76); }
     }
     if (r == kPanel) dig_words[2][0] = v;
     for (uint32_t t = 0; t < 2; ++t) {
@@ -194,6 +216,7 @@ struct FakeAuxCard final : IVcnRegisters {
       if (r == 0x7051 + t * 0x10) {
         dig_words[t][1] = v;
         dig_calls.push_back({t, {dig_words[t][0], dig_words[t][1], 0}});
+        table_order.push_back(74 + t);
       }
     }
     if (r != kDoorbell) return;
