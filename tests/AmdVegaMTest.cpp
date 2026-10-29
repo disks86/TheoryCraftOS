@@ -2050,6 +2050,17 @@ static void test_train_link() {
   CHECK(vega.train_link(edp, 148500, 8, &t) && auxcard.panel_on && t.outcome.trained());
   CHECK(actions(0) == std::vector<uint32_t>({0x08, 0x09, 0x13, 0x0B}) && actions(1).empty());
   auxcard.unpowered_channel = 0;
+  // an eDP 1.4 panel with its own rate table (1.62 and 2.7 GHz, in units of 200 kHz at 0x010): set by the index, the bandwidth code written 0, the encoder told the table's rate
+  dpcd[0x700] = 0x03;
+  const uint8_t rates[6] = {0x2A, 0x03, 0x46, 0x05, 0x00, 0x00};
+  for (size_t i = 0; i < 6; ++i) dpcd[0x10 + i] = rates[i];
+  auxcard.dig_calls.clear();
+  auxcard.sink.dpcd_writes.clear();
+  CHECK(vega.train_link(edp, 148500, 8, &t) && t.config.rate_index == 0 && t.config.rate_khz == 162000 && t.config.lanes == 4 && t.outcome.rate_index == 0);
+  CHECK(dpcd[0x100] == 0x00 && dpcd[0x115] == 0x00 && dpcd[0x101] == 0x84);
+  dpcd[0x700] = 0x02;
+  dpcd[0x10] = dpcd[0x11] = dpcd[0x12] = dpcd[0x13] = 0;
+  dpcd[0x115] = 0x55;
   // not trained: the sink never shows the clock (lane status zero): the training fails and the outcome says how, the cleanup done
   dpcd[0x202] = dpcd[0x203] = 0x00;
   auxcard.dig_calls.clear();

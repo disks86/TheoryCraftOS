@@ -44,10 +44,17 @@ class IDpSource {
 // at 1.62 Gbit/s if nothing does.
 struct DpLinkConfig {
   uint32_t lanes = 0;
-  uint32_t rate_khz = 0;        // per lane: 162000, 270000 or 540000
+  uint32_t rate_khz = 0;        // per lane: 162000, 270000 or 540000, or any rate of an eDP 1.4 panel's own table
+  // An eDP 1.4 panel lists the rates it supports (Capabilities::edp_rates_khz) and is set to one by its index (DP_LINK_RATE_SET) instead of by a bandwidth code: the index in the table
+  // when the rate came from it, else kNoRateIndex.
+  static constexpr uint8_t kNoRateIndex = 0xFF;
+  uint8_t rate_index = kNoRateIndex;
+  // For a sink with the rate table (an eDP panel of revision 1.4 or later that lists rates) the lowest rate of the table, with the fewest lanes, that carries the clock and that the encoder can be told (1.62, 2.7, 3.24 and 5.4 GHz; nothing
+  // does: the highest such rate on all the lanes); else the choice described above.
   static DpLinkConfig choose(const Dpcd::Capabilities& caps, uint32_t pixel_clock_khz, uint32_t bits_per_pixel);
   // drm_dp_link_rate_to_bw_code: DP_LINK_BW_SET for the rate (the rate in units of 27 MHz: 6, 10, 20)
-  uint8_t bandwidth_code() const { return static_cast<uint8_t>(rate_khz / 27000); }
+  // (0 when the rate is set by its table index: DP_LINK_BW_SET is then written 0)
+  uint8_t bandwidth_code() const { return rate_index != kNoRateIndex ? 0 : static_cast<uint8_t>(rate_khz / 27000); }
 };
 
 // DisplayPort link training as amdgpu_atombios_dp_link_train does it: power up the sink, downspread, the lane count (with enhanced framing if the sink has it) and the link rate on the
@@ -79,13 +86,15 @@ class DpLinkTrainer {
     bool trained() const { return result == Result::Trained; }
     uint32_t lanes = 0;
     uint8_t bandwidth_code = 0;
+    uint8_t rate_index = DpLinkConfig::kNoRateIndex;     // DP_LINK_RATE_SET, when the rate was set that way
     uint32_t clock_recovery_reads = 0;       // link status reads of the clock recovery loop
     uint32_t channel_eq_reads = 0;           // and of the channel equalization loop
     uint8_t train_set[4] = {};               // what the lanes ended up driven with (DP_TRAINING_LANEx_SET)
   };
 
   // `caps`: what the sink can do (the lane count and rate are the caller's choice within it, DpLinkConfig::choose). `lanes` 1, 2 or 4.
-  static Outcome train(IDpcdAux& aux, IDpSource& source, const Dpcd::Capabilities& caps, uint8_t bandwidth_code, uint32_t lanes);
+  // `rate_index`: not kNoRateIndex for a rate set by the eDP 1.4 table (`bandwidth_code` is then 0 and written as such, followed by DP_LINK_RATE_SET).
+  static Outcome train(IDpcdAux& aux, IDpSource& source, const Dpcd::Capabilities& caps, uint8_t bandwidth_code, uint32_t lanes, uint8_t rate_index = DpLinkConfig::kNoRateIndex);
 };
 
 }  // namespace hardware
