@@ -462,47 +462,40 @@ EXPORT BOOL WINAPI GetLogicalProcessorInformation(SYSTEM_LOGICAL_PROCESSOR_INFOR
   return TRUE;
 }
 
-/* VerifyVersionInfo: the operating system calls itself Windows 10 (10.0, build 19045), like GetVersionEx does. */
-#define VER_MINORVERSION_ 1
-#define VER_MAJORVERSION_ 2
-#define VER_BUILDNUMBER_ 4
-#define VER_PLATFORMID_ 8
-#define VER_SERVICEPACKMINOR_ 0x10
-#define VER_SERVICEPACKMAJOR_ 0x20
-EXPORT ULONGLONG WINAPI VerSetConditionMask(ULONGLONG mask, DWORD type, BYTE condition) {
-  int bit = 0;
-  for (DWORD t = type; t > 1; t >>= 1) ++bit;      /* VER_MINORVERSION=1 -> 0, MAJOR=2 -> 1, BUILD=4 -> 2, PLATFORM=8 -> 3, SPMINOR=0x10 -> 4, SPMAJOR=0x20 -> 5 */
-  if (type == 0 || (type & (type - 1))) return mask;
-  mask &= ~((ULONGLONG)7 << (bit * 3));
-  return mask | ((ULONGLONG)(condition & 7) << (bit * 3));
-}
-static BOOL version_compare(DWORD have, DWORD want, int condition) {
-  switch (condition) { case 1: return have == want; case 2: return have > want; case 3: return have >= want; case 4: return have < want; case 5: return have <= want; default: return have == want; }
-}
-EXPORT BOOL WINAPI VerifyVersionInfoW(OSVERSIONINFOW *info, DWORD type_mask, ULONGLONG condition_mask) {
+/* VerifyVersionInfo and GetProductInfo: ntdll knows the version (RtlGetVersion, RtlVerifyVersionInfo). */
+NTSTATUS NTAPI RtlVerifyVersionInfo(const void *info, ULONG types, ULONGLONG mask);
+EXPORT BOOL WINAPI VerifyVersionInfoW(OSVERSIONINFOEXW *info, DWORD type_mask, ULONGLONG condition_mask) {
   if (!info) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
-  OSVERSIONINFOW os;
-  memset(&os, 0, sizeof(os));
-  os.dwOSVersionInfoSize = sizeof(os);
-  GetVersionExW(&os);
-  #define COND(bit) ((int)((condition_mask >> ((bit) * 3)) & 7))
-  /* Major, then minor: a later field only counts when the earlier ones are equal. */
-  if (type_mask & VER_MAJORVERSION_) {
-    if (os.dwMajorVersion != info->dwMajorVersion) {
-      const int c = COND(1);
-      if (!version_compare(os.dwMajorVersion, info->dwMajorVersion, c)) { set_error(ERROR_OLD_WIN_VERSION); return FALSE; }
-      return TRUE;
-    }
-  }
-  if ((type_mask & VER_MINORVERSION_) && !version_compare(os.dwMinorVersion, info->dwMinorVersion, COND(0))) { set_error(ERROR_OLD_WIN_VERSION); return FALSE; }
-  if ((type_mask & VER_BUILDNUMBER_) && !version_compare(os.dwBuildNumber, info->dwBuildNumber, COND(2))) { set_error(ERROR_OLD_WIN_VERSION); return FALSE; }
-  if ((type_mask & VER_PLATFORMID_) && !version_compare(os.dwPlatformId, info->dwPlatformId, COND(3))) { set_error(ERROR_OLD_WIN_VERSION); return FALSE; }
-  #undef COND
-  return TRUE;
+  const NTSTATUS status = RtlVerifyVersionInfo(info, type_mask, condition_mask);
+  if (status == STATUS_SUCCESS) return TRUE;
+  set_error(status == (NTSTATUS)0xC0000059 /* STATUS_REVISION_MISMATCH */ ? 1150 /* ERROR_OLD_WIN_VERSION */ : ERROR_INVALID_PARAMETER);
+  return FALSE;
 }
+EXPORT BOOL WINAPI VerifyVersionInfoA(OSVERSIONINFOEXA *info, DWORD type_mask, ULONGLONG condition_mask) {
+  if (!info) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  OSVERSIONINFOEXW wide;
+  memset(&wide, 0, sizeof(wide));
+  wide.dwOSVersionInfoSize = info->dwOSVersionInfoSize == sizeof(OSVERSIONINFOEXA) ? sizeof(OSVERSIONINFOEXW) : sizeof(OSVERSIONINFOW);
+  wide.dwMajorVersion = info->dwMajorVersion;
+  wide.dwMinorVersion = info->dwMinorVersion;
+  wide.dwBuildNumber = info->dwBuildNumber;
+  wide.dwPlatformId = info->dwPlatformId;
+  if (info->dwOSVersionInfoSize == sizeof(OSVERSIONINFOEXA)) {
+    wide.wServicePackMajor = info->wServicePackMajor;
+    wide.wServicePackMinor = info->wServicePackMinor;
+    wide.wSuiteMask = info->wSuiteMask;
+    wide.wProductType = info->wProductType;
+  } else if (info->dwOSVersionInfoSize != sizeof(OSVERSIONINFOA)) {
+    set_error(ERROR_INVALID_PARAMETER);
+    return FALSE;
+  }
+  return VerifyVersionInfoW(&wide, type_mask, condition_mask);
+}
+/* The product of a Windows version: before Vista there is none (FALSE, 0, the last error left alone), else this system is Windows 10 Pro. */
 EXPORT BOOL WINAPI GetProductInfo(DWORD major, DWORD minor, DWORD sp_major, DWORD sp_minor, PDWORD type) {
-  (void)major; (void)minor; (void)sp_major; (void)sp_minor;
+  (void)minor; (void)sp_major; (void)sp_minor;
   if (!type) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (major < 6) { *type = 0; return FALSE; }
   *type = 0x30;      /* PRODUCT_PROFESSIONAL */
   return TRUE;
 }

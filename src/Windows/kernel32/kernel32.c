@@ -553,12 +553,28 @@ EXPORT void WINAPI GetStartupInfoA(LPSTARTUPINFOA info) {
 }
 
 EXPORT DWORD WINAPI GetVersion(void) { return (19045u << 16) | (0u << 8) | 10u; }
+NTSTATUS NTAPI RtlGetVersion(RTL_OSVERSIONINFOW *info);
+/* GetVersionEx: the size says which structure; any other size is ERROR_INSUFFICIENT_BUFFER. The extended fields come from ntdll. */
 EXPORT BOOL WINAPI GetVersionExW(LPOSVERSIONINFOW v) {
-  v->dwMajorVersion = 10; v->dwMinorVersion = 0; v->dwBuildNumber = 19045; v->dwPlatformId = 2; v->szCSDVersion[0] = 0;
+  if (!v || (v->dwOSVersionInfoSize != sizeof(OSVERSIONINFOW) && v->dwOSVersionInfoSize != sizeof(OSVERSIONINFOEXW))) { set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+  RTL_OSVERSIONINFOEXW info;
+  memset(&info, 0, sizeof(info));
+  info.dwOSVersionInfoSize = v->dwOSVersionInfoSize;
+  if (!NT_SUCCESS(RtlGetVersion((RTL_OSVERSIONINFOW *)&info))) { set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+  memcpy(v, &info, v->dwOSVersionInfoSize == sizeof(OSVERSIONINFOEXW) ? sizeof(OSVERSIONINFOEXW) : sizeof(OSVERSIONINFOW));
   return TRUE;
 }
 EXPORT BOOL WINAPI GetVersionExA(LPOSVERSIONINFOA v) {
-  v->dwMajorVersion = 10; v->dwMinorVersion = 0; v->dwBuildNumber = 19045; v->dwPlatformId = 2; v->szCSDVersion[0] = 0;
+  if (!v || (v->dwOSVersionInfoSize != sizeof(OSVERSIONINFOA) && v->dwOSVersionInfoSize != sizeof(OSVERSIONINFOEXA))) { set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+  RTL_OSVERSIONINFOEXW info;
+  memset(&info, 0, sizeof(info));
+  info.dwOSVersionInfoSize = sizeof(info);
+  RtlGetVersion((RTL_OSVERSIONINFOW *)&info);
+  v->dwMajorVersion = info.dwMajorVersion; v->dwMinorVersion = info.dwMinorVersion; v->dwBuildNumber = info.dwBuildNumber; v->dwPlatformId = info.dwPlatformId; v->szCSDVersion[0] = 0;
+  if (v->dwOSVersionInfoSize == sizeof(OSVERSIONINFOEXA)) {
+    OSVERSIONINFOEXA *ex = (OSVERSIONINFOEXA *)v;
+    ex->wServicePackMajor = info.wServicePackMajor; ex->wServicePackMinor = info.wServicePackMinor; ex->wSuiteMask = info.wSuiteMask; ex->wProductType = info.wProductType; ex->wReserved = 0;
+  }
   return TRUE;
 }
 static ULONGLONG get64(const BYTE *p) { ULONGLONG v; memcpy(&v, p, 8); return v; }

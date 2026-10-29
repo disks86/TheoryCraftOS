@@ -328,13 +328,85 @@ EXPORT ULONG NTAPI RtlNtStatusToDosError(NTSTATUS status) {
   }
 }
 
+#define STATUS_REVISION_MISMATCH ((NTSTATUS)0xC0000059)
+/* The operating system calls itself Windows 10 (10.0, build 19045), a workstation without a service pack. */
 EXPORT NTSTATUS NTAPI RtlGetVersion(RTL_OSVERSIONINFOW *info) {
-  if (!info) return STATUS_INVALID_PARAMETER;
+  if (!info || (info->dwOSVersionInfoSize != sizeof(RTL_OSVERSIONINFOW) && info->dwOSVersionInfoSize != sizeof(RTL_OSVERSIONINFOEXW))) return STATUS_INVALID_PARAMETER;
   info->dwMajorVersion = 10;
   info->dwMinorVersion = 0;
   info->dwBuildNumber = 19045;
   info->dwPlatformId = 2;
   info->szCSDVersion[0] = 0;
+  if (info->dwOSVersionInfoSize == sizeof(RTL_OSVERSIONINFOEXW)) {
+    RTL_OSVERSIONINFOEXW *ex = (RTL_OSVERSIONINFOEXW *)info;
+    ex->wServicePackMajor = ex->wServicePackMinor = 0;
+    ex->wSuiteMask = 0x0100;      /* VER_SUITE_SINGLEUSERTS */
+    ex->wProductType = 1;         /* VER_NT_WORKSTATION */
+    ex->wReserved = 0;
+  }
+  return STATUS_SUCCESS;
+}
+EXPORT VOID NTAPI RtlGetNtVersionNumbers(ULONG *major, ULONG *minor, ULONG *build) {
+  if (major) *major = 10;
+  if (minor) *minor = 0;
+  if (build) *build = 19045 | 0xF0000000u;      /* (the top bits say it is a free build) */
+}
+EXPORT ULONGLONG NTAPI VerSetConditionMask(ULONGLONG mask, ULONG type, UCHAR condition) {
+  if (type == 0) return mask;
+  static const ULONG kTypes[] = {1, 2, 4, 8, 0x10, 0x20, 0x40, 0x80};      /* minor, major, build, platform, SP minor, SP major, suite, product type */
+  for (int bit = 0; bit < 8; bit++) {
+    if (!(type & kTypes[bit])) continue;
+    mask &= ~((ULONGLONG)7 << (bit * 3));
+    mask |= (ULONGLONG)(condition & 7) << (bit * 3);
+  }
+  return mask;
+}
+static BOOLEAN version_compare(ULONG have, ULONG want, UCHAR condition) {
+  switch (condition) {
+    case 1: return have == want;      /* VER_EQUAL */
+    case 2: return have > want;       /* VER_GREATER */
+    case 3: return have >= want;      /* VER_GREATER_EQUAL */
+    case 4: return have < want;       /* VER_LESS */
+    case 5: return have <= want;      /* VER_LESS_EQUAL */
+    default: return FALSE;
+  }
+}
+/* Does this system meet the version asked for? The conditions are three bits per field in `mask`. Major, minor and the service pack numbers are one chain: a later field is
+   looked at only if the earlier one was equal (and its condition allows equality). STATUS_REVISION_MISMATCH if not. */
+EXPORT NTSTATUS NTAPI RtlVerifyVersionInfo(const RTL_OSVERSIONINFOEXW *info, ULONG types, ULONGLONG mask) {
+  RTL_OSVERSIONINFOEXW now;
+  now.dwOSVersionInfoSize = sizeof(now);
+  if (!info || !types) return STATUS_INVALID_PARAMETER;
+  if (!(types & 0xFF)) return STATUS_INVALID_PARAMETER;
+  if (info->dwOSVersionInfoSize != sizeof(RTL_OSVERSIONINFOW) && info->dwOSVersionInfoSize != sizeof(RTL_OSVERSIONINFOEXW)) return STATUS_INVALID_PARAMETER;
+  RtlGetVersion((RTL_OSVERSIONINFOW *)&now);
+  const BOOLEAN extended = info->dwOSVersionInfoSize == sizeof(RTL_OSVERSIONINFOEXW);
+  #define COND(bit) ((UCHAR)((mask >> ((bit) * 3)) & 7))
+  if (types & 0x80) { if (!extended || !version_compare(now.wProductType, info->wProductType, COND(7))) return STATUS_REVISION_MISMATCH; }
+  if (types & 0x40) {      /* VER_SUITENAME: VER_AND needs every bit, VER_OR any */
+    const UCHAR c = COND(6);
+    if (!extended) return STATUS_REVISION_MISMATCH;
+    if (c == 6 /* VER_AND */) { if ((info->wSuiteMask & now.wSuiteMask) != info->wSuiteMask) return STATUS_REVISION_MISMATCH; }
+    else if (c == 7 /* VER_OR */) { if (!(info->wSuiteMask & now.wSuiteMask)) return STATUS_REVISION_MISMATCH; }
+    else return STATUS_INVALID_PARAMETER;
+  }
+  if ((types & 8) && !version_compare(now.dwPlatformId, info->dwPlatformId, COND(3))) return STATUS_REVISION_MISMATCH;
+  if ((types & 4) && !version_compare(now.dwBuildNumber, info->dwBuildNumber, COND(2))) return STATUS_REVISION_MISMATCH;
+  if (types & 0x33) {
+    NTSTATUS status = STATUS_SUCCESS;
+    BOOLEAN next = TRUE;
+    struct { ULONG bit_type; int bit; ULONG have, want; } chain[4] = {
+      {2, 1, now.dwMajorVersion, info->dwMajorVersion}, {1, 0, now.dwMinorVersion, info->dwMinorVersion},
+      {0x20, 5, now.wServicePackMajor, extended ? info->wServicePackMajor : 0}, {0x10, 4, now.wServicePackMinor, extended ? info->wServicePackMinor : 0}};
+    for (int i = 0; i < 4 && next; i++) {
+      if (!(types & chain[i].bit_type)) continue;
+      const UCHAR c = COND(chain[i].bit);
+      status = version_compare(chain[i].have, chain[i].want, c) ? STATUS_SUCCESS : STATUS_REVISION_MISMATCH;
+      next = chain[i].have == chain[i].want && (c == 1 || c == 3 || c == 5);
+    }
+    if (status) return status;
+  }
+  #undef COND
   return STATUS_SUCCESS;
 }
 
