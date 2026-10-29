@@ -106,7 +106,7 @@ struct Card final : IVcnRegisters {
   static bool in(uint32_t r, uint32_t lo, uint32_t hi) { return r >= lo && r <= hi; }
   IVcnRegisters& owner(uint32_t r) {
     if (monitor && in(r, 0x7000, 0x7007)) return *monitor;
-    if (aux && in(r, 0x7010, 0x7061)) return *aux;
+    if (aux && (in(r, 0x7010, 0x7061) || in(r, 0x7100, 0x715F))) return *aux;
     if (azalia && FakeAzalia::owns(r)) return *azalia;
     if (in(r, 0x3400, 0x37ff)) return sdma;
     if (in(r, 0xe30, 0xe4b) || r == 0x151a || r == 0x151b) return ih;
@@ -1443,7 +1443,7 @@ static void test_hpd_rx() {
 // A video BIOS image with the object table of a board with eDP on pin 0, HDMI on pin 1 and a DisplayPort on pin 2 (literal offsets: ROM header 0x100, master data table 0x200 with the
 // GPIO_Pin_LUT at 0x300 and the Object_Header at 0x400, the paths at 0x440, the connector objects at 0x500, their records at 0x580).
 static std::vector<uint8_t> make_connector_vbios() {
-  std::vector<uint8_t> b(0x800, 0);
+  std::vector<uint8_t> b(0xA00, 0);      // (the mode setting tables are at 0x800..0x980)
   auto u8 = [&](uint32_t at, uint32_t v) { b[at] = static_cast<uint8_t>(v); };
   auto u16 = [&](uint32_t at, uint32_t v) { u8(at, v); u8(at + 1, v >> 8); };
   u8(0, 0x55); u8(1, 0xAA); u16(0x48, 0x100);
@@ -1516,6 +1516,21 @@ static std::vector<uint8_t> make_connector_vbios() {
     u8(at + 4, 8);
     u8(at + 5, 8);
     for (size_t i = 0; i < enc.b.size(); ++i) u8(at + 6 + static_cast<uint32_t>(i), enc.b[i]);
+  }
+  // the mode setting tables: each copies its parameter words to FakeAuxCard::kModeSet registers (crev: SetPixelClock 7, SelectCRTC_Source 3, the others 1)
+  const struct { uint32_t index, words, crev; } mode_tables[6] = {{12, 4, 7}, {34, 2, 1}, {35, 1, 1}, {39, 6, 1}, {42, 1, 3}, {44, 1, 1}};
+  for (uint32_t k = 0; k < 6; ++k) {
+    atomimage::Code m;
+    for (uint32_t i = 0; i < mode_tables[k].words; ++i) m.move(atomimage::REG, FakeAuxCard::kModeSet + k * 0x10 + i, atomimage::PS, i);
+    m.eot();
+    const uint32_t at = 0x800 + k * 0x40;
+    u16(0x640 + 4 + mode_tables[k].index * 2, at);
+    u16(at, 6 + static_cast<uint32_t>(m.b.size()));
+    u8(at + 2, 1);
+    u8(at + 3, mode_tables[k].crev);
+    u8(at + 4, mode_tables[k].words * 4);
+    u8(at + 5, mode_tables[k].words * 4);
+    for (size_t i = 0; i < m.b.size(); ++i) u8(at + 6 + static_cast<uint32_t>(i), m.b[i]);
   }
   u16(0x640 + 4 + 78 * 2, 0x700);
   u16(0x700, 6 + static_cast<uint32_t>(aux.b.size()));
@@ -2095,6 +2110,107 @@ static void test_train_link() {
   CHECK(!vega.train_link(dp, 148500, 8, &t));
 }
 
+// Mode setting of the three outputs through the video BIOS: the order of the tables and their words for the DisplayPort connector (DIG 3: capabilities, link config, the training between
+// the transmitter and the output), the eDP panel (powered up first), and HDMI (no training, pixel clock on PPLL1/PPLL2), the failures by stage, and switching off.
+static void test_set_mode() {
+  const std::vector<uint8_t> vbios = make_connector_vbios();   // eDP (0x92, pin 0, DIG 0), HDMI-A (0x91, pin 1, DIG 2), DisplayPort (0x93, pin 2, DIG 3 link B)
+  Rig rig;
+  FakeAuxCard auxcard;
+  rig.card.aux = &auxcard;
+  AmdVegaM vega(rig.alloc);
+  AmdVegaM::Inputs in = rig.inputs();
+  in.vbios = ConstByteView(vbios.data(), vbios.size());
+  DisplayMode m;
+  m.pixel_clock_khz = 148500;
+  m.h_display = 1920; m.h_sync_start = 2008; m.h_sync_end = 2052; m.h_total = 2200;
+  m.v_display = 1080; m.v_sync_start = 1084; m.v_sync_end = 1089; m.v_total = 1125;
+  AmdVegaM::ModeSetResult r;
+  CHECK(!vega.set_mode(AtomConnectors::Connector(), 0, m, 8, &r) && r.failed == AmdVegaM::ModeSetStage::NotReady);
+  CHECK(vega.bring_up(in));
+  if (!vega.up()) return;
+  const AtomConnectors::Connector edp = vega.connectors()[0], hdmi = vega.connectors()[1], dp = vega.connectors()[2];
+  std::vector<uint8_t>& dpcd = auxcard.sink.dpcd;
+  dpcd.assign(0x800, 0);
+  const uint8_t caps[8] = {0x12, 0x14, 0xC4, 0x01, 0x00, 0x00, 0x01, 0x00};
+  for (size_t i = 0; i < 8; ++i) dpcd[i] = caps[i];
+  dpcd[0x202] = dpcd[0x203] = 0x77;
+  dpcd[0x204] = 0x01;
+  // DisplayPort on CRTC 1: blank, disable; pixel clock (PPLL0 for DP), timing, source (DIG 3 is 0x0B), encoder setup, transmitter setup, enable, then the training (encoder 2: start, pattern 1,
+  // pattern 3, complete; the drive), video on, the output, the CRTC enabled and unblanked
+  CHECK(vega.set_mode(dp, 1, m, 8, &r) && r.failed == AmdVegaM::ModeSetStage::Done && r.pll == AmdModeSet::kPpll0 && r.link.config.lanes == 2 && r.link.config.rate_khz == 270000 && r.link.outcome.trained());
+  const std::vector<uint32_t> want_order = {34, 35, 12, 39, 42, 75, 76, 76, 75, 75, 76, 75, 75, 75, 76, 35, 34};
+  // (blank, disable CRTC; clock, timing, source; encoder setup; transmitter setup, enable; training: start, pattern 1, drive, pattern 3, complete; video on; output; enable CRTC; unblank)
+  std::vector<uint32_t> order = auxcard.table_order;
+  CHECK(order.size() == want_order.size());
+  if (order.size() != want_order.size()) { for (uint32_t t : order) printf(" %u", t); printf(" stage %d\n", int(r.failed)); }
+  CHECK(auxcard.mode_calls[0].words == std::vector<uint32_t>({1u | 1u << 8, 0}) && auxcard.mode_calls[1].words == std::vector<uint32_t>({1u}));
+  CHECK(auxcard.mode_calls[2].words[0] == 1485000 && (auxcard.mode_calls[2].words[1] & 0xFF) == 2 && ((auxcard.mode_calls[2].words[1] >> 16) & 0xFF) == 0 && auxcard.mode_calls[2].words[2] == 1);
+  CHECK(auxcard.mode_calls[3].table == 39 && auxcard.mode_calls[3].words[0] == (2200u | 1920u << 16) && (auxcard.mode_calls[3].words[4] >> 16) == 1);
+  CHECK(auxcard.mode_calls[4].table == 42 && auxcard.mode_calls[4].words[0] == (1u | 0x0Bu << 8 | 0u << 16 | 2u << 24));
+  // the tail: the CRTC enabled then unblanked
+  const size_t n = auxcard.mode_calls.size();
+  CHECK(auxcard.mode_calls[n - 2].table == 35 && auxcard.mode_calls[n - 2].words[0] == (1u | 1u << 8) && auxcard.mode_calls[n - 1].table == 34 && auxcard.mode_calls[n - 1].words[0] == 1u);
+  // the encoder setup carries the chosen lanes and rate, and the video on comes after the training and before the output
+  const FakeAuxCard::DigCall& setup = auxcard.dig_calls[0];
+  CHECK(setup.table == 1 && (setup.words[0] >> 24) == 0x0F && ((setup.words[0] >> 16) & 0xFF) == 0x31 && ((setup.words[1] >> 8) & 0xFF) == 2);
+  size_t video_on = 0, enable_output = 0, complete = 0;
+  for (size_t i = 0; i < auxcard.dig_calls.size(); ++i) {
+    const FakeAuxCard::DigCall& c = auxcard.dig_calls[i];
+    if (c.table == 1 && (c.words[0] >> 24) == 0x0D) video_on = i;
+    if (c.table == 1 && (c.words[0] >> 24) == 0x0B) complete = i;
+    if (c.table == 2 && (c.words[0] >> 24) == 9) enable_output = i;
+  }
+  CHECK(complete != 0 && video_on > complete && enable_output > video_on);
+  // HDMI on CRTC 3 (PPLL2), four lanes, no training, no AUX channel use
+  auxcard.table_order.clear();
+  auxcard.mode_calls.clear();
+  auxcard.dig_calls.clear();
+  const size_t doorbells = auxcard.doorbells;
+  CHECK(vega.set_mode(hdmi, 3, m, 10, &r) && r.pll == AmdModeSet::kPpll2 && auxcard.doorbells == doorbells);
+  CHECK(auxcard.mode_calls[2].words[2] == (3u | 1u << 8) && ((auxcard.mode_calls[2].words[1] >> 16) & 0xFF) == 3 && (auxcard.mode_calls[2].words[1] & 0xFF) == 1);
+  CHECK(auxcard.dig_calls[0].table == 1 && auxcard.dig_calls[0].words[1] == (3u | 4u << 8 | 3u << 16 | 2u << 24));      // (HDMI, four lanes, 10 bits is 3, HPD pin 1 is id 2)
+  // eDP: the panel is powered up (it answers only then) and the CRTC is the caller's
+  auxcard.unpowered_channel = 0x92;
+  auxcard.table_order.clear();
+  auxcard.dig_calls.clear();
+  rig.card.gfx.set_reg(0x1898, 0x2);
+  CHECK(vega.set_mode(edp, 0, m, 8, &r) && auxcard.panel_on && auxcard.dig_calls[0].table == 2 && (auxcard.dig_calls[0].words[0] >> 24) == 12);      // (the panel power first, then DIG 0 on encoder table 1)
+  bool dig0 = false;
+  for (const FakeAuxCard::DigCall& c : auxcard.dig_calls) dig0 = dig0 || c.table == 0;
+  CHECK(dig0);
+  auxcard.unpowered_channel = 0;
+  // failures name their stage: a table that is not in the image, a sink that is no DPCD, a mode that is no mode, a connector that is no digital output
+  CHECK(!vega.set_mode(dp, 6, m, 8, &r) && r.failed == AmdVegaM::ModeSetStage::Unsupported);
+  DisplayMode empty;
+  CHECK(!vega.set_mode(dp, 0, empty, 8, &r) && r.failed == AmdVegaM::ModeSetStage::Unsupported);
+  AtomConnectors::Connector vga = dp;
+  vga.type = AtomConnectors::Type::Vga;
+  CHECK(!vega.set_mode(vga, 0, m, 8, &r) && r.failed == AmdVegaM::ModeSetStage::Unsupported);
+  AtomConnectors::Connector no_ddc = dp;
+  no_ddc.has_ddc = false;
+  CHECK(!vega.set_mode(no_ddc, 0, m, 8, &r) && r.failed == AmdVegaM::ModeSetStage::SinkCapabilities);
+  dpcd[1] = 0;
+  CHECK(!vega.set_mode(dp, 0, m, 8, &r) && r.failed == AmdVegaM::ModeSetStage::SinkCapabilities);
+  dpcd[1] = 0x14;
+  m.h_sync_end = m.h_sync_start - 1;
+  CHECK(!vega.set_mode(hdmi, 0, m, 8, &r) && r.failed == AmdVegaM::ModeSetStage::Timing);
+  m.h_sync_end = 2052;
+  dpcd[0x202] = dpcd[0x203] = 0;
+  CHECK(!vega.set_mode(dp, 0, m, 8, &r) && r.failed == AmdVegaM::ModeSetStage::LinkTraining);
+  dpcd[0x202] = dpcd[0x203] = 0x77;
+  // switching off: video off (DP), CRTC blanked, output and transmitter off, encoder off, CRTC disabled
+  auxcard.table_order.clear();
+  auxcard.mode_calls.clear();
+  auxcard.dig_calls.clear();
+  CHECK(vega.disable_mode(dp, 1));
+  CHECK(auxcard.table_order == std::vector<uint32_t>({75, 34, 76, 76, 75, 35}));
+  CHECK((auxcard.dig_calls[0].words[0] >> 24) == 0x0C && (auxcard.dig_calls[1].words[0] >> 24) == 8 && (auxcard.dig_calls[2].words[0] >> 24) == 0 && (auxcard.dig_calls[3].words[0] >> 24) == 0);
+  CHECK(auxcard.mode_calls[0].words == std::vector<uint32_t>({1u | 1u << 8, 0}) && auxcard.mode_calls[1].words == std::vector<uint32_t>({1u}));
+  CHECK(!vega.disable_mode(dp, 6) && !vega.disable_mode(vga, 0));
+  vega.shutdown();
+  CHECK(!vega.disable_mode(dp, 0) && !vega.set_mode(dp, 0, m, 8, &r) && r.failed == AmdVegaM::ModeSetStage::NotReady);
+}
+
 // The sink's DPCD over the AUX channel of the DisplayPort and eDP connectors (through the video BIOS's table, with the panel power-up for the eDP one).
 static void test_read_dpcd() {
   const std::vector<uint8_t> vbios = make_connector_vbios();   // eDP (DDC line 0x92, pin 0), HDMI-A (0x91), DisplayPort (0x93, pin 2)
@@ -2577,6 +2693,7 @@ int main() {
   test_audio_end_to_end();
   test_read_dpcd();
   test_train_link();
+  test_set_mode();
   test_short_pulse_status();
   test_retrain_on_short_pulse();
   printf(g_failed ? "AmdVegaMTest: %d FAILED\n" : "AmdVegaMTest: all passed\n", g_failed);
