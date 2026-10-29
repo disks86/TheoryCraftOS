@@ -469,6 +469,19 @@ static void test_memory_and_exports() {
   CHECK(run(m, env, g) == Status::Done && env.samples == 64 && m.vgpr_f(8, 2) == 2.5f && m.vgpr_f(9, 2) == 256.0f);
 }
 
+static void test_wqm() {
+  TestAllocator alloc;
+  Env env;
+  Wave w;
+  w.exec = 0x0000000000100412ull;         // lanes 1, 4, 10, 20
+  Code c(alloc);
+  c.sop1(Sop1::s_mov_b64, 4, exec());
+  c.sop1(Sop1::s_wqm_b64, 126, exec());
+  c.sop1(Sop1::s_mov_b64, 6, exec());
+  c.sopp(Sopp::s_endpgm);
+  CHECK(run(w, env, c) == Status::Done && w.sgpr[4] == 0x100412u && w.exec == 0xF00FFFull && w.sgpr[6] == 0xF00FFFu);
+}
+
 static void test_failures() {
   TestAllocator alloc;
   Env env;
@@ -624,6 +637,7 @@ int main() {
   test_integer_and_conversions();
   test_compares_and_masks();
   test_memory_and_exports();
+  test_wqm();
   test_failures();
   test_llvm_interp_math();
   test_llvm_flow();

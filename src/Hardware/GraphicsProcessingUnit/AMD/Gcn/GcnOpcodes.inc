@@ -11,6 +11,7 @@ enum class Sop1 : uint16_t {
   s_andn2_saveexec_b64 = 0x23,
   s_orn2_saveexec_b64 = 0x24,
   s_nand_saveexec_b64 = 0x25,
+  s_wqm_b64 = 0x7,
 };
 enum class Sop2 : uint16_t {
   s_add_u32 = 0x0,

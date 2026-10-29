@@ -12,6 +12,8 @@
 {"s_and_saveexec_b64 s[0:1], vcc", {0xBE80206Au}, [](gcn::Code& c) { c.sop1(gcn::Sop1::s_and_saveexec_b64, 0, gcn::vcc()); }},
 {"s_or_saveexec_b64 s[4:5], s[6:7]", {0xBE842106u}, [](gcn::Code& c) { c.sop1(gcn::Sop1::s_or_saveexec_b64, 4, gcn::sgpr(6)); }},
 {"s_andn2_saveexec_b64 s[0:1], s[2:3]", {0xBE802302u}, [](gcn::Code& c) { c.sop1(gcn::Sop1::s_andn2_saveexec_b64, 0, gcn::sgpr(2)); }},
+{"s_wqm_b64 exec, exec", {0xBEFE077Eu}, [](gcn::Code& c) { c.sop1(gcn::Sop1::s_wqm_b64, 126, gcn::exec()); }},
+{"s_wqm_b64 s[4:5], s[2:3]", {0xBE840702u}, [](gcn::Code& c) { c.sop1(gcn::Sop1::s_wqm_b64, 4, gcn::sgpr(2)); }},
 {"s_add_u32 s0, s1, s2", {0x80000201u}, [](gcn::Code& c) { c.sop2(gcn::Sop2::s_add_u32, 0, gcn::sgpr(1), gcn::sgpr(2)); }},
 {"s_add_u32 s0, s1, 0x100", {0x8000FF01u, 0x00000100u}, [](gcn::Code& c) { c.sop2(gcn::Sop2::s_add_u32, 0, gcn::sgpr(1), gcn::imm_int(0x100)); }},
 {"s_add_u32 s0, 0x100, s1", {0x800001FFu, 0x00000100u}, [](gcn::Code& c) { c.sop2(gcn::Sop2::s_add_u32, 0, gcn::imm_int(0x100), gcn::sgpr(1)); }},

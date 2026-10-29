@@ -704,6 +704,8 @@ add_executable(BOOTX64
   src/Hardware/GraphicsProcessingUnit/AMD/AmdMonitor.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnIsa.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnEmu.cpp
+  src/Hardware/GraphicsProcessingUnit/AMD/Gcn/TgsiParse.cpp
+  src/Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnCompiler.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdAsicReset.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdIrq.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdSdma3.cpp
