@@ -70,11 +70,16 @@ struct Luid {
 
 // The formats of an allocation (D3DDDIFORMAT, the ones the devices can draw with). The memory layout is little-endian 32-bit words: A8R8G8B8 is 0xAARRGGBB, A8B8G8R8
 // is 0xAABBGGRR. The X formats ignore the alpha byte (a texture or render target of one reads as opaque).
-enum class Format : uint32_t { Unknown, A8R8G8B8, X8R8G8B8, A8B8G8R8, X8B8G8R8, D32Float, D24S8 };
+// A16B16G16R16F and A32B32G32R32F (D3DFMT_A16B16G16R16F / A32B32G32R32F) keep four half or single floats per pixel in the order R, G, B, A, unclamped: they need the adapter's
+// kFeatureFloatFormats (except as staging memory), have one mip level, and cannot be presented.
+enum class Format : uint32_t { Unknown, A8R8G8B8, X8R8G8B8, A8B8G8R8, X8B8G8R8, D32Float, D24S8, A16B16G16R16F, A32B32G32R32F };
 
 constexpr bool is_depth(Format f) { return f == Format::D32Float || f == Format::D24S8; }
-constexpr bool is_color(Format f) { return f == Format::A8R8G8B8 || f == Format::X8R8G8B8 || f == Format::A8B8G8R8 || f == Format::X8B8G8R8; }
-constexpr bool has_alpha(Format f) { return f == Format::A8R8G8B8 || f == Format::A8B8G8R8; }
+constexpr bool is_float(Format f) { return f == Format::A16B16G16R16F || f == Format::A32B32G32R32F; }
+constexpr bool is_color(Format f) { return f == Format::A8R8G8B8 || f == Format::X8R8G8B8 || f == Format::A8B8G8R8 || f == Format::X8B8G8R8 || is_float(f); }
+constexpr bool has_alpha(Format f) { return f == Format::A8R8G8B8 || f == Format::A8B8G8R8 || is_float(f); }
+// Bytes of one pixel of a colour format.
+constexpr uint32_t pixel_bytes(Format f) { return f == Format::A16B16G16R16F ? 8 : f == Format::A32B32G32R32F ? 16 : 4; }
 // Red and blue swapped relative to the devices' logical 0xAARRGGBB.
 constexpr bool is_rgba_order(Format f) { return f == Format::A8B8G8R8 || f == Format::X8B8G8R8; }
 
@@ -198,6 +203,7 @@ struct PipelineDesc {
   graphics::BlendState blend;                                  // needs the adapter's kFeatureBlendState (caps.features)
   graphics::CompareOp depth_compare = graphics::CompareOp::LessEqual;   // ... as does any comparison but LessEqual
   // (the attributes' per_instance flag needs kFeatureInstancing)
+  uint32_t color_target_count = 1;   // the colour outputs the pixel shader fills (SV_Target0 ..); more than one needs the adapter's kFeatureMultipleTargets, and a pass with that many targets
 };
 
 // --- Presenting -----------------------------------------------------------------------

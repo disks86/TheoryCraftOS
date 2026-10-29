@@ -48,7 +48,9 @@ class TgsiEmitter {
   static constexpr uint32_t kWork = 36, kWork2 = 37, kWork3 = 38;
   static constexpr uint32_t kPosition = 39, kVarying = 40, kColor = 44;   // (kVarying: four)
   static constexpr uint32_t kSys = 45;     // the system values (SysValue order), copied from where TGSI keeps them into registers of the interpreter's shape
-  static constexpr uint32_t kTempCount = kSys + kSysValueCount;
+  static constexpr uint32_t kColorExtra = kSys + kSysValueCount;   // colour outputs 1..3 (output 0 is kColor)
+  static constexpr uint32_t kTempCount = kColorExtra + graphics::kMaxColorTargets - 1;
+  static uint32_t color_register(uint32_t target) { return target == 0 ? kColor : kColorExtra + target - 1; }
   static constexpr uint32_t kMaxOutput = 120000;   // (the virgl command carrying the text has a 16-bit dword count)
 
   struct Imm {
@@ -379,7 +381,7 @@ String TgsiEmitter::destination(const Instr::Dst& d) {
       if (d.slot == kSlotPosition) return temp(kPosition, "");
       if (d.slot >= 0 && d.slot < static_cast<int8_t>(graphics::kMaxVaryings)) return temp(kVarying + static_cast<uint32_t>(d.slot), "");
       break;
-    case kColorOut: return temp(kColor, "");
+    case kColorOut: return temp(color_register(d.slot >= 0 ? static_cast<uint32_t>(d.slot) : 0), "");
     default: break;
   }
   unsupported_ = true;
@@ -832,7 +834,7 @@ bool TgsiEmitter::instruction(const Instr& ins) {
 
 void TgsiEmitter::assemble(String* out) {
   out->clear();
-  add(*out, vertex_ ? "VERT\n" : "FRAG\nPROPERTY FS_COLOR0_WRITES_ALL_CBUFS 1\n");
+  add(*out, vertex_ ? "VERT\n" : p_.color_outputs_ > 1 ? "FRAG\n" : "FRAG\nPROPERTY FS_COLOR0_WRITES_ALL_CBUFS 1\n");
   if (vertex_) {
     for (uint32_t i = 0; i <= max_attribute_; ++i) {
       add(*out, "DCL IN[");
@@ -861,6 +863,13 @@ void TgsiEmitter::assemble(String* out) {
     if (sys_used_[kSysPosition]) add(*out, "DCL IN[16], POSITION, LINEAR\n");
     if (sys_used_[kSysFrontFacing]) add(*out, "DCL IN[17], FACE, CONSTANT\n");
     add(*out, "DCL OUT[0], COLOR\n");
+    for (uint32_t i = 1; i < p_.color_outputs_; ++i) {
+      add(*out, "DCL OUT[");
+      add_uint(*out, i);
+      add(*out, "], COLOR[");
+      add_uint(*out, i);
+      add(*out, "]\n");
+    }
     for (uint32_t i = 0; i < graphics::kMaxTextureUnits; ++i) {
       if (!sampler_used_[i]) continue;
       add(*out, "DCL SAMP[");
@@ -943,8 +952,10 @@ NtStatus TgsiEmitter::run(String* out) {
       line("MOV", &v, &z);
     }
   } else {
-    const String c = temp(kColor);
-    line("MOV", &c, &z);
+    for (uint32_t i = 0; i < p_.color_outputs_; ++i) {
+      const String c = temp(color_register(i));
+      line("MOV", &c, &z);
+    }
   }
 
   for (const Instr& ins : p_.code_.view()) {
@@ -969,10 +980,14 @@ NtStatus TgsiEmitter::run(String* out) {
         line("MOV", &target, &v);
       }
     } else {
-      String o = str();
-      add(o, "OUT[0]");
-      const String c = temp(kColor);
-      line("MOV", &o, &c);
+      for (uint32_t i = 0; i < p_.color_outputs_; ++i) {
+        String o = str();
+        add(o, "OUT[");
+        add_uint(o, i);
+        add(o, "]");
+        const String c = temp(color_register(i));
+        line("MOV", &o, &c);
+      }
     }
     add(body_, "  ");
     add_uint(body_, inst_++);

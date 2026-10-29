@@ -324,6 +324,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
     }
   };
 
+  uint32_t color_outputs = 1;   // (SV_Target0 .. n-1 of a pixel shader)
   auto to_dst = [&](const Operand& o, Instr::Dst* d) -> NtStatus {
     d->mask = o.mask;
     if (o.components != 2) return status::kInvalidParameter;
@@ -335,8 +336,9 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       case kOpOutput: {
         if (o.dims != 1 || o.index[0] >= 16) return status::kNotSupported;
         if (!vertex) {
-          if (o.index[0] != 0) return status::kNotSupported;   // one render target
-          d->type = kColorOut, d->slot = 0;
+          if (o.index[0] >= graphics::kMaxColorTargets) return status::kNotSupported;   // (SV_Target0..3)
+          d->type = kColorOut, d->slot = static_cast<int8_t>(o.index[0]);
+          if (o.index[0] + 1 > color_outputs) color_outputs = o.index[0] + 1;
           return status::kSuccess;
         }
         const int8_t slot = out_slot[o.index[0]];
@@ -695,6 +697,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
     for (uint32_t size : cb_size) total += size;
     if (total > kMaxConstantRegisters) return status::kNotSupported;
     if (total) program->constant_registers_ = total;
+    program->color_outputs_ = color_outputs;
   }
   if (vertex) {
     bool writes_position = false;

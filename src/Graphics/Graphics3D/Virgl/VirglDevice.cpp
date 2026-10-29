@@ -21,6 +21,7 @@
 #include <new>
 #include "Graphics/Graphics3D/Virgl/VirglProtocol.hpp"
 #include "Utility/AllocatedView.hpp"
+#include "Utility/ByteStream.hpp"
 
 namespace graphics {
 
@@ -156,6 +157,7 @@ class VirglImage final : public IImage {
     hardware::VirtioGpu& gpu = device.gpu();
     id_ = gpu.allocate_resource_id();
     const bool depth = desc.format == Format::D32Float;
+    color_format_ = desc.format == Format::R32G32B32A32Float ? virgl::kFormatR32G32B32A32Float : desc.format == Format::R16G16B16A16Float ? virgl::kFormatR16G16B16A16Float : virgl::kFormatB8G8R8A8Unorm;
     const uint32_t depth_format = desc.stencil ? virgl::kFormatZ32FloatS8X24Uint : virgl::kFormatZ32Float;
     // A sampled image is stored top row first, the way write_pixels() gives it and the sampler reads it, so it does not take the Y_0_TOP flip of the images that are only
     // drawn into (and shown).
@@ -163,23 +165,23 @@ class VirglImage final : public IImage {
     uint32_t bind = depth ? virgl::kBindDepthStencil : (virgl::kBindRenderTarget | virgl::kBindSamplerView);
     if (desc.usage & kImagePresent) bind |= virgl::kBindScanout;
     ResourceCreate3d create{header(kCmdResourceCreate3d), id_, virgl::kTargetTexture2d,
-                            depth ? depth_format : virgl::kFormatB8G8R8A8Unorm, bind,
+                            depth ? depth_format : color_format_, bind,
                             desc.extent.width, desc.extent.height, 1, 1, 0, 0, sampled ? 0u : kResourceFlagY0Top, 0};
     CtxResource ctx{header(kCmdCtxAttachResource), id_, 0};
     ok_ = gpu.command(as_bytes(create)) && gpu.command(as_bytes(ctx));
-    accounted_ = uint64_t{desc.extent.width} * desc.extent.height * 4;   // (every format here is 32 bits per pixel)
+    accounted_ = uint64_t{desc.extent.width} * desc.extent.height * (depth ? 4u : bytes_per_pixel(desc.format));
     gpu.add_resource_bytes(accounted_);
     // The surface (a render-target view of the resource) is what the framebuffer state refers to.
     if (ok_ && (desc.usage & (kImageColorAttachment | kImageDepthAttachment))) {
       surface_ = device.new_handle();
-      const uint32_t fmt = depth ? depth_format : virgl::kFormatB8G8R8A8Unorm;
+      const uint32_t fmt = depth ? depth_format : color_format_;
       const uint32_t cmd[] = {virgl::header(virgl::kCreateObject, virgl::kObjectSurface, 5), surface_, id_, fmt, 0, 0};
       ok_ = device.send_commands(cmd, 6);
     }
     // The sampler view is what a texture unit is bound to: the whole resource, level 0, components in order.
     if (ok_ && sampled) {
       view_ = device.new_handle();
-      const uint32_t cmd[] = {virgl::header(virgl::kCreateObject, virgl::kObjectSamplerView, 6), view_, id_, virgl::kFormatB8G8R8A8Unorm, 0, 0, virgl::kSwizzleRgba};
+      const uint32_t cmd[] = {virgl::header(virgl::kCreateObject, virgl::kObjectSamplerView, 6), view_, id_, color_format_, 0, 0, virgl::kSwizzleRgba};
       ok_ = device.send_commands(cmd, 7);
     }
   }
@@ -210,7 +212,7 @@ class VirglImage final : public IImage {
 
   bool read_pixels(ArrayView<uint32_t> out) override {
     const uint64_t count = uint64_t{desc_.extent.width} * desc_.extent.height;
-    if (desc_.format == Format::D32Float || out.size() < count) return false;
+    if (desc_.format == Format::D32Float || is_float_format(desc_.format) || out.size() < count) return false;
     hardware::VirtioGpu& gpu = device_.gpu();
     if (!ensure_backing(count)) return false;
     TransferHost3d transfer{header(kCmdTransferFromHost3d),
@@ -222,10 +224,44 @@ class VirglImage final : public IImage {
     return true;
   }
 
+  bool read_pixels_float(ArrayView<Vec4> out) override {
+    const uint64_t count = uint64_t{desc_.extent.width} * desc_.extent.height;
+    if (!is_float_format(desc_.format) || out.size() < count || !ensure_backing(count)) return false;
+    TransferHost3d transfer{header(kCmdTransferFromHost3d), {0, 0, 0, desc_.extent.width, desc_.extent.height, 1}, 0, id_, 0, desc_.extent.width * bytes_per_pixel(desc_.format), 0};
+    if (!device_.gpu().command(as_bytes(transfer))) return false;
+    ByteReader in{ConstByteView(backing_)};
+    for (uint64_t i = 0; i < count; ++i) {
+      if (desc_.format == Format::R16G16B16A16Float) {
+        const float r = half_to_float(in.le16()), g = half_to_float(in.le16()), b = half_to_float(in.le16()), a = half_to_float(in.le16());
+        out[i] = {r, g, b, a};
+      } else {
+        const float r = __builtin_bit_cast(float, in.le32()), g = __builtin_bit_cast(float, in.le32()), b = __builtin_bit_cast(float, in.le32()), a = __builtin_bit_cast(float, in.le32());
+        out[i] = {r, g, b, a};
+      }
+    }
+    return in.ok();
+  }
+
+  bool write_pixels_float(ArrayView<const Vec4> pixels) override {
+    const uint64_t count = uint64_t{desc_.extent.width} * desc_.extent.height;
+    if (!is_float_format(desc_.format) || !(desc_.usage & kImageSampled) || pixels.size() != count || !ensure_backing(count)) return false;
+    ByteWriter out{backing_};
+    for (const Vec4& c : pixels) {
+      if (desc_.format == Format::R16G16B16A16Float) {
+        out.le16(float_to_half(c.x)), out.le16(float_to_half(c.y)), out.le16(float_to_half(c.z)), out.le16(float_to_half(c.w));
+      } else {
+        out.le32(__builtin_bit_cast(uint32_t, c.x)), out.le32(__builtin_bit_cast(uint32_t, c.y)), out.le32(__builtin_bit_cast(uint32_t, c.z)), out.le32(__builtin_bit_cast(uint32_t, c.w));
+      }
+    }
+    if (!out.ok()) return false;
+    TransferHost3d transfer{header(kCmdTransferToHost3d), {0, 0, 0, desc_.extent.width, desc_.extent.height, 1}, 0, id_, 0, desc_.extent.width * bytes_per_pixel(desc_.format), 0};
+    return device_.gpu().command(as_bytes(transfer));
+  }
+
   // Only a texture takes pixels: the host copies them from guest memory (the backing) into the resource.
   bool write_pixels(ArrayView<const uint32_t> pixels) override {
     const uint64_t count = uint64_t{desc_.extent.width} * desc_.extent.height;
-    if (!(desc_.usage & kImageSampled) || desc_.format == Format::D32Float || pixels.size() != count) return false;
+    if (!(desc_.usage & kImageSampled) || desc_.format == Format::D32Float || is_float_format(desc_.format) || pixels.size() != count) return false;
     if (!ensure_backing(count)) return false;
     const ArrayView<uint32_t> staged = backing_.cast<uint32_t>();
     for (uint64_t i = 0; i < count; ++i) staged[i] = pixels[i];
@@ -238,10 +274,11 @@ class VirglImage final : public IImage {
   bool ensure_backing(uint64_t pixel_count) {
     if (!backing_.empty()) return true;
     hardware::VirtioGpu& gpu = device_.gpu();
-    backing_ = allocate_dma_view<uint8_t>(gpu.allocator(), pixel_count * 4, 4096);
+    const uint64_t bytes = pixel_count * bytes_per_pixel(desc_.format);
+    backing_ = allocate_dma_view<uint8_t>(gpu.allocator(), bytes, 4096);
     if (backing_.empty()) return false;
     ResourceAttachBacking attach{header(kCmdResourceAttachBacking), id_, 1,
-                                 {reinterpret_cast<uint64_t>(backing_.data()), static_cast<uint32_t>(pixel_count * 4), 0}};
+                                 {reinterpret_cast<uint64_t>(backing_.data()), static_cast<uint32_t>(bytes), 0}};
     if (!gpu.command(as_bytes(attach))) {
       release_view(gpu.allocator(), backing_);
       return false;
@@ -251,7 +288,7 @@ class VirglImage final : public IImage {
 
   VirglDevice& device_;
   ImageDesc desc_;
-  uint32_t id_ = 0, surface_ = 0, view_ = 0;
+  uint32_t id_ = 0, surface_ = 0, view_ = 0, color_format_ = 0;
   uint64_t accounted_ = 0;   // what the GPU's video memory figure counts for this image
   ByteView backing_;
   bool ok_ = false;
@@ -458,7 +495,7 @@ IImage* VirglDevice::create_image(const ImageDesc& desc) {
   if (desc.mip_levels != 1) return nullptr;   // (no mipmaps either)
   // A texture is not drawn into: the two kinds of image are stored in opposite row order (see VirglImage).
   if ((desc.usage & kImageSampled) && (desc.usage & (kImageDepthAttachment | kImagePresent))) return nullptr;
-  if ((desc.usage & kImageSampled) && desc.format != Format::B8G8R8A8Unorm) return nullptr;
+  if ((desc.usage & kImageSampled) && desc.format != Format::B8G8R8A8Unorm && !is_float_format(desc.format)) return nullptr;
   if (!desc.extent.width || !desc.extent.height || desc.format == Format::Undefined) return nullptr;
   if (desc.format == Format::R8G8B8A8Unorm) return nullptr;  // only BGRA color images for now
   if (desc.stencil && desc.format != Format::D32Float) return nullptr;
@@ -515,6 +552,8 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
 
   const VirglPipeline* pipeline = nullptr;
   VirglImage* color = nullptr;
+  VirglImage* extra_colors[kMaxColorTargets - 1] = {};
+  uint32_t target_count = 1;
   VirglImage* depth = nullptr;
   VirglBuffer* vertex_buffer = nullptr;
   uint64_t vertex_offset = 0;
@@ -569,16 +608,36 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         if (!color->surface() || color->format() == Format::D32Float) return false;
         if (depth && (depth->format() != Format::D32Float || !depth->surface())) return false;
         const Extent2D e = color->extent();
-        stream.command(virgl::kSetFramebufferState, 0, 3);
-        stream.put(1);
+        target_count = 1;
+        for (uint32_t n = 0; n + 1 < kMaxColorTargets; ++n) {
+          extra_colors[n] = static_cast<VirglImage*>(cmd.pass.extra_colors[n]);
+          if (!extra_colors[n]) {
+            for (uint32_t k = n + 1; k + 1 < kMaxColorTargets; ++k)
+              if (cmd.pass.extra_colors[k]) return false;   // (a gap)
+            break;
+          }
+          VirglImage* extra = extra_colors[n];
+          // (one set of window-space conventions for the whole framebuffer)
+          if (!extra->surface() || extra->format() == Format::D32Float || extra == color || extra == depth || extra->y0_top() != color->y0_top() ||
+              extra->extent().width != e.width || extra->extent().height != e.height)
+            return false;
+          for (uint32_t k = 0; k < n; ++k)
+            if (extra_colors[k] == extra) return false;
+          target_count = n + 2;
+        }
+        for (uint32_t n = target_count - 1; n + 1 < kMaxColorTargets; ++n) extra_colors[n] = nullptr;
+        stream.command(virgl::kSetFramebufferState, 0, 2 + target_count);
+        stream.put(target_count);
         stream.put(depth ? depth->surface() : 0);
         stream.put(color->surface());
+        for (uint32_t n = 0; n + 1 < target_count; ++n) stream.put(extra_colors[n]->surface());
         viewport = {0, 0, static_cast<float>(e.width), static_cast<float>(e.height), 0, 1};
         scissor = {0, 0, e.width, e.height};
         emit_viewport();
         emit_scissor();
         uint32_t buffers = 0;
-        if (cmd.pass.clear_color) buffers |= virgl::kClearColor0;
+        if (cmd.pass.clear_color)
+          for (uint32_t n = 0; n < target_count; ++n) buffers |= virgl::kClearColor0 << n;
         if (depth && cmd.pass.clear_depth) buffers |= virgl::kClearDepth;
         if (depth && depth->stencil() && cmd.pass.clear_stencil) buffers |= virgl::kClearStencil;
         if (buffers) {
@@ -672,12 +731,15 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
       }
       case RecordedCommand::Type::Draw:
       case RecordedCommand::Type::DrawIndexed: {
-        if (!in_pass || !pipeline || !vertex_buffer) return false;
+        if (!in_pass || !pipeline || !vertex_buffer || pipeline->desc().color_target_count > target_count) return false;
         const bool indexed = cmd.type == RecordedCommand::Type::DrawIndexed;
         if (indexed && !index_buffer) return false;
         if (const uint32_t unit_count = pipeline->desc().texture_count) {
           for (uint32_t unit = 0; unit < unit_count; ++unit)
             if (!textures[unit] || textures[unit] == color || textures[unit] == depth) return false;   // unbound, or the image being drawn into
+          for (uint32_t unit = 0; unit < unit_count; ++unit)
+            for (const VirglImage* extra : extra_colors)
+              if (textures[unit] == extra) return false;
           if (textures_dirty) {
             stream.command(virgl::kSetSamplerViews, 0, 2 + unit_count);
             stream.put(virgl::kShaderFragment);

@@ -131,17 +131,17 @@ The kernel-mode driver is the D3DKMT layer, which Direct3D 9, 10, 11 and 12 all 
 - **Checked against a real compiler:** `ps_texel` (Load, SampleLevel, GetDimensions, SV_Position, SV_IsFrontFace, SV_PrimitiveID) and `vs_ids` (SV_VertexID, SV_InstanceID with a
   per-instance input) from Wine's HLSL compiler run through the kernel on the software device with the expected pictures.
 - **Not done for Direct3D 10:** geometry shaders and stream output, `sample_b` / `sample_c` / derivatives, more than four vertex attributes, more than four varyings (and semantics
-  beyond COLOR0/1 and TEXCOORD0/1), more than one vertex buffer slot, multiple render targets, multisampling, queries and predication, depth bias and wireframe fill, texture arrays,
-  cube and 3D textures, sRGB and 16-bit / float formats, compute shaders and UAVs (Direct3D 11). The other devices (virgl, SVGA3D, Intel Gen9, V3D) have none of the features above, so
+  beyond COLOR0/1 and TEXCOORD0/1), more than one vertex buffer slot, independent blend per render target (all targets share the blend state), multisampling, queries and predication, depth bias and wireframe fill, texture arrays,
+  cube and 3D textures, sRGB and the integer / 16-bit unorm / packed formats (float and half-float colour formats are done), compute shaders and UAVs (Direct3D 11). The other devices (virgl, SVGA3D, Intel Gen9, V3D) have none of the features above, so
   they run the Direct3D 9 level only.
 
 ## Conformance on a real GPU
 
-`Conformance.cpp` (`dxgk::run_conformance`) draws 26 small scenes through the services on one adapter and on the CPU renderer and compares the 32 x 32 pictures: Direct3D 9 vertex colours, Shader
+`Conformance.cpp` (`dxgk::run_conformance`) draws 29 small scenes through the services on one adapter and on the CPU renderer and compares the 32 x 32 pictures: Direct3D 9 vertex colours, Shader
 Model 1 and 3 bytecode, depth, alpha blend, indexed draws, viewport and scissor, culling and winding (into a target, a texture and a back buffer), copies; Direct3D 10 constant buffers
 (also 1 KiB, indexed by an integer register), point and linear textures, pixel shader arithmetic, `Load` / `SampleLevel` / `GetDimensions` with `SV_Position` and `SV_IsFrontFace` (into a
 texture and into a back buffer, whose rows are stored the other way up), strips, blend state, depth comparison, stencil, lines and points, per-instance attributes, `SV_InstanceID` /
-`SV_VertexID`; Direct3D 11 render to texture. A scene is *Same*, *Differs*, *Refused* (the device says `kNotSupported`: a program can fall back) or *Broken* (a step failed or the context was
+`SV_VertexID`, two render targets (`SV_Target0` / `SV_Target1`, the render pass takes up to four colour images: `kFeatureMultipleTargets`, `CommandWriter::begin_pass_targets`, `PipelineDesc::color_target_count`); half-float and float render targets that are then sampled (`A16B16G16R16F` / `A32B32G32R32F`, additive blending that exceeds 1.0; `kFeatureFloatFormats` on the CPU renderer and virgl, one mip level, no present; the memory manager converts the backing to and from `Vec4`); Direct3D 11 render to texture. A scene is *Same*, *Differs*, *Refused* (the device says `kNotSupported`: a program can fall back) or *Broken* (a step failed or the context was
 lost); a scene in which the reference draws nothing is Broken too. The system runs it at boot on each accelerated GPU and logs one line per scene (`Direct3D: ...`); the host test runs it on
 two software adapters (all the same) and on a device that is told it has no Direct3D 10 features (those scenes are refused). The DXBC fixtures are compiled by Wine's d3dcompiler
 (`tests/data/dxbc/*.hlsl`, `scripts/gen_conformance_blobs.py` writes `ConformanceBlobs.hpp`).

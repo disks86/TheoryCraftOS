@@ -519,7 +519,7 @@ NtStatus Kernel::lock(ProcessId pid, Handle allocation, uint32_t flags, uint32_t
   rec->locked = true;
   rec->read_only = (flags & kLockReadOnly) != 0;
   out->data = data;
-  out->pitch = a.is_image() ? graphics::mip_extent(a.desc().width, subresource) * 4 : 0;
+  out->pitch = a.is_image() ? graphics::mip_extent(a.desc().width, subresource) * pixel_bytes(a.desc().format) : 0;
   return status::kSuccess;
 }
 
@@ -862,6 +862,10 @@ NtStatus Kernel::escape(ProcessId pid, Handle device, ConstByteView request, Byt
         desc.blend.color_op = static_cast<graphics::BlendOp>(cop), desc.blend.alpha_op = static_cast<graphics::BlendOp>(aop);
         desc.blend.write_mask = static_cast<uint8_t>(mask);
         for (uint32_t i = 0; i < graphics::kMaxVertexAttributes; ++i) desc.attributes[i].per_instance = (instance_bits >> i) & 1;
+        if (!in.at_end()) {   // (and, after that, the number of colour outputs)
+          desc.color_target_count = in.le32();
+          if (!in.ok() || desc.color_target_count == 0 || desc.color_target_count > graphics::kMaxColorTargets) return status::kInvalidParameter;
+        }
       }
       if (!in.ok() || !in.at_end() || cull > 2 || front > 1 || compare > 7 || fail > 7 || depth_fail > 7 || pass > 7 || compare_mask > 255 || write_mask > 255 || reference > 255 || enable > 1)
         return status::kInvalidParameter;
