@@ -256,11 +256,31 @@ EXPORT BOOL WINAPI CreateDirectoryExA(LPCSTR template_directory, LPCSTR path, LP
 /* ---- initialization (.ini) files --------------------------------------------------------------------------------------------------------------------------- */
 
 /* The file is read whole, changed in memory as text (the code page is UTF-8) and written back. */
+static char *to_ansi_alloc(LPCWSTR text) {      /* UTF-8, from the process heap */
+  const int n = WideCharToMultiByte(CP_UTF8, 0, text, -1, NULL, 0, NULL, NULL);
+  char *out = n > 0 ? RtlAllocateHeap(heap(), 0, (SIZE_T)n + 1) : NULL;
+  if (out) WideCharToMultiByte(CP_UTF8, 0, text, -1, out, n, NULL, NULL);
+  return out;
+}
+/* The win.ini of the system */
+static const WCHAR g_win_ini[] = {'C', ':', '\\', 'W', 'i', 'n', 'd', 'o', 'w', 's', '\\', 'w', 'i', 'n', '.', 'i', 'n', 'i', 0};
 typedef struct { char *text; size_t_ size; } IniText;
-static BOOL ini_read(LPCWSTR path, IniText *ini) {
+/* A file name without a folder is in the Windows folder; only a name with a folder (even ".\\x.ini") is looked for where it says. */
+static LPCWSTR ini_path(LPCWSTR name, WCHAR *buffer, size_t_ capacity) {
+  for (LPCWSTR c = name; *c; ++c) if (*c == '\\' || *c == '/' || *c == ':') return name;
+  static const WCHAR kFolder[] = {'C', ':', '\\', 'W', 'i', 'n', 'd', 'o', 'w', 's', '\\', 0};
+  const size_t_ folder = wcslen(kFolder), n = wcslen(name);
+  if (folder + n + 1 > capacity) return name;
+  memcpy(buffer, kFolder, folder * 2);
+  memcpy(buffer + folder, name, (n + 1) * 2);
+  return buffer;
+}
+static BOOL ini_read(LPCWSTR given, IniText *ini) {
+  WCHAR resolved[PATH_CHARS];
+  const LPCWSTR path = ini_path(given, resolved, PATH_CHARS);
   ini->text = NULL;
   ini->size = 0;
-  HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+  HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
   if (h == INVALID_HANDLE_VALUE) return FALSE;
   const DWORD size = GetFileSize(h, NULL);
   ini->text = RtlAllocateHeap(heap(), 0, (SIZE_T)size + 2);
@@ -276,7 +296,9 @@ static BOOL ini_read(LPCWSTR path, IniText *ini) {
 }
 static void ini_free(IniText *ini) { if (ini->text) RtlFreeHeap(heap(), 0, ini->text); ini->text = NULL; }
 static int ini_lower(int c) { return c >= 'A' && c <= 'Z' ? c + 32 : c; }
+static char ini_no_section[1];      /* the section of lines before the first header: no section, not the one called "" */
 static BOOL ini_equal(const char *a, size_t_ alen, const char *b, size_t_ blen) {
+  if (a == ini_no_section || b == ini_no_section) return FALSE;
   while (alen && (*a == ' ' || *a == '\t')) { ++a; --alen; }
   while (alen && (a[alen - 1] == ' ' || a[alen - 1] == '\t')) --alen;
   while (blen && (*b == ' ' || *b == '\t')) { ++b; --blen; }
@@ -290,9 +312,11 @@ typedef struct { const char *line; size_t_ length; const char *section; size_t_ 
 static BOOL ini_next(const IniText *ini, size_t_ *at, IniLine *l, const char **section, size_t_ *section_length) {
   if (*at >= ini->size) return FALSE;
   const char *start = ini->text + *at, *end = start;
-  while ((size_t_)(end - ini->text) < ini->size && *end != '\n') ++end;      /* (a NUL inside the file is an ordinary byte) */
+  while ((size_t_)(end - ini->text) < ini->size && *end != '\n' && *end != '\r') ++end;      /* (a NUL inside the file is an ordinary byte; CR, LF and CR LF end a line) */
   l->offset = *at;
-  *at = (size_t_)(end - ini->text) + ((size_t_)(end - ini->text) < ini->size ? 1 : 0);
+  size_t_ after = (size_t_)(end - ini->text);
+  if (after < ini->size) { after += (*end == '\r' && after + 1 < ini->size && ini->text[after + 1] == '\n') ? 2 : 1; }
+  *at = after;
   size_t_ length = (size_t_)(end - start);
   if (length && start[length - 1] == '\r') --length;
   l->line = start;
@@ -337,35 +361,46 @@ static DWORD ini_list(const IniText *ini, const char *section, size_t_ section_l
   DWORD used = 0;
   BOOL truncated = FALSE;
   size_t_ at = 0, s_len = 0;
-  const char *current = "";
+  const char *current = ini_no_section;
   IniLine l;
+  if (capacity < 2) { if (capacity) out[0] = 0; return 0; }
   while (ini_next(ini, &at, &l, &current, &s_len)) {
     const char *piece = NULL;
     size_t_ piece_length = 0;
     if (names && l.header) { piece = current; piece_length = s_len; }
-    else if (!names && l.entry && ini_equal(l.section, l.section_length, section, section_length)) { piece = l.key; piece_length = l.key_length; while (piece_length && (piece[piece_length - 1] == ' ' || piece[piece_length - 1] == '\t')) --piece_length; }
+    else if (!names && l.entry && ini_equal(l.section, l.section_length, section, section_length)) { piece = l.key; piece_length = l.key_length; }
     if (!piece) continue;
-    if (used + piece_length + 3 > capacity) { truncated = TRUE; break; }
+    while (piece_length && (*piece == ' ' || *piece == '\t')) { ++piece; --piece_length; }
+    while (piece_length && (piece[piece_length - 1] == ' ' || piece[piece_length - 1] == '\t')) --piece_length;
+    if (used + piece_length + 1 > capacity - 2) {      /* what fits is copied, and the two end marks follow it */
+      const DWORD room = capacity - 2 - used;
+      memcpy(out + used, piece, piece_length < room ? piece_length : room);
+      used += (DWORD)(piece_length < room ? piece_length : room);
+      truncated = TRUE;
+      break;
+    }
     memcpy(out + used, piece, piece_length);
     used += (DWORD)piece_length;
     out[used++] = 0;
   }
-  if (capacity >= 2) { out[used] = 0; if (used == 0) out[1] = 0; }
-  if (truncated) return capacity - 2;
+  if (truncated) used = capacity - 2;
+  out[used] = 0;
+  out[used + 1] = 0;
   return used;
 }
 EXPORT DWORD WINAPI GetPrivateProfileStringA(LPCSTR section, LPCSTR key, LPCSTR default_value, LPSTR out, DWORD capacity, LPCSTR file) {
   WCHAR *w = file ? to_wide(file) : NULL;
   IniText ini = {NULL, 0};
-  const BOOL have = w && ini_read(w, &ini);
+  const BOOL have = file ? (w && ini_read(w, &ini)) : ini_read(g_win_ini, &ini);      /* (no file: win.ini) */
   free_wide(w);
   DWORD result = 0;
   if (!out || capacity == 0) { ini_free(&ini); return 0; }
+  if (!have && (!section || !key)) { out[0] = 0; return 0; }      /* (a list from a file that is not there is one end mark) */
   if (have && !section) { result = ini_list(&ini, NULL, 0, TRUE, out, capacity); ini_free(&ini); return result; }
   if (have && !key) { result = ini_list(&ini, section, strlen(section), FALSE, out, capacity); ini_free(&ini); return result; }
   if (have) {
     size_t_ at = 0, s_len = 0;
-    const char *current = "";
+    const char *current = ini_no_section;
     IniLine l;
     while (ini_next(&ini, &at, &l, &current, &s_len)) {
       if (!l.entry || !ini_equal(l.section, l.section_length, section, strlen(section)) || !ini_equal(l.key, l.key_length, key, strlen(key))) continue;
@@ -387,8 +422,33 @@ EXPORT DWORD WINAPI GetPrivateProfileStringW(LPCWSTR section, LPCWSTR key, LPCWS
   if (!out || capacity == 0) return 0;
   char *a = NULL, *k = NULL, *d = NULL, *f = NULL;
   #define NARROW(var, text) if (text) { const int n = WideCharToMultiByte(CP_UTF8, 0, text, -1, NULL, 0, NULL, NULL); var = RtlAllocateHeap(heap(), 0, (SIZE_T)n + 1); if (var) WideCharToMultiByte(CP_UTF8, 0, text, -1, var, n, NULL, NULL); }
-  NARROW(a, section) NARROW(k, key) NARROW(d, default_value) NARROW(f, file)
+  NARROW(a, section) NARROW(k, key) NARROW(d, default_value) NARROW(f, (file ? file : g_win_ini))
   #undef NARROW
+  if ((!section || !key) && capacity >= 2 && (!section || a) && (!key || k) && f) {      /* a list: made whole, then cut to the wide buffer */
+    char *whole = RtlAllocateHeap(heap(), 0, 32768);
+    WCHAR *wide_whole = RtlAllocateHeap(heap(), 0, 32768 * 2);
+    DWORD done = 0;
+    if (whole && wide_whole) {
+      const DWORD n = GetPrivateProfileStringA(a, k, d, whole, 32768 - 2, f);
+      const int converted = n ? MultiByteToWideChar(CP_UTF8, 0, whole, (int)n, wide_whole, 32768) : 0;
+      DWORD length = converted > 0 ? (DWORD)converted : 0;      /* (the names with their end marks, without the last) */
+      if (length > capacity - 2) length = capacity - 2;      /* what does not fit is cut off */
+      if (length) memcpy(out, wide_whole, (size_t_)length * 2);
+      out[length] = 0;
+      out[length + 1] = 0;
+      done = length;
+    } else {
+      out[0] = out[1] = 0;
+    }
+    if (done == 0) { WCHAR first = out[0]; (void)first; }
+    if (whole) RtlFreeHeap(heap(), 0, whole);
+    if (wide_whole) RtlFreeHeap(heap(), 0, wide_whole);
+    if (a) RtlFreeHeap(heap(), 0, a);
+    if (k) RtlFreeHeap(heap(), 0, k);
+    if (d) RtlFreeHeap(heap(), 0, d);
+    if (f) RtlFreeHeap(heap(), 0, f);
+    return done;
+  }
   char *buffer = RtlAllocateHeap(heap(), 0, (SIZE_T)capacity * 4 + 4);
   DWORD result = 0;
   if (buffer && (!section || a) && (!key || k) && f) {
@@ -414,8 +474,8 @@ EXPORT DWORD WINAPI GetPrivateProfileStringW(LPCWSTR section, LPCWSTR key, LPCWS
 }
 EXPORT UINT WINAPI GetPrivateProfileIntA(LPCSTR section, LPCSTR key, INT default_value, LPCSTR file) {
   char text[64];
-  GetPrivateProfileStringA(section, key, "\x01", text, sizeof(text), file);
-  if (text[0] == 1 && text[1] == 0) return (UINT)default_value;
+  const DWORD length = GetPrivateProfileStringA(section, key, "", text, sizeof(text), file);
+  if (length == 0) return (UINT)default_value;      /* (nothing there, or an empty value) */
   char *c = text;
   while (*c == ' ') ++c;
   const BOOL negative = *c == '-';
@@ -426,9 +486,9 @@ EXPORT UINT WINAPI GetPrivateProfileIntA(LPCSTR section, LPCSTR key, INT default
 }
 EXPORT UINT WINAPI GetPrivateProfileIntW(LPCWSTR section, LPCWSTR key, INT default_value, LPCWSTR file) {
   WCHAR wide[64];
-  static const WCHAR marker[] = {1, 0};
-  GetPrivateProfileStringW(section, key, marker, wide, 64, file);
-  if (wide[0] == 1 && wide[1] == 0) return (UINT)default_value;
+  static const WCHAR empty[] = {0};
+  const DWORD length = GetPrivateProfileStringW(section, key, empty, wide, 64, file);
+  if (length == 0) return (UINT)default_value;
   WCHAR *c = wide;
   while (*c == ' ') ++c;
   const BOOL negative = *c == '-';
@@ -438,14 +498,16 @@ EXPORT UINT WINAPI GetPrivateProfileIntW(LPCWSTR section, LPCWSTR key, INT defau
   return (UINT)(negative ? -(long long)v : (long long)v);
 }
 /* Writes: a key's value changed, added or removed (value NULL), or a whole section removed (key NULL). */
-static BOOL ini_write(LPCWSTR path, const char *section, const char *key, const char *value) {
+static BOOL ini_write(LPCWSTR given, const char *section, const char *key, const char *value) {
+  WCHAR resolved[PATH_CHARS];
+  const LPCWSTR path = ini_path(given, resolved, PATH_CHARS);
   IniText ini;
   if (!ini_read(path, &ini)) { ini.text = RtlAllocateHeap(heap(), 0, 2); if (!ini.text) return FALSE; ini.text[0] = 0; ini.size = 0; }
   const size_t_ section_length = strlen(section), key_length = key ? strlen(key) : 0, value_length = value ? strlen(value) : 0;
   char *out = RtlAllocateHeap(heap(), 0, ini.size + section_length + key_length + value_length + 16);
   if (!out) { ini_free(&ini); return FALSE; }
   size_t_ o = 0, at = 0, s_len = 0;
-  const char *current = "";
+  const char *current = ini_no_section;
   BOOL in_section = FALSE, done = FALSE, section_seen = FALSE;
   IniLine l;
   while (ini_next(&ini, &at, &l, &current, &s_len)) {
@@ -467,7 +529,7 @@ static BOOL ini_write(LPCWSTR path, const char *section, const char *key, const 
     }
     memcpy(out + o, ini.text + l.offset, end_of_line - l.offset);
     o += end_of_line - l.offset;
-    if (end_of_line > 0 && ini.text[end_of_line - 1] != '\n' && l.length) { out[o++] = '\r'; out[o++] = '\n'; }
+    if (end_of_line > 0 && ini.text[end_of_line - 1] != '\n' && ini.text[end_of_line - 1] != '\r' && l.length) { out[o++] = '\r'; out[o++] = '\n'; }
   }
   if (!done && value && key) {
     if (!section_seen) { out[o++] = '['; memcpy(out + o, section, section_length); o += section_length; out[o++] = ']'; out[o++] = '\r'; out[o++] = '\n'; }
@@ -497,10 +559,185 @@ EXPORT BOOL WINAPI WritePrivateProfileStringW(LPCWSTR section, LPCWSTR key, LPCW
   if (value && !WideCharToMultiByte(CP_UTF8, 0, value, -1, v, sizeof(v), NULL, NULL)) return FALSE;
   return ini_write(file, s, key ? k : NULL, value ? v : NULL);
 }
+/* The lines of a section as "key=value" strings, each ended by a NUL, the list ended by one more (blank lines and comments are left out). The result is the length without that
+   last NUL; a buffer too small gets what fits and size - 2. An empty section is an empty list; a file that is not there is ERROR_FILE_NOT_FOUND. */
+static DWORD ini_section_lines(LPCWSTR path, const char *section, LPSTR out, DWORD capacity) {
+  IniText ini;
+  if (!out || capacity < 2 || !section) { set_error(ERROR_INVALID_PARAMETER); return 0; }
+  out[0] = out[1] = 0;
+  if (!ini_read(path, &ini)) { set_error(ERROR_FILE_NOT_FOUND); return 0; }
+  DWORD used = 0;
+  BOOL truncated = FALSE;
+  const size_t_ section_length = strlen(section);
+  size_t_ at = 0, s_len = 0;
+  const char *current = ini_no_section;
+  IniLine l;
+  BOOL found = FALSE;
+  while (ini_next(&ini, &at, &l, &current, &s_len)) {
+    if (l.header && ini_equal(current, s_len, section, section_length)) found = TRUE;
+    if (l.header || !ini_equal(l.section, l.section_length, section, section_length)) continue;
+    const char *p = l.line;
+    size_t_ n = l.length;
+    while (n && (*p == ' ' || *p == '\t' || *p == 0)) { ++p; --n; }
+    if (n == 0 || *p == ';') continue;
+    if (used + n + 2 > capacity) {
+      const DWORD room = capacity > used + 2 ? capacity - used - 2 : 0;
+      memcpy(out + used, p, room);
+      used += room;
+      truncated = TRUE;
+      break;
+    }
+    memcpy(out + used, p, n);
+    used += (DWORD)n;
+    out[used++] = 0;
+  }
+  ini_free(&ini);
+  if (truncated) { out[capacity - 2] = out[capacity - 1] = 0; used = capacity - 2; }
+  else out[used] = 0;
+  if (used == 0) out[1] = 0;
+  set_error(found ? ERROR_SUCCESS : ERROR_FILE_NOT_FOUND);
+  return used;
+}
+EXPORT DWORD WINAPI GetPrivateProfileSectionA(LPCSTR section, LPSTR out, DWORD capacity, LPCSTR file) {
+  if (!section) { set_error(ERROR_INVALID_PARAMETER); return 0; }
+  WCHAR *w = file ? to_wide(file) : NULL;
+  if (!file) return ini_section_lines(g_win_ini, section, out, capacity);
+  if (!w) return 0;
+  const DWORD n = ini_section_lines(w, section, out, capacity);
+  free_wide(w);
+  return n;
+}
+EXPORT DWORD WINAPI GetPrivateProfileSectionW(LPCWSTR section, LPWSTR out, DWORD capacity, LPCWSTR file) {
+  if (!section || !out || capacity < 2) { set_error(ERROR_INVALID_PARAMETER); return 0; }
+  if (!file) file = g_win_ini;
+  char name[256];
+  if (!WideCharToMultiByte(CP_UTF8, 0, section, -1, name, sizeof(name), NULL, NULL)) return 0;
+  char *narrow = RtlAllocateHeap(heap(), 0, (SIZE_T)capacity * 4 + 4);
+  if (!narrow) return 0;
+  const DWORD n = ini_section_lines(file, name, narrow, capacity * 4);
+  DWORD result = 0;
+  out[0] = out[1] = 0;
+  if (n) {
+    const int wide = MultiByteToWideChar(CP_UTF8, 0, narrow, (int)n + 1, out, (int)capacity - 1);
+    if (wide > 0) { out[wide] = 0; result = (DWORD)wide - 1; }
+    if (result > capacity - 2) result = capacity - 2;
+    out[result] = 0;
+    out[result + 1] = 0;
+  }
+  RtlFreeHeap(heap(), 0, narrow);
+  return result;
+}
+/* The section is replaced by the lines in `lines` (NUL-separated, ended by an empty one); none at all leaves an empty section. */
+static BOOL ini_write_section(LPCWSTR given, const char *section, const char *lines) {
+  if (!ini_write(given, section, NULL, NULL)) return FALSE;      /* the old section goes */
+  WCHAR resolved[PATH_CHARS];
+  const LPCWSTR path = ini_path(given, resolved, PATH_CHARS);
+  IniText ini;
+  if (!ini_read(path, &ini)) { ini.text = RtlAllocateHeap(heap(), 0, 2); if (!ini.text) return FALSE; ini.text[0] = 0; ini.size = 0; }
+  size_t_ extra = strlen(section) + 8;
+  for (const char *p = lines ? lines : ""; *p; p += strlen(p) + 1) extra += strlen(p) + 2;
+  char *out = RtlAllocateHeap(heap(), 0, ini.size + extra + 4);
+  if (!out) { ini_free(&ini); return FALSE; }
+  size_t_ o = 0;
+  memcpy(out, ini.text, ini.size);
+  o = ini.size;
+  if (o && out[o - 1] != '\n') { out[o++] = '\r'; out[o++] = '\n'; }
+  out[o++] = '[';
+  memcpy(out + o, section, strlen(section)); o += strlen(section);
+  out[o++] = ']'; out[o++] = '\r'; out[o++] = '\n';
+  for (const char *p = lines ? lines : ""; *p; p += strlen(p) + 1) { const size_t_ n = strlen(p); memcpy(out + o, p, n); o += n; out[o++] = '\r'; out[o++] = '\n'; }
+  ini_free(&ini);
+  HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+  DWORD wrote = 0;
+  const BOOL ok = h != INVALID_HANDLE_VALUE && WriteFile(h, out, (DWORD)o, &wrote, NULL);
+  if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+  RtlFreeHeap(heap(), 0, out);
+  return ok;
+}
+EXPORT BOOL WINAPI WritePrivateProfileSectionA(LPCSTR section, LPCSTR lines, LPCSTR file) {
+  if (!section || !file) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  WCHAR *w = to_wide(file);
+  if (!w) return FALSE;
+  const BOOL ok = ini_write_section(w, section, lines);
+  free_wide(w);
+  return ok;
+}
+EXPORT BOOL WINAPI WritePrivateProfileSectionW(LPCWSTR section, LPCWSTR lines, LPCWSTR file) {
+  if (!section || !file) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  char name[256];
+  if (!WideCharToMultiByte(CP_UTF8, 0, section, -1, name, sizeof(name), NULL, NULL)) return FALSE;
+  size_t_ units = 1;
+  if (lines) { const WCHAR *p = lines; while (*p) p += wcslen(p) + 1; units = (size_t_)(p - lines) + 1; }
+  char *narrow = lines ? RtlAllocateHeap(heap(), 0, units * 4 + 4) : NULL;
+  if (lines && !narrow) return FALSE;
+  if (narrow) { const int n = WideCharToMultiByte(CP_UTF8, 0, lines, (int)units, narrow, (int)units * 4, NULL, NULL); narrow[n] = 0; narrow[n + 1] = 0; }
+  const BOOL ok = ini_write_section(file, name, narrow);
+  if (narrow) RtlFreeHeap(heap(), 0, narrow);
+  return ok;
+}
+EXPORT DWORD WINAPI GetProfileSectionA(LPCSTR section, LPSTR out, DWORD capacity) { return GetPrivateProfileSectionA(section, out, capacity, "C:\\Windows\\win.ini"); }
+EXPORT DWORD WINAPI GetProfileSectionW(LPCWSTR section, LPWSTR out, DWORD capacity) { return GetPrivateProfileSectionW(section, out, capacity, g_win_ini); }
+EXPORT BOOL WINAPI WriteProfileSectionA(LPCSTR section, LPCSTR lines) { return WritePrivateProfileSectionA(section, lines, "C:\\Windows\\win.ini"); }
+EXPORT BOOL WINAPI WriteProfileSectionW(LPCWSTR section, LPCWSTR lines) { return WritePrivateProfileSectionW(section, lines, g_win_ini); }
+
+/* A structure is kept as the hexadecimal digits of its bytes and a last byte, the sum of the others. */
+EXPORT BOOL WINAPI WritePrivateProfileStructA(LPCSTR section, LPCSTR key, LPVOID data, UINT size, LPCSTR file) {
+  if (!section || !file) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (!data) return WritePrivateProfileStringA(section, key, NULL, file);
+  char *text = RtlAllocateHeap(heap(), 0, (SIZE_T)size * 2 + 3);
+  if (!text) return FALSE;
+  static const char kDigits[] = "0123456789ABCDEF";
+  BYTE sum = 0;
+  for (UINT i = 0; i < size; i++) { const BYTE b = ((const BYTE *)data)[i]; sum = (BYTE)(sum + b); text[2 * i] = kDigits[b >> 4]; text[2 * i + 1] = kDigits[b & 15]; }
+  text[2 * size] = kDigits[sum >> 4];
+  text[2 * size + 1] = kDigits[sum & 15];
+  text[2 * size + 2] = 0;
+  const BOOL ok = WritePrivateProfileStringA(section, key, text, file);
+  RtlFreeHeap(heap(), 0, text);
+  return ok;
+}
+EXPORT BOOL WINAPI WritePrivateProfileStructW(LPCWSTR section, LPCWSTR key, LPVOID data, UINT size, LPCWSTR file) {
+  if (!section || !file) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  char *a = to_ansi_alloc(section), *k = key ? to_ansi_alloc(key) : NULL, *f = to_ansi_alloc(file);
+  BOOL ok = FALSE;
+  if (a && f && (!key || k)) ok = WritePrivateProfileStructA(a, k, data, size, f);
+  if (a) RtlFreeHeap(heap(), 0, a);
+  if (k) RtlFreeHeap(heap(), 0, k);
+  if (f) RtlFreeHeap(heap(), 0, f);
+  return ok;
+}
+EXPORT BOOL WINAPI GetPrivateProfileStructA(LPCSTR section, LPCSTR key, LPVOID buffer, UINT size, LPCSTR file) {
+  if (!section || !key || !file || !buffer) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  char text[2 * 1024 + 8];
+  const DWORD n = GetPrivateProfileStringA(section, key, "", text, sizeof(text), file);
+  if (n != 2 * (size + 1)) { set_error(ERROR_BAD_LENGTH); return FALSE; }
+  BYTE sum = 0;
+  for (UINT i = 0; i <= size; i++) {
+    int v[2];
+    for (int d = 0; d < 2; d++) {
+      const char c = text[2 * i + d];
+      v[d] = c >= '0' && c <= '9' ? c - '0' : c >= 'A' && c <= 'F' ? c - 'A' + 10 : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1;
+      if (v[d] < 0) { set_error(ERROR_INVALID_DATA); return FALSE; }
+    }
+    const BYTE b = (BYTE)(v[0] << 4 | v[1]);
+    if (i < size) { sum = (BYTE)(sum + b); ((BYTE *)buffer)[i] = b; }
+    else if (b != sum) { set_error(ERROR_INVALID_DATA); return FALSE; }
+  }
+  return TRUE;
+}
+EXPORT BOOL WINAPI GetPrivateProfileStructW(LPCWSTR section, LPCWSTR key, LPVOID buffer, UINT size, LPCWSTR file) {
+  if (!section || !key || !file || !buffer) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  char *a = to_ansi_alloc(section), *k = to_ansi_alloc(key), *f = to_ansi_alloc(file);
+  BOOL ok = FALSE;
+  if (a && k && f) ok = GetPrivateProfileStructA(a, k, buffer, size, f);
+  if (a) RtlFreeHeap(heap(), 0, a);
+  if (k) RtlFreeHeap(heap(), 0, k);
+  if (f) RtlFreeHeap(heap(), 0, f);
+  return ok;
+}
 EXPORT DWORD WINAPI GetPrivateProfileSectionNamesA(LPSTR out, DWORD capacity, LPCSTR file) { return GetPrivateProfileStringA(NULL, NULL, NULL, out, capacity, file); }
 EXPORT DWORD WINAPI GetPrivateProfileSectionNamesW(LPWSTR out, DWORD capacity, LPCWSTR file) { return GetPrivateProfileStringW(NULL, NULL, NULL, out, capacity, file); }
 /* The win.ini of the system */
-static const WCHAR g_win_ini[] = {'C', ':', '\\', 'W', 'i', 'n', 'd', 'o', 'w', 's', '\\', 'w', 'i', 'n', '.', 'i', 'n', 'i', 0};
 EXPORT DWORD WINAPI GetProfileStringW(LPCWSTR section, LPCWSTR key, LPCWSTR default_value, LPWSTR out, DWORD capacity) { return GetPrivateProfileStringW(section, key, default_value, out, capacity, g_win_ini); }
 EXPORT DWORD WINAPI GetProfileStringA(LPCSTR section, LPCSTR key, LPCSTR default_value, LPSTR out, DWORD capacity) { return GetPrivateProfileStringA(section, key, default_value, out, capacity, "C:\\Windows\\win.ini"); }
 EXPORT UINT WINAPI GetProfileIntW(LPCWSTR section, LPCWSTR key, INT default_value) { return GetPrivateProfileIntW(section, key, default_value, g_win_ini); }
