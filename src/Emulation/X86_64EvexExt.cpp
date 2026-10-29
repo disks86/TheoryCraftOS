@@ -70,6 +70,28 @@ X86_64Cpu::Step X86_64Cpu::evex_ext(GuestMemory& m, const EvexOp& defn) {
       ev_write_masked(reg, result, 32);
       return finish();
     }
+    case kDot: {      // AVX-VNNI-INT8 / INT16: four bytes (or two words) of each dword multiplied and added to the accumulator, with the signedness the sub value says
+      if (!ev_read_rm(m, &b, 32, true, true)) return Step::Fault;
+      const bool sixteen = def->sub & 16, a_signed = def->sub & 8, b_signed = def->sub & 4, saturate = def->sub & 1;
+      const uint32_t width = sixteen ? 16 : 8, count = sixteen ? 2 : 4;
+      const bool unsigned_accumulator = !a_signed && !b_signed;
+      for (uint32_t i = 0; i < vl / 32; ++i) {
+        int64_t sum = 0;
+        for (uint32_t k = 0; k < count; ++k) {
+          const uint64_t x = element(a, width, count * i + k), y = element(b, width, count * i + k);
+          sum += (a_signed ? signed_of(x, width) : static_cast<int64_t>(x)) * (b_signed ? signed_of(y, width) : static_cast<int64_t>(y));
+        }
+        const uint64_t old = element(old_dest, 32, i);
+        int64_t r = (unsigned_accumulator ? static_cast<int64_t>(old) : signed_of(old, 32)) + sum;
+        if (saturate) {
+          const int64_t low = unsigned_accumulator ? 0 : -0x80000000ll, high = unsigned_accumulator ? 0xFFFFFFFFll : 0x7FFFFFFFll;
+          r = r > high ? high : r < low ? low : r;
+        }
+        set_element(result, 32, i, static_cast<uint64_t>(r) & 0xFFFFFFFFu);
+      }
+      ev_write_masked(reg, result, 32);
+      return finish();
+    }
     case kMadd52: {
       if (!ev_read_rm(m, &b, 64, true, true)) return Step::Fault;
       const uint64_t mask52 = (uint64_t{1} << 52) - 1;

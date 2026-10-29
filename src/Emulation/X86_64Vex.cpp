@@ -480,6 +480,8 @@ X86_64Cpu::Step X86_64Cpu::vex_map2(GuestMemory& m, uint8_t op, bool wide_w, uin
   if ((op >= 0x96 && op <= 0x9F) || (op >= 0xA6 && op <= 0xAF) || (op >= 0xB6 && op <= 0xBF)) return vex_fma(m, op, wide_w, vvvv);
   if (op == 0xF2 || op == 0xF3 || op == 0xF5 || op == 0xF6 || op == 0xF7) return vex_bmi(m, 2, op, wide_w, vvvv);
   if ((op >= 0xDB && op <= 0xDF) || op == 0xCF || op == 0xCB || op == 0xCC || op == 0xCD || op == 0xDA) return crypto_map(m, 2, op, wide_w, vvvv);
+  if (op == 0xB0 || op == 0xB1) return vex_ne_convert(m, op, wide_w, vvvv);
+  if ((op >= 0x50 && op <= 0x53) || op == 0xB4 || op == 0xB5 || op == 0xD2 || op == 0xD3 || (op == 0x72 && pp == 2)) return vex_via_evex(m, 2, op, wide_w, vvvv);
   if (pp != 1) return fail(6);
   if (!decode_modrm() || !finish_decode()) return bad_decode();
   const uint32_t reg = d_.reg;
@@ -1152,6 +1154,8 @@ X86_64Cpu::Step X86_64Cpu::vex_bmi(GuestMemory& m, int map, uint8_t op, bool wid
 
 // --- XSAVE / XRSTOR / XGETBV ---------------------------------------------------------------------------------------------------------------
 
+// `kind`: 4 xsave, 5 xrstor, 6 xsaveopt (the same as xsave here: it may write everything), 8 xsavec (the compacted format: XCOMP_BV bit 63, the components that are present follow each other
+// without gaps). xrstor reads both formats.
 X86_64Cpu::Step X86_64Cpu::xsave_family(GuestMemory& m, uint32_t kind) {
   const uint64_t address = memory_address();
   const uint64_t requested = (s_.r[0] & 0xFFFFFFFFu) | (s_.r[2] << 32);
@@ -1159,29 +1163,53 @@ X86_64Cpu::Step X86_64Cpu::xsave_family(GuestMemory& m, uint32_t kind) {
   uint8_t image[2688] = {};
   auto put64 = [&](uint32_t at, uint64_t v) { for (uint32_t b = 0; b < 8; ++b) image[at + b] = static_cast<uint8_t>(v >> (8 * b)); };
   auto get64 = [&](uint32_t at) { uint64_t v = 0; for (uint32_t b = 0; b < 8; ++b) v |= uint64_t{image[at + b]} << (8 * b); return v; };
-  const uint64_t bytes = (features & 0xE0) ? 2688 : (features & 4) ? 832 : 576;
-  if (kind == 4) {      // xsave
+  // The components above the legacy area: feature bit, size, and offset in the standard format.
+  struct Component { uint64_t bit; uint32_t size, standard; };
+  static constexpr Component kComponents[4] = {{4, 256, 576}, {0x20, 64, 1088}, {0x40, 512, 1152}, {0x80, 1024, 1664}};
+  // Offsets of the components in the format being used: `present` is the set of components stored (the compacted format packs those).
+  auto offsets = [&](bool compacted, uint64_t present, uint32_t out[4]) {
+    uint32_t next = 576;
+    for (uint32_t c = 0; c < 4; ++c) {
+      out[c] = compacted ? next : kComponents[c].standard;
+      if (present & kComponents[c].bit) next += kComponents[c].size;
+    }
+    return next;      // the size of the area in the compacted format
+  };
+  if (kind != 5) {
+    const bool compacted = kind == 8;
+    uint32_t at[4];
+    const uint32_t packed_size = offsets(compacted, features, at);
+    uint32_t bytes = compacted ? packed_size : (features & 0xE0) ? 2688 : (features & 4) ? 832 : 576;
     save_fpu_image(image);
     put64(512, features);      // XSTATE_BV: everything requested is in use
+    if (compacted) put64(520, features | (uint64_t{1} << 63));
     for (uint32_t r = 0; r < 16; ++r) {
-      put64(576 + 16 * r, s_.ymm_high[r].lo);
-      put64(584 + 16 * r, s_.ymm_high[r].hi);
-      put64(1152 + 32 * r, s_.ymm_high[r].upper[0].lo);
-      put64(1160 + 32 * r, s_.ymm_high[r].upper[0].hi);
-      put64(1168 + 32 * r, s_.ymm_high[r].upper[1].lo);
-      put64(1176 + 32 * r, s_.ymm_high[r].upper[1].hi);
+      if (features & 4) {
+        put64(at[0] + 16 * r, s_.ymm_high[r].lo);
+        put64(at[0] + 8 + 16 * r, s_.ymm_high[r].hi);
+      }
+      if (features & 0x40) {
+        put64(at[2] + 32 * r, s_.ymm_high[r].upper[0].lo);
+        put64(at[2] + 8 + 32 * r, s_.ymm_high[r].upper[0].hi);
+        put64(at[2] + 16 + 32 * r, s_.ymm_high[r].upper[1].lo);
+        put64(at[2] + 24 + 32 * r, s_.ymm_high[r].upper[1].hi);
+      }
+      if (features & 0x80) {
+        const Vec512 v = get_vec(16 + r);
+        for (uint32_t q = 0; q < 8; ++q) put64(at[3] + 64 * r + 8 * q, v.q[q]);
+      }
     }
-    for (uint32_t k = 0; k < 8; ++k) put64(1088 + 8 * k, s_.k[k]);
-    for (uint32_t r = 0; r < 16; ++r) {
-      const Vec512 v = get_vec(16 + r);
-      for (uint32_t q = 0; q < 8; ++q) put64(1664 + 64 * r + 8 * q, v.q[q]);
-    }
+    if (features & 0x20) for (uint32_t k = 0; k < 8; ++k) put64(at[1] + 8 * k, s_.k[k]);
     if (!m.write(address, ConstByteView(image, bytes))) return fail(14, address, 2);
     return Step::Ok;
   }
   // xrstor: components not marked present in the header are put in their initial state
   if (!m.read(address, ByteView(image, 576))) return fail(14, address, 0);
-  const uint64_t bv = get64(512);
+  const uint64_t bv = get64(512), comp = get64(520);
+  const bool compacted = (comp >> 63) & 1;
+  uint32_t at[4];
+  const uint32_t packed_size = offsets(compacted, compacted ? comp : features, at);
+  const uint64_t bytes = compacted ? packed_size : (features & 0xE0) ? 2688 : (features & 4) ? 832 : 576;
   if (bytes > 576 && !m.read(address + 576, ByteView(image + 576, bytes - 576))) return fail(14, address + 576, 0);
   if (features & 1) {
     if (!(bv & 1)) { ByteView(image, 32).fill(0); image[0] = 0x7F; image[1] = 0x03; ByteView(image + 32, 128).fill(0); }
@@ -1190,29 +1218,29 @@ X86_64Cpu::Step X86_64Cpu::xsave_family(GuestMemory& m, uint32_t kind) {
   load_fpu_image(image);
   if (features & 4) {
     for (uint32_t r = 0; r < 16; ++r) {
-      s_.ymm_high[r] = Xmm();
+      s_.ymm_high[r].lo = s_.ymm_high[r].hi = 0;
       if (bv & 4) {
-        s_.ymm_high[r].lo = get64(576 + 16 * r);
-        s_.ymm_high[r].hi = get64(584 + 16 * r);
+        s_.ymm_high[r].lo = get64(at[0] + 16 * r);
+        s_.ymm_high[r].hi = get64(at[0] + 8 + 16 * r);
       }
     }
   }
   if (features & 0x20) {
-    for (uint32_t k = 0; k < 8; ++k) s_.k[k] = (bv & 0x20) ? get64(1088 + 8 * k) : 0;
+    for (uint32_t k = 0; k < 8; ++k) s_.k[k] = (bv & 0x20) ? get64(at[1] + 8 * k) : 0;
   }
   if (features & 0x40) {
     for (uint32_t r = 0; r < 16; ++r) {
-      s_.ymm_high[r].upper[0].lo = (bv & 0x40) ? get64(1152 + 32 * r) : 0;
-      s_.ymm_high[r].upper[0].hi = (bv & 0x40) ? get64(1160 + 32 * r) : 0;
-      s_.ymm_high[r].upper[1].lo = (bv & 0x40) ? get64(1168 + 32 * r) : 0;
-      s_.ymm_high[r].upper[1].hi = (bv & 0x40) ? get64(1176 + 32 * r) : 0;
+      s_.ymm_high[r].upper[0].lo = (bv & 0x40) ? get64(at[2] + 32 * r) : 0;
+      s_.ymm_high[r].upper[0].hi = (bv & 0x40) ? get64(at[2] + 8 + 32 * r) : 0;
+      s_.ymm_high[r].upper[1].lo = (bv & 0x40) ? get64(at[2] + 16 + 32 * r) : 0;
+      s_.ymm_high[r].upper[1].hi = (bv & 0x40) ? get64(at[2] + 24 + 32 * r) : 0;
     }
   }
   if (features & 0x80) {
     for (uint32_t r = 0; r < 16; ++r) {
       Vec512 v;
       if (bv & 0x80)
-        for (uint32_t q = 0; q < 8; ++q) v.q[q] = get64(1664 + 64 * r + 8 * q);
+        for (uint32_t q = 0; q < 8; ++q) v.q[q] = get64(at[3] + 64 * r + 8 * q);
       set_vec(16 + r, v, 512);
     }
   }

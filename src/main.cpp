@@ -45,6 +45,8 @@
 #include "Graphics/Graphics3D/WebGlAccelerator.hpp"
 #include "Graphics/GraphicsPool.hpp"
 #include "Graphics/SystemDxg.hpp"
+#include "Kernel/Dxgkrnl/Adapter.hpp"
+#include "Kernel/Dxgkrnl/Conformance.hpp"
 #include "Graphics/SystemGraphics.hpp"
 #include "WebGl/Accelerator.hpp"
 #include "Hardware/ImageSignalProcessor/SystemImageSignalProcessor.hpp"
@@ -581,12 +583,34 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   // The kernel half of Direct3D (what a Windows program's D3D runtime reaches through the D3DKMT system calls): one adapter per GPU of the pool.
   dxgk::Kernel dxg_kernel(shared_allocator);
   uint32_t dxg_fallbacks = 0;
-  uint32_t dxg_adapters = graphics::register_dxg_adapters(dxg_kernel, graphics_pool, shared_allocator, &dxg_fallbacks);
+  graphics::DxgFallback dxg_why;
+  uint32_t dxg_adapters = graphics::register_dxg_adapters(dxg_kernel, graphics_pool, shared_allocator, &dxg_fallbacks, &dxg_why);
   // The CPU renderer as an adapter of its own (Windows has its "WARP" one) next to the display GPU's, so the 3D test can draw on either and compare.
   if (system_graphics.accelerated() && dxg_kernel.add_adapter(system_graphics.software_device(), dxgk::AdapterConfig()) != dxgk::kInvalidIndex) ++dxg_adapters;
   dxgk::set_system_kernel(&dxg_kernel);
+  // What each accelerated GPU really does with Direct3D 9 / 10 / 11 programs, against the CPU renderer (dxgk::run_conformance): the verdicts are in the log.
+  if (dxg_adapters > 1)
+    for (uint32_t i = 0; i + 1 < dxg_adapters; ++i) {
+      dxgk::Adapter* a = dxg_kernel.adapter(i);
+      if (!a || !a->caps().accelerated) continue;
+      Entry(Level::Info, "Direct3D").text("conformance on ").text(a->caps().name);
+      const uint32_t bad = dxgk::run_conformance(shared_allocator, dxg_kernel, i, dxg_adapters - 1, [](void*, const dxgk::SceneResult& r) {
+        const bool wrong = r.verdict == dxgk::SceneVerdict::Differs || r.verdict == dxgk::SceneVerdict::Broken;
+        Entry e(wrong ? Level::Warning : r.verdict == dxgk::SceneVerdict::Refused ? Level::Info : Level::Ok, "Direct3D");
+        e.text(r.name).text(": ");
+        switch (r.verdict) {
+          case dxgk::SceneVerdict::Same: e.text("as the CPU renderer"); break;
+          case dxgk::SceneVerdict::Differs: e.text("differs in ").dec(r.bad_pixels).text(" pixels, first at ").dec(r.first_bad % 32).text(",").dec(r.first_bad / 32).text(": ").hex(r.device_value).text(" instead of ").hex(r.reference_value); break;
+          case dxgk::SceneVerdict::Refused: e.text("not supported (").text(r.step).text(")"); break;
+          case dxgk::SceneVerdict::Broken: e.text("failed at ").text(r.step).text(", status ").hex(r.status); break;
+        }
+      }, nullptr);
+      Entry(bad ? Level::Warning : Level::Ok, "Direct3D").dec(bad).text(" conformance scene(s) wrong");
+    }
   Entry(dxg_fallbacks ? Level::Warning : Level::Ok, "Direct3D").text("kernel mode driver: ").dec(dxg_adapters).text(" adapter(s)");
   if (dxg_fallbacks) Entry(Level::Warning, "Direct3D").dec(dxg_fallbacks).text(" GPU(s) failed the Direct3D self-test and use the CPU renderer");
+  if (dxg_fallbacks)
+    Entry(Level::Warning, "Direct3D").text("self-test: ").text(dxg_why.picture_wrong ? "the picture is wrong" : dxg_why.step).text(" status ").hex(static_cast<uint32_t>(dxg_why.status));
   // WebGL and WebGPU draw on the 3D hardware when there is some (and on the CPU rasterizer in src/WebGl when there is not, or for a draw the hardware cannot do).
   graphics::WebGlAccelerator web_accelerator(system_graphics.device(), shared_allocator);
   if (system_graphics.accelerated()) webgl::set_accelerator(&web_accelerator);

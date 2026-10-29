@@ -117,7 +117,7 @@ NtStatus self_test_render(allocators::IAllocator& allocator, Kernel& kernel, uin
   DeviceState state;
   where = "device state";
   if ((s = kernel.get_device_state(pid, device, &state)) != status::kSuccess) return done(s);
-  if (state.execution != DeviceExecState::Running) return done(status::kDeviceRemoved);
+  if (state.execution != DeviceExecState::Running) return done(state.last_fault ? state.last_fault : status::kDeviceRemoved);
 
   where = "lock (target)";
   if ((s = kernel.lock(pid, target, kLockReadOnly, 0, &lock)) != status::kSuccess) return done(s);

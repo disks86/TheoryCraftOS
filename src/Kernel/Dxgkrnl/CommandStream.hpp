@@ -28,7 +28,7 @@
 //   BindPipeline     pipeline handle
 //   BindVertexBuffer allocation_index, offset
 //   BindIndexBuffer  allocation_index, index_type (0: 16 bit, 1: 32 bit), offset
-//   PushConstants    byte_count (a multiple of 16, at most 128), then the bytes padded to a whole word
+//   PushConstants    byte_count (a multiple of 16, at most the adapter's max_push_constant_bytes: 128 for most, 4096 for the CPU renderer and virgl), then the bytes padded to a whole word
 //   BindTexture      unit, allocation_index, filter, address_u, address_v, mip_filter, lod_bias, min_lod, max_lod (floats)
 //   SetViewport      x, y, width, height, min_depth, max_depth (floats)
 //   SetScissor       x, y, width, height (x and y signed)
@@ -67,7 +67,7 @@ enum class Op : uint16_t {
 enum class Topology : uint32_t { TriangleList = 0, TriangleStrip = 1, TriangleFan = 2, LineList = 3, LineStrip = 4, PointList = 5 };   // (lines and points: kFeatureLines of the adapter)
 
 constexpr uint32_t kNoAllocation = 0xFFFFFFFFu;
-constexpr uint32_t kMaxPacketWords = 64;           // (PushConstants is the longest: 2 + 32)
+constexpr uint32_t kMaxPacketWords = 2 + graphics::kMaxPushConstantBytes / 4;   // (PushConstants is the longest: the byte count, then up to kMaxPushConstantBytes of constants)
 constexpr uint64_t kMaxCommandBytes = 16 * 1024 * 1024;
 
 enum BeginPassFlags : uint32_t { kPassClearColor = 1u << 0, kPassClearDepth = 1u << 1, kPassClearStencil = 1u << 2 };

@@ -47,7 +47,8 @@ class TgsiEmitter {
   static constexpr uint32_t kScratch = 32;   // 4 registers for source operands
   static constexpr uint32_t kWork = 36, kWork2 = 37, kWork3 = 38;
   static constexpr uint32_t kPosition = 39, kVarying = 40, kColor = 44;   // (kVarying: four)
-  static constexpr uint32_t kTempCount = 45;
+  static constexpr uint32_t kSys = 45;     // the system values (SysValue order), copied from where TGSI keeps them into registers of the interpreter's shape
+  static constexpr uint32_t kTempCount = kSys + kSysValueCount;
   static constexpr uint32_t kMaxOutput = 120000;   // (the virgl command carrying the text has a 16-bit dword count)
 
   struct Imm {
@@ -119,6 +120,10 @@ class TgsiEmitter {
       return 0;
     }
     return static_cast<uint32_t>(imms_.count() - 1);
+  }
+  uint32_t imm4_bits(uint32_t x, uint32_t y, uint32_t z, uint32_t w) {
+    const float v[4] = {__builtin_bit_cast(float, x), __builtin_bit_cast(float, y), __builtin_bit_cast(float, z), __builtin_bit_cast(float, w)};
+    return imm4(v);
   }
   String imm_text(const float v[4], const char* swizzle) {
     String s = str();
@@ -200,6 +205,18 @@ class TgsiEmitter {
       line(name, &target, &a);
     }
   }
+  // The first component of a source as a value UIF can test: the source itself (non-zero), or, for `is_zero`, a mask that is non-zero when the source is zero.
+  String zero_test(const Instr::Src& src, bool is_zero) {
+    String a = operand(src, 0, 0, nullptr, true);
+    if (!is_zero) return a;   // (moved out)
+    const String w = temp(kWork3, ".x");
+    String z = str();
+    add(z, "IMM[");
+    add_uint(z, imm4_bits(0, 0, 0, 0));
+    add(z, "].xxxx");
+    line("USEQ", &w, &a, &z);
+    return temp(kWork3, ".xxxx");
+  }
   bool instruction(const Instr& ins);
   bool compare(const Instr& ins);
   void assemble(String* out);
@@ -211,7 +228,9 @@ class TgsiEmitter {
   uint32_t inst_ = 0;
   bool oom_ = false, unsupported_ = false;
   bool vertex_ = false, addr_used_ = false;
+  int relative_key_ = -2;   // the address register's source in the instruction being emitted (-2: none yet, -1: a0, else the integer register and component)
   bool in_used_[16] = {};
+  bool sys_used_[kSysValueCount] = {};
   uint32_t max_attribute_ = 0;
   bool sampler_used_[graphics::kMaxTextureUnits] = {};
 };
@@ -245,13 +264,39 @@ String TgsiEmitter::operand(const Instr::Src& s, uint32_t offset, uint32_t slot,
       add_uint(base, static_cast<uint32_t>(s.slot));
       add(base, "]");
       break;
+    case kSysValue:   // (copied to a register by the prologue; the stage decides which exist)
+      if (s.number >= kSysValueCount || (vertex_ ? s.number != kSysVertexId && s.number != kSysInstanceId : s.number == kSysVertexId || s.number == kSysInstanceId)) {
+        unsupported_ = true;
+        break;
+      }
+      if (s.number == kSysPrimitiveId) {   // (virglrenderer's GLSL has no gl_PrimitiveID in a pixel shader without a geometry stage: refused, not lost)
+        unsupported_ = true;
+        break;
+      }
+      add(base, "TEMP[");
+      add_uint(base, kSys + s.number);
+      add(base, "]");
+      break;
     case kConst: {
       const uint32_t reg = s.number + offset;
       if (s.relative) {
-        if (p_.defs_.count() != 0 || s.relative_component != 0 || s.relative_temp >= 0) {
+        // (a0 of Direct3D 9, or an integer register of Shader Model 4; one address per instruction, and no immediates in the way: an immediate cannot be addressed)
+        const int key = s.relative_temp >= 0 ? 16 + s.relative_temp * 4 + s.relative_component : -1;
+        bool addressed_def = false;   // (a def inside the range that can be addressed would be read by the interpreter; a literal beyond the buffer is not in the way)
+        for (const D3d9Program::Def& d : p_.defs_.view()) addressed_def = addressed_def || !s.relative_limit || d.number < s.relative_limit;
+        if (addressed_def || (s.relative_temp < 0 && s.relative_component != 0) || (s.relative_temp >= 0 && s.relative_temp >= static_cast<int>(kScratch)) || (relative_key_ != -2 && relative_key_ != key)) {
           unsupported_ = true;
           break;
         }
+        if (s.relative_temp >= 0 && relative_key_ != key) {
+          String component = temp(static_cast<uint32_t>(s.relative_temp), "");
+          add(component, ".");
+          for (int k = 0; k < 4; ++k) add(component, StringView(&"xyzw"[s.relative_component & 3], 1));
+          String target = str();
+          add(target, "ADDR[0].x");
+          line("UARL", &target, &component);
+        }
+        relative_key_ = key;
         add(base, "CONST[ADDR[0].x+");
         add_uint(base, reg);
         add(base, "]");
@@ -388,6 +433,7 @@ bool TgsiEmitter::compare(const Instr& ins) {
 
 bool TgsiEmitter::instruction(const Instr& ins) {
   const uint16_t op = ins.op;
+  relative_key_ = -2;
   switch (op) {
     case kNop: return true;
     case kElse: line("ELSE"); return true;
@@ -410,32 +456,23 @@ bool TgsiEmitter::instruction(const Instr& ins) {
     case kLoopEnd: line("ENDLOOP"); return true;
     case kBreak0: line("BRK"); return true;
     case kContinue0: line("CONT"); return true;
-    case kBreakNz: case kBreakZ: case kContinueNz: case kContinueZ: {
-      const String a = operand(ins.src[0], 0, 0, nullptr, true), z = zero(), w = temp(kWork3, ".x");
-      line(op == kBreakNz || op == kContinueNz ? "SNE" : "SEQ", &w, &a, &z);
-      const String test = temp(kWork3, ".xxxx");
-      line("IF", &test);
+    case kBreakNz: case kBreakZ: case kContinueNz: case kContinueZ: {   // (the test is on the 32 bits being non-zero: UIF)
+      const String test = zero_test(ins.src[0], op == kBreakZ || op == kContinueZ);
+      line("UIF", &test);
       line(op == kBreakNz || op == kBreakZ ? "BRK" : "CONT");
       line("ENDIF");
       return true;
     }
-    case kIfNz: {   // (SNE first: the test value may be all ones, a NaN as a float)
-      const String a = operand(ins.src[0], 0, 0, nullptr, true), z = zero(), w = temp(kWork3, ".x");
-      line("SNE", &w, &a, &z);
-      const String test = temp(kWork3, ".xxxx");
-      line("IF", &test);
+    case kIfNz: case kIfZ: {
+      const String test = zero_test(ins.src[0], op == kIfZ);
+      line("UIF", &test);
       return true;
     }
-    case kIfZ: case kDiscardNz: case kDiscardZ: {
-      const String a = operand(ins.src[0], 0, 0, nullptr, true), z = zero(), w = temp(kWork3, ".x");
-      line(op == kDiscardNz ? "SNE" : "SEQ", &w, &a, &z);
-      const String test = temp(kWork3, ".xxxx");
-      if (op == kIfZ) {
-        line("IF", &test);
-      } else {
-        const String minus = negate(test);
-        line("KILL_IF", &minus);   // (kills when -1 < 0: the test held)
-      }
+    case kDiscardNz: case kDiscardZ: {
+      const String test = zero_test(ins.src[0], op == kDiscardZ);
+      line("UIF", &test);
+      line("KILL");
+      line("ENDIF");
       return true;
     }
     case kTexKill: {
@@ -505,6 +542,31 @@ bool TgsiEmitter::instruction(const Instr& ins) {
     case kCeil: simple = "CEIL", sources = 1; break;
     case kTrunc: simple = "TRUNC", sources = 1; break;
     case kRoundNe: simple = "ROUND", sources = 1; break;
+    // integers: the register's 32 bits are the value (TGSI's registers are untyped, the instruction says how to read them), comparisons give all ones or zero
+    case kIAdd: simple = "UADD", sources = 2; break;
+    case kINeg: simple = "INEG", sources = 1; break;
+    case kIMul: case kUMul: simple = "UMUL", sources = 2; break;
+    case kIMad: case kUMad: simple = "UMAD", sources = 3; break;
+    case kIMin: simple = "IMIN", sources = 2; break;
+    case kIMax: simple = "IMAX", sources = 2; break;
+    case kUMin: simple = "UMIN", sources = 2; break;
+    case kUMax: simple = "UMAX", sources = 2; break;
+    case kUDiv: simple = "UDIV", sources = 2; break;
+    case kURem: simple = "UMOD", sources = 2; break;
+    case kAnd: simple = "AND", sources = 2; break;
+    case kOr: simple = "OR", sources = 2; break;
+    case kXor: simple = "XOR", sources = 2; break;
+    case kNot: simple = "NOT", sources = 1; break;
+    case kFtoI: simple = "F2I", sources = 1; break;
+    case kFtoU: simple = "F2U", sources = 1; break;
+    case kItoF: simple = "I2F", sources = 1; break;
+    case kUtoF: simple = "U2F", sources = 1; break;
+    case kIEq: simple = "USEQ", sources = 2; break;
+    case kINe: simple = "USNE", sources = 2; break;
+    case kILt: simple = "ISLT", sources = 2; break;
+    case kIGe: simple = "ISGE", sources = 2; break;
+    case kULt: simple = "USLT", sources = 2; break;
+    case kUGe: simple = "USGE", sources = 2; break;
     default: break;
   }
   if (simple && ins.mask_result) {   // (a Shader Model 4 comparison is all ones for true: TGSI's FS comparisons)
@@ -624,13 +686,68 @@ bool TgsiEmitter::instruction(const Instr& ins) {
       line("MUL", &t, &a, &w2);
       break;
     }
-    case kSelect: {   // a != 0 ? b : c
+    case kSelect: {   // a != 0 ? b : c  (the 32 bits of a, whether it is a mask or a float)
       t = begin_result(ins, false, &direct);
       const String a = operand(ins.src[0], 0, 0, nullptr, false), b = operand(ins.src[1], 0, 1, nullptr, false), c = operand(ins.src[2], 0, 2, nullptr, false);
-      const String w = temp(kWork2), z = zero();
-      line("SNE", &w, &a, &z);
-      const String minus = negate(w);
-      line("CMP", &t, &minus, &b, &c);
+      line("UCMP", &t, &a, &b, &c);
+      break;
+    }
+    case kIShl: case kIShr: case kUShr: {   // (only the low five bits of the count count)
+      t = begin_result(ins, false, &direct);
+      const String a = operand(ins.src[0], 0, 0, nullptr, false), count = operand(ins.src[1], 0, 1, nullptr, false);
+      const String w = temp(kWork2);
+      String mask = str();
+      add(mask, "IMM[");
+      add_uint(mask, imm4_bits(31, 31, 31, 31));
+      add(mask, "]");
+      line("AND", &w, &count, &mask);
+      line(op == kIShl ? "SHL" : op == kIShr ? "ISHR" : "USHR", &t, &a, &w);
+      break;
+    }
+    case kTexFetch: case kTexLod: case kTexSize: {
+      const bool swizzled = ins.tex_swizzle[0] != 0 || ins.tex_swizzle[1] != 1 || ins.tex_swizzle[2] != 2 || ins.tex_swizzle[3] != 3;
+      t = begin_result(ins, true, &direct);
+      const uint32_t unit = ins.src[1].number;
+      if (unit >= graphics::kMaxTextureUnits) {
+        unsupported_ = true;
+        break;
+      }
+      sampler_used_[unit] = true;
+      String sampler = str();
+      add(sampler, "SAMP[");
+      add_uint(sampler, unit);
+      add(sampler, "]");
+      String dim = str();
+      add(dim, "2D");
+      const String texel = temp(kWork2);
+      if (op == kTexFetch) {   // ld: integer x y in the first two components, the level in the last
+        const String coordinate = operand(ins.src[0], 0, 0, nullptr, false);
+        line("TXF", &texel, &coordinate, &sampler, &dim);
+      } else if (op == kTexLod) {   // sample_l: the coordinate, and the level next to it
+        const uint8_t xyxy[4] = {0, 1, 0, 1};
+        const String coordinate = operand(ins.src[0], 0, 0, xyxy, false), level = operand(ins.src[2], 0, 1, nullptr, true);
+        const String xy = temp(kWork3, ".xy"), lod = temp(kWork3, ".w"), packed = temp(kWork3);
+        line("MOV", &xy, &coordinate);
+        line("MOV", &lod, &level);
+        line("TXL", &texel, &packed, &sampler, &dim);
+      } else {   // resinfo: width, height, (depth), levels of the level named by the source
+        const String level = operand(ins.src[0], 0, 0, nullptr, true);
+        line("TXQ", &texel, &level, &sampler, &dim);
+        const String tz = temp(kWork2, ".z"), z0 = zero();
+        line("MOV", &tz, &z0);
+        if (ins.control != 2) {   // floats (0) or reciprocals (1)
+          line("U2F", &texel, &texel);
+          if (ins.control == 1) line("RCP", &texel, &texel);
+        }
+      }
+      const String w = temp(kWork);
+      if (swizzled) {
+        String picked = temp(kWork2, ".");
+        for (uint32_t c = 0; c < 4; ++c) add(picked, StringView(&"xyzw"[ins.tex_swizzle[c] & 3], 1));
+        line("MOV", &w, &picked);
+      } else {
+        line("MOV", &w, &texel);
+      }
       break;
     }
     case kSqrt: case kSin: case kCos: case kRsq: case kExp:   // TGSI's scalar instructions, once per component
@@ -722,6 +839,8 @@ void TgsiEmitter::assemble(String* out) {
       add_uint(*out, i);
       add(*out, "]\n");
     }
+    if (sys_used_[kSysVertexId]) add(*out, "DCL SV[0], VERTEXID\n");
+    if (sys_used_[kSysInstanceId]) add(*out, "DCL SV[1], INSTANCEID\n");
     add(*out, "DCL OUT[0], POSITION\n");
     for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) {
       add(*out, "DCL OUT[");
@@ -739,6 +858,8 @@ void TgsiEmitter::assemble(String* out) {
       add_uint(*out, i);
       add(*out, "], PERSPECTIVE\n");
     }
+    if (sys_used_[kSysPosition]) add(*out, "DCL IN[16], POSITION, LINEAR\n");
+    if (sys_used_[kSysFrontFacing]) add(*out, "DCL IN[17], FACE, CONSTANT\n");
     add(*out, "DCL OUT[0], COLOR\n");
     for (uint32_t i = 0; i < graphics::kMaxTextureUnits; ++i) {
       if (!sampler_used_[i]) continue;
@@ -759,10 +880,17 @@ void TgsiEmitter::assemble(String* out) {
   for (uint64_t i = 0; i < imms_.count(); ++i) {
     add(*out, "IMM[");
     add_uint(*out, i);
-    add(*out, "] FLT32 {");
+    // A value that is no ordinary float (an integer literal: a denormal, or all ones) is written as its bits.
+    bool integer = false;
+    for (uint32_t k = 0; k < 4; ++k) {
+      const uint32_t exponent = (imms_[i].bits[k] >> 23) & 0xFF, mantissa = imms_[i].bits[k] & 0x7FFFFF;
+      integer = integer || (exponent == 0 && mantissa != 0) || exponent == 0xFF;
+    }
+    add(*out, integer ? "] UINT32 {" : "] FLT32 {");
     for (uint32_t k = 0; k < 4; ++k) {
       if (k) add(*out, ", ");
-      add_float(*out, __builtin_bit_cast(float, imms_[i].bits[k]));
+      if (integer) add_uint(*out, imms_[i].bits[k]);   // (decimal: the parser takes no hex)
+      else add_float(*out, __builtin_bit_cast(float, imms_[i].bits[k]));
     }
     add(*out, "}\n");
   }
@@ -773,8 +901,10 @@ NtStatus TgsiEmitter::run(String* out) {
   vertex_ = p_.stage_ == graphics::ShaderStage::Vertex;
   for (const Instr& ins : p_.code_.view()) {
     if (ins.dst.type == kAddrTex) addr_used_ = true;
-    for (uint32_t k = 0; k < ins.src_count; ++k)
+    for (uint32_t k = 0; k < ins.src_count; ++k) {
       if (ins.src[k].relative) addr_used_ = true;
+      if (ins.src[k].type == kSysValue && ins.src[k].number < kSysValueCount) sys_used_[ins.src[k].number] = true;
+    }
   }
 
   // Prologue: the outputs start at zero, and so does a0.
@@ -783,6 +913,27 @@ NtStatus TgsiEmitter::run(String* out) {
     String target = str();
     add(target, "ADDR[0].x");
     line("ARL", &target, &z);
+  }
+  // The system values, as the interpreter has them: registers whose x (or all four, for the pixel's position) carries the value, the rest zero. A vertex's numbers are integers;
+  // whether a pixel faces the viewer is all ones or zero.
+  for (uint32_t k = 0; k < kSysValueCount; ++k) {
+    if (!sys_used_[k]) continue;
+    const String reg = temp(kSys + k), reg_x = temp(kSys + k, ".x");
+    String source = str();
+    if (vertex_) {
+      add(source, k == kSysVertexId ? "SV[0].xxxx" : "SV[1].xxxx");
+    } else {
+      add(source, "IN[");
+      add_uint(source, 16 + k);
+      add(source, k == kSysPosition ? "]" : "].xxxx");
+    }
+    if (k == kSysPosition) {
+      line("MOV", &reg, &source);
+      continue;
+    }
+    line("MOV", &reg, &z);
+    if (k == kSysFrontFacing) line("FSGE", &reg_x, &source, &z);   // (TGSI's FACE is +1 or -1)
+    else line("MOV", &reg_x, &source);
   }
   if (vertex_) {
     const String pos = temp(kPosition);

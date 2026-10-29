@@ -61,6 +61,7 @@ constexpr uint32_t header(uint32_t command, uint32_t object, uint32_t length_dwo
 // Formats (VIRGL_FORMAT_*).
 constexpr uint32_t kFormatB8G8R8A8Unorm = 1;
 constexpr uint32_t kFormatZ32Float = 18;
+constexpr uint32_t kFormatZ32FloatS8X24Uint = 126;   // (a depth image with a stencil plane; 19, the number the name Z24_UNORM_S8_UINT suggests, makes virglrenderer lose the context)
 constexpr uint32_t kFormatR8Unorm = 64;
 constexpr uint32_t kFormatR32Float = 28;
 constexpr uint32_t kFormatR32G32Float = 29;
@@ -80,11 +81,13 @@ constexpr uint32_t kTargetBuffer = 0;
 constexpr uint32_t kTargetTexture2d = 2;
 constexpr uint32_t kShaderVertex = 0;
 constexpr uint32_t kShaderFragment = 1;
-constexpr uint32_t kPrimTriangles = 4;
+constexpr uint32_t kPrimPoints = 0, kPrimLines = 1, kPrimTriangles = 4;
 constexpr uint32_t kFuncLess = 1, kFuncLequal = 3, kFuncAlways = 7;
-constexpr uint32_t kBlendAdd = 0;
+constexpr uint32_t kBlendAdd = 0;   // (PIPE_BLEND_ADD, SUBTRACT, REVERSE_SUBTRACT, MIN, MAX: 0 .. 4, as BlendOp)
+constexpr uint32_t kBlendFactors[] = {0x11, 1, 2, 0x12, 3, 0x13, 5, 0x15, 4, 0x14, 6};   // by BlendFactor: ZERO ONE SRC_COLOR INV_SRC_COLOR SRC_ALPHA INV_SRC_ALPHA DST_COLOR INV_DST_COLOR DST_ALPHA INV_DST_ALPHA SRC_ALPHA_SATURATE
+constexpr uint32_t kStencilOps[] = {0, 1, 2, 3, 4, 7, 5, 6};   // by StencilOp (Keep Zero Replace IncrementClamp DecrementClamp Invert IncrementWrap DecrementWrap): PIPE_STENCIL_OP_*
 constexpr uint32_t kBlendFactorOne = 1, kBlendFactorSrcAlpha = 3, kBlendFactorInvSrcAlpha = 0x13;
-constexpr uint32_t kClearDepth = 1u << 0, kClearColor0 = 1u << 2;
+constexpr uint32_t kClearDepth = 1u << 0, kClearStencil = 1u << 1, kClearColor0 = 1u << 2;
 // Sampler state (the S0 dword of a sampler state object) and sampler view swizzle.
 constexpr uint32_t kWrapRepeat = 0, kWrapClampToEdge = 2;
 constexpr uint32_t kFilterNearest = 0, kFilterLinear = 1;

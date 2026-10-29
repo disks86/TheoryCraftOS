@@ -445,6 +445,7 @@ add_executable(BOOTX64
   src/Kernel/Dxgkrnl/D3d9Dxbc.cpp
   src/Kernel/Dxgkrnl/D3d9Ps1.cpp
   src/Kernel/Dxgkrnl/SelfTest.cpp
+  src/Kernel/Dxgkrnl/Conformance.cpp
   src/Kernel/Dxgkrnl/D3d9Devices.cpp
   src/Kernel/Dxgkrnl/D3d9Emit.cpp
   src/Kernel/Dxgkrnl/Adapter.cpp
@@ -642,6 +643,8 @@ add_executable(BOOTX64
   src/Emulation/X86_64X87.cpp
   src/Emulation/X86_64Vex.cpp
   src/Emulation/X86_64Crypto.cpp
+  src/Emulation/X86_64Misc.cpp
+  src/Emulation/X86_64Mmx.cpp
   src/Emulation/X86_64Evex.cpp
   src/Emulation/X86_64EvexMisc.cpp
   src/Emulation/X86_64EvexFp.cpp
@@ -706,6 +709,7 @@ add_executable(BOOTX64
   src/Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnEmu.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/Gcn/TgsiParse.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnCompiler.cpp
+  src/Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnDraw.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdAsicReset.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdIrq.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdSdma3.cpp

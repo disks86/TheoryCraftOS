@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#include <initializer_list>
 #include "Graphics/Graphics3D/Virgl/VirglDevice.hpp"
 #include <new>
 #include "Graphics/Graphics3D/Virgl/VirglProtocol.hpp"
@@ -155,14 +156,15 @@ class VirglImage final : public IImage {
     hardware::VirtioGpu& gpu = device.gpu();
     id_ = gpu.allocate_resource_id();
     const bool depth = desc.format == Format::D32Float;
-    // A texture (an image that is only sampled) is stored top row first, the way write_pixels() gives it and the sampler reads it, so it does not take the Y_0_TOP
-    // flip of the images that are drawn into.
-    const bool texture = (desc.usage & kImageSampled) != 0;
+    const uint32_t depth_format = desc.stencil ? virgl::kFormatZ32FloatS8X24Uint : virgl::kFormatZ32Float;
+    // A sampled image is stored top row first, the way write_pixels() gives it and the sampler reads it, so it does not take the Y_0_TOP flip of the images that are only
+    // drawn into (and shown).
+    const bool sampled = (desc.usage & kImageSampled) != 0;
     uint32_t bind = depth ? virgl::kBindDepthStencil : (virgl::kBindRenderTarget | virgl::kBindSamplerView);
     if (desc.usage & kImagePresent) bind |= virgl::kBindScanout;
     ResourceCreate3d create{header(kCmdResourceCreate3d), id_, virgl::kTargetTexture2d,
-                            depth ? virgl::kFormatZ32Float : virgl::kFormatB8G8R8A8Unorm, bind,
-                            desc.extent.width, desc.extent.height, 1, 1, 0, 0, texture ? 0u : kResourceFlagY0Top, 0};
+                            depth ? depth_format : virgl::kFormatB8G8R8A8Unorm, bind,
+                            desc.extent.width, desc.extent.height, 1, 1, 0, 0, sampled ? 0u : kResourceFlagY0Top, 0};
     CtxResource ctx{header(kCmdCtxAttachResource), id_, 0};
     ok_ = gpu.command(as_bytes(create)) && gpu.command(as_bytes(ctx));
     accounted_ = uint64_t{desc.extent.width} * desc.extent.height * 4;   // (every format here is 32 bits per pixel)
@@ -170,12 +172,12 @@ class VirglImage final : public IImage {
     // The surface (a render-target view of the resource) is what the framebuffer state refers to.
     if (ok_ && (desc.usage & (kImageColorAttachment | kImageDepthAttachment))) {
       surface_ = device.new_handle();
-      const uint32_t fmt = depth ? virgl::kFormatZ32Float : virgl::kFormatB8G8R8A8Unorm;
+      const uint32_t fmt = depth ? depth_format : virgl::kFormatB8G8R8A8Unorm;
       const uint32_t cmd[] = {virgl::header(virgl::kCreateObject, virgl::kObjectSurface, 5), surface_, id_, fmt, 0, 0};
       ok_ = device.send_commands(cmd, 6);
     }
     // The sampler view is what a texture unit is bound to: the whole resource, level 0, components in order.
-    if (ok_ && texture) {
+    if (ok_ && sampled) {
       view_ = device.new_handle();
       const uint32_t cmd[] = {virgl::header(virgl::kCreateObject, virgl::kObjectSamplerView, 6), view_, id_, virgl::kFormatB8G8R8A8Unorm, 0, 0, virgl::kSwizzleRgba};
       ok_ = device.send_commands(cmd, 7);
@@ -201,6 +203,10 @@ class VirglImage final : public IImage {
   Extent2D extent() const override { return desc_.extent; }
   Format format() const override { return desc_.format; }
   uint32_t usage() const { return desc_.usage; }
+  bool stencil() const { return desc_.stencil; }
+  // Stored with window y 0 at the top (drawn into and shown: the Y_0_TOP flag), or the way a texture is - row 0 first, window y 0 at the bottom of GL's window - which is what a
+  // render target that is also sampled needs, so that the sampler reads it the way a texture is read (drawn upright by an unflipped viewport, see VirglPipeline).
+  bool y0_top() const { return !(desc_.usage & kImageSampled); }
 
   bool read_pixels(ArrayView<uint32_t> out) override {
     const uint64_t count = uint64_t{desc_.extent.width} * desc_.extent.height;
@@ -294,13 +300,22 @@ class VirglPipeline final : public IPipeline {
     uint32_t cmd[64];
     uint32_t n = 0;
 
-    // Blend state: one render target, optional source-over blending.
-    const uint32_t blend_rt =
-        desc.alpha_blend
-            ? (1u | (virgl::kBlendAdd << 1) | (virgl::kBlendFactorSrcAlpha << 4) | (virgl::kBlendFactorInvSrcAlpha << 9) |
-               (virgl::kBlendAdd << 14) | (virgl::kBlendFactorOne << 17) | (virgl::kBlendFactorInvSrcAlpha << 22) |
-               (0xFu << 27))
-            : (0xFu << 27);
+    // Blend state: one render target; source-over blending (alpha_blend) or the pipeline's own state (kFeatureBlendState).
+    const BlendState& bs = desc.blend;
+    uint32_t blend_rt = 0xFu << 27;
+    if (bs.custom) {
+      // (min and max take no factors: Gallium wants ONE for them)
+      const bool color_minmax = bs.color_op == BlendOp::Min || bs.color_op == BlendOp::Max, alpha_minmax = bs.alpha_op == BlendOp::Min || bs.alpha_op == BlendOp::Max;
+      const uint32_t color_src = color_minmax ? virgl::kBlendFactorOne : virgl::kBlendFactors[static_cast<uint32_t>(bs.src_color)];
+      const uint32_t color_dst = color_minmax ? virgl::kBlendFactorOne : virgl::kBlendFactors[static_cast<uint32_t>(bs.dst_color)];
+      const uint32_t alpha_src = alpha_minmax ? virgl::kBlendFactorOne : virgl::kBlendFactors[static_cast<uint32_t>(bs.src_alpha)];
+      const uint32_t alpha_dst = alpha_minmax ? virgl::kBlendFactorOne : virgl::kBlendFactors[static_cast<uint32_t>(bs.dst_alpha)];
+      blend_rt = (bs.enable ? 1u : 0u) | (static_cast<uint32_t>(bs.color_op) << 1) | (color_src << 4) | (color_dst << 9) | (static_cast<uint32_t>(bs.alpha_op) << 14) | (alpha_src << 17) |
+                 (alpha_dst << 22) | (static_cast<uint32_t>(bs.write_mask & 0xF) << 27);
+    } else if (desc.alpha_blend) {
+      blend_rt = 1u | (virgl::kBlendAdd << 1) | (virgl::kBlendFactorSrcAlpha << 4) | (virgl::kBlendFactorInvSrcAlpha << 9) | (virgl::kBlendAdd << 14) | (virgl::kBlendFactorOne << 17) |
+                 (virgl::kBlendFactorInvSrcAlpha << 22) | (0xFu << 27);
+    }
     cmd[n++] = virgl::header(virgl::kCreateObject, virgl::kObjectBlend, 11);
     cmd[n++] = blend_;
     cmd[n++] = 0;  // s0: no independent blend, logic op, dither...
@@ -308,21 +323,28 @@ class VirglPipeline final : public IPipeline {
     cmd[n++] = blend_rt;
     for (int i = 1; i < 8; ++i) cmd[n++] = 0;
 
-    // Depth/stencil/alpha: depth only.
-    const uint32_t depth_func = desc.depth_test ? virgl::kFuncLequal : virgl::kFuncAlways;
+    // Depth and stencil (the same stencil state for both faces).
+    const uint32_t depth_func = desc.depth_test ? static_cast<uint32_t>(desc.depth_compare) : virgl::kFuncAlways;   // (CompareOp is numbered as PIPE_FUNC)
     const bool depth_on = desc.depth_test || desc.depth_write;
+    const StencilState& st = desc.stencil;
+    const uint32_t stencil_state = !st.enable ? 0u
+                                              : 1u | (static_cast<uint32_t>(st.compare) << 1) | (virgl::kStencilOps[static_cast<uint32_t>(st.fail_op)] << 4) |
+                                                    (virgl::kStencilOps[static_cast<uint32_t>(st.pass_op)] << 7) | (virgl::kStencilOps[static_cast<uint32_t>(st.depth_fail_op)] << 10) |
+                                                    (uint32_t{st.compare_mask} << 13) | (uint32_t{st.write_mask} << 21);
+    stencil_reference_ = st.enable ? st.reference : 0;
     cmd[n++] = virgl::header(virgl::kCreateObject, virgl::kObjectDsa, 5);
     cmd[n++] = dsa_;
     cmd[n++] = (depth_on ? 1u : 0u) | ((desc.depth_write ? 1u : 0u) << 1) | (depth_func << 2);
-    cmd[n++] = 0;
-    cmd[n++] = 0;
-    cmd[n++] = 0;
+    cmd[n++] = stencil_state;
+    cmd[n++] = stencil_state;
+    cmd[n++] = 0;   // alpha reference
 
     // Rasterizer: depth clip with a 0..1 clip volume (Vulkan), scissor on, GL pixel conventions.
     // Y_0_TOP images make window space match Vulkan's, which flips what GL calls counter-clockwise.
     const uint32_t cull = desc.cull_mode == CullMode::None ? virgl::kFaceNone
                           : desc.cull_mode == CullMode::Back ? virgl::kFaceBack : virgl::kFaceFront;
     const bool front_ccw = desc.front_face == FrontFace::CounterClockwise;
+    // (the winding is the same for both kinds of image: the viewport flip and Y_0_TOP, or neither, both put the picture's top row at the same place for the rasterizer)
     cmd[n++] = virgl::header(virgl::kCreateObject, virgl::kObjectRasterizer, 9);
     cmd[n++] = rasterizer_;
     cmd[n++] = (1u << 1) /*depth clip*/ | (1u << 2) /*clip half z*/ | (cull << 8) | (1u << 14) /*scissor*/ |
@@ -342,8 +364,8 @@ class VirglPipeline final : public IPipeline {
       static const uint32_t kFormats[] = {virgl::kFormatR32Float, virgl::kFormatR32G32Float,
                                           virgl::kFormatR32G32B32Float, virgl::kFormatR32G32B32A32Float};
       cmd[n++] = desc.attributes[i].offset;
-      cmd[n++] = 0;  // instance divisor
-      cmd[n++] = 0;  // vertex buffer index
+      cmd[n++] = desc.attributes[i].per_instance ? 1 : 0;   // instance divisor
+      cmd[n++] = desc.attributes[i].per_instance ? 1 : 0;   // vertex buffer index (the divisor belongs to a buffer binding on the host: per-instance attributes get a binding of their own, of the same buffer)
       cmd[n++] = kFormats[static_cast<uint32_t>(desc.attributes[i].format)];
     }
     ok_ = n <= 64 && device.send_commands(cmd, n);
@@ -360,6 +382,13 @@ class VirglPipeline final : public IPipeline {
   uint32_t dsa() const { return dsa_; }
   uint32_t rasterizer() const { return rasterizer_; }
   uint32_t elements() const { return elements_; }
+  bool has_per_instance() const {
+    for (uint32_t i = 0; i < desc_.attribute_count; ++i)
+      if (desc_.attributes[i].per_instance) return true;
+    return false;
+  }
+  uint8_t stencil_reference() const { return stencil_reference_; }
+  bool stencil_enabled() const { return desc_.stencil.enable; }
   uint32_t vertex_shader() const { return vs_; }
   uint32_t fragment_shader() const { return fs_; }
 
@@ -367,6 +396,7 @@ class VirglPipeline final : public IPipeline {
   VirglDevice& device_;
   GraphicsPipelineDesc desc_;
   uint32_t vs_, fs_;
+  uint8_t stencil_reference_ = 0;
   uint32_t blend_ = 0, dsa_ = 0, rasterizer_ = 0, elements_ = 0;
   bool ok_ = false;
 };
@@ -425,13 +455,13 @@ IBuffer* VirglDevice::create_buffer(uint64_t size, uint32_t usage) {
 void VirglDevice::destroy_buffer(IBuffer* buffer) { destroy(gpu_.allocator(), static_cast<VirglBuffer*>(buffer)); }
 
 IImage* VirglDevice::create_image(const ImageDesc& desc) {
-  if (desc.stencil) return nullptr;   // (no stencil plane on this device)
   if (desc.mip_levels != 1) return nullptr;   // (no mipmaps either)
   // A texture is not drawn into: the two kinds of image are stored in opposite row order (see VirglImage).
-  if ((desc.usage & kImageSampled) && (desc.usage & (kImageColorAttachment | kImageDepthAttachment | kImagePresent))) return nullptr;
+  if ((desc.usage & kImageSampled) && (desc.usage & (kImageDepthAttachment | kImagePresent))) return nullptr;
   if ((desc.usage & kImageSampled) && desc.format != Format::B8G8R8A8Unorm) return nullptr;
   if (!desc.extent.width || !desc.extent.height || desc.format == Format::Undefined) return nullptr;
   if (desc.format == Format::R8G8B8A8Unorm) return nullptr;  // only BGRA color images for now
+  if (desc.stencil && desc.format != Format::D32Float) return nullptr;
   VirglImage* image = make<VirglImage>(gpu_.allocator(), *this, desc);
   if (image && !image->valid()) {
     destroy(gpu_.allocator(), image);
@@ -458,7 +488,6 @@ void VirglDevice::destroy_shader_module(IShaderModule* module) {
 
 IPipeline* VirglDevice::create_graphics_pipeline(const GraphicsPipelineDesc& desc) {
   if (desc.texture_count > kMaxTextureUnits || desc.fragment_shader == nullptr) return nullptr;
-  if (desc.stencil.enable) return nullptr;   // (no stencil test on this device)
   if (!desc.vertex_shader || !desc.fragment_shader || desc.attribute_count > kMaxVertexAttributes ||
       desc.varying_count > kMaxVaryings)
     return nullptr;
@@ -501,6 +530,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
   uint32_t constants_dwords = 0;
   bool constants_dirty = false;
   bool in_pass = false;
+  PrimitiveTopology topology = PrimitiveTopology::TriangleList;
   const ConstByteView pool = recorder.constants();
 
   auto flush = [&]() {
@@ -512,7 +542,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
     if (!stream.command(virgl::kSetViewportState, 0, 7)) return;
     stream.put(0);
     stream.putf(viewport.width * 0.5f);
-    stream.putf(-viewport.height * 0.5f);  // GL's +Y is up: flip to Vulkan's +Y down
+    stream.putf((color && !color->y0_top() ? 1.0f : -1.0f) * viewport.height * 0.5f);  // GL's +Y is up: flip to Vulkan's +Y down (an upright image has its row 0 at window y 0 already)
     stream.putf(viewport.max_depth - viewport.min_depth);
     stream.putf(viewport.x + viewport.width * 0.5f);
     stream.putf(viewport.y + viewport.height * 0.5f);
@@ -523,7 +553,8 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
     stream.put(0);
     // Scissor rectangles are counted from the bottom of the target in virgl (GL's window space), while Vulkan's - and ours - count from the top.
     const uint32_t height = color ? color->extent().height : 0;
-    const uint32_t y0 = height - (scissor.y + scissor.height), y1 = height - scissor.y;
+    const bool upright = color && !color->y0_top();
+    const uint32_t y0 = upright ? scissor.y : height - (scissor.y + scissor.height), y1 = upright ? scissor.y + scissor.height : height - scissor.y;
     stream.put(scissor.x | (y0 << 16));
     stream.put((scissor.x + scissor.width) | (y1 << 16));
   };
@@ -549,6 +580,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         uint32_t buffers = 0;
         if (cmd.pass.clear_color) buffers |= virgl::kClearColor0;
         if (depth && cmd.pass.clear_depth) buffers |= virgl::kClearDepth;
+        if (depth && depth->stencil() && cmd.pass.clear_stencil) buffers |= virgl::kClearStencil;
         if (buffers) {
           stream.command(virgl::kClear, 0, 8);
           stream.put(buffers);
@@ -561,14 +593,14 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
           __builtin_memcpy(&bits, &d, 8);
           stream.put(static_cast<uint32_t>(bits));
           stream.put(static_cast<uint32_t>(bits >> 32));
-          stream.put(0);  // stencil
+          stream.put(cmd.pass.clear_stencil_value);
         }
         pipeline = nullptr;
         in_pass = true;
         break;
       }
       case RecordedCommand::Type::SetTopology:
-        if (cmd.topology != PrimitiveTopology::TriangleList) return false;   // (no lines or points here: DeviceInfo::features says so)
+        topology = cmd.topology;
         break;
       case RecordedCommand::Type::EndRenderPass:
         in_pass = false;
@@ -582,6 +614,10 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         stream.put(pipeline->dsa());
         stream.command(virgl::kBindObject, virgl::kObjectRasterizer, 1);
         stream.put(pipeline->rasterizer());
+        if (pipeline->stencil_enabled()) {
+          stream.command(virgl::kSetStencilRef, 0, 1);
+          stream.put(pipeline->stencil_reference() | (uint32_t{pipeline->stencil_reference()} << 8));
+        }
         stream.command(virgl::kBindObject, virgl::kObjectVertexElements, 1);
         stream.put(pipeline->elements());
         stream.command(virgl::kBindShader, 0, 2);
@@ -668,10 +704,13 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
           }
           constants_dirty = false;
         }
-        stream.command(virgl::kSetVertexBuffers, 0, 3);
-        stream.put(pipeline->desc().vertex_stride);
-        stream.put(static_cast<uint32_t>(vertex_offset));
-        stream.put(vertex_buffer->id());
+        const bool instanced_attributes = pipeline->has_per_instance();
+        stream.command(virgl::kSetVertexBuffers, 0, instanced_attributes ? 6 : 3);
+        for (uint32_t binding = 0; binding < (instanced_attributes ? 2u : 1u); ++binding) {
+          stream.put(pipeline->desc().vertex_stride);
+          stream.put(static_cast<uint32_t>(vertex_offset));
+          stream.put(vertex_buffer->id());
+        }
         if (indexed) {
           stream.command(virgl::kSetIndexBuffer, 0, 3);
           stream.put(index_buffer->id());
@@ -681,11 +720,11 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         stream.command(virgl::kDrawVbo, 0, 12);
         stream.put(cmd.first);
         stream.put(cmd.count);
-        stream.put(virgl::kPrimTriangles);
+        stream.put(topology == PrimitiveTopology::LineList ? virgl::kPrimLines : topology == PrimitiveTopology::PointList ? virgl::kPrimPoints : virgl::kPrimTriangles);
         stream.put(indexed ? 1 : 0);
-        stream.put(1);  // instance count
+        stream.put(cmd.instance_count);
         stream.put(static_cast<uint32_t>(cmd.vertex_offset));
-        stream.put(0);  // start instance
+        stream.put(cmd.first_instance);
         stream.put(0);  // primitive restart
         stream.put(0);  // restart index
         stream.put(0);  // min index

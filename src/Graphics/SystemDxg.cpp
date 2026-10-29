@@ -18,10 +18,11 @@
 
 #include "Graphics/SystemDxg.hpp"
 #include "Kernel/Dxgkrnl/SelfTest.hpp"
+#include "Utility/AllocatedView.hpp"
 
 namespace graphics {
 
-uint32_t register_dxg_adapters(dxgk::Kernel& kernel, GraphicsPool& pool, allocators::IAllocator& allocator, uint32_t* fallbacks) {
+uint32_t register_dxg_adapters(dxgk::Kernel& kernel, GraphicsPool& pool, allocators::IAllocator& allocator, uint32_t* fallbacks, DxgFallback* why) {
   uint32_t added = 0;
   if (fallbacks) *fallbacks = 0;
   for (uint32_t i = 0; i < pool.count(); ++i) {
@@ -36,7 +37,18 @@ uint32_t register_dxg_adapters(dxgk::Kernel& kernel, GraphicsPool& pool, allocat
     if (node->accelerated()) {
       // The device draws a Direct3D triangle on a kernel of its own first (nothing of it is left behind); if it cannot, the CPU renderer is this adapter's device.
       dxgk::Kernel probe(allocator);
-      if (probe.add_adapter(*device, config) == dxgk::kInvalidIndex || !dxgk::self_test(allocator, probe, 0)) {
+      bool passed = probe.add_adapter(*device, config) != dxgk::kInvalidIndex;
+      if (passed) {
+        const uint64_t count = uint64_t{dxgk::kSelfTestSize} * dxgk::kSelfTestSize;
+        ArrayView<uint32_t> pixels = allocate_view<uint32_t>(allocator, count);
+        DxgFallback result;
+        passed = !pixels.empty() &&
+                 (result.status = dxgk::self_test_render(allocator, probe, 0, pixels, &result.step)) == dxgk::status::kSuccess;
+        if (passed && !dxgk::self_test_picture_ok(pixels)) passed = false, result.picture_wrong = true;
+        if (!pixels.empty()) release_view(allocator, pixels);
+        if (!passed && why) *why = result;
+      }
+      if (!passed) {
         device = &node->software_device();
         if (fallbacks) ++*fallbacks;
       }
