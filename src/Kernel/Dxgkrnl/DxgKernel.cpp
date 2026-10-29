@@ -849,7 +849,7 @@ NtStatus Kernel::escape(ProcessId pid, Handle device, ConstByteView request, Byt
       const uint32_t enable = in.le32(), compare = in.le32(), fail = in.le32(), depth_fail = in.le32(), pass = in.le32();
       const uint32_t compare_mask = in.le32(), write_mask = in.le32(), reference = in.le32();
       // Optional trailing words (the state of Direct3D 10): depth_compare, then blend custom, enable, the four factors, the two ops, the write mask, and a bit per attribute for
-      // per_instance. Their absence is the base state.
+      // per_instance (then the number of colour outputs, then independent blending). Their absence is the base state.
       if (!in.ok()) return status::kInvalidParameter;
       if (!in.at_end()) {
         const uint32_t depth_compare = in.le32(), custom = in.le32(), blend_enable = in.le32(), sc = in.le32(), dc = in.le32(), sa = in.le32(), da = in.le32(), cop = in.le32(), aop = in.le32(),
@@ -865,6 +865,20 @@ NtStatus Kernel::escape(ProcessId pid, Handle device, ConstByteView request, Byt
         if (!in.at_end()) {   // (and, after that, the number of colour outputs)
           desc.color_target_count = in.le32();
           if (!in.ok() || desc.color_target_count == 0 || desc.color_target_count > graphics::kMaxColorTargets) return status::kInvalidParameter;
+          if (!in.at_end()) {   // (and, after that, independent blending: a flag, then for targets 1 .. 3 the nine words of the blend state)
+            const uint32_t independent = in.le32();
+            if (!in.ok() || independent > 1) return status::kInvalidParameter;
+            desc.independent_blend = independent != 0;
+            for (graphics::BlendState& t : desc.target_blend) {
+              const uint32_t tc = in.le32(), te = in.le32(), tsc = in.le32(), tdc = in.le32(), tsa = in.le32(), tda = in.le32(), tcop = in.le32(), taop = in.le32(), tmask = in.le32();
+              if (!in.ok() || tc > 1 || te > 1 || tsc > 10 || tdc > 10 || tsa > 10 || tda > 10 || tcop > 4 || taop > 4 || tmask > 15) return status::kInvalidParameter;
+              t.custom = tc != 0, t.enable = te != 0;
+              t.src_color = static_cast<graphics::BlendFactor>(tsc), t.dst_color = static_cast<graphics::BlendFactor>(tdc);
+              t.src_alpha = static_cast<graphics::BlendFactor>(tsa), t.dst_alpha = static_cast<graphics::BlendFactor>(tda);
+              t.color_op = static_cast<graphics::BlendOp>(tcop), t.alpha_op = static_cast<graphics::BlendOp>(taop);
+              t.write_mask = static_cast<uint8_t>(tmask);
+            }
+          }
         }
       }
       if (!in.ok() || !in.at_end() || cull > 2 || front > 1 || compare > 7 || fail > 7 || depth_fail > 7 || pass > 7 || compare_mask > 255 || write_mask > 255 || reference > 255 || enable > 1)

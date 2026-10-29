@@ -334,6 +334,10 @@ struct GraphicsPipelineDesc {
   StencilState stencil;
   BlendState blend;                                   // kFeatureBlendState
   CompareOp depth_compare = CompareOp::LessEqual;     // kFeatureBlendState: what depth_test compares with (a device without it always uses LessEqual)
+  // kFeatureIndependentBlend: with independent_blend, colour target 0 uses `blend` (or alpha_blend) and target n (1..3) uses target_blend[n - 1], which is taken as it is (custom or
+  // not: a state that is not custom means no blending and every channel written). Without it every target uses `blend`.
+  bool independent_blend = false;
+  BlendState target_blend[kMaxColorTargets - 1];
   uint32_t color_target_count = 1;                    // kFeatureMultipleTargets: how many colour outputs the fragment shader writes (the render pass must have at least as many images); blend state applies to each
 };
 
@@ -423,6 +427,7 @@ enum DeviceFeature : uint32_t {
   kFeatureInstancing = 1u << 3,    // draw(..., instance_count, first_instance) and VertexAttribute::per_instance
   kFeatureLines = 1u << 4,         // set_primitive_topology: lines and points
   kFeatureFloatFormats = 1u << 6,      // Format::R16G16B16A16Float / R32G32B32A32Float images: colour attachments (also several at once) and sampled textures, without mipmaps; read_pixels_float / write_pixels_float
+  kFeatureIndependentBlend = 1u << 9,  // GraphicsPipelineDesc::independent_blend / target_blend
   kFeatureTextureKinds = 1u << 8,      // ImageDesc::kind other than Texture2D, layer_count / write_layer_pixels / read_layer_pixels, ITextureSet::sample_volume
   kFeatureOcclusionQueries = 1u << 7,  // ICommandBuffer::begin_occlusion_query / end_occlusion_query / occlusion_result
   kFeatureMultipleTargets = 1u << 5,   // RenderPassBegin::extra_colors and GraphicsPipelineDesc::color_target_count

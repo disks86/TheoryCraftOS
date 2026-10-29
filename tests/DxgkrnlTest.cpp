@@ -3655,6 +3655,49 @@ void test_texture_kinds() {
   CHECK(kernel.create_shader(kPid, dev, sp, &refused) == status::kNotSupported);
 }
 
+void test_independent_blend() {
+  Env e;
+  Handle pipe = 0;
+  auto make = [&](Env& env, bool independent, uint32_t factor, Handle* out) {
+    Handle vs = 0, fs = 0;
+    CHECK(env.kernel.create_shader(kPid, env.dev, {ShaderKind::ColoredVertex, graphics::ShaderStage::Vertex, {}}, &vs) == status::kSuccess);
+    CHECK(env.kernel.create_shader(kPid, env.dev, {ShaderKind::ColoredFragment, graphics::ShaderStage::Fragment, {}}, &fs) == status::kSuccess);
+    graphics::GraphicsPipelineDesc gd;
+    graphics::describe_colored_pipeline(&gd);
+    PipelineDesc pd;
+    pd.vertex_shader = vs, pd.fragment_shader = fs, pd.vertex_stride = gd.vertex_stride, pd.attribute_count = 2, pd.varying_count = 1;
+    pd.attributes[0] = gd.attributes[0], pd.attributes[1] = gd.attributes[1];
+    pd.independent_blend = independent;
+    pd.target_blend[1].custom = true;
+    pd.target_blend[1].src_color = static_cast<graphics::BlendFactor>(factor);
+    return env.kernel.create_pipeline(kPid, env.dev, pd, out);
+  };
+  CHECK(make(e, true, 1, &pipe) == status::kSuccess && make(e, false, 1, &pipe) == status::kSuccess);
+  CHECK(make(e, true, 11, &pipe) == status::kInvalidParameter);   // (a factor that does not exist, in a state of a target)
+  // A device without the feature refuses it (but takes the same pipeline without independent blending).
+  FakeScreen screen(8, 6);
+  graphics::SoftwareDevice software(e.allocator, &screen);
+  SpyDevice limited(software);
+  limited.feature_mask = 0;
+  Kernel kernel(e.allocator);
+  AdapterConfig c;
+  c.display = &screen;
+  kernel.add_adapter(limited, c);
+  Handle adapter = 0, dev = 0, vs = 0, fs = 0;
+  CHECK(kernel.open_process(kPid) == status::kSuccess && kernel.open_adapter_from_index(kPid, 0, &adapter) == status::kSuccess && kernel.create_device(kPid, adapter, &dev) == status::kSuccess);
+  CHECK(kernel.create_shader(kPid, dev, {ShaderKind::ColoredVertex, graphics::ShaderStage::Vertex, {}}, &vs) == status::kSuccess);
+  CHECK(kernel.create_shader(kPid, dev, {ShaderKind::ColoredFragment, graphics::ShaderStage::Fragment, {}}, &fs) == status::kSuccess);
+  graphics::GraphicsPipelineDesc gd;
+  graphics::describe_colored_pipeline(&gd);
+  PipelineDesc pd;
+  pd.vertex_shader = vs, pd.fragment_shader = fs, pd.vertex_stride = gd.vertex_stride, pd.attribute_count = 2, pd.varying_count = 1;
+  pd.attributes[0] = gd.attributes[0], pd.attributes[1] = gd.attributes[1];
+  Handle out = 0;
+  CHECK(kernel.create_pipeline(kPid, dev, pd, &out) == status::kSuccess);
+  pd.independent_blend = true;
+  CHECK(kernel.create_pipeline(kPid, dev, pd, &out) == status::kNotSupported);
+}
+
 void test_conformance() {
   test_half_floats();
   HostAllocator allocator;
@@ -3695,6 +3738,19 @@ void test_conformance() {
       if (__builtin_strstr(r.name, "texture array")) CHECK(px(2, 0) == 0x402000 && px(12, 0) == 0x004020 && px(22, 0) == 0x200040);   // layers 0, 1, 2
       if (__builtin_strstr(r.name, "cube texture"))
         CHECK(px(2, 16) == 0xfa0000 && px(12, 16) == 0x006464 && px(22, 16) == 0x004000 && px(2, 0) == 0x640064 && px(12, 0) == 0x000064 && px(22, 0) == 0xfafa00);   // +X -X +Y, -Y +Z -Z
+    }
+    if (__builtin_strstr(r.name, "independent blend")) {
+      // In the overlap target 0 (even columns) holds both triangles added to the grey (red 0.1 + 0.5 + 0.1 ~ 0xb4), target 1 (odd ones) the second triangle alone, red and blue
+      // swapped (0.3, 0.4, 0.1 ~ 4d 66 1a); where only the first triangle is, target 0 shows 9a 34 34 and target 1 its swap.
+      auto near = [](uint32_t a, uint32_t b) {
+        for (uint32_t shift = 0; shift < 24; shift += 8) {
+          const int32_t d = static_cast<int32_t>((a >> shift) & 0xFF) - static_cast<int32_t>((b >> shift) & 0xFF);
+          if (d > 3 || d < -3) return false;
+        }
+        return true;
+      };
+      CHECK(near(r.device_picture[16 * 32 + 12] & 0xFFFFFF, 0xb49a81) && near(r.device_picture[16 * 32 + 13] & 0xFFFFFF, 0x4d661a));
+      CHECK(near(r.device_picture[28 * 32 + 8] & 0xFFFFFF, 0x9a3434) && near(r.device_picture[28 * 32 + 9] & 0xFFFFFF, 0x1a1a80));
     }
     if (__builtin_strstr(r.name, "occlusion queries")) {
       // The stripes: all 256 pixels of the open quad (red 255), half of them for the one half behind the near quad (about 128), none for the one wholly behind it.
@@ -4801,6 +4857,7 @@ int main() {
   test_conformance();
   test_occlusion_queries();
   test_texture_kinds();
+  test_independent_blend();
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);
     return 1;

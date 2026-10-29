@@ -365,28 +365,31 @@ class VirglPipeline final : public IPipeline {
     uint32_t cmd[64];
     uint32_t n = 0;
 
-    // Blend state: one render target; source-over blending (alpha_blend) or the pipeline's own state (kFeatureBlendState).
-    const BlendState& bs = desc.blend;
-    uint32_t blend_rt = 0xFu << 27;
-    if (bs.custom) {
+    // Blend state: source-over blending (alpha_blend) or the pipeline's own state (kFeatureBlendState); with independent blending each target has a state of its own, else target 0's
+    // serves them all.
+    auto render_target_blend = [](const BlendState& bs) {
       // (min and max take no factors: Gallium wants ONE for them)
       const bool color_minmax = bs.color_op == BlendOp::Min || bs.color_op == BlendOp::Max, alpha_minmax = bs.alpha_op == BlendOp::Min || bs.alpha_op == BlendOp::Max;
       const uint32_t color_src = color_minmax ? virgl::kBlendFactorOne : virgl::kBlendFactors[static_cast<uint32_t>(bs.src_color)];
       const uint32_t color_dst = color_minmax ? virgl::kBlendFactorOne : virgl::kBlendFactors[static_cast<uint32_t>(bs.dst_color)];
       const uint32_t alpha_src = alpha_minmax ? virgl::kBlendFactorOne : virgl::kBlendFactors[static_cast<uint32_t>(bs.src_alpha)];
       const uint32_t alpha_dst = alpha_minmax ? virgl::kBlendFactorOne : virgl::kBlendFactors[static_cast<uint32_t>(bs.dst_alpha)];
-      blend_rt = (bs.enable ? 1u : 0u) | (static_cast<uint32_t>(bs.color_op) << 1) | (color_src << 4) | (color_dst << 9) | (static_cast<uint32_t>(bs.alpha_op) << 14) | (alpha_src << 17) |
-                 (alpha_dst << 22) | (static_cast<uint32_t>(bs.write_mask & 0xF) << 27);
+      return (bs.enable ? 1u : 0u) | (static_cast<uint32_t>(bs.color_op) << 1) | (color_src << 4) | (color_dst << 9) | (static_cast<uint32_t>(bs.alpha_op) << 14) | (alpha_src << 17) |
+             (alpha_dst << 22) | (static_cast<uint32_t>(bs.write_mask & 0xF) << 27);
+    };
+    uint32_t blend_rt = 0xFu << 27;
+    if (desc.blend.custom) {
+      blend_rt = render_target_blend(desc.blend);
     } else if (desc.alpha_blend) {
       blend_rt = 1u | (virgl::kBlendAdd << 1) | (virgl::kBlendFactorSrcAlpha << 4) | (virgl::kBlendFactorInvSrcAlpha << 9) | (virgl::kBlendAdd << 14) | (virgl::kBlendFactorOne << 17) |
                  (virgl::kBlendFactorInvSrcAlpha << 22) | (0xFu << 27);
     }
     cmd[n++] = virgl::header(virgl::kCreateObject, virgl::kObjectBlend, 11);
     cmd[n++] = blend_;
-    cmd[n++] = 0;  // s0: no independent blend, logic op, dither...
+    cmd[n++] = desc.independent_blend ? 1u : 0u;  // s0: independent blend enable (no logic op, dither...)
     cmd[n++] = 0;  // s1
     cmd[n++] = blend_rt;
-    for (int i = 1; i < 8; ++i) cmd[n++] = 0;
+    for (uint32_t i = 1; i < 8; ++i) cmd[n++] = desc.independent_blend && i < kMaxColorTargets ? (desc.target_blend[i - 1].custom ? render_target_blend(desc.target_blend[i - 1]) : 0xFu << 27) : 0u;
 
     // Depth and stencil (the same stencil state for both faces).
     const uint32_t depth_func = desc.depth_test ? static_cast<uint32_t>(desc.depth_compare) : virgl::kFuncAlways;   // (CompareOp is numbered as PIPE_FUNC)
