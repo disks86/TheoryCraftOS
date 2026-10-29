@@ -77,6 +77,7 @@ class Allocation {
   graphics::IBuffer* buffer_ = nullptr;
   uint64_t device_bytes_ = 0;    // what residency costs
   bool device_stale_ = true;     // the device object (if any) lacks the backing's current contents
+  bool cpu_written_ = false;     // something other than the GPU wrote the backing since creation (a device that cannot take pixels may skip the upload of an allocation nobody wrote)
   bool gpu_newer_ = false;       // the device object holds contents the backing lacks
   uint32_t lock_count_ = 0;
   uint32_t pin_count_ = 0;

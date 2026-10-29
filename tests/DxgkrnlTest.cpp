@@ -28,6 +28,7 @@
 #include <vector>
 #include "Graphics/Graphics3D/BuiltinShaders.hpp"
 #include "Graphics/Graphics3D/Software/SoftwareDevice.hpp"
+#include "Kernel/Dxgkrnl/Conformance.hpp"
 #include "Kernel/Dxgkrnl/CommandStream.hpp"
 #include "Kernel/Dxgkrnl/DxgKernel.hpp"
 #include "Utility/ByteStream.hpp"
@@ -1311,9 +1312,19 @@ struct TexSet final : graphics::ITextureSet {
   }
 };
 
+// (the instructions that read their registers as integers: a source's - and || are integer ones for them)
+bool tgsi_integer_op(const std::string& op) {
+  static const char* const kOps[] = {"UCMP", "USEQ", "USNE", "ISLT", "ISGE", "USLT", "USGE", "UADD", "INEG", "UMUL", "UMAD", "IMIN", "IMAX", "UMIN", "UMAX", "UDIV", "UMOD", "AND", "OR", "XOR", "NOT",
+                                     "I2F", "U2F", "SHL", "ISHR", "USHR"};
+  for (const char* o : kOps)
+    if (op == o) return true;
+  return false;
+}
+bool tgsi_if(const std::string& op) { return op == "IF" || op == "UIF"; }
+
 class TgsiMachine {
  public:
-  float temp[64][4] = {}, in[16][4] = {}, out[16][4] = {}, cst[4100][4] = {}, imm[64][4] = {};
+  float temp[64][4] = {}, in[32][4] = {}, out[16][4] = {}, cst[4100][4] = {}, imm[64][4] = {}, sv[4][4] = {};   // (sv: VERTEXID, INSTANCEID)
   int addr = 0;
   bool killed = false;
   const graphics::ITextureSet* textures = nullptr;
@@ -1335,9 +1346,11 @@ class TgsiMachine {
         const char* p = strchr(l.c_str(), '{');
         if (!p || i >= 64) return false;
         ++p;
+        const bool bits = l.find("UINT32") != std::string::npos;   // (an integer literal, in decimal: the register holds its bits)
         for (int k = 0; k < 4; ++k) {
           char* e = nullptr;
-          imm[i][k] = strtof(p, &e);
+          if (bits) imm[i][k] = __builtin_bit_cast(float, static_cast<uint32_t>(strtoul(p, &e, 10)));
+          else imm[i][k] = strtof(p, &e);
           if (e == p) return false;
           p = e;
           while (*p == ',' || *p == ' ') ++p;
@@ -1350,7 +1363,7 @@ class TgsiMachine {
     std::vector<size_t> else_of(body.size(), 0), end_of(body.size(), 0), stack;
     for (size_t i = 0; i < body.size(); ++i) {
       const std::string op = body[i].substr(0, body[i].find(' '));
-      if (op == "IF") stack.push_back(i);
+      if (tgsi_if(op)) stack.push_back(i);
       else if (op == "ELSE") {
         if (stack.empty()) return false;
         else_of[stack.back()] = i;
@@ -1389,7 +1402,7 @@ class TgsiMachine {
         int depth = 0;
         for (; e < body.size(); ++e) {
           const std::string o = body[e].substr(0, body[e].find(' '));
-          if (o == "IF") ++depth;
+          if (tgsi_if(o)) ++depth;
           if (o == "ENDIF") {
             if (!depth) break;
             --depth;
@@ -1429,15 +1442,15 @@ class TgsiMachine {
         }
         continue;
       }
-      if (op == "IF") {
+      if (tgsi_if(op)) {
         float c[4];
-        if (!fetch(args.at(0), c)) return false;
-        if (c[0] == 0) {   // to after the ELSE or the ENDIF
+        if (!fetch(args.at(0), c, op == "UIF")) return false;
+        if (op == "UIF" ? __builtin_bit_cast(uint32_t, c[0]) == 0 : c[0] == 0) {   // to after the ELSE or the ENDIF
           size_t e = pc;
           int depth = 0;
           for (; e < body.size(); ++e) {
             const std::string o = body[e].substr(0, body[e].find(' '));
-            if (o == "IF") ++depth;
+            if (tgsi_if(o)) ++depth;
             else if ((o == "ELSE" || o == "ENDIF") && !depth) break;
             else if (o == "ENDIF") --depth;
           }
@@ -1445,7 +1458,7 @@ class TgsiMachine {
         }
         continue;
       }
-      if (!execute(op, args)) return false;
+      if (!execute(op, args)) { if (getenv("TGSI_TRACE")) printf("  TGSI machine cannot run: %s\n", l.c_str()); return false; }
     }
     return true;
   }
@@ -1495,13 +1508,14 @@ class TgsiMachine {
     static float zero[4];
     zero[0] = zero[1] = zero[2] = zero[3] = 0;
     if (r.file == "TEMP") return index >= 0 && index < 64 ? temp[index] : nullptr;
-    if (r.file == "IN") return index >= 0 && index < 16 ? in[index] : nullptr;
+    if (r.file == "IN") return index >= 0 && index < 32 ? in[index] : nullptr;
+    if (r.file == "SV") return index >= 0 && index < 4 ? sv[index] : nullptr;
     if (r.file == "OUT") return index >= 0 && index < 16 ? out[index] : nullptr;
     if (r.file == "IMM") return index >= 0 && index < 64 ? imm[index] : nullptr;
     if (r.file == "CONST") return index >= 0 && index < 4100 ? cst[index] : zero;
     return nullptr;
   }
-  bool fetch(const std::string& text, float v[4]) {
+  bool fetch(const std::string& text, float v[4], bool integer = false) {
     Ref r;
     if (!parse(text, &r)) return false;
     const float* p = reg(r);
@@ -1513,6 +1527,13 @@ class TgsiMachine {
         ch = static_cast<int>(strchr("xyzw", r.swz[i]) - "xyzw");
       }
       v[i] = p[ch];
+      if (integer) {
+        int32_t x = __builtin_bit_cast(int32_t, v[i]);
+        if (r.abs && x < 0) x = static_cast<int32_t>(0u - static_cast<uint32_t>(x));
+        if (r.neg) x = static_cast<int32_t>(0u - static_cast<uint32_t>(x));
+        v[i] = __builtin_bit_cast(float, x);
+        continue;
+      }
       if (r.abs) v[i] = fabsf(v[i]);
       if (r.neg) v[i] = -v[i];
     }
@@ -1534,9 +1555,13 @@ class TgsiMachine {
   bool execute(const std::string& op, const std::vector<std::string>& args) {
     float a[4] = {}, b[4] = {}, c[4] = {}, r[4] = {};
     auto need = [&](size_t n) { return args.size() >= n; };
-    if (op == "ARL" || op == "ARR") {
+    if (op == "ARL" || op == "ARR" || op == "UARL") {
       if (!need(2) || !fetch(args[1], a)) return false;
-      addr = static_cast<int>(floorf(op == "ARR" ? a[0] + 0.5f : a[0]));
+      addr = op == "UARL" ? static_cast<int>(__builtin_bit_cast(uint32_t, a[0])) : static_cast<int>(floorf(op == "ARR" ? a[0] + 0.5f : a[0]));
+      return true;
+    }
+    if (op == "KILL") {
+      killed = true;
       return true;
     }
     if (op == "KILL_IF") {
@@ -1544,9 +1569,11 @@ class TgsiMachine {
       for (float x : a) killed = killed || x < 0;
       return true;
     }
-    if (!need(2) || !fetch(args[1], a)) return false;
-    if (args.size() > 2 && op != "TEX" && op != "TXP" && !fetch(args[2], b)) return false;
-    if (args.size() > 3 && op != "TEX" && op != "TXP" && !fetch(args[3], c)) return false;
+    const bool integer = tgsi_integer_op(op), is_tex = op == "TEX" || op == "TXP" || op == "TXF" || op == "TXL" || op == "TXQ";
+    const bool data_integer = integer && op != "UCMP";   // (UCMP's condition is an integer, what it selects is data)
+    if (!need(2) || !fetch(args[1], a, integer)) return false;
+    if (args.size() > 2 && !is_tex && !fetch(args[2], b, data_integer)) return false;
+    if (args.size() > 3 && !is_tex && !fetch(args[3], c, data_integer)) return false;
     const bool scalar = op == "RCP" || op == "RSQ" || op == "EX2" || op == "LG2" || op == "COS" || op == "SIN";
     for (int i = 0; i < 4; ++i) {
       if (op == "MOV") r[i] = a[i];
@@ -1583,9 +1610,60 @@ class TgsiMachine {
       else if (op == "FLR") r[i] = floorf(a[i]);
       else if (op == "TRUNC") r[i] = truncf(a[i]);
       else if (op == "ROUND") r[i] = nearbyintf(a[i]);
-      else if (op != "TEX" && op != "TXP") return false;
+      else if (integer) {
+        const uint32_t ua = __builtin_bit_cast(uint32_t, a[i]), ub = __builtin_bit_cast(uint32_t, b[i]), uc = __builtin_bit_cast(uint32_t, c[i]);
+        const int32_t ia = static_cast<int32_t>(ua), ib = static_cast<int32_t>(ub);
+        uint32_t u = 0;
+        bool as_float = false;
+        float f = 0;
+        if (op == "UCMP") u = ua != 0 ? ub : uc;
+        else if (op == "USEQ") u = ua == ub ? ~0u : 0u;
+        else if (op == "USNE") u = ua != ub ? ~0u : 0u;
+        else if (op == "ISLT") u = ia < ib ? ~0u : 0u;
+        else if (op == "ISGE") u = ia >= ib ? ~0u : 0u;
+        else if (op == "USLT") u = ua < ub ? ~0u : 0u;
+        else if (op == "USGE") u = ua >= ub ? ~0u : 0u;
+        else if (op == "UADD") u = ua + ub;
+        else if (op == "INEG") u = 0u - ua;
+        else if (op == "UMUL") u = ua * ub;
+        else if (op == "UMAD") u = ua * ub + uc;
+        else if (op == "IMIN") u = static_cast<uint32_t>(ia < ib ? ia : ib);
+        else if (op == "IMAX") u = static_cast<uint32_t>(ia > ib ? ia : ib);
+        else if (op == "UMIN") u = ua < ub ? ua : ub;
+        else if (op == "UMAX") u = ua > ub ? ua : ub;
+        else if (op == "UDIV") u = ub ? ua / ub : ~0u;
+        else if (op == "UMOD") u = ub ? ua % ub : ~0u;
+        else if (op == "AND") u = ua & ub;
+        else if (op == "OR") u = ua | ub;
+        else if (op == "XOR") u = ua ^ ub;
+        else if (op == "NOT") u = ~ua;
+        else if (op == "SHL") u = ua << (ub & 31);
+        else if (op == "ISHR") u = static_cast<uint32_t>(ia >> (ub & 31));
+        else if (op == "USHR") u = ua >> (ub & 31);
+        else if (op == "I2F") as_float = true, f = static_cast<float>(ia);
+        else if (op == "U2F") as_float = true, f = static_cast<float>(ua);
+        else return false;
+        r[i] = as_float ? f : __builtin_bit_cast(float, u);
+      } else if (op == "F2I") {
+        r[i] = __builtin_bit_cast(float, static_cast<uint32_t>(static_cast<int32_t>(a[i])));
+      } else if (op == "F2U") {
+        r[i] = __builtin_bit_cast(float, a[i] <= 0 ? 0u : static_cast<uint32_t>(a[i]));
+      } else if (!is_tex) return false;
     }
     (void)scalar;
+    if (op == "TXF" || op == "TXL" || op == "TXQ") {
+      if (!need(4) || !textures) return false;
+      const unsigned unit = static_cast<unsigned>(atoi(args[2].c_str() + 5));
+      graphics::Vec4 t = {0, 0, 0, 0};
+      if (op == "TXF") t = textures->fetch(unit, __builtin_bit_cast(int32_t, a[0]), __builtin_bit_cast(int32_t, a[1]), __builtin_bit_cast(uint32_t, a[3]));
+      else if (op == "TXL") t = textures->sample_lod(unit, a[0], a[1], a[3]);
+      else {
+        uint32_t w = 0, h = 0, levels = 0;
+        if (!textures->size(unit, __builtin_bit_cast(uint32_t, a[0]), &w, &h, &levels)) return false;
+        t = {__builtin_bit_cast(float, w), __builtin_bit_cast(float, h), 0.0f, __builtin_bit_cast(float, levels)};
+      }
+      r[0] = t.x, r[1] = t.y, r[2] = t.z, r[3] = t.w;
+    }
     if (op == "TEX" || op == "TXP") {
       if (!need(4) || !textures) return false;
       const unsigned unit = static_cast<unsigned>(atoi(args[2].c_str() + 5));
@@ -3297,6 +3375,54 @@ void test_ps1() {
 }
 
 // The device suite (tests/DxgkrnlDeviceSuite.hpp) on the software device itself and on a device that passes everything through: the baseline of what other devices are held to.
+// --- The conformance scenes ---------------------------------------------------------------------------------------------------------------------------------------------
+
+struct ConformanceLog {
+  unsigned same = 0, differs = 0, refused = 0, broken = 0;
+  bool print_each = false;
+};
+
+void test_conformance() {
+  HostAllocator allocator;
+  FakeScreen screen(8, 6);
+  graphics::SoftwareDevice device(allocator, &screen), reference(allocator, &screen);
+  Kernel kernel(allocator);
+  AdapterConfig c;
+  c.display = &screen;
+  CHECK(kernel.add_adapter(device, c) == 0 && kernel.add_adapter(reference, c) == 1);
+  ConformanceLog log;
+  const uint32_t bad = run_conformance(allocator, kernel, 0, 1, [](void* context, const SceneResult& r) {
+    ConformanceLog& l = *static_cast<ConformanceLog*>(context);
+    switch (r.verdict) {
+      case SceneVerdict::Same: ++l.same; break;
+      case SceneVerdict::Differs: ++l.differs; printf("  conformance: %s differs in %u pixels\n", r.name, r.bad_pixels); break;
+      case SceneVerdict::Refused: ++l.refused; printf("  conformance: %s refused at %s\n", r.name, r.step); break;
+      case SceneVerdict::Broken: ++l.broken; printf("  conformance: %s broken at %s: %x\n", r.name, r.step, static_cast<unsigned>(r.status)); break;
+    }
+    CHECK(r.device_picture && r.reference_picture && !r.reference_failed);
+  }, &log);
+  // The software renderer takes every scene, and draws the same picture as itself.
+  CHECK(bad == 0 && log.differs == 0 && log.broken == 0 && log.refused == 0 && log.same >= 20);
+  printf("  conformance: %u scenes, all the same on two software adapters\n", log.same);
+
+  // A device that is told it has no blend state, instancing or lines refuses those scenes (honestly: kNotSupported), and the others still pass.
+  FakeScreen screen2(8, 6);
+  graphics::SoftwareDevice inner(allocator, &screen2);
+  SpyDevice plain(inner);
+  plain.feature_mask = 0;
+  Kernel limited(allocator);
+  AdapterConfig c2;
+  c2.display = &screen2;
+  CHECK(limited.add_adapter(plain, c2) == 0 && limited.add_adapter(reference, c2) == 1);
+  ConformanceLog log2;
+  const uint32_t bad2 = run_conformance(allocator, limited, 0, 1, [](void* context, const SceneResult& r) {
+    ConformanceLog& l = *static_cast<ConformanceLog*>(context);
+    r.verdict == SceneVerdict::Same ? ++l.same : r.verdict == SceneVerdict::Refused ? ++l.refused : r.verdict == SceneVerdict::Differs ? ++l.differs : ++l.broken;
+  }, &log2);
+  CHECK(bad2 == 0 && log2.refused >= 4 && log2.same >= 14);
+  printf("  conformance: a device without the Direct3D 10 features refuses %u scenes and draws %u\n", log2.refused, log2.same);
+}
+
 void test_device_suite() {
   HostAllocator allocator;
   {
@@ -3358,11 +3484,11 @@ void test_dxbc_constant_buffers() {
         CHECK(ok);
       }
     }
-    // The program as TGSI: not expressible (the register is an integer), and a device that is given 128 bytes cannot run a program that reads 256.
+    // The program as TGSI (the integer register becomes the address register); a device that is given 128 bytes cannot run a program that reads 256.
     {
       UniquePointer<D3d9Program> p = program_for(2);
       String text(allocator);
-      CHECK(p && p->emit_tgsi(&text) == status::kNotSupported);
+      CHECK(p && p->emit_tgsi(&text) == status::kSuccess);   // (UARL: the integer register is the address)
     }
     // The immediate constant buffer.
     {
@@ -3531,9 +3657,9 @@ void test_dxbc_integers() {
                  __builtin_bit_cast(uint32_t, got_f[2]), __builtin_bit_cast(uint32_t, got_f[3]));
           ++wrong;
         }
-        // (not expressible in TGSI text or Direct3D 9 tokens)
+        // (TGSI text has the instructions; the Direct3D 9 tokens do not - run_ex / the machine compare in the loop and system value tests below)
         String text(allocator);
-        CHECK(p->emit_tgsi(&text) == status::kNotSupported);
+        CHECK(p->emit_tgsi(&text) == status::kSuccess);
         ++compared;
       }
     printf("  dxbc integers: %u programs, %u wrong\n", compared, wrong);
@@ -3663,7 +3789,7 @@ void test_dxbc_loops() {
       bool tgsi_ok = true;
       run(a, &c, &tgsi_ok, true);
       CHECK(__builtin_bit_cast(uint32_t, c.x) == 5 && c.y == 4 * 1.5f);   // (the counter is 5; the pass of 3 added nothing)
-      CHECK(!tgsi_ok);   // (integer instructions are not TGSI text)
+      CHECK(tgsi_ok);   // (the TGSI text of the integer loop agrees with the interpreter)
     }
     // Floats only: a loop TGSI text can say. Count to 4 in steps of 1.0, 0.5 more each time round; a nested loop and an if with a break inside it.
     {
@@ -4149,6 +4275,118 @@ void test_dxbc_system_values() {
     CHECK(red_by_band[0] <= 2 && close8(red_by_band[1], 26, 2) && close8(red_by_band[2], 51, 2));
   }
 
+  // The TGSI text of the same shaders (what virgl gets): the vertex shader with SV_VertexID / SV_InstanceID and integer arithmetic, and the pixel shader with Load, SampleLevel,
+  // GetDimensions, SV_Position and SV_IsFrontFace, run by the TGSI machine against the interpreter; SV_PrimitiveID has no TGSI form that virglrenderer's GLSL takes.
+  {
+    struct TexelSet final : graphics::ITextureSet {
+      graphics::Vec4 sample(uint32_t unit, float u, float v) const override { return {u, v, 0.25f + 0.1f * static_cast<float>(unit), 1.0f}; }
+      graphics::Vec4 sample_lod(uint32_t unit, float u, float v, float lod) const override { return {u * 0.5f, v * 0.5f, lod * 0.125f, 0.5f + 0.1f * static_cast<float>(unit)}; }
+      graphics::Vec4 fetch(uint32_t unit, int32_t x, int32_t y, uint32_t level) const override { return {x * 0.0625f, y * 0.125f, static_cast<float>(level) * 0.25f, 0.75f + static_cast<float>(unit) * 0.0625f}; }
+      bool size(uint32_t unit, uint32_t level, uint32_t* width, uint32_t* height, uint32_t* levels) const override {
+        (void)unit;
+        *width = 8u >> level, *height = 4u >> level, *levels = 3;
+        return level < 3;
+      }
+    };
+    HostAllocator allocator;
+    NtStatus st = 0;
+    UniquePointer<D3d9Program> vsp = compile_dxbc(allocator, vs_blob, &st);
+    CHECK(vsp && st == status::kSuccess);
+    String text(allocator);
+    CHECK(vsp->emit_tgsi(&text) == status::kSuccess);
+    const std::string vs_text(text.data(), text.size());
+    CHECK(vs_text.find("DCL SV[0], VERTEXID") != std::string::npos && vs_text.find("DCL SV[1], INSTANCEID") != std::string::npos);
+    unsigned vertex_cases = 0;
+    for (uint32_t vertex_id = 0; vertex_id < 4; ++vertex_id)
+      for (uint32_t instance_id = 0; instance_id < 5; ++instance_id) {
+        graphics::Vec4 attributes[4] = {{0.1f * static_cast<float>(vertex_id), -0.3f, 0.5f, 1}, {0.25f, -0.5f, 0, 0}, {}, {}};
+        graphics::VertexContext context;
+        context.vertex_id = vertex_id, context.instance_id = instance_id;
+        graphics::ShaderIo io = {};
+        uint8_t constants[128] = {};
+        vsp->run_vertex_ex(attributes, constants, context, &io);
+        TgsiMachine m;
+        for (unsigned i = 0; i < 2; ++i) m.in[i][0] = attributes[i].x, m.in[i][1] = attributes[i].y, m.in[i][2] = attributes[i].z, m.in[i][3] = attributes[i].w;
+        m.sv[0][0] = __builtin_bit_cast(float, vertex_id), m.sv[1][0] = __builtin_bit_cast(float, instance_id);
+        CHECK(m.run(vs_text));
+        CHECK(near_value(m.out[0][0], io.position.x) && near_value(m.out[0][1], io.position.y) && near_value(m.out[0][2], io.position.z) && near_value(m.out[0][3], io.position.w));
+        CHECK(near_value(m.out[1][0], io.varying[0].x) && near_value(m.out[1][1], io.varying[0].y) && near_value(m.out[1][2], io.varying[0].z) && near_value(m.out[1][3], io.varying[0].w));
+        ++vertex_cases;
+      }
+    CHECK(vertex_cases == 20);
+
+    const std::vector<uint8_t> system_blob = read_blob("ps_system.dxbc");
+    UniquePointer<D3d9Program> psp = compile_dxbc(allocator, system_blob, &st);
+    CHECK(psp && st == status::kSuccess);
+    String ps_string(allocator);
+    CHECK(psp->emit_tgsi(&ps_string) == status::kSuccess);
+    const std::string ps_text(ps_string.data(), ps_string.size());
+    CHECK(ps_text.find("TXF") != std::string::npos && ps_text.find("TXL") != std::string::npos && ps_text.find("TXQ") != std::string::npos);
+    CHECK(ps_text.find("DCL IN[16], POSITION") != std::string::npos && ps_text.find("DCL IN[17], FACE") != std::string::npos);
+    TexelSet texels;
+    unsigned pixel_cases = 0;
+    for (bool front : {true, false})
+      for (float x : {0.5f, 5.5f, 17.5f})
+        for (float uv : {0.0f, 0.3f, 0.9f}) {
+          graphics::Vec4 varyings[4] = {};
+          varyings[2] = {uv, 1.0f - uv, 0, 0};
+          graphics::FragmentContext context;
+          context.position = {x, 9.5f, 0.25f, 0.8f};
+          context.front_facing = front;
+          graphics::Vec4 color = {};
+          uint8_t constants[128] = {};
+          const bool alive = psp->run_fragment_ex(varyings, context, constants, &texels, &color);
+          TgsiMachine m;
+          m.textures = &texels;
+          m.in[2][0] = varyings[2].x, m.in[2][1] = varyings[2].y;
+          m.in[16][0] = context.position.x, m.in[16][1] = context.position.y, m.in[16][2] = context.position.z, m.in[16][3] = context.position.w;
+          m.in[17][0] = front ? 1.0f : -1.0f;
+          CHECK(m.run(ps_text) && alive && !m.killed);
+          CHECK(near_value(m.out[0][0], color.x) && near_value(m.out[0][1], color.y) && near_value(m.out[0][2], color.z) && near_value(m.out[0][3], color.w));
+          ++pixel_cases;
+        }
+    CHECK(pixel_cases == 18);
+
+    // A constant buffer of 64 registers, indexed by an integer register: the TGSI text reads the same registers through the address register.
+    {
+      const std::vector<uint8_t> cbuf_blob = read_blob("ps_cbuf.dxbc");
+      UniquePointer<D3d9Program> cp = compile_dxbc(allocator, cbuf_blob, &st);
+      CHECK(cp && st == status::kSuccess);
+      String cstr(allocator);
+      CHECK(cp->emit_tgsi(&cstr) == status::kSuccess);
+      const std::string ctext(cstr.data(), cstr.size());
+      CHECK(ctext.find("UARL") != std::string::npos && ctext.find("DCL CONST[0..63]") != std::string::npos);
+      uint8_t constants[64 * 16];
+      TgsiMachine base;
+      for (unsigned j = 0; j < 64; ++j) {
+        const float row[4] = {j / 64.0f, 1.0f - j / 64.0f, static_cast<float>(j & 1), 0.25f};
+        memcpy(constants + j * 16, row, 16);
+        for (unsigned k = 0; k < 4; ++k) base.cst[j][k] = row[k];
+      }
+      unsigned cases = 0;
+      for (float x : {0.0f, 0.2f, 0.55f, 0.99f})
+        for (float y : {0.0f, 0.4f, 0.97f}) {
+          graphics::Vec4 varyings[4] = {};
+          varyings[0] = {0.5f, 0.25f, 0.75f, 1.0f};
+          varyings[2] = {x, y, 0, 0};
+          graphics::Vec4 color = {};
+          CHECK(cp->run_fragment_ex(varyings, graphics::FragmentContext(), constants, nullptr, &color));
+          TgsiMachine m = base;
+          m.in[0][0] = 0.5f, m.in[0][1] = 0.25f, m.in[0][2] = 0.75f, m.in[0][3] = 1.0f;
+          m.in[2][0] = x, m.in[2][1] = y;
+          CHECK(m.run(ctext));
+          CHECK(near_value(m.out[0][0], color.x) && near_value(m.out[0][1], color.y) && near_value(m.out[0][2], color.z) && near_value(m.out[0][3], color.w));
+          ++cases;
+        }
+      CHECK(cases == 12);
+    }
+
+    UniquePointer<D3d9Program> with_primitive = compile_dxbc(allocator, ps_blob, &st);
+    CHECK(with_primitive && st == status::kSuccess);
+    String refused(allocator);
+    CHECK(with_primitive->emit_tgsi(&refused) == status::kNotSupported);
+  }
+
   // A device without system values or texel access does not get these shaders (they would read zeros).
   {
     FakeScreen screen(8, 6);
@@ -4240,6 +4478,7 @@ int main() {
   test_sm3_and_sm51();
   test_ps1();
   test_device_suite();
+  test_conformance();
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);
     return 1;

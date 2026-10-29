@@ -444,6 +444,7 @@ add_executable(BOOTX64
   src/Kernel/Dxgkrnl/D3d9Dxbc.cpp
   src/Kernel/Dxgkrnl/D3d9Ps1.cpp
   src/Kernel/Dxgkrnl/SelfTest.cpp
+  src/Kernel/Dxgkrnl/Conformance.cpp
   src/Kernel/Dxgkrnl/D3d9Devices.cpp
   src/Kernel/Dxgkrnl/D3d9Emit.cpp
   src/Kernel/Dxgkrnl/Adapter.cpp

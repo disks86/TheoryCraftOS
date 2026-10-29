@@ -160,6 +160,7 @@ enum class DeviceExecState : uint32_t { Running, ErrorOutOfMemory, Hung, PageFau
 struct DeviceState {
   DeviceExecState execution = DeviceExecState::Running;
   uint32_t reset_count = 0;   // how many times a context of the device was lost
+  NtStatus last_fault = 0;    // why the last one was lost
 };
 
 enum class ContextPriority : uint8_t { Low = 0, Normal = 1, High = 2 };

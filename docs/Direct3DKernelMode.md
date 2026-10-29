@@ -135,6 +135,22 @@ The kernel-mode driver is the D3DKMT layer, which Direct3D 9, 10, 11 and 12 all 
   cube and 3D textures, sRGB and 16-bit / float formats, compute shaders and UAVs (Direct3D 11). The other devices (virgl, SVGA3D, Intel Gen9, V3D) have none of the features above, so
   they run the Direct3D 9 level only.
 
+## Conformance on a real GPU
+
+`Conformance.cpp` (`dxgk::run_conformance`) draws 26 small scenes through the services on one adapter and on the CPU renderer and compares the 32 x 32 pictures: Direct3D 9 vertex colours, Shader
+Model 1 and 3 bytecode, depth, alpha blend, indexed draws, viewport and scissor, culling and winding (into a target, a texture and a back buffer), copies; Direct3D 10 constant buffers
+(also 1 KiB, indexed by an integer register), point and linear textures, pixel shader arithmetic, `Load` / `SampleLevel` / `GetDimensions` with `SV_Position` and `SV_IsFrontFace` (into a
+texture and into a back buffer, whose rows are stored the other way up), strips, blend state, depth comparison, stencil, lines and points, per-instance attributes, `SV_InstanceID` /
+`SV_VertexID`; Direct3D 11 render to texture. A scene is *Same*, *Differs*, *Refused* (the device says `kNotSupported`: a program can fall back) or *Broken* (a step failed or the context was
+lost); a scene in which the reference draws nothing is Broken too. The system runs it at boot on each accelerated GPU and logs one line per scene (`Direct3D: ...`); the host test runs it on
+two software adapters (all the same) and on a device that is told it has no Direct3D 10 features (those scenes are refused). The DXBC fixtures are compiled by Wine's d3dcompiler
+(`tests/data/dxbc/*.hlsl`, `scripts/gen_conformance_blobs.py` writes `ConformanceBlobs.hpp`).
+
+What running it on virglrenderer taught (and is now fixed): a render target must be creatable together with sampling (virgl images are stored top row first when they are sampled; the viewport
+is not flipped for them), a stencil plane must be `Z32_FLOAT_S8X24_UINT` (format number 19, the one the name `Z24_UNORM_S8_UINT` suggests, makes the host lose the whole context), the host's GLSL
+has no `gl_PrimitiveID` in a pixel shader (`SV_PrimitiveID` is refused for virgl, not sent), the TGSI text parser takes no hexadecimal integer literals, and a push-constant packet could not carry
+more than 248 bytes although the adapters advertise 4096.
+
 ## The GPUs
 
 Every 3D device (`graphics::IGraphicsDevice`) is a miniport. `register_dxg_adapters` (SystemDxg.cpp) makes one adapter per GPU of the graphics pool from the pool's device, and an
@@ -145,7 +161,7 @@ understands):
 | Device | Shaders | Notes |
 |---|---|---|
 | Software (CPU) | the interpreter's functions | everything: textures, mipmaps, stencil, any program, and all the Direct3D 10 features above. |
-| virgl (QEMU) | TGSI text | from D3D9 / SM1 pixel / SM2-5.1; never run against a real virglrenderer. |
+| virgl (QEMU) | TGSI text | from D3D9 / SM1 pixel / SM2-5.1; run against a real virglrenderer (QEMU `virtio-gpu-gl`, host GL 4.6) by the conformance scenes below: all of them draw what the CPU renderer draws. Blend state, depth comparison, stencil (Z32F + S8 image), lines and points, instancing (per-instance attributes get a vertex-buffer binding of their own, the host's divisor belongs to the binding), integer and bitwise ops, loops, `SV_VertexID` / `SV_InstanceID` / `SV_Position` / `SV_IsFrontFace`, `Load` / `SampleLevel` / `GetDimensions`, constant buffers up to 4 KiB with integer indexing, render targets that are textures. |
 | VMware SVGA3D | Direct3D 9 tokens (D3D9 rewritten, DXBC written out first) | textures, mipmaps, stencil written from memory of the protocol; not run on a host. |
 | Intel Gen9 | a vertex function on the CPU + its two fixed pixel kernels | pixel shaders must be exactly a colour or one texture sample (`classify_fragment`); simulated engine in the host tests, picture matches the software device. |
 | Raspberry Pi V3D | its fixed vertex and pixel programs | a vertex shader that is exactly the matrix transform (`classify_vertex`, tested by running it on vectors against the built-in shader; rows or columns, Y flipped for Direct3D) and a `mov oC0, v0` pixel shader; no textures or stencil. The device is not yet in the render nodes (only the Pi session's tests make one), so a Pi has no accelerated Direct3D until it is. |
@@ -169,4 +185,4 @@ device is in the render node, Direct3D has it (and the self-test falls back to t
 - Sync objects cannot be shared between processes. No timeout detection and recovery (a hung device cannot be reset), no vblank / scan line, gamma, overlays or VidPN topology
   (multi-monitor); display mode listing and switching go straight to the GPU driver.
 - Video memory is accounted per adapter but there is no per-process budget or priority-based paging between processes.
-- Run through the kernel: the software rasterizer (everything) and the simulated Intel Gen9 engine (the self-test picture matches the software device). virgl, SVGA3D and the V3D hardware were not run here (V3D has no host simulation of its rasterizer; its matrix handling is checked numerically). One lock covers the kernel.
+- Run through the kernel: the software rasterizer (everything) and the simulated Intel Gen9 engine (the self-test picture matches the software device). virgl was run in QEMU against a real virglrenderer (the conformance scenes above); SVGA3D and the V3D hardware were not run here (V3D has no host simulation of its rasterizer; its matrix handling is checked numerically). One lock covers the kernel.

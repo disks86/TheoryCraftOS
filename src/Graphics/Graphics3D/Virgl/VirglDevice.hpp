@@ -32,7 +32,9 @@ class VirglDevice final : public IGraphicsDevice {
   explicit VirglDevice(hardware::VirtioGpu& gpu) : gpu_(gpu) {}
   ~VirglDevice();
 
-  DeviceInfo info() const override { return {"virgl (virtio-gpu)", DeviceKind::VirtualGpu, true}; }
+  DeviceInfo info() const override {
+    return {"virgl (virtio-gpu)", DeviceKind::VirtualGpu, true, kMaxPushConstantBytes, kFeatureBlendState | kFeatureTexelAccess | kFeatureSystemInputs | kFeatureInstancing | kFeatureLines};
+  }
 
   IBuffer* create_buffer(uint64_t size, uint32_t usage) override;
   void destroy_buffer(IBuffer* buffer) override;

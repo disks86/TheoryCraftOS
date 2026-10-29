@@ -26,6 +26,12 @@ namespace graphics {
 
 // Adds the adapters; returns how many were added. The pool must outlive the kernel. An accelerated GPU is first held to the Direct3D self-test (dxgk::self_test): one whose device
 // cannot draw the Direct3D 9 triangle is given the CPU renderer for Direct3D instead (counted in `*fallbacks` when it is not null).
-uint32_t register_dxg_adapters(dxgk::Kernel& kernel, GraphicsPool& pool, allocators::IAllocator& allocator, uint32_t* fallbacks = nullptr);
+// What the last failed self-test said (for the boot log): the step of the services that failed (empty when they all worked and the picture was wrong) and its status.
+struct DxgFallback {
+  const char* step = "";
+  dxgk::NtStatus status = dxgk::status::kSuccess;
+  bool picture_wrong = false;
+};
+uint32_t register_dxg_adapters(dxgk::Kernel& kernel, GraphicsPool& pool, allocators::IAllocator& allocator, uint32_t* fallbacks = nullptr, DxgFallback* why = nullptr);
 
 }  // namespace graphics
