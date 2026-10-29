@@ -53,7 +53,7 @@ bool PeFile::looks_like_pe(ConstByteView data) {
 void PeFile::clear() {
   plus_ = false;
   machine_ = characteristics_ = subsystem_ = dll_characteristics_ = 0;
-  timestamp_ = entry_rva_ = section_alignment_ = file_alignment_ = size_of_image_ = size_of_headers_ = checksum_ = 0;
+  size_of_code_ = timestamp_ = entry_rva_ = section_alignment_ = file_alignment_ = size_of_image_ = size_of_headers_ = checksum_ = 0;
   image_base_ = 0;
   directory_count_ = 0;
   for (uint32_t i = 0; i < kMaxDirectories; ++i) directory_rva_[i] = directory_size_[i] = 0;
@@ -146,7 +146,9 @@ bool PeFile::parse_all(ConstByteView file) {
     const uint16_t magic = o.le16();
     if (magic != 0x10B && magic != 0x20B) return false;
     plus_ = magic == 0x20B;
-    o.skip(2 + 4 + 4 + 4);      // linker version, SizeOfCode, SizeOfInitializedData, SizeOfUninitializedData
+    o.skip(2);      // linker version
+    size_of_code_ = o.le32();
+    o.skip(4 + 4);      // SizeOfInitializedData, SizeOfUninitializedData
     entry_rva_ = o.le32();
     o.le32();      // BaseOfCode
     if (plus_) {

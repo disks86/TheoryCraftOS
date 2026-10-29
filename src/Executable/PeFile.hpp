@@ -90,6 +90,7 @@ class PeFile {
   bool is_dll() const { return (characteristics_ & kPeDll) != 0; }
   uint32_t timestamp() const { return timestamp_; }
   uint32_t entry_rva() const { return entry_rva_; }
+  uint32_t size_of_code() const { return size_of_code_; }
   uint64_t image_base() const { return image_base_; }
   uint32_t section_alignment() const { return section_alignment_; }
   uint32_t file_alignment() const { return file_alignment_; }
@@ -135,7 +136,7 @@ class PeFile {
   allocators::IAllocator& allocator_;
   bool plus_ = false;
   uint16_t machine_ = 0, characteristics_ = 0, subsystem_ = 0, dll_characteristics_ = 0;
-  uint32_t timestamp_ = 0, entry_rva_ = 0, section_alignment_ = 0, file_alignment_ = 0, size_of_image_ = 0, size_of_headers_ = 0, checksum_ = 0;
+  uint32_t size_of_code_ = 0, timestamp_ = 0, entry_rva_ = 0, section_alignment_ = 0, file_alignment_ = 0, size_of_image_ = 0, size_of_headers_ = 0, checksum_ = 0;
   uint64_t image_base_ = 0, stack_reserve_ = 0, stack_commit_ = 0;
   uint16_t os_major_ = 0, os_minor_ = 0, subsystem_major_ = 0, subsystem_minor_ = 0;
   uint32_t loader_flags_ = 0;

@@ -146,6 +146,7 @@ EXPORT BOOL WINAPI DeviceIoControl(HANDLE h, DWORD code, LPVOID in, DWORD in_siz
 }
 /* Hard and symbolic links: supported where the mounted file system has a notion of a file separate from its one name (not every one does; CreateHardLink on a
  * directory, or where the file system has none of this, fails with ERROR_NOT_SUPPORTED, which is also what a real hard link on FAT gets). */
+VOID NTAPI TcosNoteFileLink(PCWSTR existing, PCWSTR link);
 EXPORT BOOL WINAPI CreateHardLinkW(LPCWSTR link, LPCWSTR target, LPSECURITY_ATTRIBUTES sa) {
   (void)sa;
   WCHAR source_buffer[PATH_CHARS + 8], link_buffer[PATH_CHARS + 8];
@@ -167,7 +168,10 @@ EXPORT BOOL WINAPI CreateHardLinkW(LPCWSTR link, LPCWSTR target, LPSECURITY_ATTR
   status = NtSetInformationFile(h, &iosb, info, 20 + name_bytes, 11);      /* FileLinkInformation */
   RtlFreeHeap(heap(), 0, info);
   NtClose(h);
-  return NT_SUCCESS(status) ? TRUE : fail_nt(status);
+  if (!NT_SUCCESS(status)) return fail_nt(status);
+  WCHAR existing_full[PATH_CHARS], link_full[PATH_CHARS];      /* (the loader knows a library by its file: a second name of it is the same library) */
+  if (full_path_w(target, existing_full, PATH_CHARS) && full_path_w(link, link_full, PATH_CHARS)) TcosNoteFileLink(existing_full, link_full);
+  return TRUE;
 }
 EXPORT BOOL WINAPI CreateHardLinkA(LPCSTR link, LPCSTR target, LPSECURITY_ATTRIBUTES sa) {
   WCHAR *a = to_wide(link), *b = to_wide(target);

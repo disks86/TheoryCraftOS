@@ -632,9 +632,17 @@ static LDR_DATA_TABLE_ENTRY *module_by_name(LPCWSTR name) {
   }
   return NULL;
 }
+PVOID NTAPI TcosFindModuleByFile(PCWSTR path);
+static BOOL has_separator(LPCWSTR name);
+static DWORD full_path_w(LPCWSTR in, WCHAR *out, DWORD capacity);
 EXPORT HMODULE WINAPI GetModuleHandleW(LPCWSTR name) {
   if (!name) return NtCurrentPeb()->ImageBaseAddress;
   LDR_DATA_TABLE_ENTRY *m = module_by_name(name);
+  if (!m && has_separator(name)) {      /* a file: the library loaded from it, under whatever name */
+    WCHAR full[PATH_CHARS];
+    PVOID base;
+    if (full_path_w(name, full, PATH_CHARS) && (base = TcosFindModuleByFile(full)) != NULL) return base;
+  }
   if (!m) { set_error(ERROR_MOD_NOT_FOUND); return NULL; }
   return m->DllBase;
 }
@@ -819,6 +827,15 @@ EXPORT BOOL WINAPI UnmapViewOfFile(LPCVOID base);
 /* LoadLibrary: a library the process has already (by its name) gets one more use; otherwise the file is looked for and ntdll maps it, with the libraries it imports, and
    calls their entry points. Libraries with thread-local data of their own (__declspec(thread) in a DLL) and the data-file modes are refused. */
 static HMODULE load_library_ex(LPCWSTR name, HANDLE file, DWORD flags);
+/* The files that exclusive data-file loads keep open (view -> handle), until FreeLibrary. */
+static struct { LPVOID view; HANDLE file; } g_exclusive_files[16];
+static BOOL exclusive_hold(LPVOID view, HANDLE file) {
+  for (int i = 0; i < 16; i++) if (!g_exclusive_files[i].view) { g_exclusive_files[i].view = view; g_exclusive_files[i].file = file; return TRUE; }
+  return FALSE;
+}
+static void exclusive_release(LPCVOID view) {
+  for (int i = 0; i < 16; i++) if (g_exclusive_files[i].view == view) { CloseHandle(g_exclusive_files[i].file); g_exclusive_files[i].view = NULL; }
+}
 static int find_library_restricted(LPCWSTR name, DWORD search, WCHAR *out);
 static DWORD g_default_dll_dirs;      /* SetDefaultDllDirectories */
 static BOOL has_separator(LPCWSTR name) { for (; *name; name++) if (*name == '\\' || *name == '/') return TRUE; return FALSE; }
@@ -859,17 +876,24 @@ static HMODULE load_library_ex(LPCWSTR name, HANDLE file, DWORD flags) {
     path[0] = 0;      /* (find_file may have left a name behind that is not a file) */
     unicode_string(&us, name);
   }
-  if ((flags & 0x32) && has_separator(name) && !path[0] && !search) { set_error(ERROR_FILE_NOT_FOUND); return NULL; }      /* (a file named with a folder has to be there) */
-  if ((flags & 0x32) && !GetModuleHandleW(path[0] ? path : name)) {      /* AS_DATAFILE 2, AS_DATAFILE_EXCLUSIVE 0x10, AS_IMAGE_RESOURCE 0x20: the file is only mapped (a loaded library is used as it is) */
+  if (path[0] && !(flags & 0x62)) {      /* the file of a library that is loaded already (under another name, or moved): one more use of it */
+    PVOID loaded = TcosFindModuleByFile(path);
+    LDR_DATA_TABLE_ENTRY *entry = loaded ? module_by_base(loaded) : NULL;
+    if (entry) us = entry->FullDllName;
+  }
+  if ((flags & 0x62) && has_separator(name) && !path[0] && !search) { set_error(ERROR_FILE_NOT_FOUND); return NULL; }      /* (a file named with a folder has to be there) */
+  if ((flags & 0x62) && !GetModuleHandleW(path[0] ? path : name)) {      /* AS_DATAFILE 2, AS_DATAFILE_EXCLUSIVE 0x40, AS_IMAGE_RESOURCE 0x20: the file is only mapped (a loaded library is used as it is) */
     if (!path[0]) { set_error(has_separator(name) ? ERROR_FILE_NOT_FOUND : ERROR_MOD_NOT_FOUND); return NULL; }
-    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
+    const BOOL exclusive = (flags & 0x40) != 0;      /* AS_DATAFILE_EXCLUSIVE: nobody else may write the file while it is loaded */
+    HANDLE f = CreateFileW(path, GENERIC_READ, exclusive ? FILE_SHARE_READ | FILE_SHARE_DELETE : FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
     if (f == INVALID_HANDLE_VALUE) return NULL;
     HANDLE m = CreateFileMappingW(f, NULL, PAGE_READONLY | ((flags & 0x20) ? SEC_IMAGE : 0), 0, 0, NULL);
-    CloseHandle(f);
-    if (!m) return NULL;
+    if (!m) { CloseHandle(f); return NULL; }
     LPVOID view = MapViewOfFile(m, 4 /* FILE_MAP_READ */, 0, 0, 0);
     CloseHandle(m);
-    if (!view) return NULL;
+    if (!view) { CloseHandle(f); return NULL; }
+    if (exclusive && !exclusive_hold(view, f)) CloseHandle(f);
+    else if (!exclusive) CloseHandle(f);
     return (HMODULE)((ULONG_PTR)view | ((flags & 0x20) ? 2 : 1));      /* (the low bits tell FreeLibrary and the resource functions what it is) */
   }
   if (path[0] && !GetModuleHandleW(path)) {      /* a file somebody holds open without sharing cannot be read by the loader */
@@ -903,6 +927,7 @@ EXPORT BOOL WINAPI FreeLibrary(HMODULE module) {
     MEMORY_BASIC_INFORMATION info;
     const LPCVOID view = (LPCVOID)((ULONG_PTR)module & ~(ULONG_PTR)3);
     if (!VirtualQuery(view, &info, sizeof(info)) || info.AllocationBase != view) { set_error(ERROR_BAD_EXE_FORMAT); return FALSE; }      /* (not the start of a view) */
+    exclusive_release(view);
     return UnmapViewOfFile(view);
   }      /* a data file or an image resource view */
   if (!module_by_base(module)) { set_error(ERROR_MOD_NOT_FOUND); return FALSE; }

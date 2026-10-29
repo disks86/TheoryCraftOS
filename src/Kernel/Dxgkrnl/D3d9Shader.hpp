@@ -53,7 +53,9 @@ class D3d9Program {
  public:
   static constexpr uint32_t kMaxTokens = 8192;
   static constexpr uint32_t kMaxInstructions = 1024;
+  static constexpr uint32_t kMaxSteps = 1u << 20;   // instructions one run may execute
   static constexpr uint32_t kPushConstantRegisters = 8;
+  static constexpr uint32_t kMaxConstantRegisters = 256;   // 4096 bytes: a program made from DXBC may declare constant buffers up to this much in all
 
   // Decodes and checks the token stream (little-endian words). kInvalidParameter for a malformed stream, kNotSupported for one that is fine but uses something not supported.
   static NtStatus compile(allocators::IAllocator& allocator, ConstByteView tokens, UniquePointer<D3d9Program>* out);
@@ -64,6 +66,9 @@ class D3d9Program {
   static NtStatus compile_dxbc(allocators::IAllocator& allocator, ConstByteView container, UniquePointer<D3d9Program>* out);
 
   graphics::ShaderStage stage() const { return stage_; }
+  // How many bytes of push constants the program reads (a Direct3D 9 program: eight registers; a DXBC one: its constant buffers laid end to end in slot order). A device whose
+  // limit is lower cannot run it.
+  uint32_t constant_bytes() const { return constant_registers_ * 16; }
   bool uses_textures() const { return uses_textures_; }
 
   // Runs the program. `attributes` are the vertex attributes by location, `constants` the 128-byte push-constant block.
@@ -104,6 +109,7 @@ class D3d9Program {
   graphics::ShaderStage stage_ = graphics::ShaderStage::Vertex;
   uint32_t major_ = 0, minor_ = 0;
   bool uses_textures_ = false;
+  uint32_t constant_registers_ = kPushConstantRegisters;
   List<Instruction> code_;
   struct Def {
     uint16_t number;
