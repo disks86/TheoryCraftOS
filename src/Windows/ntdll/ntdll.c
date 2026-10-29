@@ -1371,7 +1371,7 @@ EXPORT NTSTATUS NTAPI LdrLoadDll(PWSTR search_path, PULONG flags, PUNICODE_STRIN
         if (got != 0 && got < sizeof(expanded)) { us.Buffer = expanded; us.Length = (USHORT)got; us.MaximumLength = (USHORT)(got + 2); }
       }
       const NTSTATUS status = ldr_load_one(flags, &us, handle);
-      if (NT_SUCCESS(status)) return status;
+      if (NT_SUCCESS(status) || status == STATUS_DLL_INIT_FAILED || status == (NTSTATUS)0xC000007B || status == (NTSTATUS)0xC000012F || status == (NTSTATUS)0xC000011B || status == (NTSTATUS)0xC0000131 || status == (NTSTATUS)0xC0000130 || status == (NTSTATUS)0xC000035A) return status;      /* (a file that is no image of any kind, or a library that began to run, is the answer) */
       if (status != STATUS_DLL_NOT_FOUND && status != (NTSTATUS)0xC0000034 && status != (NTSTATUS)0xC000003A && !found) { found = TRUE; first_error = status; }
     }
     dir = *end ? end + 1 : end;
@@ -1417,6 +1417,69 @@ static BOOLEAN moved_to(const WCHAR *module_path, const WCHAR *path) {
     if (!moved) break;
   }
   return wide_equal_nocase(current, path);
+}
+/* Hard links made while the process runs: two names of one file. */
+static struct { WCHAR a[260], b[260]; } g_links[MAX_RENAMES];
+static ULONG g_link_count;
+EXPORT VOID NTAPI TcosNoteFileLink(PCWSTR existing, PCWSTR link) {
+  const ULONG slot = g_link_count++ % MAX_RENAMES;
+  SIZE_T i = 0;
+  for (; existing[i] && i < 259; i++) g_links[slot].a[i] = existing[i];
+  g_links[slot].a[i] = 0;
+  for (i = 0; link[i] && i < 259; i++) g_links[slot].b[i] = link[i];
+  g_links[slot].b[i] = 0;
+}
+/* Where the file that was at `path` is now (following MoveFile), in `out`. */
+static void file_now(const WCHAR *path, WCHAR *out) {
+  SIZE_T n = 0;
+  for (; path[n] && n < 259; n++) out[n] = path[n];
+  out[n] = 0;
+  for (ULONG step = 0; step < MAX_RENAMES; step++) {
+    BOOLEAN moved = FALSE;
+    const ULONG first = g_rename_count > MAX_RENAMES ? g_rename_count - MAX_RENAMES : 0;
+    for (ULONG r = first; r < g_rename_count; r++) {
+      const ULONG slot = r % MAX_RENAMES;
+      if (wide_equal_nocase(g_renames[slot].from, out)) {
+        SIZE_T k = 0;
+        for (; g_renames[slot].to[k]; k++) out[k] = g_renames[slot].to[k];
+        out[k] = 0;
+        moved = TRUE;
+      }
+    }
+    if (!moved) break;
+  }
+}
+/* Do the two paths name one file, counting the moves and hard links the process made? */
+static BOOLEAN same_file(const WCHAR *x, const WCHAR *y) {
+  WCHAR a[260], b[260];
+  file_now(x, a);
+  file_now(y, b);
+  if (wide_equal_nocase(a, b)) return TRUE;
+  const ULONG first = g_link_count > MAX_RENAMES ? g_link_count - MAX_RENAMES : 0;
+  for (ULONG r = first; r < g_link_count; r++) {
+    WCHAR la[260], lb[260];
+    file_now(g_links[r % MAX_RENAMES].a, la);
+    file_now(g_links[r % MAX_RENAMES].b, lb);
+    if ((wide_equal_nocase(la, a) && wide_equal_nocase(lb, b)) || (wide_equal_nocase(la, b) && wide_equal_nocase(lb, a))) return TRUE;
+  }
+  return FALSE;
+}
+/* The library loaded from the file at `path` (a full path), whatever it was loaded as; NULL if there is none. */
+EXPORT PVOID NTAPI TcosFindModuleByFile(PCWSTR path) {
+  PEB_LDR_DATA *ldr = NtCurrentPeb()->Ldr;
+  PVOID found = NULL;
+  loader_lock();
+  for (LIST_ENTRY *e = ldr->InLoadOrderModuleList.Flink; e != &ldr->InLoadOrderModuleList && !found; e = e->Flink) {
+    LDR_DATA_TABLE_ENTRY *c = entry_of(e);
+    WCHAR text[260];
+    const SIZE_T length = c->FullDllName.Length / 2;
+    if (length >= 260) continue;
+    for (SIZE_T i = 0; i < length; i++) text[i] = c->FullDllName.Buffer[i];
+    text[length] = 0;
+    if (same_file(text, path)) found = c->DllBase;
+  }
+  loader_unlock();
+  return found;
 }
 /* A loaded library by name, with or without ".dll", in any case; only the file name counts. */
 static WCHAR ldr_upper(WCHAR c) { return c >= 'a' && c <= 'z' ? (WCHAR)(c - 32) : c; }
@@ -1464,7 +1527,7 @@ EXPORT NTSTATUS NTAPI LdrGetDllHandleEx(ULONG flags, PWSTR path, PULONG characte
           if (length >= 260) continue;
           for (SIZE_T i = 0; i < length; i++) path[i] = c->FullDllName.Buffer[i];
           path[length] = 0;
-          if (moved_to(path, full)) m = c;
+          if (same_file(path, full)) m = c;
         }
       }
     }

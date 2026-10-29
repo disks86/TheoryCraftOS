@@ -143,6 +143,8 @@ class WebBrowser : public gui::Frame {
   // Opens what was typed as an address (see browser::normalize_address). False if it is empty. The page is fetched on the handler thread: when
   // this returns the request is only made (without a handler thread the page is already shown).
   bool navigate(StringView typed);
+  // Shows the answer to a form posted to `address` (see post_form()).
+  bool navigate_post(StringView address, StringView content_type, StringView body) { return post_form(address, content_type, body); }
   bool go_back();
   bool go_forward();
   bool reload();
@@ -168,7 +170,8 @@ class WebBrowser : public gui::Frame {
   void ask_open();
 
   // window.open() from a page: the handler opens `address` in another tab / window (and may call set_opened_by_script() on it). Called on the page's thread.
-  using OpenWindowFn = bool (*)(void* context, WebBrowser& from, StringView address);
+  // `content_type` and `body` are those of the request when a form was posted into the window (content_type empty: a GET of `address`).
+  using OpenWindowFn = bool (*)(void* context, WebBrowser& from, StringView address, StringView content_type, StringView body);
   void set_open_window_handler(OpenWindowFn handler, void* context) {
     open_fn_ = handler;
     open_ctx_ = context;
@@ -219,6 +222,7 @@ class WebBrowser : public gui::Frame {
     void set_navigation_state(StringView json, bool has_state) override;
     void history_go_to_key(uint64_t key) override;
     bool open_window(StringView address, StringView target, bool noopener) override;
+    bool open_window_post(StringView address, StringView target, StringView content_type, StringView body) override;
     void close_window() override;
     int notification_prompt(StringView origin) override { return owner_.notification_sink_ ? owner_.notification_sink_->prompt(origin) : 0; }
     uint32_t notification_show(StringView origin, StringView title, StringView body, bool sticky, StringView actions) override {
@@ -347,6 +351,7 @@ class WebBrowser : public gui::Frame {
   uint64_t refresh_due_ms_ = 0;
   String refresh_target_;
   List<String> defer_opens_;        // window.open() addresses to hand to the desktop
+  List<String> defer_open_types_, defer_open_bodies_;   // (for each: the content type and body when a form was posted into the new window)
   bool want_close_ = false, opened_by_script_ = false;
   // WebRTC: the peer connections of this window's pages, made when the first page asks and the network can do UDP.
   browser::IRtcService* rtc();
