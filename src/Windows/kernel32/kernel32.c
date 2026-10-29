@@ -67,6 +67,7 @@ static BOOL console_read_hook(HANDLE h, LPVOID buffer, DWORD length, LPDWORD rea
 static BOOL con_input_ready(void);
 static BOOL con_is_input(HANDLE h);
 static BOOL pipe_nt_name(LPCWSTR name, WCHAR *buffer, UNICODE_STRING *us, OBJECT_ATTRIBUTES *attributes, BOOL inherit);
+static BOOL mailslot_nt_name(LPCWSTR name, WCHAR *buffer, UNICODE_STRING *us, OBJECT_ATTRIBUTES *attributes, BOOL inherit);
 EXPORT HANDLE WINAPI CreateFileW(LPCWSTR path, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD disposition, DWORD flags, HANDLE template_file);
 static BOOL is_dos_device_name(const WCHAR *name);
 EXPORT BOOL WINAPI CloseHandle(HANDLE h);
@@ -2407,10 +2408,11 @@ EXPORT HANDLE WINAPI CreateMailslotW(LPCWSTR name, DWORD max_message_size, DWORD
   WCHAR buffer[300];
   UNICODE_STRING us;
   OBJECT_ATTRIBUTES attributes;
-  if (!name || !mailslot_nt_name(name, buffer, &us, &attributes, sa && sa->bInheritHandle)) return INVALID_HANDLE_VALUE;
+  if (!name) { set_error(ERROR_PATH_NOT_FOUND); return INVALID_HANDLE_VALUE; }
+  if (!mailslot_nt_name(name, buffer, &us, &attributes, sa && sa->bInheritHandle)) return INVALID_HANDLE_VALUE;
   LARGE_INTEGER timeout;
   const BOOL forever = read_timeout_ms == MAILSLOT_WAIT_FOREVER_;
-  timeout.QuadPart = forever ? 0 : -10000ll * (LONGLONG)read_timeout_ms;
+  timeout.QuadPart = forever ? -1 : (read_timeout_ms ? -10000ll * (LONGLONG)read_timeout_ms : 0);
   HANDLE h = NULL;
   IO_STATUS_BLOCK iosb;
   const NTSTATUS status = NtCreateMailslotFile(&h, 0xC0100000u /* GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE */, &attributes, &iosb, 0, 0, max_message_size,
@@ -2420,7 +2422,7 @@ EXPORT HANDLE WINAPI CreateMailslotW(LPCWSTR name, DWORD max_message_size, DWORD
 }
 EXPORT HANDLE WINAPI CreateMailslotA(LPCSTR name, DWORD max_message_size, DWORD read_timeout_ms, LPSECURITY_ATTRIBUTES sa) {
   WCHAR *w = name ? to_wide(name) : NULL;
-  if (!w) { if (name) return INVALID_HANDLE_VALUE; set_error(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE; }
+  if (!w) { if (name) return INVALID_HANDLE_VALUE; set_error(ERROR_PATH_NOT_FOUND); return INVALID_HANDLE_VALUE; }
   HANDLE h = CreateMailslotW(w, max_message_size, read_timeout_ms, sa);
   free_wide(w);
   return h;
@@ -2434,15 +2436,15 @@ EXPORT BOOL WINAPI GetMailslotInfo(HANDLE h, LPDWORD max_message_size, LPDWORD n
   if (next_size) *next_size = get32(info + 8);
   if (message_count) *message_count = get32(info + 12);
   if (read_timeout_ms) {
-    const LONGLONG hundred_ns = *(const LONGLONG *)(info + 16);
-    *read_timeout_ms = hundred_ns == 0 ? MAILSLOT_WAIT_FOREVER_ : (DWORD)(-hundred_ns / 10000);
+    const ULONGLONG hundred_ns = *(const ULONGLONG *)(info + 16);      /* (a count of 100 ns; all ones is forever) */
+    *read_timeout_ms = hundred_ns == ~0ull ? MAILSLOT_WAIT_FOREVER_ : (DWORD)(hundred_ns / 10000);
   }
   return TRUE;
 }
 EXPORT BOOL WINAPI SetMailslotInfo(HANDLE h, DWORD read_timeout_ms) {
   IO_STATUS_BLOCK iosb;
   BYTE info[8];
-  const LONGLONG hundred_ns = read_timeout_ms == MAILSLOT_WAIT_FOREVER_ ? 0 : -10000ll * (LONGLONG)read_timeout_ms;
+  const LONGLONG hundred_ns = read_timeout_ms == MAILSLOT_WAIT_FOREVER_ ? -1 : -10000ll * (LONGLONG)read_timeout_ms;
   memcpy(info, &hundred_ns, 8);
   const NTSTATUS status = NtSetInformationFile(h, &iosb, info, sizeof(info), 27 /* FileMailslotSetInformation */);
   return NT_SUCCESS(status) ? TRUE : fail_nt(status);
@@ -2746,6 +2748,14 @@ EXPORT HANDLE WINAPI CreateFileW(LPCWSTR path, DWORD access, DWORD share, LPSECU
     for (; path[i] && i < 299; ++i) normal[i] = path[i] == '/' ? '\\' : path[i];
     normal[i] = 0;
     if (!pipe_nt_name(normal, buffer, &name, &attributes, FALSE)) return INVALID_HANDLE_VALUE;
+  } else if ((path[0] == '\\' || path[0] == '/') && (path[1] == '\\' || path[1] == '/') && path[2] == '.' && (path[3] == '\\' || path[3] == '/') && (path[4] | 0x20) == 'm' && (path[5] | 0x20) == 'a' &&
+             (path[6] | 0x20) == 'i' && (path[7] | 0x20) == 'l' && (path[8] | 0x20) == 's' && (path[9] | 0x20) == 'l' && (path[10] | 0x20) == 'o' && (path[11] | 0x20) == 't' &&
+             (path[12] == '\\' || path[12] == '/')) {      /* \\.\mailslot\: the writer's end of a mailslot */
+    WCHAR normal[300];
+    size_t_ i = 0;
+    for (; path[i] && i < 299; ++i) normal[i] = path[i] == '/' ? '\\' : path[i];
+    normal[i] = 0;
+    if (!mailslot_nt_name(normal, buffer, &name, &attributes, FALSE)) return INVALID_HANDLE_VALUE;
   } else {
     /* A DOS device name (in any directory) is the device: NUL is the one that exists here, the others are not there. */
     size_t_ last = wcslen(path);
