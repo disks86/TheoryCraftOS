@@ -85,6 +85,30 @@ class Plane {
   uint64_t aperture_low_ = 0, aperture_high_ = 0;
 };
 
+// A linear ARGB8888 (or XRGB8888) picture for a CRTC's graphics plane to scan out.
+struct ScanoutSurface {
+  uint64_t address = 0;            // the GPU's address of the first pixel (256 byte aligned)
+  uint32_t width = 0, height = 0;  // in pixels
+  uint32_t pitch_pixels = 0;       // pixels from one row to the next (at least width)
+  uint32_t viewport_width = 0;     // the mode's horizontal display
+  uint32_t viewport_height = 0;    // the mode's vertical display
+};
+
+// dce_v11_0_crtc_do_set_base for a linear 32 bit surface at offset (0, 0), with dce_v11_0_vga_enable(false) and dce_v11_0_grph_enable: the graphics plane of a CRTC pointed at a picture,
+// with the surface update at vertical blank, the viewport set to the mode and the look-up table bypass off. Not done: tiled surfaces, other pixel formats, an offset into the surface,
+// the look-up table itself (dce_v11_0_crtc_load_lut) and the bandwidth update.
+class Scanout {
+ public:
+  explicit Scanout(IVcnRegisters& registers) : r_(registers) {}
+  // False if the CRTC does not exist or the surface is misaligned, empty or has a pitch below its width.
+  bool set(uint32_t crtc, const ScanoutSurface& surface);
+  // The graphics plane off (dce_v11_0_grph_enable(false)).
+  bool disable(uint32_t crtc);
+
+ private:
+  IVcnRegisters& r_;
+};
+
 // The firmware's framebuffer as the UEFI graphics output describes the current mode.
 struct FirmwareFramebuffer {
   uint64_t physical = 0;     // the CPU's address of its first byte (the OS runs identity mapped)

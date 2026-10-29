@@ -206,12 +206,12 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
   // (setup_dig(ATOM_ENABLE): DIG encoder setup, panel mode, the eDP panel on, the transmitter enabled, for DisplayPort the link trained with the sink powered up and the video turned
   // on). `bpc` is the bits per colour (6, 8, 10, 12, 16). `out->failed` names the step that failed (Done: none); a failure leaves the output as that step left it (call disable_mode()).
   // For DisplayPort the sink's capabilities are read first and the lanes and rate chosen as the driver does (DpLinkConfig::choose; none that carries the mode is a failure). What is
-  // not done: the scanout surface (amd_dce11::Plane is the caller's, between prepare and commit in the driver), the VGA enable writes around the unblank, the FMT block and interleave
+  // not done: tiled or non-ARGB8888 scanout surfaces, the look-up table, the VGA enable writes around the unblank, the FMT block and interleave
   // setup, spread spectrum, audio (enable_audio), the pixel clock limits the driver checks, a bridge chip's panel mode (the NUTMEG / TRAVIS DP1 mode) and the PLL choice the driver makes from the PLLs in use.
   // Like train_link it takes the video BIOS for milliseconds: for the desktop loop.
   enum class ModeSetStage : uint8_t {
     Done, NotReady, Unsupported, Prepare, SinkCapabilities, CrtcSource, PixelClock, Timing, Overscan, Scaler, EncoderOff, CrtcEnable, Unblank, EncoderSetup, PanelMode, TransmitterEnable,
-    LinkTraining, VideoOn,
+    LinkTraining, VideoOn, Scanout,
   };
   struct ModeSetResult {
     ModeSetStage failed = ModeSetStage::NotReady;
@@ -219,9 +219,12 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
     uint8_t panel_mode = 0;                      // DisplayPort: DP_PANEL_MODE_* (AmdModeSet::kPanelMode*)
     LinkTraining link;                           // DisplayPort: what was chosen and trained
   };
-  bool set_mode(const AtomConnectors::Connector& connector, uint8_t crtc, const DisplayMode& mode, uint32_t bpc, ModeSetResult* out, uint8_t pll = AmdModeSet::kPllInvalid);
+  // `surface`: if given, the CRTC's graphics plane is pointed at it between the timing and the overscan, where the driver sets the base (amd_dce11::Scanout); without it the plane is
+  // left as it is.
+  bool set_mode(const AtomConnectors::Connector& connector, uint8_t crtc, const DisplayMode& mode, uint32_t bpc, ModeSetResult* out, uint8_t pll = AmdModeSet::kPllInvalid,
+                const amd_dce11::ScanoutSurface* surface = nullptr);
   // The disable path (dce_v11_0_encoder_disable and _crtc_disable): the encoder off, the CRTC blanked and disabled, its power gating on, and its PLL switched off unless another CRTC set
-  // up by set_mode still uses it. False if a table fails (the rest is still done). The scanout (GRPH) is the caller's.
+  // up by set_mode still uses it; the graphics plane is switched off after the CRTC, as the driver does. False if a table fails (the rest is still done).
   bool disable_mode(const AtomConnectors::Connector& connector, uint8_t crtc);
   // The short pulse of a DisplayPort sink (a status change that is not a plug: the link was lost, or the sink asks for a test) is taken by the interrupt handler as a pin to look at
   // (`pending_short_pulses()`: bit n for pin n). The look is the AUX channel's, which takes some milliseconds, so it is not done there: service_short_pulses() does it, from the desktop loop.

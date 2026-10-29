@@ -261,12 +261,77 @@ static void test_display() {
   }
 }
 
+// The graphics plane set up for a picture of its own (dce_v11_0_crtc_do_set_base): the registers the driver writes, with their values, for each CRTC; the VGA mode off, the other bits of the
+// registers it reads and modifies left alone, and the refusals.
+static void test_scanout() {
+  const uint32_t offsets[6] = {0x1b9c - 0x1b9c, 0x1d9c - 0x1b9c, 0x1f9c - 0x1b9c, 0x419c - 0x1b9c, 0x439c - 0x1b9c, 0x459c - 0x1b9c};
+  const uint32_t vga[6] = {0xcc, 0xce, 0xf8, 0xf9, 0xfa, 0xfb};
+  for (uint32_t crtc = 0; crtc < 6; ++crtc) {
+    FakeDisplay d;
+    const uint32_t off = offsets[crtc];
+    d.set(vga[crtc], 0x00010001);              // VGA mode on, another bit set
+    d.set(0x1a12 + off, 0x00000011);           // flip control: H_RETRACE_EN and another bit
+    d.set(0x1a02 + off, 0x00000123);           // LUT bypass: enable and other bits
+    ScanoutSurface s;
+    s.address = 0x0000000123456700ull;
+    s.width = 1920;
+    s.height = 1080;
+    s.pitch_pixels = 2048;
+    s.viewport_width = 1920;
+    s.viewport_height = 1080;
+    Scanout scan(d);
+    CHECK(scan.set(crtc, s));
+    CHECK(d.get(vga[crtc]) == 0x00010000);
+    CHECK(d.get(0x1a12 + off) == 0x00000010);
+    // (the fake holds the primary address back as a pending flip: the log has what was written)
+    const auto written = [&](uint32_t reg) { uint32_t v = 0xDEADBEEFu; for (const auto& w : d.writes) if (w.first == reg) v = w.second; return v; };
+    CHECK(written(0x1a07 + off) == 1 && written(0x1a08 + off) == 1);
+    CHECK(written(0x1a04 + off) == 0x23456700 && written(0x1a05 + off) == 0x23456700);
+    CHECK(d.get(0x1a01 + off) == 2 && d.get(0x1a03 + off) == 0);
+    CHECK(d.get(0x1a02 + off) == 0x00000023);
+    CHECK(d.get(0x1a09 + off) == 0 && d.get(0x1a0a + off) == 0 && d.get(0x1a0b + off) == 0 && d.get(0x1a0c + off) == 0);
+    CHECK(d.get(0x1a0d + off) == 1920 && d.get(0x1a0e + off) == 1080 && d.get(0x1a06 + off) == 2048);
+    CHECK(d.get(0x1a00 + off) == 1 && d.get(0x1ac3 + off) == 1080 && d.get(0x1b5c + off) == 0);
+    CHECK(d.get(0x1b5d + off) == ((1920u << 16) | 1080u) && d.get(0x1bbe + off) == 0);
+    CHECK(scan.disable(crtc) && d.get(0x1a00 + off) == 0);
+  }
+  // an odd height rounds the viewport up to even
+  FakeDisplay d;
+  Scanout scan(d);
+  ScanoutSurface s;
+  s.address = 0x1000;
+  s.width = 800;
+  s.height = 601;
+  s.pitch_pixels = 800;
+  s.viewport_width = 800;
+  s.viewport_height = 601;
+  CHECK(scan.set(0, s) && d.get(0x1b5d) == ((800u << 16) | 602u));
+  // refused, nothing written: a CRTC that does not exist, a misaligned address, an empty picture, a pitch below the width, an empty viewport
+  const size_t writes = d.writes.size();
+  ScanoutSurface bad = s;
+  CHECK(!scan.set(6, s) && !scan.disable(6));
+  bad.address = 0x1001;
+  CHECK(!scan.set(0, bad));
+  bad = s; bad.width = 0;
+  CHECK(!scan.set(0, bad));
+  bad = s; bad.height = 0;
+  CHECK(!scan.set(0, bad));
+  bad = s; bad.pitch_pixels = 799;
+  CHECK(!scan.set(0, bad));
+  bad = s; bad.viewport_width = 0;
+  CHECK(!scan.set(0, bad));
+  bad = s; bad.viewport_height = 0;
+  CHECK(!scan.set(0, bad));
+  CHECK(d.writes.size() == writes);
+}
+
 int main() {
   test_probe();
   test_flip();
   test_not_taken();
   test_refusals();
   test_display();
+  test_scanout();
   printf(g_failed ? "AmdDce11Test: %d FAILED\n" : "AmdDce11Test: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }

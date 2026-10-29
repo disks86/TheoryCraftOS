@@ -592,7 +592,7 @@ bool dig_off(ModeSession& session, AuxSession* aux, const AtomConnectors::Connec
 
 }  // namespace
 
-bool AmdVegaM::set_mode(const AtomConnectors::Connector& connector, uint8_t crtc, const DisplayMode& mode, uint32_t bpc, ModeSetResult* out, uint8_t pll) {
+bool AmdVegaM::set_mode(const AtomConnectors::Connector& connector, uint8_t crtc, const DisplayMode& mode, uint32_t bpc, ModeSetResult* out, uint8_t pll, const amd_dce11::ScanoutSurface* surface) {
   ModeSetResult result;
   const auto finish = [&](ModeSetStage stage) {
     result.failed = stage;
@@ -638,6 +638,7 @@ bool AmdVegaM::set_mode(const AtomConnectors::Connector& connector, uint8_t crtc
   // dce_v11_0_crtc_mode_set: the pixel clock, the timing, (the base: the caller's), the overscan and the scaler
   if (!set.set_pixel_clock(o, mode)) return finish(ModeSetStage::PixelClock);
   if (!set.set_dtd_timing(o, mode)) return finish(ModeSetStage::Timing);
+  if (surface && !amd_dce11::Scanout(*inputs_.registers).set(crtc, *surface)) return finish(ModeSetStage::Scanout);
   if (!session.optional(AmdModeSet::kSetCrtcOverscan) && !set.overscan_setup(o)) return finish(ModeSetStage::Overscan);
   if (!session.optional(AmdModeSet::kEnableScaler) && !set.scaler_setup(o)) return finish(ModeSetStage::Scaler);
   crtc_pll_[crtc] = pll;
@@ -685,6 +686,7 @@ bool AmdVegaM::disable_mode(const AtomConnectors::Connector& connector, uint8_t 
   bool ok = dig_off(session, aux.get(), connector, o, mode);
   ok = set.blank_crtc(crtc, true) && ok;
   ok = set.enable_crtc(crtc, false) && ok;
+  ok = amd_dce11::Scanout(*inputs_.registers).disable(crtc) && ok;       // dce_v11_0_grph_enable(false)
   if (!session.optional(AmdModeSet::kEnableDispPowerGating)) ok = set.powergate_crtc(crtc, true) && ok;
   crtc_pll_[crtc] = 0xFF;
   if (pll != AmdModeSet::kPllInvalid) {
