@@ -117,8 +117,7 @@ int main() {
           in.numSlices = c.type == 1 ? ((c.depth >> k) > 0 ? c.depth >> k : 1) : c.depth;
           in.mipLevel = k;
           in.basePitch = base_pitch;
-          in.flags.color = 1;
-          in.flags.display = in.tileType == ADDR_DISPLAYABLE;
+          in.flags.color = 1;                       // (not the display flag: that is for scanout surfaces and aligns the pitch to 32; a texture only has the display micro tile order)
           in.flags.cube = c.type == 2;
           in.flags.volume = c.type == 1;
           in.flags.pow2Pad = c.levels > 1;

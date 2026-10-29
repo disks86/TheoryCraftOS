@@ -30,7 +30,7 @@
 // Layouts: an image with several levels, slices (3D, array, cube) is laid out as AMD's address library does for the 1D tiled layout (GcnTiling.hpp), and only in it: the levels are
 // stored one after the other (each starting at a multiple of 256 bytes) with the slices of a level together; the base level is padded to a power of two when there is more than one level
 // (the pitch of the descriptor is that padded pitch), a level's pitch is the base pitch shifted down and padded to 8 pixels, its height likewise, and its slices count up to a power of two
-// (a cube's 6 faces to 8). A single level 2D image may be linear or 2D tiled as before. A cube is sampled with the coordinates v_cubesc / v_cubetc / v_cubema give (the face coordinates
+// (a cube's 6 faces to 8), and a level's pitch is widened until its slice is a multiple of 256 bytes. A single level 2D image may be linear or 2D tiled as before. A cube is sampled with the coordinates v_cubesc / v_cubetc / v_cubema give (the face coordinates
 // plus 1.5 after the division by the major axis, and the face index); its bilinear filter needs DISABLE_CUBE_WRAP in the sampler since filtering across the edges of faces is not done.
 // Not done: 1D and 1D array images, arrays of cubes, mip levels or slices in the linear and 2D tiled layouts, anisotropy, depth compare, sRGB, the other formats, the border colour
 // register, texel caches. Anything outside that is refused (Unsupported), not approximated.
@@ -82,9 +82,9 @@ struct SamplerDescriptor {
   float lod_bias = 0.0f;                       // signed 6.8 fixed point in the descriptor
 };
 
-// The pitch (in pixels) of the base level of an image of this width and number of levels in the 1D tiled layout: the width padded to 8, or to a power of two first when there are
-// several levels.
-uint32_t image_pitch(uint32_t width, uint32_t levels);
+// The pitch (in pixels) of the base level of an image of this size, texel size and number of levels (or slices) in the 1D tiled layout: the width padded to 8, or to a power of two first
+// when there are several levels, and then widened by 8 until a slice is a whole number of 256 byte units (the library does so: an 8 bit image is at least 32 pixels wide).
+uint32_t image_pitch(uint32_t width, uint32_t height, uint32_t levels, uint32_t texel_bytes);
 
 // False if the description does not fit the descriptor (a size or address out of range, a misaligned address) or is outside what is implemented.
 bool make_image_descriptor(ArrayView<uint32_t> out, const ImageDescriptor& image);

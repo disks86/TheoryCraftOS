@@ -108,7 +108,20 @@ uint32_t max_levels(const ImageDescriptor& d) {
 
 uint32_t texel_bytes(TexelFormat f) { return f == TexelFormat::R8Unorm ? 1 : f == TexelFormat::Rgba8Unorm ? 4 : 16; }
 
-uint32_t image_pitch(uint32_t width, uint32_t levels) { return align8(levels > 1 ? next_pow2(width) : width); }
+namespace {
+
+// The pitch of a slice of `rows` rows: widened by 8 until the slice is a multiple of the base alignment (SiLib::HwlGetSizeAdjustmentMicroTiled)
+uint32_t widen(uint32_t pitch, uint32_t rows, uint32_t bytes) {
+  while ((static_cast<uint64_t>(pitch) * rows * bytes) % kLevelAlign != 0 && pitch < 65536) pitch += 8;
+  return pitch;
+}
+
+}  // namespace
+
+uint32_t image_pitch(uint32_t width, uint32_t height, uint32_t levels, uint32_t bytes) {
+  const uint32_t rows = align8(levels > 1 ? next_pow2(height) : height);
+  return widen(align8(levels > 1 ? next_pow2(width) : width), rows, bytes);
+}
 
 bool image_level(const ImageDescriptor& d, uint32_t level, LevelLayout* out) {
   TileLayout layout;
@@ -136,8 +149,8 @@ bool image_level(const ImageDescriptor& d, uint32_t level, LevelLayout* out) {
     l.width = (d.width >> k) > 0 ? d.width >> k : 1;
     l.height = (d.height >> k) > 0 ? d.height >> k : 1;
     l.depth = d.type == ImageType::Image3D ? ((d.depth >> k) > 0 ? d.depth >> k : 1) : d.depth;
-    l.pitch = align8((d.pitch_pixels >> k) > 0 ? d.pitch_pixels >> k : 1);
     l.rows = align8(pow2 ? next_pow2(l.height) : l.height);
+    l.pitch = widen(align8((d.pitch_pixels >> k) > 0 ? d.pitch_pixels >> k : 1), l.rows, bytes);
     l.slice_bytes = static_cast<uint64_t>(l.pitch) * l.rows * bytes;
     l.slices = pow2 ? next_pow2(l.depth) : l.depth;
     if (k == level) { *out = l; return true; }
@@ -170,7 +183,7 @@ bool make_image_descriptor(ArrayView<uint32_t> out, const ImageDescriptor& d) {
   if ((d.type == ImageType::Image2D && d.depth != 1) || (d.type == ImageType::Cube && (d.depth != 6 || d.width != d.height))) return false;
   if (d.levels > max_levels(d)) return false;
   if (d.levels > 1 || has_slices(d.type)) {
-    if (layout.kind != TileLayout::Kind::Tiled1D || d.pitch_pixels != image_pitch(d.width, d.levels)) return false;
+    if (layout.kind != TileLayout::Kind::Tiled1D || d.pitch_pixels != image_pitch(d.width, d.height, d.levels, texel_bytes(d.format))) return false;
   }
   if (image_bytes(d) == 0 || image_bytes(d) > kMaxImageBytes) return false;
   uint32_t data = 0, number = 0;
@@ -223,7 +236,7 @@ bool decode_image_descriptor(ArrayView<const uint32_t> w, ImageDescriptor* d) {
   if (w[5] != want5) return false;
   TileLayout layout;
   if (!resolve_tile_index(d->tile_index, &layout) || d->pitch_pixels < d->width || (d->address >> kMaxAddressBits) != 0 || d->levels > max_levels(*d)) return false;
-  if ((d->levels > 1 || has_slices(d->type)) && (layout.kind != TileLayout::Kind::Tiled1D || d->pitch_pixels != image_pitch(d->width, d->levels))) return false;
+  if ((d->levels > 1 || has_slices(d->type)) && (layout.kind != TileLayout::Kind::Tiled1D || d->pitch_pixels != image_pitch(d->width, d->height, d->levels, texel_bytes(d->format)))) return false;
   if (d->type == ImageType::Cube && (d->depth != 6 || d->width != d->height)) return false;
   return image_bytes(*d) != 0 && image_bytes(*d) <= kMaxImageBytes;
 }

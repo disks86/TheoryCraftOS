@@ -186,9 +186,12 @@ static void test_reference_vectors() {
     d.tile_index = idx;
     d.type = type == 1 ? ImageType::Image3D : type == 2 ? ImageType::Cube : type == 3 ? ImageType::Array2D : ImageType::Image2D;
     d.format = bpp == 8 ? TexelFormat::R8Unorm : bpp == 32 ? TexelFormat::Rgba8Unorm : TexelFormat::Rgba32Float;
-    d.pitch_pixels = image_pitch(w, levels);
+    d.pitch_pixels = image_pitch(w, h, levels, bpp / 8);
     LevelLayout l;
-    if (!image_level(d, k, &l) || l.pitch != pitch || l.rows != height || l.bytes() != size || (256 % align) != 0 || l.offset % 256 != 0) ++level_wrong;
+    if (!image_level(d, k, &l) || l.pitch != pitch || l.rows != height || l.bytes() != size || (256 % align) != 0 || l.offset % 256 != 0) {
+      if (++level_wrong <= 12) printf("  level mismatch: %s", line);
+      if (level_wrong <= 12) printf("    ours: pitch %u rows %u bytes %llu offset %llu\n", l.pitch, l.rows, static_cast<unsigned long long>(l.bytes()), static_cast<unsigned long long>(l.offset));
+    }
     if (k == 0 && d.pitch_pixels != pitch) ++level_wrong;
   }
   if (f) fclose(f);
@@ -480,7 +483,7 @@ static ImageDescriptor base_image(const Block& b, uint32_t w, uint32_t h, uint32
   d.address = b.base;
   d.width = w;
   d.height = h;
-  d.pitch_pixels = image_pitch(w, levels);
+  d.pitch_pixels = image_pitch(w, h, levels, 4);
   d.format = TexelFormat::Rgba8Unorm;
   d.tile_index = 9;
   d.type = type;

@@ -49,7 +49,7 @@ ImageDescriptor image_of(const VegaTexture& t, uint64_t address) {
   image.depth = t.depth;
   image.levels = t.levels;
   const bool chain = t.levels > 1 || t.type != ImageType::Image2D;
-  image.pitch_pixels = chain ? image_pitch(t.width, t.levels)
+  image.pitch_pixels = chain ? image_pitch(t.width, t.height, t.levels, texel_bytes(t.format))
                              : (layout_of(t.tile_index, &layout) ? static_cast<uint32_t>(align_to(t.width, surface_pitch_align(layout, texel_bytes(t.format)))) : 0);
   return image;
 }
