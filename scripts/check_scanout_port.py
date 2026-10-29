@@ -166,6 +166,42 @@ def main():
         fail('the FMT depths')
     if fmt.count('FMT_RGB_RANDOM_ENABLE') != 2 or 'if (bpc == 0)' not in fmt:
         fail('the FMT random enables')
+    # the watermarks (Watermarks in AmdDce11.cpp): registers, fields, constants of dce_v11_0's bandwidth calculation
+    for ours_name, theirs in (('kLbMemoryCtrl', 'mmLB_MEMORY_CTRL'), ('kPipe0DmifBufferControl', 'mmPIPE0_DMIF_BUFFER_CONTROL'), ('kDpgWatermarkMaskControl', 'mmDPG_WATERMARK_MASK_CONTROL'),
+                              ('kDpgPipeUrgencyControl', 'mmDPG_PIPE_URGENCY_CONTROL')):
+        g = re.search(r'\b' + ours_name + r' = (0x[0-9a-fA-F]+)', cpp)
+        if not g or int(g.group(1), 16) != reg(theirs):
+            fail(ours_name)
+    g = re.search(r'kMcSharedChmap = (0x[0-9a-fA-F]+)', cpp)
+    if not g or int(g.group(1), 16) != 0x801:
+        fail('MC_SHARED_CHMAP (gmc_8_1_d.h: 0x801)')
+    for ours_name, theirs, shift in (('kLbMemoryConfigMask', 'LB_MEMORY_CTRL__LB_MEMORY_CONFIG_MASK', 'LB_MEMORY_CTRL__LB_MEMORY_CONFIG__SHIFT'),
+                                     ('kDmifBuffersAllocatedMask', 'PIPE0_DMIF_BUFFER_CONTROL__DMIF_BUFFERS_ALLOCATED_MASK', None),
+                                     ('kDmifBuffersAllocationCompleted', 'PIPE0_DMIF_BUFFER_CONTROL__DMIF_BUFFERS_ALLOCATION_COMPLETED_MASK', None),
+                                     ('kUrgencyWatermarkMaskMask', 'DPG_WATERMARK_MASK_CONTROL__URGENCY_WATERMARK_MASK_MASK', 'DPG_WATERMARK_MASK_CONTROL__URGENCY_WATERMARK_MASK__SHIFT')):
+        g = re.search(r'\b' + ours_name + r' = (0x[0-9a-fA-F]+)', cpp)
+        t = re.search(r'#define\s+' + theirs + r'\s+(0x[0-9a-fA-F]+)', m)
+        if not g or not t or int(g.group(1), 16) != int(t.group(1), 16):
+            fail(ours_name)
+        if shift:
+            sh = re.search(r'#define\s+' + shift + r'\s+(0x[0-9a-fA-F]+)', m)
+            o = re.search((ours_name.replace('Mask', 'Shift') if 'Urgency' not in ours_name else 'kUrgencyWatermarkMaskShift') + r' = (\d+)', cpp)
+            if not sh or not o or int(sh.group(1), 16) != int(o.group(1)):
+                fail(ours_name + ' shift')
+    wm = c[c.index('static u32 dce_v11_0_line_buffer_adjust'):c.index('static void dce_v11_0_audio_get_connected_pins')]
+    for needle in ('mode->crtc_hdisplay < 1920', 'mode->crtc_hdisplay < 2560', 'mc_latency = 2000', 'dmif_size = 12288', 'dfixed_const(7)', 'dfixed_const(3)', 'dfixed_const(8)', 'dfixed_const(32)',
+                   '(512 * 8 * 1000)', '(128 * 4 * 1000)', '40000000 / wm->disp_clk', 'min_t(u32, line_time, 65535)', 'return 1920 * 2', 'return 2560 * 2', 'return 4096 * 2',
+                   'wm_high.bytes_per_pixel = 4', 'wm_high.vtaps = 1', 'URGENCY_WATERMARK_MASK, 1', 'URGENCY_WATERMARK_MASK, 2'):
+        if needle not in wm:
+            fail('the driver no longer has "%s"' % needle)
+    for needle in ('kNoOfChanMask = 0xf000', 'mc_latency = 2000', 'dmif_size = 12288', '512 * 8 * 1000', '128 * 4 * 1000', '40000000 / wm.disp_clk', '1920 * 2', '2560 * 2', '4096 * 2', 'fx_const(7), fx_const(10)',
+                   'fx_const(8), fx_const(10)', 'fx_const(32)', 'line_time > 65535', 'clocks.apu ? 2 : 4'):
+        if needle not in cpp:
+            fail('ours lacks "%s"' % needle)
+    chan = re.findall(r'case (\d+):\s*(?:\n\s*)?return (\d+);', wm[wm.index('cik_get_number_of_dram_channels'):wm.index('struct dce10_wm_params')])
+    mine = re.findall(r'case (\d+): return (\d+);', cpp[cpp.index('Watermarks::dram_channels'):cpp.index('Watermarks::dram_bandwidth')])
+    if sorted(chan) != sorted(mine):
+        fail('DRAM channel counts %s vs %s' % (chan, mine))
     if bad:
         sys.exit(1)
     print('check_scanout_port: ok')

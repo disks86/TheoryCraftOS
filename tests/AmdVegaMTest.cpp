@@ -2128,6 +2128,7 @@ static void test_set_mode() {
   AmdVegaM vega(rig.alloc);
   AmdVegaM::Inputs in = rig.inputs();
   in.vbios = ConstByteView(vbios.data(), vbios.size());
+  in.display_clocks.sclk_high_khz = 1200000; in.display_clocks.mclk_high_khz = 800000; in.display_clocks.sclk_low_khz = 300000; in.display_clocks.mclk_low_khz = 150000;
   DisplayMode m;
   m.pixel_clock_khz = 148500;
   m.h_display = 1920; m.h_sync_start = 2008; m.h_sync_end = 2052; m.h_total = 2200;
@@ -2139,6 +2140,7 @@ static void test_set_mode() {
   const AtomConnectors::Connector edp = vega.connectors()[0], hdmi = vega.connectors()[1], dp = vega.connectors()[2];
   std::vector<uint8_t>& dpcd = auxcard.sink.dpcd;
   dpcd.assign(0x800, 0);
+  for (uint32_t i = 0; i < 6; ++i) rig.card.gfx.set_reg(0x321 + i, 0x10);      // the DMIF buffer allocation completes at once
   const uint8_t caps[8] = {0x12, 0x14, 0xC4, 0x01, 0x00, 0x00, 0x01, 0x00};
   for (size_t i = 0; i < 8; ++i) dpcd[i] = caps[i];
   dpcd[0x202] = dpcd[0x203] = 0x77;
@@ -2189,6 +2191,8 @@ static void test_set_mode() {
   CHECK(rig.card.dce.get(0x1a00 + 0x2600) == 1 && rig.card.dce.get(0x1a06 + 0x2600) == 1920 && rig.card.dce.get(0x1a0d + 0x2600) == 1920 && rig.card.dce.get(0x1a01 + 0x2600) == 2);
   surface.address = 0x100001;
   CHECK(!vega.set_mode(hdmi, 3, m, 8, &r, AmdModeSet::kPllInvalid, &surface) && r.failed == AmdVegaM::ModeSetStage::Scanout);
+  // the bandwidth update at the end of the base setup: the line buffer of CRTC 3 (1920 wide: two DMIF buffers) and its watermarks
+  CHECK((rig.card.gfx.reg(0x321 + 3) & 7) == 2 && rig.card.dce.get(0x1b33 + 0x2600) != 0);
   // HDMI is a flat panel device with a FMT block: 8 bits truncated (enable, depth 1), 6 bits depth 0, 12 bits nothing; an interlaced mode turns the interleave on; the VGA mode is off after the unblank
   CHECK(rig.card.dce.get(0x1bf2 + 0x2600) == (1u | 1u << 4) && (rig.card.dce.get(0x1ac0 + 0x2600) & 8) == 0 && (rig.card.dce.get(0xf9) & 1) == 0);
   {

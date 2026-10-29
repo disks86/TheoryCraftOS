@@ -87,6 +87,7 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
     uint64_t aperture_bytes = 0;
     MmioRegion doorbells;                         // the doorbell BAR (BAR 2), at least the first 8 KiB
     uint64_t max_framebuffer_bytes = 0;           // the largest picture the display could show (0: no display part)
+    amd_dce11::WatermarkClocks display_clocks;    // the engine and memory clocks the display watermarks are computed for (the driver's current / DPM sclk and mclk); all zero: the watermarks are not touched
     uint32_t hpd_pins = 0x3F;                     // the hot plug detect pins to watch (bit n: pin n); which pin a connector is on is in the video BIOS, so by default all of them
     IPciBus* pci = nullptr;                       // where the card is, for the full reset (AmdAsicReset): its configuration space
     PciAddress pci_address{};
@@ -370,6 +371,8 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
     uint32_t pixel_clock_khz = 0, bpc = 0, retrains = 0;
     uint8_t pll = AmdModeSet::kPllInvalid;
   };
+  amd_dce11::WatermarkHead heads_[AmdModeSet::kMaxCrtcs];     // the CRTCs the watermarks are computed for
+  void update_watermarks();
   uint32_t crtc_active_ = 0;       // bit n: CRTC n was enabled by set_mode (the driver's amdgpu_crtc->enabled)
   uint8_t crtc_pll_[AmdModeSet::kMaxCrtcs] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};      // the PLL each CRTC was set up with by set_mode (0xFF: none)
   Trained trained_[amd_dce11::Interrupts::kMaxHpd];

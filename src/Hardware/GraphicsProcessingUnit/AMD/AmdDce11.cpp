@@ -285,6 +285,192 @@ bool Scanout::program_fmt(uint32_t crtc, uint32_t bpc, bool dither) {
   return true;
 }
 
+
+// ---- Watermarks (dce_v11_0.c: line_buffer_adjust, the bandwidth functions, program_watermarks, bandwidth_update) ----
+
+namespace {
+constexpr uint32_t kLbMemoryCtrl = 0x1ac1, kPipe0DmifBufferControl = 0x321, kMcSharedChmap = 0x801, kDpgWatermarkMaskControl = 0x1b32, kDpgPipeUrgencyControl = 0x1b33;
+constexpr uint32_t kLbMemoryConfigShift = 20, kLbMemoryConfigMask = 0x300000, kDmifBuffersAllocatedMask = 0x7, kDmifBuffersAllocationCompleted = 0x10, kNoOfChanShift = 12, kNoOfChanMask = 0xf000,
+                   kUrgencyWatermarkMaskShift = 8, kUrgencyWatermarkMaskMask = 0x700;
+constexpr uint32_t kAllocationTimeoutUs = 100000;        // AMDGPU_MAX_USEC_TIMEOUT
+
+// drm_fixed.h fixed20_12
+inline uint32_t fx_const(uint32_t a) { return a << 12; }
+inline uint32_t fx_mul(uint32_t a, uint32_t b) { return static_cast<uint32_t>((uint64_t{a} * b + 2048) >> 12); }
+inline uint32_t fx_div(uint32_t a, uint32_t b) {
+  if (b == 0) return 0xFFFFFFFFu;      // (the driver would divide by zero)
+  uint64_t tmp = uint64_t{a} << 13;
+  tmp /= b;
+  tmp += 1;
+  tmp /= 2;
+  return static_cast<uint32_t>(tmp);
+}
+inline uint32_t fx_trunc(uint32_t a) { return a >> 12; }
+inline uint32_t min32(uint32_t a, uint32_t b) { return a < b ? a : b; }
+}  // namespace
+
+uint32_t Watermarks::dram_channels(uint32_t chmap) {
+  switch ((chmap & kNoOfChanMask) >> kNoOfChanShift) {
+    case 1: return 2;
+    case 2: return 4;
+    case 3: return 8;
+    case 4: return 3;
+    case 5: return 6;
+    case 6: return 10;
+    case 7: return 12;
+    case 8: return 16;
+    default: return 1;
+  }
+}
+
+uint32_t Watermarks::dram_bandwidth(const Params& wm) {
+  const uint32_t yclk = fx_div(fx_const(wm.yclk), fx_const(1000));
+  const uint32_t channels = fx_const(wm.dram_channels * 4);
+  const uint32_t efficiency = fx_div(fx_const(7), fx_const(10));       // 0.7
+  return fx_trunc(fx_mul(fx_mul(channels, yclk), efficiency));
+}
+
+// (The driver's dram_bandwidth_for_display, average-vs-available and latency hiding checks only decide whether to log "force priority to high", which changes nothing: not ported.)
+
+static uint32_t data_return_bandwidth(const Watermarks::Params& wm) {
+  const uint32_t sclk = fx_div(fx_const(wm.sclk), fx_const(1000));
+  const uint32_t efficiency = fx_div(fx_const(8), fx_const(10));       // 0.8
+  return fx_trunc(fx_mul(fx_mul(fx_const(32), sclk), efficiency));
+}
+
+static uint32_t dmif_request_bandwidth(const Watermarks::Params& wm) {
+  const uint32_t disp_clk = fx_div(fx_const(wm.disp_clk), fx_const(1000));
+  const uint32_t b = fx_mul(fx_const(32), disp_clk);
+  const uint32_t efficiency = fx_div(fx_const(8), fx_const(10));       // 0.8
+  return fx_trunc(fx_mul(b, efficiency));
+}
+
+uint32_t Watermarks::available_bandwidth(const Params& wm) {
+  return min32(dram_bandwidth(wm), min32(data_return_bandwidth(wm), dmif_request_bandwidth(wm)));
+}
+
+uint32_t Watermarks::average_bandwidth(const Params& wm) {
+  const uint32_t line_time = fx_div(fx_const(wm.active_time + wm.blank_time), fx_const(1000));
+  uint32_t bandwidth = fx_mul(fx_const(wm.src_width), fx_const(wm.bytes_per_pixel));
+  bandwidth = fx_mul(bandwidth, wm.vsc_full);
+  bandwidth = fx_div(bandwidth, line_time);
+  return fx_trunc(bandwidth);
+}
+
+uint32_t Watermarks::latency_watermark(const Params& wm) {
+  const uint32_t mc_latency = 2000;       // ns
+  uint32_t available = available_bandwidth(wm);
+  if (available == 0) available = 1;       // (the driver divides by it)
+  const uint32_t worst_chunk_return_time = (512 * 8 * 1000) / available;
+  const uint32_t cursor_line_pair_return_time = (128 * 4 * 1000) / available;
+  const uint32_t dc_latency = wm.disp_clk ? 40000000 / wm.disp_clk : 0;       // dc pipe latency
+  const uint32_t other_heads_data_return_time = ((wm.num_heads + 1) * worst_chunk_return_time) + (wm.num_heads * cursor_line_pair_return_time);
+  const uint32_t latency = mc_latency + other_heads_data_return_time + dc_latency;
+  const uint32_t dmif_size = 12288;
+  if (wm.num_heads == 0) return 0;
+  const uint32_t two = fx_const(2), one = fx_const(1);
+  uint32_t max_src_lines_per_dst_line;
+  if (wm.vsc_full > two || (wm.vsc_full > one && wm.vtaps >= 3) || wm.vtaps >= 5 || (wm.vsc_full >= two && wm.interlaced)) max_src_lines_per_dst_line = 4;
+  else max_src_lines_per_dst_line = 2;
+  const uint32_t a = fx_div(fx_const(available), fx_const(wm.num_heads));
+  uint32_t tmp = static_cast<uint32_t>(uint64_t{dmif_size} * wm.disp_clk / (mc_latency + 512));
+  tmp = min32(fx_trunc(a), tmp);
+  const uint32_t lb_fill_bw = min32(tmp, wm.disp_clk * wm.bytes_per_pixel / 1000);
+  const uint32_t lines = fx_const(max_src_lines_per_dst_line * wm.src_width * wm.bytes_per_pixel);
+  const uint32_t b = fx_div(fx_const(lb_fill_bw), fx_const(1000));
+  const uint32_t line_fill_time = fx_trunc(fx_div(lines, b));
+  if (line_fill_time < wm.active_time) return latency;
+  return latency + (line_fill_time - wm.active_time);
+}
+
+uint32_t Watermarks::line_buffer_adjust(uint32_t crtc, const WatermarkHead& head, const WatermarkClocks& clocks, bool* complete) {
+  uint32_t mem_cfg, buffer_alloc;
+  const bool on = head.enabled;
+  if (on) {
+    if (head.hdisplay < 1920) {
+      mem_cfg = 1;
+      buffer_alloc = 2;
+    } else if (head.hdisplay < 2560) {
+      mem_cfg = 2;
+      buffer_alloc = 2;
+    } else {       // (4096 and wider is too big for the line buffer: the driver goes on with this too)
+      mem_cfg = 0;
+      buffer_alloc = clocks.apu ? 2 : 4;
+    }
+  } else {
+    mem_cfg = 1;
+    buffer_alloc = 0;
+  }
+  const uint32_t off = kCrtcOffsets[crtc];
+  uint32_t tmp = r_.read(kLbMemoryCtrl + off);
+  r_.write(kLbMemoryCtrl + off, (tmp & ~kLbMemoryConfigMask) | (mem_cfg << kLbMemoryConfigShift));
+  tmp = r_.read(kPipe0DmifBufferControl + crtc);
+  r_.write(kPipe0DmifBufferControl + crtc, (tmp & ~kDmifBuffersAllocatedMask) | buffer_alloc);
+  *complete = false;
+  const uint64_t begin = clock_.now_us();
+  do {
+    if (r_.read(kPipe0DmifBufferControl + crtc) & kDmifBuffersAllocationCompleted) {
+      *complete = true;
+      break;
+    }
+  } while (clock_.now_us() - begin < kAllocationTimeoutUs);
+  if (!on) return 0;       // controller not enabled, so no lb used
+  switch (mem_cfg) {
+    case 1: return 1920 * 2;
+    case 2: return 2560 * 2;
+    default: return 4096 * 2;
+  }
+}
+
+void Watermarks::program(uint32_t crtc, const WatermarkHead& head, const WatermarkClocks& clocks, uint32_t lb_size, uint32_t num_heads) {
+  uint32_t line_time = 0, wm_a = 0, wm_b = 0, lead_lines = 0;
+  if (head.enabled && num_heads && head.clock_khz) {
+    const uint32_t active_time = static_cast<uint32_t>(uint64_t{head.hdisplay} * 1000000 / head.clock_khz);
+    line_time = static_cast<uint32_t>(uint64_t{head.htotal} * 1000000 / head.clock_khz);
+    if (line_time > 65535) line_time = 65535;
+    Params wm;
+    wm.disp_clk = head.clock_khz;
+    wm.src_width = head.hdisplay;
+    wm.active_time = active_time;
+    wm.blank_time = line_time - active_time;       // (the driver computes it the same way)
+    wm.interlaced = head.interlaced;
+    wm.lb_size = lb_size;
+    wm.dram_channels = dram_channels(r_.read(kMcSharedChmap));
+    wm.num_heads = num_heads;
+    wm.yclk = clocks.mclk_high_khz;
+    wm.sclk = clocks.sclk_high_khz;
+    wm_a = min32(latency_watermark(wm), 65535);
+    wm.yclk = clocks.mclk_low_khz;
+    wm.sclk = clocks.sclk_low_khz;
+    wm_b = min32(latency_watermark(wm), 65535);
+    lead_lines = (lb_size + head.hdisplay - 1) / head.hdisplay;
+  }
+  const uint32_t off = kCrtcOffsets[crtc];
+  const uint32_t mask = r_.read(kDpgWatermarkMaskControl + off);
+  const auto select = [&](uint32_t which) { r_.write(kDpgWatermarkMaskControl + off, (mask & ~kUrgencyWatermarkMaskMask) | (which << kUrgencyWatermarkMaskShift)); };
+  const auto set_urgency = [&](uint32_t low) { r_.write(kDpgPipeUrgencyControl + off, (low & 0xFFFF) | (line_time << 16)); };
+  select(1);       // wm A
+  set_urgency(wm_a);
+  select(2);       // wm B
+  set_urgency(wm_b);
+  r_.write(kDpgWatermarkMaskControl + off, mask);      // restore the original selection
+  results_[crtc] = {line_time, wm_a, wm_b, lead_lines};
+}
+
+bool Watermarks::update(const WatermarkHead* heads, const WatermarkClocks& clocks) {
+  uint32_t num_heads = 0;
+  for (uint32_t i = 0; i < kMaxCrtcs; ++i)
+    if (heads[i].enabled) ++num_heads;
+  bool all = true;
+  for (uint32_t i = 0; i < kMaxCrtcs; ++i) {
+    bool complete = false;
+    const uint32_t lb_size = line_buffer_adjust(i, heads[i], clocks, &complete);
+    all = all && complete;
+    program(i, heads[i], clocks, lb_size, num_heads);
+  }
+  return all;
+}
+
 bool Scanout::disable(uint32_t crtc) {
   if (crtc >= kMaxCrtcs) return false;
   r_.write(kGrphEnable + kCrtcOffsets[crtc], 0);
