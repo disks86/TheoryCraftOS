@@ -16,7 +16,7 @@ The internal panel is wired to the Intel GPU, so the Intel GPU is the boot displ
   None of it can be checked without the hardware.
 - **UVD 6.3 video decode** for the Vega M beyond H.264, H.265 (8 and 10 bit), MPEG-2, VC-1 (interlaced pictures untested against real data, see below) and MPEG-4 (the MPEG-4 tools listed below; the chip has no VP9), and any run of it on the card.
 - **VCE 3.4 video encode** on the Vega M beyond the start and stop (see the VCE section), and any run of it on the card.
-- **Hardware 3D** on the Vega M: a GCN4 PM4 path needing a shader compiler to the native ISA. On the Intel GPU see below for what is and is not there.
+- **Hardware 3D** on the Vega M: a GCN4 PM4 path. The shader side exists in `src/Hardware/GraphicsProcessingUnit/AMD/Gcn` (a GCN3 assembler checked against LLVM, a wave emulator, a TGSI parser and TGSI-to-GCN compiler, and `GcnDraw`, which runs compiled shaders on the emulator for a draw call); the PM4 draw packets and shader state registers are not written, and none of it has run on the card. On the Intel GPU see below for what is and is not there.
 - Nothing here was run on a real 9575.
 
 ## Intel Gen9.5 render engine (HD Graphics 630)
@@ -308,7 +308,7 @@ write-back page); an SDMA engine gets the `INDIRECT` packet placed to end on an 
 
 The simulated engines run the buffers' packets (register writes, memory writes, copies, fences) and object to anything else (a buffer that is not packets, a compute buffer without the valid bit, a VMID, an
 IB that does not end on an 8-dword boundary), so the packets' framing is checked; what the real microcode does with these framings, and with caches (the driver's fence packets flush the GPU's caches before the write;
-the simulated ones do not model caches), has not been seen. No shaders are run (there is no compiler for the GCN4 instruction set), no draws are issued, VMIDs other than 0 and the hardware-queue
+the simulated ones do not model caches), has not been seen. No shaders are run on the card (the compiler's output has only run on the emulator), no draws are issued, VMIDs other than 0 and the hardware-queue
 priorities are not used, and nothing in the OS calls these yet.
 
 ### Copies between system memory and video memory
