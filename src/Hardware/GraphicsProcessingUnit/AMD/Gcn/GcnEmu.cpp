@@ -218,13 +218,21 @@ Status Wave::exec_sop1(uint32_t w, uint32_t literal) {
   uint64_t a64 = 0;
   const Sop1 o = static_cast<Sop1>(op);
   const bool wide = o == Sop1::s_mov_b64 || o == Sop1::s_not_b64 || o == Sop1::s_and_saveexec_b64 || o == Sop1::s_or_saveexec_b64 || o == Sop1::s_xor_saveexec_b64 ||
-                    o == Sop1::s_andn2_saveexec_b64 || o == Sop1::s_orn2_saveexec_b64 || o == Sop1::s_nand_saveexec_b64;
+                    o == Sop1::s_andn2_saveexec_b64 || o == Sop1::s_orn2_saveexec_b64 || o == Sop1::s_nand_saveexec_b64 || o == Sop1::s_wqm_b64;
   if (wide ? !src64(code, literal, &a64) : !src32(code, literal, 0, &a)) return fail(Status::BadInstruction);
   switch (o) {
     case Sop1::s_mov_b32: put_sdst(sdst, a); break;
     case Sop1::s_not_b32: put_sdst(sdst, ~a); scc = ~a != 0; break;
     case Sop1::s_cmov_b32: if (scc) put_sdst(sdst, a); break;
     case Sop1::s_mov_b64: put_sdst64(sdst, a64); break;
+    case Sop1::s_wqm_b64: {       // whole quad mode: a quad (four consecutive lanes) with any lane set has all of them set
+      uint64_t r = 0;
+      for (uint32_t q = 0; q < 16; ++q)
+        if ((a64 >> (4 * q)) & 0xF) r |= 0xFull << (4 * q);
+      put_sdst64(sdst, r);
+      scc = r != 0;
+      break;
+    }
     case Sop1::s_not_b64: put_sdst64(sdst, ~a64); scc = ~a64 != 0; break;
     case Sop1::s_and_saveexec_b64: { const uint64_t old = exec; put_sdst64(sdst, old); exec = a64 & old; scc = exec != 0; break; }
     case Sop1::s_or_saveexec_b64: { const uint64_t old = exec; put_sdst64(sdst, old); exec = a64 | old; scc = exec != 0; break; }
