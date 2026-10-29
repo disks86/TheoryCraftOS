@@ -58,6 +58,8 @@ struct UserThread {
   bool suspend_requested = false, terminate_requested = false;
   uint32_t terminate_code = 0;
   bool parked = false, redirected = false, context_dirty = false;
+  uint64_t stale_rip = 0, stale_address = 0;      // the last fault that was answered by rebuilding the page tables (see UserMode.cpp), to catch one that repeats
+  uint32_t stale_count = 0;
   uint64_t core_mask = ~uint64_t{0};      // the cores it may run on (SetThreadAffinityMask)
   uint8_t priority = kernel::kDefaultPriority;      // the kernel scheduler priority (0..31), reapplied at launch() if the thread was not spawned yet
   uint64_t saved_rip = 0;

@@ -101,6 +101,13 @@ LoadStatus load_pe(const exe::PeFile& pe, ConstByteView file, AddressSpace& spac
   return map_pe_image(pe, file, space, pe.image_base(), require_entry, out);
 }
 
+bool pe_image_contains_code(const exe::PeFile& pe) {
+  // Windows: code if it has a size of code or an entry point; otherwise only an odd section alignment, or a single executable section, makes it code.
+  bool code = pe.entry_rva() != 0 || pe.size_of_code() != 0 || (pe.section_alignment() % 4096) != 0;
+  if (pe.sections().count() == 1 && (pe.sections().view()[0].characteristics & 0x20000000u)) code = true;      // IMAGE_SCN_MEM_EXECUTE
+  return code;
+}
+
 void describe_pe_image(const exe::PeFile& pe, uint64_t file_size, uint8_t (&out)[64], ConstByteView file) {
   for (uint8_t& b : out) b = 0;
   auto put = [&](uint32_t at, uint64_t value, uint32_t bytes) { for (uint32_t i = 0; i < bytes; ++i) out[at + i] = uint8_t(value >> (8 * i)); };
@@ -115,9 +122,7 @@ void describe_pe_image(const exe::PeFile& pe, uint64_t file_size, uint8_t (&out)
   put(44, pe.characteristics(), 2);
   put(46, pe.dll_characteristics(), 2);
   put(48, pe.machine(), 2);
-  // Windows: code if it has a size of code or an entry point; otherwise only an odd section alignment, or a single executable section, makes it code.
-  bool code = pe.entry_rva() != 0 || pe.size_of_code() != 0 || (pe.section_alignment() % 4096) != 0;
-  if (pe.sections().count() == 1 && (pe.sections().view()[0].characteristics & 0x20000000u)) code = true;      // IMAGE_SCN_MEM_EXECUTE
+  const bool code = pe_image_contains_code(pe);
   put(50, code ? 1 : 0, 1);
   uint32_t flags = (pe.dll_characteristics() & 0x40) ? 0x04 : 0;      // ImageDynamicallyRelocated
   uint32_t com_rva = 0, com_size = 0;
@@ -151,7 +156,8 @@ struct MappedPieces {
 };
 
 LoadStatus map_pe_image_pieces(const exe::PeFile& pe, ConstByteView file, AddressSpace& space, uint64_t base, bool require_entry, LoadedImage* out, MappedPieces& pieces) {
-  if (!pe.is_pe32_plus() || pe.machine() != exe::kPeMachineAmd64) return LoadStatus::Unsupported;
+  const bool data_only_32bit = !pe.is_pe32_plus() && pe.machine() == 0x14C && !pe_image_contains_code(pe);      // (a 32-bit image with nothing to run can be mapped like data)
+  if ((!pe.is_pe32_plus() || pe.machine() != exe::kPeMachineAmd64) && !data_only_32bit) return LoadStatus::Unsupported;
   if (pe.section_alignment() < AddressSpace::kPageSize) return LoadStatus::Unsupported;      // the old 512-byte layout shares pages between sections
   const uint64_t image_size = pe.size_of_image();
   uint64_t image_pages = 0;

@@ -355,6 +355,26 @@ Frame* on_user_fault(Frame* frame) {
     if (result == process::windowsabi::GuardResult::Retry) return frame;
     if (result == process::windowsabi::GuardResult::Exception) guard = 1;
   }
+  // A page the program may use but the CPU does not have in the tables it runs with (another thread, or a parent changing this program's memory, rebuilt them since): the
+  // tables are rebuilt and the instruction runs again. A fault at the same place a few times in a row is real.
+  if ((frame->vector & 0xFF) == 14 && !(frame->error & 1) && task->program.process()->abi() == process::SyscallAbi::Windows) {
+    const uint64_t stale_address = read_cr2();
+    process::AddressSpace* space = task->program.process()->address_space();
+    UserThread* self = current_user_thread();
+    if (space && self && stale_address < 0x0000800000000000ull) {
+      const uint8_t need = (frame->error & 0x10) ? process::kProtExecute : (frame->error & 2) ? process::kProtWrite : process::kProtRead;
+      bool again = false;
+      irq_enable();
+      task->mutex.lock();
+      if (space->check(stale_address, 1, need)) {
+        if (self->stale_rip == frame->rip && self->stale_address == stale_address) ++self->stale_count; else { self->stale_rip = frame->rip; self->stale_address = stale_address; self->stale_count = 1; }
+        again = self->stale_count <= 3 && task->sync_tables();
+      }
+      task->mutex.unlock();
+      irq_disable();
+      if (again) return frame;
+    }
+  }
   // A write to a copy-on-write page (PAGE_WRITECOPY) is not a fault: the page gets its own copy and the instruction runs again.
   if ((frame->vector & 0xFF) == 14 && (frame->error & 3) == 3 && task->program.process()->abi() == process::SyscallAbi::Windows) {
     const uint64_t cow_address = read_cr2();
