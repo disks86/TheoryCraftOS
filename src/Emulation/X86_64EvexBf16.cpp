@@ -1,0 +1,282 @@
+/*
+ * TheoryCraftOS - a minimal UEFI x86_64 operating system.
+ * Copyright (C) 2026 Christopher Schaefer
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+// Intel AVX10.2 BFloat16 arithmetic: vadd / vsub / vmul / vdiv / vmin / vmax / vsqrt / vfmadd / vfmsub / vfnmadd / vfnmsub / vscalef / vrcp / vrsqrt / vgetexp / vgetmant / vrndscale / vreduce / vfpclass /
+// vcmp / vcomis for bf16 elements. None of them reads or writes MXCSR or raises an exception: denormal inputs are zeros, denormal results are flushed, rounding is to nearest even.
+// (Specification: Intel AVX10.2 Architecture Specification 361050, chapter 7. vrcp and vrsqrt are computed correctly rounded, which is within the documented error bound.)
+#include "Emulation/SoftFloat.hpp"
+#include "Emulation/X86_64EvexInternal.hpp"
+
+namespace emulation {
+
+using namespace softfloat;
+
+// The rows: bfloat16 arithmetic is MAP5 with 66 (and vcomisbf16), the unary and fused operations MAP6, the ones with an immediate MAP3 with F2.
+const EvexOp kEvexBf16Ops[] = {
+    {5, 1, 0x58, 0, kBfloat, 0, 16, kFull},  {5, 1, 0x5C, 0, kBfloat, 1, 16, kFull},  {5, 1, 0x59, 0, kBfloat, 2, 16, kFull},  {5, 1, 0x5E, 0, kBfloat, 3, 16, kFull},
+    {5, 1, 0x5D, 0, kBfloat, 4, 16, kFull},  {5, 1, 0x5F, 0, kBfloat, 5, 16, kFull},  {5, 1, 0x51, 0, kBfloat, 6, 16, kFull},  {5, 1, 0x2F, 0, kBfloat, 17, 16, kS2},
+    {6, 0, 0x98, 0, kBfloat, 7, 16, kFull},  {6, 0, 0x9A, 0, kBfloat, 7, 16, kFull},  {6, 0, 0x9C, 0, kBfloat, 7, 16, kFull},  {6, 0, 0x9E, 0, kBfloat, 7, 16, kFull},
+    {6, 0, 0xA8, 0, kBfloat, 7, 16, kFull},  {6, 0, 0xAA, 0, kBfloat, 7, 16, kFull},  {6, 0, 0xAC, 0, kBfloat, 7, 16, kFull},  {6, 0, 0xAE, 0, kBfloat, 7, 16, kFull},
+    {6, 0, 0xB8, 0, kBfloat, 7, 16, kFull},  {6, 0, 0xBA, 0, kBfloat, 7, 16, kFull},  {6, 0, 0xBC, 0, kBfloat, 7, 16, kFull},  {6, 0, 0xBE, 0, kBfloat, 7, 16, kFull},
+    {6, 0, 0x2C, 0, kBfloat, 8, 16, kFull},  {6, 0, 0x42, 0, kBfloat, 9, 16, kFull},  {6, 0, 0x4C, 0, kBfloat, 10, 16, kFull}, {6, 0, 0x4E, 0, kBfloat, 11, 16, kFull},
+    {3, 3, 0x08, 0, kBfloat, 12, 16, kFull}, {3, 3, 0x56, 0, kBfloat, 13, 16, kFull}, {3, 3, 0x26, 0, kBfloat, 14, 16, kFull}, {3, 3, 0xC2, 0, kBfloat, 15, 16, kFull},
+    {3, 3, 0x66, 0, kBfloat, 16, 16, kFull},
+};
+const uint32_t kEvexBf16OpCount = sizeof(kEvexBf16Ops) / sizeof(kEvexBf16Ops[0]);
+
+namespace {
+
+constexpr Format kBf = Format::BF16;
+
+uint64_t flush(uint64_t x) { return (x & 0x7F80) == 0 ? (x & 0x8000) : x; }
+bool nan_of(uint64_t x) { return (x & 0x7F80) == 0x7F80 && (x & 0x7F) != 0; }
+uint64_t quiet(uint64_t x) { return x | 0x40; }
+constexpr uint64_t kIndefinite = 0xFFC0;
+
+uint32_t to_f32(uint64_t x) { return static_cast<uint32_t>(x) << 16; }
+
+Env make_env() {
+  Env e;
+  e.mode = Rounding::NearestEven;
+  e.daz = e.ftz = true;
+  return e;
+}
+
+// 2^k as a binary32 pattern, k in [-126, 127]
+uint32_t pow2(int k) { return static_cast<uint32_t>(k + 127) << 23; }
+
+// x * 2^k computed on binary32 (exact unless it overflows or underflows), flushed to a bf16 pattern.
+uint64_t scale_by_pow2(uint64_t x, int64_t k) {
+  Env e = make_env();
+  e.ftz = false;
+  uint64_t v = to_f32(x);
+  while (k > 0) { const int step = k > 100 ? 100 : static_cast<int>(k); v = mul(Format::F32, v, pow2(step), e); k -= step; }
+  while (k < 0) { const int step = k < -100 ? 100 : static_cast<int>(-k); v = mul(Format::F32, v, pow2(-step), e); k += step; }
+  Env f = make_env();
+  return flush(convert(Format::F32, kBf, v, f));
+}
+
+// ROUND(2^m * x, RNE) * 2^-m for a finite x (a bf16 has 8 significant bits, so a value of 2^(8-m) or more is its own result)
+uint64_t round_scaled(uint64_t x, int m) {
+  const int exp = static_cast<int>((x >> 7) & 0xFF) - 127;
+  if (exp >= 8 - m) return x;
+  Env e = make_env();
+  e.ftz = false;
+  const uint64_t scaled = mul(Format::F32, to_f32(x), pow2(m), e);
+  const uint64_t rounded = round_to_integral(Format::F32, scaled, Rounding::NearestEven, false, e);
+  const uint64_t back = mul(Format::F32, rounded, pow2(-m), e);
+  Env f = make_env();
+  f.ftz = false;
+  return convert(Format::F32, kBf, back, f);
+}
+
+enum Op : uint8_t {
+  kAddOp, kSubOp, kMulOp, kDivOp, kMinOp, kMaxOp, kSqrtOp, kFmaOp, kScalefOp, kGetExpOp, kRcpOp, kRsqrtOp, kRndOp, kReduceOp, kGetMantOp, kCmpOp, kClassOp, kComisOp
+};
+
+}  // namespace
+
+// sub: the operation (an Op); for the fused multiply-adds the opcode says which one (9x: 132, Ax: 213, Bx: 231; x = 8 madd, A msub, C nmadd, E nmsub).
+X86_64Cpu::Step X86_64Cpu::evex_bf16(GuestMemory& m, const EvexOp& def) {
+  const uint32_t op = def.sub & 0x1F;
+  const bool unary = op == kSqrtOp || op == kGetExpOp || op == kRcpOp || op == kRsqrtOp || op == kRndOp || op == kReduceOp || op == kGetMantOp || op == kClassOp || op == kComisOp;
+  if (ev_.er || ev_.w) return fail(6);
+  if (unary && ev_.vvvv != 0) return fail(6);
+  const uint32_t reg = ev_.reg, vl = op == kComisOp ? 128 : ev_.vl, n = vl / 16;
+  const uint32_t imm = ev_.imm & 0xFF;
+  Env env = make_env();
+  Vec b;
+  if (op == kComisOp) {
+    uint64_t v = 0;
+    if (ev_.memory) {
+      if (!load(m, memory_address(), 2, &v)) return Step::Fault;
+    } else {
+      v = element(get_vec(ev_.rm), 16, 0);
+    }
+    const uint64_t x = flush(element(get_vec(reg), 16, 0)), y = flush(v);
+    const Order o = compare(kBf, x, y, false, env);
+    uint64_t flags = s_.rflags & ~(kZero | kParity | kCarry | kOverflow | kSign | kAdjust);
+    if (o == Order::Unordered) flags |= kZero | kParity | kCarry;
+    else if (o == Order::Less) flags |= kCarry;
+    else if (o == Order::Equal) flags |= kZero;
+    s_.rflags = flags;
+    s_.rip += d_.position;
+    return Step::Ok;
+  }
+  if (!ev_read_rm(m, &b, 16, true, false)) return Step::Fault;
+  const Vec a = get_vec(ev_.vvvv);
+  const Vec dest = ev_.old_dest;
+  Vec result;
+  uint64_t mask_bits = 0;
+  for (uint32_t i = 0; i < n; ++i) {
+    const uint64_t x = element(a, 16, i), y = element(b, 16, i);      // (unary operations use y)
+    const uint64_t fx = flush(x), fy = flush(y);
+    uint64_t r = 0;
+    switch (op) {
+      case kAddOp: r = add(kBf, x, y, env); break;
+      case kSubOp: r = sub(kBf, x, y, env); break;
+      case kMulOp: r = mul(kBf, x, y, env); break;
+      case kDivOp: r = div(kBf, x, y, env); break;
+      case kMinOp: case kMaxOp: {
+        // the second operand when either is a NaN or both are zeros; otherwise the smaller / larger
+        if (nan_of(fx) || nan_of(fy) || ((fx & 0x7FFF) == 0 && (fy & 0x7FFF) == 0)) { r = fy; break; }
+        const Order o = compare(kBf, fx, fy, false, env);
+        r = (op == kMaxOp ? o == Order::Greater : o == Order::Less) ? fx : fy;
+        break;
+      }
+      case kSqrtOp: r = sqrt(kBf, y, env); break;
+      case kFmaOp: {
+        const uint32_t order = (def.opcode >> 4) == 9 ? 0 : (def.opcode >> 4) == 0xA ? 1 : 2;
+        const uint64_t d = element(dest, 16, i);
+        uint64_t p, q, c;
+        if (order == 0) { p = d; q = y; c = x; }      // 132: dest * src3 + src2
+        else if (order == 1) { p = x; q = d; c = y; }      // 213: src2 * dest + src3
+        else { p = x; q = y; c = d; }      // 231: src2 * src3 + dest
+        const uint32_t kind = def.opcode & 15;      // 8: madd, A: msub, C: nmadd, E: nmsub
+        if (kind >= 0xC) p = negate(kBf, p);
+        if (kind == 0xA || kind == 0xE) c = negate(kBf, c);
+        r = fused_multiply_add(kBf, p, q, c, env);
+        break;
+      }
+      case kScalefOp: {
+        if (nan_of(fx) || nan_of(fy)) { r = quiet(nan_of(fx) ? fx : fy); break; }
+        const bool y_inf = (fy & 0x7FFF) == 0x7F80, x_inf = (fx & 0x7FFF) == 0x7F80, x_zero = (fx & 0x7FFF) == 0;
+        if (y_inf) {
+          const bool y_neg = fy & 0x8000;
+          if (!y_neg) r = x_zero ? kIndefinite : (x_inf ? fx : (fx & 0x8000) | 0x7F80);
+          else r = x_inf ? kIndefinite : (fx & 0x8000);
+          break;
+        }
+        if (x_inf || x_zero) { r = fx; break; }
+        // floor(y)
+        const int ey = static_cast<int>((fy >> 7) & 0xFF) - 127;
+        int64_t k;
+        if ((fy & 0x7FFF) == 0) k = 0;
+        else if (ey >= 9) k = (fy & 0x8000) ? -100000 : 100000;
+        else {
+          Env e = make_env();
+          e.ftz = false;
+          const uint64_t fl = round_to_integral(Format::F32, to_f32(fy), Rounding::Down, false, e);
+          k = to_int(Format::F32, fl, 32, true, e);
+        }
+        r = scale_by_pow2(fx, k);
+        break;
+      }
+      case kGetExpOp: {
+        if (nan_of(y)) r = quiet(y);
+        else if ((y & 0x7F80) == 0x7F80) r = 0x7F80;
+        else if ((y & 0x7F80) == 0) r = 0xFF80;
+        else { Env e = make_env(); r = from_int(kBf, static_cast<int64_t>((y >> 7) & 0xFF) - 127, e); }
+        break;
+      }
+      case kRcpOp: case kRsqrtOp: {
+        if (nan_of(fy)) { r = quiet(fy); break; }
+        const bool neg = fy & 0x8000;
+        if ((fy & 0x7FFF) == 0) { r = (neg ? 0x8000 : 0) | 0x7F80; break; }
+        if ((fy & 0x7FFF) == 0x7F80) { r = (op == kRsqrtOp && neg) ? kIndefinite : (neg ? 0x8000 : 0); break; }
+        if (op == kRsqrtOp && neg) { r = kIndefinite; break; }
+        Env e = make_env();
+        e.ftz = false;
+        uint64_t v = to_f32(fy);
+        if (op == kRsqrtOp) v = sqrt(Format::F32, v, e);
+        v = div(Format::F32, 0x3F800000, v, e);
+        Env f = make_env();
+        r = convert(Format::F32, kBf, v, f);
+        break;
+      }
+      case kRndOp: case kReduceOp: {
+        if (nan_of(fy)) { r = quiet(fy); break; }
+        if ((fy & 0x7F80) == 0x7F80) { r = op == kRndOp ? fy : kIndefinite; break; }
+        const int mm = static_cast<int>(imm >> 4);
+        const uint64_t rounded = round_scaled(fy, mm);
+        if (op == kRndOp) { r = ((rounded & 0x7FFF) == 0) ? (fy & 0x8000) : rounded; break; }
+        r = sub(kBf, fy, rounded, env);
+        break;
+      }
+      case kGetMantOp: {
+        const uint32_t sc = (imm >> 2) & 3, interval = imm & 3;
+        if (nan_of(fy)) { r = quiet(fy); break; }
+        const bool neg = fy & 0x8000;
+        const bool zero = (fy & 0x7FFF) == 0, inf = (fy & 0x7FFF) == 0x7F80;
+        const uint64_t signed_one = (sc & 1) ? 0x3F80 : 0xBF80;
+        if (!neg && (zero || inf)) { r = 0x3F80; break; }
+        if (neg) {
+          if (zero) { r = signed_one; break; }
+          if (inf) { r = (sc & 2) ? kIndefinite : signed_one; break; }
+          if (sc & 2) { r = kIndefinite; break; }
+        }
+        uint64_t sign = (sc & 1) ? 0 : (fy & 0x8000);
+        uint64_t fraction = fy & 0x7F;
+        const int unbiased = static_cast<int>((fy >> 7) & 0xFF) - 127;
+        const bool odd = unbiased & 1;
+        const bool signaling_bit = (fraction >> 6) & 1;
+        uint64_t e;
+        switch (interval) {
+          case 0: e = 127; break;
+          case 1: e = odd ? 126 : 127; break;
+          case 2: e = 126; break;
+          default: e = signaling_bit ? 126 : 127; break;
+        }
+        r = sign | (e << 7) | fraction;
+        break;
+      }
+      case kCmpOp: case kClassOp: break;
+      default: break;
+    }
+    if (op == kCmpOp) {
+      const Order o = compare(kBf, fx, fy, false, env);
+      const bool unord = o == Order::Unordered, eq = o == Order::Equal, lt = o == Order::Less, gt = o == Order::Greater, ord = !unord;
+      bool t = false;
+      switch (imm & 15) {
+        case 0: t = ord && eq; break;
+        case 1: t = ord && lt; break;
+        case 2: t = ord && (lt || eq); break;
+        case 3: t = unord; break;
+        case 4: t = unord || !eq; break;
+        case 5: t = unord || !lt; break;
+        case 6: t = unord || !(lt || eq); break;
+        case 7: t = ord; break;
+        case 8: t = unord || eq; break;
+        case 9: t = unord || lt; break;
+        case 10: t = unord || lt || eq; break;
+        case 11: t = false; break;
+        case 12: t = ord && !eq; break;
+        case 13: t = ord && (gt || eq); break;
+        case 14: t = ord && gt; break;
+        default: t = true; break;
+      }
+      mask_bits |= uint64_t{t} << i;
+    } else if (op == kClassOp) {
+      const bool negative = y & 0x8000, ones = (y & 0x7F80) == 0x7F80, zeros = (y & 0x7F80) == 0;
+      const bool mant_zero = zeros || (y & 0x7F) == 0;
+      const bool snan = ones && !mant_zero && !((y >> 6) & 1), qnan = ones && !mant_zero && ((y >> 6) & 1);
+      const bool zero = zeros;
+      const bool t = ((imm & 1) && qnan) || ((imm & 2) && !negative && zero) || ((imm & 4) && negative && zero) || ((imm & 8) && !negative && ones && mant_zero) ||
+                     ((imm & 0x10) && negative && ones && mant_zero) || ((imm & 0x40) && negative && !ones && !zero) || ((imm & 0x80) && snan);
+      mask_bits |= uint64_t{t} << i;
+    } else {
+      set_element(result, 16, i, r);
+    }
+  }
+  if (op == kCmpOp || op == kClassOp) ev_write_k(mask_bits, n);
+  else ev_write_masked(reg, result, 16);
+  s_.rip += d_.position;
+  return Step::Ok;
+}
+
+}  // namespace emulation

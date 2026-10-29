@@ -522,6 +522,10 @@ X86_64Cpu::Step X86_64Cpu::step_evex(GuestMemory& m) {
     const EvexOp& o = kEvexFp16Ops[i];
     if (o.map == map && o.pp == pp && o.opcode == opcode && (o.w < 0 || o.w == static_cast<int>(w))) def = &o;
   }
+  for (uint32_t i = 0; !def && i < kEvexBf16OpCount; ++i) {
+    const EvexOp& o = kEvexBf16Ops[i];
+    if (o.map == map && o.pp == pp && o.opcode == opcode && (o.w < 0 || o.w == static_cast<int>(w))) def = &o;
+  }
   if (!def && map == 2 && pp == 1 && (opcode == 0xC6 || opcode == 0xC7)) {      // AVX-512 PF: vgather/vscatterpf0/1 d/q ps/pd: prefetch hints, they do nothing and cannot fault
     if (!decode_modrm()) return bad_decode();
     const uint32_t kind = d_.reg & 7;
@@ -569,8 +573,8 @@ X86_64Cpu::Step X86_64Cpu::step_evex(GuestMemory& m) {
     const uint32_t vb = vl / 8;
     switch (def->tuple) {
       case kFullMem: n = (def->kind == kDup && def->sub == 6 && vl == 128) ? 8 : vb; break;
-      case kFull: n = ev_.bcst ? (def->kind == kCvt || def->map >= 5 || (elem == 16 && def->kind >= kFpBin && def->kind <= kRsqrt14) ? elem / 8 : (w ? 8 : 4)) : vb; break;
-      case kHalf: n = ev_.bcst ? (def->kind == kCvt || def->map >= 5 || (elem == 16 && def->kind >= kFpBin && def->kind <= kRsqrt14) ? elem / 8 : (w ? 8 : 4)) : vb / 2; break;
+      case kFull: n = ev_.bcst ? (def->kind == kCvt || def->map >= 5 || (elem == 16 && def->kind >= kFpBin && def->kind <= kRsqrt14) || def->kind == kBfloat ? elem / 8 : (w ? 8 : 4)) : vb; break;
+      case kHalf: n = ev_.bcst ? (def->kind == kCvt || def->map >= 5 || (elem == 16 && def->kind >= kFpBin && def->kind <= kRsqrt14) || def->kind == kBfloat ? elem / 8 : (w ? 8 : 4)) : vb / 2; break;
       case kQuarter: n = ev_.bcst ? elem / 8 : vb / 4; break;
       case kEighth: n = vb / 8; break;
       case kScalar: n = elem / 8; break;
@@ -602,6 +606,7 @@ X86_64Cpu::Step X86_64Cpu::step_evex(GuestMemory& m) {
     case kComplex: return evex_fp16(m, *def);
     case kFma4: return evex_fp(m, *def);
     case kEr: return evex_er(m, *def);
+    case kBfloat: return evex_bf16(m, *def);
     case kDot: case kVnni: case kMadd52: case kMultishift: case kShufBit: case kShift2: case kShift2Var: case kGfAffine: case kGfMul: case kBf16: case kAesNi: case kClmul: case kBroadcastMask: case kDbpsadbw:
       return evex_ext(m, *def);
     default: return evex_misc(m, *def);

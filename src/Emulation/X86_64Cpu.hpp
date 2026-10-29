@@ -178,7 +178,8 @@ class X86_64Cpu final : public IGuestCpu {
   Step evex_fp(GuestMemory& m, const EvexOp& def);
   Step evex_fp16(GuestMemory& m, const EvexOp& def);
   Step evex_ext(GuestMemory& m, const EvexOp& def);
-  Step evex_er(GuestMemory& m, const EvexOp& def);      // X86_64Misc.cpp: AVX-512 ER
+  Step evex_er(GuestMemory& m, const EvexOp& def);
+  Step evex_bf16(GuestMemory& m, const EvexOp& def);      // X86_64EvexBf16.cpp: AVX10.2 bfloat16 arithmetic      // X86_64Misc.cpp: AVX-512 ER
   Step evex_vsib(GuestMemory& m, const EvexOp& def);
   Vec512 get_vec(uint32_t reg) const;
   void set_vec(uint32_t reg, const Vec512& value, uint32_t vl_bits);

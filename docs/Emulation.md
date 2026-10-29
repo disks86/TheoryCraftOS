@@ -208,6 +208,10 @@ programs built with `-march=haswell` (or x86-64-v3) run. `X86_64Vex.cpp` holds a
   a 66 or REX prefix before EVEX) are #UD. The promoted instructions run the legacy implementation (a REX2-like decoder state, the same arithmetic and flags) and then rearrange the result, so they cannot differ
   from the legacy forms; `tests/ApxEvexTest.cpp` runs every form against its legacy instruction. Not promoted yet: map 4 `adcx` / `adox`, `crc32`, `movbe`, `movdiri`, `movdir64b`, `enqcmd`, `wrss`, the VEX
   and EVEX extensions (BMI and `kmov` on R16..R31, vector instructions using R16..R31 as base or index), and the PPX hints (which have no effect).
+- **AVX10.2, part 1: bfloat16 arithmetic** (`src/Emulation/X86_64EvexBf16.cpp`; SoftFloat gained a `BF16` format): `vadd` / `vsub` / `vmul` / `vdiv` / `vmin` / `vmax` / `vsqrt` / `vfmadd` / `vfmsub` / `vfnmadd` /
+  `vfnmsub` (132, 213, 231) / `vscalef` / `vrcp` / `vrsqrt` / `vgetexp` / `vgetmant` / `vrndscale` / `vreduce` `bf16`, `vcmpbf16`, `vfpclassbf16` and `vcomisbf16`, with the architecture's rules: no MXCSR use and no
+  exception flags, denormal inputs are zeros, denormal results are flushed, round to nearest even. `vrcp` and `vrsqrt` are correctly rounded (inside the architectural error bound). `vgetexpbf16` of -INF gives +INF
+  (the specification's pseudocode would give 128). cpuid still reports AVX10 version 1 because the rest of AVX10.2 is not there. `tests/Bf16Test.cpp` checks against the host's double arithmetic.
 - **Not implemented** (an invalid-instruction fault, never a wrong result): the rest of APX (above), the AVX10.2
   additions, `vpermil2ps/pd` and LWP, CET shadow-stack instructions beyond the no-op forms, `xsaves`/`xrstors` and `xgetbv` with ECX=1.
   Exceptions delivered to a Windows program save the XMM halves of vector state in the `CONTEXT` in memory, not the upper halves (the emulator keeps those itself).
