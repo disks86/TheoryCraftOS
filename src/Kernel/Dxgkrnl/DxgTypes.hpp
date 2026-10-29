@@ -206,6 +206,8 @@ struct PipelineDesc {
   graphics::BlendState blend;                                  // needs the adapter's kFeatureBlendState (caps.features)
   graphics::CompareOp depth_compare = graphics::CompareOp::LessEqual;   // ... as does any comparison but LessEqual
   // (the attributes' per_instance flag needs kFeatureInstancing)
+  bool independent_blend = false;    // needs kFeatureIndependentBlend: target n (1..3) blends with target_blend[n - 1], target 0 with `blend` (see graphics::GraphicsPipelineDesc)
+  graphics::BlendState target_blend[graphics::kMaxColorTargets - 1];
   uint32_t color_target_count = 1;   // the colour outputs the pixel shader fills (SV_Target0 ..); more than one needs the adapter's kFeatureMultipleTargets, and a pass with that many targets
 };
 

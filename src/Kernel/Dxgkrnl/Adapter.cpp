@@ -840,6 +840,11 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   if (static_cast<uint32_t>(d.depth_compare) > 7 || static_cast<uint32_t>(bs.src_color) > 10 || static_cast<uint32_t>(bs.dst_color) > 10 || static_cast<uint32_t>(bs.src_alpha) > 10 ||
       static_cast<uint32_t>(bs.dst_alpha) > 10 || static_cast<uint32_t>(bs.color_op) > 4 || static_cast<uint32_t>(bs.alpha_op) > 4 || bs.write_mask > 0xF)
     return status::kInvalidParameter;
+  for (const graphics::BlendState& t : d.target_blend)
+    if (static_cast<uint32_t>(t.src_color) > 10 || static_cast<uint32_t>(t.dst_color) > 10 || static_cast<uint32_t>(t.src_alpha) > 10 || static_cast<uint32_t>(t.dst_alpha) > 10 ||
+        static_cast<uint32_t>(t.color_op) > 4 || static_cast<uint32_t>(t.alpha_op) > 4 || t.write_mask > 0xF)
+      return status::kInvalidParameter;
+  if (d.independent_blend && !(caps_.features & graphics::kFeatureIndependentBlend)) return status::kNotSupported;
   if ((bs.custom || d.depth_compare != graphics::CompareOp::LessEqual) && !(caps_.features & graphics::kFeatureBlendState)) return status::kNotSupported;
   for (uint32_t i = 0; i < d.attribute_count; ++i)
     if (d.attributes[i].per_instance && !(caps_.features & graphics::kFeatureInstancing)) return status::kNotSupported;
@@ -861,6 +866,8 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   pd.alpha_blend = d.alpha_blend;
   pd.stencil = st;
   pd.blend = bs;
+  pd.independent_blend = d.independent_blend;
+  for (uint32_t i = 0; i < graphics::kMaxColorTargets - 1; ++i) pd.target_blend[i] = d.target_blend[i];
   pd.depth_compare = d.depth_compare;
   pd.color_target_count = d.color_target_count;
 

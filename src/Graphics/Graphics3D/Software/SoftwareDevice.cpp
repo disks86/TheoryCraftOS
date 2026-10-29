@@ -585,15 +585,19 @@ void write_fragment(const DrawState& s, int32_t x, int32_t y, float z, bool dept
     const SoftwareImage* image = n == 0 ? s.color : s.extra_colors[n - 1];
     if (!image) break;
     const Surface surface = image->surface();
+    // (the state of this target: its own with independent blending, which has no source-over shorthand)
+    const bool own = pd.independent_blend && n > 0;
+    const BlendState& blend = own ? pd.target_blend[n - 1] : pd.blend;
+    const bool over = !own && !blend.custom && pd.alpha_blend;
     if (!surface.floats.empty()) {
       Vec4* pixel = surface.float_row(static_cast<uint32_t>(y)) + x;
-      *pixel = image->store_float(blend_float(pd.blend, !pd.blend.custom && pd.alpha_blend, colors[n], *pixel));
+      *pixel = image->store_float(blend_float(blend, over, colors[n], *pixel));
       continue;
     }
     uint32_t out = pack_color(colors[n]);
     uint32_t* pixel = surface.row(static_cast<uint32_t>(y)) + x;
-    if (pd.blend.custom) out = blend_pixel(pd.blend, out, surface.decode(*pixel));
-    else if (pd.alpha_blend) out = blend_over(out, surface.decode(*pixel));
+    if (blend.custom) out = blend_pixel(blend, out, surface.decode(*pixel));
+    else if (over) out = blend_over(out, surface.decode(*pixel));
     *pixel = surface.encode(out);
   }
   if (pd.depth_write && !depth.empty()) depth[index] = z;

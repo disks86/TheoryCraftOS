@@ -745,6 +745,40 @@ void scene_multiple_targets(Rig& rig, ArrayView<uint32_t> out) {
   release_view(rig.allocator(), other);
 }
 
+// Independent blending: two overlapping triangles into two targets that start at dark grey. Target 0 adds (One + One) so the overlap is brighter than either triangle; target 1 does
+// not blend, so the overlap is the second triangle alone. Even columns of the picture are target 0, odd ones target 1.
+void scene_independent_blend(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureMultipleTargets | graphics::kFeatureBlendState | graphics::kFeatureIndependentBlend)) return void(rig.step("independent blend", status::kNotSupported));
+  namespace b = conformance_blobs;
+  const Vertex v[6] = {{-0.9f, -0.9f, 0.5f, 0.5f, 0.1f, 0.1f, 1}, {0.7f, -0.9f, 0.5f, 0.5f, 0.1f, 0.1f, 1}, {-0.1f, 0.9f, 0.5f, 0.5f, 0.1f, 0.1f, 1},
+                       {-0.7f, 0.5f, 0.5f, 0.1f, 0.4f, 0.3f, 1}, {0.9f, 0.5f, 0.5f, 0.1f, 0.4f, 0.3f, 1}, {0.1f, -0.9f, 0.5f, 0.1f, 0.4f, 0.3f, 1}};
+  Handle vs = rig.vertex_shader(bytes_of(b::k_vs, sizeof b::k_vs));
+  Handle ps = rig.pixel_shader(bytes_of(b::k_ps_mrt, sizeof b::k_ps_mrt));
+  PipelineDesc pd = colour_pipeline_desc(vs, ps);
+  pd.varying_count = 3;
+  pd.color_target_count = 2;
+  pd.blend.custom = pd.blend.enable = true;
+  pd.blend.src_color = pd.blend.dst_color = pd.blend.src_alpha = pd.blend.dst_alpha = graphics::BlendFactor::One;
+  pd.independent_blend = true;   // (target 1: the default state, no blending)
+  Handle pipe = rig.pipeline(pd);
+  Handle first = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize), second = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  CommandWriter w(rig.allocator());
+  w.begin_pass_targets(0, {1}, kNoAllocation, kPassClearColor, {0.1f, 0.1f, 0.1f, 1}, 1.0f, 0);
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(2);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(6);
+  w.end_pass();
+  rig.render(w, {first, second, vb});
+  ArrayView<uint32_t> other = allocate_view<uint32_t>(rig.allocator(), uint64_t{kSize} * kSize);
+  if (other.empty()) return void(rig.step("memory", status::kNoMemory));
+  rig.read(first, out);
+  rig.read(second, other);
+  for (uint32_t i = 1; i < kSize * kSize; i += 2) out[i] = other[i];
+  release_view(rig.allocator(), other);
+}
+
 // A float render target (half or single precision): two triangles are added into it (One + One), so where they overlap the colour is above 1 - which a clamping target would lose - and
 // the target is then sampled as a texture, scaled by 0.4 (ps_scale.dxbc), into an ordinary target.
 void float_target_scene(Rig& rig, ArrayView<uint32_t> out, Format format) {
@@ -966,6 +1000,7 @@ const Entry kScenes[] = {
     {"Direct3D 10 per-instance attribute", scene_instanced_colour},
     {"Direct3D 10 instancing", scene_instancing},
     {"Direct3D 10 multiple render targets (DXBC)", scene_multiple_targets},
+    {"Direct3D 10 independent blend per render target (DXBC)", scene_independent_blend},
     {"Direct3D 10 half-float render target and texture", scene_half_float_target},
     {"Direct3D 10 float render target and texture", scene_float_target},
     {"Direct3D 10 occlusion queries", scene_occlusion_query},
