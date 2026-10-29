@@ -661,7 +661,7 @@ static ImageDescriptor tex_image(const BigTexMem& m, uint32_t w, uint32_t h, uin
   d.address = m.base;
   d.width = w;
   d.height = h;
-  d.pitch_pixels = image_pitch(w, levels);
+  d.pitch_pixels = image_pitch(w, h, levels, 4);
   d.tile_index = 9;
   d.levels = levels;
   d.type = type;
