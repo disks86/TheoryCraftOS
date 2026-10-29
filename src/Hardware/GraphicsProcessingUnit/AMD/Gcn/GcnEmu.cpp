@@ -633,6 +633,28 @@ Status Wave::exec_valu(uint32_t w0, uint32_t w1, uint32_t literal) {
           float_result = true;
           break;
         }
+        case Vop3::v_cubeid_f32: case Vop3::v_cubesc_f32: case Vop3::v_cubetc_f32: case Vop3::v_cubema_f32: {
+          // the face of a direction (x, y, z), the coordinates on it and twice the major axis: the major axis is z if |z| >= |x|, |y|, else y if |y| >= |x|, else x (ties go the same way)
+          if (!fsrc(0, lane, &a) || !fsrc(1, lane, &b) || !fsrc(2, lane, &c)) return fail(Status::BadInstruction);
+          const float ax = a < 0 ? -a : a, ay = b < 0 ? -b : b, az = c < 0 ? -c : c;
+          uint32_t face;
+          if (az >= ax && az >= ay) face = c < 0 ? 5 : 4;
+          else if (ay >= ax) face = b < 0 ? 3 : 2;
+          else face = a < 0 ? 1 : 0;
+          float sc, tc, ma;
+          switch (face) {
+            case 0: sc = -c; tc = -b; ma = a; break;
+            case 1: sc = c; tc = -b; ma = a; break;
+            case 2: sc = a; tc = c; ma = b; break;
+            case 3: sc = a; tc = -c; ma = b; break;
+            case 4: sc = a; tc = -b; ma = c; break;
+            default: sc = -a; tc = -b; ma = c; break;
+          }
+          const float f = o == Vop3::v_cubeid_f32 ? static_cast<float>(face) : o == Vop3::v_cubesc_f32 ? sc : o == Vop3::v_cubetc_f32 ? tc : 2.0f * ma;
+          r = as_bits(f);
+          float_result = true;
+          break;
+        }
         case Vop3::v_cvt_pkrtz_f16_f32: {
           if (!fsrc(0, lane, &a) || !fsrc(1, lane, &b)) return fail(Status::BadInstruction);
           r = static_cast<uint32_t>(to_half_rtz(a)) | (static_cast<uint32_t>(to_half_rtz(b)) << 16);
@@ -807,10 +829,13 @@ Status Wave::exec_mimg(uint32_t w0, uint32_t w1, IEnvironment& env) {
   const uint32_t op = (w0 >> 18) & 0x7F, dmask = (w0 >> 8) & 0xF;
   const uint32_t vaddr = w1 & 0xFF, vdata = (w1 >> 8) & 0xFF, srsrc = ((w1 >> 16) & 0x1F) * 4, ssamp = ((w1 >> 21) & 0x1F) * 4;
   const Mimg o = static_cast<Mimg>(op);
+  // the address registers: the bias (image_sample_b) first, then the coordinates of the image's type (2 for a 2D image, 3 for 3D, array and cube), then the level of detail (image_sample_l)
+  const uint32_t type = sgpr[srsrc + 3] >> 28;
+  const uint32_t dims = type == 10 || type == 11 || type == 13 ? 3 : 2;
   uint32_t coords = 0;
   switch (o) {
-    case Mimg::image_sample: case Mimg::image_sample_lz: case Mimg::image_load: coords = 2; break;       // 2D images
-    case Mimg::image_sample_l: case Mimg::image_sample_b: coords = 3; break;
+    case Mimg::image_sample: case Mimg::image_sample_lz: case Mimg::image_load: coords = dims; break;
+    case Mimg::image_sample_l: case Mimg::image_sample_b: coords = dims + 1; break;
     default: return fail(Status::BadInstruction);
   }
   for (uint32_t lane = 0; lane < kWaveSize; ++lane) {

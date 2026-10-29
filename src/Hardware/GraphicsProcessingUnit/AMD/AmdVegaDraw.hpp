@@ -22,7 +22,7 @@
 //
 // The back end: the colour buffer may be linear or 1D tiled (tile mode index 8 or 9), the draw may blend, and may test and write a depth plane (32 bit float) and a stencil plane (8 bit),
 // which are cleared to the request's values before the draw and handed back after it, in their layout (`pixel_offset` and friends say where a pixel is). Up to eight textures are given
-// as tightly packed rows of texels; they are put in the area in their tile mode (linear or 1D tiled) and the image and sampler descriptors go in the descriptor table.
+// as tightly packed rows of texels (with their mip levels and slices); they are put in the area in their tile mode (linear or 1D tiled) and the image and sampler descriptors go in the descriptor table.
 //
 // The area is laid out from `area_offset` in this order, each piece 256 byte aligned: vertex code, pixel code, vertex constants, pixel constants, the descriptor table, the vertices, the
 // indices, the colour buffer, the depth plane, the stencil plane, the textures. Not validated on a real card (see GcnState.hpp for what the stream leaves out).
@@ -40,8 +40,13 @@ namespace hardware {
 struct VegaTexture {
   gcn::TexelFormat format = gcn::TexelFormat::Rgba8Unorm;
   uint32_t width = 0, height = 0;
-  uint32_t tile_index = 8;                                          // 8 linear, 9 1D tiled (display)
-  ConstByteView texels;                                             // width * height texels, rows tightly packed
+  uint32_t tile_index = 8;                                          // 8 linear, 9 1D tiled (display); more than one level or any slices need 9
+  gcn::ImageType type = gcn::ImageType::Image2D;
+  uint32_t depth = 1;                                               // 3D: the depth; array: the layers; cube: 6
+  uint32_t levels = 1;
+  // The texels: for each level from the base, for each slice, the rows of that level tightly packed (width >> level, at least 1, by height >> level; a 3D image has depth >> level slices
+  // in the level).
+  ConstByteView texels;
   gcn::SamplerDescriptor sampler;
 };
 
