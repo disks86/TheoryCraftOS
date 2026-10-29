@@ -80,6 +80,23 @@ static void test_single_block() {
   CHECK((bus.get(Bus::kEnData) & ~Bus::kEnDataBit) == (0x55555555u & ~Bus::kEnDataBit) && (bus.get(Bus::kMaskData) & ~Bus::kMaskDataBit) == (0x55555555u & ~Bus::kMaskDataBit));
 }
 
+static void test_hw_capable_pads() {
+  // A hardware capable line (the id's bit 7) has its pads switched to DDC mode first: bit 16 of the clock mask register is cleared (amdgpu_i2c_pre_xfer); other lines leave it.
+  TestAllocator alloc;
+  TickClock clock;
+  for (int hw = 0; hw < 2; ++hw) {
+    Bus bus;
+    bus.edid = make_edid(0);
+    AtomI2c::Bus record = bus.record();
+    record.hw_capable = hw != 0;
+    AmdDdc ddc(bus, clock, record);
+    ByteBuffer out(alloc);
+    const uint32_t before = bus.get(Bus::kMaskClk);
+    CHECK(ddc.read_edid(&out));
+    CHECK(((bus.get(Bus::kMaskClk) >> 16) & 1) == (hw ? 0u : ((before >> 16) & 1)));
+  }
+}
+
 static void test_masked_while_busy() {
   // During the transfer the pads are masked to software (mask bits set), as they must be for the enable bits to matter.
   TestAllocator alloc;
@@ -332,6 +349,7 @@ static void test_damage() {
 int main() {
   test_single_block();
   test_masked_while_busy();
+  test_hw_capable_pads();
   test_start_state_and_time();
   test_extensions();
   test_retries_and_failures();
