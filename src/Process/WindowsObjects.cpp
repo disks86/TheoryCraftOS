@@ -776,7 +776,8 @@ uint32_t map_image_view(Process& p, const SyscallRequest& r, uint32_t section_id
     space->unmap_allocation(chosen);
     return loaded == LoadStatus::OutOfMemory ? kNoResources : (loaded == LoadStatus::Malformed ? kStatusConflictingAddresses : 0xC000007Bu);
   }
-  if (moved && !apply_relocations(*space, pe, chosen, chosen - pe.image_base())) { space->unmap(chosen, rounded); return 0xC000007Bu; }
+  // An image that is not linked for dynamic base is mapped where there is room without its relocations being applied (Windows leaves it as the file has it).
+  if (moved && (pe.dll_characteristics() & 0x40) && !apply_relocations(*space, pe, chosen, chosen - pe.image_base())) { space->unmap(chosen, rounded); return 0xC000007Bu; }
   describe_image_pages(*space, pe, chosen);
   if (moved && (pe.dll_characteristics() & 0x40)) record_image_base(*space, chosen);
   if (!p.write_user_u64(r.args[2], chosen) || !p.write_user_u64(size_at, rounded)) { space->unmap_allocation(chosen); return kAccessViolation; }
