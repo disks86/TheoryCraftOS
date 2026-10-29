@@ -54,7 +54,7 @@ class Allocation {
   bool can_be_resident() const { return !is_staging(); }
   bool resident() const { return image_ != nullptr || buffer_ != nullptr; }
   uint32_t mip_levels() const { return desc_.mip_levels; }
-  uint32_t pitch() const { return is_image() ? desc_.width * 4 : 0; }
+  uint32_t pitch() const { return is_image() ? desc_.width * pixel_bytes(desc_.format) : 0; }
 
   // The system-memory backing (empty for depth images). Little-endian words in desc().format's layout; the levels of a mipmapped texture follow each other.
   ConstByteView backing() const { return cpu_; }

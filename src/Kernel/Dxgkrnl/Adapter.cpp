@@ -48,14 +48,15 @@ uint32_t vertex_format_bytes(graphics::VertexFormat f) { return (static_cast<uin
 // The GPU's newer contents are read back first, and the destination's device object is marked stale. The caller has checked the rectangles.
 NtStatus copy_region_cpu(VidMm& mm, Allocation& dst, uint32_t dx, uint32_t dy, Allocation& src, uint32_t sx, uint32_t sy, uint32_t w, uint32_t h) {
   if (!mm.read_back(src) || !mm.read_back(dst)) return status::kInvalidDeviceState;
-  const uint64_t row_bytes = uint64_t{w} * 4;
+  const uint32_t bpp = pixel_bytes(dst.desc().format);   // (the formats are equal)
+  const uint64_t row_bytes = uint64_t{w} * bpp;
   const bool bottom_up = &dst == &src && dy > sy;   // (overlapping rows: copy the ones that would be overwritten last)
   for (uint32_t i = 0; i < h; ++i) {
     const uint32_t y = bottom_up ? h - 1 - i : i;
     ByteView to;
     ConstByteView from;
-    if (!dst.writable_backing().try_subview((uint64_t{dy + y} * dst.desc().width + dx) * 4, row_bytes, &to) ||
-        !src.backing().try_subview((uint64_t{sy + y} * src.desc().width + sx) * 4, row_bytes, &from))
+    if (!dst.writable_backing().try_subview((uint64_t{dy + y} * dst.desc().width + dx) * bpp, row_bytes, &to) ||
+        !src.backing().try_subview((uint64_t{sy + y} * src.desc().width + sx) * bpp, row_bytes, &from))
       return status::kInvalidParameter;
     to.copy_from(from);
   }
@@ -111,6 +112,16 @@ class Adapter::StreamRunner {
 
   Allocation* alloc(uint32_t index) const { return index < allocations_.size() ? allocations_[index].get() : nullptr; }
   static bool exact(const ByteReader& p) { return p.ok() && p.at_end(); }
+  static bool is_extra_target(Allocation* const* extras, uint32_t count, const Allocation* a) {
+    for (uint32_t n = 0; n < count; ++n)
+      if (extras[n] == a) return true;
+    return false;
+  }
+  static bool is_extra_target(const Allocation* const* extras, uint32_t count, const Allocation* a) {
+    for (uint32_t n = 0; n < count; ++n)
+      if (extras[n] == a) return true;
+    return false;
+  }
 
   NtStatus walk() {
     ByteReader in(commands_);
@@ -193,25 +204,44 @@ class Adapter::StreamRunner {
     clear.x = bits_float(p.le32()), clear.y = bits_float(p.le32()), clear.z = bits_float(p.le32()), clear.w = bits_float(p.le32());
     const float clear_depth = bits_float(p.le32());
     const uint32_t clear_stencil = p.le32();
+    // Further colour targets, one word each (the adapter's kFeatureMultipleTargets).
+    Allocation* extras[graphics::kMaxColorTargets - 1] = {};
+    uint32_t extra_count = 0;
+    while (!p.at_end() && p.ok() && extra_count < graphics::kMaxColorTargets - 1) {
+      extras[extra_count] = alloc(p.le32());
+      if (!extras[extra_count]) return kBad;
+      ++extra_count;
+    }
     if (!exact(p) || in_pass_) return kBad;
+    if (extra_count && !(adapter_.caps_.features & graphics::kFeatureMultipleTargets)) return kBad;
     Allocation* color = alloc(color_index);
     Allocation* depth = depth_index == kNoAllocation ? nullptr : alloc(depth_index);
     if (!color || !color->is_image() || !(color->desc().flags & kAllocRenderTarget)) return kBad;
     if (depth_index != kNoAllocation && (!depth || !depth->is_image() || !(depth->desc().flags & kAllocDepthStencil))) return kBad;
     if (depth && (depth->desc().width != color->desc().width || depth->desc().height != color->desc().height)) return kBad;
+    for (uint32_t n = 0; n < extra_count; ++n) {
+      const Allocation* e = extras[n];
+      if (!e->is_image() || !(e->desc().flags & kAllocRenderTarget) || e == color || e == depth) return kBad;
+      if (e->desc().width != color->desc().width || e->desc().height != color->desc().height || e->desc().format != color->desc().format) return kBad;
+      for (uint32_t k = 0; k < n; ++k)
+        if (extras[k] == e) return kBad;
+    }
     if (flags & ~(kPassClearColor | kPassClearDepth | kPassClearStencil)) return kBad;
     if (!finite_within(clear.x, 1e6f) || !finite_within(clear.y, 1e6f) || !finite_within(clear.z, 1e6f) || !finite_within(clear.w, 1e6f)) return kBad;
     if (!(clear_depth >= 0.0f && clear_depth <= 1.0f) || clear_stencil > 255) return kBad;
     // A render pass may not draw into an image that is bound as a texture.
     for (uint32_t u = 0; u < graphics::kMaxTextureUnits; ++u)
-      if (texture_bound_[u] && (texture_alloc_[u] == color || texture_alloc_[u] == depth)) return kBad;
+      if (texture_bound_[u] && (texture_alloc_[u] == color || texture_alloc_[u] == depth || is_extra_target(extras, extra_count, texture_alloc_[u]))) return kBad;
     in_pass_ = true;
     pass_color_ = color;
     pass_depth_ = depth;
+    pass_target_count_ = 1 + extra_count;
+    for (uint32_t n = 0; n < graphics::kMaxColorTargets - 1; ++n) pass_extra_[n] = n < extra_count ? extras[n] : nullptr;
     if (!exec_) return status::kSuccess;
 
     NtStatus s = resident(*color);
     if (s == status::kSuccess && depth) s = resident(*depth);
+    for (uint32_t n = 0; n < extra_count && s == status::kSuccess; ++n) s = resident(*extras[n]);
     if (s == status::kSuccess) s = ensure_cb();
     if (s != status::kSuccess) return s;
     graphics::RenderPassBegin pass;
@@ -223,8 +253,10 @@ class Adapter::StreamRunner {
     pass.clear_depth_value = clear_depth;
     pass.clear_stencil = (flags & kPassClearStencil) != 0;
     pass.clear_stencil_value = static_cast<uint8_t>(clear_stencil);
+    for (uint32_t n = 0; n < extra_count; ++n) pass.extra_colors[n] = extras[n]->image();
     cb_->begin_render_pass(pass);
     mm_.note_gpu_write(*color);
+    for (uint32_t n = 0; n < extra_count; ++n) mm_.note_gpu_write(*extras[n]);
     if (depth) mm_.note_gpu_write(*depth);
     return status::kSuccess;
   }
@@ -302,7 +334,7 @@ class Adapter::StreamRunner {
     if (!finite_within(bias, 100.0f) || !finite_within(min_lod, 100.0f) || !finite_within(max_lod, 1000.0f)) return kBad;
     Allocation* a = alloc(index);
     if (!a || !a->is_image() || !(a->desc().flags & kAllocTexture) || a->is_staging()) return kBad;
-    if (in_pass_ && (a == pass_color_ || a == pass_depth_)) return kBad;
+    if (in_pass_ && (a == pass_color_ || a == pass_depth_ || is_extra_target(pass_extra_, pass_target_count_ - 1, a))) return kBad;
     texture_bound_[unit] = true;
     texture_alloc_[unit] = a;
     if (!exec_) return status::kSuccess;
@@ -362,6 +394,7 @@ class Adapter::StreamRunner {
     if (topology_ >= Topology::LineList && !(adapter_.caps_.features & graphics::kFeatureLines)) return kBad;
     for (uint32_t u = 0; u < pipeline_->texture_count(); ++u)
       if (!texture_bound_[u]) return kBad;
+    if (pipeline_->color_target_count() > pass_target_count_) return kBad;
     const bool vertices = pipeline_->attribute_count() > 0;
     if (vertices && !vertex_) return kBad;
     const uint64_t stride = pipeline_->vertex_stride();
@@ -549,6 +582,8 @@ class Adapter::StreamRunner {
   // The state a stream builds up, to check the draws.
   bool in_pass_ = false;
   const Allocation* pass_color_ = nullptr;
+  const Allocation* pass_extra_[graphics::kMaxColorTargets - 1] = {};
+  uint32_t pass_target_count_ = 1;
   const Allocation* pass_depth_ = nullptr;
   PipelineObject* pipeline_ = nullptr;
   Allocation* vertex_ = nullptr;
@@ -756,6 +791,8 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   if ((bs.custom || d.depth_compare != graphics::CompareOp::LessEqual) && !(caps_.features & graphics::kFeatureBlendState)) return status::kNotSupported;
   for (uint32_t i = 0; i < d.attribute_count; ++i)
     if (d.attributes[i].per_instance && !(caps_.features & graphics::kFeatureInstancing)) return status::kNotSupported;
+  if (d.color_target_count == 0 || d.color_target_count > graphics::kMaxColorTargets) return status::kInvalidParameter;
+  if (d.color_target_count > 1 && !(caps_.features & graphics::kFeatureMultipleTargets)) return status::kNotSupported;
 
   graphics::GraphicsPipelineDesc pd;
   pd.vertex_shader = vertex->module();
@@ -773,6 +810,7 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   pd.stencil = st;
   pd.blend = bs;
   pd.depth_compare = d.depth_compare;
+  pd.color_target_count = d.color_target_count;
 
   SharedPointer<PipelineObject> pipeline = SharedPointer<PipelineObject>::make(allocator_, device_);
   if (!pipeline) return status::kNoMemory;
@@ -784,6 +822,7 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   for (uint32_t i = 0; i < d.attribute_count; ++i) pipeline->per_instance_ = pipeline->per_instance_ || d.attributes[i].per_instance;
   pipeline->attribute_count_ = d.attribute_count;
   pipeline->texture_count_ = d.texture_count;
+  pipeline->color_target_count_ = d.color_target_count;
   *out = pipeline;
   return status::kSuccess;
 }

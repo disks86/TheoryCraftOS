@@ -67,6 +67,7 @@ constexpr uint32_t kFormatR32Float = 28;
 constexpr uint32_t kFormatR32G32Float = 29;
 constexpr uint32_t kFormatR32G32B32Float = 30;
 constexpr uint32_t kFormatR32G32B32A32Float = 31;
+constexpr uint32_t kFormatR16G16B16A16Float = 94;
 
 // Resource bind flags (VIRGL_BIND_*).
 constexpr uint32_t kBindDepthStencil = 1u << 0;

@@ -196,7 +196,7 @@ static void test_basics() {
   {      // xgetbv: x87, SSE, AVX and AVX-512 state are enabled
     Machine m(with_syscall({0x0F, 0x01, 0xD0}));
     m.cpu.state().r[1] = 0;
-    CHECK(m.run() == StopReason::Syscall && (m.cpu.state().r[0] & 0xFFFFFFFFu) == 0xE7 && m.cpu.state().r[2] == 0);
+    CHECK(m.run() == StopReason::Syscall && (m.cpu.state().r[0] & 0xFFFFFFFFu) == 0x600E7 && m.cpu.state().r[2] == 0);
     Machine bad(with_syscall({0x0F, 0x01, 0xD0}));
     bad.cpu.state().r[1] = 1;
     CHECK(bad.run() == StopReason::Fault);      // only XCR0 exists

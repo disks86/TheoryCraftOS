@@ -645,6 +645,7 @@ add_executable(BOOTX64
   src/Emulation/X86_64Crypto.cpp
   src/Emulation/X86_64Misc.cpp
   src/Emulation/X86_64Mmx.cpp
+  src/Emulation/X86_64Amx.cpp
   src/Emulation/X86_64Evex.cpp
   src/Emulation/X86_64EvexMisc.cpp
   src/Emulation/X86_64EvexFp.cpp
@@ -713,6 +714,7 @@ add_executable(BOOTX64
   src/Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnPm4.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnState.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnCp.cpp
+  src/Hardware/GraphicsProcessingUnit/AMD/AmdVegaDraw.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdAsicReset.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdIrq.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdSdma3.cpp

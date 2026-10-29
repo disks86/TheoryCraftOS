@@ -184,7 +184,14 @@ programs built with `-march=haswell` (or x86-64-v3) run. `X86_64Vex.cpp` holds a
   the format description). Half precision has no denormal exception and no DAZ/FTZ, so those never show. Two details are not known and are documented guesses: the complex instructions
   round as chained fused multiply-adds (`a.re*b.re`, then `-a.im*b.im` added with one rounding), and `vrcpph`/`vrsqrtph` return the correctly rounded value, which is inside the
   architecture's 2^-11 bound but is not what the hardware's table gives bit for bit.
-- **Not implemented** (an invalid-instruction fault, never a wrong result): Intel AMX (tile registers), APX (REX2, the 32 general registers, the EVEX-promoted legacy instructions), the AVX10.2
+- **Intel AMX**: palette 1 (eight tiles of up to 16 rows of 64 bytes) in `src/Emulation/X86_64Amx.cpp`. `ldtilecfg` / `sttilecfg` / `tilerelease` (a bad configuration is #GP: palette above 1, reserved bytes, more than 64
+  bytes or 16 rows, rows and bytes not both zero or both non-zero), `tilezero`, `tileloadd` / `tileloaddt1` / `tilestored` (the SIB index register is the row stride; a fault saves `start_row` and the restarted
+  instruction continues from it), `tdpbssd` / `sud` / `usd` / `uud` (wrapping 32-bit sums), `tdpbf16ps`, `tdpfp16ps` and the AMX-COMPLEX `tcmmimfp16ps` / `tcmmrlfp16ps`. Tiles that are not configured, repeated tiles,
+  shapes that do not fit, VEX.L / VEX.W and a SIB-less tile load are #UD. The floating-point forms accumulate each product with one rounding (round to nearest even, MXCSR ignored, bfloat16 and binary32
+  denormals flushed; fp16 denormal inputs are kept). XCR0 (`xgetbv`) gains bits 17 and 18, `xsave` / `xsavec` / `xrstor` handle TILECFG (offset 2752) and TILEDATA (2816) and keep them out of XSTATE_BV while
+  unconfigured, and cpuid reports AMX-TILE, INT8, BF16, FP16 and COMPLEX plus leaves 0xD (17, 18), 0x1D and 0x1E. There is no hardware to compare with here: the tests (`tests/AmxTest.cpp`) check against models
+  written from the definition, so the operand order of the complex forms, the fp16 denormal rule and the #GP-vs-#UD choices for odd configurations are unverified.
+- **Not implemented** (an invalid-instruction fault, never a wrong result): APX (REX2, the 32 general registers, the EVEX-promoted legacy instructions), the AVX10.2
   additions, XOP and FMA4 (AMD Bulldozer-era), CET shadow-stack instructions beyond the no-op forms, `xsaves`/`xrstors` and `xgetbv` with ECX=1.
   Exceptions delivered to a Windows program save the XMM halves of vector state in the `CONTEXT` in memory, not the upper halves (the emulator keeps those itself).
 - **Checked against the real thing**: `tests/AvxTest.cpp` assembles about 1,400 instruction forms with `llvm-mc` (`tests/data/emulation/avx_cases_gen.py`), runs each on the host

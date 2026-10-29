@@ -110,7 +110,11 @@ bool X86_64Cpu::decode_modrm() {
     const uint32_t base = (sib & 7) | (d_.rex_b ? 8 : 0);
     if ((sib & 7) == 5 && d_.mod == 0) have_base = false;
     else address = s_.r[base];
-    if (index != 4) address += s_.r[index] << scale;
+    if (index != 4) {
+      d_.sib_index = true;
+      d_.index_offset = s_.r[index] << scale;
+      address += d_.index_offset;
+    }
   } else if (rm == 5 && d_.mod == 0) {
     have_base = false;
     d_.rip_relative = true;
@@ -1110,20 +1114,28 @@ X86_64Cpu::Step X86_64Cpu::step_0f(GuestMemory& m) {
         dx = (1u << 4) | (1u << 8) | (1u << 15) | (1u << 23) | (1u << 24) | (1u << 25) | (1u << 26);      // TSC, CX8, CMOV, MMX, FXSR, SSE, SSE2
         c = (1u << 0) | (1u << 9) | (1u << 12) | (1u << 19) | (1u << 20) | (1u << 22) | (1u << 23) | (1u << 26) | (1u << 27) | (1u << 28) | (1u << 29) | (1u << 1) | (1u << 25) | (1u << 13) | (1u << 30);      // SSE3, SSSE3, FMA, CMPXCHG16B, SSE4.1, SSE4.2, MOVBE, POPCNT, XSAVE, OSXSAVE, AVX, F16C, RDRAND, PCLMULQDQ, AES
       } else if (leaf == 7 && static_cast<uint32_t>(s_.r[1]) == 1) {
-        a = (1u << 0) | (1u << 1) | (1u << 2) | (1u << 4) | (1u << 5) | (1u << 23);      // SHA512, SM3, SM4, AVX-VNNI, AVX512_BF16, AVX-IFMA
-        dx = (1u << 4) | (1u << 5) | (1u << 10) | (1u << 19);      // AVX-VNNI-INT8, AVX-NE-CONVERT, AVX-VNNI-INT16, AVX10
+        a = (1u << 0) | (1u << 1) | (1u << 2) | (1u << 4) | (1u << 5) | (1u << 21) | (1u << 23);      // SHA512, SM3, SM4, AVX-VNNI, AVX512_BF16, AMX-FP16, AVX-IFMA
+        dx = (1u << 4) | (1u << 5) | (1u << 8) | (1u << 10) | (1u << 19);      // AVX-VNNI-INT8, AVX-NE-CONVERT, AVX-VNNI-INT16, AVX10
       } else if (leaf == 7 && static_cast<uint32_t>(s_.r[1]) == 0) {
         b = (1u << 0) | (1u << 3) | (1u << 5) | (1u << 8) | (1u << 18) | (1u << 19) | (1u << 23) | (1u << 24) | (1u << 26) | (1u << 27) | (1u << 29) | (1u << 16) | (1u << 17) | (1u << 21) | (1u << 28) | (1u << 30) | (1u << 31);      // BMI1, AVX2, BMI2, SHA, AVX512F, DQ, IFMA, CD, BW, VL
         c = (1u << 1) | (1u << 6) | (1u << 8) | (1u << 9) | (1u << 10) | (1u << 11) | (1u << 12) | (1u << 14) | (1u << 22) | (1u << 27) | (1u << 28);      // VBMI, VBMI2, GFNI, VAES, VPCLMULQDQ, VNNI, BITALG, VPOPCNTDQ, RDPID, MOVDIRI, MOVDIR64B
-        dx = (1u << 2) | (1u << 3) | (1u << 8) | (1u << 11) | (1u << 23);      // AVX512_4VNNIW, AVX512_4FMAPS, AVX512_VP2INTERSECT, RTM_ALWAYS_ABORT, AVX512_FP16
+        dx = (1u << 2) | (1u << 3) | (1u << 8) | (1u << 11) | (1u << 22) | (1u << 23) | (1u << 24) | (1u << 25);      // AVX512_4VNNIW, AVX512_4FMAPS, AVX512_VP2INTERSECT, RTM_ALWAYS_ABORT, AMX-BF16, AVX512_FP16, AMX-TILE, AMX-INT8
       } else if (leaf == 0xD) {
         const uint32_t sub = static_cast<uint32_t>(s_.r[1]);
-        if (sub == 0) { a = 0xE7; b = 2688; c = 2688; }      // x87, SSE, AVX and the AVX-512 state; 512 + 64 + 256 + ... bytes
-        else if (sub == 1) { a = 3; b = 2432; }      // XSAVEOPT, XSAVEC; the compacted size of all the components
+        if (sub == 0) { a = 0x600E7; b = 10752; c = 10752; }      // x87, SSE, AVX and the AVX-512 state; 512 + 64 + 256 + ... bytes
+        else if (sub == 1) { a = 3; b = 10688; }      // XSAVEOPT, XSAVEC; the compacted size of all the components
         else if (sub == 2) { a = 256; b = 576; }      // the AVX component: 256 bytes at offset 576
         else if (sub == 5) { a = 64; b = 1088; }      // opmask registers
         else if (sub == 6) { a = 512; b = 1152; }      // the upper halves of ZMM0..15
         else if (sub == 7) { a = 1024; b = 1664; }      // ZMM16..31
+        else if (sub == 17) { a = 64; b = 2752; c = 2; }      // TILECFG (64-byte aligned in the compacted format)
+        else if (sub == 18) { a = 8192; b = 2816; c = 2; }      // TILEDATA
+      } else if (leaf == 0x1D) {      // AMX tile palettes: one, with 8 tiles of 16 rows of 64 bytes
+        const uint32_t sub = static_cast<uint32_t>(s_.r[1]);
+        if (sub == 0) a = 1;
+        else if (sub == 1) { a = 8192 | (1024u << 16); b = 64 | (8u << 16); c = 16; }
+      } else if (leaf == 0x1E && static_cast<uint32_t>(s_.r[1]) == 0) {      // TMUL: maximum K 16 rows, maximum N 64 bytes
+        b = 16 | (64u << 8);
       } else if (leaf == 0x24 && static_cast<uint32_t>(s_.r[1]) == 0) {      // AVX10 enumeration: converged version 1 (the AVX-512 set, without the new AVX10.2 instructions), 128 / 256 / 512-bit vectors
         a = 0;
         b = 1 | (7u << 16);

@@ -75,13 +75,15 @@ class D3d9Program {
   // zero), one that fetches texels, samples at a level or asks the size of a texture kFeatureTexelAccess.
   uint32_t required_features() const;
   bool uses_system_values() const { return uses_system_values_; }
+  // How many colour outputs a pixel shader writes (a DXBC one: SV_Target0 .. n-1; the others: one). More than one needs kFeatureMultipleTargets, and `color` of run_fragment is then that many Vec4s.
+  uint32_t color_output_count() const { return color_outputs_; }
   // The same with the system values (D3d9Binding hands these to the device beside the others).
   void run_vertex_ex(const graphics::Vec4* attributes, const uint8_t* constants, const graphics::VertexContext& context, graphics::ShaderIo* out) const;
   bool run_fragment_ex(const graphics::Vec4* varyings, const graphics::FragmentContext& context, const uint8_t* constants, const graphics::ITextureSet* textures, graphics::Vec4* color) const;
 
   // Runs the program. `attributes` are the vertex attributes by location, `constants` the 128-byte push-constant block.
   void run_vertex(const graphics::Vec4* attributes, const uint8_t* constants, graphics::ShaderIo* out) const;
-  // `textures` may be null when uses_textures() is false. False: the pixel was killed.
+  // `textures` may be null when uses_textures() is false. `color` has room for color_output_count() Vec4s (kMaxColorTargets is always enough). False: the pixel was killed.
   bool run_fragment(const graphics::Vec4* varyings, const uint8_t* constants, const graphics::ITextureSet* textures, graphics::Vec4* color) const;
 
   // The same program as TGSI text for a device that runs shaders on a GPU (virgl), following ShaderModuleDesc::tgsi: vertex inputs IN[n] are attribute locations, varyings
@@ -118,6 +120,7 @@ class D3d9Program {
   uint32_t major_ = 0, minor_ = 0;
   bool uses_textures_ = false;
   bool uses_system_values_ = false, uses_texel_access_ = false;
+  uint32_t color_outputs_ = 1;
   uint32_t constant_registers_ = kPushConstantRegisters;
   List<Instruction> code_;
   struct Def {

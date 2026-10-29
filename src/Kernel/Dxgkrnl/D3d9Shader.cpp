@@ -64,7 +64,7 @@ struct D3d9Program::State {
   Q a0;
   Q pos;
   Q var[graphics::kMaxVaryings];
-  Q color;
+  Q color[graphics::kMaxColorTargets];
   const graphics::Vec4* attributes = nullptr;
   const graphics::Vec4* varyings = nullptr;
   const uint8_t* constants = nullptr;
@@ -109,7 +109,8 @@ int8_t semantic_slot(uint32_t usage, uint32_t index) {
 }  // namespace
 
 uint32_t D3d9Program::required_features() const {
-  return (uses_system_values_ ? graphics::kFeatureSystemInputs : 0u) | (uses_texel_access_ ? graphics::kFeatureTexelAccess : 0u);
+  return (uses_system_values_ ? graphics::kFeatureSystemInputs : 0u) | (uses_texel_access_ ? graphics::kFeatureTexelAccess : 0u) |
+         (color_outputs_ > 1 ? graphics::kFeatureMultipleTargets : 0u);
 }
 
 bool d3d9_op_writes_register(uint16_t op) {
@@ -487,7 +488,7 @@ void D3d9Program::execute(State& s) const {
       case kRastOut: target = &s.pos; break;
       case kAttrOut:
       case kTexCrdOut: target = d.slot == kSlotPosition ? &s.pos : d.slot >= 0 ? &s.var[d.slot] : nullptr; break;
-      case kColorOut: target = &s.color; break;
+      case kColorOut: target = d.slot >= 0 && d.slot < static_cast<int8_t>(graphics::kMaxColorTargets) ? &s.color[d.slot] : nullptr; break;
       default: break;
     }
     if (!target) return;
@@ -780,7 +781,7 @@ bool D3d9Program::run_fragment_ex(const graphics::Vec4* varyings, const graphics
   s.sys[kSysPrimitiveId].f[0] = from_bits(context.primitive_id);
   execute(s);
   if (s.killed) return false;
-  *color = {s.color.f[0], s.color.f[1], s.color.f[2], s.color.f[3]};
+  for (uint32_t n = 0; n < color_outputs_; ++n) color[n] = {s.color[n].f[0], s.color[n].f[1], s.color[n].f[2], s.color[n].f[3]};
   return true;
 }
 
