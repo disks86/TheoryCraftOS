@@ -208,6 +208,8 @@ class ObjectManager {
   // is not a change-notification handle. Returns how many were taken in *count (0 with no error: nothing was queued).
   struct WatchRecord { uint32_t action = 0; char name[kWatchNameBytes] = {}; uint32_t name_size = 0; };
   bool take_watch_records(uint32_t id, WatchRecord* out, uint32_t capacity, uint32_t* count);
+  // The same for a caller that holds the system lock already (the attempt of wait_until); the mutex is not recursive.
+  bool take_watch_records_locked(uint32_t id, WatchRecord* out, uint32_t capacity, uint32_t* count);
 
   // --- mailslots (kind Mailslot; CreateMailslot/CreateFile(\\.\mailslot\name)): one reader (the handle CreateMailslot returns) and any number of writers, all on this
   // machine - there is no network broadcast here, unlike a real mailslot's domain-wide one. A writer's message is queued whole (never split across reads) until the

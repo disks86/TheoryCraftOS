@@ -45,6 +45,8 @@
 #include "Graphics/Graphics3D/WebGlAccelerator.hpp"
 #include "Graphics/GraphicsPool.hpp"
 #include "Graphics/SystemDxg.hpp"
+#include "Kernel/Dxgkrnl/Adapter.hpp"
+#include "Kernel/Dxgkrnl/Conformance.hpp"
 #include "Graphics/SystemGraphics.hpp"
 #include "WebGl/Accelerator.hpp"
 #include "Hardware/ImageSignalProcessor/SystemImageSignalProcessor.hpp"
@@ -581,12 +583,34 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   // The kernel half of Direct3D (what a Windows program's D3D runtime reaches through the D3DKMT system calls): one adapter per GPU of the pool.
   dxgk::Kernel dxg_kernel(shared_allocator);
   uint32_t dxg_fallbacks = 0;
-  uint32_t dxg_adapters = graphics::register_dxg_adapters(dxg_kernel, graphics_pool, shared_allocator, &dxg_fallbacks);
+  graphics::DxgFallback dxg_why;
+  uint32_t dxg_adapters = graphics::register_dxg_adapters(dxg_kernel, graphics_pool, shared_allocator, &dxg_fallbacks, &dxg_why);
   // The CPU renderer as an adapter of its own (Windows has its "WARP" one) next to the display GPU's, so the 3D test can draw on either and compare.
   if (system_graphics.accelerated() && dxg_kernel.add_adapter(system_graphics.software_device(), dxgk::AdapterConfig()) != dxgk::kInvalidIndex) ++dxg_adapters;
   dxgk::set_system_kernel(&dxg_kernel);
+  // What each accelerated GPU really does with Direct3D 9 / 10 / 11 programs, against the CPU renderer (dxgk::run_conformance): the verdicts are in the log.
+  if (dxg_adapters > 1)
+    for (uint32_t i = 0; i + 1 < dxg_adapters; ++i) {
+      dxgk::Adapter* a = dxg_kernel.adapter(i);
+      if (!a || !a->caps().accelerated) continue;
+      Entry(Level::Info, "Direct3D").text("conformance on ").text(a->caps().name);
+      const uint32_t bad = dxgk::run_conformance(shared_allocator, dxg_kernel, i, dxg_adapters - 1, [](void*, const dxgk::SceneResult& r) {
+        const bool wrong = r.verdict == dxgk::SceneVerdict::Differs || r.verdict == dxgk::SceneVerdict::Broken;
+        Entry e(wrong ? Level::Warning : r.verdict == dxgk::SceneVerdict::Refused ? Level::Info : Level::Ok, "Direct3D");
+        e.text(r.name).text(": ");
+        switch (r.verdict) {
+          case dxgk::SceneVerdict::Same: e.text("as the CPU renderer"); break;
+          case dxgk::SceneVerdict::Differs: e.text("differs in ").dec(r.bad_pixels).text(" pixels, first at ").dec(r.first_bad % 32).text(",").dec(r.first_bad / 32).text(": ").hex(r.device_value).text(" instead of ").hex(r.reference_value); break;
+          case dxgk::SceneVerdict::Refused: e.text("not supported (").text(r.step).text(")"); break;
+          case dxgk::SceneVerdict::Broken: e.text("failed at ").text(r.step).text(", status ").hex(r.status); break;
+        }
+      }, nullptr);
+      Entry(bad ? Level::Warning : Level::Ok, "Direct3D").dec(bad).text(" conformance scene(s) wrong");
+    }
   Entry(dxg_fallbacks ? Level::Warning : Level::Ok, "Direct3D").text("kernel mode driver: ").dec(dxg_adapters).text(" adapter(s)");
   if (dxg_fallbacks) Entry(Level::Warning, "Direct3D").dec(dxg_fallbacks).text(" GPU(s) failed the Direct3D self-test and use the CPU renderer");
+  if (dxg_fallbacks)
+    Entry(Level::Warning, "Direct3D").text("self-test: ").text(dxg_why.picture_wrong ? "the picture is wrong" : dxg_why.step).text(" status ").hex(static_cast<uint32_t>(dxg_why.status));
   // WebGL and WebGPU draw on the 3D hardware when there is some (and on the CPU rasterizer in src/WebGl when there is not, or for a draw the hardware cannot do).
   graphics::WebGlAccelerator web_accelerator(system_graphics.device(), shared_allocator);
   if (system_graphics.accelerated()) webgl::set_accelerator(&web_accelerator);
@@ -672,6 +696,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
 #ifdef TCOS_AMD_VEGAM
   UniquePointer<hardware::AmdVegaM> vega_m;   // the Radeon RX Vega M's memory controller, engines and display (opt-in, below)
   UniquePointer<hardware::PciMsi> vega_msi;   // its MSI, when the machine delivers it
+  uint8_t vega_lit_crtc[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};   // the CRTC light_up() put each hot plug pin's output on (0xFF: none)
   bool vega_msi_working = false;              // the interrupt arrived in the self-test: the desktop loop looks at the ring only when one comes
 #endif
 #ifdef TCOS_AMD_UVD
@@ -1104,6 +1129,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         inputs.aperture_bytes = aperture_bytes;
         inputs.doorbells = doorbells;
         inputs.max_framebuffer_bytes = largest;
+        inputs.output_framebuffer_bytes = 16ull << 20;     // room for the picture of one external output that light_up() lights (1920x1200 at most)
         // The full reset of the card as the last resort when an engine will not come back from its soft reset. This OS cannot POST a card afterwards (no AtomBIOS interpreter), so the
         // card would stay down and whatever it shows would go dark: only allowed when the card does not drive the display.
         inputs.pci = &pci;
@@ -1174,6 +1200,14 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
                 FixedString<64> monitor;
                 if (describe_vega_monitor(*vega_m, *connector, shared_allocator, &monitor)) Entry(Level::Info, "Vega M").text("  ").text(connector_name).text(": ").text(monitor.c_str());
                 else Entry(Level::Info, "Vega M").text("  ").text(connector_name);
+                // lit with the mode the monitor prefers and a test picture (the desktop is not drawn on it)
+                hardware::AmdVegaM::LightUp lit;
+                if (vega_m->light_up(*connector, 0xFF, &lit)) {
+                  vega_lit_crtc[pin] = lit.crtc;
+                  Entry(Level::Ok, "Vega M").text("  ").text(connector_name).text(" lit: ").dec(lit.width).text("x").dec(lit.height);
+                } else {
+                  Entry(Level::Warning, "Vega M").text("  ").text(connector_name).text(" not lit (step ").dec(static_cast<uint32_t>(lit.failed)).text(", mode set stage ").dec(static_cast<uint32_t>(lit.set.failed)).text(")");
+                }
               } else {
                 Entry(Level::Info, "Vega M").text("  output ").dec(pin + 1);
               }
@@ -1380,8 +1414,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
           vega_idle = 0;
           vega_m->service_interrupts();
         }
-        // A display plugged into or pulled out of one of the card's outputs: say so, on the debug console and as a toast. (The card's outputs are not part of the desktop: it cannot show
-        // anything on them, so this is all there is to do about it.)
+        // A display plugged into or pulled out of one of the card's outputs: say so, on the debug console and as a toast, and light it up / switch it off. (The card's outputs are not part
+        // of the desktop layout: the lit output shows the test picture.)
         hardware::AmdVegaM::HotplugEvent plug;
         while (vega_m->take_hotplug(&plug)) {
           // "HDMI-A-1" where the video BIOS says what the pin is, else "output 2"
@@ -1412,6 +1446,28 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
             if (plug.connected) text.append("was connected to ");
             text.append(where.c_str());
             text.append(" of the Radeon RX Vega M");
+          }
+          // A display plugged in: lit up with the mode it prefers and a test picture (the desktop is not drawn on it); one pulled out: switched off.
+          if (plug.has_connector && !plug.throttled && plug.pin < 6) {
+            if (plug.connected && vega_lit_crtc[plug.pin] == 0xFF) {
+              hardware::AmdVegaM::LightUp lit;
+              if (vega_m->light_up(plug.connector, 0xFF, &lit)) {
+                vega_lit_crtc[plug.pin] = lit.crtc;
+                text.append(": lit ");
+                text.append_uint(lit.width);
+                text.append("x");
+                text.append_uint(lit.height);
+              } else {
+                text.append(": not lit (step ");
+                text.append_uint(static_cast<uint32_t>(lit.failed));
+                text.append(", mode set stage ");
+                text.append_uint(static_cast<uint32_t>(lit.set.failed));
+                text.append(")");
+              }
+            } else if (!plug.connected && vega_lit_crtc[plug.pin] != 0xFF) {
+              vega_m->disable_mode(plug.connector, vega_lit_crtc[plug.pin]);
+              vega_lit_crtc[plug.pin] = 0xFF;
+            }
           }
           console::debug_puts("Vega M: ");
           console::debug_puts(StringView(text.c_str()));

@@ -99,6 +99,9 @@ void mailslot_token_release(uint64_t token) {
   objects->release(token_id(token));
 }
 
+// A read timeout as NtCreateMailslotFile gets it (a negative number is relative, in 100 ns; ~0 stands for forever) as it is kept: forever stays ~0, the rest is a plain count of 100 ns.
+uint64_t normal_timeout(uint64_t raw) { return raw == ~uint64_t{0} ? raw : (int64_t(raw) < 0 ? uint64_t(-int64_t(raw)) : raw); }
+
 uint32_t nt_create_mailslot_file(Process& p, const SyscallRequest& r) {
   uint64_t options = 0, quota = 0, max_message_size = 0, timeout_at = 0;
   if (!argument(p, r, 4, &options) || !argument(p, r, 5, &quota) || !argument(p, r, 6, &max_message_size) || !argument(p, r, 7, &timeout_at)) return kAccessViolation;
@@ -109,6 +112,7 @@ uint32_t nt_create_mailslot_file(Process& p, const SyscallRequest& r) {
   if (!objects) return kNotImplemented;
   uint64_t timeout_100ns = ~uint64_t{0};      // null ReadTimeout: wait forever, like every other timeout pointer in this codebase
   if (timeout_at != 0 && !p.read_user_u64(timeout_at, &timeout_100ns)) return kAccessViolation;
+  timeout_100ns = normal_timeout(timeout_100ns);
   const ObjectManager::Created c = objects->create_mailslot(name.view(), uint32_t(max_message_size), timeout_100ns);
   if (c.id == 0) return c.status == 0x40000000u ? kObjectNameCollision : c.status;
   const bool inherit = wants_inherit(p, r.args[2]);
@@ -149,7 +153,7 @@ uint32_t mailslot_io(Process& p, uint64_t slot, bool write, uint64_t status_bloc
     const uint32_t status = result_status(r);
     return store_io_status(p, status_block, status, status == kSuccess ? length : 0) ? status : kAccessViolation;
   }
-  if (token_is_writer(token)) return kAccessDenied;      // a writer does not read
+  if (token_is_writer(token)) return kInvalidParameter;      // a writer does not read
   length &= 0xFFFFFFFFu;
   constexpr uint64_t kMax = ObjectManager::kMailslotBufferBytes;
   uint8_t chunk[kMax];
@@ -159,14 +163,14 @@ uint32_t mailslot_io(Process& p, uint64_t slot, bool write, uint64_t status_bloc
   uint64_t read_timeout_100ns = ~uint64_t{0};
   { uint32_t cap = 0, next = 0, count = 0; objects->mailslot_info(id, &cap, &read_timeout_100ns, &next, &count); }
   uint32_t got = 0, message_size = 0;
-  uint32_t status = wait_until(p, read_timeout_100ns, [&]() -> uint64_t {
+  uint32_t status = wait_until(p, read_timeout_100ns == ~uint64_t{0} ? read_timeout_100ns : read_timeout_100ns * 100, [&]() -> uint64_t {
     const ObjectManager::MailslotResult r = objects->mailslot_read_locked(id, chunk, capacity, &got, &message_size);
     if (r == ObjectManager::MailslotResult::NoMessage) return kPending;
     if (r == ObjectManager::MailslotResult::TooSmall) return kBufferTooSmall;
     return result_status(r);
   });
   if (status == 0x102u) status = kIoTimeout;      // the read timeout elapsed with nothing to read (0x101/kAlerted, if the thread was interrupted, passes through as-is)
-  if (status != kSuccess) return store_io_status(p, status_block, status, 0) ? status : kAccessViolation;
+  if (status != kSuccess) return status;      // (a read that fails leaves the status block alone)
   if (got != 0 && !p.write_user(buffer, ConstByteView(chunk, got))) return kAccessViolation;
   return store_io_status(p, status_block, kSuccess, got) ? kSuccess : kAccessViolation;
 }
@@ -181,6 +185,7 @@ uint32_t mailslot_query_information(Process& p, uint64_t slot, uint32_t info_cla
   uint64_t read_timeout_100ns = 0;
   if (!objects->mailslot_info(id, &max_message_size, &read_timeout_100ns, &next_message_size, &message_count)) return kInvalidHandle;
   uint8_t out[24] = {};
+  if (message_count == 0) next_message_size = 0xFFFFFFFFu;      // MAILSLOT_NO_MESSAGE
   for (int i = 0; i < 4; ++i) { out[i] = uint8_t(max_message_size >> (8 * i)); out[4 + i] = 0; out[8 + i] = uint8_t(next_message_size >> (8 * i)); out[12 + i] = uint8_t(message_count >> (8 * i)); }
   for (int i = 0; i < 8; ++i) out[16 + i] = uint8_t(read_timeout_100ns >> (8 * i));
   return p.write_user(buffer, ConstByteView(out, 24)) && store_io_status(p, status_block, kSuccess, 24) ? kSuccess : kAccessViolation;
@@ -196,7 +201,7 @@ uint32_t mailslot_set_information(Process& p, uint64_t slot, uint32_t info_class
   if (!p.read_user(buffer, ByteView(in, 8))) return kAccessViolation;
   uint64_t timeout = 0;
   for (int i = 0; i < 8; ++i) timeout |= uint64_t{in[i]} << (8 * i);
-  return objects->mailslot_set_timeout(id, timeout) ? kSuccess : kInvalidHandle;
+  return objects->mailslot_set_timeout(id, normal_timeout(timeout)) ? kSuccess : kInvalidHandle;
 }
 
 }  // namespace process::windowsabi

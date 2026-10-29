@@ -157,8 +157,8 @@ class IPageEnvironment : public IObjectEnvironment {
 
 class Page final : public script::IHost, public IDomHost, public dom::IScriptRunner, public IStyleSource, public IFrameSource, public IContainerSizes {
  public:
-  static constexpr uint32_t kMaxExternalScripts = 12, kMaxStyleSheets = 8;
-  static constexpr uint64_t kMaxScriptBytes = 1u << 20, kMaxStyleSheetBytes = 512u << 10;
+  static constexpr uint32_t kMaxExternalScripts = 96, kMaxStyleSheets = 32;
+  static constexpr uint64_t kMaxScriptBytes = 1u << 20, kMaxStyleSheetBytes = 1u << 20;
 
   Page(allocators::IAllocator& allocator, IPageEnvironment& environment, StringView address, const MediaEnvironment& media, bool scripts);
   ~Page();

@@ -1314,11 +1314,16 @@ void ObjectManager::notify_path_changed(StringView affected_directory, uint32_t 
     if (!matches) continue;
     o.signaled = true;
     any = true;
-    if (w.record_count < kMaxWatchRecords && entry_name.size() < kWatchNameBytes) {      // a full queue just drops it: signaled (above) still fires
+    if (w.record_count < kMaxWatchRecords && entry_name.size() + affected_directory.size() < kWatchNameBytes) {      // a full queue just drops it: signaled (above) still fires
       WatchRecord& r = w.records[(w.record_head + w.record_count) % kMaxWatchRecords];
       r.action = action;
-      for (uint64_t k = 0; k < entry_name.size(); ++k) r.name[k] = entry_name[k];
-      r.name_size = static_cast<uint32_t>(entry_name.size());
+      uint32_t n = 0;
+      if (affected_directory.size() > watched.size() && watched.size() > 1) {      // a change below the watched folder: the name is the path from it, with backslashes
+        for (uint64_t k = watched.size() + 1; k < affected_directory.size() && n + 1 < kWatchNameBytes; ++k) r.name[n++] = affected_directory[k] == '/' ? '\\' : affected_directory[k];
+        if (n + 1 < kWatchNameBytes) r.name[n++] = '\\';
+      }
+      for (uint64_t k = 0; k < entry_name.size() && n < kWatchNameBytes; ++k) r.name[n++] = entry_name[k];
+      r.name_size = n;
       ++w.record_count;
     }
   }
@@ -1326,8 +1331,12 @@ void ObjectManager::notify_path_changed(StringView affected_directory, uint32_t 
 }
 
 bool ObjectManager::take_watch_records(uint32_t id, WatchRecord* out, uint32_t capacity, uint32_t* count) {
-  *count = 0;
   Locked hold(sync_);
+  return take_watch_records_locked(id, out, capacity, count);
+}
+
+bool ObjectManager::take_watch_records_locked(uint32_t id, WatchRecord* out, uint32_t capacity, uint32_t* count) {
+  *count = 0;
   Object* o = at(id);
   if (!o || o->kind != ObjectKind::ChangeNotification || o->watch < 0 || !watches_) return false;
   Watch& w = watches_[o->watch];

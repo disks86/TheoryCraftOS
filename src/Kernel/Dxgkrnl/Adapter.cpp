@@ -914,6 +914,7 @@ void Adapter::fault(ContextObject& context, NtStatus why) {
   DeviceState& state = context.device->state;
   state.execution = why == status::kGraphicsNoVideoMemory || why == status::kNoMemory ? DeviceExecState::ErrorOutOfMemory : why == status::kInvalidParameter ? DeviceExecState::PageFault : DeviceExecState::Hung;
   ++state.reset_count;
+  state.last_fault = why;
   for (UniquePointer<Submission>& s : context.queue.view())
     if (s->kind == SubmissionKind::Signal) s->sync->signal(s->value);
   context.queue.clear();

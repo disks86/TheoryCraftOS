@@ -204,7 +204,11 @@ bool VidMm::upload(Allocation& a) {
       for (uint64_t i = 0; i < converted.size(); ++i) converted[i] = to_logical(f, source[i]);
       pixels = ArrayView<const uint32_t>(converted.data(), converted.size());
     }
-    if (!(level == 0 ? a.image_->write_pixels(pixels) : a.image_->write_mip_pixels(level, pixels))) return false;
+    if (!(level == 0 ? a.image_->write_pixels(pixels) : a.image_->write_mip_pixels(level, pixels))) {
+      // A device that only draws into a colour target (virgl keeps targets and textures in opposite row order) takes no pixels for it; that costs nothing while the backing is still
+      // the zeros it was made with, which is what a target holds until something draws into it.
+      if (a.cpu_written_) return false;
+    }
   }
   a.device_stale_ = false;
   return true;
@@ -233,7 +237,10 @@ bool VidMm::read_back(Allocation& a) {
   return true;
 }
 
-void VidMm::note_cpu_write(Allocation& a) { a.device_stale_ = true; }
+void VidMm::note_cpu_write(Allocation& a) {
+  a.device_stale_ = true;
+  a.cpu_written_ = true;
+}
 void VidMm::note_gpu_write(Allocation& a) {
   a.gpu_newer_ = true;
   a.last_use_ = ++clock_;
