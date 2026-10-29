@@ -45,6 +45,17 @@ enum DxbcOp : uint32_t {
   kDclResource4 = 88, kDclConstantBuffer4 = 89, kDclSampler4 = 90, kDclInput4 = 95, kDclInputSgv4 = 96, kDclInputSiv4 = 97, kDclInputPs4 = 98, kDclInputPsSgv4 = 99, kDclInputPsSiv4 = 100,
   kDclOutput4 = 101, kDclOutputSgv4 = 102, kDclOutputSiv4 = 103, kDclTemps4 = 104, kDclIndexableTemp4 = 105, kDclGlobalFlags4 = 106,
 };
+// The texture a dcl_resource declares (D3D10_SB_RESOURCE_DIMENSION: 3 texture2d, 5 texture3d, 6 texturecube, 8 texture2darray); the others are not taken.
+bool resource_kind(uint32_t dimension, graphics::TextureKind* kind) {
+  switch (dimension) {
+    case 3: *kind = graphics::TextureKind::Texture2D; return true;
+    case 5: *kind = graphics::TextureKind::Texture3D; return true;
+    case 6: *kind = graphics::TextureKind::TextureCube; return true;
+    case 8: *kind = graphics::TextureKind::Texture2DArray; return true;
+    default: return false;
+  }
+}
+
 enum OperandType : uint32_t { kOpTemp = 0, kOpInput = 1, kOpOutput = 2, kOpImmediate = 4, kOpSampler = 6, kOpResource = 7, kOpConstantBuffer = 8, kOpImmediateConstantBuffer = 9, kOpNull = 13 };
 
 // Where a program made from DXBC keeps what it has no register for: its literals, and the immediate constant buffer (declared in the program) as constants of its own.
@@ -486,6 +497,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         continue;
       }
       case kDclResource4: {
+        graphics::TextureKind kind = graphics::TextureKind::Texture2D;
         Operand o;
         s = read_operand(p, &o);
         if (s != status::kSuccess) return s;
@@ -494,11 +506,13 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
           const uint32_t return_type = p.le32(), space = p.le32();
           (void)return_type;
           if (!p.ok() || o.type != kOpResource || o.dims != 3) return status::kInvalidParameter;
-          if (((token >> 11) & 0x1F) != 3 || o.index[0] >= 8 || o.index[1] != o.index[2] || o.index[1] >= graphics::kMaxTextureUnits || space != 0) return status::kNotSupported;
+          if (!resource_kind((token >> 11) & 0x1F, &kind) || o.index[0] >= 8 || o.index[1] != o.index[2] || o.index[1] >= graphics::kMaxTextureUnits || space != 0) return status::kNotSupported;
           texture_register[o.index[0]] = static_cast<int32_t>(o.index[1]);
+          program->texture_kind_[o.index[1]] = kind;
           continue;
         }
-        if (o.type != kOpResource || o.dims != 1 || ((token >> 11) & 0x1F) != 3 || o.index[0] >= graphics::kMaxTextureUnits) return status::kNotSupported;   // 2D, two units
+        if (o.type != kOpResource || o.dims != 1 || !resource_kind((token >> 11) & 0x1F, &kind) || o.index[0] >= graphics::kMaxTextureUnits) return status::kNotSupported;   // two units
+        program->texture_kind_[o.index[0]] = kind;
         continue;
       }
       case kDclInput4: case kDclInputPs4: case kDclOutput4: case kDclInputSiv4: case kDclInputPsSiv4: case kDclOutputSiv4: case kDclInputSgv4: case kDclInputPsSgv4: case kDclOutputSgv4: {
@@ -616,6 +630,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         return status::kNotSupported;
       }
       if (resource.type != kOpResource || unit >= graphics::kMaxTextureUnits || (opcode == 72 && sampler.type != kOpSampler)) return status::kNotSupported;
+      if (program->texture_kind_[unit] != graphics::TextureKind::Texture2D) return status::kNotSupported;   // (ld, sample_l and resinfo: 2D textures only)
       ins.op = opcode == 45 ? kTexFetch : opcode == 72 ? kTexLod : kTexSize;
       if (opcode == 61) {
         const uint32_t mode = (token >> 11) & 3;

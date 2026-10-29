@@ -166,12 +166,17 @@ class VirglImage final : public IImage {
     const bool sampled = (desc.usage & kImageSampled) != 0;
     uint32_t bind = depth ? virgl::kBindDepthStencil : (virgl::kBindRenderTarget | virgl::kBindSamplerView);
     if (desc.usage & kImagePresent) bind |= virgl::kBindScanout;
-    ResourceCreate3d create{header(kCmdResourceCreate3d), id_, virgl::kTargetTexture2d,
+    // A volume has its slices as the depth; an array or a cube its layers as the array size (a cube: six).
+    const uint32_t layers = layer_count();
+    const uint32_t target = desc.kind == TextureKind::Texture3D ? virgl::kTargetTexture3d : desc.kind == TextureKind::TextureCube ? virgl::kTargetTextureCube
+                            : desc.kind == TextureKind::Texture2DArray ? virgl::kTargetTexture2dArray : virgl::kTargetTexture2d;
+    ResourceCreate3d create{header(kCmdResourceCreate3d), id_, target,
                             depth ? depth_format : color_format_, bind,
-                            desc.extent.width, desc.extent.height, 1, 1, 0, 0, sampled ? 0u : kResourceFlagY0Top, 0};
+                            desc.extent.width, desc.extent.height, desc.kind == TextureKind::Texture3D ? layers : 1u, desc.kind == TextureKind::Texture3D || desc.kind == TextureKind::Texture2D ? 1u : layers, 0, 0,
+                            sampled ? 0u : kResourceFlagY0Top, 0};
     CtxResource ctx{header(kCmdCtxAttachResource), id_, 0};
     ok_ = gpu.command(as_bytes(create)) && gpu.command(as_bytes(ctx));
-    accounted_ = uint64_t{desc.extent.width} * desc.extent.height * (depth ? 4u : bytes_per_pixel(desc.format));
+    accounted_ = uint64_t{desc.extent.width} * desc.extent.height * layer_count() * (depth ? 4u : bytes_per_pixel(desc.format));
     gpu.add_resource_bytes(accounted_);
     // The surface (a render-target view of the resource) is what the framebuffer state refers to.
     if (ok_ && (desc.usage & (kImageColorAttachment | kImageDepthAttachment))) {
@@ -183,7 +188,9 @@ class VirglImage final : public IImage {
     // The sampler view is what a texture unit is bound to: the whole resource, level 0, components in order.
     if (ok_ && sampled) {
       view_ = device.new_handle();
-      const uint32_t cmd[] = {virgl::header(virgl::kCreateObject, virgl::kObjectSamplerView, 6), view_, id_, color_format_, 0, 0, virgl::kSwizzleRgba};
+      // (the layers the view shows: all of an array's or a cube's; a volume's slices are not layers)
+      const uint32_t last_layer = desc.kind == TextureKind::Texture2DArray || desc.kind == TextureKind::TextureCube ? layers - 1 : 0;
+      const uint32_t cmd[] = {virgl::header(virgl::kCreateObject, virgl::kObjectSamplerView, 6), view_, id_, color_format_, last_layer << 16, 0, virgl::kSwizzleRgba};
       ok_ = device.send_commands(cmd, 7);
     }
   }
@@ -208,6 +215,25 @@ class VirglImage final : public IImage {
   Format format() const override { return desc_.format; }
   uint32_t usage() const { return desc_.usage; }
   bool stencil() const { return desc_.stencil; }
+  uint32_t layer_count() const override { return desc_.kind == TextureKind::Texture2D ? 1 : desc_.kind == TextureKind::TextureCube ? 6 : desc_.layers; }
+  // A layer (a slice, a face) goes through the one-layer backing: the host copies from or into it at the layer's place in the resource.
+  bool write_layer_pixels(uint32_t layer, ArrayView<const uint32_t> pixels) override {
+    const uint64_t count = uint64_t{desc_.extent.width} * desc_.extent.height;
+    if (desc_.kind == TextureKind::Texture2D || layer >= layer_count() || pixels.size() != count || !ensure_backing(count)) return false;
+    const ArrayView<uint32_t> staged = backing_.cast<uint32_t>();
+    for (uint64_t i = 0; i < count; ++i) staged[i] = pixels[i];
+    TransferHost3d transfer{header(kCmdTransferToHost3d), {0, 0, layer, desc_.extent.width, desc_.extent.height, 1}, 0, id_, 0, desc_.extent.width * 4, 0};
+    return device_.gpu().command(as_bytes(transfer));
+  }
+  bool read_layer_pixels(uint32_t layer, ArrayView<uint32_t> out) override {
+    const uint64_t count = uint64_t{desc_.extent.width} * desc_.extent.height;
+    if (desc_.kind == TextureKind::Texture2D || layer >= layer_count() || out.size() < count || !ensure_backing(count)) return false;
+    TransferHost3d transfer{header(kCmdTransferFromHost3d), {0, 0, layer, desc_.extent.width, desc_.extent.height, 1}, 0, id_, 0, desc_.extent.width * 4, 0};
+    if (!device_.gpu().command(as_bytes(transfer))) return false;
+    const ArrayView<uint32_t> pixels = backing_.cast<uint32_t>();
+    for (uint64_t i = 0; i < count; ++i) out[i] = pixels[i];
+    return true;
+  }
   // Stored with window y 0 at the top (drawn into and shown: the Y_0_TOP flag), or the way a texture is - row 0 first, window y 0 at the bottom of GL's window - which is what a
   // render target that is also sampled needs, so that the sampler reads it the way a texture is read (drawn upright by an unflipped viewport, see VirglPipeline).
   bool y0_top() const { return !(desc_.usage & kImageSampled); }
@@ -469,7 +495,7 @@ uint32_t VirglDevice::sampler_state(const SamplerDesc& sampler) {
   const uint32_t wrap_t = sampler.address_v == AddressMode::Repeat ? virgl::kWrapRepeat : virgl::kWrapClampToEdge;
   const uint32_t filter = sampler.filter == Filter::Linear ? virgl::kFilterLinear : virgl::kFilterNearest;
   // No mipmaps: the minification filter is the magnification one and no level is chosen between.
-  const uint32_t s0 = wrap_s | (wrap_t << 3) | (filter << 9) | (virgl::kMipFilterNone << 11) | (filter << 13);
+  const uint32_t s0 = wrap_s | (wrap_t << 3) | (virgl::kWrapClampToEdge << 6) /* r: the slices of a volume are clamped */ | (filter << 9) | (virgl::kMipFilterNone << 11) | (filter << 13);
   const uint32_t cmd[] = {virgl::header(virgl::kCreateObject, virgl::kObjectSamplerState, 9), handle, s0, 0, 0, 0, 0, 0, 0, 0};
   if (!send_commands(cmd, 10)) return 0;
   sampler_states_[key] = handle;
@@ -495,6 +521,13 @@ void VirglDevice::destroy_buffer(IBuffer* buffer) { destroy(gpu_.allocator(), st
 
 IImage* VirglDevice::create_image(const ImageDesc& desc) {
   if (desc.mip_levels != 1) return nullptr;   // (no mipmaps either)
+  if (desc.kind != TextureKind::Texture2D) {
+    // (a volume, array or cube is only sampled: 8-bit colour, one level)
+    const uint32_t layers = desc.kind == TextureKind::TextureCube ? 6 : desc.layers;
+    if (desc.usage != kImageSampled || desc.format != Format::B8G8R8A8Unorm || layers == 0 || layers > kMaxTextureLayers || (desc.kind == TextureKind::TextureCube && desc.extent.width != desc.extent.height)) return nullptr;
+  } else if (desc.layers != 1) {
+    return nullptr;
+  }
   // A texture is not drawn into: the two kinds of image are stored in opposite row order (see VirglImage).
   if ((desc.usage & kImageSampled) && (desc.usage & (kImageDepthAttachment | kImagePresent))) return nullptr;
   if ((desc.usage & kImageSampled) && desc.format != Format::B8G8R8A8Unorm && !is_float_format(desc.format)) return nullptr;

@@ -106,6 +106,8 @@ struct AllocationDesc {
   uint32_t width = 0, height = 0;    // images
   uint32_t mip_levels = 1;           // textures only; more than one needs a texture that is not a render target
   uint64_t size = 0;                 // buffers: bytes
+  graphics::TextureKind kind = graphics::TextureKind::Texture2D;   // textures: more than 2D needs the adapter's kFeatureTextureKinds, flags exactly kAllocTexture (kAllocShared too), one mip level, an 8-bit colour format
+  uint32_t layers = 1;               // Texture3D: the depth; Texture2DArray: the array size (1 .. graphics::kMaxTextureLayers); TextureCube: 6 (width equals height)
 };
 
 struct AllocationInfo {
