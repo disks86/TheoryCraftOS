@@ -89,6 +89,7 @@
 #include "Hardware/HyperV/SystemHyperV.hpp"
 #include "Hardware/VMware/VmwareTools.hpp"
 #include "Hardware/SystemInput.hpp"
+#include "Hardware/Mouse/I2c/PlatformI2cHid.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
 #include "Kernel/Clipboard.hpp"
 #include "Program/ProgramRunner.hpp"
@@ -937,6 +938,19 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   hardware::SystemInput input(pci, usb, shared_allocator, st);
   input.set_vmmdev(guest.virtualbox());
   input.initialize();
+  // The touchpad and the touchscreen of a laptop are HID devices on an I2C bus behind the chipset (ACPI PNP0C50): found through the ACPI tables, and added to the mouse.
+  hardware::AcpiTables i2c_acpi_tables(st);
+  hardware::SystemAcpiHost i2c_acpi_host(&pci, paging_ok ? &mmio : nullptr);
+  hardware::MmioI2cRegisterSource i2c_registers(register_mapper);
+  hardware::PlatformI2cHid i2c_hid(shared_allocator, pci, i2c_registers, register_mapper, clock, i2c_acpi_host);
+  if (paging_ok && i2c_acpi_tables.initialize()) {
+    const uint32_t started = i2c_hid.start(i2c_acpi_tables, input.mice());
+    for (uint32_t i = 0; i < i2c_hid.report_count(); ++i) {
+      const hardware::PlatformI2cHid::Report& r = i2c_hid.report(i);
+      Entry(r.outcome == hardware::PlatformI2cHid::Outcome::Started ? Level::Ok : Level::Warning, "Input").text("I2C HID ").text(r.device).text(": ").text(hardware::PlatformI2cHid::outcome_name(r.outcome));
+    }
+    if (started) Entry(Level::Info, "Input").dec(started).text(" pointing device(s) on I2C");
+  }
   Entry(input.keyboards().count() ? Level::Ok : Level::Warning, "Input").dec(input.keyboards().count()).text(" keyboards");
   for (uint32_t i = 0; i < input.keyboards().count(); ++i) Entry(Level::Info, "Input").text("  ").text(input.keyboards().at(i)->name());
   Entry(input.mice().count() ? Level::Ok : Level::Warning, "Input").dec(input.mice().count()).text(" mice");
@@ -1524,6 +1538,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   if (hardware::VirtioGpu* virtio = system_gpu.virtio_gpu()) virtio->disable_interrupts();
   kernel::stop();  // threads end here; the rest of shutdown talks to the firmware
   Entry(Level::Ok, "Shutdown").text("threads stopped");
+  i2c_hid.stop(input.mice());
   input.shutdown();
   guest.shutdown();
   hyperv.shutdown();
