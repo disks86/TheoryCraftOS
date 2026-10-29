@@ -290,9 +290,9 @@ typedef struct { const char *line; size_t_ length; const char *section; size_t_ 
 static BOOL ini_next(const IniText *ini, size_t_ *at, IniLine *l, const char **section, size_t_ *section_length) {
   if (*at >= ini->size) return FALSE;
   const char *start = ini->text + *at, *end = start;
-  while (*end && *end != '\n') ++end;
+  while ((size_t_)(end - ini->text) < ini->size && *end != '\n') ++end;      /* (a NUL inside the file is an ordinary byte) */
   l->offset = *at;
-  *at = (size_t_)(end - ini->text) + (*end ? 1 : 0);
+  *at = (size_t_)(end - ini->text) + ((size_t_)(end - ini->text) < ini->size ? 1 : 0);
   size_t_ length = (size_t_)(end - start);
   if (length && start[length - 1] == '\r') --length;
   l->line = start;
