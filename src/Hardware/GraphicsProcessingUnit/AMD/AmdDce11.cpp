@@ -149,6 +149,10 @@ constexpr uint32_t kInputCscControl = 0x1a35, kPrescaleGrphControl = 0x1a2d, kIn
                    kDcLutBlackRed = 0x1a83, kDcLutWhiteBlue = 0x1a84, kDcLutWhiteGreen = 0x1a85, kDcLutWhiteRed = 0x1a86, kDcLutRwMode = 0x1a78, kDcLutWriteEnMask = 0x1a7e,
                    kDcLutRwIndex = 0x1a79, kDcLut30Color = 0x1a7c, kDegammaControl = 0x1a58, kGamutRemapControl = 0x1a59, kRegammaControl = 0x1aa0, kOutputCscControl = 0x1a3c,
                    kDenormControl = 0x1a50, kAlphaControl = 0x1abc;
+constexpr uint32_t kFmtBitDepthControl = 0x1bf2, kLbDataFormat = 0x1ac0, kInterleaveEnable = 0x8;
+// FMT_BIT_DEPTH_CONTROL: truncate enable bit 0, truncate depth 5:4, spatial dither enable bit 8, spatial dither depth 12:11, frame random bit 13, RGB random bit 14, high pass random bit 15
+constexpr uint32_t kFmtTruncateEnable = 1u << 0, kFmtTruncateDepthShift = 4, kFmtSpatialDitherEnable = 1u << 8, kFmtSpatialDitherDepthShift = 11, kFmtFrameRandom = 1u << 13, kFmtRgbRandom = 1u << 14,
+                   kFmtHighpassRandom = 1u << 15;
 constexpr uint32_t kInputCscGrphModeMask = 0x3, kPrescaleBypass = 0x10, kInputGammaModeMask = 0x1, kDegammaModeMask = 0x3 | 0x300 | 0x3000, kGamutModeMask = 0x3, kRegammaModeMask = 0x7,
                    kOutputCscModeMask = 0x7, kCursorAlphaBlend = 0x2;
 
@@ -241,6 +245,43 @@ bool Scanout::load_lut(uint32_t crtc, const LutEntry* table) {
   modify(kOutputCscControl, kOutputCscModeMask, 0);
   r_.write(kDenormControl + off, 0);
   modify(kAlphaControl, 0, kCursorAlphaBlend);
+  return true;
+}
+
+bool Scanout::vga_enable(uint32_t crtc, bool enable) {
+  if (crtc >= kMaxCrtcs) return false;
+  const uint32_t control = r_.read(kVgaControl[crtc]) & ~1u;
+  r_.write(kVgaControl[crtc], enable ? control | 1u : control);
+  return true;
+}
+
+bool Scanout::set_interleave(uint32_t crtc, bool interlaced) {
+  if (crtc >= kMaxCrtcs) return false;
+  const uint32_t tmp = r_.read(kLbDataFormat + kCrtcOffsets[crtc]) & ~kInterleaveEnable;
+  r_.write(kLbDataFormat + kCrtcOffsets[crtc], interlaced ? tmp | kInterleaveEnable : tmp);
+  return true;
+}
+
+bool Scanout::program_fmt(uint32_t crtc, uint32_t bpc, bool dither) {
+  if (crtc >= kMaxCrtcs) return false;
+  if (bpc == 0) return true;       // (the driver returns before writing when the monitor's depth is unknown)
+  uint32_t tmp = 0;
+  const uint32_t depth = bpc == 6 ? 0 : bpc == 8 ? 1 : 2;
+  switch (bpc) {
+    case 6:
+    case 8:
+    case 10:
+      if (dither) {
+        tmp |= kFmtFrameRandom | kFmtHighpassRandom | kFmtSpatialDitherEnable | (depth << kFmtSpatialDitherDepthShift);
+        if (bpc != 6) tmp |= kFmtRgbRandom;
+      } else {
+        tmp |= kFmtTruncateEnable | (depth << kFmtTruncateDepthShift);
+      }
+      break;
+    default:
+      break;       // not needed: the register is written zero
+  }
+  r_.write(kFmtBitDepthControl + kCrtcOffsets[crtc], tmp);
   return true;
 }
 

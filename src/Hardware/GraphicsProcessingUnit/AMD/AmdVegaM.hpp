@@ -370,6 +370,7 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
     uint32_t pixel_clock_khz = 0, bpc = 0, retrains = 0;
     uint8_t pll = AmdModeSet::kPllInvalid;
   };
+  uint32_t crtc_active_ = 0;       // bit n: CRTC n was enabled by set_mode (the driver's amdgpu_crtc->enabled)
   uint8_t crtc_pll_[AmdModeSet::kMaxCrtcs] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};      // the PLL each CRTC was set up with by set_mode (0xFF: none)
   Trained trained_[amd_dce11::Interrupts::kMaxHpd];
   uint32_t hotplug_head_ = 0, hotplug_count_ = 0, hotplug_dropped_ = 0, connected_pins_ = 0, throttle_reported_ = 0;

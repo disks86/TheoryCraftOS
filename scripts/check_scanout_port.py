@@ -142,6 +142,30 @@ def main():
         at = i + 1
     if not re.search(r'viewport_h = \(crtc->mode\.vdisplay \+ 1\) & ~1', body):
         fail('the viewport height rounding')
+    # the FMT block and the interleave
+    for ours_name, theirs in (('kFmtBitDepthControl', 'mmFMT_BIT_DEPTH_CONTROL'), ('kLbDataFormat', 'mmLB_DATA_FORMAT')):
+        g = re.search(r'\b' + ours_name + r' = (0x[0-9a-fA-F]+)', cpp)
+        if not g or int(g.group(1), 16) != reg(theirs):
+            fail(ours_name)
+    for ours_name, field in (('kFmtTruncateEnable', 'FMT_TRUNCATE_EN'), ('kFmtSpatialDitherEnable', 'FMT_SPATIAL_DITHER_EN'), ('kFmtFrameRandom', 'FMT_FRAME_RANDOM_ENABLE'),
+                            ('kFmtRgbRandom', 'FMT_RGB_RANDOM_ENABLE'), ('kFmtHighpassRandom', 'FMT_HIGHPASS_RANDOM_ENABLE'), ('kInterleaveEnable', None)):
+        g = re.search(r'\b' + ours_name + r' = (?:1u << (\d+)|(0x[0-9a-fA-F]+))', cpp)
+        want = int(re.search(r'#define FMT_BIT_DEPTH_CONTROL__' + field + r'_MASK (0x[0-9a-fA-F]+)', m).group(1), 16) if field else int(re.search(r'#define LB_DATA_FORMAT__INTERLEAVE_EN_MASK (0x[0-9a-fA-F]+)', m).group(1), 16)
+        got = (1 << int(g.group(1))) if g and g.group(1) else (int(g.group(2), 16) if g else None)
+        if got != want:
+            fail('%s is %s, header %s' % (ours_name, got, want))
+    for ours_name, field in (('kFmtTruncateDepthShift', 'FMT_TRUNCATE_DEPTH'), ('kFmtSpatialDitherDepthShift', 'FMT_SPATIAL_DITHER_DEPTH')):
+        g = re.search(ours_name + r' = (\d+)', cpp)
+        t = re.search(r'#define FMT_BIT_DEPTH_CONTROL__' + field + r'__SHIFT (0x[0-9a-fA-F]+)', m)
+        if not g or not t or int(g.group(1)) != int(t.group(1), 16):
+            fail(ours_name)
+    fmt = c[c.index('static void dce_v11_0_program_fmt'):]
+    fmt = fmt[:fmt.index('\n}\n')]
+    if not (re.search(r'case 6:.*?FMT_SPATIAL_DITHER_DEPTH, 0\).*?FMT_TRUNCATE_DEPTH, 0\)', fmt, re.S) and re.search(r'case 8:.*?FMT_SPATIAL_DITHER_DEPTH, 1\).*?FMT_TRUNCATE_DEPTH, 1\)', fmt, re.S) and
+            re.search(r'case 10:.*?FMT_SPATIAL_DITHER_DEPTH, 2\).*?FMT_TRUNCATE_DEPTH, 2\)', fmt, re.S)):
+        fail('the FMT depths')
+    if fmt.count('FMT_RGB_RANDOM_ENABLE') != 2 or 'if (bpc == 0)' not in fmt:
+        fail('the FMT random enables')
     if bad:
         sys.exit(1)
     print('check_scanout_port: ok')
