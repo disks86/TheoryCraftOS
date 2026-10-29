@@ -762,8 +762,8 @@ EXPORT HANDLE WINAPI CreateToolhelp32Snapshot(DWORD flags, DWORD pid) {
   }
   if (ok && (flags & (TH32CS_SNAPMODULE_ | TH32CS_SNAPMODULE32_))) {
     s->modules = RtlAllocateHeap(heap(), 0, sizeof(MODULEENTRY32W_) * 64);
-    if (s->modules) s->module_count = list_modules_of(pid, s->modules, 64); else ok = FALSE;
-    if (ok && s->module_count == 0) { set_error(ERROR_INVALID_PARAMETER); ok = FALSE; }      /* (no such process) */
+    if (s->modules) s->module_count = (flags & TH32CS_SNAPMODULE_) ? list_modules_of(pid, s->modules, 64) : 0; else ok = FALSE;      /* (the 32-bit modules alone: this machine's processes have none) */
+    if (ok && s->module_count == 0 && (flags & TH32CS_SNAPMODULE_)) { set_error(ERROR_INVALID_PARAMETER); ok = FALSE; }      /* (no such process) */
   }
   if (ok && (flags & TH32CS_SNAPHEAPLIST_)) {
     s->heaps = RtlAllocateHeap(heap(), 0, sizeof(ULONG_PTR) * HEAP_LIST_MAX);
@@ -789,6 +789,7 @@ static Snapshot *snapshot_of(HANDLE h) {
   atom_lock();
   for (int i = 0; i < SNAP_MAX; ++i) if (g_snaps[i] && g_snaps[i]->handle == h) { s = g_snaps[i]; break; }
   LeaveCriticalSection(&g_atom_lock);
+  if (s && !IsHandleValid_(h)) s = NULL;      /* (a closed snapshot) */
   return s;
 }
 /* The next entry of one list of a snapshot. */

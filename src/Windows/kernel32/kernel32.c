@@ -1175,9 +1175,10 @@ static POBJECT_ATTRIBUTES named_attributes(NamedAttributes *n, LPCWSTR name, BOO
   unsigned length = 0;
   for (; prefix[length]; ++length) n->text[length] = prefix[length];
   const WCHAR *skip = name;
-  if ((name[0] == 'L' || name[0] == 'l') && (name[1] == 'o' || name[1] == 'O') && (name[2] == 'c' || name[2] == 'C') && (name[3] == 'a' || name[3] == 'A') && (name[4] == 'l' || name[4] == 'L') && name[5] == '\\') skip = name + 6;
+  if (!name || !*name) skip = NULL;      /* (only the inherit flag was asked for) */
+  else if ((name[0] == 'L' || name[0] == 'l') && (name[1] == 'o' || name[1] == 'O') && (name[2] == 'c' || name[2] == 'C') && (name[3] == 'a' || name[3] == 'A') && (name[4] == 'l' || name[4] == 'L') && name[5] == '\\') skip = name + 6;
   else if ((name[0] == 'G' || name[0] == 'g') && (name[1] == 'l' || name[1] == 'L') && (name[2] == 'o' || name[2] == 'O') && (name[3] == 'b' || name[3] == 'B') && (name[4] == 'a' || name[4] == 'A') && (name[5] == 'l' || name[5] == 'L') && name[6] == '\\') skip = name + 7;
-  if (!name || !*name) length = 0;      /* (only the inherit flag was asked for) */
+  if (!skip) length = 0;
   else for (; *skip && length < 299; ++skip) n->text[length++] = *skip;
   n->text[length] = 0;
   n->string.Buffer = n->text;
@@ -2795,6 +2796,17 @@ EXPORT UINT WINAPI GetSystemDirectoryW(LPWSTR buffer, UINT capacity) {
 EXPORT UINT WINAPI GetSystemDirectoryA(LPSTR buffer, UINT capacity) {
   if (capacity < 20) return 20;
   memcpy(buffer, "C:\\Windows\\System32", 20);
+  return 19;
+}
+EXPORT UINT WINAPI GetSystemWow64DirectoryW(LPWSTR buffer, UINT capacity) {
+  static const WCHAR kPath[] = {'C', ':', '\\', 'W', 'i', 'n', 'd', 'o', 'w', 's', '\\', 'S', 'y', 's', 'W', 'O', 'W', '6', '4', 0};
+  if (capacity < 20) return 20;
+  memcpy(buffer, kPath, sizeof(kPath));
+  return 19;
+}
+EXPORT UINT WINAPI GetSystemWow64DirectoryA(LPSTR buffer, UINT capacity) {
+  if (capacity < 20) return 20;
+  memcpy(buffer, "C:\\Windows\\SysWOW64", 20);
   return 19;
 }
 EXPORT UINT WINAPI GetWindowsDirectoryW(LPWSTR buffer, UINT capacity) {

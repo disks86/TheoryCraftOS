@@ -82,6 +82,12 @@ uint32_t nt_query_system_information(Process& p, const SyscallRequest& r) {
     case 5: {    // SYSTEM_PROCESS_INFORMATION for each program, one after the other: the entry (0x100 bytes), its threads (SYSTEM_THREAD_INFORMATION, 0x50 bytes each), the image name's characters
       IProcessRuntime::ProcessEntry entries[32];
       const uint32_t count = runtime ? runtime->list_processes(entries, 32) : 0;
+      for (uint32_t i = 1; i < count; ++i) {      // (in the order of their ids: a program just started comes after the ones that started it)
+        IProcessRuntime::ProcessEntry moved = entries[i];
+        uint32_t k = i;
+        for (; k > 0 && entries[k - 1].pid > moved.pid; --k) entries[k] = entries[k - 1];
+        entries[k] = moved;
+      }
       constexpr uint32_t kEntry = 0x100, kThread = 0x50, kName = 24 * 2 + 8, kMaxThreadsListed = 64;
       auto entry_size = [&](const IProcessRuntime::ProcessEntry& e) { return kEntry + (e.threads < kMaxThreadsListed ? e.threads : kMaxThreadsListed) * kThread + kName; };
       uint64_t total_size = 0;
