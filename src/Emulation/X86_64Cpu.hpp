@@ -54,7 +54,7 @@ class X86_64Cpu final : public IGuestCpu {
     uint64_t q[8] = {};
   };
   struct State {
-    uint64_t r[16] = {};
+    uint64_t r[32] = {};      // RAX..R15, and R16..R31 (Intel APX; the context image and cpuid only know the first 16 unless xsave component 19 is used)
     uint64_t rip = 0;
     uint64_t rflags = 2;
     uint64_t fs_base = 0, gs_base = 0;
@@ -98,6 +98,10 @@ class X86_64Cpu final : public IGuestCpu {
     uint32_t available = 0, position = 0;
     bool truncated = false;      // it needed more bytes than there were
     bool rex_present = false, rex_w = false, rex_r = false, rex_x = false, rex_b = false;
+    bool rex_r4 = false, rex_x4 = false, rex_b4 = false;      // the APX REX2 bits that name registers 16..31
+    bool rex2 = false;
+    uint32_t ext_b() const { return (rex_b ? 8u : 0u) | (rex_b4 ? 16u : 0u); }      // the bits that REX.B / B4 add to a register number in an opcode or modrm.rm field
+    bool apx_high() const { return rex_r4 || rex_x4 || rex_b4; }
     bool operand16 = false, address32 = false, rep = false, repne = false;
     uint8_t segment = 0;         // 0 none, 1 FS, 2 GS
     uint8_t mod = 0;

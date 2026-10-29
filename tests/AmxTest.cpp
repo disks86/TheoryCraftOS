@@ -510,7 +510,7 @@ static void test_cpuid() {
   CHECK((l71.a >> 21) & 1);      // AMX-FP16
   CHECK((l71.d >> 8) & 1);       // AMX-COMPLEX
   const R d0 = cpuid(0xD, 0), d17 = cpuid(0xD, 17), d18 = cpuid(0xD, 18);
-  CHECK((d0.a & 0x60000) == 0x60000 && d0.b == 10752);
+  CHECK((d0.a & 0x60000) == 0x60000 && d0.b == 11136);
   CHECK(d17.a == 64 && d17.b == 2752 && d18.a == 8192 && d18.b == 2816);
   const R p0 = cpuid(0x1D, 0), p1 = cpuid(0x1D, 1), t = cpuid(0x1E, 0);
   CHECK(p0.a == 1);

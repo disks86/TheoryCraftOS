@@ -1163,20 +1163,20 @@ X86_64Cpu::Step X86_64Cpu::vex_bmi(GuestMemory& m, int map, uint8_t op, bool wid
 X86_64Cpu::Step X86_64Cpu::xsave_family(GuestMemory& m, uint32_t kind) {
   const uint64_t address = memory_address();
   const uint64_t requested = (s_.r[0] & 0xFFFFFFFFu) | (s_.r[2] << 32);
-  const uint64_t features = requested & 0x600E7;      // XCR0: x87, SSE, AVX, opmask, ZMM_Hi256, Hi16_ZMM, TILECFG, TILEDATA
+  const uint64_t features = requested & 0xE00E7;      // XCR0: x87, SSE, AVX, opmask, ZMM_Hi256, Hi16_ZMM, TILECFG, TILEDATA, APX (R16..R31)
   uint8_t image[2688] = {};
   auto put64 = [&](uint32_t at, uint64_t v) { for (uint32_t b = 0; b < 8; ++b) image[at + b] = static_cast<uint8_t>(v >> (8 * b)); };
   auto get64 = [&](uint32_t at) { uint64_t v = 0; for (uint32_t b = 0; b < 8; ++b) v |= uint64_t{image[at + b]} << (8 * b); return v; };
   // The components above the legacy area: feature bit, size, and offset in the standard format.
   struct Component { uint64_t bit; uint32_t size, standard; };
-  static constexpr Component kComponents[6] = {{4, 256, 576}, {0x20, 64, 1088}, {0x40, 512, 1152}, {0x80, 1024, 1664}, {0x20000, 64, 2752}, {0x40000, 8192, 2816}};
+  static constexpr Component kComponents[7] = {{4, 256, 576}, {0x20, 64, 1088}, {0x40, 512, 1152}, {0x80, 1024, 1664}, {0x20000, 64, 2752}, {0x40000, 8192, 2816}, {0x80000, 128, 11008}};
   // Offsets of the components in the format being used: `present` is the set of components stored (the compacted format packs those; the tile components start on a 64-byte boundary).
   uint32_t legacy_end = 576;      // where the components before the tiles end in the compacted format
-  auto offsets = [&](bool compacted, uint64_t present, uint32_t out[6]) {
+  auto offsets = [&](bool compacted, uint64_t present, uint32_t out[7]) {
     uint32_t next = 576;
-    for (uint32_t c = 0; c < 6; ++c) {
+    for (uint32_t c = 0; c < 7; ++c) {
       if (c == 4) legacy_end = next;
-      if (c >= 4) next = (next + 63) & ~63u;
+      if (c == 4 || c == 5) next = (next + 63) & ~63u;
       out[c] = compacted ? next : kComponents[c].standard;
       if (present & kComponents[c].bit) next += kComponents[c].size;
     }
@@ -1184,10 +1184,12 @@ X86_64Cpu::Step X86_64Cpu::xsave_family(GuestMemory& m, uint32_t kind) {
   };
   if (kind != 5) {
     const bool compacted = kind == 8;
-    uint32_t at[6];
+    uint32_t at[7];
     offsets(compacted, features, at);
     uint32_t bytes = compacted ? legacy_end : (features & 0xE0) ? 2688 : (features & 4) ? 832 : 576;
-    const uint64_t in_use = features & ~(tiles_configured() ? uint64_t{0} : uint64_t{0x60000});      // (a tile component is saved only with the tiles configured; XSTATE_BV says which were)      // (unconfigured tiles are in their initial state)
+    bool apx_used = false;
+    for (uint32_t i = 16; i < 32; ++i) apx_used |= s_.r[i] != 0;
+    const uint64_t in_use = features & ~((tiles_configured() ? uint64_t{0} : uint64_t{0x60000}) | (apx_used ? uint64_t{0} : uint64_t{0x80000}));      // (a tile component is saved only with the tiles configured; XSTATE_BV says which were)      // (unconfigured tiles are in their initial state)
     save_fpu_image(image);
     put64(512, in_use);      // XSTATE_BV: everything requested is in use
     if (compacted) put64(520, features | (uint64_t{1} << 63));
@@ -1211,6 +1213,11 @@ X86_64Cpu::Step X86_64Cpu::xsave_family(GuestMemory& m, uint32_t kind) {
     if (!m.write(address, ConstByteView(image, bytes))) return fail(14, address, 2);
     if (in_use & 0x20000)
       if (!m.write(address + at[4], ConstByteView(tiles_.config, sizeof(tiles_.config)))) return fail(14, address + at[4], 2);
+    if (in_use & 0x80000) {
+      uint8_t apx[128];
+      for (uint32_t i = 0; i < 16; ++i) for (uint32_t b = 0; b < 8; ++b) apx[8 * i + b] = static_cast<uint8_t>(s_.r[16 + i] >> (8 * b));
+      if (!m.write(address + at[6], ConstByteView(apx, sizeof(apx)))) return fail(14, address + at[6], 2);
+    }
     if (in_use & 0x40000)
       for (uint32_t t = 0; t < 8; ++t)
         if (!m.write(address + at[5] + 1024 * t, ConstByteView(tiles_.data[t], 1024))) return fail(14, address + at[5] + 1024 * t, 2);
@@ -1220,7 +1227,7 @@ X86_64Cpu::Step X86_64Cpu::xsave_family(GuestMemory& m, uint32_t kind) {
   if (!m.read(address, ByteView(image, 576))) return fail(14, address, 0);
   const uint64_t bv = get64(512), comp = get64(520);
   const bool compacted = (comp >> 63) & 1;
-  uint32_t at[6];
+  uint32_t at[7];
   offsets(compacted, compacted ? comp : features, at);
   const uint64_t bytes = compacted ? legacy_end : (features & 0xE0) ? 2688 : (features & 4) ? 832 : 576;
   if (bytes > 576 && !m.read(address + 576, ByteView(image + 576, bytes - 576))) return fail(14, address + 576, 0);
@@ -1245,6 +1252,14 @@ X86_64Cpu::Step X86_64Cpu::xsave_family(GuestMemory& m, uint32_t kind) {
       } else {
         for (auto& tile : tiles_.data) ByteView(tile, sizeof(tile)).fill(0);
       }
+    }
+  }
+  if (features & 0x80000) {
+    for (uint32_t i = 0; i < 16; ++i) s_.r[16 + i] = 0;
+    if (bv & 0x80000) {
+      uint8_t apx[128];
+      if (!m.read(address + at[6], ByteView(apx, sizeof(apx)))) return fail(14, address + at[6], 0);
+      for (uint32_t i = 0; i < 16; ++i) { uint64_t v = 0; for (uint32_t b = 0; b < 8; ++b) v |= uint64_t{apx[8 * i + b]} << (8 * b); s_.r[16 + i] = v; }
     }
   }
   load_fpu_image(image);

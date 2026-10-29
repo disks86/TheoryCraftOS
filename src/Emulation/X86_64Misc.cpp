@@ -97,9 +97,9 @@ X86_64Cpu::Step X86_64Cpu::system_0f01(GuestMemory& m) {
   if (!decode_modrm() || !finish_decode()) return bad_decode();
   if (d_.mod != 3) return fail(6);
   switch (0xC0 | ((d_.reg & 7) << 3) | (d_.rm & 7)) {
-    case 0xD0:      // xgetbv: XCR0 says x87, SSE, AVX, the AVX-512 state and the AMX tile state are enabled
+    case 0xD0:      // xgetbv: XCR0 says x87, SSE, AVX, the AVX-512 state and the AMX tile state and the APX registers are enabled
       if (static_cast<uint32_t>(s_.r[1]) != 0) return fail(13);
-      s_.r[0] = 0x600E7;
+      s_.r[0] = 0xE00E7;
       s_.r[2] = 0;
       break;
     case 0xD5:      // xend outside a transaction
