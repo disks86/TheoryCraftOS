@@ -42,7 +42,8 @@ An interpreter, one instruction per decode, flags computed eagerly.
   bit-exact), with x86 semantics: the default NaN, first-NaN propagation, all four MXCSR rounding modes, and the MXCSR exception flags (exceptions are always masked, so
   none traps). MXCSR.DAZ and FTZ are modelled (see below). `RCPPS`/`RSQRTPS` (and the scalar forms) return the correctly rounded value, within the architecture's 1.5 * 2^-12 but not the hardware's table values.
 - **Faults** are reported as x86 vectors (0, 3, 6, 13, 14 with the address), restartable (`rip` stays at the instruction).
-- **Not implemented** (each is an invalid-opcode fault, never a wrong result): segment register loads and far transfers (`mov ds`, `lss`, `call far`, `retf`, `int n`, `iret`), and the system instructions (privileged ones, `rdmsr`, the control and debug registers, `lgdt`, ...). See the x86-64 section for the full list of what exists beyond the base set.
+- **Segments and far transfers**: the six segment registers hold selectors (`mov Sreg`, `lss` / `lfs` / `lgs`, `push` / `pop fs` / `gs`; a selector is valid when null or RPL 3, and a bad one is #GP; loading FS or GS does not change the base), `call far` / `jmp far` through memory (FF /3, /5), `retf`, `iretq` (rip, cs, flags, rsp, ss; only the user-changeable flags are taken) and `int n`, where `int3` is a breakpoint and any other vector a #GP (there is no interrupt table; Linux `int 0x80` and Windows `int 0x29` / `0x2e` are not emulated). CS 0x33 is the only code segment, so a transfer to a compatibility-mode selector is #GP. See `src/Emulation/X86_64Segment.cpp` and `tests/SegmentTest.cpp`.
+- **Not implemented** (each is an invalid-opcode fault, never a wrong result): the system instructions (privileged ones, `rdmsr`, the control and debug registers, `lgdt`, ...). See the x86-64 section for the full list of what exists beyond the base set.
 
 ## The AArch64 guest (`AArch64Cpu`)
 

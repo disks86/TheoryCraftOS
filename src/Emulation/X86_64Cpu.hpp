@@ -196,6 +196,14 @@ class X86_64Cpu final : public IGuestCpu {
   uint32_t tile_rows(uint32_t t) const { return tiles_.config[48 + t]; }
   uint32_t tile_colsb(uint32_t t) const { return tiles_.config[16 + 2 * t] | (uint32_t{tiles_.config[17 + 2 * t]} << 8); }
   bool tiles_configured() const { return tiles_.config[0] != 0; }
+  // Segment registers and far transfers (X86_64Segment.cpp).
+  Step segment_move(GuestMemory& m, uint8_t opcode);
+  Step far_pointer_load(GuestMemory& m, uint8_t opcode);
+  Step far_branch(GuestMemory& m, bool is_call);
+  Step far_return(GuestMemory& m, uint8_t opcode);
+  Step interrupt_return(GuestMemory& m);
+  bool push_sized(GuestMemory& m, uint64_t value, uint32_t size);
+  bool load_selector(uint32_t segment, uint16_t selector);
   Step system_0f01(GuestMemory& m);                     // 0F 01 with a register operand: xgetbv, xend, xtest, rdtscp
   Step adx_instruction(GuestMemory& m, bool overflow);  // adcx (66 0F 38 F6) and adox (F3 0F 38 F6)
   Step fsgsbase_instruction(GuestMemory& m);            // F3 0F AE /0../3 with a register operand (already decoded): rdfsbase, rdgsbase, wrfsbase, wrgsbase
@@ -253,6 +261,7 @@ class X86_64Cpu final : public IGuestCpu {
     uint8_t data[8][1024] = {};
   };
   Tiles tiles_;
+  uint16_t selector_[6] = {0x2B, 0x33, 0x2B, 0x2B, 0x2B, 0x2B};      // es cs ss ds fs gs
   State s_;
   Decoded d_;
   GuestFault fault_;

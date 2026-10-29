@@ -54,6 +54,8 @@ uint32_t popcount64(uint64_t v) {
 
 void X86_64Cpu::reset(const process::ProgramStart& start) {
   s_ = State();
+  selector_[0] = selector_[2] = selector_[3] = selector_[4] = selector_[5] = 0x2B;
+  selector_[1] = 0x33;
   s_.rip = start.entry;
   s_.r[4] = start.stack_pointer;
   // Native Windows entry gets the first two arguments in RCX and RDX (RtlUserThreadStart); Linux programs start with zeroed registers.
@@ -657,20 +659,7 @@ X86_64Cpu::Step X86_64Cpu::step(GuestMemory& m) {
       advance();
       return Step::Ok;
     }
-    case 0x8C: case 0x8E: {      // mov r/m16, Sreg and mov Sreg, r/m16: the segment registers hold the user selectors; loading one has no effect here
-      if (!decode_modrm() || !finish_decode()) return bad_decode();
-      const uint32_t sreg = d_.reg & 7;
-      if (sreg > 5) return fail(6);
-      if (op == 0x8C) {
-        static const uint16_t selectors[6] = {0x2B, 0x33, 0x2B, 0x2B, 0x2B, 0x2B};      // es cs ss ds fs gs
-        if (!write_rm(m, d_.mod == 3 ? osize : 2, selectors[sreg])) return Step::Fault;
-      } else {
-        uint64_t v = 0;
-        if (!read_rm(m, 2, &v)) return Step::Fault;
-      }
-      advance();
-      return Step::Ok;
-    }
+    case 0x8C: case 0x8E: return segment_move(m, op);      // mov r/m16, Sreg and mov Sreg, r/m16
     case 0x8D: {      // lea
       if (!decode_modrm() || !finish_decode()) return bad_decode();
       if (d_.mod == 3) return fail(6);
@@ -888,6 +877,14 @@ X86_64Cpu::Step X86_64Cpu::step(GuestMemory& m) {
     }
     case 0xCC:
       return fail(3);
+    case 0xCA: case 0xCB: return far_return(m, op);
+    case 0xCF: return interrupt_return(m);
+    case 0xCD: {      // int n: there is no interrupt table to deliver it through; int3 is a breakpoint, anything else a general-protection fault
+      const uint64_t n = next_imm(1, false);
+      if (!finish_decode()) return bad_decode();
+      return fail(n == 3 ? 3 : 13);
+    }
+    case 0xF1: return fail(1);      // int1 (icebp): a debug exception
     case 0xE3: {      // jrcxz
       const uint64_t rel = next_imm(1, true);
       if (!finish_decode()) return bad_decode();
@@ -951,6 +948,7 @@ X86_64Cpu::Step X86_64Cpu::step_group_f(GuestMemory& m, uint8_t op) {
     s_.rip = v;
     return Step::Ok;
   }
+  if (op == 0xFF && (kind == 3 || kind == 5)) return far_branch(m, kind == 3);
   if (op == 0xFF && kind == 6) {      // push r/m64
     if (!read_rm(m, 8, &v) || !push(m, v)) return Step::Fault;
     s_.rip += d_.position;
@@ -1070,19 +1068,25 @@ X86_64Cpu::Step X86_64Cpu::step_0f(GuestMemory& m) {
       if (mmx_ssse3_opcode(3, second)) return mmx_ssse3(m, 3, second);
       return legacy_sse_map(m, 3, second);
     }
-    case 0xA0: case 0xA8: {      // push fs / push gs: the selector (zero here)
+    case 0xA0: case 0xA8: {      // push fs / push gs: the selector
       if (!finish_decode()) return bad_decode();
-      if (!push(m, 0)) return Step::Fault;
+      if (!push(m, selector_[op == 0xA0 ? 4 : 5])) return Step::Fault;
       advance();
       return Step::Ok;
     }
-    case 0xA1: case 0xA9: {      // pop fs / pop gs: the selector is dropped (the base is not reloaded from a descriptor table)
+    case 0xA1: case 0xA9: {      // pop fs / pop gs: the selector is kept (the base is not reloaded from a descriptor table)
       if (!finish_decode()) return bad_decode();
-      uint64_t ignored = 0;
-      if (!pop(m, &ignored)) return Step::Fault;
+      const uint64_t before = s_.r[4];
+      uint64_t v = 0;
+      if (!pop(m, &v)) return Step::Fault;
+      if (!load_selector(op == 0xA1 ? 4 : 5, static_cast<uint16_t>(v))) {
+        s_.r[4] = before;
+        return fail(13);
+      }
       advance();
       return Step::Ok;
     }
+    case 0xB2: case 0xB4: case 0xB5: return far_pointer_load(m, op);      // lss, lfs, lgs
     case 0x05:      // syscall
       if (!finish_decode()) return bad_decode();
       s_.rip += d_.position;
