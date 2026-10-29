@@ -441,8 +441,8 @@ segment pointer written to 0x30 from block 2 on), at most three, a block that ne
 is a module parameter, off). `AmdVegaM::read_edid(connector, &bytes)` does it for a connector; `main.cpp` reads the monitor on each new connection and at boot, parses it with the existing EDID parser, and the toast says
 "A display (DELL U2720Q 2560x1440) was connected to HDMI-A-1 of the Radeon RX Vega M". It takes the bus for some tens of milliseconds, so it runs from the desktop loop and not in the interrupt path.
 
-**Not done / not known:** DisplayPort and eDP connectors carry the EDID over the AUX channel, not GPIO pins - see the next section. `amdgpu_i2c.c` (pre_xfer, post_xfer and the pad callbacks) and `i2c-algo-bit.c` were not at hand: the register choreography (outputs cleared, pins made
-inputs, pads masked for software, a pin "high" when its output is not enabled, released again afterwards) and the protocol are written from memory of them, so `check_i2c_port.py` checks the table and entry layout, which register
+**Not done / not known:** DisplayPort and eDP connectors carry the EDID over the AUX channel, not GPIO pins - see the next section. `amdgpu_i2c.c` (pre_xfer, post_xfer and the pad callbacks) was compared with v6.12 afterwards (outputs cleared, pins made
+inputs, pads masked for software with a read-back, a pin "high" when its output is not enabled, released again afterwards, and for a hardware capable line bit 16 of the clock mask register cleared first: added then; udelay 10 and the 2200 us timeout match); `i2c-algo-bit.c` is followed from memory, so `check_i2c_port.py` checks the table and entry layout, which register
 is which, the id bits and the lookup against the driver but not the pad callbacks. Tested against a bit-level simulated bus (`tests/FakeI2cMonitor.hpp`: a monitor as an I2C slave, written independently; `AmdDdcTest`): the wire
 (addresses, offsets, segment pointers, one stop per transfer), the registers left as found, the pads masked while the pins are driven, pins left pulled low, retries, a damaged block, an absent monitor, clock stretching within and past
 the limit, the time taken, and every bit flip of the data; `AtomI2cTest`, `AtomConnectorsTest` and `AmdVegaMTest` (`test_read_edid`) cover the table, the record and the card. The simulated slave is not a real monitor: whether a real
@@ -738,6 +738,173 @@ byte of its last 128-byte block goes to `DP_TEST_EDID_CHECKSUM` (0x261) and the 
 request, several bits, or an EDID that cannot be read) is answered NAK (0x02), because there is no trained link or pattern generator to run them on. A read or write that did not go through is `handling_failed`.
 `AmdAux::dpcd_write` (a native write, 12 bytes at a time) is what writes; `IDpcdAux` gained it.
 
-Not done: the retraining itself (there is no link training yet; the boot firmware's link is what is judged, and a card that has not trained one has `lanes` 0 and cannot lose it), the other tests (training, video pattern with the test timing
+Retraining: `train_link` remembers a link it trained (by hot plug pin, with the pixel clock and bits per colour), and `service_short_pulses` trains it again for the same mode when the check says
+the link is lost (`SinkEvent::retrained`, with the new `LinkTraining` in `retrain`). A link `train_link` never trained is only reported (the boot firmware's link is judged, and a card that has not trained
+one has `lanes` 0 and cannot lose it). The memory is dropped when the sink stops answering, when a retraining fails, or when a `train_link` fails; at most `kMaxRetrains` (4) retrainings in a row are made
+(`retrain_limit`), a healthy check starts the count again. `AmdVegaMTest::test_retrain_on_short_pulse` (a sink that recovers its clock when pattern 1 starts, `FakeAuxSink::after_write`) covers it.
+
+Not done: the other tests (training, video pattern with the test timing
 registers 0x219.., PHY patterns), and the MST message and the downstream port changes. Addresses and bit meanings are from memory, like the rest of the DPCD. `AmdVegaMTest::test_short_pulse_status` (healthy link, a lost lane, a lane beyond the ones in use, an untrained link, lost alignment, each
 service interrupt, the eDP panel, a sink that times out or ends before the status, HDMI and an unknown pin, capacity and order, the dropped state) and `DpcdTest::test_lane_count` cover it.
+
+### Audio format blocks: selecting the endpoint
+
+DCE 11 has an audio format block (AFMT) for each DIG encoder, at the DIG's register block (`dig_offsets`: DIG0 at +0, DIG1 +0x100, DIG2 +0x200, DIG3 +0x300, DIG4 +0x400, DIG5 +0x500; the Vega M, like Polaris 10, has
+6 DIGs, so blocks 0 to 5 - UNIPHY3, DIG 6, has none), and each takes its audio from one of the eight endpoints (`AudioPins`): `AFMT_AUDIO_SRC_CONTROL` (0x4a45 + the DIG's offset), bits 2:0, `AFMT_AUDIO_SRC_SELECT`, is the
+endpoint's number. `amd_dce11::AudioFormat::select_pin(block, pin)` is `dce_v11_0_afmt_audio_select_pin`: a read-modify-write of that field alone (the rest of the register is kept), false for a block or endpoint that does not
+exist; `selected_pin(block)` reads it back. `AmdVegaM::select_audio_pin(connector)` ties it to the connector: the connector's encoder object gives the DIG (`AtomConnectors::afmt_instance`, HDMI and DisplayPort only), the
+endpoints are read again (`refresh_audio_pins`, as `dce_v11_0_audio_get_pin` does every time), `audio_pin_for` picks the first connected endpoint (the driver's rule: the same one for every block, it does not tell two
+displays apart), and the field is written; false for a connector with no audio block (the eDP panel, a DIG 6 transmitter, no encoder in the table) or when no endpoint is connected, and then nothing is written.
+`select_audio_pins()` does it for every HDMI and DisplayPort connector with a display on its hot plug pin and returns how many. Nothing calls it by itself: a desktop that sets up audio calls it when a display appears.
+
+Not done here (the next section does the endpoint): the audio clock and sample rate (`dce_v11_0_afmt_setmode`'s DTO and ACR), the audio packets and infoframes, and any audio output to play through. `scripts/check_afmt_port.py <dce_v11_0.c> <vid.h> <dce_11_2_d.h> <dce_11_2_sh_mask.h>` checks the
+read-modify-write against the driver's function, the register and field numbers (the generated `AmdDce11Registers.inc`), the DIG offsets, `afmt[i]->offset = dig_offsets[i]`, `num_dig` of CHIP_VEGAM and the pin ids. Tested
+by `AmdVegaMTest::test_audio_select` (the XPS-like board: HDMI on DIG 2 and DisplayPort on DIG 3 get the first connected endpoint with the other bits and blocks untouched, the eDP panel and a DIG 6 encoder get nothing,
+endpoints and displays that come and go, every block and endpoint, out-of-range blocks and endpoints, stopped).
+
+### Enabling the audio endpoint: the "ELD" from the EDID
+
+The DCE 11 hardware builds the ELD that the sound driver reads (HDMI/DP audio, the codec's ELD buffer) from registers of the endpoint, which the display driver fills from the monitor's EDID in `dce_v11_0_afmt_setmode`;
+there is no ELD buffer to write. `EdidAudio::parse(edid, &info)` finds in the CTA extension blocks (tag 0x02, revision 3 and up; the data blocks from byte 4 up to the offset in byte 2, 0 meaning 127) the
+Short Audio Descriptors of every audio data block (`drm_edid_to_sad`: the format, channels - 1, sample rate bits and byte 2 of each three-byte descriptor, at most 32), the speaker allocation data block (its three-byte
+payload; the first one) and, from the HDMI vendor block (OUI 00-0C-03, at least 5 bytes of payload; the first one), the lip sync latency fields (`drm_parse_hdmi_vsdb_audio`: present flags in bit 7 / 6 of byte 8, then video and
+audio latency for progressive and for interlaced modes). Everything in the EDID is checked: data blocks that run past the end of the data blocks, bad offsets, short blocks and blocks of other kinds are skipped (every bit flip and
+truncation of a rich EDID runs under the sanitizers in `EdidAudioTest`). All the extension blocks are read, as the current kernels do (older ones read the first only).
+
+`AudioPins` writes the endpoint's indexed registers (index at `0x17a8 + 4 * pin`, data next to it): `set_enabled` is `dce_v11_0_audio_enable` (`HOT_PLUG_CONTROL` = `AUDIO_ENABLED` or 0, the whole register), `write_speaker_allocation`
+(`CHANNEL_SPEAKER`: DisplayPort bit 0, HDMI bit 1 - for DisplayPort connectors too, as the driver does - and the monitor's allocation or 5, stereo), `write_sads` (the twelve descriptor registers for PCM, AC-3, MPEG-1, MP3, MPEG-2,
+AAC LC, DTS, ATRAC, E-AC-3, DTS-HD, MLP and WMA Pro: each holds the descriptor of that format with the most channels, for PCM the sample rates of all of them ORed into the stereo field, and for the other formats only the first
+descriptor; nothing at all for a monitor without descriptors) and `write_latency` (`RESPONSE_LIPSYNC`: the progressive or interlaced video and audio latency, 0 if the monitor gives none). `AmdVegaM::enable_audio(connector, edid,
+interlaced)` runs the driver's order: the endpoint (the first connected one, `audio_pin_for`) disabled, speaker allocation, the connector's audio format block selects the endpoint, descriptors, latency, endpoint enabled; the variant without
+an EDID reads it first (`read_edid`, over DDC or AUX) and fails with it. A monitor without a CTA extension, or an empty EDID, gives stereo speakers, untouched descriptor registers and no latency, as the driver. `disable_audio` is
+`dce_v11_0_audio_enable(pin, false)` for the endpoint the connector's block has selected. Nothing is written for a connector without an audio block or when no endpoint is connected. Nothing calls these by itself. (The audio clock and the packets are the next section's: `enable_audio` does them too now.)
+
+**Difference from the driver:** `dce_v11_0_audio_write_latency_fields` computes the video latency and then the audio latency from zero again, so only the audio latency ever reaches the register; `write_latency` puts both in
+(the intended value). **Not done:** the audio output to play through; the ELD proper for
+a driver that wants the bytes (monitor name, manufacturer, connection type, SAD count). **Not checked:** `drm_edid.c` (the SAD, speaker and vendor block parsing is from memory) and the audio coding type numbers
+(`hdmi.h`); `scripts/check_audio_port.py <dce_v11_0.c> <dce_11_2_d.h> <dce_11_2_sh_mask.h>` checks the rest against the driver: the descriptor registers and their coding types, the SAD loop, the speaker allocation, the enable write, the
+latency fields, the register and field numbers, and the order of the steps in `dce_v11_0_afmt_setmode` against `enable_audio`. Tested by `EdidAudioTest` and `AmdVegaMTest::test_audio_enable` (a simulated endpoint with indexed registers,
+`tests/FakeAzalia.hpp`: the write order and every value of the rich EDID worked out by hand, the DDC-read variant, a monitor without audio data, endpoint changes, the driver's descriptor rules).
+
+### The audio clock, the packets and the AVI InfoFrame
+
+For the endpoint to carry sound the display engine has to send the audio in the blanking of the picture and a clock the sink can regenerate it from. `AmdVegaM::enable_audio(connector, edid, mode)` does all of
+`dce_v11_0_afmt_setmode`'s audio parts now, in the driver's order (`scripts/check_hdmi_port.py` compares the register-by-register sequence with the driver's function): the endpoint is disabled, then
+`AudioFormat::setup_packets(block, crtc, clock_khz, bpc)` does the audio clock - `dce_v11_0_audio_set_dto`: `DCCG_AUDIO_DTO_SOURCE.DCCG_AUDIO_DTO0_SOURCE_SEL` is the display controller whose timing it follows, `DCCG_AUDIO_DTO0_PHASE`
+24000 and `DCCG_AUDIO_DTO0_MODULE` the pixel clock in kHz, i.e. 24 MHz / pixel clock as a ratio - and the packets of the audio format block (null packets; the general control packet every frame, with deep colour for 10 and
+12 bits per component, off for 0, 6, 8, 16 and anything else; the audio info frame every frame; the audio packet delay; the 60958 channel status update and the channel numbers 1 to 8; the audio clock regeneration packet
+with the software CTS value unless there is deep colour, sent automatically); then the speaker allocation, `enable_channels` (all eight channels), the block's endpoint selection, the descriptors and the lip sync latency;
+then `AudioFormat::start`, which writes the AVI InfoFrame into `AFMT_AVI_INFO0..3` and sends it every frame on line 2, sends the audio samples and sets the ramp test registers; and the endpoint is enabled last.
+Nothing is written for a controller that does not exist (`mode.crtc` 6 and up) or when the connector has no audio block or no endpoint is connected.
+
+`Hdmi::acr(clock_khz)` is `amdgpu_afmt_acr`: the N and CTS of the audio clock regeneration packet for 32, 44.1 and 48 kHz audio: the driver's predefined rows for 25.175, 25.2, 27, 27.027, 54, 54.054, 74.176,
+74.25, 148.352 and 148.5 MHz, otherwise calculated as `amdgpu_afmt_calc_cts` does (the fraction 128 fs / clock in lowest terms, N scaled up to the first value at or above 128 fs / 1000: 4096 / 65000, 7056 / 81250 and
+6144 / 65000 for 65 MHz). `Hdmi::vic(mode)` is `drm_match_cea_mode` for the CEA modes that matter (the 640x480 to 3840x2160 modes with their active size, scan, double clock and nominal refresh within half a percent;
+4:3 and 16:9 twins by `picture_aspect`, the first otherwise), and `Hdmi::avi_infoframe(mode, out)` the 17 bytes `hdmi_avi_infoframe_pack` makes for what `drm_hdmi_avi_infoframe_from_display_mode` fills in: RGB, no
+bars, the active format "as the picture" (A0 and active aspect 8), the picture aspect, the VIC (0 for no CEA mode) and the pixel repeat of a double clocked mode, with the checksum. The mode is the caller's
+(`AmdVegaM::AudioMode`: the timing, the controller and the bits per component; the default is 1920x1080 at 60 Hz on controller 0, 8 bits).
+
+**Checked** against `dce_v11_0.c` by `scripts/check_hdmi_port.py`: the order of the register writes, the constants (CRC control 0x1000, the ramp registers, the DTO phase, the info frame line, the audio packets per line,
+the channel enable mask and numbers, the deep colour settings, the software CTS rule) and the AVI words. `HdmiInfoframeTest` checks the predefined N/CTS rows against the HDMI formula (CTS = clock N / (128 fs) within 0.02 %),
+the calculated values by hand (13.5, 65 MHz, edge cases), the mode matching with the standard timings, its tolerance, and the InfoFrame bytes with their checksum; `AmdVegaMTest::test_audio_packets` checks the registers
+of the HDMI-A (DIG 2) and DisplayPort (DIG 3) blocks for 1080p60 and 480i with values worked out by hand from the previous contents of the registers (fields written alone leave the rest). **Not checked:**
+`amdgpu_afmt.c` itself (its rows are from memory, but the formula check would catch a wrong one), `drm_edid.c`'s CEA mode table and `hdmi.c`'s packing (the VIC table and the InfoFrame bytes are from memory of
+them; the VIC is information for the sink, a wrong one does not stop the audio). **Not done here (the next section does the sound driver's side):** the audio InfoFrame (the hardware builds it), HDMI vendor InfoFrames (4K, 3D), the DisplayPort audio secondary data packets (the driver sets
+DisplayPort up as HDMI too, and so does this).
+
+### The sound driver: the graphics card's HD Audio controller
+
+The card's audio function (PCI class 0x0403, the second function of the GPU) is a High Definition Audio controller with one HDMI / DisplayPort codec, and the system's HD Audio driver (`IntelHdaAudioDevice`, which takes any
+controller of that class) plays to it: CORB/RIRB command rings, a cyclic buffer of eight 8 KiB entries through a buffer descriptor list, output stream 0, 48 kHz 16-bit stereo. What the codec adds to an analog one, and
+what the driver now does about it:
+
+- **Which pin.** The codec's pins are the display engine's endpoints (pin *n* is endpoint *n*): a pin reports *presence detect* (`GET_PIN_SENSE` bit 31) when its endpoint is enabled for a connected display
+  (`AmdVegaM::enable_audio`, `HOT_PLUG_CONTROL.AUDIO_ENABLED`) and *ELD valid* (bit 30) once the speaker allocation and descriptors are programmed. The driver prefers, as it always did, a line out, speaker or headphone pin;
+  then a digital pin (pin capabilities HDMI bit 7 or DisplayPort bit 24) with presence and a valid ELD, then one with presence only; then any output pin - a digital one with no display, which carries sound as soon as one
+  comes (the device exists and plays into the void until then). Pins whose configuration default says "no physical connection" are skipped.
+- **What a digital pin needs.** On top of the analog setup (power, connection select, pin control `OUT_EN`, stream tag and format on the converter): the converter's digital output (`SET_DIGI_CONVERT_1`, `DIGEN`), its channel
+  count (`SET_CVT_CHAN_COUNT`, 2 - 1), and the audio InfoFrame (type 0x84, version 1, ten data bytes, checksum, channel count - 1 in the first data byte, the rest "refer to stream header") written through the pin's
+  DIP buffer (`SET_HDMI_DIP_INDEX` packet 0 byte 0, `SET_HDMI_DIP_DATA` fourteen bytes, `SET_HDMI_DIP_XMIT` stopped while writing and then sent every frame).
+- **Following the displays.** `IAudioDevice::retarget()` (default: false; `SystemAudioDevices::retarget()` calls it on every device) makes `IntelHdaAudioDevice` look at the pins again, silence the old path (no InfoFrame, digital
+  output off, pin output off, converter off the stream) and set the new one up, with the stream running on. Nothing calls it by itself: a desktop that drives the card's outputs calls `AmdVegaM::enable_audio(connector)`
+  when a display with audio appears, `disable_audio` when it goes, and `SystemAudioDevices::retarget()` after either. (The desktop in `main.cpp` does not drive the card's outputs - they show nothing - so it does not do
+  this; and an HDMI link carries audio only while it carries video.)
+- **The register seam.** The driver reached the controller through volatile casts; it now goes through `IHdaRegisters` (`PhysicalHdaRegisters` is the memory-mapped one, the only place with the casts), so that a simulated
+  controller can stand in: `IntelHdaAudioDevice(IHdaRegisters&, allocator)` is the constructor without PCI.
+
+**Tested** by `IntelHdaTest` against `tests/FakeHda.hpp`, a controller simulated at the register level (reset handshakes, the CORB read from the driver's memory and the RIRB written to it, the stream descriptor) with a
+graphics card's codec (converters 2, 4, 6, pins 3, 5, 7 each taking any converter, an optional line out), written from the HD Audio specification and independent of the driver: the pin choice over nine combinations of presence,
+ELD and connectivity, an analog pin winning, every verb a digital pin gets (and the order of the InfoFrame's), the stream descriptor, the buffer list entries, playing through the ring with the stream position, retargeting
+(the old pin silenced, the new one set up, playback going on, a pin that is gone), the failures and a restart; and by `AmdVegaMTest::test_audio_end_to_end`, where the codec's pin sense follows the display side's
+endpoint registers (`FakeAzalia`): the sound driver's pin is the endpoint `enable_audio` chose, and follows it between the HDMI and DisplayPort connectors and between endpoints.
+
+**Not checked:** all the HD Audio verbs and parameters are from the High Definition Audio specification and from memory of the Linux `patch_hdmi.c` / `hda_verbs.h` (not at hand): the DIP buffer protocol (index byte, auto-increment
+of the data verb, the xmit codes 0x00 and 0xC0), `SET_DIGI_CONVERT_1` and `SET_CVT_CHAN_COUNT` on an HDMI converter, and the pin sense bits. **Not done:** the vendor-specific verbs of the ATI codecs (channel allocation, down-mix
+info, HBR control, the multi-channel remap), more than two channels or other formats (the stream is 48 kHz 16-bit stereo), the ELD read back from the pin (`GET_HDMI_ELDD`) to check what the display side programmed,
+unsolicited events for display changes (the driver is polled: someone calls `retarget()`), DisplayPort MST (device select), and anything on real hardware.
+
+### DisplayPort link training through the video BIOS
+
+Before a DisplayPort sink shows a picture the source and the sink agree on a link: the lane count and rate, and for each lane the voltage swing and pre-emphasis the sink can still read the clock and the data
+at. `DpLinkTrainer` (`DpLinkTrain.*`) is `amdgpu_atombios_dp_link_train`; the hardware side is `AmdDpSource` (`AmdDpSource.*`), the encoder and the transmitter driven through the AtomBIOS command tables, and
+`AmdVegaM::train_link(connector, pixel_clock_khz, bpc, &out)` ties them to a connector.
+
+- **Choosing the link.** `DpLinkConfig::choose(caps, pixel_clock_khz, bits_per_pixel)` is `amdgpu_atombios_dp_get_dp_link_config`: rate by rate from 1.62 up to the sink's maximum, the fewest lanes at that rate
+  that carry the pixel clock (lanes x rate x 8 / bpp >= clock); if nothing does, no lanes (the driver's -EINVAL; training refuses). (An earlier version of this code, written from memory, had radeon's
+  "fewest lanes at 2.7 first" rule, which amdgpu does not have; the source was fetched later and the code corrected.) `bandwidth_code()` is `DP_LINK_BW_SET` (rate / 27 MHz: 6, 10, 20).
+- **The training**, in the driver's order: the sink to D0 (`DP_SET_POWER` 0x600 = 1, for DPCD 1.1 and up, 1 ms to wake), downspread (`DP_DOWNSPREAD_CTRL` 0x107 = 0x10 if the sink supports 0.5 %, else 0),
+  `DP_LANE_COUNT_SET` 0x101 (the lanes, with bit 7 for enhanced framing if the sink has it) and `DP_LINK_BW_SET` 0x100; the encoder told to start (`ATOM_ENCODER_CMD_DP_LINK_TRAINING_START`) and the pattern off on the sink
+  (`DP_TRAINING_PATTERN_SET` 0x102 = 0). **Clock recovery:** pattern 1 on the source (`..._PATTERN1`) and then on the sink, the drive (voltage 0, pre-emphasis 0) on the transmitter (`SETUP_VSEMPH`, all lanes at once from the
+  first lane's value) and on the sink (`DP_TRAINING_LANE0_SET` 0x103, one byte per lane), 400 us; then until `drm_dp_clock_recovery_ok` (the clock recovery done bit of every lane in use): wait (the sink's
+  `DP_TRAINING_AUX_RD_INTERVAL` 0x00E: 100 us if 0, else 4 ms per unit), read the link status (0x202..0x207), and if the clock is not there give up when every lane is already at the maximum swing (the 'max reached' flag) or when
+  the sink has asked for the same voltage five times in a row, else set the drive to the highest voltage swing and pre-emphasis any lane's adjust request (0x206/0x207) asks for, on every lane, with the 'max
+  reached' flags (0x04, 0x20) once level 3 is asked. **Channel equalization:** pattern 3 if the sink has it (`TPS3_SUPPORTED`), else 2, the same way; until `drm_dp_channel_eq_ok` (clock recovery, equalization and symbol lock
+  of every lane in use, and interlane alignment), with the waits 400 us or the interval, up to six adjustments (seven status reads). **Finish:** pattern off on the sink and `..._COMPLETE` on the encoder. The outcome (`Result`)
+  says where it failed, and the finish is done whatever happened (after the driver's 400 us wait). After a failed clock recovery the equalization is not tried, as in the driver; the driver ignores a failed DPCD
+  write, here it ends the training with the result that names it. For an eDP panel (or a DP bridge) whose `DP_EDP_CONFIGURATION_CAP` (0x00D) has bit 0 - the internal DP2 panel mode - `DP_EDP_CONFIGURATION_SET`
+  (0x10A) is written 1 after the downspread (the alternate scrambler seed); the encoder is told the panel mode (`ATOM_ENCODER_CMD_SETUP_PANEL_MODE`) by the mode set. A sink of DPCD 1.4 gets 100 us in the clock recovery.
+- **The tables.** The encoder is the **DIGx encoder control table (index 4)** for every DIG - the DIG number is in the parameters (revisions 1.2 to 1.4: eight bytes, pixel clock in 10 kHz, the configuration with the link rate
+  and the DIG in bits 6:4, the action, mode, lanes, bits per colour, in 1.4 the hot plug id; revision 1.5: a union of the command (DIG, action), stream setup, link setup and panel mode parameters); an earlier version
+  of this code used DIG1EncoderControl (74) and DIG2EncoderControl (75) by DIG, which the Linux driver does not do for these chips. The transmitter is `UNIPHYTransmitterControl` (76), revision 1.4, 1.5 or 1.6
+  (1.5: symbol clock = link rate / 10 in 10 kHz units, the PHY id - the same number as the DIG on this card - the action, lanes, the connector object id, the encoder mode, the configuration with the hot plug select and
+  the CRTC's PLL as the PHY's clock source, the DIG front end as a bit per DIG, the lane set). The parameters are built by `AmdModeSet::encoder` / `transmitter` (see "Mode setting"), which `AmdDpSource` calls.
+  Other revisions and DIGs that do not exist are refused (`false`), nothing is run. The table indexes, layouts, constants and the driver's conditions are checked by `scripts/check_modeset_port.py` against
+  `atombios.h`, `atombios_crtc.c` and `atombios_encoders.c`, and the DPCD addresses and bits and the algorithm's constants by `scripts/check_dplink_port.py` against `drm_dp.h`, `atombios_dp.c` and `drm_dp_helper.c`
+  (kernel v6.12; the AMD sources are `drivers/gpu/drm/amd/amdgpu/atombios_*.c`, without the `amdgpu_` prefix).
+- **`train_link`** reads the sink's capabilities (the eDP panel is powered up first), chooses the link, and trains; the connector's encoder object gives the DIG (0..5: the Vega M's six) and the link; the hot plug pin, the
+  connector object id and the bits per colour (6, 8, 10, 12, 16; anything else 8) go into the tables.
+
+**Tested** by `DpLinkTrainTest` (the algorithm against a sink and source that log everything in order: the exact write sequence of a clean training, the options of the sink, adjusting to levels the sink asks for - the
+highest of several lanes, the flags at the top level, lanes not in use ignored - the clock recovery giving up after five repeats or at the maximum swing, the equalization after one to seven reads, pattern 2 or 3, the
+delays by the read interval, every write and read and each source step failing in turn, the link configuration over twelve cases), `AmdDpSourceTest` (an AtomBIOS image whose three tables hand their parameter words to the
+card: every word for each action, rate, DIG and revision, and the refusals), and `AmdVegaMTest::test_train_link` (the DisplayPort connector on DIG 3 link B and the eDP panel on DIG 0, with the DPCD writes and the table calls
+of the whole training for 1080p60 and 4K60, failure, and the refusals).
+
+**Checked** against the driver's sources (v6.12) as above. **Not checked / not done:** which table revisions a real Polaris video BIOS has (1.5 encoder control and 1.5 transmitter control are what I believe; 1.3, 1.4 and 1.6
+are handled too), NUTMEG's 2.7-only rule, 8.1 Gbit/s, and everything on real hardware.
+
+**eDP 1.4 rate table and retraining (done after the above):** a panel of eDP revision 1.4 that lists rates (`Capabilities::edp_rates_khz`) is trained by table index: `DpLinkConfig::choose` takes the lowest listed rate (any order) that
+the encoder control can be told (1.62, 2.7, 3.24, 5.4 GHz; 2.16 and the like are skipped) with the fewest lanes, writes `DP_LINK_BW_SET` 0 and `DP_LINK_RATE_SET` (0x115) with the index after the lane count. `service_short_pulses`
+retrains a lost link that `train_link` trained (see the short pulse section). Tests: `DpLinkTrainTest::test_edp_rate_table`, `AmdVegaMTest::test_train_link`, `test_retrain_on_short_pulse`. `DP_LINK_RATE_SET` (0x115) is in `drm_dp.h` but the amdgpu AtomBIOS path never uses it (it works from `DP_MAX_LINK_RATE`), so this is an addition of ours for eDP 1.4 panels, which has not been seen to work.
+
+### Mode setting through the video BIOS
+
+`AmdModeSet` (`AmdModeSet.*`) calls the BIOS tables that set a mode with the parameters amdgpu gives them (`atombios_crtc.c` and `atombios_encoders.c`, v6.12, which an earlier version of this section had from
+memory - the comparison corrected the encoder control table index, the CRTC timing table and the sequence): SetPixelClock 1.7 (the clock in 100 Hz units - on Polaris/VEGAM the card computes the PLL from it - the PLL,
+encoder id, mode, CRTC, HDMI deep colour ratio 5:4 / 3:2 / 2:1, dual link DVI above 165 MHz), SetCRTC_UsingDTDTiming (display size and blanking to the total, sync offset and width, polarity / composite / interlace /
+double clock flags), SetCRTC_OverScan and EnableScaler (RMX off: all zero, scaler disabled), SelectCRTC_Source 1.2 / 1.3 (the DIG as ASIC_INT_DIGn_ENCODER_ID, mode, panel colour depth), EnableCRTC, BlankCRTC,
+UpdateCRTC_DoubleBufferRegisters (the lock), EnableDispPowerGating, the DIGx encoder control (1.2 to 1.5) and the UNIPHY transmitter control (1.4, 1.5, 1.6).
+
+`AmdVegaM::set_mode(connector, crtc, mode, bpc, &result[, pll])` is the DRM modeset of `dce_v11_0.c` in order: **crtc prepare** (power gating off, lock, blank and disable), the DisplayPort sink's capabilities and the lane /
+rate choice, **encoder prepare** (eDP panel on, the CRTC's source), **crtc mode set** (pixel clock - DisplayPort on PPLL0, the others on PPLL1 for even CRTCs and PPLL2 for odd unless named - DTD timing, overscan,
+scaler), **encoder mode set** (the encoder off: DP video off, the sink to D3, the transmitter disabled, the eDP panel off), **crtc commit** (enable, unblank, unlock), **encoder commit** (encoder setup, the panel mode,
+the eDP panel on, the transmitter enabled, for DisplayPort the link trained - sink to D0, ASSR for the internal DP2 panel mode - and the video on). `ModeSetResult::failed` names the step that failed; tables the BIOS
+does not have (power gating, lock, overscan, scaler) are skipped as the driver does by running nothing. `disable_mode` is `dce_v11_0_encoder_disable` and `_crtc_disable`: the encoder off, the CRTC blanked and disabled,
+power gating on, and the CRTC's PLL off unless another CRTC set up by `set_mode` still uses it. The retraining after a short pulse remembers the PLL.
+
+Tests: `tests/AmdModeSetTest.cpp` (every word of every table for every revision handled, the refusals), `AmdVegaMTest::test_set_mode` (the order and words for DisplayPort, HDMI and the eDP panel, the panel power
+sequence, the internal DP2 panel mode with ASSR, each failing stage, switching off with the shared PLL), `scripts/check_modeset_port.py`.
+
+**Scanout:** `amd_dce11::Scanout` is `dce_v11_0_crtc_do_set_base` for a linear 32 bit surface (VGA mode off, surface update at vertical blank, primary and secondary addresses, ARGB8888 control, no swap, the LUT bypass off, offsets and window, pitch, the plane enabled, the line buffer height, the viewport - the height rounded up to even - and the master update mode); `set_mode(..., surface)` calls it between the timing and the overscan as the driver does (stage `Scanout`), `disable_mode` switches the plane off after the CRTC. `scripts/check_scanout_port.py` checks the register addresses, bits and the driver's write order; `AmdDce11Test::test_scanout` every register for every CRTC. **Not done:** tiled and other pixel formats, the look-up table, the bandwidth update, the VGA enable writes around the unblank, the FMT block (dither / truncation) and
+interleave setup, the audio setup of an HDMI output (`enable_audio` / `AudioFormat`, separate calls), spread spectrum (the driver reads the BIOS's SS info; none is programmed here), the pixel clock limit checks,
+the PLL choice from the PLLs in use (`dce_v11_0_pick_pll`), a DP bridge chip's DP1 panel mode, external encoders, backlight; nothing in `main.cpp` calls `set_mode`; real hardware.

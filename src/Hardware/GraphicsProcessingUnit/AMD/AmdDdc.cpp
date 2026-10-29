@@ -18,9 +18,9 @@
 
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdDdc.hpp"
 
-// Follows the Linux amdgpu driver (Copyright Advanced Micro Devices, Inc.; MIT license) as far as it is known here: amdgpu_i2c.c's bit-banging callbacks (amdgpu_i2c_pre_xfer,
-// _post_xfer, _set_clock, _set_data, _get_clock, _get_data), written from memory of that file (it was not at hand), the algorithm of the kernel's i2c-algo-bit.c, and
-// drm_do_get_edid / drm_do_probe_ddc_edid for the EDID. The register choreography is therefore not checked against the source.
+// Follows the Linux amdgpu driver (Copyright Advanced Micro Devices, Inc.; MIT license): amdgpu_i2c.c's bit-banging callbacks (amdgpu_i2c_pre_xfer, _post_xfer, _set_clock, _set_data,
+// _get_clock, _get_data; compared with v6.12, which led to the hardware capable pad switch and the posting reads), the algorithm of the kernel's i2c-algo-bit.c (udelay 10, so a half
+// period of 5 us; timeout 2200 us), and drm_do_get_edid / drm_do_probe_ddc_edid for the EDID.
 
 namespace hardware {
 
@@ -30,20 +30,26 @@ void AmdDdc::delay_us(uint32_t us) {
   }
 }
 
-// amdgpu_i2c_pre_xfer: the output values cleared, the pins made inputs, the pads masked for software
+// amdgpu_i2c_pre_xfer: for a hardware capable line the pads switched to DDC mode (bit 16 of the clock mask register cleared), the output values cleared, the pins made inputs, the pads
+// masked for software (each mask register read back after the write, to post it)
 void AmdDdc::pre_xfer() {
+  if (bus_.hw_capable) r_.write(bus_.mask_clk_reg, r_.read(bus_.mask_clk_reg) & ~(1u << 16));
   r_.write(bus_.a_clk_reg, r_.read(bus_.a_clk_reg) & ~bus_.a_clk_mask);
   r_.write(bus_.a_data_reg, r_.read(bus_.a_data_reg) & ~bus_.a_data_mask);
   r_.write(bus_.en_clk_reg, r_.read(bus_.en_clk_reg) & ~bus_.en_clk_mask);
   r_.write(bus_.en_data_reg, r_.read(bus_.en_data_reg) & ~bus_.en_data_mask);
   r_.write(bus_.mask_clk_reg, r_.read(bus_.mask_clk_reg) | bus_.mask_clk_mask);
+  r_.read(bus_.mask_clk_reg);
   r_.write(bus_.mask_data_reg, r_.read(bus_.mask_data_reg) | bus_.mask_data_mask);
+  r_.read(bus_.mask_data_reg);
 }
 
 // amdgpu_i2c_post_xfer: the pads given back
 void AmdDdc::post_xfer() {
   r_.write(bus_.mask_clk_reg, r_.read(bus_.mask_clk_reg) & ~bus_.mask_clk_mask);
+  r_.read(bus_.mask_clk_reg);
   r_.write(bus_.mask_data_reg, r_.read(bus_.mask_data_reg) & ~bus_.mask_data_mask);
+  r_.read(bus_.mask_data_reg);
 }
 
 // a line is high when nothing pulls it low: the output is "enabled" to pull it low

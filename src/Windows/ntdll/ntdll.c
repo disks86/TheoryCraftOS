@@ -328,13 +328,86 @@ EXPORT ULONG NTAPI RtlNtStatusToDosError(NTSTATUS status) {
   }
 }
 
+#define STATUS_REVISION_MISMATCH ((NTSTATUS)0xC0000059)
+/* The operating system calls itself Windows 10 (10.0, build 19045), a workstation without a service pack. */
 EXPORT NTSTATUS NTAPI RtlGetVersion(RTL_OSVERSIONINFOW *info) {
-  if (!info) return STATUS_INVALID_PARAMETER;
+  if (!info || (info->dwOSVersionInfoSize != sizeof(RTL_OSVERSIONINFOW) && info->dwOSVersionInfoSize != sizeof(RTL_OSVERSIONINFOEXW))) return STATUS_INVALID_PARAMETER;
   info->dwMajorVersion = 10;
   info->dwMinorVersion = 0;
   info->dwBuildNumber = 19045;
   info->dwPlatformId = 2;
   info->szCSDVersion[0] = 0;
+  if (info->dwOSVersionInfoSize == sizeof(RTL_OSVERSIONINFOEXW)) {
+    RTL_OSVERSIONINFOEXW *ex = (RTL_OSVERSIONINFOEXW *)info;
+    ex->wServicePackMajor = ex->wServicePackMinor = 0;
+    ex->wSuiteMask = 0x0100;      /* VER_SUITE_SINGLEUSERTS */
+    ex->wProductType = 1;         /* VER_NT_WORKSTATION */
+    ex->wReserved = 0;
+  }
+  return STATUS_SUCCESS;
+}
+EXPORT VOID NTAPI RtlGetNtVersionNumbers(ULONG *major, ULONG *minor, ULONG *build) {
+  if (major) *major = 10;
+  if (minor) *minor = 0;
+  if (build) *build = 19045 | 0xF0000000u;      /* (the top bits say it is a free build) */
+}
+EXPORT ULONGLONG NTAPI VerSetConditionMask(ULONGLONG mask, ULONG type, UCHAR condition) {
+  if (type == 0) return mask;
+  static const ULONG kTypes[] = {1, 2, 4, 8, 0x10, 0x20, 0x40, 0x80};      /* minor, major, build, platform, SP minor, SP major, suite, product type */
+  for (int bit = 0; bit < 8; bit++) {
+    if (!(type & kTypes[bit])) continue;
+    mask &= ~((ULONGLONG)7 << (bit * 3));
+    mask |= (ULONGLONG)(condition & 7) << (bit * 3);
+  }
+  return mask;
+}
+static BOOLEAN version_compare(ULONG have, ULONG want, UCHAR condition) {
+  switch (condition) {
+    case 1: return have == want;      /* VER_EQUAL */
+    case 2: return have > want;       /* VER_GREATER */
+    case 3: return have >= want;      /* VER_GREATER_EQUAL */
+    case 4: return have < want;       /* VER_LESS */
+    case 5: return have <= want;      /* VER_LESS_EQUAL */
+    default: return FALSE;
+  }
+}
+/* Does this system meet the version asked for? The conditions are three bits per field in `mask`. Major, minor and the service pack numbers are one chain: a later field is
+   looked at only if the earlier one was equal (and its condition allows equality). STATUS_REVISION_MISMATCH if not. */
+EXPORT NTSTATUS NTAPI RtlVerifyVersionInfo(const RTL_OSVERSIONINFOEXW *info, ULONG types, ULONGLONG mask) {
+  RTL_OSVERSIONINFOEXW now;
+  now.dwOSVersionInfoSize = sizeof(now);
+  if (!info || !types) return STATUS_INVALID_PARAMETER;
+  if (!(types & 0xFF)) return STATUS_INVALID_PARAMETER;
+  RtlGetVersion((RTL_OSVERSIONINFOW *)&now);
+  const BOOLEAN extended = TRUE;      /* (the size in the structure is not looked at: the caller is trusted to have room for the fields it asks about) */
+  #define COND(bit) ((UCHAR)((mask >> ((bit) * 3)) & 7))
+  if (types & 0x80) { if (!extended || !version_compare(now.wProductType, info->wProductType, COND(7))) return STATUS_REVISION_MISMATCH; }
+  if (types & 0x40) {      /* VER_SUITENAME: VER_AND needs every bit, VER_OR any */
+    const UCHAR c = COND(6);
+    if (!extended) return STATUS_REVISION_MISMATCH;
+    if (c == 6 /* VER_AND */) { if ((info->wSuiteMask & now.wSuiteMask) != info->wSuiteMask) return STATUS_REVISION_MISMATCH; }
+    else if (c == 7 /* VER_OR */) { if (info->wSuiteMask && !(info->wSuiteMask & now.wSuiteMask)) return STATUS_REVISION_MISMATCH; }      /* (asking for none is met) */
+    else return STATUS_INVALID_PARAMETER;
+  }
+  if ((types & 8) && !version_compare(now.dwPlatformId, info->dwPlatformId, COND(3))) return STATUS_REVISION_MISMATCH;
+  if ((types & 4) && !version_compare(now.dwBuildNumber, info->dwBuildNumber, COND(2))) return STATUS_REVISION_MISMATCH;
+  if (types & 0x33) {
+    /* Major, minor, service pack major and minor are one chain. The first field whose values differ decides. While they are equal the next field is looked at; a condition
+       of EQUAL gives way to the next field's own condition, any other condition carries on to the fields after it. */
+    struct { ULONG bit_type; int bit; ULONG have, want; } chain[4] = {
+      {2, 1, now.dwMajorVersion, info->dwMajorVersion}, {1, 0, now.dwMinorVersion, info->dwMinorVersion},
+      {0x20, 5, now.wServicePackMajor, extended ? info->wServicePackMajor : 0}, {0x10, 4, now.wServicePackMinor, extended ? info->wServicePackMinor : 0}};
+    UCHAR c = 0;
+    BOOLEAN have_condition = FALSE, result = TRUE;
+    for (int i = 0; i < 4; i++) {
+      if (!(types & chain[i].bit_type)) continue;
+      if (!have_condition || c == 1) { c = COND(chain[i].bit); have_condition = TRUE; }
+      result = version_compare(chain[i].have, chain[i].want, c);
+      if (chain[i].have != chain[i].want) break;
+    }
+    if (!result) return STATUS_REVISION_MISMATCH;
+  }
+  #undef COND
   return STATUS_SUCCESS;
 }
 
@@ -495,6 +568,7 @@ EXPORT void NTAPI RtlExitUserThread(NTSTATUS status) {
 
 /* New threads begin here (the kernel passes the thread's function and parameter in the first two argument registers); the function's return value is the thread's exit code. */
 EXPORT void NTAPI TcosThreadStart(LPTHREAD_START_ROUTINE start, PVOID parameter) {
+  if (!TEB_TLS_POINTER(NtCurrentTeb())) TEB_TLS_POINTER(NtCurrentTeb()) = *(PVOID **)((BYTE *)NtCurrentTeb() + 0x1788);      /* (the kernel left the thread-local array where it could not be seen) */
   fls_thread_begins();
   notify_all_modules(DLL_THREAD_ATTACH, NULL, 1);
   RtlExitUserThread((NTSTATUS)start(parameter));
@@ -690,11 +764,16 @@ static Heap *heap_new(ULONG flags, SIZE_T commit) {
   return h;
 }
 
-static int heap_ok(Heap *h) { return h && h->magic == HEAP_MAGIC; }
-
-/* Every heap of the process, in the order they were made (the process heap first): RtlGetProcessHeaps and the Toolhelp heap lists. */
 #define MAX_HEAPS 128
 static Heap *g_heaps[MAX_HEAPS];
+/* A heap handle is good if it is one of the heaps made (a destroyed heap's memory is gone: its header is not looked at). */
+static int heap_ok(Heap *h) {
+  if (!h) return 0;
+  for (int i = 0; i < MAX_HEAPS; ++i) if (g_heaps[i] == h) return h->magic == HEAP_MAGIC;
+  return 0;
+}
+
+/* Every heap of the process, in the order they were made (the process heap first): RtlGetProcessHeaps and the Toolhelp heap lists. */
 static volatile LONG g_heaps_lock;
 static void heaps_lock(void) { while (__sync_lock_test_and_set(&g_heaps_lock, 1)) NtYieldExecution(); }
 static void heaps_unlock(void) { __sync_lock_release(&g_heaps_lock); }
@@ -1227,10 +1306,128 @@ static NTSTATUS ldr_load_one(PULONG flags, PUNICODE_STRING name, PVOID *handle) 
 
 /* A bare file name is looked for in the directories of the search path (separated by ';'): a file that is found but cannot be loaded does not stop the search; if nothing
  * loads, the answer is the error of the first file that was found (or "not found"). */
+/* The folder SetDllDirectory names (searched by LoadLibrary after the program's own). */
+static WCHAR g_dll_directory_text[520];
+static USHORT g_dll_directory_chars;
+EXPORT NTSTATUS NTAPI LdrSetDllDirectory(PUNICODE_STRING directory) {
+  const USHORT n = directory ? (USHORT)(directory->Length / 2) : 0;
+  if (n >= 520) return 0xC0000106;      /* STATUS_NAME_TOO_LONG */
+  for (USHORT i = 0; i < n; i++) g_dll_directory_text[i] = directory->Buffer[i];
+  g_dll_directory_text[n] = 0;
+  g_dll_directory_chars = n;
+  return 0;
+}
+EXPORT NTSTATUS NTAPI LdrGetDllDirectory(PUNICODE_STRING directory) {
+  const ULONG need = ((ULONG)g_dll_directory_chars + 1) * 2;
+  if (directory->MaximumLength < need) {
+    if (directory->MaximumLength >= 2 && directory->Buffer) directory->Buffer[0] = 0;
+    directory->Length = (USHORT)need;
+    return 0xC0000023;      /* STATUS_BUFFER_TOO_SMALL */
+  }
+  for (USHORT i = 0; i <= g_dll_directory_chars; i++) directory->Buffer[i] = g_dll_directory_text[i];
+  directory->Length = (USHORT)(g_dll_directory_chars * 2);
+  return 0;
+}
+#define MAX_USER_DLL_DIRS 16
+static struct { WCHAR path[520]; BOOLEAN used; ULONG sequence; } g_user_dll_dirs[MAX_USER_DLL_DIRS];
+static ULONG g_user_dll_sequence;
+EXPORT NTSTATUS NTAPI LdrAddDllDirectory(PUNICODE_STRING directory, PVOID *cookie) {
+  const USHORT n = directory->Length / 2;
+  if (n >= 520 || n < 1) return STATUS_INVALID_PARAMETER;
+  for (int i = 0; i < MAX_USER_DLL_DIRS; i++) {
+    if (g_user_dll_dirs[i].used) continue;
+    for (USHORT k = 0; k < n; k++) g_user_dll_dirs[i].path[k] = directory->Buffer[k];
+    g_user_dll_dirs[i].path[n] = 0;
+    g_user_dll_dirs[i].used = TRUE;
+    g_user_dll_dirs[i].sequence = ++g_user_dll_sequence;
+    *cookie = (PVOID)(ULONG_PTR)(i + 1);
+    return STATUS_SUCCESS;
+  }
+  return STATUS_NO_MEMORY;
+}
+EXPORT NTSTATUS NTAPI LdrRemoveDllDirectory(PVOID cookie) {
+  const ULONG_PTR i = (ULONG_PTR)cookie;
+  if (i < 1 || i > MAX_USER_DLL_DIRS || !g_user_dll_dirs[i - 1].used) return STATUS_INVALID_PARAMETER;
+  g_user_dll_dirs[i - 1].used = FALSE;
+  return STATUS_SUCCESS;
+}
+/* The folders a set of LOAD_LIBRARY_SEARCH_* flags names, separated by ';' (application 0x200, System32 0x800; the user folders belong to kernel32). */
+static BOOLEAN search_flags_path(ULONG flags, WCHAR *out, SIZE_T capacity) {
+  static const WCHAR system32[] = {'C', ':', '\\', 'W', 'i', 'n', 'd', 'o', 'w', 's', '\\', 'S', 'y', 's', 't', 'e', 'm', '3', '2', 0};
+  SIZE_T n = 0;
+  out[0] = 0;
+  if (flags & 0x1000) flags |= 0xE00;      /* LOAD_LIBRARY_SEARCH_DEFAULT_DIRS: application, user and System32 folders */
+  if (flags & 0x200) {      /* the folder of the program: ImagePathName of the process parameters, without the file */
+    const UNICODE_STRING *image = (const UNICODE_STRING *)(*(const BYTE *const *)(*(const BYTE *const *)((const BYTE *)NtCurrentTeb() + 0x60) + 0x20) + 0x60);
+    SIZE_T length = image->Length / 2;
+    while (length > 0 && image->Buffer[length - 1] != '\\') --length;
+    if (length > 1 && length < capacity) {
+      for (SIZE_T i = 0; i + 1 < length; ++i) out[n++] = image->Buffer[i];
+      out[n++] = ';';
+    }
+  }
+  if (flags & 0x800) {
+    for (SIZE_T i = 0; system32[i] && n + 1 < capacity; ++i) out[n++] = system32[i];
+    out[n++] = ';';
+  }
+  if (flags & 0x400) {      /* the folders AddDllDirectory added, the newest first, then the one SetDllDirectory named */
+    BOOLEAN done[MAX_USER_DLL_DIRS] = {0};
+    for (;;) {
+      int best = -1;
+      for (int i = 0; i < MAX_USER_DLL_DIRS; i++) if (g_user_dll_dirs[i].used && !done[i] && (best < 0 || g_user_dll_dirs[i].sequence > g_user_dll_dirs[best].sequence)) best = i;
+      if (best < 0) break;
+      done[best] = TRUE;
+      for (SIZE_T i = 0; g_user_dll_dirs[best].path[i] && n + 2 < capacity; ++i) out[n++] = g_user_dll_dirs[best].path[i];
+      out[n++] = ';';
+    }
+    for (SIZE_T i = 0; i < g_dll_directory_chars && n + 2 < capacity; ++i) out[n++] = g_dll_directory_text[i];
+    if (g_dll_directory_chars) out[n++] = ';';
+  }
+  if (n > 0) --n;
+  out[n] = 0;
+  return TRUE;
+}
+EXPORT ULONG NTAPI RtlGetFullPathName_U(PCWSTR name, ULONG size, PWSTR buffer, PWSTR *file_part);
+EXPORT NTSTATUS NTAPI LdrGetDllPath(PCWSTR name, ULONG flags, PWSTR *path, PWSTR *unused) {
+  (void)name;
+  WCHAR text[1040];
+  if ((flags & 8) && (flags & 0x1F00)) return STATUS_INVALID_PARAMETER;
+  search_flags_path(flags ? flags : 0xA00, text, 1040);
+  SIZE_T n = 0;
+  while (text[n]) ++n;
+  PWSTR copy = RtlAllocateHeap(process_heap(), 0, (n + 1) * 2);
+  if (!copy) return STATUS_NO_MEMORY;
+  for (SIZE_T i = 0; i <= n; ++i) copy[i] = text[i];
+  *path = copy;
+  if (unused) *unused = NULL;
+  return STATUS_SUCCESS;
+}
+EXPORT VOID NTAPI RtlReleasePath(PWSTR path) { if (path) RtlFreeHeap(process_heap(), 0, path); }
 EXPORT NTSTATUS NTAPI LdrLoadDll(PWSTR search_path, PULONG flags, PUNICODE_STRING name, PVOID *handle) {
+  WCHAR coded[1040];
+  BOOLEAN absolute = name->Length >= 6 && name->Buffer[1] == ':' && (name->Buffer[2] == '\\' || name->Buffer[2] == '/');
+  if (name->Length >= 2 && name->Buffer[0] == '\\') absolute = TRUE;      /* (\\server\share, or rooted in the current drive) */
+  if ((ULONG_PTR)search_path <= 0xFFFF && ((ULONG_PTR)search_path & 1)) {      /* LOAD_LIBRARY_SEARCH_* flags in place of a path */
+    const ULONG search = (ULONG)(ULONG_PTR)search_path & ~1u;
+    if (((search & 8) && (search & 0x1F00)) || ((search & 0x100) && !absolute)) return STATUS_INVALID_PARAMETER;
+    search_flags_path(search, coded, 1040);
+    search_path = coded;
+  }
   BOOLEAN bare = TRUE;
-  for (USHORT i = 0; search_path && i < name->Length / 2; ++i) if (name->Buffer[i] == '\\' || name->Buffer[i] == '/' || name->Buffer[i] == ':') bare = FALSE;
-  if (!search_path || !bare || !search_path[0]) return ldr_load_one(flags, name, handle);
+  for (USHORT i = 0; i < name->Length / 2; ++i) if (name->Buffer[i] == '\\' || name->Buffer[i] == '/' || name->Buffer[i] == ':') bare = FALSE;
+  const BOOLEAN drive_relative = name->Length >= 4 && name->Buffer[1] == ':' && !absolute;      /* ("C:name": the current folder of that drive) */
+  if (!bare && !absolute && (!search_path || drive_relative)) {      /* a relative path is taken from the current folder */
+    WCHAR full[520], text[520];
+    SIZE_T n = name->Length / 2;
+    if (n >= 520) return STATUS_NAME_TOO_LONG_;
+    for (SIZE_T i = 0; i < n; ++i) text[i] = name->Buffer[i];
+    text[n] = 0;
+    const ULONG length = RtlGetFullPathName_U(text, sizeof(full), full, NULL);
+    if (length == 0 || length >= sizeof(full)) return STATUS_DLL_NOT_FOUND;
+    UNICODE_STRING us = { (USHORT)length, (USHORT)(length + 2), full };
+    return ldr_load_one(flags, &us, handle);
+  }
+  if (!search_path || absolute || !search_path[0]) return ldr_load_one(flags, name, handle);
   NTSTATUS first_error = STATUS_DLL_NOT_FOUND;
   BOOLEAN found = FALSE;
   const WCHAR *dir = search_path;
@@ -1245,14 +1442,265 @@ EXPORT NTSTATUS NTAPI LdrLoadDll(PWSTR search_path, PULONG flags, PUNICODE_STRIN
       if (full[n - 1] != '\\') full[n++] = '\\';
       for (USHORT i = 0; i < name->Length / 2; ++i) full[n++] = name->Buffer[i];
       full[n] = 0;
+      WCHAR expanded[520];
       UNICODE_STRING us = { (USHORT)(n * 2), (USHORT)(n * 2 + 2), full };
+      if (!(full[1] == ':' && full[2] == '\\') && full[0] != '\\') {      /* (a relative folder in the path: from the current folder) */
+        const ULONG got = RtlGetFullPathName_U(full, sizeof(expanded), expanded, NULL);
+        if (got != 0 && got < sizeof(expanded)) { us.Buffer = expanded; us.Length = (USHORT)got; us.MaximumLength = (USHORT)(got + 2); }
+      }
       const NTSTATUS status = ldr_load_one(flags, &us, handle);
-      if (NT_SUCCESS(status)) return status;
+      if (NT_SUCCESS(status) || status == STATUS_DLL_INIT_FAILED || status == (NTSTATUS)0xC000007B || status == (NTSTATUS)0xC000012F || status == (NTSTATUS)0xC000011B || status == (NTSTATUS)0xC0000131 || status == (NTSTATUS)0xC0000130 || status == (NTSTATUS)0xC000035A) return status;      /* (a file that is no image of any kind, or a library that began to run, is the answer) */
       if (status != STATUS_DLL_NOT_FOUND && status != (NTSTATUS)0xC0000034 && status != (NTSTATUS)0xC000003A && !found) { found = TRUE; first_error = status; }
     }
     dir = *end ? end + 1 : end;
   }
   return first_error;
+}
+
+/* Files that were moved while the process runs (MoveFile tells us): a library is known by the path it was loaded from, and the same file under its new name is the same library. */
+static WCHAR ldr_upper(WCHAR c);
+#define MAX_RENAMES 16
+static struct { WCHAR from[260], to[260]; } g_renames[MAX_RENAMES];
+static ULONG g_rename_count;
+EXPORT VOID NTAPI TcosNoteFileRename(PCWSTR from, PCWSTR to) {
+  const ULONG slot = g_rename_count++ % MAX_RENAMES;
+  SIZE_T i = 0;
+  for (; from[i] && i < 259; i++) g_renames[slot].from[i] = from[i];
+  g_renames[slot].from[i] = 0;
+  for (i = 0; to[i] && i < 259; i++) g_renames[slot].to[i] = to[i];
+  g_renames[slot].to[i] = 0;
+}
+static BOOLEAN wide_equal_nocase(const WCHAR *a, const WCHAR *b) {
+  for (; *a && *b; a++, b++) if (ldr_upper(*a) != ldr_upper(*b)) return FALSE;
+  return *a == *b;
+}
+/* Is `path` where the file of `module_path` is now, following the moves? */
+static BOOLEAN moved_to(const WCHAR *module_path, const WCHAR *path) {
+  WCHAR current[260];
+  SIZE_T n = 0;
+  for (; module_path[n] && n < 259; n++) current[n] = module_path[n];
+  current[n] = 0;
+  for (ULONG step = 0; step < MAX_RENAMES; step++) {
+    BOOLEAN moved = FALSE;
+    const ULONG first = g_rename_count > MAX_RENAMES ? g_rename_count - MAX_RENAMES : 0;
+    for (ULONG r = first; r < g_rename_count; r++) {
+      const ULONG slot = r % MAX_RENAMES;
+      if (wide_equal_nocase(g_renames[slot].from, current)) {
+        SIZE_T k = 0;
+        for (; g_renames[slot].to[k]; k++) current[k] = g_renames[slot].to[k];
+        current[k] = 0;
+        moved = TRUE;
+      }
+    }
+    if (!moved) break;
+  }
+  return wide_equal_nocase(current, path);
+}
+/* Hard links made while the process runs: two names of one file. */
+static struct { WCHAR a[260], b[260]; } g_links[MAX_RENAMES];
+static ULONG g_link_count;
+EXPORT VOID NTAPI TcosNoteFileLink(PCWSTR existing, PCWSTR link) {
+  const ULONG slot = g_link_count++ % MAX_RENAMES;
+  SIZE_T i = 0;
+  for (; existing[i] && i < 259; i++) g_links[slot].a[i] = existing[i];
+  g_links[slot].a[i] = 0;
+  for (i = 0; link[i] && i < 259; i++) g_links[slot].b[i] = link[i];
+  g_links[slot].b[i] = 0;
+}
+/* Where the file that was at `path` is now (following MoveFile), in `out`. */
+static void file_now(const WCHAR *path, WCHAR *out) {
+  SIZE_T n = 0;
+  for (; path[n] && n < 259; n++) out[n] = path[n];
+  out[n] = 0;
+  for (ULONG step = 0; step < MAX_RENAMES; step++) {
+    BOOLEAN moved = FALSE;
+    const ULONG first = g_rename_count > MAX_RENAMES ? g_rename_count - MAX_RENAMES : 0;
+    for (ULONG r = first; r < g_rename_count; r++) {
+      const ULONG slot = r % MAX_RENAMES;
+      if (wide_equal_nocase(g_renames[slot].from, out)) {
+        SIZE_T k = 0;
+        for (; g_renames[slot].to[k]; k++) out[k] = g_renames[slot].to[k];
+        out[k] = 0;
+        moved = TRUE;
+      }
+    }
+    if (!moved) break;
+  }
+}
+/* Do the two paths name one file, counting the moves and hard links the process made? */
+static BOOLEAN same_file(const WCHAR *x, const WCHAR *y) {
+  WCHAR a[260], b[260];
+  file_now(x, a);
+  file_now(y, b);
+  if (wide_equal_nocase(a, b)) return TRUE;
+  const ULONG first = g_link_count > MAX_RENAMES ? g_link_count - MAX_RENAMES : 0;
+  for (ULONG r = first; r < g_link_count; r++) {
+    WCHAR la[260], lb[260];
+    file_now(g_links[r % MAX_RENAMES].a, la);
+    file_now(g_links[r % MAX_RENAMES].b, lb);
+    if ((wide_equal_nocase(la, a) && wide_equal_nocase(lb, b)) || (wide_equal_nocase(la, b) && wide_equal_nocase(lb, a))) return TRUE;
+  }
+  return FALSE;
+}
+/* The library loaded from the file at `path` (a full path), whatever it was loaded as; NULL if there is none. */
+EXPORT PVOID NTAPI TcosFindModuleByFile(PCWSTR path) {
+  PEB_LDR_DATA *ldr = NtCurrentPeb()->Ldr;
+  PVOID found = NULL;
+  loader_lock();
+  for (LIST_ENTRY *e = ldr->InLoadOrderModuleList.Flink; e != &ldr->InLoadOrderModuleList && !found; e = e->Flink) {
+    LDR_DATA_TABLE_ENTRY *c = entry_of(e);
+    WCHAR text[260];
+    const SIZE_T length = c->FullDllName.Length / 2;
+    if (length >= 260) continue;
+    for (SIZE_T i = 0; i < length; i++) text[i] = c->FullDllName.Buffer[i];
+    text[length] = 0;
+    if (same_file(text, path)) found = c->DllBase;
+  }
+  loader_unlock();
+  return found;
+}
+/* A loaded library by name, with or without ".dll", in any case; only the file name counts. */
+static WCHAR ldr_upper(WCHAR c) { return c >= 'a' && c <= 'z' ? (WCHAR)(c - 32) : c; }
+static LDR_DATA_TABLE_ENTRY *ldr_find_name(const UNICODE_STRING *name) {
+  PEB_LDR_DATA *ldr = NtCurrentPeb()->Ldr;
+  const WCHAR *text = name->Buffer;
+  SIZE_T length = name->Length / 2;
+  for (SIZE_T i = 0; i < length; ++i) if (text[i] == '\\' || text[i] == '/') { text += i + 1; length -= i + 1; i = (SIZE_T)-1; }
+  const BOOLEAN has_extension = length >= 4 && text[length - 4] == '.';
+  for (LIST_ENTRY *e = ldr->InLoadOrderModuleList.Flink; e != &ldr->InLoadOrderModuleList; e = e->Flink) {
+    LDR_DATA_TABLE_ENTRY *m = entry_of(e);
+    const SIZE_T base_length = m->BaseDllName.Length / 2;
+    const WCHAR *base = m->BaseDllName.Buffer;
+    SIZE_T compare = base_length;
+    if (!has_extension && base_length >= 4 && base[base_length - 4] == '.') compare = base_length - 4;
+    if (compare != length) continue;
+    SIZE_T i = 0;
+    while (i < length && ldr_upper(base[i]) == ldr_upper(text[i])) ++i;
+    if (i == length) return m;
+  }
+  return NULL;
+}
+/* flags: UNCHANGED_REFCOUNT 1, PIN 2 (never unloaded); without the first the library has one more use. */
+EXPORT NTSTATUS NTAPI LdrGetDllHandleEx(ULONG flags, PWSTR path, PULONG characteristics, PUNICODE_STRING name, PVOID *handle) {
+  (void)path; (void)characteristics;
+  if ((flags & ~7u) || (flags & 3) == 3) return STATUS_INVALID_PARAMETER;
+  if (!name || !handle) return STATUS_INVALID_PARAMETER;
+  loader_lock();
+  LDR_DATA_TABLE_ENTRY *m = NULL;
+  BOOLEAN has_folder = FALSE;
+  for (USHORT i = 0; i < name->Length / 2; i++) if (name->Buffer[i] == '\\' || name->Buffer[i] == '/') has_folder = TRUE;
+  if (has_folder) {      /* a name with a folder is a file: the library that was loaded from it, or from where it was before it moved */
+    WCHAR text[260], full[260];
+    const SIZE_T n = name->Length / 2;
+    if (n < 260) {
+      for (SIZE_T i = 0; i < n; i++) text[i] = name->Buffer[i];
+      text[n] = 0;
+      const ULONG got = RtlGetFullPathName_U(text, sizeof(full), full, NULL);
+      if (got != 0 && got < sizeof(full)) {
+        PEB_LDR_DATA *ldr = NtCurrentPeb()->Ldr;
+        for (LIST_ENTRY *e = ldr->InLoadOrderModuleList.Flink; e != &ldr->InLoadOrderModuleList && !m; e = e->Flink) {
+          LDR_DATA_TABLE_ENTRY *c = entry_of(e);
+          WCHAR path[260];
+          const SIZE_T length = c->FullDllName.Length / 2;
+          if (length >= 260) continue;
+          for (SIZE_T i = 0; i < length; i++) path[i] = c->FullDllName.Buffer[i];
+          path[length] = 0;
+          if (same_file(path, full)) m = c;
+        }
+      }
+    }
+  }
+  if (!m) m = ldr_find_name(name);
+  if (!m) { loader_unlock(); return STATUS_DLL_NOT_FOUND; }
+  PVOID base = m->DllBase;
+  if (!(flags & 1) && m->LoadCount != LDR_STATIC) {
+    UNICODE_STRING base_name = m->BaseDllName;
+    PVOID again = NULL;
+    loader_unlock();
+    const NTSTATUS status = LdrLoadDll(NULL, NULL, &base_name, &again);
+    if (!NT_SUCCESS(status)) return status;
+    loader_lock();
+    m = ldr_find_base(base);
+  }
+  if (m && (flags & 2)) m->LoadCount = LDR_STATIC;
+  loader_unlock();
+  *handle = base;
+  return STATUS_SUCCESS;
+}
+EXPORT NTSTATUS NTAPI LdrGetDllHandle(PWSTR path, ULONG characteristics, PUNICODE_STRING name, PVOID *handle) {
+  return LdrGetDllHandleEx(1, path, NULL, name, handle);
+}
+
+EXPORT NTSTATUS NTAPI LdrGetDllFullName(PVOID module, PUNICODE_STRING name) {
+  loader_lock();
+  LDR_DATA_TABLE_ENTRY *m = ldr_find_base(module ? module : NtCurrentPeb()->ImageBaseAddress);
+  if (!m) { loader_unlock(); return STATUS_DLL_NOT_FOUND; }
+  const ULONG need = (ULONG)m->FullDllName.Length + 2;
+  const BYTE *from = (const BYTE *)m->FullDllName.Buffer;
+  BYTE *to = (BYTE *)name->Buffer;
+  NTSTATUS status = STATUS_SUCCESS;
+  USHORT copied = (USHORT)need;
+  if (name->MaximumLength < need) { copied = name->MaximumLength; status = 0xC0000023; }      /* STATUS_BUFFER_TOO_SMALL: what fits is copied */
+  for (USHORT i = 0; i < copied; i++) to[i] = i < m->FullDllName.Length ? from[i] : 0;
+  name->Length = status ? copied : m->FullDllName.Length;
+  loader_unlock();
+  return status;
+}
+
+/* API sets: the contracts this system answers for (name without the version, the highest version that exists). */
+static const struct { const char *base; int maximum; int hidden; } g_api_sets[] = {
+  {"api-ms-win-core-console-l1-1-", 0, 0}, {"api-ms-win-core-file-l1-1-", 0, 0}, {"api-ms-win-core-handle-l1-1-", 0, 0}, {"api-ms-win-core-heap-l1-1-", 0, 0},
+  {"api-ms-win-core-libraryloader-l1-1-", 0, 0}, {"api-ms-win-core-memory-l1-1-", 0, 0}, {"api-ms-win-core-processthreads-l1-1-", 0, 0}, {"api-ms-win-core-synch-l1-1-", 0, 0},
+  {"api-ms-win-core-sysinfo-l1-1-", 0, 0}, {"api-ms-win-core-string-l1-1-", 0, 0}, {"api-ms-win-core-errorhandling-l1-1-", 0, 0}, {"api-ms-win-core-localization-l1-1-", 0, 0},
+  {"ext-ms-win-gdi-draw-l1-1-", 1, 0}, {"api-ms-win-deprecated-apis-advapi-l1-1-", 0, 1},
+};
+static WCHAR ascii_lower(WCHAR c) { return c >= 'A' && c <= 'Z' ? (WCHAR)(c + 32) : c; }
+/* Splits "api-ms-win-core-console-l1-1-0" (not null-terminated, no ".dll") into the contract and its last number. STATUS_INVALID_PARAMETER for anything else. */
+static NTSTATUS api_set_lookup(const UNICODE_STRING *name, BOOLEAN strip_extension, BOOLEAN *present_in_table, BOOLEAN *in_schema, BOOLEAN *implemented, BOOLEAN *visible) {
+  SIZE_T n = name->Length / 2;
+  char text[128];
+  if (n == 0 || n >= sizeof(text)) return STATUS_INVALID_PARAMETER;
+  for (SIZE_T i = 0; i < n; i++) {
+    if (name->Buffer[i] == '.' && strip_extension) { n = i; break; }
+    if (name->Buffer[i] == '.' || name->Buffer[i] > 127) return STATUS_INVALID_PARAMETER;
+    text[i] = (char)ascii_lower(name->Buffer[i]);
+  }
+  text[n] = 0;
+  const BOOLEAN api = text[0] == 'a' && text[1] == 'p' && text[2] == 'i' && text[3] == '-';
+  const BOOLEAN ext = text[0] == 'e' && text[1] == 'x' && text[2] == 't' && text[3] == '-';
+  if (!api && !ext) return STATUS_INVALID_PARAMETER;
+  *present_in_table = *in_schema = *implemented = *visible = FALSE;
+  for (SIZE_T k = 0; k < sizeof(g_api_sets) / sizeof(g_api_sets[0]); k++) {
+    SIZE_T l = 0;
+    while (g_api_sets[k].base[l] && g_api_sets[k].base[l] == text[l]) l++;
+    if (g_api_sets[k].base[l] || l == 0) continue;
+    int version = 0;
+    SIZE_T i = l;
+    if (!text[i]) return STATUS_SUCCESS;      /* (no version: not a contract name) */
+    for (; text[i] >= '0' && text[i] <= '9'; i++) version = version * 10 + (text[i] - '0');
+    if (text[i] || i == l) return STATUS_SUCCESS;
+    *present_in_table = TRUE;
+    *visible = !g_api_sets[k].hidden;
+    *in_schema = TRUE;
+    *implemented = version <= g_api_sets[k].maximum && !g_api_sets[k].hidden;
+    if (version > g_api_sets[k].maximum && !g_api_sets[k].hidden) *in_schema = FALSE;
+    return STATUS_SUCCESS;
+  }
+  return STATUS_SUCCESS;
+}
+EXPORT NTSTATUS NTAPI ApiSetQueryApiSetPresence(const UNICODE_STRING *name, BOOLEAN *present) {
+  BOOLEAN known, schema, implemented, visible;
+  *present = FALSE;
+  if (api_set_lookup(name, TRUE, &known, &schema, &implemented, &visible) == STATUS_SUCCESS) *present = known && visible;      /* (the contract exists in some version; a ".dll" is ignored) */
+  return STATUS_SUCCESS;
+}
+EXPORT NTSTATUS NTAPI ApiSetQueryApiSetPresenceEx(const UNICODE_STRING *name, BOOLEAN *in_schema, BOOLEAN *present) {
+  BOOLEAN known, schema, implemented, visible;
+  const NTSTATUS status = api_set_lookup(name, FALSE, &known, &schema, &implemented, &visible);
+  if (status) return status;
+  *in_schema = schema;
+  *present = implemented;
+  return STATUS_SUCCESS;
 }
 
 EXPORT NTSTATUS NTAPI LdrUnloadDll(PVOID base) {

@@ -36,7 +36,7 @@ ENV = dict(os.environ, LC_ALL="C")
 OUR_DLLS = ("ntdll kernel32 kernelbase advapi32 ws2_32 msvcrt ucrtbase win32u user32 gdi32 shell32 ole32 oleaut32 comctl32 comdlg32 rpcrt4 shlwapi winmm version imm32 "
             "secur32 crypt32 bcrypt ncrypt userenv setupapi iphlpapi dbghelp psapi wininet winhttp wintrust netapi32 dwmapi uxtheme mswsock gdiplus msimg32 opengl32 glu32 "
             "dnsapi mpr wtsapi32 powrprof cfgmgr32 d3d9 d3d11 dxgi dwrite shcore avrt winspool.drv wevtapi pdh wldap32 urlmon msi propsys hid usp10 winscard odbc32 "
-            "xinput1_4 dsound dinput8 d2d1 d3dcompiler_47 lz32 oleacc oledlg credui ntdsapi samlib activeds normaliz sensapi").split()
+            "xinput1_4 dsound dinput8 d2d1 d3dcompiler_47 lz32 oleacc oledlg credui ntdsapi samlib activeds normaliz sensapi authz rasapi32").split()
 # Libraries every test may need; a test names its own through the imports of its DLL (-l<dll>).
 COMMON_LIBS = ["ntdll", "user32", "advapi32", "gdi32", "kernel32", "uuid", "ole32", "oleaut32", "shell32", "comctl32", "winmm", "shlwapi", "version", "imm32", "ws2_32"]
 

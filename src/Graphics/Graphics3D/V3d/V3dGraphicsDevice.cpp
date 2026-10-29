@@ -17,6 +17,7 @@
  */
 
 #include "Graphics/Graphics3D/V3d/V3dGraphicsDevice.hpp"
+#include "Graphics/Graphics3D/BuiltinShaders.hpp"
 #include <new>
 #include "Hardware/GraphicsProcessingUnit/Broadcom/V3dDraw.hpp"
 #include "Hardware/GraphicsProcessingUnit/Broadcom/V3dFloat.hpp"
@@ -129,6 +130,8 @@ class V3dShaderModule final : public IShaderModule {
   explicit V3dShaderModule(const ShaderModuleDesc& desc) : desc_(desc) {}
   ShaderStage stage() const override { return desc_.stage; }
   QpuProgram program() const { return desc_.qpu_program; }
+  bool matrix_rows() const { return desc_.qpu_matrix_rows; }
+  bool flip_y() const { return desc_.qpu_flip_y; }
 
  private:
   ShaderModuleDesc desc_;
@@ -136,7 +139,10 @@ class V3dShaderModule final : public IShaderModule {
 
 class V3dPipeline final : public IPipeline {
  public:
-  V3dPipeline(const GraphicsPipelineDesc& desc, uint32_t position_offset, uint32_t color_offset) : desc_(desc), position_offset_(position_offset), color_offset_(color_offset) {}
+  V3dPipeline(const GraphicsPipelineDesc& desc, uint32_t position_offset, uint32_t color_offset, bool matrix_rows = false, bool flip_y = false)
+      : desc_(desc), position_offset_(position_offset), color_offset_(color_offset), matrix_rows_(matrix_rows), flip_y_(flip_y) {}
+  bool matrix_rows() const { return matrix_rows_; }
+  bool flip_y() const { return flip_y_; }
   const GraphicsPipelineDesc& desc() const { return desc_; }
   uint32_t position_offset() const { return position_offset_; }
   uint32_t color_offset() const { return color_offset_; }
@@ -144,6 +150,7 @@ class V3dPipeline final : public IPipeline {
  private:
   GraphicsPipelineDesc desc_;
   uint32_t position_offset_, color_offset_;
+  bool matrix_rows_, flip_y_;
 };
 
 uint32_t word_from_bytes(const uint8_t* b) { return static_cast<uint32_t>(b[0]) | (static_cast<uint32_t>(b[1]) << 8) | (static_cast<uint32_t>(b[2]) << 16) | (static_cast<uint32_t>(b[3]) << 24); }
@@ -275,6 +282,7 @@ class V3dGraphicsDevice::PassContent final : public IV3dBinningContent {
     // Uniform streams from the push constants (the matrix) and the viewport.
     uint32_t mvp[16];
     for (uint32_t k = 0; k < 16; ++k) mvp[k] = word_from_bytes(d.constants + 4 * k);
+    kernel_matrix_words(mvp, d.pipeline->matrix_rows(), d.pipeline->flip_y());   // (a Direct3D 9 vertex shader: rows, Y up)
     uint32_t cs[v3d_shader::kCoordinateUniformWords], vs[v3d_shader::kVertexUniformWords], fs[v3d_shader::kFragmentZUniformWords];
     const uint32_t x_scale = v3d_shader::float_bits(vp.width * 128), y_scale = v3d_shader::float_bits(vp.height * 128);
     if (!v3d_shader::coordinate_uniforms(ArrayView<uint32_t>(cs), ArrayView<const uint32_t>(mvp), x_scale, y_scale) ||
@@ -370,7 +378,7 @@ IPipeline* V3dGraphicsDevice::create_graphics_pipeline(const GraphicsPipelineDes
     else if (a.location == 1 && a.format == VertexFormat::Float4) color = static_cast<int32_t>(a.offset);
   }
   if (position < 0 || color < 0 || position > 2000 || color > 2000) return nullptr;
-  return make<V3dPipeline>(allocator_, desc, static_cast<uint32_t>(position), static_cast<uint32_t>(color));
+  return make<V3dPipeline>(allocator_, desc, static_cast<uint32_t>(position), static_cast<uint32_t>(color), vs->matrix_rows(), vs->flip_y());
 }
 void V3dGraphicsDevice::destroy_pipeline(IPipeline* pipeline) { destroy(allocator_, static_cast<V3dPipeline*>(pipeline)); }
 
@@ -475,6 +483,9 @@ bool V3dGraphicsDevice::submit(ICommandBuffer* commands) {
         if (!draws.push_back(d)) return false;
         break;
       }
+      case RecordedCommand::Type::SetTopology:
+        if (cmd.topology != PrimitiveTopology::TriangleList) return false;   // (no lines or points here: DeviceInfo::features says so)
+        break;
       case RecordedCommand::Type::EndRenderPass:
         if (!in_pass) return false;
         in_pass = false;

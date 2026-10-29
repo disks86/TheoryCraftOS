@@ -58,6 +58,8 @@ struct UserThread {
   bool suspend_requested = false, terminate_requested = false;
   uint32_t terminate_code = 0;
   bool parked = false, redirected = false, context_dirty = false;
+  uint64_t stale_rip = 0, stale_address = 0;      // the last fault that was answered by rebuilding the page tables (see UserMode.cpp), to catch one that repeats
+  uint32_t stale_count = 0;
   uint64_t core_mask = ~uint64_t{0};      // the cores it may run on (SetThreadAffinityMask)
   uint8_t priority = kernel::kDefaultPriority;      // the kernel scheduler priority (0..31), reapplied at launch() if the thread was not spawned yet
   uint64_t saved_rip = 0;
@@ -116,6 +118,7 @@ struct Task final : process::IProcessRuntime {
   uint32_t processor_count() override;
   void memory_status(uint64_t* total_bytes, uint64_t* free_bytes) override;
   bool set_affinity(uint64_t thread_id, uint64_t mask) override;
+  void flush_write_buffers() override;
   bool set_priority(uint64_t thread_id, int32_t absolute_priority) override;
   uint64_t affinity(uint64_t thread_id) override;
   bool cpu_time(uint64_t thread_id, uint64_t* hundred_ns) override;

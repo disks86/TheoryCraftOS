@@ -410,7 +410,30 @@ EXPORT DWORD WINAPI GetEnvironmentVariableA(LPCSTR name, LPSTR buffer, DWORD cap
   const WCHAR *value = find_variable(parameters()->Environment, w, &length);
   free_wide(w);
   if (!value) { set_error(ERROR_ENVVAR_NOT_FOUND); return 0; }
+  if (length == 0) {      /* a variable with an empty value: no error, the size with the end mark is 1 */
+    if (capacity == 0) return 1;
+    buffer[0] = 0;
+    return 0;
+  }
   return wide_result_to_ansi(value, (DWORD)length, buffer, capacity);
+}
+/* The whole block of the process is replaced by `block` (NAME=value entries ended by an empty one); an entry needs a name before its first '='. */
+EXPORT BOOL WINAPI SetEnvironmentStringsW(LPWSTR block) {
+  if (!block) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  size_t_ units = 0;
+  for (const WCHAR *e = block; *e; e += wcslen(e) + 1) {
+    const WCHAR *eq = e + 1;      /* (a name may start with '=': "=C:=C:\") */
+    while (*eq && *eq != '=') ++eq;
+    if (!*eq || eq == e) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+    units += wcslen(e) + 1;
+  }
+  WCHAR *fresh = RtlAllocateHeap(heap(), 0, (units + 2) * 2);
+  if (!fresh) { set_error(ERROR_NOT_ENOUGH_MEMORY); return FALSE; }
+  memcpy(fresh, block, units * 2);
+  fresh[units] = 0;
+  fresh[units + 1] = 0;
+  parameters()->Environment = fresh;
+  return TRUE;
 }
 /* Builds a new block with NAME set (or removed when value is NULL) and points the process parameters at it. */
 EXPORT BOOL WINAPI SetEnvironmentVariableW(LPCWSTR name, LPCWSTR value) {
@@ -452,8 +475,11 @@ EXPORT BOOL WINAPI SetEnvironmentVariableA(LPCSTR name, LPCSTR value) {
   free_wide(v);
   return ok;
 }
+/* What fits is copied as the real one does it: a variable's value goes in whole or not at all (after one that does not fit only the end mark is written), plain text goes
+   in up to capacity - 1 characters; the end mark follows only when the whole result fits. The result is the size needed, with the end mark. */
 EXPORT DWORD WINAPI ExpandEnvironmentStringsW(LPCWSTR source, LPWSTR dest, DWORD capacity) {
   DWORD needed = 0;
+  BOOL stopped = FALSE;      /* a variable did not fit: nothing more is written */
   for (const WCHAR *s = source; *s;) {
     const WCHAR *close = NULL;
     if (*s == '%') for (const WCHAR *e = s + 1; *e; ++e) if (*e == '%') { close = e; break; }
@@ -469,26 +495,44 @@ EXPORT DWORD WINAPI ExpandEnvironmentStringsW(LPCWSTR source, LPWSTR dest, DWORD
       }
     }
     if (value) {
-      if (needed + length < capacity && dest) memcpy(dest + needed, value, length * 2);
+      if (dest && !stopped) {
+        if (needed + length < capacity) {
+          memcpy(dest + needed, value, length * 2);
+          dest[needed + length] = 0;      /* (the end mark waits where the next character goes) */
+        } else {
+          if (capacity > 0) dest[needed] = 0;
+          stopped = TRUE;
+        }
+      }
       needed += (DWORD)length;
       s = close + 1;
     } else {
-      if (needed + 1 < capacity && dest) dest[needed] = *s;
+      if (dest && !stopped && needed + 1 < capacity) dest[needed] = *s;
       ++needed;
       ++s;
     }
   }
-  if (dest && needed < capacity) dest[needed] = 0;
+  if (dest && !stopped && needed < capacity) dest[needed] = 0;
   return needed + 1;
 }
+/* The ANSI function converts what the wide one produced, and needs a byte more than that: when the buffer is not bigger than the size needed nothing of the result is copied,
+   the buffer is made an empty string and the size needed plus one is returned. */
 EXPORT DWORD WINAPI ExpandEnvironmentStringsA(LPCSTR source, LPSTR dest, DWORD capacity) {
   WCHAR *w = to_wide(source);
   if (!w) return 0;
-  WCHAR wide[1024];
-  const DWORD n = ExpandEnvironmentStringsW(w, wide, 1024);
+  const DWORD needed = ExpandEnvironmentStringsW(w, NULL, 0);
+  if (capacity <= needed) {
+    free_wide(w);
+    if (dest) dest[0] = 0;
+    return needed + 1;
+  }
+  WCHAR *wide = RtlAllocateHeap(heap(), 0, (size_t_)needed * 2 + 2);
+  if (!wide) { free_wide(w); return 0; }
+  ExpandEnvironmentStringsW(w, wide, needed);
   free_wide(w);
-  if (n > 1024) return 0;
-  return wide_result_to_ansi(wide, n - 1, dest, capacity) + 1;
+  for (DWORD i = 0; i < needed; i++) dest[i] = (char)wide[i];      /* (ASCII: a character is a byte) */
+  RtlFreeHeap(heap(), 0, wide);
+  return needed;
 }
 
 EXPORT void WINAPI GetStartupInfoW(LPSTARTUPINFOW info) {
@@ -509,12 +553,28 @@ EXPORT void WINAPI GetStartupInfoA(LPSTARTUPINFOA info) {
 }
 
 EXPORT DWORD WINAPI GetVersion(void) { return (19045u << 16) | (0u << 8) | 10u; }
+NTSTATUS NTAPI RtlGetVersion(RTL_OSVERSIONINFOW *info);
+/* GetVersionEx: the size says which structure; any other size is ERROR_INSUFFICIENT_BUFFER. The extended fields come from ntdll. */
 EXPORT BOOL WINAPI GetVersionExW(LPOSVERSIONINFOW v) {
-  v->dwMajorVersion = 10; v->dwMinorVersion = 0; v->dwBuildNumber = 19045; v->dwPlatformId = 2; v->szCSDVersion[0] = 0;
+  if (!v || (v->dwOSVersionInfoSize != sizeof(OSVERSIONINFOW) && v->dwOSVersionInfoSize != sizeof(OSVERSIONINFOEXW))) { set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+  RTL_OSVERSIONINFOEXW info;
+  memset(&info, 0, sizeof(info));
+  info.dwOSVersionInfoSize = v->dwOSVersionInfoSize;
+  if (!NT_SUCCESS(RtlGetVersion((RTL_OSVERSIONINFOW *)&info))) { set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+  memcpy(v, &info, v->dwOSVersionInfoSize == sizeof(OSVERSIONINFOEXW) ? sizeof(OSVERSIONINFOEXW) : sizeof(OSVERSIONINFOW));
   return TRUE;
 }
 EXPORT BOOL WINAPI GetVersionExA(LPOSVERSIONINFOA v) {
-  v->dwMajorVersion = 10; v->dwMinorVersion = 0; v->dwBuildNumber = 19045; v->dwPlatformId = 2; v->szCSDVersion[0] = 0;
+  if (!v || (v->dwOSVersionInfoSize != sizeof(OSVERSIONINFOA) && v->dwOSVersionInfoSize != sizeof(OSVERSIONINFOEXA))) { set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+  RTL_OSVERSIONINFOEXW info;
+  memset(&info, 0, sizeof(info));
+  info.dwOSVersionInfoSize = sizeof(info);
+  RtlGetVersion((RTL_OSVERSIONINFOW *)&info);
+  v->dwMajorVersion = info.dwMajorVersion; v->dwMinorVersion = info.dwMinorVersion; v->dwBuildNumber = info.dwBuildNumber; v->dwPlatformId = info.dwPlatformId; v->szCSDVersion[0] = 0;
+  if (v->dwOSVersionInfoSize == sizeof(OSVERSIONINFOEXA)) {
+    OSVERSIONINFOEXA *ex = (OSVERSIONINFOEXA *)v;
+    ex->wServicePackMajor = info.wServicePackMajor; ex->wServicePackMinor = info.wServicePackMinor; ex->wSuiteMask = info.wSuiteMask; ex->wProductType = info.wProductType; ex->wReserved = 0;
+  }
   return TRUE;
 }
 static ULONGLONG get64(const BYTE *p) { ULONGLONG v; memcpy(&v, p, 8); return v; }
@@ -587,13 +647,13 @@ EXPORT BOOL WINAPI GetPhysicallyInstalledSystemMemory(ULONGLONG *kilobytes) {
 EXPORT BOOL WINAPI IsProcessorFeaturePresent(DWORD feature) { return feature == 6 || feature == 10; }
 EXPORT BOOL WINAPI GetComputerNameW(LPWSTR name, LPDWORD size) {
   static const WCHAR kName[] = {'T', 'C', 'O', 'S', 0};
-  if (*size < 5) { *size = 5; set_error(ERROR_MORE_DATA); return FALSE; }
+  if (*size < 5) { *size = 5; set_error(111 /* ERROR_BUFFER_OVERFLOW */); return FALSE; }
   memcpy(name, kName, sizeof(kName));
   *size = 4;
   return TRUE;
 }
 EXPORT BOOL WINAPI GetComputerNameA(LPSTR name, LPDWORD size) {
-  if (*size < 5) { *size = 5; set_error(ERROR_MORE_DATA); return FALSE; }
+  if (*size < 5) { *size = 5; set_error(111 /* ERROR_BUFFER_OVERFLOW */); return FALSE; }
   memcpy(name, "TCOS", 5);
   *size = 4;
   return TRUE;
@@ -632,9 +692,17 @@ static LDR_DATA_TABLE_ENTRY *module_by_name(LPCWSTR name) {
   }
   return NULL;
 }
+PVOID NTAPI TcosFindModuleByFile(PCWSTR path);
+static BOOL has_separator(LPCWSTR name);
+static DWORD full_path_w(LPCWSTR in, WCHAR *out, DWORD capacity);
 EXPORT HMODULE WINAPI GetModuleHandleW(LPCWSTR name) {
   if (!name) return NtCurrentPeb()->ImageBaseAddress;
   LDR_DATA_TABLE_ENTRY *m = module_by_name(name);
+  if (!m && has_separator(name)) {      /* a file: the library loaded from it, under whatever name */
+    WCHAR full[PATH_CHARS];
+    PVOID base;
+    if (full_path_w(name, full, PATH_CHARS) && (base = TcosFindModuleByFile(full)) != NULL) return base;
+  }
   if (!m) { set_error(ERROR_MOD_NOT_FOUND); return NULL; }
   return m->DllBase;
 }
@@ -665,8 +733,9 @@ static DWORD dos_error_of_load(NTSTATUS status) {
   }
 }
 EXPORT BOOL WINAPI GetModuleHandleExW(DWORD flags, LPCWSTR name, HMODULE *module) {
-  LDR_DATA_TABLE_ENTRY *m = (flags & 4) ? module_containing((PVOID)name) : (name ? module_by_name(name) : module_by_base(NtCurrentPeb()->ImageBaseAddress));
   if (module) *module = NULL;
+  if (!module || (flags & ~7u) || (flags & 3) == 3 || ((flags & 4) && !name)) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  LDR_DATA_TABLE_ENTRY *m = (flags & 4) ? module_containing((PVOID)name) : (name ? module_by_name(name) : module_by_base(NtCurrentPeb()->ImageBaseAddress));
   if (!m) { set_error(ERROR_MOD_NOT_FOUND); return FALSE; }
   if (!(flags & 2) || (flags & 1)) {      /* another use (a pin is a use that is never given back) */
     UNICODE_STRING base_name = m->BaseDllName;
@@ -705,9 +774,15 @@ EXPORT DWORD WINAPI GetModuleFileNameA(HMODULE module, LPSTR buffer, DWORD capac
   WCHAR wide[MAX_PATH * 2];
   const DWORD n = GetModuleFileNameW(module, wide, MAX_PATH * 2);
   if (n == 0) return 0;
-  const DWORD r = wide_result_to_ansi(wide, n, buffer, capacity);
-  if (r > capacity) { if (capacity) buffer[capacity - 1] = 0; set_error(ERROR_INSUFFICIENT_BUFFER); return capacity; }
-  return r;
+  if (n + 1 > capacity) {      /* too small: what fits, ended by a NUL, and the size of the buffer */
+    if (capacity) {
+      wide_result_to_ansi(wide, capacity - 1, buffer, capacity);
+      buffer[capacity - 1] = 0;
+    }
+    set_error(ERROR_INSUFFICIENT_BUFFER);
+    return capacity;
+  }
+  return wide_result_to_ansi(wide, n, buffer, capacity);
 }
 
 typedef struct { ULONG Characteristics, TimeDateStamp; USHORT MajorVersion, MinorVersion; ULONG Name, Base, NumberOfFunctions, NumberOfNames, AddressOfFunctions, AddressOfNames, AddressOfNameOrdinals; } ExportDirectory;
@@ -766,9 +841,15 @@ static BOOL find_file(LPCWSTR name, LPCWSTR extension, LPCWSTR extra, WCHAR *out
 static void unicode_string(UNICODE_STRING *s, LPCWSTR text);
 static WCHAR g_dll_directory[PATH_CHARS];      /* SetDllDirectory */
 
+NTSTATUS NTAPI LdrSetDllDirectory(PUNICODE_STRING directory);
+NTSTATUS NTAPI LdrGetDllDirectory(PUNICODE_STRING directory);
 EXPORT BOOL WINAPI SetDllDirectoryW(LPCWSTR directory) {
   if (directory && wcslen(directory) >= PATH_CHARS) { set_error(ERROR_FILENAME_EXCED_RANGE); return FALSE; }
   if (directory) lstrcpyW(g_dll_directory, directory); else g_dll_directory[0] = 0;
+  UNICODE_STRING text;
+  text.Buffer = g_dll_directory;
+  text.Length = text.MaximumLength = (USHORT)(wcslen(g_dll_directory) * 2);
+  LdrSetDllDirectory(&text);
   return TRUE;
 }
 EXPORT BOOL WINAPI SetDllDirectoryA(LPCSTR directory) {
@@ -780,13 +861,19 @@ EXPORT BOOL WINAPI SetDllDirectoryA(LPCSTR directory) {
 }
 EXPORT DWORD WINAPI GetDllDirectoryW(DWORD capacity, LPWSTR buffer) {
   const DWORD n = (DWORD)wcslen(g_dll_directory);
-  if (n + 1 > capacity) return n + 1;
+  if (n + 1 > capacity) {
+    if (capacity != 0 && buffer) buffer[0] = 0;
+    return n + 1;
+  }
   memcpy(buffer, g_dll_directory, (n + 1) * 2);
   return n;
 }
 EXPORT DWORD WINAPI GetDllDirectoryA(DWORD capacity, LPSTR buffer) {
   const DWORD n = (DWORD)wcslen(g_dll_directory);
-  if (n + 1 > capacity) return n + 1;
+  if (n + 1 > capacity) {
+    if (capacity != 0 && buffer) buffer[0] = 0;
+    return n + 1;
+  }
   return wide_result_to_ansi(g_dll_directory, n, buffer, capacity);
 }
 
@@ -799,28 +886,80 @@ EXPORT BOOL WINAPI UnmapViewOfFile(LPCVOID base);
 
 /* LoadLibrary: a library the process has already (by its name) gets one more use; otherwise the file is looked for and ntdll maps it, with the libraries it imports, and
    calls their entry points. Libraries with thread-local data of their own (__declspec(thread) in a DLL) and the data-file modes are refused. */
+static HMODULE load_library_ex(LPCWSTR name, HANDLE file, DWORD flags);
+/* The files that exclusive data-file loads keep open (view -> handle), until FreeLibrary. */
+static struct { LPVOID view; HANDLE file; } g_exclusive_files[16];
+static BOOL exclusive_hold(LPVOID view, HANDLE file) {
+  for (int i = 0; i < 16; i++) if (!g_exclusive_files[i].view) { g_exclusive_files[i].view = view; g_exclusive_files[i].file = file; return TRUE; }
+  return FALSE;
+}
+static void exclusive_release(LPCVOID view) {
+  for (int i = 0; i < 16; i++) if (g_exclusive_files[i].view == view) { CloseHandle(g_exclusive_files[i].file); g_exclusive_files[i].view = NULL; }
+}
+static int find_library_restricted(LPCWSTR name, DWORD search, WCHAR *out);
+static DWORD g_default_dll_dirs;      /* SetDefaultDllDirectories */
+static BOOL has_separator(LPCWSTR name) { for (; *name; name++) if (*name == '\\' || *name == '/') return TRUE; return FALSE; }
 EXPORT HMODULE WINAPI LoadLibraryExW(LPCWSTR name, HANDLE file, DWORD flags) {
-  (void)file;
-  if (!name || !name[0]) { set_error(ERROR_INVALID_PARAMETER); return NULL; }
+  const DWORD saved = GetLastError();      /* (a call that works leaves the last error as it was) */
+  WCHAR trimmed[PATH_CHARS];
+  if (name && name[0] && wcslen(name) < PATH_CHARS) {      /* blanks at the end of a name do not count */
+    SIZE_T n = wcslen(name);
+    while (n > 1 && name[n - 1] == ' ') n--;
+    memcpy(trimmed, name, n * 2);
+    trimmed[n] = 0;
+    name = trimmed;
+  }
+  HMODULE m = load_library_ex(name, file, flags);
+  if (m) set_error(saved);
+  return m;
+}
+static HMODULE load_library_ex(LPCWSTR name, HANDLE file, DWORD flags) {
+  if (file || !name || !name[0]) { set_error(ERROR_INVALID_PARAMETER); return NULL; }      /* (the file handle is reserved) */
   WCHAR path[PATH_CHARS];
   UNICODE_STRING us;
   /* The file, if there is one; otherwise the bare name (a library the process has already may be known by an alias, "api-ms-win-crt-runtime-l1-1-0.dll"): the kernel knows
      which libraries are loaded, and decides under the loader lock. */
   static const WCHAR dll[] = {'.', 'd', 'l', 'l', 0};
   path[0] = 0;
-  if (find_file(name, dll, g_dll_directory, path)) unicode_string(&us, path);
-  else unicode_string(&us, name);
-  if ((flags & 0x32) && !GetModuleHandleW(path[0] ? path : name)) {      /* AS_DATAFILE 2, AS_DATAFILE_EXCLUSIVE 0x10, AS_IMAGE_RESOURCE 0x20: the file is only mapped (a loaded library is used as it is) */
-    if (!path[0]) { set_error(ERROR_MOD_NOT_FOUND); return NULL; }
-    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
+  DWORD search = flags & 0x1F00;      /* LOAD_LIBRARY_SEARCH_*: only the folders named are looked in */
+  if (search && (flags & 8)) { set_error(ERROR_INVALID_PARAMETER); return NULL; }      /* (LOAD_WITH_ALTERED_SEARCH_PATH excludes them) */
+  if (!search && g_default_dll_dirs && !has_separator(name)) search = g_default_dll_dirs;
+  if (search) {
+    const int found = find_library_restricted(name, search, path);
+    if (found < 0) { set_error(ERROR_INVALID_PARAMETER); return NULL; }
+    if (found > 0) unicode_string(&us, path);
+    else if (GetModuleHandleW(name)) unicode_string(&us, name);      /* (a library the process has already is not searched for) */
+    else { set_error(ERROR_MOD_NOT_FOUND); return NULL; }
+  } else if (find_file(name, dll, g_dll_directory, path)) {
+    unicode_string(&us, path);
+  } else {
+    path[0] = 0;      /* (find_file may have left a name behind that is not a file) */
+    unicode_string(&us, name);
+  }
+  if (path[0] && !(flags & 0x62)) {      /* the file of a library that is loaded already (under another name, or moved): one more use of it */
+    PVOID loaded = TcosFindModuleByFile(path);
+    LDR_DATA_TABLE_ENTRY *entry = loaded ? module_by_base(loaded) : NULL;
+    if (entry) us = entry->FullDllName;
+  }
+  if ((flags & 0x62) && has_separator(name) && !path[0] && !search) { set_error(ERROR_FILE_NOT_FOUND); return NULL; }      /* (a file named with a folder has to be there) */
+  if ((flags & 0x62) && !GetModuleHandleW(path[0] ? path : name)) {      /* AS_DATAFILE 2, AS_DATAFILE_EXCLUSIVE 0x40, AS_IMAGE_RESOURCE 0x20: the file is only mapped (a loaded library is used as it is) */
+    if (!path[0]) { set_error(has_separator(name) ? ERROR_FILE_NOT_FOUND : ERROR_MOD_NOT_FOUND); return NULL; }
+    const BOOL exclusive = (flags & 0x40) != 0;      /* AS_DATAFILE_EXCLUSIVE: nobody else may write the file while it is loaded */
+    HANDLE f = CreateFileW(path, GENERIC_READ, exclusive ? FILE_SHARE_READ | FILE_SHARE_DELETE : FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
     if (f == INVALID_HANDLE_VALUE) return NULL;
     HANDLE m = CreateFileMappingW(f, NULL, PAGE_READONLY | ((flags & 0x20) ? SEC_IMAGE : 0), 0, 0, NULL);
-    CloseHandle(f);
-    if (!m) return NULL;
+    if (!m) { CloseHandle(f); return NULL; }
     LPVOID view = MapViewOfFile(m, 4 /* FILE_MAP_READ */, 0, 0, 0);
     CloseHandle(m);
-    if (!view) return NULL;
+    if (!view) { CloseHandle(f); return NULL; }
+    if (exclusive && !exclusive_hold(view, f)) CloseHandle(f);
+    else if (!exclusive) CloseHandle(f);
     return (HMODULE)((ULONG_PTR)view | ((flags & 0x20) ? 2 : 1));      /* (the low bits tell FreeLibrary and the resource functions what it is) */
+  }
+  if (path[0] && !GetModuleHandleW(path)) {      /* a file somebody holds open without sharing cannot be read by the loader */
+    HANDLE probe = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
+    if (probe == INVALID_HANDLE_VALUE) { if (GetLastError() == ERROR_SHARING_VIOLATION) return NULL; }
+    else CloseHandle(probe);
   }
   PVOID handle = NULL;
   ULONG ldr_flags = (flags & 1) ? 2 : 0;      /* DONT_RESOLVE_DLL_REFERENCES = LDR_DONT_RESOLVE_REFS */
@@ -844,8 +983,14 @@ EXPORT HMODULE WINAPI LoadLibraryExA(LPCSTR name, HANDLE file, DWORD flags) {
   return m;
 }
 EXPORT BOOL WINAPI FreeLibrary(HMODULE module) {
-  if (((ULONG_PTR)module & 3) == 1 || ((ULONG_PTR)module & 3) == 2) return UnmapViewOfFile((LPCVOID)((ULONG_PTR)module & ~(ULONG_PTR)3));      /* a data file or an image resource view */
-  if (!module_by_base(module)) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
+  if (((ULONG_PTR)module & 3) == 1 || ((ULONG_PTR)module & 3) == 2) {
+    MEMORY_BASIC_INFORMATION info;
+    const LPCVOID view = (LPCVOID)((ULONG_PTR)module & ~(ULONG_PTR)3);
+    if (!VirtualQuery(view, &info, sizeof(info)) || info.AllocationBase != view) { set_error(ERROR_BAD_EXE_FORMAT); return FALSE; }      /* (not the start of a view) */
+    exclusive_release(view);
+    return UnmapViewOfFile(view);
+  }      /* a data file or an image resource view */
+  if (!module_by_base(module)) { set_error(ERROR_MOD_NOT_FOUND); return FALSE; }
   const NTSTATUS status = LdrUnloadDll(module);
   return NT_SUCCESS(status) ? TRUE : (set_error(dos_error_of_load(status)), FALSE);
 }
@@ -1658,6 +1803,61 @@ static BOOL find_file(LPCWSTR name, LPCWSTR extension, LPCWSTR extra, WCHAR *out
   }
   return FALSE;
 }
+NTSTATUS NTAPI LdrAddDllDirectory(PUNICODE_STRING directory, PVOID *cookie);
+NTSTATUS NTAPI LdrRemoveDllDirectory(PVOID cookie);
+NTSTATUS NTAPI LdrGetDllPath(PCWSTR name, ULONG flags, PWSTR *path, PWSTR *unused);
+VOID NTAPI RtlReleasePath(PWSTR path);
+
+EXPORT PVOID WINAPI AddDllDirectory(LPCWSTR directory) {
+  const BOOL device = directory && directory[0] == '\\' && directory[1] == '\\' && (directory[2] == '.' || directory[2] == '?') && directory[3] == '\\';
+  if (!directory || !((directory[0] && directory[1] == ':' && directory[2] == '\\') || directory[0] == '\\')) { set_error(ERROR_INVALID_PARAMETER); return NULL; }      /* (a full path) */
+  if (!device && GetFileAttributesW(directory) == INVALID_FILE_ATTRIBUTES) { set_error(ERROR_FILE_NOT_FOUND); return NULL; }
+  UNICODE_STRING text;
+  unicode_string(&text, directory);
+  PVOID cookie = NULL;
+  const NTSTATUS status = LdrAddDllDirectory(&text, &cookie);
+  if (!NT_SUCCESS(status)) { set_error(status == STATUS_NO_MEMORY ? ERROR_NOT_ENOUGH_MEMORY : ERROR_INVALID_PARAMETER); return NULL; }
+  return cookie;
+}
+EXPORT BOOL WINAPI RemoveDllDirectory(PVOID cookie) {
+  if (!NT_SUCCESS(LdrRemoveDllDirectory(cookie))) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  return TRUE;
+}
+EXPORT BOOL WINAPI SetDefaultDllDirectories(DWORD flags) {
+  if (flags == 0 || (flags & ~0x1F00u) || (flags & 0x100)) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  g_default_dll_dirs = flags;
+  return TRUE;
+}
+
+/* The LOAD_LIBRARY_SEARCH_* lookup: a full path is taken as it is, anything else is looked for in the folders the flags name (application 0x200, user 0x400, System32 0x800).
+   Returns 1 found, 0 not found, -1 for flags that cannot work with this name. */
+static int find_library_restricted(LPCWSTR name, DWORD search, WCHAR *out) {
+  static const WCHAR dll[] = {'.', 'd', 'l', 'l', 0};
+  static const WCHAR system32[] = {'C', ':', '\\', 'W', 'i', 'n', 'd', 'o', 'w', 's', '\\', 'S', 'y', 's', 't', 'e', 'm', '3', '2', 0};
+  const BOOL absolute = (name[0] && name[1] == ':' && (name[2] == '\\' || name[2] == '/')) || (name[0] == '\\' && name[1] == '\\');
+  BOOL has_extension = FALSE;
+  for (LPCWSTR c = name; *c; ++c) { if (*c == '\\' || *c == '/' || *c == ':') has_extension = FALSE; else if (*c == '.') has_extension = TRUE; }
+  WCHAR file[MAX_PATH];
+  const size_t_ length = wcslen(name);
+  if (length + 5 > MAX_PATH) return 0;
+  memcpy(file, name, (length + 1) * 2);
+  if (!has_extension) memcpy(file + length, dll, sizeof(dll));
+  const BOOL rooted = name[0] == '\\' || (name[0] && name[1] == ':');      /* (rooted in the current drive, or a drive with its current folder) */
+  if (absolute || rooted) return full_path_w(file, out, PATH_CHARS) != 0 && is_program_file(out) ? 1 : 0;
+  if (search & 0x100) return -1;      /* (the folder of the library that is loaded needs a path to take it from) */
+  PWSTR list = NULL, unused = NULL;
+  if (!NT_SUCCESS(LdrGetDllPath(name, search, &list, &unused))) return -1;
+  int found = 0;
+  for (WCHAR *start = list; *start && !found;) {
+    WCHAR *end = start;
+    while (*end && *end != ';') ++end;
+    if (end > start && (size_t_)(end - start) < PATH_CHARS && try_candidate(start, (size_t_)(end - start), file, out)) found = 1;
+    start = *end ? end + 1 : end;
+  }
+  RtlReleasePath(list);
+  return found;
+}
+
 static BOOL find_program(LPCWSTR name, WCHAR *out) {
   static const WCHAR exe[] = {'.', 'e', 'x', 'e', 0};
   return find_file(name, exe, NULL, out);
@@ -1774,6 +1974,7 @@ EXPORT UINT WINAPI WinExec(LPCSTR command_line, UINT show) {
 /* ---- handles, time --------------------------------------------------------------------------------------------------------------------------------------- */
 
 EXPORT BOOL WINAPI CloseHandle(HANDLE h) {
+  if ((ULONG_PTR)h == 0x4B4F54) return TRUE;      /* (advapi32's token "handle": there is nothing behind it) */
   const NTSTATUS status = NtClose(h);
   return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
@@ -2821,6 +3022,7 @@ EXPORT BOOL WINAPI RemoveDirectoryW(LPCWSTR path) {
 }
 EXPORT BOOL WINAPI RemoveDirectoryA(LPCSTR path) { WCHAR *w = to_wide(path); const BOOL ok = w ? RemoveDirectoryW(w) : FALSE; free_wide(w); return ok; }
 
+VOID NTAPI TcosNoteFileRename(PCWSTR from, PCWSTR to);
 EXPORT BOOL WINAPI MoveFileExW(LPCWSTR from, LPCWSTR to, DWORD flags) {
   WCHAR source_buffer[PATH_CHARS + 8], target_buffer[PATH_CHARS + 8];
   UNICODE_STRING source_name, target_name;
@@ -2845,6 +3047,8 @@ EXPORT BOOL WINAPI MoveFileExW(LPCWSTR from, LPCWSTR to, DWORD flags) {
   RtlFreeHeap(heap(), 0, info);
   NtClose(h);
   if (!NT_SUCCESS(status)) return fail_nt(status);
+  WCHAR from_full[PATH_CHARS], to_full[PATH_CHARS];      /* (the loader follows a library whose file moved, to know it by its new name) */
+  if (full_path_w(from, from_full, PATH_CHARS) && full_path_w(to, to_full, PATH_CHARS)) TcosNoteFileRename(from_full, to_full);
   return TRUE;
 }
 EXPORT BOOL WINAPI MoveFileW(LPCWSTR from, LPCWSTR to) { return MoveFileExW(from, to, 0); }

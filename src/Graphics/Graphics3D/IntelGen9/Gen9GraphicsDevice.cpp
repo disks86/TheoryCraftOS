@@ -177,19 +177,27 @@ class Gen9Image final : public IImage {
 
 class Gen9ShaderModule final : public IShaderModule {
  public:
-  explicit Gen9ShaderModule(const ShaderModuleDesc& desc) : stage_(desc.stage), program_(desc.eu_program) {}
+  explicit Gen9ShaderModule(const ShaderModuleDesc& desc) : stage_(desc.stage), program_(desc.eu_program), function_(desc.eu_program == EuProgram::None ? desc.vertex_function : nullptr), varying_(desc.eu_varying) {}
   ShaderStage stage() const override { return stage_; }
   EuProgram program() const { return program_; }
+  // A vertex shader that runs as a function on the CPU (there is no compiler for the EUs; the fragment kernels are the two fixed ones).
+  VertexShaderFn function() const { return function_; }
+  uint32_t varying() const { return varying_; }
 
  private:
   ShaderStage stage_;
   EuProgram program_;
+  VertexShaderFn function_;
+  uint32_t varying_;
 };
 
 class Gen9Pipeline final : public IPipeline {
  public:
-  Gen9Pipeline(const GraphicsPipelineDesc& desc, uint32_t position_offset, uint32_t color_offset, bool textured)
-      : desc_(desc), position_offset_(position_offset), color_offset_(color_offset), textured_(textured) {}
+  Gen9Pipeline(const GraphicsPipelineDesc& desc, uint32_t position_offset, uint32_t color_offset, bool textured, VertexShaderFn function = nullptr, uint32_t varying = 0)
+      : desc_(desc), position_offset_(position_offset), color_offset_(color_offset), textured_(textured), function_(function), varying_(varying) {}
+  // The vertex shader function, when the pipeline has one in place of the fixed matrix transform, and the varying the fragment kernel reads.
+  VertexShaderFn function() const { return function_; }
+  uint32_t varying() const { return varying_; }
   const GraphicsPipelineDesc& desc() const { return desc_; }
   uint32_t position_offset() const { return position_offset_; }
   // The second attribute: a float4 colour, or for a textured pipeline a float2 texture coordinate.
@@ -200,6 +208,8 @@ class Gen9Pipeline final : public IPipeline {
   GraphicsPipelineDesc desc_;
   uint32_t position_offset_, color_offset_;
   bool textured_;
+  VertexShaderFn function_;
+  uint32_t varying_;
 };
 
 // A vertex after the vertex shader: clip-space position and colour.
@@ -412,7 +422,7 @@ void Gen9GraphicsDevice::destroy_image(IImage* image) {
 }
 
 IShaderModule* Gen9GraphicsDevice::create_shader_module(const ShaderModuleDesc& desc) {
-  const bool matches = (desc.stage == ShaderStage::Vertex && (desc.eu_program == EuProgram::ColoredVertex || desc.eu_program == EuProgram::TexturedVertex)) ||
+  const bool matches = (desc.stage == ShaderStage::Vertex && (desc.eu_program == EuProgram::ColoredVertex || desc.eu_program == EuProgram::TexturedVertex || (desc.eu_program == EuProgram::None && desc.vertex_function))) ||
                        (desc.stage == ShaderStage::Fragment && (desc.eu_program == EuProgram::ColoredFragment || desc.eu_program == EuProgram::TexturedFragment));
   return matches ? make<Gen9ShaderModule>(allocator_, desc) : nullptr;
 }
@@ -422,6 +432,16 @@ IPipeline* Gen9GraphicsDevice::create_graphics_pipeline(const GraphicsPipelineDe
   const Gen9ShaderModule* vs = static_cast<const Gen9ShaderModule*>(desc.vertex_shader);
   const Gen9ShaderModule* fs = static_cast<const Gen9ShaderModule*>(desc.fragment_shader);
   if (!vs || !fs) return nullptr;
+  if (vs->function()) {
+    // A vertex shader function with one of the two fragment kernels: up to four attributes of any float format, the kernel reads one varying.
+    const bool kernel_textured = fs->program() == EuProgram::TexturedFragment;
+    if (!kernel_textured && fs->program() != EuProgram::ColoredFragment) return nullptr;
+    if (desc.texture_count != (kernel_textured ? 1u : 0u) || desc.attribute_count == 0 || desc.attribute_count > kMaxVertexAttributes || desc.vertex_stride == 0 || desc.vertex_stride > 2048) return nullptr;
+    if (fs->varying() >= kMaxVaryings) return nullptr;
+    for (uint32_t i = 0; i < desc.attribute_count; ++i)
+      if (desc.attributes[i].location >= kMaxVertexAttributes || desc.attributes[i].offset > 2000) return nullptr;
+    return make<Gen9Pipeline>(allocator_, desc, 0, 0, kernel_textured, vs->function(), fs->varying());
+  }
   // The coloured pair (a float3 position and a float4 colour) or the textured pair (a float3 position and a float2 texture coordinate, one texture).
   const bool textured = vs->program() == EuProgram::TexturedVertex && fs->program() == EuProgram::TexturedFragment;
   const bool colored = vs->program() == EuProgram::ColoredVertex && fs->program() == EuProgram::ColoredFragment;
@@ -469,7 +489,8 @@ bool Gen9GraphicsDevice::run_job(const DrawState& state, uint32_t vertices, cons
 
 // Shades, clips, projects and culls the triangles of one draw on the CPU and runs them on the engine.
 bool Gen9GraphicsDevice::run_draw(const DrawRecord& d, const DrawState& base_state, const Extent2D& target) {
-  if (d.constants_size < kMvpBytes || !d.vertex_buffer || !d.pipeline) return false;
+  const VertexShaderFn vertex_function = d.pipeline ? d.pipeline->function() : nullptr;
+  if ((!vertex_function && d.constants_size < kMvpBytes) || !d.vertex_buffer || !d.pipeline) return false;
   const GraphicsPipelineDesc& pd = d.pipeline->desc();
 
   // The viewport (default: the whole image) as a rectangle in whole pixels.
@@ -525,10 +546,12 @@ bool Gen9GraphicsDevice::run_draw(const DrawRecord& d, const DrawState& base_sta
   if (clip.empty()) return true;   // nothing of the draw is visible
   state.clip = clip;
 
-  float mvp[16];
-  for (uint32_t k = 0; k < 16; ++k) {
-    mvp[k] = read_float(d.constants + 4 * k);
-    if (!finite(mvp[k])) return false;
+  float mvp[16] = {};
+  if (!vertex_function) {
+    for (uint32_t k = 0; k < 16; ++k) {
+      mvp[k] = read_float(d.constants + 4 * k);
+      if (!finite(mvp[k])) return false;
+    }
   }
   const uint32_t vertex_count = d.count - d.count % 3;   // triangles only
   const ByteView vertices = d.vertex_buffer->map();
@@ -542,7 +565,14 @@ bool Gen9GraphicsDevice::run_draw(const DrawRecord& d, const DrawState& base_sta
   }
   const TextureBinding* texture = d.pipeline->textured() ? &d.texture : nullptr;
   const uint32_t second_bytes = texture ? 8 : 16;   // a texture coordinate or a colour
-  const uint64_t attribute_end = d.pipeline->color_offset() + second_bytes > d.pipeline->position_offset() + 12 ? d.pipeline->color_offset() + second_bytes : d.pipeline->position_offset() + 12;
+  uint64_t attribute_end = d.pipeline->color_offset() + second_bytes > d.pipeline->position_offset() + 12 ? d.pipeline->color_offset() + second_bytes : d.pipeline->position_offset() + 12;
+  if (vertex_function) {
+    attribute_end = 0;
+    for (uint32_t a = 0; a < pd.attribute_count; ++a) {
+      const uint64_t end = uint64_t{pd.attributes[a].offset} + 4 * (static_cast<uint64_t>(pd.attributes[a].format) + 1);
+      if (end > attribute_end) attribute_end = end;
+    }
+  }
 
   for (uint32_t t = 0; t < vertex_count; t += 3) {
     ClipVertex poly[2][kMaxClipVertices];
@@ -558,6 +588,30 @@ bool Gen9GraphicsDevice::run_draw(const DrawRecord& d, const DrawState& base_sta
       }
       const uint64_t base = d.vertex_offset + static_cast<uint64_t>(index) * pd.vertex_stride;
       if (base > vertices.size() || attribute_end > vertices.size() - base) return false;
+      if (vertex_function) {
+        // The vertex shader function, with the attributes it reads by location (unset components are 0, 0, 0, 1).
+        Vec4 attributes[kMaxVertexAttributes];
+        for (Vec4& a : attributes) a = {0, 0, 0, 1};
+        for (uint32_t a = 0; a < pd.attribute_count; ++a) {
+          const VertexAttribute& attribute = pd.attributes[a];
+          const uint8_t* at = vertices.data() + base + attribute.offset;
+          const uint32_t n = static_cast<uint32_t>(attribute.format) + 1;
+          float v[4] = {0, 0, 0, 1};
+          for (uint32_t k = 0; k < n; ++k) v[k] = read_float(at + 4 * k);
+          attributes[attribute.location] = {v[0], v[1], v[2], v[3]};
+        }
+        ShaderIo io = {};
+        vertex_function(attributes, d.constants, &io);
+        const Vec4& varying = io.varying[d.pipeline->varying()];
+        const float position[4] = {io.position.x, io.position.y, io.position.z, io.position.w};
+        const float carried[4] = {varying.x, varying.y, varying.z, varying.w};
+        for (int r = 0; r < 4; ++r) {
+          poly[0][k].p[r] = position[r];
+          poly[0][k].c[r] = texture && r >= 2 ? 0.0f : carried[r];
+          if (!finite(poly[0][k].c[r]) || !finite(poly[0][k].p[r])) return false;
+        }
+        continue;
+      }
       const uint8_t* pos = vertices.data() + base + d.pipeline->position_offset();
       const uint8_t* col = vertices.data() + base + d.pipeline->color_offset();
       const float x = read_float(pos), y = read_float(pos + 4), z = read_float(pos + 8);
@@ -707,6 +761,9 @@ bool Gen9GraphicsDevice::submit(ICommandBuffer* commands) {
         if (!draws.push_back(d)) return false;
         break;
       }
+      case RecordedCommand::Type::SetTopology:
+        if (cmd.topology != PrimitiveTopology::TriangleList) return false;   // (no lines or points here: DeviceInfo::features says so)
+        break;
       case RecordedCommand::Type::EndRenderPass:
         if (!in_pass) return false;
         in_pass = false;

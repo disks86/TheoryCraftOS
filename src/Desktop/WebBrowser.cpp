@@ -185,6 +185,10 @@ WebBrowser::WebBrowser(allocators::IAllocator& allocator)
       referrer_(allocator),
       refresh_target_(allocator),
       defer_opens_(allocator),
+      window_name_(allocator),
+      defer_open_targets_(allocator),
+      defer_open_types_(allocator),
+      defer_open_bodies_(allocator),
       toolbar_(allocator),
       status_bar_(allocator),
       back_(allocator),
@@ -966,15 +970,24 @@ void WebBrowser::refresh(bool keep_scroll) {
 // After the page ran something (a click, a timer, a new window size): do what it asked of the browser, then draw it again if it changed.
 void WebBrowser::settle() {
   if (defer_opens_.count() > 0) {   // window.open()
-    List<String> opens(allocator());
+    List<String> opens(allocator()), targets(allocator()), types(allocator()), bodies(allocator());
     for (uint64_t i = 0; i < defer_opens_.count(); ++i) {
-      String copy(allocator());
+      String copy(allocator()), name(allocator()), type(allocator()), body(allocator());
       copy.assign(defer_opens_[i].view());
+      name.assign(defer_open_targets_[i].view());
+      targets.push_back(util::move(name));
+      type.assign(defer_open_types_[i].view());
+      body.assign(defer_open_bodies_[i].view());
       opens.push_back(util::move(copy));
+      types.push_back(util::move(type));
+      bodies.push_back(util::move(body));
     }
     defer_opens_.clear();
+    defer_open_targets_.clear();
+    defer_open_types_.clear();
+    defer_open_bodies_.clear();
     for (uint64_t i = 0; i < opens.count(); ++i)
-      if (open_fn_) open_fn_(open_ctx_, *this, opens[i].view());
+      if (open_fn_) open_fn_(open_ctx_, *this, opens[i].view(), targets[i].view(), types[i].view(), bodies[i].view());
   }
   if (want_close_) {   // window.close() of a window a script opened
     want_close_ = false;
@@ -1805,11 +1818,30 @@ void WebBrowser::Env::history_go_to_key(uint64_t key) {
   if (at >= 0) owner_.defer_history_ += static_cast<int32_t>(at - owner_.history_.index());
 }
 
-bool WebBrowser::Env::open_window(StringView address, StringView, bool) {
+bool WebBrowser::Env::open_window(StringView address, StringView target, bool) {
+  if (!target.empty() && owner_.window_name_.view().equals(target)) {   // this window is the one that name stands for
+    navigate(address, false);
+    return true;
+  }
   if (!owner_.open_fn_ || !(browser::is_web_address(address) || browser::is_file_address(address)) || owner_.defer_opens_.count() >= 8) return false;
-  String copy(owner_.allocator());
+  String copy(owner_.allocator()), name(owner_.allocator()), none(owner_.allocator()), nothing(owner_.allocator());
   copy.assign(address);
-  return owner_.defer_opens_.push_back(util::move(copy));
+  name.assign(target);
+  return owner_.defer_opens_.push_back(util::move(copy)) && owner_.defer_open_targets_.push_back(util::move(name)) && owner_.defer_open_types_.push_back(util::move(none)) && owner_.defer_open_bodies_.push_back(util::move(nothing));
+}
+
+bool WebBrowser::Env::open_window_post(StringView address, StringView target, StringView content_type, StringView body, bool) {
+  if (!target.empty() && owner_.window_name_.view().equals(target)) {
+    navigate_post(address, content_type, body);
+    return true;
+  }
+  if (!owner_.open_fn_ || !(browser::is_web_address(address) || browser::is_file_address(address)) || owner_.defer_opens_.count() >= 8) return false;
+  String copy(owner_.allocator()), name(owner_.allocator()), type(owner_.allocator()), data(owner_.allocator());
+  copy.assign(address);
+  name.assign(target);
+  type.assign(content_type);
+  data.assign(body);
+  return owner_.defer_opens_.push_back(util::move(copy)) && owner_.defer_open_targets_.push_back(util::move(name)) && owner_.defer_open_types_.push_back(util::move(type)) && owner_.defer_open_bodies_.push_back(util::move(data));
 }
 
 void WebBrowser::Env::close_window() { owner_.want_close_ = true; }

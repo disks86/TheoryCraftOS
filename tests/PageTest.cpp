@@ -375,6 +375,10 @@ struct FakeEnvironment final : IPageEnvironment {
     opens.push_back(std::string(a.data(), a.size()) + " [" + std::string(target.data(), target.size()) + "]" + (noopener ? " noopener" : ""));
     return allow_open;
   }
+  bool open_window_post(StringView a, StringView target, StringView type, StringView body, bool noopener) override {
+    opens.push_back(std::string(a.data(), a.size()) + " [" + std::string(target.data(), target.size()) + "] POST " + std::string(type.data(), type.size()) + " " + std::string(body.data(), body.size()) + (noopener ? " noopener" : ""));
+    return allow_open;
+  }
   void close_window() override { ++closes; }
   bool history_entries(String* json, int64_t* index) override {
     if (!sim || sim->empty()) return false;
@@ -2661,6 +2665,94 @@ static void test_iframe() {
               "console.log(w.eval('callback(7)'), w.parent === window, Object.keys(d.getElementById('p').dataset).length);"
               "</script></body></html>");
     CHECK(page_log(page) == "true true inner 2 3 | 42 42 true c true | changed T a,b true false | InvalidCharacterError true | from parent 7 true 0");
+  }
+  CHECK(a.live == 0);
+  {   // a form with a target submits into the frame of that name, in the encoding of the page (or of its accept-charset)
+    const char* accept[] = {"", " accept-charset=utf-8"};
+    const char* expected[] = {"?q=caf%E9+%26%238359%3B", "?q=caf%C3%A9+%E2%82%A7"};
+    for (int k = 0; k < 2; ++k) {
+      FakeEnvironment env(a);
+      env.files["http://example.com/answer.html?"] = "<p>answer</p>";
+      MediaEnvironment media;
+      Page page(a, env, "http://example.com/", media, true);
+      page.set_character_set(dom::Encoding::Windows1252);
+      std::string source = std::string("<html><body><iframe name=out></iframe><form id=f action=/answer.html target=out") + accept[k] +
+                           "><input name=q value='caf\xC3\xA9 \xE2\x82\xA7'></form><script>var i = document.querySelector('iframe'); "
+                           "i.onload = function () { console.log(i.contentWindow.location.search) }; document.getElementById('f').submit()</script></body></html>";
+      page.load(source.c_str());
+      page.load_frames_all();
+      CHECK(page_log(page) == expected[k]);
+      CHECK(env.navigations.empty());
+    }
+  }
+  CHECK(a.live == 0);
+  {   // a POST into a frame shows the answer there
+    FakeEnvironment env(a);
+    env.net.answers["POST http://example.com/answer"] = {200, "Content-Type: text/html\r\n", "<p id=r>posted</p>"};
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><iframe name=out></iframe><form id=f method=post action=/answer target=out><input name=q value=1></form><script>"
+              "var i = document.querySelector('iframe'); i.onload = function () { console.log(i.contentDocument.getElementById('r').textContent) }; document.getElementById('f').submit()</script></body></html>");
+    page.load_frames_all();
+    CHECK(page_log(page) == "posted");
+    CHECK(env.posts.empty() && env.navigations.empty());
+  }
+  CHECK(a.live == 0);
+  {   // targets: a sibling frame, the top page, the parent, a new window
+    struct Case {
+      const char* target;
+      const char* log;
+      const char* navigation;
+      const char* open;
+    } cases[] = {{"b", "b loaded answer", nullptr, nullptr},
+                 {"_top", "b loaded ", "http://example.com/answer.html?", nullptr},
+                 {"_parent", "b loaded ", "http://example.com/answer.html?", nullptr},
+                 {"_blank", "b loaded ", nullptr, "http://example.com/answer.html? [_blank] noopener"},
+                 {"nowhere", "b loaded ", nullptr, "http://example.com/answer.html? [nowhere]"}};
+    for (const Case& c : cases) {
+      FakeEnvironment env(a);
+      env.files["http://example.com/answer.html?"] = "<p>answer</p>";
+      MediaEnvironment media;
+      Page page(a, env, "http://example.com/", media, true);
+      std::string source = std::string("<html><body><iframe id=a srcdoc=\"<form id=f action=/answer.html target=") + c.target +
+                           "></form><script>document.getElementById('f').submit()</script>\"></iframe><iframe id=b name=b></iframe><script>"
+                           "var b = document.getElementById('b'); b.onload = function () { console.log('b loaded', b.contentDocument.body.textContent) }</script></body></html>";
+      page.load(source.c_str());
+      page.load_frames_all();
+      CHECK(page_log(page) == c.log);
+      CHECK(env.navigations.size() == (c.navigation ? 1u : 0u) && (!c.navigation || env.navigations[0] == c.navigation));
+      CHECK(env.opens.size() == (c.open ? 1u : 0u) && (!c.open || env.opens[0] == c.open));
+    }
+  }
+  CHECK(a.live == 0);
+  {   // links with a target, <base target>, window.name; a form posted into a new window
+    struct Case {
+      const char* html;
+      const char* log;
+      const char* open;
+    } cases[] = {
+        {"<iframe name=b></iframe><a id=l href=/answer.html target=b>go</a><script>var b = document.querySelector('iframe'); console.log(b.contentWindow.name); b.onload = function () { console.log('loaded', b.contentDocument.body.textContent) }; document.getElementById('l').click()</script>", "b | loaded answer", nullptr},
+        {"<base target=b><iframe name=b></iframe><a id=l href=/answer.html>go</a><script>var b = document.querySelector('iframe'); b.onload = function () { console.log('loaded', b.contentDocument.body.textContent) }; document.getElementById('l').click()</script>", "loaded answer", nullptr},
+        {"<a id=l href=/answer.html target=_blank>go</a><script>document.getElementById('l').click()</script>", "", "http://example.com/answer.html [_blank] noopener"},
+        {"<iframe srcdoc=\"<script>window.name = 'w'</script>\"></iframe><form id=f action=/answer.html target=w></form><script>var i = document.querySelector('iframe'), n = 0; i.onload = function () { if (n++ == 0) document.getElementById('f').submit(); else console.log('second', i.contentDocument.body.textContent) }</script>", "second answer", nullptr},
+        {"<form id=f method=post action=/answer target=_blank><input name=q value=1></form><script>document.getElementById('f').submit()</script>", "", "http://example.com/answer [_blank] POST application/x-www-form-urlencoded q=1 noopener"},
+        {"<a id=l href=/answer.html target=pop rel=noreferrer>go</a><a id=m href=/answer.html target=pop2>go</a><script>document.getElementById('l').click(); document.getElementById('m').click()</script>", "", "http://example.com/answer.html [pop] noopener|http://example.com/answer.html [pop2]"},
+        {"<script>window.name = 'me'</script><a id=l href=/answer.html target=me>go</a><script>document.getElementById('l').click()</script>", "", "nav:http://example.com/answer.html"}};
+    for (const Case& c : cases) {
+      FakeEnvironment env(a);
+      env.files["http://example.com/answer.html"] = "<p>answer</p>";
+      env.files["http://example.com/answer.html?"] = "<p>answer</p>";
+      MediaEnvironment media;
+      Page page(a, env, "http://example.com/", media, true);
+      std::string source = std::string("<html><body>") + c.html + "</body></html>";
+      page.load(source.c_str());
+      page.load_frames_all();
+      CHECK(page_log(page) == c.log);
+      std::string got;   // (the windows that were opened, then the navigations of this one)
+      for (const std::string& o : env.opens) got += (got.empty() ? "" : "|") + o;
+      for (const std::string& n : env.navigations) got += (got.empty() ? "" : "|") + std::string("nav:") + n;
+      CHECK(got == (c.open ? c.open : ""));
+    }
   }
   CHECK(a.live == 0);
   {   // following a link in a frame moves the frame
@@ -6101,6 +6193,7 @@ static int run_real_wpt(const char* root, const char* file) {
     }
     page.load(html.c_str());
     for (int i = 0; i < 20000; ++i) {
+      page.load_frames_all();   // (what the desktop does when it draws: frames that were pointed somewhere load, and tell the page)
       double due;
       if (!page.next_timer(&due)) break;
       if (due > env.clock) env.clock = static_cast<uint64_t>(due);

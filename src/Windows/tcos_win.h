@@ -283,6 +283,9 @@ typedef struct _SYSTEM_INFO {
 typedef struct _OSVERSIONINFOA { DWORD dwOSVersionInfoSize, dwMajorVersion, dwMinorVersion, dwBuildNumber, dwPlatformId; CHAR szCSDVersion[128]; } OSVERSIONINFOA, *LPOSVERSIONINFOA;
 typedef struct _OSVERSIONINFOW { DWORD dwOSVersionInfoSize, dwMajorVersion, dwMinorVersion, dwBuildNumber, dwPlatformId; WCHAR szCSDVersion[128]; } OSVERSIONINFOW, *LPOSVERSIONINFOW;
 typedef struct _RTL_OSVERSIONINFOW { ULONG dwOSVersionInfoSize, dwMajorVersion, dwMinorVersion, dwBuildNumber, dwPlatformId; WCHAR szCSDVersion[128]; } RTL_OSVERSIONINFOW;
+typedef struct _RTL_OSVERSIONINFOEXW { ULONG dwOSVersionInfoSize, dwMajorVersion, dwMinorVersion, dwBuildNumber, dwPlatformId; WCHAR szCSDVersion[128]; USHORT wServicePackMajor, wServicePackMinor, wSuiteMask; UCHAR wProductType, wReserved; } RTL_OSVERSIONINFOEXW;
+typedef struct _OSVERSIONINFOEXA { DWORD dwOSVersionInfoSize, dwMajorVersion, dwMinorVersion, dwBuildNumber, dwPlatformId; CHAR szCSDVersion[128]; WORD wServicePackMajor, wServicePackMinor, wSuiteMask; BYTE wProductType, wReserved; } OSVERSIONINFOEXA, *LPOSVERSIONINFOEXA;
+typedef struct _OSVERSIONINFOEXW { DWORD dwOSVersionInfoSize, dwMajorVersion, dwMinorVersion, dwBuildNumber, dwPlatformId; WCHAR szCSDVersion[128]; WORD wServicePackMajor, wServicePackMinor, wSuiteMask; BYTE wProductType, wReserved; } OSVERSIONINFOEXW, *LPOSVERSIONINFOEXW;
 
 typedef struct _PROCESS_INFORMATION { HANDLE hProcess, hThread; DWORD dwProcessId, dwThreadId; } PROCESS_INFORMATION, *LPPROCESS_INFORMATION;
 #define STILL_ACTIVE 259

@@ -3829,6 +3829,8 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
     }
     return JSON.stringify(out);
   });
+  hide(g, '__window_name', function () { return String(g.name); });
+  hide(g, '__set_window_name', function (name) { g.name = String(name); });
   hide(g, '__frame_document', function (id) {
     var r;
     try { r = ask(id, ['get', 0, 'document', []]); } catch (e) { return null; }

@@ -76,6 +76,8 @@ class IPageEnvironment : public IObjectEnvironment {
   // window.open(): a new window (tab) for `address`; `target` is the name it was given ("" or _blank: always a new one). False if the browser cannot or will not (a
   // pop-up blocker). close_window() is window.close() of a page that was opened by a script.
   virtual bool open_window(StringView address, StringView target, bool noopener) { (void)address; (void)target; (void)noopener; return false; }
+  // The same for a form that is posted: the new window shows the answer to the request. False if the browser cannot.
+  virtual bool open_window_post(StringView address, StringView target, StringView content_type, StringView body, bool noopener) { (void)address; (void)target; (void)content_type; (void)body; (void)noopener; return false; }
   virtual void close_window() {}
   virtual void alert(StringView text) = 0;
   virtual bool confirm(StringView text) = 0;
@@ -298,6 +300,9 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   void set_navigation_state(StringView json, bool has_state) override { env_.set_navigation_state(json, has_state); }
   void history_go_to_key(uint64_t key) override { env_.history_go_to_key(key); }
   bool open_window(StringView address, StringView target, bool noopener) override { return env_.open_window(address, target, noopener); }
+  void navigate_target(StringView address, StringView target, bool noopener) override {
+    if (!send_to_target(target, address, nullptr, StringView(), noopener)) env_.navigate(address, false);
+  }
   void close_window() override { env_.close_window(); }
   StringView referrer() override { return referrer_.view(); }
   void scroll_node_into_view(dom::Node* node) override;
@@ -381,6 +386,8 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   uint32_t parent_window_id() override { return parent_ ? parent_->window_id_ : 0; }
   uint32_t top_window_id() override { return root()->window_id_; }
   void load_frames() override { sync_frames(); }
+  // Loads the frames that were pointed somewhere, until none is left to load (a load handler can point one again). For a host that does not draw.
+  void load_frames_all() { for (int i = 0; i < 1000 && sync_frames(); ++i) {} }
   uint32_t frame_window_id(uint32_t iframe_serial) override;
   bool post_window_message(uint32_t target_window, StringView target_origin, StringView payload, StringView ports) override;
   bool window_request(uint32_t target_window, StringView request, String* reply) override;
@@ -417,8 +424,14 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   struct Frame;
   class FrameEnv;
   friend class FrameEnv;
-  void sync_frames();
+  bool sync_frames();   // true when a frame was loaded
   void frame_navigate(uint32_t frame_serial, StringView address);
+  void frame_post(uint32_t frame_serial, StringView address, StringView content_type, StringView body);
+  void deliver_frame(uint32_t frame_serial, StringView address, const char* content_type, StringView body);
+  Frame* frame_record(uint32_t frame_serial);
+  bool find_named_frame(StringView name, Page** owner, uint32_t* serial);
+  bool send_to_target(StringView target, StringView address, const char* content_type, StringView body, bool noopener = false);
+  bool window_named(StringView name);   // this window's own window.name (or the <iframe> name of a window without scripts)
   void frame_pick_file(uint32_t frame_serial, uint32_t node_serial, bool multiple);
   void paste_text(dom::Node* control, StringView text);
   // Messages for this window (from windows and message ports) wait here until the next turn of the event loop.

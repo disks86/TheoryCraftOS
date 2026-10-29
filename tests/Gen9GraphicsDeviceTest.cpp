@@ -27,6 +27,7 @@
 #include "Graphics/Graphics3D/BuiltinShaders.hpp"
 #include "Graphics/Graphics3D/IntelGen9/Gen9GraphicsDevice.hpp"
 #include "Graphics/Graphics3D/Software/SoftwareDevice.hpp"
+#include "DxgkrnlDeviceSuite.hpp"
 
 using namespace hardware;
 using namespace hardware::intel_gt;
@@ -274,6 +275,7 @@ static void test_resources() {
   IShaderModule* fs = p.gpu->create_shader_module(colored_fragment_shader());
   ShaderModuleDesc plain = colored_vertex_shader();
   plain.eu_program = EuProgram::None;
+  plain.vertex_function = nullptr;
   CHECK(vs && fs && !p.gpu->create_shader_module(plain));
   GraphicsPipelineDesc pd;
   describe_colored_pipeline(&pd);
@@ -341,6 +343,101 @@ static void test_resources() {
   const int warmed = p.rig.mem.live();
   churn(600);
   CHECK(p.rig.mem.live() == warmed && warmed - before <= 4 && p.rig.gpu.violations.empty());
+}
+
+
+// A vertex shader that is a function (the way Direct3D 9 bytecode reaches the device), with a fixed pixel kernel reading its varying 2.
+static void tweak_vertex(const Vec4* a, const uint8_t* c, ShaderIo* out) {
+  float m[16];
+  memcpy(m, c, sizeof m);
+  out->position = {a[0].x * m[0] * 0.5f + m[12], a[0].y * m[5] * 0.5f + m[13], a[0].z, 1.0f};
+  for (Vec4& v : out->varying) v = {0, 0, 0, 0};
+  out->varying[2] = a[2];
+}
+static bool pass_varying_2(const Vec4* v, const uint8_t*, Vec4* out) {
+  *out = v[2];
+  return true;
+}
+
+static void test_programmable_vertex() {
+  Pair p;
+  if (!p.gpu) { CHECK(false); return; }
+  auto shaders = [](IGraphicsDevice& d, IShaderModule** vs, IShaderModule** fs, uint8_t varying) {
+    ShaderModuleDesc v;
+    v.stage = ShaderStage::Vertex;
+    v.vertex_function = tweak_vertex;
+    *vs = d.create_shader_module(v);
+    ShaderModuleDesc f;
+    f.stage = ShaderStage::Fragment;
+    f.fragment_function = pass_varying_2;
+    f.eu_program = EuProgram::ColoredFragment;
+    f.eu_varying = varying;
+    *fs = d.create_shader_module(f);
+  };
+  auto pipeline = [](IGraphicsDevice& d, IShaderModule* vs, IShaderModule* fs, uint32_t location) {
+    GraphicsPipelineDesc pd;
+    pd.vertex_stride = sizeof(ColoredVertex);
+    pd.attribute_count = 2;
+    pd.attributes[0] = {0, VertexFormat::Float3, 0};
+    pd.attributes[1] = {location, VertexFormat::Float4, 12};
+    pd.varying_count = 3;
+    pd.vertex_shader = vs;
+    pd.fragment_shader = fs;
+    pd.cull_mode = CullMode::None;
+    return d.create_graphics_pipeline(pd);
+  };
+  IShaderModule *gvs, *gfs, *svs, *sfs;
+  shaders(*p.gpu, &gvs, &gfs, 2);
+  shaders(p.software, &svs, &sfs, 2);
+  CHECK(gvs && gfs && svs && sfs);
+  IPipeline* gp = pipeline(*p.gpu, gvs, gfs, 2);
+  IPipeline* sp = pipeline(p.software, svs, sfs, 2);
+  CHECK(gp && sp);
+  // (a location the vertex shader cannot take, a kernel reading a varying that does not exist)
+  CHECK(!pipeline(*p.gpu, gvs, gfs, 9));
+  IShaderModule *bad_vs, *bad_fs;
+  shaders(*p.gpu, &bad_vs, &bad_fs, 7);
+  CHECK(bad_fs && !pipeline(*p.gpu, bad_vs, bad_fs, 2));
+  static const ColoredVertex tri[3] = {cv(-0.8f, -0.8f, 0.5f, 1, 0, 0), cv(0.8f, -0.8f, 0.5f, 0, 1, 0), cv(0, 0.8f, 0.5f, 0, 0, 1)};
+  Scene gs(*p.gpu), ss(p.software);
+  IImage* gi = p.gpu->create_image({{kSize, kSize}, Format::B8G8R8A8Unorm, kImageColorAttachment | kImagePresent});
+  IImage* si = p.software.create_image({{kSize, kSize}, Format::B8G8R8A8Unorm, kImageColorAttachment});
+  CHECK(gi && si);
+  if (gi && si && gp && sp) {
+    Draw g{tri, 3}, s{tri, 3};
+    g.mvp = s.mvp = Mat4::translation(0.2f, -0.1f, 0);
+    g.pipeline = gp, s.pipeline = sp;
+    const int jobs_before = p.rig.gpu.jobs;
+    CHECK(render(*p.gpu, gs, gi, {0, 0, 0, 1}, {g}));
+    CHECK(render(p.software, ss, si, {0, 0, 0, 1}, {s}));
+    CHECK(p.rig.gpu.jobs > jobs_before && p.rig.gpu.violations.empty());
+    const std::vector<uint32_t> a = read(gi), b = read(si);
+    const uint32_t bad = differing(a, b, 6);
+    if (bad > 260) printf("  programmable vertex: %u pixels differ\n", bad);
+    CHECK(bad <= 260);
+    uint32_t lit = 0;
+    for (uint32_t px : a) lit += px != 0xFF000000;
+    CHECK(lit > 100);   // (something was drawn)
+  }
+  if (gi) p.gpu->destroy_image(gi);
+  if (si) p.software.destroy_image(si);
+  p.gpu->destroy_pipeline(gp);
+  p.software.destroy_pipeline(sp);
+  for (IShaderModule* m : {gvs, gfs, bad_vs, bad_fs}) p.gpu->destroy_shader_module(m);
+  p.software.destroy_shader_module(svs);
+  p.software.destroy_shader_module(sfs);
+}
+
+// The kernel-mode Direct3D driver on this device: a Direct3D 9 shader pair, a pipeline and a draw, compared with the same on the software device.
+static void test_direct3d_kernel() {
+  Pair p;
+  if (!p.gpu) { CHECK(false); return; }
+  CHECK(dxgk_suite::compare(p.alloc, *p.gpu, &p.display, "Intel Gen9", 6, 260) == 0);
+  // What the adapter says of this device: textures and a stencil plane, a vertex shader of any program (it runs on the CPU) but only the two fixed pixel kernels.
+  dxgk::Kernel kernel(p.alloc);
+  CHECK(kernel.add_adapter(*p.gpu, dxgk::AdapterConfig()) == 0);
+  const dxgk::AdapterCaps& caps = kernel.adapter(0)->caps();
+  CHECK(caps.textures && caps.stencil && caps.mipmaps && caps.programmable_vertex && !caps.programmable_pixel);
 }
 
 static void test_scenes() {
@@ -1064,6 +1161,8 @@ static void test_stencil() {
 int main() {
   test_resources();
   test_scenes();
+  test_programmable_vertex();
+  test_direct3d_kernel();
   test_textures();
   test_tiling_and_mipmaps();
   test_stencil();

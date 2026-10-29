@@ -66,7 +66,12 @@ bool world_directory(SyscallAbi abi, StringView shell_cwd, String* out) {
 ArrayView<const StringView> default_environment(SyscallAbi abi) {
   static const StringView kLinux[] = {"PATH=/usr/local/bin:/usr/bin:/bin", "HOME=/root", "USER=root", "LOGNAME=root", "TERM=dumb", "LANG=C.UTF-8", "SHELL=/bin/sh"};
   static const StringView kWindows[] = {"SystemDrive=C:", "SystemRoot=C:\\Windows", "windir=C:\\Windows", "PATH=C:\\Windows\\System32;C:\\Windows", "TEMP=C:\\Temp",
-                                         "TMP=C:\\Temp", "OS=Windows_NT", "PROCESSOR_ARCHITECTURE=AMD64", "NUMBER_OF_PROCESSORS=1", "COMSPEC=C:\\Windows\\System32\\cmd.exe"};
+                                         "TMP=C:\\Temp", "OS=Windows_NT", "PROCESSOR_ARCHITECTURE=AMD64", "NUMBER_OF_PROCESSORS=1", "COMSPEC=C:\\Windows\\System32\\cmd.exe",
+                                         "USERPROFILE=C:\\Users\\Default", "USERNAME=Default", "HOMEDRIVE=C:", "HOMEPATH=\\Users\\Default",
+                                         "ALLUSERSPROFILE=C:\\ProgramData", "ProgramData=C:\\ProgramData", "COMPUTERNAME=TCOS", "PROCESSOR_IDENTIFIER=Intel64 Family 6 Model 1 Stepping 1, GenuineIntel",
+                                         "PROCESSOR_LEVEL=6", "PROCESSOR_REVISION=0101", "ProgramFiles=C:\\Program Files", "CommonProgramFiles=C:\\Program Files\\Common Files",
+                                         "ProgramFiles(x86)=C:\\Program Files (x86)", "CommonProgramFiles(x86)=C:\\Program Files (x86)\\Common Files", "ProgramW6432=C:\\Program Files",
+                                         "CommonProgramW6432=C:\\Program Files\\Common Files", "APPDATA=C:\\Users\\Default\\AppData\\Roaming", "LOCALAPPDATA=C:\\Users\\Default\\AppData\\Local"};
   if (abi == SyscallAbi::Windows) return ArrayView<const StringView>(kWindows, sizeof(kWindows) / sizeof(kWindows[0]));
   return ArrayView<const StringView>(kLinux, sizeof(kLinux) / sizeof(kLinux[0]));
 }

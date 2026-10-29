@@ -355,6 +355,26 @@ Frame* on_user_fault(Frame* frame) {
     if (result == process::windowsabi::GuardResult::Retry) return frame;
     if (result == process::windowsabi::GuardResult::Exception) guard = 1;
   }
+  // A page the program may use but the CPU does not have in the tables it runs with (another thread, or a parent changing this program's memory, rebuilt them since): the
+  // tables are rebuilt and the instruction runs again. A fault at the same place a few times in a row is real.
+  if ((frame->vector & 0xFF) == 14 && !(frame->error & 1) && task->program.process()->abi() == process::SyscallAbi::Windows) {
+    const uint64_t stale_address = read_cr2();
+    process::AddressSpace* space = task->program.process()->address_space();
+    UserThread* self = current_user_thread();
+    if (space && self && stale_address < 0x0000800000000000ull) {
+      const uint8_t need = (frame->error & 0x10) ? process::kProtExecute : (frame->error & 2) ? process::kProtWrite : process::kProtRead;
+      bool again = false;
+      irq_enable();
+      task->mutex.lock();
+      if (space->check(stale_address, 1, need)) {
+        if (self->stale_rip == frame->rip && self->stale_address == stale_address) ++self->stale_count; else { self->stale_rip = frame->rip; self->stale_address = stale_address; self->stale_count = 1; }
+        again = self->stale_count <= 3 && task->sync_tables();
+      }
+      task->mutex.unlock();
+      irq_disable();
+      if (again) return frame;
+    }
+  }
   // A write to a copy-on-write page (PAGE_WRITECOPY) is not a fault: the page gets its own copy and the instruction runs again.
   if ((frame->vector & 0xFF) == 14 && (frame->error & 3) == 3 && task->program.process()->abi() == process::SyscallAbi::Windows) {
     const uint64_t cow_address = read_cr2();
@@ -657,6 +677,14 @@ bool Task::set_priority(uint64_t thread_id, int32_t absolute_priority) {
   t->priority = static_cast<uint8_t>(absolute_priority);
   if (t->spawned && t->thread && !t->joined && !t->finished) kernel::set_thread_priority(t->thread, t->priority);
   return true;
+}
+
+void Task::flush_write_buffers() {
+  CoreMask all;
+  const uint64_t online = online_core_mask();
+  for (uint32_t i = 0; i < 64; ++i) if ((online >> i) & 1) all.add(i);
+  wait_for_kernel_entry(all);      // (an interrupt drains the store buffer of the core it lands on)
+  __atomic_thread_fence(__ATOMIC_SEQ_CST);
 }
 
 bool Task::set_affinity(uint64_t thread_id, uint64_t mask) {
@@ -980,7 +1008,8 @@ uint32_t remote_operation(uint64_t pid, process::IProcessRuntime::RemoteOp& op) 
     ScopedMutex hold(task->mutex);
     const uint32_t status = process::windowsabi::run_remote(*task->program.process(), op);
     // The layout may have changed: the page tables are rebuilt and given to the threads of that program (on whatever cores they run), as at the end of one of its own system calls.
-    const bool layout = op.kind == process::IProcessRuntime::RemoteOp::Allocate || op.kind == process::IProcessRuntime::RemoteOp::Free || op.kind == process::IProcessRuntime::RemoteOp::Protect;
+    using Op = process::IProcessRuntime::RemoteOp;
+    const bool layout = op.kind == Op::Allocate || op.kind == Op::Free || op.kind == Op::Protect || op.kind == Op::MapView || op.kind == Op::Unmap;      // (a view that came or went changes the layout too)
     if (layout && status == 0 && !task->sync_tables()) return 0xC0000017u;
     return status;
   }

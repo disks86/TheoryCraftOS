@@ -131,7 +131,7 @@ class Desktop {
   MediaPlayer& media_player() { return media_player_; }
   Graphics3DTest& graphics_test() { return graphics_test_; }
   // The machine's graphics for the 3D test window (nullptr: it says there is none). They must outlive the desktop.
-  void set_graphics(graphics::SystemGraphics* graphics) { graphics_test_.set_graphics(graphics); }
+  void set_graphics(dxgk::Kernel* kernel, graphics::SystemGraphics* graphics) { graphics_test_.set_graphics(kernel, graphics); }
   // Opens the 3D test window (a spinning cube with the frame rate and whether the GPU draws it), or brings it forward.
   void open_graphics_test();
   // The machine's sound mixer, video codecs and clock for the media player (any may be nullptr). They must outlive the desktop.
@@ -345,7 +345,7 @@ class Desktop {
   void setup_spreadsheet(Spreadsheet& sheet);
   void setup_database_query(DatabaseQuery& query);
   void setup_web_browser(WebBrowser& web);
-  static bool open_script_window(void* self, WebBrowser& from, StringView address);
+  static bool open_script_window(void* self, WebBrowser& from, StringView address, StringView target, StringView content_type, StringView body);
   static uint64_t unix_ms(void* self);
   void setup_paint(Paint& paint);
   void setup_terminal(Terminal& terminal);

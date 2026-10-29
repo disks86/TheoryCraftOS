@@ -600,6 +600,14 @@ uint32_t image_header_status(ConstByteView file) {
   return 0;
 }
 
+// What NtCreateSection(SEC_IMAGE) says about the file: 0 for a PE32+ x86-64 or PE32 i386 image (the ones Windows maps on this CPU; `pe` is then parsed), else the NT status.
+uint32_t image_section_status(ConstByteView file, exe::PeFile& pe) {
+  if (const uint32_t header = image_header_status(file)) return header;
+  if (!pe.parse(file)) return 0xC000007Bu;
+  const bool good_pair = (pe.is_pe32_plus() && pe.machine() == exe::kPeMachineAmd64) || (!pe.is_pe32_plus() && pe.machine() == 0x14C);
+  return good_pair ? 0 : 0xC000007Bu;
+}
+
 // NtCreateSection(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PLARGE_INTEGER MaximumSize, ULONG PageProtection, ULONG AllocationAttributes, HANDLE FileHandle): memory to map into
 // address spaces, shared by name; with a file handle it is the file's contents (written back by FlushViewOfFile, when the last view goes and when the section does).
 uint32_t nt_create_section(Process& p, const SyscallRequest& r) {
@@ -656,12 +664,7 @@ uint32_t nt_create_section(Process& p, const SyscallRequest& r) {
     exe::PeFile pe(p.files().allocator());
     ObjectManager::SectionInfo info;
     if (!objects->section_memory(c.id, &image, &image_size, &owner) || !objects->section_info(c.id, &info)) { objects->release(c.id); return 0xC000007Bu; }
-    uint32_t header = image_header_status(ConstByteView(image, info.size));
-    if (header == 0) {
-      const bool parsed = pe.parse(ConstByteView(image, info.size));
-      const bool good_pair = parsed && ((pe.is_pe32_plus() && pe.machine() == exe::kPeMachineAmd64) || (!pe.is_pe32_plus() && pe.machine() == 0x14C));      // PE32+ for x86-64, PE32 for i386
-      if (!good_pair) header = 0xC000007Bu;
-    }
+    uint32_t header = image_section_status(ConstByteView(image, info.size), pe);
     if (header != 0) {
       objects->release(c.id);
       return header;
@@ -773,7 +776,8 @@ uint32_t map_image_view(Process& p, const SyscallRequest& r, uint32_t section_id
     space->unmap_allocation(chosen);
     return loaded == LoadStatus::OutOfMemory ? kNoResources : (loaded == LoadStatus::Malformed ? kStatusConflictingAddresses : 0xC000007Bu);
   }
-  if (moved && !apply_relocations(*space, pe, chosen, chosen - pe.image_base())) { space->unmap(chosen, rounded); return 0xC000007Bu; }
+  // An image that is not linked for dynamic base is mapped where there is room without its relocations being applied (Windows leaves it as the file has it).
+  if (moved && (pe.dll_characteristics() & 0x40) && !apply_relocations(*space, pe, chosen, chosen - pe.image_base())) { space->unmap(chosen, rounded); return 0xC000007Bu; }
   describe_image_pages(*space, pe, chosen);
   if (moved && (pe.dll_characteristics() & 0x40)) record_image_base(*space, chosen);
   if (!p.write_user_u64(r.args[2], chosen) || !p.write_user_u64(size_at, rounded)) { space->unmap_allocation(chosen); return kAccessViolation; }
@@ -882,9 +886,24 @@ uint32_t map_view_in(Process& target, uint32_t id, uint64_t offset, uint64_t* ba
   if (!space->map_shared(base, bytes, prot, storage + offset, owner)) return kStatusConflictingAddresses;
   PageAttributes attributes;
   attributes.type = PageAttributes::Mapped;
-  attributes.protect = attributes.allocation_protect = view_page;
+  attributes.protect = attributes.allocation_protect = view_page | ((info.attributes & 0x10000000u) ? 0x200u : 0u);      // (SEC_NOCACHE shows as PAGE_NOCACHE)
   attributes.file_view = info.file_backed;
   space->set_attributes(base, bytes, attributes);
+  if (objects->section_reserved(owner)) {      // pages nobody committed yet cannot be touched (the committed ones show in every view)
+    PageAttributes reserved = attributes;
+    reserved.protect = 0x01;      // PAGE_NOACCESS
+    reserved.reserved = true;
+    for (uint64_t at = 0; at < bytes;) {
+      const bool committed = objects->section_page_committed(owner, offset + at);
+      uint64_t end = at + 4096;
+      while (end < bytes && objects->section_page_committed(owner, offset + end) == committed) end += 4096;
+      if (!committed) {
+        space->protect(base + at, end - at, 0);
+        space->set_attributes(base + at, end - at, reserved);
+      }
+      at = end;
+    }
+  }
   *base_in_out = base;
   *view_in_out = bytes;
   return kSuccess;

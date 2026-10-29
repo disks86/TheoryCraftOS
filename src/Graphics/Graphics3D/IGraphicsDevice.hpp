@@ -39,7 +39,8 @@ namespace graphics {
 
 constexpr uint32_t kMaxVertexAttributes = 4;
 constexpr uint32_t kMaxVaryings = 4;
-constexpr uint32_t kMaxPushConstantBytes = 128;
+// The most a command buffer may carry as shader constants; what a device really takes is DeviceInfo::max_push_constant_bytes (most take 128: eight vec4s).
+constexpr uint32_t kMaxPushConstantBytes = 4096;
 constexpr uint32_t kMaxTextureUnits = 2;
 
 // --- Resources ---------------------------------------------------------------
@@ -142,6 +143,22 @@ struct SamplerDesc {
 class ITextureSet {
  public:
   virtual Vec4 sample(uint32_t unit, float u, float v) const = 0;
+  // --- kFeatureTexelAccess (DeviceInfo::features); a device without it leaves these at their defaults.
+  // The lookup at an explicit level of detail (lambda: 0 is the base level), as sample() takes it from the derivatives.
+  virtual Vec4 sample_lod(uint32_t unit, float u, float v, float lod) const {
+    (void)lod;
+    return sample(unit, u, v);
+  }
+  // One texel of a level, no filtering (Direct3D 10 Load): x and y are texel numbers; outside the level it is transparent black. A unit with nothing bound gives the same.
+  virtual Vec4 fetch(uint32_t unit, int32_t x, int32_t y, uint32_t level) const {
+    (void)unit, (void)x, (void)y, (void)level;
+    return {0, 0, 0, 0};
+  }
+  // The size of a level and the number of levels of the image bound to the unit (Direct3D 10 GetDimensions); false when nothing is bound.
+  virtual bool size(uint32_t unit, uint32_t level, uint32_t* width, uint32_t* height, uint32_t* levels) const {
+    (void)unit, (void)level, (void)width, (void)height, (void)levels;
+    return false;
+  }
 
  protected:
   constexpr ITextureSet() = default;
@@ -162,6 +179,21 @@ using FragmentShaderFn = bool (*)(const Vec4* varyings, const uint8_t* constants
 // The same for a fragment shader that reads the pipeline's textures.
 using TexturedFragmentShaderFn = bool (*)(const Vec4* varyings, const uint8_t* constants, const ITextureSet& textures, Vec4* color);
 
+// The same with the system values of Direct3D 10 (kFeatureSystemInputs). A vertex shader is told which vertex of which instance it is shading; a fragment shader where the pixel is
+// (position: x and y window coordinates of the pixel's centre, z the depth, w one over the clip space w), whether the triangle faces the viewer (lines and points: true) and which
+// primitive of the draw it belongs to.
+struct VertexContext {
+  uint32_t vertex_id = 0;     // the index of the vertex (or its number in a draw without indices), before the base vertex offset is added in
+  uint32_t instance_id = 0;
+};
+struct FragmentContext {
+  Vec4 position;
+  bool front_facing = true;
+  uint32_t primitive_id = 0;
+};
+using VertexShaderFnEx = void (*)(const Vec4* attributes, const uint8_t* constants, const VertexContext& context, ShaderIo* out);
+using FragmentShaderFnEx = bool (*)(const Vec4* varyings, const FragmentContext& context, const uint8_t* constants, const ITextureSet& textures, Vec4* color);
+
 // The QPU programs the Raspberry Pi's V3D device has for the built-in shaders (there is no shader compiler for the QPUs, so a module names a program it ships
 // with instead of carrying code): the coloured-vertex pipeline of BuiltinShaders.
 enum class QpuProgram : uint8_t { None, ColoredVertex, ColoredFragment };
@@ -176,6 +208,9 @@ struct ShaderModuleDesc {
   // A fragment shader that samples textures (instead of fragment_function; the pipeline then says how many in texture_count). The software, Intel Gen9 and virgl devices run these: the
   // others refuse a pipeline with textures.
   TexturedFragmentShaderFn textured_fragment_function = nullptr;
+  // The same with system values: a device with kFeatureSystemInputs runs these when a module has them (and any of the others otherwise).
+  VertexShaderFnEx vertex_function_ex = nullptr;
+  FragmentShaderFnEx fragment_function_ex = nullptr;
   // TGSI text for the GPU device. Inputs are the vertex attributes (vertex stage) or the
   // varyings as GENERIC[n] (fragment stage); push constants are CONST[0..7] (vec4 each).
   // Clip-space z is 0..1 and the first color output is the pixel.
@@ -186,8 +221,15 @@ struct ShaderModuleDesc {
   uint32_t d3d9_token_count = 0;
   // The QPU program of the V3D device that does what this module does; None for a module that has none (the V3D device then cannot run it).
   QpuProgram qpu_program = QpuProgram::None;
+  // With QpuProgram::ColoredVertex: the matrix is given as rows (the transpose of what the built-in shader takes), as a Direct3D 9 vertex shader that ends in dp4s uses it.
+  bool qpu_matrix_rows = false;
+  // ... and the program is written for Direct3D's clip space (+Y up): the device flips the Y row of the matrix.
+  bool qpu_flip_y = false;
   // The same for the Intel Gen9 device: the coloured-vertex pipeline of BuiltinShaders (the vertex transform runs on the CPU there).
   EuProgram eu_program = EuProgram::None;
+  // With a ColoredFragment / TexturedFragment eu_program: which of the vertex shader's varyings the kernel reads (the colour, or the texture coordinate in its first two components).
+  // A vertex shader with a vertex_function (and no eu_program) is run on the CPU by that device.
+  uint8_t eu_varying = 0;
 };
 
 class IShaderModule {
@@ -207,6 +249,7 @@ struct VertexAttribute {
   uint32_t location;  // which input of the vertex shader
   VertexFormat format;
   uint32_t offset;  // bytes from the start of the vertex
+  bool per_instance = false;   // kFeatureInstancing: the attribute steps with the instance, not the vertex (element number = the instance, at the same stride)
 };
 
 // The stencil test of a pipeline, one state for front and back faces: a fragment passes when (reference & compare_mask) <compare> (stored & compare_mask); what is written back
@@ -219,6 +262,18 @@ struct StencilState {
   CompareOp compare = CompareOp::Always;
   StencilOp fail_op = StencilOp::Keep, depth_fail_op = StencilOp::Keep, pass_op = StencilOp::Keep;
   uint8_t compare_mask = 0xFF, write_mask = 0xFF, reference = 0;
+};
+
+// Blending (kFeatureBlendState): result = source * source_factor (op) destination * destination_factor, for the colour and the alpha on their own, then only the channels
+// of write_mask (bit 0 red .. bit 3 alpha) are stored. Min / Max ignore the factors. With `custom` false the pipeline's alpha_blend decides (source over destination).
+enum class BlendFactor : uint8_t { Zero, One, SrcColor, InvSrcColor, SrcAlpha, InvSrcAlpha, DstColor, InvDstColor, DstAlpha, InvDstAlpha, SrcAlphaSaturate };
+enum class BlendOp : uint8_t { Add, Subtract, ReverseSubtract, Min, Max };
+struct BlendState {
+  bool custom = false;
+  bool enable = false;
+  BlendFactor src_color = BlendFactor::One, dst_color = BlendFactor::Zero, src_alpha = BlendFactor::One, dst_alpha = BlendFactor::Zero;
+  BlendOp color_op = BlendOp::Add, alpha_op = BlendOp::Add;
+  uint8_t write_mask = 0xF;
 };
 
 enum class CullMode : uint8_t { None, Back, Front };
@@ -238,6 +293,8 @@ struct GraphicsPipelineDesc {
   bool depth_write = false;
   bool alpha_blend = false;  // source over destination
   StencilState stencil;
+  BlendState blend;                                   // kFeatureBlendState
+  CompareOp depth_compare = CompareOp::LessEqual;     // kFeatureBlendState: what depth_test compares with (a device without it always uses LessEqual)
 };
 
 class IPipeline {
@@ -250,6 +307,9 @@ class IPipeline {
 // --- Commands ----------------------------------------------------------------
 
 enum class IndexType : uint8_t { Uint16, Uint32 };
+
+// What the vertices of a draw make (set_primitive_topology, DeviceFeature kFeatureLines for anything but triangles). Lines and points are one pixel wide.
+enum class PrimitiveTopology : uint8_t { TriangleList, LineList, PointList };
 
 struct Viewport {
   float x = 0, y = 0, width = 0, height = 0;
@@ -281,8 +341,11 @@ class ICommandBuffer {
   // Defaults to the whole render target.
   virtual void set_viewport(const Viewport& viewport) = 0;
   virtual void set_scissor(const Rect2D& scissor) = 0;
-  virtual void draw(uint32_t vertex_count, uint32_t first_vertex = 0) = 0;
-  virtual void draw_indexed(uint32_t index_count, uint32_t first_index = 0, int32_t vertex_offset = 0) = 0;
+  // Several instances (kFeatureInstancing): the draw is made instance_count times with instance numbers first_instance ..; a device without it draws once.
+  virtual void draw(uint32_t vertex_count, uint32_t first_vertex = 0, uint32_t instance_count = 1, uint32_t first_instance = 0) = 0;
+  virtual void draw_indexed(uint32_t index_count, uint32_t first_index = 0, int32_t vertex_offset = 0, uint32_t instance_count = 1, uint32_t first_instance = 0) = 0;
+  // What the vertices of the draws that follow make (kFeatureLines for lines and points; the default is a list of triangles).
+  virtual void set_primitive_topology(PrimitiveTopology topology) = 0;
   virtual void end_render_pass() = 0;
   // False if recording failed (out of memory, or a command used a resource wrongly).
   virtual bool end() = 0;
@@ -296,10 +359,22 @@ class ICommandBuffer {
 
 enum class DeviceKind : uint8_t { Software, VirtualGpu, Gpu };
 
+// What a device does beyond the base interface (DeviceInfo::features); a device without a feature ignores the fields and calls of it, so a user of the interface asks first.
+enum DeviceFeature : uint32_t {
+  kFeatureBlendState = 1u << 0,    // GraphicsPipelineDesc::blend and depth_compare
+  kFeatureTexelAccess = 1u << 1,   // ITextureSet::sample_lod / fetch / size
+  kFeatureSystemInputs = 1u << 2,  // ShaderModuleDesc::vertex_function_ex / fragment_function_ex
+  kFeatureInstancing = 1u << 3,    // draw(..., instance_count, first_instance) and VertexAttribute::per_instance
+  kFeatureLines = 1u << 4,         // set_primitive_topology: lines and points
+};
+
+
 struct DeviceInfo {
   const char* name;
   DeviceKind kind;
   bool accelerated;  // rendering is done by a GPU, not by the CPU
+  uint32_t max_push_constant_bytes = 128;   // what push_constants() may be given (a multiple of 16, up to kMaxPushConstantBytes)
+  uint32_t features = 0;                    // DeviceFeature bits
 };
 
 class IGraphicsDevice {

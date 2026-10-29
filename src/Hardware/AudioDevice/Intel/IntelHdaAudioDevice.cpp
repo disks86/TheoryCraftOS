@@ -50,26 +50,35 @@ constexpr uint32_t kGetParameter = 0xF00, kGetConnectionList = 0xF02, kGetConfig
 constexpr uint32_t kSetConnectionSelect = 0x701, kSetPower = 0x705, kSetChannelStream = 0x706, kSetPinControl = 0x707,
                    kSetEapd = 0x70C;
 constexpr uint32_t kSetFormat = 0x2, kSetAmplifier = 0x3;
+// Digital outputs (HDMI and DisplayPort): the pin's sense, the converter's digital output and channel count, and the codec's buffer for the audio InfoFrame (the DIP buffer)
+constexpr uint32_t kGetPinSense = 0xF09, kSetDigiConvert1 = 0x70D, kSetChannelCount = 0x72D, kSetDipIndex = 0x730, kSetDipData = 0x731, kSetDipXmit = 0x732;
+constexpr uint32_t kSensePresence = 1u << 31, kSenseEldValid = 1u << 30;
+constexpr uint32_t kDigiEnable = 0x01;
+constexpr uint32_t kDipXmitDisable = 0x00, kDipXmitBest = 0xC0;           // not sent / sent every frame
+constexpr uint8_t kAudioInfoframeType = 0x84, kAudioInfoframeVersion = 1, kAudioInfoframeLength = 10;
+constexpr uint32_t kAudioInfoframeBytes = 4 + kAudioInfoframeLength;      // the header, the checksum and the ten data bytes
 
 // Parameters.
 constexpr uint8_t kParamNodeCount = 0x04, kParamFunctionGroupType = 0x05, kParamWidgetCaps = 0x09, kParamPcmRates = 0x0A,
                   kParamPinCaps = 0x0C, kParamInputAmpCaps = 0x0D, kParamConnectionLength = 0x0E, kParamOutputAmpCaps = 0x12;
 constexpr uint32_t kWidgetOutput = 0, kWidgetInput = 1, kWidgetMixer = 2, kWidgetSelector = 3, kWidgetPin = 4;
 constexpr uint32_t kCapsOutputAmp = 1u << 2, kCapsAmpOverride = 1u << 3, kCapsFormatOverride = 1u << 4, kCapsInputAmp = 1u << 1;
-constexpr uint32_t kPinCapsInput = 1u << 5, kPinCapsOutput = 1u << 4, kPinCapsEapd = 1u << 16;
+constexpr uint32_t kPinCapsInput = 1u << 5, kPinCapsOutput = 1u << 4, kPinCapsEapd = 1u << 16, kPinCapsHdmi = 1u << 7, kPinCapsDisplayPort = 1u << 24;
 constexpr uint32_t kPcm48k = 1u << 6, kPcm16bit = 1u << 17;
 
 constexpr uint32_t kRingTimeoutUs = 50000;
+constexpr uint8_t kWantDigital = 0xFE;      // pick_pin's "a digital pin with a display" (the device types are four bits)
 
 uint32_t widget_type(uint32_t caps) { return (caps >> 20) & 0xF; }
 }  // namespace
 
-uint8_t IntelHdaAudioDevice::read8(uint32_t r) const { return *reinterpret_cast<volatile uint8_t*>(registers_ + r); }
-uint16_t IntelHdaAudioDevice::read16(uint32_t r) const { return *reinterpret_cast<volatile uint16_t*>(registers_ + r); }
-uint32_t IntelHdaAudioDevice::read32(uint32_t r) const { return *reinterpret_cast<volatile uint32_t*>(registers_ + r); }
-void IntelHdaAudioDevice::write8(uint32_t r, uint8_t v) const { *reinterpret_cast<volatile uint8_t*>(registers_ + r) = v; }
-void IntelHdaAudioDevice::write16(uint32_t r, uint16_t v) const { *reinterpret_cast<volatile uint16_t*>(registers_ + r) = v; }
-void IntelHdaAudioDevice::write32(uint32_t r, uint32_t v) const { *reinterpret_cast<volatile uint32_t*>(registers_ + r) = v; }
+// The only volatile accesses: the controller's registers are memory-mapped at an address that is valid as it is (the BAR is identity mapped).
+uint8_t PhysicalHdaRegisters::read8(uint32_t r) { return *reinterpret_cast<volatile uint8_t*>(base_ + r); }
+uint16_t PhysicalHdaRegisters::read16(uint32_t r) { return *reinterpret_cast<volatile uint16_t*>(base_ + r); }
+uint32_t PhysicalHdaRegisters::read32(uint32_t r) { return *reinterpret_cast<volatile uint32_t*>(base_ + r); }
+void PhysicalHdaRegisters::write8(uint32_t r, uint8_t v) { *reinterpret_cast<volatile uint8_t*>(base_ + r) = v; }
+void PhysicalHdaRegisters::write16(uint32_t r, uint16_t v) { *reinterpret_cast<volatile uint16_t*>(base_ + r) = v; }
+void PhysicalHdaRegisters::write32(uint32_t r, uint32_t v) { *reinterpret_cast<volatile uint32_t*>(base_ + r) = v; }
 
 // Waits until (register & mask) == value, for up to timeout_us.
 bool IntelHdaAudioDevice::wait_register(uint32_t reg, uint32_t mask, uint32_t value, uint32_t timeout_us) const {
@@ -263,22 +272,48 @@ bool IntelHdaAudioDevice::find_output_path() {
     if (get_parameter(static_cast<uint8_t>(n), kParamWidgetCaps, &caps)) widget_caps_[n] = caps ? caps : 1;  // never 0 for a widget that exists
   }
 
-  // Candidate pins in order of preference: line out, speaker, headphones; then any other output pin.
-  static constexpr uint8_t kPreference[] = {0, 1, 2, 0xFF};
-  for (uint8_t wanted : kPreference) {
-    for (uint32_t n = first; n < first + count && n < 256; ++n) {
-      if (widget_type(widget_caps_[n]) != kWidgetPin) continue;
-      uint32_t pin_caps = 0, config = 0;
-      if (!get_parameter(static_cast<uint8_t>(n), kParamPinCaps, &pin_caps) || !(pin_caps & kPinCapsOutput)) continue;
-      if (!verb(static_cast<uint8_t>(n), (kGetConfigDefault << 8), &config)) continue;
-      if (((config >> 30) & 3) == 1) continue;  // no physical connection
-      if (wanted != 0xFF && ((config >> 20) & 0xF) != wanted) continue;
-      path_length_ = 0;
-      if (!search_converter(static_cast<uint8_t>(n), 0)) continue;
-      pin_has_eapd_ = pin_caps & kPinCapsEapd;
-      pin_control_ = ((config >> 20) & 0xF) == 2 ? 0xC0 : 0x40;  // headphones also need their amplifier enabled
-      return true;
+  // Candidate pins in order of preference: line out, speaker, headphones; then a digital (HDMI or DisplayPort) pin with a display and a valid ELD behind it, then one with a display; then
+  // any other output pin (a digital one without a display: it carries sound when one is connected, see retarget()).
+  static constexpr uint8_t kPreference[] = {0, 1, 2};
+  for (uint8_t wanted : kPreference)
+    if (pick_pin(wanted, 0)) return true;
+  for (int level = 2; level >= 1; --level)
+    if (pick_pin(kWantDigital, level)) return true;
+  return pick_pin(0xFF, 0);
+}
+
+bool IntelHdaAudioDevice::pin_is_digital(uint8_t, uint32_t pin_caps) const { return (pin_caps & (kPinCapsHdmi | kPinCapsDisplayPort)) != 0; }
+
+uint32_t IntelHdaAudioDevice::pin_sense(uint8_t nid) {
+  uint32_t sense = 0;
+  return verb(nid, kGetPinSense << 8, &sense) ? sense : 0;
+}
+
+// One pass over the pins for find_output_path: output pins of the device type `wanted` (kWantDigital: digital pins whose sense has the bits `sense_level` asks for, 0xFF: any), the
+// first that has a converter behind it becomes the path.
+bool IntelHdaAudioDevice::pick_pin(uint8_t wanted, int sense_level) {
+  for (uint32_t n = first_widget_; n < first_widget_ + widget_count_ && n < 256; ++n) {
+    if (widget_type(widget_caps_[n]) != kWidgetPin) continue;
+    uint32_t pin_caps = 0, config = 0;
+    if (!get_parameter(static_cast<uint8_t>(n), kParamPinCaps, &pin_caps) || !(pin_caps & kPinCapsOutput)) continue;
+    if (!verb(static_cast<uint8_t>(n), (kGetConfigDefault << 8), &config)) continue;
+    if (((config >> 30) & 3) == 1) continue;  // no physical connection
+    const bool digital = pin_is_digital(static_cast<uint8_t>(n), pin_caps);
+    uint32_t sense = 0;
+    if (digital) sense = pin_sense(static_cast<uint8_t>(n));
+    if (wanted == kWantDigital) {
+      const uint32_t needed = sense_level >= 2 ? (kSensePresence | kSenseEldValid) : kSensePresence;
+      if (!digital || (sense & needed) != needed) continue;
+    } else if (wanted != 0xFF && ((config >> 20) & 0xF) != wanted) {
+      continue;
     }
+    path_length_ = 0;
+    if (!search_converter(static_cast<uint8_t>(n), 0)) continue;
+    pin_has_eapd_ = pin_caps & kPinCapsEapd;
+    pin_control_ = ((config >> 20) & 0xF) == 2 ? 0xC0 : 0x40;  // headphones also need their amplifier enabled
+    digital_ = digital;
+    display_present_ = digital && (sense & (kSensePresence | kSenseEldValid)) == (kSensePresence | kSenseEldValid);
+    return true;
   }
   return false;
 }
@@ -314,6 +349,11 @@ bool IntelHdaAudioDevice::configure_path() {
 
   verb(pin, (kSetPinControl << 8) | pin_control_, nullptr);
   if (pin_has_eapd_) verb(pin, (kSetEapd << 8) | 0x02, nullptr);
+  if (digital_) {
+    verb(dac, (kSetDigiConvert1 << 8) | kDigiEnable, nullptr);        // the converter's digital output on
+    verb(dac, (kSetChannelCount << 8) | 1, nullptr);                  // two channels (the count minus one)
+    send_audio_infoframe(pin);
+  }
   verb(dac, (kSetChannelStream << 8) | (kStreamTag << 4), nullptr);
   verb(dac, (kSetFormat << 16) | kFormat48k16bitStereo, nullptr);
 
@@ -329,6 +369,43 @@ bool IntelHdaAudioDevice::configure_path() {
       break;
     }
   }
+  return true;
+}
+
+// The audio InfoFrame of two channel PCM (CTA-861: type 0x84, version 1, ten data bytes of which only the channel count - 1 in the first is not zero; everything else "refer to stream
+// header") through the pin's DIP buffer, packet 0, sent every frame.
+void IntelHdaAudioDevice::send_audio_infoframe(uint8_t pin) {
+  uint8_t frame[kAudioInfoframeBytes] = {kAudioInfoframeType, kAudioInfoframeVersion, kAudioInfoframeLength, 0, 0x01};
+  uint8_t sum = 0;
+  for (uint8_t b : frame) sum = static_cast<uint8_t>(sum + b);
+  frame[3] = static_cast<uint8_t>(0 - sum);
+  verb(pin, (kSetDipXmit << 8) | kDipXmitDisable, nullptr);     // not while it is being written
+  verb(pin, (kSetDipIndex << 8) | 0, nullptr);                  // packet 0 (the audio InfoFrame), byte 0; the data verb counts on
+  for (uint8_t b : frame) verb(pin, (kSetDipData << 8) | b, nullptr);
+  verb(pin, (kSetDipXmit << 8) | kDipXmitBest, nullptr);
+}
+
+// The current path switched off: nothing is driven out of the pin and the converter takes no stream (a digital pin also stops sending its InfoFrame and the digital output goes off).
+void IntelHdaAudioDevice::silence_path() {
+  if (path_length_ == 0) return;
+  const uint8_t pin = path_[0].nid, dac = path_[path_length_ - 1].nid;
+  if (digital_) {
+    verb(pin, (kSetDipXmit << 8) | kDipXmitDisable, nullptr);
+    verb(dac, (kSetDigiConvert1 << 8) | 0, nullptr);
+  }
+  verb(pin, (kSetPinControl << 8) | 0, nullptr);
+  verb(dac, (kSetChannelStream << 8) | 0, nullptr);
+}
+
+bool IntelHdaAudioDevice::retarget() {
+  if (!running_ || !regs_) return false;
+  silence_path();
+  path_length_ = 0;
+  digital_ = false;
+  display_present_ = false;
+  if (!find_output_path() || !configure_path()) return false;
+  kernel::ScopedMutex guard(mutex_);
+  apply_volume();
   return true;
 }
 
@@ -366,14 +443,21 @@ bool IntelHdaAudioDevice::run_stream(uint32_t stream, ArrayView<BufferDescriptor
 }
 
 bool IntelHdaAudioDevice::initialize() {
-  if (device_.class_code != 0x04 || device_.subclass != 0x03) return false;
-  registers_ = pci_.memory_bar(device_.address, 0);
-  if (!registers_) return false;
+  if (external_) {
+    regs_ = external_;
+  } else {
+    if (device_.class_code != 0x04 || device_.subclass != 0x03) return false;
+    registers_ = pci_->memory_bar(device_.address, 0);
+    if (!registers_) return false;
+    physical_.set_base(registers_);
+    regs_ = &physical_;
 
-  detach_firmware_drivers(st_, device_.address);
-  owns_device_ = true;
-  const uint32_t command = pci_.read32(device_.address, kPciCommand) & 0xFFFF;
-  pci_.write32(device_.address, kPciCommand, command | (1u << 1) | (1u << 2));  // memory space, bus master
+    detach_firmware_drivers(st_, device_.address);
+    owns_device_ = true;
+    const uint32_t command = pci_->read32(device_.address, kPciCommand) & 0xFFFF;
+    pci_->write32(device_.address, kPciCommand, command | (1u << 1) | (1u << 2));  // memory space, bus master
+  }
+  controller_owned_ = true;
 
   const uint16_t capabilities = read16(kGcap);
   const uint32_t input_streams = (capabilities >> 8) & 0xF, output_streams = (capabilities >> 12) & 0xF;
@@ -410,13 +494,14 @@ bool IntelHdaAudioDevice::initialize() {
 void IntelHdaAudioDevice::shutdown() {
   capture_.stop();
   running_ = false;
-  if (registers_ && owns_device_) {
+  if (regs_ && controller_owned_) {
     write8(stream_ + kSdControl, 0);
     write8(kCorbControl, 0);
     write8(kRirbControl, 0);
     write32(kGctl, 0);  // the controller stops DMA into our memory
     wait_register(kGctl, kGctlReset, 0, 100000);
   }
+  controller_owned_ = false;
   ring_.release(allocator_);
   release_view(allocator_, descriptors_);
   release_view(allocator_, corb_);
@@ -526,7 +611,7 @@ bool IntelHdaAudioDevice::Capture::start() {
 
 void IntelHdaAudioDevice::Capture::stop() {
   IntelHdaAudioDevice& d = owner_;
-  if (owns_stream_ && d.registers_) d.write8(stream_ + kSdControl, 0);
+  if (owns_stream_ && d.regs_) d.write8(stream_ + kSdControl, 0);
   owns_stream_ = false;
   running_ = false;
   ring_.release(d.allocator_);
