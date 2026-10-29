@@ -22,7 +22,7 @@
 // of buffer / image / sampler descriptors and the vertex buffer live in a small flat GPU address space of the harness.
 //
 // Not done: clipping (a triangle with a vertex at w <= 0 is dropped), depth and stencil, blending, flat interpolation, 2x2 quads (nothing here takes derivatives), and the pixel
-// shader's input is the vertex shader's parameter of the same number.
+// shader's input k reads the vertex shader's parameter `ps_param[k]` (SPI_PS_INPUT_CNTL_k.OFFSET; the parameter of the same number by default).
 #pragma once
 
 #include <stdint.h>
@@ -66,6 +66,16 @@ struct VertexAttribute {
   uint32_t offset = 0;          // in the vertex
 };
 
+struct Viewport {
+  bool set = false;                    // false: the whole target, as PA_CL_VPORT_* with the scale half the size
+  float x_scale = 0, x_offset = 0, y_scale = 0, y_offset = 0;       // screen = ndc * scale + offset
+};
+
+struct Scissor {
+  bool set = false;
+  uint32_t left = 0, top = 0, right = 0, bottom = 0;                // pixels [left, right) x [top, bottom)
+};
+
 struct DrawCall {
   ArrayView<const uint32_t> vertex_code, pixel_code;
   ShaderInfo vertex_info, pixel_info;
@@ -75,6 +85,9 @@ struct DrawCall {
   VertexAttribute attributes[abi::kMaxAttributes];                  // attribute i is the vertex shader's IN[i]
   ArrayView<const uint32_t> indices;                                // a triangle list
   ITextureSource* textures = nullptr;
+  Viewport viewport;
+  Scissor scissor;
+  uint8_t ps_param[16] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
 };
 
 enum class DrawStatus : uint8_t { Ok, BadInput, OutOfMemory, ShaderFault };
