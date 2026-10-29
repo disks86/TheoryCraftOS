@@ -357,7 +357,11 @@ static BYTE *rsrc_rewrite(RsrcUpdate *u, const BYTE *f, SIZE_T size, SIZE_T *out
   const DWORD new_span = rsrc_align(blob_size ? blob_size : 1, pe.section_align);
   SIZE_T tail_at, tail_len;
   DWORD new_ptr;
-  if (rs >= 0) {
+  if (rs >= 0 && (old_raw == 0 || old_ptr == 0)) {      /* a section that has nothing in the file: its data goes at the end */
+    new_ptr = rsrc_align((DWORD)size, pe.file_align);
+    tail_at = size;
+    tail_len = 0;
+  } else if (rs >= 0) {
     new_ptr = old_ptr;
     tail_at = (SIZE_T)old_ptr + old_raw;
     tail_len = tail_at < size ? size - tail_at : 0;
@@ -371,7 +375,7 @@ static BYTE *rsrc_rewrite(RsrcUpdate *u, const BYTE *f, SIZE_T size, SIZE_T *out
   if (total > 0x20000000u) { HeapFree(heap(), 0, blob); set_error(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
   BYTE *out = HeapAlloc(heap(), HEAP_ZERO_MEMORY, total);
   if (!out) { HeapFree(heap(), 0, blob); set_error(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
-  memcpy(out, f, rs >= 0 ? old_ptr : size);
+  memcpy(out, f, (rs >= 0 && old_raw && old_ptr) ? old_ptr : size);
   memcpy(out + new_ptr, blob, blob_size);
   if (tail_len) memcpy(out + new_ptr + raw_size, f + tail_at, tail_len);
   HeapFree(heap(), 0, blob);
@@ -585,3 +589,63 @@ EXPORT BOOL WINAPI EndUpdateResourceW(HANDLE h, BOOL discard) {
   return ok;
 }
 EXPORT BOOL WINAPI EndUpdateResourceA(HANDLE h, BOOL discard) { return EndUpdateResourceW(h, discard); }
+
+/* GetFileMUIInfo: what the "MUI" resource (id 1) of a library or its .mui file says. The answer is a FILEMUIINFO (80 bytes) followed by, as asked, the language name, the
+ * resource type ids and names the main file and the .mui file hold (packed one after the other, from offset 72 where abBuffer starts). */
+EXPORT BOOL WINAPI GetFileMUIInfo(DWORD flags, LPCWSTR path, BYTE *info, DWORD *size) {
+  enum { kType = 1, kChecksum = 2, kLanguage = 4, kTypes = 8, kHeader = 132, kInfo = 80 };
+  if (!path || !size || (info && *size < kInfo)) { if (size) *size = 0; set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (info && (*(DWORD *)(info + 4) != 1 || *(DWORD *)info < kInfo)) { *size = 0; set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  HMODULE module = LoadLibraryExW(path, NULL, 0x2 /* LOAD_LIBRARY_AS_DATAFILE */);
+  if (!module) { if (GetLastError() == ERROR_MOD_NOT_FOUND) set_error(ERROR_FILE_NOT_FOUND); return FALSE; }
+  HRSRC r = FindResourceExW(module, L"MUI", (LPCWSTR)(ULONG_PTR)1, 0);
+  const BYTE *res = r ? LockResource(LoadResource(module, r)) : NULL;
+  const DWORD res_size = r ? SizeofResource(module, r) : 0;
+  BOOL ok = TRUE;
+  DWORD error = 0, needed = kInfo;
+  if (res && (res_size < kHeader || *(const DWORD *)res != 0xfecdfecdu)) { ok = FALSE; error = 193; }
+  else if (res && flags) {
+    #define RES32(at) (*(const DWORD *)(res + (at)))
+    /* the pieces, in order: [offset in the resource, bytes] of language, type ids main, names main, ids mui, names mui (offset 0 or size 0: not there) */
+    DWORD piece[5][2];
+    needed = 72;      /* (the strings start where abBuffer does) */
+    piece[0][0] = RES32(116); piece[0][1] = RES32(120);      /* language (else the fallback language) */
+    if (!piece[0][0]) { piece[0][0] = RES32(124); piece[0][1] = RES32(128); }
+    piece[1][0] = RES32(92); piece[1][1] = RES32(96);        /* main type ids */
+    piece[2][0] = RES32(84); piece[2][1] = RES32(88);        /* main type names */
+    piece[3][0] = RES32(108); piece[3][1] = RES32(112);      /* mui type ids */
+    piece[4][0] = RES32(100); piece[4][1] = RES32(104);      /* mui type names */
+    if ((RES32(16) << 1) == 4) {      /* a .mui file: the types it lists are its own */
+      piece[3][0] = piece[1][0]; piece[3][1] = piece[1][1]; piece[4][0] = piece[2][0]; piece[4][1] = piece[2][1];
+      piece[1][1] = piece[2][1] = 0;
+    }
+    if (!(flags & kLanguage)) piece[0][1] = 0;
+    if (!(flags & kTypes)) for (int i = 1; i < 5; ++i) piece[i][1] = 0;
+    DWORD at[5];
+    for (int i = 0; i < 5; ++i) {
+      if (piece[i][1] && (piece[i][0] > res_size || piece[i][1] > res_size - piece[i][0])) { ok = FALSE; error = 193; break; }
+      at[i] = piece[i][1] ? needed : 0;
+      needed += piece[i][1];
+    }
+    if (needed < kInfo) needed = kInfo;
+    if (ok && (!info || *size < needed)) { ok = FALSE; error = ERROR_INSUFFICIENT_BUFFER; }
+    else if (ok) {
+      memset(info + 8, 0, kInfo - 8);
+      if (flags & kType) *(DWORD *)(info + 8) = RES32(16) << 1;
+      if (flags & kChecksum) { memcpy(info + 12, res + 44, 16); memcpy(info + 28, res + 28, 16); }
+      DWORD *out = (DWORD *)(info + 44);      /* language, ids main (size = count), names main, ids mui, names mui */
+      for (int i = 0; i < 5; ++i) if (piece[i][1]) memcpy(info + at[i], res + piece[i][0], piece[i][1]);
+      out[0] = at[0];
+      out[1] = piece[1][1] / 4; out[2] = at[1]; out[3] = at[2];
+      out[4] = piece[3][1] / 4; out[5] = at[3]; out[6] = at[4];
+    }
+    #undef RES32
+  } else if (info) {
+    memset(info + 8, 0, kInfo - 8);
+    *(DWORD *)(info + 8) = res ? 0 : 1 /* MUI_FILETYPE_NOT_LANGUAGE_NEUTRAL */;
+  }
+  FreeLibrary(module);
+  if (!ok) { *size = needed; set_error(error); return FALSE; }
+  *size = needed;
+  return TRUE;
+}
