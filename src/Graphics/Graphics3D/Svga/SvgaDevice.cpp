@@ -429,6 +429,9 @@ bool SvgaDevice::submit(ICommandBuffer* commands) {
         in_pass = true;
         break;
       }
+      case RecordedCommand::Type::SetTopology:
+        if (cmd.topology != PrimitiveTopology::TriangleList) return false;   // (no lines or points here: DeviceInfo::features says so)
+        break;
       case RecordedCommand::Type::EndRenderPass:
         in_pass = false;
         break;

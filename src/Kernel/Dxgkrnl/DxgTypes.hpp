@@ -135,6 +135,7 @@ struct AdapterCaps {
   bool accelerated = false;   // a GPU draws (not the CPU)
   bool stencil = false;       // the devices accept a stencil plane
   bool mipmaps = false;
+  uint32_t features = 0;             // graphics::DeviceFeature bits of the device: blend state and depth comparison, texel access, system values, instancing, lines and points
   bool textures = false;             // sampled images (texture units; max_texture_units says how many pipelines may use)
   bool programmable_vertex = false;  // a vertex shader of any program (as a function, TGSI or Direct3D 9 tokens), not only the device's fixed transform
   bool programmable_pixel = false;   // the same for a pixel shader; false: the device has fixed pixel kernels (see D3d9Devices.cpp) and takes only shaders that are exactly one
@@ -193,6 +194,9 @@ struct PipelineDesc {
   graphics::FrontFace front_face = graphics::FrontFace::CounterClockwise;
   bool depth_test = false, depth_write = false, alpha_blend = false;
   graphics::StencilState stencil;
+  graphics::BlendState blend;                                  // needs the adapter's kFeatureBlendState (caps.features)
+  graphics::CompareOp depth_compare = graphics::CompareOp::LessEqual;   // ... as does any comparison but LessEqual
+  // (the attributes' per_instance flag needs kFeatureInstancing)
 };
 
 // --- Presenting -----------------------------------------------------------------------

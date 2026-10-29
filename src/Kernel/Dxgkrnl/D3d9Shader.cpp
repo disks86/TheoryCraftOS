@@ -69,6 +69,7 @@ struct D3d9Program::State {
   const graphics::Vec4* varyings = nullptr;
   const uint8_t* constants = nullptr;
   const graphics::ITextureSet* textures = nullptr;
+  Q sys[kSysValueCount] = {};
   bool killed = false;
 };
 
@@ -106,6 +107,10 @@ int8_t semantic_slot(uint32_t usage, uint32_t index) {
 }
 
 }  // namespace
+
+uint32_t D3d9Program::required_features() const {
+  return (uses_system_values_ ? graphics::kFeatureSystemInputs : 0u) | (uses_texel_access_ ? graphics::kFeatureTexelAccess : 0u);
+}
 
 bool d3d9_op_writes_register(uint16_t op) {
   const OpInfo* info = find_op(op);
@@ -425,6 +430,7 @@ void D3d9Program::execute(State& s) const {
     Q v = {{0, 0, 0, 0}};
     switch (src.type) {
       case kTemp: v = s.r[src.number]; break;
+      case kSysValue: if (src.number < kSysValueCount) v = s.sys[src.number]; break;
       case kInput:
         if (src.slot >= 0) {
           const graphics::Vec4 a = s.attributes ? s.attributes[src.slot] : s.varyings[src.slot];
@@ -707,6 +713,31 @@ void D3d9Program::execute(State& s) const {
         store(ins.dst, b);
         break;
       }
+      case kTexFetch: case kTexLod: case kTexSize: {
+        b = {{0, 0, 0, 0}};
+        const uint32_t unit = ins.src[1].number;
+        if (s.textures) {
+          graphics::Vec4 t = {0, 0, 0, 0};
+          if (ins.op == kTexFetch) {
+            t = s.textures->fetch(unit, __builtin_bit_cast(int32_t, a.f[0]), __builtin_bit_cast(int32_t, a.f[1]), bits_of(a.f[3]));
+          } else if (ins.op == kTexLod) {
+            const Q lod = fetch(ins.src[2], 0);
+            t = s.textures->sample_lod(unit, a.f[0], a.f[1], lod.f[0]);
+          } else {
+            uint32_t w = 0, h = 0, levels = 0;
+            if (s.textures->size(unit, bits_of(a.f[0]), &w, &h, &levels) && bits_of(a.f[0]) < levels) {
+              const uint32_t mode = ins.control;
+              t = mode == 2 ? graphics::Vec4{from_bits(w), from_bits(h), 0.0f, from_bits(levels)}
+                            : mode == 1 ? graphics::Vec4{1.0f / static_cast<float>(w), 1.0f / static_cast<float>(h), 0.0f, 1.0f / static_cast<float>(levels)}
+                                        : graphics::Vec4{static_cast<float>(w), static_cast<float>(h), 0.0f, static_cast<float>(levels)};
+            }
+          }
+          const float texel[4] = {t.x, t.y, t.z, t.w};
+          b = {{texel[ins.tex_swizzle[0]], texel[ins.tex_swizzle[1]], texel[ins.tex_swizzle[2]], texel[ins.tex_swizzle[3]]}};
+        }
+        store(ins.dst, b);
+        break;
+      }
       case kTexKill: {
         const Q t = fetch(ins.src[0], 0);
         if (t.f[0] < 0 || t.f[1] < 0 || t.f[2] < 0) {
@@ -721,20 +752,32 @@ void D3d9Program::execute(State& s) const {
   }
 }
 
-void D3d9Program::run_vertex(const graphics::Vec4* attributes, const uint8_t* constants, graphics::ShaderIo* out) const {
+void D3d9Program::run_vertex(const graphics::Vec4* attributes, const uint8_t* constants, graphics::ShaderIo* out) const { run_vertex_ex(attributes, constants, graphics::VertexContext(), out); }
+
+void D3d9Program::run_vertex_ex(const graphics::Vec4* attributes, const uint8_t* constants, const graphics::VertexContext& context, graphics::ShaderIo* out) const {
   State s = {};
   s.attributes = attributes;
   s.constants = constants;
+  s.sys[kSysVertexId].f[0] = from_bits(context.vertex_id);
+  s.sys[kSysInstanceId].f[0] = from_bits(context.instance_id);
   execute(s);
   out->position = {s.pos.f[0], -s.pos.f[1], s.pos.f[2], s.pos.f[3]};   // (Direct3D's +Y up to the device's +Y down)
   for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) out->varying[i] = {s.var[i].f[0], s.var[i].f[1], s.var[i].f[2], s.var[i].f[3]};
 }
 
 bool D3d9Program::run_fragment(const graphics::Vec4* varyings, const uint8_t* constants, const graphics::ITextureSet* textures, graphics::Vec4* color) const {
+  return run_fragment_ex(varyings, graphics::FragmentContext(), constants, textures, color);
+}
+
+bool D3d9Program::run_fragment_ex(const graphics::Vec4* varyings, const graphics::FragmentContext& context, const uint8_t* constants, const graphics::ITextureSet* textures,
+                                  graphics::Vec4* color) const {
   State s = {};
   s.varyings = varyings;
   s.constants = constants;
   s.textures = textures;
+  s.sys[kSysPosition] = {{context.position.x, context.position.y, context.position.z, context.position.w}};
+  s.sys[kSysFrontFacing].f[0] = from_bits(context.front_facing ? 0xFFFFFFFFu : 0u);
+  s.sys[kSysPrimitiveId].f[0] = from_bits(context.primitive_id);
   execute(s);
   if (s.killed) return false;
   *color = {s.color.f[0], s.color.f[1], s.color.f[2], s.color.f[3]};
@@ -749,6 +792,8 @@ constexpr uint32_t kSlots = 32;
 const D3d9Program* g_vertex[kSlots];
 const D3d9Program* g_fragment[kSlots];
 const D3d9Program* g_textured[kSlots];
+const D3d9Program* g_vertex_ex[kSlots];
+const D3d9Program* g_fragment_ex[kSlots];
 
 template <uint32_t N>
 void vertex_trampoline(const graphics::Vec4* attributes, const uint8_t* constants, graphics::ShaderIo* out) {
@@ -763,8 +808,19 @@ bool textured_trampoline(const graphics::Vec4* varyings, const uint8_t* constant
   return g_textured[N]->run_fragment(varyings, constants, &textures, color);
 }
 
+template <uint32_t N>
+void vertex_ex_trampoline(const graphics::Vec4* attributes, const uint8_t* constants, const graphics::VertexContext& context, graphics::ShaderIo* out) {
+  g_vertex_ex[N]->run_vertex_ex(attributes, constants, context, out);
+}
+template <uint32_t N>
+bool fragment_ex_trampoline(const graphics::Vec4* varyings, const graphics::FragmentContext& context, const uint8_t* constants, const graphics::ITextureSet& textures, graphics::Vec4* color) {
+  return g_fragment_ex[N]->run_fragment_ex(varyings, context, constants, &textures, color);
+}
+
 template <uint32_t... I>
 struct Trampolines {
+  static constexpr graphics::VertexShaderFnEx vertex_ex[sizeof...(I)] = {&vertex_ex_trampoline<I>...};
+  static constexpr graphics::FragmentShaderFnEx fragment_ex[sizeof...(I)] = {&fragment_ex_trampoline<I>...};
   static constexpr graphics::VertexShaderFn vertex[sizeof...(I)] = {&vertex_trampoline<I>...};
   static constexpr graphics::FragmentShaderFn fragment[sizeof...(I)] = {&fragment_trampoline<I>...};
   static constexpr graphics::TexturedFragmentShaderFn textured[sizeof...(I)] = {&textured_trampoline<I>...};
@@ -791,6 +847,18 @@ NtStatus D3d9Binding::bind(UniquePointer<D3d9Program> program, graphics::ShaderM
   if (kind_ == 0) desc->vertex_function = decltype(kTrampolines)::vertex[slot];
   else if (kind_ == 1) desc->fragment_function = decltype(kTrampolines)::fragment[slot];
   else desc->textured_fragment_function = decltype(kTrampolines)::textured[slot];
+  if (program->uses_system_values() || program->required_features()) {
+    // (a second function for the devices that pass system values and answer texel access)
+    const D3d9Program** table_ex = kind_ == 0 ? g_vertex_ex : g_fragment_ex;
+    uint32_t slot_ex = 0;
+    while (slot_ex < kSlots && table_ex[slot_ex]) ++slot_ex;
+    if (slot_ex < kSlots) {
+      table_ex[slot_ex] = program.get();
+      slot_ex_ = static_cast<int32_t>(slot_ex);
+      if (kind_ == 0) desc->vertex_function_ex = decltype(kTrampolines)::vertex_ex[slot_ex];
+      else desc->fragment_function_ex = decltype(kTrampolines)::fragment_ex[slot_ex];
+    }
+  }
   program_ = util::move(program);
   return status::kSuccess;
 }
@@ -800,6 +868,10 @@ void D3d9Binding::release() {
     const D3d9Program** table = kind_ == 0 ? g_vertex : kind_ == 1 ? g_fragment : g_textured;
     table[slot_] = nullptr;
     slot_ = -1;
+  }
+  if (slot_ex_ >= 0) {
+    (kind_ == 0 ? g_vertex_ex : g_fragment_ex)[slot_ex_] = nullptr;
+    slot_ex_ = -1;
   }
   program_.reset();
 }

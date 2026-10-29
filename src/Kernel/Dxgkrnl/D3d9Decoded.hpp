@@ -39,10 +39,15 @@ enum Opcode : uint16_t {
   kIAdd = 0x1100, kINeg, kIMul, kIMad, kIMin, kIMax, kUMin, kUMax, kUMul, kUMad, kUDiv, kURem, kIShl, kIShr, kUShr, kAnd, kOr, kXor, kNot, kFtoI, kFtoU, kItoF, kUtoF, kIEq, kINe, kILt, kIGe, kULt, kUGe,
   kIntegerFirst = kIAdd, kIntegerLast = kUGe,
   // Loops (Shader Model 4): `target` of a loop is the instruction after its endloop, of an endloop the one after its loop; break leaves, continue goes to the endloop.
+  // Texture access of Shader Model 4: ld (src[0] the integer coordinates, x y in the first two components and the level in the last; src[1] the unit), sample_l (src[0] the
+  // coordinate, src[1] the unit, src[2] the level), resinfo (src[0] the level, src[1] the unit; control: 0 floats, 1 reciprocals, 2 unsigned integers).
+  kTexFetch = 0x1300, kTexLod, kTexSize,
   kLoopBegin = 0x1200, kLoopEnd, kBreak0, kBreakNz, kBreakZ, kContinue0, kContinueNz, kContinueZ,
 };
 
-enum RegType : uint8_t { kTemp = 0, kInput = 1, kConst = 2, kAddrTex = 3, kRastOut = 4, kAttrOut = 5, kTexCrdOut = 6, kColorOut = 8, kDepthOut = 9, kSampler = 10, kConstBool = 14 };
+enum RegType : uint8_t { kTemp = 0, kInput = 1, kConst = 2, kAddrTex = 3, kRastOut = 4, kAttrOut = 5, kTexCrdOut = 6, kColorOut = 8, kDepthOut = 9, kSampler = 10, kConstBool = 14,
+               kSysValue = 20 /* (not in a token stream: a Shader Model 4 system value; number: kSysPosition ...) */ };
+enum SysValue : uint8_t { kSysPosition = 0, kSysFrontFacing, kSysPrimitiveId, kSysVertexId, kSysInstanceId, kSysValueCount };
 enum Usage : uint8_t { kUsagePosition = 0, kUsageTexCoord = 5, kUsageColor = 10 };
 enum Modifier : uint8_t { kModNone, kModNeg, kModBias, kModBiasNeg, kModSign, kModSignNeg, kModComp, kModX2, kModX2Neg, kModDz, kModDw, kModAbs, kModAbsNeg, kModNot };
 
