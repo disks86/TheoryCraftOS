@@ -300,12 +300,12 @@ static void test_duplicate_and_close() {
     uint64_t ev = 0;
     CHECK(p.make_event("Dup", true, true, &ev) == 0);
     // NtDuplicateObject(-1, handle, -1, &target, 0, 0, options): the options are the seventh argument (on the stack)
-    CHECK(p.call(WindowsSyscallNumber::NtDuplicateObject, ~uint64_t{0}, ev, ~uint64_t{0}, kBase + 0x120, 0, 0, 0) == 0);
+    CHECK(p.call(WindowsSyscallNumber::NtDuplicateObject, ~uint64_t{0}, ev, ~uint64_t{0}, kBase + 0x120, 0, 0, 2) == 0);      // (DUPLICATE_SAME_ACCESS: with no access asked for, a copy could not be waited for)
     const uint64_t copy = p.memory.get64(kBase + 0x120);
     CHECK(copy != 0 && copy != ev && p.wait(copy, 0) == 0);
     CHECK(p.call(WindowsSyscallNumber::NtClose, ev) == 0);
     CHECK(p.wait(copy, 0) == 0);      // the copy keeps the object
-    CHECK(p.call(WindowsSyscallNumber::NtDuplicateObject, ~uint64_t{0}, copy, ~uint64_t{0}, kBase + 0x120, 0, 0, 1) == 0);      // close the source
+    CHECK(p.call(WindowsSyscallNumber::NtDuplicateObject, ~uint64_t{0}, copy, ~uint64_t{0}, kBase + 0x120, 0, 0, 3) == 0);      // close the source
     CHECK(p.wait(copy, 0) == 0xC0000008u);
     CHECK(p.wait(p.memory.get64(kBase + 0x120), 0) == 0);
     CHECK(p.call(WindowsSyscallNumber::NtDuplicateObject, 0x1234, copy, ~uint64_t{0}, kBase + 0x120, 0, 0, 0) == 0xC0000002u);      // another process
