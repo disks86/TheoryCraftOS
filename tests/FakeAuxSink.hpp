@@ -21,6 +21,7 @@
 // requests, a check that they are well formed, and a script of replies that go wrong.
 #pragma once
 #include <stdint.h>
+#include <functional>
 #include <vector>
 #include "Hardware/VideoCodec/AMD/AmdVcn1.hpp"
 
@@ -41,6 +42,7 @@ struct FakeAuxSink {
   std::vector<Request> requests;
   struct DpcdWrite { uint32_t address; std::vector<uint8_t> bytes; };
   std::vector<DpcdWrite> dpcd_writes;      // the native writes the sink took, in order
+  std::function<void(uint32_t address, const std::vector<uint8_t>& bytes)> after_write;      // called after each native write has taken effect (a sink that reacts to what it is told)
   // the sink
   std::vector<uint8_t> edid, dpcd;
   bool monitor_present = true;
@@ -119,6 +121,7 @@ struct FakeAuxSink {
         if (address + i == 0x201) dpcd[address + i] &= static_cast<uint8_t>(~req.bytes[4 + i]);       // the service interrupt bits clear when a 1 is written to them
         else dpcd[address + i] = req.bytes[4 + i];
       }
+      if (after_write) after_write(address, written);
       return finish(native_odd_reply ? 0x30 : native_reply_extra);
     } else {
       const bool mot = command & 4, read = is_read;
