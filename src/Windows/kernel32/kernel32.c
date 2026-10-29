@@ -3128,6 +3128,10 @@ EXPORT UINT WINAPI GetTempFileNameW(LPCWSTR dir, LPCWSTR prefix, UINT unique, LP
   WCHAR full[PATH_CHARS];
   const DWORD n = full_path_w(dir, full, PATH_CHARS - 24);
   if (n == 0) return 0;
+  {      /* the folder has to be there */
+    const DWORD attributes = GetFileAttributesW(full);
+    if (attributes == INVALID_FILE_ATTRIBUTES || !(attributes & FILE_ATTRIBUTE_DIRECTORY)) { set_error(ERROR_DIRECTORY); return 0; }
+  }
   for (UINT attempt = 0; attempt < 0x10000; ++attempt) {
     const UINT id = unique ? unique : (GetTickCount() + ++counter) & 0xFFFF;
     DWORD length = n;
@@ -3138,13 +3142,14 @@ EXPORT UINT WINAPI GetTempFileNameW(LPCWSTR dir, LPCWSTR prefix, UINT unique, LP
     if (unique) { memcpy(result, full, (length + 1) * 2); return unique; }
     HANDLE h = CreateFileW(full, GENERIC_WRITE, 0, NULL, CREATE_NEW, 0, NULL);
     if (h != INVALID_HANDLE_VALUE) { CloseHandle(h); memcpy(result, full, (length + 1) * 2); return id; }
+    if (GetLastError() != ERROR_FILE_EXISTS && GetLastError() != ERROR_ALREADY_EXISTS) return 0;      /* (only a name that is taken is tried again) */
   }
   return 0;
 }
 EXPORT UINT WINAPI GetTempFileNameA(LPCSTR dir, LPCSTR prefix, UINT unique, LPSTR result) {
-  WCHAR *d = to_wide(dir), *p = to_wide(prefix);
+  WCHAR *d = to_wide(dir), *p = prefix ? to_wide(prefix) : NULL;
   WCHAR wide[PATH_CHARS];
-  const UINT id = d && p ? GetTempFileNameW(d, p, unique, wide) : 0;
+  const UINT id = d && (p || !prefix) ? GetTempFileNameW(d, p, unique, wide) : 0;
   free_wide(d);
   free_wide(p);
   if (!id) return 0;
