@@ -3079,9 +3079,9 @@ static void test_back_end_on_card() {
 
   const uint64_t staging_bytes = AmdVegaDraw::area_bytes(req);
   uint8_t* staging = pool.memory.data() + 4096;
-  uint8_t* pixels = pool.memory.data() + (1u << 20);
-  uint8_t* depth = pool.memory.data() + (2u << 20);
-  uint8_t* stencil = pool.memory.data() + (3u << 20);
+  uint8_t* pixels = pool.memory.data() + (3u << 20);
+  uint8_t* depth = pool.memory.data() + (5u << 20);
+  uint8_t* stencil = pool.memory.data() + (6u << 20);
   CHECK(staging_bytes > 0 && AmdVegaDraw::target_bytes(req) == 40ull * 32 * 16 && AmdVegaDraw::depth_bytes(req) == 40ull * 32 * 4 && AmdVegaDraw::stencil_bytes(req) == 40ull * 32);
   const bool ok = AmdVegaDraw::draw(vega, req, 4096, ByteView(staging, staging_bytes), ByteView(pixels, AmdVegaDraw::target_bytes(req)), ByteView(depth, AmdVegaDraw::depth_bytes(req)),
                                     ByteView(stencil, AmdVegaDraw::stencil_bytes(req)));
@@ -3108,13 +3108,48 @@ static void test_back_end_on_card() {
       (inside ? wrong : padding_wrong) += bad;
     }
   CHECK(wrong == 0 && padding_wrong == 0);
+  // the same scene with everything 2D tiled: the colour buffer (entry 10), the depth plane (entry 2, 256 byte split) and the stencil plane (entry 0, 64 byte split); the area must start at
+  // the alignment those layouts want
+  {
+    VegaDrawRequest t2 = req;
+    t2.target_tile_index = 10;
+    t2.depth_tile_index = 2;
+    t2.stencil_tile_index = 0;
+    const uint64_t align = AmdVegaDraw::area_alignment(t2);
+    CHECK(align >= 262144 && (align & (align - 1)) == 0);
+    CHECK(AmdVegaDraw::target_pitch(t2) == 128 && AmdVegaDraw::plane_pitch(t2) == 256);
+    const uint64_t offset = align;                                                    // (a multiple of it)
+    const bool ok2 = AmdVegaDraw::draw(vega, t2, offset, ByteView(staging, AmdVegaDraw::area_bytes(t2)), ByteView(pixels, AmdVegaDraw::target_bytes(t2)), ByteView(depth, AmdVegaDraw::depth_bytes(t2)),
+                                       ByteView(stencil, AmdVegaDraw::stencil_bytes(t2)));
+    if (!ok2) printf("  2D draw failed (model: %s)\n", gcn::CommandProcessorModel::result_name(last));
+    CHECK(ok2);
+    CHECK(!AmdVegaDraw::draw(vega, t2, offset + 256, ByteView(staging, AmdVegaDraw::area_bytes(t2)), ByteView(pixels, AmdVegaDraw::target_bytes(t2))));      // not at the alignment
+    uint32_t wrong2 = 0, pad2 = 0;
+    for (uint32_t y = 0; y < 29; ++y)
+      for (uint32_t x = 0; x < 40; ++x) {
+        const bool inside = x < 37;
+        const float want[4] = {inside ? 0.25f : 0.0f, inside ? 0.5f : 0.0f, inside ? 0.25f : 1.0f, inside ? 0.625f : 1.0f};
+        uint32_t bad = 0;
+        for (uint32_t k = 0; k < 4; ++k) {
+          float got;
+          memcpy(&got, pixels + AmdVegaDraw::pixel_offset(t2, x, y) + 4 * k, 4);
+          if (got != want[k]) ++bad;
+        }
+        float z;
+        memcpy(&z, depth + AmdVegaDraw::depth_offset(t2, x, y), 4);
+        if (z != (inside ? 0.25f : 1.0f)) ++bad;
+        if (stencil[AmdVegaDraw::stencil_offset(t2, x, y)] != (inside ? 2 : 0)) ++bad;
+        (inside ? wrong2 : pad2) += bad;
+      }
+    CHECK(wrong2 == 0 && pad2 == 0);
+  }
   // the pixels of the tiled buffer are not where a linear buffer would have them (it is the tiled layout that came back)
   CHECK(AmdVegaDraw::pixel_offset(req, 1, 0) == 32 && AmdVegaDraw::pixel_offset(req, 2, 0) == 64 && AmdVegaDraw::pixel_offset(req, 0, 1) == 16 && AmdVegaDraw::pixel_offset(req, 8, 0) == 64 * 16);   // (128 bit display order: y0 x0 x1 x2 y1 y2)
   // the same draw into a linear buffer without the tests: the near layer blended over the far one over the clear, as the emulator gives directly
   VegaDrawRequest plain = req;
   plain.target_tile_index = 8;
   plain.depth_stencil = gcn::DepthStencilState();
-  CHECK(AmdVegaDraw::draw(vega, plain, 4096, ByteView(staging, AmdVegaDraw::area_bytes(plain)), ByteView(pixels, AmdVegaDraw::target_bytes(plain))) && draws == 2);
+  CHECK(AmdVegaDraw::draw(vega, plain, 4096, ByteView(staging, AmdVegaDraw::area_bytes(plain)), ByteView(pixels, AmdVegaDraw::target_bytes(plain))) && draws == 3);
   gcn::Framebuffer fb(rig.alloc, plain.width, plain.height);
   fb.clear(0, 0, 1, 1);
   gcn::DrawCall c;
@@ -3175,9 +3210,9 @@ static void test_back_end_on_card() {
   VegaDrawRequest bad = tex;
   bad.textures[0].texels = ConstByteView(texels, 12);
   CHECK(AmdVegaDraw::area_bytes(bad) == 0);
-  bad = tex; bad.textures[0].tile_index = 10;
+  bad = tex; bad.textures[0].tile_index = 11;
   CHECK(AmdVegaDraw::area_bytes(bad) == 0);
-  bad = tex; bad.target_tile_index = 10;
+  bad = tex; bad.target_tile_index = 11;
   CHECK(AmdVegaDraw::area_bytes(bad) == 0);
   CHECK(draws == calls);
   vega.shutdown();

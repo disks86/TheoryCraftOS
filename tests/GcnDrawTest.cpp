@@ -553,6 +553,69 @@ static void test_descriptor_textures(Fixture& f) {
   CHECK(draw(f.alloc, badS, fb) == DrawStatus::ShaderFault);
 }
 
+// Two sided stencil (which faces are front depends on the winding and on front_clockwise) and the depth bounds test
+static void test_faces_and_bounds(Fixture& f) {
+  const float red[4] = {1, 0, 0, 1};
+  Framebuffer fb(f.alloc, 16, 16);
+  DepthBuffer db(f.alloc, 16, 16);
+  // the triangle (-1,-1) (3,-1) (-1,3) is counter clockwise on the screen; with the vertices swapped it is clockwise
+  Layers l(0.0f, red, 0.0f, red);
+  const uint32_t ccw[3] = {0, 1, 2}, cw[3] = {0, 2, 1};
+  auto run = [&](const uint32_t* idx, bool front_clockwise) {
+    fb.clear(0, 0, 0, 1);
+    db.clear(1.0f, 10);
+    DrawCall c = make_call(f, f.fs, kIdentity, as_words(l.v), 42, 28, 4, idx, 3);
+    c.depth = &db;
+    c.depth_stencil.stencil_test = true;
+    c.depth_stencil.zpass_op = 5;                       // front: add one
+    c.depth_stencil.stencil_op_value = 1;
+    c.depth_stencil.two_sided = true;
+    c.depth_stencil.front_clockwise = front_clockwise;
+    c.depth_stencil.back.zpass_op = 1;                  // back: zero
+    c.depth_stencil.back.func = 7;
+    CHECK(draw(f.alloc, c, fb) == DrawStatus::Ok);
+    return db.stencil(8, 8);
+  };
+  CHECK(run(ccw, false) == 11 && run(ccw, true) == 0 && run(cw, false) == 0 && run(cw, true) == 11);
+  // the back face has its own compare, reference and mask
+  {
+    fb.clear(0, 0, 0, 1);
+    db.clear(1.0f, 0x15);
+    DrawCall c = make_call(f, f.fs, kIdentity, as_words(l.v), 42, 28, 4, cw, 3);
+    c.depth = &db;
+    c.depth_stencil.stencil_test = true;
+    c.depth_stencil.stencil_func = 0;                   // the front never passes
+    c.depth_stencil.two_sided = true;
+    c.depth_stencil.back.func = 2;                      // the back: equal to 5 under the mask 0x0F
+    c.depth_stencil.back.ref = 0x05;
+    c.depth_stencil.back.mask = 0x0F;
+    c.depth_stencil.back.zpass_op = 2;
+    CHECK(draw(f.alloc, c, fb) == DrawStatus::Ok && is_color(fb, 8, 8, 1, 0, 0, 1) && db.stencil(8, 8) == 0xFF);
+  }
+  // depth bounds: the stored depth 0.5 is inside [0.4, 0.6] and outside [0, 0.4]; a pixel outside keeps its colour and its stencil
+  for (int inside = 0; inside < 2; ++inside) {
+    fb.clear(0, 0, 0, 1);
+    db.clear(0.5f, 3);
+    DrawCall c = make_call(f, f.fs, kIdentity, as_words(l.v), 42, 28, 4, ccw, 3);
+    c.depth = &db;
+    c.depth_stencil.depth_bounds = true;
+    c.depth_stencil.bounds_min = inside ? 0.4f : 0.0f;
+    c.depth_stencil.bounds_max = inside ? 0.6f : 0.4f;
+    c.depth_stencil.stencil_test = true;
+    c.depth_stencil.zpass_op = 5;
+    CHECK(draw(f.alloc, c, fb) == DrawStatus::Ok);
+    CHECK(inside ? (is_color(fb, 8, 8, 1, 0, 0, 1) && db.stencil(8, 8) == 4) : (is_color(fb, 8, 8, 0, 0, 0, 1) && db.stencil(8, 8) == 3));
+  }
+  // bounds need the plane
+  DrawCall c = make_call(f, f.fs, kIdentity, as_words(l.v), 42, 28, 4, ccw, 3);
+  c.depth_stencil.depth_bounds = true;
+  CHECK(draw(f.alloc, c, fb) == DrawStatus::BadInput);
+  DepthBuffer ok(f.alloc, 16, 16);
+  c.depth = &ok;
+  c.depth_stencil.bounds_min = NAN;
+  CHECK(draw(f.alloc, c, fb) == DrawStatus::BadInput);
+}
+
 int main() {
   Fixture f;
   if (!f.vs.ok || !f.fs.ok || !f.tfs.ok || !f.kfs.ok) { printf("FAILED: the shaders did not compile\n"); return 1; }
@@ -566,6 +629,7 @@ int main() {
   test_depth(f);
   test_stencil(f);
   test_descriptor_textures(f);
+  test_faces_and_bounds(f);
   printf(g_failed ? "GcnDrawTest: %d FAILED\n" : "GcnDrawTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }

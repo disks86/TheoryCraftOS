@@ -25,6 +25,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <vector>
 #include "Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnTexture.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnTiling.hpp"
 
@@ -36,18 +37,18 @@ static int g_failed = 0;
 // a flat block of memory at a base address
 struct Block final : ITexelMemory {
   uint64_t base = 0x40000;
-  uint32_t words[4096] = {};
+  std::vector<uint32_t> words = std::vector<uint32_t>(1 << 17);
   uint32_t reads = 0;
   bool read32(uint64_t address, uint32_t* out) override {
-    if (address < base || (address & 3) != 0 || (address - base) / 4 >= 4096) return false;
+    if (address < base || (address & 3) != 0 || (address - base) / 4 >= words.size()) return false;
     ++reads;
     *out = words[(address - base) / 4];
     return true;
   }
-  void put(const TileLayout& l, TexelFormat f, uint32_t pitch, uint32_t x, uint32_t y, const uint8_t* texel) {
+  void put(const TileLayout& l, TexelFormat f, uint32_t pitch, uint32_t x, uint32_t y, const uint8_t* texel, uint32_t height = 0) {
     const uint32_t bytes = texel_bytes(f);
-    const uint64_t off = surface_offset(l, bytes, pitch, x, y);
-    for (uint32_t k = 0; k < bytes; ++k) reinterpret_cast<uint8_t*>(words)[off + k] = texel[k];
+    const uint64_t off = surface_offset(l, bytes, pitch, x, y, height);
+    for (uint32_t k = 0; k < bytes; ++k) reinterpret_cast<uint8_t*>(words.data())[off + k] = texel[k];
   }
 };
 
@@ -73,7 +74,7 @@ static void test_layouts() {
           if (slot / 64 != tile) ok = false;
         }
       CHECK(ok);
-      CHECK(surface_bytes(bytes, pitch, height) == 24ull * 16 * bytes);
+      CHECK(surface_bytes(l, bytes, pitch, height) == 24ull * 16 * bytes);
     }
   // the 32 bit display order is x0 x1 y0 x2 y1 y2
   TileLayout d;
@@ -93,7 +94,81 @@ static void test_layouts() {
   CHECK(resolve_tile_index(8, &r) && r.kind == TileLayout::Kind::Linear);
   CHECK(resolve_tile_index(9, &r) && r.kind == TileLayout::Kind::Tiled1D && r.micro == TileLayout::Micro::Display);
   CHECK(resolve_tile_index(13, &r) && r.kind == TileLayout::Kind::Tiled1D && r.micro == TileLayout::Micro::Thin);
-  CHECK(!resolve_tile_index(0, &r) && !resolve_tile_index(10, &r) && !resolve_tile_index(31, &r) && !resolve_tile_index(40, &r));
+  CHECK(resolve_tile_index(10, &r) && r.kind == TileLayout::Kind::Tiled2D && r.micro == TileLayout::Micro::Display);       // 2D tiled, display
+  CHECK(resolve_tile_index(2, &r) && r.kind == TileLayout::Kind::Tiled2D && r.micro == TileLayout::Micro::Depth);          // 2D tiled, depth
+  CHECK(!resolve_tile_index(18, &r) && !resolve_tile_index(31, &r) && !resolve_tile_index(40, &r));                        // 1D thick, the unused entry, beyond the table
+}
+
+static uint64_t align_to(uint64_t v, uint64_t a) { return (v + a - 1) / a * a; }
+
+// 2D tiled layouts: the alignments the tile mode table gives, every pixel of the padded surface in its own place, and the offsets inside a macro tile
+static void test_2d_layouts() {
+  TileLayout l;
+  CHECK(resolve_tile_index(10, &l));
+  // entry 10 (2D, display, P16_32x32_16x16): 16 byte pixels fill a 1 KB micro tile, macro tile mode 4 (bank width 1, height 2, aspect 1, 8 banks): 8 * 1 * 16 * 1 pixels wide, 8 * 2 * 8 high;
+  // 4 byte pixels a 256 byte tile, macro tile mode 2 (width 1, height 4, aspect 2, 8 banks): 256 by 128
+  CHECK(surface_pitch_align(l, 16) == 128 && surface_height_align(l, 16) == 128);
+  CHECK(surface_pitch_align(l, 4) == 256 && surface_height_align(l, 4) == 128);
+  CHECK(surface_base_align(l, 4) == 16ull * 1 * 8 * 4 * 256);
+  CHECK(surface_valid(l, 4, 256) && !surface_valid(l, 4, 128) && !surface_valid(l, 4, 264));
+  const uint32_t entries[] = {0, 1, 2, 3, 10, 14};          // (11 and 16 are PRT modes: refused)
+  const uint32_t sizes[] = {1, 4, 8, 16};
+  for (const uint32_t entry : entries)
+    for (const uint32_t bytes : sizes) {
+      TileLayout t;
+      if (!resolve_tile_index(entry, &t) || t.kind != TileLayout::Kind::Tiled2D) { CHECK(false); continue; }
+      const uint32_t pitch = surface_pitch_align(t, bytes) * 2, height = surface_height_align(t, bytes) * 2;
+      const uint64_t total = surface_bytes(t, bytes, pitch, height);
+      CHECK(total == static_cast<uint64_t>(pitch) * height * bytes);
+      std::vector<uint8_t> seen(total / bytes);
+      uint32_t bad = 0;
+      for (uint32_t y = 0; y < height; ++y)
+        for (uint32_t x = 0; x < pitch; ++x) {
+          const uint64_t off = surface_offset(t, bytes, pitch, x, y, height);
+          if (off % bytes != 0 || off / bytes >= seen.size() || seen[off / bytes]) { ++bad; continue; }
+          seen[off / bytes] = 1;
+        }
+      CHECK(bad == 0);
+    }
+  // the 64 pixels of a micro tile are consecutive bytes' worth (a micro tile of the 4 byte layout is 256 bytes in one place)
+  TileLayout d;
+  resolve_tile_index(10, &d);
+  uint64_t lo = ~0ull, hi = 0;
+  for (uint32_t y = 0; y < 8; ++y)
+    for (uint32_t x = 0; x < 8; ++x) {
+      const uint64_t off = surface_offset(d, 4, 256, x, y, 128);
+      if (off < lo) lo = off;
+      if (off > hi) hi = off;
+    }
+  CHECK(hi - lo == 252 && lo % 256 == 0);
+}
+
+// The vectors computed by AMD's address library (scripts/gen_tiling_vectors.cpp), when the file is there
+static void test_reference_vectors() {
+  FILE* f = fopen("tests/data/gcn_tiling_vectors.txt", "r");
+  if (!f) { printf("  (no reference vectors: tests/data/gcn_tiling_vectors.txt)\n"); return; }
+  char line[256];
+  uint32_t infos = 0, addrs = 0, wrong = 0;
+  while (fgets(line, sizeof line, f)) {
+    unsigned idx, bpp, w, h, a, b;
+    unsigned long long c, d;
+    TileLayout t;
+    if (sscanf(line, "info %u %u %u %u %u %u %llu %llu", &idx, &bpp, &w, &h, &a, &b, &c, &d) == 8) {
+      ++infos;
+      const uint32_t bytes = bpp / 8;
+      if (!resolve_tile_index(idx, &t) || align_to(w, surface_pitch_align(t, bytes)) != a || align_to(h, surface_height_align(t, bytes)) != b ||
+          surface_bytes(t, bytes, a, h) != c || surface_base_align(t, bytes) != d)
+        ++wrong;
+    } else if (sscanf(line, "addr %u %u %u %u %u %u %llu", &idx, &bpp, &w, &h, &a, &b, &c) == 7) {
+      ++addrs;
+      const uint32_t bytes = bpp / 8;
+      if (!resolve_tile_index(idx, &t)) { ++wrong; continue; }
+      const uint32_t pitch = static_cast<uint32_t>(align_to(w, surface_pitch_align(t, bytes)));
+      if (surface_offset(t, bytes, pitch, a, b, h) != c) ++wrong;
+    }
+  }
+  fclose(f);
+  CHECK(infos > 0 && addrs > 0 && wrong == 0);
 }
 
 static void test_descriptors() {
@@ -278,6 +353,34 @@ static void test_formats_and_tiling() {
       if (sa != SampleStatus::Ok || sc != SampleStatus::Ok || memcmp(a, c, sizeof a) != 0) ++mismatches;
     }
   CHECK(samples > 200 && mismatches == 0);
+  // and 2D tiled (entry 10: the pitch is 256 pixels for 4 byte texels, the rows 128)
+  {
+    TileLayout t2;
+    CHECK(resolve_tile_index(10, &t2));
+    Block t2b;
+    const uint32_t P2 = 256;
+    for (uint32_t y = 0; y < H; ++y)
+      for (uint32_t x = 0; x < W; ++x) {
+        const uint8_t t[4] = {static_cast<uint8_t>(x * 20), static_cast<uint8_t>(y * 19), static_cast<uint8_t>(x ^ y), 200};
+        t2b.put(t2, TexelFormat::Rgba8Unorm, P2, x, y, t, H);
+      }
+    uint32_t bad2 = 0, n2 = 0;
+    for (float v = -0.3f; v < 1.3f; v += 0.0937f)
+      for (float u = -0.3f; u < 1.3f; u += 0.0711f) {
+        float a[4], c[4];
+        const SampleStatus sa = run(lb, desc(lb, W, H, P, TexelFormat::Rgba8Unorm, 8), bi, u, v, a);
+        const SampleStatus sc = run(t2b, desc(t2b, W, H, P2, TexelFormat::Rgba8Unorm, 10), bi, u, v, c);
+        ++n2;
+        if (sa != SampleStatus::Ok || sc != SampleStatus::Ok || memcmp(a, c, sizeof a) != 0) ++bad2;
+      }
+    CHECK(n2 > 200 && bad2 == 0);
+    // the base of a 2D tiled image must be aligned for the layout
+    ImageDescriptor dd = desc(t2b, W, H, P2, TexelFormat::Rgba8Unorm, 10);
+    uint32_t w8[8];
+    CHECK(make_image_descriptor(ArrayView<uint32_t>(w8, 8), dd));
+    dd.address += 256;
+    CHECK(!make_image_descriptor(ArrayView<uint32_t>(w8, 8), dd));
+  }
   // a texel the memory does not have is a fault, not a value
   Block small;
   small.base = 0x40000;
@@ -330,6 +433,8 @@ static void test_bit_flips() {
 
 int main() {
   test_layouts();
+  test_2d_layouts();
+  test_reference_vectors();
   test_descriptors();
   test_sampling();
   test_formats_and_tiling();
