@@ -409,6 +409,54 @@ static void test_link_config() {
   CHECK(DpLinkConfig::choose(sink_caps(), 148500, 0).lanes == 2);
 }
 
+static void test_edp_rate_table() {
+  // an eDP 1.4 panel: rates 2.16 (not one the encoder takes), 1.62, 2.7, 5.4 in an unsorted table; two lanes
+  Dpcd::Capabilities c = sink_caps();
+  c.edp_revision = Dpcd::kEdp14;
+  c.max_lanes = 2;
+  c.edp_rate_count = 4;
+  c.edp_rates_khz[0] = 216000; c.edp_rates_khz[1] = 270000; c.edp_rates_khz[2] = 162000; c.edp_rates_khz[3] = 540000;
+  // 1080p60 at 24 bits: 1.62 needs 4 lanes, 2.7 two lanes (180000 >= 148500): the lowest rate that works is 2.7 (index 1), one lane is 90000
+  DpLinkConfig k = DpLinkConfig::choose(c, 148500, 24);
+  CHECK(k.lanes == 2 && k.rate_khz == 270000 && k.rate_index == 1 && k.bandwidth_code() == 0);
+  // a small mode: the lowest rate (index 2), one lane
+  k = DpLinkConfig::choose(c, 25175, 24);
+  CHECK(k.lanes == 1 && k.rate_khz == 162000 && k.rate_index == 2);
+  // 4K60 needs 5.4 on four lanes: not there (two lanes), so the highest rate on the lanes there are
+  k = DpLinkConfig::choose(c, 594000, 24);
+  CHECK(k.lanes == 2 && k.rate_khz == 540000 && k.rate_index == 3);
+  // a revision before 1.4, no table, or a table of rates the encoder cannot take: the usual choice, no index
+  Dpcd::Capabilities old = c;
+  old.edp_revision = 0x02;
+  CHECK(DpLinkConfig::choose(old, 148500, 24).rate_index == DpLinkConfig::kNoRateIndex);
+  old = c;
+  old.edp_rate_count = 0;
+  CHECK(DpLinkConfig::choose(old, 148500, 24).rate_index == DpLinkConfig::kNoRateIndex);
+  old = c;
+  old.edp_rate_count = 1;
+  old.edp_rates_khz[0] = 216000;
+  k = DpLinkConfig::choose(old, 148500, 24);
+  CHECK(k.rate_index == DpLinkConfig::kNoRateIndex && k.rate_khz == 270000);
+  CHECK(DpLinkConfig::choose(sink_caps(), 148500, 24).rate_index == DpLinkConfig::kNoRateIndex);      // (a DisplayPort sink: edp_revision is kNoEdp)
+  // training by the index: LINK_BW_SET 0, then LINK_RATE_SET with the index, after the lane count
+  Rig r;
+  r.lanes = 2;
+  const DpLinkTrainer::Outcome o = DpLinkTrainer::train(r, r, c, 0, 2, 1);
+  CHECK(o.trained() && o.rate_index == 1 && o.bandwidth_code == 0);
+  const size_t lane_count = index_of(r.log, "w 0101=82"), bw = index_of(r.log, "w 0100=00"), rate = index_of(r.log, "w 0115=01"), start = index_of(r.log, "start");
+  CHECK(lane_count < bw && bw < rate && rate < start && start < r.log.size());
+  // without an index no write to the rate set
+  Rig plain;
+  plain.lanes = 2;
+  CHECK(DpLinkTrainer::train(plain, plain, sink_caps(), 0x0A, 2).trained() && index_of(plain.log, "w 0115=00") == plain.log.size() && plain.dpcd[0x115] == 0);
+  // the write of the rate index failing
+  Rig f;
+  f.lanes = 2;
+  f.fail_write_address = 0x115;
+  f.fail_write_nth = 1;
+  CHECK(DpLinkTrainer::train(f, f, c, 0, 2, 1).result == DpLinkTrainer::Result::SinkSetup);
+}
+
 int main() {
   test_clean_training();
   test_options();
@@ -418,6 +466,7 @@ int main() {
   test_patterns();
   test_failures();
   test_link_config();
+  test_edp_rate_table();
   printf(g_failed ? "DpLinkTrainTest: %d FAILED\n" : "DpLinkTrainTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }

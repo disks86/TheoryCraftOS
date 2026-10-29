@@ -63,9 +63,41 @@ void wait(Training& t, uint32_t default_us) {
 }
 }  // namespace
 
+// The rates the DIG encoder control of the video BIOS can be told (ATOM_ENCODER_CONFIG_V4_DPLINKRATE_*); a panel's table may list others (216000, 432000 ...), which are not used.
+static bool encoder_rate(uint32_t rate_khz) { return rate_khz == 162000 || rate_khz == 270000 || rate_khz == 324000 || rate_khz == 540000; }
+
 DpLinkConfig DpLinkConfig::choose(const Dpcd::Capabilities& caps, uint32_t pixel_clock_khz, uint32_t bits_per_pixel) {
   static constexpr uint32_t kRates[] = {162000, 270000, 540000};
   DpLinkConfig c;
+  if (caps.edp_revision != Dpcd::kNoEdp && caps.edp_revision >= Dpcd::kEdp14 && caps.edp_rate_count > 0) {
+    if (bits_per_pixel == 0) bits_per_pixel = 24;
+    const uint32_t count = caps.edp_rate_count < Dpcd::kMaxEdpRates ? caps.edp_rate_count : Dpcd::kMaxEdpRates;
+    bool used[Dpcd::kMaxEdpRates] = {};
+    for (uint32_t round = 0; round < count; ++round) {       // (lowest unused rate first: the table need not be sorted)
+      uint32_t best = count;
+      for (uint32_t i = 0; i < count; ++i)
+        if (!used[i] && encoder_rate(caps.edp_rates_khz[i]) && (best == count || caps.edp_rates_khz[i] < caps.edp_rates_khz[best])) best = i;
+      if (best == count) break;
+      used[best] = true;
+      for (uint32_t lanes = 1; lanes <= caps.max_lanes; lanes <<= 1) {
+        if (uint64_t{lanes} * caps.edp_rates_khz[best] * 8 / bits_per_pixel >= pixel_clock_khz) {
+          c.lanes = lanes;
+          c.rate_khz = caps.edp_rates_khz[best];
+          c.rate_index = static_cast<uint8_t>(best);
+          return c;
+        }
+      }
+    }
+    uint32_t top = count;
+    for (uint32_t i = 0; i < count; ++i)
+      if (encoder_rate(caps.edp_rates_khz[i]) && (top == count || caps.edp_rates_khz[i] > caps.edp_rates_khz[top])) top = i;
+    if (top != count) {
+      c.lanes = caps.max_lanes;
+      c.rate_khz = caps.edp_rates_khz[top];
+      c.rate_index = static_cast<uint8_t>(top);
+      return c;
+    }
+  }
   const uint32_t max_rate = caps.max_link_rate_khz();
   const uint32_t max_lanes = caps.max_lanes;
   if (bits_per_pixel == 0) bits_per_pixel = 24;
@@ -92,8 +124,9 @@ DpLinkConfig DpLinkConfig::choose(const Dpcd::Capabilities& caps, uint32_t pixel
   return c;
 }
 
-DpLinkTrainer::Outcome DpLinkTrainer::train(IDpcdAux& aux, IDpSource& source, const Dpcd::Capabilities& caps, uint8_t bandwidth_code, uint32_t lanes) {
+DpLinkTrainer::Outcome DpLinkTrainer::train(IDpcdAux& aux, IDpSource& source, const Dpcd::Capabilities& caps, uint8_t bandwidth_code, uint32_t lanes, uint8_t rate_index) {
   Outcome out;
+  out.rate_index = rate_index;
   out.lanes = lanes;
   out.bandwidth_code = bandwidth_code;
   if (lanes != 1 && lanes != 2 && lanes != 4) {
@@ -115,7 +148,8 @@ DpLinkTrainer::Outcome DpLinkTrainer::train(IDpcdAux& aux, IDpSource& source, co
   const uint8_t spread = caps.max_downspread ? Dpcd::kSpreadAmp05 : 0;
   const uint8_t lane_count = static_cast<uint8_t>(lanes | (caps.enhanced_framing ? Dpcd::kLaneCountEnhancedFraming : 0));
   if (!aux.dpcd_write(Dpcd::kDownspreadCtrl, ConstByteView(&spread, 1)) || !aux.dpcd_write(Dpcd::kLaneCountSet, ConstByteView(&lane_count, 1)) ||
-      !aux.dpcd_write(Dpcd::kLinkBwSet, ConstByteView(&bandwidth_code, 1))) {
+      !aux.dpcd_write(Dpcd::kLinkBwSet, ConstByteView(&bandwidth_code, 1)) ||
+      (rate_index != DpLinkConfig::kNoRateIndex && !aux.dpcd_write(Dpcd::kLinkRateSet, ConstByteView(&rate_index, 1)))) {
     out.result = Result::SinkSetup;
     return out;
   }

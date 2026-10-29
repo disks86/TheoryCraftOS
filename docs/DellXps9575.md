@@ -879,5 +879,8 @@ of the whole training for 1080p60 and 4K60, failure, and the refusals).
 **Not checked:** `amdgpu_atombios_dp.c`, `atombios_encoders.c`, `drm_dp.h` and `drm_dp_helper.c` were not at hand: the training algorithm and its limits (five repeats, six adjustments, the delays), what the driver puts
 in the tables' parameters, which table and revision a Polaris-class BIOS has (the encoder control 1.4 and transmitter control 1.5 are what I believe a DCE 11.2 BIOS has; the other handled revisions are for older ones),
 the DPCD registers and bits, and whether the sink wants the scrambling-disable bit with the pattern (this writes the plain pattern number). **Not done:** the PLL and the encoder setup for the mode before training (it runs
-on the clocks the firmware left), enabling the stream after it, eDP's alternate scrambler reset and panel mode, the eDP 1.4 link rate table (`DP_LINK_RATE_SET`), 8.1 Gbit/s, link retraining when a short pulse reports
-loss (`service_short_pulses` reports it, nothing calls `train_link` yet), and everything on real hardware.
+on the clocks the firmware left), enabling the stream after it, eDP's alternate scrambler reset and panel mode, 8.1 Gbit/s, and everything on real hardware.
+
+**eDP 1.4 rate table and retraining (done after the above):** a panel of eDP revision 1.4 that lists rates (`Capabilities::edp_rates_khz`) is trained by table index: `DpLinkConfig::choose` takes the lowest listed rate (any order) that
+the encoder control can be told (1.62, 2.7, 3.24, 5.4 GHz; 2.16 and the like are skipped) with the fewest lanes, writes `DP_LINK_BW_SET` 0 and `DP_LINK_RATE_SET` (0x115) with the index after the lane count. `service_short_pulses`
+retrains a lost link that `train_link` trained (see the short pulse section). Tests: `DpLinkTrainTest::test_edp_rate_table`, `AmdVegaMTest::test_train_link`, `test_retrain_on_short_pulse`. The 0x115 address is from memory.

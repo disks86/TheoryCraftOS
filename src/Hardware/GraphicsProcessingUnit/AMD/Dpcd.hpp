@@ -49,7 +49,7 @@ class Dpcd {
   static constexpr uint32_t kSupportedLinkRates = 0x010;         // eDP 1.4: up to eight 16-bit rates
   static constexpr uint32_t kLaneCountSet = 0x101, kSinkCount = 0x200, kDeviceServiceIrqVector = 0x201, kLaneStatus = 0x202, kEdpRevision = 0x700;
   // Link training (DP 1.2 2.9.3.3 / drm_dp.h): the link settings, the training pattern, the per-lane voltage swing and pre-emphasis, the downspread and the sink's power
-  static constexpr uint32_t kLinkBwSet = 0x100, kTrainingPatternSet = 0x102, kTrainingLane0Set = 0x103, kDownspreadCtrl = 0x107, kSetPower = 0x600, kTrainingAuxRdInterval = 0x00E;
+  static constexpr uint32_t kLinkBwSet = 0x100, kLinkRateSet = 0x115, kTrainingPatternSet = 0x102, kTrainingLane0Set = 0x103, kDownspreadCtrl = 0x107, kSetPower = 0x600, kTrainingAuxRdInterval = 0x00E;
   static constexpr uint8_t kLaneCountEnhancedFraming = 0x80, kSpreadAmp05 = 0x10, kPowerD0 = 1, kPowerD3 = 2;
   static constexpr uint8_t kTrainingPatternDisable = 0, kTrainingPattern1 = 1, kTrainingPattern2 = 2, kTrainingPattern3 = 3;
   // DP_TRAINING_LANEx_SET: voltage swing in bits 1:0 (levels 0..3), max swing reached bit 2, pre-emphasis in bits 4:3 (levels 0..3 as 0, 8, 16, 24), max pre-emphasis reached bit 5

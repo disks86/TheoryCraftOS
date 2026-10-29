@@ -494,7 +494,7 @@ bool AmdVegaM::train_link(const AtomConnectors::Connector& connector, uint32_t p
   source.hpd = connector.hpd_pin;
   source.bits_per_color = bpc == 6 ? 1 : bpc == 10 ? 3 : bpc == 12 ? 4 : bpc == 16 ? 5 : 2;
   AmdDpSource dp(session.host, session.bios, source);
-  result.outcome = DpLinkTrainer::train(session.aux, dp, result.caps, result.config.bandwidth_code(), result.config.lanes);
+  result.outcome = DpLinkTrainer::train(session.aux, dp, result.caps, result.config.bandwidth_code(), result.config.lanes, result.config.rate_index);
   if (out) *out = result;
   if (connector.hpd_pin < amd_dce11::Interrupts::kMaxHpd) {
     Trained& memory = trained_[connector.hpd_pin];
