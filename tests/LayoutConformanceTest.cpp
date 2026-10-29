@@ -198,8 +198,7 @@ static const Case kCases[] = {
 
 // Cases the layout engine gets wrong today.
 static const char* const kKnownGaps[] = {
-  "flow-root contains float",   // (display: flow-root is laid out as a plain block, which does not contain its floats)
-  "aspect-ratio box",           // (aspect-ratio does not size the box)
+  "",   // (none today; the array may not be empty)
 };
 
 static bool is_known_gap(const char* name) {
