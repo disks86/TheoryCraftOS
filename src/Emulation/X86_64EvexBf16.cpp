@@ -49,6 +49,11 @@ const EvexOp kEvexBf16Ops[] = {
     {5, 0, 0x68, 0, kSatCvt, 0x02 | 0x20, 16, kFull}, {5, 0, 0x69, 0, kSatCvt, 0x02, 16, kFull}, {5, 0, 0x6A, 0, kSatCvt, 0x02 | 0x30, 16, kFull}, {5, 0, 0x6B, 0, kSatCvt, 0x02 | 0x10, 16, kFull},
     {5, 1, 0x68, 0, kSatCvt, 0x00 | 0x20, 32, kFull}, {5, 1, 0x69, 0, kSatCvt, 0x00, 32, kFull}, {5, 1, 0x6A, 0, kSatCvt, 0x00 | 0x30, 32, kFull}, {5, 1, 0x6B, 0, kSatCvt, 0x00 | 0x10, 32, kFull},
     {5, 3, 0x68, 0, kSatCvt, 0x03 | 0x20, 16, kFull}, {5, 3, 0x69, 0, kSatCvt, 0x03, 16, kFull}, {5, 3, 0x6A, 0, kSatCvt, 0x03 | 0x30, 16, kFull}, {5, 3, 0x6B, 0, kSatCvt, 0x03 | 0x10, 16, kFull},
+    // FP8 conversions: sub = hf8 (else bf8) | 2 saturate | form << 2 (0 vcvtph2*, 1 vcvt2ph2*, 2 vcvtbiasph2*, 3 vcvthf82ph, 4 vcvt2ps2phx)
+    {2, 2, 0x74, 0, kFp8, 0 | 0 | 0, 16, kFull}, {5, 2, 0x74, 0, kFp8, 0 | 2, 16, kFull}, {5, 2, 0x18, 0, kFp8, 1, 16, kFull}, {5, 2, 0x1B, 0, kFp8, 1 | 2, 16, kFull},
+    {2, 3, 0x74, 0, kFp8, 4, 16, kFull}, {5, 3, 0x74, 0, kFp8, 4 | 2, 16, kFull}, {5, 3, 0x18, 0, kFp8, 4 | 1, 16, kFull}, {5, 3, 0x1B, 0, kFp8, 4 | 1 | 2, 16, kFull},
+    {2, 0, 0x74, 0, kFp8, 8, 16, kFull}, {5, 0, 0x74, 0, kFp8, 8 | 2, 16, kFull}, {5, 0, 0x18, 0, kFp8, 8 | 1, 16, kFull}, {5, 0, 0x1B, 0, kFp8, 8 | 1 | 2, 16, kFull},
+    {5, 3, 0x1E, 0, kFp8, 12 | 1, 8, kHalf}, {2, 1, 0x67, 0, kFp8, 16, 32, kFull},
 };
 const uint32_t kEvexBf16OpCount = sizeof(kEvexBf16Ops) / sizeof(kEvexBf16Ops[0]);
 
@@ -436,6 +441,151 @@ X86_64Cpu::Step X86_64Cpu::evex_minmax(GuestMemory& m, const EvexOp& def) {
   if (scalar) set_vec(ev_.reg, result, 128);
   else ev_write_masked(ev_.reg, result, bits);
   if (!bf16) s_.mxcsr |= flags;
+  s_.rip += d_.position;
+  return Step::Ok;
+}
+
+
+// --- FP8 (E5M2 "bf8" and E4M3 "hf8") conversions -----------------------------------------------------------------------------------------------
+
+namespace {
+
+// convert_fp16_to_bf8 / convert_fp16_to_bf8_bias; `bias` < 0 rounds to nearest even, otherwise it is the 8-bit rounding bias added below the fp16 LSB.
+uint8_t fp16_to_bf8(uint32_t x, bool saturate, int bias) {
+  const bool inf = (x & 0x7FFF) == 0x7C00, nan = (x & 0x7C00) == 0x7C00 && (x & 0x3FF) != 0;
+  if (inf) return static_cast<uint8_t>(saturate ? ((x >> 8) & 0x80) | 0x7B : x >> 8);
+  if (nan) return static_cast<uint8_t>((x >> 8) | 2);
+  const uint32_t add = bias < 0 ? 0x7Fu + ((x >> 8) & 1) : static_cast<uint32_t>(bias);
+  const uint32_t t = (x + add) & 0xFFFF;
+  if (saturate && ((t >> 8) & 0x7F) == 0x7C) return static_cast<uint8_t>(((t >> 8) & 0x80) | 0x7B);
+  return static_cast<uint8_t>(t >> 8);
+}
+
+// convert_fp16_to_hf8 / convert_fp16_to_hf8_bias
+uint8_t fp16_to_hf8(uint32_t x, bool saturate, int bias) {
+  constexpr uint32_t kRebias = 15 - 7;
+  const uint32_t sign = (x & 0x8000) >> 8, e16 = (x >> 10) & 0x1F, m16 = x & 0x3FF;
+  const uint32_t overflow_m = saturate ? 6 : 7;
+  uint32_t e = 0, m = 0;
+  if ((x & 0x7FFF) == 0x7C00) {
+    e = 0xF;
+    m = overflow_m;
+  } else if (e16 == 0x1F) {      // NaN
+    e = 0xF;
+    m = 7;
+  } else if (bias < 0) {
+    if (e16 > kRebias + 15 || (e16 == kRebias + 15 && m16 > 0x340)) {
+      e = 0xF;
+      m = overflow_m;
+    } else if (e16 == 0 && m16 == 0) {
+      e = m = 0;
+    } else if (e16 <= kRebias) {
+      uint32_t t = (m16 | 0x400) >> (kRebias + 1 - e16);
+      t |= ((m16 & 0x7F) + 0x7F) >> 7;      // the sticky bit
+      t += 0x3F + ((t >> 7) & 1);
+      e = t >> 10;
+      m = (t >> 7) & 7;
+    } else {
+      const uint32_t r = x + 0x3F + ((m16 >> 7) & 1);
+      e = ((r & 0x7C00) >> 10) - kRebias;
+      m = (r & 0x3FF) >> 7;
+    }
+  } else {
+    const uint32_t b = static_cast<uint32_t>(bias), xb = x + (b >> 1), e16b = (xb >> 10) & 0x1F, m16b = xb & 0x3FF;
+    if (e16b > kRebias + 15 || (e16b == kRebias + 15 && m16b >= 0x380)) {
+      e = 0xF;
+      m = overflow_m;
+    } else if (e16 == 0) {
+      m = (m16 + (b << 7)) >> (kRebias + 7);
+    } else if (e16b <= kRebias) {
+      uint32_t t = (m16 | 0x400) + (b << (kRebias - e16));
+      t >>= kRebias + 1 - e16;
+      e = t >> 10;
+      m = (t >> 7) & 7;
+    } else {
+      e = e16b - kRebias;
+      m = m16b >> 7;
+    }
+  }
+  return static_cast<uint8_t>((e << 3) | m | sign);
+}
+
+// convert_hf8_to_fp16
+uint16_t hf8_to_fp16(uint32_t in) {
+  const uint32_t s = (in & 0x80) << 8, e = (in & 0x78) >> 3;
+  uint32_t m = in & 7, e_norm = e + (15 - 7);
+  if (e == 0 && m != 0) {
+    const uint32_t lz = m > 3 ? 0 : m > 1 ? 1 : 2;
+    e_norm -= lz;
+    m = (m << (lz + 1)) & 7;
+  } else if (e == 0) {
+    e_norm = 0;
+  } else if (e == 0xF && m == 7) {
+    e_norm = 0x1F;
+  }
+  return static_cast<uint16_t>(s | (e_norm << 10) | (m << 7));
+}
+
+}  // namespace
+
+X86_64Cpu::Step X86_64Cpu::evex_fp8(GuestMemory& m, const EvexOp& def) {
+  const bool hf8 = def.sub & 1, saturate = def.sub & 2;
+  const uint32_t form = def.sub >> 2, vl = ev_.vl, reg = ev_.reg;
+  if (ev_.er && form != 4) return fail(6);
+  Vec b;
+  const Vec a = get_vec(ev_.vvvv), old = ev_.old_dest;
+  Vec result;
+  auto to_fp8 = [&](uint32_t x, int bias) -> uint8_t { return hf8 ? fp16_to_hf8(x, saturate, bias) : fp16_to_bf8(x, saturate, bias); };
+  if (form == 4) {      // vcvt2ps2phx
+    if (!ev_read_rm(m, &b, 32, true, false)) return Step::Fault;
+    Env env;
+    env.mode = ev_.er ? static_cast<Rounding>(ev_.rc) : static_cast<Rounding>((s_.mxcsr >> 13) & 3);
+    env.daz = s_.mxcsr & 0x40;
+    const uint32_t n = vl / 16;
+    for (uint32_t i = 0; i < n; ++i) {
+      if (ev_.aaa != 0 && !ev_active(i)) {
+        set_element(result, 16, i, ev_.z ? 0 : element(old, 16, i));
+        continue;
+      }
+      const uint64_t src = i < n / 2 ? element(b, 32, i) : element(a, 32, i - n / 2);
+      set_element(result, 16, i, convert(Format::F32, Format::F16, src, env));
+    }
+    set_vec(reg, result, vl);
+    if (!ev_.er) s_.mxcsr |= env.flags;
+    s_.rip += d_.position;
+    return Step::Ok;
+  }
+  if (form == 3) {      // vcvthf82ph: the source is half the destination width
+    if (ev_.vvvv != 0 || ev_.bcst) return fail(6);
+    const uint32_t saved = ev_.vl;
+    ev_.vl = vl / 2;
+    const bool ok = ev_read_rm(m, &b, 8, false, false);
+    ev_.vl = saved;
+    if (!ok) return Step::Fault;
+    for (uint32_t i = 0; i < vl / 16; ++i) {
+      if (ev_.aaa != 0 && !ev_active(i)) set_element(result, 16, i, ev_.z ? 0 : element(old, 16, i));
+      else set_element(result, 16, i, hf8_to_fp16(static_cast<uint32_t>(element(b, 8, i))));
+    }
+    set_vec(reg, result, vl);
+    s_.rip += d_.position;
+    return Step::Ok;
+  }
+  if (form != 1 && form != 0 && form != 2) return fail(6);
+  if (form == 0 && ev_.vvvv != 0) return fail(6);
+  if (!ev_read_rm(m, &b, 16, true, false)) return Step::Fault;
+  const uint32_t bytes = form == 1 ? vl / 8 : vl / 16;
+  for (uint32_t i = 0; i < bytes; ++i) {
+    if (ev_.aaa != 0 && !ev_active(i)) {
+      set_element(result, 8, i, ev_.z ? 0 : element(old, 8, i));
+      continue;
+    }
+    uint8_t r;
+    if (form == 1) r = to_fp8(static_cast<uint32_t>(i < bytes / 2 ? element(b, 16, i) : element(a, 16, i - bytes / 2)), -1);
+    else if (form == 0) r = to_fp8(static_cast<uint32_t>(element(b, 16, i)), -1);
+    else r = to_fp8(static_cast<uint32_t>(element(b, 16, i)), static_cast<int>(element(a, 8, 2 * i)));
+    set_element(result, 8, i, r);
+  }
+  set_vec(reg, result, form == 1 ? vl : (vl / 2 < 128 ? 128 : vl / 2));
   s_.rip += d_.position;
   return Step::Ok;
 }

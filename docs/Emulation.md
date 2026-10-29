@@ -151,7 +151,14 @@ programs built with `-march=haswell` (or x86-64-v3) run. `X86_64Vex.cpp` holds a
   runs `punpckl*`, and the pack instructions put the second source in the high half. About 400 MMX forms are compared with the host (generic opcodes in register and memory form, every SSSE3 operation, the shift immediates, `palignr`, `pshufw`, conversions); a mutation of `pmulhrsw` fails it.
 - **SSE4a** (`extrq`, `insertq` in the immediate and register forms, `movntss`, `movntsd`): compared with the host where the CPU has it; the upper quadword of the destination is cleared as on Zen.
 - **Packed decimal**: `fbld` and `fbstp` (eighteen digits and a sign; anything larger stores the packed-decimal indefinite and raises invalid), compared with the host by `X87Test` in every rounding mode.
-- **CET**: `endbr64`/`endbr32`, `rdsspd`/`rdsspq` and `incssp` execute as no-ops (shadow stacks are not enabled).
+- **CET** (`src/Emulation/X86_64Cet.cpp`, `tests/CetTest.cpp`): `endbr64`/`endbr32` are nops. Shadow stacks are off until the host calls `enable_shadow_stack(ssp, allow_wrss)`; while off, `rdsspd`/`rdsspq` and
+  `incsspd`/`incsspq` do nothing and `wrss`/`wruss` are #UD, as on a processor with CET disabled. While on, every near `call` also pushes the return address on the shadow stack (ordinary guest memory,
+  8 bytes down) and every near `ret` compares its target with the shadow stack top and pops it, raising #CP (vector 21, error code 1) on a mismatch with the data stack left as it was; `rdssp` reads the
+  pointer, `incssp` adds count x 8 (Q) or count x 4 (D, unverified) after reading the last entry skipped, `wrss` stores to an operand-size aligned address (#GP(0) otherwise; #UD unless WRSS was allowed),
+  and `wruss` is #GP(0) at CPL 3. Not modelled: the shadow stack page type, far calls and returns, `iret`, interrupts, the restore-token instructions and indirect branch tracking. The map 4 forms of
+  `wrss`, `wruss`, `enqcmd` and `enqcmds` are there too.
+- **ENQCMD / ENQCMDS** (cpuid 7.0 ECX bit 29): `enqcmd` reads the 64-byte command at the memory operand, replaces its first dword with the PASID, writes it to the 64-byte aligned address in the register
+  and clears ZF (ordinary memory always accepts). It is #GP(0) until the host sets a PASID with `set_pasid()` (IA32_PASID valid bit), as on a machine whose OS has not; `enqcmds` is #GP(0) at CPL 3.
 - **AVX-VNNI, AVX-IFMA, AVX-VNNI-INT8, AVX-VNNI-INT16, AVX-NE-CONVERT** (`tests/VexNewTest.cpp`, against models written from the definitions, 16 dot-product instructions at 300 cases each,
   both vector lengths, memory and register): the VEX encodings of `vpdpbusd[s]`/`vpdpwssd[s]`/`vpmadd52luq`/`vpmadd52huq` and `vcvtneps2bf16` are run by the EVEX code from a context with no mask and no broadcast
   (`vex_via_evex`); the INT8 / INT16 dot products (`kDot`: signed, unsigned or mixed operands; the all-unsigned forms accumulate and saturate as unsigned) exist in both encodings; `vbcstnebf162ps`,
@@ -159,7 +166,7 @@ programs built with `-march=haswell` (or x86-64-v3) run. `X86_64Vex.cpp` holds a
   the bfloat16 conversion are not checked against hardware.
 - **AVX-512 ER and PF** (Knights Landing; `tests/ErTest.cpp`): `vexp2ps/pd` (2^x in binary64 by its Taylor series), `vrcp28ps/pd/ss/sd` and `vrsqrt28ps/pd/ss/sd` (correctly rounded; the architecture promises 2^-23 and
   2^-28), with denormal inputs as zeros, denormal results flushed, round to nearest, and `{sae}` suppressing the flags. The gather / scatter prefetches (`vgatherpf0/1d/qps/pd`, `vscatterpf0/1`) decode and do nothing.
-- **AVX10.1** is advertised (cpuid 7.1 EDX bit 19, leaf 0x24: version 1, 128 / 256 / 512-bit vectors): the emulator has every AVX-512 instruction set it requires. The AVX10.2 additions are not implemented.
+- **AVX10.1** is advertised (cpuid 7.1 EDX bit 19, leaf 0x24: version 1, 128 / 256 / 512-bit vectors): the emulator has every AVX-512 instruction set it requires. AVX10.2 is implemented too (below), so leaf 0x24 reports version 2.
 - **MXCSR.DAZ / FTZ** (`Env::daz` / `Env::ftz` in `SoftFloat`, set from MXCSR bits 6 and 15 by every x86 float handler): with DAZ a denormal operand is a zero of its sign and raises no denormal flag (also for
   `min`/`max`, `sqrt`, rounding, comparisons, conversions and the single-to-half conversion); with FTZ a tiny result (detected before rounding, even when exact) becomes a zero of its sign and raises underflow
   and inexact. A sum with a zero and an FMA with a zero product hand the other operand back, so those paths flush it too. The AVX-512 special functions follow the hardware: `vscalef` flushes only the final
@@ -195,7 +202,14 @@ programs built with `-march=haswell` (or x86-64-v3) run. `X86_64Vex.cpp` holds a
 - **AMD FMA4, XOP and TBM** (`src/Emulation/X86_64Xop.cpp`; cpuid 0x80000001 ECX bits 16, 11, 21): all twenty FMA4 forms (VEX map 3; VEX.W swaps the r/m operand and the register in imm8[7:4]; a scalar result
   zeroes the rest of the destination, which is unverified), and from the 8F prefix: the integer multiply-accumulates (`vpmacs*`, `vpmadcs*`), `vpcmov`, `vpperm`, `vprot`, `vpshl`, `vpsha`, `vpcom` / `vpcomu`,
   the horizontal `vphadd*` / `vphsub*` and `vfrcz`, plus TBM (`blcfill`, `blci`, `blcic`, `blcmsk`, `blcs`, `blsfill`, `blsic`, `t1mskc`, `tzmsk`, `bextr` with an immediate). `8F /0` is still `pop`. Checked against
-  models only (`tests/XopTest.cpp`). Not implemented: `vpermil2ps/pd` and LWP.
+  models only (`tests/XopTest.cpp`). `vpermil2ps` / `vpermil2pd` (VEX map 3, 66 48 / 49; selector bits [1:0] or [1] pick the element, bit 2 the source, bit 3 the match bit, m2z in imm8[1:0]
+  as the Microsoft intrinsic documentation gives it; the operand order for VEX.W is from the same source) are there too, and so is LWP (below). The cpuid XOP / FMA4 / TBM / LWP bits are set.
+- **AMD Lightweight Profiling** (`src/Emulation/X86_64Lwp.cpp`, from AMD64 APM volumes 2 and 3; cpuid 0x80000001 ECX bit 15 and leaf 0x8000001C; XCR0 bit 62): `llwpcb`, `slwpcb`, `lwpval`, `lwpins` (XOP
+  map 9 / A, opcode 12). The control block, the ring buffer in guest memory with its head, the software-owned tail and MissedEvents, synchronized and continuous mode, the value-sample counter and
+  interval (with the Random bits), the performance time stamp (the emulator's time stamp counter), SLWPCB's flush of the head, counter and MissedEvents, and LWPINS's CF are modelled. Not modelled: the
+  hardware events (instructions, branches, cache misses, clocks: LLWPCB clears their flag bits, as for a processor without them, and cpuid says so) and threshold interrupts. The session is part of the CPU
+  object (like the AMX tiles) and XSAVE / XRSTOR carry it as component 62 (offset 832, 128 bytes) in a layout of this emulator's own, since AMD's is not public. `tests/XopTest.cpp` has the tests; the
+  semantics are from the manuals and unverified on hardware.
 - **Intel APX, part 1** (`D5` REX2 prefix): the payload bits M0, R4, X4, B4, W, R3, X3, B3 select the 0F map and name registers R16..R31 in modrm, SIB (an index field of 100 with X4 is R20, not "no index") and
   opcode-embedded fields; `jmpabs` (`D5 00 A1 imm64`); state in XCR0 bit 19 and xsave component 19 (offset 11008, 128 bytes, in the initial state while R16..R31 are all zero); cpuid 7.1 EDX bit 21. REX2 on an SSE,
   x87, MMX or other vector instruction that names a high register is #UD. `tests/ApxTest.cpp` runs integer instructions on R16 / R17 and on RAX / RCX and compares.
@@ -206,20 +220,30 @@ programs built with `-march=haswell` (or x86-64-v3) run. `X86_64Vex.cpp` holds a
   of the third payload byte, SCC 0xA always true, 0xB always false; the default flags in bits 6:3 of the second, taken as not inverted and PF set from CF as the specification states, both unverified); `push2`
   / `pop2` (16-byte aligned, neither register RSP). Encoding errors (reserved payload bits, ND or NF on an instruction that does not take them, a non-zero vvvv without ND, a clear U with a register operand,
   a 66 or REX prefix before EVEX) are #UD. The promoted instructions run the legacy implementation (a REX2-like decoder state, the same arithmetic and flags) and then rearrange the result, so they cannot differ
-  from the legacy forms; `tests/ApxEvexTest.cpp` runs every form against its legacy instruction. Not promoted yet: map 4 `adcx` / `adox`, `crc32`, `movbe`, `movdiri`, `movdir64b`, `enqcmd`, `wrss`, the VEX
-  and EVEX extensions (BMI and `kmov` on R16..R31, vector instructions using R16..R31 as base or index), and the PPX hints (which have no effect).
+  from the legacy forms; `tests/ApxEvexTest.cpp` runs every form against its legacy instruction. Also promoted into map 4: `adcx` / `adox` (66 / F3, opcode 66, with the new
+  destination), `crc32` (F0 / F1), `movbe` (60 / 61, with the new register-register forms), `movdiri` (F9), `movdir64b` (66 F8) and `aadd` / `aand` / `aor` / `axor` (FC; RAO-INT, which the legacy 0F 38 FC
+  encodings gained too: cpuid 7.1 EAX bit 3). The extended EVEX prefix on the existing EVEX instructions gives them R16..R31 as memory base (P0[3] = B4) and index (P1[2] = ~X4), as the r/m operand of the
+  GPR-operand forms (`vmovd` / `vmovq`, `vpbroadcast` from a GPR, `vpinsr`, `vpextr`, `vcvtsi2s*`) and as the destination of `vcvt[t]s*2si`; unused B4 / X4 / R4 are ignored, and U clear with a register
+  operand is #UD. The VEX instructions that APX promotes (BMI: `andn bextr blsi blsmsk blsr bzhi mulx pdep pext rorx sarx shlx shrx`; `kmov`; `cmpccxadd`; the AMX tile loads and stores) have the
+  EVEX form with the same map and opcode (NF for the six BMI instructions that take it). `cmpccxadd` is implemented in its VEX form as well (cpuid 7.1 EAX bit 7). Not promoted: `enqcmd`, `wrss` /
+  `wruss`, `invept` / `invvpid` / `invpcid` and `urdmsr` / `uwrmsr` (privileged or absent hardware: #UD). The PPX hints have no effect.
 - **AVX10.2, part 1: bfloat16 arithmetic** (`src/Emulation/X86_64EvexBf16.cpp`; SoftFloat gained a `BF16` format): `vadd` / `vsub` / `vmul` / `vdiv` / `vmin` / `vmax` / `vsqrt` / `vfmadd` / `vfmsub` / `vfnmadd` /
   `vfnmsub` (132, 213, 231) / `vscalef` / `vrcp` / `vrsqrt` / `vgetexp` / `vgetmant` / `vrndscale` / `vreduce` `bf16`, `vcmpbf16`, `vfpclassbf16` and `vcomisbf16`, with the architecture's rules: no MXCSR use and no
   exception flags, denormal inputs are zeros, denormal results are flushed, round to nearest even. `vrcp` and `vrsqrt` are correctly rounded (inside the architectural error bound). `vgetexpbf16` of -INF gives +INF
-  (the specification's pseudocode would give 128). cpuid still reports AVX10 version 1 because the rest of AVX10.2 is not there. `tests/Bf16Test.cpp` checks against the host's double arithmetic.
+  (the specification's pseudocode would give 128). `tests/Bf16Test.cpp` checks against the host's double arithmetic.
 - **AVX10.2, part 2**: `vminmax{ps,pd,ph,bf16}` and `vminmax{ss,sd,sh}` (all eight operations of the immediate, sign control, NaN propagation and `Number` forms, from the specification's tables; DE / IE flags in MXCSR, no
   flags for bf16), `vcomxs{s,d,h}` / `vucomxs{s,d,h}` (OF SF ZF PF CF as the specification gives, invalid for any NaN in the comx form and only for a signaling NaN in the ucomx form), `vmovd` (F3 0F 7E and
   66 0F D6 with W0), `vdpphps` (two FP16 products accumulated into binary32, RNE, DAZ / FTZ, the first NaN in low, high, destination order), `vmpsadbw` (EVEX form, 512-bit lanes reuse the control bits of the
   first two) and the saturating conversions `vcvtt{ps,pd}2{dqs,udqs,qqs,uqqs}`, `vcvtts{s,d}2{sis,usis}` and `vcvt[t]{ph,ps,bf16}2i[u]bs` (NaN gives 0, out of range saturates, IE / PE in MXCSR except for bf16;
-  the byte result sits in the low byte of a zeroed element). Not implemented: the FP8 conversions (`vcvt2ph2bf8` / `hf8`, `vcvtph2bf8` / `hf8` and their `s` forms, `vcvtbiasph2bf8` / `hf8`, `vcvthf82ph`),
-  `vcvt2ps2phx`, and the embedded rounding forms of the 256-bit instructions; cpuid therefore still reports AVX10 version 1.
-- **Not implemented** (an invalid-instruction fault, never a wrong result): the rest of APX and of AVX10.2 (above),
-  `vpermil2ps/pd` and LWP, CET shadow-stack instructions beyond the no-op forms, `xsaves`/`xrstors` and `xgetbv` with ECX=1.
+  the byte result sits in the low byte of a zeroed element). 
+- **AVX10.2, part 3: FP8 conversions** (revision 7.0 of the specification, 361050): `vcvtph2bf8` / `hf8` (E5M2 / E4M3) and their saturating `s` forms, `vcvt2ph2bf8` / `hf8` (two sources into one),
+  `vcvtbiasph2bf8` / `hf8` (an 8-bit rounding bias per element, the stochastic-rounding hook), `vcvthf82ph` (exact) and `vcvt2ps2phx` (MXCSR or embedded rounding, DAZ from MXCSR, no FTZ). The FP8
+  conversions use round to nearest even (or the bias), no MXCSR and no flags; overflow gives infinity (E5M2) or NaN (E4M3), saturated forms the maximum. `tests/Bf16Test.cpp` runs every one of the 65536
+  fp16 inputs through all the forms against a value-based model written independently of the pseudocode. The embedded-rounding forms of the 256-bit instructions were removed from AVX10.2 in revision 4.0
+  and are not implemented. cpuid reports AVX10 version 2.
+- **xgetbv with ECX=1** returns XINUSE (the components that are not in their initial state; cpuid 0xD.1 EAX bit 2). `xsaves` / `xrstors` are #GP(0): they are supervisor-state instructions and the emulator only
+  runs CPL 3 code.
+- **Not implemented** (an invalid-instruction fault, never a wrong result): the restore-token CET instructions (`rstorssp`, `saveprevssp`, `setssbsy`, `clrssbsy`) and the privileged map 4 instructions (`invept`, `invvpid`, `invpcid`, `urdmsr`, `uwrmsr`).
   Exceptions delivered to a Windows program save the XMM halves of vector state in the `CONTEXT` in memory, not the upper halves (the emulator keeps those itself).
 - **Checked against the real thing**: `tests/AvxTest.cpp` assembles about 1,400 instruction forms with `llvm-mc` (`tests/data/emulation/avx_cases_gen.py`), runs each on the host
   and on the emulator from the same random state (80,000+ comparisons per run: all vector registers, written general registers, flags, MXCSR flags except DE, the memory operand)

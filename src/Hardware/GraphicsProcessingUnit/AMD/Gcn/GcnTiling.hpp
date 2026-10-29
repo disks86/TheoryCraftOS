@@ -55,8 +55,18 @@ bool surface_valid(const TileLayout& layout, uint32_t bytes, uint32_t pitch);
 uint32_t surface_pitch_align(const TileLayout& layout, uint32_t bytes);
 uint32_t surface_height_align(const TileLayout& layout, uint32_t bytes);
 uint64_t surface_base_align(const TileLayout& layout, uint32_t bytes);
-// The byte offset of pixel (x, y) in the padded surface of `height` rows (the height matters to a 2D tiled one only); 0 for a surface that is not valid.
-uint64_t surface_offset(const TileLayout& layout, uint32_t bytes, uint32_t pitch, uint32_t x, uint32_t y, uint32_t height = 0);
+// The byte offset of pixel (x, y) in the padded surface of `height` rows (the height matters to a 2D tiled one only); 0 for a surface that is not valid. For a 2D tiled layout `slice`
+// is the slice of an array or volume: the banks rotate from slice to slice (the offset of the slice itself, slice * the bytes of one, is the caller's).
+uint64_t surface_offset(const TileLayout& layout, uint32_t bytes, uint32_t pitch, uint32_t x, uint32_t y, uint32_t height = 0, uint32_t slice = 0);
+
+// What a surface of `width` by `height` pixels (a level of a mip chain, say) becomes in the layout: the pitch and rows padded as the address library does. The linear aligned layout pads
+// the pitch to max(8, 64 / bytes) pixels and widens it until a slice is a multiple of max(64, 256 / bytes) pixels; the 1D tiled pads to 8 and widens until a slice is a multiple of 256
+// bytes; the 2D tiled pads to whole macro tiles. False for a layout that cannot hold the surface.
+bool surface_pad(const TileLayout& layout, uint32_t bytes, uint32_t width, uint32_t height, uint32_t* pitch, uint32_t* rows);
+
+// The layout a level really has: a level of a 2D tiled chain that is smaller than a macro tile (or whose macro tiles would waste too much) is 1D tiled
+// (ComputeSurfaceMipLevelTileMode); other layouts are their own.
+TileLayout level_layout(const TileLayout& base, uint32_t bytes, uint32_t width, uint32_t height);
 // The bytes a surface of `height` rows occupies (the rows padded to the height alignment)
 uint64_t surface_bytes(const TileLayout& layout, uint32_t bytes, uint32_t pitch, uint32_t height);
 

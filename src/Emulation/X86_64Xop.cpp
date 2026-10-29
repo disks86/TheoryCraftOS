@@ -18,7 +18,7 @@
 
 // The AMD extensions of the VEX encoding: FMA4 (four-operand fused multiply-add, VEX map 3), XOP (the 8F prefix, maps 8, 9 and A: integer multiply-accumulate, vpcmov, vpperm, rotates, arithmetic and
 // logical per-element shifts, vpcom, horizontal adds and subtracts, vfrcz) and TBM (the trailing bit manipulation instructions, XOP maps 9 and A).
-// Not implemented: vpermil2ps / pd, and LWP (llwpcb, slwpcb, lwpins, lwpval).
+// vpermil2ps / pd (VEX map 3) are here too; the LWP instructions (XOP map 9 / A opcode 12) are in X86_64Lwp.cpp.
 #include "Emulation/SoftFloat.hpp"
 #include "Emulation/Wide.hpp"
 #include "Emulation/X86_64Cpu.hpp"
@@ -109,12 +109,45 @@ X86_64Cpu::Step X86_64Cpu::fma4_instruction(GuestMemory& m, uint8_t op, bool wid
   return Step::Ok;
 }
 
+// --- vpermil2ps / vpermil2pd ---------------------------------------------------------------------------------------------------------------
+
+// dest = per 128-bit lane, each element picks one of the lane's elements of src1 (VEX.vvvv) or src2 by its selector element: for ps selector[1:0] is the index and for pd selector[1] (the low bit is
+// ignored); selector[2] chooses src2 over src1; selector[3] is the match bit. imm8[1:0] (m2z) decides the zeroing: 0 and 1 never zero, 2 zeroes where the match bit is 1, 3 where it is 0. With VEX.W
+// clear the r/m operand is src2 and the register in imm8[7:4] the selector, with VEX.W set they are the other way round.
+X86_64Cpu::Step X86_64Cpu::vpermil2_instruction(GuestMemory& m, uint8_t op, bool wide_w, uint32_t vvvv) {
+  auto bad_decode = [&]() { return fail(d_.available < 15 ? 14 : 6, s_.rip + d_.available); };
+  if (!decode_modrm()) return bad_decode();
+  const uint32_t imm = static_cast<uint32_t>(next_imm(1, false));
+  if (!finish_decode()) return bad_decode();
+  const bool is_double = op == 0x49, wide = vex_.wide;
+  const uint32_t w = is_double ? 64 : 32, m2z = imm & 3, r4 = (imm >> 4) & 15;
+  Xmm rm[2];
+  if (!read_y(m, wide ? 32 : 16, rm)) return Step::Fault;
+  const Xmm reg4[2] = {s_.xmm[r4], s_.ymm_high[r4]}, src1[2] = {s_.xmm[vvvv], s_.ymm_high[vvvv]};
+  const Xmm* src2 = wide_w ? reg4 : rm;
+  const Xmm* selector = wide_w ? rm : reg4;
+  Xmm out[2];
+  for (uint32_t h = 0; h < (wide ? 2u : 1u); ++h)
+    for (uint32_t i = 0; i < 128 / w; ++i) {
+      const uint64_t sel = el(selector[h], w, i);
+      const uint32_t index = is_double ? static_cast<uint32_t>((sel >> 1) & 1) : static_cast<uint32_t>(sel & 3);
+      const bool from_src2 = (sel >> 2) & 1, match = (sel >> 3) & 1;
+      const bool zero = (m2z == 2 && match) || (m2z == 3 && !match);
+      put_el(&out[h], w, i, zero ? 0 : el(from_src2 ? src2[h] : src1[h], w, index));
+    }
+  s_.xmm[d_.reg] = out[0];
+  s_.ymm_high[d_.reg] = wide ? out[1] : Xmm();
+  s_.rip += d_.position;
+  return Step::Ok;
+}
+
 // --- XOP -----------------------------------------------------------------------------------------------------------------------------------
 
 X86_64Cpu::Step X86_64Cpu::xop_instruction(GuestMemory& m, uint32_t map, uint8_t op, uint32_t vvvv) {
   auto bad_decode = [&]() { return fail(d_.available < 15 ? 14 : 6, s_.rip + d_.available); };
   const bool l = vex_.wide, w1 = d_.rex_w;
   const uint32_t opsize = d_.rex_w ? 8 : 4;
+  if ((map == 9 || map == 10) && op == 0x12) return lwp_instruction(m, map, vvvv);
   // TBM: general registers
   if ((map == 9 && (op == 0x01 || op == 0x02)) || (map == 10 && op == 0x10)) {
     if (!decode_modrm()) return bad_decode();

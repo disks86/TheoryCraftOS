@@ -34,6 +34,36 @@ uint64_t X86_64Cpu::next_random() {
   return z ^ (z >> 31);
 }
 
+// The XSTATE_BV a processor would report as in use: a component whose registers differ from their initial values (the x87 control word 0x37F and an empty stack, MXCSR 0x1F80, zeros).
+uint64_t X86_64Cpu::xstate_in_use() const {
+  uint8_t image[512] = {};
+  save_fpu_image(image);
+  uint64_t bv = 0;
+  const uint16_t fcw = static_cast<uint16_t>(image[0] | (image[1] << 8));
+  bool x87 = fcw != 0x37F || image[2] != 0 || image[3] != 0 || image[4] != 0;
+  for (uint32_t i = 8; i < 24; ++i) x87 |= image[i] != 0;
+  for (uint32_t i = 32; i < 160; ++i) x87 |= image[i] != 0;
+  if (x87) bv |= 1;
+  bool sse = s_.mxcsr != 0x1F80, avx = false, hi256 = false, hi16 = false, opmask = false;
+  for (uint32_t r = 0; r < 16; ++r) {
+    sse |= (s_.xmm[r].lo | s_.xmm[r].hi) != 0;
+    avx |= (s_.ymm_high[r].lo | s_.ymm_high[r].hi) != 0;
+    hi256 |= (s_.ymm_high[r].upper[0].lo | s_.ymm_high[r].upper[0].hi | s_.ymm_high[r].upper[1].lo | s_.ymm_high[r].upper[1].hi) != 0;
+    const Vec512 v = get_vec(16 + r);
+    for (uint64_t q : v.q) hi16 |= q != 0;
+  }
+  for (uint64_t k : s_.k) opmask |= k != 0;
+  bv |= (sse ? 2u : 0u) | (avx ? 4u : 0u) | (opmask ? 0x20u : 0u) | (hi256 ? 0x40u : 0u) | (hi16 ? 0x80u : 0u);
+  if (tiles_configured()) bv |= 0x20000;
+  if (lwp_.cb != 0) bv |= uint64_t{1} << 62;
+  for (const auto& tile : tiles_.data)
+    for (uint8_t b : tile)
+      if (b != 0) bv |= 0x40000;
+  for (uint32_t i = 16; i < 32; ++i)
+    if (s_.r[i] != 0) bv |= 0x80000;
+  return bv;
+}
+
 X86_64Cpu::Step X86_64Cpu::group9(GuestMemory& m) {
   auto bad_decode = [&]() { return fail(d_.available < 15 ? 14 : 6, s_.rip + d_.available); };
   if (!decode_modrm() || !finish_decode()) return bad_decode();
@@ -45,6 +75,7 @@ X86_64Cpu::Step X86_64Cpu::group9(GuestMemory& m) {
       s_.rip += d_.position;
       return Step::Ok;
     }
+    if ((kind == 3 || kind == 5) && !d_.operand16 && !d_.rep && !d_.repne) return fail(13);      // xrstors, xsaves: supervisor state, CPL 0 only (and no supervisor component exists here)
     if (kind != 1 || d_.operand16 || d_.rep) return fail(6);
     // cmpxchg8b / (REX.W) cmpxchg16b: compare EDX:EAX (RDX:RAX) with the memory operand; equal: store ECX:EBX (RCX:RBX), else load it into EDX:EAX. Only ZF changes. The
     // processor always writes (the old value back on a mismatch), so an unwritable operand faults either way.
@@ -98,9 +129,15 @@ X86_64Cpu::Step X86_64Cpu::system_0f01(GuestMemory& m) {
   if (d_.mod != 3) return fail(6);
   switch (0xC0 | ((d_.reg & 7) << 3) | (d_.rm & 7)) {
     case 0xD0:      // xgetbv: XCR0 says x87, SSE, AVX, the AVX-512 state and the AMX tile state and the APX registers are enabled
-      if (static_cast<uint32_t>(s_.r[1]) != 0) return fail(13);
+      if (static_cast<uint32_t>(s_.r[1]) > 1) return fail(13);
+      if (static_cast<uint32_t>(s_.r[1]) == 1) {      // XINUSE (cpuid 0xD.1:EAX bit 2)
+        const uint64_t in_use = xstate_in_use();
+        s_.r[0] = in_use & 0xFFFFFFFFu;
+        s_.r[2] = in_use >> 32;
+        break;
+      }
       s_.r[0] = 0xE00E7;
-      s_.r[2] = 0;
+      s_.r[2] = 0x40000000;      // (bit 62: LWP)
       break;
     case 0xD5:      // xend outside a transaction
       return fail(13);
@@ -167,6 +204,42 @@ X86_64Cpu::Step X86_64Cpu::direct_store(GuestMemory& m, uint8_t op) {
     if (!m.read(source, ByteView(block, 64))) return fail(14, source, 0);
     if (!m.write(destination, ConstByteView(block, 64))) return fail(14, destination, 2);
   }
+  s_.rip += d_.position;
+  return Step::Ok;
+}
+
+// aadd / aand / aor / axor [m], r (0F 38 FC with no prefix, 66, F3, F2): the memory operand is updated in one step and the flags are not touched. `kind`: 0 add, 1 and, 2 or, 3 xor.
+X86_64Cpu::Step X86_64Cpu::rao_instruction(GuestMemory& m, uint32_t kind) {
+  auto bad_decode = [&]() { return fail(d_.available < 15 ? 14 : 6, s_.rip + d_.available); };
+  if (!decode_modrm() || !finish_decode()) return bad_decode();
+  if (d_.mod == 3) return fail(6);
+  const uint32_t size = d_.rex_w ? 8 : 4;
+  const uint64_t address = memory_address();
+  uint64_t old = 0;
+  if (!load(m, address, size, &old)) return Step::Fault;
+  const uint64_t operand = get_reg(d_.reg, size);
+  const uint64_t result = kind == 0 ? old + operand : kind == 1 ? old & operand : kind == 2 ? old | operand : old ^ operand;
+  if (!store(m, address, size, size == 8 ? result : result & 0xFFFFFFFFu)) return Step::Fault;
+  s_.rip += d_.position;
+  return Step::Ok;
+}
+
+// cmpccxadd [m], reg, vvvv (VEX.128.66.0F38 E0 + cc): the flags are those of `cmp [m], reg`; if the condition holds the memory operand becomes itself plus the VEX.vvvv register, else it is written
+// back unchanged; the register in ModRM.reg receives the old memory value.
+X86_64Cpu::Step X86_64Cpu::cmpxadd_instruction(GuestMemory& m, uint8_t op, bool wide, uint32_t vvvv) {
+  auto bad_decode = [&]() { return fail(d_.available < 15 ? 14 : 6, s_.rip + d_.available); };
+  if (!d_.operand16 || d_.rep || d_.repne || vex_.wide) return fail(6);
+  if (!decode_modrm() || !finish_decode()) return bad_decode();
+  if (d_.mod == 3) return fail(6);
+  const uint32_t size = wide ? 8 : 4;
+  const uint64_t mask = wide ? ~uint64_t{0} : 0xFFFFFFFFu;
+  const uint64_t address = memory_address();
+  uint64_t old = 0;
+  if (!load(m, address, size, &old)) return Step::Fault;
+  alu(7, old, get_reg(d_.reg, size), size);
+  const uint64_t updated = condition(op & 15) ? (old + (s_.r[vvvv] & mask)) & mask : old;
+  if (!store(m, address, size, updated)) return Step::Fault;
+  set_reg(d_.reg, size, old);
   s_.rip += d_.position;
   return Step::Ok;
 }

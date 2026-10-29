@@ -174,6 +174,22 @@ bool parse_register(Scanner& sc, TgsiFile* file, uint32_t* index, bool* has_swiz
 
 }  // namespace
 
+namespace {
+
+bool target_of(StringView w, uint8_t* out) {
+  if (w.equals(StringView("2D"))) *out = TgsiShader::kTarget2D;
+  else if (w.equals(StringView("3D"))) *out = TgsiShader::kTarget3D;
+  else if (w.equals(StringView("CUBE"))) *out = TgsiShader::kTargetCube;
+  else if (w.equals(StringView("2D_ARRAY"))) *out = TgsiShader::kTarget2DArray;
+  else if (w.equals(StringView("1D"))) *out = TgsiShader::kTarget1D;
+  else if (w.equals(StringView("1D_ARRAY"))) *out = TgsiShader::kTarget1DArray;
+  else if (w.equals(StringView("CUBE_ARRAY"))) *out = TgsiShader::kTargetCubeArray;
+  else return false;
+  return true;
+}
+
+}  // namespace
+
 bool parse_tgsi(allocators::IAllocator& allocator, StringView text, TgsiShader* out, const char** error, uint32_t* line_out) {
   (void)allocator;
   const char* err = nullptr;
@@ -213,7 +229,15 @@ bool parse_tgsi(allocators::IAllocator& allocator, StringView text, TgsiShader* 
       TgsiSemantic semantic = TgsiSemantic::None;
       uint32_t semantic_index = 0;
       bool flat = false;
-      if (kind.equals(StringView("SVIEW"))) continue;       // (", 2D, FLOAT": 2D float is all there is)
+      if (kind.equals(StringView("SVIEW"))) {                // ", 2D, FLOAT": the target, then the type (float is all there is)
+        uint8_t target = TgsiShader::kTarget2D;
+        StringView t;
+        if (sc.accept(',') && sc.word(&t)) {
+          if (!target_of(t, &target)) { err = "unsupported texture target"; break; }
+        }
+        for (uint32_t k = first; k <= last && k < TgsiShader::kMaxSamplers; ++k) out->sampler_target[k] = target;
+        continue;
+      }
       // optional ", SEMANTIC[n]" and ", INTERP"
       while (sc.accept(',')) {
         StringView w;
@@ -336,7 +360,9 @@ bool parse_tgsi(allocators::IAllocator& allocator, StringView text, TgsiShader* 
       if (!sc.accept(',') || !sc.word(&w) || !w.equals(StringView("SAMP")) || !sc.accept('[') || !sc.uint_value(&sampler) || !sc.accept(']') || sampler >= TgsiShader::kMaxSamplers) { err = "TEX needs a sampler"; break; }
       inst.sampler = static_cast<uint8_t>(sampler);
       if (sc.accept(',')) {
-        if (!sc.word(&w) || !w.equals(StringView("2D"))) { err = "only 2D textures"; break; }
+        uint8_t target = 0;
+        if (!sc.word(&w) || !target_of(w, &target)) { err = "unsupported texture target"; break; }
+        if (target != out->sampler_target[sampler]) { err = "the texture target is not the one declared"; break; }
       }
     }
     sc.skip_space();

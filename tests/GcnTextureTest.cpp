@@ -37,7 +37,7 @@ static int g_failed = 0;
 // a flat block of memory at a base address
 struct Block final : ITexelMemory {
   uint64_t base = 0x40000;
-  std::vector<uint32_t> words = std::vector<uint32_t>(1 << 17);
+  std::vector<uint32_t> words = std::vector<uint32_t>(1 << 19);
   uint32_t reads = 0;
   bool read32(uint64_t address, uint32_t* out) override {
     if (address < base || (address & 3) != 0 || (address - base) / 4 >= words.size()) return false;
@@ -169,6 +169,51 @@ static void test_reference_vectors() {
   }
   fclose(f);
   CHECK(infos > 0 && addrs > 0 && wrong == 0);
+  // the mip chains and slices (when the file has them): every level's padded pitch and height, its size, the alignment of its base and its layout (a small level of a 2D tiled image is
+  // 1D tiled) are the library's, and so is the place of pixels in the slices of a level
+  f = fopen("tests/data/gcn_tiling_vectors.txt", "r");
+  uint32_t levels_seen = 0, level_wrong = 0, slices_seen = 0;
+  auto image_of = [](unsigned idx, unsigned bpp, unsigned type, unsigned w, unsigned h, unsigned depth, unsigned levels) {
+    ImageDescriptor d;
+    d.width = w;
+    d.height = h;
+    d.depth = depth;
+    d.levels = levels;
+    d.tile_index = idx;
+    d.type = type == 1 ? ImageType::Image3D : type == 2 ? ImageType::Cube : type == 3 ? ImageType::Array2D : type == 4 ? ImageType::Image1D : type == 5 ? ImageType::Array1D : ImageType::Image2D;
+    d.format = bpp == 8 ? TexelFormat::R8Unorm : bpp == 32 ? TexelFormat::Rgba8Unorm : TexelFormat::Rgba32Float;
+    d.pitch_pixels = image_pitch(w, h, levels, bpp / 8, idx);
+    return d;
+  };
+  while (f && fgets(line, sizeof line, f)) {
+    unsigned idx, bpp, type, w, h, depth, levels, k, pitch, height, slices, align, mode, z, x, y;
+    unsigned long long size, addr;
+    if (sscanf(line, "level %u %u %u %u %u %u %u %u %u %u %u %llu %u %u", &idx, &bpp, &type, &w, &h, &depth, &levels, &k, &pitch, &height, &slices, &size, &align, &mode) == 14) {
+      ++levels_seen;
+      const ImageDescriptor d = image_of(idx, bpp, type, w, h, depth, levels);
+      LevelLayout l;
+      bool bad = !image_level(d, k, &l) || l.pitch != pitch || l.rows != height || l.bytes() != size || l.slices != slices;
+      if (!bad) {
+        const unsigned kind = l.layout.kind == TileLayout::Kind::Linear ? 1 : l.layout.kind == TileLayout::Kind::Tiled1D ? 2 : 4;
+        bad = kind != mode || surface_base_align(l.layout, bpp / 8) != align || (k == 0 && d.pitch_pixels != pitch);
+      }
+      if (bad && ++level_wrong <= 12) {
+        printf("  level mismatch: %s", line);
+        printf("    ours: pitch %u rows %u bytes %llu slices %llu offset %llu kind %d\n", l.pitch, l.rows, static_cast<unsigned long long>(l.bytes()), static_cast<unsigned long long>(l.slices),
+               static_cast<unsigned long long>(l.offset), static_cast<int>(l.layout.kind));
+      }
+    } else if (sscanf(line, "slice %u %u %u %u %u %u %u %u %u %u %u %llu", &idx, &bpp, &type, &w, &h, &depth, &levels, &k, &z, &x, &y, &addr) == 12) {
+      ++slices_seen;
+      const ImageDescriptor d = image_of(idx, bpp, type, w, h, depth, levels);
+      LevelLayout l;
+      if (!image_level(d, k, &l) || image_texel_offset(d, l, x, y, z) - l.offset != addr) {
+        if (++level_wrong <= 12) printf("  pixel mismatch: %s    ours: %llu\n", line, static_cast<unsigned long long>(image_level(d, k, &l) ? image_texel_offset(d, l, x, y, z) - l.offset : 0));
+      }
+    }
+  }
+  if (f) fclose(f);
+  if (levels_seen == 0) printf("  (no mip chain vectors in the file)\n");
+  CHECK(level_wrong == 0 && (levels_seen == 0 || slices_seen > 0));
 }
 
 static void test_descriptors() {
@@ -431,6 +476,433 @@ static void test_bit_flips() {
     for (const float v : odd) CHECK(sample_image(b, ArrayView<const uint32_t>(iw, 8), ArrayView<const uint32_t>(sw, 4), u, v, o) != SampleStatus::Unsupported);
 }
 
+// writes `value` (red; green, blue 0, alpha 255) into every texel of every slice of a level
+static void fill_level(Block& b, const ImageDescriptor& d, uint32_t level, uint8_t red) {
+  LevelLayout l;
+  CHECK(image_level(d, level, &l));
+  for (uint32_t z = 0; z < l.depth; ++z)
+    for (uint32_t y = 0; y < l.height; ++y)
+      for (uint32_t x = 0; x < l.width; ++x) {
+        const uint64_t off = image_texel_offset(d, l, x, y, z);
+        const uint8_t t[4] = {red, 0, 0, 255};
+        memcpy(reinterpret_cast<uint8_t*>(b.words.data()) + off, t, 4);
+      }
+}
+
+static SampleStatus run_req(Block& b, const ImageDescriptor& d, const SamplerDescriptor& s, const SampleRequest& r, float out[4]) {
+  uint32_t iw[8], sw[4];
+  if (!make_image_descriptor(ArrayView<uint32_t>(iw, 8), d) || !make_sampler_descriptor(ArrayView<uint32_t>(sw, 4), s)) return SampleStatus::Unsupported;
+  return sample_image(b, ArrayView<const uint32_t>(iw, 8), ArrayView<const uint32_t>(sw, 4), r, out);
+}
+
+static ImageDescriptor base_image(const Block& b, uint32_t w, uint32_t h, uint32_t levels, ImageType type, uint32_t depth) {
+  ImageDescriptor d;
+  d.address = b.base;
+  d.width = w;
+  d.height = h;
+  d.pitch_pixels = image_pitch(w, h, levels, 4, 9);
+  d.format = TexelFormat::Rgba8Unorm;
+  d.tile_index = 9;
+  d.type = type;
+  d.depth = depth;
+  d.levels = levels;
+  return d;
+}
+
+static void test_mips() {
+  Block b;
+  ImageDescriptor d = base_image(b, 8, 8, 4, ImageType::Image2D, 1);
+  // the chain: 8 by 8, 4 by 4, 2 by 2, 1 by 1, each padded to 8 by 8 pixels (256 bytes) and started at a multiple of 256
+  LevelLayout l;
+  CHECK(image_level(d, 0, &l) && l.offset == 0 && l.width == 8 && l.pitch == 8 && l.rows == 8 && l.slice_bytes == 256 && l.slices == 1);
+  CHECK(image_level(d, 1, &l) && l.offset == 256 && l.width == 4 && l.height == 4 && l.pitch == 8 && l.rows == 8);
+  CHECK(image_level(d, 2, &l) && l.offset == 512 && l.width == 2);
+  CHECK(image_level(d, 3, &l) && l.offset == 768 && l.width == 1 && l.height == 1);
+  CHECK(!image_level(d, 4, &l) && image_bytes(d) == 1024);
+  // a bigger one: 20 by 12 pads to 32 by 16, 16 by 8 ... (pow2 padding of the base level, shifted down and padded to 8)
+  ImageDescriptor e = base_image(b, 20, 12, 5, ImageType::Image2D, 1);
+  CHECK(e.pitch_pixels == 32);
+  CHECK(image_level(e, 0, &l) && l.pitch == 32 && l.rows == 16 && l.slice_bytes == 32 * 16 * 4 && l.offset == 0);
+  CHECK(image_level(e, 1, &l) && l.pitch == 16 && l.width == 10 && l.height == 6 && l.rows == 8 && l.offset == 2048);        // 6 pads to 8
+  CHECK(image_level(e, 2, &l) && l.pitch == 8 && l.width == 5 && l.height == 3 && l.rows == 4 + 4 && l.offset == 2048 + 16 * 8 * 4);
+  uint32_t w[8];
+  CHECK(make_image_descriptor(ArrayView<uint32_t>(w, 8), d));
+  CHECK(((w[3] >> 16) & 0xF) == 3 && (w[3] >> 28) == 9 && ((w[3] >> 12) & 0xF) == 0);           // LAST_LEVEL 3, BASE_LEVEL 0
+  ImageDescriptor back;
+  CHECK(decode_image_descriptor(ArrayView<const uint32_t>(w, 8), &back) && back.levels == 4 && back.type == ImageType::Image2D);
+
+  // the level r is filled with red = 60 * r
+  for (uint32_t k = 0; k < 4; ++k) fill_level(b, d, k, static_cast<uint8_t>(60 * k));
+  SamplerDescriptor s;
+  float o[4];
+  SampleRequest r;
+  r.coord[0] = r.coord[1] = 0.5f;
+  r.has_lod = true;
+  auto red = [&](const SamplerDescriptor& smp, float lod) { r.lod = lod; return run_req(b, d, smp, r, o) == SampleStatus::Ok ? o[0] * 255.0f : -1.0f; };
+  auto near_to = [](float a, float want) { return a > want - 0.01f && a < want + 0.01f; };
+  // no mip filter: the base level whatever the lod
+  CHECK(near_to(red(s, 0), 0) && near_to(red(s, 2.5f), 0));
+  s.mip_filter = 1;
+  CHECK(near_to(red(s, 0), 0) && near_to(red(s, 1.4f), 60) && near_to(red(s, 1.6f), 120) && near_to(red(s, 10.0f), 180) && near_to(red(s, -3.0f), 0));
+  s.mip_filter = 2;
+  CHECK(near_to(red(s, 0), 0) && near_to(red(s, 1.0f), 60) && near_to(red(s, 1.5f), 90) && near_to(red(s, 2.25f), 135) && near_to(red(s, 3.0f), 180) && near_to(red(s, 9.0f), 180));
+  // the level of detail is clamped to the sampler's range
+  s.min_lod = 1.0f;
+  CHECK(near_to(red(s, 0), 60));
+  s.min_lod = 0.0f;
+  s.max_lod = 2.0f;
+  CHECK(near_to(red(s, 7), 120));
+  s.max_lod = 4095.0f / 256.0f;
+  // the sampler's bias and the instruction's bias add to the lod
+  s.lod_bias = 1.0f;
+  CHECK(near_to(red(s, 0), 60));
+  s.lod_bias = -0.5f;
+  CHECK(near_to(red(s, 2.0f), 90));
+  s.lod_bias = 0.0f;
+  r.has_lod = false;
+  r.bias = 2.0f;
+  r.lod = 0.0f;
+  CHECK(run_req(b, d, s, r, o) == SampleStatus::Ok && near_to(o[0] * 255.0f, 120));
+  // the minify filter applies when the lod is above 0, the magnify filter at 0: a ramp in the base level, point magnify and bilinear minify
+  {
+    for (uint32_t x = 0; x < 8; ++x)
+      for (uint32_t y = 0; y < 8; ++y) {
+        LevelLayout l0;
+        image_level(d, 0, &l0);
+        const uint8_t t[4] = {static_cast<uint8_t>(x * 30), 0, 0, 255};
+        memcpy(reinterpret_cast<uint8_t*>(b.words.data()) + image_texel_offset(d, l0, x, y, 0), t, 4);
+      }
+    SamplerDescriptor f;
+    f.mip_filter = 1;
+    f.bilinear = false;
+    f.min_bilinear_set = true;
+    f.min_bilinear = true;
+    SampleRequest q;
+    q.coord[0] = 0.5f;
+    q.coord[1] = 0.5f;
+    q.has_lod = true;
+    q.lod = 0.0f;
+    CHECK(run_req(b, d, f, q, o) == SampleStatus::Ok && near_to(o[0] * 255.0f, 120));             // texel 4 of the ramp, nearest
+    f.mip_filter = 0;
+    f.min_bilinear = true;
+    q.lod = 0.4f;
+    CHECK(run_req(b, d, f, q, o) == SampleStatus::Ok && near_to(o[0] * 255.0f, 105));             // bilinear at the edge of texels 3 and 4: (90 + 120) / 2
+  }
+  // an unnormalized lookup has no levels
+  SamplerDescriptor un;
+  un.unnormalized = true;
+  CHECK(run_req(b, d, un, r, o) == SampleStatus::Unsupported);
+  // refusals: more levels than the size has, the levels in a layout that has none, a pitch that is not the padded one
+  ImageDescriptor bad = d;
+  bad.levels = 5;
+  CHECK(!make_image_descriptor(ArrayView<uint32_t>(w, 8), bad));
+  bad = d; bad.tile_index = 8;
+  CHECK(!make_image_descriptor(ArrayView<uint32_t>(w, 8), bad));
+  bad = d; bad.tile_index = 10;
+  CHECK(!make_image_descriptor(ArrayView<uint32_t>(w, 8), bad));
+  bad = e; bad.pitch_pixels = 24;
+  CHECK(!make_image_descriptor(ArrayView<uint32_t>(w, 8), bad));
+}
+
+static void test_slices() {
+  Block b;
+  float o[4];
+  auto near_to = [](float a, float want) { return a > want - 0.01f && a < want + 0.01f; };
+  // an array of 3 layers (4 by 4), red = 80 * layer
+  {
+    ImageDescriptor d = base_image(b, 4, 4, 1, ImageType::Array2D, 3);
+    uint32_t w[8];
+    CHECK(make_image_descriptor(ArrayView<uint32_t>(w, 8), d));
+    CHECK((w[3] >> 28) == 13 && (w[4] & 0x1FFF) == 2 && (w[5] >> 13) == 2 && (w[5] & 0x1FFF) == 0);
+    LevelLayout l;
+    CHECK(image_level(d, 0, &l) && l.slices == 3 && l.slice_bytes == 8 * 8 * 4 && image_bytes(d) == 3 * 256);
+    for (uint32_t z = 0; z < 3; ++z) {
+      const uint8_t t[4] = {static_cast<uint8_t>(80 * z), 0, 0, 255};
+      for (uint32_t y = 0; y < 4; ++y) for (uint32_t x = 0; x < 4; ++x) memcpy(reinterpret_cast<uint8_t*>(b.words.data()) + image_texel_offset(d, l, x, y, z), t, 4);
+    }
+    SamplerDescriptor s;
+    SampleRequest r;
+    r.coord[0] = r.coord[1] = 0.3f;
+    const float layers[] = {0, 1, 2, 1.4f, 1.6f, -3, 99};
+    const float want[] = {0, 80, 160, 80, 160, 0, 160};
+    for (int k = 0; k < 7; ++k) {
+      r.coord[2] = layers[k];
+      CHECK(run_req(b, d, s, r, o) == SampleStatus::Ok && near_to(o[0] * 255.0f, want[k]));
+    }
+  }
+  // a volume of 4 slices (4 by 4), red = 60 * z; nearest, trilinear and the z address modes
+  {
+    ImageDescriptor d = base_image(b, 4, 4, 1, ImageType::Image3D, 4);
+    uint32_t w[8];
+    CHECK(make_image_descriptor(ArrayView<uint32_t>(w, 8), d) && (w[3] >> 28) == 10 && (w[4] & 0x1FFF) == 3 && w[5] == 0);
+    LevelLayout l;
+    CHECK(image_level(d, 0, &l) && l.slices == 4 && l.depth == 4);
+    for (uint32_t z = 0; z < 4; ++z) {
+      const uint8_t t[4] = {static_cast<uint8_t>(60 * z), 0, 0, 255};
+      for (uint32_t y = 0; y < 4; ++y) for (uint32_t x = 0; x < 4; ++x) memcpy(reinterpret_cast<uint8_t*>(b.words.data()) + image_texel_offset(d, l, x, y, z), t, 4);
+    }
+    SampleRequest r;
+    r.coord[0] = r.coord[1] = 0.4f;
+    SamplerDescriptor s;
+    r.coord[2] = 0.5f;
+    CHECK(run_req(b, d, s, r, o) == SampleStatus::Ok && near_to(o[0] * 255.0f, 120));                    // slice floor(2.0) = 2
+    r.coord[2] = 0.9f;
+    CHECK(run_req(b, d, s, r, o) == SampleStatus::Ok && near_to(o[0] * 255.0f, 180));
+    s.z_filter = 2;
+    r.coord[2] = 0.5f;
+    CHECK(run_req(b, d, s, r, o) == SampleStatus::Ok && near_to(o[0] * 255.0f, 90));                     // between slices 1 and 2
+    r.coord[2] = 0.0f;
+    s.clamp_z = 2;
+    CHECK(run_req(b, d, s, r, o) == SampleStatus::Ok && near_to(o[0] * 255.0f, 0));                      // clamped to slice 0 on both taps
+    s.clamp_z = 0;
+    CHECK(run_req(b, d, s, r, o) == SampleStatus::Ok && near_to(o[0] * 255.0f, 90));                     // wrapped: slices 3 and 0 (mean of 180 and 0)
+    s.clamp_z = 6;
+    s.border = 2;
+    CHECK(run_req(b, d, s, r, o) == SampleStatus::Ok && near_to(o[3], 1.0f) && near_to(o[0] * 255.0f, (255.0f + 0.0f) / 2));        // the slice before 0 is the (opaque white) border
+    // 3D with mips: a volume 4 by 4 by 4 with 3 levels: the slices of the levels count 4, 2, 1
+    ImageDescriptor m = base_image(b, 4, 4, 3, ImageType::Image3D, 4);
+    LevelLayout l0, l1, l2;
+    CHECK(make_image_descriptor(ArrayView<uint32_t>(w, 8), m) && image_level(m, 0, &l0) && image_level(m, 1, &l1) && image_level(m, 2, &l2));
+    CHECK(l0.slices == 4 && l1.slices == 2 && l1.depth == 2 && l2.slices == 1 && l1.offset == 1024 && l2.offset == 1024 + 2 * 256);
+  }
+  // a cube of 4 by 4 faces, red = 40 * face; the face coordinates are (s / |ma| + 1.5) and the face is the third coordinate
+  {
+    ImageDescriptor d = base_image(b, 4, 4, 1, ImageType::Cube, 6);
+    uint32_t w[8];
+    CHECK(make_image_descriptor(ArrayView<uint32_t>(w, 8), d) && (w[3] >> 28) == 11 && (w[4] & 0x1FFF) == 5 && (w[5] >> 13) == 5);
+    LevelLayout l;
+    CHECK(image_level(d, 0, &l) && l.slices == 6);
+    for (uint32_t z = 0; z < 6; ++z) {
+      const uint8_t t[4] = {static_cast<uint8_t>(40 * z), 0, 0, 255};
+      for (uint32_t y = 0; y < 4; ++y) for (uint32_t x = 0; x < 4; ++x) memcpy(reinterpret_cast<uint8_t*>(b.words.data()) + image_texel_offset(d, l, x, y, z), t, 4);
+    }
+    SamplerDescriptor s;
+    SampleRequest r;
+    r.coord[0] = r.coord[1] = 1.5f;
+    for (uint32_t face = 0; face < 6; ++face) {
+      r.coord[2] = static_cast<float>(face);
+      CHECK(run_req(b, d, s, r, o) == SampleStatus::Ok && near_to(o[0] * 255.0f, 40.0f * face));
+    }
+    // bilinear filtering across the edges of faces is not done: it needs DISABLE_CUBE_WRAP (clamping within the face)
+    s.bilinear = true;
+    CHECK(run_req(b, d, s, r, o) == SampleStatus::Unsupported);
+    s.disable_cube_wrap = true;
+    CHECK(run_req(b, d, s, r, o) == SampleStatus::Ok);
+    // refused: not square, not 6 faces
+    ImageDescriptor bad = d;
+    bad.height = 2;
+    CHECK(!make_image_descriptor(ArrayView<uint32_t>(w, 8), bad));
+    bad = d; bad.depth = 5;
+    CHECK(!make_image_descriptor(ArrayView<uint32_t>(w, 8), bad));
+    // slices need the 1D tiled layout
+    bad = d; bad.tile_index = 8;
+    CHECK(!make_image_descriptor(ArrayView<uint32_t>(w, 8), bad));
+    bad = base_image(b, 4, 4, 1, ImageType::Array2D, 2); bad.tile_index = 10;
+    CHECK(!make_image_descriptor(ArrayView<uint32_t>(w, 8), bad));
+  }
+}
+
+// every bit of descriptors of the new kinds flipped: refused, or read without leaving the memory
+static void test_new_bit_flips() {
+  Block b;
+  const ImageDescriptor kinds[] = {base_image(b, 8, 8, 4, ImageType::Image2D, 1), base_image(b, 4, 4, 3, ImageType::Image3D, 4), base_image(b, 4, 4, 1, ImageType::Cube, 6),
+                                   base_image(b, 5, 3, 2, ImageType::Array2D, 3)};
+  SamplerDescriptor smp;
+  smp.mip_filter = 2;
+  smp.z_filter = 2;
+  smp.bilinear = true;
+  smp.disable_cube_wrap = true;
+  uint32_t sw[4];
+  CHECK(make_sampler_descriptor(ArrayView<uint32_t>(sw, 4), smp));
+  for (const ImageDescriptor& d : kinds) {
+    uint32_t iw[8];
+    CHECK(make_image_descriptor(ArrayView<uint32_t>(iw, 8), d));
+    float o[4];
+    SampleRequest r;
+    r.coord[0] = r.coord[1] = r.coord[2] = 0.4f;
+    r.has_lod = true;
+    r.lod = 1.3f;
+    for (uint32_t bit = 0; bit < 8 * 32; ++bit) {
+      uint32_t f[8];
+      memcpy(f, iw, sizeof f);
+      f[bit / 32] ^= 1u << (bit % 32);
+      (void)sample_image(b, ArrayView<const uint32_t>(f, 8), ArrayView<const uint32_t>(sw, 4), r, o);
+    }
+    for (uint32_t bit = 0; bit < 4 * 32; ++bit) {
+      uint32_t f[4];
+      memcpy(f, sw, sizeof f);
+      f[bit / 32] ^= 1u << (bit % 32);
+      (void)sample_image(b, ArrayView<const uint32_t>(iw, 8), ArrayView<const uint32_t>(f, 4), r, o);
+    }
+  }
+  // awkward lods and coordinates
+  uint32_t iw[8];
+  make_image_descriptor(ArrayView<uint32_t>(iw, 8), kinds[1]);
+  const float odd[] = {NAN, INFINITY, -INFINITY, 1e30f, -1e30f};
+  float o[4];
+  for (const float a : odd) {
+    SampleRequest r;
+    r.coord[0] = a; r.coord[1] = a; r.coord[2] = a;
+    r.has_lod = true;
+    r.lod = a;
+    r.bias = a;
+    (void)sample_image(b, ArrayView<const uint32_t>(iw, 8), ArrayView<const uint32_t>(sw, 4), r, o);
+  }
+}
+
+// Chains and slices in the linear and 2D tiled layouts, and 1D and cube array images
+static void test_more_layouts() {
+  Block b;
+  auto near_to = [](float a, float want) { return a > want - 0.01f && a < want + 0.01f; };
+  // linear aligned: 8 by 8 with four levels of 4 byte texels. The pitch is a multiple of 16 pixels and widened until a slice is a multiple of 64 pixels: 16 by 8, 16 by 4, 32 by 2, 64 by 1
+  {
+    ImageDescriptor d = base_image(b, 8, 8, 4, ImageType::Image2D, 1);
+    d.tile_index = 8;
+    d.pitch_pixels = image_pitch(8, 8, 4, 4, 8);
+    CHECK(d.pitch_pixels == 16);
+    const uint32_t pitches[4] = {16, 16, 32, 64}, rows[4] = {8, 4, 2, 1};
+    const uint64_t offsets[4] = {0, 512, 768, 1024};
+    for (uint32_t k = 0; k < 4; ++k) {
+      LevelLayout l;
+      CHECK(image_level(d, k, &l) && l.pitch == pitches[k] && l.rows == rows[k] && l.offset == offsets[k] && l.layout.kind == TileLayout::Kind::Linear);
+    }
+    uint32_t w[8];
+    CHECK(make_image_descriptor(ArrayView<uint32_t>(w, 8), d));
+    for (uint32_t k = 0; k < 4; ++k) fill_level(b, d, k, static_cast<uint8_t>(60 * k));
+    SamplerDescriptor s;
+    s.mip_filter = 1;
+    SampleRequest r;
+    r.coord[0] = r.coord[1] = 0.5f;
+    r.has_lod = true;
+    float o[4];
+    r.lod = 2.0f;
+    CHECK(run_req(b, d, s, r, o) == SampleStatus::Ok && near_to(o[0] * 255.0f, 120));
+    r.lod = 3.0f;
+    CHECK(run_req(b, d, s, r, o) == SampleStatus::Ok && near_to(o[0] * 255.0f, 180));
+    // an array of linear layers
+    ImageDescriptor a = base_image(b, 8, 4, 1, ImageType::Array2D, 3);
+    a.tile_index = 8;
+    a.pitch_pixels = image_pitch(8, 4, 1, 4, 8);
+    CHECK(a.pitch_pixels == 16 && make_image_descriptor(ArrayView<uint32_t>(w, 8), a));
+    LevelLayout al;
+    CHECK(image_level(a, 0, &al) && al.slice_bytes == 16 * 4 * 4 && al.slices == 3);
+  }
+  // 2D tiled: the slices rotate the banks, every pixel of every slice has its place; a chain's small levels are 1D tiled
+  {
+    TileLayout t;
+    CHECK(resolve_tile_index(10, &t));
+    const uint32_t pitch = 256, rows = 128;
+    std::vector<uint8_t> seen(2ull * pitch * rows);
+    uint32_t bad = 0;
+    for (uint32_t z = 0; z < 2; ++z)
+      for (uint32_t y = 0; y < rows; ++y)
+        for (uint32_t x = 0; x < pitch; ++x) {
+          const uint64_t off = z * static_cast<uint64_t>(pitch) * rows * 4 + surface_offset(t, 4, pitch, x, y, rows, z);
+          if (off % 4 != 0 || off / 4 >= seen.size() || seen[off / 4]) { ++bad; continue; }
+          seen[off / 4] = 1;
+        }
+    CHECK(bad == 0);
+    CHECK(surface_offset(t, 4, pitch, 0, 0, rows, 1) != 0);                           // (the second slice starts in another bank)
+    ImageDescriptor d = base_image(b, 300, 200, 9, ImageType::Image2D, 1);
+    d.tile_index = 10;
+    d.pitch_pixels = image_pitch(300, 200, 9, 4, 10);
+    CHECK(d.pitch_pixels == 512);
+    LevelLayout l;
+    CHECK(image_level(d, 0, &l) && l.layout.kind == TileLayout::Kind::Tiled2D && l.pitch == 512 && l.rows == 256);
+    CHECK(image_level(d, 1, &l) && l.layout.kind == TileLayout::Kind::Tiled2D && l.pitch == 256 && l.rows == 128);       // 256 by 128: still a whole macro tile
+    CHECK(image_level(d, 2, &l) && l.layout.kind == TileLayout::Kind::Tiled1D && l.pitch == 128 && l.rows == 64);        // 128 wide: below the macro tile width of 256
+    CHECK(image_level(d, 8, &l) && l.layout.kind == TileLayout::Kind::Tiled1D && l.pitch == 8 && l.rows == 8);
+    // sampling a 2D tiled array: the layers hold 60 * layer
+    ImageDescriptor a = base_image(b, 40, 30, 1, ImageType::Array2D, 2);
+    a.tile_index = 10;
+    a.pitch_pixels = image_pitch(40, 30, 1, 4, 10);
+    uint32_t w[8];
+    CHECK(make_image_descriptor(ArrayView<uint32_t>(w, 8), a));
+    fill_level(b, a, 0, 0);                                          // (all of both layers 0)
+    LevelLayout al;
+    CHECK(image_level(a, 0, &al));
+    for (uint32_t y = 0; y < 30; ++y) for (uint32_t x = 0; x < 40; ++x) { const uint8_t t4[4] = {90, 0, 0, 255}; memcpy(reinterpret_cast<uint8_t*>(b.words.data()) + image_texel_offset(a, al, x, y, 1), t4, 4); }
+    SamplerDescriptor smp;
+    SampleRequest r;
+    r.coord[0] = 0.3f; r.coord[1] = 0.6f; r.coord[2] = 1.0f;
+    float o[4];
+    CHECK(run_req(b, a, smp, r, o) == SampleStatus::Ok && near_to(o[0] * 255.0f, 90));
+    r.coord[2] = 0.0f;
+    CHECK(run_req(b, a, smp, r, o) == SampleStatus::Ok && near_to(o[0] * 255.0f, 0));
+    // the base of a 2D tiled image must be at its alignment
+    a.address += 256;
+    CHECK(!make_image_descriptor(ArrayView<uint32_t>(w, 8), a));
+  }
+  // 1D images and arrays of them
+  {
+    ImageDescriptor d = base_image(b, 37, 1, 6, ImageType::Image1D, 1);
+    uint32_t w[8];
+    d.pitch_pixels = image_pitch(37, 1, 6, 4, 9);
+    CHECK(make_image_descriptor(ArrayView<uint32_t>(w, 8), d) && (w[3] >> 28) == 8 && (w[4] & 0x1FFF) == 0 && ((w[3] >> 16) & 0xF) == 5);
+    ImageDescriptor back;
+    CHECK(decode_image_descriptor(ArrayView<const uint32_t>(w, 8), &back) && back.type == ImageType::Image1D && back.height == 1);
+    for (uint32_t k = 0; k < 6; ++k) fill_level(b, d, k, static_cast<uint8_t>(30 * k));
+    SamplerDescriptor s;
+    s.mip_filter = 1;
+    SampleRequest r;
+    r.coord[0] = 0.7f;
+    r.coord[1] = 0.9f;                                               // (ignored)
+    r.has_lod = true;
+    r.lod = 3.0f;
+    float o[4];
+    CHECK(run_req(b, d, s, r, o) == SampleStatus::Ok && near_to(o[0] * 255.0f, 90));
+    s.bilinear = true;
+    CHECK(run_req(b, d, s, r, o) == SampleStatus::Ok && near_to(o[0] * 255.0f, 90));
+    ImageDescriptor bad = d;
+    bad.height = 2;
+    CHECK(!make_image_descriptor(ArrayView<uint32_t>(w, 8), bad));
+    // an array: 20 wide, 4 layers, 3 levels; layer l of level k holds 10 l + 50 k
+    ImageDescriptor a = base_image(b, 20, 1, 3, ImageType::Array1D, 4);
+    a.pitch_pixels = image_pitch(20, 1, 3, 4, 9);
+    CHECK(make_image_descriptor(ArrayView<uint32_t>(w, 8), a) && (w[3] >> 28) == 12 && (w[4] & 0x1FFF) == 3 && (w[5] >> 13) == 3);
+    for (uint32_t k = 0; k < 3; ++k) {
+      LevelLayout l;
+      CHECK(image_level(a, k, &l));
+      for (uint32_t z = 0; z < 4; ++z)
+        for (uint32_t x = 0; x < l.width; ++x) { const uint8_t t4[4] = {static_cast<uint8_t>(10 * z + 50 * k), 0, 0, 255}; memcpy(reinterpret_cast<uint8_t*>(b.words.data()) + image_texel_offset(a, l, x, 0, z), t4, 4); }
+    }
+    SamplerDescriptor sp;
+    sp.mip_filter = 1;
+    r.coord[0] = 0.5f;
+    r.has_lod = true;
+    for (uint32_t layer = 0; layer < 4; ++layer) {
+      r.coord[1] = static_cast<float>(layer);
+      r.lod = 1.0f;
+      CHECK(run_req(b, a, sp, r, o) == SampleStatus::Ok && near_to(o[0] * 255.0f, 10.0f * layer + 50.0f));
+    }
+  }
+  // a cube array: two cubes, the third coordinate is the face plus 8 for each layer; slice = 6 * layer + face holds 10 * slice
+  {
+    ImageDescriptor d = base_image(b, 4, 4, 1, ImageType::Cube, 12);
+    uint32_t w[8];
+    CHECK(make_image_descriptor(ArrayView<uint32_t>(w, 8), d) && (w[4] & 0x1FFF) == 11 && (w[5] >> 13) == 11);
+    LevelLayout l;
+    CHECK(image_level(d, 0, &l) && l.slices == 12);
+    for (uint32_t z = 0; z < 12; ++z) {
+      const uint8_t t4[4] = {static_cast<uint8_t>(10 * z), 0, 0, 255};
+      for (uint32_t y = 0; y < 4; ++y) for (uint32_t x = 0; x < 4; ++x) memcpy(reinterpret_cast<uint8_t*>(b.words.data()) + image_texel_offset(d, l, x, y, z), t4, 4);
+    }
+    SamplerDescriptor s;
+    SampleRequest r;
+    r.coord[0] = r.coord[1] = 1.5f;
+    float o[4];
+    const float ids[] = {0, 3, 5, 8, 11, 13, 100};
+    const float fixed[] = {0, 30, 50, 60, 90, 110, 100};            // (11 = 8 + 3: layer 1, face 3: slice 9; 13: slice 11; 100: layer 12 is clamped to 1, face 4: slice 10)
+    for (int n = 0; n < 7; ++n) {
+      r.coord[2] = ids[n];
+      CHECK(run_req(b, d, s, r, o) == SampleStatus::Ok && near_to(o[0] * 255.0f, fixed[n]));
+    }
+    ImageDescriptor bad = d;
+    bad.depth = 7;
+    CHECK(!make_image_descriptor(ArrayView<uint32_t>(w, 8), bad));
+  }
+}
+
 int main() {
   test_layouts();
   test_2d_layouts();
@@ -439,6 +911,10 @@ int main() {
   test_sampling();
   test_formats_and_tiling();
   test_bit_flips();
+  test_mips();
+  test_slices();
+  test_new_bit_flips();
+  test_more_layouts();
   if (g_failed == 0) printf("GcnTextureTest: all passed\n");
   return g_failed == 0 ? 0 : 1;
 }

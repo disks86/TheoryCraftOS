@@ -125,6 +125,41 @@ uint32_t give_handle(Process& p, ObjectManager& objects, ObjectKind kind, uint32
   return status;
 }
 
+
+// The rights a handle to a synchronization object can have: the object's own ("query state", and "modify state" for all but mutexes), the standard ones and SYNCHRONIZE.
+// Generic requests are mapped to them; what is asked for that is not among them is refused. `granted` gets what the handle will hold.
+constexpr uint32_t kAccessDeniedStatus = 0xC0000022u, kPrivilegeNotHeld = 0xC0000061u, kSynchronize = 0x100000u, kMaximumAllowed = 0x2000000u, kAccessSystemSecurity = 0x1000000u;
+uint32_t map_sync_access(ObjectKind kind, uint32_t desired, bool opening, uint32_t* granted) {
+  const bool modifiable = kind != ObjectKind::Mutex;
+  const uint32_t all = 0x1F0001u | (modifiable ? 2u : 0u);
+  if (kind != ObjectKind::Event && kind != ObjectKind::Mutex && kind != ObjectKind::Semaphore && kind != ObjectKind::Timer) { *granted = all; return kSuccess; }
+  uint32_t access = desired;
+  if (access & 0x80000000u) access |= 0x20001u;      // GENERIC_READ
+  if (access & 0x40000000u) access |= modifiable ? 0x20002u : 0x20000u;      // GENERIC_WRITE
+  if (access & 0x20000000u) access |= 0x120000u;      // GENERIC_EXECUTE
+  if (access & 0x10000000u) access |= all;      // GENERIC_ALL
+  access &= ~0xF0000000u;
+  if (access & kMaximumAllowed) access = all;
+  if (access & kAccessSystemSecurity) return kPrivilegeNotHeld;
+  if (opening && access == 0) return kAccessDeniedStatus;
+  if (!opening && access == 0) access = all;      // (a creator that asks for nothing gets everything)
+  if (access & ~all) return kAccessDeniedStatus;
+  *granted = access;
+  return kSuccess;
+}
+// Records on a new handle which of the rights it does not carry.
+void restrict_handle(Process& p, uint64_t handle_at, uint32_t granted, ObjectKind kind) {
+  uint64_t handle = 0, slot = 0;
+  if (!p.read_user_u64(handle_at, &handle) || !slot_of(handle, &slot)) return;
+  const bool modifiable = kind != ObjectKind::Mutex;
+  p.files().set_denied_access(slot, ~granted & (0x1F0001u | (modifiable ? 2u : 0u)));
+}
+// Does the handle (a slot) hold the rights?
+bool handle_allows(Process& p, uint64_t handle, uint32_t rights) {
+  uint64_t slot = 0;
+  return !slot_of(handle, &slot) || (p.files().denied_access(slot) & rights) == 0;
+}
+
 uint32_t create_object(Process& p, const SyscallRequest& r, ObjectKind kind, bool manual_reset, bool state, int32_t initial, int32_t maximum) {
   ObjectManager* objects = system_objects();
   if (!objects) return kNotImplemented;
@@ -132,10 +167,14 @@ uint32_t create_object(Process& p, const SyscallRequest& r, ObjectKind kind, boo
   uint32_t size = 0;
   const uint32_t status = read_name(p, r.args[2], name, ObjectManager::kNameBytes, &size);
   if (status != kSuccess) return status;
+  uint32_t granted = 0;
+  if (const uint32_t denied = map_sync_access(kind, uint32_t(r.args[1]), false, &granted)) return denied;
   const uint64_t owner = p.runtime() ? p.runtime()->current_thread_id() : p.id();
   const ObjectManager::Created c = objects->create(kind, StringView(name, size), manual_reset, state, initial, maximum, owner);
   if (c.id == 0) return c.status;
-  return give_handle(p, *objects, kind, c.id, r.args[0], c.status, wants_inherit(p, r.args[2]));
+  const uint32_t given = give_handle(p, *objects, kind, c.id, r.args[0], c.status, wants_inherit(p, r.args[2]));
+  if (given == kSuccess || given == c.status) restrict_handle(p, r.args[0], granted, kind);
+  return given;
 }
 
 uint32_t open_object(Process& p, const SyscallRequest& r, ObjectKind kind) {
@@ -146,9 +185,13 @@ uint32_t open_object(Process& p, const SyscallRequest& r, ObjectKind kind) {
   const uint32_t status = read_name(p, r.args[2], name, ObjectManager::kNameBytes, &size);
   if (status != kSuccess) return status;
   if (size == 0) return kInvalidParameter;
+  uint32_t granted = 0;
   const ObjectManager::Created c = objects->open(kind, StringView(name, size));
   if (c.id == 0) return c.status;
-  return give_handle(p, *objects, kind, c.id, r.args[0], kSuccess, wants_inherit(p, r.args[2]));
+  if (const uint32_t denied = map_sync_access(kind, uint32_t(r.args[1]), true, &granted)) { objects->release(c.id); return denied; }
+  const uint32_t given = give_handle(p, *objects, kind, c.id, r.args[0], kSuccess, wants_inherit(p, r.args[2]));
+  if (given == kSuccess) restrict_handle(p, r.args[0], granted, kind);
+  return given;
 }
 
 // The object a handle names, of the kind asked for. 0 if it is none.
@@ -178,7 +221,12 @@ bool resolve(Process& p, uint64_t handle, Waitable* w) {
   if (k == DescriptorKind::Thread) { w->type = Waitable::Thread; w->thread = p.files().token(slot); return true; }
   if (k == DescriptorKind::Pipe) { w->type = Waitable::Pipe; w->thread = slot; return true; }      // (a pipe handle is signalled, as a file object with no call under way is)
   if (k == DescriptorKind::Mailslot) { w->type = Waitable::Mailslot; w->thread = slot; return true; }
-  if (is_object_kind(k)) { w->type = Waitable::Object; w->object = uint32_t(p.files().token(slot)); return true; }
+  if (is_object_kind(k)) {
+    if (p.files().denied_access(slot) & 0x100000u) return false;      // (no SYNCHRONIZE right)
+    w->type = Waitable::Object;
+    w->object = uint32_t(p.files().token(slot));
+    return true;
+  }
   return false;
 }
 
@@ -288,6 +336,7 @@ uint32_t nt_open_event(Process& p, const SyscallRequest& r) { return open_object
 
 uint32_t nt_set_event(Process& p, const SyscallRequest& r) {
   ObjectManager* objects = system_objects();
+  if (!handle_allows(p, r.args[0], 2)) return kAccessDeniedStatus;
   const uint32_t id = object_of(p, r.args[0], DescriptorKind::Event);
   if (!objects || !id) return objects ? kInvalidHandle : kNotImplemented;
   int32_t previous = 0;
@@ -297,6 +346,7 @@ uint32_t nt_set_event(Process& p, const SyscallRequest& r) {
 uint32_t nt_reset_event(Process& p, const SyscallRequest& r) {
   ObjectManager* objects = system_objects();
   if (!objects) return kNotImplemented;
+  if (!handle_allows(p, r.args[0], 2)) return kAccessDeniedStatus;
   // FindNextChangeNotification is this same call on a ChangeNotification handle (see ObjectManager::reset_event): both are "stays signalled until told
   // otherwise" handles with nothing else to resetting them.
   uint32_t id = object_of(p, r.args[0], DescriptorKind::Event);
@@ -308,6 +358,7 @@ uint32_t nt_reset_event(Process& p, const SyscallRequest& r) {
 }
 uint32_t nt_pulse_event(Process& p, const SyscallRequest& r) {
   ObjectManager* objects = system_objects();
+  if (!handle_allows(p, r.args[0], 2)) return kAccessDeniedStatus;
   const uint32_t id = object_of(p, r.args[0], DescriptorKind::Event);
   if (!objects || !id) return objects ? kInvalidHandle : kNotImplemented;
   int32_t previous = 0;
@@ -335,6 +386,7 @@ uint32_t nt_create_semaphore(Process& p, const SyscallRequest& r) {
 }
 uint32_t nt_open_semaphore(Process& p, const SyscallRequest& r) { return open_object(p, r, ObjectKind::Semaphore); }
 uint32_t nt_release_semaphore(Process& p, const SyscallRequest& r) {
+  if (!handle_allows(p, r.args[0], 2)) return kAccessDeniedStatus;
   ObjectManager* objects = system_objects();
   const uint32_t id = object_of(p, r.args[0], DescriptorKind::Semaphore);
   if (!objects || !id) return objects ? kInvalidHandle : kNotImplemented;
@@ -515,6 +567,7 @@ uint32_t nt_open_timer(Process& p, const SyscallRequest& r) { return open_object
 
 // NtSetTimer(Handle, PLARGE_INTEGER DueTime (negative: relative, 100 ns), PTIMER_APC_ROUTINE, PVOID Context, BOOLEAN ResumeTimer, LONG Period (ms), PBOOLEAN PreviousState)
 uint32_t nt_set_timer(Process& p, const SyscallRequest& r) {
+  if (!handle_allows(p, r.args[0], 2)) return kAccessDeniedStatus;
   uint64_t resume = 0, period = 0, previous_at = 0;
   if (!argument(p, r, 4, &resume) || !argument(p, r, 5, &period) || !argument(p, r, 6, &previous_at)) return kAccessViolation;
   ObjectManager* objects = system_objects();

@@ -36,16 +36,39 @@ bool layout_of(uint32_t tile_index, TileLayout* layout) { return resolve_tile_in
 
 bool bound(const VegaTexture& t) { return t.texels.size() != 0; }
 
-uint32_t texture_pitch(const VegaTexture& t) {
+// The image the texture is, at `address`
+ImageDescriptor image_of(const VegaTexture& t, uint64_t address) {
   TileLayout layout;
-  return layout_of(t.tile_index, &layout) ? static_cast<uint32_t>(align_to(t.width, surface_pitch_align(layout, texel_bytes(t.format)))) : 0;
+  ImageDescriptor image;
+  image.address = address;
+  image.width = t.width;
+  image.height = t.height;
+  image.format = t.format;
+  image.tile_index = t.tile_index;
+  image.type = t.type;
+  image.depth = t.depth;
+  image.levels = t.levels;
+  const bool chain = !(t.levels == 1 && t.depth == 1 && (t.type == ImageType::Image2D || t.type == ImageType::Image1D));
+  image.pitch_pixels = chain ? image_pitch(t.width, t.height, t.levels, texel_bytes(t.format), t.tile_index)
+                             : (layout_of(t.tile_index, &layout) ? static_cast<uint32_t>(align_to(t.width, surface_pitch_align(layout, texel_bytes(t.format)))) : 0);
+  return image;
 }
 
-// The surface of a texture: its bytes and the layout, or false if the texture cannot be described or its texels are not the size they should be.
-bool texture_ok(const VegaTexture& t, TileLayout* layout) {
-  if (!layout_of(t.tile_index, layout) || t.width == 0 || t.height == 0 || t.width > 16384 || t.height > 16384) return false;
-  const uint64_t texel = texel_bytes(t.format);
-  return surface_valid(*layout, static_cast<uint32_t>(texel), texture_pitch(t)) && t.texels.size() == static_cast<uint64_t>(t.width) * t.height * texel;
+// The texels the request must hold for the texture: every level, every slice, tightly packed
+uint64_t texture_texels(const VegaTexture& t) {
+  uint64_t n = 0;
+  for (uint32_t k = 0; k < t.levels && k < 32; ++k) {
+    const uint64_t w = (t.width >> k) > 0 ? t.width >> k : 1, h = (t.height >> k) > 0 ? t.height >> k : 1;
+    const uint64_t d = t.type == ImageType::Image3D ? ((t.depth >> k) > 0 ? t.depth >> k : 1) : t.depth;
+    n += w * h * d;
+  }
+  return n;
+}
+
+// Whether the texture can be described and its texels are the size they should be.
+bool texture_ok(const VegaTexture& t) {
+  uint32_t w[8];
+  return make_image_descriptor(ArrayView<uint32_t>(w, 8), image_of(t, 0)) && t.texels.size() == texture_texels(t) * texel_bytes(t.format);
 }
 
 // constants the shaders read are padded to the 64 rows the command processor model probes for, and to at least what the shaders say
@@ -62,7 +85,7 @@ bool make_plan(const VegaDrawRequest& r, Plan* p) {
     if (AmdVegaDraw::plane_pitch(r) == 0) return false;
   }
   for (const VegaTexture& t : r.textures)
-    if (bound(t) && !texture_ok(t, &layout)) return false;
+    if (bound(t) && !texture_ok(t)) return false;
   uint64_t at = 0;
   // (a piece starts at a multiple of the 256 bytes and of the alignment its layout wants)
   p->alignment = AmdVegaDraw::kAlignment;
@@ -91,7 +114,7 @@ bool make_plan(const VegaDrawRequest& r, Plan* p) {
     if (!bound(r.textures[i])) continue;
     TileLayout tl;
     layout_of(r.textures[i].tile_index, &tl);
-    p->textures[i] = place(surface_bytes(tl, texel_bytes(r.textures[i].format), texture_pitch(r.textures[i]), r.textures[i].height), surface_base_align(tl, texel_bytes(r.textures[i].format)));
+    p->textures[i] = place(image_bytes(image_of(r.textures[i], 0)), image_base_align(image_of(r.textures[i], 0)));
   }
   p->total = at;
   return at <= (1ull << 31);
@@ -208,18 +231,17 @@ bool AmdVegaDraw::draw(AmdVegaM& card, const VegaDrawRequest& r, uint64_t area_o
   for (uint32_t i = 0; i < abi::kMaxSamplers; ++i) {
     const VegaTexture& t = r.textures[i];
     if (!bound(t)) continue;
-    TileLayout layout;
-    const uint32_t texel = texel_bytes(t.format), pitch = texture_pitch(t);
-    if (!texture_ok(t, &layout)) return false;
-    for (uint32_t y = 0; y < t.height; ++y)
-      for (uint32_t x = 0; x < t.width; ++x) w.patch_bytes(p.textures[i] + surface_offset(layout, texel, pitch, x, y, t.height), t.texels.subview((static_cast<uint64_t>(y) * t.width + x) * texel, texel));
-    ImageDescriptor image;
-    image.address = base + p.textures[i];
-    image.width = t.width;
-    image.height = t.height;
-    image.pitch_pixels = pitch;
-    image.format = t.format;
-    image.tile_index = t.tile_index;
+    const uint32_t texel = texel_bytes(t.format);
+    const ImageDescriptor image = image_of(t, base + p.textures[i]);
+    if (!texture_ok(t)) return false;
+    uint64_t next = 0;
+    for (uint32_t k = 0; k < t.levels; ++k) {
+      LevelLayout level;
+      if (!image_level(image, k, &level)) return false;
+      for (uint32_t z = 0; z < level.depth; ++z)
+        for (uint32_t y = 0; y < level.height; ++y)
+          for (uint32_t x = 0; x < level.width; ++x, ++next) w.patch_bytes(p.textures[i] + image_texel_offset(image, level, x, y, z), t.texels.subview(next * texel, texel));
+    }
     uint32_t iw[8], sw[4];
     if (!make_image_descriptor(ArrayView<uint32_t>(iw, 8), image) || !make_sampler_descriptor(ArrayView<uint32_t>(sw, 4), t.sampler)) return false;
     put_words(p.table + abi::kImageOffset + i * abi::kImageBytes, ArrayView<const uint32_t>(iw, 8));

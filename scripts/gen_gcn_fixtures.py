@@ -116,6 +116,9 @@ case('v_mad_f32 v0, v1, 2.0, -v3 mul:4', 'c.vop3(gcn::Vop3::v_mad_f32, 0, V(1), 
 case('v_mad_f32 v0, v1, v2, s3 div:2', 'c.vop3(gcn::Vop3::v_mad_f32, 0, V(1), V(2), S(3), gcn::Mods{0, 0, false, 3});')
 case('v_fma_f32 v250, v1, v2, v3', 'c.vop3(gcn::Vop3::v_fma_f32, 250, V(1), V(2), V(3));')
 case('v_med3_f32 v0, v1, v2, v3', 'c.vop3(gcn::Vop3::v_med3_f32, 0, V(1), V(2), V(3));')
+for name in ('cubeid', 'cubesc', 'cubetc', 'cubema'):
+    case('v_%s_f32 v0, v1, v2, v3' % name, 'c.vop3(gcn::Vop3::v_%s_f32, 0, V(1), V(2), V(3));' % name)
+case('v_cubema_f32 v4, |v5|, -v6, v7', 'c.vop3(gcn::Vop3::v_cubema_f32, 4, V(5), V(6), V(7), gcn::Mods{2, 1, false, 0});')
 case('v_bfe_u32 v0, v1, 8, 8', 'c.vop3(gcn::Vop3::v_bfe_u32, 0, V(1), gcn::imm_int(8), gcn::imm_int(8));')
 case('v_cvt_pkrtz_f16_f32 v0, v1, v2', 'c.vop3(gcn::Vop3::v_cvt_pkrtz_f16_f32, 0, V(1), V(2), gcn::Src{});')
 case('v_add_f32_e64 v0, -v1, |v2|', 'c.vop3_of(gcn::Vop2::v_add_f32, 0, V(1), V(2), gcn::Mods{1, 2, false, 0});')

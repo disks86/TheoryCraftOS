@@ -127,7 +127,7 @@ uint32_t pipe_of(const Macro& m, uint32_t x, uint32_t y) {
 }
 
 // EgBasedLib::ComputeBankFromCoord for one slice and no swizzle
-uint32_t bank_of(const Macro& m, uint32_t x, uint32_t y, uint32_t tile_split_slice) {
+uint32_t bank_of(const Macro& m, uint32_t x, uint32_t y, uint32_t tile_split_slice, uint32_t slice) {
   const uint32_t tx = x / 8 / (m.bank_width * m.pipes), ty = y / 8 / m.bank_height;
   const uint32_t x3 = bit(tx, 0), x4 = bit(tx, 1), x5 = bit(tx, 2), x6 = bit(tx, 3);
   const uint32_t y3 = bit(ty, 0), y4 = bit(ty, 1), y5 = bit(ty, 2), y6 = bit(ty, 3);
@@ -141,11 +141,12 @@ uint32_t bank_of(const Macro& m, uint32_t x, uint32_t y, uint32_t tile_split_sli
   uint32_t bank = b0 | b1 << 1 | b2 << 2 | b3 << 3;
   // HwlPreAdjustBank
   if ((m.pipe_config == 7 || m.pipe_config == 0xe) && m.bank_width == 1) bank |= bit(bank, 0) ^ bit(x / 8, 1) ^ bit(x / 8, 2);
+  bank ^= ((m.banks / 2) - 1) * slice;                     // (2D tiled thin: the slice rotates the banks)
   bank ^= ((m.banks / 2) + 1) * tile_split_slice;
   return bank & (m.banks - 1);
 }
 
-uint64_t offset_2d(const TileLayout& layout, uint32_t bytes, uint32_t pitch, uint32_t height, uint32_t x, uint32_t y) {
+uint64_t offset_2d(const TileLayout& layout, uint32_t bytes, uint32_t pitch, uint32_t height, uint32_t x, uint32_t y, uint32_t slice) {
   Macro m;
   if (!macro_of(layout, bytes, &m)) return 0;
   const Order& order = order_for(layout.micro, bytes);
@@ -173,7 +174,7 @@ uint64_t offset_2d(const TileLayout& layout, uint32_t bytes, uint32_t pitch, uin
   const uint64_t bank_interleave = (total >> pipe_interleave_bits) & (kBankInterleave - 1);
   const uint64_t rest = total >> (pipe_interleave_bits + bank_interleave_bits);
   return low | static_cast<uint64_t>(pipe_of(m, x, y)) << pipe_interleave_bits | bank_interleave << (pipe_interleave_bits + pipe_bits) |
-         static_cast<uint64_t>(bank_of(m, x, y, tile_split_slice)) << (pipe_interleave_bits + pipe_bits + bank_interleave_bits) |
+         static_cast<uint64_t>(bank_of(m, x, y, tile_split_slice, slice)) << (pipe_interleave_bits + pipe_bits + bank_interleave_bits) |
          rest << (pipe_interleave_bits + pipe_bits + bank_interleave_bits + bank_bits);
 }
 
@@ -233,12 +234,12 @@ bool surface_valid(const TileLayout& layout, uint32_t bytes, uint32_t pitch) {
   return macro_of(layout, bytes, &m) && pitch % m.pitch_align() == 0;
 }
 
-uint64_t surface_offset(const TileLayout& layout, uint32_t bytes, uint32_t pitch, uint32_t x, uint32_t y, uint32_t height) {
+uint64_t surface_offset(const TileLayout& layout, uint32_t bytes, uint32_t pitch, uint32_t x, uint32_t y, uint32_t height, uint32_t slice) {
   if (!surface_valid(layout, bytes, pitch)) return 0;
   if (layout.kind == TileLayout::Kind::Linear) return (static_cast<uint64_t>(y) * pitch + x) * bytes;
   if (layout.kind == TileLayout::Kind::Tiled2D) {
     const uint32_t align = surface_height_align(layout, bytes);
-    return offset_2d(layout, bytes, pitch, (height + align - 1) / align * align, x, y);
+    return offset_2d(layout, bytes, pitch, (height + align - 1) / align * align, x, y, slice);
   }
   const Order& order = order_for(layout.micro, bytes);
   const uint32_t bits[6] = {x & 1, x >> 1 & 1, x >> 2 & 1, y & 1, y >> 1 & 1, y >> 2 & 1};
@@ -246,6 +247,45 @@ uint64_t surface_offset(const TileLayout& layout, uint32_t bytes, uint32_t pitch
   for (uint32_t k = 0; k < 6; ++k) index |= bits[order.bit[k]] << k;
   const uint64_t tile = static_cast<uint64_t>(y / 8) * (pitch / 8) + x / 8;
   return (tile * 64 + index) * bytes;
+}
+
+bool surface_pad(const TileLayout& layout, uint32_t bytes, uint32_t width, uint32_t height, uint32_t* pitch_out, uint32_t* rows_out) {
+  if (width == 0 || height == 0 || width > 16384 || height > 16384 || !(bytes == 1 || bytes == 2 || bytes == 4 || bytes == 8 || bytes == 16)) return false;
+  auto align = [](uint32_t v, uint32_t a) { return (v + a - 1) / a * a; };
+  uint32_t pitch, rows;
+  if (layout.kind == TileLayout::Kind::Linear) {
+    const uint32_t pitch_align = 64 / bytes < 8 ? 8 : 64 / bytes;
+    const uint64_t slice_align = 256 / bytes < 64 ? 64 : 256 / bytes;               // pixels
+    pitch = align(width, pitch_align);
+    rows = height;
+    while ((static_cast<uint64_t>(pitch) * rows) % slice_align != 0 && pitch < 65536) pitch += pitch_align;
+  } else if (layout.kind == TileLayout::Kind::Tiled1D) {
+    pitch = align(width, 8);
+    rows = align(height, 8);
+    while ((static_cast<uint64_t>(pitch) * rows * bytes) % kPipeInterleaveBytes != 0 && pitch < 65536) pitch += 8;
+  } else {
+    pitch = align(width, surface_pitch_align(layout, bytes));
+    rows = align(height, surface_height_align(layout, bytes));
+  }
+  if (pitch > 65536) return false;
+  *pitch_out = pitch;
+  *rows_out = rows;
+  return true;
+}
+
+TileLayout level_layout(const TileLayout& base, uint32_t bytes, uint32_t width, uint32_t height) {
+  Macro m;
+  if (base.kind != TileLayout::Kind::Tiled2D || !macro_of(base, bytes, &m)) return base;
+  uint32_t tile_bytes = 64 * bytes;
+  if (tile_bytes > m.tile_split_bytes) tile_bytes = m.tile_split_bytes;
+  const uint64_t interleave = static_cast<uint64_t>(kPipeInterleaveBytes) * kBankInterleave;
+  const uint64_t threshold1 = static_cast<uint64_t>(tile_bytes) * m.pipes * m.bank_width * m.aspect, threshold2 = static_cast<uint64_t>(tile_bytes) * m.bank_width * m.bank_height;
+  if (width < m.pitch_align() || height < m.height_align() || interleave > threshold1 || interleave > threshold2) {
+    TileLayout one = base;
+    one.kind = TileLayout::Kind::Tiled1D;
+    return one;
+  }
+  return base;
 }
 
 uint64_t surface_bytes(const TileLayout& layout, uint32_t bytes, uint32_t pitch, uint32_t height) {

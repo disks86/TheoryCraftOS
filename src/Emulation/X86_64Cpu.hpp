@@ -87,6 +87,14 @@ class X86_64Cpu final : public IGuestCpu {
   bool set_x86_context(const process::X86Context& context) override;
   UniquePointer<IGuestCpu> clone_for_thread(allocators::IAllocator& allocator, uint64_t stack_pointer, bool set_tls, uint64_t tls) const override;
 
+  // CET shadow stacks (user mode) and ENQCMD: see X86_64Cet.cpp. Off until the host enables them.
+  void enable_shadow_stack(uint64_t shadow_stack_pointer, bool allow_wrss) { cet_.enabled = true; cet_.wrss = allow_wrss; cet_.ssp = shadow_stack_pointer; }
+  void disable_shadow_stack() { cet_ = Cet(); }
+  bool shadow_stack_enabled() const { return cet_.enabled; }
+  uint64_t shadow_stack_pointer() const { return cet_.ssp; }
+  void set_pasid(uint32_t pasid) { pasid_ = pasid & 0xFFFFF; }
+  void clear_pasid() { pasid_ = -1; }
+
   State& state() { return s_; }
   const State& state() const { return s_; }
 
@@ -143,6 +151,8 @@ class X86_64Cpu final : public IGuestCpu {
   Step step_0f(GuestMemory& m);
   Step step_0f_op(GuestMemory& m, uint8_t opcode);      // (the opcode byte after 0F already read)
   Step step_op(GuestMemory& m, uint8_t opcode);         // (a one-byte-map opcode, prefixes decoded)
+  Step apx_promoted_vex(GuestMemory& m, uint8_t p0, uint8_t p1, uint8_t p2, uint32_t map, uint8_t opcode);      // X86_64Apx.cpp: BMI, kmov, AMX tile loads and cmpccxadd in the extended EVEX prefix
+  Step cmpxadd_instruction(GuestMemory& m, uint8_t opcode, bool wide, uint32_t vvvv);      // cmpccxadd (VEX map 2, 66 E0..EF)
   Step apx_map4(GuestMemory& m, uint8_t p0, uint8_t p1, uint8_t p2, uint8_t opcode);      // Intel APX: EVEX map 4, the promoted legacy instructions
   Step step_sse(GuestMemory& m, uint8_t opcode);
   static bool sse_integer_valid(uint8_t op);
@@ -181,6 +191,7 @@ class X86_64Cpu final : public IGuestCpu {
   Step evex_er(GuestMemory& m, const EvexOp& def);
   Step evex_bf16(GuestMemory& m, const EvexOp& def);
   Step evex_minmax(GuestMemory& m, const EvexOp& def);
+  Step evex_fp8(GuestMemory& m, const EvexOp& def);      // X86_64EvexBf16.cpp: AVX10.2 FP8 conversions and vcvt2ps2phx
   Step evex_avx102(GuestMemory& m, const EvexOp& def);      // X86_64EvexBf16.cpp: AVX10.2 vdpphps, vmpsadbw and the saturating conversions      // X86_64EvexBf16.cpp: AVX10.2 vminmax and vcomx / vucomx      // X86_64EvexBf16.cpp: AVX10.2 bfloat16 arithmetic      // X86_64Misc.cpp: AVX-512 ER
   Step evex_vsib(GuestMemory& m, const EvexOp& def);
   Vec512 get_vec(uint32_t reg) const;
@@ -191,10 +202,21 @@ class X86_64Cpu final : public IGuestCpu {
   Step sm3_instruction(GuestMemory& m, uint32_t map, uint8_t op, uint32_t vvvv);
   Step vex_gather(GuestMemory& m, uint8_t opcode, bool wide, uint32_t vvvv);
   Step vex_fma(GuestMemory& m, uint8_t opcode, bool wide, uint32_t vvvv);
+  bool cet_push(GuestMemory& m, uint64_t value);
+  bool cet_check_return(GuestMemory& m, uint64_t target);
+  Step rdssp_instruction();
+  Step incssp_instruction(GuestMemory& m);
+  Step wrss_instruction(GuestMemory& m, bool user);
+  Step enqcmd_instruction(GuestMemory& m, bool supervisor);
+  Step lwp_instruction(GuestMemory& m, uint32_t map, uint32_t vvvv);      // AMD LWP: llwpcb, slwpcb (XOP map 9), lwpins, lwpval (map A)
+  bool lwp_flush(GuestMemory& m);
+  bool lwp_insert(GuestMemory& m, uint8_t event_id, uint16_t flags, uint32_t data1, uint64_t data2, bool* full);
   Step fma4_instruction(GuestMemory& m, uint8_t opcode, bool wide, uint32_t vvvv);      // AMD FMA4 (VEX map 3)
+  Step vpermil2_instruction(GuestMemory& m, uint8_t opcode, bool wide, uint32_t vvvv);      // AMD vpermil2ps / vpermil2pd (VEX map 3)
   Step xop_instruction(GuestMemory& m, uint32_t map, uint8_t opcode, uint32_t vvvv);      // AMD XOP and TBM (the 8F prefix)
   Step vex_bmi(GuestMemory& m, int map, uint8_t opcode, bool wide, uint32_t vvvv);
   Step xsave_family(GuestMemory& m, uint32_t kind);
+  uint64_t xstate_in_use() const;      // XINUSE, xgetbv with ECX = 1: the components that are not in their initial state
   // X86_64Misc.cpp: the instructions that are neither SSE nor AVX nor x87 and did not fit the main switch
   Step group9(GuestMemory& m);                          // 0F C7: cmpxchg8b/16b, xsavec, rdrand, rdseed, rdpid
   // Intel AMX: the VEX-encoded tile instructions (0F38 map: 49, 4B, 5C, 5E, 6C).
@@ -217,6 +239,7 @@ class X86_64Cpu final : public IGuestCpu {
   Step system_0f01(GuestMemory& m);                     // 0F 01 with a register operand: xgetbv, xend, xtest, rdtscp
   Step adx_instruction(GuestMemory& m, bool overflow);  // adcx (66 0F 38 F6) and adox (F3 0F 38 F6)
   Step fsgsbase_instruction(GuestMemory& m);            // F3 0F AE /0../3 with a register operand (already decoded): rdfsbase, rdgsbase, wrfsbase, wrgsbase
+  Step rao_instruction(GuestMemory& m, uint32_t kind);      // aadd / aand / aor / axor (RAO-INT): an atomic read-modify-write that leaves the flags alone
   Step direct_store(GuestMemory& m, uint8_t op);        // 0F 38 F8 (movdir64b) / F9 (movdiri)
   Step movnti(GuestMemory& m);                          // 0F C3
   // X86_64Mmx.cpp
@@ -271,6 +294,16 @@ class X86_64Cpu final : public IGuestCpu {
     uint8_t data[8][1024] = {};
   };
   Tiles tiles_;
+  // AMD Lightweight Profiling (X86_64Lwp.cpp): the running session's copy of the control block fields; cb is the LWPCB address, 0 when LWP is off.
+  struct Lwp {
+    uint64_t cb = 0, buffer_base = 0, missed = 0;
+    uint32_t buffer_size = 0, flags = 0, threshold = 0, random_bits = 0, head = 0;
+    int32_t counter = 0, interval = 0;
+  };
+  Lwp lwp_;
+  struct Cet { bool enabled = false, wrss = false; uint64_t ssp = 0; };
+  Cet cet_;
+  int64_t pasid_ = -1;      // IA32_PASID: the PASID, or -1 while its valid bit is clear
   uint16_t selector_[6] = {0x2B, 0x33, 0x2B, 0x2B, 0x2B, 0x2B};      // es cs ss ds fs gs
   State s_;
   Decoded d_;
