@@ -1008,7 +1008,8 @@ uint32_t remote_operation(uint64_t pid, process::IProcessRuntime::RemoteOp& op) 
     ScopedMutex hold(task->mutex);
     const uint32_t status = process::windowsabi::run_remote(*task->program.process(), op);
     // The layout may have changed: the page tables are rebuilt and given to the threads of that program (on whatever cores they run), as at the end of one of its own system calls.
-    const bool layout = op.kind == process::IProcessRuntime::RemoteOp::Allocate || op.kind == process::IProcessRuntime::RemoteOp::Free || op.kind == process::IProcessRuntime::RemoteOp::Protect;
+    using Op = process::IProcessRuntime::RemoteOp;
+    const bool layout = op.kind == Op::Allocate || op.kind == Op::Free || op.kind == Op::Protect || op.kind == Op::MapView || op.kind == Op::Unmap;      // (a view that came or went changes the layout too)
     if (layout && status == 0 && !task->sync_tables()) return 0xC0000017u;
     return status;
   }
