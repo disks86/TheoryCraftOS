@@ -40,6 +40,17 @@ uint8_t AmdModeSet::dig_encoder_id(uint8_t dig) {
   return dig < sizeof kIds ? kIds[dig] : 0;
 }
 
+uint8_t AmdModeSet::pick_pll(uint8_t encoder_mode, uint8_t encoder_id, bool link_b) {
+  if (is_dp(encoder_mode)) return kDpDto;
+  const uint8_t link = link_b ? 1 : 0;
+  switch (encoder_id) {
+    case 0x1E: return static_cast<uint8_t>(kComboPhyPll0 + link);        // ENCODER_OBJECT_ID_INTERNAL_UNIPHY
+    case 0x20: return static_cast<uint8_t>(kComboPhyPll0 + 2 + link);    // _UNIPHY1
+    case 0x21: return static_cast<uint8_t>(kComboPhyPll0 + 4 + link);    // _UNIPHY2
+    default: return kPllInvalid;
+  }
+}
+
 uint8_t AmdModeSet::panel_bpc(uint32_t bits_per_color) {
   switch (bits_per_color) {
     case 0: return 0;
@@ -52,9 +63,9 @@ uint8_t AmdModeSet::panel_bpc(uint32_t bits_per_color) {
 }
 
 // PIXEL_CLOCK_PARAMETERS_V7, 16 bytes: ulPixelClock (100 Hz), ucPpll, ucTransmitterID, ucEncoderMode, ucMiscInfo, ucCRTC, ucDeepColorRatio, 2 + 4 reserved
-bool AmdModeSet::set_pixel_clock(const ModeSetOutput& out, const DisplayMode& mode) {
+bool AmdModeSet::set_pixel_clock(const ModeSetOutput& out, const CrtcMode& mode) {
   uint8_t crev = 0;
-  if (!revision(bios_, kSetPixelClock, &crev) || crev != 7 || out.crtc >= kMaxCrtcs || mode.pixel_clock_khz > 0xFFFFFFFFu / 10) return false;
+  if (!revision(bios_, kSetPixelClock, &crev) || crev != 7 || (out.crtc >= kMaxCrtcs && out.crtc != kCrtcInvalid) || mode.pixel_clock_khz > 0xFFFFFFFFu / 10) return false;
   const uint32_t misc = out.encoder_mode == kModeDvi && mode.pixel_clock_khz > 165000 ? kMiscDviDualLink : 0;
   uint32_t deep = 0;                    // PIXEL_CLOCK_V7_DEEPCOLOR_RATIO_DIS / 5_4 / 3_2 / 2_1: for HDMI only
   if (out.encoder_mode == kModeHdmi) deep = out.bits_per_color == 10 ? 1 : out.bits_per_color == 12 ? 2 : out.bits_per_color == 16 ? 3 : 0;
@@ -65,7 +76,7 @@ bool AmdModeSet::set_pixel_clock(const ModeSetOutput& out, const DisplayMode& mo
 
 // SET_CRTC_USING_DTD_TIMING_PARAMETERS, 24 bytes: usH_Size, usH_Blanking_Time, usV_Size, usV_Blanking_Time, usH_SyncOffset, usH_SyncWidth, usV_SyncOffset, usV_SyncWidth,
 // susModeMiscInfo, ucH_Border, ucV_Border, ucCRTC, 3 padding. The blanking is to the end of the total (drm's crtc_hblank_end = crtc_htotal).
-bool AmdModeSet::set_dtd_timing(const ModeSetOutput& out, const DisplayMode& mode) {
+bool AmdModeSet::set_dtd_timing(const ModeSetOutput& out, const CrtcMode& mode) {
   uint8_t crev = 0;
   if (!revision(bios_, kSetCrtcUsingDtdTiming, &crev) || out.crtc >= kMaxCrtcs) return false;
   if (mode.h_total < mode.h_display || mode.v_total < mode.v_display || mode.h_sync_start < mode.h_display || mode.v_sync_start < mode.v_display ||
@@ -131,7 +142,7 @@ bool AmdModeSet::blank_crtc(uint8_t crtc, bool blank) {
 
 // DIG_ENCODER_CONTROL_PARAMETERS_V3 / _V4 (8 bytes) or _V5 (the union of the command, stream, link and panel mode parameters, 12 bytes). The tables 1.2 and 1.3 take the same
 // parameters. The lane count is the link's for DisplayPort, 8 for dual link and else 4 (decided on the byte the mode or, for the panel mode action, the panel mode is in, as the driver does).
-bool AmdModeSet::encoder(const ModeSetOutput& out, const DisplayMode& mode, uint8_t action, uint8_t panel_mode) {
+bool AmdModeSet::encoder(const ModeSetOutput& out, const CrtcMode& mode, uint8_t action, uint8_t panel_mode) {
   if (out.dig_encoder > 6) return false;
   uint8_t crev = 0;
   if (!revision(bios_, kDigxEncoderControl, &crev) || crev < 2 || crev > 5) return false;
@@ -168,7 +179,7 @@ bool AmdModeSet::encoder(const ModeSetOutput& out, const DisplayMode& mode, uint
 }
 
 // DIG_TRANSMITTER_CONTROL_PARAMETERS_V4 (8 bytes), _V1_5 (12) or _V1_6 (16)
-bool AmdModeSet::transmitter(const ModeSetOutput& out, const DisplayMode& mode, uint8_t action, uint8_t lane_num, uint8_t lane_set) {
+bool AmdModeSet::transmitter(const ModeSetOutput& out, const CrtcMode& mode, uint8_t action, uint8_t lane_num, uint8_t lane_set) {
   if (out.dig_encoder > 6) return false;
   uint8_t crev = 0;
   if (!revision(bios_, kTransmitterControl, &crev) || crev < 4 || crev > 6) return false;

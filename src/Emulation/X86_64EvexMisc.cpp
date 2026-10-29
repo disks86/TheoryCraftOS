@@ -195,6 +195,8 @@ X86_64Cpu::Step X86_64Cpu::evex_misc(GuestMemory& m, const EvexOp& defn) {
     case kHalfConv: {
       Env env;
       env.mode = ev_.er ? static_cast<Rounding>(ev_.rc) : static_cast<Rounding>((s_.mxcsr >> 13) & 3);
+      env.daz = (s_.mxcsr & 0x40) != 0;
+      env.ftz = (s_.mxcsr & 0x8000) != 0;
       const uint32_t n = vl / 32;
       uint32_t flags = 0;
       if (def->sub == 0) {      // vcvtph2ps
@@ -219,7 +221,9 @@ X86_64Cpu::Step X86_64Cpu::evex_misc(GuestMemory& m, const EvexOp& defn) {
       const Rounding mode = (imm & 4) ? static_cast<Rounding>((s_.mxcsr >> 13) & 3) : static_cast<Rounding>(imm & 3);
       for (uint32_t i = 0; i < n; ++i) {
         if (aaa != 0 && !active(i)) continue;
-        set_element(result, 16, i, half::single_to_half(static_cast<uint32_t>(element(src, 32, i)), mode, &flags));
+        uint32_t bits = static_cast<uint32_t>(element(src, 32, i));
+        if (env.daz && (bits & 0x7F800000u) == 0) bits &= 0x80000000u;      // (MXCSR.DAZ: a denormal single is a zero)
+        set_element(result, 16, i, half::single_to_half(bits, mode, &flags));
       }
       if (memory) {
         if (!ev_store_vector(m, result, 16, n * 2)) return Step::Fault;
@@ -413,7 +417,7 @@ X86_64Cpu::Step X86_64Cpu::evex_misc(GuestMemory& m, const EvexOp& defn) {
         const uint64_t x = element(b, elem, i);
         uint64_t r = 0;
         switch (def->sub) {
-          case 0: r = static_cast<uint64_t>(signed_of(x, elem) < 0 ? -signed_of(x, elem) : signed_of(x, elem)); break;
+          case 0: r = signed_of(x, elem) < 0 ? uint64_t{0} - static_cast<uint64_t>(signed_of(x, elem)) : x; break;      // (the most negative value stays itself)
           case 1: {
             uint32_t n = 0;
             while (n < elem && !((x >> (elem - 1 - n)) & 1)) ++n;

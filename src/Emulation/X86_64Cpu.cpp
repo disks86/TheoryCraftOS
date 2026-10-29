@@ -1660,6 +1660,8 @@ X86_64Cpu::Step X86_64Cpu::step_float(GuestMemory& m, uint8_t op, bool* handled)
   const uint32_t width = dbl ? 64 : 32, bytes = width / 8, lanes = 128 / width;
   Env env;
   env.mode = static_cast<Rounding>((s_.mxcsr >> 13) & 3);
+  env.daz = (s_.mxcsr & 0x40) != 0;
+  env.ftz = (s_.mxcsr & 0x8000) != 0;
   auto done = [&]() {
     if (env.flags & kInvalid) env.flags &= ~kDenormal;      // (an invalid operation takes precedence over the denormal-operand flag)
     s_.mxcsr |= env.flags;

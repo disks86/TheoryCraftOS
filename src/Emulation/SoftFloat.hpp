@@ -33,6 +33,8 @@ struct Env {
   uint32_t flags = 0;      // OR-ed in as exceptions happen (all exceptions are treated as masked)
   bool rounded_up = false; // x87: the last inexact result was rounded away from zero (the status word's C1)
   bool arm = false;        // AArch64 rules: the default NaN is positive, and a signaling NaN operand is chosen before a quiet one
+  bool daz = false;        // x86 MXCSR.DAZ: denormal operands are read as zeros of the same sign (and raise no denormal flag)
+  bool ftz = false;        // x86 MXCSR.FTZ: a tiny result (before rounding) becomes a zero of its sign, with the underflow and inexact flags
   bool tininess_after = false;      // RISC-V: underflow is detected after rounding (x86 and AArch64: before); TieAway then also rounds arithmetic results
 };
 
@@ -66,6 +68,8 @@ uint64_t to_integer_saturating(Format f, uint64_t a, Rounding mode, uint32_t bit
 // An integer (magnitude and sign) times 2^-fbits to float.
 uint64_t from_integer(Format f, uint64_t magnitude, bool negative, uint32_t fbits, Env& env);
 // FRINT*: the value rounded to an integral value of the same format. `exact` raises inexact when the value changed.
+// With MXCSR.DAZ (env.daz) a denormal operand becomes a zero of its sign; otherwise `bits` itself.
+uint64_t flush_denormal(Format f, uint64_t bits, const Env& env);
 uint64_t round_to_integral(Format f, uint64_t a, Rounding mode, bool exact, Env& env);
 // FMAX/FMIN (a NaN operand gives a NaN) and FMAXNM/FMINNM (a quiet NaN loses to a number); +0 is above -0.
 uint64_t arm_minmax(Format f, uint64_t a, uint64_t b, bool is_max, bool number, Env& env);

@@ -129,6 +129,8 @@ X86_64Cpu::Step X86_64Cpu::evex_fp(GuestMemory& m, const EvexOp& defn) {
                         (def->kind == kCvtToGpr && (def->sub & 0x40)) ||
                         ((def->kind == kCvt || def->kind == kCvtScalar) && ((def->sub & 0x40) || (type_is_float(def->sub & 7) && type_is_float((def->sub >> 3) & 7) && type_bits(def->sub & 7) < type_bits((def->sub >> 3) & 7))));
   env.mode = er && !sae_only ? static_cast<Rounding>(ev_.rc) : static_cast<Rounding>((s_.mxcsr >> 13) & 3);
+  env.daz = (s_.mxcsr & 0x40) != 0;
+  env.ftz = (s_.mxcsr & 0x8000) != 0;
   auto active = [&](uint32_t i) { return ev_active(i); };
   auto commit = [&]() {
     if (!er) s_.mxcsr |= env.flags;
@@ -390,12 +392,16 @@ X86_64Cpu::Step X86_64Cpu::evex_fp(GuestMemory& m, const EvexOp& defn) {
           const uint64_t p2inv = power_of_two(elem, -static_cast<int32_t>(scale));
           Env e2 = le;
           e2.flags = 0;
+          e2.ftz = false;      // (the scaling steps are internal: nothing is flushed or flagged until the final value)
           const uint64_t scaled = mul(fmt, x, p2, e2);
           Env e3 = le;
           e3.flags = 0;
+          e3.daz = false;
           const uint64_t rounded = round_to_integral(fmt, scaled, mode, !(imm & 8), e3);
           Env e4 = le;
           e4.flags = 0;
+          e4.ftz = false;
+          e4.daz = false;
           r = mul(fmt, rounded, p2inv, e4);
           le.flags |= e3.flags;
         }
@@ -530,7 +536,7 @@ X86_64Cpu::Step X86_64Cpu::evex_fp(GuestMemory& m, const EvexOp& defn) {
         }
         Env le = env;
         le.flags = 0;
-        const uint64_t x = element(binary ? a : b, elem, i), y = element(b, elem, i);
+        const uint64_t x = flush_denormal(fmt, element(binary ? a : b, elem, i), env), y = def->kind == kFixup ? element(b, elem, i) : flush_denormal(fmt, element(b, elem, i), env);      // (MXCSR.DAZ; the table of vfixupimm is integers)
         const bool negative = (x >> (f.mant_bits + f.exp_bits)) & 1;
         const uint64_t exponent = (x >> f.mant_bits) & f.exp_max, mantissa = x & f.mant_mask;
         const bool x_nan = exponent == f.exp_max && mantissa, x_inf = exponent == f.exp_max && !mantissa, x_zero = exponent == 0 && !mantissa, x_denormal = exponent == 0 && mantissa;
@@ -606,6 +612,8 @@ X86_64Cpu::Step X86_64Cpu::evex_fp(GuestMemory& m, const EvexOp& defn) {
             } else {
               Env e2 = le;
               e2.flags = 0;
+              e2.ftz = false;      // (one scaling: MXCSR.FTZ looks at the final result only,
+              e2.daz = false;      // and a denormal made on the way is still a number: the input was flushed above)
               int64_t k;
               const int32_t y_unbiased = ye == 0 ? -f.bias : static_cast<int32_t>(ye) - f.bias;
               if (y_unbiased >= (elem == 16 ? 7 : 20)) k = y_negative ? -(1 << 20) : (1 << 20);
@@ -620,6 +628,10 @@ X86_64Cpu::Step X86_64Cpu::evex_fp(GuestMemory& m, const EvexOp& defn) {
               }
               r = scale_by_power_of_two(fmt, elem, x, k, e2);
               le.flags |= e2.flags;
+              if (env.ftz && ((r >> f.mant_bits) & f.exp_max) == 0 && (r & ((uint64_t{1} << (f.mant_bits + f.exp_bits)) - 1)) != 0) {      // a tiny result (denormal; an exact one too) is flushed
+                le.flags |= kUnderflow | kInexact;
+                r = r & (uint64_t{1} << (f.mant_bits + f.exp_bits));
+              }
             }
             break;
           }
@@ -659,6 +671,7 @@ X86_64Cpu::Step X86_64Cpu::evex_fp(GuestMemory& m, const EvexOp& defn) {
             uint64_t rounded;
             Env e2 = le;
             e2.flags = 0;
+            e2.ftz = false;      // (the hardware flushes the final difference only, and without an underflow flag)
             if (x_zero || static_cast<int32_t>(exponent) - f.bias >= static_cast<int32_t>(f.mant_bits) - static_cast<int32_t>(scale)) {
               rounded = x;      // nothing below the 2^-scale position
             } else if (scale == 0) {
@@ -667,6 +680,7 @@ X86_64Cpu::Step X86_64Cpu::evex_fp(GuestMemory& m, const EvexOp& defn) {
               const uint64_t p2 = power_of_two(elem, static_cast<int32_t>(scale)), p2inv = power_of_two(elem, -static_cast<int32_t>(scale));
               Env e3 = e2;
               const uint64_t scaled = mul(fmt, x, p2, e3);
+              e2.daz = false;      // (x was flushed above; what follows works on the intermediate values)
               Env e4 = e2;
               const uint64_t r2 = round_to_integral(fmt, scaled, mode, false, e4);
               rounded = mul(fmt, r2, p2inv, e4);
@@ -674,7 +688,12 @@ X86_64Cpu::Step X86_64Cpu::evex_fp(GuestMemory& m, const EvexOp& defn) {
             Env e5 = le;
             e5.flags = 0;
             e5.mode = mode;      // (the subtraction rounds the way the reduction does)
+            e5.ftz = false;
             r = softfloat::sub(fmt, x, rounded, e5);
+            if (env.ftz && ((r >> f.mant_bits) & f.exp_max) == 0 && (r & ((uint64_t{1} << (f.mant_bits + f.exp_bits)) - 1)) != 0) {      // (a tiny difference is flushed: inexact, but no underflow flag)
+              r &= uint64_t{1} << (f.mant_bits + f.exp_bits);
+              e5.flags |= kInexact;
+            }
             if (!(imm & 8) && !x_zero && e2.flags == 0 && false) {}
             le.flags |= e5.flags;
             if (imm & 8) le.flags &= ~kInexact;
