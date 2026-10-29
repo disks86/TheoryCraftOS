@@ -62,7 +62,8 @@ class AmdModeSet {
   static constexpr uint8_t kEncoderSetup = 0x0F, kEncoderSetupPanelMode = 0x10, kEncoderDpVideoOff = 0x0C, kEncoderDpVideoOn = 0x0D;
   // ATOM_TRANSMITTER_ACTION_*
   static constexpr uint8_t kTransmitterDisable = 0, kTransmitterEnable = 1, kTransmitterSetupVsEmph = 11;
-  static constexpr uint8_t kPpll1 = 0, kPpll2 = 1, kPpll0 = 2, kPllInvalid = 0xFF;
+  static constexpr uint8_t kPpll1 = 0, kPpll2 = 1, kPpll0 = 2, kDpDto = 11, kComboPhyPll0 = 20, kPllInvalid = 0xFF;
+  static constexpr uint8_t kCrtcInvalid = 0xFF;
   static constexpr uint8_t kModeDp = 0, kModeLvds = 1, kModeDvi = 2, kModeHdmi = 3, kModeDpMst = 5;
   static constexpr uint8_t kPanelModeExternalDp = 0, kPanelModeInternalDp2 = 1, kPanelModeInternalDp1 = 0x11;
   static constexpr uint32_t kMaxCrtcs = 6;
@@ -83,6 +84,9 @@ class AmdModeSet {
   // amdgpu_atombios_encoder_setup_dig_transmitter: the UNIPHY transmitter control with an action (kTransmitterEnable, kTransmitterDisable, SETUP_VSEMPH with `lane_set` for all lanes)
   bool transmitter(const ModeSetOutput& out, const DisplayMode& mode, uint8_t action, uint8_t lane_num = 0, uint8_t lane_set = 0);
 
+  // dce_v11_0_pick_pll for Polaris and VEGAM: DisplayPort uses the DP DTO (ATOM_DP_DTO); the other outputs a combo PHY PLL by their UNIPHY (UNIPHY 0/1/2: PLL 0/2/4, link B one higher). The
+  // encoder id is AtomConnectors::encoder_id; kPllInvalid for any other encoder.
+  static uint8_t pick_pll(uint8_t encoder_mode, uint8_t encoder_id, bool link_b);
   // ASIC_INT_DIGn_ENCODER_ID of DIG `dig` (0..6), 0 for any other
   static uint8_t dig_encoder_id(uint8_t dig);
   // amdgpu_atombios_encoder_get_bpc: PANEL_*BIT_PER_COLOR for 6, 8, 10, 12, 16 bits (0: undefined; anything else 8)

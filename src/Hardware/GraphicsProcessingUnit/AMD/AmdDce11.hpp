@@ -85,25 +85,51 @@ class Plane {
   uint64_t aperture_low_ = 0, aperture_high_ = 0;
 };
 
-// A linear ARGB8888 (or XRGB8888) picture for a CRTC's graphics plane to scan out.
+// The pixel formats of dce_v11_0_crtc_do_set_base (DRM names, little endian; the alpha of the X formats is ignored by the display).
+enum class ScanoutFormat : uint8_t { Argb8888, Abgr8888, Rgb565, Argb1555, Argb4444, Bgra5551, Argb2101010, Bgra1010102, Indexed8 };
+
+// The surface layout of a tiled picture (the tiling flags of the buffer): GRPH_ARRAY_MODE and for the 2D mode the bank and tile parameters; the pipe configuration is for both.
+struct ScanoutTiling {
+  enum class Mode : uint8_t { Linear = 0, Tiled1D = 2, Tiled2D = 4 };       // ARRAY_LINEAR_GENERAL, ARRAY_1D_TILED_THIN1, ARRAY_2D_TILED_THIN1
+  Mode mode = Mode::Linear;
+  uint8_t pipe_config = 0;         // 5 bits
+  uint8_t num_banks = 0;           // 2 bits (2D only, as the fields below)
+  uint8_t bank_width = 0;          // 2 bits
+  uint8_t bank_height = 0;         // 2 bits
+  uint8_t macro_tile_aspect = 0;   // 2 bits
+  uint8_t tile_split = 0;          // 3 bits
+};
+
+// A picture for a CRTC's graphics plane to scan out.
 struct ScanoutSurface {
   uint64_t address = 0;            // the GPU's address of the first pixel (256 byte aligned)
   uint32_t width = 0, height = 0;  // in pixels
   uint32_t pitch_pixels = 0;       // pixels from one row to the next (at least width)
   uint32_t viewport_width = 0;     // the mode's horizontal display
   uint32_t viewport_height = 0;    // the mode's vertical display
+  uint32_t x = 0, y = 0;           // the top left of the viewport in the picture (x rounded down to a multiple of 4, y to even)
+  ScanoutFormat format = ScanoutFormat::Argb8888;
+  ScanoutTiling tiling;
 };
 
-// dce_v11_0_crtc_do_set_base for a linear 32 bit surface at offset (0, 0), with dce_v11_0_vga_enable(false) and dce_v11_0_grph_enable: the graphics plane of a CRTC pointed at a picture,
-// with the surface update at vertical blank, the viewport set to the mode and the look-up table bypass off. Not done: tiled surfaces, other pixel formats, an offset into the surface,
-// the look-up table itself (dce_v11_0_crtc_load_lut) and the bandwidth update.
+// One look-up table entry: 16 bit red, green and blue (only the top 10 bits are used).
+struct LutEntry {
+  uint16_t red = 0, green = 0, blue = 0;
+};
+
+// dce_v11_0_crtc_do_set_base for a surface at (0, 0): the graphics plane of a CRTC pointed at a picture, with the VGA mode off, the surface update at vertical blank, the pixel format and
+// tiling in the control register, the look-up table bypassed for 10 bit formats, the window and viewport and the plane enabled; and dce_v11_0_crtc_load_lut. Not done: the bandwidth update
+// (dce_v11_0_bandwidth_update), the cursor.
 class Scanout {
  public:
   explicit Scanout(IVcnRegisters& registers) : r_(registers) {}
-  // False if the CRTC does not exist or the surface is misaligned, empty or has a pitch below its width.
+  // False if the CRTC does not exist or the surface is misaligned, empty, has a pitch below its width or a tiling field out of range.
   bool set(uint32_t crtc, const ScanoutSurface& surface);
   // The graphics plane off (dce_v11_0_grph_enable(false)).
   bool disable(uint32_t crtc);
+  // dce_v11_0_crtc_load_lut: the colour pipeline set to pass the plane through the table (no input CSC, no prescale, no degamma, gamut remap or regamma, no output CSC, cursor alpha
+  // blending on) and the 256 entries written, 10 bits per colour (entry 0 first). With a null table the identity ramp.
+  bool load_lut(uint32_t crtc, const LutEntry* table256);
 
  private:
   IVcnRegisters& r_;

@@ -605,7 +605,8 @@ bool AmdVegaM::set_mode(const AtomConnectors::Connector& connector, uint8_t crtc
   if (!encoder_mode_of(connector.type, &encoder_mode) || dig >= amd_dce11::AudioFormat::kBlocks || crtc >= AmdModeSet::kMaxCrtcs || mode.pixel_clock_khz == 0) return finish(ModeSetStage::Unsupported);
   const bool dp = encoder_mode == AmdModeSet::kModeDp;
   const bool edp = connector.type == AtomConnectors::Type::EmbeddedDisplayPort;
-  if (pll == AmdModeSet::kPllInvalid) pll = dp ? AmdModeSet::kPpll0 : (crtc & 1 ? AmdModeSet::kPpll2 : AmdModeSet::kPpll1);
+  if (pll == AmdModeSet::kPllInvalid) pll = AmdModeSet::pick_pll(encoder_mode, AtomConnectors::encoder_id(connector), AtomConnectors::link_b(connector));
+  if (pll == AmdModeSet::kPllInvalid && !dp) return finish(ModeSetStage::Unsupported);       // (no PLL for this encoder: the driver fails the mode fixup)
   result.pll = pll;
   ModeSession session(*inputs_.registers, *inputs_.clock, inputs_.vbios, *inputs_.allocator);
   if (!session.bios.valid()) return finish(ModeSetStage::Unsupported);
@@ -689,12 +690,13 @@ bool AmdVegaM::disable_mode(const AtomConnectors::Connector& connector, uint8_t 
   ok = amd_dce11::Scanout(*inputs_.registers).disable(crtc) && ok;       // dce_v11_0_grph_enable(false)
   if (!session.optional(AmdModeSet::kEnableDispPowerGating)) ok = set.powergate_crtc(crtc, true) && ok;
   crtc_pll_[crtc] = 0xFF;
-  if (pll != AmdModeSet::kPllInvalid) {
+  const bool combo = pll >= AmdModeSet::kComboPhyPll0 && pll < AmdModeSet::kComboPhyPll0 + 6;
+  if (pll <= AmdModeSet::kPpll0 || combo) {        // (the DP DTO and unset PLLs are left alone, as in dce_v11_0_crtc_disable)
     bool shared = false;
     for (uint32_t i = 0; i < AmdModeSet::kMaxCrtcs; ++i) shared = shared || (i != crtc && crtc_pll_[i] == pll);
     if (!shared) {
       ModeSetOutput off;
-      off.crtc = crtc;
+      off.crtc = combo ? AmdModeSet::kCrtcInvalid : crtc;
       off.pll = pll;
       off.encoder_mode = 0;
       ok = set.set_pixel_clock(off, DisplayMode()) && ok;

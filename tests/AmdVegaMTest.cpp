@@ -2146,7 +2146,7 @@ static void test_set_mode() {
   // DisplayPort on CRTC 1 (the driver's order): power gating off, the CRTC locked, blanked and disabled; the CRTC's source (DIG 3 is 0x0B); the pixel clock (PPLL0 for DP), the timing, the
   // overscan and the scaler; the encoder off (DP video off, the transmitter disabled); the CRTC enabled, unblanked and unlocked; the encoder on: setup, panel mode, the transmitter
   // enabled, the link trained (start, pattern 1, the drive, pattern 3, complete) and the video on
-  CHECK(vega.set_mode(dp, 1, m, 8, &r) && r.failed == AmdVegaM::ModeSetStage::Done && r.pll == AmdModeSet::kPpll0 && r.link.config.lanes == 4 && r.link.config.rate_khz == 162000 &&
+  CHECK(vega.set_mode(dp, 1, m, 8, &r) && r.failed == AmdVegaM::ModeSetStage::Done && r.pll == AmdModeSet::kDpDto && r.link.config.lanes == 4 && r.link.config.rate_khz == 162000 &&
         r.link.outcome.trained() && r.panel_mode == 0);
   const std::vector<uint32_t> want_order = {13, 44, 34, 35, 42, 12, 49, 40, 33, 4, 76, 35, 34, 44, 4, 4, 76, 4, 4, 76, 4, 4, 4};
   CHECK(auxcard.table_order == want_order);
@@ -2155,7 +2155,7 @@ static void test_set_mode() {
   CHECK(mc.size() == 12 && mc[0].table == 13 && mc[0].words == std::vector<uint32_t>({1u}) && mc[1].table == 44 && mc[1].words == std::vector<uint32_t>({1u | 1u << 8}));
   CHECK(mc[2].words == std::vector<uint32_t>({1u | 1u << 8, 0}) && mc[3].words == std::vector<uint32_t>({1u}));
   CHECK(mc[4].table == 42 && mc[4].words[0] == (1u | 0x0Bu << 8 | 0u << 16 | 2u << 24));
-  CHECK(mc[5].table == 12 && mc[5].words[0] == 1485000 && (mc[5].words[1] & 0xFF) == 2 && ((mc[5].words[1] >> 16) & 0xFF) == 0 && mc[5].words[2] == 1);
+  CHECK(mc[5].table == 12 && mc[5].words[0] == 1485000 && (mc[5].words[1] & 0xFF) == 11 && ((mc[5].words[1] >> 16) & 0xFF) == 0 && mc[5].words[2] == 1);
   CHECK(mc[6].table == 49 && mc[6].words[0] == (1920u | 280u << 16) && mc[6].words[5] == 1);
   CHECK(mc[7].table == 40 && mc[7].words[2] == 1 && mc[8].table == 33 && mc[8].words[0] == 1);
   CHECK(mc[9].table == 35 && mc[9].words[0] == (1u | 1u << 8) && mc[10].table == 34 && mc[10].words[0] == 1u && mc[11].table == 44 && mc[11].words[0] == 1u);
@@ -2164,7 +2164,7 @@ static void test_set_mode() {
   CHECK(dc.size() == 11 && ((dc[0].words[0] >> 8) & 0xFF) == 0x0C && dc[1].table == 2 && (dc[1].words[0] >> 24) == 0);
   CHECK(dc[2].words[0] == (3u | 0x0Fu << 8 | 0u << 16 | 4u << 24) && dc[2].words[1] == 14850 && dc[2].words[2] == (2u | 6u << 8));
   CHECK(dc[3].words[0] == (3u | 0x10u << 8 | 0u << 16) && dc[4].table == 2 && (dc[4].words[0] >> 24) == 1 && dc[4].words[0] == (16200u | 3u << 16 | 1u << 24));
-  CHECK(dc[4].words[1] == (4u | AtomConnectors::Connector(dp).object_id << 8 | (0x30u | 2u << 2 | 2u) << 24));       // (PPLL0 is the PHY's clock source)
+  CHECK(dc[4].words[1] == (4u | AtomConnectors::Connector(dp).object_id << 8 | (0x30u | 3u << 2 | 2u) << 24));       // (the DP DTO, 11, truncated to the field's two bits, is the PHY's clock source)
   CHECK(((dc[5].words[0] >> 8) & 0xFF) == 0x08 && ((dc[dc.size() - 2].words[0] >> 8) & 0xFF) == 0x0B && ((dc.back().words[0] >> 8) & 0xFF) == 0x0D);
   // the sink was powered up by the training: D0 written
   CHECK(dpcd[0x600] == 0x01 || dpcd[0x600] == 0x02);
@@ -2173,9 +2173,9 @@ static void test_set_mode() {
   auxcard.mode_calls.clear();
   auxcard.dig_calls.clear();
   const size_t doorbells = auxcard.doorbells;
-  CHECK(vega.set_mode(hdmi, 3, m, 10, &r) && r.pll == AmdModeSet::kPpll2 && auxcard.doorbells == doorbells);
+  CHECK(vega.set_mode(hdmi, 3, m, 10, &r) && r.pll == AmdModeSet::kComboPhyPll0 + 2 && auxcard.doorbells == doorbells);
   CHECK(auxcard.table_order == std::vector<uint32_t>({13, 44, 34, 35, 42, 12, 49, 40, 33, 76, 35, 34, 44, 4, 4, 76}));
-  CHECK(mc.size() == 12 && mc[5].words[2] == (3u | 1u << 8) && ((mc[5].words[1] >> 16) & 0xFF) == 3 && (mc[5].words[1] & 0xFF) == 1);
+  CHECK(mc.size() == 12 && mc[5].words[2] == (3u | 1u << 8) && ((mc[5].words[1] >> 16) & 0xFF) == 3 && (mc[5].words[1] & 0xFF) == 22);
   CHECK(dc[0].table == 2 && (dc[0].words[0] >> 24) == 0 && dc[1].words[0] == (2u | 0x0Fu << 8 | 3u << 16 | 4u << 24) && dc[1].words[1] == 14850 && dc[1].words[2] == 3u);
   // with a surface: the graphics plane of the CRTC (3: block offset 0x2600) is pointed at it between the timing and the overscan; a bad surface is the Scanout stage
   amd_dce11::ScanoutSurface surface;
@@ -2245,15 +2245,17 @@ static void test_set_mode() {
   CHECK(auxcard.table_order == std::vector<uint32_t>({4, 76, 34, 35, 13}) && !vega.link_trained(2));
   CHECK(((dc[0].words[0] >> 8) & 0xFF) == 0x0C && (dc[1].words[0] >> 24) == 0 && dpcd[0x600] == 0x02);        // (the sink to D3)
   CHECK(mc[0].words == std::vector<uint32_t>({1u | 1u << 8, 0}) && mc[1].words == std::vector<uint32_t>({1u}) && mc[2].table == 13 && mc[2].words == std::vector<uint32_t>({1u | 1u << 8}));
-  // the last CRTC on the PLL: the PLL is switched off (SetPixelClock with no clock: PPLL0, CRTC 0), and the eDP panel's power too
+  // the DisplayPort outputs share the DP DTO, which is not switched off; the eDP panel's power is
   auxcard.table_order.clear();
   auxcard.mode_calls.clear();
   auxcard.dig_calls.clear();
   CHECK(vega.disable_mode(edp, 0));
-  CHECK(auxcard.table_order == std::vector<uint32_t>({4, 76, 76, 34, 35, 13, 12}) && mc.back().words == std::vector<uint32_t>({0u, 2u, 0u, 0u}));
+  CHECK(auxcard.table_order == std::vector<uint32_t>({4, 76, 76, 34, 35, 13}));       // (the DP DTO is not a PLL to switch off)
   CHECK(!auxcard.panel_on);
   // a connector without an AUX session (HDMI) just goes off; a CRTC that does not exist or a connector that is no output is refused
+  auxcard.mode_calls.clear();
   CHECK(vega.disable_mode(hdmi, 3) && rig.card.dce.get(0x1a00 + 0x2600) == 0);
+  CHECK(mc.back().table == 12 && mc.back().words == std::vector<uint32_t>({0u, 22u, 0xFFu, 0u}));       // (a combo PHY PLL is switched off with no CRTC)
   CHECK(!vega.disable_mode(dp, 6) && !vega.disable_mode(vga, 0));
   vega.shutdown();
   CHECK(!vega.disable_mode(dp, 0) && !vega.set_mode(dp, 0, m, 8, &r) && r.failed == AmdVegaM::ModeSetStage::NotReady);

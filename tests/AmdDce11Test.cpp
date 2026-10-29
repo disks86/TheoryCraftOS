@@ -325,6 +325,95 @@ static void test_scanout() {
   CHECK(d.writes.size() == writes);
 }
 
+// The pixel formats, tiling and viewport position of a surface, and the look-up table.
+static void test_scanout_formats() {
+  const auto written = [](FakeDisplay& d, uint32_t reg) { uint32_t v = 0xDEADBEEFu; for (const auto& w : d.writes) if (w.first == reg) v = w.second; return v; };
+  ScanoutSurface base;
+  base.address = 0x4000;
+  base.width = 640;
+  base.height = 480;
+  base.pitch_pixels = 640;
+  base.viewport_width = 640;
+  base.viewport_height = 480;
+  // the DRM formats: depth | format << 8, the crossbars of ABGR, the table bypass of the 10 bit formats
+  const struct { ScanoutFormat f; uint32_t control, swap; bool bypass; } formats[] = {
+      {ScanoutFormat::Indexed8, 0x000, 0, false}, {ScanoutFormat::Argb4444, 0x201, 0, false}, {ScanoutFormat::Argb1555, 0x001, 0, false}, {ScanoutFormat::Bgra5551, 0x501, 0, false},
+      {ScanoutFormat::Rgb565, 0x101, 0, false},   {ScanoutFormat::Argb8888, 0x002, 0, false}, {ScanoutFormat::Argb2101010, 0x102, 0, true}, {ScanoutFormat::Bgra1010102, 0x402, 0, true},
+      {ScanoutFormat::Abgr8888, 0x002, (2u << 4) | (2u << 8), false}};
+  for (const auto& f : formats) {
+    FakeDisplay d;
+    d.set(0x1a02, 0x00000023);
+    ScanoutSurface s = base;
+    s.format = f.f;
+    Scanout scan(d);
+    CHECK(scan.set(0, s) && d.get(0x1a01) == f.control && d.get(0x1a03) == f.swap && d.get(0x1a02) == (f.bypass ? 0x123u : 0x023u));
+  }
+  // tiling: 1D is the array mode and the pipe configuration; 2D adds the banks, tile split, bank size and macro tile aspect (micro tile mode 0, display)
+  {
+    FakeDisplay d;
+    ScanoutSurface s = base;
+    s.tiling.mode = ScanoutTiling::Mode::Tiled1D;
+    s.tiling.pipe_config = 0x12;
+    s.tiling.num_banks = 3;         // (ignored in 1D)
+    Scanout scan(d);
+    CHECK(scan.set(0, s) && d.get(0x1a01) == (2u | (2u << 20) | (0x12u << 24)));
+    s.tiling.mode = ScanoutTiling::Mode::Tiled2D;
+    s.tiling.num_banks = 3; s.tiling.bank_width = 1; s.tiling.bank_height = 2; s.tiling.macro_tile_aspect = 3; s.tiling.tile_split = 5;
+    CHECK(scan.set(0, s) && d.get(0x1a01) == (2u | (3u << 2) | (1u << 6) | (2u << 11) | (5u << 13) | (3u << 18) | (4u << 20) | (0x12u << 24)));
+    // out of range fields
+    const size_t n = d.writes.size();
+    ScanoutSurface bad = s;
+    bad.tiling.pipe_config = 0x20;
+    CHECK(!scan.set(0, bad));
+    bad = s; bad.tiling.num_banks = 4;
+    CHECK(!scan.set(0, bad));
+    bad = s; bad.tiling.tile_split = 8;
+    CHECK(!scan.set(0, bad));
+    bad = s; bad.tiling.mode = static_cast<ScanoutTiling::Mode>(3);
+    CHECK(!scan.set(0, bad));
+    bad = s; bad.format = static_cast<ScanoutFormat>(99);
+    CHECK(!scan.set(0, bad) && d.writes.size() == n);
+  }
+  // the viewport position: x down to a multiple of 4, y to even
+  {
+    FakeDisplay d;
+    ScanoutSurface s = base;
+    s.x = 7;
+    s.y = 5;
+    s.width = 800;
+    s.pitch_pixels = 800;
+    Scanout scan(d);
+    CHECK(scan.set(2, s) && d.get(0x1b5c + 0x1f9c - 0x1b9c) == ((4u << 16) | 4u));
+  }
+  // the look-up table: the colour pipeline passed through, 256 entries of 10 bit colour from the top bits, the identity ramp for none
+  {
+    FakeDisplay d;
+    const uint32_t off = 0x1d9c - 0x1b9c;       // CRTC 1
+    d.set(0x1a35 + off, 0x7); d.set(0x1a2d + off, 0x0); d.set(0x1a10 + off, 0x3); d.set(0x1a58 + off, 0xFFFF); d.set(0x1a59 + off, 0x7); d.set(0x1aa0 + off, 0xF); d.set(0x1a3c + off, 0xF);
+    d.set(0x1a50 + off, 0x5); d.set(0x1abc + off, 0x1);
+    Scanout scan(d);
+    LutEntry table[256];
+    for (uint32_t i = 0; i < 256; ++i) table[i] = {static_cast<uint16_t>(i << 8), static_cast<uint16_t>(0xFFFF - (i << 8)), static_cast<uint16_t>(i * 257)};
+    CHECK(scan.load_lut(1, table) && !scan.load_lut(6, table));
+    CHECK(d.get(0x1a35 + off) == 0x4 && d.get(0x1a2d + off) == 0x10 && d.get(0x1a10 + off) == 0x2 && d.get(0x1a58 + off) == 0xCCFC && d.get(0x1a59 + off) == 0x4 && d.get(0x1aa0 + off) == 0x8 &&
+          d.get(0x1a3c + off) == 0x8 && d.get(0x1a50 + off) == 0 && d.get(0x1abc + off) == 0x3);
+    CHECK(d.get(0x1a80 + off) == 0 && d.get(0x1a81 + off) == 0 && d.get(0x1a82 + off) == 0 && d.get(0x1a83 + off) == 0 && d.get(0x1a84 + off) == 0xffff && d.get(0x1a85 + off) == 0xffff &&
+          d.get(0x1a86 + off) == 0xffff && d.get(0x1a78 + off) == 0 && d.get(0x1a7e + off) == 7 && d.get(0x1a79 + off) == 0);
+    std::vector<uint32_t> colors;
+    for (const auto& w : d.writes) if (w.first == 0x1a7c + off) colors.push_back(w.second);
+    CHECK(colors.size() == 256);
+    for (uint32_t i = 0; i < colors.size() && i < 256; ++i)
+      CHECK(colors[i] == (((i << 8 & 0xffc0u) << 14) | (((0xFFFFu - (i << 8)) & 0xffc0u) << 4) | (uint32_t(i * 257) >> 6)));
+    FakeDisplay e;
+    Scanout ramp(e);
+    CHECK(ramp.load_lut(0, nullptr));
+    std::vector<uint32_t> identity;
+    for (const auto& w : e.writes) if (w.first == 0x1a7c) identity.push_back(w.second);
+    CHECK(identity.size() == 256 && identity[0] == 0 && identity[255] == ((0xffc0u << 14) | (0xffc0u << 4) | (0xffffu >> 6)));
+  }
+  (void)written;
+}
+
 int main() {
   test_probe();
   test_flip();
@@ -332,6 +421,7 @@ int main() {
   test_refusals();
   test_display();
   test_scanout();
+  test_scanout_formats();
   printf(g_failed ? "AmdDce11Test: %d FAILED\n" : "AmdDce11Test: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }

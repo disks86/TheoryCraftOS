@@ -201,13 +201,13 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
   bool link_trained(uint32_t pin) const { return pin < amd_dce11::Interrupts::kMaxHpd && trained_[pin].valid; }
   // Mode setting of one output through the video BIOS (AmdModeSet), in the order of the DRM modeset of dce_v11_0 with the AtomBIOS helpers of amdgpu (checked against v6.12): the CRTC
   // prepared (power gating off, locked, blanked and disabled); the encoder prepared (the eDP panel powered up, the CRTC's source selected); the CRTC's mode set (SetPixelClock, which on
-  // this chip computes the PLL itself: DisplayPort on PPLL0, the other outputs on PPLL1 for even CRTCs and PPLL2 for odd unless `pll` names one; the DTD timing, the overscan and the
+  // this chip computes the PLL itself: with the PLL of dce_v11_0_pick_pll for Polaris and VEGAM: the DP DTO for DisplayPort, a combo PHY PLL by UNIPHY and link for the others, unless `pll` names one; the DTD timing, the overscan and the
   // scaler); the encoder's mode set (switched off, as amdgpu_atombios_encoder_setup_dig(ATOM_DISABLE)); the CRTC committed (enabled, unblanked, unlocked); the encoder committed
   // (setup_dig(ATOM_ENABLE): DIG encoder setup, panel mode, the eDP panel on, the transmitter enabled, for DisplayPort the link trained with the sink powered up and the video turned
   // on). `bpc` is the bits per colour (6, 8, 10, 12, 16). `out->failed` names the step that failed (Done: none); a failure leaves the output as that step left it (call disable_mode()).
   // For DisplayPort the sink's capabilities are read first and the lanes and rate chosen as the driver does (DpLinkConfig::choose; none that carries the mode is a failure). What is
   // not done: tiled or non-ARGB8888 scanout surfaces, the look-up table, the VGA enable writes around the unblank, the FMT block and interleave
-  // setup, spread spectrum, audio (enable_audio), the pixel clock limits the driver checks, a bridge chip's panel mode (the NUTMEG / TRAVIS DP1 mode) and the PLL choice the driver makes from the PLLs in use.
+  // setup, spread spectrum, audio (enable_audio), the pixel clock limits the driver checks, a bridge chip's panel mode (the NUTMEG / TRAVIS DP1 mode) and 
   // Like train_link it takes the video BIOS for milliseconds: for the desktop loop.
   enum class ModeSetStage : uint8_t {
     Done, NotReady, Unsupported, Prepare, SinkCapabilities, CrtcSource, PixelClock, Timing, Overscan, Scaler, EncoderOff, CrtcEnable, Unblank, EncoderSetup, PanelMode, TransmitterEnable,
