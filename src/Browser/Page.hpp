@@ -76,6 +76,8 @@ class IPageEnvironment : public IObjectEnvironment {
   // window.open(): a new window (tab) for `address`; `target` is the name it was given ("" or _blank: always a new one). False if the browser cannot or will not (a
   // pop-up blocker). close_window() is window.close() of a page that was opened by a script.
   virtual bool open_window(StringView address, StringView target, bool noopener) { (void)address; (void)target; (void)noopener; return false; }
+  // The same for a form that is posted: the new window shows the answer to the request. False if the browser cannot.
+  virtual bool open_window_post(StringView address, StringView target, StringView content_type, StringView body) { (void)address; (void)target; (void)content_type; (void)body; return false; }
   virtual void close_window() {}
   virtual void alert(StringView text) = 0;
   virtual bool confirm(StringView text) = 0;
@@ -298,6 +300,9 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   void set_navigation_state(StringView json, bool has_state) override { env_.set_navigation_state(json, has_state); }
   void history_go_to_key(uint64_t key) override { env_.history_go_to_key(key); }
   bool open_window(StringView address, StringView target, bool noopener) override { return env_.open_window(address, target, noopener); }
+  void navigate_target(StringView address, StringView target) override {
+    if (!send_to_target(target, address, nullptr, StringView())) env_.navigate(address, false);
+  }
   void close_window() override { env_.close_window(); }
   StringView referrer() override { return referrer_.view(); }
   void scroll_node_into_view(dom::Node* node) override;

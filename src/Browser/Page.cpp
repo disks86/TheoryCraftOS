@@ -52,6 +52,7 @@ class Page::FrameEnv final : public IPageEnvironment {
   void clipboard_set(StringView text) override { owner_.env_.clipboard_set(text); }
   void pick_file(uint32_t node_serial, bool multiple) override { owner_.frame_pick_file(serial_, node_serial, multiple); }
   bool open_window(StringView address, StringView target, bool noopener) override { return owner_.env_.open_window(address, target, noopener); }
+  bool open_window_post(StringView address, StringView target, StringView type, StringView body) override { return owner_.env_.open_window_post(address, target, type, body); }
   void set_hash(StringView) override {}
   void reload() override {}
   void history_go(int32_t) override {}
@@ -198,6 +199,14 @@ bool Page::start_engine() {
         env_.console(3, prelude_error.view());
       }
       prelude_error.clear();
+      if (parent_) {   // a window in a frame starts with the name of the <iframe>
+        StringView frame_name;
+        if (dom::Node* iframe = parent_->doc_.by_serial(frame_serial_))
+          if (dom::get_attribute(iframe, "name", &frame_name) && !frame_name.empty()) {
+            const DomBindings::HookArg args[1] = {DomBindings::HookArg::of(frame_name)};
+            bindings_->call_hook("__set_window_name", args, 1);
+          }
+      }
       if (!engine_->run_library(cache_prelude(), &prelude_error) || !engine_->run_library(service_worker_client_prelude(), &prelude_error) ||
           (sw_worker_ != 0 && !engine_->run_library(service_worker_scope_prelude(), &prelude_error))) {
         prelude_error.insert(0, "The service worker script failed: ");
@@ -805,7 +814,7 @@ void Page::click(uint32_t node_serial, int32_t x, int32_t y, uint8_t object, int
       if (a->is_tag("a") && dom::get_attribute(a, "href", &href) && !href.empty()) {
         String target(allocator_);
         if (href.starts_with('#')) set_hash(href);
-        else if (resolve(href, &target)) env_.navigate(target.view(), false);
+        else if (resolve(href, &target)) navigate_target(target.view(), dom::browsing_target(a));
         return;
       }
     }
@@ -1758,7 +1767,7 @@ void Page::send_form(dom::Node* form, dom::Node* submitter) {
   }
   encoding = dom::output_encoding(encoding);
   StringView named;   // the frame (or window) the answer goes to
-  pick("formtarget", "target", &named);
+  if (!pick("formtarget", "target", &named) || named.trimmed().empty()) named = dom::browsing_target(form);
   named = named.trimmed();
   List<dom::Entry> entries(allocator_);
   if (!dom::form_entries(form, submitter, &entries)) return;
@@ -2233,7 +2242,15 @@ bool Page::find_named_frame(StringView name, Page** owner, uint32_t* serial) {
   for (uint32_t i = 1; i <= doc_.node_count(); ++i) {
     dom::Node* n = doc_.by_serial(i);
     StringView v;
-    if (n && n->is_tag("iframe") && dom::is_connected(n) && dom::get_attribute(n, "name", &v) && v.equals(name)) {
+    if (!n || !n->is_tag("iframe") || !dom::is_connected(n)) continue;
+    bool named = dom::get_attribute(n, "name", &v) && v.equals(name);
+    for (uint64_t k = 0; !named && k < frames_.count(); ++k) {   // (or the page in it called itself that: window.name = ...)
+      if (frames_[k]->serial != n->serial || !frames_[k]->page || !frames_[k]->page->bindings_) continue;
+      String own(allocator_);
+      frames_[k]->page->engine_->vm().reset_instruction_count();
+      if (frames_[k]->page->bindings_->call_hook("__window_name", nullptr, 0, &own)) named = own.view().equals(name);
+    }
+    if (named) {
       *owner = this;
       *serial = n->serial;
       return true;
@@ -2257,9 +2274,9 @@ bool Page::send_to_target(StringView target, StringView address, const char* con
   } else if (target.equals_ignore_case("_parent")) {
     owner = parent_ ? parent_ : this;
   } else if (target.equals_ignore_case("_blank")) {
-    return !post && env_.open_window(address, "_blank", false);
+    return post ? env_.open_window_post(address, "_blank", StringView(content_type), body) : env_.open_window(address, "_blank", false);
   } else if (!root()->find_named_frame(target, &owner, &serial)) {
-    return !post && env_.open_window(address, target, false);   // (a window of that name)
+    return post ? env_.open_window_post(address, target, StringView(content_type), body) : env_.open_window(address, target, false);   // (a window of that name)
   }
   if (serial == 0) {   // a whole window: the page itself, or the top of the frames
     if (owner == this) {

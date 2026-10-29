@@ -78,6 +78,8 @@ class IDomHost {
   virtual const MediaEnvironment& media() = 0;
   virtual StringView address() = 0;                            // where the page is from (with any #hash set by script)
   virtual void navigate(StringView address, bool replace) = 0; // location.assign / href = / replace
+  // Following a link (<a>, <area>) whose target is `target` ("" for none): the window the name says shows the page.
+  virtual void navigate_target(StringView address, StringView target) { (void)target; navigate(address, false); }
   virtual void set_hash(StringView hash) = 0;                  // location.hash = : no new page
   virtual void reload() = 0;
   virtual void history_go(int32_t delta) = 0;
