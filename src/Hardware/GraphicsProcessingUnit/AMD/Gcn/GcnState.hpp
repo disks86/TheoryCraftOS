@@ -21,13 +21,13 @@
 // stages in use (VS and PS only), and the draw. Register and field numbers come from the kernel's headers (GcnRegisters.inc, scripts/gen_gcn_registers.py). Everything the stream does
 // not set keeps the value the ring's clear state gave it (AmdGfx8::build_clear_state).
 //
-// The colour buffer is linear or 1D tiled (GcnTiling.hpp), with blending (CB_BLEND0_CONTROL, the blend constant, the write mask in CB_TARGET_MASK); a depth plane (32 bit float) and a
+// The colour buffer is linear or 1D tiled (GcnTiling.hpp), with blending (CB_BLEND0_CONTROL, the blend constant, the write mask in CB_TARGET_MASK; with a pixel shader that exports a second colour, the dual source factors: SPI_SHADER_COL_FORMAT names both exports and CB_SHADER_MASK enables both while CB_TARGET_MASK still names target 0 only); a depth plane (32 bit float) and a
 // stencil plane (8 bit) are set up through the DB registers with the tests and operations of DB_DEPTH_CONTROL, DB_STENCIL_CONTROL and DB_STENCILREFMASK. Textures are not state: the
 // T# and S# are in the descriptor table (make_image_descriptor in GcnTexture.hpp).
 //
 // The colour target and the planes may be 2D tiled (GcnTiling.hpp), by the tile mode index of the golden table: the colour entries 10 and 11 etc., the depth entries 0 to 7.
 //
-// Not done: multisampling, geometry / tessellation, instancing beyond one, hierarchical Z and compression, dual source blending, logic ops, and none of it has run on a card.
+// Not done: multisampling, geometry / tessellation, instancing beyond one, hierarchical Z and compression, logic ops, and none of it has run on a card.
 #pragma once
 
 #include <stdint.h>

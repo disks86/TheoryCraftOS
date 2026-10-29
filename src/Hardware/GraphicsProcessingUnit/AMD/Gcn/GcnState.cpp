@@ -99,7 +99,8 @@ bool emit_draw(Pm4Writer& w, const DrawState& s) {
                   (s.vertex_constants & 3) == 0 && (s.pixel_constants & 3) == 0 && t.width != 0 && t.height != 0 && t.width <= kMaxTargetDimension && t.height <= kMaxTargetDimension &&
                   t.pitch_pixels >= t.width && t.pitch_pixels % 8 == 0 && t.pitch_pixels <= kMaxTargetDimension && (t.address & 0xFF) == 0 && fits(t.address) && t.address != 0 &&
                   pi.ps_inputs <= kMaxInterpolants && vi.param_exports <= kMaxInterpolants && s.index_count != 0 && (!indexed || (fits(s.index_address) && s.index_max >= s.index_count)) &&
-                  (s.fence_address == 0 || ((s.fence_address & 7) == 0 && fits(s.fence_address))) && surface_ok(t.tile_index, ColorTarget::kPixelBytes, t.pitch_pixels, t.address) && blend_ok(s.blend);
+                  (s.fence_address == 0 || ((s.fence_address & 7) == 0 && fits(s.fence_address))) && surface_ok(t.tile_index, ColorTarget::kPixelBytes, t.pitch_pixels, t.address) && blend_ok(s.blend) &&
+                  pi.color_outputs >= 1 && pi.color_outputs <= 2 && (!s.blend.uses_second_source() || pi.color_outputs == 2);
   if (!ok) return false;
   const DepthTarget& dt = s.depth;
   const bool has_z = dt.z_address != 0, has_stencil = dt.stencil_address != 0;
@@ -136,7 +137,8 @@ bool emit_draw(Pm4Writer& w, const DrawState& s) {
   // what the shaders export and take: the position (4 components), the colour as 32 bit floats; the parameters and the interpolants
   w.set_context_reg(mmSPI_SHADER_POS_FORMAT, kSPI_SHADER_4COMP << SPI_SHADER_POS_FORMAT__POS0_EXPORT_FORMAT__SHIFT);
   w.set_context_reg(mmSPI_SHADER_Z_FORMAT, kSPI_SHADER_ZERO);
-  w.set_context_reg(mmSPI_SHADER_COL_FORMAT, kSPI_SHADER_32_ABGR << SPI_SHADER_COL_FORMAT__COL0_EXPORT_FORMAT__SHIFT);
+  const bool dual = pi.color_outputs == 2;           // a second colour export: the second source of dual source blending
+  w.set_context_reg(mmSPI_SHADER_COL_FORMAT, (kSPI_SHADER_32_ABGR << SPI_SHADER_COL_FORMAT__COL0_EXPORT_FORMAT__SHIFT) | (dual ? kSPI_SHADER_32_ABGR << SPI_SHADER_COL_FORMAT__COL1_EXPORT_FORMAT__SHIFT : 0u));
   w.set_context_reg(mmSPI_VS_OUT_CONFIG, (vi.param_exports == 0 ? 0 : vi.param_exports - 1) << SPI_VS_OUT_CONFIG__VS_EXPORT_COUNT__SHIFT);
   w.set_context_reg(mmPA_CL_VS_OUT_CNTL, 0);
   w.set_context_reg(mmSPI_PS_INPUT_ENA, pi.ps_input_enable);
@@ -158,7 +160,7 @@ bool emit_draw(Pm4Writer& w, const DrawState& s) {
                             t.tile_index << CB_COLOR0_ATTRIB__TILE_MODE_INDEX__SHIFT};
   w.set_context_reg(mmCB_COLOR0_BASE, ArrayView<const uint32_t>(color, 6));
   w.set_context_reg(mmCB_TARGET_MASK, s.blend.write_mask);
-  w.set_context_reg(mmCB_SHADER_MASK, 0xF);
+  w.set_context_reg(mmCB_SHADER_MASK, dual ? 0xFFu : 0xFu);
   w.set_context_reg(mmCB_COLOR_CONTROL, (kCB_NORMAL << CB_COLOR_CONTROL__MODE__SHIFT) | (0xCCu << CB_COLOR_CONTROL__ROP3__SHIFT));
   // blending: the colour factors and function, the alpha's own when separate (else the colour's), and the constant colour
   const BlendState& b = s.blend;

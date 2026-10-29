@@ -745,6 +745,54 @@ static void test_more_textures() {
   }
 }
 
+// Dual source blending: the pixel shader exports its colour and a second one (a constant here), and the factors name the second as a source
+static void test_dual_source() {
+  Fixture f;
+  Compiled dual(f.alloc);
+  compile(f.alloc, "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\nDCL OUT[1], COLOR[1]\nDCL CONST[0]\n  0: MOV OUT[0], IN[0]\n  1: MOV OUT[1], CONST[0]\n  2: END\n", &dual);
+  CHECK(dual.ok && dual.info.color_outputs == 2 && f.fs.info.color_outputs == 1);
+  if (!dual.ok) return;
+  const float src[4] = {1, 0, 0, 0.25f}, second[4] = {0.5f, 0.25f, 0.75f, 0.4f};
+  Layers one(0.0f, src, 0.0f, src);
+  Framebuffer fb(f.alloc, 16, 16);
+  auto run = [&](const BlendState& b, uint32_t tris, float r, float g, float bl, float a) {
+    fb.clear(0, 0, 1, 1);
+    DrawCall c = make_call(f, dual, kIdentity, as_words(one.v), 42, 28, 4, one.idx, tris * 3);
+    c.pixel_constants = ArrayView<const float>(second, 4);
+    c.blend = b;
+    const DrawStatus st = draw(f.alloc, c, fb);
+    return st == DrawStatus::Ok && is_color(fb, 8, 8, r, g, bl, a) && is_color(fb, 0, 0, r, g, bl, a);
+  };
+  BlendState b;
+  b.enable = true;
+  b.color_src = 1; b.color_dst = 16;                      // src + dst * (1 - src1 colour)
+  CHECK(run(b, 1, 1, 0, 0.25f, 0.25f + 0.6f));
+  b.color_src = 15; b.color_dst = 0;                      // src * src1 colour
+  CHECK(run(b, 1, 0.5f, 0, 0, 0.25f * 0.4f));
+  b.color_src = 17; b.color_dst = 18;                     // src * src1 alpha + dst * (1 - src1 alpha)
+  CHECK(run(b, 1, 0.4f, 0, 0.6f, 0.25f * 0.4f + 0.6f));
+  b.color_src = 15; b.color_dst = 16;                     // src * src1 + dst * (1 - src1)
+  CHECK(run(b, 1, 0.5f, 0, 0.25f, 0.25f * 0.4f + 0.6f));
+  b.separate_alpha = true; b.alpha_src = 1; b.alpha_dst = 0;     // the alpha its own
+  CHECK(run(b, 1, 0.5f, 0, 0.25f, 0.25f));
+  BlendState mix = b;                                      // the first source alone, with the second only named by the alpha factors
+  mix.color_src = 1; mix.color_dst = 0; mix.alpha_src = 17; mix.alpha_dst = 0;
+  CHECK(run(mix, 1, 1, 0, 0, 0.25f * 0.4f));
+  // two layers: the second sees the first's result
+  b.separate_alpha = false;
+  b.color_src = 1; b.color_dst = 16;
+  CHECK(run(b, 2, 1.5f, 0, 0.25f * 0.25f, 0.25f + (0.25f + 0.6f) * 0.6f));
+  // factors that are not dual source work with the dual shader as before (the second export is ignored)
+  BlendState plain;
+  plain.enable = true; plain.color_src = 4; plain.color_dst = 5;
+  CHECK(run(plain, 1, 0.25f, 0, 0.75f, 0.25f * 0.25f + 0.75f));
+  // refused: dual source factors with a shader that exports one colour
+  fb.clear(0, 0, 1, 1);
+  DrawCall c = make_call(f, f.fs, kIdentity, as_words(one.v), 42, 28, 4, one.idx, 3);
+  c.blend = b;
+  CHECK(draw(f.alloc, c, fb) == DrawStatus::BadInput);
+}
+
 int main() {
   Fixture f;
   if (!f.vs.ok || !f.fs.ok || !f.tfs.ok || !f.kfs.ok) { printf("FAILED: the shaders did not compile\n"); return 1; }
@@ -760,6 +808,7 @@ int main() {
   test_descriptor_textures(f);
   test_faces_and_bounds(f);
   test_more_textures();
+  test_dual_source();
   printf(g_failed ? "GcnDrawTest: %d FAILED\n" : "GcnDrawTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }
