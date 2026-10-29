@@ -215,7 +215,7 @@ class Builder {
     b.out_of_flow = out_of_flow;
     b.floated = floated;
     b.establishes_bfc = out_of_flow || floated || kind == BoxKind::InlineBlock || s.overflow_x != Overflow::Visible || s.overflow_y != Overflow::Visible ||
-                        s.layout == Layout::Flex || s.layout == Layout::Grid || s.layout == Layout::Table || s.column_count > 0;
+                        s.layout == Layout::Flex || s.layout == Layout::Grid || s.layout == Layout::Table || s.column_count > 0 || s.flow_root;
     failed_ |= !tree_.append(parent, id);
     read_table_attributes(n, &b);
     if (n->is_tag("hr")) {   // (the line of a rule: a box with a border and nothing in it)
