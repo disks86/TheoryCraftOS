@@ -177,16 +177,27 @@ class Machine final : public IEnvironment {
     *p20 = v[2] - v[0];
   }
 
-  void sample(Mimg, const uint32_t image[8], const uint32_t sampler[4], const float* coords, uint32_t, float result[4]) override {
+  void sample(Mimg op, const uint32_t image[8], const uint32_t sampler[4], const float* coords, uint32_t count, float result[4]) override {
     result[0] = result[1] = result[2] = result[3] = 0.0f;
-    if ((image[3] >> 28) != 0) {                // a real T# (its resource type is set); the harness's own unit numbers have none
-      if (!texel_memory_ || sample_image(*texel_memory_, ArrayView<const uint32_t>(image, 8), ArrayView<const uint32_t>(sampler, 4), coords[0], coords[1], result) != SampleStatus::Ok) {
+    // the address registers: the bias (image_sample_b), the coordinates of the image's type, the level of detail (image_sample_l)
+    const uint32_t type = image[3] >> 28;
+    const uint32_t dims = type == 10 || type == 11 || type == 13 ? 3 : 2;
+    SampleRequest r;
+    uint32_t at = 0;
+    if (op == Mimg::image_sample_b && at < count) r.bias = coords[at++];
+    for (uint32_t k = 0; k < dims && at < count; ++k) r.coord[k] = coords[at++];
+    if (op == Mimg::image_sample_l && at < count) {
+      r.has_lod = true;
+      r.lod = coords[at++];
+    }
+    if (type != 0) {                // a real T# (its resource type is set); the harness's own unit numbers have none
+      if (!texel_memory_ || sample_image(*texel_memory_, ArrayView<const uint32_t>(image, 8), ArrayView<const uint32_t>(sampler, 4), r, result) != SampleStatus::Ok) {
         fault_ = true;
         result[0] = result[1] = result[2] = result[3] = 0.0f;
       }
       return;
     }
-    if (textures_) textures_->sample(image[0], coords[0], coords[1], result);
+    if (textures_) textures_->sample(image[0], r.coord[0], r.coord[1], result);
   }
 
   void export_data(uint32_t target, uint32_t enable, bool compressed, const uint32_t values[kWaveSize][4], uint64_t lanes, bool) override {

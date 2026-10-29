@@ -33,7 +33,7 @@ VOP2 = ['v_cndmask_b32', 'v_add_f32', 'v_sub_f32', 'v_subrev_f32', 'v_mul_f32', 
 VOP2_LIT = ['v_madmk_f32', 'v_madak_f32']
 CMP_F = ['f', 'lt', 'eq', 'le', 'gt', 'lg', 'ge', 'o', 'u', 'nge', 'nlg', 'ngt', 'nle', 'neq', 'nlt', 'tru']
 CMP_I = ['f', 'lt', 'eq', 'le', 'gt', 'ne', 'ge', 't']
-VOP3 = ['v_mad_f32', 'v_fma_f32', 'v_mad_i32_i24', 'v_mad_u32_u24', 'v_min3_f32', 'v_max3_f32', 'v_med3_f32', 'v_bfe_u32', 'v_bfe_i32', 'v_bfi_b32', 'v_mad_u64_u32']
+VOP3 = ['v_mad_f32', 'v_fma_f32', 'v_mad_i32_i24', 'v_mad_u32_u24', 'v_min3_f32', 'v_max3_f32', 'v_med3_f32', 'v_bfe_u32', 'v_bfe_i32', 'v_bfi_b32', 'v_mad_u64_u32', 'v_cubeid_f32', 'v_cubesc_f32', 'v_cubetc_f32', 'v_cubema_f32']
 VINTRP = ['v_interp_p1_f32', 'v_interp_p2_f32', 'v_interp_mov_f32']
 MUBUF = ['buffer_load_format_x', 'buffer_load_format_xy', 'buffer_load_format_xyz', 'buffer_load_format_xyzw', 'buffer_load_dword', 'buffer_load_dwordx2', 'buffer_load_dwordx3',
          'buffer_load_dwordx4', 'buffer_store_dword', 'buffer_store_dwordx2', 'buffer_store_dwordx4', 'buffer_store_format_xyzw']

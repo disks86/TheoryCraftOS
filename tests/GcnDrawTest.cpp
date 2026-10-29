@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <string>
 #include "Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnDraw.hpp"
 
 using namespace gcn;
@@ -45,6 +46,9 @@ static const char* kVertex =
     "  0: MUL TEMP[0], CONST[0], IN[0].xxxx\n  1: MAD TEMP[0], CONST[1], IN[0].yyyy, TEMP[0]\n  2: MAD TEMP[0], CONST[2], IN[0].zzzz, TEMP[0]\n  3: ADD OUT[0], TEMP[0], CONST[3]\n  4: MOV OUT[1], IN[1]\n  5: END\n";
 static const char* kColoredFragment = "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\n  0: MOV OUT[0], IN[0]\n  1: END\n";
 static const char* kKillFragment = "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\n  0: KILL_IF IN[0]\n  1: MOV OUT[0], IN[0]\n  2: END\n";
+static std::string sampling_fragment(const char* op, const char* target) {
+  return std::string("FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\nDCL SAMP[0]\nDCL SVIEW[0], ") + target + ", FLOAT\n  0: " + op + " OUT[0], IN[0], SAMP[0], " + target + "\n  1: END\n";
+}
 static const char* kTexturedFragment = "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\nDCL SAMP[0]\nDCL SVIEW[0], 2D, FLOAT\n  0: TEX OUT[0], IN[0], SAMP[0], 2D\n  1: END\n";
 
 struct Compiled {
@@ -549,7 +553,7 @@ static void test_descriptor_textures(Fixture& f) {
   CHECK(draw(f.alloc, none, fb) == DrawStatus::ShaderFault);
   // a sampler the unit does not implement
   DrawCall badS = c;
-  badS.sampler_words[0][0] |= 1u << 28;                                  // a filter mode
+  badS.sampler_words[0][0] |= 1u << 29;                                  // a filter mode
   CHECK(draw(f.alloc, badS, fb) == DrawStatus::ShaderFault);
 }
 
@@ -616,6 +620,131 @@ static void test_faces_and_bounds(Fixture& f) {
   CHECK(draw(f.alloc, c, fb) == DrawStatus::BadInput);
 }
 
+// Textures of the other kinds through compiled shaders: the level of detail of TXL and TXB, 3D, array and cube images (the cube through v_cubeid / v_cubesc / v_cubetc / v_cubema)
+struct BigTexMem final : ITexelMemory {
+  uint64_t base = 0x80000;
+  uint32_t words[4096] = {};
+  bool read32(uint64_t address, uint32_t* out) override {
+    if (address < base || (address & 3) != 0 || (address - base) / 4 >= 4096) return false;
+    *out = words[(address - base) / 4];
+    return true;
+  }
+};
+
+static void fill_slice_level(BigTexMem& m, const ImageDescriptor& d, uint32_t level, uint32_t slice, uint8_t red) {
+  LevelLayout l;
+  CHECK(image_level(d, level, &l));
+  for (uint32_t y = 0; y < l.height; ++y)
+    for (uint32_t x = 0; x < l.width; ++x) {
+      const uint8_t t[4] = {red, 0, 0, 255};
+      memcpy(reinterpret_cast<uint8_t*>(m.words) + image_texel_offset(d, l, x, y, slice), t, 4);
+    }
+}
+
+// draws one triangle over the target whose colour attribute is `attr` at all three vertices, the image and sampler in unit 0; returns the red of the middle pixel * 255 (or -1)
+static float draw_sampled(Fixture& f, const Compiled& ps, BigTexMem& mem, const ImageDescriptor& img, const SamplerDescriptor& smp, const float attr[4]) {
+  const Vertex7 v[3] = {{{-1.0f, -1.0f, 0.0f}, {attr[0], attr[1], attr[2], attr[3]}}, {{3.0f, -1.0f, 0.0f}, {attr[0], attr[1], attr[2], attr[3]}},
+                        {{-1.0f, 3.0f, 0.0f}, {attr[0], attr[1], attr[2], attr[3]}}};
+  const uint32_t idx[3] = {0, 1, 2};
+  Framebuffer fb(f.alloc, 8, 8);
+  fb.clear(-1, -1, -1, -1);
+  DrawCall c = make_call(f, ps, kIdentity, as_words(v), 21, 28, 4, idx, 3);
+  if (!make_image_descriptor(ArrayView<uint32_t>(c.image_words[0], 8), img) || !make_sampler_descriptor(ArrayView<uint32_t>(c.sampler_words[0], 4), smp)) return -1.0f;
+  c.descriptors_set = 1;
+  c.texel_memory = &mem;
+  if (draw(f.alloc, c, fb) != DrawStatus::Ok) return -2.0f;
+  return fb.pixel(4, 4)[0] * 255.0f;
+}
+
+static ImageDescriptor tex_image(const BigTexMem& m, uint32_t w, uint32_t h, uint32_t levels, ImageType type, uint32_t depth) {
+  ImageDescriptor d;
+  d.address = m.base;
+  d.width = w;
+  d.height = h;
+  d.pitch_pixels = image_pitch(w, levels);
+  d.tile_index = 9;
+  d.levels = levels;
+  d.type = type;
+  d.depth = depth;
+  return d;
+}
+
+static void test_more_textures() {
+  Fixture f;
+  Compiled txl(f.alloc), txb(f.alloc), cube(f.alloc), vol(f.alloc), arr(f.alloc);
+  compile(f.alloc, sampling_fragment("TXL", "2D").c_str(), &txl);
+  compile(f.alloc, sampling_fragment("TXB", "2D").c_str(), &txb);
+  compile(f.alloc, sampling_fragment("TEX", "CUBE").c_str(), &cube);
+  compile(f.alloc, sampling_fragment("TEX", "3D").c_str(), &vol);
+  compile(f.alloc, sampling_fragment("TEX", "2D_ARRAY").c_str(), &arr);
+  CHECK(txl.ok && txb.ok && cube.ok && vol.ok && arr.ok);
+  if (!(txl.ok && txb.ok && cube.ok && vol.ok && arr.ok)) return;
+  auto near_to = [](float a, float want) { return a > want - 0.6f && a < want + 0.6f; };
+  // mips: 8 by 8 with 4 levels, level k red = 60 k; TXL takes the lod from w, TXB adds it
+  {
+    BigTexMem m;
+    ImageDescriptor d = tex_image(m, 8, 8, 4, ImageType::Image2D, 1);
+    for (uint32_t k = 0; k < 4; ++k) fill_slice_level(m, d, k, 0, static_cast<uint8_t>(60 * k));
+    SamplerDescriptor s;
+    s.mip_filter = 2;
+    const float lod0[4] = {0.5f, 0.5f, 0, 0}, lod15[4] = {0.5f, 0.5f, 0, 1.5f}, lod3[4] = {0.5f, 0.5f, 0, 3.0f};
+    CHECK(near_to(draw_sampled(f, txl, m, d, s, lod0), 0) && near_to(draw_sampled(f, txl, m, d, s, lod15), 90) && near_to(draw_sampled(f, txl, m, d, s, lod3), 180));
+    CHECK(near_to(draw_sampled(f, txb, m, d, s, lod15), 90));
+    s.mip_filter = 1;
+    CHECK(near_to(draw_sampled(f, txl, m, d, s, lod15), 120));
+    // a plain TEX has no derivatives here: lod 0 plus the sampler's bias
+    s.mip_filter = 2;
+    s.lod_bias = 2.0f;
+    CHECK(near_to(draw_sampled(f, f.tfs, m, d, s, lod0), 120));
+  }
+  // an array: the layer is the z coordinate
+  {
+    BigTexMem m;
+    ImageDescriptor d = tex_image(m, 4, 4, 1, ImageType::Array2D, 3);
+    for (uint32_t z = 0; z < 3; ++z) fill_slice_level(m, d, 0, z, static_cast<uint8_t>(80 * z));
+    SamplerDescriptor s;
+    const float l0[4] = {0.5f, 0.5f, 0.0f, 1}, l2[4] = {0.5f, 0.5f, 2.0f, 1}, l1[4] = {0.5f, 0.5f, 1.2f, 1};
+    CHECK(near_to(draw_sampled(f, arr, m, d, s, l0), 0) && near_to(draw_sampled(f, arr, m, d, s, l2), 160) && near_to(draw_sampled(f, arr, m, d, s, l1), 80));
+  }
+  // a volume
+  {
+    BigTexMem m;
+    ImageDescriptor d = tex_image(m, 4, 4, 1, ImageType::Image3D, 4);
+    for (uint32_t z = 0; z < 4; ++z) fill_slice_level(m, d, 0, z, static_cast<uint8_t>(60 * z));
+    SamplerDescriptor s;
+    const float a[4] = {0.5f, 0.5f, 0.3f, 1}, b[4] = {0.5f, 0.5f, 0.9f, 1};
+    CHECK(near_to(draw_sampled(f, vol, m, d, s, a), 60) && near_to(draw_sampled(f, vol, m, d, s, b), 180));
+    s.z_filter = 2;
+    const float mid[4] = {0.5f, 0.5f, 0.5f, 1};
+    CHECK(near_to(draw_sampled(f, vol, m, d, s, mid), 90));
+  }
+  // a cube: red = 40 * face; the direction is the attribute; the six axes and a few off-axis directions
+  {
+    BigTexMem m;
+    ImageDescriptor d = tex_image(m, 4, 4, 1, ImageType::Cube, 6);
+    for (uint32_t z = 0; z < 6; ++z) fill_slice_level(m, d, 0, z, static_cast<uint8_t>(40 * z));
+    SamplerDescriptor s;
+    struct Dir { float v[4]; int face; };
+    const Dir dirs[] = {{{1, 0, 0, 1}, 0}, {{-1, 0, 0, 1}, 1}, {{0, 1, 0, 1}, 2}, {{0, -1, 0, 1}, 3}, {{0, 0, 1, 1}, 4}, {{0, 0, -1, 1}, 5},
+                        {{1, 0.5f, -0.25f, 1}, 0}, {{-0.3f, -2, 0.9f, 1}, 3}, {{0.2f, 0.3f, -0.8f, 1}, 5}, {{-0.9f, 0.1f, 0.2f, 1}, 1}};
+    for (const Dir& dir : dirs) CHECK(near_to(draw_sampled(f, cube, m, d, s, dir.v), 40.0f * dir.face));
+    // the orientation on a face (the table of the OpenGL specification: on +x sc = -z, tc = -y): face 0 holds red = 20 x + 60 y
+    {
+      LevelLayout l;
+      image_level(d, 0, &l);
+      for (uint32_t y = 0; y < 4; ++y)
+        for (uint32_t x = 0; x < 4; ++x) {
+          const uint8_t t[4] = {static_cast<uint8_t>(20 * x + 60 * y), 0, 0, 255};
+          memcpy(reinterpret_cast<uint8_t*>(m.words) + image_texel_offset(d, l, x, y, 0), t, 4);
+        }
+      const float a[4] = {1, 0.5f, 0.5f, 1}, b[4] = {1, -0.5f, -0.5f, 1}, c[4] = {1, -0.5f, 0.5f, 1};
+      CHECK(near_to(draw_sampled(f, cube, m, d, s, a), 80));            // sc = -0.5, tc = -0.5: s = t = 0.25: texel (1, 1)
+      CHECK(near_to(draw_sampled(f, cube, m, d, s, b), 240));           // s = t = 0.75: texel (3, 3)
+      CHECK(near_to(draw_sampled(f, cube, m, d, s, c), 20 * 1 + 60 * 3));   // sc = -0.5 (s = 0.25), tc = +0.5 (t = 0.75): texel (1, 3)
+    }
+  }
+}
+
 int main() {
   Fixture f;
   if (!f.vs.ok || !f.fs.ok || !f.tfs.ok || !f.kfs.ok) { printf("FAILED: the shaders did not compile\n"); return 1; }
@@ -630,6 +759,7 @@ int main() {
   test_stencil(f);
   test_descriptor_textures(f);
   test_faces_and_bounds(f);
+  test_more_textures();
   printf(g_failed ? "GcnDrawTest: %d FAILED\n" : "GcnDrawTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }
