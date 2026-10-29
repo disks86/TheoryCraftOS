@@ -701,6 +701,14 @@ add_executable(BOOTX64
   src/Hardware/GraphicsProcessingUnit/AMD/AmdDpSource.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdModeSet.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdMonitor.cpp
+  src/Hardware/Acpi/AcpiResources.cpp
+  src/Hardware/Bus/I2c/DesignWareI2c.cpp
+  src/Hardware/Bus/I2c/HidInputMap.cpp
+  src/Hardware/Bus/I2c/I2cHidDevice.cpp
+  src/Hardware/Bus/I2c/IntelGpio.cpp
+  src/Hardware/Bus/I2c/LpssI2c.cpp
+  src/Hardware/Mouse/I2c/I2cHidPointer.cpp
+  src/Hardware/Mouse/I2c/PlatformI2cHid.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnIsa.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnEmu.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/Gcn/TgsiParse.cpp
