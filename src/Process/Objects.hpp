@@ -86,7 +86,7 @@ class ObjectManager {
   // ended cannot be mistaken for the next client.
   void add_pipe_end(uint32_t id, uint32_t end_code);
   void release_pipe_end(uint32_t id, uint32_t end_code);
-  enum class PipeResult { Ok, WouldBlock, Broken, Closing, NotConnected };
+  enum class PipeResult { Ok, WouldBlock, Broken, Closing, NotConnected, Listening };      // (Listening: the server end has not had a client yet; NotConnected: the server disconnected it)
   // The lock must be held (sync().lock()) for the _locked calls. Read/write move what fits (at least one byte) or say why not.
   PipeResult pipe_read_locked(uint32_t id, uint32_t end_code, uint8_t* out, uint32_t capacity, uint32_t* got, bool peek = false, uint32_t* available = nullptr);
   PipeResult pipe_write_locked(uint32_t id, uint32_t end_code, const uint8_t* data, uint32_t count, uint32_t* done);
@@ -94,7 +94,8 @@ class ObjectManager {
   PipeResult pipe_listen_locked(uint32_t id);
   // How much this end wrote that the other end has not read yet (0 when the other end is gone).
   uint32_t pipe_pending_locked(uint32_t id, uint32_t end_code);
-  void pipe_disconnect(uint32_t id);      // the server ends the connection (the instance can listen again)
+  bool pipe_disconnect(uint32_t id);      // false if nothing was connected      // the server ends the connection (the instance can listen again)
+  bool pipe_name_exists_locked(StringView name);      // some instance of the pipe exists (listening or not)
   bool pipe_name_available_locked(StringView name);      // some instance of the named pipe is not connected
   struct PipeInfo {
     bool anonymous = false, connected = false;
@@ -228,6 +229,7 @@ class ObjectManager {
   // real mailslot's ERROR_INSUFFICIENT_BUFFER - the message is not lost) if `capacity` is less than the message's size; NoMessage if the queue is empty right now.
   MailslotResult mailslot_read_locked(uint32_t id, uint8_t* out, uint32_t capacity, uint32_t* got, uint32_t* message_size);
   // GetMailslotInfo/SetMailslotInfo (NtQueryInformationFile/NtSetInformationFile classes 26/27).
+  uint32_t mailslot_message_count_locked(uint32_t id);      // (the system lock held) how many messages wait; 0 for a gone mailslot
   bool mailslot_info(uint32_t id, uint32_t* max_message_size, uint64_t* read_timeout_100ns, uint32_t* next_message_size, uint32_t* message_count);
   bool mailslot_set_timeout(uint32_t id, uint64_t read_timeout_100ns);
   // The reader's own handle closing (not a writer's): destroys the mailslot at once, same as the real one. A no-op if `id` is a writer or already gone.

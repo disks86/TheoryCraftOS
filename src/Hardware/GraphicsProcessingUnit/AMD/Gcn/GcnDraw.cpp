@@ -60,6 +60,7 @@ class Machine final : public IEnvironment {
   List<float> params_;                     // per parameter, per vertex slot: 4 floats
   uint32_t slots_ = 0;
   uint32_t param_count_ = 0;
+  const uint8_t* ps_param_ = nullptr;
 
   // the vertex wave being run
   uint32_t batch_base_ = 0;
@@ -90,8 +91,9 @@ class Machine final : public IEnvironment {
 
   void interpolation(uint32_t attr, uint32_t chan, uint32_t, float* p0, float* p10, float* p20) override {
     float v[3] = {0, 0, 0};
-    if (attr < param_count_ && chan < 4) {
-      for (uint32_t k = 0; k < 3; ++k) v[k] = params_[(static_cast<uint64_t>(attr) * slots_ + tri_[k]) * 4 + chan];
+    const uint32_t param = attr < 16 ? ps_param_[attr] : 0xFFFFu;
+    if (param < param_count_ && chan < 4) {
+      for (uint32_t k = 0; k < 3; ++k) v[k] = params_[(static_cast<uint64_t>(param) * slots_ + tri_[k]) * 4 + chan];
     }
     *p0 = v[0];
     *p10 = v[1] - v[0];
@@ -168,6 +170,9 @@ DrawStatus draw(allocators::IAllocator& allocator, const DrawCall& call, Framebu
   }
 
   Machine m(allocator);
+  m.ps_param_ = call.ps_param;            // (set from the start: code that is not what the stage should run may still interpolate)
+  m.textures_ = call.textures;
+  m.target_ = &target;
   m.vertex_const_.base = kVertexConstAddr;
   m.pixel_const_.base = kPixelConstAddr;
   m.table_.base = kTableAddr;
@@ -225,6 +230,17 @@ DrawStatus draw(allocators::IAllocator& allocator, const DrawCall& call, Framebu
   m.target_ = &target;
   m.textures_ = call.textures;
   const float fw = static_cast<float>(target.width()), fh = static_cast<float>(target.height());
+  const Viewport& vp = call.viewport;
+  const float xs = vp.set ? vp.x_scale : 0.5f * fw, xo = vp.set ? vp.x_offset : 0.5f * fw, ys = vp.set ? vp.y_scale : -0.5f * fh, yo = vp.set ? vp.y_offset : 0.5f * fh;
+  // the pixels drawn: the target, and the scissor rectangle
+  uint32_t clip_l = 0, clip_t = 0, clip_r = target.width(), clip_b = target.height();
+  if (call.scissor.set) {
+    if (call.scissor.left > clip_l) clip_l = call.scissor.left;
+    if (call.scissor.top > clip_t) clip_t = call.scissor.top;
+    if (call.scissor.right < clip_r) clip_r = call.scissor.right;
+    if (call.scissor.bottom < clip_b) clip_b = call.scissor.bottom;
+  }
+  if (clip_l >= clip_r || clip_t >= clip_b) return DrawStatus::Ok;
   uint32_t px[kWaveSize], py[kWaveSize];
   float pi[kWaveSize], pj[kWaveSize];
   m.pixel_x_ = px;
@@ -259,8 +275,8 @@ DrawStatus draw(allocators::IAllocator& allocator, const DrawCall& call, Framebu
       const float* p = &m.positions_[static_cast<uint64_t>(slot[k]) * 4];
       if (!(p[3] > 0.0f)) { ok = false; break; }
       const float inv = 1.0f / p[3];
-      v[k].x = (p[0] * inv * 0.5f + 0.5f) * fw;
-      v[k].y = (0.5f - p[1] * inv * 0.5f) * fh;
+      v[k].x = p[0] * inv * xs + xo;
+      v[k].y = p[1] * inv * ys + yo;
       v[k].inv_w = inv;
       v[k].valid = true;
     }
@@ -287,9 +303,9 @@ DrawStatus draw(allocators::IAllocator& allocator, const DrawCall& call, Framebu
       if (s->y < min_y) min_y = s->y;
       if (s->y > max_y) max_y = s->y;
     }
-    if (max_x < 0 || max_y < 0 || min_x > fw || min_y > fh) continue;
-    const uint32_t x0 = min_x < 0 ? 0 : static_cast<uint32_t>(min_x), y0 = min_y < 0 ? 0 : static_cast<uint32_t>(min_y);
-    const uint32_t x1 = max_x >= fw ? target.width() - 1 : static_cast<uint32_t>(max_x), y1 = max_y >= fh ? target.height() - 1 : static_cast<uint32_t>(max_y);
+    if (max_x < static_cast<float>(clip_l) || max_y < static_cast<float>(clip_t) || min_x > static_cast<float>(clip_r) || min_y > static_cast<float>(clip_b)) continue;
+    const uint32_t x0 = min_x < static_cast<float>(clip_l) ? clip_l : static_cast<uint32_t>(min_x), y0 = min_y < static_cast<float>(clip_t) ? clip_t : static_cast<uint32_t>(min_y);
+    const uint32_t x1 = max_x >= static_cast<float>(clip_r) ? clip_r - 1 : static_cast<uint32_t>(max_x), y1 = max_y >= static_cast<float>(clip_b) ? clip_b - 1 : static_cast<uint32_t>(max_y);
     for (uint32_t y = y0; y <= y1; ++y) {
       for (uint32_t x = x0; x <= x1; ++x) {
         const float qx = static_cast<float>(x) + 0.5f, qy = static_cast<float>(y) + 0.5f;
