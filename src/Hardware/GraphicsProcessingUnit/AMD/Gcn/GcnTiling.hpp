@@ -22,8 +22,12 @@
 //   - ARRAY_LINEAR_ALIGNED: rows of `pitch` pixels one after another;
 //   - ARRAY_1D_TILED_THIN1: 8 by 8 pixel micro tiles, laid out row by row (`pitch / 8` of them to a row), the pixels inside a micro tile in the order of the entry's micro tile mode
 //     (DISPLAY for what the display engine scans out, THIN and DEPTH for the rest). The order is the bit interleaving of AMD's address library (ComputePixelIndexWithinMicroTile).
-// Not done: the 2D tiled modes (pipe and bank swizzling, macro tiles), which the table's depth entries and most of its colour entries use, and the thick modes. A mode that is not
-// implemented is refused, not guessed. None of it has been compared with a card; the orders are those of the address library as remembered.
+//   - ARRAY_2D_TILED_THIN1: macro tiles of micro tiles spread over the memory pipes and banks (the pipe configuration, bank width / height / count and macro tile aspect of the
+//     GB_TILE_MODE / GB_MACROTILE_MODE entries, tile splits for micro tiles larger than the split size), as AMD's address library places them for a single slice and sample on the
+//     VEGAM (16 pipes in the P16_32x32_16x16 configuration with that chip's rotation of the pipe bits; GB_ADDR_CONFIG 0x22011003: 256 byte pipe interleave, bank interleave 1, 4 KB
+//     rows). The surface is padded to whole macro tiles (`surface_pitch_align`, `surface_height_align`) and its base is aligned to `surface_base_align`.
+// Not done: the thick, 3D and PRT modes, more than one slice or sample. A mode that is not implemented is refused, not guessed. The micro tile pixel orders and the 2D arithmetic were
+// written from the address library's source (egbaddrlib.cpp, siaddrlib.cpp, ciaddrlib.cpp); none of it has been compared with a card.
 #pragma once
 
 #include <stdint.h>
@@ -31,10 +35,11 @@
 namespace gcn {
 
 struct TileLayout {
-  enum class Kind : uint8_t { Linear, Tiled1D };
+  enum class Kind : uint8_t { Linear, Tiled1D, Tiled2D };
   enum class Micro : uint8_t { Display, Thin, Depth };
   Kind kind = Kind::Linear;
   Micro micro = Micro::Display;
+  uint32_t gb_tile_mode = 0;           // the GB_TILE_MODE entry (the 2D layout reads its pipe configuration and tile split from it)
 };
 
 // The golden GB_TILE_MODE register for `index` (0 to 31); 0 beyond.
@@ -44,11 +49,15 @@ uint32_t tile_mode_register(uint32_t index);
 bool resolve_tile_mode(uint32_t gb_tile_mode, TileLayout* out);
 inline bool resolve_tile_index(uint32_t index, TileLayout* out) { return resolve_tile_mode(tile_mode_register(index), out); }
 
-// The byte offset of pixel (x, y) of a surface of `bytes` per pixel (1, 2, 4, 8 or 16) and a row of `pitch` pixels (a multiple of 8 for a tiled one); the offset of a pixel inside
-// the padded surface. 0 for a size that is not one of those (check `surface_valid`).
+// A surface of `bytes` per pixel (1, 2, 4, 8 or 16) with a row of `pitch` pixels: a tiled one has a pitch that is a multiple of 8 (a 2D tiled one of `surface_pitch_align`), its rows are
+// padded to `surface_height_align` rows, and its base address is a multiple of `surface_base_align`.
 bool surface_valid(const TileLayout& layout, uint32_t bytes, uint32_t pitch);
-uint64_t surface_offset(const TileLayout& layout, uint32_t bytes, uint32_t pitch, uint32_t x, uint32_t y);
-// The bytes a surface of `height` rows occupies (the rows padded to a multiple of 8)
-uint64_t surface_bytes(uint32_t bytes, uint32_t pitch, uint32_t height);
+uint32_t surface_pitch_align(const TileLayout& layout, uint32_t bytes);
+uint32_t surface_height_align(const TileLayout& layout, uint32_t bytes);
+uint64_t surface_base_align(const TileLayout& layout, uint32_t bytes);
+// The byte offset of pixel (x, y) in the padded surface of `height` rows (the height matters to a 2D tiled one only); 0 for a surface that is not valid.
+uint64_t surface_offset(const TileLayout& layout, uint32_t bytes, uint32_t pitch, uint32_t x, uint32_t y, uint32_t height = 0);
+// The bytes a surface of `height` rows occupies (the rows padded to the height alignment)
+uint64_t surface_bytes(const TileLayout& layout, uint32_t bytes, uint32_t pitch, uint32_t height);
 
 }  // namespace gcn

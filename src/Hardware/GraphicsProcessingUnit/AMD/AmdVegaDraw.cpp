@@ -25,17 +25,21 @@ using namespace gcn;
 
 namespace {
 
-uint64_t align_up(uint64_t v) { return (v + AmdVegaDraw::kAlignment - 1) / AmdVegaDraw::kAlignment * AmdVegaDraw::kAlignment; }
+uint64_t align_to(uint64_t v, uint64_t a) { return (v + a - 1) / a * a; }
+uint64_t align_up(uint64_t v) { return align_to(v, AmdVegaDraw::kAlignment); }
 
 struct Plan {
-  uint64_t vertex_code, pixel_code, vertex_constants, pixel_constants, table, vertices, indices, target, depth, stencil, textures[abi::kMaxSamplers], total;
+  uint64_t vertex_code, pixel_code, vertex_constants, pixel_constants, table, vertices, indices, target, depth, stencil, textures[abi::kMaxSamplers], total, alignment;
 };
 
 bool layout_of(uint32_t tile_index, TileLayout* layout) { return resolve_tile_index(tile_index, layout); }
 
 bool bound(const VegaTexture& t) { return t.texels.size() != 0; }
 
-uint32_t texture_pitch(const VegaTexture& t) { return AmdVegaDraw::pitch_pixels(t.width); }
+uint32_t texture_pitch(const VegaTexture& t) {
+  TileLayout layout;
+  return layout_of(t.tile_index, &layout) ? static_cast<uint32_t>(align_to(t.width, surface_pitch_align(layout, texel_bytes(t.format)))) : 0;
+}
 
 // The surface of a texture: its bytes and the layout, or false if the texture cannot be described or its texels are not the size they should be.
 bool texture_ok(const VegaTexture& t, TileLayout* layout) {
@@ -53,11 +57,17 @@ bool make_plan(const VegaDrawRequest& r, Plan* p) {
       r.pixel_constants.size() > kConstantBytes / 4)
     return false;
   TileLayout layout;
-  if (!layout_of(r.target_tile_index, &layout) || !surface_valid(layout, ColorTarget::kPixelBytes, AmdVegaDraw::pitch_pixels(r.width))) return false;
+  if (!layout_of(r.target_tile_index, &layout) || AmdVegaDraw::target_pitch(r) == 0) return false;
+  if (AmdVegaDraw::uses_depth(r) || AmdVegaDraw::uses_stencil(r)) {
+    if (AmdVegaDraw::plane_pitch(r) == 0) return false;
+  }
   for (const VegaTexture& t : r.textures)
     if (bound(t) && !texture_ok(t, &layout)) return false;
   uint64_t at = 0;
-  auto place = [&](uint64_t bytes) { const uint64_t start = at; at = align_up(at + bytes); return start; };
+  // (a piece starts at a multiple of the 256 bytes and of the alignment its layout wants)
+  p->alignment = AmdVegaDraw::kAlignment;
+  auto place = [&](uint64_t bytes, uint64_t alignment = AmdVegaDraw::kAlignment) { if (alignment > p->alignment) p->alignment = alignment; at = align_to(at, alignment); const uint64_t start = at; at = align_up(at + bytes); return start; };
+  const uint64_t color_align = surface_base_align(layout, ColorTarget::kPixelBytes);
   p->vertex_code = place(r.vertex_code.size() * 4ull);
   p->pixel_code = place(r.pixel_code.size() * 4ull);
   p->vertex_constants = place(kConstantBytes);
@@ -65,13 +75,23 @@ bool make_plan(const VegaDrawRequest& r, Plan* p) {
   p->table = place(abi::kTableBytes);
   p->vertices = place(r.vertex_data.size() * 4ull);
   p->indices = place(r.indices.size() == 0 ? 4 : r.indices.size() * 4ull);
-  p->target = place(AmdVegaDraw::target_bytes(r));
+  p->target = place(AmdVegaDraw::target_bytes(r), color_align);
   p->depth = p->stencil = 0;
-  if (AmdVegaDraw::uses_depth(r)) p->depth = place(AmdVegaDraw::depth_bytes(r));
-  if (AmdVegaDraw::uses_stencil(r)) p->stencil = place(AmdVegaDraw::stencil_bytes(r));
+  TileLayout z_layout, s_layout;
+  if (AmdVegaDraw::uses_depth(r)) {
+    layout_of(r.depth_tile_index, &z_layout);
+    p->depth = place(AmdVegaDraw::depth_bytes(r), surface_base_align(z_layout, DepthTarget::kZBytes));
+  }
+  if (AmdVegaDraw::uses_stencil(r)) {
+    layout_of(r.stencil_tile_index, &s_layout);
+    p->stencil = place(AmdVegaDraw::stencil_bytes(r), surface_base_align(s_layout, DepthTarget::kStencilBytes));
+  }
   for (uint32_t i = 0; i < abi::kMaxSamplers; ++i) {
     p->textures[i] = 0;
-    if (bound(r.textures[i])) p->textures[i] = place(surface_bytes(texel_bytes(r.textures[i].format), texture_pitch(r.textures[i]), r.textures[i].height));
+    if (!bound(r.textures[i])) continue;
+    TileLayout tl;
+    layout_of(r.textures[i].tile_index, &tl);
+    p->textures[i] = place(surface_bytes(tl, texel_bytes(r.textures[i].format), texture_pitch(r.textures[i]), r.textures[i].height), surface_base_align(tl, texel_bytes(r.textures[i].format)));
   }
   p->total = at;
   return at <= (1ull << 31);
@@ -79,28 +99,63 @@ bool make_plan(const VegaDrawRequest& r, Plan* p) {
 
 }  // namespace
 
-uint64_t AmdVegaDraw::target_bytes(const VegaDrawRequest& r) {
+uint32_t AmdVegaDraw::target_pitch(const VegaDrawRequest& r) {
   TileLayout layout;
   if (!layout_of(r.target_tile_index, &layout)) return 0;
-  return layout.kind == TileLayout::Kind::Linear ? static_cast<uint64_t>(pitch_pixels(r.width)) * r.height * ColorTarget::kPixelBytes : surface_bytes(ColorTarget::kPixelBytes, pitch_pixels(r.width), r.height);
+  const uint32_t pitch = static_cast<uint32_t>(align_to(pitch_pixels(r.width), surface_pitch_align(layout, ColorTarget::kPixelBytes)));
+  return surface_valid(layout, ColorTarget::kPixelBytes, pitch) ? pitch : 0;
 }
 
-uint64_t AmdVegaDraw::depth_bytes(const VegaDrawRequest& r) { return uses_depth(r) ? surface_bytes(DepthTarget::kZBytes, pitch_pixels(r.width), r.height) : 0; }
-uint64_t AmdVegaDraw::stencil_bytes(const VegaDrawRequest& r) { return uses_stencil(r) ? surface_bytes(DepthTarget::kStencilBytes, pitch_pixels(r.width), r.height) : 0; }
+uint32_t AmdVegaDraw::plane_pitch(const VegaDrawRequest& r) {
+  TileLayout z, s;
+  uint64_t align = 8;
+  if (uses_depth(r)) {
+    if (!layout_of(r.depth_tile_index, &z)) return 0;
+    align = align < surface_pitch_align(z, DepthTarget::kZBytes) ? surface_pitch_align(z, DepthTarget::kZBytes) : align;
+  }
+  if (uses_stencil(r)) {
+    if (!layout_of(r.stencil_tile_index, &s)) return 0;
+    align = align < surface_pitch_align(s, DepthTarget::kStencilBytes) ? surface_pitch_align(s, DepthTarget::kStencilBytes) : align;
+  }
+  const uint32_t pitch = static_cast<uint32_t>(align_to(r.width, align));
+  return (!uses_depth(r) || surface_valid(z, DepthTarget::kZBytes, pitch)) && (!uses_stencil(r) || surface_valid(s, DepthTarget::kStencilBytes, pitch)) ? pitch : 0;
+}
+
+uint64_t AmdVegaDraw::target_bytes(const VegaDrawRequest& r) {
+  TileLayout layout;
+  const uint32_t pitch = target_pitch(r);
+  if (pitch == 0 || !layout_of(r.target_tile_index, &layout)) return 0;
+  return layout.kind == TileLayout::Kind::Linear ? static_cast<uint64_t>(pitch) * r.height * ColorTarget::kPixelBytes : surface_bytes(layout, ColorTarget::kPixelBytes, pitch, r.height);
+}
+
+uint64_t AmdVegaDraw::depth_bytes(const VegaDrawRequest& r) {
+  TileLayout layout;
+  return uses_depth(r) && plane_pitch(r) != 0 && layout_of(r.depth_tile_index, &layout) ? surface_bytes(layout, DepthTarget::kZBytes, plane_pitch(r), r.height) : 0;
+}
+
+uint64_t AmdVegaDraw::stencil_bytes(const VegaDrawRequest& r) {
+  TileLayout layout;
+  return uses_stencil(r) && plane_pitch(r) != 0 && layout_of(r.stencil_tile_index, &layout) ? surface_bytes(layout, DepthTarget::kStencilBytes, plane_pitch(r), r.height) : 0;
+}
 
 uint64_t AmdVegaDraw::pixel_offset(const VegaDrawRequest& r, uint32_t x, uint32_t y) {
   TileLayout layout;
-  return layout_of(r.target_tile_index, &layout) ? surface_offset(layout, ColorTarget::kPixelBytes, pitch_pixels(r.width), x, y) : 0;
+  return layout_of(r.target_tile_index, &layout) ? surface_offset(layout, ColorTarget::kPixelBytes, target_pitch(r), x, y, r.height) : 0;
 }
 
 uint64_t AmdVegaDraw::depth_offset(const VegaDrawRequest& r, uint32_t x, uint32_t y) {
   TileLayout layout;
-  return layout_of(kDepthTileIndex, &layout) ? surface_offset(layout, DepthTarget::kZBytes, pitch_pixels(r.width), x, y) : 0;
+  return layout_of(r.depth_tile_index, &layout) ? surface_offset(layout, DepthTarget::kZBytes, plane_pitch(r), x, y, r.height) : 0;
 }
 
 uint64_t AmdVegaDraw::stencil_offset(const VegaDrawRequest& r, uint32_t x, uint32_t y) {
   TileLayout layout;
-  return layout_of(kDepthTileIndex, &layout) ? surface_offset(layout, DepthTarget::kStencilBytes, pitch_pixels(r.width), x, y) : 0;
+  return layout_of(r.stencil_tile_index, &layout) ? surface_offset(layout, DepthTarget::kStencilBytes, plane_pitch(r), x, y, r.height) : 0;
+}
+
+uint64_t AmdVegaDraw::area_alignment(const VegaDrawRequest& r) {
+  Plan p;
+  return make_plan(r, &p) ? p.alignment : 0;
 }
 
 uint64_t AmdVegaDraw::area_bytes(const VegaDrawRequest& r) {
@@ -110,7 +165,8 @@ uint64_t AmdVegaDraw::area_bytes(const VegaDrawRequest& r) {
 
 bool AmdVegaDraw::draw(AmdVegaM& card, const VegaDrawRequest& r, uint64_t area_offset, ByteView staging, ByteView pixels, ByteView depth, ByteView stencil) {
   Plan p;
-  if (!card.up() || (area_offset & (kAlignment - 1)) != 0 || !make_plan(r, &p)) return false;
+  // (the card places a surface by its address: the area must start where the most demanding layout wants it)
+  if (!card.up() || !make_plan(r, &p) || area_offset % p.alignment != 0 || card.framebuffer_gpu_address() % p.alignment != 0) return false;
   if (staging.size() < p.total || pixels.size() < target_bytes(r) || (depth.size() != 0 && depth.size() < depth_bytes(r)) || (stencil.size() != 0 && stencil.size() < stencil_bytes(r)) || area_offset > card.layout().framebuffer_bytes || p.total > card.layout().framebuffer_bytes - area_offset) return false;
   const uint32_t vertex_count = r.indices.size() != 0 ? static_cast<uint32_t>(r.indices.size()) : r.vertex_count;
   if (vertex_count == 0 || vertex_count % 3 != 0 || r.indices.size() > 0x10000000u) return false;
@@ -156,7 +212,7 @@ bool AmdVegaDraw::draw(AmdVegaM& card, const VegaDrawRequest& r, uint64_t area_o
     const uint32_t texel = texel_bytes(t.format), pitch = texture_pitch(t);
     if (!texture_ok(t, &layout)) return false;
     for (uint32_t y = 0; y < t.height; ++y)
-      for (uint32_t x = 0; x < t.width; ++x) w.patch_bytes(p.textures[i] + surface_offset(layout, texel, pitch, x, y), t.texels.subview((static_cast<uint64_t>(y) * t.width + x) * texel, texel));
+      for (uint32_t x = 0; x < t.width; ++x) w.patch_bytes(p.textures[i] + surface_offset(layout, texel, pitch, x, y, t.height), t.texels.subview((static_cast<uint64_t>(y) * t.width + x) * texel, texel));
     ImageDescriptor image;
     image.address = base + p.textures[i];
     image.width = t.width;
@@ -183,12 +239,13 @@ bool AmdVegaDraw::draw(AmdVegaM& card, const VegaDrawRequest& r, uint64_t area_o
   s.target.address = base + p.target;
   s.target.width = r.width;
   s.target.height = r.height;
-  s.target.pitch_pixels = pitch_pixels(r.width);
+  s.target.pitch_pixels = target_pitch(r);
   s.target.tile_index = r.target_tile_index;
   s.blend = r.blend;
   s.depth_stencil = r.depth_stencil;
-  s.depth.pitch_pixels = pitch_pixels(r.width);
-  s.depth.tile_index = kDepthTileIndex;
+  s.depth.pitch_pixels = plane_pitch(r);
+  s.depth.z_tile_index = r.depth_tile_index;
+  s.depth.stencil_tile_index = r.stencil_tile_index;
   if (uses_depth(r)) s.depth.z_address = base + p.depth;
   if (uses_stencil(r)) s.depth.stencil_address = base + p.stencil;
   for (uint32_t k = 0; k < 16; ++k) s.ps_param[k] = r.ps_param[k];

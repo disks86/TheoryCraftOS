@@ -450,7 +450,7 @@ static void test_backend(Rig& rig) {
   // the registers (kernel offsets): CB_BLEND0_CONTROL 0xa1e0, DB_DEPTH_CONTROL 0xa200, DB_STENCIL_CONTROL 0xa10b, DB_STENCILREFMASK 0xa10c, DB_Z_INFO 0xa010 .. DB_DEPTH_SLICE 0xa017
   CHECK(cp.context_reg(0xa1e0) == ((1u << 30) | 4u | (5u << 8) | (4u << 16) | (5u << 24)));
   CHECK(cp.context_reg(0xa31c) == (0x70738u & ~(1u << pm4::CB_COLOR0_INFO__BLEND_BYPASS__SHIFT)) && cp.context_reg(0xa31d) == 9);
-  CHECK(cp.context_reg(0xa200) == ((1u << 0) | (1u << 1) | (1u << 2) | (1u << 4) | (7u << 8)));
+  CHECK(cp.context_reg(0xa200) == ((1u << 0) | (1u << 1) | (1u << 2) | (1u << 4) | (7u << 8) | (7u << 20)));
   CHECK(cp.context_reg(0xa10b) == (5u << 4) && cp.context_reg(0xa10c) == ((0xFFu << 8) | (0xFFu << 16) | (1u << 24)));
   CHECK(cp.context_reg(0xa010) == (3u | (13u << 20)) && cp.context_reg(0xa011) == (1u | (13u << 20) | (1u << 29)));
   CHECK(cp.context_reg(0xa012) == kDepthPlane >> 8 && cp.context_reg(0xa014) == kDepthPlane >> 8 && cp.context_reg(0xa013) == kStencilPlane >> 8 && cp.context_reg(0xa015) == kStencilPlane >> 8);
@@ -547,6 +547,53 @@ static void test_damage_backend(Rig& rig) {
   CHECK(draws > 0);
 }
 
+
+// Two sided stencil and the depth bounds through the registers
+static void test_faces_and_bounds(Rig& rig) {
+  for (int variant = 0; variant < 3; ++variant) {
+    DrawState s = backend_state(rig);
+    s.depth_stencil.zpass_op = 5;
+    s.depth_stencil.two_sided = true;
+    s.depth_stencil.back.func = 7;
+    s.depth_stencil.back.zpass_op = 2;                           // back faces set the stencil to ones
+    s.depth_stencil.front_clockwise = variant == 1;              // (the triangles are counter clockwise on the screen)
+    if (variant == 2) { s.depth_stencil.depth_bounds = true; s.depth_stencil.bounds_min = 0.0f; s.depth_stencil.bounds_max = 0.5f; }          // the plane holds 1.0: all discarded
+    uint32_t buf[512];
+    bool ok;
+    const uint32_t n = build(s, buf, 512, &ok);
+    CHECK(ok);
+    CommandProcessorModel cp(rig.alloc, rig.mem);
+    const auto res = cp.execute(ArrayView<const uint32_t>(buf, n));
+    if (res != CommandProcessorModel::Result::Ok) printf("result: %s\n", CommandProcessorModel::result_name(res));
+    CHECK(res == CommandProcessorModel::Result::Ok);
+    TileLayout thin;
+    resolve_tile_index(13, &thin);
+    const uint64_t off = surface_offset(thin, 1, kPitch, 10, 10);
+    const uint32_t stencil = (rig.mem.words[kStencilPlane + off / 4 * 4] >> ((off & 3) * 8)) & 0xFF;
+    const float blue = tiled_pixel(rig.mem, 9, 10, 10, 2);
+    if (variant == 0) CHECK(stencil == 2);                       // front: counted twice
+    if (variant == 1) CHECK(stencil == 0xFF);                    // back: ones
+    if (variant == 2) CHECK(stencil == 0 && blue == 1.0f);       // discarded by the bounds: stencil untouched, colour still blue
+    // the registers: DB_DEPTH_CONTROL bits 7 (back face) and 3 (bounds), the back func at bit 20; PA_SU_SC_MODE_CNTL.FACE bit 2; the back operations at bit 12 ..., DB_STENCILREFMASK_BF
+    CHECK((cp.context_reg(0xa200) >> 7 & 1) == 1 && (cp.context_reg(0xa200) >> 20 & 7) == 7 && (cp.context_reg(0xa200) >> 3 & 1) == (variant == 2 ? 1u : 0u));
+    CHECK(cp.context_reg(0xa081 + 0) == 0x80000000u && cp.context_reg(0xa205) == (variant == 1 ? 4u : 0u));
+    CHECK((cp.context_reg(0xa10b) >> 16 & 0xF) == 2 && cp.context_reg(0xa10d) == ((0xFFu << 8) | (0xFFu << 16) | (1u << 24)));
+    CHECK(cp.context_reg(0xa008) == 0 && cp.context_reg(0xa009) == (variant == 2 ? 0x3F000000u : 0x3F800000u));
+  }
+  // culling and polygon modes are not modelled
+  DrawState s = backend_state(rig);
+  uint32_t buf[512];
+  bool ok;
+  const uint32_t n = build(s, buf, 512, &ok);
+  Pm4Writer extra(ArrayView<uint32_t>(buf + n, 512 - n));
+  extra.set_context_reg(0xa205, 1u << 1);                         // cull back
+  extra.draw_index_auto(6);
+  CommandProcessorModel cp(rig.alloc, rig.mem);
+  CHECK(ok && cp.execute(ArrayView<const uint32_t>(buf, n)) == CommandProcessorModel::Result::Ok);
+  CommandProcessorModel cp2(rig.alloc, rig.mem);
+  CHECK(cp2.execute(ArrayView<const uint32_t>(buf, n + extra.count())) == CommandProcessorModel::Result::Unsupported);
+}
+
 // every prefix of the stream, and every bit of every dword flipped: a result each time, no crash and no sanitizer report
 static void test_damage(Rig& rig) {
   rig.set_vertices(kTriangle, 3);
@@ -586,6 +633,7 @@ int main() {
   { Rig r; test_damage(r); }
   { Rig r; test_backend(r); }
   { Rig r; test_texture(r); }
+  { Rig r; test_faces_and_bounds(r); }
   { Rig r; test_damage_backend(r); }
   printf(g_failed ? "GcnCpTest: %d FAILED\n" : "GcnCpTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
