@@ -27,7 +27,7 @@
 // exported a colour, so a pixel the shader discards changes neither. Triangles are drawn in order, so blending and the tests see the earlier triangles' pixels. Textures come
 // either from an ITextureSource by unit (the shader's T# is then a unit number) or from real T# / S# descriptors read through `texel_memory` (GcnTexture.hpp).
 //
-// Not done: clipping against the frustum (a triangle with a vertex at w <= 0 is dropped; a pixel whose depth is outside 0 to 1 is not drawn), back face stencil, depth bounds, dual
+// Not done: clipping against the frustum (a triangle with a vertex at w <= 0 is dropped; a pixel whose depth is outside 0 to 1 is not drawn), dual
 // source blending, logic ops, flat interpolation, 2x2 quads (nothing here takes derivatives), and the pixel shader's input k reads the vertex shader's parameter `ps_param[k]`
 // (SPI_PS_INPUT_CNTL_k.OFFSET; the parameter of the same number by default).
 #pragma once
@@ -102,14 +102,28 @@ struct BlendState {
   static bool supported_factor(uint32_t f) { return f <= 10 || f == 13 || f == 14 || f == 19 || f == 20; }
 };
 
+struct StencilFace {
+  uint8_t func = 7;
+  uint8_t ref = 0, mask = 0xFF, write_mask = 0xFF, op_value = 1;
+  uint8_t fail_op = 0, zpass_op = 0, zfail_op = 0;
+};
+
 struct DepthStencilState {
   bool depth_test = false, depth_write = false;
+  // The depth bounds test: a pixel whose stored depth is outside [bounds_min, bounds_max] is discarded before the stencil and depth tests (the depth plane is read for it).
+  bool depth_bounds = false;
+  float bounds_min = 0.0f, bounds_max = 1.0f;
   uint8_t depth_func = 7;                                       // 0 never, 1 less, 2 equal, 3 less or equal, 4 greater, 5 not equal, 6 greater or equal, 7 always
   bool stencil_test = false;
   uint8_t stencil_func = 7;
   uint8_t stencil_ref = 0, stencil_mask = 0xFF, stencil_write_mask = 0xFF, stencil_op_value = 1;
   // 0 keep, 1 zero, 2 ones, 3 replace with the reference, 4 replace with the operation value, 5 add (clamp), 6 subtract (clamp), 7 invert, 8 add (wrap), 9 subtract (wrap)
   uint8_t fail_op = 0, zpass_op = 0, zfail_op = 0;
+  // Two sided stencil: the faces that are not front use `back`. A triangle is clockwise when its signed area is positive in window coordinates (y down); it is a front face when
+  // that agrees with `front_clockwise` (PA_SU_SC_MODE_CNTL.FACE).
+  bool two_sided = false, front_clockwise = false;
+  StencilFace back;
+  StencilFace front() const { return StencilFace{stencil_func, stencil_ref, stencil_mask, stencil_write_mask, stencil_op_value, fail_op, zpass_op, zfail_op}; }
 };
 
 struct VertexAttribute {

@@ -25,9 +25,9 @@
 // stencil plane (8 bit) are set up through the DB registers with the tests and operations of DB_DEPTH_CONTROL, DB_STENCIL_CONTROL and DB_STENCILREFMASK. Textures are not state: the
 // T# and S# are in the descriptor table (make_image_descriptor in GcnTexture.hpp).
 //
-// Not done: multisampling, geometry / tessellation, instancing beyond one, the 2D tiled layouts (the depth entries of the tile mode table and most of its colour entries are 2D
-// tiled, so the depth planes use the 1D thin entry, which the hardware may not accept for depth), hierarchical Z and compression, back face stencil, depth bounds, dual source
-// blending, logic ops, and none of it has run on a card.
+// The colour target and the planes may be 2D tiled (GcnTiling.hpp), by the tile mode index of the golden table: the colour entries 10 and 11 etc., the depth entries 0 to 7.
+//
+// Not done: multisampling, geometry / tessellation, instancing beyond one, hierarchical Z and compression, dual source blending, logic ops, and none of it has run on a card.
 #pragma once
 
 #include <stdint.h>
@@ -57,8 +57,9 @@ struct ColorTarget {
 // The depth and stencil planes (32 bit float depth, 8 bit stencil), both of the colour target's size. A plane with address 0 is not there.
 struct DepthTarget {
   uint64_t z_address = 0, stencil_address = 0;        // 256 byte aligned
-  uint32_t pitch_pixels = 0;                          // a multiple of 8, at least the colour target's width; the stencil plane has the same pitch
-  uint32_t tile_index = 13;                           // 1D tiled, thin micro tiles
+  uint32_t pitch_pixels = 0;                          // a multiple of 8 (of the macro tile width for a 2D tiled plane), at least the colour target's width; both planes have this pitch
+  uint32_t z_tile_index = 13;                         // 1D tiled, thin micro tiles
+  uint32_t stencil_tile_index = 13;
   static constexpr uint32_t kZBytes = 4, kStencilBytes = 1;
   static constexpr uint32_t kTiled1DThinTileIndex = 13;
 };

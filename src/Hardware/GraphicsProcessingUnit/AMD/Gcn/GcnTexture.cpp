@@ -82,7 +82,7 @@ bool make_image_descriptor(ArrayView<uint32_t> out, const ImageDescriptor& d) {
   TileLayout layout;
   if (out.size() < 8 || d.width == 0 || d.height == 0 || d.width > kMaxDimension || d.height > kMaxDimension || d.pitch_pixels < d.width || d.pitch_pixels > kMaxDimension ||
       (d.address & 0xFF) != 0 || (d.address >> kMaxAddressBits) != 0 || d.tile_index >= 32 || !resolve_tile_index(d.tile_index, &layout) ||
-      !surface_valid(layout, texel_bytes(d.format), d.pitch_pixels))
+      !surface_valid(layout, texel_bytes(d.format), d.pitch_pixels) || d.address % surface_base_align(layout, texel_bytes(d.format)) != 0)
     return false;
   for (const uint8_t s : d.dst_sel)
     if (!dst_sel_ok(s)) return false;
@@ -160,7 +160,7 @@ namespace {
 
 SampleStatus fetch(ITexelMemory& memory, const ImageDescriptor& d, const TileLayout& layout, uint32_t x, uint32_t y, float rgba[4]) {
   const uint32_t bytes = texel_bytes(d.format);
-  const uint64_t at = d.address + surface_offset(layout, bytes, d.pitch_pixels, x, y);
+  const uint64_t at = d.address + surface_offset(layout, bytes, d.pitch_pixels, x, y, d.height);
   if (d.format == TexelFormat::Rgba32Float) {
     for (uint32_t c = 0; c < 4; ++c) {
       uint32_t v;

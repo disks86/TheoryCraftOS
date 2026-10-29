@@ -70,7 +70,9 @@ class Surface {
     pitch_ = pitch;
     base_ = base;
     if (!surface_valid(layout, bytes, pitch) || width == 0 || height == 0 || width > pitch) return CommandProcessorModel::Result::Unsupported;
-    const uint64_t extent = layout.kind == TileLayout::Kind::Linear ? ((static_cast<uint64_t>(height) - 1) * pitch + width) * bytes : surface_bytes(bytes, pitch, height);
+    if (base % surface_base_align(layout, bytes) != 0) return CommandProcessorModel::Result::Unsupported;
+    height_ = height;
+    const uint64_t extent = layout.kind == TileLayout::Kind::Linear ? ((static_cast<uint64_t>(height) - 1) * pitch + width) * bytes : surface_bytes(layout, bytes, pitch, height);
     if (extent > kMaxSurfaceBytes) return CommandProcessorModel::Result::Unsupported;
     // both ends mapped before anything is allocated for it
     uint32_t probe;
@@ -81,14 +83,14 @@ class Surface {
   bool store(IGpuMemory& memory) const { return memory.write(base_, ArrayView<const uint32_t>(words_.view().data(), words_.count())); }
 
   // dword `c` of the pixel (the colour's four components, or the one dword of a depth value)
-  uint32_t get32(uint32_t x, uint32_t y, uint32_t c = 0) const { return words_[surface_offset(layout_, bytes_, pitch_, x, y) / 4 + c]; }
-  void set32(uint32_t x, uint32_t y, uint32_t v, uint32_t c = 0) { words_[surface_offset(layout_, bytes_, pitch_, x, y) / 4 + c] = v; }
+  uint32_t get32(uint32_t x, uint32_t y, uint32_t c = 0) const { return words_[surface_offset(layout_, bytes_, pitch_, x, y, height_) / 4 + c]; }
+  void set32(uint32_t x, uint32_t y, uint32_t v, uint32_t c = 0) { words_[surface_offset(layout_, bytes_, pitch_, x, y, height_) / 4 + c] = v; }
   uint8_t get8(uint32_t x, uint32_t y) const {
-    const uint64_t off = surface_offset(layout_, bytes_, pitch_, x, y);
+    const uint64_t off = surface_offset(layout_, bytes_, pitch_, x, y, height_);
     return static_cast<uint8_t>(words_[off / 4] >> ((off & 3) * 8));
   }
   void set8(uint32_t x, uint32_t y, uint8_t v) {
-    const uint64_t off = surface_offset(layout_, bytes_, pitch_, x, y);
+    const uint64_t off = surface_offset(layout_, bytes_, pitch_, x, y, height_);
     const uint32_t shift = (off & 3) * 8;
     words_[off / 4] = (words_[off / 4] & ~(0xFFu << shift)) | (static_cast<uint32_t>(v) << shift);
   }
@@ -96,7 +98,7 @@ class Surface {
  private:
   List<uint32_t> words_;
   TileLayout layout_;
-  uint32_t bytes_ = 0, pitch_ = 0;
+  uint32_t bytes_ = 0, pitch_ = 0, height_ = 0;
   uint64_t base_ = 0;
 };
 
@@ -198,13 +200,20 @@ CommandProcessorModel::Result CommandProcessorModel::draw(bool indexed, const Pm
 
   // depth and stencil
   const uint32_t depth_control = context_reg(mmDB_DEPTH_CONTROL);
-  const uint32_t unsupported_depth_bits = (1u << DB_DEPTH_CONTROL__DEPTH_BOUNDS_ENABLE__SHIFT) | (1u << DB_DEPTH_CONTROL__BACKFACE_ENABLE__SHIFT) |
-                                          (1u << DB_DEPTH_CONTROL__ENABLE_COLOR_WRITES_ON_DEPTH_FAIL__SHIFT) | (1u << DB_DEPTH_CONTROL__DISABLE_COLOR_WRITES_ON_DEPTH_PASS__SHIFT);
+  const uint32_t unsupported_depth_bits = (1u << DB_DEPTH_CONTROL__ENABLE_COLOR_WRITES_ON_DEPTH_FAIL__SHIFT) | (1u << DB_DEPTH_CONTROL__DISABLE_COLOR_WRITES_ON_DEPTH_PASS__SHIFT);
+  const uint32_t mode = context_reg(mmPA_SU_SC_MODE_CNTL);
+  if ((mode & ~(1u << PA_SU_SC_MODE_CNTL__FACE__SHIFT)) != 0) return R::Unsupported;                    // (no culling, filled polygons, no offset)
   if ((depth_control & unsupported_depth_bits) != 0 || context_reg(mmDB_RENDER_CONTROL) != 0 || context_reg(mmDB_SHADER_CONTROL) != 0 || context_reg(mmDB_DEPTH_VIEW) != 0) return R::Unsupported;
   DepthStencilState& ds = call.depth_stencil;
   ds.stencil_test = (depth_control >> DB_DEPTH_CONTROL__STENCIL_ENABLE__SHIFT & 1) != 0;
   ds.depth_test = (depth_control >> DB_DEPTH_CONTROL__Z_ENABLE__SHIFT & 1) != 0;
   ds.depth_write = ds.depth_test && (depth_control >> DB_DEPTH_CONTROL__Z_WRITE_ENABLE__SHIFT & 1) != 0;
+  ds.depth_bounds = (depth_control >> DB_DEPTH_CONTROL__DEPTH_BOUNDS_ENABLE__SHIFT & 1) != 0;
+  ds.front_clockwise = (mode >> PA_SU_SC_MODE_CNTL__FACE__SHIFT & 1) != 0;
+  if (ds.depth_bounds) {
+    ds.bounds_min = bits_float(context_reg(mmDB_DEPTH_BOUNDS_MIN));
+    ds.bounds_max = bits_float(context_reg(mmDB_DEPTH_BOUNDS_MAX));
+  }
   ds.depth_func = static_cast<uint8_t>(depth_control >> DB_DEPTH_CONTROL__ZFUNC__SHIFT & 7);
   ds.stencil_func = static_cast<uint8_t>(depth_control >> DB_DEPTH_CONTROL__STENCILFUNC__SHIFT & 7);
   if (ds.stencil_test) {
@@ -217,8 +226,23 @@ CommandProcessorModel::Result CommandProcessorModel::draw(bool indexed, const Pm
     ds.stencil_mask = static_cast<uint8_t>(refmask >> DB_STENCILREFMASK__STENCILMASK__SHIFT);
     ds.stencil_write_mask = static_cast<uint8_t>(refmask >> DB_STENCILREFMASK__STENCILWRITEMASK__SHIFT);
     ds.stencil_op_value = static_cast<uint8_t>(refmask >> DB_STENCILREFMASK__STENCILOPVAL__SHIFT);
+    ds.two_sided = (depth_control >> DB_DEPTH_CONTROL__BACKFACE_ENABLE__SHIFT & 1) != 0;
+    if (ds.two_sided) {
+      const uint32_t bf = context_reg(mmDB_STENCILREFMASK_BF);
+      StencilFace& b = ds.back;
+      b.func = static_cast<uint8_t>(depth_control >> DB_DEPTH_CONTROL__STENCILFUNC_BF__SHIFT & 7);
+      b.fail_op = static_cast<uint8_t>(ops >> DB_STENCIL_CONTROL__STENCILFAIL_BF__SHIFT & 0xF);
+      b.zpass_op = static_cast<uint8_t>(ops >> DB_STENCIL_CONTROL__STENCILZPASS_BF__SHIFT & 0xF);
+      b.zfail_op = static_cast<uint8_t>(ops >> DB_STENCIL_CONTROL__STENCILZFAIL_BF__SHIFT & 0xF);
+      if (b.fail_op > 9 || b.zpass_op > 9 || b.zfail_op > 9) return R::Unsupported;
+      b.ref = static_cast<uint8_t>(bf >> DB_STENCILREFMASK_BF__STENCILTESTVAL_BF__SHIFT);
+      b.mask = static_cast<uint8_t>(bf >> DB_STENCILREFMASK_BF__STENCILMASK_BF__SHIFT);
+      b.write_mask = static_cast<uint8_t>(bf >> DB_STENCILREFMASK_BF__STENCILWRITEMASK_BF__SHIFT);
+      b.op_value = static_cast<uint8_t>(bf >> DB_STENCILREFMASK_BF__STENCILOPVAL_BF__SHIFT);
+    }
   }
-  const bool depth_used = ds.depth_test || ds.stencil_test;
+  const bool depth_used = ds.depth_test || ds.stencil_test || ds.depth_bounds;
+  const bool needs_z = ds.depth_test || ds.depth_bounds;
 
   // the target
   const uint64_t color_base = static_cast<uint64_t>(context_reg(mmCB_COLOR0_BASE)) << 8;
@@ -400,7 +424,7 @@ CommandProcessorModel::Result CommandProcessorModel::draw(bool indexed, const Pm
     const uint32_t d_pitch = (field(size, DB_DEPTH_SIZE__PITCH_TILE_MAX_MASK, DB_DEPTH_SIZE__PITCH_TILE_MAX__SHIFT) + 1) * 8;
     const uint32_t d_rows = (field(size, DB_DEPTH_SIZE__HEIGHT_TILE_MAX_MASK, DB_DEPTH_SIZE__HEIGHT_TILE_MAX__SHIFT) + 1) * 8;
     if (d_pitch < width || d_rows < height || (z_info >> DB_Z_INFO__TILE_SURFACE_ENABLE__SHIFT & 1) != 0) return R::Unsupported;
-    if (ds.depth_test) {
+    if (needs_z) {
       TileLayout layout;
       const uint64_t base = static_cast<uint64_t>(context_reg(mmDB_Z_READ_BASE)) << 8;
       if (field(z_info, DB_Z_INFO__FORMAT_MASK, DB_Z_INFO__FORMAT__SHIFT) != kZ_32_FLOAT || context_reg(mmDB_Z_WRITE_BASE) != context_reg(mmDB_Z_READ_BASE) ||
