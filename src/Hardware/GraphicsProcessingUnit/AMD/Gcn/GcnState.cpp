@@ -83,6 +83,9 @@ bool emit_draw(Pm4Writer& w, const DrawState& s) {
   for (uint32_t k = 0; k < pi.ps_inputs; ++k)
     if (s.ps_param[k] >= kMaxInterpolants) return false;
 
+  // the caches that may hold what the shaders and their buffers were before: instructions, scalar data (constants, descriptors), vector data
+  w.acquire_mem(kCoherShIcacheActionEna | kCoherShKcacheActionEna | kCoherTcl1ActionEna | kCoherTcActionEna);
+
   // the shaders: the code, the resources, the user data (constants, descriptor table) of each stage
   const uint32_t vs_regs[] = {static_cast<uint32_t>(s.vertex.address >> 8), static_cast<uint32_t>(s.vertex.address >> 40), shader_resource1(vi), shader_resource2(vi)};
   const uint32_t ps_regs[] = {static_cast<uint32_t>(s.pixel.address >> 8), static_cast<uint32_t>(s.pixel.address >> 40), shader_resource1(pi), shader_resource2(pi)};

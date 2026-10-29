@@ -102,6 +102,13 @@ bool Pm4Reader::next(Pm4Packet* packet) {
   if (error_ || pos_ >= words_.size()) return false;
   const uint32_t header = words_[pos_];
   if ((header >> 30) != 3) { error_ = true; return false; }
+  // the ring filler (pad_ib): a NOP of count 0x3FFF is one dword
+  if (((header >> 8) & 0xFF) == kPacket3Nop && ((header >> 16) & 0x3FFF) == 0x3FFF) {
+    packet->opcode = kPacket3Nop;
+    packet->body = ArrayView<const uint32_t>();
+    ++pos_;
+    return true;
+  }
   const uint64_t body = static_cast<uint64_t>((header >> 16) & 0x3FFF) + 1;
   if (body > words_.size() - pos_ - 1) { error_ = true; return false; }
   packet->opcode = (header >> 8) & 0xFF;
