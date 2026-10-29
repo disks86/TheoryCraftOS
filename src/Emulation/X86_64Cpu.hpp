@@ -105,6 +105,8 @@ class X86_64Cpu final : public IGuestCpu {
     bool rip_relative = false;
     int64_t displacement = 0;
     uint64_t ea = 0;
+    bool sib_index = false;      // the SIB byte had an index register (AMX tile loads and stores use it as the row stride)
+    uint64_t index_offset = 0;   // the index register scaled, already part of `ea`
   };
 
   uint8_t next_u8();
@@ -183,6 +185,15 @@ class X86_64Cpu final : public IGuestCpu {
   Step xsave_family(GuestMemory& m, uint32_t kind);
   // X86_64Misc.cpp: the instructions that are neither SSE nor AVX nor x87 and did not fit the main switch
   Step group9(GuestMemory& m);                          // 0F C7: cmpxchg8b/16b, xsavec, rdrand, rdseed, rdpid
+  // Intel AMX: the VEX-encoded tile instructions (0F38 map: 49, 4B, 5C, 5E, 6C).
+  Step amx_instruction(GuestMemory& m, uint8_t opcode, uint32_t vvvv);
+  Step amx_dot(uint32_t kind, uint32_t dst, uint32_t src1, uint32_t src2);
+  static bool tile_config_valid(ConstByteView config);
+  void tile_config_load(ConstByteView config);      // (valid, as checked by tile_config_valid)
+  void tile_release();
+  uint32_t tile_rows(uint32_t t) const { return tiles_.config[48 + t]; }
+  uint32_t tile_colsb(uint32_t t) const { return tiles_.config[16 + 2 * t] | (uint32_t{tiles_.config[17 + 2 * t]} << 8); }
+  bool tiles_configured() const { return tiles_.config[0] != 0; }
   Step system_0f01(GuestMemory& m);                     // 0F 01 with a register operand: xgetbv, xend, xtest, rdtscp
   Step adx_instruction(GuestMemory& m, bool overflow);  // adcx (66 0F 38 F6) and adox (F3 0F 38 F6)
   Step fsgsbase_instruction(GuestMemory& m);            // F3 0F AE /0../3 with a register operand (already decoded): rdfsbase, rdgsbase, wrfsbase, wrgsbase
@@ -234,6 +245,12 @@ class X86_64Cpu final : public IGuestCpu {
   void save_fpu_image(uint8_t* image) const;      // the 512-byte FXSAVE layout
   void load_fpu_image(const uint8_t* image);
 
+  // The AMX state: TILECFG (palette 1: palette byte, start row, 16 column widths in bytes, 16 row counts) and TILEDATA (eight tiles of 16 rows of 64 bytes).
+  struct Tiles {
+    uint8_t config[64] = {};
+    uint8_t data[8][1024] = {};
+  };
+  Tiles tiles_;
   State s_;
   Decoded d_;
   GuestFault fault_;
