@@ -1456,6 +1456,11 @@ bool ObjectManager::mailslot_info(uint32_t id, uint32_t* max_message_size, uint6
   return true;
 }
 
+uint32_t ObjectManager::mailslot_message_count_locked(uint32_t id) {
+  Mailslot* m = mailslot_of(id);
+  return m ? m->message_count : 0;
+}
+
 bool ObjectManager::mailslot_set_timeout(uint32_t id, uint64_t read_timeout_100ns) {
   Locked hold(sync_);
   Mailslot* m = mailslot_of(id);

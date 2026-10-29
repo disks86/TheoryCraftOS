@@ -2415,7 +2415,7 @@ EXPORT HANDLE WINAPI CreateMailslotW(LPCWSTR name, DWORD max_message_size, DWORD
   timeout.QuadPart = forever ? -1 : (read_timeout_ms ? -10000ll * (LONGLONG)read_timeout_ms : 0);
   HANDLE h = NULL;
   IO_STATUS_BLOCK iosb;
-  const NTSTATUS status = NtCreateMailslotFile(&h, 0xC0100000u /* GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE */, &attributes, &iosb, 0, 0, max_message_size,
+  const NTSTATUS status = NtCreateMailslotFile(&h, 0xC0100000u /* GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE */, &attributes, &iosb, 0x20 /* FILE_SYNCHRONOUS_IO_NONALERT */, 0, max_message_size,
                                                forever ? NULL : &timeout);
   if (!NT_SUCCESS(status)) { fail_nt(status); return INVALID_HANDLE_VALUE; }
   return h;

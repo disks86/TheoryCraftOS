@@ -228,6 +228,7 @@ class ObjectManager {
   // real mailslot's ERROR_INSUFFICIENT_BUFFER - the message is not lost) if `capacity` is less than the message's size; NoMessage if the queue is empty right now.
   MailslotResult mailslot_read_locked(uint32_t id, uint8_t* out, uint32_t capacity, uint32_t* got, uint32_t* message_size);
   // GetMailslotInfo/SetMailslotInfo (NtQueryInformationFile/NtSetInformationFile classes 26/27).
+  uint32_t mailslot_message_count_locked(uint32_t id);      // (the system lock held) how many messages wait; 0 for a gone mailslot
   bool mailslot_info(uint32_t id, uint32_t* max_message_size, uint64_t* read_timeout_100ns, uint32_t* next_message_size, uint32_t* message_count);
   bool mailslot_set_timeout(uint32_t id, uint64_t read_timeout_100ns);
   // The reader's own handle closing (not a writer's): destroys the mailslot at once, same as the real one. A no-op if `id` is a writer or already gone.

@@ -31,9 +31,18 @@ constexpr uint32_t kSuccess = 0, kAccessViolation = 0xC0000005u, kInvalidHandle 
 constexpr uint64_t kPending = kWaitPending;
 
 // The token of a mailslot descriptor: bits 0..31 the object id, bit 32 set for a writer (CreateFile), clear for the reader (CreateMailslot).
-constexpr uint64_t kWriterBit = 1ull << 32;
+constexpr uint64_t kWriterBit = 1ull << 32, kAsyncBit = 1ull << 33;      // (bit 33: the reader was made without FILE_SYNCHRONOUS_IO, so its reads may be pending)
 uint64_t make_token(uint32_t id, bool is_writer) { return id | (is_writer ? kWriterBit : 0); }
 uint32_t token_id(uint64_t token) { return uint32_t(token); }
+
+// The reads that returned STATUS_PENDING and wait for a message (guarded by the system lock); one per mailslot handle.
+struct PendingRead { bool used = false; uint64_t process = 0, slot = 0, status_block = 0, buffer = 0; uint32_t capacity = 0; };
+constexpr uint32_t kMaxPending = 16;
+PendingRead g_pending[kMaxPending];
+PendingRead* find_pending(uint64_t process, uint64_t slot) {
+  for (PendingRead& e : g_pending) if (e.used && e.process == process && e.slot == slot) return &e;
+  return nullptr;
+}
 bool token_is_writer(uint64_t token) { return (token & kWriterBit) != 0; }
 
 // The mailslot name in an OBJECT_ATTRIBUTES, when it is one: the part after "\??\mailslot\" or "\Device\Mailslot\" in UTF-8. False if the path is something else.
@@ -95,6 +104,7 @@ void mailslot_token_add(uint64_t token) { if (ObjectManager* objects = system_ob
 void mailslot_token_release(uint64_t token) {
   ObjectManager* objects = system_objects();
   if (!objects) return;
+  if (!token_is_writer(token)) { objects->sync().lock(); for (PendingRead& e : g_pending) if (e.used) e.used = false; objects->sync().unlock(); }      // (a pending read of a closed reader is dropped; at most a few exist)
   if (!token_is_writer(token)) objects->mailslot_close_reader(token_id(token));      // destroys it at once, like the real one
   objects->release(token_id(token));
 }
@@ -105,7 +115,7 @@ uint64_t normal_timeout(uint64_t raw) { return raw == ~uint64_t{0} ? raw : (int6
 uint32_t nt_create_mailslot_file(Process& p, const SyscallRequest& r) {
   uint64_t options = 0, quota = 0, max_message_size = 0, timeout_at = 0;
   if (!argument(p, r, 4, &options) || !argument(p, r, 5, &quota) || !argument(p, r, 6, &max_message_size) || !argument(p, r, 7, &timeout_at)) return kAccessViolation;
-  (void)options; (void)quota;
+  (void)quota;
   String name(p.files().allocator());
   if (!mailslot_name(p, r.args[2], &name) || name.empty()) return kObjectNameInvalid;
   ObjectManager* objects = system_objects();
@@ -117,7 +127,7 @@ uint32_t nt_create_mailslot_file(Process& p, const SyscallRequest& r) {
   if (c.id == 0) return c.status == 0x40000000u ? kObjectNameCollision : c.status;
   const bool inherit = wants_inherit(p, r.args[2]);
   uint64_t handle = 0;
-  const uint32_t status = give_mailslot_handle(p, make_token(c.id, false), inherit, &handle);
+  const uint32_t status = give_mailslot_handle(p, make_token(c.id, false) | ((options & 0x30) == 0 ? kAsyncBit : 0), inherit, &handle);
   if (status != kSuccess) { objects->release(c.id); return status; }
   if (!p.write_user_u64(r.args[0], handle)) { p.close_descriptor(handle / 4 - 1); return kAccessViolation; }
   return kSuccess;
@@ -143,7 +153,7 @@ uint32_t mailslot_io(Process& p, uint64_t slot, bool write, uint64_t status_bloc
   const uint64_t token = p.files().token(slot);
   const uint32_t id = token_id(token);
   if (write) {
-    if (!token_is_writer(token)) return kAccessDenied;      // the reader does not write
+    if (!token_is_writer(token)) return (token & kAsyncBit) ? kInvalidParameter : kAccessDenied;      // the reader does not write (an asynchronous handle, as the library opens it, is told so as a bad parameter)
     length &= 0xFFFFFFFFu;
     constexpr uint64_t kMax = ObjectManager::kMailslotBufferBytes;
     if (length > kMax) return kInvalidParameter;
@@ -158,6 +168,19 @@ uint32_t mailslot_io(Process& p, uint64_t slot, bool write, uint64_t status_bloc
   constexpr uint64_t kMax = ObjectManager::kMailslotBufferBytes;
   uint8_t chunk[kMax];
   const uint32_t capacity = uint32_t(length < kMax ? length : kMax);
+  if (token & kAsyncBit) {      // an asynchronous handle: with nothing to read the request stays pending until the owner waits on the handle
+    ISystemSync& sync = objects->sync();
+    sync.lock();
+    PendingRead* slot_entry = find_pending(p.id(), slot);
+    const bool empty = objects->mailslot_message_count_locked(id) == 0;
+    if (empty) {
+      if (!slot_entry) for (PendingRead& e : g_pending) if (!e.used) { slot_entry = &e; break; }
+      if (!slot_entry) { sync.unlock(); return kNoResources; }
+      *slot_entry = PendingRead{true, p.id(), slot, status_block, buffer, capacity};
+    }
+    sync.unlock();
+    if (empty) return 0x103u;      // STATUS_PENDING
+  }
   // The read timeout is fetched once, outside wait_until's own lock (mailslot_info() takes the lock itself, and wait_until's attempt() runs with it already held -
   // calling back into a _locked-free, self-locking accessor from inside that lambda would try to lock twice). It shares wait_until's own ~0-means-forever sentinel.
   uint64_t read_timeout_100ns = ~uint64_t{0};
@@ -173,6 +196,33 @@ uint32_t mailslot_io(Process& p, uint64_t slot, bool write, uint64_t status_bloc
   if (status != kSuccess) return status;      // (a read that fails leaves the status block alone)
   if (got != 0 && !p.write_user(buffer, ConstByteView(chunk, got))) return kAccessViolation;
   return store_io_status(p, status_block, kSuccess, got) ? kSuccess : kAccessViolation;
+}
+
+bool mailslot_read_ready_locked(Process& p, uint64_t slot) {
+  ObjectManager* objects = system_objects();
+  const PendingRead* e = find_pending(p.id(), slot);
+  return objects && e && objects->mailslot_message_count_locked(token_id(p.files().token(slot))) != 0;
+}
+
+uint32_t mailslot_complete_read(Process& p, uint64_t slot) {
+  ObjectManager* objects = system_objects();
+  if (!objects) return kNotImplemented;
+  ISystemSync& sync = objects->sync();
+  sync.lock();
+  PendingRead* e = find_pending(p.id(), slot);
+  const PendingRead request = e ? *e : PendingRead{};
+  if (e) e->used = false;
+  sync.unlock();
+  if (!request.used) return kSuccess;
+  uint8_t chunk[ObjectManager::kMailslotBufferBytes];
+  uint32_t got = 0, message_size = 0;
+  sync.lock();
+  const ObjectManager::MailslotResult r = objects->mailslot_read_locked(token_id(p.files().token(slot)), chunk, request.capacity, &got, &message_size);
+  sync.unlock();
+  uint32_t status = r == ObjectManager::MailslotResult::TooSmall ? kBufferTooSmall : result_status(r);
+  if (r == ObjectManager::MailslotResult::NoMessage) status = kIoTimeout;
+  if (status == kSuccess && got != 0 && !p.write_user(request.buffer, ConstByteView(chunk, got))) return kAccessViolation;
+  return store_io_status(p, request.status_block, status, status == kSuccess ? got : 0) ? kSuccess : kAccessViolation;
 }
 
 uint32_t mailslot_query_information(Process& p, uint64_t slot, uint32_t info_class, uint64_t status_block, uint64_t buffer, uint32_t length) {
