@@ -375,8 +375,8 @@ struct FakeEnvironment final : IPageEnvironment {
     opens.push_back(std::string(a.data(), a.size()) + " [" + std::string(target.data(), target.size()) + "]" + (noopener ? " noopener" : ""));
     return allow_open;
   }
-  bool open_window_post(StringView a, StringView target, StringView type, StringView body) override {
-    opens.push_back(std::string(a.data(), a.size()) + " [" + std::string(target.data(), target.size()) + "] POST " + std::string(type.data(), type.size()) + " " + std::string(body.data(), body.size()));
+  bool open_window_post(StringView a, StringView target, StringView type, StringView body, bool noopener) override {
+    opens.push_back(std::string(a.data(), a.size()) + " [" + std::string(target.data(), target.size()) + "] POST " + std::string(type.data(), type.size()) + " " + std::string(body.data(), body.size()) + (noopener ? " noopener" : ""));
     return allow_open;
   }
   void close_window() override { ++closes; }
@@ -2707,7 +2707,7 @@ static void test_iframe() {
     } cases[] = {{"b", "b loaded answer", nullptr, nullptr},
                  {"_top", "b loaded ", "http://example.com/answer.html?", nullptr},
                  {"_parent", "b loaded ", "http://example.com/answer.html?", nullptr},
-                 {"_blank", "b loaded ", nullptr, "http://example.com/answer.html? [_blank]"},
+                 {"_blank", "b loaded ", nullptr, "http://example.com/answer.html? [_blank] noopener"},
                  {"nowhere", "b loaded ", nullptr, "http://example.com/answer.html? [nowhere]"}};
     for (const Case& c : cases) {
       FakeEnvironment env(a);
@@ -2733,9 +2733,11 @@ static void test_iframe() {
     } cases[] = {
         {"<iframe name=b></iframe><a id=l href=/answer.html target=b>go</a><script>var b = document.querySelector('iframe'); console.log(b.contentWindow.name); b.onload = function () { console.log('loaded', b.contentDocument.body.textContent) }; document.getElementById('l').click()</script>", "b | loaded answer", nullptr},
         {"<base target=b><iframe name=b></iframe><a id=l href=/answer.html>go</a><script>var b = document.querySelector('iframe'); b.onload = function () { console.log('loaded', b.contentDocument.body.textContent) }; document.getElementById('l').click()</script>", "loaded answer", nullptr},
-        {"<a id=l href=/answer.html target=_blank>go</a><script>document.getElementById('l').click()</script>", "", "http://example.com/answer.html [_blank]"},
+        {"<a id=l href=/answer.html target=_blank>go</a><script>document.getElementById('l').click()</script>", "", "http://example.com/answer.html [_blank] noopener"},
         {"<iframe srcdoc=\"<script>window.name = 'w'</script>\"></iframe><form id=f action=/answer.html target=w></form><script>var i = document.querySelector('iframe'), n = 0; i.onload = function () { if (n++ == 0) document.getElementById('f').submit(); else console.log('second', i.contentDocument.body.textContent) }</script>", "second answer", nullptr},
-        {"<form id=f method=post action=/answer target=_blank><input name=q value=1></form><script>document.getElementById('f').submit()</script>", "", "http://example.com/answer [_blank] POST application/x-www-form-urlencoded q=1"}};
+        {"<form id=f method=post action=/answer target=_blank><input name=q value=1></form><script>document.getElementById('f').submit()</script>", "", "http://example.com/answer [_blank] POST application/x-www-form-urlencoded q=1 noopener"},
+        {"<a id=l href=/answer.html target=pop rel=noreferrer>go</a><a id=m href=/answer.html target=pop2>go</a><script>document.getElementById('l').click(); document.getElementById('m').click()</script>", "", "http://example.com/answer.html [pop] noopener|http://example.com/answer.html [pop2]"},
+        {"<script>window.name = 'me'</script><a id=l href=/answer.html target=me>go</a><script>document.getElementById('l').click()</script>", "", "nav:http://example.com/answer.html"}};
     for (const Case& c : cases) {
       FakeEnvironment env(a);
       env.files["http://example.com/answer.html"] = "<p>answer</p>";
@@ -2746,7 +2748,10 @@ static void test_iframe() {
       page.load(source.c_str());
       page.load_frames_all();
       CHECK(page_log(page) == c.log);
-      CHECK(env.opens.size() == (c.open ? 1u : 0u) && (!c.open || env.opens[0] == c.open));
+      std::string got;   // (the windows that were opened, then the navigations of this one)
+      for (const std::string& o : env.opens) got += (got.empty() ? "" : "|") + o;
+      for (const std::string& n : env.navigations) got += (got.empty() ? "" : "|") + std::string("nav:") + n;
+      CHECK(got == (c.open ? c.open : ""));
     }
   }
   CHECK(a.live == 0);

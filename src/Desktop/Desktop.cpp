@@ -316,12 +316,25 @@ void Desktop::setup_web_browser(WebBrowser& web) {
 }
 
 // window.open() of a page: another browser tab next to the page's (or a window of its own), showing the address. It may close itself with window.close().
-bool Desktop::open_script_window(void* self, WebBrowser& from, StringView address, StringView content_type, StringView body) {
+bool Desktop::open_script_window(void* self, WebBrowser& from, StringView address, StringView target, StringView content_type, StringView body) {
   auto* d = static_cast<Desktop*>(self);
-  Frame* host = from.host();
-  WebBrowser* opened = d->open_web_browser(host ? host->as_tabs() : nullptr);
-  if (!opened) return false;
-  opened->set_opened_by_script(true);
+  const bool named = !target.empty() && !target.equals_ignore_case("_blank");
+  WebBrowser* opened = nullptr;
+  if (named) {   // a window that was opened under that name before (and is still open) shows the page
+    auto look = [&](WebBrowser& w) {
+      if (!opened && w.manager() && &w != &from && w.window_name().equals(target)) opened = &w;
+    };
+    look(d->web_browser_);
+    for (auto& b : d->extra_browsers_) look(*b);
+    if (opened) opened->activate();
+  }
+  if (!opened) {
+    Frame* host = from.host();
+    opened = d->open_web_browser(host ? host->as_tabs() : nullptr);
+    if (!opened) return false;
+    opened->set_opened_by_script(true);
+    if (named) opened->set_window_name(target);
+  }
   return content_type.empty() ? opened->navigate(address) : opened->navigate_post(address, content_type, body);
 }
 

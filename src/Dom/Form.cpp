@@ -606,6 +606,19 @@ StringView browsing_target(const Node* element) {
   return StringView();
 }
 
+bool opens_without_opener(const Node* element) {
+  StringView rel;
+  bool opener = false;
+  if (element && get_attribute(element, "rel", &rel)) {
+    StringView rest = rel, token;
+    while (rest.next_token(' ', &token)) {
+      if (token.equals_ignore_case("noopener") || token.equals_ignore_case("noreferrer")) return true;
+      if (token.equals_ignore_case("opener")) opener = true;
+    }
+  }
+  return !opener && browsing_target(element).equals_ignore_case("_blank");
+}
+
 bool url_encode(StringView text, String* out) {
   static const char kHex[] = "0123456789ABCDEF";
   for (uint64_t i = 0; i < text.size(); ++i) {

@@ -587,7 +587,7 @@ void DomBindings::activate(dom::Node* node) {
       if (href.starts_with('#')) {
         c.host.set_hash(href);
       } else if (resolve_reference(vm_.allocator(), c.host.address(), href, &target)) {
-        c.host.navigate_target(target.view(), dom::browsing_target(n));
+        c.host.navigate_target(target.view(), dom::browsing_target(n), dom::opens_without_opener(n));
       }
       return;
     }

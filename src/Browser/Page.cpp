@@ -52,7 +52,7 @@ class Page::FrameEnv final : public IPageEnvironment {
   void clipboard_set(StringView text) override { owner_.env_.clipboard_set(text); }
   void pick_file(uint32_t node_serial, bool multiple) override { owner_.frame_pick_file(serial_, node_serial, multiple); }
   bool open_window(StringView address, StringView target, bool noopener) override { return owner_.env_.open_window(address, target, noopener); }
-  bool open_window_post(StringView address, StringView target, StringView type, StringView body) override { return owner_.env_.open_window_post(address, target, type, body); }
+  bool open_window_post(StringView address, StringView target, StringView type, StringView body, bool noopener) override { return owner_.env_.open_window_post(address, target, type, body, noopener); }
   void set_hash(StringView) override {}
   void reload() override {}
   void history_go(int32_t) override {}
@@ -814,7 +814,7 @@ void Page::click(uint32_t node_serial, int32_t x, int32_t y, uint8_t object, int
       if (a->is_tag("a") && dom::get_attribute(a, "href", &href) && !href.empty()) {
         String target(allocator_);
         if (href.starts_with('#')) set_hash(href);
-        else if (resolve(href, &target)) navigate_target(target.view(), dom::browsing_target(a));
+        else if (resolve(href, &target)) navigate_target(target.view(), dom::browsing_target(a), dom::opens_without_opener(a));
         return;
       }
     }
@@ -1787,7 +1787,7 @@ void Page::send_form(dom::Node* form, dom::Node* submitter) {
     if (!dom::encode_urlencoded(entries, encoding, &body)) return;
     target.push_back('?');
     target.append(body.view());
-    if (!send_to_target(named, target.view(), nullptr, StringView())) env_.navigate(target.view(), false);
+    if (!send_to_target(named, target.view(), nullptr, StringView(), dom::opens_without_opener(form))) env_.navigate(target.view(), false);
     return;
   }
   StringView type = "application/x-www-form-urlencoded";
@@ -1809,7 +1809,7 @@ void Page::send_form(dom::Node* form, dom::Node* submitter) {
   if (!ok) return;
   String posted_type(allocator_);
   posted_type.assign(type);
-  if (!send_to_target(named, target.view(), posted_type.c_str(), body.view())) env_.navigate_post(target.view(), type, body.view());
+  if (!send_to_target(named, target.view(), posted_type.c_str(), body.view(), dom::opens_without_opener(form))) env_.navigate_post(target.view(), type, body.view());
 }
 
 // Tab and Shift+Tab: the next control (or the one before), and out of the form after the last one.
@@ -2263,7 +2263,18 @@ bool Page::find_named_frame(StringView name, Page** owner, uint32_t* serial) {
 
 // Where the answer of a form goes: the window the `target` names (a GET when `content_type` is null, else a POST of `body`). False when the browser could not open
 // the window that was asked for (the caller then goes there in this one).
-bool Page::send_to_target(StringView target, StringView address, const char* content_type, StringView body) {
+bool Page::window_named(StringView name) {
+  if (!bindings_) {
+    StringView v;
+    dom::Node* iframe = parent_ ? parent_->doc_.by_serial(frame_serial_) : nullptr;
+    return iframe && dom::get_attribute(iframe, "name", &v) && v.equals(name);
+  }
+  String own(allocator_);
+  engine_->vm().reset_instruction_count();
+  return bindings_->call_hook("__window_name", nullptr, 0, &own) && own.view().equals(name);
+}
+
+bool Page::send_to_target(StringView target, StringView address, const char* content_type, StringView body, bool noopener) {
   const bool post = content_type != nullptr;
   Page* owner = nullptr;
   uint32_t serial = 0;
@@ -2274,9 +2285,12 @@ bool Page::send_to_target(StringView target, StringView address, const char* con
   } else if (target.equals_ignore_case("_parent")) {
     owner = parent_ ? parent_ : this;
   } else if (target.equals_ignore_case("_blank")) {
-    return post ? env_.open_window_post(address, "_blank", StringView(content_type), body) : env_.open_window(address, "_blank", false);
-  } else if (!root()->find_named_frame(target, &owner, &serial)) {
-    return post ? env_.open_window_post(address, target, StringView(content_type), body) : env_.open_window(address, target, false);   // (a window of that name)
+    return post ? env_.open_window_post(address, "_blank", StringView(content_type), body, noopener) : env_.open_window(address, "_blank", noopener);
+  } else {
+    for (Page* p = this; p && !owner; p = p->parent_)   // (a window that calls itself that: this one or one around it)
+      if (!target.empty() && p->window_named(target)) owner = p;
+    if (!owner && !root()->find_named_frame(target, &owner, &serial))
+      return post ? env_.open_window_post(address, target, StringView(content_type), body, noopener) : env_.open_window(address, target, noopener);   // (a window of that name)
   }
   if (serial == 0) {   // a whole window: the page itself, or the top of the frames
     if (owner == this) {
