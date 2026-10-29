@@ -146,7 +146,6 @@ uint32_t suspend_thread_in(Process& target, uint64_t thread_id, uint64_t* previo
   *previous_count = uint32_t(record->suspend_count++);
   if (*previous_count == 0 && record->started) {
     target.runtime()->request_suspend(record->id);
-    if (ObjectManager* objects = system_objects()) objects->notify();
   }
   return kSuccess;
 }
@@ -360,6 +359,20 @@ uint32_t nt_resume_thread(Process& p, const SyscallRequest& r) {
   {      // the thread handle CreateProcess gave out
     bool other = false;
     uint32_t previous = 0;
+    {      // a program that runs, whose main thread was suspended with SuspendThread: one suspension less
+      bool exited = false;
+      uint32_t code = 0;
+      uint64_t pid = 0;
+      if (process_handle_info(p, r.args[0], &exited, &code, &pid) && pid != p.id() && !exited && p.runtime()) {
+        IProcessRuntime::RemoteOp resume;
+        resume.kind = IProcessRuntime::RemoteOp::ResumeThread;
+        resume.thread_id = pid;
+        if (p.runtime()->remote_operation(pid, resume) == kSuccess && resume.size > 0) {
+          if (r.args[1] != 0 && !put32(p, r.args[1], uint32_t(resume.size))) return kAccessViolation;
+          return kSuccess;
+        }
+      }
+    }
     const uint32_t status = resume_process_handle(p, r.args[0], &previous, &other);
     if (other) {
       if (status == kSuccess && r.args[1] != 0 && !put32(p, r.args[1], previous)) return kAccessViolation;
