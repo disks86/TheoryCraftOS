@@ -57,9 +57,11 @@ void get_adjust_train(Training& t) {
 }
 
 // drm_dp_link_train_clock_recovery_delay / _channel_eq_delay
-void wait(Training& t, uint32_t default_us) {
+// (a sink of DPCD 1.4 or later gets a fixed 100 us in the clock recovery, whatever its interval says)
+void wait(Training& t, uint32_t default_us, bool clock_recovery) {
   const uint32_t interval = t.caps.training_read_interval;
-  t.source.delay_us(interval == 0 ? default_us : interval * DpLinkTrainer::kIntervalUnitUs);
+  if (clock_recovery && t.caps.revision >= 0x14) t.source.delay_us(100);
+  else t.source.delay_us(interval == 0 ? default_us : interval * DpLinkTrainer::kIntervalUnitUs);
 }
 }  // namespace
 
@@ -101,14 +103,8 @@ DpLinkConfig DpLinkConfig::choose(const Dpcd::Capabilities& caps, uint32_t pixel
   const uint32_t max_rate = caps.max_link_rate_khz();
   const uint32_t max_lanes = caps.max_lanes;
   if (bits_per_pixel == 0) bits_per_pixel = 24;
-  // the first rate: 2.7 Gbit/s on fewer lanes than the sink has (if the sink can do 2.7)
-  for (uint32_t lanes = 1; max_rate >= 270000 && lanes < max_lanes; lanes <<= 1) {
-    if (uint64_t{lanes} * 270000 * 8 / bits_per_pixel >= pixel_clock_khz) {
-      c.lanes = lanes;
-      c.rate_khz = 270000;
-      return c;
-    }
-  }
+  // amdgpu_atombios_dp_get_dp_link_config: the lowest rate (1.62, 2.7, 5.4 Gbit/s up to the sink's), with the fewest lanes, that carries the clock; nothing does: no lanes (the driver
+  // returns -EINVAL and sets the lane count and clock to 0)
   for (uint32_t rate : kRates) {
     if (rate > max_rate) break;
     for (uint32_t lanes = 1; lanes <= max_lanes; lanes <<= 1) {
@@ -119,12 +115,11 @@ DpLinkConfig DpLinkConfig::choose(const Dpcd::Capabilities& caps, uint32_t pixel
       }
     }
   }
-  c.lanes = 4;
-  c.rate_khz = 162000;
   return c;
 }
 
-DpLinkTrainer::Outcome DpLinkTrainer::train(IDpcdAux& aux, IDpSource& source, const Dpcd::Capabilities& caps, uint8_t bandwidth_code, uint32_t lanes, uint8_t rate_index) {
+DpLinkTrainer::Outcome DpLinkTrainer::train(IDpcdAux& aux, IDpSource& source, const Dpcd::Capabilities& caps, uint8_t bandwidth_code, uint32_t lanes, uint8_t rate_index,
+                                            bool alternate_scrambler) {
   Outcome out;
   out.rate_index = rate_index;
   out.lanes = lanes;
@@ -144,10 +139,13 @@ DpLinkTrainer::Outcome DpLinkTrainer::train(IDpcdAux& aux, IDpSource& source, co
     }
     source.delay_us(1000);
   }
-  // possibly enable the 0.5 % downspread on the sink; the lane count (with enhanced framing if the sink has it) and the link rate
+  // possibly enable the 0.5 % downspread on the sink; for an eDP panel in the internal DP2 mode its alternate scrambler seed (DP_EDP_CONFIGURATION_SET); the lane count (with enhanced
+  // framing if the sink has it) and the link rate
   const uint8_t spread = caps.max_downspread ? Dpcd::kSpreadAmp05 : 0;
   const uint8_t lane_count = static_cast<uint8_t>(lanes | (caps.enhanced_framing ? Dpcd::kLaneCountEnhancedFraming : 0));
-  if (!aux.dpcd_write(Dpcd::kDownspreadCtrl, ConstByteView(&spread, 1)) || !aux.dpcd_write(Dpcd::kLaneCountSet, ConstByteView(&lane_count, 1)) ||
+  const uint8_t assr = 1;
+  if (!aux.dpcd_write(Dpcd::kDownspreadCtrl, ConstByteView(&spread, 1)) || (alternate_scrambler && !aux.dpcd_write(Dpcd::kEdpConfigurationSet, ConstByteView(&assr, 1))) ||
+      !aux.dpcd_write(Dpcd::kLaneCountSet, ConstByteView(&lane_count, 1)) ||
       !aux.dpcd_write(Dpcd::kLinkBwSet, ConstByteView(&bandwidth_code, 1)) ||
       (rate_index != DpLinkConfig::kNoRateIndex && !aux.dpcd_write(Dpcd::kLinkRateSet, ConstByteView(&rate_index, 1)))) {
     out.result = Result::SinkSetup;
@@ -173,7 +171,7 @@ DpLinkTrainer::Outcome DpLinkTrainer::train(IDpcdAux& aux, IDpSource& source, co
     uint32_t tries = 0;
     uint32_t voltage = 0xFF;
     while (true) {
-      wait(t, kDefaultClockRecoveryUs);
+      wait(t, kDefaultClockRecoveryUs, true);
       ++out.clock_recovery_reads;
       if (!Dpcd::read_link_status(aux, &t.status)) {
         result = Result::StatusRead;
@@ -212,7 +210,7 @@ DpLinkTrainer::Outcome DpLinkTrainer::train(IDpcdAux& aux, IDpSource& source, co
       uint32_t tries = 0;
       bool equalized = false;
       while (true) {
-        wait(t, kDefaultChannelEqUs);
+        wait(t, kDefaultChannelEqUs, false);
         ++out.channel_eq_reads;
         if (!Dpcd::read_link_status(aux, &t.status)) {
           result = Result::StatusRead;
@@ -234,7 +232,8 @@ DpLinkTrainer::Outcome DpLinkTrainer::train(IDpcdAux& aux, IDpSource& source, co
     }
   }
 
-  // the pattern off on the sink and training over on the source, whatever happened
+  // the pattern off on the sink and training over on the source, whatever happened (after 400 us)
+  source.delay_us(400);
   const bool sink_off = aux.dpcd_write(Dpcd::kTrainingPatternSet, ConstByteView(&off, 1));
   const bool source_done = source.complete_training();
   if (result == Result::Trained && !sink_off) result = Result::PatternWrite;

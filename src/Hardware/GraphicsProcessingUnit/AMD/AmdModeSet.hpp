@@ -24,71 +24,72 @@
 
 namespace hardware {
 
-// What a mode set of one output needs: the CRTC, PLL, encoder and transmitter it runs on and the mode.
+// A mode as the CRTC wants it (drm_display_mode's crtc_* values: already halved for interlace and doubled for double scan).
 struct DisplayMode {
   uint32_t pixel_clock_khz = 0;
   uint16_t h_display = 0, h_sync_start = 0, h_sync_end = 0, h_total = 0;
   uint16_t v_display = 0, v_sync_start = 0, v_sync_end = 0, v_total = 0;
-  bool h_sync_negative = false, v_sync_negative = false, interlaced = false, double_scan = false;
+  bool h_sync_negative = false, v_sync_negative = false, composite_sync = false, interlaced = false, double_scan = false;
 };
 
+// What the tables of one output need to know: the CRTC, PLL, encoder, transmitter, connector and the link.
 struct ModeSetOutput {
   uint8_t crtc = 0;                     // 0..5
-  uint8_t pll = 0xFF;                   // ATOM_PPLL1 0, ATOM_PPLL2 1, ATOM_PPLL0 2 (ATOM_PPLL_INVALID 0xFF: none chosen)
-  uint8_t encoder_id = 0;               // the encoder object id (ENCODER_OBJECT_ID_*, AtomConnectors::encoder_id), for the pixel clock table
-  uint8_t dig_encoder = 0;              // 0..6 (AtomConnectors::dig_encoder)
+  uint8_t pll = 0xFF;                   // ATOM_PPLL1 0, ATOM_PPLL2 1, ATOM_PPLL0 2 (ATOM_PPLL_INVALID 0xFF: none)
+  uint8_t encoder_id = 0;               // ENCODER_OBJECT_ID_* of the encoder (AtomConnectors::encoder_id)
+  uint8_t dig_encoder = 0;              // 0..6 (AtomConnectors::dig_encoder); the PHY (UNIPHY A..G) is the same number on DCE 11
   bool link_b = false;
-  uint8_t connector_object_id = 0;
+  uint8_t connector_object_id = 0;      // CONNECTOR_OBJECT_ID_*
   uint8_t hpd = 0xFF;                   // the hot plug pin 0..5 or 0xFF
   uint8_t encoder_mode = 0;             // ATOM_ENCODER_MODE_*: DP 0, LVDS 1, DVI 2, HDMI 3
-  uint32_t bits_per_color = 8;
-  uint32_t lanes = 4;                   // of the link (DP: the trained lanes; DVI dual link and HDMI: 4 or 8)
-  uint32_t link_rate_khz = 0;           // DP: the trained rate per lane (the transmitter's symbol clock)
-  bool dual_link = false;               // DVI above 165 MHz
-  uint8_t reference_clock_source = 0;   // the transmitter's PLL as in DpSourceConfig
+  bool dfp = true;                      // a digital flat panel device (not the LVDS panel): coherent mode and dual link apply
+  uint32_t bits_per_color = 8;          // 6, 8, 10, 12, 16
+  uint32_t lanes = 0;                   // DisplayPort: dig_connector->dp_lane_count (0 until chosen)
+  uint32_t link_rate_khz = 0;           // DisplayPort: dig_connector->dp_clock (0 until chosen)
+  bool dual_link = false;               // amdgpu_dig_monitor_is_duallink: DVI above 165 MHz
 };
 
-// The tables of the video BIOS that set a mode, with the parameters the driver gives them: SetPixelClock 1.7, SetCRTC_Timing, SelectCRTC_Source 1.2/1.3, EnableCRTC, BlankCRTC,
-// UpdateCRTC_DoubleBufferRegisters, and the DIG encoder and UNIPHY transmitter control tables (1.3/1.4 and 1.4/1.5) for the actions that set up and switch the output. Port of
-// amdgpu_atombios_crtc.c and amdgpu_atombios_encoder.c for DCE 11 (Copyright Advanced Micro Devices, Inc.; MIT license), written from memory of them; the table indexes and parameter
-// layouts are checked against atombios.h by scripts/check_modeset_port.py. Each function is false if the table is not there, has a revision that is not handled, or fails.
+// The tables of the video BIOS that set a mode, with the parameters amdgpu gives them (atombios_crtc.c and atombios_encoders.c, checked against v6.12): SetPixelClock 1.7,
+// SetCRTC_UsingDTDTiming, SetCRTC_OverScan, EnableScaler, SelectCRTC_Source 1.2 / 1.3, EnableCRTC, BlankCRTC, UpdateCRTC_DoubleBufferRegisters (lock), EnableDispPowerGating, and the DIGx
+// encoder control (1.2 .. 1.5) and the UNIPHY transmitter control (1.4, 1.5, 1.6). Each function is false if the table is not there, has a revision that is not handled, or fails.
+// scripts/check_modeset_port.py checks the indexes, layouts and constants against atombios.h and the driver's sources.
 class AmdModeSet {
  public:
   // GetIndexIntoMasterTable(COMMAND, ...)
-  static constexpr uint32_t kBlankCrtc = 34, kEnableCrtc = 35, kSetPixelClock = 12, kSetCrtcTiming = 39, kSelectCrtcSource = 42, kUpdateDoubleBuffer = 44,
-                            kEncoder1Table = 74, kEncoder2Table = 75, kTransmitterTable = 76;
+  static constexpr uint32_t kDigxEncoderControl = 4, kSetPixelClock = 12, kEnableDispPowerGating = 13, kEnableScaler = 33, kBlankCrtc = 34, kEnableCrtc = 35, kSetCrtcOverscan = 40,
+                            kSelectCrtcSource = 42, kUpdateDoubleBuffer = 44, kSetCrtcUsingDtdTiming = 49, kTransmitterControl = 76;
   // ATOM_ENCODER_CMD_*
-  static constexpr uint8_t kEncoderDisable = 0, kEncoderEnable = 1, kEncoderDpVideoOff = 0x0C, kEncoderDpVideoOn = 0x0D, kEncoderSetup = 0x0F;
+  static constexpr uint8_t kEncoderSetup = 0x0F, kEncoderSetupPanelMode = 0x10, kEncoderDpVideoOff = 0x0C, kEncoderDpVideoOn = 0x0D;
   // ATOM_TRANSMITTER_ACTION_*
-  static constexpr uint8_t kTransmitterDisable = 0, kTransmitterEnable = 1, kTransmitterDisableOutput = 8, kTransmitterEnableOutput = 9, kTransmitterSetup = 10;
+  static constexpr uint8_t kTransmitterDisable = 0, kTransmitterEnable = 1, kTransmitterSetupVsEmph = 11;
   static constexpr uint8_t kPpll1 = 0, kPpll2 = 1, kPpll0 = 2, kPllInvalid = 0xFF;
-  static constexpr uint8_t kModeDp = 0, kModeLvds = 1, kModeDvi = 2, kModeHdmi = 3;
+  static constexpr uint8_t kModeDp = 0, kModeLvds = 1, kModeDvi = 2, kModeHdmi = 3, kModeDpMst = 5;
+  static constexpr uint8_t kPanelModeExternalDp = 0, kPanelModeInternalDp2 = 1, kPanelModeInternalDp1 = 0x11;
   static constexpr uint32_t kMaxCrtcs = 6;
 
   AmdModeSet(IAtomHost& host, AtomBios& bios) : host_(host), bios_(bios) {}
 
-  // SetPixelClock (V7): the pixel clock in 100 Hz units, PLL, encoder id, encoder mode, CRTC, and the deep colour ratio of an HDMI output (24, 30, 36 bit: none, 5:4, 3:2). Dual link DVI is
-  // flagged above 165 MHz as the driver does.
-  bool set_pixel_clock(const ModeSetOutput& out, const DisplayMode& mode);
-  // SetCRTC_Timing: totals, display, sync start and width of both directions and the polarity, interlace and double clock flags.
-  bool set_crtc_timing(const ModeSetOutput& out, const DisplayMode& mode);
-  // SelectCRTC_Source (V2 and V3): the CRTC to the DIG encoder (ASIC_INT_DIGn_ENCODER_ID), with the encoder mode and for V3 the panel colour depth.
-  bool select_crtc_source(const ModeSetOutput& out);
+  bool set_pixel_clock(const ModeSetOutput& out, const DisplayMode& mode);                 // amdgpu_atombios_crtc_program_pll (V7: the card computes the PLL)
+  bool set_dtd_timing(const ModeSetOutput& out, const DisplayMode& mode);                  // amdgpu_atombios_crtc_set_dtd_timing (no borders)
+  bool overscan_setup(const ModeSetOutput& out);                                          // ... _overscan_setup with RMX off: all zero
+  bool scaler_setup(const ModeSetOutput& out);                                            // ... _scaler_setup with RMX off: disabled
+  bool select_crtc_source(const ModeSetOutput& out);                                      // amdgpu_atombios_encoder_set_crtc_source (V2 / V3)
   bool enable_crtc(uint8_t crtc, bool enable);
   bool blank_crtc(uint8_t crtc, bool blank);
   bool lock_crtc(uint8_t crtc, bool lock);
-  // The DIG encoder control table of the output's DIG with an action (kEncoder*): setup for the mode (kEncoderSetup), enable, disable, DP video on and off.
-  bool encoder(const ModeSetOutput& out, const DisplayMode& mode, uint8_t action);
-  // The UNIPHY transmitter control table with an action (kTransmitter*).
-  bool transmitter(const ModeSetOutput& out, const DisplayMode& mode, uint8_t action);
+  bool powergate_crtc(uint8_t crtc, bool enable);                                         // EnableDispPowerGating
+  // amdgpu_atombios_encoder_setup_dig_encoder: the DIGx encoder control with an action (kEncoderSetup, the panel mode with `panel_mode`, the training commands of AmdDpSource, DP video on / off)
+  bool encoder(const ModeSetOutput& out, const DisplayMode& mode, uint8_t action, uint8_t panel_mode = 0);
+  // amdgpu_atombios_encoder_setup_dig_transmitter: the UNIPHY transmitter control with an action (kTransmitterEnable, kTransmitterDisable, SETUP_VSEMPH with `lane_set` for all lanes)
+  bool transmitter(const ModeSetOutput& out, const DisplayMode& mode, uint8_t action, uint8_t lane_num = 0, uint8_t lane_set = 0);
 
   // ASIC_INT_DIGn_ENCODER_ID of DIG `dig` (0..6), 0 for any other
   static uint8_t dig_encoder_id(uint8_t dig);
-  // ATOM_ENCODER_CONFIG link rate field for a DP rate, -1 if the table has none
-  static int link_rate_bits(uint32_t rate_khz, uint8_t crev);
+  // amdgpu_atombios_encoder_get_bpc: PANEL_*BIT_PER_COLOR for 6, 8, 10, 12, 16 bits (0: undefined; anything else 8)
+  static uint8_t panel_bpc(uint32_t bits_per_color);
+  static bool is_dp(uint8_t encoder_mode) { return encoder_mode == kModeDp || encoder_mode == kModeDpMst; }
 
  private:
-  bool crtc_table(uint32_t table, uint8_t crev_min, uint8_t crev_max, uint8_t crtc, uint32_t second);
   IAtomHost& host_;
   AtomBios& bios_;
 };
