@@ -212,7 +212,7 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
   // Like train_link it takes the video BIOS for milliseconds: for the desktop loop.
   enum class ModeSetStage : uint8_t {
     Done, NotReady, Unsupported, Prepare, SinkCapabilities, CrtcSource, PixelClock, Timing, Overscan, Scaler, EncoderOff, CrtcEnable, Unblank, EncoderSetup, PanelMode, TransmitterEnable,
-    LinkTraining, VideoOn, Scanout,
+    LinkTraining, VideoOn, Scanout, Audio,
   };
   struct ModeSetResult {
     ModeSetStage failed = ModeSetStage::NotReady;
@@ -222,8 +222,10 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
   };
   // `surface`: if given, the CRTC's graphics plane is pointed at it between the timing and the overscan, where the driver sets the base (amd_dce11::Scanout); without it the plane is
   // left as it is.
+  // `hdmi_edid`: for an HDMI output the monitor's EDID (what enable_audio makes the endpoint's descriptors of): given, the audio is set up in the encoder's mode set as the driver does
+  // (dce_v11_0_afmt_enable and _afmt_setmode, stage `Audio`); empty, it is not. (DisplayPort audio is not part of the driver's modeset.)
   bool set_mode(const AtomConnectors::Connector& connector, uint8_t crtc, const DisplayMode& mode, uint32_t bpc, ModeSetResult* out, uint8_t pll = AmdModeSet::kPllInvalid,
-                const amd_dce11::ScanoutSurface* surface = nullptr);
+                const amd_dce11::ScanoutSurface* surface = nullptr, ConstByteView hdmi_edid = ConstByteView());
   // The disable path (dce_v11_0_encoder_disable and _crtc_disable): the encoder off, the CRTC blanked and disabled, its power gating on, and its PLL switched off unless another CRTC set
   // up by set_mode still uses it; the graphics plane is switched off after the CRTC, as the driver does. False if a table fails (the rest is still done).
   bool disable_mode(const AtomConnectors::Connector& connector, uint8_t crtc);

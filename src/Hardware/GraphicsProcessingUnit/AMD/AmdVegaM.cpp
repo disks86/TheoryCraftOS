@@ -603,7 +603,7 @@ bool dig_off(ModeSession& session, AuxSession* aux, const AtomConnectors::Connec
 
 }  // namespace
 
-bool AmdVegaM::set_mode(const AtomConnectors::Connector& connector, uint8_t crtc, const DisplayMode& mode, uint32_t bpc, ModeSetResult* out, uint8_t pll, const amd_dce11::ScanoutSurface* surface) {
+bool AmdVegaM::set_mode(const AtomConnectors::Connector& connector, uint8_t crtc, const DisplayMode& mode, uint32_t bpc, ModeSetResult* out, uint8_t pll, const amd_dce11::ScanoutSurface* surface, ConstByteView hdmi_edid) {
   ModeSetResult result;
   const auto finish = [&](ModeSetStage stage) {
     result.failed = stage;
@@ -661,6 +661,19 @@ bool AmdVegaM::set_mode(const AtomConnectors::Connector& connector, uint8_t crtc
   // dce_v11_0_encoder_mode_set: the encoder off (setup_dig(ATOM_DISABLE))
   if (!dig_off(session, aux.get(), connector, o, mode)) return finish(ModeSetStage::EncoderOff);
   display.set_interleave(crtc, mode.interlaced);        // (a scaler setup clears it on some chips)
+  if (encoder_mode == AmdModeSet::kModeHdmi && hdmi_edid.size() != 0) {       // dce_v11_0_encoder_mode_set: afmt_enable and afmt_setmode
+    AudioMode audio;
+    audio.clock_khz = mode.pixel_clock_khz;
+    audio.hdisplay = mode.h_display;
+    audio.vdisplay = mode.v_display;
+    audio.htotal = mode.h_total;
+    audio.vtotal = mode.v_total;
+    audio.interlaced = mode.interlaced;
+    audio.double_clock = mode.double_scan;
+    audio.crtc = crtc;
+    audio.bpc = bpc;
+    if (!enable_audio(connector, hdmi_edid, audio)) return finish(ModeSetStage::Audio);
+  }
   // dce_v11_0_crtc_commit: dpms on (enabled, unblanked), unlocked
   if (!set.enable_crtc(crtc, true)) return finish(ModeSetStage::CrtcEnable);
   crtc_active_ |= 1u << crtc;

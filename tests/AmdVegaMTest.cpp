@@ -2280,6 +2280,61 @@ static void test_set_mode() {
   CHECK(!vega.disable_mode(dp, 0) && !vega.set_mode(dp, 0, m, 8, &r) && r.failed == AmdVegaM::ModeSetStage::NotReady);
 }
 
+// The HDMI audio set up in the encoder's mode set (dce_v11_0_encoder_mode_set: afmt_enable, afmt_setmode), with the monitor's EDID: the endpoint enabled, the stage named on failure.
+static void test_set_mode_audio() {
+  const std::vector<uint8_t> vbios = make_connector_vbios();
+  const uint8_t cea[] = {0x2C, 0x09, 0x07, 0x07, 0x15, 0x07, 0x50, 0x3F, 0x1E, 0x18, 0x0F, 0x54, 0x07, 0x83, 0x05, 0x00, 0x00, 0x6C, 0x03, 0x0C, 0x00, 0x10, 0x00, 0x80, 0x00, 0xC0, 30, 40, 50, 60};
+  std::vector<uint8_t> edid = make_edid(1);
+  for (size_t i = 3; i < 127; ++i) edid[128 + i] = 0;
+  edid[128 + 2] = 4 + sizeof cea;
+  for (size_t i = 0; i < sizeof cea; ++i) edid[128 + 4 + i] = cea[i];
+  uint8_t sum = 0;
+  for (size_t i = 0; i < 127; ++i) sum = static_cast<uint8_t>(sum + edid[128 + i]);
+  edid[255] = static_cast<uint8_t>(0 - sum);
+  Rig rig;
+  FakeAzalia azalia;
+  FakeAuxCard auxcard;
+  rig.card.aux = &auxcard;
+  rig.card.azalia = &azalia;
+  azalia.connectivity[2] = 0;
+  azalia.connectivity[3] = 3;
+  for (uint32_t pin = 0; pin < 3; ++pin) rig.card.gfx.set_reg(0x1898 + 8 * pin, 0x2);
+  AmdVegaM vega(rig.alloc);
+  AmdVegaM::Inputs in = rig.inputs();
+  in.hpd_pins = 0x0F;
+  in.vbios = ConstByteView(vbios.data(), vbios.size());
+  CHECK(vega.bring_up(in));
+  if (!vega.up()) return;
+  const AtomConnectors::Connector hdmi = vega.connectors()[1], dp = vega.connectors()[2];
+  DisplayMode m;
+  m.pixel_clock_khz = 148500;
+  m.h_display = 1920; m.h_sync_start = 2008; m.h_sync_end = 2052; m.h_total = 2200;
+  m.v_display = 1080; m.v_sync_start = 1084; m.v_sync_end = 1089; m.v_total = 1125;
+  AmdVegaM::ModeSetResult r;
+  azalia.writes.clear();
+  rig.card.gfx.set_reg(0x4c45, 0xAB000005u);
+  azalia.set(2, 0x25, 0xFFFFFFFFu);
+  // without an EDID: no audio setup
+  CHECK(vega.set_mode(hdmi, 3, m, 8, &r) && azalia.writes.empty());
+  // with it: the endpoint is disabled, programmed and enabled; HDMI's block (DIG 2) selects endpoint 2
+  CHECK(vega.set_mode(hdmi, 3, m, 8, &r, AmdModeSet::kPllInvalid, nullptr, ConstByteView(edid.data(), edid.size())));
+  CHECK(azalia.writes.size() == 16 && azalia.writes[0].pin == 2 && azalia.writes[0].index == 0x54 && azalia.writes[15].index == 0x54 && azalia.writes[15].value == 0x80000000u);
+  // DisplayPort has no audio setup in the modeset, even with an EDID
+  azalia.writes.clear();
+  std::vector<uint8_t>& dpcd = auxcard.sink.dpcd;
+  dpcd.assign(0x800, 0);
+  const uint8_t caps[8] = {0x12, 0x14, 0xC4, 0x01, 0x00, 0x00, 0x01, 0x00};
+  for (size_t i = 0; i < 8; ++i) dpcd[i] = caps[i];
+  dpcd[0x202] = dpcd[0x203] = 0x77;
+  dpcd[0x204] = 0x01;
+  CHECK(vega.set_mode(dp, 1, m, 8, &r, AmdModeSet::kPllInvalid, nullptr, ConstByteView(edid.data(), edid.size())) && azalia.writes.empty());
+  // a card with no connected endpoint: the Audio stage
+  azalia.connectivity[2] = 1;
+  azalia.connectivity[3] = 1;
+  CHECK(!vega.set_mode(hdmi, 3, m, 8, &r, AmdModeSet::kPllInvalid, nullptr, ConstByteView(edid.data(), edid.size())) && r.failed == AmdVegaM::ModeSetStage::Audio);
+  vega.shutdown();
+}
+
 // The sink's DPCD over the AUX channel of the DisplayPort and eDP connectors (through the video BIOS's table, with the panel power-up for the eDP one).
 static void test_read_dpcd() {
   const std::vector<uint8_t> vbios = make_connector_vbios();   // eDP (DDC line 0x92, pin 0), HDMI-A (0x91), DisplayPort (0x93, pin 2)
@@ -2763,6 +2818,7 @@ int main() {
   test_read_dpcd();
   test_train_link();
   test_set_mode();
+  test_set_mode_audio();
   test_short_pulse_status();
   test_retrain_on_short_pulse();
   printf(g_failed ? "AmdVegaMTest: %d FAILED\n" : "AmdVegaMTest: all passed\n", g_failed);
