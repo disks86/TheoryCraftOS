@@ -196,10 +196,24 @@ static void test_basics() {
   {      // xgetbv: x87, SSE, AVX and AVX-512 state are enabled
     Machine m(with_syscall({0x0F, 0x01, 0xD0}));
     m.cpu.state().r[1] = 0;
-    CHECK(m.run() == StopReason::Syscall && (m.cpu.state().r[0] & 0xFFFFFFFFu) == 0xE00E7 && m.cpu.state().r[2] == 0);
+    CHECK(m.run() == StopReason::Syscall && (m.cpu.state().r[0] & 0xFFFFFFFFu) == 0xE00E7 && m.cpu.state().r[2] == 0x40000000);
     Machine bad(with_syscall({0x0F, 0x01, 0xD0}));
-    bad.cpu.state().r[1] = 1;
-    CHECK(bad.run() == StopReason::Fault);      // only XCR0 exists
+    bad.cpu.state().r[1] = 2;
+    CHECK(bad.run() == StopReason::Fault);      // only XCR0 and XINUSE exist
+    Machine inuse(with_syscall({0x0F, 0x01, 0xD0}));      // xgetbv, ECX = 1: nothing is in use at reset
+    inuse.cpu.state().r[1] = 1;
+    CHECK(inuse.run() == StopReason::Syscall && inuse.cpu.state().r[0] == 0 && inuse.cpu.state().r[2] == 0);
+    Machine used(with_syscall({0x66, 0x0F, 0xEF, 0xC0, 0x0F, 0x01, 0xD0}));      // pxor xmm0, xmm0 leaves SSE initial
+    used.cpu.state().r[1] = 1;
+    used.cpu.state().xmm[3] = {1, 0};
+    used.cpu.state().ymm_high[2].lo = 5;
+    used.cpu.state().k[1] = 1;
+    used.cpu.state().r[20] = 7;
+    CHECK(used.run() == StopReason::Syscall && used.cpu.state().r[0] == (0x2 | 0x4 | 0x20 | 0x80000) && used.cpu.state().r[2] == 0);
+    Machine xsaves(with_syscall({0x0F, 0xC7, 0x2F}));      // xsaves [rdi]: supervisor state, #GP in user mode
+    CHECK(xsaves.run() == StopReason::Fault && xsaves.cpu.fault().vector == 13);
+    Machine xrstors(with_syscall({0x0F, 0xC7, 0x1F}));      // xrstors [rdi]
+    CHECK(xrstors.run() == StopReason::Fault && xrstors.cpu.fault().vector == 13);
   }
   {      // cpuid reports AVX, AVX2, FMA, BMI1, BMI2 and OSXSAVE
     Machine m(with_syscall({0x31, 0xC9, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x0F, 0xA2, 0x41, 0x89, 0xC8,        // leaf 1: ecx -> r8d

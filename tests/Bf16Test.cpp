@@ -680,7 +680,205 @@ static void test_saturating() {
   }
 }
 
+// --- FP8 conversions ---------------------------------------------------------------------------------------------------------------------
+// The model works on values: the finite E5M2 / E4M3 numbers are enumerated, the fp16 input is placed between two of them and rounded by the instruction's rule (nearest even, or the bias added below the
+// LSB). The two overflow slots are code 0x7C of E5M2 (infinity, value 2^16) and 0x7F of E4M3 (NaN, value 480): reaching either is an overflow.
+
+static double fp8_value(int code, bool hf8) {
+  if (hf8) { const int e = code >> 3, m = code & 7; return e == 0 ? m / 8.0 * std::ldexp(1.0, -6) : (1 + m / 8.0) * std::ldexp(1.0, e - 7); }
+  const int e = code >> 2, m = code & 3;
+  return e == 0 ? m / 4.0 * std::ldexp(1.0, -14) : (1 + m / 4.0) * std::ldexp(1.0, e - 15);
+}
+
+static uint8_t model_to_fp8(uint16_t x, bool hf8, bool sat, int bias) {
+  const uint8_t sign = (x >> 8) & 0x80;
+  const int e16 = (x >> 10) & 31, m16 = x & 0x3FF;
+  const int max_code = hf8 ? 0x7E : 0x7B, slot = hf8 ? 0x7F : 0x7C;
+  if (e16 == 31) {
+    if (m16 == 0) return sign | (sat ? max_code : slot);
+    return hf8 ? (sign | 0x7F) : uint8_t((x >> 8) | 2);
+  }
+  const double a = e16 == 0 ? m16 * std::ldexp(1.0, -24) : (1 + m16 / 1024.0) * std::ldexp(1.0, e16 - 15);
+  int q = 0;
+  for (int c = 0; c <= slot; ++c) if (fp8_value(c, hf8) <= a) q = c;
+  int code = q;
+  if (q < slot) {
+    const double lo = fp8_value(q, hf8), hi = fp8_value(q + 1, hf8), f = (a - lo) / (hi - lo);
+    bool up;
+    if (bias < 0) up = f > 0.5 || (f == 0.5 && (q & 1));
+    else if (hf8 && e16 >= 9) up = int(f * 128) + (bias >> 1) >= 128;
+    else up = int(f * 256) + bias >= 256;
+    code = q + up;
+  }
+  if (code >= slot) code = sat ? max_code : slot;
+  return sign | uint8_t(code);
+}
+
+static const struct Fp8Form { int map, pp; uint8_t op; bool hf8, sat; } kFp8Single[] = {{2, 2, 0x74, false, false}, {5, 2, 0x74, false, true}, {5, 2, 0x18, true, false}, {5, 2, 0x1B, true, true}};
+
+// pp: 2 = vcvtph2*, 3 = vcvt2ph2*, 0 = vcvtbiasph2*
+static Fp8Form fp8_form(int index, int pp) { Fp8Form f = kFp8Single[index]; f.pp = pp; return f; }
+
+static void test_fp8() {
+  for (int index = 0; index < 4; ++index) {
+    for (int biased = 0; biased < 2; ++biased) {
+      const Fp8Form one = fp8_form(index, biased ? 0 : 2), two = fp8_form(index, 3);
+      (void)two;
+      for (int chunk = 0; chunk < 2048; ++chunk) {
+        Zmm src, bias_reg;
+        for (int i = 0; i < 32; ++i) src.h[i] = uint16_t(chunk * 32 + i);
+        int biases[32];
+        for (int i = 0; i < 32; ++i) { biases[i] = biased ? int(rnd() & 0xFF) : -1; bias_reg.h[i] = uint16_t((rnd() & 0xFF00) | (biases[i] < 0 ? 0 : biases[i])); }
+        const Zmm got = run1(encode(one.map, one.pp, one.op, 0, biased ? 1 : 0, false, 2), bias_reg, src, Zmm(), false);
+        uint8_t bytes[64];
+        memcpy(bytes, got.h, 64);
+        for (int i = 0; i < 32; ++i) {
+          const uint8_t want = model_to_fp8(src.h[i], one.hf8, one.sat, biases[i]);
+          if (bytes[i] != want) printf("  single idx %d biased %d x %04x bias %d got %02x want %02x\n", index, biased, src.h[i], biases[i], bytes[i], want);
+          CHECK(bytes[i] == want);
+        }
+        for (int i = 32; i < 64; ++i) CHECK(bytes[i] == 0);
+      }
+    }
+    {      // the fixed biases: 0 truncates, 127 ties toward zero, 128 ties away, 255 rounds away
+      const Fp8Form f = fp8_form(index, 0);
+      for (int bias : {0, 127, 128, 255}) {
+        for (int chunk = 0; chunk < 2048; chunk += 7) {
+          Zmm src, bias_reg;
+          for (int i = 0; i < 32; ++i) { src.h[i] = uint16_t(chunk * 32 + i); bias_reg.h[i] = uint16_t(bias); }
+          const Zmm got = run1(encode(f.map, f.pp, f.op, 0, 1, false, 2), bias_reg, src, Zmm(), false);
+          uint8_t bytes[64];
+          memcpy(bytes, got.h, 64);
+          for (int i = 0; i < 32; ++i) CHECK(bytes[i] == model_to_fp8(src.h[i], f.hf8, f.sat, bias));
+        }
+      }
+    }
+    {      // two sources: src2 (the r/m operand) fills the low half of the bytes, src1 the high half
+      const Fp8Form f = fp8_form(index, 3);
+      for (int chunk = 0; chunk < 1024; ++chunk) {
+        Zmm a, b;
+        for (int i = 0; i < 32; ++i) { a.h[i] = uint16_t(chunk * 64 + i); b.h[i] = uint16_t(chunk * 64 + 32 + i); }
+        const Zmm got = run1(encode(f.map, f.pp, f.op, 0, 1, false, 1), a, b, Zmm(), false);      // ymm: 32 bytes
+        uint8_t bytes[64];
+        memcpy(bytes, got.h, 64);
+        for (int i = 0; i < 16; ++i) CHECK(bytes[i] == model_to_fp8(b.h[i], f.hf8, f.sat, -1));
+        for (int i = 16; i < 32; ++i) CHECK(bytes[i] == model_to_fp8(a.h[i - 16], f.hf8, f.sat, -1));
+        for (int i = 32; i < 64; ++i) CHECK(bytes[i] == 0);
+      }
+      {      // 512 bits, a masked merge, a zeroing mask, and a broadcast memory operand
+        Zmm a, b, old;
+        for (int i = 0; i < 32; ++i) { a.h[i] = uint16_t(rnd()); b.h[i] = uint16_t(rnd()); old.h[i] = uint16_t(rnd()); }
+        const uint64_t k = rnd();
+        for (int zeroing = 0; zeroing < 2; ++zeroing) {
+          const Zmm got = run1(encode(f.map, f.pp, f.op, 0, 1, false, 2, 1, zeroing), a, b, old, false, k);
+          uint8_t bytes[64], oldb[64];
+          memcpy(bytes, got.h, 64);
+          memcpy(oldb, old.h, 64);
+          for (int i = 0; i < 64; ++i) {
+            const uint8_t full = model_to_fp8(i < 32 ? b.h[i] : a.h[i - 32], f.hf8, f.sat, -1);
+            CHECK(bytes[i] == (((k >> i) & 1) ? full : (zeroing ? 0 : oldb[i])));
+          }
+        }
+        const Zmm got = run1(encode(f.map, f.pp, f.op, 0, 1, true, 2, 0, false, true), a, b, Zmm(), true);
+        uint8_t bytes[64];
+        memcpy(bytes, got.h, 64);
+        for (int i = 0; i < 32; ++i) CHECK(bytes[i] == model_to_fp8(b.h[0], f.hf8, f.sat, -1));
+        for (int i = 32; i < 64; ++i) CHECK(bytes[i] == model_to_fp8(a.h[i - 32], f.hf8, f.sat, -1));
+        // the single-source form with a broadcast element and a mask
+        const Fp8Form s = fp8_form(index, 2);
+        const Zmm got1 = run1(encode(s.map, s.pp, s.op, 0, 0, true, 2, 1, true, true), Zmm(), b, old, true, k);
+        memcpy(bytes, got1.h, 64);
+        for (int i = 0; i < 32; ++i) CHECK(bytes[i] == (((k >> i) & 1) ? model_to_fp8(b.h[0], s.hf8, s.sat, -1) : 0));
+        for (int i = 32; i < 64; ++i) CHECK(bytes[i] == 0);
+      }
+    }
+  }
+  {      // vcvthf82ph: all 256 codes, exact
+    for (int chunk = 0; chunk < 8; ++chunk) {
+      Zmm src;
+      uint8_t* sb = reinterpret_cast<uint8_t*>(src.h);
+      for (int i = 0; i < 32; ++i) sb[i] = uint8_t(chunk * 32 + i);
+      const Zmm got = run1(encode(5, 3, 0x1E, 0, 0, false, 2), Zmm(), src, Zmm(), false);
+      for (int i = 0; i < 32; ++i) {
+        const int code = chunk * 32 + i, mag = code & 0x7F;
+        uint16_t want;
+        if (mag == 0x7F) want = uint16_t(((code & 0x80) << 8) | 0x7F80);
+        else {
+          const double v = fp8_value(mag, true);
+          int e;
+          const double fr = v == 0 ? 0 : std::frexp(v, &e);
+          want = v == 0 ? 0 : uint16_t(((e - 1 + 15) << 10) | (uint32_t(std::ldexp(fr * 2 - 1, 10)) & 0x3FF));
+          want |= uint16_t((code & 0x80) << 8);
+        }
+        if (got.h[i] != want) printf("  hf82ph code %02x got %04x want %04x\n", code, got.h[i], want);
+        CHECK(got.h[i] == want);
+      }
+    }
+    // the 128-bit form reads 8 bytes and writes 8 halves; memory and a mask
+    Zmm src;
+    for (int i = 0; i < 32; ++i) src.h[i] = uint16_t(rnd());
+    Zmm old;
+    for (int i = 0; i < 32; ++i) old.h[i] = uint16_t(rnd());
+    Bytes mem_code = encode(5, 3, 0x1E, 0, 0, true, 0, 1);
+    mem_code[6] = 8;      // disp8 * 8 (the memory operand is half the vector)
+    const Zmm got = run1(mem_code, Zmm(), src, old, true, 0x5A);
+    const uint8_t* sb = reinterpret_cast<const uint8_t*>(src.h);
+    for (int i = 0; i < 8; ++i) {
+      const bool on = (0x5A >> i) & 1;
+      Zmm one;
+      (void)one;
+      if (on) {
+        const int mag = sb[i] & 0x7F;
+        const bool nan = mag == 0x7F;
+        CHECK(((got.h[i] & 0x7C00) == 0x7C00) == nan);
+        CHECK((got.h[i] >> 15) == (sb[i] >> 7));
+      } else {
+        CHECK(got.h[i] == old.h[i]);
+      }
+    }
+    for (int i = 8; i < 32; ++i) CHECK(got.h[i] == 0);
+  }
+  {      // vcvt2ps2phx against the host's float -> _Float16 conversion
+    for (int iter = 0; iter < 200; ++iter) {
+      float fa[16], fb[16];
+      for (int i = 0; i < 16; ++i) {
+        fa[i] = float(std::ldexp(double(int(rnd() % 20001) - 10000) / 7.0, int(rnd() % 40) - 25));
+        fb[i] = float(std::ldexp(double(int(rnd() % 20001) - 10000) / 3.0, int(rnd() % 30) - 12));
+        if (rnd() % 17 == 0) fa[i] = INFINITY;
+        if (rnd() % 17 == 0) fb[i] = -INFINITY;
+      }
+      Zmm a, b;
+      memcpy(a.h, fa, 64);
+      memcpy(b.h, fb, 64);
+      const Zmm got = run1(encode(2, 1, 0x67, 0, 1, false, 2), a, b, Zmm(), false);
+      for (int i = 0; i < 32; ++i) {
+        const _Float16 h = static_cast<_Float16>(i < 16 ? fb[i] : fa[i - 16]);
+        uint16_t want;
+        memcpy(&want, &h, 2);
+        CHECK(got.h[i] == want);
+      }
+    }
+    {      // embedded rounding: 1 + 2^-11 + 2^-13 rounds to 0x3C01 to nearest and to 0x3C00 toward zero
+      float x = 1.0f + std::ldexp(1.0f, -11) + std::ldexp(1.0f, -13);
+      Zmm b;
+      for (int i = 0; i < 16; ++i) memcpy(&b.h[2 * i], &x, 4);
+      CHECK(run1(encode(2, 1, 0x67, 0, 1, false, 2), Zmm(), b, Zmm(), false).h[0] == 0x3C01);
+      Bytes code = {0x62, 0xF2, 0x75, 0x78, 0x67, 0xC2, 0x0F, 0x0B};      // vcvt2ps2phx zmm0, zmm1, zmm2, {rz-sae}
+      Machine m(code);
+      set_zmm(m.cpu.state(), 2, b);
+      CHECK(m.finished());
+      CHECK(get_zmm(m.cpu.state(), 0).h[0] == 0x3C00);
+    }
+  }
+  {      // a nonzero VEX.vvvv on the single-source forms and W1 are undefined
+    CHECK(Machine(encode(5, 2, 0x18, 0, 1, false, 2)).undefined());
+    CHECK(Machine(encode(5, 2, 0x18, 0, 0, false, 2, 0, false, false, true)).undefined());
+    CHECK(Machine(encode(5, 3, 0x1E, 0, 1, false, 2)).undefined());
+  }
+}
+
 int main() {
+  test_fp8();
   test_dpphps();
   test_mpsadbw();
   test_saturating();

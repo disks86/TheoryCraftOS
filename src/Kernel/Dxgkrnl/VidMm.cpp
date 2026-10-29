@@ -49,6 +49,11 @@ bool Allocation::level_range(uint32_t level, uint64_t* offset, uint64_t* bytes) 
     return true;
   }
   if (level >= desc_.mip_levels) return false;
+  if (desc_.kind != graphics::TextureKind::Texture2D) {   // (one level: all the layers)
+    *offset = 0;
+    *bytes = uint64_t{desc_.width} * desc_.height * pixel_bytes(desc_.format) * layers();
+    return true;
+  }
   uint64_t start = 0;
   const uint32_t pixel = pixel_bytes(desc_.format);
   for (uint32_t l = 0; l < level; ++l) start += uint64_t{graphics::mip_extent(desc_.width, l)} * graphics::mip_extent(desc_.height, l) * pixel;
@@ -110,6 +115,15 @@ NtStatus VidMm::create(const AllocationDesc& desc, SharedPointer<Allocation>* ou
     if (desc.mip_levels > 1 && (desc.flags & ~(kAllocTexture | kAllocShared))) return status::kInvalidParameter;
     uint64_t total = 0;
     image_bytes(desc.width, desc.height, desc.mip_levels, pixel_bytes(desc.format), &total);
+    if (desc.kind != graphics::TextureKind::Texture2D) {
+      // (a volume, array or cube: sampled only, one level, 8-bit colour)
+      if ((desc.flags & ~(kAllocTexture | kAllocShared)) || !(desc.flags & kAllocTexture) || desc.mip_levels != 1 || depth_flag || dxgk::is_float(desc.format)) return status::kInvalidParameter;
+      if (desc.layers == 0 || desc.layers > graphics::kMaxTextureLayers || (desc.kind == graphics::TextureKind::TextureCube && (desc.layers != 6 || desc.width != desc.height))) return status::kInvalidParameter;
+      if (!(device_.info().features & graphics::kFeatureTextureKinds)) return status::kNotSupported;
+      total *= desc.layers;
+    } else if (desc.layers != 1) {
+      return status::kInvalidParameter;
+    }
     if (depth_flag) {
       device_bytes = uint64_t{desc.width} * desc.height * (desc.format == Format::D24S8 ? 5 : 4);
     } else {
@@ -164,6 +178,8 @@ bool VidMm::create_device_object(Allocation& a) {
   graphics::ImageDesc id;
   id.extent = {d.width, d.height};
   id.mip_levels = d.mip_levels;
+  id.kind = d.kind;
+  id.layers = d.layers;
   if (a.is_depth()) {
     id.format = graphics::Format::D32Float;
     id.usage = graphics::kImageDepthAttachment;
@@ -223,6 +239,25 @@ bool VidMm::upload(Allocation& a) {
     return true;
   }
   const bool convert = f != Format::A8R8G8B8;
+  if (a.desc_.kind != graphics::TextureKind::Texture2D) {
+    const uint64_t layer_bytes = uint64_t{a.desc_.width} * a.desc_.height * 4;
+    for (uint32_t layer = 0; layer < a.layers(); ++layer) {
+      ArrayView<uint32_t> source;
+      if (!as_words(a.cpu_.subview(layer_bytes * layer, layer_bytes), &source)) return false;
+      ArrayView<const uint32_t> pixels(source.data(), source.size());
+      if (convert) {
+        scratch_.clear();
+        if (!scratch_.put_zeros(layer_bytes)) return false;
+        ArrayView<uint32_t> converted;
+        if (!as_words(scratch_.writable_view(), &converted)) return false;
+        for (uint64_t i = 0; i < converted.size(); ++i) converted[i] = to_logical(f, source[i]);
+        pixels = ArrayView<const uint32_t>(converted.data(), converted.size());
+      }
+      if (!a.image_->write_layer_pixels(layer, pixels) && a.cpu_written_) return false;
+    }
+    a.device_stale_ = false;
+    return true;
+  }
   for (uint32_t level = 0; level < a.desc_.mip_levels; ++level) {
     uint64_t offset = 0, bytes = 0;
     if (!a.level_range(level, &offset, &bytes)) return false;

@@ -435,7 +435,7 @@ class Adapter::StreamRunner {
     if (instanced && (!(adapter_.caps_.features & graphics::kFeatureInstancing) || instance_count == 0 || instance_count > (1u << 20))) return kBad;
     if (topology_ >= Topology::LineList && !(adapter_.caps_.features & graphics::kFeatureLines)) return kBad;
     for (uint32_t u = 0; u < pipeline_->texture_count(); ++u)
-      if (!texture_bound_[u]) return kBad;
+      if (!texture_bound_[u] || texture_alloc_[u]->texture_kind() != pipeline_->texture_kind(u)) return kBad;   // (unbound, or a volume where the shader reads a 2D texture, ...)
     if (pipeline_->color_target_count() > pass_target_count_) return kBad;
     const bool vertices = pipeline_->attribute_count() > 0;
     if (vertices && !vertex_) return kBad;
@@ -805,6 +805,7 @@ NtStatus Adapter::create_shader(const ShaderDesc& desc, SharedPointer<ShaderObje
           md.qpu_flip_y = true;
         }
       }
+      for (uint32_t u = 0; u < graphics::kMaxTextureUnits; ++u) shader->texture_kinds_[u] = program->texture_kind(u);
       const NtStatus b = shader->d3d9_.bind(util::move(program), &md);
       if (b != status::kSuccess && !md.tgsi) return b;
       no_functions = b;   // (out of trampolines is no matter to a device that takes the text)
@@ -839,6 +840,11 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   if (static_cast<uint32_t>(d.depth_compare) > 7 || static_cast<uint32_t>(bs.src_color) > 10 || static_cast<uint32_t>(bs.dst_color) > 10 || static_cast<uint32_t>(bs.src_alpha) > 10 ||
       static_cast<uint32_t>(bs.dst_alpha) > 10 || static_cast<uint32_t>(bs.color_op) > 4 || static_cast<uint32_t>(bs.alpha_op) > 4 || bs.write_mask > 0xF)
     return status::kInvalidParameter;
+  for (const graphics::BlendState& t : d.target_blend)
+    if (static_cast<uint32_t>(t.src_color) > 10 || static_cast<uint32_t>(t.dst_color) > 10 || static_cast<uint32_t>(t.src_alpha) > 10 || static_cast<uint32_t>(t.dst_alpha) > 10 ||
+        static_cast<uint32_t>(t.color_op) > 4 || static_cast<uint32_t>(t.alpha_op) > 4 || t.write_mask > 0xF)
+      return status::kInvalidParameter;
+  if (d.independent_blend && !(caps_.features & graphics::kFeatureIndependentBlend)) return status::kNotSupported;
   if ((bs.custom || d.depth_compare != graphics::CompareOp::LessEqual) && !(caps_.features & graphics::kFeatureBlendState)) return status::kNotSupported;
   for (uint32_t i = 0; i < d.attribute_count; ++i)
     if (d.attributes[i].per_instance && !(caps_.features & graphics::kFeatureInstancing)) return status::kNotSupported;
@@ -860,6 +866,8 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   pd.alpha_blend = d.alpha_blend;
   pd.stencil = st;
   pd.blend = bs;
+  pd.independent_blend = d.independent_blend;
+  for (uint32_t i = 0; i < graphics::kMaxColorTargets - 1; ++i) pd.target_blend[i] = d.target_blend[i];
   pd.depth_compare = d.depth_compare;
   pd.color_target_count = d.color_target_count;
 
@@ -873,6 +881,7 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   for (uint32_t i = 0; i < d.attribute_count; ++i) pipeline->per_instance_ = pipeline->per_instance_ || d.attributes[i].per_instance;
   pipeline->attribute_count_ = d.attribute_count;
   pipeline->texture_count_ = d.texture_count;
+  for (uint32_t u = 0; u < graphics::kMaxTextureUnits; ++u) pipeline->texture_kinds_[u] = fragment->texture_kind(u);
   pipeline->color_target_count_ = d.color_target_count;
   *out = pipeline;
   return status::kSuccess;

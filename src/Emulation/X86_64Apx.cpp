@@ -22,8 +22,9 @@
 // Almost every promoted instruction does what the legacy instruction does, so it is run by the legacy code: the prefix bits are turned into the same decoder state a REX2 prefix would give, the legacy
 // handler for the opcode (possibly a different one: tzcnt moved from 0F BC to map 4 F4) executes, and then the results are rearranged. NF restores the flags afterwards. An NDD form snapshots the
 // legacy destination (a register, or the memory operand), lets the legacy instruction write it, moves the result to the new destination register, zeroed above the operand size, and puts the old
-// destination value back. Not promoted here yet: the map 4 forms of adcx / adox, crc32, movbe, movdiri, movdir64b, enqcmd, wrss / wruss, invept / invvpid / invpcid, urdmsr / uwrmsr, and the EVEX
-// extension of the EVEX and VEX instructions (so a vector instruction cannot name R16..R31 as a base or index register yet).
+// destination value back. The promoted legacy map 2 instructions (adcx, adox, crc32, movbe, movdiri, movdir64b, aadd, aand, aor, axor) are run the same way. Not promoted: enqcmd, wrss / wruss
+// (shadow stacks), invept / invvpid / invpcid and urdmsr / uwrmsr (privileged, or hardware that does not exist here: #UD). The EVEX extension of the existing EVEX instructions (R16..R31 as
+// memory base or index, GPR r/m and cvt-to-GPR destination) is in X86_64Evex.cpp; the promoted VEX instructions are at the end of this file.
 #include "Emulation/X86_64Cpu.hpp"
 
 namespace emulation {
@@ -107,6 +108,62 @@ X86_64Cpu::Step X86_64Cpu::apx_map4(GuestMemory& m, uint8_t p0, uint8_t p1, uint
     }
     s_.rip += d_.position;
     return Step::Ok;
+  }
+
+  // --- the promoted legacy map 2 instructions ---
+  if (op == 0x66 || op == 0xF0 || op == 0xF1 || op == 0x60 || op == 0x61 || op == 0xF9 || op == 0xF8 || op == 0xFC) {
+    if (nf || (op != 0x66 && (nd || v != 0))) return fail(6);
+    if (op == 0x66) {      // adcx (66), adox (F3), with an optional new destination
+      if (pp != 1 && pp != 2) return fail(6);
+      if (!nd && v != 0) return fail(6);
+      d_.operand16 = false;
+      const uint32_t start = d_.position;
+      if (!decode_modrm() || !finish_decode()) return bad_decode();
+      const uint32_t dest = d_.reg;
+      d_.position = start;
+      d_.truncated = false;
+      const uint64_t old = s_.r[dest];
+      const Step r = adx_instruction(m, pp == 2);
+      if (r != Step::Ok) return r;
+      if (nd) {
+        const uint64_t result = s_.r[dest];
+        s_.r[dest] = old;
+        s_.r[v] = result;
+      }
+      return Step::Ok;
+    }
+    if (op == 0xF0 || op == 0xF1) {      // crc32 (no prefix, or 66 for the 16-bit source)
+      if (pp > 1 || (op == 0xF0 && pp != 0)) return fail(6);
+      d_.repne = true;
+      return crc32_instruction(m, op);
+    }
+    if (op == 0x60 || op == 0x61) {      // movbe, which also has register forms here
+      if (pp > 1) return fail(6);
+      if (!decode_modrm() || !finish_decode()) return bad_decode();
+      auto swap = [&](uint64_t value) { uint64_t out = 0; for (uint32_t i = 0; i < osize; ++i) out = (out << 8) | ((value >> (8 * i)) & 0xFF); return out; };
+      if (op == 0x60) {
+        uint64_t value = 0;
+        if (!read_rm(m, osize, &value)) return Step::Fault;
+        set_reg(d_.reg, osize, swap(value));
+      } else if (d_.mod == 3) {
+        set_reg(d_.rm, osize, swap(get_reg(d_.reg, osize)));
+      } else if (!store(m, memory_address(), osize, swap(get_reg(d_.reg, osize)))) {
+        return Step::Fault;
+      }
+      s_.rip += d_.position;
+      return Step::Ok;
+    }
+    if (op == 0xF9) {      // movdiri
+      if (pp != 0) return fail(6);
+      return direct_store(m, op);
+    }
+    if (op == 0xF8) {      // movdir64b
+      if (pp != 1) return fail(6);
+      d_.operand16 = false;
+      return direct_store(m, op);
+    }
+    d_.operand16 = false;      // aadd (NP), aand (66), axor (F3), aor (F2)
+    return rao_instruction(m, pp == 0 ? 0 : pp == 1 ? 1 : pp == 2 ? 3 : 2);
   }
 
   // --- CMOVcc, CFCMOVcc, SETcc ---
@@ -254,6 +311,40 @@ X86_64Cpu::Step X86_64Cpu::apx_map4(GuestMemory& m, uint8_t p0, uint8_t p1, uint
     s_.r[d_.reg] &= mask;
   }
   return Step::Ok;
+}
+
+// The VEX instructions that APX promotes into the extended EVEX prefix with the same map and opcode: the BMI group (andn, bextr, blsi, blsmsk, blsr, bzhi, mulx, pdep, pext, rorx, sarx, shlx, shrx),
+// kmov, cmpccxadd and the AMX tile loads and stores. The prefix gives them R16..R31 for the registers and the memory base and index; the payload bits other than V4 and NF must be zero, and U must be 1
+// with a register operand. NF suppresses the status flags of andn, bextr, blsi, blsmsk, blsr and bzhi.
+X86_64Cpu::Step X86_64Cpu::apx_promoted_vex(GuestMemory& m, uint8_t p0, uint8_t p1, uint8_t p2, uint32_t map, uint8_t op) {
+  auto bad_decode = [&]() { return fail(d_.available < 15 ? 14 : 6, s_.rip + d_.available); };
+  const bool bmi = (map == 2 && (op == 0xF2 || op == 0xF3 || op == 0xF5 || op == 0xF6 || op == 0xF7)) || (map == 3 && op == 0xF0);
+  const bool kmov = map == 1 && op >= 0x90 && op <= 0x93;
+  const bool amx = map == 2 && (op == 0x49 || op == 0x4B);
+  const bool cmpxadd = map == 2 && (op & 0xF0) == 0xE0;
+  if (!bmi && !kmov && !amx && !cmpxadd) return fail(6);
+  if (d_.position >= d_.available) return bad_decode();
+  const bool is_reg = (d_.bytes[d_.position] >> 6) == 3, u = p1 & 4, nf = p2 & 4;
+  if (p2 & ~0x0C) return fail(6);      // payload byte 3: only V4 and NF may be set (so L must be 0)
+  if (is_reg && !u) return fail(6);
+  const uint32_t pp = p1 & 3;
+  const bool nf_ok = map == 2 && pp == 0 && (op == 0xF2 || op == 0xF3 || op == 0xF5 || op == 0xF7);
+  if (nf && !nf_ok) return fail(6);
+  d_.rex_b4 = p0 & 8;
+  d_.rex_x4 = !is_reg && !u;
+  if (!amx) d_.rex_r4 = !(p0 & 0x10);      // (the tile register is not a GPR: R4 is ignored)
+  d_.rex2 = true;
+  vex_.wide = false;
+  const uint32_t vvvv = ((~(p1 >> 3)) & 15) | ((p2 & 8) ? 0u : 16u);
+  const bool w = p1 >> 7;
+  const uint64_t saved_flags = s_.rflags;
+  Step r;
+  if (bmi) r = vex_bmi(m, static_cast<int>(map), op, w, vvvv);
+  else if (kmov) r = kmask_instruction(m, 1, op, w, vvvv);
+  else if (amx) r = amx_instruction(m, op, vvvv);
+  else r = cmpxadd_instruction(m, op, w, vvvv);
+  if (r == Step::Ok && nf) s_.rflags = (s_.rflags & ~kStatus) | (saved_flags & kStatus);
+  return r;
 }
 
 }  // namespace emulation

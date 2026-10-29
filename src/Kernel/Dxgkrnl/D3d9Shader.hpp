@@ -70,6 +70,8 @@ class D3d9Program {
   // limit is lower cannot run it.
   uint32_t constant_bytes() const { return constant_registers_ * 16; }
   bool uses_textures() const { return uses_textures_; }
+  // What the pixel shader declared texture unit `unit` to be (a DXBC dcl_resource; the others: 2D). Binding another kind to the unit makes a draw wrong, so the kernel refuses it.
+  graphics::TextureKind texture_kind(uint32_t unit) const { return unit < graphics::kMaxTextureUnits ? texture_kind_[unit] : graphics::TextureKind::Texture2D; }
 
   // What a device must have for the program to run as written (graphics::DeviceFeature bits): a program that reads system values needs kFeatureSystemInputs (without it they read as
   // zero), one that fetches texels, samples at a level or asks the size of a texture kFeatureTexelAccess.
@@ -119,6 +121,7 @@ class D3d9Program {
   graphics::ShaderStage stage_ = graphics::ShaderStage::Vertex;
   uint32_t major_ = 0, minor_ = 0;
   bool uses_textures_ = false;
+  graphics::TextureKind texture_kind_[graphics::kMaxTextureUnits] = {};
   bool uses_system_values_ = false, uses_texel_access_ = false;
   uint32_t color_outputs_ = 1;
   uint32_t constant_registers_ = kPushConstantRegisters;

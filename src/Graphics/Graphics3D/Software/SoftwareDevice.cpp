@@ -61,7 +61,7 @@ class SoftwareImage final : public IImage {
  public:
   SoftwareImage(allocators::IAllocator& allocator, const ImageDesc& desc) : allocator_(allocator), desc_(desc) {
     const uint64_t count = uint64_t{desc.extent.width} * desc.extent.height;
-    uint64_t total = count;
+    uint64_t total = count * layer_count();   // (layers: one level each)
     // The levels of a mipmapped image follow level 0 in the same storage, each as tight rows.
     for (uint32_t level = 1; level < desc.mip_levels && level < kMaxMipLevels; ++level) {
       level_offset_[level] = total;
@@ -88,6 +88,22 @@ class SoftwareImage final : public IImage {
   }
   bool valid() const { return (!color_.empty() || !hdr_.empty() || !depth_.empty()) && (!desc_.stencil || !stencil_.empty()); }
   uint32_t mip_levels() const override { return desc_.mip_levels; }
+  uint32_t layer_count() const override { return desc_.kind == TextureKind::Texture2D ? 1 : desc_.kind == TextureKind::TextureCube ? 6 : desc_.layers; }
+  TextureKind kind() const { return desc_.kind; }
+  bool write_layer_pixels(uint32_t layer, ArrayView<const uint32_t> pixels) override {
+    if (color_.empty() || layer >= layer_count() || desc_.mip_levels != 1) return false;
+    const Surface s = surface(0, layer);
+    if (pixels.size() != uint64_t{s.width} * s.height) return false;
+    for (uint64_t i = 0; i < pixels.size(); ++i) s.pixels[i] = s.encode(pixels[i]);
+    return true;
+  }
+  bool read_layer_pixels(uint32_t layer, ArrayView<uint32_t> out) override {
+    if (color_.empty() || layer >= layer_count() || desc_.mip_levels != 1) return false;
+    const Surface s = surface(0, layer);
+    if (out.size() < uint64_t{s.width} * s.height) return false;
+    for (uint64_t i = 0; i < uint64_t{s.width} * s.height; ++i) out[i] = s.decode(s.pixels[i]);
+    return true;
+  }
   Extent2D extent() const override { return desc_.extent; }
   Format format() const override { return desc_.format; }
   uint32_t usage() const { return desc_.usage; }
@@ -140,9 +156,9 @@ class SoftwareImage final : public IImage {
     }
     return true;
   }
-  Surface surface(uint32_t level = 0) const {
+  Surface surface(uint32_t level = 0, uint32_t layer = 0) const {
     Surface s;
-    const uint64_t offset = level == 0 ? 0 : level_offset_[level];
+    const uint64_t offset = level == 0 ? uint64_t{layer} * desc_.extent.width * desc_.extent.height : level_offset_[level];
     s.width = mip_extent(desc_.extent.width, level);
     s.height = mip_extent(desc_.extent.height, level);
     if (!hdr_.empty()) s.floats = hdr_;
@@ -240,6 +256,42 @@ class TextureSet final : public ITextureSet {
     for (uint32_t unit = 0; unit < kMaxTextureUnits; ++unit) lambda_[unit] = 0.0f;
   }
 
+  Vec4 sample_volume(uint32_t unit, float u, float v, float w) const override {
+    const SoftwareImage* image = image_for(unit);
+    if (!image) return {0, 0, 0, 1};
+    if (image->kind() == TextureKind::Texture2D) return sample(unit, u, v);
+    if (recording_) return {0, 0, 0, 1};
+    SamplerDesc sampler = samplers_[unit];
+    const uint32_t layers = image->layer_count();
+    w = unit_coordinate(w);
+    if (image->kind() == TextureKind::TextureCube) {
+      // The face is the axis the direction is longest along; the point on it is the other two components over that one (the usual table: +X looks along -z with t down -y, ...).
+      const float ax = u < 0 ? -u : u, ay = v < 0 ? -v : v, az = w < 0 ? -w : w;
+      float major, sc, tc;
+      uint32_t face;
+      if (ax >= ay && ax >= az) face = u >= 0 ? 0 : 1, major = ax, sc = u >= 0 ? -w : w, tc = -v;
+      else if (ay >= az) face = v >= 0 ? 2 : 3, major = ay, sc = u, tc = v >= 0 ? w : -w;
+      else face = w >= 0 ? 4 : 5, major = az, sc = w >= 0 ? u : -u, tc = -v;
+      if (!(major > 0.0f)) return texel_at(*image, 0, sampler, 0.5f, 0.5f);
+      sampler.address_u = sampler.address_v = AddressMode::ClampToEdge;
+      return texel_at(*image, face, sampler, (sc / major + 1.0f) * 0.5f, (tc / major + 1.0f) * 0.5f);
+    }
+    const float depth = static_cast<float>(layers);
+    if (image->kind() == TextureKind::Texture2DArray) {
+      int64_t layer = floor_to(w + 0.5f);
+      layer = layer < 0 ? 0 : layer >= layers ? layers - 1 : layer;
+      return texel_at(*image, static_cast<uint32_t>(layer), sampler, u, v);
+    }
+    // A volume: the slice the point lies in, or the two around it blended.
+    auto clamp_layer = [&](int64_t i) { return static_cast<uint32_t>(i < 0 ? 0 : i >= layers ? layers - 1 : i); };
+    if (sampler.filter == Filter::Nearest) return texel_at(*image, clamp_layer(floor_to(w * depth)), sampler, u, v);
+    const float fz = w * depth - 0.5f;
+    const int64_t z0 = floor_to(fz);
+    const float tz = fz - static_cast<float>(z0);
+    const Vec4 a = texel_at(*image, clamp_layer(z0), sampler, u, v), b = texel_at(*image, clamp_layer(z0 + 1), sampler, u, v);
+    return a * (1.0f - tz) + b * tz;
+  }
+
   Vec4 sample(uint32_t unit, float u, float v) const override {
     const SoftwareImage* image = image_for(unit);
     if (!image) return {0, 0, 0, 1};
@@ -302,8 +354,10 @@ class TextureSet final : public ITextureSet {
     return a * (1.0f - fraction) + b * fraction;
   }
 
-  static Vec4 sample_level(const SoftwareImage& image, uint32_t level, const SamplerDesc& sampler, float u, float v) {
-    const Surface surface = image.surface(level);
+  static Vec4 texel_at(const SoftwareImage& image, uint32_t layer, const SamplerDesc& sampler, float u, float v) { return sample_level(image, 0, sampler, u, v, layer); }
+
+  static Vec4 sample_level(const SoftwareImage& image, uint32_t level, const SamplerDesc& sampler, float u, float v, uint32_t layer = 0) {
+    const Surface surface = image.surface(level, layer);
     const int64_t w = surface.width, h = surface.height;
     if (sampler.filter == Filter::Nearest) {
       return texel(surface, index(floor_to(unit_coordinate(u) * static_cast<float>(w)), w, sampler.address_u), index(floor_to(unit_coordinate(v) * static_cast<float>(h)), h, sampler.address_v));
@@ -531,15 +585,19 @@ void write_fragment(const DrawState& s, int32_t x, int32_t y, float z, bool dept
     const SoftwareImage* image = n == 0 ? s.color : s.extra_colors[n - 1];
     if (!image) break;
     const Surface surface = image->surface();
+    // (the state of this target: its own with independent blending, which has no source-over shorthand)
+    const bool own = pd.independent_blend && n > 0;
+    const BlendState& blend = own ? pd.target_blend[n - 1] : pd.blend;
+    const bool over = !own && !blend.custom && pd.alpha_blend;
     if (!surface.floats.empty()) {
       Vec4* pixel = surface.float_row(static_cast<uint32_t>(y)) + x;
-      *pixel = image->store_float(blend_float(pd.blend, !pd.blend.custom && pd.alpha_blend, colors[n], *pixel));
+      *pixel = image->store_float(blend_float(blend, over, colors[n], *pixel));
       continue;
     }
     uint32_t out = pack_color(colors[n]);
     uint32_t* pixel = surface.row(static_cast<uint32_t>(y)) + x;
-    if (pd.blend.custom) out = blend_pixel(pd.blend, out, surface.decode(*pixel));
-    else if (pd.alpha_blend) out = blend_over(out, surface.decode(*pixel));
+    if (blend.custom) out = blend_pixel(blend, out, surface.decode(*pixel));
+    else if (over) out = blend_over(out, surface.decode(*pixel));
     *pixel = surface.encode(out);
   }
   if (pd.depth_write && !depth.empty()) depth[index] = z;
@@ -823,6 +881,15 @@ IImage* SoftwareDevice::create_image(const ImageDesc& desc) {
   if (!desc.extent.width || !desc.extent.height || desc.format == Format::Undefined) return nullptr;
   // Levels need a colour image to sample, and no more than the extent has.
   if (desc.mip_levels == 0 || desc.mip_levels > mip_level_limit(desc.extent) || desc.mip_levels > kMaxMipLevels || (desc.mip_levels > 1 && (desc.format == Format::D32Float || !(desc.usage & kImageSampled)))) return nullptr;
+  if (desc.kind != TextureKind::Texture2D) {
+    // (layered images are sampled only: one level, 8-bit colour)
+    const uint32_t layers = desc.kind == TextureKind::TextureCube ? 6 : desc.layers;
+    if (desc.usage != kImageSampled || desc.mip_levels != 1 || layers == 0 || layers > kMaxTextureLayers || desc.format == Format::D32Float || is_float_format(desc.format) ||
+        (desc.kind == TextureKind::TextureCube && desc.extent.width != desc.extent.height))
+      return nullptr;
+  } else if (desc.layers != 1) {
+    return nullptr;
+  }
   SoftwareImage* image = make<SoftwareImage>(allocator_, allocator_, desc);
   if (image && !image->valid()) {
     destroy(allocator_, image);

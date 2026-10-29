@@ -109,7 +109,10 @@ int8_t semantic_slot(uint32_t usage, uint32_t index) {
 }  // namespace
 
 uint32_t D3d9Program::required_features() const {
-  return (uses_system_values_ ? graphics::kFeatureSystemInputs : 0u) | (uses_texel_access_ ? graphics::kFeatureTexelAccess : 0u) |
+  uint32_t kinds = 0;
+  for (graphics::TextureKind k : texture_kind_)
+    if (k != graphics::TextureKind::Texture2D) kinds = graphics::kFeatureTextureKinds;
+  return kinds | (uses_system_values_ ? graphics::kFeatureSystemInputs : 0u) | (uses_texel_access_ ? graphics::kFeatureTexelAccess : 0u) |
          (color_outputs_ > 1 ? graphics::kFeatureMultipleTargets : 0u);
 }
 
@@ -707,7 +710,7 @@ void D3d9Program::execute(State& s) const {
           u *= inv, v *= inv;
         }
         if (s.textures) {
-          const graphics::Vec4 t = s.textures->sample(unit, u, v);
+          const graphics::Vec4 t = (unit >= graphics::kMaxTextureUnits || texture_kind_[unit] == graphics::TextureKind::Texture2D) ? s.textures->sample(unit, u, v) : s.textures->sample_volume(unit, u, v, ins.control & 1 ? a.f[2] * (a.f[3] == 0 ? 0.0f : 1.0f / a.f[3]) : a.f[2]);
           const float texel[4] = {t.x, t.y, t.z, t.w};
           b = {{texel[ins.tex_swizzle[0]], texel[ins.tex_swizzle[1]], texel[ins.tex_swizzle[2]], texel[ins.tex_swizzle[3]]}};
         }

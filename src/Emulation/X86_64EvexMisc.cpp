@@ -564,7 +564,7 @@ X86_64Cpu::Step X86_64Cpu::evex_vsib(GuestMemory& m, const EvexOp& def) {
   const uint8_t sib = next_u8();
   const uint32_t scale = sib >> 6;
   const uint32_t index = ((sib >> 3) & 7) | (d_.rex_x ? 8 : 0) | ((ev_.vvvv & 16) ? 16 : 0);
-  const uint32_t base_reg = (sib & 7) | (d_.rex_b ? 8 : 0);
+  const uint32_t base_reg = (sib & 7) | d_.ext_b();
   const bool no_base = (sib & 7) == 5 && mod == 0;
   int64_t disp = 0;
   const uint32_t elem = def.elem, index_bits = def.sub;

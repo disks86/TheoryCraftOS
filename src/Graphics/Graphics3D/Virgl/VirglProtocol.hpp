@@ -86,7 +86,7 @@ constexpr uint32_t kBindScanout = 1u << 18;
 constexpr uint32_t kQueryOcclusionCounter = 0;   // PIPE_QUERY_OCCLUSION_COUNTER
 constexpr uint32_t kQueryStateDone = 1;         // virgl_host_query_state::query_state once the host wrote the result (state, size, 64-bit result: 16 bytes)
 constexpr uint32_t kTargetBuffer = 0;
-constexpr uint32_t kTargetTexture2d = 2;
+constexpr uint32_t kTargetTexture2d = 2, kTargetTexture3d = 3, kTargetTextureCube = 4, kTargetTexture2dArray = 7;   // (PIPE_TEXTURE_*)
 constexpr uint32_t kShaderVertex = 0;
 constexpr uint32_t kShaderFragment = 1;
 constexpr uint32_t kPrimPoints = 0, kPrimLines = 1, kPrimTriangles = 4;

@@ -66,6 +66,7 @@ void X86_64Cpu::reset(const process::ProgramStart& start) {
   s_.rflags = 0x202;
   fault_ = GuestFault();
   retired_ = 0;
+  lwp_ = Lwp();
 }
 
 bool X86_64Cpu::pending_syscall(process::SyscallAbi abi, process::SyscallRequest* out) const {
@@ -1077,10 +1078,11 @@ X86_64Cpu::Step X86_64Cpu::step_0f_op(GuestMemory& m, uint8_t op) {
     case 0xC3: return movnti(m);
     case 0x38: {      // 0F 38 F0 / F1: movbe
       const uint8_t second = next_u8();
-      if (d_.apx_high() && second != 0xF0 && second != 0xF1 && second != 0xF6 && second != 0xF8 && second != 0xF9) return fail(6);
+      if (d_.apx_high() && second != 0xF0 && second != 0xF1 && second != 0xF6 && second != 0xF8 && second != 0xF9 && second != 0xFC) return fail(6);
       if (d_.truncated) return bad_decode();
       if ((second == 0xF0 || second == 0xF1) && d_.repne) return crc32_instruction(m, second);
       if (second == 0xF6 && (d_.operand16 || d_.rep) && !d_.repne) return adx_instruction(m, d_.rep);
+      if (second == 0xFC && !(d_.rep && d_.repne)) return rao_instruction(m, d_.repne ? 2 : d_.rep ? 3 : d_.operand16 ? 1 : 0);
       if ((second == 0xF9 && !d_.operand16 && !d_.rep && !d_.repne) || (second == 0xF8 && d_.operand16 && !d_.rep && !d_.repne)) return direct_store(m, second);
       if (!d_.operand16 && !d_.rep && !d_.repne && second >= 0xC8 && second <= 0xCD) return crypto_map(m, 2, second, false, 0);      // the SHA extensions
       if (mmx_ssse3_opcode(2, second)) return mmx_ssse3(m, 2, second);
@@ -1157,7 +1159,7 @@ X86_64Cpu::Step X86_64Cpu::step_0f_op(GuestMemory& m, uint8_t op) {
         dx = (1u << 4) | (1u << 8) | (1u << 15) | (1u << 23) | (1u << 24) | (1u << 25) | (1u << 26);      // TSC, CX8, CMOV, MMX, FXSR, SSE, SSE2
         c = (1u << 0) | (1u << 9) | (1u << 12) | (1u << 19) | (1u << 20) | (1u << 22) | (1u << 23) | (1u << 26) | (1u << 27) | (1u << 28) | (1u << 29) | (1u << 1) | (1u << 25) | (1u << 13) | (1u << 30);      // SSE3, SSSE3, FMA, CMPXCHG16B, SSE4.1, SSE4.2, MOVBE, POPCNT, XSAVE, OSXSAVE, AVX, F16C, RDRAND, PCLMULQDQ, AES
       } else if (leaf == 7 && static_cast<uint32_t>(s_.r[1]) == 1) {
-        a = (1u << 0) | (1u << 1) | (1u << 2) | (1u << 4) | (1u << 5) | (1u << 21) | (1u << 23);      // SHA512, SM3, SM4, AVX-VNNI, AVX512_BF16, AMX-FP16, AVX-IFMA
+        a = (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 4) | (1u << 5) | (1u << 7) | (1u << 21) | (1u << 23);      // SHA512, SM3, SM4, RAO-INT, AVX-VNNI, AVX512_BF16, CMPCCXADD, AMX-FP16, AVX-IFMA
         dx = (1u << 4) | (1u << 5) | (1u << 8) | (1u << 10) | (1u << 19) | (1u << 21);      // AVX-VNNI-INT8, AVX-NE-CONVERT, AVX-VNNI-INT16, APX_F, AVX10
       } else if (leaf == 7 && static_cast<uint32_t>(s_.r[1]) == 0) {
         b = (1u << 0) | (1u << 3) | (1u << 5) | (1u << 8) | (1u << 18) | (1u << 19) | (1u << 23) | (1u << 24) | (1u << 26) | (1u << 27) | (1u << 29) | (1u << 16) | (1u << 17) | (1u << 21) | (1u << 28) | (1u << 30) | (1u << 31);      // BMI1, AVX2, BMI2, SHA, AVX512F, DQ, IFMA, CD, BW, VL
@@ -1165,8 +1167,8 @@ X86_64Cpu::Step X86_64Cpu::step_0f_op(GuestMemory& m, uint8_t op) {
         dx = (1u << 2) | (1u << 3) | (1u << 8) | (1u << 11) | (1u << 22) | (1u << 23) | (1u << 24) | (1u << 25);      // AVX512_4VNNIW, AVX512_4FMAPS, AVX512_VP2INTERSECT, RTM_ALWAYS_ABORT, AMX-BF16, AVX512_FP16, AMX-TILE, AMX-INT8
       } else if (leaf == 0xD) {
         const uint32_t sub = static_cast<uint32_t>(s_.r[1]);
-        if (sub == 0) { a = 0xE00E7; b = 11136; c = 11136; }      // x87, SSE, AVX and the AVX-512 state; 512 + 64 + 256 + ... bytes
-        else if (sub == 1) { a = 3; b = 10816; }      // XSAVEOPT, XSAVEC; the compacted size of all the components
+        if (sub == 0) { a = 0xE00E7; b = 11136; c = 11136; dx = 0x40000000; }      // x87, SSE, AVX and the AVX-512 state; 512 + 64 + 256 + ... bytes
+        else if (sub == 1) { a = 7; b = 10944; }      // XSAVEOPT, XSAVEC, XGETBV with ECX = 1; the compacted size of all the components
         else if (sub == 2) { a = 256; b = 576; }      // the AVX component: 256 bytes at offset 576
         else if (sub == 5) { a = 64; b = 1088; }      // opmask registers
         else if (sub == 6) { a = 512; b = 1152; }      // the upper halves of ZMM0..15
@@ -1174,19 +1176,25 @@ X86_64Cpu::Step X86_64Cpu::step_0f_op(GuestMemory& m, uint8_t op) {
         else if (sub == 17) { a = 64; b = 2752; c = 2; }      // TILECFG (64-byte aligned in the compacted format)
         else if (sub == 18) { a = 8192; b = 2816; c = 2; }      // TILEDATA
         else if (sub == 19) { a = 128; b = 11008; }      // APX: R16..R31
+        else if (sub == 62) { a = 128; b = 832; }      // LWP
       } else if (leaf == 0x1D) {      // AMX tile palettes: one, with 8 tiles of 16 rows of 64 bytes
         const uint32_t sub = static_cast<uint32_t>(s_.r[1]);
         if (sub == 0) a = 1;
         else if (sub == 1) { a = 8192 | (1024u << 16); b = 64 | (8u << 16); c = 16; }
       } else if (leaf == 0x1E && static_cast<uint32_t>(s_.r[1]) == 0) {      // TMUL: maximum K 16 rows, maximum N 64 bytes
         b = 16 | (64u << 8);
-      } else if (leaf == 0x24 && static_cast<uint32_t>(s_.r[1]) == 0) {      // AVX10 enumeration: converged version 1 (the AVX-512 set, without the new AVX10.2 instructions), 128 / 256 / 512-bit vectors
+      } else if (leaf == 0x24 && static_cast<uint32_t>(s_.r[1]) == 0) {      // AVX10 enumeration: converged version 2 (the AVX-512 set and the AVX10.2 instructions), 128 / 256 / 512-bit vectors
         a = 0;
-        b = 1 | (7u << 16);
+        b = 2 | (7u << 16);
       } else if (leaf == 0x80000000u) {
-        a = 0x80000001u;
+        a = 0x8000001Cu;
+      } else if (leaf == 0x8000001Cu) {      // LWP: the value sample (LWPVAL) and LWPINS, continuous mode and time stamps; no hardware events, no interrupt. 32-byte records, a 136-byte LWPCB (17 quadwords),
+        a = 1u | (1u << 1) | (1u << 29) | (1u << 30);      // six event ids, the first event interval at offset 88, 32 records at least, version 1
+        b = 17u | (32u << 8) | (6u << 16) | (88u << 24);
+        c = (1u << 9) | (1u << 16);
+        dx = 1u | (1u << 1) | (1u << 29) | (1u << 30);
       } else if (leaf == 0x80000001u) {
-        c = (1u << 0) | (1u << 5) | (1u << 11) | (1u << 16) | (1u << 21);      // LAHF/SAHF, LZCNT, XOP, FMA4, TBM
+        c = (1u << 0) | (1u << 5) | (1u << 11) | (1u << 15) | (1u << 16) | (1u << 21);      // LAHF/SAHF, LZCNT, XOP, LWP, FMA4, TBM
         dx = (1u << 11) | (1u << 20) | (1u << 27) | (1u << 29);      // SYSCALL, NX, RDTSCP, long mode
       }
       s_.r[0] = a;

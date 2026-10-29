@@ -35,6 +35,18 @@
 
 namespace dxgk {
 
+namespace {
+// How TGSI names the texture target (the coordinate is then x y, x y z, x y layer, or a direction x y z).
+const char* dimension_name(graphics::TextureKind kind) {
+  switch (kind) {
+    case graphics::TextureKind::Texture3D: return "3D";
+    case graphics::TextureKind::Texture2DArray: return "2D_ARRAY";
+    case graphics::TextureKind::TextureCube: return "CUBE";
+    default: return "2D";
+  }
+}
+}  // namespace
+
 class TgsiEmitter {
  public:
   using Instr = D3d9Program::Instruction;
@@ -663,7 +675,7 @@ bool TgsiEmitter::instruction(const Instr& ins) {
       add_uint(sampler, unit);
       add(sampler, "]");
       String dim = str();
-      add(dim, "2D");
+      add(dim, dimension_name(p_.texture_kind(unit)));
       const String texel = swizzled ? temp(kWork2) : str();
       line((ins.control & 1) ? "TXP" : "TEX", swizzled ? &texel : &t, &coordinate, &sampler, &dim);
       if (swizzled) {
@@ -876,7 +888,9 @@ void TgsiEmitter::assemble(String* out) {
       add_uint(*out, i);
       add(*out, "]\nDCL SVIEW[");
       add_uint(*out, i);
-      add(*out, "], 2D, FLOAT\n");
+      add(*out, "], ");
+      add(*out, dimension_name(p_.texture_kind(i)));
+      add(*out, ", FLOAT\n");
     }
   }
   add(*out, "DCL CONST[0..");

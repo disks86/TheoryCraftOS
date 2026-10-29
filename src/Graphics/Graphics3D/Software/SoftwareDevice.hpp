@@ -32,7 +32,7 @@ class SoftwareDevice final : public IGraphicsDevice {
   SoftwareDevice(allocators::IAllocator& allocator, hardware::IGraphicsProcessingUnit* display)
       : allocator_(allocator), display_(display) {}
 
-  DeviceInfo info() const override { return {"software rasterizer", DeviceKind::Software, false, kMaxPushConstantBytes, kFeatureBlendState | kFeatureTexelAccess | kFeatureSystemInputs | kFeatureInstancing | kFeatureLines | kFeatureMultipleTargets | kFeatureFloatFormats | kFeatureOcclusionQueries}; }
+  DeviceInfo info() const override { return {"software rasterizer", DeviceKind::Software, false, kMaxPushConstantBytes, kFeatureBlendState | kFeatureTexelAccess | kFeatureSystemInputs | kFeatureInstancing | kFeatureLines | kFeatureMultipleTargets | kFeatureFloatFormats | kFeatureOcclusionQueries | kFeatureTextureKinds | kFeatureIndependentBlend}; }
 
   IBuffer* create_buffer(uint64_t size, uint32_t usage) override;
   void destroy_buffer(IBuffer* buffer) override;
