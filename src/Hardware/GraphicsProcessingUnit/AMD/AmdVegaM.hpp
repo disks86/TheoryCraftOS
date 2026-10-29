@@ -360,6 +360,8 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
   // For tests and diagnostics
   const AmdGmc8GartPlan& gart_plan() const { return gart_plan_; }
   const Layout& layout() const { return layout_; }
+  // The GPU address of the start of the framebuffer area (what offsets in upload() / download() are added to): for command buffers that name memory in it.
+  uint64_t framebuffer_gpu_address() const { return block_gpu_ + layout_.framebuffer; }
   AmdGfx8* graphics() { return gfx_.get(); }
   AmdSdma3* sdma() { return sdma_.get(); }
   AmdIh3* interrupts() { return ih_.get(); }

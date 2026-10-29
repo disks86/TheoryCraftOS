@@ -105,6 +105,8 @@ class X86_64Cpu final : public IGuestCpu {
     bool rip_relative = false;
     int64_t displacement = 0;
     uint64_t ea = 0;
+    bool sib_index = false;      // the SIB byte had an index register (AMX tile loads and stores use it as the row stride)
+    uint64_t index_offset = 0;   // the index register scaled, already part of `ea`
   };
 
   uint8_t next_u8();
@@ -136,6 +138,8 @@ class X86_64Cpu final : public IGuestCpu {
   Step step(GuestMemory& m);
   Step step_0f(GuestMemory& m);
   Step step_sse(GuestMemory& m, uint8_t opcode);
+  static bool sse_integer_valid(uint8_t op);
+  static bool sse_integer_core(uint8_t op, Xmm& dst, const Xmm& src);
   // The floating-point SSE/SSE2 opcodes (soft-float); sets *handled false for an opcode that is not one of them.
   Step step_float(GuestMemory& m, uint8_t opcode, bool* handled);
   bool read_scalar(GuestMemory& m, uint32_t size, uint64_t* out);
@@ -167,6 +171,7 @@ class X86_64Cpu final : public IGuestCpu {
   Step evex_fp(GuestMemory& m, const EvexOp& def);
   Step evex_fp16(GuestMemory& m, const EvexOp& def);
   Step evex_ext(GuestMemory& m, const EvexOp& def);
+  Step evex_er(GuestMemory& m, const EvexOp& def);      // X86_64Misc.cpp: AVX-512 ER
   Step evex_vsib(GuestMemory& m, const EvexOp& def);
   Vec512 get_vec(uint32_t reg) const;
   void set_vec(uint32_t reg, const Vec512& value, uint32_t vl_bits);
@@ -178,6 +183,35 @@ class X86_64Cpu final : public IGuestCpu {
   Step vex_fma(GuestMemory& m, uint8_t opcode, bool wide, uint32_t vvvv);
   Step vex_bmi(GuestMemory& m, int map, uint8_t opcode, bool wide, uint32_t vvvv);
   Step xsave_family(GuestMemory& m, uint32_t kind);
+  // X86_64Misc.cpp: the instructions that are neither SSE nor AVX nor x87 and did not fit the main switch
+  Step group9(GuestMemory& m);                          // 0F C7: cmpxchg8b/16b, xsavec, rdrand, rdseed, rdpid
+  // Intel AMX: the VEX-encoded tile instructions (0F38 map: 49, 4B, 5C, 5E, 6C).
+  Step amx_instruction(GuestMemory& m, uint8_t opcode, uint32_t vvvv);
+  Step amx_dot(uint32_t kind, uint32_t dst, uint32_t src1, uint32_t src2);
+  static bool tile_config_valid(ConstByteView config);
+  void tile_config_load(ConstByteView config);      // (valid, as checked by tile_config_valid)
+  void tile_release();
+  uint32_t tile_rows(uint32_t t) const { return tiles_.config[48 + t]; }
+  uint32_t tile_colsb(uint32_t t) const { return tiles_.config[16 + 2 * t] | (uint32_t{tiles_.config[17 + 2 * t]} << 8); }
+  bool tiles_configured() const { return tiles_.config[0] != 0; }
+  Step system_0f01(GuestMemory& m);                     // 0F 01 with a register operand: xgetbv, xend, xtest, rdtscp
+  Step adx_instruction(GuestMemory& m, bool overflow);  // adcx (66 0F 38 F6) and adox (F3 0F 38 F6)
+  Step fsgsbase_instruction(GuestMemory& m);            // F3 0F AE /0../3 with a register operand (already decoded): rdfsbase, rdgsbase, wrfsbase, wrgsbase
+  Step direct_store(GuestMemory& m, uint8_t op);        // 0F 38 F8 (movdir64b) / F9 (movdiri)
+  Step movnti(GuestMemory& m);                          // 0F C3
+  // X86_64Mmx.cpp
+  bool mmx_opcode(uint8_t op) const;                    // does this 0F opcode, with the prefixes seen, name an MMX instruction?
+  Step mmx_instruction(GuestMemory& m, uint8_t op);
+  Step mmx_convert(GuestMemory& m, uint8_t op);
+  bool mmx_ssse3_opcode(uint32_t map, uint8_t op) const;
+  Step mmx_ssse3(GuestMemory& m, uint32_t map, uint8_t op);
+  void mmx_enter();
+  uint64_t mmx_get(uint32_t index) const;
+  void mmx_set(uint32_t index, uint64_t value);
+  Step vex_via_evex(GuestMemory& m, uint32_t map, uint8_t op, bool wide_w, uint32_t vvvv);      // VEX forms of instructions that exist as EVEX (AVX-VNNI, AVX-IFMA, AVX-VNNI-INT8/16, vcvtneps2bf16)
+  Step vex_ne_convert(GuestMemory& m, uint8_t op, bool wide_w, uint32_t vvvv);      // AVX-NE-CONVERT
+  Step sse4a_bitfield(GuestMemory& m, uint8_t op);      // 66 0F 78 / 79 extrq, F2 0F 78 / 79 insertq
+  uint64_t next_random();
   bool read_y(GuestMemory& m, uint32_t bytes, Xmm out[2]);      // the r/m operand of a VEX instruction: a register or memory, 16 or 32 bytes
   struct VexState {
     bool redirect = false;      // the register r/m operand of an SSE core is read from the scratch slot
@@ -211,11 +245,18 @@ class X86_64Cpu final : public IGuestCpu {
   void save_fpu_image(uint8_t* image) const;      // the 512-byte FXSAVE layout
   void load_fpu_image(const uint8_t* image);
 
+  // The AMX state: TILECFG (palette 1: palette byte, start row, 16 column widths in bytes, 16 row counts) and TILEDATA (eight tiles of 16 rows of 64 bytes).
+  struct Tiles {
+    uint8_t config[64] = {};
+    uint8_t data[8][1024] = {};
+  };
+  Tiles tiles_;
   State s_;
   Decoded d_;
   GuestFault fault_;
   uint64_t retired_ = 0;
   uint64_t instruction_start_ = 0;
+  uint64_t random_state_ = 0;      // rdrand / rdseed: a counter-seeded generator (not a cryptographic source)
 };
 
 }  // namespace emulation

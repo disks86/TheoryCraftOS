@@ -36,6 +36,10 @@ uint32_t mailslot_io(Process& p, uint64_t slot, bool write, uint64_t status_bloc
 uint32_t mailslot_query_information(Process& p, uint64_t slot, uint32_t info_class, uint64_t status_block, uint64_t buffer, uint32_t length);
 uint32_t mailslot_set_information(Process& p, uint64_t slot, uint32_t info_class, uint64_t buffer, uint32_t length);
 // What closing, duplicating or inheriting a mailslot handle does: the reader's own handle closing destroys the mailslot; either end's token is reference-counted.
+// An asynchronous reader (CreateOptions without FILE_SYNCHRONOUS_IO) whose NtReadFile found no message gets STATUS_PENDING; the read is finished when the owner waits on the
+// handle: ready (the system lock held) says whether a message has come for the read pending on this handle, complete takes it into the buffer and the status block.
+bool mailslot_read_ready_locked(Process& p, uint64_t slot);
+uint32_t mailslot_complete_read(Process& p, uint64_t slot);
 void mailslot_token_add(uint64_t token);
 void mailslot_token_release(uint64_t token);
 

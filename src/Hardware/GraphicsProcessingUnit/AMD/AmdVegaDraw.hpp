@@ -1,0 +1,63 @@
+/*
+ * TheoryCraftOS - a minimal UEFI x86_64 operating system.
+ * Copyright (C) 2026 Christopher Schaefer
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+// A draw call on the Vega M's graphics engine: the shaders, constants, descriptors, vertices and indices are staged in system memory, copied to the framebuffer area of the card's
+// block by the SDMA engines (AmdVegaM::upload), the draw is submitted as an indirect buffer on the graphics ring (GcnState's packets), and the colour buffer is copied back. Compile
+// the shaders with GcnCompiler (TGSI in, the GCN3 code and its ShaderInfo out); GcnCp models what the ring does with the stream.
+//
+// The area is laid out from `area_offset` in this order, each piece 256 byte aligned: vertex code, pixel code, vertex constants, pixel constants, the descriptor table, the vertices, the
+// indices, the colour buffer. Not validated on a real card (see GcnState.hpp for what the stream leaves out).
+#pragma once
+
+#include <stdint.h>
+#include "Hardware/GraphicsProcessingUnit/AMD/AmdVegaM.hpp"
+#include "Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnDraw.hpp"
+#include "Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnState.hpp"
+
+namespace hardware {
+
+struct VegaDrawRequest {
+  ArrayView<const uint32_t> vertex_code, pixel_code;
+  gcn::ShaderInfo vertex_info, pixel_info;
+  ArrayView<const float> vertex_constants, pixel_constants;          // rows of four floats
+  ArrayView<const uint32_t> vertex_data;
+  uint32_t vertex_stride = 0;                                       // bytes
+  gcn::VertexAttribute attributes[gcn::abi::kMaxAttributes];
+  ArrayView<const uint32_t> indices;                                // a triangle list; empty: `vertex_count` vertices drawn in order
+  uint32_t vertex_count = 0;
+  uint8_t ps_param[16] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+  uint32_t width = 0, height = 0;
+  float clear[4] = {0, 0, 0, 0};                                    // what the colour buffer holds before the draw
+};
+
+class AmdVegaDraw {
+ public:
+  static constexpr uint64_t kAlignment = 256;
+  static uint32_t pitch_pixels(uint32_t width) { return (width + 7) / 8 * 8; }
+  // Bytes of the colour buffer as AmdVegaDraw::draw() returns them: float RGBA, rows of pitch_pixels(width) pixels.
+  static uint64_t target_bytes(const VegaDrawRequest& r) { return static_cast<uint64_t>(pitch_pixels(r.width)) * r.height * gcn::ColorTarget::kPixelBytes; }
+  // The bytes the area needs for the request (0 if it is not expressible), and so the size `staging` must have.
+  static uint64_t area_bytes(const VegaDrawRequest& r);
+
+  // Runs the draw. `staging` is system memory the card can reach (the memory upload() copies from), at least area_bytes() long; `pixels` receives the colour buffer (target_bytes() long;
+  // system memory the card can reach). `area_offset` is a multiple of 256 in the framebuffer area. False if the request is not expressible, does not fit the area, a transfer or the
+  // graphics ring fails; the colour buffer is then not valid.
+  static bool draw(AmdVegaM& card, const VegaDrawRequest& request, uint64_t area_offset, ByteView staging, ByteView pixels);
+};
+
+}  // namespace hardware

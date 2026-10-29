@@ -73,6 +73,7 @@ uint32_t result_status(ObjectManager::PipeResult r, bool server, bool write) {
     case ObjectManager::PipeResult::Ok: return kSuccess;
     case ObjectManager::PipeResult::Broken: return kPipeBroken;
     case ObjectManager::PipeResult::Closing: return kPipeClosing;
+    case ObjectManager::PipeResult::Listening: return 0xC00000B3u;      // STATUS_PIPE_LISTENING
     case ObjectManager::PipeResult::NotConnected: (void)server; (void)write; return kPipeDisconnected;
     default: return kPipeEmpty;
   }
@@ -319,8 +320,7 @@ uint32_t nt_fs_control_file(Process& p, const SyscallRequest& r) {
     }
     case 0x110004:      // FSCTL_PIPE_DISCONNECT
       if ((token & kFolder) || (token_end(token) & 1)) break;
-      objects->pipe_disconnect(id);
-      status = kSuccess;
+      status = objects->pipe_disconnect(id) ? kSuccess : kPipeDisconnected;
       break;
     case 0x11400C: {    // FSCTL_PIPE_PEEK: FILE_PIPE_PEEK_BUFFER { State, ReadDataAvailable, NumberOfMessages, MessageLength, Data[] }
       if (token & kFolder) break;
@@ -336,6 +336,7 @@ uint32_t nt_fs_control_file(Process& p, const SyscallRequest& r) {
       for (uint32_t i = 0; i < 4; ++i) { head[i] = uint8_t(state >> (8 * i)); head[4 + i] = uint8_t(available >> (8 * i)); head[12 + i] = uint8_t(got >> (8 * i)); }
       head[8] = available ? 1 : 0;
       if (res == ObjectManager::PipeResult::Broken && available == 0) { status = kPipeBroken; break; }
+      if (res == ObjectManager::PipeResult::Listening || (res == ObjectManager::PipeResult::NotConnected && !(end & 1))) { status = 0xC00000ADu; break; }      // STATUS_INVALID_PIPE_STATE (ERROR_BAD_PIPE): the server end has no connection
       if (res == ObjectManager::PipeResult::NotConnected) { status = kPipeDisconnected; break; }
       if (!p.write_user(output, ConstByteView(head, 16)) || (got != 0 && !p.write_user(output + 16, ConstByteView(data, got)))) return kAccessViolation;
       information = 16 + got;
@@ -369,6 +370,7 @@ uint32_t nt_fs_control_file(Process& p, const SyscallRequest& r) {
       }
       status = wait_until(p, timeout_ns, [&]() -> uint64_t {
         bool known = false;
+        if (!objects->pipe_name_exists_locked(StringView(name, n))) return 0xC0000034u;      // STATUS_OBJECT_NAME_NOT_FOUND: no such pipe at all
         if (objects->pipe_name_available_locked(StringView(name, n))) return kSuccess;
         (void)known;
         return kPending;

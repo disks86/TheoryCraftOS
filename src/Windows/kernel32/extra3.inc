@@ -509,11 +509,41 @@ static Port *port_of(HANDLE h) {
   LeaveCriticalSection(&g_atom_lock);
   return p;
 }
+/* The files tied to a port: an overlapped call that finishes on one queues a packet (its key, the bytes moved, the OVERLAPPED) there, unless the low bit of the event
+   handle is set. */
+EXPORT BOOL WINAPI PostQueuedCompletionStatus(HANDLE port, DWORD bytes, ULONG_PTR key, LPOVERLAPPED overlapped);
+typedef struct { HANDLE file, port; ULONG_PTR key; } PortLink;
+static PortLink g_links[64];
+static void port_link(HANDLE file, HANDLE port, ULONG_PTR key) {
+  atom_lock();
+  int free_slot = -1;
+  for (int i = 0; i < 64; ++i) {
+    if (g_links[i].file == file) { free_slot = i; break; }
+    if (free_slot < 0 && !g_links[i].file) free_slot = i;
+  }
+  if (free_slot >= 0) { g_links[free_slot].file = file; g_links[free_slot].port = port; g_links[free_slot].key = key; }
+  LeaveCriticalSection(&g_atom_lock);
+}
+static void port_unlink(HANDLE file) {
+  atom_lock();
+  for (int i = 0; i < 64; ++i) if (g_links[i].file == file) g_links[i].file = NULL;
+  LeaveCriticalSection(&g_atom_lock);
+}
+static void port_note(HANDLE file, LPOVERLAPPED overlapped, ULONG_PTR bytes) {
+  if (!overlapped || ((ULONG_PTR)overlapped->hEvent & 1)) return;
+  HANDLE port = NULL;
+  ULONG_PTR key = 0;
+  atom_lock();
+  for (int i = 0; i < 64; ++i) if (g_links[i].file && g_links[i].file == file) { port = g_links[i].port; key = g_links[i].key; break; }
+  LeaveCriticalSection(&g_atom_lock);
+  if (port) PostQueuedCompletionStatus(port, (DWORD)bytes, key, overlapped);
+}
 EXPORT HANDLE WINAPI CreateIoCompletionPort(HANDLE file, HANDLE existing, ULONG_PTR key, DWORD threads) {
-  (void)key; (void)threads;
+  (void)threads;
   if (existing) {
     if (!port_of(existing)) { set_error(ERROR_INVALID_PARAMETER); return NULL; }
-    return existing;      /* (associating a file changes nothing: its I/O completes at once) */
+    if (file != INVALID_HANDLE_VALUE) port_link(file, existing, key);
+    return existing;
   }
   Port *p = RtlAllocateHeap(heap(), HEAP_ZERO_MEMORY, sizeof(Port));
   if (!p) { set_error(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
@@ -526,7 +556,7 @@ EXPORT HANDLE WINAPI CreateIoCompletionPort(HANDLE file, HANDLE existing, ULONG_
   if (slot >= 0) g_ports[slot] = p;
   LeaveCriticalSection(&g_atom_lock);
   if (slot < 0) { CloseHandle(p->semaphore); RtlFreeHeap(heap(), 0, p); set_error(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
-  (void)file;
+  if (file != INVALID_HANDLE_VALUE && file) port_link(file, p->semaphore, key);
   return p->semaphore;
 }
 EXPORT BOOL WINAPI PostQueuedCompletionStatus(HANDLE port, DWORD bytes, ULONG_PTR key, LPOVERLAPPED overlapped) {

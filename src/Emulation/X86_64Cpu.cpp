@@ -110,7 +110,11 @@ bool X86_64Cpu::decode_modrm() {
     const uint32_t base = (sib & 7) | (d_.rex_b ? 8 : 0);
     if ((sib & 7) == 5 && d_.mod == 0) have_base = false;
     else address = s_.r[base];
-    if (index != 4) address += s_.r[index] << scale;
+    if (index != 4) {
+      d_.sib_index = true;
+      d_.index_offset = s_.r[index] << scale;
+      address += d_.index_offset;
+    }
   } else if (rm == 5 && d_.mod == 0) {
     have_base = false;
     d_.rip_relative = true;
@@ -314,6 +318,21 @@ uint64_t X86_64Cpu::shift(uint32_t op, uint64_t value, uint32_t count, uint32_t 
         f = (f & ~(kCarry | kOverflow)) | (carry ? kCarry : 0) | (((((result >> (bits - 1)) ^ (result >> (bits - 2))) & 1)) ? kOverflow : 0);
       }
       s_.rflags = f;
+      return result;
+    }
+    case 2: case 3: {      // rcl, rcr: a rotation of the value and the carry flag together (bits + 1 wide)
+      const uint32_t n = count % (bits + 1);
+      const unsigned __int128 ring_mask = (static_cast<unsigned __int128>(1) << (bits + 1)) - 1;
+      const unsigned __int128 ext = value | (static_cast<unsigned __int128>((f & kCarry) ? 1 : 0) << bits);
+      unsigned __int128 rotated = ext;
+      if (n) {
+        rotated = op == 2 ? ((ext << n) | (ext >> (bits + 1 - n))) & ring_mask : ((ext >> n) | (ext << (bits + 1 - n))) & ring_mask;
+      }
+      result = static_cast<uint64_t>(rotated) & mask_of(size);
+      carry = ((rotated >> bits) & 1) != 0;
+      const bool msb = ((result >> (bits - 1)) & 1) != 0;
+      const bool overflow = op == 2 ? (msb != carry) : (msb != (((result >> (bits - 2)) & 1) != 0));      // (defined for a count of one)
+      s_.rflags = (f & ~(kCarry | kOverflow)) | (carry ? kCarry : 0) | (overflow ? kOverflow : 0);
       return result;
     }
     case 4: case 6:      // shl
@@ -708,6 +727,58 @@ X86_64Cpu::Step X86_64Cpu::step(GuestMemory& m) {
       advance();
       return Step::Ok;
     }
+    case 0xC8: {      // enter imm16, imm8
+      const uint64_t allocation = next_imm(2, false);
+      const uint32_t level = static_cast<uint32_t>(next_imm(1, false)) & 31;
+      if (!finish_decode()) return bad_decode();
+      uint64_t sp = s_.r[4] - 8;
+      if (!store(m, sp, 8, s_.r[5])) return Step::Fault;
+      const uint64_t frame = sp;
+      uint64_t bp = s_.r[5];
+      for (uint32_t i = 1; i < level; ++i) {      // copy the enclosing frames' pointers
+        bp -= 8;
+        uint64_t v = 0;
+        if (!load(m, bp, 8, &v)) return Step::Fault;
+        sp -= 8;
+        if (!store(m, sp, 8, v)) return Step::Fault;
+      }
+      if (level > 0) {
+        sp -= 8;
+        if (!store(m, sp, 8, frame)) return Step::Fault;
+      }
+      s_.r[5] = frame;
+      s_.r[4] = sp - allocation;
+      advance();
+      return Step::Ok;
+    }
+    case 0xD7: {      // xlat: AL = [RBX + AL]
+      if (!finish_decode()) return bad_decode();
+      const uint64_t base = d_.segment == 1 ? s_.fs_base : d_.segment == 2 ? s_.gs_base : 0;
+      uint64_t v = 0;
+      if (!load(m, base + (d_.address32 ? (s_.r[3] & 0xFFFFFFFFu) : s_.r[3]) + (s_.r[0] & 0xFF), 1, &v)) return Step::Fault;
+      set_reg(0, 1, v);
+      advance();
+      return Step::Ok;
+    }
+    case 0xE0: case 0xE1: case 0xE2: {      // loopne, loope, loop: decrement RCX (ECX with an address-size prefix) and branch while it is not zero (and ZF agrees)
+      const int64_t displacement = static_cast<int64_t>(next_imm(1, true));
+      if (!finish_decode()) return bad_decode();
+      uint64_t counter = d_.address32 ? (s_.r[1] & 0xFFFFFFFFu) : s_.r[1];
+      counter = d_.address32 ? ((counter - 1) & 0xFFFFFFFFu) : counter - 1;
+      s_.r[1] = counter;      // (the 32-bit form clears the upper half)
+      const bool zero = (s_.rflags & kZero) != 0;
+      const bool taken = counter != 0 && (op == 0xE2 || (op == 0xE1 ? zero : !zero));
+      s_.rip += d_.position + (taken ? static_cast<uint64_t>(displacement) : 0);
+      return Step::Ok;
+    }
+    case 0x9E: case 0x9F: {      // sahf, lahf
+      if (!finish_decode()) return bad_decode();
+      constexpr uint64_t kLow = kCarry | kParity | kAdjust | kZero | kSign;
+      if (op == 0x9E) s_.rflags = (s_.rflags & ~kLow) | ((s_.r[0] >> 8) & kLow) | 2;
+      else s_.r[0] = (s_.r[0] & ~uint64_t{0xFF00}) | (((s_.rflags & kLow) | 2) << 8);
+      advance();
+      return Step::Ok;
+    }
     case 0x9D: {      // popfq: only the flags a user program may change
       if (!finish_decode()) return bad_decode();
       uint64_t v = 0;
@@ -765,7 +836,6 @@ X86_64Cpu::Step X86_64Cpu::step(GuestMemory& m) {
       else if (op >= 0xD2) count = static_cast<uint32_t>(s_.r[1] & 0xFF);
       if (!finish_decode()) return bad_decode();
       const uint32_t kind = d_.reg & 7;
-      if (kind == 2 || kind == 3) return fail(6);      // rcl / rcr
       uint64_t v = 0;
       if (!read_rm(m, size, &v)) return Step::Fault;
       const uint64_t r = shift(kind, v, count, size);
@@ -782,9 +852,23 @@ X86_64Cpu::Step X86_64Cpu::step(GuestMemory& m) {
       s_.rip = target;
       return Step::Ok;
     }
-    case 0xC6: case 0xC7: {      // mov r/m, imm
+    case 0xC6: case 0xC7: {      // mov r/m, imm; xabort (C6 F8 ib) and xbegin (C7 F8 rel32)
       const uint32_t size = op == 0xC6 ? 1 : osize;
       if (!decode_modrm()) return bad_decode();
+      if (d_.mod == 3 && (d_.reg & 7) == 7 && (d_.rm & 7) == 0) {
+        // Transactions always abort: a processor may abort any transaction at any time, and code has to have its fallback path.
+        if (op == 0xC6) {
+          next_imm(1, false);      // xabort outside a transaction does nothing
+          if (!finish_decode()) return bad_decode();
+          advance();
+          return Step::Ok;
+        }
+        const uint64_t displacement = next_imm(4, true);
+        if (!finish_decode()) return bad_decode();
+        s_.r[0] = 0;      // EAX: no abort reason, and not retryable
+        s_.rip += d_.position + displacement;
+        return Step::Ok;
+      }
       const uint64_t imm = next_imm(size == 8 ? 4 : size, true);
       if (!finish_decode()) return bad_decode();
       if ((d_.reg & 7) != 0) return fail(6);
@@ -953,20 +1037,17 @@ X86_64Cpu::Step X86_64Cpu::step_0f(GuestMemory& m) {
   if (d_.truncated) return bad_decode();
 
   switch (op) {
-    case 0x01: {      // xgetbv (0F 01 D0): XCR0 says x87, SSE and AVX state are enabled
-      if (!decode_modrm() || !finish_decode()) return bad_decode();
-      if (d_.mod != 3 || (d_.reg & 7) != 2 || (d_.rm & 7) != 0) return fail(6);
-      if (static_cast<uint32_t>(s_.r[1]) != 0) return fail(13);
-      s_.r[0] = 0xE7;      // x87, SSE, AVX, opmask, ZMM_Hi256 and Hi16_ZMM state
-      s_.r[2] = 0;
-      advance();
-      return Step::Ok;
-    }
+    case 0x01: return system_0f01(m);
+    case 0xC7: return group9(m);
+    case 0xC3: return movnti(m);
     case 0x38: {      // 0F 38 F0 / F1: movbe
       const uint8_t second = next_u8();
       if (d_.truncated) return bad_decode();
       if ((second == 0xF0 || second == 0xF1) && d_.repne) return crc32_instruction(m, second);
+      if (second == 0xF6 && (d_.operand16 || d_.rep) && !d_.repne) return adx_instruction(m, d_.rep);
+      if ((second == 0xF9 && !d_.operand16 && !d_.rep && !d_.repne) || (second == 0xF8 && d_.operand16 && !d_.rep && !d_.repne)) return direct_store(m, second);
       if (!d_.operand16 && !d_.rep && !d_.repne && second >= 0xC8 && second <= 0xCD) return crypto_map(m, 2, second, false, 0);      // the SHA extensions
+      if (mmx_ssse3_opcode(2, second)) return mmx_ssse3(m, 2, second);
       if (second != 0xF0 && second != 0xF1) return legacy_sse_map(m, 2, second);
       if (!decode_modrm() || !finish_decode()) return bad_decode();
       if (d_.mod == 3) return fail(6);
@@ -985,7 +1066,21 @@ X86_64Cpu::Step X86_64Cpu::step_0f(GuestMemory& m) {
       const uint8_t second = next_u8();
       if (d_.truncated) return bad_decode();
       if (!d_.operand16 && !d_.rep && !d_.repne && second == 0xCC) return crypto_map(m, 3, second, false, 0);      // sha1rnds4
+      if (mmx_ssse3_opcode(3, second)) return mmx_ssse3(m, 3, second);
       return legacy_sse_map(m, 3, second);
+    }
+    case 0xA0: case 0xA8: {      // push fs / push gs: the selector (zero here)
+      if (!finish_decode()) return bad_decode();
+      if (!push(m, 0)) return Step::Fault;
+      advance();
+      return Step::Ok;
+    }
+    case 0xA1: case 0xA9: {      // pop fs / pop gs: the selector is dropped (the base is not reloaded from a descriptor table)
+      if (!finish_decode()) return bad_decode();
+      uint64_t ignored = 0;
+      if (!pop(m, &ignored)) return Step::Fault;
+      advance();
+      return Step::Ok;
     }
     case 0x05:      // syscall
       if (!finish_decode()) return bad_decode();
@@ -1010,32 +1105,45 @@ X86_64Cpu::Step X86_64Cpu::step_0f(GuestMemory& m) {
       const uint32_t leaf = static_cast<uint32_t>(s_.r[0]);
       uint32_t a = 0, b = 0, c = 0, dx = 0;
       if (leaf == 0) {
-        a = 0xD;
+        a = 0x24;
         b = 0x534F4354u;      // "TCOS"
         dx = 0x34365F58u;     // "X_64"
         c = 0x554D455Fu;      // "_EMU"... in the ebx, edx, ecx order of the vendor string
       } else if (leaf == 1) {
         a = 0x00000F00u;
         dx = (1u << 4) | (1u << 8) | (1u << 15) | (1u << 23) | (1u << 24) | (1u << 25) | (1u << 26);      // TSC, CX8, CMOV, MMX, FXSR, SSE, SSE2
-        c = (1u << 0) | (1u << 9) | (1u << 12) | (1u << 19) | (1u << 20) | (1u << 22) | (1u << 23) | (1u << 26) | (1u << 27) | (1u << 28) | (1u << 29) | (1u << 1) | (1u << 25);      // SSE3, SSSE3, FMA, SSE4.1, SSE4.2, MOVBE, POPCNT, XSAVE, OSXSAVE, AVX, F16C, PCLMULQDQ, AES
+        c = (1u << 0) | (1u << 9) | (1u << 12) | (1u << 19) | (1u << 20) | (1u << 22) | (1u << 23) | (1u << 26) | (1u << 27) | (1u << 28) | (1u << 29) | (1u << 1) | (1u << 25) | (1u << 13) | (1u << 30);      // SSE3, SSSE3, FMA, CMPXCHG16B, SSE4.1, SSE4.2, MOVBE, POPCNT, XSAVE, OSXSAVE, AVX, F16C, RDRAND, PCLMULQDQ, AES
       } else if (leaf == 7 && static_cast<uint32_t>(s_.r[1]) == 1) {
-        a = (1u << 0) | (1u << 1) | (1u << 2) | (1u << 5);      // SHA512, SM3, SM4, AVX512_BF16
+        a = (1u << 0) | (1u << 1) | (1u << 2) | (1u << 4) | (1u << 5) | (1u << 21) | (1u << 23);      // SHA512, SM3, SM4, AVX-VNNI, AVX512_BF16, AMX-FP16, AVX-IFMA
+        dx = (1u << 4) | (1u << 5) | (1u << 8) | (1u << 10) | (1u << 19);      // AVX-VNNI-INT8, AVX-NE-CONVERT, AVX-VNNI-INT16, AVX10
       } else if (leaf == 7 && static_cast<uint32_t>(s_.r[1]) == 0) {
-        b = (1u << 3) | (1u << 5) | (1u << 8) | (1u << 29) | (1u << 16) | (1u << 17) | (1u << 21) | (1u << 28) | (1u << 30) | (1u << 31);      // BMI1, AVX2, BMI2, SHA, AVX512F, DQ, IFMA, CD, BW, VL
-        c = (1u << 1) | (1u << 6) | (1u << 8) | (1u << 9) | (1u << 10) | (1u << 11) | (1u << 12) | (1u << 14);      // VBMI, VBMI2, GFNI, VAES, VPCLMULQDQ, VNNI, BITALG, VPOPCNTDQ
-        dx = (1u << 2) | (1u << 3) | (1u << 8) | (1u << 23);      // AVX512_4VNNIW, AVX512_4FMAPS, AVX512_VP2INTERSECT, AVX512_FP16
+        b = (1u << 0) | (1u << 3) | (1u << 5) | (1u << 8) | (1u << 18) | (1u << 19) | (1u << 23) | (1u << 24) | (1u << 26) | (1u << 27) | (1u << 29) | (1u << 16) | (1u << 17) | (1u << 21) | (1u << 28) | (1u << 30) | (1u << 31);      // BMI1, AVX2, BMI2, SHA, AVX512F, DQ, IFMA, CD, BW, VL
+        c = (1u << 1) | (1u << 6) | (1u << 8) | (1u << 9) | (1u << 10) | (1u << 11) | (1u << 12) | (1u << 14) | (1u << 22) | (1u << 27) | (1u << 28);      // VBMI, VBMI2, GFNI, VAES, VPCLMULQDQ, VNNI, BITALG, VPOPCNTDQ, RDPID, MOVDIRI, MOVDIR64B
+        dx = (1u << 2) | (1u << 3) | (1u << 8) | (1u << 11) | (1u << 22) | (1u << 23) | (1u << 24) | (1u << 25);      // AVX512_4VNNIW, AVX512_4FMAPS, AVX512_VP2INTERSECT, RTM_ALWAYS_ABORT, AMX-BF16, AVX512_FP16, AMX-TILE, AMX-INT8
       } else if (leaf == 0xD) {
         const uint32_t sub = static_cast<uint32_t>(s_.r[1]);
-        if (sub == 0) { a = 0xE7; b = 2688; c = 2688; }      // x87, SSE, AVX and the AVX-512 state; 512 + 64 + 256 + ... bytes
+        if (sub == 0) { a = 0x600E7; b = 10752; c = 10752; }      // x87, SSE, AVX and the AVX-512 state; 512 + 64 + 256 + ... bytes
+        else if (sub == 1) { a = 3; b = 10688; }      // XSAVEOPT, XSAVEC; the compacted size of all the components
         else if (sub == 2) { a = 256; b = 576; }      // the AVX component: 256 bytes at offset 576
         else if (sub == 5) { a = 64; b = 1088; }      // opmask registers
         else if (sub == 6) { a = 512; b = 1152; }      // the upper halves of ZMM0..15
         else if (sub == 7) { a = 1024; b = 1664; }      // ZMM16..31
+        else if (sub == 17) { a = 64; b = 2752; c = 2; }      // TILECFG (64-byte aligned in the compacted format)
+        else if (sub == 18) { a = 8192; b = 2816; c = 2; }      // TILEDATA
+      } else if (leaf == 0x1D) {      // AMX tile palettes: one, with 8 tiles of 16 rows of 64 bytes
+        const uint32_t sub = static_cast<uint32_t>(s_.r[1]);
+        if (sub == 0) a = 1;
+        else if (sub == 1) { a = 8192 | (1024u << 16); b = 64 | (8u << 16); c = 16; }
+      } else if (leaf == 0x1E && static_cast<uint32_t>(s_.r[1]) == 0) {      // TMUL: maximum K 16 rows, maximum N 64 bytes
+        b = 16 | (64u << 8);
+      } else if (leaf == 0x24 && static_cast<uint32_t>(s_.r[1]) == 0) {      // AVX10 enumeration: converged version 1 (the AVX-512 set, without the new AVX10.2 instructions), 128 / 256 / 512-bit vectors
+        a = 0;
+        b = 1 | (7u << 16);
       } else if (leaf == 0x80000000u) {
         a = 0x80000001u;
       } else if (leaf == 0x80000001u) {
-        c = 1u << 5;      // LZCNT
-        dx = (1u << 11) | (1u << 20) | (1u << 29);      // SYSCALL, NX, long mode
+        c = (1u << 0) | (1u << 5);      // LAHF/SAHF, LZCNT
+        dx = (1u << 11) | (1u << 20) | (1u << 27) | (1u << 29);      // SYSCALL, NX, RDTSCP, long mode
       }
       s_.r[0] = a;
       s_.r[3] = b;
@@ -1231,7 +1339,8 @@ X86_64Cpu::Step X86_64Cpu::step_0f(GuestMemory& m) {
       if (!decode_modrm() || !finish_decode()) return bad_decode();
       const uint32_t kind = d_.reg & 7;
       if (d_.mod == 3) {
-        if (kind < 5) return fail(6);      // rdfsbase and friends
+        if (kind < 4 && d_.rep) return fsgsbase_instruction(m);
+        if (kind < 5) return fail(6);
       } else if (kind == 0 || kind == 1) {      // fxsave, fxrstor (the 16-byte alignment is not enforced)
         uint8_t image[512];
         if (kind == 0) {
@@ -1251,8 +1360,11 @@ X86_64Cpu::Step X86_64Cpu::step_0f(GuestMemory& m) {
       } else if (kind == 4 || kind == 5) {      // xsave, xrstor
         const Step r = xsave_family(m, kind);
         if (r != Step::Ok) return r;
-      } else if (kind != 7) {
-        return fail(6);      // xsaveopt and friends: not emulated
+      } else if (kind == 6 && !d_.operand16) {      // xsaveopt (66 0F AE /6 is clwb, a no-op below)
+        const Step r = xsave_family(m, 6);
+        if (r != Step::Ok) return r;
+      } else if (kind != 6 && kind != 7) {
+        return fail(6);
       }
       advance();
       return Step::Ok;
@@ -1264,27 +1376,156 @@ X86_64Cpu::Step X86_64Cpu::step_0f(GuestMemory& m) {
 
 // --- SSE2 integer and move instructions ------------------------------------------------------------------------------------------------------
 
+// The integer operations on two 128-bit values that the SSE2 integer opcodes (0F 60..7F, 0F D0..FF) share; the MMX forms run them on 64-bit values held in the low half.
+bool X86_64Cpu::sse_integer_valid(uint8_t op) {
+  switch (op) {
+    case 0x54: case 0x55: case 0x56: case 0x57: case 0xDB: case 0xDF: case 0xEB: case 0xEF:
+    case 0x60: case 0x61: case 0x62: case 0x6C: case 0x68: case 0x69: case 0x6A: case 0x6D:
+    case 0x74: case 0x75: case 0x76: case 0xFC: case 0xFD: case 0xFE: case 0xD4: case 0xF8: case 0xF9: case 0xFA: case 0xFB:
+    case 0xDA: case 0xDE: case 0x64: case 0x65: case 0x66:
+    case 0x63: case 0x67: case 0x6B: case 0xD5: case 0xE4: case 0xE5: case 0xF4: case 0xF5: case 0xF6:
+    case 0xDC: case 0xDD: case 0xD8: case 0xD9: case 0xEC: case 0xED: case 0xE8: case 0xE9: case 0xEA: case 0xEE: case 0xE0: case 0xE3:
+    case 0xD1: case 0xD2: case 0xD3: case 0xE1: case 0xE2: case 0xF1: case 0xF2: case 0xF3:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool X86_64Cpu::sse_integer_core(uint8_t op, Xmm& dst, const Xmm& src) {
+  auto unpack = [&](Xmm* d, const Xmm& s2, uint32_t width, bool high) {
+    const uint32_t lanes = 128 / width;
+    Xmm out;
+    for (uint32_t i = 0; i < lanes / 2; ++i) {
+      const uint32_t from = (high ? lanes / 2 : 0) + i;
+      lane_set(&out.lo, &out.hi, width, 2 * i, lane_get(d->lo, d->hi, width, from));
+      lane_set(&out.lo, &out.hi, width, 2 * i + 1, lane_get(s2.lo, s2.hi, width, from));
+    }
+    *d = out;
+  };
+  auto lanewise = [&](uint32_t width, auto fn) {
+    for (uint32_t i = 0; i < 128 / width; ++i) {
+      const uint64_t a = lane_get(dst.lo, dst.hi, width, i), b = lane_get(src.lo, src.hi, width, i);
+      lane_set(&dst.lo, &dst.hi, width, i, fn(a, b));
+    }
+  };
+  switch (op) {
+    case 0x54: case 0xDB: dst.lo &= src.lo; dst.hi &= src.hi; break;
+    case 0x55: case 0xDF: dst.lo = ~dst.lo & src.lo; dst.hi = ~dst.hi & src.hi; break;
+    case 0x56: case 0xEB: dst.lo |= src.lo; dst.hi |= src.hi; break;
+    case 0x57: case 0xEF: dst.lo ^= src.lo; dst.hi ^= src.hi; break;
+    case 0x60: unpack(&dst, src, 8, false); break;
+    case 0x61: unpack(&dst, src, 16, false); break;
+    case 0x62: unpack(&dst, src, 32, false); break;
+    case 0x6C: unpack(&dst, src, 64, false); break;
+    case 0x68: unpack(&dst, src, 8, true); break;
+    case 0x69: unpack(&dst, src, 16, true); break;
+    case 0x6A: unpack(&dst, src, 32, true); break;
+    case 0x6D: unpack(&dst, src, 64, true); break;
+    case 0x74: lanewise(8, [](uint64_t a, uint64_t b) { return a == b ? uint64_t{0xFF} : 0; }); break;
+    case 0x75: lanewise(16, [](uint64_t a, uint64_t b) { return a == b ? uint64_t{0xFFFF} : 0; }); break;
+    case 0x76: lanewise(32, [](uint64_t a, uint64_t b) { return a == b ? uint64_t{0xFFFFFFFFu} : 0; }); break;
+    case 0x64: lanewise(8, [](uint64_t a, uint64_t b) { return sign_extend(a, 1) > sign_extend(b, 1) ? uint64_t{0xFF} : 0; }); break;
+    case 0x65: lanewise(16, [](uint64_t a, uint64_t b) { return sign_extend(a, 2) > sign_extend(b, 2) ? uint64_t{0xFFFF} : 0; }); break;
+    case 0x66: lanewise(32, [](uint64_t a, uint64_t b) { return sign_extend(a, 4) > sign_extend(b, 4) ? uint64_t{0xFFFFFFFFu} : 0; }); break;
+    case 0xFC: lanewise(8, [](uint64_t a, uint64_t b) { return a + b; }); break;
+    case 0xFD: lanewise(16, [](uint64_t a, uint64_t b) { return a + b; }); break;
+    case 0xFE: lanewise(32, [](uint64_t a, uint64_t b) { return a + b; }); break;
+    case 0xD4: lanewise(64, [](uint64_t a, uint64_t b) { return a + b; }); break;
+    case 0xF8: lanewise(8, [](uint64_t a, uint64_t b) { return a - b; }); break;
+    case 0xF9: lanewise(16, [](uint64_t a, uint64_t b) { return a - b; }); break;
+    case 0xFA: lanewise(32, [](uint64_t a, uint64_t b) { return a - b; }); break;
+    case 0xFB: lanewise(64, [](uint64_t a, uint64_t b) { return a - b; }); break;
+    case 0x63: case 0x67: case 0x6B: {      // packsswb, packuswb, packssdw: narrow both registers' lanes with saturation
+      const uint32_t from = op == 0x6B ? 32 : 16, to = from / 2;
+      const bool is_unsigned = op == 0x67;
+      Xmm out;
+      const uint32_t lanes = 128 / from;
+      for (uint32_t i = 0; i < 2 * lanes; ++i) {
+        const Xmm& pick = i < lanes ? dst : src;
+        const int64_t v = sign_extend(lane_get(pick.lo, pick.hi, from, i % lanes), from / 8);
+        const int64_t top = is_unsigned ? (int64_t{1} << to) - 1 : (int64_t{1} << (to - 1)) - 1, bottom = is_unsigned ? 0 : -(int64_t{1} << (to - 1));
+        const int64_t clamped = v > top ? top : v < bottom ? bottom : v;
+        lane_set(&out.lo, &out.hi, to, i, static_cast<uint64_t>(clamped));
+      }
+      dst = out;
+      break;
+    }
+    case 0xD5: lanewise(16, [](uint64_t a, uint64_t b) { return a * b; }); break;
+    case 0xE5: lanewise(16, [](uint64_t a, uint64_t b) { return static_cast<uint64_t>(sign_extend(a, 2) * sign_extend(b, 2)) >> 16; }); break;
+    case 0xE4: lanewise(16, [](uint64_t a, uint64_t b) { return (a * b) >> 16; }); break;
+    case 0xF4: {      // pmuludq: the low dword of each qword lane
+      uint64_t hi0, lo0, hi1, lo1;
+      multiply_unsigned(dst.lo & 0xFFFFFFFFu, src.lo & 0xFFFFFFFFu, &hi0, &lo0);
+      multiply_unsigned(dst.hi & 0xFFFFFFFFu, src.hi & 0xFFFFFFFFu, &hi1, &lo1);
+      dst.lo = lo0;
+      dst.hi = lo1;
+      break;
+    }
+    case 0xF5: {      // pmaddwd
+      Xmm out;
+      for (uint32_t i = 0; i < 4; ++i) {
+        const int64_t p0 = sign_extend(lane_get(dst.lo, dst.hi, 16, 2 * i), 2) * sign_extend(lane_get(src.lo, src.hi, 16, 2 * i), 2);
+        const int64_t p1 = sign_extend(lane_get(dst.lo, dst.hi, 16, 2 * i + 1), 2) * sign_extend(lane_get(src.lo, src.hi, 16, 2 * i + 1), 2);
+        lane_set(&out.lo, &out.hi, 32, i, static_cast<uint64_t>(p0 + p1));
+      }
+      dst = out;
+      break;
+    }
+    case 0xF6: {      // psadbw
+      uint64_t sums[2] = {0, 0};
+      for (uint32_t i = 0; i < 16; ++i) {
+        const int64_t a = static_cast<int64_t>(lane_get(dst.lo, dst.hi, 8, i)), b = static_cast<int64_t>(lane_get(src.lo, src.hi, 8, i));
+        sums[i / 8] += static_cast<uint64_t>(a > b ? a - b : b - a);
+      }
+      dst.lo = sums[0];
+      dst.hi = sums[1];
+      break;
+    }
+    case 0xDC: lanewise(8, [](uint64_t a, uint64_t b) { return a + b > 0xFF ? uint64_t{0xFF} : a + b; }); break;
+    case 0xDD: lanewise(16, [](uint64_t a, uint64_t b) { return a + b > 0xFFFF ? uint64_t{0xFFFF} : a + b; }); break;
+    case 0xD8: lanewise(8, [](uint64_t a, uint64_t b) { return a > b ? a - b : uint64_t{0}; }); break;
+    case 0xD9: lanewise(16, [](uint64_t a, uint64_t b) { return a > b ? a - b : uint64_t{0}; }); break;
+    case 0xEC: lanewise(8, [](uint64_t a, uint64_t b) { const int64_t v = sign_extend(a, 1) + sign_extend(b, 1); return static_cast<uint64_t>(v > 127 ? 127 : v < -128 ? -128 : v); }); break;
+    case 0xED: lanewise(16, [](uint64_t a, uint64_t b) { const int64_t v = sign_extend(a, 2) + sign_extend(b, 2); return static_cast<uint64_t>(v > 32767 ? 32767 : v < -32768 ? -32768 : v); }); break;
+    case 0xE8: lanewise(8, [](uint64_t a, uint64_t b) { const int64_t v = sign_extend(a, 1) - sign_extend(b, 1); return static_cast<uint64_t>(v > 127 ? 127 : v < -128 ? -128 : v); }); break;
+    case 0xE9: lanewise(16, [](uint64_t a, uint64_t b) { const int64_t v = sign_extend(a, 2) - sign_extend(b, 2); return static_cast<uint64_t>(v > 32767 ? 32767 : v < -32768 ? -32768 : v); }); break;
+    case 0xEA: lanewise(16, [](uint64_t a, uint64_t b) { return sign_extend(a, 2) < sign_extend(b, 2) ? a : b; }); break;
+    case 0xEE: lanewise(16, [](uint64_t a, uint64_t b) { return sign_extend(a, 2) > sign_extend(b, 2) ? a : b; }); break;
+    case 0xE0: lanewise(8, [](uint64_t a, uint64_t b) { return (a + b + 1) >> 1; }); break;
+    case 0xE3: lanewise(16, [](uint64_t a, uint64_t b) { return (a + b + 1) >> 1; }); break;
+    case 0xD1: case 0xD2: case 0xD3: case 0xE1: case 0xE2: case 0xF1: case 0xF2: case 0xF3: {      // shifts by the low qword of xmm/m128
+      const uint32_t width = (op & 3) == 1 ? 16 : (op & 3) == 2 ? 32 : 64;
+      const bool left = op >= 0xF1, arithmetic = op == 0xE1 || op == 0xE2;
+      if (arithmetic && width == 64) return false;
+      const uint64_t count = src.lo;
+      for (uint32_t i = 0; i < 128 / width; ++i) {
+        const uint64_t v = lane_get(dst.lo, dst.hi, width, i);
+        uint64_t r;
+        if (arithmetic) r = static_cast<uint64_t>(sign_extend(v, width / 8) >> (count >= width ? width - 1 : count)) & ((uint64_t{1} << width) - 1);
+        else if (count >= width) r = 0;
+        else r = left ? v << count : v >> count;
+        lane_set(&dst.lo, &dst.hi, width, i, r);
+      }
+      break;
+    }
+    case 0xDA: lanewise(8, [](uint64_t a, uint64_t b) { return a < b ? a : b; }); break;
+    case 0xDE: lanewise(8, [](uint64_t a, uint64_t b) { return a > b ? a : b; }); break;
+    default: break;
+  }
+  return true;
+}
+
 X86_64Cpu::Step X86_64Cpu::step_sse(GuestMemory& m, uint8_t op) {
   auto bad_decode = [&]() { return fail(d_.available < 15 ? 14 : 6, s_.rip + d_.available); };
   auto advance = [&]() { s_.rip += d_.position; };
   const bool p66 = d_.operand16, pf3 = d_.rep, pf2 = d_.repne;
+  if (mmx_opcode(op)) return mmx_instruction(m, op);
   {
     bool handled = true;
     const Step float_result = step_float(m, op, &handled);
     if (handled) return float_result;
   }
-
-  // Lane-wise helpers over two registers.
-  auto unpack = [&](Xmm* dst, const Xmm& src, uint32_t width, bool high) {
-    const uint32_t lanes = 128 / width;
-    Xmm out;
-    for (uint32_t i = 0; i < lanes / 2; ++i) {
-      const uint32_t from = (high ? lanes / 2 : 0) + i;
-      lane_set(&out.lo, &out.hi, width, 2 * i, lane_get(dst->lo, dst->hi, width, from));
-      lane_set(&out.lo, &out.hi, width, 2 * i + 1, lane_get(src.lo, src.hi, width, from));
-    }
-    *dst = out;
-  };
 
   switch (op) {
     case 0x10: case 0x11: {      // movups / movupd / movss / movsd
@@ -1512,129 +1753,9 @@ X86_64Cpu::Step X86_64Cpu::step_sse(GuestMemory& m, uint8_t op) {
   if (!decode_modrm() || !finish_decode()) return bad_decode();
   Xmm src;
   Xmm& dst = s_.xmm[d_.reg];
-  auto lanewise = [&](uint32_t width, auto fn) {
-    for (uint32_t i = 0; i < 128 / width; ++i) {
-      const uint64_t a = lane_get(dst.lo, dst.hi, width, i), b = lane_get(src.lo, src.hi, width, i);
-      lane_set(&dst.lo, &dst.hi, width, i, fn(a, b));
-    }
-  };
-  switch (op) {
-    case 0x54: case 0x55: case 0x56: case 0x57: case 0xDB: case 0xDF: case 0xEB: case 0xEF:
-    case 0x60: case 0x61: case 0x62: case 0x6C: case 0x68: case 0x69: case 0x6A: case 0x6D:
-    case 0x74: case 0x75: case 0x76: case 0xFC: case 0xFD: case 0xFE: case 0xD4: case 0xF8: case 0xF9: case 0xFA: case 0xFB:
-    case 0xDA: case 0xDE: case 0x64: case 0x65: case 0x66:
-    case 0x63: case 0x67: case 0x6B: case 0xD5: case 0xE4: case 0xE5: case 0xF4: case 0xF5: case 0xF6:
-    case 0xDC: case 0xDD: case 0xD8: case 0xD9: case 0xEC: case 0xED: case 0xE8: case 0xE9: case 0xEA: case 0xEE: case 0xE0: case 0xE3:
-    case 0xD1: case 0xD2: case 0xD3: case 0xE1: case 0xE2: case 0xF1: case 0xF2: case 0xF3:
-      break;
-    default:
-      return fail(6);
-  }
+  if (!sse_integer_valid(op)) return fail(6);
   if (!read_xmm_rm(m, &src)) return Step::Fault;
-  switch (op) {
-    case 0x54: case 0xDB: dst.lo &= src.lo; dst.hi &= src.hi; break;
-    case 0x55: case 0xDF: dst.lo = ~dst.lo & src.lo; dst.hi = ~dst.hi & src.hi; break;
-    case 0x56: case 0xEB: dst.lo |= src.lo; dst.hi |= src.hi; break;
-    case 0x57: case 0xEF: dst.lo ^= src.lo; dst.hi ^= src.hi; break;
-    case 0x60: unpack(&dst, src, 8, false); break;
-    case 0x61: unpack(&dst, src, 16, false); break;
-    case 0x62: unpack(&dst, src, 32, false); break;
-    case 0x6C: unpack(&dst, src, 64, false); break;
-    case 0x68: unpack(&dst, src, 8, true); break;
-    case 0x69: unpack(&dst, src, 16, true); break;
-    case 0x6A: unpack(&dst, src, 32, true); break;
-    case 0x6D: unpack(&dst, src, 64, true); break;
-    case 0x74: lanewise(8, [](uint64_t a, uint64_t b) { return a == b ? uint64_t{0xFF} : 0; }); break;
-    case 0x75: lanewise(16, [](uint64_t a, uint64_t b) { return a == b ? uint64_t{0xFFFF} : 0; }); break;
-    case 0x76: lanewise(32, [](uint64_t a, uint64_t b) { return a == b ? uint64_t{0xFFFFFFFFu} : 0; }); break;
-    case 0x64: lanewise(8, [](uint64_t a, uint64_t b) { return sign_extend(a, 1) > sign_extend(b, 1) ? uint64_t{0xFF} : 0; }); break;
-    case 0x65: lanewise(16, [](uint64_t a, uint64_t b) { return sign_extend(a, 2) > sign_extend(b, 2) ? uint64_t{0xFFFF} : 0; }); break;
-    case 0x66: lanewise(32, [](uint64_t a, uint64_t b) { return sign_extend(a, 4) > sign_extend(b, 4) ? uint64_t{0xFFFFFFFFu} : 0; }); break;
-    case 0xFC: lanewise(8, [](uint64_t a, uint64_t b) { return a + b; }); break;
-    case 0xFD: lanewise(16, [](uint64_t a, uint64_t b) { return a + b; }); break;
-    case 0xFE: lanewise(32, [](uint64_t a, uint64_t b) { return a + b; }); break;
-    case 0xD4: lanewise(64, [](uint64_t a, uint64_t b) { return a + b; }); break;
-    case 0xF8: lanewise(8, [](uint64_t a, uint64_t b) { return a - b; }); break;
-    case 0xF9: lanewise(16, [](uint64_t a, uint64_t b) { return a - b; }); break;
-    case 0xFA: lanewise(32, [](uint64_t a, uint64_t b) { return a - b; }); break;
-    case 0xFB: lanewise(64, [](uint64_t a, uint64_t b) { return a - b; }); break;
-    case 0x63: case 0x67: case 0x6B: {      // packsswb, packuswb, packssdw: narrow both registers' lanes with saturation
-      const uint32_t from = op == 0x6B ? 32 : 16, to = from / 2;
-      const bool is_unsigned = op == 0x67;
-      Xmm out;
-      const uint32_t lanes = 128 / from;
-      for (uint32_t i = 0; i < 2 * lanes; ++i) {
-        const Xmm& pick = i < lanes ? dst : src;
-        const int64_t v = sign_extend(lane_get(pick.lo, pick.hi, from, i % lanes), from / 8);
-        const int64_t top = is_unsigned ? (int64_t{1} << to) - 1 : (int64_t{1} << (to - 1)) - 1, bottom = is_unsigned ? 0 : -(int64_t{1} << (to - 1));
-        const int64_t clamped = v > top ? top : v < bottom ? bottom : v;
-        lane_set(&out.lo, &out.hi, to, i, static_cast<uint64_t>(clamped));
-      }
-      dst = out;
-      break;
-    }
-    case 0xD5: lanewise(16, [](uint64_t a, uint64_t b) { return a * b; }); break;
-    case 0xE5: lanewise(16, [](uint64_t a, uint64_t b) { return static_cast<uint64_t>(sign_extend(a, 2) * sign_extend(b, 2)) >> 16; }); break;
-    case 0xE4: lanewise(16, [](uint64_t a, uint64_t b) { return (a * b) >> 16; }); break;
-    case 0xF4: {      // pmuludq: the low dword of each qword lane
-      uint64_t hi0, lo0, hi1, lo1;
-      multiply_unsigned(dst.lo & 0xFFFFFFFFu, src.lo & 0xFFFFFFFFu, &hi0, &lo0);
-      multiply_unsigned(dst.hi & 0xFFFFFFFFu, src.hi & 0xFFFFFFFFu, &hi1, &lo1);
-      dst.lo = lo0;
-      dst.hi = lo1;
-      break;
-    }
-    case 0xF5: {      // pmaddwd
-      Xmm out;
-      for (uint32_t i = 0; i < 4; ++i) {
-        const int64_t p0 = sign_extend(lane_get(dst.lo, dst.hi, 16, 2 * i), 2) * sign_extend(lane_get(src.lo, src.hi, 16, 2 * i), 2);
-        const int64_t p1 = sign_extend(lane_get(dst.lo, dst.hi, 16, 2 * i + 1), 2) * sign_extend(lane_get(src.lo, src.hi, 16, 2 * i + 1), 2);
-        lane_set(&out.lo, &out.hi, 32, i, static_cast<uint64_t>(p0 + p1));
-      }
-      dst = out;
-      break;
-    }
-    case 0xF6: {      // psadbw
-      uint64_t sums[2] = {0, 0};
-      for (uint32_t i = 0; i < 16; ++i) {
-        const int64_t a = static_cast<int64_t>(lane_get(dst.lo, dst.hi, 8, i)), b = static_cast<int64_t>(lane_get(src.lo, src.hi, 8, i));
-        sums[i / 8] += static_cast<uint64_t>(a > b ? a - b : b - a);
-      }
-      dst.lo = sums[0];
-      dst.hi = sums[1];
-      break;
-    }
-    case 0xDC: lanewise(8, [](uint64_t a, uint64_t b) { return a + b > 0xFF ? uint64_t{0xFF} : a + b; }); break;
-    case 0xDD: lanewise(16, [](uint64_t a, uint64_t b) { return a + b > 0xFFFF ? uint64_t{0xFFFF} : a + b; }); break;
-    case 0xD8: lanewise(8, [](uint64_t a, uint64_t b) { return a > b ? a - b : uint64_t{0}; }); break;
-    case 0xD9: lanewise(16, [](uint64_t a, uint64_t b) { return a > b ? a - b : uint64_t{0}; }); break;
-    case 0xEC: lanewise(8, [](uint64_t a, uint64_t b) { const int64_t v = sign_extend(a, 1) + sign_extend(b, 1); return static_cast<uint64_t>(v > 127 ? 127 : v < -128 ? -128 : v); }); break;
-    case 0xED: lanewise(16, [](uint64_t a, uint64_t b) { const int64_t v = sign_extend(a, 2) + sign_extend(b, 2); return static_cast<uint64_t>(v > 32767 ? 32767 : v < -32768 ? -32768 : v); }); break;
-    case 0xE8: lanewise(8, [](uint64_t a, uint64_t b) { const int64_t v = sign_extend(a, 1) - sign_extend(b, 1); return static_cast<uint64_t>(v > 127 ? 127 : v < -128 ? -128 : v); }); break;
-    case 0xE9: lanewise(16, [](uint64_t a, uint64_t b) { const int64_t v = sign_extend(a, 2) - sign_extend(b, 2); return static_cast<uint64_t>(v > 32767 ? 32767 : v < -32768 ? -32768 : v); }); break;
-    case 0xEA: lanewise(16, [](uint64_t a, uint64_t b) { return sign_extend(a, 2) < sign_extend(b, 2) ? a : b; }); break;
-    case 0xEE: lanewise(16, [](uint64_t a, uint64_t b) { return sign_extend(a, 2) > sign_extend(b, 2) ? a : b; }); break;
-    case 0xE0: lanewise(8, [](uint64_t a, uint64_t b) { return (a + b + 1) >> 1; }); break;
-    case 0xE3: lanewise(16, [](uint64_t a, uint64_t b) { return (a + b + 1) >> 1; }); break;
-    case 0xD1: case 0xD2: case 0xD3: case 0xE1: case 0xE2: case 0xF1: case 0xF2: case 0xF3: {      // shifts by the low qword of xmm/m128
-      const uint32_t width = (op & 3) == 1 ? 16 : (op & 3) == 2 ? 32 : 64;
-      const bool left = op >= 0xF1, arithmetic = op == 0xE1 || op == 0xE2;
-      if (arithmetic && width == 64) return fail(6);
-      const uint64_t count = src.lo;
-      for (uint32_t i = 0; i < 128 / width; ++i) {
-        const uint64_t v = lane_get(dst.lo, dst.hi, width, i);
-        uint64_t r;
-        if (arithmetic) r = static_cast<uint64_t>(sign_extend(v, width / 8) >> (count >= width ? width - 1 : count)) & ((uint64_t{1} << width) - 1);
-        else if (count >= width) r = 0;
-        else r = left ? v << count : v >> count;
-        lane_set(&dst.lo, &dst.hi, width, i, r);
-      }
-      break;
-    }
-    case 0xDA: lanewise(8, [](uint64_t a, uint64_t b) { return a < b ? a : b; }); break;
-    case 0xDE: lanewise(8, [](uint64_t a, uint64_t b) { return a > b ? a : b; }); break;
-    default: break;
-  }
+  if (!sse_integer_core(op, dst, src)) return fail(6);
   advance();
   return Step::Ok;
 }
@@ -1678,6 +1799,39 @@ X86_64Cpu::Step X86_64Cpu::step_float(GuestMemory& m, uint8_t op, bool* handled)
   };
 
   switch (op) {
+    case 0x52: case 0x53: {      // rsqrtps / rsqrtss, rcpps / rcpss: the reciprocal (square root), here the correctly rounded value; no exception flags, denormal inputs are zeros and tiny results are zero
+      if (p66 || pf2) return fail(6);
+      if (!decode_modrm() || !finish_decode()) return bad_decode();
+      Xmm src;
+      if (!source(&src)) return Step::Fault;
+      Xmm& dst = s_.xmm[d_.reg];
+      const uint32_t count = scalar ? 1 : lanes;
+      for (uint32_t i = 0; i < count; ++i) {
+        uint64_t b = lane_get(src.lo, src.hi, 32, i);
+        Env le;
+        le.mode = Rounding::NearestEven;
+        le.daz = le.ftz = true;
+        uint64_t r;
+        const bool negative = (b >> 31) & 1;
+        const uint32_t exponent = (b >> 23) & 0xFF;
+        if (exponent == 0xFF && (b & 0x7FFFFF)) r = b | 0x400000;      // a NaN, made quiet
+        else if (exponent == 0) r = negative ? 0xFF800000u : 0x7F800000u;      // zero and denormal: infinity of the same sign
+        else if (op == 0x53) r = exponent == 0xFF ? (negative ? 0x80000000u : 0) : softfloat::div(Format::F32, 0x3F800000u, b, le);
+        else if (negative) r = 0xFFC00000u;      // the square root of a negative number
+        else if (exponent == 0xFF) r = 0;
+        else {
+          Env c;
+          c.mode = Rounding::NearestEven;
+          const uint64_t wide = softfloat::convert(Format::F32, Format::F64, b, c);
+          r = softfloat::convert(Format::F64, Format::F32, softfloat::div(Format::F64, 0x3FF0000000000000ull, sqrt(Format::F64, wide, c), c), c);
+          if ((r & 0x7F800000u) == 0) r &= 0x80000000u;
+        }
+        if (op == 0x53 && (r & 0x7F800000u) == 0) r &= 0x80000000u;
+        lane_set(&dst.lo, &dst.hi, 32, i, r);
+      }
+      env.flags = 0;
+      return done();
+    }
     case 0x51: case 0x58: case 0x59: case 0x5C: case 0x5D: case 0x5E: case 0x5F: {      // sqrt add mul sub min div max
       if (!decode_modrm() || !finish_decode()) return bad_decode();
       Xmm src;
@@ -1879,12 +2033,20 @@ X86_64Cpu::Step X86_64Cpu::step_float(GuestMemory& m, uint8_t op, bool* handled)
       set_reg(d_.reg, 4, mask);
       return done();
     }
-    case 0x2B: case 0xE7: {      // movntps/pd, movntdq: plain stores
+    case 0x2B: case 0xE7: {      // movntps/pd, movntdq: plain stores; SSE4a movntss / movntsd (F3 / F2 0F 2B) store a scalar
       if (!decode_modrm() || !finish_decode()) return bad_decode();
       if (d_.mod == 3) return fail(6);
+      if (op == 0x2B && (pf3 || pf2)) {
+        if (!store(m, memory_address(), pf3 ? 4 : 8, pf3 ? s_.xmm[d_.reg].lo & 0xFFFFFFFFu : s_.xmm[d_.reg].lo)) return Step::Fault;
+        return done();
+      }
+      if (pf3 || pf2) return fail(6);
       if (!write_xmm_rm(m, s_.xmm[d_.reg])) return Step::Fault;
       return done();
     }
+    case 0x78: case 0x79:      // SSE4a: extrq (66), insertq (F2)
+      if (!(p66 != pf2) || pf3) return fail(6);
+      return sse4a_bitfield(m, op);
     case 0x7C: case 0x7D: case 0xD0: {      // SSE3: haddps/pd, hsubps/pd, addsubps/pd (F2: single, 66: double)
       if (!decode_modrm() || !finish_decode()) return bad_decode();
       if (pf3 || (!p66 && !pf2)) return fail(6);

@@ -476,10 +476,13 @@ X86_64Cpu::Step X86_64Cpu::vex_map2(GuestMemory& m, uint8_t op, bool wide_w, uin
   auto bad_decode = [&]() { return fail(d_.available < 15 ? 14 : 6, s_.rip + d_.available); };
   const bool wide = vex_.wide;
   const uint32_t pp = d_.operand16 ? 1 : d_.rep ? 2 : d_.repne ? 3 : 0;
+  if (op == 0x49 || op == 0x4B || op == 0x5C || op == 0x5E || op == 0x6C) return amx_instruction(m, op, vvvv);
   if (op >= 0x90 && op <= 0x93) return vex_gather(m, op, wide_w, vvvv);
   if ((op >= 0x96 && op <= 0x9F) || (op >= 0xA6 && op <= 0xAF) || (op >= 0xB6 && op <= 0xBF)) return vex_fma(m, op, wide_w, vvvv);
   if (op == 0xF2 || op == 0xF3 || op == 0xF5 || op == 0xF6 || op == 0xF7) return vex_bmi(m, 2, op, wide_w, vvvv);
   if ((op >= 0xDB && op <= 0xDF) || op == 0xCF || op == 0xCB || op == 0xCC || op == 0xCD || op == 0xDA) return crypto_map(m, 2, op, wide_w, vvvv);
+  if (op == 0xB0 || op == 0xB1) return vex_ne_convert(m, op, wide_w, vvvv);
+  if ((op >= 0x50 && op <= 0x53) || op == 0xB4 || op == 0xB5 || op == 0xD2 || op == 0xD3 || (op == 0x72 && pp == 2)) return vex_via_evex(m, 2, op, wide_w, vvvv);
   if (pp != 1) return fail(6);
   if (!decode_modrm() || !finish_decode()) return bad_decode();
   const uint32_t reg = d_.reg;
@@ -1152,67 +1155,121 @@ X86_64Cpu::Step X86_64Cpu::vex_bmi(GuestMemory& m, int map, uint8_t op, bool wid
 
 // --- XSAVE / XRSTOR / XGETBV ---------------------------------------------------------------------------------------------------------------
 
+// `kind`: 4 xsave, 5 xrstor, 6 xsaveopt (the same as xsave here: it may write everything), 8 xsavec (the compacted format: XCOMP_BV bit 63, the components that are present follow each other
+// without gaps). xrstor reads both formats.
 X86_64Cpu::Step X86_64Cpu::xsave_family(GuestMemory& m, uint32_t kind) {
   const uint64_t address = memory_address();
   const uint64_t requested = (s_.r[0] & 0xFFFFFFFFu) | (s_.r[2] << 32);
-  const uint64_t features = requested & 0xE7;      // XCR0: x87, SSE, AVX, opmask, ZMM_Hi256, Hi16_ZMM
+  const uint64_t features = requested & 0x600E7;      // XCR0: x87, SSE, AVX, opmask, ZMM_Hi256, Hi16_ZMM, TILECFG, TILEDATA
   uint8_t image[2688] = {};
   auto put64 = [&](uint32_t at, uint64_t v) { for (uint32_t b = 0; b < 8; ++b) image[at + b] = static_cast<uint8_t>(v >> (8 * b)); };
   auto get64 = [&](uint32_t at) { uint64_t v = 0; for (uint32_t b = 0; b < 8; ++b) v |= uint64_t{image[at + b]} << (8 * b); return v; };
-  const uint64_t bytes = (features & 0xE0) ? 2688 : (features & 4) ? 832 : 576;
-  if (kind == 4) {      // xsave
+  // The components above the legacy area: feature bit, size, and offset in the standard format.
+  struct Component { uint64_t bit; uint32_t size, standard; };
+  static constexpr Component kComponents[6] = {{4, 256, 576}, {0x20, 64, 1088}, {0x40, 512, 1152}, {0x80, 1024, 1664}, {0x20000, 64, 2752}, {0x40000, 8192, 2816}};
+  // Offsets of the components in the format being used: `present` is the set of components stored (the compacted format packs those; the tile components start on a 64-byte boundary).
+  uint32_t legacy_end = 576;      // where the components before the tiles end in the compacted format
+  auto offsets = [&](bool compacted, uint64_t present, uint32_t out[6]) {
+    uint32_t next = 576;
+    for (uint32_t c = 0; c < 6; ++c) {
+      if (c == 4) legacy_end = next;
+      if (c >= 4) next = (next + 63) & ~63u;
+      out[c] = compacted ? next : kComponents[c].standard;
+      if (present & kComponents[c].bit) next += kComponents[c].size;
+    }
+    return next;      // the size of the area in the compacted format
+  };
+  if (kind != 5) {
+    const bool compacted = kind == 8;
+    uint32_t at[6];
+    offsets(compacted, features, at);
+    uint32_t bytes = compacted ? legacy_end : (features & 0xE0) ? 2688 : (features & 4) ? 832 : 576;
+    const uint64_t in_use = features & ~(tiles_configured() ? uint64_t{0} : uint64_t{0x60000});      // (a tile component is saved only with the tiles configured; XSTATE_BV says which were)      // (unconfigured tiles are in their initial state)
     save_fpu_image(image);
-    put64(512, features);      // XSTATE_BV: everything requested is in use
+    put64(512, in_use);      // XSTATE_BV: everything requested is in use
+    if (compacted) put64(520, features | (uint64_t{1} << 63));
     for (uint32_t r = 0; r < 16; ++r) {
-      put64(576 + 16 * r, s_.ymm_high[r].lo);
-      put64(584 + 16 * r, s_.ymm_high[r].hi);
-      put64(1152 + 32 * r, s_.ymm_high[r].upper[0].lo);
-      put64(1160 + 32 * r, s_.ymm_high[r].upper[0].hi);
-      put64(1168 + 32 * r, s_.ymm_high[r].upper[1].lo);
-      put64(1176 + 32 * r, s_.ymm_high[r].upper[1].hi);
+      if (features & 4) {
+        put64(at[0] + 16 * r, s_.ymm_high[r].lo);
+        put64(at[0] + 8 + 16 * r, s_.ymm_high[r].hi);
+      }
+      if (features & 0x40) {
+        put64(at[2] + 32 * r, s_.ymm_high[r].upper[0].lo);
+        put64(at[2] + 8 + 32 * r, s_.ymm_high[r].upper[0].hi);
+        put64(at[2] + 16 + 32 * r, s_.ymm_high[r].upper[1].lo);
+        put64(at[2] + 24 + 32 * r, s_.ymm_high[r].upper[1].hi);
+      }
+      if (features & 0x80) {
+        const Vec512 v = get_vec(16 + r);
+        for (uint32_t q = 0; q < 8; ++q) put64(at[3] + 64 * r + 8 * q, v.q[q]);
+      }
     }
-    for (uint32_t k = 0; k < 8; ++k) put64(1088 + 8 * k, s_.k[k]);
-    for (uint32_t r = 0; r < 16; ++r) {
-      const Vec512 v = get_vec(16 + r);
-      for (uint32_t q = 0; q < 8; ++q) put64(1664 + 64 * r + 8 * q, v.q[q]);
-    }
+    if (features & 0x20) for (uint32_t k = 0; k < 8; ++k) put64(at[1] + 8 * k, s_.k[k]);
     if (!m.write(address, ConstByteView(image, bytes))) return fail(14, address, 2);
+    if (in_use & 0x20000)
+      if (!m.write(address + at[4], ConstByteView(tiles_.config, sizeof(tiles_.config)))) return fail(14, address + at[4], 2);
+    if (in_use & 0x40000)
+      for (uint32_t t = 0; t < 8; ++t)
+        if (!m.write(address + at[5] + 1024 * t, ConstByteView(tiles_.data[t], 1024))) return fail(14, address + at[5] + 1024 * t, 2);
     return Step::Ok;
   }
   // xrstor: components not marked present in the header are put in their initial state
   if (!m.read(address, ByteView(image, 576))) return fail(14, address, 0);
-  const uint64_t bv = get64(512);
+  const uint64_t bv = get64(512), comp = get64(520);
+  const bool compacted = (comp >> 63) & 1;
+  uint32_t at[6];
+  offsets(compacted, compacted ? comp : features, at);
+  const uint64_t bytes = compacted ? legacy_end : (features & 0xE0) ? 2688 : (features & 4) ? 832 : 576;
   if (bytes > 576 && !m.read(address + 576, ByteView(image + 576, bytes - 576))) return fail(14, address + 576, 0);
   if (features & 1) {
     if (!(bv & 1)) { ByteView(image, 32).fill(0); image[0] = 0x7F; image[1] = 0x03; ByteView(image + 32, 128).fill(0); }
     if (!(bv & 2)) { ByteView(image + 160, 256).fill(0); }
   }
+  // The tile state: a bad configuration is #GP, found before anything is changed.
+  if (features & 0x60000) {
+    uint8_t tile_config[64] = {};
+    const bool new_config = features & 0x20000;
+    if (new_config && (bv & 0x20000)) {
+      if (!m.read(address + at[4], ByteView(tile_config, sizeof(tile_config)))) return fail(14, address + at[4], 0);
+      if (!tile_config_valid(ConstByteView(tile_config, sizeof(tile_config)))) return fail(13);
+    }
+    if ((features & 0x40000) && (bv & 0x40000) && !(new_config ? tile_config[0] != 0 : tiles_configured())) return fail(13);      // tile data needs a configuration
+    if (new_config) tile_config_load(ConstByteView(tile_config, sizeof(tile_config)));
+    if (features & 0x40000) {
+      if ((bv & 0x40000) && tiles_configured()) {
+        for (uint32_t t = 0; t < 8; ++t)
+          if (!m.read(address + at[5] + 1024 * t, ByteView(tiles_.data[t], 1024))) return fail(14, address + at[5] + 1024 * t, 0);
+      } else {
+        for (auto& tile : tiles_.data) ByteView(tile, sizeof(tile)).fill(0);
+      }
+    }
+  }
   load_fpu_image(image);
   if (features & 4) {
     for (uint32_t r = 0; r < 16; ++r) {
-      s_.ymm_high[r] = Xmm();
+      s_.ymm_high[r].lo = s_.ymm_high[r].hi = 0;
       if (bv & 4) {
-        s_.ymm_high[r].lo = get64(576 + 16 * r);
-        s_.ymm_high[r].hi = get64(584 + 16 * r);
+        s_.ymm_high[r].lo = get64(at[0] + 16 * r);
+        s_.ymm_high[r].hi = get64(at[0] + 8 + 16 * r);
       }
     }
   }
   if (features & 0x20) {
-    for (uint32_t k = 0; k < 8; ++k) s_.k[k] = (bv & 0x20) ? get64(1088 + 8 * k) : 0;
+    for (uint32_t k = 0; k < 8; ++k) s_.k[k] = (bv & 0x20) ? get64(at[1] + 8 * k) : 0;
   }
   if (features & 0x40) {
     for (uint32_t r = 0; r < 16; ++r) {
-      s_.ymm_high[r].upper[0].lo = (bv & 0x40) ? get64(1152 + 32 * r) : 0;
-      s_.ymm_high[r].upper[0].hi = (bv & 0x40) ? get64(1160 + 32 * r) : 0;
-      s_.ymm_high[r].upper[1].lo = (bv & 0x40) ? get64(1168 + 32 * r) : 0;
-      s_.ymm_high[r].upper[1].hi = (bv & 0x40) ? get64(1176 + 32 * r) : 0;
+      s_.ymm_high[r].upper[0].lo = (bv & 0x40) ? get64(at[2] + 32 * r) : 0;
+      s_.ymm_high[r].upper[0].hi = (bv & 0x40) ? get64(at[2] + 8 + 32 * r) : 0;
+      s_.ymm_high[r].upper[1].lo = (bv & 0x40) ? get64(at[2] + 16 + 32 * r) : 0;
+      s_.ymm_high[r].upper[1].hi = (bv & 0x40) ? get64(at[2] + 24 + 32 * r) : 0;
     }
   }
   if (features & 0x80) {
     for (uint32_t r = 0; r < 16; ++r) {
       Vec512 v;
       if (bv & 0x80)
-        for (uint32_t q = 0; q < 8; ++q) v.q[q] = get64(1664 + 64 * r + 8 * q);
+        for (uint32_t q = 0; q < 8; ++q) v.q[q] = get64(at[3] + 64 * r + 8 * q);
       set_vec(16 + r, v, 512);
     }
   }
