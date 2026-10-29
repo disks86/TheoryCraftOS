@@ -544,7 +544,8 @@ static BOOL ini_write(LPCWSTR given, const char *section, const char *key, const
   return ok;
 }
 EXPORT BOOL WINAPI WritePrivateProfileStringA(LPCSTR section, LPCSTR key, LPCSTR value, LPCSTR file) {
-  if (!section || !file) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (!section) { set_error(ERROR_FILE_NOT_FOUND); return FALSE; }      /* (that is the answer, odd as it is) */
+  if (!file) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
   WCHAR *w = to_wide(file);
   if (!w) return FALSE;
   const BOOL ok = ini_write(w, section, key, value);
@@ -552,7 +553,8 @@ EXPORT BOOL WINAPI WritePrivateProfileStringA(LPCSTR section, LPCSTR key, LPCSTR
   return ok;
 }
 EXPORT BOOL WINAPI WritePrivateProfileStringW(LPCWSTR section, LPCWSTR key, LPCWSTR value, LPCWSTR file) {
-  if (!section || !file) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (!section) { set_error(ERROR_FILE_NOT_FOUND); return FALSE; }
+  if (!file) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
   char s[256], k[256], v[1024];
   if (!WideCharToMultiByte(CP_UTF8, 0, section, -1, s, sizeof(s), NULL, NULL)) return FALSE;
   if (key && !WideCharToMultiByte(CP_UTF8, 0, key, -1, k, sizeof(k), NULL, NULL)) return FALSE;
