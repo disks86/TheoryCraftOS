@@ -467,7 +467,13 @@ int32_t PageObjects::load_image_url(IObjectEnvironment& env, StringView url, boo
       entry->image.clear();
     } else {
       while (entry->image.frame_count() > 1 && pixels * entry->image.frame_count() > kMaxImagePixels) entry->image.limit_frames(entry->image.frame_count() - 1);
-      entry->ok = !entry->image.empty();
+      const uint64_t held = pixels * entry->image.frame_count();
+      if (held > kMaxTotalImagePixels - image_pixels_) {   // (no room left for this one: it is shown as a picture that failed, not at the cost of the page)
+        entry->image.clear();
+      } else {
+        image_pixels_ += held;
+        entry->ok = !entry->image.empty();
+      }
     }
   }
   const bool ok = entry->ok;
