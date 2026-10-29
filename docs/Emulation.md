@@ -199,7 +199,16 @@ programs built with `-march=haswell` (or x86-64-v3) run. `X86_64Vex.cpp` holds a
 - **Intel APX, part 1** (`D5` REX2 prefix): the payload bits M0, R4, X4, B4, W, R3, X3, B3 select the 0F map and name registers R16..R31 in modrm, SIB (an index field of 100 with X4 is R20, not "no index") and
   opcode-embedded fields; `jmpabs` (`D5 00 A1 imm64`); state in XCR0 bit 19 and xsave component 19 (offset 11008, 128 bytes, in the initial state while R16..R31 are all zero); cpuid 7.1 EDX bit 21. REX2 on an SSE,
   x87, MMX or other vector instruction that names a high register is #UD. `tests/ApxTest.cpp` runs integer instructions on R16 / R17 and on RAX / RCX and compares.
-- **Not implemented** (an invalid-instruction fault, never a wrong result): APX (REX2, the 32 general registers, the EVEX-promoted legacy instructions), the AVX10.2
+- **Intel APX, part 2** (`src/Emulation/X86_64Apx.cpp`, EVEX map 4, from Intel's architecture specification 355828): the promoted legacy integer instructions `add or adc sbb and sub xor` (all forms, the immediate
+  groups 80 / 81 / 83), `rol ror rcl rcr shl shr sal sar` (by 1, CL and imm8), `not neg inc dec`, `mul imul div idiv`, `imul` (0F AF, 69, 6B), `shld` / `shrd`, `tzcnt` / `lzcnt` / `popcnt`, with the new data
+  destination (EVEX.ND: the result goes to the register in EVEX.vvvv, zero-extended, and the sources stay), flag suppression (EVEX.NF) and zero-upper (ZU, for `imul` 69 / 6B and `setcc`); `cmovcc` and
+  `cfcmovcc` in the four ND / NF forms (a conditionally faulting form does not touch memory when the condition is false); `setcc` (F2, map 4 40..4F); `ccmpscc` / `ctestscc` (the condition in the low four bits
+  of the third payload byte, SCC 0xA always true, 0xB always false; the default flags in bits 6:3 of the second, taken as not inverted and PF set from CF as the specification states, both unverified); `push2`
+  / `pop2` (16-byte aligned, neither register RSP). Encoding errors (reserved payload bits, ND or NF on an instruction that does not take them, a non-zero vvvv without ND, a clear U with a register operand,
+  a 66 or REX prefix before EVEX) are #UD. The promoted instructions run the legacy implementation (a REX2-like decoder state, the same arithmetic and flags) and then rearrange the result, so they cannot differ
+  from the legacy forms; `tests/ApxEvexTest.cpp` runs every form against its legacy instruction. Not promoted yet: map 4 `adcx` / `adox`, `crc32`, `movbe`, `movdiri`, `movdir64b`, `enqcmd`, `wrss`, the VEX
+  and EVEX extensions (BMI and `kmov` on R16..R31, vector instructions using R16..R31 as base or index), and the PPX hints (which have no effect).
+- **Not implemented** (an invalid-instruction fault, never a wrong result): the rest of APX (above), the AVX10.2
   additions, `vpermil2ps/pd` and LWP, CET shadow-stack instructions beyond the no-op forms, `xsaves`/`xrstors` and `xgetbv` with ECX=1.
   Exceptions delivered to a Windows program save the XMM halves of vector state in the `CONTEXT` in memory, not the upper halves (the emulator keeps those itself).
 - **Checked against the real thing**: `tests/AvxTest.cpp` assembles about 1,400 instruction forms with `llvm-mc` (`tests/data/emulation/avx_cases_gen.py`), runs each on the host

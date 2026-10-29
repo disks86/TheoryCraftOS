@@ -648,6 +648,7 @@ add_executable(BOOTX64
   src/Emulation/X86_64Amx.cpp
   src/Emulation/X86_64Xop.cpp
   src/Emulation/X86_64Segment.cpp
+  src/Emulation/X86_64Apx.cpp
   src/Emulation/X86_64Evex.cpp
   src/Emulation/X86_64EvexMisc.cpp
   src/Emulation/X86_64EvexFp.cpp

@@ -488,6 +488,7 @@ X86_64Cpu::Step X86_64Cpu::step_evex(GuestMemory& m) {
   const uint8_t p0 = next_u8(), p1 = next_u8(), p2 = next_u8();
   const uint8_t opcode = next_u8();
   if (d_.truncated) return bad_decode();
+  if ((p0 & 7) == 4) return apx_map4(m, p0, p1, p2, opcode);      // Intel APX: the promoted legacy instructions
   if ((p0 & 0x08) != 0 || !(p1 & 4)) return fail(6);
   const uint32_t map = p0 & 7;
   if (map == 0) return fail(6);

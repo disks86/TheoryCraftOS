@@ -141,6 +141,9 @@ class X86_64Cpu final : public IGuestCpu {
   Step string_instruction(GuestMemory& m, uint8_t opcode);
   Step step(GuestMemory& m);
   Step step_0f(GuestMemory& m);
+  Step step_0f_op(GuestMemory& m, uint8_t opcode);      // (the opcode byte after 0F already read)
+  Step step_op(GuestMemory& m, uint8_t opcode);         // (a one-byte-map opcode, prefixes decoded)
+  Step apx_map4(GuestMemory& m, uint8_t p0, uint8_t p1, uint8_t p2, uint8_t opcode);      // Intel APX: EVEX map 4, the promoted legacy instructions
   Step step_sse(GuestMemory& m, uint8_t opcode);
   static bool sse_integer_valid(uint8_t op);
   static bool sse_integer_core(uint8_t op, Xmm& dst, const Xmm& src);

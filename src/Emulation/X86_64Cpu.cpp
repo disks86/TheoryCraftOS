@@ -536,6 +536,11 @@ X86_64Cpu::Step X86_64Cpu::step(GuestMemory& m) {
     op = next_u8();
   }
   if (d_.truncated) return fail(d_.available < 15 ? 14 : 6, s_.rip + d_.available);
+  return step_op(m, op);
+}
+
+// The instruction whose (one-byte map) opcode is `op`, with its prefixes decoded into d_.
+X86_64Cpu::Step X86_64Cpu::step_op(GuestMemory& m, uint8_t op) {
   Step result = Step::Ok;
   const uint32_t osize = static_cast<uint32_t>(operand_size());
   auto advance = [&]() { s_.rip += d_.position; };
@@ -1052,9 +1057,10 @@ X86_64Cpu::Step X86_64Cpu::step_group_f(GuestMemory& m, uint8_t op) {
 
 // --- the 0F opcode map -----------------------------------------------------------------------------------------------------------------------
 
-X86_64Cpu::Step X86_64Cpu::step_0f(GuestMemory& m) {
+X86_64Cpu::Step X86_64Cpu::step_0f(GuestMemory& m) { return step_0f_op(m, next_u8()); }
+
+X86_64Cpu::Step X86_64Cpu::step_0f_op(GuestMemory& m, uint8_t op) {
   const uint32_t osize = static_cast<uint32_t>(operand_size());
-  const uint8_t op = next_u8();
   auto bad_decode = [&]() { return fail(d_.available < 15 ? 14 : 6, s_.rip + d_.available); };
   auto advance = [&]() { s_.rip += d_.position; };
   if (d_.truncated) return bad_decode();
