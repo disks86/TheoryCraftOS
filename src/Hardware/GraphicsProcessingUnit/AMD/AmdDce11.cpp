@@ -138,11 +138,55 @@ constexpr uint32_t kGrphEnable = 0x1a00, kGrphControl = 0x1a01, kGrphLut10BitByp
                    kGrphXStart = 0x1a0b, kGrphYStart = 0x1a0c, kGrphXEnd = 0x1a0d, kGrphYEnd = 0x1a0e, kGrphFlipControl = 0x1a12, kLbDesktopHeight = 0x1ac3,
                    kViewportStart = 0x1b5c, kViewportSize = 0x1b5d, kCrtcMasterUpdateMode = 0x1bbe;
 constexpr uint32_t kVgaControl[kMaxCrtcs] = {0xcc, 0xce, 0xf8, 0xf9, 0xfa, 0xfb};
-constexpr uint32_t kFlipHRetraceEnable = 0x1, kLut10BitBypassEnable = 0x100, kGrphControlArgb8888 = 2;       // GRPH_DEPTH 2 (32 bit), GRPH_FORMAT 0 (ARGB8888), linear, pipe config 0
+constexpr uint32_t kFlipHRetraceEnable = 0x1, kLut10BitBypassEnable = 0x100;
+// GRPH_CONTROL fields: depth 1:0, num banks 3:2, bank width 7:6, format 10:8, bank height 12:11, tile split 15:13, macro tile aspect 19:18, array mode 23:20, pipe config 28:24, micro tile mode 30:29
+constexpr uint32_t kShiftNumBanks = 2, kShiftBankWidth = 6, kShiftFormat = 8, kShiftBankHeight = 11, kShiftTileSplit = 13, kShiftMacroTileAspect = 18, kShiftArrayMode = 20, kShiftPipeConfig = 24,
+                   kShiftMicroTileMode = 29;
+// GRPH_SWAP_CNTL crossbars: red 5:4, green 7:6, blue 9:8, alpha 11:10 (2 selects the blue / red input)
+constexpr uint32_t kSwapRedCrossbarBlue = 2u << 4, kSwapBlueCrossbarRed = 2u << 8;
+// the colour pipeline of dce_v11_0_crtc_load_lut
+constexpr uint32_t kInputCscControl = 0x1a35, kPrescaleGrphControl = 0x1a2d, kInputGammaControl = 0x1a10, kDcLutControl = 0x1a80, kDcLutBlackBlue = 0x1a81, kDcLutBlackGreen = 0x1a82,
+                   kDcLutBlackRed = 0x1a83, kDcLutWhiteBlue = 0x1a84, kDcLutWhiteGreen = 0x1a85, kDcLutWhiteRed = 0x1a86, kDcLutRwMode = 0x1a78, kDcLutWriteEnMask = 0x1a7e,
+                   kDcLutRwIndex = 0x1a79, kDcLut30Color = 0x1a7c, kDegammaControl = 0x1a58, kGamutRemapControl = 0x1a59, kRegammaControl = 0x1aa0, kOutputCscControl = 0x1a3c,
+                   kDenormControl = 0x1a50, kAlphaControl = 0x1abc;
+constexpr uint32_t kInputCscGrphModeMask = 0x3, kPrescaleBypass = 0x10, kInputGammaModeMask = 0x1, kDegammaModeMask = 0x3 | 0x300 | 0x3000, kGamutModeMask = 0x3, kRegammaModeMask = 0x7,
+                   kOutputCscModeMask = 0x7, kCursorAlphaBlend = 0x2;
+
+struct FormatBits {
+  uint32_t depth, format, swap;
+  bool bypass_lut;
+};
+bool format_bits(ScanoutFormat f, FormatBits* out) {
+  switch (f) {
+    case ScanoutFormat::Indexed8: *out = {0, 0, 0, false}; return true;
+    case ScanoutFormat::Argb4444: *out = {1, 2, 0, false}; return true;
+    case ScanoutFormat::Argb1555: *out = {1, 0, 0, false}; return true;
+    case ScanoutFormat::Bgra5551: *out = {1, 5, 0, false}; return true;
+    case ScanoutFormat::Rgb565: *out = {1, 1, 0, false}; return true;
+    case ScanoutFormat::Argb8888: *out = {2, 0, 0, false}; return true;
+    case ScanoutFormat::Argb2101010: *out = {2, 1, 0, true}; return true;     // (more than 8 bits per colour bypasses the table to keep the precision)
+    case ScanoutFormat::Bgra1010102: *out = {2, 4, 0, true}; return true;
+    case ScanoutFormat::Abgr8888: *out = {2, 0, kSwapRedCrossbarBlue | kSwapBlueCrossbarRed, false}; return true;
+  }
+  return false;
+}
 }  // namespace
 
 bool Scanout::set(uint32_t crtc, const ScanoutSurface& s) {
-  if (crtc >= kMaxCrtcs || (s.address & (kSurfaceAlignment - 1)) != 0 || s.width == 0 || s.height == 0 || s.pitch_pixels < s.width || s.viewport_width == 0 || s.viewport_height == 0) return false;
+  FormatBits fb;
+  const ScanoutTiling& t = s.tiling;
+  if (crtc >= kMaxCrtcs || (s.address & (kSurfaceAlignment - 1)) != 0 || s.width == 0 || s.height == 0 || s.pitch_pixels < s.width || s.viewport_width == 0 || s.viewport_height == 0 ||
+      !format_bits(s.format, &fb) || (t.mode != ScanoutTiling::Mode::Linear && t.mode != ScanoutTiling::Mode::Tiled1D && t.mode != ScanoutTiling::Mode::Tiled2D) || t.pipe_config > 0x1F ||
+      t.num_banks > 3 || t.bank_width > 3 || t.bank_height > 3 || t.macro_tile_aspect > 3 || t.tile_split > 7)
+    return false;
+  uint32_t control = fb.depth | (fb.format << kShiftFormat);
+  if (t.mode == ScanoutTiling::Mode::Tiled2D) {
+    control |= (uint32_t{t.num_banks} << kShiftNumBanks) | (uint32_t{4} << kShiftArrayMode) | (uint32_t{t.tile_split} << kShiftTileSplit) | (uint32_t{t.bank_width} << kShiftBankWidth) |
+               (uint32_t{t.bank_height} << kShiftBankHeight) | (uint32_t{t.macro_tile_aspect} << kShiftMacroTileAspect) | (0u << kShiftMicroTileMode);       // ADDR_SURF_MICRO_TILING_DISPLAY
+  } else if (t.mode == ScanoutTiling::Mode::Tiled1D) {
+    control |= uint32_t{2} << kShiftArrayMode;
+  }
+  control |= uint32_t{t.pipe_config} << kShiftPipeConfig;
   const uint32_t off = kCrtcOffsets[crtc];
   r_.write(kVgaControl[crtc], r_.read(kVgaControl[crtc]) & ~1u);                                  // dce_v11_0_vga_enable(false)
   // the surface address is taken at vertical blank, not horizontal
@@ -151,9 +195,10 @@ bool Scanout::set(uint32_t crtc, const ScanoutSurface& s) {
   r_.write(kGrphSecondaryAddressHigh + off, static_cast<uint32_t>(s.address >> 32));
   r_.write(kGrphPrimaryAddress + off, static_cast<uint32_t>(s.address) & GRPH_PRIMARY_SURFACE_ADDRESS__GRPH_PRIMARY_SURFACE_ADDRESS_MASK);
   r_.write(kGrphSecondaryAddress + off, static_cast<uint32_t>(s.address) & GRPH_PRIMARY_SURFACE_ADDRESS__GRPH_PRIMARY_SURFACE_ADDRESS_MASK);
-  r_.write(kGrphControl + off, kGrphControlArgb8888);
-  r_.write(kGrphSwapCntl + off, 0);                                                              // no endian swap, no crossbar
-  r_.write(kGrphLut10BitBypass + off, r_.read(kGrphLut10BitBypass + off) & ~kLut10BitBypassEnable);       // (an 8 bit picture goes through the look-up table)
+  r_.write(kGrphControl + off, control);
+  r_.write(kGrphSwapCntl + off, fb.swap);                                                        // no endian swap (little endian)
+  const uint32_t bypass = r_.read(kGrphLut10BitBypass + off);
+  r_.write(kGrphLut10BitBypass + off, fb.bypass_lut ? (bypass | kLut10BitBypassEnable) : (bypass & ~kLut10BitBypassEnable));
   r_.write(kGrphSurfaceOffsetX + off, 0);
   r_.write(kGrphSurfaceOffsetY + off, 0);
   r_.write(kGrphXStart + off, 0);
@@ -163,9 +208,39 @@ bool Scanout::set(uint32_t crtc, const ScanoutSurface& s) {
   r_.write(kGrphPitch + off, s.pitch_pixels);
   r_.write(kGrphEnable + off, 1);                                                                // dce_v11_0_grph_enable(true)
   r_.write(kLbDesktopHeight + off, s.height);
-  r_.write(kViewportStart + off, 0);
+  r_.write(kViewportStart + off, ((s.x & ~3u) << 16) | (s.y & ~1u));
   r_.write(kViewportSize + off, (s.viewport_width << 16) | ((s.viewport_height + 1) & ~1u));
   r_.write(kCrtcMasterUpdateMode + off, 0);                                                      // the flip may happen anywhere in the vertical blank interval
+  return true;
+}
+
+bool Scanout::load_lut(uint32_t crtc, const LutEntry* table) {
+  if (crtc >= kMaxCrtcs) return false;
+  const uint32_t off = kCrtcOffsets[crtc];
+  auto modify = [&](uint32_t reg, uint32_t clear, uint32_t set) { r_.write(reg + off, (r_.read(reg + off) & ~clear) | set); };
+  modify(kInputCscControl, kInputCscGrphModeMask, 0);
+  modify(kPrescaleGrphControl, kPrescaleBypass, kPrescaleBypass);
+  modify(kInputGammaControl, kInputGammaModeMask, 0);
+  r_.write(kDcLutControl + off, 0);
+  r_.write(kDcLutBlackBlue + off, 0);
+  r_.write(kDcLutBlackGreen + off, 0);
+  r_.write(kDcLutBlackRed + off, 0);
+  r_.write(kDcLutWhiteBlue + off, 0xffff);
+  r_.write(kDcLutWhiteGreen + off, 0xffff);
+  r_.write(kDcLutWhiteRed + off, 0xffff);
+  r_.write(kDcLutRwMode + off, 0);
+  r_.write(kDcLutWriteEnMask + off, 0x7);
+  r_.write(kDcLutRwIndex + off, 0);
+  for (uint32_t i = 0; i < 256; ++i) {
+    const uint32_t r = table ? table[i].red : i << 8 | i, g = table ? table[i].green : i << 8 | i, b = table ? table[i].blue : i << 8 | i;
+    r_.write(kDcLut30Color + off, ((r & 0xffc0) << 14) | ((g & 0xffc0) << 4) | (b >> 6));
+  }
+  modify(kDegammaControl, kDegammaModeMask, 0);
+  modify(kGamutRemapControl, kGamutModeMask, 0);
+  modify(kRegammaControl, kRegammaModeMask, 0);
+  modify(kOutputCscControl, kOutputCscModeMask, 0);
+  r_.write(kDenormControl + off, 0);
+  modify(kAlphaControl, 0, kCursorAlphaBlend);
   return true;
 }
 

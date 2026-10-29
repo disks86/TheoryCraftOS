@@ -442,12 +442,31 @@ static void test_transmitter() {
   }
 }
 
+static void test_pick_pll() {
+  // DisplayPort: the DP DTO whatever the encoder; the others the combo PHY PLL of their UNIPHY and link
+  CHECK(AmdModeSet::pick_pll(AmdModeSet::kModeDp, 0x1E, false) == 11 && AmdModeSet::pick_pll(AmdModeSet::kModeDpMst, 0x25, true) == 11 && AmdModeSet::pick_pll(AmdModeSet::kModeDp, 0, false) == 11);
+  const struct { uint8_t encoder; bool link_b; uint8_t pll; } rows[] = {{0x1E, false, 20}, {0x1E, true, 21}, {0x20, false, 22}, {0x20, true, 23}, {0x21, false, 24}, {0x21, true, 25}};
+  for (const auto& r : rows)
+    for (uint8_t mode : {AmdModeSet::kModeHdmi, AmdModeSet::kModeDvi, AmdModeSet::kModeLvds}) CHECK(AmdModeSet::pick_pll(mode, r.encoder, r.link_b) == r.pll);
+  CHECK(AmdModeSet::pick_pll(AmdModeSet::kModeHdmi, 0x25, false) == 0xFF && AmdModeSet::pick_pll(AmdModeSet::kModeHdmi, 0, false) == 0xFF);
+  // the pixel clock table takes no CRTC (0xFF) for a combo PHY PLL being switched off, but no other CRTC that does not exist
+  Rig r;
+  AmdModeSet s(r.card, *r.bios);
+  ModeSetOutput off;
+  off.crtc = 0xFF;
+  off.pll = 22;
+  CHECK(s.set_pixel_clock(off, DisplayMode()) && r.card.calls[0].words == std::vector<uint32_t>({0u, 22u, 0xFFu, 0u}));
+  off.crtc = 7;
+  CHECK(!s.set_pixel_clock(off, DisplayMode()));
+}
+
 int main() {
   test_pixel_clock();
   test_crtc_timing();
   test_crtc_controls();
   test_encoder();
   test_transmitter();
+  test_pick_pll();
   printf(g_failed ? "AmdModeSetTest: %d FAILED\n" : "AmdModeSetTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }

@@ -40,6 +40,17 @@ uint8_t AmdModeSet::dig_encoder_id(uint8_t dig) {
   return dig < sizeof kIds ? kIds[dig] : 0;
 }
 
+uint8_t AmdModeSet::pick_pll(uint8_t encoder_mode, uint8_t encoder_id, bool link_b) {
+  if (is_dp(encoder_mode)) return kDpDto;
+  const uint8_t link = link_b ? 1 : 0;
+  switch (encoder_id) {
+    case 0x1E: return static_cast<uint8_t>(kComboPhyPll0 + link);        // ENCODER_OBJECT_ID_INTERNAL_UNIPHY
+    case 0x20: return static_cast<uint8_t>(kComboPhyPll0 + 2 + link);    // _UNIPHY1
+    case 0x21: return static_cast<uint8_t>(kComboPhyPll0 + 4 + link);    // _UNIPHY2
+    default: return kPllInvalid;
+  }
+}
+
 uint8_t AmdModeSet::panel_bpc(uint32_t bits_per_color) {
   switch (bits_per_color) {
     case 0: return 0;
@@ -54,7 +65,7 @@ uint8_t AmdModeSet::panel_bpc(uint32_t bits_per_color) {
 // PIXEL_CLOCK_PARAMETERS_V7, 16 bytes: ulPixelClock (100 Hz), ucPpll, ucTransmitterID, ucEncoderMode, ucMiscInfo, ucCRTC, ucDeepColorRatio, 2 + 4 reserved
 bool AmdModeSet::set_pixel_clock(const ModeSetOutput& out, const DisplayMode& mode) {
   uint8_t crev = 0;
-  if (!revision(bios_, kSetPixelClock, &crev) || crev != 7 || out.crtc >= kMaxCrtcs || mode.pixel_clock_khz > 0xFFFFFFFFu / 10) return false;
+  if (!revision(bios_, kSetPixelClock, &crev) || crev != 7 || (out.crtc >= kMaxCrtcs && out.crtc != kCrtcInvalid) || mode.pixel_clock_khz > 0xFFFFFFFFu / 10) return false;
   const uint32_t misc = out.encoder_mode == kModeDvi && mode.pixel_clock_khz > 165000 ? kMiscDviDualLink : 0;
   uint32_t deep = 0;                    // PIXEL_CLOCK_V7_DEEPCOLOR_RATIO_DIS / 5_4 / 3_2 / 2_1: for HDMI only
   if (out.encoder_mode == kModeHdmi) deep = out.bits_per_color == 10 ? 1 : out.bits_per_color == 12 ? 2 : out.bits_per_color == 16 ? 3 : 0;
