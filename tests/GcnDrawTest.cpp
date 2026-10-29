@@ -44,6 +44,7 @@ static const char* kVertex =
     "VERT\nDCL IN[0]\nDCL IN[1]\nDCL OUT[0], POSITION\nDCL OUT[1], GENERIC[0]\nDCL CONST[0..3]\nDCL TEMP[0]\n"
     "  0: MUL TEMP[0], CONST[0], IN[0].xxxx\n  1: MAD TEMP[0], CONST[1], IN[0].yyyy, TEMP[0]\n  2: MAD TEMP[0], CONST[2], IN[0].zzzz, TEMP[0]\n  3: ADD OUT[0], TEMP[0], CONST[3]\n  4: MOV OUT[1], IN[1]\n  5: END\n";
 static const char* kColoredFragment = "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\n  0: MOV OUT[0], IN[0]\n  1: END\n";
+static const char* kKillFragment = "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\n  0: KILL_IF IN[0]\n  1: MOV OUT[0], IN[0]\n  2: END\n";
 static const char* kTexturedFragment = "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\nDCL SAMP[0]\nDCL SVIEW[0], 2D, FLOAT\n  0: TEX OUT[0], IN[0], SAMP[0], 2D\n  1: END\n";
 
 struct Compiled {
@@ -71,8 +72,9 @@ struct Vertex7 { float p[3]; float c[4]; };
 
 struct Fixture {
   TestAllocator alloc;
-  Compiled vs, fs, tfs;
-  Fixture() : vs(alloc), fs(alloc), tfs(alloc) {
+  Compiled vs, fs, tfs, kfs;
+  Fixture() : vs(alloc), fs(alloc), tfs(alloc), kfs(alloc) {
+    compile(alloc, kKillFragment, &kfs);
     compile(alloc, kVertex, &vs);
     compile(alloc, kColoredFragment, &fs);
     compile(alloc, kTexturedFragment, &tfs);
@@ -274,15 +276,296 @@ static void test_inputs(Fixture& f) {
   CHECK(draw(f.alloc, ok, fb) == DrawStatus::Ok);
 }
 
+
+#include "Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnTiling.hpp"
+
+// Two triangles that cover the whole target, each of one colour at one depth (z in the NDC, w 1): the colour and the depth are the whole difference between them.
+struct Layers {
+  Vertex7 v[6];
+  uint32_t idx[6] = {0, 1, 2, 3, 4, 5};
+  Layers(float z0, const float c0[4], float z1, const float c1[4]) {
+    const float pos[3][2] = {{-1, -1}, {3, -1}, {-1, 3}};
+    for (int k = 0; k < 3; ++k) {
+      v[k] = {{pos[k][0], pos[k][1], z0}, {c0[0], c0[1], c0[2], c0[3]}};
+      v[3 + k] = {{pos[k][0], pos[k][1], z1}, {c1[0], c1[1], c1[2], c1[3]}};
+    }
+  }
+};
+
+static bool is_color(const Framebuffer& fb, uint32_t x, uint32_t y, float r, float g, float b, float a) {
+  const float* p = fb.pixel(x, y);
+  return fabsf(p[0] - r) < 1e-5f && fabsf(p[1] - g) < 1e-5f && fabsf(p[2] - b) < 1e-5f && fabsf(p[3] - a) < 1e-5f;
+}
+
+static void test_blending(Fixture& f) {
+  const float src[4] = {1, 0, 0, 0.25f};
+  Layers one(0.0f, src, 0.0f, src);
+  Framebuffer fb(f.alloc, 16, 16);
+  DrawCall c;
+  auto run = [&](const BlendState& b, uint32_t tris, float r, float g, float bl, float a) {
+    fb.clear(0, 0, 1, 1);
+    c = make_call(f, f.fs, kIdentity, as_words(one.v), 42, 28, 4, one.idx, tris * 3);
+    c.blend = b;
+    return draw(f.alloc, c, fb) == DrawStatus::Ok && is_color(fb, 8, 8, r, g, bl, a) && is_color(fb, 0, 0, r, g, bl, a) && is_color(fb, 15, 15, r, g, bl, a);
+  };
+  BlendState off;
+  CHECK(run(off, 1, 1, 0, 0, 0.25f));
+  BlendState alpha;                      // src alpha, 1 - src alpha: the colour 0.25 of the source over the blue; the alpha takes the colour's factors
+  alpha.enable = true; alpha.color_src = 4; alpha.color_dst = 5;
+  CHECK(run(alpha, 1, 0.25f, 0, 0.75f, 0.25f * 0.25f + 0.75f));
+  BlendState separate = alpha;
+  separate.separate_alpha = true; separate.alpha_src = 1; separate.alpha_dst = 0;
+  CHECK(run(separate, 1, 0.25f, 0, 0.75f, 0.25f));
+  BlendState add;
+  add.enable = true; add.color_src = 1; add.color_dst = 1;
+  CHECK(run(add, 1, 1, 0, 1, 1.25f));
+  BlendState sub = add;
+  sub.color_op = 1;
+  CHECK(run(sub, 1, 1, 0, -1, -0.75f));
+  BlendState rsub = add;
+  rsub.color_op = 4;
+  CHECK(run(rsub, 1, -1, 0, 1, 0.75f));
+  BlendState mn = add;
+  mn.color_op = 2;
+  CHECK(run(mn, 1, 0, 0, 0, 0.25f));
+  BlendState mx = add;
+  mx.color_op = 3;
+  CHECK(run(mx, 1, 1, 0, 1, 1));
+  BlendState constant;                   // src * constant colour
+  constant.enable = true; constant.color_src = 13; constant.color_dst = 0;
+  constant.constant[0] = 0.5f; constant.constant[1] = 0.25f; constant.constant[2] = 0.0f; constant.constant[3] = 0.1f;
+  CHECK(run(constant, 1, 0.5f, 0, 0, 0.025f));
+  BlendState inv = constant;             // dst * (1 - constant alpha) + src * constant alpha
+  inv.color_src = 19; inv.color_dst = 20;
+  CHECK(run(inv, 1, 0.1f, 0, 0.9f, 0.1f * 0.25f + 0.9f));
+  BlendState dst_col = add;              // src * dst colour + dst * 0
+  dst_col.color_src = 8; dst_col.color_dst = 0;
+  CHECK(run(dst_col, 1, 0, 0, 0, 0.25f));
+  BlendState sat = add;                  // saturate: min(src alpha, 1 - dst alpha) = min(0.25, 0) for the colour, 1 for alpha; dst * 0
+  sat.color_src = 10; sat.color_dst = 0;
+  CHECK(run(sat, 1, 0, 0, 0, 0.25f));
+  // two layers over each other: the blend sees the first layer's result
+  CHECK(run(alpha, 2, 0.4375f, 0, 0.5625f, 0.671875f));
+  // the write mask: only red and alpha are written (no blending)
+  BlendState mask;
+  mask.write_mask = 0x9;
+  CHECK(run(mask, 1, 1, 0, 1, 0.25f));
+  mask.write_mask = 0;
+  CHECK(run(mask, 1, 0, 0, 1, 1));
+  mask.write_mask = 0x3;
+  mask.enable = true; mask.color_src = 1; mask.color_dst = 1;
+  CHECK(run(mask, 1, 1, 0, 1, 1));
+  // refused: a factor that is not one
+  BlendState bad = add;
+  bad.color_src = 11;
+  fb.clear(0, 0, 0, 0);
+  c = make_call(f, f.fs, kIdentity, as_words(one.v), 42, 28, 4, one.idx, 3);
+  c.blend = bad;
+  CHECK(draw(f.alloc, c, fb) == DrawStatus::BadInput);
+}
+
+static void test_depth(Fixture& f) {
+  const float red[4] = {1, 0, 0, 1}, green[4] = {0, 1, 0, 1};
+  const float z_far = 0.5f, z_near = -0.5f;                            // (the viewport maps z to z / 2 + 0.5: 0.75 and 0.25)
+  Framebuffer fb(f.alloc, 16, 16);
+  DepthBuffer db(f.alloc, 16, 16);
+  CHECK(db.valid());
+  DrawCall c;
+  auto run = [&](float za, float zb, uint8_t func, float clear_depth, bool write) {
+    Layers l(za, red, zb, green);
+    fb.clear(0, 0, 0, 1);
+    db.clear(clear_depth, 0);
+    c = make_call(f, f.fs, kIdentity, as_words(l.v), 42, 28, 4, l.idx, 6);
+    c.depth = &db;
+    c.depth_stencil.depth_test = true;
+    c.depth_stencil.depth_write = write;
+    c.depth_stencil.depth_func = func;
+    return draw(f.alloc, c, fb);
+  };
+  // less: the nearer layer wins in either order, and the depth buffer holds its depth
+  CHECK(run(z_far, z_near, 1, 1.0f, true) == DrawStatus::Ok && is_color(fb, 8, 8, 0, 1, 0, 1) && fabsf(db.depth(8, 8) - 0.25f) < 1e-5f);
+  CHECK(run(z_near, z_far, 1, 1.0f, true) == DrawStatus::Ok && is_color(fb, 8, 8, 1, 0, 0, 1) && fabsf(db.depth(3, 12) - 0.25f) < 1e-5f);
+  // greater against a cleared 0: the farther layer wins
+  CHECK(run(z_far, z_near, 4, 0.0f, true) == DrawStatus::Ok && is_color(fb, 8, 8, 1, 0, 0, 1) && fabsf(db.depth(8, 8) - 0.75f) < 1e-5f);
+  // no depth write: the buffer keeps its clear value, and the second layer is tested against it as well
+  CHECK(run(z_far, z_near, 1, 1.0f, false) == DrawStatus::Ok && is_color(fb, 8, 8, 0, 1, 0, 1) && db.depth(8, 8) == 1.0f);
+  // never and always
+  CHECK(run(z_far, z_near, 0, 1.0f, true) == DrawStatus::Ok && is_color(fb, 8, 8, 0, 0, 0, 1) && db.depth(8, 8) == 1.0f);
+  CHECK(run(z_near, z_far, 7, 1.0f, true) == DrawStatus::Ok && is_color(fb, 8, 8, 0, 1, 0, 1) && fabsf(db.depth(8, 8) - 0.75f) < 1e-5f);
+  // equal: the same depth twice passes the second time (its depth is the one the first wrote), a different one does not
+  CHECK(run(z_near, z_near, 3, 1.0f, true) == DrawStatus::Ok && is_color(fb, 8, 8, 0, 1, 0, 1));
+  CHECK(run(z_far, z_near, 2, 0.25f, true) == DrawStatus::Ok && is_color(fb, 8, 8, 0, 1, 0, 1));
+  CHECK(run(z_far, z_far, 2, 0.25f, true) == DrawStatus::Ok && is_color(fb, 8, 8, 0, 0, 0, 1));
+  // not equal and greater or equal
+  CHECK(run(z_far, z_near, 5, 0.75f, true) == DrawStatus::Ok && is_color(fb, 8, 8, 0, 1, 0, 1));
+  CHECK(run(z_far, z_near, 6, 0.5f, true) == DrawStatus::Ok && is_color(fb, 8, 8, 1, 0, 0, 1));
+  // outside the depth range (z = 1.5 maps to 1.25) nothing is drawn, with the test on or off
+  CHECK(run(1.5f, 1.5f, 7, 1.0f, true) == DrawStatus::Ok && is_color(fb, 8, 8, 0, 0, 0, 1) && db.depth(8, 8) == 1.0f);
+  // a pixel the shader discards leaves the depth alone
+  {
+    const float neg[4] = {-1, 0, 0, 1};
+    Layers l(z_near, neg, z_near, neg);
+    fb.clear(0, 0, 0, 1);
+    db.clear(1.0f, 0);
+    DrawCall k = make_call(f, f.kfs, kIdentity, as_words(l.v), 42, 28, 4, l.idx, 6);
+    k.depth = &db;
+    k.depth_stencil.depth_test = true;
+    k.depth_stencil.depth_write = true;
+    k.depth_stencil.depth_func = 1;
+    CHECK(draw(f.alloc, k, fb) == DrawStatus::Ok && is_color(fb, 8, 8, 0, 0, 0, 1) && db.depth(8, 8) == 1.0f);
+  }
+  // the test needs a buffer of the target's size
+  {
+    Layers l(z_near, red, z_near, red);
+    DepthBuffer small(f.alloc, 8, 8);
+    DrawCall k = make_call(f, f.fs, kIdentity, as_words(l.v), 42, 28, 4, l.idx, 3);
+    k.depth_stencil.depth_test = true;
+    CHECK(draw(f.alloc, k, fb) == DrawStatus::BadInput);                 // none
+    k.depth = &small;
+    CHECK(draw(f.alloc, k, fb) == DrawStatus::BadInput);                 // too small
+    DepthBuffer ok(f.alloc, 16, 16);
+    k.depth = &ok;
+    k.depth_stencil.depth_func = 9;
+    CHECK(draw(f.alloc, k, fb) == DrawStatus::BadInput);                 // not a function
+  }
+}
+
+static void test_stencil(Fixture& f) {
+  const float red[4] = {1, 0, 0, 1}, green[4] = {0, 1, 0, 1};
+  Framebuffer fb(f.alloc, 16, 16);
+  DepthBuffer db(f.alloc, 16, 16);
+  DrawCall c;
+  auto run = [&](const DepthStencilState& s, uint8_t clear_stencil, float clear_depth, float za, float zb) {
+    Layers l(za, red, zb, green);
+    fb.clear(0, 0, 0, 1);
+    db.clear(clear_depth, clear_stencil);
+    c = make_call(f, f.fs, kIdentity, as_words(l.v), 42, 28, 4, l.idx, 6);
+    c.depth = &db;
+    c.depth_stencil = s;
+    return draw(f.alloc, c, fb);
+  };
+  DepthStencilState s;
+  s.stencil_test = true;
+  s.stencil_func = 7;                    // always, and increment (clamp) on pass: two layers count up by two
+  s.zpass_op = 5;
+  s.stencil_op_value = 1;
+  CHECK(run(s, 0, 1.0f, 0, 0) == DrawStatus::Ok && db.stencil(8, 8) == 2 && is_color(fb, 8, 8, 0, 1, 0, 1));
+  // the clamp and the wrap
+  CHECK(run(s, 254, 1.0f, 0, 0) == DrawStatus::Ok && db.stencil(8, 8) == 255);
+  s.zpass_op = 8;
+  CHECK(run(s, 254, 1.0f, 0, 0) == DrawStatus::Ok && db.stencil(8, 8) == 0);
+  s.zpass_op = 6;
+  CHECK(run(s, 1, 1.0f, 0, 0) == DrawStatus::Ok && db.stencil(8, 8) == 0);
+  s.zpass_op = 9;
+  CHECK(run(s, 1, 1.0f, 0, 0) == DrawStatus::Ok && db.stencil(8, 8) == 255);
+  // the other operations on pass: zero, ones, invert, replace with the reference, replace with the operation value
+  s.stencil_ref = 0x42; s.stencil_op_value = 0x17;
+  const uint8_t ops[5] = {1, 2, 7, 3, 4};
+  const uint8_t want[5] = {0, 0xFF, 0xF0, 0x42, 0x17};            // (two layers: the invert is undone)
+  for (int k = 0; k < 5; ++k) {
+    s.zpass_op = ops[k];
+    CHECK(run(s, 0xF0, 1.0f, 0, 0) == DrawStatus::Ok && db.stencil(8, 8) == want[k]);
+  }
+  // the test: equal to the reference under the mask; a failing pixel gets the fail operation and is not drawn
+  DepthStencilState t;
+  t.stencil_test = true;
+  t.stencil_func = 2; t.stencil_ref = 0x05; t.stencil_mask = 0x0F;
+  t.fail_op = 4; t.stencil_op_value = 0x77;
+  t.zpass_op = 0;
+  CHECK(run(t, 0xA5, 1.0f, 0, 0) == DrawStatus::Ok && is_color(fb, 8, 8, 0, 1, 0, 1) && db.stencil(8, 8) == 0xA5);           // 0xA5 & 0x0F == 5: passes
+  CHECK(run(t, 0xA6, 1.0f, 0, 0) == DrawStatus::Ok && is_color(fb, 8, 8, 0, 0, 0, 1) && db.stencil(8, 8) == 0x77);           // fails, replaced
+  t.stencil_write_mask = 0x0F;
+  CHECK(run(t, 0xA6, 1.0f, 0, 0) == DrawStatus::Ok && db.stencil(8, 8) == 0xA7);                                              // only the low bits written
+  // depth fail: the stencil takes the z fail operation, the colour is not drawn; with depth test on and the stencil passing it counts both
+  DepthStencilState z;
+  z.stencil_test = true; z.depth_test = true; z.depth_func = 1;
+  z.zfail_op = 5; z.zpass_op = 1; z.stencil_op_value = 1;
+  CHECK(run(z, 10, 0.25f, 0.5f, 0.5f) == DrawStatus::Ok && is_color(fb, 8, 8, 0, 0, 0, 1) && db.stencil(8, 8) == 12);           // z 0.75 is not less than 0.25: two z fails
+  CHECK(run(z, 10, 1.0f, 0.5f, 0.5f) == DrawStatus::Ok && is_color(fb, 8, 8, 0, 1, 0, 1) && db.stencil(8, 8) == 0);               // depth write is off: both layers pass and zero it
+  // a discarded pixel gets no pass operation
+  {
+    const float neg[4] = {-1, 0, 0, 1};
+    Layers l(0, neg, 0, neg);
+    fb.clear(0, 0, 0, 1);
+    db.clear(1.0f, 7);
+    DrawCall k = make_call(f, f.kfs, kIdentity, as_words(l.v), 42, 28, 4, l.idx, 6);
+    k.depth = &db;
+    k.depth_stencil.stencil_test = true;
+    k.depth_stencil.zpass_op = 1;
+    CHECK(draw(f.alloc, k, fb) == DrawStatus::Ok && db.stencil(8, 8) == 7);
+  }
+  // refused: an operation that does not exist
+  DepthStencilState bad;
+  bad.stencil_test = true;
+  bad.fail_op = 10;
+  CHECK(run(bad, 0, 1.0f, 0, 0) == DrawStatus::BadInput);
+}
+
+// a block of memory the texture unit reads
+struct TexMem final : ITexelMemory {
+  uint64_t base = 0x80000;
+  uint32_t words[1024] = {};
+  bool read32(uint64_t address, uint32_t* out) override {
+    if (address < base || (address & 3) != 0 || (address - base) / 4 >= 1024) return false;
+    *out = words[(address - base) / 4];
+    return true;
+  }
+};
+
+static void test_descriptor_textures(Fixture& f) {
+  // a 2 by 2 texture (red, green / blue, white), sampled by the pixel shader through its T# and S# with point filtering; the triangle covers the target with uv = position
+  TexMem mem;
+  const uint32_t texels[4] = {0xFF0000FFu, 0xFF00FF00u, 0xFFFF0000u, 0xFFFFFFFFu};         // (r g b a bytes, little endian words)
+  for (int k = 0; k < 4; ++k) mem.words[k] = texels[k];
+  struct TV { float p[3]; float uv[2]; };
+  const TV v[3] = {{{-1.0f, -1.0f, 0.0f}, {0, 1}}, {{3.0f, -1.0f, 0.0f}, {2, 1}}, {{-1.0f, 3.0f, 0.0f}, {0, -1}}};
+  const uint32_t idx[3] = {0, 1, 2};
+  Framebuffer fb(f.alloc, 16, 16);
+  fb.clear(0, 0, 0, 0);
+  DrawCall c = make_call(f, f.tfs, kIdentity, reinterpret_cast<const uint32_t*>(v), 15, 20, 2, idx, 3);
+  ImageDescriptor img;
+  img.address = mem.base; img.width = 2; img.height = 2; img.pitch_pixels = 2; img.format = TexelFormat::Rgba8Unorm; img.tile_index = 8;
+  SamplerDescriptor smp;
+  CHECK(make_image_descriptor(ArrayView<uint32_t>(c.image_words[0], 8), img));
+  CHECK(make_sampler_descriptor(ArrayView<uint32_t>(c.sampler_words[0], 4), smp));
+  c.descriptors_set = 1;
+  c.texel_memory = &mem;
+  CHECK(draw(f.alloc, c, fb) == DrawStatus::Ok);
+  // uv.x = x / 16 and uv.y = 1 - y / 16 * 2 ... u runs 0 to 1 over the target (position -1..1 maps u 0..1), v from 1 at the bottom to 0 at the top (clamped by wrap)
+  CHECK(is_color(fb, 2, 14, 1, 0, 0, 1) || is_color(fb, 2, 14, 0, 0, 1, 1) || is_color(fb, 2, 14, 0, 1, 0, 1) || is_color(fb, 2, 14, 1, 1, 1, 1));
+  // the left half is the first column of texels, the right half the second: red or blue on the left, green or white on the right
+  uint32_t left_ok = 0, right_ok = 0;
+  for (uint32_t y = 0; y < 16; ++y) {
+    for (uint32_t x = 0; x < 6; ++x) left_ok += is_color(fb, x, y, 1, 0, 0, 1) || is_color(fb, x, y, 0, 0, 1, 1);
+    for (uint32_t x = 10; x < 16; ++x) right_ok += is_color(fb, x, y, 0, 1, 0, 1) || is_color(fb, x, y, 1, 1, 1, 1);
+  }
+  CHECK(left_ok == 96 && right_ok == 96);
+  // a T# the memory cannot satisfy is a shader fault; so is a unit with no descriptor and no memory
+  DrawCall far = c;
+  far.image_words[0][0] = 0x1000;                                       // some other address
+  CHECK(draw(f.alloc, far, fb) == DrawStatus::ShaderFault);
+  DrawCall none = c;
+  none.texel_memory = nullptr;
+  CHECK(draw(f.alloc, none, fb) == DrawStatus::ShaderFault);
+  // a sampler the unit does not implement
+  DrawCall badS = c;
+  badS.sampler_words[0][0] |= 1u << 28;                                  // a filter mode
+  CHECK(draw(f.alloc, badS, fb) == DrawStatus::ShaderFault);
+}
+
 int main() {
   Fixture f;
-  if (!f.vs.ok || !f.fs.ok || !f.tfs.ok) { printf("FAILED: the shaders did not compile\n"); return 1; }
+  if (!f.vs.ok || !f.fs.ok || !f.tfs.ok || !f.kfs.ok) { printf("FAILED: the shaders did not compile\n"); return 1; }
   test_triangle(f);
   test_quad(f);
   test_perspective(f);
   test_behind_viewer(f);
   test_textured(f);
   test_inputs(f);
+  test_blending(f);
+  test_depth(f);
+  test_stencil(f);
+  test_descriptor_textures(f);
   printf(g_failed ? "GcnDrawTest: %d FAILED\n" : "GcnDrawTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }
