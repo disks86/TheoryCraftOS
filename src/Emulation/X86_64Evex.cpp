@@ -489,7 +489,9 @@ X86_64Cpu::Step X86_64Cpu::step_evex(GuestMemory& m) {
   const uint8_t opcode = next_u8();
   if (d_.truncated) return bad_decode();
   if ((p0 & 7) == 4) return apx_map4(m, p0, p1, p2, opcode);      // Intel APX: the promoted legacy instructions
-  if ((p0 & 0x08) != 0 || !(p1 & 4)) return fail(6);
+  // (Intel APX: P0[3] is B4 and, with a memory operand, P1[2] is ~X4; the GPR base / index / r/m registers can be R16..R31. With a register operand U must stay 1.)
+  const bool b4 = p0 & 0x08, x4 = !(p1 & 4);
+  if (x4 && d_.position < d_.available && (d_.bytes[d_.position] >> 6) == 3) return fail(6);
   const uint32_t map = p0 & 7;
   if (map == 0) return fail(6);
   const bool w = p1 >> 7;
@@ -534,8 +536,19 @@ X86_64Cpu::Step X86_64Cpu::step_evex(GuestMemory& m) {
     s_.rip += d_.position;
     return Step::Ok;
   }
-  if (!def) return fail(6);
+  if (!def) return apx_promoted_vex(m, p0, p1, p2, map, opcode);
   const uint32_t elem = def->elem ? def->elem : (w ? 64 : 32);
+  {      // the APX register bits: a memory operand's base and index, a GPR r/m or reg operand; unused ones are ignored
+    const bool memory_form = d_.position < d_.available && (d_.bytes[d_.position] >> 6) != 3;
+    const bool gpr_rm = def->kind == kMoveGpr || def->kind == kBroadcastGpr || def->kind == kInsertElem || def->kind == kExtractElem || def->kind == kCvtFromGpr;
+    if (memory_form) {
+      d_.rex_b4 = b4;
+      d_.rex_x4 = x4;
+    } else if (gpr_rm) {
+      d_.rex_b4 = b4;
+    }
+    if (def->kind == kCvtToGpr) d_.rex_r4 = r_high;
+  }
 
   if (def->kind == kGather || def->kind == kScatter) {
     ev_ = EvexContext();
@@ -573,8 +586,8 @@ X86_64Cpu::Step X86_64Cpu::step_evex(GuestMemory& m) {
     const uint32_t vb = vl / 8;
     switch (def->tuple) {
       case kFullMem: n = (def->kind == kDup && def->sub == 6 && vl == 128) ? 8 : vb; break;
-      case kFull: n = ev_.bcst ? (def->kind == kCvt || def->map >= 5 || (elem == 16 && def->kind >= kFpBin && def->kind <= kRsqrt14) || def->kind == kBfloat ? elem / 8 : (w ? 8 : 4)) : vb; break;
-      case kHalf: n = ev_.bcst ? (def->kind == kCvt || def->map >= 5 || (elem == 16 && def->kind >= kFpBin && def->kind <= kRsqrt14) || def->kind == kBfloat ? elem / 8 : (w ? 8 : 4)) : vb / 2; break;
+      case kFull: n = ev_.bcst ? (def->kind == kCvt || def->map >= 5 || (elem == 16 && def->kind >= kFpBin && def->kind <= kRsqrt14) || def->kind == kBfloat || def->kind == kFp8 ? elem / 8 : (w ? 8 : 4)) : vb; break;
+      case kHalf: n = ev_.bcst ? (def->kind == kCvt || def->map >= 5 || (elem == 16 && def->kind >= kFpBin && def->kind <= kRsqrt14) || def->kind == kBfloat || def->kind == kFp8 ? elem / 8 : (w ? 8 : 4)) : vb / 2; break;
       case kQuarter: n = ev_.bcst ? elem / 8 : vb / 4; break;
       case kEighth: n = vb / 8; break;
       case kScalar: n = elem / 8; break;
@@ -609,6 +622,7 @@ X86_64Cpu::Step X86_64Cpu::step_evex(GuestMemory& m) {
     case kBfloat: return evex_bf16(m, *def);
     case kMinMax: case kComx: return evex_minmax(m, *def);
     case kDpPh: case kMpsadbw: case kSatCvt: return evex_avx102(m, *def);
+    case kFp8: return evex_fp8(m, *def);
     case kDot: case kVnni: case kMadd52: case kMultishift: case kShufBit: case kShift2: case kShift2Var: case kGfAffine: case kGfMul: case kBf16: case kAesNi: case kClmul: case kBroadcastMask: case kDbpsadbw:
       return evex_ext(m, *def);
     default: return evex_misc(m, *def);

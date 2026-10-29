@@ -482,6 +482,7 @@ X86_64Cpu::Step X86_64Cpu::vex_map2(GuestMemory& m, uint8_t op, bool wide_w, uin
   if (op >= 0x90 && op <= 0x93) return vex_gather(m, op, wide_w, vvvv);
   if ((op >= 0x96 && op <= 0x9F) || (op >= 0xA6 && op <= 0xAF) || (op >= 0xB6 && op <= 0xBF)) return vex_fma(m, op, wide_w, vvvv);
   if (op == 0xF2 || op == 0xF3 || op == 0xF5 || op == 0xF6 || op == 0xF7) return vex_bmi(m, 2, op, wide_w, vvvv);
+  if ((op & 0xF0) == 0xE0) return cmpxadd_instruction(m, op, wide_w, vvvv);
   if ((op >= 0xDB && op <= 0xDF) || op == 0xCF || op == 0xCB || op == 0xCC || op == 0xCD || op == 0xDA) return crypto_map(m, 2, op, wide_w, vvvv);
   if (op == 0xB0 || op == 0xB1) return vex_ne_convert(m, op, wide_w, vvvv);
   if ((op >= 0x50 && op <= 0x53) || op == 0xB4 || op == 0xB5 || op == 0xD2 || op == 0xD3 || (op == 0x72 && pp == 2)) return vex_via_evex(m, 2, op, wide_w, vvvv);
@@ -673,6 +674,7 @@ X86_64Cpu::Step X86_64Cpu::vex_map3(GuestMemory& m, uint8_t op, bool wide_w, uin
   if (op == 0x44 || op == 0xDF || op == 0xCE || op == 0xCF || op == 0xDE) return crypto_map(m, 3, op, wide_w, vvvv);
   if (pp != 1) return fail(6);
   if ((op >= 0x5C && op <= 0x5F) || (op >= 0x68 && op <= 0x6F) || (op >= 0x78 && op <= 0x7F)) return fma4_instruction(m, op, wide_w, vvvv);
+  if (op == 0x48 || op == 0x49) return vpermil2_instruction(m, op, wide_w, vvvv);
   if (!decode_modrm()) return bad_decode();
   const uint32_t imm = static_cast<uint32_t>(next_imm(1, false));
   if (!finish_decode()) return bad_decode();
@@ -1163,18 +1165,19 @@ X86_64Cpu::Step X86_64Cpu::vex_bmi(GuestMemory& m, int map, uint8_t op, bool wid
 X86_64Cpu::Step X86_64Cpu::xsave_family(GuestMemory& m, uint32_t kind) {
   const uint64_t address = memory_address();
   const uint64_t requested = (s_.r[0] & 0xFFFFFFFFu) | (s_.r[2] << 32);
-  const uint64_t features = requested & 0xE00E7;      // XCR0: x87, SSE, AVX, opmask, ZMM_Hi256, Hi16_ZMM, TILECFG, TILEDATA, APX (R16..R31)
+  constexpr uint64_t kLwpBit = uint64_t{1} << 62;
+  const uint64_t features = requested & (0xE00E7 | kLwpBit);      // XCR0: x87, SSE, AVX, opmask, ZMM_Hi256, Hi16_ZMM, TILECFG, TILEDATA, APX (R16..R31), LWP
   uint8_t image[2688] = {};
   auto put64 = [&](uint32_t at, uint64_t v) { for (uint32_t b = 0; b < 8; ++b) image[at + b] = static_cast<uint8_t>(v >> (8 * b)); };
   auto get64 = [&](uint32_t at) { uint64_t v = 0; for (uint32_t b = 0; b < 8; ++b) v |= uint64_t{image[at + b]} << (8 * b); return v; };
   // The components above the legacy area: feature bit, size, and offset in the standard format.
   struct Component { uint64_t bit; uint32_t size, standard; };
-  static constexpr Component kComponents[7] = {{4, 256, 576}, {0x20, 64, 1088}, {0x40, 512, 1152}, {0x80, 1024, 1664}, {0x20000, 64, 2752}, {0x40000, 8192, 2816}, {0x80000, 128, 11008}};
+  static constexpr Component kComponents[8] = {{4, 256, 576}, {0x20, 64, 1088}, {0x40, 512, 1152}, {0x80, 1024, 1664}, {0x20000, 64, 2752}, {0x40000, 8192, 2816}, {0x80000, 128, 11008}, {kLwpBit, 128, 832}};
   // Offsets of the components in the format being used: `present` is the set of components stored (the compacted format packs those; the tile components start on a 64-byte boundary).
   uint32_t legacy_end = 576;      // where the components before the tiles end in the compacted format
-  auto offsets = [&](bool compacted, uint64_t present, uint32_t out[7]) {
+  auto offsets = [&](bool compacted, uint64_t present, uint32_t out[8]) {
     uint32_t next = 576;
-    for (uint32_t c = 0; c < 7; ++c) {
+    for (uint32_t c = 0; c < 8; ++c) {
       if (c == 4) legacy_end = next;
       if (c == 4 || c == 5) next = (next + 63) & ~63u;
       out[c] = compacted ? next : kComponents[c].standard;
@@ -1184,12 +1187,12 @@ X86_64Cpu::Step X86_64Cpu::xsave_family(GuestMemory& m, uint32_t kind) {
   };
   if (kind != 5) {
     const bool compacted = kind == 8;
-    uint32_t at[7];
+    uint32_t at[8];
     offsets(compacted, features, at);
     uint32_t bytes = compacted ? legacy_end : (features & 0xE0) ? 2688 : (features & 4) ? 832 : 576;
     bool apx_used = false;
     for (uint32_t i = 16; i < 32; ++i) apx_used |= s_.r[i] != 0;
-    const uint64_t in_use = features & ~((tiles_configured() ? uint64_t{0} : uint64_t{0x60000}) | (apx_used ? uint64_t{0} : uint64_t{0x80000}));      // (a tile component is saved only with the tiles configured; XSTATE_BV says which were)      // (unconfigured tiles are in their initial state)
+    const uint64_t in_use = features & ~((tiles_configured() ? uint64_t{0} : uint64_t{0x60000}) | (apx_used ? uint64_t{0} : uint64_t{0x80000}) | (lwp_.cb != 0 ? uint64_t{0} : kLwpBit));      // (a tile component is saved only with the tiles configured; XSTATE_BV says which were)      // (unconfigured tiles are in their initial state)
     save_fpu_image(image);
     put64(512, in_use);      // XSTATE_BV: everything requested is in use
     if (compacted) put64(520, features | (uint64_t{1} << 63));
@@ -1218,6 +1221,13 @@ X86_64Cpu::Step X86_64Cpu::xsave_family(GuestMemory& m, uint32_t kind) {
       for (uint32_t i = 0; i < 16; ++i) for (uint32_t b = 0; b < 8; ++b) apx[8 * i + b] = static_cast<uint8_t>(s_.r[16 + i] >> (8 * b));
       if (!m.write(address + at[6], ConstByteView(apx, sizeof(apx)))) return fail(14, address + at[6], 2);
     }
+    if (in_use & kLwpBit) {      // (a layout of this emulator's own)
+      uint8_t area[128] = {};
+      auto put = [&](uint32_t at_byte, uint64_t v, uint32_t n) { for (uint32_t b = 0; b < n; ++b) area[at_byte + b] = static_cast<uint8_t>(v >> (8 * b)); };
+      put(0, lwp_.cb, 8); put(8, lwp_.buffer_base, 8); put(16, lwp_.missed, 8); put(24, lwp_.buffer_size, 4); put(28, lwp_.flags, 4); put(32, lwp_.threshold, 4);
+      put(36, lwp_.random_bits, 4); put(40, lwp_.head, 4); put(44, static_cast<uint32_t>(lwp_.counter), 4); put(48, static_cast<uint32_t>(lwp_.interval), 4);
+      if (!m.write(address + at[7], ConstByteView(area, sizeof(area)))) return fail(14, address + at[7], 2);
+    }
     if (in_use & 0x40000)
       for (uint32_t t = 0; t < 8; ++t)
         if (!m.write(address + at[5] + 1024 * t, ConstByteView(tiles_.data[t], 1024))) return fail(14, address + at[5] + 1024 * t, 2);
@@ -1227,7 +1237,7 @@ X86_64Cpu::Step X86_64Cpu::xsave_family(GuestMemory& m, uint32_t kind) {
   if (!m.read(address, ByteView(image, 576))) return fail(14, address, 0);
   const uint64_t bv = get64(512), comp = get64(520);
   const bool compacted = (comp >> 63) & 1;
-  uint32_t at[7];
+  uint32_t at[8];
   offsets(compacted, compacted ? comp : features, at);
   const uint64_t bytes = compacted ? legacy_end : (features & 0xE0) ? 2688 : (features & 4) ? 832 : 576;
   if (bytes > 576 && !m.read(address + 576, ByteView(image + 576, bytes - 576))) return fail(14, address + 576, 0);
@@ -1253,6 +1263,20 @@ X86_64Cpu::Step X86_64Cpu::xsave_family(GuestMemory& m, uint32_t kind) {
         for (auto& tile : tiles_.data) ByteView(tile, sizeof(tile)).fill(0);
       }
     }
+  }
+  if (features & kLwpBit) {      // LWP: off unless the area is marked present; the state is checked before it is installed
+    Lwp restored;
+    if (bv & kLwpBit) {
+      uint8_t area[128];
+      if (!m.read(address + at[7], ByteView(area, sizeof(area)))) return fail(14, address + at[7], 0);
+      auto get = [&](uint32_t at_byte, uint32_t n) { uint64_t v = 0; for (uint32_t b = 0; b < n; ++b) v |= uint64_t{area[at_byte + b]} << (8 * b); return v; };
+      restored.cb = get(0, 8); restored.buffer_base = get(8, 8); restored.missed = get(16, 8); restored.buffer_size = static_cast<uint32_t>(get(24, 4)); restored.flags = static_cast<uint32_t>(get(28, 4));
+      restored.threshold = static_cast<uint32_t>(get(32, 4)); restored.random_bits = static_cast<uint32_t>(get(36, 4)); restored.head = static_cast<uint32_t>(get(40, 4));
+      restored.counter = static_cast<int32_t>(get(44, 4)); restored.interval = static_cast<int32_t>(get(48, 4));
+      if (restored.cb != 0 && (restored.buffer_size % 32 != 0 || restored.buffer_size < 32 * 32 || restored.head >= restored.buffer_size || (restored.flags & ~0x60000002u))) return fail(13);
+      if (restored.cb == 0) restored = Lwp();
+    }
+    lwp_ = restored;
   }
   if (features & 0x80000) {
     for (uint32_t i = 0; i < 16; ++i) s_.r[16 + i] = 0;

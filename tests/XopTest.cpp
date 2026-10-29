@@ -58,7 +58,7 @@ struct Machine {
     cpu.reset(start);
     cpu.state().r[7] = kBase;
   }
-  StopReason run(uint64_t n = 8) { process::AddressSpace& s = space; GuestMemory m(s); return cpu.run(m, n); }
+  StopReason run(uint64_t n = 200) { process::AddressSpace& s = space; GuestMemory m(s); return cpu.run(m, n); }
   bool finished() { return run() == StopReason::Fault && cpu.fault().vector == 6 && cpu.fault().pc == end; }
   bool undefined() { return run() == StopReason::Fault && cpu.fault().vector == 6 && cpu.fault().pc != end; }
   void poke(uint64_t addr, const void* p, size_t n) { space.write_privileged(addr, ConstByteView(static_cast<const uint8_t*>(p), n)); }
@@ -422,6 +422,286 @@ static void test_tbm() {
 
 // --- decoding --------------------------------------------------------------------------------------------------------------------------
 
+
+// --- LWP -------------------------------------------------------------------------------------------------------------------------------
+
+constexpr uint64_t kLwpcb = 0x21000, kRing = 0x21400;
+static void put_u32(Machine& m, uint64_t at, uint32_t v) { m.poke(at, &v, 4); }
+static void put_u64(Machine& m, uint64_t at, uint64_t v) { m.poke(at, &v, 8); }
+static uint64_t get_mem(Machine& m, uint64_t at, int n = 8) {
+  uint64_t v = 0;
+  GuestMemory gm(m.space);
+  uint8_t raw[8] = {};
+  gm.read(at, ByteView(raw, n));
+  memcpy(&v, raw, n);
+  return v;
+}
+// A control block for the ring buffer at kRing: flags, size in bytes, interval and counter of the value sample event.
+static void make_lwpcb(Machine& m, uint32_t flags, uint32_t size, int32_t interval = 0, int32_t counter = 0) {
+  put_u32(m, kLwpcb + 0, flags);
+  put_u32(m, kLwpcb + 4, size);
+  put_u64(m, kLwpcb + 8, kRing);
+  put_u32(m, kLwpcb + 88, uint32_t(interval) & 0x3FFFFFF);
+  put_u32(m, kLwpcb + 92, uint32_t(counter) & 0x3FFFFFF);
+}
+static Bytes llwpcb(bool w = true) { return xop(9, 0x12, w, 0, false, false, {}, 0); }       // llwpcb rdx
+static Bytes slwpcb(bool w = true) { return xop(9, 0x12, w, 0, false, false, {}, 1); }       // slwpcb rdx
+static Bytes lwpval(bool w = true) { return xop(0xA, 0x12, w, 1, false, true, {0x78, 0x56, 0x34, 0x12}, 1); }      // lwpval rcx, [rdi], 0x12345678
+static Bytes lwpins(bool w = true) { return xop(0xA, 0x12, w, 1, false, true, {0x78, 0x56, 0x34, 0x12}, 0); }      // lwpins rcx, [rdi], 0x12345678
+static Bytes strip(Bytes b) { b.pop_back(); b.pop_back(); return b; }
+static Bytes join(std::initializer_list<Bytes> parts) { Bytes out; for (const Bytes& p : parts) { Bytes s = strip(p); out.insert(out.end(), s.begin(), s.end()); } out.push_back(0x0F); out.push_back(0x0B); return out; }
+
+static void test_lwp() {
+  {      // a value sample, then slwpcb: the record, the head pointer and the control block address
+    Bytes code = join({llwpcb(), lwpval(), slwpcb()});
+    Machine m(code);
+    make_lwpcb(m, 0xFFFFFFFF, 1024);
+    put_u32(m, kBase, 0xCAFEF00D);
+    m.cpu.state().r[2] = kLwpcb;
+    m.cpu.state().r[1] = 0x1122334455667788ull;
+    CHECK(m.finished());
+    CHECK(m.cpu.state().r[2] == kLwpcb);      // slwpcb replaced rdx
+    CHECK(get_mem(m, kLwpcb, 4) == 0x60000002);      // only the available features stay: LWPVAL, continuous mode, time stamps
+    CHECK(get_mem(m, kLwpcb + 16, 4) == 32 && get_mem(m, kLwpcb + 24) == 0);
+    CHECK(get_mem(m, kRing + 0, 1) == 1 && get_mem(m, kRing + 1, 1) == 0 && get_mem(m, kRing + 2, 2) == 0x5678);
+    CHECK(get_mem(m, kRing + 4, 4) == 0xCAFEF00D);
+    CHECK(get_mem(m, kRing + 8) == 0x10000 + llwpcb().size() - 2);      // the address of the lwpval
+    CHECK(get_mem(m, kRing + 16) == 0x1122334455667788ull);
+    CHECK(get_mem(m, kRing + 24) != 0);      // (PTSC was requested)
+  }
+  {      // a smaller operand: Data2 zero-extended, the 32-bit address
+    Bytes code = join({llwpcb(false), lwpval(false), slwpcb(false)});
+    Machine m(code);
+    make_lwpcb(m, 0x2, 1024);
+    m.cpu.state().r[2] = 0xFFFFFFFF00000000ull | kLwpcb;
+    m.cpu.state().r[1] = 0x1122334455667788ull;
+    CHECK(m.finished());
+    CHECK(m.cpu.state().r[2] == kLwpcb);
+    CHECK(get_mem(m, kRing + 16) == 0x55667788ull);
+    CHECK(get_mem(m, kRing + 24) == 0);      // no time stamp without PTSC
+  }
+  {      // the event interval: every third value sample is stored
+    Bytes code = join({llwpcb(), lwpval(), lwpval(), lwpval(), lwpval(), lwpval(), lwpval(), slwpcb()});
+    Machine m(code);
+    make_lwpcb(m, 0x2, 1024, 2);
+    m.cpu.state().r[2] = kLwpcb;
+    CHECK(m.finished());
+    CHECK(get_mem(m, kLwpcb + 16, 4) == 64);      // two records: the first and the fourth
+    CHECK(get_mem(m, kRing + 8) != get_mem(m, kRing + 40));
+    CHECK(get_mem(m, kRing + 40) == get_mem(m, kRing + 8) + 3 * lwpval().size() - 6);
+    CHECK(get_mem(m, kLwpcb + 92, 4) == 0);      // the counter: reset to 2 by the fourth, then counted down by two samples
+  }
+  {      // lwpins in synchronized mode: 31 records fit, the 32nd and later ones overwrite the last record, set CF and count as missed
+    Bytes code;
+    std::vector<Bytes> parts = {llwpcb()};
+    for (int i = 0; i < 31; ++i) parts.push_back(lwpins());
+    parts.push_back(Bytes{0x0F, 0x92, 0xC3, 0x0F, 0x0B});      // setc bl
+    parts.push_back(lwpins());
+    parts.push_back(Bytes{0x41, 0x0F, 0x92, 0xC0, 0x0F, 0x0B});      // setc r8b
+    parts.push_back(lwpins());
+    parts.push_back(slwpcb());
+    for (const Bytes& p : parts) { Bytes s = strip(p); code.insert(code.end(), s.begin(), s.end()); }
+    code.push_back(0x0F); code.push_back(0x0B);
+    Machine m(code);
+    make_lwpcb(m, 0x2, 1024);
+    m.cpu.state().r[2] = kLwpcb;
+    m.cpu.state().rflags |= 1;
+    CHECK(m.finished());
+    CHECK((m.cpu.state().r[3] & 0xFF) == 0);      // the 31st fit
+    CHECK((m.cpu.state().r[8] & 0xFF) == 1);      // the 32nd did not
+    CHECK(get_mem(m, kLwpcb + 16, 4) == 31 * 32 && get_mem(m, kLwpcb + 24) == 2);
+    CHECK(get_mem(m, kRing + 30 * 32, 1) == 255);
+  }
+  {      // continuous mode wraps: the head goes round and MissedEvents counts the wrap
+    std::vector<Bytes> parts = {llwpcb()};
+    for (int i = 0; i < 40; ++i) parts.push_back(lwpins());
+    parts.push_back(slwpcb());
+    Bytes code;
+    for (const Bytes& p : parts) { Bytes s = strip(p); code.insert(code.end(), s.begin(), s.end()); }
+    code.push_back(0x0F); code.push_back(0x0B);
+    Machine m(code);
+    make_lwpcb(m, 0x20000002, 1024);
+    m.cpu.state().r[2] = kLwpcb;
+    CHECK(m.finished());
+    CHECK(get_mem(m, kLwpcb + 16, 4) == 8 * 32 && get_mem(m, kLwpcb + 24) == 1);
+  }
+  {      // the software tail pointer frees space
+    Bytes code = join({llwpcb(), lwpins(), slwpcb()});
+    Machine m(code);
+    make_lwpcb(m, 0x2, 1024);
+    put_u32(m, kLwpcb + 16, 30 * 32);      // head: 30 records in
+    put_u32(m, kLwpcb + 64, 31 * 32);      // tail: one past
+    m.cpu.state().r[2] = kLwpcb;
+    CHECK(m.finished());
+    CHECK(get_mem(m, kLwpcb + 24) == 1);      // the next head (31) is the tail: full
+    CHECK(get_mem(m, kLwpcb + 16, 4) == 30 * 32);
+  }
+  {      // without llwpcb, and after llwpcb with zero: lwpins clears CF, lwpval does nothing, slwpcb gives zero
+    Bytes code = join({lwpins(), lwpval(), slwpcb()});
+    Machine m(code);
+    m.cpu.state().rflags |= 1;
+    m.cpu.state().r[2] = 5;
+    m.cpu.state().r[7] = 0xDEAD0000;      // (the memory operand is never touched)
+    CHECK(m.finished());
+    CHECK(m.cpu.state().r[2] == 0 && !(m.cpu.state().rflags & 1));
+    Bytes code2 = join({llwpcb(), lwpval(), Bytes{0x48, 0x31, 0xD2, 0x0F, 0x0B}, llwpcb(), lwpins(), slwpcb()});      // (xor rdx, rdx; llwpcb rdx)
+    Machine n(code2);
+    make_lwpcb(n, 0x2, 1024);
+    put_u32(n, kBase, 7);
+    n.cpu.state().r[2] = kLwpcb;
+    CHECK(n.finished());
+    CHECK(n.cpu.state().r[2] == 0);
+    CHECK(get_mem(n, kLwpcb + 16, 4) == 32);      // only the value sample before the stop was stored (and flushed by the llwpcb that stopped it)
+  }
+  {      // the value sample that is not stored does not read its operand; the stored one does
+    Bytes code = join({llwpcb(), lwpval()});
+    Machine m(code);
+    make_lwpcb(m, 0x2, 1024, 5, 3);
+    m.cpu.state().r[2] = kLwpcb;
+    m.cpu.state().r[7] = 0xDEAD0000;
+    CHECK(m.finished());
+    Machine n(code);
+    make_lwpcb(n, 0x2, 1024, 5, 0);
+    n.cpu.state().r[2] = kLwpcb;
+    n.cpu.state().r[7] = 0xDEAD0000;
+    CHECK(n.run() == StopReason::Fault && n.cpu.fault().vector == 14);
+  }
+  {      // an undersized ring buffer is #GP and leaves LWP off; negative intervals and counters become zero
+    Bytes code = join({llwpcb()});
+    Machine m(code);
+    make_lwpcb(m, 0x2, 512);
+    m.cpu.state().r[2] = kLwpcb;
+    CHECK(m.run() == StopReason::Fault && m.cpu.fault().vector == 13);
+    Bytes code2 = join({llwpcb(), slwpcb()});
+    Machine n(code2);
+    make_lwpcb(n, 0x2, 4096, -5, -9);
+    n.cpu.state().r[2] = kLwpcb;
+    CHECK(n.finished());
+    CHECK(n.cpu.state().r[2] == kLwpcb);
+    CHECK(get_mem(n, kLwpcb + 88, 4) == 0 && get_mem(n, kLwpcb + 92, 4) == 0);
+  }
+  {      // llwpcb with an unreadable control block is #PF and leaves LWP off
+    Machine m(join({llwpcb(), slwpcb()}));
+    m.cpu.state().r[2] = 0xDEAD0000;
+    CHECK(m.run() == StopReason::Fault && m.cpu.fault().vector == 14);
+  }
+  {      // encodings: a memory operand or a nonzero vvvv on llwpcb / slwpcb, L = 1, a reserved reg field
+    Machine a(xop(9, 0x12, true, 0, false, true, {}, 0));
+    CHECK(a.undefined());
+    Machine b(xop(9, 0x12, true, 1, false, false, {}, 0));
+    CHECK(b.undefined());
+    Machine c(xop(9, 0x12, true, 0, true, false, {}, 0));
+    CHECK(c.undefined());
+    Machine d(xop(9, 0x12, true, 0, false, false, {}, 2));
+    CHECK(d.undefined());
+    Machine e(xop(0xA, 0x12, true, 1, false, true, {1, 2, 3, 4}, 2));
+    CHECK(e.undefined());
+    Machine f(xop(0xA, 0x12, true, 1, true, true, {1, 2, 3, 4}, 0));
+    CHECK(f.undefined());
+  }
+  {      // XSAVE and XRSTOR carry the session (component 62): stop it, restore it, and slwpcb finds it
+    const Bytes save = {0x0F, 0xAE, 0x27};      // xsave [rdi]
+    const Bytes stop = {0x31, 0xD2};      // xor edx, edx
+    const Bytes restore = {0x0F, 0xAE, 0x2F};      // xrstor [rdi]
+    Bytes full = {0x48, 0x89, 0xD6};      // mov rsi, rdx  (remember the control block address)
+    Bytes l = strip(llwpcb());
+    full.insert(full.end(), l.begin(), l.end());
+    full.insert(full.end(), {0xB8, 0, 0, 0, 0, 0xBA, 0, 0, 0, 0x40});
+    full.insert(full.end(), save.begin(), save.end());
+    full.insert(full.end(), stop.begin(), stop.end());
+    Bytes stop_session = strip(llwpcb());
+    full.insert(full.end(), stop_session.begin(), stop_session.end());      // llwpcb rdx = 0
+    Bytes sl = strip(slwpcb());
+    full.insert(full.end(), sl.begin(), sl.end());      // slwpcb rdx -> 0
+    full.insert(full.end(), {0x49, 0x89, 0xD0});       // mov r8, rdx
+    full.insert(full.end(), {0xB8, 0, 0, 0, 0, 0xBA, 0, 0, 0, 0x40});      // (the mask again)
+    full.insert(full.end(), restore.begin(), restore.end());
+    full.insert(full.end(), sl.begin(), sl.end());      // slwpcb rdx -> the control block again
+    full.push_back(0x0F); full.push_back(0x0B);
+    Machine m(full);
+    make_lwpcb(m, 0x2, 1024);
+    m.cpu.state().r[2] = kLwpcb;
+    CHECK(m.finished());
+    CHECK(m.cpu.state().r[8] == 0);
+    CHECK(m.cpu.state().r[2] == kLwpcb);
+    // the xsave header says LWP was in use
+    CHECK(get_mem(m, kBase + 512) == (uint64_t{1} << 62));
+  }
+  {      // xgetbv: XINUSE reports a running session; cpuid advertises LWP
+    Machine m({0xB9, 1, 0, 0, 0, 0x0F, 0x01, 0xD0, 0x0F, 0x0B});
+    CHECK(m.finished());
+    CHECK(m.cpu.state().r[0] == 0 && m.cpu.state().r[2] == 0);
+    Machine n(join({llwpcb(), Bytes{0xB9, 1, 0, 0, 0, 0x0F, 0x01, 0xD0, 0x0F, 0x0B}}));
+    make_lwpcb(n, 0x2, 1024);
+    n.cpu.state().r[2] = kLwpcb;
+    CHECK(n.finished());
+    CHECK(n.cpu.state().r[2] == 0x40000000);
+    Machine c({0xB8, 0x1C, 0, 0, 0x80, 0x0F, 0xA2, 0x0F, 0x0B});
+    CHECK(c.finished());
+    CHECK((c.cpu.state().r[0] & 3) == 3 && (c.cpu.state().r[2] & 3) == 3);      // available, LWPVAL
+    CHECK(((c.cpu.state().r[3] >> 8) & 0xFF) == 32 && ((c.cpu.state().r[3] >> 24) & 0xFF) == 88);
+  }
+}
+
+// --- vpermil2ps / vpermil2pd -------------------------------------------------------------------------------------------------------------
+
+static Bytes vpermil2(bool dbl, bool w, bool l, bool memory, int m2z) {
+  Bytes code = {0xC4, 0xE3, uint8_t((w ? 0x80 : 0) | ((~1 & 15) << 3) | (l ? 4 : 0) | 1), uint8_t(dbl ? 0x49 : 0x48)};
+  code.push_back(memory ? 0x07 : 0xC2);
+  code.push_back(uint8_t(0x30 | m2z));
+  code.push_back(0x0F); code.push_back(0x0B);
+  return code;
+}
+
+static void test_vpermil2() {
+  {      // the documented example of _mm256_permute2_pd: src1 = 0..3, src2 = 4..7
+    V a = zero_v(), sel = zero_v();
+    for (int i = 0; i < 4; ++i) put<double>(&a, i, i);
+    V b = zero_v();
+    for (int i = 0; i < 4; ++i) put<double>(&b, i, i + 4);
+    put<int64_t>(&sel, 0, 2 << 1); put<int64_t>(&sel, 1, (1 << 1) + 8); put<int64_t>(&sel, 2, 0 << 1); put<int64_t>(&sel, 3, (3 << 1) + 8);
+    const double want[3][4] = {{4, 1, 2, 7}, {4, 0, 2, 0}, {0, 1, 0, 7}};
+    const int m2z[3] = {0, 2, 3};
+    for (int k = 0; k < 3; ++k) {
+      Ops o = random_ops();
+      o.a = a; o.c = b; o.b = sel;      // W1: src2 = the register in imm8 (xmm3), the selector = the r/m operand (xmm2)
+      const V got = exec(vpermil2(true, true, true, false, m2z[k]), o, false);
+      for (int i = 0; i < 4; ++i) CHECK(lane<double>(got, i) == want[k][i]);
+    }
+  }
+  for (int dbl = 0; dbl < 2; ++dbl)
+    for (int w = 0; w < 2; ++w)
+      for (int l = 0; l < 2; ++l)
+        for (int memory = 0; memory < 2; ++memory)
+          for (int m2z = 0; m2z < 4; ++m2z) {
+            Ops o = random_ops();
+            // W0: src2 = r/m (b), selector = xmm3 (c); W1: src2 = xmm3 (c), selector = r/m (b)
+            const V& src2 = w ? o.c : o.b;
+            const V& sel = w ? o.b : o.c;
+            const V got = exec(vpermil2(dbl, w, l, memory, m2z), o, memory);
+            const int width = dbl ? 8 : 4, per_lane = 16 / width, lanes = l ? 2 : 1;
+            V want = zero_v();
+            for (int ln = 0; ln < lanes; ++ln)
+              for (int i = 0; i < per_lane; ++i) {
+                const int at = ln * per_lane + i;
+                const uint64_t s = dbl ? lane<uint64_t>(sel, at) : lane<uint32_t>(sel, at);
+                const int index = dbl ? int((s >> 1) & 1) : int(s & 3);
+                const bool from2 = (s >> 2) & 1, match = (s >> 3) & 1;
+                const bool zero = (m2z == 2 && match) || (m2z == 3 && !match);
+                const V& src = from2 ? src2 : o.a;
+                if (dbl) put<uint64_t>(&want, at, zero ? 0 : lane<uint64_t>(src, ln * per_lane + index));
+                else put<uint32_t>(&want, at, zero ? 0 : lane<uint32_t>(src, ln * per_lane + index));
+              }
+            CHECK(same(got, want, 32));
+          }
+  CHECK(Machine(Bytes{0xC5, 0xF1, 0x48, 0xC2, 0x30, 0x0F, 0x0B}).undefined());      // (a VEX map 1 opcode that does not exist)
+  {      // other prefixes than 66 are #UD
+    Bytes code = vpermil2(false, false, false, false, 0);
+    code[2] = uint8_t((code[2] & ~3) | 2);
+    CHECK(Machine(code).undefined());
+  }
+}
+
 static void test_decoding() {
   {      // 8F /0 is still pop
     Machine m({0x6A, 0x2A, 0x8F, 0xC3, 0x0F, 0x0B});      // push 42; pop rbx
@@ -458,7 +738,7 @@ static void test_decoding() {
 static void test_malformed() {
   Bytes ok;
   for (const Bytes& part : {xop(8, 0xA3, false, 1, false, true, {0x30}), xop(8, 0x85, false, 1, false, false, {0x30}), xop(9, 0x80, false, 0, true, true), xop(9, 0x94, false, 1, false, false),
-                            Bytes{0xC4, 0xE3, 0x71, 0x68, 0x07, 0x30, 0x0F, 0x0B}, Bytes{0x8F, 0xE9, 0x78, 0x01, 0xCB, 0x0F, 0x0B}, Bytes{0x8F, 0xEA, 0x78, 0x10, 0xD8, 1, 2, 3, 4, 0x0F, 0x0B}})
+                            Bytes{0xC4, 0xE3, 0x71, 0x68, 0x07, 0x30, 0x0F, 0x0B}, Bytes{0xC4, 0xE3, 0x71, 0x49, 0x07, 0x32, 0x0F, 0x0B}, llwpcb(), lwpval(), slwpcb(), Bytes{0x8F, 0xE9, 0x78, 0x01, 0xCB, 0x0F, 0x0B}, Bytes{0x8F, 0xEA, 0x78, 0x10, 0xD8, 1, 2, 3, 4, 0x0F, 0x0B}})
     ok.insert(ok.end(), part.begin(), part.end() - 2);
   for (size_t cut = 0; cut < ok.size(); ++cut) {
     Bytes b(ok.begin(), ok.begin() + cut);
@@ -484,6 +764,8 @@ int main() {
   test_horizontal();
   test_frcz();
   test_tbm();
+  test_vpermil2();
+  test_lwp();
   test_decoding();
   test_malformed();
   if (g_failed) { printf("XopTest: %d failed\n", g_failed); return 1; }

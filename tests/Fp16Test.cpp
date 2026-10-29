@@ -1279,8 +1279,8 @@ static void test_state() {
   {      // an EVEX map the emulator does not know (map 7) and a reserved bit are #UD
     Machine m(with_syscall({0x62, 0xF7, 0x7C, 0x48, 0x58, 0xC1}));
     CHECK(m.run() == StopReason::Fault && m.cpu.fault().vector == 6);
-    Machine m2(with_syscall({0x62, 0xFD, 0x7C, 0x48, 0x58, 0xC1}));      // bit 3 of P0 set
-    CHECK(m2.run() == StopReason::Fault && m2.cpu.fault().vector == 6);
+    Machine m2(with_syscall({0x62, 0xFD, 0x7C, 0x48, 0x58, 0xC1}));      // bit 3 of P0 set: with APX it is B4, which a vector operand ignores
+    CHECK(m2.run() == StopReason::Syscall);
   }
 }
 
