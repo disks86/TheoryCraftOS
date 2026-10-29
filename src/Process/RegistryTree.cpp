@@ -52,7 +52,7 @@ RegistryTree::RegistryTree(allocators::IAllocator& allocator, uint64_t now) : al
   keys_.push_back(static_cast<UniquePointer<RegKey>&&>(root));
   static const char* const kHives[] = {"MACHINE\\HARDWARE", "MACHINE\\SAM", "MACHINE\\SECURITY", "MACHINE\\SOFTWARE\\Classes", "MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion",
                                        "MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", "MACHINE\\SYSTEM\\CurrentControlSet\\Control", "MACHINE\\SYSTEM\\CurrentControlSet\\Services",
-                                       "MACHINE\\SYSTEM\\CurrentControlSet\\Hardware Profiles\\Current", "USER\\.DEFAULT", "USER\\S-1-5-21-0-0-0-1000\\Software\\Microsoft\\Windows\\CurrentVersion",
+                                       "MACHINE\\SYSTEM\\CurrentControlSet\\Hardware Profiles\\Current", "MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList", "USER\\.DEFAULT", "USER\\S-1-5-21-0-0-0-1000\\Software\\Microsoft\\Windows\\CurrentVersion",
                                        "USER\\S-1-5-21-0-0-0-1000\\Environment", "USER\\S-1-5-21-0-0-0-1000\\Volatile Environment", "USER\\S-1-5-21-0-0-0-1000\\Control Panel"};
   for (const char* path : kHives) {      // every level, one after the other: a path is made one key at a time
     const StringView whole(path);
@@ -79,6 +79,19 @@ RegistryTree::RegistryTree(allocators::IAllocator& allocator, uint64_t now) : al
     text("SystemRoot", "C:\\Windows");
     text("PathName", "C:\\Windows");
     text("CSDVersion", "");
+  }
+  uint32_t profiles = 0;
+  if (resolve(kRoot, StringView("MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList"), false, now, &profiles, &created) == kRegSuccess) {
+    auto expandable = [&](const char* name, const char* value) {      // REG_EXPAND_SZ: the folders every profile API answers with
+      ByteBuffer data(allocator_);
+      for (const char* c = value; *c; ++c) data.put16(static_cast<uint8_t>(*c));
+      data.put16(0);
+      set_value(profiles, StringView(name), 2 /* REG_EXPAND_SZ */, data.view(), now);
+    };
+    expandable("ProfilesDirectory", "%SystemDrive%\\Users");
+    expandable("Default", "%SystemDrive%\\Users\\Default");
+    expandable("Public", "%SystemDrive%\\Users\\Public");
+    expandable("ProgramData", "%SystemDrive%\\ProgramData");
   }
 }
 
