@@ -1323,6 +1323,15 @@ EXPORT DWORD WINAPI QueueUserAPC(void (WINAPI *function)(ULONG_PTR), HANDLE thre
   if (!NT_SUCCESS(status)) { fail_nt(status); return 0; }
   return 1;
 }
+/* QueueUserAPC2: flags 0 is QueueUserAPC; 1 (special user APC) runs in the thread at once - here, in the calling thread, when that is the target, and otherwise as an ordinary one. */
+EXPORT DWORD WINAPI GetThreadId(HANDLE thread);
+EXPORT DWORD WINAPI GetCurrentThreadId(void);
+EXPORT BOOL WINAPI QueueUserAPC2(void (WINAPI *function)(ULONG_PTR), HANDLE thread, ULONG_PTR parameter, DWORD flags) {
+  if (flags > 1) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (!QueueUserAPC(function, thread, parameter)) return FALSE;
+  if ((flags & 1) && (thread == (HANDLE)(LONG_PTR)-2 || GetThreadId(thread) == GetCurrentThreadId())) NtTestAlert();
+  return TRUE;
+}
 static BOOL pipe_start_overlapped(int op, HANDLE h, LPVOID buffer, DWORD length, LPOVERLAPPED overlapped, void (WINAPI *routine)(DWORD, DWORD, LPOVERLAPPED));
 /* ReadFileEx / WriteFileEx: the operation is done at once; the completion routine is an APC for this thread, called when it next waits alertably. */
 typedef void (WINAPI *LPOVERLAPPED_COMPLETION_ROUTINE_)(DWORD, DWORD, LPOVERLAPPED);

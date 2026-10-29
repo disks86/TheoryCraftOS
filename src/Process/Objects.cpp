@@ -58,11 +58,8 @@ ObjectManager::Object* ObjectManager::find_locked(StringView name) {
   if (name.empty()) return nullptr;
   for (Object& o : objects_) {
     if (o.kind == ObjectKind::None || o.name_size == 0) continue;
-    if (o.kind == ObjectKind::Section) {      // (the names of file mappings are matched exactly; the other objects' ignore case)
-      if (o.name_size == name.size() && StringView(o.name, o.name_size) == name) return &o;
-    } else if (same_name(o.name, o.name_size, name)) {
-      return &o;
-    }
+    if (o.kind == ObjectKind::Pipe) continue;      // (pipes have a namespace of their own)
+    if (o.name_size == name.size() && StringView(o.name, o.name_size) == name) return &o;      // (the names of kernel objects are case sensitive)
   }
   return nullptr;
 }
