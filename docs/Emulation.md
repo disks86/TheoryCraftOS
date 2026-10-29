@@ -212,8 +212,14 @@ programs built with `-march=haswell` (or x86-64-v3) run. `X86_64Vex.cpp` holds a
   `vfnmsub` (132, 213, 231) / `vscalef` / `vrcp` / `vrsqrt` / `vgetexp` / `vgetmant` / `vrndscale` / `vreduce` `bf16`, `vcmpbf16`, `vfpclassbf16` and `vcomisbf16`, with the architecture's rules: no MXCSR use and no
   exception flags, denormal inputs are zeros, denormal results are flushed, round to nearest even. `vrcp` and `vrsqrt` are correctly rounded (inside the architectural error bound). `vgetexpbf16` of -INF gives +INF
   (the specification's pseudocode would give 128). cpuid still reports AVX10 version 1 because the rest of AVX10.2 is not there. `tests/Bf16Test.cpp` checks against the host's double arithmetic.
-- **Not implemented** (an invalid-instruction fault, never a wrong result): the rest of APX (above), the AVX10.2
-  additions, `vpermil2ps/pd` and LWP, CET shadow-stack instructions beyond the no-op forms, `xsaves`/`xrstors` and `xgetbv` with ECX=1.
+- **AVX10.2, part 2**: `vminmax{ps,pd,ph,bf16}` and `vminmax{ss,sd,sh}` (all eight operations of the immediate, sign control, NaN propagation and `Number` forms, from the specification's tables; DE / IE flags in MXCSR, no
+  flags for bf16), `vcomxs{s,d,h}` / `vucomxs{s,d,h}` (OF SF ZF PF CF as the specification gives, invalid for any NaN in the comx form and only for a signaling NaN in the ucomx form), `vmovd` (F3 0F 7E and
+  66 0F D6 with W0), `vdpphps` (two FP16 products accumulated into binary32, RNE, DAZ / FTZ, the first NaN in low, high, destination order), `vmpsadbw` (EVEX form, 512-bit lanes reuse the control bits of the
+  first two) and the saturating conversions `vcvtt{ps,pd}2{dqs,udqs,qqs,uqqs}`, `vcvtts{s,d}2{sis,usis}` and `vcvt[t]{ph,ps,bf16}2i[u]bs` (NaN gives 0, out of range saturates, IE / PE in MXCSR except for bf16;
+  the byte result sits in the low byte of a zeroed element). Not implemented: the FP8 conversions (`vcvt2ph2bf8` / `hf8`, `vcvtph2bf8` / `hf8` and their `s` forms, `vcvtbiasph2bf8` / `hf8`, `vcvthf82ph`),
+  `vcvt2ps2phx`, and the embedded rounding forms of the 256-bit instructions; cpuid therefore still reports AVX10 version 1.
+- **Not implemented** (an invalid-instruction fault, never a wrong result): the rest of APX and of AVX10.2 (above),
+  `vpermil2ps/pd` and LWP, CET shadow-stack instructions beyond the no-op forms, `xsaves`/`xrstors` and `xgetbv` with ECX=1.
   Exceptions delivered to a Windows program save the XMM halves of vector state in the `CONTEXT` in memory, not the upper halves (the emulator keeps those itself).
 - **Checked against the real thing**: `tests/AvxTest.cpp` assembles about 1,400 instruction forms with `llvm-mc` (`tests/data/emulation/avx_cases_gen.py`), runs each on the host
   and on the emulator from the same random state (80,000+ comparisons per run: all vector registers, written general registers, flags, MXCSR flags except DE, the memory operand)

@@ -19,6 +19,7 @@
 // Intel AVX10.2 BFloat16 arithmetic: vadd / vsub / vmul / vdiv / vmin / vmax / vsqrt / vfmadd / vfmsub / vfnmadd / vfnmsub / vscalef / vrcp / vrsqrt / vgetexp / vgetmant / vrndscale / vreduce / vfpclass /
 // vcmp / vcomis for bf16 elements. None of them reads or writes MXCSR or raises an exception: denormal inputs are zeros, denormal results are flushed, rounding is to nearest even.
 // (Specification: Intel AVX10.2 Architecture Specification 361050, chapter 7. vrcp and vrsqrt are computed correctly rounded, which is within the documented error bound.)
+#include "Emulation/HalfFloat.hpp"
 #include "Emulation/SoftFloat.hpp"
 #include "Emulation/X86_64EvexInternal.hpp"
 
@@ -36,6 +37,18 @@ const EvexOp kEvexBf16Ops[] = {
     {6, 0, 0x2C, 0, kBfloat, 8, 16, kFull},  {6, 0, 0x42, 0, kBfloat, 9, 16, kFull},  {6, 0, 0x4C, 0, kBfloat, 10, 16, kFull}, {6, 0, 0x4E, 0, kBfloat, 11, 16, kFull},
     {3, 3, 0x08, 0, kBfloat, 12, 16, kFull}, {3, 3, 0x56, 0, kBfloat, 13, 16, kFull}, {3, 3, 0x26, 0, kBfloat, 14, 16, kFull}, {3, 3, 0xC2, 0, kBfloat, 15, 16, kFull},
     {3, 3, 0x66, 0, kBfloat, 16, 16, kFull},
+    {3, 1, 0x52, 1, kMinMax, 0, 64, kFull},  {3, 0, 0x52, 0, kMinMax, 0, 16, kFull},  {3, 1, 0x52, 0, kMinMax, 0, 32, kFull},  {3, 3, 0x52, 0, kMinMax, 1, 16, kFull},
+    {3, 1, 0x53, 1, kMinMax, 2, 64, kS8},    {3, 0, 0x53, 0, kMinMax, 2, 16, kS2},    {3, 1, 0x53, 0, kMinMax, 2, 32, kS4},
+    {1, 3, 0x2F, 1, kComx, 0, 64, kS8},      {1, 2, 0x2F, 0, kComx, 0, 32, kS4},      {5, 2, 0x2F, 0, kComx, 0, 16, kS2},
+    {1, 3, 0x2E, 1, kComx, 1, 64, kS8},      {1, 2, 0x2E, 0, kComx, 1, 32, kS4},      {5, 2, 0x2E, 0, kComx, 1, 16, kS2},
+    {2, 0, 0x52, 0, kDpPh, 0, 32, kFull},    {3, 2, 0x42, 0, kMpsadbw, 0, 8, kFullMem},
+    // saturating conversions: sub = source type (0 f32, 1 f64, 2 f16, 3 bf16) | destination code << 2 (0: byte in a word / dword element, 1: 32 bits, 2: 64 bits) | 0x10 unsigned | 0x20 truncate | 0x40 to a GPR
+    {5, 0, 0x6D, 0, kSatCvt, 0x00 | 4 | 0x20, 32, kFull}, {5, 0, 0x6C, 0, kSatCvt, 0x00 | 4 | 0x30, 32, kFull}, {5, 0, 0x6D, 1, kSatCvt, 0x01 | 4 | 0x20, 64, kFull}, {5, 0, 0x6C, 1, kSatCvt, 0x01 | 4 | 0x30, 64, kFull},
+    {5, 1, 0x6D, 0, kSatCvt, 0x00 | 8 | 0x20, 32, kHalf}, {5, 1, 0x6C, 0, kSatCvt, 0x00 | 8 | 0x30, 32, kHalf}, {5, 1, 0x6D, 1, kSatCvt, 0x01 | 8 | 0x20, 64, kFull}, {5, 1, 0x6C, 1, kSatCvt, 0x01 | 8 | 0x30, 64, kFull},
+    {5, 3, 0x6D, -1, kSatCvt, 0x01 | 0x20 | 0x40, 64, kS8}, {5, 3, 0x6C, -1, kSatCvt, 0x01 | 0x30 | 0x40, 64, kS8}, {5, 2, 0x6D, -1, kSatCvt, 0x00 | 0x20 | 0x40, 32, kS4}, {5, 2, 0x6C, -1, kSatCvt, 0x00 | 0x30 | 0x40, 32, kS4},
+    {5, 0, 0x68, 0, kSatCvt, 0x02 | 0x20, 16, kFull}, {5, 0, 0x69, 0, kSatCvt, 0x02, 16, kFull}, {5, 0, 0x6A, 0, kSatCvt, 0x02 | 0x30, 16, kFull}, {5, 0, 0x6B, 0, kSatCvt, 0x02 | 0x10, 16, kFull},
+    {5, 1, 0x68, 0, kSatCvt, 0x00 | 0x20, 32, kFull}, {5, 1, 0x69, 0, kSatCvt, 0x00, 32, kFull}, {5, 1, 0x6A, 0, kSatCvt, 0x00 | 0x30, 32, kFull}, {5, 1, 0x6B, 0, kSatCvt, 0x00 | 0x10, 32, kFull},
+    {5, 3, 0x68, 0, kSatCvt, 0x03 | 0x20, 16, kFull}, {5, 3, 0x69, 0, kSatCvt, 0x03, 16, kFull}, {5, 3, 0x6A, 0, kSatCvt, 0x03 | 0x30, 16, kFull}, {5, 3, 0x6B, 0, kSatCvt, 0x03 | 0x10, 16, kFull},
 };
 const uint32_t kEvexBf16OpCount = sizeof(kEvexBf16Ops) / sizeof(kEvexBf16Ops[0]);
 
@@ -275,6 +288,275 @@ X86_64Cpu::Step X86_64Cpu::evex_bf16(GuestMemory& m, const EvexOp& def) {
   }
   if (op == kCmpOp || op == kClassOp) ev_write_k(mask_bits, n);
   else ev_write_masked(reg, result, 16);
+  s_.rip += d_.position;
+  return Step::Ok;
+}
+
+
+// --- vminmax, vcomx, vucomx -------------------------------------------------------------------------------------------------------------
+
+namespace {
+
+struct Layout { uint32_t exp_bits, man_bits; Format format; };
+Layout layout_of(uint32_t bits, bool bf16) {
+  if (bits == 64) return {11, 52, Format::F64};
+  if (bits == 32) return {8, 23, Format::F32};
+  return bf16 ? Layout{8, 7, Format::BF16} : Layout{5, 10, Format::F16};
+}
+
+struct Num {
+  uint64_t bits;
+  Layout l;
+  uint64_t exp() const { return (bits >> l.man_bits) & ((uint64_t{1} << l.exp_bits) - 1); }
+  uint64_t man() const { return bits & ((uint64_t{1} << l.man_bits) - 1); }
+  bool nan() const { return exp() == ((uint64_t{1} << l.exp_bits) - 1) && man() != 0; }
+  bool snan() const { return nan() && !(man() >> (l.man_bits - 1)); }
+  bool denormal() const { return exp() == 0 && man() != 0; }
+  bool neg() const { return (bits >> (l.exp_bits + l.man_bits)) & 1; }
+};
+
+uint64_t quieted(const Layout& l, uint64_t bits) { return bits | (uint64_t{1} << (l.man_bits - 1)); }
+
+}  // namespace
+
+X86_64Cpu::Step X86_64Cpu::evex_minmax(GuestMemory& m, const EvexOp& def) {
+  if (def.kind == kComx) {
+    if (ev_.vvvv != 0) return fail(6);
+    const uint32_t bits = def.elem;
+    const Layout l = layout_of(bits, false);
+    uint64_t y = 0;
+    if (ev_.memory) {
+      if (!load(m, memory_address(), bits / 8, &y)) return Step::Fault;
+    } else {
+      y = element(get_vec(ev_.rm), bits, 0);
+    }
+    uint64_t x = element(get_vec(ev_.reg), bits, 0);
+    Env env;
+    env.mode = Rounding::NearestEven;
+    env.daz = bits != 16 && (s_.mxcsr & 0x40);
+    Num nx{x, l}, ny{y, l};
+    uint32_t flags = 0;
+    if (env.daz) {
+      if (nx.denormal()) x &= ~((uint64_t{1} << l.man_bits) - 1);
+      if (ny.denormal()) y &= ~((uint64_t{1} << l.man_bits) - 1);
+    }
+    nx = Num{x, l}; ny = Num{y, l};
+    const bool unordered = nx.nan() || ny.nan();
+    if (nx.snan() || ny.snan() || (unordered && def.sub == 0)) flags |= kInvalid;
+    else if (!unordered && (nx.denormal() || ny.denormal()) && !env.daz && bits != 16) flags |= kDenormal;
+    uint64_t f = s_.rflags & ~(kOverflow | kSign | kZero | kParity | kCarry | kAdjust);
+    if (unordered) f |= kOverflow | kSign | kParity | kCarry;
+    else {
+      const Order o = compare(l.format, x, y, false, env);
+      if (o == Order::Less) f |= kOverflow | kCarry;
+      else if (o == Order::Equal) f |= kOverflow | kSign | kZero;
+    }
+    s_.rflags = f;
+    s_.mxcsr |= flags;
+    s_.rip += d_.position;
+    return Step::Ok;
+  }
+  // vminmax
+  const bool bf16 = def.sub & 1, scalar = def.sub & 2;
+  const uint32_t bits = def.elem, n = scalar ? 1 : ev_.vl / bits;
+  const Layout l = layout_of(bits, bf16);
+  const uint32_t imm = ev_.imm & 0xFF;
+  Vec b;
+  if (scalar) {
+    if (ev_.memory) {
+      uint64_t v = 0;
+      if (!load(m, memory_address(), bits / 8, &v)) return Step::Fault;
+      b.q[0] = v;
+    } else {
+      b = get_vec(ev_.rm);
+    }
+  } else if (!ev_read_rm(m, &b, bits, true, false)) {
+    return Step::Fault;
+  }
+  const Vec a = get_vec(ev_.vvvv), dest = ev_.old_dest;
+  Env env;
+  env.mode = Rounding::NearestEven;
+  const bool daz = bf16 || (bits != 16 && (s_.mxcsr & 0x40));
+  uint32_t flags = 0;
+  Vec result = scalar ? a : Vec();
+  const uint32_t op_select = imm & 3, sign_control = (imm >> 2) & 3;
+  const bool number = (imm >> 4) & 1;
+  auto flush_daz = [&](uint64_t v) {
+    Num nv{v, l};
+    return (daz && nv.denormal()) ? v & ~((uint64_t{1} << l.man_bits) - 1) : v;
+  };
+  for (uint32_t i = 0; i < n; ++i) {
+    if (ev_.aaa != 0 && !ev_active(i)) {
+      set_element(result, bits, i, ev_.z ? 0 : element(dest, bits, i));
+      continue;
+    }
+    uint64_t x = flush_daz(element(a, bits, i)), y = flush_daz(element(b, bits, scalar ? 0 : i));
+    const Num nx{x, l}, ny{y, l};
+    if (!bf16) {
+      if (nx.snan() || ny.snan()) flags |= kInvalid;
+      else if (!nx.nan() && !ny.nan() && (nx.denormal() || ny.denormal())) flags |= kDenormal;
+    }
+    uint64_t tmp;
+    bool tmp_is_nan = false;
+    if (nx.nan() || ny.nan()) {
+      if (!number) {
+        if (nx.nan()) tmp = nx.snan() ? quieted(l, x) : (ny.snan() ? quieted(l, y) : x);
+        else tmp = quieted(l, y);
+        tmp_is_nan = true;
+      } else if (nx.nan() && ny.nan()) {
+        tmp = nx.snan() ? quieted(l, x) : (ny.snan() ? quieted(l, y) : x);
+        tmp_is_nan = true;
+      } else {
+        tmp = nx.nan() ? y : x;
+      }
+    } else {
+      const bool want_max = op_select & 1, magnitude = op_select & 2;
+      auto order_of = [&](uint64_t p, uint64_t q) { return compare(l.format, magnitude ? absolute(l.format, p) : p, magnitude ? absolute(l.format, q) : q, false, env); };
+      Order o = order_of(x, y);
+      uint64_t pick;
+      if (o == Order::Equal && magnitude) o = compare(l.format, x, y, false, env);      // equal magnitudes: the signed comparison decides
+      if (o == Order::Equal) {
+        // equal values: for opposite signs (zeros, or equal magnitudes) the negative one is the minimum and the positive one the maximum
+        if (nx.neg() == ny.neg()) pick = x;
+        else pick = (nx.neg() == !want_max) ? x : y;
+      } else {
+        pick = (want_max ? o == Order::Greater : o == Order::Less) ? x : y;
+      }
+      tmp = pick;
+    }
+    if (!tmp_is_nan) {
+      const uint64_t sign_bit = uint64_t{1} << (l.exp_bits + l.man_bits);
+      if (sign_control == 3) tmp |= sign_bit;
+      else if (sign_control == 2) tmp &= ~sign_bit;
+      else if (sign_control == 1 || nx.nan()) { }
+      else tmp = (tmp & ~sign_bit) | (x & sign_bit);
+    }
+    set_element(result, bits, i, tmp);
+  }
+  if (scalar) set_vec(ev_.reg, result, 128);
+  else ev_write_masked(ev_.reg, result, bits);
+  if (!bf16) s_.mxcsr |= flags;
+  s_.rip += d_.position;
+  return Step::Ok;
+}
+
+
+// --- vdpphps, vmpsadbw, the saturating conversions ----------------------------------------------------------------------------------------------
+
+X86_64Cpu::Step X86_64Cpu::evex_avx102(GuestMemory& m, const EvexOp& def) {
+  const uint32_t reg = ev_.reg;
+  if (def.kind == kDpPh) {
+    if (ev_.er || ev_.w) return fail(6);
+    Vec b;
+    if (!ev_read_rm(m, &b, 32, true, false)) return Step::Fault;
+    const Vec a = get_vec(ev_.vvvv), dest = ev_.old_dest;
+    Vec result;
+    Env env;
+    env.mode = Rounding::NearestEven;
+    env.daz = env.ftz = true;
+    for (uint32_t i = 0; i < ev_.vl / 32; ++i) {
+      const uint32_t acc0 = static_cast<uint32_t>(element(dest, 32, i));
+      if (ev_.aaa != 0 && !ev_active(i)) {
+        set_element(result, 32, i, ev_.z ? 0 : acc0);
+        continue;
+      }
+      // the products in the order low, high; the first NaN of low*low + high*high + dest wins
+      const uint32_t s1e = half::half_to_single(static_cast<uint16_t>(element(a, 16, 2 * i))), s1o = half::half_to_single(static_cast<uint16_t>(element(a, 16, 2 * i + 1)));
+      const uint32_t s2e = half::half_to_single(static_cast<uint16_t>(element(b, 16, 2 * i))), s2o = half::half_to_single(static_cast<uint16_t>(element(b, 16, 2 * i + 1)));
+      const uint32_t order[5] = {s1e, s2e, s1o, s2o, acc0};
+      uint32_t nan = 0;
+      bool have_nan = false;
+      for (uint32_t v : order)
+        if (!have_nan && (v & 0x7F800000u) == 0x7F800000u && (v & 0x7FFFFF)) { nan = v | 0x400000u; have_nan = true; }
+      uint64_t acc = acc0;
+      if (have_nan) {
+        acc = nan;
+      } else {
+        if ((acc & 0x7F800000u) == 0) acc &= 0x80000000u;
+        acc = fused_multiply_add(Format::F32, s1o, s2o, acc, env);
+        if ((acc & 0x7F800000u) == 0) acc &= 0x80000000u;
+        acc = fused_multiply_add(Format::F32, s1e, s2e, acc, env);
+        if ((acc & 0x7F800000u) == 0) acc &= 0x80000000u;
+      }
+      set_element(result, 32, i, acc);
+    }
+    set_vec(reg, result, ev_.vl);
+    s_.rip += d_.position;
+    return Step::Ok;
+  }
+  if (def.kind == kMpsadbw) {
+    if (ev_.er || ev_.w) return fail(6);
+    Vec b;
+    if (!ev_read_rm(m, &b, 8, false, false)) return Step::Fault;
+    const Vec a = get_vec(ev_.vvvv), dest = ev_.old_dest;
+    Vec result;
+    for (uint32_t lane = 0; lane < ev_.vl / 128; ++lane) {
+      const uint32_t control = (ev_.imm >> ((lane & 1) * 3)) & 7;
+      const uint32_t blk2 = (control & 3) * 4, blk1 = ((control >> 2) & 1) * 4;
+      for (uint32_t i = 0; i < 8; ++i) {
+        const uint32_t word = lane * 8 + i;
+        if (ev_.aaa != 0 && !ev_active(word)) {
+          set_element(result, 16, word, ev_.z ? 0 : element(dest, 16, word));
+          continue;
+        }
+        uint32_t sum = 0;
+        for (uint32_t j = 0; j < 4; ++j) {
+          const int x = static_cast<int>(element(a, 8, lane * 16 + blk1 + i + j)) - static_cast<int>(element(b, 8, lane * 16 + blk2 + j));
+          sum += static_cast<uint32_t>(x < 0 ? -x : x);
+        }
+        set_element(result, 16, word, sum);
+      }
+    }
+    set_vec(reg, result, ev_.vl);
+    s_.rip += d_.position;
+    return Step::Ok;
+  }
+  // saturating conversions
+  const uint32_t src_type = def.sub & 3, dst_code = (def.sub >> 2) & 3;
+  const bool is_unsigned = def.sub & 0x10, truncate = def.sub & 0x20, to_gpr = def.sub & 0x40;
+  const uint32_t sw = src_type == 1 ? 64 : src_type == 0 ? 32 : 16;
+  const Format f = src_type == 1 ? Format::F64 : src_type == 0 ? Format::F32 : src_type == 2 ? Format::F16 : Format::BF16;
+  const bool bf16 = src_type == 3;
+  const uint32_t dw = dst_code == 0 ? sw : dst_code == 1 ? 32 : 64;      // the destination element width
+  const uint32_t int_bits = dst_code == 0 ? 8 : dw;
+  Env env;
+  env.mode = truncate ? Rounding::TowardZero : bf16 ? Rounding::NearestEven : (ev_.er ? static_cast<Rounding>(ev_.rc) : static_cast<Rounding>((s_.mxcsr >> 13) & 3));
+  if (to_gpr) {
+    if (ev_.vvvv != 0) return fail(6);
+    uint64_t v = 0;
+    if (ev_.memory) {
+      if (!load(m, memory_address(), sw / 8, &v)) return Step::Fault;
+    } else {
+      v = element(get_vec(ev_.rm), sw, 0);
+    }
+    const uint32_t bits = ev_.w ? 64 : 32;
+    const uint64_t r = to_integer_saturating(f, v, env.mode, bits, is_unsigned, 0, env);
+    set_reg(d_.reg, bits == 64 ? 8 : 4, r);
+    if (!bf16) s_.mxcsr |= env.flags;
+    s_.rip += d_.position;
+    return Step::Ok;
+  }
+  if (ev_.vvvv != 0) return fail(6);
+  const uint32_t wide = sw > dw ? sw : dw;
+  const uint32_t n = ev_.vl / wide;
+  const uint32_t saved_vl = ev_.vl;
+  Vec b;
+  ev_.vl = n * sw < 128 ? 128 : n * sw;
+  const bool ok = ev_read_rm(m, &b, sw, true, false);
+  ev_.vl = saved_vl;
+  if (!ok) return Step::Fault;
+  Vec result;
+  for (uint32_t i = 0; i < n; ++i) {
+    const uint64_t r = to_integer_saturating(f, element(b, sw, i), env.mode, int_bits, is_unsigned, 0, env);
+    set_element(result, dw, i, r & width_mask(int_bits));
+  }
+  const uint32_t out_bits = n * dw < 128 ? 128 : n * dw;
+  const Vec old = ev_.old_dest;
+  if (ev_.aaa != 0)
+    for (uint32_t i = 0; i < n; ++i)
+      if (!ev_active(i)) set_element(result, dw, i, ev_.z ? 0 : element(old, dw, i));
+  set_vec(reg, result, out_bits);
+  if (!bf16 && !ev_.er) s_.mxcsr |= env.flags;
   s_.rip += d_.position;
   return Step::Ok;
 }

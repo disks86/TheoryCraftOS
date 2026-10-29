@@ -30,7 +30,7 @@ const EvexOp kEvexOps[] = {
     {1, 1, 0xE7, 0, kMove, 1, 32, kFullMem}, {1, 0, 0x2B, 0, kMove, 1, 32, kFullMem}, {1, 1, 0x2B, 1, kMove, 1, 64, kFullMem}, {2, 1, 0x2A, 0, kMove, 0, 32, kFullMem},
     {1, 2, 0x10, 0, kMoveScalar, 0, 32, kS4}, {1, 2, 0x11, 0, kMoveScalar, 1, 32, kS4}, {1, 3, 0x10, 1, kMoveScalar, 0, 64, kS8}, {1, 3, 0x11, 1, kMoveScalar, 1, 64, kS8},
     {1, 1, 0x6E, 0, kMoveGpr, 0, 32, kS4}, {1, 1, 0x6E, 1, kMoveGpr, 0, 64, kS8}, {1, 1, 0x7E, 0, kMoveGpr, 1, 32, kS4}, {1, 1, 0x7E, 1, kMoveGpr, 1, 64, kS8},
-    {1, 2, 0x7E, 1, kMoveGpr, 2, 64, kS8}, {1, 1, 0xD6, 1, kMoveGpr, 3, 64, kS8},
+    {1, 2, 0x7E, 1, kMoveGpr, 2, 64, kS8}, {1, 1, 0xD6, 1, kMoveGpr, 3, 64, kS8}, {1, 2, 0x7E, 0, kMoveGpr, 2, 32, kS4}, {1, 1, 0xD6, 0, kMoveGpr, 3, 32, kS4},
     // broadcasts (sub: source bytes; 0x80: memory source only; 0x40: 512-bit only)
     {2, 1, 0x18, 0, kBroadcast, 4, 32, kS4}, {2, 1, 0x19, 1, kBroadcast, 8, 64, kS8}, {2, 1, 0x19, 0, kBroadcast, 8, 32, kS8},
     {2, 1, 0x1A, 0, kBroadcast, 16 | 0x80, 32, kS16}, {2, 1, 0x1A, 1, kBroadcast, 16 | 0x80, 64, kS16}, {2, 1, 0x1B, 0, kBroadcast, 32 | 0x80 | 0x40, 32, kS32}, {2, 1, 0x1B, 1, kBroadcast, 32 | 0x80, 64, kS32},
@@ -607,6 +607,8 @@ X86_64Cpu::Step X86_64Cpu::step_evex(GuestMemory& m) {
     case kFma4: return evex_fp(m, *def);
     case kEr: return evex_er(m, *def);
     case kBfloat: return evex_bf16(m, *def);
+    case kMinMax: case kComx: return evex_minmax(m, *def);
+    case kDpPh: case kMpsadbw: case kSatCvt: return evex_avx102(m, *def);
     case kDot: case kVnni: case kMadd52: case kMultishift: case kShufBit: case kShift2: case kShift2Var: case kGfAffine: case kGfMul: case kBf16: case kAesNi: case kClmul: case kBroadcastMask: case kDbpsadbw:
       return evex_ext(m, *def);
     default: return evex_misc(m, *def);

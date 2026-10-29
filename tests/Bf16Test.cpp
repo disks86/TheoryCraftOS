@@ -393,7 +393,300 @@ static void test_encoding() {
   { Bytes b = ok; b[3] |= 0x10; b[3] = uint8_t((b[3] & ~0x60) | 0x20); Machine m(b); CHECK(m.undefined()); }      // EVEX.b with a register: embedded rounding does not exist here
 }
 
+
+
+// --- vminmax, vcomx, vmovd ---------------------------------------------------------------------------------------------------------------
+
+static uint64_t dbits(double d) { uint64_t u; memcpy(&u, &d, 8); return u; }
+static double dfrom(uint64_t u) { double d; memcpy(&d, &u, 8); return d; }
+
+// The specification's minmax() on doubles (no denormal flushing); NaNs given as bit patterns.
+static uint64_t model_minmax(uint64_t abits, uint64_t bbits, int imm) {
+  const double a = dfrom(abits), b = dfrom(bbits);
+  const bool a_nan = std::isnan(a), b_nan = std::isnan(b);
+  const bool a_snan = a_nan && !(abits & (1ull << 51)), b_snan = b_nan && !(bbits & (1ull << 51));
+  const int op = imm & 3, sc = (imm >> 2) & 3;
+  const bool number = (imm >> 4) & 1, want_max = op & 1, magnitude = op & 2;
+  const uint64_t qa = abits | (1ull << 51), qb = bbits | (1ull << 51);
+  uint64_t tmp;
+  bool is_nan = false;
+  if (a_nan || b_nan) {
+    if (!number || (a_nan && b_nan)) {
+      if (a_nan) tmp = a_snan ? qa : (b_snan ? qb : abits);
+      else tmp = qb;
+      is_nan = true;
+    } else {
+      tmp = a_nan ? bbits : abits;
+    }
+  } else {
+    const double ka = magnitude ? std::fabs(a) : a, kb = magnitude ? std::fabs(b) : b;
+    double pick_a_value;
+    bool pick_a;
+    if (ka == kb) {
+      if (magnitude && std::fabs(a) == std::fabs(b)) { /* fall through to signed comparison */ }
+      if (a == b && std::signbit(a) == std::signbit(b)) pick_a = true;
+      else if (a == b) pick_a = (std::signbit(a) == !want_max);      // opposite-signed zeros
+      else pick_a = want_max ? a > b : a < b;                          // equal magnitudes, opposite signs
+    } else {
+      pick_a = want_max ? ka > kb : ka < kb;
+    }
+    (void)pick_a_value;
+    tmp = pick_a ? abits : bbits;
+  }
+  if (!is_nan) {
+    if (sc == 3) tmp |= 1ull << 63;
+    else if (sc == 2) tmp &= ~(1ull << 63);
+    else if (sc == 1 || a_nan) {}
+    else tmp = (tmp & ~(1ull << 63)) | (abits & (1ull << 63));
+  }
+  return tmp;
+}
+
+static void test_minmax_instruction() {
+  for (int imm = 0; imm < 32; ++imm)
+    for (int iter = 0; iter < 30; ++iter) {
+      uint64_t a, b;
+      switch (iter % 6) {
+        case 0: a = dbits(double(int(rnd() % 21) - 10)); b = dbits(double(int(rnd() % 21) - 10)); break;
+        case 1: a = dbits(0.0); b = dbits(-0.0); break;
+        case 2: a = dbits(-0.0); b = dbits(0.0); break;
+        case 3: { const double v = double(rnd() % 100 + 1); a = dbits(v); b = dbits(-v); break; }
+        case 4: a = 0x7FF8000000000123ull; b = dbits(3.5); break;
+        default: a = dbits(double(int64_t(rnd() % 2001) - 1000) / 8); b = dbits(double(int64_t(rnd() % 2001) - 1000) / 8); break;
+      }
+      if (iter == 5) { a = 0x7FF0000000000001ull; b = dbits(1.0); }
+      if (iter == 11) { a = dbits(1.0); b = 0x7FF0000000000002ull; }
+      if (iter == 17) { a = 0x7FF8000000000001ull; b = 0x7FF0000000000002ull; }
+      if (iter == 23) { a = 0x7FF0000000000001ull; b = 0x7FF8000000000002ull; }
+      Machine m(encode(3, 1, 0x52, 0, 1, false, 2, 0, false, false, true, {uint8_t(imm)}));
+      for (int i = 0; i < 8; ++i) { /* all lanes the same */ }
+      uint64_t q[8];
+      for (int i = 0; i < 8; ++i) q[i] = a;
+      Zmm za, zb;
+      memcpy(za.h, q, 64);
+      for (int i = 0; i < 8; ++i) q[i] = b;
+      memcpy(zb.h, q, 64);
+      set_zmm(m.cpu.state(), 1, za);
+      set_zmm(m.cpu.state(), 2, zb);
+      CHECK(m.finished());
+      const Zmm got = get_zmm(m.cpu.state(), 0);
+      uint64_t g;
+      memcpy(&g, got.h, 8);
+      const uint64_t want = model_minmax(a, b, imm);
+      if (g != want) printf("  minmax imm %02x a %016llx b %016llx: want %016llx got %016llx\n", imm, (unsigned long long)a, (unsigned long long)b, (unsigned long long)want, (unsigned long long)g);
+      CHECK(g == want);
+      const bool snan_in = (std::isnan(dfrom(a)) && !(a & (1ull << 51))) || (std::isnan(dfrom(b)) && !(b & (1ull << 51)));
+      CHECK(((m.cpu.state().mxcsr & 1) != 0) == snan_in);
+    }
+  {      // the scalar form keeps the upper part of the first source, and a masked-off result merges
+    Machine m(encode(3, 1, 0x53, 0, 1, false, 0, 0, false, false, true, {0x01}));      // vminmaxsd xmm0, xmm1, xmm2, max
+    m.cpu.state().xmm[1] = {dbits(2.0), 0x1111};
+    m.cpu.state().xmm[2] = {dbits(5.0), 0x2222};
+    CHECK(m.finished());
+    CHECK(m.cpu.state().xmm[0].lo == dbits(5.0) && m.cpu.state().xmm[0].hi == 0x1111);
+  }
+}
+
+static void test_comx() {
+  struct C { uint64_t a, b; bool signaling; };
+  const double nan = dfrom(0x7FF8000000000000ull);
+  const struct { double a, b; uint64_t flags; } cases[] = {{1.0, 2.0, 0x801 | 0x0}, {2.0, 1.0, 0}, {1.0, 1.0, 0x800 | 0x80 | 0x40}, {nan, 1.0, 0x800 | 0x80 | 4 | 1}, {1.0, nan, 0x800 | 0x80 | 4 | 1}};
+  for (const auto& c : cases)
+    for (int unordered_variant = 0; unordered_variant < 2; ++unordered_variant) {
+      Bytes code = {0x62, 0xF1, 0xFF, 0x08, uint8_t(unordered_variant ? 0x2E : 0x2F), 0xC1, 0x0F, 0x0B};      // vcomxsd / vucomxsd xmm0, xmm1
+      Machine m(code);
+      m.cpu.state().xmm[0] = {dbits(c.a), 0};
+      m.cpu.state().xmm[1] = {dbits(c.b), 0};
+      m.cpu.state().rflags = 0x202 | 0x10;
+      CHECK(m.finished());
+      CHECK((m.cpu.state().rflags & 0x8D5) == c.flags);
+      const bool qnan = std::isnan(c.a) || std::isnan(c.b);
+      CHECK(((m.cpu.state().mxcsr & 1) != 0) == (qnan && !unordered_variant));
+    }
+  Bytes bad = {0x62, 0xF1, 0xF7, 0x08, 0x2F, 0xC1, 0x0F, 0x0B};      // vvvv in use
+  Machine m(bad);
+  CHECK(m.undefined());
+}
+
+static void test_vmovd() {
+  {
+    Bytes code = {0x62, 0xF1, 0x7E, 0x08, 0x7E, 0xC1, 0x0F, 0x0B};      // vmovd xmm0, xmm1
+    Machine m(code);
+    m.cpu.state().xmm[1] = {0x1122334455667788ull, 0x99};
+    m.cpu.state().xmm[0] = {~0ull, ~0ull};
+    CHECK(m.finished());
+    CHECK(m.cpu.state().xmm[0].lo == 0x55667788ull && m.cpu.state().xmm[0].hi == 0);
+  }
+  {
+    Bytes code = {0x62, 0xF1, 0x7D, 0x08, 0xD6, 0x07, 0x0F, 0x0B};      // vmovd [rdi], xmm0
+    Machine m(code);
+    m.cpu.state().xmm[0] = {0x1122334455667788ull, 0};
+    const uint64_t pattern = ~0ull;
+    m.poke(kBase, &pattern, 8);
+    CHECK(m.finished());
+    uint64_t v = 0;
+    GuestMemory gm(m.space);
+    gm.read(kBase, ByteView(reinterpret_cast<uint8_t*>(&v), 8));
+    CHECK(v == 0xFFFFFFFF55667788ull);
+  }
+}
+
+
+
+// --- vdpphps, vmpsadbw, saturating conversions --------------------------------------------------------------------------------------------------
+
+static uint32_t bits(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
+static float from_bits(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
+
+static float half_float(uint16_t h) {
+  const int sign = h >> 15, exp = (h >> 10) & 31, man = h & 1023;
+  double v;
+  if (exp == 0) v = std::ldexp(man, -24);
+  else if (exp == 31) return man ? NAN : (sign ? -INFINITY : INFINITY);
+  else v = std::ldexp(1024 + man, exp - 25);
+  return float(sign ? -v : v);
+}
+static uint16_t random_half() { return uint16_t(((rnd() & 1) << 15) | ((8 + rnd() % 14) << 10) | (rnd() & 0x3FF)); }
+
+static void test_dpphps() {
+  for (int vl = 0; vl < 3; ++vl)
+    for (int iter = 0; iter < 30; ++iter) {
+      Zmm a, b, d;
+      for (int i = 0; i < 32; ++i) { a.h[i] = random_half(); b.h[i] = random_half(); }
+      float df[16];
+      for (float& f : df) f = float(int(rnd() % 2001) - 1000) / 16;
+      memcpy(d.h, df, 64);
+      const bool memory = iter & 1;
+      const Zmm got = run1(encode(2, 0, 0x52, 0, 1, memory, vl), a, b, d, memory);
+      float out[16];
+      memcpy(out, got.h, 64);
+      for (int i = 0; i < 4 << vl; ++i) {
+        float acc = df[i];
+        acc = std::fmaf(half_float(a.h[2 * i + 1]), half_float(b.h[2 * i + 1]), acc);
+        acc = std::fmaf(half_float(a.h[2 * i]), half_float(b.h[2 * i]), acc);
+        if ((bits(acc) & 0x7F800000u) == 0) acc = from_bits(bits(acc) & 0x80000000u);
+        CHECK(bits(out[i]) == bits(acc));
+      }
+      for (int i = 4 << vl; i < 16; ++i) CHECK(bits(out[i]) == 0);
+    }
+}
+
+static void test_mpsadbw() {
+  for (int vl = 0; vl < 3; ++vl)
+    for (int imm = 0; imm < 64; imm += 5) {
+      Zmm a, b;
+      uint8_t ab[64], bb[64];
+      for (int i = 0; i < 64; ++i) { ab[i] = uint8_t(rnd()); bb[i] = uint8_t(rnd()); }
+      memcpy(a.h, ab, 64); memcpy(b.h, bb, 64);
+      const Zmm got = run1(encode(3, 2, 0x42, 0, 1, false, vl, 0, false, false, false, {uint8_t(imm)}), a, b, Zmm(), false);
+      uint16_t out[32];
+      memcpy(out, got.h, 64);
+      for (int lane = 0; lane < (1 << vl); ++lane) {
+        const int control = (imm >> ((lane & 1) * 3)) & 7, blk2 = (control & 3) * 4, blk1 = ((control >> 2) & 1) * 4;
+        for (int i = 0; i < 8; ++i) {
+          int sum = 0;
+          for (int j = 0; j < 4; ++j) sum += std::abs(int(ab[lane * 16 + blk1 + i + j]) - int(bb[lane * 16 + blk2 + j]));
+          CHECK(out[lane * 8 + i] == sum);
+        }
+      }
+    }
+}
+
+static int64_t sat_trunc(double x, int bits, bool is_unsigned) {
+  if (std::isnan(x)) return 0;
+  if (bits == 64 && std::isinf(x)) return x > 0 ? (is_unsigned ? -1 : INT64_MAX) : (is_unsigned ? 0 : INT64_MIN);
+  const double lo = is_unsigned ? 0 : -std::ldexp(1.0, bits - 1), hi = is_unsigned ? std::ldexp(1.0, bits) : std::ldexp(1.0, bits - 1);
+  const double t = std::trunc(x);
+  if (t <= lo) return (int64_t)lo;
+  if (t >= hi) return is_unsigned ? (int64_t)(uint64_t)(hi - 1 + (bits == 64 ? 0 : 0)) : (int64_t)(hi - 1);
+  return (int64_t)t;
+}
+
+static void test_saturating() {
+  for (int iter = 0; iter < 60; ++iter) {
+    for (int unsigned_form = 0; unsigned_form < 2; ++unsigned_form) {
+      // vcvttps2dqs / vcvttps2udqs: NP map5 6D / 6C, W0
+      float f[16];
+      Zmm a;
+      for (int i = 0; i < 16; ++i) {
+        switch (rnd() % 6) {
+          case 0: f[i] = NAN; break;
+          case 1: f[i] = (rnd() & 1) ? INFINITY : -INFINITY; break;
+          case 2: f[i] = float(int(rnd() % 200) - 100) + 0.5f; break;
+          case 3: f[i] = float(std::ldexp(1.0 + double(rnd() % 100) / 100, int(rnd() % 40))) * ((rnd() & 1) ? 1 : -1); break;
+          default: f[i] = float(int(rnd() % 4001) - 2000) / 8; break;
+        }
+      }
+      memcpy(a.h, f, 64);
+      const Zmm got = run1(encode(5, 0, unsigned_form ? 0x6C : 0x6D, 0, 0, false, 2), Zmm(), a, Zmm(), false);
+      uint32_t out[16];
+      memcpy(out, got.h, 64);
+      for (int i = 0; i < 16; ++i) {
+        const int64_t want = sat_trunc(f[i], 32, unsigned_form);
+        CHECK(out[i] == uint32_t(want));
+      }
+      // vcvttpd2dqs / udqs: NP map5 W1: the result is half the width
+      double d[8];
+      for (int i = 0; i < 8; ++i) d[i] = f[i] * 3000.0;
+      Zmm ad;
+      memcpy(ad.h, d, 64);
+      const Zmm got2 = run1(encode(5, 0, unsigned_form ? 0x6C : 0x6D, 0, 0, false, 2, 0, false, false, true), Zmm(), ad, Zmm(), false);
+      uint32_t out2[16];
+      memcpy(out2, got2.h, 64);
+      for (int i = 0; i < 8; ++i) CHECK(out2[i] == uint32_t(sat_trunc(d[i], 32, unsigned_form)));
+      for (int i = 8; i < 16; ++i) CHECK(out2[i] == 0);
+      // vcvttps2qqs / uqqs: 66 map5 W0 on a half-width source (ymm source for the zmm result)
+      Zmm a3;
+      memcpy(a3.h, f, 32);
+      const Zmm got3 = run1(encode(5, 1, unsigned_form ? 0x6C : 0x6D, 0, 0, false, 2), Zmm(), a3, Zmm(), false);
+      uint64_t out3[8];
+      memcpy(out3, got3.h, 64);
+      for (int i = 0; i < 8; ++i) {
+        if (unsigned_form && f[i] >= 0 && f[i] >= 1.8446744073709552e19f && std::isfinite(f[i])) { CHECK(out3[i] == ~0ull); continue; }
+        if (!unsigned_form && std::isfinite(f[i]) && std::fabs(f[i]) >= 9.2233720368547758e18f) { CHECK(out3[i] == (f[i] > 0 ? 0x7FFFFFFFFFFFFFFFull : 0x8000000000000000ull)); continue; }
+        if (out3[i] != uint64_t(sat_trunc(f[i], 64, unsigned_form))) printf("  qq unsigned %d f %g got %llx want %llx\n", unsigned_form, f[i], (unsigned long long)out3[i], (unsigned long long)sat_trunc(f[i], 64, unsigned_form));
+        CHECK(out3[i] == uint64_t(sat_trunc(f[i], 64, unsigned_form)));
+      }
+    }
+  }
+  {      // vcvtph2ibs / vcvttbf162iubs: the byte in the low half of the element
+    Zmm a;
+    for (int i = 0; i < 32; ++i) a.h[i] = to_bf(double(int(rnd() % 600) - 300) / 4);
+    const Zmm got = run1(encode(5, 3, 0x6A, 0, 0, false, 2), Zmm(), a, Zmm(), false);      // F2 map5 6A: vcvttbf162iubs
+    for (int i = 0; i < 32; ++i) CHECK(got.h[i] == uint16_t(sat_trunc(daz(a.h[i]), 8, true)));
+    const Zmm got2 = run1(encode(5, 3, 0x69, 0, 0, false, 2), Zmm(), a, Zmm(), false);     // vcvtbf162ibs: rounds to nearest even
+    for (int i = 0; i < 32; ++i) {
+      const double x = daz(a.h[i]);
+      double r = std::nearbyint(x);
+      if (r > 127) r = 127;
+      if (r < -128) r = -128;
+      CHECK(got2.h[i] == uint16_t(uint8_t(int(r))));
+    }
+  }
+  {      // vcvttsd2sis / vcvttss2usis into a general register
+    Bytes code = {0x62, 0xF5, 0xFF, 0x08, 0x6D, 0xC1, 0x0F, 0x0B};      // vcvttsd2sis rax, xmm1  (F2, W1)
+    Machine m(code);
+    m.cpu.state().xmm[1] = {dbits(1e30), 0};
+    CHECK(m.finished());
+    CHECK(m.cpu.state().r[0] == 0x7FFFFFFFFFFFFFFFull);
+    CHECK(m.cpu.state().mxcsr & 1);
+    Bytes code2 = {0x62, 0xF5, 0x7E, 0x08, 0x6C, 0xC1, 0x0F, 0x0B};      // vcvttss2usis eax, xmm1  (F3, W0)
+    Machine m2(code2);
+    float neg = -5.5f;
+    uint32_t nb; memcpy(&nb, &neg, 4);
+    m2.cpu.state().xmm[1] = {nb, 0};
+    CHECK(m2.finished());
+    CHECK(m2.cpu.state().r[0] == 0);
+  }
+}
+
 int main() {
+  test_dpphps();
+  test_mpsadbw();
+  test_saturating();
+  test_minmax_instruction();
+  test_comx();
+  test_vmovd();
   test_binary();
   test_fma();
   test_minmax();
