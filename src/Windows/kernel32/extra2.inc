@@ -6,7 +6,7 @@ EXPORT BOOL WINAPI GetComputerNameExW(int type, LPWSTR name, LPDWORD size) {
   static const WCHAR upper[] = {'T', 'C', 'O', 'S', 0}, lower[] = {'t', 'c', 'o', 's', 0};
   const WCHAR *text = (type == 1 || type == 4 || type == 5 || type == 7) ? lower : upper;      /* ComputerNameDnsHostname/Domain/Fqdn/PhysicalDnsHostname are lower case here */
   const DWORD n = 4;
-  if (!size || (*size < n + 1 && name)) { if (size) *size = n + 1; set_error(ERROR_MORE_DATA); return FALSE; }
+  if (!size || *size < n + 1 || !name) { if (size) *size = n + 1; set_error(ERROR_MORE_DATA); return FALSE; }
   if (name) memcpy(name, text, (n + 1) * 2);
   *size = n;
   return TRUE;

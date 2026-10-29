@@ -631,13 +631,13 @@ EXPORT BOOL WINAPI GetPhysicallyInstalledSystemMemory(ULONGLONG *kilobytes) {
 EXPORT BOOL WINAPI IsProcessorFeaturePresent(DWORD feature) { return feature == 6 || feature == 10; }
 EXPORT BOOL WINAPI GetComputerNameW(LPWSTR name, LPDWORD size) {
   static const WCHAR kName[] = {'T', 'C', 'O', 'S', 0};
-  if (*size < 5) { *size = 5; set_error(ERROR_MORE_DATA); return FALSE; }
+  if (*size < 5) { *size = 5; set_error(111 /* ERROR_BUFFER_OVERFLOW */); return FALSE; }
   memcpy(name, kName, sizeof(kName));
   *size = 4;
   return TRUE;
 }
 EXPORT BOOL WINAPI GetComputerNameA(LPSTR name, LPDWORD size) {
-  if (*size < 5) { *size = 5; set_error(ERROR_MORE_DATA); return FALSE; }
+  if (*size < 5) { *size = 5; set_error(111 /* ERROR_BUFFER_OVERFLOW */); return FALSE; }
   memcpy(name, "TCOS", 5);
   *size = 4;
   return TRUE;
@@ -1958,6 +1958,7 @@ EXPORT UINT WINAPI WinExec(LPCSTR command_line, UINT show) {
 /* ---- handles, time --------------------------------------------------------------------------------------------------------------------------------------- */
 
 EXPORT BOOL WINAPI CloseHandle(HANDLE h) {
+  if ((ULONG_PTR)h == 0x4B4F54) return TRUE;      /* (advapi32's token "handle": there is nothing behind it) */
   const NTSTATUS status = NtClose(h);
   return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
