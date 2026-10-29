@@ -3254,8 +3254,8 @@ static void test_back_end_on_card() {
     VegaDrawRequest bad_mip = mip;
     bad_mip.textures[0].texels = ConstByteView(mip_texels, 64 * 4);
     CHECK(AmdVegaDraw::area_bytes(bad_mip) == 0);
-    bad_mip = mip; bad_mip.textures[0].tile_index = 8;
-    CHECK(AmdVegaDraw::area_bytes(bad_mip) == 0);                // levels need the 1D tiled layout
+    bad_mip = mip; bad_mip.textures[0].tile_index = 11;
+    CHECK(AmdVegaDraw::area_bytes(bad_mip) == 0);                // a layout that is not implemented (PRT)
   }
   // dual source blending on the card: a second colour output (constant row 0 of the pixel shader), src + dst * (1 - src1 colour) over the cleared target
   {

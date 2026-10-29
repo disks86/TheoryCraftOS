@@ -427,10 +427,18 @@ static void test_refusals() {
     CHECK(parse_tgsi(alloc, StringView(text), &sh, &error, &line) && sh.sampler_target[0] == TgsiShader::kTargetCube && sh.sampler_target[1] == TgsiShader::kTarget3D &&
           sh.sampler_target[2] == TgsiShader::kTarget2DArray);
   }
+  {
+    TgsiShader sh(alloc);
+    const char* error = nullptr;
+    uint32_t line = 0;
+    const char* text = "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\nDCL SAMP[0..2]\nDCL SVIEW[0], 1D, FLOAT\nDCL SVIEW[1], 1D_ARRAY, FLOAT\nDCL SVIEW[2], CUBE_ARRAY, FLOAT\n  0: TEX OUT[0], IN[0], SAMP[2], CUBE_ARRAY\n  1: END\n";
+    CHECK(parse_tgsi(alloc, StringView(text), &sh, &error, &line) && sh.sampler_target[0] == TgsiShader::kTarget1D && sh.sampler_target[1] == TgsiShader::kTarget1DArray &&
+          sh.sampler_target[2] == TgsiShader::kTargetCubeArray);
+  }
   // the parser's refusals
   const char* bad[] = {"", "VERT\n", "FRAG\nDCL OUT[0], COLOR\n  0: FOO OUT[0], IN[0]\n  1: END\n", "FRAG\n  0: MOV OUT[0], IN[0]\n  1: END\n  2: MOV OUT[0], IN[0]\n", "FRAG\nDCL IN[0]\n  0: MOV OUT[0] IN[0]\n  1: END\n",
                        "FRAG\nDCL OUT[0], COLOR\n  0: MOV OUT[0], CONST[\n  1: END\n", "FRAG\nIMM[1] FLT32 {1, 2, 3, 4}\n  0: END\n", "GEOM\n", "FRAG\nDCL TEMP[0..999]\n  0: END\n",
-                       "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\nDCL SAMP[0]\nDCL SVIEW[0], 1D, FLOAT\n  0: TEX OUT[0], IN[0], SAMP[0], 1D\n  1: END\n",                  // a target there is not
+                       "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\nDCL SAMP[0]\nDCL SVIEW[0], RECT, FLOAT\n  0: TEX OUT[0], IN[0], SAMP[0], RECT\n  1: END\n",                  // a target there is not
                        "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\nDCL SAMP[0]\nDCL SVIEW[0], CUBE, FLOAT\n  0: TEX OUT[0], IN[0], SAMP[0], 2D\n  1: END\n"};   // not the declared one
   for (const char* t : bad) {
     TgsiShader sh(alloc);

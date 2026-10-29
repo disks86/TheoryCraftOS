@@ -95,9 +95,10 @@ int main() {
   // The mip chains and slices of the 1D tiled layouts (entries 9 and 13): the size of every level as the library gives it, the way Mesa's drivers ask for it (the base level and, for the
   // levels, the width and height shifted down, `basePitch` the base level's pitch, pow2Pad on when there is more than one level). Lines: "level idx bpp type w h depth levels k pitch height
   // slices size align" with type 0 2D, 1 3D, 2 cube, 3 array, and slices the number of slices the library was asked for.
-  const uint32_t mip_indices[] = {9, 13};
-  const struct { uint32_t type, w, h, depth, levels; } chains[] = {{0, 8, 8, 1, 4}, {0, 20, 12, 1, 5}, {0, 37, 5, 1, 6}, {0, 64, 64, 1, 7}, {1, 4, 4, 4, 3}, {1, 16, 8, 6, 5}, {2, 8, 8, 6, 4},
-                                                                  {2, 32, 32, 6, 6}, {3, 10, 7, 3, 4}, {3, 16, 16, 5, 1}, {0, 17, 9, 1, 1}, {1, 9, 9, 9, 1}};
+  const uint32_t mip_indices[] = {8, 9, 10, 13, 14};
+  const struct { uint32_t type, w, h, depth, levels; } chains[] = {{0, 8, 8, 1, 4}, {0, 20, 12, 1, 5}, {0, 37, 5, 1, 6}, {0, 64, 64, 1, 7}, {0, 300, 200, 1, 9}, {1, 4, 4, 4, 3},
+                                                                  {1, 16, 8, 6, 5}, {2, 8, 8, 6, 4}, {2, 32, 32, 6, 6}, {2, 16, 16, 12, 5}, {3, 10, 7, 3, 4}, {3, 16, 16, 5, 1}, {0, 17, 9, 1, 1},
+                                                                  {1, 9, 9, 9, 1}, {4, 37, 1, 1, 6}, {4, 16, 1, 1, 1}, {5, 20, 1, 4, 3}, {3, 130, 70, 4, 1}};
   for (const uint32_t idx : mip_indices)
     for (const uint32_t bpp : {8u, 32u, 128u})
       for (const auto& c : chains) {
@@ -132,8 +133,28 @@ int main() {
           out.pTileInfo = &ti_out;
           if (AddrComputeSurfaceInfo(co.hLib, &in, &out) != ADDR_OK) { fprintf(stderr, "level info failed idx %u bpp %u\n", idx, bpp); break; }
           if (k == 0) base_pitch = out.pitch;
-          printf("level %u %u %u %u %u %u %u %u %u %u %u %llu %u\n", idx, bpp, c.type, c.w, c.h, c.depth, c.levels, k, out.pitch, out.height, in.numSlices, static_cast<unsigned long long>(out.surfSize),
-                 out.baseAlign);
+          printf("level %u %u %u %u %u %u %u %u %u %u %u %llu %u %u\n", idx, bpp, c.type, c.w, c.h, c.depth, c.levels, k, out.pitch, out.height, in.numSlices,
+                 static_cast<unsigned long long>(out.surfSize), out.baseAlign, static_cast<unsigned>(out.tileMode));
+          // pixels of the level, in a few slices: "slice idx bpp type w h depth levels k slice x y address" (the address from the start of the level)
+          for (uint32_t n = 0; n < 12; ++n) {
+            const uint32_t lw = (c.w >> k) > 0 ? c.w >> k : 1, lh = (c.h >> k) > 0 ? c.h >> k : 1;
+            const uint32_t x = (n * 29u + n * n) % lw, y = (n * 17u + 5 * n) % lh, z = in.numSlices > 1 ? (n * 7u + n / 3) % (c.type == 1 ? (in.numSlices) : c.depth) : 0;
+            ADDR_COMPUTE_SURFACE_ADDRFROMCOORD_INPUT ai;
+            memset(&ai, 0, sizeof ai);
+            ai.size = sizeof ai;
+            ai.x = x; ai.y = y; ai.slice = z; ai.bpp = bpp;
+            ai.pitch = out.pitch; ai.height = out.height;
+            ai.numSlices = in.numSlices; ai.numSamples = 1;
+            ai.tileMode = out.tileMode;
+            ai.tileType = in.tileType;
+            ai.tileIndex = out.tileIndex;
+            ai.pTileInfo = &ti_out;
+            ADDR_COMPUTE_SURFACE_ADDRFROMCOORD_OUTPUT ao;
+            memset(&ao, 0, sizeof ao);
+            ao.size = sizeof ao;
+            if (AddrComputeSurfaceAddrFromCoord(co.hLib, &ai, &ao) != ADDR_OK) continue;
+            printf("slice %u %u %u %u %u %u %u %u %u %u %u %llu\n", idx, bpp, c.type, c.w, c.h, c.depth, c.levels, k, z, x, y, static_cast<unsigned long long>(ao.addr));
+          }
         }
       }
   return 0;

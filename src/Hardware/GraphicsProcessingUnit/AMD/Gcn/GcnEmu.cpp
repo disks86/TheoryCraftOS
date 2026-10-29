@@ -831,7 +831,7 @@ Status Wave::exec_mimg(uint32_t w0, uint32_t w1, IEnvironment& env) {
   const Mimg o = static_cast<Mimg>(op);
   // the address registers: the bias (image_sample_b) first, then the coordinates of the image's type (2 for a 2D image, 3 for 3D, array and cube), then the level of detail (image_sample_l)
   const uint32_t type = sgpr[srsrc + 3] >> 28;
-  const uint32_t dims = type == 10 || type == 11 || type == 13 ? 3 : 2;
+  const uint32_t dims = type == 10 || type == 11 || type == 13 ? 3 : type == 8 ? 1 : 2;       // 1D: 1, 1D array: 2 (its layer), 2D: 2, 3D, cube and 2D array: 3
   uint32_t coords = 0;
   switch (o) {
     case Mimg::image_sample: case Mimg::image_sample_lz: case Mimg::image_load: coords = dims; break;
