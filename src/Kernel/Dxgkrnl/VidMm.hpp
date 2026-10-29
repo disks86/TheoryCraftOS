@@ -47,13 +47,17 @@ class Allocation {
   // What being resident costs against the adapter's budget.
   uint64_t device_bytes() const { return device_bytes_; }
   const AllocationDesc& desc() const { return desc_; }
-  bool is_buffer() const { return (desc_.flags & (kAllocVertexBuffer | kAllocIndexBuffer)) != 0; }
+  bool is_buffer() const { return (desc_.flags & (kAllocVertexBuffer | kAllocIndexBuffer | kAllocQueryResult)) != 0; }
+  bool is_query_result() const { return (desc_.flags & kAllocQueryResult) != 0; }
   bool is_image() const { return !is_buffer(); }
   bool is_depth() const { return dxgk::is_depth(desc_.format); }
   bool is_staging() const { return (desc_.flags & kAllocStaging) != 0; }
-  bool can_be_resident() const { return !is_staging(); }
+  bool can_be_resident() const { return !is_staging() && !is_query_result(); }
   bool resident() const { return image_ != nullptr || buffer_ != nullptr; }
   uint32_t mip_levels() const { return desc_.mip_levels; }
+  // The 2D images of the allocation (1 for a plain texture); they follow each other in the backing, each width * height pixels.
+  uint32_t layers() const { return desc_.kind == graphics::TextureKind::Texture2D ? 1 : desc_.layers; }
+  graphics::TextureKind texture_kind() const { return desc_.kind; }
   uint32_t pitch() const { return is_image() ? desc_.width * pixel_bytes(desc_.format) : 0; }
 
   // The system-memory backing (empty for depth images). Little-endian words in desc().format's layout; the levels of a mipmapped texture follow each other.

@@ -71,6 +71,12 @@ enum ImageUsage : uint32_t {
   kImageSampled = 1u << 3,  // may be bound as a texture with bind_texture() and filled with write_pixels()
 };
 
+// What a sampled image is (kFeatureTextureKinds for anything but Texture2D). Texture3D has `layers` slices of depth, Texture2DArray `layers` layers, TextureCube six faces in the order
+// +X, -X, +Y, -Y, +Z, -Z (`layers` is ignored). All but Texture2D have one mip level, a colour format of 8-bit channels and no usage but kImageSampled; they are filled and read
+// layer by layer (write_layer_pixels / read_layer_pixels), each layer a 2D image of `extent`.
+enum class TextureKind : uint8_t { Texture2D, Texture3D, Texture2DArray, TextureCube };
+constexpr uint32_t kMaxTextureLayers = 256;
+
 struct ImageDesc {
   Extent2D extent;
   Format format = Format::B8G8R8A8Unorm;
@@ -80,6 +86,8 @@ struct ImageDesc {
   // The levels of a sampled colour image (Mipmaps.hpp): level 0 is `extent`, each next is half as large each way. More than one needs kImageSampled and no other usage on
   // the Intel Gen9 device; devices that cannot refuse the image. A level is filled by write_mip_pixels, or all of them from level 0 by generate_mipmaps.
   uint32_t mip_levels = 1;
+  TextureKind kind = TextureKind::Texture2D;
+  uint32_t layers = 1;
 };
 
 class IImage {
@@ -103,6 +111,17 @@ class IImage {
   }
   virtual bool write_pixels_float(ArrayView<const Vec4> pixels) {
     (void)pixels;
+    return false;
+  }
+  // The layers of an image that is not Texture2D (6 for a cube; 1 for a 2D image): extent.width * extent.height values each, rows top to bottom. False for a layer that does not
+  // exist, a wrong size or a device that cannot.
+  virtual uint32_t layer_count() const { return 1; }
+  virtual bool write_layer_pixels(uint32_t layer, ArrayView<const uint32_t> pixels) {
+    (void)layer, (void)pixels;
+    return false;
+  }
+  virtual bool read_layer_pixels(uint32_t layer, ArrayView<uint32_t> out) {
+    (void)layer, (void)out;
     return false;
   }
   // The number of levels the image was made with.
@@ -155,6 +174,13 @@ struct SamplerDesc {
 class ITextureSet {
  public:
   virtual Vec4 sample(uint32_t unit, float u, float v) const = 0;
+  // The lookup in a texture of any kind (kFeatureTextureKinds): the coordinate is (u, v) and a third value `w` that means, by the kind of the image bound to the unit: Texture3D
+  // the depth coordinate (0..1 over the slices; the slices are blended by a linear filter, and w is clamped), Texture2DArray the layer (rounded to the nearest, clamped),
+  // TextureCube the z of a direction (u, v, w) = (x, y, z) that picks the face and the point on it, with no filtering across faces. A 2D image ignores w.
+  virtual Vec4 sample_volume(uint32_t unit, float u, float v, float w) const {
+    (void)w;
+    return sample(unit, u, v);
+  }
   // --- kFeatureTexelAccess (DeviceInfo::features); a device without it leaves these at their defaults.
   // The lookup at an explicit level of detail (lambda: 0 is the base level), as sample() takes it from the derivatives.
   virtual Vec4 sample_lod(uint32_t unit, float u, float v, float lod) const {
@@ -330,6 +356,9 @@ struct Viewport {
   float min_depth = 0, max_depth = 1;
 };
 
+// The occlusion queries one command buffer can hold (kFeatureOcclusionQueries): slots 0 .. kMaxOcclusionQueries - 1.
+constexpr uint32_t kMaxOcclusionQueries = 64;
+
 struct RenderPassBegin {
   IImage* color = nullptr;
   // Further colour images (kFeatureMultipleTargets): target n (1..3) is extra_colors[n - 1], and a gap ends the list. All have the extent of `color`, none is bound as a texture
@@ -364,6 +393,16 @@ class ICommandBuffer {
   // What the vertices of the draws that follow make (kFeatureLines for lines and points; the default is a list of triangles).
   virtual void set_primitive_topology(PrimitiveTopology topology) = 0;
   virtual void end_render_pass() = 0;
+  // Occlusion queries (kFeatureOcclusionQueries), inside a render pass: from begin to end, the fragments that pass the stencil and depth tests (and that the shader did not
+  // discard) are counted - one per pixel, however many targets the pipeline writes and whatever the blending or write masks do. `slot` (below kMaxOcclusionQueries) names the result; one query is open at a time and
+  // it ends before the pass does. A device without the feature ignores both.
+  virtual void begin_occlusion_query(uint32_t slot) { (void)slot; }
+  virtual void end_occlusion_query() {}
+  // After submit(): the count of a query that was begun and ended (false for a slot that was not).
+  virtual bool occlusion_result(uint32_t slot, uint64_t* samples) const {
+    (void)slot, (void)samples;
+    return false;
+  }
   // False if recording failed (out of memory, or a command used a resource wrongly).
   virtual bool end() = 0;
 
@@ -384,6 +423,8 @@ enum DeviceFeature : uint32_t {
   kFeatureInstancing = 1u << 3,    // draw(..., instance_count, first_instance) and VertexAttribute::per_instance
   kFeatureLines = 1u << 4,         // set_primitive_topology: lines and points
   kFeatureFloatFormats = 1u << 6,      // Format::R16G16B16A16Float / R32G32B32A32Float images: colour attachments (also several at once) and sampled textures, without mipmaps; read_pixels_float / write_pixels_float
+  kFeatureTextureKinds = 1u << 8,      // ImageDesc::kind other than Texture2D, layer_count / write_layer_pixels / read_layer_pixels, ITextureSet::sample_volume
+  kFeatureOcclusionQueries = 1u << 7,  // ICommandBuffer::begin_occlusion_query / end_occlusion_query / occlusion_result
   kFeatureMultipleTargets = 1u << 5,   // RenderPassBegin::extra_colors and GraphicsPipelineDesc::color_target_count
 };
 

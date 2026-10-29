@@ -100,17 +100,19 @@ class Stream {
   bool overflow_ = false;
 };
 
+constexpr uint32_t kQueryPolls = 5000;   // how many empty commands to wait for the host's query results with
+
 // --- Objects -------------------------------------------------------------------
 
 class VirglBuffer final : public IBuffer {
  public:
-  VirglBuffer(VirglDevice& device, uint64_t size, uint32_t usage) : device_(device) {
+  VirglBuffer(VirglDevice& device, uint64_t size, uint32_t usage, uint32_t extra_bind = 0) : device_(device) {
     hardware::VirtioGpu& gpu = device.gpu();
     memory_ = allocate_dma_view<uint8_t>(gpu.allocator(), size, 4096);
     if (memory_.empty()) return;
     memory_.fill(0);
     id_ = gpu.allocate_resource_id();
-    uint32_t bind = 0;
+    uint32_t bind = extra_bind;
     if (usage & kBufferVertex) bind |= virgl::kBindVertexBuffer;
     if (usage & kBufferIndex) bind |= virgl::kBindIndexBuffer;
     ResourceCreate3d create{header(kCmdResourceCreate3d), id_, virgl::kTargetBuffer, virgl::kFormatR8Unorm, bind,
@@ -164,12 +166,17 @@ class VirglImage final : public IImage {
     const bool sampled = (desc.usage & kImageSampled) != 0;
     uint32_t bind = depth ? virgl::kBindDepthStencil : (virgl::kBindRenderTarget | virgl::kBindSamplerView);
     if (desc.usage & kImagePresent) bind |= virgl::kBindScanout;
-    ResourceCreate3d create{header(kCmdResourceCreate3d), id_, virgl::kTargetTexture2d,
+    // A volume has its slices as the depth; an array or a cube its layers as the array size (a cube: six).
+    const uint32_t layers = layer_count();
+    const uint32_t target = desc.kind == TextureKind::Texture3D ? virgl::kTargetTexture3d : desc.kind == TextureKind::TextureCube ? virgl::kTargetTextureCube
+                            : desc.kind == TextureKind::Texture2DArray ? virgl::kTargetTexture2dArray : virgl::kTargetTexture2d;
+    ResourceCreate3d create{header(kCmdResourceCreate3d), id_, target,
                             depth ? depth_format : color_format_, bind,
-                            desc.extent.width, desc.extent.height, 1, 1, 0, 0, sampled ? 0u : kResourceFlagY0Top, 0};
+                            desc.extent.width, desc.extent.height, desc.kind == TextureKind::Texture3D ? layers : 1u, desc.kind == TextureKind::Texture3D || desc.kind == TextureKind::Texture2D ? 1u : layers, 0, 0,
+                            sampled ? 0u : kResourceFlagY0Top, 0};
     CtxResource ctx{header(kCmdCtxAttachResource), id_, 0};
     ok_ = gpu.command(as_bytes(create)) && gpu.command(as_bytes(ctx));
-    accounted_ = uint64_t{desc.extent.width} * desc.extent.height * (depth ? 4u : bytes_per_pixel(desc.format));
+    accounted_ = uint64_t{desc.extent.width} * desc.extent.height * layer_count() * (depth ? 4u : bytes_per_pixel(desc.format));
     gpu.add_resource_bytes(accounted_);
     // The surface (a render-target view of the resource) is what the framebuffer state refers to.
     if (ok_ && (desc.usage & (kImageColorAttachment | kImageDepthAttachment))) {
@@ -181,7 +188,9 @@ class VirglImage final : public IImage {
     // The sampler view is what a texture unit is bound to: the whole resource, level 0, components in order.
     if (ok_ && sampled) {
       view_ = device.new_handle();
-      const uint32_t cmd[] = {virgl::header(virgl::kCreateObject, virgl::kObjectSamplerView, 6), view_, id_, color_format_, 0, 0, virgl::kSwizzleRgba};
+      // (the layers the view shows: all of an array's or a cube's; a volume's slices are not layers)
+      const uint32_t last_layer = desc.kind == TextureKind::Texture2DArray || desc.kind == TextureKind::TextureCube ? layers - 1 : 0;
+      const uint32_t cmd[] = {virgl::header(virgl::kCreateObject, virgl::kObjectSamplerView, 6), view_, id_, color_format_, last_layer << 16, 0, virgl::kSwizzleRgba};
       ok_ = device.send_commands(cmd, 7);
     }
   }
@@ -206,6 +215,25 @@ class VirglImage final : public IImage {
   Format format() const override { return desc_.format; }
   uint32_t usage() const { return desc_.usage; }
   bool stencil() const { return desc_.stencil; }
+  uint32_t layer_count() const override { return desc_.kind == TextureKind::Texture2D ? 1 : desc_.kind == TextureKind::TextureCube ? 6 : desc_.layers; }
+  // A layer (a slice, a face) goes through the one-layer backing: the host copies from or into it at the layer's place in the resource.
+  bool write_layer_pixels(uint32_t layer, ArrayView<const uint32_t> pixels) override {
+    const uint64_t count = uint64_t{desc_.extent.width} * desc_.extent.height;
+    if (desc_.kind == TextureKind::Texture2D || layer >= layer_count() || pixels.size() != count || !ensure_backing(count)) return false;
+    const ArrayView<uint32_t> staged = backing_.cast<uint32_t>();
+    for (uint64_t i = 0; i < count; ++i) staged[i] = pixels[i];
+    TransferHost3d transfer{header(kCmdTransferToHost3d), {0, 0, layer, desc_.extent.width, desc_.extent.height, 1}, 0, id_, 0, desc_.extent.width * 4, 0};
+    return device_.gpu().command(as_bytes(transfer));
+  }
+  bool read_layer_pixels(uint32_t layer, ArrayView<uint32_t> out) override {
+    const uint64_t count = uint64_t{desc_.extent.width} * desc_.extent.height;
+    if (desc_.kind == TextureKind::Texture2D || layer >= layer_count() || out.size() < count || !ensure_backing(count)) return false;
+    TransferHost3d transfer{header(kCmdTransferFromHost3d), {0, 0, layer, desc_.extent.width, desc_.extent.height, 1}, 0, id_, 0, desc_.extent.width * 4, 0};
+    if (!device_.gpu().command(as_bytes(transfer))) return false;
+    const ArrayView<uint32_t> pixels = backing_.cast<uint32_t>();
+    for (uint64_t i = 0; i < count; ++i) out[i] = pixels[i];
+    return true;
+  }
   // Stored with window y 0 at the top (drawn into and shown: the Y_0_TOP flag), or the way a texture is - row 0 first, window y 0 at the bottom of GL's window - which is what a
   // render target that is also sampled needs, so that the sampler reads it the way a texture is read (drawn upright by an unflipped viewport, see VirglPipeline).
   bool y0_top() const { return !(desc_.usage & kImageSampled); }
@@ -467,7 +495,7 @@ uint32_t VirglDevice::sampler_state(const SamplerDesc& sampler) {
   const uint32_t wrap_t = sampler.address_v == AddressMode::Repeat ? virgl::kWrapRepeat : virgl::kWrapClampToEdge;
   const uint32_t filter = sampler.filter == Filter::Linear ? virgl::kFilterLinear : virgl::kFilterNearest;
   // No mipmaps: the minification filter is the magnification one and no level is chosen between.
-  const uint32_t s0 = wrap_s | (wrap_t << 3) | (filter << 9) | (virgl::kMipFilterNone << 11) | (filter << 13);
+  const uint32_t s0 = wrap_s | (wrap_t << 3) | (virgl::kWrapClampToEdge << 6) /* r: the slices of a volume are clamped */ | (filter << 9) | (virgl::kMipFilterNone << 11) | (filter << 13);
   const uint32_t cmd[] = {virgl::header(virgl::kCreateObject, virgl::kObjectSamplerState, 9), handle, s0, 0, 0, 0, 0, 0, 0, 0};
   if (!send_commands(cmd, 10)) return 0;
   sampler_states_[key] = handle;
@@ -493,6 +521,13 @@ void VirglDevice::destroy_buffer(IBuffer* buffer) { destroy(gpu_.allocator(), st
 
 IImage* VirglDevice::create_image(const ImageDesc& desc) {
   if (desc.mip_levels != 1) return nullptr;   // (no mipmaps either)
+  if (desc.kind != TextureKind::Texture2D) {
+    // (a volume, array or cube is only sampled: 8-bit colour, one level)
+    const uint32_t layers = desc.kind == TextureKind::TextureCube ? 6 : desc.layers;
+    if (desc.usage != kImageSampled || desc.format != Format::B8G8R8A8Unorm || layers == 0 || layers > kMaxTextureLayers || (desc.kind == TextureKind::TextureCube && desc.extent.width != desc.extent.height)) return nullptr;
+  } else if (desc.layers != 1) {
+    return nullptr;
+  }
   // A texture is not drawn into: the two kinds of image are stored in opposite row order (see VirglImage).
   if ((desc.usage & kImageSampled) && (desc.usage & (kImageDepthAttachment | kImagePresent))) return nullptr;
   if ((desc.usage & kImageSampled) && desc.format != Format::B8G8R8A8Unorm && !is_float_format(desc.format)) return nullptr;
@@ -546,9 +581,26 @@ void VirglDevice::destroy_command_buffer(ICommandBuffer* commands) {
 
 bool VirglDevice::submit(ICommandBuffer* commands) {
   if (!commands) return false;
-  const CommandRecorder& recorder = *static_cast<CommandRecorder*>(commands);
+  CommandRecorder& recorder = *static_cast<CommandRecorder*>(commands);
   Stream stream(gpu_.allocator());
   if (!stream.valid()) return false;
+
+  // Occlusion queries: one host query object per slot, each with a buffer of its own for its result (16 bytes: state, size, the count) that the host fills in when asked for
+  // it after the commands have run. (The host takes no offset into a shared buffer: two queries on one buffer overwrite each other.)
+  struct Queries {
+    explicit Queries(VirglDevice& d) : device(d) {}
+    ~Queries() {
+      for (uint32_t handle : objects)
+        if (handle) device.destroy_object(handle);
+      for (VirglBuffer* buffer : results)
+        if (buffer) destroy(device.gpu().allocator(), buffer);
+    }
+    VirglDevice& device;
+    VirglBuffer* results[kMaxOcclusionQueries] = {};
+    uint32_t objects[kMaxOcclusionQueries] = {};
+    bool used[kMaxOcclusionQueries] = {};
+    uint32_t open = kMaxOcclusionQueries;   // the slot between begin and end
+  } queries(*this);
 
   const VirglPipeline* pipeline = nullptr;
   VirglImage* color = nullptr;
@@ -662,7 +714,31 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         topology = cmd.topology;
         break;
       case RecordedCommand::Type::EndRenderPass:
+        if (queries.open != kMaxOcclusionQueries) return false;
         in_pass = false;
+        break;
+      case RecordedCommand::Type::BeginQuery: {
+        if (!in_pass || queries.open != kMaxOcclusionQueries || cmd.unit >= kMaxOcclusionQueries || queries.used[cmd.unit]) return false;
+        queries.results[cmd.unit] = make<VirglBuffer>(gpu_.allocator(), *this, 16, 0, virgl::kBindCustom);
+        if (!queries.results[cmd.unit] || !queries.results[cmd.unit]->valid()) return false;
+        const uint32_t handle = new_handle();
+        stream.command(virgl::kCreateObject, virgl::kObjectQuery, 4);
+        stream.put(handle);
+        stream.put(virgl::kQueryOcclusionCounter);
+        stream.put(0);
+        stream.put(queries.results[cmd.unit]->id());
+        stream.command(virgl::kBeginQuery, 0, 1);
+        stream.put(handle);
+        queries.objects[cmd.unit] = handle;
+        queries.used[cmd.unit] = true;
+        queries.open = cmd.unit;
+        break;
+      }
+      case RecordedCommand::Type::EndQuery:
+        if (queries.open == kMaxOcclusionQueries) return false;
+        stream.command(virgl::kEndQuery, 0, 1);
+        stream.put(queries.objects[queries.open]);
+        queries.open = kMaxOcclusionQueries;
         break;
       case RecordedCommand::Type::BindPipeline: {
         pipeline = static_cast<const VirglPipeline*>(cmd.pipeline);
@@ -798,7 +874,41 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
     if (stream.overflow()) return false;
     if (stream.count() > Stream::kCapacity - 512 && !flush()) return false;  // leave room for the next command
   }
-  return !in_pass && flush();
+  if (in_pass || !flush()) return false;
+  // Ask the host for each query's count (waiting for the draws), then read what it wrote into the buffer.
+  bool asked = false;
+  for (uint32_t slot = 0; slot < kMaxOcclusionQueries; ++slot) {
+    if (!queries.used[slot]) continue;
+    stream.command(virgl::kGetQueryResult, 0, 2);
+    stream.put(queries.objects[slot]);
+    stream.put(1);
+    asked = true;
+  }
+  if (asked && !flush()) return false;
+  // (the host writes each result - state, size, count - straight into the buffer's guest memory when its GL says the query is complete. It checks as it polls, which it does while
+  // commands with fences are coming in: so keep it busy with empty ones until every state reads DONE. Pulling a buffer from the host would overwrite what it wrote.)
+  for (uint32_t attempt = 0; asked; ++attempt) {
+    bool pending = false;
+    for (uint32_t slot = 0; slot < kMaxOcclusionQueries; ++slot) {
+      if (!queries.used[slot]) continue;
+      ByteReader in(queries.results[slot]->map());
+      if (in.le32() != virgl::kQueryStateDone) pending = true;
+    }
+    if (!pending) break;
+    const uint32_t nop = 0;
+    if (attempt > kQueryPolls || !send_commands(&nop, 1)) return false;
+  }
+  for (uint32_t slot = 0; slot < kMaxOcclusionQueries; ++slot) {
+    if (!queries.used[slot]) continue;
+    ByteReader in(queries.results[slot]->map());
+    in.le32();   // (the state, DONE)
+    in.le32();   // (the size of the result: 4 for a sample count, 8 for a time)
+    const uint64_t low = in.le32();
+    const uint64_t high = in.le32();
+    if (!in.ok()) return false;
+    recorder.set_occlusion_result(slot, low | (high << 32));
+  }
+  return true;
 }
 
 bool VirglDevice::present(IImage* image) {

@@ -17,6 +17,7 @@
  */
 
 #include "Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnState.hpp"
+#include "Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnTiling.hpp"
 
 namespace gcn {
 
@@ -42,6 +43,26 @@ uint32_t float_bits(float f) {
 }
 
 bool fits(uint64_t address) { return (address >> kMaxAddressBits) == 0; }
+
+// A surface the tile mode names, of the pixel size, that the registers can express
+bool surface_ok(uint32_t tile_index, uint32_t bytes, uint32_t pitch, uint64_t address) {
+  TileLayout layout;
+  return resolve_tile_index(tile_index, &layout) && surface_valid(layout, bytes, pitch) && address % surface_base_align(layout, bytes) == 0;
+}
+
+// DB_Z_INFO / DB_STENCIL_INFO.TILE_SPLIT: the tile split of the table entry
+uint32_t tile_split_code(uint32_t tile_index) { return (tile_mode_register(tile_index) & GB_TILE_MODE0__TILE_SPLIT_MASK) >> GB_TILE_MODE0__TILE_SPLIT__SHIFT; }
+
+bool blend_ok(const BlendState& b) {
+  return b.color_src <= 0x1F && b.color_dst <= 0x1F && b.alpha_src <= 0x1F && b.alpha_dst <= 0x1F && b.color_op <= 7 && b.alpha_op <= 7 && (b.write_mask & ~0xFu) == 0;
+}
+
+bool depth_stencil_ok(const DepthStencilState& d, const DepthTarget& t) {
+  const bool z = d.depth_test || d.depth_write || d.depth_bounds;
+  const StencilFace& b = d.back;
+  return d.depth_func <= 7 && d.stencil_func <= 7 && d.fail_op <= 0xF && d.zpass_op <= 0xF && d.zfail_op <= 0xF && b.func <= 7 && b.fail_op <= 0xF && b.zpass_op <= 0xF && b.zfail_op <= 0xF &&
+         (!z || t.z_address != 0) && (!d.stencil_test || t.stencil_address != 0);
+}
 
 bool stage_ok(const ShaderProgram& p, bool fragment) {
   const ShaderInfo& i = p.info;
@@ -78,8 +99,16 @@ bool emit_draw(Pm4Writer& w, const DrawState& s) {
                   (s.vertex_constants & 3) == 0 && (s.pixel_constants & 3) == 0 && t.width != 0 && t.height != 0 && t.width <= kMaxTargetDimension && t.height <= kMaxTargetDimension &&
                   t.pitch_pixels >= t.width && t.pitch_pixels % 8 == 0 && t.pitch_pixels <= kMaxTargetDimension && (t.address & 0xFF) == 0 && fits(t.address) && t.address != 0 &&
                   pi.ps_inputs <= kMaxInterpolants && vi.param_exports <= kMaxInterpolants && s.index_count != 0 && (!indexed || (fits(s.index_address) && s.index_max >= s.index_count)) &&
-                  (s.fence_address == 0 || ((s.fence_address & 7) == 0 && fits(s.fence_address)));
+                  (s.fence_address == 0 || ((s.fence_address & 7) == 0 && fits(s.fence_address))) && surface_ok(t.tile_index, ColorTarget::kPixelBytes, t.pitch_pixels, t.address) && blend_ok(s.blend);
   if (!ok) return false;
+  const DepthTarget& dt = s.depth;
+  const bool has_z = dt.z_address != 0, has_stencil = dt.stencil_address != 0;
+  if (!depth_stencil_ok(s.depth_stencil, dt)) return false;
+  if (has_z || has_stencil) {
+    if (dt.pitch_pixels < t.width || dt.pitch_pixels > kMaxTargetDimension || (has_z && ((dt.z_address & 0xFF) != 0 || !fits(dt.z_address) || !surface_ok(dt.z_tile_index, DepthTarget::kZBytes, dt.pitch_pixels, dt.z_address))) ||
+        (has_stencil && ((dt.stencil_address & 0xFF) != 0 || !fits(dt.stencil_address) || !surface_ok(dt.stencil_tile_index, DepthTarget::kStencilBytes, dt.pitch_pixels, dt.stencil_address))))
+      return false;
+  }
   for (uint32_t k = 0; k < pi.ps_inputs; ++k)
     if (s.ps_param[k] >= kMaxInterpolants) return false;
 
@@ -123,21 +152,55 @@ bool emit_draw(Pm4Writer& w, const DrawState& s) {
   const uint32_t pitch_tiles = t.pitch_pixels / 8 - 1;
   const uint32_t slice_tiles = t.pitch_pixels * ((t.height + 7) / 8 * 8) / 64 - 1;           // (the slice is whole rows of 8 by 8 pixel tiles)
   const uint32_t info = (kENDIAN_NONE << CB_COLOR0_INFO__ENDIAN__SHIFT) | (kCOLOR_32_32_32_32 << CB_COLOR0_INFO__FORMAT__SHIFT) | (kNUMBER_FLOAT << CB_COLOR0_INFO__NUMBER_TYPE__SHIFT) |
-                       (kSWAP_STD << CB_COLOR0_INFO__COMP_SWAP__SHIFT) | (1u << CB_COLOR0_INFO__BLEND_BYPASS__SHIFT) | (1u << CB_COLOR0_INFO__SIMPLE_FLOAT__SHIFT) |
+                       (kSWAP_STD << CB_COLOR0_INFO__COMP_SWAP__SHIFT) | ((s.blend.enable ? 0u : 1u) << CB_COLOR0_INFO__BLEND_BYPASS__SHIFT) | (1u << CB_COLOR0_INFO__SIMPLE_FLOAT__SHIFT) |
                        (1u << CB_COLOR0_INFO__ROUND_MODE__SHIFT);
   const uint32_t color[] = {static_cast<uint32_t>(t.address >> 8), pitch_tiles << CB_COLOR0_PITCH__TILE_MAX__SHIFT, slice_tiles << CB_COLOR0_SLICE__TILE_MAX__SHIFT, 0, info,
-                            ColorTarget::kLinearAlignedTileIndex << CB_COLOR0_ATTRIB__TILE_MODE_INDEX__SHIFT};
+                            t.tile_index << CB_COLOR0_ATTRIB__TILE_MODE_INDEX__SHIFT};
   w.set_context_reg(mmCB_COLOR0_BASE, ArrayView<const uint32_t>(color, 6));
-  w.set_context_reg(mmCB_TARGET_MASK, 0xF);
+  w.set_context_reg(mmCB_TARGET_MASK, s.blend.write_mask);
   w.set_context_reg(mmCB_SHADER_MASK, 0xF);
   w.set_context_reg(mmCB_COLOR_CONTROL, (kCB_NORMAL << CB_COLOR_CONTROL__MODE__SHIFT) | (0xCCu << CB_COLOR_CONTROL__ROP3__SHIFT));
-  w.set_context_reg(mmCB_BLEND0_CONTROL, 0);
-  // no depth, stencil or alpha test
-  w.set_context_reg(mmDB_DEPTH_CONTROL, 0);
+  // blending: the colour factors and function, the alpha's own when separate (else the colour's), and the constant colour
+  const BlendState& b = s.blend;
+  const uint32_t alpha_src = b.separate_alpha ? b.alpha_src : b.color_src, alpha_dst = b.separate_alpha ? b.alpha_dst : b.color_dst, alpha_op = b.separate_alpha ? b.alpha_op : b.color_op;
+  const uint32_t blend = (static_cast<uint32_t>(b.color_src) << CB_BLEND0_CONTROL__COLOR_SRCBLEND__SHIFT) | (static_cast<uint32_t>(b.color_op) << CB_BLEND0_CONTROL__COLOR_COMB_FCN__SHIFT) |
+                         (static_cast<uint32_t>(b.color_dst) << CB_BLEND0_CONTROL__COLOR_DESTBLEND__SHIFT) | (alpha_src << CB_BLEND0_CONTROL__ALPHA_SRCBLEND__SHIFT) |
+                         (alpha_op << CB_BLEND0_CONTROL__ALPHA_COMB_FCN__SHIFT) | (alpha_dst << CB_BLEND0_CONTROL__ALPHA_DESTBLEND__SHIFT) |
+                         ((b.separate_alpha ? 1u : 0u) << CB_BLEND0_CONTROL__SEPARATE_ALPHA_BLEND__SHIFT) | ((b.enable ? 1u : 0u) << CB_BLEND0_CONTROL__ENABLE__SHIFT);
+  w.set_context_reg(mmCB_BLEND0_CONTROL, blend);
+  const uint32_t constant[] = {float_bits(b.constant[0]), float_bits(b.constant[1]), float_bits(b.constant[2]), float_bits(b.constant[3])};
+  w.set_context_reg(mmCB_BLEND_RED, ArrayView<const uint32_t>(constant, 4));
+
+  // depth and stencil: the tests and operations, then the planes (Z_INFO .. DEPTH_SLICE: formats, read and write bases, size). Late Z: the depth is written for the pixels that
+  // exported a colour. No hierarchical Z, no clears or copies.
+  const DepthStencilState& d = s.depth_stencil;
+  const uint32_t depth_control = ((d.stencil_test ? 1u : 0u) << DB_DEPTH_CONTROL__STENCIL_ENABLE__SHIFT) | ((d.depth_test ? 1u : 0u) << DB_DEPTH_CONTROL__Z_ENABLE__SHIFT) |
+                                 ((d.depth_write ? 1u : 0u) << DB_DEPTH_CONTROL__Z_WRITE_ENABLE__SHIFT) | (static_cast<uint32_t>(d.depth_func) << DB_DEPTH_CONTROL__ZFUNC__SHIFT) |
+                                 (static_cast<uint32_t>(d.stencil_func) << DB_DEPTH_CONTROL__STENCILFUNC__SHIFT) | ((d.depth_bounds ? 1u : 0u) << DB_DEPTH_CONTROL__DEPTH_BOUNDS_ENABLE__SHIFT) |
+                                 ((d.two_sided ? 1u : 0u) << DB_DEPTH_CONTROL__BACKFACE_ENABLE__SHIFT) | (static_cast<uint32_t>(d.back.func) << DB_DEPTH_CONTROL__STENCILFUNC_BF__SHIFT);
+  w.set_context_reg(mmDB_DEPTH_CONTROL, depth_control);
+  w.set_context_reg(mmDB_STENCIL_CONTROL, (static_cast<uint32_t>(d.fail_op) << DB_STENCIL_CONTROL__STENCILFAIL__SHIFT) | (static_cast<uint32_t>(d.zpass_op) << DB_STENCIL_CONTROL__STENCILZPASS__SHIFT) |
+                                              (static_cast<uint32_t>(d.zfail_op) << DB_STENCIL_CONTROL__STENCILZFAIL__SHIFT) |
+                                              (static_cast<uint32_t>(d.back.fail_op) << DB_STENCIL_CONTROL__STENCILFAIL_BF__SHIFT) | (static_cast<uint32_t>(d.back.zpass_op) << DB_STENCIL_CONTROL__STENCILZPASS_BF__SHIFT) |
+                                              (static_cast<uint32_t>(d.back.zfail_op) << DB_STENCIL_CONTROL__STENCILZFAIL_BF__SHIFT));
+  const uint32_t refmask[] = {(static_cast<uint32_t>(d.stencil_ref) << DB_STENCILREFMASK__STENCILTESTVAL__SHIFT) | (static_cast<uint32_t>(d.stencil_mask) << DB_STENCILREFMASK__STENCILMASK__SHIFT) |
+                                  (static_cast<uint32_t>(d.stencil_write_mask) << DB_STENCILREFMASK__STENCILWRITEMASK__SHIFT) | (static_cast<uint32_t>(d.stencil_op_value) << DB_STENCILREFMASK__STENCILOPVAL__SHIFT),
+                              (static_cast<uint32_t>(d.back.ref) << DB_STENCILREFMASK_BF__STENCILTESTVAL_BF__SHIFT) | (static_cast<uint32_t>(d.back.mask) << DB_STENCILREFMASK_BF__STENCILMASK_BF__SHIFT) |
+                                  (static_cast<uint32_t>(d.back.write_mask) << DB_STENCILREFMASK_BF__STENCILWRITEMASK_BF__SHIFT) | (static_cast<uint32_t>(d.back.op_value) << DB_STENCILREFMASK_BF__STENCILOPVAL_BF__SHIFT)};
+  w.set_context_reg(mmDB_STENCILREFMASK, ArrayView<const uint32_t>(refmask, 2));
+  const uint32_t bounds[] = {float_bits(d.bounds_min), float_bits(d.bounds_max)};
+  w.set_context_reg(mmDB_DEPTH_BOUNDS_MIN, ArrayView<const uint32_t>(bounds, 2));
   w.set_context_reg(mmDB_RENDER_CONTROL, 0);
   w.set_context_reg(mmDB_SHADER_CONTROL, 0);
-  w.set_context_reg(mmDB_Z_INFO, 0);
-  w.set_context_reg(mmDB_STENCIL_INFO, 0);
+  w.set_context_reg(mmDB_DEPTH_VIEW, 0);
+  const uint32_t rows8 = (t.height + 7) / 8;
+  const uint32_t z_info = has_z ? (kZ_32_FLOAT << DB_Z_INFO__FORMAT__SHIFT) | (dt.z_tile_index << DB_Z_INFO__TILE_MODE_INDEX__SHIFT) | (tile_split_code(dt.z_tile_index) << DB_Z_INFO__TILE_SPLIT__SHIFT) : 0;
+  const uint32_t stencil_info = has_stencil ? (kSTENCIL_8 << DB_STENCIL_INFO__FORMAT__SHIFT) | (dt.stencil_tile_index << DB_STENCIL_INFO__TILE_MODE_INDEX__SHIFT) | (tile_split_code(dt.stencil_tile_index) << DB_STENCIL_INFO__TILE_SPLIT__SHIFT) | (1u << DB_STENCIL_INFO__TILE_STENCIL_DISABLE__SHIFT) : 0;
+  const uint32_t z_base = static_cast<uint32_t>(dt.z_address >> 8), stencil_base = static_cast<uint32_t>(dt.stencil_address >> 8);
+  const uint32_t pitch8 = dt.pitch_pixels / 8;
+  const uint32_t planes[] = {z_info, stencil_info, z_base, stencil_base, z_base, stencil_base, (pitch8 == 0 ? 0 : pitch8 - 1) << DB_DEPTH_SIZE__PITCH_TILE_MAX__SHIFT | (rows8 - 1) << DB_DEPTH_SIZE__HEIGHT_TILE_MAX__SHIFT,
+                             (pitch8 * rows8 == 0 ? 0 : pitch8 * rows8 - 1) << DB_DEPTH_SLICE__SLICE_TILE_MAX__SHIFT};
+  w.set_context_reg(mmDB_Z_INFO, ArrayView<const uint32_t>(planes, 8));
 
   // the viewport transform over the target (y down), scissors over the target, no clipping modes beyond the defaults, pixel centres at the half
   const uint32_t viewport[] = {float_bits(0.5f * static_cast<float>(t.width)), float_bits(0.5f * static_cast<float>(t.width)), float_bits(-0.5f * static_cast<float>(t.height)),
@@ -148,7 +211,7 @@ bool emit_draw(Pm4Writer& w, const DrawState& s) {
                        (1u << PA_CL_VTE_CNTL__VTX_W0_FMT__SHIFT);
   w.set_context_reg(mmPA_CL_VTE_CNTL, vte);
   w.set_context_reg(mmPA_CL_CLIP_CNTL, 0);
-  w.set_context_reg(mmPA_SU_SC_MODE_CNTL, 0);                                           // no culling, filled
+  w.set_context_reg(mmPA_SU_SC_MODE_CNTL, (d.front_clockwise ? 1u : 0u) << PA_SU_SC_MODE_CNTL__FACE__SHIFT);          // no culling, filled; which winding is the front
   w.set_context_reg(mmPA_SU_VTX_CNTL, 1u << PA_SU_VTX_CNTL__PIX_CENTER__SHIFT);
   w.set_context_reg(mmPA_SC_WINDOW_OFFSET, 0);
   const uint32_t scissor_tl = 1u << PA_SC_WINDOW_SCISSOR_TL__WINDOW_OFFSET_DISABLE__SHIFT;

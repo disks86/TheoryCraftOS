@@ -21,9 +21,12 @@
 // buffer, the viewport and scissors, the vertex fetch through the descriptors in memory) and running the shaders on the wave emulator (GcnDraw). Memory is the caller's (IGpuMemory),
 // so a test can place the shaders, constants and vertices anywhere and look at the colour buffer afterwards.
 //
-// What the model does not do it refuses: a draw with a state outside what GcnState sets (another primitive type, a stage other than the vertex shader, blending, depth or stencil,
-// a colour format other than 32_32_32_32 float, an instance count other than one, interpolation setups other than perspective at the pixel centre) fails with Unsupported rather than
-// drawing something else. Unknown packets fail too.
+// The back end is read from the registers too: the colour buffer (linear or 1D tiled by its tile mode index), the blend state, the depth and stencil planes with their tests and
+// operations, and the texture descriptors in the descriptor table (sampled through GcnTexture.hpp from the same memory).
+//
+// What the model does not do it refuses: a draw with a state outside what GcnState sets (another primitive type, a stage other than the vertex shader, a tile mode that is not
+// implemented, back face stencil, depth bounds, logic ops, dual source blending, a colour format other than 32_32_32_32 float, an instance count other than one, interpolation
+// setups other than perspective at the pixel centre) fails with Unsupported rather than drawing something else. Unknown packets fail too.
 #pragma once
 
 #include <stdint.h>

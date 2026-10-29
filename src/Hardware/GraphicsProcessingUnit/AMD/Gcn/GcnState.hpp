@@ -21,12 +21,18 @@
 // stages in use (VS and PS only), and the draw. Register and field numbers come from the kernel's headers (GcnRegisters.inc, scripts/gen_gcn_registers.py). Everything the stream does
 // not set keeps the value the ring's clear state gave it (AmdGfx8::build_clear_state).
 //
-// Not done: depth and stencil, blending (the colour goes to the target as the pixel shader exports it), multisampling, geometry / tessellation, instancing beyond one, textures (the
-// descriptors of images and samplers), tiled targets (the colour buffer is linear), and none of it has run on a card.
+// The colour buffer is linear or 1D tiled (GcnTiling.hpp), with blending (CB_BLEND0_CONTROL, the blend constant, the write mask in CB_TARGET_MASK); a depth plane (32 bit float) and a
+// stencil plane (8 bit) are set up through the DB registers with the tests and operations of DB_DEPTH_CONTROL, DB_STENCIL_CONTROL and DB_STENCILREFMASK. Textures are not state: the
+// T# and S# are in the descriptor table (make_image_descriptor in GcnTexture.hpp).
+//
+// The colour target and the planes may be 2D tiled (GcnTiling.hpp), by the tile mode index of the golden table: the colour entries 10 and 11 etc., the depth entries 0 to 7.
+//
+// Not done: multisampling, geometry / tessellation, instancing beyond one, hierarchical Z and compression, dual source blending, logic ops, and none of it has run on a card.
 #pragma once
 
 #include <stdint.h>
 #include "Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnCompiler.hpp"
+#include "Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnDraw.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnPm4.hpp"
 #include "Utility/ArrayView.hpp"
 
@@ -37,13 +43,25 @@ struct ShaderProgram {
   ShaderInfo info;
 };
 
-// A float RGBA colour target (CB format 32_32_32_32), linear (tile mode index 8 of the VI table: ARRAY_LINEAR_ALIGNED).
+// A float RGBA colour target (CB format 32_32_32_32). `tile_index` is the GB_TILE_MODE entry: 8 linear (ARRAY_LINEAR_ALIGNED), 9 1D tiled for display.
 struct ColorTarget {
   uint64_t address = 0;               // 256 byte aligned
   uint32_t width = 0, height = 0;
   uint32_t pitch_pixels = 0;          // a multiple of 8 (the pitch is given to the CB in units of 8 pixels)
+  uint32_t tile_index = 8;
   static constexpr uint32_t kPixelBytes = 16;
   static constexpr uint32_t kLinearAlignedTileIndex = 8;
+  static constexpr uint32_t kTiled1DTileIndex = 9;
+};
+
+// The depth and stencil planes (32 bit float depth, 8 bit stencil), both of the colour target's size. A plane with address 0 is not there.
+struct DepthTarget {
+  uint64_t z_address = 0, stencil_address = 0;        // 256 byte aligned
+  uint32_t pitch_pixels = 0;                          // a multiple of 8 (of the macro tile width for a 2D tiled plane), at least the colour target's width; both planes have this pitch
+  uint32_t z_tile_index = 13;                         // 1D tiled, thin micro tiles
+  uint32_t stencil_tile_index = 13;
+  static constexpr uint32_t kZBytes = 4, kStencilBytes = 1;
+  static constexpr uint32_t kTiled1DThinTileIndex = 13;
 };
 
 struct DrawState {
@@ -52,6 +70,9 @@ struct DrawState {
   uint64_t pixel_constants = 0;
   uint64_t descriptor_table = 0;
   ColorTarget target;
+  BlendState blend;
+  DepthStencilState depth_stencil;
+  DepthTarget depth;
   uint8_t ps_param[16] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};      // SPI_PS_INPUT_CNTL_k.OFFSET: the parameter pixel shader input k reads
   // The draw: `index_count` vertices (a triangle list) numbered 0, 1, 2 ... (DRAW_INDEX_AUTO), or when `index_address` is not 0 the 32 bit indices at that address (DRAW_INDEX_2).
   uint32_t index_count = 0;

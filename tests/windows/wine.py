@@ -117,7 +117,8 @@ def generate_headers(gen):
 
 
 def compile_one(source, obj, dll_gen=None):
-    return run([CC] + flags(dll_gen=dll_gen) + ["-c", "-o", obj, source])
+    # __FILE__ is the file name alone, as in Wine's own build (a test may use it in the name of an object, which has a length limit)
+    return run([CC] + flags(dll_gen=dll_gen) + ["-fmacro-prefix-map=%s/=" % os.path.dirname(source), "-c", "-o", obj, source])
 
 
 def test_headers(tests, gen):
@@ -177,7 +178,7 @@ def do_build(out, names):
     report = {"built": [], "compile_failed": [], "link_failed": []}
     for dll in dll_dirs(names):
         src = os.path.join(HERE, dll)
-        files = sorted(glob.glob(os.path.join(src, "*.c")))
+        files = [x for x in sorted(glob.glob(os.path.join(src, "*.c"))) if os.path.basename(x) != "dummy.c"]
         objdir = os.path.join(OUT, "obj", dll)
         os.makedirs(objdir, exist_ok=True)
 
@@ -189,6 +190,34 @@ def do_build(out, names):
         with ThreadPoolExecutor(8) as ex:
             results = list(ex.map(comp, files))
         objs, tests, helpers = [], [], []
+        # resources (the manifests and menus some tests look for in their own image) go into every program of the DLL
+        resources = []
+        # a test library (dummy.c, dummy.spec) is built and put into the programs as the resource TESTDLL "dummy.dll", which tests write out as a file and load
+        dummy_c, dummy_spec = os.path.join(src, "dummy.c"), os.path.join(src, "dummy.spec")
+        if os.path.exists(dummy_c) and os.path.exists(dummy_spec):
+            exports = re.findall(r"^@\s+\w+\s+(\w+)", open(dummy_spec).read(), re.M)
+            deff = os.path.join(objdir, "dummy.def")
+            with open(deff, "w") as f:
+                f.write("LIBRARY dummy.dll\nEXPORTS\n" + "".join("  %s\n" % e for e in exports))
+            dobj = os.path.join(objdir, "dummy_lib.o")
+            dll_path = os.path.join(objdir, "dummy.dll")
+            r = compile_one(dummy_c, dobj, dll_gen)
+            if r.returncode == 0:
+                r = run([CC, "-shared", "-nostdlib", "-nostartfiles", "-o", dll_path, dobj, deff, "-Wl,--entry=DllMain", "-lkernel32"])
+            if r.returncode == 0:
+                drc = os.path.join(objdir, "dummy_dll.rc")
+                with open(drc, "w") as f:
+                    f.write('"dummy.dll" TESTDLL "%s"\n' % dll_path.replace("\\", "/"))
+                ro = os.path.join(objdir, "dummy_dll_rc.o")
+                r = run([CC.replace("gcc", "windres"), "-O", "coff", "-o", ro, drc])
+                if r.returncode == 0:
+                    resources.append(ro)
+        for rc in sorted(glob.glob(os.path.join(src, "*.rc"))):
+            ro = os.path.join(objdir, os.path.basename(rc)[:-3] + "_rc.o")
+            r = run([CC.replace("gcc", "windres"), "-I", os.path.join(HERE, "include"), "-I", src, "-I", os.path.join(OUT, "gen"), "-D__WINESRC__", "--preprocessor-arg=-w",
+                     "-O", "coff", "-o", ro, rc])
+            if r.returncode == 0:
+                resources.append(ro)
         for s, r in results:
             if r.returncode:
                 report["compile_failed"].append("%s/%s" % (dll, os.path.basename(s)))
@@ -228,7 +257,7 @@ def do_build(out, names):
                 exe = os.path.join(OUT, "%s_%s.exe" % (dll, name))
                 # the test, the helper files, and (if it needs them) the other tests of the DLL, which are kept out of the link by --gc-sections
                 for extra in ([], helpers, helpers + others):
-                    r = run([CC, "-o", exe, tlo, o, shim_obj] + extra + ["-Wl,--gc-sections"] + forced.get(name, []) + libs)
+                    r = run([CC, "-o", exe, tlo, o, shim_obj] + extra + resources + ["-Wl,--gc-sections"] + forced.get(name, []) + libs)
                     if r.returncode == 0:
                         break
                 if r.returncode:

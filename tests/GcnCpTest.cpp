@@ -26,6 +26,7 @@
 #include <map>
 #include "Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnCp.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnState.hpp"
+#include "Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnTiling.hpp"
 
 using namespace gcn;
 
@@ -68,6 +69,7 @@ struct Memory final : IGpuMemory {
 static const char* kVertex =
     "VERT\nDCL IN[0]\nDCL IN[1]\nDCL OUT[0], POSITION\nDCL OUT[1], GENERIC[0]\nDCL CONST[0..3]\nDCL TEMP[0]\n"
     "  0: MUL TEMP[0], CONST[0], IN[0].xxxx\n  1: MAD TEMP[0], CONST[1], IN[0].yyyy, TEMP[0]\n  2: MAD TEMP[0], CONST[2], IN[0].zzzz, TEMP[0]\n  3: ADD OUT[0], TEMP[0], CONST[3]\n  4: MOV OUT[1], IN[1]\n  5: END\n";
+static const char* kTexFragment = "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\nDCL SAMP[0]\nDCL SVIEW[0], 2D, FLOAT\n  0: TEX OUT[0], IN[0], SAMP[0], 2D\n  1: END\n";
 static const char* kFragment = "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\n  0: MOV OUT[0], IN[0]\n  1: END\n";
 
 struct Program {
@@ -89,16 +91,18 @@ static void compile(allocators::IAllocator& alloc, const char* text, Program* ou
 }
 
 constexpr uint64_t kVsAddr = 0x100000, kPsAddr = 0x101000, kVsConst = 0x200000, kPsConst = 0x200400, kTable = 0x300000, kVertices = 0x400000, kIndices = 0x500000, kFence = 0x600000;
-constexpr uint64_t kTarget = 0x1000000;
-constexpr uint32_t kWidth = 40, kHeight = 30, kPitch = 48;
+constexpr uint64_t kTarget = 0x1000000, kDepthPlane = 0x2000000, kStencilPlane = 0x3000000, kTexture = 0x4000000, kPsAddr2 = 0x102000;
+constexpr uint32_t kWidth = 40, kHeight = 30, kPitch = 48, kPaddedHeight = 32;
 
 struct Rig {
   TestAllocator alloc;
-  Program vs, ps;
+  Program vs, ps, tps;
   Memory mem;
-  Rig() : vs(alloc), ps(alloc) {
+  Rig() : vs(alloc), ps(alloc), tps(alloc) {
     compile(alloc, kVertex, &vs);
     compile(alloc, kFragment, &ps);
+    compile(alloc, kTexFragment, &tps);
+    mem.put(kPsAddr2, ArrayView<const uint32_t>(tps.words.view().data(), tps.words.count()));
     mem.put(kVsAddr, ArrayView<const uint32_t>(vs.words.view().data(), vs.words.count()));
     mem.put(kPsAddr, ArrayView<const uint32_t>(ps.words.view().data(), ps.words.count()));
     // four constant rows only: the model reads as many as are mapped (the identity matrix)
@@ -107,13 +111,13 @@ struct Rig {
     mem.map(kPsConst, 4);
     mem.map(kTable, abi::kTableBytes / 4);
     mem.map(kFence, 2);
-    mem.map(kTarget, static_cast<uint64_t>(kPitch) * kHeight * 4);
+    mem.map(kTarget, static_cast<uint64_t>(kPitch) * kPaddedHeight * 4);
     clear_target(-1.0f);
   }
   void clear_target(float v) {
     uint32_t b;
     memcpy(&b, &v, 4);
-    for (uint64_t i = 0; i < static_cast<uint64_t>(kPitch) * kHeight * 4; ++i) mem.words[kTarget + 4 * i] = b;
+    for (uint64_t i = 0; i < static_cast<uint64_t>(kPitch) * kPaddedHeight * 4; ++i) mem.words[kTarget + 4 * i] = b;
   }
   float pixel(uint32_t x, uint32_t y, uint32_t c) {
     float f;
@@ -345,13 +349,19 @@ static void test_refusals(Rig& rig) {
     if (res != CommandProcessorModel::Result::Unsupported) { printf("FAILED %s: %s\n", what, CommandProcessorModel::result_name(res)); ++g_failed; }
     CHECK(rig.pixel(10, 10, 0) == -1.0f && cp.draws() == 0);
   };
-  run_with_extra("blending", [&](Pm4Writer& w) { w.set_context_reg(0xa1e0, 1u << 30); });
+  // (blending is supported now; what is refused is dual source blending, with the blend bypass bit of the target off so that the blend is not bypassed)
+  run_with_extra("dual source blending", [&](Pm4Writer& w) { w.set_context_reg(0xa31c, 0x70738 & ~(1u << pm4::CB_COLOR0_INFO__BLEND_BYPASS__SHIFT)); w.set_context_reg(0xa1e0, (1u << 30) | 0xF | (0xFu << 8)); });
+  run_with_extra("logic op", [&](Pm4Writer& w) { w.set_context_reg(0xa202, (1u << 4) | (0x88u << 16)); });
+  run_with_extra("tile mode 2D", [&](Pm4Writer& w) { w.set_context_reg(0xa31d, 10); });
+  run_with_extra("back face stencil", [&](Pm4Writer& w) { w.set_context_reg(0xa200, (1u << 0) | (1u << 7)); });
+  run_with_extra("depth bounds", [&](Pm4Writer& w) { w.set_context_reg(0xa200, 1u << 3); });
+  run_with_extra("depth clear", [&](Pm4Writer& w) { w.set_context_reg(0xa000, 1u); });
   run_with_extra("depth test", [&](Pm4Writer& w) { w.set_context_reg(0xa200, 1u << 1); });
   run_with_extra("stencil", [&](Pm4Writer& w) { w.set_context_reg(0xa200, 1u << 0); });
   run_with_extra("quad list", [&](Pm4Writer& w) { w.set_uconfig_reg(0xc242, 0x12); });
   run_with_extra("geometry stage", [&](Pm4Writer& w) { w.set_context_reg(0xa2d5, 1u << 5); });
   run_with_extra("instances", [&](Pm4Writer& w) { w.num_instances(2); });
-  run_with_extra("colour mask", [&](Pm4Writer& w) { w.set_context_reg(0xa08e, 0x7); });
+  run_with_extra("other targets", [&](Pm4Writer& w) { w.set_context_reg(0xa08e, 0xF0); });
   run_with_extra("another colour format", [&](Pm4Writer& w) { w.set_context_reg(0xa31c, 0x70738 & ~0x7Cu); });
   run_with_extra("flat shading", [&](Pm4Writer& w) { w.set_context_reg(0xa191, 1u << 10); });
   run_with_extra("no viewport transform", [&](Pm4Writer& w) { w.set_context_reg(0xa206, 0); });
@@ -370,6 +380,218 @@ static void test_refusals(Rig& rig) {
   { Rig r2; r2.set_vertices(kTriangle, 3); uint32_t d[4]; make_vertex_descriptor(ArrayView<uint32_t>(d, 4), kVertices, 28, 100, 3); r2.mem.put(kTable, ArrayView<const uint32_t>(d, 4));
     uint32_t b4[512]; bool ok4; const uint32_t m = build(r2.state(3), b4, 512, &ok4);
     CommandProcessorModel cp(r2.alloc, r2.mem); CHECK(ok4 && cp.execute(ArrayView<const uint32_t>(b4, m)) == CommandProcessorModel::Result::MemoryFault); }
+}
+
+// reads a float of the colour target through the layout
+static float tiled_pixel(Memory& mem, uint32_t tile_index, uint32_t x, uint32_t y, uint32_t c) {
+  TileLayout l;
+  resolve_tile_index(tile_index, &l);
+  const uint32_t b = mem.words[kTarget + surface_offset(l, 16, kPitch, x, y) + 4 * c];
+  float f;
+  memcpy(&f, &b, 4);
+  return f;
+}
+
+// the draw state of the back end test: a 1D tiled colour target, alpha blending, a depth plane (less, write), a stencil plane that counts
+static DrawState backend_state(Rig& rig) {
+  // 6 vertices: the far layer (z 0.5, red, alpha 0.5) and the near layer (z -0.5, green, alpha 0.5), each a triangle that covers the target
+  static const float v[42] = {-1, -1, 0.5f, 1, 0, 0, 0.5f, 3, -1, 0.5f, 1, 0, 0, 0.5f, -1, 3, 0.5f, 1, 0, 0, 0.5f,
+                              -1, -1, -0.5f, 0, 1, 0, 0.5f, 3, -1, -0.5f, 0, 1, 0, 0.5f, -1, 3, -0.5f, 0, 1, 0, 0.5f};
+  rig.set_vertices(v, 6);
+  rig.mem.map(kDepthPlane, kPitch * kPaddedHeight);
+  rig.mem.map(kStencilPlane, kPitch * kPaddedHeight / 4);
+  DrawState s = rig.state(6);
+  s.target.tile_index = 9;
+  s.blend.enable = true;
+  s.blend.color_src = 4;
+  s.blend.color_dst = 5;
+  s.depth.z_address = kDepthPlane;
+  s.depth.stencil_address = kStencilPlane;
+  s.depth.pitch_pixels = kPitch;
+  s.depth_stencil.depth_test = true;
+  s.depth_stencil.depth_write = true;
+  s.depth_stencil.depth_func = 1;
+  s.depth_stencil.stencil_test = true;
+  s.depth_stencil.stencil_func = 7;
+  s.depth_stencil.zpass_op = 5;
+  s.depth_stencil.stencil_op_value = 1;
+  // the planes hold depth 1.0 and stencil 0 in their layout (1D thin tiles), the colour target (0, 0, 1, 1) in its (1D display tiles)
+  TileLayout thin, disp;
+  resolve_tile_index(13, &thin);
+  resolve_tile_index(9, &disp);
+  const float one = 1.0f;
+  uint32_t one_bits;
+  memcpy(&one_bits, &one, 4);
+  for (uint32_t y = 0; y < kPaddedHeight; ++y)
+    for (uint32_t x = 0; x < kPitch; ++x) {
+      rig.mem.words[kDepthPlane + surface_offset(thin, 4, kPitch, x, y)] = one_bits;
+      for (uint32_t c = 0; c < 4; ++c) {
+        const float value = c >= 2 ? 1.0f : 0.0f;
+        uint32_t b;
+        memcpy(&b, &value, 4);
+        rig.mem.words[kTarget + surface_offset(disp, 16, kPitch, x, y) + 4 * c] = b;
+      }
+    }
+  for (uint32_t i = 0; i < kPitch * kPaddedHeight / 4; ++i) rig.mem.words[kStencilPlane + 4 * i] = 0;
+  return s;
+}
+
+// Two layers at different depths drawn through the registers: tiled colour, blending, depth and stencil. The values are worked out by hand.
+static void test_backend(Rig& rig) {
+  const DrawState s = backend_state(rig);
+  uint32_t buf[512];
+  bool ok;
+  const uint32_t n = build(s, buf, 512, &ok);
+  CHECK(ok);
+  CommandProcessorModel cp(rig.alloc, rig.mem);
+  const auto res = cp.execute(ArrayView<const uint32_t>(buf, n));
+  if (res != CommandProcessorModel::Result::Ok) printf("result: %s\n", CommandProcessorModel::result_name(res));
+  CHECK(res == CommandProcessorModel::Result::Ok);
+  // the registers (kernel offsets): CB_BLEND0_CONTROL 0xa1e0, DB_DEPTH_CONTROL 0xa200, DB_STENCIL_CONTROL 0xa10b, DB_STENCILREFMASK 0xa10c, DB_Z_INFO 0xa010 .. DB_DEPTH_SLICE 0xa017
+  CHECK(cp.context_reg(0xa1e0) == ((1u << 30) | 4u | (5u << 8) | (4u << 16) | (5u << 24)));
+  CHECK(cp.context_reg(0xa31c) == (0x70738u & ~(1u << pm4::CB_COLOR0_INFO__BLEND_BYPASS__SHIFT)) && cp.context_reg(0xa31d) == 9);
+  CHECK(cp.context_reg(0xa200) == ((1u << 0) | (1u << 1) | (1u << 2) | (1u << 4) | (7u << 8) | (7u << 20)));
+  CHECK(cp.context_reg(0xa10b) == (5u << 4) && cp.context_reg(0xa10c) == ((0xFFu << 8) | (0xFFu << 16) | (1u << 24)));
+  CHECK(cp.context_reg(0xa010) == (3u | (13u << 20)) && cp.context_reg(0xa011) == (1u | (13u << 20) | (1u << 29)));
+  CHECK(cp.context_reg(0xa012) == kDepthPlane >> 8 && cp.context_reg(0xa014) == kDepthPlane >> 8 && cp.context_reg(0xa013) == kStencilPlane >> 8 && cp.context_reg(0xa015) == kStencilPlane >> 8);
+  CHECK(cp.context_reg(0xa016) == (5u | (3u << 11)) && cp.context_reg(0xa017) == 6 * 4 - 1);
+  CHECK(cp.draws() == 1 && cp.last_draw().triangles == 2);
+  // by hand: the far layer over blue gives (0.5, 0, 0.5, 0.75), the near one over that (0.25, 0.5, 0.25, 0.625); the depth is 0.25 and the stencil counted twice
+  TileLayout thin;
+  resolve_tile_index(13, &thin);
+  uint32_t wrong = 0;
+  const uint32_t points[4][2] = {{0, 0}, {20, 15}, {39, 29}, {7, 22}};
+  for (const auto& p : points) {
+    const float want[4] = {0.25f, 0.5f, 0.25f, 0.625f};
+    for (uint32_t c = 0; c < 4; ++c) if (tiled_pixel(rig.mem, 9, p[0], p[1], c) != want[c]) ++wrong;
+    const uint32_t zb = rig.mem.words[kDepthPlane + surface_offset(thin, 4, kPitch, p[0], p[1])];
+    float z;
+    memcpy(&z, &zb, 4);
+    if (z != 0.25f) ++wrong;
+    const uint64_t off = surface_offset(thin, 1, kPitch, p[0], p[1]);
+    if (((rig.mem.words[kStencilPlane + off / 4 * 4] >> ((off & 3) * 8)) & 0xFF) != 2) ++wrong;
+  }
+  CHECK(wrong == 0);
+  // the pixels outside the target but inside the pitch are as they were: (0, 0, 1, 1), depth 1, stencil 0
+  CHECK(tiled_pixel(rig.mem, 9, 44, 3, 0) == 0.0f && tiled_pixel(rig.mem, 9, 44, 3, 2) == 1.0f);
+  // the same start and the same stream again: the same result
+  const DrawState again = backend_state(rig);
+  Pm4Writer w(ArrayView<uint32_t>(buf, 512));
+  CHECK(emit_draw(w, again));
+  CommandProcessorModel cp2(rig.alloc, rig.mem);
+  CHECK(cp2.execute(w.words()) == CommandProcessorModel::Result::Ok);
+  CHECK(tiled_pixel(rig.mem, 9, 10, 10, 0) == 0.25f && tiled_pixel(rig.mem, 9, 10, 10, 1) == 0.5f);
+}
+
+static void test_texture(Rig& rig) {
+  // a 2 by 2 texture (red, green / blue, white) 1D tiled at kTexture; the pixel shader samples it with the T# and S# at the descriptor table's first texture slot
+  const uint32_t texels[4] = {0xFF0000FFu, 0xFF00FF00u, 0xFFFF0000u, 0xFFFFFFFFu};
+  TileLayout disp;
+  CHECK(resolve_tile_index(9, &disp));
+  rig.mem.map(kTexture, 64);
+  for (uint32_t y = 0; y < 2; ++y)
+    for (uint32_t x = 0; x < 2; ++x) rig.mem.words[kTexture + surface_offset(disp, 4, 8, x, y)] = texels[y * 2 + x];
+  ImageDescriptor img;
+  img.address = kTexture; img.width = 2; img.height = 2; img.pitch_pixels = 8; img.format = TexelFormat::Rgba8Unorm; img.tile_index = 9;
+  uint32_t iw[8], sw[4];
+  CHECK(make_image_descriptor(ArrayView<uint32_t>(iw, 8), img));
+  CHECK(make_sampler_descriptor(ArrayView<uint32_t>(sw, 4), SamplerDescriptor()));
+  rig.mem.put(kTable + abi::kImageOffset, ArrayView<const uint32_t>(iw, 8));
+  rig.mem.put(kTable + abi::kSamplerOffset, ArrayView<const uint32_t>(sw, 4));
+  // one triangle over the target whose colour attribute is (u, v, 0, 1)
+  static const float v[21] = {-1, -1, 0, 0, 1, 0, 1, 3, -1, 0, 2, 1, 0, 1, -1, 3, 0, 0, -1, 0, 1};
+  rig.set_vertices(v, 3);
+  DrawState s = rig.state(3);
+  s.pixel.address = kPsAddr2;
+  s.pixel.info = rig.tps.info;
+  uint32_t buf[512];
+  bool ok;
+  const uint32_t n = build(s, buf, 512, &ok);
+  CHECK(ok);
+  rig.clear_target(-1.0f);
+  CommandProcessorModel cp(rig.alloc, rig.mem);
+  const auto res = cp.execute(ArrayView<const uint32_t>(buf, n));
+  if (res != CommandProcessorModel::Result::Ok) printf("result: %s\n", CommandProcessorModel::result_name(res));
+  CHECK(res == CommandProcessorModel::Result::Ok);
+  auto is = [&](uint32_t x, uint32_t y, float r, float g, float b) { return rig.pixel(x, y, 0) == r && rig.pixel(x, y, 1) == g && rig.pixel(x, y, 2) == b && rig.pixel(x, y, 3) == 1.0f; };
+  CHECK(is(5, 5, 1, 0, 0) && is(35, 5, 0, 1, 0) && is(5, 25, 0, 0, 1) && is(35, 25, 1, 1, 1));
+  // a descriptor that names memory nothing is mapped at: the draw faults
+  img.address = 0x7000000;
+  CHECK(make_image_descriptor(ArrayView<uint32_t>(iw, 8), img));
+  rig.mem.put(kTable + abi::kImageOffset, ArrayView<const uint32_t>(iw, 8));
+  CommandProcessorModel cp2(rig.alloc, rig.mem);
+  CHECK(cp2.execute(ArrayView<const uint32_t>(buf, n)) == CommandProcessorModel::Result::ShaderFault);
+}
+
+// the same truncations and bit flips for a stream that sets the back end
+static void test_damage_backend(Rig& rig) {
+  const DrawState s = backend_state(rig);
+  uint32_t buf[512];
+  bool ok;
+  const uint32_t n = build(s, buf, 512, &ok);
+  CHECK(ok);
+  for (uint32_t cut = 0; cut <= n; ++cut) {
+    CommandProcessorModel cp(rig.alloc, rig.mem);
+    (void)cp.execute(ArrayView<const uint32_t>(buf, cut));
+  }
+  uint32_t draws = 0;
+  for (uint32_t i = 0; i < n; ++i)
+    for (uint32_t bit = 0; bit < 32; ++bit) {
+      uint32_t copy[512];
+      memcpy(copy, buf, n * 4);
+      copy[i] ^= 1u << bit;
+      CommandProcessorModel cp(rig.alloc, rig.mem);
+      (void)cp.execute(ArrayView<const uint32_t>(copy, n));
+      draws += cp.draws();
+    }
+  CHECK(draws > 0);
+}
+
+
+// Two sided stencil and the depth bounds through the registers
+static void test_faces_and_bounds(Rig& rig) {
+  for (int variant = 0; variant < 3; ++variant) {
+    DrawState s = backend_state(rig);
+    s.depth_stencil.zpass_op = 5;
+    s.depth_stencil.two_sided = true;
+    s.depth_stencil.back.func = 7;
+    s.depth_stencil.back.zpass_op = 2;                           // back faces set the stencil to ones
+    s.depth_stencil.front_clockwise = variant == 1;              // (the triangles are counter clockwise on the screen)
+    if (variant == 2) { s.depth_stencil.depth_bounds = true; s.depth_stencil.bounds_min = 0.0f; s.depth_stencil.bounds_max = 0.5f; }          // the plane holds 1.0: all discarded
+    uint32_t buf[512];
+    bool ok;
+    const uint32_t n = build(s, buf, 512, &ok);
+    CHECK(ok);
+    CommandProcessorModel cp(rig.alloc, rig.mem);
+    const auto res = cp.execute(ArrayView<const uint32_t>(buf, n));
+    if (res != CommandProcessorModel::Result::Ok) printf("result: %s\n", CommandProcessorModel::result_name(res));
+    CHECK(res == CommandProcessorModel::Result::Ok);
+    TileLayout thin;
+    resolve_tile_index(13, &thin);
+    const uint64_t off = surface_offset(thin, 1, kPitch, 10, 10);
+    const uint32_t stencil = (rig.mem.words[kStencilPlane + off / 4 * 4] >> ((off & 3) * 8)) & 0xFF;
+    const float blue = tiled_pixel(rig.mem, 9, 10, 10, 2);
+    if (variant == 0) CHECK(stencil == 2);                       // front: counted twice
+    if (variant == 1) CHECK(stencil == 0xFF);                    // back: ones
+    if (variant == 2) CHECK(stencil == 0 && blue == 1.0f);       // discarded by the bounds: stencil untouched, colour still blue
+    // the registers: DB_DEPTH_CONTROL bits 7 (back face) and 3 (bounds), the back func at bit 20; PA_SU_SC_MODE_CNTL.FACE bit 2; the back operations at bit 12 ..., DB_STENCILREFMASK_BF
+    CHECK((cp.context_reg(0xa200) >> 7 & 1) == 1 && (cp.context_reg(0xa200) >> 20 & 7) == 7 && (cp.context_reg(0xa200) >> 3 & 1) == (variant == 2 ? 1u : 0u));
+    CHECK(cp.context_reg(0xa081 + 0) == 0x80000000u && cp.context_reg(0xa205) == (variant == 1 ? 4u : 0u));
+    CHECK((cp.context_reg(0xa10b) >> 16 & 0xF) == 2 && cp.context_reg(0xa10d) == ((0xFFu << 8) | (0xFFu << 16) | (1u << 24)));
+    CHECK(cp.context_reg(0xa008) == 0 && cp.context_reg(0xa009) == (variant == 2 ? 0x3F000000u : 0x3F800000u));
+  }
+  // culling and polygon modes are not modelled
+  DrawState s = backend_state(rig);
+  uint32_t buf[512];
+  bool ok;
+  const uint32_t n = build(s, buf, 512, &ok);
+  Pm4Writer extra(ArrayView<uint32_t>(buf + n, 512 - n));
+  extra.set_context_reg(0xa205, 1u << 1);                         // cull back
+  extra.draw_index_auto(6);
+  CommandProcessorModel cp(rig.alloc, rig.mem);
+  CHECK(ok && cp.execute(ArrayView<const uint32_t>(buf, n)) == CommandProcessorModel::Result::Ok);
+  CommandProcessorModel cp2(rig.alloc, rig.mem);
+  CHECK(cp2.execute(ArrayView<const uint32_t>(buf, n + extra.count())) == CommandProcessorModel::Result::Unsupported);
 }
 
 // every prefix of the stream, and every bit of every dword flipped: a result each time, no crash and no sanitizer report
@@ -404,11 +626,15 @@ static void test_damage(Rig& rig) {
 
 int main() {
   Rig rig;
-  if (!rig.vs.ok || !rig.ps.ok) { printf("FAILED: the shaders did not compile\n"); return 1; }
+  if (!rig.vs.ok || !rig.ps.ok || !rig.tps.ok) { printf("FAILED: the shaders did not compile\n"); return 1; }
   test_registers(rig);
   { Rig r; test_indexed_and_scissor(r); }
   { Rig r; test_refusals(r); }
   { Rig r; test_damage(r); }
+  { Rig r; test_backend(r); }
+  { Rig r; test_texture(r); }
+  { Rig r; test_faces_and_bounds(r); }
+  { Rig r; test_damage_backend(r); }
   printf(g_failed ? "GcnCpTest: %d FAILED\n" : "GcnCpTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }

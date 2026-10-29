@@ -36,6 +36,9 @@
 //   DrawIndexed      index_count, first_index, vertex_offset (signed)
 //   CopyRegion       dst_index, dst_x, dst_y, src_index, src_x, src_y, width, height   (colour images of one format; also staging memory)
 //   GenerateMipmaps  allocation_index
+//   BeginQuery       allocation_index, offset   (an occlusion query, the adapter's kFeatureOcclusionQueries: inside a pass; the allocation is a kAllocQueryResult buffer and `offset` a multiple of 8
+//                    with 8 bytes room. One query is open at a time and it ends before the pass does; at most kMaxOcclusionQueries per stream)
+//   EndQuery         (the count of fragments that passed the depth and stencil tests since BeginQuery is written there - a little-endian 64-bit number - once the stream has run)
 #pragma once
 #include "Kernel/Dxgkrnl/DxgTypes.hpp"
 #include <initializer_list>
@@ -60,6 +63,8 @@ enum class Op : uint16_t {
   SetTopology,
   DrawInstanced,
   DrawIndexedInstanced,
+  BeginQuery,
+  EndQuery,
 };
 
 // How the vertices (or indices) of a draw make triangles (D3D10 IASetPrimitiveTopology / D3D9 primitive types); the default is a list. A strip or fan is expanded to a list of
@@ -123,6 +128,8 @@ class CommandWriter {
     packet(Op::CopyRegion, {dst, dst_x, dst_y, src, src_x, src_y, width, height});
   }
   void generate_mipmaps(uint32_t allocation) { packet(Op::GenerateMipmaps, {allocation}); }
+  void begin_query(uint32_t allocation, uint32_t offset = 0) { packet(Op::BeginQuery, {allocation, offset}); }
+  void end_query() { packet(Op::EndQuery, {}); }
 
  private:
   void packet(Op op, std::initializer_list<uint32_t> payload) {

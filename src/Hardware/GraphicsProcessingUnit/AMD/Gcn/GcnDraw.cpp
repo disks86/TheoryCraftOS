@@ -44,6 +44,80 @@ bool fill_f(List<float>& list, uint64_t count) {
   return true;
 }
 
+bool fill_bytes(List<uint8_t>& list, uint64_t count) {
+  if (!list.reserve(count)) return false;
+  for (uint64_t i = 0; i < count; ++i)
+    if (!list.push_back(uint8_t{0})) return false;
+  return true;
+}
+
+bool compare(uint32_t func, float a, float b) {
+  switch (func) {
+    case 0: return false;
+    case 1: return a < b;
+    case 2: return a == b;
+    case 3: return a <= b;
+    case 4: return a > b;
+    case 5: return a != b;
+    case 6: return a >= b;
+    default: return true;
+  }
+}
+
+uint8_t stencil_result(uint32_t op, uint8_t old, uint8_t ref, uint8_t value) {
+  switch (op) {
+    case 1: return 0;
+    case 2: return 0xFF;
+    case 3: return ref;
+    case 4: return value;
+    case 5: return old + value > 255 ? 255 : static_cast<uint8_t>(old + value);
+    case 6: return old < value ? 0 : static_cast<uint8_t>(old - value);
+    case 7: return static_cast<uint8_t>(~old);
+    case 8: return static_cast<uint8_t>(old + value);
+    case 9: return static_cast<uint8_t>(old - value);
+    default: return old;
+  }
+}
+
+uint8_t stencil_update(const StencilFace& d, uint32_t op, uint8_t old) {
+  const uint8_t result = stencil_result(op, old, d.ref, d.op_value);
+  return static_cast<uint8_t>((old & ~d.write_mask) | (result & d.write_mask));
+}
+
+bool factor_ok(uint32_t f) { return BlendState::supported_factor(f); }
+
+// the blend factor of channel `ch` (3 is alpha)
+float blend_factor(uint32_t f, const float s[4], const float d[4], const float c[4], uint32_t ch) {
+  switch (f) {
+    case 0: return 0.0f;
+    case 1: return 1.0f;
+    case 2: return s[ch];
+    case 3: return 1.0f - s[ch];
+    case 4: return s[3];
+    case 5: return 1.0f - s[3];
+    case 6: return d[3];
+    case 7: return 1.0f - d[3];
+    case 8: return d[ch];
+    case 9: return 1.0f - d[ch];
+    case 10: return ch == 3 ? 1.0f : (s[3] < 1.0f - d[3] ? s[3] : 1.0f - d[3]);
+    case 13: return c[ch];
+    case 14: return 1.0f - c[ch];
+    case 19: return c[3];
+    case 20: return 1.0f - c[3];
+    default: return 0.0f;
+  }
+}
+
+float blend_combine(uint32_t op, float s, float sf, float d, float df) {
+  switch (op) {
+    case 1: return s * sf - d * df;
+    case 2: return s < d ? s : d;
+    case 3: return s > d ? s : d;
+    case 4: return d * df - s * sf;
+    default: return s * sf + d * df;
+  }
+}
+
 float bits_to_float(uint32_t b) {
   union { uint32_t u; float f; } c;       // (the exports are single precision bit patterns)
   c.u = b;
@@ -71,6 +145,9 @@ class Machine final : public IEnvironment {
   const uint32_t* pixel_y_ = nullptr;
   Framebuffer* target_ = nullptr;
   ITextureSource* textures_ = nullptr;
+  ITexelMemory* texel_memory_ = nullptr;
+  const BlendState* blend_ = nullptr;
+  uint64_t exported_ = 0;                  // the lanes of the pixel wave that wrote a colour
   bool fault_ = false;
 
   Region* find(uint64_t address) {
@@ -100,8 +177,15 @@ class Machine final : public IEnvironment {
     *p20 = v[2] - v[0];
   }
 
-  void sample(Mimg, const uint32_t image[8], const uint32_t[4], const float* coords, uint32_t, float result[4]) override {
+  void sample(Mimg, const uint32_t image[8], const uint32_t sampler[4], const float* coords, uint32_t, float result[4]) override {
     result[0] = result[1] = result[2] = result[3] = 0.0f;
+    if ((image[3] >> 28) != 0) {                // a real T# (its resource type is set); the harness's own unit numbers have none
+      if (!texel_memory_ || sample_image(*texel_memory_, ArrayView<const uint32_t>(image, 8), ArrayView<const uint32_t>(sampler, 4), coords[0], coords[1], result) != SampleStatus::Ok) {
+        fault_ = true;
+        result[0] = result[1] = result[2] = result[3] = 0.0f;
+      }
+      return;
+    }
     if (textures_) textures_->sample(image[0], coords[0], coords[1], result);
   }
 
@@ -113,8 +197,22 @@ class Machine final : public IEnvironment {
         if (!(lanes >> lane & 1)) continue;
         float* px = target_->pixel(pixel_x_[lane], pixel_y_[lane]);
         if (!px) continue;
+        exported_ |= uint64_t{1} << lane;
+        float src[4];
+        for (uint32_t c = 0; c < 4; ++c) src[c] = enable >> c & 1 ? bits_to_float(values[lane][c]) : 0.0f;
+        const BlendState& b = *blend_;
+        if (b.enable) {
+          const float dst[4] = {px[0], px[1], px[2], px[3]};
+          float out[4];
+          for (uint32_t c = 0; c < 4; ++c) {
+            const bool alpha = c == 3 && b.separate_alpha;
+            const uint32_t sf = alpha ? b.alpha_src : b.color_src, df = alpha ? b.alpha_dst : b.color_dst, op = alpha ? b.alpha_op : b.color_op;
+            out[c] = blend_combine(op, src[c], blend_factor(sf, src, dst, b.constant, c), dst[c], blend_factor(df, src, dst, b.constant, c));
+          }
+          for (uint32_t c = 0; c < 4; ++c) src[c] = out[c];
+        }
         for (uint32_t c = 0; c < 4; ++c)
-          if (enable >> c & 1) px[c] = bits_to_float(values[lane][c]);
+          if ((enable >> c & 1) && (b.write_mask >> c & 1)) px[c] = src[c];
       }
       return;
     }
@@ -137,7 +235,7 @@ class Machine final : public IEnvironment {
 };
 
 struct Screen {
-  float x, y, inv_w;
+  float x, y, z, inv_w;
   bool valid;
 };
 
@@ -150,6 +248,16 @@ Framebuffer::Framebuffer(allocators::IAllocator& allocator, uint32_t width, uint
 void Framebuffer::clear(float r, float g, float b, float a) {
   const float c[4] = {r, g, b, a};
   for (uint64_t i = 0; i < rgba_.count(); ++i) rgba_[i] = c[i & 3];
+}
+
+DepthBuffer::DepthBuffer(allocators::IAllocator& allocator, uint32_t width, uint32_t height) : z_(allocator), s_(allocator), width_(width), height_(height) {
+  const uint64_t count = static_cast<uint64_t>(width) * height;
+  valid_ = width != 0 && height != 0 && width <= 16384 && height <= 16384 && fill_f(z_, count) && fill_bytes(s_, count);
+}
+
+void DepthBuffer::clear(float depth, uint8_t stencil) {
+  for (uint64_t i = 0; i < z_.count(); ++i) z_[i] = depth;
+  for (uint64_t i = 0; i < s_.count(); ++i) s_[i] = stencil;
 }
 
 DrawStatus draw(allocators::IAllocator& allocator, const DrawCall& call, Framebuffer& target, DrawStats* stats) {
@@ -169,7 +277,19 @@ DrawStatus draw(allocators::IAllocator& allocator, const DrawCall& call, Framebu
     if (at.components < 1 || at.components > 4 || at.offset > call.vertex_stride || call.vertex_stride - at.offset < at.components * 4u) return DrawStatus::BadInput;
   }
 
+  const BlendState& bl = call.blend;
+  const DepthStencilState& ds = call.depth_stencil;
+  const bool depth_used = ds.depth_test || ds.depth_write || ds.stencil_test || ds.depth_bounds;
+  if (!factor_ok(bl.color_src) || !factor_ok(bl.color_dst) || !factor_ok(bl.alpha_src) || !factor_ok(bl.alpha_dst) || bl.color_op > 4 || bl.alpha_op > 4 || (bl.write_mask & ~0xFu) != 0)
+    return DrawStatus::BadInput;
+  const StencilFace& bk = ds.back;
+  if (ds.depth_func > 7 || ds.stencil_func > 7 || ds.fail_op > 9 || ds.zpass_op > 9 || ds.zfail_op > 9 || bk.func > 7 || bk.fail_op > 9 || bk.zpass_op > 9 || bk.zfail_op > 9) return DrawStatus::BadInput;
+  if (!(ds.bounds_min == ds.bounds_min) || !(ds.bounds_max == ds.bounds_max)) return DrawStatus::BadInput;
+  if (depth_used && (!call.depth || !call.depth->valid() || call.depth->width() != target.width() || call.depth->height() != target.height())) return DrawStatus::BadInput;
+
   Machine m(allocator);
+  m.blend_ = &call.blend;
+  m.texel_memory_ = call.texel_memory;
   m.ps_param_ = call.ps_param;            // (set from the start: code that is not what the stage should run may still interpolate)
   m.textures_ = call.textures;
   m.target_ = &target;
@@ -203,7 +323,12 @@ DrawStatus draw(allocators::IAllocator& allocator, const DrawCall& call, Framebu
     m.table_.words[w + 2] = static_cast<uint32_t>(vertex_count);
     m.table_.words[w + 3] = (7u << 12) | (kDataFormat[at.components - 1] << 15);
   }
-  for (uint32_t s = 0; s < abi::kMaxSamplers; ++s) m.table_.words[(abi::kImageOffset + s * abi::kImageBytes) / 4] = s;
+  for (uint32_t s = 0; s < abi::kMaxSamplers; ++s) {
+    m.table_.words[(abi::kImageOffset + s * abi::kImageBytes) / 4] = s;
+    if (!(call.descriptors_set >> s & 1)) continue;
+    for (uint32_t k = 0; k < 8; ++k) m.table_.words[(abi::kImageOffset + s * abi::kImageBytes) / 4 + k] = call.image_words[s][k];
+    for (uint32_t k = 0; k < 4; ++k) m.table_.words[(abi::kSamplerOffset + s * abi::kSamplerBytes) / 4 + k] = call.sampler_words[s][k];
+  }
 
   m.slots_ = static_cast<uint32_t>(call.indices.size());
   m.param_count_ = call.vertex_info.param_exports;
@@ -242,10 +367,11 @@ DrawStatus draw(allocators::IAllocator& allocator, const DrawCall& call, Framebu
   }
   if (clip_l >= clip_r || clip_t >= clip_b) return DrawStatus::Ok;
   uint32_t px[kWaveSize], py[kWaveSize];
-  float pi[kWaveSize], pj[kWaveSize];
+  float pi[kWaveSize], pj[kWaveSize], pz[kWaveSize];
   m.pixel_x_ = px;
   m.pixel_y_ = py;
   uint32_t pending = 0;
+  StencilFace face = ds.front();                  // the stencil state of the triangle being drawn
 
   auto flush = [&]() -> bool {
     if (pending == 0) return true;
@@ -259,7 +385,14 @@ DrawStatus draw(allocators::IAllocator& allocator, const DrawCall& call, Framebu
       w.set_vgpr_f(0, l, pi[l]);
       w.set_vgpr_f(1, l, pj[l]);
     }
-    const bool ok = w.run(call.pixel_code, m) == Status::Done;
+    m.exported_ = 0;
+    const bool ok = w.run(call.pixel_code, m) == Status::Done && !m.fault_;
+    // the pixels that wrote a colour pass: the stencil operation for passing and the depth
+    for (uint32_t l = 0; l < pending; ++l) {
+      if (!(m.exported_ >> l & 1)) continue;
+      if (ds.stencil_test) call.depth->stencil(px[l], py[l]) = stencil_update(face, face.zpass_op, call.depth->stencil(px[l], py[l]));
+      if (ds.depth_write) call.depth->depth(px[l], py[l]) = pz[l];
+    }
     ++st.pixel_waves;
     st.pixels += pending;
     pending = 0;
@@ -277,6 +410,7 @@ DrawStatus draw(allocators::IAllocator& allocator, const DrawCall& call, Framebu
       const float inv = 1.0f / p[3];
       v[k].x = p[0] * inv * xs + xo;
       v[k].y = p[1] * inv * ys + yo;
+      v[k].z = p[2] * inv * vp.z_scale + vp.z_offset;
       v[k].inv_w = inv;
       v[k].valid = true;
     }
@@ -284,10 +418,13 @@ DrawStatus draw(allocators::IAllocator& allocator, const DrawCall& call, Framebu
     uint32_t order[3] = {0, 1, 2};
     float area = (v[1].x - v[0].x) * (v[2].y - v[0].y) - (v[1].y - v[0].y) * (v[2].x - v[0].x);
     if (area == 0.0f || area != area) continue;
+    const float original_area = area;
     if (area < 0.0f) { order[1] = 2; order[2] = 1; area = -area; }
     const Screen& a = v[order[0]];
     const Screen& b = v[order[1]];
     const Screen& c = v[order[2]];
+    const float za = a.z, zb = b.z, zc = c.z;
+    face = ds.two_sided && (original_area > 0.0f) != ds.front_clockwise ? ds.back : ds.front();
     ++st.triangles;
     m.tri_[0] = slot[order[0]];
     m.tri_[1] = slot[order[1]];
@@ -313,12 +450,28 @@ DrawStatus draw(allocators::IAllocator& allocator, const DrawCall& call, Framebu
         const float e_ca = (a.x - c.x) * (qy - c.y) - (a.y - c.y) * (qx - c.x);
         const float e_ab = (b.x - a.x) * (qy - a.y) - (b.y - a.y) * (qx - a.x);
         if (!(e_bc > 0 || (e_bc == 0 && own_bc)) || !(e_ca > 0 || (e_ca == 0 && own_ca)) || !(e_ab > 0 || (e_ab == 0 && own_ab))) continue;
+        // the depth is linear in screen space; the viewport maps the clip range onto the depth range, and what is outside it is clipped
+        const float z = (e_bc * za + e_ca * zb + e_ab * zc) / area;
+        if (!(z >= 0.0f && z <= 1.0f)) continue;
+        if (ds.depth_bounds && !(call.depth->depth(x, y) >= ds.bounds_min && call.depth->depth(x, y) <= ds.bounds_max)) continue;
+        if (ds.stencil_test) {
+          uint8_t& stored = call.depth->stencil(x, y);
+          if (!compare(face.func, static_cast<float>(face.ref & face.mask), static_cast<float>(stored & face.mask))) {
+            stored = stencil_update(face, face.fail_op, stored);
+            continue;
+          }
+        }
+        if (ds.depth_test && !compare(ds.depth_func, z, call.depth->depth(x, y))) {
+          if (ds.stencil_test) call.depth->stencil(x, y) = stencil_update(face, face.zfail_op, call.depth->stencil(x, y));
+          continue;
+        }
         const float q0 = e_bc / area * a.inv_w, q1 = e_ca / area * b.inv_w, q2 = e_ab / area * c.inv_w;
         const float sum = q0 + q1 + q2;
         px[pending] = x;
         py[pending] = y;
         pi[pending] = q1 / sum;
         pj[pending] = q2 / sum;
+        pz[pending] = z;
         if (++pending == kWaveSize && !flush()) return DrawStatus::ShaderFault;
       }
     }

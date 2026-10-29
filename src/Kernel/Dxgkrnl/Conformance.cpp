@@ -85,6 +85,11 @@ class Rig {
     step("create_allocation (image)", ok() ? kernel_.create_allocation(kProcess, device_, d, &out) : status_);
     return out;
   }
+  Handle create(const AllocationDesc& d) {
+    Handle out = 0;
+    step("create_allocation", ok() ? kernel_.create_allocation(kProcess, device_, d, &out) : status_);
+    return out;
+  }
   Handle buffer(uint32_t flags, ConstByteView contents) {
     AllocationDesc d;
     d.flags = flags, d.size = contents.size();
@@ -114,6 +119,17 @@ class Rig {
     }
     kernel_.unlock(kProcess, a);
     step("read", good ? status::kSuccess : status::kInvalidParameter);
+  }
+  // Reads the little-endian 64-bit number `index` of a buffer.
+  uint64_t read_u64(Handle a, uint32_t index) {
+    LockResult lock;
+    if (!step("lock (read numbers)", ok() ? kernel_.lock(kProcess, a, kLockReadOnly, 0, &lock) : status_)) return 0;
+    ByteReader in(ConstByteView(lock.data.data(), lock.data.size()));
+    in.skip(uint64_t{index} * 8);
+    const uint64_t value = in.le64();
+    kernel_.unlock(kProcess, a);
+    step("read numbers", in.ok() ? status::kSuccess : status::kInvalidParameter);
+    return value;
   }
   // Runs a stream; the context is checked afterwards (a stream the device cannot run loses it).
   void render(const CommandWriter& commands, std::initializer_list<Handle> list) {
@@ -775,6 +791,153 @@ void float_target_scene(Rig& rig, ArrayView<uint32_t> out, Format format) {
 void scene_half_float_target(Rig& rig, ArrayView<uint32_t> out) { float_target_scene(rig, out, Format::A16B16G16R16F); }
 void scene_float_target(Rig& rig, ArrayView<uint32_t> out) { float_target_scene(rig, out, Format::A32B32G32R32F); }
 
+// Occlusion queries: a quad on the right half is drawn first (near), then three queried quads behind it - one in the open (16 x 16 pixels), one half behind the near quad (128 pixels
+// show) and one wholly behind it (none). The counts are then drawn as the colour of three stripes, so that a wrong count shows in the picture.
+void scene_occlusion_query(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureOcclusionQueries)) return void(rig.step("occlusion queries", status::kNotSupported));
+  auto quad = [](Vertex* v, float x0, float y0, float x1, float y1, float z, float r, float g, float b) {
+    v[0] = {x0, y0, z, r, g, b, 1}, v[1] = {x1, y0, z, r, g, b, 1}, v[2] = {x0, y1, z, r, g, b, 1};
+    v[3] = {x0, y1, z, r, g, b, 1}, v[4] = {x1, y0, z, r, g, b, 1}, v[5] = {x1, y1, z, r, g, b, 1};
+  };
+  Vertex v[24];
+  quad(v + 0, 0.0f, -1.0f, 1.0f, 1.0f, 0.2f, 0, 0, 0);          // near, right half
+  quad(v + 6, -1.0f, -1.0f, 0.0f, 0.0f, 0.5f, 0, 0, 0);         // in the open: 16 x 16 pixels
+  quad(v + 12, -0.5f, 0.0f, 0.5f, 1.0f, 0.5f, 0, 0, 0);         // half behind the near quad: 8 x 16 pixels show
+  quad(v + 18, 0.25f, -1.0f, 0.75f, 0.0f, 0.5f, 0, 0, 0);       // wholly behind it
+  Handle pipe = d3d9_pipeline(rig, true, false);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle depth = rig.image(kAllocDepthStencil, Format::D32Float, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  AllocationDesc rd;
+  rd.flags = kAllocQueryResult, rd.size = 3 * 8;
+  Handle results = rig.create(rd);
+  CommandWriter w(rig.allocator());
+  begin(w, 0, 1, {0, 0, 0, 1});
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(2);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(6);
+  for (uint32_t q = 0; q < 3; ++q) {
+    w.begin_query(3, q * 8);
+    w.draw(6, 6 + q * 6);
+    w.end_query();
+  }
+  w.end_pass();
+  rig.render(w, {target, depth, vb, results});
+  uint64_t counts[3];
+  for (uint32_t q = 0; q < 3; ++q) counts[q] = rig.read_u64(results, q);
+  // (the stripes: pixels 0 .. 8, 12 .. 20 and 24 .. 32)
+  Vertex s[18];
+  for (uint32_t q = 0; q < 3; ++q) {
+    const float shade = counts[q] >= 256 ? 1.0f : static_cast<float>(counts[q]) / 256.0f;
+    quad(s + q * 6, -1.0f + 0.75f * static_cast<float>(q), -1.0f, -0.5f + 0.75f * static_cast<float>(q), 1.0f, 0.5f, shade, 0.25f, 0.25f);
+  }
+  Handle svb = rig.buffer(kAllocVertexBuffer, bytes_of(s, sizeof s));
+  Handle flat = d3d9_pipeline(rig, false, false);
+  CommandWriter w2(rig.allocator());
+  begin(w2, 0, kNoAllocation, {0, 0, 0, 1});
+  w2.bind_pipeline(flat);
+  w2.bind_vertex_buffer(1);
+  w2.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w2.draw(18);
+  w2.end_pass();
+  rig.render(w2, {target, svb});
+  rig.read(target, out);
+}
+
+// A volume, an array or a cube texture of 4 x 4 layers, each layer a different colour with a gradient across it (red from the left, darker towards the bottom), sampled by pixel shaders
+// that declare Texture3D / Texture2DArray / TextureCube (ps_tex3d / ps_texarray / ps_texcube). The vertex colour is the texture coordinate (vs_vol).
+Handle layered_texture(Rig& rig, graphics::TextureKind kind, uint32_t layers, uint32_t (*base)(uint32_t layer)) {
+  AllocationDesc d;
+  d.flags = kAllocTexture, d.format = Format::A8R8G8B8, d.width = d.height = 4, d.kind = kind, d.layers = layers;
+  Handle texture = rig.create(d);
+  ByteBuffer bytes(rig.allocator());
+  for (uint32_t layer = 0; layer < layers; ++layer)
+    for (uint32_t y = 0; y < 4; ++y)
+      for (uint32_t x = 0; x < 4; ++x) {
+        const uint32_t color = base(layer);
+        const uint32_t shade = (255 - 30 * y) * (100 + 50 * x) / 255;   // 100 .. 250
+        auto channel = [&](uint32_t shift) { return (((color >> shift) & 0xFF) * shade / 255) & 0xFF; };
+        bytes.put32(0xFF000000u | (channel(16) << 16) | (channel(8) << 8) | channel(0));
+      }
+  rig.write(texture, bytes.view());
+  return texture;
+}
+
+// Draws the quads (6 vertices each; the vertex colours are the coordinates) with the given pixel shader and texture, nearest filtered.
+void sample_layered(Rig& rig, ArrayView<uint32_t> out, const uint8_t* ps, uint32_t ps_size, Handle texture, const Vertex* vertices, uint32_t quads) {
+  namespace b = conformance_blobs;
+  Handle p = dxbc_pipeline(rig, b::k_vs_vol, sizeof b::k_vs_vol, ps, ps_size, 1);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(vertices, sizeof(Vertex) * 6 * quads));
+  graphics::SamplerDesc sampler;
+  sampler.filter = graphics::Filter::Nearest;
+  sampler.address_u = sampler.address_v = graphics::AddressMode::ClampToEdge;
+  CommandWriter w(rig.allocator());
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_pipeline(p);
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.bind_texture(0, 2, sampler);
+  w.draw(6 * quads);
+  w.end_pass();
+  rig.render(w, {target, vb, texture});
+  rig.read(target, out);
+}
+
+// A quad over the pixels [x0, x1) x [y0, y1); the vertex colour of a corner is the coordinate (c(u, v) for u across and v down, each 0 .. 1).
+template <typename Coord>
+void quad_pixels(Vertex* v, float x0, float y0, float x1, float y1, Coord coord) {
+  auto at = [&](float px, float py, float u, float vv) {
+    const graphics::Vec3 c = coord(u, vv);
+    return Vertex{px / 16.0f - 1.0f, py / 16.0f - 1.0f, 0.5f, c.x, c.y, c.z, 1.0f};
+  };
+  v[0] = at(x0, y0, 0, 0), v[1] = at(x1, y0, 1, 0), v[2] = at(x0, y1, 0, 1);
+  v[3] = at(x0, y1, 0, 1), v[4] = at(x1, y0, 1, 0), v[5] = at(x1, y1, 1, 1);
+}
+
+void scene_texture_3d(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureTextureKinds)) return void(rig.step("texture kinds", status::kNotSupported));
+  namespace b = conformance_blobs;
+  Handle texture = layered_texture(rig, graphics::TextureKind::Texture3D, 4, [](uint32_t layer) -> uint32_t { return layer == 0 ? 0xFF0000u : layer == 1 ? 0x00FF00u : layer == 2 ? 0x0000FFu : 0xFFFF00u; });
+  // Top half: one slice (depth 0.6: the third) across u and v. Bottom half: v fixed, the depth running down the picture.
+  Vertex v[12];
+  quad_pixels(v, 0, 0, 32, 16, [](float u, float vv) { return graphics::Vec3{u, vv, 0.6f}; });
+  quad_pixels(v + 6, 0, 16, 32, 32, [](float u, float vv) { return graphics::Vec3{u, 0.3f, vv}; });
+  sample_layered(rig, out, b::k_ps_tex3d, sizeof b::k_ps_tex3d, texture, v, 2);
+}
+
+void scene_texture_array(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureTextureKinds)) return void(rig.step("texture kinds", status::kNotSupported));
+  namespace b = conformance_blobs;
+  Handle texture = layered_texture(rig, graphics::TextureKind::Texture2DArray, 3, [](uint32_t layer) -> uint32_t { return layer == 0 ? 0xFF8000u : layer == 1 ? 0x00FF80u : 0x8000FFu; });
+  // Three bands, one layer each (the layer is the third coordinate: 0, 1, 2). Their edges are off the pixel grid so that no pixel centre falls on a texel boundary, where devices may round either way.
+  Vertex v[18];
+  for (uint32_t i = 0; i < 3; ++i)
+    quad_pixels(v + 6 * i, static_cast<float>(i * 10) + 1.2f, 0, static_cast<float>(i * 10) + 10.8f, 32, [i](float u, float vv) { return graphics::Vec3{u, vv, static_cast<float>(i)}; });
+  sample_layered(rig, out, b::k_ps_texarray, sizeof b::k_ps_texarray, texture, v, 3);
+}
+
+void scene_texture_cube(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureTextureKinds)) return void(rig.step("texture kinds", status::kNotSupported));
+  namespace b = conformance_blobs;
+  // +X red, -X cyan, +Y green, -Y magenta, +Z blue, -Z yellow.
+  Handle texture = layered_texture(rig, graphics::TextureKind::TextureCube, 6, [](uint32_t face) -> uint32_t {
+    static const uint32_t kColours[6] = {0xFF0000u, 0x00FFFFu, 0x00FF00u, 0xFF00FFu, 0x0000FFu, 0xFFFF00u};
+    return kColours[face];
+  });
+  // Six quads in a grid of 3 x 2 (10 x 16 pixels each), each looking at one face: the direction is the face's axis, with the other two components running over -0.8 .. 0.8.
+  Vertex v[36];
+  for (uint32_t face = 0; face < 6; ++face) {
+    const float x0 = static_cast<float>(1 + (face % 3) * 10), y0 = static_cast<float>(face / 3 * 16);
+    quad_pixels(v + 6 * face, x0, y0, x0 + 10, y0 + 16, [face](float u, float vv) {
+      const float a = -0.8f + 1.6f * u, c = -0.8f + 1.6f * vv, axis = face % 2 ? -1.0f : 1.0f;
+      return face < 2 ? graphics::Vec3{axis, c, a} : face < 4 ? graphics::Vec3{a, axis, c} : graphics::Vec3{a, c, axis};
+    });
+  }
+  sample_layered(rig, out, b::k_ps_texcube, sizeof b::k_ps_texcube, texture, v, 6);
+}
+
 const Entry kScenes[] = {
     {"Direct3D 9 vertex colours", scene_vertex_colours},
     {"Direct3D 9 Shader Model 3", scene_sm3},
@@ -805,6 +968,10 @@ const Entry kScenes[] = {
     {"Direct3D 10 multiple render targets (DXBC)", scene_multiple_targets},
     {"Direct3D 10 half-float render target and texture", scene_half_float_target},
     {"Direct3D 10 float render target and texture", scene_float_target},
+    {"Direct3D 10 occlusion queries", scene_occlusion_query},
+    {"Direct3D 10 volume texture (DXBC)", scene_texture_3d},
+    {"Direct3D 10 texture array (DXBC)", scene_texture_array},
+    {"Direct3D 10 cube texture (DXBC)", scene_texture_cube},
 };
 
 bool channels_close(uint32_t a, uint32_t b) {

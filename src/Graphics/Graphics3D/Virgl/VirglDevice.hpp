@@ -33,7 +33,7 @@ class VirglDevice final : public IGraphicsDevice {
   ~VirglDevice();
 
   DeviceInfo info() const override {
-    return {"virgl (virtio-gpu)", DeviceKind::VirtualGpu, true, kMaxPushConstantBytes, kFeatureBlendState | kFeatureTexelAccess | kFeatureSystemInputs | kFeatureInstancing | kFeatureLines | kFeatureMultipleTargets | kFeatureFloatFormats};
+    return {"virgl (virtio-gpu)", DeviceKind::VirtualGpu, true, kMaxPushConstantBytes, kFeatureBlendState | kFeatureTexelAccess | kFeatureSystemInputs | kFeatureInstancing | kFeatureLines | kFeatureMultipleTargets | kFeatureFloatFormats | kFeatureOcclusionQueries | kFeatureTextureKinds};
   }
 
   IBuffer* create_buffer(uint64_t size, uint32_t usage) override;

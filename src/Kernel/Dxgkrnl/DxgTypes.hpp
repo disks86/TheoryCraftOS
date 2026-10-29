@@ -83,7 +83,7 @@ constexpr uint32_t pixel_bytes(Format f) { return f == Format::A16B16G16R16F ? 8
 // Red and blue swapped relative to the devices' logical 0xAARRGGBB.
 constexpr bool is_rgba_order(Format f) { return f == Format::A8B8G8R8 || f == Format::X8B8G8R8; }
 
-// What an allocation may be used for (D3DDDI_ALLOCATIONINFO / resource flags). A buffer is made with kAllocVertexBuffer and/or kAllocIndexBuffer; everything else is an
+// What an allocation may be used for (D3DDDI_ALLOCATIONINFO / resource flags). A buffer is made with kAllocVertexBuffer and/or kAllocIndexBuffer (or alone, kAllocQueryResult); everything else is an
 // image. kAllocStaging is memory only the CPU and copies touch (never resident on the GPU).
 enum AllocationFlags : uint32_t {
   kAllocVertexBuffer = 1u << 0,
@@ -94,6 +94,7 @@ enum AllocationFlags : uint32_t {
   kAllocPresent = 1u << 5,       // may be put on the screen (a back buffer or the primary)
   kAllocStaging = 1u << 6,
   kAllocShared = 1u << 7,        // may be shared with other processes (Kernel::share_allocation)
+  kAllocQueryResult = 1u << 8,   // a buffer the results of occlusion queries are written to (CommandStream.hpp BeginQuery); system memory only, never resident, read by locking it
 };
 
 constexpr uint32_t kMaxTextureDimension = 4096;
@@ -105,6 +106,8 @@ struct AllocationDesc {
   uint32_t width = 0, height = 0;    // images
   uint32_t mip_levels = 1;           // textures only; more than one needs a texture that is not a render target
   uint64_t size = 0;                 // buffers: bytes
+  graphics::TextureKind kind = graphics::TextureKind::Texture2D;   // textures: more than 2D needs the adapter's kFeatureTextureKinds, flags exactly kAllocTexture (kAllocShared too), one mip level, an 8-bit colour format
+  uint32_t layers = 1;               // Texture3D: the depth; Texture2DArray: the array size (1 .. graphics::kMaxTextureLayers); TextureCube: 6 (width equals height)
 };
 
 struct AllocationInfo {

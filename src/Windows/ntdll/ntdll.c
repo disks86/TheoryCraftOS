@@ -522,6 +522,7 @@ static void fls_destroy_current(int free_structure);
 static volatile LONG g_heap_lock;
 static volatile LONG g_fls_lock;
 static void fls_thread_begins(void);
+EXPORT void NTAPI RtlFreeThreadActivationContextStack(void);
 /* The libraries are told the process is ending (once): this thread's fiber local storage goes first, then every library's entry point and TLS callbacks get
  * DLL_PROCESS_DETACH with a non-NULL reserved. The libraries stay loaded; the process is not over. */
 EXPORT void NTAPI LdrShutdownProcess(void) {
@@ -563,6 +564,7 @@ EXPORT void NTAPI RtlExitUserThread(NTSTATUS status) {
   fls_destroy_current(0);
   if (!g_process_ending) notify_all_modules(DLL_THREAD_DETACH, NULL, 0);
   fls_destroy_current(1);
+  RtlFreeThreadActivationContextStack();
   for (;;) NtTerminateThread((HANDLE)(LONG_PTR)-2, status);
 }
 
@@ -586,30 +588,31 @@ static ULONG run_apcs(void) {
   ULONG count = 0;
   ULONG64 apc[4];
   while (NtDequeueApc(apc) == STATUS_SUCCESS) {
+    if (!apc[0]) continue;      /* (an APC with no routine only ends the wait) */
     ((void (NTAPI *)(ULONG_PTR, ULONG_PTR, ULONG_PTR))apc[0])((ULONG_PTR)apc[1], (ULONG_PTR)apc[2], (ULONG_PTR)apc[3]);
     ++count;
   }
   return count;
 }
-EXPORT NTSTATUS NTAPI NtTestAlert(void) { return run_apcs() ? STATUS_ALERTED : STATUS_SUCCESS; }
+EXPORT NTSTATUS NTAPI NtTestAlert(void) { run_apcs(); return STATUS_SUCCESS; }
 EXPORT NTSTATUS NTAPI NtWaitForSingleObject(HANDLE h, BOOLEAN alertable, PLARGE_INTEGER timeout) {
   const NTSTATUS status = RawNtWaitForSingleObject(h, alertable, timeout);
-  if (status == STATUS_USER_APC) run_apcs();
+  if (status == STATUS_USER_APC && !run_apcs()) return STATUS_SUCCESS;      /* (only routine-less ones) */
   return status;
 }
 EXPORT NTSTATUS NTAPI NtWaitForMultipleObjects(ULONG count, const HANDLE *handles, ULONG type, BOOLEAN alertable, PLARGE_INTEGER timeout) {
   const NTSTATUS status = RawNtWaitForMultipleObjects(count, handles, type, alertable, timeout);
-  if (status == STATUS_USER_APC) run_apcs();
+  if (status == STATUS_USER_APC && !run_apcs()) return STATUS_SUCCESS;      /* (only routine-less ones) */
   return status;
 }
 EXPORT NTSTATUS NTAPI NtDelayExecution(BOOLEAN alertable, PLARGE_INTEGER interval) {
   const NTSTATUS status = RawNtDelayExecution(alertable, interval);
-  if (status == STATUS_USER_APC) run_apcs();
+  if (status == STATUS_USER_APC && !run_apcs()) return STATUS_SUCCESS;      /* (only routine-less ones) */
   return status;
 }
 EXPORT NTSTATUS NTAPI NtSignalAndWaitForSingleObject(HANDLE signal, HANDLE wait, BOOLEAN alertable, PLARGE_INTEGER timeout) {
   const NTSTATUS status = RawNtSignalAndWaitForSingleObject(signal, wait, alertable, timeout);
-  if (status == STATUS_USER_APC) run_apcs();
+  if (status == STATUS_USER_APC && !run_apcs()) return STATUS_SUCCESS;      /* (only routine-less ones) */
   return status;
 }
 
@@ -1090,6 +1093,7 @@ EXPORT NTSTATUS NTAPI RtlDeleteCriticalSection(PRTL_CRITICAL_SECTION cs) { cs->L
 /* ---- exceptions: unwinding, dispatching, __C_specific_handler ----------------------------------------------------------------------------------------------- */
 
 #include "except.inc"
+#include "actctx.inc"
 EXPORT ULONG DbgPrint(const char *format, ...) { (void)format; return 0; }
 /* SSE and SSE2 are there (PF_XMMI_INSTRUCTIONS_AVAILABLE = 6, PF_XMMI64_INSTRUCTIONS_AVAILABLE = 10); nothing newer is reported. */
 EXPORT BOOLEAN NTAPI RtlIsProcessorFeaturePresent(ULONG feature) { return feature == 6 || feature == 10; }
@@ -1106,6 +1110,7 @@ EXPORT void NTAPI RtlUserThreadStart(ProgramEntry entry, PVOID parameter) {
   PEB_LDR_DATA *ldr = peb->Ldr;
   process_heap();
   fls_thread_begins();
+  act_init_process();
   if (ldr) {
     loader_lock();
     /* the libraries in the order they depend on each other, then the program's TLS callbacks, then the program */
@@ -1146,7 +1151,7 @@ static void ldr_remove(LIST_ENTRY *e) {
 
 /* A loader entry for a library the kernel mapped: listed in the three module lists. `path` (a UNICODE_STRING) is the file the program asked for; a library that came in
  * because another imports it is in C:\Windows\System32. */
-static LDR_DATA_TABLE_ENTRY *ldr_add(const LoadRecord *record, const UNICODE_STRING *path, int mapped_only) {
+static LDR_DATA_TABLE_ENTRY *ldr_add(const LoadRecord *record, const UNICODE_STRING *path, int mapped_only, ULONG extra_flags) {
   {      /* a program image loaded as a library is only mapped, like a DONT_RESOLVE load */
     const BYTE *image = (const BYTE *)(ULONG_PTR)record->base;
     const ULONG nt = *(const ULONG *)(image + 0x3C);
@@ -1180,7 +1185,7 @@ static LDR_DATA_TABLE_ENTRY *ldr_add(const LoadRecord *record, const UNICODE_STR
   e->BaseDllName.Buffer = full + (full_length - base_length);
   e->BaseDllName.Length = (USHORT)(base_length * 2);
   e->BaseDllName.MaximumLength = (USHORT)(base_length * 2 + 2);
-  e->Flags = 0x4 | (mapped_only ? LDRP_MAPPED_ONLY : 0);      /* LDRP_IMAGE_DLL */
+  e->Flags = 0x4 | (mapped_only ? LDRP_MAPPED_ONLY : 0) | extra_flags;      /* LDRP_IMAGE_DLL */
   e->LoadCount = 1;
   {      /* TlsIndex: -1 when the image has thread-local data that was set up */
     const BYTE *image = (const BYTE *)e->DllBase;
@@ -1270,11 +1275,12 @@ static void ldr_release(PVOID base, int detach) {
 /* Loads the DLL file at `name` (a Win32 path; or just a library's name when it is loaded already) and what it imports; calls the entry points. */
 static NTSTATUS ldr_load_one(PULONG flags, PUNICODE_STRING name, PVOID *handle) {
   const int mapped_only = flags && (*flags & 2);      /* LDR_DONT_RESOLVE_REFS */
+  const int redirected = flags && (*flags & 0x40000000);      /* (ours) a library of an activation context: its own copy, whatever else of that name is loaded */
   LoadRecord records[MAX_LOAD_RECORDS];
   ULONG count = 0;
   PVOID base = NULL;
   loader_lock();
-  NTSTATUS status = NtLoadModule(name, &base, records, MAX_LOAD_RECORDS, &count, mapped_only ? 1 : 0);
+  NTSTATUS status = NtLoadModule(name, &base, records, MAX_LOAD_RECORDS, &count, (mapped_only ? 1 : 0) | (redirected ? 4 : 0));
   if (!NT_SUCCESS(status)) { loader_unlock(); return status; }
   if (count == 0) {      /* it was there: one more use (or a library the process started with) */
     *handle = base;
@@ -1284,7 +1290,7 @@ static NTSTATUS ldr_load_one(PULONG flags, PUNICODE_STRING name, PVOID *handle) 
   LDR_DATA_TABLE_ENTRY *added[MAX_LOAD_RECORDS];
   ULONG listed = 0;
   for (; listed < count; ++listed) {
-    added[listed] = ldr_add(&records[listed], records[listed].base == (ULONG64)(ULONG_PTR)base ? name : NULL, mapped_only);
+    added[listed] = ldr_add(&records[listed], records[listed].base == (ULONG64)(ULONG_PTR)base ? name : NULL, mapped_only, records[listed].base == (ULONG64)(ULONG_PTR)base && redirected ? 0x10000000u : 0);
     if (!added[listed]) break;
   }
   ULONG attached = 0;

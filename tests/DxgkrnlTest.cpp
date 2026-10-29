@@ -30,6 +30,7 @@
 #include "Graphics/Graphics3D/Software/SoftwareDevice.hpp"
 #include "Kernel/Dxgkrnl/Conformance.hpp"
 #include "Kernel/Dxgkrnl/CommandStream.hpp"
+#include "Kernel/Dxgkrnl/ConformanceBlobs.hpp"
 #include "Kernel/Dxgkrnl/DxgKernel.hpp"
 #include "Utility/ByteStream.hpp"
 #include "DxgkrnlDeviceSuite.hpp"
@@ -553,6 +554,10 @@ void test_texture_copy_mips() {
 void test_stream_fuzz() {
   Env e;
   Handle rt = e.alloc(kTarget, Format::A8R8G8B8, 8, 8), vb = e.buffer(kAllocVertexBuffer, 3 * 28), ib = e.buffer(kAllocIndexBuffer, 64), tex = e.alloc(kTexture, Format::A8R8G8B8, 4, 4);
+  AllocationDesc query_desc;
+  query_desc.flags = kAllocQueryResult, query_desc.size = 16;
+  Handle queries = 0;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, query_desc, &queries) == status::kSuccess);
   Handle pipe = make_colored_pipeline(e);
   CHECK(write_triangle(e, vb, 1, 1, 0));
   const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
@@ -564,14 +569,16 @@ void test_stream_fuzz() {
   w.push_constants(floats(identity, 16));
   w.set_viewport({0, 0, 8, 8, 0, 1});
   w.set_scissor({0, 0, 8, 8});
+  w.begin_query(4, 8);
   w.draw(3);
+  w.end_query();
   w.draw_indexed(3);
   w.end_pass();
   w.copy_region(3, 0, 0, 3, 1, 1, 2, 2);
   w.generate_mipmaps(3);
   CHECK(w.ok());
   std::vector<uint8_t> good(w.view().data(), w.view().data() + w.view().size());
-  std::vector<Handle> list = {rt, vb, ib, tex};
+  std::vector<Handle> list = {rt, vb, ib, tex, queries};
   auto try_stream = [&](const std::vector<uint8_t>& bytes) {
     Handle ctx = 0;
     e.kernel.create_context(kPid, e.dev, ContextPriority::Normal, &ctx);
@@ -2702,7 +2709,20 @@ void test_dxbc_real() {
     // Each blob truncated and bit-flipped.
     unsigned compiled = 0, refused = 0;
     uint32_t seed = 4242;
-    for (const std::vector<uint8_t>* blob : {&vs_blob, &color_blob, &tex_blob, &math_blob}) {
+    // The volume, array and cube shaders say what they sample in the program and in the TGSI text.
+    const std::vector<uint8_t> volume_blob = read_blob("ps_tex3d.dxbc"), array_blob = read_blob("ps_texarray.dxbc"), cube_blob = read_blob("ps_texcube.dxbc");
+    {
+      struct Kind { const std::vector<uint8_t>* blob; graphics::TextureKind kind; const char* name; };
+      for (const Kind& k : {Kind{&volume_blob, graphics::TextureKind::Texture3D, "3D, FLOAT"}, Kind{&array_blob, graphics::TextureKind::Texture2DArray, "2D_ARRAY, FLOAT"},
+                            Kind{&cube_blob, graphics::TextureKind::TextureCube, "CUBE, FLOAT"}}) {
+        UniquePointer<D3d9Program> p = compile_dxbc(allocator, *k.blob, &st);
+        CHECK(st == status::kSuccess && p && p->texture_kind(0) == k.kind && p->texture_kind(1) == graphics::TextureKind::Texture2D);
+        CHECK((p->required_features() & graphics::kFeatureTextureKinds) != 0);
+        String text(allocator);
+        CHECK(p->emit_tgsi(&text) == status::kSuccess && strstr(std::string(text.view().data(), text.size()).c_str(), k.name));
+      }
+    }
+    for (const std::vector<uint8_t>* blob : {&vs_blob, &color_blob, &tex_blob, &math_blob, &volume_blob, &array_blob, &cube_blob}) {
       for (size_t cut = 0; cut < blob->size(); cut += 3) {
         std::vector<uint8_t> t(blob->begin(), blob->begin() + static_cast<long>(cut));
         UniquePointer<D3d9Program> p = compile_dxbc(allocator, t, &st);
@@ -3401,6 +3421,240 @@ void test_half_floats() {
   CHECK(graphics::half_to_float(0x0001) == 5.9604645e-8f);                    // (the smallest subnormal)
 }
 
+// The count an occlusion query left in a result buffer (~0 when it cannot be read).
+uint64_t query_count(Env& e, Handle results, uint32_t index) {
+  LockResult r;
+  if (e.kernel.lock(kPid, results, kLockReadOnly, 0, &r) != status::kSuccess) return ~uint64_t{0};
+  ByteReader in(r.data);
+  in.skip(uint64_t{index} * 8);
+  const uint64_t v = in.le64();
+  e.kernel.unlock(kPid, results);
+  return in.ok() ? v : ~uint64_t{0};
+}
+
+void test_occlusion_queries() {
+  Env e;
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  Handle rt = e.alloc(kTarget, Format::A8R8G8B8, 16, 16), rt2 = e.alloc(kTarget, Format::A8R8G8B8, 16, 16), ds = e.alloc(kAllocDepthStencil, Format::D32Float, 16, 16);
+  Handle vb = e.buffer(kAllocVertexBuffer, 3 * 28), far_vb = e.buffer(kAllocVertexBuffer, 3 * 28);
+  AllocationDesc rd;
+  rd.flags = kAllocQueryResult, rd.size = 64;
+  Handle results = 0;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, rd, &results) == status::kSuccess);
+  // A query buffer is system memory only: nothing else can be combined with it, and it needs room for a count.
+  AllocationDesc bad = rd;
+  bad.flags = kAllocQueryResult | kAllocVertexBuffer;
+  Handle none = 0;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, bad, &none) == status::kInvalidParameter);
+  bad = rd, bad.size = 4;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, bad, &none) == status::kInvalidParameter);
+  bad = rd, bad.size = 0;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, bad, &none) == status::kInvalidParameter);
+
+  Handle vs = 0, fs = 0, pipe = 0;
+  CHECK(e.kernel.create_shader(kPid, e.dev, {ShaderKind::ColoredVertex, graphics::ShaderStage::Vertex, {}}, &vs) == status::kSuccess);
+  CHECK(e.kernel.create_shader(kPid, e.dev, {ShaderKind::ColoredFragment, graphics::ShaderStage::Fragment, {}}, &fs) == status::kSuccess);
+  graphics::GraphicsPipelineDesc gd;
+  graphics::describe_colored_pipeline(&gd);
+  PipelineDesc pd;
+  pd.vertex_shader = vs, pd.fragment_shader = fs, pd.vertex_stride = gd.vertex_stride, pd.attribute_count = 2, pd.varying_count = 1;
+  pd.attributes[0] = gd.attributes[0], pd.attributes[1] = gd.attributes[1];
+  pd.cull_mode = graphics::CullMode::None;
+  pd.depth_test = pd.depth_write = true;
+  CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &pipe) == status::kSuccess);
+  CHECK(write_triangle(e, vb, 0, 1, 0));   // (depth 0.5, covers the whole 16 x 16 target)
+  const float far_v[21] = {-1, -1, 0.9f, 0, 0, 1, 1, 3, -1, 0.9f, 0, 0, 1, 1, -1, 3, 0.9f, 0, 0, 1, 1};
+  CHECK(e.write(far_vb, floats(far_v, 21)));
+
+  // List: rt 0, rt2 1, ds 2, vb 3, far_vb 4, results 5.
+  // The triangle covers all 256 pixels; the same one again behind nothing (equal depth passes) under a scissor of half the width counts 128; the farther one fails the depth test;
+  // an empty query counts nothing.
+  CommandWriter w(e.allocator);
+  w.begin_pass(0, 2, kPassClearColor | kPassClearDepth, {0, 0, 0, 1}, 1, 0);
+  w.bind_pipeline(pipe);
+  w.push_constants(floats(identity, 16));
+  w.begin_query(5, 0);
+  w.bind_vertex_buffer(3);
+  w.draw(3);
+  w.end_query();
+  w.begin_query(5, 8);
+  w.bind_vertex_buffer(4);
+  w.draw(3);
+  w.end_query();
+  w.begin_query(5, 16);
+  w.end_query();
+  w.set_scissor({0, 0, 8, 16});
+  w.begin_query(5, 24);
+  w.bind_vertex_buffer(3);
+  w.draw(3);
+  w.end_query();
+  w.end_pass();
+  CHECK(w.ok() && e.render(w, {rt, rt2, ds, vb, far_vb, results}) == status::kSuccess);
+  CHECK(query_count(e, results, 0) == 256 && query_count(e, results, 1) == 0 && query_count(e, results, 2) == 0 && query_count(e, results, 3) == 128 && query_count(e, results, 4) == 0);
+
+  // A copy in the middle of the stream runs what was recorded before it: the second pass's query is a new one and lands where it says.
+  CommandWriter w2(e.allocator);
+  w2.begin_pass(0, 2, kPassClearColor | kPassClearDepth, {0, 0, 0, 1}, 1, 0);
+  w2.bind_pipeline(pipe);
+  w2.push_constants(floats(identity, 16));
+  w2.bind_vertex_buffer(3);
+  w2.begin_query(5, 32);
+  w2.draw(3);
+  w2.end_query();
+  w2.end_pass();
+  w2.copy_region(1, 0, 0, 0, 0, 0, 16, 16);
+  w2.begin_pass(1, 2, kPassClearColor | kPassClearDepth, {0, 0, 0, 1}, 1, 0);
+  w2.bind_pipeline(pipe);
+  w2.push_constants(floats(identity, 16));
+  w2.bind_vertex_buffer(3);
+  w2.set_scissor({0, 0, 16, 4});
+  w2.begin_query(5, 40);
+  w2.draw(3);
+  w2.end_query();
+  w2.end_pass();
+  CHECK(w2.ok() && e.render(w2, {rt, rt2, ds, vb, far_vb, results}) == status::kSuccess);
+  CHECK(query_count(e, results, 4) == 256 && query_count(e, results, 5) == 64 && query_count(e, results, 6) == 0);
+
+  // What the kernel refuses (nothing runs, and the results stay as they were).
+  auto refused = [&](auto build) {
+    CommandWriter c(e.allocator);
+    build(c);
+    return c.ok() && e.render(c, {rt, rt2, ds, vb, far_vb, results}) == status::kInvalidParameter;
+  };
+  CHECK(refused([&](CommandWriter& c) { c.begin_query(5, 0); }));                                                  // outside a pass
+  CHECK(refused([&](CommandWriter& c) { c.begin_pass(0, kNoAllocation, 0, {}, 1, 0); c.end_query(); c.end_pass(); }));       // never begun
+  CHECK(refused([&](CommandWriter& c) { c.begin_pass(0, kNoAllocation, 0, {}, 1, 0); c.begin_query(5, 0); c.end_pass(); }));   // still open at the end of the pass
+  CHECK(refused([&](CommandWriter& c) { c.begin_pass(0, kNoAllocation, 0, {}, 1, 0); c.begin_query(5, 0); c.begin_query(5, 8); c.end_query(); c.end_pass(); }));   // two at once
+  CHECK(refused([&](CommandWriter& c) { c.begin_pass(0, kNoAllocation, 0, {}, 1, 0); c.begin_query(5, 4); c.end_query(); c.end_pass(); }));       // not a multiple of 8
+  CHECK(refused([&](CommandWriter& c) { c.begin_pass(0, kNoAllocation, 0, {}, 1, 0); c.begin_query(5, 64); c.end_query(); c.end_pass(); }));      // past the end
+  CHECK(refused([&](CommandWriter& c) { c.begin_pass(0, kNoAllocation, 0, {}, 1, 0); c.begin_query(5, 0xFFFFFFF8u); c.end_query(); c.end_pass(); }));
+  CHECK(refused([&](CommandWriter& c) { c.begin_pass(0, kNoAllocation, 0, {}, 1, 0); c.begin_query(3, 0); c.end_query(); c.end_pass(); }));       // a vertex buffer
+  CHECK(refused([&](CommandWriter& c) { c.begin_pass(0, kNoAllocation, 0, {}, 1, 0); c.begin_query(0, 0); c.end_query(); c.end_pass(); }));       // an image
+  CHECK(refused([&](CommandWriter& c) { c.begin_pass(0, kNoAllocation, 0, {}, 1, 0); c.begin_query(9, 0); c.end_query(); c.end_pass(); }));       // no such allocation
+  // The limit: 64 queries are fine, a 65th is not.
+  {
+    CommandWriter c(e.allocator);
+    c.begin_pass(0, kNoAllocation, 0, {}, 1, 0);
+    for (uint32_t i = 0; i < graphics::kMaxOcclusionQueries; ++i) c.begin_query(5, 56), c.end_query();
+    c.end_pass();
+    CHECK(c.ok() && e.render(c, {rt, rt2, ds, vb, far_vb, results}) == status::kSuccess);
+    CommandWriter c2(e.allocator);
+    c2.begin_pass(0, kNoAllocation, 0, {}, 1, 0);
+    for (uint32_t i = 0; i <= graphics::kMaxOcclusionQueries; ++i) c2.begin_query(5, 56), c2.end_query();
+    c2.end_pass();
+    CHECK(c2.ok() && e.render(c2, {rt, rt2, ds, vb, far_vb, results}) == status::kInvalidParameter);
+  }
+  // (a query buffer cannot be bound as a vertex buffer, whatever its size)
+  CommandWriter bound(e.allocator);
+  bound.begin_pass(0, kNoAllocation, 0, {}, 1, 0);
+  bound.bind_vertex_buffer(5);
+  bound.end_pass();
+  CHECK(e.render(bound, {rt, rt2, ds, vb, far_vb, results}) == status::kInvalidParameter);
+
+  // A device without the feature refuses the buffer and the stream.
+  FakeScreen screen(8, 6);
+  graphics::SoftwareDevice software(e.allocator, &screen);
+  SpyDevice plain(software);
+  plain.feature_mask = 0;
+  Kernel kernel(e.allocator);
+  AdapterConfig c;
+  c.display = &screen;
+  kernel.add_adapter(plain, c);
+  Handle adapter = 0, dev = 0;
+  CHECK(kernel.open_process(kPid) == status::kSuccess && kernel.open_adapter_from_index(kPid, 0, &adapter) == status::kSuccess && kernel.create_device(kPid, adapter, &dev) == status::kSuccess);
+  Handle r2 = 0;
+  CHECK(kernel.create_allocation(kPid, dev, rd, &r2) == status::kNotSupported);
+}
+
+void test_texture_kinds() {
+  Env e;
+  auto create = [&](graphics::TextureKind kind, uint32_t layers, uint32_t w, uint32_t h, uint32_t flags = kAllocTexture, Format f = Format::A8R8G8B8, uint32_t mips = 1) {
+    AllocationDesc d;
+    d.flags = flags, d.format = f, d.width = w, d.height = h, d.kind = kind, d.layers = layers, d.mip_levels = mips;
+    Handle out = 0;
+    const NtStatus s = e.kernel.create_allocation(kPid, e.dev, d, &out);
+    return s == status::kSuccess ? status::kSuccess : s;
+  };
+  using graphics::TextureKind;
+  CHECK(create(TextureKind::Texture3D, 4, 4, 4) == status::kSuccess);
+  CHECK(create(TextureKind::Texture2DArray, 256, 2, 2) == status::kSuccess);
+  CHECK(create(TextureKind::TextureCube, 6, 4, 4) == status::kSuccess);
+  CHECK(create(TextureKind::Texture3D, 4, 4, 4, kAllocTexture | kAllocShared, Format::X8B8G8R8) == status::kSuccess);
+  // What cannot be: no layers, too many, a cube that is not six squares, a render target, mipmaps, a float or depth format, staging, layers on a plain texture.
+  CHECK(create(TextureKind::Texture3D, 0, 4, 4) == status::kInvalidParameter);
+  CHECK(create(TextureKind::Texture2DArray, 257, 4, 4) == status::kInvalidParameter);
+  CHECK(create(TextureKind::TextureCube, 5, 4, 4) == status::kInvalidParameter);
+  CHECK(create(TextureKind::TextureCube, 6, 4, 8) == status::kInvalidParameter);
+  CHECK(create(TextureKind::Texture3D, 4, 4, 4, kAllocTexture | kAllocRenderTarget) == status::kInvalidParameter);
+  CHECK(create(TextureKind::Texture3D, 4, 4, 4, kAllocTexture, Format::A8R8G8B8, 2) == status::kInvalidParameter);
+  CHECK(create(TextureKind::Texture3D, 4, 4, 4, kAllocTexture, Format::A16B16G16R16F) == status::kInvalidParameter);
+  CHECK(create(TextureKind::Texture3D, 4, 4, 4, kAllocStaging) == status::kInvalidParameter);
+  CHECK(create(TextureKind::Texture2D, 2, 4, 4) == status::kInvalidParameter);
+  // The lock shows all the layers, one after the other.
+  AllocationDesc d;
+  d.flags = kAllocTexture, d.format = Format::A8R8G8B8, d.width = d.height = 4, d.kind = TextureKind::Texture2DArray, d.layers = 3;
+  Handle array = 0;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, d, &array) == status::kSuccess);
+  LockResult lock;
+  CHECK(e.kernel.lock(kPid, array, kLockReadOnly, 0, &lock) == status::kSuccess && lock.data.size() == 3 * 4 * 4 * 4 && lock.pitch == 16);
+  e.kernel.unlock(kPid, array);
+
+  // A texture of one kind where the shader declares another is refused, the right one draws.
+  namespace b = conformance_blobs;
+  auto pipeline = [&](const uint8_t* ps, uint32_t ps_size) {
+    Handle vs = 0, fs = 0, pipe = 0;
+    ShaderDesc sv, sp;
+    sv.kind = sp.kind = ShaderKind::Dxbc;
+    sv.stage = graphics::ShaderStage::Vertex, sp.stage = graphics::ShaderStage::Fragment;
+    sv.code = ConstByteView(b::k_vs_vol, sizeof b::k_vs_vol), sp.code = ConstByteView(ps, ps_size);
+    CHECK(e.kernel.create_shader(kPid, e.dev, sv, &vs) == status::kSuccess && e.kernel.create_shader(kPid, e.dev, sp, &fs) == status::kSuccess);
+    PipelineDesc pd;
+    pd.vertex_shader = vs, pd.fragment_shader = fs, pd.vertex_stride = 28, pd.attribute_count = 2, pd.varying_count = 3, pd.texture_count = 1;
+    pd.attributes[0] = {0, graphics::VertexFormat::Float3, 0};
+    pd.attributes[1] = {1, graphics::VertexFormat::Float4, 12};
+    pd.cull_mode = graphics::CullMode::None;
+    CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &pipe) == status::kSuccess);
+    return pipe;
+  };
+  Handle volume_pipe = pipeline(b::k_ps_tex3d, sizeof b::k_ps_tex3d), plain_pipe = pipeline(b::k_ps_tex, sizeof b::k_ps_tex);
+  Handle plain = e.alloc(kTexture, Format::A8R8G8B8, 4, 4), volume = 0, target = e.alloc(kTarget, Format::A8R8G8B8, 8, 8), vb = e.buffer(kAllocVertexBuffer, 3 * 28);
+  d.kind = TextureKind::Texture3D, d.layers = 4;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, d, &volume) == status::kSuccess);
+  CHECK(write_triangle(e, vb, 0.5f, 0.5f, 0.5f));
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  auto draw_with = [&](Handle pipe, Handle texture) {
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    w.bind_pipeline(pipe);
+    w.bind_vertex_buffer(1);
+    w.push_constants(floats(identity, 16));
+    w.bind_texture(0, 2, graphics::SamplerDesc());
+    w.draw(3);
+    w.end_pass();
+    return e.render(w, {target, vb, texture});
+  };
+  CHECK(draw_with(volume_pipe, volume) == status::kSuccess);
+  CHECK(draw_with(plain_pipe, plain) == status::kSuccess);
+  CHECK(draw_with(volume_pipe, plain) == status::kInvalidParameter);
+  CHECK(draw_with(plain_pipe, volume) == status::kInvalidParameter);
+
+  // A device without the feature refuses the allocations and the shaders that need it.
+  FakeScreen screen(8, 6);
+  graphics::SoftwareDevice software(e.allocator, &screen);
+  SpyDevice limited(software);
+  limited.feature_mask = 0;
+  Kernel kernel(e.allocator);
+  AdapterConfig c;
+  c.display = &screen;
+  kernel.add_adapter(limited, c);
+  Handle adapter = 0, dev = 0, refused = 0;
+  CHECK(kernel.open_process(kPid) == status::kSuccess && kernel.open_adapter_from_index(kPid, 0, &adapter) == status::kSuccess && kernel.create_device(kPid, adapter, &dev) == status::kSuccess);
+  CHECK(kernel.create_allocation(kPid, dev, d, &refused) == status::kNotSupported);
+  ShaderDesc sp;
+  sp.kind = ShaderKind::Dxbc, sp.stage = graphics::ShaderStage::Fragment, sp.code = ConstByteView(b::k_ps_tex3d, sizeof b::k_ps_tex3d);
+  CHECK(kernel.create_shader(kPid, dev, sp, &refused) == status::kNotSupported);
+}
+
 void test_conformance() {
   test_half_floats();
   HostAllocator allocator;
@@ -3429,6 +3683,24 @@ void test_conformance() {
         if (red >= 140 && red <= 165) ++single;
       }
       CHECK(bright >= 20 && single >= 20);
+    }
+    {
+      auto px = [&](uint32_t x, uint32_t y) { return r.device_picture[y * 32 + x] & 0xFFFFFF; };
+      if (__builtin_strstr(r.name, "volume texture")) {
+        // One slice (the third, blue) over the half where the depth is fixed; where it runs, the four slices in turn (yellow, blue, green, red going down the picture), each shaded
+        // from the left (dark) to the right (light) by the gradient inside the slice.
+        CHECK(px(0, 0) == 0x585800 && px(0, 4) == 0x000058 && px(0, 8) == 0x005800 && px(0, 12) == 0x580000 && px(30, 12) == 0xdc0000);
+        CHECK(px(0, 16) == 0x000040 && px(30, 16) == 0x0000a1);
+      }
+      if (__builtin_strstr(r.name, "texture array")) CHECK(px(2, 0) == 0x402000 && px(12, 0) == 0x004020 && px(22, 0) == 0x200040);   // layers 0, 1, 2
+      if (__builtin_strstr(r.name, "cube texture"))
+        CHECK(px(2, 16) == 0xfa0000 && px(12, 16) == 0x006464 && px(22, 16) == 0x004000 && px(2, 0) == 0x640064 && px(12, 0) == 0x000064 && px(22, 0) == 0xfafa00);   // +X -X +Y, -Y +Z -Z
+    }
+    if (__builtin_strstr(r.name, "occlusion queries")) {
+      // The stripes: all 256 pixels of the open quad (red 255), half of them for the one half behind the near quad (about 128), none for the one wholly behind it.
+      const uint32_t row = 8 * 32;
+      const uint32_t open = (r.device_picture[row + 4] >> 16) & 0xFF, half = (r.device_picture[row + 16] >> 16) & 0xFF, none = (r.device_picture[row + 28] >> 16) & 0xFF;
+      CHECK(open >= 250 && half >= 124 && half <= 132 && none <= 4);
     }
     if (__builtin_strstr(r.name, "multiple render targets")) {
       // Even columns come from target 0 (the vertex colour), odd ones from target 1 (red and blue swapped): across a pair of neighbours the red of one is the blue of the other.
@@ -4527,6 +4799,8 @@ int main() {
   test_ps1();
   test_device_suite();
   test_conformance();
+  test_occlusion_queries();
+  test_texture_kinds();
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);
     return 1;

@@ -52,9 +52,10 @@ while [ ${#pending[@]} -gt 0 ] && [ $round -lt 40 ]; do
   files+=("$PWD/$out/winerun.txt")
   # kernel32 tests load a program from System32 (winver.exe) as a library: any program image will do
   cp "$out/winerun.exe" "$out/winver.exe"; files+=("$PWD/$out/winver.exe")
+  cp "$out/winerun.exe" "$out/explorer.exe"; files+=("$PWD/$out/explorer.exe")      # (C:\Windows\explorer.exe: another program image to load)
   cat > "$out/qemu.sh" <<'QEMU'
 #!/bin/sh
-# Runs QEMU without a display until the program prints WINERUN DONE, the debug console is silent for 90 s, or 40 minutes pass; then stops it.
+# Runs QEMU without a display until the program prints WINERUN DONE, the debug console is silent for ${WINETEST_QUIET:-90} s, or 40 minutes pass; then stops it.
 log=$(dirname "$0")/../debugcon.log
 /usr/bin/qemu-system-x86_64 -display none -enable-kvm "$@" >/dev/null 2>&1 &
 pid=$!
@@ -64,7 +65,7 @@ while kill -0 $pid 2>/dev/null && [ $n -lt 2400 ]; do
   size=$(stat -c %s "$log" 2>/dev/null || echo 0)
   if grep -q "=== .* start" "$log" 2>/dev/null; then
     if [ "$size" = "$last" ]; then quiet=$((quiet+1)); else quiet=0; last=$size; fi
-    [ $quiet -ge 90 ] && break
+    [ $quiet -ge ${WINETEST_QUIET:-90} ] && break
   fi
   sleep 1; n=$((n+1))
 done

@@ -674,9 +674,15 @@ static LDR_DATA_TABLE_ENTRY *module_by_base(PVOID base) {
   return NULL;
 }
 /* A library by name, with or without ".dll", in any case ("KERNEL32", "kernel32.dll"). */
+static BOOL actctx_redirect(LPCWSTR name, WCHAR *out, DWORD capacity);
 static LDR_DATA_TABLE_ENTRY *module_by_name(LPCWSTR name) {
   PEB_LDR_DATA *ldr = NtCurrentPeb()->Ldr;
   if (!ldr) return NULL;
+  /* a bare name that the active activation context redirects is the library of that file; otherwise the libraries of contexts are not seen under their names */
+  WCHAR redirected[PATH_CHARS];
+  BOOL bare = TRUE;
+  for (const WCHAR *c = name; *c; ++c) if (*c == '\\' || *c == '/') bare = FALSE;
+  const BOOL has_redirect = bare && actctx_redirect(name, redirected, PATH_CHARS);
   size_t_ length = wcslen(name);
   /* A path: only the file name counts. */
   for (size_t_ i = 0; i < length; ++i) if (name[i] == '\\' || name[i] == '/') { name += i + 1; length -= i + 1; i = (size_t_)-1; }
@@ -691,7 +697,15 @@ static LDR_DATA_TABLE_ENTRY *module_by_name(LPCWSTR name) {
     if (compare != length) continue;
     size_t_ i = 0;
     while (i < length && upper(base[i]) == upper(name[i])) ++i;
-    if (i == length) return m;
+    if (i != length) continue;
+    if (has_redirect) {      /* only the library of that file */
+      const WCHAR *full = m->FullDllName.Buffer;
+      size_t_ k = 0;
+      const size_t_ full_length = m->FullDllName.Length / 2;
+      while (k < full_length && redirected[k] && upper(full[k]) == upper(redirected[k])) ++k;
+      if (!(m->Flags & 0x10000000) || k != full_length || redirected[k]) continue;
+    } else if (m->Flags & 0x10000000) continue;
+    return m;
   }
   return NULL;
 }
@@ -920,6 +934,14 @@ static HMODULE load_library_ex(LPCWSTR name, HANDLE file, DWORD flags) {
   if (file || !name || !name[0]) { set_error(ERROR_INVALID_PARAMETER); return NULL; }      /* (the file handle is reserved) */
   WCHAR path[PATH_CHARS];
   UNICODE_STRING us;
+  if (!(flags & 0x62) && !has_separator(name) && actctx_redirect(name, path, PATH_CHARS)) {      /* a library of the active activation context: that file, as a library of its own */
+    PVOID handle = NULL;
+    ULONG ldr_flags = ((flags & 1) ? 2 : 0) | 0x40000000;
+    unicode_string(&us, path);
+    const NTSTATUS status = LdrLoadDll(NULL, &ldr_flags, &us, &handle);
+    if (!NT_SUCCESS(status)) { set_error(dos_error_of_load(status)); return NULL; }
+    return (HMODULE)handle;
+  }
   /* The file, if there is one; otherwise the bare name (a library the process has already may be known by an alias, "api-ms-win-crt-runtime-l1-1-0.dll"): the kernel knows
      which libraries are loaded, and decides under the loader lock. */
   static const WCHAR dll[] = {'.', 'd', 'l', 'l', 0};
@@ -945,6 +967,7 @@ static HMODULE load_library_ex(LPCWSTR name, HANDLE file, DWORD flags) {
     if (entry) us = entry->FullDllName;
   }
   if ((flags & 0x62) && has_separator(name) && !path[0] && !search) { set_error(ERROR_FILE_NOT_FOUND); return NULL; }      /* (a file named with a folder has to be there) */
+  if ((flags & 0x62) && GetModuleHandleW(path[0] ? path : name) == (HMODULE)NtCurrentPeb()->ImageBaseAddress) return (HMODULE)NtCurrentPeb()->ImageBaseAddress;      /* (the program is not loaded a second time) */
   if ((flags & 0x62) && !GetModuleHandleW(path[0] ? path : name)) {      /* AS_DATAFILE 2, AS_DATAFILE_EXCLUSIVE 0x40, AS_IMAGE_RESOURCE 0x20: the file is only mapped (a loaded library is used as it is) */
     if (!path[0]) { set_error(has_separator(name) ? ERROR_FILE_NOT_FOUND : ERROR_MOD_NOT_FOUND); return NULL; }
     const BOOL exclusive = (flags & 0x40) != 0;      /* AS_DATAFILE_EXCLUSIVE: nobody else may write the file while it is loaded */
@@ -1323,6 +1346,15 @@ EXPORT DWORD WINAPI QueueUserAPC(void (WINAPI *function)(ULONG_PTR), HANDLE thre
   if (!NT_SUCCESS(status)) { fail_nt(status); return 0; }
   return 1;
 }
+/* QueueUserAPC2: flags 0 is QueueUserAPC; 1 (special user APC) runs in the thread at once - here, in the calling thread, when that is the target, and otherwise as an ordinary one. */
+EXPORT DWORD WINAPI GetThreadId(HANDLE thread);
+EXPORT DWORD WINAPI GetCurrentThreadId(void);
+EXPORT BOOL WINAPI QueueUserAPC2(void (WINAPI *function)(ULONG_PTR), HANDLE thread, ULONG_PTR parameter, DWORD flags) {
+  if (flags > 1) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (!QueueUserAPC(function, thread, parameter)) return FALSE;
+  if ((flags & 1) && (thread == (HANDLE)(LONG_PTR)-2 || GetThreadId(thread) == GetCurrentThreadId())) NtTestAlert();
+  return TRUE;
+}
 static BOOL pipe_start_overlapped(int op, HANDLE h, LPVOID buffer, DWORD length, LPOVERLAPPED overlapped, void (WINAPI *routine)(DWORD, DWORD, LPOVERLAPPED));
 /* ReadFileEx / WriteFileEx: the operation is done at once; the completion routine is an APC for this thread, called when it next waits alertably. */
 typedef void (WINAPI *LPOVERLAPPED_COMPLETION_ROUTINE_)(DWORD, DWORD, LPOVERLAPPED);
@@ -1629,11 +1661,35 @@ EXPORT DWORD WINAPI WaitForMultipleObjects(DWORD count, const HANDLE *handles, B
 /* ---- threads ------------------------------------------------------------------------------------------------------------------------------------------------- */
 
 #define STACK_SIZE_PARAM_IS_A_RESERVATION 0x10000
+IMPORT NTSTATUS NTAPI RtlGetActiveActivationContext(PVOID *);
+IMPORT NTSTATUS NTAPI RtlActivateActivationContext(ULONG, PVOID, ULONG_PTR *);
+IMPORT VOID NTAPI RtlReleaseActivationContext(PVOID);
+/* A thread starts with the activation context that was active in the thread that made it. */
+typedef struct ActThreadStart { LPTHREAD_START_ROUTINE start; LPVOID parameter; PVOID context; } ActThreadStart;
+static DWORD WINAPI actctx_thread_start(LPVOID p) {
+  ActThreadStart a = *(ActThreadStart *)p;
+  RtlFreeHeap(heap(), 0, p);
+  ULONG_PTR cookie;
+  RtlActivateActivationContext(0, a.context, &cookie);
+  RtlReleaseActivationContext(a.context);      /* (the frame keeps its own use of it) */
+  return a.start(a.parameter);
+}
 EXPORT HANDLE WINAPI CreateThread(LPSECURITY_ATTRIBUTES sa, SIZE_T stack, LPTHREAD_START_ROUTINE start, LPVOID parameter, DWORD flags, LPDWORD id) {
   (void)sa;
   HANDLE thread = NULL;
+  PVOID active = NULL;
+  RtlGetActiveActivationContext(&active);
+  if (active) {
+    ActThreadStart *a = RtlAllocateHeap(heap(), 0, sizeof(*a));
+    if (a) { a->start = start; a->parameter = parameter; a->context = active; start = actctx_thread_start; parameter = a; }
+    else { RtlReleaseActivationContext(active); active = NULL; }
+  }
   const NTSTATUS status = NtCreateThreadEx(&thread, 0x1FFFFF, NULL, NtCurrentProcess(), (PVOID)start, parameter, (flags & CREATE_SUSPENDED) ? 1 : 0, 0, stack, stack, NULL);
-  if (!NT_SUCCESS(status)) { set_error(status == STATUS_NOT_IMPLEMENTED ? ERROR_NOT_SUPPORTED : RtlNtStatusToDosError(status)); return NULL; }
+  if (!NT_SUCCESS(status)) {
+    if (active) { RtlReleaseActivationContext(active); RtlFreeHeap(heap(), 0, parameter); }
+    set_error(status == STATUS_NOT_IMPLEMENTED ? ERROR_NOT_SUPPORTED : RtlNtStatusToDosError(status));
+    return NULL;
+  }
   if (id) {
     ULONG64 info[6];
     *id = NT_SUCCESS(NtQueryInformationThread(thread, 0, info, sizeof(info), NULL)) ? (DWORD)info[3] : 0;
@@ -3545,3 +3601,5 @@ EXPORT BOOL WINAPI DllMain(HANDLE module, DWORD reason, PVOID reserved) {
 #include "fmtmsg.inc"
 #include "time.inc"
 #include "nls.inc"
+#include "actctx.inc"
+#include "rsrcupdate.inc"

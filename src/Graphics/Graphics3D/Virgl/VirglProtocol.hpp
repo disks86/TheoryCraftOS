@@ -40,6 +40,9 @@ enum Command : uint32_t {
   kSetBlendColor,
   kSetScissorState,
   kBindSamplerStates = 18,
+  kBeginQuery = 19,
+  kEndQuery = 20,
+  kGetQueryResult = 21,
   kBindShader = 31,
 };
 
@@ -52,6 +55,7 @@ enum ObjectType : uint32_t {
   kObjectSamplerView,
   kObjectSamplerState,
   kObjectSurface,
+  kObjectQuery,
 };
 
 constexpr uint32_t header(uint32_t command, uint32_t object, uint32_t length_dwords) {
@@ -75,11 +79,14 @@ constexpr uint32_t kBindRenderTarget = 1u << 1;
 constexpr uint32_t kBindSamplerView = 1u << 3;
 constexpr uint32_t kBindVertexBuffer = 1u << 4;
 constexpr uint32_t kBindIndexBuffer = 1u << 5;
+constexpr uint32_t kBindCustom = 1u << 17;   // a buffer kept in the host's system memory: where query results are written (read back with a transfer)
 constexpr uint32_t kBindScanout = 1u << 18;
 
 // Gallium enums.
+constexpr uint32_t kQueryOcclusionCounter = 0;   // PIPE_QUERY_OCCLUSION_COUNTER
+constexpr uint32_t kQueryStateDone = 1;         // virgl_host_query_state::query_state once the host wrote the result (state, size, 64-bit result: 16 bytes)
 constexpr uint32_t kTargetBuffer = 0;
-constexpr uint32_t kTargetTexture2d = 2;
+constexpr uint32_t kTargetTexture2d = 2, kTargetTexture3d = 3, kTargetTextureCube = 4, kTargetTexture2dArray = 7;   // (PIPE_TEXTURE_*)
 constexpr uint32_t kShaderVertex = 0;
 constexpr uint32_t kShaderFragment = 1;
 constexpr uint32_t kPrimPoints = 0, kPrimLines = 1, kPrimTriangles = 4;
