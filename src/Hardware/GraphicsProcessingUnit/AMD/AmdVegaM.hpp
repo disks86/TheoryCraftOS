@@ -192,11 +192,16 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
     DpLinkTrainer::Outcome outcome;
   };
   bool train_link(const AtomConnectors::Connector& connector, uint32_t pixel_clock_khz, uint32_t bpc, LinkTraining* out);
+  // A link that was trained (train_link succeeded) is remembered by its hot plug pin with the mode it was trained for, so service_short_pulses() can train it again when the sink loses it.
+  // The memory is dropped when the sink stops answering or a retraining fails (the next train_link starts it again), and a link is retrained at most kMaxRetrains times in a row
+  // (a healthy status check starts the count again).
+  static constexpr uint32_t kMaxRetrains = 4;
+  bool link_trained(uint32_t pin) const { return pin < amd_dce11::Interrupts::kMaxHpd && trained_[pin].valid; }
   // The short pulse of a DisplayPort sink (a status change that is not a plug: the link was lost, or the sink asks for a test) is taken by the interrupt handler as a pin to look at
   // (`pending_short_pulses()`: bit n for pin n). The look is the AUX channel's, which takes some milliseconds, so it is not done there: service_short_pulses() does it, from the desktop loop.
   // For each pending pin, lowest first, up to `capacity` of them, it reads the sink's link configuration (DP_LANE_COUNT_SET) and status (the lane training status, the alignment, the service
   // interrupt vector) and reports what a driver's short pulse handler decides on: the link is lost when it was set up for lanes and does not pass drm_dp_channel_eq_ok for them (retrain),
-  // an automated test request is made when the sink asks for one. The returned events are in `out`; pins past `capacity` stay pending. Not done: the retraining.
+  // an automated test request is made when the sink asks for one. A lost link that train_link() had trained is trained again, for the same mode (see kMaxRetrains). The returned events are in `out`; pins past `capacity` stay pending.
   struct SinkEvent {
     uint32_t pin = 0;
     bool has_connector = false;
@@ -215,6 +220,9 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
     uint8_t test_kind = 0;            // DP_TEST_REQUEST
     uint8_t test_response = 0;        // DP_TEST_RESPONSE as written (Dpcd::kTestAck | kTestEdidChecksumWrite, or kTestNak); 0 if none was given
     bool handling_failed = false;     // a read or write of the above did not go through
+    bool retrained = false;           // the link was lost, had been trained by train_link, and was trained again (`retrain` says how)
+    bool retrain_limit = false;       // lost, but kMaxRetrains retrainings in a row did not hold it: left alone
+    LinkTraining retrain;
   };
   uint32_t pending_short_pulses() const { return rx_pending_; }
   uint32_t service_short_pulses(SinkEvent* out, uint32_t capacity);
@@ -328,6 +336,11 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
   void power_up_panel(const AtomConnectors::Connector& connector, IAtomHost& host, AtomBios& bios);   // an eDP panel's power, before its AUX channel is used
   uint32_t audio_pins_ = 0;
   uint32_t rx_pending_ = 0;
+  struct Trained {
+    bool valid = false;
+    uint32_t pixel_clock_khz = 0, bpc = 0, retrains = 0;
+  };
+  Trained trained_[amd_dce11::Interrupts::kMaxHpd];
   uint32_t hotplug_head_ = 0, hotplug_count_ = 0, hotplug_dropped_ = 0, connected_pins_ = 0, throttle_reported_ = 0;
   AmdIrq::ISink* observer_ = nullptr;
   UniquePointer<AmdGfx8Compute> compute_;

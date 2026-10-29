@@ -2151,6 +2151,100 @@ static void test_read_dpcd() {
   CHECK(!vega.read_dpcd(dp, &caps));
 }
 
+// A DisplayPort link that train_link trained and the sink then loses is trained again by service_short_pulses, for the same mode; a link that was never trained, one that holds, a sink
+// that went away, a retraining that fails, and one that is lost again and again are left alone.
+static void test_retrain_on_short_pulse() {
+  const std::vector<uint8_t> vbios = make_connector_vbios();   // eDP (pin 0), HDMI-A (pin 1), DisplayPort (0x93, pin 2, DIG 3)
+  Rig rig;
+  FakeAuxCard auxcard;
+  AmdVegaM vega(rig.alloc);
+  AmdVegaM::Inputs in = rig.inputs();
+  in.hpd_pins = 0x3F;
+  in.vbios = ConstByteView(vbios.data(), vbios.size());
+  CHECK(vega.bring_up(in));
+  if (!vega.up()) return;
+  rig.card.aux = &auxcard;
+  const AtomConnectors::Connector dp = vega.connectors()[2];
+  std::vector<uint8_t>& dpcd = auxcard.sink.dpcd;
+  dpcd.assign(0x800, 0);
+  const uint8_t caps[8] = {0x12, 0x14, 0xC4, 0x01, 0x00, 0x00, 0x01, 0x00};
+  for (size_t i = 0; i < 8; ++i) dpcd[i] = caps[i];
+  dpcd[0x202] = dpcd[0x203] = 0x77;
+  dpcd[0x204] = 0x01;
+  for (uint32_t pin = 0; pin < 6; ++pin) rig.card.gfx.set_reg(0x1899 + 8 * pin, rig.card.gfx.reg(0x1899 + 8 * pin) & ~0x100000u);
+  auto pulse = [&](uint32_t pin) {
+    rig.card.gfx.set_reg(0x1898 + 8 * pin, 0x100);
+    rig.card.ih.post(42, 6 + pin, 0, 0, 0);
+    return vega.service_interrupts();
+  };
+  // the sink recovers its clock again once the training starts (pattern 1)
+  bool heals = true;
+  auxcard.sink.after_write = [&](uint32_t address, const std::vector<uint8_t>& bytes) {
+    if (heals && address == 0x102 && bytes.size() == 1 && bytes[0] == 0x01) dpcd[0x202] = dpcd[0x203] = 0x77;
+  };
+  AmdVegaM::SinkEvent ev[8];
+  // never trained: a lost link is reported, not trained
+  CHECK(!vega.link_trained(2) && !vega.link_trained(6) && !vega.link_trained(0xFFFFFFFFu));
+  dpcd[0x101] = 2;
+  dpcd[0x202] = 0x70;
+  auxcard.dig_calls.clear();
+  CHECK(pulse(2) == 1 && vega.service_short_pulses(ev, 8) == 1 && ev[0].link_lost && !ev[0].retrained && !ev[0].retrain_limit && auxcard.dig_calls.empty());
+  // trained for 1080p60 at 8 bits (two lanes at 2.7 Gbit/s)
+  dpcd[0x202] = 0x77;
+  AmdVegaM::LinkTraining t;
+  CHECK(vega.train_link(dp, 148500, 8, &t) && vega.link_trained(2) && !vega.link_trained(1));
+  // a healthy status check does nothing
+  auxcard.dig_calls.clear();
+  CHECK(pulse(2) == 1 && vega.service_short_pulses(ev, 8) == 1 && !ev[0].link_lost && !ev[0].retrained && auxcard.dig_calls.empty());
+  // lost: trained again, for the same mode, and the event says so
+  dpcd[0x202] = 0x70;
+  auxcard.sink.dpcd_writes.clear();
+  CHECK(pulse(2) == 1 && vega.service_short_pulses(ev, 8) == 1);
+  CHECK(ev[0].link_lost && ev[0].retrained && !ev[0].retrain_limit && ev[0].retrain.outcome.trained() && ev[0].retrain.config.lanes == 2 && ev[0].retrain.config.rate_khz == 270000);
+  CHECK(!auxcard.dig_calls.empty() && auxcard.dig_calls[0].table == 1 && (auxcard.dig_calls[0].words[0] & 0xFFFF) == 14850);
+  CHECK(dpcd[0x202] == 0x77 && vega.link_trained(2));
+  // the mode it was trained for is the one used again: 4K60 at 10 bits
+  CHECK(vega.train_link(dp, 594000, 10, &t) && t.config.lanes == 4);
+  dpcd[0x101] = 4;
+  dpcd[0x202] = 0x70;
+  CHECK(pulse(2) == 1 && vega.service_short_pulses(ev, 8) == 1 && ev[0].retrained && ev[0].retrain.config.lanes == 4 && ev[0].retrain.config.rate_khz == t.config.rate_khz);
+  // lost again and again: kMaxRetrains in a row, then left alone
+  for (uint32_t i = 1; i < AmdVegaM::kMaxRetrains; ++i) {
+    dpcd[0x101] = 4;
+    dpcd[0x202] = 0x70;
+    CHECK(pulse(2) == 1 && vega.service_short_pulses(ev, 8) == 1 && ev[0].retrained);
+  }
+  dpcd[0x101] = 4;
+  dpcd[0x202] = 0x70;
+  auxcard.dig_calls.clear();
+  CHECK(pulse(2) == 1 && vega.service_short_pulses(ev, 8) == 1 && ev[0].link_lost && !ev[0].retrained && ev[0].retrain_limit && auxcard.dig_calls.empty());
+  // ... a healthy check starts the count again
+  dpcd[0x202] = 0x77;
+  CHECK(pulse(2) == 1 && vega.service_short_pulses(ev, 8) == 1 && !ev[0].link_lost && !ev[0].retrain_limit);
+  dpcd[0x202] = 0x70;
+  CHECK(pulse(2) == 1 && vega.service_short_pulses(ev, 8) == 1 && ev[0].retrained && ev[0].retrain.outcome.trained());
+  // a retraining that fails drops the memory (the next loss is only reported)
+  heals = false;
+  dpcd[0x101] = 4;
+  dpcd[0x202] = 0x70;
+  CHECK(pulse(2) == 1 && vega.service_short_pulses(ev, 8) == 1 && ev[0].retrained && !ev[0].retrain.outcome.trained() && !vega.link_trained(2));
+  auxcard.dig_calls.clear();
+  CHECK(pulse(2) == 1 && vega.service_short_pulses(ev, 8) == 1 && ev[0].link_lost && !ev[0].retrained && !ev[0].retrain_limit && auxcard.dig_calls.empty());
+  // a sink that stops answering drops it too
+  heals = true;
+  dpcd[0x202] = 0x77;
+  CHECK(vega.train_link(dp, 148500, 8, &t) && vega.link_trained(2));
+  auxcard.sink.timeouts = 1000;
+  CHECK(pulse(2) == 1 && vega.service_short_pulses(ev, 8) == 1 && ev[0].read_failed && !ev[0].retrained && !vega.link_trained(2));
+  auxcard.sink.timeouts = 0;
+  // a failed train_link forgets an earlier one
+  CHECK(vega.train_link(dp, 148500, 8, &t) && vega.link_trained(2));
+  dpcd[0x202] = dpcd[0x203] = 0;
+  heals = false;
+  CHECK(!vega.train_link(dp, 148500, 8, &t) && !vega.link_trained(2));
+  vega.shutdown();
+}
+
 // The short pulse of a DisplayPort sink: queued by the interrupt handler, looked at over the AUX channel by service_short_pulses (link lost when the link set up for lanes is not in sync,
 // an automated test request, the other service interrupts, a sink that does not answer, pins that are no DisplayPort connectors).
 static void test_short_pulse_status() {
@@ -2473,6 +2567,7 @@ int main() {
   test_read_dpcd();
   test_train_link();
   test_short_pulse_status();
+  test_retrain_on_short_pulse();
   printf(g_failed ? "AmdVegaMTest: %d FAILED\n" : "AmdVegaMTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }

@@ -738,7 +738,12 @@ byte of its last 128-byte block goes to `DP_TEST_EDID_CHECKSUM` (0x261) and the 
 request, several bits, or an EDID that cannot be read) is answered NAK (0x02), because there is no trained link or pattern generator to run them on. A read or write that did not go through is `handling_failed`.
 `AmdAux::dpcd_write` (a native write, 12 bytes at a time) is what writes; `IDpcdAux` gained it.
 
-Not done: the retraining itself (there is no link training yet; the boot firmware's link is what is judged, and a card that has not trained one has `lanes` 0 and cannot lose it), the other tests (training, video pattern with the test timing
+Retraining: `train_link` remembers a link it trained (by hot plug pin, with the pixel clock and bits per colour), and `service_short_pulses` trains it again for the same mode when the check says
+the link is lost (`SinkEvent::retrained`, with the new `LinkTraining` in `retrain`). A link `train_link` never trained is only reported (the boot firmware's link is judged, and a card that has not trained
+one has `lanes` 0 and cannot lose it). The memory is dropped when the sink stops answering, when a retraining fails, or when a `train_link` fails; at most `kMaxRetrains` (4) retrainings in a row are made
+(`retrain_limit`), a healthy check starts the count again. `AmdVegaMTest::test_retrain_on_short_pulse` (a sink that recovers its clock when pattern 1 starts, `FakeAuxSink::after_write`) covers it.
+
+Not done: the other tests (training, video pattern with the test timing
 registers 0x219.., PHY patterns), and the MST message and the downstream port changes. Addresses and bit meanings are from memory, like the rest of the DPCD. `AmdVegaMTest::test_short_pulse_status` (healthy link, a lost lane, a lane beyond the ones in use, an untrained link, lost alignment, each
 service interrupt, the eDP panel, a sink that times out or ends before the status, HDMI and an unknown pin, capacity and order, the dropped state) and `DpcdTest::test_lane_count` cover it.
 
