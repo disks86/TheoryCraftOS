@@ -410,7 +410,30 @@ EXPORT DWORD WINAPI GetEnvironmentVariableA(LPCSTR name, LPSTR buffer, DWORD cap
   const WCHAR *value = find_variable(parameters()->Environment, w, &length);
   free_wide(w);
   if (!value) { set_error(ERROR_ENVVAR_NOT_FOUND); return 0; }
+  if (length == 0) {      /* a variable with an empty value: no error, the size with the end mark is 1 */
+    if (capacity == 0) return 1;
+    buffer[0] = 0;
+    return 0;
+  }
   return wide_result_to_ansi(value, (DWORD)length, buffer, capacity);
+}
+/* The whole block of the process is replaced by `block` (NAME=value entries ended by an empty one); an entry needs a name before its first '='. */
+EXPORT BOOL WINAPI SetEnvironmentStringsW(LPWSTR block) {
+  if (!block) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  size_t_ units = 0;
+  for (const WCHAR *e = block; *e; e += wcslen(e) + 1) {
+    const WCHAR *eq = e + 1;      /* (a name may start with '=': "=C:=C:\") */
+    while (*eq && *eq != '=') ++eq;
+    if (!*eq || eq == e) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+    units += wcslen(e) + 1;
+  }
+  WCHAR *fresh = RtlAllocateHeap(heap(), 0, (units + 2) * 2);
+  if (!fresh) { set_error(ERROR_NOT_ENOUGH_MEMORY); return FALSE; }
+  memcpy(fresh, block, units * 2);
+  fresh[units] = 0;
+  fresh[units + 1] = 0;
+  parameters()->Environment = fresh;
+  return TRUE;
 }
 /* Builds a new block with NAME set (or removed when value is NULL) and points the process parameters at it. */
 EXPORT BOOL WINAPI SetEnvironmentVariableW(LPCWSTR name, LPCWSTR value) {
