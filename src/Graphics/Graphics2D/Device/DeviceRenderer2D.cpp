@@ -389,9 +389,15 @@ bool DeviceRenderer2D::draw_mask_textured(const MaskView& mask, int64_t ddx, int
 
 // One rectangle at (dx, dy), w x h pixels, showing the part (u0, v0)-(u1, v1) of the image: drawn at once, in a submit of its own after what was recorded before it.
 bool DeviceRenderer2D::draw_textured_quad(IImage& image, int64_t dx, int64_t dy, uint32_t w, uint32_t h, float u0, float v0, float u1, float v1) {
-  if (!submit_pending()) return false;
   const float x0 = static_cast<float>(dx), y0 = static_cast<float>(dy), x1 = x0 + static_cast<float>(w), y1 = y0 + static_cast<float>(h);
-  const TexturedVertex quad[6] = {{{x0, y0, 0}, {u0, v0}}, {{x1, y0, 0}, {u1, v0}}, {{x1, y1, 0}, {u1, v1}}, {{x0, y0, 0}, {u0, v0}}, {{x1, y1, 0}, {u1, v1}}, {{x0, y1, 0}, {u0, v1}}};
+  const float xs[4] = {x0, x1, x1, x0}, ys[4] = {y0, y0, y1, y1};
+  return draw_textured_corners(image, xs, ys, u0, v0, u1, v1, Filter::Nearest);   // (nearest at the pixel centres: the picture's own pixels)
+}
+
+bool DeviceRenderer2D::draw_textured_corners(IImage& image, const float xs[4], const float ys[4], float u0, float v0, float u1, float v1, Filter filter) {
+  if (!submit_pending()) return false;
+  const TexturedVertex tl{{xs[0], ys[0], 0}, {u0, v0}}, tr{{xs[1], ys[1], 0}, {u1, v0}}, br{{xs[2], ys[2], 0}, {u1, v1}}, bl{{xs[3], ys[3], 0}, {u0, v1}};
+  const TexturedVertex quad[6] = {tl, tr, br, tl, br, bl};
   const ArrayView<TexturedVertex> mapped = texture_vertices_->map().cast<TexturedVertex>();
   if (mapped.size() < 6) return false;
   mapped.copy_from(ArrayView<const TexturedVertex>(quad, 6));
@@ -404,7 +410,8 @@ bool DeviceRenderer2D::draw_textured_quad(IImage& image, int64_t dx, int64_t dy,
   commands_->begin_render_pass(pass);
   commands_->bind_pipeline(blend_ == BlendMode::Alpha ? texture_blended_ : texture_opaque_);
   commands_->bind_vertex_buffer(texture_vertices_);
-  SamplerDesc sampler;   // (nearest at the pixel centres: the picture's own pixels)
+  SamplerDesc sampler;
+  sampler.filter = filter;
   sampler.address_u = sampler.address_v = AddressMode::ClampToEdge;
   commands_->bind_texture(0, &image, sampler);
   ColoredConstants constants;
@@ -419,6 +426,38 @@ bool DeviceRenderer2D::draw_textured_quad(IImage& image, int64_t dx, int64_t dy,
   commands_->draw(6);
   commands_->end_render_pass();
   return commands_->end() && device_.submit(commands_);
+}
+
+bool DeviceRenderer2D::draw_image_transformed(const Surface& s, const Rect2D& rect, const Matrix2D& m, ImageFilter filter) {
+  if (!valid_ || !s.valid() || !texture_blended_ || !texture_opaque_ || !texture_vertices_ || opacity_ != 1.0f) return false;
+  const float det = m.a * m.d - m.b * m.c;
+  if (!(det > 1e-12f || det < -1e-12f)) return false;
+  // the part of the picture that exists
+  const int64_t sx0 = rect.x > 0 ? rect.x : 0, sy0 = rect.y > 0 ? rect.y : 0;
+  const int64_t sx1 = int64_t{rect.x} + rect.width < s.width ? int64_t{rect.x} + rect.width : s.width;
+  const int64_t sy1 = int64_t{rect.y} + rect.height < s.height ? int64_t{rect.y} + rect.height : s.height;
+  if (sx0 >= sx1 || sy0 >= sy1) return true;
+  const uint32_t w = static_cast<uint32_t>(sx1 - sx0), h = static_cast<uint32_t>(sy1 - sy0);
+  const uint64_t count = uint64_t{w} * h;
+  if (!prepare_rows(count)) return false;
+  const ArrayView<uint32_t> rows = texture_rows_.first(count);
+  for (uint32_t j = 0; j < h; ++j) {
+    const ArrayView<const uint32_t> from = ArrayView<const uint32_t>(s.row(static_cast<uint32_t>(sy0) + j), s.width).subview(static_cast<uint64_t>(sx0), w);
+    const ArrayView<uint32_t> to = rows.subview(uint64_t{j} * w, w);
+    if (s.format == Format::B8G8R8A8Unorm) to.copy_from(from);
+    else
+      for (uint32_t i = 0; i < w; ++i) to[i] = s.decode(from[i]);
+  }
+  if (!submit_pending() || !ensure_texture(w, h) || !texture_->write_pixels(ArrayView<const uint32_t>(texture_rows_.data(), count))) return false;
+  // the corners of what exists, measured from the rectangle's top left corner
+  const float ox = static_cast<float>(sx0 - rect.x), oy = static_cast<float>(sy0 - rect.y), fw = static_cast<float>(w), fh = static_cast<float>(h);
+  const float lx[4] = {ox, ox + fw, ox + fw, ox}, ly[4] = {oy, oy, oy + fh, oy + fh};
+  float xs[4], ys[4];
+  for (int i = 0; i < 4; ++i) {
+    xs[i] = m.a * lx[i] + m.c * ly[i] + m.e;
+    ys[i] = m.b * lx[i] + m.d * ly[i] + m.f;
+  }
+  return draw_textured_corners(*texture_, xs, ys, 0.0f, 0.0f, 1.0f, 1.0f, filter == ImageFilter::Nearest ? Filter::Nearest : Filter::Linear);
 }
 
 bool DeviceRenderer2D::draw_device_image(IGraphicsDevice& owner, IImage& image, const Rect2D& rect, int32_t x, int32_t y) {

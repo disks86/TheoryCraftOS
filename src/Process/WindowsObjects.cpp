@@ -315,6 +315,13 @@ uint32_t wait_for(Process& p, const Waitable* items, uint32_t count, bool all, u
       left = timeout_ns - used;
     }
     if (p.exited() || (runtime && runtime->interrupted())) { sync.unlock(); return kAlerted; }
+    if (runtime) {      // asked to suspend while it waits: it stops here (its registers can be had) and goes on waiting when it is resumed
+      sync.unlock();
+      const int parked = runtime->park_point();
+      sync.lock();
+      if (parked == 2) { sync.unlock(); return kAlerted; }
+      if (parked == 1) continue;
+    }
     {      // wake up when a timer that is waited for (or one that will queue an APC) is due
       const uint64_t now = sync.now_ns();
       uint64_t due = alertable ? objects->thread_timer_deadline_locked(waiter) : ~uint64_t{0};

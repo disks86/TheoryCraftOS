@@ -273,8 +273,10 @@ Frame* on_syscall(Frame* frame, void*) {
   regs.rax = frame->rax; regs.rcx = frame->rcx; regs.rdx = frame->rdx; regs.rbx = frame->rbx; regs.rsp = frame->rsp; regs.rbp = frame->rbp;
   regs.rsi = frame->rsi; regs.rdi = frame->rdi; regs.r8 = frame->r8; regs.r9 = frame->r9; regs.r10 = frame->r10; regs.r11 = frame->r11;
   process::SyscallRequest request;
+  self->syscall_frame = frame;
   if (process::decode_x86_64(process->abi(), regs, &request)) frame->rax = process->syscall(request);
   else frame->rax = ~uint64_t{37};      // -ENOSYS
+  self->syscall_frame = nullptr;
   uint64_t fs = 0, gs = 0;
   const bool fs_changed = process->take_fs_change(&fs), gs_changed = process->take_gs_change(&gs);
   if (fs_changed || gs_changed) set_current_user_bases(fs_changed, fs, gs_changed, gs);      // arch_prctl
@@ -390,6 +392,10 @@ Frame* on_user_fault(Frame* frame) {
   }
   // A Windows program gets its exception delivered, to be handled by SEH or C++ code (or to end up in ntdll's last resort); only when that cannot be done is the program stopped.
   process::Process* process = task->program.process();
+  if ((frame->vector & 0xFF) == 13 && frame->error == 0x16A && frame->rax == 1 && process->abi() == process::SyscallAbi::Windows) {      // INT 2D, service 1 (a prompt): nothing to do
+    frame->rip += 2;
+    return frame;
+  }
   if (process->abi() == process::SyscallAbi::Windows && process->exception_dispatcher() != 0) {
     process::X86Context at, entry;
     frame_to_context(*frame, &at);
@@ -576,6 +582,11 @@ void Task::request_suspend(uint64_t id) {
 void Task::request_resume(uint64_t id) {
   if (UserThread* t = find_thread(id)) __atomic_store_n(&t->suspend_requested, false, __ATOMIC_RELEASE);
   changed.notify_all();
+}
+int Task::park_point() {
+  UserThread* ut = current_user_thread();
+  if (!ut || ut->task != this || !ut->syscall_frame || !__atomic_load_n(&ut->suspend_requested, __ATOMIC_ACQUIRE)) return 0;
+  return stop_point(ut, ut->syscall_frame) ? 2 : 1;
 }
 bool Task::is_parked(uint64_t id) {
   UserThread* t = find_thread(id);
