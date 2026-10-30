@@ -451,37 +451,12 @@ EXPORT BOOL WINAPI SetEnvironmentStringsW(LPWSTR block) {
   return TRUE;
 }
 /* Builds a new block with NAME set (or removed when value is NULL) and points the process parameters at it. */
+IMPORT NTSTATUS NTAPI RtlSetEnvironmentVar(PWSTR *penv, PCWSTR name, SIZE_T name_len, PCWSTR value, SIZE_T value_len);
 EXPORT BOOL WINAPI SetEnvironmentVariableW(LPCWSTR name, LPCWSTR value) {
   if (!name || !*name || wcslen(name) > 32767) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
   for (const WCHAR *c = name; *c; ++c) if (*c == '=') { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
-  const WCHAR *old = parameters()->Environment;
-  size_t_ old_units = 0;
-  while (old[old_units] || old[old_units + 1]) ++old_units;
-  old_units += 2;
-  const size_t_ name_length = wcslen(name), value_length = value ? wcslen(value) : 0;
-  WCHAR *fresh = RtlAllocateHeap(heap(), 0, (old_units + name_length + value_length + 4) * 2);
-  if (!fresh) { set_error(ERROR_NOT_ENOUGH_MEMORY); return FALSE; }
-  size_t_ out = 0;
-  for (const WCHAR *e = old; *e; e += wcslen(e) + 1) {
-    size_t_ i = 0;
-    while (i < name_length && e[i] && upper(e[i]) == upper(name[i])) ++i;
-    if (i == name_length && e[i] == '=') continue;      /* replaced or removed */
-    const size_t_ n = wcslen(e) + 1;
-    memcpy(fresh + out, e, n * 2);
-    out += n;
-  }
-  if (value) {
-    memcpy(fresh + out, name, name_length * 2);
-    out += name_length;
-    fresh[out++] = '=';
-    memcpy(fresh + out, value, value_length * 2);
-    out += value_length;
-    fresh[out++] = 0;
-  }
-  fresh[out++] = 0;
-  if (out == 1) fresh[out++] = 0;
-  parameters()->Environment = fresh;
-  return TRUE;
+  const NTSTATUS status = RtlSetEnvironmentVar(NULL, name, wcslen(name), value, value ? wcslen(value) : 0);
+  return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
 EXPORT BOOL WINAPI SetEnvironmentVariableA(LPCSTR name, LPCSTR value) {
   WCHAR *n = to_wide(name), *v = value ? to_wide(value) : NULL;
@@ -3089,13 +3064,14 @@ EXPORT BOOL WINAPI SetCurrentDirectoryW(LPCWSTR path) {
   DWORD length = n;
   if (full[length - 1] != '\\') full[length++] = '\\';
   full[length] = 0;
-  WCHAR *fresh = RtlAllocateHeap(heap(), 0, (SIZE_T)(length + 1) * 2);
+  const SIZE_T room = length + 1 > 260 ? length + 1 : 260;      /* (MAX_PATH characters, as Windows keeps it) */
+  WCHAR *fresh = RtlAllocateHeap(heap(), HEAP_ZERO_MEMORY, room * 2);
   if (!fresh) { set_error(ERROR_NOT_ENOUGH_MEMORY); return FALSE; }
   memcpy(fresh, full, (SIZE_T)(length + 1) * 2);
   UNICODE_STRING *cwd = &parameters()->CurrentDirectoryPath;
   cwd->Buffer = fresh;
   cwd->Length = (USHORT)(length * 2);
-  cwd->MaximumLength = (USHORT)(length * 2 + 2);
+  cwd->MaximumLength = (USHORT)(room * 2);
   return TRUE;
 }
 EXPORT BOOL WINAPI SetCurrentDirectoryA(LPCSTR path) {

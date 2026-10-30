@@ -144,6 +144,7 @@ NT_SERVICE(NtQueryInformationProcess);
 
 /* ---- the C library functions ntdll exports (shared with msvcrt.dll) -------------------------------------------------------------------------------------- */
 
+#define OWN_TOWCASE 1
 #include "../libc_string.inc"
 
 /* The Rtl* names kernel32.dll forwards straight to ntdll for (RtlFillMemory's argument order is (dest, length, fill), not memset's (dest, fill, length) - a real,
@@ -159,95 +160,53 @@ EXPORT SIZE_T NTAPI RtlCompareMemory(const void *a, const void *b, SIZE_T n) {
   return i;
 }
 
-/* ---- formatting (the narrow printf family) ------------------------------------------------------------------------------------------------------------- */
+/* ---- formatting (the printf family) --------------------------------------------------------------------------------------------------------------------- */
 
-typedef struct { char *out; size_t_ capacity, length; } Sink;
-static void sink_put(Sink *s, char c) {
-  if (s->length + 1 < s->capacity) s->out[s->length] = c;
-  ++s->length;
+/* Whether a %s or %c argument is a wide string or character: the native width of the printf (%s, %c) or the other one (%S, %C), moved by h (narrow),
+   w (wide), both (the other one) and an odd number of l (wide). */
+static int fmt_wide_arg(int native_wide, int native_conversion, int has_h, int has_w, int ells) {
+  if (has_h && has_w) return !native_wide;
+  if (has_w) return 1;
+  if (has_h) return 0;
+  if (ells & 1) return 1;
+  return native_conversion ? native_wide : !native_wide;
 }
-static void sink_pad(Sink *s, char c, int n) { while (n-- > 0) sink_put(s, c); }
+#define FMT_CH char
+#define FMT_WIDE 0
+#define FMT_SINK Sink
+#define FMT_PUT sink_put
+#define FMT_PAD sink_pad
+#define FMT_FN vformat
+#include "format.inc"
+#undef FMT_CH
+#undef FMT_WIDE
+#undef FMT_SINK
+#undef FMT_PUT
+#undef FMT_PAD
+#undef FMT_FN
+#define FMT_CH WCHAR
+#define FMT_WIDE 1
+#define FMT_SINK WSink
+#define FMT_PUT wsink_put
+#define FMT_PAD wsink_pad
+#define FMT_FN vformatw
+#include "format.inc"
+#undef FMT_CH
+#undef FMT_WIDE
+#undef FMT_SINK
+#undef FMT_PUT
+#undef FMT_PAD
+#undef FMT_FN
 
-EXPORT int vsnprintf(char *buffer, size_t_ capacity, const char *format, va_list_ args) {
-  Sink sink = {buffer, capacity, 0};
-  for (const char *f = format; *f; ++f) {
-    if (*f != '%') { sink_put(&sink, *f); continue; }
-    ++f;
-    int left = 0, zero = 0, plus = 0, space = 0, alt = 0, width = 0, precision = -1, size = 0;
-    for (;; ++f) {
-      if (*f == '-') left = 1; else if (*f == '0') zero = 1; else if (*f == '+') plus = 1; else if (*f == ' ') space = 1; else if (*f == '#') alt = 1; else break;
-    }
-    if (*f == '*') { width = __builtin_va_arg(args, int); if (width < 0) { left = 1; width = -width; } ++f; }
-    else while (isdigit((BYTE)*f)) width = width * 10 + (*f++ - '0');
-    if (*f == '.') {
-      ++f; precision = 0;
-      if (*f == '*') { precision = __builtin_va_arg(args, int); ++f; }
-      else while (isdigit((BYTE)*f)) precision = precision * 10 + (*f++ - '0');
-    }
-    for (;; ++f) {      /* size: 1 = h, 2 = hh, 4 = l (32 bit on Windows), 8 = ll, z, j, t, I64 */
-      if (*f == 'h') size = size == 1 ? 2 : 1;
-      else if (*f == 'l') size = size == 4 ? 8 : 4;
-      else if (*f == 'z' || *f == 'j' || *f == 't') size = 8;
-      else if (*f == 'I' && f[1] == '6' && f[2] == '4') { size = 8; f += 2; }
-      else if (*f == 'I' && f[1] == '3' && f[2] == '2') { size = 0; f += 2; }
-      else break;
-    }
-    const char conversion = *f;
-    if (!conversion) break;
-    char text[80];
-    const char *body = text;
-    int length = 0;
-    char sign = 0;
-    const char *digits = "0123456789abcdef";
-    switch (conversion) {
-      case '%': sink_put(&sink, '%'); continue;
-      case 'c': text[0] = (char)__builtin_va_arg(args, int); length = 1; break;
-      case 's': {
-        body = __builtin_va_arg(args, const char *);
-        if (!body) body = "(null)";
-        while (body[length] && (precision < 0 || length < precision)) ++length;
-        break;
-      }
-      case 'd': case 'i': case 'u': case 'x': case 'X': case 'o': case 'p': {
-        unsigned long long value;
-        int is_signed = conversion == 'd' || conversion == 'i';
-        unsigned base = conversion == 'o' ? 8 : (conversion == 'x' || conversion == 'X' || conversion == 'p') ? 16 : 10;
-        if (conversion == 'X') digits = "0123456789ABCDEF";
-        if (conversion == 'p') { value = (unsigned long long)__builtin_va_arg(args, void *); is_signed = 0; if (precision < 0) precision = 16; digits = "0123456789ABCDEF"; }
-        else if (is_signed) {
-          long long v = size == 8 ? __builtin_va_arg(args, long long) : __builtin_va_arg(args, int);
-          if (size == 1) v = (short)v; else if (size == 2) v = (signed char)v;
-          if (v < 0) { sign = '-'; value = (unsigned long long)-v; } else { value = (unsigned long long)v; if (plus) sign = '+'; else if (space) sign = ' '; }
-        } else {
-          value = size == 8 ? __builtin_va_arg(args, unsigned long long) : __builtin_va_arg(args, unsigned int);
-          if (size == 1) value &= 0xFFFF; else if (size == 2) value &= 0xFF;
-        }
-        char reversed[72];
-        int n = 0;
-        do { reversed[n++] = digits[value % base]; value /= base; } while (value);
-        while (precision >= 0 && n < precision && n < 70) reversed[n++] = '0';
-        if (alt && base == 16 && conversion != 'p') { reversed[n++] = conversion; reversed[n++] = '0'; }
-        for (int i = 0; i < n; ++i) text[i] = reversed[n - 1 - i];
-        length = n;
-        if (precision >= 0 && conversion != 'p') zero = 0;
-        break;
-      }
-      default: sink_put(&sink, '%'); sink_put(&sink, conversion); continue;
-    }
-    int pad = width - length - (sign ? 1 : 0);
-    if (!left && !zero) sink_pad(&sink, ' ', pad);
-    if (sign) sink_put(&sink, sign);
-    if (!left && zero && conversion != 's' && conversion != 'c') sink_pad(&sink, '0', pad);
-    for (int i = 0; i < length; ++i) sink_put(&sink, body[i]);
-    if (left) sink_pad(&sink, ' ', pad);
-  }
-  if (capacity) sink.out[sink.length < capacity ? sink.length : capacity - 1] = 0;
-  return (int)sink.length;
-}
-EXPORT int _vsnprintf(char *b, size_t_ n, const char *f, va_list_ a) { return vsnprintf(b, n, f, a); }
+EXPORT int vsnprintf(char *buffer, size_t_ capacity, const char *format, va_list_ args) { return vformat(buffer, capacity, 0, format, args); }
+EXPORT int _vsnprintf(char *b, size_t_ n, const char *f, va_list_ a) { return vformat(b, n, 1, f, a); }
+EXPORT int _vsnwprintf(WCHAR *b, size_t_ n, const WCHAR *f, va_list_ a) { return vformatw(b, n, 1, f, a); }
+EXPORT int _snwprintf(WCHAR *b, size_t_ n, const WCHAR *f, ...) { va_list_ a; __builtin_va_start(a, f); int r = vformatw(b, n, 1, f, a); __builtin_va_end(a); return r; }
+EXPORT int swprintf(WCHAR *b, size_t_ n, const WCHAR *f, ...) { va_list_ a; __builtin_va_start(a, f); int r = vformatw(b, n, 0, f, a); __builtin_va_end(a); return r < 0 || (size_t_)r >= n ? -1 : r; }
+EXPORT int vswprintf(WCHAR *b, size_t_ n, const WCHAR *f, va_list_ a) { int r = vformatw(b, n, 0, f, a); return r < 0 || (size_t_)r >= n ? -1 : r; }
 EXPORT int vsprintf(char *b, const char *f, va_list_ a) { return vsnprintf(b, (size_t_)-1 >> 1, f, a); }
 EXPORT int snprintf(char *b, size_t_ n, const char *f, ...) { va_list_ a; __builtin_va_start(a, f); int r = vsnprintf(b, n, f, a); __builtin_va_end(a); return r; }
-EXPORT int _snprintf(char *b, size_t_ n, const char *f, ...) { va_list_ a; __builtin_va_start(a, f); int r = vsnprintf(b, n, f, a); __builtin_va_end(a); return r; }
+EXPORT int _snprintf(char *b, size_t_ n, const char *f, ...) { va_list_ a; __builtin_va_start(a, f); int r = vformat(b, n, 1, f, a); __builtin_va_end(a); return r; }
 EXPORT int sprintf(char *b, const char *f, ...) { va_list_ a; __builtin_va_start(a, f); int r = vsnprintf(b, (size_t_)-1 >> 1, f, a); __builtin_va_end(a); return r; }
 
 /* ---- last error, status codes, the process --------------------------------------------------------------------------------------------------------------- */
@@ -665,7 +624,7 @@ static ULONG utf8_next(const BYTE *s, ULONG n, ULONG *used) {
   return cp;
 }
 
-EXPORT NTSTATUS NTAPI RtlUTF8ToUnicodeN(PWSTR dest, ULONG dest_bytes, PULONG written, const char *src, ULONG src_bytes) {
+static NTSTATUS utf8_to_unicode_old(PWSTR dest, ULONG dest_bytes, PULONG written, const char *src, ULONG src_bytes) {
   ULONG units = 0;      /* what the whole source needs */
   ULONG out = 0;
   for (ULONG i = 0; i < src_bytes;) {
@@ -683,10 +642,10 @@ EXPORT NTSTATUS NTAPI RtlUTF8ToUnicodeN(PWSTR dest, ULONG dest_bytes, PULONG wri
   if (written) *written = dest ? out : units * 2;
   return dest && units * 2 > dest_bytes ? STATUS_BUFFER_OVERFLOW : STATUS_SUCCESS;
 }
-EXPORT NTSTATUS NTAPI RtlMultiByteToUnicodeN(PWSTR d, ULONG db, PULONG w, const char *s, ULONG sb) { return RtlUTF8ToUnicodeN(d, db, w, s, sb); }
-EXPORT NTSTATUS NTAPI RtlMultiByteToUnicodeSize(PULONG size, const char *s, ULONG sb) { return RtlUTF8ToUnicodeN(NULL, 0, size, s, sb); }
+EXPORT NTSTATUS NTAPI RtlMultiByteToUnicodeN(PWSTR d, ULONG db, PULONG w, const char *s, ULONG sb) { return utf8_to_unicode_old(d, db, w, s, sb); }
+EXPORT NTSTATUS NTAPI RtlMultiByteToUnicodeSize(PULONG size, const char *s, ULONG sb) { return utf8_to_unicode_old(NULL, 0, size, s, sb); }
 
-EXPORT NTSTATUS NTAPI RtlUnicodeToUTF8N(char *dest, ULONG dest_bytes, PULONG written, PCWSTR src, ULONG src_bytes) {
+static NTSTATUS unicode_to_utf8_old(char *dest, ULONG dest_bytes, PULONG written, PCWSTR src, ULONG src_bytes) {
   ULONG needed = 0, out = 0;
   const ULONG count = src_bytes / 2;
   for (ULONG i = 0; i < count; ++i) {
@@ -705,8 +664,87 @@ EXPORT NTSTATUS NTAPI RtlUnicodeToUTF8N(char *dest, ULONG dest_bytes, PULONG wri
   if (written) *written = dest ? out : needed;
   return dest && needed > dest_bytes ? STATUS_BUFFER_OVERFLOW : STATUS_SUCCESS;
 }
-EXPORT NTSTATUS NTAPI RtlUnicodeToMultiByteN(char *d, ULONG db, PULONG w, PCWSTR s, ULONG sb) { return RtlUnicodeToUTF8N(d, db, w, s, sb); }
-EXPORT NTSTATUS NTAPI RtlUnicodeToMultiByteSize(PULONG size, PCWSTR s, ULONG sb) { return RtlUnicodeToUTF8N(NULL, 0, size, s, sb); }
+
+/* The next code point of UTF-8 text for RtlUTF8ToUnicodeN: *used bytes make up what is returned, and an invalid sequence is U+FFFD with *bad set. A lead byte
+   that can start no sequence is one U+FFFD; a lead followed by a continuation byte its range does not allow is one U+FFFD for the two; a valid beginning that
+   stops early is one U+FFFD for all of it. */
+static ULONG utf8_decode(const BYTE *s, ULONG n, ULONG *used, int *bad) {
+  const BYTE b = s[0];
+  if (b < 0x80) { *used = 1; return b; }
+  ULONG extra = 0, low = 0x80, high = 0xBF, cp = 0;
+  if (b >= 0xC2 && b <= 0xDF) { extra = 1; cp = b & 0x1F; }
+  else if (b >= 0xE0 && b <= 0xEF) { extra = 2; cp = b & 0x0F; if (b == 0xE0) low = 0xA0; if (b == 0xED) high = 0x9F; }
+  else if (b >= 0xF0 && b <= 0xF4) { extra = 3; cp = b & 0x07; if (b == 0xF0) low = 0x90; if (b == 0xF4) high = 0x8F; }
+  else { *used = 1; *bad = 1; return 0xFFFD; }
+  ULONG k = 1;
+  for (; k <= extra; ++k) {
+    if (k >= n) break;      /* (the text ends inside the sequence) */
+    const BYTE c = s[k];
+    if (c < (k == 1 ? low : 0x80) || c > (k == 1 ? high : 0xBF)) {
+      if ((c & 0xC0) == 0x80 && k == 1) ++k;      /* (a continuation byte that the lead does not take goes with it) */
+      break;
+    }
+    cp = (cp << 6) | (c & 0x3F);
+  }
+  if (k <= extra) { *used = k; *bad = 1; return 0xFFFD; }
+  *used = extra + 1;
+  return cp;
+}
+EXPORT NTSTATUS NTAPI RtlUTF8ToUnicodeN(PWSTR dest, ULONG dest_bytes, PULONG written, const char *src, ULONG src_bytes) {
+  if (!src) return 0xC00000F2;      /* STATUS_INVALID_PARAMETER_4 */
+  if (!written) return 0xC000000D;
+  ULONG units = 0;
+  int bad = 0, cut = 0;
+  for (ULONG i = 0; i < src_bytes;) {
+    ULONG used;
+    const ULONG cp = utf8_decode((const BYTE *)src + i, src_bytes - i, &used, &bad);
+    i += used;
+    ULONG pair[2];
+    ULONG count = 1;
+    if (cp >= 0x10000) { pair[0] = 0xD800 + ((cp - 0x10000) >> 10); pair[1] = 0xDC00 + ((cp - 0x10000) & 0x3FF); count = 2; }
+    else pair[0] = cp;
+    for (ULONG k = 0; k < count; ++k) {
+      if (dest) {
+        if ((units + 1) * 2 > dest_bytes) { cut = 1; break; }
+        dest[units] = (WCHAR)pair[k];
+      }
+      ++units;
+    }
+    if (cut) break;
+  }
+  *written = units * 2;
+  if (cut) return 0xC0000023u;
+  return bad ? 0x00000107u : STATUS_SUCCESS;
+}
+EXPORT NTSTATUS NTAPI RtlUnicodeToUTF8N(char *dest, ULONG dest_bytes, PULONG written, PCWSTR src, ULONG src_bytes) {
+  if (!src) return 0xC00000F2;
+  if (!written) return 0xC000000D;
+  if (dest && (src_bytes & 1)) return 0xC00000F3;      /* STATUS_INVALID_PARAMETER_5 (only when there is something to write to) */
+  ULONG out = 0;
+  int bad = 0, cut = 0;
+  const ULONG count = src_bytes / 2;
+  for (ULONG i = 0; i < count && !cut; ++i) {
+    ULONG cp = src[i];
+    if (cp >= 0xD800 && cp < 0xDC00 && i + 1 < count && src[i + 1] >= 0xDC00 && src[i + 1] < 0xE000) { cp = 0x10000 + ((cp - 0xD800) << 10) + (src[i + 1] - 0xDC00); ++i; }
+    else if (cp >= 0xD800 && cp < 0xE000) { cp = 0xFFFD; bad = 1; }
+    BYTE encoded[4];
+    ULONG n;
+    if (cp < 0x80) { encoded[0] = (BYTE)cp; n = 1; }
+    else if (cp < 0x800) { encoded[0] = (BYTE)(0xC0 | (cp >> 6)); encoded[1] = (BYTE)(0x80 | (cp & 0x3F)); n = 2; }
+    else if (cp < 0x10000) { encoded[0] = (BYTE)(0xE0 | (cp >> 12)); encoded[1] = (BYTE)(0x80 | ((cp >> 6) & 0x3F)); encoded[2] = (BYTE)(0x80 | (cp & 0x3F)); n = 3; }
+    else { encoded[0] = (BYTE)(0xF0 | (cp >> 18)); encoded[1] = (BYTE)(0x80 | ((cp >> 12) & 0x3F)); encoded[2] = (BYTE)(0x80 | ((cp >> 6) & 0x3F)); encoded[3] = (BYTE)(0x80 | (cp & 0x3F)); n = 4; }
+    if (dest) {
+      if (n > dest_bytes - out) { cut = 1; break; }
+      for (ULONG k = 0; k < n; ++k) dest[out + k] = (char)encoded[k];
+    }
+    out += n;
+  }
+  *written = out;
+  if (cut) return 0xC0000023u;
+  return bad ? 0x00000107u : STATUS_SUCCESS;
+}
+EXPORT NTSTATUS NTAPI RtlUnicodeToMultiByteN(char *d, ULONG db, PULONG w, PCWSTR s, ULONG sb) { return unicode_to_utf8_old(d, db, w, s, sb); }
+EXPORT NTSTATUS NTAPI RtlUnicodeToMultiByteSize(PULONG size, PCWSTR s, ULONG sb) { return unicode_to_utf8_old(NULL, 0, size, s, sb); }
 
 /* ---- the heap ------------------------------------------------------------------------------------------------------------------------------------------ */
 
@@ -876,6 +914,7 @@ EXPORT void NTAPI RtlUserThreadStart(ProgramEntry entry, PVOID parameter) {
   PEB *peb = NtCurrentPeb();
   PEB_LDR_DATA *ldr = peb->Ldr;
   process_heap();
+  relocate_process_parameters();
   reset_floating_point();
   fls_thread_begins();
   act_init_process();

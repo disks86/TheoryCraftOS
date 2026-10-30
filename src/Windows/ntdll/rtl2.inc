@@ -279,14 +279,17 @@ EXPORT NTSTATUS NTAPI RtlQueryEnvironmentVariable(PWSTR env, PWSTR name, SIZE_T 
   const WCHAR *v = env_find(env ? env : process_environment(), name, name_len, &len);
   if (!v) return STATUS_VARIABLE_NOT_FOUND_;
   *needed = len;
-  if (len > value_len) return STATUS_BUFFER_TOO_SMALL_;
+  if (len > value_len) { *needed = len + 1; return STATUS_BUFFER_TOO_SMALL_; }
   memcpy(value, v, len * 2);
   if (len < value_len) value[len] = 0;
   return STATUS_SUCCESS;
 }
+/* What is written when the buffer is too small follows Windows: plain text goes in while there is room for it and one more character (and no end mark follows if it is cut); a
+ * variable goes in whole with its end mark or not at all, and when it does not fit the end mark is written where it would have begun; nothing is written after that. */
 EXPORT NTSTATUS NTAPI RtlExpandEnvironmentStrings(PWSTR env, PWSTR src, SIZE_T src_len, PWSTR dst, SIZE_T dst_len, SIZE_T *out_len) {
   if (!env) env = (PWSTR)process_environment();
-  SIZE_T needed = 0;
+  SIZE_T needed = 0, written = 0;
+  int stopped = 0;
   SIZE_T i = 0;
   while (i < src_len) {
     SIZE_T j = i + 1;
@@ -296,18 +299,21 @@ EXPORT NTSTATUS NTAPI RtlExpandEnvironmentStrings(PWSTR env, PWSTR src, SIZE_T s
         SIZE_T vlen;
         const WCHAR *v = env_find(env, src + i + 1, j - i - 1, &vlen);
         if (v) {
-          if (needed + vlen <= dst_len && dst) memcpy(dst + needed, v, vlen * 2);
+          if (!stopped && dst) {
+            if (written + vlen < dst_len) { memcpy(dst + written, v, vlen * 2); written += vlen; dst[written] = 0; }
+            else { if (written < dst_len) dst[written] = 0; stopped = 1; }
+          }
           needed += vlen;
           i = j + 1;
           continue;
         }
       }
     }
-    if (needed < dst_len && dst) dst[needed] = src[i];
+    if (!stopped && dst) { if (written + 1 < dst_len) dst[written++] = src[i]; else stopped = 1; }
     ++needed;
     ++i;
   }
-  if (needed < dst_len && dst) dst[needed] = 0;
+  if (!stopped && dst && written < dst_len) dst[written] = 0;
   ++needed;      /* the terminator */
   if (out_len) *out_len = needed;
   return needed > dst_len ? STATUS_BUFFER_TOO_SMALL_ : STATUS_SUCCESS;
@@ -770,4 +776,462 @@ EXPORT PVOID NTAPI RtlImageDirectoryEntryToData(PVOID base, BOOLEAN mapped_as_im
   BYTE *image = (BYTE *)((ULONG_PTR)base & ~(ULONG_PTR)1);
   if (mapped_as_image || rva < *(const ULONG *)(nt + 24 + 60)) return image + rva;      /* (inside the headers: the same either way) */
   return RtlImageRvaToVa(nt, image, rva, NULL);
+}
+
+
+/* ---- process parameters and the debug buffer -------------------------------------------------------------------------------------------------------------- */
+
+#define PARAMS_HEADER 0x410
+#define PARAMS_FLAG_NORMALIZED 1
+/* The offsets of the strings in the parameters: current directory, DLL path, image, command line, window title, desktop, shell info, runtime info. */
+static const ULONG g_params_strings[8] = {0x38, 0x50, 0x60, 0x70, 0xB0, 0xC0, 0xD0, 0xE0};
+static ULONG_PTR params_align(ULONG_PTR v, ULONG to) { return (v + to - 1) & ~(ULONG_PTR)(to - 1); }
+
+/* RtlCreateProcessParameters: one heap block with the header, the strings (kept as offsets from the block: not normalized) and then the environment. */
+EXPORT NTSTATUS NTAPI RtlCreateProcessParametersEx(PVOID *result, const UNICODE_STRING *image, const UNICODE_STRING *dll_path, const UNICODE_STRING *current_directory, const UNICODE_STRING *command_line,
+                                                   PWSTR environment, const UNICODE_STRING *title, const UNICODE_STRING *desktop, const UNICODE_STRING *shell, const UNICODE_STRING *runtime, ULONG flags) {
+  static const UNICODE_STRING empty = {0, 2, NULL}, none = {0, 0, NULL};
+  RTL_USER_PROCESS_PARAMETERS *current = NtCurrentPeb()->ProcessParameters;
+  if (!result || !image) return STATUS_INVALID_PARAMETER_;
+  const UNICODE_STRING *sources[8];
+  UNICODE_STRING own_dir, own_dll;
+  if (current_directory) sources[0] = current_directory; else if (current) { own_dir = current->CurrentDirectoryPath; sources[0] = &own_dir; } else sources[0] = &none;
+  if (dll_path) sources[1] = dll_path; else if (current && current->DllPath.Buffer && current->DllPath.MaximumLength) { own_dll = current->DllPath; sources[1] = &own_dll; } else sources[1] = &none;
+  sources[2] = image;
+  sources[3] = command_line ? command_line : image;
+  sources[4] = title ? title : &empty;
+  sources[5] = desktop ? desktop : &empty;
+  sources[6] = shell ? shell : &empty;
+  sources[7] = runtime ? runtime : &none;
+  ULONG_PTR pos = PARAMS_HEADER;
+  USHORT maximum[8];
+  for (int i = 0; i < 8; ++i) {
+    USHORT m = sources[i]->MaximumLength;
+    if (i == 0 && m < 520) m = 520;
+    if (m != 0 && m < sources[i]->Length + 2) m = (USHORT)(sources[i]->Length + 2);
+    maximum[i] = m;
+    if (m) pos = params_align(pos, 8) + m;
+  }
+  const ULONG size = (ULONG)params_align(pos, 8);
+  const PWSTR env = environment ? environment : (PWSTR)process_environment();
+  SIZE_T env_chars = 0;
+  { const WCHAR *e = env; while (*e) e += wcslen(e) + 1; env_chars = (SIZE_T)(e + 1 - env); }
+  const SIZE_T total = (SIZE_T)params_align(size + env_chars * 2, 8);
+  BYTE *block = RtlAllocateHeap(RtlProcessHeap(), 8, total);
+  if (!block) return STATUS_NO_MEMORY_;
+  *(ULONG *)(block + 0) = size;
+  *(ULONG *)(block + 4) = size;
+  *(ULONG *)(block + 8) = 0;
+  pos = PARAMS_HEADER;
+  for (int i = 0; i < 8; ++i) {
+    UNICODE_STRING *dst = (UNICODE_STRING *)(block + g_params_strings[i]);
+    dst->Length = sources[i]->Length;
+    dst->MaximumLength = maximum[i];
+    if (!maximum[i]) { dst->Buffer = NULL; continue; }
+    pos = params_align(pos, 8);
+    dst->Buffer = (PWSTR)pos;      /* (an offset: the parameters are not normalized) */
+    if (sources[i]->Buffer) memcpy(block + pos, sources[i]->Buffer, sources[i]->Length);
+    pos += maximum[i];
+  }
+  *(PVOID *)(block + 0x80) = block + size;
+  memcpy(block + size, env, env_chars * 2);
+  *(SIZE_T *)(block + 0x3F0) = total - size;
+  (void)flags;
+  *result = block;
+  return STATUS_SUCCESS;
+}
+EXPORT NTSTATUS NTAPI RtlCreateProcessParameters(PVOID *result, const UNICODE_STRING *image, const UNICODE_STRING *dll_path, const UNICODE_STRING *current_directory, const UNICODE_STRING *command_line,
+                                                 PWSTR environment, const UNICODE_STRING *title, const UNICODE_STRING *desktop, const UNICODE_STRING *shell, const UNICODE_STRING *runtime) {
+  return RtlCreateProcessParametersEx(result, image, dll_path, current_directory, command_line, environment, title, desktop, shell, runtime, 0);
+}
+EXPORT NTSTATUS NTAPI RtlDestroyProcessParameters(PVOID params) { return RtlFreeHeap(RtlProcessHeap(), 0, params) ? STATUS_SUCCESS : STATUS_INVALID_PARAMETER_; }
+/* The strings of normalized parameters hold addresses, the others offsets from the parameters. */
+EXPORT PVOID NTAPI RtlNormalizeProcessParams(PVOID params) {
+  BYTE *p = params;
+  if (!p || (*(ULONG *)(p + 8) & PARAMS_FLAG_NORMALIZED)) return params;
+  for (int i = 0; i < 8; ++i) { UNICODE_STRING *s = (UNICODE_STRING *)(p + g_params_strings[i]); if (s->Buffer) s->Buffer = (PWSTR)((BYTE *)s->Buffer + (ULONG_PTR)p); }
+  *(ULONG *)(p + 8) |= PARAMS_FLAG_NORMALIZED;
+  return params;
+}
+EXPORT PVOID NTAPI RtlDeNormalizeProcessParams(PVOID params) {
+  BYTE *p = params;
+  if (!p || !(*(ULONG *)(p + 8) & PARAMS_FLAG_NORMALIZED)) return params;
+  for (int i = 0; i < 8; ++i) { UNICODE_STRING *s = (UNICODE_STRING *)(p + g_params_strings[i]); if (s->Buffer) s->Buffer = (PWSTR)((BYTE *)s->Buffer - (ULONG_PTR)p); }
+  *(ULONG *)(p + 8) &= ~(ULONG)PARAMS_FLAG_NORMALIZED;
+  return params;
+}
+
+/* The debug buffer of RtlQueryProcessDebugInformation: this process only; the heap and module lists are headers with a count. */
+EXPORT PVOID NTAPI RtlCreateQueryDebugBuffer(ULONG size, BOOLEAN event_pair) {
+  (void)size; (void)event_pair;
+  return RtlAllocateHeap(RtlProcessHeap(), 8, 0xA8);
+}
+EXPORT NTSTATUS NTAPI RtlQueryProcessDebugInformation(ULONG pid, ULONG mask, PVOID buffer) {
+  BYTE *b = buffer;
+  if (!b) return STATUS_INVALID_PARAMETER_;
+  if (pid != (ULONG)TEB_CLIENT_PROCESS(NtCurrentTeb())) return (NTSTATUS)0xC000000Bu;      /* STATUS_INVALID_CID */
+  *(ULONG *)(b + 0x40) = mask;
+  if (mask & 1) { if (!*(PVOID *)(b + 0x50)) *(PVOID *)(b + 0x50) = RtlAllocateHeap(RtlProcessHeap(), 8, 0x100); if (!*(PVOID *)(b + 0x50)) return STATUS_NO_MEMORY_; }
+  if (mask & 4) {
+    if (!*(PVOID *)(b + 0x60)) *(PVOID *)(b + 0x60) = RtlAllocateHeap(RtlProcessHeap(), 8, 0x100);
+    if (!*(PVOID *)(b + 0x60)) return STATUS_NO_MEMORY_;
+    PVOID heaps[MAX_HEAPS];
+    *(ULONG *)*(PVOID *)(b + 0x60) = RtlGetProcessHeaps(MAX_HEAPS, heaps);
+  }
+  return STATUS_SUCCESS;
+}
+EXPORT NTSTATUS NTAPI RtlDestroyQueryDebugBuffer(PVOID buffer) {
+  BYTE *b = buffer;
+  if (!b) return STATUS_INVALID_PARAMETER_;
+  for (int off = 0x50; off <= 0x68; off += 8) if (*(PVOID *)(b + off)) RtlFreeHeap(RtlProcessHeap(), 0, *(PVOID *)(b + off));
+  RtlFreeHeap(RtlProcessHeap(), 0, b);
+  return STATUS_SUCCESS;
+}
+
+/* ---- environment blocks of the heap ------------------------------------------------------------------------------------------------------------------------ */
+
+/* The characters of an environment block, with the final empty string. */
+static SIZE_T env_chars(const WCHAR *env) { const WCHAR *e = env; while (*e) e += wcslen(e) + 1; return (SIZE_T)(e + 1 - env); }
+EXPORT NTSTATUS NTAPI RtlCreateEnvironment(BOOLEAN inherit, PWSTR *environment) {
+  if (!environment) return STATUS_INVALID_PARAMETER_;
+  const WCHAR *source = inherit ? process_environment() : NULL;
+  const SIZE_T n = source ? env_chars(source) : 2;
+  WCHAR *block = RtlAllocateHeap(RtlProcessHeap(), 8, n * 2);
+  if (!block) return STATUS_NO_MEMORY_;
+  if (source) memcpy(block, source, n * 2);
+  *environment = block;
+  return STATUS_SUCCESS;
+}
+EXPORT NTSTATUS NTAPI RtlDestroyEnvironment(PWSTR environment) { RtlFreeHeap(RtlProcessHeap(), 0, environment); return STATUS_SUCCESS; }
+/* Sets (or, with no value, removes) a variable in a block of the heap (NULL: the process's own, whose size is kept in its parameters). The block is made again with exactly the size it needs. */
+EXPORT NTSTATUS NTAPI RtlSetEnvironmentVar(PWSTR *penv, PCWSTR name, SIZE_T name_len, PCWSTR value, SIZE_T value_len) {
+  RTL_USER_PROCESS_PARAMETERS *params = NtCurrentPeb()->ProcessParameters;
+  if (!name || !name_len) return STATUS_INVALID_PARAMETER_;
+  for (SIZE_T i = 0; i < name_len; ++i) if (name[i] == '=' && i > 0) return STATUS_INVALID_PARAMETER_;
+  WCHAR *old = penv ? *penv : (WCHAR *)params->Environment;
+  const SIZE_T old_chars = env_chars(old);
+  SIZE_T found_len = 0;
+  const WCHAR *found = env_find(old, name, name_len, &found_len);
+  const SIZE_T removed = found ? name_len + 1 + found_len + 1 : 0, added = value ? name_len + 1 + value_len + 1 : 0;
+  WCHAR *fresh = RtlAllocateHeap(RtlProcessHeap(), 0, (old_chars - removed + added) * 2);
+  if (!fresh) return STATUS_NO_MEMORY_;
+  SIZE_T out = 0;
+  for (const WCHAR *e = old; *e; e += wcslen(e) + 1) {
+    if (found && e + name_len + 1 == found) continue;      /* (the entry being replaced or removed) */
+    const SIZE_T n = wcslen(e) + 1;
+    memcpy(fresh + out, e, n * 2);
+    out += n;
+  }
+  if (value) {
+    memcpy(fresh + out, name, name_len * 2); out += name_len;
+    fresh[out++] = '=';
+    memcpy(fresh + out, value, value_len * 2); out += value_len;
+    fresh[out++] = 0;
+  }
+  fresh[out++] = 0;
+  if (out == 1) fresh[out++] = 0;
+  const SIZE_T capacity = penv ? RtlSizeHeap(RtlProcessHeap(), 0, old) : *(SIZE_T *)((BYTE *)params + 0x3F0);
+  if (out * 2 <= capacity) {      /* it fits where it is: the block keeps its size */
+    memcpy(old, fresh, out * 2);
+    RtlFreeHeap(RtlProcessHeap(), 0, fresh);
+    return STATUS_SUCCESS;
+  }
+  if (penv) *penv = fresh; else { params->Environment = fresh; *(SIZE_T *)((BYTE *)params + 0x3F0) = out * 2; }
+  RtlFreeHeap(RtlProcessHeap(), 0, old);
+  return STATUS_SUCCESS;
+}
+EXPORT NTSTATUS NTAPI RtlSetEnvironmentVariable(PWSTR *penv, const UNICODE_STRING *name, const UNICODE_STRING *value) {
+  if (!name) return STATUS_INVALID_PARAMETER_;
+  return RtlSetEnvironmentVar(penv, name->Buffer, name->Length / 2, value ? value->Buffer : NULL, value ? value->Length / 2 : 0);
+}
+EXPORT void NTAPI RtlSetCurrentEnvironment(PWSTR environment, PWSTR *previous) {
+  RTL_USER_PROCESS_PARAMETERS *params = NtCurrentPeb()->ProcessParameters;
+  if (previous) *previous = (PWSTR)params->Environment;
+  params->Environment = environment;
+  *(SIZE_T *)((BYTE *)params + 0x3F0) = RtlSizeHeap(RtlProcessHeap(), 0, environment);
+}
+/* The process's parameters and environment become blocks of the heap, as they are on Windows (the strings follow the header; the current directory stays where it is). */
+static void relocate_process_parameters(void) {
+  PEB *peb = NtCurrentPeb();
+  BYTE *old = (BYTE *)peb->ProcessParameters;
+  if (!old) return;
+  const ULONG index[8] = {0x38, 0x50, 0x60, 0x70, 0xB0, 0xC0, 0xD0, 0xE0};
+  ULONG size = PARAMS_HEADER;
+  for (int i = 1; i < 8; ++i) { const UNICODE_STRING *u = (const UNICODE_STRING *)(old + index[i]); if (u->Buffer) size += u->MaximumLength; }
+  BYTE *fresh = RtlAllocateHeap(RtlProcessHeap(), 8, size);
+  const SIZE_T chars = *(PVOID *)(old + 0x80) ? env_chars(*(const WCHAR **)(old + 0x80)) : 2;
+  WCHAR *env = RtlAllocateHeap(RtlProcessHeap(), 8, chars * 2);
+  if (!fresh || !env) return;
+  memcpy(fresh, old, 0x3F0);
+  if (*(PVOID *)(old + 0x80)) memcpy(env, *(const WCHAR **)(old + 0x80), chars * 2);
+  *(PVOID *)(fresh + 0x80) = env;
+  *(SIZE_T *)(fresh + 0x3F0) = chars * 2;
+  *(ULONG *)fresh = *(ULONG *)(fresh + 4) = size;
+  ULONG pos = PARAMS_HEADER;
+  for (int i = 1; i < 8; ++i) {
+    UNICODE_STRING *u = (UNICODE_STRING *)(fresh + index[i]);
+    if (!u->Buffer) continue;
+    memcpy(fresh + pos, u->Buffer, u->MaximumLength);
+    u->Buffer = (PWSTR)(fresh + pos);
+    pos += u->MaximumLength;
+  }
+  peb->ProcessParameters = (RTL_USER_PROCESS_PARAMETERS *)fresh;
+}
+
+/* ---- one character of an ANSI string ------------------------------------------------------------------------------------------------------------------- */
+
+/* The character the ANSI string points at (the code page is UTF-8), and the pointer moved past it; a byte that starts no valid sequence gives U+FFFD. */
+EXPORT WCHAR NTAPI RtlAnsiCharToUnicodeChar(PUCHAR *ansi) {
+  const UCHAR *p = *ansi;
+  const UCHAR lead = p[0];
+  unsigned count = 1;
+  ULONG cp = 0xFFFD;
+  if (lead < 0x80) cp = lead;
+  else if (lead >= 0xC2 && lead <= 0xF4) {
+    const unsigned need = lead >= 0xF0 ? 3 : lead >= 0xE0 ? 2 : 1;
+    ULONG v = lead & (0x3Fu >> need);
+    unsigned k = 0;
+    for (; k < need && (p[1 + k] & 0xC0) == 0x80; ++k) v = (v << 6) | (p[1 + k] & 0x3F);
+    const int ok = k == need && !(need == 2 && v < 0x800) && !(need == 3 && (v < 0x10000 || v > 0x10FFFF)) && !(v >= 0xD800 && v <= 0xDFFF);
+    if (ok) { count = need + 1; cp = v >= 0x10000 ? 0xD800 + ((v - 0x10000) >> 10) : v; }
+  }
+  if (lead) *ansi = (PUCHAR)(p + count); else *ansi = (PUCHAR)(p + 1);
+  return (WCHAR)cp;
+}
+
+/* ---- RtlIsTextUnicode ---------------------------------------------------------------------------------------------------------------------------------- */
+
+#define TEXT_ASCII16 0x1u
+#define TEXT_STATISTICS 0x2u
+#define TEXT_CONTROLS 0x4u
+#define TEXT_SIGNATURE 0x8u
+#define TEXT_REVERSE_ASCII16 0x10u
+#define TEXT_REVERSE_STATISTICS 0x20u
+#define TEXT_REVERSE_CONTROLS 0x40u
+#define TEXT_REVERSE_SIGNATURE 0x80u
+#define TEXT_ILLEGAL_CHARS 0x100u
+#define TEXT_ODD_LENGTH 0x200u
+#define TEXT_NULL_BYTES 0x1000u
+#define TEXT_UNICODE_MASK 0xFu
+#define TEXT_REVERSE_MASK 0xF0u
+#define TEXT_NOT_UNICODE_MASK 0xF00u
+#define TEXT_NOT_ASCII_MASK 0xF000u
+/* Whether a buffer looks like UTF-16 text; *flags says which tests to run and gets the ones that came out true. Only the first 256 characters count. */
+EXPORT BOOLEAN NTAPI RtlIsTextUnicode(PVOID buffer, ULONG size, PULONG flags_in) {
+  const WCHAR *s = buffer;
+  unsigned flags = ~0u, out = 0;
+  ULONG length = size;
+  if (length < sizeof(WCHAR)) { if (flags_in) *flags_in = 0; return FALSE; }
+  if (flags_in) flags = *flags_in;
+  if (length & 1) out |= TEXT_ODD_LENGTH;
+  if (((const char *)buffer)[length - 1] == 0) --length;      /* (a terminating NUL byte is not counted) */
+  ULONG count = length / sizeof(WCHAR);
+  if (count > 256) count = 256;
+  if (s[0] == 0xFEFF) out |= TEXT_SIGNATURE;
+  if (s[0] == 0xFFFE) out |= TEXT_REVERSE_SIGNATURE;
+  if (!(out & (TEXT_SIGNATURE | TEXT_REVERSE_SIGNATURE))) {      /* (statistics are only taken when there is no byte order mark) */
+    ULONG low = 0, high = 0;
+    for (ULONG i = 0; i < count; ++i) { if (s[i] < 0x2000) ++low; if ((s[i] & 0xFF) < 0x20) ++high; }
+    if ((flags & TEXT_STATISTICS) && low > count / 2) out |= TEXT_STATISTICS;
+    if ((flags & TEXT_REVERSE_STATISTICS) && high > count / 2) out |= TEXT_REVERSE_STATISTICS;
+    if ((flags & TEXT_REVERSE_ASCII16) && high == count) out |= TEXT_REVERSE_ASCII16;
+  }
+  if (flags & TEXT_NULL_BYTES) {
+    for (ULONG i = 0; i < count; ++i) if (!(s[i] & 0xFF) || !(s[i] >> 8)) { out |= TEXT_NULL_BYTES; break; }
+  }
+  if (flags & TEXT_CONTROLS) {
+    for (ULONG i = 0; i < count; ++i) if (s[i] == '\r' || s[i] == '\n' || s[i] == '\t' || s[i] == ' ' || s[i] == 0x3000) { out |= TEXT_CONTROLS; break; }
+  }
+  if (flags & TEXT_REVERSE_CONTROLS) {
+    for (ULONG i = 0; i < count; ++i) if (s[i] == 0x0D00 || s[i] == 0x0A00 || s[i] == 0x0900 || s[i] == 0x2000) { out |= TEXT_REVERSE_CONTROLS; break; }
+  }
+  if (flags_in) { out &= *flags_in; *flags_in = out; }
+  if (out & (TEXT_REVERSE_MASK | TEXT_NOT_UNICODE_MASK)) return FALSE;
+  if (out & TEXT_NOT_ASCII_MASK) return TRUE;
+  return (out & TEXT_UNICODE_MASK) != 0;
+}
+
+/* ---- RtlFormatMessage ---------------------------------------------------------------------------------------------------------------------------------- */
+
+typedef struct {
+  int last;               /* the last argument used */
+  ULONG_PTR *array;       /* the argument array */
+  va_list_ *list;         /* the variable argument list */
+  ULONGLONG arglist[102]; /* what has been fetched from the list */
+} FormatMessageArgs;
+
+static NTSTATUS fmt_add_chars(WCHAR **buffer, WCHAR *end, const WCHAR *str, ULONG len) {
+  if (len > (ULONG)(end - *buffer)) return STATUS_BUFFER_OVERFLOW_;
+  memcpy(*buffer, str, (size_t_)len * sizeof(WCHAR));
+  *buffer += len;
+  return STATUS_SUCCESS;
+}
+
+static ULONGLONG fmt_get_arg(int nr, FormatMessageArgs *args_data, BOOL is64) {
+  if (nr == -1) nr = args_data->last + 1;
+  if (nr < 1 || nr > 100) return 0;
+  while (nr > args_data->last) {
+    args_data->arglist[args_data->last++] = is64 ? __builtin_va_arg(*args_data->list, ULONGLONG) : __builtin_va_arg(*args_data->list, ULONG_PTR);
+  }
+  return args_data->arglist[nr - 1];
+}
+
+static const WCHAR *fmt_find(const WCHAR *set_or_text, WCHAR c, int in_set) {
+  (void)in_set;
+  for (; *set_or_text; ++set_or_text) if (*set_or_text == c) return set_or_text;
+  return NULL;
+}
+
+static NTSTATUS fmt_add_format(WCHAR **buffer, WCHAR *end, const WCHAR **src, int insert, BOOLEAN ansi, FormatMessageArgs *args_data) {
+  static const WCHAR flag_chars[] = {'0','1','2','3','4','5','6','7','8','9',' ','+','-','*','#','.',0};
+  const WCHAR *format = *src;
+  WCHAR *p, fmt[32];
+  ULONG_PTR args[5] = {0};
+  BOOL is_64 = FALSE;
+  ULONGLONG val;
+  int len, stars = 0, nb_args = 0;
+
+  p = fmt;
+  *p++ = '%';
+  if (*format++ == '!') {
+    const WCHAR *stop = fmt_find(format, '!', 0);
+    if (!stop || stop - format > 30) return STATUS_INVALID_PARAMETER_;
+    *src = stop + 1;
+    while (*format && fmt_find(flag_chars, *format, 1)) {
+      if (*format == '*') stars++;
+      *p++ = *format++;
+    }
+    if (stars > 2) return STATUS_INVALID_PARAMETER_;
+    switch (*format) {
+      case 'c': case 'C': case 's': case 'S':
+        if (ansi) *p++ = (WCHAR)(*format++ ^ ('s' - 'S'));
+        break;
+      default: break;
+    }
+    while (format != stop) *p++ = *format++;
+  } else *p++ = ansi ? 'S' : 's';      /* a simple string */
+  *p = 0;
+
+  if (args_data->list) {
+    fmt_get_arg(insert - 1, args_data, is_64);      /* make sure the previous arguments have been fetched */
+    while (stars--) {
+      args[nb_args++] = (ULONG_PTR)fmt_get_arg(insert, args_data, FALSE);
+      insert = -1;
+    }
+    if (insert == -1) args_data->last--;      /* (the quirk of Windows: an argument is dropped when a width or precision came from the list) */
+    val = fmt_get_arg(insert, args_data, is_64);
+    args[nb_args++] = (ULONG_PTR)val;
+    args[nb_args] = (ULONG_PTR)(val >> 32);
+  } else if (args_data->array) {
+    args[nb_args++] = args_data->array[insert - 1];
+    if (args_data->last < insert) args_data->last = insert;
+    if (is_64) nb_args++;
+    while (stars--) args[nb_args++] = args_data->array[args_data->last++];
+  } else return STATUS_INVALID_PARAMETER_;
+
+  len = _snwprintf_s(*buffer, (size_t_)(end - *buffer), (size_t_)(end - *buffer - 1), fmt, args[0], args[1], args[2], args[3], args[4]);
+  if (len == -1) return STATUS_BUFFER_OVERFLOW_;
+  *buffer += len;
+  return STATUS_SUCCESS;
+}
+
+/* Formats the template `src` (the message of FormatMessage) into `buffer` of `size` bytes; the arguments are an array or the address of a variable argument list. */
+EXPORT NTSTATUS NTAPI RtlFormatMessageEx(const WCHAR *src, ULONG width, BOOLEAN ignore_inserts, BOOLEAN ansi, BOOLEAN is_array, void *args, WCHAR *buffer, ULONG size, ULONG *retsize, ULONG flags) {
+  static const WCHAR spaceW = ' ', crW = '\r', tabW = '\t';
+  static const WCHAR crlfW[] = {'\r', '\n'};
+  FormatMessageArgs *args_data = RtlAllocateHeap(process_heap(), 0, sizeof(*args_data));
+  if (!args_data) return 0xC0000017;
+  NTSTATUS status = STATUS_SUCCESS;
+  WCHAR *start = buffer, *end = buffer + size / sizeof(WCHAR), *line = buffer, *space = NULL;
+  (void)flags;
+  args_data->last = 0;
+  args_data->array = is_array ? (ULONG_PTR *)args : NULL;
+  args_data->list = is_array ? NULL : (va_list_ *)args;
+  for (; *src; src++) {
+    switch (*src) {
+      case '\r':
+        if (src[1] == '\n') src++;
+        /* fall through */
+      case '\n':
+        if (!width) {
+          status = fmt_add_chars(&buffer, end, crlfW, 2);
+          line = buffer;
+          space = NULL;
+          break;
+        }
+        /* fall through */
+      case ' ':
+        space = buffer;
+        status = fmt_add_chars(&buffer, end, &spaceW, 1);
+        break;
+      case '\t':
+        if (space == buffer - 1) space = buffer;
+        status = fmt_add_chars(&buffer, end, &tabW, 1);
+        break;
+      case '%':
+        src++;
+        switch (*src) {
+          case 0:
+            status = STATUS_INVALID_PARAMETER_;
+            goto finish;
+          case 't':
+            if (!width) { status = fmt_add_chars(&buffer, end, &tabW, 1); break; }
+            /* fall through */
+          case 'n':
+            status = fmt_add_chars(&buffer, end, crlfW, 2);
+            line = buffer;
+            space = NULL;
+            break;
+          case 'r':
+            status = fmt_add_chars(&buffer, end, &crW, 1);
+            line = buffer;
+            space = NULL;
+            break;
+          case '0':
+            while (src[1]) src++;
+            break;
+          case '1': case '2': case '3': case '4': case '5': case '6': case '7': case '8': case '9':
+            if (!ignore_inserts) {
+              int nr = *src++ - '0';
+              if (*src >= '0' && *src <= '9') nr = nr * 10 + *src++ - '0';
+              status = fmt_add_format(&buffer, end, &src, nr, ansi, args_data);
+              src--;
+              break;
+            }
+            /* fall through */
+          default:
+            if (ignore_inserts) status = fmt_add_chars(&buffer, end, src - 1, 2);
+            else status = fmt_add_chars(&buffer, end, src, 1);
+            break;
+        }
+        break;
+      default:
+        status = fmt_add_chars(&buffer, end, src, 1);
+        break;
+    }
+    if (status) goto finish;
+    if (width && (ULONG)(buffer - line) >= width) {
+      LONG_PTR diff = 2;
+      WCHAR *next;
+      if (space) {      /* split the line at the last space */
+        next = space + 1;
+        while (space > line && (space[-1] == ' ' || space[-1] == '\t')) space--;
+        diff -= next - space;
+      } else space = next = buffer;      /* split at the end of the buffer */
+      if (diff > 0 && end - buffer < diff) { status = STATUS_BUFFER_OVERFLOW_; goto finish; }
+      memmove(space + 2, next, (size_t_)(buffer - next) * sizeof(WCHAR));
+      buffer += diff;
+      memcpy(space, crlfW, sizeof(crlfW));
+      line = space + 2;
+      space = NULL;
+    }
+  }
+  status = fmt_add_chars(&buffer, end, L"", 1);
+  if (!status) *retsize = (ULONG)((buffer - start) * sizeof(WCHAR));
+finish:
+  RtlFreeHeap(process_heap(), 0, args_data);
+  return status;
+}
+EXPORT NTSTATUS NTAPI RtlFormatMessage(const WCHAR *src, ULONG width, BOOLEAN ignore_inserts, BOOLEAN ansi, BOOLEAN is_array, void *args, WCHAR *buffer, ULONG size, ULONG *retsize) {
+  return RtlFormatMessageEx(src, width, ignore_inserts, ansi, is_array, args, buffer, size, retsize, 0);
 }
