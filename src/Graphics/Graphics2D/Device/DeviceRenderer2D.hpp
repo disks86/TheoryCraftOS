@@ -82,6 +82,7 @@ class DeviceRenderer2D final : public IRenderer2D {
   void fill_rounded_rect(const Rect2D& rect, const CornerRadii& radii, uint32_t color) override;
   void stroke_rounded_rect(const Rect2D& outer, const CornerRadii& radii, const EdgeWidths& widths, uint32_t color) override;
   void draw_mask(const MaskView& mask, const Rect2D& source_rect, int32_t x, int32_t y, uint32_t color) override;
+  void draw_glyph(uint64_t id, const MaskView& mask, int32_t x, int32_t y, uint32_t color) override;
   bool draw_image_transformed(const Surface& source, const Rect2D& source_rect, const Matrix2D& m, ImageFilter filter) override;
   bool begin_group(const Rect2D& bounds) override;
   bool end_group(const Matrix2D& m, uint8_t opacity, ImageFilter filter) override;
@@ -107,6 +108,9 @@ class DeviceRenderer2D final : public IRenderer2D {
   // How many clip masks were found already made (and how many had to be made) since this renderer began: the masks of rounded and mask clips are kept between frames.
   uint64_t clip_mask_hits() const { return mask_hits_; }
   uint64_t clip_mask_misses() const { return mask_misses_; }
+  // How many glyphs were put on the atlas since this renderer began (a glyph drawn again is not put there again).
+  uint64_t glyphs_made() const { return glyphs_made_; }
+  bool has_glyph_atlas() const { return atlas_ok_; }
 
   // The color to draw for a pixel with `cov` (0..255) coverage; false: draw nothing (used by the rounded-rect helpers).
   bool coverage_color(uint32_t color, uint32_t cov, uint32_t* out) const;
@@ -126,6 +130,7 @@ class DeviceRenderer2D final : public IRenderer2D {
     Rect2D clip;
     BlendMode blend;
     bool sheet;   // the vertices are the sheet's (textured), not the colored batch's
+    bool glyph = false;   // the vertices are the glyph batch's (tinted, from the atlas)
     bool erase = false;   // the vertices erase what is under them (a group's picture times one minus their alpha)
   };
 
@@ -143,6 +148,7 @@ class DeviceRenderer2D final : public IRenderer2D {
   bool sheet_slot(uint32_t w, uint32_t h, uint32_t* x, uint32_t* y);   // room for a w x h mask on the sheet (a submit and a fresh sheet if it is full)
   void sheet_emit(uint32_t sx, uint32_t sy, uint32_t w, uint32_t h, int64_t dx, int64_t dy);   // the rectangle that shows it
   void close_sheet_range();
+  void close_glyph_range();
   void reset_sheet();
   bool draw_textured_quad(IImage& image, int64_t dx, int64_t dy, uint32_t w, uint32_t h, float u0, float v0, float u1, float v1);
   // The image's (u0, v0)-(u1, v1) on the quadrilateral with corners (xs[i], ys[i]) (top left, top right, bottom right, bottom left), sampled with `filter`.
@@ -225,6 +231,30 @@ class DeviceRenderer2D final : public IRenderer2D {
     uint32_t prev_detach = 0xFFFFFFFFu;      // detach_index_ outside it
     uint32_t prev_overflow = 0;
   };
+  // The glyph atlas: the coverage of glyphs (as alpha), kept from frame to frame, so a glyph is made and sent up once and drawn tinted by the GPU
+  // (a vertex color) whenever it is wanted. Shelf packing; when it is full, it starts again.
+  static constexpr uint32_t kAtlasSize = 1024, kAtlasTable = 4096, kAtlasMaxGlyph = 128, kMaxGlyphVertices = 6 * 4096;
+  struct AtlasEntry {
+    uint64_t id = 0;
+    uint16_t x = 0, y = 0, w = 0, h = 0;
+    bool used = false;
+  };
+  bool atlas_ok_ = false;
+  IShaderModule* tint_vs_ = nullptr;
+  IShaderModule* tint_fs_ = nullptr;
+  IPipeline* glyph_blended_ = nullptr;
+  IPipeline* glyph_group_ = nullptr;
+  IBuffer* glyph_vertices_ = nullptr;
+  ArrayView<TintedVertex> glyph_batch_;
+  uint32_t glyph_count_ = 0, glyph_range_start_ = 0;
+  IImage* atlas_ = nullptr;
+  ArrayView<uint32_t> atlas_pixels_;
+  ArrayView<AtlasEntry> atlas_table_;
+  uint64_t glyphs_made_ = 0;
+  uint32_t atlas_entries_ = 0, atlas_x_ = 0, atlas_y_ = 0, atlas_shelf_ = 0;
+  bool atlas_dirty_ = false;
+  bool atlas_slot(uint32_t w, uint32_t h, uint32_t* x, uint32_t* y);
+  void atlas_reset();
   IShaderModule* scaled_fs_ = nullptr;
   IPipeline* group_blended_ = nullptr;
   IPipeline* texture_group_ = nullptr;
