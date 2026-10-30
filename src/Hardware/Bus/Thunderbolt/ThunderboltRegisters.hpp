@@ -58,7 +58,7 @@ constexpr uint32_t kRingFlagRaw = 1u << 30, kRingFlagEnable = 1u << 31;
 // REG_INMAIL_CMD / REG_OUTMAIL_CMD
 constexpr uint32_t kInmailCmdMask = 0xFF, kInmailError = 1u << 30, kInmailRequest = 1u << 31, kOutmailOpModeShift = 8, kOutmailOpModeMask = 0xF00;
 // REG_FW_STS
-constexpr uint32_t kFwStsNvmAuthDone = 1u << 31, kFwStsIcmEnable = 1u << 0;
+constexpr uint32_t kFwStsNvmAuthDone = 1u << 31, kFwStsCioResetRequest = 1u << 30, kFwStsIcmEnableCpu = 1u << 2, kFwStsIcmEnableInvert = 1u << 1, kFwStsIcmEnable = 1u << 0;
 }  // namespace tb_reg
 
 // Commands of the mailbox (nhi.h).

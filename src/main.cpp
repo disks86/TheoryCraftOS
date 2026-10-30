@@ -1159,7 +1159,11 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       for (uint32_t i = 0; i < pci.device_count(); ++i) {
         hardware::PciDeviceInfo d;
         if (!pci.pci_device(i, &d) || !hardware::ThunderboltDriver::supports(d)) continue;
-        thunderbolt = UniquePointer<hardware::ThunderboltDriver>::make(shared_allocator, shared_allocator);
+        hardware::ThunderboltDriver::Config thunderbolt_config;
+#ifdef TCOS_THUNDERBOLT_START_FIRMWARE
+        thunderbolt_config.start_firmware = true;
+#endif
+        thunderbolt = UniquePointer<hardware::ThunderboltDriver>::make(shared_allocator, shared_allocator, thunderbolt_config);
         if (!thunderbolt) break;
         if (thunderbolt->start(pci, d, register_mapper) == hardware::ThunderboltDriver::Outcome::Started) {
           Entry e(Level::Ok, "Thunderbolt");

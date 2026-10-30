@@ -24,6 +24,8 @@
 #include <string.h>
 #include <map>
 #include <vector>
+#include "Hardware/Bus/Pci/IPciBus.hpp"
+#include "Hardware/Bus/Thunderbolt/ThunderboltCio.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltRegisters.hpp"
 
 namespace fake_tb {
@@ -98,13 +100,17 @@ class FakeNhi final : public hardware::ITbRegisters {
   std::map<uint32_t, uint32_t> config_words;   // word offset of the switch space -> value
   std::map<uint32_t, uint32_t> writes;         // configuration words the host wrote
   std::vector<uint32_t> uuid_approved;
+  std::vector<uint32_t> fw_sts_writes;       // every write to the firmware status register, in order
+  uint32_t fw_sts_written = 0;
+  bool firmware_comes_up_on_reset = true;    // a CIO reset after the ARC was told to wait for it starts the firmware
+  uint32_t cio_resets = 0;
   uint32_t interrupt_mask_writes = 0, interrupt_clear_writes = 0;
 
   uint32_t read32(uint32_t offset) override {
     using namespace hardware::tb_reg;
     if (!present) return 0xFFFFFFFFu;
     if (offset == kCaps) return (version << kCapsVersionShift) | hops;
-    if (offset == kFirmwareStatus) return (icm_enabled ? kFwStsIcmEnable : 0) | (auth_done ? kFwStsNvmAuthDone : 0);
+    if (offset == kFirmwareStatus) return (icm_enabled ? kFwStsIcmEnable : 0) | (auth_done ? kFwStsNvmAuthDone : 0) | (fw_sts_written & (kFwStsCioResetRequest | kFwStsIcmEnableCpu | kFwStsIcmEnableInvert));
     if (offset == kOutmailCmd) return mode << kOutmailOpModeShift;
     if (is_ring_register(offset)) {
       Ring& r = ring_of(offset);
@@ -117,6 +123,11 @@ class FakeNhi final : public hardware::ITbRegisters {
 
   void write32(uint32_t offset, uint32_t value) override {
     using namespace hardware::tb_reg;
+    if (offset == kFirmwareStatus) {
+      fw_sts_writes.push_back(value);
+      fw_sts_written = value;
+      return;
+    }
     if (offset == kInmailCmd) {
       if ((value & kInmailRequest) && !mailbox_hang) {
         mailbox_commands.push_back(value & kInmailCmdMask);
@@ -146,6 +157,14 @@ class FakeNhi final : public hardware::ITbRegisters {
     if (offset >= kTxOptionsBase && offset < kTxOptionsBase + 32 * 64) { if ((offset - kTxOptionsBase) % 32 == 0) tx_[(offset - kTxOptionsBase) / 32].options = value; return; }
     if (offset >= kRxOptionsBase && offset < kRxOptionsBase + 32 * 64) { if ((offset - kRxOptionsBase) % 32 == 0) rx_[(offset - kRxOptionsBase) / 32].options = value; return; }
     regs_[offset] = value;
+  }
+
+  // The root router is reset through the PCIe-to-CIO registers.
+  void cio_reset() {
+    ++cio_resets;
+    using namespace hardware::tb_reg;
+    const uint32_t need = kFwStsCioResetRequest | kFwStsIcmEnableCpu | kFwStsIcmEnableInvert;
+    if (firmware_comes_up_on_reset && (fw_sts_written & need) == need) { icm_enabled = true; auth_done = true; }
   }
 
   // ---- the model's side of the rings
@@ -275,6 +294,91 @@ class FakeNhi final : public hardware::ITbRegisters {
   std::map<uint32_t, uint32_t> regs_;
   Ring tx_[64], rx_[64];
   std::map<uint32_t, std::vector<SentFrame>> queue_;
+};
+
+
+// The upstream port's configuration space as far as the driver uses it: an extended capability list with the vendor specific capability, and the PCIe-to-CIO registers behind it.
+class FakeCio final : public hardware::ITbConfigSpace {
+ public:
+  explicit FakeCio(FakeNhi& chip) : chip_(chip) {}
+  uint16_t capability = 0x100;           // where the vendor capability is (0: none)
+  bool fail_commands = false;            // every command ends with the timeout bit
+  bool hang = false;                     // the start bit never clears
+  bool root_resets = true;
+  std::map<uint32_t, uint32_t> cs1;      // port -> PHY_PORT_CS1
+  struct Command { bool write; uint32_t space, port, index, value; };
+  std::vector<Command> commands;
+
+  uint32_t read32(uint16_t offset) override {
+    if (capability != 0 && offset == capability) return 0x000B | (1u << 16);
+    if (capability != 0 && offset == capability + hardware::tb_cio::kCmd) return cmd_;
+    if (capability != 0 && offset == capability + hardware::tb_cio::kReadData) return rddata_;
+    return 0;
+  }
+  void write32(uint16_t offset, uint32_t value) override {
+    using namespace hardware::tb_cio;
+    if (capability == 0) return;
+    if (offset == capability + kWriteData) { wrdata_ = value; return; }
+    if (offset != capability + kCmd) return;
+    cmd_ = value;
+    if (!(value & kCmdStart)) return;
+    const uint32_t index = value & kCmdIndexMask, port = (value & kCmdPortMask) >> kCmdPortShift, space = (value & kCmdSpaceMask) >> kCmdSpaceShift;
+    const bool write = (value & kCmdWrite) != 0;
+    commands.push_back({write, space, port, index, write ? wrdata_ : 0});
+    if (hang) return;
+    cmd_ &= ~kCmdStart;
+    if (fail_commands) { cmd_ |= kCmdTimeout; return; }
+    if (write) {
+      if (space == 2 && port == 0 && index == kSwitchResetIndex && (wrdata_ & kSwitchResetBit) && root_resets) chip_.cio_reset();
+      if (space == 1 && index == kPhyPortCs1) cs1[port] = wrdata_;
+    } else if (space == 1 && index == kPhyPortCs1) {
+      rddata_ = cs1.count(port) ? cs1[port] : 0;
+    } else {
+      rddata_ = 0;
+    }
+  }
+
+ private:
+  FakeNhi& chip_;
+  uint32_t cmd_ = 0, wrdata_ = 0, rddata_ = 0;
+};
+
+// A tiny PCI hierarchy for finding the switch's upstream port.
+class FakePci final : public hardware::IPciBus {
+ public:
+  struct Function {
+    hardware::PciDeviceInfo info;
+    uint8_t header_type = 1, secondary = 0, subordinate = 0;
+    int pcie_type = -1;                  // -1: no PCI Express capability
+  };
+  std::vector<Function> functions;
+  const char* name() const override { return "fake pci"; }
+  bool initialize() override { return true; }
+  void shutdown() override {}
+  uint32_t device_count() const override { return static_cast<uint32_t>(functions.size()); }
+  bool pci_device(uint32_t index, hardware::PciDeviceInfo* out) const override {
+    if (index >= functions.size()) return false;
+    *out = functions[index].info;
+    return true;
+  }
+  const Function* find(hardware::PciAddress a) const {
+    for (const Function& f : functions) if (f.info.address.bus == a.bus && f.info.address.device == a.device && f.info.address.function == a.function) return &f;
+    return nullptr;
+  }
+  uint32_t read32(hardware::PciAddress a, uint16_t offset) const override {
+    const Function* f = find(a);
+    if (!f) return 0xFFFFFFFFu;
+    if (offset == 0x0C) return uint32_t(f->header_type) << 16;
+    if (offset == 0x18) return uint32_t(f->secondary) << 8 | uint32_t(f->subordinate) << 16;
+    if (offset == 0x80 && f->pcie_type >= 0) return 0x10 | (uint32_t(f->pcie_type) << 20);
+    return 0;
+  }
+  void write32(hardware::PciAddress, uint16_t, uint32_t) const override {}
+  uint64_t memory_bar(hardware::PciAddress, uint8_t) const override { return 0; }
+  uint16_t find_capability(hardware::PciAddress a, uint8_t id) const override {
+    const Function* f = find(a);
+    return (f && id == 0x10 && f->pcie_type >= 0) ? 0x80 : 0;
+  }
 };
 
 }  // namespace fake_tb

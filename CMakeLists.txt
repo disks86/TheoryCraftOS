@@ -728,6 +728,7 @@ add_executable(BOOTX64
   src/Hardware/Mouse/I2c/I2cHidPointer.cpp
   src/Hardware/Mouse/I2c/PlatformI2cHid.cpp
   src/Hardware/Bus/Thunderbolt/ThunderboltDevices.cpp
+  src/Hardware/Bus/Thunderbolt/ThunderboltCio.cpp
   src/Hardware/Bus/Thunderbolt/ThunderboltRing.cpp
   src/Hardware/Bus/Thunderbolt/ThunderboltControl.cpp
   src/Hardware/Bus/Thunderbolt/ThunderboltIcm.cpp
@@ -1071,8 +1072,12 @@ if(TCOS_INTEL_WIFI)
   target_compile_definitions(BOOTX64 PRIVATE TCOS_INTEL_WIFI)
 endif()
 option(TCOS_THUNDERBOLT "Start the Thunderbolt 3 host interface (Alpine Ridge: control channel, the controller's firmware, devices reported as they are connected; PCIe tunnels only on request; not yet run on a real controller)" OFF)
+option(TCOS_THUNDERBOLT_START_FIRMWARE "With TCOS_THUNDERBOLT: start the controller's connection manager firmware if the BIOS did not (resets the controller's CPU through the upstream port's vendor registers)" OFF)
 if(TCOS_THUNDERBOLT)
   target_compile_definitions(BOOTX64 PRIVATE TCOS_THUNDERBOLT)
+  if(TCOS_THUNDERBOLT_START_FIRMWARE)
+    target_compile_definitions(BOOTX64 PRIVATE TCOS_THUNDERBOLT_START_FIRMWARE)
+  endif()
 endif()
 option(TCOS_SELFTESTS "Run the boot-time self-checks and demos of every subsystem" OFF)
 if(TCOS_SELFTESTS)

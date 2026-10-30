@@ -22,6 +22,7 @@
 #include <stdint.h>
 #include "Allocators/IAllocator.hpp"
 #include "Hardware/Bus/Pci/IPciBus.hpp"
+#include "Hardware/Bus/Thunderbolt/ThunderboltCio.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltDevices.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltIcm.hpp"
 #include "Hardware/RegisterMapper.hpp"
@@ -34,7 +35,12 @@ class ThunderboltDriver {
   enum class Outcome : uint8_t { NotStarted, Started, UnknownDevice, BarUnmapped, OutOfMemory, ControllerFailed };
   static constexpr uint32_t kRegisterBytes = 0x40000;       // BAR 0 of the NHI
 
+  struct Config {
+    bool start_firmware = false;       // see ThunderboltIcm::Options
+    bool reset_ports = true;
+  };
   explicit ThunderboltDriver(allocators::IAllocator& allocator) : allocator_(allocator) {}
+  ThunderboltDriver(allocators::IAllocator& allocator, const Config& config) : allocator_(allocator), config_(config) {}
   ~ThunderboltDriver() { stop(); }
   ThunderboltDriver(const ThunderboltDriver&) = delete;
   ThunderboltDriver& operator=(const ThunderboltDriver&) = delete;
@@ -43,7 +49,8 @@ class ThunderboltDriver {
 
   Outcome start(IPciBus& pci, const PciDeviceInfo& device, IRegisterMapper& mapper);
   // The part after the registers are reachable (tests bring their own).
-  Outcome start_device(ITbRegisters& registers);
+  // `cio`: the PCIe-to-CIO registers if there are any (see ThunderboltCio).
+  Outcome start_device(ITbRegisters& registers, TbPcie2Cio* cio = nullptr);
   void stop();
 
   Outcome outcome() const { return outcome_; }
@@ -54,6 +61,9 @@ class ThunderboltDriver {
 
  private:
   allocators::IAllocator& allocator_;
+  Config config_;
+  UniquePointer<PciFunctionConfig> upstream_config_;
+  UniquePointer<TbPcie2Cio> cio_;
   UniquePointer<MmioTbRegisters> mmio_;
   UniquePointer<ThunderboltIcm> icm_;
   const TbNhiDevice* model_ = nullptr;

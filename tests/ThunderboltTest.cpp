@@ -548,6 +548,220 @@ static void test_garbage() {
   CHECK(icm.control().read_config(0, 0, TbConfigSpace::Switch, 0, ArrayView<uint32_t>(w, 1), 1000, nullptr, &icm) == TbControl::Result::Ok);
 }
 
+
+// ---- the PCIe-to-CIO registers, starting the firmware, bouncing the links
+
+constexpr uint32_t kLinkUp = 2u << 26;
+
+static void test_cio() {
+  FakeNhi chip;
+  fake_tb::FakeCio config(chip);
+  TbPcie2Cio cio(config, 0x100);
+  uint32_t v = 0;
+  config.cs1[3] = kLinkUp | 0x1234;
+  CHECK(cio.read(TbConfigSpace::Port, 3, 0x37, &v) && v == (kLinkUp | 0x1234));
+  CHECK(config.commands.size() == 1 && !config.commands[0].write && config.commands[0].space == 1 && config.commands[0].port == 3 && config.commands[0].index == 0x37);
+  CHECK(cio.write(TbConfigSpace::Port, 3, 0x37, 0xAABBCCDDu) && config.cs1[3] == 0xAABBCCDDu && config.commands[1].write && config.commands[1].value == 0xAABBCCDDu);
+  // arguments that do not fit the command word, no capability, a command that times out, one that never finishes
+  CHECK(!cio.read(TbConfigSpace::Port, 64, 0x37, &v) && !cio.read(TbConfigSpace::Port, 1, 0x2000, &v) && !cio.write(TbConfigSpace::Port, 99, 0, 0));
+  TbPcie2Cio none(config, 0);
+  CHECK(!none.read(TbConfigSpace::Port, 1, 0x37, &v));
+  config.fail_commands = true;
+  CHECK(!cio.read(TbConfigSpace::Port, 1, 0x37, &v) && !cio.write(TbConfigSpace::Port, 1, 0x37, 0));
+  config.fail_commands = false;
+  config.hang = true;
+  CHECK(!cio.read(TbConfigSpace::Port, 1, 0x37, &v, 5000));
+
+  // the capability list: the vendor capability is found along a chain, a missing one, a loop and a dead bus end the walk
+  struct Chain final : ITbConfigSpace {
+    uint32_t words[0x400 / 4] = {};
+    uint32_t read32(uint16_t offset) override { return offset < 0x1000 && offset / 4 < 0x400 / 4 + 0x100 / 4 ? words[(offset - 0x100) / 4] : 0; }
+    void write32(uint16_t, uint32_t) override {}
+  } chain;
+  chain.words[0] = 0x0001 | (0x140u << 20);                     // some other capability, next at 0x140
+  chain.words[0x40 / 4] = 0x000B | (1u << 16);
+  CHECK(tb_find_vendor_capability(chain) == 0x140);
+  chain.words[0x40 / 4] = 0x0002 | (0x100u << 20);              // loops back to the first
+  CHECK(tb_find_vendor_capability(chain) == 0);
+  chain.words[0] = 0;
+  CHECK(tb_find_vendor_capability(chain) == 0);
+  chain.words[0] = 0xFFFFFFFFu;
+  CHECK(tb_find_vendor_capability(chain) == 0);
+  CHECK(tb_find_vendor_capability(config) == 0x100);
+  config.capability = 0;
+  CHECK(tb_find_vendor_capability(config) == 0);
+}
+
+static void test_firmware_start() {
+  TestAllocator alloc;
+  // the BIOS did not start the firmware: without permission, or without the registers, it stays off
+  {
+    FakeNhi chip;
+    chip.icm_enabled = false;
+    chip.auth_done = false;
+    fake_tb::FakeCio config(chip);
+    TbPcie2Cio cio(config, 0x100);
+    ThunderboltIcm icm(chip, alloc);
+    ThunderboltIcm::Options options;
+    options.cio = &cio;
+    icm.set_options(options);                                           // start_firmware is off
+    CHECK(icm.start(100000) == ThunderboltIcm::Outcome::FirmwareNotRunning && config.commands.empty() && chip.fw_sts_writes.empty());
+    options.cio = nullptr;
+    options.start_firmware = true;
+    icm.set_options(options);
+    CHECK(icm.start(100000) == ThunderboltIcm::Outcome::FirmwareNotRunning && chip.fw_sts_writes.empty());
+  }
+  // with both: CIO_RESET_REQ first, then the ARC restarted, then the reset through the switch space, and the firmware authenticates
+  {
+    FakeNhi chip;
+    chip.icm_enabled = false;
+    chip.auth_done = false;
+    fake_tb::FakeCio config(chip);
+    TbPcie2Cio cio(config, 0x100);
+    ThunderboltIcm icm(chip, alloc);
+    ThunderboltIcm::Options options;
+    options.cio = &cio;
+    options.start_firmware = true;
+    icm.set_options(options);
+    CHECK(icm.start(100000) == ThunderboltIcm::Outcome::Started && chip.cio_resets == 1);
+    CHECK(chip.fw_sts_writes.size() == 2 && chip.fw_sts_writes[0] == (1u << 30) && chip.fw_sts_writes[1] == ((1u << 30) | (1u << 2) | (1u << 1)));
+    CHECK(config.commands.size() >= 1 && config.commands[0].write && config.commands[0].space == 2 && config.commands[0].port == 0 && config.commands[0].index == 0x50 && config.commands[0].value == (1u << 9));
+    CHECK(icm.security_level() == TbSecurityLevel::User);
+  }
+  // the command fails, the root router does not reset, the firmware never authenticates
+  struct Fail { const char* name; void (*setup)(FakeNhi&, fake_tb::FakeCio&); };
+  const Fail fails[] = {
+      {"cio fails", [](FakeNhi&, fake_tb::FakeCio& c) { c.fail_commands = true; }},
+      {"cio hangs", [](FakeNhi&, fake_tb::FakeCio& c) { c.hang = true; }},
+      {"no reset", [](FakeNhi&, fake_tb::FakeCio& c) { c.root_resets = false; }},
+      {"no firmware", [](FakeNhi& n, fake_tb::FakeCio&) { n.firmware_comes_up_on_reset = false; }},
+  };
+  for (const Fail& f : fails) {
+    FakeNhi chip;
+    chip.icm_enabled = false;
+    chip.auth_done = false;
+    fake_tb::FakeCio config(chip);
+    f.setup(chip, config);
+    TbPcie2Cio cio(config, 0x100);
+    ThunderboltIcm icm(chip, alloc);
+    ThunderboltIcm::Options options;
+    options.cio = &cio;
+    options.start_firmware = true;
+    icm.set_options(options);
+    const ThunderboltIcm::Outcome got = icm.start(20000);
+    if (got != ThunderboltIcm::Outcome::FirmwareStartFailed) printf("  case %s: got %s\n", f.name, ThunderboltIcm::outcome_name(got));
+    CHECK(got == ThunderboltIcm::Outcome::FirmwareStartFailed && !icm.running());
+    CHECK(alloc.dma.empty());
+  }
+  // a firmware that already runs is left alone
+  {
+    FakeNhi chip;
+    fake_tb::FakeCio config(chip);
+    TbPcie2Cio cio(config, 0x100);
+    ThunderboltIcm icm(chip, alloc);
+    ThunderboltIcm::Options options;
+    options.cio = &cio;
+    options.start_firmware = true;
+    options.reset_ports = false;
+    icm.set_options(options);
+    CHECK(icm.start() == ThunderboltIcm::Outcome::Started && chip.fw_sts_writes.empty() && config.commands.empty() && chip.cio_resets == 0);
+  }
+}
+
+static void test_port_reset() {
+  TestAllocator alloc;
+  auto run = [&](void (*setup)(fake_tb::FakeCio&), bool reset, ThunderboltIcm::Outcome expect, uint32_t failures, std::vector<fake_tb::FakeCio::Command>* log) {
+    FakeNhi chip;
+    fake_tb::FakeCio config(chip);
+    setup(config);
+    TbPcie2Cio cio(config, 0x100);
+    ThunderboltIcm icm(chip, alloc);
+    ThunderboltIcm::Options options;
+    options.cio = &cio;
+    options.reset_ports = reset;
+    icm.set_options(options);
+    const ThunderboltIcm::Outcome got = icm.start(50000);
+    CHECK(got == expect && icm.port_reset_failures() == failures);
+    if (log) *log = config.commands;
+    CHECK(alloc.dma.empty() || got == ThunderboltIcm::Outcome::Started);
+  };
+  std::vector<fake_tb::FakeCio::Command> log;
+  // physical port 0 (ports 1 and 2) has a device on both lanes, port 1 (3 and 4) has nothing
+  run([](fake_tb::FakeCio& c) { c.cs1[1] = kLinkUp | 5; c.cs1[2] = kLinkUp | 6; c.cs1[3] = 0; c.cs1[4] = 0; }, true, ThunderboltIcm::Outcome::Started, 0, &log);
+  // port 0: read lanes 1 and 2, disable both, read them again, enable both; port 1: read lanes 3 and 4 (not up: left alone)
+  CHECK(log.size() == 10 && !log[0].write && log[0].port == 1 && !log[1].write && log[1].port == 2);
+  CHECK(log.size() == 10 && log[2].write && log[2].port == 1 && log[2].value == (kLinkUp | 5 | (1u << 14)) && log[3].write && log[3].port == 2 && log[3].value == (kLinkUp | 6 | (1u << 14)));
+  CHECK(log.size() == 10 && !log[4].write && !log[5].write && log[6].write && log[6].port == 1 && log[6].value == (kLinkUp | 5) && log[7].write && log[7].port == 2 && log[7].value == (kLinkUp | 6));
+  CHECK(log.size() == 10 && !log[8].write && log[8].port == 3 && !log[9].write && log[9].port == 4);
+  // only one lane up: no reset; and both ports with devices
+  run([](fake_tb::FakeCio& c) { c.cs1[1] = kLinkUp; c.cs1[2] = 0; c.cs1[3] = 0; c.cs1[4] = 0; }, true, ThunderboltIcm::Outcome::Started, 0, &log);
+  CHECK(log.size() == 4);          // both ports read, nothing written
+  run([](fake_tb::FakeCio& c) { c.cs1[1] = kLinkUp; c.cs1[2] = kLinkUp; c.cs1[3] = kLinkUp; c.cs1[4] = kLinkUp; }, true, ThunderboltIcm::Outcome::Started, 0, &log);
+  CHECK(log.size() == 16 && log[8].port == 3 && log[10].write && log[10].port == 3 && log[14].write && log[14].port == 3);
+  // switched off
+  run([](fake_tb::FakeCio& c) { c.cs1[1] = kLinkUp; c.cs1[2] = kLinkUp; }, false, ThunderboltIcm::Outcome::Started, 0, &log);
+  CHECK(log.empty());
+  // the registers fail: both resets are reported, the start goes on
+  run([](fake_tb::FakeCio& c) { c.fail_commands = true; }, true, ThunderboltIcm::Outcome::Started, 2, nullptr);
+}
+
+static void test_upstream_port() {
+  using fake_tb::FakePci;
+  auto make = [](uint8_t bus, uint8_t dev, uint16_t id, uint8_t sec, uint8_t sub, int pcie_type) {
+    FakePci::Function f;
+    f.info.address = {bus, dev, 0};
+    f.info.vendor_id = 0x8086;
+    f.info.device_id = id;
+    f.info.class_code = 6;
+    f.info.subclass = 4;
+    f.secondary = sec;
+    f.subordinate = sub;
+    f.pcie_type = pcie_type;
+    return f;
+  };
+  PciDeviceInfo nhi{};
+  nhi.address = {5, 0, 0};
+  nhi.vendor_id = 0x8086;
+  nhi.device_id = 0x15BF;
+  PciAddress port{};
+  // the usual: root port (not Intel's), the switch's upstream port 02:00.0 over buses 3 to 6, its downstream ports (same device id, type 6) and the NHI's bus
+  {
+    FakePci pci;
+    FakePci::Function root = make(0, 28, 0x9D10, 1, 6, 4);
+    root.info.vendor_id = 0x8086;
+    pci.functions.push_back(root);
+    pci.functions.push_back(make(1, 0, 0x15C0, 2, 6, 5));      // another upstream port further out: a wider range
+    pci.functions.push_back(make(2, 0, 0x15C0, 3, 6, 5));
+    pci.functions.push_back(make(3, 0, 0x15C0, 4, 4, 6));
+    pci.functions.push_back(make(3, 2, 0x15C0, 5, 5, 6));
+    CHECK(tb_find_upstream_port(pci, nhi, &port) && port.bus == 2 && port.device == 0);
+  }
+  // the nearest wins whatever the order of discovery
+  {
+    FakePci pci;
+    pci.functions.push_back(make(2, 0, 0x15C0, 3, 6, 5));
+    pci.functions.push_back(make(1, 0, 0x15C0, 2, 6, 5));
+    CHECK(tb_find_upstream_port(pci, nhi, &port) && port.bus == 2);
+  }
+  // not found: only downstream ports, no PCIe capability, a bridge of another kind, another vendor, a bus range that does not hold the NHI, a header that is not a bridge
+  {
+    FakePci pci;
+    pci.functions.push_back(make(3, 0, 0x15C0, 4, 6, 6));
+    pci.functions.push_back(make(2, 0, 0x15C0, 3, 6, -1));
+    pci.functions.push_back(make(2, 1, 0x1234, 3, 6, 5));
+    FakePci::Function other = make(2, 2, 0x15C0, 3, 6, 5);
+    other.info.vendor_id = 0x1022;
+    pci.functions.push_back(other);
+    pci.functions.push_back(make(2, 3, 0x15C0, 6, 9, 5));
+    FakePci::Function endpoint = make(2, 4, 0x15C0, 3, 6, 5);
+    endpoint.header_type = 0;
+    pci.functions.push_back(endpoint);
+    pci.functions.push_back(make(2, 5, 0x15C0, 0, 0, 5));
+    CHECK(!tb_find_upstream_port(pci, nhi, &port));
+  }
+  CHECK([&] { FakePci empty; return !tb_find_upstream_port(empty, nhi, &port); }());
+}
+
 static void test_driver() {
   TestAllocator alloc;
   {
@@ -566,6 +780,22 @@ static void test_driver() {
     chip.icm_enabled = false;
     ThunderboltDriver driver(alloc);
     CHECK(driver.start_device(chip) == ThunderboltDriver::Outcome::ControllerFailed && driver.icm() && strlen(driver.message()) > 0);
+  }
+  {
+    // the driver hands the PCIe-to-CIO registers and its configuration to the connection manager client
+    FakeNhi chip;
+    chip.icm_enabled = false;
+    chip.auth_done = false;
+    fake_tb::FakeCio config(chip);
+    TbPcie2Cio cio(config, 0x100);
+    ThunderboltDriver::Config cfg;
+    cfg.start_firmware = true;
+    ThunderboltDriver driver(alloc, cfg);
+    CHECK(driver.start_device(chip, &cio) == ThunderboltDriver::Outcome::Started && chip.cio_resets == 1);
+    ThunderboltDriver plain(alloc);
+    FakeNhi off;
+    off.icm_enabled = false;
+    CHECK(plain.start_device(off, nullptr) == ThunderboltDriver::Outcome::ControllerFailed);
   }
   {
     PciDeviceInfo info{};
@@ -589,6 +819,10 @@ int main() {
   test_device_events();
   test_approve();
   test_garbage();
+  test_cio();
+  test_firmware_start();
+  test_port_reset();
+  test_upstream_port();
   test_driver();
   printf(g_failed ? "ThunderboltTest: %d FAILED\n" : "ThunderboltTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;

@@ -138,6 +138,7 @@ const char* ThunderboltIcm::outcome_name(Outcome outcome) {
     case Outcome::Started: return "started";
     case Outcome::NotPresent: return "the controller does not answer";
     case Outcome::FirmwareNotRunning: return "the connection manager firmware is not running (the BIOS did not start it)";
+    case Outcome::FirmwareStartFailed: return "the connection manager firmware did not come up after it was restarted";
     case Outcome::ControlFailed: return "the control channel could not be started";
     case Outcome::AuthTimeout: return "the controller's firmware image was not authenticated";
     case Outcome::SafeMode: return "the controller is in safe mode (its NVM needs an update)";
@@ -164,7 +165,11 @@ ThunderboltIcm::Outcome ThunderboltIcm::start(uint32_t timeout_us) {
   ready_ = TbDriverReady();
   if (!nhi_.present()) return outcome_ = Outcome::NotPresent;
   nhi_.disable_interrupts();
-  if (!nhi_.icm_running()) return outcome_ = Outcome::FirmwareNotRunning;
+  port_reset_failures_ = 0;
+  if (!nhi_.icm_running()) {
+    if (!options_.start_firmware || !options_.cio) return outcome_ = Outcome::FirmwareNotRunning;
+    if (!start_firmware()) return outcome_ = Outcome::FirmwareStartFailed;
+  }
   if (!control_.start()) return outcome_ = Outcome::ControlFailed;
   if (!nhi_.wait_firmware_authenticated(timeout_us < 3000000 ? timeout_us : 3000000)) {
     control_.stop();
@@ -181,6 +186,10 @@ ThunderboltIcm::Outcome ThunderboltIcm::start(uint32_t timeout_us) {
       control_.stop();
       return outcome_ = Outcome::WrongMode;
   }
+  // links that are already up are bounced, so that the firmware finds what is connected again (failures are not fatal)
+  if (options_.cio && options_.reset_ports)
+    for (uint32_t physical = 0; physical < 2; ++physical)
+      if (!reset_physical_port(physical)) ++port_reset_failures_;
   uint8_t request_bytes[tb_icm::kDriverReadyBytes], response[tb_icm::kDriverReadyResponseBytes];
   const uint32_t n = tb_icm::build_driver_ready(ByteView(request_bytes, sizeof request_bytes));
   if (n == 0 || !request(ConstByteView(request_bytes, n), ByteView(response, sizeof response), timeout_us) || !tb_icm::parse_driver_ready(ConstByteView(response, sizeof response), &ready_)) {
@@ -199,6 +208,29 @@ ThunderboltIcm::Outcome ThunderboltIcm::start(uint32_t timeout_us) {
     return outcome_ = Outcome::RootSwitchFailed;
   }
   return outcome_ = Outcome::Started;
+}
+
+// icm_firmware_start: the ARC is told to wait for a CIO reset, restarted, and the reset is triggered through the PCIe-to-CIO registers; the firmware then authenticates its image.
+bool ThunderboltIcm::start_firmware() {
+  ITbRegisters& regs = nhi_.registers();
+  regs.write32(tb_reg::kFirmwareStatus, regs.read32(tb_reg::kFirmwareStatus) | tb_reg::kFwStsCioResetRequest);
+  regs.write32(tb_reg::kFirmwareStatus, regs.read32(tb_reg::kFirmwareStatus) | tb_reg::kFwStsIcmEnableInvert | tb_reg::kFwStsIcmEnableCpu);
+  if (!options_.cio->write(TbConfigSpace::Switch, 0, tb_cio::kSwitchResetIndex, tb_cio::kSwitchResetBit)) return false;
+  return nhi_.wait_firmware_authenticated(3000000);
+}
+
+// icm_reset_phy_port: the two lanes of a physical port (ports 1 and 2, or 3 and 4) are disabled and enabled again if both are up.
+bool ThunderboltIcm::reset_physical_port(uint32_t physical_port) {
+  TbPcie2Cio& cio = *options_.cio;
+  const uint32_t port0 = physical_port ? 3 : 1, port1 = port0 + 1;
+  uint32_t v0 = 0, v1 = 0;
+  if (!cio.read(TbConfigSpace::Port, port0, tb_cio::kPhyPortCs1, &v0) || !cio.read(TbConfigSpace::Port, port1, tb_cio::kPhyPortCs1, &v1)) return false;
+  const uint32_t state0 = (v0 & tb_cio::kPhyLinkStateMask) >> tb_cio::kPhyLinkStateShift, state1 = (v1 & tb_cio::kPhyLinkStateMask) >> tb_cio::kPhyLinkStateShift;
+  if (state0 != tb_cio::kPortStateUp || state1 != tb_cio::kPortStateUp) return true;           // nothing connected
+  if (!cio.write(TbConfigSpace::Port, port0, tb_cio::kPhyPortCs1, v0 | tb_cio::kPhyLinkDisable) || !cio.write(TbConfigSpace::Port, port1, tb_cio::kPhyPortCs1, v1 | tb_cio::kPhyLinkDisable)) return false;
+  delay_us(100);
+  if (!cio.read(TbConfigSpace::Port, port0, tb_cio::kPhyPortCs1, &v0) || !cio.read(TbConfigSpace::Port, port1, tb_cio::kPhyPortCs1, &v1)) return false;
+  return cio.write(TbConfigSpace::Port, port0, tb_cio::kPhyPortCs1, v0 & ~tb_cio::kPhyLinkDisable) && cio.write(TbConfigSpace::Port, port1, tb_cio::kPhyPortCs1, v1 & ~tb_cio::kPhyLinkDisable);
 }
 
 void ThunderboltIcm::stop() {
