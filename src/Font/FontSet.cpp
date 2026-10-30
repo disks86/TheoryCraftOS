@@ -244,8 +244,12 @@ bool parse_unicode_range(StringView css, List<CodepointRange>* out) {
   }
 }
 
+namespace {
+uint64_t g_next_serial = 0;   // (sets are made one at a time, at start-up of a page or the system)
+}
+
 FontSet::FontSet(allocators::IAllocator& allocator, GlyphCacheLimits cache_limits)
-    : allocator_(allocator), faces_(allocator), instances_(allocator), instance_index_(allocator), cache_(allocator, cache_limits), fallback_(allocator) {}
+    : serial_(++g_next_serial), allocator_(allocator), faces_(allocator), instances_(allocator), instance_index_(allocator), cache_(allocator, cache_limits), fallback_(allocator) {}
 
 bool FontSet::add_face(UniquePointer<Face>&& face) {
   if (!face || faces_.count() >= kMaxFaces) return false;

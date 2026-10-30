@@ -55,6 +55,16 @@ struct TexturedScaledConstants {
   float pad[3];
 };
 ShaderModuleDesc textured_scaled_fragment_shader();
+// The tinted textured pair, for glyphs: per vertex a position, a texture coordinate and a straight color (rgba, 0..1); the fragment shader writes that color with its alpha times the
+// alpha of the texel of texture unit 0. The vertex shader takes the same matrix. Only the software and virgl devices have it.
+struct TintedVertex {
+  float position[3];
+  float uv[2];
+  float color[4];
+};
+ShaderModuleDesc tinted_vertex_shader();
+ShaderModuleDesc tinted_fragment_shader();
+void describe_tinted_pipeline(GraphicsPipelineDesc* desc);
 // Filters of a picture of premultiplied colors, one render pass each (the vertex shader is the textured one; software and virgl only).
 // Blur: one box blur pass along the step: the center texel and eight each way at multiples of the step (texture coordinates), with the nine mirrored weights.
 struct TexturedBlurConstants {

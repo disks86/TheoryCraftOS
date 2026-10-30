@@ -127,6 +127,12 @@ class IRenderer2D {
   // The glyph blit: `source_rect` of `mask` tinted with `color` (its alpha scales the coverage), top left at
   // (x, y). Fully covered pixels of an opaque color are written directly.
   virtual void draw_mask(const MaskView& mask, const Rect2D& source_rect, int32_t x, int32_t y, uint32_t color) = 0;
+  // draw_mask for a glyph: `id` names the bitmap (the same id is always the same pixels), so a renderer may keep it between calls and need not be given it again to
+  // draw it; the pixels are `mask` as they are. The default draws the mask.
+  virtual void draw_glyph(uint64_t id, const MaskView& mask, int32_t x, int32_t y, uint32_t color) {
+    (void)id;
+    draw_mask(mask, Rect2D{0, 0, mask.width, mask.height}, x, y, color);
+  }
   // Draws `source_rect` of `source` stretched over `dest`. Pixel centers of `dest` map linearly into
   // `source_rect`; samples never leave the rectangle (clamped at its edges).
   virtual void draw_image_scaled(const Surface& source, const RectF& source_rect, const Rect2D& dest, ImageFilter filter) = 0;
