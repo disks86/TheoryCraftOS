@@ -113,133 +113,616 @@ static ULONG *error_mode_of(void) {
 }
 EXPORT ULONG NTAPI RtlGetThreadErrorMode(void) { return *error_mode_of(); }
 EXPORT NTSTATUS NTAPI RtlSetThreadErrorMode(ULONG mode, PULONG old) {
-  if (mode & ~0x70u) return STATUS_INVALID_PARAMETER_;
+  if (mode & ~0x70u) return 0xC00000EFu;      /* STATUS_INVALID_PARAMETER_1 */
   ULONG *p = error_mode_of();
   if (old) *old = *p;
   *p = mode;
+  *(ULONG *)((BYTE *)NtCurrentTeb() + 0x16B0) = mode;      /* (TEB.HardErrorMode) */
   return STATUS_SUCCESS;
 }
 
-/* ---- IPv4 addresses as text ---------------------------------------------------------------------------------------------------------------------------- */
+/* ---- IP addresses as text (as Wine's ntdll does them) ---------------------------------------------------------------------------------------------------- */
 
-static char *ipv4_text(const BYTE *a, char *out) {
-  for (int i = 0; i < 4; ++i) {
-    char tmp[4];
-    const unsigned n = format_integer(a[i], 10, tmp);
-    for (unsigned k = 0; k < n; ++k) *out++ = tmp[k];
-    if (i < 3) *out++ = '.';
-  }
-  *out = 0;
-  return out;
-}
-EXPORT char *NTAPI RtlIpv4AddressToStringA(const BYTE *addr, char *s) { return ipv4_text(addr, s); }
-EXPORT WCHAR *NTAPI RtlIpv4AddressToStringW(const BYTE *addr, WCHAR *s) {
-  char t[16];
-  const char *end = ipv4_text(addr, t);
-  for (const char *p = t; p <= end; ++p) *s++ = (WCHAR)(BYTE)*p;
-  return s - 1;
-}
-EXPORT NTSTATUS NTAPI RtlIpv4AddressToStringExA(const BYTE *addr, USHORT port, char *s, PULONG len) {
-  if (!addr || !s || !len) return STATUS_INVALID_PARAMETER_;
-  char t[24];
-  char *end = ipv4_text(addr, t);
-  if (port) { *end++ = ':'; end += format_integer((USHORT)((port >> 8) | (port << 8)), 10, end); }
-  const ULONG need = (ULONG)(end - t) + 1;
-  if (*len < need) { *len = need; return STATUS_INVALID_PARAMETER_; }
-  memcpy(s, t, need);
-  *len = need;
-  return STATUS_SUCCESS;
-}
-EXPORT NTSTATUS NTAPI RtlIpv4AddressToStringExW(const BYTE *addr, USHORT port, WCHAR *s, PULONG len) {
-  char t[24];
-  ULONG n = sizeof(t);
-  NTSTATUS st = RtlIpv4AddressToStringExA(addr, port, t, &n);
-  if (st) return st;
-  if (*len < n) { *len = n; return STATUS_INVALID_PARAMETER_; }
-  for (ULONG i = 0; i < n; ++i) s[i] = (WCHAR)(BYTE)t[i];
-  *len = n;
-  return STATUS_SUCCESS;
-}
-/* One address: up to four numbers separated by dots (decimal, 0x hex, 0 octal when not strict); the last number fills the remaining bytes. */
-static NTSTATUS ipv4_parse(const WCHAR *s, int wide, int strict, const void **end, BYTE *addr, USHORT *port, int allow_port) {
-  ULONGLONG parts[4];
-  int n = 0;
-  const void *p = s;
-#define CH(q) (wide ? ((const WCHAR *)(q))[0] : (WCHAR)((const BYTE *)(q))[0])
-#define ADV(q, k) ((q) = (wide ? (const void *)((const WCHAR *)(q) + (k)) : (const void *)((const BYTE *)(q) + (k))))
-  for (;;) {
-    int base = 10, digits = 0;
-    ULONGLONG v = 0;
-    if (CH(p) == '0' && !strict) {
-      const void *q = p;
-      ADV(q, 1);
-      if (CH(q) == 'x' || CH(q) == 'X') { base = 16; ADV(q, 1); p = q; }
-      else { base = 8; }
+typedef struct { union { struct { BYTE s_b1, s_b2, s_b3, s_b4; } S_un_b; struct { USHORT s_w1, s_w2; } S_un_w; ULONG S_addr; } S_un; } IN_ADDR;
+typedef struct { union { BYTE Byte[16]; USHORT Word[8]; } u; } IN6_ADDR;
+#define s6_words u.Word
+#define s6_bytes u.Byte
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#define min(a, b) ((a) < (b) ? (a) : (b))
+USHORT NTAPI RtlUshortByteSwap(USHORT v);
+#undef htons
+#undef ntohs
+
+#define htons(x) RtlUshortByteSwap(x)
+#define ntohs(x) RtlUshortByteSwap(x)
+
+static const signed char hex_table[] =
+{
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, /* 0x00-0x0F */
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, /* 0x10-0x1F */
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, /* 0x20-0x2F */
+     0,  1,  2,  3,  4,  5,  6,  7,  8,  9, -1, -1, -1, -1, -1, -1, /* 0x30-0x3F */
+    -1, 10, 11, 12, 13, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, /* 0x40-0x4F */
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, /* 0x50-0x5F */
+    -1, 10, 11, 12, 13, 14, 15                                      /* 0x60-0x66 */
+};
+
+static BOOL parse_ipv4_component(const WCHAR **str, BOOL strict, ULONG *value)
+{
+    int base = 10, d;
+    WCHAR c;
+    ULONG cur_value, prev_value = 0;
+    BOOL success = FALSE;
+
+    if (**str == '.')
+    {
+        *str += 1;
+        return FALSE;
     }
-    for (;;) {
-      const WCHAR c = CH(p);
-      const int d = c < 128 ? rtl_digit(c, (ULONG)base) : -1;
-      if (d < 0) break;
-      if (strict && base == 10 && digits == 1 && v == 0) return STATUS_INVALID_PARAMETER_;      /* a leading zero */
-      v = v * (ULONGLONG)base + (ULONGLONG)d;
-      if (v > 0xFFFFFFFFull) return STATUS_INVALID_PARAMETER_;
-      ++digits;
-      ADV(p, 1);
+
+    if ((*str)[0] == '0')
+    {
+        if ((*str)[1] == 'x' || (*str)[1] == 'X')
+        {
+            *str += 2;
+            if (strict) return FALSE;
+            base = 16;
+        }
+        else if ((*str)[1] >= '0' && (*str)[1] <= '9')
+        {
+            *str += 1;
+            if (strict) return FALSE;
+            base = 8;
+        }
     }
-    if (!digits && !(base == 8)) return STATUS_INVALID_PARAMETER_;
-    if (strict && v > 255) return STATUS_INVALID_PARAMETER_;
-    parts[n++] = v;
-    if (CH(p) == '.' && n < 4) { ADV(p, 1); continue; }
-    break;
-  }
-  if (strict && n != 4) return STATUS_INVALID_PARAMETER_;
-  for (int i = 0; i + 1 < n; ++i) if (parts[i] > 255) return STATUS_INVALID_PARAMETER_;
-  if (parts[n - 1] >= (1ull << (8 * (5 - n))) && n < 4 + 1 && n != 4) return STATUS_INVALID_PARAMETER_;
-  if (n == 4 && parts[3] > 255) return STATUS_INVALID_PARAMETER_;
-  for (int i = 0; i + 1 < n; ++i) addr[i] = (BYTE)parts[i];
-  ULONGLONG last = parts[n - 1];
-  for (int i = 3; i >= n - 1; --i) { addr[i] = (BYTE)last; last >>= 8; }
-  if (allow_port && CH(p) == ':') {
-    ADV(p, 1);
-    ULONG v = 0;
-    int digits = 0;
-    while (CH(p) >= '0' && CH(p) <= '9') { v = v * 10 + (ULONG)(CH(p) - '0'); if (v > 65535) return STATUS_INVALID_PARAMETER_; ++digits; ADV(p, 1); }
-    if (!digits) return STATUS_INVALID_PARAMETER_;
-    *port = (USHORT)((v >> 8) | (v << 8));
-  } else if (port) {
-    *port = 0;
-  }
-  *end = p;
-  return STATUS_SUCCESS;
-#undef CH
-#undef ADV
+
+    for (cur_value = 0; **str; *str += 1)
+    {
+        c = **str;
+        if (c >= ARRAY_SIZE(hex_table)) break;
+        d = hex_table[c];
+        if (d == -1 || d >= base) break;
+        cur_value = cur_value * base + d;
+        success = TRUE;
+        if (cur_value < prev_value) return FALSE; /* overflow */
+        prev_value = cur_value;
+    }
+
+    if (success) *value = cur_value;
+    return success;
 }
-EXPORT NTSTATUS NTAPI RtlIpv4StringToAddressA(const char *s, BOOLEAN strict, const char **term, BYTE *addr) {
-  const void *end = s;
-  NTSTATUS st = ipv4_parse((const WCHAR *)s, 0, strict, &end, addr, NULL, 0);
-  if (term) *term = st ? s : (const char *)end;
-  return st;
+
+static NTSTATUS ipv4_string_to_address(const WCHAR *str, BOOL strict,
+                                       const WCHAR **terminator, IN_ADDR *address, USHORT *port)
+{
+    ULONG fields[4];
+    int n = 0;
+
+    for (;;)
+    {
+        if (!parse_ipv4_component(&str, strict, &fields[n]))
+            goto error;
+        n++;
+        if (*str != '.')
+            break;
+        if (n == 4)
+            goto error;
+        str++;
+    }
+
+    if (strict && n < 4)
+        goto error;
+
+    switch (n)
+    {
+        case 4:
+            if (fields[0] > 0xFF || fields[1] > 0xFF || fields[2] > 0xFF || fields[3] > 0xFF)
+                goto error;
+            address->S_un.S_un_b.s_b1 = fields[0];
+            address->S_un.S_un_b.s_b2 = fields[1];
+            address->S_un.S_un_b.s_b3 = fields[2];
+            address->S_un.S_un_b.s_b4 = fields[3];
+            break;
+        case 3:
+            if (fields[0] > 0xFF || fields[1] > 0xFF || fields[2] > 0xFFFF)
+                goto error;
+            address->S_un.S_un_b.s_b1 = fields[0];
+            address->S_un.S_un_b.s_b2 = fields[1];
+            address->S_un.S_un_b.s_b3 = (fields[2] & 0xFF00) >> 8;
+            address->S_un.S_un_b.s_b4 = (fields[2] & 0x00FF);
+            break;
+        case 2:
+            if (fields[0] > 0xFF || fields[1] > 0xFFFFFF)
+                goto error;
+            address->S_un.S_un_b.s_b1 = fields[0];
+            address->S_un.S_un_b.s_b2 = (fields[1] & 0xFF0000) >> 16;
+            address->S_un.S_un_b.s_b3 = (fields[1] & 0x00FF00) >> 8;
+            address->S_un.S_un_b.s_b4 = (fields[1] & 0x0000FF);
+            break;
+        case 1:
+            address->S_un.S_un_b.s_b1 = (fields[0] & 0xFF000000) >> 24;
+            address->S_un.S_un_b.s_b2 = (fields[0] & 0x00FF0000) >> 16;
+            address->S_un.S_un_b.s_b3 = (fields[0] & 0x0000FF00) >> 8;
+            address->S_un.S_un_b.s_b4 = (fields[0] & 0x000000FF);
+            break;
+        default:
+            goto error;
+    }
+
+    if (terminator) *terminator = str;
+
+    if (*str == ':')
+    {
+        str++;
+        if (!parse_ipv4_component(&str, FALSE, &fields[0]))
+            goto error;
+        if (!fields[0] || fields[0] > 0xFFFF || *str)
+            goto error;
+        if (port)
+        {
+            *port = htons(fields[0]);
+            if (terminator) *terminator = str;
+        }
+    }
+
+    if (!terminator && *str)
+        return STATUS_INVALID_PARAMETER;
+    return STATUS_SUCCESS;
+
+error:
+    if (terminator) *terminator = str;
+    return STATUS_INVALID_PARAMETER;
 }
-EXPORT NTSTATUS NTAPI RtlIpv4StringToAddressW(const WCHAR *s, BOOLEAN strict, const WCHAR **term, BYTE *addr) {
-  const void *end = s;
-  NTSTATUS st = ipv4_parse(s, 1, strict, &end, addr, NULL, 0);
-  if (term) *term = st ? s : (const WCHAR *)end;
-  return st;
+
+/***********************************************************************
+ * RtlIpv4StringToAddressExW [NTDLL.@]
+ */
+EXPORT NTSTATUS NTAPI RtlIpv4StringToAddressExW(const WCHAR *str, BOOLEAN strict, IN_ADDR *address, USHORT *port)
+{
+    if (!str || !address || !port) return STATUS_INVALID_PARAMETER;
+    return ipv4_string_to_address(str, strict, NULL, address, port);
 }
-EXPORT NTSTATUS NTAPI RtlIpv4StringToAddressExA(const char *s, BOOLEAN strict, BYTE *addr, USHORT *port) {
-  if (!s || !addr || !port) return STATUS_INVALID_PARAMETER_;
-  const void *end = s;
-  NTSTATUS st = ipv4_parse((const WCHAR *)s, 0, strict, &end, addr, port, 1);
-  if (st == STATUS_SUCCESS && *(const char *)end) return STATUS_INVALID_PARAMETER_;
-  return st;
+
+/***********************************************************************
+ * RtlIpv4StringToAddressW [NTDLL.@]
+ */
+EXPORT NTSTATUS NTAPI RtlIpv4StringToAddressW(const WCHAR *str, BOOLEAN strict, const WCHAR **terminator, IN_ADDR *address)
+{
+    return ipv4_string_to_address(str, strict, terminator, address, NULL);
 }
-EXPORT NTSTATUS NTAPI RtlIpv4StringToAddressExW(const WCHAR *s, BOOLEAN strict, BYTE *addr, USHORT *port) {
-  if (!s || !addr || !port) return STATUS_INVALID_PARAMETER_;
-  const void *end = s;
-  NTSTATUS st = ipv4_parse(s, 1, strict, &end, addr, port, 1);
-  if (st == STATUS_SUCCESS && *(const WCHAR *)end) return STATUS_INVALID_PARAMETER_;
-  return st;
+
+/***********************************************************************
+ * RtlIpv4StringToAddressExA [NTDLL.@]
+ */
+EXPORT NTSTATUS NTAPI RtlIpv4StringToAddressExA(const char *str, BOOLEAN strict, IN_ADDR *address, USHORT *port)
+{
+    WCHAR wstr[32];
+
+    if (!str) return STATUS_INVALID_PARAMETER;
+    RtlMultiByteToUnicodeN(wstr, sizeof(wstr), NULL, str, strlen(str) + 1);
+    wstr[ARRAY_SIZE(wstr) - 1] = 0;
+    return RtlIpv4StringToAddressExW(wstr, strict, address, port);
 }
+
+/***********************************************************************
+ * RtlIpv4StringToAddressA [NTDLL.@]
+ */
+EXPORT NTSTATUS NTAPI RtlIpv4StringToAddressA(const char *str, BOOLEAN strict, const char **terminator, IN_ADDR *address)
+{
+    WCHAR wstr[32];
+    const WCHAR *wterminator;
+    NTSTATUS ret;
+
+    RtlMultiByteToUnicodeN(wstr, sizeof(wstr), NULL, str, strlen(str) + 1);
+    wstr[ARRAY_SIZE(wstr) - 1] = 0;
+    ret = RtlIpv4StringToAddressW(wstr, strict, &wterminator, address);
+    if (terminator) *terminator = str + (wterminator - wstr);
+    return ret;
+}
+
+static BOOL parse_ipv6_component(const WCHAR **str, int base, ULONG *value)
+{
+    WCHAR *terminator;
+    if (**str >= ARRAY_SIZE(hex_table) || hex_table[**str] == -1) return FALSE;
+    *value = min(wcstoul(*str, &terminator, base), 0x7FFFFFFF);
+    if (*terminator == '0') terminator++; /* "0x" but nothing valid after */
+    else if (terminator == *str) return FALSE;
+    *str = terminator;
+    return TRUE;
+}
+
+static NTSTATUS ipv6_string_to_address(const WCHAR *str, BOOL ex,
+                                       const WCHAR **terminator, IN6_ADDR *address, ULONG *scope, USHORT *port)
+{
+    BOOL expecting_port = FALSE, has_0x = FALSE, too_big = FALSE;
+    int n_bytes = 0, n_ipv4_bytes = 0, gap = -1;
+    ULONG ip_component, scope_component = 0, port_component = 0;
+    const WCHAR *prev_str;
+
+    if (str[0] == '[')
+    {
+        if (!ex) goto error;
+        expecting_port = TRUE;
+        str++;
+    }
+
+    if (str[0] == ':')
+    {
+        if (str[1] != ':') goto error;
+        str++;
+        address->u.Word[0] = 0;
+    }
+
+    for (;;)
+    {
+        if (!n_ipv4_bytes && *str == ':')
+        {
+            /* double colon */
+            if (gap != -1) goto error;
+            str++;
+            prev_str = str;
+            gap = n_bytes;
+            if (n_bytes == 14 || !parse_ipv6_component(&str, 16, &ip_component)) break;
+            str = prev_str;
+        }
+        else
+        {
+            prev_str = str;
+        }
+
+        if (!n_ipv4_bytes && n_bytes <= (gap != -1 ? 10 : 12))
+        {
+            if (parse_ipv6_component(&str, 10, &ip_component) && *str == '.')
+                n_ipv4_bytes = 1;
+            str = prev_str;
+        }
+
+        if (n_ipv4_bytes)
+        {
+            /* IPv4 component */
+            if (!parse_ipv6_component(&str, 10, &ip_component)) goto error;
+            if (str - prev_str > 3 || ip_component > 255)
+            {
+                too_big = TRUE;
+            }
+            else
+            {
+                if (*str != '.' && (n_ipv4_bytes < 4 || (n_bytes < 15 && gap == -1))) goto error;
+                address->u.Byte[n_bytes] = ip_component;
+                n_bytes++;
+            }
+            if (n_ipv4_bytes == 4 || *str != '.') break;
+            n_ipv4_bytes++;
+        }
+        else
+        {
+            /* IPv6 component */
+            if (!parse_ipv6_component(&str, 16, &ip_component)) goto error;
+            if (prev_str[0] == '0' && (prev_str[1] == 'x' || prev_str[1] == 'X'))
+            {
+                /* Windows "feature": the last IPv6 component can start with "0x" and be longer than 4 digits */
+                if (terminator) *terminator = prev_str + 1; /* Windows says that the "x" is the terminator */
+                if (n_bytes < 14 && gap == -1) return STATUS_INVALID_PARAMETER;
+                address->u.Word[n_bytes/2] = htons(ip_component);
+                n_bytes += 2;
+                has_0x = TRUE;
+                goto fill_gap;
+            }
+            if (*str != ':' && n_bytes < 14 && gap == -1) goto error;
+            if (str - prev_str > 4)
+                too_big = TRUE;
+            else
+                address->u.Word[n_bytes/2] = htons(ip_component);
+            n_bytes += 2;
+            if (*str != ':' || (gap != -1 && str[1] == ':')) break;
+        }
+        if (n_bytes == (gap != -1 ? 14 : 16)) break;
+        if (too_big) return STATUS_INVALID_PARAMETER;
+        str++;
+    }
+
+    if (terminator) *terminator = str;
+    if (too_big) return STATUS_INVALID_PARAMETER;
+
+fill_gap:
+    if (gap == -1)
+    {
+        if (n_bytes < 16) goto error;
+    }
+    else
+    {
+        memmove(address->u.Byte + 16 - (n_bytes - gap), address->u.Byte + gap, n_bytes - gap);
+        memset(address->u.Byte + gap, 0, 16 - n_bytes);
+    }
+
+    if (ex)
+    {
+        if (has_0x) goto error;
+
+        if (*str == '%')
+        {
+            str++;
+            if (!parse_ipv4_component(&str, TRUE, &scope_component)) goto error;
+        }
+
+        if (expecting_port)
+        {
+            if (*str != ']') goto error;
+            str++;
+            if (*str == ':')
+            {
+                str++;
+                if (!parse_ipv4_component(&str, FALSE, &port_component)) goto error;
+                if (!port_component || port_component > 0xFFFF || *str) goto error;
+                port_component = htons(port_component);
+            }
+        }
+    }
+
+    if (!terminator && *str) return STATUS_INVALID_PARAMETER;
+
+    if (scope) *scope = scope_component;
+    if (port) *port = port_component;
+
+    return STATUS_SUCCESS;
+
+error:
+    if (terminator) *terminator = str;
+    return STATUS_INVALID_PARAMETER;
+}
+
+/***********************************************************************
+ * RtlIpv6StringToAddressExW [NTDLL.@]
+ */
+EXPORT NTSTATUS NTAPI RtlIpv6StringToAddressExW(const WCHAR *str, IN6_ADDR *address, ULONG *scope, USHORT *port)
+{
+    if (!str || !address || !scope || !port) return STATUS_INVALID_PARAMETER;
+    return ipv6_string_to_address(str, TRUE, NULL, address, scope, port);
+}
+
+/***********************************************************************
+ * RtlIpv6StringToAddressW [NTDLL.@]
+ */
+EXPORT NTSTATUS NTAPI RtlIpv6StringToAddressW(const WCHAR *str, const WCHAR **terminator, IN6_ADDR *address)
+{
+    return ipv6_string_to_address(str, FALSE, terminator, address, NULL, NULL);
+}
+
+/***********************************************************************
+ * RtlIpv6StringToAddressExA [NTDLL.@]
+ */
+EXPORT NTSTATUS NTAPI RtlIpv6StringToAddressExA(const char *str, IN6_ADDR *address, ULONG *scope, USHORT *port)
+{
+    WCHAR wstr[128];
+
+    if (!str) return STATUS_INVALID_PARAMETER;
+    RtlMultiByteToUnicodeN(wstr, sizeof(wstr), NULL, str, strlen(str) + 1);
+    wstr[ARRAY_SIZE(wstr) - 1] = 0;
+    return RtlIpv6StringToAddressExW(wstr, address, scope, port);
+}
+
+/***********************************************************************
+ * RtlIpv6StringToAddressA [NTDLL.@]
+ */
+EXPORT NTSTATUS NTAPI RtlIpv6StringToAddressA(const char *str, const char **terminator, IN6_ADDR *address)
+{
+    WCHAR wstr[128];
+    const WCHAR *wterminator = NULL;
+    NTSTATUS ret;
+
+    RtlMultiByteToUnicodeN(wstr, sizeof(wstr), NULL, str, strlen(str) + 1);
+    wstr[ARRAY_SIZE(wstr) - 1] = 0;
+    ret = RtlIpv6StringToAddressW(wstr, &wterminator, address);
+    if (terminator && wterminator) *terminator = str + (wterminator - wstr);
+    return ret;
+}
+
+/***********************************************************************
+ * RtlIpv4AddressToStringExW [NTDLL.@]
+ */
+EXPORT NTSTATUS NTAPI RtlIpv4AddressToStringExW(const IN_ADDR *pin, USHORT port, LPWSTR buffer, PULONG psize)
+{
+    WCHAR tmp_ip[32];
+    ULONG needed;
+
+    if (!pin || !buffer || !psize)
+        return STATUS_INVALID_PARAMETER;
+
+    needed = swprintf(tmp_ip, ARRAY_SIZE(tmp_ip), L"%u.%u.%u.%u",
+                      pin->S_un.S_un_b.s_b1, pin->S_un.S_un_b.s_b2,
+                      pin->S_un.S_un_b.s_b3, pin->S_un.S_un_b.s_b4);
+
+    if (port) needed += swprintf(tmp_ip + needed, ARRAY_SIZE(tmp_ip) - needed, L":%u", ntohs(port));
+
+    if (*psize > needed) {
+        *psize = needed + 1;
+        wcscpy(buffer, tmp_ip);
+        return STATUS_SUCCESS;
+    }
+
+    *psize = needed + 1;
+    return STATUS_INVALID_PARAMETER;
+}
+
+/***********************************************************************
+ * RtlIpv4AddressToStringExA [NTDLL.@]
+ */
+EXPORT NTSTATUS NTAPI RtlIpv4AddressToStringExA(const IN_ADDR *pin, USHORT port, LPSTR buffer, PULONG psize)
+{
+    CHAR tmp_ip[32];
+    ULONG needed;
+
+    if (!pin || !buffer || !psize)
+        return STATUS_INVALID_PARAMETER;
+
+    needed = sprintf(tmp_ip, "%u.%u.%u.%u",
+                     pin->S_un.S_un_b.s_b1, pin->S_un.S_un_b.s_b2,
+                     pin->S_un.S_un_b.s_b3, pin->S_un.S_un_b.s_b4);
+
+    if (port) needed += sprintf(tmp_ip + needed, ":%u", ntohs(port));
+
+    if (*psize > needed) {
+        *psize = needed + 1;
+        strcpy(buffer, tmp_ip);
+        return STATUS_SUCCESS;
+    }
+
+    *psize = needed + 1;
+    return STATUS_INVALID_PARAMETER;
+}
+
+/***********************************************************************
+ * RtlIpv4AddressToStringW [NTDLL.@]
+ */
+EXPORT WCHAR * NTAPI RtlIpv4AddressToStringW(const IN_ADDR *pin, LPWSTR buffer)
+{
+    ULONG size = 16;
+
+    if (RtlIpv4AddressToStringExW(pin, 0, buffer, &size)) size = 0;
+    return buffer + size - 1;
+}
+
+/***********************************************************************
+ * RtlIpv4AddressToStringA [NTDLL.@]
+ */
+EXPORT CHAR * NTAPI RtlIpv4AddressToStringA(const IN_ADDR *pin, LPSTR buffer)
+{
+    ULONG size = 16;
+
+    if (RtlIpv4AddressToStringExA(pin, 0, buffer, &size)) size = 0;
+    return buffer + size - 1;
+}
+
+static BOOL is_ipv4_in_ipv6(const IN6_ADDR *address)
+{
+    if (address->s6_words[5] == htons(0x5efe) && (address->s6_words[4] & ~htons(0x200)) == 0)
+        return TRUE;
+    if (*(UINT64 *)address != 0)
+        return FALSE;
+    if (address->s6_words[4] != 0 && address->s6_words[4] != 0xffff)
+        return FALSE;
+    if (address->s6_words[4] == 0 && address->s6_words[5] != 0 && address->s6_words[5] != 0xffff)
+        return FALSE;
+    if (address->s6_words[4] == 0xffff && address->s6_words[5] != 0)
+        return FALSE;
+    if (address->s6_words[6] == 0)
+        return FALSE;
+    return TRUE;
+}
+
+/***********************************************************************
+ * RtlIpv6AddressToStringExA [NTDLL.@]
+ */
+EXPORT NTSTATUS NTAPI RtlIpv6AddressToStringExA(const IN6_ADDR *address, ULONG scope, USHORT port,
+                                          char *str, ULONG *size)
+{
+    char buffer[64], *p = buffer;
+    int i, len, gap = -1, gap_len = 1, ipv6_end = 8;
+    ULONG needed;
+    NTSTATUS ret;
+
+    if (!address || !str || !size)
+        return STATUS_INVALID_PARAMETER;
+
+    if (is_ipv4_in_ipv6(address))
+        ipv6_end = 6;
+
+    for (i = 0; i < ipv6_end; i++)
+    {
+        len = 0;
+        while (i < ipv6_end && !address->s6_words[i])
+        {
+            i++;
+            len++;
+        }
+        if (len > gap_len)
+        {
+            gap = i - len;
+            gap_len = len;
+        }
+    }
+
+    if (port) p += sprintf(p, "[");
+
+    i = 0;
+    while (i < ipv6_end)
+    {
+        if (i == gap)
+        {
+            p += sprintf(p, ":");
+            i += gap_len;
+            if (i == ipv6_end) p += sprintf(p, ":");
+            continue;
+        }
+        if (i > 0) p += sprintf(p, ":");
+        p += sprintf(p, "%x", ntohs(address->s6_words[i]));
+        i++;
+    }
+
+    if (ipv6_end == 6)
+    {
+        if (p[-1] != ':') p += sprintf(p, ":");
+        p = RtlIpv4AddressToStringA((IN_ADDR *)(address->s6_words + 6), p);
+    }
+
+    if (scope) p += sprintf(p, "%%%lu", scope);
+
+    if (port) p += sprintf(p, "]:%u", ntohs(port));
+
+    needed = p - buffer + 1;
+
+    if (*size >= needed)
+    {
+        strcpy(str, buffer);
+        ret = STATUS_SUCCESS;
+    }
+    else
+    {
+        ret = STATUS_INVALID_PARAMETER;
+    }
+
+    *size = needed;
+    return ret;
+}
+
+/***********************************************************************
+ * RtlIpv6AddressToStringA [NTDLL.@]
+ */
+EXPORT char * NTAPI RtlIpv6AddressToStringA(const IN6_ADDR *address, char *str)
+{
+    ULONG size = 46;
+    if (!address || !str) return str - 1;
+    str[45] = 0; /* this byte is set even though the string is always shorter */
+    RtlIpv6AddressToStringExA(address, 0, 0, str, &size);
+    return str + size - 1;
+}
+
+/***********************************************************************
+ * RtlIpv6AddressToStringExW [NTDLL.@]
+ */
+EXPORT NTSTATUS NTAPI RtlIpv6AddressToStringExW(const IN6_ADDR *address, ULONG scope, USHORT port,
+                                          WCHAR *str, ULONG *size)
+{
+    char cstr[64];
+    NTSTATUS ret = RtlIpv6AddressToStringExA(address, scope, port, cstr, size);
+    if (ret == STATUS_SUCCESS) RtlMultiByteToUnicodeN(str, *size * sizeof(WCHAR), NULL, cstr, *size);
+    return ret;
+}
+
+/***********************************************************************
+ * RtlIpv6AddressToStringW [NTDLL.@]
+ */
+EXPORT WCHAR * NTAPI RtlIpv6AddressToStringW(const IN6_ADDR *address, WCHAR *str)
+{
+    ULONG size = 46;
+    if (!address || !str) return str;
+    str[45] = 0; /* this word is set even though the string is always shorter */
+    if (RtlIpv6AddressToStringExW(address, 0, 0, str, &size) != STATUS_SUCCESS)
+        return str;
+    return str + size - 1;
+}
+
+
 
 /* ---- the environment block ------------------------------------------------------------------------------------------------------------------------------- */
 
@@ -864,26 +1347,26 @@ EXPORT PVOID NTAPI RtlDeNormalizeProcessParams(PVOID params) {
 /* The debug buffer of RtlQueryProcessDebugInformation: this process only; the heap and module lists are headers with a count. */
 EXPORT PVOID NTAPI RtlCreateQueryDebugBuffer(ULONG size, BOOLEAN event_pair) {
   (void)size; (void)event_pair;
-  return RtlAllocateHeap(RtlProcessHeap(), 8, 0xA8);
+  return RtlAllocateHeap(RtlProcessHeap(), 8, 0xB8);
 }
 EXPORT NTSTATUS NTAPI RtlQueryProcessDebugInformation(ULONG pid, ULONG mask, PVOID buffer) {
   BYTE *b = buffer;
   if (!b) return STATUS_INVALID_PARAMETER_;
   if (pid != (ULONG)TEB_CLIENT_PROCESS(NtCurrentTeb())) return (NTSTATUS)0xC000000Bu;      /* STATUS_INVALID_CID */
   *(ULONG *)(b + 0x40) = mask;
-  if (mask & 1) { if (!*(PVOID *)(b + 0x50)) *(PVOID *)(b + 0x50) = RtlAllocateHeap(RtlProcessHeap(), 8, 0x100); if (!*(PVOID *)(b + 0x50)) return STATUS_NO_MEMORY_; }
+  if (mask & 1) { if (!*(PVOID *)(b + 0x60)) *(PVOID *)(b + 0x60) = RtlAllocateHeap(RtlProcessHeap(), 8, 0x100); if (!*(PVOID *)(b + 0x60)) return STATUS_NO_MEMORY_; }
   if (mask & 4) {
-    if (!*(PVOID *)(b + 0x60)) *(PVOID *)(b + 0x60) = RtlAllocateHeap(RtlProcessHeap(), 8, 0x100);
-    if (!*(PVOID *)(b + 0x60)) return STATUS_NO_MEMORY_;
+    if (!*(PVOID *)(b + 0x70)) *(PVOID *)(b + 0x70) = RtlAllocateHeap(RtlProcessHeap(), 8, 0x100);
+    if (!*(PVOID *)(b + 0x70)) return STATUS_NO_MEMORY_;
     PVOID heaps[MAX_HEAPS];
-    *(ULONG *)*(PVOID *)(b + 0x60) = RtlGetProcessHeaps(MAX_HEAPS, heaps);
+    *(ULONG *)*(PVOID *)(b + 0x70) = RtlGetProcessHeaps(MAX_HEAPS, heaps);
   }
   return STATUS_SUCCESS;
 }
 EXPORT NTSTATUS NTAPI RtlDestroyQueryDebugBuffer(PVOID buffer) {
   BYTE *b = buffer;
   if (!b) return STATUS_INVALID_PARAMETER_;
-  for (int off = 0x50; off <= 0x68; off += 8) if (*(PVOID *)(b + off)) RtlFreeHeap(RtlProcessHeap(), 0, *(PVOID *)(b + off));
+  for (int off = 0x60; off <= 0x78; off += 8) if (*(PVOID *)(b + off)) RtlFreeHeap(RtlProcessHeap(), 0, *(PVOID *)(b + off));
   RtlFreeHeap(RtlProcessHeap(), 0, b);
   return STATUS_SUCCESS;
 }

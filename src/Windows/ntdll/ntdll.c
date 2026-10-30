@@ -811,6 +811,8 @@ EXPORT PVOID NTAPI RtlProcessHeap(void) { return process_heap(); }
 #include "rtl.inc"
 #include "libc.inc"
 #include "rtl2.inc"
+#include "rtl3.inc"
+#include "sec.inc"
 #include "uilang.inc"
 #include "normalize.inc"
 #include "reg.inc"
@@ -839,20 +841,19 @@ EXPORT NTSTATUS NTAPI RtlInitializeCriticalSectionEx(PRTL_CRITICAL_SECTION cs, U
 }
 EXPORT NTSTATUS NTAPI RtlInitializeCriticalSection(PRTL_CRITICAL_SECTION cs) { return RtlInitializeCriticalSectionEx(cs, 0, 0); }
 EXPORT NTSTATUS NTAPI RtlInitializeCriticalSectionAndSpinCount(PRTL_CRITICAL_SECTION cs, ULONG spin) { return RtlInitializeCriticalSectionEx(cs, spin, 0); }
-/* LockCount is -1 while the section is free, and the recursion depth minus one while a thread holds it. A thread that finds it taken gives its time slice away until the owner
+/* LockCount is -1 while the section is free and -2 while a thread holds it (the recursion depth is the RecursionCount; a thread waiting adds 4 to its distance from -1). A thread that finds it taken gives its time slice away until the owner
  * has let go. */
 EXPORT NTSTATUS NTAPI RtlEnterCriticalSection(PRTL_CRITICAL_SECTION cs) {
   const HANDLE me = (HANDLE)TEB_CLIENT_THREAD(NtCurrentTeb());
   if (cs->OwningThread == me && cs->RecursionCount > 0) {      /* (only the owner can see itself here) */
     ++cs->RecursionCount;
-    ++cs->LockCount;
     return STATUS_SUCCESS;
   }
-  while (!__sync_bool_compare_and_swap(&cs->LockCount, -1, 0)) {
-    if (g_process_ending) { cs->LockCount = 0; break; }      /* (the other threads are gone: a section one of them held is taken over rather than waited for) */
+  while (!__sync_bool_compare_and_swap(&cs->LockCount, -1, -2)) {
+    if (g_process_ending) { cs->LockCount = -2; break; }      /* (the other threads are gone: a section one of them held is taken over rather than waited for) */
     if (cs->LockSemaphore) {      /* a section somebody gave a semaphore: the wait is on it, and a handle that is not one is an error that cannot be carried on from */
       LARGE_INTEGER none = { 0 };
-      __sync_add_and_fetch(&cs->LockCount, 1);
+      __sync_sub_and_fetch(&cs->LockCount, 4);
       if (NtWaitForSingleObject(cs->LockSemaphore, FALSE, &none) == STATUS_INVALID_HANDLE) {
         EXCEPTION_RECORD record;
         memset(&record, 0, sizeof(record));
@@ -860,7 +861,7 @@ EXPORT NTSTATUS NTAPI RtlEnterCriticalSection(PRTL_CRITICAL_SECTION cs) {
         record.ExceptionFlags = 1 /* EXCEPTION_NONCONTINUABLE */;
         RtlRaiseException(&record);
       }
-      __sync_sub_and_fetch(&cs->LockCount, 1);
+      __sync_add_and_fetch(&cs->LockCount, 4);
     }
     NtYieldExecution();
   }
@@ -870,15 +871,15 @@ EXPORT NTSTATUS NTAPI RtlEnterCriticalSection(PRTL_CRITICAL_SECTION cs) {
 }
 EXPORT BOOLEAN NTAPI RtlTryEnterCriticalSection(PRTL_CRITICAL_SECTION cs) {
   const HANDLE me = (HANDLE)TEB_CLIENT_THREAD(NtCurrentTeb());
-  if (cs->OwningThread == me && cs->RecursionCount > 0) { ++cs->RecursionCount; ++cs->LockCount; return TRUE; }
-  if (!__sync_bool_compare_and_swap(&cs->LockCount, -1, 0)) return FALSE;
+  if (cs->OwningThread == me && cs->RecursionCount > 0) { ++cs->RecursionCount; return TRUE; }
+  if (!__sync_bool_compare_and_swap(&cs->LockCount, -1, -2)) return FALSE;
   cs->OwningThread = me;
   cs->RecursionCount = 1;
   return TRUE;
 }
 EXPORT NTSTATUS NTAPI RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION cs) {
-  if (cs->RecursionCount <= 0) return STATUS_SUCCESS;
-  if (--cs->RecursionCount > 0) { --cs->LockCount; return STATUS_SUCCESS; }
+  if (cs->RecursionCount <= 0) { --cs->RecursionCount; return STATUS_SUCCESS; }      /* (a section that is not held: the count goes below zero, the lock stays as it is) */
+  if (--cs->RecursionCount > 0) return STATUS_SUCCESS;
   cs->OwningThread = NULL;
   __sync_lock_test_and_set(&cs->LockCount, -1);
   return STATUS_SUCCESS;
@@ -1525,6 +1526,29 @@ EXPORT NTSTATUS NTAPI LdrUnloadDll(PVOID base) {
   else if (e->LoadCount != LDR_STATIC && !g_process_ending) ldr_release(base, 1);      /* (nothing is unloaded while the process ends) */
   loader_unlock();
   return status;
+}
+
+EXPORT NTSTATUS NTAPI LdrAddRefDll(ULONG flags, PVOID base) {
+  if (flags & ~1u) return STATUS_INVALID_PARAMETER;      /* (only LDR_ADDREF_DLL_PIN) */
+  loader_lock();
+  LDR_DATA_TABLE_ENTRY *e = ldr_find_base(base);
+  NTSTATUS status = STATUS_SUCCESS;
+  if (!e) status = STATUS_DLL_NOT_FOUND;
+  else if (flags & 1) e->LoadCount = LDR_STATIC;      /* pinned: never unloaded */
+  else if (e->LoadCount != LDR_STATIC) ++e->LoadCount;
+  loader_unlock();
+  return status;
+}
+typedef void (NTAPI *LdrEnumProc)(LDR_DATA_TABLE_ENTRY *module, PVOID context, BOOLEAN *stop);
+EXPORT NTSTATUS NTAPI LdrEnumerateLoadedModules(PVOID unknown, LdrEnumProc callback, PVOID context) {
+  if (unknown || !callback) return STATUS_INVALID_PARAMETER;
+  loader_lock();
+  PEB_LDR_DATA *ldr = NtCurrentPeb()->Ldr;
+  BOOLEAN stop = FALSE;
+  for (LIST_ENTRY *e = ldr->InMemoryOrderModuleList.Flink; e != &ldr->InMemoryOrderModuleList && !stop; e = e->Flink)
+    callback((LDR_DATA_TABLE_ENTRY *)((BYTE *)e - sizeof(LIST_ENTRY)), context, &stop);      /* (InMemoryOrderLinks follow InLoadOrderLinks) */
+  loader_unlock();
+  return STATUS_SUCCESS;
 }
 
 /* ntdll's own entry point: nothing to set up (the heap is made when first used). */
