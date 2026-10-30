@@ -536,16 +536,17 @@ bool ThunderboltIcm::reset_physical_port(uint32_t physical_port) {
   return cio.write(TbConfigSpace::Port, port0, tb_cio::kPhyPortCs1, v0 & ~tb_cio::kPhyLinkDisable) && cio.write(TbConfigSpace::Port, port1, tb_cio::kPhyPortCs1, v1 & ~tb_cio::kPhyLinkDisable);
 }
 
-bool ThunderboltIcm::use_interrupts(bool on, int msix_vector) {
-  if (outcome_ != Outcome::Started || msix_vector > 15) return false;          // (the vector allocation has 4 bits a source)
+bool ThunderboltIcm::use_interrupts(bool on, int msix_vector, int data_vector) {
+  if (outcome_ != Outcome::Started || msix_vector > 15 || data_vector > 15) return false;          // (the vector allocation has 4 bits a source)
   interrupts_ = on;
   if (on) {
     msix_vector_ = msix_vector;
+    data_vector_ = data_vector;
     nhi_.set_control_interrupts(true, msix_vector);
   } else {
     nhi_.set_control_interrupts(false, msix_vector >= 0 ? msix_vector : msix_vector_);  // (takes the control rings off the table entry)
     nhi_.disable_interrupts();                        // and masks the data rings' too: they are polled while interrupts are off
-    msix_vector_ = -1;
+    msix_vector_ = data_vector_ = -1;
   }
   return true;
 }

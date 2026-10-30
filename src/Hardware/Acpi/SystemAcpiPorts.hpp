@@ -18,17 +18,31 @@
 
 #pragma once
 #include "Hardware/Acpi/AcpiEvents.hpp"
+#include "Hardware/Mmio.hpp"
+#include "Hardware/RegisterMapper.hpp"
 
 namespace hardware {
 
 // The machine's I/O ports for the ACPI event registers.
+// Blocks at memory addresses are mapped through `mapper` (nullptr: none; then they read as zero and ignore writes), a page at a time, up to four pages.
 class SystemAcpiPorts final : public IAcpiPorts {
  public:
+  explicit SystemAcpiPorts(IRegisterMapper* mapper = nullptr) : mapper_(mapper) {}
+  uint8_t mem_in8(uint64_t address) override;
+  void mem_out8(uint64_t address, uint8_t value) override;
+  uint16_t mem_in16(uint64_t address) override;
+  void mem_out16(uint64_t address, uint16_t value) override;
   uint8_t in8(uint16_t port) override;
   void out8(uint16_t port, uint8_t value) override;
   uint16_t in16(uint16_t port) override;
   void out16(uint16_t port, uint16_t value) override;
   void delay_us(uint32_t us) override;
+
+ private:
+  const MmioRegion* window(uint64_t address, uint32_t size);
+  IRegisterMapper* mapper_;
+  MmioRegion windows_[4];
+  uint32_t window_count_ = 0;
 };
 
 }  // namespace hardware

@@ -1247,8 +1247,9 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
               return thunderbolt->interrupts() != before;
             };
             thunderbolt_msix = UniquePointer<hardware::PciMsix>::make(shared_allocator, pci, register_mapper);
-            const uint8_t tb_vector = kernel::kVectorThunderbolt;
-            if (thunderbolt_msix && thunderbolt_msix->enable(d.address, &tb_vector, 1, tb_apic_id) && thunderbolt->use_interrupts(true, 0)) thunderbolt_msi_working = check_interrupt();
+            kernel::set_interrupt_handler(kernel::kVectorThunderboltData, &on_thunderbolt_interrupt, thunderbolt.get());
+            const uint8_t tb_vectors[2] = {kernel::kVectorThunderbolt, kernel::kVectorThunderboltData};     // (entry 0: the control channel, entry 1: the data rings)
+            if (thunderbolt_msix && thunderbolt_msix->enable(d.address, tb_vectors, 2, tb_apic_id) && thunderbolt->use_interrupts(true, 0, 1)) thunderbolt_msi_working = check_interrupt();
             if (!thunderbolt_msi_working) {
               thunderbolt->use_interrupts(false);
               thunderbolt_msix = UniquePointer<hardware::PciMsix>();
@@ -1601,7 +1602,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
 #ifdef TCOS_ACPI_EVENTS
     // The ACPI events: the general purpose events and the fixed buttons are read by the loop (and when the SCI arrives, at once), the embedded controller's events are asked for, and the
     // buttons of the laptop (power, sleep, lid) are reported. With the Thunderbolt controller its _PRW wake event is armed too: the firmware's method for the event says Notify(device, 2).
-    hardware::SystemAcpiPorts acpi_ports;
+    hardware::SystemAcpiPorts acpi_ports(paging_ok ? &register_mapper : nullptr);
     UniquePointer<hardware::AcpiEvents> acpi_events;
     AcpiButtonSink acpi_buttons;
     AcpiSciState acpi_sci;
@@ -1864,6 +1865,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       thunderbolt_msix = UniquePointer<hardware::PciMsix>();
       thunderbolt_msi = UniquePointer<hardware::PciMsi>();
       kernel::set_interrupt_handler(kernel::kVectorThunderbolt, nullptr, nullptr);
+      kernel::set_interrupt_handler(kernel::kVectorThunderboltData, nullptr, nullptr);
     }
 #endif
     desktop.save_browser_data();
