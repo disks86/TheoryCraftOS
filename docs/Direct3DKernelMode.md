@@ -120,7 +120,7 @@ The kernel-mode driver is the D3DKMT layer, which Direct3D 9, 10, 11 and 12 all 
   Only the software device has them so far:
   - `kFeatureBlendState`: `GraphicsPipelineDesc::blend` (factors, ops and write mask for the colour and the alpha on their own, `custom` selects it over `alpha_blend`) and
     `depth_compare` (any of the eight comparisons).
-  - `kFeatureTexelAccess`: `ITextureSet::fetch` (Load), `sample_lod` (SampleLevel), `size` (GetDimensions); DXBC `ld`, `sample_l`, `resinfo`.
+  - `kFeatureTexelAccess`: `ITextureSet::fetch` (Load), `sample_lod` (SampleLevel), `size` (GetDimensions); DXBC `ld`, `sample_l`, `resinfo`. For the images of `kFeatureTextureKinds` (one level) there are `fetch_volume` (x, y and the slice or layer; a cube has no Load), `sample_lod_volume` and `size_volume` (the depth or layer count next to the width and height); TGSI `TXF` / `TXL` / `TXQ` with the `3D`, `2D_ARRAY` and `CUBE` targets. All three kinds match the real GPU.
   - `kFeatureSystemInputs`: `VertexShaderFnEx` / `FragmentShaderFnEx` carry `SV_VertexID`, `SV_InstanceID`, `SV_Position` (pixel centre, depth, 1/w), `SV_IsFrontFace` and
     `SV_PrimitiveID`; the DXBC front end reads them from the declarations (`dcl_input_sgv` / `siv`), and a program that uses them needs the feature.
   - `kFeatureInstancing`: `draw(..., instance_count, first_instance)` and `VertexAttribute::per_instance` (the element numbered by the instance, in the same buffer at the same stride);
@@ -132,7 +132,7 @@ The kernel-mode driver is the D3DKMT layer, which Direct3D 9, 10, 11 and 12 all 
   per-instance input) from Wine's HLSL compiler run through the kernel on the software device with the expected pictures.
 - **Not done for Direct3D 10:** stream output and geometry shader features beyond the basics (see Geometry shaders below), `sample_b` / `sample_c` / derivatives, more than four vertex attributes, more than four varyings (and semantics
   beyond COLOR0/1 and TEXCOORD0/1), more than one vertex buffer slot, multisampling, predication and queries other than occlusion counts (`D3D10_QUERY_OCCLUSION`; `OCCLUSION_PREDICATE` and `SO_STATISTICS` etc. are not done), depth bias and wireframe fill, texture arrays
-  with mipmaps, mipmapped / filtered-across-faces cube and 3D textures, `Load` / `SampleLevel` / `GetDimensions` on them, cube arrays, packed formats (float, half-float, sRGB, 16-bit unorm and R32G32B32A32_UINT colour formats are done; the other integer widths, SNORM and 10-bit formats are not), UAV textures, typed UAV loads and stores, append / consume buffers, group-shared memory and barriers, indirect dispatch (Direct3D 11 compute without those). The other devices (virgl, SVGA3D, Intel Gen9, V3D) have none of the features above, so
+  with mipmaps, mipmapped / filtered-across-faces cube and 3D textures, cube arrays, packed formats (float, half-float, sRGB, 16-bit unorm and R32G32B32A32_UINT colour formats are done; the other integer widths, SNORM and 10-bit formats are not), UAV textures, typed UAV loads and stores, append / consume buffers, group-shared memory and barriers, indirect dispatch (Direct3D 11 compute without those). The other devices (virgl, SVGA3D, Intel Gen9, V3D) have none of the features above, so
   they run the Direct3D 9 level only.
 
 ## Conformance on a real GPU

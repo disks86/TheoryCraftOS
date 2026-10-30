@@ -982,6 +982,45 @@ void scene_texture_cube(Rig& rig, ArrayView<uint32_t> out) {
   sample_layered(rig, out, b::k_ps_texcube, sizeof b::k_ps_texcube, texture, v, 6);
 }
 
+// The same textures read with Load, SampleLevel and GetDimensions (ps_texel3d / ps_texelarray / ps_texelcube): the picture is the texel loaded, the texel sampled and the size.
+void scene_texel_3d(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureTextureKinds | graphics::kFeatureTexelAccess)) return void(rig.step("texture kinds", status::kNotSupported));
+  namespace b = conformance_blobs;
+  Handle texture = layered_texture(rig, graphics::TextureKind::Texture3D, 4, [](uint32_t layer) -> uint32_t { return layer == 0 ? 0xFF0000u : layer == 1 ? 0x00FF00u : layer == 2 ? 0x0000FFu : 0xFFFF00u; });
+  Vertex v[12];
+  quad_pixels(v, 0, 0, 32, 16, [](float u, float vv) { return graphics::Vec3{u * 0.97f + 0.01f, vv * 0.97f + 0.01f, 0.6f}; });
+  quad_pixels(v + 6, 0, 16, 32, 32, [](float u, float vv) { return graphics::Vec3{u * 0.97f + 0.01f, 0.3f, vv * 0.97f + 0.01f}; });
+  sample_layered(rig, out, b::k_ps_texel3d, sizeof b::k_ps_texel3d, texture, v, 2);
+}
+
+void scene_texel_array(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureTextureKinds | graphics::kFeatureTexelAccess)) return void(rig.step("texture kinds", status::kNotSupported));
+  namespace b = conformance_blobs;
+  Handle texture = layered_texture(rig, graphics::TextureKind::Texture2DArray, 3, [](uint32_t layer) -> uint32_t { return layer == 0 ? 0xFF8000u : layer == 1 ? 0x00FF80u : 0x8000FFu; });
+  Vertex v[18];
+  for (uint32_t i = 0; i < 3; ++i)
+    quad_pixels(v + 6 * i, static_cast<float>(i * 10) + 1.2f, 0, static_cast<float>(i * 10) + 10.8f, 32, [i](float u, float vv) { return graphics::Vec3{u * 0.97f + 0.01f, vv * 0.97f + 0.01f, static_cast<float>(i)}; });
+  sample_layered(rig, out, b::k_ps_texelarray, sizeof b::k_ps_texelarray, texture, v, 3);
+}
+
+void scene_texel_cube(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureTextureKinds | graphics::kFeatureTexelAccess)) return void(rig.step("texture kinds", status::kNotSupported));
+  namespace b = conformance_blobs;
+  Handle texture = layered_texture(rig, graphics::TextureKind::TextureCube, 6, [](uint32_t face) -> uint32_t {
+    static const uint32_t kColours[6] = {0xFF0000u, 0x00FFFFu, 0x00FF00u, 0xFF00FFu, 0x0000FFu, 0xFFFF00u};
+    return kColours[face];
+  });
+  Vertex v[36];
+  for (uint32_t face = 0; face < 6; ++face) {
+    const float x0 = static_cast<float>(1 + (face % 3) * 10), y0 = static_cast<float>(face / 3 * 16);
+    quad_pixels(v + 6 * face, x0, y0, x0 + 10, y0 + 16, [face](float u, float vv) {
+      const float a = -0.8f + 1.6f * u, c = -0.8f + 1.6f * vv, axis = face % 2 ? -1.0f : 1.0f;
+      return face < 2 ? graphics::Vec3{axis, c, a} : face < 4 ? graphics::Vec3{a, axis, c} : graphics::Vec3{a, c, axis};
+    });
+  }
+  sample_layered(rig, out, b::k_ps_texelcube, sizeof b::k_ps_texelcube, texture, v, 6);
+}
+
 // A compute shader (cs_fill.hlsl): 4 x 8 groups of 8 x 4 threads, each writing a pixel of a 32 x 32 picture into a structured buffer from its SV_DispatchThreadID, SV_GroupID and
 // SV_GroupIndex, a structured buffer of uint4 it writes and reads back, a constant from the constant buffer, and two atomic counters that must end at 1024. The picture is the buffer.
 void scene_compute(Rig& rig, ArrayView<uint32_t> out) {
@@ -1342,6 +1381,9 @@ const Entry kScenes[] = {
     {"Direct3D 10 volume texture (DXBC)", scene_texture_3d},
     {"Direct3D 10 texture array (DXBC)", scene_texture_array},
     {"Direct3D 10 cube texture (DXBC)", scene_texture_cube},
+    {"Direct3D 10 Load, SampleLevel, GetDimensions of a 3D image (DXBC)", scene_texel_3d},
+    {"Direct3D 10 Load, SampleLevel, GetDimensions of an image array (DXBC)", scene_texel_array},
+    {"Direct3D 10 SampleLevel, GetDimensions of a cube map (DXBC)", scene_texel_cube},
 };
 
 bool channels_close(uint32_t a, uint32_t b) {

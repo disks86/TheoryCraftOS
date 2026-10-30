@@ -412,6 +412,27 @@ class TextureSet final : public ITextureSet {
     return texel(surface, x, y);
   }
 
+  Vec4 sample_lod_volume(uint32_t unit, float u, float v, float w, float lod) const override {
+    const SoftwareImage* image = image_for(unit);
+    if (image && image->kind() == TextureKind::Texture2D) return sample_lod(unit, u, v, lod);
+    return sample_volume(unit, u, v, w);
+  }
+  Vec4 fetch_volume(uint32_t unit, int32_t x, int32_t y, int32_t z, uint32_t level) const override {
+    const SoftwareImage* image = image_for(unit);
+    if (!image) return {0, 0, 0, 0};
+    if (image->kind() == TextureKind::Texture2D) return z == 0 ? fetch(unit, x, y, level) : Vec4{0, 0, 0, 0};
+    if (image->kind() == TextureKind::TextureCube || level != 0 || z < 0 || static_cast<uint32_t>(z) >= image->layer_count()) return {0, 0, 0, 0};
+    const Surface surface = image->surface(0, static_cast<uint32_t>(z));
+    if (x < 0 || y < 0 || static_cast<uint32_t>(x) >= surface.width || static_cast<uint32_t>(y) >= surface.height) return {0, 0, 0, 0};
+    return texel(surface, x, y);
+  }
+  bool size_volume(uint32_t unit, uint32_t level, uint32_t* width, uint32_t* height, uint32_t* depth, uint32_t* levels) const override {
+    if (!size(unit, level, width, height, levels)) return false;
+    const SoftwareImage* image = image_for(unit);
+    *depth = image->kind() == TextureKind::Texture3D || image->kind() == TextureKind::Texture2DArray ? image->layer_count() : 1;
+    return true;
+  }
+
   bool size(uint32_t unit, uint32_t level, uint32_t* width, uint32_t* height, uint32_t* levels) const override {
     const SoftwareImage* image = image_for(unit);
     if (!image) return false;

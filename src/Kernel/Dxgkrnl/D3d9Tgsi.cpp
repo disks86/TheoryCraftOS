@@ -883,23 +883,27 @@ bool TgsiEmitter::instruction(const Instr& ins) {
       add_uint(sampler, unit);
       add(sampler, "]");
       String dim = str();
-      add(dim, "2D");
+      const graphics::TextureKind kind = p_.texture_kind_[unit];
+      add(dim, dimension_name(kind));
       const String texel = temp(kWork2);
-      if (op == kTexFetch) {   // ld: integer x y in the first two components, the level in the last
+      if (op == kTexFetch) {   // ld: integer x y (and z, the slice or layer) in the first components, the level in the last
         const String coordinate = operand(ins.src[0], 0, 0, nullptr, false);
         line("TXF", &texel, &coordinate, &sampler, &dim);
       } else if (op == kTexLod) {   // sample_l: the coordinate, and the level next to it
-        const uint8_t xyxy[4] = {0, 1, 0, 1};
-        const String coordinate = operand(ins.src[0], 0, 0, xyxy, false), level = operand(ins.src[2], 0, 1, nullptr, true);
-        const String xy = temp(kWork3, ".xy"), lod = temp(kWork3, ".w"), packed = temp(kWork3);
+        const uint8_t xyxy[4] = {0, 1, 0, 1}, xyzz[4] = {0, 1, 2, 2};
+        const bool flat = kind == graphics::TextureKind::Texture2D;
+        const String coordinate = operand(ins.src[0], 0, 0, flat ? xyxy : xyzz, false), level = operand(ins.src[2], 0, 1, nullptr, true);
+        const String xy = temp(kWork3, flat ? ".xy" : ".xyz"), lod = temp(kWork3, ".w"), packed = temp(kWork3);
         line("MOV", &xy, &coordinate);
         line("MOV", &lod, &level);
         line("TXL", &texel, &packed, &sampler, &dim);
       } else {   // resinfo: width, height, (depth), levels of the level named by the source
         const String level = operand(ins.src[0], 0, 0, nullptr, true);
         line("TXQ", &texel, &level, &sampler, &dim);
-        const String tz = temp(kWork2, ".z"), z0 = zero();
-        line("MOV", &tz, &z0);
+        if (kind == graphics::TextureKind::Texture2D || kind == graphics::TextureKind::TextureCube) {   // (no depth: resinfo leaves zero)
+          const String tz = temp(kWork2, ".z"), z0 = zero();
+          line("MOV", &tz, &z0);
+        }
         if (ins.control != 2) {   // floats (0) or reciprocals (1)
           line("U2F", &texel, &texel);
           if (ins.control == 1) line("RCP", &texel, &texel);

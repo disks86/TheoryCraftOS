@@ -4361,6 +4361,17 @@ void test_conformance() {
       }
       if (__builtin_strstr(r.name, "integer render")) CHECK(px(16, 4) == 0xFF3380CC && px(0, 0) == 0xFF14283C);   // (51, 128, 204 = 255 * the colour, and the cleared (20, 40, 60))
     }
+    if (__builtin_strstr(r.name, "GetDimensions of")) {
+      // The alpha is the number of levels over 2 (one level: 0x80) wherever something is drawn; the size is in the colour: the 4 x 4 texels of a 3D image of 4 slices, an array of 3 layers
+      // (blue 3 / 8 over 2 = 0x30 in the first band) and a cube map.
+      uint32_t drawn = 0, wrong = 0;
+      for (uint32_t i = 0; i < 32 * 32; ++i)
+        if (r.device_picture[i] >> 24 == 0x80) ++drawn;
+        else if ((r.device_picture[i] & 0xFFFFFF) != 0) ++wrong;
+      CHECK(drawn > 500 && wrong == 0);
+      if (__builtin_strstr(r.name, "image array")) CHECK((r.device_picture[8] & 0xFF) == 0x30);
+      if (__builtin_strstr(r.name, "3D image")) CHECK((r.device_picture[20 * 32 + 8] & 0xFFFF00) == 0x102000);
+    }
     if (__builtin_strstr(r.name, "tessellation, winding")) {
       // Back faces culled: the counter-clockwise patches (the right cells) are drawn, the clockwise ones (the left cells) are not.
       uint32_t left = 0, right = 0;

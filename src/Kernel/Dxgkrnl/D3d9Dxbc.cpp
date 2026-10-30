@@ -819,7 +819,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         return status::kNotSupported;
       }
       if (resource.type != kOpResource || unit >= graphics::kMaxTextureUnits || (opcode == 72 && sampler.type != kOpSampler)) return status::kNotSupported;
-      if (program->texture_kind_[unit] != graphics::TextureKind::Texture2D) return status::kNotSupported;   // (ld, sample_l and resinfo: 2D textures only)
+      if (opcode == 45 && program->texture_kind_[unit] == graphics::TextureKind::TextureCube) return status::kNotSupported;   // (a cube has no Load)
       ins.op = opcode == 45 ? kTexFetch : opcode == 72 ? kTexLod : kTexSize;
       if (opcode == 61) {
         const uint32_t mode = (token >> 11) & 3;

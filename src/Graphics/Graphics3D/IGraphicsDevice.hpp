@@ -187,6 +187,20 @@ class ITextureSet {
     (void)w;
     return sample(unit, u, v);
   }
+  // The texel access of kFeatureTexelAccess for the images of kFeatureTextureKinds (which have one level): SampleLevel (the lod does nothing but select the only level), Load of a texel of
+  // a slice of a volume or a layer of an array (x, y, and z the slice or layer; a texel outside, or a level above 0, is transparent black; a cube has no Load), and GetDimensions (width,
+  // height, then the depth of a volume or the layer count of an array; 1 for the others; and the levels).
+  virtual Vec4 sample_lod_volume(uint32_t unit, float u, float v, float w, float lod) const {
+    (void)lod;
+    return sample_volume(unit, u, v, w);
+  }
+  virtual Vec4 fetch_volume(uint32_t unit, int32_t x, int32_t y, int32_t z, uint32_t level) const {
+    return z == 0 ? fetch(unit, x, y, level) : Vec4{0, 0, 0, 0};
+  }
+  virtual bool size_volume(uint32_t unit, uint32_t level, uint32_t* width, uint32_t* height, uint32_t* depth, uint32_t* levels) const {
+    *depth = 1;
+    return size(unit, level, width, height, levels);
+  }
   // --- kFeatureTexelAccess (DeviceInfo::features); a device without it leaves these at their defaults.
   // The lookup at an explicit level of detail (lambda: 0 is the base level), as sample() takes it from the derivatives.
   virtual Vec4 sample_lod(uint32_t unit, float u, float v, float lod) const {

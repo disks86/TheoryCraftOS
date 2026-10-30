@@ -830,18 +830,22 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
         const uint32_t unit = ins.src[1].number;
         if (s.textures) {
           graphics::Vec4 t = {0, 0, 0, 0};
+          const graphics::TextureKind kind = unit < graphics::kMaxTextureUnits ? texture_kind_[unit] : graphics::TextureKind::Texture2D;
+          const bool flat = kind == graphics::TextureKind::Texture2D;
           if (ins.op == kTexFetch) {
-            t = s.textures->fetch(unit, __builtin_bit_cast(int32_t, a.f[0]), __builtin_bit_cast(int32_t, a.f[1]), bits_of(a.f[3]));
+            t = flat ? s.textures->fetch(unit, __builtin_bit_cast(int32_t, a.f[0]), __builtin_bit_cast(int32_t, a.f[1]), bits_of(a.f[3]))
+                     : s.textures->fetch_volume(unit, __builtin_bit_cast(int32_t, a.f[0]), __builtin_bit_cast(int32_t, a.f[1]), __builtin_bit_cast(int32_t, a.f[2]), bits_of(a.f[3]));
           } else if (ins.op == kTexLod) {
             const Q lod = fetch(ins.src[2], 0);
-            t = s.textures->sample_lod(unit, a.f[0], a.f[1], lod.f[0]);
+            t = flat ? s.textures->sample_lod(unit, a.f[0], a.f[1], lod.f[0]) : s.textures->sample_lod_volume(unit, a.f[0], a.f[1], a.f[2], lod.f[0]);
           } else {
-            uint32_t w = 0, h = 0, levels = 0;
-            if (s.textures->size(unit, bits_of(a.f[0]), &w, &h, &levels) && bits_of(a.f[0]) < levels) {
+            uint32_t w = 0, h = 0, d = 1, levels = 0;
+            if (s.textures->size_volume(unit, bits_of(a.f[0]), &w, &h, &d, &levels) && bits_of(a.f[0]) < levels) {
+              if (kind == graphics::TextureKind::TextureCube || flat) d = 0;   // (what resinfo leaves in the third component for the kinds with no depth)
               const uint32_t mode = ins.control;
-              t = mode == 2 ? graphics::Vec4{from_bits(w), from_bits(h), 0.0f, from_bits(levels)}
-                            : mode == 1 ? graphics::Vec4{1.0f / static_cast<float>(w), 1.0f / static_cast<float>(h), 0.0f, 1.0f / static_cast<float>(levels)}
-                                        : graphics::Vec4{static_cast<float>(w), static_cast<float>(h), 0.0f, static_cast<float>(levels)};
+              t = mode == 2 ? graphics::Vec4{from_bits(w), from_bits(h), from_bits(d), from_bits(levels)}
+                            : mode == 1 ? graphics::Vec4{1.0f / static_cast<float>(w), 1.0f / static_cast<float>(h), d ? 1.0f / static_cast<float>(d) : 0.0f, 1.0f / static_cast<float>(levels)}
+                                        : graphics::Vec4{static_cast<float>(w), static_cast<float>(h), static_cast<float>(d), static_cast<float>(levels)};
             }
           }
           const float texel[4] = {t.x, t.y, t.z, t.w};
