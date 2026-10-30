@@ -3808,6 +3808,178 @@ static void test_usb4_retimers() {
   }
 }
 
+static void test_usb4_dp_bandwidth() {
+  auto status = [](fake_usb4::Router& r, uint32_t port) { return (r.ports[port].space[0x10 + kDpStatusCtrl] & kDpStatusAllocatedMask) >> kDpStatusAllocatedShift; };
+  auto estimate = [](fake_usb4::Router& r, uint32_t port) { return (r.ports[port].space[0x10 + kDpCs2] & kDpCs2EstimatedMask) >> kDpCs2EstimatedShift; };
+  {   // the allocation mode on a stream through two bonded links (40 Gb/s each way)
+    TestAllocator alloc;
+    FakeNhi chip;
+    fake_usb4::Fabric fabric(chip);
+    fabric.dp_bw_mode = true;
+    fabric.add(0, 2, 2, false, true, 2, false, 2, 0);
+    fabric.add(0x01, 2, 1, true, false, 1, true, 0, 1);
+    fabric.add(0x301, 1, 0, true, false, 0, true, 0, 1);
+    fabric.link(0, 1, 0x01);
+    fabric.link(0x01, 3, 0x301);
+    TbNhi nhi(chip);
+    TbControl control(nhi, alloc);
+    CHECK(control.start());
+    Usb4Domain domain(control, nhi, alloc);
+    const char* error = nullptr;
+    CHECK(domain.start(nullptr) && domain.tunnel_dp(0, 10, 2, 5, &error) && domain.dp_bandwidth_mode(0, 10) && !domain.dp_bandwidth_mode(0, 11));
+    fake_usb4::Router& host = fabric.at(0);
+    // the smaller of the two adapters: HBR2 on two lanes = 8640 Mb/s, in steps of 250, rounded up to 8750
+    CHECK(domain.dp_maximum_bandwidth(0, 10) == 8750 && domain.dp_allocated_bandwidth(0, 10) == 0 && status(host, 10) == 0);
+    const uint32_t cs2 = host.ports[10].space[0x10 + kDpCs2];
+    CHECK((cs2 & kDpCs2Cmms) && ((cs2 & kDpCs2NrdRateMask) >> kDpCs2NrdRateShift) == 2 && (cs2 & kDpCs2NrdLanesMask) == 1 && ((cs2 & kDpCs2GranularityMask) >> kDpCs2GranularityShift) == 0 && ((cs2 & kDpCs2CmIdMask) >> kDpCs2CmIdShift) == 0);
+    CHECK(((cs2 & kDpCs2GroupMask) >> kDpCs2GroupShift) == 1 && estimate(host, 10) == 35);                // (the estimate is capped by what the stream can use: 8750 / 250)
+    // the adapter asks for 6000: an error packet, then the grant, the acknowledge, the request gone
+    fabric.request_dp_bandwidth(0, 10, 6000);
+    chip.send_async_error(0, 10, kErrorDpBandwidth);
+    domain.poll();
+    CHECK(domain.dp_allocated_bandwidth(0, 10) == 6000 && status(host, 10) == 24 && !(host.ports[10].space[0x10 + kDpCs8] & kDpCs8Dr) && !(host.ports[10].space[0x10 + kDpCs2] & kDpCs2Ca));
+    // asking for more than the stream can use gets the maximum; asking by polling works too
+    fabric.request_dp_bandwidth(0, 10, 20000);
+    CHECK(domain.dp_poll_requests() == 1 && domain.dp_allocated_bandwidth(0, 10) == 8750 && status(host, 10) == 35);
+    CHECK(domain.dp_poll_requests() == 0);                                                                // (nothing pending)
+    // a request from a router we do not know, or for an adapter that is no stream: nothing happens
+    chip.send_async_error(0x999, 10, kErrorDpBandwidth);
+    chip.send_async_error(0, 11, kErrorDpBandwidth);
+    chip.send_async_error(0, 10, 99);
+    domain.poll();
+    CHECK(domain.dp_allocated_bandwidth(0, 10) == 8750);
+    // closing it: the stream's numbers are gone
+    CHECK(domain.disconnect_dp(0, 10) && !domain.dp_bandwidth_mode(0, 10) && domain.dp_maximum_bandwidth(0, 10) == 0);
+    control.stop();
+  }
+  {   // two streams over one single lane link (20 Gb/s): what one holds the other cannot have
+    TestAllocator alloc;
+    FakeNhi chip;
+    fake_usb4::Fabric fabric(chip);
+    fabric.dp_bw_mode = true;
+    fabric.bond_never_completes = true;
+    fabric.add(0, 2, 2, false, true, 2, false, 2, 0);
+    fabric.add(0x01, 2, 1, true, false, 1, true, 0, 2);
+    fabric.at(0x01).ports[9].space[0x10 + kDpLocalCap] = (3u << kDpCommonRateShift) | (2u << kDpCommonLanesShift);            // HBR3 on four lanes: 25920 Mb/s
+    fabric.at(0x01).ports[10].space[0x10 + kDpLocalCap] = (3u << kDpCommonRateShift) | (2u << kDpCommonLanesShift);
+    fabric.link(0, 1, 0x01);
+    TbNhi nhi(chip);
+    TbControl control(nhi, alloc);
+    CHECK(control.start());
+    Usb4Domain domain(control, nhi, alloc);
+    const char* error = nullptr;
+    CHECK(domain.start(nullptr) && !domain.link_bonded(1) && domain.tunnel_dp(0, 10, 1, 9, &error) && domain.tunnel_dp(0, 11, 1, 10, &error));
+    fake_usb4::Router& host = fabric.at(0);
+    CHECK(domain.dp_maximum_bandwidth(0, 10) == 26000 && estimate(host, 10) == 80 && estimate(host, 11) == 80);                  // 20000 / 250 for each
+    fabric.request_dp_bandwidth(0, 10, 26000);                                                          // more than the link has: refused
+    CHECK(domain.dp_poll_requests() == 0 && domain.dp_allocated_bandwidth(0, 10) == 0 && !(host.ports[10].space[0x10 + kDpCs8] & kDpCs8Dr));
+    fabric.request_dp_bandwidth(0, 10, 15000);
+    CHECK(domain.dp_poll_requests() == 1 && domain.dp_allocated_bandwidth(0, 10) == 15000);
+    CHECK(estimate(host, 11) == 20 && estimate(host, 10) == 80);                                       // the second can have 5000, the first keeps its 15000 and what is free
+    fabric.request_dp_bandwidth(0, 11, 8000);
+    CHECK(domain.dp_poll_requests() == 0 && domain.dp_allocated_bandwidth(0, 11) == 0);
+    fabric.request_dp_bandwidth(0, 11, 5000);
+    CHECK(domain.dp_poll_requests() == 1 && domain.dp_allocated_bandwidth(0, 11) == 5000);
+    // the first one lets go: the second's estimate goes up
+    CHECK(domain.disconnect_dp(0, 10) && estimate(host, 11) == 80);
+    control.stop();
+  }
+}
+
+static void test_usb4_dp_arbitration() {
+  TestAllocator alloc;
+  FakeNhi chip;
+  fake_usb4::Fabric fabric(chip);
+  fabric.dp_bw_mode = true;
+  fabric.add(0, 2, 2, false, true, 2, false, 2, 0);                        // host: DP in 10 11
+  fabric.add(0x01, 2, 1, true, false, 1, true, 0, 1);                      // D1: DP out 9
+  fabric.add(0x301, 1, 0, true, false, 0, true, 0, 1);                     // D2: DP out 5
+  fabric.link(0, 1, 0x01);
+  fabric.link(0x01, 3, 0x301);
+  fake_usb4::Router& host = fabric.at(0);
+  fake_usb4::Router& d1 = fabric.at(0x01);
+  fake_usb4::Router& d2 = fabric.at(0x301);
+  host.dp_arbitration = true;
+  host.ports[10].space[0x10 + kDpLocalCap] |= kDpCommonUhbr20;             // HBR3 x4 as the non-reduced rate, UHBR20 through the allocation mode
+  d2.ports[5].space[0x10 + kDpLocalCap] = (3u << kDpCommonRateShift) | (2u << kDpCommonLanesShift) | kDpCommonUhbr20 | kDpCommonBwMode;
+  host.ports[11].space[0x10 + kDpLocalCap] &= ~kDpCommonBwMode;            // the second input has no allocation mode
+  TbNhi nhi(chip);
+  TbControl control(nhi, alloc);
+  CHECK(control.start());
+  Usb4Domain domain(control, nhi, alloc);
+  const char* error = nullptr;
+  CHECK(domain.start(nullptr));
+  // another connection manager holds the second input: it is asked, and nothing else happens
+  host.dp_held_by_other = 1u << 11;
+  CHECK(!domain.tunnel_dp(0, 11, 1, 9, &error) && error && domain.dp_tunnels() == 0 && host.dp_ops.size() == 1 && host.dp_ops[0] == (kOpQueryDpResource | 11u << 8));
+  CHECK(!(host.ports[11].space[0x10] & kDpCs0Ve) && !(host.ports[11].space[0x10 + kDpRemoteCap]));
+  host.dp_held_by_other = 0;
+  host.dp_ops.clear();
+  // UHBR20 on four lanes through the allocation mode: 77575 Mb/s, granularity 500, the maximum rounded up to 78000; the non-reduced rate is still HBR3 x4
+  CHECK(domain.tunnel_dp(0, 10, 2, 5, &error) && domain.dp_bandwidth_mode(0, 10) && domain.dp_maximum_bandwidth(0, 10) == 78000);
+  const uint32_t cs2 = host.ports[10].space[0x10 + kDpCs2];
+  CHECK(((cs2 & kDpCs2NrdRateMask) >> kDpCs2NrdRateShift) == 3 && (cs2 & kDpCs2NrdLanesMask) == 2 && ((cs2 & kDpCs2GranularityMask) >> kDpCs2GranularityShift) == 1);
+  CHECK(host.dp_ops.size() == 2 && host.dp_ops[0] == (kOpQueryDpResource | 10u << 8) && host.dp_ops[1] == (kOpAllocDpResource | 10u << 8) && (host.dp_held_by_us & (1u << 10)));
+  // the stream takes 33000 of the 40000 of the two links
+  fabric.request_dp_bandwidth(0, 10, 33000);
+  CHECK(domain.dp_poll_requests() == 1 && domain.dp_allocated_bandwidth(0, 10) == 33000);
+  // a stream without the allocation mode is cut to what is left (7000): HBR2 on one lane of the output's HBR2 x2 (4320 Mb/s)
+  CHECK(domain.tunnel_dp(0, 11, 1, 9, &error) && !domain.dp_bandwidth_mode(0, 11));
+  const uint32_t reduced = host.ports[11].space[0x10 + kDpRemoteCap];
+  CHECK(((reduced & kDpCommonRateMask) >> kDpCommonRateShift) == 2 && ((reduced & kDpCommonLanesMask) >> kDpCommonLanesShift) == 0);
+  CHECK(d1.ports[9].space[0x10 + kDpRemoteCap] == host.ports[11].space[0x10 + kDpLocalCap]);              // (the output is told the input's, unreduced)
+  CHECK(domain.disconnect_dp(0, 11));
+  CHECK(host.dp_ops.back() == (kOpDeallocDpResource | 11u << 8) && !(host.dp_held_by_us & (1u << 11)));
+  // the first stream takes nearly all: nothing fits, the stream is refused and the input handed back
+  fabric.request_dp_bandwidth(0, 10, 39500);
+  CHECK(domain.dp_poll_requests() == 1 && domain.dp_allocated_bandwidth(0, 10) == 39500);
+  CHECK(!domain.tunnel_dp(0, 11, 1, 9, &error) && error && domain.dp_tunnels() == 1 && !(host.ports[11].space[0x10] & kDpCs0Ve) && !(host.dp_held_by_us & (1u << 11)));
+  // the display's receiver: not read yet, then read (and it can do less than the adapters said: the stream's maximum follows)
+  CHECK(!domain.dp_dprx_done(0, 10) && !domain.dp_wait_dprx(0, 10, 1) && !domain.dp_dprx_done(0, 11) && !domain.dp_dprx_done(7, 10));
+  host.ports[10].space[0x10 + kDpLocalCap] = (2u << kDpCommonRateShift) | (1u << kDpCommonLanesShift) | kDpCommonBwMode;
+  host.ports[10].space[0x10 + kDpCommonCap] |= kDpCommonDprxDone;
+  CHECK(domain.dp_dprx_done(0, 10) && domain.dp_wait_dprx(0, 10, 1) && domain.dp_maximum_bandwidth(0, 10) == 9000);       // 8640 rounded up to 500
+  CHECK(domain.disconnect_dp(0, 10) && host.dp_held_by_us == 0);
+  // a router that does not know the operations leaves the arbitration out
+  host.dp_arbitration = false;
+  CHECK(domain.tunnel_dp(0, 11, 1, 9, &error));
+  control.stop();
+}
+
+static void test_usb4_usb3_and_dp_bandwidth() {
+  // a USB 3 stream holds 9000 Mb/s on a single lane link of 20 Gb/s, using 2000; a DisplayPort stream asks for 8000
+  TestAllocator alloc;
+  FakeNhi chip;
+  fake_usb4::Fabric fabric(chip);
+  fabric.dp_bw_mode = true;
+  fabric.bond_never_completes = true;
+  fabric.add(0, 2, 2, false, true, 2, false, 2, 0);
+  fabric.add(0x01, 2, 1, true, false, 1, true, 0, 1);
+  fabric.link(0, 1, 0x01);
+  TbNhi nhi(chip);
+  TbControl control(nhi, alloc);
+  CHECK(control.start());
+  Usb4Domain domain(control, nhi, alloc);
+  const char* error = nullptr;
+  CHECK(domain.start(nullptr) && domain.approve_usb3(1, &error));
+  fake_usb4::Router& host = fabric.at(0);
+  auto units = [](uint32_t cs2, bool down) { return down ? (cs2 >> 12) & 0xFFF : cs2 & 0xFFF; };
+  const uint32_t full = units(host.ports[8].space[0x10 + kUsb3Cs2], true);
+  CHECK(full == 2198);                                                                          // 9000 Mb/s in units of 512 microframes
+  host.ports[8].space[0x10 + kUsb3Cs1] = (host.ports[8].space[0x10 + kUsb3Cs1] & kUsb3Cs1Hca) | 489u | (489u << 12);   // 2000 Mb/s consumed each way
+  CHECK(domain.tunnel_dp(0, 10, 1, 9, &error));
+  // (the USB 3 stream counts 3/2 of 9000 = 13500 of the 20000: 6500 are free for the DisplayPort stream)
+  CHECK((host.ports[10].space[0x10 + kDpCs2] >> kDpCs2EstimatedShift) == 26);
+  fabric.request_dp_bandwidth(0, 10, 8000);
+  CHECK(domain.dp_poll_requests() == 1 && domain.dp_allocated_bandwidth(0, 10) == 8000);
+  // the USB 3 stream was cut to what it uses to make room, then took back what is free (up to 90% of the link rate): 9000 again
+  CHECK(units(host.ports[8].space[0x10 + kUsb3Cs2], true) == 2198 && !(host.ports[8].space[0x10 + kUsb3Cs2] & kUsb3Cs2Cmr));
+  // a second request that does not fit next to the 9000 USB 3 holds again and the 8000 of the first
+  fabric.request_dp_bandwidth(0, 10, 20000);
+  CHECK(domain.dp_poll_requests() == 1 && domain.dp_allocated_bandwidth(0, 10) <= 8750);
+  control.stop();
+}
+
 static void test_usb4_garbage() {
   // the routers answer with noise: the manager must stay inside its arrays, whatever comes (and the sanitizers say if it does not)
   for (uint32_t seed = 1; seed <= 200; ++seed) {
@@ -3866,6 +4038,9 @@ int main() {
   test_usb4_tbt3_extras();
   test_usb4_tbt3_drom();
   test_usb4_retimers();
+  test_usb4_dp_bandwidth();
+  test_usb4_dp_arbitration();
+  test_usb4_usb3_and_dp_bandwidth();
   test_usb4_runtime_sleep();
   test_usb4_xdomain_failures();
   test_usb4_driver();

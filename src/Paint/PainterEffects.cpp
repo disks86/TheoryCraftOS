@@ -371,6 +371,19 @@ bool DisplayPainter::paint_group(graphics::IRenderer2D& r, const DisplayList& li
     if (device.empty()) return true;
     const IRect source = grown(transformed_bounds(inverse, device), 1).intersection(g);
     if (source.empty()) return true;
+    // The renderer has offscreen targets (the GPU): the content is drawn there, on the GPU, and moved by its texture units. (A picture that shrinks a lot is box filtered on the CPU below instead.)
+    const double scale = t.determinant() < 0 ? -t.determinant() : t.determinant();
+    if (scale >= 0.25 && r.begin_group(to_rect(source))) {
+      const bool drawn = run(r, list, begin + 1, close, dx, dy, source, groups + 1);
+      graphics::Matrix2D m;
+      m.a = static_cast<float>(t.a);
+      m.b = static_cast<float>(t.b);
+      m.c = static_cast<float>(t.c);
+      m.d = static_cast<float>(t.d);
+      m.e = static_cast<float>(t.e);
+      m.f = static_cast<float>(t.f);
+      return r.end_group(m, 255, graphics::ImageFilter::Bilinear) && drawn;
+    }
     Pixmap content(allocator_);
     if (!content.create(source.width, source.height)) return run(r, list, begin + 1, close, dx, dy, clip_visible, groups) && false;
     {

@@ -41,6 +41,13 @@
 //                    with 8 bytes room. One query is open at a time and it ends before the pass does; at most kMaxOcclusionQueries per stream)
 //   SetStreamOutput  slot, allocation_index (kNoAllocation: none), offset   (the buffer the pipeline's stream output declaration puts buffer `slot` in: a kAllocStreamOutput buffer, offset a multiple of 4 or kStreamOutputAppendOffset; anywhere,
 //                    the adapter's kFeatureStreamOutput)
+//   SetRootSignature root signature handle   (Direct3D 12 binding: forgets the root arguments; the draws and dispatches that follow bind textures, storage buffers and constants from them: see D3d12.hpp)
+//   SetDescriptorHeaps count (1 or 2), heap handles   (at most one of each type: views and samplers)
+//   SetRootConstants parameter, first value, count, values   (32-bit values into a root constants parameter)
+//   SetRootDescriptor parameter, allocation_index, offset   (a root constant buffer view or unordered access view: a buffer allocation and the offset of its range)
+//   SetRootTable     parameter, first descriptor   (the descriptor table of the parameter starts at that descriptor of the heap of its type)
+//   ResourceBarrier  count, then for each: type (0 transition, 1 unordered access, 2 aliasing), allocation_index (kNoAllocation: all, for the last two), state before, state after, flags (1 begin only, 2 end only)
+//                    (an allocation made with kAllocTrackState has the state it was left in; a transition names it, and what uses the allocation after that needs it in a state that allows the use)
 //   BindUav          slot, allocation_index, offset, size   (a storage buffer for compute shaders, outside a pass: slot below kMaxStorageBuffers, a kAllocUnorderedAccess buffer, offset and size multiples of 4)
 //   Dispatch         groups_x, groups_y, groups_z   (outside a pass, with a compute pipeline bound by BindPipeline and every storage slot its shader uses bound; each count at most kMaxDispatchGroups)
 //   ResolveRegion    destination_index, source_index   (outside a pass: the samples of a multisampled colour render target averaged into an ordinary image of the same format and size, the adapter's kFeatureMultisample)
@@ -75,6 +82,12 @@ enum class Op : uint16_t {
   Dispatch,
   ResolveRegion,
   SetStreamOutput,
+  SetRootSignature,
+  SetDescriptorHeaps,
+  SetRootConstants,
+  SetRootDescriptor,
+  SetRootTable,
+  ResourceBarrier,
 };
 
 // How the vertices (or indices) of a draw make triangles (D3D10 IASetPrimitiveTopology / D3D9 primitive types); the default is a list. A strip or fan is expanded to a list of
@@ -155,6 +168,33 @@ class CommandWriter {
   // Stream output buffer `slot` (below kMaxStreamOutputBuffers) is the kAllocStreamOutput allocation, written from `offset` (a multiple of 4; the draws that follow append); kNoAllocation unbinds it.
   // (`offset` kStreamOutputAppendOffset: where the last stream output into the buffer ended)
   void set_stream_output(uint32_t slot, uint32_t allocation, uint32_t offset = 0) { packet(Op::SetStreamOutput, {slot, allocation, offset}); }
+  void set_root_signature(Handle signature) { packet(Op::SetRootSignature, {signature}); }
+  void set_descriptor_heaps(std::initializer_list<Handle> heaps) {
+    ok_ &= bytes_.put32(static_cast<uint32_t>(Op::SetDescriptorHeaps) | ((2 + static_cast<uint32_t>(heaps.size())) << 16));
+    ok_ &= bytes_.put32(static_cast<uint32_t>(heaps.size()));
+    for (Handle h : heaps) ok_ &= bytes_.put32(h);
+  }
+  void set_root_constants(uint32_t parameter, uint32_t first, ConstByteView values) {
+    const uint32_t count = static_cast<uint32_t>(values.size() / 4);
+    ok_ &= bytes_.put32(static_cast<uint32_t>(Op::SetRootConstants) | ((4 + count) << 16));
+    ok_ &= bytes_.put32(parameter);
+    ok_ &= bytes_.put32(first);
+    ok_ &= bytes_.put32(count);
+    ok_ &= bytes_.append(values.first(uint64_t{count} * 4));
+  }
+  void set_root_descriptor(uint32_t parameter, uint32_t allocation, uint32_t offset = 0) { packet(Op::SetRootDescriptor, {parameter, allocation, offset}); }
+  void set_root_table(uint32_t parameter, uint32_t first_descriptor) { packet(Op::SetRootTable, {parameter, first_descriptor}); }
+  struct Barrier {
+    uint32_t type = 0, allocation = kNoAllocationIndex, before = 0, after = 0, flags = 0;
+    static constexpr uint32_t kNoAllocationIndex = 0xFFFFFFFFu;
+  };
+  void resource_barrier(std::initializer_list<Barrier> barriers) {
+    ok_ &= bytes_.put32(static_cast<uint32_t>(Op::ResourceBarrier) | ((2 + 5 * static_cast<uint32_t>(barriers.size())) << 16));
+    ok_ &= bytes_.put32(static_cast<uint32_t>(barriers.size()));
+    for (const Barrier& b : barriers)
+      for (uint32_t w : {b.type, b.allocation, b.before, b.after, b.flags}) ok_ &= bytes_.put32(w);
+  }
+  void transition(uint32_t allocation, uint32_t before, uint32_t after) { resource_barrier({Barrier{0, allocation, before, after, 0}}); }
   void bind_uav(uint32_t slot, uint32_t allocation, uint32_t offset, uint32_t size) { packet(Op::BindUav, {slot, allocation, offset, size}); }
   void dispatch(uint32_t x, uint32_t y = 1, uint32_t z = 1) { packet(Op::Dispatch, {x, y, z}); }
   // `mode`: a graphics::ResolveMode (0 average, 1 sample 0, 2 least, 3 greatest); a depth buffer needs 1 or the adapter's kFeatureResolveModes. Left out (0, two words), it is the average of a colour target.

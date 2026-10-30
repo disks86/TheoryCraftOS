@@ -39,6 +39,7 @@ struct Port {
   std::vector<Rt> retimers;                                      // retimers on the cable behind this lane adapter (the last one is the one at the end)
   uint32_t rt_opcode[8] = {}, rt_metadata[8] = {};
   uint32_t sb_enumerations = 0;
+  bool dp_acked = false;
   bool locked = false;                                           // a downstream lane adapter stays locked until the host clears LCK
 };
 
@@ -60,6 +61,10 @@ struct Router {
   std::vector<uint8_t> drom;         // what DROM_READ gives (none: the operation is not supported)
   uint32_t drom_status = 0;          // the status the operation ends with
   uint32_t drom_reads = 0;
+  bool dp_arbitration = false;       // the DP resource operations are supported
+  uint32_t dp_held_by_other = 0;     // bit n: the DP IN adapter n is held by another connection manager
+  uint32_t dp_held_by_us = 0;
+  std::vector<uint32_t> dp_ops;      // opcode | port << 8 of each DP resource operation
 };
 
 class Fabric {
@@ -87,7 +92,7 @@ class Fabric {
     }
     for (uint32_t i = 0; i < usb3_down; ++i) r->ports.push_back(usb3(++n, kTypeUsb3Down));
     if (usb3_up) r->ports.push_back(usb3(++n, kTypeUsb3Up));
-    for (uint32_t i = 0; i < dp_in; ++i) { Port p = adapter(++n, kTypeDpIn); p.space[0x10 + kDpLocalCap] = (3u << kDpCommonRateShift) | (2u << kDpCommonLanesShift); r->ports.push_back(p); }      // HBR3, four lanes
+    for (uint32_t i = 0; i < dp_in; ++i) { Port p = adapter(++n, kTypeDpIn); p.space[0x10 + kDpLocalCap] = (3u << kDpCommonRateShift) | (2u << kDpCommonLanesShift) | (dp_bw_mode ? kDpCommonBwMode : 0); r->ports.push_back(p); }      // HBR3, four lanes
     for (uint32_t i = 0; i < dp_out; ++i) { Port p = adapter(++n, kTypeDpOut); p.space[0x10 + kDpLocalCap] = (2u << kDpCommonRateShift) | (1u << kDpCommonLanesShift); r->ports.push_back(p); }     // HBR2, two lanes
     r->max_port = n;
     r->regs[6] = (1u << 18);                                     // ROUTER_CS_6.HCI: it has an xHCI
@@ -124,6 +129,13 @@ class Fabric {
     }
     return r;
   }
+  // The DP IN adapter asks for `mbps` (in units of the granularity the connection manager set).
+  void request_dp_bandwidth(uint64_t route, uint32_t port, uint32_t mbps) {
+    Port& p = at(route).ports[port];
+    const uint32_t gr = (p.space[0x10 + kDpCs2] & kDpCs2GranularityMask) >> kDpCs2GranularityShift;
+    const uint32_t granularity = gr == 0 ? 250 : gr == 1 ? 500 : 1000;
+    p.space[0x10 + kDpCs8] = (p.space[0x10 + kDpCs8] & ~kDpCs8RequestedMask) | (mbps / granularity) | kDpCs8Dr;
+  }
   Router& at(uint64_t route) { return *routers_[route]; }
   bool has(uint64_t route) const { return routers_.count(route) != 0; }
   // Connects the downstream lane adapter `port` of the router at `parent_route` to the router at `route` (the link comes up).
@@ -155,6 +167,7 @@ class Fabric {
     parent.ports[port + 1].state = kPortUnplugged;
     at(route).connected = false;
   }
+  bool dp_bw_mode = false;                                       // DP IN adapters of routers added from now on support the bandwidth allocation mode
   bool tmu_ucap = true;                                          // new routers support the uni-directional TMU mode
   bool refuse_sleep = false;                                     // ROUTER_CS_6.SLPR never comes up
   struct PcieWrite { uint32_t bridge_mask, offset, value; };
@@ -216,7 +229,7 @@ class Fabric {
 
   fake_tb::FakeNhi::ConfigAnswer handle(bool write, uint64_t route, uint32_t port, uint32_t space, uint32_t offset, uint32_t length, const std::vector<uint32_t>& data) {
     auto it = routers_.find(route & ((1ull << 54) - 1));
-    if (it == routers_.end() || !it->second->connected) return fail(6);                   // nobody there
+    if (it == routers_.end() || !it->second->connected) return fail(4);                   // nobody there
     Router& r = *it->second;
     // the downstream lane adapter that leads here must have been unlocked
     fake_tb::FakeNhi::ConfigAnswer a;
@@ -236,7 +249,7 @@ class Fabric {
       const uint32_t parent_port = static_cast<uint32_t>((route >> shift) & 0xFF);
       parent_route &= ~(0xFFull << shift);
       auto pit = routers_.find(parent_route);
-      if (pit != routers_.end() && parent_port < pit->second->ports.size() && pit->second->ports[parent_port].locked) return fail(6);
+      if (pit != routers_.end() && parent_port < pit->second->ports.size() && pit->second->ports[parent_port].locked) return fail(4);
     }
     if (space == 2) {                                                               // the router's own space
       if (offset + length > 512) return fail(2);
@@ -247,7 +260,7 @@ class Fabric {
       }
       return a;
     }
-    if (port == 0 || port > r.max_port) return fail(6);
+    if (port == 0 || port > r.max_port) return fail(4);
     Port& p = r.ports[port];
     if (!p.implemented) return fail(2);
     if (space == 1) {                                                               // port space
@@ -328,6 +341,14 @@ class Fabric {
           r.regs[9 + d] = word;
         }
         r.regs[26] = (r.drom_status << kCs26StatusShift);
+      } else if (r.dp_arbitration && ((v & 0xFFFF) == kOpQueryDpResource || (v & 0xFFFF) == kOpAllocDpResource || (v & 0xFFFF) == kOpDeallocDpResource)) {
+        const uint32_t op = v & 0xFFFF, port = r.regs[25] & 0xFF, bit = port < 32 ? 1u << port : 0;
+        r.dp_ops.push_back(op | port << 8);
+        uint32_t status = 0;
+        if (op == kOpDeallocDpResource) r.dp_held_by_us &= ~bit;
+        else if (r.dp_held_by_other & bit) status = 1;
+        else if (op == kOpAllocDpResource) r.dp_held_by_us |= bit;
+        r.regs[26] = status << kCs26StatusShift;
       } else if ((v & 0xFFFF) == kOpBufferAlloc && !r.buffer_alloc.empty()) {
         for (uint32_t d = 0; d < 16; ++d) r.regs[9 + d] = d < r.buffer_alloc.size() ? r.buffer_alloc[d] : 0;
         r.regs[25] = static_cast<uint32_t>(r.buffer_alloc.size());
@@ -389,6 +410,14 @@ class Fabric {
     }
     if (p.type == kTypePort && i == 0x20 + 0x13 && (v & kPortCs19StartAsym)) {         // the transition starts and ends at once
       p.space[i] = v & ~kPortCs19StartAsym;
+      return;
+    }
+    if (p.type == kTypeDpIn && i == 0x10 + kDpCs2) {                                    // the connection manager's side of the bandwidth allocation handshake
+      const bool was = (p.space[i] & kDpCs2Ca) != 0, now = (v & kDpCs2Ca) != 0;
+      p.space[i] = v;
+      if (v & kDpCs2Cmms) p.space[0x10 + kDpCs8] |= kDpCs8Dpme;
+      if (now && !was) p.dp_acked = true;
+      if (!now && was && p.dp_acked) { p.space[0x10 + kDpCs8] &= ~kDpCs8Dr; p.dp_acked = false; }       // the request is over when the acknowledge has come and gone
       return;
     }
     if (p.type == kTypeDpOut && i == 0x10 + kDpStatusCtrl) {                            // the connection manager handshake completes at once
