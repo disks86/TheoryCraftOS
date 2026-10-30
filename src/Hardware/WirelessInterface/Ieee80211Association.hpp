@@ -57,6 +57,8 @@ class Ieee80211Association {
   WifiResult start(const WifiNetwork& network, ConstByteView ap_rsn_element, StringView passphrase, const uint8_t snonce[wpa2::kNonceBytes], const uint8_t our_address[6]);
   // A frame the radio received from the air (the 802.11 frame without FCS).
   void on_frame(ConstByteView frame);
+  // An EAPOL frame the radio already took out of a data frame (the hardware may have decrypted it).
+  void on_eapol(ConstByteView eapol);
   // The clock: retries and time-outs.
   void poll();
   // Leaves the network (a deauthentication frame goes out if joined).

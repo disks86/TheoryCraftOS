@@ -224,6 +224,85 @@ int32_t IwlCommandQueue::enqueue(const IwlHostCommand& command, const char** err
   return sequence;
 }
 
+void IwlCommandQueue::write_byte_count(uint32_t index, uint16_t frame_bytes, uint8_t station, bool ccm) {
+  // iwl_txq_gen1_update_byte_cnt_tbl: the frame, its FCS, a delimiter and the cipher's MIC, in dwords, with the station in the top four bits
+  uint32_t len = frame_bytes + 4 + 4 + (ccm ? 8 : 0);
+  len = (len + 3) / 4;
+  if (len > 0xFFF) return;
+  const uint16_t entry = static_cast<uint16_t>(len | (static_cast<uint32_t>(station & 0xF) << 12));
+  uint8_t* table = shared_byte_counts_ ? shared_byte_counts_ : byte_counts_.data();
+  auto put = [&](uint32_t at) {
+    uint8_t* p = table + (static_cast<uint64_t>(queue_) * kByteCountEntries + at) * 2;
+    p[0] = static_cast<uint8_t>(entry);
+    p[1] = static_cast<uint8_t>(entry >> 8);
+  };
+  put(index);
+  if (index < 64) put(kRingEntries + index);
+}
+
+int32_t IwlCommandQueue::enqueue_frame(ConstByteView prefix, ConstByteView payload, uint16_t frame_bytes, uint8_t station, bool ccm, const char** error) {
+  const char* local = nullptr;
+  if (!error) error = &local;
+  if (!ready()) {
+    *error = "the queue is not initialised";
+    return -1;
+  }
+  const uint64_t total = prefix.size() + payload.size();
+  if (prefix.size() < kFirstTbBytes + 4 || prefix.size() > 512 || total > kSlotBytes) {
+    *error = "the frame is too large";
+    return -1;
+  }
+  if (in_flight() >= kSlots - 1) {
+    *error = "no space in the transmit queue";
+    return -1;
+  }
+  const uint32_t index = write_;
+  const uint32_t slot = index & (kSlots - 1);
+  const uint16_t sequence = static_cast<uint16_t>((queue_ << 8) | index);
+  ByteView out = commands_.subview(static_cast<uint64_t>(slot) * kSlotBytes, kSlotBytes);
+  out.fill(0);
+  out.subview(0, prefix.size()).copy_from(prefix);
+  if (payload.size()) out.subview(prefix.size(), payload.size()).copy_from(payload);
+  put16(&out[2], sequence);                                                  // the device command header's sequence
+  // the first buffer holds the start of the command (and the "scratch" the firmware writes its transmit status to: its address goes in the command)
+  const uint64_t first_bus = first_tbs_bus_ + static_cast<uint64_t>(slot) * kFirstTbStride;
+  const uint32_t scratch_at = 4 + 44;                                        // device header + dram_lsb_ptr in the TX command parameters
+  put32(&out[scratch_at], static_cast<uint32_t>(first_bus + 4 + 8));
+  out[scratch_at + 4] = static_cast<uint8_t>((first_bus + 4 + 8) >> 32);
+  first_tbs_.subview(static_cast<uint64_t>(slot) * kFirstTbStride, kFirstTbBytes).copy_from(out.subview(0, kFirstTbBytes));
+  uint8_t* t = tfd(index);
+  ByteView(t, kTfdBytes).fill(0);
+  set_tb(t, 0, first_bus, kFirstTbBytes);
+  // the second buffer: the rest of the command and the 802.11 header, a whole number of dwords; the third: the payload
+  const uint64_t slot_bus = commands_bus_ + static_cast<uint64_t>(slot) * kSlotBytes;
+  const uint32_t tb1 = static_cast<uint32_t>(prefix.size()) - kFirstTbBytes;
+  set_tb(t, 1, slot_bus + kFirstTbBytes, tb1);
+  if (payload.size()) set_tb(t, 2, slot_bus + prefix.size(), static_cast<uint32_t>(payload.size()));
+  write_byte_count(index, frame_bytes, station, ccm);
+  __atomic_thread_fence(__ATOMIC_RELEASE);
+  write_ = (write_ + 1) & (kRingEntries - 1);
+  if (!device_.grab_nic_access()) {
+    write_ = index;
+    invalidate(index);
+    *error = "the MAC would not wake to send a frame";
+    return -1;
+  }
+  device_.write32(kHbusTargWrptr, write_ | (queue_ << 8));
+  device_.release_nic_access();
+  return sequence;
+}
+
+void IwlCommandQueue::reclaim_until(uint32_t ssn) {
+  if (!ready()) return;
+  ssn &= kRingEntries - 1;
+  const uint32_t pending = in_flight();
+  if (((ssn - read_) & (kRingEntries - 1)) > pending) return;                // not a position between what was read and what was written
+  while (read_ != ssn) {
+    invalidate(read_);
+    read_ = (read_ + 1) & (kRingEntries - 1);
+  }
+}
+
 void IwlCommandQueue::reclaim(uint32_t index) {
   if (!ready() || index >= kRingEntries) return;
   const uint32_t stop = (index + 1) & (kRingEntries - 1);

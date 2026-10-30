@@ -191,6 +191,7 @@ void IwlScanner::add_network(const WifiNetwork& network) {
 }
 
 void IwlScanner::on_notification(const IwlRxPacket& packet) {
+  if (forward_) forward_->on_notification(packet);
   if (packet.group == 0 && packet.command == kRxMpduCommand) {
     IwlRxFrame frame;
     if (!iwl_parse_rx_mpdu(packet, &frame) || !frame.crc_ok) return;

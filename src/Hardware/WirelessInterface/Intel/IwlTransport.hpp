@@ -78,6 +78,8 @@ class IwlTransport final : private IIwlPacketSink {
 
   const IwlAliveInfo& alive() const { return alive_; }
   IwlPcieDevice& device() { return device_; }
+  IwlCommandQueue& command_queue() { return tx_; }
+  allocators::IAllocator& allocator() { return allocator_; }
 
  private:
   void on_packet(const IwlRxPacket& packet) override;
