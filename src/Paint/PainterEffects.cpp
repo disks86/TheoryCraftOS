@@ -426,9 +426,8 @@ bool DisplayPainter::paint_group(graphics::IRenderer2D& r, const DisplayList& li
   }
   const IRect visible = g.intersection(clip_visible);
   if (visible.empty()) return true;
-  // The GPU does a chain of blurs and colour functions on the picture of the content (a drop shadow stays on the CPU).
-  bool on_gpu = r.supports_group_filters();
-  for (uint32_t i = 0; i < chain.count && i < kMaxFilterSteps; ++i) on_gpu = on_gpu && chain.steps[i].kind != FilterStep::DropShadow;
+  // The GPU does the chain (blurs, colour functions, drop shadows) on the picture of the content.
+  const bool on_gpu = r.supports_group_filters();
   if (on_gpu) {
     // (the picture is the visible part and what the blurs read around it; the clip shows only the visible part when it is laid over the target)
     const IRect area = grown(visible, reach);
@@ -440,6 +439,7 @@ bool DisplayPainter::paint_group(graphics::IRenderer2D& r, const DisplayList& li
         const FilterStep& step = chain.steps[i];
         graphics::ColorTransform t;
         if (step.kind == FilterStep::Blur) ok = r.group_blur(step.amount) && ok;
+        else if (step.kind == FilterStep::DropShadow) ok = r.group_drop_shadow(iround(step.dx), iround(step.dy), step.blur / 2.0f, step.color) && ok;
         else if (color_filter_transform(step.kind, step.amount, &t)) ok = r.group_color(t) && ok;
       }
       ok = r.end_group(graphics::Matrix2D(), 255, graphics::ImageFilter::Nearest) && ok;
@@ -837,6 +837,18 @@ void DisplayPainter::draw_text_op(graphics::IRenderer2D& r, const DisplayList& l
   const IRect area = rect.intersection(visible);
   const IRect work = grown(area, reach).intersection(rect);
   if (area.empty() || work.empty()) return;
+  if (r.supports_group_filters()) {
+    // On the GPU: the run is drawn in its colour into a filter group and blurred there.
+    r.push_clip_rect(to_rect(area));
+    bool done = r.begin_filter_group(to_rect(work));
+    if (done) {
+      draw_text_run(r, list, op, exact, dx, dy, op.color);
+      r.group_blur(sigma);
+      done = r.end_group(graphics::Matrix2D(), 255, graphics::ImageFilter::Nearest);
+    }
+    r.pop_clip();
+    if (done) return;
+  }
   Pixmap run_picture(allocator_);
   if (!run_picture.create(work.width, work.height)) return;
   {
