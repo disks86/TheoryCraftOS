@@ -31,6 +31,8 @@ class SystemAcpiHost final : public IAcpiHost {
   SystemAcpiHost(const IPciBus* pci, MmioMapper* mmio) : pci_(pci), mmio_(mmio), ports_(), ec_(ports_) {}
 
   void configure_ec(uint16_t data_port, uint16_t command_port) override { ec_.configure(data_port, command_port); }
+  bool ec_status(uint8_t* value) override { return ec_.status(value); }
+  bool ec_query(uint8_t* event) override { return ec_.query(event); }
   bool region_read(const acpi::RegionAccess& access, uint64_t* value) override;
   bool region_write(const acpi::RegionAccess& access, uint64_t value) override;
   void stall_us(uint32_t us) override;
