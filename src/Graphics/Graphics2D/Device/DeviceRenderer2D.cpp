@@ -112,7 +112,13 @@ DeviceRenderer2D::DeviceRenderer2D(IGraphicsDevice& device, allocators::IAllocat
       textured.fragment_shader = color_fs_;
       filter_color_ = device.create_graphics_pipeline(textured);
     }
-    filters_ok_ = groups_ok_ && filter_blur_ && filter_color_;
+    BlendState erase;   // dst = dst * (1 - src alpha), colour and alpha
+    erase.custom = erase.enable = true;
+    erase.src_color = erase.src_alpha = BlendFactor::Zero;
+    erase.dst_color = erase.dst_alpha = BlendFactor::InvSrcAlpha;
+    colored.blend = erase;
+    group_erase_ = device.create_graphics_pipeline(colored);
+    filters_ok_ = groups_ok_ && filter_blur_ && filter_color_ && group_erase_;
   }
   for (IImage*& image : images_) image = device.create_image({extent, Format::B8G8R8A8Unorm, kImageColorAttachment | kImagePresent});
   commands_ = device.create_command_buffer();
@@ -135,6 +141,7 @@ DeviceRenderer2D::~DeviceRenderer2D() {
   }
   for (MaskEntry& e : mask_cache_)
     if (e.image) device_.destroy_image(e.image);
+  if (group_erase_) device_.destroy_pipeline(group_erase_);
   if (masked_) device_.destroy_pipeline(masked_);
   if (masked_fs_) device_.destroy_shader_module(masked_fs_);
   if (filter_color_) device_.destroy_pipeline(filter_color_);
@@ -168,14 +175,14 @@ DeviceRenderer2D::~DeviceRenderer2D() {
 void DeviceRenderer2D::close_range() {
   close_sheet_range();
   if (count_ <= range_start_) return;
-  ranges_[range_count_++] = {range_start_, count_ - range_start_, clip_, blend_, false};
+  ranges_[range_count_++] = {range_start_, count_ - range_start_, clip_, blend_, false, erase_};
   range_start_ = count_;
   if (range_count_ == kMaxRanges) submit_pending();
 }
 
 void DeviceRenderer2D::close_sheet_range() {
   if (sheet_count_ <= sheet_range_start_) return;
-  ranges_[range_count_++] = {sheet_range_start_, sheet_count_ - sheet_range_start_, clip_, blend_, true};
+  ranges_[range_count_++] = {sheet_range_start_, sheet_count_ - sheet_range_start_, clip_, blend_, true, false};
   sheet_range_start_ = sheet_count_;
   if (range_count_ == kMaxRanges) submit_pending();
 }
@@ -249,7 +256,7 @@ bool DeviceRenderer2D::submit_pending() {
         bound = 1;
       }
     } else {
-      commands_->bind_pipeline(colored_pipeline(r.blend));
+      commands_->bind_pipeline(r.erase && group_erase_ ? group_erase_ : colored_pipeline(r.blend));
       if (bound != 0) {
         commands_->bind_vertex_buffer(vertices_);
         bound = 0;
@@ -1302,6 +1309,17 @@ bool DeviceRenderer2D::group_blur(float sigma) {
     if (radius <= 0) continue;
     if (!blur_pass(radius, true) || !blur_pass(radius, false)) return false;
   }
+  return true;
+}
+
+bool DeviceRenderer2D::group_cut_out(const Rect2D& rect, const CornerRadii& radii) {
+  unwind_masks();
+  if (!group_depth_ || !filters_ok_ || erase_) return false;
+  close_range();   // (what was recorded before is not erased)
+  erase_ = true;
+  fill_rounded_rect(rect, radii, 0xFF000000u);
+  close_range();
+  erase_ = false;
   return true;
 }
 
