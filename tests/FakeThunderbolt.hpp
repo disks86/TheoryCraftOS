@@ -93,6 +93,7 @@ class FakeNhi final : public hardware::ITbRegisters {
   uint32_t unreadable_root_reads = 0;        // root router reads that fail with an error packet first
   uint32_t error_code = 0;                   // set: answer configuration requests with this error code
   uint64_t route_answer = 0x0000000000000001ull;
+  bool titan_ridge = false;                  // the Titan Ridge forms of the messages
   bool answer_get_route = true;
   // secure connect: the keys the devices hold (by the first word of the UUID), and how they misbehave
   std::map<uint32_t, std::vector<uint8_t>> device_keys;
@@ -113,6 +114,7 @@ class FakeNhi final : public hardware::ITbRegisters {
   std::map<uint32_t, uint32_t> config_words;   // word offset of the switch space -> value
   std::map<uint32_t, uint32_t> writes;         // configuration words the host wrote
   std::vector<uint32_t> uuid_approved;
+  std::vector<uint64_t> approved_routes;     // Titan Ridge: the route strings of the approvals
   std::vector<uint32_t> fw_sts_writes;       // every write to the firmware status register, in order
   uint32_t fw_sts_written = 0;
   bool firmware_comes_up_on_reset = true;    // a CIO reset after the ARC was told to wait for it starts the firmware
@@ -200,6 +202,17 @@ class FakeNhi final : public hardware::ITbRegisters {
     w[5] = d.key | (uint32_t(d.id) << 8) | ((uint32_t(d.link) | (uint32_t(d.depth) << 4) | (approved ? 1u << 8 : 0) | (rejected ? 1u << 9 : 0)) << 16);
     send_icm_event(w);
   }
+  // Titan Ridge: the device named by its route string; `packet_id` other than 0 is a quality of service packet
+  void send_device_connected_tr(const Device& d, uint64_t route, bool approved = false, bool rejected = false, uint32_t packet_id = 0) {
+    std::vector<uint32_t> w(61, 0);
+    w[0] = 3u | (packet_id << 16) | (1u << 24);
+    memcpy(&w[1], d.uuid, 16);
+    w[5] = static_cast<uint32_t>(route >> 32);
+    w[6] = static_cast<uint32_t>(route);
+    w[7] = d.id | ((uint32_t(approved ? 1u << 8 : 0) | (rejected ? 1u << 9 : 0)) << 16);
+    send_icm_event(w);
+  }
+  void send_device_disconnected_tr(uint64_t route) { send_icm_event({4u | (1u << 24), static_cast<uint32_t>(route >> 32), static_cast<uint32_t>(route)}); }
   void send_device_disconnected(uint8_t link, uint8_t depth) { send_icm_event({4u | (1u << 24), (uint32_t(link) | (uint32_t(depth) << 4)) << 16}); }
 
  private:
@@ -290,30 +303,34 @@ class FakeNhi final : public hardware::ITbRegisters {
     requests_seen.push_back(code);
     if (code == 3) {
       if (!answer_driver_ready) return;
-      reply(kIcmResponse, {3u | (1u << 24), 5u | (7u << 8) | ((security & 0xFu) << 16)});
-    } else if (code == 4 && w.size() >= 6) {
+      if (titan_ridge) reply(kIcmResponse, {3u | (1u << 24), (security & 0x7u) << 16, 0x00100002u, 0x15EBu});
+      else reply(kIcmResponse, {3u | (1u << 24), 5u | (7u << 8) | ((security & 0xFu) << 16)});
+    } else if (code == 4 && w.size() >= (titan_ridge ? 8u : 6u)) {
       Device d;
       memcpy(d.uuid, &w[1], 16);
       uuid_approved.push_back(w[1]);
+      if (titan_ridge) approved_routes.push_back((uint64_t(w[5]) << 32) | w[6]);
       for (Device& known : devices)
         if (memcmp(known.uuid, d.uuid, 16) == 0) known.approved = !approve_error;
-      std::vector<uint32_t> out(w.begin(), w.begin() + 6);
+      std::vector<uint32_t> out(w.begin(), w.begin() + (titan_ridge ? 8 : 6));
       out[0] = 4u | ((approve_error ? 1u : 0u) << 8) | (1u << 24);
       reply(kIcmResponse, out);
-    } else if (code == 6 && w.size() >= 14) {
-      // ADD_DEVICE_KEY: hdr, uuid, key id, connection id, reserved, 32 bytes of key
+    } else if (code == 6 && w.size() >= (titan_ridge ? 16u : 14u)) {
+      // ADD_DEVICE_KEY: hdr, uuid, key id / route, connection id, then 32 bytes of key
+      const size_t head = titan_ridge ? 8 : 6;
       std::vector<uint8_t> key(32);
-      memcpy(key.data(), &w[6], 32);
+      memcpy(key.data(), &w[head], 32);
       if (!add_key_error) device_keys[w[1]] = key;
-      std::vector<uint32_t> out(w.begin(), w.begin() + 6);
+      std::vector<uint32_t> out(w.begin(), w.begin() + head);
       out[0] = 6u | ((add_key_error ? 1u : 0u) << 8) | (1u << 24);
       reply(kIcmResponse, out);
-    } else if (code == 5 && w.size() >= 14) {
-      // CHALLENGE_DEVICE: the answer is the request's first 24 bytes, the challenge and HMAC-SHA256 of it under the device's key
-      std::vector<uint32_t> out(22, 0);
-      for (int i = 0; i < 14; ++i) out[i] = w[i];
+    } else if (code == 5 && w.size() >= (titan_ridge ? 16u : 14u)) {
+      // CHALLENGE_DEVICE: the answer is the request's header, the challenge and HMAC-SHA256 of it under the device's key
+      const size_t head = titan_ridge ? 8 : 6;
+      std::vector<uint32_t> out(head + 16, 0);
+      for (size_t i = 0; i < head + 8; ++i) out[i] = w[i];
       std::vector<uint8_t> challenge(32);
-      memcpy(challenge.data(), &w[6], 32);
+      memcpy(challenge.data(), &w[head], 32);
       challenges.push_back(challenge);
       uint32_t flags = 0;
       auto it = device_keys.find(w[1]);
@@ -323,7 +340,7 @@ class FakeNhi final : public hardware::ITbRegisters {
         uint8_t mac[32];
         crypto::hmac(crypto::HashKind::Sha256, ConstByteView(it->second.data(), 32), ConstByteView(challenge.data(), 32), mac);
         if (challenge_wrong) mac[5] ^= 1;
-        memcpy(&out[14], mac, 32);
+        memcpy(&out[head + 8], mac, 32);
       }
       out[0] = 5u | (flags << 8) | (1u << 24);
       reply(kIcmResponse, out);
@@ -361,6 +378,7 @@ class FakeCio final : public hardware::ITbConfigSpace {
   bool fail_commands = false;            // every command ends with the timeout bit
   bool hang = false;                     // the start bit never clears
   bool root_resets = true;
+  bool titan = false;                    // the reset is a different register on Titan Ridge
   std::map<uint32_t, uint32_t> cs1;      // port -> PHY_PORT_CS1
   struct Command { bool write; uint32_t space, port, index, value; };
   std::vector<Command> commands;
@@ -385,7 +403,7 @@ class FakeCio final : public hardware::ITbConfigSpace {
     cmd_ &= ~kCmdStart;
     if (fail_commands) { cmd_ |= kCmdTimeout; return; }
     if (write) {
-      if (space == 2 && port == 0 && index == kSwitchResetIndex && (wrdata_ & kSwitchResetBit) && root_resets) chip_.cio_reset();
+      if (space == 2 && port == 0 && root_resets && ((index == kSwitchResetIndex && (wrdata_ & kSwitchResetBit) && !titan) || (index == kTitanSwitchResetIndex && (wrdata_ & kTitanSwitchResetBit) && titan))) chip_.cio_reset();
       if (space == 1 && index == kPhyPortCs1) cs1[port] = wrdata_;
     } else if (space == 1 && index == kPhyPortCs1) {
       rddata_ = cs1.count(port) ? cs1[port] : 0;

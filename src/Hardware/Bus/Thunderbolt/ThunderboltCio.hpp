@@ -56,6 +56,7 @@ constexpr uint32_t kCmdSpaceShift = 19, kCmdSpaceMask = 3u << 19, kCmdPortShift 
 constexpr uint16_t kVendorExtendedCapability = 0x000B;
 // the registers it is used for
 constexpr uint32_t kSwitchResetIndex = 0x50, kSwitchResetBit = 1u << 9;        // the root router's reset (switch space, port 0)
+constexpr uint32_t kTitanSwitchResetIndex = 0x777, kTitanSwitchResetBit = 1u << 1;   // (Titan Ridge keeps it elsewhere)
 constexpr uint32_t kPhyPortCs1 = 0x37, kPhyLinkDisable = 1u << 14, kPhyLinkStateShift = 26, kPhyLinkStateMask = 0xFu << 26, kPortStateUp = 2;
 }  // namespace tb_cio
 

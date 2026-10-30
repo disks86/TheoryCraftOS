@@ -50,7 +50,7 @@ class ThunderboltDriver {
   Outcome start(IPciBus& pci, const PciDeviceInfo& device, IRegisterMapper& mapper);
   // The part after the registers are reachable (tests bring their own).
   // `cio`: the PCIe-to-CIO registers if there are any (see ThunderboltCio).
-  Outcome start_device(ITbRegisters& registers, TbPcie2Cio* cio = nullptr);
+  Outcome start_device(ITbRegisters& registers, TbPcie2Cio* cio = nullptr, TbGeneration generation = TbGeneration::AlpineRidge);
   void stop();
 
   Outcome outcome() const { return outcome_; }
