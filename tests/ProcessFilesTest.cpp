@@ -511,7 +511,7 @@ static void test_windows_files() {
   o = rig.create("\\??\\C:\\temp\\CASE.TEST", kGenericWrite, 5, kOptions);      // FILE_OPEN_IF
   CHECK(o.status == 0 && read_file(fs, "/Windows/Temp/CASE.TEST") == "<missing>" && read_file(fs, "/Windows/Temp/Case.Test") == "");
   rig.call(WindowsSyscallNumber::NtClose, o.handle);
-  o = rig.create("\\??\\C:\\Temp\\moved.txt", kGenericWrite | kGenericRead, 2, kOptions);
+  o = rig.create("\\??\\C:\\Temp\\moved.txt", kGenericWrite | kGenericRead | 0x10000 /* DELETE: a rename takes it */, 2, kOptions);
   rig.write(o.handle, "data", 0);
   // FILE_RENAME_INFORMATION: ReplaceIfExists, RootDirectory, FileNameLength, FileName
   const std::string target = "\\??\\C:\\Temp\\renamed.txt";
