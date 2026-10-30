@@ -733,6 +733,9 @@ add_executable(BOOTX64
   src/Hardware/WirelessInterface/Intel/IwlMvm.cpp
   src/Hardware/WirelessInterface/Intel/IwlScan.cpp
   src/Hardware/WirelessInterface/Ieee80211Scan.cpp
+  src/Hardware/WirelessInterface/Ieee80211Frames.cpp
+  src/Hardware/WirelessInterface/Ieee80211Association.cpp
+  src/Hardware/WirelessInterface/Wpa2.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnIsa.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnEmu.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/Gcn/TgsiParse.cpp
