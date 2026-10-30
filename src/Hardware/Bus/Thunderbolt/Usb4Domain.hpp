@@ -54,6 +54,10 @@ constexpr uint8_t kPortCapPhy = 0x01, kPortCapTime1 = 0x03, kPortCapAdapter = 0x
 constexpr uint32_t kDpCs0 = 0, kDpCs0Ae = 1u << 30, kDpCs0Ve = 1u << 31, kDpCs3 = 3, kDpCs3Hpdc = 1u << 9, kDpLocalCap = 4, kDpRemoteCap = 5, kDpStatusCtrl = 6, kDpStatusCtrlCmhs = 1u << 25, kDpStatusCtrlUf = 1u << 26,
                    kDpCommonRateShift = 8, kDpCommonRateMask = 0xFu << 8, kDpCommonLanesShift = 12, kDpCommonLanesMask = 7u << 12,
                    kDpVideoHop = 9, kDpAuxTxHop = 8, kDpAuxRxHop = 8, kDpVideoPriority = 1, kDpAuxPriority = 2, kDpWeight = 1, kAdpCs4NfcMask = 0x3FF;
+// The sideband channel of a USB4 port (PORT_CS_1 holds the command, PORT_CS_2 on the data) and what retimers answer on it (sb_regs.h)
+constexpr uint32_t kPortCs1 = 1, kPortCs2 = 2, kSbLengthShift = 8, kSbTargetShift = 16, kSbRetimerShift = 20, kSbWrite = 1u << 24, kSbNoResponse = 1u << 25, kSbResponseCode = 1u << 26, kSbPending = 1u << 31,
+                   kSbTargetRouter = 0, kSbTargetRetimer = 2, kSbVendorId = 0x00, kSbProductId = 0x01, kSbOpcode = 0x08, kSbMetadata = 0x09, kMaxRetimers = 6,
+                   kSbOpErr = 0x20525245, kSbOpOns = 0x444D4321, kSbOpEnumerate = 0x4D554E45, kSbOpQueryLast = 0x5453414C, kSbOpGetNvmSectorSize = 0x53534E47;
 // Thunderbolt 3 device routers: the vendor specific capabilities of their space (plug events, link controller) and the link controller's registers
 constexpr uint8_t kSwitchCapVse = 0x05, kVsecPlugEvents = 0x01, kVsecLinkController = 0x06;
 constexpr uint32_t kLcDesc = 2, kLcSxCtrl = 0x96, kLcSxCtrlWoc = 1u << 1, kLcSxCtrlWod = 1u << 2, kLcSxCtrlWodpc = 1u << 3, kLcSxCtrlWodpd = 1u << 4, kLcSxCtrlWou4 = 1u << 5, kLcSxCtrlWop = 1u << 6, kLcSxCtrlSlp = 1u << 31, kLcSxCtrlL1c = 1u << 16, kLcSxCtrlL2c = 1u << 20, kLcSxCtrlUpstream = 1u << 30, kLcCs42 = 0x2A, kLcCs42UsbPlugged = 1u << 31, kLcLinkReq = 0xAD, kLcLinkReqXhciConnect = 1u << 31, kLcPortAttr = 0x8D, kLcPortAttrBe = 1u << 12, kPlugEventsUsbDisable = 1u << 2,
@@ -81,6 +85,9 @@ struct Usb4Port {
   uint8_t number = 0;
   uint32_t type = 0;
   uint8_t cap_phy = 0, cap_adapter = 0, cap_usb4 = 0, cap_tmu = 0;
+  struct Retimer { uint32_t vendor = 0, product = 0, sector_size = 0; };
+  Retimer retimers[6];               // the retimers on the cable behind this port (on-board ones, as many as the last one's index)
+  uint8_t retimer_count = 0;
   uint16_t max_in_hop = 0, max_out_hop = 0;
   bool disabled = false;
   uint8_t link_nr = 0;               // 0 for the first of two lane adapters, 1 for the second
@@ -247,7 +254,14 @@ class Usb4Domain final : public IThunderboltEvents, public IXdomainHost, private
   uint32_t unreachable_links() const { return unreachable_; }
   // Reads and parses a router's DROM (names, which ports are unused, which lane adapters belong together); a router without one keeps the defaults. Done for every router found.
   bool read_drom(Usb4Router& r);
+  // The retimers on the cable behind a USB4 port (tb_retimer_scan): the router is asked to enumerate them, each index is asked whether it is the last, and the vendor, product and NVM sector size of
+  // the ones found are read. Done for every port with a link when it is scanned; not the firmware update of a retimer.
+  uint8_t retimer_count(uint32_t router_index, uint32_t port) const { const Usb4Router* r = router(router_index); return r && port < usb4::kMaxPorts ? r->ports[port].retimer_count : 0; }
+  const Usb4Port::Retimer* retimer(uint32_t router_index, uint32_t port, uint32_t index) const { const Usb4Router* r = router(router_index); return r && port < usb4::kMaxPorts && index < r->ports[port].retimer_count ? &r->ports[port].retimers[index] : nullptr; }
   bool read_buffer_allocation(Usb4Router& r);
+  int sb_transfer(const Usb4Router& r, uint32_t port, uint32_t target, uint32_t index, uint32_t reg, bool write_it, uint32_t* data, uint32_t bytes);
+  int sb_op(const Usb4Router& r, uint32_t port, uint32_t target, uint32_t index, uint32_t opcode, uint32_t timeout_us);
+  void scan_retimers(Usb4Router& r, uint32_t port);
   // Time synchronisation (tmu.c, uni-directional low resolution - the mode the Linux driver starts in): the host router is asked for its rate, each router below it gets the parameters, the
   // adapters on both ends of its link are set to uni-directional with time sync on, and its local time is first set from the host router's so that it starts near it.
   bool tmu_enabled(uint32_t router_index) const { const Usb4Router* r = router(router_index); return r && r->tmu_lowres; }

@@ -35,6 +35,10 @@ struct Port {
   std::vector<uint32_t> space = std::vector<uint32_t>(256, 0);
   std::map<uint32_t, std::pair<uint32_t, uint32_t>> hops;      // hop index -> two dwords
   uint32_t state = kPortDisabled;                                // lanes: the link state
+  struct Rt { uint32_t vendor, product, sector; };
+  std::vector<Rt> retimers;                                      // retimers on the cable behind this lane adapter (the last one is the one at the end)
+  uint32_t rt_opcode[8] = {}, rt_metadata[8] = {};
+  uint32_t sb_enumerations = 0;
   bool locked = false;                                           // a downstream lane adapter stays locked until the host clears LCK
 };
 
@@ -357,6 +361,30 @@ class Fabric {
     if (i == 4 && p.type == kTypePort) {                                               // ADP_CS_4: the lock bit
       p.space[4] = v;
       if (!(v & kAdpCs4Lck)) p.locked = false;
+      return;
+    }
+    if (p.type == kTypePort && i == 0x20 + kPortCs1 && (v & kSbPending)) {              // a sideband transaction runs at once
+      const uint32_t reg = v & 0xFF, target = (v >> kSbTargetShift) & 7, index = (v >> kSbRetimerShift) & 0xF;
+      const bool wr = (v & kSbWrite) != 0;
+      uint32_t result = v & ~kSbPending;
+      if (target == kSbTargetRetimer && (index == 0 || index > p.retimers.size() + 1 || index > 6)) {
+        result |= kSbNoResponse;                                                      // nothing answers at that index
+      } else if (target == kSbTargetRouter) {
+        if (wr && reg == kSbOpcode && p.space[0x20 + kPortCs2] == kSbOpEnumerate) ++p.sb_enumerations;
+      } else if (index <= p.retimers.size()) {
+        const Port::Rt& rt = p.retimers[index - 1];
+        if (wr && reg == kSbOpcode) {
+          const uint32_t op = p.space[0x20 + kPortCs2];
+          p.rt_opcode[index] = op == kSbOpQueryLast || op == kSbOpGetNvmSectorSize ? 0 : kSbOpOns;       // (done: the register reads zero)
+          if (op == kSbOpQueryLast) p.rt_metadata[index] = index == p.retimers.size() ? 1 : 0;
+          if (op == kSbOpGetNvmSectorSize) p.rt_metadata[index] = rt.sector;
+        } else if (!wr) {
+          p.space[0x20 + kPortCs2] = reg == kSbVendorId ? rt.vendor : reg == kSbProductId ? rt.product : reg == kSbOpcode ? p.rt_opcode[index] : reg == kSbMetadata ? p.rt_metadata[index] : 0;
+        }
+      } else if (!wr) {
+        result |= kSbNoResponse;
+      }
+      p.space[i] = result;
       return;
     }
     if (p.type == kTypePort && i == 0x20 + 0x13 && (v & kPortCs19StartAsym)) {         // the transition starts and ends at once

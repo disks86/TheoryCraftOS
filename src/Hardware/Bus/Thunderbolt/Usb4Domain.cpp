@@ -758,6 +758,73 @@ bool Usb4Domain::tmu_enable(Usb4Router& child, Usb4Router& parent, const Usb4Rou
   return ok;
 }
 
+// ------------------------------------------------------------------ retimers
+
+// One transaction on the sideband channel (usb4_port_sb_read / sb_write): the data first for a write, then the command with its pending bit, which clears when it is done; the response
+// code and no-response bits say how it went. Returns 0, -1 (no answer from the target: no such retimer) or -2 (any other failure).
+int Usb4Domain::sb_transfer(const Usb4Router& r, uint32_t port, uint32_t target, uint32_t index, uint32_t reg, bool write_it, uint32_t* data, uint32_t bytes) {
+  const Usb4Port& p = r.ports[port];
+  const uint32_t dwords = (bytes + 3) / 4;
+  if (p.cap_usb4 == 0 || dwords == 0 || dwords > kOpDataDwords) return -2;
+  if (write_it && !port_write(r, port, p.cap_usb4 + kPortCs2, ArrayView<const uint32_t>(data, dwords))) return -2;
+  uint32_t command = reg | (bytes << kSbLengthShift) | ((target << kSbTargetShift) & (7u << kSbTargetShift)) | kSbPending;
+  if (target == kSbTargetRetimer) command |= index << kSbRetimerShift;
+  if (write_it) command |= kSbWrite;
+  if (!port_write(r, port, p.cap_usb4 + kPortCs1, ArrayView<const uint32_t>(&command, 1))) return -2;
+  uint32_t word = 0;
+  bool done = false;
+  for (uint32_t waited = 0; waited < 500000 && !done; waited += 50) {
+    if (!port_read(r, port, p.cap_usb4 + kPortCs1, ArrayView<uint32_t>(&word, 1))) return -2;
+    done = (word & kSbPending) == 0;
+    if (!done) delay_us(50);
+  }
+  if (!done) return -2;
+  if (word & kSbNoResponse) return -1;
+  if (word & kSbResponseCode) return -2;
+  if (!write_it && !port_read(r, port, p.cap_usb4 + kPortCs2, ArrayView<uint32_t>(data, dwords))) return -2;
+  return 0;
+}
+
+// usb4_port_sb_op: the opcode is written to the target's opcode register and read back until it changes; zero is success, the error and not-supported codes are failures.
+int Usb4Domain::sb_op(const Usb4Router& r, uint32_t port, uint32_t target, uint32_t index, uint32_t opcode, uint32_t timeout_us) {
+  uint32_t value = opcode;
+  int result = sb_transfer(r, port, target, index, kSbOpcode, true, &value, 4);
+  if (result != 0) return result;
+  for (uint32_t waited = 0; waited < timeout_us; waited += 1000) {
+    result = sb_transfer(r, port, target, index, kSbOpcode, false, &value, 4);
+    if (result != 0) return result;
+    if (value != opcode) return value == 0 ? 0 : -2;
+    delay_us(1000);
+  }
+  return -2;
+}
+
+void Usb4Domain::scan_retimers(Usb4Router& r, uint32_t port) {
+  Usb4Port& p = r.ports[port];
+  p.retimer_count = 0;
+  if (p.cap_usb4 == 0) return;
+  uint32_t value = kSbOpEnumerate;
+  if (sb_transfer(r, port, kSbTargetRouter, 0, kSbOpcode, true, &value, 4) != 0) return;      // (a broadcast: the indices facing this port are set)
+  uint32_t last = 0;
+  for (uint32_t i = 1; i <= kMaxRetimers; ++i) {
+    const int result = sb_op(r, port, kSbTargetRetimer, i, kSbOpQueryLast, 500000);
+    if (result != 0) break;
+    uint32_t metadata = 0;
+    if (sb_transfer(r, port, kSbTargetRetimer, i, kSbMetadata, false, &metadata, 4) != 0) break;
+    if (metadata & 1) last = i;
+  }
+  for (uint32_t i = 1; i <= last; ++i) {
+    uint32_t vendor = 0, product = 0, metadata = 0;
+    if (sb_transfer(r, port, kSbTargetRetimer, i, kSbVendorId, false, &vendor, 4) != 0 || sb_transfer(r, port, kSbTargetRetimer, i, kSbProductId, false, &product, 4) != 0) break;
+    // (a retimer that has no NVM operations is not taken)
+    if (sb_op(r, port, kSbTargetRetimer, i, kSbOpGetNvmSectorSize, 500000) != 0 || sb_transfer(r, port, kSbTargetRetimer, i, kSbMetadata, false, &metadata, 4) != 0) break;
+    Usb4Port::Retimer& rt = p.retimers[p.retimer_count++];
+    rt.vendor = vendor;
+    rt.product = product;
+    rt.sector_size = metadata & 0xFFFFFF;
+  }
+}
+
 // ------------------------------------------------------------------ the tree
 
 bool Usb4Domain::start(const char** error) {
@@ -798,6 +865,7 @@ void Usb4Domain::scan_port(int index, uint32_t port_number) {
   }
   if (!up) return;
   Usb4Router& parent_ref = *routers_[index];
+  scan_retimers(parent_ref, port_number);                  // (the cable's retimers, before the router behind it)
   if (!unlock_downstream(parent_ref, port_number)) return;
   const uint64_t route = parent_ref.route | (static_cast<uint64_t>(port_number) << (8 * parent_ref.depth));
   int child_index = -1;

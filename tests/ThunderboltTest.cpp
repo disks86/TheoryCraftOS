@@ -3789,6 +3789,25 @@ static void test_usb4_tbt3_drom() {
   }
 }
 
+static void test_usb4_retimers() {
+  {   // two retimers on the cable behind the host's first lane adapter, none behind the second
+    Usb4Rig rig;
+    rig.fabric.at(0).ports[1].retimers = {{0x8086, 0x1111, 4096}, {0x8087, 0x2222, 8192}};
+    Usb4Domain domain(rig.control, rig.nhi, rig.alloc);
+    CHECK(domain.start(nullptr) && domain.present_count() == 3);
+    CHECK(domain.retimer_count(0, 1) == 2 && domain.retimer_count(0, 3) == 0 && domain.retimer_count(1, 1) == 0 && domain.retimer_count(9, 1) == 0 && domain.retimer_count(0, 70) == 0);
+    const Usb4Port::Retimer* a = domain.retimer(0, 1, 0);
+    const Usb4Port::Retimer* b = domain.retimer(0, 1, 1);
+    CHECK(a && b && a->vendor == 0x8086 && a->product == 0x1111 && a->sector_size == 4096 && b->vendor == 0x8087 && b->product == 0x2222 && b->sector_size == 8192 && !domain.retimer(0, 1, 2));
+    CHECK(rig.fabric.at(0).ports[1].sb_enumerations >= 1);                                  // (the router was asked to enumerate)
+  }
+  {   // no retimers, a lane adapter without the sideband: nothing found, nothing lost
+    Usb4Rig rig(false);
+    Usb4Domain domain(rig.control, rig.nhi, rig.alloc);
+    CHECK(domain.start(nullptr) && domain.retimer_count(0, 1) == 0 && domain.present_count() == 2);
+  }
+}
+
 static void test_usb4_garbage() {
   // the routers answer with noise: the manager must stay inside its arrays, whatever comes (and the sanitizers say if it does not)
   for (uint32_t seed = 1; seed <= 200; ++seed) {
@@ -3846,6 +3865,7 @@ int main() {
   test_usb4_clx();
   test_usb4_tbt3_extras();
   test_usb4_tbt3_drom();
+  test_usb4_retimers();
   test_usb4_runtime_sleep();
   test_usb4_xdomain_failures();
   test_usb4_driver();
