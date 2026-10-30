@@ -709,6 +709,11 @@ add_executable(BOOTX64
   src/Hardware/Bus/I2c/LpssI2c.cpp
   src/Hardware/Mouse/I2c/I2cHidPointer.cpp
   src/Hardware/Mouse/I2c/PlatformI2cHid.cpp
+  src/Hardware/Bus/Thunderbolt/ThunderboltDevices.cpp
+  src/Hardware/Bus/Thunderbolt/ThunderboltRing.cpp
+  src/Hardware/Bus/Thunderbolt/ThunderboltControl.cpp
+  src/Hardware/Bus/Thunderbolt/ThunderboltIcm.cpp
+  src/Hardware/Bus/Thunderbolt/ThunderboltDriver.cpp
   src/Hardware/WirelessInterface/Intel/IwlDevices.cpp
   src/Hardware/WirelessInterface/Intel/IwlFirmware.cpp
   src/Hardware/WirelessInterface/Intel/IwlPcie.cpp
@@ -1046,6 +1051,10 @@ endif()
 option(TCOS_INTEL_WIFI "Start the Intel Wireless-AC 9000 series card (firmware from /firmware, initialisation, hardware address and channels; no scanning or joining yet; not yet run on a real card)" OFF)
 if(TCOS_INTEL_WIFI)
   target_compile_definitions(BOOTX64 PRIVATE TCOS_INTEL_WIFI)
+endif()
+option(TCOS_THUNDERBOLT "Start the Thunderbolt 3 host interface (Alpine Ridge: control channel, the controller's firmware, devices reported as they are connected; PCIe tunnels only on request; not yet run on a real controller)" OFF)
+if(TCOS_THUNDERBOLT)
+  target_compile_definitions(BOOTX64 PRIVATE TCOS_THUNDERBOLT)
 endif()
 option(TCOS_SELFTESTS "Run the boot-time self-checks and demos of every subsystem" OFF)
 if(TCOS_SELFTESTS)

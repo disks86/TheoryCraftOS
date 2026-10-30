@@ -1,0 +1,290 @@
+/*
+ * TheoryCraftOS - a minimal UEFI x86_64 operating system.
+ * Copyright (C) 2026 Christopher Schaefer
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+#include "Hardware/Bus/Thunderbolt/ThunderboltIcm.hpp"
+#include "Kernel/Delay.hpp"
+#include "Utility/ByteStream.hpp"
+
+namespace hardware {
+
+namespace tb_icm {
+
+namespace {
+uint32_t header(ByteWriter& w, uint8_t code) {
+  w.u8(code);
+  w.u8(0);        // flags
+  w.u8(0);        // packet id
+  w.u8(0);        // total packets
+  return 0;
+}
+TbSecurityLevel security_of(uint32_t value) { return value <= 5 ? static_cast<TbSecurityLevel>(value) : TbSecurityLevel::Unknown; }
+}  // namespace
+
+uint32_t build_driver_ready(ByteView out) {
+  ByteWriter w(out);
+  header(w, kDriverReady);
+  return w.ok() ? static_cast<uint32_t>(w.position()) : 0;
+}
+
+bool parse_driver_ready(ConstByteView response, TbDriverReady* out) {
+  if (response.size() < kDriverReadyResponseBytes) return false;
+  ByteReader r(response);
+  const uint8_t code = r.u8(), flags = r.u8();
+  r.skip(2);
+  out->rom_version = r.u8();
+  out->ram_version = r.u8();
+  const uint16_t info = r.le16();
+  if (!r.ok() || code != kDriverReady) return false;
+  out->security = security_of(info & 0xF);
+  // (bit 13: the firmware supports the preboot ACL; bits 7 to 11 its number of entries)
+  out->boot_acl_entries = (info & (1u << 13)) ? (info >> 7) & 0x1F : 0;
+  out->rtd3 = (flags & kFlagRtd3) != 0;
+  return true;
+}
+
+uint32_t build_approve_device(const TbDevice& device, ByteView out) {
+  ByteWriter w(out);
+  header(w, kApproveDevice);
+  w.bytes(ConstByteView(device.uuid, sizeof device.uuid));
+  w.u8(device.connection_key);
+  w.u8(device.connection_id);
+  w.le16(0);
+  return w.ok() ? static_cast<uint32_t>(w.position()) : 0;
+}
+
+uint32_t build_get_route(uint8_t link, uint8_t depth, ByteView out) {
+  ByteWriter w(out);
+  header(w, kGetRoute);
+  w.le16(0);
+  w.le16(static_cast<uint16_t>((static_cast<uint32_t>(depth) << kDepthShift) | link));
+  return w.ok() ? static_cast<uint32_t>(w.position()) : 0;
+}
+
+uint8_t response_flags(ConstByteView response) {
+  uint8_t flags = 0;
+  return response.try_get(1, &flags) ? flags : 0;
+}
+
+bool parse_get_route(ConstByteView response, uint64_t* route) {
+  if (response.size() < kGetRouteResponseBytes) return false;
+  ByteReader r(response);
+  r.skip(8);
+  const uint32_t hi = r.le32(), lo = r.le32();
+  if (!r.ok()) return false;
+  *route = (static_cast<uint64_t>(hi & 0x3FFFFF) << 32) | lo;
+  return true;
+}
+
+bool parse_device_connected(ConstByteView event, TbDevice* out, bool* rejected) {
+  if (event.size() < kDeviceConnectedMinBytes) return false;
+  ByteReader r(event);
+  const uint8_t code = r.u8(), flags = r.u8();
+  r.skip(2);
+  TbDevice d;
+  const bool got = r.read_into(ByteView(d.uuid, sizeof d.uuid));
+  d.connection_key = r.u8();
+  d.connection_id = r.u8();
+  const uint16_t link_info = r.le16();
+  if (!r.ok() || !got || code != kEventDeviceConnected) return false;
+  d.link = link_info & kLinkMask;
+  d.depth = static_cast<uint8_t>((link_info & kDepthMask) >> kDepthShift);
+  d.authorized = (link_info & kApproved) != 0;
+  d.boot = (link_info & kBoot) != 0;
+  d.dual_lane = (flags & kFlagDualLane) != 0;
+  d.gen3 = (flags & kFlagSpeedGen3) != 0;
+  d.security = security_of((flags & kFlagSecurityMask) >> kFlagSecurityShift);
+  *rejected = (link_info & kRejected) != 0;
+  *out = d;
+  return true;
+}
+
+bool parse_device_disconnected(ConstByteView event, uint8_t* link, uint8_t* depth) {
+  if (event.size() < kDeviceDisconnectedBytes) return false;
+  ByteReader r(event);
+  const uint8_t code = r.u8();
+  r.skip(5);
+  const uint16_t link_info = r.le16();
+  if (!r.ok() || code != kEventDeviceDisconnected) return false;
+  *link = link_info & kLinkMask;
+  *depth = static_cast<uint8_t>((link_info & kDepthMask) >> kDepthShift);
+  return true;
+}
+
+}  // namespace tb_icm
+
+namespace {
+// Both links of a dual-link port belong to the same physical port (tb_phy_port_from_link).
+uint8_t physical_port(uint8_t link) { return link == 0 ? 0 : static_cast<uint8_t>((link - 1) / 2); }
+}  // namespace
+
+const char* ThunderboltIcm::outcome_name(Outcome outcome) {
+  switch (outcome) {
+    case Outcome::NotStarted: return "not started";
+    case Outcome::Started: return "started";
+    case Outcome::NotPresent: return "the controller does not answer";
+    case Outcome::FirmwareNotRunning: return "the connection manager firmware is not running (the BIOS did not start it)";
+    case Outcome::ControlFailed: return "the control channel could not be started";
+    case Outcome::AuthTimeout: return "the controller's firmware image was not authenticated";
+    case Outcome::SafeMode: return "the controller is in safe mode (its NVM needs an update)";
+    case Outcome::WrongMode: return "the controller's firmware is in a mode that does not manage it";
+    case Outcome::DriverReadyFailed: return "the firmware did not answer DRIVER_READY";
+    case Outcome::RootSwitchFailed: return "the root router did not become readable";
+  }
+  return "";
+}
+
+bool ThunderboltIcm::request(ConstByteView request, ByteView response, uint32_t timeout_us) {
+  for (uint32_t attempt = 0; attempt <= kRetries; ++attempt) {
+    const TbControl::Result result = control_.icm_request(request, response, timeout_us, this);
+    if (result == TbControl::Result::Ok) return true;
+    if (result != TbControl::Result::Timeout) return false;
+    delay_us(50);
+  }
+  return false;
+}
+
+ThunderboltIcm::Outcome ThunderboltIcm::start(uint32_t timeout_us) {
+  stop();
+  devices_.clear();
+  ready_ = TbDriverReady();
+  if (!nhi_.present()) return outcome_ = Outcome::NotPresent;
+  nhi_.disable_interrupts();
+  if (!nhi_.icm_running()) return outcome_ = Outcome::FirmwareNotRunning;
+  if (!control_.start()) return outcome_ = Outcome::ControlFailed;
+  if (!nhi_.wait_firmware_authenticated(timeout_us < 3000000 ? timeout_us : 3000000)) {
+    control_.stop();
+    return outcome_ = Outcome::AuthTimeout;
+  }
+  switch (nhi_.firmware_mode()) {
+    case TbFirmwareMode::Safe:
+      return outcome_ = Outcome::SafeMode;
+    case TbFirmwareMode::ConnectionManager:
+      // like the Linux driver: the firmware reports every device; approving one is still the caller's decision
+      nhi_.mailbox(tb_mailbox::kAllowAllDevices, 0, 500000);
+      break;
+    default:
+      control_.stop();
+      return outcome_ = Outcome::WrongMode;
+  }
+  uint8_t request_bytes[tb_icm::kDriverReadyBytes], response[tb_icm::kDriverReadyResponseBytes];
+  const uint32_t n = tb_icm::build_driver_ready(ByteView(request_bytes, sizeof request_bytes));
+  if (n == 0 || !request(ConstByteView(request_bytes, n), ByteView(response, sizeof response), timeout_us) || !tb_icm::parse_driver_ready(ConstByteView(response, sizeof response), &ready_)) {
+    control_.stop();
+    return outcome_ = Outcome::DriverReadyFailed;
+  }
+  // wait until the root router's configuration space can be read
+  bool readable = false;
+  for (uint32_t i = 0; i < 50 && !readable; ++i) {
+    uint32_t word = 0;
+    readable = control_.read_config(0, 0, TbConfigSpace::Switch, 0, ArrayView<uint32_t>(&word, 1), 100000, nullptr, this) == TbControl::Result::Ok;
+    if (!readable) delay_us(50000);
+  }
+  if (!readable) {
+    control_.stop();
+    return outcome_ = Outcome::RootSwitchFailed;
+  }
+  return outcome_ = Outcome::Started;
+}
+
+void ThunderboltIcm::stop() {
+  if (outcome_ == Outcome::Started || control_.running()) {
+    nhi_.mailbox(tb_mailbox::kDriverUnloads, 0, 500000);
+    control_.stop();
+  }
+  devices_.clear();
+  outcome_ = Outcome::NotStarted;
+}
+
+void ThunderboltIcm::poll() {
+  if (outcome_ == Outcome::Started || outcome_ == Outcome::SafeMode) control_.poll(this);
+}
+
+void ThunderboltIcm::remove_downstream(uint8_t link, uint8_t depth) {
+  // the device and everything behind it on the same physical port
+  for (uint64_t i = devices_.count(); i-- > 0;)
+    if (physical_port(devices_[i].link) == physical_port(link) && devices_[i].depth >= depth) devices_.remove_at(i);
+}
+
+void ThunderboltIcm::on_event(TbPacketType type, ConstByteView body) {
+  if (type != TbPacketType::IcmEvent) return;
+  uint8_t code = 0;
+  if (!body.try_get(0, &code)) return;
+  if (code == tb_icm::kEventDeviceConnected) {
+    TbDevice device;
+    bool rejected = false;
+    if (!tb_icm::parse_device_connected(body, &device, &rejected) || rejected) return;
+    // the same device again (the firmware repeats the ones that are still there after a resume), or a stale entry at that place
+    for (uint64_t i = devices_.count(); i-- > 0;) {
+      const TbDevice& known = devices_[i];
+      bool same = true;
+      for (uint32_t k = 0; k < sizeof device.uuid; ++k) same = same && known.uuid[k] == device.uuid[k];
+      if (same || (physical_port(known.link) == physical_port(device.link) && known.depth == device.depth)) devices_.remove_at(i);
+    }
+    if (devices_.count() < kMaxDevices) devices_.push_back(device);
+  } else if (code == tb_icm::kEventDeviceDisconnected) {
+    uint8_t link = 0, depth = 0;
+    if (tb_icm::parse_device_disconnected(body, &link, &depth)) remove_downstream(link, depth);
+  }
+}
+
+bool ThunderboltIcm::approve(uint64_t index, const char** error) {
+  const char* local = nullptr;
+  if (!error) error = &local;
+  if (outcome_ != Outcome::Started) {
+    *error = "the controller is not running";
+    return false;
+  }
+  if (index >= devices_.count()) {
+    *error = "no such device";
+    return false;
+  }
+  if (ready_.security != TbSecurityLevel::None && ready_.security != TbSecurityLevel::User) {
+    *error = "this security level does not allow a PCIe tunnel with one approval";
+    return false;
+  }
+  const TbDevice device = devices_[index];
+  uint8_t request_bytes[tb_icm::kApproveBytes], response[tb_icm::kApproveBytes];
+  const uint32_t n = tb_icm::build_approve_device(device, ByteView(request_bytes, sizeof request_bytes));
+  if (n == 0 || !request(ConstByteView(request_bytes, n), ByteView(response, sizeof response), kApproveTimeoutUs)) {
+    *error = "the firmware did not answer";
+    return false;
+  }
+  if (tb_icm::response_flags(ConstByteView(response, sizeof response)) & tb_icm::kFlagError) {
+    *error = "the firmware could not create the PCIe tunnel";
+    return false;
+  }
+  // (the list may have changed while waiting: find the device again)
+  for (uint64_t i = 0; i < devices_.count(); ++i) {
+    bool same = true;
+    for (uint32_t k = 0; k < sizeof device.uuid; ++k) same = same && devices_[i].uuid[k] == device.uuid[k];
+    if (same) devices_[i].authorized = true;
+  }
+  return true;
+}
+
+bool ThunderboltIcm::route(uint64_t index, uint64_t* route) {
+  if (outcome_ != Outcome::Started || index >= devices_.count()) return false;
+  const TbDevice device = devices_[index];
+  uint8_t request_bytes[tb_icm::kGetRouteBytes], response[tb_icm::kGetRouteResponseBytes];
+  const uint32_t n = tb_icm::build_get_route(device.link, device.depth, ByteView(request_bytes, sizeof request_bytes));
+  if (n == 0 || !request(ConstByteView(request_bytes, n), ByteView(response, sizeof response), kRequestTimeoutUs)) return false;
+  if (tb_icm::response_flags(ConstByteView(response, sizeof response)) & tb_icm::kFlagError) return false;
+  return tb_icm::parse_get_route(ConstByteView(response, sizeof response), route);
+}
+
+}  // namespace hardware

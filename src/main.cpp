@@ -91,6 +91,9 @@
 #ifdef TCOS_INTEL_WIFI
 #include "Hardware/WirelessInterface/Intel/IwlWireless.hpp"
 #endif
+#ifdef TCOS_THUNDERBOLT
+#include "Hardware/Bus/Thunderbolt/ThunderboltDriver.hpp"
+#endif
 #include "Hardware/Keyboard/KeyCodes.hpp"
 #include "Kernel/Clipboard.hpp"
 #include "Program/ProgramRunner.hpp"
@@ -1118,6 +1121,29 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       }
     }
 #endif
+#ifdef TCOS_THUNDERBOLT
+    // The Thunderbolt 3 host interface (Alpine Ridge): the control channel to the controller's own connection manager firmware, which the BIOS has to have started. Devices that are
+    // connected are listed (and announced on the desktop); none gets a PCIe tunnel, which would give it access to memory, until something approves it. Opt-in (-DTCOS_THUNDERBOLT=ON): none
+    // of it has run on a real controller.
+    UniquePointer<hardware::ThunderboltDriver> thunderbolt;
+    uint64_t thunderbolt_devices = 0;
+    if (clock_ok && paging_ok) {
+      for (uint32_t i = 0; i < pci.device_count(); ++i) {
+        hardware::PciDeviceInfo d;
+        if (!pci.pci_device(i, &d) || !hardware::ThunderboltDriver::supports(d)) continue;
+        thunderbolt = UniquePointer<hardware::ThunderboltDriver>::make(shared_allocator, shared_allocator);
+        if (!thunderbolt) break;
+        if (thunderbolt->start(pci, d, register_mapper) == hardware::ThunderboltDriver::Outcome::Started) {
+          Entry e(Level::Ok, "Thunderbolt");
+          e.text(thunderbolt->model()->name).text(", security level ").dec(static_cast<uint32_t>(thunderbolt->icm()->security_level())).text(", firmware ").dec(thunderbolt->icm()->driver_ready().rom_version).text(".").dec(thunderbolt->icm()->driver_ready().ram_version);
+        } else {
+          Entry(Level::Warning, "Thunderbolt").text(thunderbolt->model() ? thunderbolt->model()->name : "controller").text(" not started: ").text(thunderbolt->message());
+          thunderbolt = UniquePointer<hardware::ThunderboltDriver>();
+        }
+        break;
+      }
+    }
+#endif
 #ifdef TCOS_AMD_VEGAM
     // The Radeon RX Vega M of a Kaby Lake-G machine: the memory controller with its GART, the interrupt ring, the engines' microcode through the SMC, the graphics engine with
     // its compute queues and the SDMA engines (in the order of the Linux driver, before the video engine, which needs the memory controller), and, if the card drives the display
@@ -1505,6 +1531,17 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
           console::debug_puts(StringView(text.c_str()));
           console::debug_puts("\n");
           desktop.notify(StringView("Display"), StringView(text.c_str()), plug.throttled ? gui::NoticeKind::Warning : gui::NoticeKind::Information);
+        }
+      }
+#endif
+#ifdef TCOS_THUNDERBOLT
+      if (thunderbolt) {
+        thunderbolt->poll();
+        const uint64_t now_devices = thunderbolt->icm()->device_count();
+        if (now_devices != thunderbolt_devices) {
+          desktop.notify(StringView("Thunderbolt"), StringView(now_devices > thunderbolt_devices ? "A Thunderbolt device was connected (not authorized: no PCIe tunnel)" : "A Thunderbolt device was removed"),
+                         gui::NoticeKind::Information);
+          thunderbolt_devices = now_devices;
         }
       }
 #endif
