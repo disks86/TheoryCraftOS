@@ -44,7 +44,7 @@ constexpr uint64_t kUnixToNtSeconds = 11644473600ull;
 constexpr uint64_t kUseFilePointer = 0xFFFFFFFFFFFFFFFEull, kWriteToEnd = 0xFFFFFFFFFFFFFFFFull;
 // NtCreateFile dispositions, options, access bits, Information results
 constexpr uint32_t kSupersede = 0, kOpen = 1, kCreate = 2, kOpenIf = 3, kOverwrite = 4, kOverwriteIf = 5;
-constexpr uint32_t kDirectoryFile = 1, kNonDirectoryFile = 0x40, kDeleteOnClose = 0x1000;
+constexpr uint32_t kDirectoryFile = 1, kNonDirectoryFile = 0x40, kDeleteOnClose = 0x1000, kOpenByFileId = 0x2000;
 constexpr uint32_t kCannotDelete = 0xC0000121u, kUserMappedFile = 0xC0000243u;
 constexpr uint32_t kGenericRead = 0x80000000u, kGenericWrite = 0x40000000u, kGenericAll = 0x10000000u, kFileReadData = 1, kFileWriteData = 2, kFileAppendData = 4;
 constexpr uint64_t kFileSuperseded = 0, kFileOpened = 1, kFileCreated = 2, kFileOverwritten = 3;
@@ -114,6 +114,17 @@ bool store_io_status(Process& p, uint64_t address, uint32_t status, uint64_t inf
 
 uint64_t file_time(uint64_t unix_seconds) { return unix_seconds ? (unix_seconds + kUnixToNtSeconds) * 10000000ull : 0; }
 
+// The time now as a FILETIME, and a file's exact times noted: after a write the last write time moves to now, a file made starts with now everywhere.
+uint64_t nt_now(Process& p) { return p.host().realtime_ns() / 100 + kUnixToNtSeconds * 10000000ull; }
+void note_times(Process& p, StringView virtual_path, uint32_t which) {
+  ObjectManager* objects = system_objects();
+  if (!objects) return;
+  ObjectManager::FileTimes t;
+  t.created = t.accessed = t.written = nt_now(p);
+  objects->file_times_set(virtual_path, which, t);
+}
+
+
 void put(ByteView out, uint64_t at, uint64_t value, uint32_t bytes) {
   for (uint32_t i = 0; i < bytes; ++i) out[at + i] = static_cast<uint8_t>(value >> (8 * i));
 }
@@ -171,6 +182,58 @@ uint32_t object_path(Process& p, uint64_t attributes, String* virtual_path) {
     case PathResult::UnknownDrive: return kObjectPathNotFound;
     default: return kObjectNameInvalid;
   }
+}
+
+// The file index (FileInternalInformation, the FileId of a directory listing, what OpenFileById opens): the file systems here have no inode numbers to give, so it is a hash of the
+// file's path (spelled in lower case), which names the same file for as long as it is there under that name. Never 0 and never with all ones in the low half.
+uint64_t file_id_of(StringView virtual_path) {
+  uint64_t hash = 0xCBF29CE484222325ull;
+  for (char c : virtual_path) {
+    hash ^= static_cast<uint8_t>(c >= 'A' && c <= 'Z' ? c + 32 : c);
+    hash *= 0x100000001B3ull;
+  }
+  if ((hash & 0xFFFFFFFFu) == 0xFFFFFFFFu) hash ^= 1;
+  return hash ? hash : 1;
+}
+
+// The path of the file whose index is `id`, looked for from `start` downwards (the directory a caller of OpenFileById names); the search is small and bounded.
+bool find_file_id(ProcessFiles& files, StringView start, uint64_t id, uint32_t depth, uint32_t* budget, String* found) {
+  if (file_id_of(start) == id) return found->assign(start);
+  if (depth == 0) return false;
+  String host(files.allocator());
+  UniquePointer<filesystem::IDirectory> directory;
+  if (!files.host_path_of(start, &host) || !files.file_system() || files.file_system()->open_directory(host.view(), &directory) != Status::Ok) return false;
+  DirectoryEntry entry;
+  while (*budget != 0 && directory->next(&entry) == Status::Ok) {
+    --*budget;
+    String child(files.allocator());
+    if (!child.assign(start) || (start != StringView("/") && !child.push_back('/')) || !child.append(entry.name.view())) return false;
+    if (file_id_of(child.view()) == id) return found->assign(child.view());
+    if (entry.type == NodeType::Directory && !entry.is_symlink && find_file_id(files, child.view(), id, depth - 1, budget, found)) return true;
+  }
+  return false;
+}
+
+// FILE_OPEN_BY_FILE_ID: the object name is the 8 bytes of a file index and the root directory the one to look in (the whole tree when there is none).
+uint32_t path_by_file_id(Process& p, uint64_t attributes, String* virtual_path) {
+  ProcessFiles& files = p.files();
+  if (!files.attached()) return kObjectPathNotFound;
+  uint64_t root = 0, name = 0, buffer = 0, id = 0;
+  uint8_t header[8];
+  if (attributes == 0 || !p.read_user_u64(attributes + 8, &root) || !p.read_user_u64(attributes + 16, &name) || name == 0 || !p.read_user(name, ByteView(header, 8)) || !p.read_user_u64(name + 8, &buffer) ||
+      !p.read_user_u64(buffer, &id))
+    return kAccessViolation;
+  if ((header[0] | (header[1] << 8)) != 8) return kInvalidParameter;
+  String start(files.allocator());
+  if (root != 0) {
+    uint64_t slot = 0;
+    if (!handle_slot(root, &slot) || files.kind(slot) != DescriptorKind::Directory) return kInvalidHandle;
+    start.assign(files.object(slot)->path.view());
+  } else {
+    start.assign(StringView("/"));
+  }
+  uint32_t budget = 4096;
+  return find_file_id(files, start.view(), id, 4, &budget, virtual_path) ? kSuccess : kObjectNameNotFound;
 }
 
 // The status for a missing name: the path is wrong if the folder above is missing too.
@@ -232,7 +295,7 @@ uint32_t open_by_attributes(Process& p, uint64_t object_attributes, uint32_t acc
     }
   }
   String virtual_path(files.allocator());
-  const uint32_t named = object_path(p, object_attributes, &virtual_path);
+  const uint32_t named = (options & kOpenByFileId) ? path_by_file_id(p, object_attributes, &virtual_path) : object_path(p, object_attributes, &virtual_path);
   if (named != kSuccess) return named;
   if (disposition > kOverwriteIf) return kInvalidParameter;
   if ((options & kDirectoryFile) && (options & kNonDirectoryFile)) return kInvalidParameter;
@@ -283,7 +346,8 @@ uint32_t open_by_attributes(Process& p, uint64_t object_attributes, uint32_t acc
   const Status status = files.open(virtual_path.view(), f, &slot, &created);
   if (status == Status::OutOfMemory && files.free_slot(0) < 0) return kTooManyOpenedFiles;
   if (status != Status::Ok) return status_for(files, status, virtual_path.view());
-  if (created) notify_directory_changed(virtual_path.view(), kFileActionAdded);
+  if (created) { notify_directory_changed(virtual_path.view(), kFileActionAdded); note_times(p, virtual_path.view(), 7); }
+  else if (f.truncate && existed) note_times(p, virtual_path.view(), 4);
   if (created && (file_attributes & kAttributeReadOnly)) {
     filesystem::MetadataChange change;
     change.set_read_only = true;
@@ -296,6 +360,7 @@ uint32_t open_by_attributes(Process& p, uint64_t object_attributes, uint32_t acc
   if (files.kind(slot) == DescriptorKind::File) {
     OpenObject* opened = files.object(slot);
     opened->granted_access = access;
+    if (opened->no_data_access) opened->readable = false;      // (a handle for attributes only reads nothing)
     opened->writable = (access & (kGenericAll | kGenericWrite | kFileWriteData | kFileAppendData)) != 0;      // (an overwrite writes through the file system's own handle, not the program's)
   }
   if (sharing && wanted && files.kind(slot) == DescriptorKind::File) sharing->share_acquire(virtual_path.view(), files.object(slot), wanted, share);
@@ -380,6 +445,7 @@ uint32_t file_io(Process& p, const SyscallRequest& r, bool write) {
     if (io == Status::Ok && moved < n) break;      // end of the file
   }
   if (io != Status::Ok && done == 0) return nt_status(io);
+  if (write && done != 0) note_times(p, object.path.view(), 4);
   object.position = at + done;
   status = kSuccess;
   if (!write && done == 0 && length != 0) status = kEndOfFile;
@@ -390,10 +456,13 @@ uint32_t file_io(Process& p, const SyscallRequest& r, bool write) {
 
 
 void write_times(ByteView out, uint64_t at, const DirectoryEntry& e) {
-  put(out, at, file_time(e.created ? e.created : e.modified), 8);      // CreationTime
-  put(out, at + 8, file_time(e.modified), 8);                           // LastAccessTime
-  put(out, at + 16, file_time(e.modified), 8);                          // LastWriteTime
-  put(out, at + 24, file_time(e.modified), 8);                          // ChangeTime
+  const uint64_t modified = e.exact_modified ? e.exact_modified : file_time(e.modified);
+  const uint64_t created = e.exact_created ? e.exact_created : e.created ? file_time(e.created) : modified;
+  const uint64_t accessed = e.exact_accessed ? e.exact_accessed : e.accessed ? file_time(e.accessed) : modified;
+  put(out, at, created, 8);            // CreationTime
+  put(out, at + 8, accessed, 8);       // LastAccessTime
+  put(out, at + 16, modified, 8);      // LastWriteTime
+  put(out, at + 24, modified, 8);      // ChangeTime
 }
 
 uint64_t allocation_of(const DirectoryEntry& e) { return (e.size + 4095) & ~uint64_t{4095}; }
@@ -443,7 +512,7 @@ uint64_t to_utf16(StringView text, uint8_t* out, uint64_t capacity) {
 }
 
 // One directory entry in the layout of `info_class`, with NextEntryOffset left 0. Returns its size (unpadded), or 0 if the class is unknown.
-uint64_t build_directory_record(uint32_t info_class, const DirectoryEntry& e, uint64_t index, uint8_t* out, uint64_t capacity) {
+uint64_t build_directory_record(uint32_t info_class, const DirectoryEntry& e, uint64_t index, uint64_t file_id, uint8_t* out, uint64_t capacity) {
   uint8_t name[2 * (filesystem::kMaxNameLength + 1)];
   const uint64_t name_bytes = to_utf16(e.name.view(), name, sizeof(name));
   if (name_bytes == 0 && !e.name.empty()) return 0;
@@ -469,7 +538,7 @@ uint64_t build_directory_record(uint32_t info_class, const DirectoryEntry& e, ui
     put(v, 48, allocation_of(e), 8);                   // AllocationSize
     put(v, 56, attributes_of(e), 4);
     put(v, 60, name_bytes, 4);
-    if (info_class == kFileIdBothDirectoryInformation) put(v, 96, index + 1, 8);      // FileId
+    if (info_class == kFileIdBothDirectoryInformation) put(v, 96, file_id, 8);      // FileId
   }
   for (uint64_t i = 0; i < name_bytes; ++i) v[name_at + i] = name[i];
   return header + name_bytes;
@@ -586,6 +655,8 @@ uint32_t nt_query_information_file(Process& p, const SyscallRequest& r) {
       size = 24;
       break;
     case kFilePositionInformation: put(v, 0, object ? object->position : 0, 8); size = 8; break;
+    case 8: put(v, 0, object ? object->granted_access : 0, 4); size = 4; break;      // FileAccessInformation: the access the handle was opened with
+    case 6: put(v, 0, object ? file_id_of(object->path.view()) : 0, 8); size = 8; break;      // FileInternalInformation: the index of the file
     case kFileNetworkOpenInformation:
       write_times(v, 0, e);
       put(v, 32, allocation_of(e), 8);
@@ -597,8 +668,9 @@ uint32_t nt_query_information_file(Process& p, const SyscallRequest& r) {
       // The path on the volume, "\dir\file" (the root is "\").
       if (!object) return kInvalidParameter;
       uint8_t name[2 * (kMaxPath + 1)];
-      String windows_name(files.allocator());
-      for (char c : object->path.view()) if (!windows_name.push_back(c == '/' ? '\\' : c)) return kNoMemory;
+      String windows_name(files.allocator()), spelled(files.allocator());
+      if (!files.canonical_path(object->path.view(), &spelled)) spelled.assign(object->path.view());
+      for (char c : spelled.view()) if (!windows_name.push_back(c == '/' ? '\\' : c)) return kNoMemory;
       const uint64_t bytes = to_utf16(windows_name.view(), name, sizeof(name));
       if (length < 4) return kInfoLengthMismatch;
       uint8_t out[4];
@@ -656,8 +728,16 @@ uint32_t nt_set_information_file(Process& p, const SyscallRequest& r) {
       if (int64_t(value) < 0) return kInvalidParameter;
       if (value < files.size_of(*object) && file_is_mapped(files, object->path.view())) return kUserMappedFile;      // (a mapped file cannot be made shorter)
       status = nt_status(files.resize(*object, value));
+      if (status == kSuccess) note_times(p, object->path.view(), 4);
       break;
     case kFileAllocationInformation: break;      // nothing to change: sizes are exact
+    case 43: {      // FileIoPriorityHintInformation { IO_PRIORITY_HINT }: the hint is taken and has no effect
+      if (length < 4) return kInfoLengthMismatch;
+      uint8_t hint[4];
+      if (!p.read_user(address, ByteView(hint, 4))) return kAccessViolation;
+      if ((hint[0] | (hint[1] << 8) | (hint[2] << 16) | (uint32_t(hint[3]) << 24)) > 2) return kInvalidParameter;      // (VeryLow, Low, Normal; "Max" is no hint)
+      break;
+    }
     case kFileBasicInformation: {      // the times (0 or -1: leave as they are) and the read-only attribute (0: leave); the file system says if it keeps none of that
       if (length < 40) return kInfoLengthMismatch;
       if (!(object->granted_access & (0x100 /* FILE_WRITE_ATTRIBUTES */ | kGenericWrite | kGenericAll))) return kAccessDenied;
@@ -676,11 +756,26 @@ uint32_t nt_set_information_file(Process& p, const SyscallRequest& r) {
       const uint32_t attributes = raw[32] | (uint32_t{raw[33]} << 8) | (uint32_t{raw[34]} << 16) | (uint32_t{raw[35]} << 24);
       if (attributes != 0) { change.set_read_only = true; change.read_only = (attributes & kAttributeReadOnly) != 0; }
       if (change.set_created || change.set_modified || change.set_read_only) status = nt_status(files.set_metadata(object->path.view(), change));
+      if (status == kSuccess) {      // the exact times are kept here (the file systems keep seconds)
+        ObjectManager::FileTimes exact;
+        uint32_t which = 0;
+        auto exact_time = [&](uint32_t at, uint32_t bit, uint64_t* field) {
+          const uint64_t nt = le64(at);
+          if (nt == 0 || nt == ~uint64_t{0}) return;
+          *field = nt;
+          which |= bit;
+        };
+        exact_time(0, 1, &exact.created);
+        exact_time(8, 2, &exact.accessed);
+        exact_time(16, 4, &exact.written);
+        if (which != 0) if (ObjectManager* objects = system_objects()) objects->file_times_set(object->path.view(), which, exact);
+      }
       break;
     }
     case kFileDispositionInformation: {
       uint8_t flag = 0;
-      if (length < 1 || !p.read_user(address, ByteView(&flag, 1))) return kAccessViolation;
+      if (length < 1) return kInfoLengthMismatch;
+      if (!p.read_user(address, ByteView(&flag, 1))) return kAccessViolation;
       object->delete_on_close = flag != 0;
       break;
     }
@@ -696,7 +791,7 @@ uint32_t nt_set_information_file(Process& p, const SyscallRequest& r) {
       if (!util::append_utf8_from_utf16le(&name, ConstByteView(units, name_bytes))) return kNoMemory;
       if (files.resolve(name.view(), &target) != PathResult::Ok) return kObjectNameInvalid;
       DirectoryEntry existing;
-      if (file_is_mapped(files, object->path.view())) return kSharingViolation;      // (a mapped file stays where it is)
+      if (file_is_mapped(files, object->path.view()) == 1) return kSharingViolation;      // (a file with a data view stays where it is; a program image can be renamed)
       auto same_ignoring_case = [](StringView a, StringView b) {
         if (a.size() != b.size()) return false;
         for (uint64_t i = 0; i < a.size(); ++i) {
@@ -708,7 +803,9 @@ uint32_t nt_set_information_file(Process& p, const SyscallRequest& r) {
       const bool respelled = same_ignoring_case(object->path.view(), target.view()) && object->path.view() != target.view();
       if (!respelled && files.stat(target.view(), &existing) == Status::Ok) {
         if (!header[0]) return kObjectNameCollision;
-        status = nt_status(files.remove(target.view()));
+        if (existing.type == NodeType::Directory) return kAccessDenied;      // (a directory is never replaced)
+        const Status removed = files.remove(target.view());
+        status = removed == Status::Busy ? kAccessDenied : nt_status(removed);      // (a file somebody has open stays)
       }
       if (status == kSuccess) {
         String old_path(files.allocator());
@@ -717,6 +814,16 @@ uint32_t nt_set_information_file(Process& p, const SyscallRequest& r) {
         if (status == kSuccess) {
           notify_directory_changed(old_path.view(), kFileActionRenamedOldName);
           notify_directory_changed(target.view(), kFileActionRenamedNewName);
+          if (ObjectManager* sharing = system_objects()) {      // the other opens of the file follow it to its new name
+            const void* others[8];
+            const uint32_t count = sharing->share_owners(old_path.view(), others, 8);
+            for (uint32_t i = 0; i < count && i < 8; ++i) {
+              OpenObject* other = const_cast<OpenObject*>(static_cast<const OpenObject*>(others[i]));
+              other->path.assign(target.view());
+              sharing->share_retarget(other, target.view());
+            }
+            sharing->share_retarget(object, target.view());
+          }
           object->path.assign(target.view());
         }
       }
@@ -779,7 +886,11 @@ uint32_t nt_query_directory_file(Process& p, const SyscallRequest& r) {
     if (status == Status::EndOfDirectory) break;
     if (status != Status::Ok) return any ? kSuccess : nt_status(status);
     if (!pattern.empty() && !dos_wildcard_matches(pattern, entry.name.view())) continue;
-    const uint64_t size = build_directory_record(static_cast<uint32_t>(info_class), entry, ++object.directory_index, record, sizeof(record));
+    String entry_path(files.allocator());
+    if (entry.name.view() == StringView(".")) entry_path.assign(object.path.view());
+    else if (entry.name.view() == StringView("..")) entry_path.assign(virtual_directory_of(object.path.view()));
+    else if (entry_path.assign(object.path.view()) && (object.path.view() == StringView("/") || entry_path.push_back('/'))) entry_path.append(entry.name.view());
+    const uint64_t size = build_directory_record(static_cast<uint32_t>(info_class), entry, ++object.directory_index, file_id_of(entry_path.view()), record, sizeof(record));
     if (size == 0) return kInvalidInfoClass;
     const uint64_t padded = (size + 7) & ~uint64_t{7};
     if (used + size > length) {

@@ -205,6 +205,56 @@ bool ProcessFiles::host_path(StringView virtual_path, String* out) const {
   return style_ != PathStyle::Windows || fold_case(out, root_prefix_.size());
 }
 
+bool ProcessFiles::canonical_path(StringView virtual_path, String* out, uint32_t depth) const {
+  String host(*allocator_);
+  if (!host_path(virtual_path, &host)) return false;
+  const StringView whole = host.view();
+  if (whole.size() < root_prefix_.size()) return false;
+  String walked(*allocator_);
+  if (!walked.assign(root_prefix_)) return false;
+  uint64_t at = root_prefix_.size();
+  while (at < whole.size()) {
+    if (whole[at] == '/') { ++at; continue; }
+    uint64_t end = at;
+    while (end < whole.size() && whole[end] != '/') ++end;
+    const StringView name = whole.substr(at, end - at);
+    uint64_t after = end;
+    while (after < whole.size() && whole[after] == '/') ++after;
+    String next(*allocator_);
+    if (!next.assign(walked.view()) || !next.push_back('/') || !next.append(name)) return false;
+    if (after < whole.size() && depth < 8) {      // a directory above the last name that is a link: carry on from what it points at
+      String target(*allocator_);
+      bool to_directory = false;
+      if (fs_->read_symbolic_link(next.view(), &target, &to_directory) == Status::Ok && !target.empty()) {
+        String joined(*allocator_);
+        if (target[0] != '/') { if (!joined.assign(walked.view()) || !joined.push_back('/')) return false; }
+        if (!joined.append(target.view()) || !joined.push_back('/') || !joined.append(whole.substr(after, whole.size() - after))) return false;
+        String clean(*allocator_);      // (".." and "." in the target)
+        uint64_t k = 0;
+        while (k < joined.size()) {
+          while (k < joined.size() && joined[k] == '/') ++k;
+          uint64_t e = k;
+          while (e < joined.size() && joined[e] != '/') ++e;
+          const StringView part = joined.view().substr(k, e - k);
+          k = e;
+          if (part.empty() || part == StringView(".")) continue;
+          if (part == StringView("..")) { const uint64_t cut = clean.view().rfind('/'); if (cut != StringView::npos) clean.assign(clean.view().first(cut)); continue; }
+          if (!clean.push_back('/') || !clean.append(part)) return false;
+        }
+        if (clean.size() < root_prefix_.size() || !equal_ignoring_case(clean.view().first(root_prefix_.size()), root_prefix_)) return false;
+        String inside(*allocator_);
+        if (!inside.assign(clean.view().without_prefix(root_prefix_.size()))) return false;
+        if (inside.empty()) inside.push_back('/');
+        return canonical_path(inside.view(), out, depth + 1);
+      }
+    }
+    walked.assign(next.view());
+    at = after;
+  }
+  const StringView inside = walked.view().without_prefix(root_prefix_.size());
+  return inside.empty() ? out->assign(StringView("/")) : out->assign(inside);
+}
+
 int64_t ProcessFiles::free_slot(uint64_t minimum) const {
   for (uint64_t i = minimum; i < kMaxDescriptors; ++i) if (slots_[i].kind == DescriptorKind::Closed) return static_cast<int64_t>(i);
   return -1;
@@ -223,7 +273,7 @@ bool ProcessFiles::close(uint64_t slot) {
     String path(*allocator_), virtual_path(*allocator_);
     virtual_path.assign(closing.object->path.view());
     closing.object = SharedPointer<OpenObject>();      // the file must be closed before it can be removed
-    if (host_path(virtual_path.view(), &path)) fs_->remove(path.view());
+    if (host_path(virtual_path.view(), &path) && fs_->remove(path.view()) == Status::Ok) if (ObjectManager* objects = system_objects()) objects->file_times_forget(virtual_path.view());
   }
   return true;
 }
@@ -296,11 +346,32 @@ DescriptorKind ProcessFiles::device_at(StringView virtual_path) const {
   return DescriptorKind::Closed;
 }
 
+namespace {
+constexpr uint64_t kNtEpochSeconds = 11644473600ull;
+}
+
+// The times the system keeps more exactly than the file systems do (see ObjectManager::file_times_set) go into the entry. They are ignored once the file system's own time of
+// the last change is different (somebody else wrote the file since).
+void ProcessFiles::apply_precise_times(StringView virtual_path, DirectoryEntry* entry) const {
+  ObjectManager* objects = system_objects();
+  ObjectManager::FileTimes t;
+  if (!objects || !objects->file_times_get(virtual_path, &t)) return;
+  if (t.written != 0) {      // (a time before 1970 is 0 seconds to the file systems)
+    const int64_t known = static_cast<int64_t>(t.written / 10000000ull) - static_cast<int64_t>(kNtEpochSeconds), have = static_cast<int64_t>(entry->modified);
+    if (!(known < 0 && have == 0) && (known > have ? known - have : have - known) > 3) return;
+  }
+  entry->exact_created = t.created;
+  entry->exact_accessed = t.accessed;
+  entry->exact_modified = t.written;
+}
+
 Status ProcessFiles::stat(StringView virtual_path, DirectoryEntry* entry) {
   if (!fs_) return Status::NotFound;
   String path(*allocator_);
   if (!host_path(virtual_path, &path)) return Status::NotFound;
-  return fs_->stat(path.view(), entry);
+  const Status status = fs_->stat(path.view(), entry);
+  if (status == Status::Ok) apply_precise_times(virtual_path, entry);
+  return status;
 }
 
 Status ProcessFiles::open(StringView virtual_path, const OpenFlags& flags, uint32_t* slot, bool* created) {
@@ -375,7 +446,9 @@ Status ProcessFiles::remove(StringView virtual_path) {
   String path(*allocator_);
   if (!host_path(virtual_path, &path)) return Status::NotFound;
   if (virtual_path == StringView("/")) return Status::Busy;      // the root of the program's tree stays
-  return fs_->remove(path.view());
+  const Status status = fs_->remove(path.view());
+  if (status == Status::Ok) if (ObjectManager* objects = system_objects()) objects->file_times_forget(virtual_path);
+  return status;
 }
 
 Status ProcessFiles::rename(StringView from, StringView to) {
@@ -390,7 +463,9 @@ Status ProcessFiles::rename(StringView from, StringView to) {
     return Status::NotFound;
   }
   if (from == StringView("/")) return Status::Busy;
-  return fs_->rename(a.view(), b.view());
+  const Status status = fs_->rename(a.view(), b.view());
+  if (status == Status::Ok) if (ObjectManager* objects = system_objects()) objects->file_times_move(from, to);
+  return status;
 }
 
 Status ProcessFiles::create_hard_link(StringView existing, StringView link) {
@@ -468,7 +543,12 @@ Status ProcessFiles::next_entry(OpenObject& object, DirectoryEntry* entry) {
     ++object.directory_phase;
     return Status::Ok;
   }
-  return object.directory->next(entry);
+  const Status status = object.directory->next(entry);
+  if (status == Status::Ok && system_objects()) {
+    String full(*allocator_);
+    if (full.assign(object.path.view()) && (full.view() == StringView("/") || full.push_back('/')) && full.append(entry->name.view())) apply_precise_times(full.view(), entry);
+  }
+  return status;
 }
 
 bool prepare_program_folders(filesystem::IFileSystem& fs) {

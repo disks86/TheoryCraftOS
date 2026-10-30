@@ -172,8 +172,17 @@ class ObjectManager {
   // Would an open wanting `access` with everything shared be allowed? (Deleting a file, renaming it.) Takes the lock itself.
   bool share_allows(StringView path, uint32_t access);
   void share_release(const void* owner);      // the open file is gone
+  void share_retarget(const void* owner, StringView new_path);      // the open file was renamed: its share now belongs to the new name
   // The open files of `path` (at most `capacity` of them are written to `owners`); how many there are.
   uint32_t share_owners(StringView path, const void** owners, uint32_t capacity);
+
+  // --- file times finer than the file systems keep them: the time of a file in 100 ns units since 1601 (Windows' FILETIME), kept by path for files that were written, created or had
+  // their times set while the system runs. `which` says which of created (1), accessed (2) and written (4) a call sets; 0 in a field read back means no precise time is known.
+  struct FileTimes { uint64_t created = 0, accessed = 0, written = 0; };
+  void file_times_set(StringView path, uint32_t which, const FileTimes& times);
+  bool file_times_get(StringView path, FileTimes* times);
+  void file_times_move(StringView from, StringView to);      // the file was renamed
+  void file_times_forget(StringView path);                   // the file is gone
 
   // --- job objects (kind Job: create() and open() make and find them). A job groups processes: its limits (active process count, kill on close, breakaway) are enforced and
   // its members can be ended together. A process belongs to at most one job; the processes it starts join the same job. Members are ended by a flag that they see themselves
@@ -305,7 +314,7 @@ class ObjectManager {
   void job_flag_all_locked(Job& j, uint32_t code);
   Pipe* pipe_of(uint32_t id);      // (locked)
   void free_pipe_locked(Object& o);
-  static constexpr uint32_t kMaxPipes = 128, kMaxSections = 64, kMaxLocks = 256, kMaxShares = 1024;
+  static constexpr uint32_t kMaxPipes = 128, kMaxSections = 64, kMaxLocks = 256, kMaxShares = 1024, kMaxTimes = 512;
 
   struct Watch {
     bool used = false;
@@ -330,6 +339,8 @@ class ObjectManager {
   RangeLock* locks_ = nullptr;      // kMaxLocks of them, made with the first
   struct ShareEntry;
   ShareEntry* shares_ = nullptr;      // kMaxShares of them, made with the first
+  struct TimesEntry;
+  TimesEntry* times_ = nullptr;      // kMaxTimes of them, made with the first
   Section* sections_ = nullptr;      // kMaxSections, made with the first section
   Job* jobs_ = nullptr;              // kJobMaxJobs, made with the first job (never moved: job_kill_for() reads it without the lock)
   uint32_t pending_kills_ = 0;       // members flagged to end that have not ended yet (atomic)

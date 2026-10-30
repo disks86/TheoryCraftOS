@@ -129,6 +129,8 @@ class ProcessFiles {
   // --- operations on cleaned virtual paths
   filesystem::Status open(StringView virtual_path, const OpenFlags& flags, uint32_t* slot, bool* created = nullptr);
   filesystem::Status stat(StringView virtual_path, filesystem::DirectoryEntry* entry);
+  // Puts the exact times the system keeps for the file (see ObjectManager::file_times_set) into `entry`.
+  void apply_precise_times(StringView virtual_path, filesystem::DirectoryEntry* entry) const;
   filesystem::Status make_directory(StringView virtual_path);
   filesystem::Status set_metadata(StringView virtual_path, const filesystem::MetadataChange& change);
   filesystem::Status remove(StringView virtual_path);
@@ -149,6 +151,11 @@ class ProcessFiles {
   // Next entry of a directory, "." and ".." first. Ok, EndOfDirectory, or an error. `pending` entries are kept by the caller via the object.
   filesystem::Status next_entry(OpenObject& object, filesystem::DirectoryEntry* entry);
   void rewind(OpenObject& object);
+
+ public:
+  // The path as the file system spells it: the case of every name as it is stored, and the directories that are symbolic links replaced by what they point at (the last name is
+  // kept as it is, a link opened itself stays the link). False if it cannot be worked out.
+  bool canonical_path(StringView virtual_path, String* out, uint32_t depth = 0) const;
 
  private:
   struct Slot {

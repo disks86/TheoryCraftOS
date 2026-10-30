@@ -157,37 +157,107 @@ EXPORT DWORD WINAPI SearchPathA(LPCSTR path, LPCSTR file, LPCSTR extension, DWOR
 
 /* ---- file information by handle -------------------------------------------------------------------------------------------------------------------------- */
 
+/* The classes of FILE_INFO_BY_HANDLE_CLASS: how each is asked of the system (the class of NtQueryInformationFile or of NtSetInformationFile), and the smallest buffer it takes.
+ * -1 means that the call has no such direction. */
+typedef struct { signed char query, set; BYTE query_size; } FileInfoClass;
+static const FileInfoClass g_file_info_classes[] = {
+  {4, 4, 40},        /* 0 FileBasicInfo */
+  {5, -1, 24},       /* 1 FileStandardInfo */
+  {9, -1, 4},        /* 2 FileNameInfo */
+  {-1, 10, 0},       /* 3 FileRenameInfo */
+  {-1, 13, 0},       /* 4 FileDispositionInfo */
+  {-1, 19, 0},       /* 5 FileAllocationInfo */
+  {-1, 20, 0},       /* 6 FileEndOfFileInfo */
+  {-1, -1, 0},       /* 7 FileStreamInfo */
+  {-1, -1, 16},      /* 8 FileCompressionInfo */
+  {-1, -1, 8},       /* 9 FileAttributeTagInfo */
+  {37, -1, 104},     /* 10 FileIdBothDirectoryInfo */
+  {37, -1, 104},     /* 11 FileIdBothDirectoryRestartInfo */
+  {-1, 43, 0},       /* 12 FileIoPriorityHintInfo */
+  {-1, -1, 0},       /* 13 FileRemoteProtocolInfo */
+  {2, -1, 68},       /* 14 FileFullDirectoryInfo */
+  {2, -1, 68},       /* 15 FileFullDirectoryRestartInfo */
+};
 EXPORT BOOL WINAPI GetFileInformationByHandleEx(HANDLE h, int info_class, LPVOID info, DWORD size) {
   IO_STATUS_BLOCK iosb;
   NTSTATUS status;
-  switch (info_class) {
-    case 0: status = NtQueryInformationFile(h, &iosb, info, size, 4); break;       /* FileBasicInfo */
-    case 1: status = NtQueryInformationFile(h, &iosb, info, size, 5); break;       /* FileStandardInfo */
-    case 2: status = NtQueryInformationFile(h, &iosb, info, size, 9); break;       /* FileNameInfo */
-    case 9: {                                                                       /* FileAttributeTagInfo { FileAttributes, ReparseTag } */
-      BYTE basic[40];
-      if (size < 8) { set_error(ERROR_BAD_LENGTH); return FALSE; }
-      status = NtQueryInformationFile(h, &iosb, basic, sizeof(basic), 4);
-      if (NT_SUCCESS(status)) { ((DWORD *)info)[0] = get32(basic + 32); ((DWORD *)info)[1] = 0; }
-      break;
-    }
-    default: set_error(ERROR_INVALID_PARAMETER); return FALSE;
+  if (info_class < 0 || info_class >= (int)(sizeof(g_file_info_classes) / sizeof(g_file_info_classes[0]))) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (info_class == 8 || info_class == 9) {      /* FileCompressionInfo { CompressedFileSize, CompressionFormat, ... } and FileAttributeTagInfo { FileAttributes, ReparseTag } */
+    BYTE basic[40], standard[24];
+    if (size < (DWORD)g_file_info_classes[info_class].query_size) { set_error(ERROR_BAD_LENGTH); return FALSE; }
+    if (!info) { set_error(ERROR_NOACCESS); return FALSE; }
+    status = NtQueryInformationFile(h, &iosb, basic, sizeof(basic), 4);
+    if (!NT_SUCCESS(status)) return fail_nt(status);
+    if (info_class == 9) { ((DWORD *)info)[0] = get32(basic + 32); ((DWORD *)info)[1] = 0; return TRUE; }
+    status = NtQueryInformationFile(h, &iosb, standard, sizeof(standard), 5);
+    if (!NT_SUCCESS(status)) return fail_nt(status);
+    memset(info, 0, 16);
+    memcpy(info, standard + 8, 8);      /* the compressed size is the size: nothing is compressed */
+    return TRUE;
+  }
+  const FileInfoClass *c = &g_file_info_classes[info_class];
+  if (c->query < 0) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (size < c->query_size) { set_error(ERROR_BAD_LENGTH); return FALSE; }
+  if (!info) { set_error(ERROR_NOACCESS); return FALSE; }
+  if (c->query == 37 || c->query == 2) {      /* a listing goes on where the last call stopped, the Restart classes begin again */
+    UNICODE_STRING *no_pattern = NULL;
+    status = NtQueryDirectoryFile(h, NULL, NULL, NULL, &iosb, info, size, c->query, FALSE, no_pattern, info_class == 11 || info_class == 15);
+    if (status == STATUS_NO_MORE_FILES) { set_error(ERROR_NO_MORE_FILES); return FALSE; }
+  } else {
+    status = NtQueryInformationFile(h, &iosb, info, size, c->query);
   }
   return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
 EXPORT BOOL WINAPI SetFileInformationByHandle(HANDLE h, int info_class, LPVOID info, DWORD size) {
   IO_STATUS_BLOCK iosb;
-  ULONG nt_class;
-  switch (info_class) {
-    case 0: nt_class = 4; break;       /* FileBasicInfo */
-    case 3: nt_class = 10; break;      /* FileRenameInfo (the same layout as NT's) */
-    case 4: nt_class = 13; break;      /* FileDispositionInfo */
-    case 5: nt_class = 19; break;      /* FileAllocationInfo */
-    case 6: nt_class = 20; break;      /* FileEndOfFileInfo */
-    default: set_error(ERROR_INVALID_PARAMETER); return FALSE;
-  }
-  const NTSTATUS status = NtSetInformationFile(h, &iosb, info, size, nt_class);
+  if (info_class < 0 || info_class >= (int)(sizeof(g_file_info_classes) / sizeof(g_file_info_classes[0])) || g_file_info_classes[info_class].set < 0) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  const NTSTATUS status = NtSetInformationFile(h, &iosb, info, size, g_file_info_classes[info_class].set);
   return NT_SUCCESS(status) ? TRUE : fail_nt(status);
+}
+
+/* ReOpenFile: another handle to the file of an open one, with the access, sharing and flags given (the flags are the FILE_FLAG_ ones; attributes make no sense for an open). A
+ * directory cannot be reopened. */
+EXPORT HANDLE WINAPI ReOpenFile(HANDLE original, DWORD access, DWORD share, DWORD flags) {
+  if (flags & 0xFFFF) { set_error(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE; }
+  WCHAR path[PATH_CHARS + 64];
+  const DWORD n = GetFinalPathNameByHandleW(original, path, PATH_CHARS + 64, 0);
+  if (n == 0 || n >= PATH_CHARS + 64) {
+    if (n == 0 && GetLastError() == ERROR_INVALID_HANDLE) return INVALID_HANDLE_VALUE;
+    set_error(n ? ERROR_FILENAME_EXCED_RANGE : ERROR_INVALID_PARAMETER);
+    return INVALID_HANDLE_VALUE;
+  }
+  const DWORD attributes = GetFileAttributesW(path);
+  if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY)) { set_error(ERROR_ACCESS_DENIED); return INVALID_HANDLE_VALUE; }
+  return CreateFileW(path, access, share, NULL, OPEN_EXISTING, flags & ~(DWORD)FILE_FLAG_BACKUP_SEMANTICS, NULL);
+}
+
+typedef struct { DWORD dwSize; DWORD Type; LONGLONG FileId; LONGLONG ExtendedHigh; } FILE_ID_DESCRIPTOR_;      /* (the union is 128 bits wide) */
+/* OpenFileById: the file whose index (FileInternalInformation, the FileId of a directory listing) is given, looked for from the directory handle. */
+EXPORT HANDLE WINAPI OpenFileById(HANDLE hint, const FILE_ID_DESCRIPTOR_ *descriptor, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD flags) {
+  if (!descriptor || descriptor->dwSize != sizeof(*descriptor) || descriptor->Type != 0 /* FileIdType */) { set_error(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE; }
+  LONGLONG id = descriptor->FileId;
+  UNICODE_STRING name;
+  name.Buffer = (PWSTR)&id;
+  name.Length = name.MaximumLength = sizeof(id);
+  OBJECT_ATTRIBUTES attributes;
+  memset(&attributes, 0, sizeof(attributes));
+  attributes.Length = sizeof(attributes);
+  attributes.RootDirectory = hint;
+  attributes.ObjectName = &name;
+  attributes.Attributes = 0x40 | ((sa && sa->bInheritHandle) ? 2 : 0);
+  ULONG nt_access = (access & ~(GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | GENERIC_ALL)) | SYNCHRONIZE | FILE_READ_ATTRIBUTES;
+  if (access & (GENERIC_READ | GENERIC_ALL)) nt_access |= FILE_READ_DATA;
+  if (access & (GENERIC_WRITE | GENERIC_ALL)) nt_access |= FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES;
+  if (access & (GENERIC_EXECUTE | GENERIC_ALL)) nt_access |= 0x20;
+  ULONG options = 0x20 /* FILE_SYNCHRONOUS_IO_NONALERT */ | 0x2000 /* FILE_OPEN_BY_FILE_ID */;
+  if (flags & FILE_FLAG_DELETE_ON_CLOSE) { options |= 0x1000; nt_access |= DELETE; }
+  HANDLE handle = NULL;
+  IO_STATUS_BLOCK iosb;
+  const NTSTATUS status = NtCreateFile(&handle, nt_access, &attributes, &iosb, NULL, FILE_ATTRIBUTE_NORMAL, share & 7, 1 /* FILE_OPEN */, options, NULL, 0);
+  if (!NT_SUCCESS(status)) { fail_nt(status); return INVALID_HANDLE_VALUE; }
+  overlapped_forget(handle);
+  if (flags & 0x40000000u /* FILE_FLAG_OVERLAPPED */) overlapped_note(handle);
+  return handle;
 }
 
 /* ---- copying and moving with a progress routine ------------------------------------------------------------------------------------------------------------- */
@@ -218,12 +288,50 @@ EXPORT BOOL WINAPI MoveFileWithProgressA(LPCSTR from, LPCSTR to, LPPROGRESS_ROUT
   free_wide(a); free_wide(b);
   return ok;
 }
+/* ReplaceFile: `replacement` takes the place (and the name) of `replaced`; `backup`, if given, becomes the old `replaced` (it keeps its times). Both files are opened first, the
+ * way the move needs them (the replacement for good, exclusively; the replaced one for deleting, which a program that has it open may allow), and the rights are checked. */
 EXPORT BOOL WINAPI ReplaceFileW(LPCWSTR replaced, LPCWSTR replacement, LPCWSTR backup, DWORD flags, LPVOID exclude, LPVOID reserved) {
   (void)flags; (void)exclude; (void)reserved;
-  if (GetFileAttributesW(replacement) == INVALID_FILE_ATTRIBUTES) { set_error(ERROR_FILE_NOT_FOUND); return FALSE; }
-  if (GetFileAttributesW(replaced) == INVALID_FILE_ATTRIBUTES) { set_error(ERROR_FILE_NOT_FOUND); return FALSE; }
-  if (backup && !MoveFileExW(replaced, backup, 1 /* MOVEFILE_REPLACE_EXISTING */)) return FALSE;
-  return MoveFileExW(replacement, replaced, 1);
+  if (!replaced || !replacement) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  const DWORD replacement_attributes = GetFileAttributesW(replacement);
+  if (replacement_attributes == INVALID_FILE_ATTRIBUTES) { if (GetLastError() != ERROR_PATH_NOT_FOUND) set_error(ERROR_FILE_NOT_FOUND); return FALSE; }
+  const DWORD replaced_attributes = GetFileAttributesW(replaced);
+  if (replaced_attributes == INVALID_FILE_ATTRIBUTES) { if (GetLastError() != ERROR_PATH_NOT_FOUND) set_error(ERROR_FILE_NOT_FOUND); return FALSE; }
+  if ((replaced_attributes | replacement_attributes) & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_READONLY)) { set_error(ERROR_ACCESS_DENIED); return FALSE; }
+  HANDLE hold_replacement = CreateFileW(replacement, GENERIC_READ | GENERIC_WRITE | DELETE, 0, NULL, OPEN_EXISTING, 0, NULL);
+  if (hold_replacement == INVALID_HANDLE_VALUE) return FALSE;
+  HANDLE hold_replaced = CreateFileW(replaced, DELETE, 7, NULL, OPEN_EXISTING, 0, NULL);
+  if (hold_replaced == INVALID_HANDLE_VALUE) { const DWORD error = GetLastError(); CloseHandle(hold_replacement); set_error(error); return FALSE; }
+  CloseHandle(hold_replaced);
+  CloseHandle(hold_replacement);
+  /* The old file leaves its name first (to the backup, or to a name of its own that goes away at once), as programs that still have it open may not let it be replaced. */
+  WCHAR aside[PATH_CHARS];
+  LPCWSTR away = backup;
+  if (!backup) {
+    static UINT counter;
+    WCHAR full[PATH_CHARS];
+    const DWORD n = full_path_w(replaced, full, PATH_CHARS - 24);
+    if (n == 0) return FALSE;
+    DWORD cut = n;
+    while (cut > 0 && full[cut - 1] != '\\') --cut;
+    memcpy(aside, full, cut * 2);
+    static const WCHAR stem[] = {'.', 't', 'c', 'o', 's', '-', 'r', 'e', 'p', 'l', 'a', 'c', 'e', 'd', '-'};
+    memcpy(aside + cut, stem, sizeof(stem));
+    UINT id = ++counter;
+    DWORD at = cut + (DWORD)(sizeof(stem) / 2);
+    do { aside[at++] = (WCHAR)('0' + id % 10); id /= 10; } while (id);
+    aside[at] = 0;
+    away = aside;
+  }
+  if (!MoveFileExW(replaced, away, 1 /* MOVEFILE_REPLACE_EXISTING */)) return FALSE;
+  if (!MoveFileExW(replacement, replaced, 1)) {
+    const DWORD error = GetLastError();
+    MoveFileExW(away, replaced, 1);      /* (the old file back where it was) */
+    set_error(error);
+    return FALSE;
+  }
+  if (!backup) DeleteFileW(away);
+  return TRUE;
 }
 EXPORT BOOL WINAPI ReplaceFileA(LPCSTR replaced, LPCSTR replacement, LPCSTR backup, DWORD flags, LPVOID exclude, LPVOID reserved) {
   WCHAR *a = replaced ? to_wide(replaced) : NULL, *b = replacement ? to_wide(replacement) : NULL, *c = backup ? to_wide(backup) : NULL;

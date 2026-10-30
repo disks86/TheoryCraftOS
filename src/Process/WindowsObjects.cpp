@@ -527,6 +527,18 @@ uint32_t nt_duplicate_object(Process& p, const SyscallRequest& r) {
   }
   uint64_t slot = 0;
   if (!slot_of(r.args[1], &slot) || p.files().kind(slot) == DescriptorKind::Closed) return kInvalidHandle;
+  if (!(options & 2) && p.files().kind(slot) == DescriptorKind::File) {      // a file handle cannot be copied with rights the original does not have
+    if (const OpenObject* opened = p.files().object(slot)) {
+      auto map_file_access = [](uint32_t a) {
+        if (a & 0x80000000u) a |= 0x120089u;      // GENERIC_READ
+        if (a & 0x40000000u) a |= 0x120116u;      // GENERIC_WRITE
+        if (a & 0x20000000u) a |= 0x1200A0u;      // GENERIC_EXECUTE
+        if (a & 0x10000000u) a |= 0x1F01FFu;      // GENERIC_ALL
+        return a & ~0xF0000000u;
+      };
+      if (map_file_access(uint32_t(desired_access)) & ~map_file_access(opened->granted_access)) return 0xC0000022u;      // STATUS_ACCESS_DENIED
+    }
+  }
   const int64_t copy = p.files().duplicate(slot, 0);
   if (copy < 0) return kNoResources;
   if (is_object_kind(p.files().kind(slot))) if (ObjectManager* objects = system_objects()) objects->add_ref(uint32_t(p.files().token(slot)));
@@ -737,7 +749,7 @@ uint32_t nt_create_section(Process& p, const SyscallRequest& r) {
   if (fs) reported |= kSecFile;
   else reported |= (flags & kSecReserve) ? kSecReserve : kSecCommit;
   const ObjectManager::Created c = objects->create_section(StringView(name, name_size), (flags & kSecImage) ? 0 : size, page, reported, fs, host.view());
-  if (c.id == 0) return c.status;
+  if (c.id == 0) return (fs && c.status == kNoResources) ? 0xC0000040u /* STATUS_SECTION_TOO_BIG: more than can be held */ : c.status;
   if (fs && !(flags & kSecImage)) objects->section_set_reported_size(c.id, size != 0 ? size : file_size);      // (a section of a file has the size it was asked for, not the pages')
   if (flags & kSecImage) {      // the file has to be a PE image this OS can run
     uint8_t* image = nullptr;

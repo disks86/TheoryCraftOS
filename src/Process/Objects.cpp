@@ -242,6 +242,7 @@ ObjectManager::~ObjectManager() {
   if (jobs_ && allocator_) allocator_->deallocate(jobs_);
   if (locks_ && allocator_) allocator_->deallocate(locks_);
   if (shares_ && allocator_) allocator_->deallocate(shares_);
+  if (times_ && allocator_) allocator_->deallocate(times_);
   if (sections_) {
     for (uint32_t i = 0; i < kMaxSections; ++i) if (sections_[i].storage && allocator_) allocator_->deallocate(sections_[i].storage);
     if (allocator_) allocator_->deallocate(sections_);
@@ -679,6 +680,89 @@ uint32_t ObjectManager::share_owners(StringView path, const void** owners, uint3
     ++count;
   }
   return count;
+}
+
+struct ObjectManager::TimesEntry {
+  bool used = false;
+  FileTimes times;
+  char path[260] = {};
+  uint32_t path_size = 0;
+  uint32_t age = 0;
+};
+
+void ObjectManager::file_times_set(StringView path, uint32_t which, const FileTimes& times) {
+  Locked hold(sync_);
+  if (!allocator_ || path.size() >= 260 || which == 0) return;
+  if (!times_) {
+    void* memory = allocator_->allocate(sizeof(TimesEntry) * kMaxTimes);
+    if (!memory) return;
+    times_ = static_cast<TimesEntry*>(memory);
+    for (uint32_t i = 0; i < kMaxTimes; ++i) new (&times_[i]) TimesEntry();
+  }
+  TimesEntry* slot = nullptr;
+  uint32_t newest = 0;
+  for (uint32_t i = 0; i < kMaxTimes; ++i) {
+    TimesEntry& e = times_[i];
+    if (e.used && e.age > newest) newest = e.age;
+    if (e.used && same_name(e.path, e.path_size, path)) { slot = &e; break; }
+  }
+  if (!slot) {      // a free entry, or the one that was used longest ago
+    uint32_t oldest = 0xFFFFFFFFu;
+    for (uint32_t i = 0; i < kMaxTimes; ++i) {
+      TimesEntry& e = times_[i];
+      if (!e.used) { slot = &e; break; }
+      if (e.age < oldest) { oldest = e.age; slot = &e; }
+    }
+    slot->used = true;
+    slot->times = FileTimes();
+    for (uint32_t k = 0; k < path.size(); ++k) slot->path[k] = path[k];
+    slot->path_size = static_cast<uint32_t>(path.size());
+  }
+  slot->age = newest + 1;
+  if (which & 1) slot->times.created = times.created;
+  if (which & 2) slot->times.accessed = times.accessed;
+  if (which & 4) slot->times.written = times.written;
+}
+
+bool ObjectManager::file_times_get(StringView path, FileTimes* times) {
+  Locked hold(sync_);
+  if (!times_) return false;
+  for (uint32_t i = 0; i < kMaxTimes; ++i) {
+    const TimesEntry& e = times_[i];
+    if (!e.used || !same_name(e.path, e.path_size, path)) continue;
+    *times = e.times;
+    return true;
+  }
+  return false;
+}
+
+void ObjectManager::file_times_move(StringView from, StringView to) {
+  Locked hold(sync_);
+  if (!times_ || to.size() >= 260) return;
+  for (uint32_t i = 0; i < kMaxTimes; ++i) if (times_[i].used && same_name(times_[i].path, times_[i].path_size, to)) times_[i].used = false;
+  for (uint32_t i = 0; i < kMaxTimes; ++i) {
+    TimesEntry& e = times_[i];
+    if (!e.used || !same_name(e.path, e.path_size, from)) continue;
+    for (uint32_t k = 0; k < to.size(); ++k) e.path[k] = to[k];
+    e.path_size = static_cast<uint32_t>(to.size());
+  }
+}
+
+void ObjectManager::file_times_forget(StringView path) {
+  Locked hold(sync_);
+  if (!times_) return;
+  for (uint32_t i = 0; i < kMaxTimes; ++i) if (times_[i].used && same_name(times_[i].path, times_[i].path_size, path)) times_[i].used = false;
+}
+
+void ObjectManager::share_retarget(const void* owner, StringView new_path) {
+  Locked hold(sync_);
+  if (!shares_ || new_path.size() >= 260) return;
+  for (uint32_t i = 0; i < kMaxShares; ++i) {
+    ShareEntry& e = shares_[i];
+    if (!e.used || e.owner != owner) continue;
+    for (uint32_t k = 0; k < new_path.size(); ++k) e.path[k] = new_path[k];
+    e.path_size = static_cast<uint32_t>(new_path.size());
+  }
 }
 
 void ObjectManager::share_release(const void* owner) {

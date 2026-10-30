@@ -636,6 +636,58 @@ static Port *port_of(HANDLE h) {
 }
 /* The files tied to a port: an overlapped call that finishes on one queues a packet (its key, the bytes moved, the OVERLAPPED) there, unless the low bit of the event
    handle is set. */
+/* ReadFileScatter / WriteFileGather: the bytes go from (to) a list of page-sized buffers, ending with a null entry, to (from) the file at the offset of the OVERLAPPED. The
+ * file has to be one opened for overlapped calls. The work is done at once, the call says what an asynchronous one says and the completion is there for the event and the port. */
+typedef union { PVOID Buffer; ULONGLONG Alignment; } FILE_SEGMENT_ELEMENT_;
+static BOOL scatter_gather(HANDLE h, FILE_SEGMENT_ELEMENT_ *segments, DWORD bytes, LPOVERLAPPED overlapped, BOOL write) {
+  if (!overlapped || !segments || !overlapped_known(h)) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  LARGE_INTEGER offset;
+  offset.LowPart = overlapped->Offset;
+  offset.HighPart = (LONG)overlapped->OffsetHigh;
+  overlapped->Internal = (ULONG_PTR)STATUS_PENDING;
+  DWORD done = 0;
+  NTSTATUS status = STATUS_SUCCESS;
+  while (done < bytes && segments->Buffer) {
+    const DWORD n = bytes - done < 4096 ? bytes - done : 4096;
+    IO_STATUS_BLOCK iosb;
+    LARGE_INTEGER at;
+    at.QuadPart = offset.QuadPart + done;
+    iosb.Information = 0;
+    status = write ? NtWriteFile(h, NULL, NULL, NULL, &iosb, segments->Buffer, n, &at, NULL) : NtReadFile(h, NULL, NULL, NULL, &iosb, segments->Buffer, n, &at, NULL);
+    if (!NT_SUCCESS(status)) break;
+    done += (DWORD)iosb.Information;
+    if (iosb.Information < n) break;
+    ++segments;
+  }
+  if (done == 0 && status != STATUS_SUCCESS) {
+    complete_overlapped(overlapped, status, 0);
+    set_error(RtlNtStatusToDosError(status));
+    return FALSE;
+  }
+  complete_overlapped(overlapped, STATUS_SUCCESS, done);
+  port_note(h, overlapped, done);
+  set_error(ERROR_IO_PENDING);
+  return FALSE;
+}
+EXPORT BOOL WINAPI ReadFileScatter(HANDLE h, FILE_SEGMENT_ELEMENT_ *segments, DWORD bytes, LPDWORD reserved, LPOVERLAPPED overlapped) { (void)reserved; return scatter_gather(h, segments, bytes, overlapped, FALSE); }
+EXPORT BOOL WINAPI WriteFileGather(HANDLE h, FILE_SEGMENT_ELEMENT_ *segments, DWORD bytes, LPDWORD reserved, LPOVERLAPPED overlapped) { (void)reserved; return scatter_gather(h, segments, bytes, overlapped, TRUE); }
+/* FILE_SKIP_COMPLETION_PORT_ON_SUCCESS (1) and FILE_SKIP_SET_EVENT_ON_HANDLE (2): a call here is done before it returns, and tells so only by the packet at the port; the modes are accepted. */
+EXPORT BOOL WINAPI SetFileCompletionNotificationModes(HANDLE h, UCHAR modes) {
+  if (modes & ~3) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (device_type(h) < 0) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
+  return TRUE;
+}
+/* SetFileValidData: tells the file system that the data up to `length` is to be taken as written, which takes the privilege to manage volumes. The tokens here are one fixed user
+ * without any privilege that can be enabled (see advapi32), so a handle that may write is told that it is not held. */
+EXPORT BOOL WINAPI SetFileValidData(HANDLE h, LONGLONG length) {
+  (void)length;
+  IO_STATUS_BLOCK iosb;
+  BYTE access[4];
+  const NTSTATUS status = NtQueryInformationFile(h, &iosb, access, sizeof(access), 8);      /* FileAccessInformation */
+  if (!NT_SUCCESS(status)) return fail_nt(status);
+  set_error(get32(access) & 2 /* FILE_WRITE_DATA */ ? 1314 /* ERROR_PRIVILEGE_NOT_HELD */ : ERROR_ACCESS_DENIED);
+  return FALSE;
+}
 EXPORT BOOL WINAPI PostQueuedCompletionStatus(HANDLE port, DWORD bytes, ULONG_PTR key, LPOVERLAPPED overlapped);
 typedef struct { HANDLE file, port; ULONG_PTR key; } PortLink;
 static PortLink g_links[64];
@@ -665,6 +717,7 @@ static void port_note(HANDLE file, LPOVERLAPPED overlapped, ULONG_PTR bytes) {
 }
 EXPORT HANDLE WINAPI CreateIoCompletionPort(HANDLE file, HANDLE existing, ULONG_PTR key, DWORD threads) {
   (void)threads;
+  if (file && file != INVALID_HANDLE_VALUE && GetFileType(file) == FILE_TYPE_DISK && !overlapped_known(file)) { set_error(ERROR_INVALID_PARAMETER); return NULL; }      /* (a file opened for synchronous calls cannot be tied to a port) */
   if (existing) {
     if (!port_of(existing)) { set_error(ERROR_INVALID_PARAMETER); return NULL; }
     if (file != INVALID_HANDLE_VALUE) port_link(file, existing, key);
@@ -695,12 +748,12 @@ EXPORT BOOL WINAPI PostQueuedCompletionStatus(HANDLE port, DWORD bytes, ULONG_PT
   ReleaseSemaphore(p->semaphore, 1, NULL);
   return TRUE;
 }
-EXPORT BOOL WINAPI GetQueuedCompletionStatus(HANDLE port, LPDWORD bytes, PULONG_PTR key, LPOVERLAPPED *overlapped, DWORD timeout) {
+static BOOL port_take(HANDLE port, LPDWORD bytes, PULONG_PTR key, LPOVERLAPPED *overlapped, DWORD timeout, BOOL alertable) {
   Port *p = port_of(port);
   if (!p) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
   if (overlapped) *overlapped = NULL;
-  const DWORD w = WaitForSingleObject(p->semaphore, timeout);
-  if (w != WAIT_OBJECT_0) { set_error(w == WAIT_TIMEOUT ? WAIT_TIMEOUT : GetLastError()); return FALSE; }
+  const DWORD w = WaitForSingleObjectEx(p->semaphore, timeout, alertable);
+  if (w != WAIT_OBJECT_0) { set_error(w == WAIT_TIMEOUT || w == WAIT_IO_COMPLETION ? w : GetLastError()); return FALSE; }
   atom_lock();
   PortPacket k = p->packets[p->head];
   p->head = (p->head + 1) % PORT_QUEUE;
@@ -711,18 +764,17 @@ EXPORT BOOL WINAPI GetQueuedCompletionStatus(HANDLE port, LPDWORD bytes, PULONG_
   if (overlapped) *overlapped = k.overlapped;
   return TRUE;
 }
-typedef struct { LPOVERLAPPED lpOverlapped; ULONG_PTR key; ULONG_PTR internal; DWORD bytes; } OVERLAPPED_ENTRY_;
+EXPORT BOOL WINAPI GetQueuedCompletionStatus(HANDLE port, LPDWORD bytes, PULONG_PTR key, LPOVERLAPPED *overlapped, DWORD timeout) { return port_take(port, bytes, key, overlapped, timeout, FALSE); }
+typedef struct { ULONG_PTR key; LPOVERLAPPED lpOverlapped; ULONG_PTR internal; DWORD bytes; } OVERLAPPED_ENTRY_;
 EXPORT BOOL WINAPI GetQueuedCompletionStatusEx(HANDLE port, OVERLAPPED_ENTRY_ *entries, ULONG count, PULONG removed, DWORD timeout, BOOL alertable) {
-  (void)alertable;
   ULONG n = 0;
-  DWORD wait = timeout;
   while (n < count) {
     DWORD bytes; ULONG_PTR key; LPOVERLAPPED ov;
-    if (!GetQueuedCompletionStatus(port, &bytes, &key, &ov, n == 0 ? wait : 0)) break;
+    if (!port_take(port, &bytes, &key, &ov, n == 0 ? timeout : 0, n == 0 && alertable)) break;
     entries[n].lpOverlapped = ov; entries[n].key = key; entries[n].internal = 0; entries[n].bytes = bytes; ++n;
   }
   if (removed) *removed = n;
-  if (n == 0) { if (GetLastError() != ERROR_INVALID_HANDLE) set_error(WAIT_TIMEOUT); return FALSE; }
+  if (n == 0) { if (GetLastError() != ERROR_INVALID_HANDLE && GetLastError() != WAIT_IO_COMPLETION) set_error(WAIT_TIMEOUT); return FALSE; }
   return TRUE;
 }
 

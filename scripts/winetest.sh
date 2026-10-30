@@ -53,6 +53,7 @@ while [ ${#pending[@]} -gt 0 ] && [ $round -lt 40 ]; do
   # kernel32 tests load a program from System32 (winver.exe) as a library: any program image will do
   cp "$out/winerun.exe" "$out/winver.exe"; files+=("$PWD/$out/winver.exe")
   cp "$out/winerun.exe" "$out/explorer.exe"; files+=("$PWD/$out/explorer.exe")      # (C:\Windows\explorer.exe: another program image to load)
+  cp "$out/winerun.exe" "$out/regedit.exe"; files+=("$PWD/$out/regedit.exe")      # (C:\Windows\regedit.exe: a program file the file tests open)
   cat > "$out/qemu.sh" <<'QEMU'
 #!/bin/sh
 # Runs QEMU without a display until the program prints WINERUN DONE, the debug console is silent for ${WINETEST_QUIET:-90} s, or 40 minutes pass; then stops it.
