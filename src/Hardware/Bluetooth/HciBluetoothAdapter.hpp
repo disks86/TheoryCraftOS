@@ -60,6 +60,7 @@ class HciBluetoothAdapter final : public IBluetoothAdapter, private ISmUserInter
   BluetoothResult disconnect(const hci::BdAddr& address) override;
   BluetoothResult forget(const hci::BdAddr& address) override;
   void set_auto_reconnect(bool on) override;
+  bool auto_reconnect() const override { return auto_reconnect_; }
   void set_pairing_ui(IBluetoothPairingUi* ui) override;
   void passkey_entered(const hci::BdAddr& address, uint32_t passkey) override;
   void confirm(const hci::BdAddr& address, bool accepted) override;

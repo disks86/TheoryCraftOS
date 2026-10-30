@@ -150,7 +150,12 @@ bool SystemBluetoothDetails::adapter(uint32_t id, BluetoothAdapterInfo* out) {
   address_text(a->address(), out->address);
   out->ready = a->ready();
   out->discovering = a->discovering();
+  out->auto_reconnect = a->auto_reconnect();
   return true;
+}
+
+void SystemBluetoothDetails::set_auto_reconnect(uint32_t id, bool on) {
+  if (find(id)) manager_.set_auto_reconnect(on);
 }
 
 bool SystemBluetoothDetails::set_discovery(uint32_t id, bool on) {

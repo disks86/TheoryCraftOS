@@ -82,12 +82,15 @@ class BluetoothService final : public IBluetoothManager {
   uint32_t ready_count() const;
 
   // IBluetoothManager: the adapters of the controllers that are ready, and the profiles offered to the devices that connect to them.
+  bool auto_reconnect() const override { return auto_reconnect_; }
+  void set_auto_reconnect(bool on) override;
   uint32_t adapter_count() const override;
   IBluetoothAdapter* adapter(uint32_t index) override;
   bool add_profile(IBluetoothProfile* profile) override { return profiles_.add(profile); }
   bool remove_profile(IBluetoothProfile* profile) override { return profiles_.remove(profile); }
   // The bonds of every controller (one table: a device bonded through one is known to the others). They are loaded when the service starts and saved by save_bonds().
   SmBondStore& bonds() { return bonds_; }
+  // Writes the bonds and the settings (the auto-reconnect choice) to the storage.
   bool save_bonds();
   uint32_t added() const { return added_; }
   uint32_t removed() const { return removed_; }
@@ -107,6 +110,7 @@ class BluetoothService final : public IBluetoothManager {
   UsbPortWatcher watcher_;
   List<UniquePointer<Entry>> entries_;
   uint32_t added_ = 0, removed_ = 0;
+  bool auto_reconnect_ = false;
 };
 
 }  // namespace hardware
