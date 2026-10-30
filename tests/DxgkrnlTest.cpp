@@ -5153,6 +5153,42 @@ void test_dxil() {
     CHECK(alive_count > 20);   // (the test is about colours, not about every pixel being killed)
     printf("  dxil %s: 200 pixels compared, %u not killed\n", name, alive_count);
   }
+
+  // The shader the old compiler cannot make (a switch, signed division, tan and the hyperbolic functions, an early return): compared with the same function in C++.
+  {
+    UniquePointer<D3d9Program> translated;
+    CHECK(load("dxil_ps_more.dxil", &translated));
+    if (translated) {
+      unsigned early = 0, checked = 0;
+      for (uint32_t n = 0; n < 300; ++n) {
+        graphics::Vec4 varyings[4] = {};
+        varyings[0] = {random(-1, 2), random(-1, 2), random(-1, 2), random(-1, 2)};
+        varyings[2] = {n % 7 == 0 ? random(0, 0.1f) : random(0, 1), random(0, 1), 0, 0};
+        const float cx = varyings[0].x, cy = varyings[0].y, cz = varyings[0].z, cw = varyings[0].w, tx = varyings[2].x, ty = varyings[2].y;
+        graphics::Vec4 room[graphics::kMaxColorTargets] = {};
+        uint8_t constants[128] = {};
+        const bool alive = translated->run_fragment_ex(varyings, graphics::FragmentContext(), constants, &textures, room);
+        float want[4];
+        if (tx < 0.1f) {
+          want[0] = cx, want[1] = cy, want[2] = cz, want[3] = 0.5f;
+          ++early;
+        } else {
+          const int a = static_cast<int>(cx * 20.0f - 8.0f), b = static_cast<int>(ty * 6.0f) - 3, d = b == 0 ? 1 : b;
+          want[0] = static_cast<float>(a / d) + static_cast<float>(a % d) * 0.25f;
+          want[1] = __builtin_tanf(cy * 0.5f) + __builtin_coshf(cz * 0.3f) + __builtin_sinhf(cw * 0.3f) + __builtin_tanhf(cx * 0.2f);
+          const uint32_t which = static_cast<uint32_t>(ty * 5.0f);
+          want[2] = which == 0 ? 1.0f : which <= 2 ? cx * 2.0f : which == 3 ? __builtin_sqrtf(__builtin_fabsf(cy)) : -1.0f;
+          want[3] = 1.0f;
+        }
+        const bool same = alive && close_to(room[0].x, want[0]) && close_to(room[0].y, want[1]) && close_to(room[0].z, want[2]) && close_to(room[0].w, want[3]);
+        if (!same && checked < 3) printf("  more #%u: %g %g %g %g wants %g %g %g %g\n", n, room[0].x, room[0].y, room[0].z, room[0].w, want[0], want[1], want[2], want[3]);
+        CHECK(same);
+        ++checked;
+      }
+      CHECK(early > 10);
+      printf("  dxil dxil_ps_more: 300 pixels compared with C++ (%u early returns)\n", early);
+    }
+  }
   // The vertex shader: a matrix and a tint from the constants.
   {
     UniquePointer<D3d9Program> reference, translated;
@@ -5238,7 +5274,7 @@ void test_dxil() {
     }
   }
   // Truncated and with a bit flipped: refused or compiled, never a crash (and the sanitizers say nothing).
-  for (const char* name : {"dxil_ps_math.dxil", "dxil_ps_flow.dxil", "dxil_vs.dxil", "dxil_ps_tex.dxil", "dxil_cs_fill.dxil", "dxil_ps_loop.dxil", "dxil_cs_shared.dxil"}) {
+  for (const char* name : {"dxil_ps_math.dxil", "dxil_ps_flow.dxil", "dxil_vs.dxil", "dxil_ps_tex.dxil", "dxil_cs_fill.dxil", "dxil_ps_loop.dxil", "dxil_cs_shared.dxil", "dxil_ps_more.dxil"}) {
     const std::vector<uint8_t> blob = read_blob(name);
     for (size_t n = 0; n < blob.size(); n += 11) {
       UniquePointer<D3d9Program> program;

@@ -682,7 +682,18 @@ class ModuleBuilder final : public BitstreamVisitor {
         }
         return push_instruction(ins, true);
       }
-      case 12: ins.op = Op::Switch; return fail(status::kNotSupported);
+      case 12: {  // SWITCH [type, condition, default block, (case value, block)...]
+        ins.op = Op::Switch;
+        if (ops.size() < 3 || (ops.size() - 3) % 2 != 0 || (ops.size() - 3) / 2 > 60) return fail(status::kNotSupported);
+        at = 1;
+        if (!operand(ops, &at, &ins.operands[0], false)) return fail(status::kInvalidParameter);
+        ins.blocks[0] = static_cast<uint32_t>(ops[2]);
+        ins.phi_first = static_cast<uint32_t>(m_.phi_values.count());
+        ins.phi_count = static_cast<uint32_t>((ops.size() - 3) / 2);
+        for (uint64_t i = 3; i + 1 < ops.size(); i += 2)
+          if (!m_.phi_values.push_back(static_cast<uint32_t>(ops[i])) || !m_.phi_blocks.push_back(static_cast<uint32_t>(ops[i + 1]))) return fail(status::kNoMemory);
+        return terminate(ins, false);
+      }
       case 19: ins.op = Op::Alloca; return push_instruction(ins, true);   // (numbered; the translator refuses it)
       case 20: {  // LOAD [pointer, type, alignment, volatile]
         ins.op = Op::Load;

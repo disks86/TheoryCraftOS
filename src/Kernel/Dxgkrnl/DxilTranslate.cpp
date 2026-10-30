@@ -182,7 +182,10 @@ class Translator {
   bool translate(const Instruction& ins);
   bool phi_moves(uint32_t pred, uint32_t target);
   uint32_t find_merge(uint32_t a, uint32_t b);
-  void successors_of(uint32_t block, uint32_t* out, uint32_t* count) const;
+  static constexpr uint32_t kMaxSuccessors = 64;
+  void successors_of(uint32_t block, uint32_t* out, uint32_t* count) const;   // (out has room for kMaxSuccessors)
+  uint32_t find_merge_of(const uint32_t* targets, uint32_t count);
+  bool switch_region(const Instruction& t, uint32_t b, uint32_t stop);
   const Block& block_at(uint32_t i) const { return m_.blocks[f_.first_block_start + i]; }
   const Instruction& instruction_at(uint32_t i) const { return m_.instructions[i]; }
   const Instruction& terminator(uint32_t block) const {
@@ -199,6 +202,9 @@ class Translator {
   bool binary(const Instruction& ins, uint32_t dxbc_opcode, uint32_t first_arg);
   bool ternary(const Instruction& ins, uint32_t dxbc_opcode, uint32_t first_arg);
   bool sincos(const Instruction& ins, bool cosine);
+  bool trig(const Instruction& ins, uint32_t opcode);
+  bool classify(const Instruction& ins, uint32_t opcode);
+  bool signed_divide(const Instruction& ins, bool remainder, const Val& a, const Val& b, const Val& r);
   bool dot(const Instruction& ins, uint32_t n);
   bool sample(const Instruction& ins, bool level);
   bool texture_load(const Instruction& ins);
@@ -223,7 +229,7 @@ class Translator {
   uint32_t temps_ = 0;
   bool dry_ = true;
   int32_t pos_ = 0;
-  uint32_t depth_ = 0, steps_ = 0;
+  uint32_t depth_ = 0, steps_ = 0, if_depth_ = 0;   // (if_depth_: the ifs open at this point of the walk)
   NtStatus status_ = status::kSuccess;
   uint32_t kind_ = 0;
   Resource res_[4][kMaxResources];
@@ -254,9 +260,9 @@ class Translator {
 
 void Translator::src(const Val& v, uint32_t modifier) {
   switch (v.kind) {
-    case VK::Imm:
+    case VK::Imm:   // (a modifier on a literal is made in the literal: negate, absolute value, negated absolute value)
       put(0x4001u);
-      put(v.a);
+      put(modifier == 1 ? v.a ^ 0x80000000u : modifier == 2 ? v.a & 0x7FFFFFFFu : modifier == 3 ? v.a | 0x80000000u : v.a);
       break;
     case VK::Temp: case VK::Input:
       put(2u | (2u << 2) | (v.b << 4) | ((v.kind == VK::Input ? 1u : 0u) << 12) | (1u << 20) | (modifier ? 1u << 31 : 0u));
@@ -507,30 +513,43 @@ void Translator::successors_of(uint32_t block, uint32_t* out, uint32_t* count) c
   const Instruction& t = m_.instructions[b.first + b.count - 1];
   if (t.op == Op::Br) out[(*count)++] = t.blocks[0];
   else if (t.op == Op::CondBr) out[(*count)++] = t.blocks[0], out[(*count)++] = t.blocks[1];
+  else if (t.op == Op::Switch) {
+    out[(*count)++] = t.blocks[0];
+    for (uint32_t k = 0; k < t.phi_count && *count < kMaxSuccessors; ++k) out[(*count)++] = m_.phi_blocks[t.phi_first + k];
+  }
 }
 
 // The first block both a and b lead to (the join of an if): the lowest block number reachable from both.
 uint32_t Translator::find_merge(uint32_t a, uint32_t b) {
+  const uint32_t pair[2] = {a, b};
+  return find_merge_of(pair, 2);
+}
+
+// The lowest block every one of the targets leads to.
+uint32_t Translator::find_merge_of(const uint32_t* targets, uint32_t count) {
   const uint32_t n = f_.block_count;
   marks_.clear();
-  for (uint32_t i = 0; i < 2 * n; ++i)
+  for (uint64_t i = 0; i < uint64_t{count} * n; ++i)
     if (!marks_.push_back(0)) return kNone;
-  for (uint32_t side = 0; side < 2; ++side) {
+  for (uint32_t side = 0; side < count; ++side) {
     List<uint32_t> stack(allocator_);
-    if (!stack.push_back(side == 0 ? a : b)) return kNone;
+    if (!stack.push_back(targets[side])) return kNone;
     while (stack.count()) {
       const uint32_t x = stack[stack.count() - 1];
       stack.remove_at(stack.count() - 1);
-      if (x >= n || marks_[side * n + x]) continue;
-      marks_[side * n + x] = 1;
-      uint32_t next[2], count = 0;
-      successors_of(x, next, &count);
-      for (uint32_t k = 0; k < count; ++k)
+      if (x >= n || marks_[uint64_t{side} * n + x]) continue;
+      marks_[uint64_t{side} * n + x] = 1;
+      uint32_t next[kMaxSuccessors], successors = 0;
+      successors_of(x, next, &successors);
+      for (uint32_t k = 0; k < successors; ++k)
         if (next[k] > x && !stack.push_back(next[k])) return kNone;   // (forward edges only)
     }
   }
-  for (uint32_t x = 0; x < n; ++x)
-    if (marks_[x] && marks_[n + x]) return x;
+  for (uint32_t x = 0; x < n; ++x) {
+    bool all = true;
+    for (uint32_t side = 0; side < count && all; ++side) all = marks_[uint64_t{side} * n + x] != 0;
+    if (all) return x;
+  }
   return kNone;
 }
 
@@ -567,9 +586,14 @@ bool Translator::region(uint32_t start, uint32_t stop, uint32_t pred) {
       finish(at);
     }
     ++pos_;
+    ++if_depth_;
   };
   auto simple = [&](uint32_t opcode) {
     if (!dry_) finish(begin(opcode));
+  };
+  auto end_if = [&]() {
+    simple(21);
+    --if_depth_;
   };
   // The loop on top of the stack ends here: its exit block is what comes next.
   auto end_loop = [&](uint32_t* exit) -> bool {
@@ -606,8 +630,8 @@ bool Translator::region(uint32_t start, uint32_t stop, uint32_t pred) {
       if (loop_i >= 0) return error(status::kNotSupported);   // (a return inside a loop)
       if (dry_) {
         if (t.operands[0] != 0) note_use(t.operands[0], pos_);
-      } else {
-        finish(begin(62));
+      } else if (if_depth_ == 0) {
+        finish(begin(62));   // (a return in an arm just ends the arm: nothing follows the join of an if whose other arm goes on)
       }
       ++pos_;
       return true;
@@ -637,6 +661,7 @@ bool Translator::region(uint32_t start, uint32_t stop, uint32_t pred) {
       b = target;
       continue;
     }
+    if (t.op == Op::Switch) return switch_region(t, b, stop);
     if (t.op != Op::CondBr) return error(status::kNotSupported);
     const uint32_t tb = t.blocks[0], fb = t.blocks[1];
     if (tb == fb) return error(status::kNotSupported);
@@ -652,7 +677,7 @@ bool Translator::region(uint32_t start, uint32_t stop, uint32_t pred) {
         simple(18);   // else
         if (!phi_moves(b, other)) return false;
         simple(2);    // break
-        simple(21);   // endif
+        end_if();
         uint32_t exit = kNone;
         bool done = false;
         if (!end_loop(&exit) || !after_loop(exit, &done)) return false;
@@ -667,7 +692,7 @@ bool Translator::region(uint32_t start, uint32_t stop, uint32_t pred) {
         condition(t.operands[0], t_out);
         if (!phi_moves(b, out)) return false;
         simple(2);    // break
-        simple(21);   // endif
+        end_if();
         if (!phi_moves(b, in)) return false;
         if (in == stop) return true;
         if (stop != kNone && in > stop) return error(status::kNotSupported);
@@ -682,11 +707,93 @@ bool Translator::region(uint32_t start, uint32_t stop, uint32_t pred) {
     if (!region(tb, merge, b)) return false;
     simple(18);   // else
     if (!region(fb, merge, b)) return false;
-    simple(21);   // endif
+    end_if();
     if (merge == kNone || merge == stop) return true;
     if (stop != kNone && merge > stop) return error(status::kNotSupported);
     b = merge;
   }
+}
+
+// A switch as a chain of tests: the targets in order of their first case, each with the values that lead to it (one test of equalities joined by or), the default last.
+bool Translator::switch_region(const Instruction& t, uint32_t b, uint32_t stop) {
+  if (loops_.count()) return error(status::kNotSupported);   // (breaks and continues of a loop mix with those of a switch)
+  uint32_t targets[kMaxSuccessors], count = 0;
+  targets[count++] = t.blocks[0];
+  for (uint32_t k = 0; k < t.phi_count; ++k) {
+    const uint32_t bb = m_.phi_blocks[t.phi_first + k];
+    bool seen = false;
+    for (uint32_t i = 0; i < count; ++i) seen |= targets[i] == bb;
+    if (!seen && count < kMaxSuccessors) targets[count++] = bb;
+  }
+  for (uint32_t i = 0; i < count; ++i)
+    if (targets[i] <= b || targets[i] >= f_.block_count) return error(status::kNotSupported);
+  const uint32_t merge = find_merge_of(targets, count);
+  // (the default is the last arm: it has no test; a target the cases do not name is only the default)
+  uint32_t order[kMaxSuccessors], tests = 0;
+  for (uint32_t k = 0; k < t.phi_count; ++k) {
+    const uint32_t bb = m_.phi_blocks[t.phi_first + k];
+    bool seen = false;
+    for (uint32_t i = 0; i < tests; ++i) seen |= order[i] == bb;
+    if (!seen && bb != t.blocks[0]) order[tests++] = bb;
+  }
+  uint32_t open = 0;
+  for (uint32_t i = 0; i < tests; ++i) {
+    // the condition: the condition value equals one of this target's case values
+    if (dry_) {
+      note_use(t.operands[0], pos_);
+    } else {
+      const Val value = use(t.operands[0]);
+      uint32_t reg = 0, comp = 0;
+      if (!alloc_scalar(pos_ + 1, &reg, &comp)) return false;
+      Val flag;
+      flag.kind = VK::Temp, flag.a = reg, flag.b = comp;
+      bool first = true;
+      for (uint32_t k = 0; k < t.phi_count; ++k) {
+        if (m_.phi_blocks[t.phi_first + k] != order[i]) continue;
+        uint64_t number = 0;
+        if (!constant_int(m_.phi_values[t.phi_first + k], &number)) return error(status::kNotSupported);
+        Val c;
+        c.kind = VK::Imm, c.a = static_cast<uint32_t>(number);
+        if (first) {
+          const uint32_t at = begin(32);   // ieq flag, value, c
+          dst_scalar(flag);
+          src(value), src(c);
+          finish(at);
+        } else {
+          uint32_t r2 = 0, c2 = 0;
+          if (!alloc_scalar(pos_ + 1, &r2, &c2)) return false;
+          Val other;
+          other.kind = VK::Temp, other.a = r2, other.b = c2;
+          const uint32_t at = begin(32);
+          dst_scalar(other);
+          src(value), src(c);
+          finish(at);
+          const uint32_t or_at = begin(60);   // or flag, flag, other
+          dst_scalar(flag);
+          src(flag), src(other);
+          finish(or_at);
+        }
+        first = false;
+      }
+      const uint32_t at = begin(31, 1u << 18);   // if_nz flag
+      src(flag);
+      finish(at);
+    }
+    ++pos_;
+    ++open;
+    ++if_depth_;
+    if (!region(order[i], merge, b)) return false;
+    if (!dry_) finish(begin(18));   // else
+  }
+  if (!region(t.blocks[0], merge, b)) return false;
+  for (uint32_t i = 0; i < open; ++i) {
+    if (!dry_) finish(begin(21));   // endif
+    --if_depth_;
+  }
+  if (merge == kNone || merge == stop) return true;
+  if (stop != kNone && merge > stop) return error(status::kNotSupported);
+  // (the walk goes on at the join: the caller's loop does that when it is told, so this is the one place a region continues from inside a helper)
+  return region(merge, stop, kNone);
 }
 
 // --- instructions ------------------------------------------------------------------------------------------------------------------------------------------------
@@ -800,6 +907,10 @@ bool Translator::binop(const Instruction& ins) {
       else dst_null(), dst_scalar(r);
       src(a), src(b);
       finish(at);
+      break;
+    }
+    case 4: case 6: {                   // sdiv / srem
+      if (!signed_divide(ins, ins.code == 6, a, b, r)) return false;
       break;
     }
     case 7: three(41); break;           // shl
@@ -964,6 +1075,138 @@ bool Translator::sincos(const Instruction& ins, bool cosine) {
   src(a);
   finish(at);
   return define(ins.result, r);
+}
+
+// tan (sin / cos) and the hyperbolic functions (from 2^(x log2 e) and its inverse).
+bool Translator::trig(const Instruction& ins, uint32_t opcode) {
+  const Val x = use(ins.args[1]);
+  const Val r = new_scalar(ins.result);
+  if (r.kind == VK::None || !m_.is_float(ins.type)) return error(status::kNotSupported);
+  auto scratch = [&]() {
+    Val v;
+    v.kind = VK::Temp;
+    if (!alloc_scalar(pos_ + 1, &v.a, &v.b)) v.kind = VK::None;
+    return v;
+  };
+  auto imm = [](float f) {
+    Val v;
+    v.kind = VK::Imm, v.a = __builtin_bit_cast(uint32_t, f);
+    return v;
+  };
+  auto emit3 = [&](uint32_t op, const Val& d, const Val& a, const Val& b, uint32_t mod_b = 0) {
+    const uint32_t at = begin(op);
+    dst_scalar(d);
+    src(a), src(b, mod_b);
+    finish(at);
+  };
+  if (opcode == 14) {   // tan
+    const Val s = scratch(), c = scratch();
+    if (s.kind == VK::None || c.kind == VK::None) return false;
+    const uint32_t at = begin(77);
+    dst_scalar(s), dst_scalar(c);
+    src(x);
+    finish(at);
+    emit3(14, r, s, c);
+    return define(ins.result, r);
+  }
+  // t = x * log2(e); e1 = 2^t; e2 = 2^-t
+  const Val t = scratch(), e1 = scratch(), e2 = scratch();
+  if (t.kind == VK::None || e1.kind == VK::None || e2.kind == VK::None) return false;
+  emit3(56, t, x, imm(1.4426950408889634f));
+  {
+    const uint32_t at = begin(25);
+    dst_scalar(e1);
+    src(t);
+    finish(at);
+  }
+  {
+    const uint32_t at = begin(25);
+    dst_scalar(e2);
+    src(t, 1);
+    finish(at);
+  }
+  const Val half = imm(0.5f);
+  if (opcode == 18 || opcode == 19) {   // cosh / sinh: (e1 +- e2) / 2
+    emit3(0, t, e1, e2, opcode == 19 ? 1u : 0u);
+    emit3(56, r, t, half);
+    return define(ins.result, r);
+  }
+  // tanh: (e1 - e2) / (e1 + e2)
+  const Val numerator = scratch();
+  if (numerator.kind == VK::None) return false;
+  emit3(0, numerator, e1, e2, 1);
+  emit3(0, t, e1, e2);
+  emit3(14, r, numerator, t);
+  return define(ins.result, r);
+}
+
+// IsNaN, IsInf, IsFinite: masks.
+bool Translator::classify(const Instruction& ins, uint32_t opcode) {
+  const Val x = use(ins.args[1]);
+  const Val r = new_scalar(ins.result, true);
+  if (r.kind == VK::None || !m_.is_float(value_type(ins.args[1]))) return error(status::kNotSupported);
+  Val infinity;
+  infinity.kind = VK::Imm, infinity.a = 0x7F800000u;
+  const uint32_t at = begin(opcode == 8 ? 57 : opcode == 9 ? 24 : 49);   // ne x, x / eq |x|, inf / lt |x|, inf
+  dst_scalar(r);
+  if (opcode == 8) src(x), src(x);
+  else src(x, 2), src(infinity);
+  finish(at);
+  return define(ins.result, r);
+}
+
+// Signed division and remainder from the unsigned one: the magnitudes divided, the sign put back.
+bool Translator::signed_divide(const Instruction&, bool remainder, const Val& a, const Val& b, const Val& r) {
+  auto scratch = [&]() {
+    Val v;
+    v.kind = VK::Temp;
+    if (!alloc_scalar(pos_ + 1, &v.a, &v.b)) v.kind = VK::None;
+    return v;
+  };
+  Val thirty_one;
+  thirty_one.kind = VK::Imm, thirty_one.a = 31;
+  Val sign_a = scratch(), sign_b = scratch(), abs_a = scratch(), abs_b = scratch(), t = scratch();
+  if (sign_a.kind == VK::None || sign_b.kind == VK::None || abs_a.kind == VK::None || abs_b.kind == VK::None || t.kind == VK::None) return false;
+  auto three = [&](uint32_t op, const Val& d, const Val& x, const Val& y) {
+    const uint32_t at = begin(op);
+    dst_scalar(d);
+    src(x), src(y);
+    finish(at);
+  };
+  auto negate = [&](const Val& d, const Val& x) {   // d = -x
+    const uint32_t at = begin(40);
+    dst_scalar(d);
+    src(x);
+    finish(at);
+  };
+  // |v| = (v ^ s) - s with s = v >> 31
+  auto magnitude = [&](const Val& sign, const Val& out, const Val& v) {
+    three(42, sign, v, thirty_one);       // ishr
+    three(87, t, v, sign);                // xor
+    negate(out, sign);                    // out = -s
+    three(30, out, t, out);               // t + -s
+  };
+  magnitude(sign_a, abs_a, a);
+  magnitude(sign_b, abs_b, b);
+  {
+    const uint32_t at = begin(78);        // udiv quotient, remainder
+    if (remainder) dst_null(), dst_scalar(r);
+    else dst_scalar(r), dst_null();
+    src(abs_a), src(abs_b);
+    finish(at);
+  }
+  // the quotient has the sign of a xor b, the remainder that of a
+  Val sign = sign_a;
+  if (!remainder) {
+    three(87, t, sign_a, sign_b);
+    sign = t;
+  }
+  Val negative = abs_b;                   // (a scratch)
+  three(87, negative, r, sign);           // r ^ s
+  const Val s2 = abs_a;
+  negate(s2, sign);                       // -s
+  three(30, r, negative, s2);             // (r ^ s) + -s
+  return true;
 }
 
 bool Translator::dot(const Instruction& ins, uint32_t n) {
@@ -1254,6 +1497,8 @@ bool Translator::dx_call(const Instruction& ins) {
       finish(at);
       return true;
     }
+    case 8: case 9: case 10: return classify(ins, static_cast<uint32_t>(opcode));
+    case 14: case 18: case 19: case 20: return trig(ins, static_cast<uint32_t>(opcode));
     case kFAbs: return unary(ins, 54, 1, 2);
     case kSaturate: return unary(ins, 54, 1, 0, true);
     case kSin: return sincos(ins, false);
@@ -1440,7 +1685,7 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
   for (uint32_t i = 0; i < f_.block_count; ++i)
     if (!latch_of_.push_back(kNone)) return status::kNoMemory;
   for (uint32_t x = 0; x < f_.block_count; ++x) {
-    uint32_t next[2], count = 0;
+    uint32_t next[kMaxSuccessors], count = 0;
     successors_of(x, next, &count);
     for (uint32_t k = 0; k < count; ++k)
       if (next[k] <= x && next[k] < f_.block_count && (latch_of_[next[k]] == kNone || latch_of_[next[k]] < x)) latch_of_[next[k]] = x;
@@ -1452,7 +1697,7 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
   for (uint32_t i = 0; i < f_.block_count; ++i)
     if (!visited_marks_.push_back(0)) return status::kNoMemory;
   dry_ = true;
-  pos_ = 0, depth_ = 0, steps_ = 0;
+  pos_ = 0, depth_ = 0, steps_ = 0, if_depth_ = 0;
   if (!region(0, kNone, kNone)) return status_ != status::kSuccess ? status_ : status::kNotSupported;
   for (uint64_t i = values; i-- > 0;)
     if (alias_of_[i] != kNone && alias_of_[i] < values && last_use_[i] > last_use_[alias_of_[i]]) last_use_[alias_of_[i]] = last_use_[i];
@@ -1461,7 +1706,7 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
   // the second pass: the code
   for (uint32_t i = 0; i < f_.block_count; ++i) visited_marks_[i] = 0;
   dry_ = false;
-  pos_ = 0, depth_ = 0, steps_ = 0;
+  pos_ = 0, depth_ = 0, steps_ = 0, if_depth_ = 0;
   for (uint32_t b = 0; b < f_.block_count; ++b) {
     const Block& blk = block_at(b);
     for (uint32_t i = 0; i < blk.count; ++i) {
