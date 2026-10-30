@@ -6,7 +6,7 @@ q = open(w + '/q.bin', 'rb').read()
 raw = open(w + '/e.raw', 'rb').read()
 i = raw.rfind(b'[exit=')
 e = raw[:i]
-blk, xo, vo, rx, rn, rf, rv, bo = map(int, open(w + '/layout.txt').read().split())
+blk, xo, vo, rx, rn, rf, rv, bo, rp = map(int, open(w + '/layout.txt').read().split())
 cases = open(w + '/cases.txt').read().split('\n')
 print(raw[i:].decode().strip(), 'sizes', len(q), len(e))
 bad = 0
@@ -19,7 +19,7 @@ for ci, text in enumerate(cases):
         print('emulator stopped before case', ci, text)
         bad += 1
         break
-    if a[rx:] != b[rx:]:
+    if a[rx:] != b[rx:] or False:
         bad += 1
         if bad <= 12:
             diffs = []
@@ -38,6 +38,10 @@ for ci, text in enumerate(cases):
                 y = b[rv + k * 16:rv + k * 16 + 16]
                 if x != y:
                     diffs.append('v%d q=%s e=%s' % (k, x[::-1].hex(), y[::-1].hex()))
+            if a[rp:rp + 34] != b[rp:rp + 34]:
+                pq = [int.from_bytes(a[rp + 2 * k:rp + 2 * k + 2], 'little') for k in range(17)]
+                pe = [int.from_bytes(b[rp + 2 * k:rp + 2 * k + 2], 'little') for k in range(17)]
+                diffs.append(' '.join('%s q=%04x e=%04x' % ('p%d' % k if k < 16 else 'ffr', pq[k], pe[k]) for k in range(17) if pq[k] != pe[k]))
             if a[bo:] != b[bo:]:
                 diffs.append('MEMORY q=%s e=%s' % (a[bo:bo + 160].hex(), b[bo:bo + 160].hex()))
             print('MISMATCH #%d: %s' % (ci, text))

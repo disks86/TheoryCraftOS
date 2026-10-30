@@ -39,6 +39,9 @@ class AArch64Cpu final : public IGuestCpu {
     Vec v[32];
     uint32_t fpcr = 0, fpsr = 0;
     uint64_t tpidr_el0 = 0;
+    // SVE at a vector length of 128 bits: Z0..Z31 are v[], a predicate has one bit per byte of the vector (16 bits), FFR is the first-fault register.
+    uint16_t p[16] = {};
+    uint16_t ffr = 0;
   };
   static constexpr uint32_t kN = 1u << 31, kZ = 1u << 30, kC = 1u << 29, kV = 1u << 28;
 
@@ -106,6 +109,15 @@ class AArch64Cpu final : public IGuestCpu {
   bool neon_by_element(uint32_t insn, Step* result);      // AArch64NeonElement.cpp
   bool neon_two_register(uint32_t insn, Step* result);    // AArch64NeonTwo.cpp
   bool neon_three_different(uint32_t insn, Step* result);      // AArch64NeonDiff.cpp      // AArch64NeonShift.cpp; these return false when the instruction is not of their class
+  // SVE (AArch64Sve*.cpp); each returns false when the word is not of its class, and sve() then raises an undefined-instruction fault.
+  Step sve(GuestMemory& m, uint32_t insn);
+  bool sve_integer(uint32_t insn);          // 0x04: integer arithmetic, reductions, shifts, counting, index
+  bool sve_permute(uint32_t insn);          // 0x05: dup, permutes, select, table lookup, last/first element
+  bool sve_predicate(uint32_t insn);        // 0x24 / 0x25: compares, predicate logic, while, counts, immediates
+  bool sve2(uint32_t insn);                 // 0x44 / 0x45: SVE2 integer
+  bool sve_float(uint32_t insn);            // 0x64 / 0x65: floating point
+  Step sve_memory(GuestMemory& m, uint32_t insn);      // 0x84 .. 0xE5: loads and stores
+  void sve_set_flags(uint16_t mask, uint16_t result, uint32_t esz);      // PredTest
   bool crypto(uint32_t insn, Step* result);      // AArch64Crypto.cpp: AES, SHA, SM3, SM4 and pmull; false when the instruction is not one of them
 
   // floating point helpers (AArch64Fp.cpp)
