@@ -123,26 +123,29 @@ uint32_t DellWmiHotkeys::scan() {
 
 void DellWmiHotkeys::on_notify(acpi::Node* device, uint32_t value) {
   if (!sink_) return;
-  for (uint32_t d = 0; d < count_; ++d) {
-    if (devices_[d].node != device || devices_[d].notify_id != value) continue;
-    acpi::Node* wed = vm_.find("_WED", device);
-    if (!wed || vm_.parent(wed) != device) return;
-    acpi::Value argument;
-    argument.kind = acpi::ValueKind::Integer;
-    argument.integer = value;
-    acpi::Value result;
-    uint8_t copy[128];
-    uint32_t size = 0;
-    if (!vm_.evaluate(wed, &argument, 1, &result) || result.kind != acpi::ValueKind::Buffer || !result.bytes) return;
-    size = result.length < sizeof copy ? result.length : sizeof copy;
-    for (uint32_t i = 0; i < size; ++i) copy[i] = result.bytes[i];
-    uint8_t keys[8];
-    const uint32_t n = dell_wmi_decode(ConstByteView(copy, size), keys, 8);
-    for (uint32_t i = 0; i < n; ++i) {
-      if (!brightness_ && (keys[i] == key::kBrightnessUp || keys[i] == key::kBrightnessDown)) continue;
-      sink_(context_, keys[i]);
+  uint8_t keys[8];
+  uint32_t n = 0;
+  {
+    kernel::ScopedRecursiveMutex guard(vm_.mutex());     // _WED's buffer is copied before anything else can evaluate
+    for (uint32_t d = 0; d < count_ && n == 0; ++d) {
+      if (devices_[d].node != device || devices_[d].notify_id != value) continue;
+      acpi::Node* wed = vm_.find("_WED", device);
+      if (!wed || vm_.parent(wed) != device) return;
+      acpi::Value argument;
+      argument.kind = acpi::ValueKind::Integer;
+      argument.integer = value;
+      acpi::Value result;
+      uint8_t copy[128];
+      if (!vm_.evaluate(wed, &argument, 1, &result) || result.kind != acpi::ValueKind::Buffer || !result.bytes) return;
+      const uint32_t size = result.length < sizeof copy ? result.length : sizeof copy;
+      for (uint32_t i = 0; i < size; ++i) copy[i] = result.bytes[i];
+      n = dell_wmi_decode(ConstByteView(copy, size), keys, 8);
+      break;
     }
-    return;
+  }
+  for (uint32_t i = 0; i < n; ++i) {                      // (the keys are acted on without the interpreter held: they post notices and change the brightness)
+    if (!brightness_ && (keys[i] == key::kBrightnessUp || keys[i] == key::kBrightnessDown)) continue;
+    sink_(context_, keys[i]);
   }
 }
 

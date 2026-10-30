@@ -29,6 +29,7 @@ bool EmbeddedController::wait(uint8_t mask, bool set) {
 }
 
 bool EmbeddedController::read(uint8_t address, uint8_t* value) {
+  kernel::ScopedMutex guard(mutex_);
   if (!configured() || broken()) return false;
   // An answer left over from an earlier event would be taken for ours.
   for (int i = 0; i < 16 && (ports_.in8(command_port_) & kStatusOutputFull); ++i) ports_.in8(data_port_);
@@ -53,6 +54,7 @@ bool EmbeddedController::status(uint8_t* value) {
 }
 
 bool EmbeddedController::query(uint8_t* event) {
+  kernel::ScopedMutex guard(mutex_);
   if (!configured() || broken()) return false;
   for (int i = 0; i < 16 && (ports_.in8(command_port_) & kStatusOutputFull); ++i) ports_.in8(data_port_);
   bool ok = wait(kStatusInputFull, false);
@@ -66,6 +68,7 @@ bool EmbeddedController::query(uint8_t* event) {
 }
 
 bool EmbeddedController::write(uint8_t address, uint8_t value) {
+  kernel::ScopedMutex guard(mutex_);
   if (!configured() || broken()) return false;
   for (int i = 0; i < 16 && (ports_.in8(command_port_) & kStatusOutputFull); ++i) ports_.in8(data_port_);
   bool ok = wait(kStatusInputFull, false);

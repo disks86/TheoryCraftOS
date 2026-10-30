@@ -159,6 +159,7 @@ bool AcpiBattery::initialize(const AcpiTables& acpi) {
 }
 
 BatteryStatus AcpiBattery::read() {
+  kernel::ScopedMutex guard(read_mutex_);
   BatteryStatus out;
   if (battery_count_ == 0) return out;
   uint64_t remaining = 0, full = 0;

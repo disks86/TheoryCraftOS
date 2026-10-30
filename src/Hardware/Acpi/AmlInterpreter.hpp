@@ -27,6 +27,7 @@
 #pragma once
 #include <stdint.h>
 #include "Allocators/IAllocator.hpp"
+#include "Kernel/Sync.hpp"
 #include "Utility/ArrayView.hpp"
 
 namespace acpi {
@@ -99,6 +100,10 @@ class AmlInterpreter {
   // The namespace node at an absolute path such as "\\_SB.PCI0.BAT0" (or a name relative to `scope`, searched upwards like AML does), or nullptr.
   Node* find(const char* path, Node* scope = nullptr) const;
   Node* root() const;
+
+  // The interpreter runs one evaluation at a time: evaluate(), evaluate_integer(), device_has_id() and load_table() take this lock themselves. A caller that uses what evaluate()
+  // returned (a package, a buffer: valid until the next evaluation) holds it for the evaluation and for the use, or another thread's evaluation can overwrite the value.
+  kernel::RecursiveMutex& mutex();
 
   // Reads the named value or runs the method. `result` (may be nullptr) is valid until the next evaluate().
   bool evaluate(Node* node, const Value* arguments, uint32_t argument_count, Value* result);
