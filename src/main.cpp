@@ -1818,6 +1818,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
           tb_seen = tb_arrived;
           tb_idle = 0;
           thunderbolt->poll();
+          if (thunderbolt->usb4()) thunderbolt->usb4()->tick(hardware::uptime_us() / 1000);       // (the bandwidth groups' timers)
           if (thunderbolt_net) thunderbolt_net->poll();
         }
 #ifdef TCOS_THUNDERBOLT_RUNTIME_PM
