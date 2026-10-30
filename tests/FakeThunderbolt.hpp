@@ -92,6 +92,13 @@ class FakeNhi final : public hardware::ITbRegisters {
   uint32_t unreadable_root_reads = 0;        // root router reads that fail with an error packet first
   uint32_t error_code = 0;                   // set: answer configuration requests with this error code
   uint64_t route_answer = 0x0000000000000001ull;
+  bool answer_get_route = true;
+  // GET_TOPOLOGY: one entry per router, answered in as many packets
+  struct Router { uint64_t route = 0; bool used = true; uint8_t upstream = 0; uint32_t ports[16] = {}; };
+  std::vector<Router> topology;
+  bool answer_topology = true, topology_reversed = false;
+  int topology_drop = -1;                    // a packet that is not sent
+  uint32_t topology_total_override = 0;      // what the packets say the total is (0: the real number)
 
   // what the host did
   std::vector<uint32_t> mailbox_commands;
@@ -286,7 +293,22 @@ class FakeNhi final : public hardware::ITbRegisters {
       std::vector<uint32_t> out(w.begin(), w.begin() + 6);
       out[0] = 4u | ((approve_error ? 1u : 0u) << 8) | (1u << 24);
       reply(kIcmResponse, out);
+    } else if (code == 1) {
+      if (!answer_topology) return;
+      const uint32_t total = topology_total_override ? topology_total_override : static_cast<uint32_t>(topology.size());
+      for (uint32_t k = 0; k < topology.size(); ++k) {
+        const uint32_t i = topology_reversed ? static_cast<uint32_t>(topology.size()) - 1 - k : k;
+        if (static_cast<int>(i) == topology_drop) continue;
+        std::vector<uint32_t> out(38, 0);
+        out[0] = 1u | (i << 16) | (total << 24);
+        out[1] = static_cast<uint32_t>(topology[i].route);
+        out[2] = static_cast<uint32_t>(topology[i].route >> 32);
+        out[3] = (topology[i].used ? 1u : 0u) | (uint32_t(topology[i].upstream) << 1) | (i << 24);
+        for (int port = 0; port < 16; ++port) out[6 + port] = topology[i].ports[port];
+        reply(kIcmResponse, out);
+      }
     } else if (code == 0xA && w.size() >= 2) {
+      if (!answer_get_route) return;
       reply(kIcmResponse, {0xAu | (1u << 24), w[1], static_cast<uint32_t>(route_answer >> 32), static_cast<uint32_t>(route_answer)});
     }
   }

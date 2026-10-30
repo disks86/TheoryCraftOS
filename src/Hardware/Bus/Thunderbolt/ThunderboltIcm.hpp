@@ -44,6 +44,7 @@ constexpr uint32_t kFlagSecurityShift = 3, kFlagSecurityMask = 3u << 3;
 constexpr uint16_t kLinkMask = 0x7, kDepthMask = 0xF0, kApproved = 1u << 8, kRejected = 1u << 9, kBoot = 1u << 10;
 constexpr uint32_t kDepthShift = 4;
 // the sizes of the structures
+constexpr uint32_t kTopologyBytes = 152, kTopologyPackets = 14, kPortTypePort = 1;
 constexpr uint32_t kHeaderBytes = 4, kDriverReadyBytes = 4, kDriverReadyResponseBytes = 8, kApproveBytes = 24, kGetRouteBytes = 8, kGetRouteResponseBytes = 16, kDeviceConnectedMinBytes = 24,
                    kDeviceDisconnectedBytes = 8;
 }  // namespace tb_icm
@@ -67,7 +68,23 @@ struct TbDevice {
   TbSecurityLevel security = TbSecurityLevel::Unknown;
 };
 
+// One router of the topology the firmware reports (one GET_TOPOLOGY packet each; the packet's number is the router's index, the host is 0).
+struct TbTopologySwitch {
+  bool used = false;
+  uint8_t upstream_port = 0, switch_index = 0;
+  uint64_t route = 0;
+  uint32_t ports[16] = {};         // type in the low 24 bits (1: a lane port), the index of the router behind it in the top 8 (0xFF: none)
+  // The index of the router behind port `port`, or 0 if there is none (the host is 0 and is never behind a port).
+  uint32_t behind(uint32_t port) const {
+    if (port >= 16 || (ports[port] & 0xFFFFFF) != 1) return 0;
+    const uint32_t index = ports[port] >> 24;
+    return index != 0xFF ? index : 0;
+  }
+};
+
 namespace tb_icm {
+uint32_t build_get_topology(ByteView out);
+bool parse_topology_packet(ConstByteView packet, TbTopologySwitch* out);
 uint32_t build_driver_ready(ByteView out);
 bool parse_driver_ready(ConstByteView response, TbDriverReady* out);
 uint32_t build_approve_device(const TbDevice& device, ByteView out);
@@ -103,7 +120,7 @@ class ThunderboltIcm final : public IThunderboltEvents {
   };
   static constexpr uint32_t kRequestTimeoutUs = 5000000, kApproveTimeoutUs = 10000000, kRetries = 3, kMaxDevices = 32;
 
-  ThunderboltIcm(ITbRegisters& registers, allocators::IAllocator& allocator) : nhi_(registers), control_(nhi_, allocator), devices_(allocator) {}
+  ThunderboltIcm(ITbRegisters& registers, allocators::IAllocator& allocator) : allocator_(allocator), nhi_(registers), control_(nhi_, allocator), devices_(allocator) {}
   ~ThunderboltIcm() { stop(); }
   ThunderboltIcm(const ThunderboltIcm&) = delete;
   ThunderboltIcm& operator=(const ThunderboltIcm&) = delete;
@@ -133,6 +150,10 @@ class ThunderboltIcm final : public IThunderboltEvents {
   bool approve(uint64_t index, const char** error);
   // The route string of the device (ICM_GET_ROUTE).
   bool route(uint64_t index, uint64_t* route);
+  // The topology the firmware reports (GET_TOPOLOGY, an answer of up to 14 packets): `out` gets one entry per packet.
+  bool topology(List<TbTopologySwitch>& out);
+  // The route string of the router at `link` and `depth`, found by walking that topology (icm_fr_get_route): the first router behind the link, then the next that follows in the index order.
+  static bool route_in_topology(const List<TbTopologySwitch>& switches, uint8_t link, uint8_t depth, uint64_t* route);
 
   TbNhi& nhi() { return nhi_; }
   TbControl& control() { return control_; }
@@ -145,6 +166,7 @@ class ThunderboltIcm final : public IThunderboltEvents {
   bool reset_physical_port(uint32_t physical_port);
   void remove_downstream(uint8_t link, uint8_t depth);
 
+  allocators::IAllocator& allocator_;
   TbNhi nhi_;
   TbControl control_;
   List<TbDevice> devices_;

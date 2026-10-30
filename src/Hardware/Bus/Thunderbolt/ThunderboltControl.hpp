@@ -93,6 +93,10 @@ class TbControl {
   // An ICM request: sent as an ICM command, answered by an ICM response with the same code (the first byte of the body). The response body is copied into `response`, which has to be
   // exactly as long as the response is expected to be. Events that arrive while waiting go to `events`.
   Result icm_request(ConstByteView request, ByteView response, uint32_t timeout_us, IThunderboltEvents* events);
+  // The same for an answer in several packets (GET_TOPOLOGY): up to `packets` responses of `packet_bytes` each, the packet with id n copied to `responses` at n * packet_bytes. Done when
+  // as many packets have come as the first of them says there are (they may arrive in any order); one that claims more than `packets`, or an id outside them, is not taken.
+  Result icm_request_packets(ConstByteView request, ByteView responses, uint32_t packet_bytes, uint32_t packets, uint32_t timeout_us, IThunderboltEvents* events,
+                              uint32_t* total_packets = nullptr);
   // Router configuration space (tb_cfg_read_raw / tb_cfg_write_raw): `words` 32 bit words at the word offset `offset` of `space` (of `port` for the port space) of the router at `route`.
   Result read_config(uint64_t route, uint32_t port, TbConfigSpace space, uint32_t offset, ArrayView<uint32_t> words, uint32_t timeout_us, ConfigError* error, IThunderboltEvents* events);
   Result write_config(uint64_t route, uint32_t port, TbConfigSpace space, uint32_t offset, ArrayView<const uint32_t> words, uint32_t timeout_us, ConfigError* error, IThunderboltEvents* events);
@@ -105,6 +109,7 @@ class TbControl {
     uint64_t route = 0;
     uint8_t seq = 0, code = 0;
     uint32_t expected_bytes = 0;
+    uint32_t packets = 1, total = 0, received_mask = 0;     // ICM answers of several packets
     ByteView out;
     Result result = Result::Timeout;
     ConfigError error;
