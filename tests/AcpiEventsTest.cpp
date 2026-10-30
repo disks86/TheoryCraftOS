@@ -30,6 +30,7 @@
 #include "Hardware/Backlight/AcpiVideoKeys.hpp"
 #include "Hardware/Backlight/IntelPchBacklight.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
+#include "Hardware/Power/Thermal.hpp"
 #include "Hardware/Sensor/AcpiAmbientLight.hpp"
 #include "Hardware/Sensor/SensorHub.hpp"
 
@@ -631,7 +632,36 @@ static void test_ambient_light() {
   CHECK(!none.initialize());
 }
 
+static Bytes thermal_zone(const char* n, const Bytes& body) { return cat({b({0x5B, 0x85}), pkg(cat({path(n), body}))}); }
+
+static void test_thermal_zones() {
+  // 3231 = 50.0 C, 3581 = 85.0 C, 3731 = 100.0 C (tenths of a Kelvin)
+  const Bytes tz0 = thermal_zone("TZ00", cat({name_def("TMPV", num(3231)), method("_TMP", 0, cat({b({0xA4}), path("TMPV")})), name_def("_PSV", num(3581)), name_def("_CRT", num(3731))}));
+  const Bytes tz1 = thermal_zone("TZ01", cat({method("_TMP", 0, cat({b({0xA4}), num(0)}))}));                  // (a reading that is not a temperature)
+  const Bytes no_tmp = thermal_zone("TZ02", name_def("_PSV", num(3581)));
+  const Bytes dsdt = make_table("DSDT", scope("\\_TZ", cat({tz0, tz1, no_tmp})));
+  const Bytes fadt = make_fadt();
+  const ConstByteView tables[1] = {ConstByteView(dsdt.data(), dsdt.size())};
+  TestAllocator alloc;
+  FakeHost host;
+  FakePorts ports;
+  AcpiEvents events(host, ports, alloc);
+  CHECK(events.initialize(tables, 1, ConstByteView(fadt.data(), fadt.size())));
+  Node* zones[4];
+  CHECK(AcpiThermalZone::find_zones(events.interpreter(), zones, 4) == 2);
+  AcpiThermalZone a(events.interpreter(), zones[0]), bad(events.interpreter(), zones[1]);
+  int32_t t = 0;
+  CHECK(a.read(&t) && t == 50000 && a.limits().passive_mc == 85000 && a.limits().critical_mc == 100000);
+  CHECK(!bad.read(&t) && bad.limits().passive_mc == -1 && bad.limits().critical_mc == -1);
+  struct Cooler : IThermalActuator { uint32_t last = 100; bool set_ceiling_percent(uint32_t p) override { last = p; return true; } } cooler;
+  ThermalManager manager(&cooler);
+  CHECK(manager.add(&a) && manager.add(&bad));
+  manager.poll(0);
+  CHECK(manager.hottest_millicelsius() == 50000 && cooler.last == 100 && !manager.critical());
+}
+
 int main() {
+  test_thermal_zones();
   test_ambient_light();
   test_dell_wmi();
   test_backlight();

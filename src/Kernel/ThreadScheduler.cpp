@@ -121,7 +121,17 @@ void stop_tick() { apic::stop_timer(); }
 void ack_tick() { apic::eoi(); }
 void ack_wakeup() { apic::eoi(); }
 [[noreturn]] void halt_forever() { for (;;) __asm__ volatile("cli; hlt"); }
-void idle_wait() { __asm__ volatile("sti; hlt"); }
+uint32_t g_idle_mwait_hint = 0xFFFFFFFFu;
+void idle_wait() {
+  const uint32_t hint = __atomic_load_n(&g_idle_mwait_hint, __ATOMIC_RELAXED);
+  if (hint == 0xFFFFFFFFu) {
+    __asm__ volatile("sti; hlt");
+    return;
+  }
+  Core* c = this_core();
+  __asm__ volatile("monitor" ::"a"(&c->parked), "c"(0), "d"(0));       // (armed before the interrupts are on, so a wake-up in between ends the wait at once)
+  __asm__ volatile("sti; mwait" ::"a"(hint), "c"(1) : "memory");       // ECX 1: an interrupt ends the wait even with the flag masked
+}
 void start_tick(uint32_t hz) { apic::start_timer(hz); }
 // Makes `c` this core's record and returns what the firmware had there.
 uint64_t swap_core_pointer(Core* c) {
@@ -408,9 +418,27 @@ Frame* on_yield(Frame* frame, void*) {
   return result;
 }
 
+// Work for every core (run_on_every_core): the function, and the bit of each core that still has to run it.
+struct CoreWork {
+  void (*fn)(void*) = nullptr;
+  void* argument = nullptr;
+  uint64_t pending = 0;
+  uint32_t busy = 0;
+};
+CoreWork g_core_work;
+
+void run_core_work(Core* c) {
+  if (c->index >= 64) return;
+  const uint64_t bit = uint64_t{1} << c->index;
+  if (!(__atomic_load_n(&g_core_work.pending, __ATOMIC_ACQUIRE) & bit)) return;
+  g_core_work.fn(g_core_work.argument);
+  __atomic_fetch_and(&g_core_work.pending, ~bit, __ATOMIC_ACQ_REL);
+}
+
 Frame* on_wakeup(Frame* frame, void*) {
   ack_wakeup();
   Core* c = this_core();
+  run_core_work(c);
   __atomic_fetch_add(&c->kernel_entries, 1, __ATOMIC_SEQ_CST);
   if (g.stopping && c->index != g.boot_core) park_core(c);
   const uint64_t flags = lock_irq();
@@ -710,6 +738,41 @@ void set_current_user_context(uint64_t cr3, void* context) {
   irq_restore(flags);
 }
 #endif
+
+void set_idle_mwait_hint(uint32_t hint) {
+#if defined(__x86_64__)
+  __atomic_store_n(&g_idle_mwait_hint, hint, __ATOMIC_RELAXED);
+#else
+  (void)hint;
+#endif
+}
+
+bool run_on_every_core(void (*fn)(void*), void* argument, uint64_t timeout_us) {
+  if (!g.running) {
+    fn(argument);
+    return true;
+  }
+  while (__atomic_exchange_n(&g_core_work.busy, 1u, __ATOMIC_ACQUIRE)) yield();
+  const uint64_t flags = lock_irq();                                    // (this core stays this core while it is read and while the function runs)
+  Core* self = this_core();
+  const uint64_t others = online_core_mask() & ~(self->index < 64 ? uint64_t{1} << self->index : 0);
+  g_core_work.fn = fn;
+  g_core_work.argument = argument;
+  __atomic_store_n(&g_core_work.pending, others, __ATOMIC_RELEASE);
+  for (uint32_t i = 0; i < g.core_count && i < 64; ++i)
+    if (others & (uint64_t{1} << i)) send_wakeup(g.cores[i].apic_id);
+  fn(argument);
+  unlock_irq(flags);
+  uint64_t waited = 0;
+  while (__atomic_load_n(&g_core_work.pending, __ATOMIC_ACQUIRE) != 0 && waited < timeout_us) {
+    hardware::delay_us(50);
+    waited += 50;
+  }
+  const bool done = __atomic_load_n(&g_core_work.pending, __ATOMIC_ACQUIRE) == 0;
+  __atomic_store_n(&g_core_work.pending, 0, __ATOMIC_RELEASE);
+  __atomic_store_n(&g_core_work.busy, 0u, __ATOMIC_RELEASE);
+  return done;
+}
 
 uint64_t online_core_mask() {
   uint64_t mask = 0;
