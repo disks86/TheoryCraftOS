@@ -20,6 +20,7 @@ int main() {
     process::ProgramStart start;
     start.arch = process::UserArch::AArch64; start.entry = 0x10000; start.stack_pointer = 0x21000;
     cpu.reset(start);
+    cpu.state().streaming = cpu.state().za_enabled = true;      // (so that SME instructions are not rejected for the mode they run in)
     GuestMemory m(space);
     const StopReason r = cpu.run(m, 1);
     uint8_t out = 0;

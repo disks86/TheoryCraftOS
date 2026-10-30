@@ -34,14 +34,14 @@ enum class PathStyle : uint8_t {
   Posix,      // "/", names are bytes (UTF-8), case counts as the file system says
   Windows,    // "C:\dir\file", "\\??\\C:\dir\file" (NT), either slash, drive C only, no < > : " | ? * in names
 };
-enum class PathResult : uint8_t { Ok, Empty, TooLong, Invalid };
+enum class PathResult : uint8_t { Ok, Empty, TooLong, Invalid, UnknownDrive };
 constexpr uint64_t kMaxPath = 4096;
 
 // Makes `path` absolute against `cwd` (both in the cleaned form this function produces: "/" or "/a/b") and cleans it. `*out` is the cleaned virtual path.
 PathResult resolve_path(PathStyle style, StringView cwd, StringView path, String* out);
 
 // What a descriptor (Linux file descriptor, Windows handle) refers to.
-enum class DescriptorKind : uint8_t { Closed, ConsoleInput, ConsoleOutput, ConsoleError, File, Directory, Null, Zero, Random, Thread, Event, Mutex, Semaphore, Process, Pipe, Timer, Section, Job, Socket, ChangeNotification, Mailslot, Key };
+enum class DescriptorKind : uint8_t { Closed, ConsoleInput, ConsoleOutput, ConsoleError, File, Directory, Null, Zero, Random, Thread, Event, Mutex, Semaphore, Process, Pipe, Timer, Section, Job, Socket, ChangeNotification, Mailslot, Key, MountManager, DebugObject };
 
 // How open() treats the path. (The Linux O_* and Windows dispositions both reduce to these.)
 struct OpenFlags {

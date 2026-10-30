@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Process/WindowsObjects.hpp"
+#include "Process/WindowsDebug.hpp"
 #include "Process/WindowsMemory.hpp"
 #include "Process/ModuleLoader.hpp"
 #include "Executable/PeFile.hpp"
@@ -38,7 +39,7 @@ constexpr uint64_t kUnixToNt = 11644473600ull * 10000000ull;
 constexpr uint64_t kCurrentProcess = ~uint64_t{0};
 constexpr uint32_t kMaxWait = 64;
 
-bool is_object_kind(DescriptorKind k) { return k == DescriptorKind::Event || k == DescriptorKind::Mutex || k == DescriptorKind::Semaphore || k == DescriptorKind::Process || k == DescriptorKind::Timer || k == DescriptorKind::Section || k == DescriptorKind::Job || k == DescriptorKind::ChangeNotification; }
+bool is_object_kind(DescriptorKind k) { return k == DescriptorKind::Event || k == DescriptorKind::Mutex || k == DescriptorKind::Semaphore || k == DescriptorKind::Process || k == DescriptorKind::Timer || k == DescriptorKind::Section || k == DescriptorKind::Job || k == DescriptorKind::ChangeNotification || k == DescriptorKind::DebugObject; }
 DescriptorKind descriptor_kind_of(ObjectKind k) {
   switch (k) {
     case ObjectKind::Event: return DescriptorKind::Event;
@@ -48,6 +49,7 @@ DescriptorKind descriptor_kind_of(ObjectKind k) {
     case ObjectKind::Section: return DescriptorKind::Section;
     case ObjectKind::Job: return DescriptorKind::Job;
     case ObjectKind::ChangeNotification: return DescriptorKind::ChangeNotification;
+    case ObjectKind::DebugObject: return DescriptorKind::DebugObject;
     default: return DescriptorKind::Semaphore;
   }
 }
@@ -809,6 +811,16 @@ uint32_t nt_query_section(Process& p, const SyscallRequest& r) {
   return kSuccess;
 }
 uint32_t nt_create_job_object(Process& p, const SyscallRequest& r) { return create_object(p, r, ObjectKind::Job, false, false, 0, 0); }
+// NtCreateDebugObject(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, ULONG Flags): the flags are DEBUG_KILL_ON_CLOSE (1) only.
+uint32_t nt_create_debug_object(Process& p, const SyscallRequest& r) {
+  const uint32_t flags = uint32_t(r.args[3]);
+  if (flags & ~uint32_t{1}) return kInvalidParameter;
+  const uint32_t status = create_object(p, r, ObjectKind::DebugObject, false, false, 0, 0);
+  if (status != kSuccess) return status;
+  uint64_t handle = 0, slot = 0;
+  if (p.read_user_u64(r.args[0], &handle) && slot_of(handle, &slot)) debug_note_created(uint32_t(p.files().token(slot)), flags);
+  return status;
+}
 uint32_t nt_open_job_object(Process& p, const SyscallRequest& r) { return open_object(p, r, ObjectKind::Job); }
 
 namespace {
@@ -1077,6 +1089,7 @@ uint32_t nt_query_object(Process& p, const SyscallRequest& r) {
         case DescriptorKind::Timer: type = "Timer"; break;
         case DescriptorKind::Section: type = "Section"; break;
         case DescriptorKind::Job: type = "Job"; break;
+        case DescriptorKind::DebugObject: type = "DebugObject"; break;
         case DescriptorKind::ChangeNotification: type = "ChangeNotification"; break;
         case DescriptorKind::Mailslot: type = "Mailslot"; break;
         case DescriptorKind::Key: type = "Key"; break;

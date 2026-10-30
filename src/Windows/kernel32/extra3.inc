@@ -1196,26 +1196,110 @@ EXPORT BOOL WINAPI SetInformationJobObject(HANDLE job, int info_class, LPVOID in
   return NT_SUCCESS(s) ? TRUE : fail_nt(s);
 }
 
-/* Debugging another program is not possible: a program cannot attach to itself, and with nothing attached there are no events. As on Windows, the first failed attach
- * leaves a debug object behind, which makes WaitForDebugEvent time out instead of failing on the handle. */
-static int g_debug_object_made;
+/* ---- debugging ----------------------------------------------------------------------------------------------------------------------------------------------- */
+
+/* The DEBUG_EVENT of the debugger API, made from the DBGUI_WAIT_STATE_CHANGE the kernel gives (see src/Process/WindowsDebug.hpp). */
+typedef struct {
+  DWORD dwDebugEventCode, dwProcessId, dwThreadId, pad;
+  union {
+    struct { EXCEPTION_RECORD ExceptionRecord; DWORD dwFirstChance; } Exception;
+    struct { HANDLE hThread; LPVOID lpThreadLocalBase; LPVOID lpStartAddress; } CreateThread;
+    struct { HANDLE hFile, hProcess, hThread; LPVOID lpBaseOfImage; DWORD dwDebugInfoFileOffset, nDebugInfoSize; LPVOID lpThreadLocalBase, lpStartAddress, lpImageName; WORD fUnicode; } CreateProcessInfo;
+    struct { DWORD dwExitCode; } ExitThread;
+    struct { DWORD dwExitCode; } ExitProcess;
+    struct { HANDLE hFile; LPVOID lpBaseOfDll; DWORD dwDebugInfoFileOffset, nDebugInfoSize; LPVOID lpImageName; WORD fUnicode; } LoadDll;
+    struct { LPVOID lpBaseOfDll; } UnloadDll;
+    struct { LPSTR lpDebugStringData; WORD fUnicode, nDebugStringLength; } DebugString;
+    BYTE bytes[0xA0];
+  } u;
+} TCOS_DEBUG_EVENT;   /* (0xB0 bytes, as DEBUG_EVENT) */
+
+static BOOL wait_debug_event(TCOS_DEBUG_EVENT *event, DWORD milliseconds) {
+  HANDLE object = DbgUiGetThreadDebugObject();
+  if (!object) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
+  BYTE state[0xC0];
+  LARGE_INTEGER timeout;
+  timeout.QuadPart = -(LONGLONG)milliseconds * 10000;
+  NTSTATUS status;
+  do status = NtWaitForDebugEvent(object, FALSE, milliseconds == INFINITE ? NULL : &timeout, state); while (status == STATUS_USER_APC);
+  if (status == (NTSTATUS)0x102) { set_error(121 /* ERROR_SEM_TIMEOUT */); return FALSE; }
+  if (!NT_SUCCESS(status)) return fail_nt(status);
+  memset(event, 0, sizeof(*event));
+  event->dwProcessId = (DWORD)*(ULONG64 *)(state + 8);
+  event->dwThreadId = (DWORD)*(ULONG64 *)(state + 16);
+  switch (*(DWORD *)state) {
+    case 2:      /* DbgCreateThread */
+      event->dwDebugEventCode = 2;
+      event->u.CreateThread.hThread = *(HANDLE *)(state + 0x18);
+      event->u.CreateThread.lpStartAddress = *(LPVOID *)(state + 0x28);
+      break;
+    case 3:      /* DbgCreateProcess */
+      event->dwDebugEventCode = 3;
+      event->u.CreateProcessInfo.hProcess = *(HANDLE *)(state + 0x18);
+      event->u.CreateProcessInfo.hThread = *(HANDLE *)(state + 0x20);
+      event->u.CreateProcessInfo.lpBaseOfImage = *(LPVOID *)(state + 0x38);
+      event->u.CreateProcessInfo.lpStartAddress = *(LPVOID *)(state + 0x50);
+      break;
+    case 4: event->dwDebugEventCode = 4; event->u.ExitThread.dwExitCode = *(DWORD *)(state + 0x18); break;
+    case 5: event->dwDebugEventCode = 5; event->u.ExitProcess.dwExitCode = *(DWORD *)(state + 0x18); break;
+    case 6: {      /* DbgException */
+      EXCEPTION_RECORD *record = (EXCEPTION_RECORD *)(state + 0x18);
+      if (record->ExceptionCode == 0x40010006u && record->NumberParameters >= 2) {      /* DBG_PRINTEXCEPTION_C: OutputDebugString */
+        event->dwDebugEventCode = 8;
+        event->u.DebugString.lpDebugStringData = (LPSTR)record->ExceptionInformation[1];
+        event->u.DebugString.nDebugStringLength = (WORD)record->ExceptionInformation[0];
+      } else {
+        event->dwDebugEventCode = 1;
+        event->u.Exception.ExceptionRecord = *record;
+        event->u.Exception.dwFirstChance = *(DWORD *)(state + 0xB0);
+      }
+      break;
+    }
+    case 9: event->dwDebugEventCode = 6; event->u.LoadDll.lpBaseOfDll = *(LPVOID *)(state + 0x20); break;
+    case 10: event->dwDebugEventCode = 7; event->u.UnloadDll.lpBaseOfDll = *(LPVOID *)(state + 0x18); break;
+    default: event->dwDebugEventCode = 0xFFFFFFFFu; break;
+  }
+  return TRUE;
+}
+EXPORT BOOL WINAPI WaitForDebugEvent(LPVOID event, DWORD milliseconds) { return wait_debug_event((TCOS_DEBUG_EVENT *)event, milliseconds); }
+EXPORT BOOL WINAPI WaitForDebugEventEx(LPVOID event, DWORD milliseconds) { return wait_debug_event((TCOS_DEBUG_EVENT *)event, milliseconds); }
+EXPORT BOOL WINAPI ContinueDebugEvent(DWORD process_id, DWORD thread_id, DWORD status) {
+  HANDLE object = DbgUiGetThreadDebugObject();
+  if (!object) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
+  ULONG64 id[2] = {process_id, thread_id};
+  const NTSTATUS result = NtDebugContinue(object, id, (NTSTATUS)status);
+  return NT_SUCCESS(result) ? TRUE : fail_nt(result);
+}
 EXPORT BOOL WINAPI DebugActiveProcess(DWORD id) {
-  (void)id;
-  g_debug_object_made = 1;
-  SetLastError(ERROR_ACCESS_DENIED);
-  return FALSE;
+  HANDLE process = OpenProcess(0x1FFFFF, FALSE, id);
+  if (!process) return FALSE;
+  NTSTATUS status = DbgUiConnectToDbg();
+  if (NT_SUCCESS(status)) status = NtDebugActiveProcess(process, DbgUiGetThreadDebugObject());
+  if (NT_SUCCESS(status)) {
+    status = DbgUiIssueRemoteBreakin(process);
+    if (!NT_SUCCESS(status)) NtRemoveProcessDebug(process, DbgUiGetThreadDebugObject());
+  }
+  NtClose(process);
+  return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
 EXPORT BOOL WINAPI DebugActiveProcessStop(DWORD id) {
-  (void)id;
-  SetLastError(ERROR_ACCESS_DENIED);
-  return FALSE;
+  HANDLE process = OpenProcess(0x1FFFFF, FALSE, id);
+  if (!process) return FALSE;
+  const NTSTATUS status = NtRemoveProcessDebug(process, DbgUiGetThreadDebugObject());
+  NtClose(process);
+  return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
-EXPORT BOOL WINAPI WaitForDebugEvent(LPVOID event, DWORD milliseconds) {
-  (void)event; (void)milliseconds;
-  SetLastError(g_debug_object_made ? 121 : ERROR_INVALID_HANDLE);
-  return FALSE;
+EXPORT BOOL WINAPI DebugSetProcessKillOnExit(BOOL kill) {
+  HANDLE object = DbgUiGetThreadDebugObject();
+  if (!object) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
+  ULONG flags = kill ? 1 : 0;
+  const NTSTATUS status = NtSetInformationDebugObject(object, 1, &flags, sizeof(flags), NULL);
+  return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
-EXPORT BOOL WINAPI WaitForDebugEventEx(LPVOID event, DWORD milliseconds) { return WaitForDebugEvent(event, milliseconds); }
+EXPORT BOOL WINAPI DebugBreakProcess(HANDLE process) {
+  const NTSTATUS status = DbgUiIssueRemoteBreakin(process);
+  return NT_SUCCESS(status) ? TRUE : fail_nt(status);
+}
 
 /* ---- delay-loaded imports -------------------------------------------------------------------------------------------------------------------------- */
 

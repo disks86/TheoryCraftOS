@@ -30,6 +30,9 @@
 #include "FileSystem/Ram/RamFileSystem.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltKeys.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltNet.hpp"
+#include "Hardware/Bus/Thunderbolt/ThunderboltNvm.hpp"
+#include "Hardware/Bus/Thunderbolt/Usb4Domain.hpp"
+#include "FakeUsb4.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltXdomain.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltControl.hpp"
 #include "Hardware/Bus/Pci/PciMsix.hpp"
@@ -80,7 +83,7 @@ static std::vector<uint8_t> as_bytes(const std::vector<uint32_t>& words) {
 static void test_devices() {
   CHECK(tb_find_nhi(0x8086, 0x15BF) && tb_find_nhi(0x8086, 0x15D2) && tb_find_nhi(0x8086, 0x15D9) && tb_find_nhi(0x8086, 0x15DC));
   CHECK(tb_find_nhi(0x8086, 0x15BF)->generation == TbGeneration::AlpineRidge);
-  CHECK(tb_find_nhi(0x8086, 0x15EB) && tb_find_nhi(0x8086, 0x15E8) && tb_find_nhi(0x8086, 0x15EB)->generation == TbGeneration::TitanRidge && !tb_find_nhi(0x8086, 0x15EA) && !tb_find_nhi(0x8086, 0x9A1B) && !tb_find_nhi(0x10DE, 0x15BF) && !tb_find_nhi(0x8086, 0));
+  CHECK(tb_find_nhi(0x8086, 0x15EB) && tb_find_nhi(0x8086, 0x15E8) && tb_find_nhi(0x8086, 0x15EB)->generation == TbGeneration::TitanRidge && !tb_find_nhi(0x8086, 0x15EA) && !tb_find_nhi(0x10DE, 0x15BF) && !tb_find_nhi(0x8086, 0));
 }
 
 static void test_framing() {
@@ -2009,6 +2012,51 @@ static void test_net() {
 
 
 
+// The data rings take part in the interrupts: with MSI-X their two bits go to the table entry the control channel uses, with a single MSI they are only unmasked, and without interrupts they stay polled.
+static void test_net_interrupts() {
+  using namespace hardware::tb_reg;
+  {
+    NetFixture f;
+    CHECK(f.icm.use_interrupts(true, 3));
+    f.bring_up();
+    CHECK(f.net->connected());
+    // (12 hops: the transmit ring of hop 1 is bit 1, the receive ring of hop 1 is bit 13; each ring's slot in the allocation has 4 bits, 8 slots to a register)
+    CHECK(f.chip.unmasked[0] & (1u << 1));
+    CHECK(f.chip.unmasked[0] & (1u << 13));
+    CHECK(((f.chip.read32(kIntVecAllocBase) >> 4) & 0xF) == 3 && ((f.chip.read32(kIntVecAllocBase + 4) >> 20) & 0xF) == 3);
+    // a frame for us raises the interrupt through the data ring's bit
+    uint32_t raised = f.chip.interrupts_raised;
+    f.chip.peer_send(ethernet(100, 1), 0);
+    CHECK(f.chip.interrupts_raised > raised);
+    // closing masks them again, before the hops are released
+    f.chip.peer_logout(f.remote, f.local, 0x01, 6);
+    f.step();
+    CHECK(!f.net->connected() && !(f.chip.unmasked[0] & (1u << 1)) && !(f.chip.unmasked[0] & (1u << 13)) && (f.chip.unmasked[0] & (1u << 0)));
+    CHECK(((f.chip.read32(kIntVecAllocBase) >> 4) & 0xF) == 0);
+  }
+  {   // two table entries: the data rings on their own
+    NetFixture f;
+    CHECK(f.icm.use_interrupts(true, 2, 5));
+    f.bring_up();
+    CHECK(f.net->connected() && ((f.chip.read32(kIntVecAllocBase) >> 4) & 0xF) == 5 && ((f.chip.read32(kIntVecAllocBase + 4) >> 20) & 0xF) == 5);   // data rings (bits 1 and 13) on entry 5
+    CHECK((f.chip.read32(kIntVecAllocBase) & 0xF) == 2 && ((f.chip.read32(kIntVecAllocBase + 4) >> 16) & 0xF) == 2);                                    // the control channel's (bits 0 and 12) on entry 2
+    CHECK(!f.icm.use_interrupts(true, 0, 16));
+  }
+  {   // a single MSI: unmasked, no vector allocation
+    NetFixture f;
+    CHECK(f.icm.use_interrupts(true));
+    f.bring_up();
+    CHECK(f.net->connected() && (f.chip.unmasked[0] & (1u << 1)) && (f.chip.unmasked[0] & (1u << 13)) && f.chip.read32(kIntVecAllocBase) == 0);
+  }
+  {   // no interrupts: polled, nothing unmasked; turning them on and off covers the data rings
+    NetFixture f;
+    f.bring_up();
+    CHECK(f.net->connected() && f.chip.unmasked[0] == 0);
+    CHECK(f.icm.use_interrupts(true, 0) && (f.chip.unmasked[0] & (1u << 0)));
+    CHECK(f.icm.use_interrupts(false) && f.chip.unmasked[0] == 0);
+  }
+}
+
 static void test_net_lifecycle() {
   // the other host logs out: the connection is closed (path and rings), and made again when it logs in
   {
@@ -2338,7 +2386,7 @@ static void test_msix() {
 
 static void test_ice_lake() {
   TestAllocator alloc;
-  CHECK(tb_find_nhi(0x8086, 0x8A17) && tb_find_nhi(0x8086, 0x8A0D) && tb_find_nhi(0x8086, 0x8A17)->generation == TbGeneration::IceLake && !tb_find_nhi(0x8086, 0x9A1B));
+  CHECK(tb_find_nhi(0x8086, 0x8A17) && tb_find_nhi(0x8086, 0x8A0D) && tb_find_nhi(0x8086, 0x8A17)->generation == TbGeneration::IceLake && tb_find_nhi(0x8086, 0x9A1B) && tb_find_nhi(0x8086, 0x9A1B)->generation == TbGeneration::Usb4 && tb_find_nhi(0x8086, 0xA833)->generation == TbGeneration::Usb4 && !tb_find_nhi(0x8086, 0x9A1C));
   // the power handling alone
   {
     fake_tb::FakeIclConfig config;
@@ -2457,6 +2505,664 @@ static void test_driver() {
   CHECK(alloc.dma.empty());
 }
 
+// ---- the preboot ACL
+
+static TbUuid acl_uuid(uint8_t seed, bool device = true) {
+  TbUuid u;
+  for (uint32_t i = 0; i < 8; ++i) u.bytes[i] = static_cast<uint8_t>(seed + i);
+  for (uint32_t i = 8; i < 16; ++i) u.bytes[i] = device ? 0xFF : 0x12;
+  return u;
+}
+
+static void test_boot_acl() {
+  uint8_t bytes[tb_icm::kPrebootAclBytes];
+  TbUuid list[3] = {acl_uuid(0x10), TbUuid(), acl_uuid(0x30)};
+  // the messages: 4 + 16 * 8 bytes, the write flag only on a write, an empty entry (and the rest of a short list) all ones
+  CHECK(tb_icm::build_preboot_acl(false, ArrayView<const TbUuid>(), ByteView(bytes, sizeof bytes)) == 132 && bytes[0] == 0x18 && bytes[1] == 0 && bytes[4] == 0xFF && bytes[131] == 0xFF);
+  CHECK(tb_icm::build_preboot_acl(true, ArrayView<const TbUuid>(list, 3), ByteView(bytes, sizeof bytes)) == 132 && bytes[0] == 0x18 && bytes[1] == 0x80);
+  CHECK(bytes[4] == 0x10 && bytes[11] == 0x17 && bytes[12] == 0xFF && bytes[19] == 0xFF && bytes[20] == 0x30 && bytes[28] == 0xFF && bytes[131] == 0xFF);
+  uint8_t small[100];
+  CHECK(tb_icm::build_preboot_acl(true, ArrayView<const TbUuid>(list, 3), ByteView(small, sizeof small)) == 0);                 // too small a buffer
+  const TbUuid not_a_device = acl_uuid(0x50, false);
+  CHECK(tb_icm::build_preboot_acl(true, ArrayView<const TbUuid>(&not_a_device, 1), ByteView(bytes, sizeof bytes)) == 0);          // the high half has to be ones
+  std::vector<TbUuid> too_many(17, acl_uuid(1));
+  CHECK(tb_icm::build_preboot_acl(true, ArrayView<const TbUuid>(too_many.data(), too_many.size()), ByteView(bytes, sizeof bytes)) == 0);
+  // reading an answer: ones and zeros are empty, the others get their high half
+  CHECK(tb_icm::build_preboot_acl(true, ArrayView<const TbUuid>(list, 3), ByteView(bytes, sizeof bytes)) == 132);
+  memset(&bytes[4 + 3 * 8], 0, 8);                                                                                             // (an all zero entry is empty too)
+  TbUuid got[16];
+  CHECK(tb_icm::parse_preboot_acl(ConstByteView(bytes, sizeof bytes), ArrayView<TbUuid>(got, 16)));
+  CHECK(memcmp(got[0].bytes, list[0].bytes, 16) == 0 && got[1].is_null() && memcmp(got[2].bytes, list[2].bytes, 16) == 0 && got[3].is_null() && got[15].is_null());
+  TbUuid few[2];
+  CHECK(tb_icm::parse_preboot_acl(ConstByteView(bytes, sizeof bytes), ArrayView<TbUuid>(few, 2)) && memcmp(few[0].bytes, list[0].bytes, 16) == 0);   // (only as many as asked for)
+  for (uint32_t cut = 0; cut < sizeof bytes; cut += 7) CHECK(!tb_icm::parse_preboot_acl(ConstByteView(bytes, cut), ArrayView<TbUuid>(got, 16)));    // truncated
+  for (uint32_t bit = 0; bit < sizeof bytes * 8; bit += 5) {                                                                   // bit flips never read outside or crash
+    uint8_t flipped[sizeof bytes];
+    memcpy(flipped, bytes, sizeof bytes);
+    flipped[bit / 8] ^= static_cast<uint8_t>(1u << (bit % 8));
+    tb_icm::parse_preboot_acl(ConstByteView(flipped, sizeof flipped), ArrayView<TbUuid>(got, 16));
+  }
+
+  // against the firmware: Alpine Ridge and Titan Ridge forms
+  for (const bool titan : {false, true}) {
+    TestAllocator alloc;
+    FakeNhi chip;
+    chip.titan_ridge = titan;
+    chip.boot_acl_entries = 16;
+    ThunderboltIcm icm(chip, alloc);
+    ThunderboltIcm::Options options;
+    options.generation = titan ? TbGeneration::TitanRidge : TbGeneration::AlpineRidge;
+    icm.set_options(options);
+    const char* error = nullptr;
+    TbUuid entries[16];
+    CHECK(!icm.get_boot_acl(ArrayView<TbUuid>(entries, 16), &error) && error);                                                // not started
+    CHECK(icm.start() == ThunderboltIcm::Outcome::Started && icm.driver_ready().boot_acl_entries == 16);
+    CHECK(icm.get_boot_acl(ArrayView<TbUuid>(entries, 16), &error));
+    for (const TbUuid& e : entries) CHECK(e.is_null());                                                                          // (a fresh firmware has none)
+    CHECK(icm.set_boot_acl(ArrayView<const TbUuid>(list, 3), &error) && chip.acl_writes == 1);
+    CHECK(chip.acl[0] == 0x13121110u && chip.acl[1] == 0x17161514u && chip.acl[2] == 0xFFFFFFFFu && chip.acl[4] == 0x33323130u && chip.acl[6] == 0xFFFFFFFFu);
+    TbUuid back[4];
+    CHECK(icm.get_boot_acl(ArrayView<TbUuid>(back, 4), &error) && memcmp(back[0].bytes, list[0].bytes, 16) == 0 && back[1].is_null() && memcmp(back[2].bytes, list[2].bytes, 16) == 0 && back[3].is_null());
+    CHECK(icm.set_boot_acl(ArrayView<const TbUuid>(), &error) && icm.get_boot_acl(ArrayView<TbUuid>(entries, 16), &error) && entries[0].is_null());     // cleared
+    CHECK(!icm.set_boot_acl(ArrayView<const TbUuid>(too_many.data(), 17), &error) && error);
+    CHECK(!icm.set_boot_acl(ArrayView<const TbUuid>(&not_a_device, 1), &error) && error);
+    chip.acl_error = true;
+    CHECK(!icm.get_boot_acl(ArrayView<TbUuid>(entries, 16), &error) && error && !icm.set_boot_acl(ArrayView<const TbUuid>(list, 3), &error));
+    chip.acl_error = false;
+    chip.answer_driver_ready = true;
+  }
+  {   // a firmware without one
+    TestAllocator alloc;
+    FakeNhi chip;
+    ThunderboltIcm icm(chip, alloc);
+    CHECK(icm.start() == ThunderboltIcm::Outcome::Started && icm.driver_ready().boot_acl_entries == 0);
+    const char* error = nullptr;
+    TbUuid entries[16];
+    CHECK(!icm.get_boot_acl(ArrayView<TbUuid>(entries, 16), &error) && error && !icm.set_boot_acl(ArrayView<const TbUuid>(entries, 1), &error));
+  }
+  {   // a shorter list than the firmware keeps is refused when it is longer than the firmware's
+    TestAllocator alloc;
+    FakeNhi chip;
+    chip.boot_acl_entries = 4;
+    ThunderboltIcm icm(chip, alloc);
+    CHECK(icm.start() == ThunderboltIcm::Outcome::Started);
+    const char* error = nullptr;
+    TbUuid five[5] = {acl_uuid(1), acl_uuid(2), acl_uuid(3), acl_uuid(4), acl_uuid(5)};
+    CHECK(!icm.set_boot_acl(ArrayView<const TbUuid>(five, 5), &error) && icm.set_boot_acl(ArrayView<const TbUuid>(five, 4), &error));
+    TbUuid out[16];
+    CHECK(icm.get_boot_acl(ArrayView<TbUuid>(out, 16), &error) && !out[3].is_null() && out[4].is_null());
+  }
+}
+
+// ---- the firmware update through the DMA port
+
+// An image the validation accepts: the digital section at 16 KiB, its size inside, the device id at +5, `size` bytes in all.
+static std::vector<uint8_t> nvm_image(uint32_t size, uint16_t device_id, uint32_t header = 0x4000) {
+  std::vector<uint8_t> image(size);
+  for (uint32_t i = 0; i < size; ++i) image[i] = static_cast<uint8_t>(i * 7 + (i >> 8));
+  image[0] = static_cast<uint8_t>(header);
+  image[1] = static_cast<uint8_t>(header >> 8);
+  image[2] = static_cast<uint8_t>(header >> 16);
+  image[3] = 0x55;                                   // (the top byte is not part of the pointer)
+  if (header + 6 >= size) return image;              // (a pointer that leads outside: nothing to fill in)
+  image[header] = 0x00;
+  image[header + 1] = 0x10;                          // the section is 4 KiB
+  image[header + 5] = static_cast<uint8_t>(device_id);
+  image[header + 6] = static_cast<uint8_t>(device_id >> 8);
+  return image;
+}
+
+static void test_nvm() {
+  // the image checks
+  {
+    uint32_t start = 0;
+    const std::vector<uint8_t> good = nvm_image(64 * 1024, 0x15EB);
+    CHECK(tb_nvm_validate_image(ConstByteView(good.data(), good.size()), 0x15EB, false, &start) && start == 0x4000);
+    CHECK(!tb_nvm_validate_image(ConstByteView(good.data(), good.size()), 0x15D9, false, &start));           // another controller's
+    CHECK(tb_nvm_validate_image(ConstByteView(good.data(), good.size()), 0x15D9, true, &start));            // (safe mode: any)
+    const std::vector<uint8_t> small = nvm_image(16 * 1024 + 16, 0x15EB);
+    CHECK(!tb_nvm_validate_image(ConstByteView(small.data(), small.size()), 0x15EB, false, &start));        // below the minimum size
+    const std::vector<uint8_t> unaligned = nvm_image(64 * 1024, 0x15EB, 0x4100);
+    CHECK(!tb_nvm_validate_image(ConstByteView(unaligned.data(), unaligned.size()), 0x15EB, false, &start));
+    const std::vector<uint8_t> outside = nvm_image(64 * 1024, 0x15EB, 0xFF000);
+    CHECK(!tb_nvm_validate_image(ConstByteView(outside.data(), outside.size()), 0x15EB, false, &start));
+    std::vector<uint8_t> edge = nvm_image(64 * 1024, 0x15EB, 0xC000);                                         // the section starts so near the end that the id is cut off
+    CHECK(tb_nvm_validate_image(ConstByteView(edge.data(), edge.size()), 0x15EB, true, &start));
+    std::vector<uint8_t> cut(good.begin(), good.begin() + 0x4005 + 2 - 1);
+    CHECK(!tb_nvm_validate_image(ConstByteView(cut.data(), cut.size()), 0x15EB, true, &start));              // (and below the minimum)
+    std::vector<uint8_t> cut_edge = nvm_image(32 * 1024, 0x15EB, 0x7000);
+    cut_edge.resize(0x7000 + 7);
+    CHECK(!tb_nvm_validate_image(ConstByteView(cut_edge.data(), cut_edge.size()), 0x15EB, true, &start));
+    std::vector<uint8_t> big_section = nvm_image(32 * 1024, 0x15EB);
+    big_section[0x4000] = 0xFF; big_section[0x4001] = 0xFF;                                                  // a section larger than the image
+    CHECK(!tb_nvm_validate_image(ConstByteView(big_section.data(), big_section.size()), 0x15EB, false, &start));
+    const std::vector<uint8_t> huge(1024 * 1024 + 4, 0);
+    CHECK(!tb_nvm_validate_image(ConstByteView(huge.data(), huge.size()), 0x15EB, false, &start) && !tb_nvm_validate_image(ConstByteView(), 0, true, nullptr));
+    // bit flips in the header never make it read outside
+    for (uint32_t bit = 0; bit < 64; ++bit) {
+      std::vector<uint8_t> f = good;
+      f[bit / 8] ^= static_cast<uint8_t>(1u << (bit % 8));
+      tb_nvm_validate_image(ConstByteView(f.data(), f.size()), 0x15EB, false, &start);
+    }
+  }
+  TestAllocator alloc;
+  auto make_chip = [](FakeNhi& chip) {
+    chip.flash.present = true;
+    chip.flash.active.resize(256 * 1024);
+    for (uint32_t i = 0; i < chip.flash.active.size(); ++i) chip.flash.active[i] = static_cast<uint8_t>(i * 13 + (i >> 9));
+    chip.flash.active[0x45] = 0x02;                  // one area: (1 MiB << 2) / 8 = 512 KiB, less the 16 KiB header, halved
+    chip.flash.active[0x46] = 0;
+    chip.flash.active[0x08] = 0;
+    chip.flash.active[0x09] = 0x2A;                  // minor 42
+    chip.flash.active[0x0A] = 0x17;                  // major 23
+    chip.flash.active[0x0B] = 0;
+  };
+  {   // finding the port, reading, the version
+    FakeNhi chip;
+    make_chip(chip);
+    ThunderboltIcm icm(chip, alloc);
+    CHECK(icm.start() == ThunderboltIcm::Outcome::Started);
+    TbDmaPort port(icm.control(), &icm);
+    uint8_t buffer[8];
+    CHECK(port.flash_read(0, ByteView(buffer, 4)) == TbNvmResult::NoDmaPort);                                 // (not found yet)
+    CHECK(port.find() == TbNvmResult::Ok && port.port() == 5);
+    for (uint32_t port_number : {3u, 7u}) {
+      FakeNhi other;
+      make_chip(other);
+      other.flash.port = port_number;
+      ThunderboltIcm other_icm(other, alloc);
+      CHECK(other_icm.start() == ThunderboltIcm::Outcome::Started);
+      TbDmaPort other_port(other_icm.control(), &other_icm);
+      CHECK(other_port.find() == TbNvmResult::Ok && other_port.port() == port_number);
+    }
+    TbNvmVersion version;
+    CHECK(tb_nvm_read_version(port, &version) == TbNvmResult::Ok && version.major == 0x17 && version.minor == 0x2A && version.active_size == (512 * 1024 - 16 * 1024) / 2);
+    // reads of every alignment and length come out right, across block boundaries
+    for (uint32_t address : {0u, 1u, 3u, 60u, 61u, 64u, 1000u}) {
+      for (uint32_t length : {1u, 2u, 4u, 63u, 64u, 65u, 130u}) {
+        std::vector<uint8_t> got(length);
+        CHECK(port.flash_read(address, ByteView(got.data(), got.size())) == TbNvmResult::Ok && memcmp(got.data(), chip.flash.active.data() + address, length) == 0);
+      }
+    }
+    // a command that is slow to finish is waited for; one the controller refuses fails with its status; a lost one is tried again
+    chip.flash.busy_reads = 5;
+    std::vector<uint8_t> got(10);
+    CHECK(port.flash_read(100, ByteView(got.data(), got.size())) == TbNvmResult::Ok && memcmp(got.data(), chip.flash.active.data() + 100, 10) == 0);
+    chip.flash.fail_status = 2;
+    CHECK(port.flash_read(0, ByteView(got.data(), got.size())) == TbNvmResult::Ok);                           // (a read is tried again: the second time works)
+    chip.flash.fail_status = 2;
+    CHECK(port.flash_write(0, ConstByteView(chip.flash.active.data(), 8)) == TbNvmResult::Access);
+    chip.flash.fail_status = 3;
+    CHECK(port.update_auth() == TbNvmResult::Failed && !chip.flash.auth_started);
+    CHECK(port.flash_write(2, ConstByteView(chip.flash.active.data(), 8)) == TbNvmResult::BadRequest && port.flash_write(0, ConstByteView(chip.flash.active.data(), 7)) == TbNvmResult::BadRequest);
+    CHECK(chip.flash.inactive.empty());                                                                         // none of that wrote anything
+  }
+  {   // the update: the image after its header goes to the other area, then the authentication starts
+    FakeNhi chip;
+    make_chip(chip);
+    ThunderboltIcm icm(chip, alloc);
+    CHECK(icm.start() == ThunderboltIcm::Outcome::Started);
+    TbDmaPort port(icm.control(), &icm);
+    CHECK(port.find() == TbNvmResult::Ok);
+    const std::vector<uint8_t> image = nvm_image(100 * 1024, 0x15EB);
+    CHECK(tb_nvm_update(port, ConstByteView(image.data(), image.size()), 0x15D9, false) == TbNvmResult::BadImage && chip.flash.inactive.empty() && !chip.flash.auth_started);   // the wrong controller: nothing written
+    CHECK(tb_nvm_update(port, ConstByteView(image.data(), image.size()), 0x15EB, false) == TbNvmResult::Ok);
+    CHECK(chip.flash.inactive.size() == image.size() - 0x4000 && memcmp(chip.flash.inactive.data(), image.data() + 0x4000, chip.flash.inactive.size()) == 0 && chip.flash.auth_started && !chip.flash.css_written);
+    CHECK(chip.flash.active[0x45] == 0x02);                                                                     // (the running area is untouched)
+    uint32_t status = 99;
+    CHECK(port.update_auth_status(&status) == 1 && status == 0);
+    CHECK(port.power_cycle() == TbNvmResult::Ok && chip.flash.power_cycled);
+    // 64 byte blocks of 16 dwords, the last one shorter
+    uint32_t writes = 0;
+    for (uint32_t cmd : chip.flash.commands) writes += (cmd >> 28) == 0;
+    CHECK(writes == (image.size() - 0x4000 + 63) / 64);
+  }
+  {   // a bad signature, a write that fails half way, and a controller that does not answer the authentication (it is restarting: not an error)
+    FakeNhi chip;
+    make_chip(chip);
+    chip.flash.fail_auth = true;
+    ThunderboltIcm icm(chip, alloc);
+    CHECK(icm.start() == ThunderboltIcm::Outcome::Started);
+    TbDmaPort port(icm.control(), &icm);
+    CHECK(port.find() == TbNvmResult::Ok);
+    const std::vector<uint8_t> image = nvm_image(40 * 1024, 0x15EB);
+    CHECK(tb_nvm_update(port, ConstByteView(image.data(), image.size()), 0x15EB, false) == TbNvmResult::Auth);
+    uint32_t status = 0;
+    CHECK(port.update_auth_status(&status) == 1 && status == 1);
+    chip.flash.fail_auth = false;
+    chip.flash.mail_out = 0;
+    CHECK(port.update_auth_status(&status) == 0);                                                               // no update status to report
+    chip.flash.inactive.clear();
+    chip.flash.fail_status = 2;
+    CHECK(tb_nvm_update(port, ConstByteView(image.data(), image.size()), 0x15EB, false) == TbNvmResult::Access);
+    chip.flash.auth_started = false;
+    chip.flash.drop_writes = 1000000;                                                                           // the mailbox never takes a command
+    CHECK(tb_nvm_update(port, ConstByteView(image.data(), image.size()), 0x15EB, false) != TbNvmResult::Ok);
+    chip.flash.drop_writes = 0;
+    chip.flash.commands.clear();
+    // a controller that restarts: the authentication command times out and that counts as started
+    chip.flash.busy_reads = 0;
+    FakeNhi quiet;
+    make_chip(quiet);
+    ThunderboltIcm quiet_icm(quiet, alloc);
+    CHECK(quiet_icm.start() == ThunderboltIcm::Outcome::Started);
+    TbDmaPort quiet_port(quiet_icm.control(), &quiet_icm);
+    CHECK(quiet_port.find() == TbNvmResult::Ok);
+    quiet.flash.drop_writes = 0;
+    CHECK(tb_nvm_update(quiet_port, ConstByteView(image.data(), image.size()), 0x15EB, false) == TbNvmResult::Ok);
+  }
+  {   // no mailbox on the router
+    FakeNhi chip;
+    ThunderboltIcm icm(chip, alloc);
+    CHECK(icm.start() == ThunderboltIcm::Outcome::Started);
+    TbDmaPort port(icm.control(), &icm);
+    TbNvmVersion version;
+    CHECK(port.find() == TbNvmResult::NoDmaPort && tb_nvm_read_version(port, &version) == TbNvmResult::NoDmaPort && port.update_auth() == TbNvmResult::NoDmaPort && port.update_auth_status(nullptr) == -1);
+    const std::vector<uint8_t> image = nvm_image(40 * 1024, 0x15EB);
+    CHECK(tb_nvm_update(port, ConstByteView(image.data(), image.size()), 0x15EB, false) == TbNvmResult::NoDmaPort);
+  }
+  {   // the paths are closed through the mailbox first
+    FakeNhi chip;
+    ThunderboltIcm icm(chip, alloc);
+    CHECK(!icm.disconnect_pcie_paths());
+    CHECK(icm.start() == ThunderboltIcm::Outcome::Started && icm.disconnect_pcie_paths() && chip.mailbox_commands.back() == 0x06);
+  }
+}
+
+// ---- the USB4 connection manager in software
+
+using namespace hardware::usb4;
+
+// A host router (lane pairs on ports 1/2 and 3/4, PCIe down adapters on 5 and 6, the NHI adapter on 7), a dock D1 behind port 1 (upstream 1/2, downstream 3/4, a PCIe down adapter 5, a PCIe up
+// adapter 6) and a device D2 behind D1's port 3 (upstream 1/2, PCIe up adapter 3).
+struct Usb4Rig {
+  TestAllocator alloc;
+  FakeNhi chip;
+  fake_usb4::Fabric fabric{chip};
+  TbNhi nhi{chip};
+  TbControl control{nhi, alloc};
+  static constexpr uint64_t kD1 = 0x01, kD2 = 0x301;
+  Usb4Rig(bool with_d2 = true) {
+    fabric.add(0, 2, 2, false, true, 2);
+    fabric.add(kD1, 2, 1, true, false, 1, true);
+    fabric.link(0, 1, kD1);
+    if (with_d2) {
+      fabric.add(kD2, 1, 0, true, false, 0, true);
+      fabric.link(kD1, 3, kD2);
+    }
+    CHECK(control.start());
+  }
+  ~Usb4Rig() { control.stop(); }
+};
+
+static void test_usb4_scan() {
+  Usb4Rig rig;
+  Usb4Domain domain(rig.control, rig.alloc);
+  const char* error = nullptr;
+  CHECK(!domain.approve_pcie(1, &error) && error);                                    // not started
+  CHECK(domain.start(&error));
+  CHECK(domain.present_count() == 3 && domain.router(0) && domain.router(1) && domain.router(2) && !domain.router(3));
+  const Usb4Router& host = *domain.router(0);
+  const Usb4Router& d1 = *domain.router(1);
+  const Usb4Router& d2 = *domain.router(2);
+  CHECK(host.route == 0 && host.depth == 0 && host.parent < 0 && host.upstream_port == 7 && host.max_port == 9 && host.usb4_version == 1);
+  CHECK(d1.route == 0x01 && d1.depth == 1 && d1.parent == 0 && d1.parent_port == 1 && d1.upstream_port == 1 && d1.uid == (0xA0A0A0A1ull | (0x0B0B0B0Bull << 32)));
+  CHECK(d2.route == 0x301 && d2.depth == 2 && d2.parent == 1 && d2.parent_port == 3);
+  // the ports were read: types, capabilities, hops, the lanes paired
+  CHECK(host.ports[1].type == kTypePort && host.ports[1].cap_phy == 0x10 && host.ports[1].cap_usb4 == 0x20 && host.ports[1].dual_link == 2 && host.ports[2].link_nr == 1);
+  CHECK(host.ports[5].type == kTypePcieDown && host.ports[5].cap_adapter == 0x10 && host.ports[7].type == kTypeNhi && host.ports[1].max_in_hop == 0x7FF);
+  CHECK(host.ports[1].remote_router == 1 && d1.ports[1].remote_router == 0 && d1.ports[3].remote_router == 2 && host.ports[3].remote_router < 0);
+  // the routers were configured: route, depth, upstream port, enabled; the connection manager's version; PCIe tunnelling allowed, configuration valid
+  fake_usb4::Router& fr = rig.fabric.at(0x01);
+  CHECK(fr.regs[2] == 0x01 && fr.regs[3] == (1u << 31) && ((fr.regs[1] >> 20) & 7) == 1 && fr.upstream == 1 && (fr.regs[4] & 0xFFFF) == (0x10u << 8 | 0xA));
+  CHECK((fr.regs[5] & kCs5Pto) && (fr.regs[5] & kCs5Hco) && !(fr.regs[5] & kCs5Cns) && (fr.regs[5] & kCs5Cv));
+  fake_usb4::Router& fr2 = rig.fabric.at(0x301);
+  CHECK(((fr2.regs[1] >> 20) & 7) == 2 && fr2.regs[2] == 0x301 && (fr2.regs[5] & kCs5Pto) && (fr2.regs[5] & kCs5Hco));
+  CHECK(rig.fabric.at(0).regs[3] == (1u << 31));                                      // the host router itself: enabled, route 0
+  // both ends of a link are marked configured
+  CHECK((rig.fabric.at(0).ports[1].space[0x20 + kPortCs19] & kPortCs19Pc) && (fr.ports[1].space[0x20 + kPortCs19] & kPortCs19Pc) && (fr.ports[3].space[0x20 + kPortCs19] & kPortCs19Pc));
+  // the downstream adapters were unlocked
+  CHECK(!(rig.fabric.at(0).ports[1].space[4] & kAdpCs4Lck) && !(fr.ports[3].space[4] & kAdpCs4Lck));
+  CHECK(domain.unreachable_links() == 0 && domain.preboot_tunnels_closed() == 0);
+}
+
+static void test_usb4_preboot() {
+  Usb4Rig rig(false);
+  rig.fabric.at(0).ports[5].space[0x10 + 0] |= kAdpPcieCs0Pe;                          // the BIOS left a PCIe tunnel on
+  rig.fabric.at(0x01).ports[6].space[0x10 + 0] |= kAdpPcieCs0Pe;
+  Usb4Domain domain(rig.control, rig.alloc);
+  CHECK(domain.start(nullptr) && domain.preboot_tunnels_closed() == 2);
+  CHECK(!(rig.fabric.at(0).ports[5].space[0x10] & kAdpPcieCs0Pe) && !(rig.fabric.at(0x01).ports[6].space[0x10] & kAdpPcieCs0Pe));
+}
+
+static void test_usb4_pcie() {
+  Usb4Rig rig;
+  Usb4Domain domain(rig.control, rig.alloc);
+  const char* error = nullptr;
+  CHECK(domain.start(nullptr));
+  CHECK(!domain.approve_pcie(0, &error) && error);                                    // the host
+  CHECK(!domain.approve_pcie(9, &error) && error);
+  CHECK(!domain.approve_pcie(2, &error) && error && !domain.pcie_tunnelled(2));       // the dock first
+  rig.fabric.log.clear();
+  CHECK(domain.approve_pcie(1, &error) && domain.pcie_tunnelled(1) && domain.router(1)->pcie_tunnel);
+  // down path: host PCIe down adapter 5 (hop 8) -> lane 1 (next hop 8) -> D1 lane 1 (hop 8) -> PCIe up adapter 5 (next hop 8)
+  fake_usb4::Router& host = rig.fabric.at(0);
+  fake_usb4::Router& d1 = rig.fabric.at(0x01);
+  auto hop = [](fake_usb4::Router& r, uint32_t port, uint32_t index) { return r.ports[port].hops[index]; };
+  const auto h0 = hop(host, 5, 8), h1 = hop(d1, 1, 8);
+  CHECK(h0.first == (8u | (1u << 11) | (7u << 17) | (1u << 31)) && h1.first == (8u | (6u << 11) | (32u << 17) | (1u << 31)));
+  CHECK((h0.second & 0xF) == 1 && ((h0.second >> 8) & 7) == 3 && ((h0.second >> 12) & 0x7FF) == 0x7FF && (h0.second & (1u << 24)) && (h0.second & (1u << 25)));       // source: ingress fc, egress fc (internal)
+  CHECK((h1.second & (1u << 24)) && !(h1.second & (1u << 25)));                        // destination: no egress fc
+  // up path: D1 PCIe up adapter 5 (hop 8) -> lane 1 (next hop 8) -> host lane 1 (hop 8) -> PCIe down adapter 5 (next hop 8)
+  const auto u0 = hop(d1, 6, 8), u1 = hop(host, 1, 8);
+  CHECK(u0.first == (8u | (1u << 11) | (7u << 17) | (1u << 31)) && u1.first == (8u | (5u << 11) | (32u << 17) | (1u << 31)));
+  // the adapters were enabled, the far one first
+  CHECK((d1.ports[6].space[0x10] & kAdpPcieCs0Pe) != 0 && (host.ports[5].space[0x10] & kAdpPcieCs0Pe) != 0);
+  size_t up_enable = 0, down_enable = 0, last_hop_write = 0, first_hop_write = 1000000;
+  for (size_t i = 0; i < rig.fabric.log.size(); ++i) {
+    if (rig.fabric.log[i] == "W 1 6 1 16") up_enable = i;
+    if (rig.fabric.log[i] == "W 0 5 1 16") down_enable = i;
+    if (rig.fabric.log[i][0] == 'H') { last_hop_write = i; if (i < first_hop_write) first_hop_write = i; }
+  }
+  CHECK(up_enable != 0 && down_enable > up_enable && down_enable > last_hop_write);
+  // the second tunnel, to D2: D1's PCIe down adapter 6, HopIDs 8 again on the new link
+  CHECK(domain.approve_pcie(2, &error) && domain.pcie_tunnelled(2));
+  fake_usb4::Router& d2 = rig.fabric.at(0x301);
+  CHECK((d1.ports[5].space[0x10] & kAdpPcieCs0Pe) != 0 && (d2.ports[3].space[0x10] & kAdpPcieCs0Pe) != 0);
+  CHECK(hop(d1, 5, 8).first == (8u | (3u << 11) | (7u << 17) | (1u << 31)) && hop(d2, 1, 8).first == (8u | (3u << 11) | (32u << 17) | (1u << 31)));
+  CHECK(!domain.approve_pcie(2, &error) && error);                                    // twice
+  // taking the tunnels down: the adapters, then the hops
+  CHECK(domain.disconnect_pcie(2) && !domain.pcie_tunnelled(2) && !(d2.ports[3].space[0x10] & kAdpPcieCs0Pe) && !(d1.ports[5].space[0x10] & kAdpPcieCs0Pe));
+  CHECK(!(hop(d1, 5, 8).first & (1u << 31)) && !(hop(d2, 1, 8).first & (1u << 31)) && !domain.disconnect_pcie(2));
+  CHECK(domain.approve_pcie(2, &error));                                              // the HopIDs were given back
+  CHECK(domain.disconnect_pcie(2) && domain.disconnect_pcie(1));
+  CHECK(!(host.ports[5].space[0x10] & kAdpPcieCs0Pe) && !(hop(host, 5, 8).first & (1u << 31)) && !(hop(d1, 1, 8).first & (1u << 31)));
+}
+
+static void test_usb4_failures() {
+  {   // a hop table write fails half way: nothing is left enabled, no HopID is lost
+    Usb4Rig rig;
+    Usb4Domain domain(rig.control, rig.alloc);
+    const char* error = nullptr;
+    CHECK(domain.start(nullptr));
+    rig.fabric.fail_hop_writes = 1;
+    CHECK(!domain.approve_pcie(1, &error) && error && !domain.pcie_tunnelled(1) && !(rig.fabric.at(0).ports[5].space[0x10] & kAdpPcieCs0Pe) && !(rig.fabric.at(0x01).ports[6].space[0x10] & kAdpPcieCs0Pe));
+    CHECK(domain.approve_pcie(1, &error));                                            // and a second try works with the same HopIDs
+    CHECK((rig.fabric.at(0).ports[5].hops[8].first & (1u << 31)) != 0);
+  }
+  {   // a router that is not USB4, one too deep, and a link with nothing on it
+    Usb4Rig rig(false);
+    rig.fabric.at(0x01).version = 0;
+    Usb4Domain domain(rig.control, rig.alloc);
+    CHECK(domain.start(nullptr) && domain.present_count() == 1 && domain.unreachable_links() == 1);
+  }
+  {
+    Usb4Rig rig(false);
+    rig.fabric.unlink(0, 1, 0x01);
+    Usb4Domain domain(rig.control, rig.alloc);
+    CHECK(domain.start(nullptr) && domain.present_count() == 1 && domain.unreachable_links() == 0);
+  }
+  {   // a chain deeper than the limit: the sixth router is not taken
+    TestAllocator alloc;
+    FakeNhi chip;
+    fake_usb4::Fabric fabric(chip);
+    fabric.add(0, 1, 0, false, true);
+    uint64_t route = 0, parent = 0;
+    for (uint32_t depth = 1; depth <= 7; ++depth) {
+      route = parent | (uint64_t{depth == 1 ? 1u : 3u} << (8 * (depth - 1)));
+      fabric.add(route, 2, 0, false);
+      fabric.link(parent, depth == 1 ? 1 : 3, route);
+      parent = route;
+    }
+    TbNhi nhi(chip);
+    TbControl control(nhi, alloc);
+    CHECK(control.start());
+    Usb4Domain domain(control, alloc);
+    CHECK(domain.start(nullptr) && domain.present_count() == 6);                      // the host and routers at depth 1 to 5
+    control.stop();
+  }
+  {   // no PCIe adapters on the dock
+    Usb4Rig rig(false);
+    rig.fabric.add(0x1234, 0, 0, false);
+    Usb4Domain domain(rig.control, rig.alloc);
+    const char* error = nullptr;
+    CHECK(domain.start(nullptr));
+    rig.fabric.at(0x01).ports[6].type = kTypeUsb3Up;
+    rig.fabric.at(0x01).ports[6].space[2] = kTypeUsb3Up;
+    Usb4Domain again(rig.control, rig.alloc);
+    CHECK(again.start(nullptr) && !again.approve_pcie(1, &error) && error);
+  }
+}
+
+static void test_usb4_hotplug() {
+  Usb4Rig rig;
+  Usb4Domain domain(rig.control, rig.alloc);
+  const char* error = nullptr;
+  CHECK(domain.start(nullptr));
+  CHECK(domain.approve_pcie(1, &error) && domain.approve_pcie(2, &error));
+  // the dock is unplugged: the event is acknowledged, the dock and what hangs from it go, with their tunnels
+  rig.fabric.unlink(0, 1, 0x01);
+  rig.chip.send_plug_event(0, 1, true);
+  domain.poll();
+  CHECK(domain.events_seen() == 1 && domain.present_count() == 1 && !domain.router(1) && !domain.router(2) && !domain.pcie_tunnelled(1) && !domain.pcie_tunnelled(2));
+  CHECK(rig.chip.errors_from_host.size() == 1 && (rig.chip.errors_from_host[0][2] & 0xFF) == 7 && ((rig.chip.errors_from_host[0][2] >> 8) & 0x3F) == 1 && (rig.chip.errors_from_host[0][2] >> 30) == 3);
+  CHECK(!(rig.fabric.at(0).ports[5].space[0x10] & kAdpPcieCs0Pe));                                  // the host's PCIe down adapter was switched off
+  // and plugged in again: found again, in the same places, the HopIDs free
+  rig.fabric.link(0, 1, 0x01);
+  rig.chip.send_plug_event(0, 1, false);
+  domain.poll();
+  CHECK(domain.present_count() == 3 && domain.router(1) && domain.router(1)->route == 0x01 && domain.router(2) && domain.router(2)->route == 0x301);
+  CHECK(rig.chip.errors_from_host.size() == 2 && (rig.chip.errors_from_host[1][2] >> 30) == 2);                // the plug acknowledgement
+  CHECK(domain.approve_pcie(1, &error));
+  // the device behind the dock is unplugged
+  rig.fabric.unlink(0x01, 3, 0x301);
+  rig.chip.send_plug_event(0x01, 3, true);
+  domain.poll();
+  CHECK(domain.present_count() == 2 && !domain.router(2));
+  // events for routers we do not know, for port 0 and for a port past the end are ignored (and acknowledged)
+  rig.chip.send_plug_event(0x555, 1, false);
+  rig.chip.send_plug_event(0x01, 0, false);
+  rig.chip.send_plug_event(0x01, 40, true);
+  domain.poll();
+  CHECK(domain.present_count() == 2 && domain.events_seen() == 6);
+  // more events than the queue holds: the extra ones are dropped, nothing breaks
+  for (uint32_t i = 0; i < 40; ++i) rig.chip.send_plug_event(0x01, 4, false);
+  domain.poll();
+  CHECK(domain.present_count() == 2);
+  // a packet that is not an event is not taken
+  CHECK(!domain.on_event(TbPacketType::Read, ConstByteView()));
+  const uint8_t shorter[8] = {};
+  CHECK(!domain.on_event(TbPacketType::Event, ConstByteView(shorter, sizeof shorter)));
+}
+
+static void test_usb4_driver() {
+  // the driver picks the software connection manager for a Tiger Lake and later controller
+  Usb4Rig rig;
+  ThunderboltDriver driver(rig.alloc);
+  // (the rig's control channel is not started here: the driver makes its own on the same chip)
+  rig.control.stop();
+  CHECK(driver.start_device(rig.chip, nullptr, TbGeneration::Usb4, nullptr) == ThunderboltDriver::Outcome::Started);
+  CHECK(!driver.icm() && driver.usb4() && driver.usb4()->present_count() == 3 && driver.device_count() == 2 && driver.xdomain_count() == 0 && !driver.runtime_allowed());
+  // plug events go through poll()
+  rig.fabric.unlink(0, 1, 0x01);
+  rig.chip.send_plug_event(0, 1, true);
+  driver.poll();
+  CHECK(driver.device_count() == 0);
+  // interrupts: the control channel's rings
+  CHECK(driver.use_interrupts(true, 0) && rig.chip.unmasked[0] == ((1u << 0) | (1u << 12)));
+  CHECK(driver.use_interrupts(false) && rig.chip.unmasked[0] == 0 && !driver.use_interrupts(true, 16));
+  driver.probe_control();
+  // sleep: the routers are put to sleep and the channel stopped; the wake finds them again
+  rig.fabric.link(0, 1, 0x01);
+  rig.chip.send_plug_event(0, 1, false);
+  driver.poll();
+  CHECK(driver.device_count() == 2 && !driver.runtime_suspend(false) && driver.suspend(false) && driver.device_count() == 0 && driver.usb4()->suspended());
+  for (uint64_t route : {0ull, 0x01ull, 0x301ull}) rig.fabric.at(route).regs[5] &= ~kCs5Slp, rig.fabric.at(route).regs[6] &= ~kCs6Slpr;
+  CHECK(driver.resume() == ThunderboltDriver::Outcome::Started && driver.device_count() == 2);
+  driver.stop();
+  CHECK(!driver.usb4() && driver.device_count() == 0);
+  {   // a host router that does not answer: the start fails with a reason
+    TestAllocator alloc;
+    FakeNhi chip;
+    fake_usb4::Fabric fabric(chip);                        // (no router at all)
+    ThunderboltDriver failing(alloc);
+    CHECK(failing.start_device(chip, nullptr, TbGeneration::Usb4, nullptr) == ThunderboltDriver::Outcome::ControllerFailed && failing.message()[0] != '\0');
+  }
+  rig.control.start();                                      // (the rig's destructor stops it)
+}
+
+static void test_usb4_bonding() {
+  {   // both ends can: the lanes are bonded, the credits double
+    Usb4Rig rig;
+    Usb4Domain domain(rig.control, rig.alloc);
+    CHECK(domain.start(nullptr));
+    CHECK(domain.link_bonded(1) && domain.link_bonded(2) && !domain.link_bonded(0) && !domain.link_bonded(9));
+    CHECK(domain.router(0)->ports[1].bonded && domain.router(0)->ports[2].bonded && domain.router(1)->ports[1].bonded && domain.router(1)->ports[2].bonded && !domain.router(0)->ports[3].bonded);
+    fake_usb4::Router& host = rig.fabric.at(0);
+    fake_usb4::Router& d1 = rig.fabric.at(0x01);
+    // lane 0 and lane 1 of each end are set to the dual width; the downstream end's lane 0 is told to bond, the upstream one's is not
+    CHECK((host.ports[1].space[0x11] & kLaneCs1TargetWidthMask) == kLaneCs1TargetDual && (host.ports[2].space[0x11] & kLaneCs1TargetWidthMask) == kLaneCs1TargetDual);
+    CHECK((d1.ports[1].space[0x11] & kLaneCs1TargetWidthMask) == kLaneCs1TargetDual && (d1.ports[2].space[0x11] & kLaneCs1TargetWidthMask) == kLaneCs1TargetDual);
+    CHECK((host.ports[1].space[0x11] & kLaneCs1Lb) && !(d1.ports[1].space[0x11] & kLaneCs1Lb));
+    CHECK((host.ports[3].space[0x11] & kLaneCs1TargetWidthMask) == 0);                      // the second link of the host: nothing there
+  }
+  {   // the router does not offer it
+    Usb4Rig rig(false);
+    rig.fabric.at(0x01).ports[1].space[0x20 + kPortCs18] = 0;
+    Usb4Domain domain(rig.control, rig.alloc);
+    const char* error = nullptr;
+    CHECK(domain.start(nullptr) && !domain.link_bonded(1) && (rig.fabric.at(0).ports[1].space[0x11] & kLaneCs1TargetWidthMask) == 0);
+    CHECK(domain.approve_pcie(1, &error) && (rig.fabric.at(0).ports[5].hops[8].first >> 17 & 0x7F) == 7 && (rig.fabric.at(0).ports[1].hops[8].first >> 17 & 0x7F) == 16);       // (one lane: 16 credits)
+  }
+  {   // a router whose lane adapters do not support two lanes
+    Usb4Rig rig(false);
+    rig.fabric.at(0x01).ports[1].space[0x10] &= ~(0x3Fu << 20);
+    Usb4Domain domain(rig.control, rig.alloc);
+    CHECK(domain.start(nullptr) && !domain.link_bonded(1));
+  }
+  {   // the link never reports two lanes: everything is put back
+    Usb4Rig rig(false);
+    rig.fabric.bond_never_completes = true;
+    Usb4Domain domain(rig.control, rig.alloc);
+    CHECK(domain.start(nullptr) && !domain.link_bonded(1) && domain.present_count() == 2);
+    fake_usb4::Router& host = rig.fabric.at(0);
+    CHECK((host.ports[1].space[0x11] & kLaneCs1TargetWidthMask) == kLaneCs1TargetSingle && (host.ports[2].space[0x11] & kLaneCs1TargetWidthMask) == kLaneCs1TargetSingle);
+  }
+}
+
+static void test_usb4_usb3() {
+  Usb4Rig rig;
+  Usb4Domain domain(rig.control, rig.alloc);
+  const char* error = nullptr;
+  CHECK(domain.start(nullptr));
+  fake_usb4::Router& host = rig.fabric.at(0);
+  fake_usb4::Router& d1 = rig.fabric.at(0x01);
+  fake_usb4::Router& d2 = rig.fabric.at(0x301);
+  host.ports[8].space[0x10 + kUsb3Cs4] = kUsb3Cs4Mslr20G << kUsb3Cs4MslrShift;               // the host adapter can do 20 Gb/s, the dock's only 10
+  CHECK(!domain.approve_usb3(2, &error) && error && !domain.usb3_tunnelled(2));                // the dock first
+  rig.fabric.log.clear();
+  CHECK(domain.approve_usb3(1, &error) && domain.usb3_tunnelled(1) && domain.router(1)->usb3_tunnel && !domain.pcie_tunnelled(1));
+  // host USB 3 down adapter (port 8) -> lane 1 -> dock lane 1 -> USB 3 up adapter (port 8): HopID 8, weight 2, priority 3, 7 credits on adapters and 32 on the bonded lanes
+  auto hop = [](fake_usb4::Router& r, uint32_t port, uint32_t index) { return r.ports[port].hops[index]; };
+  CHECK(hop(host, 8, 8).first == (8u | (1u << 11) | (7u << 17) | (1u << 31)) && hop(d1, 1, 8).first == (8u | (8u << 11) | (32u << 17) | (1u << 31)));
+  CHECK((hop(host, 8, 8).second & 0xF) == kUsb3Weight && ((hop(host, 8, 8).second >> 8) & 7) == kUsb3Priority);
+  CHECK((host.ports[8].space[0x10] & kUsb3Cs0Pe) && (d1.ports[8].space[0x10] & kUsb3Cs0Pe));
+  // the bandwidth of the host's adapter: 90% of the slower rate (10 Gb/s) = 9000 Mb/s each way, scale 0, 2198 units of 512 microframes; the request is withdrawn
+  const uint32_t cs2 = host.ports[8].space[0x10 + kUsb3Cs2];
+  CHECK((cs2 & 0xFFF) == 2198 && ((cs2 >> 12) & 0xFFF) == 2198 && !(cs2 & kUsb3Cs2Cmr) && (host.ports[8].space[0x10 + kUsb3Cs3] & 0x3F) == 0);
+  // the near adapter is enabled before the far one
+  size_t near_at = 0, far_at = 0;
+  for (size_t i = 0; i < rig.fabric.log.size(); ++i) {
+    if (rig.fabric.log[i] == "W 0 8 1 16") near_at = i;
+    if (rig.fabric.log[i] == "W 1 8 1 16") far_at = i;
+  }
+  CHECK(near_at != 0 && far_at > near_at);
+  // PCIe and USB 3 tunnels to the same router do not get in each other's way
+  CHECK(domain.approve_pcie(1, &error) && domain.pcie_tunnelled(1) && domain.usb3_tunnelled(1));
+  CHECK(hop(host, 5, 8).first & (1u << 31));
+  // the device behind the dock: its own tunnel, no bandwidth allocation (it is not the host's adapter)
+  CHECK(domain.approve_usb3(2, &error) && (d1.ports[7].space[0x10] & kUsb3Cs0Pe) && (d2.ports[4].space[0x10] & kUsb3Cs0Pe) && !(d1.ports[7].space[0x10 + kUsb3Cs2]));
+  CHECK(!domain.approve_usb3(2, &error));
+  CHECK(domain.disconnect_usb3(2) && !(d2.ports[4].space[0x10] & kUsb3Cs0Pe) && !(hop(d2, 1, 8).first & (1u << 31)) && !domain.disconnect_usb3(2));
+  CHECK(domain.disconnect_usb3(1) && domain.pcie_tunnelled(1) && !(host.ports[8].space[0x10] & kUsb3Cs0Pe));
+  // an unplug takes both kinds with it
+  CHECK(domain.approve_usb3(1, &error));
+  rig.fabric.unlink(0, 1, 0x01);
+  rig.chip.send_plug_event(0, 1, true);
+  domain.poll();
+  CHECK(!domain.usb3_tunnelled(1) && !domain.pcie_tunnelled(1) && !(host.ports[8].space[0x10] & kUsb3Cs0Pe) && !(host.ports[5].space[0x10] & kAdpPcieCs0Pe));
+  // a BIOS USB 3 tunnel is switched off too
+  Usb4Rig other(false);
+  other.fabric.at(0).ports[9].space[0x10] |= kUsb3Cs0Pe;
+  Usb4Domain again(other.control, other.alloc);
+  CHECK(again.start(nullptr) && again.preboot_tunnels_closed() == 1 && !(other.fabric.at(0).ports[9].space[0x10] & kUsb3Cs0Pe));
+  {   // the bandwidth request is never acknowledged: no tunnel, nothing left over
+    Usb4Rig rig2;
+    Usb4Domain d(rig2.control, rig2.alloc);
+    CHECK(d.start(nullptr));
+    rig2.fabric.no_usb3_ack = true;
+    CHECK(!d.approve_usb3(1, &error) && error && !d.usb3_tunnelled(1) && !(rig2.fabric.at(0).ports[8].space[0x10] & kUsb3Cs0Pe) && !(rig2.fabric.at(0).ports[8].hops[8].first & (1u << 31)));
+    rig2.fabric.no_usb3_ack = false;
+    CHECK(d.approve_usb3(1, &error));                         // the HopIDs were given back
+  }
+}
+
+static void test_usb4_sleep() {
+  Usb4Rig rig;
+  Usb4Domain domain(rig.control, rig.alloc);
+  const char* error = nullptr;
+  CHECK(!domain.suspend() && !domain.resume(&error));                                   // not started
+  CHECK(domain.start(nullptr) && domain.approve_pcie(1, &error) && domain.approve_usb3(1, &error));
+  CHECK(domain.suspend() && domain.suspended() && domain.present_count() == 0 && !domain.pcie_tunnelled(1) && !domain.usb3_tunnelled(1));
+  for (uint64_t route : {0ull, 0x01ull, 0x301ull}) CHECK((rig.fabric.at(route).regs[5] & kCs5Slp) && (rig.fabric.at(route).regs[6] & kCs6Slpr));
+  CHECK(!(rig.fabric.at(0).ports[5].space[0x10] & kAdpPcieCs0Pe) && !(rig.fabric.at(0).ports[8].space[0x10] & kUsb3Cs0Pe));      // the tunnels came down first
+  CHECK(!domain.suspend() && domain.router(0) == nullptr);
+  // the deepest router went to sleep before the ones above it
+  size_t d2_at = 0, d1_at = 0, host_at = 0;
+  for (size_t i = 0; i < rig.fabric.log.size(); ++i) {
+    if (rig.fabric.log[i] == "W 301 0 2 5") d2_at = i;
+    if (rig.fabric.log[i] == "W 1 0 2 5") d1_at = i;
+    if (rig.fabric.log[i] == "W 0 0 2 5") host_at = i;
+  }
+  CHECK(d2_at != 0 && d1_at > d2_at && host_at > d1_at);
+  // after the wake: found again, no tunnels
+  for (uint64_t route : {0ull, 0x01ull, 0x301ull}) rig.fabric.at(route).regs[5] &= ~kCs5Slp, rig.fabric.at(route).regs[6] &= ~kCs6Slpr;
+  CHECK(domain.resume(&error) && !domain.suspended() && domain.present_count() == 3 && !domain.pcie_tunnelled(1) && domain.approve_pcie(1, &error));
+  CHECK(!domain.resume(&error));
+  // a host router that does not go to sleep: reported, still resumable
+  rig.fabric.refuse_sleep = true;
+  CHECK(!domain.suspend() && domain.suspended() && domain.present_count() == 0);
+  rig.fabric.refuse_sleep = false;
+  CHECK(domain.resume(&error) && domain.present_count() == 3);
+}
+
+static void test_usb4_garbage() {
+  // the routers answer with noise: the manager must stay inside its arrays, whatever comes (and the sanitizers say if it does not)
+  for (uint32_t seed = 1; seed <= 200; ++seed) {
+    Usb4Rig rig;
+    rig.fabric.random_garbage = true;
+    rig.fabric.noise_seed = seed * 2654435761u;
+    Usb4Domain domain(rig.control, rig.alloc);
+    domain.start(nullptr);
+    const char* error = nullptr;
+    for (uint32_t i = 0; i < 4; ++i) domain.approve_pcie(i, &error);
+    domain.poll();
+  }
+  // a router that claims 63 ports and ports whose capability lists loop
+  Usb4Rig rig(false);
+  fake_usb4::Router& r = rig.fabric.at(0x01);
+  r.max_port = 63;
+  r.ports.resize(64);
+  for (uint32_t i = 6; i < 64; ++i) r.ports[i].implemented = false;
+  r.ports[1].space[0x10] = 0x10 | (0x77u << 8);                                       // a capability that points at itself
+  Usb4Domain domain(rig.control, rig.alloc);
+  CHECK(domain.start(nullptr));
+  // the unplug of a router while a request to it is in flight: the request fails, not the manager
+  rig.fabric.unlink(0, 1, 0x01);
+  uint32_t word = 0;
+  CHECK(rig.control.read_config(0x01, 0, TbConfigSpace::Switch, 0, ArrayView<uint32_t>(&word, 1), 1000, nullptr, nullptr) == TbControl::Result::Failed);
+}
+
 int main() {
   test_devices();
   test_framing();
@@ -2467,6 +3173,18 @@ int main() {
   test_icm_start();
   test_device_events();
   test_approve();
+  test_boot_acl();
+  test_nvm();
+  test_usb4_scan();
+  test_usb4_preboot();
+  test_usb4_pcie();
+  test_usb4_failures();
+  test_usb4_hotplug();
+  test_usb4_bonding();
+  test_usb4_usb3();
+  test_usb4_sleep();
+  test_usb4_driver();
+  test_usb4_garbage();
   test_garbage();
   test_cio();
   test_firmware_start();
@@ -2484,6 +3202,7 @@ int main() {
   test_net_messages();
   test_net();
   test_net_lifecycle();
+  test_net_interrupts();
   test_power();
   test_msix();
   test_ice_lake();

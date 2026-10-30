@@ -107,6 +107,7 @@
 #define NT_SERVICE_NtReadVirtualMemory 84
 #define NT_SERVICE_NtWriteVirtualMemory 85
 #define NT_SERVICE_NtCreateSymbolicLink 86
+#define NT_SERVICE_NtTcosDebugException 501
 #define NT_SERVICE_NtCreateSocket 87
 #define NT_SERVICE_NtBindSocket 88
 #define NT_SERVICE_NtConnectSocket 89
@@ -2061,7 +2062,7 @@
 #define NT_SERVICE_NtUserZapActiveAndFocus 5633
 #define NT_SERVICE_NtValidateCompositionSurfaceHandle 5634
 #define NT_SERVICE_NtVisualCaptureBits 5635
-#define NT_SERVICE_COUNT 501
+#define NT_SERVICE_COUNT 502
 #define NT_SERVICE_WIN32K_BASE 4096
 #define NT_SERVICE_WIN32K_END 5636
 #endif

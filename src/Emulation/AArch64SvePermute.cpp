@@ -183,6 +183,29 @@ bool AArch64Cpu::sve_permute(uint32_t insn) {
       }
       case 0x0E: {      // DUP (scalar), INSR, SUNPK / UUNPK, REV
         const uint32_t sel = bits_of(insn, 20, 16);
+        if ((sel & 0x18) == 0x08) {      // PMOV: the predicate to or from a slice of the vector's bits
+          const uint32_t t = ((sel >> 1) & 1) | (((sel >> 2) & 1) << 1) | (((insn >> 22) & 1) << 2) | (((insn >> 23) & 1) << 3);
+          if (t == 0) return false;
+          uint32_t e = 3;
+          while (!((t >> e) & 1)) --e;
+          const uint32_t index = t & ((1u << e) - 1), n = 16u >> e, first = index * n;
+          if (sel & 1) {      // to the vector (Zd, Pn)
+            const uint16_t pr = s_.p[bits_of(insn, 8, 5)];
+            unsigned __int128 bitsv = index == 0 ? 0 : (static_cast<unsigned __int128>(dst->hi) << 64) | dst->lo;      // (slice 0 clears the rest of the vector, the others keep it)
+            for (uint32_t j = 0; j < n; ++j) {
+              const unsigned __int128 mask = static_cast<unsigned __int128>(1) << (first + j);
+              bitsv = active(pr, j, e) ? (bitsv | mask) : (bitsv & ~mask);
+            }
+            *dst = Vec{static_cast<uint64_t>(bitsv), static_cast<uint64_t>(bitsv >> 64)};
+          } else {      // to the predicate (Pd, Zn)
+            const unsigned __int128 bitsv = (static_cast<unsigned __int128>(s_.v[zn].hi) << 64) | s_.v[zn].lo;
+            uint16_t r = 0;
+            for (uint32_t j = 0; j < n; ++j)
+              if ((bitsv >> (first + j)) & 1) r = static_cast<uint16_t>(r | (1u << (j << e)));
+            s_.p[insn & 15] = r;
+          }
+          return true;
+        }
         if (sel == 0) {
           const uint64_t v = reg_sp(zn, true) & element_ones(esz);
           for (uint32_t i = 0; i < elements; ++i) put(dst, esz, i, v);

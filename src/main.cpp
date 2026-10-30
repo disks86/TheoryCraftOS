@@ -111,6 +111,9 @@
 #include "Database/SystemDatabases.hpp"
 #include "Database/Local/SystemSettings.hpp"
 #include "Hardware/Acpi/SystemAcpiHost.hpp"
+#include "Hardware/Acpi/SystemAcpiPorts.hpp"
+#include "Hardware/Acpi/AcpiEvents.hpp"
+#include "Hardware/Acpi/IoApic.hpp"
 #include "Hardware/Battery/AcpiBattery.hpp"
 #include "SystemMonitor.hpp"
 #include "FileSystem/SystemLayout.hpp"
@@ -174,6 +177,46 @@ static kernel::Frame* on_thunderbolt_interrupt(kernel::Frame* frame, void* drive
   static_cast<hardware::ThunderboltDriver*>(driver)->on_interrupt();
   return frame;
 }
+#endif
+
+#ifdef TCOS_ACPI_EVENTS
+// What the buttons of the laptop did, counted where the events are polled and acted on in the desktop loop.
+struct AcpiButtonSink final : hardware::IAcpiButtonListener {
+  uint32_t power = 0, sleep = 0, lid_closed = 0, lid_opened = 0;
+  void on_button(hardware::AcpiButton button, bool lid_open) override {
+    if (button == hardware::AcpiButton::Power) ++power;
+    else if (button == hardware::AcpiButton::Sleep) ++sleep;
+    else if (lid_open) ++lid_opened;
+    else ++lid_closed;
+  }
+};
+
+// The system control interrupt: the handler masks the I/O APIC input (it is level triggered: it stays up until the event registers are cleared) and says so; the loop reads the events and unmasks.
+struct AcpiSciState {
+  hardware::IoApic* ioapic = nullptr;
+  uint32_t gsi = 0;
+  uint32_t pending = 0, arrived = 0;
+};
+static kernel::Frame* on_acpi_sci(kernel::Frame* frame, void* context) {
+  kernel::apic::eoi();
+  AcpiSciState* sci = static_cast<AcpiSciState*>(context);
+  sci->ioapic->mask(sci->gsi, true);
+  __atomic_fetch_add(&sci->arrived, 1, __ATOMIC_ACQ_REL);
+  __atomic_store_n(&sci->pending, 1, __ATOMIC_RELEASE);
+  return frame;
+}
+#endif
+
+#ifdef TCOS_THUNDERBOLT
+// The firmware says Notify(device, 2) when the controller (or a root port above it) woke the machine: counted, for the desktop loop to act on.
+struct ThunderboltWakeListener final : hardware::IAcpiNotifyListener {
+  hardware::AcpiEvents* events = nullptr;
+  acpi::Node* controller = nullptr;
+  uint32_t wakes = 0;
+  void on_notify(acpi::Node* device, uint32_t value) override {
+    if (value == 2 && events && controller && events->is_within(device, controller)) ++wakes;
+  }
+};
 #endif
 
 #ifdef TCOS_AMD_VEGAM
@@ -1172,6 +1215,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     UniquePointer<hardware::ThunderboltNet> thunderbolt_net;        // networking to another host on the cable (after the driver: it goes first)
     hardware::ThunderboltNetLink* thunderbolt_link = nullptr;       // its entry in the list of network interfaces, which outlives them both
     uint64_t thunderbolt_devices = 0;
+    hardware::PciAddress thunderbolt_address = {0, 0, 0};
     UniquePointer<hardware::PciMsix> thunderbolt_msix;              // its MSI-X, when the machine delivers it
     UniquePointer<hardware::PciMsi> thunderbolt_msi;                // else its MSI
     bool thunderbolt_msi_working = false;                           // an interrupt arrived in the start-up check: the loop reads the channel only when one comes
@@ -1185,10 +1229,11 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
 #endif
         thunderbolt = UniquePointer<hardware::ThunderboltDriver>::make(shared_allocator, shared_allocator, thunderbolt_config);
         if (!thunderbolt) break;
+        thunderbolt_address = d.address;
         if (thunderbolt->start(pci, d, register_mapper) == hardware::ThunderboltDriver::Outcome::Started) {
           if (!smb_random.ready()) smb_random.initialize();
           thunderbolt_keys = UniquePointer<hardware::FileTbKeyStore>::make(shared_allocator, explorer_files.file_system(), shared_allocator);
-          if (thunderbolt_keys) thunderbolt->icm()->set_secure(&smb_random, thunderbolt_keys.get());
+          if (thunderbolt_keys && thunderbolt->icm()) thunderbolt->icm()->set_secure(&smb_random, thunderbolt_keys.get());
           // MSI-X first (the first entry of the table carries the control channel's rings), then MSI: the handler, then the message to the core that runs this. Kept only if an interrupt
           // arrives for a request of the controller.
           const uint32_t tb_apic_id = kernel::running() ? kernel::apic::this_apic_id() : 0xFFFF;
@@ -1196,14 +1241,14 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
             kernel::set_interrupt_handler(kernel::kVectorThunderbolt, &on_thunderbolt_interrupt, thunderbolt.get());
             auto check_interrupt = [&]() {
               const uint32_t before = thunderbolt->interrupts();
-              uint32_t word = 0;
-              thunderbolt->icm()->control().read_config(0, 0, hardware::TbConfigSpace::Switch, 0, ArrayView<uint32_t>(&word, 1), 100000, nullptr, thunderbolt->icm());
+              thunderbolt->probe_control();
               hardware::delay_us(2000);
               return thunderbolt->interrupts() != before;
             };
             thunderbolt_msix = UniquePointer<hardware::PciMsix>::make(shared_allocator, pci, register_mapper);
-            const uint8_t tb_vector = kernel::kVectorThunderbolt;
-            if (thunderbolt_msix && thunderbolt_msix->enable(d.address, &tb_vector, 1, tb_apic_id) && thunderbolt->use_interrupts(true, 0)) thunderbolt_msi_working = check_interrupt();
+            kernel::set_interrupt_handler(kernel::kVectorThunderboltData, &on_thunderbolt_interrupt, thunderbolt.get());
+            const uint8_t tb_vectors[2] = {kernel::kVectorThunderbolt, kernel::kVectorThunderboltData};     // (entry 0: the control channel, entry 1: the data rings)
+            if (thunderbolt_msix && thunderbolt_msix->enable(d.address, tb_vectors, 2, tb_apic_id) && thunderbolt->use_interrupts(true, 0, 1)) thunderbolt_msi_working = check_interrupt();
             if (!thunderbolt_msi_working) {
               thunderbolt->use_interrupts(false);
               thunderbolt_msix = UniquePointer<hardware::PciMsix>();
@@ -1217,7 +1262,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
             }
           }
           // networking to another host: offered in our properties, an interface for the network stack that gets an address when the cable's other end answers
-          thunderbolt_net = UniquePointer<hardware::ThunderboltNet>::make(shared_allocator, *thunderbolt->icm(), shared_allocator, smb_random);
+          if (thunderbolt->icm()) thunderbolt_net = UniquePointer<hardware::ThunderboltNet>::make(shared_allocator, *thunderbolt->icm(), shared_allocator, smb_random);
           if (thunderbolt_net && thunderbolt->icm()->offer_network(hardware::ThunderboltNet::offered_flags(hardware::ThunderboltNet::Config())) && thunderbolt_net->initialize()) {
             UniquePointer<hardware::ThunderboltNetLink> link = UniquePointer<hardware::ThunderboltNetLink>::make(shared_allocator, thunderbolt_net.get());
             hardware::ThunderboltNetLink* raw = link.get();
@@ -1226,7 +1271,15 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
             stacks.start_service();
           }
           Entry e(Level::Ok, "Thunderbolt");
-          e.text(thunderbolt->model()->name).text(thunderbolt_msix ? " (MSI-X)" : thunderbolt_msi_working ? " (MSI)" : " (polled)").text(", security level ").dec(static_cast<uint32_t>(thunderbolt->icm()->security_level())).text(", firmware ").dec(thunderbolt->icm()->driver_ready().rom_version).text(".").dec(thunderbolt->icm()->driver_ready().ram_version);
+          e.text(thunderbolt->model()->name).text(thunderbolt_msix ? " (MSI-X)" : thunderbolt_msi_working ? " (MSI)" : " (polled)");
+          if (thunderbolt->icm()) {
+            e.text(", security level ").dec(static_cast<uint32_t>(thunderbolt->icm()->security_level())).text(", firmware ").dec(thunderbolt->icm()->driver_ready().rom_version).text(".").dec(thunderbolt->icm()->driver_ready().ram_version);
+          } else if (thunderbolt->usb4()) {
+            // the connection manager is ours: the routers found, and tunnels left by the BIOS that were switched off
+            e.text(", software connection manager: ").dec(thunderbolt->usb4()->present_count()).text(" router(s)");
+            if (thunderbolt->usb4()->preboot_tunnels_closed()) e.text(", ").dec(thunderbolt->usb4()->preboot_tunnels_closed()).text(" tunnel(s) of the BIOS closed");
+            e.text("; no PCIe tunnel is made until one is approved");
+          }
         } else {
           Entry(Level::Warning, "Thunderbolt").text(thunderbolt->model() ? thunderbolt->model()->name : "controller").text(" not started: ").text(thunderbolt->message());
           thunderbolt = UniquePointer<hardware::ThunderboltDriver>();
@@ -1553,6 +1606,72 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         else e2.text(", ").dec(static_cast<uint32_t>(first.percent)).text("%").text(first.state == hardware::BatteryState::Charging ? ", charging" : first.state == hardware::BatteryState::Discharging ? ", discharging" : first.state == hardware::BatteryState::Full ? ", full" : "");
       }
     }
+#ifdef TCOS_ACPI_EVENTS
+    // The ACPI events: the general purpose events and the fixed buttons are read by the loop (and when the SCI arrives, at once), the embedded controller's events are asked for, and the
+    // buttons of the laptop (power, sleep, lid) are reported. With the Thunderbolt controller its _PRW wake event is armed too: the firmware's method for the event says Notify(device, 2).
+    hardware::SystemAcpiPorts acpi_ports(paging_ok ? &register_mapper : nullptr);
+    UniquePointer<hardware::AcpiEvents> acpi_events;
+    AcpiButtonSink acpi_buttons;
+    AcpiSciState acpi_sci;
+    UniquePointer<hardware::MmioIoApicWindow> acpi_ioapic_window;
+    UniquePointer<hardware::IoApic> acpi_ioapic;
+    bool acpi_sci_working = false;
+    if (acpi_tables.initialize()) {
+      acpi_events = UniquePointer<hardware::AcpiEvents>::make(shared_allocator, acpi_host, acpi_ports, shared_allocator);
+      if (acpi_events && acpi_events->initialize(acpi_tables) && acpi_events->enable_acpi_mode()) {
+        acpi_events->set_button_listener(&acpi_buttons);
+        const bool has_ec = acpi_events->enable_embedded_controller();
+        const uint32_t buttons = acpi_events->enable_buttons();
+        Entry(Level::Info, "ACPI").text("events: ").text(has_ec ? "embedded controller armed, " : "no embedded controller events, ").dec(buttons).text(" button source(s)");
+        bool lid = false;
+        if (acpi_events->lid_open(&lid)) Entry(Level::Info, "ACPI").text(lid ? "lid is open" : "lid is closed");
+        // the SCI: the I/O APIC input the MADT names, the vector kVectorAcpiSci to this core
+        const uint32_t apic_id = kernel::running() ? kernel::apic::this_apic_id() : 0xFFFF;
+        const ConstByteView madt = acpi_tables.find("APIC");
+        hardware::IoApicInfo ioapics[8];
+        const uint32_t ioapic_count = hardware::madt_ioapics(madt, ArrayView<hardware::IoApicInfo>(ioapics, 8));
+        const hardware::SciRoute route = hardware::madt_sci_route(madt, acpi_events->fadt().sci_interrupt);
+        if (paging_ok && apic_id <= 0xFF && ioapic_count != 0 && acpi_events->fadt().sci_interrupt != 0) {
+          for (uint32_t i = 0; i < ioapic_count && i < 8 && !acpi_sci_working; ++i) {
+            hardware::MmioRegion region;
+            if (!register_mapper.map_registers(ioapics[i].address, 0x20, &region)) continue;
+            acpi_ioapic_window = UniquePointer<hardware::MmioIoApicWindow>::make(shared_allocator, region);
+            if (!acpi_ioapic_window) break;
+            acpi_ioapic = UniquePointer<hardware::IoApic>::make(shared_allocator, *acpi_ioapic_window, ioapics[i].gsi_base);
+            if (acpi_ioapic && acpi_ioapic->contains(route.gsi)) {
+              acpi_sci.ioapic = acpi_ioapic.get();
+              acpi_sci.gsi = route.gsi;
+              kernel::set_interrupt_handler(kernel::kVectorAcpiSci, &on_acpi_sci, &acpi_sci);
+              acpi_sci_working = acpi_ioapic->route(route.gsi, kernel::kVectorAcpiSci, apic_id, route.level, route.active_low, false);
+              if (!acpi_sci_working) kernel::set_interrupt_handler(kernel::kVectorAcpiSci, nullptr, nullptr);
+            }
+            if (!acpi_sci_working) {
+              acpi_ioapic = UniquePointer<hardware::IoApic>();
+              acpi_ioapic_window = UniquePointer<hardware::MmioIoApicWindow>();
+            }
+          }
+        }
+        Entry(acpi_sci_working ? Level::Ok : Level::Info, "ACPI").text(acpi_sci_working ? "SCI: GSI " : "SCI not routed (events are polled); GSI ").dec(route.gsi).text(route.level ? ", level" : ", edge").text(route.active_low ? ", active low" : ", active high");
+      } else {
+        acpi_events = UniquePointer<hardware::AcpiEvents>();
+      }
+    }
+#endif
+#ifdef TCOS_THUNDERBOLT
+    ThunderboltWakeListener thunderbolt_wake;
+    uint32_t thunderbolt_wakes_seen = 0;
+    if (thunderbolt && acpi_events) {
+      acpi::Node* controller = acpi_events->find_pci_device(pci, thunderbolt_address);
+      thunderbolt_wake.events = acpi_events.get();
+      thunderbolt_wake.controller = controller;
+      acpi_events->set_listener(&thunderbolt_wake);
+      hardware::AcpiEvents::WakeSource source;
+      if (controller && acpi_events->wake_source(controller, &source) && acpi_events->enable_wake(controller))
+        Entry(Level::Ok, "Thunderbolt").text("wake: ACPI event ").dec(source.gpe).text(" armed (from sleep state S").dec(source.deepest_state).text(")");
+      else
+        Entry(Level::Info, "Thunderbolt").text(controller ? "the controller names no wake event in the ACPI tables" : "the controller is not described in the ACPI tables");
+    }
+#endif
     desktop.set_system_monitor(&monitor);
     desktop.set_clock_source(read_local_time, st);
     desktop.set_diagnostic_output(console::debug_puts);
@@ -1645,17 +1764,85 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         }
       }
 #endif
+#ifdef TCOS_ACPI_EVENTS
+      if (acpi_events) {
+        static uint32_t acpi_idle = 0;
+        // the events are read when the SCI came, and every so often regardless (about every 100 ms: a few port reads), in case it did not
+        if (__atomic_exchange_n(&acpi_sci.pending, 0, __ATOMIC_ACQ_REL) || ++acpi_idle >= 25) {
+          acpi_idle = 0;
+          acpi_events->poll();
+          if (acpi_sci_working && acpi_ioapic) {
+            const uint64_t flags = kernel::irq_save();                // (the index and data registers are a pair: not while the handler could use them)
+            acpi_ioapic->mask(acpi_sci.gsi, false);
+            kernel::irq_restore(flags);
+          }
+        }
+        static AcpiButtonSink acpi_seen;
+        if (acpi_buttons.power != acpi_seen.power) {
+          acpi_seen.power = acpi_buttons.power;
+          Entry(Level::Info, "ACPI").text("power button");
+          desktop.request_shutdown();
+        }
+        if (acpi_buttons.sleep != acpi_seen.sleep) {
+          acpi_seen.sleep = acpi_buttons.sleep;
+          desktop.notify(StringView("Power"), StringView("Sleep button pressed (this system cannot sleep yet)"), gui::NoticeKind::Information);
+        }
+        if (acpi_buttons.lid_closed != acpi_seen.lid_closed || acpi_buttons.lid_opened != acpi_seen.lid_opened) {
+          const bool closed = acpi_buttons.lid_closed != acpi_seen.lid_closed;
+          acpi_seen.lid_closed = acpi_buttons.lid_closed;
+          acpi_seen.lid_opened = acpi_buttons.lid_opened;
+          Entry(Level::Info, "ACPI").text(closed ? "lid closed" : "lid opened");
+          desktop.notify(StringView("Lid"), StringView(closed ? "The lid was closed" : "The lid was opened"), gui::NoticeKind::Information);
+        }
+      }
+#endif
 #ifdef TCOS_THUNDERBOLT
       if (thunderbolt) {
         static uint32_t tb_seen = 0, tb_idle = 0;                   // with MSI the channel is read when an interrupt came (and now and then in case one was lost)
         const uint32_t tb_arrived = thunderbolt->interrupts();
+#ifdef TCOS_THUNDERBOLT_RUNTIME_PM
+        static bool tb_asleep = false;                              // in D3hot: its registers are not read
+        static uint64_t tb_idle_since = hardware::uptime_us();
+        if (tb_asleep) {
+          // the wake: the firmware's notification (an ACPI event polled below) or, failing that, the PME status of the function
+          if (thunderbolt_wake.wakes != thunderbolt_wakes_seen || thunderbolt->wake_pending()) {
+            thunderbolt_wakes_seen = thunderbolt_wake.wakes;
+            tb_asleep = thunderbolt->resume() != hardware::ThunderboltDriver::Outcome::Started;
+            tb_idle_since = hardware::uptime_us();
+            Entry(tb_asleep ? Level::Warning : Level::Info, "Thunderbolt").text(tb_asleep ? "did not come back from runtime suspend" : "back from runtime suspend");
+          }
+        }
+        if (!tb_asleep)
+#endif
         if (!thunderbolt_msi_working || tb_arrived != tb_seen || ++tb_idle >= 250) {
           tb_seen = tb_arrived;
           tb_idle = 0;
           thunderbolt->poll();
           if (thunderbolt_net) thunderbolt_net->poll();
         }
-        const uint64_t now_devices = thunderbolt->icm()->device_count();
+#ifdef TCOS_THUNDERBOLT_RUNTIME_PM
+        // Idle (no device, no other host, the firmware allows it) for half a minute: sleep, with the wake armed in ACPI so that a plugged in cable is noticed.
+        if (!tb_asleep) {
+          const uint64_t tb_now = hardware::uptime_us();
+          if (thunderbolt->device_count() != 0 || thunderbolt->xdomain_count() != 0 || !acpi_events || !thunderbolt_wake.controller) {
+            tb_idle_since = tb_now;
+          } else if (tb_now - tb_idle_since >= 30000000ull && thunderbolt->runtime_allowed()) {
+            tb_idle_since = tb_now;                                  // (whatever happens, the next try is half a minute away)
+            if (thunderbolt->runtime_suspend(true)) {
+              tb_asleep = true;
+              Entry(Level::Info, "Thunderbolt").text(thunderbolt->wake_armed() ? "runtime suspend, wake armed" : "runtime suspend");
+            }
+          }
+        }
+#endif
+        if (acpi_events) {
+          if (thunderbolt_wake.wakes != thunderbolt_wakes_seen) {
+            thunderbolt_wakes_seen = thunderbolt_wake.wakes;
+            Entry(Level::Info, "Thunderbolt").text("woken by the firmware's notification");
+            thunderbolt->poll();                                     // (what woke it is in the control channel)
+          }
+        }
+        const uint64_t now_devices = thunderbolt->device_count();
         if (now_devices != thunderbolt_devices) {
           desktop.notify(StringView("Thunderbolt"), StringView(now_devices > thunderbolt_devices ? "A Thunderbolt device was connected (not authorized: no PCIe tunnel)" : "A Thunderbolt device was removed"),
                          gui::NoticeKind::Information);
@@ -1672,12 +1859,20 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       }
       hardware::delay_us(4000);
     }
+#ifdef TCOS_ACPI_EVENTS
+    if (acpi_sci_working && acpi_ioapic) {                           // (before the handler's state goes)
+      acpi_ioapic->mask(acpi_sci.gsi, true);
+      kernel::set_interrupt_handler(kernel::kVectorAcpiSci, nullptr, nullptr);
+    }
+#endif
 #ifdef TCOS_THUNDERBOLT
+    if (acpi_events && thunderbolt_wake.controller) acpi_events->disable_wake(thunderbolt_wake.controller);
     if (thunderbolt_link) thunderbolt_link->detach();                // (the network interface list keeps the entry; it stops using the connection before that goes)
     if (thunderbolt_msix || thunderbolt_msi) {                      // (before the driver goes: the handler holds a pointer to it)
       thunderbolt_msix = UniquePointer<hardware::PciMsix>();
       thunderbolt_msi = UniquePointer<hardware::PciMsi>();
       kernel::set_interrupt_handler(kernel::kVectorThunderbolt, nullptr, nullptr);
+      kernel::set_interrupt_handler(kernel::kVectorThunderboltData, nullptr, nullptr);
     }
 #endif
     desktop.save_browser_data();

@@ -20,6 +20,7 @@
 #include "Process/ModuleLoader.hpp"
 #include "Process/WindowsFiles.hpp"
 #include "Process/WindowsProcess.hpp"
+#include "Process/WindowsDebug.hpp"
 
 namespace process::windowsabi {
 
@@ -78,6 +79,7 @@ uint32_t nt_load_module(Process& p, const SyscallRequest& r) {
     for (uint32_t i = count; i > 0; --i) host->unload_module(loaded[i - 1].base);
     return kAccessViolation;
   }
+  for (uint32_t i = 0; i < count; ++i) debug_module_loaded(p, loaded[i].base);
   return kSuccess;
 }
 
@@ -105,7 +107,10 @@ uint32_t nt_release_module(Process& p, const SyscallRequest& r) {
 
 uint32_t nt_unload_module(Process& p, const SyscallRequest& r) {
   IModuleHost* host = p.module_host();
-  return host ? host->unload_module(r.args[0]) : kNotImplemented;
+  if (!host) return kNotImplemented;
+  const uint32_t status = host->unload_module(r.args[0]);
+  if (status == kSuccess) debug_module_unloaded(p, r.args[0]);
+  return status;
 }
 
 }  // namespace process::windowsabi

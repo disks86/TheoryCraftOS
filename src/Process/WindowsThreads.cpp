@@ -19,6 +19,7 @@
 #include "Process/AddressSpace.hpp"
 #include "Process/WindowsFiles.hpp"
 #include "Process/WindowsProcess.hpp"
+#include "Process/WindowsDebug.hpp"
 #include "Process/Objects.hpp"
 #include "Process/WindowsException.hpp"
 #include "Process/WindowsStartup.hpp"
@@ -111,6 +112,7 @@ uint32_t create_thread_in(Process& target, uint64_t start, uint64_t argument_val
   record->started = !suspended;
   record->suspend_count = suspended ? 1 : 0;
   *thread_id = id;
+  debug_thread_created(target, id, start);
   return kSuccess;
 }
 
@@ -255,6 +257,7 @@ uint32_t nt_create_thread_ex(Process& p, const SyscallRequest& r) {
   }
   record->started = !suspended;
   record->suspend_count = suspended ? 1 : 0;
+  debug_thread_created(p, id, start);
   return kSuccess;
 }
 
@@ -273,6 +276,7 @@ void end_thread(Process& p, Process::ThreadRecord& record, uint32_t code) {
     record.extra_tls_size[i] = 0;
   }
   if (ObjectManager* objects = system_objects()) { objects->abandon_thread(record.id); objects->process_exited(record.id, code); }      // (the second: a handle to the thread from another program)
+  debug_thread_exited(p, record.id, code);
   if (p.live_threads() == 0) p.terminate(code);
   if (p.runtime()) p.runtime()->notify();
   if (ObjectManager* objects = system_objects()) objects->notify();

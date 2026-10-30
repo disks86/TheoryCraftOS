@@ -93,7 +93,7 @@ uint64_t errno_of_or_zero(Status status) { return status == Status::Ok ? 0 : err
 int64_t path_error(PathResult r) {
   switch (r) {
     case PathResult::Empty:
-    case PathResult::Invalid: return -kEnoent;
+    case PathResult::Invalid: case PathResult::UnknownDrive: return -kEnoent;
     default: return -kEnametoolong;
   }
 }

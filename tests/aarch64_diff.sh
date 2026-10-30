@@ -20,11 +20,14 @@ wait
 clang --target=aarch64-linux-gnu -march=armv9.5-a -O1 -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -c tests/aarch64_diff/qprobe.c -o "$work/qprobe.o"
 clang --target=aarch64-linux-gnu -march=armv9.5-a -c tests/aarch64_diff/qstart.s -o "$work/qstart.o"
 "$lld" -static -nostdlib -e _start "$work/qstart.o" "$work/qprobe.o" -o "$work/qprobe.elf"
+clang --target=aarch64-linux-gnu -march=armv9.5-a+sme2 -DSME -O1 -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -c tests/aarch64_diff/qprobe.c -o "$work/qprobe_sme.o"
+"$lld" -static -nostdlib -e _start "$work/qstart.o" "$work/qprobe_sme.o" -o "$work/qprobe_sme.elf"
 export A64_PROBE="$work/probe" A64_QPROBE="$work/qprobe.elf"
 fail=0
 for mode in "${modes[@]}"; do
   for seed in $(seq 1 "$seeds"); do
     if [ "$mode" = words ]; then python3 tests/aarch64_diff/words.py "$seed" "$work" "$filter" "$perkey"; fi
+    if [ "$mode" = sme ]; then SME=1 A64_QPROBE="$work/qprobe_sme.elf" python3 tests/aarch64_diff/words.py "$seed" "$work" "$filter" "$perkey"; fi
     if [ "$mode" = svemem ]; then SVEMEM=1 python3 tests/aarch64_diff/words.py "$seed" "$work" "$filter" "$perkey"; fi
     python3 tests/aarch64_diff/gen.py "$mode" "$seed" "$work"
     llvm-mc -triple=aarch64-linux-gnu -mattr=+all -filetype=obj "$work/t.s" -o "$work/t.o"
