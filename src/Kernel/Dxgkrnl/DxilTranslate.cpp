@@ -69,7 +69,7 @@ struct Resource {
 enum DxOp : uint32_t {
   kLoadInput = 4, kStoreOutput = 5, kFAbs = 6, kSaturate = 7, kCos = 12, kSin = 13, kExp = 21, kFrc = 22, kLog = 23, kSqrt = 24, kRsqrt = 25, kRoundNe = 26, kRoundNi = 27, kRoundPi = 28, kRoundZ = 29,
   kFMax = 35, kFMin = 36, kIMax = 37, kIMin = 38, kUMax = 39, kUMin = 40, kIMul = 41, kUMul = 42, kFMad = 46, kIMad = 48, kUMad = 49, kDot2 = 54, kDot3 = 55, kDot4 = 56, kCreateHandle = 57,
-  kCBufferLoadLegacy = 59, kSample = 60, kSampleBias = 61, kSampleLevel = 62, kSampleGrad = 63, kTextureGather = 73, kTextureLoad = 66, kBufferLoad = 68, kBufferStore = 69, kAtomicBinOp = 78, kBarrier = 80, kDiscard = 82,
+  kCBufferLoadLegacy = 59, kCalculateLod = 81, kSample = 60, kSampleBias = 61, kSampleLevel = 62, kSampleGrad = 63, kTextureGather = 73, kTextureLoad = 66, kBufferLoad = 68, kBufferStore = 69, kAtomicBinOp = 78, kBarrier = 80, kDiscard = 82,
   kDerivCoarseX = 83, kDerivCoarseY = 84, kDerivFineX = 85, kDerivFineY = 86, kThreadId = 93, kGroupId = 94, kThreadIdInGroup = 95, kFlattenedThreadIdInGroup = 96,
 };
 
@@ -209,6 +209,7 @@ class Translator {
   bool ternary(const Instruction& ins, uint32_t dxbc_opcode, uint32_t first_arg);
   bool sincos(const Instruction& ins, bool cosine);
   bool texture_gather(const Instruction& ins);
+  bool calculate_lod(const Instruction& ins);
   bool sample_bias_grad(const Instruction& ins, bool gradients);
   bool inverse_trig(const Instruction& ins, uint32_t opcode);
   bool trig(const Instruction& ins, uint32_t opcode);
@@ -1360,6 +1361,33 @@ bool Translator::sample(const Instruction& ins, bool level) {
   return define(ins.result, r);
 }
 
+// CalculateLOD of a 2D texture: the lod instruction's x (clamped) or y (not).
+bool Translator::calculate_lod(const Instruction& ins) {
+  Val srv, smp;
+  uint64_t clamped = 0;
+  if (ins.arg_count < 7 || !resource_of(ins.args[1], 0, &srv) || !resource_of(ins.args[2], 3, &smp) || !constant_int(ins.args[6], &clamped)) return error(status::kNotSupported);
+  const Val r = new_scalar(ins.result);
+  uint32_t scratch = 0, result = 0;
+  if (r.kind == VK::None || !alloc_reg(pos_, &scratch) || !alloc_reg(pos_, &result)) return false;
+  if (!pack(ins.args + 3, 2, scratch, false)) return false;
+  {
+    const uint32_t at = begin(108);   // lod
+    dst_temp(result, 0xF);
+    put(2u | (1u << 2) | (0xE4u << 4) | (1u << 20));
+    put(scratch);
+    src_resource(srv.c);
+    src_sampler(smp.c);
+    finish(at);
+  }
+  Val component;
+  component.kind = VK::Temp, component.a = result, component.b = clamped ? 0u : 1u;
+  const uint32_t at = begin(54);
+  dst_scalar(r);
+  src(component);
+  finish(at);
+  return define(ins.result, r);
+}
+
 // sample_b (a bias) and sample_d (two gradients) of a 2D texture.
 bool Translator::sample_bias_grad(const Instruction& ins, bool gradients) {
   Val srv, smp;
@@ -1735,6 +1763,7 @@ bool Translator::dx_call(const Instruction& ins) {
     case kSampleBias: case kSampleGrad: return sample_bias_grad(ins, opcode == kSampleGrad);
     case kTextureLoad: return texture_load(ins);
     case kTextureGather: return texture_gather(ins);
+    case kCalculateLod: return calculate_lod(ins);
     case kThreadId: return thread_value(ins, 32, true);
     case kGroupId: return thread_value(ins, 33, true);
     case kThreadIdInGroup: return thread_value(ins, 34, true);

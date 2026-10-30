@@ -409,6 +409,15 @@ void scene_dxil_grad(Rig& rig, ArrayView<uint32_t> out) {
   textured_quad(rig, pipe, texture, target, graphics::Filter::Linear, out);
 }
 
+// CalculateLevelOfDetail (dxil_ps_lod_show.hlsl): the level the hardware works out for the coordinate against the interpreter's, from the quad.
+void scene_dxil_lod(Rig& rig, ArrayView<uint32_t> out) {
+  namespace b = conformance_blobs;
+  Handle pipe = dxbc_pipeline(rig, b::k_vs, sizeof b::k_vs, b::k_dxil_ps_lod_show, sizeof b::k_dxil_ps_lod_show, 1);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle texture = checker(rig);
+  textured_quad(rig, pipe, texture, target, graphics::Filter::Nearest, out);
+}
+
 // Draw a picture into a texture, then draw the texture onto the screen: a Direct3D 9 render target that is also a texture, and every Direct3D 11 / 12 post-processing step.
 void scene_render_to_texture(Rig& rig, ArrayView<uint32_t> out) {
   namespace b = conformance_blobs;
@@ -2295,6 +2304,7 @@ const Entry kScenes[] = {
     {"Direct3D 12 DXIL gather4 (Shader Model 6)", scene_dxil_gather},
     {"Direct3D 12 DXIL derivatives (Shader Model 6)", scene_dxil_derivatives},
     {"Direct3D 12 DXIL sample_d and sample_b (Shader Model 6)", scene_dxil_grad},
+    {"Direct3D 12 DXIL CalculateLevelOfDetail (Shader Model 6)", scene_dxil_lod},
     {"Direct3D 12 DXIL buffer shader resource views (Shader Model 6)", scene_dxil_compute_srv},
     {"Direct3D 12 DXIL group-shared memory, barriers and a loop (Shader Model 6)", scene_dxil_compute_shared},
     {"Direct3D 11 stream output of two streams (DXBC)", scene_stream_output},

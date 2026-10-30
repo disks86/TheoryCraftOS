@@ -948,7 +948,7 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
         store(ins.dst, b);
         break;
       }
-      case kTexGrad: case kTexBias: {
+      case kTexGrad: case kTexBias: case kTexQueryLod: {
         // sample_d (the gradients are given) and sample_b (they are the quad's differences of the coordinate): the level is log2 of the longer of the two gradients in texels, plus the bias
         b = {{0, 0, 0, 0}};
         const uint32_t unit = ins.src[1].number;
@@ -964,13 +964,19 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
               return;
             }
             gx = quad_difference(a, pc - 1, false, false), gy = quad_difference(a, pc - 1, true, false);
-            bias = fetch(ins.src[2], 0).f[0];
+            if (ins.op == kTexBias) bias = fetch(ins.src[2], 0).f[0];
           }
           const float fw = static_cast<float>(w), fh = static_cast<float>(h);
           const float lx = sqrt_(gx.f[0] * gx.f[0] * fw * fw + gx.f[1] * gx.f[1] * fh * fh), ly = sqrt_(gy.f[0] * gy.f[0] * fw * fw + gy.f[1] * gy.f[1] * fh * fh);
           const float rho = lx > ly ? lx : ly;
           const float lod = (rho > 0.0f ? static_cast<float>(fmath::ln(rho) * 1.4426950408889634) : -126.0f) + bias;
-          const graphics::Vec4 t = s.textures->sample_lod(unit, a.f[0], a.f[1], lod);
+          graphics::Vec4 t;
+          if (ins.op == kTexQueryLod) {
+            const float top = static_cast<float>(levels - 1);
+            t = {lod < 0.0f ? 0.0f : lod > top ? top : lod, lod, 0.0f, 0.0f};
+          } else {
+            t = s.textures->sample_lod(unit, a.f[0], a.f[1], lod);
+          }
           const float texel[4] = {t.x, t.y, t.z, t.w};
           b = {{texel[ins.tex_swizzle[0]], texel[ins.tex_swizzle[1]], texel[ins.tex_swizzle[2]], texel[ins.tex_swizzle[3]]}};
         }
