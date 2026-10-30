@@ -22,6 +22,7 @@
 #pragma once
 #include <stdint.h>
 #include <string.h>
+#include <functional>
 #include <map>
 #include <vector>
 #include "Crypto/Crypto.hpp"
@@ -120,10 +121,21 @@ class FakeNhi final : public hardware::ITbRegisters {
   bool firmware_comes_up_on_reset = true;    // a CIO reset after the ARC was told to wait for it starts the firmware
   uint32_t cio_resets = 0;
   uint32_t interrupt_mask_writes = 0, interrupt_clear_writes = 0;
+  std::function<void()> raise_interrupt;           // the MSI: called when a ring that is unmasked completes something
+  uint32_t notify_reads = 0, interrupts_raised = 0;
+  uint32_t unmasked[64] = {};                      // the interrupt enable registers as the host left them
+  uint32_t notify[96] = {};
 
   uint32_t read32(uint32_t offset) override {
     using namespace hardware::tb_reg;
     if (!present) return 0xFFFFFFFFu;
+    if (offset >= kRingNotifyBase && offset < kRingNotifyBase + 96 * 4 && (offset - kRingNotifyBase) % 4 == 0 && offset != kRingIntClear && offset != kRingIntClear + 4) {
+      uint32_t& n = notify[(offset - kRingNotifyBase) / 4];
+      const uint32_t v = n;
+      n = 0;
+      ++notify_reads;
+      return v;
+    }
     if (offset == kCaps) return (version << kCapsVersionShift) | hops;
     if (offset == kFirmwareStatus) return (icm_enabled ? kFwStsIcmEnable : 0) | (auth_done ? kFwStsNvmAuthDone : 0) | (fw_sts_written & (kFwStsCioResetRequest | kFwStsIcmEnableCpu | kFwStsIcmEnableInvert));
     if (offset == kOutmailCmd) return mode << kOutmailOpModeShift;
@@ -152,7 +164,11 @@ class FakeNhi final : public hardware::ITbRegisters {
       regs_[offset] = value;
       return;
     }
-    if (offset >= kRingInterruptMaskClearBase && offset < kRingInterruptMaskClearBase + 0x100) ++interrupt_mask_writes;
+    if (offset >= kRingInterruptBase && offset < kRingInterruptBase + 64 * 4 && (offset - kRingInterruptBase) % 4 == 0 && offset != kRingInterruptMaskClearBase) unmasked[(offset - kRingInterruptBase) / 4] = value;
+    if (offset >= kRingInterruptMaskClearBase && offset < kRingInterruptMaskClearBase + 0x100) {
+      ++interrupt_mask_writes;
+      if ((offset - kRingInterruptMaskClearBase) % 4 == 0 && (offset - kRingInterruptMaskClearBase) / 4 < 64) unmasked[(offset - kRingInterruptMaskClearBase) / 4] &= ~value;
+    }
     if (offset >= kRingIntClear && offset < kRingIntClear + 0x100) ++interrupt_clear_writes;
     if (is_ring_register(offset)) {
       Ring& r = ring_of(offset);
@@ -172,6 +188,16 @@ class FakeNhi final : public hardware::ITbRegisters {
     if (offset >= kTxOptionsBase && offset < kTxOptionsBase + 32 * 64) { if ((offset - kTxOptionsBase) % 32 == 0) tx_[(offset - kTxOptionsBase) / 32].options = value; return; }
     if (offset >= kRxOptionsBase && offset < kRxOptionsBase + 32 * 64) { if ((offset - kRxOptionsBase) % 32 == 0) rx_[(offset - kRxOptionsBase) / 32].options = value; return; }
     regs_[offset] = value;
+  }
+
+  // A descriptor of a ring completed: the chip raises the ring's bit and the MSI if the host unmasked it.
+  void completed(bool tx_ring, uint32_t hop) {
+    const uint32_t index = tx_ring ? hop : hop + hops;
+    const uint32_t reg = index / 32, bit = 1u << (index % 32);
+    if (reg >= 64 || !(unmasked[reg] & bit)) return;
+    notify[reg] |= bit;
+    ++interrupts_raised;
+    if (raise_interrupt) raise_interrupt();
   }
 
   // The root router is reset through the PCIe-to-CIO registers.
@@ -237,6 +263,7 @@ class FakeNhi final : public hardware::ITbRegisters {
       std::vector<uint8_t> bytes(buffer, buffer + length);
       d[2] = word | (0x2u << 20);                    // COMPLETED
       r.tail = (r.tail + 1) % r.size;
+      completed(true, hop);
       sent.push_back({hop, sof, eof, bytes});
       if (hop == 0) control_frame(eof, bytes);
     }
@@ -259,6 +286,7 @@ class FakeNhi final : public hardware::ITbRegisters {
       d[2] = (length & 0xFFF) | (uint32_t(f.eof & 0xF) << 12) | (uint32_t(f.sof & 0xF) << 16) | (flags << 20);
       r.tail = (r.tail + 1) % r.size;
       q.erase(q.begin());
+      completed(false, hop);
     }
   }
 

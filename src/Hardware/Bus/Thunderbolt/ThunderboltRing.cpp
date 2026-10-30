@@ -38,9 +38,34 @@ void write_shared32(uint32_t* p, uint32_t v) { *static_cast<volatile uint32_t*>(
 uint64_t tb_bus_address(const void* dma_memory) { return reinterpret_cast<uint64_t>(dma_memory); }
 
 void TbNhi::disable_interrupts() {
+  for (uint32_t& m : interrupt_mask_) m = 0;
   const uint32_t hops = hop_count();
   for (uint32_t i = 0; i < (31 + 2 * hops) / 32; ++i) registers_.write32(tb_reg::kRingInterruptMaskClearBase + i * 4, ~0u);
   for (uint32_t i = 0; i < (31 + 3 * hops) / 32; ++i) registers_.write32(tb_reg::kRingIntClear + i * 4, ~0u);
+}
+
+void TbNhi::set_control_interrupts(bool on) {
+  const uint32_t hops = hop_count();
+  if (hops == 0 || hops > 1023) return;
+  const uint32_t indexes[2] = {0, hops};         // hop 0, transmit and receive
+  for (uint32_t index : indexes) {
+    const uint32_t reg = index / 32, bit = 1u << (index % 32);
+    if (reg >= 64) continue;
+    if (on) {
+      interrupt_mask_[reg] |= bit;
+      registers_.write32(tb_reg::kRingInterruptBase + reg * 4, interrupt_mask_[reg]);
+    } else {
+      interrupt_mask_[reg] &= ~bit;
+      registers_.write32(tb_reg::kRingInterruptMaskClearBase + reg * 4, bit);
+    }
+  }
+}
+
+bool TbNhi::acknowledge_interrupt() {
+  const uint32_t hops = hop_count();
+  uint32_t any = 0;
+  for (uint32_t i = 0; i < (31 + 3 * hops) / 32 && i < 96; ++i) any |= registers_.read32(tb_reg::kRingNotifyBase + i * 4);
+  return any != 0;
 }
 
 bool TbNhi::wait_firmware_authenticated(uint32_t timeout_us) {
