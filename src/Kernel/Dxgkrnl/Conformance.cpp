@@ -1250,6 +1250,33 @@ void scene_d3d12_heap(Rig& rig, ArrayView<uint32_t> out) {
   rig.read(target, out);
 }
 
+// DXIL (Shader Model 6) shaders: a vertex shader with a constant buffer (a matrix and a tint) and two pixel shaders - one with a lot of arithmetic, one with branches and a discard - each
+// drawing a triangle in a half of the picture. The kernel translates the bitcode to the tokens of the same shader, so this checks that what comes out runs on the GPU as it does on the CPU.
+void scene_dxil(Rig& rig, ArrayView<uint32_t> out) {
+  namespace b = conformance_blobs;
+  Handle left = dxbc_pipeline(rig, b::k_dxil_vs, sizeof b::k_dxil_vs, b::k_dxil_ps_math, sizeof b::k_dxil_ps_math, 0);
+  Handle right = dxbc_pipeline(rig, b::k_dxil_vs, sizeof b::k_dxil_vs, b::k_dxil_ps_flow, sizeof b::k_dxil_ps_flow, 0);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  // (positions in the cell, colours, so that the varyings span ranges that take the branches both ways)
+  const Vertex v[6] = {{-0.9f, -0.9f, 0.5f, 0.9f, 0.1f, 0.1f, 1.0f}, {-0.05f, -0.9f, 0.5f, 0.1f, 0.9f, 0.4f, 1.0f}, {-0.45f, 0.9f, 0.5f, 0.2f, 0.3f, 0.9f, 0.6f},
+                       {0.05f, -0.9f, 0.5f, 0.9f, 0.1f, 0.1f, 1.0f}, {0.9f, -0.9f, 0.5f, 0.1f, 0.9f, 0.4f, 1.0f}, {0.45f, 0.9f, 0.5f, 0.2f, 0.3f, 0.9f, 0.6f}};
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  float constants[20];
+  for (uint32_t k = 0; k < 16; ++k) constants[k] = kIdentity[k];
+  constants[16] = 1.0f, constants[17] = 0.9f, constants[18] = 1.0f, constants[19] = 1.0f;   // (the tint)
+  CommandWriter w(rig.allocator());
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(constants, sizeof constants));
+  w.bind_pipeline(left);
+  w.draw(3, 0);
+  w.bind_pipeline(right);
+  w.draw(3, 3);
+  w.end_pass();
+  rig.render(w, {target, vb});
+  rig.read(target, out);
+}
+
 // Group-shared memory and barriers (cs_shared.hlsl): 16 groups of 8 x 8 threads, each writing a slot of a 64-word shared array, reading its neighbour's after a barrier, and the 64 slots added
 // by a reduction with a barrier in its loop. The picture is the buffer: red the neighbour's value, green the sum, blue the thread.
 void scene_compute_shared(Rig& rig, ArrayView<uint32_t> out) {
@@ -2187,6 +2214,7 @@ const Entry kScenes[] = {
     {"Direct3D 12 root signature, descriptors and states: compute (DXBC)", scene_d3d12_compute},
     {"Direct3D 12 root signature, descriptors and states: textures (DXBC)", scene_d3d12_textures},
     {"Direct3D 12 resource heap: a target and a texture aliased (DXBC)", scene_d3d12_heap},
+    {"Direct3D 12 DXIL shaders (Shader Model 6)", scene_dxil},
     {"Direct3D 11 stream output of two streams (DXBC)", scene_stream_output},
     {"Direct3D 11 stream output appending, statistics and timestamps (DXBC)", scene_stream_output_append},
     {"Direct3D 11 stream output of vertex and domain shaders (DXBC)", scene_stream_output_stages},
