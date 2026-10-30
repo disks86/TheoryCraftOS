@@ -234,6 +234,7 @@ struct PipelineDesc {
   bool independent_blend = false;    // needs kFeatureIndependentBlend: target n (1..3) blends with target_blend[n - 1], target 0 with `blend` (see graphics::GraphicsPipelineDesc)
   graphics::BlendState target_blend[graphics::kMaxColorTargets - 1];
   bool multisample = false;          // needs kFeatureMultisample: coverage per sample in a pass of multisampled images (see graphics::GraphicsPipelineDesc::multisample)
+  bool alpha_to_coverage = false;    // with multisample: the first target's alpha says how many samples a pixel's colour reaches (see graphics::GraphicsPipelineDesc::alpha_to_coverage)
   uint32_t color_target_count = 1;   // the colour outputs the pixel shader fills (SV_Target0 ..); more than one needs the adapter's kFeatureMultipleTargets, and a pass with that many targets
 };
 

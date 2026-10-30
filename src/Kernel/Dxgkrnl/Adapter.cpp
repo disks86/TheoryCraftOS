@@ -224,7 +224,10 @@ class Adapter::StreamRunner {
 
   NtStatus begin_query(ByteReader& p) {
     const uint32_t index = p.le32(), offset = p.le32();
+    uint32_t kind = 0;
+    if (!p.at_end()) kind = p.le32();
     if (!exact(p) || !in_pass_ || query_open_ || !(adapter_.caps_.features & graphics::kFeatureOcclusionQueries)) return kBad;
+    if (kind > static_cast<uint32_t>(graphics::QueryKind::PsInvocations) || (kind != 0 && !(adapter_.caps_.features & graphics::kFeatureStatisticsQueries))) return kBad;
     Allocation* a = alloc(index);
     if (!a || !a->is_query_result() || offset % 8 || offset > a->desc().size - 8) return kBad;
     if (queries_in_stream_ >= graphics::kMaxOcclusionQueries) return kBad;
@@ -234,7 +237,7 @@ class Adapter::StreamRunner {
     const NtStatus s = ensure_cb();
     if (s != status::kSuccess) return s;
     if (!pending_.push_back({a, offset, next_slot_})) return status::kNoMemory;
-    cb_->begin_occlusion_query(next_slot_++);
+    cb_->begin_query(next_slot_++, static_cast<graphics::QueryKind>(kind));
     return status::kSuccess;
   }
 
@@ -965,7 +968,8 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
         static_cast<uint32_t>(t.color_op) > 4 || static_cast<uint32_t>(t.alpha_op) > 4 || t.write_mask > 0xF)
       return status::kInvalidParameter;
   if (d.independent_blend && !(caps_.features & graphics::kFeatureIndependentBlend)) return status::kNotSupported;
-  if (d.multisample && !(caps_.features & graphics::kFeatureMultisample)) return status::kNotSupported;
+  if ((d.multisample || d.alpha_to_coverage) && !(caps_.features & graphics::kFeatureMultisample)) return status::kNotSupported;
+  if (d.alpha_to_coverage && !d.multisample) return status::kInvalidParameter;
   if (hull || domain) {
     if (!hull || !domain || hull->stage() != graphics::ShaderStage::Hull || domain->stage() != graphics::ShaderStage::Domain || hull->tess_output_points() != domain->tess_input_points() || hull->tess_domain() != domain->tess_domain()) return status::kInvalidParameter;
     if (!(caps_.features & graphics::kFeatureTessellation)) return status::kNotSupported;
@@ -995,6 +999,7 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   pd.blend = bs;
   pd.independent_blend = d.independent_blend;
   pd.multisample = d.multisample;
+  pd.alpha_to_coverage = d.alpha_to_coverage;
   pd.geometry_shader = geometry ? geometry->module() : nullptr;
   pd.hull_shader = hull ? hull->module() : nullptr;
   pd.domain_shader = domain ? domain->module() : nullptr;

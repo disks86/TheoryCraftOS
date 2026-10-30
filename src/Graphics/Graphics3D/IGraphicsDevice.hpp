@@ -429,6 +429,9 @@ struct GraphicsPipelineDesc {
   // kFeatureMultisample, on a pass with several samples per pixel: with multisample the triangle covers the samples whose positions it contains and depth and stencil are tested for each
   // (the shader still runs once per pixel); without it a pixel is all or nothing by its centre, as Direct3D 9 draws. Lines and points cover every sample of their pixel.
   bool multisample = false;
+  // With multisample: the samples a pixel's shader result reaches are the first round(alpha * samples) of the covered ones, alpha being the first target's (which samples of a partly
+  // covered pixel get it is up to the device; of a wholly covered pixel, only how many - and a real GPU may truncate where this rounds: 0.7 of 4 samples kept 2 on the one tried).
+  bool alpha_to_coverage = false;
   // kFeatureGeometryShaders: a geometry shader module run between the vertex and fragment shaders (nullptr: none). What it takes must be what the draws make (triangles, lines or points).
   const IShaderModule* geometry_shader = nullptr;
   // kFeatureTessellation: the hull and domain shader modules of a pipeline for PatchList draws (both or neither).
@@ -456,6 +459,7 @@ class IPipeline {
 enum class IndexType : uint8_t { Uint16, Uint32 };
 
 // What the vertices of a draw make (set_primitive_topology, DeviceFeature kFeatureLines for anything but triangles). Lines and points are one pixel wide.
+enum class QueryKind : uint8_t { Occlusion, OcclusionPredicate, IaVertices, IaPrimitives, VsInvocations, PsInvocations };
 enum class PrimitiveTopology : uint8_t { TriangleList, LineList, PointList, PatchList };   // (PatchList: kFeatureTessellation, with set_patch_control_points)
 
 struct Viewport {
@@ -517,6 +521,12 @@ class ICommandBuffer {
   // discard) are counted - one per pixel, however many targets the pipeline writes and whatever the blending or write masks do. `slot` (below kMaxOcclusionQueries) names the result; one query is open at a time and
   // it ends before the pass does. A device without the feature ignores both.
   virtual void begin_occlusion_query(uint32_t slot) { (void)slot; }
+  // The other queries (kFeatureStatisticsQueries), begun and ended the same way and read with occlusion_result: OcclusionPredicate is 1 if any fragment passed, else 0; IaVertices the vertices
+  // the draws between begin and end took (a draw of n vertices and i instances: n * i), IaPrimitives the primitives they assembled (a patch is a primitive), VsInvocations the vertex shader
+  // runs (a device may run it fewer times than there are vertices, by reusing results) and PsInvocations the fragment shader runs (a device may shade more pixels than it writes).
+  virtual void begin_query(uint32_t slot, QueryKind kind) {
+    if (kind == QueryKind::Occlusion) begin_occlusion_query(slot);
+  }
   virtual void end_occlusion_query() {}
   // After submit(): the count of a query that was begun and ended (false for a slot that was not).
   virtual bool occlusion_result(uint32_t slot, uint64_t* samples) const {
@@ -544,6 +554,7 @@ enum DeviceFeature : uint32_t {
   kFeatureLines = 1u << 4,         // set_primitive_topology: lines and points
   kFeatureFloatFormats = 1u << 6,      // Format::R16G16B16A16Float / R32G32B32A32Float images: colour attachments (also several at once) and sampled textures, without mipmaps; read_pixels_float / write_pixels_float
   kFeatureTessellation = 1u << 16,     // ShaderStage::Hull / Domain, GraphicsPipelineDesc::hull_shader / domain_shader, PrimitiveTopology::PatchList
+  kFeatureStatisticsQueries = 1u << 18,  // QueryKind other than Occlusion (with kFeatureOcclusionQueries)
   kFeatureSnormFormats = 1u << 17,     // Format::R16G16B16A16Snorm, R10G10B10A2Unorm
   kFeatureSrgbFormats = 1u << 13,      // Format::B8G8R8A8Srgb / R8G8B8A8Srgb
   kFeatureUnorm16Formats = 1u << 14,   // Format::R16G16B16A16Unorm (also kFeatureFloatFormats' read_pixels_float / write_pixels_float)

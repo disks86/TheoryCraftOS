@@ -468,7 +468,7 @@ class VirglPipeline final : public VirglPipelineBase {
     }
     cmd[n++] = virgl::header(virgl::kCreateObject, virgl::kObjectBlend, 11);
     cmd[n++] = blend_;
-    cmd[n++] = desc.independent_blend ? 1u : 0u;  // s0: independent blend enable (no logic op, dither...)
+    cmd[n++] = (desc.independent_blend ? 1u : 0u) | (desc.alpha_to_coverage && desc.multisample ? 1u << 3 : 0u);  // s0: independent blend enable, alpha to coverage (no logic op, dither...)
     cmd[n++] = 0;  // s1
     cmd[n++] = blend_rt;
     for (uint32_t i = 1; i < 8; ++i) cmd[n++] = desc.independent_blend && i < kMaxColorTargets ? (desc.target_blend[i - 1].custom ? render_target_blend(desc.target_blend[i - 1]) : 0xFu << 27) : 0u;
@@ -899,13 +899,18 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         break;
       }
       case RecordedCommand::Type::BeginQuery: {
-        if (!in_pass || queries.open != kMaxOcclusionQueries || cmd.unit >= kMaxOcclusionQueries || queries.used[cmd.unit]) return false;
+        if (!in_pass || queries.open != kMaxOcclusionQueries || cmd.unit >= kMaxOcclusionQueries || queries.used[cmd.unit] || cmd.count > static_cast<uint32_t>(QueryKind::PsInvocations)) return false;
         queries.results[cmd.unit] = make<VirglBuffer>(gpu_.allocator(), *this, 16, 0, virgl::kBindCustom);
         if (!queries.results[cmd.unit] || !queries.results[cmd.unit]->valid()) return false;
         const uint32_t handle = new_handle();
         stream.command(virgl::kCreateObject, virgl::kObjectQuery, 4);
         stream.put(handle);
-        stream.put(virgl::kQueryOcclusionCounter);
+        {
+          const QueryKind kind = static_cast<QueryKind>(cmd.count);
+          stream.put(kind == QueryKind::Occlusion ? virgl::kQueryOcclusionCounter
+                     : kind == QueryKind::OcclusionPredicate ? virgl::kQueryOcclusionPredicate
+                                                             : virgl::kQueryPipelineStatistics | ((kind == QueryKind::IaVertices ? 0u : kind == QueryKind::IaPrimitives ? 1u : kind == QueryKind::VsInvocations ? 2u : 7u) << 16));
+        }
         stream.put(0);
         stream.put(queries.results[cmd.unit]->id());
         stream.command(virgl::kBeginQuery, 0, 1);
