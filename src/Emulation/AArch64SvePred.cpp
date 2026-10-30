@@ -239,7 +239,7 @@ bool AArch64Cpu::sve_predicate(uint32_t insn) {
         const uint16_t gp = s_.p[pn], dn = s_.p[pd];
         int last = -1;
         for (uint32_t i = 0; i < elements; ++i)
-          if (active(gp, i, esz) && active(dn, i, esz)) last = static_cast<int>(i);
+          if (active(dn, i, esz)) last = static_cast<int>(i);      // (the last active element of the destination, wherever the governing predicate is)
         uint16_t r = 0;
         for (uint32_t i = static_cast<uint32_t>(last + 1); i < elements; ++i)
           if (active(gp, i, esz)) { r = static_cast<uint16_t>(1u << (i << esz)); break; }
@@ -353,11 +353,14 @@ bool AArch64Cpu::sve_predicate(uint32_t insn) {
     }
     if (sel == 0x0C) {      // WHILEWR / WHILERW
       const bool rw = bit4;
-      const int64_t diff = (static_cast<int64_t>(reg(rm, true)) - static_cast<int64_t>(reg(rn, true))) / static_cast<int64_t>(1u << esz);
+      // WHILEWR compares unsigned operands, WHILERW signed ones (as qemu does); the division by the element size rounds toward zero
+      const I128 raw = rw ? static_cast<I128>(static_cast<int64_t>(reg(rm, true))) - static_cast<I128>(static_cast<int64_t>(reg(rn, true)))
+                          : static_cast<I128>(reg(rm, true)) - static_cast<I128>(reg(rn, true));
+      const I128 diff128 = raw >= 0 ? raw >> esz : -((-raw) >> esz);
+      const I128 absdiff = diff128 < 0 ? -diff128 : diff128;
       uint16_t r = 0;
-      const int64_t absdiff = diff < 0 ? -diff : diff;
       for (uint32_t i = 0; i < elements; ++i) {
-        const bool cond = rw ? (absdiff == 0 || static_cast<int64_t>(i) < absdiff) : (diff <= 0 || static_cast<int64_t>(i) < diff);
+        const bool cond = rw ? (absdiff == 0 || static_cast<I128>(i) < absdiff) : (diff128 <= 0 || static_cast<I128>(i) < diff128);
         if (cond) r = static_cast<uint16_t>(r | (1u << (i << esz)));
         else break;
       }

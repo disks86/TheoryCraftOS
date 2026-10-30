@@ -18,6 +18,7 @@
 #pragma once
 #include <stdint.h>
 #include "Emulation/AArch64NeonCommon.hpp"
+#include "Emulation/Wide.hpp"
 
 // Helpers shared by the SVE files (AArch64Sve*.cpp). The vector length is fixed at 128 bits, so a Z register is the low and high word of the V register of the same number, a
 // predicate register is 16 bits (one per byte of the vector), and an element of size 2^esz bytes is active when the predicate bit at (index << esz) is set.
@@ -86,6 +87,24 @@ inline bool decode_logical_immediate(uint32_t imm13, uint64_t* out) {
   for (uint32_t i = 0; i < 64; i += esize) value |= element << i;
   *out = value;
   return true;
+}
+
+// The low 64 bits of a product (wrapping, so a 64-bit element times itself is not signed overflow).
+inline uint64_t product_bits(int64_t a, int64_t b) { return static_cast<uint64_t>(a) * static_cast<uint64_t>(b); }
+
+// A signed 64 x 64 product as a 128-bit integer (built from the unsigned product, so that no compiler runtime routine is needed).
+inline I128 multiply_signed(int64_t a, int64_t b) {
+  const bool negative = (a < 0) != (b < 0);
+  uint64_t hi, lo;
+  multiply_unsigned(a < 0 ? uint64_t{0} - static_cast<uint64_t>(a) : static_cast<uint64_t>(a), b < 0 ? uint64_t{0} - static_cast<uint64_t>(b) : static_cast<uint64_t>(b), &hi, &lo);
+  const I128 magnitude = (static_cast<I128>(hi) << 64) | lo;
+  return negative ? -magnitude : magnitude;
+}
+
+// (acc * 2^w + 2 * prod + round) >> w, evaluated as acc + ((prod + 2^(w-2)) >> (w-1)) so that nothing exceeds 128 bits even for 64-bit elements.
+inline I128 doubling_high(I128 acc, I128 prod, uint32_t w, bool rounding) {
+  const I128 half_unit = rounding ? (static_cast<I128>(1) << (w - 2)) : 0;
+  return acc + ((prod + half_unit) >> (w - 1));
 }
 
 // The high half of a 64 x 64 product, signed or unsigned.

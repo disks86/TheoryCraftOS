@@ -74,8 +74,11 @@ Linux programs only (there is no AArch64 Windows interface). Files: `AArch64Cpu.
   single, double and BFloat16 arithmetic of FEAT_B16B16), SVE2 widening and narrowing arithmetic, `sqdmull` and friends, complex integer arithmetic (`cmla`, `sqrdcmlah`, `cdot`, `cadd`), dot products and
   8-bit matrix multiplies, bit permutes (`bext`/`bdep`/`bgrp`), `histcnt`/`histseg`/`match`, `pmull`, AES / SM4 / `rax1` on Z registers, and every load and store: contiguous (one to four registers, sign and
   zero extending, non-temporal, `ld1rq`/`ld1r*`), first-fault and non-fault (a fault that is not on the first active element is suppressed and clears FFR from there), gathers and scatters with vector bases
-  or offsets, `ldr`/`str` of Z and P registers, and prefetches (accepted, no effect). **Not implemented**: SME (ZA, streaming mode), SVE2.1/2.2 (the quadword reductions, predicate-as-counter, `pmov`/`psel`/`pext`,
-  multi-vector forms, `ld1q`/`st1q`, `ld2q`..), the FP8 and BFloat16 dot products / `fmmla` / `bfmlal*` of the newer extensions, `luti`, and `ld1ro*` (undefined at this length, as in qemu).
+  or offsets, `ldr`/`str` of Z and P registers, and prefetches (accepted, no effect). Also present from the newer extensions: BFloat16 (`bfdot`, `bfmmla`, `bfmlalb/t`, `bfmlslb/t`, `bfmla`/`bfmls`/`bfmul` by element; the dot
+  products and the matrix multiply round to odd at each step, flush denormals, produce the default NaN and report no exceptions, as qemu does), the half-to-single `fmlalb/t`, `fmlslb/t`, `fdot`, `fmmla` (single),
+  `fclamp`/`bfclamp`, the quadword reductions (`addqv`, `smaxqv`, `faddqv`, ...), `fcmla` by element. **Not implemented**: SME (ZA, streaming mode), the rest of SVE2.1/2.2 (predicate-as-counter registers and
+  `pmov`/`psel`/`pext`/paired `while*`, zeroing-predicated conversions, multi-vector narrowing, `ld1q`/`st1q`, `ld2q`..), the FP8 conversions, dot products and multiplies, `luti`, `firstp`/`lastp`, and `ld1ro*`
+  (undefined at this length, as in qemu).
 - **Other user-mode extensions**: scalar half precision (`FEAT_FP16`), `bfcvt`, `fjcvtzs`, `frint32/64`, exclusive pairs (`ldxp`/`stxp`), `casp*`, LRCPC2/3 (`ldapur`, `stlur`, `ldapr`/`stlr` with writeback),
   CSSC (`smax`/`smin`/`umax`/`umin` with registers and immediates, `abs`, `cnt`, `ctz`), `crc32*`, and pointer tags: the top byte of a user address is ignored (TBI), as Linux runs user code.
 - **Not implemented** (an undefined-instruction fault, never a wrong result): SME, the newest SVE extensions (above), pointer authentication (`ldraa`, `pacga`, ...), MTE (`irg`, `stg`, `ldg`, ...), FEAT_MOPS (`cpy*`, `set*`),
@@ -89,8 +92,7 @@ modes use hand-written generators; the `words` mode (`SVE=1` for the SVE space, 
 rewritten to land in the scratch buffer) need none: it draws random 32-bit words, keeps those `llvm-mc` (all features) decodes, re-assembles them to the same bits (so no should-be-zero
 field is set) and runs a few per mnemonic and operand shape, e.g. `tests/aarch64_diff.sh words --seeds 3 --filter '^(sq|uq)' --perkey 8`. It also reports which sampled forms the emulator lacks
 (`tests/aarch64_diff/probe.cpp`), which is the decode-coverage measure: of about 594,000 canonical base-ISA words in a 2-million-word sample the emulator now lacks 8.7% (mostly the Armv9.4+ features listed
-above); of the SVE forms qemu implements, about 88% by mnemonic and operand shape are present (the rest are the SVE2.1 / SME2 additions and the FP8 / newer BFloat16 forms), and all of those it has agree with
-qemu. Two qemu differences are known: it does not load a first-fault or non-fault element that is the first active one but sits in the upper half of the register (the architecture requires the load), and
+above); of the SVE forms qemu implements, about 90% by mnemonic and operand shape are present (the rest are the SVE2.1 / SME2 additions and the FP8 forms), and all of those it has agree with qemu. Two qemu differences are known: it does not load a first-fault or non-fault element that is the first active one but sits in the upper half of the register (the architecture requires the load), and
 the NaN sign of some rotated `fcmla` results. `qprobe.c` / `qstart.s` filter the words qemu itself rejects. It needs clang's AArch64 target, `llvm-mc`, an AArch64-capable `ld.lld` (rustup's works) and `qemu-aarch64`, so it is not in `run_host_tests.sh`.
 `tests/data/emulation/guest-aarch64.elf` is the checked-in build of the test guest (`clang --target=aarch64-linux-gnu -O2 -static -nostdlib -ffreestanding
 -fno-builtin -fno-stack-protector -ffp-contract=off -fuse-ld=lld tests/data/emulation/guest.c`); its output must equal the x86-64 build's.
