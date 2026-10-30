@@ -193,6 +193,18 @@ EXPORT BOOL WINAPI GetTokenInformation(HANDLE token, int class_, PVOID info, DWO
       memset(info, 0, 4);
       return TRUE;
     }
+    case 10: {      /* TokenStatistics: a primary token without privileges (see AdjustTokenPrivileges) */
+      if (returned) *returned = 56;
+      if (capacity < 56) { SetLastError(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+      DWORD *words = info;
+      memset(info, 0, 56);
+      words[0] = 0x1000; words[2] = 0x3E7;      /* TokenId, AuthenticationId */
+      words[4] = words[5] = 0x7FFFFFFF;         /* ExpirationTime: never */
+      words[6] = 1;                             /* TokenType: TokenPrimary */
+      words[7] = 0;                             /* ImpersonationLevel */
+      words[12] = 0x1000;                       /* ModifiedId */
+      return TRUE;
+    }
     case 18: case 20: {      /* TokenElevationType (1 = default, as if UAC had already allowed it), TokenElevation (1 = elevated: there is nothing this OS refuses a program) */
       if (returned) *returned = 4;
       if (capacity < 4) { SetLastError(ERROR_INSUFFICIENT_BUFFER); return FALSE; }

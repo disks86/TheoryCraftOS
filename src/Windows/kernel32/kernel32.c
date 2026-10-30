@@ -3312,15 +3312,15 @@ EXPORT HANDLE WINAPI CreateFileW(LPCWSTR path, DWORD access, DWORD share, LPSECU
   WCHAR buffer[PATH_CHARS + 8];
   UNICODE_STRING name;
   OBJECT_ATTRIBUTES attributes;
+  const BOOL is_pipe = (path[0] == '\\' || path[0] == '/') && (path[1] == '\\' || path[1] == '/') && path[2] == '.' && (path[3] == '\\' || path[3] == '/') && (path[4] | 0x20) == 'p' &&
+                       (path[5] | 0x20) == 'i' && (path[6] | 0x20) == 'p' && (path[7] | 0x20) == 'e' && (path[8] == '\\' || path[8] == '/' || path[8] == 0);      /* \\.\pipe\ */
   {
     const size_t_ plen = wcslen(path);
     /* a name that ends in a separator is a directory: opening it as a file finds no such path */
-    if (!(flags & FILE_FLAG_BACKUP_SEMANTICS) && is_separator(path[plen - 1]) && !(plen == 3 && path[1] == ':')) { set_error(ERROR_PATH_NOT_FOUND); return INVALID_HANDLE_VALUE; }
+    if (!(flags & FILE_FLAG_BACKUP_SEMANTICS) && is_separator(path[plen - 1]) && !(plen == 3 && path[1] == ':') && !is_pipe) {      /* (a pipe's name may end in one) */ set_error(ERROR_PATH_NOT_FOUND); return INVALID_HANDLE_VALUE; }
     /* \\.\Volume{GUID}: the raw volume, which no program here may open */
     if (is_separator(path[0]) && is_separator(path[1]) && path[2] == '.' && is_separator(path[3]) && vol_prefix_ci(path + 4, (const WCHAR *)L"Volume{544f5343-0000-4000-8000-000000000001}") && !path[4 + 44]) { set_error(ERROR_ACCESS_DENIED); return INVALID_HANDLE_VALUE; }
   }
-  const BOOL is_pipe = (path[0] == '\\' || path[0] == '/') && (path[1] == '\\' || path[1] == '/') && path[2] == '.' && (path[3] == '\\' || path[3] == '/') && (path[4] | 0x20) == 'p' &&
-                       (path[5] | 0x20) == 'i' && (path[6] | 0x20) == 'p' && (path[7] | 0x20) == 'e' && (path[8] == '\\' || path[8] == '/' || path[8] == 0);      /* \\.\pipe\ */
   if (is_pipe) {
     WCHAR normal[300];
     size_t_ i = 0;
