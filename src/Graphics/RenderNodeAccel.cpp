@@ -73,7 +73,7 @@ void RenderNode::build_accelerated(hardware::VirtioGpu* virtio, hardware::Vmware
       reason_ = "the Intel render engine did not start or did not draw the test picture";
     }
   } else if (intel) {
-    reason_ = "the Intel render engine is off (build with TCOS_INTEL_RENDER to try it)";
+    reason_ = "the Intel render engine is off (built with TCOS_INTEL_RENDER=OFF)";
   } else {
     reason_text_.assign("the display adapter has no 3D driver: ");
     reason_text_.append(gpu_ ? gpu_->name() : "none");

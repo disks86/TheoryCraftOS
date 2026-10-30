@@ -56,6 +56,9 @@ class IwlScanner final : private IIwlNotificationHandler {
   // Copies the networks found, strongest first; returns how many fit.
   uint32_t results(ArrayView<WifiNetwork> out) const;
   uint32_t frames_seen() const { return frames_seen_; }
+  // Every notification is also passed on (the station link reads the frames and the transmit responses from the same stream).
+  void set_forward(IIwlNotificationHandler* next) { forward_ = next; }
+  uint8_t auxiliary_station_id() const { return 0; }
 
  private:
   void on_notification(const IwlRxPacket& packet) override;
@@ -66,6 +69,7 @@ class IwlScanner final : private IIwlNotificationHandler {
   allocators::IAllocator& allocator_;
   IwlCommandQueue aux_queue_;
   List<WifiNetwork> networks_;
+  IIwlNotificationHandler* forward_ = nullptr;
   const IwlFirmware* firmware_ = nullptr;
   IwlNvmData nvm_;
   bool ready_ = false, scanning_ = false, last_completed_ = false;

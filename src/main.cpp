@@ -576,7 +576,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
 
   // 2D and 3D rendering: the GPU's 3D engine where we can drive it, the software renderer otherwise.
 #ifdef TCOS_INTEL_RENDER
-  constexpr bool kIntelRender = true;    // the Gen9.5 render engine path (opt-in: it has not run on real hardware)
+  constexpr bool kIntelRender = true;    // the Gen9.5 render engine path (on by default; it has not run on real hardware, so its self-test decides: -DTCOS_INTEL_RENDER=OFF to keep the CPU renderer)
 #else
   constexpr bool kIntelRender = false;
 #endif
