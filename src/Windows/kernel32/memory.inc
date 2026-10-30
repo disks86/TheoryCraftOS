@@ -202,8 +202,8 @@ static HANDLE mem_realloc(int local, HANDLE h, SIZE_T size, UINT flags) {
       return h;
     }
     const SIZE_T have = RtlSizeHeap(heap(), 0, e->ptr);
-    if (locked && !moveable && size > have) { set_error(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
-    void *p = RtlReAllocateHeap(heap(), zero ? HEAP_ZERO_MEMORY : 0, e->ptr, size);
+    const int in_place = locked && !moveable && size > have;      /* (a locked block that may not move grows where it is, or not at all) */
+    void *p = RtlReAllocateHeap(heap(), (zero ? HEAP_ZERO_MEMORY : 0) | (in_place ? 0x10 /* HEAP_REALLOC_IN_PLACE_ONLY */ : 0), e->ptr, size);
     if (!p) { set_error(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
     e->ptr = p;
     return h;
