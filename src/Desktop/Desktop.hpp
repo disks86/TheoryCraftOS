@@ -73,6 +73,7 @@
 #include "Gui/Windows/TabFrame.hpp"
 #include "Gui/Windows/WindowManager.hpp"
 #include "Gui/Windows/WindowSwitcher.hpp"
+#include "Hardware/Backlight/IBacklight.hpp"
 #include "Hardware/Monitor/SystemMonitors.hpp"
 
 namespace desktop {
@@ -131,6 +132,15 @@ class Desktop {
   void set_program_launcher(IProgramLauncher* launcher);
   Paint& paint() { return paint_; }
   MediaPlayer& media_player() { return media_player_; }
+  // The backlight the brightness keys change (nullptr: none, the keys do nothing). It must outlive the desktop.
+  void set_backlight(hardware::IBacklight* backlight) { backlight_ = backlight; }
+  // Changes the brightness by `delta_percent` (negative: darker) and shows the level. False without a backlight that takes it.
+  bool adjust_brightness(int delta_percent);
+  // The same for the master volume and the mute.
+  bool adjust_volume(int delta_percent);
+  bool toggle_mute();
+  // Key presses of the function row as the desktop acts on them: true if the key was one of those (and so is not for the focused program).
+  bool handle_media_key(uint8_t usage) { return on_media_key(usage); }
   Graphics3DTest& graphics_test() { return graphics_test_; }
   // The machine's graphics for the 3D test window (nullptr: it says there is none). They must outlive the desktop.
   void set_graphics(dxgk::Kernel* kernel, graphics::SystemGraphics* graphics) { graphics_test_.set_graphics(kernel, graphics); }
@@ -321,6 +331,8 @@ class Desktop {
   static void on_database_query(void* self, gui::Control&);
   static void on_web_browser(void* self, gui::Control&);
   static bool on_shortcut(void* self, const gui::KeyArgs& args);
+  // The keys of the keyboard's function row (volume, mute, brightness, play/pause) and the same from other places (a button of the firmware's video extensions).
+  bool on_media_key(uint8_t usage);
   static void on_terminal(void* self, gui::Control&);
   static void on_calculator(void* self, gui::Control&);
   static void on_calendar(void* self, gui::Control&);
@@ -434,6 +446,8 @@ class Desktop {
   database::DatabaseManager* databases_ = nullptr;
   browser::IPageLoader* page_loader_ = nullptr;
   audio::AudioMixer* media_mixer_ = nullptr;
+  hardware::IBacklight* backlight_ = nullptr;
+  uint32_t osd_toast_ = 0;
   hardware::SystemVideoCodecs* media_codecs_ = nullptr;
   const hardware::IClock* media_clock_ = nullptr;
   database::local::SystemSettings* settings_ = nullptr;

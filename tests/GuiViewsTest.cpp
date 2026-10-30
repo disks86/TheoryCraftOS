@@ -36,6 +36,7 @@
 #include "Desktop/CopyProgressDialog.hpp"
 #include "Desktop/ColorDialog.hpp"
 #include "Desktop/Desktop.hpp"
+#include "Hardware/Backlight/IBacklight.hpp"
 #include "Desktop/PrintDialog.hpp"
 #include "Desktop/FileDialog.hpp"
 #include "Desktop/MediaPlayer.hpp"
@@ -2982,6 +2983,36 @@ static void test_media_player() {
         sound_player.close_media();
         CHECK(sound_player.kind() == desktop::MediaPlayer::Kind::None && sound_player.audio_player()->state() == audio::PlayerState::Empty);
       }
+      // The playlist: the media files of the folder, by name (song.mid is not there yet); next / previous go through them, the end of a track goes on to the next.
+      {
+        auto run = [&](int rounds) {
+          for (int i = 0; i < rounds; ++i) {
+            sound_player.audio_player()->update();
+            mixer.pump();
+            device.play_all();
+            sound_player.pump();
+          }
+        };
+        CHECK(sound_player.open_file("/tone.flac") && sound_player.playlist().count() == 2 && sound_player.playlist().current() == 0);
+        CHECK(sound_player.next_track() && sound_player.path().equals("/tone.wav") && sound_player.playlist().current() == 1);
+        CHECK(!sound_player.next_track() && sound_player.path().equals("/tone.wav"));                                    // (the end of the list)
+        run(3);
+        CHECK(sound_player.previous_track() && sound_player.path().equals("/tone.flac"));                                 // (played for less than 3 s: the one before)
+        CHECK(sound_player.previous_track() && sound_player.path().equals("/tone.flac") && sound_player.playlist().current() == 0);   // (the start: this one again)
+        // played through: on to the next track by itself (16000 frames at 8 kHz)
+        run(400);
+        CHECK(sound_player.path().equals("/tone.wav") && sound_player.playlist().current() == 1);
+        // stopped by hand in the middle: stays
+        sound_player.audio_player()->seek(4000);
+        sound_player.audio_player()->stop();
+        run(10);
+        CHECK(sound_player.path().equals("/tone.wav"));
+        sound_player.close_media();
+        CHECK(!sound_player.next_track() && !sound_player.previous_track());
+        // a file picked in another folder replaces the list
+        sound_player.playlist().clear();
+        CHECK(sound_player.playlist().count() == 0 && sound_player.playlist().following(true) == desktop::Playlist::kNone);
+      }
       // A MIDI file: played by the software synthesizer, or on the MIDI hardware when the machine has some.
       {
         static const uint8_t kSong[] = {'M', 'T', 'h', 'd', 0, 0, 0, 6, 0, 0, 0, 1, 0x01, 0xE0, 'M', 'T', 'r', 'k', 0, 0, 0, 13,
@@ -2993,7 +3024,7 @@ static void test_media_player() {
         file.reset();
         CHECK(desktop::MediaPlayer::is_media_name("tune.MID") && desktop::MediaPlayer::is_media_name("tune.midi") && desktop::MediaPlayer::is_media_name("x.kar"));
         CHECK(sound_player.open_file("/song.mid") && sound_player.kind() == desktop::MediaPlayer::Kind::Audio && !notices.showing());
-        CHECK(sound_player.status_label().text().equals("Playing /song.mid (synthesized)") && sound_player.audio_player()->duration() >= 48000);
+        CHECK(sound_player.status_label().text().equals("Playing /song.mid (synthesized) (1 of 3)") && sound_player.audio_player()->duration() >= 48000);
         int loud = 0;
         for (int i = 0; i < 40; ++i) {
           sound_player.audio_player()->update();
@@ -3012,7 +3043,7 @@ static void test_media_player() {
           void reset() override {}
         } hardware;
         sound_player.set_midi_output(&hardware);
-        CHECK(sound_player.open_file("/song.mid") && sound_player.status_label().text().equals("Playing /song.mid (on the MIDI hardware)"));
+        CHECK(sound_player.open_file("/song.mid") && sound_player.status_label().text().equals("Playing /song.mid (on the MIDI hardware) (1 of 3)"));
         for (int i = 0; i < 40; ++i) {
           sound_player.audio_player()->update();
           mixer.pump();
@@ -5668,6 +5699,85 @@ static void test_desktop_shortcuts() {
     d.ask_shut_down();
     press(hardware::key::kLeftGui, hardware::modifier::kLeftGui);
     CHECK(!d.start_button().open());
+  }
+  CHECK(a.live == 0);
+}
+
+struct FakeBacklight final : hardware::IBacklight {
+  uint8_t level = 50;
+  bool refuse = false;
+  const char* name() const override { return "fake backlight"; }
+  bool initialize() override { return true; }
+  void shutdown() override {}
+  uint32_t steps() const override { return 11; }
+  bool percent(uint8_t* out) override { *out = level; return true; }
+  bool set_percent(uint8_t p) override { if (refuse) return false; level = p; return true; }
+};
+
+// The function row: volume, mute and brightness keys act on the mixer and the backlight and are not passed on; without a backlight the brightness keys do nothing.
+static void test_desktop_media_keys() {
+  namespace key = hardware::key;
+  TestAllocator a;
+  FakeDevice dev;
+  FakeBacklight light;
+  {
+    audio::AudioMixer mixer(dev, a);
+    CHECK(mixer.initialize());
+    Screen screen(a, 800, 600);
+    desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+    d.set_media_services(&mixer, nullptr, nullptr);
+    d.window().layout();
+    Window& w = d.window();
+    auto press = [&](uint8_t usage) { KeyArgs k; k.usage = usage; w.key(k); };
+    // volume
+    mixer.set_master_volume(50);
+    press(key::kVolumeUp);
+    CHECK(dev.vol == 56 && d.toasts().count() == 1);
+    press(key::kVolumeUp);
+    CHECK(dev.vol == 62 && d.toasts().count() == 1);                            // (the notice is replaced, not stacked)
+    press(key::kVolumeDown);
+    CHECK(dev.vol == 56);
+    mixer.set_master_volume(97);
+    press(key::kVolumeUp);
+    CHECK(dev.vol == 100);
+    mixer.set_master_volume(3);
+    press(key::kVolumeDown);
+    CHECK(dev.vol == 0);
+    press(key::kMute);
+    CHECK(dev.mute);
+    press(key::kMute);
+    CHECK(!dev.mute);
+    press(key::kMute);
+    press(key::kVolumeUp);                                                      // louder ends the mute
+    CHECK(!dev.mute && dev.vol == 6);
+    // brightness
+    press(key::kBrightnessUp);
+    CHECK(light.level == 50);                                                   // (no backlight yet)
+    d.set_backlight(&light);
+    press(key::kBrightnessUp);
+    CHECK(light.level == 60);
+    press(key::kBrightnessDown);
+    press(key::kBrightnessDown);
+    CHECK(light.level == 40);
+    light.level = 95;
+    press(key::kBrightnessUp);
+    CHECK(light.level == 100);
+    light.level = 5;
+    press(key::kBrightnessDown);
+    CHECK(light.level == 0);
+    light.refuse = true;
+    light.level = 30;
+    CHECK(!d.adjust_brightness(10) && light.level == 30);
+    // the keys work over a dialog as well
+    d.ask_shut_down();
+    light.refuse = false;
+    press(key::kBrightnessUp);
+    CHECK(light.level == 40);
+    // ordinary keys are not taken
+    CHECK(!d.handle_media_key(key::kTab) && !d.handle_media_key(4));
+    CHECK(!d.handle_media_key(key::kMediaNext) && !d.handle_media_key(key::kMediaPrevious));          // (the player is not open: the keys are left alone)
+    CHECK(desktop::Playlist::folder_of("/a/b/c.mp3").equals("/a/b") && desktop::Playlist::folder_of("/c.mp3").equals("/") && desktop::Playlist::folder_of("c.mp3").empty());
+    mixer.stop_service();
   }
   CHECK(a.live == 0);
 }
@@ -8506,6 +8616,7 @@ int main() {
   test_tile_button();
   test_wheel_switching();
   test_desktop_shortcuts();
+  test_desktop_media_keys();
   test_tabs();
   test_spreadsheet_grid();
   test_spreadsheet_app();

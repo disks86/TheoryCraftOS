@@ -25,6 +25,13 @@
 #include <map>
 #include <vector>
 #include "Hardware/Acpi/AcpiEvents.hpp"
+#include "Hardware/Acpi/DellWmiHotkeys.hpp"
+#include "Hardware/Backlight/AcpiBacklight.hpp"
+#include "Hardware/Backlight/AcpiVideoKeys.hpp"
+#include "Hardware/Backlight/IntelPchBacklight.hpp"
+#include "Hardware/Keyboard/KeyCodes.hpp"
+#include "Hardware/Sensor/AcpiAmbientLight.hpp"
+#include "Hardware/Sensor/SensorHub.hpp"
 
 using namespace acpi;
 using namespace hardware;
@@ -444,7 +451,190 @@ static void test_buttons() {
   }
 }
 
+
+// A panel with the video extensions: _BCL, _BCM (stores the level) and _BQC; a second display without _BCM that must not be taken; GPE 0x10 notifies "brighter".
+static Bytes make_video_dsdt(bool with_query) {
+  const Bytes levels = package(9, cat({num(80), num(40), num(10), num(20), num(40), num(60), num(80), num(100), num(20)}));   // (unsorted, one twice)
+  Bytes lcd_body = cat({name_def("_ADR", num(0x400)), name_def("_BCL", levels), method("_BCM", 1, store(b({0x68}), path("\\_SB.BRTV")))});
+  if (with_query) lcd_body = cat({lcd_body, method("_BQC", 0, cat({b({0xA4}), path("\\_SB.BRTV")}))});
+  const Bytes lcd = device("LCD0", lcd_body);
+  const Bytes crt = device("CRT0", cat({name_def("_ADR", num(0x100)), name_def("_BCL", levels)}));
+  const Bytes video = device("VID0", cat({name_def("_HID", num(0x0A0AD041)), lcd, crt}));
+  const Bytes ec = device("EC0", cat({name_def("_HID", num(0x090CD041)), name_def("_GPE", num(0x23)), method("_Q60", 0, notify("\\_SB.VID0.LCD0", 0x86))}));   // (the keys come through the controller)
+  return cat({scope("\\_SB", cat({name_def("BRTV", num(40)), video, ec}))});
+}
+
+struct StepCounter {
+  int up = 0, down = 0;
+  static void step(void* self, bool brighter) { auto* c = static_cast<StepCounter*>(self); (brighter ? c->up : c->down)++; }
+};
+
+struct FakeBank final : intel_gt::IRegisterBank {
+  std::map<uint64_t, uint32_t> r;
+  uint32_t read32(uint64_t o) override { return r[o]; }
+  void write32(uint64_t o, uint32_t v) override { r[o] = v; }
+};
+
+static void test_backlight() {
+  for (bool with_query : {true, false}) {
+    TestAllocator alloc;
+    FakeHost host;
+    FakePorts ports;
+    const Bytes dsdt = make_table("DSDT", make_video_dsdt(with_query));
+    const Bytes fadt = make_fadt();
+    const ConstByteView tables[1] = {ConstByteView(dsdt.data(), dsdt.size())};
+    AcpiEvents events(host, ports, alloc);
+    CHECK(events.initialize(tables, 1, ConstByteView(fadt.data(), fadt.size())) && events.enable_acpi_mode());
+    Node* found[4];
+    CHECK(AcpiBacklight::find_devices(events.interpreter(), found, 4) == 1);                  // (the display without _BCM is not a backlight)
+    AcpiBacklight light(events.interpreter(), found[0]);
+    CHECK(light.initialize() && light.steps() == 6);
+    uint8_t now = 0;
+    if (with_query) {
+      CHECK(light.percent(&now) && now == 33);                                               // level 40 of 10..100
+    } else {
+      CHECK(!light.percent(&now));                                                           // nobody told us yet
+    }
+    CHECK(light.set_percent(100) && light.percent(&now) && now == 100);
+    uint64_t stored = 0;
+    CHECK(events.interpreter().evaluate_integer("\\_SB.BRTV", &stored) && stored == 100);
+    CHECK(light.set_percent(0) && light.percent(&now) && now == 0);
+    CHECK(events.interpreter().evaluate_integer("\\_SB.BRTV", &stored) && stored == 10);
+    CHECK(light.set_percent(50) && events.interpreter().evaluate_integer("\\_SB.BRTV", &stored) && stored == 60);   // nearest of 10 20 40 60 80 100 to 55
+    CHECK(light.set_percent(250) && events.interpreter().evaluate_integer("\\_SB.BRTV", &stored) && stored == 100);
+    // the firmware's own brightness keys
+    StepCounter counter;
+    AcpiVideoKeys keys(light, &StepCounter::step, &counter);
+    CHECK(events.add_listener(&keys));
+    CHECK(events.enable_embedded_controller());
+    host.ec_events.push_back(0x60);
+    ports.raise(0x23);
+    events.poll();
+    CHECK(counter.up == 1 && counter.down == 0);
+    keys.on_notify(found[0], 0x87);
+    keys.on_notify(found[0], 0x85);
+    keys.on_notify(nullptr, 0x86);
+    CHECK(counter.up == 1 && counter.down == 1);
+  }
+  {   // a table without any panel, and a list that is not a list
+    TestAllocator alloc;
+    FakeHost host;
+    FakePorts ports;
+    const Bytes bad = make_table("DSDT", scope("\\_SB", device("LCD0", cat({name_def("_BCL", num(5)), method("_BCM", 1, b({0xA4, 0x00}))}))));
+    const Bytes fadt = make_fadt();
+    const ConstByteView tables[1] = {ConstByteView(bad.data(), bad.size())};
+    AcpiEvents events(host, ports, alloc);
+    CHECK(events.initialize(tables, 1, ConstByteView(fadt.data(), fadt.size())));
+    Node* found[2];
+    const uint32_t n = AcpiBacklight::find_devices(events.interpreter(), found, 2);
+    CHECK(n == 1);
+    AcpiBacklight light(events.interpreter(), found[0]);
+    uint8_t now;
+    CHECK(!light.initialize() && !light.set_percent(10) && !light.percent(&now));
+  }
+  {   // the PCH PWM: refuses to start one, and scales the duty to the period the firmware chose
+    FakeBank bank;
+    IntelPchBacklight off(bank);
+    CHECK(!off.initialize());
+    bank.r[IntelPchBacklight::kControl2] = (1000u << 16) | 500;
+    CHECK(!off.initialize());                                                                // (not enabled)
+    uint8_t now;
+    CHECK(!off.percent(&now) && !off.set_percent(10) && bank.r[IntelPchBacklight::kControl2] == ((1000u << 16) | 500));
+    bank.r[IntelPchBacklight::kControl1] = IntelPchBacklight::kEnable;
+    IntelPchBacklight on(bank);
+    CHECK(on.initialize() && on.steps() == 256 && on.percent(&now) && now == 50);
+    CHECK(on.set_percent(25) && bank.r[IntelPchBacklight::kControl2] == ((1000u << 16) | 250) && on.percent(&now) && now == 25);
+    CHECK(on.set_percent(200) && (bank.r[IntelPchBacklight::kControl2] & 0xFFFF) == 1000);
+    bank.r[IntelPchBacklight::kControl2] = (0u << 16) | 5;
+    IntelPchBacklight noperiod(bank);
+    CHECK(!noperiod.initialize());
+  }
+}
+
+static Bytes words(std::initializer_list<uint16_t> w) { Bytes r; for (uint16_t v : w) { r.push_back(static_cast<uint8_t>(v)); r.push_back(static_cast<uint8_t>(v >> 8)); } return r; }
+static Bytes buffer_obj(const Bytes& data) { return cat({b({0x11}), pkg(cat({num(data.size()), data}))}); }
+
+static void test_dell_wmi() {
+  namespace K = hardware::key;
+  uint8_t keys[8];
+  // type 0: one code; type 0x10: every code of the entry; the unknown ones are skipped
+  CHECK(dell_wmi_decode(ConstByteView(words({2, 0, 0x109}).data(), 6), keys, 8) == 1 && keys[0] == K::kMute);
+  const Bytes two = words({3, 0x10, 0x57, 0x150, 2, 0, 0xE006});
+  CHECK(dell_wmi_decode(ConstByteView(two.data(), two.size()), keys, 8) == 3 && keys[0] == K::kBrightnessDown && keys[1] == kDellMicMute && keys[2] == K::kBrightnessUp);
+  CHECK(dell_wmi_decode(ConstByteView(two.data(), two.size()), keys, 2) == 2);                      // (the capacity)
+  const Bytes unknown = words({2, 0, 0xE0F0, 0, 0});
+  CHECK(dell_wmi_decode(ConstByteView(unknown.data(), unknown.size()), keys, 8) == 0);             // (a zero length stops)
+  const Bytes toolong = words({9, 0x10, 0x57});
+  CHECK(dell_wmi_decode(ConstByteView(toolong.data(), toolong.size()), keys, 8) == 0);             // (the entry does not fit)
+  CHECK(dell_wmi_decode(ConstByteView(), keys, 8) == 0);
+  for (size_t n = 0; n <= two.size(); ++n) dell_wmi_decode(ConstByteView(two.data(), n), keys, 8);   // cut anywhere
+  for (size_t bit = 0; bit < two.size() * 8; ++bit) { Bytes f = two; f[bit / 8] ^= static_cast<uint8_t>(1u << (bit % 8)); dell_wmi_decode(ConstByteView(f.data(), f.size()), keys, 8); }
+
+  // through the tables: a WMI device with the event block, an event from the embedded controller
+  const Bytes wdg = cat({b({0x94, 0x59, 0xBB, 0x9D, 0x97, 0xA9, 0xDA, 0x11, 0xB0, 0x12, 0xB6, 0x22, 0xA1, 0xEF, 0x54, 0x92, 0xD0, 0x00, 0x01, 0x08}),
+                         b({1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 'A', 'A', 1, 0})});
+  const Bytes wmi = device("WMI0", cat({name_def("_HID", num(0x140CD041)), name_def("_WDG", buffer_obj(wdg)), method("_WED", 1, cat({b({0xA4}), buffer_obj(two)}))}));
+  const Bytes plain = device("WMI1", cat({name_def("_HID", num(0x140CD041)), name_def("_WDG", buffer_obj(wdg.size() > 20 ? Bytes(wdg.begin() + 20, wdg.end()) : wdg))}));
+  const Bytes ec = device("EC0", cat({name_def("_HID", num(0x090CD041)), name_def("_GPE", num(0x23)), method("_Q70", 0, notify("\\_SB.WMI0", 0xD0)), method("_Q71", 0, notify("\\_SB.WMI0", 0xD1))}));
+  const Bytes dsdt = make_table("DSDT", scope("\\_SB", cat({wmi, plain, ec})));
+  const Bytes fadt = make_fadt();
+  const ConstByteView tables[1] = {ConstByteView(dsdt.data(), dsdt.size())};
+  TestAllocator alloc;
+  FakeHost host;
+  FakePorts ports;
+  AcpiEvents events(host, ports, alloc);
+  CHECK(events.initialize(tables, 1, ConstByteView(fadt.data(), fadt.size())) && events.enable_acpi_mode() && events.enable_embedded_controller());
+  std::vector<uint8_t> got;
+  auto sink = [](void* c, uint8_t k) { static_cast<std::vector<uint8_t>*>(c)->push_back(k); };
+  DellWmiHotkeys hotkeys(events.interpreter(), sink, &got, true);
+  CHECK(hotkeys.scan() == 1);                                                                       // (the second device has no event block of Dell's)
+  CHECK(events.add_listener(&hotkeys));
+  host.ec_events.push_back(0x70);
+  ports.raise(0x23);
+  events.poll();
+  CHECK(got.size() == 3 && got[0] == K::kBrightnessDown && got[1] == kDellMicMute && got[2] == K::kBrightnessUp);
+  got.clear();
+  host.ec_events.push_back(0x71);                                                                   // (another notify id: not ours)
+  ports.raise(0x23);
+  events.poll();
+  CHECK(got.empty());
+  DellWmiHotkeys no_brightness(events.interpreter(), sink, &got, false);
+  CHECK(no_brightness.scan() == 1);
+  no_brightness.on_notify(events.interpreter().find("\\_SB.WMI0"), 0xD0);
+  CHECK(got.size() == 1 && got[0] == kDellMicMute);
+  no_brightness.on_notify(nullptr, 0xD0);
+}
+
+static Bytes str(const char* s) { Bytes r = b({0x0D}); while (*s) r.push_back(static_cast<uint8_t>(*s++)); r.push_back(0); return r; }
+
+static void test_ambient_light() {
+  const Bytes light = device("ALS0", cat({name_def("_HID", str("ACPI0008")), name_def("LUX", num(250)), method("_ALI", 0, cat({b({0xA4}), path("\\_SB.ALS0.LUX")}))}));
+  const Bytes broken = device("ALS1", cat({name_def("_HID", str("ACPI0008"))}));                       // (no _ALI: not a sensor)
+  const Bytes other = device("DEV3", cat({name_def("_HID", str("PNP0C0A")), method("_ALI", 0, cat({b({0xA4}), num(7)}))}));
+  const Bytes dsdt = make_table("DSDT", scope("\\_SB", cat({light, broken, other})));
+  const Bytes fadt = make_fadt();
+  const ConstByteView tables[1] = {ConstByteView(dsdt.data(), dsdt.size())};
+  TestAllocator alloc;
+  FakeHost host;
+  FakePorts ports;
+  AcpiEvents events(host, ports, alloc);
+  CHECK(events.initialize(tables, 1, ConstByteView(fadt.data(), fadt.size())));
+  Node* found[4];
+  CHECK(AcpiAmbientLight::find_devices(events.interpreter(), found, 4) == 1);
+  AcpiAmbientLight sensor(events.interpreter(), found[0]);
+  SensorHub hub;
+  SensorReading r;
+  CHECK(sensor.initialize() && sensor.kind() == SensorKind::AmbientLight && hub.add(&sensor));
+  CHECK(hub.read(SensorKind::AmbientLight, &r) && r.x == 250.0f && r.sequence == 1);
+  CHECK(sensor.read(&r) && r.sequence == 2);
+  AcpiAmbientLight none(events.interpreter(), nullptr);
+  CHECK(!none.initialize());
+}
+
 int main() {
+  test_ambient_light();
+  test_dell_wmi();
+  test_backlight();
   test_fadt();
   test_buttons();
   test_memory_blocks();

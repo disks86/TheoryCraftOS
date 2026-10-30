@@ -124,6 +124,25 @@ class KeyboardDiff {
   KeyboardState previous_;
 };
 
+// Consumer control keys (page 0x0C, usage 1): volume, mute, play/pause, next, previous, stop and the brightness keys of a keyboard's media row, as the codes of key:: that carry them
+// (kVolumeUp ... kBrightnessDown). Other consumer usages are not keys we carry and are left out. A report holds them as single bits (a variable item per usage), as a run of bits
+// for a usage range, or as an array of usage numbers.
+uint8_t consumer_usage_to_key(uint16_t usage);
+
+class ConsumerDecoder {
+ public:
+  bool init(const InputReport& report);
+  bool valid() const { return valid_; }
+  // The keys down in a report (in KeyboardState::keys; the modifiers are zero).
+  bool decode(ConstByteView data, KeyboardState* out) const;
+
+ private:
+  bool valid_ = false;
+  InputField fields_[InputReport::kMaxFields];
+  uint32_t count_ = 0;
+  uint32_t bytes_ = 0;
+};
+
 class PointerDecoder {
  public:
   // Finds the buttons, the X and Y axes and the wheel in a pointing device's report.

@@ -35,7 +35,9 @@ namespace hardware {
 
 namespace hid_usage {
 constexpr uint16_t kPageGenericDesktop = 0x01, kPageButton = 0x09, kPageDigitizer = 0x0D;
+constexpr uint16_t kPageSensor = 0x20;
 constexpr uint16_t kPointer = 0x01, kMouse = 0x02, kX = 0x30, kY = 0x31;
+constexpr uint16_t kPen = 0x02, kStylus = 0x20, kInRange = 0x32, kTipPressure = 0x30, kBarrelSwitch = 0x44, kInvert = 0x3C, kEraser = 0x45, kSecondaryBarrel = 0x5A, kXTilt = 0x3D, kYTilt = 0x3E;
 constexpr uint16_t kTouchPad = 0x05, kTouchScreen = 0x04, kFinger = 0x22, kTipSwitch = 0x42, kConfidence = 0x47, kContactId = 0x51, kContactCount = 0x54, kScanTime = 0x56, kWidth = 0x48, kHeight = 0x49;
 }  // namespace hid_usage
 
@@ -49,6 +51,7 @@ struct HidInputField {
   int32_t logical_min = 0, logical_max = 0;
   int32_t physical_min = 0, physical_max = 0;
   int32_t unit = 0, unit_exponent = 0;
+  uint8_t application = 0;             // index of the top level (application) collection it is in
   int8_t slot = -1;                    // the finger collection (counted within the report id) the field is in, -1 outside any
   HidField field() const {
     HidField f;
@@ -63,6 +66,20 @@ struct HidInputField {
   }
 };
 
+// A feature item: what the host can set on the device. A variable item is one field (owner = its own usage); an array item (the selectors of "reporting state": No Events, All
+// Events, ...) is one field whose value is the index in `usages`, and its owner is the logical collection around it.
+struct HidFeature {
+  uint8_t report_id = 0;
+  uint8_t application = 0;             // as HidInputField::application
+  uint16_t owner_page = 0, owner_usage = 0;
+  uint32_t bit_offset = 0;
+  uint8_t bit_size = 0;
+  bool is_array = false;
+  int32_t logical_min = 0, logical_max = 0;
+  uint16_t usages[8] = {};             // the selectors of an array item (usage page = the owner's)
+  uint8_t usage_count = 0;
+};
+
 struct HidApplication {
   uint16_t usage_page = 0, usage = 0;
 };
@@ -71,11 +88,14 @@ class HidInputMap {
  public:
   static constexpr uint32_t kMaxFields = 512, kMaxApplications = 8, kMaxSlots = 16;
 
-  explicit HidInputMap(allocators::IAllocator& allocator) : fields_(allocator) {}
+  explicit HidInputMap(allocators::IAllocator& allocator) : fields_(allocator), features_(allocator) {}
 
   bool parse(ConstByteView descriptor);
 
   ArrayView<const HidInputField> fields() const { return ArrayView<const HidInputField>(fields_.view().data(), fields_.count()); }
+  ArrayView<const HidFeature> features() const { return ArrayView<const HidFeature>(features_.view().data(), features_.count()); }
+  // The bytes of the feature report with this id (the id byte included).
+  uint32_t feature_report_bytes(uint8_t report_id) const { return (feature_bits_[report_id] + 7) / 8; }
   // The field with this usage in the finger slot (-1: outside the fingers) of the report, or nullptr.
   const HidInputField* find(uint8_t report_id, uint16_t usage_page, uint16_t usage, int8_t slot) const;
   uint32_t slots(uint8_t report_id) const;                // fingers in the report
@@ -88,6 +108,8 @@ class HidInputMap {
 
  private:
   List<HidInputField> fields_;
+  List<HidFeature> features_;
+  uint32_t feature_bits_[256] = {};
   HidApplication applications_[kMaxApplications] = {};
   uint32_t application_count_ = 0;
   bool uses_ids_ = false;

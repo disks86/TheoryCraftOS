@@ -91,6 +91,9 @@
 #include "Hardware/VMware/VmwareTools.hpp"
 #include "Hardware/SystemInput.hpp"
 #include "Hardware/Mouse/I2c/PlatformI2cHid.hpp"
+#include "Hardware/Pen/PenMouse.hpp"
+#include "Hardware/Sensor/AcpiAmbientLight.hpp"
+#include "Hardware/Sensor/SensorHub.hpp"
 #ifdef TCOS_BLUETOOTH
 #include "Hardware/Bluetooth/BluetoothService.hpp"
 #include "Hardware/Bluetooth/HidOverGatt.hpp"
@@ -119,6 +122,10 @@
 #include "Hardware/Acpi/SystemAcpiHost.hpp"
 #include "Hardware/Acpi/SystemAcpiPorts.hpp"
 #include "Hardware/Acpi/AcpiEvents.hpp"
+#include "Hardware/Acpi/DellWmiHotkeys.hpp"
+#include "Hardware/Backlight/AcpiBacklight.hpp"
+#include "Hardware/Backlight/AcpiVideoKeys.hpp"
+#include "Hardware/Backlight/IntelPchBacklight.hpp"
 #include "Hardware/Acpi/IoApic.hpp"
 #include "Hardware/Battery/AcpiBattery.hpp"
 #include "SystemMonitor.hpp"
@@ -1031,11 +1038,19 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   hardware::SystemAcpiHost i2c_acpi_host(&pci, paging_ok ? &mmio : nullptr);
   hardware::MmioI2cRegisterSource i2c_registers(register_mapper);
   hardware::PlatformI2cHid i2c_hid(shared_allocator, pci, i2c_registers, register_mapper, clock, i2c_acpi_host);
+  // Pens and sensors: any driver adds its devices here; the pen is also an absolute mouse, so every program works with it.
+  hardware::CompositePen pens;
+  hardware::PenMouse pen_mouse(pens);
+  hardware::SensorHub sensors;
+  input.mice().add(&pen_mouse);
+  i2c_hid.set_pens(&pens);
+  i2c_hid.set_sensors(&sensors);
   if (paging_ok && i2c_acpi_tables.initialize()) {
     const uint32_t started = i2c_hid.start(i2c_acpi_tables, input.mice());
     for (uint32_t i = 0; i < i2c_hid.report_count(); ++i) {
       const hardware::PlatformI2cHid::Report& r = i2c_hid.report(i);
-      Entry(r.outcome == hardware::PlatformI2cHid::Outcome::Started ? Level::Ok : Level::Warning, "Input").text("I2C HID ").text(r.device).text(": ").text(hardware::PlatformI2cHid::outcome_name(r.outcome));
+      Entry(r.outcome == hardware::PlatformI2cHid::Outcome::Started ? Level::Ok : Level::Warning, "Input").text("I2C HID ").text(r.device).text(": ").text(hardware::PlatformI2cHid::outcome_name(r.outcome)).text(r.pen ? ", with a pen" : "");
+      if (r.sensors) Entry(Level::Ok, "Sensor").text("I2C HID ").text(r.device).text(": ").dec(r.sensors).text(" sensor(s)");
     }
     if (started) Entry(Level::Info, "Input").dec(started).text(" pointing device(s) on I2C");
   }
@@ -1737,6 +1752,58 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         Entry(Level::Info, "Thunderbolt").text(controller ? "the controller names no wake event in the ACPI tables" : "the controller is not described in the ACPI tables");
     }
 #endif
+    // The screen's brightness (the Fn keys and the firmware's brightness notifications): the panel's ACPI methods if the tables have them, else the PWM of the PCH as the firmware left it.
+    hardware::AcpiBacklight* acpi_backlight_ptr = nullptr;
+    UniquePointer<hardware::AcpiBacklight> acpi_backlight;
+    UniquePointer<hardware::AcpiVideoKeys> acpi_video_keys;
+    UniquePointer<hardware::IntelPchBacklight> pch_backlight;
+    UniquePointer<hardware::DellWmiHotkeys> dell_hotkeys;
+#ifdef TCOS_ACPI_EVENTS
+    if (acpi_events) {
+      acpi::Node* panels[4];
+      const uint32_t found = hardware::AcpiBacklight::find_devices(acpi_events->interpreter(), panels, 4);
+      for (uint32_t i = 0; i < found && !acpi_backlight; ++i) {
+        auto candidate = UniquePointer<hardware::AcpiBacklight>::make(shared_allocator, acpi_events->interpreter(), panels[i]);
+        if (candidate && candidate->initialize()) acpi_backlight = static_cast<UniquePointer<hardware::AcpiBacklight>&&>(candidate);
+      }
+      if (acpi_backlight) {
+        acpi_backlight_ptr = acpi_backlight.get();
+        desktop.set_backlight(acpi_backlight.get());
+        acpi_video_keys = UniquePointer<hardware::AcpiVideoKeys>::make(shared_allocator, *acpi_backlight,
+            [](void* d, bool brighter) { static_cast<desktop::Desktop*>(d)->adjust_brightness(brighter ? 10 : -10); }, &desktop);
+        if (acpi_video_keys) acpi_events->add_listener(acpi_video_keys.get());
+        Entry(Level::Ok, "Display").text("backlight: ACPI, ").dec(acpi_backlight->steps()).text(" levels");
+      }
+      // Dell's hotkeys (ACPI-WMI): mute and, when the video extensions do not report the brightness keys themselves, brightness.
+      dell_hotkeys = UniquePointer<hardware::DellWmiHotkeys>::make(shared_allocator, acpi_events->interpreter(),
+          [](void* d, uint8_t key) { if (key != hardware::kDellMicMute) static_cast<desktop::Desktop*>(d)->handle_media_key(key); }, &desktop, !acpi_backlight_ptr);
+      if (dell_hotkeys && dell_hotkeys->scan() != 0 && acpi_events->add_listener(dell_hotkeys.get()))
+        Entry(Level::Ok, "Keyboard").text("Dell hotkeys through ACPI-WMI (").dec(dell_hotkeys->device_count()).text(" device)");
+    }
+#endif
+    if (!acpi_backlight_ptr) {
+      hardware::IntelRenderHardware render;
+      if (hardware::IntelGpu* intel = system_gpu.intel_gpu(); intel && intel->render_hardware(&render) && render.registers) {
+        pch_backlight = UniquePointer<hardware::IntelPchBacklight>::make(shared_allocator, *render.registers);
+        if (pch_backlight && pch_backlight->initialize()) {
+          desktop.set_backlight(pch_backlight.get());
+          Entry(Level::Ok, "Display").text("backlight: Intel PCH PWM");
+        }
+      }
+    }
+#ifdef TCOS_ACPI_EVENTS
+    // The ambient light sensor of the firmware (ACPI0008) next to the sensor hubs found on I2C.
+    UniquePointer<hardware::AcpiAmbientLight> acpi_light;
+    if (acpi_events) {
+      acpi::Node* lights[2];
+      const uint32_t found = hardware::AcpiAmbientLight::find_devices(acpi_events->interpreter(), lights, 2);
+      for (uint32_t i = 0; i < found && !acpi_light; ++i) {
+        auto candidate = UniquePointer<hardware::AcpiAmbientLight>::make(shared_allocator, acpi_events->interpreter(), lights[i]);
+        if (candidate && candidate->initialize()) acpi_light = static_cast<UniquePointer<hardware::AcpiAmbientLight>&&>(candidate);
+      }
+      if (acpi_light && sensors.add(acpi_light.get())) Entry(Level::Ok, "Sensor").text("ambient light sensor through ACPI");
+    }
+#endif
     desktop.set_system_monitor(&monitor);
     desktop.set_clock_source(read_local_time, st);
     desktop.set_diagnostic_output(console::debug_puts);
@@ -1994,6 +2061,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   kernel::stop();  // threads end here; the rest of shutdown talks to the firmware
   Entry(Level::Ok, "Shutdown").text("threads stopped");
   i2c_hid.stop(input.mice());
+  input.mice().remove(&pen_mouse);
   input.shutdown();
   guest.shutdown();
   hyperv.shutdown();

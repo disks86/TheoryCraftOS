@@ -85,6 +85,9 @@ add_executable(BOOTX64
   src/Hardware/Acpi/EmbeddedController.cpp
   src/Hardware/Acpi/SystemAcpiHost.cpp
   src/Hardware/Acpi/AcpiEvents.cpp
+  src/Hardware/Acpi/DellWmiHotkeys.cpp
+  src/Hardware/Backlight/AcpiBacklight.cpp
+  src/Hardware/Backlight/IntelPchBacklight.cpp
   src/Hardware/Acpi/IoApic.cpp
   src/Hardware/Acpi/SystemAcpiPorts.cpp
   src/Hardware/Battery/AcpiBattery.cpp
@@ -115,6 +118,8 @@ add_executable(BOOTX64
   src/Hardware/Guest/VirtioBalloon.cpp
   src/Hardware/Guest/SystemGuestServices.cpp
   src/Hardware/Keyboard/Usb/UsbHidKeyboard.cpp
+  src/Hardware/Keyboard/Usb/UsbHidConsumer.cpp
+  src/Hardware/Hid/HidDescriptor.cpp
   src/Hardware/Keyboard/Virtio/VirtioKeyboard.cpp
   src/Hardware/Mouse/Usb/UsbHidMouse.cpp
   src/Hardware/Mouse/Virtio/VirtioMouse.cpp
@@ -475,6 +480,7 @@ add_executable(BOOTX64
   src/Desktop/FileProperties.cpp
   src/Desktop/CopyProgressDialog.cpp
   src/Desktop/DirectoryListing.cpp
+  src/Desktop/Playlist.cpp
   src/Desktop/FileDialog.cpp
   src/Desktop/ColorDialog.cpp
   src/Desktop/PrintDialog.cpp
@@ -750,6 +756,12 @@ add_executable(BOOTX64
   src/Hardware/Bus/I2c/IntelGpio.cpp
   src/Hardware/Bus/I2c/LpssI2c.cpp
   src/Hardware/Mouse/I2c/I2cHidPointer.cpp
+  src/Hardware/Pen/CompositePen.cpp
+  src/Hardware/Pen/PenMouse.cpp
+  src/Hardware/Pen/I2c/I2cHidPen.cpp
+  src/Hardware/Sensor/SensorHub.cpp
+  src/Hardware/Sensor/HidSensor.cpp
+  src/Hardware/Sensor/AcpiAmbientLight.cpp
   src/Hardware/Mouse/I2c/PlatformI2cHid.cpp
   src/Hardware/Bus/Thunderbolt/ThunderboltDevices.cpp
   src/Hardware/Bus/Pci/PciMsix.cpp
@@ -774,7 +786,6 @@ add_executable(BOOTX64
   src/Hardware/Bluetooth/Smp.cpp
   src/Hardware/Bluetooth/HciBluetoothAdapter.cpp
   src/Hardware/Bluetooth/HidOverGatt.cpp
-  src/Hardware/Hid/HidDescriptor.cpp
   src/Hardware/Bluetooth/HciPackets.cpp
   src/Hardware/Bluetooth/UsbHciTransport.cpp
   src/Hardware/Bluetooth/HciController.cpp
