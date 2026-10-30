@@ -45,9 +45,11 @@ struct Router {
   uint32_t vendor = 0x8086, device = 0x1234;
   uint32_t upstream = 1;
   uint32_t max_port = 0;
-  uint32_t regs[64] = {};
+  uint32_t regs[512] = {};
+  uint32_t first_cap = 0x20;
   std::vector<Port> ports;           // index 0 is the control adapter
-  uint32_t cs5_writes = 0;
+  uint32_t cs5_writes = 0, post_times = 0;
+  std::vector<uint32_t> buffer_alloc;  // BUFFER_ALLOC entries (index | value << 16); none: the operation is not supported
   std::vector<uint8_t> drom;         // what DROM_READ gives (none: the operation is not supported)
   uint32_t drom_status = 0;          // the status the operation ends with
   uint32_t drom_reads = 0;
@@ -81,10 +83,34 @@ class Fabric {
     r->max_port = n;
     r->regs[6] = (1u << 18);                                     // ROUTER_CS_6.HCI: it has an xHCI
     r->regs[7] = 0xA0A0A0A0u + static_cast<uint32_t>(route);
+    r->regs[0x20] = (kSwitchCapTmu << 8) | (tmu_ucap ? kTmuRtrCs0Ucap : 0);          // the TMU capability, last in the list
+    r->regs[0x20 + kTmuRtrCs1] = 0x11110000u;                                           // the router's local time, for the host router to be read
+    r->regs[0x20 + kTmuRtrCs1 + 1] = 0x22222222u;
+    r->regs[0x20 + kTmuRtrCs1 + 2] = 0x00003333u;
     r->regs[8] = 0x0B0B0B0Bu;
     Router& ref = *r;
     routers_[route] = std::move(r);
     return ref;
+  }
+  // Makes the router at `route` a Thunderbolt 3 one: no USB4 version, no USB4 port capabilities, the plug events capability (at 0x28, short form) and the link controller (at 0x30, long form,
+  // per-port blocks of 4 dwords from 4 dwords in), the link controller's bonding attribute set.
+  Router& make_tbt3(uint64_t route, uint32_t device_id = 0x15EA) {
+    Router& r = *routers_[route];
+    r.version = 0;
+    r.device = device_id;
+    r.first_cap = 0x28;
+    r.regs[0x28] = 0x30 | (kSwitchCapVse << 8) | (kVsecPlugEvents << 16) | (0x10u << 24);
+    r.regs[0x30] = (kSwitchCapVse << 8) | (kVsecLinkController << 16);
+    r.regs[0x31] = 0;                                                                    // next: none, length: left zero
+    r.regs[0x30 + kLcDesc] = (4u << 8) | (4u << 16);
+    for (uint32_t phys = 0; phys < 4; ++phys) r.regs[0x30 + 4 + phys * 4 + kLcPortAttr] |= kLcPortAttrBe;
+    for (Port& p : r.ports) {
+      if (p.type != kTypePort) continue;
+      p.space[0x10] &= ~0xFFu;                                                           // the lane adapter capability is the last in the list
+      p.space[0x20] = 0;
+      p.space[0x20 + kPortCs18] = 0;
+    }
+    return r;
   }
   Router& at(uint64_t route) { return *routers_[route]; }
   bool has(uint64_t route) const { return routers_.count(route) != 0; }
@@ -117,6 +143,7 @@ class Fabric {
     parent.ports[port + 1].state = kPortUnplugged;
     at(route).connected = false;
   }
+  bool tmu_ucap = true;                                          // new routers support the uni-directional TMU mode
   bool refuse_sleep = false;                                     // ROUTER_CS_6.SLPR never comes up
   bool no_usb3_ack = false;                                      // the USB 3 adapter never grants the connection manager its request
   bool bond_never_completes = false;                             // the link keeps reporting one lane
@@ -137,7 +164,8 @@ class Fabric {
     p.space[5] = 0x7FF | (0x7FFu << 11);                         // plenty of HopIDs
     p.space[4] = 40u << 20;                                       // total buffers (ADP_CS_4)
     p.space[0x10] = 0x20 | (kPortCapPhy << 8) | (2u << 20);       // the lane adapter capability, next at 0x20; it supports two lanes
-    p.space[0x20] = (kPortCapUsb4 << 8);
+    p.space[0x20] = 0x40 | (kPortCapUsb4 << 8);                   // the USB4 capability, next the TMU one
+    p.space[0x40] = (kPortCapTime1 << 8);
     p.space[0x20 + kPortCs18] = kPortCs18Be;                      // bonding enabled
     return p;
   }
@@ -193,7 +221,7 @@ class Fabric {
       if (pit != routers_.end() && parent_port < pit->second->ports.size() && pit->second->ports[parent_port].locked) return fail(6);
     }
     if (space == 2) {                                                               // the router's own space
-      if (offset + length > 64) return fail(2);
+      if (offset + length > 512) return fail(2);
       if (!write) {
         for (uint32_t i = 0; i < length; ++i) a.data.push_back(read_switch(r, offset + i));
       } else {
@@ -230,7 +258,7 @@ class Fabric {
     if (random_garbage) return noise();
     switch (i) {
       case 0: return r.vendor | (r.device << 16);
-      case 1: return 0x08 | (r.upstream << 8) | (r.max_port << 14) | (r.regs[1] & 0x00700000u) | (0x02u << 24);
+      case 1: return r.first_cap | (r.upstream << 8) | (r.max_port << 14) | (r.regs[1] & 0x00700000u) | (0x02u << 24);
       case 2: return r.regs[2];
       case 3: return r.regs[3];
       case 4: return r.regs[4] | (uint32_t{r.version} << 24);
@@ -240,6 +268,8 @@ class Fabric {
   void write_switch(Router& r, uint32_t i, uint32_t v) {
     if (i == 1) r.regs[1] = (r.regs[1] & ~0x00700000u) | (v & 0x00700000u) , r.upstream = (v >> 8) & 0x3F;
     else if (i == 4) r.regs[4] = v & 0x00FFFFFFu;
+    else if (i == 0x20) r.regs[i] = (r.regs[i] & 0x4000FFFFu) | (v & ~0x4000FFFFu);              // the capability header and UCAP are read only
+    else if (i == 0x20 + kTmuRtrCs24) { r.regs[i] = 0; r.regs[i + 1] = 0; ++r.post_times; }  // the post time trigger clears itself at once
     else r.regs[i] = v;
     if (i == 26 && (v & kCs26Ov)) {                                                    // a router operation
       if ((v & 0xFFFF) == kOpDromRead && !r.drom.empty()) {
@@ -254,6 +284,10 @@ class Fabric {
           r.regs[9 + d] = word;
         }
         r.regs[26] = (r.drom_status << kCs26StatusShift);
+      } else if ((v & 0xFFFF) == kOpBufferAlloc && !r.buffer_alloc.empty()) {
+        for (uint32_t d = 0; d < 16; ++d) r.regs[9 + d] = d < r.buffer_alloc.size() ? r.buffer_alloc[d] : 0;
+        r.regs[25] = static_cast<uint32_t>(r.buffer_alloc.size());
+        r.regs[26] = 0;
       } else {
         r.regs[26] = kCs26Ons;
       }

@@ -3346,6 +3346,163 @@ static void test_usb4_drom() {
   }
 }
 
+static void test_usb4_tmu() {
+  {   // every router keeps time in step with the host router
+    Usb4Rig rig;
+    Usb4Domain domain(rig.control, rig.nhi, rig.alloc);
+    CHECK(domain.start(nullptr));
+    CHECK(domain.tmu_enabled(0) && domain.tmu_enabled(1) && domain.tmu_enabled(2));
+    fake_usb4::Router& host = rig.fabric.at(0);
+    fake_usb4::Router& d1 = rig.fabric.at(0x01);
+    fake_usb4::Router& d2 = rig.fabric.at(0x301);
+    const uint32_t cap = 0x20;
+    // the host router's rate is 1000; the time disruption bit is back down everywhere
+    CHECK((host.regs[cap + kTmuRtrCs3] >> kTmuRtrCs3IntervalShift) == 1000 && !(host.regs[cap] & kTmuRtrCs0Td) && !(d1.regs[cap] & kTmuRtrCs0Td) && !(d2.regs[cap] & kTmuRtrCs0Td));
+    // the dock's parameters: window 30, averaging 4 in all four fields
+    CHECK(((d1.regs[cap] & kTmuRtrCs0FreqWindMask) >> kTmuRtrCs0FreqWindShift) == 30 && (d1.regs[cap + kTmuRtrCs15] & 0xFFFFFF) == (4u | (4u << 6) | (4u << 12) | (4u << 18)));
+    // its time was set from the host's: the local time of the host router (the three dwords) is in the dock's registers
+    CHECK(d1.post_times == 1 && d1.regs[cap + kTmuRtrCs22] == (host.regs[cap + kTmuRtrCs1 + 1] << 16 | host.regs[cap + kTmuRtrCs1] >> 16));
+    // both ends of each link: uni-directional, time sync not disabled
+    CHECK((host.ports[1].space[0x40 + kTmuAdpCs3] & kTmuAdpCs3Udm) && (d1.ports[1].space[0x40 + kTmuAdpCs3] & kTmuAdpCs3Udm) && !(host.ports[1].space[0x40 + kTmuAdpCs6] & kTmuAdpCs6Dts));
+    CHECK((d1.ports[3].space[0x40 + kTmuAdpCs3] & kTmuAdpCs3Udm) && (d2.ports[1].space[0x40 + kTmuAdpCs3] & kTmuAdpCs3Udm));
+    CHECK(!(host.ports[3].space[0x40 + kTmuAdpCs3] & kTmuAdpCs3Udm));                         // (a link with nothing on it is left alone)
+  }
+  {   // a host router that cannot do it: nobody below tries, and everything else works
+    Usb4Rig rig(false);
+    rig.fabric.at(0).regs[0x20] &= ~kTmuRtrCs0Ucap;
+    Usb4Domain domain(rig.control, rig.nhi, rig.alloc);
+    CHECK(domain.start(nullptr) && !domain.tmu_enabled(0) && !domain.tmu_enabled(1) && domain.present_count() == 2 && rig.fabric.at(0x01).post_times == 0);
+  }
+  {   // a dock that cannot: the host keeps its rate, the dock is left without
+    Usb4Rig rig(false);
+    rig.fabric.at(0x01).regs[0x20] &= ~kTmuRtrCs0Ucap;
+    Usb4Domain domain(rig.control, rig.nhi, rig.alloc);
+    CHECK(domain.start(nullptr) && domain.tmu_enabled(0) && !domain.tmu_enabled(1) && !(rig.fabric.at(0x01).ports[1].space[0x40 + kTmuAdpCs3] & kTmuAdpCs3Udm));
+  }
+  {   // no TMU capability at all
+    Usb4Rig rig(false);
+    rig.fabric.at(0x01).regs[1] = 0;                                                        // (the model reads the first capability offset from the header: take the TMU one out of the list)
+    Usb4Domain domain(rig.control, rig.nhi, rig.alloc);
+    CHECK(domain.start(nullptr) && domain.present_count() == 2);
+  }
+}
+
+static std::vector<uint32_t> buffer_alloc(int usb3, int aux, int main, int pcie, int dma) {
+  std::vector<uint32_t> v;
+  if (usb3 >= 0) v.push_back(1u | (uint32_t(usb3) << 16));
+  if (aux >= 0) v.push_back(2u | (uint32_t(aux) << 16));
+  if (main >= 0) v.push_back(3u | (uint32_t(main) << 16));
+  if (pcie >= 0) v.push_back(4u | (uint32_t(pcie) << 16));
+  if (dma >= 0) v.push_back(5u | (uint32_t(dma) << 16));
+  return v;
+}
+
+static void test_usb4_credits() {
+  {   // the routers' preferred allocation sets the credits of lane adapters
+    Usb4Rig rig;
+    for (uint64_t route : {0ull, 0x01ull, 0x301ull}) rig.fabric.at(route).buffer_alloc = buffer_alloc(8, 1, 2, 10, 14);
+    Usb4Domain domain(rig.control, rig.nhi, rig.alloc);
+    const char* error = nullptr;
+    CHECK(domain.start(nullptr));
+    const Usb4Router& host = *domain.router(0);
+    CHECK(host.credit_allocation && host.max_usb3_credits == 8 && host.max_pcie_credits == 10 && host.max_dma_credits == 14 && host.min_dp_aux_credits == 1 && host.min_dp_main_credits == 2);
+    fake_usb4::Router& fh = rig.fabric.at(0);
+    fake_usb4::Router& d1 = rig.fabric.at(0x01);
+    // PCIe: the router's most (10), of the 38 usable less the USB 3 share (8); the adapters keep 7
+    CHECK(domain.approve_pcie(1, &error));
+    CHECK(((fh.ports[1].hops[8].first >> 17) & 0x7F) == 10 && ((d1.ports[1].hops[8].first >> 17) & 0x7F) == 10 && ((fh.ports[5].hops[8].first >> 17) & 0x7F) == 7);
+    // USB 3: its most (8) on the lane adapters
+    CHECK(domain.approve_usb3(1, &error) && ((fh.ports[1].hops[9].first >> 17) & 0x7F) != 0 && ((d1.ports[1].hops[9].first >> 17) & 0x7F) == 8);
+    // DMA paths take what is left: the host interface's 14, and the lane adapter's share is counted
+    CHECK(domain.disconnect_pcie(1) && domain.disconnect_usb3(1));
+    rig.fabric.link_host(0, 3);
+    Usb4Domain again(rig.control, rig.nhi, rig.alloc);
+    CHECK(again.start(nullptr) && again.xdomain_count() == 1);
+    CHECK(again.approve_xdomain_paths(0, 9, 1, 10, 2, &error));
+    CHECK(again.router(0)->ports[3].dma_credits == 14 && ((fh.ports[3].hops[10].first >> 17) & 0x7F) == 14);
+    CHECK(again.disconnect_xdomain_paths(0) && again.router(0)->ports[3].dma_credits == 0);
+  }
+  {   // too few buffers for a PCIe path: refused, nothing taken
+    Usb4Rig rig(false);
+    for (uint64_t route : {0ull, 0x01ull}) rig.fabric.at(route).buffer_alloc = buffer_alloc(8, 1, 2, 4, 14);
+    Usb4Domain domain(rig.control, rig.nhi, rig.alloc);
+    const char* error = nullptr;
+    CHECK(domain.start(nullptr) && !domain.approve_pcie(1, &error) && error && !domain.pcie_tunnelled(1) && !(rig.fabric.at(0).ports[5].space[0x10] & kAdpPcieCs0Pe));
+  }
+  {   // a smaller baMaxHI limits the DMA path
+    Usb4Rig rig(false);
+    rig.fabric.link_host(0, 3);
+    rig.fabric.at(0).buffer_alloc = buffer_alloc(8, 1, 2, 10, 5);
+    Usb4Domain domain(rig.control, rig.nhi, rig.alloc);
+    const char* error = nullptr;
+    CHECK(domain.start(nullptr) && domain.approve_xdomain_paths(0, 9, 1, 10, 2, &error) && ((rig.fabric.at(0).ports[3].hops[10].first >> 17) & 0x7F) == 5);
+  }
+  {   // incomplete preferences (a PCIe adapter and no baMaxPCIe), a host router without baMaxHI, too many lane adapters without the DisplayPort entries: the fixed values stay
+    Usb4Rig rig(false);
+    rig.fabric.at(0).buffer_alloc = buffer_alloc(8, 1, 2, -1, 14);
+    rig.fabric.at(0x01).buffer_alloc = buffer_alloc(8, -1, -1, 10, 14);
+    Usb4Domain domain(rig.control, rig.nhi, rig.alloc);
+    const char* error = nullptr;
+    CHECK(domain.start(nullptr) && !domain.router(0)->credit_allocation && !domain.router(1)->credit_allocation);
+    CHECK(domain.approve_pcie(1, &error) && ((rig.fabric.at(0).ports[1].hops[8].first >> 17) & 0x7F) == 32);        // (bonded: 2 x 16)
+    Usb4Rig no_hi(false);
+    no_hi.fabric.at(0).buffer_alloc = buffer_alloc(8, 1, 2, 10, -1);
+    Usb4Domain d(no_hi.control, no_hi.nhi, no_hi.alloc);
+    CHECK(d.start(nullptr) && !d.router(0)->credit_allocation);
+  }
+}
+
+static void test_usb4_tbt3_device() {
+  Usb4Rig rig(false);
+  rig.fabric.add(0x03, 2, 0, true);
+  rig.fabric.make_tbt3(0x03);
+  rig.fabric.at(0x03).regs[0x29] = 0xFFFFFFFFu;                                                 // the plug events register as the router powers up
+  rig.fabric.link(0, 3, 0x03);
+  Usb4Domain domain(rig.control, rig.nhi, rig.alloc);
+  const char* error = nullptr;
+  CHECK(domain.start(nullptr) && domain.present_count() == 3 && domain.unreachable_links() == 0);
+  const Usb4Router& dock = *domain.router(2);
+  CHECK(dock.tbt3 && dock.usb4_version == 0 && dock.route == 0x03 && dock.parent == 0 && dock.cap_plug_events == 0x28 && dock.cap_lc == 0x30 && dock.depth == 1);
+  fake_usb4::Router& fr = rig.fabric.at(0x03);
+  // configured with three words, the pause between plug events at its longest, the USB hot plug event disabled
+  CHECK(fr.regs[2] == 0x03 && fr.regs[3] == (1u << 31) && (fr.regs[4] & 0xFF) == 0xFF && fr.regs[0x29] == 0xFFFFFF87u);
+  // none of the USB4 router steps: no tunnelling bits, no configuration valid
+  CHECK(fr.cs5_writes == 0 && !(fr.regs[5] & kCs5Cv) && !domain.tmu_enabled(2));
+  // the link is marked configured through the link controller on its side (lane 1 of physical port 0: L1C, and the upstream flag) and through the port capability on the USB4 side
+  CHECK((fr.regs[0x34 + kLcSxCtrl] & kLcSxCtrlL1c) && (fr.regs[0x34 + kLcSxCtrl] & kLcSxCtrlUpstream) && (rig.fabric.at(0).ports[3].space[0x20 + kPortCs19] & kPortCs19Pc));
+  // the link controller allows bonding: the lanes are bonded
+  CHECK(domain.link_bonded(2) && (fr.ports[1].space[0x11] & kLaneCs1TargetWidthMask) == kLaneCs1TargetDual);
+  // a PCIe tunnel to it works as to any router: 32 credits on the bonded lanes
+  CHECK(domain.approve_pcie(2, &error) && domain.pcie_tunnelled(2) && ((fr.ports[1].hops[8].first >> 17) & 0x7F) == 32 && (fr.ports[5].space[0x10] & kAdpPcieCs0Pe));
+  // it sleeps with the rest (through its own link, not driven here), and is found again
+  CHECK(domain.suspend(false));
+  CHECK(domain.resume(&error) && domain.present_count() == 3);
+  // an Alpine Ridge bridge keeps the USB hot plug event
+  Usb4Rig alpine(false);
+  alpine.fabric.add(0x03, 2, 0, true);
+  alpine.fabric.make_tbt3(0x03, 0x1578);
+  alpine.fabric.at(0x03).regs[0x29] = 0xFFFFFFFFu;
+  alpine.fabric.link(0, 3, 0x03);
+  Usb4Domain d(alpine.control, alpine.nhi, alpine.alloc);
+  CHECK(d.start(nullptr) && alpine.fabric.at(0x03).regs[0x29] == 0xFFFFFF83u);
+  // not Intel's, without the plug events capability, without the link controller: not taken
+  Usb4Rig other(false);
+  other.fabric.add(0x03, 2, 0, true);
+  other.fabric.make_tbt3(0x03);
+  other.fabric.at(0x03).vendor = 0x1234;
+  other.fabric.link(0, 3, 0x03);
+  Usb4Domain d2(other.control, other.nhi, other.alloc);
+  CHECK(d2.start(nullptr) && d2.present_count() == 2 && d2.unreachable_links() == 1);
+  Usb4Rig nolc(false);
+  nolc.fabric.add(0x03, 2, 0, true);
+  nolc.fabric.make_tbt3(0x03);
+  nolc.fabric.at(0x03).regs[0x28] &= ~0xFFu;
+  nolc.fabric.at(0x03).regs[0x30] = 0;                                                          // (the link controller is not in the list any more)
+  nolc.fabric.link(0, 3, 0x03);
+  Usb4Domain d3(nolc.control, nolc.nhi, nolc.alloc);
+  CHECK(d3.start(nullptr) && d3.present_count() == 2);                                         // (it is refused: its link cannot be configured)
+}
+
 static void test_usb4_garbage() {
   // the routers answer with noise: the manager must stay inside its arrays, whatever comes (and the sanitizers say if it does not)
   for (uint32_t seed = 1; seed <= 200; ++seed) {
@@ -3395,6 +3552,9 @@ int main() {
   test_usb4_sleep();
   test_usb4_xdomain();
   test_usb4_drom();
+  test_usb4_tmu();
+  test_usb4_credits();
+  test_usb4_tbt3_device();
   test_usb4_runtime_sleep();
   test_usb4_xdomain_failures();
   test_usb4_driver();
