@@ -16,7 +16,7 @@ def E(mn,T,N,shape,mode,svemn=None,sve_asm=None):
     v,m,pos=r
     sv=svemn or mn
     if mode==0: w=sve_word('%s z0.%s, p7/m, z0.%s, z0.%s'%(sv,T,T,T))
-    elif mode==1: w=sve_word('%s z0.%s, z0.%s, z0.%s'%(sv,T,T,T))
+    elif mode in (1,3): w=sve_word('%s z0.%s, z0.%s, z0.%s'%(sv,T,T,T))
     else: w=sve_word('%s z0.%s, z0.%s, z0.%s'%(sv,T,T,T))
     if w is None: print('NOSVE',sv,T,file=sys.stderr); return
     ents.append((m,v,N,{'S':0,'M':1,'C':2}[shape],mode,w,mn+'.'+T))
@@ -35,6 +35,9 @@ for N in (2,4):
     for mn in ('bfmax','bfmin','bfmaxnm','bfminnm'):
         E(mn,'h',N,'S',0); E(mn,'h',N,'M',0)
     E('bfclamp','h',N,'C',2)
+    for T in 'hsd':
+        E('fmul',T,N,'S',3); E('fmul',T,N,'M',3)
+    E('bfmul','h',N,'S',3); E('bfmul','h',N,'M',3)
 with open(''+OUT+'/AArch64Sme2VecForms.inc','w') as f:
     f.write('// Generated from the LLVM encodings of the SME2 multi-vector arithmetic: the fixed bits, the shape, and the equivalent single-vector SVE instruction word. Do not edit.\n')
     f.write('struct Sme2VecForm { uint32_t mask, value; uint8_t group, shape, mode; uint32_t sve_word; };\n')

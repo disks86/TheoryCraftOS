@@ -578,7 +578,7 @@ AArch64Cpu::Step AArch64Cpu::system_instruction(uint32_t insn) {
   } else if (read && k == make(3, 3, 4, 2, 2)) {      // SVCR: bit 0 SM, bit 1 ZA
     set_reg(rt, (s_.streaming ? 1u : 0u) | (s_.za_enabled ? 2u : 0u), true);
   } else if (read) {
-    if (k == make(3, 0, 0, 4, 5)) value = 0x81f15cff00000000ull | (1ull << 42) | (1ull << 41) | (7ull << 28);      // ID_AA64SMFR0_EL1: SME2, the outer products, FA64, and the FP8 dot products and multiply-adds
+    if (k == make(3, 0, 0, 4, 5)) value = 0x81f15cff00000000ull | (1ull << 42) | (1ull << 41) | (7ull << 28) | (1ull << 60);      // ID_AA64SMFR0_EL1: SME2, the outer products, FA64, and the FP8 dot products and multiply-adds
     else if (k == make(3, 3, 14, 0, 2) || k == make(3, 3, 14, 0, 1)) value = retired_;      // CNTVCT_EL0 / CNTPCT_EL0: the instruction count is the clock
     else if (k == make(3, 3, 14, 0, 0)) value = 1000000000;      // CNTFRQ_EL0
     else if (k == make(3, 3, 0, 0, 7)) value = 0x10;      // DCZID_EL0: DC ZVA prohibited

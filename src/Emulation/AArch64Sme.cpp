@@ -130,6 +130,17 @@ AArch64Cpu::Step AArch64Cpu::sme(GuestMemory& m, uint32_t insn) {
     else put(&s_.za[i * n + tile], esz, k, value);
   };
 
+  if ((insn & 0xFFFFFC23u) == 0xC08B0000u) {      // LUTI4 {Zd.B x4}, ZT0, {Zn, Zn+1}: sixty-four nibble indices into the table of 32 bit entries, the low byte of each
+    const uint32_t zd = bits_of(insn, 4, 2) << 2, zn = bits_of(insn, 9, 6) << 1;
+    Vec out[4];
+    for (uint32_t e = 0; e < 64; ++e) {
+      const uint32_t src = (zn + e / 32) & 31, nibble = e % 32;
+      const uint32_t index = static_cast<uint32_t>(get(s_.v[src], 3, nibble / 16) >> ((nibble % 16) * 4)) & 15;
+      put(&out[e / 16], 0, e % 16, (s_.zt0[index / 2] >> ((index % 2) * 32)) & 0xFF);
+    }
+    for (uint32_t k = 0; k < 4; ++k) s_.v[(zd + k) & 31] = out[k];
+    return Step::Ok;
+  }
   if (top == 0xC0 && ((insn >> 23) & 1) && !((insn >> 21) & 1) && !((insn >> 10) & 3) && (bits_of(insn, 19, 18) == 3 || bits_of(insn, 19, 17) == 5) && bits_of(insn, 13, 12) != 3) {      // LUTI2 / LUTI4: expand table indices from a vector through ZT0
     const bool luti2 = bits_of(insn, 19, 18) == 3, single = (insn >> 22) & 1, strided = (insn >> 20) & 1, x2 = !single && ((insn >> 14) & 1), x4 = !single && !x2 && ((insn >> 15) & 1);
     if (!single && !x2 && !x4) return undefined();

@@ -244,13 +244,13 @@ AArch64Cpu::Step AArch64Cpu::sme2_vector(GuestMemory& m, uint32_t form, uint32_t
   for (uint32_t r = 0; r < n; ++r) {
     s_ = saved;
     uint32_t zm;
-    if (f.shape == 0) zm = bits_of(insn, 19, 16);
+    if (f.shape == 0) zm = f.mode == 3 ? bits_of(insn, 20, 17) : bits_of(insn, 19, 16);      // (mode 3, FMUL: the single Zm sits one bit higher)
     else if (f.shape == 1) zm = (n == 2 ? (bits_of(insn, 20, 17) << 1) : (bits_of(insn, 20, 18) << 2)) + r;
     else zm = bits_of(insn, 20, 16);
     uint32_t word = f.sve_word;
     const uint32_t d = (dn + r) & 31;
     if (f.mode == 0) word = (word & ~0x3FFu) | (zm << 5) | d | (7u << 10);
-    else if (f.mode == 1) word = (word & ~0x1F03FFu) | (zm << 16) | (d << 5) | d;
+    else if (f.mode == 1 || f.mode == 3) word = (word & ~0x1F03FFu) | (zm << 16) | (d << 5) | d;
     else word = (word & ~0x1F03FFu) | (zm << 16) | (bits_of(insn, 9, 5) << 5) | d;
     s_.p[7] = 0xFFFF;
     const Step step = sve(m, word);

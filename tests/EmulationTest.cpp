@@ -1153,6 +1153,22 @@ static void test_aarch64_sme() {
     f.cpu.state().v[2].lo = 0xFFFFFFFF00000003ull;      // 3 and -1
     CHECK(f.run() == StopReason::Syscall && f.cpu.state().v[0].lo == 0x3FC0000041000000ull);      // 8.0 and 1.5
   }
+  {      // SME2.2 multi-vector FMUL (not checkable against qemu): {z0, z1} * z2, and the SME2 LUTv2 four-register LUTI4
+    A64Machine m({0xc1a4e800, 0xd4000001});      // fmul {z0.s, z1.s}, {z0.s, z1.s}, z2.s
+    AArch64Cpu::State& s = m.cpu.state();
+    s.streaming = true;
+    s.za_enabled = true;
+    s.v[0].lo = s.v[0].hi = s.v[1].lo = s.v[1].hi = 0x3F8000003F800000ull;      // 1.0
+    s.v[2].lo = s.v[2].hi = 0x4000000040000000ull;      // 2.0
+    CHECK(m.run() == StopReason::Syscall && s.v[0].lo == 0x4000000040000000ull && s.v[1].hi == 0x4000000040000000ull);
+    A64Machine l({0xc08b0080, 0xd4000001});      // luti4 {z0.b-z3.b}, zt0, {z4, z5}
+    l.cpu.state().streaming = true;
+    l.cpu.state().za_enabled = true;
+    for (uint32_t i = 0; i < 8; ++i) l.cpu.state().zt0[i] = 0x0000000100000000ull * (2 * i + 1) + 2 * i;      // entry e has the low byte e
+    l.cpu.state().v[4].lo = 0x0F0E0D0C0B0A0908ull;      // nibbles 8 9 .. F 0 ... : index = nibble
+    l.cpu.state().v[4].hi = 0;
+    CHECK(l.run() == StopReason::Syscall && (l.cpu.state().v[0].lo & 0xFF) == 8);
+  }
   {      // streaming-only instructions are undefined outside streaming mode
     A64Machine m({0xc0828001, 0xd4000001});      // mov z1.s, p0/m, za0v.s[w12, 0]
     CHECK(m.run() == StopReason::Fault && m.cpu.fault().vector == 6);
