@@ -36,6 +36,7 @@
 #include "Desktop/CopyProgressDialog.hpp"
 #include "Desktop/ColorDialog.hpp"
 #include "Desktop/Desktop.hpp"
+#include "Hardware/Backlight/IBacklight.hpp"
 #include "Desktop/PrintDialog.hpp"
 #include "Desktop/FileDialog.hpp"
 #include "Desktop/MediaPlayer.hpp"
@@ -5672,6 +5673,83 @@ static void test_desktop_shortcuts() {
   CHECK(a.live == 0);
 }
 
+struct FakeBacklight final : hardware::IBacklight {
+  uint8_t level = 50;
+  bool refuse = false;
+  const char* name() const override { return "fake backlight"; }
+  bool initialize() override { return true; }
+  void shutdown() override {}
+  uint32_t steps() const override { return 11; }
+  bool percent(uint8_t* out) override { *out = level; return true; }
+  bool set_percent(uint8_t p) override { if (refuse) return false; level = p; return true; }
+};
+
+// The function row: volume, mute and brightness keys act on the mixer and the backlight and are not passed on; without a backlight the brightness keys do nothing.
+static void test_desktop_media_keys() {
+  namespace key = hardware::key;
+  TestAllocator a;
+  FakeDevice dev;
+  FakeBacklight light;
+  {
+    audio::AudioMixer mixer(dev, a);
+    CHECK(mixer.initialize());
+    Screen screen(a, 800, 600);
+    desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+    d.set_media_services(&mixer, nullptr, nullptr);
+    d.window().layout();
+    Window& w = d.window();
+    auto press = [&](uint8_t usage) { KeyArgs k; k.usage = usage; w.key(k); };
+    // volume
+    mixer.set_master_volume(50);
+    press(key::kVolumeUp);
+    CHECK(dev.vol == 56 && d.toasts().count() == 1);
+    press(key::kVolumeUp);
+    CHECK(dev.vol == 62 && d.toasts().count() == 1);                            // (the notice is replaced, not stacked)
+    press(key::kVolumeDown);
+    CHECK(dev.vol == 56);
+    mixer.set_master_volume(97);
+    press(key::kVolumeUp);
+    CHECK(dev.vol == 100);
+    mixer.set_master_volume(3);
+    press(key::kVolumeDown);
+    CHECK(dev.vol == 0);
+    press(key::kMute);
+    CHECK(dev.mute);
+    press(key::kMute);
+    CHECK(!dev.mute);
+    press(key::kMute);
+    press(key::kVolumeUp);                                                      // louder ends the mute
+    CHECK(!dev.mute && dev.vol == 6);
+    // brightness
+    press(key::kBrightnessUp);
+    CHECK(light.level == 50);                                                   // (no backlight yet)
+    d.set_backlight(&light);
+    press(key::kBrightnessUp);
+    CHECK(light.level == 60);
+    press(key::kBrightnessDown);
+    press(key::kBrightnessDown);
+    CHECK(light.level == 40);
+    light.level = 95;
+    press(key::kBrightnessUp);
+    CHECK(light.level == 100);
+    light.level = 5;
+    press(key::kBrightnessDown);
+    CHECK(light.level == 0);
+    light.refuse = true;
+    light.level = 30;
+    CHECK(!d.adjust_brightness(10) && light.level == 30);
+    // the keys work over a dialog as well
+    d.ask_shut_down();
+    light.refuse = false;
+    press(key::kBrightnessUp);
+    CHECK(light.level == 40);
+    // ordinary keys are not taken
+    CHECK(!d.handle_media_key(key::kTab) && !d.handle_media_key(4));
+    mixer.stop_service();
+  }
+  CHECK(a.live == 0);
+}
+
 // Clicking a path in the terminal's output opens a folder in a file explorer and a file in the program for it.
 // A launcher that runs a script instead of a program: it prints, then "types" at the keyboard while the terminal thinks a program is running.
 struct ScriptedLauncher final : desktop::IProgramLauncher {
@@ -8506,6 +8584,7 @@ int main() {
   test_tile_button();
   test_wheel_switching();
   test_desktop_shortcuts();
+  test_desktop_media_keys();
   test_tabs();
   test_spreadsheet_grid();
   test_spreadsheet_app();

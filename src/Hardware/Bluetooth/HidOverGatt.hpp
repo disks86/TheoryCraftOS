@@ -26,7 +26,8 @@
 //               lost notification costs a key's transition only if two arrive between polls, and then the latest state still wins.
 //   detach():   the device's keys and buttons are released before the device leaves the input system.
 //
-// Consumer control keys (volume, media) and other report kinds are not translated.
+// Consumer control keys (volume, mute, play/pause, next, previous, stop, brightness) are translated to the codes of key:: and travel with the keyboard's; other consumer usages and other
+// report kinds are not.
 #pragma once
 #include "Allocators/IAllocator.hpp"
 #include "Hardware/Bluetooth/IBluetooth.hpp"
@@ -47,7 +48,8 @@ class BluetoothHidKeyboard final : public KeyboardBase {
   void shutdown() override {}
   // Called with a decoded report from the notification path; any thread.
   void deliver(const hid::KeyboardState& state);
-  void set_label(const char* text);
+  // The media keys (volume, play/pause ...) come in reports of their own; they are held together with the keys of the keyboard report, whose state is kept for that.
+  void deliver_consumer(const hid::KeyboardState& state);
 
  private:
   void fetch() override;
@@ -56,6 +58,8 @@ class BluetoothHidKeyboard final : public KeyboardBase {
   kernel::Mutex mutex_;
   hid::KeyboardState ring_[kRing];
   uint32_t head_ = 0, count_ = 0;
+  hid::KeyboardState typed_, media_;      // the latest keyboard report and the latest consumer report
+  void queue(const hid::KeyboardState& combined);
   hid::KeyboardDiff diff_;
 };
 
@@ -106,8 +110,9 @@ class HidOverGatt final : public IBluetoothProfile, public IInputDeviceSource, p
  private:
   struct Route {
     uint16_t value_handle = 0;
-    bool keyboard = false;
+    bool keyboard = false, consumer = false;
     hid::KeyboardDecoder keyboard_decoder;
+    hid::ConsumerDecoder consumer_decoder;
     hid::PointerDecoder pointer_decoder;
   };
   struct Record {

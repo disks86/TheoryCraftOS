@@ -29,6 +29,7 @@
 #include "Hardware/Bluetooth/HciBluetoothAdapter.hpp"
 #include "Hardware/Bluetooth/HidOverGatt.hpp"
 #include "Hardware/Hid/HidDescriptor.hpp"
+#include "Hardware/Keyboard/KeyCodes.hpp"
 #include "SystemBluetoothDetails.hpp"
 #include "Hardware/Keyboard/CompositeKeyboard.hpp"
 #include "Hardware/Mouse/CompositeMouse.hpp"
@@ -828,6 +829,21 @@ static const uint8_t kKeyboardMouseMap[] = {
     0x75, 0x01, 0x81, 0x02, 0x95, 0x01, 0x75, 0x05, 0x81, 0x03, 0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x38, 0x15, 0x81, 0x25, 0x7F, 0x75, 0x08,
     0x95, 0x03, 0x81, 0x06, 0xC0, 0xC0};
 
+static void test_key_maps() {
+  namespace key = hardware::key;
+  CHECK(hardware::usage_from_linux_key(113) == key::kMute && hardware::usage_from_linux_key(114) == key::kVolumeDown && hardware::usage_from_linux_key(115) == key::kVolumeUp &&
+        hardware::usage_from_linux_key(163) == key::kMediaNext && hardware::usage_from_linux_key(164) == key::kMediaPlayPause && hardware::usage_from_linux_key(165) == key::kMediaPrevious &&
+        hardware::usage_from_linux_key(166) == key::kMediaStop && hardware::usage_from_linux_key(224) == key::kBrightnessDown && hardware::usage_from_linux_key(225) == key::kBrightnessUp);
+}
+
+static void test_ps2_media_keys() {
+  namespace key = hardware::key;
+  CHECK(hardware::usage_from_scan_code_set1(0x30, true) == key::kVolumeUp && hardware::usage_from_scan_code_set1(0x2E, true) == key::kVolumeDown && hardware::usage_from_scan_code_set1(0x20, true) == key::kMute &&
+        hardware::usage_from_scan_code_set1(0x22, true) == key::kMediaPlayPause && hardware::usage_from_scan_code_set1(0x19, true) == key::kMediaNext && hardware::usage_from_scan_code_set1(0x10, true) == key::kMediaPrevious &&
+        hardware::usage_from_scan_code_set1(0x24, true) == key::kMediaStop);
+  CHECK(hardware::usage_from_scan_code_set1(0x30, false) != key::kVolumeUp);                                  // (the same code without the E0 prefix is B)
+}
+
 static void test_hid_descriptor() {
   using namespace hid;
   ReportMap map;
@@ -898,6 +914,39 @@ static void test_hid_descriptor() {
     ReportMap m;
     parse_report_map(ConstByteView(flipped, sizeof flipped), &m);
     for (uint32_t i = 0; i < m.report_count; ++i) { KeyboardDecoder k; PointerDecoder p; k.init(m.reports[i]); p.init(m.reports[i]); k.decode(ConstByteView(report, 8), &st); p.decode(ConstByteView(move, 4), &e); p.decode(ConstByteView(report, 1), &e); }
+  }
+  // the keys of the consumer page (volume, mute, transport): one bit each, and the usages map to the keyboard's key codes
+  {
+    const uint8_t consumer[] = {0x05, 0x0C, 0x09, 0x01, 0xA1, 0x01, 0x85, 0x03, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x07, 0x09, 0xE9, 0x09, 0xEA, 0x09, 0xE2, 0x09, 0xCD,
+                                0x09, 0xB5, 0x09, 0xB6, 0x09, 0xB7, 0x81, 0x02, 0x95, 0x01, 0x81, 0x03, 0xC0};
+    ReportMap cmap;
+    CHECK(parse_report_map(ConstByteView(consumer, sizeof consumer), &cmap) && cmap.report_count == 1 && cmap.reports[0].id == 3 && cmap.reports[0].app_page == 0x0C && cmap.reports[0].app_usage == 1);
+    ConsumerDecoder cd;
+    CHECK(cd.init(cmap.reports[0]) && cd.valid());
+    KeyboardState ck;
+    const uint8_t down[1] = {0x05};                                                    // volume up and mute
+    CHECK(cd.decode(ConstByteView(down, 1), &ck) && ck.key_count == 2 && ck.keys[0] == hardware::key::kVolumeUp && ck.keys[1] == hardware::key::kMute);
+    const uint8_t none[1] = {0};
+    CHECK(cd.decode(ConstByteView(none, 1), &ck) && ck.key_count == 0 && !cd.decode(ConstByteView(none, 0), &ck));
+    const uint8_t all[1] = {0x7F};
+    CHECK(cd.decode(ConstByteView(all, 1), &ck) && ck.key_count == 7);
+    CHECK(consumer_usage_to_key(0xE9) == hardware::key::kVolumeUp && consumer_usage_to_key(0xEA) == hardware::key::kVolumeDown && consumer_usage_to_key(0xCD) == hardware::key::kMediaPlayPause &&
+          consumer_usage_to_key(0x6F) == hardware::key::kBrightnessUp && consumer_usage_to_key(0x70) == hardware::key::kBrightnessDown && consumer_usage_to_key(0x1234) == 0);
+    ConsumerDecoder kbd_only;
+    CHECK(!kbd_only.init(*map.find(1)) && !kbd_only.valid());
+    for (size_t n = 0; n <= sizeof consumer; ++n) {
+      ReportMap m;
+      parse_report_map(ConstByteView(consumer, n), &m);
+      for (uint32_t i = 0; i < m.report_count; ++i) { ConsumerDecoder d; d.init(m.reports[i]); d.decode(ConstByteView(down, 1), &ck); }
+    }
+    for (size_t bit = 0; bit < sizeof consumer * 8; ++bit) {
+      uint8_t flipped[sizeof consumer];
+      memcpy(flipped, consumer, sizeof flipped);
+      flipped[bit / 8] ^= static_cast<uint8_t>(1u << (bit % 8));
+      ReportMap m;
+      parse_report_map(ConstByteView(flipped, sizeof flipped), &m);
+      for (uint32_t i = 0; i < m.report_count; ++i) { ConsumerDecoder d; d.init(m.reports[i]); d.decode(ConstByteView(down, 1), &ck); d.decode(ConstByteView(all, 1), &ck); }
+    }
   }
   // a huge report size and count do not wrap
   const uint8_t huge[] = {0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x75, 0xFF, 0x96, 0xFF, 0xFF, 0x81, 0x02, 0x75, 0x20, 0x95, 0xFF, 0x81, 0x02, 0xC0};
@@ -1408,6 +1457,8 @@ int main() {
   test_bonds_and_encryption();
   test_garbage();
   test_service_stack();
+  test_key_maps();
+  test_ps2_media_keys();
   test_hid_descriptor();
   test_hid_end_to_end();
   test_profile_plugin();

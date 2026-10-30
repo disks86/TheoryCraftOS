@@ -89,14 +89,30 @@ hid::InputReport boot_mouse() {
 
 // ------------------------------------------------------------------ the devices
 
-void BluetoothHidKeyboard::deliver(const hid::KeyboardState& state) {
-  kernel::ScopedMutex guard(mutex_);
+// (with the lock held) The keys of the keyboard report and of the consumer report make one state: the modifiers of the first, every key of both.
+void BluetoothHidKeyboard::queue(const hid::KeyboardState& combined) {
   if (count_ == kRing) {                                    // full: the newest state replaces the one before it (the latest state is what counts)
-    ring_[(head_ + count_ - 1) % kRing] = state;
+    ring_[(head_ + count_ - 1) % kRing] = combined;
     return;
   }
-  ring_[(head_ + count_) % kRing] = state;
+  ring_[(head_ + count_) % kRing] = combined;
   ++count_;
+}
+
+void BluetoothHidKeyboard::deliver(const hid::KeyboardState& state) {
+  kernel::ScopedMutex guard(mutex_);
+  typed_ = state;
+  hid::KeyboardState combined = state;
+  for (uint32_t i = 0; i < media_.key_count && combined.key_count < hid::KeyboardState::kMaxKeys; ++i) combined.keys[combined.key_count++] = media_.keys[i];
+  queue(combined);
+}
+
+void BluetoothHidKeyboard::deliver_consumer(const hid::KeyboardState& state) {
+  kernel::ScopedMutex guard(mutex_);
+  media_ = state;
+  hid::KeyboardState combined = typed_;
+  for (uint32_t i = 0; i < media_.key_count && combined.key_count < hid::KeyboardState::kMaxKeys; ++i) combined.keys[combined.key_count++] = media_.keys[i];
+  queue(combined);
 }
 
 void BluetoothHidKeyboard::fetch() {
@@ -117,6 +133,8 @@ void BluetoothHidKeyboard::on_release_all() {
   {
     kernel::ScopedMutex guard(mutex_);
     count_ = 0;
+    typed_ = hid::KeyboardState();
+    media_ = hid::KeyboardState();
   }
   diff_.release_all([this](uint8_t usage, bool pressed) { push(usage, pressed); });
 }
@@ -211,7 +229,7 @@ bool HidOverGatt::attach_reports(IBluetoothRemote& remote, Record& record) {
   UniquePointer<hid::ReportMap> map = UniquePointer<hid::ReportMap>::make(allocator_);
   if (!map || !hid::parse_report_map(ConstByteView(descriptor, length), map.get())) return false;
 
-  bool want_keyboard = false, want_mouse = false;
+  bool want_keyboard = false, want_mouse = false, want_consumer = false;
   int route_characteristic[kMaxReports] = {};
   for (uint32_t c = 0; c < db.characteristic_count && record.route_count < kMaxReports; ++c) {
     const GattCharacteristic& ch = db.characteristics[c];
@@ -230,6 +248,10 @@ bool HidOverGatt::attach_reports(IBluetoothRemote& remote, Record& record) {
       if (!route.keyboard_decoder.init(*report)) continue;
       route.keyboard = true;
       want_keyboard = true;
+    } else if (report->app_page == hid::kPageConsumer && report->app_usage == 1 && !want_consumer) {      // the media keys
+      if (!route.consumer_decoder.init(*report)) continue;
+      route.consumer = true;
+      want_consumer = true;
     } else if (report->app_page == hid::kPageGenericDesktop && (report->app_usage == hid::kUsageMouse || report->app_usage == hid::kUsagePointer) && !want_mouse) {
       if (!route.pointer_decoder.init(*report)) continue;
       want_mouse = true;
@@ -242,11 +264,11 @@ bool HidOverGatt::attach_reports(IBluetoothRemote& remote, Record& record) {
   if (record.route_count == 0) return false;
   {
     kernel::ScopedMutex guard(mutex_);
-    if (want_keyboard) record.keyboard = UniquePointer<BluetoothHidKeyboard>::make(allocator_);
+    if (want_keyboard || want_consumer) record.keyboard = UniquePointer<BluetoothHidKeyboard>::make(allocator_);
     if (want_mouse) {
       record.mouse = UniquePointer<BluetoothHidMouse>::make(allocator_);
       for (uint32_t i = 0; i < record.route_count; ++i)
-        if (!record.routes[i].keyboard && record.mouse) record.mouse->configure(record.routes[i].pointer_decoder.absolute(), record.routes[i].pointer_decoder.max_x(), record.routes[i].pointer_decoder.max_y());
+        if (!record.routes[i].keyboard && !record.routes[i].consumer && record.mouse) record.mouse->configure(record.routes[i].pointer_decoder.absolute(), record.routes[i].pointer_decoder.max_x(), record.routes[i].pointer_decoder.max_y());
     }
   }
   uint32_t subscribed = 0;
@@ -306,6 +328,9 @@ void HidOverGatt::on_notification(IBluetoothRemote& remote, uint16_t value_handl
     if (route.keyboard) {
       hid::KeyboardState state;
       if (record->keyboard && route.keyboard_decoder.decode(value, &state)) record->keyboard->deliver(state);
+    } else if (route.consumer) {
+      hid::KeyboardState state;
+      if (record->keyboard && route.consumer_decoder.decode(value, &state)) record->keyboard->deliver_consumer(state);
     } else {
       MouseEvent event;
       if (record->mouse && route.pointer_decoder.decode(value, &event)) record->mouse->deliver(event);

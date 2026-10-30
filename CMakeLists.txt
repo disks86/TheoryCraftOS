@@ -85,6 +85,8 @@ add_executable(BOOTX64
   src/Hardware/Acpi/EmbeddedController.cpp
   src/Hardware/Acpi/SystemAcpiHost.cpp
   src/Hardware/Acpi/AcpiEvents.cpp
+  src/Hardware/Backlight/AcpiBacklight.cpp
+  src/Hardware/Backlight/IntelPchBacklight.cpp
   src/Hardware/Acpi/IoApic.cpp
   src/Hardware/Acpi/SystemAcpiPorts.cpp
   src/Hardware/Battery/AcpiBattery.cpp

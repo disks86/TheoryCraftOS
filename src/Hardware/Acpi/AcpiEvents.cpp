@@ -258,8 +258,11 @@ void AcpiEvents::deliver() {
     for (uint32_t k = 0; k < button_count_; ++k)
       if (buttons_[k].device == nodes[i]) button_pressed(buttons_[k].kind);
   }
-  if (listener_)
-    for (uint32_t i = 0; i < count; ++i) listener_->on_notify(nodes[i], values[i]);
+  for (uint32_t i = 0; i < count; ++i) {
+    if (listener_) listener_->on_notify(nodes[i], values[i]);
+    for (IAcpiNotifyListener* more : more_listeners_)
+      if (more) more->on_notify(nodes[i], values[i]);
+  }
 }
 
 static char hex_digit(uint32_t v) { return static_cast<char>(v < 10 ? '0' + v : 'A' + (v - 10)); }
