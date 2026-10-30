@@ -129,6 +129,13 @@ class Fabric {
     }
     return r;
   }
+  // A Thunderbolt 3 router whose links support CL states (LINK_ATTR.CPS in each port's link controller block) and which has the low power capability (at 0x100) behind the link controller.
+  void make_clx_capable(uint64_t route) {
+    Router& r = *routers_[route];
+    for (uint32_t phys = 0; phys < 4; ++phys) r.regs[0x50 + 4 + phys * 4 + kLcLinkAttr] |= kLcLinkAttrCps;
+    r.regs[0x51] = 0x100;
+    r.regs[0x100] = (kSwitchCapVse << 8) | (kVsecLowPower << 16) | (0x10u << 24);
+  }
   // The DP IN adapter asks for `mbps` (in units of the granularity the connection manager set).
   void request_dp_bandwidth(uint64_t route, uint32_t port, uint32_t mbps) {
     Port& p = at(route).ports[port];
