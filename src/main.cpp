@@ -1568,6 +1568,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     guest.set_display_request_handler(on_vbox_display_request, &vbox_display);
     desktop.set_display_changer(&DisplayPipeline::apply, &display_pipeline);
     desktop.set_hardware_inventory(&inventory);
+    desktop.set_device_details(&inventory);
     desktop.set_network_details(&network_details);
     desktop.set_wireless_details(&wireless_details);
     desktop.set_media_services(mixer.get(), &video_codecs, &clock);

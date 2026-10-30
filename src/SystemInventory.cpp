@@ -19,58 +19,11 @@
 #include "SystemInventory.hpp"
 #include "Hardware/WirelessInterface/IWirelessInterface.hpp"
 #include "Desktop/Format.hpp"
+#include "SystemInventoryNames.hpp"
 
 using desktop::HardwareGroup;
 
-namespace {
-
-void append_hex(String* out, uint32_t value, uint32_t digits) {
-  static const char kDigits[] = "0123456789ABCDEF";
-  for (int shift = static_cast<int>(digits) * 4 - 4; shift >= 0; shift -= 4) out->push_back(kDigits[(value >> shift) & 15]);
-}
-
-const char* pci_class_name(uint8_t class_code) {
-  switch (class_code) {
-    case 0x00: return "unclassified";
-    case 0x01: return "storage controller";
-    case 0x02: return "network controller";
-    case 0x03: return "display controller";
-    case 0x04: return "multimedia controller";
-    case 0x05: return "memory controller";
-    case 0x06: return "bridge";
-    case 0x07: return "communication controller";
-    case 0x08: return "system peripheral";
-    case 0x09: return "input device";
-    case 0x0C: return "serial bus controller";
-    case 0x0D: return "wireless controller";
-    default: return "device";
-  }
-}
-
-const char* usb_controller_name(hardware::UsbControllerKind kind) {
-  switch (kind) {
-    case hardware::UsbControllerKind::Uhci: return "UHCI USB controller";
-    case hardware::UsbControllerKind::Ohci: return "OHCI USB controller";
-    case hardware::UsbControllerKind::Ehci: return "EHCI USB controller";
-    case hardware::UsbControllerKind::Xhci: return "xHCI USB controller";
-    default: return "USB controller";
-  }
-}
-
-const char* usb_class_name(uint8_t device_class) {
-  switch (device_class) {
-    case 0x01: return "audio";
-    case 0x03: return "input";
-    case 0x07: return "printer";
-    case 0x08: return "storage";
-    case 0x09: return "hub";
-    case 0x0E: return "video";
-    case 0xEF: return "composite";
-    default: return "";
-  }
-}
-
-}  // namespace
+using namespace system_inventory;
 
 void SystemInventory::add(desktop::HardwareList* list, HardwareGroup group, StringView name, uint32_t id, bool wireless) { list->add(group, name, scratch_.view(), id, wireless); }
 
@@ -122,7 +75,7 @@ void SystemInventory::collect(desktop::HardwareList* list) {
       } else {
         scratch_.append(", not connected");
       }
-      add(list, HardwareGroup::Displays, m.name());
+      add(list, HardwareGroup::Displays, m.name(), i);
     }
   }
   if (storage_) {
@@ -137,7 +90,7 @@ void SystemInventory::collect(desktop::HardwareList* list) {
         scratch_.append(", serial ");
         scratch_.append(info.serial);
       }
-      add(list, HardwareGroup::Storage, info.model[0] ? StringView(info.model) : StringView(d->name()));
+      add(list, HardwareGroup::Storage, info.model[0] ? StringView(info.model) : StringView(d->name()), i);
     }
   }
   if (network_) {
@@ -173,7 +126,7 @@ void SystemInventory::collect(desktop::HardwareList* list) {
     for (uint32_t i = 0; i < audio_->count(); ++i)
       if (hardware::IAudioDevice* d = audio_->at(i)) {
         scratch_.assign(audio_->is_hardware(i) ? "48 kHz 16-bit stereo" : "software device, plays to nowhere");
-        add(list, HardwareGroup::Audio, d->name());
+        add(list, HardwareGroup::Audio, d->name(), i);
       }
   }
   if (mpu_ && mpu_->present()) {
@@ -187,19 +140,19 @@ void SystemInventory::collect(desktop::HardwareList* list) {
       if (!usb_midi_->device_info(i, &info)) continue;
       scratch_.assign(info.input && info.output ? "keys and output" : info.input ? "keys" : "output");
       if (info.synthesizer) scratch_.append(", a synthesizer");
-      add(list, HardwareGroup::Midi, info.name);
+      add(list, HardwareGroup::Midi, info.name, 1 + i);
     }
   }
   if (input_) {
     for (uint32_t i = 0; i < input_->keyboards().count(); ++i)
       if (hardware::IKeyboard* k = input_->keyboards().at(i)) {
         scratch_.assign("keyboard");
-        add(list, HardwareGroup::Input, k->name());
+        add(list, HardwareGroup::Input, k->name(), i);
       }
     for (uint32_t i = 0; i < input_->mice().count(); ++i)
       if (hardware::IMouse* m = input_->mice().at(i)) {
         scratch_.assign(m->is_absolute() ? "pointer (absolute)" : "mouse");
-        add(list, HardwareGroup::Input, m->name());
+        add(list, HardwareGroup::Input, m->name(), kMouseIdBase + i);
       }
   }
   if (usb_) {
@@ -208,7 +161,7 @@ void SystemInventory::collect(desktop::HardwareList* list) {
       scratch_.append_uint(usb_->port_count(c));
       scratch_.append(" ports");
       name.assign(usb_controller_name(usb_->controller_kind(c)));
-      add(list, HardwareGroup::Usb, name.view());
+      add(list, HardwareGroup::Usb, name.view(), (c << 16) | kUsbControllerPort);
       for (uint32_t p = 0; p < usb_->port_count(c); ++p) {
         hardware::UsbDeviceDescriptor d;
         if (!usb_->device_descriptor(c, p, &d)) continue;
@@ -224,7 +177,7 @@ void SystemInventory::collect(desktop::HardwareList* list) {
           scratch_.append(", ");
           scratch_.append(usb_class_name(d.device_class));
         }
-        add(list, HardwareGroup::Usb, name.view());
+        add(list, HardwareGroup::Usb, name.view(), (c << 16) | p);
       }
     }
   }
@@ -232,14 +185,14 @@ void SystemInventory::collect(desktop::HardwareList* list) {
     for (uint32_t i = 0; i < printers_->count(); ++i)
       if (hardware::IPrinter* p = printers_->at(i)) {
         scratch_.assign("");
-        add(list, HardwareGroup::Printers, p->name());
+        add(list, HardwareGroup::Printers, p->name(), i);
       }
   }
   if (cameras_) {
     for (uint32_t i = 0; i < cameras_->count(); ++i)
       if (hardware::ICamera* c = cameras_->at(i)) {
         scratch_.assign("");
-        add(list, HardwareGroup::Cameras, c->name());
+        add(list, HardwareGroup::Cameras, c->name(), i);
       }
   }
   if (pci_) {
@@ -258,7 +211,7 @@ void SystemInventory::collect(desktop::HardwareList* list) {
       scratch_.append_uint(d.address.device);
       scratch_.append(", function ");
       scratch_.append_uint(d.address.function);
-      add(list, HardwareGroup::System, name.view());
+      add(list, HardwareGroup::System, name.view(), i);
     }
   }
 }
@@ -268,7 +221,7 @@ bool SystemInventory::refresh() {
   collect(&next);
   if (next.same_as(current_)) return false;
   current_.clear();
-  for (uint32_t i = 0; i < next.count(); ++i) current_.add(next.at(i).group, next.at(i).name, next.at(i).detail);
+  for (uint32_t i = 0; i < next.count(); ++i) current_.add(next.at(i).group, next.at(i).name, next.at(i).detail, next.at(i).id, next.at(i).wireless);
   return true;
 }
 
