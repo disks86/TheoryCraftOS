@@ -249,6 +249,7 @@ class TgsiEmitter {
   bool in_used_[16] = {};
   bool sys_used_[kSysValueCount] = {};
   bool buffer_used_[graphics::kMaxStorageBuffers] = {};
+  bool shared_used_ = false;   // group-shared memory is used (MEMORY[0]), barriers too
   bool compute_ = false;
   bool geometry_ = false, hull_ = false, domain_ = false;
   uint32_t current_cp_ = 0;   // a hull shader: the output control point the copy of the control point phase being written makes
@@ -775,6 +776,17 @@ bool TgsiEmitter::instruction(const Instr& ins) {
       line(op == kIShl ? "SHL" : op == kIShr ? "ISHR" : "USHR", &t, &a, &w);
       break;
     }
+    case kBarrier: {
+      // sync_g: the memory the group shares is made visible (MEMBAR on shared memory and buffers), then the threads wait for each other
+      String flags = str();
+      add(flags, "IMM[");
+      add_uint(flags, imm4_bits(9, 9, 9, 9));   // TGSI_MEMBAR_SHADER_BUFFER | TGSI_MEMBAR_SHARED
+      add(flags, "].xxxx");
+      line("MEMBAR", &flags);
+      line("BARRIER");
+      shared_used_ = true;
+      return true;
+    }
     case kGsEmit: case kGsCut: {
       const String stream = zero();
       if (op == kGsCut) {
@@ -803,10 +815,20 @@ bool TgsiEmitter::instruction(const Instr& ins) {
       // components x and y of one register); the words of a store are packed first, the way Direct3D writes them.
       const bool structured = ins.stride != 0, atomic = op == kBufAtomic || op == kBufImmAtomic;
       String buffer = str();
-      add(buffer, "BUFFER[");
-      add_uint(buffer, ins.uav);
-      add(buffer, "]");
-      buffer_used_[ins.uav] = true;
+      if (ins.uav >= graphics::kMaxStorageBuffers) {
+        // group-shared memory: the host has one such region, TGSI's MEMORY[0]
+        if (ins.uav != graphics::kMaxStorageBuffers) {
+          unsupported_ = true;
+          break;
+        }
+        add(buffer, "MEMORY[0]");
+        shared_used_ = true;
+      } else {
+        add(buffer, "BUFFER[");
+        add_uint(buffer, ins.uav);
+        add(buffer, "]");
+        buffer_used_[ins.uav] = true;
+      }
       const String address = temp(kWork3, ".x"), address_source = temp(kWork3, ".xxxx");
       const String index = operand(ins.src[0], 0, 0, nullptr, true);
       if (structured) {
@@ -1097,6 +1119,7 @@ void TgsiEmitter::assemble(String* out) {
       add_uint(*out, i);
       add(*out, "]\n");
     }
+    if (shared_used_) add(*out, "DCL MEMORY[0], SHARED\n");
   } else if (vertex_) {
     for (uint32_t i = 0; i <= max_attribute_; ++i) {
       add(*out, "DCL IN[");

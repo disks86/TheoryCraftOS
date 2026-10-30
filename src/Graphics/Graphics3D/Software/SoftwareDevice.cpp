@@ -259,14 +259,16 @@ class SoftwareShaderModule final : public IShaderModule {
 
 class SoftwareComputePipeline final : public IPipeline {
  public:
-  SoftwareComputePipeline(ComputeShaderFn function, const uint32_t group[3]) : function_(function) {
+  SoftwareComputePipeline(ComputeShaderFn function, ComputeGroupShaderFn group_function, const uint32_t group[3]) : function_(function), group_function_(group_function) {
     for (uint32_t i = 0; i < 3; ++i) group_[i] = group[i];
   }
   ComputeShaderFn function() const { return function_; }
+  ComputeGroupShaderFn group_function() const { return group_function_; }
   uint32_t group(uint32_t axis) const { return group_[axis]; }
 
  private:
   ComputeShaderFn function_;
+  ComputeGroupShaderFn group_function_;
   uint32_t group_[3];
 };
 
@@ -1190,7 +1192,7 @@ IShaderModule* SoftwareDevice::create_shader_module(const ShaderModuleDesc& desc
     return make<SoftwareShaderModule>(allocator_, desc);
   }
   if (desc.stage == ShaderStage::Compute) {
-    if (!desc.compute_function) return nullptr;
+    if (!desc.compute_function && !desc.compute_group_function) return nullptr;
     uint64_t threads = 1;
     for (uint32_t axis : desc.thread_group) {
       if (axis == 0 || axis > kMaxThreadsPerGroup) return nullptr;
@@ -1209,7 +1211,7 @@ void SoftwareDevice::destroy_shader_module(IShaderModule* module) {
 IPipeline* SoftwareDevice::create_compute_pipeline(const IShaderModule* shader) {
   if (!shader || shader->stage() != ShaderStage::Compute) return nullptr;
   const SoftwareShaderModule* module = static_cast<const SoftwareShaderModule*>(shader);
-  return make<SoftwareComputePipeline>(allocator_, module->desc().compute_function, module->desc().thread_group);
+  return make<SoftwareComputePipeline>(allocator_, module->desc().compute_function, module->desc().compute_group_function, module->desc().thread_group);
 }
 
 IPipeline* SoftwareDevice::create_graphics_pipeline(const GraphicsPipelineDesc& desc) {
@@ -1370,6 +1372,10 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
           for (uint32_t y = 0; y < gy; ++y)
             for (uint32_t x = 0; x < gx; ++x) {
               context.group_id[0] = x, context.group_id[1] = y, context.group_id[2] = z;
+              if (compute->group_function()) {
+                compute->group_function()(context, s.constants);   // (the shader runs the threads of the group itself)
+                continue;
+              }
               uint32_t index = 0;
               for (uint32_t tz = 0; tz < compute->group(2); ++tz)
                 for (uint32_t ty = 0; ty < compute->group(1); ++ty)

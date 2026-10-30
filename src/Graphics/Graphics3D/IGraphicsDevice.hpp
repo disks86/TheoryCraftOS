@@ -302,14 +302,21 @@ using DomainShaderFn = void (*)(const HullOutputData& patch, float u, float v, f
 // in order (no barriers or group-shared memory: a module that needs them is not given a function). `buffers` are the storage buffers bound at the time (empty views for slots
 // that are not bound); a read or write outside a buffer must be dropped or read as zero by the shader.
 constexpr uint32_t kMaxStorageBuffers = 4;
+constexpr uint32_t kMaxSharedMemories = 4;     // group-shared memories (g0 .. g3) of a compute shader (the group runner makes them: a context's `shared`)
+constexpr uint32_t kMaxSharedBytes = 32768;   // all of them together (Direct3D's limit)
+constexpr uint32_t kMaxBarrierThreads = 256;  // threads of a group that uses barriers (each has its own registers while it waits)
 struct ComputeContext {
   uint32_t group_id[3] = {};      // SV_GroupID
   uint32_t thread_id[3] = {};     // SV_GroupThreadID
   uint32_t dispatch_id[3] = {};   // SV_DispatchThreadID: group_id * thread group size + thread_id
   uint32_t group_index = 0;       // SV_GroupIndex: the thread's number in its group
   ByteView buffers[kMaxStorageBuffers];
+  ByteView shared[kMaxSharedMemories];   // (made by a group function for the group it runs)
 };
 using ComputeShaderFn = void (*)(const ComputeContext& context, const uint8_t* constants);
+// A compute shader that uses group-shared memory or barriers is run a whole group at a time: the function runs all the threads of the group named by group_id (thread_id, dispatch_id and
+// group_index of the context are ignored), keeping them in step at the barriers, with memory of its own for the group-shared registers.
+using ComputeGroupShaderFn = ComputeShaderFn;
 // Most threads in a group and most groups (in each dimension) of a dispatch.
 constexpr uint32_t kMaxThreadsPerGroup = 1024;
 constexpr uint32_t kMaxDispatchGroups = 65535;
@@ -338,6 +345,8 @@ struct ShaderModuleDesc {
   GeometryShaderFn geometry_function = nullptr;
   GeometryPrimitive geometry_input = GeometryPrimitive::Triangle;
   GeometryTopology geometry_output = GeometryTopology::TriangleStrip;
+  ComputeGroupShaderFn compute_group_function = nullptr;   // compute: instead of compute_function, for a shader with group-shared memory or barriers
+  uint32_t shared_memory_bytes = 0;                        // ... and how much group-shared memory it declares (virgl makes it with the shader)
   uint32_t geometry_max_vertices = 0;
   uint32_t geometry_instances = 1;   // runs of a geometry shader for each primitive (1 .. 32)
   // Hull and domain shaders (stages Hull and Domain): functions for the software device (virgl: TGSI text), the control points taken and made, and the tessellator's settings (both stages say them).

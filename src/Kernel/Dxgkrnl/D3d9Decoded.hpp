@@ -48,6 +48,7 @@ enum Opcode : uint16_t {
   kBufLoad = 0x1400, kBufStore, kBufAtomic, kBufImmAtomic,
   // Geometry shaders: emit appends the output registers' vertex to the strip, cut ends the strip.
   kGsEmit = 0x1500, kGsCut,
+  kBarrier = 0x1600,   // sync_g..: the thread waits until every thread of its group is here (a group runner switches threads there)
   kLoopBegin = 0x1200, kLoopEnd, kBreak0, kBreakNz, kBreakZ, kContinue0, kContinueNz, kContinueZ,
 };
 

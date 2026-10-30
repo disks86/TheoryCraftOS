@@ -346,7 +346,7 @@ class VirglShaderModule final : public IShaderModule {
     cmd[2] = desc.stage == ShaderStage::Vertex ? virgl::kShaderVertex : desc.stage == ShaderStage::Compute ? virgl::kShaderCompute : desc.stage == ShaderStage::Geometry ? virgl::kShaderGeometry : desc.stage == ShaderStage::Hull ? virgl::kShaderTessControl : desc.stage == ShaderStage::Domain ? virgl::kShaderTessEval : virgl::kShaderFragment;
     cmd[3] = length;                         // total text length (no continuation bit: it all fits)
     cmd[4] = length < 300 ? 300 : length;    // upper bound on the TGSI token count the host reserves
-    cmd[5] = 0;                              // no stream output
+    cmd[5] = desc.stage == ShaderStage::Compute ? desc.shared_memory_bytes : 0;   // no stream output; for a compute shader the group-shared memory it needs, in bytes
     cmd[6 + text_dwords - 1] = 0;
     __builtin_memcpy(&cmd[6], desc.tgsi, length - 1);
     ok_ = device.send_commands(cmd, total);

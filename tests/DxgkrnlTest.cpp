@@ -4275,6 +4275,49 @@ void test_tessellation_kernel() {
   CHECK(shader(graphics::ShaderStage::Domain, b::k_ds_dent, sizeof b::k_ds_dent, &refused, &kernel, dev) == status::kNotSupported);
 }
 
+void test_compute_shared() {
+  HostAllocator allocator;
+  const std::vector<uint8_t> blob = read_blob("cs_shared.dxbc");
+  UniquePointer<D3d9Program> program;
+  CHECK(D3d9Program::compile_dxbc(allocator, ConstByteView(blob.data(), blob.size()), &program) == status::kSuccess && program);
+  if (!program) return;
+  CHECK(program->needs_group() && program->shared_bytes(0) == 256 && program->shared_total_bytes() == 256);
+  CHECK((program->required_features() & graphics::kFeatureCompute) != 0);
+  uint8_t storage[32 * 32 * 4] = {};
+  graphics::ComputeContext context;
+  context.buffers[0] = ByteView(storage, sizeof storage);
+  context.group_id[0] = 1;
+  program->run_compute_group(context, nullptr);
+  ByteReader in{ConstByteView(storage, sizeof storage)};
+  uint32_t words[1024];
+  for (uint32_t& w : words) w = in.le32();
+  // (group (1, 0): slot k holds k + 7, so thread 0 reads 8 from its neighbour and the sum of the 64 slots is 2016 + 448 = 2464, whose >> 3 is 308, low byte 0x34; the thread's blue is 4 * its number)
+  for (uint32_t t = 0; t < 8; ++t) CHECK(words[8 + t] == (0xFF000000u | ((8 + t) << 16) | (0x34u << 8) | (t * 4)));
+  CHECK(words[0] == 0 && words[7] == 0);   // (the other groups were not run)
+  // The text for the GPU: the shared memory, the barrier.
+  String text(allocator);
+  CHECK(program->emit_tgsi(&text) == status::kSuccess);
+  const std::string tgsi(text.view().data(), text.size());
+  CHECK(tgsi.find("DCL MEMORY[0], SHARED") != std::string::npos && tgsi.find("BARRIER") != std::string::npos && tgsi.find("MEMORY[0]") != std::string::npos);
+  // Truncated and bit-flipped: refused or compiled, never a crash.
+  for (size_t n = 0; n < blob.size(); n += 11) {
+    UniquePointer<D3d9Program> cut;
+    D3d9Program::compile_dxbc(allocator, ConstByteView(blob.data(), n), &cut);
+  }
+  for (size_t bit = 0; bit < blob.size() * 8; bit += 37) {
+    std::vector<uint8_t> flipped = blob;
+    flipped[bit / 8] ^= static_cast<uint8_t>(1u << (bit % 8));
+    UniquePointer<D3d9Program> bad;
+    D3d9Program::compile_dxbc(allocator, ConstByteView(flipped.data(), flipped.size()), &bad);
+    if (bad && bad->needs_group()) {
+      uint8_t scratch[32 * 32 * 4] = {};
+      graphics::ComputeContext c;
+      c.buffers[0] = ByteView(scratch, sizeof scratch);
+      bad->run_compute_group(c, nullptr);
+    }
+  }
+}
+
 // Geometry shaders with adjacency input and instances.
 void test_geometry_extras() {
   HostAllocator allocator;
@@ -4436,6 +4479,11 @@ void test_conformance() {
         CHECK(near(px(7, 4), 0xFF36659C) && (px(6, 4) & 0xFFFFFF) == 0);
       }
       if (__builtin_strstr(r.name, "integer render")) CHECK(px(16, 4) == 0xFF3380CC && px(0, 0) == 0xFF14283C);   // (51, 128, 204 = 255 * the colour, and the cleared (20, 40, 60))
+    }
+    if (__builtin_strstr(r.name, "group-shared memory")) {
+      // Thread 0 of group (0, 0): the neighbour's value is 1, the sum of the 64 slots (0 .. 63) 2016 (>> 3 is 252), the thread's own number 0. Thread 1 sees 2 and has 4 as its blue.
+      auto px = [&](uint32_t x, uint32_t y) { return r.device_picture[y * 32 + x]; };
+      CHECK(px(0, 0) == 0xFF01FC00u && px(1, 0) == 0xFF02FC04u && px(8, 0) == (0xFF000000u | (8u << 16) | (0x34u << 8)));
     }
     if (__builtin_strstr(r.name, "adjacency primitives")) {
       // The triangle (left) and the quad (right) both drawn.
@@ -5618,6 +5666,7 @@ int main() {
   test_sm3_and_sm51();
   test_ps1();
   test_device_suite();
+  test_compute_shared();
   test_geometry_extras();
   test_alpha_to_coverage();
   test_conformance();

@@ -1107,6 +1107,26 @@ void scene_compute(Rig& rig, ArrayView<uint32_t> out) {
     for (uint32_t& pixel : out) pixel ^= 0x0000FF00u;
 }
 
+// Group-shared memory and barriers (cs_shared.hlsl): 16 groups of 8 x 8 threads, each writing a slot of a 64-word shared array, reading its neighbour's after a barrier, and the 64 slots added
+// by a reduction with a barrier in its loop. The picture is the buffer: red the neighbour's value, green the sum, blue the thread.
+void scene_compute_shared(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureCompute)) return void(rig.step("compute", status::kNotSupported));
+  namespace b = conformance_blobs;
+  Handle cs = rig.shader("create_shader (compute)", ShaderKind::Dxbc, graphics::ShaderStage::Compute, bytes_of(b::k_cs_shared, sizeof b::k_cs_shared));
+  PipelineDesc pd;
+  pd.compute_shader = cs;
+  Handle pipe = rig.pipeline(pd);
+  AllocationDesc d;
+  d.flags = kAllocUnorderedAccess, d.size = kPixels * 4;
+  Handle picture = rig.create(d);
+  CommandWriter w(rig.allocator());
+  w.bind_pipeline(pipe);
+  w.bind_uav(0, 0, 0, kPixels * 4);
+  w.dispatch(kSize / 8, kSize / 8, 1);
+  rig.render(w, {picture});
+  rig.read_words(picture, out);
+}
+
 // Multisampling (4 samples): a far red rectangle and a near green one that overlaps it, both with edges between the pixels' sample positions, drawn into 4x colour and depth images (depth
 // tested per sample) and resolved. Vertical and horizontal edges are covered the same by every device that uses the standard 4x pattern, whatever the order of the samples.
 void scene_multisample(Rig& rig, ArrayView<uint32_t> out) {
@@ -1613,6 +1633,7 @@ const Entry kScenes[] = {
     {"Direct3D 10 4x multisampling", scene_multisample},
     {"Direct3D 10 alpha to coverage", scene_alpha_to_coverage},
     {"Direct3D 11 compute shader and unordered access views (DXBC)", scene_compute},
+    {"Direct3D 11 group-shared memory and barriers (DXBC)", scene_compute_shared},
     {"Direct3D 10 independent blend per render target (DXBC)", scene_independent_blend},
     {"Direct3D 10 half-float render target and texture", scene_half_float_target},
     {"Direct3D 10 float render target and texture", scene_float_target},

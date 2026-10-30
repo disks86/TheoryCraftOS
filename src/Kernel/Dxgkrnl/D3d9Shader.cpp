@@ -18,7 +18,9 @@
 
 #include "Kernel/Dxgkrnl/D3d9Decoded.hpp"
 #include <utility>
+#include <new>
 #include "Math/FloatMath.hpp"
+#include "Utility/AllocatedView.hpp"
 #include "Utility/ByteStream.hpp"
 #include "Utility/Move.hpp"
 
@@ -78,6 +80,8 @@ struct D3d9Program::State {
   bool geometry_cut = false;   // a cut came after the last emit
   Q sys[kSysValueCount] = {};
   bool killed = false;
+  bool at_barrier = false;     // the run stopped at a barrier ...
+  uint64_t barrier_pc = 0;     // ... and goes on from this instruction
 };
 
 D3d9Program::D3d9Program(allocators::IAllocator& allocator) : allocator_(allocator), code_(allocator), defs_(allocator), bools_(allocator) {}
@@ -634,12 +638,16 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
         ++out->count;
         break;
       }
+      case kBarrier:
+        s.at_barrier = true;
+        s.barrier_pc = pc;
+        return;
       case kGsCut:
         if (s.geometry_out && s.geometry_out->count) s.geometry_cut = true;
         break;
       case kBufLoad: case kBufStore: case kBufAtomic: case kBufImmAtomic: {
-        if (!s.compute || ins.uav >= graphics::kMaxStorageBuffers) break;
-        const ByteView buffer = s.compute->buffers[ins.uav];
+        if (!s.compute || ins.uav >= graphics::kMaxStorageBuffers + graphics::kMaxSharedMemories) break;
+        const ByteView buffer = ins.uav < graphics::kMaxStorageBuffers ? s.compute->buffers[ins.uav] : s.compute->shared[ins.uav - graphics::kMaxStorageBuffers];
         // The byte address: a raw buffer's is the address; a structured one's the structure number times the stride plus the offset (an atomic gives both in one register).
         uint64_t address = bits_of(a.f[0]);
         if (ins.stride) {
@@ -964,6 +972,68 @@ void D3d9Program::run_compute(const graphics::ComputeContext& context, const uin
   execute(s);
 }
 
+// A group of threads that share memory or wait for each other at barriers: every thread has its own registers and runs up to its next barrier (or its end); when all have stopped, they
+// all go on. Threads that have finished do not wait for the others.
+void D3d9Program::run_compute_group(const graphics::ComputeContext& context, const uint8_t* constants) const {
+  if (stage_ != graphics::ShaderStage::Compute) return;
+  const uint32_t threads = thread_group_[0] * thread_group_[1] * thread_group_[2];
+  if (threads == 0 || threads > graphics::kMaxBarrierThreads) return;
+  // The memory: the registers of the threads, where each is to go on, which are done, and the group-shared memories.
+  State* states = static_cast<State*>(allocator_.allocate(sizeof(State) * threads));
+  ArrayView<uint64_t> resume = allocate_view<uint64_t>(allocator_, threads);
+  ArrayView<uint8_t> done = allocate_view<uint8_t>(allocator_, threads);
+  ArrayView<uint8_t> shared_memory[graphics::kMaxSharedMemories];
+  graphics::ComputeContext group = context;
+  bool ok = states && !resume.empty() && !done.empty();
+  for (uint32_t k = 0; k < graphics::kMaxSharedMemories && ok; ++k) {
+    if (!shared_bytes_[k]) continue;
+    shared_memory[k] = allocate_view<uint8_t>(allocator_, shared_bytes_[k]);
+    ok = !shared_memory[k].empty();
+    if (ok) {
+      shared_memory[k].fill(0);
+      group.shared[k] = ByteView(shared_memory[k].data(), shared_memory[k].size());
+    }
+  }
+  uint32_t constructed = 0;
+  if (ok) {
+    for (; constructed < threads; ++constructed) {
+      State* s = new (&states[constructed]) State();
+      s->constants = constants;
+      s->compute = &group;
+      const uint32_t i = constructed;
+      const uint32_t tx = i % thread_group_[0], ty = (i / thread_group_[0]) % thread_group_[1], tz = i / (thread_group_[0] * thread_group_[1]);
+      const uint32_t id[3] = {tx, ty, tz};
+      for (uint32_t k = 0; k < 3; ++k) {
+        s->sys[kSysDispatchThreadId].f[k] = from_bits(context.group_id[k] * thread_group_[k] + id[k]);
+        s->sys[kSysGroupId].f[k] = from_bits(context.group_id[k]);
+        s->sys[kSysGroupThreadId].f[k] = from_bits(id[k]);
+      }
+      s->sys[kSysGroupIndex].f[0] = from_bits(i);
+      resume[i] = 0;
+      done[i] = 0;
+    }
+    uint32_t remaining = threads;
+    for (uint32_t phase = 0; remaining && phase < 100000; ++phase)
+      for (uint32_t i = 0; i < threads; ++i) {
+        if (done[i]) continue;
+        State& s = states[i];
+        s.at_barrier = false;
+        execute(s, resume[i], code_.count());
+        if (s.at_barrier) {
+          resume[i] = s.barrier_pc;
+        } else {
+          done[i] = 1;
+          --remaining;
+        }
+      }
+  }
+  for (uint32_t i = 0; i < constructed; ++i) states[i].~State();
+  if (states) allocator_.deallocate(states);
+  release_view(allocator_, resume);
+  release_view(allocator_, done);
+  for (ArrayView<uint8_t>& m : shared_memory) release_view(allocator_, m);
+}
+
 // --- Trampolines -----------------------------------------------------------------------------------------------------------------------------------------------------
 
 namespace {
@@ -1007,6 +1077,11 @@ void compute_trampoline(const graphics::ComputeContext& context, const uint8_t* 
 }
 
 template <uint32_t N>
+void compute_group_trampoline(const graphics::ComputeContext& context, const uint8_t* constants) {
+  g_compute[N]->run_compute_group(context, constants);
+}
+
+template <uint32_t N>
 void geometry_trampoline(const graphics::GeometryInputData& input, const uint8_t* constants, graphics::GeometryOutputData* output) {
   g_geometry[N]->run_geometry(input, constants, output);
 }
@@ -1026,6 +1101,7 @@ struct Trampolines {
   static constexpr graphics::DomainShaderFn domain[sizeof...(I)] = {&domain_trampoline<I>...};
   static constexpr graphics::GeometryShaderFn geometry[sizeof...(I)] = {&geometry_trampoline<I>...};
   static constexpr graphics::ComputeShaderFn compute[sizeof...(I)] = {&compute_trampoline<I>...};
+  static constexpr graphics::ComputeShaderFn compute_group[sizeof...(I)] = {&compute_group_trampoline<I>...};
   static constexpr graphics::VertexShaderFnEx vertex_ex[sizeof...(I)] = {&vertex_ex_trampoline<I>...};
   static constexpr graphics::FragmentShaderFnEx fragment_ex[sizeof...(I)] = {&fragment_ex_trampoline<I>...};
   static constexpr graphics::VertexShaderFn vertex[sizeof...(I)] = {&vertex_trampoline<I>...};
@@ -1087,7 +1163,12 @@ NtStatus D3d9Binding::bind(UniquePointer<D3d9Program> program, graphics::ShaderM
     slot_ = static_cast<int32_t>(slot);
     kind_ = 3;
     desc->stage = graphics::ShaderStage::Compute;
-    desc->compute_function = decltype(kTrampolines)::compute[slot];
+    if (program->needs_group()) {
+      desc->compute_group_function = decltype(kTrampolines)::compute_group[slot];
+      desc->shared_memory_bytes = program->shared_total_bytes();
+    } else {
+      desc->compute_function = decltype(kTrampolines)::compute[slot];
+    }
     for (uint32_t k = 0; k < 3; ++k) desc->thread_group[k] = program->thread_group(k);
     program_ = util::move(program);
     return status::kSuccess;
