@@ -30,7 +30,7 @@ namespace paint {
 class DisplayPainter {
  public:
   DisplayPainter(allocators::IAllocator& allocator, font::FontSet& fonts, browser::IObjectPainter* objects)
-      : allocator_(allocator), fonts_(fonts), objects_(objects), resolved_(allocator), have_(allocator) {}
+      : allocator_(allocator), fonts_(fonts), objects_(objects), resolved_(allocator), have_(allocator), run_(allocator) {}
 
   // Draws `list` so that page position (0, 0) is at (dx, dy) on the target, inside `view` (target coordinates; nothing outside it changes).
   // The canvas colour of the page is not drawn here: fill the view with DisplayList::background() (or the default paper) first.
@@ -59,6 +59,7 @@ class DisplayPainter {
   font::FontHandle font_of(const DisplayList& list, uint32_t index);
   List<font::FontHandle> resolved_;
   List<uint8_t> have_;
+  font::GlyphRun run_;   // (shaped into again for every text op: its storage is kept, not allocated per run)
 
   allocators::IAllocator& allocator_;
   font::FontSet& fonts_;

@@ -22,7 +22,7 @@ namespace paint {
 
 void DisplayPainter::draw_text(graphics::IRenderer2D& r, font::FontHandle font, StringView text, int32_t x64, int32_t baseline, uint32_t color, int32_t letter64,
                                int32_t word64) {
-  font::GlyphRun run(allocator_);
+  font::GlyphRun& run = run_;
   font::ShapeOptions options;
   options.letter_spacing = letter64;
   options.word_spacing = word64;
