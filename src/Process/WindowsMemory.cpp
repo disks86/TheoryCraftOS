@@ -447,6 +447,7 @@ uint32_t run_remote(Process& target, IProcessRuntime::RemoteOp& op) {
       target.read_user_u64(target.gs_base() + 0x60, &op.address);      // TEB.ProcessEnvironmentBlock
       for (uint32_t i = 0; i < 64; ++i) op.image[i] = target.image_information()[i];
       op.protect = target.priority_class;      // (the Win32 priority class)
+      if (const Process::ThreadRecord* main_thread = target.find_thread(target.id())) op.argument = main_thread->teb;      // (the TEB of its main thread)
       return kStatusSuccess;
     }
   }

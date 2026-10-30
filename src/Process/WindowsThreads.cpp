@@ -134,10 +134,11 @@ uint32_t context_in(Process& target, uint64_t thread_id, bool set, X86Context* c
     if (set) return store_context(target, stopped_at, *context) ? kSuccess : kAccessViolation;
     return apply_context(target, stopped_at, context) ? kSuccess : kAccessViolation;
   }
-  if (record->suspend_count == 0) return 0xC000000Du;
-  if (record->started && !runtime->is_parked(record->id)) return 0xC0000001u;
+  X86Context probe;
+  if (!runtime->get_context(record->id, &probe)) return record->suspend_count == 0 ? 0xC000000Du : 0xC0000001u;      // (it runs: a thread that is not parked has no registers to give)
   if (set) return runtime->set_context(record->id, *context) ? kSuccess : 0xC0000001u;
-  return runtime->get_context(record->id, context) ? kSuccess : 0xC0000001u;
+  *context = probe;
+  return kSuccess;
 }
 
 uint32_t terminate_thread_in(Process& target, uint64_t thread_id, uint32_t code) {
@@ -497,7 +498,7 @@ uint32_t context_call(Process& p, const SyscallRequest& r, bool set) {
   IProcessRuntime* runtime = p.runtime();
   if (!runtime) return kNotImplemented;
   if (record->finished) return 0xC000004Bu;
-  if (record->id == runtime->current_thread_id() || record->suspend_count == 0) return 0xC000000Du;      // a thread's own registers, or a thread that runs, are not to be had
+  if (record->id == runtime->current_thread_id() || (record->suspend_count == 0 && record->started)) return 0xC000000Du;      // a thread's own registers, or a thread that runs, are not to be had
   for (uint32_t waited = 0; record->started && !runtime->is_parked(record->id); ++waited) {      // it stops at its next system call or timer tick
     if (waited > 5000 || p.exited()) return 0xC0000001u;
     p.block_sleep(1000000);
@@ -608,6 +609,11 @@ uint32_t nt_query_information_thread(Process& p, const SyscallRequest& r) {
     uint64_t slot = r.args[0] / 4 - 1;
     if (!system_objects()->query_process(uint32_t(p.files().token(slot)), &exited, &code, &owner)) return kInvalidHandle;
     uint8_t info[48] = {};
+    if (main_thread_of_other && p.runtime() && !exited) {      // where its TEB is
+      IProcessRuntime::RemoteOp op;
+      op.kind = IProcessRuntime::RemoteOp::ProcessInfo;
+      if (p.runtime()->remote_operation(owner, op) == kSuccess) for (uint32_t i = 0; i < 8; ++i) info[8 + i] = uint8_t(op.argument >> (8 * i));
+    }
     const uint32_t status_value = exited ? code : kStillActive;
     for (uint32_t i = 0; i < 4; ++i) info[i] = uint8_t(status_value >> (8 * i));
     for (uint32_t i = 0; i < 8; ++i) { info[16 + i] = uint8_t((owner & (kRemoteThreadIdLimit - 1)) >> (8 * i)); info[24 + i] = uint8_t(owner >> (8 * i)); }

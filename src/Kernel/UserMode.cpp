@@ -458,6 +458,7 @@ void user_main(void* argument) {
   frame.rflags = kFlagsInterrupt | 2;
   frame.rsp = start.stack_pointer;
   frame.ss = kSelectorUserData;
+  if (ut->start_context_set) context_to_frame(ut->saved, &frame);      // (registers set before it ran)
   irq_disable();
   tcos_resume_frame(&frame);
 }
@@ -596,7 +597,11 @@ bool Task::get_context(uint64_t id, process::X86Context* out) {
   UserThread* t = find_thread(id);
   if (!t) return false;
   if (!t->spawned) {      // it has not run yet: its registers are the ones it will start with
+    if (t->start_context_set) { *out = t->saved; return true; }
     *out = process::X86Context();
+    out->rflags = 0x200;
+    out->fpu[0] = 0x7F; out->fpu[1] = 0x02;      // the x87 control word, 0x27F
+    out->fpu[24] = 0x80; out->fpu[25] = 0x1F;    // MXCSR, 0x1F80
     out->rip = t->start.entry;
     out->gpr[process::X86Context::kRsp] = t->start.stack_pointer;
     out->gpr[process::X86Context::kRcx] = t->start.argument;
@@ -615,6 +620,8 @@ bool Task::set_context(uint64_t id, const process::X86Context& context) {
     t->start.stack_pointer = context.gpr[process::X86Context::kRsp];
     t->start.argument = context.gpr[process::X86Context::kRcx];
     t->start.argument2 = context.gpr[process::X86Context::kRdx];
+    t->saved = context;      // (all of them: the thread starts with exactly these)
+    t->start_context_set = true;
     return true;
   }
   if (!t->parked) return false;
@@ -651,6 +658,7 @@ UserThread* Task::add_thread(const process::ThreadStart& start) {
 constexpr uint32_t kUserThreadKernelStack = 256 * 1024;
 
 bool Task::launch(UserThread* t, uint32_t stack_bytes) {
+  program.finish_loading();      // (a process created suspended gets its imports and loader list when its first thread starts)
   __atomic_add_fetch(&running_threads, 1, __ATOMIC_ACQ_REL);      // (before the thread can run and end)
   t->thread = kernel::spawn(user_main, t, "user-thread", -1, -1, stack_bytes);
   t->spawned = t->thread != nullptr;
@@ -917,6 +925,7 @@ uint32_t Task::spawn_process(const process::ChildSpec& spec) {
   if (abi == process::SyscallAbi::Windows) p.set_library_provider(program.library_provider());
   p.set_working_directory(spec.working_directory);
   p.set_processor_count(processor_count());
+  p.defer_loading(spec.suspended);
   p.set_command_line(spec.command_line);
   p.set_startup(spec.startup);
   // argv: the program's name, then (for a Linux program) the words of the command line
@@ -1210,6 +1219,7 @@ uint32_t process_snapshot(ProcessInfo* out, uint32_t capacity) {
 bool Task::start_first_thread() {
   UserThread* t = first_thread;
   if (!t || t->spawned) return false;
+  program.finish_loading();
   first_thread = nullptr;
   __atomic_add_fetch(&running_threads, 1, __ATOMIC_ACQ_REL);
   t->thread = kernel::spawn(user_main, t, "program");

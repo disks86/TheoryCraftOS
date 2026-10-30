@@ -125,8 +125,12 @@ class ModuleSet {
 // the load: its slot points at a stub that stops the program with a message when it is called, which describe_missing() explains. `main_image` is the program as
 // load_pe() mapped it. Fails (NeedsLibraries, Malformed, OutOfMemory) only for a library file that is damaged, built for another CPU, or has no relocations when its
 // base is taken. `detail` gets a text for the user on failure.
+// With `bind_program` false the program's own import table is left as the file has it (bind_program_imports() fills it in later: a process that is created suspended has not
+// resolved its imports yet).
 LoadStatus load_windows_modules(AddressSpace& space, allocators::IAllocator& allocator, const exe::PeFile& program, ConstByteView program_file, StringView program_name,
-                                ILibraryProvider& provider, ModuleSet* out, String* detail);
+                                ILibraryProvider& provider, ModuleSet* out, String* detail, bool bind_program = true);
+// The import table of the program (the first module of the set), when load_windows_modules() left it alone.
+LoadStatus bind_program_imports(AddressSpace& space, allocators::IAllocator& allocator, const exe::PeFile& program, ModuleSet* set);
 
 // After start-up: loads one more library (the file `provider` has for `canonical_name`) and the libraries it imports that are not loaded yet, into the process that `set` describes,
 // and binds their imports. What was loaded is appended to `set` (modules_ and, in the order their entry points must run, order_): the caller reads set->count() and set->init_count()

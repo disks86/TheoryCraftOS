@@ -499,7 +499,7 @@ uint64_t ModuleSet::export_address(StringView module, StringView function) const
 }
 
 LoadStatus load_windows_modules(AddressSpace& space, allocators::IAllocator& allocator, const exe::PeFile& program, ConstByteView program_file, StringView program_name,
-                                ILibraryProvider& provider, ModuleSet* out, String* detail) {
+                                ILibraryProvider& provider, ModuleSet* out, String* detail, bool bind_program) {
   (void)program_file;
   Context c{space, allocator, provider, *out, detail};
   UniquePointer<Module> main = UniquePointer<Module>::make(allocator, allocator);
@@ -521,7 +521,7 @@ LoadStatus load_windows_modules(AddressSpace& space, allocators::IAllocator& all
     if (status != LoadStatus::Ok) return status;
   }
   // Phase 2: bind.
-  for (uint64_t i = 0; i < out->modules_.count(); ++i) {
+  for (uint64_t i = bind_program ? 0 : 1; i < out->modules_.count(); ++i) {
     const LoadStatus status = bind_imports(c, *out->modules_[i]);
     if (status != LoadStatus::Ok) { main_raw->pe = nullptr; return status; }
   }
@@ -530,6 +530,25 @@ LoadStatus load_windows_modules(AddressSpace& space, allocators::IAllocator& all
   for (UniquePointer<Module>& m : out->modules_.view()) m->pinned = true;      // (these stay as long as the process does)
   main_raw->pe = nullptr;      // (the program's headers belong to the caller and may go away)
   return LoadStatus::Ok;
+}
+
+namespace {
+class NoLibraries final : public ILibraryProvider {
+ public:
+  bool find(StringView, ConstByteView*) override { return false; }
+};
+}  // namespace
+
+LoadStatus bind_program_imports(AddressSpace& space, allocators::IAllocator& allocator, const exe::PeFile& program, ModuleSet* set) {
+  if (set->modules_.count() == 0 || !set->modules_[0]->main) return LoadStatus::Malformed;
+  NoLibraries none;
+  String detail(allocator);
+  Context c{space, allocator, none, *set, &detail};
+  Module& main = *set->modules_[0];
+  main.pe = &program;      // (the headers are the caller's, and only here)
+  const LoadStatus status = bind_imports(c, main);
+  main.pe = nullptr;
+  return status;
 }
 
 }  // namespace process

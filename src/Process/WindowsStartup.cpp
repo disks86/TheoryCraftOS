@@ -219,6 +219,7 @@ LoadStatus build_windows_startup(AddressSpace& space, const exe::PeFile& pe, con
   w.u16(peb + 0x120, 19045);                        // OSBuildNumber
   w.u32(peb + 0x124, 2);                            // OSPlatformId: VER_PLATFORM_WIN32_NT
   w.u32(peb + 0x2C0, 1);                            // SessionId
+  w.u64(peb + 0xC0, uint64_t(-25920000000000ll));   // CriticalSectionTimeout: 30 days
 
   // --- the TEB (NT_TIB first)
   w.u64(teb + 0x00, ~uint64_t{0});                  // ExceptionList (unused on x64)
@@ -229,6 +230,9 @@ LoadStatus build_windows_startup(AddressSpace& space, const exe::PeFile& pe, con
   w.u64(teb + 0x40, input.process_id);              // ClientId.UniqueProcess
   w.u64(teb + 0x48, input.thread_id);               // ClientId.UniqueThread
   w.u64(teb + 0x60, peb);                           // ProcessEnvironmentBlock
+  w.u64(teb + 0x7D8, input.process_id);             // RealClientId
+  w.u64(teb + 0x7E0, input.thread_id);
+  w.unicode_string(teb + 0x1258, teb + 0x1268, 0, 522);      // StaticUnicodeString
   w.u64(teb + 0x1478, input.stack_top - input.stack_size);    // DeallocationStack
   if (!write_tls(w, space, teb, tls_area, tls, tls_count)) return LoadStatus::Malformed;
   for (uint32_t i = 0; i < tls_count; ++i) if (tls_index_at[i] != 0) w.u32(tls_index_at[i], i);      // _tls_index = the module's number
@@ -285,7 +289,7 @@ LoadStatus build_windows_startup(AddressSpace& space, const exe::PeFile& pe, con
       w.u16(entry + 0x6C, 0xFFFF);                     // LoadCount: static
       w.u16(entry + 0x6E, m.tls_rva ? 0xFFFF : 0);     // TlsIndex: -1 for a module with thread-local data
     }
-    w.u64(peb + 0x18, ldr);                            // PEB.Ldr
+    if (!input.defer_ldr) w.u64(peb + 0x18, ldr);      // PEB.Ldr
   }
   if (!w.ok()) return LoadStatus::Malformed;
 
@@ -334,6 +338,9 @@ LoadStatus build_windows_thread(AddressSpace& space, const WindowsThreadInput& i
   w.u64(teb + 0x40, input.process_id);              // ClientId
   w.u64(teb + 0x48, input.thread_id);
   w.u64(teb + 0x60, input.peb);
+  w.u64(teb + 0x7D8, input.process_id);             // RealClientId
+  w.u64(teb + 0x7E0, input.thread_id);
+  w.unicode_string(teb + 0x1258, teb + 0x1268, 0, 522);      // StaticUnicodeString
   w.u64(teb + 0x1478, base);                        // DeallocationStack
   if (!write_tls(w, space, teb, tls_area, input.tls, input.tls_count, true)) { space.unmap(base, total); return LoadStatus::Malformed; }
   if (!w.ok()) { space.unmap(base, total); return LoadStatus::Malformed; }
