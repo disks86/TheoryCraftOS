@@ -61,7 +61,9 @@ class TgsiEmitter {
   static constexpr uint32_t kPosition = 39, kVarying = 40, kColor = 44;   // (kVarying: four)
   static constexpr uint32_t kSys = 45;     // the system values (SysValue order), copied from where TGSI keeps them into registers of the interpreter's shape
   static constexpr uint32_t kColorExtra = kSys + kSysValueCount;   // colour outputs 1..3 (output 0 is kColor)
-  static constexpr uint32_t kTempCount = kColorExtra + graphics::kMaxColorTargets - 1;
+  static constexpr uint32_t kGsPosition = kColorExtra + graphics::kMaxColorTargets - 1;   // a geometry shader's input positions, three vertices, turned back to Direct3D's +Y up
+  static constexpr uint32_t kPatchBase = kGsPosition + 3;   // a hull shader's patch constant registers (shadows of the tessellation factors)
+  static constexpr uint32_t kTempCount = kPatchBase + graphics::kMaxPatchRegisters;
   static uint32_t color_register(uint32_t target) { return target == 0 ? kColor : kColorExtra + target - 1; }
   static constexpr uint32_t kMaxOutput = 120000;   // (the virgl command carrying the text has a 16-bit dword count)
 
@@ -234,6 +236,7 @@ class TgsiEmitter {
   bool instruction(const Instr& ins);
   bool compare(const Instr& ins);
   void assemble(String* out);
+  void write_control_point_outputs();
 
   const D3d9Program& p_;
   allocators::IAllocator& a_;
@@ -247,6 +250,8 @@ class TgsiEmitter {
   bool sys_used_[kSysValueCount] = {};
   bool buffer_used_[graphics::kMaxStorageBuffers] = {};
   bool compute_ = false;
+  bool geometry_ = false, hull_ = false, domain_ = false;
+  uint32_t current_cp_ = 0;   // a hull shader: the output control point the copy of the control point phase being written makes
   uint32_t max_attribute_ = 0;
   bool sampler_used_[graphics::kMaxTextureUnits] = {};
 };
@@ -260,6 +265,49 @@ String TgsiEmitter::operand(const Instr::Src& s, uint32_t offset, uint32_t slot,
       add(base, "]");
       break;
     case kInput:
+      if (hull_ || domain_) {
+        // IN[control point][1 + varying]; the control point being made is the invocation's (ADDR[1]); the position is turned back to Direct3D's +Y up into a scratch register
+        if ((!s.vertex_from_id && s.vertex >= graphics::kMaxPatchControlPoints) || (s.slot != kSlotPosition && (s.slot < 0 || s.slot >= static_cast<int8_t>(graphics::kMaxVaryings)))) {
+          unsupported_ = true;
+          break;
+        }
+        String in = str();
+        add(in, "IN[");
+        add_uint(in, s.vertex_from_id ? current_cp_ : s.vertex);   // (the control point phase is written once for each output control point, so the one being made is known)
+        add(in, "][");
+        add_uint(in, s.slot == kSlotPosition ? 0u : static_cast<uint32_t>(s.slot) + 1);
+        add(in, "]");
+        if (s.slot != kSlotPosition || domain_) {   // (a domain shader's control points are the hull shader's, already in Direct3D's space)
+          add(base, in.view());
+          break;
+        }
+        const float flip[4] = {1.0f, -1.0f, 1.0f, 1.0f};
+        const String scratch = temp(kScratch + slot), factor = imm_text(flip, ".xyzw");
+        line("MUL", &scratch, &in, &factor);
+        add(base, "TEMP[");
+        add_uint(base, kScratch + slot);
+        add(base, "]");
+        break;
+      }
+      if (geometry_) {
+        // IN[vertex][1 + varying] (the position is in a register of its own: the host's +Y is the other way up)
+        if (s.vertex >= 3 || (s.slot != kSlotPosition && (s.slot < 0 || s.slot >= static_cast<int8_t>(graphics::kMaxVaryings)))) {
+          unsupported_ = true;
+          break;
+        }
+        if (s.slot == kSlotPosition) {
+          add(base, "TEMP[");
+          add_uint(base, kGsPosition + s.vertex);
+          add(base, "]");
+        } else {
+          add(base, "IN[");
+          add_uint(base, s.vertex);
+          add(base, "][");
+          add_uint(base, static_cast<uint32_t>(s.slot) + 1);
+          add(base, "]");
+        }
+        break;
+      }
       if (s.slot < 0 || s.slot >= 16) {
         unsupported_ = true;
         break;
@@ -281,7 +329,15 @@ String TgsiEmitter::operand(const Instr::Src& s, uint32_t offset, uint32_t slot,
       add(base, "]");
       break;
     case kSysValue:   // (copied to a register by the prologue; the stage decides which exist)
-      if (s.number >= kSysValueCount || (compute_ ? s.number < kSysDispatchThreadId : vertex_ ? s.number != kSysVertexId && s.number != kSysInstanceId : s.number == kSysVertexId || s.number == kSysInstanceId || s.number >= kSysDispatchThreadId)) {
+      if (s.number == kSysOutputControlPointId && !hull_) {
+        unsupported_ = true;
+        break;
+      }
+      if (s.number == kSysDomainLocation && !domain_) {
+        unsupported_ = true;
+        break;
+      }
+      if (s.number >= kSysValueCount || (compute_ || hull_ || domain_ ? s.number < kSysDispatchThreadId : vertex_ ? s.number != kSysVertexId && s.number != kSysInstanceId : s.number == kSysVertexId || s.number == kSysInstanceId || s.number >= kSysDispatchThreadId)) {
         unsupported_ = true;
         break;
       }
@@ -396,6 +452,9 @@ String TgsiEmitter::destination(const Instr::Dst& d) {
       if (d.slot >= 0 && d.slot < static_cast<int8_t>(graphics::kMaxVaryings)) return temp(kVarying + static_cast<uint32_t>(d.slot), "");
       break;
     case kColorOut: return temp(color_register(d.slot >= 0 ? static_cast<uint32_t>(d.slot) : 0), "");
+    case kPatchOut:
+      if (d.number < graphics::kMaxPatchRegisters) return temp(kPatchBase + d.number, "");
+      break;
     default: break;
   }
   unsupported_ = true;
@@ -720,6 +779,29 @@ bool TgsiEmitter::instruction(const Instr& ins) {
       line(op == kIShl ? "SHL" : op == kIShr ? "ISHR" : "USHR", &t, &a, &w);
       break;
     }
+    case kGsEmit: case kGsCut: {
+      const String stream = zero();
+      if (op == kGsCut) {
+        line("ENDPRIM", &stream);
+        return true;
+      }
+      // The position goes out as the host wants it (+Y down), the varyings as they are.
+      const float flip[4] = {1.0f, -1.0f, 1.0f, 1.0f};
+      const String pos = temp(kPosition), factor = imm_text(flip, ".xyzw");
+      String o = str();
+      add(o, "OUT[0]");
+      line("MUL", &o, &pos, &factor);
+      for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) {
+        String target = str();
+        add(target, "OUT[");
+        add_uint(target, i + 1);
+        add(target, "]");
+        const String v = temp(kVarying + i);
+        line("MOV", &target, &v);
+      }
+      line("EMIT", &stream);
+      return true;
+    }
     case kBufLoad: case kBufStore: case kBufAtomic: case kBufImmAtomic: {
       // Storage buffers: TGSI's LOAD / STORE / ATOM* on BUFFER[n], addressed in bytes. The address of a structured buffer is index * stride + offset (an atomic gives both in the
       // components x and y of one register); the words of a store are packed first, the way Direct3D writes them.
@@ -913,10 +995,87 @@ bool TgsiEmitter::instruction(const Instr& ins) {
   return true;
 }
 
+// A hull shader's control point phase is over: the output control point this invocation made goes to the per-vertex outputs, at the invocation's index.
+void TgsiEmitter::write_control_point_outputs() {
+  const String pos = temp(kPosition);
+  String o = str();
+  add(o, "OUT[");
+  add_uint(o, current_cp_);
+  add(o, "][0]");
+  line("MOV", &o, &pos);
+  for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) {
+    String target = str();
+    add(target, "OUT[");
+    add_uint(target, current_cp_);
+    add(target, "][");
+    add_uint(target, i + 1);
+    add(target, "]");
+    const String v = temp(kVarying + i);
+    line("MOV", &target, &v);
+  }
+}
+
 void TgsiEmitter::assemble(String* out) {
   out->clear();
-  add(*out, compute_ ? "COMP\n" : vertex_ ? "VERT\n" : p_.color_outputs_ > 1 ? "FRAG\n" : "FRAG\nPROPERTY FS_COLOR0_WRITES_ALL_CBUFS 1\n");
-  if (compute_) {
+  if (geometry_) {
+    static const char* const kInputs[] = {"POINTS", "LINES", "TRIANGLES"};
+    static const char* const kOutputs[] = {"POINTS", "LINE_STRIP", "TRIANGLE_STRIP"};
+    add(*out, "GEOM\nPROPERTY GS_INPUT_PRIMITIVE ");
+    add(*out, kInputs[static_cast<uint32_t>(p_.geometry_input_)]);
+    add(*out, "\nPROPERTY GS_OUTPUT_PRIMITIVE ");
+    add(*out, kOutputs[static_cast<uint32_t>(p_.geometry_output_)]);
+    add(*out, "\nPROPERTY GS_MAX_OUTPUT_VERTICES ");
+    add_uint(*out, p_.geometry_max_vertices_);
+    add(*out, "\nPROPERTY GS_INVOCATIONS 1\nDCL IN[][0], POSITION\n");
+    for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) {
+      add(*out, "DCL IN[][");
+      add_uint(*out, i + 1);
+      add(*out, "], GENERIC[");
+      add_uint(*out, i);
+      add(*out, "]\n");
+    }
+    add(*out, "DCL OUT[0], POSITION\n");
+    for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) {
+      add(*out, "DCL OUT[");
+      add_uint(*out, i + 1);
+      add(*out, "], GENERIC[");
+      add_uint(*out, i);
+      add(*out, "]\n");
+    }
+  }
+  if (hull_ || domain_) {
+    if (hull_) {
+      add(*out, "TESS_CTRL\nPROPERTY TCS_VERTICES_OUT ");
+      add_uint(*out, p_.tess_output_points_);
+      add(*out, "\nDCL SV[0], INVOCATIONID\n");
+    } else {
+      // (the values of these properties are numbers: PIPE_PRIM_TRIANGLES is 4, PIPE_TESS_SPACING_EQUAL 2)
+      add(*out, "TESS_EVAL\nPROPERTY TES_PRIM_MODE 4\nPROPERTY TES_SPACING 2\n");
+      add(*out, p_.tess_output_ == graphics::TessOutput::TriangleCw ? "PROPERTY TES_VERTEX_ORDER_CW 1\n" : "PROPERTY TES_VERTEX_ORDER_CW 0\n");
+      add(*out, "PROPERTY TES_POINT_MODE 0\nDCL SV[0], TESSCOORD\n");
+    }
+    add(*out, "DCL IN[][0], POSITION\n");
+    for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) {
+      add(*out, "DCL IN[][");
+      add_uint(*out, i + 1);
+      add(*out, "], GENERIC[");
+      add_uint(*out, i);
+      add(*out, "]\n");
+    }
+    add(*out, hull_ ? "DCL OUT[][0], POSITION\n" : "DCL OUT[0], POSITION\n");
+    for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) {
+      add(*out, hull_ ? "DCL OUT[][" : "DCL OUT[");
+      add_uint(*out, i + 1);
+      add(*out, hull_ ? "], GENERIC[" : "], GENERIC[");
+      add_uint(*out, i);
+      add(*out, "]\n");
+    }
+    if (hull_) add(*out, "DCL OUT[5], TESSOUTER\nDCL OUT[6], TESSINNER\n");
+  }
+  if (!geometry_ && !hull_ && !domain_) add(*out, compute_ ? "COMP\n" : vertex_ ? "VERT\n" : p_.color_outputs_ > 1 ? "FRAG\n" : "FRAG\nPROPERTY FS_COLOR0_WRITES_ALL_CBUFS 1\n");
+  if (geometry_ || hull_ || domain_) {
+    // (the declarations are above)
+  } else if (compute_) {
     add(*out, "PROPERTY CS_FIXED_BLOCK_WIDTH ");
     add_uint(*out, p_.thread_group_[0]);
     add(*out, "\nPROPERTY CS_FIXED_BLOCK_HEIGHT ");
@@ -1006,11 +1165,28 @@ void TgsiEmitter::assemble(String* out) {
 NtStatus TgsiEmitter::run(String* out) {
   vertex_ = p_.stage_ == graphics::ShaderStage::Vertex;
   compute_ = p_.stage_ == graphics::ShaderStage::Compute;
+  geometry_ = p_.stage_ == graphics::ShaderStage::Geometry;
+  hull_ = p_.stage_ == graphics::ShaderStage::Hull;
+  domain_ = p_.stage_ == graphics::ShaderStage::Domain;
   for (const Instr& ins : p_.code_.view()) {
     if (ins.dst.type == kAddrTex) addr_used_ = true;
     for (uint32_t k = 0; k < ins.src_count; ++k) {
       if (ins.src[k].relative) addr_used_ = true;
       if (ins.src[k].type == kSysValue && ins.src[k].number < kSysValueCount) sys_used_[ins.src[k].number] = true;
+    }
+  }
+
+  // A geometry shader's input positions, turned back to Direct3D's clip space (the vertex shader's text flips Y for the host).
+  if (geometry_) {
+    const float flip[4] = {1.0f, -1.0f, 1.0f, 1.0f};
+    const uint32_t vertices = p_.geometry_input_ == graphics::GeometryPrimitive::Triangle ? 3 : p_.geometry_input_ == graphics::GeometryPrimitive::Line ? 2 : 1;
+    for (uint32_t v = 0; v < vertices; ++v) {
+      const String target = temp(kGsPosition + v), factor = imm_text(flip, ".xyzw");
+      String in = str();
+      add(in, "IN[");
+      add_uint(in, v);
+      add(in, "][0]");
+      line("MUL", &target, &in, &factor);
     }
   }
 
@@ -1066,6 +1242,22 @@ NtStatus TgsiEmitter::run(String* out) {
       }
       continue;
     }
+    if (hull_ || domain_) {
+      // vOutputControlPointID (the invocation) and SV_DomainLocation (the tessellation coordinate), as the interpreter has them
+      const String z0 = zero();
+      line("MOV", &reg, &z0);
+      if (k == kSysOutputControlPointId) {
+        String source = str();
+        add(source, "SV[0].xxxx");
+        line("MOV", &reg_x, &source);
+      } else if (k == kSysDomainLocation) {
+        const String xyz = temp(kSys + k, ".xyz");
+        String source = str();
+        add(source, "SV[0].xyzz");
+        line("MOV", &xyz, &source);
+      }
+      continue;
+    }
     String source = str();
     if (vertex_) {
       add(source, k == kSysVertexId ? "SV[0].xxxx" : "SV[1].xxxx");
@@ -1082,7 +1274,7 @@ NtStatus TgsiEmitter::run(String* out) {
     if (k == kSysFrontFacing) line("FSGE", &reg_x, &source, &z);   // (TGSI's FACE is +1 or -1)
     else line("MOV", &reg_x, &source);
   }
-  if (vertex_) {
+  if (vertex_ || geometry_ || hull_ || domain_) {
     const String pos = temp(kPosition);
     line("MOV", &pos, &z);
     for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) {
@@ -1096,14 +1288,71 @@ NtStatus TgsiEmitter::run(String* out) {
     }
   }
 
-  for (const Instr& ins : p_.code_.view()) {
-    instruction(ins);
+  if (hull_) {
+    // The invocation: which output control point this is. The patch constant shadows start at zero.
+    for (uint32_t r = 0; r < graphics::kMaxPatchRegisters; ++r) {
+      const String reg = temp(kPatchBase + r);
+      line("MOV", &reg, &z);
+    }
+  }
+  const D3d9Program::Instruction* code = p_.code_.view().data();
+  const uint64_t code_count = p_.code_.count();
+  uint64_t first = 0;
+  if (hull_) {
+    // The control point phase is run by each invocation for its own control point: written out once for each, behind a test of the invocation's number (TGSI cannot index the
+    // per-vertex arrays by it in a way every host takes), the shadows starting at zero in each.
+    for (uint32_t cp = 0; cp < p_.tess_output_points_ && !oom_ && !unsupported_; ++cp) {
+      current_cp_ = cp;
+      const String test = temp(kWork3, ".x"), id = [&] { String s = str(); add(s, "SV[0].xxxx"); return s; }(), number = [&] { String s = str(); add(s, "IMM["); add_uint(s, imm4_bits(cp, cp, cp, cp)); add(s, "].xxxx"); return s; }();
+      line("USEQ", &test, &id, &number);
+      const String cond = temp(kWork3, ".xxxx");
+      line("UIF", &cond);
+      const String pos = temp(kPosition), id_reg = temp(kSys + kSysOutputControlPointId, ".x");
+      line("MOV", &pos, &z);
+      for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) {
+        const String v = temp(kVarying + i);
+        line("MOV", &v, &z);
+      }
+      String as_id = str();
+      add(as_id, "SV[0].xxxx");
+      line("MOV", &id_reg, &as_id);
+      for (uint64_t i = p_.hs_cp_begin_; i < p_.hs_cp_end_ && i < code_count; ++i) {
+        instruction(code[i]);
+        if (oom_ || unsupported_) break;
+      }
+      write_control_point_outputs();
+      line("ENDIF");
+    }
+    first = p_.hs_cp_end_;
+  }
+  for (uint64_t i = first; i < code_count && !oom_ && !unsupported_; ++i) {
+    instruction(code[i]);
     if (oom_ || unsupported_) break;
   }
 
   // Epilogue: the shadows to the outputs.
   if (!oom_ && !unsupported_) {
-    if (vertex_) {
+    if (hull_) {
+      // The patch constants: the factors out of the registers the shader wrote them to (the patch outputs, as TGSI has them, are the two vectors of factors).
+      const String tess_outer = [&] { String s = str(); add(s, "OUT[5]"); return s; }(), tess_inner = [&] { String s = str(); add(s, "OUT[6]"); return s; }();
+      for (uint32_t k = 0; k < 3; ++k) {
+        if (p_.outer_factor_reg_[k] < 0) continue;
+        String target = str();
+        add(target, "OUT[5].");
+        add(target, StringView(&"xyz"[k], 1));
+        const String source = temp(kPatchBase + static_cast<uint32_t>(p_.outer_factor_reg_[k]), ".xxxx");
+        line("MOV", &target, &source);
+      }
+      if (p_.inner_factor_reg_ >= 0) {
+        String target = str();
+        add(target, "OUT[6].x");
+        const String source = temp(kPatchBase + static_cast<uint32_t>(p_.inner_factor_reg_), ".xxxx");
+        line("MOV", &target, &source);
+      }
+      (void)tess_outer, (void)tess_inner;
+    } else if (geometry_) {
+      // (the vertices were written out by the emits)
+    } else if (vertex_ || domain_) {
       const float flip[4] = {1.0f, -1.0f, 1.0f, 1.0f};
       const String pos = temp(kPosition), factor = imm_text(flip, ".xyzw");
       String o = str();

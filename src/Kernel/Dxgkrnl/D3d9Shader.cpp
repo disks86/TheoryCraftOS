@@ -70,6 +70,12 @@ struct D3d9Program::State {
   const uint8_t* constants = nullptr;
   const graphics::ITextureSet* textures = nullptr;
   const graphics::ComputeContext* compute = nullptr;
+  const graphics::GeometryInputData* geometry_in = nullptr;
+  const graphics::HullInputData* hull_in = nullptr;        // a hull shader's input control points
+  const graphics::HullOutputData* patch_in = nullptr;      // a domain shader's patch (control points and constants)
+  Q patch_out[graphics::kMaxPatchRegisters] = {};          // a hull shader's patch constant registers
+  graphics::GeometryOutputData* geometry_out = nullptr;
+  bool geometry_cut = false;   // a cut came after the last emit
   Q sys[kSysValueCount] = {};
   bool killed = false;
 };
@@ -114,6 +120,8 @@ uint32_t D3d9Program::required_features() const {
   for (graphics::TextureKind k : texture_kind_)
     if (k != graphics::TextureKind::Texture2D) kinds = graphics::kFeatureTextureKinds;
   if (stage_ == graphics::ShaderStage::Compute) kinds |= graphics::kFeatureCompute;
+  if (stage_ == graphics::ShaderStage::Geometry) kinds |= graphics::kFeatureGeometryShaders;
+  if (stage_ == graphics::ShaderStage::Hull || stage_ == graphics::ShaderStage::Domain) kinds |= graphics::kFeatureTessellation;
   return kinds | (uses_system_values_ ? graphics::kFeatureSystemInputs : 0u) | (uses_texel_access_ ? graphics::kFeatureTexelAccess : 0u) |
          (color_outputs_ > 1 ? graphics::kFeatureMultipleTargets : 0u);
 }
@@ -419,7 +427,7 @@ float apply_modifier(uint8_t m, float x) {
 
 }  // namespace
 
-void D3d9Program::execute(State& s) const {
+void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
   using Instr = Instruction;
   auto push_constant = [&](uint32_t index) {
     Q q = {{0, 0, 0, 0}};
@@ -437,7 +445,36 @@ void D3d9Program::execute(State& s) const {
     switch (src.type) {
       case kTemp: v = s.r[src.number]; break;
       case kSysValue: if (src.number < kSysValueCount) v = s.sys[src.number]; break;
+      case kPatchIn:
+        if (s.patch_in && src.number < graphics::kMaxPatchRegisters) v = {{s.patch_in->patch[src.number].x, s.patch_in->patch[src.number].y, s.patch_in->patch[src.number].z, s.patch_in->patch[src.number].w}};
+        break;
       case kInput:
+        if (s.hull_in || s.patch_in) {
+          // a hull shader's input control point, or a domain shader's (the hull shader's output) one; the control point being made when the index is vOutputControlPointID
+          uint32_t cp = src.vertex;
+          if (src.vertex_from_id) cp = bits_of(s.sys[kSysOutputControlPointId].f[0]);
+          if (cp < graphics::kMaxPatchControlPoints) {
+            graphics::Vec4 a = {0, 0, 0, 0};
+            if (s.hull_in) {
+              if (src.slot == kSlotPosition) a = s.hull_in->position[cp];
+              else if (src.slot >= 0 && src.slot < static_cast<int8_t>(graphics::kMaxVaryings)) a = s.hull_in->varying[cp][src.slot];
+            } else {
+              if (src.slot == kSlotPosition) a = s.patch_in->control_point[cp].position;
+              else if (src.slot >= 0 && src.slot < static_cast<int8_t>(graphics::kMaxVaryings)) a = s.patch_in->control_point[cp].varying[src.slot];
+            }
+            v = {{a.x, a.y, a.z, a.w}};
+          }
+          break;
+        }
+        if (s.geometry_in) {
+          // (a geometry shader: the position or a varying of one vertex of the primitive)
+          if (src.vertex < 3 && src.slot == kSlotPosition) v = {{s.geometry_in->position[src.vertex].x, s.geometry_in->position[src.vertex].y, s.geometry_in->position[src.vertex].z, s.geometry_in->position[src.vertex].w}};
+          else if (src.vertex < 3 && src.slot >= 0 && src.slot < static_cast<int8_t>(graphics::kMaxVaryings)) {
+            const graphics::Vec4 a = s.geometry_in->varying[src.vertex][src.slot];
+            v = {{a.x, a.y, a.z, a.w}};
+          }
+          break;
+        }
         if (src.slot >= 0) {
           const graphics::Vec4 a = s.attributes ? s.attributes[src.slot] : s.varyings[src.slot];
           v = {{a.x, a.y, a.z, a.w}};
@@ -490,6 +527,7 @@ void D3d9Program::execute(State& s) const {
     switch (d.type) {
       case kTemp: target = &s.r[d.number]; break;
       case kAddrTex: target = &s.a0; break;
+      case kPatchOut: target = d.number < graphics::kMaxPatchRegisters ? &s.patch_out[d.number] : nullptr; break;
       case kRastOut: target = &s.pos; break;
       case kAttrOut:
       case kTexCrdOut: target = d.slot == kSlotPosition ? &s.pos : d.slot >= 0 ? &s.var[d.slot] : nullptr; break;
@@ -516,9 +554,9 @@ void D3d9Program::execute(State& s) const {
     }
   };
 
-  const uint64_t count = code_.count();
+  const uint64_t count = code_.count() < end ? code_.count() : end;
   uint32_t steps = 0;   // (a loop that never ends stops the program, not the machine)
-  for (uint64_t pc = 0; pc < count;) {
+  for (uint64_t pc = begin; pc < count;) {
     if (++steps > kMaxSteps) return;
     const Instr& ins = code_[pc++];
     int_mode = ins.op >= kIntegerFirst && ins.op <= kIntegerLast;
@@ -585,6 +623,20 @@ void D3d9Program::execute(State& s) const {
         break;
       case kDp3: b = fetch(ins.src[1], 0); store(ins.dst, splat(dot(a, b, 3))); break;
       case kDp4: b = fetch(ins.src[1], 0); store(ins.dst, splat(dot(a, b, 4))); break;
+      case kGsEmit: {
+        graphics::GeometryOutputData* out = s.geometry_out;
+        if (!out || out->count >= geometry_max_vertices_ || out->count >= graphics::kMaxGeometryVertices) break;   // (past the maximum: dropped)
+        graphics::ShaderIo& v = out->vertex[out->count];
+        v.position = {s.pos.f[0], -s.pos.f[1], s.pos.f[2], s.pos.f[3]};
+        for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) v.varying[i] = {s.var[i].f[0], s.var[i].f[1], s.var[i].f[2], s.var[i].f[3]};
+        out->restart[out->count] = s.geometry_cut;
+        s.geometry_cut = false;
+        ++out->count;
+        break;
+      }
+      case kGsCut:
+        if (s.geometry_out && s.geometry_out->count) s.geometry_cut = true;
+        break;
       case kBufLoad: case kBufStore: case kBufAtomic: case kBufImmAtomic: {
         if (!s.compute || ins.uav >= graphics::kMaxStorageBuffers) break;
         const ByteView buffer = s.compute->buffers[ins.uav];
@@ -844,6 +896,55 @@ bool D3d9Program::run_fragment_ex(const graphics::Vec4* varyings, const graphics
   return true;
 }
 
+void D3d9Program::run_hull(const graphics::HullInputData& input, const uint8_t* constants, graphics::HullOutputData* output) const {
+  if (stage_ != graphics::ShaderStage::Hull || !output) return;
+  State s;
+  s.constants = constants;
+  // (the vertex shader's positions come with Y down; the hull and domain shaders work in Direct3D's clip space, with Y up: turned over on the way in, here, and on the way out of the domain shader)
+  graphics::HullInputData upright = input;
+  for (uint32_t k = 0; k < upright.control_points && k < graphics::kMaxPatchControlPoints; ++k) upright.position[k].y = -upright.position[k].y;
+  s.hull_in = &upright;
+  // The control point phase once for each output control point, then the fork and join phases (which make the patch constants).
+  for (uint32_t cp = 0; cp < tess_output_points_ && cp < graphics::kMaxPatchControlPoints; ++cp) {
+    s.sys[kSysOutputControlPointId].f[0] = from_bits(cp);
+    s.pos = {{0, 0, 0, 0}};
+    for (Q& v : s.var) v = {{0, 0, 0, 0}};
+    execute(s, hs_cp_begin_, hs_cp_end_);
+    graphics::ShaderIo& out = output->control_point[cp];
+    out.position = {s.pos.f[0], s.pos.f[1], s.pos.f[2], s.pos.f[3]};
+    for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) out.varying[i] = {s.var[i].f[0], s.var[i].f[1], s.var[i].f[2], s.var[i].f[3]};
+  }
+  if (hs_fork_end_ > hs_fork_begin_) execute(s, hs_fork_begin_, hs_fork_end_);
+  if (hs_join_end_ > hs_join_begin_) execute(s, hs_join_begin_, hs_join_end_);
+  for (uint32_t i = 0; i < graphics::kMaxPatchRegisters; ++i) output->patch[i] = {s.patch_out[i].f[0], s.patch_out[i].f[1], s.patch_out[i].f[2], s.patch_out[i].f[3]};
+  for (uint32_t k = 0; k < 3; ++k) output->outer[k] = outer_factor_reg_[k] >= 0 ? s.patch_out[outer_factor_reg_[k]].f[0] : 0.0f;   // (a factor not written culls the patch)
+  output->inner[0] = inner_factor_reg_ >= 0 ? s.patch_out[inner_factor_reg_].f[0] : 0.0f;
+}
+
+void D3d9Program::run_domain(const graphics::HullOutputData& patch, float u, float v, float w, const uint8_t* constants, graphics::ShaderIo* out) const {
+  if (stage_ != graphics::ShaderStage::Domain || !out) return;
+  State s;
+  s.constants = constants;
+  s.patch_in = &patch;
+  s.sys[kSysDomainLocation] = {{u, v, w, 0.0f}};
+  execute(s);
+  out->position = {s.pos.f[0], -s.pos.f[1], s.pos.f[2], s.pos.f[3]};
+  for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) out->varying[i] = {s.var[i].f[0], s.var[i].f[1], s.var[i].f[2], s.var[i].f[3]};
+}
+
+void D3d9Program::run_geometry(const graphics::GeometryInputData& input, const uint8_t* constants, graphics::GeometryOutputData* output) const {
+  if (stage_ != graphics::ShaderStage::Geometry || !output) return;
+  State s;
+  s.constants = constants;
+  // The vertex shader's positions come with Y the way the devices want it (down); the shader works in Direct3D's clip space (up), so they are turned over on the way in and out.
+  graphics::GeometryInputData upright = input;
+  for (graphics::Vec4& p : upright.position) p.y = -p.y;
+  s.geometry_in = &upright;
+  s.geometry_out = output;
+  output->count = 0;
+  execute(s);
+}
+
 void D3d9Program::run_compute(const graphics::ComputeContext& context, const uint8_t* constants) const {
   if (stage_ != graphics::ShaderStage::Compute) return;
   State s;
@@ -869,6 +970,9 @@ const D3d9Program* g_textured[kSlots];
 const D3d9Program* g_vertex_ex[kSlots];
 const D3d9Program* g_fragment_ex[kSlots];
 const D3d9Program* g_compute[kSlots];
+const D3d9Program* g_geometry[kSlots];
+const D3d9Program* g_hull[kSlots];
+const D3d9Program* g_domain[kSlots];
 
 template <uint32_t N>
 void vertex_trampoline(const graphics::Vec4* attributes, const uint8_t* constants, graphics::ShaderIo* out) {
@@ -897,8 +1001,25 @@ void compute_trampoline(const graphics::ComputeContext& context, const uint8_t* 
   g_compute[N]->run_compute(context, constants);
 }
 
+template <uint32_t N>
+void geometry_trampoline(const graphics::GeometryInputData& input, const uint8_t* constants, graphics::GeometryOutputData* output) {
+  g_geometry[N]->run_geometry(input, constants, output);
+}
+
+template <uint32_t N>
+void hull_trampoline(const graphics::HullInputData& input, const uint8_t* constants, graphics::HullOutputData* output) {
+  g_hull[N]->run_hull(input, constants, output);
+}
+template <uint32_t N>
+void domain_trampoline(const graphics::HullOutputData& patch, float u, float v, float w, const uint8_t* constants, graphics::ShaderIo* out) {
+  g_domain[N]->run_domain(patch, u, v, w, constants, out);
+}
+
 template <uint32_t... I>
 struct Trampolines {
+  static constexpr graphics::HullShaderFn hull[sizeof...(I)] = {&hull_trampoline<I>...};
+  static constexpr graphics::DomainShaderFn domain[sizeof...(I)] = {&domain_trampoline<I>...};
+  static constexpr graphics::GeometryShaderFn geometry[sizeof...(I)] = {&geometry_trampoline<I>...};
   static constexpr graphics::ComputeShaderFn compute[sizeof...(I)] = {&compute_trampoline<I>...};
   static constexpr graphics::VertexShaderFnEx vertex_ex[sizeof...(I)] = {&vertex_ex_trampoline<I>...};
   static constexpr graphics::FragmentShaderFnEx fragment_ex[sizeof...(I)] = {&fragment_ex_trampoline<I>...};
@@ -917,6 +1038,41 @@ constexpr auto kTrampolines = make_trampolines(std::make_integer_sequence<uint32
 NtStatus D3d9Binding::bind(UniquePointer<D3d9Program> program, graphics::ShaderModuleDesc* desc) {
   release();
   if (!program) return status::kInvalidParameter;
+  if (program->stage() == graphics::ShaderStage::Hull || program->stage() == graphics::ShaderStage::Domain) {
+    const bool is_hull = program->stage() == graphics::ShaderStage::Hull;
+    const D3d9Program** table = is_hull ? g_hull : g_domain;
+    uint32_t slot = 0;
+    while (slot < kSlots && table[slot]) ++slot;
+    if (slot == kSlots) return status::kInsufficientResources;
+    table[slot] = program.get();
+    slot_ = static_cast<int32_t>(slot);
+    kind_ = is_hull ? 5 : 6;
+    desc->stage = program->stage();
+    if (is_hull) desc->hull_function = decltype(kTrampolines)::hull[slot];
+    else desc->domain_function = decltype(kTrampolines)::domain[slot];
+    desc->tess_input_points = program->tess_input_points();
+    desc->tess_output_points = program->tess_output_points();
+    desc->tess_domain = graphics::TessDomain::Triangle;
+    desc->tess_partitioning = program->tess_partitioning();
+    desc->tess_output = program->tess_output();
+    program_ = util::move(program);
+    return status::kSuccess;
+  }
+  if (program->stage() == graphics::ShaderStage::Geometry) {
+    uint32_t slot = 0;
+    while (slot < kSlots && g_geometry[slot]) ++slot;
+    if (slot == kSlots) return status::kInsufficientResources;
+    g_geometry[slot] = program.get();
+    slot_ = static_cast<int32_t>(slot);
+    kind_ = 4;
+    desc->stage = graphics::ShaderStage::Geometry;
+    desc->geometry_function = decltype(kTrampolines)::geometry[slot];
+    desc->geometry_input = program->geometry_input();
+    desc->geometry_output = program->geometry_output();
+    desc->geometry_max_vertices = program->geometry_max_vertices();
+    program_ = util::move(program);
+    return status::kSuccess;
+  }
   if (program->stage() == graphics::ShaderStage::Compute) {
     uint32_t slot = 0;
     while (slot < kSlots && g_compute[slot]) ++slot;
@@ -959,7 +1115,7 @@ NtStatus D3d9Binding::bind(UniquePointer<D3d9Program> program, graphics::ShaderM
 
 void D3d9Binding::release() {
   if (slot_ >= 0) {
-    const D3d9Program** table = kind_ == 0 ? g_vertex : kind_ == 1 ? g_fragment : kind_ == 3 ? g_compute : g_textured;
+    const D3d9Program** table = kind_ == 0 ? g_vertex : kind_ == 1 ? g_fragment : kind_ == 3 ? g_compute : kind_ == 4 ? g_geometry : kind_ == 5 ? g_hull : kind_ == 6 ? g_domain : g_textured;
     table[slot_] = nullptr;
     slot_ = -1;
   }

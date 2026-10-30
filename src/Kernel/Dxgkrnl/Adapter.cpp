@@ -145,6 +145,7 @@ class Adapter::StreamRunner {
     cb_ = adapter_.device_.create_command_buffer();
     if (!cb_) return status::kNoMemory;
     device_topology_ = graphics::PrimitiveTopology::TriangleList;
+    device_patch_points_ = 0;
     cb_->begin();
     return status::kSuccess;
   }
@@ -212,7 +213,8 @@ class Adapter::StreamRunner {
       case Op::Dispatch: return dispatch(p);
       case Op::SetTopology: {
         const uint32_t topology = p.le32();
-        if (!exact(p) || topology > static_cast<uint32_t>(Topology::PointList)) return kBad;
+        if (!exact(p) || topology > kPatchListBase + graphics::kMaxPatchControlPoints) return kBad;
+        if (topology > static_cast<uint32_t>(Topology::PointList) && !(adapter_.caps_.features & graphics::kFeatureTessellation)) return kBad;
         topology_ = static_cast<Topology>(topology);
         return status::kSuccess;
       }
@@ -272,7 +274,8 @@ class Adapter::StreamRunner {
         if (extras[k] == e) return kBad;
     }
     if (flags & ~(kPassClearColor | kPassClearDepth | kPassClearStencil)) return kBad;
-    if (!finite_within(clear.x, 1e6f) || !finite_within(clear.y, 1e6f) || !finite_within(clear.z, 1e6f) || !finite_within(clear.w, 1e6f)) return kBad;
+    // (the clear colour of an integer target is four integers as float bits: any bit pattern)
+    if (!is_integer(color->desc().format) && (!finite_within(clear.x, 1e6f) || !finite_within(clear.y, 1e6f) || !finite_within(clear.z, 1e6f) || !finite_within(clear.w, 1e6f))) return kBad;
     if (!(clear_depth >= 0.0f && clear_depth <= 1.0f) || clear_stencil > 255) return kBad;
     // A render pass may not draw into an image that is bound as a texture.
     for (uint32_t u = 0; u < graphics::kMaxTextureUnits; ++u)
@@ -500,10 +503,23 @@ class Adapter::StreamRunner {
     }
     if (!exact(p) || !in_pass_ || !pipeline_) return kBad;
     if (instanced && (!(adapter_.caps_.features & graphics::kFeatureInstancing) || instance_count == 0 || instance_count > (1u << 20))) return kBad;
-    if (topology_ >= Topology::LineList && !(adapter_.caps_.features & graphics::kFeatureLines)) return kBad;
+    if (topology_ >= Topology::LineList && topology_ <= Topology::PointList && !(adapter_.caps_.features & graphics::kFeatureLines)) return kBad;
+    // Patches go with a hull and a domain shader that take that many control points, and those shaders go with patches (and with no geometry shader).
+    if (is_patch_list(topology_) != pipeline_->has_tessellation()) return kBad;
+    if (pipeline_->has_tessellation() && (patch_points(topology_) != pipeline_->tess_input_points() || pipeline_->has_geometry())) return kBad;
     for (uint32_t u = 0; u < pipeline_->texture_count(); ++u)
       if (!texture_bound_[u] || texture_alloc_[u]->texture_kind() != pipeline_->texture_kind(u)) return kBad;   // (unbound, or a volume where the shader reads a 2D texture, ...)
     if (pipeline_->color_target_count() > pass_target_count_) return kBad;
+    if (pipeline_->blends()) {   // (an integer target takes no blending)
+      if (is_integer(pass_color_->desc().format)) return kBad;
+      for (uint32_t n = 0; n + 1 < pass_target_count_; ++n)
+        if (pass_extra_[n] && is_integer(pass_extra_[n]->desc().format)) return kBad;
+    }
+    if (pipeline_->has_geometry()) {   // (the geometry shader takes the primitives the draw makes)
+      const graphics::GeometryPrimitive made = topology_ == Topology::LineList || topology_ == Topology::LineStrip ? graphics::GeometryPrimitive::Line
+                                               : topology_ == Topology::PointList ? graphics::GeometryPrimitive::Point : graphics::GeometryPrimitive::Triangle;
+      if (made != pipeline_->geometry_input()) return kBad;
+    }
     const bool vertices = pipeline_->attribute_count() > 0;
     if (vertices && !vertex_) return kBad;
     const uint64_t stride = pipeline_->vertex_stride();
@@ -531,7 +547,7 @@ class Adapter::StreamRunner {
       const uint32_t restart = index_bytes_ == 4 ? 0xFFFFFFFFu : 0xFFFFu;
       for (uint32_t i = 0; i < count; ++i) {
         const uint32_t raw = index_bytes_ == 4 ? in.le32() : in.le16();
-        if (topology_ != Topology::TriangleList && topology_ != Topology::LineList && topology_ != Topology::PointList && raw == restart) continue;   // (ends a strip: names no vertex)
+        if (topology_ != Topology::TriangleList && topology_ != Topology::LineList && topology_ != Topology::PointList && !is_patch_list(topology_) && raw == restart) continue;   // (ends a strip: names no vertex)
         const int64_t v = int64_t{raw} + vertex_offset;
         if (!in.ok() || v < 0) return kBad;
         if (v > highest) highest = v;
@@ -541,7 +557,15 @@ class Adapter::StreamRunner {
     const NtStatus s = ensure_cb();
     if (s != status::kSuccess) return s;
     if (topology_ == Topology::TriangleStrip || topology_ == Topology::TriangleFan || topology_ == Topology::LineStrip) return draw_expanded(indexed, count, first, vertex_offset, instance_count, first_instance);
-    set_device_topology(topology_ == Topology::LineList ? graphics::PrimitiveTopology::LineList : topology_ == Topology::PointList ? graphics::PrimitiveTopology::PointList : graphics::PrimitiveTopology::TriangleList);
+    if (is_patch_list(topology_)) {
+      set_device_topology(graphics::PrimitiveTopology::PatchList);
+      if (device_patch_points_ != patch_points(topology_)) {
+        cb_->set_patch_control_points(patch_points(topology_));
+        device_patch_points_ = patch_points(topology_);
+      }
+    } else {
+      set_device_topology(topology_ == Topology::LineList ? graphics::PrimitiveTopology::LineList : topology_ == Topology::PointList ? graphics::PrimitiveTopology::PointList : graphics::PrimitiveTopology::TriangleList);
+    }
     if (indexed && index_rebind_) {   // (an expanded draw left its own indices bound)
       cb_->bind_index_buffer(index_->buffer(), index_bytes_ == 4 ? graphics::IndexType::Uint32 : graphics::IndexType::Uint16, index_offset_);
       index_rebind_ = false;
@@ -713,6 +737,7 @@ class Adapter::StreamRunner {
   uint64_t index_offset_ = 0;
   uint32_t index_bytes_ = 2;
   Topology topology_ = Topology::TriangleList;
+  uint32_t device_patch_points_ = 0;
   graphics::PrimitiveTopology device_topology_ = graphics::PrimitiveTopology::TriangleList;   // what the recorded commands have set so far
   uint32_t strip_triangle_ = 0;      // the position of the triangle being made in its strip (for the winding)
   bool index_rebind_ = false;        // the device's bound indices are a draw's own, not the stream's
@@ -834,7 +859,7 @@ NtStatus Adapter::create_shader(const ShaderDesc& desc, SharedPointer<ShaderObje
       }
       md.stage = stage;
       // The devices without a shader compiler: SVGA3D takes the (rewritten) Direct3D 9 tokens, Intel Gen9 runs a vertex function and one of two fixed pixel kernels.
-      if (stage != graphics::ShaderStage::Compute) {
+      if (stage != graphics::ShaderStage::Compute && stage != graphics::ShaderStage::Geometry && stage != graphics::ShaderStage::Hull && stage != graphics::ShaderStage::Domain) {
         List<uint32_t> svga(allocator_);
         bool have_svga = false;
         if (desc.kind == ShaderKind::D3d9Bytecode) {
@@ -857,8 +882,8 @@ NtStatus Adapter::create_shader(const ShaderDesc& desc, SharedPointer<ShaderObje
           md.d3d9_token_count = static_cast<uint32_t>(shader->tokens_.size());
         }
       }
-      if (stage == graphics::ShaderStage::Compute) {
-        // (nothing but the interpreter and the TGSI text runs a compute shader)
+      if (stage == graphics::ShaderStage::Compute || stage == graphics::ShaderStage::Geometry || stage == graphics::ShaderStage::Hull || stage == graphics::ShaderStage::Domain) {
+        // (nothing but the interpreter and the TGSI text runs a compute or geometry shader)
       } else if (stage == graphics::ShaderStage::Fragment) {
         uint8_t varying = 0;
         const FragmentKernel kernel = program->classify_fragment(&varying);
@@ -879,6 +904,9 @@ NtStatus Adapter::create_shader(const ShaderDesc& desc, SharedPointer<ShaderObje
       }
       for (uint32_t u = 0; u < graphics::kMaxTextureUnits; ++u) shader->texture_kinds_[u] = program->texture_kind(u);
       for (uint32_t k = 0; k < 3; ++k) shader->thread_group_[k] = program->thread_group(k);
+      shader->geometry_input_ = program->geometry_input();
+      shader->tess_input_points_ = program->tess_input_points();
+      shader->tess_output_points_ = program->tess_output_points();
       for (uint32_t u = 0; u < graphics::kMaxStorageBuffers; ++u)
         if (program->storage_kind(u) != D3d9Program::BufferKind::None) shader->storage_mask_ |= 1u << u;
       const NtStatus b = shader->d3d9_.bind(util::move(program), &md);
@@ -910,7 +938,8 @@ NtStatus Adapter::create_compute_pipeline(const SharedPointer<ShaderObject>& sha
   return status::kSuccess;
 }
 
-NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<ShaderObject>& vertex, const SharedPointer<ShaderObject>& fragment, SharedPointer<PipelineObject>* out) {
+NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<ShaderObject>& vertex, const SharedPointer<ShaderObject>& fragment, SharedPointer<PipelineObject>* out,
+                                  const SharedPointer<ShaderObject>& geometry, const SharedPointer<ShaderObject>& hull, const SharedPointer<ShaderObject>& domain) {
   if (!vertex || !fragment || vertex->stage() != graphics::ShaderStage::Vertex || fragment->stage() != graphics::ShaderStage::Fragment) return status::kInvalidParameter;
   if (d.vertex_stride > kMaxVertexStride || d.attribute_count > graphics::kMaxVertexAttributes || d.varying_count > graphics::kMaxVaryings || d.texture_count > graphics::kMaxTextureUnits)
     return status::kInvalidParameter;
@@ -936,6 +965,12 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
       return status::kInvalidParameter;
   if (d.independent_blend && !(caps_.features & graphics::kFeatureIndependentBlend)) return status::kNotSupported;
   if (d.multisample && !(caps_.features & graphics::kFeatureMultisample)) return status::kNotSupported;
+  if (hull || domain) {
+    if (!hull || !domain || hull->stage() != graphics::ShaderStage::Hull || domain->stage() != graphics::ShaderStage::Domain || hull->tess_output_points() != domain->tess_input_points()) return status::kInvalidParameter;
+    if (!(caps_.features & graphics::kFeatureTessellation)) return status::kNotSupported;
+    if (geometry) return status::kNotSupported;   // (a geometry shader after the tessellator is not made)
+  }
+  if (geometry && (geometry->stage() != graphics::ShaderStage::Geometry || !(caps_.features & graphics::kFeatureGeometryShaders))) return geometry && geometry->stage() != graphics::ShaderStage::Geometry ? status::kInvalidParameter : status::kNotSupported;
   if ((bs.custom || d.depth_compare != graphics::CompareOp::LessEqual) && !(caps_.features & graphics::kFeatureBlendState)) return status::kNotSupported;
   for (uint32_t i = 0; i < d.attribute_count; ++i)
     if (d.attributes[i].per_instance && !(caps_.features & graphics::kFeatureInstancing)) return status::kNotSupported;
@@ -959,6 +994,9 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   pd.blend = bs;
   pd.independent_blend = d.independent_blend;
   pd.multisample = d.multisample;
+  pd.geometry_shader = geometry ? geometry->module() : nullptr;
+  pd.hull_shader = hull ? hull->module() : nullptr;
+  pd.domain_shader = domain ? domain->module() : nullptr;
   for (uint32_t i = 0; i < graphics::kMaxColorTargets - 1; ++i) pd.target_blend[i] = d.target_blend[i];
   pd.depth_compare = d.depth_compare;
   pd.color_target_count = d.color_target_count;
@@ -969,6 +1007,12 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   if (!pipeline->pipeline_) return status::kNotSupported;
   pipeline->vertex_ = vertex;
   pipeline->fragment_ = fragment;
+  pipeline->geometry_ = geometry;
+  pipeline->hull_ = hull;
+  pipeline->domain_ = domain;
+  if (hull) pipeline->tess_input_points_ = hull->tess_input_points();
+  pipeline->blends_ = d.alpha_blend || d.blend.enable || (d.independent_blend && (d.target_blend[0].enable || d.target_blend[1].enable || d.target_blend[2].enable));
+  if (geometry) pipeline->geometry_input_ = geometry->geometry_input();
   pipeline->stride_ = d.vertex_stride;
   for (uint32_t i = 0; i < d.attribute_count; ++i) pipeline->per_instance_ = pipeline->per_instance_ || d.attributes[i].per_instance;
   pipeline->attribute_count_ = d.attribute_count;

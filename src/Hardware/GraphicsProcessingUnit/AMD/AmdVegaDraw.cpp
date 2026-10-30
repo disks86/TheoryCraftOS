@@ -227,6 +227,19 @@ bool AmdVegaDraw::draw(AmdVegaM& card, const VegaDrawRequest& r, uint64_t area_o
     for (uint32_t c = 0; c < 4; ++c) { const uint32_t v = float_word(r.clear[c]); put_words(p.target + (i * 4 + c) * 4, ArrayView<const uint32_t>(&v, 1)); }
   for (uint64_t i = 0; i < depth_bytes(r) / DepthTarget::kZBytes; ++i) { const uint32_t v = float_word(r.clear_depth); put_words(p.depth + i * 4, ArrayView<const uint32_t>(&v, 1)); }
   for (uint64_t i = 0; i < stencil_bytes(r); ++i) { const uint8_t b = r.clear_stencil; w.patch_bytes(p.stencil + i, ConstByteView(&b, 1)); }
+  // ... unless the request brings the contents they start from
+  if (r.initial_target.size() != 0) {
+    if (r.initial_target.size() != target_bytes(r)) return false;
+    w.patch_bytes(p.target, r.initial_target);
+  }
+  if (r.initial_depth.size() != 0) {
+    if (r.initial_depth.size() != depth_bytes(r)) return false;
+    w.patch_bytes(p.depth, r.initial_depth);
+  }
+  if (r.initial_stencil.size() != 0) {
+    if (r.initial_stencil.size() != stencil_bytes(r)) return false;
+    w.patch_bytes(p.stencil, r.initial_stencil);
+  }
   // the textures in their layout, and their descriptors
   for (uint32_t i = 0; i < abi::kMaxSamplers; ++i) {
     const VegaTexture& t = r.textures[i];
@@ -271,6 +284,7 @@ bool AmdVegaDraw::draw(AmdVegaM& card, const VegaDrawRequest& r, uint64_t area_o
   if (uses_depth(r)) s.depth.z_address = base + p.depth;
   if (uses_stencil(r)) s.depth.stencil_address = base + p.stencil;
   for (uint32_t k = 0; k < 16; ++k) s.ps_param[k] = r.ps_param[k];
+  s.device_clip_space = r.device_clip_space;
   s.index_count = vertex_count;
   if (r.indices.size() != 0) {
     s.index_address = base + p.indices;

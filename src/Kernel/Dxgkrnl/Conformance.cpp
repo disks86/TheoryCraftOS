@@ -1054,6 +1054,176 @@ void scene_multisample(Rig& rig, ArrayView<uint32_t> out) {
   release_view(rig.allocator(), other);
 }
 
+// A geometry shader (gs_copy.hlsl): every triangle comes out as itself and, as a second strip, a half-size copy moved to the lower right with the red and blue swapped.
+void scene_geometry_shader(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureGeometryShaders)) return void(rig.step("geometry shaders", status::kNotSupported));
+  namespace b = conformance_blobs;
+  const Vertex v[3] = {{-0.9f, -0.9f, 0.5f, 1, 0, 0, 1}, {0.9f, -0.9f, 0.5f, 0, 1, 0, 1}, {0.0f, 0.9f, 0.5f, 0, 0, 1, 1}};
+  Handle vs = rig.vertex_shader(bytes_of(b::k_vs, sizeof b::k_vs));
+  Handle gs = rig.shader("create_shader (geometry)", ShaderKind::Dxbc, graphics::ShaderStage::Geometry, bytes_of(b::k_gs_copy, sizeof b::k_gs_copy));
+  Handle ps = rig.pixel_shader(bytes_of(b::k_ps_color, sizeof b::k_ps_color));
+  PipelineDesc pd = colour_pipeline_desc(vs, ps);
+  pd.varying_count = 3;
+  pd.geometry_shader = gs;
+  Handle pipe = rig.pipeline(pd);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  CommandWriter w(rig.allocator());
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(3);
+  w.end_pass();
+  rig.render(w, {target, vb});
+  rig.read(target, out);
+}
+
+// Draws a full-target quad (the vertex shader makes the texture coordinate from the colour: u / 2, v / 2) with a pixel shader that reads the texture in unit 0, nearest filtered, into `target`.
+void show_texture(Rig& rig, Handle target, Handle texture, const uint8_t* ps, uint32_t ps_size) {
+  namespace b = conformance_blobs;
+  auto vert = [](float x, float y, float u, float v) { return Vertex{x, y, 0.5f, u / 2, v / 2, 1, 1}; };
+  const Vertex quad[6] = {vert(-1, -1, 0, 0), vert(1, -1, 1, 0), vert(-1, 1, 0, 1), vert(-1, 1, 0, 1), vert(1, -1, 1, 0), vert(1, 1, 1, 1)};
+  Handle pipe = dxbc_pipeline(rig, b::k_vs, sizeof b::k_vs, ps, ps_size, 1);
+  Handle qvb = rig.buffer(kAllocVertexBuffer, bytes_of(quad, sizeof quad));
+  graphics::SamplerDesc sampler;
+  sampler.filter = graphics::Filter::Nearest;
+  sampler.address_u = sampler.address_v = graphics::AddressMode::ClampToEdge;
+  CommandWriter w(rig.allocator());
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.bind_texture(0, 2, sampler);
+  w.draw(6);
+  w.end_pass();
+  rig.render(w, {target, qvb, texture});
+}
+
+// sRGB: two triangles are drawn into an sRGB render target, the second half transparent (so the blend happens on linear values and the result is encoded), and the target is then sampled
+// (decoded to linear values again) into an ordinary one. The even columns of the picture are the sRGB image as it is stored, the odd ones what the sampler made of it.
+void scene_srgb(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureSrgbFormats | graphics::kFeatureBlendState)) return void(rig.step("sRGB formats", status::kNotSupported));
+  namespace b = conformance_blobs;
+  const Vertex tri[6] = {{-0.9f, -0.9f, 0.5f, 0.2f, 0.5f, 0.8f, 1.0f}, {0.9f, -0.9f, 0.5f, 0.2f, 0.5f, 0.8f, 1.0f}, {-0.9f, 0.9f, 0.5f, 0.2f, 0.5f, 0.8f, 1.0f},
+                         {-0.5f, -0.5f, 0.5f, 1.0f, 0.5f, 0.0f, 0.5f}, {0.5f, -0.5f, 0.5f, 1.0f, 0.5f, 0.0f, 0.5f}, {-0.5f, 0.5f, 0.5f, 1.0f, 0.5f, 0.0f, 0.5f}};
+  Handle vs = rig.vertex_shader(bytes_of(kVertexTokens, sizeof kVertexTokens), ShaderKind::D3d9Bytecode);
+  Handle ps = rig.pixel_shader(bytes_of(kPixelTokens, sizeof kPixelTokens), ShaderKind::D3d9Bytecode);
+  PipelineDesc pd = colour_pipeline_desc(vs, ps);
+  pd.alpha_blend = true;
+  Handle pipe = rig.pipeline(pd);
+  Handle texture = rig.image(kAllocRenderTarget | kAllocTexture, Format::A8R8G8B8Srgb, kSize, kSize);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle tvb = rig.buffer(kAllocVertexBuffer, bytes_of(tri, sizeof tri));
+  CommandWriter w(rig.allocator());
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(2);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(6);
+  w.end_pass();
+  rig.render(w, {texture, target, tvb});
+  show_texture(rig, target, texture, b::k_ps_tex, sizeof b::k_ps_tex);
+  ArrayView<uint32_t> raw = allocate_view<uint32_t>(rig.allocator(), uint64_t{kSize} * kSize);
+  if (raw.empty()) return void(rig.step("memory", status::kNoMemory));
+  rig.read(target, out);
+  rig.read(texture, raw);
+  for (uint32_t i = 0; i < kSize * kSize; i += 2) out[i] = raw[i];
+  release_view(rig.allocator(), raw);
+}
+
+// 16-bit normalised: a colour of 1/10000 .. 3/10000 (far below what 8 bits keep) is added twenty times into a 16-bit target and into an 8-bit one, and both are shown a hundred times
+// brighter. The 8-bit one stays black (the even columns), the 16-bit one has gathered it (the odd ones).
+void scene_unorm16(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureUnorm16Formats | graphics::kFeatureBlendState)) return void(rig.step("16-bit formats", status::kNotSupported));
+  namespace b = conformance_blobs;
+  Vertex tri[60];
+  for (uint32_t i = 0; i < 20; ++i) {
+    tri[3 * i] = {-0.9f, -0.9f, 0.5f, 0.0001f, 0.0002f, 0.0003f, 1.0f};
+    tri[3 * i + 1] = {0.9f, -0.9f, 0.5f, 0.0001f, 0.0002f, 0.0003f, 1.0f};
+    tri[3 * i + 2] = {0.0f, 0.9f, 0.5f, 0.0001f, 0.0002f, 0.0003f, 1.0f};
+  }
+  Handle vs = rig.vertex_shader(bytes_of(kVertexTokens, sizeof kVertexTokens), ShaderKind::D3d9Bytecode);
+  Handle ps = rig.pixel_shader(bytes_of(kPixelTokens, sizeof kPixelTokens), ShaderKind::D3d9Bytecode);
+  PipelineDesc add = colour_pipeline_desc(vs, ps);
+  add.blend.custom = add.blend.enable = true;
+  add.blend.src_color = add.blend.dst_color = add.blend.src_alpha = add.blend.dst_alpha = graphics::BlendFactor::One;
+  Handle pipe = rig.pipeline(add);
+  Handle narrow = rig.image(kAllocRenderTarget | kAllocTexture, Format::A8R8G8B8, kSize, kSize), wide = rig.image(kAllocRenderTarget | kAllocTexture, Format::A16B16G16R16, kSize, kSize);
+  Handle shown_narrow = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize), shown_wide = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle tvb = rig.buffer(kAllocVertexBuffer, bytes_of(tri, sizeof tri));
+  for (Handle image : {narrow, wide}) {
+    CommandWriter w(rig.allocator());
+    begin(w, 0, kNoAllocation, {0, 0, 0, 0});
+    w.bind_pipeline(pipe);
+    w.bind_vertex_buffer(1);
+    w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+    w.draw(60);
+    w.end_pass();
+    rig.render(w, {image, tvb});
+  }
+  show_texture(rig, shown_narrow, narrow, b::k_ps_scale100, sizeof b::k_ps_scale100);
+  show_texture(rig, shown_wide, wide, b::k_ps_scale100, sizeof b::k_ps_scale100);
+  ArrayView<uint32_t> other = allocate_view<uint32_t>(rig.allocator(), uint64_t{kSize} * kSize);
+  if (other.empty()) return void(rig.step("memory", status::kNoMemory));
+  rig.read(shown_narrow, out);
+  rig.read(shown_wide, other);
+  for (uint32_t i = 1; i < kSize * kSize; i += 2) out[i] = other[i];
+  release_view(rig.allocator(), other);
+}
+
+// Integers: a triangle's colour is written by the pixel shader as four integers (colour * 255) into an R32G32B32A32_UINT target cleared to (20, 40, 60, 255), and a second pass reads them
+// back with Load (an integer texture is not sampled) and shows them divided by 255.
+void scene_integer(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureIntegerFormats)) return void(rig.step("integer formats", status::kNotSupported));
+  namespace b = conformance_blobs;
+  const Vertex tri[3] = {{-0.9f, -0.9f, 0.5f, 0.2f, 0.5f, 0.8f, 1.0f}, {0.9f, -0.9f, 0.5f, 0.2f, 0.5f, 0.8f, 1.0f}, {0.0f, 0.9f, 0.5f, 0.2f, 0.5f, 0.8f, 1.0f}};
+  Handle first = dxbc_pipeline(rig, b::k_vs, sizeof b::k_vs, b::k_ps_int_write, sizeof b::k_ps_int_write, 0);
+  Handle texture = rig.image(kAllocRenderTarget | kAllocTexture, Format::A32B32G32R32Uint, kSize, kSize);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle tvb = rig.buffer(kAllocVertexBuffer, bytes_of(tri, sizeof tri));
+  CommandWriter w(rig.allocator());
+  // (the clear colour: the bits of the integers)
+  begin(w, 0, kNoAllocation, {__builtin_bit_cast(float, 20u), __builtin_bit_cast(float, 40u), __builtin_bit_cast(float, 60u), __builtin_bit_cast(float, 255u)});
+  w.bind_pipeline(first);
+  w.bind_vertex_buffer(2);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(3);
+  w.end_pass();
+  rig.render(w, {texture, target, tvb});
+  show_texture(rig, target, texture, b::k_ps_int_load, sizeof b::k_ps_int_load);
+  rig.read(target, out);
+}
+
+// Tessellation (hs_tri / ds_dent): a patch of three control points is cut into the 4 x 4 lattice of the triangle domain (all factors 4, integer partitioning), and the domain shader pulls
+// each point toward the centre by how far it is from the edges, so the picture is a dented triangle that shows the lattice (a plain triangle if the tessellator did nothing).
+void scene_tessellation(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureTessellation)) return void(rig.step("tessellation", status::kNotSupported));
+  namespace b = conformance_blobs;
+  const Vertex v[3] = {{-0.9f, -0.9f, 0.5f, 1, 0, 0, 1}, {0.9f, -0.9f, 0.5f, 0, 1, 0, 1}, {0.0f, 0.9f, 0.5f, 0, 0, 1, 1}};
+  Handle vs = rig.vertex_shader(bytes_of(b::k_vs, sizeof b::k_vs));
+  Handle hs = rig.shader("create_shader (hull)", ShaderKind::Dxbc, graphics::ShaderStage::Hull, bytes_of(b::k_hs_tri, sizeof b::k_hs_tri));
+  Handle ds = rig.shader("create_shader (domain)", ShaderKind::Dxbc, graphics::ShaderStage::Domain, bytes_of(b::k_ds_dent, sizeof b::k_ds_dent));
+  Handle ps = rig.pixel_shader(bytes_of(b::k_ps_color, sizeof b::k_ps_color));
+  PipelineDesc pd = colour_pipeline_desc(vs, ps);
+  pd.varying_count = 3;
+  pd.hull_shader = hs;
+  pd.domain_shader = ds;
+  Handle pipe = rig.pipeline(pd);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  CommandWriter w(rig.allocator());
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.set_topology(patch_list(3));
+  w.draw(3);
+  w.end_pass();
+  rig.render(w, {target, vb});
+  rig.read(target, out);
+}
+
 const Entry kScenes[] = {
     {"Direct3D 9 vertex colours", scene_vertex_colours},
     {"Direct3D 9 Shader Model 3", scene_sm3},
@@ -1082,6 +1252,11 @@ const Entry kScenes[] = {
     {"Direct3D 10 per-instance attribute", scene_instanced_colour},
     {"Direct3D 10 instancing", scene_instancing},
     {"Direct3D 10 multiple render targets (DXBC)", scene_multiple_targets},
+    {"Direct3D 10 geometry shader (DXBC)", scene_geometry_shader},
+    {"Direct3D 11 tessellation, hull and domain shaders (DXBC)", scene_tessellation},
+    {"Direct3D 10 sRGB render target and texture", scene_srgb},
+    {"Direct3D 10 16-bit normalised render target and texture", scene_unorm16},
+    {"Direct3D 10 integer render target and Load (DXBC)", scene_integer},
     {"Direct3D 10 4x multisampling", scene_multisample},
     {"Direct3D 11 compute shader and unordered access views (DXBC)", scene_compute},
     {"Direct3D 10 independent blend per render target (DXBC)", scene_independent_blend},

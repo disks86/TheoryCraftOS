@@ -1012,6 +1012,20 @@ void ObjectManager::add_ref(uint32_t id) {
   if (Object* o = at(id)) ++o->references;
 }
 
+void ObjectManager::free_object_locked(Object& o) {
+  free_pipe_locked(o);
+  free_section_locked(o);
+  free_job_locked(o);
+  free_watch_locked(o);
+  free_mailslot_locked(o);
+  o = Object();
+}
+
+// An object nobody has a handle to goes at once - unless a thread is waiting for it, or a thread owns it (the mutex of a thread that ends is abandoned and its waiters told).
+void ObjectManager::finish_dying_locked(Object& o) {
+  if (o.dying && o.waiters <= 0 && !o.abandoned && !(o.kind == ObjectKind::Mutex && o.owner != 0)) free_object_locked(o);
+}
+
 void ObjectManager::release(uint32_t id) {
   Locked hold(sync_);
   Object* o = at(id);
@@ -1021,12 +1035,12 @@ void ObjectManager::release(uint32_t id) {
       o->name_size = 0;
       return;
     }
-    free_pipe_locked(*o);
-    free_section_locked(*o);
-    free_job_locked(*o);
-    free_watch_locked(*o);
-    free_mailslot_locked(*o);
-    *o = Object();
+    if (o->waiters > 0 || (o->kind == ObjectKind::Mutex && o->owner != 0)) {
+      o->dying = true;
+      o->name_size = 0;
+      return;
+    }
+    free_object_locked(*o);
   }
 }
 
@@ -1076,6 +1090,7 @@ uint32_t ObjectManager::release_mutex(uint32_t id, uint64_t owner, int32_t* prev
   if (--o->recursion == 0) {
     o->owner = 0;
     sync_.notify_all();
+    finish_dying_locked(*o);
   }
   return kSuccess;
 }
@@ -1162,7 +1177,10 @@ void ObjectManager::acquire_locked(uint32_t id, uint64_t waiter, bool* abandoned
 }
 
 void ObjectManager::waiting_locked(uint32_t id, int32_t delta) {
-  if (Object* o = at(id)) o->waiters += delta;
+  if (Object* o = at(id)) {
+    o->waiters += delta;
+    if (delta < 0) finish_dying_locked(*o);
+  }
 }
 
 

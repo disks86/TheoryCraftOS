@@ -484,6 +484,7 @@ bool V3dGraphicsDevice::submit(ICommandBuffer* commands) {
         break;
       }
       case RecordedCommand::Type::Resolve:
+      case RecordedCommand::Type::SetPatchPoints:
       case RecordedCommand::Type::BindComputePipeline:
       case RecordedCommand::Type::BindStorageBuffer:
       case RecordedCommand::Type::Dispatch:

@@ -49,6 +49,9 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
   // Reserves the stack's memory. False if the allocator ran out.
   bool initialize();
 
+  // For an interface whose link comes and goes (Wi-Fi): start DHCP when the link comes up and drop the address when it goes down. Off by default (a wired link is assumed up).
+  void set_dhcp_follows_link(bool follow) { follow_link_ = follow; }
+
   // The interface this stack drives.
   hardware::INetworkInterface& interface() const { return nic_; }
 
@@ -112,6 +115,7 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
   hardware::INetworkInterface& nic_;
   hardware::IClock& clock_;
   allocators::IAllocator& allocator_;
+  bool follow_link_ = false, link_was_up_ = false;
   IpConfiguration config_;
   Dictionary<uint32_t, ArpEntry> arp_;
   Queue<PendingPacket> pending_;

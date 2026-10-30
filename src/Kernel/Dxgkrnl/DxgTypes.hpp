@@ -72,16 +72,27 @@ struct Luid {
 // is 0xAABBGGRR. The X formats ignore the alpha byte (a texture or render target of one reads as opaque).
 // A16B16G16R16F and A32B32G32R32F (D3DFMT_A16B16G16R16F / A32B32G32R32F) keep four half or single floats per pixel in the order R, G, B, A, unclamped: they need the adapter's
 // kFeatureFloatFormats (except as staging memory), have one mip level, and cannot be presented.
-enum class Format : uint32_t { Unknown, A8R8G8B8, X8R8G8B8, A8B8G8R8, X8B8G8R8, D32Float, D24S8, A16B16G16R16F, A32B32G32R32F };
+// The sRGB formats (DXGI_FORMAT_B8G8R8A8_UNORM_SRGB / R8G8B8A8_UNORM_SRGB) lay out like A8R8G8B8 / A8B8G8R8 but hold sRGB-encoded colour channels: a texture is read as the linear values they
+// mean, a render target takes linear values and stores them encoded (the adapter's kFeatureSrgbFormats; not presentable). A16B16G16R16 (D3DFMT_A16B16G16R16, unorm) keeps four 16-bit
+// normalised channels in the order R, G, B, A (kFeatureUnorm16Formats). A32B32G32R32Uint (DXGI_FORMAT_R32G32B32A32_UINT) keeps four unsigned integers (kFeatureIntegerFormats): a shader
+// writes them as bits, a texture is read with `ld` (no filtering), the target takes no blending, and the clear colour of a pass is the four integers as float bits.
+// Like the floats, these three have one mip level and cannot be presented or multisampled.
+enum class Format : uint32_t { Unknown, A8R8G8B8, X8R8G8B8, A8B8G8R8, X8B8G8R8, D32Float, D24S8, A16B16G16R16F, A32B32G32R32F, A8R8G8B8Srgb, A8B8G8R8Srgb, A16B16G16R16, A32B32G32R32Uint };
 
 constexpr bool is_depth(Format f) { return f == Format::D32Float || f == Format::D24S8; }
 constexpr bool is_float(Format f) { return f == Format::A16B16G16R16F || f == Format::A32B32G32R32F; }
-constexpr bool is_color(Format f) { return f == Format::A8R8G8B8 || f == Format::X8R8G8B8 || f == Format::A8B8G8R8 || f == Format::X8B8G8R8 || is_float(f); }
-constexpr bool has_alpha(Format f) { return f == Format::A8R8G8B8 || f == Format::A8B8G8R8 || is_float(f); }
+constexpr bool is_srgb(Format f) { return f == Format::A8R8G8B8Srgb || f == Format::A8B8G8R8Srgb; }
+constexpr bool is_integer(Format f) { return f == Format::A32B32G32R32Uint; }
+// Formats that are read and written as Vec4s (no 32-bit words), one level.
+constexpr bool is_wide(Format f) { return is_float(f) || f == Format::A16B16G16R16 || is_integer(f); }
+constexpr bool is_color(Format f) { return f == Format::A8R8G8B8 || f == Format::X8R8G8B8 || f == Format::A8B8G8R8 || f == Format::X8B8G8R8 || is_srgb(f) || is_wide(f); }
+constexpr bool has_alpha(Format f) { return f == Format::A8R8G8B8 || f == Format::A8B8G8R8 || is_srgb(f) || is_wide(f); }
 // Bytes of one pixel of a colour format.
-constexpr uint32_t pixel_bytes(Format f) { return f == Format::A16B16G16R16F ? 8 : f == Format::A32B32G32R32F ? 16 : 4; }
+constexpr uint32_t pixel_bytes(Format f) { return (f == Format::A16B16G16R16F || f == Format::A16B16G16R16) ? 8 : (f == Format::A32B32G32R32F || f == Format::A32B32G32R32Uint) ? 16 : 4; }
 // Red and blue swapped relative to the devices' logical 0xAARRGGBB.
-constexpr bool is_rgba_order(Format f) { return f == Format::A8B8G8R8 || f == Format::X8B8G8R8; }
+constexpr bool is_rgba_order(Format f) { return f == Format::A8B8G8R8 || f == Format::X8B8G8R8 || f == Format::A8B8G8R8Srgb; }
+// A8R8G8B8 and its sRGB twin: the layout the devices take without a conversion.
+constexpr bool is_plain_bgra(Format f) { return f == Format::A8R8G8B8 || f == Format::A8R8G8B8Srgb; }
 
 // What an allocation may be used for (D3DDDI_ALLOCATIONINFO / resource flags). A buffer is made with kAllocVertexBuffer and/or kAllocIndexBuffer (or alone, kAllocQueryResult); everything else is an
 // image. kAllocStaging is memory only the CPU and copies touch (never resident on the GPU).
@@ -197,6 +208,8 @@ struct ShaderDesc {
 
 struct PipelineDesc {
   Handle vertex_shader = 0, fragment_shader = 0;
+  Handle hull_shader = 0, domain_shader = 0;   // not 0: tessellation (both, stages Hull and Domain; needs kFeatureTessellation; the draws are PatchList topology with the hull shader's input control point count)
+  Handle geometry_shader = 0;   // not 0: a geometry shader (stage Geometry) that runs between the vertex and the pixel shader; needs kFeatureGeometryShaders, and the draws must make what it takes
   Handle compute_shader = 0;   // not 0: a compute pipeline of that shader (stage Compute), and nothing else of the description is used; needs kFeatureCompute
   uint32_t vertex_stride = 0;
   graphics::VertexAttribute attributes[graphics::kMaxVertexAttributes] = {};

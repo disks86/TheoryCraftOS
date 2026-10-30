@@ -88,7 +88,7 @@ bool IwlCommandQueue::init(const char** error) {
   }
   device_.write_prph(kScdTxFact, 0);                                         // all transmit FIFOs off
   device_.write32(kFhKeepWarm, static_cast<uint32_t>(keep_warm_bus_ >> 4));  // the "keep warm" page
-  device_.write32(cbbc_queue(kCommandQueue), static_cast<uint32_t>(tfds_bus_ >> 8));
+  device_.write32(cbbc_queue(queue_), static_cast<uint32_t>(tfds_bus_ >> 8));
   device_.set_prph_bits(kScdGpCtrl, kScdGpCtrlAutoActive);
   device_.set_prph_bits(kScdGpCtrl, kScdGpCtrlEnable31Queues);               // (more than 20 queues)
   device_.release_nic_access();
@@ -116,25 +116,56 @@ bool IwlCommandQueue::start(const char** error) {
     done += n;
   }
   device_.write_prph(kScdDramBase, static_cast<uint32_t>(byte_counts_bus_ >> 10));
-  // the command queue on its FIFO (iwl_trans_pcie_txq_enable with the scheduler config)
-  device_.write_prph(kScdEnCtrl, 0);                                         // scheduler off while the command queue is configured
-  device_.write_prph(scd_queue_status(kCommandQueue), kQueueStatusScdActEn);   // inactive
-  device_.clear_prph_bits(kScdAggrSel, 1u << kCommandQueue);
-  read_ = write_ = 0;
-  device_.write32(kHbusTargWrptr, (0u) | (kCommandQueue << 8));
-  device_.write_prph(scd_queue_read_pointer(kCommandQueue), 0);
-  const uint32_t context = scd_base_ + scd_context_queue(kCommandQueue);
-  const uint32_t window = (kFrameLimit & kContextWindowMask) | (kFrameLimit << kContextFrameLimitShift);
-  device_.write_mem(context, zero, 1);
-  device_.write_mem(context + 4, &window, 1);
-  device_.write_prph(scd_queue_status(kCommandQueue), kQueueStatusActive | (kCommandFifo << 0) | kQueueStatusWsl | kQueueStatusMask);
-  device_.write_prph(kScdEnCtrl, 1u << kCommandQueue);
+  configure_queue();
   device_.write_prph(kScdTxFact, 0xFF);                                      // activate the FIFOs
   for (uint32_t channel = 0; channel < kTcsrChannels; ++channel)
     device_.write32(iwl_fh::tx_config(channel), iwl_fh::kTxChannelEnable | kTcsrCreditEnable);
   device_.write32(kFhTxChickenBits, device_.read32(kFhTxChickenBits) | kFhTxChickenScdAutoRetry);
   device_.release_nic_access();
   return true;
+}
+
+// iwl_trans_pcie_txq_enable with the scheduler config: the queue inactive, off the aggregation list, its pointers at the start, its window and frame limit, then active on its FIFO.
+// The command queue also switches the scheduler's "set active" control to itself; other queues are chained.
+void IwlCommandQueue::configure_queue() {
+  const bool primary = queue_ == kCommandQueue;
+  uint32_t zero = 0;
+  if (primary) device_.write_prph(kScdEnCtrl, 0);                              // scheduler off while the command queue is configured
+  device_.write_prph(scd_queue_status(queue_), kQueueStatusScdActEn);          // inactive
+  if (!primary) device_.set_prph_bits(kScdQueueChainSel, 1u << queue_);
+  device_.clear_prph_bits(kScdAggrSel, 1u << queue_);
+  read_ = write_ = 0;
+  device_.write32(kHbusTargWrptr, (0u) | (queue_ << 8));
+  device_.write_prph(scd_queue_read_pointer(queue_), 0);
+  const uint32_t context = scd_base_ + scd_context_queue(queue_);
+  const uint32_t window = (kFrameLimit & kContextWindowMask) | (kFrameLimit << kContextFrameLimitShift);
+  device_.write_mem(context, &zero, 1);
+  device_.write_mem(context + 4, &window, 1);
+  device_.write_prph(scd_queue_status(queue_), kQueueStatusActive | (fifo_ << 0) | kQueueStatusWsl | kQueueStatusMask);
+  if (primary) device_.write_prph(kScdEnCtrl, 1u << queue_);
+}
+
+bool IwlCommandQueue::start_secondary(const char** error) {
+  const char* local = nullptr;
+  if (!error) error = &local;
+  if (!ready()) {
+    *error = "the queue is not initialised";
+    return false;
+  }
+  if (!device_.grab_nic_access()) {
+    *error = "the MAC would not wake to start a transmit queue";
+    return false;
+  }
+  scd_base_ = device_.read_prph(kScdSramBase);
+  configure_queue();
+  device_.release_nic_access();
+  return true;
+}
+
+void IwlCommandQueue::deactivate() {
+  if (!ready() || !device_.grab_nic_access()) return;
+  device_.write_prph(scd_queue_status(queue_), kQueueStatusScdActEn);
+  device_.release_nic_access();
 }
 
 void IwlCommandQueue::release() {
@@ -167,7 +198,7 @@ int32_t IwlCommandQueue::enqueue(const IwlHostCommand& command, const char** err
   const uint32_t index = write_;
   const uint32_t slot = index & (kSlots - 1);
   const uint32_t total = header + static_cast<uint32_t>(command.data.size());
-  const uint16_t sequence = static_cast<uint16_t>((kCommandQueue << 8) | index);
+  const uint16_t sequence = static_cast<uint16_t>((queue_ << 8) | index);
   ByteView out = commands_.subview(static_cast<uint64_t>(slot) * kSlotBytes, kSlotBytes);
   out.fill(0);
   uint8_t head[8] = {command.opcode, command.group};
@@ -194,9 +225,88 @@ int32_t IwlCommandQueue::enqueue(const IwlHostCommand& command, const char** err
     *error = "the MAC would not wake to send a command";
     return -1;
   }
-  device_.write32(kHbusTargWrptr, write_ | (kCommandQueue << 8));
+  device_.write32(kHbusTargWrptr, write_ | (queue_ << 8));
   device_.release_nic_access();
   return sequence;
+}
+
+void IwlCommandQueue::write_byte_count(uint32_t index, uint16_t frame_bytes, uint8_t station, bool ccm) {
+  // iwl_txq_gen1_update_byte_cnt_tbl: the frame, its FCS, a delimiter and the cipher's MIC, in dwords, with the station in the top four bits
+  uint32_t len = frame_bytes + 4 + 4 + (ccm ? 8 : 0);
+  len = (len + 3) / 4;
+  if (len > 0xFFF) return;
+  const uint16_t entry = static_cast<uint16_t>(len | (static_cast<uint32_t>(station & 0xF) << 12));
+  uint8_t* table = shared_byte_counts_ ? shared_byte_counts_ : byte_counts_.data();
+  auto put = [&](uint32_t at) {
+    uint8_t* p = table + (static_cast<uint64_t>(queue_) * kByteCountEntries + at) * 2;
+    p[0] = static_cast<uint8_t>(entry);
+    p[1] = static_cast<uint8_t>(entry >> 8);
+  };
+  put(index);
+  if (index < 64) put(kRingEntries + index);
+}
+
+int32_t IwlCommandQueue::enqueue_frame(ConstByteView prefix, ConstByteView payload, uint16_t frame_bytes, uint8_t station, bool ccm, const char** error) {
+  const char* local = nullptr;
+  if (!error) error = &local;
+  if (!ready()) {
+    *error = "the queue is not initialised";
+    return -1;
+  }
+  const uint64_t total = prefix.size() + payload.size();
+  if (prefix.size() < kFirstTbBytes + 4 || prefix.size() > 512 || total > kSlotBytes) {
+    *error = "the frame is too large";
+    return -1;
+  }
+  if (in_flight() >= kSlots - 1) {
+    *error = "no space in the transmit queue";
+    return -1;
+  }
+  const uint32_t index = write_;
+  const uint32_t slot = index & (kSlots - 1);
+  const uint16_t sequence = static_cast<uint16_t>((queue_ << 8) | index);
+  ByteView out = commands_.subview(static_cast<uint64_t>(slot) * kSlotBytes, kSlotBytes);
+  out.fill(0);
+  out.subview(0, prefix.size()).copy_from(prefix);
+  if (payload.size()) out.subview(prefix.size(), payload.size()).copy_from(payload);
+  put16(&out[2], sequence);                                                  // the device command header's sequence
+  // the first buffer holds the start of the command (and the "scratch" the firmware writes its transmit status to: its address goes in the command)
+  const uint64_t first_bus = first_tbs_bus_ + static_cast<uint64_t>(slot) * kFirstTbStride;
+  const uint32_t scratch_at = 4 + 44;                                        // device header + dram_lsb_ptr in the TX command parameters
+  put32(&out[scratch_at], static_cast<uint32_t>(first_bus + 4 + 8));
+  out[scratch_at + 4] = static_cast<uint8_t>((first_bus + 4 + 8) >> 32);
+  first_tbs_.subview(static_cast<uint64_t>(slot) * kFirstTbStride, kFirstTbBytes).copy_from(out.subview(0, kFirstTbBytes));
+  uint8_t* t = tfd(index);
+  ByteView(t, kTfdBytes).fill(0);
+  set_tb(t, 0, first_bus, kFirstTbBytes);
+  // the second buffer: the rest of the command and the 802.11 header, a whole number of dwords; the third: the payload
+  const uint64_t slot_bus = commands_bus_ + static_cast<uint64_t>(slot) * kSlotBytes;
+  const uint32_t tb1 = static_cast<uint32_t>(prefix.size()) - kFirstTbBytes;
+  set_tb(t, 1, slot_bus + kFirstTbBytes, tb1);
+  if (payload.size()) set_tb(t, 2, slot_bus + prefix.size(), static_cast<uint32_t>(payload.size()));
+  write_byte_count(index, frame_bytes, station, ccm);
+  __atomic_thread_fence(__ATOMIC_RELEASE);
+  write_ = (write_ + 1) & (kRingEntries - 1);
+  if (!device_.grab_nic_access()) {
+    write_ = index;
+    invalidate(index);
+    *error = "the MAC would not wake to send a frame";
+    return -1;
+  }
+  device_.write32(kHbusTargWrptr, write_ | (queue_ << 8));
+  device_.release_nic_access();
+  return sequence;
+}
+
+void IwlCommandQueue::reclaim_until(uint32_t ssn) {
+  if (!ready()) return;
+  ssn &= kRingEntries - 1;
+  const uint32_t pending = in_flight();
+  if (((ssn - read_) & (kRingEntries - 1)) > pending) return;                // not a position between what was read and what was written
+  while (read_ != ssn) {
+    invalidate(read_);
+    read_ = (read_ + 1) & (kRingEntries - 1);
+  }
 }
 
 void IwlCommandQueue::reclaim(uint32_t index) {

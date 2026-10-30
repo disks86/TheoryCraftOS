@@ -323,12 +323,40 @@ static BOOL nls_info_is_number(DWORD base) {
     default: return FALSE;
   }
 }
+/* The ANSI code page a language uses on Windows (0: none, a language of Unicode only); the code page of this system is UTF-8, but a program asking for the default ANSI code page of a locale gets this. */
+static BOOL nls_ansi_codepage(LCID lcid, DWORD *cp) {
+  switch (lcid & 0x3FF) {
+    case 0x09: case 0x07: case 0x0A: case 0x0C: case 0x10: case 0x13: case 0x16: case 0x1D: *cp = 1252; return TRUE;   /* English, German, Spanish, French, Italian, Dutch, Portuguese, Swedish */
+    case 0x19: case 0x22: case 0x23: *cp = 1251; return TRUE;                                                         /* Russian, Ukrainian, Belarusian */
+    case 0x11: *cp = 932; return TRUE;
+    case 0x04: *cp = 936; return TRUE;
+    case 0x12: *cp = 949; return TRUE;
+    case 0x15: case 0x0E: case 0x05: *cp = 1250; return TRUE;                                                         /* Polish, Hungarian, Czech */
+    case 0x08: *cp = 1253; return TRUE;
+    case 0x1F: *cp = 1254; return TRUE;
+    case 0x0D: *cp = 1255; return TRUE;
+    case 0x01: *cp = 1256; return TRUE;
+    case 0x39: case 0x37: *cp = 0; return TRUE;                                                                        /* Hindi, Georgian: Unicode only */
+    default: return FALSE;
+  }
+}
 EXPORT int WINAPI GetLocaleInfoW(LCID locale, LCTYPE type, LPWSTR buffer, int capacity) {
-  const int kind = nls_locale_of(locale);
+  int kind = nls_locale_of(locale);
+  DWORD ansi_cp = 0;
+  const BOOL ansi = (type & 0xFFFF) == 0x1004 && nls_ansi_codepage(locale, &ansi_cp) && !(kind == 2);
+  if (ansi) kind = 1;
   if (kind == 0 || capacity < 0 || (capacity > 0 && !buffer)) { set_error(ERROR_INVALID_PARAMETER); return 0; }
   WCHAR text[80];
   const BOOL user = !(type & LCT_NOUSEROVERRIDE);
   if (!nls_info_text(kind, type, user, text)) { set_error(ERROR_INVALID_FLAGS); return 0; }
+  if (ansi) {
+    char digits[12];
+    int d = 0, k = 0;
+    DWORD v = ansi_cp;
+    do { digits[d++] = (char)('0' + v % 10); v /= 10; } while (v);
+    while (d) text[k++] = (WCHAR)digits[--d];
+    text[k] = 0;
+  }
   const DWORD base = type & 0xFFFF;
   if (type & LCT_RETURN_NUMBER) {
     if (!nls_info_is_number(base)) { set_error(ERROR_INVALID_FLAGS); return 0; }

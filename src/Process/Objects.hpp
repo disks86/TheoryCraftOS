@@ -265,6 +265,7 @@ class ObjectManager {
     char name[kNameBytes] = {};
     uint32_t name_size = 0;
     bool manual_reset = false, signaled = false, abandoned = false;
+    bool dying = false;                    // no handle is left, but a thread waits for it or a mutex is owned: it goes with the last of those
     int32_t count = 0, maximum = 0;        // semaphore
     uint64_t owner = 0;                    // mutex: the thread that owns it, 0 if none
     int32_t recursion = 0;
@@ -282,6 +283,8 @@ class ObjectManager {
   Object* at(uint32_t id) { return id >= 1 && id <= kCapacity && objects_[id - 1].kind != ObjectKind::None ? &objects_[id - 1] : nullptr; }
   Object* find_locked(StringView name);
   void fire_timer_locked(Object& o, uint64_t now);
+  void free_object_locked(Object& o);
+  void finish_dying_locked(Object& o);
 
   struct Pipe;
   struct Section;

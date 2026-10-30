@@ -261,6 +261,12 @@ static void test_shared(TestAllocator& a) {
   CubeFrameTimes times;
   const uint32_t W = 160, H = 120;
 
+  // With two adapters, the one on the device the desktop draws on is chosen first (so the frame can stay there).
+  dxgk::Kernel two(a);
+  CHECK(two.add_adapter(device, dxgk::AdapterConfig()) == 0 && two.add_adapter(other, dxgk::AdapterConfig()) == 1);
+  CHECK(CubeRenderer::find_adapter(two, false) == 0 && CubeRenderer::find_adapter(two, false, &other) == 1 && CubeRenderer::find_adapter(two, false, &device) == 0);
+  CHECK(CubeRenderer::find_adapter(two, true, &other) == dxgk::kInvalidIndex);   // (the preference never changes the kind)
+
   CubeRenderer plain(a, kernel, 0x40);
   CHECK(plain.open(0, W, H) && !plain.shareable());   // (a target made for readback only is not lent)
   graphics::IGraphicsDevice* lent_device = nullptr;

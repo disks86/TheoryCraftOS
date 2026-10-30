@@ -425,6 +425,7 @@ add_executable(BOOTX64
   src/Hardware/GraphicsProcessingUnit/Intel/IntelRenderBatch.cpp
   src/Graphics/Graphics3D/IntelGen9/Gen9GraphicsDevice.cpp
   src/Graphics/Graphics3D/IntelGen9/IntelRenderStack.cpp
+  src/Graphics/Graphics3D/Vega/VegaGraphicsDevice.cpp
   src/Hardware/GraphicsProcessingUnit/QEMU/QemuStdVgaGpu.cpp
   src/Hardware/GraphicsProcessingUnit/Virtio/VirtioGpu.cpp
   src/Hardware/GraphicsProcessingUnit/VMware/VmwareSvgaGpu.cpp
@@ -736,6 +737,14 @@ add_executable(BOOTX64
   src/Hardware/WirelessInterface/Intel/IwlNvm.cpp
   src/Hardware/WirelessInterface/Intel/IwlInit.cpp
   src/Hardware/WirelessInterface/Intel/IwlDriver.cpp
+  src/Hardware/WirelessInterface/Intel/IwlMvm.cpp
+  src/Hardware/WirelessInterface/Intel/IwlScan.cpp
+  src/Hardware/WirelessInterface/Intel/IwlLink.cpp
+  src/Hardware/WirelessInterface/Intel/IwlWireless.cpp
+  src/Hardware/WirelessInterface/Ieee80211Scan.cpp
+  src/Hardware/WirelessInterface/Ieee80211Frames.cpp
+  src/Hardware/WirelessInterface/Ieee80211Association.cpp
+  src/Hardware/WirelessInterface/Wpa2.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnIsa.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnEmu.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/Gcn/TgsiParse.cpp
@@ -938,7 +947,7 @@ if(TCOS_ARCH STREQUAL "x86_64")
   add_custom_command(OUTPUT ${WINDOWS_DIR}/kernel32.dll
     COMMAND ${CMAKE_C_COMPILER} ${WINDOWS_DLL_FLAGS} ${kernel32_stubs} -Wl,--image-base=0x180200000 -o ${WINDOWS_DIR}/kernel32.dll
             ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.c ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.def ${WINDOWS_DIR}/libntdll.a
-    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.c ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra2.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra3.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/console.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/legacy.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/fmtmsg.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/time.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/memory.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/nls.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/actctx.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/rsrcupdate.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.def ${WINDOWS_DIR}/libntdll.a ${WINDOWS_HEADERS} ${CMAKE_SOURCE_DIR}/src/Windows/stubs/kernel32.inc ${WINDOWS_STUBS_C}
+    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.c ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra2.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra3.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/console.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/legacy.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/fmtmsg.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/time.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/memory.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/nls.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/actctx.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/codepage.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/codepage_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/rsrcupdate.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.def ${WINDOWS_DIR}/libntdll.a ${WINDOWS_HEADERS} ${CMAKE_SOURCE_DIR}/src/Windows/stubs/kernel32.inc ${WINDOWS_STUBS_C}
     COMMENT "Building kernel32.dll")
   windows_stub_flags(msvcrt_stubs msvcrt 0)
   add_custom_command(OUTPUT ${WINDOWS_DIR}/msvcrt.dll
@@ -1040,7 +1049,7 @@ if(TCOS_USERMODE_DEMO AND TCOS_USERMODE_DEMO_PROGRAM)
   target_sources(BOOTX64 PRIVATE ${CMAKE_BINARY_DIR}/demo_files.S)
   set_source_files_properties(${CMAKE_BINARY_DIR}/demo_files.S PROPERTIES OBJECT_DEPENDS "${TCOS_USERMODE_DEMO_FILES}")
 endif()
-option(TCOS_INTEL_RENDER "Use the render engine of an Intel Gen9.5 display GPU for 3D (not yet run on real hardware; the CPU renderer is used if its self-test fails)" OFF)
+option(TCOS_INTEL_RENDER "Use the render engine of an Intel Gen9.5 display GPU for 3D and for the desktop (not yet run on real hardware; the CPU renderer is used if its self-test fails; -DTCOS_INTEL_RENDER=OFF keeps the CPU renderer)" ON)
 if(TCOS_INTEL_RENDER)
   target_compile_definitions(BOOTX64 PRIVATE TCOS_INTEL_RENDER)
 endif()

@@ -206,7 +206,8 @@ CommandProcessorModel::Result CommandProcessorModel::draw(bool indexed, const Pm
   const uint32_t depth_control = context_reg(mmDB_DEPTH_CONTROL);
   const uint32_t unsupported_depth_bits = (1u << DB_DEPTH_CONTROL__ENABLE_COLOR_WRITES_ON_DEPTH_FAIL__SHIFT) | (1u << DB_DEPTH_CONTROL__DISABLE_COLOR_WRITES_ON_DEPTH_PASS__SHIFT);
   const uint32_t mode = context_reg(mmPA_SU_SC_MODE_CNTL);
-  if ((mode & ~(1u << PA_SU_SC_MODE_CNTL__FACE__SHIFT)) != 0) return R::Unsupported;                    // (no culling, filled polygons, no offset)
+  const uint32_t cull_bits = (1u << PA_SU_SC_MODE_CNTL__CULL_FRONT__SHIFT) | (1u << PA_SU_SC_MODE_CNTL__CULL_BACK__SHIFT);
+  if ((mode & ~((1u << PA_SU_SC_MODE_CNTL__FACE__SHIFT) | cull_bits)) != 0 || (mode & cull_bits) == cull_bits) return R::Unsupported;   // (filled polygons, no offset; culling both faces draws nothing)
   if ((depth_control & unsupported_depth_bits) != 0 || context_reg(mmDB_RENDER_CONTROL) != 0 || context_reg(mmDB_SHADER_CONTROL) != 0 || context_reg(mmDB_DEPTH_VIEW) != 0) return R::Unsupported;
   DepthStencilState& ds = call.depth_stencil;
   ds.stencil_test = (depth_control >> DB_DEPTH_CONTROL__STENCIL_ENABLE__SHIFT & 1) != 0;
@@ -214,6 +215,7 @@ CommandProcessorModel::Result CommandProcessorModel::draw(bool indexed, const Pm
   ds.depth_write = ds.depth_test && (depth_control >> DB_DEPTH_CONTROL__Z_WRITE_ENABLE__SHIFT & 1) != 0;
   ds.depth_bounds = (depth_control >> DB_DEPTH_CONTROL__DEPTH_BOUNDS_ENABLE__SHIFT & 1) != 0;
   ds.front_clockwise = (mode >> PA_SU_SC_MODE_CNTL__FACE__SHIFT & 1) != 0;
+  ds.cull = (mode & (1u << PA_SU_SC_MODE_CNTL__CULL_FRONT__SHIFT)) ? 1 : (mode & (1u << PA_SU_SC_MODE_CNTL__CULL_BACK__SHIFT)) ? 2 : 0;
   if (ds.depth_bounds) {
     ds.bounds_min = bits_float(context_reg(mmDB_DEPTH_BOUNDS_MIN));
     ds.bounds_max = bits_float(context_reg(mmDB_DEPTH_BOUNDS_MAX));

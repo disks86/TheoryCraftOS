@@ -693,10 +693,83 @@ API int _finite(double x) { return !(x != x) && !ld_isinf(x); }
 API int _fpclass(double x) { return x != x ? 2 : ld_isinf(x) ? (x < 0 ? 4 : 0x200) : 0x80; }
 API int __fpclassify(double x) { return x != x ? 0x0100 : ld_isinf(x) ? 0x0500 : x == 0 ? 0x4000 : 0x0400; }
 API int __setusermatherr(void *handler) { (void)handler; return 0; }
-API unsigned _controlfp(unsigned a, unsigned b) { (void)a; (void)b; return 0x9001F; }
-API int _controlfp_s(unsigned *current, unsigned a, unsigned b) { (void)a; (void)b; if (current) *current = 0x9001F; return 0; }
-API unsigned _clearfp(void) { return 0; }
-API void _fpreset(void) {}
+/* The floating point environment of x86-64: the control word of the x87 unit is left as it is (53 bit precision is what threads start with, the CRT reports 64); the SSE
+ * control and status register keeps the exception masks, the rounding mode and the flush-to-zero modes. */
+#define FP_EM_INVALID 0x10u
+#define FP_EM_DENORMAL 0x80000u
+#define FP_EM_ZERODIVIDE 8u
+#define FP_EM_OVERFLOW 4u
+#define FP_EM_UNDERFLOW 2u
+#define FP_EM_INEXACT 1u
+#define FP_MCW_EM 0x8001Fu
+#define FP_MCW_RC 0x300u
+#define FP_MCW_DN 0x3000000u
+static unsigned fp_flags_from_mxcsr(unsigned x) {
+  unsigned f = 0;
+  if (x & 0x80) f |= FP_EM_INVALID;
+  if (x & 0x100) f |= FP_EM_DENORMAL;
+  if (x & 0x200) f |= FP_EM_ZERODIVIDE;
+  if (x & 0x400) f |= FP_EM_OVERFLOW;
+  if (x & 0x800) f |= FP_EM_UNDERFLOW;
+  if (x & 0x1000) f |= FP_EM_INEXACT;
+  switch (x & 0x6000) { case 0x2000: f |= 0x100; break; case 0x4000: f |= 0x200; break; case 0x6000: f |= 0x300; break; }
+  if (x & 0x8000) f |= 0x1000000u;      /* _DN_FLUSH */
+  return f;      /* (the precision field is 0: _PC_64) */
+}
+API unsigned _control87(unsigned value, unsigned mask) {
+  unsigned x;
+  __asm__ volatile("stmxcsr %0" : "=m"(x));
+  const unsigned old = fp_flags_from_mxcsr(x);
+  mask &= FP_MCW_EM | FP_MCW_RC | FP_MCW_DN | 0x30000u;
+  if (mask) {
+    const unsigned now = (old & ~mask) | (value & mask);
+    x &= ~(0x1F80u | 0x6000u | 0x8000u);
+    if (now & FP_EM_INVALID) x |= 0x80;
+    if (now & FP_EM_DENORMAL) x |= 0x100;
+    if (now & FP_EM_ZERODIVIDE) x |= 0x200;
+    if (now & FP_EM_OVERFLOW) x |= 0x400;
+    if (now & FP_EM_UNDERFLOW) x |= 0x800;
+    if (now & FP_EM_INEXACT) x |= 0x1000;
+    switch (now & 0x300) { case 0x100: x |= 0x2000; break; case 0x200: x |= 0x4000; break; case 0x300: x |= 0x6000; break; }
+    if (now & 0x1000000u) x |= 0x8000;
+    __asm__ volatile("ldmxcsr %0" : : "m"(x));
+    return now;
+  }
+  return old;
+}
+API unsigned _controlfp(unsigned value, unsigned mask) { return _control87(value, mask & ~FP_EM_DENORMAL); }
+API int _controlfp_s(unsigned *current, unsigned value, unsigned mask) {
+  const unsigned valid = FP_MCW_EM | FP_MCW_RC | FP_MCW_DN | 0x30000u;
+  if (value & mask & ~valid) { if (current) *current = _control87(0, 0); return 22; }      /* EINVAL */
+  const unsigned r = _control87(value, mask & ~FP_EM_DENORMAL);
+  if (current) *current = r;
+  return 0;
+}
+API unsigned _statusfp(void) {
+  unsigned x;
+  unsigned short w;
+  __asm__ volatile("stmxcsr %0" : "=m"(x));
+  __asm__ volatile("fnstsw %0" : "=m"(w));
+  unsigned f = 0;
+  const unsigned bits = x | w;
+  if (bits & 1) f |= 0x10;      /* _SW_INVALID */
+  if (bits & 2) f |= 0x80000;      /* _SW_DENORMAL */
+  if (bits & 4) f |= 8;      /* _SW_ZERODIVIDE */
+  if (bits & 8) f |= 4;      /* _SW_OVERFLOW */
+  if (bits & 0x10) f |= 2;      /* _SW_UNDERFLOW */
+  if (bits & 0x20) f |= 1;      /* _SW_INEXACT */
+  return f;
+}
+API unsigned _clearfp(void) {
+  const unsigned f = _statusfp();
+  unsigned x;
+  __asm__ volatile("stmxcsr %0" : "=m"(x));
+  x &= ~0x3Fu;
+  __asm__ volatile("ldmxcsr %0" : : "m"(x));
+  __asm__ volatile("fnclex");
+  return f;
+}
+API void _fpreset(void) { unsigned x = 0x1F80; unsigned short cw = 0x27F; __asm__ volatile("fninit; fldcw %1; ldmxcsr %0" : : "m"(x), "m"(cw)); }
 API void _statusfp_dummy(void) {}
 
 /* ====================================================================================================================================================================
@@ -1905,6 +1978,7 @@ __asm__(
     ".globl _setjmp\n_setjmp:\n"
     ".globl __intrinsic_setjmp\n__intrinsic_setjmp:\n"
     ".globl _setjmpex\n_setjmpex:\n"
+    ".globl __intrinsic_setjmpex\n__intrinsic_setjmpex:\n"
     ".globl setjmp\nsetjmp:\n"
     "  movq %rdx, 0(%rcx)\n"
     "  movq %rbx, 8(%rcx)\n"
@@ -1962,7 +2036,7 @@ __asm__(
     "  movdqa 240(%rcx), %xmm15\n"
     "  movq 16(%rcx), %rsp\n"
     "  jmpq *80(%rcx)\n"
-    ".section .drectve\n.ascii \" -export:_setjmp -export:__intrinsic_setjmp -export:_setjmpex -export:setjmp -export:longjmp\"\n.text\n");
+    ".section .drectve\n.ascii \" -export:_setjmp -export:__intrinsic_setjmp -export:_setjmpex -export:__intrinsic_setjmpex -export:setjmp -export:longjmp\"\n.text\n");
 
 /* ====================================================================================================================================================================
  * Signals, exit, atexit and the start-up entry points of the runtime

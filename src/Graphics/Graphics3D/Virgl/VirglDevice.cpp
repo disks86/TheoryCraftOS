@@ -165,7 +165,8 @@ class VirglImage final : public IImage {
     hardware::VirtioGpu& gpu = device.gpu();
     id_ = gpu.allocate_resource_id();
     const bool depth = desc.format == Format::D32Float;
-    color_format_ = desc.format == Format::R32G32B32A32Float ? virgl::kFormatR32G32B32A32Float : desc.format == Format::R16G16B16A16Float ? virgl::kFormatR16G16B16A16Float : virgl::kFormatB8G8R8A8Unorm;
+    color_format_ = desc.format == Format::R32G32B32A32Float ? virgl::kFormatR32G32B32A32Float : desc.format == Format::R16G16B16A16Float ? virgl::kFormatR16G16B16A16Float
+                    : desc.format == Format::R16G16B16A16Unorm ? virgl::kFormatR16G16B16A16Unorm : desc.format == Format::B8G8R8A8Srgb ? virgl::kFormatB8G8R8A8Srgb : virgl::kFormatB8G8R8A8Unorm;
     const uint32_t depth_format = desc.stencil ? virgl::kFormatZ32FloatS8X24Uint : virgl::kFormatZ32Float;
     // A sampled image is stored top row first, the way write_pixels() gives it and the sampler reads it, so it does not take the Y_0_TOP flip of the images that are only
     // drawn into (and shown).
@@ -248,7 +249,7 @@ class VirglImage final : public IImage {
 
   bool read_pixels(ArrayView<uint32_t> out) override {
     const uint64_t count = uint64_t{desc_.extent.width} * desc_.extent.height;
-    if (desc_.format == Format::D32Float || is_float_format(desc_.format) || out.size() < count) return false;
+    if (desc_.format == Format::D32Float || is_wide_format(desc_.format) || out.size() < count) return false;
     hardware::VirtioGpu& gpu = device_.gpu();
     if (!ensure_backing(count)) return false;
     TransferHost3d transfer{header(kCmdTransferFromHost3d),
@@ -262,13 +263,17 @@ class VirglImage final : public IImage {
 
   bool read_pixels_float(ArrayView<Vec4> out) override {
     const uint64_t count = uint64_t{desc_.extent.width} * desc_.extent.height;
-    if (!is_float_format(desc_.format) || out.size() < count || !ensure_backing(count)) return false;
+    if (!is_wide_format(desc_.format) || out.size() < count || !ensure_backing(count)) return false;
     TransferHost3d transfer{header(kCmdTransferFromHost3d), {0, 0, 0, desc_.extent.width, desc_.extent.height, 1}, 0, id_, 0, desc_.extent.width * bytes_per_pixel(desc_.format), 0};
     if (!device_.gpu().command(as_bytes(transfer))) return false;
     ByteReader in{ConstByteView(backing_)};
     for (uint64_t i = 0; i < count; ++i) {
       if (desc_.format == Format::R16G16B16A16Float) {
         const float r = half_to_float(in.le16()), g = half_to_float(in.le16()), b = half_to_float(in.le16()), a = half_to_float(in.le16());
+        out[i] = {r, g, b, a};
+      } else if (desc_.format == Format::R16G16B16A16Unorm) {
+        constexpr float k = 1.0f / 65535.0f;
+        const float r = static_cast<float>(in.le16()) * k, g = static_cast<float>(in.le16()) * k, b = static_cast<float>(in.le16()) * k, a = static_cast<float>(in.le16()) * k;
         out[i] = {r, g, b, a};
       } else {
         const float r = __builtin_bit_cast(float, in.le32()), g = __builtin_bit_cast(float, in.le32()), b = __builtin_bit_cast(float, in.le32()), a = __builtin_bit_cast(float, in.le32());
@@ -280,11 +285,14 @@ class VirglImage final : public IImage {
 
   bool write_pixels_float(ArrayView<const Vec4> pixels) override {
     const uint64_t count = uint64_t{desc_.extent.width} * desc_.extent.height;
-    if (!is_float_format(desc_.format) || !(desc_.usage & kImageSampled) || pixels.size() != count || !ensure_backing(count)) return false;
+    if (!is_wide_format(desc_.format) || !(desc_.usage & kImageSampled) || pixels.size() != count || !ensure_backing(count)) return false;
     ByteWriter out{backing_};
     for (const Vec4& c : pixels) {
       if (desc_.format == Format::R16G16B16A16Float) {
         out.le16(float_to_half(c.x)), out.le16(float_to_half(c.y)), out.le16(float_to_half(c.z)), out.le16(float_to_half(c.w));
+      } else if (desc_.format == Format::R16G16B16A16Unorm) {
+        auto q = [](float v) { return static_cast<uint32_t>(!(v > 0.0f) ? 0.0f : v >= 1.0f ? 65535.0f : v * 65535.0f + 0.5f); };
+        out.le16(q(c.x)), out.le16(q(c.y)), out.le16(q(c.z)), out.le16(q(c.w));
       } else {
         out.le32(__builtin_bit_cast(uint32_t, c.x)), out.le32(__builtin_bit_cast(uint32_t, c.y)), out.le32(__builtin_bit_cast(uint32_t, c.z)), out.le32(__builtin_bit_cast(uint32_t, c.w));
       }
@@ -297,7 +305,7 @@ class VirglImage final : public IImage {
   // Only a texture takes pixels: the host copies them from guest memory (the backing) into the resource.
   bool write_pixels(ArrayView<const uint32_t> pixels) override {
     const uint64_t count = uint64_t{desc_.extent.width} * desc_.extent.height;
-    if (!(desc_.usage & kImageSampled) || desc_.format == Format::D32Float || is_float_format(desc_.format) || pixels.size() != count) return false;
+    if (!(desc_.usage & kImageSampled) || desc_.format == Format::D32Float || is_wide_format(desc_.format) || pixels.size() != count) return false;
     if (!ensure_backing(count)) return false;
     const ArrayView<uint32_t> staged = backing_.cast<uint32_t>();
     for (uint64_t i = 0; i < count; ++i) staged[i] = pixels[i];
@@ -343,7 +351,7 @@ class VirglShaderModule final : public IShaderModule {
     if (!cmd) return;
     cmd[0] = virgl::header(virgl::kCreateObject, virgl::kObjectShader, 5 + text_dwords);
     cmd[1] = handle_;
-    cmd[2] = desc.stage == ShaderStage::Vertex ? virgl::kShaderVertex : desc.stage == ShaderStage::Compute ? virgl::kShaderCompute : virgl::kShaderFragment;
+    cmd[2] = desc.stage == ShaderStage::Vertex ? virgl::kShaderVertex : desc.stage == ShaderStage::Compute ? virgl::kShaderCompute : desc.stage == ShaderStage::Geometry ? virgl::kShaderGeometry : desc.stage == ShaderStage::Hull ? virgl::kShaderTessControl : desc.stage == ShaderStage::Domain ? virgl::kShaderTessEval : virgl::kShaderFragment;
     cmd[3] = length;                         // total text length (no continuation bit: it all fits)
     cmd[4] = length < 300 ? 300 : length;    // upper bound on the TGSI token count the host reserves
     cmd[5] = 0;                              // no stream output
@@ -394,7 +402,10 @@ class VirglPipeline final : public VirglPipelineBase {
  public:
   VirglPipeline(VirglDevice& device, const GraphicsPipelineDesc& desc)
       : VirglPipelineBase(false), device_(device), desc_(desc), vs_(static_cast<const VirglShaderModule*>(desc.vertex_shader)->handle()),
-        fs_(static_cast<const VirglShaderModule*>(desc.fragment_shader)->handle()) {
+        fs_(static_cast<const VirglShaderModule*>(desc.fragment_shader)->handle()),
+        gs_(desc.geometry_shader ? static_cast<const VirglShaderModule*>(desc.geometry_shader)->handle() : 0),
+        hs_(desc.hull_shader ? static_cast<const VirglShaderModule*>(desc.hull_shader)->handle() : 0),
+        ds_(desc.domain_shader ? static_cast<const VirglShaderModule*>(desc.domain_shader)->handle() : 0) {
     blend_ = device.new_handle();
     dsa_ = device.new_handle();
     rasterizer_ = device.new_handle();
@@ -496,11 +507,14 @@ class VirglPipeline final : public VirglPipelineBase {
   bool stencil_enabled() const { return desc_.stencil.enable; }
   uint32_t vertex_shader() const { return vs_; }
   uint32_t fragment_shader() const { return fs_; }
+  uint32_t geometry_shader() const { return gs_; }   // (0: none)
+  uint32_t hull_shader() const { return hs_; }
+  uint32_t domain_shader() const { return ds_; }
 
  private:
   VirglDevice& device_;
   GraphicsPipelineDesc desc_;
-  uint32_t vs_, fs_;
+  uint32_t vs_, fs_, gs_, hs_, ds_;
   uint8_t stencil_reference_ = 0;
   uint32_t blend_ = 0, dsa_ = 0, rasterizer_ = 0, elements_ = 0;
   bool ok_ = false;
@@ -575,7 +589,8 @@ IImage* VirglDevice::create_image(const ImageDesc& desc) {
   }
   // A texture is not drawn into: the two kinds of image are stored in opposite row order (see VirglImage).
   if ((desc.usage & kImageSampled) && (desc.usage & (kImageDepthAttachment | kImagePresent))) return nullptr;
-  if ((desc.usage & kImageSampled) && desc.format != Format::B8G8R8A8Unorm && !is_float_format(desc.format)) return nullptr;
+  if (desc.format == Format::R32G32B32A32Uint || desc.format == Format::R8G8B8A8Srgb) return nullptr;   // (no integer formats here, and only BGRA colour)
+  if ((desc.usage & kImageSampled) && desc.format != Format::B8G8R8A8Unorm && desc.format != Format::B8G8R8A8Srgb && !is_wide_format(desc.format)) return nullptr;
   if (!desc.extent.width || !desc.extent.height || desc.format == Format::Undefined) return nullptr;
   if (desc.format == Format::R8G8B8A8Unorm) return nullptr;  // only BGRA color images for now
   if (desc.stencil && desc.format != Format::D32Float) return nullptr;
@@ -610,6 +625,8 @@ IPipeline* VirglDevice::create_graphics_pipeline(const GraphicsPipelineDesc& des
     return nullptr;
   if (desc.vertex_shader->stage() != ShaderStage::Vertex || desc.fragment_shader->stage() != ShaderStage::Fragment)
     return nullptr;
+  if (desc.geometry_shader && desc.geometry_shader->stage() != ShaderStage::Geometry) return nullptr;
+  if ((desc.hull_shader != nullptr) != (desc.domain_shader != nullptr) || (desc.hull_shader && (desc.hull_shader->stage() != ShaderStage::Hull || desc.domain_shader->stage() != ShaderStage::Domain))) return nullptr;
   VirglPipeline* p = make<VirglPipeline>(gpu_.allocator(), *this, desc);
   if (p && !p->valid()) {
     destroy(gpu_.allocator(), p);
@@ -676,6 +693,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
   bool in_pass = false;
   PrimitiveTopology topology = PrimitiveTopology::TriangleList;
   const VirglComputePipeline* compute = nullptr;
+  uint32_t patch_points = 0;
   struct StorageBinding {
     VirglBuffer* buffer = nullptr;
     uint64_t offset = 0, size = 0;
@@ -771,6 +789,9 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
       }
       case RecordedCommand::Type::SetTopology:
         topology = cmd.topology;
+        break;
+      case RecordedCommand::Type::SetPatchPoints:
+        patch_points = cmd.count;
         break;
       case RecordedCommand::Type::EndRenderPass:
         if (queries.open != kMaxOcclusionQueries) return false;
@@ -887,6 +908,16 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         stream.command(virgl::kBindShader, 0, 2);
         stream.put(pipeline->fragment_shader());
         stream.put(virgl::kShaderFragment);
+        // (always: the host keeps a geometry shader bound, across submits too, until another bind - none, handle 0, for a pipeline without one)
+        stream.command(virgl::kBindShader, 0, 2);
+        stream.put(pipeline->geometry_shader());
+        stream.put(virgl::kShaderGeometry);
+        stream.command(virgl::kBindShader, 0, 2);
+        stream.put(pipeline->hull_shader());
+        stream.put(virgl::kShaderTessControl);
+        stream.command(virgl::kBindShader, 0, 2);
+        stream.put(pipeline->domain_shader());
+        stream.put(virgl::kShaderTessEval);
         constants_dirty = constants_dwords != 0;  // constants belong to the program: resend
         break;
       }
@@ -982,10 +1013,11 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
           stream.put(index_type == IndexType::Uint16 ? 2 : 4);
           stream.put(static_cast<uint32_t>(index_offset));
         }
-        stream.command(virgl::kDrawVbo, 0, 12);
+        const bool patches = topology == PrimitiveTopology::PatchList;
+        stream.command(virgl::kDrawVbo, 0, patches ? 14 : 12);
         stream.put(cmd.first);
         stream.put(cmd.count);
-        stream.put(topology == PrimitiveTopology::LineList ? virgl::kPrimLines : topology == PrimitiveTopology::PointList ? virgl::kPrimPoints : virgl::kPrimTriangles);
+        stream.put(patches ? virgl::kPrimPatches : topology == PrimitiveTopology::LineList ? virgl::kPrimLines : topology == PrimitiveTopology::PointList ? virgl::kPrimPoints : virgl::kPrimTriangles);
         stream.put(indexed ? 1 : 0);
         stream.put(cmd.instance_count);
         stream.put(static_cast<uint32_t>(cmd.vertex_offset));
@@ -995,6 +1027,10 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         stream.put(0);  // min index
         stream.put(0xFFFFFFFFu);  // max index
         stream.put(0);  // count from stream output
+        if (patches) {
+          stream.put(patch_points);
+          stream.put(0);   // draw id
+        }
         break;
       }
     }
