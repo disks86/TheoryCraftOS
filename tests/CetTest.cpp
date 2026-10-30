@@ -225,10 +225,114 @@ static void test_enqcmd() {
   CHECK(id.finished() && ((st(id).r[1] >> 29) & 1));      // cpuid.7.0:ECX bit 29
 }
 
+static const Bytes kRstorssp = {0xF3, 0x0F, 0x01, 0x2E}, kSaveprevssp = {0xF3, 0x0F, 0x01, 0xEA}, kSetssbsy = {0xF3, 0x0F, 0x01, 0xE8}, kClrssbsy = {0xF3, 0x0F, 0xAE, 0x36};
+
+// jmp over a far-returning function; the function body; the far call through [rsi] (m16:64 holding the function and the code selector)
+static Bytes far_program(const Bytes& body) {
+  Bytes code = {0xEB, uint8_t(body.size() + 2)};
+  code.insert(code.end(), body.begin(), body.end());
+  code.insert(code.end(), {0x48, 0xCB});      // retfq
+  code.insert(code.end(), {0x48, 0xFF, 0x1E});      // call far [rsi]
+  return code;
+}
+
+static void test_far_and_tokens() {
+  for (int smash = 0; smash < 2; ++smash) {
+    const Bytes body = smash ? Bytes{0x48, 0x83, 0x04, 0x24, 0x01} : Bytes{};      // add qword [rsp], 1
+    Machine m(far_program(body));
+    m.cpu.enable_shadow_stack(kShadow, false);
+    const uint64_t target = kCode + 2;
+    m.poke(kData, &target, 8);
+    const uint16_t selector = 0x33;
+    m.poke(kData + 8, &selector, 2);
+    if (smash) {
+      CHECK(m.faulted(21));
+      CHECK(m.cpu.shadow_stack_pointer() == kShadow - 16);
+    } else {
+      CHECK(m.finished() && m.cpu.shadow_stack_pointer() == kShadow);
+    }
+  }
+  {      // the far call pushes the selector and then the return address
+    Machine m(far_program({}));
+    m.cpu.enable_shadow_stack(kShadow, false);
+    const uint64_t target = kCode + 2;
+    m.poke(kData, &target, 8);
+    const uint16_t selector = 0x33;
+    m.poke(kData + 8, &selector, 2);
+    Bytes stop = far_program({0x0F, 0x0B});      // (the body is an ud2: stop inside the function)
+    Machine inside(stop);
+    inside.cpu.enable_shadow_stack(kShadow, false);
+    inside.poke(kData, &target, 8);
+    inside.poke(kData + 8, &selector, 2);
+    CHECK(inside.faulted(6));
+    CHECK(inside.peek(kShadow - 8) == 0x33 && inside.peek(kShadow - 16) == kCode + stop.size());
+  }
+  {      // rstorssp switches stacks and leaves a previous-SSP token; saveprevssp turns it into a restore token for the stack that was left; rstorssp switches back
+    const uint64_t other = kShadow + 0x200;
+    Machine a(kRstorssp);
+    a.cpu.enable_shadow_stack(kShadow, false);
+    const uint64_t token = (other + 8) | 1;
+    a.poke(other, &token, 8);
+    st(a).r[6] = other;
+    st(a).rflags |= 0x8D5;
+    CHECK(a.finished());
+    CHECK(a.cpu.shadow_stack_pointer() == other);
+    CHECK(a.peek(other) == (kShadow | 3));
+    CHECK((st(a).rflags & 0x8D5) == 0);
+    Bytes both = kRstorssp;
+    both.insert(both.end(), kSaveprevssp.begin(), kSaveprevssp.end());
+    Machine b(both);
+    b.cpu.enable_shadow_stack(kShadow, false);
+    b.poke(other, &token, 8);
+    st(b).r[6] = other;
+    CHECK(b.finished());
+    CHECK(b.cpu.shadow_stack_pointer() == other + 8);
+    CHECK(b.peek(kShadow - 8) == (kShadow | 1));      // the restore token for the old stack
+    // and back again
+    Bytes back = both;
+    back.insert(back.end(), kRstorssp.begin(), kRstorssp.end());
+    Machine c(back);
+    c.cpu.enable_shadow_stack(kShadow, false);
+    c.poke(other, &token, 8);
+    st(c).r[6] = other;
+    // (the third instruction takes rsi from the register: point it at the new token)
+    c.run(2);
+    st(c).r[6] = kShadow - 8;
+    CHECK(c.finished());
+    CHECK(c.cpu.shadow_stack_pointer() == kShadow - 8);
+  }
+  {      // a token that is not a restore token for this address is #CP(RSTORSSP) and is written back unchanged; misaligned is #GP; disabled is #UD
+    Machine m(kRstorssp);
+    m.cpu.enable_shadow_stack(kShadow, false);
+    const uint64_t bad = 0x1234567;
+    m.poke(kData, &bad, 8);
+    CHECK(m.faulted(21) && m.peek(kData) == bad && m.cpu.shadow_stack_pointer() == kShadow);
+    Machine g(kRstorssp);
+    g.cpu.enable_shadow_stack(kShadow, false);
+    st(g).r[6] = kData + 4;
+    CHECK(g.faulted(13));
+    Machine d(kRstorssp);
+    CHECK(d.faulted(6));
+    Machine e(kSaveprevssp);
+    CHECK(e.faulted(6));
+    Machine f(kSaveprevssp);
+    f.cpu.enable_shadow_stack(kShadow, false);
+    CHECK(f.faulted(13));      // (an empty stack: no token with bit 1)
+  }
+  {      // supervisor-only instructions: #UD, as without supervisor shadow stacks
+    Machine a(kSetssbsy);
+    a.cpu.enable_shadow_stack(kShadow, false);
+    CHECK(a.faulted(6) && a.cpu.fault().pc == kCode);
+    Machine b(kClrssbsy);
+    b.cpu.enable_shadow_stack(kShadow, false);
+    CHECK(b.faulted(6) && b.cpu.fault().pc == kCode);
+  }
+}
+
 // Every prefix and every single-bit flip of the encodings: whatever happens, it must happen safely.
 static void test_malformed() {
   Bytes all;
-  for (const Bytes& b : {kWrssq, kWruss, kEnqcmd, kEnqcmds, kWrssqApx, kEnqcmdApx, kRdsspq, kIncsspq}) all.insert(all.end(), b.begin(), b.end());
+  for (const Bytes& b : {kWrssq, kWruss, kEnqcmd, kEnqcmds, kWrssqApx, kEnqcmdApx, kRdsspq, kIncsspq, kRstorssp, kSaveprevssp, kSetssbsy, kClrssbsy}) all.insert(all.end(), b.begin(), b.end());
   for (size_t cut = 0; cut < all.size(); ++cut) {
     Machine m{Bytes(all.begin(), all.begin() + cut)};
     m.cpu.enable_shadow_stack(kShadow, true);
@@ -253,6 +357,7 @@ int main() {
   test_shadow();
   test_wrss();
   test_enqcmd();
+  test_far_and_tokens();
   test_malformed();
   if (g_failed) { printf("CetTest: %d failed\n", g_failed); return 1; }
   printf("CetTest: all passed\n");

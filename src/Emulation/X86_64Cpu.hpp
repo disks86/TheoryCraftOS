@@ -94,6 +94,8 @@ class X86_64Cpu final : public IGuestCpu {
   uint64_t shadow_stack_pointer() const { return cet_.ssp; }
   void set_pasid(uint32_t pasid) { pasid_ = pasid & 0xFFFFF; }
   void clear_pasid() { pasid_ = -1; }
+  // AMD LWP: true once the ring buffer fill reached the threshold with threshold interrupts enabled (the host delivers the interrupt, if it wants one); reading clears it.
+  bool take_lwp_interrupt() { const bool pending = lwp_interrupt_; lwp_interrupt_ = false; return pending; }
 
   State& state() { return s_; }
   const State& state() const { return s_; }
@@ -205,12 +207,19 @@ class X86_64Cpu final : public IGuestCpu {
   bool cet_push(GuestMemory& m, uint64_t value);
   bool cet_check_return(GuestMemory& m, uint64_t target);
   Step rdssp_instruction();
+  Step rstorssp_instruction(GuestMemory& m);
+  Step saveprevssp_instruction(GuestMemory& m);
+  bool cet_push_far(GuestMemory& m, uint16_t selector, uint64_t address);
+  bool cet_check_far(GuestMemory& m, uint16_t selector, uint64_t address);
   Step incssp_instruction(GuestMemory& m);
   Step wrss_instruction(GuestMemory& m, bool user);
   Step enqcmd_instruction(GuestMemory& m, bool supervisor);
   Step lwp_instruction(GuestMemory& m, uint32_t map, uint32_t vvvv);      // AMD LWP: llwpcb, slwpcb (XOP map 9), lwpins, lwpval (map A)
   bool lwp_flush(GuestMemory& m);
-  bool lwp_insert(GuestMemory& m, uint8_t event_id, uint16_t flags, uint32_t data1, uint64_t data2, bool* full);
+  bool lwp_insert(GuestMemory& m, uint8_t event_id, uint16_t flags, uint32_t data1, uint64_t instruction_address, uint64_t data2, bool* full);
+  bool lwp_retire(GuestMemory& m, uint64_t ip);
+  void lwp_reload(uint32_t id);
+  bool lwp_ip_eligible(uint64_t ip) const;
   Step fma4_instruction(GuestMemory& m, uint8_t opcode, bool wide, uint32_t vvvv);      // AMD FMA4 (VEX map 3)
   Step vpermil2_instruction(GuestMemory& m, uint8_t opcode, bool wide, uint32_t vvvv);      // AMD vpermil2ps / vpermil2pd (VEX map 3)
   Step xop_instruction(GuestMemory& m, uint32_t map, uint8_t opcode, uint32_t vvvv);      // AMD XOP and TBM (the 8F prefix)
@@ -296,11 +305,12 @@ class X86_64Cpu final : public IGuestCpu {
   Tiles tiles_;
   // AMD Lightweight Profiling (X86_64Lwp.cpp): the running session's copy of the control block fields; cb is the LWPCB address, 0 when LWP is off.
   struct Lwp {
-    uint64_t cb = 0, buffer_base = 0, missed = 0;
-    uint32_t buffer_size = 0, flags = 0, threshold = 0, random_bits = 0, head = 0;
-    int32_t counter = 0, interval = 0;
+    uint64_t cb = 0, buffer_base = 0, missed = 0, base_ip = 0, limit_ip = 0;
+    uint32_t buffer_size = 0, flags = 0, threshold = 0, random_bits = 0, head = 0, filters = 0;
+    int32_t counter[7] = {}, interval[7] = {};      // by EventId (1..6)
   };
   Lwp lwp_;
+  bool lwp_interrupt_ = false;
   struct Cet { bool enabled = false, wrss = false; uint64_t ssp = 0; };
   Cet cet_;
   int64_t pasid_ = -1;      // IA32_PASID: the PASID, or -1 while its valid bit is clear

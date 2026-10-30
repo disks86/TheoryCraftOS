@@ -67,6 +67,7 @@ void X86_64Cpu::reset(const process::ProgramStart& start) {
   fault_ = GuestFault();
   retired_ = 0;
   lwp_ = Lwp();
+  lwp_interrupt_ = false;
   cet_ = Cet();
   pasid_ = -1;
 }
@@ -1208,11 +1209,11 @@ X86_64Cpu::Step X86_64Cpu::step_0f_op(GuestMemory& m, uint8_t op) {
         b = 2 | (7u << 16);
       } else if (leaf == 0x80000000u) {
         a = 0x8000001Cu;
-      } else if (leaf == 0x8000001Cu) {      // LWP: the value sample (LWPVAL) and LWPINS, continuous mode and time stamps; no hardware events, no interrupt. 32-byte records, a 136-byte LWPCB (17 quadwords),
-        a = 1u | (1u << 1) | (1u << 29) | (1u << 30);      // six event ids, the first event interval at offset 88, 32 records at least, version 1
+      } else if (leaf == 0x8000001Cu) {      // LWP: the value sample (LWPVAL) and LWPINS, instructions / branches / clocks events, continuous mode, time stamps and the threshold interrupt flag; no cache miss event. 32-byte records, a 136-byte LWPCB (17 quadwords),
+        a = 1u | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 5) | (1u << 6) | (1u << 29) | (1u << 30) | (1u << 31);      // six event ids, the first event interval at offset 88, 32 records at least, version 1
         b = 17u | (32u << 8) | (6u << 16) | (88u << 24);
-        c = (1u << 9) | (1u << 16);
-        dx = 1u | (1u << 1) | (1u << 29) | (1u << 30);
+        c = (1u << 9) | (1u << 16) | (1u << 29);      // (version 1, 32 records at least, IP filtering)
+        dx = 1u | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 5) | (1u << 6) | (1u << 29) | (1u << 30) | (1u << 31);
       } else if (leaf == 0x80000001u) {
         c = (1u << 0) | (1u << 5) | (1u << 11) | (1u << 15) | (1u << 16) | (1u << 21);      // LAHF/SAHF, LZCNT, XOP, LWP, FMA4, TBM
         dx = (1u << 11) | (1u << 20) | (1u << 27) | (1u << 29);      // SYSCALL, NX, RDTSCP, long mode
@@ -1433,6 +1434,8 @@ X86_64Cpu::Step X86_64Cpu::step_0f_op(GuestMemory& m, uint8_t op) {
       } else if (kind == 4 || kind == 5) {      // xsave, xrstor
         const Step r = xsave_family(m, kind);
         if (r != Step::Ok) return r;
+      } else if (kind == 6 && d_.rep) {      // clrssbsy: supervisor shadow stacks only, which do not exist here
+        return fail(6);
       } else if (kind == 6 && !d_.operand16) {      // xsaveopt (66 0F AE /6 is clwb, a no-op below)
         const Step r = xsave_family(m, 6);
         if (r != Step::Ok) return r;
@@ -2243,6 +2246,7 @@ StopReason X86_64Cpu::run(GuestMemory& memory, uint64_t max_instructions) {
     const Step step_result = step(memory);
     if (step_result == Step::Fault) return StopReason::Fault;
     ++retired_;
+    if (lwp_.cb != 0 && (lwp_.flags & 0x6C) && !lwp_retire(memory, instruction_start_)) return StopReason::Fault;
     if (step_result == Step::Syscall) return StopReason::Syscall;
   }
   return StopReason::Budget;

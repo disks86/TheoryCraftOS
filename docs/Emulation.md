@@ -155,7 +155,9 @@ programs built with `-march=haswell` (or x86-64-v3) run. `X86_64Vex.cpp` holds a
   `incsspd`/`incsspq` do nothing and `wrss`/`wruss` are #UD, as on a processor with CET disabled. While on, every near `call` also pushes the return address on the shadow stack (ordinary guest memory,
   8 bytes down) and every near `ret` compares its target with the shadow stack top and pops it, raising #CP (vector 21, error code 1) on a mismatch with the data stack left as it was; `rdssp` reads the
   pointer, `incssp` adds count x 8 (Q) or count x 4 (D, unverified) after reading the last entry skipped, `wrss` stores to an operand-size aligned address (#GP(0) otherwise; #UD unless WRSS was allowed),
-  and `wruss` is #GP(0) at CPL 3. Not modelled: the shadow stack page type, far calls and returns, `iret`, interrupts, the restore-token instructions and indirect branch tracking. The map 4 forms of
+  and `wruss` is #GP(0) at CPL 3. Far calls push CS and the return address on the shadow stack, `retf` and `iretq` compare both (#CP, error code 2; the layout is from memory of the
+  SDM and unverified). `rstorssp` / `saveprevssp` switch shadow stacks through restore tokens (#CP error code 4 for a bad token; #GP for a misaligned address or a token without bit 1). `setssbsy` and
+  `clrssbsy` act on supervisor shadow stacks, which the emulator does not have, so they are #UD. Not modelled: the shadow stack page type, the privilege-changing and compatibility-mode cases, interrupts and indirect branch tracking. The map 4 forms of
   `wrss`, `wruss`, `enqcmd` and `enqcmds` are there too.
 - **ENQCMD / ENQCMDS** (cpuid 7.0 ECX bit 29): `enqcmd` reads the 64-byte command at the memory operand, replaces its first dword with the PASID, writes it to the 64-byte aligned address in the register
   and clears ZF (ordinary memory always accepts). It is #GP(0) until the host sets a PASID with `set_pasid()` (IA32_PASID valid bit), as on a machine whose OS has not; `enqcmds` is #GP(0) at CPL 3.
@@ -205,11 +207,14 @@ programs built with `-march=haswell` (or x86-64-v3) run. `X86_64Vex.cpp` holds a
   models only (`tests/XopTest.cpp`). `vpermil2ps` / `vpermil2pd` (VEX map 3, 66 48 / 49; selector bits [1:0] or [1] pick the element, bit 2 the source, bit 3 the match bit, m2z in imm8[1:0]
   as the Microsoft intrinsic documentation gives it; the operand order for VEX.W is from the same source) are there too, and so is LWP (below). The cpuid XOP / FMA4 / TBM / LWP bits are set.
 - **AMD Lightweight Profiling** (`src/Emulation/X86_64Lwp.cpp`, from AMD64 APM volumes 2 and 3; cpuid 0x80000001 ECX bit 15 and leaf 0x8000001C; XCR0 bit 62): `llwpcb`, `slwpcb`, `lwpval`, `lwpins` (XOP
-  map 9 / A, opcode 12). The control block, the ring buffer in guest memory with its head, the software-owned tail and MissedEvents, synchronized and continuous mode, the value-sample counter and
-  interval (with the Random bits), the performance time stamp (the emulator's time stamp counter), SLWPCB's flush of the head, counter and MissedEvents, and LWPINS's CF are modelled. Not modelled: the
-  hardware events (instructions, branches, cache misses, clocks: LLWPCB clears their flag bits, as for a processor without them, and cpuid says so) and threshold interrupts. The session is part of the CPU
-  object (like the AMX tiles) and XSAVE / XRSTOR carry it as component 62 (offset 832, 128 bytes) in a layout of this emulator's own, since AMD's is not public. `tests/XopTest.cpp` has the tests; the
-  semantics are from the manuals and unverified on hardware.
+  map 9 / A, opcode 12). The control block, the ring buffer in guest memory with its head, the software-owned tail and MissedEvents, synchronized and continuous mode, the Random bits, the performance time
+  stamp (the emulator's time stamp counter), SLWPCB's flush of the head, counters and MissedEvents, and LWPINS's CF are modelled, and so are the events: the programmed value sample (1) and programmed
+  event (255), instructions retired (2), branches retired (3: conditional, relative and register-indirect branches, `call`, `ret`; the NAB / NCB / NRB filters; TKN set when taken; no prediction
+  information, so PRV = 0, and no fused branches), and CPU clocks and reference clocks not halted (5, 6: one clock per retired instruction), with the IP range filter (IPF / IPI) for all of them. The
+  threshold interrupt is a host-visible flag: when the ring fill reaches the threshold with Flags.INT set, `take_lwp_interrupt()` returns true once. Not modelled: the DCache miss event (there is no
+  cache; cpuid does not offer it and LLWPCB clears its flag), branch prediction filters, and the interrupt delivery itself. The session is part of the CPU object (like the AMX tiles) and XSAVE /
+  XRSTOR carry it as component 62 (offset 832, 128 bytes) in a layout of this emulator's own, since AMD's is not public. The minimum interval of a hardware event is 1. `tests/XopTest.cpp` has the
+  tests; the semantics are from the manuals and unverified on hardware.
 - **Intel APX, part 1** (`D5` REX2 prefix): the payload bits M0, R4, X4, B4, W, R3, X3, B3 select the 0F map and name registers R16..R31 in modrm, SIB (an index field of 100 with X4 is R20, not "no index") and
   opcode-embedded fields; `jmpabs` (`D5 00 A1 imm64`); state in XCR0 bit 19 and xsave component 19 (offset 11008, 128 bytes, in the initial state while R16..R31 are all zero); cpuid 7.1 EDX bit 21. REX2 on an SSE,
   x87, MMX or other vector instruction that names a high register is #UD. `tests/ApxTest.cpp` runs integer instructions on R16 / R17 and on RAX / RCX and compares.
@@ -243,7 +248,7 @@ programs built with `-march=haswell` (or x86-64-v3) run. `X86_64Vex.cpp` holds a
   and are not implemented. cpuid reports AVX10 version 2.
 - **xgetbv with ECX=1** returns XINUSE (the components that are not in their initial state; cpuid 0xD.1 EAX bit 2). `xsaves` / `xrstors` are #GP(0): they are supervisor-state instructions and the emulator only
   runs CPL 3 code.
-- **Not implemented** (an invalid-instruction fault, never a wrong result): the restore-token CET instructions (`rstorssp`, `saveprevssp`, `setssbsy`, `clrssbsy`) and the privileged map 4 instructions (`invept`, `invvpid`, `invpcid`, `urdmsr`, `uwrmsr`).
+- **Not implemented** (an invalid-instruction fault, never a wrong result): `invept`, `invvpid`, `invpcid` and `urdmsr` / `uwrmsr` (VMX, the INVPCID feature and the user-MSR feature, none of which cpuid advertises, so #UD is the architectural answer).
   Exceptions delivered to a Windows program save the XMM halves of vector state in the `CONTEXT` in memory, not the upper halves (the emulator keeps those itself).
 - **Checked against the real thing**: `tests/AvxTest.cpp` assembles about 1,400 instruction forms with `llvm-mc` (`tests/data/emulation/avx_cases_gen.py`), runs each on the host
   and on the emulator from the same random state (80,000+ comparisons per run: all vector registers, written general registers, flags, MXCSR flags except DE, the memory operand)

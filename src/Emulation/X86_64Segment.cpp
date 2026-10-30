@@ -98,6 +98,10 @@ X86_64Cpu::Step X86_64Cpu::far_branch(GuestMemory& m, bool is_call) {
       s_.r[4] = saved_sp;
       return Step::Fault;
     }
+    if (cet_.enabled && !cet_push_far(m, selector_[1], return_address)) {
+      s_.r[4] = saved_sp;
+      return Step::Fault;
+    }
   }
   selector_[1] = kCodeSelector;
   s_.rip = size == 8 ? offset : offset & (size == 4 ? 0xFFFFFFFFu : 0xFFFFu);
@@ -113,6 +117,7 @@ X86_64Cpu::Step X86_64Cpu::far_return(GuestMemory& m, uint8_t op) {
   uint64_t target = 0, selector = 0;
   if (!load(m, s_.r[4], size, &target) || !load(m, s_.r[4] + size, 2, &selector)) return Step::Fault;
   if (static_cast<uint16_t>(selector) != kCodeSelector) return fail(13);
+  if (cet_.enabled && !cet_check_far(m, static_cast<uint16_t>(selector), target)) return Step::Fault;
   selector_[1] = kCodeSelector;
   s_.r[4] += 2 * size + extra;
   s_.rip = size == 8 ? target : target & (size == 4 ? 0xFFFFFFFFu : 0xFFFFu);
@@ -129,6 +134,7 @@ X86_64Cpu::Step X86_64Cpu::interrupt_return(GuestMemory& m) {
     if (!load(m, s_.r[4] + i * size, size, &frame[i])) return Step::Fault;
   if (static_cast<uint16_t>(frame[1]) != kCodeSelector) return fail(13);
   if (!data_selector_valid(static_cast<uint16_t>(frame[4])) || (frame[4] >> 3) == 0) return fail(13);
+  if (cet_.enabled && !cet_check_far(m, static_cast<uint16_t>(frame[1]), frame[0])) return Step::Fault;
   constexpr uint64_t kWritable = 0x1 | 0x4 | 0x10 | 0x40 | 0x80 | 0x100 | 0x400 | 0x800 | 0x4000 | 0x40000 | 0x200000;
   s_.rflags = ((s_.rflags & ~kWritable) | (frame[2] & kWritable)) | 2;
   selector_[1] = kCodeSelector;
