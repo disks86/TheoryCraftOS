@@ -211,8 +211,19 @@ static BOOL con_std_is_terminal(HANDLE h) {
 static BOOL con_attached(void) { if (!g_host_tried) { con_lock(); con_unlock(); } return g_host != NULL; }
 static BOOL con_std_is_console(HANDLE h) { return con_std_is_terminal(h) && con_attached(); }
 /* The standard output of a console (the same handle as CONOUT$) is not something to read from. */
-static BOOL con_is_output_only(HANDLE h) { return h && h == GetStdHandle(STD_OUTPUT_HANDLE) && h != GetStdHandle(STD_INPUT_HANDLE) && con_std_is_console(h); }
-static BOOL con_is_input(HANDLE h) { return h && h == GetStdHandle(STD_INPUT_HANDLE) && con_std_is_console(h); }
+/* The handles CreateFile made for "CONIN$" and "CONOUT$" (more handles to the console input and output, which then are not the standard handles). */
+static HANDLE g_con_alias[16];
+static BOOL g_con_alias_input[16];
+static void con_alias_add(HANDLE h, BOOL input) {
+  for (int i = 0; i < 16; ++i) if (g_con_alias[i] == h || !g_con_alias[i]) { g_con_alias[i] = h; g_con_alias_input[i] = input; return; }
+}
+static void con_alias_forget(HANDLE h) { for (int i = 0; i < 16; ++i) if (g_con_alias[i] == h) g_con_alias[i] = NULL; }
+static int con_alias_kind(HANDLE h) {      /* 1: an input alias, 2: an output alias, 0: none (a handle that was closed and is a file now is none either) */
+  for (int i = 0; i < 16; ++i) if (g_con_alias[i] == h && h && device_type(h) == 0x50) return g_con_alias_input[i] ? 1 : 2;
+  return 0;
+}
+static BOOL con_is_output_only(HANDLE h) { return h && ((h == GetStdHandle(STD_OUTPUT_HANDLE) && h != GetStdHandle(STD_INPUT_HANDLE) && con_std_is_console(h)) || con_alias_kind(h) == 2); }
+static BOOL con_is_input(HANDLE h) { return h && ((h == GetStdHandle(STD_INPUT_HANDLE) && con_std_is_console(h)) || con_alias_kind(h) == 1); }
 static BOOL con_buffer_alive(HANDLE h) { return SetEvent(h) || GetLastError() != ERROR_INVALID_HANDLE; }
 /* The screen buffer a handle writes to (the lock is held), or NULL. */
 static ScreenBuffer *con_buffer(HANDLE h) {
@@ -406,7 +417,7 @@ static BOOL console_write_hook(HANDLE h, LPCVOID buffer, DWORD length, LPDWORD w
   static BYTE carry[4];
   static int carried;
   *handled = FALSE;
-  if (h != GetStdHandle(STD_OUTPUT_HANDLE) && h != GetStdHandle(STD_ERROR_HANDLE)) return FALSE;
+  if (h != GetStdHandle(STD_OUTPUT_HANDLE) && h != GetStdHandle(STD_ERROR_HANDLE) && con_alias_kind(h) != 2) return FALSE;
   if (!con_std_is_console(h)) return FALSE;
   *handled = TRUE;
   const BYTE *b = buffer;

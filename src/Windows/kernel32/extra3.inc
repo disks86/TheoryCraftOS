@@ -505,28 +505,40 @@ EXPORT BOOL WINAPI WriteProcessMemory(HANDLE process, LPVOID base, LPCVOID buffe
   if (done) *done = got;
   return NT_SUCCESS(status) && status != (NTSTATUS)0x8000000D ? TRUE : fail_nt(status);
 }
-/* Attribute lists: a header and room for as many entries as were asked for; an entry names an attribute and points to the caller's value. */
-typedef struct ProcThreadAttributeEntry { DWORD_PTR attribute; SIZE_T size; PVOID value; } ProcThreadAttributeEntry;
-typedef struct ProcThreadAttributeList { DWORD flags; DWORD capacity; DWORD count; DWORD reserved; PVOID unknown; ProcThreadAttributeEntry entries[1]; } ProcThreadAttributeList;
+/* Attribute lists (the type is in kernel32.c, where CreateProcess reads them): a header and room for as many entries as were asked for; an entry names an attribute and points to
+   the caller's value. Only the four fields of the header are written by Initialize (the rest of the memory stays as it was). */
 EXPORT BOOL WINAPI InitializeProcThreadAttributeList(ProcThreadAttributeList *list, DWORD count, DWORD flags, PSIZE_T size) {
-  if (flags || count == 0 || count > 27) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
-  const SIZE_T needed = 32 + (SIZE_T)count * sizeof(ProcThreadAttributeEntry);
-  if (!list || *size < needed) { *size = needed; set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
-  memset(list, 0, needed);
-  list->capacity = count;
+  if (flags || count > 27) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  const SIZE_T needed = 24 + (SIZE_T)count * sizeof(ProcThreadAttributeEntry);
+  const SIZE_T have = *size;
   *size = needed;
+  if (!list || have < needed) { set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+  list->flags = 0;
+  list->capacity = count;
+  list->count = 0;
+  list->unknown = NULL;
   return TRUE;
 }
-EXPORT void WINAPI DeleteProcThreadAttributeList(ProcThreadAttributeList *list) { if (list) list->count = 0; }
+EXPORT void WINAPI DeleteProcThreadAttributeList(ProcThreadAttributeList *list) { (void)list; }
 EXPORT BOOL WINAPI UpdateProcThreadAttribute(ProcThreadAttributeList *list, DWORD flags, DWORD_PTR attribute, PVOID value, SIZE_T size, PVOID previous, PSIZE_T returned) {
   (void)previous; (void)returned;
-  if (flags & ~1u || !list || !value) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
-  for (DWORD i = 0; i < list->count; ++i) if (list->entries[i].attribute == attribute) { set_error(5010); return FALSE; }
-  if (list->count >= list->capacity) { set_error(31); return FALSE; }
+  if (flags & ~1u) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (list->count >= list->capacity) { set_error(31 /* ERROR_GEN_FAILURE */); return FALSE; }
+  switch (attribute & ~(DWORD_PTR)0x40000000) {      /* (PROC_THREAD_ATTRIBUTE_ADDITIVE is not part of the identity) */
+    case 0x00020000: if (size != sizeof(HANDLE)) { set_error(24 /* ERROR_BAD_LENGTH */); return FALSE; } break;      /* PARENT_PROCESS */
+    case 0x00020002: if (size == 0 || size % sizeof(HANDLE)) { set_error(24); return FALSE; } break;      /* HANDLE_LIST */
+    case 0x00030003: if (size != sizeof(GROUP_AFFINITY)) { set_error(24); return FALSE; } break;      /* GROUP_AFFINITY */
+    case 0x00030005: if (size != 4) { set_error(24); return FALSE; } break;      /* IDEAL_PROCESSOR (a PROCESSOR_NUMBER) */
+    case 0x00020016: if (size != sizeof(HANDLE)) { set_error(24); return FALSE; } break;      /* PSEUDOCONSOLE */
+    default: set_error(ERROR_NOT_SUPPORTED); return FALSE;
+  }
+  const DWORD bit = 1u << (attribute & 0xFFFF);
+  if (list->flags & bit) { set_error(698 /* ERROR_OBJECT_NAME_EXISTS */); return FALSE; }
   list->entries[list->count].attribute = attribute;
   list->entries[list->count].size = size;
   list->entries[list->count].value = value;
   list->count++;
+  list->flags |= bit;
   return TRUE;
 }
 EXPORT HANDLE WINAPI CreateRemoteThreadEx(HANDLE process, LPSECURITY_ATTRIBUTES sa, SIZE_T stack, LPTHREAD_START_ROUTINE start, LPVOID parameter, DWORD flags, LPVOID attributes, LPDWORD id) {
@@ -586,6 +598,91 @@ EXPORT BOOL WINAPI GetLogicalProcessorInformation(SYSTEM_LOGICAL_PROCESSOR_INFOR
   *length = need;
   return TRUE;
 }
+
+/* The processors in the shapes Windows 10 gives them: SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX records and CPU sets, made by the kernel. */
+EXPORT BOOL WINAPI GetLogicalProcessorInformationEx(DWORD relation, BYTE *buffer, PDWORD length) {
+  if (!length) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  ULONG returned = 0;
+  const NTSTATUS status = NtQuerySystemInformationEx(107 /* SystemLogicalProcessorInformationEx */, &relation, sizeof(relation), buffer, buffer ? *length : 0, &returned);
+  if (status == (NTSTATUS)0xC0000004 /* STATUS_INFO_LENGTH_MISMATCH */) { *length = returned; set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+  if (!NT_SUCCESS(status)) return fail_nt(status);
+  *length = returned;
+  return TRUE;
+}
+EXPORT BOOL WINAPI GetSystemCpuSetInformation(BYTE *info, ULONG length, ULONG *returned, HANDLE process, ULONG flags) {
+  if (returned) *returned = 0;
+  if (flags) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (!info && length) { set_error(ERROR_NOACCESS); return FALSE; }
+  if (!process) process = GetCurrentProcess();
+  ULONG got = 0;
+  const NTSTATUS status = NtQuerySystemInformationEx(175 /* SystemCpuSetInformation */, &process, sizeof(process), info, length, &got);
+  if (returned && (NT_SUCCESS(status) || status == (NTSTATUS)0xC0000023)) *returned = got;
+  return NT_SUCCESS(status) ? TRUE : fail_nt(status);
+}
+/* Every processor is in NUMA node 0 of processor group 0. */
+EXPORT BOOL WINAPI GetNumaProcessorNode(UCHAR processor, PUCHAR node) {
+  SYSTEM_INFO si;
+  GetSystemInfo(&si);
+  if (processor >= si.dwNumberOfProcessors) { *node = 0xFF; set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  *node = 0;
+  return TRUE;
+}
+typedef struct { WORD Group; BYTE Number, Reserved; } PROCESSOR_NUMBER_;
+EXPORT BOOL WINAPI GetNumaProcessorNodeEx(PROCESSOR_NUMBER_ *processor, USHORT *node) {
+  SYSTEM_INFO si;
+  GetSystemInfo(&si);
+  if (processor->Group != 0 || processor->Number >= si.dwNumberOfProcessors || processor->Number >= 64) { *node = 0xFFFF; set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  *node = 0;
+  return TRUE;
+}
+EXPORT BOOL WINAPI GetNumaHighestNodeNumber(PULONG node) { *node = 0; return TRUE; }
+/* Windows 10: one session for everything that runs here. */
+EXPORT BOOL WINAPI ProcessIdToSessionId(DWORD pid, DWORD *session) {
+  if (!session) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  HANDLE process = pid == GetCurrentProcessId() ? GetCurrentProcess() : OpenProcess(0x1000 /* PROCESS_QUERY_LIMITED_INFORMATION */, FALSE, pid);
+  if (!process) { if (GetLastError() == ERROR_ACCESS_DENIED || GetLastError() == ERROR_INVALID_PARAMETER) set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  ULONG id = 0;
+  const NTSTATUS status = NtQueryInformationProcess(process, 24 /* ProcessSessionInformation */, &id, sizeof(id), NULL);
+  if (process != GetCurrentProcess()) CloseHandle(process);
+  if (!NT_SUCCESS(status)) return fail_nt(status);
+  *session = id;
+  return TRUE;
+}
+EXPORT DWORD WINAPI WTSGetActiveConsoleSessionId(void) { return 1; }
+EXPORT BOOL WINAPI GetSystemRegistryQuota(PDWORD allowed, PDWORD used) {
+  if (allowed) *allowed = 0x2000000;      /* the registry may hold 32 MiB, and holds a little */
+  if (used) *used = 0x180000;
+  return TRUE;
+}
+/* Nothing here runs under WOW64: the machine of a program is "unknown" (it is the native one), the native machine is x86-64. */
+EXPORT BOOL WINAPI IsWow64Process(HANDLE process, PBOOL wow64) {
+  ULONG_PTR information = 0;
+  const NTSTATUS status = NtQueryInformationProcess(process, 26 /* ProcessWow64Information */, &information, sizeof(information), NULL);
+  if (!NT_SUCCESS(status)) return fail_nt(status);
+  if (wow64) *wow64 = information != 0;
+  return TRUE;
+}
+EXPORT BOOL WINAPI IsWow64Process2(HANDLE process, USHORT *machine, USHORT *native_machine) {
+  ULONG_PTR information = 0;
+  const NTSTATUS status = NtQueryInformationProcess(process, 26 /* ProcessWow64Information */, &information, sizeof(information), NULL);
+  if (!NT_SUCCESS(status)) return fail_nt(status);
+  if (machine) *machine = 0;      /* IMAGE_FILE_MACHINE_UNKNOWN */
+  if (native_machine) *native_machine = 0x8664;      /* IMAGE_FILE_MACHINE_AMD64 */
+  return TRUE;
+}
+
+/* Pseudo consoles: an object that stands for the console of a program started with PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE (the program's standard handles are its own console
+   in that case). The pipes it was made with are not read or written: what the program prints stays in its console model. */
+EXPORT HRESULT WINAPI CreatePseudoConsole(COORD size, HANDLE input, HANDLE output, DWORD flags, HANDLE *console) {
+  if (!console || size.X <= 0 || size.Y <= 0 || (flags & ~7u)) return (HRESULT)0x80070057;      /* E_INVALIDARG */
+  if (GetFileType(input) == FILE_TYPE_UNKNOWN || GetFileType(output) == FILE_TYPE_UNKNOWN) return (HRESULT)0x80070006;      /* E_HANDLE */
+  HANDLE object = CreateEventW(NULL, TRUE, FALSE, NULL);
+  if (!object) return (HRESULT)0x8007000E;      /* E_OUTOFMEMORY */
+  *console = object;
+  return 0;
+}
+EXPORT HRESULT WINAPI ResizePseudoConsole(HANDLE console, COORD size) { (void)console; return size.X > 0 && size.Y > 0 ? 0 : (HRESULT)0x80070057; }
+EXPORT void WINAPI ClosePseudoConsole(HANDLE console) { CloseHandle(console); }
 
 /* VerifyVersionInfo and GetProductInfo: ntdll knows the version (RtlGetVersion, RtlVerifyVersionInfo). */
 NTSTATUS NTAPI RtlVerifyVersionInfo(const void *info, ULONG types, ULONGLONG mask);
@@ -1219,6 +1316,15 @@ EXPORT BOOL WINAPI K32GetProcessMemoryInfo(HANDLE process, PROCESS_MEMORY_COUNTE
 }
 /* The path of the program as the NT name ("\\Device\\HarddiskVolume1\\..."): its length in characters, or 0 and ERROR_INSUFFICIENT_BUFFER if `size` characters (with the NUL) do not hold it. */
 EXPORT DWORD WINAPI K32GetProcessImageFileNameW(HANDLE process, LPWSTR name, DWORD size) {
+  {      /* the kernel knows the NT name of the program */
+    BYTE info[16 + 2 * (MAX_PATH * 2 + 1)];
+    if (NT_SUCCESS(NtQueryInformationProcess(process, 27, info, sizeof(info), NULL))) {
+      const DWORD length = get16(info) / 2;
+      if (!name || length + 1 > size) { set_error(ERROR_INSUFFICIENT_BUFFER); return 0; }
+      memcpy(name, (const WCHAR *)(ULONG_PTR)get64(info + 8), ((size_t_)length + 1) * 2);
+      return length;
+    }
+  }
   ModuleRecord_ m;
   DWORD pid = 0;
   if (!find_module_record(process, NULL, &m, &pid)) return 0;

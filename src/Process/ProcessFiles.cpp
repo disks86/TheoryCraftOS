@@ -302,11 +302,16 @@ bool ProcessFiles::duplicate_to(uint64_t slot, uint64_t target) {
   return true;
 }
 
-uint32_t ProcessFiles::inherit_from(const ProcessFiles& parent, void (*copy_token)(DescriptorKind kind, uint64_t token)) {
+uint32_t ProcessFiles::inherit_from(const ProcessFiles& parent, void (*copy_token)(DescriptorKind kind, uint64_t token), const uint64_t* only, uint32_t only_count, bool restrict) {
   uint32_t copied = 0;
   for (uint64_t slot = 0; slot < kMaxDescriptors; ++slot) {
     const Slot& s = parent.slots_[slot];
     if (s.kind == DescriptorKind::Closed || !s.inherit || s.kind == DescriptorKind::Thread) continue;      // (a thread of the parent means nothing to the child)
+    if (restrict) {
+      bool listed = false;
+      for (uint32_t i = 0; i < only_count && !listed; ++i) listed = only[i] == slot;
+      if (!listed) continue;
+    }
     close(slot);
     slots_[slot].kind = s.kind;
     slots_[slot].object = s.object;
@@ -316,6 +321,20 @@ uint32_t ProcessFiles::inherit_from(const ProcessFiles& parent, void (*copy_toke
     ++copied;
   }
   return copied;
+}
+
+bool ProcessFiles::adopt_from(const ProcessFiles& parent, uint64_t slot, void (*copy_token)(DescriptorKind kind, uint64_t token)) {
+  if (slot >= kMaxDescriptors || slots_[slot].kind != DescriptorKind::Closed) return false;
+  const Slot& s = parent.slots_[slot];
+  if (s.kind == DescriptorKind::Closed || s.kind == DescriptorKind::Thread) return false;
+  slots_[slot].kind = s.kind;
+  slots_[slot].object = s.object;
+  slots_[slot].token = s.token;
+  slots_[slot].close_on_exec = false;
+  slots_[slot].inherit = s.inherit;
+  slots_[slot].protect = s.protect;
+  if (copy_token && s.token != 0) copy_token(s.kind, s.token);
+  return true;
 }
 
 int64_t ProcessFiles::open_token(DescriptorKind kind, uint64_t token) {

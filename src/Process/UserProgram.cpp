@@ -192,7 +192,6 @@ bool UserProgram::set_standard_handles(const uint64_t handles[3]) {
   const uint64_t parameters = ok ? read_u64(space_, peb + 0x20, &ok) : 0;
   if (!ok || parameters == 0) return false;
   for (uint32_t i = 0; i < 3; ++i) {
-    if (handles[i] == 0 || handles[i] == ~uint64_t{0}) continue;
     if (!write_u64(space_, parameters + 0x20 + 8 * i, handles[i])) return false;
   }
   return true;

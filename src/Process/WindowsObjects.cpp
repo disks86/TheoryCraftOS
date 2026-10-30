@@ -522,7 +522,7 @@ uint32_t nt_duplicate_object(Process& p, const SyscallRequest& r) {
       p.close_descriptor(uint64_t(slot_for_process));
       return kAccessViolation;
     }
-    p.files().set_handle_flags(uint64_t(slot_for_process), (attributes & 2) != 0, false);
+    p.files().set_handle_flags(uint64_t(slot_for_process), (options & 4) ? false : (attributes & 2) != 0, false);      // (the pseudo handle has no attributes to keep)
     return kSuccess;
   }
   uint64_t slot = 0;
@@ -538,6 +538,13 @@ uint32_t nt_duplicate_object(Process& p, const SyscallRequest& r) {
       };
       if (map_file_access(uint32_t(desired_access)) & ~map_file_access(opened->granted_access)) return 0xC0000022u;      // STATUS_ACCESS_DENIED
     }
+  }
+  if ((options & 1) && !p.files().protected_from_close(slot)) {      // DUPLICATE_CLOSE_SOURCE into this very process: the source goes first, so the handle keeps its number
+    if (target_at != 0 && !p.write_user_u64(target_at, r.args[1])) return kAccessViolation;
+    const uint32_t original = p.files().denied_access(slot);
+    p.files().set_denied_access(slot, (options & 2) ? original : (original | ~uint32_t(desired_access)));
+    p.files().set_handle_flags(slot, (options & 4) ? p.files().inheritable(slot) : (attributes & 2) != 0, (options & 4) != 0 && p.files().protected_from_close(slot));
+    return kSuccess;
   }
   const int64_t copy = p.files().duplicate(slot, 0);
   if (copy < 0) return kNoResources;
@@ -555,8 +562,8 @@ uint32_t nt_duplicate_object(Process& p, const SyscallRequest& r) {
     p.files().set_denied_access(uint64_t(copy), (options & 2) ? original : (original | ~uint32_t(desired_access)));
   }
   const bool same = (options & 4) != 0;      // DUPLICATE_SAME_ATTRIBUTES; otherwise the handle is inheritable if the attributes say OBJ_INHERIT
-  p.files().set_handle_flags(uint64_t(copy), same ? p.files().inheritable(slot) : (attributes & 2) != 0, false);
-  if (options & 1) p.close_descriptor(slot);      // DUPLICATE_CLOSE_SOURCE
+  p.files().set_handle_flags(uint64_t(copy), same ? p.files().inheritable(slot) : (attributes & 2) != 0, same && p.files().protected_from_close(slot));
+  if ((options & 1) && !p.files().protected_from_close(slot)) p.close_descriptor(slot);      // DUPLICATE_CLOSE_SOURCE (a handle that cannot be closed stays)
   return kSuccess;
 }
 

@@ -5795,7 +5795,9 @@ bool run_wine_test_program(allocators::IAllocator& allocator) {
     const bool is_test = underscore != StringView::npos && underscore > 0 && test_name.size() > 4 && test_name.substr(test_name.size() - 4) == StringView(".exe");
     if (is_test) files.create_directory("/Windows/Windows/Tests");
     // (explorer.exe stands for the shell program some tests load as a library from C:\Windows)
-    extra.assign(is_test ? "/Windows/Windows/Tests/" : (test_name == StringView("explorer.exe") || test_name == StringView("regedit.exe")) ? "/Windows/Windows/" : "/Windows/Windows/System32/");
+    // (iexplore.exe is the web browser the process tests start from its place in Program Files)
+    if (test_name == StringView("iexplore.exe")) files.create_directory("/Windows/Program Files/Internet Explorer");
+    extra.assign(is_test ? "/Windows/Windows/Tests/" : test_name == StringView("iexplore.exe") ? "/Windows/Program Files/Internet Explorer/" : (test_name == StringView("explorer.exe") || test_name == StringView("regedit.exe")) ? "/Windows/Windows/" : "/Windows/Windows/System32/");
     extra.append(test_name);
     if (files.open_file(extra.view(), filesystem::OpenMode::CreateTruncate, &f) == filesystem::Status::Ok) f->write(0, ConstByteView(tcos_wine_test_files[i].begin, static_cast<uint64_t>(tcos_wine_test_files[i].end - tcos_wine_test_files[i].begin)), &n);
     f.reset();

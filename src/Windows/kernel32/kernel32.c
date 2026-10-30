@@ -66,6 +66,8 @@ static BOOL console_write_hook(HANDLE h, LPCVOID buffer, DWORD length, LPDWORD w
 static BOOL console_read_hook(HANDLE h, LPVOID buffer, DWORD length, LPDWORD read, BOOL *handled);
 static BOOL con_input_ready(void);
 static BOOL con_is_input(HANDLE h);
+static void con_alias_add(HANDLE h, BOOL input);
+static void con_alias_forget(HANDLE h);
 static BOOL pipe_nt_name(LPCWSTR name, WCHAR *buffer, UNICODE_STRING *us, OBJECT_ATTRIBUTES *attributes, BOOL inherit);
 static BOOL mailslot_nt_name(LPCWSTR name, WCHAR *buffer, UNICODE_STRING *us, OBJECT_ATTRIBUTES *attributes, BOOL inherit);
 EXPORT HANDLE WINAPI CreateFileW(LPCWSTR path, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD disposition, DWORD flags, HANDLE template_file);
@@ -308,7 +310,6 @@ EXPORT BOOL WINAPI GetExitCodeProcess(HANDLE h, LPDWORD code) {
   *code = (DWORD)info[0];
   return TRUE;
 }
-EXPORT BOOL WINAPI IsWow64Process(HANDLE h, LPBOOL wow) { (void)h; *wow = FALSE; return TRUE; }
 EXPORT BOOL WINAPI IsDebuggerPresent(void) { return NtCurrentPeb()->BeingDebugged != 0; }
 EXPORT BOOL WINAPI CheckRemoteDebuggerPresent(HANDLE h, LPBOOL present) {
   if (!h || !present) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
@@ -539,20 +540,25 @@ EXPORT DWORD WINAPI ExpandEnvironmentStringsA(LPCSTR source, LPSTR dest, DWORD c
   return needed;
 }
 
-/* The startup information the process was created with: the fields of the process parameters (the strings are the ones in the parameters). */
+/* The startup information the process was created with: the fields of the process parameters (the strings are the ones in the parameters). The standard handles are in it
+   only if the process was started with STARTF_USESTDHANDLES: the wide version leaves them as they are, the ANSI one sets them to INVALID_HANDLE_VALUE. */
 EXPORT void WINAPI GetStartupInfoW(LPSTARTUPINFOW info) {
   const RTL_USER_PROCESS_PARAMETERS *pp = parameters();
-  memset(info, 0, sizeof(*info));
   info->cb = sizeof(*info);
+  info->lpReserved = NULL;
   info->lpDesktop = pp->DesktopInfo.Buffer;
   info->lpTitle = pp->WindowTitle.Buffer;
   info->dwX = pp->StartingX; info->dwY = pp->StartingY; info->dwXSize = pp->CountX; info->dwYSize = pp->CountY;
   info->dwXCountChars = pp->CountCharsX; info->dwYCountChars = pp->CountCharsY; info->dwFillAttribute = pp->FillAttribute;
   info->dwFlags = pp->WindowFlags;
   info->wShowWindow = (WORD)pp->ShowWindowFlags;
-  info->hStdInput = pp->StandardInput;
-  info->hStdOutput = pp->StandardOutput;
-  info->hStdError = pp->StandardError;
+  info->cbReserved2 = 0;
+  info->lpReserved2 = NULL;
+  if (pp->WindowFlags & 0x100) {
+    info->hStdInput = pp->StandardInput;
+    info->hStdOutput = pp->StandardOutput;
+    info->hStdError = pp->StandardError;
+  }
 }
 /* The same with ANSI strings, converted once and kept. */
 EXPORT void WINAPI GetStartupInfoA(LPSTARTUPINFOA info) {
@@ -567,7 +573,8 @@ EXPORT void WINAPI GetStartupInfoA(LPSTARTUPINFOA info) {
   info->dwX = wide.dwX; info->dwY = wide.dwY; info->dwXSize = wide.dwXSize; info->dwYSize = wide.dwYSize;
   info->dwXCountChars = wide.dwXCountChars; info->dwYCountChars = wide.dwYCountChars; info->dwFillAttribute = wide.dwFillAttribute;
   info->dwFlags = wide.dwFlags; info->wShowWindow = wide.wShowWindow;
-  info->hStdInput = pp->StandardInput; info->hStdOutput = pp->StandardOutput; info->hStdError = pp->StandardError;
+  if (pp->WindowFlags & 0x100) { info->hStdInput = pp->StandardInput; info->hStdOutput = pp->StandardOutput; info->hStdError = pp->StandardError; }
+  else info->hStdInput = info->hStdOutput = info->hStdError = INVALID_HANDLE_VALUE;
 }
 
 EXPORT DWORD WINAPI GetVersion(void) { return (19045u << 16) | (0u << 8) | 10u; }
@@ -2023,16 +2030,10 @@ static BOOL dos_path_to_native(const WCHAR *dos, WCHAR *out, DWORD capacity) {
 EXPORT BOOL WINAPI QueryFullProcessImageNameW(HANDLE h, DWORD flags, LPWSTR name, PDWORD size) {
   if (flags > 1) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }      /* (PROCESS_NAME_NATIVE is the only flag) */
   BYTE info[16 + 2 * (MAX_PATH * 2 + 1)];
-  const NTSTATUS status = NtQueryInformationProcess(h, 27, info, sizeof(info), NULL);
+  const NTSTATUS status = NtQueryInformationProcess(h, (flags & 1) ? 27 : 43 /* ProcessImageFileName, ProcessImageFileNameWin32 */, info, sizeof(info), NULL);
   if (!NT_SUCCESS(status)) return fail_nt(status);
-  WCHAR native[PATH_CHARS];
   const WCHAR *text = (const WCHAR *)(ULONG_PTR)get64(info + 8);
-  DWORD n = get16(info) / 2;
-  if (flags & 1) {
-    if (!dos_path_to_native(text, native, PATH_CHARS)) { set_error(31); return FALSE; }
-    text = native;
-    n = (DWORD)wcslen(native);
-  }
+  const DWORD n = get16(info) / 2;
   if (!name) { set_error(*size == 0 ? ERROR_INSUFFICIENT_BUFFER : ERROR_INVALID_PARAMETER); return FALSE; }
   if (n + 1 > *size) { set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
   memcpy(name, text, n * 2);
@@ -2195,6 +2196,14 @@ static void unicode_string(UNICODE_STRING *s, LPCWSTR text) {
   s->Buffer = (PWSTR)text;
 }
 
+typedef struct ProcThreadAttributeEntry { DWORD_PTR attribute; SIZE_T size; PVOID value; } ProcThreadAttributeEntry;
+typedef struct ProcThreadAttributeList { DWORD flags; DWORD capacity; DWORD count; DWORD reserved; PVOID unknown; ProcThreadAttributeEntry entries[1]; } ProcThreadAttributeList;
+/* The value of an attribute of a list, or NULL. */
+static const ProcThreadAttributeEntry *attribute_of(const ProcThreadAttributeList *list, DWORD_PTR attribute) {
+  for (DWORD i = 0; list && i < list->count && i < list->capacity; ++i) if (list->entries[i].attribute == attribute) return &list->entries[i];
+  return NULL;
+}
+
 /* The console a new process belongs to: none for DETACHED_PROCESS, a console of its own for CREATE_NEW_CONSOLE, otherwise the one of this process. */
 static void con_note_child(DWORD pid, HANDLE console);
 static HANDLE console_for_new_process(DWORD flags) {
@@ -2245,15 +2254,23 @@ EXPORT BOOL WINAPI CreateProcessW(LPCWSTR application, LPWSTR command_line, LPSE
   const BOOL debug_start = (flags & (0x1 | 0x2) /* DEBUG_PROCESS | DEBUG_ONLY_THIS_PROCESS */) != 0;
   if (debug_start && !NT_SUCCESS(DbgUiConnectToDbg())) { set_error(ERROR_ACCESS_DENIED); return FALSE; }
   ULONG nt_flags = ((flags & CREATE_SUSPENDED) || debug_start ? 1 : 0) | (inherit_handles ? 2 : 0) | ((flags & 0x01000000 /* CREATE_BREAKAWAY_FROM_JOB */) ? 8 : 0);
-  HANDLE std_in = NULL, std_out = NULL, std_err = NULL;
+  /* the standard handles of the child: the ones of the startup information, none for a program without a console, or those of this program (the kernel decides which of them the
+     child can have, by what it inherits) */
+  HANDLE std_in, std_out, std_err;
+  nt_flags |= 0x10;
   if (startup && (startup->dwFlags & 0x100)) {
     nt_flags |= 4;
     std_in = startup->hStdInput;
     std_out = startup->hStdOutput;
     std_err = startup->hStdError;
+  } else {
+    std_in = parameters()->StandardInput;
+    std_out = parameters()->StandardOutput;
+    std_err = parameters()->StandardError;
   }
-  /* the startup block of the kernel: size, STARTF_ flags, position, size, characters, fill, show, console flags, reserved; the console; the title and the desktop */
-  struct { ULONG words[12]; HANDLE console; PUNICODE_STRING title, desktop; } block;
+  /* the startup block of the kernel: size, STARTF_ flags, position, size, characters, fill, show, console flags, reserved; the console; the title and the desktop; the process
+     that stands in for the parent (an attribute) and the handles that are inherited (an attribute) */
+  struct { ULONG words[12]; HANDLE console; PUNICODE_STRING title, desktop; HANDLE parent; HANDLE *inherit_list; ULONG inherit_count, reserved; } block;
   UNICODE_STRING title_string, desktop_string;
   memset(&block, 0, sizeof(block));
   block.words[0] = sizeof(block);
@@ -2265,6 +2282,16 @@ EXPORT BOOL WINAPI CreateProcessW(LPCWSTR application, LPWSTR command_line, LPSE
   }
   if (!block.title) { unicode_string(&title_string, image); block.title = &title_string; }      /* (a program without a title has its own path as the title) */
   block.console = console_for_new_process(flags);
+  if ((flags & 0x80000 /* EXTENDED_STARTUPINFO_PRESENT */) && startup && startup->cb >= sizeof(STARTUPINFOW) + sizeof(PVOID)) {
+    const ProcThreadAttributeList *attributes = *(ProcThreadAttributeList *const *)((const BYTE *)startup + sizeof(STARTUPINFOW));
+    if (attributes) {
+      const ProcThreadAttributeEntry *entry = attribute_of(attributes, 0x00020000);      /* PARENT_PROCESS */
+      if (entry) { block.parent = *(HANDLE *)entry->value; nt_flags |= 0x40; }
+      entry = attribute_of(attributes, 0x00020002);      /* HANDLE_LIST */
+      if (entry) { block.inherit_list = entry->value; block.inherit_count = (ULONG)(entry->size / sizeof(HANDLE)); nt_flags |= 0x80; }
+      if (attribute_of(attributes, 0x00020016)) nt_flags |= 0x20;      /* PSEUDOCONSOLE */
+    }
+  }
   const NTSTATUS status = NtCreateUserProcess(&process, &thread, &image_name, &command, cwd_pointer, environment ? environment : GetEnvironmentStringsW(), nt_flags, &process_id,
                                               &thread_id, std_in, std_out, std_err, &block);
   if (!NT_SUCCESS(status)) {
@@ -2295,14 +2322,16 @@ EXPORT BOOL WINAPI CreateProcessA(LPCSTR application, LPSTR command_line, LPSECU
                                   BOOL inherit_handles, DWORD flags, LPVOID environment, LPCSTR directory, LPSTARTUPINFOA startup, LPPROCESS_INFORMATION information) {
   WCHAR *wide_application = application ? to_wide(application) : NULL, *wide_command = command_line ? to_wide(command_line) : NULL, *wide_directory = directory ? to_wide(directory) : NULL;
   WCHAR *wide_environment = NULL, *wide_title = NULL, *wide_desktop = NULL;
-  STARTUPINFOW wide_startup;
+  struct { STARTUPINFOW info; LPVOID attributes; } wide_startup;      /* (STARTUPINFOEXW) */
   BOOL ok = FALSE;
   if (startup) {      /* the startup information with wide strings */
-    memcpy(&wide_startup, startup, sizeof(wide_startup));
+    memset(&wide_startup, 0, sizeof(wide_startup));
+    memcpy(&wide_startup.info, startup, sizeof(wide_startup.info));
+    if (startup->cb >= sizeof(wide_startup)) wide_startup.attributes = ((struct { STARTUPINFOA info; LPVOID attributes; } *)startup)->attributes;
     wide_title = startup->lpTitle ? to_wide(startup->lpTitle) : NULL;
     wide_desktop = startup->lpDesktop ? to_wide(startup->lpDesktop) : NULL;
-    wide_startup.lpTitle = wide_title;
-    wide_startup.lpDesktop = wide_desktop;
+    wide_startup.info.lpTitle = wide_title;
+    wide_startup.info.lpDesktop = wide_desktop;
   }
   if ((application && !wide_application) || (command_line && !wide_command) || (directory && !wide_directory)) goto done;
   if (environment) {      /* "NAME=value\0...\0\0" in the ANSI code page: converted as a whole */
@@ -2315,7 +2344,7 @@ EXPORT BOOL WINAPI CreateProcessA(LPCSTR application, LPSTR command_line, LPSECU
     if (!wide_environment) { set_error(ERROR_NOT_ENOUGH_MEMORY); goto done; }
     MultiByteToWideChar(CP_UTF8, 0, e, (int)n, wide_environment, units);
   }
-  ok = CreateProcessW(wide_application, wide_command, process_attributes, thread_attributes, inherit_handles, flags | CREATE_UNICODE_ENVIRONMENT, wide_environment, wide_directory, startup ? &wide_startup : NULL, information);
+  ok = CreateProcessW(wide_application, wide_command, process_attributes, thread_attributes, inherit_handles, flags | CREATE_UNICODE_ENVIRONMENT, wide_environment, wide_directory, startup ? &wide_startup.info : NULL, information);
 done:
   free_wide(wide_application);
   free_wide(wide_command);
@@ -2350,6 +2379,7 @@ EXPORT BOOL WINAPI CloseHandle(HANDLE h) {
   if ((ULONG_PTR)h == 0x4B4F54) return TRUE;      /* (advapi32's token "handle": there is nothing behind it) */
   port_unlink(h);
   overlapped_forget(h);
+  con_alias_forget(h);
   const NTSTATUS status = NtClose(h);
   return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
@@ -3263,8 +3293,14 @@ EXPORT HANDLE WINAPI CreateFileW(LPCWSTR path, DWORD access, DWORD share, LPSECU
   (void)template_file;
   if (!path || !path[0]) { set_error(ERROR_PATH_NOT_FOUND); return INVALID_HANDLE_VALUE; }
   /* The console by its device names. */
-  if (equals_ignore_case(path, (const WCHAR *)L"CONOUT$")) return GetStdHandle(STD_OUTPUT_HANDLE);
-  if (equals_ignore_case(path, (const WCHAR *)L"CONIN$")) return GetStdHandle(STD_INPUT_HANDLE);
+  if (equals_ignore_case(path, (const WCHAR *)L"CONOUT$") || equals_ignore_case(path, (const WCHAR *)L"CONIN$")) {      /* another handle to the console (descriptors 0 and 1 are it) */
+    const BOOL input = equals_ignore_case(path, (const WCHAR *)L"CONIN$");
+    HANDLE copy = NULL;
+    const NTSTATUS made = NtDuplicateObject(NtCurrentProcess(), (HANDLE)(ULONG_PTR)(input ? 4 : 8), NtCurrentProcess(), &copy, 0, (sa && sa->bInheritHandle) ? 2 : 0, 2 /* DUPLICATE_SAME_ACCESS */);
+    if (!NT_SUCCESS(made)) { fail_nt(made); return INVALID_HANDLE_VALUE; }
+    con_alias_add(copy, input);
+    return copy;
+  }
   WCHAR buffer[PATH_CHARS + 8];
   UNICODE_STRING name;
   OBJECT_ATTRIBUTES attributes;
@@ -3764,7 +3800,7 @@ EXPORT UINT WINAPI GetTempFileNameA(LPCSTR dir, LPCSTR prefix, UINT unique, LPST
   return id;
 }
 EXPORT BOOL WINAPI DuplicateHandle(HANDLE sp, HANDLE source, HANDLE tp, HANDLE *target, DWORD access, BOOL inherit, DWORD options) {
-  const NTSTATUS status = NtDuplicateObject(sp, source, tp, target, access, inherit ? 2 /* OBJ_INHERIT */ : 0, options & 3);      /* DUPLICATE_CLOSE_SOURCE, DUPLICATE_SAME_ACCESS; within this process */
+  const NTSTATUS status = NtDuplicateObject(sp, source, tp, target, access, inherit ? 2 /* OBJ_INHERIT */ : 0, options & 7);      /* DUPLICATE_CLOSE_SOURCE, DUPLICATE_SAME_ACCESS, DUPLICATE_SAME_ATTRIBUTES */
   return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
 

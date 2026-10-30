@@ -288,6 +288,8 @@ uint32_t open_by_attributes(Process& p, uint64_t object_attributes, uint32_t acc
         if (!same) continue;
         const int64_t slot = files.open_device(n > 12 ? DescriptorKind::MountManager : DescriptorKind::Null);
         if (slot < 0) return kTooManyOpenedFiles;
+        uint8_t flag_bytes[4] = {};
+        if (p.read_user(object_attributes + 24, ByteView(flag_bytes, 4))) files.set_handle_flags(uint64_t(slot), (flag_bytes[0] & 2) != 0, false);      // OBJ_INHERIT
         *handle = (uint64_t(slot) + 1) * 4;
         *information = kFileOpened;
         return kSuccess;
@@ -639,7 +641,14 @@ uint32_t nt_query_information_file(Process& p, const SyscallRequest& r) {
   }
   if (kind == DescriptorKind::Pipe && static_cast<uint32_t>(info_class) == kFileNameInformation) {      // "\\name": where a pipe is
     String pipe_name(files.allocator()), windows_name(files.allocator());
-    if (!pipe_handle_name(p, slot, &pipe_name) || pipe_name.empty() || !windows_name.push_back('\\') || !windows_name.append(pipe_name.view())) return kInvalidParameter;
+    if (!pipe_handle_name(p, slot, &pipe_name)) return kInvalidParameter;
+    if (pipe_name.empty()) {      // an anonymous pipe has a name too: "Win32Pipes.<process>.<number>"
+      static const char digits[] = "0123456789abcdef";
+      const uint32_t number = uint32_t(p.files().token(slot));
+      if (!pipe_name.assign("Win32Pipes.00000000.")) return kInvalidParameter;
+      for (int shift = 28; shift >= 0; shift -= 4) if (!pipe_name.push_back(digits[(number >> shift) & 15])) return kInvalidParameter;
+    }
+    if (!windows_name.push_back('\\') || !windows_name.append(pipe_name.view())) return kInvalidParameter;
     uint8_t name[2 * (kMaxPath + 1)];
     const uint64_t bytes = to_utf16(windows_name.view(), name, sizeof(name));
     const uint64_t length = r.args[3] & 0xFFFFFFFFu;

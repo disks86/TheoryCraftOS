@@ -244,6 +244,7 @@ ObjectManager::~ObjectManager() {
   if (shares_ && allocator_) allocator_->deallocate(shares_);
   if (times_ && allocator_) allocator_->deallocate(times_);
   if (links_ && allocator_) allocator_->deallocate(links_);
+  if (images_ && allocator_) allocator_->deallocate(images_);
   if (sections_) {
     for (uint32_t i = 0; i < kMaxSections; ++i) if (sections_[i].storage && allocator_) allocator_->deallocate(sections_[i].storage);
     if (allocator_) allocator_->deallocate(sections_);
@@ -689,6 +690,42 @@ uint32_t ObjectManager::share_owners(StringView path, const void** owners, uint3
     ++count;
   }
   return count;
+}
+
+struct ObjectManager::ImageEntry {
+  uint64_t pid = 0;
+  uint32_t size = 0;
+  char path[520] = {};
+};
+constexpr uint32_t kMaxImages = 128;
+
+void ObjectManager::process_image_note(uint64_t pid, StringView path) {
+  Locked hold(sync_);
+  if (!allocator_ || path.size() >= sizeof(ImageEntry::path)) return;
+  if (!images_) {
+    void* memory = allocator_->allocate(sizeof(ImageEntry) * kMaxImages);
+    if (!memory) return;
+    images_ = static_cast<ImageEntry*>(memory);
+    for (uint32_t i = 0; i < kMaxImages; ++i) new (&images_[i]) ImageEntry();
+  }
+  ImageEntry* slot = nullptr;
+  for (uint32_t i = 0; i < kMaxImages && !slot; ++i) if (images_[i].pid == pid) slot = &images_[i];
+  if (!slot) { slot = &images_[image_next_]; image_next_ = (image_next_ + 1) % kMaxImages; }      // (the oldest is replaced)
+  slot->pid = pid;
+  for (uint64_t k = 0; k < path.size(); ++k) slot->path[k] = path[k];
+  slot->size = static_cast<uint32_t>(path.size());
+}
+
+uint32_t ObjectManager::process_image_get(uint64_t pid, char* out, uint32_t capacity) {
+  Locked hold(sync_);
+  if (!images_) return 0;
+  for (uint32_t i = 0; i < kMaxImages; ++i) {
+    const ImageEntry& e = images_[i];
+    if (e.pid != pid || e.size == 0 || e.size > capacity) continue;
+    for (uint32_t k = 0; k < e.size; ++k) out[k] = e.path[k];
+    return e.size;
+  }
+  return 0;
 }
 
 struct ObjectManager::LinkEntry {

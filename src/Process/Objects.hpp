@@ -191,6 +191,10 @@ class ObjectManager {
   uint32_t link_text(StringView link_path, char* out, uint32_t capacity);      // the target text, 0 if none is known
   void link_forget(StringView link_path);
 
+  // --- the file a process was started from (its Win32 path), kept by process id while it runs and for a while after: what NtQueryInformationProcess answers about another process.
+  void process_image_note(uint64_t pid, StringView path);
+  uint32_t process_image_get(uint64_t pid, char* out, uint32_t capacity);      // the length of the path, 0 if none is known (or it does not fit)
+
   // --- job objects (kind Job: create() and open() make and find them). A job groups processes: its limits (active process count, kill on close, breakaway) are enforced and
   // its members can be ended together. A process belongs to at most one job; the processes it starts join the same job. Members are ended by a flag that they see themselves
   // at their next system call or timer tick (job_kill_for(), which takes no lock). All these take the lock themselves.
@@ -350,6 +354,9 @@ class ObjectManager {
   TimesEntry* times_ = nullptr;      // kMaxTimes of them, made with the first
   struct LinkEntry;
   LinkEntry* links_ = nullptr;      // kMaxLinkTexts of them, made with the first
+  struct ImageEntry;
+  ImageEntry* images_ = nullptr;     // kMaxImages of them, made with the first
+  uint32_t image_next_ = 0;
   Section* sections_ = nullptr;      // kMaxSections, made with the first section
   Job* jobs_ = nullptr;              // kJobMaxJobs, made with the first job (never moved: job_kill_for() reads it without the lock)
   uint32_t pending_kills_ = 0;       // members flagged to end that have not ended yet (atomic)

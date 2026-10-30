@@ -94,8 +94,14 @@ struct ChildSpec {
   ArrayView<const StringView> environment;      // "NAME=value" each
   bool suspended = false;                // it does not run until resume_process()
   bool inherit_handles = false;          // the child gets the parent's inheritable handles, at the same numbers
-  bool use_std_handles = false;          // the child's standard input, output and error are these handles of the parent (which are inherited too)
+  bool use_std_handles = false;          // the child's standard input, output and error are these values (0: none, ~0: invalid; handles of the parent are inherited with the rest)
   uint64_t std_handles[3] = {};
+  bool console_std[3] = {};              // the child's own console for this standard device is made inheritable (a pseudo console stands in for what it cannot have)
+  static constexpr uint32_t kMaxInheritList = 64;
+  bool restrict_inherit = false;         // only the handles in inherit_list (descriptor numbers) are inherited (PROC_THREAD_ATTRIBUTE_HANDLE_LIST)
+  uint32_t inherit_list_count = 0;
+  uint64_t inherit_list[kMaxInheritList] = {};
+  bool copy_std[3] = {};                 // the parent's handle for this standard device is duplicated into the child at the same number (with its flags), inheriting or not
   StartupSpec startup;                   // the STARTUPINFO of the parent and the console of the child
 };
 
@@ -128,6 +134,8 @@ class IProcessRuntime {
   virtual void request_terminate(uint64_t id, uint32_t code) { (void)id; (void)code; }
   // Other processes (CreateProcess). The new process shares the console of this one. spawn_process returns an NTSTATUS (0xC0000002: not supported here).
   virtual uint64_t allocate_process_id() { return 0; }
+  // The same with the program `parent_pid` standing in for the parent (PROC_THREAD_ATTRIBUTE_PARENT_PROCESS): the child inherits from it and is its child.
+  virtual uint32_t spawn_process_for(uint64_t parent_pid, const ChildSpec& spec) { (void)parent_pid; return spawn_process(spec); }
   virtual uint32_t spawn_process(const ChildSpec& spec) { (void)spec; return 0xC0000002u; }
   virtual bool terminate_process(uint64_t pid, uint32_t code) { (void)pid; (void)code; return false; }
   virtual bool resume_process(uint64_t pid) { (void)pid; return false; }

@@ -947,19 +947,25 @@ uint32_t Task::spawn_process(const process::ChildSpec& spec) {
     discard();
     return loaded == process::LoadStatus::OutOfMemory ? kNoMemory : kInvalidImage;
   }
+  auto count_use = [](process::DescriptorKind kind, uint64_t token) {      // the child's table holds one more use of what the parent's does
+    if (process::ObjectManager* objects = process::system_objects()) {
+      if (kind == process::DescriptorKind::Pipe) process::windowsabi::pipe_token_add(token);
+    else if (kind == process::DescriptorKind::Socket) process::windowsabi::socket_token_add(token);
+      else if (kind == process::DescriptorKind::Mailslot) process::windowsabi::mailslot_token_add(token);
+      else if (kind == process::DescriptorKind::Key) process::windowsabi::key_token_add(token);
+      else if (kind == process::DescriptorKind::Event || kind == process::DescriptorKind::Mutex || kind == process::DescriptorKind::Semaphore || kind == process::DescriptorKind::Process || kind == process::DescriptorKind::Timer || kind == process::DescriptorKind::Section || kind == process::DescriptorKind::Job || kind == process::DescriptorKind::ChangeNotification || kind == process::DescriptorKind::DebugObject) objects->add_ref(uint32_t(token));
+    }
+  };
   if (spec.inherit_handles) {
-    auto count_use = [](process::DescriptorKind kind, uint64_t token) {      // the child's table holds one more use of what the parent's does
-      if (process::ObjectManager* objects = process::system_objects()) {
-        if (kind == process::DescriptorKind::Pipe) process::windowsabi::pipe_token_add(token);
-      else if (kind == process::DescriptorKind::Socket) process::windowsabi::socket_token_add(token);
-        else if (kind == process::DescriptorKind::Mailslot) process::windowsabi::mailslot_token_add(token);
-        else if (kind == process::DescriptorKind::Key) process::windowsabi::key_token_add(token);
-        else if (kind == process::DescriptorKind::Event || kind == process::DescriptorKind::Mutex || kind == process::DescriptorKind::Semaphore || kind == process::DescriptorKind::Process || kind == process::DescriptorKind::Timer || kind == process::DescriptorKind::Section || kind == process::DescriptorKind::Job || kind == process::DescriptorKind::ChangeNotification || kind == process::DescriptorKind::DebugObject) objects->add_ref(uint32_t(token));
-      }
-    };
-    p.process()->files().inherit_from(program.process()->files(), count_use);
+    p.process()->files().inherit_from(program.process()->files(), count_use, spec.inherit_list, spec.inherit_list_count, spec.restrict_inherit);
+  }
+  for (uint32_t i = 0; i < 3; ++i) {      // the standard handles that are copied into the child (a console child whose parent did not let it inherit)
+    if (!spec.copy_std[i] || spec.std_handles[i] == 0 || spec.std_handles[i] % 4 != 0) continue;
+    const uint64_t slot = spec.std_handles[i] / 4 - 1;
+    if (slot < process::ProcessFiles::kMaxDescriptors) p.process()->files().adopt_from(program.process()->files(), slot, count_use);
   }
   if (spec.use_std_handles) p.set_standard_handles(spec.std_handles);
+  for (uint32_t i = 0; i < 3; ++i) if (spec.console_std[i]) p.process()->files().set_handle_flags(i, true, false);      // (a pseudo console's handles can be inherited)
   if (p.process()) p.process()->set_parent_id(program.process()->id());
   child->task = usermode::spawn(p, allocator_, "program", spec.suspended);
   if (!child->task) { discard(); return kNoResources; }
@@ -1016,6 +1022,27 @@ static bool with_child(Task& self, uint64_t pid, Action action) {
   }
   self.mutex.lock();
   return found && result;
+}
+
+uint32_t Task::spawn_process_for(uint64_t parent_pid, const process::ChildSpec& spec) {
+  if (parent_pid == program.process()->id()) return spawn_process(spec);
+  Task* target = nullptr;
+  mutex.unlock();      // (another program's lock is taken, and no lock of this one may be held meanwhile: see remote_operation)
+  g_tasks_mutex.lock();
+  for (Task* t = g_tasks; t; t = t->all_next) {
+    if (t == this || !t->program.loaded() || t->program.process()->id() != parent_pid || t->program.process()->exited()) continue;
+    t->mutex.lock();      // (the registry's lock is let go of first: starting the program takes it again)
+    target = t;
+    break;
+  }
+  g_tasks_mutex.unlock();
+  uint32_t status = 0xC000000Bu;      // STATUS_INVALID_CID
+  if (target) {
+    status = target->spawn_process(spec);
+    target->mutex.unlock();
+  }
+  mutex.lock();
+  return status;
 }
 
 bool Task::terminate_process(uint64_t pid, uint32_t code) {
@@ -1155,7 +1182,7 @@ uint32_t process_snapshot(ProcessInfo* out, uint32_t capacity) {
   uint32_t n = 0;
   ScopedMutex registry(g_tasks_mutex);
   for (Task* task = g_tasks; task && n < capacity; task = task->all_next) {
-    if (!task->program.loaded()) continue;
+    if (!task->program.loaded() || task->program.process()->exited()) continue;      // (one that has ended is gone from the list, whatever still holds its record)
     ProcessInfo& info = out[n++];
     info = ProcessInfo();
     info.id = task->program.process()->id();

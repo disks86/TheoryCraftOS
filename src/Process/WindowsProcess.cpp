@@ -21,6 +21,7 @@
 #include "Process/WindowsFiles.hpp"
 #include "Process/WindowsDebug.hpp"
 #include "Utility/ByteBuffer.hpp"
+#include "Utility/ByteStream.hpp"
 #include "Utility/Utf16.hpp"
 
 namespace process::windowsabi {
@@ -31,7 +32,7 @@ constexpr uint32_t kSuccess = 0, kNotImplemented = 0xC0000002u, kAccessViolation
                    kNoMemory = 0xC0000017u, kObjectNameNotFound = 0xC0000034u, kInvalidImageFormat = 0xC000007Bu, kNoResources = 0xC000009Au,
                    kNameTooLong = 0xC0000106u;
 constexpr uint64_t kMaxImageBytes = 64ull << 20, kMaxEnvironmentBytes = 64 * 1024, kMaxStringBytes = 2 * 8192;
-constexpr uint32_t kMaxEnvironmentEntries = 512, kCreateSuspended = 1, kInheritHandles = 2, kUseStdHandles = 4, kBreakawayFromJob = 8;
+constexpr uint32_t kMaxEnvironmentEntries = 512, kCreateSuspended = 1, kInheritHandles = 2, kUseStdHandles = 4, kBreakawayFromJob = 8, kExplicitStdHandles = 0x10, kPseudoConsole = 0x20, kHasParent = 0x40, kHasHandleList = 0x80;
 
 bool slot_of(uint64_t handle, uint64_t* slot) {
   if (handle == 0 || handle % 4 != 0 || handle / 4 > Process::kMaxDescriptors) return false;
@@ -118,6 +119,17 @@ bool read_program_file(Process& p, StringView path, ByteBuffer* out, uint32_t* s
   }
   p.files().close(slot);
   return ok;
+}
+
+// The subsystem field of a PE image's optional header (2: window program, 3: console program), 0 if the file is too short.
+static uint32_t pe_subsystem(ConstByteView image) {
+  ByteReader r(image);
+  r.seek(0x3C);
+  const uint32_t header = r.le32();
+  if (!r.ok() || header > image.size()) return 0;
+  r.seek(uint64_t{header} + 24 + 68);
+  const uint16_t subsystem = r.le16();
+  return r.ok() ? subsystem : 0;
 }
 
 namespace {
@@ -215,10 +227,13 @@ uint32_t nt_create_user_process(Process& p, const SyscallRequest& r) {
   // The startup block: ULONG size, flags, x, y, xsize, ysize, xchars, ychars, fill, show, console flags, reserved; HANDLE console; PUNICODE_STRING title, desktop.
   String startup_title(allocator), startup_desktop(allocator);
   uint32_t startup_words[12] = {};
-  uint64_t startup_console = 0;
+  uint64_t startup_console = 0, parent_handle = 0, list_at = 0;
+  uint32_t list_count = 0;
   if (startup_at != 0) {
-    uint8_t block[48 + 24];
+    uint8_t block[48 + 24 + 24];
     if (!p.read_user(startup_at, ByteView(block, sizeof(block)))) return kAccessViolation;
+    for (uint32_t i = 0; i < 8; ++i) { parent_handle |= uint64_t{block[72 + i]} << (8 * i); list_at |= uint64_t{block[80 + i]} << (8 * i); }
+    list_count = block[88] | (uint32_t{block[89]} << 8) | (uint32_t{block[90]} << 16) | (uint32_t{block[91]} << 24);
     for (uint32_t i = 0; i < 12; ++i) startup_words[i] = block[4 * i] | (uint32_t{block[4 * i + 1]} << 8) | (uint32_t{block[4 * i + 2]} << 16) | (uint32_t{block[4 * i + 3]} << 24);
     uint64_t pointers[3] = {};
     for (uint32_t k = 0; k < 3; ++k) for (uint32_t i = 0; i < 8; ++i) pointers[k] |= uint64_t{block[48 + 8 * k + i]} << (8 * i);
@@ -243,24 +258,73 @@ uint32_t nt_create_user_process(Process& p, const SyscallRequest& r) {
   const bool debug_child = debug_wants_child(p.id());      // (a debugged program's child is attached before it runs)
   spec.suspended = (flags_arg & kCreateSuspended) != 0 || debug_child;
   spec.inherit_handles = (flags_arg & kInheritHandles) != 0;
-  spec.use_std_handles = (flags_arg & kUseStdHandles) != 0;
-  if (spec.use_std_handles) {
-    for (uint32_t i = 0; i < 3; ++i) {
-      uint64_t slot = 0;
-      if (!slot_of(std_handles[i], &slot) || p.files().kind(slot) == DescriptorKind::Closed) {
-        if (std_handles[i] == 0 || std_handles[i] == ~uint64_t{0}) { spec.std_handles[i] = std_handles[i]; continue; }      // none
-        return kInvalidHandle;
-      }
-      if (slot > 2 && (!spec.inherit_handles || !p.files().inheritable(slot))) return kInvalidHandle;      // (the child only has what it inherits)
-      spec.std_handles[i] = std_handles[i];
+  uint64_t parent_pid = p.id();
+  if (flags_arg & kHasParent) {      // PROC_THREAD_ATTRIBUTE_PARENT_PROCESS: a process that may have children made for it
+    bool exited = false;
+    uint32_t code = 0;
+    if (!names_own_process(p, parent_handle)) {
+      if (!process_handle_info(p, parent_handle, &exited, &code, &parent_pid)) return kInvalidHandle;
+      if (process_handle_lacks(p, parent_handle, 0x80)) return 0xC0000022u;      // no PROCESS_CREATE_PROCESS
+      if (exited) return 0xC000010Au;      // STATUS_PROCESS_IS_TERMINATING
     }
   }
+  if (flags_arg & kHasHandleList) {      // PROC_THREAD_ATTRIBUTE_HANDLE_LIST: the child inherits those handles only
+    if (!spec.inherit_handles || list_count == 0 || list_count > ChildSpec::kMaxInheritList) return kInvalidParameter;
+    spec.restrict_inherit = true;
+    for (uint32_t i = 0; i < list_count; ++i) {
+      uint64_t handle = 0, slot = 0;
+      if (!p.read_user_u64(list_at + 8 * uint64_t{i}, &handle)) return kAccessViolation;
+      if (!slot_of(handle, &slot) || p.files().kind(slot) == DescriptorKind::Closed || (parent_pid == p.id() && !p.files().inheritable(slot))) return kInvalidParameter;
+      spec.inherit_list[spec.inherit_list_count++] = slot;
+    }
+  }
+  if (flags_arg & kExplicitStdHandles) {
+    // The three values are what the child's process parameters get: the ones of the startup information (kUseStdHandles), or the parent's own. What the child can do with them
+    // depends on what it inherits: with nothing inherited, a console program still gets copies of the parent's standard handles, a window program gets none; handles that mean
+    // nothing in a child (a console for a window program, any when it has to do without) become 0. A value that names nothing in the parent is passed on as it is.
+    const bool use_startup = (flags_arg & kUseStdHandles) != 0, detached = startup_console == 0, inherit = spec.inherit_handles;
+    const bool window_program = pe_subsystem(image.view()) == 2;      // IMAGE_SUBSYSTEM_WINDOWS_GUI
+    spec.use_std_handles = true;
+    for (uint32_t i = 0; i < 3; ++i) {
+      uint64_t value = std_handles[i], slot = 0;
+      const bool known = slot_of(value, &slot) && p.files().kind(slot) != DescriptorKind::Closed;
+      const DescriptorKind kind = known ? p.files().kind(slot) : DescriptorKind::Closed;
+      const bool console = kind == DescriptorKind::ConsoleInput || kind == DescriptorKind::ConsoleOutput || kind == DescriptorKind::ConsoleError;
+      if (use_startup) {
+        if (!inherit || (window_program && console)) value = 0;
+      } else if (detached) {
+        value = 0;
+      } else if (!inherit) {
+        if (window_program || !known) value = 0; else spec.copy_std[i] = true;
+      } else if (window_program && console) {
+        value = 0;
+      }
+      if ((flags_arg & kPseudoConsole) && !window_program && !detached && (value == 0 || spec.copy_std[i])) {      // a pseudo console is the console of the child: its handles stand in
+        if (value == 0 || console) { value = (uint64_t{i} + 1) * 4; spec.copy_std[i] = false; spec.console_std[i] = true; }
+      }
+      spec.std_handles[i] = value;
+    }
+  } else {
+    spec.use_std_handles = (flags_arg & kUseStdHandles) != 0;
+    if (spec.use_std_handles) {
+      for (uint32_t i = 0; i < 3; ++i) {
+        uint64_t slot = 0;
+        if (!slot_of(std_handles[i], &slot) || p.files().kind(slot) == DescriptorKind::Closed) {
+          if (std_handles[i] == 0 || std_handles[i] == ~uint64_t{0}) { spec.std_handles[i] = std_handles[i]; continue; }      // none
+          return kInvalidHandle;
+        }
+        if (slot > 2 && (!spec.inherit_handles || !p.files().inheritable(slot))) return kInvalidHandle;      // (the child only has what it inherits)
+        spec.std_handles[i] = std_handles[i];
+      }
+    }
+  }
+  objects->process_image_note(spec.pid, image_path.view());
   const ObjectManager::Created created = objects->create_process(spec.pid);
   if (created.id == 0) return created.status;
   const uint32_t joined = objects->job_inherit(p.id(), spec.pid, (flags_arg & kBreakawayFromJob) != 0);      // the child belongs to the job of the one that starts it
   if (joined != kSuccess) { objects->release(created.id); return joined; }
   objects->add_ref(created.id);      // (one reference for each of the two handles)
-  status = runtime->spawn_process(spec);
+  status = parent_pid == p.id() ? runtime->spawn_process(spec) : runtime->spawn_process_for(parent_pid, spec);
   if (status != kSuccess) {
     objects->job_forget(spec.pid);
     objects->release(created.id);
@@ -347,6 +411,51 @@ void repriority_threads(Process& p) {
 
 namespace {
 
+// The UNICODE_STRING and its characters (UTF-16 bytes) in the caller's buffer.
+uint32_t write_image_name(Process& p, ConstByteView chars, uint64_t buffer, uint32_t length, uint64_t returned) {
+  const uint32_t need = uint32_t(16 + chars.size() + 2);
+  if (returned != 0 && !p.write_user_u32(returned, need)) return kAccessViolation;
+  if (length < need) return kInfoLengthMismatch;
+  uint8_t out[16] = {};
+  const uint64_t bytes = chars.size(), text_at = buffer + 16;
+  out[0] = uint8_t(bytes); out[1] = uint8_t(bytes >> 8);
+  out[2] = uint8_t(bytes + 2); out[3] = uint8_t((bytes + 2) >> 8);
+  for (uint32_t i = 0; i < 8; ++i) out[8 + i] = uint8_t(text_at >> (8 * i));
+  if (!p.write_user(buffer, ConstByteView(out, 16))) return kAccessViolation;
+  if (bytes != 0 && !p.write_user(text_at, chars)) return kAccessViolation;
+  const uint8_t terminator[2] = {};
+  return p.write_user(text_at + bytes, ConstByteView(terminator, 2)) ? kSuccess : kAccessViolation;
+}
+
+// ProcessImageFileName (the NT name, "\\Device\\HarddiskVolume1\\dir\\program.exe") and ProcessImageFileNameWin32 (the Win32 name): a UNICODE_STRING followed by its characters.
+// The path of this process is in its parameters, that of another one was noted when it was started.
+uint32_t image_file_name(Process& p, uint64_t buffer, uint32_t length, uint64_t returned, bool self, uint64_t pid, bool native) {
+  ByteBuffer chars(p.files().allocator());
+  if (self) {
+    uint64_t peb = 0, parameters = 0, image_length = 0, image_buffer = 0;
+    uint8_t name[16] = {};
+    p.read_user_u64(p.gs_base() + 0x60, &peb);
+    if (peb == 0 || !p.read_user_u64(peb + 0x20, &parameters) || !p.read_user(parameters + 0x60, ByteView(name, 16))) return kAccessViolation;
+    image_length = name[0] | (uint64_t{name[1]} << 8);
+    for (uint32_t i = 0; i < 8; ++i) image_buffer |= uint64_t{name[8 + i]} << (8 * i);
+    uint8_t text[2 * 520] = {};
+    if (image_length > sizeof(text) - 2 || !p.read_user(image_buffer, ByteView(text, image_length))) return kInfoLengthMismatch;
+    if (!chars.append(ConstByteView(text, image_length))) return kNoMemory;
+  } else {
+    char path[520];
+    ObjectManager* objects = system_objects();
+    const uint32_t size = objects ? objects->process_image_get(pid, path, sizeof(path)) : 0;
+    if (size == 0) return kInvalidInfoClass;
+    if (!util::append_utf16le(&chars, StringView(path, size))) return kNoMemory;
+  }
+  if (native && chars.size() >= 4 && chars.view()[1] == 0 && chars.view()[2] == ':') {      // "C:" is the volume's device
+    ByteBuffer device(p.files().allocator());
+    if (!util::append_utf16le(&device, "\\Device\\HarddiskVolume1") || !device.append(chars.view().subview(4, chars.size() - 4))) return kNoMemory;
+    return write_image_name(p, device.view(), buffer, length, returned);
+  }
+  return write_image_name(p, chars.view(), buffer, length, returned);
+}
+
 struct Buffer {
   uint8_t bytes[128] = {};
   void put(uint32_t at, uint64_t value, uint32_t size) { for (uint32_t i = 0; i < size; ++i) bytes[at + i] = uint8_t(value >> (8 * i)); }
@@ -369,6 +478,8 @@ uint32_t nt_query_information_process(Process& p, const SyscallRequest& r) {
   if (process_handle_lacks(p, r.args[0], 0x400 | 0x1000)) return 0xC0000022u;      // neither PROCESS_QUERY_INFORMATION nor PROCESS_QUERY_LIMITED_INFORMATION
   // The classes a handle with the limited right only may not ask for: the debugger's things and the cookie.
   if (process_handle_lacks(p, r.args[0], 0x400) && (info_class == 7 || info_class == 30 || info_class == 31 || info_class == 34 || info_class == 36)) return 0xC0000022u;
+  if (info_class == 27 || info_class == 43) return image_file_name(p, r.args[2], length, returned, self, child_pid, info_class == 27);
+  if (!self && child_exited && info_class == 37) return 0xC000010Au;      // STATUS_PROCESS_IS_TERMINATING
   if (!self && info_class == 7) {      // ProcessDebugPort of another program: -1 when a debugger is attached
     if (length < 8) return kInfoLengthMismatch;
     uint8_t port[8] = {};
@@ -378,12 +489,14 @@ uint32_t nt_query_information_process(Process& p, const SyscallRequest& r) {
     return kSuccess;
   }
   uint64_t remote_peb = 0;
+  uint32_t remote_priority = 0x20;      // NORMAL_PRIORITY_CLASS
   uint8_t remote_image[64] = {};
-  if (!self && !child_exited && p.runtime() && (info_class == 0 || info_class == 37)) {      // (another program's PEB and image are not ours to look into: it tells)
+  if (!self && p.runtime() && (info_class == 0 || info_class == 37 || info_class == 18)) {      // (another program's PEB and image are not ours to look into: it tells)
     IProcessRuntime::RemoteOp op;
     op.kind = IProcessRuntime::RemoteOp::ProcessInfo;
     if (p.runtime()->remote_operation(child_pid, op) == kSuccess) {
       remote_peb = op.address;
+      remote_priority = op.protect;
       for (uint32_t i = 0; i < 64; ++i) remote_image[i] = op.image[i];
     }
   }
@@ -404,6 +517,12 @@ uint32_t nt_query_information_process(Process& p, const SyscallRequest& r) {
     const uint8_t(&image)[64] = self ? p.image_information() : remote_image;
     for (uint32_t i = 0; i < 64; ++i) b.bytes[i] = image[i];
     size = 64;
+  } else if (info_class == 18 && !self) {      // ProcessPriorityClass of another program
+    b.put(1, nt_priority_class(remote_priority), 1);
+    size = 2;
+  } else if (info_class == 26 || info_class == 24) {      // ProcessWow64Information: not a 32-bit process; ProcessSessionInformation: session 1 (the one in the PEB)
+    if (info_class == 24) b.put(0, 1, 4);
+    size = info_class == 24 ? 4 : 8;
   } else if (!self) {
     return kInvalidInfoClass;
   } else {
@@ -440,27 +559,7 @@ uint32_t nt_query_information_process(Process& p, const SyscallRequest& r) {
         break;
       }
       case 21: b.put(0, runtime ? runtime->affinity(0) : 1, 8); size = 8; break;
-      case 24: size = 4; break;                                         // ProcessSessionInformation: session 0
       case 26: size = 8; break;                                         // ProcessWow64Information: not a 32-bit process
-      case 27: {      // ProcessImageFileName: a UNICODE_STRING followed by its characters (read from the process parameters)
-        uint64_t peb = 0, parameters = 0, image_length = 0, image_buffer = 0;
-        uint8_t name[16] = {};
-        p.read_user_u64(p.gs_base() + 0x60, &peb);
-        if (peb == 0 || !p.read_user_u64(peb + 0x20, &parameters) || !p.read_user(parameters + 0x60, ByteView(name, 16))) return kAccessViolation;
-        image_length = name[0] | (uint64_t{name[1]} << 8);
-        for (uint32_t i = 0; i < 8; ++i) image_buffer |= uint64_t{name[8 + i]} << (8 * i);
-        const uint32_t need = uint32_t(16 + image_length + 2);
-        if (returned != 0 && !p.write_user_u32(returned, need)) return kAccessViolation;
-        if (length < need) return kInfoLengthMismatch;
-        uint8_t text[2 * 520] = {};
-        if (image_length > sizeof(text) - 2 || !p.read_user(image_buffer, ByteView(text, image_length))) return kInfoLengthMismatch;
-        uint8_t out[16] = {};
-        out[0] = uint8_t(image_length); out[1] = uint8_t(image_length >> 8);
-        out[2] = uint8_t(image_length + 2); out[3] = uint8_t((image_length + 2) >> 8);
-        const uint64_t text_at = r.args[2] + 16;
-        for (uint32_t i = 0; i < 8; ++i) out[8 + i] = uint8_t(text_at >> (8 * i));
-        return p.write_user(r.args[2], ConstByteView(out, 16)) && p.write_user(text_at, ConstByteView(text, image_length + 2)) ? kSuccess : kAccessViolation;
-      }
       case 30: if (!debug_object_of(p.id())) return kPortNotSet; return 0xC0000002u;      // ProcessDebugObjectHandle
       case 31: b.put(0, 1, 4); size = 4; break;                         // ProcessDebugFlags: inheriting
       case 36: b.put(0, uint32_t(p.id() * 2654435761u) | 1u, 4); size = 4; break;      // ProcessCookie

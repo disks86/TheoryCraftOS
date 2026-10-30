@@ -191,6 +191,7 @@ class WindowsSyscalls final : public ISyscallInterface {
       case WindowsSyscallNumber::NtSetInformationProcess: return windowsabi::nt_set_information_process(process, r);
       case WindowsSyscallNumber::NtSetInformationThread: return windowsabi::nt_set_information_thread(process, r);
       case WindowsSyscallNumber::NtQuerySystemInformation: return windowsabi::nt_query_system_information(process, r);
+      case WindowsSyscallNumber::NtQuerySystemInformationEx: return windowsabi::nt_query_system_information_ex(process, r);
       case WindowsSyscallNumber::NtContinue: return nt_continue(process, r);
       case WindowsSyscallNumber::NtCreateThreadEx: return windowsabi::nt_create_thread_ex(process, r);
       case WindowsSyscallNumber::NtTerminateThread: return windowsabi::nt_terminate_thread(process, r);

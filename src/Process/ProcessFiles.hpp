@@ -109,8 +109,11 @@ class ProcessFiles {
   bool protected_from_close(uint64_t slot) const { return slot < kMaxDescriptors && slots_[slot].protect; }
   void set_handle_flags(uint64_t slot, bool inherit, bool protect) { if (slot < kMaxDescriptors) { slots_[slot].inherit = inherit; slots_[slot].protect = protect; } }
   // A new process's table gets the handles of `parent` that are inheritable, at the same numbers (what a Windows child receives). Console descriptors stay as they are.
-  // `copy_token` is called for each token-carrying kind so the owner can count the extra use; returns how many were copied.
-  uint32_t inherit_from(const ProcessFiles& parent, void (*copy_token)(DescriptorKind kind, uint64_t token));
+  // `copy_token` is called for each token-carrying kind so the owner can count the extra use; returns how many were copied. With `restrict` only the descriptors in `only` are.
+  uint32_t inherit_from(const ProcessFiles& parent, void (*copy_token)(DescriptorKind kind, uint64_t token), const uint64_t* only = nullptr, uint32_t only_count = 0, bool restrict = false);
+  // The one descriptor `slot` of `parent`, inheritable or not, with its handle flags, if this table has nothing at that number yet. False if the parent has nothing there or this
+  // table does.
+  bool adopt_from(const ProcessFiles& parent, uint64_t slot, void (*copy_token)(DescriptorKind kind, uint64_t token));
   // Opens a device node as a descriptor (the Null/Zero/Random kinds).
   int64_t open_device(DescriptorKind kind);
   // A descriptor for something the process keeps track of itself (a thread): `token` says which one. -1 if the table is full.
