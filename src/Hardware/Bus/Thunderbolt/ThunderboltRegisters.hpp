@@ -54,7 +54,8 @@ constexpr uint32_t kCaps = 0x39640, kResetRegister = 0x39898, kInmailData = 0x39
 
 constexpr uint32_t kCapsHopMask = 0x3FF, kCapsVersionShift = 16, kCapsVersionMask = 0xFF;
 // ring options
-constexpr uint32_t kRingFlagRaw = 1u << 30, kRingFlagEnable = 1u << 31;
+constexpr uint32_t kRingFlagE2eFlowControl = 1u << 28, kRingFlagRaw = 1u << 30, kRingFlagEnable = 1u << 31;
+constexpr uint32_t kRxOptionsE2eHopShift = 12, kRxOptionsE2eHopMask = 0x7FFu << 12;      // a receive ring with end to end flow control names the transmit hop its credits go out on
 // REG_INMAIL_CMD / REG_OUTMAIL_CMD
 constexpr uint32_t kInmailCmdMask = 0xFF, kInmailError = 1u << 30, kInmailRequest = 1u << 31, kOutmailOpModeShift = 8, kOutmailOpModeMask = 0xF00;
 // REG_FW_STS
@@ -63,7 +64,7 @@ constexpr uint32_t kFwStsNvmAuthDone = 1u << 31, kFwStsCioResetRequest = 1u << 3
 
 // Commands of the mailbox (nhi.h).
 namespace tb_mailbox {
-constexpr uint32_t kSaveDevices = 0x05, kDisconnectPciePaths = 0x06, kDriverUnloads = 0x07, kAllowAllDevices = 0x23;
+constexpr uint32_t kSaveDevices = 0x05, kDisconnectPciePaths = 0x06, kDriverUnloads = 0x07, kDisconnectPortA = 0x10, kDisconnectPortB = 0x11, kAllowAllDevices = 0x23;
 }
 
 }  // namespace hardware
