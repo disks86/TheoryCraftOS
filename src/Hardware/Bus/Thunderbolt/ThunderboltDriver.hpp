@@ -65,7 +65,8 @@ class ThunderboltDriver {
     if (icm_ && icm_->nhi().acknowledge_interrupt()) __atomic_fetch_add(&interrupts_, 1, __ATOMIC_ACQ_REL);
   }
   uint32_t interrupts() const { return __atomic_load_n(&interrupts_, __ATOMIC_ACQUIRE); }
-  bool use_interrupts(bool on) { return icm_ && icm_->use_interrupts(on); }
+  // `msix_vector`: the entry of the MSI-X table that carries them (see PciMsix), or -1 for a single MSI.
+  bool use_interrupts(bool on, int msix_vector = -1) { return icm_ && icm_->use_interrupts(on, msix_vector); }
   // Sleep. suspend() puts the controller to sleep (ThunderboltIcm::suspend) and the PCI function in D3hot, with its wake-up (PME) armed if `wake` is asked for and the function can raise one
   // from D3hot (`wake_armed()` says); resume() brings the function back to D0 and the controller up again. runtime_suspend() is the same while the machine runs, for a controller the
   // firmware allows that for (ThunderboltIcm::runtime_allowed): not with a path to another host open or while the firmware vetoes it.

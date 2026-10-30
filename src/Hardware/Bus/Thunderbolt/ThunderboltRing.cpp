@@ -61,13 +61,24 @@ void TbNhi::release_hop(bool transmit, uint32_t hop) {
   hops_used_[transmit ? 1 : 0][hop / 32] &= ~(1u << (hop % 32));
 }
 
-void TbNhi::set_control_interrupts(bool on) {
+void TbNhi::set_control_interrupts(bool on, int vector) {
   const uint32_t hops = hop_count();
-  if (hops == 0 || hops > 1023) return;
+  if (hops == 0 || hops > 1023 || vector > 15) return;
   const uint32_t indexes[2] = {0, hops};         // hop 0, transmit and receive
   for (uint32_t index : indexes) {
     const uint32_t reg = index / 32, bit = 1u << (index % 32);
     if (reg >= 64) continue;
+    if (vector >= 0) {
+      // (ring_interrupt_active with an MSI-X vector: auto clear on, the ring's slot of the vector allocation names the entry, the throttling of that entry is none)
+      const uint32_t misc = registers_.read32(tb_reg::kDmaMisc);
+      if (!(misc & tb_reg::kDmaMiscIntAutoClear)) registers_.write32(tb_reg::kDmaMisc, misc | tb_reg::kDmaMiscIntAutoClear);
+      const uint32_t step = index / tb_reg::kIntVecAllocPerRegister * 4, shift = index % tb_reg::kIntVecAllocPerRegister * tb_reg::kIntVecAllocBits;
+      uint32_t allocation = registers_.read32(tb_reg::kIntVecAllocBase + step);
+      allocation &= ~(tb_reg::kIntVecAllocMask << shift);
+      if (on) allocation |= static_cast<uint32_t>(vector) << shift;
+      registers_.write32(tb_reg::kIntVecAllocBase + step, allocation);
+      registers_.write32(tb_reg::kIntThrottlingRate + static_cast<uint32_t>(vector) * 4, 0);
+    }
     if (on) interrupt_mask_[reg] |= bit;
     else interrupt_mask_[reg] &= ~bit;
     registers_.write32(tb_reg::kRingInterruptBase + reg * 4, interrupt_mask_[reg]);

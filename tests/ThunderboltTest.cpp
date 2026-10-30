@@ -32,6 +32,7 @@
 #include "Hardware/Bus/Thunderbolt/ThunderboltNet.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltXdomain.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltControl.hpp"
+#include "Hardware/Bus/Pci/PciMsix.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltDevices.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltDriver.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltIcm.hpp"
@@ -2275,6 +2276,63 @@ static void test_power() {
   CHECK(alloc.dma.empty());
 }
 
+
+// ---- MSI-X
+
+static void test_msix() {
+  TestAllocator alloc;
+  fake_tb::FakePci pci;
+  fake_tb::FakePci::Function nhi;
+  nhi.info.address = {5, 0, 0};
+  nhi.msix_size = 16;
+  pci.functions.push_back(nhi);
+  const PciAddress address = {5, 0, 0};
+  auto& fn = pci.functions[0];
+  fake_tb::FakeMapper mapper;
+  {
+    PciMsix msix(pci, mapper);
+    CHECK(msix.table_size(address) == 16 && msix.table_size({9, 9, 9}) == 0);
+    const uint8_t vectors[3] = {0x52, 0x53, 0x54};
+    CHECK(msix.enable(address, vectors, 3, 4) && msix.enabled() && (fn.msix_control & 0x8000) && !(fn.msix_control & 0x4000));
+    // entries 0 to 2 deliver their vectors to core 4 (physical destination in bits 12 to 19 of the address), the other 13 stay masked
+    CHECK(fn.msix_table[0] == (0xFEE00000u | (4u << 12)) && fn.msix_table[1] == 0 && fn.msix_table[2] == 0x52 && fn.msix_table[3] == 0);
+    CHECK(fn.msix_table[4 * 2 + 2] == 0x54 && fn.msix_table[4 * 2 + 3] == 0 && fn.msix_table[4 * 3 + 3] == 1 && fn.msix_table[4 * 15 + 3] == 1);
+    CHECK(!msix.enable(address, vectors, 1, 0));                              // already on
+    msix.disable();
+    CHECK(!msix.enabled() && !(fn.msix_control & 0xC000) && fn.msix_table[3] == 1 && fn.msix_table[4 * 2 + 3] == 1);
+    msix.disable();                                                           // (again: nothing)
+    // refused: more entries than the table has, none asked for, a core that does not fit, a table whose BAR is not assigned or cannot be mapped, no capability
+    CHECK(!msix.enable(address, vectors, 17, 0) && !msix.enable(address, vectors, 0, 0) && !msix.enable(address, vectors, 1, 256));
+    fn.msix_bar_assigned = false;
+    CHECK(!msix.enable(address, vectors, 1, 0));
+    fn.msix_bar_assigned = true;
+    mapper.fail = true;
+    CHECK(!msix.enable(address, vectors, 1, 0) && !(fn.msix_control & 0xC000));
+    mapper.fail = false;
+    CHECK(!msix.enable({9, 9, 9}, vectors, 1, 0));
+    CHECK(msix.enable(address, vectors, 1, 0));
+  }
+  CHECK(!(fn.msix_control & 0xC000));                                         // (the destructor switches it off)
+  // the controller side: the control rings' interrupts go to one entry, the chip clears the status bits itself
+  FakeNhi chip;
+  ThunderboltDriver driver(alloc);
+  CHECK(driver.start_device(chip) == ThunderboltDriver::Outcome::Started);
+  CHECK(driver.use_interrupts(true, 3));
+  CHECK((chip.read32(0x39864) & 4) != 0);                                    // DMA_MISC: auto clear
+  CHECK(chip.read32(0x38C40) == 3u && chip.read32(0x38C44) == (3u << 16));    // the allocation of interrupt sources 0 (transmit) and 12 (receive, in the second register): 4 bits each, 8 to a register
+  CHECK(chip.unmasked[0] == ((1u << 0) | (1u << 12)));
+  CHECK(driver.use_interrupts(false, 3) && chip.read32(0x38C40) == 0 && chip.read32(0x38C44) == 0 && chip.unmasked[0] == 0);
+  // an out of range entry is not used
+  CHECK(!driver.use_interrupts(true, 16) && chip.read32(0x38C40) == 0 && chip.read32(0x38C44) == 0 && !driver.icm()->interrupts_on());
+  // after sleep the routing comes back
+  CHECK(driver.use_interrupts(true, 5) && driver.suspend());
+  CHECK(driver.resume() == ThunderboltDriver::Outcome::Started && chip.read32(0x38C40) == 5u && chip.read32(0x38C44) == (5u << 16) && chip.unmasked[0] == ((1u << 0) | (1u << 12)));
+  // a frame still raises the interrupt
+  chip.raise_interrupt = [&] { driver.on_interrupt(); };
+  chip.send_device_connected(make_device(0x20, 1, 1));
+  CHECK(driver.interrupts() >= 1);
+}
+
 static void test_driver() {
   TestAllocator alloc;
   {
@@ -2349,6 +2407,7 @@ int main() {
   test_net();
   test_net_lifecycle();
   test_power();
+  test_msix();
   test_driver();
   printf(g_failed ? "ThunderboltTest: %d FAILED\n" : "ThunderboltTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
