@@ -4534,6 +4534,18 @@ void test_stream_output_extras() {
     const uint64_t t0 = query_count(e, results, 0), t1 = query_count(e, results, 1), t2 = query_count(e, results, 2);
     CHECK(t0 != 0 && t1 > t0 && t2 > t1);
   }
+  {
+    // The frequency (nanoseconds) and the disjoint flag (0).
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    w.begin_query(2, 0, static_cast<uint32_t>(graphics::QueryKind::TimestampDisjoint));
+    w.end_query();
+    w.begin_query(2, 8, static_cast<uint32_t>(graphics::QueryKind::TimestampFrequency));
+    w.end_query();
+    w.end_pass();
+    CHECK(e.render(w, {target, vb, results}) == status::kSuccess);
+    CHECK(query_count(e, results, 0) == 0 && query_count(e, results, 1) == 1000000000u);
+  }
 
   // Appending: the second draw, in another pass, goes after the first's records.
   Handle big0 = buffer(6 * 32), big1 = buffer(6 * 16);

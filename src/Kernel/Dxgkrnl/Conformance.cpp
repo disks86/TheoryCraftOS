@@ -1325,7 +1325,7 @@ void scene_stream_output_append(Rig& rig, ArrayView<uint32_t> out) {
   od.size = 7 * 16;
   Handle second = rig.create(od);
   AllocationDesc rd;
-  rd.flags = kAllocQueryResult, rd.size = 4 * 8;
+  rd.flags = kAllocQueryResult, rd.size = 6 * 8;
   Handle results = rig.create(rd);
   auto pass = [&](CommandWriter& w, uint32_t offset, bool queries) {
     begin(w, 0, kNoAllocation, {0, 0, 0, 1});
@@ -1345,6 +1345,10 @@ void scene_stream_output_append(Rig& rig, ArrayView<uint32_t> out) {
       w.end_query();
       w.begin_query(4, 24, static_cast<uint32_t>(graphics::QueryKind::Timestamp));
       w.end_query();
+      w.begin_query(4, 32, static_cast<uint32_t>(graphics::QueryKind::TimestampDisjoint));
+      w.end_query();
+      w.begin_query(4, 40, static_cast<uint32_t>(graphics::QueryKind::TimestampFrequency));
+      w.end_query();
     } else {
       w.draw(3);
     }
@@ -1362,7 +1366,7 @@ void scene_stream_output_append(Rig& rig, ArrayView<uint32_t> out) {
   uint32_t f0[56], f1[28];
   rig.read_words(first, ArrayView<uint32_t>(f0, 56));
   rig.read_words(second, ArrayView<uint32_t>(f1, 28));
-  Vertex squares[7 * 6 + 3 * 6];
+  Vertex squares[7 * 6 + 4 * 6];
   const uint32_t n = squares_from_records(f0, f1, 7, [](uint32_t i) { return i >= 3 && i < 6 ? -0.5f : 0.0f; }, squares);
   // (stripes: the numbers as the height of a bar, in the bottom quarter)
   auto bar = [&](uint32_t k, float value, float r, float g, float bl) {
@@ -1373,15 +1377,20 @@ void scene_stream_output_append(Rig& rig, ArrayView<uint32_t> out) {
   };
   bar(0, static_cast<float>(written) / 4.0f, 1, 0.3f, 0.3f);
   bar(1, static_cast<float>(needed) / 4.0f, 0.3f, 1, 0.3f);
+  // (the fourth bar: the clock was not interrupted and runs in nanoseconds)
+  Vertex* last = squares + n + 18;
+  const float tick = rig.read_u64(results, 5) == 1000000000u && rig.read_u64(results, 4) == 0 ? 1.0f : 0.1f;
+  last[0] = {0.9f - 0.4f, -1.0f, 0.4f, 1, 1, 0.3f, 1}, last[1] = {0.9f, -1.0f, 0.4f, 1, 1, 0.3f, 1}, last[2] = {0.9f - 0.4f, -1.0f + 0.5f * tick, 0.4f, 1, 1, 0.3f, 1};
+  last[3] = last[2], last[4] = last[1], last[5] = {0.9f, -1.0f + 0.5f * tick, 0.4f, 1, 1, 0.3f, 1};
   bar(2, t1 > t0 && t0 != 0 ? 1.0f : 0.1f, 0.3f, 0.3f, 1);
   Handle flat = d3d9_pipeline(rig, false, false);
-  Handle svb = rig.buffer(kAllocVertexBuffer, bytes_of(squares, sizeof(Vertex) * (n + 18)));
+  Handle svb = rig.buffer(kAllocVertexBuffer, bytes_of(squares, sizeof(Vertex) * (n + 24)));
   CommandWriter w3(rig.allocator());
   begin(w3, 0, kNoAllocation, {0, 0, 0, 1});
   w3.bind_pipeline(flat);
   w3.bind_vertex_buffer(1);
   w3.push_constants(bytes_of(kIdentity, sizeof kIdentity));
-  w3.draw(n + 18);
+  w3.draw(n + 24);
   w3.end_pass();
   rig.render(w3, {target, svb});
   rig.read(target, out);

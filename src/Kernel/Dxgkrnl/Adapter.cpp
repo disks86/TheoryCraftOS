@@ -234,8 +234,8 @@ class Adapter::StreamRunner {
     kind &= 0xFF;
     const uint32_t features = adapter_.caps_.features;
     const bool so_kind = kind == static_cast<uint32_t>(graphics::QueryKind::SoPrimitivesWritten) || kind == static_cast<uint32_t>(graphics::QueryKind::SoPrimitivesNeeded);
-    if (kind > static_cast<uint32_t>(graphics::QueryKind::SoPrimitivesNeeded) || stream >= (so_kind ? graphics::kMaxGeometryStreams : 1u)) return kBad;
-    if (kind == static_cast<uint32_t>(graphics::QueryKind::Timestamp) ? !(features & graphics::kFeatureTimestampQueries)
+    if (kind > static_cast<uint32_t>(graphics::QueryKind::TimestampDisjoint) || stream >= (so_kind ? graphics::kMaxGeometryStreams : 1u)) return kBad;
+    if (kind == static_cast<uint32_t>(graphics::QueryKind::Timestamp) || kind == static_cast<uint32_t>(graphics::QueryKind::TimestampFrequency) || kind == static_cast<uint32_t>(graphics::QueryKind::TimestampDisjoint) ? !(features & graphics::kFeatureTimestampQueries)
         : so_kind ? (features & (graphics::kFeatureStatisticsQueries | graphics::kFeatureStreamOutput)) != (graphics::kFeatureStatisticsQueries | graphics::kFeatureStreamOutput)
         : (kind != 0 && !(features & graphics::kFeatureStatisticsQueries))) return kBad;
     Allocation* a = alloc(index);
