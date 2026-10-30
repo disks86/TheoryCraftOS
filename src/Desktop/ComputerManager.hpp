@@ -22,7 +22,8 @@
 // It reads the machine through an ISystemMonitor and an IHardwareInventory and refreshes itself when update() is called (the desktop does so once
 // a second while the window is open). Right-clicking the Displays group of the hardware tree offers Display Settings, and right-clicking a network
 // adapter offers Properties (its address, gateway, DNS server, link state and speed - another window, see NetworkProperties); a Wi-Fi adapter also offers Wi-Fi Properties (the network it is joined to, the networks in range and joining one - see WirelessProperties). The File menu
-// closes the window; the View menu picks the tab.
+// closes the window; the View menu picks the tab. Every other device has a Properties item too (a display's also Display Settings): the same window for
+// every device of a kind, whatever its driver - see DeviceProperties and IDeviceDetails.
 #pragma once
 #include "Gui/Controls/DataGrid.hpp"
 #include "Gui/Controls/ContextMenu.hpp"
@@ -137,6 +138,10 @@ class ComputerManager : public gui::Frame {
   // Fired when Wi-Fi Properties is chosen for a wireless adapter; wireless_adapter() is the adapter's number (HardwareEntry::id).
   void on_open_wireless_properties(gui::Handler handler) { open_wireless_properties_ = handler; }
   uint32_t wireless_adapter() const { return properties_adapter_; }
+  // Fired when Properties is chosen for any other device; device_group() and device_id() say which (HardwareEntry::group and ::id).
+  void on_open_device_properties(gui::Handler handler) { open_device_properties_ = handler; }
+  HardwareGroup device_group() const { return device_group_; }
+  uint32_t device_id() const { return properties_adapter_; }
   // Reads the monitor and refreshes everything. `now_us` is the uptime; load figures are over the time since
   // the previous call.
   void update(uint64_t now_us);
@@ -157,6 +162,9 @@ class ComputerManager : public gui::Frame {
   gui::TreeView& hardware_tree() { return tree_; }
   gui::ContextMenu& display_menu() { return display_menu_; }
   gui::ContextMenu& adapter_menu() { return adapter_menu_; }
+  // The menu of a device that has no menu of its own (a sound card, a disk, ...): Properties. A display's also has Display Settings.
+  gui::ContextMenu& device_menu() { return device_menu_; }
+  gui::ContextMenu& monitor_menu() { return monitor_menu_; }
   // The menu of a Wi-Fi adapter: Properties and Wi-Fi Properties.
   gui::ContextMenu& wireless_menu() { return wireless_menu_; }
   gui::Label& hardware_info() { return hardware_info_; }
@@ -253,7 +261,9 @@ class ComputerManager : public gui::Frame {
   static void on_display_settings_item(void* self, gui::Control&);
   static void on_properties_item(void* self, gui::Control&);
   static void on_wireless_item(void* self, gui::Control&);
+  static void on_device_item(void* self, gui::Control&);
   bool selected_adapter(uint32_t* id) const;
+  bool selected_entry(HardwareEntry* out) const;
   void rebuild_hardware();
 
   gui::MenuBar menu_;
@@ -264,11 +274,13 @@ class ComputerManager : public gui::Frame {
   gui::ScrollPanel core_scroll_;
   gui::Panel processes_page_, performance_page_, hardware_page_, usermode_page_, cpu_row_, memory_row_;
   gui::TreeView tree_;
-  gui::ContextMenu display_menu_, adapter_menu_, wireless_menu_;
+  gui::ContextMenu display_menu_, adapter_menu_, wireless_menu_, device_menu_, monitor_menu_;
+  gui::MenuItem *device_properties_item_ = nullptr, *monitor_properties_item_ = nullptr, *monitor_settings_item_ = nullptr;
   gui::MenuItem *display_settings_item_ = nullptr, *properties_item_ = nullptr, *wireless_properties_item_ = nullptr, *wireless_adapter_item_ = nullptr;
   gui::Label hardware_info_;
   IHardwareInventory* inventory_ = nullptr;
-  gui::Handler open_display_settings_, open_network_properties_, open_wireless_properties_;
+  gui::Handler open_display_settings_, open_network_properties_, open_wireless_properties_, open_device_properties_;
+  HardwareGroup device_group_ = HardwareGroup::System;
   uint32_t properties_adapter_ = 0;
   int32_t group_nodes_[kHardwareGroupCount] = {};
   gui::Label cpu_title_, cpu_value_, memory_title_, memory_value_, info_;

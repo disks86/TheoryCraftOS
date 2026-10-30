@@ -497,9 +497,11 @@ add_executable(BOOTX64
   src/Desktop/CubeRenderer.cpp
   src/SystemMonitor.cpp
   src/SystemInventory.cpp
+  src/SystemDeviceDetails.cpp
   src/SystemNetworkDetails.cpp
   src/SystemWirelessDetails.cpp
   src/Desktop/NetworkProperties.cpp
+  src/Desktop/DeviceProperties.cpp
   src/Desktop/WirelessProperties.cpp
   src/Gui/Controls/MenuButton.cpp
   src/GraphicsDemo.cpp
