@@ -13,6 +13,9 @@ SME = bool(os.environ.get('SME'))
 SVEMEM = bool(os.environ.get('SVEMEM'))
 SVE = bool(os.environ.get('SVE')) or SVEMEM
 words = []
+if os.environ.get('WORDS_FILE'):      # a fixed list of instruction words (one hex word per line), each run COPIES times with different random state
+    words = [int(l.split()[0], 16) for l in open(os.environ['WORDS_FILE']) if l.strip()] * int(os.environ.get('COPIES', '40'))
+    candidates = 0
 while len(words) < candidates:
     w = rng.getrandbits(32)
     if (w >> 26) & 7 == 5: continue                 # branches

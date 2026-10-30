@@ -50,6 +50,55 @@ bool textured_scaled_fragment(const Vec4* varyings, const uint8_t* constants, co
   return true;
 }
 
+// Group filters. The blur: 17 samples along one direction, the center and eight each way at multiples of the step (CONST[7].xy, in texture coordinates), weighted by
+// the nine weights in CONST[4..6] (center first, mirrored): one pass of a box blur. The color function: the texel is made straight, goes through
+// rgb' = rows * rgb + add (CONST[4..6], the add in .w), is clamped, and is made premultiplied again with alpha * CONST[7].x.
+bool textured_blur_fragment(const Vec4* varyings, const uint8_t* constants, const ITextureSet& textures, Vec4* color) {
+  const float* c = reinterpret_cast<const float*>(constants);
+  const float* weight = c + 16;
+  const float sx = c[28], sy = c[29];
+  Vec4 sum = textures.sample(0, varyings[0].x, varyings[0].y);
+  sum = Vec4{sum.x * weight[0], sum.y * weight[0], sum.z * weight[0], sum.w * weight[0]};
+  for (int i = 1; i <= 8; ++i) {
+    const float k = static_cast<float>(i), w = weight[i];
+    const Vec4 a = textures.sample(0, varyings[0].x + sx * k, varyings[0].y + sy * k);
+    const Vec4 b = textures.sample(0, varyings[0].x - sx * k, varyings[0].y - sy * k);
+    sum = Vec4{sum.x + (a.x + b.x) * w, sum.y + (a.y + b.y) * w, sum.z + (a.z + b.z) * w, sum.w + (a.w + b.w) * w};
+  }
+  *color = sum;
+  return true;
+}
+
+bool textured_color_fragment(const Vec4* varyings, const uint8_t* constants, const ITextureSet& textures, Vec4* color) {
+  const float* c = reinterpret_cast<const float*>(constants);
+  const Vec4 t = textures.sample(0, varyings[0].x, varyings[0].y);
+  const float inv = 1.0f / (t.w > 0.0001f ? t.w : 0.0001f);
+  const float r = t.x * inv, g = t.y * inv, b = t.z * inv;
+  auto clamp01 = [](float v) { return v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v; };
+  const float nr = clamp01(c[16] * r + c[17] * g + c[18] * b + c[19]);
+  const float ng = clamp01(c[20] * r + c[21] * g + c[22] * b + c[23]);
+  const float nb = clamp01(c[24] * r + c[25] * g + c[26] * b + c[27]);
+  const float a = t.w * c[28];
+  *color = Vec4{nr * a, ng * a, nb * a, a};
+  return true;
+}
+
+// The shadow of a picture: its alpha moved by CONST[5].xy (texture coordinates), tinted with the straight color CONST[4], made premultiplied.
+bool textured_shadow_fragment(const Vec4* varyings, const uint8_t* constants, const ITextureSet& textures, Vec4* color) {
+  const float* c = reinterpret_cast<const float*>(constants);
+  const float a = textures.sample(0, varyings[0].x - c[20], varyings[0].y - c[21]).w * c[19];
+  *color = Vec4{c[16] * a, c[17] * a, c[18] * a, a};
+  return true;
+}
+
+// A picture through a coverage mask: texture 0 (premultiplied colours) times the alpha of texture 1, at the same coordinate.
+bool textured_masked_fragment(const Vec4* varyings, const uint8_t*, const ITextureSet& textures, Vec4* color) {
+  const Vec4 t = textures.sample(0, varyings[0].x, varyings[0].y);
+  const float k = textures.sample(1, varyings[0].x, varyings[0].y).w;
+  *color = Vec4{t.x * k, t.y * k, t.z * k, t.w * k};
+  return true;
+}
+
 // Push constants are CONST[0..3], the columns of the matrix.
 constexpr const char kColoredVertexTgsi[] =
     "VERT\n"
@@ -99,6 +148,128 @@ constexpr const char kTexturedScaledFragmentTgsi[] =
     "  0: TEX TEMP[0], IN[0], SAMP[0], 2D\n"
     "  1: MUL OUT[0], TEMP[0], CONST[4].xxxx\n"
     "  2: END\n";
+
+constexpr const char kTexturedBlurFragmentTgsi[] =
+    "FRAG\n"
+    "PROPERTY FS_COLOR0_WRITES_ALL_CBUFS 1\n"
+    "DCL IN[0], GENERIC[0], PERSPECTIVE\n"
+    "DCL OUT[0], COLOR\n"
+    "DCL SAMP[0]\n"
+    "DCL SVIEW[0], 2D, FLOAT\n"
+    "DCL CONST[4..7]\n"
+    "DCL TEMP[0..2]\n"
+    "IMM[0] FLT32 { 1.0, 2.0, 3.0, 4.0}\n"
+    "IMM[1] FLT32 { 5.0, 6.0, 7.0, 8.0}\n"
+    "  0: TEX TEMP[0], IN[0], SAMP[0], 2D\n"
+    "  1: MUL TEMP[1], TEMP[0], CONST[4].xxxx\n"
+    "  2: MAD TEMP[2].xy, CONST[7].xyxx, IMM[0].xxxx, IN[0]\n"
+    "  3: TEX TEMP[0], TEMP[2], SAMP[0], 2D\n"
+    "  4: MAD TEMP[1], TEMP[0], CONST[4].yyyy, TEMP[1]\n"
+    "  5: MAD TEMP[2].xy, CONST[7].xyxx, -IMM[0].xxxx, IN[0]\n"
+    "  6: TEX TEMP[0], TEMP[2], SAMP[0], 2D\n"
+    "  7: MAD TEMP[1], TEMP[0], CONST[4].yyyy, TEMP[1]\n"
+    "  8: MAD TEMP[2].xy, CONST[7].xyxx, IMM[0].yyyy, IN[0]\n"
+    "  9: TEX TEMP[0], TEMP[2], SAMP[0], 2D\n"
+    "  10: MAD TEMP[1], TEMP[0], CONST[4].zzzz, TEMP[1]\n"
+    "  11: MAD TEMP[2].xy, CONST[7].xyxx, -IMM[0].yyyy, IN[0]\n"
+    "  12: TEX TEMP[0], TEMP[2], SAMP[0], 2D\n"
+    "  13: MAD TEMP[1], TEMP[0], CONST[4].zzzz, TEMP[1]\n"
+    "  14: MAD TEMP[2].xy, CONST[7].xyxx, IMM[0].zzzz, IN[0]\n"
+    "  15: TEX TEMP[0], TEMP[2], SAMP[0], 2D\n"
+    "  16: MAD TEMP[1], TEMP[0], CONST[4].wwww, TEMP[1]\n"
+    "  17: MAD TEMP[2].xy, CONST[7].xyxx, -IMM[0].zzzz, IN[0]\n"
+    "  18: TEX TEMP[0], TEMP[2], SAMP[0], 2D\n"
+    "  19: MAD TEMP[1], TEMP[0], CONST[4].wwww, TEMP[1]\n"
+    "  20: MAD TEMP[2].xy, CONST[7].xyxx, IMM[0].wwww, IN[0]\n"
+    "  21: TEX TEMP[0], TEMP[2], SAMP[0], 2D\n"
+    "  22: MAD TEMP[1], TEMP[0], CONST[5].xxxx, TEMP[1]\n"
+    "  23: MAD TEMP[2].xy, CONST[7].xyxx, -IMM[0].wwww, IN[0]\n"
+    "  24: TEX TEMP[0], TEMP[2], SAMP[0], 2D\n"
+    "  25: MAD TEMP[1], TEMP[0], CONST[5].xxxx, TEMP[1]\n"
+    "  26: MAD TEMP[2].xy, CONST[7].xyxx, IMM[1].xxxx, IN[0]\n"
+    "  27: TEX TEMP[0], TEMP[2], SAMP[0], 2D\n"
+    "  28: MAD TEMP[1], TEMP[0], CONST[5].yyyy, TEMP[1]\n"
+    "  29: MAD TEMP[2].xy, CONST[7].xyxx, -IMM[1].xxxx, IN[0]\n"
+    "  30: TEX TEMP[0], TEMP[2], SAMP[0], 2D\n"
+    "  31: MAD TEMP[1], TEMP[0], CONST[5].yyyy, TEMP[1]\n"
+    "  32: MAD TEMP[2].xy, CONST[7].xyxx, IMM[1].yyyy, IN[0]\n"
+    "  33: TEX TEMP[0], TEMP[2], SAMP[0], 2D\n"
+    "  34: MAD TEMP[1], TEMP[0], CONST[5].zzzz, TEMP[1]\n"
+    "  35: MAD TEMP[2].xy, CONST[7].xyxx, -IMM[1].yyyy, IN[0]\n"
+    "  36: TEX TEMP[0], TEMP[2], SAMP[0], 2D\n"
+    "  37: MAD TEMP[1], TEMP[0], CONST[5].zzzz, TEMP[1]\n"
+    "  38: MAD TEMP[2].xy, CONST[7].xyxx, IMM[1].zzzz, IN[0]\n"
+    "  39: TEX TEMP[0], TEMP[2], SAMP[0], 2D\n"
+    "  40: MAD TEMP[1], TEMP[0], CONST[5].wwww, TEMP[1]\n"
+    "  41: MAD TEMP[2].xy, CONST[7].xyxx, -IMM[1].zzzz, IN[0]\n"
+    "  42: TEX TEMP[0], TEMP[2], SAMP[0], 2D\n"
+    "  43: MAD TEMP[1], TEMP[0], CONST[5].wwww, TEMP[1]\n"
+    "  44: MAD TEMP[2].xy, CONST[7].xyxx, IMM[1].wwww, IN[0]\n"
+    "  45: TEX TEMP[0], TEMP[2], SAMP[0], 2D\n"
+    "  46: MAD TEMP[1], TEMP[0], CONST[6].xxxx, TEMP[1]\n"
+    "  47: MAD TEMP[2].xy, CONST[7].xyxx, -IMM[1].wwww, IN[0]\n"
+    "  48: TEX TEMP[0], TEMP[2], SAMP[0], 2D\n"
+    "  49: MAD TEMP[1], TEMP[0], CONST[6].xxxx, TEMP[1]\n"
+    "  50: MOV OUT[0], TEMP[1]\n"
+    "  51: END\n";
+
+constexpr const char kTexturedColorFragmentTgsi[] =
+    "FRAG\n"
+    "PROPERTY FS_COLOR0_WRITES_ALL_CBUFS 1\n"
+    "DCL IN[0], GENERIC[0], PERSPECTIVE\n"
+    "DCL OUT[0], COLOR\n"
+    "DCL SAMP[0]\n"
+    "DCL SVIEW[0], 2D, FLOAT\n"
+    "DCL CONST[4..7]\n"
+    "DCL TEMP[0..3]\n"
+    "IMM[0] FLT32 { 0.0001, 1.0, 0.0, 0.0}\n"
+    "  0: TEX TEMP[0], IN[0], SAMP[0], 2D\n"
+    "  1: MAX TEMP[1].x, TEMP[0].wwww, IMM[0].xxxx\n"
+    "  2: RCP TEMP[1].x, TEMP[1].xxxx\n"
+    "  3: MUL TEMP[2].xyz, TEMP[0].xyzx, TEMP[1].xxxx\n"
+    "  4: DP3 TEMP[3].x, CONST[4], TEMP[2]\n"
+    "  5: ADD TEMP[3].x, TEMP[3].xxxx, CONST[4].wwww\n"
+    "  6: DP3 TEMP[3].y, CONST[5], TEMP[2]\n"
+    "  7: ADD TEMP[3].y, TEMP[3].yyyy, CONST[5].wwww\n"
+    "  8: DP3 TEMP[3].z, CONST[6], TEMP[2]\n"
+    "  9: ADD TEMP[3].z, TEMP[3].zzzz, CONST[6].wwww\n"
+    "  10: MAX TEMP[3].xyz, TEMP[3].xyzx, IMM[0].zzzz\n"
+    "  11: MIN TEMP[3].xyz, TEMP[3].xyzx, IMM[0].yyyy\n"
+    "  12: MUL TEMP[1].w, TEMP[0].wwww, CONST[7].xxxx\n"
+    "  13: MUL OUT[0].xyz, TEMP[3].xyzx, TEMP[1].wwww\n"
+    "  14: MOV OUT[0].w, TEMP[1].wwww\n"
+    "  15: END\n";
+
+constexpr const char kTexturedMaskedFragmentTgsi[] =
+    "FRAG\n"
+    "PROPERTY FS_COLOR0_WRITES_ALL_CBUFS 1\n"
+    "DCL IN[0], GENERIC[0], PERSPECTIVE\n"
+    "DCL OUT[0], COLOR\n"
+    "DCL SAMP[0]\n"
+    "DCL SAMP[1]\n"
+    "DCL SVIEW[0], 2D, FLOAT\n"
+    "DCL SVIEW[1], 2D, FLOAT\n"
+    "DCL TEMP[0..1]\n"
+    "  0: TEX TEMP[0], IN[0], SAMP[0], 2D\n"
+    "  1: TEX TEMP[1], IN[0], SAMP[1], 2D\n"
+    "  2: MUL OUT[0], TEMP[0], TEMP[1].wwww\n"
+    "  3: END\n";
+
+constexpr const char kTexturedShadowFragmentTgsi[] =
+    "FRAG\n"
+    "PROPERTY FS_COLOR0_WRITES_ALL_CBUFS 1\n"
+    "DCL IN[0], GENERIC[0], PERSPECTIVE\n"
+    "DCL OUT[0], COLOR\n"
+    "DCL SAMP[0]\n"
+    "DCL SVIEW[0], 2D, FLOAT\n"
+    "DCL CONST[4..5]\n"
+    "DCL TEMP[0..2]\n"
+    "  0: ADD TEMP[0].xy, IN[0].xyxx, -CONST[5].xyxx\n"
+    "  1: TEX TEMP[1], TEMP[0], SAMP[0], 2D\n"
+    "  2: MUL TEMP[2].x, TEMP[1].wwww, CONST[4].wwww\n"
+    "  3: MUL OUT[0].xyz, CONST[4].xyzx, TEMP[2].xxxx\n"
+    "  4: MOV OUT[0].w, TEMP[2].xxxx\n"
+    "  5: END\n";
 
 // The same two shaders as Direct3D 9 bytecode (vs_2_0, ps_2_0). Position comes in as v0, color as v1; the matrix columns are c0..c3, and c31 is
 // the device's (1, -1, 1, 1) that turns Direct3D's +Y up into Vulkan's +Y down.
@@ -168,6 +339,38 @@ ShaderModuleDesc textured_scaled_fragment_shader() {
   d.stage = ShaderStage::Fragment;
   d.textured_fragment_function = textured_scaled_fragment;
   d.tgsi = kTexturedScaledFragmentTgsi;   // (no Direct3D 9, QPU or Intel program: those devices refuse the pipeline)
+  return d;
+}
+
+ShaderModuleDesc textured_blur_fragment_shader() {
+  ShaderModuleDesc d;
+  d.stage = ShaderStage::Fragment;
+  d.textured_fragment_function = textured_blur_fragment;
+  d.tgsi = kTexturedBlurFragmentTgsi;
+  return d;
+}
+
+ShaderModuleDesc textured_color_fragment_shader() {
+  ShaderModuleDesc d;
+  d.stage = ShaderStage::Fragment;
+  d.textured_fragment_function = textured_color_fragment;
+  d.tgsi = kTexturedColorFragmentTgsi;
+  return d;
+}
+
+ShaderModuleDesc textured_masked_fragment_shader() {
+  ShaderModuleDesc d;
+  d.stage = ShaderStage::Fragment;
+  d.textured_fragment_function = textured_masked_fragment;
+  d.tgsi = kTexturedMaskedFragmentTgsi;
+  return d;
+}
+
+ShaderModuleDesc textured_shadow_fragment_shader() {
+  ShaderModuleDesc d;
+  d.stage = ShaderStage::Fragment;
+  d.textured_fragment_function = textured_shadow_fragment;
+  d.tgsi = kTexturedShadowFragmentTgsi;
   return d;
 }
 

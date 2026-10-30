@@ -680,6 +680,10 @@ add_executable(BOOTX64
   src/Emulation/AArch64Sve2.cpp
   src/Emulation/AArch64Sme.cpp
   src/Emulation/AArch64Sme2.cpp
+  src/Emulation/AArch64Fp8.cpp
+  src/Emulation/AArch64Fp8Neon.cpp
+  src/Emulation/AArch64Fp8Sve.cpp
+  src/Emulation/AArch64Lut.cpp
   src/Emulation/AArch64NeonShift.cpp
   src/Emulation/AArch64NeonThree.cpp
   src/Emulation/AArch64NeonElement.cpp
@@ -760,6 +764,17 @@ add_executable(BOOTX64
   src/Hardware/Bus/Thunderbolt/ThunderboltIcl.cpp
   src/Hardware/Bus/Thunderbolt/ThunderboltIcm.cpp
   src/Hardware/Bus/Thunderbolt/ThunderboltDriver.cpp
+  src/Hardware/Bluetooth/BtCrypto.cpp
+  src/Hardware/Bluetooth/BondFile.cpp
+  src/Hardware/Bluetooth/L2cap.cpp
+  src/Hardware/Bluetooth/Att.cpp
+  src/Hardware/Bluetooth/Gatt.cpp
+  src/Hardware/Bluetooth/Smp.cpp
+  src/Hardware/Bluetooth/HciPackets.cpp
+  src/Hardware/Bluetooth/UsbHciTransport.cpp
+  src/Hardware/Bluetooth/HciController.cpp
+  src/Hardware/Bluetooth/IntelBluetooth.cpp
+  src/Hardware/Bluetooth/BluetoothService.cpp
   src/Hardware/WirelessInterface/Intel/IwlDevices.cpp
   src/Hardware/WirelessInterface/Intel/IwlFirmware.cpp
   src/Hardware/WirelessInterface/Intel/IwlPcie.cpp
@@ -974,7 +989,7 @@ if(TCOS_ARCH STREQUAL "x86_64")
     COMMAND ${CMAKE_COMMAND} -E make_directory ${WINDOWS_DIR}
     COMMAND ${CMAKE_C_COMPILER} ${WINDOWS_DLL_FLAGS} ${ntdll_stubs} -Wl,--image-base=0x180000000 -Wl,--out-implib=${WINDOWS_DIR}/libntdll.a
             -o ${WINDOWS_DIR}/ntdll.dll ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/ntdll.c
-    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/ntdll.c ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/except.inc ${CMAKE_SOURCE_DIR}/src/Windows/libc_string.inc ${WINDOWS_HEADERS} ${CMAKE_SOURCE_DIR}/src/Windows/stubs/ntdll.inc ${WINDOWS_STUBS_C} ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/services.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/zw.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/rtl.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/libc.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/rtl2.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/status.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/casetab.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/normalize.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/uilang.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/locale_names.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/unidata.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/idn_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/reg.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/fls.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/actctx.inc
+    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/ntdll.c ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/except.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/heap.inc ${CMAKE_SOURCE_DIR}/src/Windows/libc_string.inc ${WINDOWS_HEADERS} ${CMAKE_SOURCE_DIR}/src/Windows/stubs/ntdll.inc ${WINDOWS_STUBS_C} ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/services.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/zw.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/rtl.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/libc.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/rtl2.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/status.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/casetab.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/normalize.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/uilang.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/locale_names.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/unidata.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/idn_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/reg.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/fls.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/actctx.inc
     COMMENT "Building ntdll.dll")
   windows_stub_flags(kernel32_stubs kernel32 0)
   add_custom_command(OUTPUT ${WINDOWS_DIR}/kernel32.dll
@@ -1097,6 +1112,10 @@ endif()
 option(TCOS_INTEL_WIFI "Start the Intel Wireless-AC 9000 series card (firmware from /firmware, initialisation, hardware address and channels; no scanning or joining yet; not yet run on a real card)" OFF)
 if(TCOS_INTEL_WIFI)
   target_compile_definitions(BOOTX64 PRIVATE TCOS_INTEL_WIFI)
+endif()
+option(TCOS_BLUETOOTH "Start the Bluetooth controllers on the USB ports (Intel firmware from /firmware/ibt-*.sfi, bring-up, events; nothing is scanned or paired; not yet run on a real controller)" OFF)
+if(TCOS_BLUETOOTH)
+  target_compile_definitions(BOOTX64 PRIVATE TCOS_BLUETOOTH)
 endif()
 option(TCOS_THUNDERBOLT "Start the Thunderbolt 3 host interface (Alpine Ridge: control channel, the controller's firmware, devices reported as they are connected; PCIe tunnels only on request; not yet run on a real controller)" OFF)
 option(TCOS_THUNDERBOLT_START_FIRMWARE "With TCOS_THUNDERBOLT: start the controller's connection manager firmware if the BIOS did not (resets the controller's CPU through the upstream port's vendor registers)" OFF)

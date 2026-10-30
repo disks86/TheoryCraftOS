@@ -710,337 +710,60 @@ EXPORT NTSTATUS NTAPI RtlUnicodeToMultiByteSize(PULONG size, PCWSTR s, ULONG sb)
 
 /* ---- the heap ------------------------------------------------------------------------------------------------------------------------------------------ */
 
-/* A chunk is [prev_size (8)][size and flags (8)][payload...]; the user pointer is the payload, 16-byte aligned. prev_size is only meaningful while the chunk before is
- * free (it then lies in that chunk's last 8 bytes). A free chunk keeps two list links at the start of its payload. A segment ends with a zero-size "in use" chunk. */
-#define CHUNK_USED 1ull
-#define CHUNK_PREV_USED 2ull
-#define CHUNK_SIZE(c) ((c)->size_flags & ~15ull)
-typedef struct Chunk { ULONGLONG prev_size, size_flags; struct Chunk *next, *prev; } Chunk;
-typedef struct Segment { struct Segment *next; PVOID base; SIZE_T size; } Segment;
-typedef struct Heap { ULONGLONG magic; ULONG flags; Segment *segments; Chunk free_list; } Heap;
-#define HEAP_MAGIC 0x50414548454B4F54ull
-#define MIN_CHUNK 32ull
-#define SEGMENT_MIN (1ull << 20)
+#include "heap.inc"
 
-static Chunk *chunk_next(Chunk *c) { return (Chunk *)((BYTE *)c + CHUNK_SIZE(c)); }
-static void free_unlink(Chunk *c) { c->prev->next = c->next; c->next->prev = c->prev; }
-static void free_link(Heap *h, Chunk *c) { c->next = h->free_list.next; c->prev = &h->free_list; h->free_list.next->prev = c; h->free_list.next = c; }
-
-/* Makes `c` (size bytes, not in any list) a free chunk and puts the bookkeeping of its neighbour right. */
-static void make_free(Heap *h, Chunk *c, ULONGLONG size, int prev_used) {
-  c->size_flags = size | (prev_used ? CHUNK_PREV_USED : 0);
-  Chunk *after = (Chunk *)((BYTE *)c + size);
-  after->prev_size = size;
-  after->size_flags &= ~CHUNK_PREV_USED;
-  free_link(h, c);
-}
-
-static int heap_add_segment(Heap *h, SIZE_T minimum) {
-  SIZE_T size = minimum + sizeof(Segment) + 64 + 4096;
-  if (size < SEGMENT_MIN) size = SEGMENT_MIN;
-  PVOID base = NULL;
-  if (!NT_SUCCESS(NtAllocateVirtualMemory(NtCurrentProcess(), &base, 0, &size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE))) return 0;
-  Segment *segment = (Segment *)base;
-  segment->base = base;
-  segment->size = size;
-  segment->next = h->segments;
-  h->segments = segment;
-  BYTE *start = (BYTE *)(((ULONG_PTR)base + sizeof(Segment) + 15) & ~15ull);      /* (16-aligned, so that start + 16, the payload, is too) */
-  BYTE *end = (BYTE *)(((ULONG_PTR)base + size) & ~15ull) - 16;      /* (so that end - start is a multiple of 16: the chunks are) */
-  Chunk *sentinel = (Chunk *)end;
-  sentinel->size_flags = CHUNK_USED;      /* size 0 */
-  make_free(h, (Chunk *)start, (ULONGLONG)(end - start), 1);
-  return 1;
-}
-
-static void heaps_add(Heap *h);
-static Heap *heap_new(ULONG flags, SIZE_T commit) {
-  SIZE_T size = commit < SEGMENT_MIN ? SEGMENT_MIN : commit;
-  PVOID base = NULL;
-  if (!NT_SUCCESS(NtAllocateVirtualMemory(NtCurrentProcess(), &base, 0, &size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE))) return NULL;
-  Heap *h = (Heap *)base;
-  h->magic = HEAP_MAGIC;
-  h->flags = flags;
-  h->free_list.next = h->free_list.prev = &h->free_list;
-  Segment *segment = (Segment *)((BYTE *)base + ((sizeof(Heap) + 15) & ~15ull));
-  segment->base = base;
-  segment->size = size;
-  segment->next = NULL;
-  h->segments = segment;
-  BYTE *start = (BYTE *)(((ULONG_PTR)segment + sizeof(Segment) + 15) & ~15ull);
-  BYTE *end = (BYTE *)(((ULONG_PTR)base + size) & ~15ull) - 16;      /* (so that end - start is a multiple of 16: the chunks are) */
-  Chunk *sentinel = (Chunk *)end;
-  sentinel->size_flags = CHUNK_USED;
-  make_free(h, (Chunk *)start, (ULONGLONG)(end - start), 1);
-  heaps_add(h);
-  return h;
-}
-
-#define MAX_HEAPS 128
-static Heap *g_heaps[MAX_HEAPS];
-/* A heap handle is good if it is one of the heaps made (a destroyed heap's memory is gone: its header is not looked at). */
-static int heap_ok(Heap *h) {
-  if (!h) return 0;
-  for (int i = 0; i < MAX_HEAPS; ++i) if (g_heaps[i] == h) return h->magic == HEAP_MAGIC;
-  return 0;
-}
-
-/* Every heap of the process, in the order they were made (the process heap first): RtlGetProcessHeaps and the Toolhelp heap lists. */
-static volatile LONG g_heaps_lock;
-static void heaps_lock(void) { while (__sync_lock_test_and_set(&g_heaps_lock, 1)) NtYieldExecution(); }
-static void heaps_unlock(void) { __sync_lock_release(&g_heaps_lock); }
-static void heaps_add(Heap *h) { heaps_lock(); for (int i = 0; i < MAX_HEAPS; ++i) if (!g_heaps[i]) { g_heaps[i] = h; break; } heaps_unlock(); }
-static void heaps_remove(Heap *h) { heaps_lock(); for (int i = 0; i < MAX_HEAPS; ++i) if (g_heaps[i] == h) g_heaps[i] = NULL; heaps_unlock(); }
-
-EXPORT PVOID NTAPI RtlCreateHeap(ULONG flags, PVOID base, SIZE_T reserve, SIZE_T commit, PVOID lock, PVOID parameters) {
-  (void)base; (void)reserve; (void)lock; (void)parameters;
-  return heap_new(flags, commit);
-}
-
-/* The heaps are shared by the threads of the process: one spin lock (a waiting thread gives its time slice to the holder) covers all of them. */
-/* The heap lock is recursive (RtlLockHeap holds it across calls of the same thread). */
-static volatile ULONG_PTR g_heap_owner;
-static LONG g_heap_depth;
-static void heap_lock(void) {
-  const ULONG_PTR me = TEB_CLIENT_THREAD(NtCurrentTeb());
-  if (g_heap_lock && g_heap_owner == me) { ++g_heap_depth; return; }
-  while (__sync_lock_test_and_set(&g_heap_lock, 1)) NtYieldExecution();
-  g_heap_owner = me;
-  g_heap_depth = 1;
-}
-static void heap_unlock(void) {
-  if (--g_heap_depth > 0) return;
-  g_heap_owner = 0;
-  __sync_lock_release(&g_heap_lock);
-}
-
-static PVOID heap_alloc(PVOID heap, ULONG flags, SIZE_T bytes) {
-  Heap *h = heap;
-  if (!heap_ok(h)) return NULL;
-  if (bytes > (1ull << 46)) return NULL;
-  /* (16 for the header; at the end of the payload 8 for the user value and 8 for the user flags - RtlSetUserValueHeap and friends - and the size asked for, kept in the next chunk's prev_size field, which is payload while this chunk is used) */
-  ULONGLONG need = (bytes + 32 + 15) & ~15ull;
-  if (need < MIN_CHUNK) need = MIN_CHUNK;
-  for (int attempt = 0; attempt < 2; ++attempt) {
-    for (Chunk *c = h->free_list.next; c != &h->free_list; c = c->next) {
-      const ULONGLONG size = CHUNK_SIZE(c);
-      if (size < need) continue;
-      free_unlink(c);
-      if (size - need >= MIN_CHUNK) {      /* split: the rest stays free */
-        c->size_flags = need | CHUNK_USED | (c->size_flags & CHUNK_PREV_USED);
-        make_free(h, (Chunk *)((BYTE *)c + need), size - need, 1);
-      } else {
-        c->size_flags |= CHUNK_USED;
-        chunk_next(c)->size_flags |= CHUNK_PREV_USED;
-      }
-      BYTE *user = (BYTE *)c + 16;
-      if (flags & HEAP_ZERO_MEMORY) memset(user, 0, (size_t_)bytes);
-      *(ULONGLONG *)((BYTE *)c + CHUNK_SIZE(c)) = bytes;      /* the last 8 bytes of the payload say how many were asked for (HeapSize) */
-      *(ULONGLONG *)((BYTE *)c + CHUNK_SIZE(c) - 16) = 0;      /* user value */
-      *(ULONGLONG *)((BYTE *)c + CHUNK_SIZE(c) - 8) = flags & 0xF00;      /* user flags (HEAP_SETTABLE_USER_FLAG1..3) and whether there is a user value (HEAP_SETTABLE_USER_VALUE) */
-      return user;
-    }
-    if (attempt == 0 && !heap_add_segment(h, need)) return NULL;
-  }
-  return NULL;
-}
-
-/* Does `memory` lie inside a segment of the heap, where a block can be? (Callers hand over all kinds of pointers; none must be followed before this says yes.) */
-static int heap_owns(Heap *h, PVOID memory) {
-  const ULONG_PTR p = (ULONG_PTR)memory;
-  if (p & 15) return 0;
-  for (Segment *s = h->segments; s; s = s->next) {
-    const ULONG_PTR base = (ULONG_PTR)s->base;
-    if (p >= base + sizeof(Segment) + 16 && p < base + s->size) return 1;
+IMPORT NTSTATUS NTAPI NtOpenKey(PHANDLE, ULONG, POBJECT_ATTRIBUTES);
+IMPORT NTSTATUS NTAPI NtQueryValueKey(HANDLE, PUNICODE_STRING, ULONG, PVOID, ULONG, PULONG);
+/* The GlobalFlag value (a DWORD, or a hexadecimal text) of a key; FALSE if there is none. */
+static int key_global_flag(const WCHAR *path, ULONG path_chars, ULONG *out) {
+  UNICODE_STRING name = {(USHORT)(path_chars * 2), (USHORT)(path_chars * 2 + 2), (PWSTR)path};
+  OBJECT_ATTRIBUTES attributes = {sizeof(attributes), NULL, &name, 0x40, NULL, NULL};
+  HANDLE key = NULL;
+  if (!NT_SUCCESS(NtOpenKey(&key, 0x20019, &attributes))) return 0;
+  static const WCHAR value_name[] = {'G', 'l', 'o', 'b', 'a', 'l', 'F', 'l', 'a', 'g', 0};
+  UNICODE_STRING value = {20, 22, (PWSTR)value_name};
+  BYTE buffer[12 + 64];
+  ULONG needed = 0;
+  const NTSTATUS status = NtQueryValueKey(key, &value, 2, buffer, sizeof(buffer), &needed);
+  NtClose(key);
+  if (!NT_SUCCESS(status)) return 0;
+  const ULONG type = *(ULONG *)(buffer + 4), length = *(ULONG *)(buffer + 8);
+  const BYTE *data = buffer + 12;
+  if (type == 4 && length >= 4) { *out = *(const ULONG *)data; return 1; }
+  if (type == 1) {      /* REG_SZ: hexadecimal, with or without 0x */
+    ULONG v = 0;
+    const WCHAR *w = (const WCHAR *)data;
+    ULONG n = length / 2, i = 0;
+    if (n > 2 && w[0] == '0' && (w[1] == 'x' || w[1] == 'X')) i = 2;
+    for (; i < n && w[i]; ++i) { const WCHAR c = w[i]; v = v * 16 + (c >= '0' && c <= '9' ? c - '0' : (c | 0x20) >= 'a' && (c | 0x20) <= 'f' ? (c | 0x20) - 'a' + 10 : 0); }
+    *out = v;
+    return 1;
   }
   return 0;
 }
-
-static BOOLEAN heap_free(PVOID heap, ULONG flags, PVOID memory) {
-  (void)flags;
-  Heap *h = heap;
-  if (!heap_ok(h)) return FALSE;
-  if (!memory) return TRUE;
-  if (!heap_owns(h, memory)) return FALSE;
-  Chunk *c = (Chunk *)((BYTE *)memory - 16);
-  if (!(c->size_flags & CHUNK_USED)) return FALSE;      /* freed twice */
-  ULONGLONG size = CHUNK_SIZE(c);
-  int prev_used = (c->size_flags & CHUNK_PREV_USED) != 0;
-  Chunk *after = chunk_next(c);
-  if (!(after->size_flags & CHUNK_USED)) {      /* merge with the free chunk after */
-    size += CHUNK_SIZE(after);
-    free_unlink(after);
-  }
-  if (!prev_used) {      /* merge with the free chunk before */
-    Chunk *before = (Chunk *)((BYTE *)c - c->prev_size);
-    size += CHUNK_SIZE(before);
-    prev_used = (before->size_flags & CHUNK_PREV_USED) != 0;
-    free_unlink(before);
-    c = before;
-  }
-  make_free(h, c, size, prev_used);
-  return TRUE;
-}
-
-static SIZE_T heap_size(PVOID heap, ULONG flags, PVOID memory) {
-  (void)flags;
-  if (!heap_ok(heap) || !memory || !heap_owns(heap, memory)) return (SIZE_T)-1;
-  Chunk *c = (Chunk *)((BYTE *)memory - 16);
-  return (c->size_flags & CHUNK_USED) ? (SIZE_T) * (ULONGLONG *)((BYTE *)c + CHUNK_SIZE(c)) : (SIZE_T)-1;
-}
-static SIZE_T heap_capacity(PVOID memory) { Chunk *c = (Chunk *)((BYTE *)memory - 16); return (SIZE_T)(CHUNK_SIZE(c) - 32); }
-static ULONGLONG *chunk_user_value(PVOID memory) { Chunk *c = (Chunk *)((BYTE *)memory - 16); return (ULONGLONG *)((BYTE *)c + CHUNK_SIZE(c) - 16); }
-static ULONGLONG *chunk_user_flags(PVOID memory) { Chunk *c = (Chunk *)((BYTE *)memory - 16); return (ULONGLONG *)((BYTE *)c + CHUNK_SIZE(c) - 8); }
-
-static PVOID heap_realloc(PVOID heap, ULONG flags, PVOID memory, SIZE_T bytes) {
-  if (!memory) return heap_alloc(heap, flags, bytes);
-  const SIZE_T have = heap_size(heap, flags, memory);
-  if (have == (SIZE_T)-1) return NULL;
-  if (bytes <= heap_capacity(memory)) {      /* fits in the chunk: stays where it is */
-    Chunk *c = (Chunk *)((BYTE *)memory - 16);
-    if ((flags & HEAP_ZERO_MEMORY) && bytes > have) memset((BYTE *)memory + have, 0, bytes - have);
-    *(ULONGLONG *)((BYTE *)c + CHUNK_SIZE(c)) = bytes;
-    return memory;
-  }
-  if (flags & 0x10 /* HEAP_REALLOC_IN_PLACE_ONLY */) {
-    /* A big block may grow into the free chunk after it (a small one is never grown in place: it would be a low-fragmentation block on Windows). */
-    Chunk *c = (Chunk *)((BYTE *)memory - 16);
-    Chunk *after = chunk_next(c);
-    const ULONGLONG have_size = CHUNK_SIZE(c), need = (bytes + 32 + 15) & ~15ull;
-    if (have_size < 0x4000 || (after->size_flags & CHUNK_USED) || have_size + CHUNK_SIZE(after) < need) return NULL;
-    const ULONGLONG total = have_size + CHUNK_SIZE(after);
-    free_unlink(after);
-    if (total - need >= MIN_CHUNK) {
-      c->size_flags = need | CHUNK_USED | (c->size_flags & CHUNK_PREV_USED);
-      make_free(heap, (Chunk *)((BYTE *)c + need), total - need, 1);
-    } else {
-      c->size_flags = total | CHUNK_USED | (c->size_flags & CHUNK_PREV_USED);
-      chunk_next(c)->size_flags |= CHUNK_PREV_USED;
-    }
-    const ULONGLONG user_value = *(ULONGLONG *)((BYTE *)c + have_size - 16), user_flags = *(ULONGLONG *)((BYTE *)c + have_size - 8);
-    *(ULONGLONG *)((BYTE *)c + CHUNK_SIZE(c) - 16) = user_value;
-    *(ULONGLONG *)((BYTE *)c + CHUNK_SIZE(c) - 8) = user_flags;
-    if ((flags & HEAP_ZERO_MEMORY) && bytes > have) memset((BYTE *)memory + have, 0, bytes - have);
-    *(ULONGLONG *)((BYTE *)c + CHUNK_SIZE(c)) = bytes;
-    return memory;
-  }
-  PVOID fresh = heap_alloc(heap, flags & ~HEAP_ZERO_MEMORY, bytes);
-  if (!fresh) return NULL;
-  memcpy(fresh, memory, have < bytes ? have : bytes);
-  if ((flags & HEAP_ZERO_MEMORY) && bytes > have) memset((BYTE *)fresh + have, 0, bytes - have);
-  *chunk_user_value(fresh) = *chunk_user_value(memory);
-  *chunk_user_flags(fresh) = *chunk_user_flags(memory);
-  heap_free(heap, flags, memory);
-  return fresh;
-}
-
-/* The value and the flags (HEAP_SETTABLE_USER_FLAG1..3) a program can keep with a block. */
-EXPORT BOOLEAN NTAPI RtlGetUserInfoHeap(PVOID heap, ULONG flags, PVOID memory, PVOID *value, PULONG user_flags) {
-  (void)flags;
-  heap_lock();
-  const int ok = heap_ok(heap) && memory && heap_size(heap, 0, memory) != (SIZE_T)-1;
-  if (ok) { if (value && (*chunk_user_flags(memory) & 0x100)) *value = (PVOID)(ULONG_PTR)*chunk_user_value(memory); if (user_flags) *user_flags = (ULONG)(*chunk_user_flags(memory) & 0xE00); }
-  heap_unlock();
-  return ok ? TRUE : FALSE;
-}
-EXPORT BOOLEAN NTAPI RtlSetUserValueHeap(PVOID heap, ULONG flags, PVOID memory, PVOID value) {
-  (void)flags;
-  heap_lock();
-  const int ok = heap_ok(heap) && memory && heap_size(heap, 0, memory) != (SIZE_T)-1;
-  if (ok) { *chunk_user_value(memory) = (ULONGLONG)(ULONG_PTR)value; *chunk_user_flags(memory) |= 0x100; }
-  heap_unlock();
-  return ok ? TRUE : FALSE;
-}
-EXPORT BOOLEAN NTAPI RtlSetUserFlagsHeap(PVOID heap, ULONG flags, PVOID memory, ULONG clear, ULONG set) {
-  (void)flags;
-  heap_lock();
-  const int ok = heap_ok(heap) && memory && heap_size(heap, 0, memory) != (SIZE_T)-1;
-  if (ok) *chunk_user_flags(memory) = (*chunk_user_flags(memory) & ~(ULONGLONG)(clear & 0xE00)) | (set & 0xE00);
-  heap_unlock();
-  return ok ? TRUE : FALSE;
-}
-EXPORT PVOID NTAPI RtlAllocateHeap(PVOID heap, ULONG flags, SIZE_T bytes) { heap_lock(); PVOID r = heap_alloc(heap, flags, bytes); heap_unlock(); return r; }
-EXPORT BOOLEAN NTAPI RtlFreeHeap(PVOID heap, ULONG flags, PVOID memory) { heap_lock(); BOOLEAN r = heap_free(heap, flags, memory); heap_unlock(); return r; }
-EXPORT SIZE_T NTAPI RtlSizeHeap(PVOID heap, ULONG flags, PVOID memory) { heap_lock(); SIZE_T r = heap_size(heap, flags, memory); heap_unlock(); return r; }
-EXPORT PVOID NTAPI RtlReAllocateHeap(PVOID heap, ULONG flags, PVOID memory, SIZE_T bytes) { heap_lock(); PVOID r = heap_realloc(heap, flags, memory, bytes); heap_unlock(); return r; }
-
-EXPORT BOOLEAN NTAPI RtlValidateHeap(PVOID heap, ULONG flags, PVOID memory) {
-  (void)flags;
-  if (!heap_ok(heap)) return FALSE;
-  return memory ? heap_size(heap, 0, memory) != (SIZE_T)-1 : TRUE;
-}
-
-EXPORT PVOID NTAPI RtlDestroyHeap(PVOID heap) {
-  Heap *h = heap;
-  if (!heap_ok(h) || h == NtCurrentPeb()->ProcessHeap) return heap;
-  Segment *segment = h->segments;
-  PVOID first = h;
-  h->magic = 0;
-  heaps_remove(h);
-  while (segment) {
-    Segment *next = segment->next;
-    PVOID base = segment->base;
-    SIZE_T zero = 0;
-    if (base != first) NtFreeVirtualMemory(NtCurrentProcess(), &base, &zero, MEM_RELEASE);
-    segment = next;
-  }
-  SIZE_T zero = 0;
-  NtFreeVirtualMemory(NtCurrentProcess(), &first, &zero, MEM_RELEASE);
-  return NULL;
-}
-
-EXPORT BOOLEAN NTAPI RtlLockHeap(PVOID heap) { (void)heap; heap_lock(); return TRUE; }
-EXPORT BOOLEAN NTAPI RtlUnlockHeap(PVOID heap) { (void)heap; if (g_heap_lock && g_heap_owner == TEB_CLIENT_THREAD(NtCurrentTeb())) heap_unlock(); return TRUE; }
-EXPORT ULONG NTAPI RtlCompactHeap(PVOID heap, ULONG flags) { (void)heap; (void)flags; return 0; }
-EXPORT NTSTATUS NTAPI RtlSetHeapInformation(PVOID heap, ULONG info_class, PVOID info, SIZE_T length) { (void)heap; (void)info_class; (void)info; (void)length; return STATUS_SUCCESS; }
-EXPORT NTSTATUS NTAPI RtlQueryHeapInformation(PVOID heap, ULONG info_class, PVOID info, SIZE_T length, PSIZE_T returned) {
-  (void)heap; (void)info_class; (void)info; (void)length; (void)returned;
-  return STATUS_NOT_IMPLEMENTED;
-}
-EXPORT ULONG NTAPI RtlGetProcessHeaps(ULONG count, PVOID *heaps) {
+/* The global flags of the process: the image's own entry of the image file execution options, or the system's (Session Manager). */
+static void read_global_flags(void) {
+  PEB *peb = NtCurrentPeb();
+  static const WCHAR session[] = L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Session Manager";
+  static const WCHAR options[] = L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\";
+  ULONG flags = 0;
+  WCHAR path[260];
   ULONG n = 0;
-  heaps_lock();
-  for (int i = 0; i < MAX_HEAPS; ++i) if (g_heaps[i]) { if (n < count && heaps) heaps[n] = g_heaps[i]; ++n; }
-  heaps_unlock();
-  return n;
-}
-
-/* RtlWalkHeap(heap, entry): the blocks of a heap one after the other, in the layout of PROCESS_HEAP_ENTRY (lpData NULL starts). */
-typedef struct { PVOID lpData; DWORD cbData; BYTE cbOverhead, iRegionIndex; WORD wFlags; ULONGLONG region[3]; } HeapWalkEntry;
-static Chunk *segment_first_chunk(Segment *s) { return (Chunk *)((BYTE *)(((ULONG_PTR)s + sizeof(Segment) + 15) & ~15ull)); }
-EXPORT NTSTATUS NTAPI RtlWalkHeap(PVOID heap, PVOID entry) {
-  Heap *h = heap;
-  HeapWalkEntry *e = entry;
-  if (!heap_ok(h) || !e) return STATUS_INVALID_HANDLE;
-  Segment *segments[64];
-  int count = 0;
-  for (Segment *s = h->segments; s && count < 64; s = s->next) segments[count++] = s;
-  NTSTATUS status = 0x8000001A;      /* STATUS_NO_MORE_ENTRIES */
-  heap_lock();
-  int region = 0;
-  Chunk *c = NULL;
-  if (!e->lpData) { if (count > 0) c = segment_first_chunk(segments[0]); }
-  else { region = e->iRegionIndex; c = chunk_next((Chunk *)((BYTE *)e->lpData - 16)); }
-  while (c) {
-    if (CHUNK_SIZE(c) != 0) break;      /* (a segment ends with a chunk of size 0) */
-    if (++region >= count) { c = NULL; break; }
-    c = segment_first_chunk(segments[region]);
+  if (peb->ProcessParameters && peb->ProcessParameters->ImagePathName.Buffer) {
+    const WCHAR *image = peb->ProcessParameters->ImagePathName.Buffer;
+    ULONG length = peb->ProcessParameters->ImagePathName.Length / 2, base = 0;
+    for (ULONG i = 0; i < length; ++i) if (image[i] == '\\' || image[i] == '/') base = i + 1;
+    for (; n < sizeof(options) / 2 - 1; ++n) path[n] = ((const WCHAR *)options)[n];
+    for (ULONG i = base; i < length && n < 255; ++i) path[n++] = image[i];
+    if (!key_global_flag((const WCHAR *)path, n, &flags)) key_global_flag((const WCHAR *)session, sizeof(session) / 2 - 1, &flags);
   }
-  if (c) {
-    e->lpData = (BYTE *)c + 16;
-    e->cbData = (c->size_flags & CHUNK_USED) ? (DWORD)*(ULONGLONG *)((BYTE *)c + CHUNK_SIZE(c)) : (DWORD)(CHUNK_SIZE(c) - 16);
-    e->cbOverhead = 8;
-    e->iRegionIndex = (BYTE)region;
-    e->wFlags = (c->size_flags & CHUNK_USED) ? 4 /* PROCESS_HEAP_ENTRY_BUSY */ : 0;
-    status = STATUS_SUCCESS;
-  }
-  heap_unlock();
-  return status;
+  *(ULONG *)((BYTE *)peb + 0xBC) = flags;
 }
-
 static PVOID process_heap(void) {
   PEB *peb = NtCurrentPeb();
-  if (!peb->ProcessHeap) { heap_lock(); if (!peb->ProcessHeap) peb->ProcessHeap = heap_new(0, 0); heap_unlock(); }
+  if (!peb->ProcessHeap) {
+    static int flags_read;
+    if (!flags_read) { flags_read = 1; read_global_flags(); } while (__sync_lock_test_and_set(&g_heap_lock, 1)) NtYieldExecution(); if (!peb->ProcessHeap) peb->ProcessHeap = heap_new(0, 0, 0, 1); __sync_lock_release(&g_heap_lock); }
   return peb->ProcessHeap;
 }
 EXPORT PVOID NTAPI RtlProcessHeap(void) { return process_heap(); }

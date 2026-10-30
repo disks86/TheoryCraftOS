@@ -15,6 +15,7 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
+#include "Emulation/AArch64Fp8.hpp"
 #include "Emulation/AArch64SveCommon.hpp"
 #include "Emulation/SoftFloat.hpp"
 
@@ -129,6 +130,17 @@ AArch64Cpu::Step AArch64Cpu::sme(GuestMemory& m, uint32_t insn) {
     else put(&s_.za[i * n + tile], esz, k, value);
   };
 
+  if ((insn & 0xFFFFFC23u) == 0xC08B0000u) {      // LUTI4 {Zd.B x4}, ZT0, {Zn, Zn+1}: sixty-four nibble indices into the table of 32 bit entries, the low byte of each
+    const uint32_t zd = bits_of(insn, 4, 2) << 2, zn = bits_of(insn, 9, 6) << 1;
+    Vec out[4];
+    for (uint32_t e = 0; e < 64; ++e) {
+      const uint32_t src = (zn + e / 32) & 31, nibble = e % 32;
+      const uint32_t index = static_cast<uint32_t>(get(s_.v[src], 3, nibble / 16) >> ((nibble % 16) * 4)) & 15;
+      put(&out[e / 16], 0, e % 16, (s_.zt0[index / 2] >> ((index % 2) * 32)) & 0xFF);
+    }
+    for (uint32_t k = 0; k < 4; ++k) s_.v[(zd + k) & 31] = out[k];
+    return Step::Ok;
+  }
   if (top == 0xC0 && ((insn >> 23) & 1) && !((insn >> 21) & 1) && !((insn >> 10) & 3) && (bits_of(insn, 19, 18) == 3 || bits_of(insn, 19, 17) == 5) && bits_of(insn, 13, 12) != 3) {      // LUTI2 / LUTI4: expand table indices from a vector through ZT0
     const bool luti2 = bits_of(insn, 19, 18) == 3, single = (insn >> 22) & 1, strided = (insn >> 20) & 1, x2 = !single && ((insn >> 14) & 1), x4 = !single && !x2 && ((insn >> 15) & 1);
     if (!single && !x2 && !x4) return undefined();
@@ -310,6 +322,27 @@ AArch64Cpu::Step AArch64Cpu::sme(GuestMemory& m, uint32_t insn) {
     const uint32_t key = insn >> 21;
     Env env = fp_env();
     auto finish = [&]() { fp_finish(env); return Step::Ok; };
+    if (top == 0x80 && key == 0x405 && !(insn & 4) && !(b3 && (insn & 2))) {      // FMOPA / FMOPS (FP8 into single, or half with bit 3): groups of four (two) bytes, predicated per byte
+      const fp8::Fmt fa = static_cast<fp8::Fmt>(s_.fpmr & 1), fb = static_cast<fp8::Fmt>((s_.fpmr >> 3) & 1);
+      const uint32_t group = b3 ? 2 : 4, rows = b3 ? 8 : 4, tiles = b3 ? 2 : 4, tile = insn & (b3 ? 1u : 3u);
+      const uint32_t scale = b3 ? static_cast<uint32_t>((s_.fpmr >> 16) & 15) : static_cast<uint32_t>((s_.fpmr >> 16) & 0x7F);
+      for (uint32_t i = 0; i < rows; ++i)
+        for (uint32_t j = 0; j < rows; ++j) {
+          bool any = false;
+          uint8_t x[4], y[4];
+          for (uint32_t k = 0; k < group; ++k) {
+            const bool row_on = active(pn, group * i + k, 0), col_on = active(pm, group * j + k, 0);
+            any = any || (row_on && col_on);
+            x[k] = row_on ? static_cast<uint8_t>(get(a, 0, group * i + k)) : 0;      // (each operand is zeroed by its own predicate, so a NaN under the other one still counts)
+            y[k] = col_on ? static_cast<uint8_t>(get(b, 0, group * j + k)) : 0;
+            if (subtract) x[k] ^= 0x80;
+          }
+          if (!any) continue;
+          Vec& row = s_.za[i * tiles + tile];
+          put(&row, b3 ? 1 : 2, j, fp8::dot_add(fa, x, fb, y, group, scale, b3 ? Format::F16 : Format::F32, static_cast<uint32_t>(get(row, b3 ? 1 : 2, j)), (s_.fpmr >> 14) & 1));
+        }
+      return Step::Ok;
+    }
     if (top == 0x80 && key == 0x404 && !b3) {      // FMOPA / FMOPS (single precision)
       const uint32_t tile = insn & 3;
       for (uint32_t i = 0; i < 4; ++i)

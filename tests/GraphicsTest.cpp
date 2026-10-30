@@ -731,6 +731,74 @@ static void test_groups(Rig& g) {
   CHECK(!r.end_group(none, 255, ImageFilter::Nearest));   // (no group open)
 }
 
+// The masks of rounded and mask clips are kept: the same clip again (even moved) is found made, a different one is made, and the picture is the same either way.
+static void test_mask_cache(Rig& g) {
+  IRenderer2D& r = *g.r;
+  DeviceRenderer2D& d = *g.dev;
+  auto rounded = [&](int32_t x, int32_t y, float radius) {
+    g.reset();
+    CHECK(r.push_clip_rounded_rect({x, y, 40, 40}, CornerRadii::uniform(radius)));
+    r.fill_rect({0, 0, 64, 64}, kWhite);
+    r.pop_clip();
+    g.read();
+  };
+  rounded(8, 8, 12);
+  const uint64_t hits0 = d.clip_mask_hits(), misses0 = d.clip_mask_misses();
+  uint32_t first[64 * 64];
+  for (uint32_t i = 0; i < 64 * 64; ++i) first[i] = g.frame[i];
+  rounded(8, 8, 12);
+  CHECK(d.clip_mask_hits() == hits0 + 1 && d.clip_mask_misses() == misses0);
+  uint32_t same = 0;
+  for (uint32_t i = 0; i < 64 * 64; ++i) same += first[i] == g.frame[i];
+  CHECK(same == 64 * 64);
+  rounded(10, 6, 12);   // (moved: the same mask)
+  CHECK(d.clip_mask_hits() == hits0 + 2 && d.clip_mask_misses() == misses0);
+  CHECK(g.at(10 + 20, 6 + 20) == kWhite && g.at(10, 6) == kBlack && g.at(10 + 39, 6 + 39) == kBlack);
+  rounded(8, 8, 6);   // (another radius)
+  CHECK(d.clip_mask_misses() == misses0 + 1 && g.at(8, 8) == kBlack);
+  // a mask clip
+  uint8_t m8[64], n8[64];
+  for (uint32_t i = 0; i < 64; ++i) {
+    m8[i] = (i % 8) < 4 ? 255 : 0;
+    n8[i] = (i % 8) < 2 ? 255 : 0;
+  }
+  const uint64_t mh = d.clip_mask_hits(), mm = d.clip_mask_misses();
+  for (int round = 0; round < 3; ++round) {
+    g.reset();
+    r.push_clip_mask(MaskView{ConstByteView(m8, 64), 8, 8, 8}, 20, 20);
+    r.fill_rect({0, 0, 64, 64}, kWhite);
+    r.pop_clip();
+    g.read();
+    CHECK(g.at(21, 21) == kWhite && g.at(25, 21) == kBlack);
+  }
+  CHECK(d.clip_mask_misses() == mm + 1 && d.clip_mask_hits() == mh + 2);
+  g.reset();
+  r.push_clip_mask(MaskView{ConstByteView(n8, 64), 8, 8, 8}, 20, 20);
+  r.fill_rect({0, 0, 64, 64}, kWhite);
+  r.pop_clip();
+  g.read();
+  CHECK(d.clip_mask_misses() == mm + 2 && g.at(21, 21) == kWhite && g.at(23, 21) == kBlack);
+  // many different clips push the oldest out; the first one still draws right afterwards (made again)
+  for (int i = 0; i < 40; ++i) rounded(2, 2, 3.1f + static_cast<float>(i) * 0.25f);
+  const uint64_t before = d.clip_mask_misses();
+  rounded(8, 8, 12);
+  CHECK(d.clip_mask_misses() == before + 1);
+  uint32_t same2 = 0;
+  for (uint32_t i = 0; i < 64 * 64; ++i) same2 += first[i] == g.frame[i];
+  CHECK(same2 == 64 * 64);
+  // clips nested deeper than a cache entry could be spared still draw
+  g.reset();
+  r.push_clip_rounded_rect({0, 0, 60, 60}, CornerRadii::uniform(20));
+  r.push_clip_rounded_rect({4, 4, 52, 52}, CornerRadii::uniform(16));
+  r.push_clip_rounded_rect({8, 8, 44, 44}, CornerRadii::uniform(12));
+  r.fill_rect({0, 0, 64, 64}, kWhite);
+  r.pop_clip();
+  r.pop_clip();
+  r.pop_clip();
+  g.read();
+  CHECK(g.at(30, 30) == kWhite && g.at(0, 0) == kBlack && g.at(8, 8) == kBlack);
+}
+
 static void test_gradients(Rig& g) {
   IRenderer2D& r = *g.r;
   const GradientStop rb[2] = {{0, kRed}, {1, kBlue}};
@@ -1152,12 +1220,13 @@ static void test_primitives() {
     g.r = &d;
     g.dev = &d;
     g.frame = allocate_view<uint32_t>(a, kW * kH);
-    g.exact_clips = false;
+    g.exact_clips = true;   // (rounded and mask clips go through offscreen groups)
     test_rounded(g);
     test_mask(g);
     test_scaled(g, a);
     test_transformed(g, a);
     test_groups(g);
+    test_mask_cache(g);
     test_gradients(g);
     test_clip_stack(g, a);
     test_layers(g);

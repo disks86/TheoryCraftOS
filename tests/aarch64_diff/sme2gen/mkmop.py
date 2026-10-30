@@ -5,8 +5,8 @@ import sys,re
 exec(open(HERE+'/gen.py').read())
 SZ={'b':0,'h':1,'s':2,'d':3}
 ents=[]
-OPS=['smop4','umop4','sumop4','usmop4','fmop4','bfmop4']
-def add(op,sub,srcT,dst,nn,nm):
+OPS=['smop4','umop4','sumop4','usmop4','fmop4','bfmop4','fmop48']
+def add(op,sub,srcT,dst,nn,nm,opname=None):
     mn=op+('s' if sub else 'a')
     t='%s za<t:0-%d>.%s, <n4%d>, <m4%d>'%(mn,{'s':3,'d':7,'h':1}[dst],'%s'.replace('%s',dst),nn,nm)
     # source types use %s -> srcT: build with explicit
@@ -14,7 +14,7 @@ def add(op,sub,srcT,dst,nn,nm):
     r=derive(t.replace('za<t:','za<t:'),srcT)
     if not r: print('NONE',t,srcT,file=sys.stderr); return
     v,m,pos=r
-    ents.append((m,v,OPS.index(op),sub,SZ[srcT],SZ[dst],nn,nm,mn))
+    ents.append((m,v,OPS.index(opname or op),sub,SZ[srcT],SZ[dst],nn,nm,mn))
 for sub in (0,1):
     for op in ('smop4','umop4','sumop4','usmop4'):
         for srcT,dst in (('b','s'),('h','s'),('h','d')):
@@ -26,6 +26,9 @@ for sub in (0,1):
     for srcT,dst in (('h','s'),('h','h')):
         for nn in (1,2):
             for nm in (1,2): add('bfmop4',sub,srcT,dst,nn,nm)
+    for srcT,dst in (('b','s'),('b','h')):
+        for nn in (1,2):
+            for nm in (1,2): add('fmop4',sub,srcT,dst,nn,nm,'fmop48')
 with open(''+OUT+'/AArch64Sme2Mop4Forms.inc','w') as f:
     f.write('// Generated from the LLVM encodings of the SME2.1 MOP4 outer products: the fixed bits, the operation, the element sizes and the number of vectors of each operand. Do not edit.\n')
     f.write('enum Sme2Mop4Op : uint8_t {%s};\n'%', '.join('mo_'+o for o in OPS))

@@ -39,6 +39,10 @@ struct Port {
   std::vector<Rt> retimers;                                      // retimers on the cable behind this lane adapter (the last one is the one at the end)
   uint32_t rt_opcode[8] = {}, rt_metadata[8] = {};
   uint32_t sb_enumerations = 0;
+  std::vector<uint8_t> rt_flash[8];                              // what was written to each retimer's other flash area
+  uint32_t rt_offset[8] = {}, rt_block_writes[8] = {}, rt_block_timeouts = 0, rt_auth_error = 0;     // timeouts: block writes that fail (once each); auth error: the status an authentication ends with
+  uint32_t rt_data[16] = {}, rt_data_bytes = 0;
+  bool rt_gone[8] = {};                                         // the retimer restarted and does not answer
   bool dp_acked = false;
   bool locked = false;                                           // a downstream lane adapter stays locked until the host clears LCK
 };
@@ -61,6 +65,10 @@ struct Router {
   std::vector<uint8_t> drom;         // what DROM_READ gives (none: the operation is not supported)
   uint32_t drom_status = 0;          // the status the operation ends with
   uint32_t drom_reads = 0;
+  bool dp_arbitration = false;       // the DP resource operations are supported
+  uint32_t dp_held_by_other = 0;     // bit n: the DP IN adapter n is held by another connection manager
+  uint32_t dp_held_by_us = 0;
+  std::vector<uint32_t> dp_ops;      // opcode | port << 8 of each DP resource operation
 };
 
 class Fabric {
@@ -124,6 +132,18 @@ class Fabric {
       p.space[0x20 + kPortCs18] = 0;
     }
     return r;
+  }
+  // A Thunderbolt 3 router whose links support CL states (LINK_ATTR.CPS in each port's link controller block) and which has the low power capability (at 0x100) behind the link controller.
+  void make_clx_capable(uint64_t route) {
+    Router& r = *routers_[route];
+    for (uint32_t phys = 0; phys < 4; ++phys) r.regs[0x50 + 4 + phys * 4 + kLcLinkAttr] |= kLcLinkAttrCps;
+    r.regs[0x51] = 0x120;                                                                              // link controller (long form) -> time capability (long form) -> low power (short) -> TMU
+    r.regs[0x120] = (kSwitchCapVse << 8) | (kVsecTime2 << 16);
+    r.regs[0x121] = 0x100;
+    r.regs[0x100] = 0x20 | (kSwitchCapVse << 8) | (kVsecLowPower << 16) | (0x10u << 24);
+    r.regs[0x120 + kTime2Cs9] = kTime2Cs9ObjMask;
+    for (Port& p : r.ports)
+      if (p.type == kTypePort) p.space[0x10] |= 0x40;                                                  // the lane adapters' time capability (the USB4 one is gone)
   }
   // The DP IN adapter asks for `mbps` (in units of the granularity the connection manager set).
   void request_dp_bandwidth(uint64_t route, uint32_t port, uint32_t mbps) {
@@ -337,6 +357,14 @@ class Fabric {
           r.regs[9 + d] = word;
         }
         r.regs[26] = (r.drom_status << kCs26StatusShift);
+      } else if (r.dp_arbitration && ((v & 0xFFFF) == kOpQueryDpResource || (v & 0xFFFF) == kOpAllocDpResource || (v & 0xFFFF) == kOpDeallocDpResource)) {
+        const uint32_t op = v & 0xFFFF, port = r.regs[25] & 0xFF, bit = port < 32 ? 1u << port : 0;
+        r.dp_ops.push_back(op | port << 8);
+        uint32_t status = 0;
+        if (op == kOpDeallocDpResource) r.dp_held_by_us &= ~bit;
+        else if (r.dp_held_by_other & bit) status = 1;
+        else if (op == kOpAllocDpResource) r.dp_held_by_us |= bit;
+        r.regs[26] = status << kCs26StatusShift;
       } else if ((v & 0xFFFF) == kOpBufferAlloc && !r.buffer_alloc.empty()) {
         for (uint32_t d = 0; d < 16; ++d) r.regs[9 + d] = d < r.buffer_alloc.size() ? r.buffer_alloc[d] : 0;
         r.regs[25] = static_cast<uint32_t>(r.buffer_alloc.size());
@@ -380,15 +408,42 @@ class Fabric {
         result |= kSbNoResponse;                                                      // nothing answers at that index
       } else if (target == kSbTargetRouter) {
         if (wr && reg == kSbOpcode && p.space[0x20 + kPortCs2] == kSbOpEnumerate) ++p.sb_enumerations;
+      } else if (index <= p.retimers.size() && p.rt_gone[index]) {
+        result |= kSbNoResponse;
       } else if (index <= p.retimers.size()) {
         const Port::Rt& rt = p.retimers[index - 1];
-        if (wr && reg == kSbOpcode) {
+        if (wr && reg == kSbMetadata) {
+          p.rt_metadata[index] = p.space[0x20 + kPortCs2];
+        } else if (wr && reg == kSbData) {
+          p.rt_data_bytes = (v >> kSbLengthShift) & 0xFF;
+          for (uint32_t k = 0; k < 16; ++k) p.rt_data[k] = p.space[0x20 + kPortCs2 + k];
+        } else if (wr && reg == kSbOpcode) {
           const uint32_t op = p.space[0x20 + kPortCs2];
-          p.rt_opcode[index] = op == kSbOpQueryLast || op == kSbOpGetNvmSectorSize ? 0 : kSbOpOns;       // (done: the register reads zero)
+          p.rt_opcode[index] = op == kSbOpQueryLast || op == kSbOpGetNvmSectorSize || op == kSbOpNvmSetOffset || op == kSbOpNvmBlockWrite || op == kSbOpNvmRead ? 0 : kSbOpOns;       // (done: the register reads zero)
           if (op == kSbOpQueryLast) p.rt_metadata[index] = index == p.retimers.size() ? 1 : 0;
           if (op == kSbOpGetNvmSectorSize) p.rt_metadata[index] = rt.sector;
+          if (op == kSbOpNvmSetOffset) p.rt_offset[index] = ((p.rt_metadata[index] >> 2) & 0x3FFFFF) * 4;
+          if (op == kSbOpNvmBlockWrite) {
+            if (p.rt_block_timeouts > 0) { --p.rt_block_timeouts; p.rt_opcode[index] = kSbOpOns; }      // (a block that is not taken)
+            else {
+              ++p.rt_block_writes[index];
+              if (p.rt_flash[index].size() < p.rt_offset[index] + p.rt_data_bytes) p.rt_flash[index].resize(p.rt_offset[index] + p.rt_data_bytes);
+              for (uint32_t k = 0; k < p.rt_data_bytes; ++k) p.rt_flash[index][p.rt_offset[index] + k] = static_cast<uint8_t>(p.rt_data[k / 4] >> (8 * (k % 4)));
+              p.rt_offset[index] += p.rt_data_bytes;
+            }
+          }
+          if (op == kSbOpNvmRead) {
+            const uint32_t at = ((p.rt_metadata[index] >> 2) & 0x3FFFFF) * 4, len = ((p.rt_metadata[index] >> 24) & 0xF) ? ((p.rt_metadata[index] >> 24) & 0xF) * 4 : 64;
+            for (uint32_t k = 0; k < 16; ++k) p.rt_data[k] = 0;
+            for (uint32_t k = 0; k < len; ++k) if (at + k < p.rt_flash[index].size()) p.rt_data[k / 4] |= uint32_t{p.rt_flash[index][at + k]} << (8 * (k % 4));
+          }
+          if (op == kSbOpNvmAuthWrite) {
+            if (p.rt_auth_error != 0) { p.rt_opcode[index] = kSbOpErr; p.rt_metadata[index] = p.rt_auth_error; }
+            else p.rt_gone[index] = true;                                                        // it restarts
+          }
         } else if (!wr) {
-          p.space[0x20 + kPortCs2] = reg == kSbVendorId ? rt.vendor : reg == kSbProductId ? rt.product : reg == kSbOpcode ? p.rt_opcode[index] : reg == kSbMetadata ? p.rt_metadata[index] : 0;
+          if (reg == kSbData) for (uint32_t k = 0; k < 16; ++k) p.space[0x20 + kPortCs2 + k] = p.rt_data[k];
+          else p.space[0x20 + kPortCs2] = reg == kSbVendorId ? rt.vendor : reg == kSbProductId ? rt.product : reg == kSbOpcode ? p.rt_opcode[index] : reg == kSbMetadata ? p.rt_metadata[index] : 0;
         }
       } else if (!wr) {
         result |= kSbNoResponse;

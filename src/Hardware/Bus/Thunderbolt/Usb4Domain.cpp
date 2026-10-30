@@ -327,6 +327,7 @@ bool Usb4Domain::router_op(const Usb4Router& r, uint32_t opcode, uint32_t* metad
   if (tx_dwords > kOpDataDwords || rx_dwords > kOpDataDwords) return false;
   if (metadata && !write(r.route, 0, TbConfigSpace::Switch, kRouterCs25, ArrayView<const uint32_t>(metadata, 1))) return false;
   if (tx_dwords && !write(r.route, 0, TbConfigSpace::Switch, kRouterCs9, ArrayView<const uint32_t>(tx, tx_dwords))) return false;
+  op_unsupported_ = false;
   uint32_t word = opcode | kCs26Ov;
   if (!write(r.route, 0, TbConfigSpace::Switch, kRouterCs26, ArrayView<const uint32_t>(&word, 1))) return false;
   bool done = false;
@@ -335,6 +336,7 @@ bool Usb4Domain::router_op(const Usb4Router& r, uint32_t opcode, uint32_t* metad
     done = (word & kCs26Ov) == 0;
     if (!done) delay_us(1000);
   }
+  op_unsupported_ = done && (word & kCs26Ons);
   if (!done || (word & kCs26Ons)) return false;
   if (status) *status = static_cast<uint8_t>((word & kCs26StatusMask) >> kCs26StatusShift);
   if (metadata && !read(r.route, 0, TbConfigSpace::Switch, kRouterCs25, ArrayView<uint32_t>(metadata, 1))) return false;
@@ -657,17 +659,29 @@ int Usb4Domain::find_router_cap(const Usb4Router& r, uint8_t id) {
   uint32_t header = 0;
   if (!read(r.route, 0, TbConfigSpace::Switch, 1, ArrayView<uint32_t>(&header, 1))) return -1;
   uint32_t offset = header & 0xFF;
-  for (uint32_t i = 0; i < 64 && offset != 0 && offset < 64; ++i) {
+  for (uint32_t i = 0; i < 64 && offset != 0 && offset < 0x1F00; ++i) {
     uint32_t word = 0;
     if (!read(r.route, 0, TbConfigSpace::Switch, offset, ArrayView<uint32_t>(&word, 1))) return -1;
     if (((word >> 8) & 0xFF) == id) return static_cast<int>(offset);
-    offset = word & 0xFF;
+    uint32_t next = word & 0xFF;
+    if (((word >> 8) & 0xFF) == kSwitchCapVse && ((word >> 24) & 0xFF) == 0) {      // (a vendor specific capability in the long form keeps its next offset in the second dword)
+      uint32_t second = 0;
+      if (!read(r.route, 0, TbConfigSpace::Switch, offset + 1, ArrayView<uint32_t>(&second, 1))) return -1;
+      next = second & 0xFFFF;
+    }
+    offset = next;
   }
   return -1;
 }
 
 bool Usb4Domain::tmu_set_time_disruption(const Usb4Router& r, bool set) {
   uint32_t word = 0;
+  if (r.tbt3) {                                              // (a Thunderbolt 3 router has the bit in its time vendor capability)
+    const int cap = find_router_vse(r, kVsecTime2);
+    if (cap < 0 || static_cast<uint32_t>(cap) + kTime2Cs26 >= 0x1F00 || !read(r.route, 0, TbConfigSpace::Switch, cap + kTime2Cs26, ArrayView<uint32_t>(&word, 1))) return false;
+    word = set ? (word | kTime2Cs26Td) : (word & ~kTime2Cs26Td);
+    return write(r.route, 0, TbConfigSpace::Switch, cap + kTime2Cs26, ArrayView<const uint32_t>(&word, 1));
+  }
   if (!read(r.route, 0, TbConfigSpace::Switch, r.cap_tmu + kTmuRtrCs0, ArrayView<uint32_t>(&word, 1))) return false;
   word = set ? (word | kTmuRtrCs0Td) : (word & ~kTmuRtrCs0Td);
   return write(r.route, 0, TbConfigSpace::Switch, r.cap_tmu + kTmuRtrCs0, ArrayView<const uint32_t>(&word, 1));
@@ -725,11 +739,22 @@ bool Usb4Domain::tmu_enable_root(Usb4Router& root) {
   return ok;
 }
 
+// Titan Ridge objects to CL states while the time is synchronized; the objections of the time capability and of the upstream adapter are switched off first (tb_switch_tmu_disable_objections).
+bool Usb4Domain::tmu_disable_objections(const Usb4Router& r) {
+  if (!is_titan_ridge(r)) return true;
+  const int cap = find_router_vse(r, kVsecTime2);
+  uint32_t word = 0;
+  if (cap < 0 || static_cast<uint32_t>(cap) + kTime2Cs9 >= 0x1F00 || !read(r.route, 0, TbConfigSpace::Switch, cap + kTime2Cs9, ArrayView<uint32_t>(&word, 1))) return false;
+  word &= ~kTime2Cs9ObjMask;
+  return write(r.route, 0, TbConfigSpace::Switch, cap + kTime2Cs9, ArrayView<const uint32_t>(&word, 1)) && tmu_port_write(r, r.upstream_port, kTmuAdpCs6, kTmuAdpCs6ObjMask, kTmuAdpCs6ObjMask);
+}
+
 bool Usb4Domain::tmu_enable(Usb4Router& child, Usb4Router& parent, const Usb4Router& root, uint32_t down_port) {
-  if (child.tbt3 || child.cap_tmu == 0 || !parent.tmu_lowres) return false;
+  if (child.cap_tmu == 0 || !parent.tmu_lowres) return false;
   uint32_t cs0 = 0;
   if (!read(child.route, 0, TbConfigSpace::Switch, child.cap_tmu + kTmuRtrCs0, ArrayView<uint32_t>(&cs0, 1)) || !(cs0 & kTmuRtrCs0Ucap)) return false;
-  tmu_post_time(child, root);
+  if (child.tbt3 && !tmu_disable_objections(child)) return false;
+  if (!child.tbt3) tmu_post_time(child, root);              // (the time is posted to USB4 routers only)
   if (!tmu_set_time_disruption(child, true)) return false;
   bool ok = tmu_rate_write(parent, kTmuLowResRate);
   // the parameters of the mode: the frequency measurement window and the averaging constants
@@ -823,6 +848,86 @@ void Usb4Domain::scan_retimers(Usb4Router& r, uint32_t port) {
     rt.product = product;
     rt.sector_size = metadata & 0xFFFFFF;
   }
+}
+
+const Usb4Port::Retimer* Usb4Domain::find_retimer(uint32_t router_index, uint32_t port, uint32_t index, const Usb4Router** router) const {
+  const Usb4Router* r = this->router(router_index);
+  if (!r || port == 0 || port >= usb4::kMaxPorts || index >= r->ports[port].retimer_count) return nullptr;
+  *router = r;
+  return &r->ports[port].retimers[index];
+}
+
+// NVM_SET_OFFSET: the dword address in the metadata (bits 23:2), then the operation.
+bool Usb4Domain::retimer_set_offset(const Usb4Router& r, uint32_t port, uint32_t sb_index, uint32_t address) {
+  uint32_t metadata = ((address / 4) << 2) & 0xFFFFFCu;
+  return sb_transfer(r, port, kSbTargetRetimer, sb_index, kSbMetadata, true, &metadata, 4) == 0 && sb_op(r, port, kSbTargetRetimer, sb_index, kSbOpNvmSetOffset, 500000) == 0;
+}
+
+Usb4Domain::RetimerNvm Usb4Domain::retimer_nvm_write(uint32_t router_index, uint32_t port, uint32_t index, ConstByteView image) {
+  const Usb4Router* r = nullptr;
+  const Usb4Port::Retimer* rt = find_retimer(router_index, port, index, &r);
+  if (!rt) return RetimerNvm::NoSuchRetimer;
+  if (rt->vendor != kRetimerVendorIntel) return RetimerNvm::Unsupported;
+  uint32_t start = 0;
+  if (!tb_nvm_validate_image(image, static_cast<uint16_t>(rt->product), false, &start) || (image.size() - start) % 4 != 0) return RetimerNvm::BadImage;
+  const uint32_t sb_index = index + 1;
+  if (!retimer_set_offset(*r, port, sb_index, 0)) return RetimerNvm::Failed;
+  const uint64_t total = image.size() - start;
+  for (uint64_t done = 0; done < total;) {
+    const uint32_t bytes = static_cast<uint32_t>(total - done < 64 ? total - done : 64);
+    uint32_t block[kOpDataDwords] = {};
+    for (uint32_t i = 0; i < bytes; ++i) block[i / 4] |= uint32_t{image[start + done + i]} << (8 * (i % 4));
+    bool ok = false;
+    for (uint32_t attempt = 0; attempt < 4 && !ok; ++attempt)        // (a timeout is tried again, three times)
+      ok = sb_transfer(*r, port, kSbTargetRetimer, sb_index, kSbData, true, block, bytes) == 0 && sb_op(*r, port, kSbTargetRetimer, sb_index, kSbOpNvmBlockWrite, 1000000) == 0;
+    if (!ok) return RetimerNvm::Failed;
+    done += bytes;
+  }
+  return RetimerNvm::Ok;
+}
+
+// The authentication starts with a raw write of the opcode: once it runs the retimer's index is gone, so there is no answer to wait for. A status that can still be read is an error code
+// with the reason in the metadata; no answer at all is what it looks like when it works. `auth_only` authenticates what is in the flash already (the offset set to the start).
+Usb4Domain::RetimerNvm Usb4Domain::retimer_nvm_authenticate(uint32_t router_index, uint32_t port, uint32_t index, bool auth_only, uint32_t* status) {
+  const Usb4Router* r = nullptr;
+  const Usb4Port::Retimer* rt = find_retimer(router_index, port, index, &r);
+  if (!rt) return RetimerNvm::NoSuchRetimer;
+  if (rt->vendor != kRetimerVendorIntel) return RetimerNvm::Unsupported;
+  const uint32_t sb_index = index + 1;
+  if (auth_only && !retimer_set_offset(*r, port, sb_index, 0)) return RetimerNvm::Failed;
+  uint32_t opcode = kSbOpNvmAuthWrite;
+  if (sb_transfer(*r, port, kSbTargetRetimer, sb_index, kSbOpcode, true, &opcode, 4) != 0) return RetimerNvm::Failed;
+  delay_us(150);
+  if (status) *status = 0;
+  uint32_t value = 0;
+  if (sb_transfer(*r, port, kSbTargetRetimer, sb_index, kSbOpcode, false, &value, 4) != 0) return RetimerNvm::Ok;        // (gone: it restarts)
+  if (value == 0) return RetimerNvm::Ok;
+  if (value != kSbOpErr) return RetimerNvm::Failed;
+  uint32_t metadata = 0;
+  if (sb_transfer(*r, port, kSbTargetRetimer, sb_index, kSbMetadata, false, &metadata, 4) != 0) return RetimerNvm::Failed;
+  if (status) *status = metadata & kSbMetadataAuthMask;
+  return (metadata & kSbMetadataAuthMask) != 0 ? RetimerNvm::AuthFailed : RetimerNvm::Ok;
+}
+
+// NVM_READ in blocks of up to 16 dwords from a dword aligned address (tb_nvm_read_data); a block shorter than 16 dwords says its length in the metadata.
+Usb4Domain::RetimerNvm Usb4Domain::retimer_nvm_read(uint32_t router_index, uint32_t port, uint32_t index, uint32_t address, ByteView out) {
+  const Usb4Router* r = nullptr;
+  const Usb4Port::Retimer* rt = find_retimer(router_index, port, index, &r);
+  if (!rt) return RetimerNvm::NoSuchRetimer;
+  if (address % 4 != 0 || out.size() % 4 != 0 || address > 0x3FFFFFu) return RetimerNvm::Failed;
+  const uint32_t sb_index = index + 1;
+  for (uint64_t done = 0; done < out.size();) {
+    const uint32_t bytes = static_cast<uint32_t>(out.size() - done < 64 ? out.size() - done : 64), dwords = bytes / 4;
+    uint32_t metadata = (((address + static_cast<uint32_t>(done)) / 4) << 2) & 0xFFFFFCu;
+    if (dwords < kOpDataDwords) metadata |= dwords << 24;
+    uint32_t block[kOpDataDwords] = {};
+    if (sb_transfer(*r, port, kSbTargetRetimer, sb_index, kSbMetadata, true, &metadata, 4) != 0 || sb_op(*r, port, kSbTargetRetimer, sb_index, kSbOpNvmRead, 500000) != 0 ||
+        sb_transfer(*r, port, kSbTargetRetimer, sb_index, kSbData, false, block, bytes) != 0)
+      return RetimerNvm::Failed;
+    for (uint32_t i = 0; i < bytes; ++i) out[done + i] = static_cast<uint8_t>(block[i / 4] >> (8 * (i % 4)));
+    done += bytes;
+  }
+  return RetimerNvm::Ok;
 }
 
 // ------------------------------------------------------------------ the tree
@@ -1434,6 +1539,7 @@ bool Usb4Domain::remove_tunnel(int slot) {
         port_write(in, t.down_port, in.ports[t.down_port].cap_adapter + kDpCs3, ArrayView<const uint32_t>(&hpd, 1));
       }
       set_dp_enable(in, t.down_port, false);
+      dp_resource(in, kOpDeallocDpResource, t.down_port);     // (and the input is free for the other managers again)
     }
     if (t.device_router >= 0 && routers_[t.device_router]->present) set_dp_enable(*routers_[t.device_router], t.up_port, false);
     deactivate_path(&t.third);
@@ -1444,7 +1550,13 @@ bool Usb4Domain::remove_tunnel(int slot) {
   deactivate_path(&t.up);
   release_path(&t.down);
   release_path(&t.up);
+  const uint8_t group = t.bw_mode || t.kind == Usb4TunnelKind::Dp ? t.group : 0;
   t = Usb4Tunnel();
+  if (group != 0 && group < 8) {                            // (the last stream of a group takes the group's keep with it)
+    bool others = false;
+    for (uint32_t i = 0; i < kMaxTunnels; ++i) others = others || (tunnels_[i].used && tunnels_[i].kind == Usb4TunnelKind::Dp && tunnels_[i].bw_mode && tunnels_[i].group == group);
+    if (!others) group_reserved_[group] = group_timer_[group] = 0;
+  }
   return true;
 }
 
@@ -1750,7 +1862,80 @@ bool Usb4Domain::set_dp_enable(const Usb4Router& r, uint32_t port, bool enable) 
 
 // tb_dp_xchg_caps for two USB4 adapters: the connection manager handshake on the OUT adapter (UF and CMHS set, CMHS clears when it is done, three seconds), then the IN adapter's local
 // capabilities become the OUT adapter's remote ones and the OUT adapter's the IN adapter's (no reduction: they are not limited here).
-bool Usb4Domain::dp_exchange_caps(const Usb4Router& in, uint32_t in_port, const Usb4Router& out, uint32_t out_port) {
+// The rate and bandwidth of a DisplayPort link in Mb/s (tb_dp_cap_get_rate, tb_dp_cap_get_rate_ext, tb_dp_bandwidth). The first knows the rates up to HBR3 (0 for the rest), the second the
+// UHBR rates as well; tunnelling removes the 8b/10b (or the 128b/132b) encoding of the link.
+static uint32_t dp_cap_rate(uint32_t cap) {
+  switch ((cap & usb4::kDpCommonRateMask) >> usb4::kDpCommonRateShift) {
+    case 0: return 1620;
+    case 1: return 2700;
+    case 2: return 5400;
+    case 3: return 8100;
+    default: return 0;
+  }
+}
+static uint32_t dp_cap_rate_ext(uint32_t cap) {
+  if (cap & usb4::kDpCommonUhbr20) return 20000;
+  if (cap & usb4::kDpCommonUhbr13_5) return 13500;
+  if (cap & usb4::kDpCommonUhbr10) return 10000;
+  return dp_cap_rate(cap);
+}
+static uint32_t dp_cap_lanes(uint32_t cap) {
+  switch ((cap & usb4::kDpCommonLanesMask) >> usb4::kDpCommonLanesShift) {
+    case 0: return 1;
+    case 1: return 2;
+    case 2: return 4;
+    default: return 0;
+  }
+}
+static uint32_t dp_bandwidth(uint32_t rate, uint32_t lanes) {
+  return rate >= 10000 ? rate * lanes * 128 / 132 : rate * lanes * 8 / 10;
+}
+
+// DP resource arbitration between connection managers (usb4_switch_query/alloc/dealloc_dp_resource): the operation of the router with the DP IN adapter, the adapter in the metadata. A
+// router that does not know the operations (ONS) leaves the arbitration out, and the adapter is ours; a status other than 0 says another manager holds it.
+bool Usb4Domain::dp_resource(const Usb4Router& r, uint32_t opcode, uint32_t port) {
+  uint32_t metadata = port;
+  uint8_t status = 0;
+  if (!router_op(r, opcode, &metadata, &status, nullptr, 0, nullptr, 0)) return op_unsupported_;
+  return status == 0;
+}
+
+// DPRX done (DP_COMMON_CAP, tb_dp_wait_dprx): the receiver of the display has been read.
+bool Usb4Domain::dp_dprx_done(uint32_t in_router, uint32_t in_port) {
+  if (in_router >= routers_.count() || !routers_[in_router]->present || in_port == 0 || in_port > routers_[in_router]->max_port) return false;
+  const Usb4Router& in = *routers_[in_router];
+  uint32_t cap = 0;
+  return in.ports[in_port].type == kTypeDpIn && in.ports[in_port].cap_adapter != 0 && port_read(in, in_port, in.ports[in_port].cap_adapter + kDpCommonCap, ArrayView<uint32_t>(&cap, 1)) && (cap & kDpCommonDprxDone);
+}
+
+bool Usb4Domain::dp_wait_dprx(uint32_t in_router, uint32_t in_port, uint32_t timeout_ms) {
+  bool done = dp_dprx_done(in_router, in_port);
+  for (uint32_t waited = 0; waited < timeout_ms * 1000 && !done; waited += 100) {
+    delay_us(100);
+    done = dp_dprx_done(in_router, in_port);
+  }
+  if (!done) return false;
+  const int slot = dp_find(in_router, in_port);
+  if (slot >= 0 && tunnels_[slot].bw_mode) dp_update_maximum(slot);
+  return true;
+}
+
+// The stream's maximum once the display has told its capabilities: the DP IN adapter's local capability register now holds the lowest of what was read over AUX.
+bool Usb4Domain::dp_update_maximum(int slot) {
+  Usb4Tunnel& t = tunnels_[slot];
+  const Usb4Router& in = *routers_[t.host_router];
+  uint32_t cap = 0;
+  if (t.granularity == 0 || !port_read(in, t.down_port, in.ports[t.down_port].cap_adapter + kDpLocalCap, ArrayView<uint32_t>(&cap, 1))) return false;
+  const uint32_t bw = dp_bandwidth(dp_cap_rate_ext(cap), dp_cap_lanes(cap));
+  if (bw == 0) return false;
+  t.max_bw = (bw + t.granularity - 1) / t.granularity * t.granularity;
+  return true;
+}
+
+// The capabilities of the two adapters, each copied to the other's remote capability register. A stream without the allocation mode runs at what the links on the way leave free
+// (`max_bandwidth`, 0 for no limit): when the output's rate and lanes do not fit, the highest combination of both adapters' that does is written to the input instead
+// (tb_dp_xchg_caps, tb_dp_reduce_bandwidth).
+bool Usb4Domain::dp_exchange_caps(const Usb4Router& in, uint32_t in_port, const Usb4Router& out, uint32_t out_port, uint32_t max_bandwidth, const char** error) {
   const Usb4Port& i = in.ports[in_port];
   const Usb4Port& o = out.ports[out_port];
   uint32_t status = 0;
@@ -1766,6 +1951,26 @@ bool Usb4Domain::dp_exchange_caps(const Usb4Router& in, uint32_t in_port, const 
   if (!done) return false;
   uint32_t in_cap = 0, out_cap = 0;
   if (!port_read(in, in_port, i.cap_adapter + kDpLocalCap, ArrayView<uint32_t>(&in_cap, 1)) || !port_read(out, out_port, o.cap_adapter + kDpLocalCap, ArrayView<uint32_t>(&out_cap, 1))) return false;
+  if (max_bandwidth != 0) {
+    const uint32_t in_rate = dp_cap_rate(in_cap), in_lanes = dp_cap_lanes(in_cap), out_rate = dp_cap_rate(out_cap), out_lanes = dp_cap_lanes(out_cap);
+    if (dp_bandwidth(out_rate, out_lanes) > max_bandwidth) {
+      static const uint32_t kReduced[][2] = {{8100, 4}, {5400, 4}, {8100, 2}, {2700, 4}, {5400, 2}, {8100, 1}, {1620, 4}, {5400, 1}, {2700, 2}, {1620, 2}, {2700, 1}, {1620, 1}};
+      bool found = false;
+      for (const auto& combination : kReduced) {
+        if (combination[0] > out_rate || combination[1] > out_lanes || combination[0] > in_rate || combination[1] > in_lanes) continue;
+        if (dp_bandwidth(combination[0], combination[1]) > max_bandwidth) continue;
+        const uint32_t rate_index = combination[0] == 1620 ? 0 : combination[0] == 2700 ? 1 : combination[0] == 5400 ? 2 : 3;
+        const uint32_t lanes_index = combination[1] == 1 ? 0 : combination[1] == 2 ? 1 : 2;
+        out_cap = (out_cap & ~(kDpCommonRateMask | kDpCommonLanesMask)) | (rate_index << kDpCommonRateShift) | (lanes_index << kDpCommonLanesShift);
+        found = true;
+        break;
+      }
+      if (!found) {
+        if (error) *error = "not enough bandwidth for the stream";
+        return false;
+      }
+    }
+  }
   return port_write(out, out_port, o.cap_adapter + kDpRemoteCap, ArrayView<const uint32_t>(&in_cap, 1)) && port_write(in, in_port, i.cap_adapter + kDpRemoteCap, ArrayView<const uint32_t>(&out_cap, 1));
 }
 
@@ -1861,6 +2066,11 @@ bool Usb4Domain::tunnel_dp(uint32_t in_router, uint32_t in_port, uint32_t out_ro
     *error = "too many tunnels";
     return false;
   }
+  // another connection manager (the BIOS's, or the one of a router in between) may hold the input: ask before anything is written
+  if (!dp_resource(in, kOpQueryDpResource, in_port) || !dp_resource(in, kOpAllocDpResource, in_port)) {
+    *error = "the DisplayPort input belongs to another connection manager";
+    return false;
+  }
   Usb4Tunnel& t = tunnels_[slot];
   t = Usb4Tunnel();
   t.used = true;
@@ -1903,7 +2113,17 @@ bool Usb4Domain::tunnel_dp(uint32_t in_router, uint32_t in_port, uint32_t out_ro
       t.down.hops[i].nfc_credits = static_cast<uint8_t>(usable < 12 ? usable : 12);
     }
   }
-  if (!dp_exchange_caps(in, in_port, out, out_port)) return fail("the adapters did not exchange their capabilities");
+  // a stream without the allocation mode is cut down to what the links have free, if that is less than the output would send
+  uint32_t input_cap = 0;
+  const bool alloc_mode = port_read(in, in_port, in.ports[in_port].cap_adapter + kDpLocalCap, ArrayView<uint32_t>(&input_cap, 1)) && (input_cap & kDpCommonBwMode) && in.usb4_version != 0 && out.usb4_version != 0;
+  int limit = 0;
+  if (!alloc_mode) {
+    limit = dp_available(slot);
+    if (limit == 0) return fail("no bandwidth left on the links");
+    if (limit < 0 || limit == 0x7FFFFFFF) limit = 0;
+  }
+  const char* why = "the adapters did not exchange their capabilities";
+  if (!dp_exchange_caps(in, in_port, out, out_port, static_cast<uint32_t>(limit), &why)) return fail(why);
   if (!dp_enable_bandwidth_mode(slot)) return fail("the bandwidth allocation mode could not be set up");
   if (!activate_path(&t.down) || !activate_path(&t.up) || !activate_path(&t.third)) return fail("the paths could not be written");
   if (!set_dp_enable(in, in_port, true) || !set_dp_enable(out, out_port, true)) return fail("the DisplayPort adapters could not be enabled");
@@ -1923,6 +2143,46 @@ bool Usb4Domain::disconnect_dp(uint32_t in_router, uint32_t in_port) {
   return false;
 }
 
+bool Usb4Domain::dp_find_output(uint32_t in_router, uint32_t in_port, uint32_t* out_router, uint32_t* out_port) {
+  if (!started_ || in_router >= routers_.count() || !routers_[in_router]->present || in_port == 0 || in_port > routers_[in_router]->max_port || routers_[in_router]->ports[in_port].type != kTypeDpIn) return false;
+  auto top_port = [&](uint32_t router) {                    // the host router's lane adapter that leads to the router (0 for the host router itself)
+    int r = static_cast<int>(router);
+    if (routers_[r]->parent < 0) return 0u;
+    while (routers_[routers_[r]->parent]->parent >= 0) r = routers_[r]->parent;
+    return static_cast<uint32_t>(routers_[r]->parent_port);
+  };
+  const uint32_t wanted = top_port(in_router);
+  for (uint32_t r = 0; r < routers_.count(); ++r) {
+    const Usb4Router& router = *routers_[r];
+    if (!router.present || r == in_router || (wanted != 0 && top_port(r) != wanted)) continue;
+    for (uint32_t p = 1; p <= router.max_port; ++p) {
+      const Usb4Port& port = router.ports[p];
+      if (port.type != kTypeDpOut || port.cap_adapter == 0) continue;
+      bool used = false;
+      for (uint32_t i = 0; i < kMaxTunnels; ++i) used = used || (tunnels_[i].used && tunnels_[i].kind == Usb4TunnelKind::Dp && tunnels_[i].device_router == static_cast<int>(r) && tunnels_[i].up_port == p);
+      uint32_t word = 0;
+      if (used || !port_read(router, p, port.cap_adapter + kDpOutCs2, ArrayView<uint32_t>(&word, 1)) || !(word & kDpOutCs2Hpd)) continue;
+      *out_router = r;
+      *out_port = p;
+      return true;
+    }
+  }
+  return false;
+}
+
+uint32_t Usb4Domain::dp_connect_displays() {
+  uint32_t made = 0;
+  for (uint32_t r = 0; r < routers_.count(); ++r) {
+    if (!routers_[r]->present) continue;
+    for (uint32_t p = 1; p <= routers_[r]->max_port; ++p) {
+      if (routers_[r]->ports[p].type != kTypeDpIn || dp_find(r, p) >= 0) continue;
+      uint32_t out_router = 0, out_port = 0;
+      if (dp_find_output(r, p, &out_router, &out_port) && tunnel_dp(r, p, out_router, out_port, nullptr)) ++made;
+    }
+  }
+  return made;
+}
+
 uint32_t Usb4Domain::dp_tunnels() const {
   uint32_t n = 0;
   for (uint32_t i = 0; i < kMaxTunnels; ++i) n += tunnels_[i].used && tunnels_[i].kind == Usb4TunnelKind::Dp;
@@ -1931,8 +2191,13 @@ uint32_t Usb4Domain::dp_tunnels() const {
 
 // ------------------------------------------------------------------ CL states
 
+bool Usb4Domain::is_titan_ridge(const Usb4Router& r) {
+  return r.vendor_id == 0x8086 && (r.device_id == 0x15E7 || r.device_id == 0x15EA || r.device_id == 0x15EF);
+}
+
+// Of the Thunderbolt 3 routers only Titan Ridge has CL states (tb_switch_clx_is_supported).
 bool Usb4Domain::clx_supported(const Usb4Router& r) const {
-  if (r.tbt3 || r.usb4_version == 0) return false;
+  if (r.tbt3 ? !is_titan_ridge(r) : r.usb4_version == 0) return false;
   if (r.vendor_id == 0x8086 && (r.device_id == 0x9A1B || r.device_id == 0x9A1D || r.device_id == 0x9A1F || r.device_id == 0x9A21)) return false;     // (tb_switch_is_tiger_lake)
   return true;
 }
@@ -1940,9 +2205,14 @@ bool Usb4Domain::clx_supported(const Usb4Router& r) const {
 // tb_port_clx_supported: a bonded link, no other host, the port says it can (PORT_CS_18.CPS), and the lane adapter lists the states.
 bool Usb4Domain::port_clx_supported(const Usb4Router& r, uint32_t port, uint8_t states) {
   const Usb4Port& p = r.ports[port];
-  if (!p.bonded || p.xdomain || p.cap_usb4 == 0 || p.cap_phy == 0) return false;
+  if (!p.bonded || p.xdomain || p.cap_phy == 0) return false;
   uint32_t word = 0;
-  if (!port_read(r, port, p.cap_usb4 + kPortCs18, ArrayView<uint32_t>(&word, 1)) || !(word & kPortCs18Cps)) return false;
+  if (r.tbt3) {                                              // (the link controller says whether the link, an active cable included, supports it: tb_lc_is_clx_supported)
+    uint32_t block = 0;
+    if (!lc_port_block(r, port, &block) || block + kLcLinkAttr >= 0x1F00 || !read(r.route, 0, TbConfigSpace::Switch, block + kLcLinkAttr, ArrayView<uint32_t>(&word, 1)) || !(word & kLcLinkAttrCps)) return false;
+  } else if (p.cap_usb4 == 0 || !port_read(r, port, p.cap_usb4 + kPortCs18, ArrayView<uint32_t>(&word, 1)) || !(word & kPortCs18Cps)) {
+    return false;
+  }
   uint32_t mask = 0;
   if (states & kClx0s) mask |= kLaneCs0Cl0sSupport;
   if (states & kClx1) mask |= kLaneCs0Cl1Support;
@@ -1990,8 +2260,27 @@ bool Usb4Domain::clx_enable(Usb4Router& child, uint8_t states) {
     port_clx_set(child, up, states, false);
     return false;
   }
+  if (!mask_clx_objections(child)) {
+    port_clx_set(child, up, states, false);
+    port_clx_set(parent, down, states, false);
+    return false;
+  }
   child.clx = static_cast<uint8_t>(child.clx | states);
   return true;
+}
+
+// A Titan Ridge below the host has two dual-lane ports (lanes 1 2 and 3 4): the objections of the port that is not the upstream one are masked in the low power capability, those of the
+// upstream one unmasked (tb_switch_mask_clx_objections).
+bool Usb4Domain::mask_clx_objections(const Usb4Router& child) {
+  if (!child.tbt3 || !is_titan_ridge(child)) return true;
+  const int cap = find_router_vse(child, kVsecLowPower);
+  if (cap < 0) return false;
+  const bool port_a = child.upstream_port == 1;
+  const uint32_t mask = port_a ? kLowPwrPortBMask : kLowPwrPortAMask, unmask = port_a ? kLowPwrPortAMask : kLowPwrPortBMask, offset = static_cast<uint32_t>(cap) + (port_a ? kLowPwrC1Cl1 : kLowPwrC3Cl1);
+  uint32_t val[2] = {};
+  if (offset + 2 >= 0x1F00 || !read(child.route, 0, TbConfigSpace::Switch, offset, ArrayView<uint32_t>(val, 2))) return false;
+  for (uint32_t& v : val) v = (v | mask) & ~unmask;
+  return write(child.route, 0, TbConfigSpace::Switch, offset, ArrayView<const uint32_t>(val, 2));
 }
 
 bool Usb4Domain::clx_disable(Usb4Router& child) {
@@ -2074,6 +2363,15 @@ int Usb4Domain::dp_available(int slot) {
       for (uint32_t h = 0; h + 1 < other.third.length; ++h)
         if (other.third.hops[h].router == r) { capacity -= static_cast<int>(other.allocated_bw); break; }
     }
+    uint32_t groups = 0;                                     // (what is kept for the groups of the streams that cross the link, once per group, the stream's own included)
+    for (uint32_t i = 0; i < kMaxTunnels; ++i) {
+      const Usb4Tunnel& other = tunnels_[i];
+      if (!other.used || other.kind != Usb4TunnelKind::Dp || !other.bw_mode || other.group >= 8) continue;
+      for (uint32_t h = 0; h + 1 < other.third.length; ++h)
+        if (other.third.hops[h].router == r) { groups |= 1u << other.group; break; }
+    }
+    for (uint32_t g = 1; g < 8; ++g)
+      if (groups & (1u << g)) capacity -= static_cast<int>(group_reserved_[g]);
     if (router.usb4_version >= 2 && router.parent >= 0 && routers_[router.parent]->usb4_version >= 2 && find_tunnel(r, Usb4TunnelKind::Pcie) >= 0) capacity -= 1500;
     const int usb3 = usb3_on_link(r);                        // (what the USB 3 stream is allocated, times the PCIe weight on top of its own: 3 / 2)
     if (usb3 >= 0) capacity -= static_cast<int>(tunnels_[usb3].allocated_bw * 3 / 2);
@@ -2105,23 +2403,25 @@ bool Usb4Domain::dp_enable_bandwidth_mode(int slot) {
   if (!port_read(in, t.down_port, i.cap_adapter + kDpLocalCap, ArrayView<uint32_t>(&in_cap, 1))) return false;
   if (!(in_cap & kDpCommonBwMode) || in.usb4_version == 0 || out.usb4_version == 0) return true;       // (not supported: the stream runs at the full rate, as before)
   if (!port_read(out, t.up_port, o.cap_adapter + kDpLocalCap, ArrayView<uint32_t>(&out_cap, 1))) return false;
-  static const uint32_t kRates[4] = {1620, 2700, 5400, 8100}, kLanes[3] = {1, 2, 4};
-  const uint32_t in_rate_i = (in_cap & kDpCommonRateMask) >> kDpCommonRateShift, out_rate_i = (out_cap & kDpCommonRateMask) >> kDpCommonRateShift;
-  const uint32_t in_lanes_i = (in_cap & kDpCommonLanesMask) >> kDpCommonLanesShift, out_lanes_i = (out_cap & kDpCommonLanesMask) >> kDpCommonLanesShift;
-  if (in_rate_i > 3 || out_rate_i > 3 || in_lanes_i > 2 || out_lanes_i > 2) return false;
-  const uint32_t rate_i = in_rate_i < out_rate_i ? in_rate_i : out_rate_i, lanes_i = in_lanes_i < out_lanes_i ? in_lanes_i : out_lanes_i;
-  const uint32_t nrd_bw = kRates[rate_i] * kLanes[lanes_i] * 8 / 10;
+  // the non-reduced rate and lanes are those of the lower of the two adapters (no UHBR: DisplayPort 2.0 and below); the maximum through the allocation mode counts the UHBR rates too
+  const uint32_t in_rate = dp_cap_rate(in_cap), out_rate = dp_cap_rate(out_cap), in_lanes = dp_cap_lanes(in_cap), out_lanes = dp_cap_lanes(out_cap);
+  if (in_rate == 0 || out_rate == 0 || in_lanes == 0 || out_lanes == 0) return false;
+  const uint32_t rate_i = (in_rate < out_rate ? in_rate : out_rate) == 1620 ? 0 : (in_rate < out_rate ? in_rate : out_rate) == 2700 ? 1 : (in_rate < out_rate ? in_rate : out_rate) == 5400 ? 2 : 3;
+  const uint32_t lanes_n = in_lanes < out_lanes ? in_lanes : out_lanes, lanes_i = lanes_n == 1 ? 0 : lanes_n == 2 ? 1 : 2;
+  const uint32_t ext_in = dp_cap_rate_ext(in_cap), ext_out = dp_cap_rate_ext(out_cap);
+  const uint32_t max_bw = dp_bandwidth(ext_in < ext_out ? ext_in : ext_out, lanes_n);
   uint32_t granularity = 250;
-  while (nrd_bw / granularity > 255 && granularity <= 1000) granularity *= 2;
+  while (max_bw / granularity > 255 && granularity <= 1000) granularity *= 2;
   if (granularity > 1000) return false;
   // the connection manager's declaration and the group of streams that share a link: one group per host lane adapter the stream leaves by
   if (!port_read(in, t.down_port, i.cap_adapter + kDpCs2, ArrayView<uint32_t>(&cs2, 1))) return false;
   const uint32_t lane = t.third.length ? t.third.hops[t.third.length - 1].in_port : 1;
   cs2 &= ~(kDpCs2CmIdMask | kDpCs2GroupMask | kDpCs2NrdRateMask | kDpCs2NrdLanesMask | kDpCs2GranularityMask);
-  cs2 |= kDpCs2Cmms | (0u << kDpCs2CmIdShift) | ((((lane - 1) / 2) % 7 + 1) << kDpCs2GroupShift) | (rate_i << kDpCs2NrdRateShift) | lanes_i | ((granularity == 250 ? 0u : granularity == 500 ? 1u : 2u) << kDpCs2GranularityShift);
+  t.group = static_cast<uint8_t>(((lane - 1) / 2) % 7 + 1);
+  cs2 |= kDpCs2Cmms | (0u << kDpCs2CmIdShift) | (static_cast<uint32_t>(t.group) << kDpCs2GroupShift) | (rate_i << kDpCs2NrdRateShift) | lanes_i | ((granularity == 250 ? 0u : granularity == 500 ? 1u : 2u) << kDpCs2GranularityShift);
   if (!port_write(in, t.down_port, i.cap_adapter + kDpCs2, ArrayView<const uint32_t>(&cs2, 1))) return false;
   t.granularity = granularity;
-  t.max_bw = (nrd_bw + granularity - 1) / granularity * granularity;
+  t.max_bw = (max_bw + granularity - 1) / granularity * granularity;
   t.bw_mode = true;
   const int available = dp_available(slot);
   if (available < 0 || !dp_write_estimate(slot, static_cast<uint32_t>(available))) return false;
@@ -2162,16 +2462,51 @@ bool Usb4Domain::dp_serve_request(int slot) {
   if (!port_read(in, t.down_port, p.cap_adapter + kDpCs8, ArrayView<uint32_t>(&cs8, 1)) || !(cs8 & kDpCs8Dr)) return false;
   uint32_t requested = (cs8 & kDpCs8RequestedMask) * t.granularity;
   if (requested > t.max_bw) requested = t.max_bw;
+  if (requested <= t.allocated_bw) {                         // (less or the same: what is given back is kept for the group for a while, tb_alloc_dp_bandwidth)
+    if (t.group < 8 && t.allocated_bw > requested) {
+      group_reserved_[t.group] += t.allocated_bw - requested;
+      group_timer_[t.group] = kGroupReleaseMs;
+    }
+    return dp_allocate(slot, requested);
+  }
   usb3_release_unused(slot);                                // (USB 3 gives back what it holds without using, to make room)
   const int available = dp_available(slot);
-  if (available < 0 || requested > static_cast<uint32_t>(available)) {
+  const uint32_t reserved = t.group < 8 ? group_reserved_[t.group] : 0;
+  if (available < 0 || requested > static_cast<uint32_t>(available) + reserved) {
     dp_allocate(slot, t.allocated_bw);                       // (not enough: the adapter is acknowledged with what it has, so that it stops asking and settles for that)
     usb3_reclaim();
     return false;
   }
   const bool ok = dp_allocate(slot, requested);
+  if (ok && t.group < 8 && requested > static_cast<uint32_t>(available)) {     // (the part that came from the group's keep)
+    const uint32_t used = requested - static_cast<uint32_t>(available);
+    group_reserved_[t.group] -= used < group_reserved_[t.group] ? used : group_reserved_[t.group];
+  }
   usb3_reclaim();
   return ok;
+}
+
+void Usb4Domain::tick(uint64_t now_ms) {
+  if (ticked_ && now_ms > last_tick_ms_) {
+    const uint64_t delta = now_ms - last_tick_ms_;
+    advance_time(delta > 0xFFFFFFFFull ? 0xFFFFFFFFu : static_cast<uint32_t>(delta));
+  }
+  ticked_ = true;
+  last_tick_ms_ = now_ms;
+}
+
+// Time passes: a group's keep is let go when its 10 s are over, and the estimates of the streams are made again.
+void Usb4Domain::advance_time(uint32_t milliseconds) {
+  bool released = false;
+  for (uint32_t g = 1; g < 8; ++g) {
+    if (group_timer_[g] == 0) continue;
+    group_timer_[g] = milliseconds >= group_timer_[g] ? 0 : group_timer_[g] - milliseconds;
+    if (group_timer_[g] == 0 && group_reserved_[g] != 0) {
+      group_reserved_[g] = 0;
+      released = true;
+    }
+  }
+  if (released) dp_recalc_estimates();
 }
 
 // tb_release_unused_usb3_bandwidth: the USB 3 streams on the links this stream crosses are cut down to what they consume.
@@ -2216,7 +2551,7 @@ void Usb4Domain::dp_recalc_estimates() {
     if (!tunnels_[i].used || tunnels_[i].kind != Usb4TunnelKind::Dp || !tunnels_[i].bw_mode) continue;
     const int available = dp_available(static_cast<int>(i));
     if (available < 0) continue;
-    uint32_t estimate = static_cast<uint32_t>(available);      // (what the links have free for it, its own allocation not counted against it)
+    uint32_t estimate = static_cast<uint32_t>(available) + (tunnels_[i].group < 8 ? group_reserved_[tunnels_[i].group] : 0);     // (what the links have free for it, its own allocation not counted against it, the keep of its group added)
     if (estimate > tunnels_[i].max_bw) estimate = tunnels_[i].max_bw;
     dp_write_estimate(static_cast<int>(i), estimate);
   }

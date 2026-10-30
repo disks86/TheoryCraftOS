@@ -1,5 +1,5 @@
 // Generated from the LLVM encodings of the SME2.1 MOP4 outer products: the fixed bits, the operation, the element sizes and the number of vectors of each operand. Do not edit.
-enum Sme2Mop4Op : uint8_t {mo_smop4, mo_umop4, mo_sumop4, mo_usmop4, mo_fmop4, mo_bfmop4};
+enum Sme2Mop4Op : uint8_t {mo_smop4, mo_umop4, mo_sumop4, mo_usmop4, mo_fmop4, mo_bfmop4, mo_fmop48};
 struct Sme2Mop4Form { uint32_t mask, value; Sme2Mop4Op op; uint8_t subtract, src, dst, nn, nm; };
 static const Sme2Mop4Form kSme2Mop4Forms[] = {
     {0xfff1fe3c, 0x80008000, mo_smop4, 0, 0, 2, 1, 1},  // smop4a
@@ -66,6 +66,14 @@ static const Sme2Mop4Form kSme2Mop4Forms[] = {
     {0xfff1fe3e, 0x81300008, mo_bfmop4, 0, 1, 1, 1, 2},  // bfmop4a
     {0xfff1fe3e, 0x81200208, mo_bfmop4, 0, 1, 1, 2, 1},  // bfmop4a
     {0xfff1fe3e, 0x81300208, mo_bfmop4, 0, 1, 1, 2, 2},  // bfmop4a
+    {0xfff1fe3c, 0x80200000, mo_fmop48, 0, 0, 2, 1, 1},  // fmop4a
+    {0xfff1fe3c, 0x80300000, mo_fmop48, 0, 0, 2, 1, 2},  // fmop4a
+    {0xfff1fe3c, 0x80200200, mo_fmop48, 0, 0, 2, 2, 1},  // fmop4a
+    {0xfff1fe3c, 0x80300200, mo_fmop48, 0, 0, 2, 2, 2},  // fmop4a
+    {0xfff1fe3e, 0x80200008, mo_fmop48, 0, 0, 1, 1, 1},  // fmop4a
+    {0xfff1fe3e, 0x80300008, mo_fmop48, 0, 0, 1, 1, 2},  // fmop4a
+    {0xfff1fe3e, 0x80200208, mo_fmop48, 0, 0, 1, 2, 1},  // fmop4a
+    {0xfff1fe3e, 0x80300208, mo_fmop48, 0, 0, 1, 2, 2},  // fmop4a
     {0xfff1fe3c, 0x80008010, mo_smop4, 1, 0, 2, 1, 1},  // smop4s
     {0xfff1fe3c, 0x80108010, mo_smop4, 1, 0, 2, 1, 2},  // smop4s
     {0xfff1fe3c, 0x80008210, mo_smop4, 1, 0, 2, 2, 1},  // smop4s

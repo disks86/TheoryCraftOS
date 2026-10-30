@@ -18,7 +18,7 @@ def emit(op,mn,srcT,dst,N,shape,scale,idxmax=0):
         entries.append((m,v,op,1,'VI',SZ[srcT],SZ[dst],[x[0] for x in offbits],scale,[x[0] for x in idxbits],mn))
         return
     _old(op,mn,srcT,dst,N,shape,scale,idxmax)
-def E(mn,srcT,dst,N,shape,scale=1,idxmax=0): emit('k_'+mn,mn,srcT,dst,N,shape,scale,idxmax)
+def E(mn,srcT,dst,N,shape,scale=1,idxmax=0,op=None): emit('k_'+(op or mn),mn,srcT,dst,N,shape,scale,idxmax)
 for T in 'sd':
     ix=3 if T=='s' else 1
     for N in (2,4):
@@ -50,6 +50,24 @@ for N in (2,4):
         for sh in 'SM': E(mn,'h','h',N,sh)
         E(mn,'h','h',N,'I',1,7)
 for mn in ('svdot','uvdot'): E(mn,'h','s',2,'I',1,3)
+# FP8 (the operations read FPMR): dot products into half and single, widening multiply-adds into half (two vectors) and single (four), vertical dots
+for N in (2,4):
+    for dst,ix in (('h',7),('s',3)):
+        for sh in 'SM': E('fdot','b',dst,N,sh,op='fdot8')
+        E('fdot','b',dst,N,'I',1,ix,op='fdot8')
+for mn,dst,sc in (('fmlal','h',2),('fmlall','s',4)):
+    E(mn,'b',dst,1,'V',sc,op=mn+'8'); E(mn,'b',dst,1,'VI',sc,15,op=mn+'8')
+    for N in (2,4):
+        for sh in 'SM': E(mn,'b',dst,N,sh,sc,op=mn+'8')
+        E(mn,'b',dst,N,'I',sc,15,op=mn+'8')
+E('fvdot','b','h',2,'I',1,7,op='fvdot8')
+for mn in ('fvdotb','fvdott'):      # two source vectors, four ZA vectors
+    t='%s za.s[<w>, <o:0-7>, vgx4], <n2>, z<zi>.b[<ix:0-3>]'%mn
+    r=derive(t,'b')
+    if r:
+        v,m,pos=r
+        ob=val_map(t,'b','o:0-7',8); ib=val_map(t,'b','ix:0-3',4)
+        entries.append((m,v,'k_'+mn+'8',2,'I',0,2,[x[0] for x in ob],1,[x[0] for x in ib],mn))
 ops=sorted({e[2] for e in entries})
 SH={'A':0,'S':1,'M':2,'I':3,'V':4,'VI':5}
 with open(''+OUT+'/AArch64Sme2Forms.inc','w') as f:

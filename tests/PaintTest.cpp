@@ -333,6 +333,107 @@ static void test_transforms_on_device() {
   }
 }
 
+// CSS filters drawn through the device renderer's group filters agree with the CPU filters.
+static void test_filters_on_device() {
+  const char* pages[] = {
+      "<div style='margin:20px;width:40px;height:30px;background:#e22;filter:blur(3px)'></div>",
+      "<div style='margin:20px;width:40px;height:30px;background:#e22;border:4px solid #139;filter:grayscale(1)'></div>",
+      "<div style='margin:20px;width:40px;height:30px;background:#2a6;filter:brightness(1.5) contrast(.8)'></div>",
+      "<div style='margin:20px;width:40px;height:30px;background:linear-gradient(90deg,#f00,#00f);filter:hue-rotate(90deg) saturate(2)'></div>",
+      "<div style='margin:20px;width:40px;height:30px;background:#2a6;filter:sepia(1) invert(.5) opacity(.6)'></div>",
+      "<div style='margin:30px;width:30px;height:20px;background:#0a0;filter:blur(2px) brightness(1.3)'></div>",
+  };
+  for (const char* body : pages) {
+    Shot cpu(page(body), 120, 100);
+    const std::vector<uint32_t> gpu = cpu.via_device();
+    uint32_t far = 0, inked = 0;
+    for (uint32_t y = 0; y < cpu.height; ++y)
+      for (uint32_t x = 0; x < cpu.width; ++x) {
+        const uint32_t a = cpu.px(x, y), b = gpu[y * cpu.width + x];
+        if (a != 0xFFFFFFFFu) ++inked;
+        if (!near_color(a, b, 24)) ++far;
+      }
+    CHECK(inked > 100);
+    if (far * 10 >= inked + 40) printf("filter page differs: far %u inked %u: %s\n", far, inked, body);
+    CHECK(far * 10 < inked + 40);
+  }
+}
+
+// Rounded clips and clip-path shapes through the device renderer (a group laid over the target through the clip's coverage) agree with the CPU's clips.
+static void test_clips_on_device() {
+  const char* pages[] = {
+      "<div style='margin:10px;width:70px;height:60px;border-radius:25px;overflow:hidden;background:#fff'><div style='width:100px;height:100px;background:#e22'></div></div>",
+      "<div style='margin:10px;width:70px;height:60px;border-radius:12px 30px 5px 40px;overflow:hidden'><div style='width:100px;height:100px;background:linear-gradient(90deg,#00f,#0c0)'></div></div>",
+      "<div style='margin:10px;width:80px;height:70px;background:#e22;clip-path:polygon(50% 0,100% 100%,0 100%)'></div>",
+      "<div style='margin:10px;width:80px;height:70px;background:#139;clip-path:circle(35px at 40px 35px)'></div>",
+      "<div style='margin:10px;width:90px;height:80px;border-radius:30px;overflow:hidden;background:#ccc'><div style='margin:5px;width:60px;height:60px;border-radius:20px;overflow:hidden;background:#0a0'><div style='width:100px;height:30px;background:#fa0'></div></div></div>",
+  };
+  for (const char* body : pages) {
+    Shot cpu(page(body), 120, 100);
+    const std::vector<uint32_t> gpu = cpu.via_device();
+    uint32_t far = 0, inked = 0;
+    for (uint32_t y = 0; y < cpu.height; ++y)
+      for (uint32_t x = 0; x < cpu.width; ++x) {
+        const uint32_t a = cpu.px(x, y), b = gpu[y * cpu.width + x];
+        if (a != 0xFFFFFFFFu) ++inked;
+        if (!near_color(a, b, 12)) ++far;
+      }
+    CHECK(inked > 500);
+    if (far * 50 >= inked) printf("clip page differs: far %u inked %u: %s\n", far, inked, body);
+    CHECK(far * 50 < inked);
+  }
+}
+
+// Box shadows through the device renderer (blurred in a filter group, the box cut out of it) agree with the CPU's.
+static void test_shadows_on_device() {
+  const char* pages[] = {
+      "<div style='margin:30px;width:50px;height:30px;background:#fff;box-shadow:6px 8px 10px #000'></div>",
+      "<div style='margin:30px;width:50px;height:30px;background:#fff;border-radius:14px;box-shadow:0 0 12px 4px rgba(200,0,0,.8)'></div>",
+      "<div style='margin:30px;width:50px;height:30px;background:#ffc;box-shadow:inset 0 0 10px #000'></div>",
+      "<div style='margin:30px;width:50px;height:30px;background:#ffc;border-radius:12px;box-shadow:inset 4px 4px 8px 2px #139'></div>",
+      "<div style='margin:30px;width:50px;height:30px;background:#fff;box-shadow:3px 3px 0 #000, 0 0 16px #06c'></div>",
+  };
+  for (const char* body : pages) {
+    Shot cpu(page(body), 120, 100);
+    const std::vector<uint32_t> gpu = cpu.via_device();
+    uint32_t far = 0, inked = 0;
+    for (uint32_t y = 0; y < cpu.height; ++y)
+      for (uint32_t x = 0; x < cpu.width; ++x) {
+        const uint32_t a = cpu.px(x, y), b = gpu[y * cpu.width + x];
+        if (a != 0xFFFFFFFFu) ++inked;
+        if (!near_color(a, b, 28)) ++far;
+      }
+    CHECK(inked > 300);
+    if (far * 25 >= inked) printf("shadow page differs: far %u inked %u: %s\n", far, inked, body);
+    CHECK(far * 25 < inked);
+  }
+}
+
+// text-shadow blur and filter: drop-shadow() through the device renderer's group filters agree with the CPU's.
+static void test_text_and_drop_shadows_on_device() {
+  const char* pages[] = {
+      "<div style='margin:20px;font:24px sans-serif;color:#fff;background:#222;width:90px;height:40px;text-shadow:2px 2px 4px #f00'>Shade</div>",
+      "<div style='margin:20px;font:26px sans-serif;color:#036;text-shadow:0 0 6px #fa0, 1px 1px 0 #000'>Glow</div>",
+      "<div style='margin:25px;width:40px;height:30px;background:#e22;filter:drop-shadow(6px 5px 4px #000)'></div>",
+      "<div style='margin:20px;width:40px;height:30px;border-radius:15px;background:#2a6;filter:drop-shadow(0 0 6px rgba(0,0,200,.9)) brightness(1.2)'></div>",
+      "<div style='margin:25px;width:30px;height:30px;background:#e22;filter:drop-shadow(4px 4px 0 #00f)'></div>",
+  };
+  for (const char* body : pages) {
+    Shot cpu(page(body), 140, 100);
+    const std::vector<uint32_t> gpu = cpu.via_device();
+    uint32_t far = 0, inked = 0;
+    for (uint32_t y = 0; y < cpu.height; ++y)
+      for (uint32_t x = 0; x < cpu.width; ++x) {
+        const uint32_t a = cpu.px(x, y), b = gpu[y * cpu.width + x];
+        if (a != 0xFFFFFFFFu) ++inked;
+        if (!near_color(a, b, 40)) ++far;
+      }
+    CHECK(inked > 200);
+    if (far * 12 >= inked) printf("shadow page differs: far %u inked %u: %s\n", far, inked, body);
+    CHECK(far * 12 < inked);
+  }
+}
+
 static void test_transforms() {
   // translate
   Shot a(page("<div style='width:40px;height:40px;background:#f00;transform:translate(50px,20px)'></div>"));
@@ -863,6 +964,10 @@ int main() {
     test_golden();
     test_transforms();
     test_transforms_on_device();
+    test_filters_on_device();
+    test_clips_on_device();
+    test_shadows_on_device();
+    test_text_and_drop_shadows_on_device();
     test_filters();
     test_shadows();
     test_gradients_more();

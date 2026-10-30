@@ -117,6 +117,14 @@ static const Sme2VecForm kSme2VecForms[] = {
     {0xfff0ffe1, 0xc120a121, 2, 0, 0, 0x65059c00},  // bfminnm.h
     {0xffe1ffe1, 0xc120b121, 2, 1, 0, 0x65059c00},  // bfminnm.h
     {0xffe0fc01, 0xc120c000, 2, 2, 2, 0x64202400},  // bfclamp.h
+    {0xffe1fc21, 0xc160e800, 2, 0, 3, 0x65400800},  // fmul.h
+    {0xffe1fc21, 0xc160e400, 2, 1, 3, 0x65400800},  // fmul.h
+    {0xffe1fc21, 0xc1a0e800, 2, 0, 3, 0x65800800},  // fmul.s
+    {0xffe1fc21, 0xc1a0e400, 2, 1, 3, 0x65800800},  // fmul.s
+    {0xffe1fc21, 0xc1e0e800, 2, 0, 3, 0x65c00800},  // fmul.d
+    {0xffe1fc21, 0xc1e0e400, 2, 1, 3, 0x65c00800},  // fmul.d
+    {0xffe1fc21, 0xc120e800, 2, 0, 3, 0x65000800},  // bfmul.h
+    {0xffe1fc21, 0xc120e400, 2, 1, 3, 0x65000800},  // bfmul.h
     {0xfff0ffe3, 0xc120a800, 4, 0, 0, 0x04081c00},  // smax.b
     {0xffe3ffe3, 0xc120b800, 4, 1, 0, 0x04081c00},  // smax.b
     {0xfff0ffe3, 0xc120a820, 4, 0, 0, 0x040a1c00},  // smin.b
@@ -233,4 +241,12 @@ static const Sme2VecForm kSme2VecForms[] = {
     {0xfff0ffe3, 0xc120a921, 4, 0, 0, 0x65059c00},  // bfminnm.h
     {0xffe3ffe3, 0xc120b921, 4, 1, 0, 0x65059c00},  // bfminnm.h
     {0xffe0fc03, 0xc120c800, 4, 2, 2, 0x64202400},  // bfclamp.h
+    {0xffe1fc63, 0xc161e800, 4, 0, 3, 0x65400800},  // fmul.h
+    {0xffe3fc63, 0xc161e400, 4, 1, 3, 0x65400800},  // fmul.h
+    {0xffe1fc63, 0xc1a1e800, 4, 0, 3, 0x65800800},  // fmul.s
+    {0xffe3fc63, 0xc1a1e400, 4, 1, 3, 0x65800800},  // fmul.s
+    {0xffe1fc63, 0xc1e1e800, 4, 0, 3, 0x65c00800},  // fmul.d
+    {0xffe3fc63, 0xc1e1e400, 4, 1, 3, 0x65c00800},  // fmul.d
+    {0xffe1fc63, 0xc121e800, 4, 0, 3, 0x65000800},  // bfmul.h
+    {0xffe3fc63, 0xc121e400, 4, 1, 3, 0x65000800},  // bfmul.h
 };

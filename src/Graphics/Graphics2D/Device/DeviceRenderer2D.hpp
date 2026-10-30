@@ -19,6 +19,7 @@
 #pragma once
 #include "Allocators/IAllocator.hpp"
 #include "Graphics/Graphics2D/IRenderer2D.hpp"
+#include "Graphics/Graphics2D/Raster2D.hpp"
 #include "Graphics/Graphics3D/BuiltinShaders.hpp"
 #include "Graphics/Graphics3D/IGraphicsDevice.hpp"
 
@@ -41,6 +42,7 @@ namespace graphics {
 // gradients are triangles with per-vertex colors. Documented approximations (the push calls return false):
 // rounded and mask clips scissor to their bounding rectangle, and layers have no offscreen target, so group
 // opacity is applied to each shape (overlapping shapes show through each other). copy_rect reads the frame back.
+// With offscreen groups a rounded or mask clip is exact too: what is drawn under it goes to a group, which is laid over the parent through the clip's coverage when it is popped.
 // Offscreen groups (begin_group / end_group, and push_layer with an opacity) render into an image of their own, kept premultiplied, and lay it over the
 // target with a textured quad: exact group opacity, and transformed content drawn by the GPU. They need custom blending and the scaled textured shader
 // (software and virgl devices); without them begin_group() returns false.
@@ -83,6 +85,12 @@ class DeviceRenderer2D final : public IRenderer2D {
   bool draw_image_transformed(const Surface& source, const Rect2D& source_rect, const Matrix2D& m, ImageFilter filter) override;
   bool begin_group(const Rect2D& bounds) override;
   bool end_group(const Matrix2D& m, uint8_t opacity, ImageFilter filter) override;
+  bool supports_group_filters() const override { return filters_ok_ && groups_ok_; }
+  bool begin_filter_group(const Rect2D& bounds) override;
+  bool group_blur(float sigma) override;
+  bool group_color(const ColorTransform& t) override;
+  bool group_cut_out(const Rect2D& rect, const CornerRadii& radii) override;
+  bool group_drop_shadow(int32_t dx, int32_t dy, float sigma, uint32_t color) override;
   void draw_image_scaled(const Surface& source, const RectF& source_rect, const Rect2D& dest, ImageFilter filter) override;
   void fill_linear_gradient(const Rect2D& rect, Vec2 from, Vec2 to, ArrayView<const GradientStop> stops) override;
   void fill_radial_gradient(const Rect2D& rect, Vec2 center, Vec2 radii, ArrayView<const GradientStop> stops) override;
@@ -95,6 +103,10 @@ class DeviceRenderer2D final : public IRenderer2D {
   bool copy_rect(const Rect2D& source, int32_t dest_x, int32_t dest_y) override;
   bool draw_device_image(IGraphicsDevice& owner, IImage& image, const Rect2D& source, int32_t x, int32_t y) override;
   void present() override;
+
+  // How many clip masks were found already made (and how many had to be made) since this renderer began: the masks of rounded and mask clips are kept between frames.
+  uint64_t clip_mask_hits() const { return mask_hits_; }
+  uint64_t clip_mask_misses() const { return mask_misses_; }
 
   // The color to draw for a pixel with `cov` (0..255) coverage; false: draw nothing (used by the rounded-rect helpers).
   bool coverage_color(uint32_t color, uint32_t cov, uint32_t* out) const;
@@ -114,6 +126,7 @@ class DeviceRenderer2D final : public IRenderer2D {
     Rect2D clip;
     BlendMode blend;
     bool sheet;   // the vertices are the sheet's (textured), not the colored batch's
+    bool erase = false;   // the vertices erase what is under them (a group's picture times one minus their alpha)
   };
 
   void triangle_colors(const float* xs, const float* ys, const Vec4* colors);  // three vertices, own colors
@@ -134,12 +147,20 @@ class DeviceRenderer2D final : public IRenderer2D {
   bool draw_textured_quad(IImage& image, int64_t dx, int64_t dy, uint32_t w, uint32_t h, float u0, float v0, float u1, float v1);
   // The image's (u0, v0)-(u1, v1) on the quadrilateral with corners (xs[i], ys[i]) (top left, top right, bottom right, bottom left), sampled with `filter`.
   // `scale` is not null for the composite of a group: its pipeline, and the opacity it is drawn at.
-  bool draw_textured_corners(IImage& image, const float xs[4], const float ys[4], float u0, float v0, float u1, float v1, Filter filter, const float* scale = nullptr);
+  bool draw_textured_corners(IImage& image, const float xs[4], const float ys[4], float u0, float v0, float u1, float v1, Filter filter, const float* scale = nullptr, IImage* mask = nullptr);
   // The image, origin and size of what drawing goes to now: the frame, or the innermost group.
   IImage* target_image() const;
   Extent2D target_extent() const;
   Rect2D to_target(const Rect2D& clip) const;   // a clip rectangle in target coordinates, in the coordinates of the current image
   void fill_matrix(Mat4* mvp) const;
+  bool finish_group(const Matrix2D& m, uint8_t opacity, ImageFilter filter);   // the top group onto its parent (through its clip mask, if it is one)
+  void unwind_masks();   // ends the clip groups on top of the group stack (clips left open inside a group or layer)
+  bool push_exact_clip(const Rect2D& rect, const raster::RRect* rounded, const MaskView* mask);
+  bool open_group(const Rect2D& bounds, bool detached);   // begin_group / begin_filter_group
+  bool filter_pass(IPipeline* pipeline, void* constants, uint32_t size, bool horizontal_unused);   // the top group's image through `pipeline` into a new image (which replaces it)
+  bool blur_pass(int32_t radius, bool horizontal);
+  // One textured rectangle covering all of `dest` (w x h), showing `source`, through `pipeline`; `clear` first wipes dest to transparent.
+  bool pass_to(IImage* dest, uint32_t w, uint32_t h, IImage* source, IPipeline* pipeline, const void* constants, uint32_t size, Filter filter, bool clear);
   IPipeline* colored_pipeline(BlendMode mode) const;
   IPipeline* textured_pipeline(BlendMode mode) const;
 
@@ -198,6 +219,11 @@ class DeviceRenderer2D final : public IRenderer2D {
     float opacity = 1.0f;          // the renderer's per-shape opacity outside the group
     bool layer = false;            // from push_layer: its opacity is applied when it ends
     uint8_t layer_opacity = 255;
+    int32_t mask_slot = -1;        // the mask is entry n of the mask cache (which owns it), or -1: the group owns it
+    IImage* mask = nullptr;        // a clip by a coverage mask: the picture is laid over the parent through it when the clip is popped
+    bool detached = false;         // a filter group: its clip is its bounds alone
+    uint32_t prev_detach = 0xFFFFFFFFu;      // detach_index_ outside it
+    uint32_t prev_overflow = 0;
   };
   IShaderModule* scaled_fs_ = nullptr;
   IPipeline* group_blended_ = nullptr;
@@ -206,6 +232,32 @@ class DeviceRenderer2D final : public IRenderer2D {
   Group groups_[kMaxGroups];
   uint32_t group_depth_ = 0;
   bool groups_ok_ = false;
+  // The coverage masks of exact clips, kept (least recently used first to go) so that the same clip drawn again does not build and upload its mask again.
+  static constexpr uint32_t kMaskCacheEntries = 24;
+  static constexpr uint64_t kMaskCachePixels = uint64_t{1} << 23;   // what the cache may hold in all
+  struct MaskEntry {
+    uint64_t key = 0, used = 0;
+    uint32_t width = 0, height = 0, in_use = 0;   // in_use: open groups that draw through it
+    IImage* image = nullptr;
+  };
+  MaskEntry mask_cache_[kMaskCacheEntries];
+  uint64_t mask_clock_ = 0, mask_cache_pixels_ = 0, mask_hits_ = 0, mask_misses_ = 0;
+  int32_t find_mask(uint64_t key, uint32_t w, uint32_t h);
+  int32_t keep_mask(uint64_t key, IImage* image, uint32_t w, uint32_t h);   // a slot for a new mask (evicting the oldest unused), or -1
+  IShaderModule* masked_fs_ = nullptr;
+  IPipeline* masked_ = nullptr;
+  bool masks_ok_ = false;
+  IShaderModule* shadow_fs_ = nullptr;
+  IPipeline* filter_shadow_ = nullptr;
+  IPipeline* group_erase_ = nullptr;
+  bool erase_ = false;   // shapes recorded now erase
+  IShaderModule* blur_fs_ = nullptr;
+  IShaderModule* color_fs_ = nullptr;
+  IPipeline* filter_blur_ = nullptr;
+  IPipeline* filter_color_ = nullptr;
+  bool filters_ok_ = false;
+  static constexpr uint32_t kNoDetach = 0xFFFFFFFFu;
+  uint32_t detach_index_ = kNoDetach;   // the clip_stack_ entry that is the bounds of the innermost filter group: the clip is that entry and those above it
   uint32_t layer_is_group_ = 0;   // bit n: the open layer n is a group
 };
 

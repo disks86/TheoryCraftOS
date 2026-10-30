@@ -473,6 +473,7 @@ RES_ZA = (RES_P + 17*2 + 15) // 16 * 16      # the ZA array: 16 rows of 16 bytes
 RES_ZT0 = RES_ZA + 256      # the 64 byte ZT0 lookup table
 BUF_OFF = RES_ZT0 + 64
 BUF_SIZE = 1024
+FPMR_OFF = V_OFF + 32*16 + 40      # the initial FPMR sits in the gap after the predicates
 INIT_P = V_OFF + 32*16      # initial predicates, same layout (inside the init area, which is RES_OFF-aligned, so reserve the room)
 BLK = BUF_OFF + BUF_SIZE
 
@@ -481,6 +482,7 @@ data = ['.data', '.balign 16']
 for i, text in enumerate(cases):
     out.append(f'  adrp x0, blk{i}\n  add x0, x0, :lo12:blk{i}\n  mov sp, x0')
     out.append(f'  ldr x0, [sp, #{NZCV_OFF}]\n  msr nzcv, x0\n  msr fpsr, xzr')
+    if mode in ('words', 'sme', 'svemem'): out.append(f'  ldr x0, [sp, #{FPMR_OFF}]\n  msr fpmr, x0')
     if mode == 'sme':      # streaming mode with ZA enabled: state is loaded with the SVE and ZA loads, which are legal there
         out.append(f'  add x1, sp, #{INIT_ZA + 64}\n  ldr zt0, [x1]')
         out.append(f'  add x1, sp, #{INIT_ZA}\n  mov w12, #0')
@@ -526,7 +528,12 @@ for i, text in enumerate(cases):
         vs.append(struct.pack('<QQ', v64(fpmode), v64(fpmode)))
     ps = b''.join(struct.pack('<H', pred16()) for _ in range(17))
     blob = b''.join(words + xs + pad + vs) + ps
-    blob += bytes(INIT_ZA - len(blob)) + bytes(random.getrandbits(8) for _ in range(256))
+    def fpmr_value():
+        pick = lambda hi, lo=0: random.choice([0, 0, 1, random.randrange(lo, hi + 1)])
+        return (random.getrandbits(1) | random.getrandbits(1) << 3 | random.getrandbits(1) << 6 | random.getrandbits(1) << 14 | random.getrandbits(1) << 15
+                | pick(127) << 16 | pick(255) << 24 | pick(63) << 32)
+    blob += bytes(INIT_ZA - 8 - len(blob)) + struct.pack('<Q', fpmr_value())
+    blob += bytes(random.getrandbits(8) for _ in range(256))
     blob += bytes(BUF_OFF - len(blob)) + bytes(random.getrandbits(8) for _ in range(BUF_SIZE))
     for off in range(0, len(blob), 16):
         data.append('  .quad 0x%x, 0x%x' % struct.unpack('<QQ', blob[off:off+16]))
