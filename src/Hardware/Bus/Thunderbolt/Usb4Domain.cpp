@@ -317,6 +317,7 @@ void Usb4Domain::scan_port(int index, uint32_t port_number) {
   }
   parent.ports[port_number].remote_router = static_cast<int16_t>(child_index);
   child.ports[child.upstream_port].remote_router = static_cast<int16_t>(index);
+  bond_link(child, parent, port_number);                 // (two lanes as one when both ends can; the link stays as it was when not)
   configuration_valid(child);
   scan_router(child_index);
 }
@@ -340,16 +341,9 @@ void Usb4Domain::remove_router(int index) {
       remove_router(child);
     }
   }
-  const int tunnel = find_tunnel(index);
-  if (tunnel >= 0) {
-    Usb4Tunnel& t = tunnels_[tunnel];
-    // the device is gone: only the host side needs undoing
-    if (t.host_router >= 0 && routers_[t.host_router]->present) set_pcie_enable(*routers_[t.host_router], t.down_port, false);
-    deactivate_path(&t.down);
-    deactivate_path(&t.up);
-    release_path(&t.down);
-    release_path(&t.up);
-    t = Usb4Tunnel();
+  for (uint32_t k = 0; k < 2; ++k) {
+    const int tunnel = find_tunnel(index, k == 0 ? Usb4TunnelKind::Pcie : Usb4TunnelKind::Usb3);
+    if (tunnel >= 0) remove_tunnel(tunnel);                // (the device is gone: only the host side can be undone)
   }
   r.present = false;
 }
@@ -360,13 +354,57 @@ void Usb4Domain::close_preboot_tunnels() {
     Usb4Router& r = *routers_[i];
     for (uint32_t p = 1; p <= r.max_port; ++p) {
       const Usb4Port& port = r.ports[p];
-      if ((port.type != kTypePcieDown && port.type != kTypePcieUp) || port.cap_adapter == 0) continue;
+      if ((port.type != kTypePcieDown && port.type != kTypePcieUp && port.type != kTypeUsb3Down && port.type != kTypeUsb3Up) || port.cap_adapter == 0) continue;
       uint32_t word = 0;
-      if (!port_read(r, p, port.cap_adapter + kAdpPcieCs0, ArrayView<uint32_t>(&word, 1)) || !(word & kAdpPcieCs0Pe)) continue;
-      if (find_tunnel(static_cast<int>(i)) >= 0) continue;     // (ours)
-      if (set_pcie_enable(r, p, false)) ++preboot_closed_;
+      if (!port_read(r, p, port.cap_adapter + kAdpPcieCs0, ArrayView<uint32_t>(&word, 1)) || !(word & kAdpPcieCs0Pe)) continue;       // (PE is bit 31 of the first dword of the PCIe and the USB 3 adapters alike)
+      if (find_tunnel(static_cast<int>(i), Usb4TunnelKind::Pcie) >= 0 || find_tunnel(static_cast<int>(i), Usb4TunnelKind::Usb3) >= 0) continue;     // (ours)
+      const Usb4TunnelKind kind = (port.type == kTypePcieDown || port.type == kTypePcieUp) ? Usb4TunnelKind::Pcie : Usb4TunnelKind::Usb3;
+      if (set_adapter_enable(r, p, kind, false)) ++preboot_closed_;
     }
   }
+}
+
+// ------------------------------------------------------------------ sleep
+
+// usb4_switch_set_sleep: the sleep bit, then wait for the router to say it is ready.
+bool Usb4Domain::put_to_sleep(Usb4Router& r) {
+  uint32_t cs5 = 0;
+  if (!read(r.route, 0, TbConfigSpace::Switch, kRouterCs5, ArrayView<uint32_t>(&cs5, 1))) return false;
+  cs5 |= kCs5Slp;
+  if (!write(r.route, 0, TbConfigSpace::Switch, kRouterCs5, ArrayView<const uint32_t>(&cs5, 1))) return false;
+  for (uint32_t waited = 0; waited < 500000; waited += 1000) {
+    uint32_t cs6 = 0;
+    if (read(r.route, 0, TbConfigSpace::Switch, kRouterCs6, ArrayView<uint32_t>(&cs6, 1)) && (cs6 & kCs6Slpr)) return true;
+    delay_us(1000);
+  }
+  return false;
+}
+
+bool Usb4Domain::suspend() {
+  if (!started_ || suspended_) return false;
+  plug_count_ = 0;                                         // (events from before the sleep mean nothing after it)
+  for (uint32_t i = 0; i < kMaxTunnels; ++i)
+    if (tunnels_[i].used) remove_tunnel(static_cast<int>(i));
+  // deepest first; a router that will not sleep is left awake and dropped with the rest, the host router's refusal is what the answer reports
+  bool host_asleep = true;
+  for (int depth = static_cast<int>(kMaxDepth); depth >= 0; --depth) {
+    for (uint64_t i = 0; i < routers_.count(); ++i) {
+      Usb4Router& r = *routers_[i];
+      if (!r.present || r.depth != depth) continue;
+      if (!put_to_sleep(r) && depth == 0) host_asleep = false;
+    }
+  }
+  for (uint64_t i = 0; i < routers_.count(); ++i) routers_[i]->present = false;
+  started_ = false;
+  suspended_ = true;
+  return host_asleep;
+}
+
+bool Usb4Domain::resume(const char** error) {
+  if (!suspended_) return false;
+  suspended_ = false;
+  preboot_closed_ = 0;
+  return start(error);
 }
 
 // ------------------------------------------------------------------ events
@@ -448,8 +486,10 @@ void Usb4Domain::release_path(Usb4Path* path) {
 
 // A path over one link, from `start_port` of the router `start` to `end_port` of the router `end` that hangs from it (or the other way round): two hops, as tb_path_alloc makes of a PCIe path.
 // The HopID on the link is the lowest that is free as the output of the first router's lane adapter and as the input of the second router's.
-bool Usb4Domain::build_path(Usb4Path* path, int first_router, uint32_t first_port, int second_router, uint32_t second_port) {
+bool Usb4Domain::build_path(Usb4Path* path, int first_router, uint32_t first_port, int second_router, uint32_t second_port, Usb4TunnelKind kind) {
   *path = Usb4Path();
+  path->priority = kind == Usb4TunnelKind::Usb3 ? kUsb3Priority : kPciePriority;
+  path->weight = kind == Usb4TunnelKind::Usb3 ? kUsb3Weight : kPcieWeight;
   Usb4Router& a = *routers_[first_router];
   Usb4Router& b = *routers_[second_router];
   // which of them is the parent: its lane adapter toward the other, and the other's upstream lane adapter
@@ -483,18 +523,19 @@ bool Usb4Domain::build_path(Usb4Path* path, int first_router, uint32_t first_por
   path->hops[1] = Usb4Hop{static_cast<int16_t>(second_router), static_cast<uint8_t>(in_lane), static_cast<uint8_t>(second_port), static_cast<uint16_t>(link_hop), static_cast<uint16_t>(last_out), 0};
   for (uint32_t i = 0; i < path->length; ++i) {
     const Usb4Router& router = *routers_[path->hops[i].router];
-    path->hops[i].credits = router.ports[path->hops[i].in_port].is_lane() ? kPcieCredits : 7;     // (no credit allocation: 16 on a lane adapter, 7 on a protocol adapter)
+    const Usb4Port& in = router.ports[path->hops[i].in_port];
+    path->hops[i].credits = in.is_lane() ? (in.bonded ? 2 * kPcieCredits : kPcieCredits) : 7;     // (no credit allocation: 16 on a lane adapter, 32 when bonded, 7 on a protocol adapter)
   }
   return true;
 }
 
 // One entry of a hop table (tb_path_activate). PCIe paths: flow control out of the source and internal hops and into every hop, no shared buffers, priority 3, weight 1.
-bool Usb4Domain::write_hop(const Usb4Router& r, uint32_t port, uint32_t hop_index, const Usb4Hop& hop, bool first, bool last) {
+bool Usb4Domain::write_hop(const Usb4Router& r, uint32_t port, uint32_t hop_index, const Usb4Hop& hop, bool first, bool last, const Usb4Path& path) {
   const uint8_t in_mask = first ? kPathSource : kPathInternal, out_mask = last ? kPathDestination : kPathInternal;
   const bool ingress_fc = (kPathAll & in_mask) != 0, egress_fc = ((kPathSource | kPathInternal) & out_mask) != 0;
   uint32_t words[2];
   words[0] = hop.out_hop | (static_cast<uint32_t>(hop.out_port) << 11) | (static_cast<uint32_t>(hop.credits) << 17) | (1u << 31);
-  words[1] = kPcieWeight | (kPciePriority << 8) | (0x7FFu << 12) | (ingress_fc ? 1u << 24 : 0) | (egress_fc ? 1u << 25 : 0);   // (counter field all ones, counter disabled: what Linux writes)
+  words[1] = path.weight | (static_cast<uint32_t>(path.priority) << 8) | (0x7FFu << 12) | (ingress_fc ? 1u << 24 : 0) | (egress_fc ? 1u << 25 : 0);   // (counter field all ones, counter disabled: what Linux writes)
   return write(r.route, port, TbConfigSpace::Hops, 2 * hop_index, ArrayView<const uint32_t>(words, 2));
 }
 
@@ -522,7 +563,7 @@ bool Usb4Domain::activate_path(Usb4Path* path) {
     const Usb4Hop& hop = path->hops[i];
     const Usb4Router& r = *routers_[hop.router];
     disable_hop(r, hop.in_port, hop.in_hop);              // (left over from before)
-    if (!write_hop(r, hop.in_port, hop.in_hop, hop, i == 0, i == static_cast<int>(path->length) - 1)) {
+    if (!write_hop(r, hop.in_port, hop.in_hop, hop, i == 0, i == static_cast<int>(path->length) - 1, *path)) {
       for (uint32_t k = static_cast<uint32_t>(i) + 1; k < path->length; ++k) disable_hop(*routers_[path->hops[k].router], path->hops[k].in_port, path->hops[k].in_hop);
       return false;
     }
@@ -540,23 +581,31 @@ void Usb4Domain::deactivate_path(Usb4Path* path) {
   path->activated = false;
 }
 
-bool Usb4Domain::set_pcie_enable(const Usb4Router& r, uint32_t port, bool enable) {
+bool Usb4Domain::set_adapter_enable(const Usb4Router& r, uint32_t port, Usb4TunnelKind kind, bool enable) {
+  (void)kind;                                                       // (the enable bit is bit 31 of the first dword for both kinds)
   const Usb4Port& p = r.ports[port];
   if (p.cap_adapter == 0) return false;
   const uint32_t word = enable ? kAdpPcieCs0Pe : 0;
   return port_write(r, port, p.cap_adapter + kAdpPcieCs0, ArrayView<const uint32_t>(&word, 1));
 }
 
-int Usb4Domain::find_tunnel(int router_index) const {
+bool Usb4Domain::set_pcie_enable(const Usb4Router& r, uint32_t port, bool enable) { return set_adapter_enable(r, port, Usb4TunnelKind::Pcie, enable); }
+
+int Usb4Domain::find_tunnel(int router_index, Usb4TunnelKind kind) const {
   for (uint32_t i = 0; i < kMaxTunnels; ++i)
-    if (tunnels_[i].used && tunnels_[i].device_router == router_index) return static_cast<int>(i);
+    if (tunnels_[i].used && tunnels_[i].device_router == router_index && tunnels_[i].kind == kind) return static_cast<int>(i);
   return -1;
 }
 
-bool Usb4Domain::pcie_tunnelled(uint32_t router_index) const { return find_tunnel(static_cast<int>(router_index)) >= 0; }
+bool Usb4Domain::pcie_tunnelled(uint32_t router_index) const { return find_tunnel(static_cast<int>(router_index), Usb4TunnelKind::Pcie) >= 0; }
+bool Usb4Domain::usb3_tunnelled(uint32_t router_index) const { return find_tunnel(static_cast<int>(router_index), Usb4TunnelKind::Usb3) >= 0; }
+bool Usb4Domain::link_bonded(uint32_t router_index) const {
+  const Usb4Router* r = router(router_index);
+  return r && r->parent >= 0 && r->ports[r->upstream_port].bonded;
+}
 
-// The PCIe down adapter that belongs to a lane adapter of the host: the n-th down adapter for the n-th lane adapter that is a primary one and not the upstream one (usb4_switch_map_pcie_down).
-int Usb4Domain::port_pcie_down_for(const Usb4Router& host, uint32_t lane_port) {
+// The down adapter of `type` that belongs to a lane adapter of the host: the n-th down adapter for the n-th primary downstream lane adapter (usb4_switch_map_pcie_down and its USB 3 twin).
+int Usb4Domain::port_pcie_down_for(const Usb4Router& host, uint32_t lane_port, uint32_t type) {
   uint32_t index = 0;
   for (uint32_t p = 1; p <= host.max_port; ++p) {
     const Usb4Port& port = host.ports[p];
@@ -566,16 +615,81 @@ int Usb4Domain::port_pcie_down_for(const Usb4Router& host, uint32_t lane_port) {
   }
   uint32_t seen = 0;
   for (uint32_t p = 1; p <= host.max_port; ++p) {
-    if (host.ports[p].type != kTypePcieDown) continue;
+    if (host.ports[p].type != type) continue;
     if (seen == index) return static_cast<int>(p);
     ++seen;
   }
   return -1;
 }
 
-bool Usb4Domain::approve_pcie(uint32_t router_index, const char** error) {
+// USB 3 bandwidth of the host router's down adapter (usb4_usb3_port_allocate_bandwidth): the adapter is asked for control (CMR, waiting for HCA), the bandwidth already consumed is read, and the
+// larger of that and the wanted rate is written with a scale that makes it fit 12 bits; the request is withdrawn again.
+bool Usb4Domain::usb3_allocate_bandwidth(const Usb4Router& host, uint32_t down_port, const Usb4Router& device, uint32_t up_port) {
+  const Usb4Port& down = host.ports[down_port];
+  const Usb4Port& up = device.ports[up_port];
+  uint32_t speed_down = 0, speed_up = 0;
+  if (!port_read(host, down_port, down.cap_adapter + kUsb3Cs4, ArrayView<uint32_t>(&speed_down, 1)) || !port_read(device, up_port, up.cap_adapter + kUsb3Cs4, ArrayView<uint32_t>(&speed_up, 1))) return false;
+  const uint32_t rate_down = ((speed_down >> kUsb3Cs4MslrShift) & kUsb3Cs4MslrMask) == kUsb3Cs4Mslr20G ? 20000 : 10000;
+  const uint32_t rate_up = ((speed_up >> kUsb3Cs4MslrShift) & kUsb3Cs4MslrMask) == kUsb3Cs4Mslr20G ? 20000 : 10000;
+  const uint32_t wanted = (rate_down < rate_up ? rate_down : rate_up) * 90 / 100;
+  auto set_request = [&](bool on) {
+    uint32_t cs2 = 0;
+    if (!port_read(host, down_port, down.cap_adapter + kUsb3Cs2, ArrayView<uint32_t>(&cs2, 1))) return false;
+    cs2 = on ? (cs2 | kUsb3Cs2Cmr) : (cs2 & ~kUsb3Cs2Cmr);
+    if (!port_write(host, down_port, down.cap_adapter + kUsb3Cs2, ArrayView<const uint32_t>(&cs2, 1))) return false;
+    for (uint32_t waited = 0; waited < 1500000; waited += 1000) {
+      uint32_t cs1 = 0;
+      if (!port_read(host, down_port, down.cap_adapter + kUsb3Cs1, ArrayView<uint32_t>(&cs1, 1))) return false;
+      if (((cs1 & kUsb3Cs1Hca) != 0) == on) return true;
+      delay_us(1000);
+    }
+    return false;
+  };
+  if (!set_request(true)) return false;
+  bool ok = false;
+  uint32_t cs1 = 0, scale = 0;
+  if (port_read(host, down_port, down.cap_adapter + kUsb3Cs1, ArrayView<uint32_t>(&cs1, 1)) && port_read(host, down_port, down.cap_adapter + kUsb3Cs3, ArrayView<uint32_t>(&scale, 1))) {
+    scale &= 0x3F;
+    auto to_mbps = [](uint32_t bw, uint32_t sc) { return static_cast<uint32_t>((static_cast<uint64_t>(bw) * 512 << sc) * 8000 / 1000000); };
+    const uint32_t consumed_up = to_mbps(cs1 & 0xFFF, scale), consumed_down = to_mbps((cs1 >> 12) & 0xFFF, scale);
+    const uint32_t up_bw = wanted > consumed_up ? wanted : consumed_up, down_bw = wanted > consumed_down ? wanted : consumed_down;
+    const uint32_t max_bw = up_bw > down_bw ? up_bw : down_bw;
+    auto to_bw = [](uint32_t mbps, uint32_t sc) { const uint64_t uframes = static_cast<uint64_t>(mbps) * 1000000 / 8000; const uint64_t unit = 512ull << sc; return static_cast<uint32_t>((uframes + unit - 1) / unit); };
+    uint32_t new_scale = 0;
+    while (new_scale < 64 && to_bw(max_bw, new_scale) >= 4096) ++new_scale;
+    uint32_t cs2 = 0;
+    if (new_scale < 64 && port_write(host, down_port, down.cap_adapter + kUsb3Cs3, ArrayView<const uint32_t>(&new_scale, 1)) &&
+        port_read(host, down_port, down.cap_adapter + kUsb3Cs2, ArrayView<uint32_t>(&cs2, 1))) {
+      cs2 = (cs2 & ~0x00FFFFFFu) | to_bw(up_bw, new_scale) | (to_bw(down_bw, new_scale) << 12);
+      ok = port_write(host, down_port, down.cap_adapter + kUsb3Cs2, ArrayView<const uint32_t>(&cs2, 1));
+    }
+  }
+  set_request(false);
+  return ok;
+}
+
+bool Usb4Domain::remove_tunnel(int slot) {
+  Usb4Tunnel& t = tunnels_[slot];
+  // the adapters first (down, then up), then the paths; the device may be gone already
+  if (t.host_router >= 0 && routers_[t.host_router]->present) set_adapter_enable(*routers_[t.host_router], t.down_port, t.kind, false);
+  if (t.device_router >= 0 && routers_[t.device_router]->present) {
+    set_adapter_enable(*routers_[t.device_router], t.up_port, t.kind, false);
+    if (t.kind == Usb4TunnelKind::Pcie) routers_[t.device_router]->pcie_tunnel = false;
+    else routers_[t.device_router]->usb3_tunnel = false;
+  }
+  deactivate_path(&t.down);
+  deactivate_path(&t.up);
+  release_path(&t.down);
+  release_path(&t.up);
+  t = Usb4Tunnel();
+  return true;
+}
+
+bool Usb4Domain::make_tunnel(uint32_t router_index, Usb4TunnelKind kind, const char** error) {
   const char* local = nullptr;
   if (!error) error = &local;
+  const bool pcie = kind == Usb4TunnelKind::Pcie;
+  const uint32_t down_type = pcie ? kTypePcieDown : kTypeUsb3Down, up_type = pcie ? kTypePcieUp : kTypeUsb3Up;
   if (!started_ || router_index >= routers_.count() || !routers_[router_index]->present) {
     *error = "no such router";
     return false;
@@ -585,7 +699,7 @@ bool Usb4Domain::approve_pcie(uint32_t router_index, const char** error) {
     *error = "the host router";
     return false;
   }
-  if (find_tunnel(static_cast<int>(router_index)) >= 0) {
+  if (find_tunnel(static_cast<int>(router_index), kind) >= 0) {
     *error = "already tunnelled";
     return false;
   }
@@ -594,32 +708,32 @@ bool Usb4Domain::approve_pcie(uint32_t router_index, const char** error) {
     *error = "its parent is gone";
     return false;
   }
-  // the parent must be tunnelled to its own parent first (the device's PCIe link hangs below the parent's bridge)
-  if (host.parent >= 0 && find_tunnel(device.parent) < 0) {
-    *error = "the router above it has no PCIe tunnel yet";
+  // the parent must be tunnelled to its own parent first (the device's link hangs below the parent's bridge or hub)
+  if (host.parent >= 0 && find_tunnel(device.parent, kind) < 0) {
+    *error = "the router above it has no such tunnel yet";
     return false;
   }
   int up = -1;
   for (uint32_t p = 1; p <= device.max_port && up < 0; ++p)
-    if (device.ports[p].type == kTypePcieUp && device.ports[p].cap_adapter != 0) up = static_cast<int>(p);
+    if (device.ports[p].type == up_type && device.ports[p].cap_adapter != 0) up = static_cast<int>(p);
   if (up < 0) {
-    *error = "the router has no PCIe up adapter";
+    *error = pcie ? "the router has no PCIe up adapter" : "the router has no USB 3 up adapter";
     return false;
   }
-  int down = port_pcie_down_for(host, device.parent_port);
+  int down = port_pcie_down_for(host, device.parent_port, down_type);
   auto in_use = [&](int port) {
     for (uint32_t i = 0; i < kMaxTunnels; ++i)
-      if (tunnels_[i].used && tunnels_[i].host_router == device.parent && tunnels_[i].down_port == port) return true;
+      if (tunnels_[i].used && tunnels_[i].kind == kind && tunnels_[i].host_router == device.parent && tunnels_[i].down_port == port) return true;
     uint32_t word = 0;
     return !port_read(host, static_cast<uint32_t>(port), host.ports[port].cap_adapter + kAdpPcieCs0, ArrayView<uint32_t>(&word, 1)) || (word & kAdpPcieCs0Pe) != 0;
   };
   if (down < 0 || host.ports[down].cap_adapter == 0 || in_use(down)) {
     down = -1;
     for (uint32_t p = 1; p <= host.max_port && down < 0; ++p)
-      if (host.ports[p].type == kTypePcieDown && host.ports[p].cap_adapter != 0 && !in_use(static_cast<int>(p))) down = static_cast<int>(p);
+      if (host.ports[p].type == down_type && host.ports[p].cap_adapter != 0 && !in_use(static_cast<int>(p))) down = static_cast<int>(p);
   }
   if (down < 0) {
-    *error = "no free PCIe down adapter";
+    *error = pcie ? "no free PCIe down adapter" : "no free USB 3 down adapter";
     return false;
   }
   int slot = -1;
@@ -632,55 +746,117 @@ bool Usb4Domain::approve_pcie(uint32_t router_index, const char** error) {
   Usb4Tunnel& t = tunnels_[slot];
   t = Usb4Tunnel();
   t.used = true;
+  t.kind = kind;
   t.device_router = static_cast<int16_t>(router_index);
   t.host_router = device.parent;
   t.down_port = static_cast<uint8_t>(down);
   t.up_port = static_cast<uint8_t>(up);
-  if (!build_path(&t.down, device.parent, static_cast<uint32_t>(down), static_cast<int>(router_index), static_cast<uint32_t>(up)) ||
-      !build_path(&t.up, static_cast<int>(router_index), static_cast<uint32_t>(up), device.parent, static_cast<uint32_t>(down))) {
-    release_path(&t.down);
-    release_path(&t.up);
-    t = Usb4Tunnel();
-    *error = "no HopIDs left for the paths";
+  auto fail = [&](const char* why) {
+    remove_tunnel(slot);
+    *error = why;
     return false;
-  }
-  if (!activate_path(&t.down) || !activate_path(&t.up) || !set_pcie_enable(device, static_cast<uint32_t>(up), true)) {
-    deactivate_path(&t.down);
-    deactivate_path(&t.up);
-    release_path(&t.down);
-    release_path(&t.up);
-    t = Usb4Tunnel();
-    *error = "the paths could not be written";
-    return false;
-  }
-  if (!set_pcie_enable(host, static_cast<uint32_t>(down), true)) {
-    set_pcie_enable(device, static_cast<uint32_t>(up), false);
-    deactivate_path(&t.down);
-    deactivate_path(&t.up);
-    release_path(&t.down);
-    release_path(&t.up);
-    t = Usb4Tunnel();
-    *error = "the PCIe down adapter could not be enabled";
-    return false;
+  };
+  if (!build_path(&t.down, device.parent, static_cast<uint32_t>(down), static_cast<int>(router_index), static_cast<uint32_t>(up), kind) ||
+      !build_path(&t.up, static_cast<int>(router_index), static_cast<uint32_t>(up), device.parent, static_cast<uint32_t>(down), kind))
+    return fail("no HopIDs left for the paths");
+  // USB 3 over the host router's adapter has its bandwidth allocated first
+  if (!pcie && host.parent < 0 && !usb3_allocate_bandwidth(host, static_cast<uint32_t>(down), device, static_cast<uint32_t>(up))) return fail("the USB 3 bandwidth could not be allocated");
+  if (!activate_path(&t.down) || !activate_path(&t.up)) return fail("the paths could not be written");
+  // PCIe: the far adapter first; USB 3: the near one first (tb_pci_activate / tb_usb3_activate)
+  if (pcie) {
+    if (!set_adapter_enable(device, static_cast<uint32_t>(up), kind, true) || !set_adapter_enable(host, static_cast<uint32_t>(down), kind, true)) return fail("the adapters could not be enabled");
+  } else {
+    if (!set_adapter_enable(host, static_cast<uint32_t>(down), kind, true) || !set_adapter_enable(device, static_cast<uint32_t>(up), kind, true)) return fail("the adapters could not be enabled");
   }
   t.active = true;
-  device.pcie_tunnel = true;
+  if (pcie) device.pcie_tunnel = true;
+  else device.usb3_tunnel = true;
   return true;
 }
 
+bool Usb4Domain::approve_pcie(uint32_t router_index, const char** error) { return make_tunnel(router_index, Usb4TunnelKind::Pcie, error); }
+bool Usb4Domain::approve_usb3(uint32_t router_index, const char** error) { return make_tunnel(router_index, Usb4TunnelKind::Usb3, error); }
+
 bool Usb4Domain::disconnect_pcie(uint32_t router_index) {
-  const int slot = find_tunnel(static_cast<int>(router_index));
-  if (slot < 0) return false;
-  Usb4Tunnel& t = tunnels_[slot];
-  // the adapters first (down, then up), then the paths; the device may be gone already
-  if (routers_[t.host_router]->present) set_pcie_enable(*routers_[t.host_router], t.down_port, false);
-  if (routers_[router_index]->present) set_pcie_enable(*routers_[router_index], t.up_port, false);
-  deactivate_path(&t.down);
-  deactivate_path(&t.up);
-  release_path(&t.down);
-  release_path(&t.up);
-  if (routers_[router_index]->present) routers_[router_index]->pcie_tunnel = false;
-  t = Usb4Tunnel();
+  const int slot = find_tunnel(static_cast<int>(router_index), Usb4TunnelKind::Pcie);
+  return slot >= 0 && remove_tunnel(slot);
+}
+
+bool Usb4Domain::disconnect_usb3(uint32_t router_index) {
+  const int slot = find_tunnel(static_cast<int>(router_index), Usb4TunnelKind::Usb3);
+  return slot >= 0 && remove_tunnel(slot);
+}
+
+// ------------------------------------------------------------------ lane bonding
+
+int Usb4Domain::lane_width(const Usb4Router& r, uint32_t port) {
+  const Usb4Port& p = r.ports[port];
+  uint32_t word = 0;
+  if (p.cap_phy == 0 || !port_read(r, port, p.cap_phy + kLaneCs1, ArrayView<uint32_t>(&word, 1))) return -1;
+  return static_cast<int>((word & kLaneCs1CurrentWidthMask) >> kLaneCs1CurrentWidthShift);
+}
+
+bool Usb4Domain::set_lane_width(const Usb4Router& r, uint32_t port, uint32_t target) {
+  const Usb4Port& p = r.ports[port];
+  uint32_t word = 0;
+  if (p.cap_phy == 0 || !port_read(r, port, p.cap_phy + kLaneCs1, ArrayView<uint32_t>(&word, 1))) return false;
+  word = (word & ~kLaneCs1TargetWidthMask) | target;
+  return port_write(r, port, p.cap_phy + kLaneCs1, ArrayView<const uint32_t>(&word, 1));
+}
+
+// Bonds the two lanes of the link between `parent`'s downstream adapter and `child`'s upstream one (tb_switch_lane_bonding_enable, USB4 generation 3 links): when both ends can (the
+// upstream USB4 port says BE, both lane adapters support two lanes) each end's lane 0 and lane 1 adapters are set to the dual width, the downstream end is told to bond, and the link must
+// report two lanes within 100 ms. Anything short of that leaves the link as it was.
+bool Usb4Domain::bond_link(Usb4Router& child, Usb4Router& parent, uint32_t down_port) {
+  Usb4Port& up = child.ports[child.upstream_port];
+  Usb4Port& down = parent.ports[down_port];
+  if (up.dual_link < 0 || down.dual_link < 0 || up.cap_usb4 == 0) return false;
+  uint32_t cs18 = 0;
+  if (!port_read(child, child.upstream_port, up.cap_usb4 + kPortCs18, ArrayView<uint32_t>(&cs18, 1)) || !(cs18 & kPortCs18Be)) return false;
+  for (int end = 0; end < 2; ++end) {
+    const Usb4Router& r = end == 0 ? child : parent;
+    const uint32_t lane0 = end == 0 ? child.upstream_port : down_port;
+    uint32_t word = 0;
+    const Usb4Port& p = r.ports[lane0];
+    if (p.cap_phy == 0 || !port_read(r, lane0, p.cap_phy + kLaneCs0, ArrayView<uint32_t>(&word, 1))) return false;
+    if (((word >> kLaneCs0WidthShift) & kLaneCs0WidthMask) != kLaneCs0WidthDual) return false;     // (does not support two lanes)
+  }
+  if (!port_up(parent, static_cast<uint32_t>(down.dual_link))) return false;
+  // each end, upstream first: lane 0 to dual, lane 1 to dual, and the downstream end's lane 0 is told to bond
+  struct End { Usb4Router* router; uint32_t lane0; bool upstream; };
+  const End ends[2] = {{&child, child.upstream_port, true}, {&parent, down_port, false}};
+  bool done[2] = {false, false};
+  auto undo = [&]() {
+    for (int i = 0; i < 2; ++i) {
+      if (!done[i]) continue;
+      const Usb4Router& r = *ends[i].router;
+      set_lane_width(r, ends[i].lane0, kLaneCs1TargetSingle);
+      set_lane_width(r, static_cast<uint32_t>(r.ports[ends[i].lane0].dual_link), kLaneCs1TargetSingle);
+    }
+  };
+  for (int i = 0; i < 2; ++i) {
+    const End& e = ends[i];
+    const uint32_t lane1 = static_cast<uint32_t>(e.router->ports[e.lane0].dual_link);
+    if (lane_width(*e.router, e.lane0) == 1 && !set_lane_width(*e.router, e.lane0, kLaneCs1TargetDual)) { undo(); return false; }
+    const int width1 = lane_width(*e.router, lane1);
+    if (width1 == 1 && !set_lane_width(*e.router, lane1, kLaneCs1TargetDual)) { undo(); return false; }
+    if (width1 == 1 && !e.upstream) {
+      const Usb4Port& p = e.router->ports[e.lane0];
+      uint32_t word = 0;
+      if (!port_read(*e.router, e.lane0, p.cap_phy + kLaneCs1, ArrayView<uint32_t>(&word, 1))) { undo(); return false; }
+      word |= kLaneCs1Lb;
+      if (!port_write(*e.router, e.lane0, p.cap_phy + kLaneCs1, ArrayView<const uint32_t>(&word, 1))) { undo(); return false; }
+    }
+    done[i] = true;
+  }
+  bool dual = false;
+  for (uint32_t waited = 0; waited < 100000 && !dual; waited += 1000) {
+    dual = lane_width(parent, down_port) == static_cast<int>(kLaneCs0WidthDual);
+    if (!dual) delay_us(1000);
+  }
+  if (!dual) { undo(); return false; }
+  up.bonded = down.bonded = true;
+  child.ports[up.dual_link].bonded = parent.ports[down.dual_link].bonded = true;
   return true;
 }
 

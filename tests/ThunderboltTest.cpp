@@ -2783,11 +2783,11 @@ struct Usb4Rig {
   TbControl control{nhi, alloc};
   static constexpr uint64_t kD1 = 0x01, kD2 = 0x301;
   Usb4Rig(bool with_d2 = true) {
-    fabric.add(0, 2, 2, false, true);
-    fabric.add(kD1, 2, 1, true);
+    fabric.add(0, 2, 2, false, true, 2);
+    fabric.add(kD1, 2, 1, true, false, 1, true);
     fabric.link(0, 1, kD1);
     if (with_d2) {
-      fabric.add(kD2, 1, 0, true);
+      fabric.add(kD2, 1, 0, true, false, 0, true);
       fabric.link(kD1, 3, kD2);
     }
     CHECK(control.start());
@@ -2805,7 +2805,7 @@ static void test_usb4_scan() {
   const Usb4Router& host = *domain.router(0);
   const Usb4Router& d1 = *domain.router(1);
   const Usb4Router& d2 = *domain.router(2);
-  CHECK(host.route == 0 && host.depth == 0 && host.parent < 0 && host.upstream_port == 7 && host.max_port == 7 && host.usb4_version == 1);
+  CHECK(host.route == 0 && host.depth == 0 && host.parent < 0 && host.upstream_port == 7 && host.max_port == 9 && host.usb4_version == 1);
   CHECK(d1.route == 0x01 && d1.depth == 1 && d1.parent == 0 && d1.parent_port == 1 && d1.upstream_port == 1 && d1.uid == (0xA0A0A0A1ull | (0x0B0B0B0Bull << 32)));
   CHECK(d2.route == 0x301 && d2.depth == 2 && d2.parent == 1 && d2.parent_port == 3);
   // the ports were read: types, capabilities, hops, the lanes paired
@@ -2850,12 +2850,12 @@ static void test_usb4_pcie() {
   fake_usb4::Router& d1 = rig.fabric.at(0x01);
   auto hop = [](fake_usb4::Router& r, uint32_t port, uint32_t index) { return r.ports[port].hops[index]; };
   const auto h0 = hop(host, 5, 8), h1 = hop(d1, 1, 8);
-  CHECK(h0.first == (8u | (1u << 11) | (7u << 17) | (1u << 31)) && h1.first == (8u | (6u << 11) | (16u << 17) | (1u << 31)));
+  CHECK(h0.first == (8u | (1u << 11) | (7u << 17) | (1u << 31)) && h1.first == (8u | (6u << 11) | (32u << 17) | (1u << 31)));
   CHECK((h0.second & 0xF) == 1 && ((h0.second >> 8) & 7) == 3 && ((h0.second >> 12) & 0x7FF) == 0x7FF && (h0.second & (1u << 24)) && (h0.second & (1u << 25)));       // source: ingress fc, egress fc (internal)
   CHECK((h1.second & (1u << 24)) && !(h1.second & (1u << 25)));                        // destination: no egress fc
   // up path: D1 PCIe up adapter 5 (hop 8) -> lane 1 (next hop 8) -> host lane 1 (hop 8) -> PCIe down adapter 5 (next hop 8)
   const auto u0 = hop(d1, 6, 8), u1 = hop(host, 1, 8);
-  CHECK(u0.first == (8u | (1u << 11) | (7u << 17) | (1u << 31)) && u1.first == (8u | (5u << 11) | (16u << 17) | (1u << 31)));
+  CHECK(u0.first == (8u | (1u << 11) | (7u << 17) | (1u << 31)) && u1.first == (8u | (5u << 11) | (32u << 17) | (1u << 31)));
   // the adapters were enabled, the far one first
   CHECK((d1.ports[6].space[0x10] & kAdpPcieCs0Pe) != 0 && (host.ports[5].space[0x10] & kAdpPcieCs0Pe) != 0);
   size_t up_enable = 0, down_enable = 0, last_hop_write = 0, first_hop_write = 1000000;
@@ -2869,7 +2869,7 @@ static void test_usb4_pcie() {
   CHECK(domain.approve_pcie(2, &error) && domain.pcie_tunnelled(2));
   fake_usb4::Router& d2 = rig.fabric.at(0x301);
   CHECK((d1.ports[5].space[0x10] & kAdpPcieCs0Pe) != 0 && (d2.ports[3].space[0x10] & kAdpPcieCs0Pe) != 0);
-  CHECK(hop(d1, 5, 8).first == (8u | (3u << 11) | (7u << 17) | (1u << 31)) && hop(d2, 1, 8).first == (8u | (3u << 11) | (16u << 17) | (1u << 31)));
+  CHECK(hop(d1, 5, 8).first == (8u | (3u << 11) | (7u << 17) | (1u << 31)) && hop(d2, 1, 8).first == (8u | (3u << 11) | (32u << 17) | (1u << 31)));
   CHECK(!domain.approve_pcie(2, &error) && error);                                    // twice
   // taking the tunnels down: the adapters, then the hops
   CHECK(domain.disconnect_pcie(2) && !domain.pcie_tunnelled(2) && !(d2.ports[3].space[0x10] & kAdpPcieCs0Pe) && !(d1.ports[5].space[0x10] & kAdpPcieCs0Pe));
@@ -2992,6 +2992,13 @@ static void test_usb4_driver() {
   CHECK(driver.use_interrupts(true, 0) && rig.chip.unmasked[0] == ((1u << 0) | (1u << 12)));
   CHECK(driver.use_interrupts(false) && rig.chip.unmasked[0] == 0 && !driver.use_interrupts(true, 16));
   driver.probe_control();
+  // sleep: the routers are put to sleep and the channel stopped; the wake finds them again
+  rig.fabric.link(0, 1, 0x01);
+  rig.chip.send_plug_event(0, 1, false);
+  driver.poll();
+  CHECK(driver.device_count() == 2 && !driver.runtime_suspend(false) && driver.suspend(false) && driver.device_count() == 0 && driver.usb4()->suspended());
+  for (uint64_t route : {0ull, 0x01ull, 0x301ull}) rig.fabric.at(route).regs[5] &= ~kCs5Slp, rig.fabric.at(route).regs[6] &= ~kCs6Slpr;
+  CHECK(driver.resume() == ThunderboltDriver::Outcome::Started && driver.device_count() == 2);
   driver.stop();
   CHECK(!driver.usb4() && driver.device_count() == 0);
   {   // a host router that does not answer: the start fails with a reason
@@ -3002,6 +3009,131 @@ static void test_usb4_driver() {
     CHECK(failing.start_device(chip, nullptr, TbGeneration::Usb4, nullptr) == ThunderboltDriver::Outcome::ControllerFailed && failing.message()[0] != '\0');
   }
   rig.control.start();                                      // (the rig's destructor stops it)
+}
+
+static void test_usb4_bonding() {
+  {   // both ends can: the lanes are bonded, the credits double
+    Usb4Rig rig;
+    Usb4Domain domain(rig.control, rig.alloc);
+    CHECK(domain.start(nullptr));
+    CHECK(domain.link_bonded(1) && domain.link_bonded(2) && !domain.link_bonded(0) && !domain.link_bonded(9));
+    CHECK(domain.router(0)->ports[1].bonded && domain.router(0)->ports[2].bonded && domain.router(1)->ports[1].bonded && domain.router(1)->ports[2].bonded && !domain.router(0)->ports[3].bonded);
+    fake_usb4::Router& host = rig.fabric.at(0);
+    fake_usb4::Router& d1 = rig.fabric.at(0x01);
+    // lane 0 and lane 1 of each end are set to the dual width; the downstream end's lane 0 is told to bond, the upstream one's is not
+    CHECK((host.ports[1].space[0x11] & kLaneCs1TargetWidthMask) == kLaneCs1TargetDual && (host.ports[2].space[0x11] & kLaneCs1TargetWidthMask) == kLaneCs1TargetDual);
+    CHECK((d1.ports[1].space[0x11] & kLaneCs1TargetWidthMask) == kLaneCs1TargetDual && (d1.ports[2].space[0x11] & kLaneCs1TargetWidthMask) == kLaneCs1TargetDual);
+    CHECK((host.ports[1].space[0x11] & kLaneCs1Lb) && !(d1.ports[1].space[0x11] & kLaneCs1Lb));
+    CHECK((host.ports[3].space[0x11] & kLaneCs1TargetWidthMask) == 0);                      // the second link of the host: nothing there
+  }
+  {   // the router does not offer it
+    Usb4Rig rig(false);
+    rig.fabric.at(0x01).ports[1].space[0x20 + kPortCs18] = 0;
+    Usb4Domain domain(rig.control, rig.alloc);
+    const char* error = nullptr;
+    CHECK(domain.start(nullptr) && !domain.link_bonded(1) && (rig.fabric.at(0).ports[1].space[0x11] & kLaneCs1TargetWidthMask) == 0);
+    CHECK(domain.approve_pcie(1, &error) && (rig.fabric.at(0).ports[5].hops[8].first >> 17 & 0x7F) == 7 && (rig.fabric.at(0).ports[1].hops[8].first >> 17 & 0x7F) == 16);       // (one lane: 16 credits)
+  }
+  {   // a router whose lane adapters do not support two lanes
+    Usb4Rig rig(false);
+    rig.fabric.at(0x01).ports[1].space[0x10] &= ~(0x3Fu << 20);
+    Usb4Domain domain(rig.control, rig.alloc);
+    CHECK(domain.start(nullptr) && !domain.link_bonded(1));
+  }
+  {   // the link never reports two lanes: everything is put back
+    Usb4Rig rig(false);
+    rig.fabric.bond_never_completes = true;
+    Usb4Domain domain(rig.control, rig.alloc);
+    CHECK(domain.start(nullptr) && !domain.link_bonded(1) && domain.present_count() == 2);
+    fake_usb4::Router& host = rig.fabric.at(0);
+    CHECK((host.ports[1].space[0x11] & kLaneCs1TargetWidthMask) == kLaneCs1TargetSingle && (host.ports[2].space[0x11] & kLaneCs1TargetWidthMask) == kLaneCs1TargetSingle);
+  }
+}
+
+static void test_usb4_usb3() {
+  Usb4Rig rig;
+  Usb4Domain domain(rig.control, rig.alloc);
+  const char* error = nullptr;
+  CHECK(domain.start(nullptr));
+  fake_usb4::Router& host = rig.fabric.at(0);
+  fake_usb4::Router& d1 = rig.fabric.at(0x01);
+  fake_usb4::Router& d2 = rig.fabric.at(0x301);
+  host.ports[8].space[0x10 + kUsb3Cs4] = kUsb3Cs4Mslr20G << kUsb3Cs4MslrShift;               // the host adapter can do 20 Gb/s, the dock's only 10
+  CHECK(!domain.approve_usb3(2, &error) && error && !domain.usb3_tunnelled(2));                // the dock first
+  rig.fabric.log.clear();
+  CHECK(domain.approve_usb3(1, &error) && domain.usb3_tunnelled(1) && domain.router(1)->usb3_tunnel && !domain.pcie_tunnelled(1));
+  // host USB 3 down adapter (port 8) -> lane 1 -> dock lane 1 -> USB 3 up adapter (port 8): HopID 8, weight 2, priority 3, 7 credits on adapters and 32 on the bonded lanes
+  auto hop = [](fake_usb4::Router& r, uint32_t port, uint32_t index) { return r.ports[port].hops[index]; };
+  CHECK(hop(host, 8, 8).first == (8u | (1u << 11) | (7u << 17) | (1u << 31)) && hop(d1, 1, 8).first == (8u | (8u << 11) | (32u << 17) | (1u << 31)));
+  CHECK((hop(host, 8, 8).second & 0xF) == kUsb3Weight && ((hop(host, 8, 8).second >> 8) & 7) == kUsb3Priority);
+  CHECK((host.ports[8].space[0x10] & kUsb3Cs0Pe) && (d1.ports[8].space[0x10] & kUsb3Cs0Pe));
+  // the bandwidth of the host's adapter: 90% of the slower rate (10 Gb/s) = 9000 Mb/s each way, scale 0, 2198 units of 512 microframes; the request is withdrawn
+  const uint32_t cs2 = host.ports[8].space[0x10 + kUsb3Cs2];
+  CHECK((cs2 & 0xFFF) == 2198 && ((cs2 >> 12) & 0xFFF) == 2198 && !(cs2 & kUsb3Cs2Cmr) && (host.ports[8].space[0x10 + kUsb3Cs3] & 0x3F) == 0);
+  // the near adapter is enabled before the far one
+  size_t near_at = 0, far_at = 0;
+  for (size_t i = 0; i < rig.fabric.log.size(); ++i) {
+    if (rig.fabric.log[i] == "W 0 8 1 16") near_at = i;
+    if (rig.fabric.log[i] == "W 1 8 1 16") far_at = i;
+  }
+  CHECK(near_at != 0 && far_at > near_at);
+  // PCIe and USB 3 tunnels to the same router do not get in each other's way
+  CHECK(domain.approve_pcie(1, &error) && domain.pcie_tunnelled(1) && domain.usb3_tunnelled(1));
+  CHECK(hop(host, 5, 8).first & (1u << 31));
+  // the device behind the dock: its own tunnel, no bandwidth allocation (it is not the host's adapter)
+  CHECK(domain.approve_usb3(2, &error) && (d1.ports[7].space[0x10] & kUsb3Cs0Pe) && (d2.ports[4].space[0x10] & kUsb3Cs0Pe) && !(d1.ports[7].space[0x10 + kUsb3Cs2]));
+  CHECK(!domain.approve_usb3(2, &error));
+  CHECK(domain.disconnect_usb3(2) && !(d2.ports[4].space[0x10] & kUsb3Cs0Pe) && !(hop(d2, 1, 8).first & (1u << 31)) && !domain.disconnect_usb3(2));
+  CHECK(domain.disconnect_usb3(1) && domain.pcie_tunnelled(1) && !(host.ports[8].space[0x10] & kUsb3Cs0Pe));
+  // an unplug takes both kinds with it
+  CHECK(domain.approve_usb3(1, &error));
+  rig.fabric.unlink(0, 1, 0x01);
+  rig.chip.send_plug_event(0, 1, true);
+  domain.poll();
+  CHECK(!domain.usb3_tunnelled(1) && !domain.pcie_tunnelled(1) && !(host.ports[8].space[0x10] & kUsb3Cs0Pe) && !(host.ports[5].space[0x10] & kAdpPcieCs0Pe));
+  // a BIOS USB 3 tunnel is switched off too
+  Usb4Rig other(false);
+  other.fabric.at(0).ports[9].space[0x10] |= kUsb3Cs0Pe;
+  Usb4Domain again(other.control, other.alloc);
+  CHECK(again.start(nullptr) && again.preboot_tunnels_closed() == 1 && !(other.fabric.at(0).ports[9].space[0x10] & kUsb3Cs0Pe));
+  {   // the bandwidth request is never acknowledged: no tunnel, nothing left over
+    Usb4Rig rig2;
+    Usb4Domain d(rig2.control, rig2.alloc);
+    CHECK(d.start(nullptr));
+    rig2.fabric.no_usb3_ack = true;
+    CHECK(!d.approve_usb3(1, &error) && error && !d.usb3_tunnelled(1) && !(rig2.fabric.at(0).ports[8].space[0x10] & kUsb3Cs0Pe) && !(rig2.fabric.at(0).ports[8].hops[8].first & (1u << 31)));
+    rig2.fabric.no_usb3_ack = false;
+    CHECK(d.approve_usb3(1, &error));                         // the HopIDs were given back
+  }
+}
+
+static void test_usb4_sleep() {
+  Usb4Rig rig;
+  Usb4Domain domain(rig.control, rig.alloc);
+  const char* error = nullptr;
+  CHECK(!domain.suspend() && !domain.resume(&error));                                   // not started
+  CHECK(domain.start(nullptr) && domain.approve_pcie(1, &error) && domain.approve_usb3(1, &error));
+  CHECK(domain.suspend() && domain.suspended() && domain.present_count() == 0 && !domain.pcie_tunnelled(1) && !domain.usb3_tunnelled(1));
+  for (uint64_t route : {0ull, 0x01ull, 0x301ull}) CHECK((rig.fabric.at(route).regs[5] & kCs5Slp) && (rig.fabric.at(route).regs[6] & kCs6Slpr));
+  CHECK(!(rig.fabric.at(0).ports[5].space[0x10] & kAdpPcieCs0Pe) && !(rig.fabric.at(0).ports[8].space[0x10] & kUsb3Cs0Pe));      // the tunnels came down first
+  CHECK(!domain.suspend() && domain.router(0) == nullptr);
+  // the deepest router went to sleep before the ones above it
+  size_t d2_at = 0, d1_at = 0, host_at = 0;
+  for (size_t i = 0; i < rig.fabric.log.size(); ++i) {
+    if (rig.fabric.log[i] == "W 301 0 2 5") d2_at = i;
+    if (rig.fabric.log[i] == "W 1 0 2 5") d1_at = i;
+    if (rig.fabric.log[i] == "W 0 0 2 5") host_at = i;
+  }
+  CHECK(d2_at != 0 && d1_at > d2_at && host_at > d1_at);
+  // after the wake: found again, no tunnels
+  for (uint64_t route : {0ull, 0x01ull, 0x301ull}) rig.fabric.at(route).regs[5] &= ~kCs5Slp, rig.fabric.at(route).regs[6] &= ~kCs6Slpr;
+  CHECK(domain.resume(&error) && !domain.suspended() && domain.present_count() == 3 && !domain.pcie_tunnelled(1) && domain.approve_pcie(1, &error));
+  CHECK(!domain.resume(&error));
+  // a host router that does not go to sleep: reported, still resumable
+  rig.fabric.refuse_sleep = true;
+  CHECK(!domain.suspend() && domain.suspended() && domain.present_count() == 0);
+  rig.fabric.refuse_sleep = false;
+  CHECK(domain.resume(&error) && domain.present_count() == 3);
 }
 
 static void test_usb4_garbage() {
@@ -3048,6 +3180,9 @@ int main() {
   test_usb4_pcie();
   test_usb4_failures();
   test_usb4_hotplug();
+  test_usb4_bonding();
+  test_usb4_usb3();
+  test_usb4_sleep();
   test_usb4_driver();
   test_usb4_garbage();
   test_garbage();
