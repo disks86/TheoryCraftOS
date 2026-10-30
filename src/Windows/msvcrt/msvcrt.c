@@ -1613,6 +1613,22 @@ API int fscanf(void *f, const char *format, ...) { va_list_ a; va_start_(a, form
 API int scanf(const char *format, ...) { va_list_ a; va_start_(a, format); int r = stream_vscanf(STDIN_, format, a); va_end_(a); return r; }
 API int sscanf(const char *s, const char *format, ...) { va_list_ a; va_start_(a, format); int r = text_vscanf(s, strlen(s), format, a); va_end_(a); return r; }
 
+/* The wide forms scan the text as narrow characters (a character above 0x7F becomes '?'): numbers and the like are read right, a %s or %c reads one byte per character. */
+static int wide_vscanf(const wchar_t *text, const wchar_t *format, va_list_ args) {
+  char narrow_text[512], narrow_format[256];
+  size_t_ n = 0;
+  for (; text[n] && n < sizeof(narrow_text) - 1; ++n) narrow_text[n] = text[n] < 0x80 ? (char)text[n] : '?';
+  narrow_text[n] = 0;
+  size_t_ f = 0;
+  for (; format[f] && f < sizeof(narrow_format) - 1; ++f) narrow_format[f] = format[f] < 0x80 ? (char)format[f] : '?';
+  narrow_format[f] = 0;
+  return text_vscanf(narrow_text, n, narrow_format, args);
+}
+API int vswscanf(const wchar_t *s, const wchar_t *format, va_list_ a) { return wide_vscanf(s, format, a); }
+API int swscanf(const wchar_t *s, const wchar_t *format, ...) { va_list_ a; va_start_(a, format); int r = wide_vscanf(s, format, a); va_end_(a); return r; }
+API int swscanf_s(const wchar_t *s, const wchar_t *format, ...) { va_list_ a; va_start_(a, format); int r = wide_vscanf(s, format, a); va_end_(a); return r; }
+API int __stdio_common_vswscanf(unsigned long long options, const wchar_t *s, size_t_ length, const wchar_t *format, void *locale, va_list_ a) { (void)options; (void)locale; (void)length; return wide_vscanf(s, format, a); }
+
 /* the Universal CRT's entry points */
 API int __stdio_common_vfprintf(unsigned long long options, void *f, const char *format, void *locale, va_list_ a) { (void)options; (void)locale; return stream_vprintf(f, format, a); }
 API int __stdio_common_vfprintf_s(unsigned long long options, void *f, const char *format, void *locale, va_list_ a) { (void)options; (void)locale; return stream_vprintf(f, format, a); }

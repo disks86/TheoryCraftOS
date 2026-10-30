@@ -290,12 +290,6 @@ EXPORT int WINAPI GetUserPreferredUILanguages(DWORD flags, PULONG count, LPWSTR 
 EXPORT BOOL WINAPI GetSystemPreferredUILanguages(DWORD flags, PULONG count, LPWSTR languages, PULONG length) { return GetUserPreferredUILanguages(flags, count, languages, length); }
 EXPORT BOOL WINAPI GetThreadPreferredUILanguages(DWORD flags, PULONG count, LPWSTR languages, PULONG length) { return GetUserPreferredUILanguages(flags, count, languages, length); }
 EXPORT BOOL WINAPI GetProcessPreferredUILanguages(DWORD flags, PULONG count, LPWSTR languages, PULONG length) { return GetUserPreferredUILanguages(flags, count, languages, length); }
-typedef BOOL (CALLBACK *LOCALE_ENUMPROCA_)(LPSTR);
-typedef BOOL (CALLBACK *LOCALE_ENUMPROCW_)(LPWSTR);
-typedef BOOL (CALLBACK *LOCALE_ENUMPROCEX_)(LPWSTR, DWORD, LPARAM);
-EXPORT BOOL WINAPI EnumSystemLocalesA(LOCALE_ENUMPROCA_ proc, DWORD flags) { (void)flags; char id[] = "00000409"; return proc(id) || TRUE; }
-EXPORT BOOL WINAPI EnumSystemLocalesW(LOCALE_ENUMPROCW_ proc, DWORD flags) { (void)flags; WCHAR id[] = {'0', '0', '0', '0', '0', '4', '0', '9', 0}; return proc(id) || TRUE; }
-EXPORT BOOL WINAPI EnumSystemLocalesEx(LOCALE_ENUMPROCEX_ proc, DWORD flags, LPARAM param, LPVOID reserved) { (void)reserved; WCHAR name[] = {'e', 'n', '-', 'U', 'S', 0}; return proc(name, flags, param) || TRUE; }
 
 /* ---- atoms ----------------------------------------------------------------------------------------------------------------------------------------------- */
 
