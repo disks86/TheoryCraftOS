@@ -58,6 +58,13 @@ class ThunderboltDriver {
   ThunderboltIcm* icm() { return icm_.get(); }
   const char* message() const { return icm_ ? ThunderboltIcm::outcome_name(icm_->outcome()) : ""; }
   void poll() { if (icm_) icm_->poll(); }
+  // Interrupt-driven operation. `on_interrupt()` is what the MSI handler calls: it acknowledges the chip and counts. `interrupts()` is the count, for a loop that polls only after one
+  // came (and now and then regardless, in case one was lost). `use_interrupts(true)` unmasks the control channel's ring interrupts in the chip; the MSI itself is the caller's.
+  void on_interrupt() {
+    if (icm_ && icm_->nhi().acknowledge_interrupt()) __atomic_fetch_add(&interrupts_, 1, __ATOMIC_ACQ_REL);
+  }
+  uint32_t interrupts() const { return __atomic_load_n(&interrupts_, __ATOMIC_ACQUIRE); }
+  bool use_interrupts(bool on) { return icm_ && icm_->use_interrupts(on); }
   // System sleep: see ThunderboltIcm::suspend / resume.
   bool suspend() { return icm_ && icm_->suspend(); }
   Outcome resume();
@@ -65,6 +72,7 @@ class ThunderboltDriver {
  private:
   allocators::IAllocator& allocator_;
   Config config_;
+  uint32_t interrupts_ = 0;
   UniquePointer<PciFunctionConfig> upstream_config_;
   UniquePointer<TbPcie2Cio> cio_;
   UniquePointer<MmioTbRegisters> mmio_;

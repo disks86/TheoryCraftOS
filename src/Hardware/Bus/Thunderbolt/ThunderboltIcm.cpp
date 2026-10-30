@@ -370,7 +370,9 @@ ThunderboltIcm::Outcome ThunderboltIcm::bring_up(uint32_t timeout_us, bool resum
     control_.stop();
     return outcome_ = Outcome::RootSwitchFailed;
   }
-  return outcome_ = Outcome::Started;
+  outcome_ = Outcome::Started;
+  if (interrupts_) nhi_.set_control_interrupts(true);          // (start-up masked them)
+  return outcome_;
 }
 
 // icm_firmware_start: the ARC is told to wait for a CIO reset, restarted, and the reset is triggered through the PCIe-to-CIO registers; the firmware then authenticates its image.
@@ -396,6 +398,13 @@ bool ThunderboltIcm::reset_physical_port(uint32_t physical_port) {
   return cio.write(TbConfigSpace::Port, port0, tb_cio::kPhyPortCs1, v0 & ~tb_cio::kPhyLinkDisable) && cio.write(TbConfigSpace::Port, port1, tb_cio::kPhyPortCs1, v1 & ~tb_cio::kPhyLinkDisable);
 }
 
+bool ThunderboltIcm::use_interrupts(bool on) {
+  if (outcome_ != Outcome::Started) return false;
+  interrupts_ = on;
+  nhi_.set_control_interrupts(on);
+  return true;
+}
+
 bool ThunderboltIcm::suspend() {
   if (outcome_ != Outcome::Started) return false;
   nhi_.mailbox(tb_mailbox::kSaveDevices, 0, 500000);
@@ -417,6 +426,7 @@ void ThunderboltIcm::stop() {
     control_.stop();
   }
   devices_.clear();
+  interrupts_ = false;
   outcome_ = Outcome::NotStarted;
 }
 

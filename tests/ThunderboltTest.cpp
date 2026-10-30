@@ -1293,6 +1293,55 @@ static void test_titan() {
   }
 }
 
+
+// ---- interrupts
+
+static void test_interrupts() {
+  TestAllocator alloc;
+  FakeNhi chip;
+  ThunderboltDriver driver(alloc);
+  CHECK(!driver.use_interrupts(true) && driver.interrupts() == 0);               // not started
+  CHECK(driver.start_device(chip) == ThunderboltDriver::Outcome::Started);
+  CHECK(chip.unmasked[0] == 0 && chip.interrupts_raised == 0);                    // start-up keeps them masked
+  chip.raise_interrupt = [&] { driver.on_interrupt(); };
+  CHECK(driver.use_interrupts(true) && driver.icm()->interrupts_on());
+  CHECK(chip.unmasked[0] == ((1u << 0) | (1u << 12)));                           // hop 0, transmit (bit 0) and receive (bit hops)
+  // a frame for the host: the chip raises the interrupt, the handler reads the notify registers and counts
+  const uint32_t reads = chip.notify_reads;
+  chip.send_device_connected(make_device(0x20, 1, 1));
+  CHECK(chip.interrupts_raised == 1 && driver.interrupts() == 1 && chip.notify_reads > reads && chip.notify[0] == 0);
+  CHECK(driver.icm()->device_count() == 0);                                      // (the handler only counts)
+  driver.poll();
+  CHECK(driver.icm()->device_count() == 1);
+  // what the host sends completes a transmit descriptor: another interrupt
+  uint32_t word = 0;
+  CHECK(driver.icm()->control().read_config(0, 0, TbConfigSpace::Switch, 0, ArrayView<uint32_t>(&word, 1), 1000, nullptr, driver.icm()) == TbControl::Result::Ok);
+  CHECK(driver.interrupts() >= 3);
+  // masked again: nothing more
+  CHECK(driver.use_interrupts(false) && chip.unmasked[0] == 0);
+  const uint32_t before = chip.interrupts_raised;
+  chip.send_device_connected(make_device(0x50, 3, 1));
+  driver.poll();
+  CHECK(chip.interrupts_raised == before && driver.icm()->device_count() == 2);
+  // an interrupt with nothing to report is not counted
+  const uint32_t counted = driver.interrupts();
+  driver.on_interrupt();
+  CHECK(driver.interrupts() == counted);
+  // they survive sleep: masked by the bring-up, unmasked again after it
+  CHECK(driver.use_interrupts(true) && driver.suspend());
+  CHECK(!driver.use_interrupts(false));
+  CHECK(driver.resume() == ThunderboltDriver::Outcome::Started && chip.unmasked[0] == ((1u << 0) | (1u << 12)));
+  driver.stop();
+  CHECK(!driver.use_interrupts(true));
+  driver.on_interrupt();                                                          // (safe with no controller)
+  // a controller with many hops: the receive ring's bit is in another register
+  FakeNhi wide;
+  wide.hops = 40;
+  ThunderboltDriver wide_driver(alloc);
+  CHECK(wide_driver.start_device(wide) == ThunderboltDriver::Outcome::Started && wide_driver.use_interrupts(true));
+  CHECK(wide.unmasked[0] == 1u && wide.unmasked[1] == (1u << 8));
+}
+
 static void test_driver() {
   TestAllocator alloc;
   {
@@ -1359,6 +1408,7 @@ int main() {
   test_key_files();
   test_suspend();
   test_titan();
+  test_interrupts();
   test_driver();
   printf(g_failed ? "ThunderboltTest: %d FAILED\n" : "ThunderboltTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;

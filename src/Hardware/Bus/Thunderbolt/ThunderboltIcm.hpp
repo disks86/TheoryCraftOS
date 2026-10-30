@@ -167,6 +167,10 @@ class ThunderboltIcm final : public IThunderboltEvents {
   // Tells the firmware the driver goes away (the mailbox's DRIVER_UNLOADS) and stops the channel.
   void stop();
   bool running() const { return outcome_ == Outcome::Started; }
+  // Interrupts from the control channel's rings (the caller routes the MSI and calls TbNhi::acknowledge_interrupt from its handler). Only unmasks them in the chip; the channel is still
+  // read by poll(), which the caller may then call only after an interrupt. Remembered over suspend and resume. False if the controller is not running.
+  bool use_interrupts(bool on);
+  bool interrupts_on() const { return interrupts_; }
   Outcome outcome() const { return outcome_; }
 
   // Reads the control channel: events update the device list.
@@ -216,6 +220,7 @@ class ThunderboltIcm final : public IThunderboltEvents {
   List<TbDevice> devices_;
   TbDriverReady ready_;
   crypto::IRandom* random_ = nullptr;
+  bool interrupts_ = false;
   ITbKeyStore* keys_ = nullptr;
   Options options_;
   uint32_t port_reset_failures_ = 0;
