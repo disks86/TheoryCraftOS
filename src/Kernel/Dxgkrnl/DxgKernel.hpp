@@ -155,6 +155,13 @@ class Kernel {
   // --- Shaders and pipelines directly (escape() is the same through the private-data ABI).
   NtStatus create_shader(ProcessId pid, Handle device, const ShaderDesc& desc, Handle* shader);
   NtStatus create_pipeline(ProcessId pid, Handle device, const PipelineDesc& desc, Handle* pipeline);
+  // Direct3D 12 binding objects (D3d12.hpp): a root signature from its serialized form, descriptor heaps (a heap holds views or samplers), the descriptors in them.
+  NtStatus create_root_signature(ProcessId pid, Handle device, ConstByteView blob, Handle* signature);
+  NtStatus destroy_root_signature(ProcessId pid, Handle signature);
+  NtStatus create_descriptor_heap(ProcessId pid, Handle device, DescriptorHeapType type, uint32_t count, Handle* heap);
+  NtStatus destroy_descriptor_heap(ProcessId pid, Handle heap);
+  NtStatus write_descriptor(ProcessId pid, Handle heap, uint32_t index, const DescriptorDesc& desc);
+  NtStatus copy_descriptors(ProcessId pid, Handle destination, uint32_t destination_index, Handle source, uint32_t source_index, uint32_t count);
   NtStatus destroy_shader(ProcessId pid, Handle shader);
   NtStatus destroy_pipeline(ProcessId pid, Handle pipeline);
   NtStatus escape(ProcessId pid, Handle device, ConstByteView request, ByteView reply, uint32_t* reply_bytes);

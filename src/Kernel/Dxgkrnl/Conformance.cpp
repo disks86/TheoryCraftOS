@@ -53,6 +53,7 @@ class Rig {
   }
 
   allocators::IAllocator& allocator() { return allocator_; }
+  Kernel& kernel() { return kernel_; }
   const AdapterCaps& caps() const { return caps_; }
   bool ok() const { return status_ == status::kSuccess; }
   NtStatus status() const { return status_; }
@@ -90,6 +91,17 @@ class Rig {
     step("create_allocation", ok() ? kernel_.create_allocation(kProcess, device_, d, &out) : status_);
     return out;
   }
+  Handle root_signature(ConstByteView blob) {
+    Handle h = 0;
+    step("create_root_signature", ok() ? kernel_.create_root_signature(kProcess, device_, blob, &h) : status_);
+    return h;
+  }
+  Handle descriptor_heap(DescriptorHeapType type, uint32_t count) {
+    Handle h = 0;
+    step("create_descriptor_heap", ok() ? kernel_.create_descriptor_heap(kProcess, device_, type, count, &h) : status_);
+    return h;
+  }
+  void descriptor(Handle heap, uint32_t index, const DescriptorDesc& d) { step("write_descriptor", ok() ? kernel_.write_descriptor(kProcess, heap, index, d) : status_); }
   Handle buffer(uint32_t flags, ConstByteView contents) {
     AllocationDesc d;
     d.flags = flags, d.size = contents.size();
@@ -1107,6 +1119,95 @@ void scene_compute(Rig& rig, ArrayView<uint32_t> out) {
     for (uint32_t& pixel : out) pixel ^= 0x0000FF00u;
 }
 
+// Direct3D 12 binding: the compute scene again with a root signature (b0 as four root constants, u0 and u1 as root descriptors, u2 from a descriptor table) and resource states (the
+// picture is made in the common state and moved to unordered access).
+void scene_d3d12_compute(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureCompute)) return void(rig.step("compute", status::kNotSupported));
+  namespace b = conformance_blobs;
+  Handle cs = rig.shader("create_shader (compute)", ShaderKind::Dxbc, graphics::ShaderStage::Compute, bytes_of(b::k_cs_fill, sizeof b::k_cs_fill));
+  PipelineDesc pd;
+  pd.compute_shader = cs;
+  Handle pipe = rig.pipeline(pd);
+  auto storage = [&](uint64_t size, uint32_t extra) {
+    AllocationDesc d;
+    d.flags = kAllocUnorderedAccess | extra, d.size = size, d.initial_state = state::kCommon;
+    return rig.create(d);
+  };
+  Handle picture = storage(kPixels * 4, kAllocTrackState), structured = storage(kPixels * 16, 0), counters = storage(16, 0);
+  // (root signature version 1.0: four parameters - constants b0 x 4; UAV u0; UAV u1; a table with the UAV u2 -, no static samplers)
+  const uint32_t blob[] = {1, 4, 24, 0, 32 * 4, 0,
+                           1, 0, 18 * 4, 4, 0, 21 * 4, 4, 0, 23 * 4, 0, 0, 25 * 4,
+                           0, 0, 4, 0, 0, 1, 0, 1, 27 * 4, 1, 1, 2, 0, 0};
+  Handle signature = rig.root_signature(bytes_of(blob, sizeof blob));
+  Handle heap = rig.descriptor_heap(DescriptorHeapType::CbvSrvUav, 2);
+  DescriptorDesc uav;
+  uav.kind = DescriptorKind::Uav, uav.allocation = counters;
+  rig.descriptor(heap, 1, uav);
+  const uint32_t constants[4] = {0x00102030u, 0, 0, 0};
+  CommandWriter w(rig.allocator());
+  w.transition(0, state::kCommon, state::kUnorderedAccess);
+  w.set_root_signature(signature);
+  w.set_descriptor_heaps({heap});
+  w.set_root_constants(0, 0, bytes_of(constants, sizeof constants));
+  w.set_root_descriptor(1, 0, 0);
+  w.set_root_descriptor(2, 1, 0);
+  w.set_root_table(3, 1);
+  w.bind_pipeline(pipe);
+  w.dispatch(kSize / 8, kSize / 4, 1);
+  w.transition(0, state::kUnorderedAccess, state::kCopySource);
+  rig.render(w, {picture, structured, counters});
+  rig.read_words(picture, out);
+  if (rig.read_u64(counters, 0) != (uint64_t{1024} | (uint64_t{1024} << 32)))
+    for (uint32_t& pixel : out) pixel ^= 0x0000FF00u;
+}
+
+// Direct3D 12 binding for drawing: the volume texture scene with a root signature (a table with t0, b0 as 16 root constants, a static point sampler), a descriptor heap, and a render target
+// and a texture that move between states with barriers.
+void scene_d3d12_textures(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureTextureKinds)) return void(rig.step("texture kinds", status::kNotSupported));
+  namespace b = conformance_blobs;
+  AllocationDesc td;
+  td.flags = kAllocTexture | kAllocTrackState, td.format = Format::A8R8G8B8, td.width = 4, td.height = 4, td.kind = graphics::TextureKind::Texture3D, td.layers = 4, td.initial_state = state::kCopyDest;
+  Handle texture = rig.create(td);
+  ByteBuffer bytes(rig.allocator());
+  for (uint32_t layer = 0; layer < 4; ++layer)
+    for (uint32_t texel = 0; texel < 16; ++texel) bytes.put32(0xFF000000u | (layer == 0 ? 0xFF0000u : layer == 1 ? 0x00FF00u : layer == 2 ? 0x0000FFu : 0xFFFF00u));
+  rig.write(texture, bytes.view());
+  Vertex v[12];
+  quad_pixels(v, 0, 0, 32, 16, [](float u, float vv) { return graphics::Vec3{u, vv, 0.6f}; });
+  quad_pixels(v + 6, 0, 16, 32, 32, [](float u, float vv) { return graphics::Vec3{u, 0.3f, vv}; });
+  Handle p = dxbc_pipeline(rig, b::k_vs_vol, sizeof b::k_vs_vol, b::k_ps_tex3d, sizeof b::k_ps_tex3d, 1);
+  AllocationDesc rd;
+  rd.flags = kAllocRenderTarget | kAllocTrackState, rd.format = Format::A8R8G8B8, rd.width = kSize, rd.height = kSize, rd.initial_state = state::kCommon;
+  Handle target = rig.create(rd);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  // (root signature version 1.0: a table with the SRV t0, then b0 as 16 constants; a static point sampler with clamped addresses)
+  const uint32_t blob[] = {1, 2, 24, 1, 22 * 4, 0,
+                           0, 0, 12 * 4, 1, 0, 19 * 4,
+                           1, 14 * 4, 0, 1, 0, 0, 0,
+                           0, 0, 16,
+                           0, 3, 3, 3, 0, 1, 8, 0, 0, __builtin_bit_cast(uint32_t, 1000.0f), 0, 0, 0};
+  Handle signature = rig.root_signature(bytes_of(blob, sizeof blob));
+  Handle heap = rig.descriptor_heap(DescriptorHeapType::CbvSrvUav, 3);
+  DescriptorDesc srv;
+  srv.kind = DescriptorKind::Srv, srv.allocation = texture;
+  rig.descriptor(heap, 2, srv);
+  CommandWriter w(rig.allocator());
+  w.transition(2, state::kCopyDest, state::kPixelShaderResource);
+  w.transition(0, state::kCommon, state::kRenderTarget);
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.set_root_signature(signature);
+  w.set_descriptor_heaps({heap});
+  w.set_root_constants(1, 0, bytes_of(kIdentity, sizeof kIdentity));
+  w.set_root_table(0, 2);
+  w.bind_pipeline(p);
+  w.bind_vertex_buffer(1);
+  w.draw(12);
+  w.end_pass();
+  rig.render(w, {target, vb, texture});
+  rig.read(target, out);
+}
+
 // Group-shared memory and barriers (cs_shared.hlsl): 16 groups of 8 x 8 threads, each writing a slot of a 64-word shared array, reading its neighbour's after a barrier, and the 64 slots added
 // by a reduction with a barrier in its loop. The picture is the buffer: red the neighbour's value, green the sum, blue the thread.
 void scene_compute_shared(Rig& rig, ArrayView<uint32_t> out) {
@@ -2041,6 +2142,8 @@ const Entry kScenes[] = {
     {"Direct3D 10 geometry shader (DXBC)", scene_geometry_shader},
     {"Direct3D 11 instanced geometry (DXBC)", scene_geometry_instances},
     {"Direct3D 10 adjacency primitives (DXBC)", scene_geometry_adjacency},
+    {"Direct3D 12 root signature, descriptors and states: compute (DXBC)", scene_d3d12_compute},
+    {"Direct3D 12 root signature, descriptors and states: textures (DXBC)", scene_d3d12_textures},
     {"Direct3D 11 stream output of two streams (DXBC)", scene_stream_output},
     {"Direct3D 11 stream output appending, statistics and timestamps (DXBC)", scene_stream_output_append},
     {"Direct3D 11 stream output of vertex and domain shaders (DXBC)", scene_stream_output_stages},

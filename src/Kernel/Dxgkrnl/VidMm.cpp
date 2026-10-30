@@ -17,6 +17,7 @@
  */
 
 #include "Kernel/Dxgkrnl/VidMm.hpp"
+#include "Kernel/Dxgkrnl/D3d12.hpp"
 #include "Graphics/Graphics3D/Mipmaps.hpp"
 #include "Graphics/WidePixels.hpp"
 #include "Utility/AllocatedView.hpp"
@@ -44,7 +45,7 @@ graphics::Format wide_format_of(Format f) {
 }
 
 constexpr uint64_t kMaxQueryResultBytes = 1 << 20;
-constexpr uint32_t kKnownFlags = kAllocVertexBuffer | kAllocIndexBuffer | kAllocTexture | kAllocRenderTarget | kAllocDepthStencil | kAllocPresent | kAllocStaging | kAllocShared | kAllocQueryResult | kAllocUnorderedAccess | kAllocStreamOutput;
+constexpr uint32_t kKnownFlags = kAllocVertexBuffer | kAllocIndexBuffer | kAllocTexture | kAllocRenderTarget | kAllocDepthStencil | kAllocPresent | kAllocStaging | kAllocShared | kAllocQueryResult | kAllocUnorderedAccess | kAllocStreamOutput | kAllocConstantBuffer | kAllocTrackState;
 
 // The bytes of all levels of a w x h image of `pixel`-byte pixels; false if the description's levels are not possible. (w and h are at most kMaxTextureDimension, so nothing overflows.)
 bool image_bytes(uint32_t w, uint32_t h, uint32_t levels, uint32_t pixel, uint64_t* total) {
@@ -100,9 +101,13 @@ uint32_t VidMm::from_logical(Format f, uint32_t pixel) {
   return pixel;
 }
 
-NtStatus VidMm::create(const AllocationDesc& desc, SharedPointer<Allocation>* out) {
+NtStatus VidMm::create(const AllocationDesc& requested, SharedPointer<Allocation>* out) {
+  AllocationDesc desc = requested;
+  const bool track_state = (desc.flags & kAllocTrackState) != 0;   // (the other checks are about what the allocation is, not what states it moves through)
+  desc.flags &= ~kAllocTrackState;
+  if (track_state && (requested.initial_state & ~kStateMask)) return status::kInvalidParameter;
   if (desc.flags == 0 || (desc.flags & ~kKnownFlags)) return status::kInvalidParameter;
-  const bool buffer = (desc.flags & (kAllocVertexBuffer | kAllocIndexBuffer | kAllocQueryResult | kAllocUnorderedAccess | kAllocStreamOutput)) != 0;
+  const bool buffer = (desc.flags & (kAllocVertexBuffer | kAllocIndexBuffer | kAllocQueryResult | kAllocUnorderedAccess | kAllocStreamOutput | kAllocConstantBuffer)) != 0;
   if ((desc.flags & kAllocUnorderedAccess) && !(device_.info().features & graphics::kFeatureCompute)) return status::kNotSupported;
   if ((desc.flags & kAllocStreamOutput) && !(device_.info().features & graphics::kFeatureStreamOutput)) return status::kNotSupported;
   uint64_t cpu_bytes = 0, device_bytes = 0;
@@ -111,6 +116,11 @@ NtStatus VidMm::create(const AllocationDesc& desc, SharedPointer<Allocation>* ou
     if (desc.flags & ~(kAllocQueryResult | kAllocShared)) return status::kInvalidParameter;
     if (!(device_.info().features & graphics::kFeatureOcclusionQueries)) return status::kNotSupported;
     if (desc.size < 8 || desc.size > kMaxQueryResultBytes) return status::kInvalidParameter;
+    cpu_bytes = desc.size;
+  } else if (desc.flags & kAllocConstantBuffer) {
+    // (read by the CPU when a draw takes the constants: no device object)
+    if (desc.flags & ~(kAllocConstantBuffer | kAllocShared)) return status::kInvalidParameter;
+    if (desc.size < 16 || desc.size % 16 || desc.size > kMaxBufferBytes) return status::kInvalidParameter;
     cpu_bytes = desc.size;
   } else if (buffer) {
     if (desc.flags & (kAllocTexture | kAllocRenderTarget | kAllocDepthStencil | kAllocPresent | kAllocStaging)) return status::kInvalidParameter;
@@ -176,6 +186,8 @@ sized:
     a->cpu_.fill(0);
   }
   ++next_id_;
+  a->state_tracked_ = track_state;
+  a->state_ = track_state ? requested.initial_state : 0;
   a->device_bytes_ = device_bytes;
   system_bytes_ += cpu_bytes;
   *out = a;

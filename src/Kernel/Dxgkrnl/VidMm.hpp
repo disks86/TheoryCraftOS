@@ -47,12 +47,17 @@ class Allocation {
   // What being resident costs against the adapter's budget.
   uint64_t device_bytes() const { return device_bytes_; }
   const AllocationDesc& desc() const { return desc_; }
-  bool is_buffer() const { return (desc_.flags & (kAllocVertexBuffer | kAllocIndexBuffer | kAllocQueryResult | kAllocUnorderedAccess | kAllocStreamOutput)) != 0; }
+  bool is_buffer() const { return (desc_.flags & (kAllocVertexBuffer | kAllocIndexBuffer | kAllocQueryResult | kAllocUnorderedAccess | kAllocStreamOutput | kAllocConstantBuffer)) != 0; }
+  bool is_constant_buffer() const { return (desc_.flags & kAllocConstantBuffer) != 0; }
+  // Direct3D 12 resource states (kAllocTrackState): the state the last stream that ran the allocation's barriers left it in.
+  bool state_tracked() const { return state_tracked_; }
+  uint32_t state() const { return state_; }
+  void set_state(uint32_t state) { state_ = state; }
   bool is_query_result() const { return (desc_.flags & kAllocQueryResult) != 0; }
   bool is_image() const { return !is_buffer(); }
   bool is_depth() const { return dxgk::is_depth(desc_.format); }
   bool is_staging() const { return (desc_.flags & kAllocStaging) != 0; }
-  bool can_be_resident() const { return !is_staging() && !is_query_result(); }
+  bool can_be_resident() const { return !is_staging() && !is_query_result() && !is_constant_buffer(); }
   bool resident() const { return image_ != nullptr || buffer_ != nullptr; }
   uint32_t mip_levels() const { return desc_.mip_levels; }
   // The 2D images of the allocation (1 for a plain texture); they follow each other in the backing, each width * height pixels.
@@ -79,6 +84,8 @@ class Allocation {
   ByteView cpu_;
   graphics::IImage* image_ = nullptr;
   graphics::IBuffer* buffer_ = nullptr;
+  bool state_tracked_ = false;
+  uint32_t state_ = 0;
   uint64_t so_filled_ = 0;   // a stream output buffer: how far the last stream output into it got (kept while the device object is gone)
   uint64_t device_bytes_ = 0;    // what residency costs
   bool device_stale_ = true;     // the device object (if any) lacks the backing's current contents

@@ -444,6 +444,7 @@ add_executable(BOOTX64
   src/Graphics/GraphicsPool.cpp
   src/Graphics/SystemDxg.cpp
   src/Kernel/Dxgkrnl/VidMm.cpp
+  src/Kernel/Dxgkrnl/D3d12.cpp
   src/Kernel/Dxgkrnl/D3d9Shader.cpp
   src/Kernel/Dxgkrnl/D3d9Tgsi.cpp
   src/Kernel/Dxgkrnl/D3d9Dxbc.cpp

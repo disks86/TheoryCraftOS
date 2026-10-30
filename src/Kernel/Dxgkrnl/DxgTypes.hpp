@@ -115,6 +115,8 @@ enum AllocationFlags : uint32_t {
   kAllocShared = 1u << 7,        // may be shared with other processes (Kernel::share_allocation)
   kAllocUnorderedAccess = 1u << 9,   // a buffer compute shaders read and write (BindUav; the adapter's kFeatureCompute); may also be a vertex or index buffer
   kAllocStreamOutput = 1u << 10,   // a buffer a geometry shader's stream output is written to (SetStreamOutput; the adapter's kFeatureStreamOutput): read by locking it
+  kAllocConstantBuffer = 1u << 11,   // a buffer of constants (Direct3D 12 root constant buffer views and descriptors); system memory only, never resident: read by the CPU when a draw needs it
+  kAllocTrackState = 1u << 12,       // Direct3D 12 resource states: AllocationDesc::initial_state is the state; ResourceBarrier moves it and uses of the allocation check it (CommandStream.hpp). Any other flags as usual.
   kAllocQueryResult = 1u << 8,   // a buffer the results of occlusion queries are written to (CommandStream.hpp BeginQuery); system memory only, never resident, read by locking it
 };
 
@@ -130,6 +132,7 @@ struct AllocationDesc {
   graphics::TextureKind kind = graphics::TextureKind::Texture2D;   // textures: more than 2D needs the adapter's kFeatureTextureKinds, flags exactly kAllocTexture (kAllocShared too), one mip level, an 8-bit colour format
   uint32_t samples = 1;              // 2, 4 or 8 (the adapter's kFeatureMultisample and sample counts): a render target of an 8-bit colour format or a depth buffer, nothing else; it has no system-memory
                                      // backing, cannot be locked, copied, sampled or presented, and is turned into an ordinary image by the stream's ResolveRegion
+  uint32_t initial_state = 0;        // kAllocTrackState: the resource state it starts in (D3d12.hpp ResourceState)
   uint32_t layers = 1;               // Texture3D: the depth; Texture2DArray: the array size (1 .. graphics::kMaxTextureLayers); TextureCube: 6 (width equals height)
 };
 
