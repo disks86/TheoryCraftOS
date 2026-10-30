@@ -95,6 +95,19 @@ class Fabric {
     at(route).connected = true;
     for (uint32_t i : {1u, 2u}) at(route).ports[i].state = kPortUp;
   }
+  // Another host on the cable behind the downstream lane adapter `port`: the link is up and no router answers.
+  void link_host(uint64_t parent_route, uint32_t port) {
+    Router& parent = at(parent_route);
+    parent.ports[port].state = kPortUp;
+    parent.ports[port].locked = true;
+    parent.ports[port].space[4] |= kAdpCs4Lck;
+    parent.ports[port + 1].state = kPortUp;
+  }
+  void unlink_host(uint64_t parent_route, uint32_t port) {
+    Router& parent = at(parent_route);
+    parent.ports[port].state = kPortUnplugged;
+    parent.ports[port + 1].state = kPortUnplugged;
+  }
   void unlink(uint64_t parent_route, uint32_t port, uint64_t route) {
     Router& parent = at(parent_route);
     parent.ports[port].state = kPortUnplugged;
@@ -119,6 +132,7 @@ class Fabric {
     p.space[2] = kTypePort;
     p.space[3] = number << 20;
     p.space[5] = 0x7FF | (0x7FFu << 11);                         // plenty of HopIDs
+    p.space[4] = 40u << 20;                                       // total buffers (ADP_CS_4)
     p.space[0x10] = 0x20 | (kPortCapPhy << 8) | (2u << 20);       // the lane adapter capability, next at 0x20; it supports two lanes
     p.space[0x20] = (kPortCapUsb4 << 8);
     p.space[0x20 + kPortCs18] = kPortCs18Be;                      // bonding enabled
@@ -137,6 +151,7 @@ class Fabric {
     p.space[2] = type;
     p.space[3] = number << 20;
     p.space[5] = 31 | (31u << 11);
+    p.space[4] = 40u << 20;
     p.space[0x10] = (kPortCapAdapter << 8);
     return p;
   }
