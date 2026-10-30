@@ -364,6 +364,49 @@ void Usb4Domain::close_preboot_tunnels() {
   }
 }
 
+// ------------------------------------------------------------------ sleep
+
+// usb4_switch_set_sleep: the sleep bit, then wait for the router to say it is ready.
+bool Usb4Domain::put_to_sleep(Usb4Router& r) {
+  uint32_t cs5 = 0;
+  if (!read(r.route, 0, TbConfigSpace::Switch, kRouterCs5, ArrayView<uint32_t>(&cs5, 1))) return false;
+  cs5 |= kCs5Slp;
+  if (!write(r.route, 0, TbConfigSpace::Switch, kRouterCs5, ArrayView<const uint32_t>(&cs5, 1))) return false;
+  for (uint32_t waited = 0; waited < 500000; waited += 1000) {
+    uint32_t cs6 = 0;
+    if (read(r.route, 0, TbConfigSpace::Switch, kRouterCs6, ArrayView<uint32_t>(&cs6, 1)) && (cs6 & kCs6Slpr)) return true;
+    delay_us(1000);
+  }
+  return false;
+}
+
+bool Usb4Domain::suspend() {
+  if (!started_ || suspended_) return false;
+  plug_count_ = 0;                                         // (events from before the sleep mean nothing after it)
+  for (uint32_t i = 0; i < kMaxTunnels; ++i)
+    if (tunnels_[i].used) remove_tunnel(static_cast<int>(i));
+  // deepest first; a router that will not sleep is left awake and dropped with the rest, the host router's refusal is what the answer reports
+  bool host_asleep = true;
+  for (int depth = static_cast<int>(kMaxDepth); depth >= 0; --depth) {
+    for (uint64_t i = 0; i < routers_.count(); ++i) {
+      Usb4Router& r = *routers_[i];
+      if (!r.present || r.depth != depth) continue;
+      if (!put_to_sleep(r) && depth == 0) host_asleep = false;
+    }
+  }
+  for (uint64_t i = 0; i < routers_.count(); ++i) routers_[i]->present = false;
+  started_ = false;
+  suspended_ = true;
+  return host_asleep;
+}
+
+bool Usb4Domain::resume(const char** error) {
+  if (!suspended_) return false;
+  suspended_ = false;
+  preboot_closed_ = 0;
+  return start(error);
+}
+
 // ------------------------------------------------------------------ events
 
 bool Usb4Domain::on_event(TbPacketType type, ConstByteView body) {

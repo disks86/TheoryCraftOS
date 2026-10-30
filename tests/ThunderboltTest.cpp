@@ -2992,6 +2992,13 @@ static void test_usb4_driver() {
   CHECK(driver.use_interrupts(true, 0) && rig.chip.unmasked[0] == ((1u << 0) | (1u << 12)));
   CHECK(driver.use_interrupts(false) && rig.chip.unmasked[0] == 0 && !driver.use_interrupts(true, 16));
   driver.probe_control();
+  // sleep: the routers are put to sleep and the channel stopped; the wake finds them again
+  rig.fabric.link(0, 1, 0x01);
+  rig.chip.send_plug_event(0, 1, false);
+  driver.poll();
+  CHECK(driver.device_count() == 2 && !driver.runtime_suspend(false) && driver.suspend(false) && driver.device_count() == 0 && driver.usb4()->suspended());
+  for (uint64_t route : {0ull, 0x01ull, 0x301ull}) rig.fabric.at(route).regs[5] &= ~kCs5Slp, rig.fabric.at(route).regs[6] &= ~kCs6Slpr;
+  CHECK(driver.resume() == ThunderboltDriver::Outcome::Started && driver.device_count() == 2);
   driver.stop();
   CHECK(!driver.usb4() && driver.device_count() == 0);
   {   // a host router that does not answer: the start fails with a reason
@@ -3100,6 +3107,35 @@ static void test_usb4_usb3() {
   }
 }
 
+static void test_usb4_sleep() {
+  Usb4Rig rig;
+  Usb4Domain domain(rig.control, rig.alloc);
+  const char* error = nullptr;
+  CHECK(!domain.suspend() && !domain.resume(&error));                                   // not started
+  CHECK(domain.start(nullptr) && domain.approve_pcie(1, &error) && domain.approve_usb3(1, &error));
+  CHECK(domain.suspend() && domain.suspended() && domain.present_count() == 0 && !domain.pcie_tunnelled(1) && !domain.usb3_tunnelled(1));
+  for (uint64_t route : {0ull, 0x01ull, 0x301ull}) CHECK((rig.fabric.at(route).regs[5] & kCs5Slp) && (rig.fabric.at(route).regs[6] & kCs6Slpr));
+  CHECK(!(rig.fabric.at(0).ports[5].space[0x10] & kAdpPcieCs0Pe) && !(rig.fabric.at(0).ports[8].space[0x10] & kUsb3Cs0Pe));      // the tunnels came down first
+  CHECK(!domain.suspend() && domain.router(0) == nullptr);
+  // the deepest router went to sleep before the ones above it
+  size_t d2_at = 0, d1_at = 0, host_at = 0;
+  for (size_t i = 0; i < rig.fabric.log.size(); ++i) {
+    if (rig.fabric.log[i] == "W 301 0 2 5") d2_at = i;
+    if (rig.fabric.log[i] == "W 1 0 2 5") d1_at = i;
+    if (rig.fabric.log[i] == "W 0 0 2 5") host_at = i;
+  }
+  CHECK(d2_at != 0 && d1_at > d2_at && host_at > d1_at);
+  // after the wake: found again, no tunnels
+  for (uint64_t route : {0ull, 0x01ull, 0x301ull}) rig.fabric.at(route).regs[5] &= ~kCs5Slp, rig.fabric.at(route).regs[6] &= ~kCs6Slpr;
+  CHECK(domain.resume(&error) && !domain.suspended() && domain.present_count() == 3 && !domain.pcie_tunnelled(1) && domain.approve_pcie(1, &error));
+  CHECK(!domain.resume(&error));
+  // a host router that does not go to sleep: reported, still resumable
+  rig.fabric.refuse_sleep = true;
+  CHECK(!domain.suspend() && domain.suspended() && domain.present_count() == 0);
+  rig.fabric.refuse_sleep = false;
+  CHECK(domain.resume(&error) && domain.present_count() == 3);
+}
+
 static void test_usb4_garbage() {
   // the routers answer with noise: the manager must stay inside its arrays, whatever comes (and the sanitizers say if it does not)
   for (uint32_t seed = 1; seed <= 200; ++seed) {
@@ -3146,6 +3182,7 @@ int main() {
   test_usb4_hotplug();
   test_usb4_bonding();
   test_usb4_usb3();
+  test_usb4_sleep();
   test_usb4_driver();
   test_usb4_garbage();
   test_garbage();

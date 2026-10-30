@@ -68,7 +68,7 @@ class ThunderboltDriver {
     else if (usb4_) usb4_->poll();
   }
   // Devices connected (routers other than the host's own, for the software connection manager) and other hosts on the cable (none are handled there).
-  uint64_t device_count() const { return icm_ ? icm_->device_count() : usb4_ ? usb4_->present_count() - 1 : 0; }
+  uint64_t device_count() const { return icm_ ? icm_->device_count() : usb4_ && usb4_->present_count() != 0 ? usb4_->present_count() - 1 : 0; }
   uint64_t xdomain_count() const { return icm_ ? icm_->xdomain_count() : 0; }
   // A request of the control channel that interrupts when answered, for checking that an interrupt arrives.
   void probe_control();

@@ -48,7 +48,7 @@ constexpr uint32_t kUsb3Cs0Pe = 1u << 31, kUsb3Cs1 = 1, kUsb3Cs1Hca = 1u << 31, 
 constexpr uint8_t kPortCapPhy = 0x01, kPortCapAdapter = 0x04, kPortCapUsb4 = 0x06;
 // router configuration space
 constexpr uint32_t kRouterCs1 = 1, kRouterCs5 = 5, kRouterCs6 = 6, kRouterCs7 = 7;
-constexpr uint32_t kCs5Pto = 1u << 25, kCs5Hco = 1u << 26, kCs5Cns = 1u << 23, kCs5Cv = 1u << 31, kCs6Hci = 1u << 18, kCs6Cr = 1u << 25;
+constexpr uint32_t kCs5Pto = 1u << 25, kCs5Hco = 1u << 26, kCs5Slp = 1u << 0, kCs5Cns = 1u << 23, kCs5Cv = 1u << 31, kCs6Slpr = 1u << 0, kCs6Hci = 1u << 18, kCs6Cr = 1u << 25;
 // adapter registers (relative to the adapter capability, except ADP_CS_4 and ADP_CS_5 which are in the port header)
 constexpr uint32_t kAdpCs4 = 4, kAdpCs4Lck = 1u << 31, kAdpCs5 = 5, kAdpCs5Dhp = 1u << 31, kPortCs19 = 0x13, kPortCs19Pc = 1u << 3, kAdpPcieCs0 = 0, kAdpPcieCs0Pe = 1u << 31;
 // port states (the lane adapter's)
@@ -145,6 +145,13 @@ class Usb4Domain final : public IThunderboltEvents {
   // Is the link above this router running both lanes as one?
   bool link_bonded(uint32_t router_index) const;
 
+  // Sleep (tb_suspend): every tunnel is taken down and each router told to sleep, the ones farthest from the host first (ROUTER_CS_5.SLP, waiting for SLPR), and the topology is forgotten.
+  // resume() starts afresh - the host router is configured again and everything below it found again, the links having come up on their own - so no tunnel is restored: they are approved
+  // again. False if the host router would not go to sleep (the topology is forgotten all the same, and resume() works).
+  bool suspend();
+  bool resume(const char** error);
+  bool suspended() const { return suspended_; }
+
   // IThunderboltEvents: hot plug events are queued, everything else ignored.
   bool on_event(TbPacketType type, ConstByteView body) override;
 
@@ -181,6 +188,7 @@ class Usb4Domain final : public IThunderboltEvents {
   bool configuration_valid(Usb4Router& r);
   bool switch_setup(Usb4Router& child, const Usb4Router& parent);
   void close_preboot_tunnels();
+  bool put_to_sleep(Usb4Router& r);
   void process_plug(const Plug& plug);
   void ack_plug(const Plug& plug);
   int find_router(uint64_t route) const;
@@ -212,7 +220,7 @@ class Usb4Domain final : public IThunderboltEvents {
   Plug plugs_[kPlugQueue];
   uint32_t plug_head_ = 0, plug_count_ = 0;
   uint32_t preboot_closed_ = 0, events_seen_ = 0, unreachable_ = 0;
-  bool started_ = false;
+  bool started_ = false, suspended_ = false;
 };
 
 }  // namespace hardware

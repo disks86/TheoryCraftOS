@@ -101,6 +101,7 @@ class Fabric {
     parent.ports[port + 1].state = kPortUnplugged;
     at(route).connected = false;
   }
+  bool refuse_sleep = false;                                     // ROUTER_CS_6.SLPR never comes up
   bool no_usb3_ack = false;                                      // the USB 3 adapter never grants the connection manager its request
   bool bond_never_completes = false;                             // the link keeps reporting one lane
   uint32_t fail_hop_writes = 0;                                  // the next hop table writes get an error
@@ -224,6 +225,7 @@ class Fabric {
     else r.regs[i] = v;
     if (i == 5) {
       ++r.cs5_writes;
+      if ((v & kCs5Slp) && !refuse_sleep) r.regs[6] |= kCs6Slpr;
       if (v & kCs5Cv) r.regs[6] |= kCs6Cr;
     }
   }

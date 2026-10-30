@@ -97,9 +97,15 @@ void ThunderboltDriver::probe_control() {
 }
 
 bool ThunderboltDriver::sleep(bool wake, bool runtime) {
-  if (!icm_) return false;
-  bool devices = icm_->device_count() != 0 || icm_->xdomain_count() != 0;
-  if (!(runtime ? icm_->runtime_suspend() : icm_->suspend())) return false;
+  if (!icm_ && !usb4_) return false;
+  bool devices = device_count() != 0 || xdomain_count() != 0;
+  if (icm_) {
+    if (!(runtime ? icm_->runtime_suspend() : icm_->suspend())) return false;
+  } else {
+    if (runtime) return false;                                // (the software connection manager has no runtime power management)
+    usb4_->suspend();                                          // (routers asleep, tunnels down; the control channel stops with it)
+    usb4_control_->stop();
+  }
   if (icl_ && !devices) {
     // (icl_nhi_suspend: with nothing connected the link controller is told to get ready for a reset and the power forced off; with something connected the controller stays powered)
     icl_->lc_mailbox(tb_icl::kPrepareForReset);
@@ -116,13 +122,18 @@ bool ThunderboltDriver::sleep(bool wake, bool runtime) {
 }
 
 ThunderboltDriver::Outcome ThunderboltDriver::resume() {
-  if (!icm_) return outcome_;
+  if (!icm_ && !usb4_) return outcome_;
   if (power_ && power_->available()) power_->enter_d0();
   wake_armed_ = false;
   if (icl_ && !icl_powered_) {
     if (!icl_->force_power(true)) return outcome_ = Outcome::ControllerFailed;
     icl_->set_ltr();
     icl_powered_ = true;
+  }
+  if (usb4_) {
+    usb4_nhi_->disable_interrupts();
+    if (!usb4_control_->start()) return outcome_ = Outcome::ControllerFailed;
+    return outcome_ = usb4_->resume(&usb4_error_) ? Outcome::Started : Outcome::ControllerFailed;
   }
   return outcome_ = icm_->resume() == ThunderboltIcm::Outcome::Started ? Outcome::Started : Outcome::ControllerFailed;
 }
