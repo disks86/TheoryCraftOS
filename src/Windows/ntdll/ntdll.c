@@ -712,9 +712,58 @@ EXPORT NTSTATUS NTAPI RtlUnicodeToMultiByteSize(PULONG size, PCWSTR s, ULONG sb)
 
 #include "heap.inc"
 
+IMPORT NTSTATUS NTAPI NtOpenKey(PHANDLE, ULONG, POBJECT_ATTRIBUTES);
+IMPORT NTSTATUS NTAPI NtQueryValueKey(HANDLE, PUNICODE_STRING, ULONG, PVOID, ULONG, PULONG);
+/* The GlobalFlag value (a DWORD, or a hexadecimal text) of a key; FALSE if there is none. */
+static int key_global_flag(const WCHAR *path, ULONG path_chars, ULONG *out) {
+  UNICODE_STRING name = {(USHORT)(path_chars * 2), (USHORT)(path_chars * 2 + 2), (PWSTR)path};
+  OBJECT_ATTRIBUTES attributes = {sizeof(attributes), NULL, &name, 0x40, NULL, NULL};
+  HANDLE key = NULL;
+  if (!NT_SUCCESS(NtOpenKey(&key, 0x20019, &attributes))) return 0;
+  static const WCHAR value_name[] = {'G', 'l', 'o', 'b', 'a', 'l', 'F', 'l', 'a', 'g', 0};
+  UNICODE_STRING value = {20, 22, (PWSTR)value_name};
+  BYTE buffer[12 + 64];
+  ULONG needed = 0;
+  const NTSTATUS status = NtQueryValueKey(key, &value, 2, buffer, sizeof(buffer), &needed);
+  NtClose(key);
+  if (!NT_SUCCESS(status)) return 0;
+  const ULONG type = *(ULONG *)(buffer + 4), length = *(ULONG *)(buffer + 8);
+  const BYTE *data = buffer + 12;
+  if (type == 4 && length >= 4) { *out = *(const ULONG *)data; return 1; }
+  if (type == 1) {      /* REG_SZ: hexadecimal, with or without 0x */
+    ULONG v = 0;
+    const WCHAR *w = (const WCHAR *)data;
+    ULONG n = length / 2, i = 0;
+    if (n > 2 && w[0] == '0' && (w[1] == 'x' || w[1] == 'X')) i = 2;
+    for (; i < n && w[i]; ++i) { const WCHAR c = w[i]; v = v * 16 + (c >= '0' && c <= '9' ? c - '0' : (c | 0x20) >= 'a' && (c | 0x20) <= 'f' ? (c | 0x20) - 'a' + 10 : 0); }
+    *out = v;
+    return 1;
+  }
+  return 0;
+}
+/* The global flags of the process: the image's own entry of the image file execution options, or the system's (Session Manager). */
+static void read_global_flags(void) {
+  PEB *peb = NtCurrentPeb();
+  static const WCHAR session[] = L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Session Manager";
+  static const WCHAR options[] = L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\";
+  ULONG flags = 0;
+  WCHAR path[260];
+  ULONG n = 0;
+  if (peb->ProcessParameters && peb->ProcessParameters->ImagePathName.Buffer) {
+    const WCHAR *image = peb->ProcessParameters->ImagePathName.Buffer;
+    ULONG length = peb->ProcessParameters->ImagePathName.Length / 2, base = 0;
+    for (ULONG i = 0; i < length; ++i) if (image[i] == '\\' || image[i] == '/') base = i + 1;
+    for (; n < sizeof(options) / 2 - 1; ++n) path[n] = ((const WCHAR *)options)[n];
+    for (ULONG i = base; i < length && n < 255; ++i) path[n++] = image[i];
+    if (!key_global_flag((const WCHAR *)path, n, &flags)) key_global_flag((const WCHAR *)session, sizeof(session) / 2 - 1, &flags);
+  }
+  *(ULONG *)((BYTE *)peb + 0xBC) = flags;
+}
 static PVOID process_heap(void) {
   PEB *peb = NtCurrentPeb();
-  if (!peb->ProcessHeap) { while (__sync_lock_test_and_set(&g_heap_lock, 1)) NtYieldExecution(); if (!peb->ProcessHeap) peb->ProcessHeap = heap_new(0, 0, 0, 1); __sync_lock_release(&g_heap_lock); }
+  if (!peb->ProcessHeap) {
+    static int flags_read;
+    if (!flags_read) { flags_read = 1; read_global_flags(); } while (__sync_lock_test_and_set(&g_heap_lock, 1)) NtYieldExecution(); if (!peb->ProcessHeap) peb->ProcessHeap = heap_new(0, 0, 0, 1); __sync_lock_release(&g_heap_lock); }
   return peb->ProcessHeap;
 }
 EXPORT PVOID NTAPI RtlProcessHeap(void) { return process_heap(); }

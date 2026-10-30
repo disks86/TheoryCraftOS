@@ -24,12 +24,17 @@
 
 #define CHUNK_USED 1ull
 #define CHUNK_PREV_USED 2ull
-#define CHUNK_SIZE(c) ((c)->size_flags & ~15ull)
+#define CHUNK_SIZE_MASK 0x00000FFFFFFFFFF0ull
+#define CHUNK_SIZE(c) ((c)->size_flags & CHUNK_SIZE_MASK)
+#define CHUNK_BIG 8ull      /* a header of 16 bytes (a heap with global flags, or a call with checking flags), not 8 */
+#define CHUNK_INFO 4ull      /* the block keeps user info (a value and flags) after its tail */
+#define CHUNK_UNUSED_SHIFT 44      /* 8 bits: how many bytes of the payload are not asked for */
+#define CHUNK_UFLAGS_SHIFT 52      /* 12 bits: the user flags (HEAP_SETTABLE_USER_FLAG1..3 are 0x200..0x800) */
 typedef struct Chunk { ULONGLONG prev_size, size_flags; struct Chunk *next, *prev; } Chunk;
 
 #define REGION_ALIGN 0x10000ull
 #define INITIAL_COMMIT (0x400ull * sizeof(void *))
-#define LARGE_MIN 0x7F000ull        /* a block of this size or more is a block of its own (growable heaps) */
+#define LARGE_MIN 0xFF000ull        /* a block of this size or more is a block of its own (growable heaps) */
 #define LARGE_HEADER 0x40ull
 #define LARGE_MAGIC 0x4C415247454B4C42ull
 #define MIN_CHUNK 32ull
@@ -66,6 +71,14 @@ static Chunk *chunk_next(Chunk *c) { return (Chunk *)((BYTE *)c + CHUNK_SIZE(c))
 static void free_unlink(Chunk *c) { c->prev->next = c->next; c->next->prev = c->prev; }
 static void free_link(Heap *h, Chunk *c) { c->next = h->free_list.next; c->prev = &h->free_list; h->free_list.next->prev = c; h->free_list.next = c; }
 static ULONGLONG round_up(ULONGLONG v, ULONGLONG to) { return (v + to - 1) & ~(to - 1); }
+#define HF_TAIL 0x20u
+#define HF_FREE 0x40u
+#define HF_NO_COALESCE 0x80u
+#define HF_SHARED 0x04000000u
+#define HF_PAGE_ALLOCS 0x01000000u
+#define TAIL_BYTES 16ull
+static void fill_dwords(BYTE *at, SIZE_T bytes, ULONG pattern) { for (SIZE_T i = 0; i + 4 <= bytes; i += 4) *(ULONG *)(at + i) = pattern; }
+static int check_dwords(const BYTE *at, SIZE_T bytes, ULONG pattern) { for (SIZE_T i = 0; i + 4 <= bytes; i += 4) if (*(const ULONG *)(at + i) != pattern) return 0; return 1; }
 
 /* Makes `c` (size bytes, not in any list) a free chunk and puts the bookkeeping of its neighbour right. */
 static void make_free(Heap *h, Chunk *c, ULONGLONG size, int prev_used) {
@@ -74,6 +87,7 @@ static void make_free(Heap *h, Chunk *c, ULONGLONG size, int prev_used) {
   after->prev_size = size;
   after->size_flags &= ~CHUNK_PREV_USED;
   free_link(h, c);
+  if (h->flags & HF_FREE) fill_dwords((BYTE *)c + 32, (SIZE_T)(size - 32), 0xFEEEFEEEu);      /* (free checking: a free chunk is filled, and the fill is checked) */
 }
 
 static void heaps_add(Heap *h);
@@ -130,9 +144,18 @@ static Heap *heap_new(ULONG flags, SIZE_T initial, SIZE_T maximum, int process_h
   if (!commit_pages(base, commit)) { SIZE_T zero = 0; NtFreeVirtualMemory(NtCurrentProcess(), &base, &zero, MEM_RELEASE); return NULL; }
   Heap *h = (Heap *)base;
   h->ffeeffee = 0xFFEEFFEEu;
-  const ULONG kept = flags & (HEAP_FLAG_NO_SERIALIZE | HEAP_FLAG_GENERATE_EXCEPTIONS);      /* (the others - tail and free checking, shared - do nothing here) */
-  h->flags = kept | (maximum ? 0 : 2 /* HEAP_GROWABLE */) | (process_heap ? 0 : 0x1000 /* HEAP_PRIVATE */);
-  h->force_flags = kept;
+  const ULONG kept = flags & (HEAP_FLAG_NO_SERIALIZE | HEAP_FLAG_GENERATE_EXCEPTIONS);      /* (the others - tail and free checking, shared - come from the global flags only) */
+  const ULONG global = *(ULONG *)((BYTE *)NtCurrentPeb() + 0xBC);
+  ULONG derived = 0;
+  if (global & 0x10) derived |= HF_TAIL;
+  if (global & 0x20) derived |= HF_FREE;
+  if (global & 0x40) derived |= 0x40000000u | HF_TAIL | HF_FREE;
+  if (global & 0x80) derived |= 0x20000000u | HF_TAIL | HF_FREE;
+  if (global & 0x200000) derived |= HF_NO_COALESCE;
+  if (global & 0x2000000) derived |= HF_PAGE_ALLOCS;
+  if (global & 0x800) derived |= HF_SHARED;
+  h->flags = derived | kept | (maximum ? 0 : 2 /* HEAP_GROWABLE */) | (process_heap ? 0 : 0x1000 /* HEAP_PRIVATE */);
+  h->force_flags = h->flags & ~(HF_SHARED | HF_NO_COALESCE | ((h->flags & HF_PAGE_ALLOCS) ? 0 : 0x1002u));
   h->auto_flags = maximum ? 0 : 2;
   h->magic = HEAP_MAGIC;
   h->maximum = maximum;
@@ -145,6 +168,7 @@ static Heap *heap_new(ULONG flags, SIZE_T initial, SIZE_T maximum, int process_h
   h->first.header = (ULONG)header;
   h->subheaps = &h->first;
   region_init(h, &h->first);
+  if (h->flags & HF_PAGE_ALLOCS) for (BYTE *b = (BYTE *)h; b < (BYTE *)h + 0x70; ++b) *b = 0xEE;      /* (such a heap has a header of that fill) */
   heaps_add(h);
   return h;
 }
@@ -198,7 +222,20 @@ static Subheap *region_add(Heap *h, SIZE_T need) {
 }
 
 #define MAX_HEAP_BLOCK (1ull << 46)
-static ULONGLONG chunk_need(SIZE_T bytes) { ULONGLONG need = ((ULONGLONG)bytes + 32 + 15) & ~15ull; return need < MIN_CHUNK ? MIN_CHUNK : need; }
+static ULONGLONG chunk_tail(Heap *h) { return (h->flags & HF_TAIL) ? TAIL_BYTES : 0; }
+static ULONGLONG chunk_pad(Heap *h) { return (h->flags & 0x70000000u) ? 16 : 0; }      /* (the validating heaps keep 16 bytes after the tail) */
+static ULONGLONG chunk_base(Chunk *c) { return (c->size_flags & CHUNK_BIG) ? 16 : 8; }
+/* The size of the chunk for a block: what the chunk owns of the header (8 bytes, or 16), the payload, a tail, padding and user info, up to 16 (the next chunk's prev_size field is payload). */
+static ULONGLONG chunk_need(Heap *h, SIZE_T bytes, int info, int big) { ULONGLONG need = ((ULONGLONG)bytes + chunk_tail(h) + chunk_pad(h) + (info ? 16 : 0) + (big ? 16 : 8) + 15) & ~15ull; return need < MIN_CHUNK ? MIN_CHUNK : need; }
+static ULONGLONG chunk_asked(Heap *h, Chunk *c) {
+  const ULONGLONG unused = (c->size_flags >> CHUNK_UNUSED_SHIFT) & 0xFF;
+  return CHUNK_SIZE(c) - chunk_base(c) - unused - ((c->size_flags & CHUNK_INFO) ? 16 : 0) - chunk_tail(h) - chunk_pad(h);
+}
+static void chunk_set_asked(Heap *h, Chunk *c, SIZE_T bytes) {
+  const ULONGLONG used = bytes + chunk_tail(h) + chunk_pad(h) + ((c->size_flags & CHUNK_INFO) ? 16 : 0);
+  c->size_flags = (c->size_flags & ~(0xFFull << CHUNK_UNUSED_SHIFT)) | ((CHUNK_SIZE(c) - chunk_base(c) - used) << CHUNK_UNUSED_SHIFT);
+}
+static BYTE *chunk_info(Heap *h, Chunk *c) { return (BYTE *)c + 16 + chunk_asked(h, c) + chunk_tail(h) + chunk_pad(h); }
 static int heap_is_fixed(Heap *h) { return h->maximum != 0; }
 
 static PVOID large_alloc(Heap *h, ULONG flags, SIZE_T bytes) {
@@ -210,7 +247,7 @@ static PVOID large_alloc(Heap *h, ULONG flags, SIZE_T bytes) {
   l->reserved = l->committed = total;
   l->asked = bytes;
   l->user_value = 0;
-  l->user_flags = flags & 0xF00;
+  l->user_flags = flags & 0xE00;
   l->magic = LARGE_MAGIC;
   l->next = NULL;
   Large **tail = &h->large;
@@ -223,7 +260,9 @@ static PVOID heap_alloc_locked(Heap *h, ULONG flags, SIZE_T bytes) {
   if (bytes > MAX_HEAP_BLOCK) return NULL;
   if (heap_is_fixed(h) && bytes >= 0xFF000) return NULL;      /* (a fixed heap holds no very big blocks) */
   if (bytes >= LARGE_MIN && !heap_is_fixed(h)) return large_alloc(h, flags, bytes);
-  const ULONGLONG need = chunk_need(bytes);
+  const int info = (flags & 0x100) != 0;
+  const int big = *(ULONG *)((BYTE *)NtCurrentPeb() + 0xBC) != 0 || (flags & (HF_TAIL | HF_FREE));
+  const ULONGLONG need = chunk_need(h, bytes, info, big);
   for (int attempt = 0; attempt < 3; ++attempt) {
     Chunk *chosen = NULL;
     for (Chunk *c = h->free_list.next; c != &h->free_list; c = c->next) {
@@ -236,18 +275,20 @@ static PVOID heap_alloc_locked(Heap *h, ULONG flags, SIZE_T bytes) {
       Chunk *c = chosen;
       const ULONGLONG size = CHUNK_SIZE(c);
       free_unlink(c);
+      const ULONGLONG extra_bits = (info ? CHUNK_INFO : 0) | (big ? CHUNK_BIG : 0) | ((ULONGLONG)(flags & 0xE00) << CHUNK_UFLAGS_SHIFT);
       if (size - need >= MIN_CHUNK) {      /* split: the rest stays free */
-        c->size_flags = need | CHUNK_USED | (c->size_flags & CHUNK_PREV_USED);
+        c->size_flags = need | CHUNK_USED | (c->size_flags & CHUNK_PREV_USED) | extra_bits;
         make_free(h, (Chunk *)((BYTE *)c + need), size - need, 1);
       } else {
-        c->size_flags |= CHUNK_USED;
+        c->size_flags = size | CHUNK_USED | (c->size_flags & CHUNK_PREV_USED) | extra_bits;
         chunk_next(c)->size_flags |= CHUNK_PREV_USED;
       }
+      chunk_set_asked(h, c, bytes);
       BYTE *user = (BYTE *)c + 16;
-      if (flags & HEAP_FLAG_ZERO_MEMORY) memset(user, 0, (size_t_)(CHUNK_SIZE(c) - 32));      /* (all of the payload: the bytes after the size are zero too) */
-      *(ULONGLONG *)((BYTE *)c + CHUNK_SIZE(c)) = bytes;      /* the last 8 bytes of the payload say how many were asked for (HeapSize) */
-      *(ULONGLONG *)((BYTE *)c + CHUNK_SIZE(c) - 16) = 0;      /* user value */
-      *(ULONGLONG *)((BYTE *)c + CHUNK_SIZE(c) - 8) = flags & 0xF00;      /* user flags (HEAP_SETTABLE_USER_FLAG1..3) and whether there is a user value (HEAP_SETTABLE_USER_VALUE) */
+      if (flags & HEAP_FLAG_ZERO_MEMORY) memset(user, 0, (size_t_)((h->flags & (HF_TAIL | 0x70000000u)) || info ? bytes : CHUNK_SIZE(c) - chunk_base(c)));      /* (all of the payload: the bytes after the size are zero too, unless a tail follows) */
+      else if (h->flags & HF_FREE) fill_dwords(user, bytes, 0xBAADF00Du);
+      if (h->flags & HF_TAIL) memset(user + bytes, 0xAB, (size_t_)TAIL_BYTES);
+      if (info) memset(chunk_info(h, c), 0, 16);
       return user;
     }
     if (attempt == 0) {      /* commit more of the newest region */
@@ -297,6 +338,7 @@ static BOOLEAN heap_free_locked(Heap *h, PVOID memory) {
   ULONGLONG size = CHUNK_SIZE(c);
   int prev_used = (c->size_flags & CHUNK_PREV_USED) != 0;
   Chunk *after = chunk_next(c);
+  if (h->flags & HF_NO_COALESCE) { make_free(h, c, size, prev_used); return TRUE; }
   if (!(after->size_flags & CHUNK_USED)) {      /* merge with the free chunk after */
     size += CHUNK_SIZE(after);
     free_unlink(after);
@@ -316,18 +358,22 @@ static BOOLEAN heap_free_locked(Heap *h, PVOID memory) {
 static SIZE_T heap_size_locked(Heap *h, PVOID memory) {
   if (Large *l = heap_large_of(h, memory)) return l->asked;
   Chunk *c = heap_chunk_of(h, memory);
-  return c ? (SIZE_T) * (ULONGLONG *)((BYTE *)c + CHUNK_SIZE(c)) : (SIZE_T)-1;
+  return c ? (SIZE_T)chunk_asked(h, c) : (SIZE_T)-1;
 }
-static SIZE_T chunk_capacity(Chunk *c) { return (SIZE_T)(CHUNK_SIZE(c) - 32); }
-static ULONGLONG *block_user_value(Heap *h, PVOID memory) {
+/* The user info of a block: a value and flags, there if the block was made with HEAP_ADD_USER_INFO (blocks of their own pages always have them). */
+static int block_has_info(Heap *h, PVOID memory) { if (heap_large_of(h, memory)) return 1; return ((((Chunk *)((BYTE *)memory - 16))->size_flags) & CHUNK_INFO) != 0; }
+static ULONGLONG *block_value_slot(Heap *h, PVOID memory) {
   if (Large *l = heap_large_of(h, memory)) return &l->user_value;
-  Chunk *c = (Chunk *)((BYTE *)memory - 16);
-  return (ULONGLONG *)((BYTE *)c + CHUNK_SIZE(c) - 16);
+  return (ULONGLONG *)(chunk_info(h, (Chunk *)((BYTE *)memory - 16)) + 8);
 }
-static ULONGLONG *block_user_flags(Heap *h, PVOID memory) {
-  if (Large *l = heap_large_of(h, memory)) return &l->user_flags;
+static ULONG block_uflags(Heap *h, PVOID memory) {
+  if (Large *l = heap_large_of(h, memory)) return (ULONG)l->user_flags & 0xE00;
+  return (ULONG)((((Chunk *)((BYTE *)memory - 16))->size_flags >> CHUNK_UFLAGS_SHIFT) & 0xE00);
+}
+static void block_set_uflags(Heap *h, PVOID memory, ULONG value) {
+  if (Large *l = heap_large_of(h, memory)) { l->user_flags = value & 0xE00; return; }
   Chunk *c = (Chunk *)((BYTE *)memory - 16);
-  return (ULONGLONG *)((BYTE *)c + CHUNK_SIZE(c) - 8);
+  c->size_flags = (c->size_flags & ~(0xFFFull << CHUNK_UFLAGS_SHIFT)) | ((ULONGLONG)(value & 0xE00) << CHUNK_UFLAGS_SHIFT);
 }
 
 static PVOID heap_realloc_locked(Heap *h, ULONG flags, PVOID memory, SIZE_T bytes) {
@@ -357,51 +403,65 @@ static PVOID heap_realloc_locked(Heap *h, ULONG flags, PVOID memory, SIZE_T byte
     if (flags & HEAP_FLAG_REALLOC_IN_PLACE) return NULL;
   } else {
     Chunk *c = (Chunk *)((BYTE *)memory - 16);
-    if (bytes <= chunk_capacity(c) && (bytes < LARGE_MIN || heap_is_fixed(h))) {      /* fits in the chunk: stays where it is */
-      if ((flags & HEAP_FLAG_ZERO_MEMORY) && bytes > have) memset((BYTE *)memory + have, 0, bytes - have);
-      *(ULONGLONG *)((BYTE *)c + CHUNK_SIZE(c)) = bytes;
-      return memory;
-    }
-    if (flags & HEAP_FLAG_REALLOC_IN_PLACE) {
+    const int info = (c->size_flags & CHUNK_INFO) != 0;
+    const SIZE_T tail = (SIZE_T)chunk_tail(h);
+    const ULONGLONG need = chunk_need(h, bytes, info, (c->size_flags & CHUNK_BIG) != 0);
+    ULONGLONG size = CHUNK_SIZE(c);
+    const int small_enough = bytes < LARGE_MIN || heap_is_fixed(h);
+    BYTE saved_info[16];
+    if (info) for (int i = 0; i < 16; ++i) saved_info[i] = chunk_info(h, c)[i];
+    int resized = 0;
+    if (need <= size && small_enough) {      /* fits in the chunk: stays where it is (and gives back what is far too much) */
+      if (size - need >= 64) {
+        Chunk *rest = (Chunk *)((BYTE *)c + need);
+        ULONGLONG rest_size = size - need;
+        Chunk *after = chunk_next(c);
+        if (!(after->size_flags & CHUNK_USED)) { rest_size += CHUNK_SIZE(after); free_unlink(after); }
+        c->size_flags = (c->size_flags & ~CHUNK_SIZE_MASK) | need;
+        make_free(h, rest, rest_size, 1);
+      }
+      resized = 1;
+    } else if (flags & HEAP_FLAG_REALLOC_IN_PLACE) {
       /* A big block may grow into the free chunk after it (a small one is never grown in place: it would be a low-fragmentation block on Windows). */
       Chunk *after = chunk_next(c);
-      const ULONGLONG have_size = CHUNK_SIZE(c), need = chunk_need(bytes);
-      if (have_size < 0x4000) return NULL;
-      if (have_size + ((after->size_flags & CHUNK_USED) ? 0 : CHUNK_SIZE(after)) < need) {      /* at the end of a region, which can commit more */
+      if (size < 0x4000 || !small_enough) return NULL;
+      if (size + ((after->size_flags & CHUNK_USED) ? 0 : CHUNK_SIZE(after)) < need) {      /* at the end of a region, which can commit more */
         Chunk *end = (after->size_flags & CHUNK_USED) ? after : chunk_next(after);
         if (CHUNK_SIZE(end) != 0) return NULL;
         for (Subheap *s = h->subheaps; s; s = s->next) {
           if ((BYTE *)c < s->base || (BYTE *)c >= s->base + s->committed) continue;
-          const ULONGLONG got = have_size + ((after->size_flags & CHUNK_USED) ? 0 : CHUNK_SIZE(after));
+          const ULONGLONG got = size + ((after->size_flags & CHUNK_USED) ? 0 : CHUNK_SIZE(after));
           if (!region_extend(h, s, (SIZE_T)(need - got + 16))) return NULL;
           break;
         }
         after = chunk_next(c);
       }
-      if ((after->size_flags & CHUNK_USED) || have_size + CHUNK_SIZE(after) < need) return NULL;
-      const ULONGLONG total = have_size + CHUNK_SIZE(after);
+      if ((after->size_flags & CHUNK_USED) || size + CHUNK_SIZE(after) < need) return NULL;
+      const ULONGLONG total = size + CHUNK_SIZE(after);
       free_unlink(after);
       if (total - need >= MIN_CHUNK) {
-        c->size_flags = need | CHUNK_USED | (c->size_flags & CHUNK_PREV_USED);
+        c->size_flags = (c->size_flags & ~CHUNK_SIZE_MASK) | need;
         make_free(h, (Chunk *)((BYTE *)c + need), total - need, 1);
       } else {
-        c->size_flags = total | CHUNK_USED | (c->size_flags & CHUNK_PREV_USED);
+        c->size_flags = (c->size_flags & ~CHUNK_SIZE_MASK) | total;
         chunk_next(c)->size_flags |= CHUNK_PREV_USED;
       }
-      const ULONGLONG user_value = *(ULONGLONG *)((BYTE *)c + have_size - 16), user_flags = *(ULONGLONG *)((BYTE *)c + have_size - 8);
-      *(ULONGLONG *)((BYTE *)c + CHUNK_SIZE(c) - 16) = user_value;
-      *(ULONGLONG *)((BYTE *)c + CHUNK_SIZE(c) - 8) = user_flags;
+      resized = 1;
+    }
+    if (resized) {
+      chunk_set_asked(h, c, bytes);
       if ((flags & HEAP_FLAG_ZERO_MEMORY) && bytes > have) memset((BYTE *)memory + have, 0, bytes - have);
-      *(ULONGLONG *)((BYTE *)c + CHUNK_SIZE(c)) = bytes;
+      else if ((h->flags & HF_FREE) && bytes > have) fill_dwords((BYTE *)memory + ((have + 3) & ~(SIZE_T)3), bytes - ((have + 3) & ~(SIZE_T)3), 0xBAADF00Du);
+      if (tail) memset((BYTE *)memory + bytes, 0xAB, tail);
+      if (info) for (int i = 0; i < 16; ++i) chunk_info(h, c)[i] = saved_info[i];
       return memory;
     }
   }
-  PVOID fresh = heap_alloc_locked(h, flags & ~(ULONG)HEAP_FLAG_ZERO_MEMORY, bytes);
+  PVOID fresh = heap_alloc_locked(h, (flags & ~(ULONG)HEAP_FLAG_ZERO_MEMORY) | (block_has_info(h, memory) ? 0x100u : 0u), bytes);
   if (!fresh) return NULL;
   memcpy(fresh, memory, have < bytes ? have : bytes);
   if ((flags & HEAP_FLAG_ZERO_MEMORY) && bytes > have) memset((BYTE *)fresh + have, 0, bytes - have);
-  *block_user_value(h, fresh) = *block_user_value(h, memory);
-  *block_user_flags(h, fresh) = *block_user_flags(h, memory);
+  if (block_has_info(h, fresh) && block_has_info(h, memory)) { *block_value_slot(h, fresh) = *block_value_slot(h, memory); block_set_uflags(h, fresh, block_uflags(h, memory)); }
   heap_free_locked(h, memory);
   return fresh;
 }
@@ -470,23 +530,53 @@ EXPORT PVOID NTAPI RtlReAllocateHeap(PVOID heap, ULONG flags, PVOID memory, SIZE
   }
   return r;
 }
+/* Is the tail of the block (the asked size is `bytes`) still what was put there? */
+static int tail_intact(Heap *h, PVOID memory, SIZE_T bytes) {
+  if (!(h->flags & HF_TAIL) || heap_large_of(h, memory)) return 1;
+  for (SIZE_T i = 0; i < TAIL_BYTES; ++i) if (((BYTE *)memory)[bytes + i] != 0xAB) return 0;
+  return 1;
+}
+/* Every chunk of every region: the sizes agree, free chunks keep their fill, blocks keep their tails. */
+static int heap_validate_all(Heap *h) {
+  for (Subheap *s = h->subheaps; s; s = s->next) {
+    Chunk *c = region_first(s);
+    BYTE *end = s->base + s->committed - 16;
+    while ((BYTE *)c < end) {
+      const ULONGLONG size = CHUNK_SIZE(c);
+      if (size < MIN_CHUNK || (BYTE *)c + size > end) return 0;
+      if (c->size_flags & CHUNK_USED) {
+        const ULONGLONG asked = chunk_asked(h, c);
+        if ((h->flags & HF_TAIL) && asked + TAIL_BYTES + chunk_base(c) <= size && !tail_intact(h, (BYTE *)c + 16, (SIZE_T)asked)) return 0;
+      } else if ((h->flags & HF_FREE) && !check_dwords((BYTE *)c + 32, (SIZE_T)(size - 32), 0xFEEEFEEEu)) {
+        return 0;
+      }
+      c = chunk_next(c);
+    }
+  }
+  return 1;
+}
 EXPORT BOOLEAN NTAPI RtlValidateHeap(PVOID heap, ULONG flags, PVOID memory) {
   Heap *h = heap;
   if (!heap_ok(h)) return FALSE;
-  if (!memory) return TRUE;
   void *held = heap_lock_for(h, flags, 1);
-  const SIZE_T r = heap_size_locked(h, memory);
+  BOOLEAN ok;
+  if (!memory) ok = heap_validate_all(h) ? TRUE : FALSE;
+  else { const SIZE_T r = heap_size_locked(h, memory); ok = r != (SIZE_T)-1 && tail_intact(h, memory, r); }
   heap_unlock_for(h, held);
-  return r != (SIZE_T)-1;
+  return ok;
 }
 
-/* The value and the flags (HEAP_SETTABLE_USER_FLAG1..3) a program can keep with a block. */
+/* The value and the flags (HEAP_SETTABLE_USER_FLAG1..3) a program can keep with a block (a block made with HEAP_ADD_USER_INFO has room for them). */
 EXPORT BOOLEAN NTAPI RtlGetUserInfoHeap(PVOID heap, ULONG flags, PVOID memory, PVOID *value, PULONG user_flags) {
   Heap *h = heap;
   if (!heap_ok(h) || !memory) return FALSE;
   void *held = heap_lock_for(h, flags, 1);
   const int ok = heap_size_locked(h, memory) != (SIZE_T)-1;
-  if (ok) { if (value && (*block_user_flags(h, memory) & 0x100)) *value = (PVOID)(ULONG_PTR)*block_user_value(h, memory); if (user_flags) *user_flags = (ULONG)(*block_user_flags(h, memory) & 0xE00); }
+  if (ok) {
+    const int info = block_has_info(h, memory);
+    if (value && info) *value = (PVOID)(ULONG_PTR)*block_value_slot(h, memory);
+    if (user_flags) *user_flags = info ? block_uflags(h, memory) : 0;
+  }
   heap_unlock_for(h, held);
   return ok ? TRUE : FALSE;
 }
@@ -494,17 +584,18 @@ EXPORT BOOLEAN NTAPI RtlSetUserValueHeap(PVOID heap, ULONG flags, PVOID memory, 
   Heap *h = heap;
   if (!heap_ok(h) || !memory) return FALSE;
   void *held = heap_lock_for(h, flags, 1);
-  const int ok = heap_size_locked(h, memory) != (SIZE_T)-1;
-  if (ok) { *block_user_value(h, memory) = (ULONGLONG)(ULONG_PTR)value; *block_user_flags(h, memory) |= 0x100; }
+  const int ok = heap_size_locked(h, memory) != (SIZE_T)-1 && block_has_info(h, memory);
+  if (ok) *block_value_slot(h, memory) = (ULONGLONG)(ULONG_PTR)value;
   heap_unlock_for(h, held);
   return ok ? TRUE : FALSE;
 }
 EXPORT BOOLEAN NTAPI RtlSetUserFlagsHeap(PVOID heap, ULONG flags, PVOID memory, ULONG clear, ULONG set) {
   Heap *h = heap;
   if (!heap_ok(h) || !memory) return FALSE;
+  if ((clear | set) & ~(ULONG)0xE00) { heap_error(87 /* ERROR_INVALID_PARAMETER */); return FALSE; }
   void *held = heap_lock_for(h, flags, 1);
-  const int ok = heap_size_locked(h, memory) != (SIZE_T)-1;
-  if (ok) *block_user_flags(h, memory) = (*block_user_flags(h, memory) & ~(ULONGLONG)(clear & 0xE00)) | (set & 0xE00);
+  const int ok = heap_size_locked(h, memory) != (SIZE_T)-1 && block_has_info(h, memory);
+  if (ok) block_set_uflags(h, memory, (block_uflags(h, memory) & ~clear) | set);
   heap_unlock_for(h, held);
   return ok ? TRUE : FALSE;
 }
@@ -640,11 +731,11 @@ EXPORT NTSTATUS NTAPI RtlWalkHeap(PVOID heap, PVOID entry) {
         if (c && CHUNK_SIZE(c) == 0) { stage = 1; c = NULL; }      /* (the sentinel: what follows is the uncommitted part) */
         if (c) {
           if (c->size_flags & CHUNK_USED) {
-            const ULONGLONG asked = *(ULONGLONG *)((BYTE *)c + CHUNK_SIZE(c));
+            const ULONGLONG asked = chunk_asked(h, c);
             const int lfh = h->compat == 2 && asked < 0x4000;
-            out.lpData = (BYTE *)c + 16; out.cbData = asked; out.cbOverhead = lfh ? 8 : (BYTE)(CHUNK_SIZE(c) - 16 - asked); out.wFlags = lfh ? 0x8001 : WALK_BUSY;
+            out.lpData = (BYTE *)c + 16; out.cbData = asked; out.cbOverhead = lfh ? 8 : (BYTE)(CHUNK_SIZE(c) - asked); out.wFlags = lfh ? 0x8001 : WALK_BUSY;
           } else {
-            out.lpData = (BYTE *)c + 16; out.cbData = CHUNK_SIZE(c) - 64; out.cbOverhead = 32; out.wFlags = 0;
+            out.lpData = (BYTE *)c + 32; out.cbData = CHUNK_SIZE(c) - 80; out.cbOverhead = 32; out.wFlags = 0;
           }
           out.iRegionIndex = (BYTE)s->index;
           found = 1;
