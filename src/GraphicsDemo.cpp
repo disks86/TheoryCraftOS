@@ -116,10 +116,19 @@ int groups_check(IGraphicsDevice& device, allocators::IAllocator& allocator) {
       r.fill_rect({12, 12, 16, 16}, rgb(255, 255, 255));
       blurred = r.group_blur(3.0f) && r.end_group(Matrix2D(), 255, ImageFilter::Nearest);
     }
-    bool ok = blurred && r.read_pixels(px);
+    bool cut = blurred && r.begin_filter_group({44, 0, 20, 20});   // a square with a rectangle cut out of it
+    if (cut) {
+      r.fill_rect({44, 0, 20, 20}, rgb(255, 255, 255));
+      cut = r.group_cut_out({48, 4, 12, 12}, CornerRadii{}) && r.end_group(Matrix2D(), 255, ImageFilter::Nearest);
+    }
+    bool ok = cut && r.read_pixels(px);
     if (ok) {
       auto chan = [&](uint32_t x, uint32_t y) { return static_cast<int>((px[y * W + x] >> 8) & 0xFF); };
-      const int left = chan(10, 20), right = chan(29, 20), center = chan(20, 20), far = chan(2, 44) + chan(60, 2);
+      ok = chan(54, 10) == 0 && chan(45, 1) == 255 && chan(47, 10) == 255 && chan(60, 10) == 255;   // (a ring around a hole)
+    }
+    if (ok) {
+      auto chan = [&](uint32_t x, uint32_t y) { return static_cast<int>((px[y * W + x] >> 8) & 0xFF); };
+      const int left = chan(10, 20), right = chan(29, 20), center = chan(20, 20), far = chan(2, 44) + chan(30, 46);
       ok = (px[5 * W + 5] & 0xFFFFFF) == 0x00FFFF && chan(18, 0) == 0 &&   // (inverted red is cyan)
            center >= 240 && left > 20 && left < 235 && right > 20 && right < 235 && left - right <= 12 && right - left <= 12 && far <= 8;
     }

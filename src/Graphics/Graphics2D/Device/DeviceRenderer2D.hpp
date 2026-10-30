@@ -89,6 +89,7 @@ class DeviceRenderer2D final : public IRenderer2D {
   bool begin_filter_group(const Rect2D& bounds) override;
   bool group_blur(float sigma) override;
   bool group_color(const ColorTransform& t) override;
+  bool group_cut_out(const Rect2D& rect, const CornerRadii& radii) override;
   void draw_image_scaled(const Surface& source, const RectF& source_rect, const Rect2D& dest, ImageFilter filter) override;
   void fill_linear_gradient(const Rect2D& rect, Vec2 from, Vec2 to, ArrayView<const GradientStop> stops) override;
   void fill_radial_gradient(const Rect2D& rect, Vec2 center, Vec2 radii, ArrayView<const GradientStop> stops) override;
@@ -124,6 +125,7 @@ class DeviceRenderer2D final : public IRenderer2D {
     Rect2D clip;
     BlendMode blend;
     bool sheet;   // the vertices are the sheet's (textured), not the colored batch's
+    bool erase = false;   // the vertices erase what is under them (a group's picture times one minus their alpha)
   };
 
   void triangle_colors(const float* xs, const float* ys, const Vec4* colors);  // three vertices, own colors
@@ -242,6 +244,8 @@ class DeviceRenderer2D final : public IRenderer2D {
   IShaderModule* masked_fs_ = nullptr;
   IPipeline* masked_ = nullptr;
   bool masks_ok_ = false;
+  IPipeline* group_erase_ = nullptr;
+  bool erase_ = false;   // shapes recorded now erase
   IShaderModule* blur_fs_ = nullptr;
   IShaderModule* color_fs_ = nullptr;
   IPipeline* filter_blur_ = nullptr;

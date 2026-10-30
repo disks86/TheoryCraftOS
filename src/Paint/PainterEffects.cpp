@@ -601,6 +601,39 @@ void DisplayPainter::draw_shadow(graphics::IRenderer2D& r, const ShadowData& sh,
   const float sigma = sh.blur > 0.0f ? sh.blur / 2.0f : 0.0f;
   const int32_t reach = blur_reach(sigma);
   const IRect box = shifted(sh.box, dx, dy);
+  if (r.supports_group_filters()) {
+    // On the GPU: the shape of the shadow (or, inset, everything but it) is drawn into a filter group, blurred there, and the box is cut out of it (inset: the
+    // group is laid over the target through the box's clip).
+    const IRect area = grown(out_area, reach);
+    const int32_t spread_px = sh.spread;
+    auto grow_by = [&](float by) {   // (a square corner stays square)
+      graphics::CornerRadii out = sh.radii;
+      auto g = [&](float v) { return v > 0.0f ? (v + by > 0.0f ? v + by : 0.0f) : 0.0f; };
+      out.tl_x = g(out.tl_x); out.tl_y = g(out.tl_y); out.tr_x = g(out.tr_x); out.tr_y = g(out.tr_y);
+      out.br_x = g(out.br_x); out.br_y = g(out.br_y); out.bl_x = g(out.bl_x); out.bl_y = g(out.bl_y);
+      return out;
+    };
+    const int32_t grow = sh.inset ? -spread_px : spread_px;
+    const IRect shape{box.x + sh.dx - grow, box.y + sh.dy - grow, box.width + 2 * grow, box.height + 2 * grow};
+    r.push_clip_rect(to_rect(out_area));
+    if (sh.inset) r.push_clip_rounded_rect(to_rect(box), sh.radii);
+    bool done = r.begin_filter_group(to_rect(area));
+    if (done) {
+      if (!sh.inset) {
+        if (!shape.empty()) r.fill_rounded_rect(to_rect(shape), grow_by(static_cast<float>(spread_px)), sh.color);
+        r.group_blur(sigma);
+        r.group_cut_out(to_rect(box), sh.radii);
+      } else {
+        r.fill_rect(to_rect(area), sh.color);
+        if (!shape.empty()) r.group_cut_out(to_rect(shape), grow_by(static_cast<float>(-spread_px)));
+        r.group_blur(sigma);
+      }
+      done = r.end_group(graphics::Matrix2D(), 255, graphics::ImageFilter::Nearest);
+    }
+    if (sh.inset) r.pop_clip();
+    r.pop_clip();
+    if (done) return;
+  }
   IRect work = grown(out_area, reach);
   if (!sh.inset) work = work.intersection(bounds);
   AlphaMask mask(allocator_);
