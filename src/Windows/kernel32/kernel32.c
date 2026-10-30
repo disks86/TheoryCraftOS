@@ -73,6 +73,11 @@ static BOOL is_dos_device_name(const WCHAR *name);
 EXPORT BOOL WINAPI CloseHandle(HANDLE h);
 static void port_note(HANDLE file, LPOVERLAPPED overlapped, ULONG_PTR bytes);      /* (extra3.inc: a finished overlapped call is queued at the port its file is tied to) */
 static void port_unlink(HANDLE file);
+/* The files opened with FILE_FLAG_OVERLAPPED (every file is opened for synchronous calls underneath; this is what the flag said). */
+static HANDLE volatile g_overlapped_files[256];
+static void overlapped_note(HANDLE h) { for (int i = 0; i < 256; ++i) if (__sync_bool_compare_and_swap(&g_overlapped_files[i], (HANDLE)NULL, h)) return; }
+static void overlapped_forget(HANDLE h) { for (int i = 0; i < 256; ++i) __sync_bool_compare_and_swap(&g_overlapped_files[i], h, (HANDLE)NULL); }
+static BOOL overlapped_known(HANDLE h) { for (int i = 0; i < 256; ++i) if (g_overlapped_files[i] == h) return TRUE; return FALSE; }
 EXPORT BOOL WINAPI GetFileAttributesExW(LPCWSTR path, int level, LPVOID data);
 static BOOL fail_nt(NTSTATUS status) { set_error(RtlNtStatusToDosError(status)); return FALSE; }
 static PVOID heap(void) { return RtlProcessHeap(); }
@@ -1120,23 +1125,50 @@ EXPORT LONG WINAPI InterlockedExchangeAdd(volatile LONG *p, LONG v) { return __s
 EXPORT LONG WINAPI InterlockedCompareExchange(volatile LONG *p, LONG exchange, LONG compare) { return __sync_val_compare_and_swap(p, compare, exchange); }
 EXPORT LONG64 WINAPI InterlockedCompareExchange64(volatile LONG64 *p, LONG64 exchange, LONG64 compare) { return __sync_val_compare_and_swap(p, compare, exchange); }
 
-EXPORT BOOL WINAPI InitOnceExecuteOnce(PINIT_ONCE once, PINIT_ONCE_FN function, PVOID parameter, PVOID *context) {
-  if ((ULONG_PTR)once->Ptr & 2) { if (context) *context = (PVOID)((ULONG_PTR)once->Ptr & ~3ull); return TRUE; }
-  PVOID result = NULL;
-  if (!function(once, parameter, &result)) return FALSE;
-  once->Ptr = (PVOID)(((ULONG_PTR)result & ~3ull) | 2);
-  if (context) *context = result;
-  return TRUE;
-}
+/* One-time initialization. INIT_ONCE.Ptr is 0 (not started), 1 (a thread is initializing; others wait), 3 (asynchronous initialization under way: several threads may
+ * try; the first to finish wins) or <context> | 2 (done; the context's two low bits are free for this). */
+#define INIT_ONCE_CHECK_ONLY_ 1
+#define INIT_ONCE_ASYNC_ 2
+#define INIT_ONCE_INIT_FAILED_ 4
+EXPORT void WINAPI InitOnceInitialize(PINIT_ONCE once) { once->Ptr = NULL; }
 EXPORT BOOL WINAPI InitOnceBeginInitialize(PINIT_ONCE once, DWORD flags, PBOOL pending, PVOID *context) {
-  (void)flags;
-  if ((ULONG_PTR)once->Ptr & 2) { *pending = FALSE; if (context) *context = (PVOID)((ULONG_PTR)once->Ptr & ~3ull); return TRUE; }
-  *pending = TRUE;
-  return TRUE;
+  volatile ULONG_PTR *state = (volatile ULONG_PTR *)&once->Ptr;
+  if ((flags & ~(DWORD)(INIT_ONCE_CHECK_ONLY_ | INIT_ONCE_ASYNC_)) || ((flags & INIT_ONCE_CHECK_ONLY_) && (flags & INIT_ONCE_ASYNC_))) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  for (;;) {
+    const ULONG_PTR v = *state;
+    if ((v & 3) == 2) { *pending = FALSE; if (context) *context = (PVOID)(v & ~(ULONG_PTR)3); return TRUE; }
+    if (flags & INIT_ONCE_CHECK_ONLY_) { set_error(31 /* ERROR_GEN_FAILURE */); return FALSE; }
+    if (flags & INIT_ONCE_ASYNC_) {
+      if (v == 1) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }      /* (another thread is initializing synchronously) */
+      if (v == 0 && !__sync_bool_compare_and_swap(state, 0, 3)) continue;
+      *pending = TRUE;
+      return TRUE;
+    }
+    if (v == 3) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+    if (v == 0) { if (!__sync_bool_compare_and_swap(state, 0, 1)) continue; *pending = TRUE; return TRUE; }
+    NtYieldExecution();      /* v == 1: somebody else is at it: wait for them */
+  }
 }
 EXPORT BOOL WINAPI InitOnceComplete(PINIT_ONCE once, DWORD flags, PVOID context) {
-  (void)flags;
-  once->Ptr = (PVOID)(((ULONG_PTR)context & ~3ull) | 2);
+  volatile ULONG_PTR *state = (volatile ULONG_PTR *)&once->Ptr;
+  const BOOL failed = (flags & INIT_ONCE_INIT_FAILED_) != 0, async = (flags & INIT_ONCE_ASYNC_) != 0;
+  if ((flags & ~(DWORD)(INIT_ONCE_ASYNC_ | INIT_ONCE_INIT_FAILED_)) || (failed && async) || (failed ? context != NULL : ((ULONG_PTR)context & 3) != 0)) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  const ULONG_PTR v = *state;
+  if ((v == 3) != async && v != 0 && (v & 3) != 2) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }      /* (the kind of the completion is the kind of the begin) */
+  if (v == 0 || (v & 3) == 2) { if (async && v == 0) { set_error(ERROR_INVALID_PARAMETER); return FALSE; } set_error(31); return FALSE; }
+  const ULONG_PTR next = failed ? 0 : ((ULONG_PTR)context | 2);
+  if (!__sync_bool_compare_and_swap(state, v, next)) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  return TRUE;
+}
+EXPORT BOOL WINAPI InitOnceExecuteOnce(PINIT_ONCE once, PINIT_ONCE_FN function, PVOID parameter, PVOID *context) {
+  BOOL pending = FALSE;
+  PVOID result = NULL;
+  if (!InitOnceBeginInitialize(once, 0, &pending, &result)) return FALSE;
+  if (!pending) { if (context) *context = result; return TRUE; }
+  result = context ? *context : NULL;      /* (the callback is given what the caller's variable holds) */
+  if (!function(once, parameter, &result)) { InitOnceComplete(once, INIT_ONCE_INIT_FAILED_, NULL); return FALSE; }      /* (the error is the callback's) */
+  if (!InitOnceComplete(once, 0, result)) { InitOnceComplete(once, INIT_ONCE_INIT_FAILED_, NULL); return FALSE; }
+  if (context) *context = result;
   return TRUE;
 }
 
@@ -1311,6 +1343,7 @@ EXPORT HANDLE WINAPI OpenSemaphoreA(DWORD access, BOOL inherit, LPCSTR name) {
 }
 EXPORT BOOL WINAPI ReleaseSemaphore(HANDLE h, LONG count, PLONG previous) { const NTSTATUS s = NtReleaseSemaphore(h, count, previous); return NT_SUCCESS(s) ? TRUE : fail_nt(s); }
 
+EXPORT HANDLE WINAPI GetStdHandle(DWORD which);
 EXPORT DWORD WINAPI WaitForSingleObjectEx(HANDLE h, DWORD timeout_ms, BOOL alertable);
 EXPORT DWORD WINAPI WaitForSingleObject(HANDLE h, DWORD timeout_ms) { return WaitForSingleObjectEx(h, timeout_ms, FALSE); }
 
@@ -1616,6 +1649,7 @@ static DWORD wait_result(NTSTATUS status) {
 static BOOL pipe_calls_pending(void);
 EXPORT BOOL WINAPI SwitchToThread(void);
 EXPORT DWORD WINAPI WaitForSingleObjectEx(HANDLE h, DWORD timeout_ms, BOOL alertable) {
+  if ((ULONG_PTR)h >= 0xFFFFFFF4u && (ULONG_PTR)h <= 0xFFFFFFF6u) h = GetStdHandle((DWORD)(ULONG_PTR)h);      /* STD_INPUT_HANDLE and the others */
   if (con_is_input(h)) {      /* the console input is ready when a key event is waiting: asked again until it is */
     const DWORD start = GetTickCount();
     while (!con_input_ready()) {
@@ -1635,6 +1669,9 @@ EXPORT DWORD WINAPI WaitForSingleObjectEx(HANDLE h, DWORD timeout_ms, BOOL alert
 }
 EXPORT DWORD WINAPI WaitForMultipleObjectsEx(DWORD count, const HANDLE *handles, BOOL all, DWORD timeout_ms, BOOL alertable) {
   if (count == 0 || count > 64 || !handles) { set_error(ERROR_INVALID_PARAMETER); return WAIT_FAILED; }
+  HANDLE mapped[64];      /* the STD_*_HANDLE numbers stand for the handles the process has for them */
+  for (DWORD i = 0; i < count; ++i) mapped[i] = ((ULONG_PTR)handles[i] >= 0xFFFFFFF4u && (ULONG_PTR)handles[i] <= 0xFFFFFFF6u) ? GetStdHandle((DWORD)(ULONG_PTR)handles[i]) : handles[i];
+  handles = mapped;
   for (DWORD i = 0; i < count && !all; ++i) {
     if (!con_is_input(handles[i])) continue;
     HANDLE others[64];      /* a console input among the handles: the others are asked without waiting, in turns with it */
@@ -2077,6 +2114,7 @@ EXPORT UINT WINAPI WinExec(LPCSTR command_line, UINT show) {
 EXPORT BOOL WINAPI CloseHandle(HANDLE h) {
   if ((ULONG_PTR)h == 0x4B4F54) return TRUE;      /* (advapi32's token "handle": there is nothing behind it) */
   port_unlink(h);
+  overlapped_forget(h);
   const NTSTATUS status = NtClose(h);
   return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
@@ -2969,6 +3007,8 @@ EXPORT HANDLE WINAPI CreateFileW(LPCWSTR path, DWORD access, DWORD share, LPSECU
   }
   /* CREATE_ALWAYS and OPEN_ALWAYS say, by a success with ERROR_ALREADY_EXISTS, that the file was there. */
   set_error(((disposition == CREATE_ALWAYS && iosb.Information == 3) || (disposition == OPEN_ALWAYS && iosb.Information == 1)) ? ERROR_ALREADY_EXISTS : ERROR_SUCCESS);
+  overlapped_forget(handle);
+  if (flags & 0x40000000u /* FILE_FLAG_OVERLAPPED */) overlapped_note(handle);
   return handle;
 }
 EXPORT HANDLE WINAPI CreateFileA(LPCSTR path, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD disposition, DWORD flags, HANDLE template_file) {

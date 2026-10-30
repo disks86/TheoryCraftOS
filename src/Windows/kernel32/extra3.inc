@@ -1156,11 +1156,7 @@ static DWORD WINAPI bind_dispatcher(LPVOID unused) {
 EXPORT BOOL WINAPI BindIoCompletionCallback(HANDLE file, IO_COMPLETION_ROUTINE_ routine, ULONG flags) {
   (void)flags;
   if (!file || file == INVALID_HANDLE_VALUE) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
-  ULONG mode = 0;
-  IO_STATUS_BLOCK iosb;
-  const NTSTATUS s = NtQueryInformationFile(file, &iosb, &mode, sizeof(mode), 16 /* FileModeInformation */);
-  if (!NT_SUCCESS(s)) return fail_nt(s);
-  if (!routine || (mode & 0x30)) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }      /* (a file not opened for overlapped use, or no routine) */
+  if (!routine || !overlapped_known(file)) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }      /* (a file not opened for overlapped use, or no routine) */
   atom_lock();
   int free_slot = -1;
   for (int i = 0; i < 64; ++i) {

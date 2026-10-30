@@ -209,7 +209,7 @@ uint32_t put_previous(Process& p, uint64_t address, int32_t value) {
 
 // What can be waited for.
 struct Waitable {
-  enum Type { Invalid, Thread, Object, Mailslot, Never, Pipe } type = Invalid;
+  enum Type { Invalid, Thread, Object, Mailslot, Never, Pipe, Always } type = Invalid;
   uint64_t thread = 0;      // (Mailslot: the descriptor slot)
   uint32_t object = 0;
 };
@@ -221,6 +221,11 @@ bool resolve(Process& p, uint64_t handle, Waitable* w) {
   if (k == DescriptorKind::Thread) { w->type = Waitable::Thread; w->thread = p.files().token(slot); return true; }
   if (k == DescriptorKind::Pipe) { w->type = Waitable::Pipe; w->thread = slot; return true; }      // (a pipe handle is signalled, as a file object with no call under way is)
   if (k == DescriptorKind::Mailslot) { w->type = Waitable::Mailslot; w->thread = slot; return true; }
+  if (k == DescriptorKind::File || k == DescriptorKind::Directory || k == DescriptorKind::ConsoleInput || k == DescriptorKind::ConsoleOutput || k == DescriptorKind::ConsoleError ||
+      k == DescriptorKind::Null || k == DescriptorKind::Zero || k == DescriptorKind::Random) {      // a file object is signalled when no call on it is under way
+    w->type = Waitable::Always;
+    return true;
+  }
   if (is_object_kind(k)) {
     if (p.files().denied_access(slot) & 0x100000u) return false;      // (no SYNCHRONIZE right)
     w->type = Waitable::Object;
@@ -258,6 +263,7 @@ uint32_t wait_for(Process& p, const Waitable* items, uint32_t count, bool all, u
       return !t || t->finished;
     }
     if (items[i].type == Waitable::Never) return false;
+    if (items[i].type == Waitable::Always) return true;
     if (items[i].type == Waitable::Pipe) return !pipe_handle_gone_locked(p, items[i].thread);
     if (items[i].type == Waitable::Mailslot) return mailslot_read_ready_locked(p, items[i].thread);
     return objects->ready_locked(items[i].object, waiter);
@@ -397,7 +403,8 @@ uint32_t nt_release_semaphore(Process& p, const SyscallRequest& r) {
 
 uint32_t nt_wait_for_single_object(Process& p, const SyscallRequest& r) {
   Waitable w;
-  if (!resolve(p, r.args[0], &w)) {
+  if (r.args[0] == ~uint64_t{0} || r.args[0] == ~uint64_t{1}) w.type = Waitable::Never;      // the pseudo handles of the running process and thread: signalled when it ends, and it is running
+  else if (!resolve(p, r.args[0], &w)) {
     uint64_t slot = 0;
     return slot_of(r.args[0], &slot) && p.files().kind(slot) != DescriptorKind::Closed ? kTypeMismatch : kInvalidHandle;
   }

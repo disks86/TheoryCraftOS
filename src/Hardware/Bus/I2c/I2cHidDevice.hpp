@@ -25,7 +25,7 @@
 #pragma once
 #include <stdint.h>
 #include "Allocators/IAllocator.hpp"
-#include "Hardware/Bus/I2c/II2cBus.hpp"
+#include "Hardware/Bus/I2c/II2cMaster.hpp"
 #include "Utility/ByteBuffer.hpp"
 
 namespace hardware {
@@ -44,7 +44,7 @@ class I2cHidDevice {
  public:
   static constexpr uint32_t kDescriptorBytes = 30, kMaxReportDescriptor = 16384, kMaxInput = 4096;
 
-  I2cHidDevice(allocators::IAllocator& allocator, II2cBus& bus, uint16_t address, uint16_t descriptor_register)
+  I2cHidDevice(allocators::IAllocator& allocator, II2cMaster& bus, uint16_t address, uint16_t descriptor_register)
       : bus_(bus), address_(address), descriptor_register_(descriptor_register), report_descriptor_(allocator) {}
 
   // Reads the HID descriptor, powers the device on, resets it (the answer is waited for by polling the input register) and reads the report descriptor.
@@ -65,7 +65,7 @@ class I2cHidDevice {
  private:
   bool read_register(uint16_t reg, ByteView out);
   bool command(uint8_t opcode, uint8_t low_byte);
-  II2cBus& bus_;
+  II2cMaster& bus_;
   uint16_t address_, descriptor_register_;
   I2cHidDescriptor descriptor_;
   ByteBuffer report_descriptor_;

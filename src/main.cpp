@@ -90,6 +90,9 @@
 #include "Hardware/VMware/VmwareTools.hpp"
 #include "Hardware/SystemInput.hpp"
 #include "Hardware/Mouse/I2c/PlatformI2cHid.hpp"
+#ifdef TCOS_INTEL_WIFI
+#include "Hardware/WirelessInterface/Intel/IwlDriver.hpp"
+#endif
 #include "Hardware/Keyboard/KeyCodes.hpp"
 #include "Kernel/Clipboard.hpp"
 #include "Program/ProgramRunner.hpp"
@@ -951,6 +954,9 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     }
     if (started) Entry(Level::Info, "Input").dec(started).text(" pointing device(s) on I2C");
   }
+#ifdef TCOS_INTEL_WIFI
+  hardware::IwlDriver intel_wifi(shared_allocator);
+#endif
   Entry(input.keyboards().count() ? Level::Ok : Level::Warning, "Input").dec(input.keyboards().count()).text(" keyboards");
   for (uint32_t i = 0; i < input.keyboards().count(); ++i) Entry(Level::Info, "Input").text("  ").text(input.keyboards().at(i)->name());
   Entry(input.mice().count() ? Level::Ok : Level::Warning, "Input").dec(input.mice().count()).text(" mice");
@@ -1100,6 +1106,28 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     filesystem::set_unix_clock(wall_clock_seconds, nullptr);   // before the volumes are mounted: they stamp what they create
     SystemFileSystem explorer_files(shared_allocator, storage);
     desktop::KernelProgramLauncher program_launcher(shared_allocator);      // what the terminals run programs with
+#ifdef TCOS_INTEL_WIFI
+    // The Intel Wireless-AC 9560 (and the rest of the 9000 series): the firmware from /firmware, started, initialised, its hardware address and channels read. Scanning and joining a
+    // network are not written yet, so the card is not given to the network stack. Opt-in (-DTCOS_INTEL_WIFI=ON): none of it has run on a real card.
+    if (clock_ok && paging_ok) {
+      hardware::FileSystemFirmwareSource wifi_firmware(explorer_files.file_system(), shared_allocator);
+      for (uint32_t i = 0; i < pci.device_count(); ++i) {
+        hardware::PciDeviceInfo d;
+        if (!pci.pci_device(i, &d) || !hardware::IwlDriver::supports(d)) continue;
+        const hardware::IwlDriver::Outcome outcome = intel_wifi.start(pci, d, register_mapper, wifi_firmware);
+        if (outcome == hardware::IwlDriver::Outcome::Started) {
+          const hardware::IwlNvmData& nvm = intel_wifi.nvm();
+          Entry e(Level::Ok, "Wi-Fi");
+          e.text("Intel Wireless-AC ").text(intel_wifi.firmware_name()).text(", ");
+          for (int b = 0; b < 6; ++b) e.hex2(nvm.hw_address[b]).text(b < 5 ? ":" : "");
+          e.text(", ").dec(nvm.valid_channels()).text(" channels");
+        } else {
+          Entry(Level::Warning, "Wi-Fi").text("Intel Wireless-AC not started: ").text(hardware::IwlDriver::outcome_name(outcome)).text(intel_wifi.message()[0] ? " - " : "").text(intel_wifi.message());
+        }
+        break;
+      }
+    }
+#endif
 #ifdef TCOS_AMD_VEGAM
     // The Radeon RX Vega M of a Kaby Lake-G machine: the memory controller with its GART, the interrupt ring, the engines' microcode through the SMC, the graphics engine with
     // its compute queues and the SDMA engines (in the order of the Linux driver, before the video engine, which needs the memory controller), and, if the card drives the display
@@ -1552,6 +1580,9 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   audio.shutdown();
   cameras.shutdown();
   serial_ports.shutdown();
+#ifdef TCOS_INTEL_WIFI
+  intel_wifi.stop();
+#endif
 #ifdef TCOS_AMD_VEGAM
   if (hardware::AmdGpu* display = system_gpu.amd_gpu()) display->set_native_display(nullptr);   // (gives the firmware's framebuffer back before the card is stopped)
   vega_m = UniquePointer<hardware::AmdVegaM>();

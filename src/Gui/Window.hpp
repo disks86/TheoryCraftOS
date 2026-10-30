@@ -61,6 +61,14 @@ class Window final : public Control {
   // Is the caret in the shown half of its blink period? It stays shown for a moment after every key press and click, so it never blinks away
   // while you type. Without ticks it is always shown.
   bool caret_visible() const { return __atomic_load_n(&caret_hidden_, __ATOMIC_ACQUIRE) == 0; }
+  // A control that animates (it asks for the next frame as soon as it has been drawn) says, while it paints, how long a frame should take at the most: the render loop then waits for the
+  // rest of that time instead of drawing as fast as it can. The request lasts for the frame being drawn; the shortest of several counts. Safe from any thread.
+  void request_frame_interval(uint64_t us) {
+    uint64_t current = __atomic_load_n(&frame_interval_us_, __ATOMIC_ACQUIRE);
+    while ((current == 0 || us < current) && !__atomic_compare_exchange_n(&frame_interval_us_, &current, us, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+    }
+  }
+  uint64_t frame_interval_us() const { return __atomic_load_n(&frame_interval_us_, __ATOMIC_ACQUIRE); }
   // Something changed: wakes whoever waits in wait_for_frame(). Safe from any thread.
   void mark_dirty();
   // Waits until the window was marked dirty (or the timeout passed); true if it was. For render loops.
@@ -204,6 +212,7 @@ class Window final : public Control {
   Point cursor_;
   bool cursor_visible_ = false;
   bool dirty_ = true;
+  uint64_t frame_interval_us_ = 0;   // request_frame_interval(), for the frame being drawn
   static constexpr uint64_t kCaretHalfPeriodUs = 530000;
   uint64_t now_us_ = 0, caret_epoch_us_ = 0;   // (under the UI lock)
   void restart_caret();

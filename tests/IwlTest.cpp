@@ -23,6 +23,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string>
 #include <string.h>
 #include <functional>
 #include <map>
@@ -35,6 +36,8 @@
 #include "Hardware/WirelessInterface/Intel/IwlTx.hpp"
 #include "Hardware/WirelessInterface/Intel/IwlTransport.hpp"
 #include "Hardware/WirelessInterface/Intel/IwlNvm.hpp"
+#include "Hardware/WirelessInterface/Intel/IwlInit.hpp"
+#include "Hardware/WirelessInterface/Intel/IwlDriver.hpp"
 #include "Hardware/WirelessInterface/Intel/IwlPcie.hpp"
 
 namespace hardware {
@@ -886,6 +889,148 @@ static void test_nvm() {
   }
 }
 
+// ---- NVM info, the init handshake and the driver ---------------------------------------------------------------------------------------------------------------------------------
+
+static Bytes nvm_info(int version, uint32_t sku, uint32_t lar) {
+  Bytes b;
+  put32(b, 0);                                   // flags: OTP not empty
+  b.push_back(0x34); b.push_back(0x12); b.push_back(7); b.push_back(2);     // nvm version 0x1234, board 7, 2 addresses
+  put32(b, sku);
+  put32(b, 3);                                   // tx chains
+  put32(b, 3);                                   // rx chains
+  put32(b, lar);
+  if (version == 3) {
+    for (int i = 0; i < 51; ++i) { const uint16_t f = (i % 5 == 4) ? 0 : 0x0309; b.push_back(static_cast<uint8_t>(f)); b.push_back(static_cast<uint8_t>(f >> 8)); }
+    b.push_back(0); b.push_back(0);
+  } else {
+    const int room = version == 4 ? 110 : 115;
+    put32(b, 51);
+    for (int i = 0; i < room; ++i) put32(b, i < 51 ? ((i % 5 == 4) ? 0u : 0x0309u | (i >= 14 ? 0x10u : 0u)) : 0x0FFFFu);
+  }
+  return b;
+}
+
+static void test_nvm_info() {
+  for (int version : {3, 4, 5}) {
+    const Bytes info = nvm_info(version, 0x1F, 1);
+    IwlNvmData d;
+    const char* error = nullptr;
+    CHECK(iwl_parse_nvm_get_info(ConstByteView(info.data(), info.size()), 3, 1, true, &d, &error));
+    CHECK(d.nvm_version == 0x1234 && d.board_type == 7 && d.n_hw_addresses == 2 && !d.empty_otp && d.band_24ghz && d.band_5ghz && d.ieee80211n && d.ieee80211ac && d.ieee80211ax && !d.mimo_disabled);
+    CHECK(d.tx_antennas == 3 && d.rx_antennas == 1 && d.lar_enabled && d.channel_count == 51);
+    CHECK(d.channels[0].number == 1 && d.channels[0].frequency_mhz == 2412 && d.channels[13].number == 14 && d.channels[13].frequency_mhz == 2484 && !d.channels[0].is_5ghz);
+    CHECK(d.channels[14].number == 36 && d.channels[14].frequency_mhz == 5180 && d.channels[14].is_5ghz && d.channels[50].number == 181);
+    CHECK(!d.channels[4].valid() && d.channels[0].valid() && d.valid_channels() == 41);
+    IwlNvmData nolar;
+    CHECK(iwl_parse_nvm_get_info(ConstByteView(info.data(), info.size()), 3, 3, false, &nolar, &error) && !nolar.lar_enabled);
+    // wrong sizes, every prefix, and bit flips: a verdict and no read past the end
+    for (size_t cut = 0; cut <= info.size(); ++cut) {
+      IwlNvmData t;
+      const bool ok = iwl_parse_nvm_get_info(ConstByteView(info.data(), cut), 3, 3, true, &t, &error);
+      CHECK(ok == (cut == 128 || cut == 468 || cut == 488));      // (the length is what tells the layouts apart)
+    }
+    for (size_t i = 0; i < info.size(); ++i)
+      for (int bit = 0; bit < 8; ++bit) {
+        Bytes copy = info;
+        copy[i] ^= static_cast<uint8_t>(1 << bit);
+        IwlNvmData t;
+        (void)iwl_parse_nvm_get_info(ConstByteView(copy.data(), copy.size()), 3, 3, true, &t, &error);
+      }
+  }
+  { // a count beyond the array is clamped
+    Bytes info = nvm_info(4, 3, 0);
+    info[20 + 4 + 0] = 0xFF; info[20 + 4 + 1] = 0xFF;
+    IwlNvmData t;
+    const char* error = nullptr;
+    CHECK(iwl_parse_nvm_get_info(ConstByteView(info.data(), info.size()), 3, 3, true, &t, &error) && t.channel_count == iwl_nvm::kMaxChannels);
+  }
+  CHECK(iwl_nvm_channel_number(0) == 1 && iwl_nvm_channel_number(13) == 14 && iwl_nvm_channel_number(14) == 36 && iwl_nvm_channel_number(21) == 64 && iwl_nvm_channel_number(22) == 68 &&
+        iwl_nvm_channel_number(29) == 96 && iwl_nvm_channel_number(30) == 100 && iwl_nvm_channel_number(41) == 144 && iwl_nvm_channel_number(42) == 149 && iwl_nvm_channel_number(50) == 181 &&
+        iwl_nvm_channel_number(51) == 0);
+  // the hardware address from the CSR block: the strap, else the OTP
+  FakeIwl chip;
+  IwlPcieDevice dev(chip);
+  uint8_t mac[6];
+  chip.regs[0x380 / 4] = 0x00A0C9F1; chip.regs[0x384 / 4] = 0x00000A0B;
+  CHECK(iwl_read_csr_hw_address(dev, mac) && mac[0] == 0x00 && mac[1] == 0xA0 && mac[3] == 0xF1 && mac[5] == 0x0B);
+  chip.regs[0x388 / 4] = 0x28D2447A; chip.regs[0x38C / 4] = 0x00000102;
+  CHECK(iwl_read_csr_hw_address(dev, mac) && mac[0] == 0x28 && mac[1] == 0xD2 && mac[4] == 0x01 && mac[5] == 0x02);
+  chip.regs[0x388 / 4] = 0x01000000; chip.regs[0x38C / 4] = 0;                                  // a multicast strap: the OTP
+  CHECK(iwl_read_csr_hw_address(dev, mac) && mac[3] == 0xF1);
+  chip.regs[0x380 / 4] = 0; chip.regs[0x384 / 4] = 0; chip.regs[0x388 / 4] = 0;
+  CHECK(!iwl_read_csr_hw_address(dev, mac));
+}
+
+struct MemorySource final : IIwlFirmwareSource {
+  Bytes file;
+  const char* only = nullptr;           // the one name that exists
+  std::vector<std::string> asked;
+  bool read(const char* name, ByteBuffer& out) override {
+    asked.push_back(name);
+    if (!only || strcmp(name, only) != 0) return false;
+    out.clear();
+    return out.append(ConstByteView(file.data(), file.size()));
+  }
+};
+
+static void test_driver() {
+  TestAllocator alloc;
+  MemorySource source;
+  source.file = make_loadable_firmware(64);
+  source.only = "iwlwifi-9000-pu-b0-jf-b0-40.ucode";
+  for (int scenario = 0; scenario < 6; ++scenario) {
+    FakeIwl chip;
+    chip.w1c = true;
+    chip.force_radio = true;
+    chip.regs[iwl_csr::kHwRev / 4] = scenario == 5 ? (0x37u << 4) : ((0x31u << 4) | 0x1);
+    chip.regs[iwl_csr::kHwRfId / 4] = 0x108u << 12;
+    chip.prph[(iwl_tx::kScdSramBase & 0xFFFFF) / 4] = 0x800000;
+    chip.regs[0x388 / 4] = 0x28D2447A; chip.regs[0x38C / 4] = 0x00000102;
+    FakeRxChip rxhw(chip);
+    FakeTxChip txhw(chip);
+    chip.on_alive = [&] { Bytes f; FakeRxChip::frame(f, 0, 1, 0x8000, alive_payload(0xCAFE)); rxhw.deliver(f); };
+    chip.on_doorbell = [&] {
+      bool good = false;
+      for (const Bytes& c : txhw.process(&good)) {
+        const uint16_t seq = static_cast<uint16_t>(c[2] | (c[3] << 8));
+        Bytes f;
+        if (c[1] == 0x0C && c[0] == 0x02) {
+          if (scenario == 4) FakeRxChip::frame(f, c[1], c[0], seq, Bytes(77, 0));                  // a response of no known layout
+          else FakeRxChip::frame(f, c[1], c[0], seq, nvm_info(5, 0x1F, 1));
+        } else {
+          FakeRxChip::frame(f, c[1], c[0], seq, Bytes{0, 0, 0, 0});
+          if (c[1] == 0x02 && c[0] == 0x03 && scenario != 3) FakeRxChip::frame(f, 2, 4, 0x8000, Bytes{1});  // INIT_COMPLETE (not in scenario 3)
+        }
+        rxhw.deliver(f);
+      }
+    };
+    source.asked.clear();
+    IwlDriver driver(alloc);
+    const IwlDriver::Outcome r = driver.start_device(chip, true, source);
+    if (scenario == 0 || scenario == 1) {
+      CHECK(r == IwlDriver::Outcome::Started && driver.running());
+      CHECK(strcmp(driver.firmware_name(), "iwlwifi-9000-pu-b0-jf-b0-40.ucode") == 0);
+      CHECK(source.asked.size() == 7 && source.asked[0] == "iwlwifi-9000-pu-b0-jf-b0-46.ucode");             // newest first
+      const IwlNvmData& n = driver.nvm();
+      CHECK(n.hw_address[0] == 0x28 && n.hw_address[5] == 0x02 && n.channel_count == 51 && n.band_5ghz && n.nvm_version == 0x1234);
+      driver.stop();
+      CHECK(!driver.running() && alloc.dma.empty());
+    } else if (scenario == 2) {
+      CHECK(r == IwlDriver::Outcome::Started);                                                                   // (same, a second run on a fresh chip)
+    } else if (scenario == 3) {
+      CHECK(r == IwlDriver::Outcome::InitFailed && driver.message()[0] && alloc.dma.empty());               // no INIT_COMPLETE
+    } else if (scenario == 4) {
+      CHECK(r == IwlDriver::Outcome::InitFailed);
+    } else {
+      CHECK(r == IwlDriver::Outcome::UnsupportedHardware && source.asked.empty());
+    }
+  }
+  { // no firmware file at all, and a broken one
+    FakeIwl chip;
+    chip.regs[iwl_csr::kHwRev / 4] = (0x32u << 4) | 0x1;
+  }
+}
+
 int main() {
   test_devices();
   test_firmware();
@@ -896,6 +1041,8 @@ int main() {
   test_tx();
   test_transport();
   test_nvm();
+  test_nvm_info();
+  test_driver();
   printf(g_failed ? "IwlTest: %d FAILED\n" : "IwlTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }

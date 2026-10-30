@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <vector>
 #include "Emulation/X86_64Cpu.hpp"
 #include "Process/AddressSpace.hpp"
@@ -667,7 +668,7 @@ static void test_lwp_hardware_events() {
     make_lwpcb(m, 0xFFFFFFFF, 1024);
     m.cpu.state().r[2] = kLwpcb;
     CHECK(m.finished());
-    CHECK(get_mem(m, kLwpcb, 4) == 0xE000006E);
+    CHECK(get_mem(m, kLwpcb, 4) == 0xE000007E);
   }
   {      // instructions retired: every fourth instruction (interval 3), starting with the llwpcb that starts it
     Machine m(lwp_run(Bytes(8, 0x90)));
@@ -753,6 +754,72 @@ static void test_lwp_hardware_events() {
       CHECK(m.cpu.take_lwp_interrupt() == bool(interrupts));
       CHECK(!m.cpu.take_lwp_interrupt());
     }
+  }
+}
+
+static void test_lwp_cache_misses() {
+  constexpr uint64_t kBigData = 0x40000;
+  auto make = [&](const Bytes& body, uint32_t filters, int32_t counter) {
+    auto m = std::make_unique<Machine>(lwp_run(body));
+    m->space.map(kBigData, 0x10000, process::kProtRead | process::kProtWrite);
+    make_lwpcb(*m, 0x10, 4096);
+    set_event(*m, 4, 1, counter);
+    put_u32(*m, kLwpcb + 36, filters);
+    m->cpu.state().r[2] = kLwpcb;
+    m->cpu.state().r[6] = kBigData;      // rsi
+    m->cpu.state().r[4] = 0x21F00;
+    return m;
+  };
+  const Bytes load_rax = {0x48, 0x8B, 0x06};      // mov rax, [rsi]
+  const Bytes load_rbx_64 = {0x48, 0x8B, 0x5E, 0x40};      // mov rbx, [rsi + 64]
+  {      // the first touch of a line misses and goes to DRAM; a second touch hits
+    Bytes body = load_rax;
+    body.insert(body.end(), load_rax.begin(), load_rax.end());
+    body.insert(body.end(), load_rbx_64.begin(), load_rbx_64.end());
+    auto m = make(body, 0, 0);
+    CHECK(m->finished());
+    CHECK(get_mem(*m, kLwpcb + 16, 4) == 32);      // the first miss; the next one (interval 1) is not due
+    CHECK(record_field(*m, 0, 0, 1) == 4);
+    CHECK(record_field(*m, 0, 8) == 0x10005);      // the first load
+    CHECK(record_field(*m, 0, 16) == kBigData);
+    CHECK(record_field(*m, 0, 4, 4) == 256);       // latency of a DRAM access
+    CHECK(((record_field(*m, 0, 2, 2) >> 13) & 7) == 3 && ((record_field(*m, 0, 2, 2) >> 12) & 1) == 1);      // SRC = DRAM, DAV
+    auto n = make(body, 0, 1);      // the counter starts at 1: the second miss (the other line) is stored
+    CHECK(n->finished());
+    CHECK(get_mem(*n, kLwpcb + 16, 4) == 32 && record_field(*n, 0, 16) == kBigData + 64);
+  }
+  {      // the latency filter: MinLatency * 16 cycles
+    auto at = make(load_rax, 16, 0);
+    CHECK(at->finished() && get_mem(*at, kLwpcb + 16, 4) == 32);
+    auto above = make(load_rax, 17, 0);
+    CHECK(above->finished() && get_mem(*above, kLwpcb + 16, 4) == 0);
+  }
+  {      // the level filter: DRAM only, or local L3 only
+    auto ram = make(load_rax, 0x100 | 0x800, 0);
+    CHECK(ram->finished() && get_mem(*ram, kLwpcb + 16, 4) == 32);
+    auto l3 = make(load_rax, 0x100 | 0x200, 0);
+    CHECK(l3->finished() && get_mem(*l3, kLwpcb + 16, 4) == 0);
+  }
+  {      // nine lines of one L1 set push the first one out of the L1 but not out of the second level: its reload is a local L3 hit (source 1, 48 cycles)
+    Bytes body;
+    for (int i = 0; i < 9; ++i) {
+      const int32_t disp = 4096 * i;
+      body.insert(body.end(), {0x48, 0x8B, 0x86, uint8_t(disp), uint8_t(disp >> 8), uint8_t(disp >> 16), uint8_t(disp >> 24)});      // mov rax, [rsi + disp]
+    }
+    body.insert(body.end(), load_rax.begin(), load_rax.end());
+    auto m = make(body, 0x100 | 0x200, 0);
+    CHECK(m->finished());
+    CHECK(get_mem(*m, kLwpcb + 16, 4) == 32);
+    CHECK(record_field(*m, 0, 16) == kBigData && record_field(*m, 0, 4, 4) == 48 && ((record_field(*m, 0, 2, 2) >> 13) & 7) == 1);
+  }
+  {      // a store allocates the line, so the load after it hits; a load that spans two lines reports once, with the address that was asked for
+    Bytes body = {0x48, 0x89, 0x06};      // mov [rsi], rax
+    body.insert(body.end(), load_rax.begin(), load_rax.end());
+    auto m = make(body, 0, 0);
+    CHECK(m->finished() && get_mem(*m, kLwpcb + 16, 4) == 0);
+    Bytes split = {0x48, 0x8B, 0x46, 0x3C};      // mov rax, [rsi + 60]
+    auto n = make(split, 0, 0);
+    CHECK(n->finished() && get_mem(*n, kLwpcb + 16, 4) == 32 && record_field(*n, 0, 16) == kBigData + 60);
   }
 }
 
@@ -880,6 +947,7 @@ int main() {
   test_vpermil2();
   test_lwp();
   test_lwp_hardware_events();
+  test_lwp_cache_misses();
   test_decoding();
   test_malformed();
   if (g_failed) { printf("XopTest: %d failed\n", g_failed); return 1; }

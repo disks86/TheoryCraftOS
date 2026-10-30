@@ -332,7 +332,8 @@ X86_64Cpu::Step X86_64Cpu::apx_promoted_vex(GuestMemory& m, uint8_t p0, uint8_t 
   const bool kmov = map == 1 && op >= 0x90 && op <= 0x93;
   const bool amx = map == 2 && (op == 0x49 || op == 0x4B);
   const bool cmpxadd = map == 2 && (op & 0xF0) == 0xE0;
-  if (!bmi && !kmov && !amx && !cmpxadd) return fail(6);
+  const bool user_msr = map == 7 && op == 0xF8;
+  if (!bmi && !kmov && !amx && !cmpxadd && !user_msr) return fail(6);
   if (d_.position >= d_.available) return bad_decode();
   const bool is_reg = (d_.bytes[d_.position] >> 6) == 3, u = p1 & 4, nf = p2 & 4;
   if (p2 & ~0x0C) return fail(6);      // payload byte 3: only V4 and NF may be set (so L must be 0)
@@ -349,6 +350,14 @@ X86_64Cpu::Step X86_64Cpu::apx_promoted_vex(GuestMemory& m, uint8_t p0, uint8_t 
   const bool w = p1 >> 7;
   const uint64_t saved_flags = s_.rflags;
   Step r;
+  if (user_msr) {      // urdmsr r64, imm32 (F2) / uwrmsr imm32, r64 (F3), with R16..R31 for the register
+    if ((pp != 2 && pp != 3) || w || vvvv != 0 || (p2 & 4)) return fail(6);
+    if (!decode_modrm()) return bad_decode();
+    const uint32_t index = static_cast<uint32_t>(next_imm(4, false));
+    if (!finish_decode()) return bad_decode();
+    if (d_.mod != 3 || (d_.reg & 7) != 0) return fail(6);
+    return user_msr_instruction(pp == 2, true, index);
+  }
   if (bmi) r = vex_bmi(m, static_cast<int>(map), op, w, vvvv);
   else if (kmov) r = kmask_instruction(m, 1, op, w, vvvv);
   else if (amx) r = amx_instruction(m, op, vvvv);

@@ -96,6 +96,7 @@ void Window::render() {
     // holding a grid or list would repaint non-stop. Changes made while we draw (below) still ask for the next frame.
     layout();
     __atomic_store_n(&dirty_, false, __ATOMIC_RELEASE);
+    __atomic_store_n(&frame_interval_us_, uint64_t{0}, __ATOMIC_RELEASE);
     Painter painter(*renderer_, theme_);
     paint_tree(painter);
     if (popup_) popup_->paint_tree(painter);
