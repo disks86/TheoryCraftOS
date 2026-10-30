@@ -110,7 +110,27 @@ IwlDriver::Outcome IwlDriver::start_device(IIwlRegisters& registers, bool integr
   return outcome_;
 }
 
+IwlScanner* IwlDriver::enable_scanning(const char** error) {
+  const char* local = nullptr;
+  if (!error) error = &local;
+  if (outcome_ != Outcome::Started || !transport_) {
+    *error = "the card is not running";
+    return nullptr;
+  }
+  scanner_ = UniquePointer<IwlScanner>::make(allocator_, *transport_, allocator_);
+  if (!scanner_) {
+    *error = "out of memory";
+    return nullptr;
+  }
+  if (!scanner_->bring_up(firmware_, nvm_, error)) {
+    scanner_ = UniquePointer<IwlScanner>();
+    return nullptr;
+  }
+  return scanner_.get();
+}
+
 void IwlDriver::stop() {
+  scanner_ = UniquePointer<IwlScanner>();                      // (before the transport it talks through)
   if (transport_) transport_->stop();
   transport_ = UniquePointer<IwlTransport>();
   mmio_registers_ = UniquePointer<MmioIwlRegisters>();

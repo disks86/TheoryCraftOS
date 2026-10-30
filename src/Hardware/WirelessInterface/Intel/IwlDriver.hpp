@@ -31,6 +31,7 @@
 #include "Hardware/WirelessInterface/Intel/IwlInit.hpp"
 #include "Hardware/WirelessInterface/Intel/IwlNvm.hpp"
 #include "Hardware/WirelessInterface/Intel/IwlPcie.hpp"
+#include "Hardware/WirelessInterface/Intel/IwlScan.hpp"
 #include "Hardware/WirelessInterface/Intel/IwlTransport.hpp"
 #include "Utility/ByteBuffer.hpp"
 #include "Utility/UniquePointer.hpp"
@@ -94,6 +95,9 @@ class IwlDriver {
   bool running() const { return transport_ && transport_->running(); }
   const IwlNvmData& nvm() const { return nvm_; }
   IwlTransport* transport() { return transport_.get(); }
+  // The runtime commands for scanning (after Started); the scanner, or nullptr with a message in *error.
+  IwlScanner* enable_scanning(const char** error);
+  IwlScanner* scanner() { return scanner_.get(); }
 
  private:
   Outcome fail(Outcome outcome, const char* message);
@@ -101,6 +105,7 @@ class IwlDriver {
   allocators::IAllocator& allocator_;
   UniquePointer<MmioIwlRegisters> mmio_registers_;
   UniquePointer<IwlTransport> transport_;
+  UniquePointer<IwlScanner> scanner_;
   ByteBuffer file_;
   IwlFirmware firmware_;
   IwlNvmData nvm_;

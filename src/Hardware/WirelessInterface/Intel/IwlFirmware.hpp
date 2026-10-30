@@ -44,7 +44,7 @@ struct IwlSection {
 };
 
 struct IwlCommandVersion {
-  uint8_t group, command, command_version, notification_version;
+  uint8_t command, group, command_version, notification_version;      // (the file's order: the command id first)
 };
 
 class IwlFirmware {
@@ -65,6 +65,8 @@ class IwlFirmware {
   uint32_t phy_config() const { return phy_config_; }
   uint32_t cpu_count() const { return cpu_count_; }
   uint32_t paging_size() const { return paging_size_; }
+  // How many channel entries the firmware's scan request has room for (its layout depends on it).
+  uint32_t scan_channels() const { return scan_channels_; }
   uint32_t probe_max_length() const { return probe_max_length_; }
   uint32_t fw_major() const { return fw_major_; }
   uint32_t fw_minor() const { return fw_minor_; }
@@ -88,6 +90,7 @@ class IwlFirmware {
   bool add_section(List<IwlSection>& list, ConstByteView tlv, bool secure, const char** error);
 
   List<IwlSection> regular_, init_, wowlan_;
+  uint32_t scan_channels_ = 40;
   uint32_t version_ = 0, build_ = 0, flags_ = 0, phy_config_ = 0, cpu_count_ = 1, paging_size_ = 0, probe_max_length_ = 0, fw_major_ = 0, fw_minor_ = 0;
   char human_readable_[65] = {};
   uint32_t api_[kApiWords] = {}, capa_[kApiWords] = {};

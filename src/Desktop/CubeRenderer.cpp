@@ -65,13 +65,16 @@ graphics::Mat4 CubeRenderer::transform(float angle, float aspect) {
          graphics::Mat4::rotation_x(0.6f * angle);
 }
 
-uint32_t CubeRenderer::find_adapter(Kernel& kernel, bool accelerated) {
+uint32_t CubeRenderer::find_adapter(Kernel& kernel, bool accelerated, const graphics::IGraphicsDevice* preferred) {
   const uint32_t count = kernel.adapter_count();
+  uint32_t first = kInvalidIndex;
   for (uint32_t i = 0; i < count; ++i) {
     Adapter* a = kernel.adapter(i);
-    if (a && a->caps().accelerated == accelerated) return i;
+    if (!a || a->caps().accelerated != accelerated) continue;
+    if (preferred && &a->device() == preferred) return i;
+    if (first == kInvalidIndex) first = i;
   }
-  return kInvalidIndex;
+  return first;
 }
 
 void CubeRenderer::close() {

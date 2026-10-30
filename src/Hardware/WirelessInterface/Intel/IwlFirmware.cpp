@@ -25,7 +25,7 @@ namespace {
 
 // iwl_ucode_tlv_type
 constexpr uint32_t kTlvProbeMaxLen = 6, kTlvFlags = 18, kTlvSecRt = 19, kTlvSecInit = 20, kTlvSecWowlan = 21, kTlvPhySku = 23, kTlvSecureSecRt = 24, kTlvSecureSecInit = 25,
-                   kTlvSecureSecWowlan = 26, kTlvNumOfCpu = 27, kTlvApiChangesSet = 29, kTlvEnabledCapabilities = 30, kTlvPaging = 32, kTlvFwVersion = 36, kTlvCmdVersions = 48,
+                   kTlvSecureSecWowlan = 26, kTlvNumOfCpu = 27, kTlvApiChangesSet = 29, kTlvEnabledCapabilities = 30, kTlvNScanChannels = 31, kTlvPaging = 32, kTlvFwVersion = 36, kTlvCmdVersions = 48,
                    kTlvIml = 52;
 constexpr uint32_t kHeaderBytes = 8 + 64 + 4 + 4 + 8;
 
@@ -55,6 +55,7 @@ bool IwlFirmware::parse(ConstByteView d, const char** error) {
   for (uint32_t& w : api_) w = 0;
   for (uint32_t& w : capa_) w = 0;
   flags_ = phy_config_ = paging_size_ = probe_max_length_ = fw_major_ = fw_minor_ = 0;
+  scan_channels_ = 40;                                              // IWL_DEFAULT_SCAN_CHANNELS
   cpu_count_ = 1;
   image_loader_ = command_versions_ = ConstByteView();
   if (d.size() < kHeaderBytes) { *error = "the file is shorter than its header"; return false; }
@@ -103,6 +104,11 @@ bool IwlFirmware::parse(ConstByteView d, const char** error) {
         if (length != 4) { *error = "bad NUM_OF_CPU"; return false; }
         cpu_count_ = le32(body, 0);
         if (cpu_count_ != 1 && cpu_count_ != 2) { *error = "the firmware wants a number of processors the chip does not have"; return false; }
+        break;
+      case kTlvNScanChannels:
+        if (body.size() != 4) { *error = "scan channel count TLV has the wrong length"; return false; }
+        scan_channels_ = le32(body, 0);
+        if (scan_channels_ == 0 || scan_channels_ > 128) { *error = "scan channel count out of range"; return false; }
         break;
       case kTlvPaging:
         if (length != 4) { *error = "bad PAGING"; return false; }
