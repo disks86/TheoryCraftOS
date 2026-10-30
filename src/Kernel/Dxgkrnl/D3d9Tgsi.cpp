@@ -789,7 +789,14 @@ bool TgsiEmitter::instruction(const Instr& ins) {
       return true;
     }
     case kGsEmit: case kGsCut: {
-      const String stream = zero();
+      // (the stream is the first component of an immediate: the float zero is stream 0)
+      const String stream = ins.control ? [&] {
+        String s = str();
+        add(s, "IMM[");
+        add_uint(s, imm4_bits(ins.control, ins.control, ins.control, ins.control));
+        add(s, "].xxxx");
+        return s;
+      }() : zero();
       if (op == kGsCut) {
         line("ENDPRIM", &stream);
         return true;
@@ -800,6 +807,9 @@ bool TgsiEmitter::instruction(const Instr& ins) {
       String o = str();
       add(o, "OUT[0]");
       line("MUL", &o, &pos, &factor);
+      String upright = str();
+      add(upright, "OUT[5]");
+      line("MOV", &upright, &pos);
       for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) {
         String target = str();
         add(target, "OUT[");
@@ -1123,6 +1133,7 @@ void TgsiEmitter::assemble(String* out) {
       add_uint(*out, i);
       add(*out, "]\n");
     }
+    add(*out, "DCL OUT[5], GENERIC[4]\n");   // (the position as the shader wrote it, +Y up: what stream output takes, as the host's output 0 is turned over)
   }
   if (hull_ || domain_) {
     if (hull_) {

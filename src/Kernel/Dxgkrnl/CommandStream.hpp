@@ -39,6 +39,8 @@
 //   BeginQuery       allocation_index, offset [, kind]   (kind: a graphics::QueryKind, 0 occlusion count if left out, 1 occlusion predicate, 2 IA vertices, 3 IA primitives, 4 VS invocations, 5 PS invocations;
 //                    the others need kFeatureStatisticsQueries. An occlusion query, the adapter's kFeatureOcclusionQueries: inside a pass; the allocation is a kAllocQueryResult buffer and `offset` a multiple of 8
 //                    with 8 bytes room. One query is open at a time and it ends before the pass does; at most kMaxOcclusionQueries per stream)
+//   SetStreamOutput  slot, allocation_index (kNoAllocation: none), offset   (the buffer the pipeline's stream output declaration puts buffer `slot` in: a kAllocStreamOutput buffer, offset a multiple of 4; anywhere,
+//                    the adapter's kFeatureStreamOutput)
 //   BindUav          slot, allocation_index, offset, size   (a storage buffer for compute shaders, outside a pass: slot below kMaxStorageBuffers, a kAllocUnorderedAccess buffer, offset and size multiples of 4)
 //   Dispatch         groups_x, groups_y, groups_z   (outside a pass, with a compute pipeline bound by BindPipeline and every storage slot its shader uses bound; each count at most kMaxDispatchGroups)
 //   ResolveRegion    destination_index, source_index   (outside a pass: the samples of a multisampled colour render target averaged into an ordinary image of the same format and size, the adapter's kFeatureMultisample)
@@ -72,6 +74,7 @@ enum class Op : uint16_t {
   BindUav,
   Dispatch,
   ResolveRegion,
+  SetStreamOutput,
 };
 
 // How the vertices (or indices) of a draw make triangles (D3D10 IASetPrimitiveTopology / D3D9 primitive types); the default is a list. A strip or fan is expanded to a list of
@@ -148,6 +151,8 @@ class CommandWriter {
     else packet(Op::BeginQuery, {allocation, offset, kind});
   }
   void end_query() { packet(Op::EndQuery, {}); }
+  // Stream output buffer `slot` (below kMaxStreamOutputBuffers) is the kAllocStreamOutput allocation, written from `offset` (a multiple of 4; the draws that follow append); kNoAllocation unbinds it.
+  void set_stream_output(uint32_t slot, uint32_t allocation, uint32_t offset = 0) { packet(Op::SetStreamOutput, {slot, allocation, offset}); }
   void bind_uav(uint32_t slot, uint32_t allocation, uint32_t offset, uint32_t size) { packet(Op::BindUav, {slot, allocation, offset, size}); }
   void dispatch(uint32_t x, uint32_t y = 1, uint32_t z = 1) { packet(Op::Dispatch, {x, y, z}); }
   // `mode`: a graphics::ResolveMode (0 average, 1 sample 0, 2 least, 3 greatest); a depth buffer needs 1 or the adapter's kFeatureResolveModes. Left out (0, two words), it is the average of a colour target.

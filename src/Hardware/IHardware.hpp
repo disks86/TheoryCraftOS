@@ -20,6 +20,7 @@
 // firmware services). Freestanding: no RTTI, exceptions or heap, so the
 // destructor is protected and non-virtual - never delete through IHardware.
 #pragma once
+#include "Hardware/DeviceProperties.hpp"
 
 namespace hardware {
 
@@ -31,6 +32,9 @@ class IHardware {
   virtual bool initialize() = 0;
   // Quiesce the device. Safe to call when not initialized.
   virtual void shutdown() = 0;
+  // Adds the device's own facts (firmware version, link width, ...) to its Properties window. The window already shows what the class interface
+  // tells, so a driver only overrides this for what is particular to it. Must not change the device.
+  virtual void describe(IPropertySink& sink) const { (void)sink; }
 
  protected:
   constexpr IHardware() = default;

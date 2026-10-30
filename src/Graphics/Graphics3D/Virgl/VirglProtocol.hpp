@@ -40,6 +40,7 @@ enum Command : uint32_t {
   kSetBlendColor,
   kSetScissorState,
   kBlit = 16,
+  kSetStreamoutTargets = 25,
   kBindSamplerStates = 18,
   kBeginQuery = 19,
   kEndQuery = 20,
@@ -60,6 +61,7 @@ enum ObjectType : uint32_t {
   kObjectSamplerState,
   kObjectSurface,
   kObjectQuery,
+  kObjectStreamoutTarget,
 };
 
 constexpr uint32_t header(uint32_t command, uint32_t object, uint32_t length_dwords) {
@@ -106,6 +108,7 @@ constexpr uint32_t kShaderTessControl = 3, kShaderTessEval = 4;   // (PIPE_SHADE
 constexpr uint32_t kPrimPatches = 14;   // (PIPE_PRIM_PATCHES; the draw command then has two more words, the control points of a patch and the draw id)
 constexpr uint32_t kShaderGeometry = 2;   // (PIPE_SHADER_GEOMETRY)
 constexpr uint32_t kShaderCompute = 5;   // (PIPE_SHADER_COMPUTE)
+constexpr uint32_t kBindStreamOutput = 1u << 11;   // a buffer the stream output of a geometry shader is written to
 constexpr uint32_t kBindShaderBuffer = 1u << 14;   // a buffer compute shaders read and write
 constexpr uint32_t kShaderVertex = 0;
 constexpr uint32_t kShaderFragment = 1;

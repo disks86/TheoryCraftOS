@@ -20,6 +20,7 @@
 // network, audio, MIDI, input, USB, printer and camera devices, and every device found on the PCI bus. Each source is optional (nullptr: that group
 // is left out). refresh() looks at them all again - hot-plugged devices appear and go - and says whether the list changed. The sources must outlive it.
 #pragma once
+#include "Desktop/DeviceDetails.hpp"
 #include "Desktop/HardwareInventory.hpp"
 #include "Utility/String.hpp"
 #include "Hardware/AudioDevice/SystemAudioDevices.hpp"
@@ -36,7 +37,14 @@
 #include "Hardware/StorageDevice/SystemStorageDevices.hpp"
 #include "Hardware/SystemInput.hpp"
 
-class SystemInventory final : public desktop::IHardwareInventory {
+// The numbers (HardwareEntry::id) of the devices of the kinds whose number is not just their place in their subsystem.
+constexpr uint32_t kMouseIdBase = 0x10000;      // Input: keyboards are 0.., mice kMouseIdBase..
+constexpr uint32_t kUsbControllerPort = 0xFFFF; // Usb: (controller << 16) | port, or (controller << 16) | kUsbControllerPort for the controller itself
+
+// Lists the machine's devices for the Hardware tab and, being asked by group and number, tells the facts of any of them for its Properties window
+// (IDeviceDetails). The facts come from the class interfaces, so every device of a kind is described the same way, plus what the driver adds with
+// IHardware::describe().
+class SystemInventory final : public desktop::IHardwareInventory, public desktop::IDeviceDetails {
  public:
   explicit SystemInventory(allocators::IAllocator& allocator) : allocator_(allocator), current_(allocator), scratch_(allocator) {}
 
@@ -57,6 +65,7 @@ class SystemInventory final : public desktop::IHardwareInventory {
   bool refresh() override;
   uint32_t count() const override { return current_.count(); }
   bool entry(uint32_t index, desktop::HardwareEntry* out) const override;
+  bool describe(desktop::HardwareGroup group, uint32_t id, desktop::DevicePropertyList* out) override;
 
  private:
   void collect(desktop::HardwareList* list);

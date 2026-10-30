@@ -1262,8 +1262,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
             }
           }
           // networking to another host: offered in our properties, an interface for the network stack that gets an address when the cable's other end answers
-          if (thunderbolt->icm()) thunderbolt_net = UniquePointer<hardware::ThunderboltNet>::make(shared_allocator, *thunderbolt->icm(), shared_allocator, smb_random);
-          if (thunderbolt_net && thunderbolt->icm()->offer_network(hardware::ThunderboltNet::offered_flags(hardware::ThunderboltNet::Config())) && thunderbolt_net->initialize()) {
+          if (thunderbolt->xdomain_host()) thunderbolt_net = UniquePointer<hardware::ThunderboltNet>::make(shared_allocator, *thunderbolt->xdomain_host(), shared_allocator, smb_random);
+          if (thunderbolt_net && thunderbolt->xdomain_host()->offer_network(hardware::ThunderboltNet::offered_flags(hardware::ThunderboltNet::Config())) && thunderbolt_net->initialize()) {
             UniquePointer<hardware::ThunderboltNetLink> link = UniquePointer<hardware::ThunderboltNetLink>::make(shared_allocator, thunderbolt_net.get());
             hardware::ThunderboltNetLink* raw = link.get();
             stacks.stop_service();
@@ -1568,6 +1568,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     guest.set_display_request_handler(on_vbox_display_request, &vbox_display);
     desktop.set_display_changer(&DisplayPipeline::apply, &display_pipeline);
     desktop.set_hardware_inventory(&inventory);
+    desktop.set_device_details(&inventory);
     desktop.set_network_details(&network_details);
     desktop.set_wireless_details(&wireless_details);
     desktop.set_media_services(mixer.get(), &video_codecs, &clock);

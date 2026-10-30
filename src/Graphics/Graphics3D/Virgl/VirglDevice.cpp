@@ -117,6 +117,7 @@ class VirglBuffer final : public IBuffer {
     if (usage & kBufferVertex) bind |= virgl::kBindVertexBuffer;
     if (usage & kBufferIndex) bind |= virgl::kBindIndexBuffer;
     if (usage & kBufferStorage) bind |= virgl::kBindShaderBuffer;
+    if (usage & kBufferStreamOutput) bind |= virgl::kBindStreamOutput;
     ResourceCreate3d create{header(kCmdResourceCreate3d), id_, virgl::kTargetBuffer, virgl::kFormatR8Unorm, bind,
                             static_cast<uint32_t>(size), 1, 1, 1, 0, 0, 0, 0};
     ResourceAttachBacking attach{header(kCmdResourceAttachBacking), id_, 1,
@@ -334,23 +335,39 @@ class VirglImage final : public IImage {
 
 class VirglShaderModule final : public IShaderModule {
  public:
-  VirglShaderModule(VirglDevice& device, const ShaderModuleDesc& desc) : stage_(desc.stage), tgsi_(desc.tgsi), tess_output_(desc.tess_output), tess_partitioning_(desc.tess_partitioning) {
+  // `stream_output`: the declaration of a pipeline whose geometry shader this is (the host takes it with the shader).
+  VirglShaderModule(VirglDevice& device, const ShaderModuleDesc& desc, const GraphicsPipelineDesc* stream_output = nullptr)
+      : stage_(desc.stage), tgsi_(desc.tgsi), tess_output_(desc.tess_output), tess_partitioning_(desc.tess_partitioning) {
     for (uint32_t k = 0; k < 3; ++k) thread_group_[k] = desc.thread_group[k];
     handle_ = device.new_handle();
     const uint32_t length = string_length(desc.tgsi) + 1;  // with the terminating NUL
     const uint32_t text_dwords = (length + 3) / 4;
-    const uint32_t total = 6 + text_dwords;
+    const uint32_t outputs = stream_output ? stream_output->stream_output_count : 0;
+    const uint32_t so_dwords = outputs ? 4 + 2 * outputs : 0;   // (the four strides, and two words for each output)
+    const uint32_t total = 6 + so_dwords + text_dwords;
     hardware::VirtioGpu& gpu = device.gpu();
     uint32_t* cmd = static_cast<uint32_t*>(gpu.allocator().allocate(total * 4));
     if (!cmd) return;
-    cmd[0] = virgl::header(virgl::kCreateObject, virgl::kObjectShader, 5 + text_dwords);
+    cmd[0] = virgl::header(virgl::kCreateObject, virgl::kObjectShader, 5 + so_dwords + text_dwords);
     cmd[1] = handle_;
     cmd[2] = desc.stage == ShaderStage::Vertex ? virgl::kShaderVertex : desc.stage == ShaderStage::Compute ? virgl::kShaderCompute : desc.stage == ShaderStage::Geometry ? virgl::kShaderGeometry : desc.stage == ShaderStage::Hull ? virgl::kShaderTessControl : desc.stage == ShaderStage::Domain ? virgl::kShaderTessEval : virgl::kShaderFragment;
     cmd[3] = length;                         // total text length (no continuation bit: it all fits)
     cmd[4] = length < 300 ? 300 : length;    // upper bound on the TGSI token count the host reserves
-    cmd[5] = desc.stage == ShaderStage::Compute ? desc.shared_memory_bytes : 0;   // no stream output; for a compute shader the group-shared memory it needs, in bytes
-    cmd[6 + text_dwords - 1] = 0;
-    __builtin_memcpy(&cmd[6], desc.tgsi, length - 1);
+    cmd[5] = desc.stage == ShaderStage::Compute ? desc.shared_memory_bytes : outputs;   // stream output outputs; for a compute shader the group-shared memory it needs, in bytes
+    if (outputs) {
+      for (uint32_t b = 0; b < 4; ++b) cmd[6 + b] = stream_output->stream_output_stride[b] / 4;   // (strides in words)
+      uint32_t fill[4] = {};   // (the words of each buffer's record the entries so far take)
+      for (uint32_t e = 0; e < outputs; ++e) {
+        const StreamOutputEntry& entry = stream_output->stream_output[e];
+        // (the shader keeps the position as the shader wrote it, +Y up, in output 5 as well as in the host's output 0)
+        const uint32_t reg = entry.output == 0 ? 5u : entry.output;
+        cmd[10 + 2 * e] = reg | (entry.start_component << 8) | (entry.component_count << 10) | (entry.buffer << 13) | (fill[entry.buffer] << 16);
+        cmd[11 + 2 * e] = entry.stream;
+        fill[entry.buffer] += entry.component_count;
+      }
+    }
+    cmd[6 + so_dwords + text_dwords - 1] = 0;
+    __builtin_memcpy(&cmd[6 + so_dwords], desc.tgsi, length - 1);
     ok_ = device.send_commands(cmd, total);
     gpu.allocator().deallocate(cmd);
   }
@@ -406,6 +423,18 @@ class VirglPipeline final : public VirglPipelineBase {
         gs_(desc.geometry_shader ? static_cast<const VirglShaderModule*>(desc.geometry_shader)->handle() : 0),
         hs_(desc.hull_shader ? static_cast<const VirglShaderModule*>(desc.hull_shader)->handle() : 0),
         ds_(desc.domain_shader ? static_cast<const VirglShaderModule*>(desc.domain_shader)->handle() : 0) {
+    // Stream output goes with the geometry shader on the host: a copy of it that has the declaration. Only stream 0 can be drawn there (or none).
+    if (desc.stream_output_count) {
+      if (!gs_ || desc.rasterized_stream > 0) return;
+      const auto* geometry = static_cast<const VirglShaderModule*>(desc.geometry_shader);
+      if (!geometry->tgsi()) return;
+      ShaderModuleDesc variant;
+      variant.stage = ShaderStage::Geometry;
+      variant.tgsi = geometry->tgsi();
+      VirglShaderModule module(device, variant, &desc);
+      if (!module.valid()) return;
+      gs_ = module.handle();
+    }
     // The output primitive of the tessellator is the hull shader's to say (Direct3D) but the evaluation shader's TGSI (OpenGL): a domain shader made for another one gets a copy of its text
     // with the winding and point mode of the hull shader it is used with.
     if (hs_ && ds_) {
@@ -499,7 +528,7 @@ class VirglPipeline final : public VirglPipelineBase {
     // (the winding is the same for both kinds of image: the viewport flip and Y_0_TOP, or neither, both put the picture's top row at the same place for the rasterizer)
     cmd[n++] = virgl::header(virgl::kCreateObject, virgl::kObjectRasterizer, 9);
     cmd[n++] = rasterizer_;
-    cmd[n++] = (1u << 1) /*depth clip*/ | (1u << 2) /*clip half z*/ | (cull << 8) | (1u << 14) /*scissor*/ |
+    cmd[n++] = (1u << 1) /*depth clip*/ | (1u << 2) /*clip half z*/ | (desc.stream_output_count && desc.rasterized_stream < 0 ? 1u << 3 : 0u) /*rasterizer discard*/ | (cull << 8) | (1u << 14) /*scissor*/ |
                ((front_ccw ? 1u : 0u) << 15) | (desc.multisample ? 1u << 25 : 0u) /*multisample*/ | (1u << 29) /*half pixel center*/ | (1u << 30) /*bottom edge rule*/;
     cmd[n++] = float_bits(1.0f);  // point size
     cmd[n++] = 0;                 // sprite coord enable
@@ -735,12 +764,46 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
     uint64_t offset = 0, size = 0;
   } storage[kMaxStorageBuffers];
   bool storage_dirty = false, compute_constants_dirty = false;
+  // Stream output: the buffers bound (kept here) and the host's target objects for them, which are made when a draw with stream output needs them and destroyed after it: the host only ends a
+  // transform feedback when its target objects go, and one that is still running (paused) makes the draws of other programs fail.
+  struct StreamOutputSlot {
+    const VirglBuffer* buffer = nullptr;
+    uint64_t offset = 0;
+  } so_slot[kMaxStreamOutputBuffers];
+  uint32_t so_handles[kMaxStreamOutputBuffers] = {};
+  bool so_set = false;
   const ConstByteView pool = recorder.constants();
 
   auto flush = [&]() {
     if (stream.count() && !send_commands(stream.data(), stream.count())) return false;
     stream.reset();
     return true;
+  };
+
+  auto end_stream_output = [&]() {
+    if (!so_set) return;
+    for (uint32_t& handle : so_handles) {
+      if (!handle) continue;
+      stream.command(virgl::kDestroyObject, 0, 1);
+      stream.put(handle);
+      handle = 0;
+    }
+    stream.command(virgl::kSetStreamoutTargets, 0, 1);
+    stream.put(0);   // (no targets)
+    so_set = false;
+  };
+  auto begin_stream_output = [&]() {
+    if (so_set) return;
+    for (uint32_t k = 0; k < kMaxStreamOutputBuffers; ++k) {
+      if (!so_slot[k].buffer) continue;
+      so_handles[k] = new_handle();
+      stream.command(virgl::kCreateObject, virgl::kObjectStreamoutTarget, 4);
+      stream.put(so_handles[k]), stream.put(so_slot[k].buffer->id()), stream.put(static_cast<uint32_t>(so_slot[k].offset)), stream.put(static_cast<uint32_t>(so_slot[k].buffer->size() - so_slot[k].offset));
+    }
+    stream.command(virgl::kSetStreamoutTargets, 0, 5);
+    stream.put(0);   // (no appending: the targets start where they were bound)
+    for (uint32_t k = 0; k < kMaxStreamOutputBuffers; ++k) stream.put(so_handles[k]);
+    so_set = true;
   };
   auto emit_viewport = [&]() {
     if (!stream.command(virgl::kSetViewportState, 0, 7)) return;
@@ -831,6 +894,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         break;
       case RecordedCommand::Type::EndRenderPass:
         if (queries.open != kMaxOcclusionQueries) return false;
+        end_stream_output();
         in_pass = false;
         break;
       case RecordedCommand::Type::Resolve: {
@@ -860,6 +924,14 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         stream.put(compute->shader());
         stream.put(virgl::kShaderCompute);
         compute_constants_dirty = constants_dwords != 0;
+        break;
+      }
+      case RecordedCommand::Type::BindStreamOutput: {
+        if (cmd.unit >= kMaxStreamOutputBuffers) return false;
+        const VirglBuffer* target = static_cast<const VirglBuffer*>(cmd.buffer);
+        if (target && cmd.offset > target->size()) return false;
+        end_stream_output();   // (the draws that follow start at this binding's beginning)
+        so_slot[cmd.unit] = {target, cmd.offset};
         break;
       }
       case RecordedCommand::Type::BindStorageBuffer:
@@ -934,6 +1006,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
       case RecordedCommand::Type::BindPipeline: {
         pipeline = static_cast<const VirglPipeline*>(cmd.pipeline);
         if (!pipeline) return false;
+        if (!pipeline->desc().stream_output_count) end_stream_output();
         stream.command(virgl::kBindObject, virgl::kObjectBlend, 1);
         stream.put(pipeline->blend());
         stream.command(virgl::kBindObject, virgl::kObjectDsa, 1);
@@ -1012,6 +1085,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         if (!in_pass || !pipeline || !vertex_buffer || pipeline->desc().color_target_count > target_count) return false;
         const bool indexed = cmd.type == RecordedCommand::Type::DrawIndexed;
         if (indexed && !index_buffer) return false;
+        if (pipeline->desc().stream_output_count) begin_stream_output();
         if (const uint32_t unit_count = pipeline->desc().texture_count) {
           for (uint32_t unit = 0; unit < unit_count; ++unit)
             if (!textures[unit] || textures[unit] == color || textures[unit] == depth) return false;   // unbound, or the image being drawn into
