@@ -32,27 +32,29 @@ static BOOL wide_is_letter(WCHAR c) {
 #define C1_XDIGIT_ 0x80
 #define C1_ALPHA_ 0x100
 #define C1_DEFINED_ 0x200
-static WORD ctype1(WCHAR c) {
-  WORD t = 0;
-  if (c < 0x20 || c == 0x7F || (c >= 0x80 && c < 0xA0)) t |= C1_CNTRL_;
-  if (c == ' ' || (c >= 9 && c <= 13) || c == 0xA0 || c == 0x2000 || c == 0x3000) t |= C1_SPACE_;
-  if (c == ' ' || c == 9 || c == 0xA0) t |= C1_BLANK_;
-  if (c >= '0' && c <= '9') t |= C1_DIGIT_ | C1_XDIGIT_;
-  if ((c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f')) t |= C1_XDIGIT_;
-  if (wide_is_letter(c)) { t |= C1_ALPHA_; if (wide_lower(c) != c) t |= C1_UPPER_; else if (wide_upper(c) != c) t |= C1_LOWER_; }
-  if (c < 0x80 ? ((c >= 0x21 && c <= 0x2F) || (c >= 0x3A && c <= 0x40) || (c >= 0x5B && c <= 0x60) || (c >= 0x7B && c <= 0x7E))
-               : ((c >= 0xA1 && c <= 0xBF && c != 0xAA && c != 0xB5 && c != 0xBA) || c == 0xD7 || c == 0xF7 || (c >= 0x2010 && c <= 0x2027) || (c >= 0x3001 && c <= 0x3003)))
-    t |= C1_PUNCT_;
-  if (c != 0xFFFF && c != 0xFFFE) t |= C1_DEFINED_;
-  return t;
+#include "ctype_data.inc"
+static BOOL fold_digit(DWORD cp, DWORD *ascii);
+/* The classes of a character: the three words of GetStringType. */
+static void ctype_of(WCHAR c, WORD *c1, WORD *c2, WORD *c3) {
+  SIZE_T lo = 0, hi = sizeof(k_ctype_runs) / sizeof(k_ctype_runs[0]);
+  *c1 = *c2 = *c3 = 0;
+  while (lo < hi) {
+    const SIZE_T mid = lo + (hi - lo) / 2;
+    if (c < k_ctype_runs[mid].first) hi = mid;
+    else if (c > k_ctype_runs[mid].last) lo = mid + 1;
+    else { *c1 = k_ctype_runs[mid].c1; *c2 = k_ctype_runs[mid].c2; *c3 = k_ctype_runs[mid].c3; break; }
+  }
+  DWORD ascii;
+  if ((*c1 & C1_DIGIT_) && c != 0xB2 && c != 0xB3 && c != 0xB9 && !fold_digit(c, &ascii)) *c1 &= (WORD)~C1_DIGIT_;
 }
+static WORD ctype1(WCHAR c) { WORD c1, c2, c3; ctype_of(c, &c1, &c2, &c3); return c1; }
 EXPORT BOOL WINAPI GetStringTypeW(DWORD info_type, LPCWSTR source, int count, LPWORD types) {
   if (!source || !types || (info_type != 1 && info_type != 2 && info_type != 4)) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
   if (count < 0) count = (int)wcslen(source);
   for (int i = 0; i < count; ++i) {
-    if (info_type == 1) types[i] = ctype1(source[i]);
-    else if (info_type == 2) types[i] = source[i] >= 0x590 && source[i] <= 0x8FF ? 2 /* C2_RIGHTTOLEFT */ : (ctype1(source[i]) & C1_CNTRL_ ? 0 : 1 /* C2_LEFTTORIGHT */);
-    else types[i] = (ctype1(source[i]) & C1_ALPHA_) ? 0x8000 /* C3_ALPHA */ : 0;
+    WORD c1, c2, c3;
+    ctype_of(source[i], &c1, &c2, &c3);
+    types[i] = info_type == 1 ? c1 : info_type == 2 ? c2 : c3;
   }
   return TRUE;
 }
@@ -70,18 +72,70 @@ EXPORT BOOL WINAPI GetStringTypeA(LCID locale, DWORD info_type, LPCSTR source, i
 }
 EXPORT BOOL WINAPI GetStringTypeExA(LCID locale, DWORD info_type, LPCSTR source, int count, LPWORD types) { return GetStringTypeA(locale, info_type, source, count, types); }
 
+/* ---- FoldString ------------------------------------------------------------------------------------------------------------------------------------ */
+
+#define FOLD_CZONE 0x10u
+#define FOLD_PRECOMPOSED 0x20u
+#define FOLD_COMPOSITE 0x40u
+#define FOLD_DIGITS 0x80u
+#define FOLD_LIGATURES 0x2000u
+/* The scripts' digits MAP_FOLDDIGITS turns into ASCII: the first character, the digit it stands for and how many follow (the numbers of Windows, not all of Unicode). */
+static const struct { DWORD first; BYTE digit, count; } k_fold_digits[] = {{0x0030,0,10},{0x00b2,2,2},{0x00b9,1,1},{0x0660,0,10},{0x06f0,0,10},{0x07c0,0,10},{0x0966,0,10},{0x09e6,0,10},{0x0a66,0,10},{0x0ae6,0,10},{0x0b66,0,10},{0x0be6,0,10},{0x0c66,0,10},{0x0c78,0,4},{0x0c7c,1,3},{0x0ce6,0,10},{0x0d66,0,10},{0x0de6,0,10},{0x0e50,0,10},{0x0ed0,0,10},{0x0f20,0,10},{0x1040,0,10},{0x1090,0,10},{0x1369,1,9},{0x17e0,0,10},{0x1810,0,10},{0x1946,0,10},{0x19d0,0,10},{0x19da,1,1},{0x1a80,0,10},{0x1a90,0,10},{0x1b50,0,10},{0x1bb0,0,10},{0x1c40,0,10},{0x1c50,0,10},{0x2070,0,1},{0x2074,4,6},{0x2080,0,10},{0x2460,1,9},{0x2474,1,9},{0x2488,1,9},{0x24ea,0,1},{0x24f5,1,9},{0x24ff,0,1},{0x2776,1,9},{0x2780,1,9},{0x278a,1,9},{0x3007,0,1},{0x3021,1,9},{0xa620,0,10},{0xa8d0,0,10},{0xa8e0,0,10},{0xa900,0,10},{0xa9d0,0,10},{0xa9f0,0,10},{0xaa50,0,10},{0xabf0,0,10},{0xff10,0,10},{0x10107,1,9},{0x10320,1,1},{0x10321,5,1},{0x104a0,0,10},{0x10a40,1,4},{0x10d30,0,10},{0x10d40,0,10},{0x10e60,1,9},{0x11052,1,9},{0x11066,0,10},{0x110f0,0,10},{0x11136,0,10},{0x111d0,0,10},{0x112f0,0,10},{0x11450,0,10},{0x114d0,0,10},{0x11650,0,10},{0x116c0,0,10},{0x116d0,0,10},{0x116da,0,10},{0x11730,0,10},{0x118e0,0,10},{0x11950,0,10},{0x11bf0,0,10},{0x11c50,0,10},{0x11d50,0,10},{0x11da0,0,10},{0x11de0,0,10},{0x11f50,0,10},{0x16130,0,10},{0x16a60,0,10},{0x16ac0,0,10},{0x16b50,0,10},{0x16d70,0,10},{0x1ccf0,0,10},{0x1d7ce,0,10},{0x1d7d8,0,10},{0x1d7e2,0,10},{0x1d7ec,0,10},{0x1d7f6,0,10},{0x1e140,0,10},{0x1e2f0,0,10},{0x1e4f0,0,10},{0x1e5f1,0,10},{0x1e950,0,10},{0x1f100,0,1},{0x1f101,0,10},{0x1fbf0,0,10}};
+/* What MAP_EXPAND_LIGATURES makes of a character (at most 3 characters). */
+static const struct { WCHAR from; WCHAR to[3]; } k_ligatures[] = {
+  {0x00c6, {'A', 'E', 0}}, {0x00de, {'T', 'H', 0}}, {0x00df, {'s', 's', 0}}, {0x00e6, {'a', 'e', 0}}, {0x00fe, {'t', 'h', 0}}, {0x0132, {'I', 'J', 0}}, {0x0133, {'i', 'j', 0}},
+  {0x0152, {'O', 'E', 0}}, {0x0153, {'o', 'e', 0}}, {0x01c4, {'D', 0x017d, 0}}, {0x01c5, {'D', 0x017e, 0}}, {0x01c6, {'d', 0x017e, 0}}, {0x01c7, {'L', 'J', 0}},
+  {0x01c8, {'L', 'j', 0}}, {0x01c9, {'l', 'j', 0}}, {0x01ca, {'N', 'J', 0}}, {0x01cb, {'N', 'j', 0}}, {0x01cc, {'n', 'j', 0}}, {0x01e2, {0x0100, 0x0112, 0}},
+  {0x01e3, {0x0101, 0x0113, 0}}, {0x01f1, {'D', 'Z', 0}}, {0x01f2, {'D', 'z', 0}}, {0x01f3, {'d', 'z', 0}}, {0x01fc, {0x00c1, 0x00c9, 0}}, {0x01fd, {0x00e1, 0x00e9, 0}},
+  {0x05f0, {0x05d5, 0x05d5, 0}}, {0x05f1, {0x05d5, 0x05d9, 0}}, {0x05f2, {0x05d9, 0x05d9, 0}}, {0xfb00, {'f', 'f', 0}}, {0xfb01, {'f', 'i', 0}}, {0xfb02, {'f', 'l', 0}},
+  {0xfb03, {'f', 'f', 'i'}}, {0xfb04, {'f', 'f', 'l'}}, {0xfb05, {0x017f, 't', 0}}, {0xfb06, {'s', 't', 0}},
+};
+static BOOL fold_digit(DWORD cp, DWORD *ascii) {
+  for (SIZE_T i = 0; i < sizeof(k_fold_digits) / sizeof(k_fold_digits[0]); ++i)
+    if (cp >= k_fold_digits[i].first && cp - k_fold_digits[i].first < k_fold_digits[i].count) { *ascii = '0' + k_fold_digits[i].digit + (cp - k_fold_digits[i].first); return TRUE; }
+  return FALSE;
+}
+NTSTATUS NTAPI RtlNormalizeString(ULONG form, const WCHAR *src, INT src_len, WCHAR *dst, INT *dst_len);
 EXPORT int WINAPI FoldStringW(DWORD flags, LPCWSTR source, int count, LPWSTR dest, int capacity) {
-  if (!source) { set_error(ERROR_INVALID_PARAMETER); return 0; }
-  if (count < 0) count = (int)wcslen(source) + 1;
-  if (capacity == 0) return count;
-  if (capacity < count) { set_error(ERROR_INSUFFICIENT_BUFFER); return 0; }
-  for (int i = 0; i < count; ++i) {
-    WCHAR c = source[i];
-    if ((flags & 0x2 /* MAP_FOLDCZONE */) && c >= 0xFF01 && c <= 0xFF5E) c = (WCHAR)(c - 0xFEE0);      /* full-width to ASCII */
-    if ((flags & 0x8 /* MAP_EXPAND_LIGATURES */) == 0 && (flags & 0x10 /* MAP_FOLDDIGITS */) && c >= 0x660 && c <= 0x669) c = (WCHAR)('0' + c - 0x660);
-    dest[i] = c;
+  const DWORD valid = FOLD_CZONE | FOLD_PRECOMPOSED | FOLD_COMPOSITE | FOLD_DIGITS | FOLD_LIGATURES;
+  if (!flags || (flags & ~valid) || ((flags & FOLD_PRECOMPOSED) && (flags & (FOLD_COMPOSITE | FOLD_LIGATURES))) || ((flags & FOLD_COMPOSITE) && (flags & FOLD_LIGATURES))) { set_error(ERROR_INVALID_FLAGS); return 0; }
+  if (!source || !count || capacity < 0 || (capacity > 0 && !dest) || source == dest) { set_error(ERROR_INVALID_PARAMETER); return 0; }
+  const SIZE_T n = count < 0 ? wcslen(source) + 1 : (SIZE_T)count;
+  /* the work buffer: every character can become at most three, and a normalization of the result is made in a second buffer */
+  WCHAR *work = RtlAllocateHeap(heap(), 0, (n * 3 + 1) * 2);
+  if (!work) { set_error(ERROR_NOT_ENOUGH_MEMORY); return 0; }
+  SIZE_T length = 0;
+  for (SIZE_T i = 0; i < n; ++i) {
+    DWORD cp = source[i];
+    BOOL pair = FALSE;
+    if (cp >= 0xD800 && cp < 0xDC00 && i + 1 < n && (source[i + 1] & 0xFC00) == 0xDC00) { cp = 0x10000 + ((cp - 0xD800) << 10) + (source[i + 1] - 0xDC00); pair = TRUE; }
+    DWORD ascii;
+    if ((flags & FOLD_DIGITS) && fold_digit(cp, &ascii)) { work[length++] = (WCHAR)ascii; if (pair) ++i; continue; }
+    if (flags & FOLD_LIGATURES) {
+      BOOL expanded = FALSE;
+      for (SIZE_T k = 0; !pair && k < sizeof(k_ligatures) / sizeof(k_ligatures[0]); ++k)
+        if (k_ligatures[k].from == cp) { for (int c = 0; c < 3 && k_ligatures[k].to[c]; ++c) work[length++] = k_ligatures[k].to[c]; expanded = TRUE; break; }
+      if (expanded) continue;
+    }
+    work[length++] = source[i];
+    if (pair) work[length++] = source[++i];
   }
-  return count;
+  const WCHAR *result = work;
+  SIZE_T result_length = length;
+  WCHAR *normalized = NULL;
+  if (flags & (FOLD_CZONE | FOLD_PRECOMPOSED | FOLD_COMPOSITE)) {
+    const ULONG form = (flags & FOLD_COMPOSITE) ? ((flags & FOLD_CZONE) ? 6 : 2) : ((flags & FOLD_PRECOMPOSED) ? ((flags & FOLD_CZONE) ? 5 : 1) : 5);
+    INT room = (INT)(length * 18 + 8);
+    normalized = RtlAllocateHeap(heap(), 0, (SIZE_T)room * 2);
+    if (normalized && RtlNormalizeString(form, work, (INT)length, normalized, &room) == STATUS_SUCCESS) { result = normalized; result_length = (SIZE_T)room; }
+  }
+  int ret;
+  if (capacity == 0) ret = (int)result_length;
+  else if ((SIZE_T)capacity < result_length) { set_error(ERROR_INSUFFICIENT_BUFFER); ret = 0; }
+  else { memcpy(dest, result, result_length * 2); ret = (int)result_length; }
+  RtlFreeHeap(heap(), 0, work);
+  if (normalized) RtlFreeHeap(heap(), 0, normalized);
+  return ret;
 }
 EXPORT int WINAPI FoldStringA(DWORD flags, LPCSTR source, int count, LPSTR dest, int capacity) { (void)flags; if (count < 0) count = (int)strlen(source) + 1; if (capacity == 0) return count; if (capacity < count) { set_error(ERROR_INSUFFICIENT_BUFFER); return 0; } memcpy(dest, source, (size_t_)count); return count; }
 EXPORT int WINAPI CompareStringOrdinal(LPCWSTR a, int an, LPCWSTR b, int bn, BOOL ignore_case) {
@@ -95,132 +149,162 @@ EXPORT int WINAPI CompareStringOrdinal(LPCWSTR a, int an, LPCWSTR b, int bn, BOO
   }
   return an == bn ? 2 /* CSTR_EQUAL */ : an < bn ? 1 : 3;
 }
-EXPORT int WINAPI FindStringOrdinal(DWORD flags, LPCWSTR source, int source_count, LPCWSTR value, int value_count, BOOL ignore_case) {
-  if (!source || !value) { set_error(ERROR_INVALID_PARAMETER); return -1; }
-  if (source_count < 0) source_count = (int)wcslen(source);
-  if (value_count < 0) value_count = (int)wcslen(value);
-  if (value_count > source_count) return -1;
-  if (flags & 2 /* FIND_FROMEND */) {
-    for (int i = source_count - value_count; i >= 0; --i) if (CompareStringOrdinal(source + i, value_count, value, value_count, ignore_case) == 2) return i;
-  } else {
-    for (int i = 0; i + value_count <= source_count; ++i) if (CompareStringOrdinal(source + i, value_count, value, value_count, ignore_case) == 2) return i;
+#define FIND_STARTSWITH_ 0x00100000u
+#define FIND_ENDSWITH_ 0x00200000u
+#define FIND_FROMSTART_ 0x00400000u
+#define FIND_FROMEND_ 0x00800000u
+#define FIND_MODES_ (FIND_STARTSWITH_ | FIND_ENDSWITH_ | FIND_FROMSTART_ | FIND_FROMEND_)
+/* Where a value is in a text, for one of the four modes: the start of the first match in `first` order, or of the last one. `same(start, length)` says whether the text from
+ * start for length units equals the value; for a match the length is returned in *found. */
+typedef BOOL (*FindMatcher)(void *context, int start, int length, int *found);
+static int find_in(DWORD mode, int count, FindMatcher matcher, void *context, int *found) {
+  if (mode == FIND_STARTSWITH_) return matcher(context, 0, count, found) ? 0 : -1;
+  if (mode == FIND_ENDSWITH_) {
+    for (int start = count; start >= 0; --start) { int length; if (matcher(context, start, count - start, &length) && length == count - start) { *found = length; return start; } }
+    return -1;
   }
+  if (mode == FIND_FROMEND_) {
+    for (int start = count; start >= 0; --start) if (matcher(context, start, count - start, found)) return start;
+    return -1;
+  }
+  for (int start = 0; start <= count; ++start) if (matcher(context, start, count - start, found)) return start;
   return -1;
 }
+
+typedef struct { const WCHAR *source, *value; int value_count; BOOL ignore_case; } OrdinalFind;
+static BOOL ordinal_match(void *context, int start, int available, int *found) {
+  const OrdinalFind *f = context;
+  if (f->value_count > available) return FALSE;
+  for (int i = 0; i < f->value_count; ++i) {
+    WCHAR x = f->source[start + i], y = f->value[i];
+    if (f->ignore_case) { x = wide_upper(x); y = wide_upper(y); }
+    if (x != y) return FALSE;
+  }
+  *found = f->value_count;
+  return TRUE;
+}
+EXPORT int WINAPI FindStringOrdinal(DWORD flags, LPCWSTR source, int source_count, LPCWSTR value, int value_count, BOOL ignore_case) {
+  if (flags != FIND_STARTSWITH_ && flags != FIND_ENDSWITH_ && flags != FIND_FROMSTART_ && flags != FIND_FROMEND_) { set_error(ERROR_INVALID_FLAGS); return -1; }
+  if (!source || !value || source_count < -1 || value_count < -1) { set_error(ERROR_INVALID_PARAMETER); return -1; }
+  if (source_count < 0) source_count = (int)wcslen(source);
+  if (value_count < 0) value_count = (int)wcslen(value);
+  OrdinalFind f = { source, value, value_count, ignore_case };
+  int found = 0;
+  set_error(0);
+  if (value_count == 0) return flags == FIND_FROMEND_ || flags == FIND_ENDSWITH_ ? source_count : 0;
+  return find_in(flags, source_count, ordinal_match, &f, &found);
+}
+
+/* A text as the linguistic comparison sees it: canonically decomposed, and with the case, the nonspacing marks and the symbols left out as the flags ask. On the heap. */
+static WCHAR *find_prepare(DWORD flags, const WCHAR *text, int count, int *length) {
+  INT room = count * 18 + 8;
+  WCHAR *normalized = RtlAllocateHeap(heap(), 0, (SIZE_T)room * 2);
+  if (!normalized) return NULL;
+  if (count == 0) { *length = 0; return normalized; }
+  if (RtlNormalizeString(2, text, count, normalized, &room) != STATUS_SUCCESS) { memcpy(normalized, text, (SIZE_T)count * 2); room = count; }
+  int out = 0;
+  for (int i = 0; i < room; ++i) {
+    WCHAR c = normalized[i];
+    WORD c1, c2, c3;
+    ctype_of(c, &c1, &c2, &c3);
+    if ((flags & 2 /* NORM_IGNORENONSPACE */) && (c3 & 1 /* C3_NONSPACING */)) continue;
+    if ((flags & 4 /* NORM_IGNORESYMBOLS */) && (c1 & (C1_PUNCT_ | C1_SPACE_) || c3 & 8 /* C3_SYMBOL */)) continue;
+    if (flags & (1 /* NORM_IGNORECASE */ | 0x10 /* LINGUISTIC_IGNORECASE */)) c = wide_upper(c);
+    normalized[out++] = c;
+  }
+  *length = out;
+  return normalized;
+}
+typedef struct { const WCHAR *source; int source_count; const WCHAR *prepared_value; int prepared_count; DWORD flags; } LinguisticFind;
+static BOOL linguistic_match(void *context, int start, int available, int *found) {
+  const LinguisticFind *f = context;
+  /* the shortest stretch of the source whose preparation equals the value */
+  for (int length = 0; length <= available; ++length) {
+    int prepared_count;
+    WCHAR *prepared = find_prepare(f->flags, f->source + start, length, &prepared_count);
+    if (!prepared) return FALSE;
+    const BOOL same = prepared_count == f->prepared_count && memcmp(prepared, f->prepared_value, (SIZE_T)prepared_count * 2) == 0;
+    RtlFreeHeap(heap(), 0, prepared);
+    if (same && (length > 0 || f->prepared_count == 0)) { *found = length; return TRUE; }
+    if (prepared_count > f->prepared_count + 4) return FALSE;
+  }
+  return FALSE;
+}
 EXPORT int WINAPI FindNLSStringEx(LPCWSTR locale_name, DWORD flags, LPCWSTR source, int source_count, LPCWSTR value, int value_count, LPINT found_length, LPVOID version, LPVOID reserved, LPARAM sort_handle) {
-  (void)locale_name; (void)version; (void)reserved; (void)sort_handle;
-  const int at = FindStringOrdinal((flags & 0x00400000) ? 2 : 1, source, source_count, value, value_count, (flags & 1) != 0);
-  if (at >= 0 && found_length) *found_length = value_count < 0 ? (int)wcslen(value) : value_count;
+  (void)version; (void)reserved; (void)sort_handle;
+  const DWORD mode = flags & FIND_MODES_;
+  if ((locale_name && !nls_locale_of_name(locale_name)) || !source || !value || source_count < -1 || value_count < -1 || (mode != FIND_STARTSWITH_ && mode != FIND_ENDSWITH_ && mode != FIND_FROMSTART_ && mode != FIND_FROMEND_)) {
+    set_error(ERROR_INVALID_PARAMETER);
+    return -1;
+  }
+  if (source_count < 0) source_count = (int)wcslen(source);
+  if (value_count < 0) value_count = (int)wcslen(value);
+  int prepared_count;
+  WCHAR *prepared = find_prepare(flags, value, value_count, &prepared_count);
+  if (!prepared) { set_error(ERROR_NOT_ENOUGH_MEMORY); return -1; }
+  LinguisticFind f = { source, source_count, prepared, prepared_count, flags };
+  int found = 0;
+  set_error(0);
+  const int at = find_in(mode, source_count, linguistic_match, &f, &found);
+  RtlFreeHeap(heap(), 0, prepared);
+  if (at >= 0 && found_length) *found_length = found;
   return at;
 }
 EXPORT int WINAPI FindNLSString(LCID locale, DWORD flags, LPCWSTR source, int source_count, LPCWSTR value, int value_count, LPINT found_length) { (void)locale; return FindNLSStringEx(NULL, flags, source, source_count, value, value_count, found_length, NULL, NULL, 0); }
-EXPORT BOOL WINAPI IsNLSDefinedString(int function, DWORD flags, LPVOID version, LPCWSTR text, int count) { (void)function; (void)flags; (void)version; (void)text; (void)count; return TRUE; }
-EXPORT BOOL WINAPI IsNormalizedString(int form, LPCWSTR text, int count) {      /* (text without combining marks is in every form already) */
-  (void)form;
-  if (count < 0) count = (int)wcslen(text);
-  for (int i = 0; i < count; ++i) if (text[i] >= 0x300 && text[i] <= 0x36F) return FALSE;
-  return TRUE;
+NTSTATUS NTAPI RtlNormalizeString(ULONG form, const WCHAR *src, INT src_len, WCHAR *dst, INT *dst_len);
+NTSTATUS NTAPI RtlIsNormalizedString(ULONG form, const WCHAR *src, INT src_len, BOOLEAN *normalized);
+EXPORT BOOL WINAPI IsNormalizedString(int form, LPCWSTR text, int count) {
+  BOOLEAN normalized = FALSE;
+  if (!text || count == 0) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  const NTSTATUS status = RtlIsNormalizedString((ULONG)form, text, count, &normalized);
+  if (!NT_SUCCESS(status)) { set_error(status == ((NTSTATUS)0xC0000717) ? 1113 : RtlNtStatusToDosError(status)); return FALSE; }
+  return normalized;
 }
+/* A negative result is the size needed (ERROR_INSUFFICIENT_BUFFER) or minus the index of the invalid character (ERROR_NO_UNICODE_TRANSLATION). */
 EXPORT int WINAPI NormalizeString(int form, LPCWSTR source, int count, LPWSTR dest, int capacity) {
-  (void)form;
-  if (count < 0) count = (int)wcslen(source) + 1;
-  if (capacity == 0) return count;
-  if (capacity < count) { set_error(ERROR_INSUFFICIENT_BUFFER); return count; }
-  memcpy(dest, source, (size_t_)count * 2);
-  return count;
+  if (!source || count == 0 || capacity < 0 || (capacity > 0 && !dest)) {
+    if (count == 0 && source) { set_error(0); return 0; }
+    set_error(ERROR_INVALID_PARAMETER);
+    return 0;
+  }
+  INT length = capacity;
+  const NTSTATUS status = RtlNormalizeString((ULONG)form, source, count, dest, &length);
+  if (status == STATUS_SUCCESS) { set_error(0); return length; }
+  if (status == ((NTSTATUS)0xC0000023)) { set_error(ERROR_INSUFFICIENT_BUFFER); return -length; }
+  if (status == ((NTSTATUS)0xC0000717)) { set_error(1113); return -length; }
+  set_error(status == STATUS_NO_MEMORY ? ERROR_NOT_ENOUGH_MEMORY : ERROR_INVALID_PARAMETER);
+  return 0;
 }
 
 /* ---- locale information (English, United States) --------------------------------------------------------------------------------------------------------- */
 
-static const char *const k_days[7] = {"Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"};
-static const char *const k_months[12] = {"January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"};
-/* The text of a LOCALE_ value, or NULL for a number (*number) or an unknown one. */
-static const char *locale_text(DWORD type, DWORD *number, char *scratch) {
-  *number = (DWORD)-1;
-  switch (type & 0xFFFF) {
-    case 0x01: return "1033";                  /* LOCALE_ILANGUAGE */
-    case 0x02: return "English (United States)";      /* SLANGUAGE */
-    case 0x03: case 0x1001: return "English";   /* SABBREVLANGNAME, SENGLISHLANGUAGENAME */
-    case 0x04: return "English (United States)";
-    case 0x05: *number = 1; return NULL;       /* ICOUNTRY */
-    case 0x06: return "United States";         /* SCOUNTRY */
-    case 0x07: return "USA";
-    case 0x08: return "USA";
-    case 0x09: *number = 1; return NULL;       /* SABBREVCTRYNAME... ICOUNTRY (kept) */
-    case 0x0A: return "United States";
-    case 0x0B: return "1";                     /* IDEFAULTCOUNTRY */
-    case 0x0C: return ",";                     /* SLIST */
-    case 0x0D: *number = 1; return NULL;       /* IMEASURE: US */
-    case 0x0E: return ".";                     /* SDECIMAL */
-    case 0x0F: return ",";                     /* STHOUSAND */
-    case 0x10: return "3;0";                   /* SGROUPING */
-    case 0x11: *number = 2; return NULL;       /* IDIGITS */
-    case 0x12: *number = 1; return NULL;       /* ILZERO */
-    case 0x13: *number = 0; return NULL;       /* INEGNUMBER... (see 0x1010) */
-    case 0x14: return "$";                     /* SCURRENCY */
-    case 0x15: return "USD";                   /* SINTLSYMBOL */
-    case 0x16: return ".";                     /* SMONDECIMALSEP */
-    case 0x17: return ",";                     /* SMONTHOUSANDSEP */
-    case 0x18: return "3;0";                   /* SMONGROUPING */
-    case 0x19: *number = 2; return NULL;       /* ICURRDIGITS */
-    case 0x1A: *number = 2; return NULL;       /* IINTLCURRDIGITS */
-    case 0x1B: *number = 0; return NULL;       /* ICURRENCY: $1 */
-    case 0x1C: *number = 0; return NULL;       /* INEGCURR: ($1) */
-    case 0x1D: return "/";                     /* SDATE */
-    case 0x1E: return ":";                     /* STIME */
-    case 0x1F: return "M/d/yyyy";              /* SSHORTDATE */
-    case 0x20: return "dddd, MMMM d, yyyy";    /* SLONGDATE */
-    case 0x21: *number = 0; return NULL;       /* IDATE: month-day-year */
-    case 0x22: *number = 0; return NULL;       /* ILDATE */
-    case 0x23: *number = 0; return NULL;       /* ITIME: 12 hour */
-    case 0x24: *number = 0; return NULL;       /* ICENTURY... */
-    case 0x25: *number = 0; return NULL;       /* ITLZERO */
-    case 0x26: *number = 0; return NULL;       /* IDAYLZERO */
-    case 0x27: *number = 0; return NULL;       /* IMONLZERO */
-    case 0x28: return "AM";
-    case 0x29: return "PM";
-    case 0x4A: *number = 0; return NULL;       /* ITIMEMARKPOSN */
-    case 0x50: return "";                      /* SPOSITIVESIGN */
-    case 0x51: return "-";                     /* SNEGATIVESIGN */
-    case 0x59: return "en";                    /* SISO639LANGNAME */
-    case 0x5A: return "US";                    /* SISO3166CTRYNAME */
-    case 0x5C: return "en-US";                 /* SNAME */
-    case 0x1002: return "United States";       /* SENGLISHCOUNTRYNAME */
-    case 0x1003: return "h:mm:ss tt";          /* STIMEFORMAT */
-    case 0x1006: return "MMMM yyyy";           /* SYEARMONTH */
-    case 0x79: return "h:mm tt";               /* SSHORTTIME */
-    case 0x1004: *number = 1252; return NULL;  /* IDEFAULTANSICODEPAGE */
-    case 0x1007: *number = 437; return NULL;   /* IDEFAULTCODEPAGE */
-    case 0x100B: *number = 0; return NULL;     /* IFIRSTWEEKOFYEAR */
-    case 0x100C: *number = 6; return NULL;     /* IFIRSTDAYOFWEEK: Sunday */
-    case 0x1010: *number = 1; return NULL;     /* INEGNUMBER */
-    case 0x1014: *number = 0; return NULL;     /* ILANGUAGE (kept) */
-    default: break;
+NTSTATUS NTAPI RtlGetSystemPreferredUILanguages(DWORD flags, PVOID unknown, ULONG *count, WCHAR *buffer, ULONG *size);
+NTSTATUS NTAPI RtlGetUserPreferredUILanguages(DWORD flags, PVOID unknown, ULONG *count, WCHAR *buffer, ULONG *size);
+NTSTATUS NTAPI RtlGetProcessPreferredUILanguages(DWORD flags, ULONG *count, WCHAR *buffer, ULONG *size);
+NTSTATUS NTAPI RtlGetThreadPreferredUILanguages(DWORD flags, ULONG *count, WCHAR *buffer, ULONG *size);
+NTSTATUS NTAPI RtlSetThreadPreferredUILanguages(DWORD flags, const WCHAR *languages, ULONG *count);
+NTSTATUS NTAPI RtlSetProcessPreferredUILanguages(DWORD flags, const WCHAR *languages, ULONG *count);
+USHORT NTAPI RtlThreadUILanguageInternal(void);
+int WINAPI LCIDToLocaleName(LCID lcid, LPWSTR name, int capacity, DWORD flags);
+static BOOL ui_result(NTSTATUS status) { if (status == STATUS_SUCCESS) return TRUE; set_error(RtlNtStatusToDosError(status)); return FALSE; }
+EXPORT BOOL WINAPI GetUserPreferredUILanguages(DWORD flags, PULONG count, LPWSTR languages, PULONG length) { return ui_result(RtlGetUserPreferredUILanguages(flags, NULL, count, languages, length)); }
+EXPORT BOOL WINAPI GetSystemPreferredUILanguages(DWORD flags, PULONG count, LPWSTR languages, PULONG length) { return ui_result(RtlGetSystemPreferredUILanguages(flags, NULL, count, languages, length)); }
+EXPORT BOOL WINAPI GetThreadPreferredUILanguages(DWORD flags, PULONG count, LPWSTR languages, PULONG length) { return ui_result(RtlGetThreadPreferredUILanguages(flags, count, languages, length)); }
+EXPORT BOOL WINAPI GetProcessPreferredUILanguages(DWORD flags, PULONG count, LPWSTR languages, PULONG length) { return ui_result(RtlGetProcessPreferredUILanguages(flags, count, languages, length)); }
+EXPORT BOOL WINAPI SetThreadPreferredUILanguages(DWORD flags, PCWSTR languages, PULONG count) { return ui_result(RtlSetThreadPreferredUILanguages(flags, languages, count)); }
+EXPORT BOOL WINAPI SetProcessPreferredUILanguages(DWORD flags, PCWSTR languages, PULONG count) { return ui_result(RtlSetProcessPreferredUILanguages(flags, languages, count)); }
+/* SetThreadUILanguage(0) just reports the language; any other makes it the language of the thread. */
+EXPORT LANGID WINAPI SetThreadUILanguage(LANGID language) {
+  if (language) {
+    WCHAR name[85];
+    if (LCIDToLocaleName(language, name, 85, 0) <= 0) return 0;
+    WCHAR list[88] = {0};
+    memcpy(list, name, wcslen(name) * 2);
+    if (!ui_result(RtlSetThreadPreferredUILanguages(0x8, list, NULL))) return 0;
+    return language;
   }
-  const DWORD t = type & 0xFFFF;
-  if (t >= 0x2A && t <= 0x30) return k_days[t - 0x2A];      /* SDAYNAME1..7 */
-  if (t >= 0x31 && t <= 0x37) { memcpy(scratch, k_days[t - 0x31], 3); scratch[3] = 0; return scratch; }      /* SABBREVDAYNAME */
-  if (t >= 0x38 && t <= 0x43) return k_months[t - 0x38];     /* SMONTHNAME1..12 */
-  if (t >= 0x44 && t <= 0x4F) { memcpy(scratch, k_months[t - 0x44], 3); scratch[3] = 0; return scratch; }      /* SABBREVMONTHNAME */
-  return NULL;
+  return RtlThreadUILanguageInternal();
 }
-EXPORT int WINAPI GetUserPreferredUILanguages(DWORD flags, PULONG count, LPWSTR languages, PULONG length) {
-  (void)flags;
-  static const WCHAR en[] = {'e', 'n', '-', 'U', 'S', 0, 0};
-  if (count) *count = 1;
-  if (length) { if (languages && *length < 7) { *length = 7; set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; } *length = 7; }
-  if (languages) memcpy(languages, en, sizeof(en));
-  return TRUE;
-}
-EXPORT BOOL WINAPI GetSystemPreferredUILanguages(DWORD flags, PULONG count, LPWSTR languages, PULONG length) { return GetUserPreferredUILanguages(flags, count, languages, length); }
-EXPORT BOOL WINAPI GetThreadPreferredUILanguages(DWORD flags, PULONG count, LPWSTR languages, PULONG length) { return GetUserPreferredUILanguages(flags, count, languages, length); }
-EXPORT BOOL WINAPI GetProcessPreferredUILanguages(DWORD flags, PULONG count, LPWSTR languages, PULONG length) { return GetUserPreferredUILanguages(flags, count, languages, length); }
-typedef BOOL (CALLBACK *LOCALE_ENUMPROCA_)(LPSTR);
-typedef BOOL (CALLBACK *LOCALE_ENUMPROCW_)(LPWSTR);
-typedef BOOL (CALLBACK *LOCALE_ENUMPROCEX_)(LPWSTR, DWORD, LPARAM);
-EXPORT BOOL WINAPI EnumSystemLocalesA(LOCALE_ENUMPROCA_ proc, DWORD flags) { (void)flags; char id[] = "00000409"; return proc(id) || TRUE; }
-EXPORT BOOL WINAPI EnumSystemLocalesW(LOCALE_ENUMPROCW_ proc, DWORD flags) { (void)flags; WCHAR id[] = {'0', '0', '0', '0', '0', '4', '0', '9', 0}; return proc(id) || TRUE; }
-EXPORT BOOL WINAPI EnumSystemLocalesEx(LOCALE_ENUMPROCEX_ proc, DWORD flags, LPARAM param, LPVOID reserved) { (void)reserved; WCHAR name[] = {'e', 'n', '-', 'U', 'S', 0}; return proc(name, flags, param) || TRUE; }
 
 /* ---- atoms ----------------------------------------------------------------------------------------------------------------------------------------------- */
 

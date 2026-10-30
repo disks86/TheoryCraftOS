@@ -213,7 +213,7 @@ class ThunderboltIcm final : public IThunderboltEvents {
   bool running() const { return outcome_ == Outcome::Started; }
   // Interrupts from the control channel's rings (the caller routes the MSI and calls TbNhi::acknowledge_interrupt from its handler). Only unmasks them in the chip; the channel is still
   // read by poll(), which the caller may then call only after an interrupt. Remembered over suspend and resume. False if the controller is not running.
-  bool use_interrupts(bool on);
+  bool use_interrupts(bool on, int msix_vector = -1);
   bool interrupts_on() const { return interrupts_; }
   Outcome outcome() const { return outcome_; }
 
@@ -259,7 +259,9 @@ class ThunderboltIcm final : public IThunderboltEvents {
   bool on_event(TbPacketType type, ConstByteView body) override;
 
  private:
-  bool titan() const { return options_.generation == TbGeneration::TitanRidge; }
+  // (Ice Lake's firmware speaks Titan Ridge's messages)
+  bool titan() const { return options_.generation == TbGeneration::TitanRidge || options_.generation == TbGeneration::IceLake; }
+  bool ice_lake() const { return options_.generation == TbGeneration::IceLake; }
   bool same_place(const TbDevice& a, const TbDevice& b) const;
   uint32_t approve_bytes() const { return titan() ? tb_icm::kTrApproveBytes : tb_icm::kApproveBytes; }
   uint32_t build_approve(const TbDevice& device, ByteView out) const { return titan() ? tb_icm::build_approve_device_tr(device, out) : tb_icm::build_approve_device(device, out); }
@@ -296,6 +298,7 @@ class ThunderboltIcm final : public IThunderboltEvents {
   TbDriverReady ready_;
   crypto::IRandom* random_ = nullptr;
   bool interrupts_ = false, rtd3_veto_ = false;
+  int msix_vector_ = -1;
   ITbKeyStore* keys_ = nullptr;
   Options options_;
   uint32_t port_reset_failures_ = 0;

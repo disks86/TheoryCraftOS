@@ -18,12 +18,30 @@
 
 #include "Kernel/Dxgkrnl/VidMm.hpp"
 #include "Graphics/Graphics3D/Mipmaps.hpp"
+#include "Graphics/WidePixels.hpp"
 #include "Utility/AllocatedView.hpp"
 #include "Utility/ByteStream.hpp"
 
 namespace dxgk {
 
 namespace {
+
+// The device's format of an allocation format that is read and written as Vec4s.
+graphics::Format wide_format_of(Format f) {
+  switch (f) {
+    case Format::A16B16G16R16F: return graphics::Format::R16G16B16A16Float;
+    case Format::A32B32G32R32F: return graphics::Format::R32G32B32A32Float;
+    case Format::A16B16G16R16: return graphics::Format::R16G16B16A16Unorm;
+    case Format::A32B32G32R32Uint: return graphics::Format::R32G32B32A32Uint;
+    case Format::A32B32G32R32Sint: return graphics::Format::R32G32B32A32Sint;
+    case Format::A16B16G16R16Uint: return graphics::Format::R16G16B16A16Uint;
+    case Format::A16B16G16R16Sint: return graphics::Format::R16G16B16A16Sint;
+    case Format::A8B8G8R8Uint: return graphics::Format::R8G8B8A8Uint;
+    case Format::A16B16G16R16Snorm: return graphics::Format::R16G16B16A16Snorm;
+    case Format::A2B10G10R10: return graphics::Format::R10G10B10A2Unorm;
+    default: return graphics::Format::Undefined;
+  }
+}
 
 constexpr uint64_t kMaxQueryResultBytes = 1 << 20;
 constexpr uint32_t kKnownFlags = kAllocVertexBuffer | kAllocIndexBuffer | kAllocTexture | kAllocRenderTarget | kAllocDepthStencil | kAllocPresent | kAllocStaging | kAllocShared | kAllocQueryResult | kAllocUnorderedAccess;
@@ -111,7 +129,7 @@ NtStatus VidMm::create(const AllocationDesc& desc, SharedPointer<Allocation>* ou
     if (depth_flag && (desc.flags & ~(kAllocDepthStencil | kAllocShared))) return status::kInvalidParameter;
     if (dxgk::is_wide(desc.format)) {
       if (desc.mip_levels != 1 || (desc.flags & kAllocPresent)) return status::kInvalidParameter;
-      const uint32_t needed = dxgk::is_float(desc.format) ? graphics::kFeatureFloatFormats : dxgk::is_integer(desc.format) ? graphics::kFeatureIntegerFormats : graphics::kFeatureUnorm16Formats;
+      const uint32_t needed = dxgk::is_float(desc.format) ? graphics::kFeatureFloatFormats : dxgk::is_integer(desc.format) ? graphics::kFeatureIntegerFormats : (desc.format == Format::A16B16G16R16Snorm || desc.format == Format::A2B10G10R10) ? graphics::kFeatureSnormFormats : graphics::kFeatureUnorm16Formats;
       if (!(desc.flags & kAllocStaging) && !(device_.info().features & needed)) return status::kNotSupported;
     }
     if (dxgk::is_srgb(desc.format)) {
@@ -205,10 +223,7 @@ bool VidMm::create_device_object(Allocation& a) {
     a.image_ = device_.create_image(id);
     return a.image_ != nullptr;
   }
-  id.format = d.format == Format::A16B16G16R16F ? graphics::Format::R16G16B16A16Float
-              : d.format == Format::A32B32G32R32F ? graphics::Format::R32G32B32A32Float
-              : d.format == Format::A16B16G16R16 ? graphics::Format::R16G16B16A16Unorm
-              : d.format == Format::A32B32G32R32Uint ? graphics::Format::R32G32B32A32Uint
+  id.format = dxgk::is_wide(d.format) ? wide_format_of(d.format)
               : dxgk::is_srgb(d.format) ? (is_rgba_order(d.format) ? graphics::Format::R8G8B8A8Srgb : graphics::Format::B8G8R8A8Srgb)
               : is_rgba_order(d.format) ? graphics::Format::R8G8B8A8Unorm : graphics::Format::B8G8R8A8Unorm;
   id.usage = 0;
@@ -250,18 +265,8 @@ bool VidMm::upload(Allocation& a) {
     scratch_.clear();
     if (!scratch_.put_zeros(uint64_t{a.desc_.width} * a.desc_.height * sizeof(graphics::Vec4)) || !scratch_.writable_view().try_cast<graphics::Vec4>(&pixels)) return false;
     ByteReader in(ConstByteView(a.cpu_));
-    for (graphics::Vec4& c : pixels) {
-      if (f == Format::A16B16G16R16F) {
-        c = {graphics::half_to_float(static_cast<uint16_t>(in.le16())), graphics::half_to_float(static_cast<uint16_t>(in.le16())), graphics::half_to_float(static_cast<uint16_t>(in.le16())),
-             graphics::half_to_float(static_cast<uint16_t>(in.le16()))};
-      } else if (f == Format::A16B16G16R16) {
-        constexpr float k = 1.0f / 65535.0f;
-        const float r = static_cast<float>(in.le16()) * k, g = static_cast<float>(in.le16()) * k, b = static_cast<float>(in.le16()) * k, al = static_cast<float>(in.le16()) * k;
-        c = {r, g, b, al};
-      } else {
-        c = {__builtin_bit_cast(float, in.le32()), __builtin_bit_cast(float, in.le32()), __builtin_bit_cast(float, in.le32()), __builtin_bit_cast(float, in.le32())};   // (single floats, or integers as their bits)
-      }
-    }
+    const graphics::Format device_format = wide_format_of(f);
+    for (graphics::Vec4& c : pixels) c = graphics::decode_wide_pixel(device_format, in);
     if (!in.ok()) return false;
     if (!a.image_->write_pixels_float(ArrayView<const graphics::Vec4>(pixels.data(), pixels.size())) && a.cpu_written_) return false;
     a.device_stale_ = false;
@@ -332,16 +337,8 @@ bool VidMm::read_back(Allocation& a) {
     if (!scratch_.put_zeros(uint64_t{a.desc_.width} * a.desc_.height * sizeof(graphics::Vec4)) || !scratch_.writable_view().try_cast<graphics::Vec4>(&pixels)) return false;
     if (!a.image_->read_pixels_float(pixels)) return false;
     ByteWriter out(a.cpu_.first(uint64_t{a.desc_.width} * a.desc_.height * pixel_bytes(f)));
-    for (const graphics::Vec4& c : pixels) {
-      if (f == Format::A16B16G16R16F) {
-        out.le16(graphics::float_to_half(c.x)), out.le16(graphics::float_to_half(c.y)), out.le16(graphics::float_to_half(c.z)), out.le16(graphics::float_to_half(c.w));
-      } else if (f == Format::A16B16G16R16) {
-        auto q = [](float v) { return static_cast<uint32_t>(!(v > 0.0f) ? 0.0f : v >= 1.0f ? 65535.0f : v * 65535.0f + 0.5f); };
-        out.le16(q(c.x)), out.le16(q(c.y)), out.le16(q(c.z)), out.le16(q(c.w));
-      } else {
-        out.le32(__builtin_bit_cast(uint32_t, c.x)), out.le32(__builtin_bit_cast(uint32_t, c.y)), out.le32(__builtin_bit_cast(uint32_t, c.z)), out.le32(__builtin_bit_cast(uint32_t, c.w));
-      }
-    }
+    const graphics::Format device_format = wide_format_of(f);
+    for (const graphics::Vec4& c : pixels) graphics::encode_wide_pixel(device_format, c, out);
     if (!out.ok()) return false;
     a.gpu_newer_ = false;
     return true;

@@ -282,3 +282,8 @@ a `BIND_SHADER` of both on every pipeline bind, and `DRAW_VBO` of `PIPE_PRIM_PAT
   (multi-monitor); display mode listing and switching go straight to the GPU driver.
 - Video memory is accounted per adapter but there is no per-process budget or priority-based paging between processes.
 - Run through the kernel: the software rasterizer (everything) and the simulated Intel Gen9 engine (the self-test picture matches the software device). virgl was run in QEMU against a real virglrenderer (the conformance scenes above); SVGA3D and the V3D hardware were not run here (V3D has no host simulation of its rasterizer; its matrix handling is checked numerically). One lock covers the kernel.
+
+
+### More colour formats
+
+`A32B32G32R32Sint`, `A16B16G16R16Uint` / `Sint`, `A8B8G8R8Uint` (the integer formats, narrow ones saturate), `A16B16G16R16Snorm` and `A2B10G10R10` (10-bit colour with two bits of alpha) join the wide formats: pixels travel as `Vec4`s, laid out and quantised by `Graphics/WidePixels.hpp` (one place for the software device, the memory manager and virgl). Features: `kFeatureIntegerFormats`, `kFeatureSnormFormats`. virgl ids (from virglrenderer's `virgl_hw.h`): R32G32B32A32_SINT 200, R16G16B16A16_UINT 188, _SINT 192, R8G8B8A8_UINT 180, R16G16B16A16_SNORM 59, R10G10B10A2_UNORM 8. Two conformance scenes match the real GPU. `SV_PrimitiveID` is a `PRIMID` input on virgl and matches too.

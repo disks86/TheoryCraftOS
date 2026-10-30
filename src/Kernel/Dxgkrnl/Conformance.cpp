@@ -1235,6 +1235,87 @@ void scene_integer(Rig& rig, ArrayView<uint32_t> out) {
   rig.read(target, out);
 }
 
+// Render target formats: a triangle is drawn into a 16 x 16 target of each format (the clear colour and the colour of the triangle are the same for all), and each target is then shown in a
+// quarter of the picture through a pixel shader that reads it back (Load for the integers, Sample for the others).
+struct FormatBlob {
+  const uint8_t* code;
+  uint32_t size;
+};
+struct FormatCase {
+  Format format;
+  FormatBlob write, show;
+  float colour[4];       // the triangle's colour (what the vertices carry)
+  bool integer;
+};
+#define FORMAT_BLOB(name) FormatBlob{conformance_blobs::k_##name, sizeof conformance_blobs::k_##name}
+
+void formats_scene(Rig& rig, ArrayView<uint32_t> out, const FormatCase* cases, uint32_t count, uint32_t feature) {
+  if (!rig.has(feature)) return void(rig.step("render target formats", status::kNotSupported));
+  namespace b = conformance_blobs;
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vs = rig.vertex_shader(bytes_of(b::k_vs, sizeof b::k_vs));
+  for (uint32_t i = 0; i < count; ++i) {
+    const FormatCase& c = cases[i];
+    const Vertex tri[3] = {{-0.9f, -0.9f, 0.5f, c.colour[0], c.colour[1], c.colour[2], c.colour[3]}, {0.9f, -0.9f, 0.5f, c.colour[0], c.colour[1], c.colour[2], c.colour[3]},
+                           {0.0f, 0.9f, 0.5f, c.colour[0], c.colour[1], c.colour[2], c.colour[3]}};
+    Handle texture = rig.image(kAllocRenderTarget | kAllocTexture, c.format, 16, 16);
+    Handle write = rig.pixel_shader(bytes_of(c.write.code, c.write.size));
+    PipelineDesc wd = colour_pipeline_desc(vs, write);
+    wd.varying_count = 3;
+    Handle first = rig.pipeline(wd);
+    Handle tvb = rig.buffer(kAllocVertexBuffer, bytes_of(tri, sizeof tri));
+    CommandWriter w(rig.allocator());
+    // (the clear colour of an integer target is the bits of the integers)
+    const graphics::Vec4 clear = c.integer ? graphics::Vec4{__builtin_bit_cast(float, 20u), __builtin_bit_cast(float, 40u), __builtin_bit_cast(float, 60u), __builtin_bit_cast(float, 255u)} : graphics::Vec4{0, 0, 0, 0};
+    begin(w, 0, kNoAllocation, clear);
+    w.bind_pipeline(first);
+    w.bind_vertex_buffer(2);
+    w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+    w.draw(3);
+    w.end_pass();
+    rig.render(w, {texture, target, tvb});
+    // The target in its quarter of the picture.
+    auto vert = [](float x, float y, float u, float v) { return Vertex{x, y, 0.5f, u / 2, v / 2, 1, 1}; };
+    const Vertex quad[6] = {vert(-1, -1, 0, 0), vert(1, -1, 1, 0), vert(-1, 1, 0, 1), vert(-1, 1, 0, 1), vert(1, -1, 1, 0), vert(1, 1, 1, 1)};
+    Handle pipe = dxbc_pipeline(rig, b::k_vs, sizeof b::k_vs, c.show.code, c.show.size, 1);
+    Handle qvb = rig.buffer(kAllocVertexBuffer, bytes_of(quad, sizeof quad));
+    graphics::SamplerDesc sampler;
+    sampler.filter = graphics::Filter::Nearest;
+    sampler.address_u = sampler.address_v = graphics::AddressMode::ClampToEdge;
+    CommandWriter show(rig.allocator());
+    show.begin_pass(0, kNoAllocation, i == 0 ? kPassClearColor : 0u, {0, 0, 0, 1}, 1.0f, 0);
+    const float x = static_cast<float>((i & 1) * 16), y = static_cast<float>((i >> 1) * 16);
+    show.set_viewport({x, y, 16, 16, 0.0f, 1.0f});
+    show.set_scissor({static_cast<int32_t>(x), static_cast<int32_t>(y), 16, 16});
+    show.bind_pipeline(pipe);
+    show.bind_vertex_buffer(1);
+    show.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+    show.bind_texture(0, 2, sampler);
+    show.draw(6);
+    show.end_pass();
+    rig.render(show, {target, qvb, texture});
+  }
+  rig.read(target, out);
+}
+
+#define FORMAT_SCENE(name, feature, ...)                                      \
+  void name(Rig& rig, ArrayView<uint32_t> out) {                              \
+    static const FormatCase cases[] = {__VA_ARGS__};                          \
+    formats_scene(rig, out, cases, sizeof cases / sizeof cases[0], feature);  \
+  }
+// Integers of every width and sign: the writer makes colour * 255 (minus 100 for the signed ones) as integers, the reader shows them back as (value (+ 100)) / 255.
+FORMAT_SCENE(scene_integer_formats, graphics::kFeatureIntegerFormats,
+             {Format::A16B16G16R16Uint, FORMAT_BLOB(ps_int_write), FORMAT_BLOB(ps_uint_loadq), {0.2f, 0.5f, 0.8f, 1.0f}, true},
+             {Format::A16B16G16R16Sint, FORMAT_BLOB(ps_sint_write), FORMAT_BLOB(ps_sint_loadq), {0.3f, 0.6f, 0.9f, 1.0f}, true},
+             {Format::A8B8G8R8Uint, FORMAT_BLOB(ps_int_write), FORMAT_BLOB(ps_uint_loadq), {0.9f, 0.4f, 0.1f, 1.0f}, true},
+             {Format::A32B32G32R32Sint, FORMAT_BLOB(ps_sint_write), FORMAT_BLOB(ps_sint_loadq), {0.1f, 0.7f, 0.4f, 1.0f}, true})
+// Signed and 10-bit normalised: a negative colour into a snorm target (shown with its green negated), and 10 bit colours with two bits of alpha (0.7 is kept as 2/3).
+FORMAT_SCENE(scene_normalised_formats, graphics::kFeatureSnormFormats,
+             {Format::A16B16G16R16Snorm, FORMAT_BLOB(ps_color), FORMAT_BLOB(ps_snorm_show), {0.3f, -0.6f, 0.9f, 1.0f}, false},
+             {Format::A16B16G16R16Snorm, FORMAT_BLOB(ps_color), FORMAT_BLOB(ps_snorm_show), {-0.2f, -0.9f, 0.45f, 0.5f}, false},
+             {Format::A2B10G10R10, FORMAT_BLOB(ps_color), FORMAT_BLOB(ps_show), {0.2f, 0.5f, 0.8f, 0.7f}, false},
+             {Format::A2B10G10R10, FORMAT_BLOB(ps_color), FORMAT_BLOB(ps_show), {0.05f, 0.95f, 0.5f, 0.3f}, false})
+
 // Tessellation: a few patches drawn into one picture, each in its own cell (a single one fills the picture), with the tessellation factors in the constants after the matrix. The domain shaders move every point by an amount of its own, so a point that is not where the tessellator should put it, or a
 // triangle that joins other points, shows in the picture.
 struct TessBlob {
@@ -1372,6 +1453,8 @@ const Entry kScenes[] = {
     {"Direct3D 10 sRGB render target and texture", scene_srgb},
     {"Direct3D 10 16-bit normalised render target and texture", scene_unorm16},
     {"Direct3D 10 integer render target and Load (DXBC)", scene_integer},
+    {"Direct3D 10 integer formats of every width and sign (DXBC)", scene_integer_formats},
+    {"Direct3D 10 signed and 10-bit normalised formats (DXBC)", scene_normalised_formats},
     {"Direct3D 10 4x multisampling", scene_multisample},
     {"Direct3D 11 compute shader and unordered access views (DXBC)", scene_compute},
     {"Direct3D 10 independent blend per render target (DXBC)", scene_independent_blend},

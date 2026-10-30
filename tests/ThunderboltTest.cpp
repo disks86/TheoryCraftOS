@@ -32,6 +32,7 @@
 #include "Hardware/Bus/Thunderbolt/ThunderboltNet.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltXdomain.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltControl.hpp"
+#include "Hardware/Bus/Pci/PciMsix.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltDevices.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltDriver.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltIcm.hpp"
@@ -2275,6 +2276,141 @@ static void test_power() {
   CHECK(alloc.dma.empty());
 }
 
+
+// ---- MSI-X
+
+static void test_msix() {
+  TestAllocator alloc;
+  fake_tb::FakePci pci;
+  fake_tb::FakePci::Function nhi;
+  nhi.info.address = {5, 0, 0};
+  nhi.msix_size = 16;
+  pci.functions.push_back(nhi);
+  const PciAddress address = {5, 0, 0};
+  auto& fn = pci.functions[0];
+  fake_tb::FakeMapper mapper;
+  {
+    PciMsix msix(pci, mapper);
+    CHECK(msix.table_size(address) == 16 && msix.table_size({9, 9, 9}) == 0);
+    const uint8_t vectors[3] = {0x52, 0x53, 0x54};
+    CHECK(msix.enable(address, vectors, 3, 4) && msix.enabled() && (fn.msix_control & 0x8000) && !(fn.msix_control & 0x4000));
+    // entries 0 to 2 deliver their vectors to core 4 (physical destination in bits 12 to 19 of the address), the other 13 stay masked
+    CHECK(fn.msix_table[0] == (0xFEE00000u | (4u << 12)) && fn.msix_table[1] == 0 && fn.msix_table[2] == 0x52 && fn.msix_table[3] == 0);
+    CHECK(fn.msix_table[4 * 2 + 2] == 0x54 && fn.msix_table[4 * 2 + 3] == 0 && fn.msix_table[4 * 3 + 3] == 1 && fn.msix_table[4 * 15 + 3] == 1);
+    CHECK(!msix.enable(address, vectors, 1, 0));                              // already on
+    msix.disable();
+    CHECK(!msix.enabled() && !(fn.msix_control & 0xC000) && fn.msix_table[3] == 1 && fn.msix_table[4 * 2 + 3] == 1);
+    msix.disable();                                                           // (again: nothing)
+    // refused: more entries than the table has, none asked for, a core that does not fit, a table whose BAR is not assigned or cannot be mapped, no capability
+    CHECK(!msix.enable(address, vectors, 17, 0) && !msix.enable(address, vectors, 0, 0) && !msix.enable(address, vectors, 1, 256));
+    fn.msix_bar_assigned = false;
+    CHECK(!msix.enable(address, vectors, 1, 0));
+    fn.msix_bar_assigned = true;
+    mapper.fail = true;
+    CHECK(!msix.enable(address, vectors, 1, 0) && !(fn.msix_control & 0xC000));
+    mapper.fail = false;
+    CHECK(!msix.enable({9, 9, 9}, vectors, 1, 0));
+    CHECK(msix.enable(address, vectors, 1, 0));
+  }
+  CHECK(!(fn.msix_control & 0xC000));                                         // (the destructor switches it off)
+  // the controller side: the control rings' interrupts go to one entry, the chip clears the status bits itself
+  FakeNhi chip;
+  ThunderboltDriver driver(alloc);
+  CHECK(driver.start_device(chip) == ThunderboltDriver::Outcome::Started);
+  CHECK(driver.use_interrupts(true, 3));
+  CHECK((chip.read32(0x39864) & 4) != 0);                                    // DMA_MISC: auto clear
+  CHECK(chip.read32(0x38C40) == 3u && chip.read32(0x38C44) == (3u << 16));    // the allocation of interrupt sources 0 (transmit) and 12 (receive, in the second register): 4 bits each, 8 to a register
+  CHECK(chip.unmasked[0] == ((1u << 0) | (1u << 12)));
+  CHECK(driver.use_interrupts(false, 3) && chip.read32(0x38C40) == 0 && chip.read32(0x38C44) == 0 && chip.unmasked[0] == 0);
+  // an out of range entry is not used
+  CHECK(!driver.use_interrupts(true, 16) && chip.read32(0x38C40) == 0 && chip.read32(0x38C44) == 0 && !driver.icm()->interrupts_on());
+  // after sleep the routing comes back
+  CHECK(driver.use_interrupts(true, 5) && driver.suspend());
+  CHECK(driver.resume() == ThunderboltDriver::Outcome::Started && chip.read32(0x38C40) == 5u && chip.read32(0x38C44) == (5u << 16) && chip.unmasked[0] == ((1u << 0) | (1u << 12)));
+  // a frame still raises the interrupt
+  chip.raise_interrupt = [&] { driver.on_interrupt(); };
+  chip.send_device_connected(make_device(0x20, 1, 1));
+  CHECK(driver.interrupts() >= 1);
+}
+
+
+// ---- Ice Lake (the firmware is the connection manager there too)
+
+static void test_ice_lake() {
+  TestAllocator alloc;
+  CHECK(tb_find_nhi(0x8086, 0x8A17) && tb_find_nhi(0x8086, 0x8A0D) && tb_find_nhi(0x8086, 0x8A17)->generation == TbGeneration::IceLake && !tb_find_nhi(0x8086, 0x9A1B));
+  // the power handling alone
+  {
+    fake_tb::FakeIclConfig config;
+    TbIceLake icl(config);
+    CHECK(icl.force_power(true) && (config.force_power_register & 2) && (config.force_power_register >> 24) == 0x22);
+    CHECK(icl.force_power(false) && !(config.force_power_register & 2));
+    config.firmware_comes_up = false;
+    CHECK(!icl.force_power(true, 20000));
+    config.firmware_comes_up = true;
+    CHECK(icl.lc_mailbox(tb_icl::kPrepareForReset) && config.lc_commands.size() == 1 && config.lc_commands[0] == 0x21 && config.lc_command == 0);       // (the valid bit is cleared after)
+    config.lc_done = false;
+    CHECK(!icl.lc_mailbox(tb_icl::kGoToSx, 3000) && config.lc_commands.size() == 2 && config.lc_commands[1] == 2 && config.lc_command == 0);
+    icl.set_ltr();
+    CHECK(config.ltr == (0x3FFFu << 16 | 0x3FFF));
+    uint32_t uuid[4];
+    icl.uuid(uuid);
+    CHECK(uuid[0] == 0x11223344u && uuid[1] == 0x55667788u && uuid[2] == 0xFFFFFFFFu && uuid[3] == 0xFFFFFFFFu);
+  }
+  // a driver for it: force powered first, the firmware's messages are Titan Ridge's, no mode to check and no devices to approve
+  {
+    FakeNhi chip;
+    chip.titan_ridge = true;
+    chip.auth_done = false;                              // (never looked at)
+    fake_tb::FakeIclConfig config;
+    ThunderboltDriver driver(alloc);
+    CHECK(driver.start_device(chip, nullptr, TbGeneration::IceLake, &config) == ThunderboltDriver::Outcome::Started);
+    CHECK((config.force_power_register & 2) && config.ltr == (0x3FFFu << 16 | 0x3FFF));
+    CHECK(chip.mailbox_commands.empty());                // no ALLOW_ALL_DEVICES
+    ThunderboltIcm& icm = *driver.icm();
+    CHECK(icm.security_level() == TbSecurityLevel::None && icm.driver_ready().rtd3 && icm.runtime_allowed());
+    chip.send_device_connected_tr(make_device(0x20, 0, 0), 0x01);
+    driver.poll();
+    CHECK(icm.device_count() == 1 && icm.device(0).route == 0x01);
+    // sleeping with a device connected keeps the controller powered; without one the link controller is told and the power forced off
+    config.lc_commands.clear();
+    CHECK(driver.suspend() && config.lc_commands.empty() && (config.force_power_register & 2));
+    CHECK(driver.resume() == ThunderboltDriver::Outcome::Started);
+    chip.send_device_disconnected_tr(0x01);
+    driver.poll();
+    CHECK(icm.device_count() == 0);
+    CHECK(driver.suspend() && config.lc_commands.size() == 1 && config.lc_commands[0] == 0x21 && !(config.force_power_register & 2));
+    CHECK(driver.resume() == ThunderboltDriver::Outcome::Started && (config.force_power_register & 2));
+    // runtime suspend too (it always works on this controller)
+    CHECK(driver.runtime_suspend() && !(config.force_power_register & 2) && driver.resume() == ThunderboltDriver::Outcome::Started);
+    // shutting down tells the firmware, then lets the controller power down
+    chip.mailbox_commands.clear();
+    driver.stop();
+    CHECK(chip.mailbox_commands.size() == 1 && chip.mailbox_commands[0] == 0x07 && !(config.force_power_register & 2));
+  }
+  // the firmware that does not come up, and a start without the configuration space
+  {
+    FakeNhi chip;
+    chip.titan_ridge = true;
+    fake_tb::FakeIclConfig config;
+    config.firmware_comes_up = false;
+    ThunderboltDriver driver(alloc);
+    CHECK(driver.start_device(chip, nullptr, TbGeneration::IceLake, &config) == ThunderboltDriver::Outcome::ControllerFailed);
+    ThunderboltDriver bare(alloc);
+    CHECK(bare.start_device(chip, nullptr, TbGeneration::IceLake, nullptr) == ThunderboltDriver::Outcome::ControllerFailed);
+  }
+  // a firmware that is not running at all is still not started by us (no way to)
+  {
+    FakeNhi chip;
+    chip.titan_ridge = true;
+    chip.icm_enabled = false;
+    fake_tb::FakeIclConfig config;
+    ThunderboltDriver driver(alloc);
+    CHECK(driver.start_device(chip, nullptr, TbGeneration::IceLake, &config) == ThunderboltDriver::Outcome::ControllerFailed);
+  }
+  CHECK(alloc.dma.empty());
+}
+
 static void test_driver() {
   TestAllocator alloc;
   {
@@ -2349,6 +2485,8 @@ int main() {
   test_net();
   test_net_lifecycle();
   test_power();
+  test_msix();
+  test_ice_lake();
   test_driver();
   printf(g_failed ? "ThunderboltTest: %d FAILED\n" : "ThunderboltTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;

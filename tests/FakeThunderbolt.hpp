@@ -27,7 +27,9 @@
 #include <vector>
 #include "Crypto/Crypto.hpp"
 #include "Hardware/Bus/Pci/IPciBus.hpp"
+#include "Hardware/RegisterMapper.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltCio.hpp"
+#include "Hardware/Bus/Thunderbolt/ThunderboltIcl.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltRegisters.hpp"
 
 namespace fake_tb {
@@ -661,6 +663,10 @@ class FakePci final : public hardware::IPciBus {
     int pcie_type = -1;                  // -1: no PCI Express capability
     bool pm = false, pme_from_d3hot = true;     // a power management capability at 0x70
     mutable uint32_t pmcsr = 0;
+    uint32_t msix_size = 0;                         // a MSI-X capability at 0x90 with this many entries (0: none)
+    mutable uint32_t msix_control = 0;
+    mutable std::vector<uint32_t> msix_table;
+    bool msix_bar_assigned = true;
   };
   std::vector<Function> functions;
   const char* name() const override { return "fake pci"; }
@@ -684,21 +690,76 @@ class FakePci final : public hardware::IPciBus {
     if (offset == 0x80 && f->pcie_type >= 0) return 0x10 | (uint32_t(f->pcie_type) << 20);
     if (f->pm && offset == 0x70) return 0x01 | (3u << 16) | (f->pme_from_d3hot ? (1u << 30) : 0);
     if (f->pm && offset == 0x74) return f->pmcsr;
+    if (f->msix_size && offset == 0x90) return 0x11 | ((f->msix_control | (f->msix_size - 1)) << 16);
+    if (f->msix_size && offset == 0x94) return 0;                // the table is at offset 0 of BAR 0
     return 0;
   }
   void write32(hardware::PciAddress a, uint16_t offset, uint32_t value) const override {
     const Function* f = find(a);
+    if (f && f->msix_size && offset == 0x90) { f->msix_control = (value >> 16) & 0xC000; return; }
     if (!f || !f->pm || offset != 0x74) return;
     // the state and the PME enable are written; the status bit clears when a one is written
     f->pmcsr = (value & 0x103) | (f->pmcsr & 0x8000 & ~value);
   }
   void set_wake_pending(hardware::PciAddress a) const { const Function* f = find(a); if (f) f->pmcsr |= 0x8000; }
-  uint64_t memory_bar(hardware::PciAddress, uint8_t) const override { return 0; }
+  uint64_t memory_bar(hardware::PciAddress a, uint8_t index) const override {
+    const Function* f = find(a);
+    if (!f || !f->msix_size || index != 0 || !f->msix_bar_assigned) return 0;
+    if (f->msix_table.size() != f->msix_size * 4) f->msix_table.assign(f->msix_size * 4, 0xFFFFFFFFu);
+    return reinterpret_cast<uint64_t>(f->msix_table.data());
+  }
   uint16_t find_capability(hardware::PciAddress a, uint8_t id) const override {
     const Function* f = find(a);
     if (f && id == 0x10 && f->pcie_type >= 0) return 0x80;
     if (f && id == 0x01 && f->pm) return 0x70;
+    if (f && id == 0x11 && f->msix_size) return 0x90;
     return 0;
+  }
+};
+
+
+// Registers that are plain memory.
+class FakeMapper final : public hardware::IRegisterMapper {
+ public:
+  bool fail = false;
+  uint32_t mapped = 0;
+  bool map_registers(uint64_t physical, uint64_t length, hardware::MmioRegion* region) override {
+    if (fail) return false;
+    ++mapped;
+    *region = hardware::MmioRegion(physical, length);
+    return true;
+  }
+};
+
+
+// The NHI's PCI configuration space as far as an Ice Lake controller's power handling uses it.
+class FakeIclConfig final : public hardware::ITbConfigSpace {
+ public:
+  bool firmware_comes_up = true;           // FW_READY appears once the controller is force powered
+  bool lc_done = true;
+  uint32_t force_power_register = 0, ltr = 0, max_ltr = 0x3FFF, lc_command = 0;
+  std::vector<uint32_t> lc_commands;       // the commands sent (without the valid bit)
+  uint32_t power_writes = 0;
+  uint32_t read32(uint16_t offset) override {
+    using namespace hardware::tb_icl;
+    if (offset == kFwReadyRegister) return (firmware_comes_up && (force_power_register & kForcePower)) ? kFwReady : 0;
+    if (offset == kMaxLtrRegister) return max_ltr;
+    if (offset == kLtrRegister) return ltr;
+    if (offset == kLcDoneRegister) return lc_done ? kLcDone : 0;
+    if (offset == kLcCommandRegister) return lc_command;
+    if (offset == kForcePowerRegister) return force_power_register;
+    if (offset == kUuidLowRegister) return 0x11223344u;
+    if (offset == kUuidHighRegister) return 0x55667788u;
+    return 0;
+  }
+  void write32(uint16_t offset, uint32_t value) override {
+    using namespace hardware::tb_icl;
+    if (offset == kForcePowerRegister) { force_power_register = value; ++power_writes; }
+    else if (offset == kLtrRegister) ltr = value;
+    else if (offset == kLcCommandRegister) {
+      lc_command = value;
+      if (value & kLcValid) lc_commands.push_back((value & kLcCommandMask) >> kLcCommandShift);
+    }
   }
 };
 

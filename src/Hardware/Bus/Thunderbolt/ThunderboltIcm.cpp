@@ -418,33 +418,41 @@ ThunderboltIcm::Outcome ThunderboltIcm::bring_up(uint32_t timeout_us, bool resum
     if (!start_firmware()) return outcome_ = Outcome::FirmwareStartFailed;
   }
   if (!control_.start()) return outcome_ = Outcome::ControlFailed;
-  if (!nhi_.wait_firmware_authenticated(timeout_us < 3000000 ? timeout_us : 3000000)) {
-    control_.stop();
-    return outcome_ = Outcome::AuthTimeout;
-  }
-  switch (nhi_.firmware_mode()) {
-    case TbFirmwareMode::Safe:
-      return outcome_ = Outcome::SafeMode;
-    case TbFirmwareMode::ConnectionManager:
-      // like the Linux driver: the firmware reports every device; approving one is still the caller's decision
-      nhi_.mailbox(tb_mailbox::kAllowAllDevices, 0, 500000);
-      break;
-    default:
+  if (!ice_lake()) {
+    // (Ice Lake's firmware is known to be up once it is force powered: no image to wait for, no mode to read)
+    if (!nhi_.wait_firmware_authenticated(timeout_us < 3000000 ? timeout_us : 3000000)) {
       control_.stop();
-      return outcome_ = Outcome::WrongMode;
+      return outcome_ = Outcome::AuthTimeout;
+    }
+    switch (nhi_.firmware_mode()) {
+      case TbFirmwareMode::Safe:
+        return outcome_ = Outcome::SafeMode;
+      case TbFirmwareMode::ConnectionManager:
+        // like the Linux driver: the firmware reports every device; approving one is still the caller's decision
+        nhi_.mailbox(tb_mailbox::kAllowAllDevices, 0, 500000);
+        break;
+      default:
+        control_.stop();
+        return outcome_ = Outcome::WrongMode;
+    }
   }
   // links that are already up are bounced, so that the firmware finds what is connected again (failures are not fatal)
-  if (options_.cio && options_.reset_ports && !resuming)
+  if (options_.cio && options_.reset_ports && !resuming && !ice_lake())
     for (uint32_t physical = 0; physical < 2; ++physical)
       if (!reset_physical_port(physical)) ++port_reset_failures_;
   uint8_t request_bytes[tb_icm::kDriverReadyBytes], response[tb_icm::kTrDriverReadyResponseBytes];
   const uint32_t response_bytes = titan() ? tb_icm::kTrDriverReadyResponseBytes : tb_icm::kDriverReadyResponseBytes;
   const uint32_t n = tb_icm::build_driver_ready(ByteView(request_bytes, sizeof request_bytes));
   // (Titan Ridge answers DRIVER_READY quickly or not at all: ten tries of a quarter second)
-  const bool answered = n != 0 && (titan() ? request(ConstByteView(request_bytes, n), ByteView(response, response_bytes), 250000, 10) : request(ConstByteView(request_bytes, n), ByteView(response, response_bytes), timeout_us));
+  const bool answered = n != 0 && (ice_lake() ? request(ConstByteView(request_bytes, n), ByteView(response, response_bytes), 20000000)
+                                              : titan() ? request(ConstByteView(request_bytes, n), ByteView(response, response_bytes), 250000, 10) : request(ConstByteView(request_bytes, n), ByteView(response, response_bytes), timeout_us));
   if (!answered || !(titan() ? tb_icm::parse_driver_ready_tr(ConstByteView(response, response_bytes), &ready_) : tb_icm::parse_driver_ready(ConstByteView(response, response_bytes), &ready_))) {
     control_.stop();
     return outcome_ = Outcome::DriverReadyFailed;
+  }
+  if (ice_lake()) {                                 // (it says neither: devices are not asked to be approved, and runtime power management always works)
+    ready_.security = TbSecurityLevel::None;
+    ready_.rtd3 = true;
   }
   // wait until the root router's configuration space can be read
   bool readable = false;
@@ -458,7 +466,7 @@ ThunderboltIcm::Outcome ThunderboltIcm::bring_up(uint32_t timeout_us, bool resum
     return outcome_ = Outcome::RootSwitchFailed;
   }
   outcome_ = Outcome::Started;
-  if (interrupts_) nhi_.set_control_interrupts(true);          // (start-up masked them)
+  if (interrupts_) nhi_.set_control_interrupts(true, msix_vector_);          // (start-up masked them)
   return outcome_;
 }
 
@@ -485,10 +493,11 @@ bool ThunderboltIcm::reset_physical_port(uint32_t physical_port) {
   return cio.write(TbConfigSpace::Port, port0, tb_cio::kPhyPortCs1, v0 & ~tb_cio::kPhyLinkDisable) && cio.write(TbConfigSpace::Port, port1, tb_cio::kPhyPortCs1, v1 & ~tb_cio::kPhyLinkDisable);
 }
 
-bool ThunderboltIcm::use_interrupts(bool on) {
-  if (outcome_ != Outcome::Started) return false;
+bool ThunderboltIcm::use_interrupts(bool on, int msix_vector) {
+  if (outcome_ != Outcome::Started || msix_vector > 15) return false;          // (the vector allocation has 4 bits a source)
   interrupts_ = on;
-  nhi_.set_control_interrupts(on);
+  msix_vector_ = on ? msix_vector : -1;
+  nhi_.set_control_interrupts(on, msix_vector);
   return true;
 }
 
@@ -522,6 +531,7 @@ void ThunderboltIcm::stop() {
   devices_.clear();
   xdomains_.clear();
   interrupts_ = false;
+  msix_vector_ = -1;
   outcome_ = Outcome::NotStarted;
 }
 

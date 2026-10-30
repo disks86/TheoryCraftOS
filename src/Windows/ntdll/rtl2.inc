@@ -592,50 +592,73 @@ EXPORT PVOID NTAPI RtlEnumerateGenericTableWithoutSplaying(RTL_GENERIC_TABLE_ *t
 
 /* ---- locale names and numbers ------------------------------------------------------------------------------------------------------------------------------ */
 
-/* The locales of this OS: the invariant one and English (United States), with the neutral name "en". */
+#include "locale_names.inc"
 #define NLS_STATUS_INVALID_PARAMETER_1 ((NTSTATUS)0xC00000EF)
 #define NLS_STATUS_INVALID_PARAMETER_2 ((NTSTATUS)0xC00000F0)
 #define NLS_STATUS_BUFFER_TOO_SMALL ((NTSTATUS)0xC0000023)
+#define NLS_STATUS_UNSUCCESSFUL ((NTSTATUS)0xC0000001)
+#define NLS_RTL_ALLOW_NEUTRAL 2u
 static WCHAR nls_low(WCHAR c) { return c >= 'A' && c <= 'Z' ? (WCHAR)(c + 32) : c; }
-static BOOL nls_name_equals(const WCHAR *name, const char *text) {
-  for (; *text; ++text, ++name) if (nls_low(*name) != (WCHAR)*text) return FALSE;
+/* Names are compared without regard to case, and an underscore is a hyphen. */
+static BOOL nls_name_matches(const WCHAR *name, const char *text) {
+  for (; *text; ++text, ++name) {
+    WCHAR a = nls_low(*name), b = (WCHAR)nls_low((BYTE)*text);
+    if (a == '_') a = '-';
+    if (b == '_') b = '-';
+    if (a != b) return FALSE;
+  }
   return *name == 0;
 }
+/* The number of the locale with a name in the table, or -1. */
+static int nls_find_name(const WCHAR *name) {
+  if (!name) return -1;
+  for (int i = 0; i < RTL_LOCALE_COUNT; ++i) if (nls_name_matches(name, k_rtl_locale_names + k_rtl_locale_name[i]) && *name) return i;
+  return -1;
+}
+static int nls_find_lcid(ULONG lcid) {
+  int lo = 0, hi = RTL_LOCALE_COUNT;
+  while (lo < hi) {
+    const int mid = lo + (hi - lo) / 2;
+    if (k_rtl_locale_lcid[mid] < lcid) lo = mid + 1; else if (k_rtl_locale_lcid[mid] > lcid) hi = mid; else return mid;
+  }
+  return -1;
+}
+static BOOL nls_is_neutral_entry(int i) { return k_rtl_locale_default[i] != i; }
 EXPORT BOOLEAN NTAPI RtlIsValidLocaleName(const WCHAR *name, ULONG flags) {
   if (!name) return FALSE;
   if (*name == 0) return TRUE;
-  if (nls_name_equals(name, "en-us")) return TRUE;
-  return (flags & 2) && nls_name_equals(name, "en");
+  const int i = nls_find_name(name);
+  return i >= 0 && (!nls_is_neutral_entry(i) || (flags & NLS_RTL_ALLOW_NEUTRAL));
 }
 EXPORT NTSTATUS NTAPI RtlLocaleNameToLcid(const WCHAR *name, ULONG *lcid, ULONG flags) {
   if (!name) return NLS_STATUS_INVALID_PARAMETER_1;
   if (*name == 0) { *lcid = 0x7F; return 0; }
-  if (nls_name_equals(name, "en-us")) { *lcid = 0x409; return 0; }
-  if ((flags & 2) && nls_name_equals(name, "en")) { *lcid = 0x09; return 0; }
-  return NLS_STATUS_INVALID_PARAMETER_1;
+  const int i = nls_find_name(name);
+  if (i < 0 || (nls_is_neutral_entry(i) && !(flags & NLS_RTL_ALLOW_NEUTRAL))) return NLS_STATUS_INVALID_PARAMETER_1;
+  *lcid = k_rtl_locale_lcid[i];
+  return 0;
 }
 EXPORT NTSTATUS NTAPI RtlLcidToLocaleName(ULONG lcid, UNICODE_STRING *name, ULONG flags, BOOLEAN allocate) {
-  static const WCHAR en_us[] = {'e', 'n', '-', 'U', 'S', 0}, en[] = {'e', 'n', 0}, invariant[] = {0};
-  (void)flags;
-  const WCHAR *text;
+  const char *text;
   switch (lcid) {
-    case 0x409: case 0x1000: case 0x2000: case 0x800: case 0x400: text = en_us; break;
-    case 0x7F: text = invariant; break;
-    case 0x09: text = en; break;
-    default: return NLS_STATUS_INVALID_PARAMETER_1;
+    case 0x800: case 0x400: case 0xC00: case 0x1400: lcid = 0x409; break;
+    case 0: case 0x1000: return NLS_STATUS_INVALID_PARAMETER_1;
+    default: break;
   }
+  const int i = nls_find_lcid(lcid);
+  if (i < 0 || (nls_is_neutral_entry(i) && !(flags & NLS_RTL_ALLOW_NEUTRAL))) return NLS_STATUS_INVALID_PARAMETER_1;
   if (!name) return NLS_STATUS_INVALID_PARAMETER_2;
-  if (lcid == 0x1000) return NLS_STATUS_INVALID_PARAMETER_1;
+  text = k_rtl_locale_names + k_rtl_locale_name[i];
   USHORT length = 0;
   while (text[length]) ++length;
-  length = (USHORT)(length * 2);
+  const USHORT bytes = (USHORT)(length * 2);
   if (allocate) {
-    name->Buffer = RtlAllocateHeap(RtlProcessHeap(), 0, (SIZE_T)length + 2);
+    name->Buffer = RtlAllocateHeap(RtlProcessHeap(), 0, (SIZE_T)bytes + 2);
     if (!name->Buffer) return STATUS_NO_MEMORY;
-    name->MaximumLength = (USHORT)(length + 2);
-  } else if (name->MaximumLength < length + 2) return NLS_STATUS_BUFFER_TOO_SMALL;
-  memcpy(name->Buffer, text, (SIZE_T)length + 2);
-  name->Length = length;
+    name->MaximumLength = (USHORT)(bytes + 2);
+  } else if (name->MaximumLength < bytes + 2) return NLS_STATUS_BUFFER_TOO_SMALL;
+  for (USHORT k = 0; k <= length; ++k) name->Buffer[k] = (WCHAR)(BYTE)text[k];
+  name->Length = bytes;
   return 0;
 }
 

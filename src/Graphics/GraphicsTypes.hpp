@@ -46,14 +46,27 @@ enum class Format : uint8_t {
   R8G8B8A8Srgb,        // the same with R, G, B, A in memory order
   R16G16B16A16Unorm,   // 64-bit, four 16-bit normalised channels in the order R, G, B, A (kFeatureUnorm16Formats)
   R32G32B32A32Uint,    // 128-bit, four unsigned integers R, G, B, A (kFeatureIntegerFormats): values travel as the bits of the Vec4s (read_pixels_float); no blending, no filtering - a texture is read with fetch
+  R32G32B32A32Sint,    // the same with signed integers
+  R16G16B16A16Uint,    // 64-bit, four unsigned 16-bit integers (kFeatureIntegerFormats): a value above 65535 is stored as 65535
+  R16G16B16A16Sint,    // four signed 16-bit integers: stored clamped to -32768 .. 32767
+  R8G8B8A8Uint,        // 32-bit, four unsigned bytes in the order R, G, B, A: stored clamped to 255 (still a wide format: the pixels travel as Vec4s of integer bits)
+  R16G16B16A16Snorm,   // 64-bit, four 16-bit signed normalised channels (-1 .. 1; kFeatureSnormFormats)
+  R10G10B10A2Unorm,    // 32-bit packed: R in bits 0-9, G 10-19, B 20-29, A 30-31, all normalised (kFeatureSnormFormats)
 };
 
 constexpr bool is_float_format(Format f) { return f == Format::R16G16B16A16Float || f == Format::R32G32B32A32Float; }
 constexpr bool is_srgb_format(Format f) { return f == Format::B8G8R8A8Srgb || f == Format::R8G8B8A8Srgb; }
-constexpr bool is_integer_format(Format f) { return f == Format::R32G32B32A32Uint; }
+constexpr bool is_integer_format(Format f) { return f == Format::R32G32B32A32Uint || f == Format::R32G32B32A32Sint || f == Format::R16G16B16A16Uint || f == Format::R16G16B16A16Sint || f == Format::R8G8B8A8Uint; }
 // Formats whose pixels do not fit a 32-bit word: they are read and written as Vec4s (read_pixels_float / write_pixels_float) and have one mip level.
-constexpr bool is_wide_format(Format f) { return is_float_format(f) || f == Format::R16G16B16A16Unorm || is_integer_format(f); }
-constexpr uint32_t bytes_per_pixel(Format f) { return f == Format::Undefined ? 0 : (f == Format::R16G16B16A16Float || f == Format::R16G16B16A16Unorm) ? 8 : (f == Format::R32G32B32A32Float || f == Format::R32G32B32A32Uint) ? 16 : 4; }
+constexpr bool is_wide_format(Format f) { return is_float_format(f) || f == Format::R16G16B16A16Unorm || f == Format::R16G16B16A16Snorm || f == Format::R10G10B10A2Unorm || is_integer_format(f); }
+constexpr uint32_t bytes_per_pixel(Format f) {
+  switch (f) {
+    case Format::Undefined: return 0;
+    case Format::R16G16B16A16Float: case Format::R16G16B16A16Unorm: case Format::R16G16B16A16Snorm: case Format::R16G16B16A16Uint: case Format::R16G16B16A16Sint: return 8;
+    case Format::R32G32B32A32Float: case Format::R32G32B32A32Uint: case Format::R32G32B32A32Sint: return 16;
+    default: return 4;
+  }
+}
 
 // IEEE half floats (1 sign, 5 exponent, 10 fraction bits) to and from float; to_half rounds to nearest even, saturates to infinity, and keeps NaN.
 inline float half_to_float(uint16_t h) {
