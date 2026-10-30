@@ -48,6 +48,7 @@ struct BluetoothAdapterInfo {
   char address[18] = {};
   bool ready = false;
   bool discovering = false;
+  bool auto_reconnect = false;        // paired devices that start advertising are connected again by themselves
 };
 
 struct BluetoothPrompt {
@@ -64,6 +65,8 @@ class IBluetoothDetails {
   virtual bool is_bluetooth(uint32_t id) = 0;
   // The adapter's state. False if there is no such adapter (any more).
   virtual bool adapter(uint32_t id, BluetoothAdapterInfo* out) = 0;
+  // Switches the automatic reconnection of paired devices on or off (for all adapters; it is kept across restarts).
+  virtual void set_auto_reconnect(uint32_t id, bool on) = 0;
   // Starts or stops the search for devices.
   virtual bool set_discovery(uint32_t id, bool on) = 0;
   // The devices found so far and the ones connected: connected first, then paired, then by signal. Writes up to `capacity`; returns how many.

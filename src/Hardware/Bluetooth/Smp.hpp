@@ -51,6 +51,7 @@ struct SmBond {
 class SmBondStore {
  public:
   static constexpr uint32_t kMaxBonds = 16;
+  static constexpr uint32_t kHeaderBytes = 5, kRecordBytes = 58;      // the serialised form: "BTBD" and the count, then this many bytes a bond
   // The bond for a device: by identity or link address, or, failing that, by resolving a private address with each bond's IRK.
   const SmBond* find(const hci::BdAddr& address, uint8_t address_type) const;
   bool store(const SmBond& bond);       // replaces the bond of the same device; false if the table is full

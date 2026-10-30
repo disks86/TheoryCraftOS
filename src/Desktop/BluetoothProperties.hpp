@@ -22,6 +22,7 @@
 #pragma once
 #include "Desktop/BluetoothDetails.hpp"
 #include "Gui/Controls/Button.hpp"
+#include "Gui/Controls/CheckBox.hpp"
 #include "Gui/Controls/DataGrid.hpp"
 #include "Gui/Controls/Label.hpp"
 #include "Gui/Controls/Panel.hpp"
@@ -45,6 +46,8 @@ class BluetoothProperties : public gui::Frame {
 
   gui::Label& adapter_label() { return adapter_label_; }
   gui::Label& status_label() { return status_; }
+  // "Reconnect to paired devices automatically": follows the adapter's setting; ticking it changes the setting.
+  gui::CheckBox& auto_reconnect_box() { return auto_reconnect_; }
   gui::DataGrid& grid() { return grid_; }
   // The text of a cell of the device list (columns: device, type, signal, status).
   StringView cell(uint32_t row, uint32_t column) const;
@@ -68,6 +71,7 @@ class BluetoothProperties : public gui::Frame {
   static void on_selection(void* self, gui::Control&);
   static void on_accept(void* self, gui::Control&);
   static void on_reject(void* self, gui::Control&);
+  static void on_auto_reconnect(void* self, gui::Control&);
   void fill_devices(const BluetoothDeviceRow* list, uint32_t count);
   void update_prompt();
   void update_buttons();
@@ -81,6 +85,8 @@ class BluetoothProperties : public gui::Frame {
   gui::DataGrid grid_;
   gui::Panel prompt_row_, buttons_, gap_a_, gap_b_, gap_c_;
   gui::TextBox passkey_;
+  gui::CheckBox auto_reconnect_;
+  bool syncing_ = false;      // the box is being set from the adapter, not by the user
   gui::Button search_button_, connect_button_, disconnect_button_, forget_button_, close_button_, accept_button_, reject_button_;
   BluetoothDeviceRow shown_[IBluetoothDetails::kMaxDevices], fresh_[IBluetoothDetails::kMaxDevices];   // (the list on screen; the one just read)
   uint32_t shown_count_ = 0;

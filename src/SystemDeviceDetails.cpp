@@ -430,6 +430,7 @@ bool SystemInventory::describe(HardwareGroup group, uint32_t id, desktop::Device
       sink.add("Address", text.view());
       sink.add_flag("Ready", a->ready());
       sink.add_flag("Searching for devices", a->discovering());
+      sink.add_flag("Reconnects paired devices", a->auto_reconnect());
       uint32_t connected = 0, paired = 0;
       for (uint32_t i = 0; i < a->device_count(); ++i) {
         hardware::BluetoothDeviceInfo info;

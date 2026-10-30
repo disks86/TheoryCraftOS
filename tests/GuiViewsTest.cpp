@@ -2331,7 +2331,7 @@ struct FakeBluetoothDetails final : desktop::IBluetoothDetails {
   Row rows[3];
   uint32_t row_count = 3;
   desktop::BluetoothPrompt question;
-  int discovery_calls = 0, connects = 0, disconnects = 0, forgets = 0;
+  int discovery_calls = 0, connects = 0, disconnects = 0, forgets = 0, auto_calls = 0;
   bool confirm_answer = false, confirmed = false;
   int32_t typed = -1;
   uint8_t last_key[6] = {};
@@ -2343,6 +2343,7 @@ struct FakeBluetoothDetails final : desktop::IBluetoothDetails {
     return true;
   }
   bool set_discovery(uint32_t, bool on) override { ++discovery_calls; info.discovering = on; return true; }
+  void set_auto_reconnect(uint32_t, bool on) override { ++auto_calls; info.auto_reconnect = on; }
   uint32_t devices(uint32_t, Row* out, uint32_t capacity) override {
     uint32_t n = 0;
     for (; n < row_count && n < capacity; ++n) out[n] = rows[n];
@@ -2425,6 +2426,16 @@ static void test_bluetooth_properties() {
     CHECK(props.cell(0, 0).equals("Keyboard") && props.cell(0, 1).equals("Keyboard") && props.cell(0, 2).equals("90%") && props.cell(0, 3).equals("Paired"));
     CHECK(props.cell(1, 3).equals("Not paired") && props.cell(2, 0).equals("A1:A2:A3:A4:A5:A6") && props.cell(2, 2).empty() && props.cell(2, 3).equals("Not supported yet") && props.cell(7, 0).empty());
     CHECK(!props.prompt_row().visible() && props.search_button().text().equals("Stop"));
+    // The automatic reconnection of paired devices: off at first, ticking the box changes the adapter's setting, and the box follows the adapter when it changes by itself.
+    CHECK(props.auto_reconnect_box().enabled() && !props.auto_reconnect_box().checked() && props.auto_reconnect_box().text().find(StringView("paired devices")) != StringView::npos && details.auto_calls == 0);
+    click_center(w, props.auto_reconnect_box());
+    CHECK(props.auto_reconnect_box().checked() && details.auto_calls == 1 && details.info.auto_reconnect && props.status_label().text().find(StringView("connect again")) != StringView::npos);
+    details.info.auto_reconnect = false;
+    props.update();
+    CHECK(!props.auto_reconnect_box().checked() && details.auto_calls == 1);                  // (set from the adapter: not a change the user made)
+    click_center(w, props.auto_reconnect_box());
+    click_center(w, props.auto_reconnect_box());
+    CHECK(!props.auto_reconnect_box().checked() && details.auto_calls == 3 && !details.info.auto_reconnect);
     // Nothing picked: the actions are off. A device that can be connected enables Connect (and Forget if it is paired); one that cannot, nothing.
     CHECK(!props.connect_button().enabled() && !props.disconnect_button().enabled() && !props.forget_button().enabled());
     props.grid().select_row(0);
@@ -2506,7 +2517,7 @@ static void test_bluetooth_properties() {
     // An adapter that is gone, or not ready.
     details.known = 9;
     props.update();
-    CHECK(props.grid().row_count() == 0 && props.adapter_label().text().find(StringView("not there")) != StringView::npos && !props.search_button().enabled());
+    CHECK(props.grid().row_count() == 0 && props.adapter_label().text().find(StringView("not there")) != StringView::npos && !props.search_button().enabled() && !props.auto_reconnect_box().enabled());
     details.known = 0;
     details.info.ready = false;
     props.update();

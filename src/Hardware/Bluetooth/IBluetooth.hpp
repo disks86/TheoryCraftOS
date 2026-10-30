@@ -130,6 +130,7 @@ class IBluetoothAdapter : public IHardware {
   virtual BluetoothResult forget(const hci::BdAddr& address) = 0;
   // Connect again to bonded devices that start advertising (a keyboard that was switched off and on).
   virtual void set_auto_reconnect(bool on) = 0;
+  virtual bool auto_reconnect() const = 0;
 
   virtual void set_pairing_ui(IBluetoothPairingUi* ui) = 0;
   virtual void passkey_entered(const hci::BdAddr& address, uint32_t passkey) = 0;
@@ -145,6 +146,9 @@ class IBluetoothAdapter : public IHardware {
 
 class IBluetoothManager {
  public:
+  // Whether the adapters connect again to bonded devices that start advertising. One setting for all adapters, kept across restarts; adapters that appear later follow it.
+  virtual bool auto_reconnect() const = 0;
+  virtual void set_auto_reconnect(bool on) = 0;
   virtual uint32_t adapter_count() const = 0;
   virtual IBluetoothAdapter* adapter(uint32_t index) = 0;
   // Profiles are offered every device that connects through any adapter, those registered before and after the adapter came up alike. The profile must outlive the manager or be removed.

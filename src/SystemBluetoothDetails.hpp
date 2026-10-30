@@ -29,6 +29,7 @@ class SystemBluetoothDetails final : public desktop::IBluetoothDetails {
 
   bool is_bluetooth(uint32_t id) override;
   bool adapter(uint32_t id, desktop::BluetoothAdapterInfo* out) override;
+  void set_auto_reconnect(uint32_t id, bool on) override;
   bool set_discovery(uint32_t id, bool on) override;
   uint32_t devices(uint32_t id, desktop::BluetoothDeviceRow* out, uint32_t capacity) override;
   desktop::BluetoothResult connect(uint32_t id, const uint8_t key[6]) override;

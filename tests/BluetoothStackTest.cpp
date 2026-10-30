@@ -1150,6 +1150,9 @@ static void test_system_details() {
   struct Manager final : IBluetoothManager {
     IBluetoothAdapter* a = nullptr;
     BluetoothProfileRegistry* profiles = nullptr;
+    bool reconnect = false;
+    bool auto_reconnect() const override { return reconnect; }
+    void set_auto_reconnect(bool on) override { reconnect = on; if (a) a->set_auto_reconnect(on); }
     uint32_t adapter_count() const override { return a ? 1 : 0; }
     IBluetoothAdapter* adapter(uint32_t i) override { return i == 0 ? a : nullptr; }
     bool add_profile(IBluetoothProfile* p) override { return profiles->add(p); }
@@ -1174,6 +1177,13 @@ static void test_system_details() {
     CHECK(details.is_bluetooth(0) && !details.is_bluetooth(1));
     desktop::BluetoothAdapterInfo info;
     CHECK(details.adapter(0, &info) && strcmp(info.name, "Bluetooth adapter") == 0 && strcmp(info.address, "66:55:44:33:22:11") == 0 && info.ready && !info.discovering && !details.adapter(1, &info));
+    CHECK(!info.auto_reconnect);
+    details.set_auto_reconnect(0, true);
+    CHECK(manager.reconnect && w.adapter->auto_reconnect() && details.adapter(0, &info) && info.auto_reconnect);
+    details.set_auto_reconnect(1, false);                              // (no such adapter: nothing changes)
+    CHECK(manager.reconnect);
+    details.set_auto_reconnect(0, false);
+    CHECK(!manager.reconnect && !w.adapter->auto_reconnect());
     CHECK(details.set_discovery(0, true) && details.adapter(0, &info) && info.discovering);
     w.advertise();
     w.host.controller.inquiry();
@@ -1293,6 +1303,100 @@ static void test_system_details() {
   }
 }
 
+// The auto-reconnect choice belongs to the service: kept in the bond file after the bonds, read back at start-up, followed by adapters that appear later.
+static void test_auto_reconnect_setting() {
+  TestAllocator a;
+  filesystem::RamFileSystem files(a);
+  FileBluetoothBonds storage(files, a);
+  TestRandom random;
+  struct Fw final : IBluetoothFirmwareSource { bool read(const char*, ByteBuffer&) override { return false; } } fw;
+  {   // off by default; switching it on is applied to the adapter and saved with the (empty) bonds
+    Host host;
+    host.vendor = 0x0A5C;
+    Bus bus;
+    bus.hosts = {&host};
+    BluetoothService service(&bus, &fw, a, &random, &storage);
+    service.start();
+    CHECK(!service.auto_reconnect() && !service.entry(0)->adapter->auto_reconnect());
+    service.set_auto_reconnect(true);
+    CHECK(service.auto_reconnect() && service.entry(0)->adapter->auto_reconnect());
+    service.set_auto_reconnect(true);                                   // (no change: nothing to do)
+    // a bond is added: the next save keeps both
+    SmBond bond;
+    bond.used = true;
+    bond.address.b[0] = 9;
+    bond.address_type = 1;
+    bond.has_ltk = true;
+    CHECK(service.bonds().store(bond) && service.save_bonds());
+  }
+  {   // the next start finds the choice and the bond; an adapter that comes up is set from it
+    Host host;
+    host.vendor = 0x0A5C;
+    Bus bus;
+    bus.hosts = {&host};
+    BluetoothService service(&bus, &fw, a, &random, &storage);
+    service.start();
+    CHECK(service.auto_reconnect() && service.bonds().count() == 1 && service.entry(0)->adapter->auto_reconnect());
+    service.set_auto_reconnect(false);
+    CHECK(!service.auto_reconnect() && !service.entry(0)->adapter->auto_reconnect());
+  }
+  {   // switched off again, and kept so
+    Host host;
+    host.vendor = 0x0A5C;
+    Bus bus;
+    bus.hosts = {&host};
+    BluetoothService service(&bus, &fw, a, &random, &storage);
+    service.start();
+    CHECK(!service.auto_reconnect() && service.bonds().count() == 1);
+    // a controller that is plugged in later follows the choice
+    service.set_auto_reconnect(true);
+    Host second;
+    second.vendor = 0x0A5C;
+    bus.hosts.push_back(&second);
+    service.step(true);
+    CHECK(service.count() == 2 && service.entry(1)->adapter && service.entry(1)->adapter->auto_reconnect());
+  }
+  {   // a file from before there were settings, and damaged or cut ones: the default, and the bonds as far as they go
+    ByteBuffer file(a);
+    SmBondStore store;
+    SmBond bond;
+    bond.used = true;
+    bond.address.b[0] = 5;
+    bond.has_ltk = true;
+    store.store(bond);
+    CHECK(store.serialize(file) && file.size() == SmBondStore::kHeaderBytes + SmBondStore::kRecordBytes);
+    CHECK(storage.save(file.view()));
+    Host host;
+    host.vendor = 0x0A5C;
+    Bus bus;
+    bus.hosts = {&host};
+    {
+      BluetoothService service(&bus, &fw, a, &random, &storage);
+      service.start();
+      CHECK(!service.auto_reconnect() && service.bonds().count() == 1);
+    }
+    for (uint32_t cut = 1; cut <= 5; ++cut) {                          // the trailer cut short
+      ByteBuffer partial(a);
+      CHECK(partial.append(file.view()) && partial.put_tag("BTST") && partial.put8(1));
+      partial.truncate(partial.size() - cut);
+      CHECK(storage.save(partial.view()));
+      BluetoothService service(&bus, &fw, a, &random, &storage);
+      service.start();
+      CHECK(!service.auto_reconnect() && service.bonds().count() == 1);
+    }
+    ByteBuffer wrong(a);
+    CHECK(wrong.append(file.view()) && wrong.put_tag("XXXX") && wrong.put8(1) && storage.save(wrong.view()));
+    BluetoothService service(&bus, &fw, a, &random, &storage);
+    service.start();
+    CHECK(!service.auto_reconnect());
+    ByteBuffer on(a);
+    CHECK(on.append(file.view()) && on.put_tag("BTST") && on.put8(3) && storage.save(on.view()));
+    BluetoothService again(&bus, &fw, a, &random, &storage);
+    again.start();
+    CHECK(again.auto_reconnect());
+  }
+}
+
 int main() {
   setvbuf(stdout, nullptr, _IONBF, 0);
   test_crypto();
@@ -1308,6 +1412,7 @@ int main() {
   test_hid_end_to_end();
   test_profile_plugin();
   test_system_details();
+  test_auto_reconnect_setting();
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }
   printf("bluetooth stack tests passed\n");
   return 0;

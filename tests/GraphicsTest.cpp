@@ -924,6 +924,45 @@ static void test_glyphs() {
   release_view(a, cs.pixels);
 }
 
+// draw_image_tiled on the device renderer: a texture the sampler repeats; the CPU renderer says no.
+static void test_tiled(Rig& g, TestAllocator& a) {
+  IRenderer2D& r = *g.r;
+  Surface tile = make_surface(a, 3, 2);
+  const uint32_t colors[6] = {kRed, kGreen, kBlue, kWhite, 0xFFFFFF00, 0xFF00FFFF};
+  for (uint32_t i = 0; i < 6; ++i) tile.pixels[i] = colors[i];
+  // cells of the tile's own size: pixel (x, y) shows tile pixel ((x - 5) mod 3, (y - 4) mod 2), inside the area only
+  g.reset();
+  CHECK(r.draw_image_tiled(tile, 5, 4, 3, 2, {2, 3, 20, 9}));
+  g.read();
+  uint32_t wrong = 0;
+  for (int32_t y = 0; y < 64; ++y)
+    for (int32_t x = 0; x < 64; ++x) {
+      const bool inside = x >= 2 && x < 22 && y >= 3 && y < 12;
+      const int32_t tx = ((x - 5) % 3 + 3) % 3, ty = ((y - 4) % 2 + 2) % 2;
+      wrong += g.at(x, y) != (inside ? colors[ty * 3 + tx] : kBlack);
+    }
+  CHECK(wrong == 0);
+  // cells twice as big: each texel is 2 x 2 pixels
+  g.reset();
+  CHECK(r.draw_image_tiled(tile, 0, 0, 6, 4, {0, 0, 24, 8}));
+  g.read();
+  wrong = 0;
+  for (int32_t y = 0; y < 8; ++y)
+    for (int32_t x = 0; x < 24; ++x) wrong += g.at(x, y) != colors[((y % 4) / 2) * 3 + ((x % 6) / 2)];
+  CHECK(wrong == 0);
+  // translucent texels blend over what is there; a clip limits the area; an empty area draws nothing
+  tile.pixels[0] = 0x80FF0000;
+  g.reset();
+  r.fill_rect({0, 0, 64, 64}, kBlue);
+  r.push_clip_rect({4, 4, 6, 4});
+  CHECK(r.draw_image_tiled(tile, 4, 4, 3, 2, {0, 0, 64, 64}));
+  r.pop_clip();
+  CHECK(r.draw_image_tiled(tile, 0, 0, 3, 2, {10, 10, 0, 5}));
+  g.read();
+  CHECK(chan_near(g.at(4, 4), blend_over(0x80FF0000, kBlue), 1) && g.at(5, 4) == kGreen && g.at(3, 4) == kBlue && g.at(10, 4) == kBlue && g.at(4, 8) == kBlue);
+  release_view(a, tile.pixels);
+}
+
 static void test_gradients(Rig& g) {
   IRenderer2D& r = *g.r;
   const GradientStop rb[2] = {{0, kRed}, {1, kBlue}};
@@ -1351,6 +1390,7 @@ static void test_primitives() {
     test_scaled(g, a);
     test_transformed(g, a);
     test_groups(g);
+    test_tiled(g, a);
     test_mask_cache(g);
     test_gradients(g);
     test_clip_stack(g, a);
