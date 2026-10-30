@@ -71,7 +71,7 @@ class LpssI2cController {
   static bool prepare(IPciBus& pci, PciAddress address, uint64_t* bar);
   // Takes the function out of reset and sets the master up on the registers.
   bool initialize(II2cRegisters& registers, PciAddress address, const DesignWareI2c::Config& config);
-  II2cBus& bus() { return master_; }
+  II2cMaster& bus() { return master_; }
   PciAddress address() const { return address_; }
 
  private:

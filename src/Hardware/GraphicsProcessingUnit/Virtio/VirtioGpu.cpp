@@ -190,7 +190,9 @@ bool VirtioGpu::setup_3d() {
           in.skip(4 + 4 * 64);
           virgl_bset_ = in.le32();
           virgl_glsl_level_ = in.le32();
-          if (!in.ok()) virgl_bset_ = virgl_glsl_level_ = 0;
+          in.skip(4 * 4);   // (max_texture_array_layers, max_streamout_buffers, max_dual_source_render_targets, max_render_targets)
+          virgl_max_samples_ = in.le32();
+          if (!in.ok()) virgl_bset_ = virgl_glsl_level_ = virgl_max_samples_ = 0;
         }
       }
     }

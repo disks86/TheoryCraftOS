@@ -74,8 +74,11 @@ bool CubeView::ensure_renderer(uint32_t width, uint32_t height) {
     if (!renderer_) return false;
   }
   const bool switched = renderer_->adapter_index() != adapter;
-  if (!renderer_->open(adapter, width, height)) return false;
+  // (on a GPU the picture stays there when the desktop's renderer draws on that very device: only then is the color target made one it can sample)
+  const dxgk::Adapter* chosen = kernel_->adapter(adapter);
+  if (!renderer_->open(adapter, width, height, chosen && chosen->caps().accelerated)) return false;
   texture_available_ = renderer_->texture_available();
+  share_refused_ = false;
   if (switched) restart_benchmark();   // (a new size alone keeps the average going: the frames are not the same work, but the check boxes are what the numbers compare)
   return true;
 }
@@ -98,9 +101,29 @@ void CubeView::paint(gui::Painter& painter) {
   if (ready) {
     const float angle = static_cast<float>((frame_start - start_us_) % 6000000) * (kTwoPi / 6000000.0f);   // one turn in 6 seconds
     CubeFrameTimes times;
-    drawn = renderer_->render(angle, use_texture_, &times);
+    // A frame that stays on the GPU is composed from there; if the renderer cannot take it (another device, a CPU renderer) it is read back and drawn from memory as before.
+    const bool shared = renderer_->shareable() && !share_refused_;
+    drawn = renderer_->render(angle, use_texture_, &times, !shared);
     if (drawn) {
-      painter.image(renderer_->picture(), {0, 0, width, height}, (area.width - static_cast<int32_t>(width)) / 2, (area.height - static_cast<int32_t>(height)) / 2);
+      const int32_t px = (area.width - static_cast<int32_t>(width)) / 2, py = (area.height - static_cast<int32_t>(height)) / 2;
+      bool shown = false;
+      if (shared) {
+        graphics::IGraphicsDevice* device = nullptr;
+        graphics::IImage* image = nullptr;
+        if (renderer_->acquire_target(&device, &image)) {
+          shown = painter.device_image(*device, *image, {0, 0, width, height}, px, py);
+          renderer_->release_target();
+        }
+        if (!shown) {
+          share_refused_ = true;   // (until the renderer is made again)
+          const uint64_t start = hardware::uptime_us();
+          drawn = renderer_->fetch_picture();
+          times.readback_us = hardware::uptime_us() - start;
+        }
+      }
+      if (drawn && !shown) painter.image(renderer_->picture(), {0, 0, width, height}, px, py);
+    }
+    if (drawn) {
       active_accelerated_ = renderer_->caps().accelerated;
       active_textured_ = renderer_->last_textured();
       device_name_.assign(renderer_->caps().name);

@@ -82,6 +82,11 @@ void Painter::image(const graphics::Surface& source, const Rect2D& source_rect, 
   renderer_.draw_image(source, source_rect, x + f.origin_x, y + f.origin_y);
 }
 
+bool Painter::device_image(graphics::IGraphicsDevice& owner, graphics::IImage& image, const Rect2D& source_rect, int32_t x, int32_t y) {
+  const Frame& f = frames_[depth_];
+  return renderer_.draw_device_image(owner, image, source_rect, x + f.origin_x, y + f.origin_y);
+}
+
 void Painter::text(int32_t x, int32_t y, StringView s, uint32_t color) {
   // draw_text wants a C string: copy in pieces so any length works.
   char buffer[65];

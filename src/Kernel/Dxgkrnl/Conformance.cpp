@@ -1011,6 +1011,49 @@ void scene_compute(Rig& rig, ArrayView<uint32_t> out) {
     for (uint32_t& pixel : out) pixel ^= 0x0000FF00u;
 }
 
+// Multisampling (4 samples): a far red rectangle and a near green one that overlaps it, both with edges between the pixels' sample positions, drawn into 4x colour and depth images (depth
+// tested per sample) and resolved. Vertical and horizontal edges are covered the same by every device that uses the standard 4x pattern, whatever the order of the samples.
+void scene_multisample(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureMultisample | graphics::kFeatureBlendState)) return void(rig.step("multisampling", status::kNotSupported));
+  auto rect = [](Vertex* v, float x0, float y0, float x1, float y1, float z, float r, float g, float b) {
+    auto at = [&](float px, float py) { return Vertex{px / 16.0f - 1.0f, py / 16.0f - 1.0f, z, r, g, b, 1}; };
+    v[0] = at(x0, y0), v[1] = at(x1, y0), v[2] = at(x0, y1);
+    v[3] = at(x0, y1), v[4] = at(x1, y0), v[5] = at(x1, y1);
+  };
+  Vertex v[12];
+  rect(v, 4.3f, 3.4f, 20.6f, 22.7f, 0.6f, 1, 0, 0);
+  rect(v + 6, 12.4f, 9.2f, 27.8f, 28.6f, 0.3f, 0, 1, 0);
+  Handle vs = rig.vertex_shader(bytes_of(kVertexTokens, sizeof kVertexTokens), ShaderKind::D3d9Bytecode);
+  Handle ps = rig.pixel_shader(bytes_of(kPixelTokens, sizeof kPixelTokens), ShaderKind::D3d9Bytecode);
+  PipelineDesc pd = colour_pipeline_desc(vs, ps);
+  pd.depth_test = pd.depth_write = true;
+  pd.multisample = true;
+  Handle pipe = rig.pipeline(pd);
+  AllocationDesc color_desc, depth_desc;
+  color_desc.flags = kAllocRenderTarget, color_desc.format = Format::A8R8G8B8, color_desc.width = color_desc.height = kSize, color_desc.samples = 4;
+  depth_desc.flags = kAllocDepthStencil, depth_desc.format = Format::D32Float, depth_desc.width = depth_desc.height = kSize, depth_desc.samples = 4;
+  Handle multisampled = rig.create(color_desc), depth = rig.create(depth_desc);
+  // Resolved twice: into an image that is only drawn into (the even columns of the picture) and into one that is also a texture (the odd ones), which devices may store the other way up.
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize), textured = rig.image(kAllocRenderTarget | kAllocTexture, Format::A8R8G8B8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  CommandWriter w(rig.allocator());
+  w.begin_pass(0, 1, kPassClearColor | kPassClearDepth, {0, 0, 0, 1}, 1.0f, 0);
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(4);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(12);
+  w.end_pass();
+  w.resolve_region(2, 0);
+  w.resolve_region(3, 0);
+  rig.render(w, {multisampled, depth, target, textured, vb});
+  ArrayView<uint32_t> other = allocate_view<uint32_t>(rig.allocator(), uint64_t{kSize} * kSize);
+  if (other.empty()) return void(rig.step("memory", status::kNoMemory));
+  rig.read(target, out);
+  rig.read(textured, other);
+  for (uint32_t i = 1; i < kSize * kSize; i += 2) out[i] = other[i];
+  release_view(rig.allocator(), other);
+}
+
 const Entry kScenes[] = {
     {"Direct3D 9 vertex colours", scene_vertex_colours},
     {"Direct3D 9 Shader Model 3", scene_sm3},
@@ -1039,6 +1082,7 @@ const Entry kScenes[] = {
     {"Direct3D 10 per-instance attribute", scene_instanced_colour},
     {"Direct3D 10 instancing", scene_instancing},
     {"Direct3D 10 multiple render targets (DXBC)", scene_multiple_targets},
+    {"Direct3D 10 4x multisampling", scene_multisample},
     {"Direct3D 11 compute shader and unordered access views (DXBC)", scene_compute},
     {"Direct3D 10 independent blend per render target (DXBC)", scene_independent_blend},
     {"Direct3D 10 half-float render target and texture", scene_half_float_target},

@@ -26,7 +26,7 @@
 // mode, DMA, the slave role, suspend.
 #pragma once
 #include <stdint.h>
-#include "Hardware/Bus/I2c/II2cBus.hpp"
+#include "Hardware/Bus/I2c/II2cMaster.hpp"
 #include "Hardware/Mmio.hpp"
 
 namespace hardware {
@@ -63,7 +63,7 @@ constexpr uint32_t kIntrTxAbrt = 1u << 6, kIntrStopDet = 1u << 9;
 constexpr uint32_t kStatusActivity = 1u << 0, kStatusTxNotFull = 1u << 1, kStatusTxEmpty = 1u << 2, kStatusRxNotEmpty = 1u << 3, kStatusMasterActivity = 1u << 5;
 }  // namespace dw_i2c
 
-class DesignWareI2c final : public II2cBus {
+class DesignWareI2c final : public II2cMaster {
  public:
   struct Config {
     uint32_t clock_hz = 120000000;       // the controller's clock (Sunrise Point's LPSS I2C: 120 MHz)

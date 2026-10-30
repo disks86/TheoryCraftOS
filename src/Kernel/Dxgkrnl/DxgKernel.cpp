@@ -36,6 +36,7 @@ struct AllocRec {
   SharedPointer<Allocation> allocation;
   Handle device = 0;
   bool locked = false, read_only = false;
+  bool acquired = false;   // lent out by acquire_image (and pinned)
 };
 struct ContextRec {
   SharedPointer<ContextObject> context;
@@ -500,7 +501,7 @@ NtStatus Kernel::lock(ProcessId pid, Handle allocation, uint32_t flags, uint32_t
   Allocation& a = *rec->allocation;
   if (flags & ~(kLockReadOnly | kLockDoNotWait | kLockDiscard)) return status::kInvalidParameter;
   if (rec->locked) return status::kInvalidDeviceState;
-  if (a.is_depth()) return status::kNotSupported;
+  if (a.is_depth() || a.desc().samples != 1) return status::kNotSupported;
   uint64_t offset = 0, bytes = 0;
   if (!a.level_range(subresource, &offset, &bytes)) return status::kInvalidParameter;
   // Queued work that uses the allocation has to be done before the CPU may touch it. The queues run on their own as soon as they can, so what is still queued is waiting for a fence.
@@ -532,6 +533,41 @@ NtStatus Kernel::unlock(ProcessId pid, Handle allocation) {
   if (!rec->read_only) rec->allocation->manager().note_cpu_write(*rec->allocation);
   rec->allocation->manager().lock_released(*rec->allocation);
   rec->locked = false;
+  return status::kSuccess;
+}
+
+NtStatus Kernel::acquire_image(ProcessId pid, Handle allocation, AcquiredImage* out) {
+  kernel::ScopedMutex g(lock_);
+  Process* p = find_process(pid);
+  AllocRec* rec = p ? p->allocations.raw(allocation) : nullptr;
+  if (!rec || !out) return status::kInvalidHandle;
+  Allocation& a = *rec->allocation;
+  if (!a.is_image() || a.is_depth() || a.is_staging() || !(a.desc().flags & kAllocTexture) || !(a.desc().flags & kAllocRenderTarget)) return status::kNotSupported;
+  if (rec->locked || rec->acquired) return status::kInvalidDeviceState;
+  Adapter* adapter = nullptr;
+  for (UniquePointer<Adapter>& ad : adapters_.view())
+    if (&ad->vidmm() == &a.manager()) adapter = ad.get();
+  if (!adapter) return status::kInvalidDeviceState;
+  adapter->pump();
+  if (adapter->allocation_in_use(a)) return status::kGraphicsAllocationBusy;
+  const NtStatus s = a.manager().make_resident(a);
+  if (s != status::kSuccess) return s;
+  if (!a.image()) return status::kInvalidDeviceState;
+  a.manager().pin(a);
+  rec->acquired = true;
+  out->device = &adapter->device();
+  out->image = a.image();
+  return status::kSuccess;
+}
+
+NtStatus Kernel::release_image(ProcessId pid, Handle allocation) {
+  kernel::ScopedMutex g(lock_);
+  Process* p = find_process(pid);
+  AllocRec* rec = p ? p->allocations.raw(allocation) : nullptr;
+  if (!rec) return status::kInvalidHandle;
+  if (!rec->acquired) return status::kInvalidDeviceState;
+  rec->allocation->manager().unpin(*rec->allocation);
+  rec->acquired = false;
   return status::kSuccess;
 }
 
@@ -890,6 +926,11 @@ NtStatus Kernel::escape(ProcessId pid, Handle device, ConstByteView request, Byt
               t.src_alpha = static_cast<graphics::BlendFactor>(tsa), t.dst_alpha = static_cast<graphics::BlendFactor>(tda);
               t.color_op = static_cast<graphics::BlendOp>(tcop), t.alpha_op = static_cast<graphics::BlendOp>(taop);
               t.write_mask = static_cast<uint8_t>(tmask);
+            }
+            if (!in.at_end()) {   // (and, after that, whether coverage is per sample)
+              const uint32_t multisample = in.le32();
+              if (!in.ok() || multisample > 1) return status::kInvalidParameter;
+              desc.multisample = multisample != 0;
             }
           }
         }

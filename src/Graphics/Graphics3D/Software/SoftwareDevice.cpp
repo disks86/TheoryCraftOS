@@ -60,7 +60,7 @@ class SoftwareBuffer final : public IBuffer {
 class SoftwareImage final : public IImage {
  public:
   SoftwareImage(allocators::IAllocator& allocator, const ImageDesc& desc) : allocator_(allocator), desc_(desc) {
-    const uint64_t count = uint64_t{desc.extent.width} * desc.extent.height;
+    const uint64_t count = uint64_t{desc.extent.width} * desc.extent.height * desc.samples;   // (a multisampled image keeps its samples one after the other for each pixel)
     uint64_t total = count * layer_count();   // (layers: one level each)
     // The levels of a mipmapped image follow level 0 in the same storage, each as tight rows.
     for (uint32_t level = 1; level < desc.mip_levels && level < kMaxMipLevels; ++level) {
@@ -88,6 +88,8 @@ class SoftwareImage final : public IImage {
   }
   bool valid() const { return (!color_.empty() || !hdr_.empty() || !depth_.empty()) && (!desc_.stencil || !stencil_.empty()); }
   uint32_t mip_levels() const override { return desc_.mip_levels; }
+  uint32_t samples() const { return desc_.samples; }
+  ArrayView<uint32_t> all_samples() const { return color_; }
   uint32_t layer_count() const override { return desc_.kind == TextureKind::Texture2D ? 1 : desc_.kind == TextureKind::TextureCube ? 6 : desc_.layers; }
   TextureKind kind() const { return desc_.kind; }
   bool write_layer_pixels(uint32_t layer, ArrayView<const uint32_t> pixels) override {
@@ -109,12 +111,12 @@ class SoftwareImage final : public IImage {
   uint32_t usage() const { return desc_.usage; }
   bool read_pixels(ArrayView<uint32_t> out) override {
     const uint64_t count = uint64_t{desc_.extent.width} * desc_.extent.height;
-    if (color_.empty() || out.size() < count) return false;
+    if (color_.empty() || out.size() < count || desc_.samples > 1) return false;   // (a multisampled image is resolved first)
     Surface s = surface();
     for (uint64_t i = 0; i < count; ++i) out[i] = s.decode(color_[i]);
     return true;
   }
-  bool write_pixels(ArrayView<const uint32_t> pixels) override { return write_mip_pixels(0, pixels); }
+  bool write_pixels(ArrayView<const uint32_t> pixels) override { return desc_.samples == 1 && write_mip_pixels(0, pixels); }
   bool read_pixels_float(ArrayView<Vec4> out) override {
     if (hdr_.empty() || out.size() < hdr_.size()) return false;
     for (uint64_t i = 0; i < hdr_.size(); ++i) out[i] = hdr_[i];
@@ -163,7 +165,7 @@ class SoftwareImage final : public IImage {
     s.height = mip_extent(desc_.extent.height, level);
     if (!hdr_.empty()) s.floats = hdr_;
     else s.pixels = color_.subview(offset, uint64_t{s.width} * s.height);
-    s.pitch = s.width;
+    s.pitch = s.width * desc_.samples;   // (a multisampled image: the samples of a pixel are neighbours, so the pixel x is at x * samples)
     s.format = desc_.format;
     return s;
   }
@@ -457,6 +459,7 @@ struct DrawState {
   const uint8_t* constants = nullptr;
   uint8_t constants_storage[kMaxPushConstantBytes] = {};
   uint32_t primitive_id = 0;   // the primitive of the draw being rasterized (SV_PrimitiveID)
+  uint32_t sample_count = 1;   // samples per pixel of the pass's images
   uint64_t* samples = nullptr; // the open occlusion query's count: one more for every fragment that passes the stencil and depth tests
 };
 
@@ -576,12 +579,13 @@ Vec4 blend_float(const BlendState& b, bool over, Vec4 source, Vec4 destination) 
 }
 
 // Stencil test, depth write, blend and store of a shaded fragment of the pixel (x, y); depth_ok is the depth test's verdict.
-void write_fragment(const DrawState& s, int32_t x, int32_t y, float z, bool depth_ok, const Vec4* colors) {
+void write_fragment(const DrawState& s, int32_t x, int32_t y, float z, bool depth_ok, const Vec4* colors, uint32_t sample = 0) {
   const GraphicsPipelineDesc& pd = s.pipeline->desc();
   const ArrayView<float> depth = s.depth ? s.depth->depth() : ArrayView<float>();
   const ArrayView<uint8_t> stencil = s.depth ? s.depth->stencil() : ArrayView<uint8_t>();
   const bool stencil_on = pd.stencil.enable && !stencil.empty();
-  const uint64_t index = uint64_t{static_cast<uint32_t>(y)} * s.color->extent().width + static_cast<uint32_t>(x);
+  const uint32_t samples = s.sample_count;
+  const uint64_t index = (uint64_t{static_cast<uint32_t>(y)} * s.color->extent().width + static_cast<uint32_t>(x)) * samples + sample;   // (the sample's place in the depth and stencil planes)
   if (stencil_on) {
     // The stencil test comes first, then the depth test; each outcome has its own op (a fragment the shader discarded changed nothing).
     const StencilState& st = pd.stencil;
@@ -608,7 +612,7 @@ void write_fragment(const DrawState& s, int32_t x, int32_t y, float z, bool dept
       continue;
     }
     uint32_t out = pack_color(colors[n]);
-    uint32_t* pixel = surface.row(static_cast<uint32_t>(y)) + x;
+    uint32_t* pixel = surface.row(static_cast<uint32_t>(y)) + uint64_t{static_cast<uint32_t>(x)} * samples + sample;
     if (blend.custom) out = blend_pixel(blend, out, surface.decode(*pixel));
     else if (over) out = blend_over(out, surface.decode(*pixel));
     *pixel = surface.encode(out);
@@ -622,6 +626,15 @@ bool run_fragment_shader(const DrawState& s, const Vec4* varying, const Fragment
   if (s.pipeline->textured()) return s.pipeline->textured()(varying, s.constants, s.textures, color);
   return s.pipeline->fragment()(varying, s.constants, color);
 }
+
+// Where the samples of a pixel are, in sixteenths of a pixel from its centre (+y down): the standard patterns of Direct3D 10.
+struct SamplePosition {
+  int8_t x, y;
+};
+constexpr SamplePosition kSamples2[2] = {{4, 4}, {-4, -4}};
+constexpr SamplePosition kSamples4[4] = {{-2, -6}, {6, -2}, {-6, 2}, {2, 6}};
+constexpr SamplePosition kSamples8[8] = {{1, -3}, {-1, 3}, {5, 1}, {-3, -5}, {-5, 5}, {-7, -1}, {3, 7}, {7, -7}};
+inline const SamplePosition* sample_positions(uint32_t count) { return count == 2 ? kSamples2 : count == 4 ? kSamples4 : kSamples8; }
 
 // An edge is "top" or "left" when pixels exactly on it belong to the triangle.
 inline bool owns_edge(float dx, float dy) { return dy < 0 || (dy == 0 && dx > 0); }
@@ -687,8 +700,40 @@ void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVert
   };
   const bool lod_pass = s.pipeline->samples_textures() && s.textures.uses_lod();
 
+  // Per row, the columns that can be inside: each edge value is linear in x, so it is solved for where it turns non-negative and the range is widened by two pixels, which covers the
+  // rounding. The exact tests below still decide every pixel, so the picture is the one a full scan of the bounding box gives. (Far off-screen vertices make the solving imprecise: no trimming.)
+  const bool trim = fx0 > -1e5f && fx1 < 1e5f && fy0 > -1e5f && fy1 < 1e5f;
+  struct EdgeLine {
+    float vx, vy, dx, dy;
+  };
+  const EdgeLine edges[3] = {{v1->x, v1->y, e0dx, e0dy}, {v2->x, v2->y, e1dx, e1dy}, {v0->x, v0->y, e2dx, e2dy}};
+  const uint32_t target_width = s.color->extent().width;
+
   for (int32_t y = min_y; y < max_y; ++y) {
-    for (int32_t x = min_x; x < max_x; ++x) {
+    int32_t row_begin = min_x, row_end = max_x;
+    if (trim) {
+      const float row_y = y + 0.5f;
+      bool empty = false;
+      for (const EdgeLine& e : edges) {
+        const float t = (row_y - e.vy) * e.dx;   // (the edge value is t - (px - vx) * dy, to be >= 0)
+        if (e.dy == 0) {
+          if (t < 0) empty = true;
+        } else {
+          const float bound = e.vx + t / e.dy - 0.5f;   // (the x whose pixel centre has the value zero)
+          if (e.dy < 0) {   // the value grows with x: it is non-negative from the bound on
+            const float lo = bound - 2.0f;
+            if (lo >= static_cast<float>(row_end)) empty = true;
+            else if (lo > static_cast<float>(row_begin)) row_begin = static_cast<int32_t>(lo);
+          } else {   // it shrinks with x: non-negative up to the bound
+            const float hi = bound + 3.0f;
+            if (hi <= static_cast<float>(row_begin)) empty = true;
+            else if (hi < static_cast<float>(row_end)) row_end = static_cast<int32_t>(hi);
+          }
+        }
+      }
+      if (empty || row_begin >= row_end) continue;
+    }
+    for (int32_t x = row_begin; x < row_end; ++x) {
       const float px = x + 0.5f, py = y + 0.5f;
       const float w0 = (px - v1->x) * e0dy - (py - v1->y) * e0dx;
       const float w1 = (px - v2->x) * e1dy - (py - v2->y) * e1dx;
@@ -696,15 +741,39 @@ void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVert
       // With y down and a positive area, an interior point has all three edge values <= 0 in this
       // formulation, so flip the sign to get weights.
       const float l0 = -w0, l1 = -w1, l2 = -w2;
-      if (l0 < 0 || l1 < 0 || l2 < 0) continue;
-      if ((l0 == 0 && !own0) || (l1 == 0 && !own1) || (l2 == 0 && !own2)) continue;
+      const uint32_t sample_count = s.sample_count;
+      // Which samples the triangle covers, and the depth at each (a pixel with one sample per pixel is the centre; a multisampled pass without multisample covers all or none by the centre).
+      uint32_t covered = 0;
+      float sample_z[8];
+      auto weights_inside = [&](float a0, float a1, float a2) {
+        if (a0 < 0 || a1 < 0 || a2 < 0) return false;
+        return !((a0 == 0 && !own0) || (a1 == 0 && !own1) || (a2 == 0 && !own2));
+      };
+      if (sample_count > 1 && pd.multisample) {
+        const SamplePosition* positions = sample_positions(sample_count);
+        for (uint32_t k = 0; k < sample_count; ++k) {
+          const float sx = px + static_cast<float>(positions[k].x) * (1.0f / 16.0f), sy = py + static_cast<float>(positions[k].y) * (1.0f / 16.0f);
+          const float a0 = -((sx - v1->x) * e0dy - (sy - v1->y) * e0dx), a1 = -((sx - v2->x) * e1dy - (sy - v2->y) * e1dx), a2 = -((sx - v0->x) * e2dy - (sy - v0->y) * e2dx);
+          if (!weights_inside(a0, a1, a2)) continue;
+          covered |= 1u << k;
+          sample_z[k] = (a0 * v0->z + a1 * v1->z + a2 * v2->z) * inv_area;
+        }
+        if (!covered) continue;
+      } else {
+        if (!weights_inside(l0, l1, l2)) continue;
+        covered = (1u << sample_count) - 1;
+        const float centre_z = (l0 * v0->z + l1 * v1->z + l2 * v2->z) * inv_area;
+        for (uint32_t k = 0; k < sample_count; ++k) sample_z[k] = centre_z;
+      }
       const float b0 = l0 * inv_area, b1 = l1 * inv_area, b2 = l2 * inv_area;
 
-      const uint64_t index = uint64_t{static_cast<uint32_t>(y)} * s.color->extent().width + static_cast<uint32_t>(x);
+      const uint64_t index = uint64_t{static_cast<uint32_t>(y)} * target_width + static_cast<uint32_t>(x);
       const float z = b0 * v0->z + b1 * v1->z + b2 * v2->z;
-      bool depth_ok = true;
-      if (pd.depth_test && !depth.empty()) depth_ok = depth_passes(pd.depth_compare, z, depth[index]);
-      if (!depth_ok && !stencil_on) continue;   // (with a stencil test the depth result is needed after the shader)
+      uint32_t depth_pass = covered;   // (the samples that pass the depth test)
+      if (pd.depth_test && !depth.empty())
+        for (uint32_t k = 0; k < sample_count; ++k)
+          if ((covered >> k & 1) && !depth_passes(pd.depth_compare, sample_z[k], depth[index * sample_count + k])) depth_pass &= ~(1u << k);
+      if (!depth_pass && !stencil_on) continue;   // (with a stencil test the depth result is needed after the shader)
 
       // Perspective-correct varyings: weights scaled by 1/w.
       const float p0 = b0 * v0->inv_w, p1 = b1 * v1->inv_w, p2 = b2 * v2->inv_w;
@@ -746,7 +815,8 @@ void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVert
       context.front_facing = front;
       context.primitive_id = s.primitive_id;
       if (!run_fragment_shader(s, varying, context, color)) continue;
-      write_fragment(s, x, y, z, depth_ok, color);
+      for (uint32_t k = 0; k < sample_count; ++k)
+        if (covered >> k & 1) write_fragment(s, x, y, sample_z[k], (depth_pass >> k & 1) != 0, color, k);
     }
   }
 }
@@ -759,16 +829,19 @@ void fragment_at(const DrawState& s, int32_t x, int32_t y, float z, float inv_w,
   if (x < 0 || y < 0 || static_cast<uint32_t>(x) >= target.width || static_cast<uint32_t>(y) >= target.height) return;
   const ArrayView<float> depth = s.depth ? s.depth->depth() : ArrayView<float>();
   const uint64_t index = uint64_t{static_cast<uint32_t>(y)} * s.color->extent().width + static_cast<uint32_t>(x);
-  bool depth_ok = true;
-  if (pd.depth_test && !depth.empty()) depth_ok = depth_passes(pd.depth_compare, z, depth[index]);
-  if (!depth_ok && !(pd.stencil.enable && s.depth && !s.depth->stencil().empty())) return;
+  const uint32_t sample_count = s.sample_count;   // (a line or point covers every sample of its pixel)
+  uint32_t depth_pass = (1u << sample_count) - 1;
+  if (pd.depth_test && !depth.empty())
+    for (uint32_t k = 0; k < sample_count; ++k)
+      if (!depth_passes(pd.depth_compare, z, depth[index * sample_count + k])) depth_pass &= ~(1u << k);
+  if (!depth_pass && !(pd.stencil.enable && s.depth && !s.depth->stencil().empty())) return;
   FragmentContext context;
   context.position = {static_cast<float>(x) + 0.5f, static_cast<float>(y) + 0.5f, z, inv_w};
   context.front_facing = true;
   context.primitive_id = s.primitive_id;
   Vec4 color[kMaxColorTargets];
   if (!run_fragment_shader(s, varying, context, color)) return;
-  write_fragment(s, x, y, z, depth_ok, color);
+  for (uint32_t k = 0; k < sample_count; ++k) write_fragment(s, x, y, z, (depth_pass >> k & 1) != 0, color, k);
 }
 
 ScreenVertex to_screen(const DrawState& s, const ClipVertex& v, uint32_t varyings) {
@@ -894,6 +967,13 @@ IImage* SoftwareDevice::create_image(const ImageDesc& desc) {
   if (!desc.extent.width || !desc.extent.height || desc.format == Format::Undefined) return nullptr;
   // Levels need a colour image to sample, and no more than the extent has.
   if (desc.mip_levels == 0 || desc.mip_levels > mip_level_limit(desc.extent) || desc.mip_levels > kMaxMipLevels || (desc.mip_levels > 1 && (desc.format == Format::D32Float || !(desc.usage & kImageSampled)))) return nullptr;
+  if (desc.samples != 1) {
+    // (a multisampled image is an 8-bit colour or a depth attachment, alone, of one level)
+    const bool depth = desc.format == Format::D32Float;
+    if ((desc.samples != 2 && desc.samples != 4 && desc.samples != 8) || desc.mip_levels != 1 || desc.kind != TextureKind::Texture2D || is_float_format(desc.format) ||
+        desc.usage != (depth ? kImageDepthAttachment : kImageColorAttachment))
+      return nullptr;
+  }
   if (desc.kind != TextureKind::Texture2D) {
     // (layered images are sampled only: one level, 8-bit colour)
     const uint32_t layers = desc.kind == TextureKind::TextureCube ? 6 : desc.layers;
@@ -987,13 +1067,15 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
         s.depth = static_cast<SoftwareImage*>(cmd.pass.depth);
         if (!(s.color->usage() & kImageColorAttachment) || s.color->format() == Format::D32Float) return false;
         if (s.depth && s.depth->format() != Format::D32Float) return false;
+        s.sample_count = s.color->samples();
+        if (s.depth && s.depth->samples() != s.sample_count) return false;
         const Extent2D e = s.color->extent();
         if (s.depth && (s.depth->extent().width != e.width || s.depth->extent().height != e.height)) return false;
         for (SoftwareImage*& extra : s.extra_colors) extra = nullptr;
         for (uint32_t n = 0; n + 1 < kMaxColorTargets && cmd.pass.extra_colors[n]; ++n) {
           SoftwareImage* image = static_cast<SoftwareImage*>(cmd.pass.extra_colors[n]);
           if (!(image->usage() & kImageColorAttachment) || image->format() == Format::D32Float || image == s.color || image == s.depth) return false;
-          if (image->extent().width != e.width || image->extent().height != e.height) return false;
+          if (image->extent().width != e.width || image->extent().height != e.height || image->samples() != s.sample_count) return false;
           for (uint32_t k = 0; k < n; ++k)
             if (s.extra_colors[k] == image) return false;
           s.extra_colors[n] = image;
@@ -1008,14 +1090,11 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
               continue;
             }
             const uint32_t v = surface.encode(pack_color(cmd.pass.clear_color_value));
-            for (uint32_t y = 0; y < e.height; ++y)
-              for (uint32_t x = 0; x < e.width; ++x) surface.row(y)[x] = v;
+            image->all_samples().fill(v);   // (every sample of every pixel; the rows of a plain image are tight)
           }
         }
-        if (s.depth && cmd.pass.clear_depth)
-          for (float& d : s.depth->depth()) d = cmd.pass.clear_depth_value;
-        if (s.depth && cmd.pass.clear_stencil)
-          for (uint8_t& v : s.depth->stencil()) v = cmd.pass.clear_stencil_value;
+        if (s.depth && cmd.pass.clear_depth) s.depth->depth().fill(cmd.pass.clear_depth_value);
+        if (s.depth && cmd.pass.clear_stencil) s.depth->stencil().fill(cmd.pass.clear_stencil_value);
         s.viewport = {0, 0, static_cast<float>(e.width), static_cast<float>(e.height), 0, 1};
         s.scissor = {0, 0, e.width, e.height};
         s.pipeline = nullptr;
@@ -1026,6 +1105,28 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
         if (query_open) return false;
         in_pass = false;
         break;
+      case RecordedCommand::Type::Resolve: {
+        // The samples of each pixel averaged (to the nearest, per channel) into the single-sample image.
+        SoftwareImage* to = static_cast<SoftwareImage*>(cmd.image);
+        const SoftwareImage* from = static_cast<const SoftwareImage*>(cmd.image2);
+        if (in_pass || !to || !from || to->samples() != 1 || from->samples() < 2 || to->format() != from->format() || is_float_format(to->format()) || to->format() == Format::D32Float ||
+            to->extent().width != from->extent().width || to->extent().height != from->extent().height)
+          return false;
+        const Surface out = to->surface(), in = from->surface();
+        const uint32_t n = from->samples();
+        for (uint32_t y = 0; y < out.height; ++y)
+          for (uint32_t x = 0; x < out.width; ++x) {
+            uint32_t sum[4] = {};
+            for (uint32_t k = 0; k < n; ++k) {
+              const uint32_t argb = in.decode(in.row(y)[uint64_t{x} * n + k]);
+              for (uint32_t c = 0; c < 4; ++c) sum[c] += (argb >> (8 * c)) & 0xFF;
+            }
+            uint32_t argb = 0;
+            for (uint32_t c = 0; c < 4; ++c) argb |= ((sum[c] + n / 2) / n) << (8 * c);
+            out.row(y)[x] = out.encode(argb);
+          }
+        break;
+      }
       case RecordedCommand::Type::BindComputePipeline:
         if (in_pass) return false;
         compute = static_cast<const SoftwareComputePipeline*>(cmd.pipeline);

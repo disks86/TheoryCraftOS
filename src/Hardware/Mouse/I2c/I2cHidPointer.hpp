@@ -40,7 +40,7 @@ class I2cHidPointer final : public IMouse {
   enum class Kind : uint8_t { None, Touchpad, Touchscreen, Mouse };
   static constexpr uint32_t kMaxContacts = 10, kQueue = 64;
 
-  I2cHidPointer(allocators::IAllocator& allocator, II2cBus& bus, uint16_t address, uint16_t descriptor_register, IClock& clock, const char* name)
+  I2cHidPointer(allocators::IAllocator& allocator, II2cMaster& bus, uint16_t address, uint16_t descriptor_register, IClock& clock, const char* name)
       : device_(allocator, bus, address, descriptor_register), map_(allocator), clock_(clock), name_(name) {}
 
   void set_attention(IAttentionLine* line) { attention_ = line; }

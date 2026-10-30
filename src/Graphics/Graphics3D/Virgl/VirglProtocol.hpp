@@ -39,6 +39,7 @@ enum Command : uint32_t {
   kSetStencilRef,
   kSetBlendColor,
   kSetScissorState,
+  kBlit = 16,
   kBindSamplerStates = 18,
   kBeginQuery = 19,
   kEndQuery = 20,

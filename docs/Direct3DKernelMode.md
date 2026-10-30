@@ -40,7 +40,7 @@ backing: their contents are lost on eviction, and they cannot be locked. Formats
 ## The command stream
 
 Packets of little-endian words, `op | size << 16` then the payload (full layout in `CommandStream.hpp`): `BeginPass`, `EndPass`, `BindPipeline`, `BindVertexBuffer`,
-`BindIndexBuffer`, `PushConstants`, `BindTexture`, `SetViewport`, `SetScissor`, `Draw`, `DrawIndexed`, `CopyRegion`, `GenerateMipmaps`, `BeginQuery`, `EndQuery`, `BindUav`, `Dispatch`. Allocations are named by index into
+`BindIndexBuffer`, `PushConstants`, `BindTexture`, `SetViewport`, `SetScissor`, `Draw`, `DrawIndexed`, `CopyRegion`, `GenerateMipmaps`, `BeginQuery`, `EndQuery`, `BindUav`, `Dispatch`, `ResolveRegion`. Allocations are named by index into
 the allocation list passed with the stream, pipelines by handle. `render()` copies the stream, **validates all of it** (packet sizes, indices, flags, finite floats, pass /
 pipeline / buffer / texture state, ranges of draws against buffer sizes, a pass never draws into a bound texture, copies inside the images) and queues it; nothing is queued if
 it is wrong. When it runs, index values are checked against the vertex buffer (the buffer can change after the stream was checked); a failure there loses the context.
@@ -137,11 +137,11 @@ The kernel-mode driver is the D3DKMT layer, which Direct3D 9, 10, 11 and 12 all 
 
 ## Conformance on a real GPU
 
-`Conformance.cpp` (`dxgk::run_conformance`) draws 35 small scenes through the services on one adapter and on the CPU renderer and compares the 32 x 32 pictures: Direct3D 9 vertex colours, Shader
+`Conformance.cpp` (`dxgk::run_conformance`) draws 36 small scenes through the services on one adapter and on the CPU renderer and compares the 32 x 32 pictures: Direct3D 9 vertex colours, Shader
 Model 1 and 3 bytecode, depth, alpha blend, indexed draws, viewport and scissor, culling and winding (into a target, a texture and a back buffer), copies; Direct3D 10 constant buffers
 (also 1 KiB, indexed by an integer register), point and linear textures, pixel shader arithmetic, `Load` / `SampleLevel` / `GetDimensions` with `SV_Position` and `SV_IsFrontFace` (into a
 texture and into a back buffer, whose rows are stored the other way up), strips, blend state, depth comparison, stencil, lines and points, per-instance attributes, `SV_InstanceID` /
-`SV_VertexID`, two render targets (`SV_Target0` / `SV_Target1`, the render pass takes up to four colour images: `kFeatureMultipleTargets`, `CommandWriter::begin_pass_targets`, `PipelineDesc::color_target_count`); half-float and float render targets that are then sampled (`A16B16G16R16F` / `A32B32G32R32F`, additive blending that exceeds 1.0; `kFeatureFloatFormats` on the CPU renderer and virgl, one mip level, no present; the memory manager converts the backing to and from `Vec4`); occlusion queries (a near quad, then three queried quads: in the open, half behind it, wholly behind it - the counts 256 / 128 / 0 are drawn as the colour of three stripes); a compute shader with unordered access views (`cs_fill`: 4 x 8 groups of 8 x 4 threads fill a 32 x 32 picture in a structured buffer from `SV_DispatchThreadID` / `SV_GroupID` / `SV_GroupIndex`, with atomic counters that must reach 1024); independent blend per render target (target 0 adds, target 1 does not blend; `kFeatureIndependentBlend`, `PipelineDesc::independent_blend` / `target_blend`, the escape ABI's trailing words); a volume, an array and a cube texture sampled by `Texture3D` / `Texture2DArray` / `TextureCube` pixel shaders (`kFeatureTextureKinds`); Direct3D 11 render to texture. A scene is *Same*, *Differs*, *Refused* (the device says `kNotSupported`: a program can fall back) or *Broken* (a step failed or the context was
+`SV_VertexID`, two render targets (`SV_Target0` / `SV_Target1`, the render pass takes up to four colour images: `kFeatureMultipleTargets`, `CommandWriter::begin_pass_targets`, `PipelineDesc::color_target_count`); half-float and float render targets that are then sampled (`A16B16G16R16F` / `A32B32G32R32F`, additive blending that exceeds 1.0; `kFeatureFloatFormats` on the CPU renderer and virgl, one mip level, no present; the memory manager converts the backing to and from `Vec4`); occlusion queries (a near quad, then three queried quads: in the open, half behind it, wholly behind it - the counts 256 / 128 / 0 are drawn as the colour of three stripes); 4x multisampling (a far and a near rectangle with fractional edges, depth tested per sample, resolved into a plain image and into a texture-capable one); a compute shader with unordered access views (`cs_fill`: 4 x 8 groups of 8 x 4 threads fill a 32 x 32 picture in a structured buffer from `SV_DispatchThreadID` / `SV_GroupID` / `SV_GroupIndex`, with atomic counters that must reach 1024); independent blend per render target (target 0 adds, target 1 does not blend; `kFeatureIndependentBlend`, `PipelineDesc::independent_blend` / `target_blend`, the escape ABI's trailing words); a volume, an array and a cube texture sampled by `Texture3D` / `Texture2DArray` / `TextureCube` pixel shaders (`kFeatureTextureKinds`); Direct3D 11 render to texture. A scene is *Same*, *Differs*, *Refused* (the device says `kNotSupported`: a program can fall back) or *Broken* (a step failed or the context was
 lost); a scene in which the reference draws nothing is Broken too. The system runs it at boot on each accelerated GPU and logs one line per scene (`Direct3D: ...`); the host test runs it on
 two software adapters (all the same) and on a device that is told it has no Direct3D 10 features (those scenes are refused). The DXBC fixtures are compiled by Wine's d3dcompiler
 (`tests/data/dxbc/*.hlsl`, `scripts/gen_conformance_blobs.py` writes `ConformanceBlobs.hpp`).
@@ -212,6 +212,18 @@ transfers what the shader wrote. The device claims `kFeatureCompute` only when t
 (Wine's) has no `ByteAddressBuffer` methods, so the raw-buffer path is tested with a shader written token by token (`test_compute`); the conformance shader uses structured buffers.
 The conformance run on virglrenderer is the only check of the TGSI path against a real host.
 
+## Multisampling
+
+An allocation with `samples` 2, 4 or 8 (the adapter's `kFeatureMultisample`; `DeviceInfo::sample_counts` says which) is a render target of an 8-bit colour format or a depth buffer, nothing
+else: no system-memory backing (so no lock, copy, texture or present), one level. Every image of a pass has the same count. `ResolveRegion destination, source` (outside a pass) averages the
+samples of a multisampled colour target into an ordinary image of the same format and size - a render target, a texture, a back buffer. Coverage is per sample when the pipeline says
+`multisample` (D3D10 `MultisampleEnable`): a triangle covers the samples whose standard Direct3D positions (2x: (4,4) (-4,-4); 4x: (-2,-6) (6,-2) (-6,2) (2,6); 8x as in `SoftwareDevice.cpp`, in
+sixteenths of a pixel) it contains, depth and stencil are tested for each, the shader runs once per pixel at its centre, and the colour goes to the covered samples that pass; without
+`multisample` the pixel is all or nothing by its centre. Lines and points cover every sample. Occlusion queries count samples. The contents of a multisampled image do not survive being
+evicted from video memory (there is nothing to read them back into). virgl: resources with `nr_samples`, the rasterizer's multisample bit, and `VIRGL_CCMD_BLIT` for the resolve (the host
+keeps a multisampled image the GL way up whatever flag it was made with, so the blit turns the picture over only for a destination kept upright); 2 and 4 samples, as far as the host's
+`max_samples` goes. The conformance scene uses only vertical and horizontal edges, which every device with the standard patterns covers the same whatever the order of the samples.
+
 ## Not done
 
 - **The user-mode half and the system-call glue**: no `NtGdiDdDDI*` services in `src/Process/Windows*.cpp` / `win32u`, no d3d9 / dxgi / d3d11 DLLs. `lock()` returns a view of
@@ -219,7 +231,7 @@ The conformance run on virglrenderer is the only check of the TGSI path against 
 - **Shaders**: SM2 / SM3 / SM4 / SM5.0 / SM5.1 vertex and pixel shaders (no geometry / tessellation / compute shaders, no 5.1 register spaces or arrays of resources). The pixel stage of Intel Gen9 is two fixed kernels, so a general pixel
   shader runs there only on the software, virgl (as unvalidated TGSI) and SVGA3D (unvalidated) paths. No loops, calls, predication, ps_1_x, constants above c7 (push constants are
   128 bytes), depth output, fog / point size, cube and volume samplers. Pipeline state is limited to what `IGraphicsDevice` offers (one colour target, 2 textures, alpha blend on/off, depth and stencil).
-- No stream-out, no UAV textures, no group-shared memory or barriers (a compute shader that needs `sync` or `dcl_tgsm` is refused), no multisampling, no mipmapped / render-target / float cube, volume or array textures, no sRGB / integer / 16-bit unorm formats.
+- No stream-out, no UAV textures, no group-shared memory or barriers (a compute shader that needs `sync` or `dcl_tgsm` is refused), no multisampled shader resources (`Texture2DMS`, `ld2dms`), no depth resolve, no alpha-to-coverage or sample mask, no per-sample shading, no centroid interpolation, no mipmapped / render-target / float cube, volume or array textures, no sRGB / integer / 16-bit unorm formats.
 - Sync objects cannot be shared between processes. No timeout detection and recovery (a hung device cannot be reset), no vblank / scan line, gamma, overlays or VidPN topology
   (multi-monitor); display mode listing and switching go straight to the GPU driver.
 - Video memory is accounted per adapter but there is no per-process budget or priority-based paging between processes.

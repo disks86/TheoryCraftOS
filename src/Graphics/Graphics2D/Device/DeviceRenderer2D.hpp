@@ -43,8 +43,9 @@ namespace graphics {
 // opacity is applied to each shape (overlapping shapes show through each other). copy_rect reads the frame back.
 //
 // Differences from the CPU renderer: lines are one-pixel-wide quads and circles
-// are polygons, so their pixels are not identical; draw_image costs one rectangle
-// per run of equal pixels (there are no textures yet), so keep images small.
+// are polygons, so their pixels are not identical. draw_image of a large picture goes up as a texture and is one
+// textured rectangle (the device samples it at pixel centres, so the pixels are the picture's); a small one, or one drawn
+// under a layer's opacity, costs a rectangle per run of equal pixels.
 class DeviceRenderer2D final : public IRenderer2D {
  public:
   DeviceRenderer2D(IGraphicsDevice& device, allocators::IAllocator& allocator, Extent2D extent);
@@ -85,6 +86,7 @@ class DeviceRenderer2D final : public IRenderer2D {
   bool push_layer(const Rect2D& bounds, uint8_t opacity) override;
   void pop_layer() override;
   bool copy_rect(const Rect2D& source, int32_t dest_x, int32_t dest_y) override;
+  bool draw_device_image(IGraphicsDevice& owner, IImage& image, const Rect2D& source, int32_t x, int32_t y) override;
   void present() override;
 
   // The color to draw for a pixel with `cov` (0..255) coverage; false: draw nothing (used by the rounded-rect helpers).
@@ -110,6 +112,9 @@ class DeviceRenderer2D final : public IRenderer2D {
   void quad(float x0, float y0, float x1, float y1, uint32_t color);  // axis-aligned, corners
   void close_range();   // ends the run in progress (when the clip or blend mode changes)
   bool submit_pending();  // sends everything recorded to the device
+  bool draw_texture(const Surface& source, const Rect2D& rect, int32_t x, int32_t y);  // `rect` of the picture as one textured rectangle; false: not done
+  bool ensure_texture(uint32_t width, uint32_t height);
+  bool draw_textured_quad(IImage& image, int64_t dx, int64_t dy, uint32_t w, uint32_t h, float u0, float v0, float u1, float v1);
 
   IGraphicsDevice& device_;
   allocators::IAllocator& allocator_;
@@ -119,6 +124,15 @@ class DeviceRenderer2D final : public IRenderer2D {
   IPipeline* blended_ = nullptr;
   IPipeline* opaque_ = nullptr;
   IBuffer* vertices_ = nullptr;
+  // Pictures as textures: the textured pair of pipelines, six vertices for the rectangle, the texture (kept while pictures stay the same size) and the rows it is filled from.
+  IShaderModule* texture_vs_ = nullptr;
+  IShaderModule* texture_fs_ = nullptr;
+  IPipeline* texture_blended_ = nullptr;
+  IPipeline* texture_opaque_ = nullptr;
+  IBuffer* texture_vertices_ = nullptr;
+  IImage* texture_ = nullptr;
+  Extent2D texture_extent_;
+  ArrayView<uint32_t> texture_rows_;
   // Double buffered: frames are drawn into images_[back_] and present() shows that image and then draws into the other, so the screen
   // never shows a half-drawn frame. (Every frame must repaint all of the target: the back image holds the frame before last.)
   IImage* images_[2] = {};

@@ -60,10 +60,16 @@ class IWaitHook {
 //                    write, reference: one word each)                                                                                       reply: handle
 //                    (optionally, after that: depth_compare, blend custom, enable, source colour, destination colour, source alpha, destination alpha factors, colour op, alpha op,
 //                    write mask, per-instance bits of the attributes, then the number of colour outputs, then for independent blending a flag and the nine words
-//                    (custom, enable, four factors, two ops, write mask) of the blend state of each of targets 1 .. 3 - one word each)
+//                    (custom, enable, four factors, two ops, write mask) of the blend state of each of targets 1 .. 3, then multisample - one word each)
 //   DestroyShader / DestroyPipeline   handle
 //   CreateComputePipeline   shader (a Compute stage shader)                                                                           reply: handle
 enum class EscapeOp : uint32_t { CreateShader = 1, CreatePipeline = 2, DestroyShader = 3, DestroyPipeline = 4, CreateComputePipeline = 5 };
+
+// A render target lent to a compositor that draws on the same device (Kernel::acquire_image).
+struct AcquiredImage {
+  graphics::IGraphicsDevice* device = nullptr;
+  graphics::IImage* image = nullptr;
+};
 
 class Kernel {
  public:
@@ -117,6 +123,11 @@ class Kernel {
   // The CPU's view of one subresource (a mip level; 0 for a buffer). The view is the allocation's system-memory backing and stays valid until unlock().
   NtStatus lock(ProcessId pid, Handle allocation, uint32_t flags, uint32_t subresource, LockResult* out);
   NtStatus unlock(ProcessId pid, Handle allocation);
+  // Lends the device's own image of a render target made with kAllocRenderTarget | kAllocTexture, so that something drawing on the same device (the desktop's 2D renderer) can sample the
+  // picture in place instead of the CPU reading it back and sending it again. Queued work on it is done first and the allocation is resident and stays so (pinned) until
+  // release_image(); the CPU must not lock it meanwhile. Not for a staging, depth or non-texture allocation (kNotSupported).
+  NtStatus acquire_image(ProcessId pid, Handle allocation, AcquiredImage* out);
+  NtStatus release_image(ProcessId pid, Handle allocation);
   // Residency of a list of allocations. make_resident reports kGraphicsNoVideoMemory if they cannot all be on the GPU at once.
   NtStatus make_resident(ProcessId pid, Handle device, ArrayView<const Handle> allocations);
   NtStatus evict(ProcessId pid, Handle device, ArrayView<const Handle> allocations);
