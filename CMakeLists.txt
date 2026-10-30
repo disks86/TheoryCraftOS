@@ -76,6 +76,9 @@ add_executable(BOOTX64
   src/Hardware/CentralProcessingUnit/Zhaoxin/ZhaoxinGenerations.cpp
   src/Hardware/CentralProcessingUnit/SystemCpu.cpp
   src/Hardware/CentralProcessingUnit/CpuTemperature.cpp
+  src/Hardware/Power/CpuPower.cpp
+  src/Hardware/Power/PowerManager.cpp
+  src/Hardware/Power/Thermal.cpp
   src/Hardware/CentralProcessingUnit/X86_64Cpu.S
   src/Hardware/IoPort.cpp
   src/Hardware/RandomAccessMemory/UefiRandomAccessMemory.cpp
@@ -1132,6 +1135,10 @@ endif()
 option(TCOS_INTEL_WIFI "Start the Intel Wireless-AC 9000 series card (firmware from /firmware, initialisation, hardware address and channels; no scanning or joining yet; not yet run on a real card)" OFF)
 if(TCOS_INTEL_WIFI)
   target_compile_definitions(BOOTX64 PRIVATE TCOS_INTEL_WIFI)
+endif()
+option(TCOS_POWER "Power management: Intel hardware P-states / SpeedStep under a profile that follows the battery, MWAIT idle states, thermal throttling and shutdown at the critical temperature; not yet run on a real machine" OFF)
+if(TCOS_POWER)
+  target_compile_definitions(BOOTX64 PRIVATE TCOS_POWER)
 endif()
 option(TCOS_ISH "Start the Intel Integrated Sensor Hub (PCI 8086:9D35 / A135): resets its IPC, brings up ISHTP and the HID client, adds the sensors to the sensor hub; not yet run on a real machine" OFF)
 if(TCOS_ISH)
