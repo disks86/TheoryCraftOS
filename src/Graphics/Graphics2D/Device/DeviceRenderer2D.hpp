@@ -83,6 +83,10 @@ class DeviceRenderer2D final : public IRenderer2D {
   bool draw_image_transformed(const Surface& source, const Rect2D& source_rect, const Matrix2D& m, ImageFilter filter) override;
   bool begin_group(const Rect2D& bounds) override;
   bool end_group(const Matrix2D& m, uint8_t opacity, ImageFilter filter) override;
+  bool supports_group_filters() const override { return filters_ok_ && groups_ok_; }
+  bool begin_filter_group(const Rect2D& bounds) override;
+  bool group_blur(float sigma) override;
+  bool group_color(const ColorTransform& t) override;
   void draw_image_scaled(const Surface& source, const RectF& source_rect, const Rect2D& dest, ImageFilter filter) override;
   void fill_linear_gradient(const Rect2D& rect, Vec2 from, Vec2 to, ArrayView<const GradientStop> stops) override;
   void fill_radial_gradient(const Rect2D& rect, Vec2 center, Vec2 radii, ArrayView<const GradientStop> stops) override;
@@ -140,6 +144,9 @@ class DeviceRenderer2D final : public IRenderer2D {
   Extent2D target_extent() const;
   Rect2D to_target(const Rect2D& clip) const;   // a clip rectangle in target coordinates, in the coordinates of the current image
   void fill_matrix(Mat4* mvp) const;
+  bool open_group(const Rect2D& bounds, bool detached);   // begin_group / begin_filter_group
+  bool filter_pass(IPipeline* pipeline, void* constants, uint32_t size, bool horizontal_unused);   // the top group's image through `pipeline` into a new image (which replaces it)
+  bool blur_pass(int32_t radius, bool horizontal);
   IPipeline* colored_pipeline(BlendMode mode) const;
   IPipeline* textured_pipeline(BlendMode mode) const;
 
@@ -198,6 +205,9 @@ class DeviceRenderer2D final : public IRenderer2D {
     float opacity = 1.0f;          // the renderer's per-shape opacity outside the group
     bool layer = false;            // from push_layer: its opacity is applied when it ends
     uint8_t layer_opacity = 255;
+    bool detached = false;         // a filter group: its clip is its bounds alone
+    uint32_t prev_detach = 0xFFFFFFFFu;      // detach_index_ outside it
+    uint32_t prev_overflow = 0;
   };
   IShaderModule* scaled_fs_ = nullptr;
   IPipeline* group_blended_ = nullptr;
@@ -206,6 +216,13 @@ class DeviceRenderer2D final : public IRenderer2D {
   Group groups_[kMaxGroups];
   uint32_t group_depth_ = 0;
   bool groups_ok_ = false;
+  IShaderModule* blur_fs_ = nullptr;
+  IShaderModule* color_fs_ = nullptr;
+  IPipeline* filter_blur_ = nullptr;
+  IPipeline* filter_color_ = nullptr;
+  bool filters_ok_ = false;
+  static constexpr uint32_t kNoDetach = 0xFFFFFFFFu;
+  uint32_t detach_index_ = kNoDetach;   // the clip_stack_ entry that is the bounds of the innermost filter group: the clip is that entry and those above it
   uint32_t layer_is_group_ = 0;   // bit n: the open layer n is a group
 };
 

@@ -333,6 +333,32 @@ static void test_transforms_on_device() {
   }
 }
 
+// CSS filters drawn through the device renderer's group filters agree with the CPU filters.
+static void test_filters_on_device() {
+  const char* pages[] = {
+      "<div style='margin:20px;width:40px;height:30px;background:#e22;filter:blur(3px)'></div>",
+      "<div style='margin:20px;width:40px;height:30px;background:#e22;border:4px solid #139;filter:grayscale(1)'></div>",
+      "<div style='margin:20px;width:40px;height:30px;background:#2a6;filter:brightness(1.5) contrast(.8)'></div>",
+      "<div style='margin:20px;width:40px;height:30px;background:linear-gradient(90deg,#f00,#00f);filter:hue-rotate(90deg) saturate(2)'></div>",
+      "<div style='margin:20px;width:40px;height:30px;background:#2a6;filter:sepia(1) invert(.5) opacity(.6)'></div>",
+      "<div style='margin:30px;width:30px;height:20px;background:#0a0;filter:blur(2px) brightness(1.3)'></div>",
+  };
+  for (const char* body : pages) {
+    Shot cpu(page(body), 120, 100);
+    const std::vector<uint32_t> gpu = cpu.via_device();
+    uint32_t far = 0, inked = 0;
+    for (uint32_t y = 0; y < cpu.height; ++y)
+      for (uint32_t x = 0; x < cpu.width; ++x) {
+        const uint32_t a = cpu.px(x, y), b = gpu[y * cpu.width + x];
+        if (a != 0xFFFFFFFFu) ++inked;
+        if (!near_color(a, b, 24)) ++far;
+      }
+    CHECK(inked > 100);
+    if (far * 10 >= inked + 40) printf("filter page differs: far %u inked %u: %s\n", far, inked, body);
+    CHECK(far * 10 < inked + 40);
+  }
+}
+
 static void test_transforms() {
   // translate
   Shot a(page("<div style='width:40px;height:40px;background:#f00;transform:translate(50px,20px)'></div>"));
@@ -863,6 +889,7 @@ int main() {
     test_golden();
     test_transforms();
     test_transforms_on_device();
+    test_filters_on_device();
     test_filters();
     test_shadows();
     test_gradients_more();

@@ -122,13 +122,13 @@
 
 // TCOS_SELFTESTS (cmake -DTCOS_SELFTESTS=ON) adds the boot-time self-checks and demos of every
 // subsystem; the default boot only reports the hardware and opens the desktop.
+#include "GraphicsDemo.hpp"
 #ifdef TCOS_SELFTESTS
 #include "AsyncDemo.hpp"
 #include "AudioDemo.hpp"
 #include "ConcurrentDemo.hpp"
 #include "ContainerDemo.hpp"
 #include "FileSystemDemo.hpp"
-#include "GraphicsDemo.hpp"
 #include "GuiDemo.hpp"
 #include "IspDemo.hpp"
 #include "KernelDemo.hpp"
@@ -690,6 +690,10 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       Entry(Level::Ok, "Graphics").text("3D: ").text(system_graphics.device().info().name)
           .text(system_graphics.accelerated() ? " (GPU accelerated)" : " (software)").text(", WebGL/WebGPU: ").text(system_graphics.accelerated() ? "GPU accelerated, CPU for what the GPU cannot draw" : "software").text(", 2D: ").text(renderer->name())
           .text(renderer->accelerated() ? " (GPU accelerated)" : " (software)");
+      if (system_graphics.accelerated()) {
+        const int groups = check_2d_groups(system_graphics.device(), shared_allocator);
+        Entry(groups > 0 ? Level::Ok : groups == 0 ? Level::Warning : Level::Info, "Graphics").text("2D offscreen groups: ").text(groups > 1 ? "ok (opacity, composite, blur and colour filters)" : groups > 0 ? "ok (opacity, composite; no filters on this device)" : groups == 0 ? "WRONG on this device" : "not supported by this device");
+      }
       if (!system_graphics.accelerated())
         Entry(system_gpu.virtio_gpu() || system_gpu.vmware_gpu() ? Level::Warning : Level::Info, "Graphics").text("no 3D acceleration: ").text(system_graphics.software_reason());
     }
