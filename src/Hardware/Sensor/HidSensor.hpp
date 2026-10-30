@@ -24,7 +24,7 @@
 #pragma once
 #include "Hardware/Bus/I2c/HidInputMap.hpp"
 #include "Hardware/Bus/I2c/I2cHidClient.hpp"
-#include "Hardware/Mouse/I2c/I2cHidPointer.hpp"
+#include "Hardware/Hid/HidFunctionHost.hpp"
 #include "Hardware/Sensor/ISensor.hpp"
 #include "Kernel/Sync.hpp"
 
@@ -33,7 +33,7 @@ namespace hardware {
 class HidSensor final : public ISensor, public II2cHidClient {
  public:
   static constexpr uint32_t kMaxPerDevice = 8;
-  HidSensor(I2cHidPointer& device, SensorKind kind, uint8_t report_id, const char* name) : device_(device), kind_(kind), report_id_(report_id), name_(name) {}
+  HidSensor(IHidFunctionHost& device, SensorKind kind, uint8_t report_id, const char* name) : device_(device), kind_(kind), report_id_(report_id), name_(name) {}
 
   // Finds the sensors in the device's report descriptor; for each one found `make(kind, report_id)` is called by the caller's loop: this fills `kinds` / `ids` (up to kMaxPerDevice) and
   // returns how many.
@@ -44,11 +44,13 @@ class HidSensor final : public ISensor, public II2cHidClient {
   void shutdown() override { device_.remove_client(this); }
   SensorKind kind() const override { return kind_; }
   bool read(SensorReading* out) override;
+  // Tells the device again to report (after the device or its link was reset).
+  bool reenable() { return enable(); }
   void on_report(ConstByteView report) override;
 
  private:
   bool enable();
-  I2cHidPointer& device_;
+  IHidFunctionHost& device_;
   SensorKind kind_;
   uint8_t report_id_;
   const char* name_;

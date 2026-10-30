@@ -23,7 +23,7 @@
 #pragma once
 #include "Hardware/Bus/I2c/HidInputMap.hpp"
 #include "Hardware/Bus/I2c/I2cHidClient.hpp"
-#include "Hardware/Mouse/I2c/I2cHidPointer.hpp"
+#include "Hardware/Hid/HidFunctionHost.hpp"
 #include "Hardware/Pen/IPen.hpp"
 #include "Kernel/Sync.hpp"
 
@@ -32,7 +32,7 @@ namespace hardware {
 class I2cHidPen final : public IPen, public II2cHidClient {
  public:
   static constexpr uint32_t kQueue = 64;
-  explicit I2cHidPen(I2cHidPointer& device, const char* name) : device_(device), name_(name) {}
+  explicit I2cHidPen(IHidFunctionHost& device, const char* name) : device_(device), name_(name) {}
 
   // Looks for the pen report in the device's map. False if there is none.
   bool initialize() override;
@@ -46,7 +46,7 @@ class I2cHidPen final : public IPen, public II2cHidClient {
   void on_report(ConstByteView report) override;
 
  private:
-  I2cHidPointer& device_;
+  IHidFunctionHost& device_;
   const char* name_;
   kernel::Mutex mutex_;
   uint8_t report_id_ = 0;
