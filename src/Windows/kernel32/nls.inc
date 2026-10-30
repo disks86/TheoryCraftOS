@@ -163,6 +163,7 @@ static int nls_deliver(const NlsOut *o, LPWSTR out, int capacity) {
 }
 static void nls_widen(WCHAR *to, const char *from) { while ((*to++ = (WCHAR)(BYTE)*from++)) {} }
 
+#define LOCALE_NAME_MAX_LENGTH_ 85
 static BOOL nls_info_text(int kind, DWORD type, BOOL user_override, WCHAR *out /* 80 */);
 static int nls_date_format(int locale, DWORD flags, const SYSTEMTIME *time, LPCWSTR format, LPWSTR out, int capacity) {
   if (locale == 0) { set_error(ERROR_INVALID_PARAMETER); return 0; }
@@ -906,31 +907,54 @@ EXPORT LCID WINAPI LocaleNameToLCID(LPCWSTR name, DWORD flags) {
   return k_locale_lcid[kind - 1];
 }
 EXPORT BOOL WINAPI IsValidLocaleName(LPCWSTR name) { return name && nls_locale_of_name(name) != 0 && !nls_name_is(name, "!x-sys-default-locale"); }
+/* A locale identifier that is in the table as it is (the "default" identifiers are not locales). */
 EXPORT BOOL WINAPI IsValidLocale(LCID lcid, DWORD flags) {
-  if (flags != 1 && flags != 2) { set_error(ERROR_INVALID_FLAGS); return FALSE; }
-  return nls_locale_of(lcid) != 0;
+  if (flags > 2) { set_error(ERROR_INVALID_FLAGS); return FALSE; }
+  return nls_index_of_lcid(lcid) >= 0;
 }
 EXPORT LCID WINAPI ConvertDefaultLocale(LCID lcid) {
   switch (lcid) {
-    case 0: case 0x400: case 0x800: case 0xC00: case 0x1000: return NLS_LCID_EN_US;
-    case 0x1400: return 0x409;
+    case 0: case 0x400: case 0x800: case 0xC00: case 0x1000: case 0x1400: return NLS_LCID_EN_US;
     default: break;
   }
-  /* a neutral sublanguage becomes the default one of the language */
-  if (!(lcid & 0xFC00) && (lcid & 0xFFFF) && (lcid >> 10 & 0x3F) == 0) {
-    const int kind = nls_locale_of(lcid);
-    if (kind != 0 && nls_index_of_lcid(lcid) >= 0 && nls_kind_is_neutral(nls_index_of_lcid(lcid) + 1)) return (lcid & 0xFFFF0000u) | (k_locale_lcid[kind - 1] & 0xFFFF);
-  }
+  /* a neutral locale becomes the default specific one of its language */
+  const int index = nls_index_of_lcid(lcid);
+  if (index >= 0 && k_locale_default[index] != index) return k_locale_lcid[k_locale_default[index]];
   return lcid;
 }
+/* The locale a name stands for: the name as it is, or cut back at the last '-' or '_' until it names a locale; a neutral locale gives its specific one and the sort
+ * order is dropped ("de-DE_phoneb" is "de-DE"). A name that has anything but letters, digits, hyphens and underscores is refused. */
 EXPORT int WINAPI ResolveLocaleName(LPCWSTR name, LPWSTR out, int capacity) {
-  static const WCHAR en_us[] = {'e', 'n', '-', 'U', 'S', 0}, invariant[] = {0};
   if (capacity < 0 || (capacity > 0 && !out)) { set_error(ERROR_INVALID_PARAMETER); return 0; }
-  const WCHAR *text = !name || (name[0] && nls_locale_of_name(name) == 0 && !(name[0] && name[1] && name[2] == '-')) ? en_us : (*name == 0 ? invariant : en_us);
-  if (name && !*name) text = invariant;
+  int kind;
+  if (name && nls_name_is(name, "!x-sys-default-locale")) kind = nls_default_kind();
+  else if (!name) kind = nls_default_kind();
+  else {
+    WCHAR work[LOCALE_NAME_MAX_LENGTH_];
+    int n = 0;
+    for (; name[n]; ++n) {
+      const WCHAR c = name[n];
+      if (n >= LOCALE_NAME_MAX_LENGTH_ - 1 || !((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '-' || c == '_')) { set_error(ERROR_INVALID_PARAMETER); return 0; }
+      work[n] = c;
+    }
+    work[n] = 0;
+    kind = n == 0 ? nls_invariant_kind() : 0;
+    while (kind == 0 && n > 0) {
+      kind = nls_locale_of_name(work);
+      if (kind) break;
+      while (n > 0 && work[n - 1] != '-' && work[n - 1] != '_') --n;
+      if (n > 0) --n;
+      work[n] = 0;
+    }
+    if (kind == 0) kind = nls_invariant_kind();
+    else if (nls_kind_is_neutral(kind)) kind = k_locale_default[kind - 1] + 1;
+  }
+  WCHAR text[80];
+  nls_text_wide(kind, 0x5C, text);
+  for (int i = 0; text[i]; ++i) if (text[i] == '_') text[i] = 0;
   const int n = (int)wcslen(text) + 1;
   if (capacity == 0) return n;
-  if (capacity < n) { set_error(ERROR_INSUFFICIENT_BUFFER); return 0; }
+  if (capacity < n) { if (capacity > 0) { memcpy(out, text, (size_t_)(capacity - 1) * 2); out[capacity - 1] = 0; } set_error(ERROR_INSUFFICIENT_BUFFER); return 0; }
   memcpy(out, text, (size_t_)n * 2);
   return n;
 }
