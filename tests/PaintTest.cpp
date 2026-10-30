@@ -359,6 +359,31 @@ static void test_filters_on_device() {
   }
 }
 
+// Rounded clips and clip-path shapes through the device renderer (a group laid over the target through the clip's coverage) agree with the CPU's clips.
+static void test_clips_on_device() {
+  const char* pages[] = {
+      "<div style='margin:10px;width:70px;height:60px;border-radius:25px;overflow:hidden;background:#fff'><div style='width:100px;height:100px;background:#e22'></div></div>",
+      "<div style='margin:10px;width:70px;height:60px;border-radius:12px 30px 5px 40px;overflow:hidden'><div style='width:100px;height:100px;background:linear-gradient(90deg,#00f,#0c0)'></div></div>",
+      "<div style='margin:10px;width:80px;height:70px;background:#e22;clip-path:polygon(50% 0,100% 100%,0 100%)'></div>",
+      "<div style='margin:10px;width:80px;height:70px;background:#139;clip-path:circle(35px at 40px 35px)'></div>",
+      "<div style='margin:10px;width:90px;height:80px;border-radius:30px;overflow:hidden;background:#ccc'><div style='margin:5px;width:60px;height:60px;border-radius:20px;overflow:hidden;background:#0a0'><div style='width:100px;height:30px;background:#fa0'></div></div></div>",
+  };
+  for (const char* body : pages) {
+    Shot cpu(page(body), 120, 100);
+    const std::vector<uint32_t> gpu = cpu.via_device();
+    uint32_t far = 0, inked = 0;
+    for (uint32_t y = 0; y < cpu.height; ++y)
+      for (uint32_t x = 0; x < cpu.width; ++x) {
+        const uint32_t a = cpu.px(x, y), b = gpu[y * cpu.width + x];
+        if (a != 0xFFFFFFFFu) ++inked;
+        if (!near_color(a, b, 12)) ++far;
+      }
+    CHECK(inked > 500);
+    if (far * 50 >= inked) printf("clip page differs: far %u inked %u: %s\n", far, inked, body);
+    CHECK(far * 50 < inked);
+  }
+}
+
 static void test_transforms() {
   // translate
   Shot a(page("<div style='width:40px;height:40px;background:#f00;transform:translate(50px,20px)'></div>"));
@@ -890,6 +915,7 @@ int main() {
     test_transforms();
     test_transforms_on_device();
     test_filters_on_device();
+    test_clips_on_device();
     test_filters();
     test_shadows();
     test_gradients_more();
