@@ -42,15 +42,27 @@ constexpr uint32_t kTypeInactive = 0, kTypePort = 0x000001, kTypeNhi = 0x000002,
                    kTypeUsb3Down = 0x200101, kTypeUsb3Up = 0x200102;
 // the lane adapter capability (LANE_ADP_CS_0 and 1, relative to the PHY capability) and the USB4 port capability
 constexpr uint32_t kLaneCs0 = 0, kLaneCs0WidthShift = 20, kLaneCs0WidthMask = 0x3F, kLaneCs0WidthDual = 2, kLaneCs1 = 1, kLaneCs1TargetWidthMask = 3u << 4, kLaneCs1TargetSingle = 1u << 4,
-                   kLaneCs1TargetDual = 3u << 4, kLaneCs1Lb = 1u << 15, kLaneCs1CurrentWidthShift = 20, kLaneCs1CurrentWidthMask = 0x3Fu << 20, kPortCs18 = 0x12, kPortCs18Be = 1u << 8;
+                   kLaneCs1TargetDual = 3u << 4, kLaneCs1Lb = 1u << 15, kLaneCs1CurrentWidthShift = 20, kLaneCs1CurrentWidthMask = 0x3Fu << 20, kPortCs18 = 0x12, kPortCs18Be = 1u << 8, kPortCs18Csa = 1u << 22, kPortCs18Tip = 1u << 24, kPortCs19StartAsym = 1u << 24,
+                   kLaneCs1TargetAsymMask = 3u << 6, kLaneCs1TargetAsymTx = 1u << 6, kLaneCs1TargetAsymRx = 2u << 6, kLaneCs1CurrentSpeedShift = 16, kLaneCs1CurrentSpeedMask = 0xFu << 16, kLaneSpeedGen4 = 2, kLaneSpeedGen3 = 4,
+                   kLaneCs0Cl0sSupport = 1u << 26, kLaneCs0Cl1Support = 1u << 27, kLaneCs0Cl2Support = 1u << 28, kLaneCs1Cl0sEnable = 1u << 10, kLaneCs1Cl1Enable = 1u << 11, kLaneCs1Cl2Enable = 1u << 12, kLaneCs1Pms = 1u << 30, kPortCs18Cps = 1u << 10;
 // USB 3 adapters (ADP_USB3_CS_*, relative to the adapter capability)
 constexpr uint32_t kUsb3Cs0Pe = 1u << 31, kUsb3Cs1 = 1, kUsb3Cs1Hca = 1u << 31, kUsb3Cs2 = 2, kUsb3Cs2Cmr = 1u << 31, kUsb3Cs3 = 3, kUsb3Cs4 = 4, kUsb3Cs4MslrShift = 12, kUsb3Cs4MslrMask = 0x7F, kUsb3Cs4Mslr20G = 1,
                    kUsb3Hop = 8, kUsb3Priority = 3, kUsb3Weight = 2;
 // capabilities of a port (TB_PORT_CAP_*) and of a router
 constexpr uint8_t kPortCapPhy = 0x01, kPortCapTime1 = 0x03, kPortCapAdapter = 0x04, kPortCapUsb4 = 0x06;
+// DisplayPort adapters (ADP_DP_CS_*, relative to the adapter capability)
+constexpr uint32_t kDpCs0 = 0, kDpCs0Ae = 1u << 30, kDpCs0Ve = 1u << 31, kDpCs3 = 3, kDpCs3Hpdc = 1u << 9, kDpLocalCap = 4, kDpRemoteCap = 5, kDpStatusCtrl = 6, kDpStatusCtrlCmhs = 1u << 25, kDpStatusCtrlUf = 1u << 26,
+                   kDpCommonRateShift = 8, kDpCommonRateMask = 0xFu << 8, kDpCommonLanesShift = 12, kDpCommonLanesMask = 7u << 12,
+                   kDpVideoHop = 9, kDpAuxTxHop = 8, kDpAuxRxHop = 8, kDpVideoPriority = 1, kDpAuxPriority = 2, kDpWeight = 1, kAdpCs4NfcMask = 0x3FF;
+// The sideband channel of a USB4 port (PORT_CS_1 holds the command, PORT_CS_2 on the data) and what retimers answer on it (sb_regs.h)
+constexpr uint32_t kPortCs1 = 1, kPortCs2 = 2, kSbLengthShift = 8, kSbTargetShift = 16, kSbRetimerShift = 20, kSbWrite = 1u << 24, kSbNoResponse = 1u << 25, kSbResponseCode = 1u << 26, kSbPending = 1u << 31,
+                   kSbTargetRouter = 0, kSbTargetRetimer = 2, kSbVendorId = 0x00, kSbProductId = 0x01, kSbOpcode = 0x08, kSbMetadata = 0x09, kMaxRetimers = 6,
+                   kSbOpErr = 0x20525245, kSbOpOns = 0x444D4321, kSbOpEnumerate = 0x4D554E45, kSbOpQueryLast = 0x5453414C, kSbOpGetNvmSectorSize = 0x53534E47;
 // Thunderbolt 3 device routers: the vendor specific capabilities of their space (plug events, link controller) and the link controller's registers
 constexpr uint8_t kSwitchCapVse = 0x05, kVsecPlugEvents = 0x01, kVsecLinkController = 0x06;
-constexpr uint32_t kLcDesc = 2, kLcSxCtrl = 0x96, kLcSxCtrlL1c = 1u << 16, kLcSxCtrlL2c = 1u << 20, kLcSxCtrlUpstream = 1u << 30, kLcPortAttr = 0x8D, kLcPortAttrBe = 1u << 12, kPlugEventsUsbDisable = 1u << 2;
+constexpr uint32_t kLcDesc = 2, kLcSxCtrl = 0x96, kLcSxCtrlWoc = 1u << 1, kLcSxCtrlWod = 1u << 2, kLcSxCtrlWodpc = 1u << 3, kLcSxCtrlWodpd = 1u << 4, kLcSxCtrlWou4 = 1u << 5, kLcSxCtrlWop = 1u << 6, kLcSxCtrlSlp = 1u << 31, kLcSxCtrlL1c = 1u << 16, kLcSxCtrlL2c = 1u << 20, kLcSxCtrlUpstream = 1u << 30, kLcCs42 = 0x2A, kLcCs42UsbPlugged = 1u << 31, kLcLinkReq = 0xAD, kLcLinkReqXhciConnect = 1u << 31, kLcPortAttr = 0x8D, kLcPortAttrBe = 1u << 12, kPlugEventsUsbDisable = 1u << 2,
+                   kPlugEventsEepromCtl = 4, kPlugEventsDromOffset = 12, kEepromSk = 1u << 0, kEepromCs = 1u << 1, kEepromDi = 1u << 2, kEepromDo = 1u << 3, kEepromBitBang = 1u << 4, kEepromNotPresent = 1u << 5, kEepromPresent = 1u << 7,
+                   kPlugEventsPcieWrData = 0x1B, kPlugEventsPcieCmd = 0x1C, kPcieCmdBridgeShift = 10, kPcieCmdWrite = 1u << 21, kPcieCmdValue = 2u << 22, kPcieCmdReqAck = 1u << 30, kPcieCmdTimeout = 1u << 31;
 // the time management unit: the router capability (TB_SWITCH_CAP_TMU), its registers, the port registers
 constexpr uint8_t kSwitchCapTmu = 0x03;
 constexpr uint32_t kTmuRtrCs0 = 0, kTmuRtrCs0FreqWindShift = 16, kTmuRtrCs0FreqWindMask = 0x7FFu << 16, kTmuRtrCs0Td = 1u << 27, kTmuRtrCs0Ucap = 1u << 30, kTmuRtrCs1 = 1, kTmuRtrCs3 = 3, kTmuRtrCs3IntervalShift = 16,
@@ -73,6 +85,9 @@ struct Usb4Port {
   uint8_t number = 0;
   uint32_t type = 0;
   uint8_t cap_phy = 0, cap_adapter = 0, cap_usb4 = 0, cap_tmu = 0;
+  struct Retimer { uint32_t vendor = 0, product = 0, sector_size = 0; };
+  Retimer retimers[6];               // the retimers on the cable behind this port (on-board ones, as many as the last one's index)
+  uint8_t retimer_count = 0;
   uint16_t max_in_hop = 0, max_out_hop = 0;
   bool disabled = false;
   uint8_t link_nr = 0;               // 0 for the first of two lane adapters, 1 for the second
@@ -101,6 +116,7 @@ struct Usb4Router {
   int16_t parent = -1;               // the router above it and the port of that one it hangs from
   uint8_t parent_port = 0;
   bool configured = false;
+  uint8_t clx = 0;                   // the low power states enabled on the link above it (Usb4Clx)
   uint8_t cap_tmu = 0;               // the router's time management unit capability (0: none)
   bool tbt3 = false;                 // a Thunderbolt 3 router (no USB4 version): configured through its plug events and link controller capabilities
   uint8_t cap_plug_events = 0, cap_lc = 0;
@@ -115,18 +131,26 @@ struct Usb4Hop {
   uint8_t in_port = 0, out_port = 0;
   uint16_t in_hop = 0, out_hop = 0;  // out_hop is the HopID the next router's adapter gets as its input
   uint8_t credits = 0;
+  uint8_t nfc_credits = 0;           // buffers not under flow control that the path takes on the input adapter (DisplayPort video)
 };
 
 struct Usb4Path {
   uint8_t length = 0;
   uint8_t priority = 3, weight = 1;
+  bool pm_support = false;           // the path may be in a low power state (USB4 version 2 routers)
   bool dma = false;                  // a DMA path: its credits are counted against the lane adapters
   uint8_t egress_fc_enable = 3, ingress_fc_enable = 7;     // which hops (source 1, internal 2, destination 4) have flow control out of / into them
   Usb4Hop hops[usb4::kMaxHops];
   bool activated = false;
 };
 
-enum class Usb4TunnelKind : uint8_t { Pcie, Usb3, Dma };
+// The width of a link: one lane, two lanes bonded, or (USB4 version 2, 80 Gb/s links) three lanes one way and one the other. The values are what the lane adapter reports.
+// The low power states of the lanes of a link (CL0s, CL1, CL2).
+enum Usb4Clx : uint8_t { kClx0s = 1, kClx1 = 2, kClx2 = 4 };
+
+enum class Usb4LinkWidth : uint8_t { Single = 1, Dual = 2, AsymTx = 4, AsymRx = 8 };
+
+enum class Usb4TunnelKind : uint8_t { Pcie, Usb3, Dma, Dp };
 
 struct Usb4Tunnel {
   bool used = false;
@@ -134,6 +158,7 @@ struct Usb4Tunnel {
   int16_t device_router = -1;        // the router at the far end (its PCIe up adapter)
   int16_t host_router = -1;          // where the PCIe down adapter is
   uint8_t down_port = 0, up_port = 0;
+  Usb4Path third;                    // a DisplayPort tunnel: down is the video path, up the AUX transmit path, third the AUX receive path
   Usb4Path down, up;                 // down: from the down adapter to the up adapter; up: back (a DMA tunnel: down is the path we send on, up the one we receive on)
   uint64_t xdomain_route = 0;        // a DMA tunnel: the route of the other host
   bool active = false;
@@ -169,8 +194,26 @@ class Usb4Domain final : public IThunderboltEvents, public IXdomainHost, private
   bool approve_usb3(uint32_t router_index, const char** error);
   bool disconnect_usb3(uint32_t router_index);
   bool usb3_tunnelled(uint32_t router_index) const;
+  // A DisplayPort tunnel from a DP IN adapter of one router to a DP OUT adapter of a router below it (video, AUX in both directions; tb_tunnel_alloc_dp). The two adapters exchange their
+  // capabilities (the connection manager handshake, then each side is told the other's), the paths are written, and the adapters' video and AUX enables are set. The link rate and lane
+  // count are whatever the adapters can do at most: the bandwidth allocation mode and any reduction to fit a link are not done. Needs a caller that knows which output is to be driven.
+  bool tunnel_dp(uint32_t in_router, uint32_t in_port, uint32_t out_router, uint32_t out_port, const char** error);
+  bool disconnect_dp(uint32_t in_router, uint32_t in_port);
+  uint32_t dp_tunnels() const;
   // Is the link above this router running both lanes as one?
   bool link_bonded(uint32_t router_index) const;
+  // The current width of the link above a router, read from its lane adapter (0 for the host router or a link that cannot be read).
+  Usb4LinkWidth link_width(uint32_t router_index);
+  // Low power states of the high speed lanes (clx.c). The first link below the host router gets them when it comes up (as the Linux driver does: that is what lets the processor save energy):
+  // CL0s, CL1 and, between version 2 routers, CL2, if both ends of a bonded link support them. A path to another host switches them off meanwhile, sleep too. `set_clx_policy(false)` keeps them
+  // off. Not on a Tiger Lake host router (known to misbehave), not on Thunderbolt 3 routers.
+  uint8_t clx_state(uint32_t router_index) const { const Usb4Router* r = router(router_index); return r ? r->clx : 0; }
+  void set_clx_policy(bool enabled) { clx_policy_ = enabled; }
+  bool set_clx(uint32_t router_index, uint8_t states);
+  // Changes the link above a router between two lanes bonded and the asymmetric forms with three lanes in one direction (AsymTx: three from the host towards the router): both routers must be
+  // USB4 version 2, the link must run at generation 4 and both ends must support the change (PORT_CS_18.CSA). The host-side policy of when an asymmetric link is worth it (bandwidth demand) is
+  // the caller's. Refused with a tunnel of a bandwidth-sensitive kind (DisplayPort) through the link.
+  bool set_link_width(uint32_t router_index, Usb4LinkWidth width, const char** error);
 
   // Sleep (tb_suspend): every tunnel is taken down and each router told to sleep, the ones farthest from the host first (ROUTER_CS_5.SLP, waiting for SLPR), and the topology is forgotten.
   // resume() starts afresh - the host router is configured again and everything below it found again, the links having come up on their own - so no tunnel is restored: they are approved
@@ -211,7 +254,14 @@ class Usb4Domain final : public IThunderboltEvents, public IXdomainHost, private
   uint32_t unreachable_links() const { return unreachable_; }
   // Reads and parses a router's DROM (names, which ports are unused, which lane adapters belong together); a router without one keeps the defaults. Done for every router found.
   bool read_drom(Usb4Router& r);
+  // The retimers on the cable behind a USB4 port (tb_retimer_scan): the router is asked to enumerate them, each index is asked whether it is the last, and the vendor, product and NVM sector size of
+  // the ones found are read. Done for every port with a link when it is scanned; not the firmware update of a retimer.
+  uint8_t retimer_count(uint32_t router_index, uint32_t port) const { const Usb4Router* r = router(router_index); return r && port < usb4::kMaxPorts ? r->ports[port].retimer_count : 0; }
+  const Usb4Port::Retimer* retimer(uint32_t router_index, uint32_t port, uint32_t index) const { const Usb4Router* r = router(router_index); return r && port < usb4::kMaxPorts && index < r->ports[port].retimer_count ? &r->ports[port].retimers[index] : nullptr; }
   bool read_buffer_allocation(Usb4Router& r);
+  int sb_transfer(const Usb4Router& r, uint32_t port, uint32_t target, uint32_t index, uint32_t reg, bool write_it, uint32_t* data, uint32_t bytes);
+  int sb_op(const Usb4Router& r, uint32_t port, uint32_t target, uint32_t index, uint32_t opcode, uint32_t timeout_us);
+  void scan_retimers(Usb4Router& r, uint32_t port);
   // Time synchronisation (tmu.c, uni-directional low resolution - the mode the Linux driver starts in): the host router is asked for its rate, each router below it gets the parameters, the
   // adapters on both ends of its link are set to uni-directional with time sync on, and its local time is first set from the host router's so that it starts near it.
   bool tmu_enabled(uint32_t router_index) const { const Usb4Router* r = router(router_index); return r && r->tmu_lowres; }
@@ -239,9 +289,18 @@ class Usb4Domain final : public IThunderboltEvents, public IXdomainHost, private
   // A router operation (usb4_native_switch_op): metadata and data in, the opcode written, the answer waited for. `status` is the operation's own result; false if the router does not support it.
   bool router_op(const Usb4Router& r, uint32_t opcode, uint32_t* metadata, uint8_t* status, const uint32_t* tx, uint32_t tx_dwords, uint32_t* rx, uint32_t rx_dwords);
   bool drom_read(const Usb4Router& r, uint32_t address, ByteView out);
+  bool eeprom_ctl(const Usb4Router& r, uint32_t* word, bool write);
+  bool eeprom_active(const Usb4Router& r, bool enable);
+  bool eeprom_out(const Usb4Router& r, uint8_t value);
+  bool eeprom_in(const Usb4Router& r, uint8_t* value);
+  bool eeprom_read_n(const Usb4Router& r, uint32_t offset, uint8_t* out, uint32_t count);
   int find_router_cap(const Usb4Router& r, uint8_t id);
   int find_router_vse(const Usb4Router& r, uint8_t vsec);
   bool plug_events_active(const Usb4Router& r);
+  bool lc_sleep(const Usb4Router& r, bool runtime);
+  bool pcie_bridge_write(const Usb4Router& r, uint32_t bridge, uint32_t offset, uint32_t value);
+  bool lc_port_block(const Usb4Router& r, uint32_t port, uint32_t* cap);
+  void tbt3_after_pcie(const Usb4Router& host, const Usb4Router& device);
   bool lc_set_configured(const Usb4Router& r, uint32_t port, bool upstream);
   bool configure_port(const Usb4Router& r, uint32_t port, bool upstream);
   bool bonding_possible(const Usb4Router& child);
@@ -280,10 +339,26 @@ class Usb4Domain final : public IThunderboltEvents, public IXdomainHost, private
   bool disable_hop(const Usb4Router& r, uint32_t port, uint32_t hop_index);
   bool set_pcie_enable(const Usb4Router& r, uint32_t port, bool enable);
   int find_tunnel(int router_index, Usb4TunnelKind kind = Usb4TunnelKind::Pcie) const;
+  bool build_chain_path(Usb4Path* path, const int* routers, uint32_t n, uint32_t first_port, uint32_t first_hop, uint32_t last_port, uint32_t last_hop);
+  bool add_nfc(const Usb4Router& r, uint32_t port, int delta);
+  bool dp_exchange_caps(const Usb4Router& in, uint32_t in_port, const Usb4Router& out, uint32_t out_port);
+  bool set_dp_enable(const Usb4Router& r, uint32_t port, bool enable);
   bool make_tunnel(uint32_t router_index, Usb4TunnelKind kind, const char** error);
   bool remove_tunnel(int slot);
   bool set_adapter_enable(const Usb4Router& r, uint32_t port, Usb4TunnelKind kind, bool enable);
   bool usb3_allocate_bandwidth(const Usb4Router& host, uint32_t down_port, const Usb4Router& device, uint32_t up_port);
+  int link_generation(const Usb4Router& r, uint32_t port);
+  bool asym_supported(const Usb4Router& r, uint32_t port);
+  bool set_asym_width(const Usb4Router& r, uint32_t port, Usb4LinkWidth width);
+  bool asym_start(const Usb4Router& r, uint32_t port);
+  bool wait_link_width(const Usb4Router& r, uint32_t port, uint32_t widths, uint32_t timeout_us);
+  bool clx_supported(const Usb4Router& r) const;
+  bool port_clx_supported(const Usb4Router& r, uint32_t port, uint8_t states);
+  bool port_clx_set(const Usb4Router& r, uint32_t port, uint8_t states, bool enable);
+  bool clx_enable(Usb4Router& child, uint8_t states);
+  bool clx_disable(Usb4Router& child);
+  void clx_enable_first_link(int router_index);
+  void clx_disable_up(int router_index);
   bool bond_link(Usb4Router& child, Usb4Router& parent, uint32_t down_port);
   int lane_width(const Usb4Router& r, uint32_t port);
   bool set_lane_width(const Usb4Router& r, uint32_t port, uint32_t target);
@@ -307,7 +382,7 @@ class Usb4Domain final : public IThunderboltEvents, public IXdomainHost, private
   Plug plugs_[kPlugQueue];
   uint32_t plug_head_ = 0, plug_count_ = 0;
   uint32_t preboot_closed_ = 0, events_seen_ = 0, unreachable_ = 0;
-  bool started_ = false, suspended_ = false;
+  bool started_ = false, suspended_ = false, clx_policy_ = true;
 };
 
 }  // namespace hardware

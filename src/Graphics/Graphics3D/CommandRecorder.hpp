@@ -206,7 +206,7 @@ class CommandRecorder : public ICommandBuffer {
     add(c);
   }
   void begin_occlusion_query(uint32_t slot) override { begin_query(slot, QueryKind::Occlusion); }
-  void begin_query(uint32_t slot, QueryKind kind) override {
+  void begin_query(uint32_t slot, QueryKind kind, uint32_t stream = 0) override {
     if (slot >= kMaxOcclusionQueries) {
       ok_ = false;
       return;
@@ -214,7 +214,7 @@ class CommandRecorder : public ICommandBuffer {
     RecordedCommand c;
     c.type = RecordedCommand::Type::BeginQuery;
     c.unit = slot;
-    c.count = static_cast<uint32_t>(kind);
+    c.count = static_cast<uint32_t>(kind) | (stream & 3) << 8;
     add(c);
   }
   void end_occlusion_query() override {

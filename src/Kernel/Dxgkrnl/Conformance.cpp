@@ -1281,6 +1281,260 @@ void scene_stream_output(Rig& rig, ArrayView<uint32_t> out) {
   rig.read(target, out);
 }
 
+
+// A picture made of stream output records: a small square for each record of a buffer of positions (4 floats) and colours (4 floats), coloured by the vector in the second buffer (0.5 * q + 0.5),
+// shifted by `shift(i)`.
+template <typename Shift>
+uint32_t squares_from_records(const uint32_t* positions, const uint32_t* vectors, uint32_t records, Shift shift, Vertex* squares) {
+  auto f = [](uint32_t bits) { return __builtin_bit_cast(float, bits); };
+  auto shade = [](float x) { return x < 0.0f ? 0.0f : x > 1.0f ? 1.0f : x; };
+  for (uint32_t i = 0; i < records; ++i) {
+    const float x = f(positions[8 * i]), y = f(positions[8 * i + 1]) + shift(i), r = shade(f(vectors[4 * i]) * 0.5f + 0.5f), g = shade(f(vectors[4 * i + 1]) * 0.5f + 0.5f), bl = shade(f(vectors[4 * i + 2]) * 0.5f + 0.5f);
+    const float h = 0.2f;
+    Vertex* q = squares + 6 * i;
+    q[0] = {x - h, y - h, 0.5f, r, g, bl, 1}, q[1] = {x + h, y - h, 0.5f, r, g, bl, 1}, q[2] = {x - h, y + h, 0.5f, r, g, bl, 1};
+    q[3] = q[2], q[4] = q[1], q[5] = {x + h, y + h, 0.5f, r, g, bl, 1};
+  }
+  return 6 * records;
+}
+
+// Appending across passes and submits, the statistics of stream output and timestamps. Two rounds of three records go into buffers made for seven (the second round after the first, appended in
+// another pass of the same commands); a third round, in other commands, has room for one record: one primitive is written, three were needed. The squares of the second round are moved down so
+// that a round that overwrote the first shows. Stripes at the bottom: written (1 of 4), needed (3 of 4), and whether the timestamps went forwards.
+void scene_stream_output_append(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureStreamOutput | graphics::kFeatureGeometryShaders | graphics::kFeatureOcclusionQueries | graphics::kFeatureStatisticsQueries | graphics::kFeatureTimestampQueries))
+    return void(rig.step("stream output append", status::kNotSupported));
+  namespace b = conformance_blobs;
+  const Vertex v[3] = {{-0.5f, -0.5f, 0.5f, 1, 0, 0, 1}, {0.5f, -0.5f, 0.5f, 0, 1, 0, 1}, {0.0f, 0.5f, 0.5f, 0, 0, 1, 1}};
+  Handle vs = rig.vertex_shader(bytes_of(b::k_vs, sizeof b::k_vs));
+  Handle gs = rig.shader("create_shader (geometry)", ShaderKind::Dxbc, graphics::ShaderStage::Geometry, bytes_of(b::k_gs_streams, sizeof b::k_gs_streams));
+  Handle ps = rig.pixel_shader(bytes_of(b::k_ps_color, sizeof b::k_ps_color));
+  PipelineDesc pd = colour_pipeline_desc(vs, ps);
+  pd.varying_count = 3;
+  pd.geometry_shader = gs;
+  pd.stream_output_count = 3;
+  pd.stream_output[0] = {0, 0, 0, 4, 0}, pd.stream_output[1] = {0, 1, 0, 4, 0}, pd.stream_output[2] = {1, 4, 0, 4, 1};
+  pd.stream_output_stride[0] = 32, pd.stream_output_stride[1] = 16;
+  pd.rasterized_stream = -1;
+  Handle pipe = rig.pipeline(pd);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  AllocationDesc od;
+  od.flags = kAllocStreamOutput, od.size = 7 * 32;
+  Handle first = rig.create(od);
+  od.size = 7 * 16;
+  Handle second = rig.create(od);
+  AllocationDesc rd;
+  rd.flags = kAllocQueryResult, rd.size = 6 * 8;
+  Handle results = rig.create(rd);
+  auto pass = [&](CommandWriter& w, uint32_t offset, bool queries) {
+    begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+    w.set_stream_output(0, 2, offset);
+    w.set_stream_output(1, 3, offset);
+    w.bind_pipeline(pipe);
+    w.bind_vertex_buffer(1);
+    w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+    if (queries) {
+      w.begin_query(4, 0, static_cast<uint32_t>(graphics::QueryKind::Timestamp));
+      w.end_query();
+      w.begin_query(4, 8, static_cast<uint32_t>(graphics::QueryKind::SoPrimitivesWritten));
+      w.draw(3);
+      w.end_query();
+      w.begin_query(4, 16, static_cast<uint32_t>(graphics::QueryKind::SoPrimitivesNeeded));
+      w.draw(3);
+      w.end_query();
+      w.begin_query(4, 24, static_cast<uint32_t>(graphics::QueryKind::Timestamp));
+      w.end_query();
+      w.begin_query(4, 32, static_cast<uint32_t>(graphics::QueryKind::TimestampDisjoint));
+      w.end_query();
+      w.begin_query(4, 40, static_cast<uint32_t>(graphics::QueryKind::TimestampFrequency));
+      w.end_query();
+    } else {
+      w.draw(3);
+    }
+    w.end_pass();
+  };
+  CommandWriter w(rig.allocator());
+  pass(w, 0, false);
+  pass(w, kStreamOutputAppendOffset, false);
+  rig.render(w, {target, vb, first, second, results});
+  CommandWriter w2(rig.allocator());
+  pass(w2, kStreamOutputAppendOffset, true);
+  rig.render(w2, {target, vb, first, second, results});
+  // (the first query of the third round took a record, the second found none left: so 1 written by it, then none, and 3 needed by each)
+  const uint64_t t0 = rig.read_u64(results, 0), written = rig.read_u64(results, 1), needed = rig.read_u64(results, 2), t1 = rig.read_u64(results, 3);
+  uint32_t f0[56], f1[28];
+  rig.read_words(first, ArrayView<uint32_t>(f0, 56));
+  rig.read_words(second, ArrayView<uint32_t>(f1, 28));
+  Vertex squares[7 * 6 + 4 * 6];
+  const uint32_t n = squares_from_records(f0, f1, 7, [](uint32_t i) { return i >= 3 && i < 6 ? -0.5f : 0.0f; }, squares);
+  // (stripes: the numbers as the height of a bar, in the bottom quarter)
+  auto bar = [&](uint32_t k, float value, float r, float g, float bl) {
+    const float x0 = -0.9f + 0.6f * static_cast<float>(k), x1 = x0 + 0.4f, top = -1.0f + 0.5f * value;
+    Vertex* q = squares + n + 6 * k;
+    q[0] = {x0, -1.0f, 0.4f, r, g, bl, 1}, q[1] = {x1, -1.0f, 0.4f, r, g, bl, 1}, q[2] = {x0, top, 0.4f, r, g, bl, 1};
+    q[3] = q[2], q[4] = q[1], q[5] = {x1, top, 0.4f, r, g, bl, 1};
+  };
+  bar(0, static_cast<float>(written) / 4.0f, 1, 0.3f, 0.3f);
+  bar(1, static_cast<float>(needed) / 4.0f, 0.3f, 1, 0.3f);
+  // (the fourth bar: the clock was not interrupted and runs in nanoseconds)
+  Vertex* last = squares + n + 18;
+  const float tick = rig.read_u64(results, 5) == 1000000000u && rig.read_u64(results, 4) == 0 ? 1.0f : 0.1f;
+  last[0] = {0.9f - 0.4f, -1.0f, 0.4f, 1, 1, 0.3f, 1}, last[1] = {0.9f, -1.0f, 0.4f, 1, 1, 0.3f, 1}, last[2] = {0.9f - 0.4f, -1.0f + 0.5f * tick, 0.4f, 1, 1, 0.3f, 1};
+  last[3] = last[2], last[4] = last[1], last[5] = {0.9f, -1.0f + 0.5f * tick, 0.4f, 1, 1, 0.3f, 1};
+  bar(2, t1 > t0 && t0 != 0 ? 1.0f : 0.1f, 0.3f, 0.3f, 1);
+  Handle flat = d3d9_pipeline(rig, false, false);
+  Handle svb = rig.buffer(kAllocVertexBuffer, bytes_of(squares, sizeof(Vertex) * (n + 24)));
+  CommandWriter w3(rig.allocator());
+  begin(w3, 0, kNoAllocation, {0, 0, 0, 1});
+  w3.bind_pipeline(flat);
+  w3.bind_vertex_buffer(1);
+  w3.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w3.draw(n + 24);
+  w3.end_pass();
+  rig.render(w3, {target, svb});
+  rig.read(target, out);
+}
+
+// Stream output of a vertex shader and of a domain shader: the three vertices of a triangle come out as the records they were (squares, as with the geometry shader), and the triangles the
+// tessellator made of a patch are drawn again from the records (position and colour of each vertex).
+void scene_stream_output_stages(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureStreamOutput | graphics::kFeatureTessellation | graphics::kFeatureOcclusionQueries | graphics::kFeatureStatisticsQueries))
+    return void(rig.step("stream output stages", status::kNotSupported));
+  namespace b = conformance_blobs;
+  const Vertex v[3] = {{-0.5f, -0.25f, 0.5f, 1, 0, 0, 1}, {0.5f, -0.25f, 0.5f, 0, 1, 0, 1}, {0.0f, 0.75f, 0.5f, 0, 0, 1, 1}};
+  Handle vs = rig.vertex_shader(bytes_of(b::k_vs, sizeof b::k_vs));
+  Handle ps = rig.pixel_shader(bytes_of(b::k_ps_color, sizeof b::k_ps_color));
+  Handle hs = rig.shader("create_shader (hull)", ShaderKind::Dxbc, graphics::ShaderStage::Hull, bytes_of(b::k_hs_tri_cb, sizeof b::k_hs_tri_cb));
+  Handle ds = rig.shader("create_shader (domain)", ShaderKind::Dxbc, graphics::ShaderStage::Domain, bytes_of(b::k_ds_noise, sizeof b::k_ds_noise));
+  PipelineDesc vp = colour_pipeline_desc(vs, ps);
+  vp.varying_count = 3;
+  vp.stream_output_count = 2;
+  vp.stream_output[0] = {0, 0, 0, 4, 0}, vp.stream_output[1] = {0, 1, 0, 4, 0};
+  vp.stream_output_stride[0] = 32;
+  vp.rasterized_stream = -1;
+  Handle vertex_pipe = rig.pipeline(vp);
+  PipelineDesc tp = vp;
+  tp.hull_shader = hs, tp.domain_shader = ds;
+  Handle domain_pipe = rig.pipeline(tp);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  AllocationDesc od;
+  od.flags = kAllocStreamOutput, od.size = 3 * 32;
+  Handle vertex_out = rig.create(od);
+  od.size = 64 * 3 * 32;
+  Handle domain_out = rig.create(od);
+  AllocationDesc rd;
+  rd.flags = kAllocQueryResult, rd.size = 8;
+  Handle results = rig.create(rd);
+  CommandWriter w(rig.allocator());
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.set_stream_output(0, 2);
+  w.bind_pipeline(vertex_pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(3);
+  float constants[24];
+  for (uint32_t k = 0; k < 16; ++k) constants[k] = kIdentity[k];
+  for (uint32_t k = 0; k < 8; ++k) constants[16 + k] = k < 4 ? 3.0f : 0.0f;
+  w.set_stream_output(0, 3);
+  w.bind_pipeline(domain_pipe);
+  w.push_constants(bytes_of(constants, sizeof constants));
+  w.set_topology(patch_list(3));
+  w.begin_query(4, 0, static_cast<uint32_t>(graphics::QueryKind::SoPrimitivesWritten));
+  w.draw(3);
+  w.end_query();
+  w.end_pass();
+  rig.render(w, {target, vb, vertex_out, domain_out, results});
+  const uint64_t triangles = rig.read_u64(results, 0);
+  const uint32_t count = triangles > 64 ? 64 : static_cast<uint32_t>(triangles);
+  uint32_t f0[24], f1[64 * 24];
+  rig.read_words(vertex_out, ArrayView<uint32_t>(f0, 24));
+  rig.read_words(domain_out, ArrayView<uint32_t>(f1, 24 * count));
+  auto f = [](uint32_t bits) { return __builtin_bit_cast(float, bits); };
+  Vertex drawn[3 * 6 + 64 * 3];
+  uint32_t n = 0;
+  for (uint32_t i = 0; i < 3; ++i) {
+    const float x = f(f0[8 * i]) * 0.5f - 0.5f, y = f(f0[8 * i + 1]) * 0.5f - 0.5f, h = 0.1f;
+    const float r = f(f0[8 * i + 4]), g = f(f0[8 * i + 5]), bl = f(f0[8 * i + 6]);
+    Vertex* q = drawn + n;
+    q[0] = {x - h, y - h, 0.5f, r, g, bl, 1}, q[1] = {x + h, y - h, 0.5f, r, g, bl, 1}, q[2] = {x - h, y + h, 0.5f, r, g, bl, 1};
+    q[3] = q[2], q[4] = q[1], q[5] = {x + h, y + h, 0.5f, r, g, bl, 1};
+    n += 6;
+  }
+  for (uint32_t i = 0; i < 3 * count; ++i) {
+    const float x = f(f1[8 * i]) * 0.5f + 0.4f, y = f(f1[8 * i + 1]) * 0.5f + 0.2f;
+    drawn[n++] = {x, y, 0.5f, f(f1[8 * i + 4]), f(f1[8 * i + 5]), f(f1[8 * i + 6]), 1};
+  }
+  Handle flat = d3d9_pipeline(rig, false, false);
+  Handle svb = rig.buffer(kAllocVertexBuffer, bytes_of(drawn, sizeof(Vertex) * n));
+  CommandWriter w2(rig.allocator());
+  begin(w2, 0, kNoAllocation, {0, 0, 0, 1});
+  w2.bind_pipeline(flat);
+  w2.bind_vertex_buffer(1);
+  w2.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w2.draw(n);
+  w2.end_pass();
+  rig.render(w2, {target, svb});
+  rig.read(target, out);
+}
+
+// A stream other than the first drawn: gs_streams_draw1 puts a point at each vertex in stream 1 (moved by half a pixel to the centre of a pixel) and a vector in stream 0, which only the buffer
+// gets. The picture is the three points.
+void scene_stream_output_draw_stream1(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureStreamOutput | graphics::kFeatureGeometryShaders)) return void(rig.step("stream output draw stream", status::kNotSupported));
+  namespace b = conformance_blobs;
+  const Vertex v[3] = {{-0.5f, -0.5f, 0.5f, 1, 0, 0, 1}, {0.5f, -0.5f, 0.5f, 0, 1, 0, 1}, {0.0f, 0.5f, 0.5f, 0, 0, 1, 1}};
+  Handle vs = rig.vertex_shader(bytes_of(b::k_vs, sizeof b::k_vs));
+  Handle gs = rig.shader("create_shader (geometry)", ShaderKind::Dxbc, graphics::ShaderStage::Geometry, bytes_of(b::k_gs_streams_draw1, sizeof b::k_gs_streams_draw1));
+  Handle ps = rig.pixel_shader(bytes_of(b::k_ps_color, sizeof b::k_ps_color));
+  PipelineDesc pd = colour_pipeline_desc(vs, ps);
+  pd.varying_count = 3;
+  pd.geometry_shader = gs;
+  pd.stream_output_count = 2;
+  pd.stream_output[0] = {0, 4, 0, 4, 0}, pd.stream_output[1] = {1, 0, 0, 4, 1};   // (stream 0's vector made of the position and colour; stream 1's position)
+  pd.stream_output_stride[0] = 16, pd.stream_output_stride[1] = 16;
+  pd.rasterized_stream = 1;
+  Handle pipe = rig.pipeline(pd);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  AllocationDesc od;
+  od.flags = kAllocStreamOutput, od.size = 3 * 16;
+  Handle first = rig.create(od);
+  Handle second = rig.create(od);
+  CommandWriter w(rig.allocator());
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.set_stream_output(0, 2);
+  w.set_stream_output(1, 3);
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(3);
+  w.end_pass();
+  rig.render(w, {target, vb, first, second});
+  // (stream 0's vectors, position + colour, drawn as squares on the points: a pixel alone is little to compare)
+  uint32_t g0[12];
+  rig.read_words(first, ArrayView<uint32_t>(g0, 12));
+  Vertex squares[18];
+  for (uint32_t i = 0; i < 3; ++i) {
+    const float x = __builtin_bit_cast(float, g0[4 * i]) * 0.5f, y = __builtin_bit_cast(float, g0[4 * i + 1]) * 0.5f - 0.25f, h = 0.15f;
+    Vertex* q = squares + 6 * i;
+    q[0] = {x - h, y - h, 0.5f, 1, 1, 0.5f, 1}, q[1] = {x + h, y - h, 0.5f, 1, 1, 0.5f, 1}, q[2] = {x - h, y + h, 0.5f, 1, 1, 0.5f, 1};
+    q[3] = q[2], q[4] = q[1], q[5] = {x + h, y + h, 0.5f, 1, 1, 0.5f, 1};
+  }
+  Handle flat = d3d9_pipeline(rig, false, false);
+  Handle svb = rig.buffer(kAllocVertexBuffer, bytes_of(squares, sizeof squares));
+  CommandWriter w2(rig.allocator());
+  w2.begin_pass(0, kNoAllocation, 0, {0, 0, 0, 1}, 1.0f, 0);   // (the points stay)
+  w2.bind_pipeline(flat);
+  w2.bind_vertex_buffer(1);
+  w2.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w2.draw(18);
+  w2.end_pass();
+  rig.render(w2, {target, svb});
+  rig.read(target, out);
+}
+
 // Primitives with adjacency: a triangle with the three vertices beside it (the shader draws the even ones, with some of the colour of the odd one after each), and a line with the vertex
 // before and after (the shader makes a quad of its four).
 void scene_geometry_adjacency(Rig& rig, ArrayView<uint32_t> out) {
@@ -1788,6 +2042,9 @@ const Entry kScenes[] = {
     {"Direct3D 11 instanced geometry (DXBC)", scene_geometry_instances},
     {"Direct3D 10 adjacency primitives (DXBC)", scene_geometry_adjacency},
     {"Direct3D 11 stream output of two streams (DXBC)", scene_stream_output},
+    {"Direct3D 11 stream output appending, statistics and timestamps (DXBC)", scene_stream_output_append},
+    {"Direct3D 11 stream output of vertex and domain shaders (DXBC)", scene_stream_output_stages},
+    {"Direct3D 11 stream output drawing the second stream (DXBC)", scene_stream_output_draw_stream1},
     {"Direct3D 11 tessellation, triangle domain (DXBC)", scene_tess_triangle, false, 6},
     {"Direct3D 11 tessellation, quad domain (DXBC)", scene_tess_quad, false, 6},
     {"Direct3D 11 tessellation, isolines and points (DXBC)", scene_tess_lines_points, true},

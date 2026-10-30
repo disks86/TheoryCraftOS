@@ -60,6 +60,11 @@ struct GradientStop {
   uint32_t color = 0;
 };
 
+// An affine map of the plane: (x, y) -> (a x + c y + e, b x + d y + f).
+struct Matrix2D {
+  float a = 1, b = 0, c = 0, d = 1, e = 0, f = 0;
+};
+
 enum class ImageFilter : uint8_t {
   Nearest,   // the texel containing the pixel center
   Bilinear,  // 2x2 texels weighted by distance, alpha-aware, never reading outside the source rectangle
@@ -118,6 +123,16 @@ class IRenderer2D {
   // Draws `source_rect` of `source` stretched over `dest`. Pixel centers of `dest` map linearly into
   // `source_rect`; samples never leave the rectangle (clamped at its edges).
   virtual void draw_image_scaled(const Surface& source, const RectF& source_rect, const Rect2D& dest, ImageFilter filter) = 0;
+  // Draws `source_rect` of `source` under `m`: a point (x, y) of the rectangle, measured from its top left corner in source pixels, lands at
+  // m(x, y) on the target. Pixel centers of the target map back through the inverse into the rectangle (samples never leave it; a pixel whose
+  // center falls outside the transformed rectangle is not drawn, so the edges are not anti-aliased). Rotation, skew and scaling in one pass,
+  // done by the GPU's texture units where there is one. Returns false, with nothing drawn, when this renderer cannot do it (the default;
+  // the device renderer under a layer's opacity, or without textures) or `m` is not invertible: the caller then resamples itself.
+  virtual bool draw_image_transformed(const Surface& source, const Rect2D& source_rect, const Matrix2D& m, ImageFilter filter) {
+    (void)source, (void)source_rect, (void)m, (void)filter;
+    return false;
+  }
+
   // Fills `rect` with a gradient along the line from `from` to `to` (pixel coordinates; stops at 0 and 1 are
   // at those points, the ends extend as flat color). Stops must be sorted by offset; at most
   // kMaxGradientStops are used; no stops draws nothing; one stop is a flat fill.

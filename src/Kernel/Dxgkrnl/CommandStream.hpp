@@ -36,10 +36,10 @@
 //   DrawIndexed      index_count, first_index, vertex_offset (signed)
 //   CopyRegion       dst_index, dst_x, dst_y, src_index, src_x, src_y, width, height   (colour images of one format; also staging memory)
 //   GenerateMipmaps  allocation_index
-//   BeginQuery       allocation_index, offset [, kind]   (kind: a graphics::QueryKind, 0 occlusion count if left out, 1 occlusion predicate, 2 IA vertices, 3 IA primitives, 4 VS invocations, 5 PS invocations;
-//                    the others need kFeatureStatisticsQueries. An occlusion query, the adapter's kFeatureOcclusionQueries: inside a pass; the allocation is a kAllocQueryResult buffer and `offset` a multiple of 8
+//   BeginQuery       allocation_index, offset [, kind]   (kind: a graphics::QueryKind, 0 occlusion count if left out, 1 occlusion predicate, 2 IA vertices, 3 IA primitives, 4 VS invocations, 5 PS invocations, 6 timestamp (kFeatureTimestampQueries; ns, read when the query ends),
+//                    7 / 8 stream output primitives written / needed (both kFeatureStatisticsQueries and kFeatureStreamOutput; bits 8-9 of the kind word say which output stream); the others need kFeatureStatisticsQueries. An occlusion query, the adapter's kFeatureOcclusionQueries: inside a pass; the allocation is a kAllocQueryResult buffer and `offset` a multiple of 8
 //                    with 8 bytes room. One query is open at a time and it ends before the pass does; at most kMaxOcclusionQueries per stream)
-//   SetStreamOutput  slot, allocation_index (kNoAllocation: none), offset   (the buffer the pipeline's stream output declaration puts buffer `slot` in: a kAllocStreamOutput buffer, offset a multiple of 4; anywhere,
+//   SetStreamOutput  slot, allocation_index (kNoAllocation: none), offset   (the buffer the pipeline's stream output declaration puts buffer `slot` in: a kAllocStreamOutput buffer, offset a multiple of 4 or kStreamOutputAppendOffset; anywhere,
 //                    the adapter's kFeatureStreamOutput)
 //   BindUav          slot, allocation_index, offset, size   (a storage buffer for compute shaders, outside a pass: slot below kMaxStorageBuffers, a kAllocUnorderedAccess buffer, offset and size multiples of 4)
 //   Dispatch         groups_x, groups_y, groups_z   (outside a pass, with a compute pipeline bound by BindPipeline and every storage slot its shader uses bound; each count at most kMaxDispatchGroups)
@@ -89,6 +89,7 @@ inline bool is_adjacency(Topology t) { return t == Topology::LineListAdjacency |
 inline uint32_t patch_points(Topology t) { return static_cast<uint32_t>(t) - kPatchListBase; }
 
 constexpr uint32_t kNoAllocation = 0xFFFFFFFFu;
+constexpr uint32_t kStreamOutputAppendOffset = 0xFFFFFFFFu;   // SetStreamOutput's offset for "after what the last stream output into the buffer wrote"
 constexpr uint32_t kMaxPacketWords = 2 + graphics::kMaxPushConstantBytes / 4;   // (PushConstants is the longest: the byte count, then up to kMaxPushConstantBytes of constants)
 constexpr uint64_t kMaxCommandBytes = 16 * 1024 * 1024;
 
@@ -152,6 +153,7 @@ class CommandWriter {
   }
   void end_query() { packet(Op::EndQuery, {}); }
   // Stream output buffer `slot` (below kMaxStreamOutputBuffers) is the kAllocStreamOutput allocation, written from `offset` (a multiple of 4; the draws that follow append); kNoAllocation unbinds it.
+  // (`offset` kStreamOutputAppendOffset: where the last stream output into the buffer ended)
   void set_stream_output(uint32_t slot, uint32_t allocation, uint32_t offset = 0) { packet(Op::SetStreamOutput, {slot, allocation, offset}); }
   void bind_uav(uint32_t slot, uint32_t allocation, uint32_t offset, uint32_t size) { packet(Op::BindUav, {slot, allocation, offset, size}); }
   void dispatch(uint32_t x, uint32_t y = 1, uint32_t z = 1) { packet(Op::Dispatch, {x, y, z}); }

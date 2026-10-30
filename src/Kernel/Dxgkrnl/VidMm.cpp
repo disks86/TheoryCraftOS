@@ -189,6 +189,7 @@ void VidMm::forget(Allocation& a) {
 }
 
 void VidMm::release_device_object(Allocation& a) {
+  if (a.buffer_) a.so_filled_ = a.buffer_->stream_output_filled();   // (where the next stream output that appends goes)
   if (a.image_) device_.destroy_image(a.image_);
   if (a.buffer_) device_.destroy_buffer(a.buffer_);
   a.image_ = nullptr;
@@ -210,6 +211,7 @@ bool VidMm::create_device_object(Allocation& a) {
     if (d.flags & kAllocUnorderedAccess) usage |= graphics::kBufferStorage;
     if (d.flags & kAllocStreamOutput) usage |= graphics::kBufferStreamOutput;
     a.buffer_ = device_.create_buffer(d.size, usage);
+    if (a.buffer_) a.buffer_->set_stream_output_filled(a.so_filled_);
     return a.buffer_ != nullptr;
   }
   graphics::ImageDesc id;

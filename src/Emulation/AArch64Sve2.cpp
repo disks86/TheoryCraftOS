@@ -386,7 +386,7 @@ bool AArch64Cpu::sve2(uint32_t insn) {
       if (sz == 3) { zmr = bits_of(insn, 19, 16); index = (insn >> 20) & 1; }      // .d destination: 1-bit index
       else { zmr = bits_of(insn, 18, 16); index = bits_of(insn, 20, 19); }
     };
-    if ((op == 0x32 || op == 0x33) && size == 2) {      // SDOT, UDOT (two-way, halfwords into words, by element)
+    if ((op == 0x32 || op == 0x33) && size == 2 && !((insn >> 21) & 1)) {      // SDOT, UDOT (two-way, halfwords into words, by element)
       const Vec n = s_.v[zn], m = s_.v[bits_of(insn, 18, 16)];
       const uint32_t index = bits_of(insn, 20, 19);
       for (uint32_t i = 0; i < 4; ++i) put(dst, 2, i, (get(*dst, 2, i) + static_cast<uint64_t>(dot_sum(n, m, 1, 2, i, op == 0x32, op == 0x32, index * 2))) & 0xFFFFFFFFu);
