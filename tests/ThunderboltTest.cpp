@@ -3618,6 +3618,60 @@ static void test_usb4_asymmetric() {
   }
 }
 
+static void test_usb4_clx() {
+  const uint32_t all = kLaneCs1Cl0sEnable | kLaneCs1Cl1Enable | kLaneCs1Cl2Enable;
+  {   // version 1 routers: CL0s and CL1 on the first link only, the secondary marked
+    Usb4Rig rig;
+    Usb4Domain domain(rig.control, rig.nhi, rig.alloc);
+    CHECK(domain.start(nullptr));
+    fake_usb4::Router& host = rig.fabric.at(0);
+    fake_usb4::Router& d1 = rig.fabric.at(0x01);
+    fake_usb4::Router& d2 = rig.fabric.at(0x301);
+    CHECK(domain.clx_state(1) == (kClx0s | kClx1) && domain.clx_state(2) == 0 && domain.clx_state(0) == 0);
+    CHECK((host.ports[1].space[0x11] & all) == (kLaneCs1Cl0sEnable | kLaneCs1Cl1Enable) && (d1.ports[1].space[0x11] & all) == (kLaneCs1Cl0sEnable | kLaneCs1Cl1Enable));
+    CHECK((d1.ports[1].space[0x11] & kLaneCs1Pms) && !(host.ports[1].space[0x11] & kLaneCs1Pms) && !(d2.ports[1].space[0x11] & all) && !(d1.ports[3].space[0x11] & all));
+    // CL1 alone is not asked for; CL2 needs version 2 on both sides
+    CHECK(!domain.set_clx(1, kClx1) && !domain.set_clx(1, kClx0s | kClx1 | kClx2) && domain.set_clx(1, 0) && domain.clx_state(1) == 0 && !(host.ports[1].space[0x11] & all));
+    CHECK(domain.set_clx(1, kClx0s) && domain.clx_state(1) == kClx0s && !domain.set_clx(0, kClx0s) && !domain.set_clx(9, kClx0s));
+    // sleep switches them off first
+    CHECK(domain.suspend(false) && !(host.ports[1].space[0x11] & all) && !(d1.ports[1].space[0x11] & all));
+  }
+  {   // version 2 routers: CL2 too; the policy can keep them off
+    Usb4Rig rig(false);
+    rig.fabric.at(0).version = 0x40;
+    rig.fabric.at(0x01).version = 0x40;
+    Usb4Domain domain(rig.control, rig.nhi, rig.alloc);
+    CHECK(domain.start(nullptr) && domain.clx_state(1) == (kClx0s | kClx1 | kClx2));
+    Usb4Rig off(false);
+    Usb4Domain d(off.control, off.nhi, off.alloc);
+    d.set_clx_policy(false);
+    CHECK(d.start(nullptr) && d.clx_state(1) == 0 && !(off.fabric.at(0).ports[1].space[0x11] & all));
+  }
+  {   // not on a Tiger Lake host router, not when the port does not say it can, not on an unbonded link
+    Usb4Rig tgl(false);
+    tgl.fabric.at(0).device = 0x9A1B;
+    Usb4Domain d1(tgl.control, tgl.nhi, tgl.alloc);
+    CHECK(d1.start(nullptr) && d1.clx_state(1) == 0);
+    Usb4Rig nocps(false);
+    nocps.fabric.at(0x01).ports[1].space[0x20 + kPortCs18] &= ~kPortCs18Cps;
+    Usb4Domain d2(nocps.control, nocps.nhi, nocps.alloc);
+    CHECK(d2.start(nullptr) && d2.clx_state(1) == 0);
+    Usb4Rig single(false);
+    single.fabric.at(0x01).ports[1].space[0x20 + kPortCs18] &= ~kPortCs18Be;
+    Usb4Domain d3(single.control, single.nhi, single.alloc);
+    CHECK(d3.start(nullptr) && !d3.link_bonded(1) && d3.clx_state(1) == 0);
+  }
+  {   // a path to another host switches them off, closing it brings them back
+    Usb4Rig rig(false);
+    rig.fabric.link_host(0x01, 3);                                                          // another computer on the dock's second link: its path crosses the first link
+    Usb4Domain domain(rig.control, rig.nhi, rig.alloc);
+    const char* error = nullptr;
+    CHECK(domain.start(nullptr) && domain.clx_state(1) == (kClx0s | kClx1) && domain.xdomain_count() == 1);
+    CHECK(domain.approve_xdomain_paths(0, 9, 1, 10, 2, &error) && domain.clx_state(1) == 0 && !(rig.fabric.at(0).ports[1].space[0x11] & all));
+    CHECK(domain.disconnect_xdomain_paths(0) && domain.clx_state(1) == (kClx0s | kClx1));
+  }
+}
+
 static void test_usb4_garbage() {
   // the routers answer with noise: the manager must stay inside its arrays, whatever comes (and the sanitizers say if it does not)
   for (uint32_t seed = 1; seed <= 200; ++seed) {
@@ -3672,6 +3726,7 @@ int main() {
   test_usb4_tbt3_device();
   test_usb4_dp();
   test_usb4_asymmetric();
+  test_usb4_clx();
   test_usb4_runtime_sleep();
   test_usb4_xdomain_failures();
   test_usb4_driver();

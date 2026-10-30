@@ -43,7 +43,8 @@ constexpr uint32_t kTypeInactive = 0, kTypePort = 0x000001, kTypeNhi = 0x000002,
 // the lane adapter capability (LANE_ADP_CS_0 and 1, relative to the PHY capability) and the USB4 port capability
 constexpr uint32_t kLaneCs0 = 0, kLaneCs0WidthShift = 20, kLaneCs0WidthMask = 0x3F, kLaneCs0WidthDual = 2, kLaneCs1 = 1, kLaneCs1TargetWidthMask = 3u << 4, kLaneCs1TargetSingle = 1u << 4,
                    kLaneCs1TargetDual = 3u << 4, kLaneCs1Lb = 1u << 15, kLaneCs1CurrentWidthShift = 20, kLaneCs1CurrentWidthMask = 0x3Fu << 20, kPortCs18 = 0x12, kPortCs18Be = 1u << 8, kPortCs18Csa = 1u << 22, kPortCs18Tip = 1u << 24, kPortCs19StartAsym = 1u << 24,
-                   kLaneCs1TargetAsymMask = 3u << 6, kLaneCs1TargetAsymTx = 1u << 6, kLaneCs1TargetAsymRx = 2u << 6, kLaneCs1CurrentSpeedShift = 16, kLaneCs1CurrentSpeedMask = 0xFu << 16, kLaneSpeedGen4 = 2, kLaneSpeedGen3 = 4;
+                   kLaneCs1TargetAsymMask = 3u << 6, kLaneCs1TargetAsymTx = 1u << 6, kLaneCs1TargetAsymRx = 2u << 6, kLaneCs1CurrentSpeedShift = 16, kLaneCs1CurrentSpeedMask = 0xFu << 16, kLaneSpeedGen4 = 2, kLaneSpeedGen3 = 4,
+                   kLaneCs0Cl0sSupport = 1u << 26, kLaneCs0Cl1Support = 1u << 27, kLaneCs0Cl2Support = 1u << 28, kLaneCs1Cl0sEnable = 1u << 10, kLaneCs1Cl1Enable = 1u << 11, kLaneCs1Cl2Enable = 1u << 12, kLaneCs1Pms = 1u << 30, kPortCs18Cps = 1u << 10;
 // USB 3 adapters (ADP_USB3_CS_*, relative to the adapter capability)
 constexpr uint32_t kUsb3Cs0Pe = 1u << 31, kUsb3Cs1 = 1, kUsb3Cs1Hca = 1u << 31, kUsb3Cs2 = 2, kUsb3Cs2Cmr = 1u << 31, kUsb3Cs3 = 3, kUsb3Cs4 = 4, kUsb3Cs4MslrShift = 12, kUsb3Cs4MslrMask = 0x7F, kUsb3Cs4Mslr20G = 1,
                    kUsb3Hop = 8, kUsb3Priority = 3, kUsb3Weight = 2;
@@ -106,6 +107,7 @@ struct Usb4Router {
   int16_t parent = -1;               // the router above it and the port of that one it hangs from
   uint8_t parent_port = 0;
   bool configured = false;
+  uint8_t clx = 0;                   // the low power states enabled on the link above it (Usb4Clx)
   uint8_t cap_tmu = 0;               // the router's time management unit capability (0: none)
   bool tbt3 = false;                 // a Thunderbolt 3 router (no USB4 version): configured through its plug events and link controller capabilities
   uint8_t cap_plug_events = 0, cap_lc = 0;
@@ -134,6 +136,9 @@ struct Usb4Path {
 };
 
 // The width of a link: one lane, two lanes bonded, or (USB4 version 2, 80 Gb/s links) three lanes one way and one the other. The values are what the lane adapter reports.
+// The low power states of the lanes of a link (CL0s, CL1, CL2).
+enum Usb4Clx : uint8_t { kClx0s = 1, kClx1 = 2, kClx2 = 4 };
+
 enum class Usb4LinkWidth : uint8_t { Single = 1, Dual = 2, AsymTx = 4, AsymRx = 8 };
 
 enum class Usb4TunnelKind : uint8_t { Pcie, Usb3, Dma, Dp };
@@ -190,6 +195,12 @@ class Usb4Domain final : public IThunderboltEvents, public IXdomainHost, private
   bool link_bonded(uint32_t router_index) const;
   // The current width of the link above a router, read from its lane adapter (0 for the host router or a link that cannot be read).
   Usb4LinkWidth link_width(uint32_t router_index);
+  // Low power states of the high speed lanes (clx.c). The first link below the host router gets them when it comes up (as the Linux driver does: that is what lets the processor save energy):
+  // CL0s, CL1 and, between version 2 routers, CL2, if both ends of a bonded link support them. A path to another host switches them off meanwhile, sleep too. `set_clx_policy(false)` keeps them
+  // off. Not on a Tiger Lake host router (known to misbehave), not on Thunderbolt 3 routers.
+  uint8_t clx_state(uint32_t router_index) const { const Usb4Router* r = router(router_index); return r ? r->clx : 0; }
+  void set_clx_policy(bool enabled) { clx_policy_ = enabled; }
+  bool set_clx(uint32_t router_index, uint8_t states);
   // Changes the link above a router between two lanes bonded and the asymmetric forms with three lanes in one direction (AsymTx: three from the host towards the router): both routers must be
   // USB4 version 2, the link must run at generation 4 and both ends must support the change (PORT_CS_18.CSA). The host-side policy of when an asymmetric link is worth it (bandwidth demand) is
   // the caller's. Refused with a tunnel of a bandwidth-sensitive kind (DisplayPort) through the link.
@@ -317,6 +328,13 @@ class Usb4Domain final : public IThunderboltEvents, public IXdomainHost, private
   bool set_asym_width(const Usb4Router& r, uint32_t port, Usb4LinkWidth width);
   bool asym_start(const Usb4Router& r, uint32_t port);
   bool wait_link_width(const Usb4Router& r, uint32_t port, uint32_t widths, uint32_t timeout_us);
+  bool clx_supported(const Usb4Router& r) const;
+  bool port_clx_supported(const Usb4Router& r, uint32_t port, uint8_t states);
+  bool port_clx_set(const Usb4Router& r, uint32_t port, uint8_t states, bool enable);
+  bool clx_enable(Usb4Router& child, uint8_t states);
+  bool clx_disable(Usb4Router& child);
+  void clx_enable_first_link(int router_index);
+  void clx_disable_up(int router_index);
   bool bond_link(Usb4Router& child, Usb4Router& parent, uint32_t down_port);
   int lane_width(const Usb4Router& r, uint32_t port);
   bool set_lane_width(const Usb4Router& r, uint32_t port, uint32_t target);
@@ -340,7 +358,7 @@ class Usb4Domain final : public IThunderboltEvents, public IXdomainHost, private
   Plug plugs_[kPlugQueue];
   uint32_t plug_head_ = 0, plug_count_ = 0;
   uint32_t preboot_closed_ = 0, events_seen_ = 0, unreachable_ = 0;
-  bool started_ = false, suspended_ = false;
+  bool started_ = false, suspended_ = false, clx_policy_ = true;
 };
 
 }  // namespace hardware

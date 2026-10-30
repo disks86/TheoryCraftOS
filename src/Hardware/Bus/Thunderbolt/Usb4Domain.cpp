@@ -687,6 +687,7 @@ void Usb4Domain::scan_port(int index, uint32_t port_number) {
   {
     int root = index;
     while (routers_[root]->parent >= 0) root = routers_[root]->parent;
+    clx_enable_first_link(child_index);
     tmu_enable(child, parent, *routers_[root], port_number);   // (a router that cannot keep time with the host's works without it)
   }
   configuration_valid(child);
@@ -833,6 +834,8 @@ bool Usb4Domain::suspend(bool runtime) {
   if (!started_ || suspended_ || (runtime && !runtime_allowed())) return false;
   plug_count_ = 0;                                         // (events from before the sleep mean nothing after it)
   xd_.clear();                                              // (the other hosts and their paths)
+  for (uint64_t i = 0; i < routers_.count(); ++i)
+    if (routers_[i]->present) clx_disable(*routers_[i]);     // (the low power states go before the links do)
   for (uint32_t i = 0; i < kMaxTunnels; ++i)
     if (tunnels_[i].used) remove_tunnel(static_cast<int>(i));
   // deepest first; a router that will not sleep is left awake and dropped with the rest, the host router's refusal is what the answer reports
@@ -1444,6 +1447,7 @@ bool Usb4Domain::open_paths(const TbXDomain& xd, uint16_t transmit_path, uint16_
     return false;
   }
   const uint32_t nhi_port = routers_[root]->upstream_port;
+  clx_disable_up(parent);                                   // (the low power states are off for as long as the path to the other host is)
   int slot = -1;
   for (uint32_t i = 0; i < kMaxTunnels && slot < 0; ++i)
     if (!tunnels_[i].used) slot = static_cast<int>(i);
@@ -1480,6 +1484,9 @@ bool Usb4Domain::open_paths(const TbXDomain& xd, uint16_t transmit_path, uint16_
 void Usb4Domain::close_paths(const TbXDomain& xd) {
   for (uint32_t i = 0; i < kMaxTunnels; ++i)
     if (tunnels_[i].used && tunnels_[i].kind == Usb4TunnelKind::Dma && tunnels_[i].xdomain_route == xd.route) remove_tunnel(static_cast<int>(i));
+  const uint32_t length = route_length(xd.route);
+  const int parent = length ? find_router(xd.route & ~(0xFFull << (8 * (length - 1)))) : -1;
+  if (parent >= 0 && routers_[parent]->present) clx_enable_first_link(parent);
 }
 
 // ------------------------------------------------------------------ DisplayPort
@@ -1665,6 +1672,105 @@ uint32_t Usb4Domain::dp_tunnels() const {
   uint32_t n = 0;
   for (uint32_t i = 0; i < kMaxTunnels; ++i) n += tunnels_[i].used && tunnels_[i].kind == Usb4TunnelKind::Dp;
   return n;
+}
+
+// ------------------------------------------------------------------ CL states
+
+bool Usb4Domain::clx_supported(const Usb4Router& r) const {
+  if (r.tbt3 || r.usb4_version == 0) return false;
+  if (r.vendor_id == 0x8086 && (r.device_id == 0x9A1B || r.device_id == 0x9A1D || r.device_id == 0x9A1F || r.device_id == 0x9A21)) return false;     // (tb_switch_is_tiger_lake)
+  return true;
+}
+
+// tb_port_clx_supported: a bonded link, no other host, the port says it can (PORT_CS_18.CPS), and the lane adapter lists the states.
+bool Usb4Domain::port_clx_supported(const Usb4Router& r, uint32_t port, uint8_t states) {
+  const Usb4Port& p = r.ports[port];
+  if (!p.bonded || p.xdomain || p.cap_usb4 == 0 || p.cap_phy == 0) return false;
+  uint32_t word = 0;
+  if (!port_read(r, port, p.cap_usb4 + kPortCs18, ArrayView<uint32_t>(&word, 1)) || !(word & kPortCs18Cps)) return false;
+  uint32_t mask = 0;
+  if (states & kClx0s) mask |= kLaneCs0Cl0sSupport;
+  if (states & kClx1) mask |= kLaneCs0Cl1Support;
+  if (states & kClx2) mask |= kLaneCs0Cl2Support;
+  return port_read(r, port, p.cap_phy + kLaneCs0, ArrayView<uint32_t>(&word, 1)) && (word & mask) != 0;
+}
+
+bool Usb4Domain::port_clx_set(const Usb4Router& r, uint32_t port, uint8_t states, bool enable) {
+  const Usb4Port& p = r.ports[port];
+  uint32_t mask = 0;
+  if (states & kClx0s) mask |= kLaneCs1Cl0sEnable;
+  if (states & kClx1) mask |= kLaneCs1Cl1Enable;
+  if (states & kClx2) mask |= kLaneCs1Cl2Enable;
+  uint32_t word = 0;
+  if (mask == 0 || p.cap_phy == 0 || !port_read(r, port, p.cap_phy + kLaneCs1, ArrayView<uint32_t>(&word, 1))) return false;
+  word = enable ? (word | mask) : (word & ~mask);
+  return port_write(r, port, p.cap_phy + kLaneCs1, ArrayView<const uint32_t>(&word, 1));
+}
+
+// tb_switch_clx_enable: CL1 needs CL0s; CL2 needs version 2 routers on both sides; the upstream adapter of the router is made the power management secondary and the downstream one the primary; both
+// ends must support the states; the upstream end is enabled first and undone if the downstream one fails.
+bool Usb4Domain::clx_enable(Usb4Router& child, uint8_t states) {
+  if (states == 0 || child.clx == states || ((states & kClx1) && !(states & kClx0s)) || child.parent < 0) return false;
+  Usb4Router& parent = *routers_[child.parent];
+  if (!clx_supported(child) || !clx_supported(parent)) return false;
+  if ((states & kClx2) && (child.usb4_version < 2 || parent.usb4_version < 2)) return false;
+  const uint32_t up = child.upstream_port, down = child.parent_port;
+  const uint8_t both[2] = {0, 1};
+  (void)both;
+  {   // power management: the upstream adapter is the secondary
+    const Usb4Port& u = child.ports[up];
+    const Usb4Port& d = parent.ports[down];
+    uint32_t word = 0;
+    if (u.cap_phy == 0 || d.cap_phy == 0) return false;
+    if (!port_read(child, up, u.cap_phy + kLaneCs1, ArrayView<uint32_t>(&word, 1))) return false;
+    word |= kLaneCs1Pms;
+    if (!port_write(child, up, u.cap_phy + kLaneCs1, ArrayView<const uint32_t>(&word, 1))) return false;
+    if (!port_read(parent, down, d.cap_phy + kLaneCs1, ArrayView<uint32_t>(&word, 1))) return false;
+    word &= ~kLaneCs1Pms;
+    if (!port_write(parent, down, d.cap_phy + kLaneCs1, ArrayView<const uint32_t>(&word, 1))) return false;
+  }
+  if (!port_clx_supported(child, up, states) || !port_clx_supported(parent, down, states)) return false;
+  if (!port_clx_set(child, up, states, true)) return false;
+  if (!port_clx_set(parent, down, states, true)) {
+    port_clx_set(child, up, states, false);
+    return false;
+  }
+  child.clx = static_cast<uint8_t>(child.clx | states);
+  return true;
+}
+
+bool Usb4Domain::clx_disable(Usb4Router& child) {
+  if (child.clx == 0 || child.parent < 0) return false;
+  Usb4Router& parent = *routers_[child.parent];
+  const bool ok = port_clx_set(child, child.upstream_port, child.clx, false) && port_clx_set(parent, child.parent_port, child.clx, false);
+  if (ok) child.clx = 0;
+  return ok;
+}
+
+// Only the first link below the host router (tb_enable_clx): with CL2 if the routers allow, else CL0s and CL1.
+void Usb4Domain::clx_enable_first_link(int router_index) {
+  if (!clx_policy_) return;
+  Usb4Router* r = routers_[router_index].get();
+  while (r->parent >= 0 && routers_[r->parent]->parent >= 0) r = routers_[r->parent].get();
+  if (r->parent < 0) return;
+  for (uint32_t i = 0; i < kMaxTunnels; ++i) {               // (a path to another host through this link keeps them off)
+    if (!tunnels_[i].used || tunnels_[i].kind != Usb4TunnelKind::Dma) continue;
+    for (uint32_t h = 0; h < tunnels_[i].down.length; ++h)
+      if (routers_[tunnels_[i].down.hops[h].router].get() == r) return;
+  }
+  if (!clx_enable(*r, kClx0s | kClx1 | kClx2)) clx_enable(*r, kClx0s | kClx1);
+}
+
+// tb_disable_clx: from this router up to the host router.
+void Usb4Domain::clx_disable_up(int router_index) {
+  for (Usb4Router* r = routers_[router_index].get(); r && r->parent >= 0; r = routers_[r->parent].get()) clx_disable(*r);
+}
+
+bool Usb4Domain::set_clx(uint32_t router_index, uint8_t states) {
+  if (router_index >= routers_.count() || !routers_[router_index]->present) return false;
+  Usb4Router& r = *routers_[router_index];
+  if (states == 0) return r.clx == 0 || clx_disable(r);
+  return clx_enable(r, states);
 }
 
 // ------------------------------------------------------------------ lane bonding

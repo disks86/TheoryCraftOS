@@ -168,10 +168,10 @@ class Fabric {
     p.space[3] = number << 20;
     p.space[5] = 0x7FF | (0x7FFu << 11);                         // plenty of HopIDs
     p.space[4] = 40u << 20;                                       // total buffers (ADP_CS_4)
-    p.space[0x10] = 0x20 | (kPortCapPhy << 8) | (2u << 20);       // the lane adapter capability, next at 0x20; it supports two lanes
+    p.space[0x10] = 0x20 | (kPortCapPhy << 8) | (2u << 20) | kLaneCs0Cl0sSupport | kLaneCs0Cl1Support | kLaneCs0Cl2Support;       // the lane adapter capability, next at 0x20; it supports two lanes and the low power states
     p.space[0x20] = 0x40 | (kPortCapUsb4 << 8);                   // the USB4 capability, next the TMU one
     p.space[0x40] = (kPortCapTime1 << 8);
-    p.space[0x20 + kPortCs18] = kPortCs18Be | kPortCs18Csa;       // bonding and asymmetric links supported
+    p.space[0x20 + kPortCs18] = kPortCs18Be | kPortCs18Csa | kPortCs18Cps;       // bonding and asymmetric links supported
     return p;
   }
   static Port usb3(uint32_t number, uint32_t type) {
@@ -313,7 +313,7 @@ class Fabric {
       uint32_t width = dual ? 2u : 1u;
       if (gen4_links) width = asym == kLaneCs1TargetAsymTx ? 4u : asym == kLaneCs1TargetAsymRx ? 8u : (dual || width == 2 ? 2u : (bond_never_completes ? 1u : 2u));
       if (asym_stuck) width = 2u;
-      return (p.space[0x11] & (kLaneCs1TargetWidthMask | kLaneCs1Lb | kLaneCs1TargetAsymMask)) | (p.state << 26) | (width << kLaneCs1CurrentWidthShift) | ((gen4_links ? kLaneSpeedGen4 : kLaneSpeedGen3) << kLaneCs1CurrentSpeedShift);
+      return (p.space[0x11] & (kLaneCs1TargetWidthMask | kLaneCs1Lb | kLaneCs1TargetAsymMask | kLaneCs1Cl0sEnable | kLaneCs1Cl1Enable | kLaneCs1Cl2Enable | kLaneCs1Pms)) | (p.state << 26) | (width << kLaneCs1CurrentWidthShift) | ((gen4_links ? kLaneSpeedGen4 : kLaneSpeedGen3) << kLaneCs1CurrentSpeedShift);
     }
     return p.space[i];
   }
