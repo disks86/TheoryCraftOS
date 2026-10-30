@@ -136,9 +136,16 @@ bool IwlFirmware::parse(ConstByteView d, const char** error) {
 }
 
 uint32_t IwlFirmware::command_version_of(uint8_t group, uint8_t command) const {
+  // (Newer files list the legacy commands under the long group, 1, which has the same command numbers; older ones under group 0.)
   for (uint32_t i = 0; i < command_version_count(); ++i) {
     const IwlCommandVersion v = command_version(i);
     if (v.group == group && v.command == command) return v.command_version;
+  }
+  if (group == 0) {
+    for (uint32_t i = 0; i < command_version_count(); ++i) {
+      const IwlCommandVersion v = command_version(i);
+      if (v.group == 1 && v.command == command) return v.command_version;
+    }
   }
   return 0;
 }
