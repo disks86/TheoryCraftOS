@@ -63,6 +63,8 @@ struct TexturedBlurConstants {
   float step[2];
   float pad[2];
 };
+// A picture (texture 0, premultiplied) multiplied by the alpha of texture 1 at the same coordinate: a clip by a coverage mask. Its pipeline has two textures.
+ShaderModuleDesc textured_masked_fragment_shader();
 ShaderModuleDesc textured_blur_fragment_shader();
 // Colour function on straight colors: rgb' = rows * rgb + add (each row: three factors and the add), clamped, alpha' = alpha * alpha_scale; the output is premultiplied.
 struct TexturedColorConstants {

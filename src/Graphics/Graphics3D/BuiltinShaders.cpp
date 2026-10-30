@@ -83,6 +83,14 @@ bool textured_color_fragment(const Vec4* varyings, const uint8_t* constants, con
   return true;
 }
 
+// A picture through a coverage mask: texture 0 (premultiplied colours) times the alpha of texture 1, at the same coordinate.
+bool textured_masked_fragment(const Vec4* varyings, const uint8_t*, const ITextureSet& textures, Vec4* color) {
+  const Vec4 t = textures.sample(0, varyings[0].x, varyings[0].y);
+  const float k = textures.sample(1, varyings[0].x, varyings[0].y).w;
+  *color = Vec4{t.x * k, t.y * k, t.z * k, t.w * k};
+  return true;
+}
+
 // Push constants are CONST[0..3], the columns of the matrix.
 constexpr const char kColoredVertexTgsi[] =
     "VERT\n"
@@ -224,6 +232,21 @@ constexpr const char kTexturedColorFragmentTgsi[] =
     "  14: MOV OUT[0].w, TEMP[1].wwww\n"
     "  15: END\n";
 
+constexpr const char kTexturedMaskedFragmentTgsi[] =
+    "FRAG\n"
+    "PROPERTY FS_COLOR0_WRITES_ALL_CBUFS 1\n"
+    "DCL IN[0], GENERIC[0], PERSPECTIVE\n"
+    "DCL OUT[0], COLOR\n"
+    "DCL SAMP[0]\n"
+    "DCL SAMP[1]\n"
+    "DCL SVIEW[0], 2D, FLOAT\n"
+    "DCL SVIEW[1], 2D, FLOAT\n"
+    "DCL TEMP[0..1]\n"
+    "  0: TEX TEMP[0], IN[0], SAMP[0], 2D\n"
+    "  1: TEX TEMP[1], IN[0], SAMP[1], 2D\n"
+    "  2: MUL OUT[0], TEMP[0], TEMP[1].wwww\n"
+    "  3: END\n";
+
 // The same two shaders as Direct3D 9 bytecode (vs_2_0, ps_2_0). Position comes in as v0, color as v1; the matrix columns are c0..c3, and c31 is
 // the device's (1, -1, 1, 1) that turns Direct3D's +Y up into Vulkan's +Y down.
 constexpr uint32_t kColoredVertexD3d9[] = {
@@ -308,6 +331,14 @@ ShaderModuleDesc textured_color_fragment_shader() {
   d.stage = ShaderStage::Fragment;
   d.textured_fragment_function = textured_color_fragment;
   d.tgsi = kTexturedColorFragmentTgsi;
+  return d;
+}
+
+ShaderModuleDesc textured_masked_fragment_shader() {
+  ShaderModuleDesc d;
+  d.stage = ShaderStage::Fragment;
+  d.textured_fragment_function = textured_masked_fragment;
+  d.tgsi = kTexturedMaskedFragmentTgsi;
   return d;
 }
 

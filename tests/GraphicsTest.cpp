@@ -1152,7 +1152,7 @@ static void test_primitives() {
     g.r = &d;
     g.dev = &d;
     g.frame = allocate_view<uint32_t>(a, kW * kH);
-    g.exact_clips = false;
+    g.exact_clips = true;   // (rounded and mask clips go through offscreen groups)
     test_rounded(g);
     test_mask(g);
     test_scaled(g, a);

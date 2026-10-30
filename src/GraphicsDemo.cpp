@@ -125,6 +125,26 @@ int groups_check(IGraphicsDevice& device, allocators::IAllocator& allocator) {
     }
     result = ok ? 2 : 0;
   }
+  // Exact clips (a rounded one, one by a coverage mask): the corners of a rounded clip are cut, the middle shows, the edge is partly covered; the mask's half covered column is half.
+  if (result == 2) {
+    r.clear(rgb(0, 0, 0));
+    const bool exact = r.push_clip_rounded_rect({4, 4, 32, 32}, CornerRadii::uniform(14));
+    r.fill_rect({0, 0, 64, 48}, rgb(255, 255, 255));
+    r.pop_clip();
+    uint8_t cov[16 * 8];
+    for (uint32_t y = 0; y < 8; ++y)
+      for (uint32_t x = 0; x < 16; ++x) cov[y * 16 + x] = x < 8 ? 255 : (x < 12 ? 128 : 0);
+    const bool mexact = r.push_clip_mask(MaskView{ConstByteView(cov, sizeof cov), 16, 8, 16}, 40, 4);
+    r.fill_rect({0, 0, 64, 48}, rgb(255, 255, 255));
+    r.pop_clip();
+    bool ok = exact && mexact && r.read_pixels(px);
+    if (ok) {
+      auto chan = [&](uint32_t x, uint32_t y) { return static_cast<int>((px[y * W + x] >> 8) & 0xFF); };
+      const int corner = chan(4, 4), middle = chan(20, 20), edge = chan(5, 12), outside = chan(2, 20);
+      ok = corner == 0 && middle == 255 && outside == 0 && edge > 20 && edge < 250 && chan(44, 6) == 255 && chan(50, 6) >= 124 && chan(50, 6) <= 132 && chan(54, 6) == 0 && chan(44, 14) == 0;
+    }
+    result = ok ? 3 : 0;
+  }
   release_view(allocator, px);
   return result;
 }
@@ -304,7 +324,7 @@ bool run_graphics_demo(SystemGraphics& graphics, allocators::IAllocator& allocat
   console::puts(graphics.renderer_2d() && graphics.renderer_2d()->accelerated() ? ", GPU)\n" : ", CPU)\n");
   console::puts(device_2d ? "  2D on the 3D device (readback of shapes, alpha, text): ok\n"
                           : "  2D on the 3D device (readback of shapes, alpha, text): FAILED\n");
-  console::puts(groups > 0 ? (groups > 1 ? "  2D offscreen groups (opacity, composite, blur and colour filters): ok\n" : "  2D offscreen groups (opacity, premultiplied composite): ok\n")
+  console::puts(groups > 0 ? (groups > 1 ? "  2D offscreen groups (opacity, composite, blur, colour filters, clips): ok\n" : "  2D offscreen groups (opacity, premultiplied composite): ok\n")
                            : groups == 0 ? "  2D offscreen groups (opacity, premultiplied composite): FAILED\n" : "  2D offscreen groups: not supported by this device\n");
   console::puts(conventions ? "  3D conventions (orientation, culling, depth): ok\n"
                             : "  3D conventions (orientation, culling, depth): FAILED\n");
