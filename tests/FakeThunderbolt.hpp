@@ -155,6 +155,17 @@ class FakeNhi final : public hardware::ITbRegisters {
                       0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
   bool acl_error = false;                          // the ACL requests end with the error flag
   uint32_t acl_writes = 0;
+  // A model of routers behind the control channel (see FakeUsb4.hpp): asked first for every configuration space request. `error` nonzero answers with that error code on `port`.
+  struct ConfigAnswer {
+    bool handled = false;
+    uint32_t error = 0;
+    uint32_t port = 0;                 // the port the answer comes from
+    std::vector<uint32_t> data;
+  };
+  std::function<ConfigAnswer(bool write, uint64_t route, uint32_t port, uint32_t space, uint32_t offset, uint32_t length, const std::vector<uint32_t>& data)> config_model;
+  std::vector<std::vector<uint32_t>> errors_from_host;       // error packets the host sent (the acknowledgement of a plug event)
+  // A hot plug event from the router at `route`.
+  void send_plug_event(uint64_t route, uint32_t port, bool unplug) { reply(kEvent, {static_cast<uint32_t>(route >> 32) & 0x3FFFFF, static_cast<uint32_t>(route), port | (unplug ? 0x80000000u : 0u)}); }
   std::function<void()> raise_interrupt;           // the MSI: called when a ring that is unmasked completes something
   uint32_t notify_reads = 0, interrupts_raised = 0;
   uint32_t unmasked[64] = {};                      // the interrupt enable registers as the host left them
@@ -341,6 +352,7 @@ class FakeNhi final : public hardware::ITbRegisters {
       else xdp_responses.push_back(w);
       return;
     }
+    if (eof == kError) { errors_from_host.push_back(w); return; }
     if (eof != kRead && eof != kWrite) return;
     // configuration space request: route (22 + 32 bits), then offset:13 length:6 port:6 space:2 seq:2
     const uint32_t route_hi = w[0] & 0x3FFFFF, route_lo = w[1], addr = w[2];
@@ -354,6 +366,20 @@ class FakeNhi final : public hardware::ITbRegisters {
     if (flash.present && space == 1 && ((addr >> 19) & 0x3F) == flash.port && (offset == 2 || (offset >= kFlashCap && offset <= kFlashCap + 18))) {
       flash_access(eof == kWrite, route_hi, route_lo, addr, offset, length, w);
       return;
+    }
+    if (config_model) {
+      std::vector<uint32_t> data(w.begin() + 3, w.end());
+      const ConfigAnswer a = config_model(eof == kWrite, (uint64_t(route_hi) << 32) | route_lo, (addr >> 19) & 0x3F, space, offset, length, data);
+      if (a.handled) {
+        if (a.error != 0) {
+          reply(kError, {route_hi | (0x200u << 22), route_lo, a.error | (a.port << 8) | (3u << 30)});
+        } else {
+          std::vector<uint32_t> out = {route_hi | (0x200u << 22), route_lo, (addr & ~(0x3Fu << 19)) | (a.port << 19)};
+          if (eof == kRead) out.insert(out.end(), a.data.begin(), a.data.end());
+          reply(static_cast<uint8_t>(eof), out);
+        }
+        return;
+      }
     }
     if (error_code != 0) {
       reply(kError, {route_hi | (0x200u << 22), route_lo, error_code | (3u << 8)});
