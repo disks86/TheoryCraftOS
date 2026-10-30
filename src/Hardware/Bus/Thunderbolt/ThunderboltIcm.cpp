@@ -458,7 +458,7 @@ ThunderboltIcm::Outcome ThunderboltIcm::bring_up(uint32_t timeout_us, bool resum
     return outcome_ = Outcome::RootSwitchFailed;
   }
   outcome_ = Outcome::Started;
-  if (interrupts_) nhi_.set_control_interrupts(true);          // (start-up masked them)
+  if (interrupts_) nhi_.set_control_interrupts(true, msix_vector_);          // (start-up masked them)
   return outcome_;
 }
 
@@ -485,10 +485,11 @@ bool ThunderboltIcm::reset_physical_port(uint32_t physical_port) {
   return cio.write(TbConfigSpace::Port, port0, tb_cio::kPhyPortCs1, v0 & ~tb_cio::kPhyLinkDisable) && cio.write(TbConfigSpace::Port, port1, tb_cio::kPhyPortCs1, v1 & ~tb_cio::kPhyLinkDisable);
 }
 
-bool ThunderboltIcm::use_interrupts(bool on) {
-  if (outcome_ != Outcome::Started) return false;
+bool ThunderboltIcm::use_interrupts(bool on, int msix_vector) {
+  if (outcome_ != Outcome::Started || msix_vector > 15) return false;          // (the vector allocation has 4 bits a source)
   interrupts_ = on;
-  nhi_.set_control_interrupts(on);
+  msix_vector_ = on ? msix_vector : -1;
+  nhi_.set_control_interrupts(on, msix_vector);
   return true;
 }
 
@@ -522,6 +523,7 @@ void ThunderboltIcm::stop() {
   devices_.clear();
   xdomains_.clear();
   interrupts_ = false;
+  msix_vector_ = -1;
   outcome_ = Outcome::NotStarted;
 }
 

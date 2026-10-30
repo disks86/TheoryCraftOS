@@ -213,7 +213,7 @@ class ThunderboltIcm final : public IThunderboltEvents {
   bool running() const { return outcome_ == Outcome::Started; }
   // Interrupts from the control channel's rings (the caller routes the MSI and calls TbNhi::acknowledge_interrupt from its handler). Only unmasks them in the chip; the channel is still
   // read by poll(), which the caller may then call only after an interrupt. Remembered over suspend and resume. False if the controller is not running.
-  bool use_interrupts(bool on);
+  bool use_interrupts(bool on, int msix_vector = -1);
   bool interrupts_on() const { return interrupts_; }
   Outcome outcome() const { return outcome_; }
 
@@ -296,6 +296,7 @@ class ThunderboltIcm final : public IThunderboltEvents {
   TbDriverReady ready_;
   crypto::IRandom* random_ = nullptr;
   bool interrupts_ = false, rtd3_veto_ = false;
+  int msix_vector_ = -1;
   ITbKeyStore* keys_ = nullptr;
   Options options_;
   uint32_t port_reset_failures_ = 0;

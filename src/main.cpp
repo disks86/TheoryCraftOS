@@ -93,6 +93,7 @@
 #endif
 #ifdef TCOS_THUNDERBOLT
 #include "Hardware/Bus/Pci/PciMsi.hpp"
+#include "Hardware/Bus/Pci/PciMsix.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltDriver.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltNet.hpp"
 #include "Kernel/Apic.hpp"
@@ -1143,7 +1144,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     UniquePointer<hardware::ThunderboltNet> thunderbolt_net;        // networking to another host on the cable (after the driver: it goes first)
     hardware::ThunderboltNetLink* thunderbolt_link = nullptr;       // its entry in the list of network interfaces, which outlives them both
     uint64_t thunderbolt_devices = 0;
-    UniquePointer<hardware::PciMsi> thunderbolt_msi;                // its MSI, when the machine delivers it
+    UniquePointer<hardware::PciMsix> thunderbolt_msix;              // its MSI-X, when the machine delivers it
+    UniquePointer<hardware::PciMsi> thunderbolt_msi;                // else its MSI
     bool thunderbolt_msi_working = false;                           // an interrupt arrived in the start-up check: the loop reads the channel only when one comes
     if (clock_ok && paging_ok) {
       for (uint32_t i = 0; i < pci.device_count(); ++i) {
@@ -1159,17 +1161,26 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
           if (!smb_random.ready()) smb_random.initialize();
           thunderbolt_keys = UniquePointer<hardware::FileTbKeyStore>::make(shared_allocator, explorer_files.file_system(), shared_allocator);
           if (thunderbolt_keys) thunderbolt->icm()->set_secure(&smb_random, thunderbolt_keys.get());
-          // MSI: the handler, then the message to the core that runs this; kept only if an interrupt arrives for a request of the controller
+          // MSI-X first (the first entry of the table carries the control channel's rings), then MSI: the handler, then the message to the core that runs this. Kept only if an interrupt
+          // arrives for a request of the controller.
           const uint32_t tb_apic_id = kernel::running() ? kernel::apic::this_apic_id() : 0xFFFF;
           if (tb_apic_id <= 0xFF) {
             kernel::set_interrupt_handler(kernel::kVectorThunderbolt, &on_thunderbolt_interrupt, thunderbolt.get());
-            thunderbolt_msi = UniquePointer<hardware::PciMsi>::make(shared_allocator, pci);
-            if (thunderbolt_msi && thunderbolt_msi->enable(d.address, 0xFEE00000u | (tb_apic_id << 12), kernel::kVectorThunderbolt) && thunderbolt->use_interrupts(true)) {
+            auto check_interrupt = [&]() {
               const uint32_t before = thunderbolt->interrupts();
               uint32_t word = 0;
               thunderbolt->icm()->control().read_config(0, 0, hardware::TbConfigSpace::Switch, 0, ArrayView<uint32_t>(&word, 1), 100000, nullptr, thunderbolt->icm());
               hardware::delay_us(2000);
-              thunderbolt_msi_working = thunderbolt->interrupts() != before;
+              return thunderbolt->interrupts() != before;
+            };
+            thunderbolt_msix = UniquePointer<hardware::PciMsix>::make(shared_allocator, pci, register_mapper);
+            const uint8_t tb_vector = kernel::kVectorThunderbolt;
+            if (thunderbolt_msix && thunderbolt_msix->enable(d.address, &tb_vector, 1, tb_apic_id) && thunderbolt->use_interrupts(true, 0)) thunderbolt_msi_working = check_interrupt();
+            if (!thunderbolt_msi_working) {
+              thunderbolt->use_interrupts(false);
+              thunderbolt_msix = UniquePointer<hardware::PciMsix>();
+              thunderbolt_msi = UniquePointer<hardware::PciMsi>::make(shared_allocator, pci);
+              if (thunderbolt_msi && thunderbolt_msi->enable(d.address, 0xFEE00000u | (tb_apic_id << 12), kernel::kVectorThunderbolt) && thunderbolt->use_interrupts(true)) thunderbolt_msi_working = check_interrupt();
             }
             if (!thunderbolt_msi_working) {
               thunderbolt->use_interrupts(false);
@@ -1187,7 +1198,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
             stacks.start_service();
           }
           Entry e(Level::Ok, "Thunderbolt");
-          e.text(thunderbolt->model()->name).text(thunderbolt_msi_working ? " (MSI)" : " (polled)").text(", security level ").dec(static_cast<uint32_t>(thunderbolt->icm()->security_level())).text(", firmware ").dec(thunderbolt->icm()->driver_ready().rom_version).text(".").dec(thunderbolt->icm()->driver_ready().ram_version);
+          e.text(thunderbolt->model()->name).text(thunderbolt_msix ? " (MSI-X)" : thunderbolt_msi_working ? " (MSI)" : " (polled)").text(", security level ").dec(static_cast<uint32_t>(thunderbolt->icm()->security_level())).text(", firmware ").dec(thunderbolt->icm()->driver_ready().rom_version).text(".").dec(thunderbolt->icm()->driver_ready().ram_version);
         } else {
           Entry(Level::Warning, "Thunderbolt").text(thunderbolt->model() ? thunderbolt->model()->name : "controller").text(" not started: ").text(thunderbolt->message());
           thunderbolt = UniquePointer<hardware::ThunderboltDriver>();
@@ -1615,7 +1626,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     }
 #ifdef TCOS_THUNDERBOLT
     if (thunderbolt_link) thunderbolt_link->detach();                // (the network interface list keeps the entry; it stops using the connection before that goes)
-    if (thunderbolt_msi) {                                          // (before the driver goes: the handler holds a pointer to it)
+    if (thunderbolt_msix || thunderbolt_msi) {                      // (before the driver goes: the handler holds a pointer to it)
+      thunderbolt_msix = UniquePointer<hardware::PciMsix>();
       thunderbolt_msi = UniquePointer<hardware::PciMsi>();
       kernel::set_interrupt_handler(kernel::kVectorThunderbolt, nullptr, nullptr);
     }
