@@ -231,6 +231,71 @@ bool KeyboardDecoder::decode(ConstByteView data, KeyboardState* out) const {
   return true;
 }
 
+// ------------------------------------------------------------------ consumer control keys
+
+uint8_t consumer_usage_to_key(uint16_t usage) {
+  switch (usage) {
+    case 0xE9: return key::kVolumeUp;
+    case 0xEA: return key::kVolumeDown;
+    case 0xE2: return key::kMute;
+    case 0xCD: return key::kMediaPlayPause;
+    case 0xB7: return key::kMediaStop;
+    case 0xB5: return key::kMediaNext;
+    case 0xB6: return key::kMediaPrevious;
+    case 0x6F: return key::kBrightnessUp;
+    case 0x70: return key::kBrightnessDown;
+    default: return 0;
+  }
+}
+
+bool ConsumerDecoder::init(const InputReport& report) {
+  valid_ = false;
+  count_ = 0;
+  bytes_ = 0;
+  for (uint32_t i = 0; i < report.field_count; ++i) {
+    const InputField& f = report.fields[i];
+    if (f.page != kPageConsumer || f.bit_size == 0 || f.bit_size > 16 || f.count == 0) continue;
+    bool useful = false;
+    if (f.variable) {
+      for (uint32_t n = 0; n < f.count && n < 0x10000; ++n) useful = useful || consumer_usage_to_key(static_cast<uint16_t>(f.usage_min + n)) != 0;
+    } else {
+      useful = true;                                          // (an array can name any usage; the ones we carry are found when a report arrives)
+    }
+    if (!useful || count_ == InputReport::kMaxFields) continue;
+    fields_[count_++] = f;
+    const uint32_t end = f.bit_offset + f.bit_size * f.count;
+    if (end > bytes_) bytes_ = end;
+  }
+  bytes_ = (bytes_ + 7) / 8;
+  valid_ = count_ != 0;
+  return valid_;
+}
+
+bool ConsumerDecoder::decode(ConstByteView data, KeyboardState* out) const {
+  *out = KeyboardState();
+  if (!valid_ || data.size() < bytes_) return false;
+  auto add = [&](uint16_t usage) {
+    const uint8_t key = consumer_usage_to_key(usage);
+    if (!key || out->key_count == KeyboardState::kMaxKeys) return;
+    for (uint32_t i = 0; i < out->key_count; ++i)
+      if (out->keys[i] == key) return;
+    out->keys[out->key_count++] = key;
+  };
+  for (uint32_t i = 0; i < count_; ++i) {
+    const InputField& f = fields_[i];
+    if (f.variable) {
+      for (uint32_t n = 0; n < f.count; ++n)
+        if (extract_bits(data, f.bit_offset + n * f.bit_size, 1, false)) add(static_cast<uint16_t>(f.usage_min + n));
+    } else {
+      for (uint32_t n = 0; n < f.count; ++n) {
+        const int32_t usage = extract_bits(data, f.bit_offset + n * f.bit_size, f.bit_size, false);
+        if (usage > 0) add(static_cast<uint16_t>(usage));
+      }
+    }
+  }
+  return true;
+}
+
 // ------------------------------------------------------------------ pointers
 
 bool PointerDecoder::init(const InputReport& report) {

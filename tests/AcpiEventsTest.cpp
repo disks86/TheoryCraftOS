@@ -25,6 +25,9 @@
 #include <map>
 #include <vector>
 #include "Hardware/Acpi/AcpiEvents.hpp"
+#include "Hardware/Backlight/AcpiBacklight.hpp"
+#include "Hardware/Backlight/AcpiVideoKeys.hpp"
+#include "Hardware/Backlight/IntelPchBacklight.hpp"
 
 using namespace acpi;
 using namespace hardware;
@@ -444,7 +447,108 @@ static void test_buttons() {
   }
 }
 
+
+// A panel with the video extensions: _BCL, _BCM (stores the level) and _BQC; a second display without _BCM that must not be taken; GPE 0x10 notifies "brighter".
+static Bytes make_video_dsdt(bool with_query) {
+  const Bytes levels = package(9, cat({num(80), num(40), num(10), num(20), num(40), num(60), num(80), num(100), num(20)}));   // (unsorted, one twice)
+  Bytes lcd_body = cat({name_def("_ADR", num(0x400)), name_def("_BCL", levels), method("_BCM", 1, store(b({0x68}), path("\\_SB.BRTV")))});
+  if (with_query) lcd_body = cat({lcd_body, method("_BQC", 0, cat({b({0xA4}), path("\\_SB.BRTV")}))});
+  const Bytes lcd = device("LCD0", lcd_body);
+  const Bytes crt = device("CRT0", cat({name_def("_ADR", num(0x100)), name_def("_BCL", levels)}));
+  const Bytes video = device("VID0", cat({name_def("_HID", num(0x0A0AD041)), lcd, crt}));
+  const Bytes ec = device("EC0", cat({name_def("_HID", num(0x090CD041)), name_def("_GPE", num(0x23)), method("_Q60", 0, notify("\\_SB.VID0.LCD0", 0x86))}));   // (the keys come through the controller)
+  return cat({scope("\\_SB", cat({name_def("BRTV", num(40)), video, ec}))});
+}
+
+struct StepCounter {
+  int up = 0, down = 0;
+  static void step(void* self, bool brighter) { auto* c = static_cast<StepCounter*>(self); (brighter ? c->up : c->down)++; }
+};
+
+struct FakeBank final : intel_gt::IRegisterBank {
+  std::map<uint64_t, uint32_t> r;
+  uint32_t read32(uint64_t o) override { return r[o]; }
+  void write32(uint64_t o, uint32_t v) override { r[o] = v; }
+};
+
+static void test_backlight() {
+  for (bool with_query : {true, false}) {
+    TestAllocator alloc;
+    FakeHost host;
+    FakePorts ports;
+    const Bytes dsdt = make_table("DSDT", make_video_dsdt(with_query));
+    const Bytes fadt = make_fadt();
+    const ConstByteView tables[1] = {ConstByteView(dsdt.data(), dsdt.size())};
+    AcpiEvents events(host, ports, alloc);
+    CHECK(events.initialize(tables, 1, ConstByteView(fadt.data(), fadt.size())) && events.enable_acpi_mode());
+    Node* found[4];
+    CHECK(AcpiBacklight::find_devices(events.interpreter(), found, 4) == 1);                  // (the display without _BCM is not a backlight)
+    AcpiBacklight light(events.interpreter(), found[0]);
+    CHECK(light.initialize() && light.steps() == 6);
+    uint8_t now = 0;
+    if (with_query) {
+      CHECK(light.percent(&now) && now == 33);                                               // level 40 of 10..100
+    } else {
+      CHECK(!light.percent(&now));                                                           // nobody told us yet
+    }
+    CHECK(light.set_percent(100) && light.percent(&now) && now == 100);
+    uint64_t stored = 0;
+    CHECK(events.interpreter().evaluate_integer("\\_SB.BRTV", &stored) && stored == 100);
+    CHECK(light.set_percent(0) && light.percent(&now) && now == 0);
+    CHECK(events.interpreter().evaluate_integer("\\_SB.BRTV", &stored) && stored == 10);
+    CHECK(light.set_percent(50) && events.interpreter().evaluate_integer("\\_SB.BRTV", &stored) && stored == 60);   // nearest of 10 20 40 60 80 100 to 55
+    CHECK(light.set_percent(250) && events.interpreter().evaluate_integer("\\_SB.BRTV", &stored) && stored == 100);
+    // the firmware's own brightness keys
+    StepCounter counter;
+    AcpiVideoKeys keys(light, &StepCounter::step, &counter);
+    CHECK(events.add_listener(&keys));
+    CHECK(events.enable_embedded_controller());
+    host.ec_events.push_back(0x60);
+    ports.raise(0x23);
+    events.poll();
+    CHECK(counter.up == 1 && counter.down == 0);
+    keys.on_notify(found[0], 0x87);
+    keys.on_notify(found[0], 0x85);
+    keys.on_notify(nullptr, 0x86);
+    CHECK(counter.up == 1 && counter.down == 1);
+  }
+  {   // a table without any panel, and a list that is not a list
+    TestAllocator alloc;
+    FakeHost host;
+    FakePorts ports;
+    const Bytes bad = make_table("DSDT", scope("\\_SB", device("LCD0", cat({name_def("_BCL", num(5)), method("_BCM", 1, b({0xA4, 0x00}))}))));
+    const Bytes fadt = make_fadt();
+    const ConstByteView tables[1] = {ConstByteView(bad.data(), bad.size())};
+    AcpiEvents events(host, ports, alloc);
+    CHECK(events.initialize(tables, 1, ConstByteView(fadt.data(), fadt.size())));
+    Node* found[2];
+    const uint32_t n = AcpiBacklight::find_devices(events.interpreter(), found, 2);
+    CHECK(n == 1);
+    AcpiBacklight light(events.interpreter(), found[0]);
+    uint8_t now;
+    CHECK(!light.initialize() && !light.set_percent(10) && !light.percent(&now));
+  }
+  {   // the PCH PWM: refuses to start one, and scales the duty to the period the firmware chose
+    FakeBank bank;
+    IntelPchBacklight off(bank);
+    CHECK(!off.initialize());
+    bank.r[IntelPchBacklight::kControl2] = (1000u << 16) | 500;
+    CHECK(!off.initialize());                                                                // (not enabled)
+    uint8_t now;
+    CHECK(!off.percent(&now) && !off.set_percent(10) && bank.r[IntelPchBacklight::kControl2] == ((1000u << 16) | 500));
+    bank.r[IntelPchBacklight::kControl1] = IntelPchBacklight::kEnable;
+    IntelPchBacklight on(bank);
+    CHECK(on.initialize() && on.steps() == 256 && on.percent(&now) && now == 50);
+    CHECK(on.set_percent(25) && bank.r[IntelPchBacklight::kControl2] == ((1000u << 16) | 250) && on.percent(&now) && now == 25);
+    CHECK(on.set_percent(200) && (bank.r[IntelPchBacklight::kControl2] & 0xFFFF) == 1000);
+    bank.r[IntelPchBacklight::kControl2] = (0u << 16) | 5;
+    IntelPchBacklight noperiod(bank);
+    CHECK(!noperiod.initialize());
+  }
+}
+
 int main() {
+  test_backlight();
   test_fadt();
   test_buttons();
   test_memory_blocks();

@@ -39,6 +39,17 @@ constexpr uint8_t kRight = 0x4F;
 constexpr uint8_t kLeft = 0x50;
 constexpr uint8_t kDown = 0x51;
 constexpr uint8_t kUp = 0x52;
+constexpr uint8_t kMute = 0x7F;       // keyboard page: Keyboard Mute, Volume Up, Volume Down
+constexpr uint8_t kVolumeUp = 0x80;
+constexpr uint8_t kVolumeDown = 0x81;
+// The other keys of a laptop's Fn row come from the consumer page (0x0C) of HID, or from scan codes of their own. They have no code on the keyboard page, so they travel in codes the page
+// leaves unused (0xE8 and up); a program that does not know them ignores them like any unknown key.
+constexpr uint8_t kMediaPlayPause = 0xE8;
+constexpr uint8_t kMediaStop = 0xE9;
+constexpr uint8_t kMediaPrevious = 0xEA;
+constexpr uint8_t kMediaNext = 0xEB;
+constexpr uint8_t kBrightnessUp = 0xEC;
+constexpr uint8_t kBrightnessDown = 0xED;
 constexpr uint8_t kLeftControl = 0xE0;
 constexpr uint8_t kLeftShift = 0xE1;
 constexpr uint8_t kLeftAlt = 0xE2;

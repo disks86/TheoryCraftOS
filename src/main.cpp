@@ -119,6 +119,9 @@
 #include "Hardware/Acpi/SystemAcpiHost.hpp"
 #include "Hardware/Acpi/SystemAcpiPorts.hpp"
 #include "Hardware/Acpi/AcpiEvents.hpp"
+#include "Hardware/Backlight/AcpiBacklight.hpp"
+#include "Hardware/Backlight/AcpiVideoKeys.hpp"
+#include "Hardware/Backlight/IntelPchBacklight.hpp"
 #include "Hardware/Acpi/IoApic.hpp"
 #include "Hardware/Battery/AcpiBattery.hpp"
 #include "SystemMonitor.hpp"
@@ -1737,6 +1740,39 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         Entry(Level::Info, "Thunderbolt").text(controller ? "the controller names no wake event in the ACPI tables" : "the controller is not described in the ACPI tables");
     }
 #endif
+    // The screen's brightness (the Fn keys and the firmware's brightness notifications): the panel's ACPI methods if the tables have them, else the PWM of the PCH as the firmware left it.
+    hardware::AcpiBacklight* acpi_backlight_ptr = nullptr;
+    UniquePointer<hardware::AcpiBacklight> acpi_backlight;
+    UniquePointer<hardware::AcpiVideoKeys> acpi_video_keys;
+    UniquePointer<hardware::IntelPchBacklight> pch_backlight;
+#ifdef TCOS_ACPI_EVENTS
+    if (acpi_events) {
+      acpi::Node* panels[4];
+      const uint32_t found = hardware::AcpiBacklight::find_devices(acpi_events->interpreter(), panels, 4);
+      for (uint32_t i = 0; i < found && !acpi_backlight; ++i) {
+        auto candidate = UniquePointer<hardware::AcpiBacklight>::make(shared_allocator, acpi_events->interpreter(), panels[i]);
+        if (candidate && candidate->initialize()) acpi_backlight = static_cast<UniquePointer<hardware::AcpiBacklight>&&>(candidate);
+      }
+      if (acpi_backlight) {
+        acpi_backlight_ptr = acpi_backlight.get();
+        desktop.set_backlight(acpi_backlight.get());
+        acpi_video_keys = UniquePointer<hardware::AcpiVideoKeys>::make(shared_allocator, *acpi_backlight,
+            [](void* d, bool brighter) { static_cast<desktop::Desktop*>(d)->adjust_brightness(brighter ? 10 : -10); }, &desktop);
+        if (acpi_video_keys) acpi_events->add_listener(acpi_video_keys.get());
+        Entry(Level::Ok, "Display").text("backlight: ACPI, ").dec(acpi_backlight->steps()).text(" levels");
+      }
+    }
+#endif
+    if (!acpi_backlight_ptr) {
+      hardware::IntelRenderHardware render;
+      if (hardware::IntelGpu* intel = system_gpu.intel_gpu(); intel && intel->render_hardware(&render) && render.registers) {
+        pch_backlight = UniquePointer<hardware::IntelPchBacklight>::make(shared_allocator, *render.registers);
+        if (pch_backlight && pch_backlight->initialize()) {
+          desktop.set_backlight(pch_backlight.get());
+          Entry(Level::Ok, "Display").text("backlight: Intel PCH PWM");
+        }
+      }
+    }
     desktop.set_system_monitor(&monitor);
     desktop.set_clock_source(read_local_time, st);
     desktop.set_diagnostic_output(console::debug_puts);

@@ -49,8 +49,15 @@ constexpr uint8_t kSet1[0x59] = {
 // After a 0xE0 prefix.
 uint8_t extended_usage(uint8_t code) {
   switch (code) {
+    case 0x10: return key::kMediaPrevious;
+    case 0x19: return key::kMediaNext;
     case 0x1C: return 0x58;  // keypad enter
     case 0x1D: return 0xE4;  // right control
+    case 0x20: return key::kMute;
+    case 0x22: return key::kMediaPlayPause;
+    case 0x24: return key::kMediaStop;
+    case 0x2E: return key::kVolumeDown;
+    case 0x30: return key::kVolumeUp;
     case 0x35: return 0x54;  // keypad /
     case 0x37: return 0x46;  // print screen
     case 0x38: return 0xE6;  // right alt
@@ -82,6 +89,15 @@ uint8_t usage_from_scan_code_set1(uint8_t code, bool extended) {
 uint8_t usage_from_linux_key(uint16_t code) {
   if (code < sizeof(kSet1)) return ArrayView<const uint8_t>(kSet1)[code];  // codes 1-88 match set-1 make codes
   switch (code) {
+    case 113: return key::kMute;            // KEY_MUTE
+    case 114: return key::kVolumeDown;
+    case 115: return key::kVolumeUp;
+    case 163: return key::kMediaNext;       // KEY_NEXTSONG
+    case 164: return key::kMediaPlayPause;
+    case 165: return key::kMediaPrevious;
+    case 166: return key::kMediaStop;       // KEY_STOPCD
+    case 224: return key::kBrightnessDown;
+    case 225: return key::kBrightnessUp;
     case 96:  return 0x58;  // keypad enter
     case 97:  return 0xE4;  // right control
     case 98:  return 0x54;  // keypad /
