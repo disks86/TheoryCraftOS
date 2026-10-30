@@ -379,7 +379,8 @@ struct Rig {
   Surface* soft = nullptr;
   DeviceRenderer2D* dev = nullptr;
   ArrayView<uint32_t> frame;  // last read
-  bool exact_clips = true;    // rounded / mask clips and layers are exact (software renderer)
+  bool exact_clips = true;    // rounded / mask clips are exact (software renderer)
+  bool exact_layers = true;   // layers are isolated (the software renderer; the device renderer with offscreen groups)
 
   void read() {
     if (dev) {
@@ -689,6 +690,47 @@ static void test_transformed(Rig& g, TestAllocator& a) {
   release_view(a, img.pixels);
 }
 
+// begin_group / end_group on the device renderer: what is drawn between them is moved as a picture; the CPU renderer says no.
+static void test_groups(Rig& g) {
+  IRenderer2D& r = *g.r;
+  g.reset();
+  CHECK(r.begin_group({0, 0, 32, 32}));
+  r.fill_rect({4, 4, 8, 4}, kRed);
+  r.fill_rect({0, 0, 64, 2}, kGreen);   // (clipped to the group's bounds)
+  Matrix2D move;
+  move.e = 20;
+  move.f = 10;
+  CHECK(r.end_group(move, 255, ImageFilter::Nearest));
+  g.read();
+  CHECK(g.at(24, 14) == kRed && g.at(31, 17) == kRed && g.at(32, 14) == kBlack && g.at(24, 18) == kBlack && g.at(4, 4) == kBlack);
+  CHECK(g.at(20, 10) == kGreen && g.at(51, 11) == kGreen && g.at(52, 10) == kBlack && g.at(20, 12) == kBlack);
+  // a quarter turn, at half opacity, over a background: overlapping shapes inside are one picture
+  g.reset();
+  r.fill_rect({0, 0, 64, 64}, kBlue);
+  CHECK(r.begin_group({0, 0, 16, 16}));
+  r.fill_rect({0, 0, 4, 2}, kWhite);
+  r.fill_rect({2, 0, 4, 2}, kWhite);
+  Matrix2D turn;   // (x, y) -> (-y + 40, x)
+  turn.a = 0; turn.b = 1; turn.c = -1; turn.d = 0;
+  turn.e = 40;
+  CHECK(r.end_group(turn, 128, ImageFilter::Nearest));
+  g.read();
+  CHECK(chan_near(g.at(39, 1), 0xFF8080FF, 2) && chan_near(g.at(39, 3), 0xFF8080FF, 2) && g.at(39, 7) == kBlue && g.at(37, 1) == kBlue);   // (not brighter where the two overlap)
+  // groups nest, and the clip in force at the start limits the result
+  g.reset();
+  r.push_clip_rect({0, 0, 30, 64});
+  CHECK(r.begin_group({0, 0, 64, 64}));
+  CHECK(r.begin_group({0, 0, 64, 64}));
+  r.fill_rect({10, 10, 40, 4}, kRed);
+  Matrix2D none;
+  CHECK(r.end_group(none, 255, ImageFilter::Nearest));
+  CHECK(r.end_group(none, 255, ImageFilter::Nearest));
+  r.pop_clip();
+  g.read();
+  CHECK(g.at(29, 11) == kRed && g.at(30, 11) == kBlack && g.at(9, 11) == kBlack);
+  CHECK(!r.end_group(none, 255, ImageFilter::Nearest));   // (no group open)
+}
+
 static void test_gradients(Rig& g) {
   IRenderer2D& r = *g.r;
   const GradientStop rb[2] = {{0, kRed}, {1, kBlue}};
@@ -887,13 +929,13 @@ static void test_clip_stack(Rig& g, TestAllocator& a) {
 static void test_layers(Rig& g) {
   IRenderer2D& r = *g.r;
   g.reset();
-  CHECK(r.push_layer({10, 10, 30, 30}, 128) == g.exact_clips);
+  CHECK(r.push_layer({10, 10, 30, 30}, 128) == g.exact_layers);
   r.fill_rect({0, 0, 64, 64}, kRed);  // clipped to the layer bounds
   r.pop_layer();
   g.read();
   CHECK(chan_near(g.at(10, 10), 0xFF800000, 1) && chan_near(g.at(39, 39), 0xFF800000, 1));
-  if (g.exact_clips) CHECK(g.at(9, 10) == kBlack && g.at(40, 40) == kBlack);
-  if (!g.exact_clips) {
+  if (g.exact_layers) CHECK(g.at(9, 10) == kBlack && g.at(40, 40) == kBlack);
+  if (!g.exact_layers) {
     // (the device renderer cannot clip to the bounds; it only applies the opacity)
   }
   // Group opacity: overlapping shapes in a layer composite as one.
@@ -904,7 +946,7 @@ static void test_layers(Rig& g) {
   r.pop_layer();
   g.read();
   CHECK(chan_near(g.at(12, 12), 0xFF808080, 1));
-  if (g.exact_clips) CHECK(chan_near(g.at(25, 25), 0xFF808080, 1));  // not 192
+  if (g.exact_layers) CHECK(chan_near(g.at(25, 25), 0xFF808080, 1));  // not 192
   else CHECK(red_of(g.at(25, 25)) >= 128);
   // Opacity 255 is exact, opacity 0 shows nothing.
   g.reset();
@@ -955,7 +997,7 @@ static void test_layers(Rig& g) {
   r.fill_rect({0, 0, 4, 4}, kWhite);
   g.read();
   CHECK(g.at(1, 1) == kWhite);
-  if (g.exact_clips) CHECK(g.at(30, 30) == kBlack);
+  if (g.exact_layers) CHECK(g.at(30, 30) == kBlack);
   // More layers than the stack holds still balance.
   g.reset();
   for (uint32_t i = 0; i < kMaxLayerDepth + 3; ++i) r.push_layer({0, 0, 64, 64}, 255);
@@ -1115,6 +1157,7 @@ static void test_primitives() {
     test_mask(g);
     test_scaled(g, a);
     test_transformed(g, a);
+    test_groups(g);
     test_gradients(g);
     test_clip_stack(g, a);
     test_layers(g);

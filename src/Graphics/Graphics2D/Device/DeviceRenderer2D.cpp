@@ -58,6 +58,38 @@ DeviceRenderer2D::DeviceRenderer2D(IGraphicsDevice& device, allocators::IAllocat
     sheet_ = device.create_image({{kSheetSize, kSheetSize}, Format::B8G8R8A8Unorm, kImageSampled});
     sheet_pixels_ = allocate_view<uint32_t>(allocator, uint64_t{kSheetSize} * kSheetSize);
   }
+  // Offscreen groups: custom blending (premultiplied over) and the shader that scales a texel; best effort, without them begin_group() says no.
+  if ((device.info().features & kFeatureBlendState) && vs_ && fs_ && texture_vs_ && texture_fs_ && texture_vertices_) {
+    BlendState over;   // source over, for a destination that holds premultiplied colors: rgb = src.rgb * a + dst.rgb * (1 - a), a = a + dst.a * (1 - a)
+    over.custom = over.enable = true;
+    over.src_color = BlendFactor::SrcAlpha;
+    over.dst_color = BlendFactor::InvSrcAlpha;
+    over.src_alpha = BlendFactor::One;
+    over.dst_alpha = BlendFactor::InvSrcAlpha;
+    BlendState premultiplied = over;   // a source that is premultiplied already
+    premultiplied.src_color = BlendFactor::One;
+    GraphicsPipelineDesc colored;
+    describe_colored_pipeline(&colored);
+    colored.vertex_shader = vs_;
+    colored.fragment_shader = fs_;
+    colored.cull_mode = CullMode::None;
+    colored.blend = over;
+    group_blended_ = device.create_graphics_pipeline(colored);
+    GraphicsPipelineDesc textured;
+    describe_textured_pipeline(&textured);
+    textured.vertex_shader = texture_vs_;
+    textured.fragment_shader = texture_fs_;
+    textured.cull_mode = CullMode::None;
+    textured.blend = over;
+    texture_group_ = device.create_graphics_pipeline(textured);
+    scaled_fs_ = device.create_shader_module(textured_scaled_fragment_shader());
+    if (scaled_fs_) {
+      textured.fragment_shader = scaled_fs_;
+      textured.blend = premultiplied;
+      composite_ = device.create_graphics_pipeline(textured);
+    }
+    groups_ok_ = group_blended_ && texture_group_ && composite_;
+  }
   for (IImage*& image : images_) image = device.create_image({extent, Format::B8G8R8A8Unorm, kImageColorAttachment | kImagePresent});
   commands_ = device.create_command_buffer();
   valid_ = blended_ && opaque_ && vertices_ && images_[0] && images_[1] && commands_;
@@ -73,6 +105,13 @@ DeviceRenderer2D::DeviceRenderer2D(IGraphicsDevice& device, allocators::IAllocat
 }
 
 DeviceRenderer2D::~DeviceRenderer2D() {
+  while (group_depth_) {
+    if (groups_[--group_depth_].image) device_.destroy_image(groups_[group_depth_].image);
+  }
+  if (composite_) device_.destroy_pipeline(composite_);
+  if (texture_group_) device_.destroy_pipeline(texture_group_);
+  if (group_blended_) device_.destroy_pipeline(group_blended_);
+  if (scaled_fs_) device_.destroy_shader_module(scaled_fs_);
   if (sheet_) device_.destroy_image(sheet_);
   if (sheet_vertices_) device_.destroy_buffer(sheet_vertices_);
   release_view(allocator_, sheet_pixels_);
@@ -113,6 +152,37 @@ void DeviceRenderer2D::reset_sheet() {
   sheet_x_ = sheet_y_ = sheet_shelf_ = 0;
 }
 
+IImage* DeviceRenderer2D::target_image() const { return group_depth_ ? groups_[group_depth_ - 1].image : images_[back_]; }
+
+Extent2D DeviceRenderer2D::target_extent() const {
+  if (!group_depth_) return extent_;
+  const Rect2D& b = groups_[group_depth_ - 1].bounds;
+  return {b.width, b.height};
+}
+
+// Drawing is in the frame's coordinates whatever the target: a group's image starts at its bounds, so shapes and scissors are moved by that.
+Rect2D DeviceRenderer2D::to_target(const Rect2D& clip) const {
+  if (!group_depth_) return clip;
+  const Rect2D& b = groups_[group_depth_ - 1].bounds;
+  const Rect2D inside = raster::intersect(clip, b);
+  return {inside.x - b.x, inside.y - b.y, inside.width, inside.height};
+}
+
+// Pixel coordinates (0,0 top left of the image) to clip space; depth is constant.
+void DeviceRenderer2D::fill_matrix(Mat4* mvp) const {
+  const Extent2D e = target_extent();
+  const float ox = group_depth_ ? static_cast<float>(groups_[group_depth_ - 1].bounds.x) : 0.0f, oy = group_depth_ ? static_cast<float>(groups_[group_depth_ - 1].bounds.y) : 0.0f;
+  mvp->m[0] = 2.0f / e.width;
+  mvp->m[5] = 2.0f / e.height;
+  mvp->m[10] = 0;
+  mvp->m[12] = -1 - 2.0f * ox / e.width;
+  mvp->m[13] = -1 - 2.0f * oy / e.height;
+  mvp->m[14] = 0.5f;
+}
+
+IPipeline* DeviceRenderer2D::colored_pipeline(BlendMode mode) const { return mode == BlendMode::Alpha ? (group_depth_ ? group_blended_ : blended_) : opaque_; }
+IPipeline* DeviceRenderer2D::textured_pipeline(BlendMode mode) const { return mode == BlendMode::Alpha ? (group_depth_ ? texture_group_ : texture_blended_) : texture_opaque_; }
+
 bool DeviceRenderer2D::submit_pending() {
   close_range();
   if (!valid_ || range_count_ == 0) return true;
@@ -126,24 +196,18 @@ bool DeviceRenderer2D::submit_pending() {
   }
   commands_->begin();
   RenderPassBegin pass;
-  pass.color = images_[back_];
+  pass.color = target_image();
   pass.clear_color = false;  // keep what earlier frames and submissions drew
   commands_->begin_render_pass(pass);
-  // Pixel coordinates (0,0 top left) to clip space; depth is constant.
   ColoredConstants constants;
-  constants.mvp.m[0] = 2.0f / extent_.width;
-  constants.mvp.m[5] = 2.0f / extent_.height;
-  constants.mvp.m[10] = 0;
-  constants.mvp.m[12] = -1;
-  constants.mvp.m[13] = -1;
-  constants.mvp.m[14] = 0.5f;
+  fill_matrix(&constants.mvp);
   bool pushed = false;
   int bound = -1;   // which vertex buffer is bound: 0 colored, 1 the sheet's
   for (uint32_t i = 0; i < range_count_; ++i) {
     const Range& r = ranges_[i];
-    commands_->set_scissor(r.clip);
+    commands_->set_scissor(to_target(r.clip));
     if (r.sheet) {
-      commands_->bind_pipeline(r.blend == BlendMode::Alpha ? texture_blended_ : texture_opaque_);
+      commands_->bind_pipeline(textured_pipeline(r.blend));
       if (bound != 1) {
         commands_->bind_vertex_buffer(sheet_vertices_);
         SamplerDesc sampler;   // (nearest at the pixel centres: the baked pixels as they are)
@@ -152,7 +216,7 @@ bool DeviceRenderer2D::submit_pending() {
         bound = 1;
       }
     } else {
-      commands_->bind_pipeline(r.blend == BlendMode::Alpha ? blended_ : opaque_);
+      commands_->bind_pipeline(colored_pipeline(r.blend));
       if (bound != 0) {
         commands_->bind_vertex_buffer(vertices_);
         bound = 0;
@@ -215,6 +279,14 @@ void DeviceRenderer2D::set_blend(BlendMode mode) {
 
 void DeviceRenderer2D::clear(uint32_t color) {
   if (!valid_) return;
+  if (group_depth_) {   // (a group is cleared by painting over it)
+    const Rect2D b = groups_[group_depth_ - 1].bounds;
+    const BlendMode saved = blend_;
+    set_blend(BlendMode::Replace);
+    quad(static_cast<float>(b.x), static_cast<float>(b.y), static_cast<float>(b.x) + b.width, static_cast<float>(b.y) + b.height, color);
+    set_blend(saved);
+    return;
+  }
   count_ = range_start_ = range_count_ = 0;  // the clear wipes whatever was recorded
   sheet_count_ = sheet_range_start_ = 0;
   commands_->begin();
@@ -394,7 +466,7 @@ bool DeviceRenderer2D::draw_textured_quad(IImage& image, int64_t dx, int64_t dy,
   return draw_textured_corners(image, xs, ys, u0, v0, u1, v1, Filter::Nearest);   // (nearest at the pixel centres: the picture's own pixels)
 }
 
-bool DeviceRenderer2D::draw_textured_corners(IImage& image, const float xs[4], const float ys[4], float u0, float v0, float u1, float v1, Filter filter) {
+bool DeviceRenderer2D::draw_textured_corners(IImage& image, const float xs[4], const float ys[4], float u0, float v0, float u1, float v1, Filter filter, const float* scale) {
   if (!submit_pending()) return false;
   const TexturedVertex tl{{xs[0], ys[0], 0}, {u0, v0}}, tr{{xs[1], ys[1], 0}, {u1, v0}}, br{{xs[2], ys[2], 0}, {u1, v1}}, bl{{xs[3], ys[3], 0}, {u0, v1}};
   const TexturedVertex quad[6] = {tl, tr, br, tl, br, bl};
@@ -405,24 +477,20 @@ bool DeviceRenderer2D::draw_textured_corners(IImage& image, const float xs[4], c
 
   commands_->begin();
   RenderPassBegin pass;
-  pass.color = images_[back_];
+  pass.color = target_image();
   pass.clear_color = false;
   commands_->begin_render_pass(pass);
-  commands_->bind_pipeline(blend_ == BlendMode::Alpha ? texture_blended_ : texture_opaque_);
+  commands_->bind_pipeline(scale ? composite_ : textured_pipeline(blend_));
   commands_->bind_vertex_buffer(texture_vertices_);
   SamplerDesc sampler;
   sampler.filter = filter;
   sampler.address_u = sampler.address_v = AddressMode::ClampToEdge;
   commands_->bind_texture(0, &image, sampler);
-  ColoredConstants constants;
-  constants.mvp.m[0] = 2.0f / extent_.width;
-  constants.mvp.m[5] = 2.0f / extent_.height;
-  constants.mvp.m[10] = 0;
-  constants.mvp.m[12] = -1;
-  constants.mvp.m[13] = -1;
-  constants.mvp.m[14] = 0.5f;
-  commands_->push_constants(&constants, sizeof(constants));
-  commands_->set_scissor(clip_);
+  TexturedScaledConstants constants;
+  fill_matrix(&constants.mvp);
+  constants.scale = scale ? *scale : 1.0f;
+  commands_->push_constants(&constants, scale ? sizeof(constants) : sizeof(ColoredConstants));
+  commands_->set_scissor(to_target(clip_));
   commands_->draw(6);
   commands_->end_render_pass();
   return commands_->end() && device_.submit(commands_);
@@ -856,9 +924,26 @@ bool DeviceRenderer2D::push_layer(const Rect2D& bounds, uint8_t opacity) {
   }
   layer_clip_depth_[layer_depth_] = clip_depth_;
   layer_clip_overflow_[layer_depth_] = clip_overflow_;
-  layer_opacity_[layer_depth_++] = opacity_;
-  opacity_ *= static_cast<float>(opacity) / 255.0f;
-  (void)bounds;  // (no offscreen target: nothing is isolated, so the bounds clip nothing)
+  layer_opacity_[layer_depth_] = opacity_;
+  layer_is_group_ &= ~(1u << layer_depth_);
+  if (opacity != 255 && begin_group(bounds)) {   // isolated: drawn on its own and laid over the target as one
+    groups_[group_depth_ - 1].layer = true;
+    groups_[group_depth_ - 1].layer_opacity = opacity;
+    layer_is_group_ |= 1u << layer_depth_;
+    ++layer_depth_;
+    return true;
+  }
+  if (opacity != 255 && groups_ok_ && clip_depth_ < kMaxClipDepth) {
+    const Rect2D shown = raster::intersect(bounds, clip_);
+    if (!shown.width || !shown.height) {   // nothing of it is on the target: nothing in it shows
+      clip_stack_[clip_depth_++] = {0, 0, 0, 0};
+      apply_clip();
+      ++layer_depth_;
+      return true;
+    }
+  }
+  ++layer_depth_;
+  opacity_ *= static_cast<float>(opacity) / 255.0f;   // (no offscreen target: nothing is isolated, so the bounds clip nothing)
   return opacity == 255;
 }
 
@@ -869,14 +954,70 @@ void DeviceRenderer2D::pop_layer() {
   }
   if (!layer_depth_) return;
   --layer_depth_;
+  if (layer_is_group_ & (1u << layer_depth_)) {
+    layer_is_group_ &= ~(1u << layer_depth_);
+    end_group(Matrix2D(), groups_[group_depth_ - 1].layer_opacity, ImageFilter::Nearest);
+    return;
+  }
   opacity_ = layer_opacity_[layer_depth_];
   clip_depth_ = layer_clip_depth_[layer_depth_];  // clips pushed inside the layer end with it
   clip_overflow_ = layer_clip_overflow_[layer_depth_];
   apply_clip();
 }
 
+bool DeviceRenderer2D::begin_group(const Rect2D& bounds) {
+  if (!valid_ || !groups_ok_ || group_depth_ >= kMaxGroups || opacity_ != 1.0f || clip_depth_ >= kMaxClipDepth) return false;
+  const Rect2D b = raster::intersect(bounds, clip_);
+  if (!b.width || !b.height || uint64_t{b.width} * b.height > (uint64_t{1} << 24)) return false;
+  if (!submit_pending()) return false;   // (what was drawn so far goes to the parent first)
+  IImage* image = device_.create_image({{b.width, b.height}, Format::B8G8R8A8Unorm, kImageColorAttachment | kImageSampled});
+  if (!image) return false;
+  commands_->begin();
+  RenderPassBegin pass;   // (clears to transparent black)
+  pass.color = image;
+  pass.clear_color_value = Vec4{0, 0, 0, 0};
+  commands_->begin_render_pass(pass);
+  commands_->end_render_pass();
+  if (!commands_->end() || !device_.submit(commands_)) {
+    device_.destroy_image(image);
+    return false;
+  }
+  Group& g = groups_[group_depth_++];
+  g.image = image;
+  g.bounds = b;
+  g.clip_depth = clip_depth_;
+  g.clip_overflow = clip_overflow_;
+  g.opacity = opacity_;
+  g.layer = false;
+  g.layer_opacity = 255;
+  clip_stack_[clip_depth_++] = b;   // (nothing outside the picture)
+  apply_clip();
+  return true;
+}
+
+bool DeviceRenderer2D::end_group(const Matrix2D& m, uint8_t opacity, ImageFilter filter) {
+  if (!group_depth_) return false;
+  bool ok = submit_pending();   // the group's own shapes into its image
+  const Group g = groups_[--group_depth_];
+  clip_depth_ = g.clip_depth;   // clips pushed inside the group end with it
+  clip_overflow_ = g.clip_overflow;
+  opacity_ = g.opacity;
+  apply_clip();
+  const float lx[4] = {0, static_cast<float>(g.bounds.width), static_cast<float>(g.bounds.width), 0}, ly[4] = {0, 0, static_cast<float>(g.bounds.height), static_cast<float>(g.bounds.height)};
+  float xs[4], ys[4];
+  for (int i = 0; i < 4; ++i) {
+    const float x = static_cast<float>(g.bounds.x) + lx[i], y = static_cast<float>(g.bounds.y) + ly[i];
+    xs[i] = m.a * x + m.c * y + m.e;
+    ys[i] = m.b * x + m.d * y + m.f;
+  }
+  const float scale = static_cast<float>(opacity) / 255.0f;
+  ok = ok && draw_textured_corners(*g.image, xs, ys, 0.0f, 0.0f, 1.0f, 1.0f, filter == ImageFilter::Nearest ? Filter::Nearest : Filter::Linear, &scale);
+  device_.destroy_image(g.image);
+  return ok;
+}
+
 bool DeviceRenderer2D::copy_rect(const Rect2D& source, int32_t dest_x, int32_t dest_y) {
-  if (!valid_) return false;
+  if (!valid_ || group_depth_) return false;
   const Rect2D src = raster::intersect(source, {0, 0, extent_.width, extent_.height});
   if (!src.width || !src.height) return true;
   if (!submit_pending() || !images_[back_]) return false;
