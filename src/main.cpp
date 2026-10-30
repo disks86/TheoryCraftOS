@@ -38,6 +38,7 @@
 #include "SystemInventory.hpp"
 #include "SystemNetworkDetails.hpp"
 #include "SystemWirelessDetails.hpp"
+#include "SystemBluetoothDetails.hpp"
 #include "BootLog.hpp"
 #include "Graphics/Logo/Logo.hpp"
 #include "Utility/AllocatedView.hpp"
@@ -1239,7 +1240,10 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     if (!smb_random.ready()) smb_random.initialize();
     UniquePointer<hardware::BluetoothService> bluetooth = UniquePointer<hardware::BluetoothService>::make(shared_allocator, &usb, &bluetooth_files, shared_allocator, smb_random.ready() ? &smb_random : nullptr, &bluetooth_bonds);
     uint32_t bluetooth_bonds_saved = 0;
+    UniquePointer<SystemBluetoothDetails> bluetooth_details;
     if (bluetooth && paging_ok) {
+      bluetooth_details = UniquePointer<SystemBluetoothDetails>::make(shared_allocator, *bluetooth);      // (the window's view of it, and the pairing questions)
+      inventory.set_bluetooth(bluetooth.get());
       bluetooth->add_profile(&bluetooth_hid);
       input.add_source(&bluetooth_hid);
       bluetooth->start();
@@ -1624,6 +1628,9 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     desktop.set_device_details(&inventory);
     desktop.set_network_details(&network_details);
     desktop.set_wireless_details(&wireless_details);
+#ifdef TCOS_BLUETOOTH
+    if (bluetooth_details) desktop.set_bluetooth_details(bluetooth_details.get());
+#endif
     desktop.set_media_services(mixer.get(), &video_codecs, &clock);
     desktop.set_capture_hub(capture_hub.get());
     desktop.set_midi_output(&usb_midi);

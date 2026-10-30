@@ -503,6 +503,8 @@ add_executable(BOOTX64
   src/SystemDeviceDetails.cpp
   src/SystemNetworkDetails.cpp
   src/SystemWirelessDetails.cpp
+  src/SystemBluetoothDetails.cpp
+  src/Desktop/BluetoothProperties.cpp
   src/Desktop/NetworkProperties.cpp
   src/Desktop/DeviceProperties.cpp
   src/Desktop/WirelessProperties.cpp

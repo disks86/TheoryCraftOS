@@ -25,7 +25,7 @@ using desktop::HardwareGroup;
 
 using namespace system_inventory;
 
-void SystemInventory::add(desktop::HardwareList* list, HardwareGroup group, StringView name, uint32_t id, bool wireless) { list->add(group, name, scratch_.view(), id, wireless); }
+void SystemInventory::add(desktop::HardwareList* list, HardwareGroup group, StringView name, uint32_t id, bool wireless, bool bluetooth) { list->add(group, name, scratch_.view(), id, wireless, bluetooth); }
 
 void SystemInventory::collect(desktop::HardwareList* list) {
   String name(allocator_);
@@ -120,6 +120,23 @@ void SystemInventory::collect(desktop::HardwareList* list) {
           }
         }
         add(list, HardwareGroup::Network, n->name(), i, radio != nullptr);
+      }
+  }
+  if (bluetooth_) {
+    for (uint32_t i = 0; i < bluetooth_->adapter_count(); ++i)
+      if (hardware::IBluetoothAdapter* a = bluetooth_->adapter(i)) {
+        scratch_.assign(a->ready() ? "ready" : "not ready");
+        if (a->ready()) {
+          uint32_t connected = 0;
+          for (uint32_t d = 0; d < a->device_count(); ++d) {
+            hardware::BluetoothDeviceInfo info;
+            if (a->device(d, &info) && info.state == hardware::BluetoothLinkState::Connected) ++connected;
+          }
+          scratch_.append(", ");
+          scratch_.append_uint(connected);
+          scratch_.append(" connected");
+        }
+        add(list, HardwareGroup::Bluetooth, a->name(), i, false, true);
       }
   }
   if (audio_) {
