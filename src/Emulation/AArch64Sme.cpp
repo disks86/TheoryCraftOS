@@ -15,6 +15,7 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
+#include "Emulation/AArch64Fp8.hpp"
 #include "Emulation/AArch64SveCommon.hpp"
 #include "Emulation/SoftFloat.hpp"
 
@@ -310,6 +311,27 @@ AArch64Cpu::Step AArch64Cpu::sme(GuestMemory& m, uint32_t insn) {
     const uint32_t key = insn >> 21;
     Env env = fp_env();
     auto finish = [&]() { fp_finish(env); return Step::Ok; };
+    if (top == 0x80 && key == 0x405 && !(insn & 4) && !(b3 && (insn & 2))) {      // FMOPA / FMOPS (FP8 into single, or half with bit 3): groups of four (two) bytes, predicated per byte
+      const fp8::Fmt fa = static_cast<fp8::Fmt>(s_.fpmr & 1), fb = static_cast<fp8::Fmt>((s_.fpmr >> 3) & 1);
+      const uint32_t group = b3 ? 2 : 4, rows = b3 ? 8 : 4, tiles = b3 ? 2 : 4, tile = insn & (b3 ? 1u : 3u);
+      const uint32_t scale = b3 ? static_cast<uint32_t>((s_.fpmr >> 16) & 15) : static_cast<uint32_t>((s_.fpmr >> 16) & 0x7F);
+      for (uint32_t i = 0; i < rows; ++i)
+        for (uint32_t j = 0; j < rows; ++j) {
+          bool any = false;
+          uint8_t x[4], y[4];
+          for (uint32_t k = 0; k < group; ++k) {
+            const bool row_on = active(pn, group * i + k, 0), col_on = active(pm, group * j + k, 0);
+            any = any || (row_on && col_on);
+            x[k] = row_on ? static_cast<uint8_t>(get(a, 0, group * i + k)) : 0;      // (each operand is zeroed by its own predicate, so a NaN under the other one still counts)
+            y[k] = col_on ? static_cast<uint8_t>(get(b, 0, group * j + k)) : 0;
+            if (subtract) x[k] ^= 0x80;
+          }
+          if (!any) continue;
+          Vec& row = s_.za[i * tiles + tile];
+          put(&row, b3 ? 1 : 2, j, fp8::dot_add(fa, x, fb, y, group, scale, b3 ? Format::F16 : Format::F32, static_cast<uint32_t>(get(row, b3 ? 1 : 2, j)), (s_.fpmr >> 14) & 1));
+        }
+      return Step::Ok;
+    }
     if (top == 0x80 && key == 0x404 && !b3) {      // FMOPA / FMOPS (single precision)
       const uint32_t tile = insn & 3;
       for (uint32_t i = 0; i < 4; ++i)

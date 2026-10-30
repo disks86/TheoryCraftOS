@@ -48,6 +48,7 @@ class AArch64Cpu final : public IGuestCpu {
     bool streaming = false, za_enabled = false;
     Vec za[16];
     uint64_t zt0[8] = {};
+    uint64_t fpmr = 0;      // FEAT_FPMR: the FP8 formats, saturation modes and scales
   };
   static constexpr uint32_t kN = 1u << 31, kZ = 1u << 30, kC = 1u << 29, kV = 1u << 28;
 
@@ -114,6 +115,9 @@ class AArch64Cpu final : public IGuestCpu {
   bool neon_three_same(uint32_t insn, Step* result);      // AArch64NeonThree.cpp
   bool neon_by_element(uint32_t insn, Step* result);      // AArch64NeonElement.cpp
   bool neon_two_register(uint32_t insn, Step* result);    // AArch64NeonTwo.cpp
+  bool lut(uint32_t insn);                         // AArch64Lut.cpp: LUTI2 / LUTI4 (Advanced SIMD and SVE)
+  bool fp8_sve(uint32_t insn, Step* result);       // AArch64Fp8Sve.cpp: FEAT_FP8 in SVE
+  bool fp8_neon(uint32_t insn, Step* result);      // AArch64Fp8Neon.cpp: FEAT_FP8 Advanced SIMD
   bool neon_three_different(uint32_t insn, Step* result);      // AArch64NeonDiff.cpp      // AArch64NeonShift.cpp; these return false when the instruction is not of their class
   // SVE (AArch64Sve*.cpp); each returns false when the word is not of its class, and sve() then raises an undefined-instruction fault.
   Step sve(GuestMemory& m, uint32_t insn);
@@ -129,6 +133,7 @@ class AArch64Cpu final : public IGuestCpu {
   Step sme2_array(uint32_t form, uint32_t insn);
   Step sme2_vector(GuestMemory& m, uint32_t form, uint32_t insn);
   Step sme2_misc(GuestMemory& m, uint32_t form, uint32_t insn);
+  Step sme2_fp8_convert(uint32_t insn);
   Step sme2_mop4(uint32_t form, uint32_t insn);
   bool sme2_mop4_match(uint32_t insn, uint32_t* form) const;
   void set_streaming_state(bool streaming, bool za, bool change_sm, bool change_za);      // SMSTART / SMSTOP

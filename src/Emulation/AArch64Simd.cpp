@@ -72,6 +72,7 @@ AArch64Cpu::Step AArch64Cpu::simd(uint32_t insn) {
   {
     Step crypto_result;
     if (crypto(insn, &crypto_result)) return crypto_result;
+    if (fp8_neon(insn, &crypto_result)) return crypto_result;
     if (neon_shift_immediate(insn, &crypto_result)) return crypto_result;
     if (neon_three_same(insn, &crypto_result)) return crypto_result;
     if (neon_by_element(insn, &crypto_result)) return crypto_result;
@@ -147,6 +148,15 @@ AArch64Cpu::Step AArch64Cpu::simd(uint32_t insn) {
   if ((insn & 0x9FF80400u) == 0x0F000400u) {
     const uint32_t cmode = bits_of(insn, 15, 12);
     const uint64_t imm8 = (uint64_t{bits_of(insn, 18, 16)} << 5) | bits_of(insn, 9, 5);
+    if ((insn >> 11) & 1) {      // bit 11 (o2) is only set for FMOV (vector, half precision)
+      if (cmode != 15 || u) return undefined();
+      const uint64_t half = ((imm8 & 0x80) << 8) | ((imm8 & 0x40) ? 0x3000ull : 0x4000ull) | ((imm8 & 0x30) << 6) | ((imm8 & 0x0F) << 6);
+      Vec v;
+      v.lo = half * 0x0001000100010001ull;
+      v.hi = q ? v.lo : 0;
+      s_.v[rd] = v;
+      return Step::Ok;
+    }
     uint64_t imm;
     bool is_orr_bic = false;
     uint32_t w = 32;

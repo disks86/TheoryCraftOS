@@ -161,5 +161,8 @@ uint64_t multiply_high(uint64_t a, uint64_t b, bool is_signed);
 // FEXPA: the exponential-approximation helper (AArch64SveFloat.cpp).
 uint64_t sve_expa(uint32_t esz, uint64_t x);
 
+// FSCALE: x * 2^n with one rounding (shared with the Advanced SIMD instruction).
+uint64_t fscale_value(softfloat::Format f, uint64_t x, int64_t n, softfloat::Env& env);
+
 }  // namespace sve
 }  // namespace emulation

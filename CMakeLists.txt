@@ -677,6 +677,10 @@ add_executable(BOOTX64
   src/Emulation/AArch64Sve2.cpp
   src/Emulation/AArch64Sme.cpp
   src/Emulation/AArch64Sme2.cpp
+  src/Emulation/AArch64Fp8.cpp
+  src/Emulation/AArch64Fp8Neon.cpp
+  src/Emulation/AArch64Fp8Sve.cpp
+  src/Emulation/AArch64Lut.cpp
   src/Emulation/AArch64NeonShift.cpp
   src/Emulation/AArch64NeonThree.cpp
   src/Emulation/AArch64NeonElement.cpp

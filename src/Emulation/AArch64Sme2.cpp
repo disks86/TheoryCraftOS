@@ -15,6 +15,7 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
+#include "Emulation/AArch64Fp8.hpp"
 #include "Emulation/AArch64SveCommon.hpp"
 #include "Emulation/SoftFloat.hpp"
 
@@ -169,6 +170,59 @@ AArch64Cpu::Step AArch64Cpu::sme2_array(uint32_t form, uint32_t insn) {
             }
             const uint64_t product = static_cast<uint64_t>(ext(a, src, n_signed) * ext(b, src, m_signed));
             put(&row, dst, l, (sub ? get(row, dst, l) - product : get(row, dst, l) + product) & element_ones(dst));
+          }
+        }
+      return Step::Ok;
+    }
+    case k_fdot8: {      // FDOT (FP8 to half or single)
+      const fp8::Fmt fa = static_cast<fp8::Fmt>(s_.fpmr & 1), fb = static_cast<fp8::Fmt>((s_.fpmr >> 3) & 1);
+      const uint32_t group = dst == 1 ? 2 : 4, scale_amount = dst == 1 ? static_cast<uint32_t>((s_.fpmr >> 16) & 15) : static_cast<uint32_t>((s_.fpmr >> 16) & 0x7F);
+      for (uint32_t r = 0; r < n; ++r) {
+        Vec& row = s_.za[row_of(r, 0)];
+        for (uint32_t l = 0; l < lanes; ++l) {
+          uint8_t a[4], b[4];
+          for (uint32_t k = 0; k < group; ++k) {
+            a[k] = static_cast<uint8_t>(get(zn_vec(r), 0, group * l + k));
+            b[k] = static_cast<uint8_t>(get(f.shape == 3 ? s_.v[zm] : zm_vec(r), 0, f.shape == 3 ? group * idx + k : group * l + k));
+          }
+          put(&row, dst, l, fp8::dot_add(fa, a, fb, b, group, scale_amount, dst == 1 ? Format::F16 : Format::F32, static_cast<uint32_t>(get(row, dst, l)), (s_.fpmr >> 14) & 1));
+        }
+      }
+      return Step::Ok;
+    }
+    case k_fvdot8: case k_fvdotb8: case k_fvdott8: {      // FVDOT, FVDOTB, FVDOTT: vertical dot products of a sliding window of two source vectors with a pair of bytes of Zm
+      const fp8::Fmt fa = static_cast<fp8::Fmt>(s_.fpmr & 1), fb = static_cast<fp8::Fmt>((s_.fpmr >> 3) & 1);
+      const bool to_half = op == k_fvdot8;
+      const uint32_t scale_amount = to_half ? static_cast<uint32_t>((s_.fpmr >> 16) & 15) : static_cast<uint32_t>((s_.fpmr >> 16) & 0x7F);
+      const uint32_t slots = to_half ? 2 : 1, vectors = to_half ? 2 : 4, stride_za = to_half ? 8 : 4, element = to_half ? 1 : 2;
+      const uint32_t base = to_half ? ((rv & ~1u) + off) : (rv + off), msel = to_half ? 2 * idx : 4 * idx + (op == k_fvdott8 ? 2 : 0);
+      for (uint32_t sl = 0; sl < slots; ++sl)
+        for (uint32_t v = 0; v < vectors; ++v) {
+          const uint32_t row_index = (base % stride_za) + sl + v * stride_za;
+          if (row_index >= 16) continue;      // (the second slot does not wrap past the array)
+          Vec& row = s_.za[row_index];
+          for (uint32_t l = 0; l < lanes; ++l) {      // (the upper four half precision lanes see zeros, so only a NaN in Zm changes them)
+            uint8_t a[2], b[2];
+            for (uint32_t j = 0; j < 2; ++j) {
+              a[j] = (l < 4 && zn + v + j < 32) ? static_cast<uint8_t>(get(s_.v[zn + v + j], 0, 4 * l + (to_half ? sl : 0))) : 0;      // (the window does not wrap: a register past z31 reads as zero)
+              b[j] = static_cast<uint8_t>(get(s_.v[zm], 0, msel + j));
+            }
+            put(&row, element, l, fp8::dot_add(fa, a, fb, b, 2, scale_amount, to_half ? Format::F16 : Format::F32, static_cast<uint32_t>(get(row, element, l)), (s_.fpmr >> 14) & 1));
+          }
+        }
+      return Step::Ok;
+    }
+    case k_fmlal8: case k_fmlall8: {      // FMLAL (FP8 into half) and FMLALL (FP8 into single) of two or four ZA vectors per source vector
+      const fp8::Fmt fa = static_cast<fp8::Fmt>(s_.fpmr & 1), fb = static_cast<fp8::Fmt>((s_.fpmr >> 3) & 1);
+      const uint32_t scale_amount = dst == 1 ? static_cast<uint32_t>((s_.fpmr >> 16) & 15) : static_cast<uint32_t>((s_.fpmr >> 16) & 0x7F);
+      Env quiet = fp_env();
+      for (uint32_t r = 0; r < n; ++r)
+        for (uint32_t j = 0; j < scale; ++j) {
+          Vec& row = s_.za[row_of(r, j)];
+          for (uint32_t l = 0; l < lanes; ++l) {
+            const uint8_t a = static_cast<uint8_t>(get(zn_vec(r), 0, scale * l + j));
+            const uint8_t b = static_cast<uint8_t>((f.shape == 3 || f.shape == 5) ? get(s_.v[zm], 0, idx) : get(zm_vec(r), 0, scale * l + j));
+            put(&row, dst, l, fp8::multiply_add(fa, a, fb, b, scale_amount, dst == 1 ? Format::F16 : Format::F32, static_cast<uint32_t>(get(row, dst, l)), (s_.fpmr >> 14) & 1, quiet));
           }
         }
       return Step::Ok;
@@ -349,7 +403,16 @@ AArch64Cpu::Step AArch64Cpu::sme2_mop4(uint32_t form, uint32_t insn) {
       const uint64_t acc = get(row, dst, j);
       uint64_t result;
       const Vec a = s_.v[(zn + (f.nn == 2 && j >= rows / 2 ? 1 : 0)) & 31], b = s_.v[(zm + (f.nm == 2 && i >= rows / 2 ? 1 : 0)) & 31];      // (a pair is split by column half for the first operand and by row half for the second)
-      if (f.op == mo_fmop4 || f.op == mo_bfmop4) {
+      if (f.op == mo_fmop48) {      // FP8 into half or single: groups of two or four bytes
+        const fp8::Fmt fa = static_cast<fp8::Fmt>(s_.fpmr & 1), fb = static_cast<fp8::Fmt>((s_.fpmr >> 3) & 1);
+        const uint32_t group = dst == 1 ? 2 : 4;
+        uint8_t x[4], y[4];
+        for (uint32_t k = 0; k < group; ++k) {
+          x[k] = static_cast<uint8_t>(get(a, 0, group * i + k)) ^ (sub ? 0x80 : 0);
+          y[k] = static_cast<uint8_t>(get(b, 0, group * j + k));
+        }
+        result = fp8::dot_add(fa, x, fb, y, group, dst == 1 ? static_cast<uint32_t>((s_.fpmr >> 16) & 15) : static_cast<uint32_t>((s_.fpmr >> 16) & 0x7F), dst == 1 ? Format::F16 : Format::F32, static_cast<uint32_t>(acc), (s_.fpmr >> 14) & 1);
+      } else if (f.op == mo_fmop4 || f.op == mo_bfmop4) {
         const bool bf = f.op == mo_bfmop4;
         if (src == dst) {      // single, double and half precision (BFloat16 for BFMOP4 into half)
           const Format fmt = dst == 2 ? Format::F32 : dst == 3 ? Format::F64 : bf ? Format::BF16 : Format::F16;
@@ -384,7 +447,51 @@ AArch64Cpu::Step AArch64Cpu::sme2_mop4(uint32_t form, uint32_t insn) {
   return Step::Ok;
 }
 
+// FP8 conversions of vectors: bytes to two vectors of halves (consecutive, or even and odd bytes with the "L" forms), and halves or singles to bytes.
+AArch64Cpu::Step AArch64Cpu::sme2_fp8_convert(uint32_t insn) {
+  if ((insn & 0xFF3FFC00u) == 0xC126E000u) {      // F1CVT, F2CVT, BF1CVT, BF2CVT and the L forms
+    const uint32_t opc = bits_of(insn, 23, 22), second = (opc >> 1) & 1;      // (bit 23: the second format; bit 22: BFloat16)
+    const bool bfloat = opc & 1, interleave = insn & 1;
+    const fp8::Fmt fmt = static_cast<fp8::Fmt>((s_.fpmr >> (second ? 3 : 0)) & 1);
+    const uint32_t lscale = second ? static_cast<uint32_t>((s_.fpmr >> 32) & 0x3F) : static_cast<uint32_t>((s_.fpmr >> 16) & (bfloat ? 0x3F : 0x7F));
+    const uint32_t zd = bits_of(insn, 4, 1) << 1;
+    const Vec src = s_.v[bits_of(insn, 9, 5)];
+    Vec out[2];
+    for (uint32_t k = 0; k < 2; ++k)
+      for (uint32_t i = 0; i < 8; ++i) {
+        const uint8_t b = static_cast<uint8_t>(get(src, 0, interleave ? 2 * i + k : 8 * k + i));
+        bool inexact;
+        put(&out[k], 1, i, fp8::widen(fmt, b, bfloat ? Format::BF16 : Format::F16, bfloat ? lscale : (lscale & 15), &inexact));
+      }
+    s_.v[zd] = out[0];
+    s_.v[(zd + 1) & 31] = out[1];
+    return Step::Ok;
+  }
+  const bool halves = (insn & 0xFFBFFC20u) == 0xC124E000u, singles = (insn & 0xFFFFFC40u) == 0xC134E000u;
+  if (halves || singles) {
+    const fp8::Fmt fd = static_cast<fp8::Fmt>((s_.fpmr >> 6) & 1);
+    const bool saturate = (s_.fpmr >> 15) & 1, flag = halves ? (insn >> 22) & 1 : (insn >> 5) & 1;      // (bfloat for the halves, interleaved for the singles)
+    uint32_t flags = 0;
+    Vec out;
+    if (halves) {
+      const uint32_t zn = bits_of(insn, 9, 6) << 1;
+      const int32_t nscale = flag ? static_cast<int32_t>(static_cast<int8_t>(s_.fpmr >> 24)) : static_cast<int32_t>((s_.fpmr >> 24) & 15) - static_cast<int32_t>((s_.fpmr >> 24) & 16);
+      for (uint32_t k = 0; k < 2; ++k)
+        for (uint32_t i = 0; i < 8; ++i) put(&out, 0, 8 * k + i, fp8::narrow(fd, flag ? Format::BF16 : Format::F16, get(s_.v[(zn + k) & 31], 1, i), nscale, saturate, &flags));
+    } else {
+      const uint32_t zn = bits_of(insn, 9, 7) << 2;
+      const int32_t nscale = static_cast<int8_t>(s_.fpmr >> 24);
+      for (uint32_t k = 0; k < 4; ++k)
+        for (uint32_t i = 0; i < 4; ++i) put(&out, 0, flag ? 4 * i + k : 4 * k + i, fp8::narrow(fd, Format::F32, get(s_.v[(zn + k) & 31], 2, i), nscale, saturate, &flags));
+    }
+    s_.v[insn & 31] = out;
+    return Step::Ok;
+  }
+  return undefined();
+}
+
 AArch64Cpu::Step AArch64Cpu::sme2(GuestMemory& m, uint32_t insn) {
+  if ((insn & 0xFF3FFC00u) == 0xC126E000u || (insn & 0xFFBFFC20u) == 0xC124E000u || (insn & 0xFFFFFC40u) == 0xC134E000u) return sme2_fp8_convert(insn);
   for (uint32_t i = 0; i < sizeof(kSme2MiscForms) / sizeof(kSme2MiscForms[0]); ++i)
     if ((insn & kSme2MiscForms[i].mask) == kSme2MiscForms[i].value) return sme2_misc(m, i, insn);
   for (uint32_t i = 0; i < sizeof(kSme2VecForms) / sizeof(kSme2VecForms[0]); ++i)

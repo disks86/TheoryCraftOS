@@ -1120,6 +1120,39 @@ static void test_aarch64_sme() {
     CHECK(s.v[12].lo == 0x0000000200000001ull && s.v[12].hi == 0x0000000400000003ull && s.v[13].lo == 0 && s.v[13].hi == 0);
     CHECK(s.v[14].lo == 0x0002000200010001ull && s.v[14].hi == 0x0004000400030003ull);
   }
+  {      // FEAT_FP8: widening conversions (with the scale), a narrowing conversion, a dot product, FSCALE and a table lookup (the format and scale registers are set directly)
+    A64Machine m({0x2e217822,       // f1cvtl v2.8h, v1.8b
+                  0xd4000001});
+    AArch64Cpu::State& s = m.cpu.state();
+    s.fpmr = 0;      // E5M2, no scale
+    s.v[1].lo = 0x000000000000003Cull * 0x100 + 0x40;      // bytes 0x40 (2.0) and 0x3c (1.0) in E5M2
+    s.v[1].hi = 0;
+    CHECK(m.run() == StopReason::Syscall);
+    CHECK((s.v[2].lo & 0xFFFF) == 0x4000 && ((s.v[2].lo >> 16) & 0xFFFF) == 0x3C00);      // 2.0 and 1.0 as halves
+  }
+  {      // the same conversion with LSCALE = 1 halves the values, and E4M3 / FP8 dot products
+    A64Machine m({0x2e217822, 0xd4000001});
+    m.cpu.state().fpmr = 1ull << 16;
+    m.cpu.state().v[1].lo = 0x3C40;
+    CHECK(m.run() == StopReason::Syscall && (m.cpu.state().v[2].lo & 0xFFFF) == 0x3C00 && ((m.cpu.state().v[2].lo >> 16) & 0xFFFF) == 0x3800);
+    A64Machine d({0x4e42fc20, 0xd4000001});      // fdot v0.8h, v1.16b, v2.16b: 1.0 + 3 * 3 + 3 * 3 in every lane
+    for (auto& v : {&d.cpu.state().v[1], &d.cpu.state().v[2]}) v->lo = v->hi = 0x4242424242424242ull;
+    d.cpu.state().v[0].lo = d.cpu.state().v[0].hi = 0x3C003C003C003C00ull;
+    CHECK(d.run() == StopReason::Syscall && d.cpu.state().v[0].lo == 0x4CC04CC04CC04CC0ull && d.cpu.state().v[0].hi == 0x4CC04CC04CC04CC0ull);
+    A64Machine n({0x0e42f423, 0xd4000001});      // fcvtn v3.8b, v1.4h, v2.4h to E4M3: 1.0 is 0x38
+    n.cpu.state().fpmr = 1ull << 6;
+    n.cpu.state().v[1].lo = n.cpu.state().v[2].lo = 0x3C003C003C003C00ull;
+    CHECK(n.run() == StopReason::Syscall && n.cpu.state().v[3].lo == 0x3838383838383838ull && n.cpu.state().v[3].hi == 0);
+    A64Machine l({0x4e821020, 0xd4000001});      // luti2 v0.16b, {v1.16b}, v2[0]
+    l.cpu.state().v[1].lo = 0x281E140A281E140Aull;      // the table 10, 20, 30, 40
+    l.cpu.state().v[2].lo = 0xE4;      // indices 0 1 2 3
+    l.cpu.state().v[2].hi = 0;
+    CHECK(l.run() == StopReason::Syscall && (l.cpu.state().v[0].lo & 0xFFFFFFFFu) == 0x281E140Au);
+    A64Machine f({0x2ea2fc20, 0xd4000001});
+    f.cpu.state().v[1].lo = 0x404000003F800000ull;      // 1.0 and 3.0
+    f.cpu.state().v[2].lo = 0xFFFFFFFF00000003ull;      // 3 and -1
+    CHECK(f.run() == StopReason::Syscall && f.cpu.state().v[0].lo == 0x3FC0000041000000ull);      // 8.0 and 1.5
+  }
   {      // streaming-only instructions are undefined outside streaming mode
     A64Machine m({0xc0828001, 0xd4000001});      // mov z1.s, p0/m, za0v.s[w12, 0]
     CHECK(m.run() == StopReason::Fault && m.cpu.fault().vector == 6);
@@ -1131,7 +1164,7 @@ static void test_aarch64_sme() {
 }
 
 static void test_aarch64_robustness() {
-  const Words sample = {0xf9400420, 0x91000400, 0xf9000420, 0x1e601000, 0x1e611001, 0x1e612802, 0x9e660045, 0x1f410803, 0x9e780066, 0x3dc00020, 0x4ea08400, 0x3d800420,
+  const Words sample = {0xf9400420, 0x91000400, 0xf9000420, 0x1e601000, 0x1e611001, 0x1e612802, 0x9e660045, 0x1f410803, 0x9e780066, 0x3dc00020, 0x4ea08400, 0x3d800420, 0x2e217800, 0x0e40f400, 0x4e40fc00, 0x0e00c400, 0x6e00ec00, 0x4e801000, 0x2ea2fc20, 0x0fc00000,
                         0xf1000c1f, 0x1a9f17e7, 0xdac01149, 0x0c407000, 0x4c40a000, 0x0d404000, 0x2e208400, 0x0e200800};
   uint32_t runs = 0;
   for (size_t i = 0; i < sample.size(); ++i) {      // every single-bit flip of every word
@@ -1155,7 +1188,7 @@ static void test_aarch64_robustness() {
     ++runs;
   }
   {      // SVE: every bit flip of one word of each kind (integer, predicate, permute, floating point, SVE2, loads, stores), then random words from the SVE encoding space with addresses in the data page
-    const Words sve = {0x04a14020, 0x04802022, 0x2598e3e0, 0x25a317e1, 0x05a36041, 0x658600c7, 0x44836041, 0x45836041, 0xa540a483, 0xa41f68c4, 0xc5c8c889, 0xe540e4a3, 0xe5a4a861, 0x8508448b, 0x2519f003, 0x252c9000};
+    const Words sve = {0x04a14020, 0x04802022, 0x2598e3e0, 0x25a317e1, 0x05a36041, 0x658600c7, 0x44836041, 0x45836041, 0xa540a483, 0xa41f68c4, 0xc5c8c889, 0xe540e4a3, 0xe5a4a861, 0x8508448b, 0x2519f003, 0x252c9000, 0x65083000, 0x650a3040, 0x64208400, 0x64a08800, 0x6420c000, 0x6420e000, 0x4520b000};
     for (size_t i = 0; i < sve.size(); ++i)
       for (int bit = 0; bit < 32; ++bit) {
         A64Machine m({sve[i] ^ (1u << bit), 0xd4000001});
@@ -1177,7 +1210,8 @@ static void test_aarch64_robustness() {
   }
   {      // SME: every bit flip of one word of each kind in streaming mode with ZA enabled, then random words from the SME encoding space
     const Words sme = {0xc0800000, 0xc0828001, 0xc0860008, 0xc0840000, 0xc0cc2006, 0xe11f8020, 0xc0480001, 0xe0400000, 0xe1400000, 0x80830061, 0xa0830061, 0xc0090000, 0xa040402c, 0xa0204000, 0xc0e00000, 0xc0c10000,
-                       0xc1a01c10, 0xc1241441, 0xc1a5a006, 0xc1a1d008, 0x80008143, 0xc1efd40e, 0xc1231802, 0xc1600c00, 0xc1a0e000, 0xc1a08000, 0xc1b6e000, 0x81800008, 0xc0000000};
+                       0xc1a01c10, 0xc1241441, 0xc1a5a006, 0xc1a1d008, 0x80008143, 0xc1efd40e, 0xc1231802, 0xc1600c00, 0xc1a0e000, 0xc1a08000, 0xc1b6e000, 0x81800008, 0xc0000000,
+                       0xc126e040, 0xc124e040, 0xc134e0a0, 0x80a00000, 0x80200000, 0xc1d00000, 0xc1e00000};
     auto prepare = [](A64Machine& m, uint64_t seed) {
       m.cpu.state().streaming = true;
       m.cpu.state().za_enabled = true;
