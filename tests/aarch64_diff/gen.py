@@ -47,6 +47,19 @@ def vh():
         out |= h << (16 * i)
     return out
 
+def pred16():
+    # a predicate for a 128-bit vector: random, all true, element-aligned patterns for each element size, or sparse
+    k = random.random()
+    if k < 0.3: return random.getrandbits(16)
+    if k < 0.4: return 0xFFFF
+    if k < 0.45: return 0
+    if k < 0.85:
+        esz = random.randrange(4); out = 0
+        for i in range(16 >> esz):
+            if random.random() < 0.6: out |= 1 << (i << esz)
+        return out
+    return 1 << random.randrange(16)
+
 def regs3(): return [random.randrange(0, 31) for _ in range(3)]
 def fp(): return random.randrange(0, 32)
 
@@ -394,6 +407,28 @@ elif mode == 'words':
     for line in open(WORK + '/sample.txt'):
         w, text = line.rstrip('\n').split(' ', 1)
         add(f'.inst 0x{w} // {text}')
+elif mode == 'svemem':
+    # SVE loads and stores chosen by words.py (SVEMEM=1): the registers that address memory are rewritten so that every access lands in the scratch buffer.
+    # x28 is the buffer base, x27 a small element offset, z31 a vector of small offsets (or, as a vector base, of addresses inside the buffer).
+    import re as _re
+    for line in open(WORK + '/sample.txt'):
+        w, text = line.rstrip('\n').split(' ', 1)
+        pre = ''
+        m = _re.search(r'\[(x\d+|sp)(?:, (x\d+|z\d+\.[sd]))?', text)
+        t2 = _re.sub(r'\[x\d+', '[x28', text)
+        if _re.search(r'\[z\d+\.([sd])', t2):      # vector base (plus immediate or scalar)
+            t2 = _re.sub(r'\[z\d+\.([sd])', r'[z31.\1', t2)
+            T = _re.search(r'\[z31\.([sd])', t2).group(1)
+            pre = f'index z31.{T}, ' + ('w28' if T == 's' else 'x28') + f', #{random.choice([1, 2, 4, 8])}'
+        elif _re.search(r', z\d+\.([sd])(, |\])', t2):      # vector of offsets
+            t2 = _re.sub(r', z\d+\.([sd])(, |\])', r', z31.\1\2', t2, count=1)
+            T = _re.search(r', z31\.([sd])', t2).group(1)
+            neg = 'sxtw' in t2 and random.random() < 0.3
+            pre = f'index z31.{T}, #{random.randrange(-8, 0) if neg else random.randrange(0, 4)}, #{random.choice([1, 2, 3, 4])}'
+        t2 = _re.sub(r', x\d+(\]|, lsl)', r', x27\1', t2)
+        if _re.search(r'\bz31\b', _re.sub(r'\[[^]]*\]', '', t2)): continue      # the destination or source list uses z31: skip
+        if pre: add(pre + '\n  ' + t2)
+        else: add(t2)
 elif mode == 'int2':
     for _ in range(6000):
         sf = random.random() < 0.6
@@ -424,14 +459,16 @@ elif mode == 'int2':
 # --- emit asm
 NZCV_OFF = 0; X_OFF = 8; V_OFF = 8 + 31*8 + 8  # keep 16-aligned: x0..x30 then pad
 V_OFF = (8 + 31*8 + 15) // 16 * 16
-INIT_SIZE = V_OFF + 32*16
+INIT_SIZE = V_OFF + 32*16 + 48
 RES_OFF = (INIT_SIZE + 15) // 16 * 16
 RES_X = RES_OFF; RES_V = RES_OFF + 31*8 + 24  # nzcv,fpsr stored first? layout below
 # result layout: x0..x30 (248), nzcv(8), fpsr(8), pad to 16, v0..v31
 RES_NZCV = RES_OFF + 31*8; RES_FPSR = RES_NZCV + 8
 RES_V = (RES_FPSR + 8 + 15) // 16 * 16
-BUF_OFF = (RES_V + 32*16 + 15) // 16 * 16
-BUF_SIZE = 256
+RES_P = RES_V + 32*16       # p0..p15 then FFR, 2 bytes each (vector length 128 bits)
+BUF_OFF = (RES_P + 17*2 + 15) // 16 * 16
+BUF_SIZE = 1024
+INIT_P = V_OFF + 32*16      # initial predicates, same layout (inside the init area, which is RES_OFF-aligned, so reserve the room)
 BLK = BUF_OFF + BUF_SIZE
 
 out = ['.text', '.globl _start', '_start:']
@@ -440,15 +477,21 @@ for i, text in enumerate(cases):
     out.append(f'  adrp x0, blk{i}\n  add x0, x0, :lo12:blk{i}\n  mov sp, x0')
     out.append(f'  ldr x0, [sp, #{NZCV_OFF}]\n  msr nzcv, x0\n  msr fpsr, xzr')
     for k in range(0, 32, 2): out.append(f'  ldp q{k}, q{k+1}, [sp, #{V_OFF + k*16}]')
+    out.append(f'  add x1, sp, #{INIT_P}\n  ldr p0, [x1, #16, mul vl]\n  wrffr p0.b')
+    for k in range(16): out.append(f'  ldr p{k}, [x1, #{k}, mul vl]')
     for k in range(0, 30, 2): out.append(f'  ldp x{k}, x{k+1}, [sp, #{X_OFF + k*8}]')
     out.append(f'  ldr x30, [sp, #{X_OFF + 30*8}]')
-    out.append(f'  add x28, sp, #{BUF_OFF + 96}')
+    out.append(f'  add x28, sp, #{BUF_OFF + 384}')
+    out.append(f'  mov x27, #{random.randrange(0, 6)}')
     out.append(f'  {text}')
     out.append(f'  add sp, sp, #{RES_OFF}')
     for k in range(0, 30, 2): out.append(f'  stp x{k}, x{k+1}, [sp, #{RES_X + k*8 - RES_OFF}]')
     out.append(f'  str x30, [sp, #{RES_X + 30*8 - RES_OFF}]')
     out.append(f'  mrs x0, nzcv\n  str x0, [sp, #{RES_NZCV - RES_OFF}]\n  mrs x0, fpsr\n  str x0, [sp, #{RES_FPSR - RES_OFF}]')
     for k in range(0, 32, 2): out.append(f'  stp q{k}, q{k+1}, [sp, #{RES_V + k*16 - RES_OFF}]')
+    out.append(f'  add x1, sp, #{RES_P - RES_OFF}')
+    for k in range(16): out.append(f'  str p{k}, [x1, #{k}, mul vl]')
+    out.append(f'  rdffr p0.b\n  str p0, [x1, #16, mul vl]')
     data.append(f'blk{i}:')
     words = [random.getrandbits(32) & 0xF0000000]  # nzcv
     words = [struct.pack('<Q', random.getrandbits(4) << 28)]
@@ -458,7 +501,8 @@ for i, text in enumerate(cases):
     vs = []
     for _ in range(32):
         vs.append(struct.pack('<QQ', v64(fpmode), v64(fpmode)))
-    blob = b''.join(words + xs + pad + vs)
+    ps = b''.join(struct.pack('<H', pred16()) for _ in range(17))
+    blob = b''.join(words + xs + pad + vs) + ps
     blob += bytes(BUF_OFF - len(blob)) + bytes(random.getrandbits(8) for _ in range(BUF_SIZE))
     for off in range(0, len(blob), 16):
         data.append('  .quad 0x%x, 0x%x' % struct.unpack('<QQ', blob[off:off+16]))
@@ -468,4 +512,4 @@ out.append('.balign 8\n.pool')
 data.append(f'.set total, {BLK * len(cases)}')
 open(WORK + '/t.s', 'w').write('\n'.join(out + data) + '\n')
 open(WORK + '/cases.txt', 'w').write('\n'.join(c.replace('\n', ' ; ') for c in cases) + '\n')
-open(WORK + '/layout.txt', 'w').write(f'{BLK} {X_OFF} {V_OFF} {RES_X} {RES_NZCV} {RES_FPSR} {RES_V} {BUF_OFF}\n')
+open(WORK + '/layout.txt', 'w').write(f'{BLK} {X_OFF} {V_OFF} {RES_X} {RES_NZCV} {RES_FPSR} {RES_V} {BUF_OFF} {RES_P}\n')

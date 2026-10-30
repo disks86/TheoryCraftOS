@@ -50,6 +50,8 @@ constexpr uint32_t kTxRingBase = 0x00000, kRxRingBase = 0x08000;
 // 32 bytes per hop: +0 the flags, +4 (RX) the SOF / EOF masks
 constexpr uint32_t kTxOptionsBase = 0x19800, kRxOptionsBase = 0x29800;
 constexpr uint32_t kRingNotifyBase = 0x37800, kRingIntClear = 0x37808, kRingInterruptBase = 0x38200, kRingInterruptMaskClearBase = 0x38208;
+constexpr uint32_t kIntThrottlingRate = 0x38C00, kIntVecAllocBase = 0x38C40, kDmaMisc = 0x39864;
+constexpr uint32_t kIntVecAllocBits = 4, kIntVecAllocMask = 0xF, kIntVecAllocPerRegister = 32 / kIntVecAllocBits, kDmaMiscIntAutoClear = 1u << 2;
 constexpr uint32_t kCaps = 0x39640, kResetRegister = 0x39898, kInmailData = 0x39900, kInmailCmd = 0x39904, kOutmailCmd = 0x3990C, kFirmwareStatus = 0x39944;
 
 constexpr uint32_t kCapsHopMask = 0x3FF, kCapsVersionShift = 16, kCapsVersionMask = 0xFF;

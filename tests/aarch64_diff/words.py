@@ -8,11 +8,15 @@ flt = re.compile(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3] else None
 per_key = int(sys.argv[4]) if len(sys.argv) > 4 else 4
 candidates = int(sys.argv[5]) if len(sys.argv) > 5 else 600000
 rng = random.Random(seed)
+import os
+SVEMEM = bool(os.environ.get('SVEMEM'))
+SVE = bool(os.environ.get('SVE')) or SVEMEM
 words = []
 while len(words) < candidates:
     w = rng.getrandbits(32)
     if (w >> 26) & 7 == 5: continue                 # branches
     if (w >> 24) in (0xD4, 0xD5, 0xD6, 0xD7): continue    # exceptions, system, branches to register
+    if SVE: w = (w & ~(0xF << 25)) | (2 << 25)            # the SVE encoding space only
     words.append(w)
 MATTR = '--mattr=+all'
 valid, texts = [], []
@@ -35,6 +39,7 @@ for base in range(0, len(words), CH):
         if e is None: break
         if int(e[0], 16) | int(e[1], 16) << 8 | int(e[2], 16) << 16 | int(e[3], 16) << 24 == w:
             valid.append(w); texts.append(t)
+SKIP_SVE = re.compile(r'^(ld|st|prf|ldr|str)')       # (loads and stores need valid addresses: the "sve_mem" mode)
 SKIP = re.compile(r'^(ld|st|prf|cas|swp|ldr|str|udf|brk|hlt|svc|hvc|smc|dcps|eret|drps|msr|mrs|sys|at |dc |ic |tlbi|wf|sev|hint|yield|nop|bti|paci|auti|xpac|ret|br|bl|b\.|cb|tb|isb|dsb|dmb|clrex|ssbb|pssbb|sb|esb|psb|tsb|csdb|cpy|set|rcw|gcs|chk|irg|gmi|addg|subg|stg|stz|ldg|zero|sm(start|stop)|rdffr|setffr|wrffr|rdvl|addvl|addpl|rdsvl|addsvl|addspl|ld[0-9]|st[0-9])')
 def key(t):
     m = t.split()[0]
@@ -44,8 +49,16 @@ def key(t):
     return m + ' ' + shape
 groups = collections.defaultdict(list)
 for w, t in zip(valid, texts):
-    if SKIP.match(t): continue
-    if re.search(r'\bz#|\bz[0-9]|\bp[0-9]+[/,.]|\bpn|\bza|\[x[0-9]|\[sp', t): continue
+    if SVEMEM:
+        # memory forms only; the ones that need the stack pointer or a 128-bit element (SVE2.1) are skipped
+        # (qemu does not load a first-fault or non-fault element that is the first active one but sits in the upper half of the register, which the architecture does not allow: those are
+        # covered by the unit tests instead)
+        if not re.match(r'^(ld[1-4]|ldnt1|st[1-4]|stnt1|prf)', t) or re.search(r'\bza|\bpn[0-9]|\bzt0|\bsp\b|\.q\b|\bz31\b|\bx27\b|\bx28\b', t): continue
+    elif SVE:
+        if SKIP_SVE.match(t) or re.search(r'\bza|\bpn[0-9]|\bzt0|\[x[0-9]|\[sp|\bsm(start|stop)', t): continue
+    else:
+        if SKIP.match(t): continue
+        if re.search(r'\bz#|\bz[0-9]|\bp[0-9]+[/,.]|\bpn|\bza|\[x[0-9]|\[sp', t): continue
     if re.match(r'^\S+\s+w?sp\b', t): continue        # writes the stack pointer, which the test program needs
     if flt and not flt.search(t): continue
     groups[key(t)].append((w, t))
@@ -66,7 +79,21 @@ if probe:
     data = b''.join(struct.pack('<I', int(w, 16)) for w, _ in rows)
     res = subprocess.run([probe], input=data, capture_output=True).stdout
     kept = [r for r, st in zip(rows, res) if st != 1]
+    # drop what qemu does not implement either (SIGILL), so the comparison only covers instructions both can run
+    qp = os.environ.get('A64_QPROBE')
+    if qp and kept:
+        data = b''.join(struct.pack('<I', int(w, 16)) for w, _ in kept)
+        qres = subprocess.run(['qemu-aarch64', '-cpu', 'max,sve-max-vq=1,sme128=on', qp], input=data, capture_output=True, timeout=600).stdout
+        if len(qres) == len(kept):
+            lost = collections.Counter(t.split()[0] for (w, t), st in zip(kept, qres) if st == 1)
+            kept = [r for r, st in zip(kept, qres) if st != 1]
+            if lost: print('qemu rejects:', ' '.join('%s:%d' % kv for kv in lost.most_common(30)))
+        else:
+            print('qprobe failed (%d of %d results); keeping all' % (len(qres), len(kept)))
     missing = collections.Counter(t.split()[0] for (w, t), st in zip(rows, res) if st == 1)
+    with open(work + '/missing.txt', 'w') as f:
+        for (w, t), st in zip(rows, res):
+            if st == 1: f.write('%s %s\n' % (w, t))
     with open(work + '/sample.txt', 'w') as f:
         for w, t in kept: f.write('%s %s\n' % (w, t))
     print('emulator lacks %d of %d sampled forms; kept %d' % (sum(missing.values()), len(rows), len(kept)))

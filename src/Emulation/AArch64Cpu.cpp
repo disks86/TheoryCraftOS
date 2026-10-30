@@ -964,6 +964,9 @@ AArch64Cpu::Step AArch64Cpu::step(GuestMemory& m) {
     case 5: case 13:     // x101: data processing, register
       result = data_register(insn);
       break;
+    case 2:              // 0010: SVE
+      result = sve(m, insn);
+      break;
     case 7: case 15:     // x111: scalar floating point and Advanced SIMD
       result = (((insn >> 24) & 0x1E) == 0x1E && !((insn >> 29) & 1) && !((insn >> 30) & 1)) ? floating_point(insn) : simd(insn);
       break;

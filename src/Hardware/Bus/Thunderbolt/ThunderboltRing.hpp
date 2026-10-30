@@ -54,7 +54,9 @@ class TbNhi {
   void release_hop(bool transmit, uint32_t hop);
 
   // Unmasks (or masks again) the interrupts of one ring of the control channel, hop 0: the transmit ring's bit is the hop, the receive ring's the hop plus the number of hops.
-  void set_control_interrupts(bool on);
+  // With MSI-X (`vector` >= 0, one of the table's first 16 entries) the two rings' interrupts are also routed to that entry (the vector allocation registers) and the chip is told to clear
+  // the status bits itself; with MSI (-1) all the rings share the one message.
+  void set_control_interrupts(bool on, int vector = -1);
   // What the interrupt handler does: reads all the notify registers, which is what lets the chip raise the next interrupt (they are read-to-clear, even those of rings that are masked).
   // True if any ring had something to say. Touches only registers, so it is fine in an interrupt handler.
   bool acknowledge_interrupt();

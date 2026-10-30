@@ -33,7 +33,11 @@ uint64_t shift_by_register(I128 v, int32_t sh, uint32_t w, bool round, bool satu
   if (sh >= 0) {
     if (saturate) {
       if (v == 0) return 0;
-      const I128 shifted = v << (sh > 64 ? 64 : sh);
+      if (sh >= static_cast<int32_t>(w)) {      // (any non-zero value overflows)
+        *sat = true;
+        return is_unsigned ? ones(w) : (v < 0 ? uint64_t{1} << (w - 1) : ones(w - 1));
+      }
+      const I128 shifted = v << sh;
       return is_unsigned ? saturate_to_unsigned(shifted, w, sat) : saturate_to_signed(shifted, w, sat);
     }
     return sh >= static_cast<int32_t>(w) ? 0 : (static_cast<uint64_t>(v) << sh) & ones(w);

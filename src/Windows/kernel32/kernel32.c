@@ -2766,8 +2766,12 @@ static void complete_overlapped(LPOVERLAPPED overlapped, NTSTATUS status, ULONG_
   overlapped->InternalHigh = bytes;
   if (overlapped->hEvent) NtSetEvent((HANDLE)((ULONG_PTR)overlapped->hEvent & ~(ULONG_PTR)1), NULL);
 }
+static BOOL con_std_is_console(HANDLE h);
+static BOOL con_is_output_only(HANDLE h);
 EXPORT BOOL WINAPI ReadFile(HANDLE h, LPVOID buffer, DWORD length, LPDWORD read, LPOVERLAPPED overlapped) {
   if (read) *read = 0;
+  if (con_is_output_only(h)) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
+  if (length > 0x7FFFFFFFu && con_std_is_console(h)) { set_error(ERROR_NOACCESS); return FALSE; }
   if (pipe_start_overlapped(0, h, buffer, length, overlapped, NULL)) return FALSE;
   if (!overlapped) { BOOL handled; const BOOL result = console_read_hook(h, buffer, length, read, &handled); if (handled) return result; }
   IO_STATUS_BLOCK iosb;
@@ -3755,6 +3759,7 @@ EXPORT BOOL WINAPI DllMain(HANDLE module, DWORD reason, PVOID reserved) {
   return TRUE;
 }
 
+#include "locale.inc"
 #include "extra.inc"
 #include "extra2.inc"
 #include "extra3.inc"
@@ -3762,5 +3767,7 @@ EXPORT BOOL WINAPI DllMain(HANDLE module, DWORD reason, PVOID reserved) {
 #include "fmtmsg.inc"
 #include "time.inc"
 #include "nls.inc"
+#include "nls2.inc"
+#include "idn.inc"
 #include "actctx.inc"
 #include "rsrcupdate.inc"
