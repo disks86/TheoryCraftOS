@@ -69,7 +69,7 @@ enum class Op : uint8_t {
   Binop, Cast, Cmp, Select, Call, Br, CondBr, Ret, Phi, ExtractValue, Load, Store, Alloca, Gep, Unreachable, Switch, Other
 };
 
-constexpr uint32_t kMaxCallArguments = 16;
+constexpr uint32_t kMaxCallArguments = 20;
 struct Instruction {
   Op op = Op::Other;
   uint32_t code = 0;            // Binop: the LLVM binary operator (0 add, 1 sub, 2 mul, 3 udiv, 4 sdiv, 5 urem, 6 srem, 7 shl, 8 lshr, 9 ashr, 10 and, 11 or, 12 xor); Cast: the cast opcode; Cmp: the predicate

@@ -564,6 +564,41 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
     }
   };
 
+  // The difference along an axis of the value `a` of the instruction at `at`, over the pair of the quad (see kDdx): the other pixel's value is found by running the shader up to `at` on its
+  // varyings (a pixel run for this, which hands back what the instruction read: s.capture_at). Zero without a quad.
+  auto quad_difference = [&](const Q& a, uint64_t at, bool y_axis, bool coarse) {
+    Q zero = {{0, 0, 0, 0}};
+    const graphics::FragmentContext* f = s.fragment;
+    if (!f || !f->quad_fn || s.derivative_depth >= 2) return zero;
+    const uint32_t own = f->quad_corner & 3;
+    uint32_t corner[2];
+    if (!y_axis) corner[0] = coarse ? 0 : (own & 2), corner[1] = corner[0] + 1;
+    else corner[0] = coarse ? 0 : (own & 1), corner[1] = corner[0] + 2;
+    Q value[2];
+    for (uint32_t k = 0; k < 2; ++k) {
+      if (corner[k] == own) {
+        value[k] = a;
+        continue;
+      }
+      graphics::Vec4 varyings[graphics::kMaxVaryings] = {}, position = {};
+      f->quad_fn(f->quad_user, corner[k], varyings, &position);
+      State other = {};
+      other.varyings = varyings;
+      other.constants = s.constants;
+      other.textures = s.textures;
+      for (uint32_t n = 0; n < kSysValueCount; ++n) other.sys[n] = s.sys[n];
+      other.sys[kSysPosition] = {{position.x, position.y, position.z, position.w}};
+      other.fragment = f;
+      other.derivative_depth = s.derivative_depth + 1;
+      other.capture_at = at;
+      execute(other, 0, at + 1);
+      value[k] = other.captured;
+    }
+    Q r = {{0, 0, 0, 0}};
+    for (int i = 0; i < 4; ++i) r.f[i] = value[1].f[i] - value[0].f[i];
+    return r;
+  };
+
   const uint64_t count = code_.count() < end ? code_.count() : end;
   uint32_t steps = 0;   // (a loop that never ends stops the program, not the machine)
   for (uint64_t pc = begin; pc < count;) {
@@ -609,44 +644,11 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
         }
         break;
       case kDdx: case kDdy: case kDdxCoarse: case kDdyCoarse: {
-        // The value of the source at the other pixels of the quad is found by running the shader up to this instruction for them, on their varyings; the derivative is the difference of the
-        // pair along the axis (a pair of the pixel's own row or column, or of the quad's first for the coarse ones).
         if (s.capture_at == pc - 1) {
           s.captured = a;
           return;
         }
-        const graphics::FragmentContext* f = s.fragment;
-        if (!f || !f->quad_fn || s.derivative_depth >= 2) {
-          store(ins.dst, r);
-          break;
-        }
-        const bool y_axis = ins.op == kDdy || ins.op == kDdyCoarse, coarse = ins.op == kDdxCoarse || ins.op == kDdyCoarse;
-        const uint32_t own = f->quad_corner & 3;
-        uint32_t corner[2];
-        if (!y_axis) corner[0] = coarse ? 0 : (own & 2), corner[1] = corner[0] + 1;
-        else corner[0] = coarse ? 0 : (own & 1), corner[1] = corner[0] + 2;
-        Q value[2];
-        for (uint32_t k = 0; k < 2; ++k) {
-          if (corner[k] == own) {
-            value[k] = a;
-            continue;
-          }
-          graphics::Vec4 varyings[graphics::kMaxVaryings] = {}, position = {};
-          f->quad_fn(f->quad_user, corner[k], varyings, &position);
-          State other = {};
-          other.varyings = varyings;
-          other.constants = s.constants;
-          other.textures = s.textures;
-          for (uint32_t n = 0; n < kSysValueCount; ++n) other.sys[n] = s.sys[n];
-          other.sys[kSysPosition] = {{position.x, position.y, position.z, position.w}};
-          other.fragment = f;
-          other.derivative_depth = s.derivative_depth + 1;
-          other.capture_at = pc - 1;
-          // (what the shader has computed before this instruction does not depend on the other pixel's results: the run starts at the beginning)
-          execute(other, 0, pc);
-          value[k] = other.captured;
-        }
-        for (int i = 0; i < 4; ++i) r.f[i] = value[1].f[i] - value[0].f[i];
+        r = quad_difference(a, pc - 1, ins.op == kDdy || ins.op == kDdyCoarse, ins.op == kDdxCoarse || ins.op == kDdyCoarse);
         store(ins.dst, r);
         break;
       }
@@ -942,6 +944,35 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
             const float texel[4] = {t.x, t.y, t.z, t.w};
             b.f[k] = texel[ins.control & 3];
           }
+        }
+        store(ins.dst, b);
+        break;
+      }
+      case kTexGrad: case kTexBias: {
+        // sample_d (the gradients are given) and sample_b (they are the quad's differences of the coordinate): the level is log2 of the longer of the two gradients in texels, plus the bias
+        b = {{0, 0, 0, 0}};
+        const uint32_t unit = ins.src[1].number;
+        uint32_t w = 0, h = 0, levels = 0;
+        if (s.textures && unit < graphics::kMaxTextureUnits && s.textures->size(unit, 0, &w, &h, &levels) && w && h) {
+          Q gx, gy;
+          float bias = 0.0f;
+          if (ins.op == kTexGrad) {
+            gx = fetch(ins.src[2], 0), gy = fetch(ins.src[3], 0);
+          } else {
+            if (s.capture_at == pc - 1) {
+              s.captured = a;
+              return;
+            }
+            gx = quad_difference(a, pc - 1, false, false), gy = quad_difference(a, pc - 1, true, false);
+            bias = fetch(ins.src[2], 0).f[0];
+          }
+          const float fw = static_cast<float>(w), fh = static_cast<float>(h);
+          const float lx = sqrt_(gx.f[0] * gx.f[0] * fw * fw + gx.f[1] * gx.f[1] * fh * fh), ly = sqrt_(gy.f[0] * gy.f[0] * fw * fw + gy.f[1] * gy.f[1] * fh * fh);
+          const float rho = lx > ly ? lx : ly;
+          const float lod = (rho > 0.0f ? static_cast<float>(fmath::ln(rho) * 1.4426950408889634) : -126.0f) + bias;
+          const graphics::Vec4 t = s.textures->sample_lod(unit, a.f[0], a.f[1], lod);
+          const float texel[4] = {t.x, t.y, t.z, t.w};
+          b = {{texel[ins.tex_swizzle[0]], texel[ins.tex_swizzle[1]], texel[ins.tex_swizzle[2]], texel[ins.tex_swizzle[3]]}};
         }
         store(ins.dst, b);
         break;

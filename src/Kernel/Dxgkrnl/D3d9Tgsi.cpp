@@ -906,6 +906,51 @@ bool TgsiEmitter::instruction(const Instr& ins) {
       line("MOV", &w, &old_all);
       break;
     }
+    case kTexGrad: case kTexBias: {
+      // sample_d: TXD takes the two gradients after the coordinate; sample_b: TXB takes the bias in the coordinate's fourth component (as TXL the level)
+      const bool swizzled = ins.tex_swizzle[0] != 0 || ins.tex_swizzle[1] != 1 || ins.tex_swizzle[2] != 2 || ins.tex_swizzle[3] != 3;
+      t = begin_result(ins, true, &direct);
+      const uint32_t unit = ins.src[1].number;
+      if (unit >= graphics::kMaxTextureUnits) {
+        unsupported_ = true;
+        break;
+      }
+      sampler_used_[unit] = true;
+      String sampler = str();
+      add(sampler, "SAMP[");
+      add_uint(sampler, unit);
+      add(sampler, "], ");
+      add(sampler, dimension_name(p_.texture_kind_[unit]));
+      const String texel = temp(kWork2);
+      const uint8_t xyxy[4] = {0, 1, 0, 1};
+      if (op == kTexGrad) {
+        const String coordinate = operand(ins.src[0], 0, 0, xyxy, false), dx = operand(ins.src[2], 0, 1, xyxy, false), dy = operand(ins.src[3], 0, 2, xyxy, false);
+        String rest = str();
+        add(rest, dy.view());
+        add(rest, ", ");
+        add(rest, sampler.view());
+        String first = str();
+        add(first, dx.view());
+        add(first, ", ");
+        add(first, rest.view());
+        line("TXD", &texel, &coordinate, &first);
+      } else {
+        const String coordinate = operand(ins.src[0], 0, 0, xyxy, false), bias = operand(ins.src[2], 0, 1, nullptr, true);
+        const String xy = temp(kWork3, ".xy"), w3 = temp(kWork3, ".w"), packed = temp(kWork3);
+        line("MOV", &xy, &coordinate);
+        line("MOV", &w3, &bias);
+        line("TXB", &texel, &packed, &sampler);
+      }
+      const String w = temp(kWork);
+      if (swizzled) {
+        String picked = temp(kWork2, ".");
+        for (uint32_t c = 0; c < 4; ++c) add(picked, StringView(&"xyzw"[ins.tex_swizzle[c] & 3], 1));
+        line("MOV", &w, &picked);
+      } else {
+        line("MOV", &w, &texel);
+      }
+      break;
+    }
     case kTexGather: {
       // gather4: TG4 takes the component (an integer immediate) between the coordinate and the sampler
       t = begin_result(ins, false, &direct);

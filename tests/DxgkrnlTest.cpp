@@ -5319,6 +5319,57 @@ void test_dxil() {
       }
     }
   }
+  // sample_d and sample_b: the level from the gradients (or the quad's differences of the coordinate) and the bias, over the fake texture whose lookup shows the level in the blue channel.
+  {
+    UniquePointer<D3d9Program> translated;
+    CHECK(load("dxil_ps_grad.dxil", &translated));
+    if (translated) {
+      struct Plane {
+        graphics::Vec4 origin[4], step_x[4], step_y[4];
+        graphics::Vec4 at(uint32_t i, uint32_t corner) const {
+          const float fx = static_cast<float>(corner & 1), fy = static_cast<float>(corner >> 1);
+          return {origin[i].x + step_x[i].x * fx + step_y[i].x * fy, origin[i].y + step_x[i].y * fx + step_y[i].y * fy, origin[i].z + step_x[i].z * fx + step_y[i].z * fy,
+                  origin[i].w + step_x[i].w * fx + step_y[i].w * fy};
+        }
+      };
+      auto level = [](float ax, float ay, float bx, float by) {
+        const float l1 = __builtin_sqrtf(ax * ax * 64.0f + ay * ay * 16.0f), l2 = __builtin_sqrtf(bx * bx * 64.0f + by * by * 16.0f);
+        return __builtin_log2f(l1 > l2 ? l1 : l2);
+      };
+      for (uint32_t n = 0; n < 200; ++n) {
+        Plane plane = {};
+        for (uint32_t i = 0; i < 4; ++i) {
+          plane.origin[i] = {random(0.2f, 1), random(0.2f, 1), random(0.2f, 1), random(0.2f, 1)};
+          plane.step_x[i] = {random(0.01f, 0.2f), random(0.01f, 0.2f), random(0.01f, 0.2f), random(0.01f, 0.2f)};
+          plane.step_y[i] = {random(0.01f, 0.2f), random(0.01f, 0.2f), random(0.01f, 0.2f), random(0.01f, 0.2f)};
+        }
+        const uint32_t own = n % 4;
+        graphics::FragmentContext context;
+        context.quad_corner = own;
+        context.quad_user = &plane;
+        context.quad_fn = [](const void* user, uint32_t corner, graphics::Vec4* varyings, graphics::Vec4* position) {
+          const Plane& p = *static_cast<const Plane*>(user);
+          for (uint32_t i = 0; i < 4; ++i) varyings[i] = p.at(i, corner);
+          *position = {static_cast<float>(corner & 1), static_cast<float>(corner >> 1), 0, 1};
+        };
+        graphics::Vec4 varyings[4];
+        for (uint32_t i = 0; i < 4; ++i) varyings[i] = plane.at(i, own);
+        graphics::Vec4 room[graphics::kMaxColorTargets] = {};
+        uint8_t constants[128] = {};
+        const bool alive = translated->run_fragment_ex(varyings, context, constants, &textures, room);
+        const graphics::Vec4 c = varyings[0], uv = varyings[2];
+        const float lod_a = level(c.x * 0.1f, c.y * 0.05f, 0.02f, c.z * 0.2f);
+        const uint32_t row = own & 2, col = own & 1;
+        const graphics::Vec4 r0 = plane.at(2, row), r1 = plane.at(2, row + 1), c0 = plane.at(2, col), c1 = plane.at(2, col + 2);
+        const float lod_b = level(r1.x - r0.x, r1.y - r0.y, c1.x - c0.x, c1.y - c0.y) + (c.w * 2.0f - 1.0f);
+        const float want_blue = lod_a * 0.125f * 0.5f + lod_b * 0.125f * 0.5f;
+        const float want_red = uv.x * 0.5f;   // (both lookups give u / 2)
+        const bool same = alive && close_to(room[0].z, want_blue) && close_to(room[0].x, want_red);
+        if (!same && n < 3) printf("  grad #%u: %g %g wants %g %g\n", n, room[0].x, room[0].z, want_red, want_blue);
+        CHECK(same);
+      }
+    }
+  }
   // atan, asin and acos (polynomials in the translation): compared with libm within 1e-4.
   {
     UniquePointer<D3d9Program> translated;
