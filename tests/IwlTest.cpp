@@ -24,9 +24,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <map>
+#include <sys/mman.h>
 #include <vector>
 #include "Hardware/WirelessInterface/Intel/IwlDevices.hpp"
 #include "Hardware/WirelessInterface/Intel/IwlFirmware.hpp"
+#include "Hardware/WirelessInterface/Intel/IwlFwLoad.hpp"
 #include "Hardware/WirelessInterface/Intel/IwlPcie.hpp"
 
 namespace hardware {
@@ -39,12 +42,25 @@ static int g_failed = 0;
 #define CHECK(...) do { if (!(__VA_ARGS__)) { printf("FAILED line %d: %s\n", __LINE__, #__VA_ARGS__); ++g_failed; } } while (0)
 
 struct TestAllocator final : allocators::IAllocator {
+  std::map<void*, size_t> dma;
   void* allocate(uint64_t size) override { return malloc(size); }
   void* allocate_aligned(uint64_t size, uint64_t alignment) override {
     const uint64_t al = alignment < 16 ? 16 : alignment;
     return aligned_alloc(al, (size + al - 1) / al * al);
   }
-  void deallocate(void* p) override { if (p) free(p); }
+  // memory the "chip" reads: in the low 2 GiB like the kernel's DMA pool, so that the pointer is the bus address
+  void* allocate_dma(uint64_t size, uint64_t) override {
+    const size_t rounded = (size + 4095) / 4096 * 4096;
+    void* p = mmap(nullptr, rounded, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
+    if (p == MAP_FAILED) return nullptr;
+    dma[p] = rounded;
+    return p;
+  }
+  void deallocate(void* p) override {
+    if (!p) return;
+    auto it = dma.find(p);
+    if (it != dma.end()) { munmap(p, it->second); dma.erase(it); } else free(p);
+  }
 };
 
 static void test_devices() {
@@ -217,7 +233,7 @@ static void test_real_firmware() {
 // ---- the chip's registers ---------------------------------------------------------------------------------------------------------------------------------------------------------
 
 struct FakeIwl final : IIwlRegisters {
-  uint32_t regs[0x1000 / 4] = {};
+  uint32_t regs[0x2000 / 4] = {};
   uint32_t prph[0x100000 / 4] = {};
   uint32_t mem[0x1000] = {};
   uint32_t prph_addr_w = 0, prph_addr_r = 0, mem_w = 0, mem_r = 0;
@@ -227,26 +243,48 @@ struct FakeIwl final : IIwlRegisters {
   uint32_t last_prph_read_address = 0, last_prph_write_address = 0;
   uint32_t resets = 0;
   uint32_t reads_of_gp = 0;
+  struct Transfer { uint32_t dst, bytes; bool extended; };
+  std::vector<Transfer> transfers;
+  std::map<uint32_t, uint8_t> device_memory;
+  bool w1c = false, fail_transfers = false, cpu_released = false, alive_never = false, extended_during = false;
 
   uint32_t read32(uint32_t offset) override {
     switch (offset) {
       case iwl_csr::kHbusPrphRdat: last_prph_read_address = prph_addr_r; return prph[(prph_addr_r & 0xFFFFF) / 4];
       case iwl_csr::kHbusMemRdat: return mem[(mem_r++) % 0x1000];
       case iwl_csr::kGpCntrl: ++reads_of_gp; return regs[offset / 4];
-      default: return regs[(offset / 4) % 0x400];
+      default: return regs[(offset / 4) % 0x800];
     }
   }
   void write32(uint32_t offset, uint32_t value) override {
     switch (offset) {
       case iwl_csr::kHbusPrphRaddr: prph_addr_r = value; return;
       case iwl_csr::kHbusPrphWaddr: prph_addr_w = value; return;
-      case iwl_csr::kHbusPrphWdat: last_prph_write_address = prph_addr_w; prph[(prph_addr_w & 0xFFFFF) / 4] = value; return;
+      case iwl_csr::kHbusPrphWdat:
+        last_prph_write_address = prph_addr_w;
+        prph[(prph_addr_w & 0xFFFFF) / 4] = value;
+        if ((prph_addr_w & 0xFFFFF) == (iwl_prph::kReleaseCpuReset & 0xFFFFF) && (value & iwl_prph::kReleaseCpuResetBit)) cpu_released = true;
+        if ((prph_addr_w & 0xFFFFF) == (iwl_prph::kLmpmChick & 0xFFFFF)) extended_during = value & 1;
+        return;
       case iwl_csr::kHbusMemRaddr: mem_r = value / 4; return;
       case iwl_csr::kHbusMemWaddr: mem_w = value / 4; return;
       case iwl_csr::kHbusMemWdat: mem[(mem_w++) % 0x1000] = value; return;
       default: break;
     }
-    uint32_t& r = regs[(offset / 4) % 0x400];
+    if (offset == iwl_fh::tx_config(iwl_fh::kServiceChannel) && (value & iwl_fh::kTxChannelEnable)) {
+      // the flow handler's DMA: bus address (the host pointer), byte count and device address from the registers
+      const uint64_t bus = regs[iwl_fh::tfdib_ctrl0(9) / 4] | (static_cast<uint64_t>(regs[iwl_fh::tfdib_ctrl1(9) / 4] >> iwl_fh::kTfdibAddressShift) << 32);
+      const uint32_t bytes = regs[iwl_fh::tfdib_ctrl1(9) / 4] & 0x0FFFFFFF, dst = regs[iwl_fh::service_sram_address(9) / 4];
+      transfers.push_back({dst, bytes, extended_during});
+      if (!fail_transfers) {
+        const uint8_t* src = reinterpret_cast<const uint8_t*>(bus);
+        for (uint32_t i = 0; i < bytes; ++i) device_memory[dst + i] = src[i];
+        regs[iwl_csr::kFhIntStatus / 4] |= iwl_csr::kFhIntTxMask;
+      }
+    }
+    if (offset == iwl_fh::kUcodeLoadStatus && value == 0xFFFFFFFFu && cpu_released && !alive_never) regs[iwl_csr::kInt / 4] |= iwl_csr::kIntBitAlive;
+    uint32_t& r = regs[(offset / 4) % 0x800];
+    if (w1c && (offset == iwl_csr::kFhIntStatus || offset == iwl_csr::kInt)) { r &= ~value; return; }
     r = value;
     if (offset == iwl_csr::kHwIfConfig) {
       if (never_ready || (own_after_wake && !(value & iwl_csr::kHwIfWakeMe))) r &= ~iwl_csr::kHwIfPciOwnSet;
@@ -331,11 +369,95 @@ static void test_pcie() {
   }
 }
 
+// ---- loading the firmware ------------------------------------------------------------------------------------------------------------------------------------------------------
+
+static Bytes make_loadable_firmware(uint32_t big_size) {
+  Bytes f;
+  put32(f, 0);
+  put32(f, IwlFirmware::kMagic);
+  f.insert(f.end(), 88 - 8, 0);
+  tlv(f, 27, u32s({2}));
+  tlv(f, 19, section(0x00000000, 16, 0xA1));
+  tlv(f, 19, section(0x00040000, 8, 0xA2));                       // in the extended address range
+  tlv(f, 19, section(0xFFFFCCCC, 0, 0));
+  tlv(f, 24, section(0x00800000, big_size, 0xB1));                // a section of several chunks
+  tlv(f, 19, section(0xAAAABBBB, 0, 0));
+  tlv(f, 19, section(0x00000000, 16, 0xC1));                      // paging: not loaded
+  return f;
+}
+
+static void test_load() {
+  TestAllocator alloc;
+  const Bytes file = make_loadable_firmware(0x20000 * 2 + 4100);
+  IwlFirmware fw(alloc);
+  const char* error = nullptr;
+  CHECK(fw.parse(ConstByteView(file.data(), file.size()), &error));
+  {
+    FakeIwl chip;
+    chip.w1c = true;
+    IwlPcieDevice dev(chip);
+    CHECK(dev.apm_init());
+    IwlFwLoad load(dev, alloc);
+    CHECK(load.load(fw, IwlImage::Regular, &error));
+    if (error) printf("  load error: %s\n", error);
+    CHECK(load.sections_loaded() == 3 && load.chunks_loaded() == 1 + 1 + 3);
+    // the bytes landed at their device addresses; the paging section did not
+    CHECK(chip.device_memory[0] == 0xA1 && chip.device_memory[15] == 0xA1 && chip.device_memory[16] == 0 && chip.device_memory[0x40000] == 0xA2 && chip.device_memory[0x40007] == 0xA2);
+    CHECK(chip.device_memory[0x00800000] == 0xB1 && chip.device_memory[0x00800000 + 0x20000 * 2 + 4099] == 0xB1 && chip.device_memory.count(0x00800000 + 0x20000 * 2 + 4100) == 0);
+    CHECK(chip.transfers.size() == 5 && chip.transfers[0].dst == 0 && chip.transfers[1].dst == 0x40000 && chip.transfers[1].extended && !chip.transfers[0].extended);
+    CHECK(chip.transfers[2].dst == 0x00800000 && chip.transfers[2].bytes == 0x20000 && chip.transfers[3].dst == 0x00800000 + 0x20000 && chip.transfers[4].bytes == 4100);
+    CHECK(chip.cpu_released && !(chip.prph[(iwl_prph::kLmpmChick & 0xFFFFF) / 4] & 1) && chip.prph[(iwl_prph::kWfpmGp2 & 0xFFFFF) / 4] == 0x01010101);
+    // the ROM was told: the first processor's two sections (bits 0 and 1), then 0xFFFF, then the second's, then everything
+    CHECK(chip.regs[iwl_fh::kUcodeLoadStatus / 4] == 0xFFFFFFFFu);
+    CHECK(load.wait_alive(1000, &error) && !(chip.regs[iwl_csr::kInt / 4] & iwl_csr::kIntBitAlive));
+  }
+  {
+    FakeIwl chip;                                                  // a transfer that never completes
+    chip.w1c = true;
+    chip.fail_transfers = true;
+    IwlPcieDevice dev(chip);
+    CHECK(dev.apm_init());
+    IwlFwLoad load(dev, alloc);
+    CHECK(!load.load(fw, IwlImage::Regular, &error) && error);
+  }
+  {
+    FakeIwl chip;                                                  // the firmware never says it is alive
+    chip.w1c = true;
+    chip.alive_never = true;
+    IwlPcieDevice dev(chip);
+    CHECK(dev.apm_init());
+    IwlFwLoad load(dev, alloc);
+    CHECK(load.load(fw, IwlImage::Regular, &error) && !load.wait_alive(200, &error) && error);
+    chip.regs[iwl_csr::kInt / 4] = iwl_csr::kIntBitSwError;
+    CHECK(!load.wait_alive(200, &error));
+  }
+  {
+    FakeIwl chip;                                                  // no MAC clock: nothing can be loaded
+    chip.w1c = true;
+    chip.clock_never = true;
+    IwlPcieDevice dev(chip);
+    IwlFwLoad load(dev, alloc);
+    CHECK(!load.load(fw, IwlImage::Regular, &error));
+    FakeIwl chip2;
+    chip2.w1c = true;
+    IwlPcieDevice dev2(chip2);
+    CHECK(dev2.apm_init());
+    IwlFwLoad load2(dev2, alloc);
+    CHECK(!load2.load(fw, IwlImage::Wowlan, &error));              // an image the file does not have
+    // a section that is not a whole number of dwords
+    Bytes odd = make_loadable_firmware(13);
+    IwlFirmware ofw(alloc);
+    CHECK(ofw.parse(ConstByteView(odd.data(), odd.size()), &error));
+    CHECK(!load2.load(ofw, IwlImage::Regular, &error));
+  }
+}
+
 int main() {
   test_devices();
   test_firmware();
   test_real_firmware();
   test_pcie();
+  test_load();
   printf(g_failed ? "IwlTest: %d FAILED\n" : "IwlTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }

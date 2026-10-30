@@ -712,6 +712,7 @@ add_executable(BOOTX64
   src/Hardware/WirelessInterface/Intel/IwlDevices.cpp
   src/Hardware/WirelessInterface/Intel/IwlFirmware.cpp
   src/Hardware/WirelessInterface/Intel/IwlPcie.cpp
+  src/Hardware/WirelessInterface/Intel/IwlFwLoad.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnIsa.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnEmu.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/Gcn/TgsiParse.cpp
