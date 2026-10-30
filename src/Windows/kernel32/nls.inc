@@ -653,15 +653,18 @@ EXPORT int WINAPI GetCurrencyFormatA(LCID locale, DWORD flags, LPCSTR value, con
 /* How a character sorts: a primary weight (symbols < digits < letters, letters without case or accent), then the accent, then the case (lower before upper). */
 typedef struct { unsigned primary, accent, upper; BOOL ignorable, special; } SortWeight;
 
-static const char k_sort_symbols[] = "\t\n\v\f\r _'-,;:!?.\"()[]{}@*/\\&#%`^+<=>|~$";
+static const char k_sort_symbols[] = "\t\n\v\f\r '-,;:!?#._\"()[]{}@*/\\&%`^+<=>|~$";
 static const char k_latin1_base[] = "AAAAAAACEEEEIIIIDNOOOOO*OUUUUY?s";
 static const unsigned char k_latin1_accent[32] = {1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 5, 1, 2, 3, 5, 9, 4, 1, 2, 3, 4, 5, 0, 10, 1, 2, 3, 5, 2, 0, 11};
 
 static void sort_weight_of(WCHAR c, DWORD flags, SortWeight *w) {
   w->primary = 0; w->accent = 0; w->upper = 0; w->ignorable = FALSE; w->special = FALSE;
-  if (c < 0x20 && !(c >= 9 && c <= 13)) { w->ignorable = TRUE; return; }
+  if (c == 0) { w->ignorable = TRUE; return; }
+  if (c < 0x20 && !(c >= 9 && c <= 13)) { w->primary = 0x10u + c; return; }      /* (the controls sort before the symbols) */
   if (c == 0x7F || c == 0xAD || (c >= 0x200B && c <= 0x200F) || c == 0xFEFF) { w->ignorable = TRUE; return; }
   if (c >= '0' && c <= '9') { w->primary = 0x1000 + (c - '0'); return; }
+  if (c == 0x131) { w->primary = 0x2000 + 8 * 4 + 1; return; }      /* the dotless i and the i with a dot sort after the i */
+  if (c == 0xE130) { w->primary = 0x2000 + 8 * 4 + 2; w->upper = 1; return; }
   if (c >= 0xC0 && c <= 0xFF && c != 0xD7 && c != 0xF7) {
     const unsigned i = (c & 0x1F) | 0;
     const unsigned idx = (c - 0xC0) & 0x1F;
@@ -688,12 +691,20 @@ static void sort_weight_of(WCHAR c, DWORD flags, SortWeight *w) {
   if (c >= 0x100 && c < 0x4000) w->upper = 0;
 }
 /* The next character of the string that counts (the others are skipped). */
+static BOOL sort_is_mark(WCHAR c) {
+  if (c < 0x300) return FALSE;
+  WORD c1, c2, c3;
+  ctype_of(c, &c1, &c2, &c3);
+  return (c3 & 1 /* C3_NONSPACING */) != 0;
+}
 static BOOL sort_next(const WCHAR **p, const WCHAR *end, DWORD flags, SortWeight *w, BOOL include_special) {
   while (*p < end) {
     const WCHAR c = **p;
     sort_weight_of(c, flags, w);
     ++*p;
     if (w->ignorable || c == 0) continue;
+    /* the combining marks after a letter are its accent */
+    while (*p < end && sort_is_mark(**p) && !sort_is_mark(c)) { w->accent = (w->accent * 131u + (unsigned)(**p - 0x2FFu)) & 0xFFFFu; ++*p; }
     if ((flags & CMP_IGNORESYMBOLS) && w->primary < 0x1000) continue;
     if (w->special && !include_special) continue;
     return TRUE;
@@ -711,6 +722,7 @@ static int sort_compare(const WCHAR *a, int an, const WCHAR *b, int bn, DWORD fl
   const WCHAR *a_end = a + an, *b_end = b + bn;
   for (int pass = 0; pass < 4; ++pass) {
     if (pass == 1 && (flags & (CMP_IGNORENONSPACE | CMP_LINGUISTIC_IGNOREDIACRITIC))) continue;
+    if (pass == 2 && (flags & (CMP_IGNORECASE | CMP_LINGUISTIC_IGNORECASE))) continue;
     if (pass == 3 && (flags & CMP_STRINGSORT)) continue;
     const WCHAR *pa = a, *pb = b;
     for (;;) {
@@ -735,6 +747,22 @@ static int sort_compare(const WCHAR *a, int an, const WCHAR *b, int bn, DWORD fl
   return 2;
 }
 
+/* How many of the units a string is said to have can be read: a count that is longer than the string stops where its memory does (the comparison ends at the first
+ * difference, so it never needed the rest). */
+static int nls_readable_units(const WCHAR *s, int n) {
+  int ok = 0;
+  while (ok < n) {
+    const ULONG_PTR page_end = ((ULONG_PTR)(s + ok) | 0xFFF) + 1;
+    int step = (int)((page_end - (ULONG_PTR)(s + ok)) / 2);
+    if (step <= 0) step = 1;
+    if (step > n - ok) step = n - ok;
+    if (!range_allowed(s + ok, (SIZE_T)step * 2, FALSE)) break;
+    ok += step;
+  }
+  return ok;
+}
+/* The decomposition of the capital I with a dot above would turn it into an I and a mark; it is a letter of its own in the sort order, kept as a private character. */
+static void nls_protect_dotted_i(WCHAR *text, int count) { for (int i = 0; i < count; ++i) if (text[i] == 0x130) text[i] = 0xE130; }
 /* The checks and the conversion of the length that CompareString* have in common. */
 static int nls_compare(DWORD flags, const WCHAR *a, int an, const WCHAR *b, int bn, BOOL ex) {
   const DWORD valid = CMP_IGNORECASE | CMP_IGNORENONSPACE | CMP_IGNORESYMBOLS | CMP_LINGUISTIC_IGNORECASE | CMP_LINGUISTIC_IGNOREDIACRITIC | CMP_STRINGSORT | CMP_IGNOREKANATYPE | CMP_IGNOREWIDTH | CMP_LINGUISTIC_CASING | LCT_USE_CP_ACP | (ex ? CMP_DIGITSASNUMBERS : 0);
@@ -742,7 +770,26 @@ static int nls_compare(DWORD flags, const WCHAR *a, int an, const WCHAR *b, int 
   if (!a || !b) { set_error(ERROR_INVALID_PARAMETER); return 0; }
   if (an < 0) an = (int)wcslen(a);
   if (bn < 0) bn = (int)wcslen(b);
-  return sort_compare(a, an, b, bn, flags);
+  an = nls_readable_units(a, an);
+  bn = nls_readable_units(b, bn);
+  /* the strings are compared decomposed, so that a letter with its accent and the letter followed by the mark are the same */
+  INT room_a = an * 18 + 8, room_b = bn * 18 + 8;
+  WCHAR *da = RtlAllocateHeap(heap(), 0, ((SIZE_T)room_a + (SIZE_T)an) * 2), *db = RtlAllocateHeap(heap(), 0, ((SIZE_T)room_b + (SIZE_T)bn) * 2);
+  int result;
+  BOOL done = FALSE;
+  if (da && db && an && bn) {
+    WCHAR *ca = da + room_a, *cb = db + room_b;       /* (copies, with the dotted capital i set aside) */
+    memcpy(ca, a, (SIZE_T)an * 2); memcpy(cb, b, (SIZE_T)bn * 2);
+    nls_protect_dotted_i(ca, an); nls_protect_dotted_i(cb, bn);
+    if (RtlNormalizeString(2, ca, an, da, &room_a) == STATUS_SUCCESS && RtlNormalizeString(2, cb, bn, db, &room_b) == STATUS_SUCCESS) {
+      result = sort_compare(da, room_a, db, room_b, flags);
+      done = TRUE;
+    }
+  }
+  if (!done) result = sort_compare(a, an, b, bn, flags);
+  if (da) RtlFreeHeap(heap(), 0, da);
+  if (db) RtlFreeHeap(heap(), 0, db);
+  return result;
 }
 EXPORT int WINAPI CompareStringW(DWORD locale, DWORD flags, LPCWSTR a, int an, LPCWSTR b, int bn) {
   (void)locale;
@@ -801,7 +848,7 @@ static WCHAR nls_unaccent(WCHAR c) {
 }
 static BOOL nls_nonspacing(WCHAR c) { return c >= 0x300 && c <= 0x36F; }
 
-static int nls_sort_key(const WCHAR *src, int count, DWORD flags, BYTE *out, int capacity) {
+static int nls_sort_key_raw(const WCHAR *src, int count, DWORD flags, BYTE *out, int capacity) {
   int n = 0;
   #define KEY(b) do { if (out && n < capacity) out[n] = (BYTE)(b); ++n; } while (0)
   for (int pass = 0; pass < 4; ++pass) {
@@ -811,13 +858,22 @@ static int nls_sort_key(const WCHAR *src, int count, DWORD flags, BYTE *out, int
     SortWeight w;
     while (sort_next(&p, end, flags, &w, pass == 3)) {
       if (pass == 0 || pass == 3) { KEY((w.primary + 0x100) >> 8); KEY((w.primary + 0x100) & 0xFF); }
-      else if (pass == 1) KEY(w.accent + 2);
+      else if (pass == 1) { KEY((w.accent >> 8) + 2); KEY((w.accent & 0xFF) + 2); }
       else KEY((w.upper && !(flags & (CMP_IGNORECASE | CMP_LINGUISTIC_IGNORECASE))) ? 3 : 2);
     }
     KEY(1);
   }
   KEY(0);
   #undef KEY
+  return n;
+}
+static int nls_sort_key(const WCHAR *src, int count, DWORD flags, BYTE *out, int capacity) {
+  INT room = count * 18 + 8;
+  WCHAR *decomposed = count > 0 ? RtlAllocateHeap(heap(), 0, (SIZE_T)room * 2) : NULL;
+  int n;
+  if (decomposed && RtlNormalizeString(2, src, count, decomposed, &room) == STATUS_SUCCESS) n = nls_sort_key_raw(decomposed, room, flags, out, capacity);
+  else n = nls_sort_key_raw(src, count, flags, out, capacity);
+  if (decomposed) RtlFreeHeap(heap(), 0, decomposed);
   return n;
 }
 
