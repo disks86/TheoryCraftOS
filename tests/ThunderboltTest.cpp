@@ -27,6 +27,8 @@
 #include <sys/mman.h>
 #include <vector>
 #include "FakeThunderbolt.hpp"
+#include "FileSystem/Ram/RamFileSystem.hpp"
+#include "Hardware/Bus/Thunderbolt/ThunderboltKeys.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltControl.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltDevices.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltDriver.hpp"
@@ -846,6 +848,217 @@ static void test_topology() {
   CHECK(tb_icm::build_get_topology(ByteView(out, 8)) == 4 && out[0] == 1 && tb_icm::build_get_topology(ByteView(out, 3)) == 0);
 }
 
+
+// ---- secure connect
+
+struct MemoryKeys final : ITbKeyStore {
+  std::map<uint32_t, std::vector<uint8_t>> keys;
+  bool fail_store = false;
+  static uint32_t id(const uint8_t uuid[16]) { uint32_t v; memcpy(&v, uuid, 4); return v; }
+  bool load(const uint8_t uuid[16], uint8_t key[kTbKeyBytes]) override {
+    auto it = keys.find(id(uuid));
+    if (it == keys.end()) return false;
+    memcpy(key, it->second.data(), kTbKeyBytes);
+    return true;
+  }
+  bool store(const uint8_t uuid[16], const uint8_t key[kTbKeyBytes]) override {
+    if (fail_store) return false;
+    keys[id(uuid)] = std::vector<uint8_t>(key, key + kTbKeyBytes);
+    return true;
+  }
+  void remove(const uint8_t uuid[16]) override { keys.erase(id(uuid)); }
+};
+
+struct CountingRandom final : crypto::IRandom {
+  uint8_t next = 1;
+  bool fail = false;
+  bool fill(ByteView out) override {
+    if (fail) return false;
+    for (uint8_t& b : out) b = next++;
+    return true;
+  }
+};
+
+static void test_secure() {
+  TestAllocator alloc;
+  // the HMAC the challenge relies on, against RFC 4231's first test case
+  {
+    uint8_t key[20], mac[32];
+    memset(key, 0x0B, sizeof key);
+    crypto::hmac(crypto::HashKind::Sha256, ConstByteView(key, 20), ConstByteView(reinterpret_cast<const uint8_t*>("Hi There"), 8), mac);
+    const uint8_t expect[32] = {0xb0, 0x34, 0x4c, 0x61, 0xd8, 0xdb, 0x38, 0x53, 0x5c, 0xa8, 0xaf, 0xce, 0xaf, 0x0b, 0xf1, 0x2b, 0x88, 0x1d, 0xc2, 0x00, 0xc9, 0x83, 0x3d, 0xa7, 0x26, 0xe9, 0x37, 0x6c, 0x2e, 0x32, 0xcf, 0xf7};
+    CHECK(memcmp(mac, expect, 32) == 0);
+  }
+  // the messages
+  TbDevice d;
+  for (int i = 0; i < 16; ++i) d.uuid[i] = static_cast<uint8_t>(0xC0 + i);
+  d.connection_key = 7;
+  d.connection_id = 9;
+  uint8_t key[32], out[80];
+  for (int i = 0; i < 32; ++i) key[i] = static_cast<uint8_t>(i);
+  CHECK(tb_icm::build_add_device_key(d, ConstByteView(key, 32), ByteView(out, sizeof out)) == 56 && out[0] == 6 && out[4] == 0xC0 && out[20] == 7 && out[21] == 9 && out[24] == 0 && out[55] == 31);
+  CHECK(tb_icm::build_challenge_device(d, ConstByteView(key, 32), ByteView(out, sizeof out)) == 56 && out[0] == 5 && out[24] == 0 && out[55] == 31);
+  CHECK(tb_icm::build_add_device_key(d, ConstByteView(key, 31), ByteView(out, sizeof out)) == 0 && tb_icm::build_challenge_device(d, ConstByteView(key, 32), ByteView(out, 55)) == 0);
+  uint8_t reply[88] = {};
+  reply[56] = 0xEE;
+  reply[87] = 0xFF;
+  uint8_t got[32];
+  CHECK(tb_icm::parse_challenge_response(ConstByteView(reply, 88), ByteView(got, 32)) && got[0] == 0xEE && got[31] == 0xFF);
+  for (size_t len = 0; len < 88; ++len) CHECK(!tb_icm::parse_challenge_response(ConstByteView(reply, len), ByteView(got, 32)));
+  CHECK(!tb_icm::parse_challenge_response(ConstByteView(reply, 88), ByteView(got, 31)));
+
+  auto start = [&](FakeNhi& chip, ThunderboltIcm& icm, MemoryKeys& keys, CountingRandom& random) {
+    chip.security = 2;
+    icm.set_secure(&random, &keys);
+    return icm.start() == ThunderboltIcm::Outcome::Started;
+  };
+  const char* error = nullptr;
+  {
+    FakeNhi chip;
+    ThunderboltIcm icm(chip, alloc);
+    MemoryKeys keys;
+    CountingRandom random;
+    CHECK(start(chip, icm, keys, random) && icm.security_level() == TbSecurityLevel::Secure);
+    chip.send_device_connected(make_device(0x20, 1, 1));
+    icm.poll();
+    // the plain approval does not work here
+    CHECK(!icm.approve(0, &error) && error && strstr(error, "key"));
+    // the first time: a key goes to the device and to the store, then the approval
+    chip.requests_seen.clear();
+    CHECK(icm.approve_secure(0, &error) && icm.device(0).authorized);
+    CHECK(chip.requests_seen.size() == 2 && chip.requests_seen[0] == 6 && chip.requests_seen[1] == 4);
+    CHECK(keys.keys.size() == 1 && chip.device_keys.size() == 1 && keys.keys.begin()->second == chip.device_keys.begin()->second);
+    // the same device later (a new connection): a challenge it can answer
+    chip.send_device_disconnected(1, 1);
+    icm.poll();
+    CHECK(icm.device_count() == 0);
+    chip.send_device_connected(make_device(0x20, 1, 1));
+    icm.poll();
+    chip.requests_seen.clear();
+    CHECK(icm.approve_secure(0, &error) && icm.device(0).authorized && chip.requests_seen.size() == 2 && chip.requests_seen[0] == 5 && chip.requests_seen[1] == 4);
+    CHECK(chip.challenges.size() == 1 && chip.challenges[0].size() == 32);
+    // each challenge is fresh
+    chip.send_device_disconnected(1, 1);
+    chip.send_device_connected(make_device(0x20, 1, 1));
+    icm.poll();
+    CHECK(icm.approve_secure(0, &error) && chip.challenges.size() == 2 && chip.challenges[0] != chip.challenges[1]);
+    // a device that answers wrongly is not approved and no approval is sent
+    chip.send_device_disconnected(1, 1);
+    chip.send_device_connected(make_device(0x20, 1, 1));
+    icm.poll();
+    chip.challenge_wrong = true;
+    chip.requests_seen.clear();
+    CHECK(!icm.approve_secure(0, &error) && error && strstr(error, "key") && !icm.device(0).authorized && chip.requests_seen.size() == 1);
+    chip.challenge_wrong = false;
+    chip.challenge_error = true;
+    CHECK(!icm.approve_secure(0, &error) && !icm.device(0).authorized);
+    chip.challenge_error = false;
+    // the device lost its key (a reset): it says so, and nothing is approved
+    chip.device_keys.clear();
+    chip.requests_seen.clear();
+    CHECK(!icm.approve_secure(0, &error) && error && strstr(error, "no key") && chip.requests_seen.size() == 1);
+    // once its stored key is removed it can be given a new one
+    keys.remove(icm.device(0).uuid);
+    CHECK(icm.approve_secure(0, &error) && icm.device(0).authorized && chip.device_keys.size() == 1);
+    // a device on the same port further out only after the one it hangs from
+    chip.send_device_connected(make_device(0x50, 1, 2));
+    icm.poll();
+    CHECK(icm.device_count() == 2);
+    uint64_t second = 0;
+    for (uint64_t i = 0; i < icm.device_count(); ++i) if (icm.device(i).depth == 2) second = i;
+    chip.send_device_disconnected(1, 1);                 // the first goes away (and takes the second with it); plug both back, the far one is offered first
+    icm.poll();
+    CHECK(icm.device_count() == 0);
+    chip.send_device_connected(make_device(0x20, 1, 1));
+    chip.send_device_connected(make_device(0x50, 1, 2));
+    icm.poll();
+    CHECK(icm.device_count() == 2);
+    for (uint64_t i = 0; i < icm.device_count(); ++i) if (icm.device(i).depth == 2) second = i;
+    CHECK(!icm.approve_secure(second, &error) && error && strstr(error, "hangs"));
+  }
+  // failures on the way: no store or random source, a random source that fails, a device that cannot keep the key, a store that cannot, other levels
+  {
+    FakeNhi chip;
+    ThunderboltIcm icm(chip, alloc);
+    MemoryKeys keys;
+    CountingRandom random;
+    chip.security = 2;
+    CHECK(icm.start() == ThunderboltIcm::Outcome::Started);
+    chip.send_device_connected(make_device(0x20, 1, 1));
+    icm.poll();
+    CHECK(!icm.approve_secure(0, &error) && strstr(error, "random"));
+    icm.set_secure(&random, &keys);
+    random.fail = true;
+    CHECK(!icm.approve_secure(0, &error) && strstr(error, "random") && keys.keys.empty() && chip.device_keys.empty());
+    random.fail = false;
+    chip.add_key_error = true;
+    CHECK(!icm.approve_secure(0, &error) && keys.keys.empty() && !icm.device(0).authorized);
+    chip.add_key_error = false;
+    keys.fail_store = true;
+    chip.requests_seen.clear();
+    CHECK(!icm.approve_secure(0, &error) && strstr(error, "saved") && chip.requests_seen.size() == 1);        // never approved without the key kept
+    keys.fail_store = false;
+    CHECK(!icm.approve_secure(9, &error) && strstr(error, "no such"));
+  }
+  for (uint32_t level : {0u, 1u, 3u}) {
+    FakeNhi chip;
+    ThunderboltIcm icm(chip, alloc);
+    MemoryKeys keys;
+    CountingRandom random;
+    chip.security = level;
+    icm.set_secure(&random, &keys);
+    CHECK(icm.start() == ThunderboltIcm::Outcome::Started);
+    chip.send_device_connected(make_device(0x20, 1, 1));
+    icm.poll();
+    CHECK(!icm.approve_secure(0, &error) && error && chip.uuid_approved.empty() && keys.keys.empty());
+  }
+  // the parent rule applies to plain approvals as well
+  {
+    FakeNhi chip;
+    ThunderboltIcm icm(chip, alloc);
+    CHECK(icm.start() == ThunderboltIcm::Outcome::Started);
+    chip.send_device_connected(make_device(0x50, 1, 2));
+    chip.send_device_connected(make_device(0x20, 1, 1));
+    icm.poll();
+    uint64_t far = icm.device(0).depth == 2 ? 0 : 1, near = 1 - far;
+    CHECK(!icm.approve(far, &error) && strstr(error, "hangs"));
+    CHECK(icm.approve(near, nullptr) && icm.approve(far, nullptr));
+  }
+}
+
+static void test_key_files() {
+  TestAllocator alloc;
+  filesystem::RamFileSystem files(alloc);
+  FileTbKeyStore store(files, alloc);
+  uint8_t uuid[16], other[16], key[32], got[32];
+  for (int i = 0; i < 16; ++i) { uuid[i] = static_cast<uint8_t>(i); other[i] = static_cast<uint8_t>(0x80 + i); }
+  for (int i = 0; i < 32; ++i) key[i] = static_cast<uint8_t>(0xA0 + i);
+  CHECK(!store.load(uuid, got));
+  CHECK(store.store(uuid, key) && store.load(uuid, got) && memcmp(key, got, 32) == 0);
+  CHECK(!store.load(other, got));
+  // replaced, and each device has its own
+  key[0] ^= 0xFF;
+  CHECK(store.store(uuid, key) && store.load(uuid, got) && got[0] == key[0]);
+  uint8_t key2[32];
+  memset(key2, 0x42, 32);
+  CHECK(store.store(other, key2) && store.load(other, got) && got[5] == 0x42 && store.load(uuid, got) && got[0] == key[0]);
+  // the file is where the layout says, named by the UUID
+  filesystem::DirectoryEntry entry;
+  CHECK(files.stat(StringView("/AppStore/Thunderbolt/Keys/000102030405060708090a0b0c0d0e0f"), &entry) == filesystem::Status::Ok && entry.size == 32);
+  store.remove(uuid);
+  CHECK(!store.load(uuid, got) && store.load(other, got));
+  store.remove(uuid);                                           // (again: nothing to remove)
+  // a file of the wrong size is not a key
+  {
+    UniquePointer<filesystem::IFile> f;
+    CHECK(files.open_file(StringView("/AppStore/Thunderbolt/Keys/000102030405060708090a0b0c0d0e0f"), filesystem::OpenMode::CreateTruncate, &f) == filesystem::Status::Ok);
+    uint64_t n = 0;
+    uint8_t few[7] = {};
+    f->write(0, ConstByteView(few, 7), &n);
+    CHECK(!store.load(uuid, got));
+  }
+}
+
 static void test_driver() {
   TestAllocator alloc;
   {
@@ -908,6 +1121,8 @@ int main() {
   test_port_reset();
   test_upstream_port();
   test_topology();
+  test_secure();
+  test_key_files();
   test_driver();
   printf(g_failed ? "ThunderboltTest: %d FAILED\n" : "ThunderboltTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;

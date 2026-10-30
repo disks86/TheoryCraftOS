@@ -729,6 +729,7 @@ add_executable(BOOTX64
   src/Hardware/Mouse/I2c/PlatformI2cHid.cpp
   src/Hardware/Bus/Thunderbolt/ThunderboltDevices.cpp
   src/Hardware/Bus/Thunderbolt/ThunderboltCio.cpp
+  src/Hardware/Bus/Thunderbolt/ThunderboltKeys.cpp
   src/Hardware/Bus/Thunderbolt/ThunderboltRing.cpp
   src/Hardware/Bus/Thunderbolt/ThunderboltControl.cpp
   src/Hardware/Bus/Thunderbolt/ThunderboltIcm.cpp

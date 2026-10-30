@@ -24,8 +24,10 @@
 #pragma once
 #include <stdint.h>
 #include "Allocators/IAllocator.hpp"
+#include "Crypto/Random.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltCio.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltControl.hpp"
+#include "Hardware/Bus/Thunderbolt/ThunderboltKeys.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltRing.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Utility/ArrayView.hpp"
@@ -45,6 +47,7 @@ constexpr uint16_t kLinkMask = 0x7, kDepthMask = 0xF0, kApproved = 1u << 8, kRej
 constexpr uint32_t kDepthShift = 4;
 // the sizes of the structures
 constexpr uint32_t kTopologyBytes = 152, kTopologyPackets = 14, kPortTypePort = 1;
+constexpr uint32_t kKeyedBytes = 56, kChallengeResponseBytes = 88;
 constexpr uint32_t kHeaderBytes = 4, kDriverReadyBytes = 4, kDriverReadyResponseBytes = 8, kApproveBytes = 24, kGetRouteBytes = 8, kGetRouteResponseBytes = 16, kDeviceConnectedMinBytes = 24,
                    kDeviceDisconnectedBytes = 8;
 }  // namespace tb_icm
@@ -89,6 +92,11 @@ uint32_t build_driver_ready(ByteView out);
 bool parse_driver_ready(ConstByteView response, TbDriverReady* out);
 uint32_t build_approve_device(const TbDevice& device, ByteView out);
 uint32_t build_get_route(uint8_t link, uint8_t depth, ByteView out);
+// ADD_DEVICE_KEY and CHALLENGE_DEVICE: the device, then 32 bytes (the key, the challenge).
+uint32_t build_add_device_key(const TbDevice& device, ConstByteView key, ByteView out);
+uint32_t build_challenge_device(const TbDevice& device, ConstByteView challenge, ByteView out);
+// The 32 byte response of a CHALLENGE_DEVICE answer.
+bool parse_challenge_response(ConstByteView response, ByteView out);
 // The header flags of a response (kFlagError ...), or 0.
 uint8_t response_flags(ConstByteView response);
 bool parse_get_route(ConstByteView response, uint64_t* route);
@@ -148,6 +156,11 @@ class ThunderboltIcm final : public IThunderboltEvents {
 
   // Asks the firmware to approve the device (and so to create its PCIe tunnel). Refused here unless the security level is none or user. On false, `*error` says why.
   bool approve(uint64_t index, const char** error);
+  // Secure connect (security level "secure"). Needs a key store and a random source. A device that has no key yet is given a new one (ADD_DEVICE_KEY: the device keeps it in its NVM, we
+  // keep it in the store) and approved; one that has is sent a random challenge and approved only if its answer is HMAC-SHA256 of the challenge under the stored key. A device that
+  // lost its key (or a different device with the same UUID) fails the challenge and stays unapproved. A device can only be approved after the one it hangs from.
+  void set_secure(crypto::IRandom* random, ITbKeyStore* keys) { random_ = random; keys_ = keys; }
+  bool approve_secure(uint64_t index, const char** error);
   // The route string of the device (ICM_GET_ROUTE).
   bool route(uint64_t index, uint64_t* route);
   // The topology the firmware reports (GET_TOPOLOGY, an answer of up to 14 packets): `out` gets one entry per packet.
@@ -162,6 +175,9 @@ class ThunderboltIcm final : public IThunderboltEvents {
 
  private:
   bool request(ConstByteView request, ByteView response, uint32_t timeout_us);
+  bool parent_authorized(const TbDevice& device) const;
+  void mark_authorized(const TbDevice& device);
+  bool request_flags(ConstByteView request, ByteView response, uint32_t timeout_us, const char** error, const char* no_answer);
   bool start_firmware();
   bool reset_physical_port(uint32_t physical_port);
   void remove_downstream(uint8_t link, uint8_t depth);
@@ -171,6 +187,8 @@ class ThunderboltIcm final : public IThunderboltEvents {
   TbControl control_;
   List<TbDevice> devices_;
   TbDriverReady ready_;
+  crypto::IRandom* random_ = nullptr;
+  ITbKeyStore* keys_ = nullptr;
   Options options_;
   uint32_t port_reset_failures_ = 0;
   Outcome outcome_ = Outcome::NotStarted;

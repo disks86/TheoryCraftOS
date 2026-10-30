@@ -17,6 +17,7 @@
  */
 
 #include "Hardware/Bus/Thunderbolt/ThunderboltIcm.hpp"
+#include "Crypto/Crypto.hpp"
 #include "Kernel/Delay.hpp"
 #include "Utility/ByteStream.hpp"
 
@@ -101,6 +102,36 @@ uint32_t build_get_route(uint8_t link, uint8_t depth, ByteView out) {
   w.le16(0);
   w.le16(static_cast<uint16_t>((static_cast<uint32_t>(depth) << kDepthShift) | link));
   return w.ok() ? static_cast<uint32_t>(w.position()) : 0;
+}
+
+namespace {
+uint32_t keyed(ByteWriter& w, uint8_t code, const TbDevice& device, ConstByteView secret) {
+  header(w, code);
+  w.bytes(ConstByteView(device.uuid, sizeof device.uuid));
+  w.u8(device.connection_key);
+  w.u8(device.connection_id);
+  w.le16(0);
+  w.bytes(secret);
+  return w.ok() ? static_cast<uint32_t>(w.position()) : 0;
+}
+}  // namespace
+
+uint32_t build_add_device_key(const TbDevice& device, ConstByteView key, ByteView out) {
+  if (key.size() != kTbKeyBytes) return 0;
+  ByteWriter w(out);
+  return keyed(w, kAddDeviceKey, device, key);
+}
+
+uint32_t build_challenge_device(const TbDevice& device, ConstByteView challenge, ByteView out) {
+  if (challenge.size() != kTbKeyBytes) return 0;
+  ByteWriter w(out);
+  return keyed(w, kChallengeDevice, device, challenge);
+}
+
+bool parse_challenge_response(ConstByteView response, ByteView out) {
+  if (response.size() < kChallengeResponseBytes || out.size() != kTbKeyBytes) return false;
+  out.copy_from(response.subview(kKeyedBytes, kTbKeyBytes));
+  return true;
 }
 
 uint8_t response_flags(ConstByteView response) {
@@ -302,6 +333,14 @@ void ThunderboltIcm::on_event(TbPacketType type, ConstByteView body) {
   }
 }
 
+// A device hangs from the one a step nearer on the same physical port: that one has to be approved first.
+bool ThunderboltIcm::parent_authorized(const TbDevice& device) const {
+  if (device.depth <= 1) return true;
+  for (uint64_t i = 0; i < devices_.count(); ++i)
+    if (physical_port(devices_[i].link) == physical_port(device.link) && devices_[i].depth == device.depth - 1) return devices_[i].authorized;
+  return false;
+}
+
 bool ThunderboltIcm::approve(uint64_t index, const char** error) {
   const char* local = nullptr;
   if (!error) error = &local;
@@ -314,26 +353,112 @@ bool ThunderboltIcm::approve(uint64_t index, const char** error) {
     return false;
   }
   if (ready_.security != TbSecurityLevel::None && ready_.security != TbSecurityLevel::User) {
-    *error = "this security level does not allow a PCIe tunnel with one approval";
+    *error = ready_.security == TbSecurityLevel::Secure ? "this security level needs a key: use approve_secure" : "this security level does not allow a PCIe tunnel";
     return false;
   }
   const TbDevice device = devices_[index];
+  if (!parent_authorized(device)) {
+    *error = "the device it hangs from is not approved";
+    return false;
+  }
   uint8_t request_bytes[tb_icm::kApproveBytes], response[tb_icm::kApproveBytes];
   const uint32_t n = tb_icm::build_approve_device(device, ByteView(request_bytes, sizeof request_bytes));
-  if (n == 0 || !request(ConstByteView(request_bytes, n), ByteView(response, sizeof response), kApproveTimeoutUs)) {
+  if (n == 0 || !request_flags(ConstByteView(request_bytes, n), ByteView(response, sizeof response), kApproveTimeoutUs, error, "the PCIe tunnel could not be created")) return false;
+  mark_authorized(device);
+  return true;
+}
+
+// A request whose answer has the error flag set is a refusal.
+bool ThunderboltIcm::request_flags(ConstByteView request_bytes, ByteView response, uint32_t timeout_us, const char** error, const char* refused) {
+  if (!request(request_bytes, response, timeout_us)) {
     *error = "the firmware did not answer";
     return false;
   }
-  if (tb_icm::response_flags(ConstByteView(response, sizeof response)) & tb_icm::kFlagError) {
-    *error = "the firmware could not create the PCIe tunnel";
+  if (tb_icm::response_flags(ConstByteView(response.data(), response.size())) & tb_icm::kFlagError) {
+    *error = refused;
     return false;
   }
+  return true;
+}
+
+void ThunderboltIcm::mark_authorized(const TbDevice& device) {
   // (the list may have changed while waiting: find the device again)
   for (uint64_t i = 0; i < devices_.count(); ++i) {
     bool same = true;
     for (uint32_t k = 0; k < sizeof device.uuid; ++k) same = same && devices_[i].uuid[k] == device.uuid[k];
     if (same) devices_[i].authorized = true;
   }
+}
+
+bool ThunderboltIcm::approve_secure(uint64_t index, const char** error) {
+  const char* local = nullptr;
+  if (!error) error = &local;
+  if (outcome_ != Outcome::Started) {
+    *error = "the controller is not running";
+    return false;
+  }
+  if (ready_.security != TbSecurityLevel::Secure) {
+    *error = "keys are only used at the secure security level";
+    return false;
+  }
+  if (index >= devices_.count()) {
+    *error = "no such device";
+    return false;
+  }
+  if (!random_ || !keys_) {
+    *error = "there is no key store or random source";
+    return false;
+  }
+  const TbDevice device = devices_[index];
+  if (!parent_authorized(device)) {
+    *error = "the device it hangs from is not approved";
+    return false;
+  }
+  uint8_t key[kTbKeyBytes], request_bytes[tb_icm::kKeyedBytes], approve_request[tb_icm::kApproveBytes], approve_response[tb_icm::kApproveBytes];
+  if (keys_->load(device.uuid, key)) {
+    // the device has a key: it has to prove it still does
+    uint8_t challenge[kTbKeyBytes], response[tb_icm::kChallengeResponseBytes], expected[kTbKeyBytes], answer[kTbKeyBytes];
+    if (!random_->fill(ByteView(challenge, sizeof challenge))) {
+      *error = "no random numbers";
+      return false;
+    }
+    const uint32_t n = tb_icm::build_challenge_device(device, ConstByteView(challenge, sizeof challenge), ByteView(request_bytes, sizeof request_bytes));
+    if (n == 0) return false;
+    if (!request(ConstByteView(request_bytes, n), ByteView(response, sizeof response), kRequestTimeoutUs)) {
+      *error = "the firmware did not answer";
+      return false;
+    }
+    const uint8_t flags = tb_icm::response_flags(ConstByteView(response, sizeof response));
+    if (flags & tb_icm::kFlagNoKey) {
+      *error = "the device has no key (it was reset): remove its key to give it a new one";
+      return false;
+    }
+    if ((flags & tb_icm::kFlagError) || !tb_icm::parse_challenge_response(ConstByteView(response, sizeof response), ByteView(answer, sizeof answer))) {
+      *error = "the device rejected the challenge";
+      return false;
+    }
+    crypto::hmac(crypto::HashKind::Sha256, ConstByteView(key, sizeof key), ConstByteView(challenge, sizeof challenge), expected);
+    if (!crypto::equal_constant_time(expected, answer, kTbKeyBytes)) {
+      *error = "the device did not know the key";
+      return false;
+    }
+  } else {
+    // first time: a new key goes into the device and into the store
+    if (!random_->fill(ByteView(key, sizeof key))) {
+      *error = "no random numbers";
+      return false;
+    }
+    uint8_t response[tb_icm::kApproveBytes];
+    const uint32_t n = tb_icm::build_add_device_key(device, ConstByteView(key, sizeof key), ByteView(request_bytes, sizeof request_bytes));
+    if (n == 0 || !request_flags(ConstByteView(request_bytes, n), ByteView(response, sizeof response), kRequestTimeoutUs, error, "the device could not keep the key")) return false;
+    if (!keys_->store(device.uuid, key)) {
+      *error = "the key could not be saved";
+      return false;
+    }
+  }
+  const uint32_t n = tb_icm::build_approve_device(device, ByteView(approve_request, sizeof approve_request));
+  if (n == 0 || !request_flags(ConstByteView(approve_request, n), ByteView(approve_response, sizeof approve_response), kApproveTimeoutUs, error, "the PCIe tunnel could not be created")) return false;
+  mark_authorized(device);
   return true;
 }
 

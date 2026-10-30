@@ -24,6 +24,7 @@
 #include <string.h>
 #include <map>
 #include <vector>
+#include "Crypto/Crypto.hpp"
 #include "Hardware/Bus/Pci/IPciBus.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltCio.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltRegisters.hpp"
@@ -93,6 +94,11 @@ class FakeNhi final : public hardware::ITbRegisters {
   uint32_t error_code = 0;                   // set: answer configuration requests with this error code
   uint64_t route_answer = 0x0000000000000001ull;
   bool answer_get_route = true;
+  // secure connect: the keys the devices hold (by the first word of the UUID), and how they misbehave
+  std::map<uint32_t, std::vector<uint8_t>> device_keys;
+  bool add_key_error = false, challenge_error = false, challenge_wrong = false;
+  std::vector<std::vector<uint8_t>> challenges;        // what the host sent
+  std::vector<uint8_t> requests_seen;                  // the ICM codes of the requests, in order
   // GET_TOPOLOGY: one entry per router, answered in as many packets
   struct Router { uint64_t route = 0; bool used = true; uint8_t upstream = 0; uint32_t ports[16] = {}; };
   std::vector<Router> topology;
@@ -281,6 +287,7 @@ class FakeNhi final : public hardware::ITbRegisters {
   // (the words of a body are the little endian values of the bytes the driver wrote: an ICM header is code | flags << 8 | packet id << 16 | total packets << 24)
   void icm_command(const std::vector<uint32_t>& w) {
     const uint8_t code = static_cast<uint8_t>(w[0] & 0xFF);
+    requests_seen.push_back(code);
     if (code == 3) {
       if (!answer_driver_ready) return;
       reply(kIcmResponse, {3u | (1u << 24), 5u | (7u << 8) | ((security & 0xFu) << 16)});
@@ -292,6 +299,33 @@ class FakeNhi final : public hardware::ITbRegisters {
         if (memcmp(known.uuid, d.uuid, 16) == 0) known.approved = !approve_error;
       std::vector<uint32_t> out(w.begin(), w.begin() + 6);
       out[0] = 4u | ((approve_error ? 1u : 0u) << 8) | (1u << 24);
+      reply(kIcmResponse, out);
+    } else if (code == 6 && w.size() >= 14) {
+      // ADD_DEVICE_KEY: hdr, uuid, key id, connection id, reserved, 32 bytes of key
+      std::vector<uint8_t> key(32);
+      memcpy(key.data(), &w[6], 32);
+      if (!add_key_error) device_keys[w[1]] = key;
+      std::vector<uint32_t> out(w.begin(), w.begin() + 6);
+      out[0] = 6u | ((add_key_error ? 1u : 0u) << 8) | (1u << 24);
+      reply(kIcmResponse, out);
+    } else if (code == 5 && w.size() >= 14) {
+      // CHALLENGE_DEVICE: the answer is the request's first 24 bytes, the challenge and HMAC-SHA256 of it under the device's key
+      std::vector<uint32_t> out(22, 0);
+      for (int i = 0; i < 14; ++i) out[i] = w[i];
+      std::vector<uint8_t> challenge(32);
+      memcpy(challenge.data(), &w[6], 32);
+      challenges.push_back(challenge);
+      uint32_t flags = 0;
+      auto it = device_keys.find(w[1]);
+      if (it == device_keys.end()) flags |= 1u << 1;                     // no key
+      else if (challenge_error) flags |= 1u;
+      else {
+        uint8_t mac[32];
+        crypto::hmac(crypto::HashKind::Sha256, ConstByteView(it->second.data(), 32), ConstByteView(challenge.data(), 32), mac);
+        if (challenge_wrong) mac[5] ^= 1;
+        memcpy(&out[14], mac, 32);
+      }
+      out[0] = 5u | (flags << 8) | (1u << 24);
       reply(kIcmResponse, out);
     } else if (code == 1) {
       if (!answer_topology) return;

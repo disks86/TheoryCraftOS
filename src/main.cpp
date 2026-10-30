@@ -1154,6 +1154,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     // connected are listed (and announced on the desktop); none gets a PCIe tunnel, which would give it access to memory, until something approves it. Opt-in (-DTCOS_THUNDERBOLT=ON): none
     // of it has run on a real controller.
     UniquePointer<hardware::ThunderboltDriver> thunderbolt;
+    UniquePointer<hardware::FileTbKeyStore> thunderbolt_keys;       // the keys of devices approved at the secure level
     uint64_t thunderbolt_devices = 0;
     if (clock_ok && paging_ok) {
       for (uint32_t i = 0; i < pci.device_count(); ++i) {
@@ -1166,6 +1167,9 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         thunderbolt = UniquePointer<hardware::ThunderboltDriver>::make(shared_allocator, shared_allocator, thunderbolt_config);
         if (!thunderbolt) break;
         if (thunderbolt->start(pci, d, register_mapper) == hardware::ThunderboltDriver::Outcome::Started) {
+          if (!smb_random.ready()) smb_random.initialize();
+          thunderbolt_keys = UniquePointer<hardware::FileTbKeyStore>::make(shared_allocator, explorer_files.file_system(), shared_allocator);
+          if (thunderbolt_keys) thunderbolt->icm()->set_secure(&smb_random, thunderbolt_keys.get());
           Entry e(Level::Ok, "Thunderbolt");
           e.text(thunderbolt->model()->name).text(", security level ").dec(static_cast<uint32_t>(thunderbolt->icm()->security_level())).text(", firmware ").dec(thunderbolt->icm()->driver_ready().rom_version).text(".").dec(thunderbolt->icm()->driver_ready().ram_version);
         } else {
