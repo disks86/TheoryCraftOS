@@ -43,7 +43,7 @@ enum DxbcOp : uint32_t {
   kGe4 = 29, kIf4 = 31, kLog4 = 47, kLt4 = 49, kMad4 = 50, kMin4 = 51, kMax4 = 52, kCustomData4 = 53, kMov4 = 54, kMovc4 = 55, kMul4 = 56, kNe4 = 57, kNop4 = 58, kRet4 = 62,
   kRoundNe4 = 64, kRoundNi4 = 65, kRoundPi4 = 66, kRoundZ4 = 67, kRsq4 = 68, kSample4 = 69, kSqrt4 = 75, kSincos4 = 77,
   kDclResource4 = 88, kDclConstantBuffer4 = 89, kDclSampler4 = 90, kDclInput4 = 95, kDclInputSgv4 = 96, kDclInputSiv4 = 97, kDclInputPs4 = 98, kDclInputPsSgv4 = 99, kDclInputPsSiv4 = 100,
-  kDclThreadGroup4 = 155, kDclUavRaw4 = 157, kDclUavStructured4 = 158, kLdRaw4 = 165, kStoreRaw4 = 166, kLdStructured4 = 167, kStoreStructured4 = 168, kSync4 = 190,
+  kEmit4 = 19, kCut4 = 9, kDclOutputTopology4 = 92, kDclInputPrimitive4 = 93, kDclMaxOutputVertices4 = 94, kDclThreadGroup4 = 155, kDclUavRaw4 = 157, kDclUavStructured4 = 158, kLdRaw4 = 165, kStoreRaw4 = 166, kLdStructured4 = 167, kStoreStructured4 = 168, kSync4 = 190,
   kDclOutput4 = 101, kDclOutputSgv4 = 102, kDclOutputSiv4 = 103, kDclTemps4 = 104, kDclIndexableTemp4 = 105, kDclGlobalFlags4 = 106,
 };
 // The texture a dcl_resource declares (D3D10_SB_RESOURCE_DIMENSION: 3 texture2d, 5 texture3d, 6 texturecube, 8 texture2darray); the others are not taken.
@@ -160,7 +160,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
   const uint32_t version = in.le32(), length = in.le32();
   const uint32_t program_type = version >> 16, major = (version >> 4) & 0xF, minor = version & 0xF;
   if (length != shader.size() / 4) return status::kInvalidParameter;
-  if (program_type != 0 && program_type != 1 && program_type != 5) return status::kNotSupported;   // pixel, vertex and compute shaders only
+  if (program_type != 0 && program_type != 1 && program_type != 2 && program_type != 5) return status::kNotSupported;   // pixel, vertex, geometry and compute shaders only
   if (program_type == 5 && major != 5) return status::kNotSupported;
   if (!((major == 4 && minor <= 1) || (major == 5 && minor <= 1))) return status::kNotSupported;
   const bool v51 = major == 5 && minor == 1;   // (constant buffers, textures and samplers are ranges with a space: cb[ID][index][element], t[ID][index])
@@ -177,11 +177,14 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
   };
   const bool vertex = program_type == 1;
   const bool compute = program_type == 5;
+  const bool geometry = program_type == 2;
+  bool geometry_input_declared = false, geometry_output_declared = false;
+  uint32_t geometry_vertices = 0;   // the vertices of an input primitive
   bool thread_group_declared = false;
 
   UniquePointer<D3d9Program> program = UniquePointer<D3d9Program>::make(allocator, allocator);
   if (!program) return status::kNoMemory;
-  program->stage_ = vertex ? graphics::ShaderStage::Vertex : compute ? graphics::ShaderStage::Compute : graphics::ShaderStage::Fragment;
+  program->stage_ = vertex ? graphics::ShaderStage::Vertex : compute ? graphics::ShaderStage::Compute : geometry ? graphics::ShaderStage::Geometry : graphics::ShaderStage::Fragment;
   program->major_ = major;
   program->minor_ = minor;
 
@@ -196,10 +199,11 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
   if (!isgn.empty()) {
     if (!read_signature(isgn, isgn_size, elements, &count)) return status::kInvalidParameter;
     for (uint32_t i = 0; i < count; ++i)
-      if (elements[i].reg < 16) in_slot[elements[i].reg] = signature_slot(elements[i], false);
+      if (elements[i].reg < 16) in_slot[elements[i].reg] = signature_slot(elements[i], geometry);   // (a geometry shader's inputs include the position)
   }
-  if (vertex) {
-    for (uint32_t i = 0; i < graphics::kMaxVertexAttributes; ++i) in_slot[i] = static_cast<int8_t>(i);   // (vN is attribute location N)
+  if (vertex || geometry) {
+    if (vertex)
+      for (uint32_t i = 0; i < graphics::kMaxVertexAttributes; ++i) in_slot[i] = static_cast<int8_t>(i);   // (vN is attribute location N)
     if (osgn.empty() || !read_signature(osgn, osgn_size, elements, &count)) return status::kInvalidParameter;
     for (uint32_t i = 0; i < count; ++i)
       if (elements[i].reg < 16) out_slot[elements[i].reg] = signature_slot(elements[i], true);
@@ -290,6 +294,12 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         s->type = kTemp, s->number = static_cast<uint16_t>(o.index[0]);
         return status::kSuccess;
       case kOpInput: {
+        if (geometry) {
+          // v[vertex][register], both immediate
+          if (o.dims != 2 || o.index[0] >= geometry_vertices || o.index[1] >= 16 || in_slot[o.index[1]] == kSlotNone) return status::kNotSupported;
+          s->type = kInput, s->number = static_cast<uint16_t>(o.index[1]), s->slot = in_slot[o.index[1]], s->vertex = static_cast<uint8_t>(o.index[0]);
+          return status::kSuccess;
+        }
         if (o.dims == 1 && o.index[0] < 16 && in_sys[o.index[0]] >= 0) {
           s->type = kSysValue, s->number = static_cast<uint16_t>(in_sys[o.index[0]]);
           program->uses_system_values_ = true;
@@ -355,7 +365,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         return status::kSuccess;
       case kOpOutput: {
         if (o.dims != 1 || o.index[0] >= 16) return status::kNotSupported;
-        if (!vertex) {
+        if (!vertex && !geometry) {
           if (o.index[0] >= graphics::kMaxColorTargets) return status::kNotSupported;   // (SV_Target0..3)
           d->type = kColorOut, d->slot = static_cast<int8_t>(o.index[0]);
           if (o.index[0] + 1 > color_outputs) color_outputs = o.index[0] + 1;
@@ -528,6 +538,11 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         Operand o;
         s = read_operand(p, &o);
         if (s != status::kSuccess) return s;
+        if (geometry && (opcode == kDclInput4 || opcode == kDclInputSiv4) && o.type == kOpInput) {
+          // v[N][register] (and for the _siv form the system value after it): the signature says what the register is
+          if (o.dims != 2 || o.index[0] != geometry_vertices || o.index[1] >= 16 || in_slot[o.index[1]] == kSlotNone) return status::kNotSupported;
+          continue;
+        }
         if (compute && opcode == kDclInput4 && (o.type == kOpThreadId || o.type == kOpThreadGroupId || o.type == kOpThreadIdInGroup || o.type == kOpThreadIdFlat)) continue;
         if ((o.type != kOpInput && o.type != kOpOutput) || o.dims != 1 || o.index[0] >= 16) return status::kNotSupported;   // (depth and the like)
         // An input that is a system value says which in its declaration (a name after the operand); the rest take their meaning from the signature.
@@ -548,6 +563,29 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         continue;
       }
       case kDclIndexableTemp4: return status::kNotSupported;
+      case kDclInputPrimitive4: {
+        // (D3D10_SB_PRIMITIVE: 1 point, 2 line, 3 triangle; the adjacency primitives are not taken)
+        const uint32_t primitive = (token >> 11) & 0x3F;
+        if (!geometry || primitive < 1 || primitive > 3) return status::kNotSupported;
+        program->geometry_input_ = primitive == 1 ? graphics::GeometryPrimitive::Point : primitive == 2 ? graphics::GeometryPrimitive::Line : graphics::GeometryPrimitive::Triangle;
+        geometry_vertices = primitive;
+        geometry_input_declared = true;
+        continue;
+      }
+      case kDclOutputTopology4: {
+        // (D3D10_SB_PRIMITIVE_TOPOLOGY: 1 point list, 3 line strip, 5 triangle strip)
+        const uint32_t topology = (token >> 11) & 0x3F;
+        if (!geometry || (topology != 1 && topology != 3 && topology != 5)) return status::kNotSupported;
+        program->geometry_output_ = topology == 1 ? graphics::GeometryTopology::PointList : topology == 3 ? graphics::GeometryTopology::LineStrip : graphics::GeometryTopology::TriangleStrip;
+        geometry_output_declared = true;
+        continue;
+      }
+      case kDclMaxOutputVertices4: {
+        const uint32_t n = p.le32();
+        if (!geometry || !p.ok() || n == 0 || n > graphics::kMaxGeometryVertices) return status::kNotSupported;
+        program->geometry_max_vertices_ = n;
+        continue;
+      }
       case kDclThreadGroup4: {
         if (!compute) return status::kNotSupported;
         const uint32_t x = p.le32(), y = p.le32(), z = p.le32();
@@ -587,6 +625,8 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       s = to_src(c, &ins.src[0]);
       if (s != status::kSuccess) return s;
       ins.src_count = 1;
+    } else if (geometry && (opcode == kEmit4 || opcode == kCut4)) {
+      ins.op = opcode == kEmit4 ? kGsEmit : kGsCut;
     } else if (opcode == kLoop4 || opcode == kEndloop4 || opcode == kBreak4 || opcode == kContinue4) {
       ins.op = opcode == kLoop4 ? kLoopBegin : opcode == kEndloop4 ? kLoopEnd : opcode == kBreak4 ? kBreak0 : kContinue0;
     } else if (opcode == kBreakc4 || opcode == kContinuec4) {
@@ -800,7 +840,8 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
     program->color_outputs_ = color_outputs;
   }
   if (compute && (!thread_group_declared || program->code_.count() == 0)) return status::kInvalidParameter;
-  if (vertex) {
+  if (geometry && (!geometry_input_declared || !geometry_output_declared || program->geometry_max_vertices_ == 0)) return status::kInvalidParameter;
+  if (vertex || geometry) {
     bool writes_position = false;
     for (const Instr& ins : program->code_.view())
       if (ins.dst.slot == kSlotPosition) writes_position = true;

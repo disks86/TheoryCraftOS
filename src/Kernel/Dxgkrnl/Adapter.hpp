@@ -57,7 +57,8 @@ class Adapter {
   // --- Shaders and pipelines. kNotSupported when the device has no way to run the shader; kInvalidParameter for bad input.
   NtStatus create_shader(const ShaderDesc& desc, SharedPointer<ShaderObject>* out);
   NtStatus create_compute_pipeline(const SharedPointer<ShaderObject>& shader, SharedPointer<PipelineObject>* out);
-  NtStatus create_pipeline(const PipelineDesc& desc, const SharedPointer<ShaderObject>& vertex, const SharedPointer<ShaderObject>& fragment, SharedPointer<PipelineObject>* out);
+  NtStatus create_pipeline(const PipelineDesc& desc, const SharedPointer<ShaderObject>& vertex, const SharedPointer<ShaderObject>& fragment, SharedPointer<PipelineObject>* out,
+                         const SharedPointer<ShaderObject>& geometry = SharedPointer<ShaderObject>());
 
   // --- Contexts and their queues.
   NtStatus create_context(const SharedPointer<DeviceObject>& device, ContextPriority priority, SharedPointer<ContextObject>* out);

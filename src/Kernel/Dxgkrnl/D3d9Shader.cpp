@@ -70,6 +70,9 @@ struct D3d9Program::State {
   const uint8_t* constants = nullptr;
   const graphics::ITextureSet* textures = nullptr;
   const graphics::ComputeContext* compute = nullptr;
+  const graphics::GeometryInputData* geometry_in = nullptr;
+  graphics::GeometryOutputData* geometry_out = nullptr;
+  bool geometry_cut = false;   // a cut came after the last emit
   Q sys[kSysValueCount] = {};
   bool killed = false;
 };
@@ -114,6 +117,7 @@ uint32_t D3d9Program::required_features() const {
   for (graphics::TextureKind k : texture_kind_)
     if (k != graphics::TextureKind::Texture2D) kinds = graphics::kFeatureTextureKinds;
   if (stage_ == graphics::ShaderStage::Compute) kinds |= graphics::kFeatureCompute;
+  if (stage_ == graphics::ShaderStage::Geometry) kinds |= graphics::kFeatureGeometryShaders;
   return kinds | (uses_system_values_ ? graphics::kFeatureSystemInputs : 0u) | (uses_texel_access_ ? graphics::kFeatureTexelAccess : 0u) |
          (color_outputs_ > 1 ? graphics::kFeatureMultipleTargets : 0u);
 }
@@ -438,6 +442,15 @@ void D3d9Program::execute(State& s) const {
       case kTemp: v = s.r[src.number]; break;
       case kSysValue: if (src.number < kSysValueCount) v = s.sys[src.number]; break;
       case kInput:
+        if (s.geometry_in) {
+          // (a geometry shader: the position or a varying of one vertex of the primitive)
+          if (src.vertex < 3 && src.slot == kSlotPosition) v = {{s.geometry_in->position[src.vertex].x, s.geometry_in->position[src.vertex].y, s.geometry_in->position[src.vertex].z, s.geometry_in->position[src.vertex].w}};
+          else if (src.vertex < 3 && src.slot >= 0 && src.slot < static_cast<int8_t>(graphics::kMaxVaryings)) {
+            const graphics::Vec4 a = s.geometry_in->varying[src.vertex][src.slot];
+            v = {{a.x, a.y, a.z, a.w}};
+          }
+          break;
+        }
         if (src.slot >= 0) {
           const graphics::Vec4 a = s.attributes ? s.attributes[src.slot] : s.varyings[src.slot];
           v = {{a.x, a.y, a.z, a.w}};
@@ -585,6 +598,20 @@ void D3d9Program::execute(State& s) const {
         break;
       case kDp3: b = fetch(ins.src[1], 0); store(ins.dst, splat(dot(a, b, 3))); break;
       case kDp4: b = fetch(ins.src[1], 0); store(ins.dst, splat(dot(a, b, 4))); break;
+      case kGsEmit: {
+        graphics::GeometryOutputData* out = s.geometry_out;
+        if (!out || out->count >= geometry_max_vertices_ || out->count >= graphics::kMaxGeometryVertices) break;   // (past the maximum: dropped)
+        graphics::ShaderIo& v = out->vertex[out->count];
+        v.position = {s.pos.f[0], -s.pos.f[1], s.pos.f[2], s.pos.f[3]};
+        for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) v.varying[i] = {s.var[i].f[0], s.var[i].f[1], s.var[i].f[2], s.var[i].f[3]};
+        out->restart[out->count] = s.geometry_cut;
+        s.geometry_cut = false;
+        ++out->count;
+        break;
+      }
+      case kGsCut:
+        if (s.geometry_out && s.geometry_out->count) s.geometry_cut = true;
+        break;
       case kBufLoad: case kBufStore: case kBufAtomic: case kBufImmAtomic: {
         if (!s.compute || ins.uav >= graphics::kMaxStorageBuffers) break;
         const ByteView buffer = s.compute->buffers[ins.uav];
@@ -844,6 +871,19 @@ bool D3d9Program::run_fragment_ex(const graphics::Vec4* varyings, const graphics
   return true;
 }
 
+void D3d9Program::run_geometry(const graphics::GeometryInputData& input, const uint8_t* constants, graphics::GeometryOutputData* output) const {
+  if (stage_ != graphics::ShaderStage::Geometry || !output) return;
+  State s;
+  s.constants = constants;
+  // The vertex shader's positions come with Y the way the devices want it (down); the shader works in Direct3D's clip space (up), so they are turned over on the way in and out.
+  graphics::GeometryInputData upright = input;
+  for (graphics::Vec4& p : upright.position) p.y = -p.y;
+  s.geometry_in = &upright;
+  s.geometry_out = output;
+  output->count = 0;
+  execute(s);
+}
+
 void D3d9Program::run_compute(const graphics::ComputeContext& context, const uint8_t* constants) const {
   if (stage_ != graphics::ShaderStage::Compute) return;
   State s;
@@ -869,6 +909,7 @@ const D3d9Program* g_textured[kSlots];
 const D3d9Program* g_vertex_ex[kSlots];
 const D3d9Program* g_fragment_ex[kSlots];
 const D3d9Program* g_compute[kSlots];
+const D3d9Program* g_geometry[kSlots];
 
 template <uint32_t N>
 void vertex_trampoline(const graphics::Vec4* attributes, const uint8_t* constants, graphics::ShaderIo* out) {
@@ -897,8 +938,14 @@ void compute_trampoline(const graphics::ComputeContext& context, const uint8_t* 
   g_compute[N]->run_compute(context, constants);
 }
 
+template <uint32_t N>
+void geometry_trampoline(const graphics::GeometryInputData& input, const uint8_t* constants, graphics::GeometryOutputData* output) {
+  g_geometry[N]->run_geometry(input, constants, output);
+}
+
 template <uint32_t... I>
 struct Trampolines {
+  static constexpr graphics::GeometryShaderFn geometry[sizeof...(I)] = {&geometry_trampoline<I>...};
   static constexpr graphics::ComputeShaderFn compute[sizeof...(I)] = {&compute_trampoline<I>...};
   static constexpr graphics::VertexShaderFnEx vertex_ex[sizeof...(I)] = {&vertex_ex_trampoline<I>...};
   static constexpr graphics::FragmentShaderFnEx fragment_ex[sizeof...(I)] = {&fragment_ex_trampoline<I>...};
@@ -917,6 +964,21 @@ constexpr auto kTrampolines = make_trampolines(std::make_integer_sequence<uint32
 NtStatus D3d9Binding::bind(UniquePointer<D3d9Program> program, graphics::ShaderModuleDesc* desc) {
   release();
   if (!program) return status::kInvalidParameter;
+  if (program->stage() == graphics::ShaderStage::Geometry) {
+    uint32_t slot = 0;
+    while (slot < kSlots && g_geometry[slot]) ++slot;
+    if (slot == kSlots) return status::kInsufficientResources;
+    g_geometry[slot] = program.get();
+    slot_ = static_cast<int32_t>(slot);
+    kind_ = 4;
+    desc->stage = graphics::ShaderStage::Geometry;
+    desc->geometry_function = decltype(kTrampolines)::geometry[slot];
+    desc->geometry_input = program->geometry_input();
+    desc->geometry_output = program->geometry_output();
+    desc->geometry_max_vertices = program->geometry_max_vertices();
+    program_ = util::move(program);
+    return status::kSuccess;
+  }
   if (program->stage() == graphics::ShaderStage::Compute) {
     uint32_t slot = 0;
     while (slot < kSlots && g_compute[slot]) ++slot;
@@ -959,7 +1021,7 @@ NtStatus D3d9Binding::bind(UniquePointer<D3d9Program> program, graphics::ShaderM
 
 void D3d9Binding::release() {
   if (slot_ >= 0) {
-    const D3d9Program** table = kind_ == 0 ? g_vertex : kind_ == 1 ? g_fragment : kind_ == 3 ? g_compute : g_textured;
+    const D3d9Program** table = kind_ == 0 ? g_vertex : kind_ == 1 ? g_fragment : kind_ == 3 ? g_compute : kind_ == 4 ? g_geometry : g_textured;
     table[slot_] = nullptr;
     slot_ = -1;
   }

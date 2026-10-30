@@ -949,6 +949,40 @@ ClipVertex run_vertex_shader(const SoftwarePipeline& pipeline, ConstByteView ver
   return out;
 }
 
+// Runs a geometry shader on one primitive and draws what it emits: the vertices are a strip (a triangle strip turns every second triangle over, as Direct3D does) or points.
+void run_geometry_shader(const DrawState& s, const SoftwareShaderModule& module, const ClipVertex* v, uint32_t count) {
+  const ShaderModuleDesc& md = module.desc();
+  GeometryInputData input;
+  for (uint32_t k = 0; k < count && k < 3; ++k) {
+    input.position[k] = v[k].position;
+    for (uint32_t i = 0; i < kMaxVaryings; ++i) input.varying[k][i] = v[k].varying[i];
+  }
+  input.primitive_id = s.primitive_id;
+  GeometryOutputData output;
+  md.geometry_function(input, s.constants, &output);
+  if (output.count > md.geometry_max_vertices) output.count = md.geometry_max_vertices;
+  auto clip = [&](uint32_t i) {
+    ClipVertex c;
+    c.position = output.vertex[i].position;
+    for (uint32_t k = 0; k < kMaxVaryings; ++k) c.varying[k] = output.vertex[i].varying[k];
+    return c;
+  };
+  uint32_t in_strip = 0;   // vertices of the strip so far
+  for (uint32_t i = 0; i < output.count; ++i) {
+    if (output.restart[i]) in_strip = 0;
+    ++in_strip;
+    if (md.geometry_output == GeometryTopology::PointList) {
+      draw_point(s, clip(i));
+    } else if (md.geometry_output == GeometryTopology::LineStrip) {
+      if (in_strip >= 2) draw_line(s, clip(i - 1), clip(i));
+    } else if (in_strip >= 3) {
+      const bool odd = (in_strip - 3) & 1;
+      if (odd) draw_triangle(s, clip(i - 1), clip(i - 2), clip(i));
+      else draw_triangle(s, clip(i - 2), clip(i - 1), clip(i));
+    }
+  }
+}
+
 }  // namespace
 
 // --- Device ------------------------------------------------------------------
@@ -993,6 +1027,10 @@ IImage* SoftwareDevice::create_image(const ImageDesc& desc) {
 void SoftwareDevice::destroy_image(IImage* image) { destroy(allocator_, static_cast<SoftwareImage*>(image)); }
 
 IShaderModule* SoftwareDevice::create_shader_module(const ShaderModuleDesc& desc) {
+  if (desc.stage == ShaderStage::Geometry) {
+    if (!desc.geometry_function || desc.geometry_max_vertices == 0 || desc.geometry_max_vertices > kMaxGeometryVertices) return nullptr;
+    return make<SoftwareShaderModule>(allocator_, desc);
+  }
   if (desc.stage == ShaderStage::Compute) {
     if (!desc.compute_function) return nullptr;
     uint64_t threads = 1;
@@ -1023,6 +1061,7 @@ IPipeline* SoftwareDevice::create_graphics_pipeline(const GraphicsPipelineDesc& 
   const auto* vs = static_cast<const SoftwareShaderModule*>(desc.vertex_shader);
   const auto* fs = static_cast<const SoftwareShaderModule*>(desc.fragment_shader);
   if (vs->stage() != ShaderStage::Vertex || fs->stage() != ShaderStage::Fragment) return nullptr;
+  if (desc.geometry_shader && desc.geometry_shader->stage() != ShaderStage::Geometry) return nullptr;
   // A shader that samples textures needs the pipeline to say how many, and the other way round.
   // (one with system values reads whatever it likes)
   const bool textured = fs->desc().textured_fragment_function != nullptr;
@@ -1260,12 +1299,22 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
         const uint32_t instances = cmd.instance_count;
         if (instances > 1u << 20) return false;
         const uint32_t per_primitive = topology == PrimitiveTopology::TriangleList ? 3 : topology == PrimitiveTopology::LineList ? 2 : 1;
+        const SoftwareShaderModule* geometry = static_cast<const SoftwareShaderModule*>(pd.geometry_shader);
+        if (geometry) {
+          // (the geometry shader takes the primitives the draw makes)
+          const GeometryPrimitive taken = geometry->desc().geometry_input;
+          if (taken != (per_primitive == 3 ? GeometryPrimitive::Triangle : per_primitive == 2 ? GeometryPrimitive::Line : GeometryPrimitive::Point)) return false;
+        }
         for (uint32_t instance = 0; instance < instances; ++instance) {
           s.primitive_id = 0;
           for (uint32_t t = 0; t + per_primitive <= cmd.count; t += per_primitive, ++s.primitive_id) {
             ClipVertex v[3];
             for (uint32_t k = 0; k < per_primitive; ++k)
               if (!vertex_at(t + k, instance, &v[k])) return false;
+            if (geometry) {
+              run_geometry_shader(s, *geometry, v, per_primitive);
+              continue;
+            }
             if (topology == PrimitiveTopology::TriangleList) draw_triangle(s, v[0], v[1], v[2]);
             else if (topology == PrimitiveTopology::LineList) draw_line(s, v[0], v[1]);
             else draw_point(s, v[0]);

@@ -72,6 +72,11 @@ class D3d9Program {
   bool uses_textures() const { return uses_textures_; }
   // A compute shader (cs_5_0 DXBC, see D3d9Dxbc.cpp): the size of its thread group, and what it declared each storage buffer slot (u#) to be.
   enum class BufferKind : uint8_t { None, Raw, Structured };
+  // A geometry shader (gs_4_0 / gs_5_0 DXBC): what it takes and makes, and the most vertices one invocation emits.
+  graphics::GeometryPrimitive geometry_input() const { return geometry_input_; }
+  graphics::GeometryTopology geometry_output() const { return geometry_output_; }
+  uint32_t geometry_max_vertices() const { return geometry_max_vertices_; }
+  void run_geometry(const graphics::GeometryInputData& input, const uint8_t* constants, graphics::GeometryOutputData* output) const;
   uint32_t thread_group(uint32_t axis) const { return axis < 3 ? thread_group_[axis] : 1; }
   BufferKind storage_kind(uint32_t slot) const { return slot < graphics::kMaxStorageBuffers ? uav_kind_[slot] : BufferKind::None; }
   uint32_t storage_stride(uint32_t slot) const { return slot < graphics::kMaxStorageBuffers ? uav_stride_[slot] : 0; }
@@ -129,6 +134,9 @@ class D3d9Program {
   uint32_t major_ = 0, minor_ = 0;
   bool uses_textures_ = false;
   uint32_t thread_group_[3] = {1, 1, 1};
+  graphics::GeometryPrimitive geometry_input_ = graphics::GeometryPrimitive::Triangle;
+  graphics::GeometryTopology geometry_output_ = graphics::GeometryTopology::TriangleStrip;
+  uint32_t geometry_max_vertices_ = 0;
   BufferKind uav_kind_[graphics::kMaxStorageBuffers] = {};
   uint32_t uav_stride_[graphics::kMaxStorageBuffers] = {};
   graphics::TextureKind texture_kind_[graphics::kMaxTextureUnits] = {};

@@ -46,6 +46,8 @@ enum Opcode : uint16_t {
   // words), kBufStore (dst.mask: how many words; src[2] the value), kBufAtomic / kBufImmAtomic (src[0] the address, src[1] the operand; the second also writes the old value to dst). The
   // buffer is `uav`; `stride` is 0 for a raw buffer (byte address) and the structure size for a structured one; an atomic's kind is `control` (AtomicKind).
   kBufLoad = 0x1400, kBufStore, kBufAtomic, kBufImmAtomic,
+  // Geometry shaders: emit appends the output registers' vertex to the strip, cut ends the strip.
+  kGsEmit = 0x1500, kGsCut,
   kLoopBegin = 0x1200, kLoopEnd, kBreak0, kBreakNz, kBreakZ, kContinue0, kContinueNz, kContinueZ,
 };
 
@@ -73,6 +75,7 @@ struct D3d9Program::Instruction {
   struct Src {
     uint8_t type = 0;
     uint16_t number = 0;
+    uint8_t vertex = 0;        // a geometry shader's input: which vertex of the primitive (v[vertex][register])
     int8_t slot = kSlotNone;   // inputs: the attribute location / varying
     uint8_t swizzle[4] = {0, 1, 2, 3};
     uint8_t modifier = kModNone;

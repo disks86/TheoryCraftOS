@@ -2727,8 +2727,8 @@ void test_dxbc_real() {
         CHECK(p->emit_tgsi(&text) == status::kSuccess && strstr(std::string(text.view().data(), text.size()).c_str(), k.name));
       }
     }
-    const std::vector<uint8_t> compute_blob = read_blob("cs_fill.dxbc");
-    for (const std::vector<uint8_t>* blob : {&vs_blob, &color_blob, &tex_blob, &math_blob, &volume_blob, &array_blob, &cube_blob, &compute_blob}) {
+    const std::vector<uint8_t> compute_blob = read_blob("cs_fill.dxbc"), geometry_blob = read_blob("gs_copy.dxbc");
+    for (const std::vector<uint8_t>* blob : {&vs_blob, &color_blob, &tex_blob, &math_blob, &volume_blob, &array_blob, &cube_blob, &compute_blob, &geometry_blob}) {
       for (size_t cut = 0; cut < blob->size(); cut += 3) {
         std::vector<uint8_t> t(blob->begin(), blob->begin() + static_cast<long>(cut));
         UniquePointer<D3d9Program> p = compile_dxbc(allocator, t, &st);
@@ -2754,6 +2754,12 @@ void test_dxbc_real() {
           for (uint32_t k = 0; k < graphics::kMaxStorageBuffers; ++k) context.buffers[k] = ByteView(storage[k], sizeof storage[k]);
           context.dispatch_id[0] = context.dispatch_id[1] = 5;
           p->run_compute(context, constants);
+          // (a geometry shader, given a triangle)
+          graphics::GeometryInputData in;
+          for (uint32_t k = 0; k < 3; ++k) in.position[k] = {static_cast<float>(k), 1.0f, 0.5f, 1.0f};
+          graphics::GeometryOutputData out;
+          p->run_geometry(in, constants, &out);
+          CHECK(out.count <= graphics::kMaxGeometryVertices);
         } else {
           ++refused;
         }
@@ -3992,6 +3998,67 @@ void test_multisample() {
   CHECK(kernel.create_allocation(kPid, dev, d, &refused) == status::kNotSupported);
 }
 
+void test_geometry_kernel() {
+  Env e;
+  namespace b = conformance_blobs;
+  Handle vs = 0, gs = 0, ps = 0;
+  ShaderDesc sd;
+  sd.kind = ShaderKind::Dxbc;
+  sd.stage = graphics::ShaderStage::Vertex, sd.code = ConstByteView(b::k_vs, sizeof b::k_vs);
+  CHECK(e.kernel.create_shader(kPid, e.dev, sd, &vs) == status::kSuccess);
+  sd.stage = graphics::ShaderStage::Geometry, sd.code = ConstByteView(b::k_gs_copy, sizeof b::k_gs_copy);
+  CHECK(e.kernel.create_shader(kPid, e.dev, sd, &gs) == status::kSuccess);
+  sd.stage = graphics::ShaderStage::Fragment, sd.code = ConstByteView(b::k_ps_color, sizeof b::k_ps_color);
+  CHECK(e.kernel.create_shader(kPid, e.dev, sd, &ps) == status::kSuccess);
+  auto pipeline = [&](Handle geometry, Handle* out) {
+    PipelineDesc pd;
+    pd.vertex_shader = vs, pd.fragment_shader = ps, pd.geometry_shader = geometry, pd.vertex_stride = 28, pd.attribute_count = 2, pd.varying_count = 3;
+    pd.attributes[0] = {0, graphics::VertexFormat::Float3, 0};
+    pd.attributes[1] = {1, graphics::VertexFormat::Float4, 12};
+    pd.cull_mode = graphics::CullMode::None;
+    return e.kernel.create_pipeline(kPid, e.dev, pd, out);
+  };
+  Handle with_gs = 0, without = 0, wrong = 0;
+  CHECK(pipeline(gs, &with_gs) == status::kSuccess && pipeline(0, &without) == status::kSuccess);
+  CHECK(pipeline(vs, &wrong) == status::kInvalidParameter);   // (not a geometry shader)
+  CHECK(pipeline(0x7777, &wrong) == status::kInvalidHandle);
+  Handle target = e.alloc(kTarget, Format::A8R8G8B8, 32, 32), vb = e.buffer(kAllocVertexBuffer, 4 * 28);
+  const float v[28] = {-0.9f, -0.9f, 0.5f, 1, 0, 0, 1, 0.9f, -0.9f, 0.5f, 0, 1, 0, 1, 0, 0.9f, 0.5f, 0, 0, 1, 1, 0.5f, 0.9f, 0.5f, 1, 1, 0, 1};
+  CHECK(e.write(vb, floats(v, 28)));
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  auto draw = [&](Handle pipe, Topology topology, uint32_t count) {
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    w.bind_pipeline(pipe);
+    w.bind_vertex_buffer(1);
+    w.push_constants(floats(identity, 16));
+    w.set_topology(topology);
+    w.draw(count);
+    w.end_pass();
+    return e.render(w, {target, vb});
+  };
+  // It takes triangles: a list or a strip (which the kernel makes into a list); lines and points are refused (and a pipeline without it takes anything).
+  CHECK(draw(with_gs, Topology::TriangleList, 3) == status::kSuccess);
+  CHECK(e.pixel(target, 4, 28) != 0xFF000000u);
+  CHECK(draw(with_gs, Topology::TriangleStrip, 4) == status::kSuccess);
+  CHECK(draw(with_gs, Topology::LineList, 2) == status::kInvalidParameter);
+  CHECK(draw(with_gs, Topology::PointList, 2) == status::kInvalidParameter);
+  CHECK(draw(without, Topology::LineList, 2) == status::kSuccess);
+  // A device without the feature refuses the shader.
+  FakeScreen screen(8, 6);
+  graphics::SoftwareDevice software(e.allocator, &screen);
+  SpyDevice limited(software);
+  limited.feature_mask = 0;
+  Kernel kernel(e.allocator);
+  AdapterConfig c;
+  c.display = &screen;
+  kernel.add_adapter(limited, c);
+  Handle adapter = 0, dev = 0, refused = 0;
+  CHECK(kernel.open_process(kPid) == status::kSuccess && kernel.open_adapter_from_index(kPid, 0, &adapter) == status::kSuccess && kernel.create_device(kPid, adapter, &dev) == status::kSuccess);
+  sd.stage = graphics::ShaderStage::Geometry, sd.code = ConstByteView(b::k_gs_copy, sizeof b::k_gs_copy);
+  CHECK(kernel.create_shader(kPid, dev, sd, &refused) == status::kNotSupported);
+}
+
 void test_conformance() {
   test_half_floats();
   HostAllocator allocator;
@@ -4045,6 +4112,18 @@ void test_conformance() {
       };
       CHECK(near(r.device_picture[16 * 32 + 12] & 0xFFFFFF, 0xb49a81) && near(r.device_picture[16 * 32 + 13] & 0xFFFFFF, 0x4d661a));
       CHECK(near(r.device_picture[28 * 32 + 8] & 0xFFFFFF, 0x9a3434) && near(r.device_picture[28 * 32 + 9] & 0xFFFFFF, 0x1a1a80));
+    }
+    if (__builtin_strstr(r.name, "geometry shader")) {
+      // The triangle itself (red at the lower left, blue at the top) and its copy at half the size to the lower right with red and blue swapped.
+      auto px = [&](uint32_t x, uint32_t y) { return r.device_picture[y * 32 + x] & 0xFFFFFF; };
+      auto near = [](uint32_t a, uint32_t b) {
+        for (uint32_t shift = 0; shift < 24; shift += 8) {
+          const int32_t d = static_cast<int32_t>((a >> shift) & 0xFF) - static_cast<int32_t>((b >> shift) & 0xFF);
+          if (d > 3 || d < -3) return false;
+        }
+        return true;
+      };
+      CHECK(near(px(4, 28), 0xdd1111) && near(px(14, 8), 0x2c11c2) && near(px(24, 28), 0x30705f) && px(24, 8) == 0 && px(0, 0) == 0);
     }
     if (__builtin_strstr(r.name, "multisampling")) {
       // Inside a rectangle all four samples agree; on the left edge of the far one (x = 4.3) three of the four samples of the pixel are inside: 3/4 of red. Where the near green edge
@@ -5182,6 +5261,7 @@ int main() {
   test_compute();
   test_compute_kernel();
   test_multisample();
+  test_geometry_kernel();
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);
     return 1;

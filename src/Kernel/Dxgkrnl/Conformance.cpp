@@ -1054,6 +1054,31 @@ void scene_multisample(Rig& rig, ArrayView<uint32_t> out) {
   release_view(rig.allocator(), other);
 }
 
+// A geometry shader (gs_copy.hlsl): every triangle comes out as itself and, as a second strip, a half-size copy moved to the lower right with the red and blue swapped.
+void scene_geometry_shader(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureGeometryShaders)) return void(rig.step("geometry shaders", status::kNotSupported));
+  namespace b = conformance_blobs;
+  const Vertex v[3] = {{-0.9f, -0.9f, 0.5f, 1, 0, 0, 1}, {0.9f, -0.9f, 0.5f, 0, 1, 0, 1}, {0.0f, 0.9f, 0.5f, 0, 0, 1, 1}};
+  Handle vs = rig.vertex_shader(bytes_of(b::k_vs, sizeof b::k_vs));
+  Handle gs = rig.shader("create_shader (geometry)", ShaderKind::Dxbc, graphics::ShaderStage::Geometry, bytes_of(b::k_gs_copy, sizeof b::k_gs_copy));
+  Handle ps = rig.pixel_shader(bytes_of(b::k_ps_color, sizeof b::k_ps_color));
+  PipelineDesc pd = colour_pipeline_desc(vs, ps);
+  pd.varying_count = 3;
+  pd.geometry_shader = gs;
+  Handle pipe = rig.pipeline(pd);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  CommandWriter w(rig.allocator());
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(3);
+  w.end_pass();
+  rig.render(w, {target, vb});
+  rig.read(target, out);
+}
+
 const Entry kScenes[] = {
     {"Direct3D 9 vertex colours", scene_vertex_colours},
     {"Direct3D 9 Shader Model 3", scene_sm3},
@@ -1082,6 +1107,7 @@ const Entry kScenes[] = {
     {"Direct3D 10 per-instance attribute", scene_instanced_colour},
     {"Direct3D 10 instancing", scene_instancing},
     {"Direct3D 10 multiple render targets (DXBC)", scene_multiple_targets},
+    {"Direct3D 10 geometry shader (DXBC)", scene_geometry_shader},
     {"Direct3D 10 4x multisampling", scene_multisample},
     {"Direct3D 11 compute shader and unordered access views (DXBC)", scene_compute},
     {"Direct3D 10 independent blend per render target (DXBC)", scene_independent_blend},
