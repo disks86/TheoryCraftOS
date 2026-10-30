@@ -41,6 +41,9 @@ namespace graphics {
 // gradients are triangles with per-vertex colors. Documented approximations (the push calls return false):
 // rounded and mask clips scissor to their bounding rectangle, and layers have no offscreen target, so group
 // opacity is applied to each shape (overlapping shapes show through each other). copy_rect reads the frame back.
+// Offscreen groups (begin_group / end_group, and push_layer with an opacity) render into an image of their own, kept premultiplied, and lay it over the
+// target with a textured quad: exact group opacity, and transformed content drawn by the GPU. They need custom blending and the scaled textured shader
+// (software and virgl devices); without them begin_group() returns false.
 // draw_image_transformed uploads the picture as a texture and draws it as one textured quadrilateral (the texture unit does the resampling).
 //
 // Differences from the CPU renderer: lines are one-pixel-wide quads and circles
@@ -78,6 +81,8 @@ class DeviceRenderer2D final : public IRenderer2D {
   void stroke_rounded_rect(const Rect2D& outer, const CornerRadii& radii, const EdgeWidths& widths, uint32_t color) override;
   void draw_mask(const MaskView& mask, const Rect2D& source_rect, int32_t x, int32_t y, uint32_t color) override;
   bool draw_image_transformed(const Surface& source, const Rect2D& source_rect, const Matrix2D& m, ImageFilter filter) override;
+  bool begin_group(const Rect2D& bounds) override;
+  bool end_group(const Matrix2D& m, uint8_t opacity, ImageFilter filter) override;
   void draw_image_scaled(const Surface& source, const RectF& source_rect, const Rect2D& dest, ImageFilter filter) override;
   void fill_linear_gradient(const Rect2D& rect, Vec2 from, Vec2 to, ArrayView<const GradientStop> stops) override;
   void fill_radial_gradient(const Rect2D& rect, Vec2 center, Vec2 radii, ArrayView<const GradientStop> stops) override;
@@ -128,7 +133,15 @@ class DeviceRenderer2D final : public IRenderer2D {
   void reset_sheet();
   bool draw_textured_quad(IImage& image, int64_t dx, int64_t dy, uint32_t w, uint32_t h, float u0, float v0, float u1, float v1);
   // The image's (u0, v0)-(u1, v1) on the quadrilateral with corners (xs[i], ys[i]) (top left, top right, bottom right, bottom left), sampled with `filter`.
-  bool draw_textured_corners(IImage& image, const float xs[4], const float ys[4], float u0, float v0, float u1, float v1, Filter filter);
+  // `scale` is not null for the composite of a group: its pipeline, and the opacity it is drawn at.
+  bool draw_textured_corners(IImage& image, const float xs[4], const float ys[4], float u0, float v0, float u1, float v1, Filter filter, const float* scale = nullptr);
+  // The image, origin and size of what drawing goes to now: the frame, or the innermost group.
+  IImage* target_image() const;
+  Extent2D target_extent() const;
+  Rect2D to_target(const Rect2D& clip) const;   // a clip rectangle in target coordinates, in the coordinates of the current image
+  void fill_matrix(Mat4* mvp) const;
+  IPipeline* colored_pipeline(BlendMode mode) const;
+  IPipeline* textured_pipeline(BlendMode mode) const;
 
   IGraphicsDevice& device_;
   allocators::IAllocator& allocator_;
@@ -176,6 +189,24 @@ class DeviceRenderer2D final : public IRenderer2D {
   uint32_t layer_depth_ = 0, layer_overflow_ = 0;
   BlendMode blend_ = BlendMode::Alpha;
   bool valid_ = false;
+  // Offscreen groups: the pipelines that keep premultiplied colors in them, the one that lays a group over its parent, and the stack.
+  static constexpr uint32_t kMaxGroups = 4;
+  struct Group {
+    IImage* image = nullptr;
+    Rect2D bounds;                 // in target coordinates (the image is this big)
+    uint32_t clip_depth = 0, clip_overflow = 0;
+    float opacity = 1.0f;          // the renderer's per-shape opacity outside the group
+    bool layer = false;            // from push_layer: its opacity is applied when it ends
+    uint8_t layer_opacity = 255;
+  };
+  IShaderModule* scaled_fs_ = nullptr;
+  IPipeline* group_blended_ = nullptr;
+  IPipeline* texture_group_ = nullptr;
+  IPipeline* composite_ = nullptr;
+  Group groups_[kMaxGroups];
+  uint32_t group_depth_ = 0;
+  bool groups_ok_ = false;
+  uint32_t layer_is_group_ = 0;   // bit n: the open layer n is a group
 };
 
 }  // namespace graphics

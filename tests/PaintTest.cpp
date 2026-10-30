@@ -24,7 +24,9 @@
 #include <vector>
 #include "Browser/Renderer.hpp"
 #include "Dom/HtmlBuilder.hpp"
+#include "Graphics/Graphics2D/Device/DeviceRenderer2D.hpp"
 #include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
+#include "Graphics/Graphics3D/Software/SoftwareDevice.hpp"
 #include "Layout/BoxBuilder.hpp"
 #include "Layout/FontMeasurer.hpp"
 #include "Layout/Layout.hpp"
@@ -96,6 +98,20 @@ struct Shot {
     painter.paint(renderer, list, 0, 0, view);
   }
   uint32_t px(uint32_t x, uint32_t y) const { return image.frame(0)[y * width + x]; }
+  // The same list drawn by the device renderer (on the software device): its offscreen groups move the transformed content. Returns the frame.
+  std::vector<uint32_t> via_device() const {
+    graphics::SoftwareDevice device(g_alloc, nullptr);
+    graphics::DeviceRenderer2D renderer(device, g_alloc, {width, height});
+    std::vector<uint32_t> frame(static_cast<size_t>(width) * height, 0);
+    if (!renderer.valid()) return frame;
+    const uint32_t paper = list.background() ? list.background() : 0xFFFFFFFFu;
+    renderer.set_blend(graphics::BlendMode::Replace);
+    renderer.fill_rect(graphics::Rect2D{0, 0, width, height}, paper);
+    paint::DisplayPainter painter(g_alloc, *g_fonts, nullptr);
+    painter.paint(renderer, list, 0, 0, graphics::Rect2D{0, 0, width, height});
+    renderer.read_pixels(ArrayView<uint32_t>(frame.data(), frame.size()));
+    return frame;
+  }
   // For looking at a picture: with TCOS_DUMP=<directory> the page is written there as <name>.png
   void dump(const char* name) const {
     const char* dir = getenv("TCOS_DUMP");
@@ -287,6 +303,35 @@ static void test_golden() {
 
 static bool is_white(uint32_t rgb) { return rgb == 0xFFFFFFu; }
 static int luma(uint32_t rgb) { return static_cast<int>(((rgb >> 16) & 0xFF) * 3 + ((rgb >> 8) & 0xFF) * 6 + (rgb & 0xFF)) / 10; }
+
+// Transformed content drawn through the device renderer's offscreen groups agrees with the CPU path (edges and filtering differ a little).
+static void test_transforms_on_device() {
+  const char* pages[] = {
+      "<div style='margin:10px;width:20px;height:20px;background:#f00;transform:scale(2);transform-origin:0 0'></div>",
+      "<div id=a style='margin:40px 0 0 40px;width:40px;height:20px;background:#f00;transform:rotate(90deg)'></div>",
+      "<div style='margin:30px;width:40px;height:40px;background:#f00;transform:rotate(45deg)'></div>",
+      "<div style='margin:10px;width:60px;height:40px;background:#08f;border:3px solid #000;transform:rotate(-20deg);opacity:.5'><div style='width:20px;height:20px;background:#0c0'></div></div>",
+      "<div style='margin:20px;width:60px;height:30px;transform:rotate(10deg);color:#000'>Transform</div>",
+  };
+  {
+    graphics::SoftwareDevice device(g_alloc, nullptr);
+    graphics::DeviceRenderer2D renderer(device, g_alloc, {16, 16});
+    CHECK(renderer.valid() && renderer.begin_group(graphics::Rect2D{0, 0, 8, 8}) && renderer.end_group(graphics::Matrix2D(), 255, graphics::ImageFilter::Nearest));   // (the pages below do use groups)
+  }
+  for (const char* body : pages) {
+    Shot cpu(page(body), 120, 100);
+    const std::vector<uint32_t> gpu = cpu.via_device();
+    uint32_t far = 0, inked = 0;
+    for (uint32_t y = 0; y < cpu.height; ++y)
+      for (uint32_t x = 0; x < cpu.width; ++x) {
+        const uint32_t a = cpu.px(x, y), b = gpu[y * cpu.width + x];
+        if (a != 0xFFFFFFFFu) ++inked;
+        if (!near_color(a, b, 40)) ++far;
+      }
+    CHECK(inked > 100);
+    CHECK(far * 5 < inked + 40);   // (only edge pixels of the pictures may differ: the quad's edges are not anti-aliased)
+  }
+}
 
 static void test_transforms() {
   // translate
@@ -817,6 +862,7 @@ int main() {
     test_hit_testing();
     test_golden();
     test_transforms();
+    test_transforms_on_device();
     test_filters();
     test_shadows();
     test_gradients_more();
