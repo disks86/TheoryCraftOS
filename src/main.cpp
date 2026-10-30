@@ -90,6 +90,10 @@
 #include "Hardware/VMware/VmwareTools.hpp"
 #include "Hardware/SystemInput.hpp"
 #include "Hardware/Mouse/I2c/PlatformI2cHid.hpp"
+#ifdef TCOS_BLUETOOTH
+#include "Hardware/Bluetooth/BluetoothService.hpp"
+#include "Hardware/WirelessInterface/Intel/IwlDriver.hpp"      // (FileSystemFirmwareSource reads /firmware)
+#endif
 #ifdef TCOS_INTEL_WIFI
 #include "Hardware/WirelessInterface/Intel/IwlWireless.hpp"
 #endif
@@ -1206,6 +1210,37 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       }
     }
 #endif
+#ifdef TCOS_BLUETOOTH
+    // The Bluetooth controllers on the USB ports (the Intel one on the Wireless-AC 9560 among them): its firmware, /firmware/ibt-*.sfi (the name without Linux's intel/ directory), is
+    // loaded and the controller brought up. Nothing is scanned, paired or connected. Opt-in (-DTCOS_BLUETOOTH=ON): none of it has run on a real controller.
+    struct BluetoothFirmwareFiles final : hardware::IBluetoothFirmwareSource {
+      hardware::FileSystemFirmwareSource files;
+      BluetoothFirmwareFiles(filesystem::IFileSystem& file_system, allocators::IAllocator& allocator) : files(file_system, allocator) {}
+      bool read(const char* name, ByteBuffer& out) override {
+        const char prefix[] = "intel/";
+        uint32_t skip = 0;
+        while (prefix[skip] && name[skip] == prefix[skip]) ++skip;
+        return files.read(name + (prefix[skip] ? 0 : skip), out);
+      }
+    } bluetooth_files(explorer_files.file_system(), shared_allocator);
+    UniquePointer<hardware::BluetoothService> bluetooth = UniquePointer<hardware::BluetoothService>::make(shared_allocator, &usb, &bluetooth_files, shared_allocator);
+    if (bluetooth && paging_ok) {
+      bluetooth->start();
+      for (uint32_t i = 0; i < bluetooth->count(); ++i) {
+        const hardware::BluetoothService::Entry* e = bluetooth->entry(i);
+        Entry log(e->state == hardware::BluetoothState::Ready ? Level::Ok : Level::Warning, "Bluetooth");
+        if (e->state == hardware::BluetoothState::Ready) {
+          const hardware::hci::BdAddr& a = e->controller->info().address;
+          log.text("controller ");
+          for (int b = 5; b >= 0; --b) log.hex2(a.b[b]).text(b > 0 ? ":" : "");
+          log.text(", ready");
+        } else {
+          log.text("controller not started: ").text(e->message);
+          if (e->firmware[0]) log.text(" (").text(e->firmware).text(")");
+        }
+      }
+    }
+#endif
 #ifdef TCOS_THUNDERBOLT
     // The Thunderbolt 3 host interface (Alpine Ridge): the control channel to the controller's own connection manager firmware, which the BIOS has to have started. Devices that are
     // connected are listed (and announced on the desktop); none gets a PCIe tunnel, which would give it access to memory, until something approves it. Opt-in (-DTCOS_THUNDERBOLT=ON): none
@@ -1761,6 +1796,15 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
           console::debug_puts(StringView(text.c_str()));
           console::debug_puts("\n");
           desktop.notify(StringView("Display"), StringView(text.c_str()), plug.throttled ? gui::NoticeKind::Warning : gui::NoticeKind::Information);
+        }
+      }
+#endif
+#ifdef TCOS_BLUETOOTH
+      if (bluetooth) {
+        static uint32_t bluetooth_idle = 0;
+        if (++bluetooth_idle >= 25) {                                // (about every 100 ms: events read, controllers plugged in or pulled out noticed)
+          bluetooth_idle = 0;
+          bluetooth->step(true);
         }
       }
 #endif

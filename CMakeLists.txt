@@ -752,6 +752,11 @@ add_executable(BOOTX64
   src/Hardware/Bus/Thunderbolt/ThunderboltIcl.cpp
   src/Hardware/Bus/Thunderbolt/ThunderboltIcm.cpp
   src/Hardware/Bus/Thunderbolt/ThunderboltDriver.cpp
+  src/Hardware/Bluetooth/HciPackets.cpp
+  src/Hardware/Bluetooth/UsbHciTransport.cpp
+  src/Hardware/Bluetooth/HciController.cpp
+  src/Hardware/Bluetooth/IntelBluetooth.cpp
+  src/Hardware/Bluetooth/BluetoothService.cpp
   src/Hardware/WirelessInterface/Intel/IwlDevices.cpp
   src/Hardware/WirelessInterface/Intel/IwlFirmware.cpp
   src/Hardware/WirelessInterface/Intel/IwlPcie.cpp
@@ -1089,6 +1094,10 @@ endif()
 option(TCOS_INTEL_WIFI "Start the Intel Wireless-AC 9000 series card (firmware from /firmware, initialisation, hardware address and channels; no scanning or joining yet; not yet run on a real card)" OFF)
 if(TCOS_INTEL_WIFI)
   target_compile_definitions(BOOTX64 PRIVATE TCOS_INTEL_WIFI)
+endif()
+option(TCOS_BLUETOOTH "Start the Bluetooth controllers on the USB ports (Intel firmware from /firmware/ibt-*.sfi, bring-up, events; nothing is scanned or paired; not yet run on a real controller)" OFF)
+if(TCOS_BLUETOOTH)
+  target_compile_definitions(BOOTX64 PRIVATE TCOS_BLUETOOTH)
 endif()
 option(TCOS_THUNDERBOLT "Start the Thunderbolt 3 host interface (Alpine Ridge: control channel, the controller's firmware, devices reported as they are connected; PCIe tunnels only on request; not yet run on a real controller)" OFF)
 option(TCOS_THUNDERBOLT_START_FIRMWARE "With TCOS_THUNDERBOLT: start the controller's connection manager firmware if the BIOS did not (resets the controller's CPU through the upstream port's vendor registers)" OFF)
