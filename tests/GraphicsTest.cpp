@@ -653,6 +653,42 @@ static void test_scaled(Rig& g, TestAllocator& a) {
   release_view(a, img.pixels);
 }
 
+// draw_image_transformed: a move, a scale and a quarter turn land on the same pixels on both renderers.
+static void test_transformed(Rig& g, TestAllocator& a) {
+  IRenderer2D& r = *g.r;
+  Surface img = make_surface(a, 2, 2);
+  img.row(0)[0] = kRed; img.row(0)[1] = kGreen; img.row(1)[0] = kBlue; img.row(1)[1] = kWhite;
+  Matrix2D move;
+  move.e = 12;
+  move.f = 7;
+  g.reset();
+  CHECK(r.draw_image_transformed(img, {0, 0, 2, 2}, move, ImageFilter::Nearest));
+  g.read();
+  CHECK(g.at(12, 7) == kRed && g.at(13, 7) == kGreen && g.at(12, 8) == kBlue && g.at(13, 8) == kWhite && g.at(11, 7) == kBlack && g.at(14, 8) == kBlack && g.at(12, 9) == kBlack);
+  Matrix2D twice;
+  twice.a = twice.d = 2;
+  twice.e = 20;
+  twice.f = 20;
+  g.reset();
+  CHECK(r.draw_image_transformed(img, {0, 0, 2, 2}, twice, ImageFilter::Nearest));
+  g.read();
+  CHECK(g.at(20, 20) == kRed && g.at(21, 21) == kRed && g.at(22, 20) == kGreen && g.at(20, 22) == kBlue && g.at(23, 23) == kWhite && g.at(24, 20) == kBlack && g.at(19, 20) == kBlack);
+  Matrix2D turn;   // (x, y) -> (-y + 10, x): a quarter turn clockwise
+  turn.a = 0; turn.b = 1; turn.c = -1; turn.d = 0;
+  turn.e = 10;
+  g.reset();
+  CHECK(r.draw_image_transformed(img, {0, 0, 2, 2}, turn, ImageFilter::Nearest));
+  g.read();
+  CHECK(g.at(9, 0) == kRed && g.at(9, 1) == kGreen && g.at(8, 0) == kBlue && g.at(8, 1) == kWhite && g.at(10, 0) == kBlack && g.at(7, 0) == kBlack);
+  Matrix2D flat;   // not invertible: refused, nothing drawn
+  flat.a = 0;
+  g.reset();
+  CHECK(!r.draw_image_transformed(img, {0, 0, 2, 2}, flat, ImageFilter::Bilinear));
+  g.read();
+  CHECK(g.at(0, 0) == kBlack);
+  release_view(a, img.pixels);
+}
+
 static void test_gradients(Rig& g) {
   IRenderer2D& r = *g.r;
   const GradientStop rb[2] = {{0, kRed}, {1, kBlue}};
@@ -1033,6 +1069,7 @@ static void test_primitives() {
     test_rounded(g);
     test_mask(g);
     test_scaled(g, a);
+    test_transformed(g, a);
     test_gradients(g);
     test_clip_stack(g, a);
     test_layers(g);
@@ -1077,6 +1114,7 @@ static void test_primitives() {
     test_rounded(g);
     test_mask(g);
     test_scaled(g, a);
+    test_transformed(g, a);
     test_gradients(g);
     test_clip_stack(g, a);
     test_layers(g);
