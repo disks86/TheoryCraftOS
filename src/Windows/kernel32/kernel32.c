@@ -333,6 +333,19 @@ EXPORT BOOL WINAPI CheckRemoteDebuggerPresent(HANDLE h, LPBOOL present) { if (!h
 EXPORT void WINAPI DebugBreak(void) { __asm__ volatile("int3"); }
 EXPORT void WINAPI OutputDebugStringA(LPCSTR s) { (void)s; }
 EXPORT void WINAPI OutputDebugStringW(LPCWSTR s) { (void)s; }
+IMPORT NTSTATUS NTAPI RtlSetThreadErrorMode(ULONG, ULONG *);
+IMPORT ULONG NTAPI RtlGetThreadErrorMode(void);
+static DWORD thread_error_mode_from_rtl(ULONG rtl) { return ((rtl & 0x10) ? 1u : 0u) | ((rtl & 0x20) ? 2u : 0u) | ((rtl & 0x40) ? 0x8000u : 0u); }
+EXPORT DWORD WINAPI GetThreadErrorMode(void) { return thread_error_mode_from_rtl(RtlGetThreadErrorMode()); }
+EXPORT BOOL WINAPI SetThreadErrorMode(DWORD mode, LPDWORD old) {
+  if (mode & ~(DWORD)(1 | 2 | 0x8000)) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  ULONG previous = 0;
+  const ULONG rtl = ((mode & 1) ? 0x10u : 0u) | ((mode & 2) ? 0x20u : 0u) | ((mode & 0x8000) ? 0x40u : 0u);
+  const NTSTATUS s = RtlSetThreadErrorMode(rtl, &previous);
+  if (!NT_SUCCESS(s)) return fail_nt(s);
+  if (old) *old = thread_error_mode_from_rtl(previous);
+  return TRUE;
+}
 EXPORT UINT WINAPI SetErrorMode(UINT mode) {
   ULONG old = 0;
   NtQueryInformationProcess(NtCurrentProcess(), 12, &old, sizeof(old), NULL);
@@ -1683,14 +1696,13 @@ EXPORT SIZE_T WINAPI VirtualQueryEx(HANDLE process, LPCVOID address, PMEMORY_BAS
 }
 
 EXPORT HANDLE WINAPI OpenThread(DWORD access, BOOL inherit, DWORD id) {
-  (void)access;
   OBJECT_ATTRIBUTES attributes;
   memset(&attributes, 0, sizeof(attributes));
   attributes.Length = sizeof(attributes);
   attributes.Attributes = inherit ? 2 : 0;
   ULONG64 client[2] = {GetCurrentProcessId(), id};
   HANDLE h = NULL;
-  const NTSTATUS status = NtOpenThread(&h, 0x1F03FF, &attributes, client);
+  const NTSTATUS status = NtOpenThread(&h, access, &attributes, client);
   if (!NT_SUCCESS(status)) { fail_nt(status); return NULL; }
   return h;
 }
@@ -1813,9 +1825,96 @@ EXPORT DWORD WINAPI SuspendThread(HANDLE h) {
 }
 EXPORT BOOL WINAPI TerminateThread(HANDLE h, DWORD code) { const NTSTATUS status = NtTerminateThread(h, (NTSTATUS)code); return NT_SUCCESS(status) ? TRUE : fail_nt(status); }
 EXPORT BOOL WINAPI SetThreadPriority(HANDLE h, int priority) {
+  if (!(priority == -15 || priority == 15 || (priority >= -2 && priority <= 2))) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }      /* IDLE, LOWEST..HIGHEST, TIME_CRITICAL */
   LONG value = priority;
   const NTSTATUS status = NtSetInformationThread(h, 3, &value, sizeof(value));      /* ThreadBasePriority */
   return NT_SUCCESS(status) ? TRUE : fail_nt(status);
+}
+
+EXPORT BOOL WINAPI SetProcessAffinityMask(HANDLE h, DWORD_PTR mask);
+typedef struct GroupAffinity { ULONG_PTR Mask; WORD Group; WORD Reserved[3]; } GROUP_AFFINITY;
+typedef ULONG_PTR KAFFINITY, *PULONG_PTR;
+EXPORT BOOL WINAPI GetProcessAffinityMask(HANDLE h, DWORD_PTR *process, DWORD_PTR *system);
+/* Priority boost: whether the system may raise the thread's priority is only remembered (nothing here boosts). */
+static struct { DWORD id; BOOL disabled; } g_boost[64];
+static BOOL g_process_boost_disabled;
+EXPORT BOOL WINAPI SetThreadPriorityBoost(HANDLE h, BOOL disabled) {
+  BYTE info[48];
+  const NTSTATUS status = NtQueryInformationThread(h, 0, info, sizeof(info), NULL);      /* (the handle has to name a thread, and allow querying) */
+  if (!NT_SUCCESS(status)) return fail_nt(status);
+  LONG value = 0;
+  const NTSTATUS set = NtSetInformationThread(h, 3, &value, 0);      /* (only the right to set is checked: a length of 0 changes nothing) */
+  if (set == 0xC0000022u) return fail_nt(set);
+  const DWORD id = GetThreadId(h);
+  int slot = -1;
+  for (int i = 0; i < 64; ++i) if (g_boost[i].id == id) { slot = i; break; }
+  if (slot < 0) for (int i = 0; i < 64; ++i) if (!g_boost[i].id) { slot = i; break; }
+  if (slot < 0) { set_error(ERROR_NOT_ENOUGH_MEMORY); return FALSE; }
+  g_boost[slot].id = id;
+  g_boost[slot].disabled = disabled != 0;
+  return TRUE;
+}
+EXPORT BOOL WINAPI GetThreadPriorityBoost(HANDLE h, PBOOL disabled) {
+  BYTE info[48];
+  const NTSTATUS status = NtQueryInformationThread(h, 0, info, sizeof(info), NULL);
+  if (!NT_SUCCESS(status)) return fail_nt(status);
+  const DWORD id = GetThreadId(h);
+  *disabled = g_process_boost_disabled;
+  for (int i = 0; i < 64; ++i) if (g_boost[i].id == id) *disabled = g_boost[i].disabled;
+  return TRUE;
+}
+EXPORT BOOL WINAPI SetProcessPriorityBoost(HANDLE process, BOOL disabled) {
+  (void)process;
+  g_process_boost_disabled = disabled != 0;
+  for (int i = 0; i < 64; ++i) g_boost[i].id = 0;      /* (every thread follows the process) */
+  return TRUE;
+}
+EXPORT BOOL WINAPI GetProcessPriorityBoost(HANDLE process, PBOOL disabled) { (void)process; *disabled = g_process_boost_disabled; return TRUE; }
+
+/* The limits of the thread's stack, and the part of it kept for handling a stack overflow. */
+EXPORT void WINAPI GetCurrentThreadStackLimits(PULONG_PTR low, PULONG_PTR high) {
+  *low = *(ULONG_PTR *)TEB_BYTE(NtCurrentTeb(), 0x1478);      /* DeallocationStack */
+  *high = *(ULONG_PTR *)TEB_BYTE(NtCurrentTeb(), 0x08);      /* StackBase */
+}
+EXPORT BOOL WINAPI SetThreadStackGuarantee(PULONG size) {
+  ULONG *guarantee = (ULONG *)TEB_BYTE(NtCurrentTeb(), 0x1748);
+  const ULONG old = *guarantee, wanted = *size;
+  const ULONG_PTR stack = *(ULONG_PTR *)TEB_BYTE(NtCurrentTeb(), 0x08) - *(ULONG_PTR *)TEB_BYTE(NtCurrentTeb(), 0x1478);
+  *size = old;
+  if (wanted == 0) return TRUE;
+  if (wanted > stack / 2) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  ULONG rounded = (wanted + 0xFFF) & ~0xFFFu;
+  if (rounded < 8192) rounded = 8192;      /* (at least two pages) */
+  if (rounded > old) *guarantee = rounded;
+  return TRUE;
+}
+
+/* Processor groups: there is one, group 0, and the thread's affinity mask is its mask. */
+EXPORT BOOL WINAPI GetThreadGroupAffinity(HANDLE h, GROUP_AFFINITY *affinity) {
+  if (!affinity) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  BYTE info[48];
+  const NTSTATUS status = NtQueryInformationThread(h, 0, info, sizeof(info), NULL);
+  if (!NT_SUCCESS(status)) return fail_nt(status);
+  memset(affinity, 0, sizeof(*affinity));
+  affinity->Mask = (KAFFINITY)get64(info + 32);
+  affinity->Group = 0;
+  return TRUE;
+}
+EXPORT BOOL WINAPI SetThreadGroupAffinity(HANDLE h, const GROUP_AFFINITY *affinity, GROUP_AFFINITY *previous) {
+  if (!affinity) { set_error(ERROR_NOACCESS); return FALSE; }
+  DWORD_PTR process_mask = 0, system_mask = 0;
+  GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask);
+  if (affinity->Group != 0 || (affinity->Mask & ~system_mask)) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  BYTE info[48];
+  NTSTATUS status = NtQueryInformationThread(h, 0, info, sizeof(info), NULL);
+  if (!NT_SUCCESS(status)) return fail_nt(status);
+  const KAFFINITY old = (KAFFINITY)get64(info + 32);
+  (void)process_mask;
+  GROUP_AFFINITY sent = *affinity;      /* (no mask: the thread follows the process's again) */
+  status = NtSetInformationThread(h, 30, &sent, 16);      /* ThreadGroupInformation */
+  if (!NT_SUCCESS(status)) return fail_nt(status);
+  if (previous) { memset(previous, 0, sizeof(*previous)); previous->Mask = old; }
+  return TRUE;
 }
 EXPORT int WINAPI GetThreadPriority(HANDLE h) {
   BYTE info[48];
@@ -1824,6 +1923,7 @@ EXPORT int WINAPI GetThreadPriority(HANDLE h) {
   return (LONG)get32(info + 44);      /* BasePriority */
 }
 EXPORT DWORD_PTR WINAPI SetThreadAffinityMask(HANDLE h, DWORD_PTR mask) {
+  if (mask == 0) { set_error(ERROR_INVALID_PARAMETER); return 0; }
   BYTE info[48];
   NTSTATUS status = NtQueryInformationThread(h, 0, info, sizeof(info), NULL);
   if (!NT_SUCCESS(status)) { fail_nt(status); return 0; }

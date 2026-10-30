@@ -272,6 +272,9 @@ class Process {
     uint32_t apc_count = 0;
     uint64_t start_address = 0;                       // where the thread began (the start routine), 0 if not known
     int32_t priority = 0;                             // THREAD_PRIORITY_NORMAL; kept for the program to read back
+    static constexpr uint32_t kMaxDescriptionChars = 255;
+    uint16_t description[kMaxDescriptionChars] = {};  // SetThreadDescription
+    uint32_t description_bytes = 0;
     uint64_t teb = 0, region_base = 0, region_size = 0;      // the thread's TEB and the one region that holds its stack, TEB and TLS block
   };
   // What the program can set and read back about itself.

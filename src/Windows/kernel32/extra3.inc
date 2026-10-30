@@ -368,40 +368,35 @@ EXPORT ATOM WINAPI GlobalFindAtomA(LPCSTR name) { ATOM_FROM_A(atom_find(w_, TRUE
 
 /* ---- thread descriptions, memory of the process itself, processors, versions ------------------------------------------------------------------------------------- */
 
-#define DESC_SLOTS 64
-static struct { DWORD thread; WCHAR *text; } g_descriptions[DESC_SLOTS];
+/* A thread's description is kept by the system (ThreadNameInformation): a UNICODE_STRING and the characters after it. */
 EXPORT HRESULT WINAPI SetThreadDescription(HANDLE thread, LPCWSTR description) {
-  if (!description) return (HRESULT)0x80070057;
-  DWORD id = GetThreadId(thread);
-  if (id == 0) return (HRESULT)0x80070006;
-  const size_t_ len = wcslen(description);
-  WCHAR *copy = RtlAllocateHeap(heap(), 0, (len + 1) * 2);
-  if (!copy) return (HRESULT)0x8007000E;
-  memcpy(copy, description, (len + 1) * 2);
-  atom_lock();      /* (any lock will do; this one is there) */
-  int slot = -1;
-  for (int i = 0; i < DESC_SLOTS; ++i) if (g_descriptions[i].text && g_descriptions[i].thread == id) { slot = i; break; }
-  if (slot < 0) for (int i = 0; i < DESC_SLOTS; ++i) if (!g_descriptions[i].text) { slot = i; break; }
-  HRESULT hr = 0;
-  if (slot < 0) { RtlFreeHeap(heap(), 0, copy); hr = (HRESULT)0x8007000E; }
-  else { if (g_descriptions[slot].text) RtlFreeHeap(heap(), 0, g_descriptions[slot].text); g_descriptions[slot].text = copy; g_descriptions[slot].thread = id; }
-  LeaveCriticalSection(&g_atom_lock);
-  return hr;
+  struct { USHORT length, maximum; ULONG pad; PWSTR buffer; } name;
+  const SIZE_T n = description ? wcslen(description) : 0;
+  if (n > 255) return (HRESULT)0x80070057;
+  name.length = name.maximum = (USHORT)(n * 2);
+  name.pad = 0;
+  name.buffer = (PWSTR)description;
+  const NTSTATUS s = NtSetInformationThread(thread, 38, &name, sizeof(name));
+  if (s == 0) return (HRESULT)0x10000000;      /* HRESULT_FROM_NT(STATUS_SUCCESS) */
+  return s == STATUS_INVALID_HANDLE ? (HRESULT)0x80070006 : (HRESULT)((ULONG)s | 0x10000000u);
 }
 EXPORT HRESULT WINAPI GetThreadDescription(HANDLE thread, WCHAR **description) {
-  if (!description) return (HRESULT)0x80070057;
-  DWORD id = GetThreadId(thread);
-  if (id == 0) return (HRESULT)0x80070006;
-  atom_lock();
-  const WCHAR *found = NULL;
-  for (int i = 0; i < DESC_SLOTS; ++i) if (g_descriptions[i].text && g_descriptions[i].thread == id) { found = g_descriptions[i].text; break; }
-  const size_t_ len = found ? wcslen(found) : 0;
-  WCHAR *copy = LocalAlloc(0, (len + 1) * 2);      /* the caller frees it with LocalFree */
-  if (copy) { if (found) memcpy(copy, found, (len + 1) * 2); else copy[0] = 0; }
-  LeaveCriticalSection(&g_atom_lock);
-  if (!copy) return (HRESULT)0x8007000E;
-  *description = copy;
-  return 0;
+  BYTE small[16];
+  ULONG needed = 0;
+  NTSTATUS s = NtQueryInformationThread(thread, 38, small, 0, &needed);
+  if (s != (NTSTATUS)0xC0000023 && s != 0) return s == STATUS_INVALID_HANDLE ? (HRESULT)0x80070006 : (HRESULT)((ULONG)s | 0x10000000u);
+  BYTE *buffer = RtlAllocateHeap(heap(), 0, needed + 2);
+  if (!buffer) return (HRESULT)0x8007000E;
+  s = NtQueryInformationThread(thread, 38, buffer, needed, &needed);
+  if (s != 0) { RtlFreeHeap(heap(), 0, buffer); return (HRESULT)((ULONG)s | 0x10000000u); }
+  const USHORT bytes = *(USHORT *)buffer;
+  WCHAR *text = LocalAlloc(0, (SIZE_T)bytes + 2);
+  if (!text) { RtlFreeHeap(heap(), 0, buffer); return (HRESULT)0x8007000E; }
+  memcpy(text, buffer + 16, bytes);
+  text[bytes / 2] = 0;
+  RtlFreeHeap(heap(), 0, buffer);
+  *description = text;
+  return (HRESULT)0x10000000;
 }
 
 EXPORT BOOL WINAPI ReadProcessMemory(HANDLE process, LPCVOID base, LPVOID buffer, SIZE_T size, SIZE_T *done) {
@@ -432,11 +427,63 @@ EXPORT BOOL WINAPI WriteProcessMemory(HANDLE process, LPVOID base, LPCVOID buffe
   if (done) *done = got;
   return NT_SUCCESS(status) && status != (NTSTATUS)0x8000000D ? TRUE : fail_nt(status);
 }
+/* Attribute lists: a header and room for as many entries as were asked for; an entry names an attribute and points to the caller's value. */
+typedef struct ProcThreadAttributeEntry { DWORD_PTR attribute; SIZE_T size; PVOID value; } ProcThreadAttributeEntry;
+typedef struct ProcThreadAttributeList { DWORD flags; DWORD capacity; DWORD count; DWORD reserved; PVOID unknown; ProcThreadAttributeEntry entries[1]; } ProcThreadAttributeList;
+EXPORT BOOL WINAPI InitializeProcThreadAttributeList(ProcThreadAttributeList *list, DWORD count, DWORD flags, PSIZE_T size) {
+  if (flags || count == 0 || count > 27) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  const SIZE_T needed = 32 + (SIZE_T)count * sizeof(ProcThreadAttributeEntry);
+  if (!list || *size < needed) { *size = needed; set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+  memset(list, 0, needed);
+  list->capacity = count;
+  *size = needed;
+  return TRUE;
+}
+EXPORT void WINAPI DeleteProcThreadAttributeList(ProcThreadAttributeList *list) { if (list) list->count = 0; }
+EXPORT BOOL WINAPI UpdateProcThreadAttribute(ProcThreadAttributeList *list, DWORD flags, DWORD_PTR attribute, PVOID value, SIZE_T size, PVOID previous, PSIZE_T returned) {
+  (void)previous; (void)returned;
+  if (flags & ~1u || !list || !value) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  for (DWORD i = 0; i < list->count; ++i) if (list->entries[i].attribute == attribute) { set_error(5010); return FALSE; }
+  if (list->count >= list->capacity) { set_error(31); return FALSE; }
+  list->entries[list->count].attribute = attribute;
+  list->entries[list->count].size = size;
+  list->entries[list->count].value = value;
+  list->count++;
+  return TRUE;
+}
 EXPORT HANDLE WINAPI CreateRemoteThreadEx(HANDLE process, LPSECURITY_ATTRIBUTES sa, SIZE_T stack, LPTHREAD_START_ROUTINE start, LPVOID parameter, DWORD flags, LPVOID attributes, LPDWORD id) {
-  (void)sa; (void)attributes;
+  (void)sa;
+  const GROUP_AFFINITY *affinity = NULL;
+  if (attributes) {      /* the group affinity attribute (group affinity | thread | input) says where the thread may run */
+    const ProcThreadAttributeList *list = attributes;
+    for (DWORD i = 0; i < list->count && i < list->capacity; ++i)
+      if (list->entries[i].attribute == 0x30003 && list->entries[i].size >= sizeof(GROUP_AFFINITY)) affinity = list->entries[i].value;
+  }
+  DWORD_PTR process_mask = 0, system_mask = 0;
+  GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask);
+  if (affinity && (affinity->Group != 0 || (affinity->Mask & ~system_mask))) { set_error(ERROR_INVALID_PARAMETER); return NULL; }
   HANDLE thread = NULL;
-  const NTSTATUS status = NtCreateThreadEx(&thread, 0x1FFFFF, NULL, process, (PVOID)start, parameter, (flags & CREATE_SUSPENDED) ? 1 : 0, 0, stack, stack, NULL);
-  if (!NT_SUCCESS(status)) { set_error(status == STATUS_NOT_IMPLEMENTED ? ERROR_NOT_SUPPORTED : RtlNtStatusToDosError(status)); return NULL; }
+  const BOOL start_suspended = (flags & CREATE_SUSPENDED) != 0;
+  PVOID active = NULL;
+  if (process == NtCurrentProcess()) {      /* a thread of this program starts with the activation context that is active here */
+    RtlGetActiveActivationContext(&active);
+    if (active) {
+      ActThreadStart *a = RtlAllocateHeap(heap(), 0, sizeof(*a));
+      if (a) { a->start = start; a->parameter = parameter; a->context = active; start = actctx_thread_start; parameter = a; }
+      else { RtlReleaseActivationContext(active); active = NULL; }
+    }
+  }
+  const NTSTATUS status = NtCreateThreadEx(&thread, 0x1FFFFF, NULL, process, (PVOID)start, parameter, (start_suspended || affinity) ? 1 : 0, 0, stack, stack, NULL);
+  if (!NT_SUCCESS(status)) {
+    if (active) { RtlReleaseActivationContext(active); RtlFreeHeap(heap(), 0, parameter); }
+    set_error(status == STATUS_NOT_IMPLEMENTED ? ERROR_NOT_SUPPORTED : RtlNtStatusToDosError(status));
+    return NULL;
+  }
+  if (affinity) {
+    ULONGLONG mask = affinity->Mask ? affinity->Mask : process_mask;
+    NtSetInformationThread(thread, 4, &mask, sizeof(mask));
+    if (!start_suspended) ResumeThread(thread);
+  }
   if (id) {
     ULONG64 info[6];
     *id = NT_SUCCESS(NtQueryInformationThread(thread, 0, info, sizeof(info), NULL)) ? (DWORD)info[3] : 0;

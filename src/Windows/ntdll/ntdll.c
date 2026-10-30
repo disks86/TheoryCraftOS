@@ -569,7 +569,14 @@ EXPORT void NTAPI RtlExitUserThread(NTSTATUS status) {
 }
 
 /* New threads begin here (the kernel passes the thread's function and parameter in the first two argument registers); the function's return value is the thread's exit code. */
+/* Threads start with the floating point state Windows gives them: 53 bit precision, every exception masked, round to nearest. */
+static void reset_floating_point(void) {
+  static const unsigned short cw = 0x27f;
+  static const unsigned mxcsr = 0x1f80;
+  __asm__ volatile("fldcw %0; ldmxcsr %1" : : "m"(cw), "m"(mxcsr));
+}
 EXPORT void NTAPI TcosThreadStart(LPTHREAD_START_ROUTINE start, PVOID parameter) {
+  reset_floating_point();
   if (!TEB_TLS_POINTER(NtCurrentTeb())) TEB_TLS_POINTER(NtCurrentTeb()) = *(PVOID **)((BYTE *)NtCurrentTeb() + 0x1788);      /* (the kernel left the thread-local array where it could not be seen) */
   fls_thread_begins();
   notify_all_modules(DLL_THREAD_ATTACH, NULL, 1);
@@ -1139,6 +1146,7 @@ EXPORT void NTAPI RtlUserThreadStart(ProgramEntry entry, PVOID parameter) {
   PEB *peb = NtCurrentPeb();
   PEB_LDR_DATA *ldr = peb->Ldr;
   process_heap();
+  reset_floating_point();
   fls_thread_begins();
   act_init_process();
   if (ldr) {

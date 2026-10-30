@@ -35,6 +35,12 @@ constexpr uint32_t kCreateSuspended = 1;
 constexpr uint32_t kStillActive = 259;
 
 // The thread a handle names: the pseudo handle of the calling thread, or a thread descriptor. Null if it is neither.
+// A handle made with fewer rights than a thread has (OpenThread with an access mask) lacks the rights in its `denied` set; the current-thread pseudo handle has them all.
+bool thread_handle_lacks(Process& p, uint64_t handle, uint32_t rights) {
+  if (handle == kCurrentThread || handle == 0 || handle % 4 != 0 || handle / 4 > Process::kMaxDescriptors) return false;
+  return (p.files().denied_access(handle / 4 - 1) & rights) == rights;
+}
+
 Process::ThreadRecord* thread_of(Process& p, uint64_t handle) {
   if (handle == kCurrentThread || handle == 0) return p.runtime() ? p.find_thread(p.runtime()->current_thread_id()) : p.find_thread(p.id());
   if (handle % 4 != 0 || handle / 4 > Process::kMaxDescriptors) return nullptr;
@@ -274,6 +280,7 @@ void end_thread(Process& p, Process::ThreadRecord& record, uint32_t code) {
 
 // NtTerminateThread(HANDLE Thread, NTSTATUS ExitStatus): the calling thread ends at once; another one is told to end (it does at its next system call or timer tick).
 uint32_t nt_terminate_thread(Process& p, const SyscallRequest& r) {
+  if (thread_handle_lacks(p, r.args[0], 0x1)) return 0xC0000022u;
   uint64_t remote_id = 0;
   if (remote_thread_handle(p, r.args[0], &remote_id)) {
     IProcessRuntime::RemoteOp op;
@@ -317,6 +324,7 @@ uint32_t terminate_other_threads(Process& p, uint32_t code) {
 
 // NtSuspendThread(HANDLE Thread, PULONG PreviousSuspendCount)
 uint32_t nt_suspend_thread(Process& p, const SyscallRequest& r) {
+  if (thread_handle_lacks(p, r.args[0], 0x2)) return 0xC0000022u;
   {      // a thread of another program: one made by CreateRemoteThread, or the main thread whose handle CreateProcess gave out
     uint64_t remote_id = 0, pid = 0;
     bool exited = false;
@@ -347,6 +355,7 @@ uint32_t nt_suspend_thread(Process& p, const SyscallRequest& r) {
 
 // NtResumeThread(HANDLE Thread, PULONG PreviousSuspendCount)
 uint32_t nt_resume_thread(Process& p, const SyscallRequest& r) {
+  if (thread_handle_lacks(p, r.args[0], 0x2)) return 0xC0000022u;
   uint64_t remote_id = 0;
   if (remote_thread_handle(p, r.args[0], &remote_id)) {
     IProcessRuntime::RemoteOp op;
@@ -484,6 +493,15 @@ uint32_t nt_open_thread(Process& p, const SyscallRequest& r) {
   uint8_t attributes[4] = {};
   if (r.args[2] != 0) p.read_user(r.args[2] + 24, ByteView(attributes, 4));
   p.files().set_handle_flags(uint64_t(slot), (attributes[0] & 2) != 0, false);
+  {      // the rights asked for (generic ones mapped); the others are denied to the handle
+    uint32_t want = uint32_t(r.args[1]);
+    if (want & 0x80000000u) want |= 0x20000 | 0x40 | 0x800;      // GENERIC_READ: READ_CONTROL, query information
+    if (want & 0x40000000u) want |= 0x20000 | 0x20 | 0x2 | 0x1 | 0x4 | 0x10 | 0x400;      // GENERIC_WRITE
+    if (want & 0x20000000u) want |= 0x20000 | 0x100000 | 0x800 | 0x2;      // GENERIC_EXECUTE
+    if (want & 0x10000000u) want |= 0x1FFFFF;      // GENERIC_ALL
+    if (want & 0x2000000u) want = 0x1FFFFF;      // MAXIMUM_ALLOWED
+    p.files().set_denied_access(uint64_t(slot), ~want & 0x1FFFFFu);
+  }
   if (!p.write_user_u64(r.args[0], (uint64_t(slot) + 1) * 4)) { p.files().close(uint64_t(slot)); return kAccessViolation; }
   return kSuccess;
 }
@@ -509,9 +527,25 @@ uint32_t nt_query_information_thread(Process& p, const SyscallRequest& r) {
     if (returned != 0 && !p.write_user_u32(returned, 48)) return kAccessViolation;
     return p.write_user(r.args[2], ConstByteView(info, 48)) ? kSuccess : kAccessViolation;
   }
+  {      // THREAD_QUERY_INFORMATION, or for the few classes of limited information THREAD_QUERY_LIMITED_INFORMATION will do
+    const uint32_t wanted_class = uint32_t(r.args[1]);
+    const bool limited_ok = wanted_class == 0 || wanted_class == 1 || wanted_class == 12 || wanted_class == 14 || wanted_class == 38;
+    if (thread_handle_lacks(p, r.args[0], limited_ok ? (0x40 | 0x800) : 0x40)) return 0xC0000022u;
+  }
   Process::ThreadRecord* record = thread_of(p, r.args[0]);
   if (!record) return kInvalidHandle;
   const uint32_t info_class = uint32_t(r.args[1]), length = uint32_t(r.args[3]);
+  if (info_class == 38) {      // ThreadNameInformation: a UNICODE_STRING that points into the buffer, right after itself, and the characters
+    const uint32_t needed = 16 + record->description_bytes;
+    if (returned != 0 && !p.write_user_u32(returned, needed)) return kAccessViolation;
+    if (length < needed) return 0xC0000023u;      // STATUS_BUFFER_TOO_SMALL
+    uint8_t head[16] = {};
+    for (uint32_t i = 0; i < 2; ++i) { head[i] = uint8_t(record->description_bytes >> (8 * i)); head[2 + i] = uint8_t(record->description_bytes >> (8 * i)); }
+    for (uint32_t i = 0; i < 8; ++i) head[8 + i] = uint8_t((r.args[2] + 16) >> (8 * i));
+    if (!p.write_user(r.args[2], ConstByteView(head, 16))) return kAccessViolation;
+    if (record->description_bytes != 0 && !p.write_user(r.args[2] + 16, ConstByteView(reinterpret_cast<const uint8_t*>(record->description), record->description_bytes))) return kAccessViolation;
+    return kSuccess;
+  }
   uint8_t out[48] = {};
   auto put = [&](uint32_t at, uint64_t v, uint32_t size) { for (uint32_t i = 0; i < size; ++i) out[at + i] = uint8_t(v >> (8 * i)); };
   uint32_t size = 0;
@@ -548,12 +582,28 @@ uint32_t nt_query_information_thread(Process& p, const SyscallRequest& r) {
 // NtSetInformationThread(Thread, Class, Buffer, Length): priority (2, 3: the value is kept for the program to read back), affinity (4), ideal processor (13, which
 // only has to name a core that exists), and hiding from a debugger (17: nothing to hide from).
 uint32_t nt_set_information_thread(Process& p, const SyscallRequest& r) {
+  if (thread_handle_lacks(p, r.args[0], uint32_t(r.args[1]) == 38 ? (0x20 | 0x400) : 0x20)) return 0xC0000022u;      // THREAD_SET_INFORMATION (THREAD_SET_LIMITED_INFORMATION is enough to name a thread)
   uint64_t remote_id = 0;
   if (remote_thread_handle(p, r.args[0], &remote_id)) return kSuccess;      // (the scheduling of another program's thread is that program's own: accepted, not applied)
   Process::ThreadRecord* record = thread_of(p, r.args[0]);
   if (!record) return kInvalidHandle;
   const uint32_t info_class = uint32_t(r.args[1]), length = uint32_t(r.args[3]);
-  uint8_t in[8] = {};
+  uint8_t in[16] = {};
+  if (info_class == 38) {      // ThreadNameInformation: the name is what the UNICODE_STRING in the buffer points to
+    if (length != 16) return kInfoLengthMismatch;
+    uint8_t head[16];
+    if (r.args[2] == 0 || !p.read_user(r.args[2], ByteView(head, 16))) return kAccessViolation;
+    uint32_t bytes = uint32_t(head[0]) | uint32_t(head[1]) << 8;
+    uint64_t at = 0;
+    for (uint32_t i = 0; i < 8; ++i) at |= uint64_t{head[8 + i]} << (8 * i);
+    bytes &= ~1u;
+    if (bytes > Process::ThreadRecord::kMaxDescriptionChars * 2) return kInvalidParameter;
+    uint16_t text[Process::ThreadRecord::kMaxDescriptionChars] = {};
+    if (bytes != 0 && (at == 0 || !p.read_user(at, ByteView(reinterpret_cast<uint8_t*>(text), bytes)))) return kAccessViolation;
+    for (uint32_t i = 0; i < Process::ThreadRecord::kMaxDescriptionChars; ++i) record->description[i] = text[i];
+    record->description_bytes = bytes;
+    return kSuccess;
+  }
   auto need = [&](uint32_t bytes) -> uint32_t {
     if (length != bytes) return kInfoLengthMismatch;
     return p.read_user(r.args[2], ByteView(in, bytes)) ? kSuccess : kAccessViolation;
@@ -574,13 +624,23 @@ uint32_t nt_set_information_thread(Process& p, const SyscallRequest& r) {
       if (status != kSuccess) return status;
       uint64_t mask = 0;
       for (uint32_t i = 0; i < 8; ++i) mask |= uint64_t{in[i]} << (8 * i);
+      if (mask == ~uint64_t{0}) mask = 0;      // "all processors": the thread follows the process's mask
       return p.runtime() && p.runtime()->set_affinity(record->id, mask) ? kSuccess : kInvalidParameter;
     }
     case 13: {     // ThreadIdealProcessor
       const uint32_t status = need(4);
       if (status != kSuccess) return status;
       const uint32_t core = in[0] | (uint32_t{in[1]} << 8) | (uint32_t{in[2]} << 16) | (uint32_t{in[3]} << 24);
-      return p.runtime() && core < p.runtime()->processor_count() ? kSuccess : kInvalidParameter;
+      return p.runtime() && (core < p.runtime()->processor_count() || core == 64) ? kSuccess : kInvalidParameter;      // (64, MAXIMUM_PROCESSORS: no ideal processor)
+    }
+    case 30: {     // ThreadGroupInformation: a GROUP_AFFINITY
+      const uint32_t status = need(16);
+      if (status != kSuccess) return status;
+      uint64_t mask = 0;
+      for (uint32_t i = 0; i < 8; ++i) mask |= uint64_t{in[i]} << (8 * i);
+      if (in[8] != 0 || in[9] != 0) return kInvalidParameter;
+      if (p.runtime() && (mask & ~p.runtime()->affinity(0))) p.runtime()->set_affinity(~uint64_t{0}, ~uint64_t{0});      // (a mask the process was not allowed: the process's own goes back to every processor)
+      return p.runtime() && p.runtime()->set_affinity(record->id, mask) ? kSuccess : kInvalidParameter;
     }
     case 17: return length == 0 ? kSuccess : kInfoLengthMismatch;
     default: return kInvalidInfoClass;
