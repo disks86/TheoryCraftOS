@@ -497,6 +497,55 @@ bool Usb4Domain::plug_events_active(const Usb4Router& r) {
   return write(r.route, 0, TbConfigSpace::Switch, r.cap_plug_events + 1, ArrayView<const uint32_t>(&events, 1));
 }
 
+// The link controller block of a lane adapter's physical port (find_port_lc_cap).
+bool Usb4Domain::lc_port_block(const Usb4Router& r, uint32_t port, uint32_t* cap) {
+  if (r.cap_lc == 0) return false;
+  uint32_t desc = 0;
+  if (!read(r.route, 0, TbConfigSpace::Switch, r.cap_lc + kLcDesc, ArrayView<uint32_t>(&desc, 1))) return false;
+  *cap = r.cap_lc + ((desc >> 8) & 0xFF) + ((port - 1) / 2) * ((desc >> 16) & 0xFFF);
+  return *cap + kLcLinkReq < 0x1F00;
+}
+
+// tb_switch_pcie_bridge_write: a write to one of the router's PCIe bridges through the plug events capability, acknowledged within 100 ms.
+bool Usb4Domain::pcie_bridge_write(const Usb4Router& r, uint32_t bridge, uint32_t offset, uint32_t value) {
+  if (r.cap_plug_events == 0) return false;
+  if (!write(r.route, 0, TbConfigSpace::Switch, r.cap_plug_events + kPlugEventsPcieWrData, ArrayView<const uint32_t>(&value, 1))) return false;
+  const uint32_t command = (offset & 0x3FF) | (1u << (bridge + kPcieCmdBridgeShift)) | kPcieCmdWrite | kPcieCmdValue | kPcieCmdReqAck;
+  if (!write(r.route, 0, TbConfigSpace::Switch, r.cap_plug_events + kPlugEventsPcieCmd, ArrayView<const uint32_t>(&command, 1))) return false;
+  for (uint32_t waited = 0; waited < 100000; waited += 1000) {
+    uint32_t word = 0;
+    if (!read(r.route, 0, TbConfigSpace::Switch, r.cap_plug_events + kPlugEventsPcieCmd, ArrayView<uint32_t>(&word, 1))) return false;
+    if (!(word & kPcieCmdReqAck)) return !(word & kPcieCmdTimeout);
+    delay_us(1000);
+  }
+  return false;
+}
+
+// What Linux does for a Thunderbolt 3 router once its PCIe tunnel is up: a Titan Ridge one directly below the host gets the PCIe L1 setting of its two bridges, and the xHCI of the router is
+// connected to the link controller of ports 1 and 3 (Titan Ridge: both; Alpine Ridge: those with a USB device plugged in). A failure is not an error of the tunnel.
+void Usb4Domain::tbt3_after_pcie(const Usb4Router& host, const Usb4Router& device) {
+  if (!device.tbt3 || device.vendor_id != 0x8086) return;
+  const bool titan = device.device_id == 0x15E7 || device.device_id == 0x15EA || device.device_id == 0x15EF;
+  const bool alpine = device.device_id == 0x1576 || device.device_id == 0x1578 || device.device_id == 0x15C0 || device.device_id == 0x15D3 || device.device_id == 0x15DA;
+  if (titan && host.parent < 0) {
+    if (pcie_bridge_write(device, 5, 0x143, 0x0C7806B1u)) pcie_bridge_write(device, 0, 0x143, 0x0C5806B1u);
+  }
+  if (!titan && !alpine) return;
+  const uint32_t ports[2] = {1, 3};
+  for (uint32_t port : ports) {
+    if (port > device.max_port) continue;
+    uint32_t cap = 0, word = 0;
+    if (!lc_port_block(device, port, &cap)) continue;
+    if (alpine) {
+      uint32_t status = 0;
+      if (!read(device.route, 0, TbConfigSpace::Switch, cap + kLcCs42, ArrayView<uint32_t>(&status, 1)) || !(status & kLcCs42UsbPlugged)) continue;
+    }
+    if (!read(device.route, 0, TbConfigSpace::Switch, cap + kLcLinkReq, ArrayView<uint32_t>(&word, 1)) || (word & kLcLinkReqXhciConnect)) continue;
+    word |= kLcLinkReqXhciConnect;
+    write(device.route, 0, TbConfigSpace::Switch, cap + kLcLinkReq, ArrayView<const uint32_t>(&word, 1));
+  }
+}
+
 // tb_lc_set_wake and tb_lc_set_sleep: in each link controller's block, the wake bits (all of them for a runtime sleep: connect and disconnect, USB4, PCIe, DisplayPort; none for a system sleep, and
 // none at all for the host router) and then the sleep bit.
 bool Usb4Domain::lc_sleep(const Usb4Router& r, bool runtime) {
@@ -1292,8 +1341,12 @@ bool Usb4Domain::make_tunnel(uint32_t router_index, Usb4TunnelKind kind, const c
     if (!set_adapter_enable(host, static_cast<uint32_t>(down), kind, true) || !set_adapter_enable(device, static_cast<uint32_t>(up), kind, true)) return fail("the adapters could not be enabled");
   }
   t.active = true;
-  if (pcie) device.pcie_tunnel = true;
-  else device.usb3_tunnel = true;
+  if (pcie) {
+    device.pcie_tunnel = true;
+    tbt3_after_pcie(host, device);
+  } else {
+    device.usb3_tunnel = true;
+  }
   return true;
 }
 

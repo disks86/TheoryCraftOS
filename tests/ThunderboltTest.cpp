@@ -3672,6 +3672,58 @@ static void test_usb4_clx() {
   }
 }
 
+static void test_usb4_tbt3_extras() {
+  auto rig_with = [](Usb4Rig& rig, uint32_t device_id, uint64_t route = 0x03, uint64_t parent = 0, uint32_t port = 3) {
+    rig.fabric.add(route, 2, 0, true);
+    rig.fabric.make_tbt3(route, device_id);
+    rig.fabric.link(parent, port, route);
+  };
+  {   // a Titan Ridge dock directly below the host: the PCIe L1 setting of its two bridges, the xHCI connected on ports 1 and 3
+    Usb4Rig rig(false);
+    rig_with(rig, 0x15EA);
+    Usb4Domain domain(rig.control, rig.nhi, rig.alloc);
+    const char* error = nullptr;
+    CHECK(domain.start(nullptr) && rig.fabric.pcie_writes.empty());
+    CHECK(domain.approve_pcie(2, &error) && rig.fabric.pcie_writes.size() == 2);
+    CHECK(rig.fabric.pcie_writes[0].offset == 0x143 && (rig.fabric.pcie_writes[0].bridge_mask & (1u << 5)) && rig.fabric.pcie_writes[0].value == 0x0C7806B1u);
+    CHECK((rig.fabric.pcie_writes[1].bridge_mask & 1u) && rig.fabric.pcie_writes[1].value == 0x0C5806B1u);
+    fake_usb4::Router& fr = rig.fabric.at(0x03);
+    CHECK((fr.regs[0x34 + kLcLinkReq] & kLcLinkReqXhciConnect) && (fr.regs[0x38 + kLcLinkReq] & kLcLinkReqXhciConnect));
+  }
+  {   // a bridge that does not acknowledge: the first write is the last
+    Usb4Rig rig(false);
+    rig_with(rig, 0x15EA);
+    rig.fabric.pcie_writes_time_out = true;
+    Usb4Domain domain(rig.control, rig.nhi, rig.alloc);
+    const char* error = nullptr;
+    CHECK(domain.start(nullptr) && domain.approve_pcie(2, &error) && domain.pcie_tunnelled(2) && rig.fabric.pcie_writes.size() == 1);
+  }
+  {   // an Alpine Ridge dock: only the ports with a USB device plugged in
+    Usb4Rig rig(false);
+    rig_with(rig, 0x1578);
+    rig.fabric.at(0x03).regs[0x38 + kLcCs42] = kLcCs42UsbPlugged;                              // (port 3: physical port 1)
+    Usb4Domain domain(rig.control, rig.nhi, rig.alloc);
+    const char* error = nullptr;
+    CHECK(domain.start(nullptr) && domain.approve_pcie(2, &error) && rig.fabric.pcie_writes.empty());
+    fake_usb4::Router& fr = rig.fabric.at(0x03);
+    CHECK(!(fr.regs[0x34 + kLcLinkReq] & kLcLinkReqXhciConnect) && (fr.regs[0x38 + kLcLinkReq] & kLcLinkReqXhciConnect));
+  }
+  {   // a Titan Ridge dock not directly below the host: no L1 setting, the xHCI still connected; an unknown one: nothing
+    Usb4Rig rig(false);
+    rig.fabric.add(0x301, 2, 0, true);
+    rig.fabric.make_tbt3(0x301, 0x15EA);
+    rig.fabric.link(0x01, 3, 0x301);
+    Usb4Domain domain(rig.control, rig.nhi, rig.alloc);
+    const char* error = nullptr;
+    CHECK(domain.start(nullptr) && domain.present_count() == 3 && domain.approve_pcie(1, &error) && domain.approve_pcie(2, &error) && rig.fabric.pcie_writes.empty());
+    CHECK(rig.fabric.at(0x301).regs[0x34 + kLcLinkReq] & kLcLinkReqXhciConnect);
+    Usb4Rig other(false);
+    rig_with(other, 0x1234);
+    Usb4Domain d(other.control, other.nhi, other.alloc);
+    CHECK(d.start(nullptr) && d.approve_pcie(2, &error) && other.fabric.pcie_writes.empty() && !(other.fabric.at(0x03).regs[0x34 + kLcLinkReq] & kLcLinkReqXhciConnect));
+  }
+}
+
 static void test_usb4_garbage() {
   // the routers answer with noise: the manager must stay inside its arrays, whatever comes (and the sanitizers say if it does not)
   for (uint32_t seed = 1; seed <= 200; ++seed) {
@@ -3727,6 +3779,7 @@ int main() {
   test_usb4_dp();
   test_usb4_asymmetric();
   test_usb4_clx();
+  test_usb4_tbt3_extras();
   test_usb4_runtime_sleep();
   test_usb4_xdomain_failures();
   test_usb4_driver();

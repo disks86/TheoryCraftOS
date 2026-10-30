@@ -50,6 +50,7 @@ struct Router {
   std::vector<Port> ports;           // index 0 is the control adapter
   uint32_t cs5_writes = 0, post_times = 0;
   std::vector<uint32_t> buffer_alloc;  // BUFFER_ALLOC entries (index | value << 16); none: the operation is not supported
+  uint32_t cap_plug_events_model = 0;  // where the plug events capability is (a Thunderbolt 3 router)
   std::vector<uint8_t> drom;         // what DROM_READ gives (none: the operation is not supported)
   uint32_t drom_status = 0;          // the status the operation ends with
   uint32_t drom_reads = 0;
@@ -101,6 +102,7 @@ class Fabric {
     r.version = 0;
     r.device = device_id;
     r.first_cap = 0x28;
+    r.cap_plug_events_model = 0x28;
     r.regs[0x28] = 0x30 | (kSwitchCapVse << 8) | (kVsecPlugEvents << 16) | (0x10u << 24);
     r.regs[0x30] = (kSwitchCapVse << 8) | (kVsecLinkController << 16);
     r.regs[0x31] = 0;                                                                    // next: none, length: left zero
@@ -147,6 +149,9 @@ class Fabric {
   }
   bool tmu_ucap = true;                                          // new routers support the uni-directional TMU mode
   bool refuse_sleep = false;                                     // ROUTER_CS_6.SLPR never comes up
+  struct PcieWrite { uint32_t bridge_mask, offset, value; };
+  std::vector<PcieWrite> pcie_writes;                            // the writes made to the PCIe bridges of Thunderbolt 3 routers
+  bool pcie_writes_time_out = false;
   bool gen4_links = false;                                       // every link runs at generation 4 and reports asymmetric widths as asked
   bool asym_stuck = false;                                       // the transition never completes
   bool dp_handshake_never_done = false;                         // CMHS stays set
@@ -274,6 +279,10 @@ class Fabric {
     if (i == 1) r.regs[1] = (r.regs[1] & ~0x00700000u) | (v & 0x00700000u) , r.upstream = (v >> 8) & 0x3F;
     else if (i == 4) r.regs[4] = v & 0x00FFFFFFu;
     else if (i == 0x20) r.regs[i] = (r.regs[i] & 0x4000FFFFu) | (v & ~0x4000FFFFu);              // the capability header and UCAP are read only
+    else if (r.cap_plug_events_model != 0 && i == r.cap_plug_events_model + kPlugEventsPcieCmd) {                  // a write to a PCIe bridge through the plug events capability
+      pcie_writes.push_back({(v >> kPcieCmdBridgeShift) & 0xFF, v & 0x3FF, r.regs[r.cap_plug_events_model + kPlugEventsPcieWrData]});
+      r.regs[i] = pcie_writes_time_out ? (v | kPcieCmdTimeout) & ~kPcieCmdReqAck : (v & ~kPcieCmdReqAck);
+    }
     else if (i == 0x20 + kTmuRtrCs24) { r.regs[i] = 0; r.regs[i + 1] = 0; ++r.post_times; }  // the post time trigger clears itself at once
     else r.regs[i] = v;
     if (i == 26 && (v & kCs26Ov)) {                                                    // a router operation

@@ -56,7 +56,8 @@ constexpr uint32_t kDpCs0 = 0, kDpCs0Ae = 1u << 30, kDpCs0Ve = 1u << 31, kDpCs3 
                    kDpVideoHop = 9, kDpAuxTxHop = 8, kDpAuxRxHop = 8, kDpVideoPriority = 1, kDpAuxPriority = 2, kDpWeight = 1, kAdpCs4NfcMask = 0x3FF;
 // Thunderbolt 3 device routers: the vendor specific capabilities of their space (plug events, link controller) and the link controller's registers
 constexpr uint8_t kSwitchCapVse = 0x05, kVsecPlugEvents = 0x01, kVsecLinkController = 0x06;
-constexpr uint32_t kLcDesc = 2, kLcSxCtrl = 0x96, kLcSxCtrlWoc = 1u << 1, kLcSxCtrlWod = 1u << 2, kLcSxCtrlWodpc = 1u << 3, kLcSxCtrlWodpd = 1u << 4, kLcSxCtrlWou4 = 1u << 5, kLcSxCtrlWop = 1u << 6, kLcSxCtrlSlp = 1u << 31, kLcSxCtrlL1c = 1u << 16, kLcSxCtrlL2c = 1u << 20, kLcSxCtrlUpstream = 1u << 30, kLcPortAttr = 0x8D, kLcPortAttrBe = 1u << 12, kPlugEventsUsbDisable = 1u << 2;
+constexpr uint32_t kLcDesc = 2, kLcSxCtrl = 0x96, kLcSxCtrlWoc = 1u << 1, kLcSxCtrlWod = 1u << 2, kLcSxCtrlWodpc = 1u << 3, kLcSxCtrlWodpd = 1u << 4, kLcSxCtrlWou4 = 1u << 5, kLcSxCtrlWop = 1u << 6, kLcSxCtrlSlp = 1u << 31, kLcSxCtrlL1c = 1u << 16, kLcSxCtrlL2c = 1u << 20, kLcSxCtrlUpstream = 1u << 30, kLcCs42 = 0x2A, kLcCs42UsbPlugged = 1u << 31, kLcLinkReq = 0xAD, kLcLinkReqXhciConnect = 1u << 31, kLcPortAttr = 0x8D, kLcPortAttrBe = 1u << 12, kPlugEventsUsbDisable = 1u << 2,
+                   kPlugEventsPcieWrData = 0x1B, kPlugEventsPcieCmd = 0x1C, kPcieCmdBridgeShift = 10, kPcieCmdWrite = 1u << 21, kPcieCmdValue = 2u << 22, kPcieCmdReqAck = 1u << 30, kPcieCmdTimeout = 1u << 31;
 // the time management unit: the router capability (TB_SWITCH_CAP_TMU), its registers, the port registers
 constexpr uint8_t kSwitchCapTmu = 0x03;
 constexpr uint32_t kTmuRtrCs0 = 0, kTmuRtrCs0FreqWindShift = 16, kTmuRtrCs0FreqWindMask = 0x7FFu << 16, kTmuRtrCs0Td = 1u << 27, kTmuRtrCs0Ucap = 1u << 30, kTmuRtrCs1 = 1, kTmuRtrCs3 = 3, kTmuRtrCs3IntervalShift = 16,
@@ -277,6 +278,9 @@ class Usb4Domain final : public IThunderboltEvents, public IXdomainHost, private
   int find_router_vse(const Usb4Router& r, uint8_t vsec);
   bool plug_events_active(const Usb4Router& r);
   bool lc_sleep(const Usb4Router& r, bool runtime);
+  bool pcie_bridge_write(const Usb4Router& r, uint32_t bridge, uint32_t offset, uint32_t value);
+  bool lc_port_block(const Usb4Router& r, uint32_t port, uint32_t* cap);
+  void tbt3_after_pcie(const Usb4Router& host, const Usb4Router& device);
   bool lc_set_configured(const Usb4Router& r, uint32_t port, bool upstream);
   bool configure_port(const Usb4Router& r, uint32_t port, bool upstream);
   bool bonding_possible(const Usb4Router& child);
