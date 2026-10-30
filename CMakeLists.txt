@@ -709,6 +709,9 @@ add_executable(BOOTX64
   src/Hardware/Bus/I2c/LpssI2c.cpp
   src/Hardware/Mouse/I2c/I2cHidPointer.cpp
   src/Hardware/Mouse/I2c/PlatformI2cHid.cpp
+  src/Hardware/WirelessInterface/Intel/IwlDevices.cpp
+  src/Hardware/WirelessInterface/Intel/IwlFirmware.cpp
+  src/Hardware/WirelessInterface/Intel/IwlPcie.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnIsa.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnEmu.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/Gcn/TgsiParse.cpp
