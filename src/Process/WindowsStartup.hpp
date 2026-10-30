@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #pragma once
+#include "Process/StartupSpec.hpp"
 #include <stdint.h>
 #include "Allocators/IAllocator.hpp"
 #include "Executable/PeFile.hpp"
@@ -51,6 +52,7 @@ struct WindowsModule {
 };
 
 struct WindowsStartupInput {
+  const StartupSpec* startup = nullptr;             // the startup information (STARTUPINFO, console), or none
   allocators::IAllocator* allocator = nullptr;      // for converting the text to UTF-16
   uint64_t process_id = 0, thread_id = 0;
   uint64_t stack_top = 0, stack_size = 0;

@@ -1107,6 +1107,26 @@ void scene_compute(Rig& rig, ArrayView<uint32_t> out) {
     for (uint32_t& pixel : out) pixel ^= 0x0000FF00u;
 }
 
+// Group-shared memory and barriers (cs_shared.hlsl): 16 groups of 8 x 8 threads, each writing a slot of a 64-word shared array, reading its neighbour's after a barrier, and the 64 slots added
+// by a reduction with a barrier in its loop. The picture is the buffer: red the neighbour's value, green the sum, blue the thread.
+void scene_compute_shared(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureCompute)) return void(rig.step("compute", status::kNotSupported));
+  namespace b = conformance_blobs;
+  Handle cs = rig.shader("create_shader (compute)", ShaderKind::Dxbc, graphics::ShaderStage::Compute, bytes_of(b::k_cs_shared, sizeof b::k_cs_shared));
+  PipelineDesc pd;
+  pd.compute_shader = cs;
+  Handle pipe = rig.pipeline(pd);
+  AllocationDesc d;
+  d.flags = kAllocUnorderedAccess, d.size = kPixels * 4;
+  Handle picture = rig.create(d);
+  CommandWriter w(rig.allocator());
+  w.bind_pipeline(pipe);
+  w.bind_uav(0, 0, 0, kPixels * 4);
+  w.dispatch(kSize / 8, kSize / 8, 1);
+  rig.render(w, {picture});
+  rig.read_words(picture, out);
+}
+
 // Multisampling (4 samples): a far red rectangle and a near green one that overlaps it, both with edges between the pixels' sample positions, drawn into 4x colour and depth images (depth
 // tested per sample) and resolved. Vertical and horizontal edges are covered the same by every device that uses the standard 4x pattern, whatever the order of the samples.
 void scene_multisample(Rig& rig, ArrayView<uint32_t> out) {
@@ -1170,6 +1190,67 @@ void scene_geometry_shader(Rig& rig, ArrayView<uint32_t> out) {
   w.bind_vertex_buffer(1);
   w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
   w.draw(3);
+  w.end_pass();
+  rig.render(w, {target, vb});
+  rig.read(target, out);
+}
+
+// The geometry shader that runs twice for each primitive (gs_copy_inst2: gs_copy with an instance count of 2): the same triangles drawn twice over, so the same picture as gs_copy's.
+void scene_geometry_instances(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureGeometryShaders)) return void(rig.step("geometry shaders", status::kNotSupported));
+  namespace b = conformance_blobs;
+  const Vertex v[3] = {{-0.9f, -0.9f, 0.5f, 1, 0, 0, 1}, {0.9f, -0.9f, 0.5f, 0, 1, 0, 1}, {0.0f, 0.9f, 0.5f, 0, 0, 1, 1}};
+  Handle vs = rig.vertex_shader(bytes_of(b::k_vs, sizeof b::k_vs));
+  Handle gs = rig.shader("create_shader (geometry)", ShaderKind::Dxbc, graphics::ShaderStage::Geometry, bytes_of(b::k_gs_copy_inst2, sizeof b::k_gs_copy_inst2));
+  Handle ps = rig.pixel_shader(bytes_of(b::k_ps_color, sizeof b::k_ps_color));
+  PipelineDesc pd = colour_pipeline_desc(vs, ps);
+  pd.varying_count = 3;
+  pd.geometry_shader = gs;
+  Handle pipe = rig.pipeline(pd);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  CommandWriter w(rig.allocator());
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(3);
+  w.end_pass();
+  rig.render(w, {target, vb});
+  rig.read(target, out);
+}
+
+// Primitives with adjacency: a triangle with the three vertices beside it (the shader draws the even ones, with some of the colour of the odd one after each), and a line with the vertex
+// before and after (the shader makes a quad of its four).
+void scene_geometry_adjacency(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureGeometryShaders)) return void(rig.step("geometry shaders", status::kNotSupported));
+  namespace b = conformance_blobs;
+  const Vertex v[10] = {{-0.9f, -0.9f, 0.5f, 1, 0, 0, 1}, {0.0f, 0.0f, 0.5f, 0, 0, 1, 1}, {-0.1f, -0.9f, 0.5f, 0, 1, 0, 1}, {0.0f, 0.0f, 0.5f, 1, 1, 1, 1}, {-0.5f, 0.9f, 0.5f, 0, 0, 1, 1}, {0.0f, 0.0f, 0.5f, 1, 1, 0, 1},
+                        {0.1f, -0.9f, 0.5f, 1, 0, 0, 1}, {0.9f, -0.9f, 0.5f, 0, 1, 0, 1}, {0.1f, 0.9f, 0.5f, 0, 0, 1, 1}, {0.9f, 0.9f, 0.5f, 1, 1, 0, 1}};
+  Handle vs = rig.vertex_shader(bytes_of(b::k_vs, sizeof b::k_vs));
+  Handle ps = rig.pixel_shader(bytes_of(b::k_ps_color, sizeof b::k_ps_color));
+  Handle triangles = 0, lines = 0;
+  for (uint32_t k = 0; k < 2; ++k) {
+    const uint8_t* code = k == 0 ? b::k_gs_tri_adj : b::k_gs_line_adj;
+    const uint32_t size = k == 0 ? sizeof b::k_gs_tri_adj : sizeof b::k_gs_line_adj;
+    Handle gs = rig.shader("create_shader (geometry)", ShaderKind::Dxbc, graphics::ShaderStage::Geometry, bytes_of(code, size));
+    PipelineDesc pd = colour_pipeline_desc(vs, ps);
+    pd.varying_count = 3;
+    pd.geometry_shader = gs;
+    (k == 0 ? triangles : lines) = rig.pipeline(pd);
+  }
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  CommandWriter w(rig.allocator());
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.bind_pipeline(triangles);
+  w.set_topology(Topology::TriangleListAdjacency);
+  w.draw(6, 0);
+  w.bind_pipeline(lines);
+  w.set_topology(Topology::LineListAdjacency);
+  w.draw(4, 6);
   w.end_pass();
   rig.render(w, {target, vb});
   rig.read(target, out);
@@ -1267,6 +1348,114 @@ void scene_unorm16(Rig& rig, ArrayView<uint32_t> out) {
   for (uint32_t i = 1; i < kSize * kSize; i += 2) out[i] = other[i];
   release_view(rig.allocator(), other);
 }
+
+// A multisampled image read by a shader (ps_ms.hlsl: Texture2DMS Load, sample (x mod 4) of the pixel at x, y): two rectangles with edges off the pixel grid drawn into a 4x multisampled
+// target (the colours of its samples are what the picture shows, one sample a column), then the target itself is bound to the pixel shader as a texture.
+void scene_multisample_resource(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureMultisample | graphics::kFeatureTexelAccess | graphics::kFeatureSystemInputs)) return void(rig.step("multisampling", status::kNotSupported));
+  namespace b = conformance_blobs;
+  auto rect = [](Vertex* v, float x0, float y0, float x1, float y1, float z, float r, float g, float bl) {
+    auto at = [&](float px, float py) { return Vertex{px / 16.0f - 1.0f, py / 16.0f - 1.0f, z, r, g, bl, 1}; };
+    v[0] = at(x0, y0), v[1] = at(x1, y0), v[2] = at(x0, y1);
+    v[3] = at(x0, y1), v[4] = at(x1, y0), v[5] = at(x1, y1);
+  };
+  Vertex v[12];
+  rect(v, 4.3f, 3.4f, 20.6f, 22.7f, 0.6f, 1, 0, 0);
+  rect(v + 6, 12.4f, 9.2f, 27.8f, 28.6f, 0.3f, 0, 1, 0);
+  Handle vs = rig.vertex_shader(bytes_of(kVertexTokens, sizeof kVertexTokens), ShaderKind::D3d9Bytecode);
+  Handle ps = rig.pixel_shader(bytes_of(kPixelTokens, sizeof kPixelTokens), ShaderKind::D3d9Bytecode);
+  PipelineDesc pd = colour_pipeline_desc(vs, ps);
+  pd.depth_test = pd.depth_write = true;
+  pd.multisample = true;
+  Handle pipe = rig.pipeline(pd);
+  AllocationDesc color_desc, depth_desc;
+  color_desc.flags = kAllocRenderTarget | kAllocTexture, color_desc.format = Format::A8R8G8B8, color_desc.width = color_desc.height = kSize, color_desc.samples = 4;
+  depth_desc.flags = kAllocDepthStencil, depth_desc.format = Format::D32Float, depth_desc.width = depth_desc.height = kSize, depth_desc.samples = 4;
+  Handle multisampled = rig.create(color_desc), depth = rig.create(depth_desc);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  CommandWriter w(rig.allocator());
+  w.begin_pass(0, 1, kPassClearColor | kPassClearDepth, {0, 0, 0, 1}, 1.0f, 0);
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(2);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(12);
+  w.end_pass();
+  rig.render(w, {multisampled, depth, vb});
+  // The second pass: a quad over the target, the pixel shader loading the samples.
+  auto vert = [](float x, float y) { return Vertex{x, y, 0.5f, 1, 1, 1, 1}; };
+  const Vertex quad[6] = {vert(-1, -1), vert(1, -1), vert(-1, 1), vert(-1, 1), vert(1, -1), vert(1, 1)};
+  Handle show = dxbc_pipeline(rig, b::k_vs, sizeof b::k_vs, b::k_ps_ms, sizeof b::k_ps_ms, 1);
+  Handle qvb = rig.buffer(kAllocVertexBuffer, bytes_of(quad, sizeof quad));
+  graphics::SamplerDesc sampler;
+  CommandWriter w2(rig.allocator());
+  begin(w2, 0, kNoAllocation, {0, 0, 0, 1});
+  w2.bind_pipeline(show);
+  w2.bind_vertex_buffer(1);
+  w2.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w2.bind_texture(0, 2, sampler);
+  w2.draw(6);
+  w2.end_pass();
+  rig.render(w2, {target, qvb, multisampled});
+  rig.read(target, out);
+}
+
+// Depth resolve: two rectangles with edges off the pixel grid (the near one at depth 0.3, the far one at 0.7, behind it where they overlap) are drawn into a 4x multisampled depth buffer, which
+// is resolved (sample 0, or the least or greatest of the samples) into a plain one; then the plain depth buffer is read by drawing over it with the depth test: a quad at depth 0.5 that
+// shows green where the stored depth is greater (0.7 and the cleared 1), and one at 0.85 over it that shows blue where it is the cleared 1, so the picture says which of the three depths each pixel
+// holds: black (0.3), green (0.7), blue (1).
+void depth_resolve_scene(Rig& rig, ArrayView<uint32_t> out, uint32_t mode) {
+  if (!rig.has(graphics::kFeatureMultisample | graphics::kFeatureDepthResolve | (mode == 1 ? 0u : graphics::kFeatureResolveModes))) return void(rig.step("depth resolve", status::kNotSupported));
+  auto rect = [](Vertex* v, float x0, float y0, float x1, float y1, float z, float r, float g, float b) {
+    auto at = [&](float px, float py) { return Vertex{px / 16.0f - 1.0f, py / 16.0f - 1.0f, z, r, g, b, 1}; };
+    v[0] = at(x0, y0), v[1] = at(x1, y0), v[2] = at(x0, y1);
+    v[3] = at(x0, y1), v[4] = at(x1, y0), v[5] = at(x1, y1);
+  };
+  Vertex v[12];
+  rect(v, 4.3f, 3.4f, 20.6f, 22.7f, 0.3f, 1, 0, 0);
+  rect(v + 6, 12.4f, 9.2f, 27.8f, 28.6f, 0.7f, 0, 1, 0);
+  Vertex probes[12];
+  rect(probes, 0, 0, 32, 32, 0.5f, 0, 1, 0);
+  rect(probes + 6, 0, 0, 32, 32, 0.85f, 0, 0, 1);
+  Handle vs = rig.vertex_shader(bytes_of(kVertexTokens, sizeof kVertexTokens), ShaderKind::D3d9Bytecode);
+  Handle ps = rig.pixel_shader(bytes_of(kPixelTokens, sizeof kPixelTokens), ShaderKind::D3d9Bytecode);
+  PipelineDesc draw = colour_pipeline_desc(vs, ps);
+  draw.depth_test = draw.depth_write = true;
+  draw.multisample = true;
+  Handle draw_pipe = rig.pipeline(draw);
+  PipelineDesc probe = colour_pipeline_desc(vs, ps);
+  probe.depth_test = true;
+  probe.depth_compare = graphics::CompareOp::Less;
+  Handle probe_pipe = rig.pipeline(probe);
+  AllocationDesc color_desc, depth_desc;
+  color_desc.flags = kAllocRenderTarget, color_desc.format = Format::A8R8G8B8, color_desc.width = color_desc.height = kSize, color_desc.samples = 4;
+  depth_desc.flags = kAllocDepthStencil, depth_desc.format = Format::D32Float, depth_desc.width = depth_desc.height = kSize, depth_desc.samples = 4;
+  Handle ms_color = rig.create(color_desc), ms_depth = rig.create(depth_desc);
+  Handle plain_depth = rig.image(kAllocDepthStencil, Format::D32Float, kSize, kSize);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v)), pvb = rig.buffer(kAllocVertexBuffer, bytes_of(probes, sizeof probes));
+  CommandWriter w(rig.allocator());
+  w.begin_pass(0, 1, kPassClearColor | kPassClearDepth, {0, 0, 0, 1}, 1.0f, 0);
+  w.bind_pipeline(draw_pipe);
+  w.bind_vertex_buffer(3);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(12);
+  w.end_pass();
+  w.resolve_region(2, 1, mode);
+  rig.render(w, {ms_color, ms_depth, plain_depth, vb});
+  CommandWriter w2(rig.allocator());
+  w2.begin_pass(0, 1, kPassClearColor, {0, 0, 0, 1}, 1.0f, 0);
+  w2.bind_pipeline(probe_pipe);
+  w2.bind_vertex_buffer(2);
+  w2.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w2.draw(12);
+  w2.end_pass();
+  rig.render(w2, {target, plain_depth, pvb});
+  rig.read(target, out);
+}
+void scene_depth_resolve_sample0(Rig& rig, ArrayView<uint32_t> out) { depth_resolve_scene(rig, out, 1); }
+void scene_depth_resolve_min(Rig& rig, ArrayView<uint32_t> out) { depth_resolve_scene(rig, out, 2); }
+void scene_depth_resolve_max(Rig& rig, ArrayView<uint32_t> out) { depth_resolve_scene(rig, out, 3); }
 
 // Alpha to coverage: five bands of whole pixels, all the same orange, with alphas 0, 1, 0, 1 and 1: into a 4x multisampled target the alpha 0 bands keep none of their samples and the
 // others all, so the resolved picture is black, orange, black, orange, orange. (A GPU gives a fraction of an alpha a number of samples that varies from pixel to pixel, which a picture cannot
@@ -1535,6 +1724,8 @@ const Entry kScenes[] = {
     {"Direct3D 10 instancing", scene_instancing},
     {"Direct3D 10 multiple render targets (DXBC)", scene_multiple_targets},
     {"Direct3D 10 geometry shader (DXBC)", scene_geometry_shader},
+    {"Direct3D 11 instanced geometry (DXBC)", scene_geometry_instances},
+    {"Direct3D 10 adjacency primitives (DXBC)", scene_geometry_adjacency},
     {"Direct3D 11 tessellation, triangle domain (DXBC)", scene_tess_triangle, false, 6},
     {"Direct3D 11 tessellation, quad domain (DXBC)", scene_tess_quad, false, 6},
     {"Direct3D 11 tessellation, isolines and points (DXBC)", scene_tess_lines_points, true},
@@ -1549,7 +1740,12 @@ const Entry kScenes[] = {
     {"Direct3D 10 signed and 10-bit normalised formats (DXBC)", scene_normalised_formats},
     {"Direct3D 10 4x multisampling", scene_multisample},
     {"Direct3D 10 alpha to coverage", scene_alpha_to_coverage},
+    {"Direct3D 12 depth resolve, first sample", scene_depth_resolve_sample0},
+    {"Direct3D 12 depth resolve, least sample", scene_depth_resolve_min},
+    {"Direct3D 12 depth resolve, greatest sample", scene_depth_resolve_max},
+    {"Direct3D 10 multisampled image as a shader resource (DXBC)", scene_multisample_resource},
     {"Direct3D 11 compute shader and unordered access views (DXBC)", scene_compute},
+    {"Direct3D 11 group-shared memory and barriers (DXBC)", scene_compute_shared},
     {"Direct3D 10 independent blend per render target (DXBC)", scene_independent_blend},
     {"Direct3D 10 half-float render target and texture", scene_half_float_target},
     {"Direct3D 10 float render target and texture", scene_float_target},

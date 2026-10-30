@@ -25,7 +25,8 @@
 
 namespace hardware {
 
-enum class TbGeneration : uint8_t { AlpineRidge, TitanRidge, IceLake };
+// Alpine Ridge to Ice Lake have a connection manager in firmware (ThunderboltIcm); Usb4 is Tiger Lake and later, whose host router has none (Usb4Domain does its work).
+enum class TbGeneration : uint8_t { AlpineRidge, TitanRidge, IceLake, Usb4 };
 
 struct TbNhiDevice {
   uint16_t device_id;

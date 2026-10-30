@@ -290,6 +290,7 @@ LoadStatus UserProgram::load(ConstByteView file, ArrayView<const StringView> arg
     input.command_line = command_line.view();
     input.environment = environment;
     input.processor_count = processor_count_;
+    if (has_startup_) input.startup = &startup_;
     input.current_directory = working_directory_.empty() ? StringView("/") : working_directory_.view();
     // The module lists for PEB.Ldr: the program, then the libraries in load order; the initialization order as indexes.
     WindowsModule listed[64];

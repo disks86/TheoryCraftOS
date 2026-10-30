@@ -109,7 +109,7 @@ constexpr uint32_t kShaderCompute = 5;   // (PIPE_SHADER_COMPUTE)
 constexpr uint32_t kBindShaderBuffer = 1u << 14;   // a buffer compute shaders read and write
 constexpr uint32_t kShaderVertex = 0;
 constexpr uint32_t kShaderFragment = 1;
-constexpr uint32_t kPrimPoints = 0, kPrimLines = 1, kPrimTriangles = 4;
+constexpr uint32_t kPrimPoints = 0, kPrimLines = 1, kPrimTriangles = 4, kPrimLinesAdjacency = 10, kPrimTrianglesAdjacency = 12;
 constexpr uint32_t kFuncLess = 1, kFuncLequal = 3, kFuncAlways = 7;
 constexpr uint32_t kBlendAdd = 0;   // (PIPE_BLEND_ADD, SUBTRACT, REVERSE_SUBTRACT, MIN, MAX: 0 .. 4, as BlendOp)
 constexpr uint32_t kBlendFactors[] = {0x11, 1, 2, 0x12, 3, 0x13, 5, 0x15, 4, 0x14, 6};   // by BlendFactor: ZERO ONE SRC_COLOR INV_SRC_COLOR SRC_ALPHA INV_SRC_ALPHA DST_COLOR INV_DST_COLOR DST_ALPHA INV_DST_ALPHA SRC_ALPHA_SATURATE

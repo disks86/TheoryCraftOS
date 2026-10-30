@@ -215,6 +215,8 @@ void ThunderboltNet::close(bool logout) {
     // the path first, then the rings: the chip may still be moving frames
     if (index < icm_.xdomain_count()) icm_.disconnect_xdomain_paths(index);
   }
+  if (rx_hop_ >= 0) icm_.ring_interrupts(false, static_cast<uint32_t>(rx_hop_), false);
+  if (tx_hop_ >= 0) icm_.ring_interrupts(true, static_cast<uint32_t>(tx_hop_), false);
   if (rx_ring_) rx_ring_->stop();
   if (tx_ring_) tx_ring_->stop();
   rx_ring_ = UniquePointer<TbRing>();
@@ -328,6 +330,8 @@ void ThunderboltNet::try_connect() {
   tx_mode.e2e = rx_mode.e2e = e2e;
   rx_mode.e2e_tx_hop = static_cast<uint32_t>(tx_hop_);
   auto fail = [&]() {
+    icm_.ring_interrupts(false, static_cast<uint32_t>(rx_hop_), false);
+    icm_.ring_interrupts(true, static_cast<uint32_t>(tx_hop_), false);
     rx_ring_->stop();
     tx_ring_->stop();
     release_view(allocator_, rx_buffers_);
@@ -349,6 +353,8 @@ void ThunderboltNet::try_connect() {
       fail();
       return;
     }
+  icm_.ring_interrupts(true, static_cast<uint32_t>(tx_hop_), true);          // (the data rings raise the same interrupt as the control channel, when it is in use)
+  icm_.ring_interrupts(false, static_cast<uint32_t>(rx_hop_), true);
   const char* error = nullptr;
   if (!icm_.approve_xdomain_paths(index, static_cast<uint16_t>(local_path_), static_cast<uint16_t>(tx_hop_), static_cast<uint16_t>(remote_path_), static_cast<uint16_t>(rx_hop_), &error)) {
     fail();

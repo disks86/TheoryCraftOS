@@ -113,7 +113,7 @@ PathResult resolve_path(PathStyle style, StringView cwd, StringView path, String
     if (prefixed) path = path.without_prefix(skip);
     const bool drive = path.size() >= 2 && path[1] == ':' && ((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z'));
     if (drive) {
-      if (path[0] != 'C' && path[0] != 'c') return PathResult::Invalid;      // there is only drive C
+      if (path[0] != 'C' && path[0] != 'c') return PathResult::UnknownDrive;      // there is only drive C
       path = path.without_prefix(2);
       absolute = !path.empty() && (path[0] == '\\' || path[0] == '/');
       if (path.empty()) return out->assign(cwd) ? PathResult::Ok : PathResult::TooLong;      // "C:" alone is the current directory

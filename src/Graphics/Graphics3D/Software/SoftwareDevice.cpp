@@ -259,14 +259,16 @@ class SoftwareShaderModule final : public IShaderModule {
 
 class SoftwareComputePipeline final : public IPipeline {
  public:
-  SoftwareComputePipeline(ComputeShaderFn function, const uint32_t group[3]) : function_(function) {
+  SoftwareComputePipeline(ComputeShaderFn function, ComputeGroupShaderFn group_function, const uint32_t group[3]) : function_(function), group_function_(group_function) {
     for (uint32_t i = 0; i < 3; ++i) group_[i] = group[i];
   }
   ComputeShaderFn function() const { return function_; }
+  ComputeGroupShaderFn group_function() const { return group_function_; }
   uint32_t group(uint32_t axis) const { return group_[axis]; }
 
  private:
   ComputeShaderFn function_;
+  ComputeGroupShaderFn group_function_;
   uint32_t group_[3];
 };
 
@@ -419,6 +421,14 @@ class TextureSet final : public ITextureSet {
     const Surface surface = image->surface(0, static_cast<uint32_t>(z));
     if (x < 0 || y < 0 || static_cast<uint32_t>(x) >= surface.width || static_cast<uint32_t>(y) >= surface.height) return {0, 0, 0, 0};
     return texel(surface, x, y);
+  }
+  Vec4 fetch_sample(uint32_t unit, int32_t x, int32_t y, uint32_t sample) const override {
+    const SoftwareImage* image = image_for(unit);
+    if (!image || image->samples() < 2 || sample >= image->samples()) return {0, 0, 0, 0};
+    const Surface surface = image->surface();
+    if (x < 0 || y < 0 || static_cast<uint32_t>(x) >= surface.width || static_cast<uint32_t>(y) >= surface.height) return {0, 0, 0, 0};
+    // (the samples of a pixel are neighbours: the pixel x is at x * samples)
+    return texel(surface, static_cast<int64_t>(x) * image->samples() + sample, y);
   }
   bool size_volume(uint32_t unit, uint32_t level, uint32_t* width, uint32_t* height, uint32_t* depth, uint32_t* levels) const override {
     if (!size(unit, level, width, height, levels)) return false;
@@ -1058,14 +1068,7 @@ ClipVertex run_vertex_shader(const SoftwarePipeline& pipeline, ConstByteView ver
 }
 
 // Runs a geometry shader on one primitive and draws what it emits: the vertices are a strip (a triangle strip turns every second triangle over, as Direct3D does) or points.
-void run_geometry_shader(const DrawState& s, const SoftwareShaderModule& module, const ClipVertex* v, uint32_t count) {
-  const ShaderModuleDesc& md = module.desc();
-  GeometryInputData input;
-  for (uint32_t k = 0; k < count && k < 3; ++k) {
-    input.position[k] = v[k].position;
-    for (uint32_t i = 0; i < kMaxVaryings; ++i) input.varying[k][i] = v[k].varying[i];
-  }
-  input.primitive_id = s.primitive_id;
+void run_geometry_instance(const DrawState& s, const ShaderModuleDesc& md, const GeometryInputData& input) {
   GeometryOutputData output;
   md.geometry_function(input, s.constants, &output);
   if (output.count > md.geometry_max_vertices) output.count = md.geometry_max_vertices;
@@ -1088,6 +1091,20 @@ void run_geometry_shader(const DrawState& s, const SoftwareShaderModule& module,
       if (odd) draw_triangle(s, clip(i - 1), clip(i - 2), clip(i));
       else draw_triangle(s, clip(i - 2), clip(i - 1), clip(i));
     }
+  }
+}
+
+void run_geometry_shader(const DrawState& s, const SoftwareShaderModule& module, const ClipVertex* v, uint32_t count) {
+  const ShaderModuleDesc& md = module.desc();
+  GeometryInputData input;
+  for (uint32_t k = 0; k < count && k < kMaxGeometryInputVertices; ++k) {
+    input.position[k] = v[k].position;
+    for (uint32_t i = 0; i < kMaxVaryings; ++i) input.varying[k][i] = v[k].varying[i];
+  }
+  input.primitive_id = s.primitive_id;
+  for (uint32_t instance = 0; instance < md.geometry_instances; ++instance) {
+    input.instance_id = instance;
+    run_geometry_instance(s, md, input);
   }
 }
 
@@ -1150,7 +1167,7 @@ IImage* SoftwareDevice::create_image(const ImageDesc& desc) {
     // (a multisampled image is an 8-bit colour or a depth attachment, alone, of one level)
     const bool depth = desc.format == Format::D32Float;
     if ((desc.samples != 2 && desc.samples != 4 && desc.samples != 8) || desc.mip_levels != 1 || desc.kind != TextureKind::Texture2D || is_wide_format(desc.format) ||
-        desc.usage != (depth ? kImageDepthAttachment : kImageColorAttachment))
+        (depth ? desc.usage != kImageDepthAttachment : (desc.usage & ~kImageSampled) != kImageColorAttachment))
       return nullptr;
   }
   if (desc.kind != TextureKind::Texture2D) {
@@ -1183,7 +1200,7 @@ IShaderModule* SoftwareDevice::create_shader_module(const ShaderModuleDesc& desc
     return make<SoftwareShaderModule>(allocator_, desc);
   }
   if (desc.stage == ShaderStage::Compute) {
-    if (!desc.compute_function) return nullptr;
+    if (!desc.compute_function && !desc.compute_group_function) return nullptr;
     uint64_t threads = 1;
     for (uint32_t axis : desc.thread_group) {
       if (axis == 0 || axis > kMaxThreadsPerGroup) return nullptr;
@@ -1202,7 +1219,7 @@ void SoftwareDevice::destroy_shader_module(IShaderModule* module) {
 IPipeline* SoftwareDevice::create_compute_pipeline(const IShaderModule* shader) {
   if (!shader || shader->stage() != ShaderStage::Compute) return nullptr;
   const SoftwareShaderModule* module = static_cast<const SoftwareShaderModule*>(shader);
-  return make<SoftwareComputePipeline>(allocator_, module->desc().compute_function, module->desc().thread_group);
+  return make<SoftwareComputePipeline>(allocator_, module->desc().compute_function, module->desc().compute_group_function, module->desc().thread_group);
 }
 
 IPipeline* SoftwareDevice::create_graphics_pipeline(const GraphicsPipelineDesc& desc) {
@@ -1308,11 +1325,35 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
         // The samples of each pixel averaged (to the nearest, per channel) into the single-sample image.
         SoftwareImage* to = static_cast<SoftwareImage*>(cmd.image);
         const SoftwareImage* from = static_cast<const SoftwareImage*>(cmd.image2);
-        if (in_pass || !to || !from || to->samples() != 1 || from->samples() < 2 || to->format() != from->format() || is_wide_format(to->format()) || to->format() == Format::D32Float ||
-            to->extent().width != from->extent().width || to->extent().height != from->extent().height)
+        if (in_pass || !to || !from || to->samples() != 1 || from->samples() < 2 || to->format() != from->format() || is_wide_format(to->format()) ||
+            to->extent().width != from->extent().width || to->extent().height != from->extent().height || cmd.count > static_cast<uint32_t>(ResolveMode::Max))
           return false;
-        const Surface out = to->surface(), in = from->surface();
+        const ResolveMode mode = static_cast<ResolveMode>(cmd.count);
         const uint32_t n = from->samples();
+        if (to->format() == Format::D32Float) {
+          // A depth image: the depth of sample 0, or the least, the greatest or the mean of the samples; the stencil plane takes sample 0's.
+          if (to->depth().empty() || from->depth().size() < to->depth().size() * n) return false;
+          const uint64_t pixels = uint64_t{to->extent().width} * to->extent().height;
+          for (uint64_t i = 0; i < pixels; ++i) {
+            const float* samples = &from->depth()[i * n];
+            float value = samples[0];
+            for (uint32_t k = 1; k < n; ++k) {
+              if (mode == ResolveMode::Min) value = samples[k] < value ? samples[k] : value;
+              else if (mode == ResolveMode::Max) value = samples[k] > value ? samples[k] : value;
+              else if (mode == ResolveMode::Average) value += samples[k];
+            }
+            to->depth()[i] = mode == ResolveMode::Average ? value / static_cast<float>(n) : value;
+            if (!to->stencil().empty() && !from->stencil().empty()) to->stencil()[i] = from->stencil()[i * n];
+          }
+          break;
+        }
+        const Surface out = to->surface(), in = from->surface();
+        if (mode == ResolveMode::Sample0) {
+          for (uint32_t y = 0; y < out.height; ++y)
+            for (uint32_t x = 0; x < out.width; ++x) out.row(y)[x] = in.row(y)[uint64_t{x} * n];
+          break;
+        }
+        if (mode != ResolveMode::Average) return false;   // (a colour image is averaged or takes sample 0)
         for (uint32_t y = 0; y < out.height; ++y)
           for (uint32_t x = 0; x < out.width; ++x) {
             if (is_srgb_format(in.format)) {
@@ -1363,6 +1404,10 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
           for (uint32_t y = 0; y < gy; ++y)
             for (uint32_t x = 0; x < gx; ++x) {
               context.group_id[0] = x, context.group_id[1] = y, context.group_id[2] = z;
+              if (compute->group_function()) {
+                compute->group_function()(context, s.constants);   // (the shader runs the threads of the group itself)
+                continue;
+              }
               uint32_t index = 0;
               for (uint32_t tz = 0; tz < compute->group(2); ++tz)
                 for (uint32_t ty = 0; ty < compute->group(1); ++ty)
@@ -1487,12 +1532,14 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
         // (patches need a hull and a domain shader that take that many control points, and those shaders need patches)
         if (patches != (hull != nullptr) || (patches && (patch_points != hull->desc().tess_input_points || patch_points == 0 || patch_points > kMaxPatchControlPoints))) return false;
         if (patches && pd.geometry_shader) return false;   // (a geometry shader after the tessellator is not made)
-        const uint32_t per_primitive = patches ? patch_points : topology == PrimitiveTopology::TriangleList ? 3 : topology == PrimitiveTopology::LineList ? 2 : 1;
+        const uint32_t per_primitive = patches ? patch_points : topology == PrimitiveTopology::TriangleListAdjacency ? 6 : topology == PrimitiveTopology::LineListAdjacency ? 4 : topology == PrimitiveTopology::TriangleList ? 3 : topology == PrimitiveTopology::LineList ? 2 : 1;
+        const bool adjacency = topology == PrimitiveTopology::TriangleListAdjacency || topology == PrimitiveTopology::LineListAdjacency;
+        if (adjacency && !pd.geometry_shader) return false;   // (only a geometry shader takes the neighbours)
         const SoftwareShaderModule* geometry = static_cast<const SoftwareShaderModule*>(pd.geometry_shader);
         if (geometry) {
           // (the geometry shader takes the primitives the draw makes)
           const GeometryPrimitive taken = geometry->desc().geometry_input;
-          if (taken != (per_primitive == 3 ? GeometryPrimitive::Triangle : per_primitive == 2 ? GeometryPrimitive::Line : GeometryPrimitive::Point)) return false;
+          if (taken != (per_primitive == 6 ? GeometryPrimitive::TriangleAdjacency : per_primitive == 4 ? GeometryPrimitive::LineAdjacency : per_primitive == 3 ? GeometryPrimitive::Triangle : per_primitive == 2 ? GeometryPrimitive::Line : GeometryPrimitive::Point)) return false;
         }
         stat_ia_vertices += uint64_t{cmd.count} * instances;
         stat_ia_primitives += uint64_t{cmd.count / per_primitive} * instances;

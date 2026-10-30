@@ -44,6 +44,8 @@ uint32_t nt_delete_file(Process& p, const SyscallRequest& r);
 uint32_t nt_create_symbolic_link(Process& p, const SyscallRequest& r);
 uint32_t nt_flush_buffers_file(Process& p, const SyscallRequest& r);
 uint32_t nt_query_volume_information_file(Process& p, const SyscallRequest& r);
+// NtDeviceIoControlFile: the mount manager (IOCTL_MOUNTMGR_QUERY_POINTS); every other device answers STATUS_INVALID_DEVICE_REQUEST.
+uint32_t nt_device_io_control_file(Process& p, const SyscallRequest& r);
 // NtCreateChangeNotification(POBJECT_ATTRIBUTES DirectoryAttributes, ULONG WatchTree, ULONG NotifyFilter, PHANDLE Result): this OS's own service, behind
 // FindFirstChangeNotification(W/A) - a handle that becomes signalled (like a manual-reset event) when a file or subdirectory is created, deleted, renamed or linked
 // directly under the named directory, or anywhere under it if WatchTree is nonzero. FindNextChangeNotification is NtResetEvent on the same handle; FindCloseChangeNotification

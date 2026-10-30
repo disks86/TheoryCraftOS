@@ -83,16 +83,6 @@ EXPORT BOOL WINAPI FlushInstructionCache(HANDLE process, LPCVOID base, SIZE_T si
 
 EXPORT UINT WINAPI GetSystemWindowsDirectoryW(LPWSTR buffer, UINT capacity) { return GetWindowsDirectoryW(buffer, capacity); }
 EXPORT UINT WINAPI GetSystemWindowsDirectoryA(LPSTR buffer, UINT capacity) { return GetWindowsDirectoryA(buffer, capacity); }
-EXPORT DWORD WINAPI GetLogicalDriveStringsW(DWORD capacity, LPWSTR buffer) {
-  if (capacity < 5) return 5;
-  buffer[0] = 'C'; buffer[1] = ':'; buffer[2] = '\\'; buffer[3] = 0; buffer[4] = 0;
-  return 4;
-}
-EXPORT DWORD WINAPI GetLogicalDriveStringsA(DWORD capacity, LPSTR buffer) {
-  if (capacity < 5) return 5;
-  buffer[0] = 'C'; buffer[1] = ':'; buffer[2] = '\\'; buffer[3] = 0; buffer[4] = 0;
-  return 4;
-}
 
 EXPORT DWORD WINAPI GetActiveProcessorCount(WORD group) {
   if (group != 0 && group != 0xFFFF) return 0;

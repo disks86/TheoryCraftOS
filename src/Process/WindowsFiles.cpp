@@ -168,6 +168,7 @@ uint32_t object_path(Process& p, uint64_t attributes, String* virtual_path) {
     case PathResult::Ok: return kSuccess;
     case PathResult::Empty: return root != 0 ? kSuccess : kObjectNameInvalid;
     case PathResult::Invalid: return kObjectNameInvalid;
+    case PathResult::UnknownDrive: return kObjectPathNotFound;
     default: return kObjectNameInvalid;
   }
 }
@@ -214,7 +215,7 @@ uint32_t open_by_attributes(Process& p, uint64_t object_attributes, uint32_t acc
     uint64_t name_at = 0;
     String text(files.allocator());
     if (object_attributes != 0 && p.read_user_u64(object_attributes + 16, &name_at) && name_at != 0 && read_unicode_string(p, name_at, &text) == kSuccess) {
-      static const char* const names[] = {"\\??\\nul", "\\device\\null"};
+      static const char* const names[] = {"\\??\\nul", "\\device\\null", "\\??\\mountpointmanager", "\\device\\mountpointmanager"};
       for (const char* device : names) {
         uint64_t n = 0;
         while (device[n]) ++n;
@@ -222,7 +223,7 @@ uint32_t open_by_attributes(Process& p, uint64_t object_attributes, uint32_t acc
         bool same = true;
         for (uint64_t i = 0; same && i < n; ++i) same = (text.view()[i] >= 'A' && text.view()[i] <= 'Z' ? char(text.view()[i] + 32) : text.view()[i]) == device[i];
         if (!same) continue;
-        const int64_t slot = files.open_device(DescriptorKind::Null);
+        const int64_t slot = files.open_device(n > 12 ? DescriptorKind::MountManager : DescriptorKind::Null);
         if (slot < 0) return kTooManyOpenedFiles;
         *handle = (uint64_t(slot) + 1) * 4;
         *information = kFileOpened;
@@ -609,6 +610,10 @@ uint32_t nt_query_information_file(Process& p, const SyscallRequest& r) {
       const uint32_t status = room < bytes ? kBufferOverflow : kSuccess;
       return store_io_status(p, status_block, status, 4 + room) ? status : kAccessViolation;
     }
+    case 35:      // FileAttributeTagInformation { FileAttributes, ReparseTag }: no file here is a reparse point
+      put(v, 0, attributes_of(e), 4);
+      size = 8;
+      break;
     default: return kInvalidInfoClass;
   }
   if (length < size) return kInfoLengthMismatch;
@@ -985,7 +990,7 @@ uint32_t nt_query_volume_information_file(Process& p, const SyscallRequest& r) {
     const filesystem::FileSystemInfo fs = p.files().file_system()->info();
     constexpr uint64_t kUnit = 4096, kSector = 512;
     const uint64_t total_units = fs.total_bytes ? fs.total_bytes / kUnit : (4ull << 30) / kUnit;      // (a file system without a limit is told to have 4 GiB)
-    const uint64_t free_units = fs.total_bytes ? fs.free_bytes / kUnit : total_units;
+    const uint64_t free_units = fs.total_bytes ? fs.free_bytes / kUnit : total_units - 1;      // (and one unit of it is in use: the root folder)
     uint8_t out[160] = {};
     ByteView v(out, sizeof(out));
     uint64_t size = 0;
@@ -1000,7 +1005,7 @@ uint32_t nt_query_volume_information_file(Process& p, const SyscallRequest& r) {
       size = 24;
     } else if (volume_class == 5) {      // FILE_FS_ATTRIBUTE_INFORMATION { FileSystemAttributes, MaximumComponentNameLength, FileSystemNameLength, FileSystemName[] }
       const uint64_t bytes = utf16(fs.type_name.view(), 12);
-      put(v, 0, 0x3 | 0x4 | 0x40000 * 0 | (fs.read_only ? 0x80000 : 0), 4);      // case-sensitive search, case preserving names, (read-only volume)
+      put(v, 0, 0x3 | 0x4 | 0x01000000 | (fs.read_only ? 0x80000 : 0), 4);      // case-sensitive search, case preserving names, open by file ID, (read-only volume)
       put(v, 4, 255, 4);
       put(v, 8, bytes, 4);
       size = 12 + bytes;
@@ -1019,6 +1024,55 @@ uint32_t nt_query_volume_information_file(Process& p, const SyscallRequest& r) {
   put(ByteView(b, 8), 0, console ? 0x50 : (kind == DescriptorKind::Pipe ? 0x11 : kind == DescriptorKind::Null ? 0x15 : kind == DescriptorKind::Mailslot ? 0x0c : 7), 4);      // DeviceType: FILE_DEVICE_CONSOLE / FILE_DEVICE_NAMED_PIPE / FILE_DEVICE_DISK
   if (!p.write_user(r.args[2], ConstByteView(b, 8))) return kAccessViolation;
   return store_io_status(p, r.args[1], kSuccess, 8) ? kSuccess : kAccessViolation;
+}
+
+// NtDeviceIoControlFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, IoControlCode, InputBuffer, InputBufferLength, OutputBuffer, OutputBufferLength).
+// The mount manager knows the one volume: its drive letter and its volume name, both pointing at the device of the volume.
+uint32_t nt_device_io_control_file(Process& p, const SyscallRequest& r) {
+  uint64_t status_block = 0, code = 0, input = 0, input_length = 0, output = 0, output_length = 0;
+  if (!argument(p, r, 4, &status_block) || !argument(p, r, 5, &code) || !argument(p, r, 6, &input) || !argument(p, r, 7, &input_length) || !argument(p, r, 8, &output) ||
+      !argument(p, r, 9, &output_length))
+    return kAccessViolation;
+  uint64_t slot = 0;
+  if (!handle_slot(r.args[0], &slot) || p.files().kind(slot) == DescriptorKind::Closed) return kInvalidHandle;
+  if (p.files().kind(slot) != DescriptorKind::MountManager) return kInvalidDeviceRequest;
+  input_length &= 0xFFFFFFFFu;
+  output_length &= 0xFFFFFFFFu;
+  constexpr uint32_t kQueryPoints = 0x6D0008u;      // IOCTL_MOUNTMGR_QUERY_POINTS
+  if (static_cast<uint32_t>(code) != kQueryPoints) return kInvalidDeviceRequest;
+  // MOUNTMGR_MOUNT_POINT is six ULONGs; MOUNTMGR_MOUNT_POINTS is { Size, NumberOfMountPoints, MountPoints[] }.
+  constexpr uint64_t kPoint = 24, kHeader = 8;
+  if (input_length < kPoint || output_length < kHeader + kPoint) return kInvalidParameter;
+  static const char* const kLinks[] = {"\\DosDevices\\C:", "\\??\\Volume{544f5343-0000-4000-8000-000000000001}"};
+  static const char kDevice[] = "\\Device\\HarddiskVolume1";
+  static const uint8_t kUnique[] = {'T', 'C', 'O', 'S', 'V', 'O', 'L', '1'};
+  auto length_of = [](const char* s) { uint64_t n = 0; while (s[n]) ++n; return n; };
+  constexpr uint64_t kCount = 2;
+  uint8_t image[512] = {};
+  ByteView v(image, sizeof(image));
+  uint64_t at = kHeader + kCount * kPoint;
+  const uint64_t device_bytes = 2 * length_of(kDevice);
+  for (uint64_t i = 0; i < kCount; ++i) {
+    const uint64_t link_bytes = 2 * length_of(kLinks[i]), entry = kHeader + i * kPoint;
+    if (at + link_bytes + sizeof(kUnique) + device_bytes > sizeof(image)) return kNoMemory;
+    put(v, entry + 0, at, 4); put(v, entry + 4, link_bytes, 4);
+    for (uint64_t k = 0; k < link_bytes / 2; ++k) image[at + 2 * k] = uint8_t(kLinks[i][k]);
+    at += link_bytes;
+    put(v, entry + 8, at, 4); put(v, entry + 12, sizeof(kUnique), 4);
+    for (uint64_t k = 0; k < sizeof(kUnique); ++k) image[at + k] = kUnique[k];
+    at += sizeof(kUnique);
+    put(v, entry + 16, at, 4); put(v, entry + 20, device_bytes, 4);
+    for (uint64_t k = 0; k < device_bytes / 2; ++k) image[at + 2 * k] = uint8_t(kDevice[k]);
+    at += device_bytes;
+  }
+  put(v, 0, at, 4);
+  put(v, 4, kCount, 4);
+  if (output_length < at) {      // only the header: the size that is needed and how many there are
+    if (!p.write_user(output, ConstByteView(image, kHeader))) return kAccessViolation;
+    return store_io_status(p, status_block, kBufferOverflow, kHeader) ? kBufferOverflow : kAccessViolation;
+  }
+  if (!p.write_user(output, ConstByteView(image, at))) return kAccessViolation;
+  return store_io_status(p, status_block, kSuccess, at) ? kSuccess : kAccessViolation;
 }
 
 }  // namespace process::windowsabi

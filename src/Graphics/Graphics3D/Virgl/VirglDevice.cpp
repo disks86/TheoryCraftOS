@@ -235,6 +235,8 @@ class VirglImage final : public IImage {
   Format format() const override { return desc_.format; }
   uint32_t usage() const { return desc_.usage; }
   uint32_t samples() const { return desc_.samples; }
+  bool has_stencil() const { return desc_.stencil; }
+  uint32_t blit_format() const { return desc_.format == Format::D32Float ? (desc_.stencil ? virgl::kFormatZ32FloatS8X24Uint : virgl::kFormatZ32Float) : color_format_; }   // (what a blit calls the image's format)
   uint32_t color_format() const { return color_format_; }
   bool stencil() const { return desc_.stencil; }
   uint32_t layer_count() const override { return desc_.kind == TextureKind::Texture2D ? 1 : desc_.kind == TextureKind::TextureCube ? 6 : desc_.layers; }
@@ -346,7 +348,7 @@ class VirglShaderModule final : public IShaderModule {
     cmd[2] = desc.stage == ShaderStage::Vertex ? virgl::kShaderVertex : desc.stage == ShaderStage::Compute ? virgl::kShaderCompute : desc.stage == ShaderStage::Geometry ? virgl::kShaderGeometry : desc.stage == ShaderStage::Hull ? virgl::kShaderTessControl : desc.stage == ShaderStage::Domain ? virgl::kShaderTessEval : virgl::kShaderFragment;
     cmd[3] = length;                         // total text length (no continuation bit: it all fits)
     cmd[4] = length < 300 ? 300 : length;    // upper bound on the TGSI token count the host reserves
-    cmd[5] = 0;                              // no stream output
+    cmd[5] = desc.stage == ShaderStage::Compute ? desc.shared_memory_bytes : 0;   // no stream output; for a compute shader the group-shared memory it needs, in bytes
     cmd[6 + text_dwords - 1] = 0;
     __builtin_memcpy(&cmd[6], desc.tgsi, length - 1);
     ok_ = device.send_commands(cmd, total);
@@ -610,9 +612,9 @@ void VirglDevice::destroy_buffer(IBuffer* buffer) { destroy(gpu_.allocator(), st
 IImage* VirglDevice::create_image(const ImageDesc& desc) {
   if (desc.mip_levels != 1) return nullptr;   // (no mipmaps either)
   if (desc.samples != 1) {
-    // (a multisampled image is an 8-bit colour or a depth attachment alone: resolved, never read or sampled)
+    // (a multisampled image is an 8-bit colour image, which a shader may read with texel fetches, or a depth attachment alone: resolved)
     const bool depth = desc.format == Format::D32Float;
-    if ((desc.samples != 2 && desc.samples != 4) || desc.kind != TextureKind::Texture2D || desc.usage != (depth ? kImageDepthAttachment : kImageColorAttachment) || (!depth && desc.format != Format::B8G8R8A8Unorm)) return nullptr;
+    if ((desc.samples != 2 && desc.samples != 4) || desc.kind != TextureKind::Texture2D || (depth ? desc.usage != kImageDepthAttachment : (desc.usage & ~kImageSampled) != kImageColorAttachment) || (!depth && desc.format != Format::B8G8R8A8Unorm)) return nullptr;
   }
   if (desc.kind != TextureKind::Texture2D) {
     // (a volume, array or cube is only sampled: 8-bit colour, one level)
@@ -837,14 +839,17 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         const VirglImage* from = static_cast<const VirglImage*>(cmd.image2);
         if (in_pass || !to || !from || to->samples() != 1 || from->samples() < 2 || to->extent().width != from->extent().width || to->extent().height != from->extent().height) return false;
         const Extent2D e = from->extent();
-        const bool flip = to->y0_top();   // (a multisampled image does not take the flag: the host stores it the way GL does, and only a destination kept upright needs the blit to turn it over)
+        const bool depth = to->format() == Format::D32Float;
+        // (the host's blit averages colour and takes the first sample of depth: the other modes are not made)
+        if (static_cast<ResolveMode>(cmd.count) != (depth ? ResolveMode::Sample0 : ResolveMode::Average)) return false;
+        const bool flip = !depth && to->y0_top();   // (a multisampled image does not take the flag: the host stores it the way GL does, and only a destination kept upright needs the blit to turn it over)
         stream.command(virgl::kBlit, 0, 21);
-        stream.put(0xF);   // (all four channels, nearest, no scissor)
+        stream.put(depth ? (to->has_stencil() ? 0x30u : 0x10u) : 0xFu);   // (all four channels, or depth and stencil; nearest, no scissor)
         stream.put(0);
         stream.put(e.width | (e.height << 16));
-        stream.put(to->id()), stream.put(0), stream.put(to->color_format());
+        stream.put(to->id()), stream.put(0), stream.put(to->blit_format());
         stream.put(0), stream.put(flip ? e.height : 0), stream.put(0), stream.put(e.width), stream.put(flip ? static_cast<uint32_t>(-static_cast<int32_t>(e.height)) : e.height), stream.put(1);
-        stream.put(from->id()), stream.put(0), stream.put(from->color_format());
+        stream.put(from->id()), stream.put(0), stream.put(from->blit_format());
         stream.put(0), stream.put(0), stream.put(0), stream.put(e.width), stream.put(e.height), stream.put(1);
         break;
       }
@@ -1058,7 +1063,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         stream.command(virgl::kDrawVbo, 0, patches ? 14 : 12);
         stream.put(cmd.first);
         stream.put(cmd.count);
-        stream.put(patches ? virgl::kPrimPatches : topology == PrimitiveTopology::LineList ? virgl::kPrimLines : topology == PrimitiveTopology::PointList ? virgl::kPrimPoints : virgl::kPrimTriangles);
+        stream.put(patches ? virgl::kPrimPatches : topology == PrimitiveTopology::LineListAdjacency ? virgl::kPrimLinesAdjacency : topology == PrimitiveTopology::TriangleListAdjacency ? virgl::kPrimTrianglesAdjacency : topology == PrimitiveTopology::LineList ? virgl::kPrimLines : topology == PrimitiveTopology::PointList ? virgl::kPrimPoints : virgl::kPrimTriangles);
         stream.put(indexed ? 1 : 0);
         stream.put(cmd.instance_count);
         stream.put(static_cast<uint32_t>(cmd.vertex_offset));

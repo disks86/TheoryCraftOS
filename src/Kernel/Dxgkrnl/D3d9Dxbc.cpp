@@ -45,13 +45,14 @@ enum DxbcOp : uint32_t {
   kDclResource4 = 88, kDclConstantBuffer4 = 89, kDclSampler4 = 90, kDclInput4 = 95, kDclInputSgv4 = 96, kDclInputSiv4 = 97, kDclInputPs4 = 98, kDclInputPsSgv4 = 99, kDclInputPsSiv4 = 100,
   kHsDecls4 = 113, kHsControlPointPhase4 = 114, kHsForkPhase4 = 115, kHsJoinPhase4 = 116, kDclInputControlPointCount4 = 147, kDclOutputControlPointCount4 = 148, kDclTessDomain4 = 149,
   kDclTessPartitioning4 = 150, kDclTessOutputPrimitive4 = 151, kDclHsMaxTessFactor4 = 152, kDclHsForkInstances4 = 153, kDclHsJoinInstances4 = 154,
-  kEmit4 = 19, kCut4 = 9, kDclOutputTopology4 = 92, kDclInputPrimitive4 = 93, kDclMaxOutputVertices4 = 94, kDclThreadGroup4 = 155, kDclUavRaw4 = 157, kDclUavStructured4 = 158, kLdRaw4 = 165, kStoreRaw4 = 166, kLdStructured4 = 167, kStoreStructured4 = 168, kSync4 = 190,
+  kEmit4 = 19, kCut4 = 9, kDclOutputTopology4 = 92, kDclInputPrimitive4 = 93, kDclMaxOutputVertices4 = 94, kDclGsInstanceCount4 = 206, kDclThreadGroup4 = 155, kDclUavRaw4 = 157, kDclUavStructured4 = 158, kLdRaw4 = 165, kStoreRaw4 = 166, kLdStructured4 = 167, kStoreStructured4 = 168, kSync4 = 190, kDclTgsmRaw4 = 159, kDclTgsmStructured4 = 160,
   kDclOutput4 = 101, kDclOutputSgv4 = 102, kDclOutputSiv4 = 103, kDclTemps4 = 104, kDclIndexableTemp4 = 105, kDclGlobalFlags4 = 106,
 };
 // The texture a dcl_resource declares (D3D10_SB_RESOURCE_DIMENSION: 3 texture2d, 5 texture3d, 6 texturecube, 8 texture2darray); the others are not taken.
 bool resource_kind(uint32_t dimension, graphics::TextureKind* kind) {
   switch (dimension) {
     case 3: *kind = graphics::TextureKind::Texture2D; return true;
+    case 4: *kind = graphics::TextureKind::Texture2DMS; return true;   // (dcl_resource_texture2dms: the sample count is in the token)
     case 5: *kind = graphics::TextureKind::Texture3D; return true;
     case 6: *kind = graphics::TextureKind::TextureCube; return true;
     case 8: *kind = graphics::TextureKind::Texture2DArray; return true;
@@ -59,7 +60,7 @@ bool resource_kind(uint32_t dimension, graphics::TextureKind* kind) {
   }
 }
 
-enum OperandType : uint32_t { kOpOutputControlPointId = 22, kOpForkInstanceId = 23, kOpJoinInstanceId = 24, kOpInputControlPoint = 25, kOpInputPatchConstant = 27, kOpDomainPoint = 28, kOpUav = 30, kOpThreadId = 32, kOpThreadGroupId = 33, kOpThreadIdInGroup = 34, kOpThreadIdFlat = 36, kOpTemp = 0, kOpInput = 1, kOpOutput = 2, kOpImmediate = 4, kOpSampler = 6, kOpResource = 7, kOpConstantBuffer = 8, kOpImmediateConstantBuffer = 9, kOpNull = 13 };
+enum OperandType : uint32_t { kOpOutputControlPointId = 22, kOpForkInstanceId = 23, kOpJoinInstanceId = 24, kOpInputControlPoint = 25, kOpInputPatchConstant = 27, kOpDomainPoint = 28, kOpUav = 30, kOpThreadId = 32, kOpThreadGroupId = 33, kOpThreadIdInGroup = 34, kOpThreadIdFlat = 36, kOpGsInstanceId = 37, kOpTgsm = 31, kOpTemp = 0, kOpInput = 1, kOpOutput = 2, kOpImmediate = 4, kOpSampler = 6, kOpResource = 7, kOpConstantBuffer = 8, kOpImmediateConstantBuffer = 9, kOpNull = 13 };
 
 // Where a program made from DXBC keeps what it has no register for: its literals, and the immediate constant buffer (declared in the program) as constants of its own.
 constexpr uint16_t kLiteralBase = 0x4000, kImmediateBufferBase = 0x6000;
@@ -335,6 +336,10 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         if (!hull || phase != 1) return status::kNotSupported;
         s->type = kSysValue, s->number = kSysOutputControlPointId;
         return status::kSuccess;
+      case kOpGsInstanceId:
+        if (!geometry) return status::kNotSupported;
+        s->type = kSysValue, s->number = kSysGsInstanceId;
+        return status::kSuccess;
       case kOpDomainPoint:
         if (!domain) return status::kNotSupported;
         s->type = kSysValue, s->number = kSysDomainLocation;
@@ -563,16 +568,19 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
           if (!resource_kind((token >> 11) & 0x1F, &kind) || o.index[0] >= 8 || o.index[1] != o.index[2] || o.index[1] >= graphics::kMaxTextureUnits || space != 0) return status::kNotSupported;
           texture_register[o.index[0]] = static_cast<int32_t>(o.index[1]);
           program->texture_kind_[o.index[1]] = kind;
+          program->texture_samples_[o.index[1]] = static_cast<uint8_t>((token >> 16) & 0x7F);
           continue;
         }
         if (o.type != kOpResource || o.dims != 1 || !resource_kind((token >> 11) & 0x1F, &kind) || o.index[0] >= graphics::kMaxTextureUnits) return status::kNotSupported;   // two units
         program->texture_kind_[o.index[0]] = kind;
+        program->texture_samples_[o.index[0]] = static_cast<uint8_t>((token >> 16) & 0x7F);
         continue;
       }
       case kDclInput4: case kDclInputPs4: case kDclOutput4: case kDclInputSiv4: case kDclInputPsSiv4: case kDclOutputSiv4: case kDclInputSgv4: case kDclInputPsSgv4: case kDclOutputSgv4: {
         Operand o;
         s = read_operand(p, &o);
         if (s != status::kSuccess) return s;
+        if (geometry && opcode == kDclInput4 && o.type == kOpGsInstanceId) continue;   // (vGSInstanceID)
         if (geometry && (opcode == kDclInput4 || opcode == kDclInputSiv4) && o.type == kOpInput) {
           // v[N][register] (and for the _siv form the system value after it): the signature says what the register is
           if (o.dims != 2 || o.index[0] != geometry_vertices || o.index[1] >= 16 || in_slot[o.index[1]] == kSlotNone) return status::kNotSupported;
@@ -674,11 +682,12 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         if (!hull || p.le32() != 1 || !p.ok()) return status::kNotSupported;   // (one instance of a phase)
         continue;
       case kDclInputPrimitive4: {
-        // (D3D10_SB_PRIMITIVE: 1 point, 2 line, 3 triangle; the adjacency primitives are not taken)
+        // (D3D10_SB_PRIMITIVE: 1 point, 2 line, 3 triangle, 6 line with adjacency, 7 triangle with adjacency)
         const uint32_t primitive = (token >> 11) & 0x3F;
-        if (!geometry || primitive < 1 || primitive > 3) return status::kNotSupported;
-        program->geometry_input_ = primitive == 1 ? graphics::GeometryPrimitive::Point : primitive == 2 ? graphics::GeometryPrimitive::Line : graphics::GeometryPrimitive::Triangle;
-        geometry_vertices = primitive;
+        if (!geometry || !((primitive >= 1 && primitive <= 3) || primitive == 6 || primitive == 7)) return status::kNotSupported;
+        program->geometry_input_ = primitive == 1 ? graphics::GeometryPrimitive::Point : primitive == 2 ? graphics::GeometryPrimitive::Line : primitive == 3 ? graphics::GeometryPrimitive::Triangle
+                                   : primitive == 6 ? graphics::GeometryPrimitive::LineAdjacency : graphics::GeometryPrimitive::TriangleAdjacency;
+        geometry_vertices = primitive == 6 ? 4 : primitive == 7 ? 6 : primitive;
         geometry_input_declared = true;
         continue;
       }
@@ -688,6 +697,12 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         if (!geometry || (topology != 1 && topology != 3 && topology != 5)) return status::kNotSupported;
         program->geometry_output_ = topology == 1 ? graphics::GeometryTopology::PointList : topology == 3 ? graphics::GeometryTopology::LineStrip : graphics::GeometryTopology::TriangleStrip;
         geometry_output_declared = true;
+        continue;
+      }
+      case kDclGsInstanceCount4: {
+        const uint32_t n = p.le32();
+        if (!geometry || !p.ok() || n == 0 || n > 32) return status::kNotSupported;
+        program->geometry_instances_ = n;
         continue;
       }
       case kDclMaxOutputVertices4: {
@@ -704,6 +719,25 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
           return status::kInvalidParameter;
         program->thread_group_[0] = x, program->thread_group_[1] = y, program->thread_group_[2] = z;
         thread_group_declared = true;
+        continue;
+      }
+      case kDclTgsmRaw4: case kDclTgsmStructured4: {
+        // dcl_tgsm_raw g#, bytes / dcl_tgsm_structured g#, stride, count: group-shared memory
+        Operand o;
+        s = read_operand(p, &o);
+        if (s != status::kSuccess) return s;
+        const uint32_t first = p.le32(), second = opcode == kDclTgsmStructured4 ? p.le32() : 0;
+        if (!compute || !p.ok() || o.type != kOpTgsm || o.dims != 1 || o.index[0] >= graphics::kMaxSharedMemories || program->shared_bytes_[o.index[0]] != 0) return status::kNotSupported;
+        const uint32_t slot = graphics::kMaxStorageBuffers + o.index[0];
+        uint64_t bytes = first;
+        if (opcode == kDclTgsmStructured4) {
+          if (first == 0 || first > 2048 || first % 4 || second == 0) return status::kNotSupported;
+          bytes = uint64_t{first} * second;
+        }
+        if (bytes == 0 || bytes % 4 || bytes > graphics::kMaxSharedBytes || program->shared_total_bytes() + bytes > graphics::kMaxSharedBytes) return status::kNotSupported;
+        program->shared_bytes_[o.index[0]] = static_cast<uint32_t>(bytes);
+        program->uav_kind_[slot] = opcode == kDclTgsmRaw4 ? D3d9Program::BufferKind::Raw : D3d9Program::BufferKind::Structured;
+        program->uav_stride_[slot] = opcode == kDclTgsmStructured4 ? first : 0;
         continue;
       }
       case kDclUavRaw4: case kDclUavStructured4: {
@@ -743,6 +777,15 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       s = to_src(c, &ins.src[0]);
       if (s != status::kSuccess) return s;
       ins.src_count = 1;
+    } else if (compute && opcode == kSync4) {
+      // sync_g / sync_ug...: the flags say what it waits for; only the threads of the group matter here (everything else a thread does is already in order for the one running)
+      const uint32_t flags = (token >> 11) & 0xF;
+      if (flags & 1) {
+        ins.op = kBarrier;
+        program->uses_barrier_ = true;
+      } else {
+        ins.op = kNop;
+      }
     } else if (geometry && (opcode == kEmit4 || opcode == kCut4)) {
       ins.op = opcode == kEmit4 ? kGsEmit : kGsCut;
     } else if (opcode == kLoop4 || opcode == kEndloop4 || opcode == kBreak4 || opcode == kContinue4) {
@@ -804,12 +847,15 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       }
       if (!p.at_end()) return status::kInvalidParameter;
       continue;
-    } else if (opcode == 45 || opcode == 72 || opcode == 61) {
+    } else if (opcode == 45 || opcode == 46 || opcode == 72 || opcode == 61 || opcode == 111) {
       // ld (dst, integer address, resource), sample_l (dst, coordinate, resource, sampler, level), resinfo (dst, level, resource): Shader Model 4 texture access beyond sample.
       if (vertex || compute) return status::kNotSupported;
       Operand d, address, resource, sampler, lod;
-      if ((s = read_operand(p, &d)) != status::kSuccess || (s = read_operand(p, &address)) != status::kSuccess || (s = read_operand(p, &resource)) != status::kSuccess) return s;
+      if ((s = read_operand(p, &d)) != status::kSuccess) return s;
+      if (opcode != 111 && (s = read_operand(p, &address)) != status::kSuccess) return s;   // (sampleinfo has no address)
+      if ((s = read_operand(p, &resource)) != status::kSuccess) return s;
       if (opcode == 72 && ((s = read_operand(p, &sampler)) != status::kSuccess || (s = read_operand(p, &lod)) != status::kSuccess)) return s;
+      if (opcode == 46 && (s = read_operand(p, &lod)) != status::kSuccess) return s;   // (ld_ms: the sample)
       uint32_t unit = resource.index[0];
       if (v51) {
         if (resource.type != kOpResource || resource.dims != 2 || resource.index[0] >= 8 || texture_register[resource.index[0]] < 0 || resource.index[1] != static_cast<uint32_t>(texture_register[resource.index[0]]))
@@ -820,7 +866,24 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       }
       if (resource.type != kOpResource || unit >= graphics::kMaxTextureUnits || (opcode == 72 && sampler.type != kOpSampler)) return status::kNotSupported;
       if (opcode == 45 && program->texture_kind_[unit] == graphics::TextureKind::TextureCube) return status::kNotSupported;   // (a cube has no Load)
-      ins.op = opcode == 45 ? kTexFetch : opcode == 72 ? kTexLod : kTexSize;
+      const bool multisampled = program->texture_kind_[unit] == graphics::TextureKind::Texture2DMS;
+      if ((opcode == 46 || opcode == 111) != multisampled && (opcode == 46 || opcode == 111 || opcode == 45 || opcode == 72)) return status::kNotSupported;   // (ld_ms and sampleinfo go with a multisampled texture, and ld and sample_l do not)
+      ins.op = opcode == 45 ? kTexFetch : opcode == 46 ? kTexFetchMs : opcode == 111 ? kTexSamples : opcode == 72 ? kTexLod : kTexSize;
+      if (opcode == 111) {
+        // sampleinfo: the sample count the texture was declared with, as a constant (an unsigned result when the instruction says so)
+        ins.control = static_cast<uint8_t>(program->texture_samples_[unit]);
+        ins.tex_swizzle[0] = ((token >> 11) & 1) ? 1 : 0;
+        s = to_dst(d, &ins.dst);
+        if (s != status::kSuccess) return s;
+        ins.src[0].type = kSampler, ins.src[0].number = static_cast<uint16_t>(unit);
+        ins.src_count = 0;
+        program->uses_textures_ = true;
+        program->uses_texel_access_ = true;
+        if (!p.at_end()) return status::kInvalidParameter;
+        s = emit(ins);
+        if (s != status::kSuccess) return s;
+        continue;
+      }
       if (opcode == 61) {
         const uint32_t mode = (token >> 11) & 3;
         if (mode > 2) return status::kNotSupported;
@@ -832,7 +895,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       if (s != status::kSuccess) return s;
       ins.src[1].type = kSampler, ins.src[1].number = static_cast<uint16_t>(unit);
       ins.src_count = 2;
-      if (opcode == 72) {
+      if (opcode == 72 || opcode == 46) {
         s = to_src(lod, &ins.src[2]);
         if (s != status::kSuccess) return s;
         ins.src_count = 3;
@@ -859,8 +922,9 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         if (structured && (s = read_operand(p, &offset)) != status::kSuccess) return s;
         if ((s = read_operand(p, &value)) != status::kSuccess) return s;
       }
-      if (uav.type != kOpUav || uav.dims != 1 || uav.index[0] >= graphics::kMaxStorageBuffers) return status::kNotSupported;
-      const uint32_t slot = uav.index[0];
+      const bool group_shared = uav.type == kOpTgsm;
+      if ((uav.type != kOpUav && !group_shared) || uav.dims != 1 || uav.index[0] >= (group_shared ? graphics::kMaxSharedMemories : graphics::kMaxStorageBuffers)) return status::kNotSupported;
+      const uint32_t slot = group_shared ? graphics::kMaxStorageBuffers + uav.index[0] : uav.index[0];
       const D3d9Program::BufferKind kind = program->uav_kind_[slot];
       if (kind == D3d9Program::BufferKind::None || ((load || store) && structured != (kind == D3d9Program::BufferKind::Structured))) return status::kNotSupported;   // (an atomic works on either kind)
       ins.uav = static_cast<uint8_t>(slot);
@@ -958,6 +1022,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
     program->color_outputs_ = color_outputs;
   }
   if (compute && (!thread_group_declared || program->code_.count() == 0)) return status::kInvalidParameter;
+  if (compute && program->needs_group() && program->thread_group_[0] * program->thread_group_[1] * program->thread_group_[2] > graphics::kMaxBarrierThreads) return status::kNotSupported;   // (a thread that waits keeps registers of its own)
   if (geometry && (!geometry_input_declared || !geometry_output_declared || program->geometry_max_vertices_ == 0)) return status::kInvalidParameter;
   if (patch_stage) {
     if (!tess_domain_declared || input_points == 0) return status::kInvalidParameter;

@@ -21,13 +21,21 @@
 namespace hardware {
 
 namespace {
-// (nhi.h: PCI_DEVICE_ID_INTEL_ALPINE_RIDGE_*_NHI, TITAN_RIDGE_*_NHI and ICL_NHI0 / NHI1)
+// (nhi.h: PCI_DEVICE_ID_INTEL_ALPINE_RIDGE_*_NHI, TITAN_RIDGE_*_NHI, ICL_NHI0 / NHI1 and the USB4 hosts from TGL_NHI0 on)
 constexpr TbNhiDevice kDevices[] = {
     {0x15BF, "Alpine Ridge LP", TbGeneration::AlpineRidge},          {0x15D2, "Alpine Ridge C 4C", TbGeneration::AlpineRidge},
     {0x15D9, "Alpine Ridge C 2C", TbGeneration::AlpineRidge},        {0x15DC, "Alpine Ridge LP (USB only)", TbGeneration::AlpineRidge},
     {0x15DD, "Alpine Ridge (USB only)", TbGeneration::AlpineRidge},  {0x15DE, "Alpine Ridge C (USB only)", TbGeneration::AlpineRidge},
     {0x15E8, "Titan Ridge 2C", TbGeneration::TitanRidge},            {0x15EB, "Titan Ridge 4C", TbGeneration::TitanRidge},
     {0x8A17, "Ice Lake NHI 0", TbGeneration::IceLake},                {0x8A0D, "Ice Lake NHI 1", TbGeneration::IceLake},
+    {0x9A1B, "Tiger Lake NHI 0", TbGeneration::Usb4},                 {0x9A1D, "Tiger Lake NHI 1", TbGeneration::Usb4},
+    {0x9A1F, "Tiger Lake-H NHI 0", TbGeneration::Usb4},               {0x9A21, "Tiger Lake-H NHI 1", TbGeneration::Usb4},
+    {0x463E, "Alder Lake NHI 0", TbGeneration::Usb4},                 {0x466D, "Alder Lake NHI 1", TbGeneration::Usb4},
+    {0xA73E, "Raptor Lake NHI 0", TbGeneration::Usb4},                {0xA76D, "Raptor Lake NHI 1", TbGeneration::Usb4},
+    {0x7EB2, "Meteor Lake-M NHI 0", TbGeneration::Usb4},              {0x7EC2, "Meteor Lake-P NHI 0", TbGeneration::Usb4},
+    {0x7EC3, "Meteor Lake-P NHI 1", TbGeneration::Usb4},              {0xA833, "Lunar Lake NHI 0", TbGeneration::Usb4},
+    {0xA834, "Lunar Lake NHI 1", TbGeneration::Usb4},                 {0x5781, "Barlow Ridge host (80G)", TbGeneration::Usb4},
+    {0x5784, "Barlow Ridge host (40G)", TbGeneration::Usb4},
 };
 }  // namespace
 

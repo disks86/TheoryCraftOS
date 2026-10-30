@@ -176,9 +176,9 @@ uint32_t resume_process_handle(Process& p, uint64_t handle, uint32_t* previous, 
 
 uint32_t nt_create_user_process(Process& p, const SyscallRequest& r) {
   uint64_t cwd_at = 0, environment_at = 0, flags_arg = 0, pid_out = 0, tid_out = 0;
-  uint64_t std_handles[3] = {};
+  uint64_t std_handles[3] = {}, startup_at = 0;
   if (!argument(p, r, 4, &cwd_at) || !argument(p, r, 5, &environment_at) || !argument(p, r, 6, &flags_arg) || !argument(p, r, 7, &pid_out) || !argument(p, r, 8, &tid_out) ||
-      !argument(p, r, 9, &std_handles[0]) || !argument(p, r, 10, &std_handles[1]) || !argument(p, r, 11, &std_handles[2]))
+      !argument(p, r, 9, &std_handles[0]) || !argument(p, r, 10, &std_handles[1]) || !argument(p, r, 11, &std_handles[2]) || !argument(p, r, 12, &startup_at))
     return kAccessViolation;
   ObjectManager* objects = system_objects();
   IProcessRuntime* runtime = p.runtime();
@@ -204,7 +204,27 @@ uint32_t nt_create_user_process(Process& p, const SyscallRequest& r) {
     entries[found++] = rest.first(length);
     at += length + 1;
   }
+  // The startup block: ULONG size, flags, x, y, xsize, ysize, xchars, ychars, fill, show, console flags, reserved; HANDLE console; PUNICODE_STRING title, desktop.
+  String startup_title(allocator), startup_desktop(allocator);
+  uint32_t startup_words[12] = {};
+  uint64_t startup_console = 0;
+  if (startup_at != 0) {
+    uint8_t block[48 + 24];
+    if (!p.read_user(startup_at, ByteView(block, sizeof(block)))) return kAccessViolation;
+    for (uint32_t i = 0; i < 12; ++i) startup_words[i] = block[4 * i] | (uint32_t{block[4 * i + 1]} << 8) | (uint32_t{block[4 * i + 2]} << 16) | (uint32_t{block[4 * i + 3]} << 24);
+    uint64_t pointers[3] = {};
+    for (uint32_t k = 0; k < 3; ++k) for (uint32_t i = 0; i < 8; ++i) pointers[k] |= uint64_t{block[48 + 8 * k + i]} << (8 * i);
+    startup_console = pointers[0];
+    status = read_text(p, pointers[1], &startup_title);
+    if (status == kSuccess) status = read_text(p, pointers[2], &startup_desktop);
+    if (status != kSuccess) return status;
+  }
   ChildSpec spec;
+  spec.startup.flags = startup_words[1]; spec.startup.x = startup_words[2]; spec.startup.y = startup_words[3]; spec.startup.x_size = startup_words[4]; spec.startup.y_size = startup_words[5];
+  spec.startup.x_chars = startup_words[6]; spec.startup.y_chars = startup_words[7]; spec.startup.fill_attribute = startup_words[8]; spec.startup.show_window = startup_words[9];
+  spec.startup.console_flags = startup_words[10]; spec.startup.console_handle = startup_console;
+  spec.startup.title = startup_title.view();
+  spec.startup.desktop = startup_desktop.view();
   spec.pid = runtime->allocate_process_id();
   if (spec.pid == 0) return kNoResources;
   spec.image = image.view();
@@ -354,6 +374,7 @@ uint32_t nt_query_information_process(Process& p, const SyscallRequest& r) {
     b.put(16, runtime ? runtime->affinity(0) : 1, 8);                   // AffinityMask
     b.put(24, 8, 8);                                                    // BasePriority
     b.put(32, self ? p.id() : child_pid, 8);                            // UniqueProcessId
+    b.put(40, self ? p.parent_id() : p.id(), 8);                        // InheritedFromUniqueProcessId
     size = 48;
   } else if (info_class == 37) {      // ProcessImageInformation: SECTION_IMAGE_INFORMATION
     const uint8_t(&image)[64] = self ? p.image_information() : remote_image;

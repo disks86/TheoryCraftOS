@@ -866,6 +866,7 @@ uint32_t Task::spawn_process(const process::ChildSpec& spec) {
   p.set_working_directory(spec.working_directory);
   p.set_processor_count(processor_count());
   p.set_command_line(spec.command_line);
+  p.set_startup(spec.startup);
   // argv: the program's name, then (for a Linux program) the words of the command line
   StringView argv[32];
   uint32_t argc = 0;
@@ -907,6 +908,7 @@ uint32_t Task::spawn_process(const process::ChildSpec& spec) {
     p.process()->files().inherit_from(program.process()->files(), count_use);
   }
   if (spec.use_std_handles) p.set_standard_handles(spec.std_handles);
+  if (p.process()) p.process()->set_parent_id(program.process()->id());
   child->task = usermode::spawn(p, allocator_, "program", spec.suspended);
   if (!child->task) { discard(); return kNoResources; }
   child->started = !spec.suspended;

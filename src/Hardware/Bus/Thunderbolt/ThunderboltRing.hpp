@@ -57,6 +57,8 @@ class TbNhi {
   // With MSI-X (`vector` >= 0, one of the table's first 16 entries) the two rings' interrupts are also routed to that entry (the vector allocation registers) and the chip is told to clear
   // the status bits itself; with MSI (-1) all the rings share the one message.
   void set_control_interrupts(bool on, int vector = -1);
+  // The same for any ring: the ring on `hop`, transmit or receive (a data ring once it runs; a ring's interrupt is off until this turns it on, and must be turned off before the hop is released).
+  void set_ring_interrupts(bool transmit, uint32_t hop, bool on, int vector = -1);
   // What the interrupt handler does: reads all the notify registers, which is what lets the chip raise the next interrupt (they are read-to-clear, even those of rings that are masked).
   // True if any ring had something to say. Touches only registers, so it is fine in an interrupt handler.
   bool acknowledge_interrupt();

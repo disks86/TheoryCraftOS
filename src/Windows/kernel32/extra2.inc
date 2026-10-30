@@ -75,59 +75,6 @@ EXPORT BOOL WINAPI GetDiskFreeSpaceA(LPCSTR root, LPDWORD sectors_per_cluster, L
   free_wide(w);
   return ok;
 }
-EXPORT BOOL WINAPI GetVolumeInformationW(LPCWSTR root, LPWSTR label, DWORD label_size, LPDWORD serial, LPDWORD max_component, LPDWORD flags, LPWSTR file_system, DWORD file_system_size) {
-  HANDLE h = open_volume(root);
-  if (!h) return FALSE;
-  IO_STATUS_BLOCK iosb;
-  BYTE volume[18 + 2 * 64], attributes[12 + 2 * 32];
-  NTSTATUS status = NtQueryVolumeInformationFile(h, &iosb, volume, sizeof(volume), 1);      /* FileFsVolumeInformation */
-  if (NT_SUCCESS(status)) status = NtQueryVolumeInformationFile(h, &iosb, attributes, sizeof(attributes), 5);      /* FileFsAttributeInformation */
-  NtClose(h);
-  if (!NT_SUCCESS(status)) return fail_nt(status);
-  const DWORD label_bytes = get32(volume + 12), name_bytes = get32(attributes + 8);
-  if (label) { if (label_size * 2 < label_bytes + 2) { set_error(ERROR_MORE_DATA); return FALSE; } memcpy(label, volume + 18, label_bytes); label[label_bytes / 2] = 0; }
-  if (file_system) { if (file_system_size * 2 < name_bytes + 2) { set_error(ERROR_MORE_DATA); return FALSE; } memcpy(file_system, attributes + 12, name_bytes); file_system[name_bytes / 2] = 0; }
-  if (serial) *serial = get32(volume + 8);
-  if (max_component) *max_component = get32(attributes + 4);
-  if (flags) *flags = get32(attributes);
-  return TRUE;
-}
-EXPORT BOOL WINAPI GetVolumeInformationA(LPCSTR root, LPSTR label, DWORD label_size, LPDWORD serial, LPDWORD max_component, LPDWORD flags, LPSTR file_system, DWORD file_system_size) {
-  WCHAR *w = root ? to_wide(root) : NULL;
-  if (root && !w) return FALSE;
-  WCHAR wide_label[64], wide_system[32];
-  const BOOL ok = GetVolumeInformationW(w, wide_label, 64, serial, max_component, flags, wide_system, 32);
-  free_wide(w);
-  if (!ok) return FALSE;
-  if (label && label_size) { if (WideCharToMultiByte(CP_UTF8, 0, wide_label, -1, label, (int)label_size, NULL, NULL) == 0) { set_error(ERROR_MORE_DATA); return FALSE; } }
-  if (file_system && file_system_size) { if (WideCharToMultiByte(CP_UTF8, 0, wide_system, -1, file_system, (int)file_system_size, NULL, NULL) == 0) { set_error(ERROR_MORE_DATA); return FALSE; } }
-  return TRUE;
-}
-EXPORT BOOL WINAPI GetVolumePathNameW(LPCWSTR file, LPWSTR buffer, DWORD capacity) {
-  WCHAR full[PATH_CHARS];
-  if (!file || full_path_w(file, full, PATH_CHARS) == 0) return FALSE;
-  if (capacity < 4) { set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
-  buffer[0] = full[0]; buffer[1] = ':'; buffer[2] = '\\'; buffer[3] = 0;
-  return TRUE;
-}
-EXPORT BOOL WINAPI GetVolumePathNameA(LPCSTR file, LPSTR buffer, DWORD capacity) {
-  WCHAR *w = file ? to_wide(file) : NULL;
-  if (!w) return FALSE;
-  WCHAR out[8];
-  const BOOL ok = GetVolumePathNameW(w, out, 8);
-  free_wide(w);
-  if (!ok || capacity < 4) return FALSE;
-  buffer[0] = (char)out[0]; buffer[1] = ':'; buffer[2] = '\\'; buffer[3] = 0;
-  return TRUE;
-}
-EXPORT BOOL WINAPI GetVolumeNameForVolumeMountPointW(LPCWSTR mount_point, LPWSTR name, DWORD capacity) {
-  (void)mount_point;
-  static const WCHAR volume[] = {'\\', '\\', '?', '\\', 'V', 'o', 'l', 'u', 'm', 'e', '{', '0', '0', '0', '0', '0', '0', '0', '0', '-', '0', '0', '0', '0', '-', '0', '0', '0', '0', '-', '0', '0', '0', '0', '-', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '1', '}', '\\', 0};
-  if (capacity < sizeof(volume) / 2) { set_error(ERROR_FILENAME_EXCED_RANGE); return FALSE; }
-  memcpy(name, volume, sizeof(volume));
-  return TRUE;
-}
-
 /* SearchPath: `path` is a list of folders separated by ';' (NULL: the usual places). */
 EXPORT DWORD WINAPI SearchPathW(LPCWSTR path, LPCWSTR file, LPCWSTR extension, DWORD capacity, LPWSTR buffer, LPWSTR *file_part) {
   WCHAR found[PATH_CHARS];
