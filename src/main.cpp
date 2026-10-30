@@ -1233,7 +1233,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         if (thunderbolt->start(pci, d, register_mapper) == hardware::ThunderboltDriver::Outcome::Started) {
           if (!smb_random.ready()) smb_random.initialize();
           thunderbolt_keys = UniquePointer<hardware::FileTbKeyStore>::make(shared_allocator, explorer_files.file_system(), shared_allocator);
-          if (thunderbolt_keys) thunderbolt->icm()->set_secure(&smb_random, thunderbolt_keys.get());
+          if (thunderbolt_keys && thunderbolt->icm()) thunderbolt->icm()->set_secure(&smb_random, thunderbolt_keys.get());
           // MSI-X first (the first entry of the table carries the control channel's rings), then MSI: the handler, then the message to the core that runs this. Kept only if an interrupt
           // arrives for a request of the controller.
           const uint32_t tb_apic_id = kernel::running() ? kernel::apic::this_apic_id() : 0xFFFF;
@@ -1241,8 +1241,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
             kernel::set_interrupt_handler(kernel::kVectorThunderbolt, &on_thunderbolt_interrupt, thunderbolt.get());
             auto check_interrupt = [&]() {
               const uint32_t before = thunderbolt->interrupts();
-              uint32_t word = 0;
-              thunderbolt->icm()->control().read_config(0, 0, hardware::TbConfigSpace::Switch, 0, ArrayView<uint32_t>(&word, 1), 100000, nullptr, thunderbolt->icm());
+              thunderbolt->probe_control();
               hardware::delay_us(2000);
               return thunderbolt->interrupts() != before;
             };
@@ -1263,7 +1262,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
             }
           }
           // networking to another host: offered in our properties, an interface for the network stack that gets an address when the cable's other end answers
-          thunderbolt_net = UniquePointer<hardware::ThunderboltNet>::make(shared_allocator, *thunderbolt->icm(), shared_allocator, smb_random);
+          if (thunderbolt->icm()) thunderbolt_net = UniquePointer<hardware::ThunderboltNet>::make(shared_allocator, *thunderbolt->icm(), shared_allocator, smb_random);
           if (thunderbolt_net && thunderbolt->icm()->offer_network(hardware::ThunderboltNet::offered_flags(hardware::ThunderboltNet::Config())) && thunderbolt_net->initialize()) {
             UniquePointer<hardware::ThunderboltNetLink> link = UniquePointer<hardware::ThunderboltNetLink>::make(shared_allocator, thunderbolt_net.get());
             hardware::ThunderboltNetLink* raw = link.get();
@@ -1272,7 +1271,15 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
             stacks.start_service();
           }
           Entry e(Level::Ok, "Thunderbolt");
-          e.text(thunderbolt->model()->name).text(thunderbolt_msix ? " (MSI-X)" : thunderbolt_msi_working ? " (MSI)" : " (polled)").text(", security level ").dec(static_cast<uint32_t>(thunderbolt->icm()->security_level())).text(", firmware ").dec(thunderbolt->icm()->driver_ready().rom_version).text(".").dec(thunderbolt->icm()->driver_ready().ram_version);
+          e.text(thunderbolt->model()->name).text(thunderbolt_msix ? " (MSI-X)" : thunderbolt_msi_working ? " (MSI)" : " (polled)");
+          if (thunderbolt->icm()) {
+            e.text(", security level ").dec(static_cast<uint32_t>(thunderbolt->icm()->security_level())).text(", firmware ").dec(thunderbolt->icm()->driver_ready().rom_version).text(".").dec(thunderbolt->icm()->driver_ready().ram_version);
+          } else if (thunderbolt->usb4()) {
+            // the connection manager is ours: the routers found, and tunnels left by the BIOS that were switched off
+            e.text(", software connection manager: ").dec(thunderbolt->usb4()->present_count()).text(" router(s)");
+            if (thunderbolt->usb4()->preboot_tunnels_closed()) e.text(", ").dec(thunderbolt->usb4()->preboot_tunnels_closed()).text(" tunnel(s) of the BIOS closed");
+            e.text("; no PCIe tunnel is made until one is approved");
+          }
         } else {
           Entry(Level::Warning, "Thunderbolt").text(thunderbolt->model() ? thunderbolt->model()->name : "controller").text(" not started: ").text(thunderbolt->message());
           thunderbolt = UniquePointer<hardware::ThunderboltDriver>();
@@ -1817,9 +1824,9 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         // Idle (no device, no other host, the firmware allows it) for half a minute: sleep, with the wake armed in ACPI so that a plugged in cable is noticed.
         if (!tb_asleep) {
           const uint64_t tb_now = hardware::uptime_us();
-          if (thunderbolt->icm()->device_count() != 0 || thunderbolt->icm()->xdomain_count() != 0 || !acpi_events || !thunderbolt_wake.controller) {
+          if (thunderbolt->device_count() != 0 || thunderbolt->xdomain_count() != 0 || !acpi_events || !thunderbolt_wake.controller) {
             tb_idle_since = tb_now;
-          } else if (tb_now - tb_idle_since >= 30000000ull && thunderbolt->icm()->runtime_allowed()) {
+          } else if (tb_now - tb_idle_since >= 30000000ull && thunderbolt->runtime_allowed()) {
             tb_idle_since = tb_now;                                  // (whatever happens, the next try is half a minute away)
             if (thunderbolt->runtime_suspend(true)) {
               tb_asleep = true;
@@ -1835,7 +1842,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
             thunderbolt->poll();                                     // (what woke it is in the control channel)
           }
         }
-        const uint64_t now_devices = thunderbolt->icm()->device_count();
+        const uint64_t now_devices = thunderbolt->device_count();
         if (now_devices != thunderbolt_devices) {
           desktop.notify(StringView("Thunderbolt"), StringView(now_devices > thunderbolt_devices ? "A Thunderbolt device was connected (not authorized: no PCIe tunnel)" : "A Thunderbolt device was removed"),
                          gui::NoticeKind::Information);
