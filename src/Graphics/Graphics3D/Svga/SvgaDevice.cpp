@@ -429,6 +429,9 @@ bool SvgaDevice::submit(ICommandBuffer* commands) {
         in_pass = true;
         break;
       }
+      case RecordedCommand::Type::BindComputePipeline:
+      case RecordedCommand::Type::BindStorageBuffer:
+      case RecordedCommand::Type::Dispatch:
       case RecordedCommand::Type::BeginQuery:
       case RecordedCommand::Type::EndQuery:
         return false;   // (no occlusion queries: DeviceInfo::features says so)

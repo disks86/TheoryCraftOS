@@ -544,8 +544,9 @@ struct FakeCommands final : graphics::ICommandBuffer {
   }
   void set_viewport(const graphics::Viewport& v) override { viewport = v; }
   void set_scissor(const graphics::Rect2D& r) override { scissor = r; }
-  void draw(uint32_t n, uint32_t) override { ++draws; last_vertices = n; }
-  void draw_indexed(uint32_t, uint32_t, int32_t) override {}
+  void draw(uint32_t n, uint32_t, uint32_t, uint32_t) override { ++draws; last_vertices = n; }
+  void draw_indexed(uint32_t, uint32_t, int32_t, uint32_t, uint32_t) override {}
+  void set_primitive_topology(graphics::PrimitiveTopology) override {}
   void end_render_pass() override {}
   bool end() override { return true; }
 };

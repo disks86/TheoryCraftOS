@@ -1225,7 +1225,8 @@ X86_64Cpu::Step X86_64Cpu::xsave_family(GuestMemory& m, uint32_t kind) {
       uint8_t area[128] = {};
       auto put = [&](uint32_t at_byte, uint64_t v, uint32_t n) { for (uint32_t b = 0; b < n; ++b) area[at_byte + b] = static_cast<uint8_t>(v >> (8 * b)); };
       put(0, lwp_.cb, 8); put(8, lwp_.buffer_base, 8); put(16, lwp_.missed, 8); put(24, lwp_.buffer_size, 4); put(28, lwp_.flags, 4); put(32, lwp_.threshold, 4);
-      put(36, lwp_.random_bits, 4); put(40, lwp_.head, 4); put(44, static_cast<uint32_t>(lwp_.counter), 4); put(48, static_cast<uint32_t>(lwp_.interval), 4);
+      put(36, lwp_.random_bits, 4); put(40, lwp_.head, 4); put(44, lwp_.filters, 4); put(48, lwp_.base_ip, 8); put(56, lwp_.limit_ip, 8);
+      for (uint32_t id = 1; id <= 6; ++id) { put(64 + 8 * (id - 1), static_cast<uint32_t>(lwp_.counter[id]), 4); put(68 + 8 * (id - 1), static_cast<uint32_t>(lwp_.interval[id]), 4); }
       if (!m.write(address + at[7], ConstByteView(area, sizeof(area)))) return fail(14, address + at[7], 2);
     }
     if (in_use & 0x40000)
@@ -1272,8 +1273,9 @@ X86_64Cpu::Step X86_64Cpu::xsave_family(GuestMemory& m, uint32_t kind) {
       auto get = [&](uint32_t at_byte, uint32_t n) { uint64_t v = 0; for (uint32_t b = 0; b < n; ++b) v |= uint64_t{area[at_byte + b]} << (8 * b); return v; };
       restored.cb = get(0, 8); restored.buffer_base = get(8, 8); restored.missed = get(16, 8); restored.buffer_size = static_cast<uint32_t>(get(24, 4)); restored.flags = static_cast<uint32_t>(get(28, 4));
       restored.threshold = static_cast<uint32_t>(get(32, 4)); restored.random_bits = static_cast<uint32_t>(get(36, 4)); restored.head = static_cast<uint32_t>(get(40, 4));
-      restored.counter = static_cast<int32_t>(get(44, 4)); restored.interval = static_cast<int32_t>(get(48, 4));
-      if (restored.cb != 0 && (restored.buffer_size % 32 != 0 || restored.buffer_size < 32 * 32 || restored.head >= restored.buffer_size || (restored.flags & ~0x60000002u))) return fail(13);
+      restored.filters = static_cast<uint32_t>(get(44, 4)); restored.base_ip = get(48, 8); restored.limit_ip = get(56, 8);
+      for (uint32_t id = 1; id <= 6; ++id) { restored.counter[id] = static_cast<int32_t>(get(64 + 8 * (id - 1), 4)); restored.interval[id] = static_cast<int32_t>(get(68 + 8 * (id - 1), 4)); }
+      if (restored.cb != 0 && (restored.buffer_size % 32 != 0 || restored.buffer_size < 32 * 32 || restored.head >= restored.buffer_size || (restored.flags & ~0xE000006Eu))) return fail(13);
       if (restored.cb == 0) restored = Lwp();
     }
     lwp_ = restored;

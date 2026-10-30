@@ -17,6 +17,7 @@
  */
 
 #include "Hardware/GraphicsProcessingUnit/Virtio/VirtioGpu.hpp"
+#include "Utility/ByteStream.hpp"
 #include <new>
 #include "Kernel/Apic.hpp"
 #include "Kernel/Delay.hpp"
@@ -178,7 +179,21 @@ bool VirtioGpu::setup_3d() {
     RespCapsetInfo info{};
     if (execute(as_bytes(query), ByteView(reinterpret_cast<uint8_t*>(&info), sizeof(info))) != kRespOkCapsetInfo)
       continue;
-    if (info.capset_id == kCapsetVirgl || info.capset_id == kCapsetVirgl2) virgl = true;
+    if (info.capset_id == kCapsetVirgl || info.capset_id == kCapsetVirgl2) {
+      virgl = true;
+      if (!virgl_bset_) {
+        // (version 1 of either set starts with virgl_caps_v1: max_version, four 64-byte format masks, then bset and glsl_level)
+        GetCapset request{header(kCmdGetCapset), info.capset_id, 1};
+        RespCapset caps{};
+        if (execute(as_bytes(request), ByteView(reinterpret_cast<uint8_t*>(&caps), sizeof(caps))) == kRespOkCapset) {
+          ByteReader in{ConstByteView(caps.data, sizeof(caps.data))};
+          in.skip(4 + 4 * 64);
+          virgl_bset_ = in.le32();
+          virgl_glsl_level_ = in.le32();
+          if (!in.ok()) virgl_bset_ = virgl_glsl_level_ = 0;
+        }
+      }
+    }
   }
   if (!virgl) return false;
   CtxCreate ctx{};

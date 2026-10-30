@@ -36,6 +36,7 @@ struct AllocRec {
   SharedPointer<Allocation> allocation;
   Handle device = 0;
   bool locked = false, read_only = false;
+  bool acquired = false;   // lent out by acquire_image (and pinned)
 };
 struct ContextRec {
   SharedPointer<ContextObject> context;
@@ -535,6 +536,41 @@ NtStatus Kernel::unlock(ProcessId pid, Handle allocation) {
   return status::kSuccess;
 }
 
+NtStatus Kernel::acquire_image(ProcessId pid, Handle allocation, AcquiredImage* out) {
+  kernel::ScopedMutex g(lock_);
+  Process* p = find_process(pid);
+  AllocRec* rec = p ? p->allocations.raw(allocation) : nullptr;
+  if (!rec || !out) return status::kInvalidHandle;
+  Allocation& a = *rec->allocation;
+  if (!a.is_image() || a.is_depth() || a.is_staging() || !(a.desc().flags & kAllocTexture) || !(a.desc().flags & kAllocRenderTarget)) return status::kNotSupported;
+  if (rec->locked || rec->acquired) return status::kInvalidDeviceState;
+  Adapter* adapter = nullptr;
+  for (UniquePointer<Adapter>& ad : adapters_.view())
+    if (&ad->vidmm() == &a.manager()) adapter = ad.get();
+  if (!adapter) return status::kInvalidDeviceState;
+  adapter->pump();
+  if (adapter->allocation_in_use(a)) return status::kGraphicsAllocationBusy;
+  const NtStatus s = a.manager().make_resident(a);
+  if (s != status::kSuccess) return s;
+  if (!a.image()) return status::kInvalidDeviceState;
+  a.manager().pin(a);
+  rec->acquired = true;
+  out->device = &adapter->device();
+  out->image = a.image();
+  return status::kSuccess;
+}
+
+NtStatus Kernel::release_image(ProcessId pid, Handle allocation) {
+  kernel::ScopedMutex g(lock_);
+  Process* p = find_process(pid);
+  AllocRec* rec = p ? p->allocations.raw(allocation) : nullptr;
+  if (!rec) return status::kInvalidHandle;
+  if (!rec->acquired) return status::kInvalidDeviceState;
+  rec->allocation->manager().unpin(*rec->allocation);
+  rec->acquired = false;
+  return status::kSuccess;
+}
+
 NtStatus Kernel::make_resident(ProcessId pid, Handle device, ArrayView<const Handle> allocations) {
   kernel::ScopedMutex g(lock_);
   Process* p = find_process(pid);
@@ -767,6 +803,19 @@ NtStatus Kernel::create_shader_locked(Process& p, Handle device, const ShaderDes
 NtStatus Kernel::create_pipeline_locked(Process& p, Handle device, const PipelineDesc& desc, Handle* pipeline) {
   DeviceObject* d = p.devices.raw(device);
   if (!d) return status::kInvalidHandle;
+  if (desc.compute_shader) {
+    SharedPointer<ShaderRec> cs = p.shaders.get(desc.compute_shader);
+    if (!cs || cs->device != device) return status::kInvalidHandle;
+    SharedPointer<PipelineObject> compute;
+    const NtStatus ct = d->adapter().create_compute_pipeline(cs->shader, &compute);
+    if (ct != status::kSuccess) return ct;
+    SharedPointer<PipelineRec> crec = SharedPointer<PipelineRec>::make(allocator_);
+    if (!crec) return status::kNoMemory;
+    crec->pipeline = compute;
+    crec->device = device;
+    *pipeline = p.pipelines.insert(crec);
+    return *pipeline ? status::kSuccess : status::kInsufficientResources;
+  }
   SharedPointer<ShaderRec> vs = p.shaders.get(desc.vertex_shader), fs = p.shaders.get(desc.fragment_shader);
   if (!vs || !fs || vs->device != device || fs->device != device) return status::kInvalidHandle;
   SharedPointer<PipelineObject> pipe;
@@ -818,7 +867,7 @@ NtStatus Kernel::escape(ProcessId pid, Handle device, ConstByteView request, Byt
     case EscapeOp::CreateShader: {
       ShaderDesc desc;
       const uint32_t kind = in.le32(), stage = in.le32(), bytes = in.le32();
-      if (!in.ok() || kind > static_cast<uint32_t>(ShaderKind::Dxbc) || stage > 1) return status::kInvalidParameter;
+      if (!in.ok() || kind > static_cast<uint32_t>(ShaderKind::Dxbc) || stage > 2) return status::kInvalidParameter;
       desc.kind = static_cast<ShaderKind>(kind);
       desc.stage = static_cast<graphics::ShaderStage>(stage);
       desc.code = in.take(bytes);
@@ -897,6 +946,17 @@ NtStatus Kernel::escape(ProcessId pid, Handle device, ConstByteView request, Byt
       desc.stencil.compare_mask = static_cast<uint8_t>(compare_mask);
       desc.stencil.write_mask = static_cast<uint8_t>(write_mask);
       desc.stencil.reference = static_cast<uint8_t>(reference);
+      Handle h = 0;
+      const NtStatus st = create_pipeline_locked(*p, device, desc, &h);
+      if (st != status::kSuccess) return st;
+      out.le32(h);
+      break;
+    }
+    case EscapeOp::CreateComputePipeline: {
+      PipelineDesc desc;
+      desc.compute_shader = in.le32();
+      if (!in.ok() || !in.at_end()) return status::kInvalidParameter;
+      if (reply.size() < 4) return status::kBufferTooSmall;
       Handle h = 0;
       const NtStatus st = create_pipeline_locked(*p, device, desc, &h);
       if (st != status::kSuccess) return st;

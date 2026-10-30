@@ -26,6 +26,7 @@
 #pragma once
 #include "Allocators/IAllocator.hpp"
 #include "Graphics/GraphicsTypes.hpp"
+#include "Graphics/Graphics3D/IGraphicsDevice.hpp"
 #include "Kernel/Dxgkrnl/DxgKernel.hpp"
 #include "Utility/UniquePointer.hpp"
 
@@ -55,7 +56,8 @@ class CubeRenderer {
   static uint32_t find_adapter(dxgk::Kernel& kernel, bool accelerated);
 
   // Creates everything for a picture of this size on the adapter. False (and nothing is held) if the kernel refuses anything essential; the logo is best effort.
-  bool open(uint32_t adapter_index, uint32_t width, uint32_t height);
+  // `shareable`: the color target can also be sampled, so that a renderer on the same device can show it in place (acquire_target) and the frame need not be read back.
+  bool open(uint32_t adapter_index, uint32_t width, uint32_t height, bool shareable = false);
   void close();
   bool is_open() const { return static_cast<bool>(state_); }
   uint32_t adapter_index() const { return adapter_index_; }
@@ -65,8 +67,16 @@ class CubeRenderer {
   // Whether the faces can show the logo (known once open).
   bool texture_available() const { return texture_available_; }
 
-  // Draws one frame at `angle` (radians around the cube's turn) and copies it into picture(). `textured` is honoured when texture_available().
-  bool render(float angle, bool textured, CubeFrameTimes* times);
+  // Draws one frame at `angle` (radians around the cube's turn) and copies it into picture(). `textured` is honoured when texture_available(). Without `read_back` the frame stays on
+  // the GPU (picture() is then the frame before): show it with acquire_target(), or fetch_picture() to have it on the CPU after all.
+  bool render(float angle, bool textured, CubeFrameTimes* times, bool read_back = true);
+  // Whether the color target can be lent to a renderer on the adapter's device.
+  bool shareable() const { return shareable_; }
+  // Lends the device and its image of the last frame's color target; release_target() when done with it (the next render() needs it back).
+  bool acquire_target(graphics::IGraphicsDevice** device, graphics::IImage** image);
+  void release_target();
+  // The last frame, read back into picture() now (what render() does unless told not to).
+  bool fetch_picture() { return state_ && read_back(); }
   // The last frame, B8G8R8A8.
   const graphics::Surface& picture() const { return picture_; }
   bool last_textured() const { return last_textured_; }
@@ -91,6 +101,8 @@ class CubeRenderer {
   graphics::Surface picture_;
   bool texture_available_ = false;
   bool last_textured_ = false;
+  bool shareable_ = false;
+  bool target_lent_ = false;
 };
 
 }  // namespace desktop

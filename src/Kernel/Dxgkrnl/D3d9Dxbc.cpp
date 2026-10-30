@@ -43,6 +43,7 @@ enum DxbcOp : uint32_t {
   kGe4 = 29, kIf4 = 31, kLog4 = 47, kLt4 = 49, kMad4 = 50, kMin4 = 51, kMax4 = 52, kCustomData4 = 53, kMov4 = 54, kMovc4 = 55, kMul4 = 56, kNe4 = 57, kNop4 = 58, kRet4 = 62,
   kRoundNe4 = 64, kRoundNi4 = 65, kRoundPi4 = 66, kRoundZ4 = 67, kRsq4 = 68, kSample4 = 69, kSqrt4 = 75, kSincos4 = 77,
   kDclResource4 = 88, kDclConstantBuffer4 = 89, kDclSampler4 = 90, kDclInput4 = 95, kDclInputSgv4 = 96, kDclInputSiv4 = 97, kDclInputPs4 = 98, kDclInputPsSgv4 = 99, kDclInputPsSiv4 = 100,
+  kDclThreadGroup4 = 155, kDclUavRaw4 = 157, kDclUavStructured4 = 158, kLdRaw4 = 165, kStoreRaw4 = 166, kLdStructured4 = 167, kStoreStructured4 = 168, kSync4 = 190,
   kDclOutput4 = 101, kDclOutputSgv4 = 102, kDclOutputSiv4 = 103, kDclTemps4 = 104, kDclIndexableTemp4 = 105, kDclGlobalFlags4 = 106,
 };
 // The texture a dcl_resource declares (D3D10_SB_RESOURCE_DIMENSION: 3 texture2d, 5 texture3d, 6 texturecube, 8 texture2darray); the others are not taken.
@@ -56,7 +57,7 @@ bool resource_kind(uint32_t dimension, graphics::TextureKind* kind) {
   }
 }
 
-enum OperandType : uint32_t { kOpTemp = 0, kOpInput = 1, kOpOutput = 2, kOpImmediate = 4, kOpSampler = 6, kOpResource = 7, kOpConstantBuffer = 8, kOpImmediateConstantBuffer = 9, kOpNull = 13 };
+enum OperandType : uint32_t { kOpUav = 30, kOpThreadId = 32, kOpThreadGroupId = 33, kOpThreadIdInGroup = 34, kOpThreadIdFlat = 36, kOpTemp = 0, kOpInput = 1, kOpOutput = 2, kOpImmediate = 4, kOpSampler = 6, kOpResource = 7, kOpConstantBuffer = 8, kOpImmediateConstantBuffer = 9, kOpNull = 13 };
 
 // Where a program made from DXBC keeps what it has no register for: its literals, and the immediate constant buffer (declared in the program) as constants of its own.
 constexpr uint16_t kLiteralBase = 0x4000, kImmediateBufferBase = 0x6000;
@@ -159,7 +160,8 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
   const uint32_t version = in.le32(), length = in.le32();
   const uint32_t program_type = version >> 16, major = (version >> 4) & 0xF, minor = version & 0xF;
   if (length != shader.size() / 4) return status::kInvalidParameter;
-  if (program_type != 0 && program_type != 1) return status::kNotSupported;   // pixel and vertex shaders only
+  if (program_type != 0 && program_type != 1 && program_type != 5) return status::kNotSupported;   // pixel, vertex and compute shaders only
+  if (program_type == 5 && major != 5) return status::kNotSupported;
   if (!((major == 4 && minor <= 1) || (major == 5 && minor <= 1))) return status::kNotSupported;
   const bool v51 = major == 5 && minor == 1;   // (constant buffers, textures and samplers are ranges with a space: cb[ID][index][element], t[ID][index])
   int32_t cb_register[8], texture_register[8];   // by range ID: the register the range starts at, or -1
@@ -174,10 +176,12 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
     return base;
   };
   const bool vertex = program_type == 1;
+  const bool compute = program_type == 5;
+  bool thread_group_declared = false;
 
   UniquePointer<D3d9Program> program = UniquePointer<D3d9Program>::make(allocator, allocator);
   if (!program) return status::kNoMemory;
-  program->stage_ = vertex ? graphics::ShaderStage::Vertex : graphics::ShaderStage::Fragment;
+  program->stage_ = vertex ? graphics::ShaderStage::Vertex : compute ? graphics::ShaderStage::Compute : graphics::ShaderStage::Fragment;
   program->major_ = major;
   program->minor_ = minor;
 
@@ -295,6 +299,11 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         s->type = kInput, s->number = static_cast<uint16_t>(o.index[0]), s->slot = in_slot[o.index[0]];
         return status::kSuccess;
       }
+      case kOpThreadId: case kOpThreadGroupId: case kOpThreadIdInGroup: case kOpThreadIdFlat:
+        if (!compute) return status::kNotSupported;
+        s->type = kSysValue;
+        s->number = o.type == kOpThreadId ? kSysDispatchThreadId : o.type == kOpThreadGroupId ? kSysGroupId : o.type == kOpThreadIdInGroup ? kSysGroupThreadId : kSysGroupIndex;
+        return status::kSuccess;
       case kOpConstantBuffer: {
         uint32_t slot, element;
         if (v51) {
@@ -519,6 +528,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         Operand o;
         s = read_operand(p, &o);
         if (s != status::kSuccess) return s;
+        if (compute && opcode == kDclInput4 && (o.type == kOpThreadId || o.type == kOpThreadGroupId || o.type == kOpThreadIdInGroup || o.type == kOpThreadIdFlat)) continue;
         if ((o.type != kOpInput && o.type != kOpOutput) || o.dims != 1 || o.index[0] >= 16) return status::kNotSupported;   // (depth and the like)
         // An input that is a system value says which in its declaration (a name after the operand); the rest take their meaning from the signature.
         if (o.type == kOpInput && (opcode == kDclInputSgv4 || opcode == kDclInputSiv4 || opcode == kDclInputPsSgv4 || opcode == kDclInputPsSiv4)) {
@@ -538,6 +548,27 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         continue;
       }
       case kDclIndexableTemp4: return status::kNotSupported;
+      case kDclThreadGroup4: {
+        if (!compute) return status::kNotSupported;
+        const uint32_t x = p.le32(), y = p.le32(), z = p.le32();
+        if (!p.ok() || x == 0 || y == 0 || z == 0 || x > graphics::kMaxThreadsPerGroup || y > graphics::kMaxThreadsPerGroup || z > graphics::kMaxThreadsPerGroup ||
+            uint64_t{x} * y * z > graphics::kMaxThreadsPerGroup)
+          return status::kInvalidParameter;
+        program->thread_group_[0] = x, program->thread_group_[1] = y, program->thread_group_[2] = z;
+        thread_group_declared = true;
+        continue;
+      }
+      case kDclUavRaw4: case kDclUavStructured4: {
+        Operand o;
+        s = read_operand(p, &o);
+        if (s != status::kSuccess) return s;
+        const uint32_t stride = opcode == kDclUavStructured4 ? p.le32() : 0;
+        if (!compute || !p.ok() || o.type != kOpUav || o.dims != 1 || o.index[0] >= graphics::kMaxStorageBuffers || program->uav_kind_[o.index[0]] != D3d9Program::BufferKind::None) return status::kNotSupported;
+        if (opcode == kDclUavStructured4 && (stride == 0 || stride > 2048 || stride % 4)) return status::kNotSupported;
+        program->uav_kind_[o.index[0]] = opcode == kDclUavRaw4 ? D3d9Program::BufferKind::Raw : D3d9Program::BufferKind::Structured;
+        program->uav_stride_[o.index[0]] = stride;
+        continue;
+      }
       default: break;
     }
 
@@ -617,7 +648,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       continue;
     } else if (opcode == 45 || opcode == 72 || opcode == 61) {
       // ld (dst, integer address, resource), sample_l (dst, coordinate, resource, sampler, level), resinfo (dst, level, resource): Shader Model 4 texture access beyond sample.
-      if (vertex) return status::kNotSupported;
+      if (vertex || compute) return status::kNotSupported;
       Operand d, address, resource, sampler, lod;
       if ((s = read_operand(p, &d)) != status::kSuccess || (s = read_operand(p, &address)) != status::kSuccess || (s = read_operand(p, &resource)) != status::kSuccess) return s;
       if (opcode == 72 && ((s = read_operand(p, &sampler)) != status::kSuccess || (s = read_operand(p, &lod)) != status::kSuccess)) return s;
@@ -652,8 +683,62 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         for (uint32_t k = 0; k < 4; ++k) ins.tex_swizzle[k] = resource.swizzle[k];
       program->uses_textures_ = true;
       program->uses_texel_access_ = true;
+    } else if (compute && ((opcode >= 165 && opcode <= 168) || (opcode >= 169 && opcode <= 177 && opcode != 172) || (opcode >= 180 && opcode <= 189 && opcode != 185))) {
+      // Storage buffers: ld_raw / ld_structured (dst, address, [offset,] u#), store_raw / store_structured (u#.mask, address, [offset,] value), the atomics (u#, address, value) and the
+      // immediate ones that return the old value (dst, u#, address, value).
+      const bool load = opcode == kLdRaw4 || opcode == kLdStructured4, store = opcode == kStoreRaw4 || opcode == kStoreStructured4;
+      const bool structured = opcode == kLdStructured4 || opcode == kStoreStructured4;
+      const bool immediate = opcode >= 180;
+      Operand d, uav, address, offset, value;
+      if (immediate && (s = read_operand(p, &d)) != status::kSuccess) return s;
+      if (load && (s = read_operand(p, &d)) != status::kSuccess) return s;
+      if (load) {
+        if ((s = read_operand(p, &address)) != status::kSuccess) return s;
+        if (structured && (s = read_operand(p, &offset)) != status::kSuccess) return s;
+        if ((s = read_operand(p, &uav)) != status::kSuccess) return s;
+      } else {
+        if ((s = read_operand(p, &uav)) != status::kSuccess || (s = read_operand(p, &address)) != status::kSuccess) return s;
+        if (structured && (s = read_operand(p, &offset)) != status::kSuccess) return s;
+        if ((s = read_operand(p, &value)) != status::kSuccess) return s;
+      }
+      if (uav.type != kOpUav || uav.dims != 1 || uav.index[0] >= graphics::kMaxStorageBuffers) return status::kNotSupported;
+      const uint32_t slot = uav.index[0];
+      const D3d9Program::BufferKind kind = program->uav_kind_[slot];
+      if (kind == D3d9Program::BufferKind::None || ((load || store) && structured != (kind == D3d9Program::BufferKind::Structured))) return status::kNotSupported;   // (an atomic works on either kind)
+      ins.uav = static_cast<uint8_t>(slot);
+      ins.stride = program->uav_stride_[slot];
+      if (load) {
+        ins.op = kBufLoad;
+        s = to_dst(d, &ins.dst);
+        if (s != status::kSuccess) return s;
+        s = to_src(address, &ins.src[0]);
+        if (s != status::kSuccess) return s;
+        if (structured && (s = to_src(offset, &ins.src[1])) != status::kSuccess) return s;
+        ins.src_count = structured ? 2 : 1;
+        for (uint32_t k = 0; k < 4; ++k) ins.tex_swizzle[k] = uav.swizzle[k];
+      } else if (store) {
+        ins.op = kBufStore;
+        ins.dst.mask = uav.mask;
+        s = to_src(address, &ins.src[0]);
+        if (s != status::kSuccess) return s;
+        if (structured && (s = to_src(offset, &ins.src[1])) != status::kSuccess) return s;
+        if ((s = to_src(value, &ins.src[2])) != status::kSuccess) return s;
+        ins.src_count = 3;
+      } else {
+        // (the kind of atomic by opcode: add, and, or, xor, imax, imin, umax, umin, exchange)
+        const uint32_t base = immediate ? opcode - 180 : opcode - 169;
+        static const uint8_t kPlain[] = {kAtomicAnd, kAtomicOr, kAtomicXor, 0xFF, kAtomicAdd, kAtomicIMax, kAtomicIMin, kAtomicUMax, kAtomicUMin};   // 169 .. 177
+        static const uint8_t kImm[] = {kAtomicAdd, kAtomicAnd, kAtomicOr, kAtomicXor, kAtomicExchange, 0xFF, kAtomicIMax, kAtomicIMin, kAtomicUMax, kAtomicUMin};   // 180 .. 189
+        ins.control = immediate ? kImm[base] : kPlain[base];
+        ins.op = immediate ? kBufImmAtomic : kBufAtomic;
+        if (immediate && (s = to_dst(d, &ins.dst)) != status::kSuccess) return s;
+        s = to_src(address, &ins.src[0]);
+        if (s != status::kSuccess) return s;
+        if ((s = to_src(value, &ins.src[1])) != status::kSuccess) return s;
+        ins.src_count = 2;
+      }
     } else if (opcode == kSample4) {
-      if (vertex) return status::kNotSupported;   // (no textures in the vertex stage)
+      if (vertex || compute) return status::kNotSupported;   // (no textures in the vertex stage)
       Operand d, coordinate, resource, sampler;
       if ((s = read_operand(p, &d)) != status::kSuccess || (s = read_operand(p, &coordinate)) != status::kSuccess || (s = read_operand(p, &resource)) != status::kSuccess ||
           (s = read_operand(p, &sampler)) != status::kSuccess)
@@ -714,6 +799,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
     if (total) program->constant_registers_ = total;
     program->color_outputs_ = color_outputs;
   }
+  if (compute && (!thread_group_declared || program->code_.count() == 0)) return status::kInvalidParameter;
   if (vertex) {
     bool writes_position = false;
     for (const Instr& ins : program->code_.view())

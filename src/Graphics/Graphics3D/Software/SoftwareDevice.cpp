@@ -190,6 +190,19 @@ class SoftwareShaderModule final : public IShaderModule {
   ShaderModuleDesc desc_;
 };
 
+class SoftwareComputePipeline final : public IPipeline {
+ public:
+  SoftwareComputePipeline(ComputeShaderFn function, const uint32_t group[3]) : function_(function) {
+    for (uint32_t i = 0; i < 3; ++i) group_[i] = group[i];
+  }
+  ComputeShaderFn function() const { return function_; }
+  uint32_t group(uint32_t axis) const { return group_[axis]; }
+
+ private:
+  ComputeShaderFn function_;
+  uint32_t group_[3];
+};
+
 class SoftwarePipeline final : public IPipeline {
  public:
   SoftwarePipeline(const GraphicsPipelineDesc& desc, VertexShaderFn vs, FragmentShaderFn fs, TexturedFragmentShaderFn textured, VertexShaderFnEx vs_ex, FragmentShaderFnEx fs_ex)
@@ -674,8 +687,40 @@ void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVert
   };
   const bool lod_pass = s.pipeline->samples_textures() && s.textures.uses_lod();
 
+  // Per row, the columns that can be inside: each edge value is linear in x, so it is solved for where it turns non-negative and the range is widened by two pixels, which covers the
+  // rounding. The exact tests below still decide every pixel, so the picture is the one a full scan of the bounding box gives. (Far off-screen vertices make the solving imprecise: no trimming.)
+  const bool trim = fx0 > -1e5f && fx1 < 1e5f && fy0 > -1e5f && fy1 < 1e5f;
+  struct EdgeLine {
+    float vx, vy, dx, dy;
+  };
+  const EdgeLine edges[3] = {{v1->x, v1->y, e0dx, e0dy}, {v2->x, v2->y, e1dx, e1dy}, {v0->x, v0->y, e2dx, e2dy}};
+  const uint32_t target_width = s.color->extent().width;
+
   for (int32_t y = min_y; y < max_y; ++y) {
-    for (int32_t x = min_x; x < max_x; ++x) {
+    int32_t row_begin = min_x, row_end = max_x;
+    if (trim) {
+      const float row_y = y + 0.5f;
+      bool empty = false;
+      for (const EdgeLine& e : edges) {
+        const float t = (row_y - e.vy) * e.dx;   // (the edge value is t - (px - vx) * dy, to be >= 0)
+        if (e.dy == 0) {
+          if (t < 0) empty = true;
+        } else {
+          const float bound = e.vx + t / e.dy - 0.5f;   // (the x whose pixel centre has the value zero)
+          if (e.dy < 0) {   // the value grows with x: it is non-negative from the bound on
+            const float lo = bound - 2.0f;
+            if (lo >= static_cast<float>(row_end)) empty = true;
+            else if (lo > static_cast<float>(row_begin)) row_begin = static_cast<int32_t>(lo);
+          } else {   // it shrinks with x: non-negative up to the bound
+            const float hi = bound + 3.0f;
+            if (hi <= static_cast<float>(row_begin)) empty = true;
+            else if (hi < static_cast<float>(row_end)) row_end = static_cast<int32_t>(hi);
+          }
+        }
+      }
+      if (empty || row_begin >= row_end) continue;
+    }
+    for (int32_t x = row_begin; x < row_end; ++x) {
       const float px = x + 0.5f, py = y + 0.5f;
       const float w0 = (px - v1->x) * e0dy - (py - v1->y) * e0dx;
       const float w1 = (px - v2->x) * e1dy - (py - v2->y) * e1dx;
@@ -687,7 +732,7 @@ void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVert
       if ((l0 == 0 && !own0) || (l1 == 0 && !own1) || (l2 == 0 && !own2)) continue;
       const float b0 = l0 * inv_area, b1 = l1 * inv_area, b2 = l2 * inv_area;
 
-      const uint64_t index = uint64_t{static_cast<uint32_t>(y)} * s.color->extent().width + static_cast<uint32_t>(x);
+      const uint64_t index = uint64_t{static_cast<uint32_t>(y)} * target_width + static_cast<uint32_t>(x);
       const float z = b0 * v0->z + b1 * v1->z + b2 * v2->z;
       bool depth_ok = true;
       if (pd.depth_test && !depth.empty()) depth_ok = depth_passes(pd.depth_compare, z, depth[index]);
@@ -900,11 +945,27 @@ IImage* SoftwareDevice::create_image(const ImageDesc& desc) {
 void SoftwareDevice::destroy_image(IImage* image) { destroy(allocator_, static_cast<SoftwareImage*>(image)); }
 
 IShaderModule* SoftwareDevice::create_shader_module(const ShaderModuleDesc& desc) {
+  if (desc.stage == ShaderStage::Compute) {
+    if (!desc.compute_function) return nullptr;
+    uint64_t threads = 1;
+    for (uint32_t axis : desc.thread_group) {
+      if (axis == 0 || axis > kMaxThreadsPerGroup) return nullptr;
+      threads *= axis;
+    }
+    if (threads > kMaxThreadsPerGroup) return nullptr;
+    return make<SoftwareShaderModule>(allocator_, desc);
+  }
   if (desc.stage == ShaderStage::Vertex ? !(desc.vertex_function || desc.vertex_function_ex) : !(desc.fragment_function_ex || (!desc.fragment_function) != (!desc.textured_fragment_function))) return nullptr;   // (a fragment shader is one or the other)
   return make<SoftwareShaderModule>(allocator_, desc);
 }
 void SoftwareDevice::destroy_shader_module(IShaderModule* module) {
   destroy(allocator_, static_cast<SoftwareShaderModule*>(module));
+}
+
+IPipeline* SoftwareDevice::create_compute_pipeline(const IShaderModule* shader) {
+  if (!shader || shader->stage() != ShaderStage::Compute) return nullptr;
+  const SoftwareShaderModule* module = static_cast<const SoftwareShaderModule*>(shader);
+  return make<SoftwareComputePipeline>(allocator_, module->desc().compute_function, module->desc().thread_group);
 }
 
 IPipeline* SoftwareDevice::create_graphics_pipeline(const GraphicsPipelineDesc& desc) {
@@ -934,6 +995,8 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
   if (!commands) return false;
   CommandRecorder& recorder = *static_cast<CommandRecorder*>(commands);
   DrawState s;
+  const SoftwareComputePipeline* compute = nullptr;
+  ByteView storage[kMaxStorageBuffers];
   uint64_t query_samples = 0;
   uint32_t query_slot = 0;
   bool query_open = false;
@@ -977,14 +1040,11 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
               continue;
             }
             const uint32_t v = surface.encode(pack_color(cmd.pass.clear_color_value));
-            for (uint32_t y = 0; y < e.height; ++y)
-              for (uint32_t x = 0; x < e.width; ++x) surface.row(y)[x] = v;
+            surface.pixels.fill(v);   // (the rows are tight: pitch is the width)
           }
         }
-        if (s.depth && cmd.pass.clear_depth)
-          for (float& d : s.depth->depth()) d = cmd.pass.clear_depth_value;
-        if (s.depth && cmd.pass.clear_stencil)
-          for (uint8_t& v : s.depth->stencil()) v = cmd.pass.clear_stencil_value;
+        if (s.depth && cmd.pass.clear_depth) s.depth->depth().fill(cmd.pass.clear_depth_value);
+        if (s.depth && cmd.pass.clear_stencil) s.depth->stencil().fill(cmd.pass.clear_stencil_value);
         s.viewport = {0, 0, static_cast<float>(e.width), static_cast<float>(e.height), 0, 1};
         s.scissor = {0, 0, e.width, e.height};
         s.pipeline = nullptr;
@@ -995,6 +1055,41 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
         if (query_open) return false;
         in_pass = false;
         break;
+      case RecordedCommand::Type::BindComputePipeline:
+        if (in_pass) return false;
+        compute = static_cast<const SoftwareComputePipeline*>(cmd.pipeline);
+        break;
+      case RecordedCommand::Type::BindStorageBuffer: {
+        if (in_pass || cmd.unit >= kMaxStorageBuffers || !cmd.buffer) return false;
+        ByteView whole = cmd.buffer->map(), part;
+        if (!whole.try_subview(cmd.offset, cmd.count, &part)) return false;
+        storage[cmd.unit] = part;
+        break;
+      }
+      case RecordedCommand::Type::Dispatch: {
+        if (in_pass || !compute) return false;
+        const uint32_t gx = cmd.count, gy = cmd.first, gz = cmd.instance_count;
+        if (gx > kMaxDispatchGroups || gy > kMaxDispatchGroups || gz > kMaxDispatchGroups) return false;
+        const uint64_t threads_per_group = uint64_t{compute->group(0)} * compute->group(1) * compute->group(2);
+        if (uint64_t{gx} * gy * gz * threads_per_group > kMaxDispatchThreads) return false;
+        ComputeContext context;
+        for (uint32_t k = 0; k < kMaxStorageBuffers; ++k) context.buffers[k] = storage[k];
+        for (uint32_t z = 0; z < gz; ++z)
+          for (uint32_t y = 0; y < gy; ++y)
+            for (uint32_t x = 0; x < gx; ++x) {
+              context.group_id[0] = x, context.group_id[1] = y, context.group_id[2] = z;
+              uint32_t index = 0;
+              for (uint32_t tz = 0; tz < compute->group(2); ++tz)
+                for (uint32_t ty = 0; ty < compute->group(1); ++ty)
+                  for (uint32_t tx = 0; tx < compute->group(0); ++tx, ++index) {
+                    context.thread_id[0] = tx, context.thread_id[1] = ty, context.thread_id[2] = tz;
+                    context.dispatch_id[0] = x * compute->group(0) + tx, context.dispatch_id[1] = y * compute->group(1) + ty, context.dispatch_id[2] = z * compute->group(2) + tz;
+                    context.group_index = index;
+                    compute->function()(context, s.constants);
+                  }
+            }
+        break;
+      }
       case RecordedCommand::Type::BeginQuery:
         if (!in_pass || query_open) return false;
         query_open = true;

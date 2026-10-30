@@ -245,6 +245,8 @@ class TgsiEmitter {
   int relative_key_ = -2;   // the address register's source in the instruction being emitted (-2: none yet, -1: a0, else the integer register and component)
   bool in_used_[16] = {};
   bool sys_used_[kSysValueCount] = {};
+  bool buffer_used_[graphics::kMaxStorageBuffers] = {};
+  bool compute_ = false;
   uint32_t max_attribute_ = 0;
   bool sampler_used_[graphics::kMaxTextureUnits] = {};
 };
@@ -279,7 +281,7 @@ String TgsiEmitter::operand(const Instr::Src& s, uint32_t offset, uint32_t slot,
       add(base, "]");
       break;
     case kSysValue:   // (copied to a register by the prologue; the stage decides which exist)
-      if (s.number >= kSysValueCount || (vertex_ ? s.number != kSysVertexId && s.number != kSysInstanceId : s.number == kSysVertexId || s.number == kSysInstanceId)) {
+      if (s.number >= kSysValueCount || (compute_ ? s.number < kSysDispatchThreadId : vertex_ ? s.number != kSysVertexId && s.number != kSysInstanceId : s.number == kSysVertexId || s.number == kSysInstanceId || s.number >= kSysDispatchThreadId)) {
         unsupported_ = true;
         break;
       }
@@ -718,6 +720,73 @@ bool TgsiEmitter::instruction(const Instr& ins) {
       line(op == kIShl ? "SHL" : op == kIShr ? "ISHR" : "USHR", &t, &a, &w);
       break;
     }
+    case kBufLoad: case kBufStore: case kBufAtomic: case kBufImmAtomic: {
+      // Storage buffers: TGSI's LOAD / STORE / ATOM* on BUFFER[n], addressed in bytes. The address of a structured buffer is index * stride + offset (an atomic gives both in the
+      // components x and y of one register); the words of a store are packed first, the way Direct3D writes them.
+      const bool structured = ins.stride != 0, atomic = op == kBufAtomic || op == kBufImmAtomic;
+      String buffer = str();
+      add(buffer, "BUFFER[");
+      add_uint(buffer, ins.uav);
+      add(buffer, "]");
+      buffer_used_[ins.uav] = true;
+      const String address = temp(kWork3, ".x"), address_source = temp(kWork3, ".xxxx");
+      const String index = operand(ins.src[0], 0, 0, nullptr, true);
+      if (structured) {
+        const String offset = (atomic ? component(ins.src[0], 1, 1) : operand(ins.src[1], 0, 1, nullptr, true)), stride = [&] {
+          String s = str();
+          add(s, "IMM[");
+          add_uint(s, imm4_bits(ins.stride, ins.stride, ins.stride, ins.stride));
+          add(s, "].xxxx");
+          return s;
+        }();
+        line("UMAD", &address, &index, &stride, &offset);
+      } else {
+        line("MOV", &address, &index);
+      }
+      if (op == kBufLoad) {
+        t = begin_result(ins, true, &direct);
+        uint32_t needed = 0;   // (how many words to read: up to the last one a destination component takes)
+        for (uint32_t c = 0; c < 4; ++c)
+          if (ins.dst.mask & (1u << c)) needed = needed > static_cast<uint32_t>((ins.tex_swizzle[c] & 3) + 1) ? needed : static_cast<uint32_t>((ins.tex_swizzle[c] & 3) + 1);
+        if (needed == 0) needed = 1;
+        const String w2 = temp(kWork2), z0 = zero();
+        line("MOV", &w2, &z0);
+        String words = temp(kWork2, ".");
+        add(words, StringView("xyzw", needed));
+        line("LOAD", &words, &buffer, &address_source);
+        String picked = temp(kWork2, ".");
+        for (uint32_t c = 0; c < 4; ++c) add(picked, StringView(&"xyzw"[ins.tex_swizzle[c] & 3], 1));
+        const String w = temp(kWork);
+        line("MOV", &w, &picked);
+        break;
+      }
+      if (op == kBufStore) {
+        uint32_t written = 0;
+        for (uint32_t c = 0; c < 4; ++c) {
+          if (!(ins.dst.mask & (1u << c))) continue;
+          const String target = temp(kWork2, written == 0 ? ".x" : written == 1 ? ".y" : written == 2 ? ".z" : ".w");
+          const String value = component(ins.src[2], c, 2);
+          line("MOV", &target, &value);
+          ++written;
+        }
+        if (written == 0) return true;
+        String stored = str();
+        add(stored, buffer.view());
+        add(stored, ".");
+        add(stored, StringView("xyzw", written));
+        const String w2 = temp(kWork2);
+        line("STORE", &stored, &address_source, &w2);
+        return true;
+      }
+      static const char* const kAtomics[] = {"ATOMUADD", "ATOMAND", "ATOMOR", "ATOMXOR", "ATOMIMAX", "ATOMIMIN", "ATOMUMAX", "ATOMUMIN", "ATOMXCHG"};
+      const String operand_value = operand(ins.src[1], 0, 2, nullptr, true), old = temp(kWork2, ".x");
+      line(ins.control < 9 ? kAtomics[ins.control] : "ATOMUADD", &old, &buffer, &address_source, &operand_value);
+      if (op == kBufAtomic) return true;
+      t = begin_result(ins, true, &direct);
+      const String w = temp(kWork), old_all = temp(kWork2, ".xxxx");
+      line("MOV", &w, &old_all);
+      break;
+    }
     case kTexFetch: case kTexLod: case kTexSize: {
       const bool swizzled = ins.tex_swizzle[0] != 0 || ins.tex_swizzle[1] != 1 || ins.tex_swizzle[2] != 2 || ins.tex_swizzle[3] != 3;
       t = begin_result(ins, true, &direct);
@@ -846,8 +915,22 @@ bool TgsiEmitter::instruction(const Instr& ins) {
 
 void TgsiEmitter::assemble(String* out) {
   out->clear();
-  add(*out, vertex_ ? "VERT\n" : p_.color_outputs_ > 1 ? "FRAG\n" : "FRAG\nPROPERTY FS_COLOR0_WRITES_ALL_CBUFS 1\n");
-  if (vertex_) {
+  add(*out, compute_ ? "COMP\n" : vertex_ ? "VERT\n" : p_.color_outputs_ > 1 ? "FRAG\n" : "FRAG\nPROPERTY FS_COLOR0_WRITES_ALL_CBUFS 1\n");
+  if (compute_) {
+    add(*out, "PROPERTY CS_FIXED_BLOCK_WIDTH ");
+    add_uint(*out, p_.thread_group_[0]);
+    add(*out, "\nPROPERTY CS_FIXED_BLOCK_HEIGHT ");
+    add_uint(*out, p_.thread_group_[1]);
+    add(*out, "\nPROPERTY CS_FIXED_BLOCK_DEPTH ");
+    add_uint(*out, p_.thread_group_[2]);
+    add(*out, "\nDCL SV[0], BLOCK_ID\nDCL SV[1], THREAD_ID\n");
+    for (uint32_t i = 0; i < graphics::kMaxStorageBuffers; ++i) {
+      if (!buffer_used_[i]) continue;
+      add(*out, "DCL BUFFER[");
+      add_uint(*out, i);
+      add(*out, "]\n");
+    }
+  } else if (vertex_) {
     for (uint32_t i = 0; i <= max_attribute_; ++i) {
       add(*out, "DCL IN[");
       add_uint(*out, i);
@@ -903,11 +986,11 @@ void TgsiEmitter::assemble(String* out) {
   for (uint64_t i = 0; i < imms_.count(); ++i) {
     add(*out, "IMM[");
     add_uint(*out, i);
-    // A value that is no ordinary float (an integer literal: a denormal, or all ones) is written as its bits.
+    // A value that is no ordinary float (an integer literal: a denormal, or all ones, or a large one) is written as its bits.
     bool integer = false;
     for (uint32_t k = 0; k < 4; ++k) {
       const uint32_t exponent = (imms_[i].bits[k] >> 23) & 0xFF, mantissa = imms_[i].bits[k] & 0x7FFFFF;
-      integer = integer || (exponent == 0 && mantissa != 0) || exponent == 0xFF;
+      integer = integer || (exponent == 0 && mantissa != 0) || (p_.major_ >= 4 && exponent >= 0x9C);   // (a Shader Model 4 literal is typeless: one too large to write as a decimal is an integer, 0xFF000000 and the like)
     }
     add(*out, integer ? "] UINT32 {" : "] FLT32 {");
     for (uint32_t k = 0; k < 4; ++k) {
@@ -922,6 +1005,7 @@ void TgsiEmitter::assemble(String* out) {
 
 NtStatus TgsiEmitter::run(String* out) {
   vertex_ = p_.stage_ == graphics::ShaderStage::Vertex;
+  compute_ = p_.stage_ == graphics::ShaderStage::Compute;
   for (const Instr& ins : p_.code_.view()) {
     if (ins.dst.type == kAddrTex) addr_used_ = true;
     for (uint32_t k = 0; k < ins.src_count; ++k) {
@@ -942,6 +1026,46 @@ NtStatus TgsiEmitter::run(String* out) {
   for (uint32_t k = 0; k < kSysValueCount; ++k) {
     if (!sys_used_[k]) continue;
     const String reg = temp(kSys + k), reg_x = temp(kSys + k, ".x");
+    if (compute_) {
+      // (the thread's numbers: BLOCK_ID and THREAD_ID of TGSI, and the dispatch number and the number in the group worked out from them)
+      const String z0 = zero();
+      line("MOV", &reg, &z0);
+      const String group = [&] {
+        String s = str();
+        add(s, "IMM[");
+        add_uint(s, imm4_bits(p_.thread_group_[0], p_.thread_group_[1], p_.thread_group_[2], 0));
+        add(s, "]");
+        return s;
+      }();
+      if (k == kSysDispatchThreadId) {
+        const String xyz = temp(kSys + k, ".xyz");
+        String block = str(), thread = str();
+        add(block, "SV[0].xyzz"), add(thread, "SV[1].xyzz");   // (three components: the host has uvec3s)
+        line("UMAD", &xyz, &block, &group, &thread);
+      } else if (k == kSysGroupId || k == kSysGroupThreadId) {
+        const String xyz = temp(kSys + k, ".xyz");
+        String source = str();
+        add(source, k == kSysGroupId ? "SV[0].xyzz" : "SV[1].xyzz");
+        line("MOV", &xyz, &source);
+      } else if (k == kSysGroupIndex) {
+        const String w = temp(kWork, ".x"), area = [&] {
+          String s = str();
+          add(s, "IMM[");
+          add_uint(s, imm4_bits(p_.thread_group_[0] * p_.thread_group_[1], p_.thread_group_[0], 0, 0));
+          add(s, "]");
+          return s;
+        }();
+        String tz = str(), ty = str(), tx = str(), area_xy = str(), width = str();
+        add(tz, "SV[1].zzzz"), add(ty, "SV[1].yyyy"), add(tx, "SV[1].xxxx");
+        add(area_xy, area.view()), add(area_xy, ".xxxx");
+        add(width, area.view()), add(width, ".yyyy");
+        line("UMUL", &w, &tz, &area_xy);
+        const String wx = temp(kWork, ".xxxx");
+        line("UMAD", &w, &ty, &width, &wx);
+        line("UADD", &reg_x, &wx, &tx);
+      }
+      continue;
+    }
     String source = str();
     if (vertex_) {
       add(source, k == kSysVertexId ? "SV[0].xxxx" : "SV[1].xxxx");
@@ -965,7 +1089,7 @@ NtStatus TgsiEmitter::run(String* out) {
       const String v = temp(kVarying + i);
       line("MOV", &v, &z);
     }
-  } else {
+  } else if (!compute_) {
     for (uint32_t i = 0; i < p_.color_outputs_; ++i) {
       const String c = temp(color_register(i));
       line("MOV", &c, &z);
@@ -993,7 +1117,7 @@ NtStatus TgsiEmitter::run(String* out) {
         const String v = temp(kVarying + i);
         line("MOV", &target, &v);
       }
-    } else {
+    } else if (!compute_) {
       for (uint32_t i = 0; i < p_.color_outputs_; ++i) {
         String o = str();
         add(o, "OUT[");

@@ -277,6 +277,39 @@ static void test_device_2d() {
 }
 
 
+// A large picture goes up to the device renderer as one texture; the pixels are the CPU renderer's, under a clip, a source rectangle, an offset that runs off the target, and alpha.
+static void test_device_2d_large_image() {
+  TestAllocator a;
+  SoftwareDevice device(a, nullptr);
+  const uint32_t W = 200, H = 160;
+  DeviceRenderer2D d(device, a, {W, H});
+  CHECK(d.valid());
+  Surface cpu_surface = make_surface(a, W, H);
+  SoftwareRenderer2D cpu(cpu_surface);
+  Surface img = make_surface(a, 100, 80);
+  for (uint32_t y = 0; y < 80; ++y)
+    for (uint32_t x = 0; x < 100; ++x) img.pixels[y * 100 + x] = ((x * 2 + y) % 256 < 40 ? 0x80000000u : 0xFF000000u) | (x * 2 << 16) | (y * 3 << 8) | ((x + y) & 0xFF);
+  ArrayView<uint32_t> pixels = allocate_view<uint32_t>(a, W * H);
+  for (IRenderer2D* r : {static_cast<IRenderer2D*>(&d), static_cast<IRenderer2D*>(&cpu)}) {
+    r->clear(0xFF204060);
+    r->draw_image(img, {0, 0, 100, 80}, 10, 20);        // the whole picture
+    r->draw_image(img, {10, 5, 90, 70}, 150, 100);      // part of it, running off the right and bottom
+    r->set_clip({20, 90, 40, 40});
+    r->draw_image(img, {0, 0, 100, 80}, 15, 85);        // under a clip
+    r->reset_clip();
+    r->set_blend(BlendMode::Replace);
+    r->draw_image(img, {-5, -5, 110, 90}, 105, -10);    // a rectangle larger than the picture, partly above the target
+  }
+  CHECK(d.read_pixels(pixels));
+  uint32_t differing = 0;
+  for (uint32_t y = 0; y < H; ++y)
+    for (uint32_t x = 0; x < W; ++x) differing += pixels[y * W + x] != px(cpu_surface, x, y);
+  CHECK(differing == 0);
+  release_view(a, pixels);
+  release_view(a, img.pixels);
+  release_view(a, cpu_surface.pixels);
+}
+
 // ---- Pixel-engine primitives, run on both renderers --------------------------------------------------------
 
 namespace {
@@ -1614,6 +1647,7 @@ int main() {
   test_2d();
   test_3d();
   test_device_2d();
+  test_device_2d_large_image();
   test_blend_math();
   test_fast_paths();
   test_primitives();

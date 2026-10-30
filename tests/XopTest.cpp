@@ -455,7 +455,7 @@ static void test_lwp() {
   {      // a value sample, then slwpcb: the record, the head pointer and the control block address
     Bytes code = join({llwpcb(), lwpval(), slwpcb()});
     Machine m(code);
-    make_lwpcb(m, 0xFFFFFFFF, 1024);
+    make_lwpcb(m, 0x60000002, 1024);
     put_u32(m, kBase, 0xCAFEF00D);
     m.cpu.state().r[2] = kLwpcb;
     m.cpu.state().r[1] = 0x1122334455667788ull;
@@ -643,6 +643,119 @@ static void test_lwp() {
   }
 }
 
+
+// the LWPCB bytes of the hardware events: interval at 88 + 8 * (id - 1), counter 4 above it
+static void set_event(Machine& m, uint32_t id, int32_t interval, int32_t counter) {
+  put_u32(m, kLwpcb + 88 + 8 * (id - 1), uint32_t(interval) & 0x3FFFFFF);
+  put_u32(m, kLwpcb + 92 + 8 * (id - 1), uint32_t(counter) & 0x3FFFFFF);
+}
+static Bytes lwp_run(const Bytes& body) {      // llwpcb rdx; body; slwpcb rdx
+  Bytes code;
+  for (const Bytes& p : {llwpcb(), Bytes{0x0F, 0x0B}}) (void)p;
+  Bytes a = strip(llwpcb()), c = strip(slwpcb());
+  code.insert(code.end(), a.begin(), a.end());
+  code.insert(code.end(), body.begin(), body.end());
+  code.insert(code.end(), c.begin(), c.end());
+  code.push_back(0x0F); code.push_back(0x0B);
+  return code;
+}
+static uint64_t record_field(Machine& m, int index, int offset, int n = 8) { return get_mem(m, kRing + 32 * index + offset, n); }
+
+static void test_lwp_hardware_events() {
+  {      // flags: the available events stay, the others are cleared
+    Machine m(join({llwpcb()}));
+    make_lwpcb(m, 0xFFFFFFFF, 1024);
+    m.cpu.state().r[2] = kLwpcb;
+    CHECK(m.finished());
+    CHECK(get_mem(m, kLwpcb, 4) == 0xE000006E);
+  }
+  {      // instructions retired: every fourth instruction (interval 3), starting with the llwpcb that starts it
+    Machine m(lwp_run(Bytes(8, 0x90)));
+    make_lwpcb(m, 0x4, 1024);
+    set_event(m, 2, 3, 0);
+    m.cpu.state().r[2] = kLwpcb;
+    CHECK(m.finished());
+    CHECK(get_mem(m, kLwpcb + 16, 4) == 3 * 32);
+    for (int i = 0; i < 3; ++i) CHECK(record_field(m, i, 0, 1) == 2);
+    CHECK(record_field(m, 0, 8) == 0x10000 && record_field(m, 1, 8) == 0x10008 && record_field(m, 2, 8) == 0x1000C);
+  }
+  {      // the clock events: records for 5 and 6 alternate
+    Machine m(lwp_run(Bytes(6, 0x90)));
+    make_lwpcb(m, 0x60, 1024);
+    set_event(m, 5, 3, 0);
+    set_event(m, 6, 3, 0);
+    m.cpu.state().r[2] = kLwpcb;
+    CHECK(m.finished());
+    CHECK(record_field(m, 0, 0, 1) == 5 && record_field(m, 1, 0, 1) == 6 && record_field(m, 2, 0, 1) == 5 && record_field(m, 3, 0, 1) == 6);
+    CHECK(record_field(m, 2, 8) == 0x10008);
+  }
+  {      // the IP range filter: only 0x10008..0x1000C are eligible (inclusive), or everything else with IPI
+    for (int invert = 0; invert < 2; ++invert) {
+      Machine m(lwp_run(Bytes(8, 0x90)));
+      make_lwpcb(m, 0x4, 1024);
+      set_event(m, 2, 1, 0);
+      put_u32(m, kLwpcb + 36, 0x80000000u | (invert ? 0x40000000u : 0));
+      put_u64(m, kLwpcb + 40, 0x10008);
+      put_u64(m, kLwpcb + 48, 0x1000C);
+      m.cpu.state().r[2] = kLwpcb;
+      CHECK(m.finished());
+      if (!invert) {
+        CHECK(get_mem(m, kLwpcb + 16, 4) == 3 * 32);
+        CHECK(record_field(m, 0, 8) == 0x10008 && record_field(m, 1, 8) == 0x1000A && record_field(m, 2, 8) == 0x1000C);
+      } else {
+        CHECK(record_field(m, 0, 8) == 0x10000);      // the llwpcb is outside the range
+      }
+    }
+  }
+  {      // branches: taken and untaken conditional, relative jump, call, return, jump through a register
+    const Bytes body = {0x31, 0xC0,                                  // 0x10005 xor eax, eax
+                        0x74, 0x02, 0x90, 0x90,                      // 0x10007 jz +2 (taken)
+                        0x75, 0x02, 0x90, 0x90,                      // 0x1000B jnz +2 (not taken)
+                        0xE8, 0x02, 0x00, 0x00, 0x00,                // 0x1000F call +2 (to the ret)
+                        0xEB, 0x01,                                  // 0x10014 jmp +1 (after the return)
+                        0xC3,                                        // 0x10016 ret
+                        0x48, 0x8D, 0x05, 0x02, 0x00, 0x00, 0x00,    // 0x10017 lea rax, [rip + 2]
+                        0xFF, 0xE0};                                 // 0x1001E jmp rax
+    // branch order: jz (1), jnz (2), call (3), ret (4), jmp (5), jmp rax (6)
+    struct Case { uint32_t filters; int32_t counter; std::vector<std::pair<uint64_t, uint64_t>> expected; std::vector<uint32_t> tkn; };
+    const Case cases[] = {
+        {0, 0, {{0x10007, 0x1000B}, {0x1000F, 0x10016}, {0x10014, 0x10017}}, {1, 1, 1}},      // branches 1, 3, 5 (interval 1)
+        {0x10000000u, 0, {{0x1000F, 0x10016}, {0x10014, 0x10017}}, {1, 1}},                    // NCB: the conditional ones are not counted
+        {0x08000000u | 0x20000000u, 0, {{0x10007, 0x1000B}}, {1}},                           // NAB + NRB: only the two conditional branches count
+        {0, 1, {{0x1000B, 0x1000D}}, {0}},                                                     // the counter starts at 1: the second branch, which is not taken, is stored first
+    };
+    for (const Case& c : cases) {
+      Machine m(lwp_run(body));
+      make_lwpcb(m, 0x8, 1024);
+      set_event(m, 3, 1, c.counter);
+      put_u32(m, kLwpcb + 36, c.filters);
+      m.cpu.state().r[2] = kLwpcb;
+      m.cpu.state().r[4] = 0x21F00;
+      CHECK(m.finished());
+      const size_t stored = get_mem(m, kLwpcb + 16, 4) / 32;
+      CHECK(stored >= c.expected.size());
+      for (size_t i = 0; i < c.expected.size() && i < stored; ++i) {
+        CHECK(record_field(m, int(i), 0, 1) == 3);
+        CHECK(record_field(m, int(i), 8) == c.expected[i].first);
+        CHECK(record_field(m, int(i), 16) == c.expected[i].second);
+        CHECK(((record_field(m, int(i), 2, 2) >> 15) & 1) == c.tkn[i]);
+      }
+    }
+  }
+  {      // the threshold: two records reach 64 bytes, and only with INT set does the host see the interrupt flag
+    for (int interrupts = 0; interrupts < 2; ++interrupts) {
+      Machine m(lwp_run(Bytes(10, 0x90)));
+      make_lwpcb(m, 0x4 | (interrupts ? 0x80000000u : 0), 1024);
+      set_event(m, 2, 1, 0);
+      put_u32(m, kLwpcb + 32, 64);
+      m.cpu.state().r[2] = kLwpcb;
+      CHECK(m.finished());
+      CHECK(m.cpu.take_lwp_interrupt() == bool(interrupts));
+      CHECK(!m.cpu.take_lwp_interrupt());
+    }
+  }
+}
+
 // --- vpermil2ps / vpermil2pd -------------------------------------------------------------------------------------------------------------
 
 static Bytes vpermil2(bool dbl, bool w, bool l, bool memory, int m2z) {
@@ -766,6 +879,7 @@ int main() {
   test_tbm();
   test_vpermil2();
   test_lwp();
+  test_lwp_hardware_events();
   test_decoding();
   test_malformed();
   if (g_failed) { printf("XopTest: %d failed\n", g_failed); return 1; }

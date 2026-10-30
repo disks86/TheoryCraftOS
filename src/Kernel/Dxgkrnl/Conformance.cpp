@@ -120,6 +120,15 @@ class Rig {
     kernel_.unlock(kProcess, a);
     step("read", good ? status::kSuccess : status::kInvalidParameter);
   }
+  // Reads `out.size()` little-endian words from the start of a buffer.
+  void read_words(Handle a, ArrayView<uint32_t> out) {
+    LockResult lock;
+    if (!step("lock (read words)", ok() ? kernel_.lock(kProcess, a, kLockReadOnly, 0, &lock) : status_)) return;
+    ByteReader in(ConstByteView(lock.data.data(), lock.data.size()));
+    for (uint32_t& w : out) w = in.le32();
+    kernel_.unlock(kProcess, a);
+    step("read words", in.ok() ? status::kSuccess : status::kInvalidParameter);
+  }
   // Reads the little-endian 64-bit number `index` of a buffer.
   uint64_t read_u64(Handle a, uint32_t index) {
     LockResult lock;
@@ -972,6 +981,36 @@ void scene_texture_cube(Rig& rig, ArrayView<uint32_t> out) {
   sample_layered(rig, out, b::k_ps_texcube, sizeof b::k_ps_texcube, texture, v, 6);
 }
 
+// A compute shader (cs_fill.hlsl): 4 x 8 groups of 8 x 4 threads, each writing a pixel of a 32 x 32 picture into a structured buffer from its SV_DispatchThreadID, SV_GroupID and
+// SV_GroupIndex, a structured buffer of uint4 it writes and reads back, a constant from the constant buffer, and two atomic counters that must end at 1024. The picture is the buffer.
+void scene_compute(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureCompute)) return void(rig.step("compute", status::kNotSupported));
+  namespace b = conformance_blobs;
+  Handle cs = rig.shader("create_shader (compute)", ShaderKind::Dxbc, graphics::ShaderStage::Compute, bytes_of(b::k_cs_fill, sizeof b::k_cs_fill));
+  PipelineDesc pd;
+  pd.compute_shader = cs;
+  Handle pipe = rig.pipeline(pd);
+  auto storage = [&](uint64_t size) {
+    AllocationDesc d;
+    d.flags = kAllocUnorderedAccess, d.size = size;
+    return rig.create(d);
+  };
+  Handle picture = storage(kPixels * 4), structured = storage(kPixels * 16), counters = storage(16);
+  const uint32_t constants[4] = {0x00102030u, 0, 0, 0};
+  CommandWriter w(rig.allocator());
+  w.bind_pipeline(pipe);
+  w.push_constants(bytes_of(constants, sizeof constants));
+  w.bind_uav(0, 0, 0, kPixels * 4);
+  w.bind_uav(1, 1, 0, kPixels * 16);
+  w.bind_uav(2, 2, 0, 16);
+  w.dispatch(kSize / 8, kSize / 4, 1);
+  rig.render(w, {picture, structured, counters});
+  rig.read_words(picture, out);
+  // (a counter that did not reach 1024 - an atomic lost - shows as a green cast)
+  if (rig.read_u64(counters, 0) != (uint64_t{1024} | (uint64_t{1024} << 32)))
+    for (uint32_t& pixel : out) pixel ^= 0x0000FF00u;
+}
+
 const Entry kScenes[] = {
     {"Direct3D 9 vertex colours", scene_vertex_colours},
     {"Direct3D 9 Shader Model 3", scene_sm3},
@@ -1000,6 +1039,7 @@ const Entry kScenes[] = {
     {"Direct3D 10 per-instance attribute", scene_instanced_colour},
     {"Direct3D 10 instancing", scene_instancing},
     {"Direct3D 10 multiple render targets (DXBC)", scene_multiple_targets},
+    {"Direct3D 11 compute shader and unordered access views (DXBC)", scene_compute},
     {"Direct3D 10 independent blend per render target (DXBC)", scene_independent_blend},
     {"Direct3D 10 half-float render target and texture", scene_half_float_target},
     {"Direct3D 10 float render target and texture", scene_float_target},

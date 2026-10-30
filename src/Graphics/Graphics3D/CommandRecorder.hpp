@@ -29,7 +29,7 @@ namespace graphics {
 struct RecordedCommand {
   enum class Type : uint8_t {
     BeginRenderPass, BindPipeline, BindVertexBuffer, BindIndexBuffer, PushConstants, BindTexture, SetViewport, SetScissor,
-    Draw, DrawIndexed, EndRenderPass, SetTopology, BeginQuery, EndQuery,
+    Draw, DrawIndexed, EndRenderPass, SetTopology, BeginQuery, EndQuery, BindComputePipeline, BindStorageBuffer, Dispatch,
   };
   Type type = Type::Draw;
   RenderPassBegin pass;
@@ -151,6 +151,31 @@ class CommandRecorder : public ICommandBuffer {
   void end_render_pass() override {
     RecordedCommand c;
     c.type = RecordedCommand::Type::EndRenderPass;
+    add(c);
+  }
+  void bind_compute_pipeline(const IPipeline* pipeline) override {
+    RecordedCommand c;
+    c.type = RecordedCommand::Type::BindComputePipeline;
+    c.pipeline = pipeline;
+    add(c);
+  }
+  void bind_storage_buffer(uint32_t slot, IBuffer* buffer, uint64_t offset, uint64_t size) override {
+    if (slot >= kMaxStorageBuffers) {
+      ok_ = false;
+      return;
+    }
+    RecordedCommand c;
+    c.type = RecordedCommand::Type::BindStorageBuffer;
+    c.unit = slot;
+    c.buffer = buffer;
+    c.offset = offset;
+    c.count = static_cast<uint32_t>(size > 0xFFFFFFFFu ? 0xFFFFFFFFu : size);
+    add(c);
+  }
+  void dispatch(uint32_t groups_x, uint32_t groups_y, uint32_t groups_z) override {
+    RecordedCommand c;
+    c.type = RecordedCommand::Type::Dispatch;
+    c.count = groups_x, c.first = groups_y, c.instance_count = groups_z;
     add(c);
   }
   void begin_occlusion_query(uint32_t slot) override {

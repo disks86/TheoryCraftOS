@@ -69,6 +69,7 @@ struct D3d9Program::State {
   const graphics::Vec4* varyings = nullptr;
   const uint8_t* constants = nullptr;
   const graphics::ITextureSet* textures = nullptr;
+  const graphics::ComputeContext* compute = nullptr;
   Q sys[kSysValueCount] = {};
   bool killed = false;
 };
@@ -112,6 +113,7 @@ uint32_t D3d9Program::required_features() const {
   uint32_t kinds = 0;
   for (graphics::TextureKind k : texture_kind_)
     if (k != graphics::TextureKind::Texture2D) kinds = graphics::kFeatureTextureKinds;
+  if (stage_ == graphics::ShaderStage::Compute) kinds |= graphics::kFeatureCompute;
   return kinds | (uses_system_values_ ? graphics::kFeatureSystemInputs : 0u) | (uses_texel_access_ ? graphics::kFeatureTexelAccess : 0u) |
          (color_outputs_ > 1 ? graphics::kFeatureMultipleTargets : 0u);
 }
@@ -583,6 +585,60 @@ void D3d9Program::execute(State& s) const {
         break;
       case kDp3: b = fetch(ins.src[1], 0); store(ins.dst, splat(dot(a, b, 3))); break;
       case kDp4: b = fetch(ins.src[1], 0); store(ins.dst, splat(dot(a, b, 4))); break;
+      case kBufLoad: case kBufStore: case kBufAtomic: case kBufImmAtomic: {
+        if (!s.compute || ins.uav >= graphics::kMaxStorageBuffers) break;
+        const ByteView buffer = s.compute->buffers[ins.uav];
+        // The byte address: a raw buffer's is the address; a structured one's the structure number times the stride plus the offset (an atomic gives both in one register).
+        uint64_t address = bits_of(a.f[0]);
+        if (ins.stride) {
+          const uint32_t offset = ins.op == kBufLoad || ins.op == kBufStore ? bits_of(fetch(ins.src[1], 0).f[0]) : bits_of(a.f[1]);
+          address = address * ins.stride + offset;
+        }
+        auto word_at = [&](uint64_t at, uint32_t* out) {
+          ConstByteView part;
+          if (!ConstByteView(buffer.data(), buffer.size()).try_subview(at, 4, &part)) return false;
+          *out = ByteReader(part).le32();
+          return true;
+        };
+        auto put_word = [&](uint64_t at, uint32_t value) {
+          ByteView part;
+          if (!buffer.try_subview(at, 4, &part)) return;   // (a write outside the buffer is dropped)
+          ByteWriter(part).le32(value);
+        };
+        if (ins.op == kBufLoad) {
+          Q words = {{0, 0, 0, 0}};
+          for (uint32_t k = 0; k < 4; ++k) {
+            uint32_t w = 0;
+            if (word_at(address + 4ull * k, &w)) words.f[k] = from_bits(w);   // (outside the buffer: zero)
+          }
+          for (uint32_t k = 0; k < 4; ++k) r.f[k] = words.f[ins.tex_swizzle[k] & 3];
+          store(ins.dst, r);
+        } else if (ins.op == kBufStore) {
+          const Q value = fetch(ins.src[2], 0);
+          uint32_t written = 0;
+          for (uint32_t k = 0; k < 4; ++k)
+            if (ins.dst.mask & (1u << k)) put_word(address + 4ull * written++, bits_of(value.f[k]));   // (the words packed one after the other)
+        } else {
+          const uint32_t operand = bits_of(fetch(ins.src[1], 0).f[0]);
+          uint32_t old = 0;
+          if (!word_at(address, &old)) break;
+          uint32_t updated = old;
+          switch (ins.control) {
+            case kAtomicAdd: updated = old + operand; break;
+            case kAtomicAnd: updated = old & operand; break;
+            case kAtomicOr: updated = old | operand; break;
+            case kAtomicXor: updated = old ^ operand; break;
+            case kAtomicIMax: updated = static_cast<int32_t>(operand) > static_cast<int32_t>(old) ? operand : old; break;
+            case kAtomicIMin: updated = static_cast<int32_t>(operand) < static_cast<int32_t>(old) ? operand : old; break;
+            case kAtomicUMax: updated = operand > old ? operand : old; break;
+            case kAtomicUMin: updated = operand < old ? operand : old; break;
+            default: updated = operand; break;
+          }
+          put_word(address, updated);
+          if (ins.op == kBufImmAtomic) store(ins.dst, splat(from_bits(old)));
+        }
+        break;
+      }
       case kDp2Add: b = fetch(ins.src[1], 0); c = fetch(ins.src[2], 0); store(ins.dst, splat(dot(a, b, 2) + c.f[0])); break;
       case kExp:
         for (int i = 0; i < 4; ++i) r.f[i] = static_cast<float>(fmath::exp(static_cast<double>(ins.vector ? a.f[i] : a.f[0]) * 0.6931471805599453));
@@ -788,6 +844,20 @@ bool D3d9Program::run_fragment_ex(const graphics::Vec4* varyings, const graphics
   return true;
 }
 
+void D3d9Program::run_compute(const graphics::ComputeContext& context, const uint8_t* constants) const {
+  if (stage_ != graphics::ShaderStage::Compute) return;
+  State s;
+  s.constants = constants;
+  s.compute = &context;
+  for (uint32_t k = 0; k < 3; ++k) {
+    s.sys[kSysDispatchThreadId].f[k] = from_bits(context.dispatch_id[k]);
+    s.sys[kSysGroupId].f[k] = from_bits(context.group_id[k]);
+    s.sys[kSysGroupThreadId].f[k] = from_bits(context.thread_id[k]);
+  }
+  s.sys[kSysGroupIndex].f[0] = from_bits(context.group_index);
+  execute(s);
+}
+
 // --- Trampolines -----------------------------------------------------------------------------------------------------------------------------------------------------
 
 namespace {
@@ -798,6 +868,7 @@ const D3d9Program* g_fragment[kSlots];
 const D3d9Program* g_textured[kSlots];
 const D3d9Program* g_vertex_ex[kSlots];
 const D3d9Program* g_fragment_ex[kSlots];
+const D3d9Program* g_compute[kSlots];
 
 template <uint32_t N>
 void vertex_trampoline(const graphics::Vec4* attributes, const uint8_t* constants, graphics::ShaderIo* out) {
@@ -821,8 +892,14 @@ bool fragment_ex_trampoline(const graphics::Vec4* varyings, const graphics::Frag
   return g_fragment_ex[N]->run_fragment_ex(varyings, context, constants, &textures, color);
 }
 
+template <uint32_t N>
+void compute_trampoline(const graphics::ComputeContext& context, const uint8_t* constants) {
+  g_compute[N]->run_compute(context, constants);
+}
+
 template <uint32_t... I>
 struct Trampolines {
+  static constexpr graphics::ComputeShaderFn compute[sizeof...(I)] = {&compute_trampoline<I>...};
   static constexpr graphics::VertexShaderFnEx vertex_ex[sizeof...(I)] = {&vertex_ex_trampoline<I>...};
   static constexpr graphics::FragmentShaderFnEx fragment_ex[sizeof...(I)] = {&fragment_ex_trampoline<I>...};
   static constexpr graphics::VertexShaderFn vertex[sizeof...(I)] = {&vertex_trampoline<I>...};
@@ -840,6 +917,19 @@ constexpr auto kTrampolines = make_trampolines(std::make_integer_sequence<uint32
 NtStatus D3d9Binding::bind(UniquePointer<D3d9Program> program, graphics::ShaderModuleDesc* desc) {
   release();
   if (!program) return status::kInvalidParameter;
+  if (program->stage() == graphics::ShaderStage::Compute) {
+    uint32_t slot = 0;
+    while (slot < kSlots && g_compute[slot]) ++slot;
+    if (slot == kSlots) return status::kInsufficientResources;
+    g_compute[slot] = program.get();
+    slot_ = static_cast<int32_t>(slot);
+    kind_ = 3;
+    desc->stage = graphics::ShaderStage::Compute;
+    desc->compute_function = decltype(kTrampolines)::compute[slot];
+    for (uint32_t k = 0; k < 3; ++k) desc->thread_group[k] = program->thread_group(k);
+    program_ = util::move(program);
+    return status::kSuccess;
+  }
   const D3d9Program** table = program->stage() == graphics::ShaderStage::Vertex ? g_vertex : program->uses_textures() ? g_textured : g_fragment;
   uint32_t slot = 0;
   while (slot < kSlots && table[slot]) ++slot;
@@ -869,7 +959,7 @@ NtStatus D3d9Binding::bind(UniquePointer<D3d9Program> program, graphics::ShaderM
 
 void D3d9Binding::release() {
   if (slot_ >= 0) {
-    const D3d9Program** table = kind_ == 0 ? g_vertex : kind_ == 1 ? g_fragment : g_textured;
+    const D3d9Program** table = kind_ == 0 ? g_vertex : kind_ == 1 ? g_fragment : kind_ == 3 ? g_compute : g_textured;
     table[slot_] = nullptr;
     slot_ = -1;
   }
