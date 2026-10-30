@@ -90,6 +90,7 @@
 #include "Hardware/Mouse/I2c/PlatformI2cHid.hpp"
 #ifdef TCOS_INTEL_WIFI
 #include "Hardware/WirelessInterface/Intel/IwlDriver.hpp"
+#include "Kernel/Delay.hpp"
 #endif
 #include "Hardware/Keyboard/KeyCodes.hpp"
 #include "Kernel/Clipboard.hpp"
@@ -1097,6 +1098,22 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
           e.text("Intel Wireless-AC ").text(intel_wifi.firmware_name()).text(", ");
           for (int b = 0; b < 6; ++b) e.hex2(nvm.hw_address[b]).text(b < 5 ? ":" : "");
           e.text(", ").dec(nvm.valid_channels()).text(" channels");
+          // a look around: scan, wait up to 15 s for the end, list what was heard
+          const char* scan_error = nullptr;
+          if (hardware::IwlScanner* scanner = intel_wifi.enable_scanning(&scan_error)) {
+            if (scanner->start_scan(true, &scan_error)) {
+              for (uint32_t waited = 0; scanner->poll() && waited < 15000000; waited += 20000) hardware::delay_us(20000);
+              hardware::WifiNetwork found[16];
+              const uint32_t n = scanner->results(ArrayView<hardware::WifiNetwork>(found, 16));
+              Entry(n ? Level::Ok : Level::Info, "Wi-Fi").dec(n).text(" network(s) in range").text(scanner->scanning() ? " (the scan did not finish)" : "");
+              for (uint32_t i = 0; i < n; ++i)
+                Entry(Level::Info, "Wi-Fi").text("  ").text(found[i].ssid).text("  ").text(hardware::wifi_security_name(found[i].security)).text("  channel ").dec(found[i].channel).text("  ").dec(found[i].signal_percent).text("%");
+            } else {
+              Entry(Level::Warning, "Wi-Fi").text("scan not started: ").text(scan_error ? scan_error : "?");
+            }
+          } else {
+            Entry(Level::Warning, "Wi-Fi").text("scanning not available: ").text(scan_error ? scan_error : "?");
+          }
         } else {
           Entry(Level::Warning, "Wi-Fi").text("Intel Wireless-AC not started: ").text(hardware::IwlDriver::outcome_name(outcome)).text(intel_wifi.message()[0] ? " - " : "").text(intel_wifi.message());
         }
