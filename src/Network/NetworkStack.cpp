@@ -105,6 +105,18 @@ void NetworkStack::poll() {
   for (uint32_t i = 0; i < kFramesPerPoll && nic_.receive(ByteView(frame), &length); ++i)
     if (length <= sizeof(frame)) handle_frame(ConstByteView(frame).first(length));
 
+  if (follow_link_) {
+    const bool up = nic_.link_up();
+    if (up != link_was_up_) {
+      link_was_up_ = up;
+      if (up) {
+        dhcp_->start();
+      } else {
+        dhcp_->stop();
+        config_ = IpConfiguration{};
+      }
+    }
+  }
   dhcp_->poll();
   resolver_->poll();
   service_pending();

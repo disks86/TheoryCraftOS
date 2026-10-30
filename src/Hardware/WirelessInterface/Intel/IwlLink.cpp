@@ -92,10 +92,11 @@ bool IwlStationLink::prepare(const IwlFirmware& firmware, const IwlNvmData& nvm,
   int32_t length = 0;
 
   // the channel
-  uint32_t n = iwl_build_phy_context(kCtxtActionAdd, network.channel, network.channel > 14, tx_antennas_, rx_antennas_, ByteView(out, sizeof out));
+  uint32_t n = iwl_build_phy_context(phy_added_ ? kCtxtActionModify : kCtxtActionAdd, network.channel, network.channel > 14, tx_antennas_, rx_antennas_, ByteView(out, sizeof out));
   command.opcode = kPhyContextCommand;
   command.data = ConstByteView(out, n);
   if (!send_command(command, ByteView(response, sizeof response), nullptr, error)) return false;
+  phy_added_ = true;
   // the interface now knows the access point
   if (!send_mac_context(false, 0, error)) return false;
   // the interface bound to the channel
@@ -121,6 +122,25 @@ bool IwlStationLink::prepare(const IwlFirmware& firmware, const IwlNvmData& nvm,
   have_ptk_ = false;
   pn_ = 0;
   return true;
+}
+
+void IwlStationLink::teardown() {
+  if (prepared_) {
+    const char* error = nullptr;
+    uint8_t out[24], response[16];
+    const uint8_t remove_station[4] = {kStationId, 0, 0, 0};
+    IwlHostCommand command;
+    command.opcode = 0x19;                                    // REMOVE_STA
+    command.data = ConstByteView(remove_station, sizeof remove_station);
+    send_command(command, ByteView(response, sizeof response), nullptr, &error);
+    const uint32_t n = iwl_build_binding(kCtxtActionRemove, 0, 0, 0, ByteView(out, sizeof out));
+    command = IwlHostCommand();
+    command.opcode = kBindingContextCommand;
+    command.data = ConstByteView(out, n);
+    send_command(command, ByteView(response, sizeof response), nullptr, &error);
+    queue_.deactivate();
+  }
+  release();
 }
 
 void IwlStationLink::release() {

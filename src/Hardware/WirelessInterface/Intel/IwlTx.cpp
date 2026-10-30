@@ -162,6 +162,12 @@ bool IwlCommandQueue::start_secondary(const char** error) {
   return true;
 }
 
+void IwlCommandQueue::deactivate() {
+  if (!ready() || !device_.grab_nic_access()) return;
+  device_.write_prph(scd_queue_status(queue_), kQueueStatusScdActEn);
+  device_.release_nic_access();
+}
+
 void IwlCommandQueue::release() {
   release_view(allocator_, tfds_);
   release_view(allocator_, commands_);

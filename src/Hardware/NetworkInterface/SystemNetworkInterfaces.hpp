@@ -39,6 +39,9 @@ class SystemNetworkInterfaces {
   // Stops every interface and frees them.
   void shutdown();
 
+  // Takes an interface that was made elsewhere (it needs more than the PCI bus to be made: a file system for firmware, say). It is stopped and freed with the others.
+  bool adopt(UniquePointer<INetworkInterface> interface) { return interface && interfaces_.push_back(util::move(interface)); }
+
   uint32_t count() const { return static_cast<uint32_t>(interfaces_.count()); }
   INetworkInterface* at(uint32_t index) const {
     return index < interfaces_.count() ? interfaces_[index].get() : nullptr;

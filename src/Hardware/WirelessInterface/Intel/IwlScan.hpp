@@ -36,7 +36,7 @@ class IwlScanner final : private IIwlNotificationHandler {
   static constexpr uint32_t kCommandTimeoutUs = 2000000;
 
   IwlScanner(IwlTransport& transport, allocators::IAllocator& allocator)
-      : transport_(transport), allocator_(allocator), aux_queue_(transport.device(), allocator, iwl_tx::kAuxQueue, iwl_tx::kMcastFifo), networks_(allocator) {}
+      : transport_(transport), allocator_(allocator), aux_queue_(transport.device(), allocator, iwl_tx::kAuxQueue, iwl_tx::kMcastFifo), networks_(allocator), rsn_records_(allocator) {}
   ~IwlScanner() { shut_down(); }
   IwlScanner(const IwlScanner&) = delete;
   IwlScanner& operator=(const IwlScanner&) = delete;
@@ -56,19 +56,27 @@ class IwlScanner final : private IIwlNotificationHandler {
   // Copies the networks found, strongest first; returns how many fit.
   uint32_t results(ArrayView<WifiNetwork> out) const;
   uint32_t frames_seen() const { return frames_seen_; }
+  // The RSN element of the access point's beacon (id 48 included), as heard in the latest scan; false if it had none.
+  bool rsn_element(const MacAddress& bssid, ConstByteView* element) const;
   // Every notification is also passed on (the station link reads the frames and the transmit responses from the same stream).
   void set_forward(IIwlNotificationHandler* next) { forward_ = next; }
   uint8_t auxiliary_station_id() const { return 0; }
 
  private:
   void on_notification(const IwlRxPacket& packet) override;
-  void add_network(const WifiNetwork& network);
+  struct RsnRecord {
+    MacAddress bssid{};
+    uint8_t length = 0;
+    uint8_t element[64] = {};
+  };
+  void add_network(const WifiNetwork& network, ConstByteView rsn);
   bool send(const IwlHostCommand& command, ByteView response, int32_t* length, const char** error);
 
   IwlTransport& transport_;
   allocators::IAllocator& allocator_;
   IwlCommandQueue aux_queue_;
   List<WifiNetwork> networks_;
+  List<RsnRecord> rsn_records_;
   IIwlNotificationHandler* forward_ = nullptr;
   const IwlFirmware* firmware_ = nullptr;
   IwlNvmData nvm_;

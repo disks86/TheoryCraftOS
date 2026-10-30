@@ -18,6 +18,7 @@
 
 
 #include "Hardware/WirelessInterface/Intel/IwlScan.hpp"
+#include "Hardware/WirelessInterface/Ieee80211Frames.hpp"
 #include "Hardware/WirelessInterface/Ieee80211Scan.hpp"
 #include "Kernel/Delay.hpp"
 
@@ -115,6 +116,7 @@ void IwlScanner::shut_down() {
   scanning_ = false;
   aux_queue_.release();
   networks_.clear();
+  rsn_records_.clear();
 }
 
 bool IwlScanner::start_scan(bool active, const char** error) {
@@ -164,6 +166,7 @@ bool IwlScanner::start_scan(bool active, const char** error) {
   if (ok) {
     // (the firmware may answer, report networks and even finish before the command call returns: the state is ready first)
     networks_.clear();
+    rsn_records_.clear();
     scan_uid_ = request.uid;
     scanning_ = true;
     last_completed_ = false;
@@ -179,7 +182,27 @@ bool IwlScanner::start_scan(bool active, const char** error) {
   return ok;
 }
 
-void IwlScanner::add_network(const WifiNetwork& network) {
+bool IwlScanner::rsn_element(const MacAddress& bssid, ConstByteView* element) const {
+  for (uint64_t i = 0; i < rsn_records_.count(); ++i)
+    if (rsn_records_[i].bssid == bssid) {
+      *element = ConstByteView(rsn_records_[i].element, rsn_records_[i].length);
+      return rsn_records_[i].length != 0;
+    }
+  return false;
+}
+
+void IwlScanner::add_network(const WifiNetwork& network, ConstByteView rsn) {
+  if (rsn.size() != 0 && rsn.size() <= 64) {
+    bool known = false;
+    for (uint64_t i = 0; i < rsn_records_.count() && !known; ++i) known = rsn_records_[i].bssid == network.bssid;
+    if (!known && rsn_records_.count() < kMaxNetworks) {
+      RsnRecord rec;
+      rec.bssid = network.bssid;
+      rec.length = static_cast<uint8_t>(rsn.size());
+      for (uint64_t i = 0; i < rsn.size(); ++i) rec.element[i] = rsn[i];
+      rsn_records_.push_back(rec);
+    }
+  }
   for (uint64_t i = 0; i < networks_.count(); ++i) {
     if (networks_[i].bssid == network.bssid) {
       if (network.signal_percent > networks_[i].signal_percent) networks_[i].signal_percent = network.signal_percent;
@@ -197,7 +220,7 @@ void IwlScanner::on_notification(const IwlRxPacket& packet) {
     if (!iwl_parse_rx_mpdu(packet, &frame) || !frame.crc_ok) return;
     ++frames_seen_;
     WifiNetwork network;
-    if (wifi_parse_announcement(frame.frame, frame.channel, frame.signal_dbm, &network)) add_network(network);
+    if (wifi_parse_announcement(frame.frame, frame.channel, frame.signal_dbm, &network)) add_network(network, ieee80211::find_rsn_element(frame.frame));
     return;
   }
   if (packet.group == 0 && packet.command == kScanCompleteUmacCommand) {
