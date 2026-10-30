@@ -434,7 +434,8 @@ class Adapter::StreamRunner {
     const uint32_t slot = p.le32(), index = p.le32(), offset = p.le32(), size = p.le32();
     if (!exact(p) || in_pass_ || !(adapter_.caps_.features & graphics::kFeatureCompute) || slot >= graphics::kMaxStorageBuffers) return kBad;
     Allocation* a = alloc(index);
-    if (!a || !(a->desc().flags & kAllocUnorderedAccess) || !use(a, state::kUnorderedAccess) || size == 0 || offset % 4 || size % 4 || offset > a->desc().size || size > a->desc().size - offset) return kBad;
+    const bool read_only = slot >= graphics::kMaxUavBuffers;   // (the slots after u3 are shader resource views of buffers)
+    if (!a || !(a->desc().flags & kAllocUnorderedAccess) || !use(a, read_only ? state::kNonPixelShaderResource : state::kUnorderedAccess) || size == 0 || offset % 4 || size % 4 || offset > a->desc().size || size > a->desc().size - offset) return kBad;
     uav_bound_[slot] = true;
     uav_alloc_[slot] = a;
     if (!exec_) return status::kSuccess;
@@ -459,7 +460,7 @@ class Adapter::StreamRunner {
     if (s != status::kSuccess) return s;
     cb_->dispatch(x, y, z);
     for (uint32_t slot = 0; slot < graphics::kMaxStorageBuffers; ++slot)
-      if (uav_bound_[slot]) mm_.note_gpu_write(*uav_alloc_[slot]);
+      if (uav_bound_[slot] && slot < graphics::kMaxUavBuffers) mm_.note_gpu_write(*uav_alloc_[slot]);
     return status::kSuccess;
   }
 
@@ -880,8 +881,10 @@ class Adapter::StreamRunner {
       if (!a->is_buffer() || a->is_query_result() || !use(a, state::kVertexAndConstantBuffer)) return kBad;
     } else if (rp.type == RootParameterType::Uav) {
       if (!(a->desc().flags & kAllocUnorderedAccess) || !use(a, state::kUnorderedAccess)) return kBad;
+    } else if (rp.type == RootParameterType::Srv) {
+      if (!(a->desc().flags & kAllocUnorderedAccess) || !use(a, state::kNonPixelShaderResource)) return kBad;   // (a buffer: a storage buffer the shader only reads)
     } else {
-      return kBad;   // (a shader resource view of a buffer: no device has buffer shader resources)
+      return kBad;
     }
     arguments_[index].set = true;
     arguments_[index].allocation = a;
@@ -999,8 +1002,12 @@ class Adapter::StreamRunner {
         ByteView out(block, block_bytes);
         if (!out.copy_from(arg.allocation->backing().subview(arg.offset, block_bytes))) return kBad;
       } else if (rp.type == RootParameterType::Uav) {
-        if (rp.space != 0 || !arg.set || rp.shader_register >= graphics::kMaxStorageBuffers) return kBad;
+        if (rp.space != 0 || !arg.set || rp.shader_register >= graphics::kMaxUavBuffers) return kBad;
         const NtStatus s = lower_uav(rp.shader_register, arg.allocation, arg.offset, arg.allocation->desc().size - arg.offset);
+        if (s != status::kSuccess) return s;
+      } else if (rp.type == RootParameterType::Srv) {
+        if (rp.space != 0 || !arg.set || rp.shader_register >= graphics::kMaxSrvBuffers) return kBad;
+        const NtStatus s = lower_uav(graphics::kMaxUavBuffers + rp.shader_register, arg.allocation, arg.offset, arg.allocation->desc().size - arg.offset);
         if (s != status::kSuccess) return s;
       } else if (rp.type == RootParameterType::Table && !rp.sampler_table) {
         if (!arg.set || !view_heap_) return kBad;
@@ -1015,12 +1022,16 @@ class Adapter::StreamRunner {
             const Descriptor& d = view_heap_->at(at);
             const uint32_t reg = range.base_register + static_cast<uint32_t>(k);
             if (d.kind == DescriptorKind::None) continue;   // (a descriptor that was never written: not used by a shader that is right)
-            if (range.type == RangeType::Srv && d.kind == DescriptorKind::Srv) {
+            if (range.type == RangeType::Srv && d.kind == DescriptorKind::Srv && d.allocation->is_buffer()) {
+              if (reg >= graphics::kMaxSrvBuffers) return kBad;
+              const NtStatus s = lower_uav(graphics::kMaxUavBuffers + reg, d.allocation.get(), d.offset, d.size);
+              if (s != status::kSuccess) return s;
+            } else if (range.type == RangeType::Srv && d.kind == DescriptorKind::Srv) {
               if (reg >= graphics::kMaxTextureUnits) return kBad;
               const NtStatus s = lower_texture(reg, d.allocation.get(), sampler_for(reg));
               if (s != status::kSuccess) return s;
             } else if (range.type == RangeType::Uav && d.kind == DescriptorKind::Uav) {
-              if (reg >= graphics::kMaxStorageBuffers) return kBad;
+              if (reg >= graphics::kMaxUavBuffers) return kBad;
               const NtStatus s = lower_uav(reg, d.allocation.get(), d.offset, d.size);
               if (s != status::kSuccess) return s;
             } else if (range.type == RangeType::Cbv && d.kind == DescriptorKind::Cbv) {

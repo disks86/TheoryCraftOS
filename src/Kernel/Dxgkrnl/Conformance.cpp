@@ -1308,6 +1308,30 @@ void compute_shared(Rig& rig, ArrayView<uint32_t> out, const uint8_t* code, uint
 }
 
 void scene_compute_shared(Rig& rig, ArrayView<uint32_t> out) { compute_shared(rig, out, conformance_blobs::k_cs_shared, sizeof conformance_blobs::k_cs_shared); }
+// Buffer shader resource views (dxil_cs_srv.hlsl): a structured buffer of uint4 (t0) and a byte address buffer (t1), read-only, combined into the picture buffer (u0).
+void scene_dxil_compute_srv(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureCompute)) return void(rig.step("compute", status::kNotSupported));
+  namespace b = conformance_blobs;
+  Handle cs = rig.shader("create_shader (compute)", ShaderKind::Dxbc, graphics::ShaderStage::Compute, bytes_of(b::k_dxil_cs_srv, sizeof b::k_dxil_cs_srv));
+  PipelineDesc pd;
+  pd.compute_shader = cs;
+  Handle pipe = rig.pipeline(pd);
+  ByteBuffer structured(rig.allocator()), raw(rig.allocator());
+  for (uint32_t i = 0; i < kPixels * 4; ++i) structured.put32(0x01010101u * (i % 251) + i * 7);
+  for (uint32_t i = 0; i < kPixels; ++i) raw.put32(0x9E3779B9u * (i + 1));
+  Handle src = rig.buffer(kAllocUnorderedAccess, structured.view()), bytes = rig.buffer(kAllocUnorderedAccess, raw.view());
+  AllocationDesc d;
+  d.flags = kAllocUnorderedAccess, d.size = kPixels * 4;
+  Handle picture = rig.create(d);
+  CommandWriter w(rig.allocator());
+  w.bind_pipeline(pipe);
+  w.bind_uav(0, 2, 0, kPixels * 4);
+  w.bind_uav(graphics::kMaxUavBuffers, 0, 0, kPixels * 16);
+  w.bind_uav(graphics::kMaxUavBuffers + 1, 1, 0, kPixels * 4);
+  w.dispatch(kSize / 8, kSize / 4, 1);
+  rig.render(w, {src, bytes, picture});
+  rig.read_words(picture, out);
+}
 void scene_dxil_compute_shared(Rig& rig, ArrayView<uint32_t> out) { compute_shared(rig, out, conformance_blobs::k_dxil_cs_shared, sizeof conformance_blobs::k_dxil_cs_shared); }
 
 // Multisampling (4 samples): a far red rectangle and a near green one that overlaps it, both with edges between the pixels' sample positions, drawn into 4x colour and depth images (depth
@@ -2240,6 +2264,7 @@ const Entry kScenes[] = {
     {"Direct3D 12 DXIL compute shader (Shader Model 6)", scene_dxil_compute},
     {"Direct3D 12 DXIL geometry shader (Shader Model 6)", scene_dxil_geometry},
     {"Direct3D 12 DXIL hull and domain shaders (Shader Model 6)", scene_dxil_tess},
+    {"Direct3D 12 DXIL buffer shader resource views (Shader Model 6)", scene_dxil_compute_srv},
     {"Direct3D 12 DXIL group-shared memory, barriers and a loop (Shader Model 6)", scene_dxil_compute_shared},
     {"Direct3D 11 stream output of two streams (DXBC)", scene_stream_output},
     {"Direct3D 11 stream output appending, statistics and timestamps (DXBC)", scene_stream_output_append},

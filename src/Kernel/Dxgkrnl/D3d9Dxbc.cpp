@@ -45,7 +45,7 @@ enum DxbcOp : uint32_t {
   kDclResource4 = 88, kDclConstantBuffer4 = 89, kDclSampler4 = 90, kDclInput4 = 95, kDclInputSgv4 = 96, kDclInputSiv4 = 97, kDclInputPs4 = 98, kDclInputPsSgv4 = 99, kDclInputPsSiv4 = 100,
   kHsDecls4 = 113, kHsControlPointPhase4 = 114, kHsForkPhase4 = 115, kHsJoinPhase4 = 116, kDclInputControlPointCount4 = 147, kDclOutputControlPointCount4 = 148, kDclTessDomain4 = 149,
   kDclTessPartitioning4 = 150, kDclTessOutputPrimitive4 = 151, kDclHsMaxTessFactor4 = 152, kDclHsForkInstances4 = 153, kDclHsJoinInstances4 = 154,
-  kEmit4 = 19, kCut4 = 9, kDclOutputTopology4 = 92, kDclInputPrimitive4 = 93, kDclMaxOutputVertices4 = 94, kDclGsInstanceCount4 = 206, kDclThreadGroup4 = 155, kDclUavRaw4 = 157, kDclUavStructured4 = 158, kLdRaw4 = 165, kStoreRaw4 = 166, kLdStructured4 = 167, kStoreStructured4 = 168, kSync4 = 190, kDclTgsmRaw4 = 159, kDclTgsmStructured4 = 160,
+  kEmit4 = 19, kCut4 = 9, kDclOutputTopology4 = 92, kDclInputPrimitive4 = 93, kDclMaxOutputVertices4 = 94, kDclGsInstanceCount4 = 206, kDclThreadGroup4 = 155, kDclResourceRaw4 = 161, kDclResourceStructured4 = 162, kDclUavRaw4 = 157, kDclUavStructured4 = 158, kLdRaw4 = 165, kStoreRaw4 = 166, kLdStructured4 = 167, kStoreStructured4 = 168, kSync4 = 190, kDclTgsmRaw4 = 159, kDclTgsmStructured4 = 160,
   kDclOutput4 = 101, kDclOutputSgv4 = 102, kDclOutputSiv4 = 103, kDclTemps4 = 104, kDclIndexableTemp4 = 105, kDclGlobalFlags4 = 106,
 };
 // The texture a dcl_resource declares (D3D10_SB_RESOURCE_DIMENSION: 3 texture2d, 5 texture3d, 6 texturecube, 8 texture2darray); the others are not taken.
@@ -780,15 +780,19 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         program->uav_stride_[slot] = opcode == kDclTgsmStructured4 ? first : 0;
         continue;
       }
-      case kDclUavRaw4: case kDclUavStructured4: {
+      case kDclUavRaw4: case kDclUavStructured4: case kDclResourceRaw4: case kDclResourceStructured4: {
+        // (a shader resource view of a buffer, t#, is a read-only storage buffer in the slot after the u# ones)
+        const bool srv = opcode == kDclResourceRaw4 || opcode == kDclResourceStructured4, structured_decl = opcode == kDclUavStructured4 || opcode == kDclResourceStructured4;
         Operand o;
         s = read_operand(p, &o);
         if (s != status::kSuccess) return s;
-        const uint32_t stride = opcode == kDclUavStructured4 ? p.le32() : 0;
-        if (!compute || !p.ok() || o.type != kOpUav || o.dims != 1 || o.index[0] >= graphics::kMaxStorageBuffers || program->uav_kind_[o.index[0]] != D3d9Program::BufferKind::None) return status::kNotSupported;
-        if (opcode == kDclUavStructured4 && (stride == 0 || stride > 2048 || stride % 4)) return status::kNotSupported;
-        program->uav_kind_[o.index[0]] = opcode == kDclUavRaw4 ? D3d9Program::BufferKind::Raw : D3d9Program::BufferKind::Structured;
-        program->uav_stride_[o.index[0]] = stride;
+        const uint32_t stride = structured_decl ? p.le32() : 0;
+        if (!compute || !p.ok() || o.type != (srv ? kOpResource : kOpUav) || o.dims != 1 || o.index[0] >= (srv ? graphics::kMaxSrvBuffers : graphics::kMaxUavBuffers)) return status::kNotSupported;
+        const uint32_t slot = srv ? graphics::kMaxUavBuffers + o.index[0] : o.index[0];
+        if (program->uav_kind_[slot] != D3d9Program::BufferKind::None) return status::kNotSupported;
+        if (structured_decl && (stride == 0 || stride > 2048 || stride % 4)) return status::kNotSupported;
+        program->uav_kind_[slot] = structured_decl ? D3d9Program::BufferKind::Structured : D3d9Program::BufferKind::Raw;
+        program->uav_stride_[slot] = stride;
         continue;
       }
       default: break;
@@ -976,8 +980,10 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         if ((s = read_operand(p, &value)) != status::kSuccess) return s;
       }
       const bool group_shared = uav.type == kOpTgsm;
-      if ((uav.type != kOpUav && !group_shared) || uav.dims != 1 || uav.index[0] >= (group_shared ? graphics::kMaxSharedMemories : graphics::kMaxStorageBuffers)) return status::kNotSupported;
-      const uint32_t slot = group_shared ? graphics::kMaxStorageBuffers + uav.index[0] : uav.index[0];
+      const bool read_only_view = uav.type == kOpResource && load;   // (t#: a load only)
+      if ((uav.type != kOpUav && !group_shared && !read_only_view) || uav.dims != 1 || uav.index[0] >= (group_shared ? graphics::kMaxSharedMemories : read_only_view ? graphics::kMaxSrvBuffers : graphics::kMaxUavBuffers))
+        return status::kNotSupported;
+      const uint32_t slot = group_shared ? graphics::kMaxStorageBuffers + uav.index[0] : read_only_view ? graphics::kMaxUavBuffers + uav.index[0] : uav.index[0];
       const D3d9Program::BufferKind kind = program->uav_kind_[slot];
       if (kind == D3d9Program::BufferKind::None || ((load || store) && structured != (kind == D3d9Program::BufferKind::Structured))) return status::kNotSupported;   // (an atomic works on either kind)
       ins.uav = static_cast<uint8_t>(slot);

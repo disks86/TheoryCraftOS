@@ -324,7 +324,9 @@ using DomainShaderFn = void (*)(const HullOutputData& patch, float u, float v, f
 // Compute shaders (kFeatureCompute). A software compute shader is called once per thread; the device runs the groups of a dispatch one after the other and the threads of a group
 // in order (no barriers or group-shared memory: a module that needs them is not given a function). `buffers` are the storage buffers bound at the time (empty views for slots
 // that are not bound); a read or write outside a buffer must be dropped or read as zero by the shader.
-constexpr uint32_t kMaxStorageBuffers = 4;
+constexpr uint32_t kMaxUavBuffers = 4;                            // u0 .. u3: storage buffers shaders read and write
+constexpr uint32_t kMaxSrvBuffers = 4;                            // t0 .. t3 of a buffer: read-only storage buffers, in the slots after the u# ones (slot kMaxUavBuffers + n)
+constexpr uint32_t kMaxStorageBuffers = kMaxUavBuffers + kMaxSrvBuffers;
 constexpr uint32_t kMaxSharedMemories = 4;     // group-shared memories (g0 .. g3) of a compute shader (the group runner makes them: a context's `shared`)
 constexpr uint32_t kMaxSharedBytes = 32768;   // all of them together (Direct3D's limit)
 constexpr uint32_t kMaxBarrierThreads = 256;  // threads of a group that uses barriers (each has its own registers while it waits)

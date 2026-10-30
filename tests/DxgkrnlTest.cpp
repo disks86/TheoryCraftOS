@@ -2750,7 +2750,7 @@ void test_dxbc_real() {
           graphics::ShaderIo io;
           p->run_vertex(v, constants, &io);
           // (a compute shader, on buffers that are a little too small for what it does)
-          uint8_t storage[4][64] = {};
+          uint8_t storage[graphics::kMaxStorageBuffers][64] = {};
           graphics::ComputeContext context;
           for (uint32_t k = 0; k < graphics::kMaxStorageBuffers; ++k) context.buffers[k] = ByteView(storage[k], sizeof storage[k]);
           context.dispatch_id[0] = context.dispatch_id[1] = 5;
@@ -4930,6 +4930,54 @@ void test_d3d12_compute() {
   CHECK(run([&](CommandWriter& w) { w.set_root_descriptor(1, 0, 0); w.set_root_descriptor(2, 1, 0); w.set_root_table(3, 2); w.set_root_descriptor(1, 2, 2); }) == status::kInvalidParameter);   // (offset not a multiple of 4... 2)
 }
 
+
+// Shader resource views of buffers: a root descriptor (t0) and a table entry (t1) reach a compute shader as read-only storage buffers.
+void test_d3d12_buffer_views() {
+  Env e;
+  namespace b = conformance_blobs;
+  Handle cs = 0, pipe = 0;
+  ShaderDesc sd;
+  sd.kind = ShaderKind::Dxbc, sd.stage = graphics::ShaderStage::Compute, sd.code = ConstByteView(b::k_dxil_cs_srv, sizeof b::k_dxil_cs_srv);
+  CHECK(e.kernel.create_shader(kPid, e.dev, sd, &cs) == status::kSuccess);
+  PipelineDesc pd;
+  pd.compute_shader = cs;
+  CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &pipe) == status::kSuccess);
+  Handle dst = e.buffer(kAllocUnorderedAccess, 4096), src = e.buffer(kAllocUnorderedAccess, 16384), raw = e.buffer(kAllocUnorderedAccess, 4096);
+  std::vector<uint32_t> a(4096), r(1024);
+  for (uint32_t i = 0; i < a.size(); ++i) a[i] = 0x01010101u * (i % 251) + i * 7;
+  for (uint32_t i = 0; i < r.size(); ++i) r[i] = 0x9E3779B9u * (i + 1);
+  CHECK(e.write(src, ConstByteView(reinterpret_cast<const uint8_t*>(a.data()), 16384)) && e.write(raw, ConstByteView(reinterpret_cast<const uint8_t*>(r.data()), 4096)));
+  const std::vector<uint8_t> blob = serialize_signature(1, {{4, 0, {}, 0, 0, 0}, {3, 0, {}, 0, 0, 0}, {0, 0, {{0, 1, 1, 0, 0}}}});
+  Handle sig = 0, views = 0;
+  CHECK(e.kernel.create_root_signature(kPid, e.dev, ConstByteView(blob.data(), blob.size()), &sig) == status::kSuccess);
+  CHECK(e.kernel.create_descriptor_heap(kPid, e.dev, DescriptorHeapType::CbvSrvUav, 2, &views) == status::kSuccess);
+  DescriptorDesc srv;
+  srv.kind = DescriptorKind::Srv, srv.allocation = raw;
+  CHECK(e.kernel.write_descriptor(kPid, views, 1, srv) == status::kSuccess);
+  auto run = [&](Handle root_src) {
+    CommandWriter w(e.allocator);
+    w.set_root_signature(sig);
+    w.set_descriptor_heaps({views});
+    w.set_root_descriptor(0, 0, 0);
+    w.set_root_descriptor(1, root_src, 0);
+    w.set_root_table(2, 1);
+    w.bind_pipeline(pipe);
+    w.dispatch(4, 8, 1);
+    return w.ok() ? e.render(w, {dst, src, raw}) : status::kNoMemory;
+  };
+  CHECK(run(1) == status::kSuccess);
+  LockResult lock;
+  CHECK(e.kernel.lock(kPid, dst, kLockReadOnly, 0, &lock) == status::kSuccess);
+  ByteReader in(lock.data);
+  bool same = true;
+  for (uint32_t i = 0; i < 1024; ++i) same = same && in.le32() == a[4 * i] + a[4 * i + 3] * 3 + r[i] + (r[1023 - i] ^ a[4 * i + 1]);
+  CHECK(same);
+  e.kernel.unlock(kPid, dst);
+  // A texture is not a buffer view; a buffer that is not a storage buffer is no root SRV.
+  Handle vb = e.buffer(kAllocVertexBuffer, 4096);
+  CHECK(run(vb) == status::kInvalidParameter);
+}
+
 // Resource states: an allocation made with kAllocTrackState is used only in states that allow it.
 void test_d3d12_barriers() {
   Env e;
@@ -5388,6 +5436,33 @@ void test_dxil() {
       CHECK(a0 == b0 && a1 == b1 && a2 == b2);
       CHECK(b0[0] != 0 && b2[0] == 0 && b2[1] == 4);   // (the counters reached 1024: 0x400)
       printf("  dxil dxil_cs_fill: %s\n", a0 == b0 && a1 == b1 && a2 == b2 ? "same buffers" : "buffers differ");
+    }
+  }
+
+  // Shader resource views of buffers (t#: read-only storage buffers after the u# ones).
+  {
+    UniquePointer<D3d9Program> translated;
+    CHECK(load("dxil_cs_srv.dxil", &translated));
+    if (translated) {
+      CHECK(translated->storage_kind(graphics::kMaxUavBuffers) == D3d9Program::BufferKind::Structured && translated->storage_kind(graphics::kMaxUavBuffers + 1) == D3d9Program::BufferKind::Raw &&
+            translated->storage_kind(0) == D3d9Program::BufferKind::Structured);
+      std::vector<uint32_t> src(1024 * 4), raw(1024), dst(1024, 0);
+      for (uint32_t i = 0; i < src.size(); ++i) src[i] = 0x01010101u * (i % 251) + i * 7;
+      for (uint32_t i = 0; i < raw.size(); ++i) raw[i] = 0x9E3779B9u * (i + 1);
+      graphics::ComputeContext context;
+      context.buffers[0] = ByteView(reinterpret_cast<uint8_t*>(dst.data()), dst.size() * 4);
+      context.buffers[graphics::kMaxUavBuffers] = ByteView(reinterpret_cast<uint8_t*>(src.data()), src.size() * 4);
+      context.buffers[graphics::kMaxUavBuffers + 1] = ByteView(reinterpret_cast<uint8_t*>(raw.data()), raw.size() * 4);
+      uint8_t constants[128] = {};
+      for (uint32_t y = 0; y < 32; ++y)
+        for (uint32_t x = 0; x < 32; ++x) {
+          context.thread_id[0] = x % 8, context.thread_id[1] = y % 4, context.dispatch_id[0] = x, context.dispatch_id[1] = y, context.group_index = (y % 4) * 8 + x % 8;
+          translated->run_compute(context, constants);
+        }
+      bool same = true;
+      for (uint32_t i = 0; i < 1024; ++i) same = same && dst[i] == src[4 * i] + src[4 * i + 3] * 3 + raw[i] + (raw[1023 - i] ^ src[4 * i + 1]);
+      CHECK(same);
+      printf("  dxil dxil_cs_srv: %s\n", same ? "buffer views read" : "buffer views differ");
     }
   }
 
@@ -6890,6 +6965,7 @@ int main() {
   test_root_signature_parse();
   test_d3d12_binding();
   test_d3d12_compute();
+  test_d3d12_buffer_views();
   test_d3d12_barriers();
   test_d3d12_heaps();
   test_d3d12_reserved();

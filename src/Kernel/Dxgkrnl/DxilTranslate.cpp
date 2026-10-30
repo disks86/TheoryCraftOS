@@ -1397,14 +1397,18 @@ bool Translator::thread_value(const Instruction& ins, uint32_t type, bool dimens
 }
 
 // A UAV operand with a write mask (a store's destination) or a full swizzle (a load's source).
+uint32_t srv_token() { return 2u | (1u << 2) | (0xE4u << 4) | (7u << 12) | (1u << 20); }
+
 uint32_t uav_token(uint32_t mask, bool destination) {
   return destination ? (2u | (mask << 4) | (30u << 12) | (1u << 20)) : (2u | (1u << 2) | (0xE4u << 4) | (30u << 12) | (1u << 20));
 }
 
 bool Translator::buffer_load(const Instruction& ins) {
   Val h;
-  if (ins.arg_count < 4 || !resource_of(ins.args[1], 1, &h)) return error(status::kNotSupported);
-  const Resource& r = res_[1][h.b];
+  if (ins.arg_count < 4) return error(status::kNotSupported);
+  if (!resource_of(ins.args[1], use(ins.args[1]).a == 0 ? 0 : 1, &h)) return false;
+  const bool view = h.a == 0;   // (a shader resource view: t# in place of u#)
+  const Resource& r = res_[h.a][h.b];
   const bool structured = r.kind == 12;
   if (!structured && r.kind != 11) return error(status::kNotSupported);
   const Val index = use(ins.args[2]);
@@ -1416,13 +1420,13 @@ bool Translator::buffer_load(const Instruction& ins) {
     const uint32_t at = begin(167);        // ld_structured dst, index, offset, u#
     dst_temp(r_out.a, 0xF);
     src(index), src(offset);
-    put(uav_token(0, false)), put(slot);
+    put(view ? srv_token() : uav_token(0, false)), put(slot);
     finish(at);
   } else {
     const uint32_t at = begin(165);        // ld_raw dst, byte address, u#
     dst_temp(r_out.a, 0xF);
     src(index);
-    put(uav_token(0, false)), put(slot);
+    put(view ? srv_token() : uav_token(0, false)), put(slot);
     finish(at);
   }
   return define(ins.result, r_out);
@@ -2032,6 +2036,12 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
   for (uint32_t i = 0; i < kMaxResources; ++i) {
     const Resource& r = res_[0][i];
     if (!r.present) continue;
+    if (r.kind == 11 || r.kind == 12) {   // (a raw or structured buffer view: a read-only storage buffer of a compute shader)
+      if (!compute || r.lower >= graphics::kMaxSrvBuffers) return status::kNotSupported;
+      if (r.kind == 12) word(162u | (4u << 24)), word((7u << 12) | (1u << 20)), word(r.lower), word(r.stride);
+      else word(161u | (3u << 24)), word((7u << 12) | (1u << 20)), word(r.lower);
+      continue;
+    }
     // (the kind: 2 texture 2D, 4 texture 3D, 5 cube, 7 2D array)
     const uint32_t dimension = r.kind == 2 ? 3 : r.kind == 4 ? 5 : r.kind == 5 ? 6 : r.kind == 7 ? 8 : 0;
     if (!dimension || r.lower >= graphics::kMaxTextureUnits) return status::kNotSupported;
