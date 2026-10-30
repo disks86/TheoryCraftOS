@@ -143,7 +143,7 @@ NtStatus VidMm::create(const AllocationDesc& desc, SharedPointer<Allocation>* ou
       // (a multisampled target: the device keeps the samples, the system keeps nothing)
       const graphics::DeviceInfo info = device_.info();
       if (!(info.features & graphics::kFeatureMultisample) || desc.samples >= 32 || !(info.sample_counts >> desc.samples & 1)) return status::kNotSupported;
-      if (desc.flags != (depth_flag ? kAllocDepthStencil : kAllocRenderTarget) || desc.mip_levels != 1 || desc.kind != graphics::TextureKind::Texture2D || desc.layers != 1 || dxgk::is_wide(desc.format))
+      if ((depth_flag ? desc.flags != kAllocDepthStencil : (desc.flags & ~kAllocTexture) != kAllocRenderTarget) || desc.mip_levels != 1 || desc.kind != graphics::TextureKind::Texture2D || desc.layers != 1 || dxgk::is_wide(desc.format))
         return status::kInvalidParameter;
       device_bytes = uint64_t{desc.width} * desc.height * desc.samples * (depth_flag ? (desc.format == Format::D24S8 ? 5 : 4) : 4);
       goto sized;

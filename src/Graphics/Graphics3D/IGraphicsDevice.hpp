@@ -77,7 +77,7 @@ enum ImageUsage : uint32_t {
 // What a sampled image is (kFeatureTextureKinds for anything but Texture2D). Texture3D has `layers` slices of depth, Texture2DArray `layers` layers, TextureCube six faces in the order
 // +X, -X, +Y, -Y, +Z, -Z (`layers` is ignored). All but Texture2D have one mip level, a colour format of 8-bit channels and no usage but kImageSampled; they are filled and read
 // layer by layer (write_layer_pixels / read_layer_pixels), each layer a 2D image of `extent`.
-enum class TextureKind : uint8_t { Texture2D, Texture3D, Texture2DArray, TextureCube };
+enum class TextureKind : uint8_t { Texture2D, Texture3D, Texture2DArray, TextureCube, Texture2DMS };   // (Texture2DMS: only what a shader declares for a unit - a multisampled colour image, whose ImageDesc::kind is Texture2D, is bound to it)
 constexpr uint32_t kMaxTextureLayers = 256;
 
 struct ImageDesc {
@@ -200,6 +200,11 @@ class ITextureSet {
   virtual bool size_volume(uint32_t unit, uint32_t level, uint32_t* width, uint32_t* height, uint32_t* depth, uint32_t* levels) const {
     *depth = 1;
     return size(unit, level, width, height, levels);
+  }
+  // One sample of a multisampled colour image (Texture2DMS Load): x and y are texel numbers, `sample` the sample; outside the image or the samples it is transparent black.
+  virtual Vec4 fetch_sample(uint32_t unit, int32_t x, int32_t y, uint32_t sample) const {
+    (void)unit, (void)x, (void)y, (void)sample;
+    return {0, 0, 0, 0};
   }
   // --- kFeatureTexelAccess (DeviceInfo::features); a device without it leaves these at their defaults.
   // The lookup at an explicit level of detail (lambda: 0 is the base level), as sample() takes it from the derivatives.
@@ -471,6 +476,7 @@ class IPipeline {
 enum class IndexType : uint8_t { Uint16, Uint32 };
 
 // What the vertices of a draw make (set_primitive_topology, DeviceFeature kFeatureLines for anything but triangles). Lines and points are one pixel wide.
+enum class ResolveMode : uint8_t { Average, Sample0, Min, Max };
 enum class QueryKind : uint8_t { Occlusion, OcclusionPredicate, IaVertices, IaPrimitives, VsInvocations, PsInvocations };
 enum class PrimitiveTopology : uint8_t { TriangleList, LineList, PointList, PatchList, LineListAdjacency, TriangleListAdjacency };   // (the adjacency lists need a geometry shader that takes them)   // (PatchList: kFeatureTessellation, with set_patch_control_points)
 
@@ -519,8 +525,11 @@ class ICommandBuffer {
   virtual void set_patch_control_points(uint32_t count) { (void)count; }
   virtual void end_render_pass() = 0;
   // Averages the samples of a multisampled colour image into a single-sample image of the same format and size (kFeatureMultisample), outside a render pass.
-  virtual void resolve_image(IImage* destination, IImage* source) {
-    (void)destination, (void)source;
+  // The image may be a depth image (kFeatureDepthResolve): then the destination gets the depth of sample 0 (a stencil plane that comes along: sample 0's too). `mode` says how the samples are
+  // combined: Average (the default, colour only, or depth with kFeatureResolveModes), Sample0, Min, Max (depth only; Sample0 of a colour image too): all but the average of a colour image and
+  // the sample 0 of a depth image are kFeatureResolveModes.
+  virtual void resolve_image(IImage* destination, IImage* source, ResolveMode mode = ResolveMode::Average) {
+    (void)destination, (void)source, (void)mode;
   }
   // Compute (kFeatureCompute), outside a render pass: bind_compute_pipeline makes the pipeline of create_compute_pipeline current for the dispatches that follow, bind_storage_buffer
   // puts `size` bytes of a kBufferStorage buffer from `offset` in slot 0 .. kMaxStorageBuffers - 1, and dispatch runs x * y * z thread groups. A device without the feature ignores all three.
@@ -566,6 +575,8 @@ enum DeviceFeature : uint32_t {
   kFeatureLines = 1u << 4,         // set_primitive_topology: lines and points
   kFeatureFloatFormats = 1u << 6,      // Format::R16G16B16A16Float / R32G32B32A32Float images: colour attachments (also several at once) and sampled textures, without mipmaps; read_pixels_float / write_pixels_float
   kFeatureTessellation = 1u << 16,     // ShaderStage::Hull / Domain, GraphicsPipelineDesc::hull_shader / domain_shader, PrimitiveTopology::PatchList
+  kFeatureDepthResolve = 1u << 19,       // resolve_image of a multisampled depth image (sample 0)
+  kFeatureResolveModes = 1u << 20,       // ResolveMode other than a colour image's average and a depth image's sample 0
   kFeatureStatisticsQueries = 1u << 18,  // QueryKind other than Occlusion (with kFeatureOcclusionQueries)
   kFeatureSnormFormats = 1u << 17,     // Format::R16G16B16A16Snorm, R10G10B10A2Unorm
   kFeatureSrgbFormats = 1u << 13,      // Format::B8G8R8A8Srgb / R8G8B8A8Srgb

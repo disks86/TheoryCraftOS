@@ -84,6 +84,8 @@ add_executable(BOOTX64
   src/Hardware/Acpi/AmlInterpreter.cpp
   src/Hardware/Acpi/EmbeddedController.cpp
   src/Hardware/Acpi/SystemAcpiHost.cpp
+  src/Hardware/Acpi/AcpiEvents.cpp
+  src/Hardware/Acpi/SystemAcpiPorts.cpp
   src/Hardware/Battery/AcpiBattery.cpp
   src/Hardware/Keyboard/KeyCodes.cpp
   src/Hardware/Keyboard/KeyboardBase.cpp
@@ -740,6 +742,7 @@ add_executable(BOOTX64
   src/Hardware/Bus/Thunderbolt/ThunderboltKeys.cpp
   src/Hardware/Bus/Thunderbolt/ThunderboltNet.cpp
   src/Hardware/Bus/Thunderbolt/ThunderboltPower.cpp
+  src/Hardware/Bus/Thunderbolt/ThunderboltNvm.cpp
   src/Hardware/Bus/Thunderbolt/ThunderboltRing.cpp
   src/Hardware/Bus/Thunderbolt/ThunderboltXdomain.cpp
   src/Hardware/Bus/Thunderbolt/ThunderboltControl.cpp
@@ -1086,8 +1089,12 @@ if(TCOS_INTEL_WIFI)
 endif()
 option(TCOS_THUNDERBOLT "Start the Thunderbolt 3 host interface (Alpine Ridge: control channel, the controller's firmware, devices reported as they are connected; PCIe tunnels only on request; not yet run on a real controller)" OFF)
 option(TCOS_THUNDERBOLT_START_FIRMWARE "With TCOS_THUNDERBOLT: start the controller's connection manager firmware if the BIOS did not (resets the controller's CPU through the upstream port's vendor registers)" OFF)
+option(TCOS_THUNDERBOLT_RUNTIME_PM "With TCOS_THUNDERBOLT: put the controller in D3hot after half a minute without devices or another host, and wake it by the ACPI event the tables name (polled)" OFF)
 if(TCOS_THUNDERBOLT)
   target_compile_definitions(BOOTX64 PRIVATE TCOS_THUNDERBOLT)
+  if(TCOS_THUNDERBOLT_RUNTIME_PM)
+    target_compile_definitions(BOOTX64 PRIVATE TCOS_THUNDERBOLT_RUNTIME_PM)
+  endif()
   if(TCOS_THUNDERBOLT_START_FIRMWARE)
     target_compile_definitions(BOOTX64 PRIVATE TCOS_THUNDERBOLT_START_FIRMWARE)
   endif()

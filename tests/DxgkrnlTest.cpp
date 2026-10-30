@@ -3912,8 +3912,8 @@ void test_multisample() {
   CHECK(create(kAllocRenderTarget, Format::A8R8G8B8, 8) == status::kSuccess && create(kAllocDepthStencil, Format::D32Float, 4) == status::kSuccess);
   CHECK(create(kAllocRenderTarget, Format::A8R8G8B8, 3) == status::kNotSupported && create(kAllocRenderTarget, Format::A8R8G8B8, 16) == status::kNotSupported);
   CHECK(create(kAllocRenderTarget, Format::A8R8G8B8, 64) == status::kNotSupported);
-  // Render targets and depth buffers only, one level, 8-bit colour.
-  CHECK(create(kAllocRenderTarget | kAllocTexture, Format::A8R8G8B8, 4) == status::kInvalidParameter);
+  // Render targets (that may be read by a shader, as a multisampled texture) and depth buffers only, one level, 8-bit colour.
+  CHECK(create(kAllocRenderTarget | kAllocTexture, Format::A8R8G8B8, 4) == status::kSuccess && create(kAllocDepthStencil | kAllocTexture, Format::D32Float, 4) == status::kInvalidParameter);
   CHECK(create(kAllocTexture, Format::A8R8G8B8, 4) == status::kInvalidParameter);
   CHECK(create(kAllocRenderTarget | kAllocPresent, Format::A8R8G8B8, 4) == status::kInvalidParameter);
   CHECK(create(kAllocStaging, Format::A8R8G8B8, 4) == status::kInvalidParameter);
@@ -4480,6 +4480,13 @@ void test_conformance() {
       }
       if (__builtin_strstr(r.name, "integer render")) CHECK(px(16, 4) == 0xFF3380CC && px(0, 0) == 0xFF14283C);   // (51, 128, 204 = 255 * the colour, and the cleared (20, 40, 60))
     }
+    if (__builtin_strstr(r.name, "multisampled image as a shader")) {
+      // The red rectangle's left edge is x = 4.3, which cuts pixel 4: the rows of its column read samples 0 .. 3 in turn, and of the four two are on the red side and two are not.
+      auto px = [&](uint32_t x, uint32_t y) { return r.device_picture[y * 32 + x]; };
+      uint32_t black = 0, red = 0;
+      for (uint32_t y = 8; y < 12; ++y) (px(4, y) == 0xFF000000u ? black : red) += px(4, y) == 0xFF000000u || px(4, y) == 0xFFFF0000u;
+      CHECK(black == 2 && red == 2 && px(10, 10) == 0xFFFF0000u && px(14, 14) == 0xFF00FF00u);
+    }
     if (__builtin_strstr(r.name, "group-shared memory")) {
       // Thread 0 of group (0, 0): the neighbour's value is 1, the sum of the 64 slots (0 .. 63) 2016 (>> 3 is 252), the thread's own number 0. Thread 1 sees 2 and has 4 as its blue.
       auto px = [&](uint32_t x, uint32_t y) { return r.device_picture[y * 32 + x]; };
@@ -4496,6 +4503,20 @@ void test_conformance() {
       uint32_t lit = 0;
       for (uint32_t i = 0; i < 32 * 32; ++i) lit += (r.device_picture[i] & 0xFFFFFF) != 0;
       CHECK(lit > 100);
+    }
+    if (__builtin_strstr(r.name, "depth resolve")) {
+      // Counts of the three levels: black (near, 0.3), green (0.7) and blue (the cleared 1). Of the pixels where the rectangles' edges cut, the first sample's depth is one of them, the least the
+      // nearer, the greatest the further: so there are more far (blue) pixels under "greatest" than "first" than "least", the reverse for black.
+      uint32_t black = 0, green = 0, blue = 0;
+      for (uint32_t i = 0; i < 32 * 32; ++i) {
+        const uint32_t c = r.device_picture[i] & 0xFFFFFF;
+        black += c == 0, green += c == 0x00FF00, blue += c == 0x0000FF;
+      }
+      CHECK(black + green + blue == 1024);
+      static uint32_t s_black[3], s_blue[3];
+      const uint32_t which = __builtin_strstr(r.name, "first") ? 0 : __builtin_strstr(r.name, "least") ? 1 : 2;
+      s_black[which] = black, s_blue[which] = blue;
+      if (which == 2) CHECK(s_black[1] > s_black[0] && s_black[0] > s_black[2] && s_blue[2] > s_blue[0] && s_blue[0] > s_blue[1]);   // (the scenes run in this order: first, least, greatest)
     }
     if (__builtin_strstr(r.name, "alpha to coverage")) {
       // The red channel of each band (the colour is red 1): none, all, none, all, all.

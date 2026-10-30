@@ -139,6 +139,49 @@ uint8_t response_flags(ConstByteView response) {
   return response.try_get(1, &flags) ? flags : 0;
 }
 
+uint32_t build_preboot_acl(bool write, ArrayView<const TbUuid> entries, ByteView out) {
+  if (entries.size() > kPrebootAclEntries) return 0;
+  ByteWriter w(out);
+  w.u8(kPrebootAcl);
+  w.u8(write ? kFlagWrite : 0);
+  w.u8(0);
+  w.u8(0);
+  for (uint32_t i = 0; i < kPrebootAclEntries; ++i) {
+    // (an empty entry, and any entry past the end of a shorter list, is all ones)
+    if (!write || i >= entries.size() || entries[i].is_null()) {
+      for (uint32_t k = 0; k < 8; ++k) w.u8(0xFF);
+      continue;
+    }
+    for (uint32_t k = 8; k < 16; ++k)
+      if (entries[i].bytes[k] != 0xFF) return 0;  // only the low half is kept, and the high half has to say it is a device
+    w.bytes(ConstByteView(entries[i].bytes, 8));
+  }
+  return w.ok() ? static_cast<uint32_t>(w.position()) : 0;
+}
+
+bool parse_preboot_acl(ConstByteView response, ArrayView<TbUuid> entries) {
+  if (response.size() < kPrebootAclBytes) return false;
+  ByteReader r(response);
+  r.skip(4);
+  for (uint32_t i = 0; i < kPrebootAclEntries; ++i) {
+    uint8_t raw[8];
+    if (!r.read_into(ByteView(raw, sizeof raw))) return false;
+    if (i >= entries.size()) continue;
+    TbUuid entry;
+    bool empty = true, ones = true;
+    for (const uint8_t b : raw) {
+      empty = empty && b == 0xFF;
+      ones = ones && b == 0;
+    }
+    if (!empty && !ones) {  // (all zeros is empty too)
+      for (uint32_t k = 0; k < 8; ++k) entry.bytes[k] = raw[k];
+      for (uint32_t k = 8; k < 16; ++k) entry.bytes[k] = 0xFF;
+    }
+    entries[i] = entry;
+  }
+  return true;
+}
+
 bool parse_get_route(ConstByteView response, uint64_t* route) {
   if (response.size() < kGetRouteResponseBytes) return false;
   ByteReader r(response);
@@ -496,8 +539,14 @@ bool ThunderboltIcm::reset_physical_port(uint32_t physical_port) {
 bool ThunderboltIcm::use_interrupts(bool on, int msix_vector) {
   if (outcome_ != Outcome::Started || msix_vector > 15) return false;          // (the vector allocation has 4 bits a source)
   interrupts_ = on;
-  msix_vector_ = on ? msix_vector : -1;
-  nhi_.set_control_interrupts(on, msix_vector);
+  if (on) {
+    msix_vector_ = msix_vector;
+    nhi_.set_control_interrupts(true, msix_vector);
+  } else {
+    nhi_.set_control_interrupts(false, msix_vector >= 0 ? msix_vector : msix_vector_);  // (takes the control rings off the table entry)
+    nhi_.disable_interrupts();                        // and masks the data rings' too: they are polled while interrupts are off
+    msix_vector_ = -1;
+  }
   return true;
 }
 
@@ -697,6 +746,45 @@ void ThunderboltIcm::mark_authorized(const TbDevice& device) {
     for (uint32_t k = 0; k < sizeof device.uuid; ++k) same = same && devices_[i].uuid[k] == device.uuid[k];
     if (same) devices_[i].authorized = true;
   }
+}
+
+bool ThunderboltIcm::get_boot_acl(ArrayView<TbUuid> entries, const char** error) {
+  const char* local = nullptr;
+  if (!error) error = &local;
+  if (outcome_ != Outcome::Started || ready_.boot_acl_entries == 0) {
+    *error = outcome_ != Outcome::Started ? "the controller is not running" : "the firmware has no preboot ACL";
+    return false;
+  }
+  uint8_t request_bytes[tb_icm::kPrebootAclBytes], response[tb_icm::kPrebootAclBytes];
+  const uint32_t n = tb_icm::build_preboot_acl(false, ArrayView<const TbUuid>(), ByteView(request_bytes, sizeof request_bytes));
+  if (n == 0 || !request_flags(ConstByteView(request_bytes, n), ByteView(response, sizeof response), kApproveTimeoutUs, error, "the firmware refused to give the list")) return false;
+  const uint32_t wanted = entries.size() < ready_.boot_acl_entries ? static_cast<uint32_t>(entries.size()) : ready_.boot_acl_entries;
+  for (TbUuid& entry : entries) entry = TbUuid();
+  if (!tb_icm::parse_preboot_acl(ConstByteView(response, sizeof response), entries.first(wanted))) {
+    *error = "the list was cut short";
+    return false;
+  }
+  return true;
+}
+
+bool ThunderboltIcm::set_boot_acl(ArrayView<const TbUuid> entries, const char** error) {
+  const char* local = nullptr;
+  if (!error) error = &local;
+  if (outcome_ != Outcome::Started || ready_.boot_acl_entries == 0) {
+    *error = outcome_ != Outcome::Started ? "the controller is not running" : "the firmware has no preboot ACL";
+    return false;
+  }
+  if (entries.size() > ready_.boot_acl_entries) {
+    *error = "more entries than the firmware keeps";
+    return false;
+  }
+  uint8_t request_bytes[tb_icm::kPrebootAclBytes], response[tb_icm::kPrebootAclBytes];
+  const uint32_t n = tb_icm::build_preboot_acl(true, entries, ByteView(request_bytes, sizeof request_bytes));
+  if (n == 0) {
+    *error = "an entry is not a device id of this controller";
+    return false;
+  }
+  return request_flags(ConstByteView(request_bytes, n), ByteView(response, sizeof response), kApproveTimeoutUs, error, "the firmware refused the list");
 }
 
 bool ThunderboltIcm::approve_secure(uint64_t index, const char** error) {

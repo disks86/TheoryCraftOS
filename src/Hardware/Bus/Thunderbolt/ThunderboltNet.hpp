@@ -84,6 +84,7 @@ class ThunderboltNet final : public INetworkInterface, public IThunderboltIpHand
   // IHardware: makes the hardware address and starts watching for a host that offers the service.
   const char* name() const override { return "Thunderbolt networking"; }
   bool link_comes_and_goes() const override { return true; }
+  bool direct_link() const override { return true; }
   bool initialize() override;
   void shutdown() override;
 
@@ -164,6 +165,7 @@ class ThunderboltNetLink final : public INetworkInterface {
   MacAddress mac_address() const override { return mac_; }
   bool link_up() const override { return with([](ThunderboltNet& n) { return n.link_up(); }, false); }
   bool link_comes_and_goes() const override { return true; }
+  bool direct_link() const override { return true; }
   uint32_t link_speed_mbps() const override { return with([](ThunderboltNet& n) { return n.link_speed_mbps(); }, 0u); }
   LinkDuplex link_duplex() const override { return with([](ThunderboltNet& n) { return n.link_duplex(); }, LinkDuplex::Unknown); }
   bool transmit(ConstByteView frame) override { return with([&](ThunderboltNet& n) { return n.transmit(frame); }, false); }

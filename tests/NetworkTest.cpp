@@ -303,6 +303,44 @@ int main() {
     Lan lan; lan.a.start_dhcp(); for (int i = 0; i < 200000; ++i) lan.step(); assert(lan.a.dhcp().state() == DhcpState::Failed && !lan.a.configuration().configured());
     lan.a.start_dhcp(); assert(lan.a.dhcp().state() == DhcpState::Selecting); lan.configure_static(); assert(lan.a.dhcp().state() == DhcpState::Stopped && lan.a.configuration().configured());
   }
+  { // ---- link-local fallback (RFC 3927): no DHCP server, so both hosts probe and take 169.254.x.y; a server that appears later replaces it
+    Lan lan; lan.a.set_link_local_fallback(true); lan.b.set_link_local_fallback(true);
+    const Ipv4Address want_a = NetworkStack::link_local_candidate(lan.nic_a.mac, 0), want_b = NetworkStack::link_local_candidate(lan.nic_b.mac, 0);
+    assert(want_a.is_link_local() && want_a.octets[2] >= 1 && want_a.octets[2] <= 254 && want_a != want_b);
+    int probes = 0, announces = 0;
+    lan.wire.tap = [&](const std::vector<uint8_t>& f, int from) { if (from == 0 && load16(&f[12]) == 0x0806 && load16(&f[20]) == 1) { if (load32(&f[28]) == 0) ++probes; else ++announces; } };
+    lan.a.start_dhcp(); lan.b.start_dhcp();
+    assert(lan.run_until([&] { return lan.a.using_link_local() && lan.b.using_link_local(); }, 200000));
+    assert(lan.a.configuration().address == want_a && lan.b.configuration().address == want_b && lan.a.configuration().netmask == Ipv4Address::make(255,255,0,0));
+    assert(lan.a.configuration().gateway.is_unspecified());
+    lan.step(10000); assert(probes == 3 && announces == 2);
+    uint32_t rtt; assert(lan.a.ping(want_b, 2000, &rtt) && lan.b.ping(want_a, 2000, &rtt));
+    // a DHCP server appears: the next retry takes its lease
+    MiniDhcpServer server; server.socket = lan.b.udp_open(67); assert(server.socket);
+    for (int i = 0; i < 90000 && lan.a.using_link_local(); ++i) { lan.step(); server.poll(lan.b); }
+    assert(!lan.a.using_link_local() && lan.a.configuration().address == Ipv4Address::make(10,0,0,100));
+  }
+  { // ---- link-local: a host already holding the first choice makes the newcomer pick another; a claim on a held address is defended once, the second gives it up
+    Lan lan; lan.a.set_link_local_fallback(true);
+    const Ipv4Address first = NetworkStack::link_local_candidate(lan.nic_a.mac, 0), second = NetworkStack::link_local_candidate(lan.nic_a.mac, 1);
+    assert(first != second);
+    IpConfiguration cb; cb.address = first; cb.netmask = Ipv4Address::make(255,255,0,0); lan.b.configure(cb);
+    lan.a.start_dhcp();
+    assert(lan.run_until([&] { return lan.a.using_link_local(); }, 200000));
+    assert(lan.a.configuration().address == second);
+    lan.step(5000);
+    int announces = 0;
+    lan.wire.tap = [&](const std::vector<uint8_t>& f, int from) { if (from == 0 && load16(&f[12]) == 0x0806 && load32(&f[28]) == second.value()) ++announces; };
+    auto claim = [&](Ipv4Address ip, const hardware::MacAddress& mac, bool probe) {   // an ARP request from another host
+      std::vector<uint8_t> f(42, 0); memset(&f[0], 0xFF, 6); memcpy(&f[6], mac.bytes, 6); store16(&f[12], 0x0806); store16(&f[14], 1); store16(&f[16], 0x0800); f[18] = 6; f[19] = 4; store16(&f[20], 1);
+      memcpy(&f[22], mac.bytes, 6); put_ip(probe ? kAnyAddress : ip, &f[28]); put_ip(ip, &f[38]); lan.nic_a.inbox.push_back(f); lan.a.poll(); };
+    const hardware::MacAddress other = {{0x02, 0, 0, 0, 0, 9}};
+    claim(second, other, true); assert(lan.a.configuration().address == second && announces == 1);       // a probe is answered by defending
+    claim(second, other, false); assert(lan.a.configuration().address == second && announces == 2);     // first claim in ten seconds: defended
+    lan.step(1000); claim(second, other, false); assert(!lan.a.configuration().configured());           // second: given up
+    assert(lan.run_until([&] { return lan.a.using_link_local(); }, 30000));
+    assert(lan.a.configuration().address == NetworkStack::link_local_candidate(lan.nic_a.mac, 2));       // a new address
+  }
   { // ---- before an address exists, nothing but DHCP is accepted or sent
     Lan lan; uint32_t rtt; assert(!lan.a.ping(Ipv4Address::make(10,0,0,2), 100, &rtt)); assert(!lan.a.tcp_open()->connect(Ipv4Address::make(10,0,0,2), 80));
   }

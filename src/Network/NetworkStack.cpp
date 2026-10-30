@@ -30,6 +30,9 @@ constexpr uint32_t kMaxPending = 8;
 constexpr uint32_t kFramesPerPoll = 64;  // bound the work done in one poll()
 constexpr uint8_t kIcmpEchoReply = 0, kIcmpEchoRequest = 8;
 constexpr uint16_t kArpRequest = 1, kArpReply = 2;
+// RFC 3927: three probes about a second apart, two seconds of quiet, two announcements two seconds apart, ten conflicts before slowing down, defend an address once in ten seconds.
+constexpr uint32_t kLinkLocalProbes = 3, kLinkLocalAnnouncements = 2, kLinkLocalMaxConflicts = 10;
+constexpr uint64_t kLinkLocalProbeMs = 1000, kLinkLocalQuietMs = 2000, kLinkLocalAnnounceMs = 2000, kLinkLocalRateLimitMs = 60000, kLinkLocalDefendMs = 10000, kLinkLocalDhcpRetryMs = 60000;
 }  // namespace
 
 NetworkStack::NetworkStack(hardware::INetworkInterface& nic, hardware::IClock& clock, allocators::IAllocator& allocator)
@@ -64,6 +67,7 @@ IpConfiguration NetworkStack::configuration() const {
 void NetworkStack::configure(const IpConfiguration& configuration) {
   kernel::ScopedRecursiveMutex guard(mutex_);
   dhcp_->stop();
+  link_local_state_ = LinkLocalState::Off;
   config_ = configuration;
 }
 
@@ -72,9 +76,14 @@ void NetworkStack::start_dhcp() {
   dhcp_->start();
 }
 
-void NetworkStack::on_lease(const IpConfiguration& configuration) { config_ = configuration; }
+void NetworkStack::on_lease(const IpConfiguration& configuration) {
+  link_local_state_ = LinkLocalState::Off;  // a real lease replaces a made-up address
+  config_ = configuration;
+}
 
-void NetworkStack::on_lease_lost() { config_ = IpConfiguration{}; }
+void NetworkStack::on_lease_lost() {
+  if (link_local_state_ != LinkLocalState::Bound && link_local_state_ != LinkLocalState::Announcing) config_ = IpConfiguration{};
+}
 
 bool NetworkStack::wait_for_address(uint32_t timeout_ms) {
   const uint64_t deadline = now_ms() + timeout_ms;
@@ -113,11 +122,13 @@ void NetworkStack::poll() {
         dhcp_->start();
       } else {
         dhcp_->stop();
+        link_local_state_ = LinkLocalState::Off;
         config_ = IpConfiguration{};
       }
     }
   }
   dhcp_->poll();
+  service_link_local();
   resolver_->poll();
   service_pending();
   tcp_.poll();
@@ -153,6 +164,9 @@ void NetworkStack::handle_arp(ConstByteView arp) {
   const Ipv4Address target_ip = Ipv4Address::read(in);
   if (!in.ok()) return;  // truncated
 
+  check_link_local_claim(operation, sender_mac, sender_ip, target_ip);
+  if (using_link_local() && target_ip == link_local_address_ && (sender_ip.is_unspecified() || sender_ip == link_local_address_) && !(sender_mac == nic_.mac_address()))
+    return;  // a probe or a claim on our address: check_link_local_claim has defended it, and answering would only confirm the clash
   const bool for_us = config_.configured() && target_ip == config_.address;
   // Learn the sender if we were addressed or already know it (RFC 826): this
   // refreshes entries without letting every broadcast fill the cache.
@@ -289,6 +303,10 @@ bool NetworkStack::send_frame(const hardware::MacAddress& destination, uint16_t 
 }
 
 void NetworkStack::send_arp(uint16_t operation, const hardware::MacAddress& target_mac, Ipv4Address target_ip) {
+  send_arp_from(operation, config_.address, target_mac, target_ip);
+}
+
+void NetworkStack::send_arp_from(uint16_t operation, Ipv4Address sender_ip, const hardware::MacAddress& target_mac, Ipv4Address target_ip) {
   uint8_t arp[kArpPacketSize];
   ByteWriter out{ByteView(arp)};
   out.be16(1);  // Ethernet
@@ -297,7 +315,7 @@ void NetworkStack::send_arp(uint16_t operation, const hardware::MacAddress& targ
   out.u8(4);
   out.be16(operation);
   nic_.mac_address().write(out);
-  config_.address.write(out);
+  sender_ip.write(out);
   if (operation == kArpRequest) out.zeros(6);  // asking: the target's address is what we want to learn
   else target_mac.write(out);
   target_ip.write(out);
@@ -453,6 +471,94 @@ bool NetworkStack::ping(Ipv4Address address, uint32_t timeout_ms, uint32_t* rtt_
   ping_active_ = false;
   if (ok && rtt_ms) *rtt_ms = static_cast<uint32_t>(ping_rtt_ms_);
   return ok;
+}
+
+}  // namespace network
+
+namespace network {
+
+// ------------------------------------------------------------------ link-local addresses (RFC 3927)
+
+Ipv4Address NetworkStack::link_local_candidate(const hardware::MacAddress& mac, uint32_t attempt) {
+  uint32_t hash = 2166136261u;  // FNV-1a over the MAC address and the attempt
+  for (const uint8_t byte : mac.bytes) hash = (hash ^ byte) * 16777619u;
+  for (uint32_t i = 0; i < 4; ++i) hash = (hash ^ ((attempt >> (8 * i)) & 0xFF)) * 16777619u;
+  return Ipv4Address::make(169, 254, static_cast<uint8_t>(1 + (hash >> 8) % 254), static_cast<uint8_t>(hash >> 20));
+}
+
+void NetworkStack::service_link_local() {
+  if (!link_local_enabled_) return;
+  const uint64_t now = now_ms();
+  if (link_local_state_ == LinkLocalState::Off) {
+    if (config_.configured() || dhcp_->state() != DhcpState::Failed || (follow_link_ && !link_was_up_)) return;
+    link_local_address_ = link_local_candidate(nic_.mac_address(), link_local_attempt_);
+    link_local_state_ = LinkLocalState::Probing;
+    link_local_step_ = 0;
+    link_local_next_ms_ = now;
+    return;
+  }
+  if (link_local_state_ == LinkLocalState::Bound && dhcp_->state() == DhcpState::Failed && now >= link_local_dhcp_retry_ms_) {
+    link_local_dhcp_retry_ms_ = now + kLinkLocalDhcpRetryMs;  // a server may have appeared
+    dhcp_->start();
+  }
+  if (now < link_local_next_ms_) return;
+  const uint32_t jitter = (nic_.mac_address().bytes[5] + link_local_step_ * 37u) % 1000;  // spreads two hosts that start together
+  switch (link_local_state_) {
+    case LinkLocalState::Probing:
+      if (link_local_step_ < kLinkLocalProbes) {
+        send_arp_from(kArpRequest, kAnyAddress, hardware::MacAddress{}, link_local_address_);  // "does anyone have this address?"
+        ++link_local_step_;
+        link_local_next_ms_ = now + (link_local_step_ == kLinkLocalProbes ? kLinkLocalQuietMs : kLinkLocalProbeMs + jitter);
+      } else {
+        config_ = IpConfiguration{link_local_address_, Ipv4Address::make(255, 255, 0, 0), kAnyAddress, kAnyAddress};
+        link_local_state_ = LinkLocalState::Announcing;
+        link_local_step_ = 0;
+        link_local_next_ms_ = now;
+      }
+      break;
+    case LinkLocalState::Announcing:
+      if (link_local_step_ < kLinkLocalAnnouncements) {
+        send_arp_from(kArpRequest, link_local_address_, hardware::MacAddress{}, link_local_address_);  // "this address is mine"
+        ++link_local_step_;
+        link_local_next_ms_ = now + kLinkLocalAnnounceMs;
+      } else {
+        link_local_state_ = LinkLocalState::Bound;
+        link_local_dhcp_retry_ms_ = now + kLinkLocalDhcpRetryMs;
+      }
+      break;
+    default:
+      break;
+  }
+}
+
+// Picks another address after a conflict; after ten of them waits a minute between tries.
+void NetworkStack::link_local_conflict() {
+  if (link_local_state_ == LinkLocalState::Announcing || link_local_state_ == LinkLocalState::Bound) config_ = IpConfiguration{};
+  ++link_local_attempt_;
+  link_local_address_ = link_local_candidate(nic_.mac_address(), link_local_attempt_);
+  link_local_state_ = LinkLocalState::Probing;
+  link_local_step_ = 0;
+  link_local_next_ms_ = now_ms() + (link_local_attempt_ % kLinkLocalMaxConflicts == 0 ? kLinkLocalRateLimitMs : 0);
+}
+
+// An ARP packet from another host that claims, or asks for, the address we are probing or hold.
+void NetworkStack::check_link_local_claim(uint16_t operation, const hardware::MacAddress& sender_mac, Ipv4Address sender_ip, Ipv4Address target_ip) {
+  if (link_local_state_ == LinkLocalState::Off || sender_mac == nic_.mac_address()) return;
+  const bool claims = sender_ip == link_local_address_;                                                  // it uses the address
+  const bool probes = sender_ip.is_unspecified() && target_ip == link_local_address_ && operation == kArpRequest;  // it is about to
+  if (!claims && !probes) return;
+  if (link_local_state_ == LinkLocalState::Probing || link_local_state_ == LinkLocalState::Announcing) {
+    link_local_conflict();
+    return;
+  }
+  // Bound. A probe is answered by defending; a claim is defended once, and the second one in ten seconds gives the address up.
+  const uint64_t now = now_ms();
+  if (claims && link_local_defended_ms_ != 0 && now - link_local_defended_ms_ < kLinkLocalDefendMs) {
+    link_local_conflict();
+    return;
+  }
+  if (claims) link_local_defended_ms_ = now;
+  send_arp_from(kArpRequest, link_local_address_, hardware::MacAddress{}, link_local_address_);
 }
 
 }  // namespace network

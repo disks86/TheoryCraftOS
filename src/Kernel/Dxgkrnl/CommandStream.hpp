@@ -150,7 +150,11 @@ class CommandWriter {
   void end_query() { packet(Op::EndQuery, {}); }
   void bind_uav(uint32_t slot, uint32_t allocation, uint32_t offset, uint32_t size) { packet(Op::BindUav, {slot, allocation, offset, size}); }
   void dispatch(uint32_t x, uint32_t y = 1, uint32_t z = 1) { packet(Op::Dispatch, {x, y, z}); }
-  void resolve_region(uint32_t destination, uint32_t source) { packet(Op::ResolveRegion, {destination, source}); }
+  // `mode`: a graphics::ResolveMode (0 average, 1 sample 0, 2 least, 3 greatest); a depth buffer needs 1 or the adapter's kFeatureResolveModes. Left out (0, two words), it is the average of a colour target.
+  void resolve_region(uint32_t destination, uint32_t source, uint32_t mode = 0) {
+    if (mode == 0) packet(Op::ResolveRegion, {destination, source});
+    else packet(Op::ResolveRegion, {destination, source, mode});
+  }
 
  private:
   void packet(Op op, std::initializer_list<uint32_t> payload) {

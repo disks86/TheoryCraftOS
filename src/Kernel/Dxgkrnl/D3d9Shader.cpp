@@ -833,6 +833,21 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
         store(ins.dst, b);
         break;
       }
+      case kTexFetchMs: {
+        b = {{0, 0, 0, 0}};
+        const uint32_t unit = ins.src[1].number;
+        if (s.textures) {
+          const Q sample = fetch(ins.src[2], 0);
+          const graphics::Vec4 t = s.textures->fetch_sample(unit, __builtin_bit_cast(int32_t, a.f[0]), __builtin_bit_cast(int32_t, a.f[1]), bits_of(sample.f[0]));
+          const float texel[4] = {t.x, t.y, t.z, t.w};
+          b = {{texel[ins.tex_swizzle[0]], texel[ins.tex_swizzle[1]], texel[ins.tex_swizzle[2]], texel[ins.tex_swizzle[3]]}};
+        }
+        store(ins.dst, b);
+        break;
+      }
+      case kTexSamples:
+        store(ins.dst, splat(ins.tex_swizzle[0] ? from_bits(ins.control) : static_cast<float>(ins.control)));
+        break;
       case kTexFetch: case kTexLod: case kTexSize: {
         b = {{0, 0, 0, 0}};
         const uint32_t unit = ins.src[1].number;

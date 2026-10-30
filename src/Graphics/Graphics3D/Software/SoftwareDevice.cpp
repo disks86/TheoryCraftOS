@@ -422,6 +422,14 @@ class TextureSet final : public ITextureSet {
     if (x < 0 || y < 0 || static_cast<uint32_t>(x) >= surface.width || static_cast<uint32_t>(y) >= surface.height) return {0, 0, 0, 0};
     return texel(surface, x, y);
   }
+  Vec4 fetch_sample(uint32_t unit, int32_t x, int32_t y, uint32_t sample) const override {
+    const SoftwareImage* image = image_for(unit);
+    if (!image || image->samples() < 2 || sample >= image->samples()) return {0, 0, 0, 0};
+    const Surface surface = image->surface();
+    if (x < 0 || y < 0 || static_cast<uint32_t>(x) >= surface.width || static_cast<uint32_t>(y) >= surface.height) return {0, 0, 0, 0};
+    // (the samples of a pixel are neighbours: the pixel x is at x * samples)
+    return texel(surface, static_cast<int64_t>(x) * image->samples() + sample, y);
+  }
   bool size_volume(uint32_t unit, uint32_t level, uint32_t* width, uint32_t* height, uint32_t* depth, uint32_t* levels) const override {
     if (!size(unit, level, width, height, levels)) return false;
     const SoftwareImage* image = image_for(unit);
@@ -1159,7 +1167,7 @@ IImage* SoftwareDevice::create_image(const ImageDesc& desc) {
     // (a multisampled image is an 8-bit colour or a depth attachment, alone, of one level)
     const bool depth = desc.format == Format::D32Float;
     if ((desc.samples != 2 && desc.samples != 4 && desc.samples != 8) || desc.mip_levels != 1 || desc.kind != TextureKind::Texture2D || is_wide_format(desc.format) ||
-        desc.usage != (depth ? kImageDepthAttachment : kImageColorAttachment))
+        (depth ? desc.usage != kImageDepthAttachment : (desc.usage & ~kImageSampled) != kImageColorAttachment))
       return nullptr;
   }
   if (desc.kind != TextureKind::Texture2D) {
@@ -1317,11 +1325,35 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
         // The samples of each pixel averaged (to the nearest, per channel) into the single-sample image.
         SoftwareImage* to = static_cast<SoftwareImage*>(cmd.image);
         const SoftwareImage* from = static_cast<const SoftwareImage*>(cmd.image2);
-        if (in_pass || !to || !from || to->samples() != 1 || from->samples() < 2 || to->format() != from->format() || is_wide_format(to->format()) || to->format() == Format::D32Float ||
-            to->extent().width != from->extent().width || to->extent().height != from->extent().height)
+        if (in_pass || !to || !from || to->samples() != 1 || from->samples() < 2 || to->format() != from->format() || is_wide_format(to->format()) ||
+            to->extent().width != from->extent().width || to->extent().height != from->extent().height || cmd.count > static_cast<uint32_t>(ResolveMode::Max))
           return false;
-        const Surface out = to->surface(), in = from->surface();
+        const ResolveMode mode = static_cast<ResolveMode>(cmd.count);
         const uint32_t n = from->samples();
+        if (to->format() == Format::D32Float) {
+          // A depth image: the depth of sample 0, or the least, the greatest or the mean of the samples; the stencil plane takes sample 0's.
+          if (to->depth().empty() || from->depth().size() < to->depth().size() * n) return false;
+          const uint64_t pixels = uint64_t{to->extent().width} * to->extent().height;
+          for (uint64_t i = 0; i < pixels; ++i) {
+            const float* samples = &from->depth()[i * n];
+            float value = samples[0];
+            for (uint32_t k = 1; k < n; ++k) {
+              if (mode == ResolveMode::Min) value = samples[k] < value ? samples[k] : value;
+              else if (mode == ResolveMode::Max) value = samples[k] > value ? samples[k] : value;
+              else if (mode == ResolveMode::Average) value += samples[k];
+            }
+            to->depth()[i] = mode == ResolveMode::Average ? value / static_cast<float>(n) : value;
+            if (!to->stencil().empty() && !from->stencil().empty()) to->stencil()[i] = from->stencil()[i * n];
+          }
+          break;
+        }
+        const Surface out = to->surface(), in = from->surface();
+        if (mode == ResolveMode::Sample0) {
+          for (uint32_t y = 0; y < out.height; ++y)
+            for (uint32_t x = 0; x < out.width; ++x) out.row(y)[x] = in.row(y)[uint64_t{x} * n];
+          break;
+        }
+        if (mode != ResolveMode::Average) return false;   // (a colour image is averaged or takes sample 0)
         for (uint32_t y = 0; y < out.height; ++y)
           for (uint32_t x = 0; x < out.width; ++x) {
             if (is_srgb_format(in.format)) {

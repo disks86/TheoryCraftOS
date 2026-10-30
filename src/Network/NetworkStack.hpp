@@ -52,6 +52,14 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
   // For an interface whose link comes and goes (Wi-Fi): start DHCP when the link comes up and drop the address when it goes down. Off by default (a wired link is assumed up).
   void set_dhcp_follows_link(bool follow) { follow_link_ = follow; }
 
+  // For a cable to one other host: when DHCP gets no answer, take an address from 169.254.0.0/16 (RFC 3927). The address is probed with ARP before use (three probes, a conflict picks another), announced, and
+  // defended once against a later claim; DHCP is tried again every minute and a lease replaces it. Off by default.
+  void set_link_local_fallback(bool on) { link_local_enabled_ = on; }
+  bool using_link_local() const { return link_local_state_ == LinkLocalState::Announcing || link_local_state_ == LinkLocalState::Bound; }
+
+  // The address the stack tries on its `attempt`-th try (0 first): from the MAC address and the attempt, in 169.254.1.0 - 169.254.254.255 as the RFC reserves the first and last 256.
+  static Ipv4Address link_local_candidate(const hardware::MacAddress& mac, uint32_t attempt);
+
   // The interface this stack drives.
   hardware::INetworkInterface& interface() const { return nic_; }
 
@@ -102,6 +110,10 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
   void handle_icmp(Ipv4Address source, ConstByteView icmp);
   bool send_frame(const hardware::MacAddress& destination, uint16_t ether_type, ConstByteView payload);
   void send_arp(uint16_t operation, const hardware::MacAddress& target_mac, Ipv4Address target_ip);
+  void send_arp_from(uint16_t operation, Ipv4Address sender_ip, const hardware::MacAddress& target_mac, Ipv4Address target_ip);
+  void service_link_local();
+  void link_local_conflict();
+  void check_link_local_claim(uint16_t operation, const hardware::MacAddress& sender_mac, Ipv4Address sender_ip, Ipv4Address target_ip);
   void learn(Ipv4Address address, const hardware::MacAddress& mac);
   void flush_pending(Ipv4Address resolved);
   void service_pending();
@@ -116,6 +128,12 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
   hardware::IClock& clock_;
   allocators::IAllocator& allocator_;
   bool follow_link_ = false, link_was_up_ = false;
+  enum class LinkLocalState : uint8_t { Off, Probing, Announcing, Bound };
+  bool link_local_enabled_ = false;
+  LinkLocalState link_local_state_ = LinkLocalState::Off;
+  Ipv4Address link_local_address_ = kAnyAddress;    // the candidate being probed, or the one in use
+  uint32_t link_local_attempt_ = 0, link_local_step_ = 0;   // addresses tried so far; probes or announcements sent for this one
+  uint64_t link_local_next_ms_ = 0, link_local_defended_ms_ = 0, link_local_dhcp_retry_ms_ = 0;
   IpConfiguration config_;
   Dictionary<uint32_t, ArpEntry> arp_;
   Queue<PendingPacket> pending_;
