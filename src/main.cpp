@@ -119,6 +119,7 @@
 #include "Hardware/Acpi/SystemAcpiHost.hpp"
 #include "Hardware/Acpi/SystemAcpiPorts.hpp"
 #include "Hardware/Acpi/AcpiEvents.hpp"
+#include "Hardware/Acpi/DellWmiHotkeys.hpp"
 #include "Hardware/Backlight/AcpiBacklight.hpp"
 #include "Hardware/Backlight/AcpiVideoKeys.hpp"
 #include "Hardware/Backlight/IntelPchBacklight.hpp"
@@ -1745,6 +1746,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     UniquePointer<hardware::AcpiBacklight> acpi_backlight;
     UniquePointer<hardware::AcpiVideoKeys> acpi_video_keys;
     UniquePointer<hardware::IntelPchBacklight> pch_backlight;
+    UniquePointer<hardware::DellWmiHotkeys> dell_hotkeys;
 #ifdef TCOS_ACPI_EVENTS
     if (acpi_events) {
       acpi::Node* panels[4];
@@ -1761,6 +1763,11 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         if (acpi_video_keys) acpi_events->add_listener(acpi_video_keys.get());
         Entry(Level::Ok, "Display").text("backlight: ACPI, ").dec(acpi_backlight->steps()).text(" levels");
       }
+      // Dell's hotkeys (ACPI-WMI): mute and, when the video extensions do not report the brightness keys themselves, brightness.
+      dell_hotkeys = UniquePointer<hardware::DellWmiHotkeys>::make(shared_allocator, acpi_events->interpreter(),
+          [](void* d, uint8_t key) { if (key != hardware::kDellMicMute) static_cast<desktop::Desktop*>(d)->handle_media_key(key); }, &desktop, !acpi_backlight_ptr);
+      if (dell_hotkeys && dell_hotkeys->scan() != 0 && acpi_events->add_listener(dell_hotkeys.get()))
+        Entry(Level::Ok, "Keyboard").text("Dell hotkeys through ACPI-WMI (").dec(dell_hotkeys->device_count()).text(" device)");
     }
 #endif
     if (!acpi_backlight_ptr) {

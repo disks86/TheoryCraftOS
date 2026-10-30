@@ -104,6 +104,9 @@ static Bytes partitioned_stick() {
 // ------------------------------------------------------------------------------------------------ the fake host with sticks
 
 // An absolute pointer: three buttons, X and Y as 16 bits each in 0..32767.
+// volume up / down, mute, play-pause, next, previous, stop: one bit each in report 3
+static const uint8_t kConsumerDescriptor[] = {0x05, 0x0C, 0x09, 0x01, 0xA1, 0x01, 0x85, 0x03, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x07, 0x09, 0xE9, 0x09, 0xEA, 0x09, 0xE2, 0x09, 0xCD,
+                                              0x09, 0xB5, 0x09, 0xB6, 0x09, 0xB7, 0x81, 0x02, 0x95, 0x01, 0x81, 0x03, 0xC0};
 static const uint8_t kTabletDescriptor[] = {0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x09, 0x01, 0xA1, 0x00, 0x05, 0x09, 0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01,
                                             0x95, 0x03, 0x75, 0x01, 0x81, 0x02, 0x95, 0x01, 0x75, 0x05, 0x81, 0x03, 0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x15, 0x00,
                                             0x26, 0xFF, 0x7F, 0x75, 0x10, 0x95, 0x02, 0x81, 0x02, 0xC0, 0xC0};
@@ -122,7 +125,7 @@ struct FakeStickHost final : IUsbHostController {
     int unplug_after = -1;           // yank the stick after this many commands
     bool broken_inquiry = false;     // answers nothing sensible
     bool no_storage = false;         // not a mass-storage device at all
-    // Human interface devices instead of storage: 0 none, 1 boot keyboard, 2 boot mouse, 3 absolute tablet (report descriptor served), 4 vendor device
+    // Human interface devices instead of storage: 0 none, 1 boot keyboard, 2 boot mouse, 3 absolute tablet (report descriptor served), 4 vendor device, 6 media keys
     int hid = 0;
     std::vector<Bytes> reports;      // what the device has sent and the host has not read yet
     bool fail_start = false;         // the interrupt endpoint cannot be set up
@@ -177,6 +180,10 @@ struct FakeStickHost final : IUsbHostController {
       put({9, 4, 0, 0, 1, 3, 0, 0, 0});
       put({9, 0x21, 0x11, 0x01, 0, 1, 0x22, static_cast<uint8_t>(sizeof(kTabletDescriptor)), 0});
       put({7, 5, 0x81, 3, 8, 0, 4});
+    } else if (hid == 6) {   // media keys: a consumer control report (id 3) in a non-boot interface
+      put({9, 4, 0, 0, 1, 3, 0, 0, 0});
+      put({9, 0x21, 0x11, 0x01, 0, 1, 0x22, static_cast<uint8_t>(sizeof(kConsumerDescriptor)), 0});
+      put({7, 5, 0x81, 3, 8, 0, 4});
     } else if (hid == 5) {   // printer, bidirectional
       put({9, 4, 0, 0, 2, 7, 1, 2, 0});
       put({7, 5, 0x01, 2, 0x00, 0x02, 0});
@@ -216,6 +223,10 @@ struct FakeStickHost final : IUsbHostController {
       if (request == 1 && buffer.size() >= 1) { buffer[0] = s.port_status; return true; }   // GET_PORT_STATUS
       return false;
     }
+    if (s.hid == 6 && request == 6 && value == 0x2200) {
+      memcpy(buffer.data(), kConsumerDescriptor, buffer.size() < sizeof kConsumerDescriptor ? buffer.size() : sizeof kConsumerDescriptor);
+      return true;
+    }
     if (s.hid != 3 || request != 6 || value != 0x2200) return false;
     memcpy(buffer.data(), kTabletDescriptor, buffer.size() < sizeof kTabletDescriptor ? buffer.size() : sizeof kTabletDescriptor);
     return true;
@@ -230,7 +241,7 @@ struct FakeStickHost final : IUsbHostController {
     const Bytes r = sticks[port]->reports.front();
     sticks[port]->reports.erase(sticks[port]->reports.begin());
     const size_t n = r.size() < buffer.size() ? r.size() : buffer.size();
-    memcpy(buffer.data(), r.data(), n);
+    if (n) memcpy(buffer.data(), r.data(), n);
     *length = static_cast<uint16_t>(n);
     return true;
   }
