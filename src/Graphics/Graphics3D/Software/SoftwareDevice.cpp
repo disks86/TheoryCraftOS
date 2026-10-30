@@ -916,6 +916,13 @@ void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVert
       context.front_facing = front;
       context.primitive_id = s.primitive_id;
       if (!run_fragment_shader(s, varying, context, color)) continue;
+      if (pd.alpha_to_coverage && pd.multisample && sample_count > 1) {
+        // (the first round(alpha * samples) samples of the pixel keep what they covered)
+        const float a = color[0].w;
+        uint32_t keep = !(a > 0.0f) ? 0 : a >= 1.0f ? sample_count : static_cast<uint32_t>(a * static_cast<float>(sample_count) + 0.5f);
+        if (keep > sample_count) keep = sample_count;
+        covered &= (1u << keep) - 1;
+      }
       for (uint32_t k = 0; k < sample_count; ++k)
         if (covered >> k & 1) write_fragment(s, x, y, sample_z[k], (depth_pass >> k & 1) != 0, color, k);
     }

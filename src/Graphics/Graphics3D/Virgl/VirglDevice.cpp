@@ -468,7 +468,7 @@ class VirglPipeline final : public VirglPipelineBase {
     }
     cmd[n++] = virgl::header(virgl::kCreateObject, virgl::kObjectBlend, 11);
     cmd[n++] = blend_;
-    cmd[n++] = desc.independent_blend ? 1u : 0u;  // s0: independent blend enable (no logic op, dither...)
+    cmd[n++] = (desc.independent_blend ? 1u : 0u) | (desc.alpha_to_coverage && desc.multisample ? 1u << 3 : 0u);  // s0: independent blend enable, alpha to coverage (no logic op, dither...)
     cmd[n++] = 0;  // s1
     cmd[n++] = blend_rt;
     for (uint32_t i = 1; i < 8; ++i) cmd[n++] = desc.independent_blend && i < kMaxColorTargets ? (desc.target_blend[i - 1].custom ? render_target_blend(desc.target_blend[i - 1]) : 0xFu << 27) : 0u;

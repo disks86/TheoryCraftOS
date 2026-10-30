@@ -934,8 +934,9 @@ NtStatus Kernel::escape(ProcessId pid, Handle device, ConstByteView request, Byt
             }
             if (!in.at_end()) {   // (and, after that, whether coverage is per sample)
               const uint32_t multisample = in.le32();
-              if (!in.ok() || multisample > 1) return status::kInvalidParameter;
-              desc.multisample = multisample != 0;
+              if (!in.ok() || multisample > 3) return status::kInvalidParameter;   // (bit 0: coverage per sample, bit 1: alpha to coverage)
+              desc.multisample = (multisample & 1) != 0;
+              desc.alpha_to_coverage = (multisample & 2) != 0;
               if (!in.at_end()) {   // (and, after that, a geometry shader, then a hull and a domain shader)
                 desc.geometry_shader = in.le32();
                 if (!in.ok()) return status::kInvalidParameter;

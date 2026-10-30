@@ -429,6 +429,9 @@ struct GraphicsPipelineDesc {
   // kFeatureMultisample, on a pass with several samples per pixel: with multisample the triangle covers the samples whose positions it contains and depth and stencil are tested for each
   // (the shader still runs once per pixel); without it a pixel is all or nothing by its centre, as Direct3D 9 draws. Lines and points cover every sample of their pixel.
   bool multisample = false;
+  // With multisample: the samples a pixel's shader result reaches are the first round(alpha * samples) of the covered ones, alpha being the first target's (which samples of a partly
+  // covered pixel get it is up to the device; of a wholly covered pixel, only how many - and a real GPU may truncate where this rounds: 0.7 of 4 samples kept 2 on the one tried).
+  bool alpha_to_coverage = false;
   // kFeatureGeometryShaders: a geometry shader module run between the vertex and fragment shaders (nullptr: none). What it takes must be what the draws make (triangles, lines or points).
   const IShaderModule* geometry_shader = nullptr;
   // kFeatureTessellation: the hull and domain shader modules of a pipeline for PatchList draws (both or neither).

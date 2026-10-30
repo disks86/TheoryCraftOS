@@ -1268,6 +1268,42 @@ void scene_unorm16(Rig& rig, ArrayView<uint32_t> out) {
   release_view(rig.allocator(), other);
 }
 
+// Alpha to coverage: five bands of whole pixels, all the same orange, with alphas 0, 1, 0, 1 and 1: into a 4x multisampled target the alpha 0 bands keep none of their samples and the
+// others all, so the resolved picture is black, orange, black, orange, orange. (A GPU gives a fraction of an alpha a number of samples that varies from pixel to pixel, which a picture cannot
+// compare; the CPU renderer's own rounding is tested in test_alpha_to_coverage.)
+void scene_alpha_to_coverage(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureMultisample)) return void(rig.step("multisampling", status::kNotSupported));
+  Vertex v[30];
+  static const float kAlpha[5] = {0.0f, 1.0f, 0.0f, 1.0f, 1.0f};   // (only the ends: in between, a GPU dithers the number of samples from pixel to pixel)
+  for (uint32_t i = 0; i < 5; ++i) {
+    const float x0 = static_cast<float>(i * 6) / 16.0f - 1.0f, x1 = static_cast<float>(i * 6 + 6) / 16.0f - 1.0f, y0 = -1.0f, y1 = 1.0f;
+    Vertex* p = v + i * 6;
+    p[0] = {x0, y0, 0.5f, 1.0f, 0.5f, 0.2f, kAlpha[i]}, p[1] = {x1, y0, 0.5f, 1.0f, 0.5f, 0.2f, kAlpha[i]}, p[2] = {x0, y1, 0.5f, 1.0f, 0.5f, 0.2f, kAlpha[i]};
+    p[3] = p[2], p[4] = p[1], p[5] = {x1, y1, 0.5f, 1.0f, 0.5f, 0.2f, kAlpha[i]};
+  }
+  Handle vs = rig.vertex_shader(bytes_of(kVertexTokens, sizeof kVertexTokens), ShaderKind::D3d9Bytecode);
+  Handle ps = rig.pixel_shader(bytes_of(kPixelTokens, sizeof kPixelTokens), ShaderKind::D3d9Bytecode);
+  PipelineDesc pd = colour_pipeline_desc(vs, ps);
+  pd.multisample = true;
+  pd.alpha_to_coverage = true;
+  Handle pipe = rig.pipeline(pd);
+  AllocationDesc color_desc;
+  color_desc.flags = kAllocRenderTarget, color_desc.format = Format::A8R8G8B8, color_desc.width = color_desc.height = kSize, color_desc.samples = 4;
+  Handle multisampled = rig.create(color_desc);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  CommandWriter w(rig.allocator());
+  w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1.0f, 0);
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(2);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(30);
+  w.end_pass();
+  w.resolve_region(1, 0);
+  rig.render(w, {multisampled, target, vb});
+  rig.read(target, out);
+}
+
 // Integers: a triangle's colour is written by the pixel shader as four integers (colour * 255) into an R32G32B32A32_UINT target cleared to (20, 40, 60, 255), and a second pass reads them
 // back with Load (an integer texture is not sampled) and shows them divided by 255.
 void scene_integer(Rig& rig, ArrayView<uint32_t> out) {
@@ -1512,6 +1548,7 @@ const Entry kScenes[] = {
     {"Direct3D 10 integer formats of every width and sign (DXBC)", scene_integer_formats},
     {"Direct3D 10 signed and 10-bit normalised formats (DXBC)", scene_normalised_formats},
     {"Direct3D 10 4x multisampling", scene_multisample},
+    {"Direct3D 10 alpha to coverage", scene_alpha_to_coverage},
     {"Direct3D 11 compute shader and unordered access views (DXBC)", scene_compute},
     {"Direct3D 10 independent blend per render target (DXBC)", scene_independent_blend},
     {"Direct3D 10 half-float render target and texture", scene_half_float_target},

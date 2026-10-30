@@ -291,3 +291,7 @@ a `BIND_SHADER` of both on every pipeline bind, and `DRAW_VBO` of `PIPE_PRIM_PAT
 ### More queries
 
 `BeginQuery` takes an optional third word, a `graphics::QueryKind`: 0 occlusion count, 1 occlusion predicate (0 or 1), 2 IA vertices, 3 IA primitives, 4 VS invocations, 5 PS invocations (`kFeatureStatisticsQueries`; the result is still a 64-bit number in the `kAllocQueryResult` buffer). The CPU renderer counts them exactly (VS invocations once for every vertex it reads, including repeats of an index); a GPU may run the vertex shader fewer times and shade helper pixels, so the scene compares the predicates and the IA counts exactly and the shader runs only against "more than none". virgl: `PIPE_QUERY_OCCLUSION_PREDICATE` (1) and `PIPE_QUERY_PIPELINE_STATISTICS` (10 in virglrenderer's `p_defines.h`, which is not the numbering older Gallium used) with the statistic in the upper half of the type word. Not done: timestamps, time elapsed, stream output statistics.
+
+### Alpha to coverage
+
+`PipelineDesc::alpha_to_coverage` (with `multisample`; bit 1 of the multisample word of the escape, `kFeatureMultisample`): the samples a pixel's colour reaches are the first round(alpha * samples) of the covered ones, alpha being target 0's. virgl sets the blend state's `ALPHA_TO_COVERAGE` bit. On the real GPU tried, a fraction of an alpha gives a number of samples that varies from pixel to pixel (dither), so the conformance scene uses alphas of 0 and 1 and the rounding of the CPU renderer is a unit test (`test_alpha_to_coverage`).

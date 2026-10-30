@@ -4275,6 +4275,51 @@ void test_tessellation_kernel() {
   CHECK(shader(graphics::ShaderStage::Domain, b::k_ds_dent, sizeof b::k_ds_dent, &refused, &kernel, dev) == status::kNotSupported);
 }
 
+// Alpha to coverage on the CPU renderer: a quad of whole pixels keeps round(alpha * 4) of the 4 samples, so the resolved red is that many quarters (a GPU dithers fractions from pixel to pixel,
+// which the conformance scene therefore leaves out).
+void test_alpha_to_coverage() {
+  Env e;
+  namespace b = conformance_blobs;
+  Handle vs = 0, ps = 0, pipe = 0;
+  ShaderDesc sd;
+  sd.kind = ShaderKind::Dxbc, sd.stage = graphics::ShaderStage::Vertex, sd.code = ConstByteView(b::k_vs, sizeof b::k_vs);
+  CHECK(e.kernel.create_shader(kPid, e.dev, sd, &vs) == status::kSuccess);
+  sd.stage = graphics::ShaderStage::Fragment, sd.code = ConstByteView(b::k_ps_color, sizeof b::k_ps_color);
+  CHECK(e.kernel.create_shader(kPid, e.dev, sd, &ps) == status::kSuccess);
+  PipelineDesc pd;
+  pd.vertex_shader = vs, pd.fragment_shader = ps, pd.vertex_stride = 28, pd.attribute_count = 2, pd.varying_count = 3;
+  pd.attributes[0] = {0, graphics::VertexFormat::Float3, 0};
+  pd.attributes[1] = {1, graphics::VertexFormat::Float4, 12};
+  pd.cull_mode = graphics::CullMode::None;
+  pd.multisample = true;
+  pd.alpha_to_coverage = true;
+  CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &pipe) == status::kSuccess);
+  AllocationDesc md;
+  md.flags = kTarget, md.format = Format::A8R8G8B8, md.width = md.height = 32, md.samples = 4;
+  Handle multisampled = 0;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, md, &multisampled) == status::kSuccess);
+  Handle target = e.alloc(kTarget, Format::A8R8G8B8, 32, 32), vb = e.buffer(kAllocVertexBuffer, 6 * 28);
+  const float alphas[7] = {0.0f, 0.1f, 0.3f, 0.5f, 0.7f, 0.9f, 1.0f};
+  const uint32_t expected[7] = {0, 0, 1, 2, 3, 4, 4};   // (0.1 * 4 = 0.4 rounds to 0; 0.3 * 4 = 1.2 to 1; 0.5 * 4 = 2; 0.7 * 4 = 2.8 to 3; 0.9 * 4 = 3.6 to 4)
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  for (uint32_t i = 0; i < 7; ++i) {
+    const float a = alphas[i];
+    const float v[42] = {-1, -1, 0.5f, 1, 0, 0, a, 1, -1, 0.5f, 1, 0, 0, a, -1, 1, 0.5f, 1, 0, 0, a, -1, 1, 0.5f, 1, 0, 0, a, 1, -1, 0.5f, 1, 0, 0, a, 1, 1, 0.5f, 1, 0, 0, a};
+    CHECK(e.write(vb, floats(v, 42)));
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1.0f, 0);
+    w.bind_pipeline(pipe);
+    w.bind_vertex_buffer(2);
+    w.push_constants(floats(identity, 16));
+    w.draw(6);
+    w.end_pass();
+    w.resolve_region(1, 0);
+    CHECK(e.render(w, {multisampled, target, vb}) == status::kSuccess);
+    const uint32_t red = (e.pixel(target, 5, 5) >> 16) & 0xFF;
+    CHECK(red == expected[i] * 255 / 4 || red == (expected[i] * 255 + 2) / 4);
+  }
+}
+
 void test_conformance() {
   test_half_floats();
   HostAllocator allocator;
@@ -4360,6 +4405,11 @@ void test_conformance() {
         CHECK(near(px(7, 4), 0xFF36659C) && (px(6, 4) & 0xFFFFFF) == 0);
       }
       if (__builtin_strstr(r.name, "integer render")) CHECK(px(16, 4) == 0xFF3380CC && px(0, 0) == 0xFF14283C);   // (51, 128, 204 = 255 * the colour, and the cleared (20, 40, 60))
+    }
+    if (__builtin_strstr(r.name, "alpha to coverage")) {
+      // The red channel of each band (the colour is red 1): none, all, none, all, all.
+      auto red = [&](uint32_t band) { return (r.device_picture[16 * 32 + band * 6 + 3] >> 16) & 0xFF; };
+      CHECK(red(0) == 0 && red(1) == 255 && red(2) == 0 && red(3) == 255 && red(4) == 255);
     }
     if (__builtin_strstr(r.name, "occlusion predicate and pipeline")) {
       // Stripes of 4 pixels from x = 1: predicate 1 (full red), predicate 0 (0.25 of the red is the base: 0), 12 of 16 vertices (0.75), 6 of 8 primitives (0.75), both runs counted (1).
@@ -5525,6 +5575,7 @@ int main() {
   test_sm3_and_sm51();
   test_ps1();
   test_device_suite();
+  test_alpha_to_coverage();
   test_conformance();
   test_occlusion_queries();
   test_texture_kinds();

@@ -968,7 +968,8 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
         static_cast<uint32_t>(t.color_op) > 4 || static_cast<uint32_t>(t.alpha_op) > 4 || t.write_mask > 0xF)
       return status::kInvalidParameter;
   if (d.independent_blend && !(caps_.features & graphics::kFeatureIndependentBlend)) return status::kNotSupported;
-  if (d.multisample && !(caps_.features & graphics::kFeatureMultisample)) return status::kNotSupported;
+  if ((d.multisample || d.alpha_to_coverage) && !(caps_.features & graphics::kFeatureMultisample)) return status::kNotSupported;
+  if (d.alpha_to_coverage && !d.multisample) return status::kInvalidParameter;
   if (hull || domain) {
     if (!hull || !domain || hull->stage() != graphics::ShaderStage::Hull || domain->stage() != graphics::ShaderStage::Domain || hull->tess_output_points() != domain->tess_input_points() || hull->tess_domain() != domain->tess_domain()) return status::kInvalidParameter;
     if (!(caps_.features & graphics::kFeatureTessellation)) return status::kNotSupported;
@@ -998,6 +999,7 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   pd.blend = bs;
   pd.independent_blend = d.independent_blend;
   pd.multisample = d.multisample;
+  pd.alpha_to_coverage = d.alpha_to_coverage;
   pd.geometry_shader = geometry ? geometry->module() : nullptr;
   pd.hull_shader = hull ? hull->module() : nullptr;
   pd.domain_shader = domain ? domain->module() : nullptr;
