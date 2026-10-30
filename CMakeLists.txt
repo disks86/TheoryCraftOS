@@ -480,6 +480,7 @@ add_executable(BOOTX64
   src/Desktop/FileProperties.cpp
   src/Desktop/CopyProgressDialog.cpp
   src/Desktop/DirectoryListing.cpp
+  src/Desktop/Playlist.cpp
   src/Desktop/FileDialog.cpp
   src/Desktop/ColorDialog.cpp
   src/Desktop/PrintDialog.cpp

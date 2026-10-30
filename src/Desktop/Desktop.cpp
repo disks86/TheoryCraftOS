@@ -284,6 +284,12 @@ bool Desktop::on_media_key(uint8_t usage) {
         if (player->playing()) player->pause(); else player->play();
       }
       return true;
+    case key::kMediaNext:
+      if (media_player_.manager()) media_player_.next_track();       // (only with the player open: the key is not for a window that is not there)
+      return media_player_.manager() != nullptr;
+    case key::kMediaPrevious:
+      if (media_player_.manager()) media_player_.previous_track();
+      return media_player_.manager() != nullptr;
     case key::kMediaStop:
       if (audio::AudioPlayer* player = media_player_.audio_player()) player->stop();
       return true;
@@ -1187,6 +1193,7 @@ void Desktop::pump(uint64_t uptime_us) {
   input_.pump();
   web_browser_.tick(uptime_us);
   toasts_.tick(uptime_us);
+  if (media_player_.manager()) window_.locked([&] { media_player_.pump(); });
   web_notifications_.pump();
   if (browser_store_ && browser_data_restored_ && uptime_us - last_browser_save_us_ > 30000000ull) {   // (the data of the browser is saved when it changed, at most every half minute)
     last_browser_save_us_ = uptime_us;
