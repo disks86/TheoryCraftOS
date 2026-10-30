@@ -80,6 +80,9 @@ class VirtioGpu : public FramebufferGpu, public IMonitorSource {
   // --- For the 3D device ------------------------------------------------------
   // True if the host renders 3D for us (virgl negotiated, capset present, context created).
   bool has_3d() const { return has_3d_; }
+  // What the virgl host says it can do (virgl_caps_v1: the GLSL level; zero when the set could not be read). Compute shaders and the memory barrier they need are core in
+  // OpenGL 4.3 / GLSL 4.30; a host below that (or one that did not say) gets none. (The capability bits `bset` were read as well, but their numbering is not relied on.)
+  bool virgl_has_compute() const { return has_3d_ && virgl_glsl_level_ >= 430; }
   uint32_t context_id() const { return kContextId; }
   uint32_t allocate_resource_id() { return next_resource_++; }
   // Bookkeeping of the 3D resources (buffers and images) the host holds for us, in bytes; the 3D device calls these as it creates and
@@ -147,6 +150,7 @@ class VirtioGpu : public FramebufferGpu, public IMonitorSource {
   uint32_t used_scanouts_ = 0;                                // bit mask of the scanouts that were given a resource
 
   bool has_3d_ = false;
+  uint32_t virgl_bset_ = 0, virgl_glsl_level_ = 0;
   uint32_t next_resource_ = 1;
   uint64_t resource_bytes_ = 0;   // live 3D resources, see add_resource_bytes()
   uint32_t screen_resource_ = 0;  // the 2D framebuffer resource

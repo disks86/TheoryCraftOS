@@ -181,6 +181,9 @@ bool target_of(StringView w, uint8_t* out) {
   else if (w.equals(StringView("3D"))) *out = TgsiShader::kTarget3D;
   else if (w.equals(StringView("CUBE"))) *out = TgsiShader::kTargetCube;
   else if (w.equals(StringView("2D_ARRAY"))) *out = TgsiShader::kTarget2DArray;
+  else if (w.equals(StringView("1D"))) *out = TgsiShader::kTarget1D;
+  else if (w.equals(StringView("1D_ARRAY"))) *out = TgsiShader::kTarget1DArray;
+  else if (w.equals(StringView("CUBE_ARRAY"))) *out = TgsiShader::kTargetCubeArray;
   else return false;
   return true;
 }

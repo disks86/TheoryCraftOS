@@ -70,6 +70,13 @@ class D3d9Program {
   // limit is lower cannot run it.
   uint32_t constant_bytes() const { return constant_registers_ * 16; }
   bool uses_textures() const { return uses_textures_; }
+  // A compute shader (cs_5_0 DXBC, see D3d9Dxbc.cpp): the size of its thread group, and what it declared each storage buffer slot (u#) to be.
+  enum class BufferKind : uint8_t { None, Raw, Structured };
+  uint32_t thread_group(uint32_t axis) const { return axis < 3 ? thread_group_[axis] : 1; }
+  BufferKind storage_kind(uint32_t slot) const { return slot < graphics::kMaxStorageBuffers ? uav_kind_[slot] : BufferKind::None; }
+  uint32_t storage_stride(uint32_t slot) const { return slot < graphics::kMaxStorageBuffers ? uav_stride_[slot] : 0; }
+  // Runs the shader for one thread. `constants` are the push constants; the buffers are the context's.
+  void run_compute(const graphics::ComputeContext& context, const uint8_t* constants) const;
   // What the pixel shader declared texture unit `unit` to be (a DXBC dcl_resource; the others: 2D). Binding another kind to the unit makes a draw wrong, so the kernel refuses it.
   graphics::TextureKind texture_kind(uint32_t unit) const { return unit < graphics::kMaxTextureUnits ? texture_kind_[unit] : graphics::TextureKind::Texture2D; }
 
@@ -121,6 +128,9 @@ class D3d9Program {
   graphics::ShaderStage stage_ = graphics::ShaderStage::Vertex;
   uint32_t major_ = 0, minor_ = 0;
   bool uses_textures_ = false;
+  uint32_t thread_group_[3] = {1, 1, 1};
+  BufferKind uav_kind_[graphics::kMaxStorageBuffers] = {};
+  uint32_t uav_stride_[graphics::kMaxStorageBuffers] = {};
   graphics::TextureKind texture_kind_[graphics::kMaxTextureUnits] = {};
   bool uses_system_values_ = false, uses_texel_access_ = false;
   uint32_t color_outputs_ = 1;

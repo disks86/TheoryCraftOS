@@ -488,9 +488,15 @@ typedef struct TpTimer {
   BOOL closing;
   DWORD flags;
   void *queue;
+  BOOL fired;               /* a timer that runs once has been started: it can no longer be changed */
+  BOOL delete_requested;    /* deleted while a callback was running: whoever ends the last callback frees it */
+  HANDLE completion;        /* set when that has happened */
+  struct TpQueueDelete *queue_delete;
 } TpTimer;
+typedef struct TpQueueDelete { volatile LONG remaining; HANDLE event; } TpQueueDelete;
 static struct { CRITICAL_SECTION lock; TpTimer *list; HANDLE wake; HANDLE thread; volatile LONG state; } g_timers;
 
+static void timer_after_callbacks(TpTimer *t);
 static void run_timer(TpItem *item) {
   TpTimer *t = item->object;
   TpInstance in;
@@ -498,7 +504,10 @@ static void run_timer(TpItem *item) {
   if (t->kind == TIMER_POOL) ((TP_TIMER_CALLBACK_)t->callback)(&in, t->context, t);
   else ((WAITORTIMERCALLBACK_)t->callback)(t->context, TRUE);
   instance_finish(&in);
-  if (InterlockedDecrement(&t->pending) == 0) SetEvent(t->idle);
+  if (InterlockedDecrement(&t->pending) == 0) {
+    SetEvent(t->idle);
+    if (t->kind == TIMER_QUEUE) timer_after_callbacks(t);
+  }
 }
 static DWORD WINAPI timer_thread(LPVOID p) {
   (void)p;
@@ -512,6 +521,7 @@ static DWORD WINAPI timer_thread(LPVOID p) {
         if (InterlockedIncrement(&t->pending) == 1) ResetEvent(t->idle);
         if (!pool_post(run_timer, t, NULL)) { if (InterlockedDecrement(&t->pending) == 0) SetEvent(t->idle); }
         t->due = t->period ? now + t->period : 0;
+        t->fired = t->period == 0;
       }
       if (t->due != 0 && t->due < next) next = t->due;
     }
@@ -549,6 +559,7 @@ static void timer_arm(TpTimer *t, ULONGLONG delay_ms, DWORD period) {
   EnterCriticalSection(&g_timers.lock);
   t->due = GetTickCount64() + delay_ms + 1;
   t->period = period;
+  t->fired = FALSE;
   LeaveCriticalSection(&g_timers.lock);
   SetEvent(g_timers.wake);
 }
@@ -586,35 +597,97 @@ EXPORT BOOL WINAPI IsThreadpoolTimerSet(PVOID timer) { return ((TpTimer *)timer)
 EXPORT void WINAPI WaitForThreadpoolTimerCallbacks(PVOID timer, BOOL cancel_pending) { if (cancel_pending) timer_disarm(timer); WaitForSingleObject(((TpTimer *)timer)->idle, INFINITE); }
 EXPORT void WINAPI CloseThreadpoolTimer(PVOID timer) { timer_free(timer); }
 
-/* Timer queues: a handle is a list owner; the timers it made are freed with it. */
+/* Timer queues: a handle is a list owner; the timers it made are freed with it. A timer deleted while one of its callbacks runs goes when the last callback ends (the call
+ * says 997; a completion event is set then; INVALID_HANDLE_VALUE waits). */
 typedef struct TpQueue { int dummy; } TpQueue;
+static void timer_unlink(TpTimer *t) {
+  for (TpTimer **link = &g_timers.list; *link; link = &(*link)->next) if (*link == t) { *link = t->next; break; }
+}
+static void timer_destroy(TpTimer *t) { CloseHandle(t->idle); HeapFree(heap(), 0, t); }
+static void timer_after_callbacks(TpTimer *t) {
+  EnterCriticalSection(&g_timers.lock);
+  if (!t->delete_requested || t->pending != 0) { LeaveCriticalSection(&g_timers.lock); return; }
+  t->delete_requested = FALSE;
+  timer_unlink(t);
+  HANDLE completion = t->completion;
+  TpQueueDelete *qd = t->queue_delete;
+  LeaveCriticalSection(&g_timers.lock);
+  timer_destroy(t);
+  if (completion) SetEvent(completion);
+  if (qd && InterlockedDecrement(&qd->remaining) == 0) { if (qd->event) SetEvent(qd->event); HeapFree(heap(), 0, qd); }
+}
 EXPORT HANDLE WINAPI CreateTimerQueue(void) { timers_start(); return HeapAlloc(heap(), HEAP_ZERO_MEMORY, sizeof(TpQueue)); }
 EXPORT BOOL WINAPI CreateTimerQueueTimer(PHANDLE new_timer, HANDLE queue, WAITORTIMERCALLBACK_ callback, PVOID context, DWORD due_ms, DWORD period_ms, ULONG flags) {
+  if (!new_timer || !callback) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
   TpTimer *t = timer_new(TIMER_QUEUE, (PVOID)callback, context);
   if (!t) return FALSE;
   t->queue = queue;
   t->flags = flags;
-  timer_arm(t, due_ms, period_ms);
+  if (due_ms == 0) {      /* due now: the callback is started before the call returns */
+    EnterCriticalSection(&g_timers.lock);
+    if (InterlockedIncrement(&t->pending) == 1) ResetEvent(t->idle);
+    t->period = period_ms;
+    t->fired = period_ms == 0;
+    t->due = period_ms ? GetTickCount64() + period_ms + 1 : 0;
+    LeaveCriticalSection(&g_timers.lock);
+    if (!pool_post(run_timer, t, NULL)) { if (InterlockedDecrement(&t->pending) == 0) SetEvent(t->idle); }
+    SetEvent(g_timers.wake);
+  } else timer_arm(t, due_ms, period_ms);
   *new_timer = t;
   return TRUE;
 }
-EXPORT BOOL WINAPI ChangeTimerQueueTimer(HANDLE queue, HANDLE timer, ULONG due_ms, ULONG period_ms) { (void)queue; timer_arm(timer, due_ms, period_ms); return TRUE; }
+EXPORT BOOL WINAPI ChangeTimerQueueTimer(HANDLE queue, HANDLE timer, ULONG due_ms, ULONG period_ms) {
+  (void)queue;
+  TpTimer *t = timer;
+  if (!t) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  EnterCriticalSection(&g_timers.lock);
+  const BOOL done = t->fired && t->period == 0;      /* (a once-only timer that has started takes no new time) */
+  LeaveCriticalSection(&g_timers.lock);
+  if (!done) timer_arm(t, due_ms, period_ms);
+  return TRUE;
+}
 EXPORT BOOL WINAPI CancelTimerQueueTimer(HANDLE queue, HANDLE timer) { (void)queue; timer_disarm(timer); return TRUE; }
 EXPORT BOOL WINAPI DeleteTimerQueueTimer(HANDLE queue, HANDLE timer, HANDLE completion) {
   (void)queue;
-  timer_free(timer);
+  TpTimer *t = timer;
+  if (!t) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  EnterCriticalSection(&g_timers.lock);
+  t->closing = TRUE;
+  t->due = 0;
+  const BOOL running = t->pending != 0;
+  if (running && completion != INVALID_HANDLE_VALUE) {
+    t->delete_requested = TRUE;
+    t->completion = completion;
+    LeaveCriticalSection(&g_timers.lock);
+    set_error(997);
+    return FALSE;
+  }
+  LeaveCriticalSection(&g_timers.lock);
+  timer_free(t);      /* (waits for a running callback when asked to) */
   if (completion && completion != INVALID_HANDLE_VALUE) SetEvent(completion);
   return TRUE;
 }
 EXPORT BOOL WINAPI DeleteTimerQueueEx(HANDLE queue, HANDLE completion) {
-  EnterCriticalSection(&g_timers.lock);
+  if (!queue) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
+  const BOOL wait = completion == INVALID_HANDLE_VALUE;
+  TpQueueDelete *qd = wait ? NULL : HeapAlloc(heap(), HEAP_ZERO_MEMORY, sizeof(*qd));
+  if (qd) { qd->remaining = 1; qd->event = completion; }
   TpTimer *mine[64];
   int n = 0;
-  for (TpTimer *t = g_timers.list; t && n < 64; t = t->next) if (t->kind == TIMER_QUEUE && t->queue == queue) mine[n++] = t;
+  BOOL pending_any = FALSE;
+  EnterCriticalSection(&g_timers.lock);
+  for (TpTimer *t = g_timers.list; t && n < 64; t = t->next) {
+    if (t->kind != TIMER_QUEUE || t->queue != queue) continue;
+    t->closing = TRUE;
+    t->due = 0;
+    if (t->pending != 0 && qd) { t->delete_requested = TRUE; t->completion = NULL; t->queue_delete = qd; InterlockedIncrement(&qd->remaining); pending_any = TRUE; }
+    else mine[n++] = t;
+  }
   LeaveCriticalSection(&g_timers.lock);
   for (int i = 0; i < n; ++i) timer_free(mine[i]);
   HeapFree(heap(), 0, queue);
-  if (completion && completion != INVALID_HANDLE_VALUE) SetEvent(completion);
+  if (qd && InterlockedDecrement(&qd->remaining) == 0) { if (qd->event) SetEvent(qd->event); HeapFree(heap(), 0, qd); pending_any = FALSE; }
+  if (pending_any) { set_error(997); return FALSE; }
   return TRUE;
 }
 EXPORT BOOL WINAPI DeleteTimerQueue(HANDLE queue) { return DeleteTimerQueueEx(queue, NULL); }

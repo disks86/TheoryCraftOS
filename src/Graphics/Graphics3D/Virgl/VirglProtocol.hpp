@@ -44,6 +44,9 @@ enum Command : uint32_t {
   kEndQuery = 20,
   kGetQueryResult = 21,
   kBindShader = 31,
+  kSetShaderBuffers = 34,
+  kMemoryBarrier = 36,
+  kLaunchGrid = 37,
 };
 
 enum ObjectType : uint32_t {
@@ -87,6 +90,8 @@ constexpr uint32_t kQueryOcclusionCounter = 0;   // PIPE_QUERY_OCCLUSION_COUNTER
 constexpr uint32_t kQueryStateDone = 1;         // virgl_host_query_state::query_state once the host wrote the result (state, size, 64-bit result: 16 bytes)
 constexpr uint32_t kTargetBuffer = 0;
 constexpr uint32_t kTargetTexture2d = 2, kTargetTexture3d = 3, kTargetTextureCube = 4, kTargetTexture2dArray = 7;   // (PIPE_TEXTURE_*)
+constexpr uint32_t kShaderCompute = 5;   // (PIPE_SHADER_COMPUTE)
+constexpr uint32_t kBindShaderBuffer = 1u << 14;   // a buffer compute shaders read and write
 constexpr uint32_t kShaderVertex = 0;
 constexpr uint32_t kShaderFragment = 1;
 constexpr uint32_t kPrimPoints = 0, kPrimLines = 1, kPrimTriangles = 4;

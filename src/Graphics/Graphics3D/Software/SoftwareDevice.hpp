@@ -32,7 +32,7 @@ class SoftwareDevice final : public IGraphicsDevice {
   SoftwareDevice(allocators::IAllocator& allocator, hardware::IGraphicsProcessingUnit* display)
       : allocator_(allocator), display_(display) {}
 
-  DeviceInfo info() const override { return {"software rasterizer", DeviceKind::Software, false, kMaxPushConstantBytes, kFeatureBlendState | kFeatureTexelAccess | kFeatureSystemInputs | kFeatureInstancing | kFeatureLines | kFeatureMultipleTargets | kFeatureFloatFormats | kFeatureOcclusionQueries | kFeatureTextureKinds | kFeatureIndependentBlend}; }
+  DeviceInfo info() const override { return {"software rasterizer", DeviceKind::Software, false, kMaxPushConstantBytes, kFeatureBlendState | kFeatureTexelAccess | kFeatureSystemInputs | kFeatureInstancing | kFeatureLines | kFeatureMultipleTargets | kFeatureFloatFormats | kFeatureOcclusionQueries | kFeatureTextureKinds | kFeatureIndependentBlend | kFeatureCompute}; }
 
   IBuffer* create_buffer(uint64_t size, uint32_t usage) override;
   void destroy_buffer(IBuffer* buffer) override;
@@ -41,6 +41,7 @@ class SoftwareDevice final : public IGraphicsDevice {
   IShaderModule* create_shader_module(const ShaderModuleDesc& desc) override;
   void destroy_shader_module(IShaderModule* module) override;
   IPipeline* create_graphics_pipeline(const GraphicsPipelineDesc& desc) override;
+  IPipeline* create_compute_pipeline(const IShaderModule* shader) override;
   void destroy_pipeline(IPipeline* pipeline) override;
   ICommandBuffer* create_command_buffer() override;
   void destroy_command_buffer(ICommandBuffer* commands) override;

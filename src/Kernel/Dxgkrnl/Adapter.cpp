@@ -207,6 +207,8 @@ class Adapter::StreamRunner {
       case Op::GenerateMipmaps: return generate_mipmaps(p);
       case Op::BeginQuery: return begin_query(p);
       case Op::EndQuery: return end_query(p);
+      case Op::BindUav: return bind_uav(p);
+      case Op::Dispatch: return dispatch(p);
       case Op::SetTopology: {
         const uint32_t topology = p.le32();
         if (!exact(p) || topology > static_cast<uint32_t>(Topology::PointList)) return kBad;
@@ -314,12 +316,55 @@ class Adapter::StreamRunner {
       found = lookup_->find_pipeline(handle);
       if (!found || !collected_->push_back(found)) return found ? status::kNoMemory : status::kInvalidHandle;
     }
+    if (found->compute()) {
+      // (a compute pipeline is bound between passes and dispatched; it leaves the graphics pipeline alone)
+      if (in_pass_) return kBad;
+      compute_ = found.get();
+      if (exec_) {
+        const NtStatus s = ensure_cb();
+        if (s != status::kSuccess) return s;
+        cb_->bind_compute_pipeline(compute_->pipeline());
+      }
+      return status::kSuccess;
+    }
     pipeline_ = found.get();
     if (exec_) {
       const NtStatus s = ensure_cb();
       if (s != status::kSuccess) return s;
       cb_->bind_pipeline(pipeline_->pipeline());
     }
+    return status::kSuccess;
+  }
+
+  NtStatus bind_uav(ByteReader& p) {
+    const uint32_t slot = p.le32(), index = p.le32(), offset = p.le32(), size = p.le32();
+    if (!exact(p) || in_pass_ || !(adapter_.caps_.features & graphics::kFeatureCompute) || slot >= graphics::kMaxStorageBuffers) return kBad;
+    Allocation* a = alloc(index);
+    if (!a || !(a->desc().flags & kAllocUnorderedAccess) || size == 0 || offset % 4 || size % 4 || offset > a->desc().size || size > a->desc().size - offset) return kBad;
+    uav_bound_[slot] = true;
+    uav_alloc_[slot] = a;
+    if (!exec_) return status::kSuccess;
+    NtStatus s = resident(*a);
+    if (s == status::kSuccess) s = ensure_cb();
+    if (s != status::kSuccess) return s;
+    cb_->bind_storage_buffer(slot, a->buffer(), offset, size);
+    return status::kSuccess;
+  }
+
+  NtStatus dispatch(ByteReader& p) {
+    const uint32_t x = p.le32(), y = p.le32(), z = p.le32();
+    if (!exact(p) || in_pass_ || !compute_) return kBad;
+    if (x > graphics::kMaxDispatchGroups || y > graphics::kMaxDispatchGroups || z > graphics::kMaxDispatchGroups) return kBad;
+    const uint64_t per_group = uint64_t{compute_->thread_group(0)} * compute_->thread_group(1) * compute_->thread_group(2);
+    if (uint64_t{x} * y * z * per_group > graphics::kMaxDispatchThreads) return kBad;
+    for (uint32_t slot = 0; slot < graphics::kMaxStorageBuffers; ++slot)
+      if ((compute_->storage_mask() >> slot & 1) && !uav_bound_[slot]) return kBad;
+    if (x == 0 || y == 0 || z == 0 || !exec_) return status::kSuccess;
+    const NtStatus s = ensure_cb();
+    if (s != status::kSuccess) return s;
+    cb_->dispatch(x, y, z);
+    for (uint32_t slot = 0; slot < graphics::kMaxStorageBuffers; ++slot)
+      if (uav_bound_[slot]) mm_.note_gpu_write(*uav_alloc_[slot]);
     return status::kSuccess;
   }
 
@@ -637,6 +682,9 @@ class Adapter::StreamRunner {
   uint32_t pass_target_count_ = 1;
   const Allocation* pass_depth_ = nullptr;
   PipelineObject* pipeline_ = nullptr;
+  PipelineObject* compute_ = nullptr;
+  bool uav_bound_[graphics::kMaxStorageBuffers] = {};
+  Allocation* uav_alloc_[graphics::kMaxStorageBuffers] = {};
   Allocation* vertex_ = nullptr;
   uint64_t vertex_offset_ = 0;
   Allocation* index_ = nullptr;
@@ -764,7 +812,7 @@ NtStatus Adapter::create_shader(const ShaderDesc& desc, SharedPointer<ShaderObje
       }
       md.stage = stage;
       // The devices without a shader compiler: SVGA3D takes the (rewritten) Direct3D 9 tokens, Intel Gen9 runs a vertex function and one of two fixed pixel kernels.
-      {
+      if (stage != graphics::ShaderStage::Compute) {
         List<uint32_t> svga(allocator_);
         bool have_svga = false;
         if (desc.kind == ShaderKind::D3d9Bytecode) {
@@ -787,7 +835,9 @@ NtStatus Adapter::create_shader(const ShaderDesc& desc, SharedPointer<ShaderObje
           md.d3d9_token_count = static_cast<uint32_t>(shader->tokens_.size());
         }
       }
-      if (stage == graphics::ShaderStage::Fragment) {
+      if (stage == graphics::ShaderStage::Compute) {
+        // (nothing but the interpreter and the TGSI text runs a compute shader)
+      } else if (stage == graphics::ShaderStage::Fragment) {
         uint8_t varying = 0;
         const FragmentKernel kernel = program->classify_fragment(&varying);
         if (kernel != FragmentKernel::None) {
@@ -806,6 +856,9 @@ NtStatus Adapter::create_shader(const ShaderDesc& desc, SharedPointer<ShaderObje
         }
       }
       for (uint32_t u = 0; u < graphics::kMaxTextureUnits; ++u) shader->texture_kinds_[u] = program->texture_kind(u);
+      for (uint32_t k = 0; k < 3; ++k) shader->thread_group_[k] = program->thread_group(k);
+      for (uint32_t u = 0; u < graphics::kMaxStorageBuffers; ++u)
+        if (program->storage_kind(u) != D3d9Program::BufferKind::None) shader->storage_mask_ |= 1u << u;
       const NtStatus b = shader->d3d9_.bind(util::move(program), &md);
       if (b != status::kSuccess && !md.tgsi) return b;
       no_functions = b;   // (out of trampolines is no matter to a device that takes the text)
@@ -817,6 +870,21 @@ NtStatus Adapter::create_shader(const ShaderDesc& desc, SharedPointer<ShaderObje
   shader->module_ = device_.create_shader_module(md);
   if (!shader->module_) return no_functions != status::kSuccess ? no_functions : status::kNotSupported;
   *out = shader;
+  return status::kSuccess;
+}
+
+NtStatus Adapter::create_compute_pipeline(const SharedPointer<ShaderObject>& shader, SharedPointer<PipelineObject>* out) {
+  if (!shader || shader->stage() != graphics::ShaderStage::Compute) return status::kInvalidParameter;
+  if (!(caps_.features & graphics::kFeatureCompute)) return status::kNotSupported;
+  SharedPointer<PipelineObject> pipeline = SharedPointer<PipelineObject>::make(allocator_, device_);
+  if (!pipeline) return status::kNoMemory;
+  pipeline->pipeline_ = device_.create_compute_pipeline(shader->module());
+  if (!pipeline->pipeline_) return status::kNotSupported;
+  pipeline->compute_ = true;
+  for (uint32_t k = 0; k < 3; ++k) pipeline->thread_group_[k] = shader->thread_group_[k];
+  pipeline->storage_mask_ = shader->storage_mask_;
+  pipeline->vertex_ = shader;   // (kept alive for as long as the pipeline is)
+  *out = pipeline;
   return status::kSuccess;
 }
 
