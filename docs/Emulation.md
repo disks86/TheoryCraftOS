@@ -79,6 +79,7 @@ Linux programs only (there is no AArch64 Windows interface). Files: `AArch64Cpu.
   `fclamp`/`bfclamp`, the quadword reductions (`addqv`, `smaxqv`, `faddqv`, ...), `fcmla` by element. **Not implemented**: SME (ZA, streaming mode), the rest of SVE2.1/2.2 (predicate-as-counter registers and
   `pmov`/`psel`/`pext`/paired `while*`, zeroing-predicated conversions, multi-vector narrowing, `ld1q`/`st1q`, `ld2q`..), the FP8 conversions, dot products and multiplies, `luti`, `firstp`/`lastp`, and `ld1ro*`
   (undefined at this length, as in qemu).
+- **Advertised to programs**: `AT_HWCAP`/`AT_HWCAP2` of an AArch64 program list what is implemented (FP, ASIMD, crypto, CRC32, atomics, FP16, dot product, SVE, SVE2 and its sub-features, I8MM, BF16), ID_AA64PFR0/ZFR0/ISAR0/ISAR1_EL1 report the same, and `prctl(PR_SVE_GET_VL / PR_SVE_SET_VL)` answer 16 bytes.
 - **Other user-mode extensions**: scalar half precision (`FEAT_FP16`), `bfcvt`, `fjcvtzs`, `frint32/64`, exclusive pairs (`ldxp`/`stxp`), `casp*`, LRCPC2/3 (`ldapur`, `stlur`, `ldapr`/`stlr` with writeback),
   CSSC (`smax`/`smin`/`umax`/`umin` with registers and immediates, `abs`, `cnt`, `ctz`), `crc32*`, and pointer tags: the top byte of a user address is ignored (TBI), as Linux runs user code.
 - **Not implemented** (an undefined-instruction fault, never a wrong result): SME, the newest SVE extensions (above), pointer authentication (`ldraa`, `pacga`, ...), MTE (`irg`, `stg`, `ldg`, ...), FEAT_MOPS (`cpy*`, `set*`),

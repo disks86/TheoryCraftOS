@@ -258,9 +258,15 @@ LoadStatus build_linux_stack(AddressSpace& space, uint64_t stack_top, const Load
   const uint64_t random_address = (strings - 16) & ~uint64_t{15};
   if (strings < 16 || !space.write_privileged(random_address, random)) return LoadStatus::OutOfMemory;
 
+  // AT_HWCAP / AT_HWCAP2 of an AArch64 program: what the emulator implements (FP, Advanced SIMD, crypto, CRC32, LSE atomics, half precision, dot product, SVE, SVE2 and the Armv8.6 matrix and BFloat16 extensions)
+  uint64_t hwcap = 0, hwcap2 = 0;
+  if (platform == StringView("aarch64")) {
+    hwcap = 0x4fef7fb;
+    hwcap2 = 0x777e;
+  }
   struct Aux { uint64_t key, value; };
   const Aux aux[] = {{3, image.phdr}, {4, image.phent}, {5, image.phnum}, {6, AddressSpace::kPageSize}, {7, 0}, {8, 0}, {9, image.entry}, {11, 0}, {12, 0},
-                     {13, 0}, {14, 0}, {15, platform_at}, {16, 0}, {17, 100}, {23, 0}, {25, random_address}, {26, 0}, {31, executable_at}, {0, 0}};
+                     {13, 0}, {14, 0}, {15, platform_at}, {16, hwcap}, {17, 100}, {23, 0}, {25, random_address}, {26, hwcap2}, {31, executable_at}, {0, 0}};
   const uint64_t words = 1 + arguments.size() + 1 + environment.size() + 1 + 2 * (sizeof(aux) / sizeof(aux[0]));
   if (words * 8 > random_address) return LoadStatus::Malformed;
   const uint64_t sp = (random_address - words * 8) & ~uint64_t{15};
