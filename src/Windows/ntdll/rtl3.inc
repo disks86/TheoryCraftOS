@@ -1007,3 +1007,51 @@ EXPORT NTSTATUS NTAPI RtlDecompressBuffer(USHORT format, PUCHAR uncompressed, UL
         default: return 0xC000025Fu;
     }
 }
+
+/* ---- debug output ------------------------------------------------------------------------------------------------------------------------------------------ */
+
+IMPORT void NTAPI RtlCaptureContext(CONTEXT *);
+static BOOL debugger_handled(EXCEPTION_RECORD *record, CONTEXT *context, BOOLEAN first_chance);
+EXPORT BOOLEAN NTAPI RtlDispatchException(EXCEPTION_RECORD *record, CONTEXT *context);
+
+/* Prints formatted text for the debugger: when the process is being debugged the text goes to it as a DBG_PRINTEXCEPTION_C exception. Only the error level (bit 0 of the level
+   mask, or the level 0 itself) is shown. */
+EXPORT NTSTATUS NTAPI vDbgPrintExWithPrefix(const char *prefix, ULONG id, ULONG level, const char *fmt, va_list_ args) {
+  const ULONG level_mask = level <= 31 ? (1u << level) : level;
+  char buf[1024];
+  size_t_ len = strlen(prefix);
+  (void)id;
+  if (len >= sizeof(buf)) len = sizeof(buf) - 1;
+  memcpy(buf, prefix, len);
+  buf[len] = 0;
+  const int written = _vsnprintf(buf + len, sizeof(buf) - len, fmt, args);
+  if (written < 0) buf[sizeof(buf) - 1] = 0;
+  if ((level_mask & 1u) && NtCurrentPeb()->BeingDebugged) {
+    EXCEPTION_RECORD record;
+    memset(&record, 0, sizeof(record));
+    record.ExceptionCode = 0x40010006u;      /* DBG_PRINTEXCEPTION_C */
+    record.ExceptionAddress = (PVOID)RtlRaiseException;
+    record.NumberParameters = 2;
+    record.ExceptionInformation[1] = (ULONG_PTR)buf;
+    record.ExceptionInformation[0] = strlen(buf) + 1;
+    CONTEXT context;
+    RtlCaptureContext(&context);
+    if (!debugger_handled(&record, &context, TRUE)) RtlDispatchException(&record, &context);      /* (nobody has to want it: the print goes on either way) */
+  }
+  return STATUS_SUCCESS;
+}
+EXPORT NTSTATUS NTAPI vDbgPrintEx(ULONG id, ULONG level, const char *fmt, va_list_ args) { return vDbgPrintExWithPrefix("", id, level, fmt, args); }
+EXPORT NTSTATUS DbgPrintEx(ULONG id, ULONG level, const char *fmt, ...) {
+  va_list_ args;
+  __builtin_va_start(args, fmt);
+  const NTSTATUS status = vDbgPrintEx(id, level, fmt, args);
+  __builtin_va_end(args);
+  return status;
+}
+EXPORT NTSTATUS DbgPrint(const char *fmt, ...) {
+  va_list_ args;
+  __builtin_va_start(args, fmt);
+  const NTSTATUS status = vDbgPrintEx(0, 0, fmt, args);
+  __builtin_va_end(args);
+  return status;
+}
