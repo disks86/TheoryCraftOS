@@ -47,7 +47,12 @@ constexpr uint32_t kLaneCs0 = 0, kLaneCs0WidthShift = 20, kLaneCs0WidthMask = 0x
 constexpr uint32_t kUsb3Cs0Pe = 1u << 31, kUsb3Cs1 = 1, kUsb3Cs1Hca = 1u << 31, kUsb3Cs2 = 2, kUsb3Cs2Cmr = 1u << 31, kUsb3Cs3 = 3, kUsb3Cs4 = 4, kUsb3Cs4MslrShift = 12, kUsb3Cs4MslrMask = 0x7F, kUsb3Cs4Mslr20G = 1,
                    kUsb3Hop = 8, kUsb3Priority = 3, kUsb3Weight = 2;
 // capabilities of a port (TB_PORT_CAP_*) and of a router
-constexpr uint8_t kPortCapPhy = 0x01, kPortCapAdapter = 0x04, kPortCapUsb4 = 0x06;
+constexpr uint8_t kPortCapPhy = 0x01, kPortCapTime1 = 0x03, kPortCapAdapter = 0x04, kPortCapUsb4 = 0x06;
+// the time management unit: the router capability (TB_SWITCH_CAP_TMU), its registers, the port registers
+constexpr uint8_t kSwitchCapTmu = 0x03;
+constexpr uint32_t kTmuRtrCs0 = 0, kTmuRtrCs0FreqWindShift = 16, kTmuRtrCs0FreqWindMask = 0x7FFu << 16, kTmuRtrCs0Td = 1u << 27, kTmuRtrCs0Ucap = 1u << 30, kTmuRtrCs1 = 1, kTmuRtrCs3 = 3, kTmuRtrCs3IntervalShift = 16,
+                   kTmuRtrCs15 = 15, kTmuRtrCs18 = 18, kTmuRtrCs22 = 22, kTmuRtrCs24 = 24, kTmuRtrCs25 = 25, kTmuAdpCs3 = 3, kTmuAdpCs3Udm = 1u << 29, kTmuAdpCs6 = 6, kTmuAdpCs6Dts = 1u << 1,
+                   kTmuLowResRate = 1000, kTmuLowResFreqWindow = 30, kTmuLowResAverage = 4;
 // router configuration space
 constexpr uint32_t kRouterCs1 = 1, kRouterCs5 = 5, kRouterCs6 = 6, kRouterCs7 = 7, kRouterCs9 = 9, kRouterCs25 = 25, kRouterCs26 = 26;
 // router operations (ROUTER_CS_26): the opcode in the low half, OV (the operation is valid / still running), ONS (not supported) and the status
@@ -64,7 +69,7 @@ constexpr uint32_t kMaxPorts = 64, kMaxRouters = 32, kMaxDepth = 5, kMaxHops = 8
 struct Usb4Port {
   uint8_t number = 0;
   uint32_t type = 0;
-  uint8_t cap_phy = 0, cap_adapter = 0, cap_usb4 = 0;
+  uint8_t cap_phy = 0, cap_adapter = 0, cap_usb4 = 0, cap_tmu = 0;
   uint16_t max_in_hop = 0, max_out_hop = 0;
   bool disabled = false;
   uint8_t link_nr = 0;               // 0 for the first of two lane adapters, 1 for the second
@@ -89,6 +94,8 @@ struct Usb4Router {
   int16_t parent = -1;               // the router above it and the port of that one it hangs from
   uint8_t parent_port = 0;
   bool configured = false;
+  uint8_t cap_tmu = 0;               // the router's time management unit capability (0: none)
+  bool tmu_lowres = false;           // its time is kept in step with the host router's, uni-directionally at the low resolution
   bool pcie_tunnel = false;          // a PCIe tunnel made by this domain ends here
   bool usb3_tunnel = false;          // so does a USB 3 tunnel
   Usb4Port ports[usb4::kMaxPorts];
@@ -194,6 +201,9 @@ class Usb4Domain final : public IThunderboltEvents, public IXdomainHost, private
   uint32_t unreachable_links() const { return unreachable_; }
   // Reads and parses a router's DROM (names, which ports are unused, which lane adapters belong together); a router without one keeps the defaults. Done for every router found.
   bool read_drom(Usb4Router& r);
+  // Time synchronisation (tmu.c, uni-directional low resolution - the mode the Linux driver starts in): the host router is asked for its rate, each router below it gets the parameters, the
+  // adapters on both ends of its link are set to uni-directional with time sync on, and its local time is first set from the host router's so that it starts near it.
+  bool tmu_enabled(uint32_t router_index) const { const Usb4Router* r = router(router_index); return r && r->tmu_lowres; }
 
  private:
   struct Plug {
@@ -218,6 +228,13 @@ class Usb4Domain final : public IThunderboltEvents, public IXdomainHost, private
   // A router operation (usb4_native_switch_op): metadata and data in, the opcode written, the answer waited for. `status` is the operation's own result; false if the router does not support it.
   bool router_op(const Usb4Router& r, uint32_t opcode, uint32_t* metadata, uint8_t* status, const uint32_t* tx, uint32_t tx_dwords, uint32_t* rx, uint32_t rx_dwords);
   bool drom_read(const Usb4Router& r, uint32_t address, ByteView out);
+  int find_router_cap(const Usb4Router& r, uint8_t id);
+  bool tmu_set_time_disruption(const Usb4Router& r, bool set);
+  bool tmu_port_write(const Usb4Router& r, uint32_t port, uint32_t offset, uint32_t mask, uint32_t value);
+  bool tmu_rate_write(const Usb4Router& r, uint32_t rate);
+  bool tmu_post_time(const Usb4Router& child, const Usb4Router& host);
+  bool tmu_enable_root(Usb4Router& root);
+  bool tmu_enable(Usb4Router& child, Usb4Router& parent, const Usb4Router& root, uint32_t down_port);
   void scan_router(int index);
   void scan_port(int index, uint32_t port);
   void remove_router(int index);

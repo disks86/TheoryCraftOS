@@ -47,7 +47,7 @@ struct Router {
   uint32_t max_port = 0;
   uint32_t regs[64] = {};
   std::vector<Port> ports;           // index 0 is the control adapter
-  uint32_t cs5_writes = 0;
+  uint32_t cs5_writes = 0, post_times = 0;
   std::vector<uint8_t> drom;         // what DROM_READ gives (none: the operation is not supported)
   uint32_t drom_status = 0;          // the status the operation ends with
   uint32_t drom_reads = 0;
@@ -81,6 +81,10 @@ class Fabric {
     r->max_port = n;
     r->regs[6] = (1u << 18);                                     // ROUTER_CS_6.HCI: it has an xHCI
     r->regs[7] = 0xA0A0A0A0u + static_cast<uint32_t>(route);
+    r->regs[0x20] = (kSwitchCapTmu << 8) | (tmu_ucap ? kTmuRtrCs0Ucap : 0);          // the TMU capability, last in the list
+    r->regs[0x20 + kTmuRtrCs1] = 0x11110000u;                                           // the router's local time, for the host router to be read
+    r->regs[0x20 + kTmuRtrCs1 + 1] = 0x22222222u;
+    r->regs[0x20 + kTmuRtrCs1 + 2] = 0x00003333u;
     r->regs[8] = 0x0B0B0B0Bu;
     Router& ref = *r;
     routers_[route] = std::move(r);
@@ -117,6 +121,7 @@ class Fabric {
     parent.ports[port + 1].state = kPortUnplugged;
     at(route).connected = false;
   }
+  bool tmu_ucap = true;                                          // new routers support the uni-directional TMU mode
   bool refuse_sleep = false;                                     // ROUTER_CS_6.SLPR never comes up
   bool no_usb3_ack = false;                                      // the USB 3 adapter never grants the connection manager its request
   bool bond_never_completes = false;                             // the link keeps reporting one lane
@@ -137,7 +142,8 @@ class Fabric {
     p.space[5] = 0x7FF | (0x7FFu << 11);                         // plenty of HopIDs
     p.space[4] = 40u << 20;                                       // total buffers (ADP_CS_4)
     p.space[0x10] = 0x20 | (kPortCapPhy << 8) | (2u << 20);       // the lane adapter capability, next at 0x20; it supports two lanes
-    p.space[0x20] = (kPortCapUsb4 << 8);
+    p.space[0x20] = 0x40 | (kPortCapUsb4 << 8);                   // the USB4 capability, next the TMU one
+    p.space[0x40] = (kPortCapTime1 << 8);
     p.space[0x20 + kPortCs18] = kPortCs18Be;                      // bonding enabled
     return p;
   }
@@ -230,7 +236,7 @@ class Fabric {
     if (random_garbage) return noise();
     switch (i) {
       case 0: return r.vendor | (r.device << 16);
-      case 1: return 0x08 | (r.upstream << 8) | (r.max_port << 14) | (r.regs[1] & 0x00700000u) | (0x02u << 24);
+      case 1: return 0x20 | (r.upstream << 8) | (r.max_port << 14) | (r.regs[1] & 0x00700000u) | (0x02u << 24);
       case 2: return r.regs[2];
       case 3: return r.regs[3];
       case 4: return r.regs[4] | (uint32_t{r.version} << 24);
@@ -240,6 +246,8 @@ class Fabric {
   void write_switch(Router& r, uint32_t i, uint32_t v) {
     if (i == 1) r.regs[1] = (r.regs[1] & ~0x00700000u) | (v & 0x00700000u) , r.upstream = (v >> 8) & 0x3F;
     else if (i == 4) r.regs[4] = v & 0x00FFFFFFu;
+    else if (i == 0x20) r.regs[i] = (r.regs[i] & 0x4000FFFFu) | (v & ~0x4000FFFFu);              // the capability header and UCAP are read only
+    else if (i == 0x20 + kTmuRtrCs24) { r.regs[i] = 0; r.regs[i + 1] = 0; ++r.post_times; }  // the post time trigger clears itself at once
     else r.regs[i] = v;
     if (i == 26 && (v & kCs26Ov)) {                                                    // a router operation
       if ((v & 0xFFFF) == kOpDromRead && !r.drom.empty()) {

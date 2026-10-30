@@ -155,6 +155,10 @@ bool Usb4Domain::read_router(uint64_t route, int16_t parent, uint8_t parent_port
     *error = "could not read the router's ports";
     return false;
   }
+  {
+    const int tmu = find_router_cap(r, kSwitchCapTmu);
+    if (tmu > 0) r.cap_tmu = static_cast<uint8_t>(tmu);
+  }
   read_drom(r);                                            // (before the default pairing, which leaves what it says alone)
   link_lane_adapters(r);
   *index_out = index;
@@ -185,6 +189,8 @@ bool Usb4Domain::init_ports(Usb4Router& r) {
       const int phy = find_port_cap(r, p, first, kPortCapPhy);
       if (phy > 0) port.cap_phy = static_cast<uint8_t>(phy);
       const int u4 = find_port_cap(r, p, first, kPortCapUsb4);
+      const int time1 = find_port_cap(r, p, first, kPortCapTime1);
+      if (time1 > 0) port.cap_tmu = static_cast<uint8_t>(time1);
       if (u4 > 0) {
         port.cap_usb4 = static_cast<uint8_t>(u4);
         uint32_t hop0[2];                                   // (the buffers the control path uses are in its hop entry)
@@ -360,6 +366,114 @@ bool Usb4Domain::read_drom(Usb4Router& r) {
   return true;
 }
 
+// ------------------------------------------------------------------ time management unit
+
+// A capability of the router's own space: the list starts at the first offset of the header (dword 1, low byte), each entry has its id in byte 1 and the next offset in byte 0.
+int Usb4Domain::find_router_cap(const Usb4Router& r, uint8_t id) {
+  uint32_t header = 0;
+  if (!read(r.route, 0, TbConfigSpace::Switch, 1, ArrayView<uint32_t>(&header, 1))) return -1;
+  uint32_t offset = header & 0xFF;
+  for (uint32_t i = 0; i < 64 && offset != 0 && offset < 64; ++i) {
+    uint32_t word = 0;
+    if (!read(r.route, 0, TbConfigSpace::Switch, offset, ArrayView<uint32_t>(&word, 1))) return -1;
+    if (((word >> 8) & 0xFF) == id) return static_cast<int>(offset);
+    offset = word & 0xFF;
+  }
+  return -1;
+}
+
+bool Usb4Domain::tmu_set_time_disruption(const Usb4Router& r, bool set) {
+  uint32_t word = 0;
+  if (!read(r.route, 0, TbConfigSpace::Switch, r.cap_tmu + kTmuRtrCs0, ArrayView<uint32_t>(&word, 1))) return false;
+  word = set ? (word | kTmuRtrCs0Td) : (word & ~kTmuRtrCs0Td);
+  return write(r.route, 0, TbConfigSpace::Switch, r.cap_tmu + kTmuRtrCs0, ArrayView<const uint32_t>(&word, 1));
+}
+
+bool Usb4Domain::tmu_rate_write(const Usb4Router& r, uint32_t rate) {
+  uint32_t word = 0;
+  if (!read(r.route, 0, TbConfigSpace::Switch, r.cap_tmu + kTmuRtrCs3, ArrayView<uint32_t>(&word, 1))) return false;
+  word = (word & 0xFFFFu) | (rate << kTmuRtrCs3IntervalShift);
+  return write(r.route, 0, TbConfigSpace::Switch, r.cap_tmu + kTmuRtrCs3, ArrayView<const uint32_t>(&word, 1));
+}
+
+bool Usb4Domain::tmu_port_write(const Usb4Router& r, uint32_t port, uint32_t offset, uint32_t mask, uint32_t value) {
+  const Usb4Port& p = r.ports[port];
+  if (p.cap_tmu == 0) return false;
+  uint32_t word = 0;
+  if (!port_read(r, port, p.cap_tmu + offset, ArrayView<uint32_t>(&word, 1))) return false;
+  word = (word & ~mask) | value;
+  return port_write(r, port, p.cap_tmu + offset, ArrayView<const uint32_t>(&word, 1));
+}
+
+// The host router's time, three dwords from TMU_RTR_CS_1, goes to the child's local time registers and the post-time trigger is waited for (tb_switch_tmu_post_time).
+bool Usb4Domain::tmu_post_time(const Usb4Router& child, const Usb4Router& host) {
+  if (host.cap_tmu == 0 || child.cap_tmu == 0) return false;
+  uint32_t gm[3];
+  if (!read(host.route, 0, TbConfigSpace::Switch, host.cap_tmu + kTmuRtrCs1, ArrayView<uint32_t>(gm, 3))) return false;
+  const uint64_t hi = gm[2] & 0xFFFFu, mid = gm[1], lo = (gm[0] & 0xFFFF0000u) >> 16;
+  const uint64_t local_time = hi << 48 | mid << 16 | lo;
+  if (!tmu_set_time_disruption(child, true)) return false;
+  bool ok = false;
+  const uint32_t local[2] = {static_cast<uint32_t>(local_time), static_cast<uint32_t>(local_time >> 32)};
+  const uint32_t post[2] = {0x00000001u, 0xFFFFFFFFu}, high = 0;
+  if (write(child.route, 0, TbConfigSpace::Switch, child.cap_tmu + kTmuRtrCs22, ArrayView<const uint32_t>(local, 2)) &&
+      write(child.route, 0, TbConfigSpace::Switch, child.cap_tmu + kTmuRtrCs24, ArrayView<const uint32_t>(post, 2)) &&
+      write(child.route, 0, TbConfigSpace::Switch, child.cap_tmu + kTmuRtrCs25, ArrayView<const uint32_t>(&high, 1))) {
+    for (uint32_t tries = 0; tries < 100 && !ok; ++tries) {
+      uint32_t now[2];
+      if (!read(child.route, 0, TbConfigSpace::Switch, child.cap_tmu + kTmuRtrCs24, ArrayView<uint32_t>(now, 2))) break;
+      ok = now[0] == 0 && now[1] == 0;
+      if (!ok) delay_us(5);
+    }
+  }
+  tmu_set_time_disruption(child, false);
+  return ok;
+}
+
+bool Usb4Domain::tmu_enable_root(Usb4Router& root) {
+  if (root.cap_tmu == 0) return false;
+  uint32_t cs0 = 0;
+  if (!read(root.route, 0, TbConfigSpace::Switch, root.cap_tmu + kTmuRtrCs0, ArrayView<uint32_t>(&cs0, 1)) || !(cs0 & kTmuRtrCs0Ucap)) return false;      // (no uni-directional mode)
+  if (!tmu_set_time_disruption(root, true)) return false;
+  const bool ok = tmu_rate_write(root, kTmuLowResRate);
+  tmu_set_time_disruption(root, false);
+  root.tmu_lowres = ok;
+  return ok;
+}
+
+bool Usb4Domain::tmu_enable(Usb4Router& child, Usb4Router& parent, const Usb4Router& root, uint32_t down_port) {
+  if (child.cap_tmu == 0 || !parent.tmu_lowres) return false;
+  uint32_t cs0 = 0;
+  if (!read(child.route, 0, TbConfigSpace::Switch, child.cap_tmu + kTmuRtrCs0, ArrayView<uint32_t>(&cs0, 1)) || !(cs0 & kTmuRtrCs0Ucap)) return false;
+  tmu_post_time(child, root);
+  if (!tmu_set_time_disruption(child, true)) return false;
+  bool ok = tmu_rate_write(parent, kTmuLowResRate);
+  // the parameters of the mode: the frequency measurement window and the averaging constants
+  if (ok) {
+    uint32_t word = 0;
+    ok = read(child.route, 0, TbConfigSpace::Switch, child.cap_tmu + kTmuRtrCs0, ArrayView<uint32_t>(&word, 1));
+    word = (word & ~kTmuRtrCs0FreqWindMask) | (kTmuLowResFreqWindow << kTmuRtrCs0FreqWindShift);
+    ok = ok && write(child.route, 0, TbConfigSpace::Switch, child.cap_tmu + kTmuRtrCs0, ArrayView<const uint32_t>(&word, 1));
+    ok = ok && read(child.route, 0, TbConfigSpace::Switch, child.cap_tmu + kTmuRtrCs15, ArrayView<uint32_t>(&word, 1));
+    const uint32_t avg = kTmuLowResAverage;
+    word = (word & ~0x00FFFFFFu) | avg | (avg << 6) | (avg << 12) | (avg << 18);
+    ok = ok && write(child.route, 0, TbConfigSpace::Switch, child.cap_tmu + kTmuRtrCs15, ArrayView<const uint32_t>(&word, 1));
+    if (ok && child.usb4_version > 1) {                    // (the delta averaging constant of version 2 routers: zero for this mode)
+      ok = read(child.route, 0, TbConfigSpace::Switch, child.cap_tmu + kTmuRtrCs18, ArrayView<uint32_t>(&word, 1));
+      word &= ~(0xFFu << 16);
+      ok = ok && write(child.route, 0, TbConfigSpace::Switch, child.cap_tmu + kTmuRtrCs18, ArrayView<const uint32_t>(&word, 1));
+    }
+  }
+  // both ends of the link: uni-directional, and the time sync that was disabled switched on (DTS cleared)
+  if (ok) {
+    ok = tmu_port_write(child, child.upstream_port, kTmuAdpCs3, kTmuAdpCs3Udm, kTmuAdpCs3Udm) && tmu_port_write(child, child.upstream_port, kTmuAdpCs6, kTmuAdpCs6Dts, 0) &&
+         tmu_port_write(parent, down_port, kTmuAdpCs3, kTmuAdpCs3Udm, kTmuAdpCs3Udm) && tmu_port_write(parent, down_port, kTmuAdpCs6, kTmuAdpCs6Dts, 0);
+  }
+  tmu_set_time_disruption(child, false);
+  child.tmu_lowres = ok;
+  return ok;
+}
+
 // ------------------------------------------------------------------ the tree
 
 bool Usb4Domain::start(const char** error) {
@@ -369,6 +483,7 @@ bool Usb4Domain::start(const char** error) {
   int root = -1;
   if (!read_router(0, -1, 0, &root, error)) return false;
   started_ = true;
+  tmu_enable_root(*routers_[root]);
   scan_router(root);
   close_preboot_tunnels();
   return true;
@@ -418,6 +533,11 @@ void Usb4Domain::scan_port(int index, uint32_t port_number) {
   parent.ports[port_number].remote_router = static_cast<int16_t>(child_index);
   child.ports[child.upstream_port].remote_router = static_cast<int16_t>(index);
   bond_link(child, parent, port_number);                 // (two lanes as one when both ends can; the link stays as it was when not)
+  {
+    int root = index;
+    while (routers_[root]->parent >= 0) root = routers_[root]->parent;
+    tmu_enable(child, parent, *routers_[root], port_number);   // (a router that cannot keep time with the host's works without it)
+  }
   configuration_valid(child);
   scan_router(child_index);
 }

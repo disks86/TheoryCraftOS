@@ -3346,6 +3346,47 @@ static void test_usb4_drom() {
   }
 }
 
+static void test_usb4_tmu() {
+  {   // every router keeps time in step with the host router
+    Usb4Rig rig;
+    Usb4Domain domain(rig.control, rig.nhi, rig.alloc);
+    CHECK(domain.start(nullptr));
+    CHECK(domain.tmu_enabled(0) && domain.tmu_enabled(1) && domain.tmu_enabled(2));
+    fake_usb4::Router& host = rig.fabric.at(0);
+    fake_usb4::Router& d1 = rig.fabric.at(0x01);
+    fake_usb4::Router& d2 = rig.fabric.at(0x301);
+    const uint32_t cap = 0x20;
+    // the host router's rate is 1000; the time disruption bit is back down everywhere
+    CHECK((host.regs[cap + kTmuRtrCs3] >> kTmuRtrCs3IntervalShift) == 1000 && !(host.regs[cap] & kTmuRtrCs0Td) && !(d1.regs[cap] & kTmuRtrCs0Td) && !(d2.regs[cap] & kTmuRtrCs0Td));
+    // the dock's parameters: window 30, averaging 4 in all four fields
+    CHECK(((d1.regs[cap] & kTmuRtrCs0FreqWindMask) >> kTmuRtrCs0FreqWindShift) == 30 && (d1.regs[cap + kTmuRtrCs15] & 0xFFFFFF) == (4u | (4u << 6) | (4u << 12) | (4u << 18)));
+    // its time was set from the host's: the local time of the host router (the three dwords) is in the dock's registers
+    CHECK(d1.post_times == 1 && d1.regs[cap + kTmuRtrCs22] == (host.regs[cap + kTmuRtrCs1 + 1] << 16 | host.regs[cap + kTmuRtrCs1] >> 16));
+    // both ends of each link: uni-directional, time sync not disabled
+    CHECK((host.ports[1].space[0x40 + kTmuAdpCs3] & kTmuAdpCs3Udm) && (d1.ports[1].space[0x40 + kTmuAdpCs3] & kTmuAdpCs3Udm) && !(host.ports[1].space[0x40 + kTmuAdpCs6] & kTmuAdpCs6Dts));
+    CHECK((d1.ports[3].space[0x40 + kTmuAdpCs3] & kTmuAdpCs3Udm) && (d2.ports[1].space[0x40 + kTmuAdpCs3] & kTmuAdpCs3Udm));
+    CHECK(!(host.ports[3].space[0x40 + kTmuAdpCs3] & kTmuAdpCs3Udm));                         // (a link with nothing on it is left alone)
+  }
+  {   // a host router that cannot do it: nobody below tries, and everything else works
+    Usb4Rig rig(false);
+    rig.fabric.at(0).regs[0x20] &= ~kTmuRtrCs0Ucap;
+    Usb4Domain domain(rig.control, rig.nhi, rig.alloc);
+    CHECK(domain.start(nullptr) && !domain.tmu_enabled(0) && !domain.tmu_enabled(1) && domain.present_count() == 2 && rig.fabric.at(0x01).post_times == 0);
+  }
+  {   // a dock that cannot: the host keeps its rate, the dock is left without
+    Usb4Rig rig(false);
+    rig.fabric.at(0x01).regs[0x20] &= ~kTmuRtrCs0Ucap;
+    Usb4Domain domain(rig.control, rig.nhi, rig.alloc);
+    CHECK(domain.start(nullptr) && domain.tmu_enabled(0) && !domain.tmu_enabled(1) && !(rig.fabric.at(0x01).ports[1].space[0x40 + kTmuAdpCs3] & kTmuAdpCs3Udm));
+  }
+  {   // no TMU capability at all
+    Usb4Rig rig(false);
+    rig.fabric.at(0x01).regs[1] = 0;                                                        // (the model reads the first capability offset from the header: take the TMU one out of the list)
+    Usb4Domain domain(rig.control, rig.nhi, rig.alloc);
+    CHECK(domain.start(nullptr) && domain.present_count() == 2);
+  }
+}
+
 static void test_usb4_garbage() {
   // the routers answer with noise: the manager must stay inside its arrays, whatever comes (and the sanitizers say if it does not)
   for (uint32_t seed = 1; seed <= 200; ++seed) {
@@ -3395,6 +3436,7 @@ int main() {
   test_usb4_sleep();
   test_usb4_xdomain();
   test_usb4_drom();
+  test_usb4_tmu();
   test_usb4_runtime_sleep();
   test_usb4_xdomain_failures();
   test_usb4_driver();
