@@ -43,6 +43,8 @@ enum DxbcOp : uint32_t {
   kGe4 = 29, kIf4 = 31, kLog4 = 47, kLt4 = 49, kMad4 = 50, kMin4 = 51, kMax4 = 52, kCustomData4 = 53, kMov4 = 54, kMovc4 = 55, kMul4 = 56, kNe4 = 57, kNop4 = 58, kRet4 = 62,
   kRoundNe4 = 64, kRoundNi4 = 65, kRoundPi4 = 66, kRoundZ4 = 67, kRsq4 = 68, kSample4 = 69, kSqrt4 = 75, kSincos4 = 77,
   kDclResource4 = 88, kDclConstantBuffer4 = 89, kDclSampler4 = 90, kDclInput4 = 95, kDclInputSgv4 = 96, kDclInputSiv4 = 97, kDclInputPs4 = 98, kDclInputPsSgv4 = 99, kDclInputPsSiv4 = 100,
+  kHsDecls4 = 113, kHsControlPointPhase4 = 114, kHsForkPhase4 = 115, kHsJoinPhase4 = 116, kDclInputControlPointCount4 = 147, kDclOutputControlPointCount4 = 148, kDclTessDomain4 = 149,
+  kDclTessPartitioning4 = 150, kDclTessOutputPrimitive4 = 151, kDclHsMaxTessFactor4 = 152, kDclHsForkInstances4 = 153, kDclHsJoinInstances4 = 154,
   kEmit4 = 19, kCut4 = 9, kDclOutputTopology4 = 92, kDclInputPrimitive4 = 93, kDclMaxOutputVertices4 = 94, kDclThreadGroup4 = 155, kDclUavRaw4 = 157, kDclUavStructured4 = 158, kLdRaw4 = 165, kStoreRaw4 = 166, kLdStructured4 = 167, kStoreStructured4 = 168, kSync4 = 190,
   kDclOutput4 = 101, kDclOutputSgv4 = 102, kDclOutputSiv4 = 103, kDclTemps4 = 104, kDclIndexableTemp4 = 105, kDclGlobalFlags4 = 106,
 };
@@ -57,7 +59,7 @@ bool resource_kind(uint32_t dimension, graphics::TextureKind* kind) {
   }
 }
 
-enum OperandType : uint32_t { kOpUav = 30, kOpThreadId = 32, kOpThreadGroupId = 33, kOpThreadIdInGroup = 34, kOpThreadIdFlat = 36, kOpTemp = 0, kOpInput = 1, kOpOutput = 2, kOpImmediate = 4, kOpSampler = 6, kOpResource = 7, kOpConstantBuffer = 8, kOpImmediateConstantBuffer = 9, kOpNull = 13 };
+enum OperandType : uint32_t { kOpOutputControlPointId = 22, kOpForkInstanceId = 23, kOpJoinInstanceId = 24, kOpInputControlPoint = 25, kOpInputPatchConstant = 27, kOpDomainPoint = 28, kOpUav = 30, kOpThreadId = 32, kOpThreadGroupId = 33, kOpThreadIdInGroup = 34, kOpThreadIdFlat = 36, kOpTemp = 0, kOpInput = 1, kOpOutput = 2, kOpImmediate = 4, kOpSampler = 6, kOpResource = 7, kOpConstantBuffer = 8, kOpImmediateConstantBuffer = 9, kOpNull = 13 };
 
 // Where a program made from DXBC keeps what it has no register for: its literals, and the immediate constant buffer (declared in the program) as constants of its own.
 constexpr uint16_t kLiteralBase = 0x4000, kImmediateBufferBase = 0x6000;
@@ -74,6 +76,7 @@ struct Operand {
   float imm[4] = {0, 0, 0, 0};
   bool relative = false;   // the last index adds the integer in a temporary's component (cb0[r1.x + 3], icb[r2.y])
   uint8_t relative_temp = 0, relative_component = 0;
+  bool vertex_from_id = false;   // a control point operand indexed by vOutputControlPointID
 };
 
 struct SigElement {
@@ -160,7 +163,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
   const uint32_t version = in.le32(), length = in.le32();
   const uint32_t program_type = version >> 16, major = (version >> 4) & 0xF, minor = version & 0xF;
   if (length != shader.size() / 4) return status::kInvalidParameter;
-  if (program_type != 0 && program_type != 1 && program_type != 2 && program_type != 5) return status::kNotSupported;   // pixel, vertex, geometry and compute shaders only
+  if (program_type != 0 && program_type != 1 && program_type != 2 && program_type != 3 && program_type != 4 && program_type != 5) return status::kNotSupported;   // pixel, vertex, geometry, hull, domain and compute shaders
   if (program_type == 5 && major != 5) return status::kNotSupported;
   if (!((major == 4 && minor <= 1) || (major == 5 && minor <= 1))) return status::kNotSupported;
   const bool v51 = major == 5 && minor == 1;   // (constant buffers, textures and samplers are ranges with a space: cb[ID][index][element], t[ID][index])
@@ -177,14 +180,18 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
   };
   const bool vertex = program_type == 1;
   const bool compute = program_type == 5;
-  const bool geometry = program_type == 2;
+  const bool geometry = program_type == 2, hull = program_type == 3, domain = program_type == 4;
+  const bool patch_stage = hull || domain;
+  int phase = 0;   // a hull shader: 0 declarations, 1 control point, 2 fork, 3 join
+  uint32_t input_points = 0, output_points = 0;
+  bool tess_domain_declared = false;
   bool geometry_input_declared = false, geometry_output_declared = false;
   uint32_t geometry_vertices = 0;   // the vertices of an input primitive
   bool thread_group_declared = false;
 
   UniquePointer<D3d9Program> program = UniquePointer<D3d9Program>::make(allocator, allocator);
   if (!program) return status::kNoMemory;
-  program->stage_ = vertex ? graphics::ShaderStage::Vertex : compute ? graphics::ShaderStage::Compute : geometry ? graphics::ShaderStage::Geometry : graphics::ShaderStage::Fragment;
+  program->stage_ = vertex ? graphics::ShaderStage::Vertex : compute ? graphics::ShaderStage::Compute : geometry ? graphics::ShaderStage::Geometry : hull ? graphics::ShaderStage::Hull : domain ? graphics::ShaderStage::Domain : graphics::ShaderStage::Fragment;
   program->major_ = major;
   program->minor_ = minor;
 
@@ -199,9 +206,9 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
   if (!isgn.empty()) {
     if (!read_signature(isgn, isgn_size, elements, &count)) return status::kInvalidParameter;
     for (uint32_t i = 0; i < count; ++i)
-      if (elements[i].reg < 16) in_slot[elements[i].reg] = signature_slot(elements[i], geometry);   // (a geometry shader's inputs include the position)
+      if (elements[i].reg < 16) in_slot[elements[i].reg] = signature_slot(elements[i], geometry || patch_stage);   // (a geometry, hull or domain shader's inputs include the position)
   }
-  if (vertex || geometry) {
+  if (vertex || geometry || patch_stage) {
     if (vertex)
       for (uint32_t i = 0; i < graphics::kMaxVertexAttributes; ++i) in_slot[i] = static_cast<int8_t>(i);   // (vN is attribute location N)
     if (osgn.empty() || !read_signature(osgn, osgn_size, elements, &count)) return status::kInvalidParameter;
@@ -250,6 +257,12 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         const uint32_t temp = p.le32();
         if (!p.ok() || temp >= kMaxTemps) return status::kNotSupported;
         o->relative_temp = static_cast<uint8_t>(temp);
+      } else if (representation == 2 && i == 0 && o->dims == 2 && patch_stage && (o->type == kOpInput || o->type == kOpInputControlPoint)) {
+        // vicp[vOutputControlPointID][register]: the control point being made
+        const uint32_t sub = p.le32();
+        if (!p.ok() || ((sub >> 12) & 0xFF) != kOpOutputControlPointId || ((sub >> 20) & 3) != 0 || (sub >> 31)) return status::kNotSupported;
+        o->vertex_from_id = true;
+        o->index[0] = 0;
       } else {
         return status::kNotSupported;   // 64-bit indices, relative anywhere else
       }
@@ -293,11 +306,15 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         if (o.dims != 1 || o.index[0] >= kMaxTemps) return status::kNotSupported;
         s->type = kTemp, s->number = static_cast<uint16_t>(o.index[0]);
         return status::kSuccess;
+      case kOpInputControlPoint:
       case kOpInput: {
-        if (geometry) {
-          // v[vertex][register], both immediate
-          if (o.dims != 2 || o.index[0] >= geometry_vertices || o.index[1] >= 16 || in_slot[o.index[1]] == kSlotNone) return status::kNotSupported;
+        if (geometry || patch_stage) {
+          // v[vertex][register]: the vertex immediate, or for a hull shader's control point phase the control point being made
+          const uint32_t limit = geometry ? geometry_vertices : input_points;
+          if (o.dims != 2 || (!o.vertex_from_id && o.index[0] >= limit) || o.index[1] >= 16 || in_slot[o.index[1]] == kSlotNone) return status::kNotSupported;
+          if (o.vertex_from_id && !(hull && phase == 1)) return status::kNotSupported;
           s->type = kInput, s->number = static_cast<uint16_t>(o.index[1]), s->slot = in_slot[o.index[1]], s->vertex = static_cast<uint8_t>(o.index[0]);
+          s->vertex_from_id = o.vertex_from_id;
           return status::kSuccess;
         }
         if (o.dims == 1 && o.index[0] < 16 && in_sys[o.index[0]] >= 0) {
@@ -309,6 +326,18 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         s->type = kInput, s->number = static_cast<uint16_t>(o.index[0]), s->slot = in_slot[o.index[0]];
         return status::kSuccess;
       }
+      case kOpInputPatchConstant:
+        if (!domain || o.dims != 1 || o.index[0] >= graphics::kMaxPatchRegisters) return status::kNotSupported;
+        s->type = kPatchIn, s->number = static_cast<uint16_t>(o.index[0]);
+        return status::kSuccess;
+      case kOpOutputControlPointId:
+        if (!hull || phase != 1) return status::kNotSupported;
+        s->type = kSysValue, s->number = kSysOutputControlPointId;
+        return status::kSuccess;
+      case kOpDomainPoint:
+        if (!domain) return status::kNotSupported;
+        s->type = kSysValue, s->number = kSysDomainLocation;
+        return status::kSuccess;
       case kOpThreadId: case kOpThreadGroupId: case kOpThreadIdInGroup: case kOpThreadIdFlat:
         if (!compute) return status::kNotSupported;
         s->type = kSysValue;
@@ -365,7 +394,12 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         return status::kSuccess;
       case kOpOutput: {
         if (o.dims != 1 || o.index[0] >= 16) return status::kNotSupported;
-        if (!vertex && !geometry) {
+        if (hull && (phase == 2 || phase == 3)) {   // (a patch constant register)
+          if (o.index[0] >= graphics::kMaxPatchRegisters) return status::kNotSupported;
+          d->type = kPatchOut, d->number = static_cast<uint16_t>(o.index[0]);
+          return status::kSuccess;
+        }
+        if (!vertex && !geometry && !patch_stage) {
           if (o.index[0] >= graphics::kMaxColorTargets) return status::kNotSupported;   // (SV_Target0..3)
           d->type = kColorOut, d->slot = static_cast<int8_t>(o.index[0]);
           if (o.index[0] + 1 > color_outputs) color_outputs = o.index[0] + 1;
@@ -543,6 +577,25 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
           if (o.dims != 2 || o.index[0] != geometry_vertices || o.index[1] >= 16 || in_slot[o.index[1]] == kSlotNone) return status::kNotSupported;
           continue;
         }
+        if (patch_stage && (opcode == kDclInput4 || opcode == kDclInputSiv4)) {
+          // control points (v[N][register] of a hull shader, vicp[N][register] of a domain shader), the control point being made, the domain location, the patch constants
+          if (o.type == kOpInput || o.type == kOpInputControlPoint) {
+            if (o.dims != 2 || o.index[0] != input_points || o.index[1] >= 16 || in_slot[o.index[1]] == kSlotNone) return status::kNotSupported;
+            continue;
+          }
+          if (o.type == kOpOutputControlPointId || o.type == kOpDomainPoint || o.type == kOpInputPatchConstant || o.type == kOpForkInstanceId || o.type == kOpJoinInstanceId) continue;
+          return status::kNotSupported;
+        }
+        if (hull && opcode == kDclOutputSiv4 && o.type == kOpOutput && (phase == 2 || phase == 3)) {
+          // a tessellation factor: the register of the patch constant outputs it is in (the triangle's three edges, then the inside)
+          const uint32_t name = p.le32() & 0xFFFF;
+          if (!p.ok() || o.dims != 1 || o.index[0] >= graphics::kMaxPatchRegisters) return status::kNotSupported;
+          if (name >= 17 && name <= 19) program->outer_factor_reg_[name - 17] = static_cast<int8_t>(o.index[0]);
+          else if (name == 20) program->inner_factor_reg_ = static_cast<int8_t>(o.index[0]);
+          else return status::kNotSupported;
+          continue;
+        }
+        if (hull && opcode == kDclOutput4 && o.type == kOpOutput && (phase == 2 || phase == 3)) continue;   // (a patch constant register)
         if (compute && opcode == kDclInput4 && (o.type == kOpThreadId || o.type == kOpThreadGroupId || o.type == kOpThreadIdInGroup || o.type == kOpThreadIdFlat)) continue;
         if ((o.type != kOpInput && o.type != kOpOutput) || o.dims != 1 || o.index[0] >= 16) return status::kNotSupported;   // (depth and the like)
         // An input that is a system value says which in its declaration (a name after the operand); the rest take their meaning from the signature.
@@ -563,6 +616,46 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         continue;
       }
       case kDclIndexableTemp4: return status::kNotSupported;
+      case kHsDecls4:
+        if (!hull) return status::kNotSupported;
+        phase = 0;
+        continue;
+      case kHsControlPointPhase4: case kHsForkPhase4: case kHsJoinPhase4: {
+        if (!hull) return status::kNotSupported;
+        const int next = opcode == kHsControlPointPhase4 ? 1 : opcode == kHsForkPhase4 ? 2 : 3;
+        if (next <= phase) return status::kNotSupported;   // (the phases come once each, in order)
+        phase = next;
+        (next == 1 ? program->hs_cp_begin_ : next == 2 ? program->hs_fork_begin_ : program->hs_join_begin_) = program->code_.count();
+        continue;
+      }
+      case kDclInputControlPointCount4: case kDclOutputControlPointCount4: {
+        const uint32_t n = (token >> 11) & 0x3F;
+        if (!patch_stage || n == 0 || n > graphics::kMaxPatchControlPoints || (opcode == kDclOutputControlPointCount4 && !hull)) return status::kNotSupported;
+        (opcode == kDclInputControlPointCount4 ? input_points : output_points) = n;
+        continue;
+      }
+      case kDclTessDomain4:
+        if (!patch_stage || ((token >> 11) & 7) != 2) return status::kNotSupported;   // (the triangle domain only)
+        tess_domain_declared = true;
+        continue;
+      case kDclTessPartitioning4: {
+        const uint32_t mode = (token >> 11) & 7;
+        if (!hull || (mode != 1 && mode != 2)) return status::kNotSupported;   // (integer and power of two)
+        program->tess_partitioning_ = mode == 1 ? graphics::TessPartitioning::Integer : graphics::TessPartitioning::Pow2;
+        continue;
+      }
+      case kDclTessOutputPrimitive4: {
+        const uint32_t mode = (token >> 11) & 7;
+        if (!hull || (mode != 3 && mode != 4)) return status::kNotSupported;   // (triangles)
+        program->tess_output_ = mode == 3 ? graphics::TessOutput::TriangleCw : graphics::TessOutput::TriangleCcw;
+        continue;
+      }
+      case kDclHsMaxTessFactor4:
+        p.le32();
+        continue;
+      case kDclHsForkInstances4: case kDclHsJoinInstances4:
+        if (!hull || p.le32() != 1 || !p.ok()) return status::kNotSupported;   // (one instance of a phase)
+        continue;
       case kDclInputPrimitive4: {
         // (D3D10_SB_PRIMITIVE: 1 point, 2 line, 3 triangle; the adjacency primitives are not taken)
         const uint32_t primitive = (token >> 11) & 0x3F;
@@ -612,6 +705,14 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
 
     Instr ins;
     if (opcode == kRet4) {
+      if (hull) {
+        // (a phase ends; a program with no more phases is done)
+        if (phase == 1) program->hs_cp_end_ = program->code_.count();
+        else if (phase == 2) program->hs_fork_end_ = program->code_.count();
+        else if (phase == 3) program->hs_join_end_ = program->code_.count();
+        else return status::kInvalidParameter;
+        continue;
+      }
       returned = true;
       continue;
     }
@@ -841,7 +942,13 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
   }
   if (compute && (!thread_group_declared || program->code_.count() == 0)) return status::kInvalidParameter;
   if (geometry && (!geometry_input_declared || !geometry_output_declared || program->geometry_max_vertices_ == 0)) return status::kInvalidParameter;
-  if (vertex || geometry) {
+  if (patch_stage) {
+    if (!tess_domain_declared || input_points == 0) return status::kInvalidParameter;
+    if (hull && (output_points == 0 || phase == 0)) return status::kInvalidParameter;
+    program->tess_input_points_ = input_points;
+    program->tess_output_points_ = hull ? output_points : input_points;
+  }
+  if (vertex || geometry || domain) {
     bool writes_position = false;
     for (const Instr& ins : program->code_.view())
       if (ins.dst.slot == kSlotPosition) writes_position = true;

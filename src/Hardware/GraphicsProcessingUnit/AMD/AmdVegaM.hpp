@@ -89,6 +89,7 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
     MmioRegion doorbells;                         // the doorbell BAR (BAR 2), at least the first 8 KiB
     uint64_t output_framebuffer_bytes = 0;        // room in the block for the picture of one more output (light_up); 0: none
     uint64_t max_framebuffer_bytes = 0;           // the largest picture the display could show (0: no display part)
+    uint64_t draw_area_bytes = 0;                 // room in the block after those for the data of draws (AmdVegaDraw, draw_area()); 0: none
     amd_dce11::WatermarkClocks display_clocks;    // the engine and memory clocks the display watermarks are computed for (the driver's current / DPM sclk and mclk); all zero: the watermarks are not touched
     uint32_t hpd_pins = 0x3F;                     // the hot plug detect pins to watch (bit n: pin n); which pin a connector is on is in the video BIOS, so by default all of them
     IPciBus* pci = nullptr;                       // where the card is, for the full reset (AmdAsicReset): its configuration space
@@ -362,6 +363,14 @@ class AmdVegaM final : public amd_dce11::INativeDisplay, private AmdIrq::ISink {
   const Layout& layout() const { return layout_; }
   // The GPU address of the start of the framebuffer area (what offsets in upload() / download() are added to): for command buffers that name memory in it.
   uint64_t framebuffer_gpu_address() const { return block_gpu_ + layout_.framebuffer; }
+  // Where the room for draws is in the framebuffer area (offset for upload() / download() and AmdVegaDraw::draw, and its size); false when the card has none.
+  bool draw_area(uint64_t* offset, uint64_t* bytes) const {
+    if (!up() || inputs_.draw_area_bytes == 0) return false;
+    constexpr uint64_t kMegabyte = 1ull << 20;
+    *offset = ((inputs_.max_framebuffer_bytes + kMegabyte - 1) / kMegabyte * kMegabyte + inputs_.output_framebuffer_bytes + kMegabyte - 1) / kMegabyte * kMegabyte;
+    *bytes = (inputs_.draw_area_bytes + kMegabyte - 1) / kMegabyte * kMegabyte;
+    return true;
+  }
   AmdGfx8* graphics() { return gfx_.get(); }
   AmdSdma3* sdma() { return sdma_.get(); }
   AmdIh3* interrupts() { return ih_.get(); }

@@ -1046,6 +1046,63 @@ void run_geometry_shader(const DrawState& s, const SoftwareShaderModule& module,
   }
 }
 
+// Tessellates one patch: the hull shader makes the output control points and the factors; with all four factors the same after rounding (integer: up, power of two: up to the next one;
+// 1 or 2) the triangle domain is the regular lattice of N * N triangles, each corner turned into a vertex by the domain shader. A factor that is not above 0 culls the patch; factors
+// that differ drop it (the stitching of rings is not made). The triangles are (u, v) counter-clockwise, or clockwise for TriangleCw.
+void run_tessellation(const DrawState& s, const SoftwareShaderModule& hull, const SoftwareShaderModule& domain, const ClipVertex* v, uint32_t count) {
+  const ShaderModuleDesc& hd = hull.desc();
+  HullInputData input;
+  input.control_points = count;
+  input.primitive_id = s.primitive_id;
+  for (uint32_t k = 0; k < count && k < kMaxPatchControlPoints; ++k) {
+    input.position[k] = v[k].position;
+    for (uint32_t i = 0; i < kMaxVaryings; ++i) input.varying[k][i] = v[k].varying[i];
+  }
+  HullOutputData patch;
+  hd.hull_function(input, s.constants, &patch);
+  const float factors[4] = {patch.outer[0], patch.outer[1], patch.outer[2], patch.inner[0]};
+  uint32_t n[4];
+  for (uint32_t k = 0; k < 4; ++k) {
+    float f = factors[k];
+    if (!(f > 0.0f)) return;   // (culled)
+    if (f > 64.0f) f = 64.0f;
+    uint32_t c = static_cast<uint32_t>(f);
+    if (static_cast<float>(c) < f) ++c;   // (rounded up)
+    if (c < 1) c = 1;
+    if (hd.tess_partitioning == TessPartitioning::Pow2) {
+      uint32_t p = 1;
+      while (p < c) p <<= 1;
+      c = p;
+    }
+    n[k] = c;
+  }
+  if (n[0] != n[1] || n[1] != n[2] || n[2] != n[3]) return;
+  // (the lattice is what the real tessellator makes for 1 and 2 only: from 3 on its inner triangles are concentric rings, stitched to the outer one, not the points of the lattice)
+  if (n[0] > 2) return;
+  const uint32_t N = n[0];
+  const DomainShaderFn ds = domain.desc().domain_function;
+  auto vertex = [&](uint32_t i, uint32_t j) {
+    ShaderIo io;
+    const float inv = 1.0f / static_cast<float>(N);
+    ds(patch, static_cast<float>(i) * inv, static_cast<float>(j) * inv, static_cast<float>(N - i - j) * inv, s.constants, &io);
+    ClipVertex c;
+    c.position = io.position;
+    for (uint32_t k = 0; k < kMaxVaryings; ++k) c.varying[k] = io.varying[k];
+    return c;
+  };
+  const bool clockwise = hd.tess_output == TessOutput::TriangleCw;
+  auto emit = [&](uint32_t ai, uint32_t aj, uint32_t bi, uint32_t bj, uint32_t ci, uint32_t cj) {
+    const ClipVertex a = vertex(ai, aj), b = vertex(bi, bj), c = vertex(ci, cj);
+    if (clockwise) draw_triangle(s, a, c, b);
+    else draw_triangle(s, a, b, c);
+  };
+  for (uint32_t j = 0; j < N; ++j)
+    for (uint32_t i = 0; i + j < N; ++i) {
+      emit(i, j, i + 1, j, i, j + 1);
+      if (i + j + 2 <= N) emit(i + 1, j, i + 1, j + 1, i, j + 1);
+    }
+}
+
 }  // namespace
 
 // --- Device ------------------------------------------------------------------
@@ -1090,6 +1147,12 @@ IImage* SoftwareDevice::create_image(const ImageDesc& desc) {
 void SoftwareDevice::destroy_image(IImage* image) { destroy(allocator_, static_cast<SoftwareImage*>(image)); }
 
 IShaderModule* SoftwareDevice::create_shader_module(const ShaderModuleDesc& desc) {
+  if (desc.stage == ShaderStage::Hull || desc.stage == ShaderStage::Domain) {
+    // (the triangle domain only, with up to the most control points)
+    if (desc.stage == ShaderStage::Hull ? !desc.hull_function : !desc.domain_function) return nullptr;
+    if (desc.tess_domain != TessDomain::Triangle || desc.tess_input_points == 0 || desc.tess_input_points > kMaxPatchControlPoints || desc.tess_output_points == 0 || desc.tess_output_points > kMaxPatchControlPoints) return nullptr;
+    return make<SoftwareShaderModule>(allocator_, desc);
+  }
   if (desc.stage == ShaderStage::Geometry) {
     if (!desc.geometry_function || desc.geometry_max_vertices == 0 || desc.geometry_max_vertices > kMaxGeometryVertices) return nullptr;
     return make<SoftwareShaderModule>(allocator_, desc);
@@ -1125,6 +1188,12 @@ IPipeline* SoftwareDevice::create_graphics_pipeline(const GraphicsPipelineDesc& 
   const auto* fs = static_cast<const SoftwareShaderModule*>(desc.fragment_shader);
   if (vs->stage() != ShaderStage::Vertex || fs->stage() != ShaderStage::Fragment) return nullptr;
   if (desc.geometry_shader && desc.geometry_shader->stage() != ShaderStage::Geometry) return nullptr;
+  if (desc.hull_shader || desc.domain_shader) {
+    if (!desc.hull_shader || !desc.domain_shader || desc.hull_shader->stage() != ShaderStage::Hull || desc.domain_shader->stage() != ShaderStage::Domain) return nullptr;
+    const ShaderModuleDesc& h = static_cast<const SoftwareShaderModule*>(desc.hull_shader)->desc();
+    const ShaderModuleDesc& d = static_cast<const SoftwareShaderModule*>(desc.domain_shader)->desc();
+    if (h.tess_output_points != d.tess_input_points) return nullptr;   // (the domain shader takes the hull shader's control points)
+  }
   // A shader that samples textures needs the pipeline to say how many, and the other way round.
   // (one with system values reads whatever it likes)
   const bool textured = fs->desc().textured_fragment_function != nullptr;
@@ -1156,6 +1225,7 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
   uint64_t index_offset = 0;
   IndexType index_type = IndexType::Uint16;
   PrimitiveTopology topology = PrimitiveTopology::TriangleList;
+  uint32_t patch_points = 0;
   bool in_pass = false;
   s.constants = s.constants_storage;
   const ConstByteView pool = recorder.constants();
@@ -1321,6 +1391,9 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
       case RecordedCommand::Type::SetTopology:
         topology = cmd.topology;
         break;
+      case RecordedCommand::Type::SetPatchPoints:
+        patch_points = cmd.count;
+        break;
       case RecordedCommand::Type::SetScissor: {
         if (!in_pass) return false;
         const Extent2D e = s.color->extent();
@@ -1375,7 +1448,13 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
         };
         const uint32_t instances = cmd.instance_count;
         if (instances > 1u << 20) return false;
-        const uint32_t per_primitive = topology == PrimitiveTopology::TriangleList ? 3 : topology == PrimitiveTopology::LineList ? 2 : 1;
+        const bool patches = topology == PrimitiveTopology::PatchList;
+        const SoftwareShaderModule* hull = static_cast<const SoftwareShaderModule*>(pd.hull_shader);
+        const SoftwareShaderModule* domain = static_cast<const SoftwareShaderModule*>(pd.domain_shader);
+        // (patches need a hull and a domain shader that take that many control points, and those shaders need patches)
+        if (patches != (hull != nullptr) || (patches && (patch_points != hull->desc().tess_input_points || patch_points == 0 || patch_points > kMaxPatchControlPoints))) return false;
+        if (patches && pd.geometry_shader) return false;   // (a geometry shader after the tessellator is not made)
+        const uint32_t per_primitive = patches ? patch_points : topology == PrimitiveTopology::TriangleList ? 3 : topology == PrimitiveTopology::LineList ? 2 : 1;
         const SoftwareShaderModule* geometry = static_cast<const SoftwareShaderModule*>(pd.geometry_shader);
         if (geometry) {
           // (the geometry shader takes the primitives the draw makes)
@@ -1385,9 +1464,13 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
         for (uint32_t instance = 0; instance < instances; ++instance) {
           s.primitive_id = 0;
           for (uint32_t t = 0; t + per_primitive <= cmd.count; t += per_primitive, ++s.primitive_id) {
-            ClipVertex v[3];
+            ClipVertex v[kMaxPatchControlPoints];
             for (uint32_t k = 0; k < per_primitive; ++k)
               if (!vertex_at(t + k, instance, &v[k])) return false;
+            if (patches) {
+              run_tessellation(s, *hull, *domain, v, per_primitive);
+              continue;
+            }
             if (geometry) {
               run_geometry_shader(s, *geometry, v, per_primitive);
               continue;

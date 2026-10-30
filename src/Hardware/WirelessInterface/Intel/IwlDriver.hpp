@@ -94,6 +94,7 @@ class IwlDriver {
   const char* firmware_name() const { return firmware_name_; }
   bool running() const { return transport_ && transport_->running(); }
   const IwlNvmData& nvm() const { return nvm_; }
+  const IwlFirmware& firmware() const { return firmware_; }
   IwlTransport* transport() { return transport_.get(); }
   // The runtime commands for scanning (after Started); the scanner, or nullptr with a message in *error.
   IwlScanner* enable_scanning(const char** error);

@@ -1195,6 +1195,35 @@ void scene_integer(Rig& rig, ArrayView<uint32_t> out) {
   rig.read(target, out);
 }
 
+// Tessellation (hs_tri / ds_dent): a patch of three control points is cut into the 4 x 4 lattice of the triangle domain (all factors 4, integer partitioning), and the domain shader pulls
+// each point toward the centre by how far it is from the edges, so the picture is a dented triangle that shows the lattice (a plain triangle if the tessellator did nothing).
+void scene_tessellation(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureTessellation)) return void(rig.step("tessellation", status::kNotSupported));
+  namespace b = conformance_blobs;
+  const Vertex v[3] = {{-0.9f, -0.9f, 0.5f, 1, 0, 0, 1}, {0.9f, -0.9f, 0.5f, 0, 1, 0, 1}, {0.0f, 0.9f, 0.5f, 0, 0, 1, 1}};
+  Handle vs = rig.vertex_shader(bytes_of(b::k_vs, sizeof b::k_vs));
+  Handle hs = rig.shader("create_shader (hull)", ShaderKind::Dxbc, graphics::ShaderStage::Hull, bytes_of(b::k_hs_tri, sizeof b::k_hs_tri));
+  Handle ds = rig.shader("create_shader (domain)", ShaderKind::Dxbc, graphics::ShaderStage::Domain, bytes_of(b::k_ds_dent, sizeof b::k_ds_dent));
+  Handle ps = rig.pixel_shader(bytes_of(b::k_ps_color, sizeof b::k_ps_color));
+  PipelineDesc pd = colour_pipeline_desc(vs, ps);
+  pd.varying_count = 3;
+  pd.hull_shader = hs;
+  pd.domain_shader = ds;
+  Handle pipe = rig.pipeline(pd);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  CommandWriter w(rig.allocator());
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.set_topology(patch_list(3));
+  w.draw(3);
+  w.end_pass();
+  rig.render(w, {target, vb});
+  rig.read(target, out);
+}
+
 const Entry kScenes[] = {
     {"Direct3D 9 vertex colours", scene_vertex_colours},
     {"Direct3D 9 Shader Model 3", scene_sm3},
@@ -1224,6 +1253,7 @@ const Entry kScenes[] = {
     {"Direct3D 10 instancing", scene_instancing},
     {"Direct3D 10 multiple render targets (DXBC)", scene_multiple_targets},
     {"Direct3D 10 geometry shader (DXBC)", scene_geometry_shader},
+    {"Direct3D 11 tessellation, hull and domain shaders (DXBC)", scene_tessellation},
     {"Direct3D 10 sRGB render target and texture", scene_srgb},
     {"Direct3D 10 16-bit normalised render target and texture", scene_unorm16},
     {"Direct3D 10 integer render target and Load (DXBC)", scene_integer},

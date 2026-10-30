@@ -85,6 +85,8 @@ class VirtioGpu : public FramebufferGpu, public IMonitorSource {
   // Most samples per pixel the host's multisampled images have (0 when it did not say).
   uint32_t virgl_max_samples() const { return has_3d_ ? virgl_max_samples_ : 0; }
   // Geometry shaders are core in OpenGL 3.2 / GLSL 1.50.
+  // Tessellation is core in OpenGL 4.0 / GLSL 4.00.
+  bool virgl_has_tessellation() const { return has_3d_ && virgl_glsl_level_ >= 400; }
   bool virgl_has_geometry() const { return has_3d_ && virgl_glsl_level_ >= 150; }
   bool virgl_has_compute() const { return has_3d_ && virgl_glsl_level_ >= 430; }
   uint32_t context_id() const { return kContextId; }
