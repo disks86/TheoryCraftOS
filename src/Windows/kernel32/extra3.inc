@@ -149,22 +149,106 @@ EXPORT int WINAPI CompareStringOrdinal(LPCWSTR a, int an, LPCWSTR b, int bn, BOO
   }
   return an == bn ? 2 /* CSTR_EQUAL */ : an < bn ? 1 : 3;
 }
-EXPORT int WINAPI FindStringOrdinal(DWORD flags, LPCWSTR source, int source_count, LPCWSTR value, int value_count, BOOL ignore_case) {
-  if (!source || !value) { set_error(ERROR_INVALID_PARAMETER); return -1; }
-  if (source_count < 0) source_count = (int)wcslen(source);
-  if (value_count < 0) value_count = (int)wcslen(value);
-  if (value_count > source_count) return -1;
-  if (flags & 2 /* FIND_FROMEND */) {
-    for (int i = source_count - value_count; i >= 0; --i) if (CompareStringOrdinal(source + i, value_count, value, value_count, ignore_case) == 2) return i;
-  } else {
-    for (int i = 0; i + value_count <= source_count; ++i) if (CompareStringOrdinal(source + i, value_count, value, value_count, ignore_case) == 2) return i;
+#define FIND_STARTSWITH_ 0x00100000u
+#define FIND_ENDSWITH_ 0x00200000u
+#define FIND_FROMSTART_ 0x00400000u
+#define FIND_FROMEND_ 0x00800000u
+#define FIND_MODES_ (FIND_STARTSWITH_ | FIND_ENDSWITH_ | FIND_FROMSTART_ | FIND_FROMEND_)
+/* Where a value is in a text, for one of the four modes: the start of the first match in `first` order, or of the last one. `same(start, length)` says whether the text from
+ * start for length units equals the value; for a match the length is returned in *found. */
+typedef BOOL (*FindMatcher)(void *context, int start, int length, int *found);
+static int find_in(DWORD mode, int count, FindMatcher matcher, void *context, int *found) {
+  if (mode == FIND_STARTSWITH_) return matcher(context, 0, count, found) ? 0 : -1;
+  if (mode == FIND_ENDSWITH_) {
+    for (int start = count; start >= 0; --start) { int length; if (matcher(context, start, count - start, &length) && length == count - start) { *found = length; return start; } }
+    return -1;
   }
+  if (mode == FIND_FROMEND_) {
+    for (int start = count; start >= 0; --start) if (matcher(context, start, count - start, found)) return start;
+    return -1;
+  }
+  for (int start = 0; start <= count; ++start) if (matcher(context, start, count - start, found)) return start;
   return -1;
 }
+
+typedef struct { const WCHAR *source, *value; int value_count; BOOL ignore_case; } OrdinalFind;
+static BOOL ordinal_match(void *context, int start, int available, int *found) {
+  const OrdinalFind *f = context;
+  if (f->value_count > available) return FALSE;
+  for (int i = 0; i < f->value_count; ++i) {
+    WCHAR x = f->source[start + i], y = f->value[i];
+    if (f->ignore_case) { x = wide_upper(x); y = wide_upper(y); }
+    if (x != y) return FALSE;
+  }
+  *found = f->value_count;
+  return TRUE;
+}
+EXPORT int WINAPI FindStringOrdinal(DWORD flags, LPCWSTR source, int source_count, LPCWSTR value, int value_count, BOOL ignore_case) {
+  if (flags != FIND_STARTSWITH_ && flags != FIND_ENDSWITH_ && flags != FIND_FROMSTART_ && flags != FIND_FROMEND_) { set_error(ERROR_INVALID_FLAGS); return -1; }
+  if (!source || !value || source_count < -1 || value_count < -1) { set_error(ERROR_INVALID_PARAMETER); return -1; }
+  if (source_count < 0) source_count = (int)wcslen(source);
+  if (value_count < 0) value_count = (int)wcslen(value);
+  OrdinalFind f = { source, value, value_count, ignore_case };
+  int found = 0;
+  set_error(0);
+  if (value_count == 0) return flags == FIND_FROMEND_ || flags == FIND_ENDSWITH_ ? source_count : 0;
+  return find_in(flags, source_count, ordinal_match, &f, &found);
+}
+
+/* A text as the linguistic comparison sees it: canonically decomposed, and with the case, the nonspacing marks and the symbols left out as the flags ask. On the heap. */
+static WCHAR *find_prepare(DWORD flags, const WCHAR *text, int count, int *length) {
+  INT room = count * 18 + 8;
+  WCHAR *normalized = RtlAllocateHeap(heap(), 0, (SIZE_T)room * 2);
+  if (!normalized) return NULL;
+  if (count == 0) { *length = 0; return normalized; }
+  if (RtlNormalizeString(2, text, count, normalized, &room) != STATUS_SUCCESS) { memcpy(normalized, text, (SIZE_T)count * 2); room = count; }
+  int out = 0;
+  for (int i = 0; i < room; ++i) {
+    WCHAR c = normalized[i];
+    WORD c1, c2, c3;
+    ctype_of(c, &c1, &c2, &c3);
+    if ((flags & 2 /* NORM_IGNORENONSPACE */) && (c3 & 1 /* C3_NONSPACING */)) continue;
+    if ((flags & 4 /* NORM_IGNORESYMBOLS */) && (c1 & (C1_PUNCT_ | C1_SPACE_) || c3 & 8 /* C3_SYMBOL */)) continue;
+    if (flags & (1 /* NORM_IGNORECASE */ | 0x10 /* LINGUISTIC_IGNORECASE */)) c = wide_upper(c);
+    normalized[out++] = c;
+  }
+  *length = out;
+  return normalized;
+}
+typedef struct { const WCHAR *source; int source_count; const WCHAR *prepared_value; int prepared_count; DWORD flags; } LinguisticFind;
+static BOOL linguistic_match(void *context, int start, int available, int *found) {
+  const LinguisticFind *f = context;
+  /* the shortest stretch of the source whose preparation equals the value */
+  for (int length = 0; length <= available; ++length) {
+    int prepared_count;
+    WCHAR *prepared = find_prepare(f->flags, f->source + start, length, &prepared_count);
+    if (!prepared) return FALSE;
+    const BOOL same = prepared_count == f->prepared_count && memcmp(prepared, f->prepared_value, (SIZE_T)prepared_count * 2) == 0;
+    RtlFreeHeap(heap(), 0, prepared);
+    if (same && (length > 0 || f->prepared_count == 0)) { *found = length; return TRUE; }
+    if (prepared_count > f->prepared_count + 4) return FALSE;
+  }
+  return FALSE;
+}
+static int nls_locale_of_name(LPCWSTR name);
 EXPORT int WINAPI FindNLSStringEx(LPCWSTR locale_name, DWORD flags, LPCWSTR source, int source_count, LPCWSTR value, int value_count, LPINT found_length, LPVOID version, LPVOID reserved, LPARAM sort_handle) {
-  (void)locale_name; (void)version; (void)reserved; (void)sort_handle;
-  const int at = FindStringOrdinal((flags & 0x00400000) ? 2 : 1, source, source_count, value, value_count, (flags & 1) != 0);
-  if (at >= 0 && found_length) *found_length = value_count < 0 ? (int)wcslen(value) : value_count;
+  (void)version; (void)reserved; (void)sort_handle;
+  const DWORD mode = flags & FIND_MODES_;
+  if ((locale_name && !nls_locale_of_name(locale_name)) || !source || !value || source_count < -1 || value_count < -1 || (mode != FIND_STARTSWITH_ && mode != FIND_ENDSWITH_ && mode != FIND_FROMSTART_ && mode != FIND_FROMEND_)) {
+    set_error(ERROR_INVALID_PARAMETER);
+    return -1;
+  }
+  if (source_count < 0) source_count = (int)wcslen(source);
+  if (value_count < 0) value_count = (int)wcslen(value);
+  int prepared_count;
+  WCHAR *prepared = find_prepare(flags, value, value_count, &prepared_count);
+  if (!prepared) { set_error(ERROR_NOT_ENOUGH_MEMORY); return -1; }
+  LinguisticFind f = { source, source_count, prepared, prepared_count, flags };
+  int found = 0;
+  set_error(0);
+  const int at = find_in(mode, source_count, linguistic_match, &f, &found);
+  RtlFreeHeap(heap(), 0, prepared);
+  if (at >= 0 && found_length) *found_length = found;
   return at;
 }
 EXPORT int WINAPI FindNLSString(LCID locale, DWORD flags, LPCWSTR source, int source_count, LPCWSTR value, int value_count, LPINT found_length) { (void)locale; return FindNLSStringEx(NULL, flags, source, source_count, value, value_count, found_length, NULL, NULL, 0); }
