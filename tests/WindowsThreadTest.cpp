@@ -500,16 +500,20 @@ static void test_process_lists() {
   const uint64_t out = kBase + 0x2000, returned = kBase + 0x1F00;
   CHECK(s.call(WindowsSyscallNumber::NtQuerySystemInformation, 5, out, 16, returned) == 0xC0000004u);      // too small: it says how much
   const uint32_t need = s.memory.get32(returned);
-  CHECK(need == (0x100 + 2 * 0x50 + 56) + (0x100 + 1 * 0x50 + 56));
+  // (the list starts with the System process and ends with services.exe, which no list of Windows is without)
+  const uint32_t system_size = 0x100 + 56;
+  CHECK(need == system_size + (0x100 + 2 * 0x50 + 56) + (0x100 + 1 * 0x50 + 56) + system_size);
   CHECK(s.call(WindowsSyscallNumber::NtQuerySystemInformation, 5, out, need, returned) == 0);
+  CHECK(s.memory.get32(out) == system_size && s.memory.get64(out + 0x50) == 4 && s.memory.get64(out + 0x58) == 0 && s.memory.get32(out + 0x64) == 0);
+  const uint64_t base = out + system_size;
   const uint32_t first = uint32_t(0x100 + 2 * 0x50 + 56);
-  CHECK(s.memory.get32(out) == first && s.memory.get32(out + 4) == 2 && s.memory.get64(out + 0x50) == 7 && s.memory.get64(out + 0x58) == 0);
-  CHECK(s.memory.get64(out + 0x20) == 1007 && s.memory.get64(out + 0x90) == 4096 * 7 && (s.memory.get32(out + 0x38) & 0xFFFF) == 16);      // CreateTime, WorkingSetSize, "main.exe" (8 characters)
-  CHECK(s.memory.get64(out + 0x30 + 0x100) == ((uint64_t(1) << 20) | 7) && s.memory.get64(out + 0x28 + 0x100) == 7 && s.memory.get64(out + 0x20 + 0x100) == 0x1000);      // the first thread
-  CHECK(s.memory.get64(out + 0x30 + 0x150) == ((uint64_t(2) << 20) | 7) && s.memory.get32(out + 0x38 + 0x150) == 9);      // the second: priority 8 + 1
-  CHECK(s.memory.get32(out + first) == 0 && s.memory.get64(out + first + 0x50) == 8 && s.memory.get64(out + first + 0x58) == 7);      // the child, the last entry
-  const uint64_t name_at = s.memory.get64(out + 0x40);
-  CHECK(name_at == out + 0x100 + 2 * 0x50 && s.memory.bytes[name_at - kBase] == 'm' && s.memory.bytes[name_at - kBase + 1] == 0);
+  CHECK(s.memory.get32(base) == first && s.memory.get32(base + 4) == 2 && s.memory.get64(base + 0x50) == 7 && s.memory.get64(base + 0x58) == 0 && s.memory.get32(base + 0x64) == 1);
+  CHECK(s.memory.get64(base + 0x20) == 1007 && s.memory.get64(base + 0x90) == 4096 * 7 && (s.memory.get32(base + 0x38) & 0xFFFF) == 16);      // CreateTime, WorkingSetSize, "main.exe" (8 characters)
+  CHECK(s.memory.get64(base + 0x30 + 0x100) == ((uint64_t(1) << 20) | 7) && s.memory.get64(base + 0x28 + 0x100) == 7 && s.memory.get64(base + 0x20 + 0x100) == 0x1000);      // the first thread
+  CHECK(s.memory.get64(base + 0x30 + 0x150) == ((uint64_t(2) << 20) | 7) && s.memory.get32(base + 0x38 + 0x150) == 9);      // the second: priority 8 + 1
+  CHECK(s.memory.get32(base + first) != 0 && s.memory.get64(base + first + 0x50) == 8 && s.memory.get64(base + first + 0x58) == 7);      // the child
+  const uint64_t name_at = s.memory.get64(base + 0x40);
+  CHECK(name_at == base + 0x100 + 2 * 0x50 && s.memory.bytes[name_at - kBase] == 'm' && s.memory.bytes[name_at - kBase + 1] == 0);
   // modules of process 7 (the id is the first 8 bytes of the buffer; 0 is this process)
   s.memory.put64(out, 0);
   CHECK(s.call(WindowsSyscallNumber::NtQuerySystemInformation, 0x80, out, 8 + 2 * 112, returned) == 0);
