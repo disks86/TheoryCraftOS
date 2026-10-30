@@ -1220,6 +1220,67 @@ void scene_geometry_instances(Rig& rig, ArrayView<uint32_t> out) {
   rig.read(target, out);
 }
 
+// Stream output (gs_streams.hlsl): a geometry shader with two streams of points writes, for each of the three vertices of a triangle, the position and colour (stream 0, 32 bytes a vertex) and a
+// vector made of both (stream 1, 16 bytes) into two buffers, with nothing drawn (stream -1). The picture is made from the buffers: a small square at the position of each record in stream 0, coloured
+// by the record of stream 1 (the vector 0.5 * q + 0.5), so a position that is turned over, a colour that is not the vertex's or a record that is in the wrong place shows.
+void scene_stream_output(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureStreamOutput | graphics::kFeatureGeometryShaders)) return void(rig.step("stream output", status::kNotSupported));
+  namespace b = conformance_blobs;
+  const Vertex v[3] = {{-0.5f, -0.5f, 0.5f, 1, 0, 0, 1}, {0.5f, -0.5f, 0.5f, 0, 1, 0, 1}, {0.0f, 0.5f, 0.5f, 0, 0, 1, 1}};
+  Handle vs = rig.vertex_shader(bytes_of(b::k_vs, sizeof b::k_vs));
+  Handle gs = rig.shader("create_shader (geometry)", ShaderKind::Dxbc, graphics::ShaderStage::Geometry, bytes_of(b::k_gs_streams, sizeof b::k_gs_streams));
+  Handle ps = rig.pixel_shader(bytes_of(b::k_ps_color, sizeof b::k_ps_color));
+  PipelineDesc pd = colour_pipeline_desc(vs, ps);
+  pd.varying_count = 3;
+  pd.geometry_shader = gs;
+  pd.stream_output_count = 3;
+  pd.stream_output[0] = {0, 0, 0, 4, 0}, pd.stream_output[1] = {0, 1, 0, 4, 0}, pd.stream_output[2] = {1, 4, 0, 4, 1};
+  pd.stream_output_stride[0] = 32, pd.stream_output_stride[1] = 16;
+  pd.rasterized_stream = -1;
+  Handle pipe = rig.pipeline(pd);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  AllocationDesc od;
+  od.flags = kAllocStreamOutput, od.size = 3 * 32;
+  Handle first = rig.create(od);
+  od.size = 3 * 16;
+  Handle second = rig.create(od);
+  CommandWriter w(rig.allocator());
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.set_stream_output(0, 2);
+  w.set_stream_output(1, 3);
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(3);
+  w.end_pass();
+  rig.render(w, {target, vb, first, second});
+  uint32_t f0[24], f1[12];
+  rig.read_words(first, ArrayView<uint32_t>(f0, 24));
+  rig.read_words(second, ArrayView<uint32_t>(f1, 12));
+  auto f = [](uint32_t bits) { return __builtin_bit_cast(float, bits); };
+  auto shade = [](float x) { return x < 0.0f ? 0.0f : x > 1.0f ? 1.0f : x; };
+  Vertex squares[18];
+  for (uint32_t i = 0; i < 3; ++i) {
+    const float x = f(f0[8 * i]), y = f(f0[8 * i + 1]), r = shade(f(f1[4 * i]) * 0.5f + 0.5f), g = shade(f(f1[4 * i + 1]) * 0.5f + 0.5f), bl = shade(f(f1[4 * i + 2]) * 0.5f + 0.5f);
+    const float h = 0.2f;
+    Vertex* q = squares + 6 * i;
+    q[0] = {x - h, y - h, 0.5f, r, g, bl, 1}, q[1] = {x + h, y - h, 0.5f, r, g, bl, 1}, q[2] = {x - h, y + h, 0.5f, r, g, bl, 1};
+    q[3] = q[2], q[4] = q[1], q[5] = {x + h, y + h, 0.5f, r, g, bl, 1};
+  }
+  Handle flat = d3d9_pipeline(rig, false, false);
+  Handle svb = rig.buffer(kAllocVertexBuffer, bytes_of(squares, sizeof squares));
+  CommandWriter w2(rig.allocator());
+  begin(w2, 0, kNoAllocation, {0, 0, 0, 1});
+  w2.bind_pipeline(flat);
+  w2.bind_vertex_buffer(1);
+  w2.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w2.draw(18);
+  w2.end_pass();
+  rig.render(w2, {target, svb});
+  rig.read(target, out);
+}
+
 // Primitives with adjacency: a triangle with the three vertices beside it (the shader draws the even ones, with some of the colour of the odd one after each), and a line with the vertex
 // before and after (the shader makes a quad of its four).
 void scene_geometry_adjacency(Rig& rig, ArrayView<uint32_t> out) {
@@ -1726,6 +1787,7 @@ const Entry kScenes[] = {
     {"Direct3D 10 geometry shader (DXBC)", scene_geometry_shader},
     {"Direct3D 11 instanced geometry (DXBC)", scene_geometry_instances},
     {"Direct3D 10 adjacency primitives (DXBC)", scene_geometry_adjacency},
+    {"Direct3D 11 stream output of two streams (DXBC)", scene_stream_output},
     {"Direct3D 11 tessellation, triangle domain (DXBC)", scene_tess_triangle, false, 6},
     {"Direct3D 11 tessellation, quad domain (DXBC)", scene_tess_quad, false, 6},
     {"Direct3D 11 tessellation, isolines and points (DXBC)", scene_tess_lines_points, true},

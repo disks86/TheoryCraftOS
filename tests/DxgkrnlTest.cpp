@@ -4617,6 +4617,18 @@ void test_conformance() {
       auto px = [&](uint32_t x, uint32_t y) { return r.device_picture[y * 32 + x]; };
       CHECK(px(0, 0) == 0xFF01FC00u && px(1, 0) == 0xFF02FC04u && px(8, 0) == (0xFF000000u | (8u << 16) | (0x34u << 8)));
     }
+    if (__builtin_strstr(r.name, "stream output of two streams")) {
+      // Squares at the three positions of stream 0 (the lower left and lower right and the top middle, +Y up as the shader had it), coloured by 0.5 * q + 0.5 of stream 1.
+      auto px = [&](uint32_t x, uint32_t y) { return r.device_picture[y * 32 + x] & 0xFFFFFF; };
+      auto near = [](uint32_t a, uint32_t b) {
+        for (uint32_t shift = 0; shift < 24; shift += 8) {
+          const int32_t d = static_cast<int32_t>((a >> shift) & 0xFF) - static_cast<int32_t>((b >> shift) & 0xFF);
+          if (d > 3 || d < -3) return false;
+        }
+        return true;
+      };
+      CHECK(near(px(8, 24), 0x7F00FF) && near(px(24, 24), 0xFF7FFF) && near(px(16, 8), 0x7FFFFF) && px(16, 24) == 0 && px(0, 0) == 0);
+    }
     if (__builtin_strstr(r.name, "adjacency primitives")) {
       // The triangle (left) and the quad (right) both drawn.
       uint32_t left = 0, right = 0;
