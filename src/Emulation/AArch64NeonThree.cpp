@@ -250,7 +250,7 @@ bool AArch64Cpu::neon_three_same(uint32_t insn, Step* result) {
     const Format f = sz ? Format::F64 : Format::F32;
     const uint32_t w = sz ? 64 : 32;
     if (!scalar && sz && !q) return bad();
-    const bool pairwise = u && (fop == 0x18 || fop == 0x1A && !a_bit || fop == 0x1E);
+    const bool pairwise = u && (fop == 0x18 || (fop == 0x1A && !a_bit) || fop == 0x1E);
     if (u && (fop == 0x19 || (fop == 0x1B && a_bit))) return bad();
     const uint32_t n = scalar ? 1 : (q ? 128 : 64) / w;
     for (uint32_t i = 0; i < n; ++i) {

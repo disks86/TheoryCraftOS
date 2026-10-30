@@ -42,7 +42,7 @@ bool AArch64Cpu::neon_three_different(uint32_t insn, Step* result) {
     *result = Step::Ok;
     return true;
   };
-  if (size == 3 || size == 0 && saturating_long) return bad();
+  if (size == 3 || (size == 0 && saturating_long)) return bad();
   if (narrowing_high) {      // the source elements are 2w bits wide, the result w
     if (scalar) return bad();
     const uint32_t w = 8u << size, n = 64 / w;
