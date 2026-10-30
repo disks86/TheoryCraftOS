@@ -940,6 +940,62 @@ void quad_pixels(Vertex* v, float x0, float y0, float x1, float y1, Coord coord)
   v[3] = at(x0, y1, 0, 1), v[4] = at(x1, y0, 1, 0), v[5] = at(x1, y1, 1, 1);
 }
 
+// The other queries: the occlusion predicate of a quad that shows and of one that is hidden, the vertices and primitives that draws took, and (only whether they are more than none, as a device
+// may reuse vertex results and shade helper pixels) the vertex shader and pixel shader runs. The picture is a stripe for each, as bright as its result.
+void scene_statistics_queries(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureOcclusionQueries | graphics::kFeatureStatisticsQueries)) return void(rig.step("statistics queries", status::kNotSupported));
+  auto quad = [](Vertex* v, float x0, float y0, float x1, float y1, float z, float r, float g, float b) {
+    v[0] = {x0, y0, z, r, g, b, 1}, v[1] = {x1, y0, z, r, g, b, 1}, v[2] = {x0, y1, z, r, g, b, 1};
+    v[3] = {x0, y1, z, r, g, b, 1}, v[4] = {x1, y0, z, r, g, b, 1}, v[5] = {x1, y1, z, r, g, b, 1};
+  };
+  Vertex v[24];
+  quad(v + 0, 0.0f, -1.0f, 1.0f, 1.0f, 0.2f, 0, 0, 0);
+  quad(v + 6, -1.0f, -1.0f, 0.0f, 0.0f, 0.5f, 0, 0, 0);
+  quad(v + 12, -0.5f, 0.0f, 0.5f, 1.0f, 0.5f, 0, 0, 0);
+  quad(v + 18, 0.25f, -1.0f, 0.75f, 0.0f, 0.5f, 0, 0, 0);
+  Handle pipe = d3d9_pipeline(rig, true, false);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle depth = rig.image(kAllocDepthStencil, Format::D32Float, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  AllocationDesc rd;
+  rd.flags = kAllocQueryResult, rd.size = 6 * 8;
+  Handle results = rig.create(rd);
+  CommandWriter w(rig.allocator());
+  begin(w, 0, 1, {0, 0, 0, 1});
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(2);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(6);
+  // (kind, first vertex, vertex count)
+  static const uint32_t kQueries[6][3] = {{1, 6, 6}, {1, 18, 6}, {2, 6, 12}, {3, 6, 18}, {4, 6, 6}, {5, 6, 6}};
+  for (uint32_t q = 0; q < 6; ++q) {
+    w.begin_query(3, q * 8, kQueries[q][0]);
+    w.draw(kQueries[q][2], kQueries[q][1]);
+    w.end_query();
+  }
+  w.end_pass();
+  rig.render(w, {target, depth, vb, results});
+  uint64_t counts[6];
+  for (uint32_t q = 0; q < 6; ++q) counts[q] = rig.read_u64(results, q);
+  Vertex s[36];
+  for (uint32_t q = 0; q < 6; ++q) {
+    const float value = q < 2 ? static_cast<float>(counts[q]) : q == 2 ? static_cast<float>(counts[q]) / 16.0f : q == 3 ? static_cast<float>(counts[q]) / 8.0f : counts[q] > 0 ? 1.0f : 0.0f;
+    const float x0 = (1.0f + 5.0f * static_cast<float>(q)) / 16.0f - 1.0f;
+    quad(s + q * 6, x0, -1.0f, x0 + 4.0f / 16.0f, 1.0f, 0.5f, value > 1.0f ? 1.0f : value, 0.25f, 0.25f);
+  }
+  Handle svb = rig.buffer(kAllocVertexBuffer, bytes_of(s, sizeof s));
+  Handle flat = d3d9_pipeline(rig, false, false);
+  CommandWriter w2(rig.allocator());
+  begin(w2, 0, kNoAllocation, {0, 0, 0, 1});
+  w2.bind_pipeline(flat);
+  w2.bind_vertex_buffer(1);
+  w2.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w2.draw(36);
+  w2.end_pass();
+  rig.render(w2, {target, svb});
+  rig.read(target, out);
+}
+
 void scene_texture_3d(Rig& rig, ArrayView<uint32_t> out) {
   if (!rig.has(graphics::kFeatureTextureKinds)) return void(rig.step("texture kinds", status::kNotSupported));
   namespace b = conformance_blobs;
@@ -1461,6 +1517,7 @@ const Entry kScenes[] = {
     {"Direct3D 10 half-float render target and texture", scene_half_float_target},
     {"Direct3D 10 float render target and texture", scene_float_target},
     {"Direct3D 10 occlusion queries", scene_occlusion_query},
+    {"Direct3D 10 occlusion predicate and pipeline statistics", scene_statistics_queries},
     {"Direct3D 10 volume texture (DXBC)", scene_texture_3d},
     {"Direct3D 10 texture array (DXBC)", scene_texture_array},
     {"Direct3D 10 cube texture (DXBC)", scene_texture_cube},

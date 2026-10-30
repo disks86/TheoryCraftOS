@@ -4361,6 +4361,11 @@ void test_conformance() {
       }
       if (__builtin_strstr(r.name, "integer render")) CHECK(px(16, 4) == 0xFF3380CC && px(0, 0) == 0xFF14283C);   // (51, 128, 204 = 255 * the colour, and the cleared (20, 40, 60))
     }
+    if (__builtin_strstr(r.name, "occlusion predicate and pipeline")) {
+      // Stripes of 4 pixels from x = 1: predicate 1 (full red), predicate 0 (0.25 of the red is the base: 0), 12 of 16 vertices (0.75), 6 of 8 primitives (0.75), both runs counted (1).
+      auto red = [&](uint32_t stripe) { return (r.device_picture[16 * 32 + 1 + 5 * stripe + 1] >> 16) & 0xFF; };
+      CHECK(red(0) == 255 && red(1) == 0 && red(2) >= 190 && red(2) <= 192 && red(3) >= 190 && red(3) <= 192 && red(4) == 255 && red(5) == 255);
+    }
     if (__builtin_strstr(r.name, "of every width") || __builtin_strstr(r.name, "10-bit normalised")) {
       // The colour of the triangle of each quarter, as the format keeps it (integers: colour * 255 (- 100); the 10-bit alpha of 0.7 is 2/3, of 0.3 1/3).
       auto tri = [&](uint32_t q) { return r.device_picture[((q >> 1) * 16 + 8) * 32 + (q & 1) * 16 + 8]; };

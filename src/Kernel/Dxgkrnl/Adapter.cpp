@@ -224,7 +224,10 @@ class Adapter::StreamRunner {
 
   NtStatus begin_query(ByteReader& p) {
     const uint32_t index = p.le32(), offset = p.le32();
+    uint32_t kind = 0;
+    if (!p.at_end()) kind = p.le32();
     if (!exact(p) || !in_pass_ || query_open_ || !(adapter_.caps_.features & graphics::kFeatureOcclusionQueries)) return kBad;
+    if (kind > static_cast<uint32_t>(graphics::QueryKind::PsInvocations) || (kind != 0 && !(adapter_.caps_.features & graphics::kFeatureStatisticsQueries))) return kBad;
     Allocation* a = alloc(index);
     if (!a || !a->is_query_result() || offset % 8 || offset > a->desc().size - 8) return kBad;
     if (queries_in_stream_ >= graphics::kMaxOcclusionQueries) return kBad;
@@ -234,7 +237,7 @@ class Adapter::StreamRunner {
     const NtStatus s = ensure_cb();
     if (s != status::kSuccess) return s;
     if (!pending_.push_back({a, offset, next_slot_})) return status::kNoMemory;
-    cb_->begin_occlusion_query(next_slot_++);
+    cb_->begin_query(next_slot_++, static_cast<graphics::QueryKind>(kind));
     return status::kSuccess;
   }
 

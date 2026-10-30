@@ -551,6 +551,7 @@ struct DrawState {
   uint32_t primitive_id = 0;   // the primitive of the draw being rasterized (SV_PrimitiveID)
   uint32_t sample_count = 1;   // samples per pixel of the pass's images
   uint64_t* samples = nullptr; // the open occlusion query's count: one more for every fragment that passes the stencil and depth tests
+  uint64_t* ps_invocations = nullptr;   // one more for every run of the fragment shader (a statistics query)
 };
 
 float read_float(ConstByteView bytes, uint64_t offset) {
@@ -721,6 +722,7 @@ void write_fragment(const DrawState& s, int32_t x, int32_t y, float z, bool dept
 
 // Runs the pipeline's fragment shader; false if it discarded the pixel.
 bool run_fragment_shader(const DrawState& s, const Vec4* varying, const FragmentContext& context, Vec4* color) {
+  if (s.ps_invocations) ++*s.ps_invocations;
   if (s.pipeline->fragment_ex()) return s.pipeline->fragment_ex()(varying, context, s.constants, s.textures, color);
   if (s.pipeline->textured()) return s.pipeline->textured()(varying, s.constants, s.textures, color);
   return s.pipeline->fragment()(varying, s.constants, color);
@@ -1234,6 +1236,8 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
   ByteView storage[kMaxStorageBuffers];
   uint64_t query_samples = 0;
   uint32_t query_slot = 0;
+  QueryKind query_kind = QueryKind::Occlusion;
+  uint64_t stat_ia_vertices = 0, stat_ia_primitives = 0, stat_vs = 0, stat_ps = 0;   // (what the draws since the query began did)
   bool query_open = false;
   IBuffer* vertex_buffer = nullptr;
   uint64_t vertex_offset = 0;
@@ -1366,16 +1370,21 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
       }
       case RecordedCommand::Type::BeginQuery:
         if (!in_pass || query_open) return false;
+        if (cmd.count > static_cast<uint32_t>(QueryKind::PsInvocations)) return false;
         query_open = true;
         query_slot = cmd.unit;
-        query_samples = 0;
+        query_kind = static_cast<QueryKind>(cmd.count);
+        query_samples = stat_ia_vertices = stat_ia_primitives = stat_vs = stat_ps = 0;
         s.samples = &query_samples;
+        s.ps_invocations = &stat_ps;
         break;
       case RecordedCommand::Type::EndQuery:
         if (!query_open) return false;
         query_open = false;
         s.samples = nullptr;
-        recorder.set_occlusion_result(query_slot, query_samples);
+        s.ps_invocations = nullptr;
+        recorder.set_occlusion_result(query_slot, query_kind == QueryKind::Occlusion ? query_samples : query_kind == QueryKind::OcclusionPredicate ? (query_samples ? 1u : 0u) : query_kind == QueryKind::IaVertices ? stat_ia_vertices
+                                                                                                                              : query_kind == QueryKind::IaPrimitives ? stat_ia_primitives : query_kind == QueryKind::VsInvocations ? stat_vs : stat_ps);
         break;
       case RecordedCommand::Type::BindPipeline:
         s.pipeline = static_cast<const SoftwarePipeline*>(cmd.pipeline);
@@ -1459,6 +1468,7 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
           VertexContext context;
           context.vertex_id = static_cast<uint32_t>(v);
           context.instance_id = cmd.first_instance + instance;
+          ++stat_vs;
           *out = run_vertex_shader(*s.pipeline, vertices, byte, instance_byte, s.constants, context);
           return true;
         };
@@ -1477,6 +1487,8 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
           const GeometryPrimitive taken = geometry->desc().geometry_input;
           if (taken != (per_primitive == 3 ? GeometryPrimitive::Triangle : per_primitive == 2 ? GeometryPrimitive::Line : GeometryPrimitive::Point)) return false;
         }
+        stat_ia_vertices += uint64_t{cmd.count} * instances;
+        stat_ia_primitives += uint64_t{cmd.count / per_primitive} * instances;
         // (the tessellator's room is taken once for the draw)
         TessellatorHolder tessellator(allocator_, patches);
         if (patches && !tessellator.valid()) return false;

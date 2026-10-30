@@ -899,13 +899,18 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         break;
       }
       case RecordedCommand::Type::BeginQuery: {
-        if (!in_pass || queries.open != kMaxOcclusionQueries || cmd.unit >= kMaxOcclusionQueries || queries.used[cmd.unit]) return false;
+        if (!in_pass || queries.open != kMaxOcclusionQueries || cmd.unit >= kMaxOcclusionQueries || queries.used[cmd.unit] || cmd.count > static_cast<uint32_t>(QueryKind::PsInvocations)) return false;
         queries.results[cmd.unit] = make<VirglBuffer>(gpu_.allocator(), *this, 16, 0, virgl::kBindCustom);
         if (!queries.results[cmd.unit] || !queries.results[cmd.unit]->valid()) return false;
         const uint32_t handle = new_handle();
         stream.command(virgl::kCreateObject, virgl::kObjectQuery, 4);
         stream.put(handle);
-        stream.put(virgl::kQueryOcclusionCounter);
+        {
+          const QueryKind kind = static_cast<QueryKind>(cmd.count);
+          stream.put(kind == QueryKind::Occlusion ? virgl::kQueryOcclusionCounter
+                     : kind == QueryKind::OcclusionPredicate ? virgl::kQueryOcclusionPredicate
+                                                             : virgl::kQueryPipelineStatistics | ((kind == QueryKind::IaVertices ? 0u : kind == QueryKind::IaPrimitives ? 1u : kind == QueryKind::VsInvocations ? 2u : 7u) << 16));
+        }
         stream.put(0);
         stream.put(queries.results[cmd.unit]->id());
         stream.command(virgl::kBeginQuery, 0, 1);

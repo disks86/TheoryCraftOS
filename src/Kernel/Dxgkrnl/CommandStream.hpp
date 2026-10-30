@@ -36,7 +36,8 @@
 //   DrawIndexed      index_count, first_index, vertex_offset (signed)
 //   CopyRegion       dst_index, dst_x, dst_y, src_index, src_x, src_y, width, height   (colour images of one format; also staging memory)
 //   GenerateMipmaps  allocation_index
-//   BeginQuery       allocation_index, offset   (an occlusion query, the adapter's kFeatureOcclusionQueries: inside a pass; the allocation is a kAllocQueryResult buffer and `offset` a multiple of 8
+//   BeginQuery       allocation_index, offset [, kind]   (kind: a graphics::QueryKind, 0 occlusion count if left out, 1 occlusion predicate, 2 IA vertices, 3 IA primitives, 4 VS invocations, 5 PS invocations;
+//                    the others need kFeatureStatisticsQueries. An occlusion query, the adapter's kFeatureOcclusionQueries: inside a pass; the allocation is a kAllocQueryResult buffer and `offset` a multiple of 8
 //                    with 8 bytes room. One query is open at a time and it ends before the pass does; at most kMaxOcclusionQueries per stream)
 //   BindUav          slot, allocation_index, offset, size   (a storage buffer for compute shaders, outside a pass: slot below kMaxStorageBuffers, a kAllocUnorderedAccess buffer, offset and size multiples of 4)
 //   Dispatch         groups_x, groups_y, groups_z   (outside a pass, with a compute pipeline bound by BindPipeline and every storage slot its shader uses bound; each count at most kMaxDispatchGroups)
@@ -140,7 +141,11 @@ class CommandWriter {
     packet(Op::CopyRegion, {dst, dst_x, dst_y, src, src_x, src_y, width, height});
   }
   void generate_mipmaps(uint32_t allocation) { packet(Op::GenerateMipmaps, {allocation}); }
-  void begin_query(uint32_t allocation, uint32_t offset = 0) { packet(Op::BeginQuery, {allocation, offset}); }
+  // `kind`: a graphics::QueryKind (0, the occlusion count, when it is left out: the packet then has two words)
+  void begin_query(uint32_t allocation, uint32_t offset = 0, uint32_t kind = 0) {
+    if (kind == 0) packet(Op::BeginQuery, {allocation, offset});
+    else packet(Op::BeginQuery, {allocation, offset, kind});
+  }
   void end_query() { packet(Op::EndQuery, {}); }
   void bind_uav(uint32_t slot, uint32_t allocation, uint32_t offset, uint32_t size) { packet(Op::BindUav, {slot, allocation, offset, size}); }
   void dispatch(uint32_t x, uint32_t y = 1, uint32_t z = 1) { packet(Op::Dispatch, {x, y, z}); }
