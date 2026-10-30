@@ -92,6 +92,8 @@ static BOOL con_std_is_console(HANDLE h) {
   for (int i = 0; i < 3; ++i) if (h == GetStdHandle(i == 0 ? STD_INPUT_HANDLE : i == 1 ? STD_OUTPUT_HANDLE : STD_ERROR_HANDLE)) { g_con_cache[i].h = h; g_con_cache[i].console = type == 0x50; return type == 0x50; }
   return type == 0x50;
 }
+/* The standard output of a console (the same handle as CONOUT$) is not something to read from. */
+static BOOL con_is_output_only(HANDLE h) { return h && h == GetStdHandle(STD_OUTPUT_HANDLE) && h != GetStdHandle(STD_INPUT_HANDLE) && con_std_is_console(h); }
 static BOOL con_is_input(HANDLE h) { return h && h == GetStdHandle(STD_INPUT_HANDLE) && con_std_is_console(h); }
 static BOOL con_buffer_alive(HANDLE h) { return SetEvent(h) || GetLastError() != ERROR_INVALID_HANDLE; }
 /* The screen buffer a handle writes to (the lock is held), or NULL. */
@@ -464,9 +466,17 @@ EXPORT BOOL WINAPI GetNumberOfConsoleInputEvents(HANDLE h, LPDWORD count) {
   return TRUE;
 }
 EXPORT BOOL WINAPI WriteConsoleInputW(HANDLE h, const INPUT_RECORD_ *in, DWORD length, LPDWORD written) {
+  if (!written) { set_error(12); return FALSE; }
+  if (!h && length && !in) { set_error(ERROR_NOACCESS); return FALSE; }
   if (!con_is_input(h)) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
+  if (length && !in) { set_error(ERROR_NOACCESS); return FALSE; }
   DWORD n = 0;
   con_lock();
+  /* a single mouse-move record written behind a queued mouse-move record replaces it */
+  if (length == 1 && in[0].EventType == 2 && g_inject_count > 0 && in[0].Event.raw[12] == 1) {
+    INPUT_RECORD_ *last = &g_injected[(g_inject_head + g_inject_count - 1) % CON_INJECT_MAX];
+    if (last->EventType == 2 && last->Event.raw[12] == 1) { *last = in[0]; con_unlock(); if (written) *written = 1; return TRUE; }
+  }
   for (; n < length && g_inject_count < CON_INJECT_MAX; ++n) g_injected[(g_inject_head + g_inject_count++) % CON_INJECT_MAX] = in[n];
   con_unlock();
   if (written) *written = n;
@@ -513,6 +523,8 @@ static BOOL con_read_text(char *out, DWORD capacity, DWORD *got) {
 }
 EXPORT BOOL WINAPI ReadConsoleA(HANDLE h, LPVOID buffer, DWORD length, LPDWORD read, LPVOID control) {
   (void)control;
+  if (con_is_output_only(h)) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
+  if (length > 0x7FFFFFFFu) { set_error(ERROR_NOACCESS); return FALSE; }
   if (read) *read = 0;
   if (!con_is_input(h)) {      /* (a redirected input is read as it is) */
     DWORD got = 0;
@@ -528,6 +540,7 @@ EXPORT BOOL WINAPI ReadConsoleA(HANDLE h, LPVOID buffer, DWORD length, LPDWORD r
 EXPORT BOOL WINAPI ReadConsoleW(HANDLE h, LPVOID buffer, DWORD length, LPDWORD read, LPVOID control) {
   char utf8[1024];
   DWORD got = 0;
+  if (length > 0x7FFFFFFFu) { set_error(ERROR_NOACCESS); return FALSE; }
   if (read) *read = 0;
   if (!ReadConsoleA(h, utf8, length < 340 ? length * 3 : 1020, &got, control)) return FALSE;
   const int units = got ? MultiByteToWideChar(CP_UTF8, 0, utf8, (int)got, buffer, (int)length) : 0;
@@ -603,6 +616,7 @@ EXPORT BOOL WINAPI GenerateConsoleCtrlEvent(DWORD event, DWORD group) {
   return TRUE;
 }
 EXPORT DWORD WINAPI GetConsoleTitleW(LPWSTR title, DWORD size) {
+  if (size == 0) return 0;
   con_lock();
   const DWORD n = (DWORD)wcslen(g_con_title);
   if (size > 0) { const DWORD k = n < size - 1 ? n : size - 1; memcpy(title, g_con_title, (size_t_)k * 2); title[k] = 0; }
@@ -611,6 +625,7 @@ EXPORT DWORD WINAPI GetConsoleTitleW(LPWSTR title, DWORD size) {
 }
 EXPORT DWORD WINAPI GetConsoleTitleA(LPSTR title, DWORD size) {
   WCHAR wide[260];
+  if (size == 0) return 0;
   const DWORD n = GetConsoleTitleW(wide, 260);
   if (size > 0) { const DWORD k = n < size - 1 ? n : size - 1; for (DWORD i = 0; i < k; ++i) title[i] = (char)wide[i]; title[k] = 0; }
   return n;
