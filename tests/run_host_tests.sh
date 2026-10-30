@@ -133,7 +133,7 @@ for t in "${WANTED[@]}"; do
     SheetTest) build_and_run SheetTest tests/SheetTest.cpp tests/KernelStubs.cpp src/Spreadsheet/Sheet.cpp src/Math/FloatMath.cpp ;;
     AmlTest) build_and_run AmlTest tests/AmlTest.cpp tests/KernelStubs.cpp src/Hardware/Acpi/AmlInterpreter.cpp src/Hardware/Acpi/EmbeddedController.cpp src/Hardware/Acpi/AcpiTables.cpp src/Hardware/Battery/AcpiBattery.cpp ;;
     IoApicTest) build_and_run IoApicTest tests/IoApicTest.cpp tests/KernelStubs.cpp src/Hardware/Acpi/IoApic.cpp ;;
-    AcpiEventsTest) build_and_run AcpiEventsTest tests/AcpiEventsTest.cpp tests/KernelStubs.cpp src/Hardware/Backlight/AcpiBacklight.cpp src/Hardware/Backlight/IntelPchBacklight.cpp src/Hardware/Acpi/AmlInterpreter.cpp src/Hardware/Acpi/AcpiEvents.cpp src/Hardware/Acpi/AcpiTables.cpp ;;
+    AcpiEventsTest) build_and_run AcpiEventsTest tests/AcpiEventsTest.cpp tests/KernelStubs.cpp src/Hardware/Backlight/AcpiBacklight.cpp src/Hardware/Backlight/IntelPchBacklight.cpp src/Hardware/Acpi/DellWmiHotkeys.cpp src/Hardware/Keyboard/KeyCodes.cpp src/Hardware/Acpi/AmlInterpreter.cpp src/Hardware/Acpi/AcpiEvents.cpp src/Hardware/Acpi/AcpiTables.cpp ;;
     ClipboardTest) build_and_run ClipboardTest tests/ClipboardTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Kernel/Clipboard.cpp ;;
     StringTest) build_and_run StringTest tests/StringTest.cpp ;;
     RegexTest) build_and_run RegexTest tests/RegexTest.cpp src/Regex/Regex.cpp ;;
@@ -339,7 +339,7 @@ for t in "${WANTED[@]}"; do
     InputHotplugTest) build_and_run InputHotplugTest tests/InputHotplugTest.cpp tests/UsbAudioStubs.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Kernel/Paging.cpp \
                         src/Hardware/MmioMapper.cpp src/Hardware/Bus/Pci/PciBar.cpp src/Hardware/Bus/Virtio/VirtioPciDevice.cpp src/Hardware/Bus/Virtio/Virtqueue.cpp src/Hardware/Bus/Virtio/VirtioInputDevice.cpp \
                         src/Hardware/SystemInput.cpp tests/HypervisorStubs.cpp src/Hardware/Bus/Ps2/*.cpp src/Hardware/Keyboard/*.cpp src/Hardware/Keyboard/*/*.cpp src/Hardware/Mouse/*.cpp src/Hardware/Mouse/*/*.cpp \
-                        src/Hardware/Bus/Usb/Hid/*.cpp src/Hardware/Bus/I2c/*.cpp src/Hardware/Acpi/AcpiResources.cpp src/Hardware/Acpi/AcpiTables.cpp src/Hardware/Acpi/AmlInterpreter.cpp \
+                        src/Hardware/Bus/Usb/Hid/*.cpp src/Hardware/Hid/*.cpp src/Hardware/Bus/I2c/*.cpp src/Hardware/Acpi/AcpiResources.cpp src/Hardware/Acpi/AcpiTables.cpp src/Hardware/Acpi/AmlInterpreter.cpp \
                         src/Hardware/StorageDevice/StorageDeviceBase.cpp src/Hardware/StorageDevice/SystemStorageDevices.cpp src/Hardware/StorageDevice/*/*.cpp \
                         src/FileSystem/FileSystemTypes.cpp ;;
     StreamTest) build_and_run StreamTest tests/StreamTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Stream/StreamStatus.cpp src/Async/Executor.cpp \
@@ -421,7 +421,7 @@ for t in "${WANTED[@]}"; do
         -o "$out/InputHotplugThreadTest" tests/InputHotplugThreadTest.cpp tests/HostThreads.cpp tests/UsbAudioStubs.cpp src/Kernel/Paging.cpp \
         src/Hardware/MmioMapper.cpp src/Hardware/Bus/Pci/PciBar.cpp src/Hardware/Bus/Virtio/VirtioPciDevice.cpp src/Hardware/Bus/Virtio/Virtqueue.cpp src/Hardware/Bus/Virtio/VirtioInputDevice.cpp \
         src/Hardware/SystemInput.cpp tests/HypervisorStubs.cpp src/Hardware/Bus/Ps2/*.cpp src/Hardware/Keyboard/*.cpp src/Hardware/Keyboard/*/*.cpp src/Hardware/Mouse/*.cpp src/Hardware/Mouse/*/*.cpp \
-        src/Hardware/Bus/Usb/Hid/*.cpp src/Hardware/Bus/I2c/*.cpp src/Hardware/Acpi/AcpiResources.cpp src/Hardware/Acpi/AcpiTables.cpp src/Hardware/Acpi/AmlInterpreter.cpp
+        src/Hardware/Bus/Usb/Hid/*.cpp src/Hardware/Hid/*.cpp src/Hardware/Bus/I2c/*.cpp src/Hardware/Acpi/AcpiResources.cpp src/Hardware/Acpi/AcpiTables.cpp src/Hardware/Acpi/AmlInterpreter.cpp
       "$out/InputHotplugThreadTest" ;;
     AudioHotplugThreadTest)  # real threads, checked with ThreadSanitizer
       echo "== AudioHotplugThreadTest"

@@ -25,6 +25,7 @@
 #include "Hardware/InputSource.hpp"
 #include "Hardware/Keyboard/CompositeKeyboard.hpp"
 #include "Hardware/Keyboard/Ps2/Ps2Keyboard.hpp"
+#include "Hardware/Keyboard/Usb/UsbHidConsumer.hpp"
 #include "Hardware/Keyboard/Usb/UsbHidKeyboard.hpp"
 #include "Hardware/Mouse/CompositeMouse.hpp"
 #include "Hardware/Mouse/Ps2/Ps2Mouse.hpp"
@@ -132,6 +133,7 @@ class SystemInput {
   List<UniquePointer<IHardware>> owned_;  // the allocator-backed devices, freed with the list
   UsbPortWatcher watcher_;
   UsbHidKeyboard* usb_keyboards_[CompositeKeyboard::kMaxKeyboards] = {};   // the USB devices among them, to find those that left
+  UsbHidConsumer* usb_consumers_[CompositeKeyboard::kMaxKeyboards] = {};
   UsbHidMouse* usb_mice_[CompositeMouse::kMaxMice] = {};
   IInputDeviceSource* sources_[kMaxSources] = {};
   Notifier notifier_ = nullptr;
