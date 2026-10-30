@@ -116,6 +116,15 @@ NtStatus VidMm::create(const AllocationDesc& desc, SharedPointer<Allocation>* ou
     if (desc.mip_levels > 1 && (desc.flags & ~(kAllocTexture | kAllocShared))) return status::kInvalidParameter;
     uint64_t total = 0;
     image_bytes(desc.width, desc.height, desc.mip_levels, pixel_bytes(desc.format), &total);
+    if (desc.samples != 1) {
+      // (a multisampled target: the device keeps the samples, the system keeps nothing)
+      const graphics::DeviceInfo info = device_.info();
+      if (!(info.features & graphics::kFeatureMultisample) || desc.samples >= 32 || !(info.sample_counts >> desc.samples & 1)) return status::kNotSupported;
+      if (desc.flags != (depth_flag ? kAllocDepthStencil : kAllocRenderTarget) || desc.mip_levels != 1 || desc.kind != graphics::TextureKind::Texture2D || desc.layers != 1 || dxgk::is_float(desc.format))
+        return status::kInvalidParameter;
+      device_bytes = uint64_t{desc.width} * desc.height * desc.samples * (depth_flag ? (desc.format == Format::D24S8 ? 5 : 4) : 4);
+      goto sized;
+    }
     if (desc.kind != graphics::TextureKind::Texture2D) {
       // (a volume, array or cube: sampled only, one level, 8-bit colour)
       if ((desc.flags & ~(kAllocTexture | kAllocShared)) || !(desc.flags & kAllocTexture) || desc.mip_levels != 1 || depth_flag || dxgk::is_float(desc.format)) return status::kInvalidParameter;
@@ -132,6 +141,7 @@ NtStatus VidMm::create(const AllocationDesc& desc, SharedPointer<Allocation>* ou
       device_bytes = desc.flags & kAllocStaging ? 0 : total;
     }
   }
+sized:
   if (cpu_bytes > system_limit_ || system_bytes_ > system_limit_ - cpu_bytes) return status::kGraphicsNoVideoMemory;
 
   SharedPointer<Allocation> a = SharedPointer<Allocation>::make(allocator_, *this, allocator_, desc, next_id_);
@@ -182,6 +192,7 @@ bool VidMm::create_device_object(Allocation& a) {
   id.mip_levels = d.mip_levels;
   id.kind = d.kind;
   id.layers = d.layers;
+  id.samples = d.samples;
   if (a.is_depth()) {
     id.format = graphics::Format::D32Float;
     id.usage = graphics::kImageDepthAttachment;
@@ -217,6 +228,10 @@ bool VidMm::upload(Allocation& a) {
     return true;
   }
   if (!a.image_) return false;
+  if (a.desc_.samples != 1) {
+    a.device_stale_ = false;   // (a multisampled target has no pixels of the CPU's to upload)
+    return true;
+  }
   if (a.is_depth()) {
     a.device_stale_ = false;   // (nothing to upload: the contents of a depth buffer start undefined)
     return true;
@@ -294,7 +309,7 @@ bool VidMm::read_back(Allocation& a) {
     a.gpu_newer_ = false;
     return true;
   }
-  if (!a.image_ || a.is_depth()) {
+  if (!a.image_ || a.is_depth() || a.desc_.samples != 1) {   // (a multisampled image comes back as the resolved one)
     a.gpu_newer_ = false;
     return true;
   }

@@ -19,8 +19,7 @@
 
 // The register level of an Intel Wireless-AC 9000 series card on PCI Express, after iwlwifi's pcie/trans.c and iwl-csr.h: taking ownership of the hardware ("prepare card"), waking
 // the MAC (INIT_DONE, the clock ready), the access to the device's internal peripheral registers and memory through the HBUS window (which needs the MAC awake), the basic
-// functions of the adapter (APM) and stopping them. Nothing here loads firmware or touches the DMA queues yet: that is the next layer (the context information, the command and
-// receive queues). The registers are the 4 KiB window of BAR 0; a test supplies a model.
+// functions of the adapter (APM) and stopping them. Loading firmware is IwlFwLoad, the DMA queues come after. The registers are the 4 KiB window of BAR 0; a test supplies a model.
 #pragma once
 #include <stdint.h>
 #include "Hardware/Mmio.hpp"
@@ -95,6 +94,8 @@ class IwlPcieDevice {
   void read_mem(uint32_t address, uint32_t* out, uint32_t dwords);
   void write_mem(uint32_t address, const uint32_t* data, uint32_t dwords);
 
+  uint32_t read32(uint32_t offset) { return regs_.read32(offset); }
+  void write32(uint32_t offset, uint32_t value) { regs_.write32(offset, value); }
   void set_bit(uint32_t offset, uint32_t bits) { regs_.write32(offset, regs_.read32(offset) | bits); }
   void clear_bit(uint32_t offset, uint32_t bits) { regs_.write32(offset, regs_.read32(offset) & ~bits); }
   // Reads until (value & mask) == (bits & mask), at most `timeout_us` microseconds (10 us apart).

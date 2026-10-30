@@ -143,6 +143,14 @@ X86_64Cpu::Step X86_64Cpu::step_vex(GuestMemory& m, uint8_t first) {
       return vex_simd(m, op, 0, wide, vvvv);
     }
     case 2: return vex_map2(m, op, d_.rex_w, vvvv);
+    case 7: {      // urdmsr r64, imm32 (F2) and uwrmsr imm32, r64 (F3): VEX.128.W0.MAP7 F8 /0
+      if (op != 0xF8 || (pp != 2 && pp != 3) || d_.rex_w || wide || vvvv != 0) return fail(6);
+      if (!decode_modrm()) return bad_decode();
+      const uint32_t index = static_cast<uint32_t>(next_imm(4, false));
+      if (!finish_decode()) return bad_decode();
+      if (d_.mod != 3 || (d_.reg & 7) != 0) return fail(6);
+      return user_msr_instruction(pp == 2, true, index);
+    }
     case 8: case 9: case 10: return first == 0x8F ? xop_instruction(m, map, op, vvvv) : fail(6);
     case 3:
       if (op >= 0x30 && op <= 0x33) return kmask_instruction(m, 3, op, d_.rex_w, vvvv);
@@ -1275,10 +1283,12 @@ X86_64Cpu::Step X86_64Cpu::xsave_family(GuestMemory& m, uint32_t kind) {
       restored.threshold = static_cast<uint32_t>(get(32, 4)); restored.random_bits = static_cast<uint32_t>(get(36, 4)); restored.head = static_cast<uint32_t>(get(40, 4));
       restored.filters = static_cast<uint32_t>(get(44, 4)); restored.base_ip = get(48, 8); restored.limit_ip = get(56, 8);
       for (uint32_t id = 1; id <= 6; ++id) { restored.counter[id] = static_cast<int32_t>(get(64 + 8 * (id - 1), 4)); restored.interval[id] = static_cast<int32_t>(get(68 + 8 * (id - 1), 4)); }
-      if (restored.cb != 0 && (restored.buffer_size % 32 != 0 || restored.buffer_size < 32 * 32 || restored.head >= restored.buffer_size || (restored.flags & ~0xE000006Eu))) return fail(13);
+      if (restored.cb != 0 && (restored.buffer_size % 32 != 0 || restored.buffer_size < 32 * 32 || restored.head >= restored.buffer_size || (restored.flags & ~0xE000007Eu))) return fail(13);
       if (restored.cb == 0) restored = Lwp();
     }
     lwp_ = restored;
+    dcache_on_ = lwp_.cb != 0 && (lwp_.flags & 0x10);
+    dcache_ = Dcache();
   }
   if (features & 0x80000) {
     for (uint32_t i = 0; i < 16; ++i) s_.r[16 + i] = 0;

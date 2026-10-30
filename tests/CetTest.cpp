@@ -329,6 +329,74 @@ static void test_far_and_tokens() {
   }
 }
 
+static void test_user_msr() {
+  auto imm = [](uint32_t v) { return Bytes{uint8_t(v), uint8_t(v >> 8), uint8_t(v >> 16), uint8_t(v >> 24)}; };
+  auto cat = [](Bytes a, const Bytes& b) { a.insert(a.end(), b.begin(), b.end()); return a; };
+  {      // the register forms: urdmsr rax <- MSR[rcx], uwrmsr MSR[rcx] <- rax
+    Machine r({0xF2, 0x48, 0x0F, 0x38, 0xF8, 0xC8});
+    r.cpu.set_user_msr(0x1234, 0xAABBCCDD11223344ull, false);
+    st(r).r[1] = 0x1234;
+    CHECK(r.finished() && st(r).r[0] == 0xAABBCCDD11223344ull);
+    Machine w({0xF3, 0x48, 0x0F, 0x38, 0xF8, 0xC8});
+    w.cpu.set_user_msr(0x1234, 0, true);
+    st(w).r[1] = 0x1234;
+    st(w).r[0] = 0x5566;
+    CHECK(w.finished());
+    uint64_t value = 0;
+    CHECK(w.cpu.user_msr(0x1234, &value) && value == 0x5566);
+    Machine ro({0xF3, 0x48, 0x0F, 0x38, 0xF8, 0xC8});
+    ro.cpu.set_user_msr(0x1234, 7, false);
+    st(ro).r[1] = 0x1234;
+    CHECK(ro.faulted(13));
+    Machine none({0xF2, 0x48, 0x0F, 0x38, 0xF8, 0xC8});
+    st(none).r[1] = 0x1234;
+    CHECK(none.faulted(13));
+    Machine big({0xF2, 0x48, 0x0F, 0x38, 0xF8, 0xC8});
+    big.cpu.set_user_msr(0x34, 1, false);
+    st(big).r[1] = 0x100000034ull;      // (bits above 31 are not ignored)
+    CHECK(big.faulted(13));
+    Machine w0({0xF2, 0x0F, 0x38, 0xF8, 0xC8});      // without REX.W
+    w0.cpu.set_user_msr(0, 0, false);
+    CHECK(w0.faulted(6));
+  }
+  {      // the immediate forms in VEX map 7, and the EVEX ones with r20
+    Machine r(cat({0xC4, 0xE7, 0x7B, 0xF8, 0xC0}, imm(0x4000)));
+    r.cpu.set_user_msr(0x4000, 0x99, false);
+    CHECK(r.finished() && st(r).r[0] == 0x99);
+    Machine w(cat({0xC4, 0xE7, 0x7A, 0xF8, 0xC0}, imm(0x4000)));
+    w.cpu.set_user_msr(0x4000, 0, true);
+    st(w).r[0] = 0x77;
+    uint64_t value = 0;
+    CHECK(w.finished() && w.cpu.user_msr(0x4000, &value) && value == 0x77);
+    Machine er(cat({0x62, 0xFF, 0x7F, 0x08, 0xF8, 0xC4}, imm(0x4000)));
+    er.cpu.set_user_msr(0x4000, 0x1234, false);
+    CHECK(er.finished() && st(er).r[20] == 0x1234);
+    Machine ew(cat({0x62, 0xFF, 0x7E, 0x08, 0xF8, 0xC4}, imm(0x4000)));
+    ew.cpu.set_user_msr(0x4000, 0, true);
+    st(ew).r[20] = 0x4321;
+    CHECK(ew.finished() && ew.cpu.user_msr(0x4000, &value) && value == 0x4321);
+    Machine bad(cat({0xC4, 0xE7, 0x7B, 0xF8, 0xC8}, imm(1)));      // /1 is reserved
+    bad.cpu.set_user_msr(1, 0, false);
+    CHECK(bad.faulted(6));
+    Machine un(cat({0xC4, 0xE7, 0x7B, 0xF8, 0xC0}, imm(0x4001)));
+    CHECK(un.faulted(13));
+    Machine apx(cat({0x62, 0xF4, 0x7F, 0x08, 0xF8, 0xC0}, Bytes{}));      // (the register form with REX.W clear in map 4 needs W: #UD)
+    CHECK(apx.faulted(6));
+    Machine m4({0x62, 0xF4, 0xFF, 0x08, 0xF8, 0xC8});      // the map 4 form (F2, W1): urdmsr rax, rcx
+    m4.cpu.set_user_msr(0x55, 0xABCD, false);
+    st(m4).r[1] = 0x55;
+    CHECK(m4.finished() && st(m4).r[0] == 0xABCD);
+  }
+  {      // the table fills up; the cpuid bit is set
+    Machine m({0x90});
+    for (uint32_t i = 0; i < 16; ++i) CHECK(m.cpu.set_user_msr(i, i, false));
+    CHECK(!m.cpu.set_user_msr(99, 0, false));
+    CHECK(m.cpu.set_user_msr(3, 33, true));      // (an existing entry is updated)
+    Machine id({0xB8, 7, 0, 0, 0, 0xB9, 1, 0, 0, 0, 0x0F, 0xA2});
+    CHECK(id.finished() && ((st(id).r[2] >> 15) & 1));
+  }
+}
+
 // Every prefix and every single-bit flip of the encodings: whatever happens, it must happen safely.
 static void test_malformed() {
   Bytes all;
@@ -358,6 +426,7 @@ int main() {
   test_wrss();
   test_enqcmd();
   test_far_and_tokens();
+  test_user_msr();
   test_malformed();
   if (g_failed) { printf("CetTest: %d failed\n", g_failed); return 1; }
   printf("CetTest: all passed\n");

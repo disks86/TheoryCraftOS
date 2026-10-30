@@ -178,11 +178,11 @@ class VirglImage final : public IImage {
                             : desc.kind == TextureKind::Texture2DArray ? virgl::kTargetTexture2dArray : virgl::kTargetTexture2d;
     ResourceCreate3d create{header(kCmdResourceCreate3d), id_, target,
                             depth ? depth_format : color_format_, bind,
-                            desc.extent.width, desc.extent.height, desc.kind == TextureKind::Texture3D ? layers : 1u, desc.kind == TextureKind::Texture3D || desc.kind == TextureKind::Texture2D ? 1u : layers, 0, 0,
+                            desc.extent.width, desc.extent.height, desc.kind == TextureKind::Texture3D ? layers : 1u, desc.kind == TextureKind::Texture3D || desc.kind == TextureKind::Texture2D ? 1u : layers, 0, desc.samples > 1 ? desc.samples : 0u,
                             sampled ? 0u : kResourceFlagY0Top, 0};
     CtxResource ctx{header(kCmdCtxAttachResource), id_, 0};
     ok_ = gpu.command(as_bytes(create)) && gpu.command(as_bytes(ctx));
-    accounted_ = uint64_t{desc.extent.width} * desc.extent.height * layer_count() * (depth ? 4u : bytes_per_pixel(desc.format));
+    accounted_ = uint64_t{desc.extent.width} * desc.extent.height * layer_count() * desc.samples * (depth ? 4u : bytes_per_pixel(desc.format));
     gpu.add_resource_bytes(accounted_);
     // The surface (a render-target view of the resource) is what the framebuffer state refers to.
     if (ok_ && (desc.usage & (kImageColorAttachment | kImageDepthAttachment))) {
@@ -220,6 +220,8 @@ class VirglImage final : public IImage {
   Extent2D extent() const override { return desc_.extent; }
   Format format() const override { return desc_.format; }
   uint32_t usage() const { return desc_.usage; }
+  uint32_t samples() const { return desc_.samples; }
+  uint32_t color_format() const { return color_format_; }
   bool stencil() const { return desc_.stencil; }
   uint32_t layer_count() const override { return desc_.kind == TextureKind::Texture2D ? 1 : desc_.kind == TextureKind::TextureCube ? 6 : desc_.layers; }
   // A layer (a slice, a face) goes through the one-layer backing: the host copies from or into it at the layer's place in the resource.
@@ -451,7 +453,7 @@ class VirglPipeline final : public VirglPipelineBase {
     cmd[n++] = virgl::header(virgl::kCreateObject, virgl::kObjectRasterizer, 9);
     cmd[n++] = rasterizer_;
     cmd[n++] = (1u << 1) /*depth clip*/ | (1u << 2) /*clip half z*/ | (cull << 8) | (1u << 14) /*scissor*/ |
-               ((front_ccw ? 1u : 0u) << 15) | (1u << 29) /*half pixel center*/ | (1u << 30) /*bottom edge rule*/;
+               ((front_ccw ? 1u : 0u) << 15) | (desc.multisample ? 1u << 25 : 0u) /*multisample*/ | (1u << 29) /*half pixel center*/ | (1u << 30) /*bottom edge rule*/;
     cmd[n++] = float_bits(1.0f);  // point size
     cmd[n++] = 0;                 // sprite coord enable
     cmd[n++] = 0;                 // line stipple, clip planes
@@ -559,6 +561,11 @@ void VirglDevice::destroy_buffer(IBuffer* buffer) { destroy(gpu_.allocator(), st
 
 IImage* VirglDevice::create_image(const ImageDesc& desc) {
   if (desc.mip_levels != 1) return nullptr;   // (no mipmaps either)
+  if (desc.samples != 1) {
+    // (a multisampled image is an 8-bit colour or a depth attachment alone: resolved, never read or sampled)
+    const bool depth = desc.format == Format::D32Float;
+    if ((desc.samples != 2 && desc.samples != 4) || desc.kind != TextureKind::Texture2D || desc.usage != (depth ? kImageDepthAttachment : kImageColorAttachment) || (!depth && desc.format != Format::B8G8R8A8Unorm)) return nullptr;
+  }
   if (desc.kind != TextureKind::Texture2D) {
     // (a volume, array or cube is only sampled: 8-bit colour, one level)
     const uint32_t layers = desc.kind == TextureKind::TextureCube ? 6 : desc.layers;
@@ -769,6 +776,23 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         if (queries.open != kMaxOcclusionQueries) return false;
         in_pass = false;
         break;
+      case RecordedCommand::Type::Resolve: {
+        // A blit from the multisampled image to the plain one; one kept upright (an image that is only drawn into) is turned over.
+        const VirglImage* to = static_cast<const VirglImage*>(cmd.image);
+        const VirglImage* from = static_cast<const VirglImage*>(cmd.image2);
+        if (in_pass || !to || !from || to->samples() != 1 || from->samples() < 2 || to->extent().width != from->extent().width || to->extent().height != from->extent().height) return false;
+        const Extent2D e = from->extent();
+        const bool flip = to->y0_top();   // (a multisampled image does not take the flag: the host stores it the way GL does, and only a destination kept upright needs the blit to turn it over)
+        stream.command(virgl::kBlit, 0, 21);
+        stream.put(0xF);   // (all four channels, nearest, no scissor)
+        stream.put(0);
+        stream.put(e.width | (e.height << 16));
+        stream.put(to->id()), stream.put(0), stream.put(to->color_format());
+        stream.put(0), stream.put(flip ? e.height : 0), stream.put(0), stream.put(e.width), stream.put(flip ? static_cast<uint32_t>(-static_cast<int32_t>(e.height)) : e.height), stream.put(1);
+        stream.put(from->id()), stream.put(0), stream.put(from->color_format());
+        stream.put(0), stream.put(0), stream.put(0), stream.put(e.width), stream.put(e.height), stream.put(1);
+        break;
+      }
       case RecordedCommand::Type::BindComputePipeline: {
         compute = static_cast<const VirglComputePipeline*>(cmd.pipeline);
         if (in_pass || !compute) return false;

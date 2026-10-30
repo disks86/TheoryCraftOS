@@ -29,7 +29,7 @@ namespace graphics {
 struct RecordedCommand {
   enum class Type : uint8_t {
     BeginRenderPass, BindPipeline, BindVertexBuffer, BindIndexBuffer, PushConstants, BindTexture, SetViewport, SetScissor,
-    Draw, DrawIndexed, EndRenderPass, SetTopology, BeginQuery, EndQuery, BindComputePipeline, BindStorageBuffer, Dispatch,
+    Draw, DrawIndexed, EndRenderPass, SetTopology, BeginQuery, EndQuery, BindComputePipeline, BindStorageBuffer, Dispatch, Resolve,
   };
   Type type = Type::Draw;
   RenderPassBegin pass;
@@ -46,6 +46,7 @@ struct RecordedCommand {
   PrimitiveTopology topology = PrimitiveTopology::TriangleList;   // SetTopology
   uint32_t unit = 0;       // BindTexture; the slot of BeginQuery
   IImage* image = nullptr;
+  IImage* image2 = nullptr;   // Resolve: the source (image is the destination)
   SamplerDesc sampler;
 };
 
@@ -151,6 +152,13 @@ class CommandRecorder : public ICommandBuffer {
   void end_render_pass() override {
     RecordedCommand c;
     c.type = RecordedCommand::Type::EndRenderPass;
+    add(c);
+  }
+  void resolve_image(IImage* destination, IImage* source) override {
+    RecordedCommand c;
+    c.type = RecordedCommand::Type::Resolve;
+    c.image = destination;
+    c.image2 = source;
     add(c);
   }
   void bind_compute_pipeline(const IPipeline* pipeline) override {

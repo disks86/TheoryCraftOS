@@ -23,10 +23,21 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string>
 #include <string.h>
+#include <functional>
+#include <map>
+#include <sys/mman.h>
 #include <vector>
 #include "Hardware/WirelessInterface/Intel/IwlDevices.hpp"
 #include "Hardware/WirelessInterface/Intel/IwlFirmware.hpp"
+#include "Hardware/WirelessInterface/Intel/IwlFwLoad.hpp"
+#include "Hardware/WirelessInterface/Intel/IwlRx.hpp"
+#include "Hardware/WirelessInterface/Intel/IwlTx.hpp"
+#include "Hardware/WirelessInterface/Intel/IwlTransport.hpp"
+#include "Hardware/WirelessInterface/Intel/IwlNvm.hpp"
+#include "Hardware/WirelessInterface/Intel/IwlInit.hpp"
+#include "Hardware/WirelessInterface/Intel/IwlDriver.hpp"
 #include "Hardware/WirelessInterface/Intel/IwlPcie.hpp"
 
 namespace hardware {
@@ -39,12 +50,25 @@ static int g_failed = 0;
 #define CHECK(...) do { if (!(__VA_ARGS__)) { printf("FAILED line %d: %s\n", __LINE__, #__VA_ARGS__); ++g_failed; } } while (0)
 
 struct TestAllocator final : allocators::IAllocator {
+  std::map<void*, size_t> dma;
   void* allocate(uint64_t size) override { return malloc(size); }
   void* allocate_aligned(uint64_t size, uint64_t alignment) override {
     const uint64_t al = alignment < 16 ? 16 : alignment;
     return aligned_alloc(al, (size + al - 1) / al * al);
   }
-  void deallocate(void* p) override { if (p) free(p); }
+  // memory the "chip" reads: in the low 2 GiB like the kernel's DMA pool, so that the pointer is the bus address
+  void* allocate_dma(uint64_t size, uint64_t) override {
+    const size_t rounded = (size + 4095) / 4096 * 4096;
+    void* p = mmap(nullptr, rounded, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
+    if (p == MAP_FAILED) return nullptr;
+    dma[p] = rounded;
+    return p;
+  }
+  void deallocate(void* p) override {
+    if (!p) return;
+    auto it = dma.find(p);
+    if (it != dma.end()) { munmap(p, it->second); dma.erase(it); } else free(p);
+  }
 };
 
 static void test_devices() {
@@ -217,7 +241,7 @@ static void test_real_firmware() {
 // ---- the chip's registers ---------------------------------------------------------------------------------------------------------------------------------------------------------
 
 struct FakeIwl final : IIwlRegisters {
-  uint32_t regs[0x1000 / 4] = {};
+  uint32_t regs[0x2000 / 4] = {};
   uint32_t prph[0x100000 / 4] = {};
   uint32_t mem[0x1000] = {};
   uint32_t prph_addr_w = 0, prph_addr_r = 0, mem_w = 0, mem_r = 0;
@@ -227,26 +251,51 @@ struct FakeIwl final : IIwlRegisters {
   uint32_t last_prph_read_address = 0, last_prph_write_address = 0;
   uint32_t resets = 0;
   uint32_t reads_of_gp = 0;
+  struct Transfer { uint32_t dst, bytes; bool extended; };
+  std::vector<Transfer> transfers;
+  std::map<uint32_t, uint8_t> device_memory;
+  std::function<void()> on_alive, on_doorbell;
+  bool force_radio = false;
+  bool w1c = false, fail_transfers = false, cpu_released = false, alive_never = false, extended_during = false;
 
   uint32_t read32(uint32_t offset) override {
     switch (offset) {
       case iwl_csr::kHbusPrphRdat: last_prph_read_address = prph_addr_r; return prph[(prph_addr_r & 0xFFFFF) / 4];
       case iwl_csr::kHbusMemRdat: return mem[(mem_r++) % 0x1000];
-      case iwl_csr::kGpCntrl: ++reads_of_gp; return regs[offset / 4];
-      default: return regs[(offset / 4) % 0x400];
+      case iwl_csr::kGpCntrl: ++reads_of_gp; return regs[offset / 4] | (force_radio ? iwl_csr::kGpHwRfKillSw : 0);
+      default: return regs[(offset / 4) % 0x800];
     }
   }
   void write32(uint32_t offset, uint32_t value) override {
     switch (offset) {
       case iwl_csr::kHbusPrphRaddr: prph_addr_r = value; return;
       case iwl_csr::kHbusPrphWaddr: prph_addr_w = value; return;
-      case iwl_csr::kHbusPrphWdat: last_prph_write_address = prph_addr_w; prph[(prph_addr_w & 0xFFFFF) / 4] = value; return;
+      case iwl_csr::kHbusPrphWdat:
+        last_prph_write_address = prph_addr_w;
+        prph[(prph_addr_w & 0xFFFFF) / 4] = value;
+        if ((prph_addr_w & 0xFFFFF) == (iwl_prph::kReleaseCpuReset & 0xFFFFF) && (value & iwl_prph::kReleaseCpuResetBit)) cpu_released = true;
+        if ((prph_addr_w & 0xFFFFF) == (iwl_prph::kLmpmChick & 0xFFFFF)) extended_during = value & 1;
+        return;
       case iwl_csr::kHbusMemRaddr: mem_r = value / 4; return;
       case iwl_csr::kHbusMemWaddr: mem_w = value / 4; return;
       case iwl_csr::kHbusMemWdat: mem[(mem_w++) % 0x1000] = value; return;
       default: break;
     }
-    uint32_t& r = regs[(offset / 4) % 0x400];
+    if (offset == iwl_fh::tx_config(iwl_fh::kServiceChannel) && (value & iwl_fh::kTxChannelEnable)) {
+      // the flow handler's DMA: bus address (the host pointer), byte count and device address from the registers
+      const uint64_t bus = regs[iwl_fh::tfdib_ctrl0(9) / 4] | (static_cast<uint64_t>(regs[iwl_fh::tfdib_ctrl1(9) / 4] >> iwl_fh::kTfdibAddressShift) << 32);
+      const uint32_t bytes = regs[iwl_fh::tfdib_ctrl1(9) / 4] & 0x0FFFFFFF, dst = regs[iwl_fh::service_sram_address(9) / 4];
+      transfers.push_back({dst, bytes, extended_during});
+      if (!fail_transfers) {
+        const uint8_t* src = reinterpret_cast<const uint8_t*>(bus);
+        for (uint32_t i = 0; i < bytes; ++i) device_memory[dst + i] = src[i];
+        regs[iwl_csr::kFhIntStatus / 4] |= iwl_csr::kFhIntTxMask;
+      }
+    }
+    if (offset == iwl_fh::kUcodeLoadStatus && value == 0xFFFFFFFFu && cpu_released && !alive_never) { regs[iwl_csr::kInt / 4] |= iwl_csr::kIntBitAlive; if (on_alive) on_alive(); }
+    if (offset == iwl_tx::kHbusTargWrptr) { regs[offset / 4] = value; if (on_doorbell) on_doorbell(); return; }
+    uint32_t& r = regs[(offset / 4) % 0x800];
+    if (w1c && (offset == iwl_csr::kFhIntStatus || offset == iwl_csr::kInt)) { r &= ~value; return; }
     r = value;
     if (offset == iwl_csr::kHwIfConfig) {
       if (never_ready || (own_after_wake && !(value & iwl_csr::kHwIfWakeMe))) r &= ~iwl_csr::kHwIfPciOwnSet;
@@ -331,11 +380,669 @@ static void test_pcie() {
   }
 }
 
+// ---- loading the firmware ------------------------------------------------------------------------------------------------------------------------------------------------------
+
+static Bytes make_loadable_firmware(uint32_t big_size) {
+  Bytes f;
+  put32(f, 0);
+  put32(f, IwlFirmware::kMagic);
+  f.insert(f.end(), 88 - 8, 0);
+  tlv(f, 27, u32s({2}));
+  tlv(f, 19, section(0x00000000, 16, 0xA1));
+  tlv(f, 19, section(0x00040000, 8, 0xA2));                       // in the extended address range
+  tlv(f, 19, section(0xFFFFCCCC, 0, 0));
+  tlv(f, 24, section(0x00800000, big_size, 0xB1));                // a section of several chunks
+  tlv(f, 19, section(0xAAAABBBB, 0, 0));
+  tlv(f, 19, section(0x00000000, 16, 0xC1));                      // paging: not loaded
+  return f;
+}
+
+static void test_load() {
+  TestAllocator alloc;
+  const Bytes file = make_loadable_firmware(0x20000 * 2 + 4100);
+  IwlFirmware fw(alloc);
+  const char* error = nullptr;
+  CHECK(fw.parse(ConstByteView(file.data(), file.size()), &error));
+  {
+    FakeIwl chip;
+    chip.w1c = true;
+    IwlPcieDevice dev(chip);
+    CHECK(dev.apm_init());
+    IwlFwLoad load(dev, alloc);
+    CHECK(load.load(fw, IwlImage::Regular, &error));
+    if (error) printf("  load error: %s\n", error);
+    CHECK(load.sections_loaded() == 3 && load.chunks_loaded() == 1 + 1 + 3);
+    // the bytes landed at their device addresses; the paging section did not
+    CHECK(chip.device_memory[0] == 0xA1 && chip.device_memory[15] == 0xA1 && chip.device_memory[16] == 0 && chip.device_memory[0x40000] == 0xA2 && chip.device_memory[0x40007] == 0xA2);
+    CHECK(chip.device_memory[0x00800000] == 0xB1 && chip.device_memory[0x00800000 + 0x20000 * 2 + 4099] == 0xB1 && chip.device_memory.count(0x00800000 + 0x20000 * 2 + 4100) == 0);
+    CHECK(chip.transfers.size() == 5 && chip.transfers[0].dst == 0 && chip.transfers[1].dst == 0x40000 && chip.transfers[1].extended && !chip.transfers[0].extended);
+    CHECK(chip.transfers[2].dst == 0x00800000 && chip.transfers[2].bytes == 0x20000 && chip.transfers[3].dst == 0x00800000 + 0x20000 && chip.transfers[4].bytes == 4100);
+    CHECK(chip.cpu_released && !(chip.prph[(iwl_prph::kLmpmChick & 0xFFFFF) / 4] & 1) && chip.prph[(iwl_prph::kWfpmGp2 & 0xFFFFF) / 4] == 0x01010101);
+    // the ROM was told: the first processor's two sections (bits 0 and 1), then 0xFFFF, then the second's, then everything
+    CHECK(chip.regs[iwl_fh::kUcodeLoadStatus / 4] == 0xFFFFFFFFu);
+    CHECK(load.wait_alive(1000, &error) && !(chip.regs[iwl_csr::kInt / 4] & iwl_csr::kIntBitAlive));
+  }
+  {
+    FakeIwl chip;                                                  // a transfer that never completes
+    chip.w1c = true;
+    chip.fail_transfers = true;
+    IwlPcieDevice dev(chip);
+    CHECK(dev.apm_init());
+    IwlFwLoad load(dev, alloc);
+    CHECK(!load.load(fw, IwlImage::Regular, &error) && error);
+  }
+  {
+    FakeIwl chip;                                                  // the firmware never says it is alive
+    chip.w1c = true;
+    chip.alive_never = true;
+    IwlPcieDevice dev(chip);
+    CHECK(dev.apm_init());
+    IwlFwLoad load(dev, alloc);
+    CHECK(load.load(fw, IwlImage::Regular, &error) && !load.wait_alive(200, &error) && error);
+    chip.regs[iwl_csr::kInt / 4] = iwl_csr::kIntBitSwError;
+    CHECK(!load.wait_alive(200, &error));
+  }
+  {
+    FakeIwl chip;                                                  // no MAC clock: nothing can be loaded
+    chip.w1c = true;
+    chip.clock_never = true;
+    IwlPcieDevice dev(chip);
+    IwlFwLoad load(dev, alloc);
+    CHECK(!load.load(fw, IwlImage::Regular, &error));
+    FakeIwl chip2;
+    chip2.w1c = true;
+    IwlPcieDevice dev2(chip2);
+    CHECK(dev2.apm_init());
+    IwlFwLoad load2(dev2, alloc);
+    CHECK(!load2.load(fw, IwlImage::Wowlan, &error));              // an image the file does not have
+    // a section that is not a whole number of dwords
+    Bytes odd = make_loadable_firmware(13);
+    IwlFirmware ofw(alloc);
+    CHECK(ofw.parse(ConstByteView(odd.data(), odd.size()), &error));
+    CHECK(!load2.load(ofw, IwlImage::Regular, &error));
+  }
+}
+
+// ---- the receive queue ----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+struct CollectSink final : IIwlPacketSink {
+  struct Seen { uint8_t command, group; uint16_t sequence; Bytes payload; };
+  std::vector<Seen> seen;
+  void on_packet(const IwlRxPacket& p) override {
+    Seen s{p.command, p.group, p.sequence, Bytes()};
+    for (uint64_t i = 0; i < p.payload.size(); ++i) s.payload.push_back(p.payload[i]);
+    seen.push_back(s);
+  }
+};
+
+// The chip's receive side: takes the posted buffers in order, fills them with frames, closes them.
+struct FakeRxChip {
+  FakeIwl& chip;
+  uint32_t taken = 0, closed = 0;
+  explicit FakeRxChip(FakeIwl& c) : chip(c) {}
+  uint64_t prph64(uint32_t a) { return chip.prph[(a & 0xFFFFF) / 4] | (static_cast<uint64_t>(chip.prph[((a & 0xFFFFF) + 4) / 4]) << 32); }
+  uint32_t write_pointer() { return chip.regs[0x1C80 / 4]; }
+  // frame: len_n_flags(size = 4 + payload), command header, payload; padded to 64
+  static void frame(Bytes& b, uint8_t group, uint8_t cmd, uint16_t seq, const Bytes& payload) {
+    put32(b, static_cast<uint32_t>(4 + payload.size()));
+    b.push_back(cmd); b.push_back(group); b.push_back(static_cast<uint8_t>(seq)); b.push_back(static_cast<uint8_t>(seq >> 8));
+    b.insert(b.end(), payload.begin(), payload.end());
+    while (b.size() % 64) b.push_back(0);
+  }
+  // returns false when the host has not posted a buffer
+  bool deliver(const Bytes& content, bool end_marker = true) {
+    if (((write_pointer() - taken) & 255) == 0) return false;
+    const uint64_t* ring = reinterpret_cast<const uint64_t*>(prph64(0xA08000));
+    const uint64_t entry = ring[taken % 256];
+    const uint32_t vid = entry & 0xFFF;
+    uint8_t* buffer = reinterpret_cast<uint8_t*>(entry & ~0xFFFull);
+    memset(buffer, 0, 4096);
+    memcpy(buffer, content.data(), content.size() < 4096 ? content.size() : 4096);
+    if (end_marker && content.size() + 4 <= 4096) { const uint32_t m = iwl_frame::kInvalid; memcpy(buffer + content.size(), &m, 4); }
+    uint32_t* used = reinterpret_cast<uint32_t*>(prph64(0xA08100));
+    used[closed % 256] = vid;
+    ++taken;
+    ++closed;
+    *reinterpret_cast<uint16_t*>(prph64(0xA08200)) = static_cast<uint16_t>(closed % 256);
+    return true;
+  }
+};
+
+static void test_rx() {
+  TestAllocator alloc;
+  FakeIwl chip;
+  chip.w1c = true;
+  IwlPcieDevice dev(chip);
+  CHECK(dev.apm_init());
+  IwlRxQueue rxq(dev, alloc);
+  const char* error = nullptr;
+  CHECK(rxq.init(true, &error));
+  if (error) printf("  rx error: %s\n", error);
+  FakeRxChip hw(chip);
+  CHECK(chip.prph[0x09820 / 4] == (iwl_rfh::kDmaEnable | iwl_rfh::kDmaBufferSize4K | iwl_rfh::kDmaMinBuffer4And8 | iwl_rfh::kDmaDropTooLarge | iwl_rfh::kDmaRingSize256));
+  CHECK(chip.prph[0x0980C / 4] == 0x10001u && (chip.prph[0x09800 / 4] & 3) == 3 && !(chip.prph[0x09800 / 4] & iwl_rfh::kGenCfgChunk128));
+  CHECK(hw.write_pointer() == 248 && rxq.buffers_posted() == 248 && (chip.regs[iwl_rfh::kIntCoalescing / 4] & 0xFF) == iwl_rfh::kIntCoalescingDefault);
+  const uint64_t* ring = reinterpret_cast<const uint64_t*>(hw.prph64(0xA08000));
+  CHECK((ring[0] & 0xFFF) == 1 && (ring[247] & 0xFFF) == 248 && (ring[0] & ~0xFFFull) != 0);
+  CollectSink sink;
+  CHECK(rxq.poll(sink) == 0);
+  // one buffer with three frames
+  Bytes content;
+  FakeRxChip::frame(content, 0, 0x01, 0x8000 | 5, Bytes{1, 2, 3, 4, 5});                 // a notification
+  FakeRxChip::frame(content, 3, 0x40, 0x0007, Bytes(100, 0xEE));                         // a response of queue 0, index 7
+  FakeRxChip::frame(content, 0, 0x02, 0x0400, Bytes());
+  CHECK(hw.deliver(content));
+  CHECK(rxq.poll(sink) == 3 && sink.seen.size() == 3);
+  CHECK(sink.seen[0].command == 1 && sink.seen[0].group == 0 && sink.seen[0].sequence == 0x8005 && sink.seen[0].payload == Bytes({1, 2, 3, 4, 5}));
+  CHECK(sink.seen[1].command == 0x40 && sink.seen[1].group == 3 && sink.seen[1].payload.size() == 100 && sink.seen[1].payload[99] == 0xEE);
+  CHECK(sink.seen[2].payload.empty() && sink.seen[2].sequence == 0x0400);
+  { IwlRxPacket p; p.sequence = 0x0407; CHECK(p.is_response() && p.queue() == 4 && p.index() == 7); p.sequence = 0x8001; CHECK(!p.is_response()); }
+  // the buffer went back: 249 posted, the pointer moves in groups of eight
+  CHECK(rxq.buffers_posted() == 249 && hw.write_pointer() == 248);
+  for (int i = 0; i < 7; ++i) { CHECK(hw.deliver(content)); }
+  CHECK(rxq.poll(sink) == 21 && rxq.buffers_posted() == 256 && hw.write_pointer() == 0);
+  // lying frames: a size beyond the buffer, a size smaller than the header, the invalid marker in the middle
+  sink.seen.clear();
+  Bytes bad;
+  put32(bad, 0x3FFF); bad.push_back(1); bad.push_back(0); bad.push_back(0); bad.push_back(0);
+  CHECK(hw.deliver(bad));
+  Bytes tiny;
+  put32(tiny, 2); tiny.insert(tiny.end(), 8, 0);
+  CHECK(hw.deliver(tiny));
+  Bytes marked;
+  FakeRxChip::frame(marked, 0, 9, 0x8000, Bytes{7});
+  put32(marked, iwl_frame::kInvalid);
+  FakeRxChip::frame(marked, 0, 10, 0x8000, Bytes{8});
+  CHECK(hw.deliver(marked, false));
+  CHECK(rxq.poll(sink) == 1 && sink.seen.size() == 1 && sink.seen[0].command == 9);
+  // a full buffer of frames up to its last byte
+  Bytes full;
+  while (full.size() + 64 <= 4096) FakeRxChip::frame(full, 0, 11, 0x8000, Bytes(40, 1));
+  CHECK(hw.deliver(full, false));
+  sink.seen.clear();
+  CHECK(rxq.poll(sink) == 64);
+  // the chip names buffers that do not exist and a closed index beyond what it wrote
+  {
+    uint32_t* used = reinterpret_cast<uint32_t*>(hw.prph64(0xA08100));
+    used[hw.closed % 256] = 0; used[(hw.closed + 1) % 256] = 0xFFF; used[(hw.closed + 2) % 256] = 300;
+    hw.closed += 3;
+    *reinterpret_cast<uint16_t*>(hw.prph64(0xA08200)) = static_cast<uint16_t>(hw.closed % 256);
+    CHECK(rxq.poll(sink) == 0);
+    *reinterpret_cast<uint16_t*>(hw.prph64(0xA08200)) = 0xFFFF;                       // an index with the high bits set: only 12 bits count
+    (void)rxq.poll(sink);
+  }
+  // random buffers
+  uint32_t seed = 99;
+  for (int round = 0; round < 200; ++round) {
+    Bytes junk(4096);
+    for (auto& b : junk) { seed = seed * 1664525u + 1013904223u; b = static_cast<uint8_t>(seed >> 24); }
+    if (round % 3 == 0) for (size_t i = 0; i < junk.size(); i += 64) { junk[i + 1] &= 0x3F; junk[i + 2] = 0; junk[i + 3] = 0; }
+    *reinterpret_cast<uint16_t*>(hw.prph64(0xA08200)) = static_cast<uint16_t>(hw.closed % 256);
+    if (!hw.deliver(junk, false)) break;
+    (void)rxq.poll(sink);
+  }
+  rxq.release();
+  CHECK(!rxq.ready() && alloc.dma.empty() && chip.prph[0x09820 / 4] == 0);
+  // no memory
+  struct Empty final : allocators::IAllocator {
+    void* allocate(uint64_t) override { return nullptr; }
+    void* allocate_aligned(uint64_t, uint64_t) override { return nullptr; }
+    void* allocate_dma(uint64_t, uint64_t) override { return nullptr; }
+    void deallocate(void*) override {}
+  } none;
+  IwlRxQueue starved(dev, none);
+  CHECK(!starved.init(false, &error) && !starved.ready());
+}
+
+// ---- the command queue ------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+// The chip's transmit side for the command queue: reads the TFDs the host announced and puts their buffers together.
+struct FakeTxChip {
+  FakeIwl& chip;
+  uint32_t read = 0;
+  explicit FakeTxChip(FakeIwl& c) : chip(c) {}
+  uint64_t ring_base() { return static_cast<uint64_t>(chip.regs[iwl_tx::cbbc_queue(0) / 4]) << 8; }
+  std::vector<Bytes> process(bool* ok) {
+    std::vector<Bytes> out;
+    *ok = true;
+    const uint32_t wr = chip.regs[iwl_tx::kHbusTargWrptr / 4] & 0xFF;
+    while (read != wr) {
+      const uint8_t* tfd = reinterpret_cast<const uint8_t*>(ring_base()) + read * 128;
+      Bytes cmd;
+      const uint32_t tbs = tfd[3] & 0x1F;
+      if (tbs == 0 || tbs > 20) { *ok = false; }
+      for (uint32_t i = 0; i < tbs && i < 20; ++i) {
+        const uint8_t* tb = tfd + 4 + i * 6;
+        uint32_t lo; memcpy(&lo, tb, 4);
+        uint16_t hi_len; memcpy(&hi_len, tb + 4, 2);
+        const uint64_t addr = lo | (static_cast<uint64_t>(hi_len & 0xF) << 32);
+        const uint32_t len = hi_len >> 4;
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(addr);
+        cmd.insert(cmd.end(), p, p + len);
+      }
+      out.push_back(cmd);
+      read = (read + 1) & 255;
+    }
+    return out;
+  }
+};
+
+static void test_tx() {
+  TestAllocator alloc;
+  FakeIwl chip;
+  chip.w1c = true;
+  IwlPcieDevice dev(chip);
+  CHECK(dev.apm_init());
+  IwlCommandQueue q(dev, alloc);
+  const char* error = nullptr;
+  CHECK(q.init(&error));
+  if (error) printf("  tx error: %s\n", error);
+  FakeTxChip hw(chip);
+  CHECK(hw.ring_base() != 0 && (hw.ring_base() & 255) == 0 && (chip.prph[iwl_tx::kScdTxFact & 0xFFFFF / 4 ? (iwl_tx::kScdTxFact & 0xFFFFF) / 4 : 0]) == 0);
+  CHECK((chip.prph[(iwl_tx::kScdGpCtrl & 0xFFFFF) / 4] & (iwl_tx::kScdGpCtrlAutoActive | 1)) == (iwl_tx::kScdGpCtrlAutoActive | 1) && chip.regs[iwl_tx::kFhKeepWarm / 4] != 0);
+  // every TFD in the ring points at the invalid block until used
+  { const uint8_t* t = reinterpret_cast<const uint8_t*>(hw.ring_base()); CHECK(t[3] == 1 && t[255 * 128 + 3] == 1); }
+  // before the scheduler is started: commands can be queued
+  chip.prph[(iwl_tx::kScdSramBase & 0xFFFFF) / 4] = 0x800000;
+  CHECK(q.start(&error));
+  CHECK(q.scd_base() == 0x800000);
+  CHECK(chip.prph[(iwl_tx::scd_queue_status(0) & 0xFFFFF) / 4] == (iwl_tx::kQueueStatusActive | iwl_tx::kCommandFifo | iwl_tx::kQueueStatusWsl | iwl_tx::kQueueStatusMask));
+  CHECK(chip.prph[(iwl_tx::kScdEnCtrl & 0xFFFFF) / 4] == 1 && chip.prph[(iwl_tx::kScdTxFact & 0xFFFFF) / 4] == 0xFF);
+  CHECK(chip.prph[(iwl_tx::kScdDramBase & 0xFFFFF) / 4] != 0);
+  CHECK(chip.regs[iwl_fh::tx_config(3) / 4] == (iwl_fh::kTxChannelEnable | iwl_tx::kTcsrCreditEnable) && (chip.regs[iwl_tx::kFhTxChickenBits / 4] & 2));
+  CHECK(chip.mem[((0x800000 + iwl_tx::scd_context_queue(0) + 4) / 4) % 0x1000] == (64u | (64u << 16)));
+  // a short command: header 4 bytes, 6 bytes of data
+  Bytes d1{1, 2, 3, 4, 5, 6};
+  IwlHostCommand c1;
+  c1.opcode = 0x40; c1.data = ConstByteView(d1.data(), d1.size());
+  int32_t seq = q.enqueue(c1, &error);
+  CHECK(seq == 0 && q.in_flight() == 1 && (chip.regs[iwl_tx::kHbusTargWrptr / 4] & 0xFF) == 1 && ((chip.regs[iwl_tx::kHbusTargWrptr / 4] >> 8) & 0xFF) == 0);
+  bool ok = false;
+  std::vector<Bytes> got = hw.process(&ok);
+  CHECK(ok && got.size() == 1 && got[0] == Bytes({0x40, 0, 0, 0, 1, 2, 3, 4, 5, 6}));
+  { const uint8_t* t = reinterpret_cast<const uint8_t*>(hw.ring_base()); CHECK(t[3] == 1); }   // one TB: the command fits the first 20 bytes
+  // a long wide command
+  Bytes d2(100);
+  for (size_t i = 0; i < d2.size(); ++i) d2[i] = static_cast<uint8_t>(i);
+  IwlHostCommand c2;
+  c2.group = 3; c2.opcode = 0x07; c2.version = 2; c2.data = ConstByteView(d2.data(), d2.size());
+  seq = q.enqueue(c2, &error);
+  CHECK(seq == 1);
+  got = hw.process(&ok);
+  CHECK(ok && got.size() == 1 && got[0].size() == 108 && got[0][0] == 7 && got[0][1] == 3 && got[0][2] == 1 && got[0][3] == 0 && got[0][4] == 100 && got[0][5] == 0 && got[0][7] == 2 && got[0][8] == 0 && got[0][107] == 99);
+  { const uint8_t* t = reinterpret_cast<const uint8_t*>(hw.ring_base()) + 128; CHECK(t[3] == 2); }
+  // the queue fills at 31 commands
+  CHECK(q.in_flight() == 2);
+  int sent = 0;
+  while (q.enqueue(c1, &error) >= 0) ++sent;
+  CHECK(sent == 29 && q.in_flight() == 31 && error);
+  // too large
+  Bytes big(2000);
+  IwlHostCommand c3; c3.opcode = 1; c3.data = ConstByteView(big.data(), big.size());
+  CHECK(q.enqueue(c3, &error) < 0);
+  // answers free the commands, bogus indexes change nothing
+  q.reclaim(200);
+  CHECK(q.in_flight() == 31);
+  q.reclaim(5);
+  CHECK(q.in_flight() == 25);
+  q.reclaim(5);
+  CHECK(q.in_flight() == 25);
+  q.reclaim(30);
+  CHECK(q.in_flight() == 0);
+  // the ring wraps (the chip catches up first)
+  (void)hw.process(&ok);
+  for (int round = 0; round < 40; ++round) {
+    const int32_t s = q.enqueue(c1, &error);
+    CHECK(s >= 0);
+    if (s < 0) break;
+    got = hw.process(&ok);
+    CHECK(ok && got.size() == 1 && got[0][2] == static_cast<uint8_t>(s) && got[0][3] == 0);
+    q.reclaim(static_cast<uint32_t>(s) & 0xFF);
+  }
+  CHECK(q.in_flight() == 0);
+  for (int round = 0; round < 300; ++round) {
+    const int32_t s = q.enqueue(c1, &error);
+    CHECK(s >= 0);
+    if (s < 0) break;
+    (void)hw.process(&ok);
+    q.reclaim(static_cast<uint32_t>(s) & 0xFF);
+  }
+  CHECK(q.write_pointer() == (1 + 1 + 29 + 40 + 300) % 256);
+  q.release();
+  CHECK(!q.ready() && alloc.dma.empty() && q.enqueue(c1, &error) < 0);
+}
+
+// ---- bringing the firmware up -----------------------------------------------------------------------------------------------------------------------------------------------------
+
+static Bytes alive_payload(uint16_t status) {
+  Bytes p;
+  p.push_back(static_cast<uint8_t>(status)); p.push_back(static_cast<uint8_t>(status >> 8)); p.push_back(0); p.push_back(0);
+  put32(p, 46); put32(p, 1);
+  p.insert(p.end(), 8, 0);
+  put32(p, 0x1234);
+  p.insert(p.end(), 16, 0);
+  put32(p, 0x800000);
+  p.insert(p.end(), 40, 0);
+  return p;
+}
+
+struct NoteCollector final : IIwlNotificationHandler {
+  std::vector<uint8_t> commands;
+  void on_notification(const IwlRxPacket& p) override { commands.push_back(p.command); }
+};
+
+static void test_transport() {
+  TestAllocator alloc;
+  const Bytes file = make_loadable_firmware(64);
+  IwlFirmware fw(alloc);
+  const char* error = nullptr;
+  CHECK(fw.parse(ConstByteView(file.data(), file.size()), &error));
+  for (int scenario = 0; scenario < 5; ++scenario) {
+    FakeIwl chip;
+    chip.w1c = true;
+    chip.force_radio = scenario != 3;
+    chip.regs[iwl_csr::kHwRev / 4] = (0x31u << 4) | 0x3;
+    chip.prph[(iwl_tx::kScdSramBase & 0xFFFFF) / 4] = 0x800000;
+    IwlTransport tp(chip, alloc, true);
+    FakeRxChip rxhw(chip);
+    FakeTxChip txhw(chip);
+    bool answer = scenario != 4;
+    chip.on_alive = [&] {
+      Bytes f;
+      FakeRxChip::frame(f, 0, iwl_cmd::kAliveNotification, 0x8000, alive_payload(scenario == 2 ? 0xDEAD : 0xCAFE));
+      rxhw.deliver(f);
+    };
+    chip.on_doorbell = [&] {
+      bool ok = false;
+      const std::vector<Bytes> cmds = txhw.process(&ok);
+      if (!answer) return;
+      for (const Bytes& c : cmds) {
+        Bytes f;
+        const uint16_t seq = static_cast<uint16_t>(c[2] | (c[3] << 8));
+        FakeRxChip::frame(f, c[1], c[0], seq, Bytes{0xAA, c[0], static_cast<uint8_t>(c.size())});
+        FakeRxChip::frame(f, 0, 0x77, 0x8000, Bytes{1});                              // and a notification after it
+        rxhw.deliver(f);
+      }
+    };
+    const bool started = tp.start(fw, IwlImage::Regular, 5000, &error);
+    if (scenario == 2) { CHECK(!started && error && alloc.dma.empty() && !tp.running()); continue; }
+    if (scenario == 3) { CHECK(!started && error && strstr(error, "radio")); continue; }
+    CHECK(started && tp.running());
+    if (error && !started) printf("  start error: %s\n", error);
+    CHECK(tp.alive().valid && tp.alive().status == 0xCAFE && tp.alive().ucode_major == 46 && tp.alive().ucode_minor == 1 && tp.alive().scd_base == 0x800000 && tp.alive().error_event_table == 0x1234);
+    // the MAC step and dash and the radio configuration went into the config register
+    CHECK((chip.regs[iwl_csr::kHwIfConfig / 4] & 0xF) == 3);
+    CHECK(chip.regs[iwl_csr::kMacShadowRegCtrl / 4] == iwl_csr::kMacShadowRegCtrlEnable);
+    Bytes d{9, 8, 7};
+    IwlHostCommand c;
+    c.opcode = 0x21; c.data = ConstByteView(d.data(), d.size());
+    uint8_t buf[16] = {};
+    NoteCollector notes;
+    if (scenario == 4) {
+      CHECK(tp.send_sync(c, ByteView(buf, sizeof buf), 2000, &error) < 0 && error);    // nobody answers
+      tp.stop();
+      CHECK(alloc.dma.empty());
+      continue;
+    }
+    int32_t n = tp.send_sync(c, ByteView(buf, sizeof buf), 2000, &error);
+    CHECK(n == 3 && buf[0] == 0xAA && buf[1] == 0x21 && buf[2] == 7);
+    // the notification that followed the response was left for the next poll
+    CHECK(tp.poll(&notes) <= 1);
+    n = tp.send_sync(c, ByteView(buf, 2), 2000, &error);                       // a response longer than the buffer: the length is still reported
+    CHECK(n == 3 && buf[1] == 0x21);
+    IwlHostCommand wide;
+    wide.group = 4; wide.opcode = 0x02; wide.version = 1;
+    CHECK(tp.send_sync(wide, ByteView(buf, sizeof buf), 2000, &error) == 3 && buf[2] == 8);
+    tp.stop();
+    CHECK(!tp.running() && alloc.dma.empty() && tp.send_sync(c, ByteView(buf, sizeof buf), 100, &error) < 0);
+  }
+}
+
+// ---- the NVM and the MAC address ---------------------------------------------------------------------------------------------------------------------------------------------------
+
+static void test_nvm() {
+  uint8_t mac[6];
+  CHECK(iwl_valid_ether_address(Bytes({0x00, 0x1B, 0x21, 1, 2, 3}).data()) && !iwl_valid_ether_address(Bytes({0x01, 0, 0, 0, 0, 1}).data()) && !iwl_valid_ether_address(Bytes(6, 0).data()));
+  // the fused words: byte-reversed
+  iwl_flip_hw_address(0x11223344, 0x0000AABB, mac);
+  CHECK(mac[0] == 0x11 && mac[1] == 0x22 && mac[2] == 0x33 && mac[3] == 0x44 && mac[4] == 0xAA && mac[5] == 0xBB);
+  // the override section wins when usable
+  Bytes ov{0, 0, 0x02, 0x11, 0x22, 0x33, 0x44, 0x55};
+  CHECK(iwl_choose_mac_address(ConstByteView(ov.data(), ov.size()), 0x11223344, 0xAABB, mac) && mac[0] == 0x02 && mac[5] == 0x55);
+  Bytes reserved{0, 0, 0x02, 0xcc, 0xaa, 0xff, 0xee, 0x00};                               // the reserved address: use the fused one
+  CHECK(iwl_choose_mac_address(ConstByteView(reserved.data(), reserved.size()), 0x10223344, 0xAABB, mac) && mac[0] == 0x10);
+  Bytes multicast{0, 0, 0x01, 1, 2, 3, 4, 5};
+  CHECK(iwl_choose_mac_address(ConstByteView(multicast.data(), multicast.size()), 0x10223344, 0xAABB, mac) && mac[0] == 0x10);
+  CHECK(!iwl_choose_mac_address(ConstByteView(), 0, 0, mac) && !iwl_choose_mac_address(ConstByteView(ov.data(), 5), 0, 0, mac));
+  CHECK(!iwl_choose_mac_address(ConstByteView(), 0x01000000, 0, mac));                      // a multicast fused address
+  {
+    FakeIwl chip;
+    IwlPcieDevice dev(chip);
+    CHECK(dev.apm_init());
+    chip.prph[(iwl_nvm::kWfmpMacAddr0 & 0xFFFFF) / 4] = 0x00A0C9F1;
+    chip.prph[(iwl_nvm::kWfmpMacAddr1 & 0xFFFFF) / 4] = 0x00000A0B;
+    CHECK(iwl_read_fused_address(dev, mac) && mac[0] == 0x00 && mac[1] == 0xA0 && mac[2] == 0xC9 && mac[3] == 0xF1 && mac[4] == 0x0A && mac[5] == 0x0B);
+  }
+  // requests and responses
+  uint8_t req[8];
+  iwl_nvm_read_request(12, 0x0102, 2048, req);
+  CHECK(req[0] == 0 && req[1] == 0 && req[2] == 12 && req[3] == 0 && req[4] == 2 && req[5] == 1 && req[6] == 0 && req[7] == 8);
+  auto response = [](uint16_t offset, uint16_t length, uint16_t type, uint16_t status, size_t data) {
+    Bytes b;
+    for (uint16_t v : {offset, length, type, status}) { b.push_back(static_cast<uint8_t>(v)); b.push_back(static_cast<uint8_t>(v >> 8)); }
+    b.insert(b.end(), data, 0x5A);
+    return b;
+  };
+  ConstByteView data;
+  Bytes ok = response(100, 10, 3, 0, 10);
+  CHECK(iwl_nvm_parse_response(ConstByteView(ok.data(), ok.size()), 3, 100, 2048, &data) && data.size() == 10);
+  for (const Bytes& bad : {response(100, 10, 3, 1, 10), response(100, 10, 4, 0, 10), response(104, 10, 3, 0, 10), response(100, 3000, 3, 0, 3000), response(100, 10, 3, 0, 4), response(100, 10, 3, 0, 0)})
+    CHECK(!iwl_nvm_parse_response(ConstByteView(bad.data(), bad.size()), 3, 100, 2048, &data));
+  CHECK(!iwl_nvm_parse_response(ConstByteView(ok.data(), 6), 3, 100, 2048, &data));
+
+  // reading sections through a running firmware
+  TestAllocator alloc;
+  const Bytes file = make_loadable_firmware(64);
+  IwlFirmware fw(alloc);
+  const char* error = nullptr;
+  CHECK(fw.parse(ConstByteView(file.data(), file.size()), &error));
+  for (int scenario = 0; scenario < 3; ++scenario) {
+    FakeIwl chip;
+    chip.w1c = true;
+    chip.force_radio = true;
+    chip.prph[(iwl_tx::kScdSramBase & 0xFFFFF) / 4] = 0x800000;
+    IwlTransport tp(chip, alloc, true);
+    FakeRxChip rxhw(chip);
+    FakeTxChip txhw(chip);
+    Bytes section(5000);
+    for (size_t i = 0; i < section.size(); ++i) section[i] = static_cast<uint8_t>(i * 7);
+    chip.on_alive = [&] { Bytes f; FakeRxChip::frame(f, 0, 1, 0x8000, alive_payload(0xCAFE)); rxhw.deliver(f); };
+    chip.on_doorbell = [&] {
+      bool good = false;
+      for (const Bytes& c : txhw.process(&good)) {
+        const uint16_t offset = static_cast<uint16_t>(c[8] | (c[9] << 8)), want = static_cast<uint16_t>(c[10] | (c[11] << 8));
+        const uint16_t type = static_cast<uint16_t>(c[6] | (c[7] << 8));
+        const uint16_t seq = static_cast<uint16_t>(c[2] | (c[3] << 8));
+        size_t n = offset >= section.size() ? 0 : section.size() - offset;
+        if (n > want) n = want;
+        Bytes payload;
+        for (uint16_t v : {offset, static_cast<uint16_t>(n), type, static_cast<uint16_t>(scenario == 1 ? 1 : 0)}) { payload.push_back(static_cast<uint8_t>(v)); payload.push_back(static_cast<uint8_t>(v >> 8)); }
+        if (scenario == 2 && offset > 0) payload[0] ^= 1;                                  // the wrong offset comes back
+        payload.insert(payload.end(), section.begin() + (offset < section.size() ? offset : section.size()), section.begin() + (offset < section.size() ? offset : section.size()) + n);
+        Bytes f;
+        FakeRxChip::frame(f, 0, 0x88, seq, payload);
+        rxhw.deliver(f);
+      }
+    };
+    CHECK(tp.start(fw, IwlImage::Regular, 5000, &error));
+    ByteBuffer out(alloc);
+    const bool read = iwl_read_nvm_section(tp, 12, out, &error);
+    if (scenario == 0) {
+      CHECK(read && out.size() == 5000);
+      bool same = out.size() == 5000;
+      for (size_t i = 0; same && i < 5000; ++i) same = out.view()[i] == section[i];
+      CHECK(same);
+    } else {
+      CHECK(!read && error);
+    }
+    tp.stop();
+  }
+}
+
+// ---- NVM info, the init handshake and the driver ---------------------------------------------------------------------------------------------------------------------------------
+
+static Bytes nvm_info(int version, uint32_t sku, uint32_t lar) {
+  Bytes b;
+  put32(b, 0);                                   // flags: OTP not empty
+  b.push_back(0x34); b.push_back(0x12); b.push_back(7); b.push_back(2);     // nvm version 0x1234, board 7, 2 addresses
+  put32(b, sku);
+  put32(b, 3);                                   // tx chains
+  put32(b, 3);                                   // rx chains
+  put32(b, lar);
+  if (version == 3) {
+    for (int i = 0; i < 51; ++i) { const uint16_t f = (i % 5 == 4) ? 0 : 0x0309; b.push_back(static_cast<uint8_t>(f)); b.push_back(static_cast<uint8_t>(f >> 8)); }
+    b.push_back(0); b.push_back(0);
+  } else {
+    const int room = version == 4 ? 110 : 115;
+    put32(b, 51);
+    for (int i = 0; i < room; ++i) put32(b, i < 51 ? ((i % 5 == 4) ? 0u : 0x0309u | (i >= 14 ? 0x10u : 0u)) : 0x0FFFFu);
+  }
+  return b;
+}
+
+static void test_nvm_info() {
+  for (int version : {3, 4, 5}) {
+    const Bytes info = nvm_info(version, 0x1F, 1);
+    IwlNvmData d;
+    const char* error = nullptr;
+    CHECK(iwl_parse_nvm_get_info(ConstByteView(info.data(), info.size()), 3, 1, true, &d, &error));
+    CHECK(d.nvm_version == 0x1234 && d.board_type == 7 && d.n_hw_addresses == 2 && !d.empty_otp && d.band_24ghz && d.band_5ghz && d.ieee80211n && d.ieee80211ac && d.ieee80211ax && !d.mimo_disabled);
+    CHECK(d.tx_antennas == 3 && d.rx_antennas == 1 && d.lar_enabled && d.channel_count == 51);
+    CHECK(d.channels[0].number == 1 && d.channels[0].frequency_mhz == 2412 && d.channels[13].number == 14 && d.channels[13].frequency_mhz == 2484 && !d.channels[0].is_5ghz);
+    CHECK(d.channels[14].number == 36 && d.channels[14].frequency_mhz == 5180 && d.channels[14].is_5ghz && d.channels[50].number == 181);
+    CHECK(!d.channels[4].valid() && d.channels[0].valid() && d.valid_channels() == 41);
+    IwlNvmData nolar;
+    CHECK(iwl_parse_nvm_get_info(ConstByteView(info.data(), info.size()), 3, 3, false, &nolar, &error) && !nolar.lar_enabled);
+    // wrong sizes, every prefix, and bit flips: a verdict and no read past the end
+    for (size_t cut = 0; cut <= info.size(); ++cut) {
+      IwlNvmData t;
+      const bool ok = iwl_parse_nvm_get_info(ConstByteView(info.data(), cut), 3, 3, true, &t, &error);
+      CHECK(ok == (cut == 128 || cut == 468 || cut == 488));      // (the length is what tells the layouts apart)
+    }
+    for (size_t i = 0; i < info.size(); ++i)
+      for (int bit = 0; bit < 8; ++bit) {
+        Bytes copy = info;
+        copy[i] ^= static_cast<uint8_t>(1 << bit);
+        IwlNvmData t;
+        (void)iwl_parse_nvm_get_info(ConstByteView(copy.data(), copy.size()), 3, 3, true, &t, &error);
+      }
+  }
+  { // a count beyond the array is clamped
+    Bytes info = nvm_info(4, 3, 0);
+    info[20 + 4 + 0] = 0xFF; info[20 + 4 + 1] = 0xFF;
+    IwlNvmData t;
+    const char* error = nullptr;
+    CHECK(iwl_parse_nvm_get_info(ConstByteView(info.data(), info.size()), 3, 3, true, &t, &error) && t.channel_count == iwl_nvm::kMaxChannels);
+  }
+  CHECK(iwl_nvm_channel_number(0) == 1 && iwl_nvm_channel_number(13) == 14 && iwl_nvm_channel_number(14) == 36 && iwl_nvm_channel_number(21) == 64 && iwl_nvm_channel_number(22) == 68 &&
+        iwl_nvm_channel_number(29) == 96 && iwl_nvm_channel_number(30) == 100 && iwl_nvm_channel_number(41) == 144 && iwl_nvm_channel_number(42) == 149 && iwl_nvm_channel_number(50) == 181 &&
+        iwl_nvm_channel_number(51) == 0);
+  // the hardware address from the CSR block: the strap, else the OTP
+  FakeIwl chip;
+  IwlPcieDevice dev(chip);
+  uint8_t mac[6];
+  chip.regs[0x380 / 4] = 0x00A0C9F1; chip.regs[0x384 / 4] = 0x00000A0B;
+  CHECK(iwl_read_csr_hw_address(dev, mac) && mac[0] == 0x00 && mac[1] == 0xA0 && mac[3] == 0xF1 && mac[5] == 0x0B);
+  chip.regs[0x388 / 4] = 0x28D2447A; chip.regs[0x38C / 4] = 0x00000102;
+  CHECK(iwl_read_csr_hw_address(dev, mac) && mac[0] == 0x28 && mac[1] == 0xD2 && mac[4] == 0x01 && mac[5] == 0x02);
+  chip.regs[0x388 / 4] = 0x01000000; chip.regs[0x38C / 4] = 0;                                  // a multicast strap: the OTP
+  CHECK(iwl_read_csr_hw_address(dev, mac) && mac[3] == 0xF1);
+  chip.regs[0x380 / 4] = 0; chip.regs[0x384 / 4] = 0; chip.regs[0x388 / 4] = 0;
+  CHECK(!iwl_read_csr_hw_address(dev, mac));
+}
+
+struct MemorySource final : IIwlFirmwareSource {
+  Bytes file;
+  const char* only = nullptr;           // the one name that exists
+  std::vector<std::string> asked;
+  bool read(const char* name, ByteBuffer& out) override {
+    asked.push_back(name);
+    if (!only || strcmp(name, only) != 0) return false;
+    out.clear();
+    return out.append(ConstByteView(file.data(), file.size()));
+  }
+};
+
+static void test_driver() {
+  TestAllocator alloc;
+  MemorySource source;
+  source.file = make_loadable_firmware(64);
+  source.only = "iwlwifi-9000-pu-b0-jf-b0-40.ucode";
+  for (int scenario = 0; scenario < 6; ++scenario) {
+    FakeIwl chip;
+    chip.w1c = true;
+    chip.force_radio = true;
+    chip.regs[iwl_csr::kHwRev / 4] = scenario == 5 ? (0x37u << 4) : ((0x31u << 4) | 0x1);
+    chip.regs[iwl_csr::kHwRfId / 4] = 0x108u << 12;
+    chip.prph[(iwl_tx::kScdSramBase & 0xFFFFF) / 4] = 0x800000;
+    chip.regs[0x388 / 4] = 0x28D2447A; chip.regs[0x38C / 4] = 0x00000102;
+    FakeRxChip rxhw(chip);
+    FakeTxChip txhw(chip);
+    chip.on_alive = [&] { Bytes f; FakeRxChip::frame(f, 0, 1, 0x8000, alive_payload(0xCAFE)); rxhw.deliver(f); };
+    chip.on_doorbell = [&] {
+      bool good = false;
+      for (const Bytes& c : txhw.process(&good)) {
+        const uint16_t seq = static_cast<uint16_t>(c[2] | (c[3] << 8));
+        Bytes f;
+        if (c[1] == 0x0C && c[0] == 0x02) {
+          if (scenario == 4) FakeRxChip::frame(f, c[1], c[0], seq, Bytes(77, 0));                  // a response of no known layout
+          else FakeRxChip::frame(f, c[1], c[0], seq, nvm_info(5, 0x1F, 1));
+        } else {
+          FakeRxChip::frame(f, c[1], c[0], seq, Bytes{0, 0, 0, 0});
+          if (c[1] == 0x02 && c[0] == 0x03 && scenario != 3) FakeRxChip::frame(f, 2, 4, 0x8000, Bytes{1});  // INIT_COMPLETE (not in scenario 3)
+        }
+        rxhw.deliver(f);
+      }
+    };
+    source.asked.clear();
+    IwlDriver driver(alloc);
+    const IwlDriver::Outcome r = driver.start_device(chip, true, source);
+    if (scenario == 0 || scenario == 1) {
+      CHECK(r == IwlDriver::Outcome::Started && driver.running());
+      CHECK(strcmp(driver.firmware_name(), "iwlwifi-9000-pu-b0-jf-b0-40.ucode") == 0);
+      CHECK(source.asked.size() == 7 && source.asked[0] == "iwlwifi-9000-pu-b0-jf-b0-46.ucode");             // newest first
+      const IwlNvmData& n = driver.nvm();
+      CHECK(n.hw_address[0] == 0x28 && n.hw_address[5] == 0x02 && n.channel_count == 51 && n.band_5ghz && n.nvm_version == 0x1234);
+      driver.stop();
+      CHECK(!driver.running() && alloc.dma.empty());
+    } else if (scenario == 2) {
+      CHECK(r == IwlDriver::Outcome::Started);                                                                   // (same, a second run on a fresh chip)
+    } else if (scenario == 3) {
+      CHECK(r == IwlDriver::Outcome::InitFailed && driver.message()[0] && alloc.dma.empty());               // no INIT_COMPLETE
+    } else if (scenario == 4) {
+      CHECK(r == IwlDriver::Outcome::InitFailed);
+    } else {
+      CHECK(r == IwlDriver::Outcome::UnsupportedHardware && source.asked.empty());
+    }
+  }
+  { // no firmware file at all, and a broken one
+    FakeIwl chip;
+    chip.regs[iwl_csr::kHwRev / 4] = (0x32u << 4) | 0x1;
+  }
+}
+
 int main() {
   test_devices();
   test_firmware();
   test_real_firmware();
   test_pcie();
+  test_load();
+  test_rx();
+  test_tx();
+  test_transport();
+  test_nvm();
+  test_nvm_info();
+  test_driver();
   printf(g_failed ? "IwlTest: %d FAILED\n" : "IwlTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }

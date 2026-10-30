@@ -26,7 +26,7 @@
 //
 // enqcmd needs a valid PASID (IA32_PASID bit 31, set by the host with set_pasid()), otherwise it is #GP(0), as on a machine whose operating system has not set one up. The 64-byte command is
 // written to the destination (64-byte aligned, the address in the register) with its first dword replaced by the PASID; ordinary memory accepts every command, so ZF is clear. enqcmds is the
-// supervisor form: #GP(0) at CPL 3.
+// supervisor form: #GP(0) at CPL 3. The register forms of the same opcode are urdmsr and uwrmsr (user MSRs, listed by the host with set_user_msr(); the map 7 immediate forms are decoded in the VEX code).
 #include "Emulation/X86_64Cpu.hpp"
 
 namespace emulation {
@@ -149,7 +149,7 @@ X86_64Cpu::Step X86_64Cpu::wrss_instruction(GuestMemory& m, bool user) {
 X86_64Cpu::Step X86_64Cpu::enqcmd_instruction(GuestMemory& m, bool supervisor) {
   auto bad_decode = [&]() { return fail(d_.available < 15 ? 14 : 6, s_.rip + d_.available); };
   if (!decode_modrm() || !finish_decode()) return bad_decode();
-  if (d_.mod == 3) return fail(6);
+  if (d_.mod == 3) return d_.rex_w ? user_msr_instruction(supervisor, false, 0) : fail(6);      // urdmsr (F2) and uwrmsr (F3) share the opcode with enqcmd and enqcmds
   if (supervisor || pasid_ < 0) return fail(13);
   const uint64_t source = memory_address();
   const uint64_t destination = get_reg(d_.reg, d_.address32 ? 4 : 8);
@@ -160,6 +160,38 @@ X86_64Cpu::Step X86_64Cpu::enqcmd_instruction(GuestMemory& m, bool supervisor) {
   for (uint32_t i = 0; i < 4; ++i) command[i] = static_cast<uint8_t>(first >> (8 * i));
   if (!m.write(destination, ConstByteView(command, sizeof(command)))) return fail(14, destination, 2);
   s_.rflags &= ~(kZero | kCarry | kParity | kAdjust | kSign | kOverflow);      // ZF = 0: accepted
+  s_.rip += d_.position;
+  return Step::Ok;
+}
+
+bool X86_64Cpu::set_user_msr(uint32_t index, uint64_t value, bool writable) {
+  UserMsr* free_slot = nullptr;
+  for (UserMsr& entry : user_msrs_) {
+    if (entry.present && entry.index == index) { entry.value = value; entry.writable = writable; return true; }
+    if (!entry.present && free_slot == nullptr) free_slot = &entry;
+  }
+  if (free_slot == nullptr) return false;
+  *free_slot = UserMsr{true, writable, index, value};
+  return true;
+}
+
+bool X86_64Cpu::user_msr(uint32_t index, uint64_t* value) const {
+  for (const UserMsr& entry : user_msrs_)
+    if (entry.present && entry.index == index) { *value = entry.value; return true; }
+  return false;
+}
+
+// urdmsr r64, r64 (F2 REX.W 0F 38 F8, mod = 3: the MSR index in ModRM.reg, the destination ModRM.rm), uwrmsr r64, r64 (F3: the index in ModRM.reg, the value in ModRM.rm), and the VEX / EVEX map 7
+// forms with a 32-bit immediate index (the register is ModRM.rm). Only the MSRs the host listed are reachable; anything else, or a write to a read-only one, is #GP(0) (the user MSR table of
+// IA32_USER_MSR_CTL is not modelled beyond that).
+X86_64Cpu::Step X86_64Cpu::user_msr_instruction(bool write, bool use_immediate, uint32_t immediate) {
+  const uint64_t index = use_immediate ? immediate : get_reg(d_.reg, 8);
+  UserMsr* found = nullptr;
+  for (UserMsr& entry : user_msrs_)
+    if (entry.present && entry.index == index && index <= 0xFFFFFFFFu) found = &entry;
+  if (found == nullptr || (write && !found->writable)) return fail(13);
+  if (write) found->value = get_reg(d_.rm, 8);
+  else set_reg(d_.rm, 8, found->value);
   s_.rip += d_.position;
   return Step::Ok;
 }

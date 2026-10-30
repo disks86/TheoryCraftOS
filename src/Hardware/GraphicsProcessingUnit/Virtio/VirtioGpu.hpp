@@ -82,6 +82,8 @@ class VirtioGpu : public FramebufferGpu, public IMonitorSource {
   bool has_3d() const { return has_3d_; }
   // What the virgl host says it can do (virgl_caps_v1: the GLSL level; zero when the set could not be read). Compute shaders and the memory barrier they need are core in
   // OpenGL 4.3 / GLSL 4.30; a host below that (or one that did not say) gets none. (The capability bits `bset` were read as well, but their numbering is not relied on.)
+  // Most samples per pixel the host's multisampled images have (0 when it did not say).
+  uint32_t virgl_max_samples() const { return has_3d_ ? virgl_max_samples_ : 0; }
   bool virgl_has_compute() const { return has_3d_ && virgl_glsl_level_ >= 430; }
   uint32_t context_id() const { return kContextId; }
   uint32_t allocate_resource_id() { return next_resource_++; }
@@ -150,7 +152,7 @@ class VirtioGpu : public FramebufferGpu, public IMonitorSource {
   uint32_t used_scanouts_ = 0;                                // bit mask of the scanouts that were given a resource
 
   bool has_3d_ = false;
-  uint32_t virgl_bset_ = 0, virgl_glsl_level_ = 0;
+  uint32_t virgl_bset_ = 0, virgl_glsl_level_ = 0, virgl_max_samples_ = 0;
   uint32_t next_resource_ = 1;
   uint64_t resource_bytes_ = 0;   // live 3D resources, see add_resource_bytes()
   uint32_t screen_resource_ = 0;  // the 2D framebuffer resource

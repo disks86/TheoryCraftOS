@@ -761,6 +761,7 @@ bool Gen9GraphicsDevice::submit(ICommandBuffer* commands) {
         if (!draws.push_back(d)) return false;
         break;
       }
+      case RecordedCommand::Type::Resolve:
       case RecordedCommand::Type::BindComputePipeline:
       case RecordedCommand::Type::BindStorageBuffer:
       case RecordedCommand::Type::Dispatch:

@@ -558,6 +558,10 @@ void test_stream_fuzz() {
   query_desc.flags = kAllocQueryResult, query_desc.size = 16;
   Handle queries = 0;
   CHECK(e.kernel.create_allocation(kPid, e.dev, query_desc, &queries) == status::kSuccess);
+  AllocationDesc ms_desc;
+  ms_desc.flags = kAllocRenderTarget, ms_desc.format = Format::A8R8G8B8, ms_desc.width = ms_desc.height = 8, ms_desc.samples = 4;
+  Handle ms_target = 0;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, ms_desc, &ms_target) == status::kSuccess);
   Handle pipe = make_colored_pipeline(e);
   CHECK(write_triangle(e, vb, 1, 1, 0));
   const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
@@ -574,11 +578,12 @@ void test_stream_fuzz() {
   w.end_query();
   w.draw_indexed(3);
   w.end_pass();
+  w.resolve_region(0, 5);
   w.copy_region(3, 0, 0, 3, 1, 1, 2, 2);
   w.generate_mipmaps(3);
   CHECK(w.ok());
   std::vector<uint8_t> good(w.view().data(), w.view().data() + w.view().size());
-  std::vector<Handle> list = {rt, vb, ib, tex, queries};
+  std::vector<Handle> list = {rt, vb, ib, tex, queries, ms_target};
   auto try_stream = [&](const std::vector<uint8_t>& bytes) {
     Handle ctx = 0;
     e.kernel.create_context(kPid, e.dev, ContextPriority::Normal, &ctx);
@@ -3878,6 +3883,115 @@ void test_compute_kernel() {
   CHECK(kernel.create_shader(kPid, dev, sd, &refused) == status::kNotSupported);
 }
 
+void test_multisample() {
+  Env e;
+  auto create = [&](uint32_t flags, Format f, uint32_t samples, uint32_t w = 32, uint32_t h = 32, uint32_t mips = 1, Handle* out = nullptr) {
+    AllocationDesc d;
+    d.flags = flags, d.format = f, d.width = w, d.height = h, d.samples = samples, d.mip_levels = mips;
+    Handle handle = 0;
+    const NtStatus st = e.kernel.create_allocation(kPid, e.dev, d, &handle);
+    if (out) *out = handle;
+    return st;
+  };
+  CHECK(create(kAllocRenderTarget, Format::A8R8G8B8, 2) == status::kSuccess && create(kAllocRenderTarget, Format::A8R8G8B8, 4) == status::kSuccess);
+  CHECK(create(kAllocRenderTarget, Format::A8R8G8B8, 8) == status::kSuccess && create(kAllocDepthStencil, Format::D32Float, 4) == status::kSuccess);
+  CHECK(create(kAllocRenderTarget, Format::A8R8G8B8, 3) == status::kNotSupported && create(kAllocRenderTarget, Format::A8R8G8B8, 16) == status::kNotSupported);
+  CHECK(create(kAllocRenderTarget, Format::A8R8G8B8, 64) == status::kNotSupported);
+  // Render targets and depth buffers only, one level, 8-bit colour.
+  CHECK(create(kAllocRenderTarget | kAllocTexture, Format::A8R8G8B8, 4) == status::kInvalidParameter);
+  CHECK(create(kAllocTexture, Format::A8R8G8B8, 4) == status::kInvalidParameter);
+  CHECK(create(kAllocRenderTarget | kAllocPresent, Format::A8R8G8B8, 4) == status::kInvalidParameter);
+  CHECK(create(kAllocStaging, Format::A8R8G8B8, 4) == status::kInvalidParameter);
+  CHECK(create(kAllocRenderTarget, Format::A8R8G8B8, 4, 32, 32, 2) == status::kInvalidParameter);
+  CHECK(create(kAllocRenderTarget, Format::A16B16G16R16F, 4) == status::kInvalidParameter);
+  // (the images below)
+  Handle ms = 0, ms2 = 0, depth = 0, depth2 = 0, plain = 0, other_size = 0, texture = 0;
+  CHECK(create(kAllocRenderTarget, Format::A8R8G8B8, 4, 32, 32, 1, &ms) == status::kSuccess && create(kAllocRenderTarget, Format::A8R8G8B8, 2, 32, 32, 1, &ms2) == status::kSuccess);
+  CHECK(create(kAllocDepthStencil, Format::D32Float, 4, 32, 32, 1, &depth) == status::kSuccess && create(kAllocDepthStencil, Format::D32Float, 2, 32, 32, 1, &depth2) == status::kSuccess);
+  CHECK(create(kAllocRenderTarget, Format::A8R8G8B8, 1, 32, 32, 1, &plain) == status::kSuccess && create(kAllocRenderTarget, Format::A8R8G8B8, 1, 16, 16, 1, &other_size) == status::kSuccess);
+  CHECK(create(kAllocTexture | kAllocRenderTarget, Format::A8R8G8B8, 1, 32, 32, 1, &texture) == status::kSuccess);
+  LockResult lock;
+  CHECK(e.kernel.lock(kPid, ms, kLockReadOnly, 0, &lock) == status::kNotSupported);   // (no pixels of the CPU's)
+
+  // A pipeline of the builtin shaders, with coverage per sample or without.
+  auto pipeline = [&](bool multisample) {
+    Handle vs = 0, fs = 0, pipe = 0;
+    CHECK(e.kernel.create_shader(kPid, e.dev, {ShaderKind::ColoredVertex, graphics::ShaderStage::Vertex, {}}, &vs) == status::kSuccess);
+    CHECK(e.kernel.create_shader(kPid, e.dev, {ShaderKind::ColoredFragment, graphics::ShaderStage::Fragment, {}}, &fs) == status::kSuccess);
+    graphics::GraphicsPipelineDesc gd;
+    graphics::describe_colored_pipeline(&gd);
+    PipelineDesc pd;
+    pd.vertex_shader = vs, pd.fragment_shader = fs, pd.vertex_stride = gd.vertex_stride, pd.attribute_count = 2, pd.varying_count = 1;
+    pd.attributes[0] = gd.attributes[0], pd.attributes[1] = gd.attributes[1];
+    pd.cull_mode = graphics::CullMode::None;
+    pd.multisample = multisample;
+    CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &pipe) == status::kSuccess);
+    return pipe;
+  };
+  const Handle covering = pipeline(true), aliased = pipeline(false);
+  // A red rectangle from x = 4.3 to 20.6 over the whole height, in NDC of a 32 x 32 target.
+  const float x0 = 4.3f / 16 - 1, x1 = 20.6f / 16 - 1;
+  const float v[42] = {x0, -1, 0.5f, 1, 0, 0, 1, x1, -1, 0.5f, 1, 0, 0, 1, x0, 1, 0.5f, 1, 0, 0, 1,
+                       x0, 1, 0.5f, 1, 0, 0, 1, x1, -1, 0.5f, 1, 0, 0, 1, x1, 1, 0.5f, 1, 0, 0, 1};
+  Handle vb = e.buffer(kAllocVertexBuffer, sizeof v);
+  CHECK(e.write(vb, floats(v, 42)));
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  auto draw = [&](Handle pipe, Handle target, Handle depth_buffer, Handle resolve_to) {
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, depth_buffer ? 1u : kNoAllocation, kPassClearColor | (depth_buffer ? kPassClearDepth : 0u), {0, 0, 0, 1}, 1, 0);
+    w.bind_pipeline(pipe);
+    w.bind_vertex_buffer(3);
+    w.push_constants(floats(identity, 16));
+    w.draw(6);
+    w.end_pass();
+    if (resolve_to) w.resolve_region(2, 0);
+    return e.render(w, {target, depth_buffer ? depth_buffer : target, resolve_to ? resolve_to : target, vb});
+  };
+  auto red = [&](Handle image, uint32_t x, uint32_t y) { return (e.pixel(image, x, y) >> 16) & 0xFF; };
+  // 4 samples: x offsets 1/8, 3/8, 5/8, 7/8 of a pixel, so pixel 4 (edge at 0.3) has three of its four samples inside, pixel 20 (edge at 0.6) two.
+  CHECK(draw(covering, ms, 0, plain) == status::kSuccess);
+  CHECK(red(plain, 10, 10) == 255 && red(plain, 3, 10) == 0 && red(plain, 22, 10) == 0 && red(plain, 4, 10) == 191 && red(plain, 20, 10) == 128 && e.pixel(plain, 10, 10) >> 24 == 0xFF);
+  // 2 samples (x offsets 1/4, 3/4): pixel 4 has one of two.
+  CHECK(draw(covering, ms2, 0, plain) == status::kSuccess);
+  CHECK(red(plain, 4, 10) == 128 && red(plain, 20, 10) == 128 && red(plain, 10, 10) == 255);
+  // Without multisample the pixel is all or nothing by its centre: pixel 4's centre (4.5) is inside, pixel 20's (20.5) is not (the edge at 20.6).
+  CHECK(draw(aliased, ms, 0, plain) == status::kSuccess);
+  CHECK(red(plain, 4, 10) == 255 && red(plain, 20, 10) == 255 && red(plain, 21, 10) == 0);
+  // The same into a texture; and with a depth buffer of the same count.
+  CHECK(draw(covering, ms, depth, texture) == status::kSuccess && red(texture, 4, 10) == 191 && red(texture, 10, 10) == 255);
+
+  // Refused: counts that differ in a pass; resolving what is not multisampled, into a multisampled image, between sizes; copies; a resolve inside a pass.
+  CHECK(draw(covering, ms, depth2, plain) == status::kInvalidParameter);
+  auto stream = [&](auto build) {
+    CommandWriter w(e.allocator);
+    build(w);
+    return e.render(w, {ms, plain, other_size, ms2, texture});
+  };
+  CHECK(stream([&](CommandWriter& w) { w.resolve_region(1, 0); }) == status::kSuccess);
+  CHECK(stream([&](CommandWriter& w) { w.resolve_region(1, 1); }) == status::kInvalidParameter);   // (not multisampled)
+  CHECK(stream([&](CommandWriter& w) { w.resolve_region(0, 3); }) == status::kInvalidParameter);   // (into a multisampled image)
+  CHECK(stream([&](CommandWriter& w) { w.resolve_region(2, 0); }) == status::kInvalidParameter);   // (another size)
+  CHECK(stream([&](CommandWriter& w) { w.resolve_region(0, 0); }) == status::kInvalidParameter);
+  CHECK(stream([&](CommandWriter& w) { w.copy_region(1, 0, 0, 0, 0, 0, 8, 8); }) == status::kInvalidParameter);
+  CHECK(stream([&](CommandWriter& w) { w.copy_region(0, 0, 0, 1, 0, 0, 8, 8); }) == status::kInvalidParameter);
+  CHECK(stream([&](CommandWriter& w) { w.begin_pass(0, kNoAllocation, 0, {}, 1, 0); w.resolve_region(1, 0); w.end_pass(); }) == status::kInvalidParameter);
+
+  // A device without the feature refuses the images and the pipeline flag.
+  FakeScreen screen(8, 6);
+  graphics::SoftwareDevice software(e.allocator, &screen);
+  SpyDevice limited(software);
+  limited.feature_mask = 0;
+  Kernel kernel(e.allocator);
+  AdapterConfig c;
+  c.display = &screen;
+  kernel.add_adapter(limited, c);
+  Handle adapter = 0, dev = 0, refused = 0;
+  CHECK(kernel.open_process(kPid) == status::kSuccess && kernel.open_adapter_from_index(kPid, 0, &adapter) == status::kSuccess && kernel.create_device(kPid, adapter, &dev) == status::kSuccess);
+  AllocationDesc d;
+  d.flags = kAllocRenderTarget, d.format = Format::A8R8G8B8, d.width = d.height = 8, d.samples = 4;
+  CHECK(kernel.create_allocation(kPid, dev, d, &refused) == status::kNotSupported);
+}
+
 void test_conformance() {
   test_half_floats();
   HostAllocator allocator;
@@ -3931,6 +4045,21 @@ void test_conformance() {
       };
       CHECK(near(r.device_picture[16 * 32 + 12] & 0xFFFFFF, 0xb49a81) && near(r.device_picture[16 * 32 + 13] & 0xFFFFFF, 0x4d661a));
       CHECK(near(r.device_picture[28 * 32 + 8] & 0xFFFFFF, 0x9a3434) && near(r.device_picture[28 * 32 + 9] & 0xFFFFFF, 0x1a1a80));
+    }
+    if (__builtin_strstr(r.name, "multisampling")) {
+      // Inside a rectangle all four samples agree; on the left edge of the far one (x = 4.3) three of the four samples of the pixel are inside: 3/4 of red. Where the near green edge
+      // (x = 12.4) cuts the pixel above the red, two samples are green and two red.
+      auto px = [&](uint32_t x, uint32_t y) { return r.device_picture[y * 32 + x] & 0xFFFFFF; };
+      auto near = [](uint32_t a, uint32_t b) {
+        for (uint32_t shift = 0; shift < 24; shift += 8) {
+          const int32_t d = static_cast<int32_t>((a >> shift) & 0xFF) - static_cast<int32_t>((b >> shift) & 0xFF);
+          if (d > 2 || d < -2) return false;
+        }
+        return true;
+      };
+      // (columns 8 and 20 are even, 9 and 21 odd: both images give the same picture)
+      CHECK(px(8, 10) == 0xFF0000 && px(9, 10) == 0xFF0000 && px(20, 20) == 0x00FF00 && px(21, 20) == 0x00FF00 && px(1, 1) == 0 && near(px(4, 10), 0xBF0000) && near(px(12, 15), 0x808000));
+      CHECK(near(px(5, 10), 0xFF0000) && near(px(13, 15), 0x00FF00));
     }
     if (__builtin_strstr(r.name, "compute shader")) {
       // Every pixel from the formula of cs_fill.hlsl (the thread of x, y is number (y % 4) * 8 + x % 8 of group x / 8, y / 4).
@@ -5052,6 +5181,7 @@ int main() {
   test_independent_blend();
   test_compute();
   test_compute_kernel();
+  test_multisample();
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);
     return 1;

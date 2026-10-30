@@ -208,6 +208,7 @@ class Adapter::StreamRunner {
       case Op::BeginQuery: return begin_query(p);
       case Op::EndQuery: return end_query(p);
       case Op::BindUav: return bind_uav(p);
+      case Op::ResolveRegion: return resolve(p);
       case Op::Dispatch: return dispatch(p);
       case Op::SetTopology: {
         const uint32_t topology = p.le32();
@@ -262,11 +263,11 @@ class Adapter::StreamRunner {
     Allocation* depth = depth_index == kNoAllocation ? nullptr : alloc(depth_index);
     if (!color || !color->is_image() || !(color->desc().flags & kAllocRenderTarget)) return kBad;
     if (depth_index != kNoAllocation && (!depth || !depth->is_image() || !(depth->desc().flags & kAllocDepthStencil))) return kBad;
-    if (depth && (depth->desc().width != color->desc().width || depth->desc().height != color->desc().height)) return kBad;
+    if (depth && (depth->desc().width != color->desc().width || depth->desc().height != color->desc().height || depth->desc().samples != color->desc().samples)) return kBad;
     for (uint32_t n = 0; n < extra_count; ++n) {
       const Allocation* e = extras[n];
       if (!e->is_image() || !(e->desc().flags & kAllocRenderTarget) || e == color || e == depth) return kBad;
-      if (e->desc().width != color->desc().width || e->desc().height != color->desc().height || e->desc().format != color->desc().format) return kBad;
+      if (e->desc().width != color->desc().width || e->desc().height != color->desc().height || e->desc().format != color->desc().format || e->desc().samples != color->desc().samples) return kBad;
       for (uint32_t k = 0; k < n; ++k)
         if (extras[k] == e) return kBad;
     }
@@ -333,6 +334,27 @@ class Adapter::StreamRunner {
       if (s != status::kSuccess) return s;
       cb_->bind_pipeline(pipeline_->pipeline());
     }
+    return status::kSuccess;
+  }
+
+  // Averages the samples of a multisampled colour target into an ordinary image of the same format and size.
+  NtStatus resolve(ByteReader& p) {
+    const uint32_t to_index = p.le32(), from_index = p.le32();
+    if (!exact(p) || in_pass_ || !(adapter_.caps_.features & graphics::kFeatureMultisample)) return kBad;
+    Allocation* to = alloc(to_index);
+    Allocation* from = alloc(from_index);
+    if (!to || !from || !to->is_image() || !from->is_image() || to->is_depth() || from->is_depth() || to->is_staging() || to == from) return kBad;
+    if (from->desc().samples < 2 || to->desc().samples != 1 || to->mip_levels() != 1 || to->layers() != 1) return kBad;
+    if (to->desc().format != from->desc().format || to->desc().width != from->desc().width || to->desc().height != from->desc().height) return kBad;
+    if (!(from->desc().flags & kAllocRenderTarget)) return kBad;
+    unbind_textures_of(to);
+    if (!exec_) return status::kSuccess;
+    NtStatus s = resident(*to);
+    if (s == status::kSuccess) s = resident(*from);
+    if (s == status::kSuccess) s = ensure_cb();
+    if (s != status::kSuccess) return s;
+    cb_->resolve_image(to->image(), from->image());
+    mm_.note_gpu_write(*to);
     return status::kSuccess;
   }
 
@@ -624,7 +646,7 @@ class Adapter::StreamRunner {
     Allocation* dst = alloc(di);
     Allocation* src = alloc(si);
     if (!dst || !src || !dst->is_image() || !src->is_image() || dst->is_depth() || src->is_depth()) return kBad;
-    if (dst->desc().format != src->desc().format || dst->mip_levels() != 1 || src->mip_levels() != 1) return kBad;
+    if (dst->desc().format != src->desc().format || dst->mip_levels() != 1 || src->mip_levels() != 1 || dst->desc().samples != 1 || src->desc().samples != 1) return kBad;
     if (uint64_t{dx} + w > dst->desc().width || uint64_t{dy} + h > dst->desc().height || uint64_t{sx} + w > src->desc().width || uint64_t{sy} + h > src->desc().height) return kBad;
     if (!exec_) return status::kSuccess;
     NtStatus s = flush();
@@ -913,6 +935,7 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
         static_cast<uint32_t>(t.color_op) > 4 || static_cast<uint32_t>(t.alpha_op) > 4 || t.write_mask > 0xF)
       return status::kInvalidParameter;
   if (d.independent_blend && !(caps_.features & graphics::kFeatureIndependentBlend)) return status::kNotSupported;
+  if (d.multisample && !(caps_.features & graphics::kFeatureMultisample)) return status::kNotSupported;
   if ((bs.custom || d.depth_compare != graphics::CompareOp::LessEqual) && !(caps_.features & graphics::kFeatureBlendState)) return status::kNotSupported;
   for (uint32_t i = 0; i < d.attribute_count; ++i)
     if (d.attributes[i].per_instance && !(caps_.features & graphics::kFeatureInstancing)) return status::kNotSupported;
@@ -935,6 +958,7 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   pd.stencil = st;
   pd.blend = bs;
   pd.independent_blend = d.independent_blend;
+  pd.multisample = d.multisample;
   for (uint32_t i = 0; i < graphics::kMaxColorTargets - 1; ++i) pd.target_blend[i] = d.target_blend[i];
   pd.depth_compare = d.depth_compare;
   pd.color_target_count = d.color_target_count;

@@ -91,6 +91,9 @@ struct ImageDesc {
   uint32_t mip_levels = 1;
   TextureKind kind = TextureKind::Texture2D;
   uint32_t layers = 1;
+  // Samples per pixel of a multisampled attachment (kFeatureMultisample; DeviceInfo::sample_counts says which counts): a colour or depth attachment alone, one mip level, not sampled, not
+  // presented, not read or written by pixels - it is drawn into and then resolved (ICommandBuffer::resolve_image). All the attachments of a pass have the same count.
+  uint32_t samples = 1;
 };
 
 class IImage {
@@ -354,6 +357,9 @@ struct GraphicsPipelineDesc {
   bool depth_test = false;  // pass if closer or equal (LEQUAL)
   bool depth_write = false;
   bool alpha_blend = false;  // source over destination
+  // kFeatureMultisample, on a pass with several samples per pixel: with multisample the triangle covers the samples whose positions it contains and depth and stencil are tested for each
+  // (the shader still runs once per pixel); without it a pixel is all or nothing by its centre, as Direct3D 9 draws. Lines and points cover every sample of their pixel.
+  bool multisample = false;
   StencilState stencil;
   BlendState blend;                                   // kFeatureBlendState
   CompareOp depth_compare = CompareOp::LessEqual;     // kFeatureBlendState: what depth_test compares with (a device without it always uses LessEqual)
@@ -420,6 +426,10 @@ class ICommandBuffer {
   // What the vertices of the draws that follow make (kFeatureLines for lines and points; the default is a list of triangles).
   virtual void set_primitive_topology(PrimitiveTopology topology) = 0;
   virtual void end_render_pass() = 0;
+  // Averages the samples of a multisampled colour image into a single-sample image of the same format and size (kFeatureMultisample), outside a render pass.
+  virtual void resolve_image(IImage* destination, IImage* source) {
+    (void)destination, (void)source;
+  }
   // Compute (kFeatureCompute), outside a render pass: bind_compute_pipeline makes the pipeline of create_compute_pipeline current for the dispatches that follow, bind_storage_buffer
   // puts `size` bytes of a kBufferStorage buffer from `offset` in slot 0 .. kMaxStorageBuffers - 1, and dispatch runs x * y * z thread groups. A device without the feature ignores all three.
   virtual void bind_compute_pipeline(const IPipeline* pipeline) { (void)pipeline; }
@@ -457,6 +467,7 @@ enum DeviceFeature : uint32_t {
   kFeatureInstancing = 1u << 3,    // draw(..., instance_count, first_instance) and VertexAttribute::per_instance
   kFeatureLines = 1u << 4,         // set_primitive_topology: lines and points
   kFeatureFloatFormats = 1u << 6,      // Format::R16G16B16A16Float / R32G32B32A32Float images: colour attachments (also several at once) and sampled textures, without mipmaps; read_pixels_float / write_pixels_float
+  kFeatureMultisample = 1u << 11,      // ImageDesc::samples, GraphicsPipelineDesc::multisample, ICommandBuffer::resolve_image
   kFeatureCompute = 1u << 10,          // compute shaders: create_compute_pipeline, kBufferStorage buffers, ICommandBuffer::dispatch
   kFeatureIndependentBlend = 1u << 9,  // GraphicsPipelineDesc::independent_blend / target_blend
   kFeatureTextureKinds = 1u << 8,      // ImageDesc::kind other than Texture2D, layer_count / write_layer_pixels / read_layer_pixels, ITextureSet::sample_volume
@@ -471,6 +482,7 @@ struct DeviceInfo {
   bool accelerated;  // rendering is done by a GPU, not by the CPU
   uint32_t max_push_constant_bytes = 128;   // what push_constants() may be given (a multiple of 16, up to kMaxPushConstantBytes)
   uint32_t features = 0;                    // DeviceFeature bits
+  uint32_t sample_counts = 0;               // kFeatureMultisample: bit n set: ImageDesc::samples = n is supported
 };
 
 class IGraphicsDevice {
