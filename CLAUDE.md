@@ -13,6 +13,39 @@ Write new code so that memory errors cannot happen, not so that they are unlikel
 - Keep every `reinterpret_cast` in one small helper with a comment saying why it is safe (alignment, lifetime), and don't scatter casts through logic code.
 - New decoders and parsers need truncation and bit-flip cases in their host tests. Run them with `tests/run_host_tests.sh <TestName>`, which builds with ASan and UBSan, and fix any sanitizer report.
 
+## Concurrent data structures
+
+Shared state touched by more than one core, thread or interrupt handler goes in one of these, not in a bare container, a hand-rolled
+atomic dance, or a raw `SpinLock` wrapped around ad-hoc fields. Pick the lightest one that fits:
+
+- `Hive<T>` (`ObjectContainer/Hive.hpp`): the container for objects that other code holds pointers to (tasks, connections, buffers,
+  descriptors). O(1) insert and erase, and elements never move, so a pointer stays valid until that element is erased. Prefer it over
+  `List`/`Array` plus indices whenever references must survive other insertions and removals.
+- `Concurrent*` containers (`ObjectContainer/Concurrent/`: queue, stack, list, dictionary, priority queue, ...): the default for shared
+  collections with short operations. They are `Synchronized` wrappers, so every access takes a `SpinLock`: never call back into the same
+  container from inside `with()`/`for_each()`, and copy values out instead of keeping references past the lock.
+- `Synchronized<T>` / `AtomicSharedPointer<T>` (`Synchronization/`): a single shared value or a swappable `SharedPointer` that readers load
+  a private copy of. Use these before writing a new lock-protected class.
+- RCU (`Kernel/Rcu.hpp`, shaped after C++26 `<rcu>`): read-mostly data that is read far more often than it changes (routing and lookup
+  tables, registries, configuration). Readers use `RcuReader` and never block or write; the writer publishes a new version with
+  `rcu_assign_pointer`, retires the old one (`RcuObjectBase`, `rcu_retire`) and it is freed after a grace period. Readers must not sleep
+  inside the section. Use `rcu_dereference` on the published pointer.
+- Hazard pointers (`Kernel/HazardPointer.hpp`): safe reclamation for lock-free structures where readers follow pointers to nodes that
+  another core may unlink (`HazardDomain`, `HazardGuard::protect`, `HazardDomain::retire`). Use them when readers must hold a few
+  individual nodes for a short time, or when a reader may stall (preemption, interrupt) and must not hold back all reclamation, which RCU
+  would. Keep guards short-lived: slots are fixed in number.
+
+Guidance:
+
+- Do not free (or reuse) an object that a lock-free reader might still see. Retire it through RCU or a hazard domain; never `delete`
+  it right after unlinking.
+- Both RCU and hazard pointers work from threads, interrupt handlers and early boot, with no allocation and no interrupt masking, so use
+  them on paths that must not take a `SpinLock`.
+- Do not reach for lock-free code when a `Concurrent*` container is fast enough. Add a lock-free structure only where profiling or a
+  context (interrupt handler, hot read path) demands it, and keep the memory-safety rules above.
+- New concurrent code needs a host test that exercises several threads (see `tests/HiveTest.cpp`, `tests/RcuTest.cpp`,
+  `tests/HazardPointerTest.cpp`; `src/ConcurrentDemo.cpp` shows the containers in use). Run it with `tests/run_host_tests.sh <TestName>`.
+
 ## Filesystem layout
 
 The system filesystem has a fixed layout: `/` is the primary partition, `/EFI` the EFI partition, `/Desktop` (with `Downloads`, `Documents`,
