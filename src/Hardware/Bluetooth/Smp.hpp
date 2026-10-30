@@ -100,6 +100,12 @@ class SecurityManager final : public IL2capFixedHandler {
 
   // Pairs with the peripheral on a link and waits for the outcome (the encryption on, the keys received). On Failed, failure_reason() is the code the peripheral or we sent.
   SmResult pair(uint16_t link, uint32_t timeout_ms = 60000);
+  // The same without waiting: start_pairing() sends the request (Ok: it is under way), the controller's poll() carries it on, and pairing_finished() says when it ended (Ok or Failed, with
+  // failure_reason()). Only one pairing at a time.
+  SmResult start_pairing(uint16_t link);
+  bool pairing_finished(SmResult* result);
+  // A pairing that takes too long is given up (the peripheral is told).
+  void abort_pairing();
   // Encrypts a link with the bond of its peripheral.
   SmResult encrypt(uint16_t link, uint32_t timeout_ms = 5000);
   uint8_t failure_reason() const { return failure_; }

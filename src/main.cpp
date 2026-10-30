@@ -92,6 +92,7 @@
 #include "Hardware/Mouse/I2c/PlatformI2cHid.hpp"
 #ifdef TCOS_BLUETOOTH
 #include "Hardware/Bluetooth/BluetoothService.hpp"
+#include "Hardware/Bluetooth/HidOverGatt.hpp"
 #include "Hardware/WirelessInterface/Intel/IwlDriver.hpp"      // (FileSystemFirmwareSource reads /firmware)
 #endif
 #ifdef TCOS_INTEL_WIFI
@@ -1015,6 +1016,9 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
 
   // Input devices: PS/2, USB HID and virtio-input, merged into one keyboard and mouse.
   hardware::SystemInput input(pci, usb, shared_allocator, st);
+#ifdef TCOS_BLUETOOTH
+  hardware::HidOverGatt bluetooth_hid(shared_allocator);      // Bluetooth keyboards and mice: a profile for the Bluetooth manager and a source of input devices for SystemInput (it outlives both)
+#endif
   input.set_vmmdev(guest.virtualbox());
   input.initialize();
   // The touchpad and the touchscreen of a laptop are HID devices on an I2C bus behind the chipset (ACPI PNP0C50): found through the ACPI tables, and added to the mouse.
@@ -1236,6 +1240,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     UniquePointer<hardware::BluetoothService> bluetooth = UniquePointer<hardware::BluetoothService>::make(shared_allocator, &usb, &bluetooth_files, shared_allocator, smb_random.ready() ? &smb_random : nullptr, &bluetooth_bonds);
     uint32_t bluetooth_bonds_saved = 0;
     if (bluetooth && paging_ok) {
+      bluetooth->add_profile(&bluetooth_hid);
+      input.add_source(&bluetooth_hid);
       bluetooth->start();
       bluetooth_bonds_saved = bluetooth->bonds().count();
       for (uint32_t i = 0; i < bluetooth->count(); ++i) {

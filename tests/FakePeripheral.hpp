@@ -135,6 +135,14 @@ struct Peripheral {
     db.push_back(v);
     return db.back();
   }
+  void add_descriptor(uint16_t h, uint16_t uuid16, const Bytes& value, bool encrypted_only = false) {
+    Attr a;
+    a.handle = h;
+    a.uuid = Uuid::from16(uuid16);
+    a.value = value;
+    a.encrypted_only = encrypted_only;
+    db.push_back(a);
+  }
   void add_cccd(uint16_t h) {
     Attr a;
     a.handle = h;
