@@ -415,17 +415,101 @@ uint32_t Usb4Domain::available_credits(const Usb4Router& r, const Usb4Port& lane
   return credits > 0 ? static_cast<uint32_t>(credits) : 0;
 }
 
+// ---- the EEPROM of a Thunderbolt 3 router (eeprom.c): its DROM is read by driving the serial flash's pins from the plug events capability, one bit at a time.
+
+bool Usb4Domain::eeprom_ctl(const Usb4Router& r, uint32_t* word, bool write_it) {
+  if (write_it) return write(r.route, 0, TbConfigSpace::Switch, r.cap_plug_events + kPlugEventsEepromCtl, ArrayView<const uint32_t>(word, 1));
+  return read(r.route, 0, TbConfigSpace::Switch, r.cap_plug_events + kPlugEventsEepromCtl, ArrayView<uint32_t>(word, 1));
+}
+
+// Access on: bit banging enabled and the chip selected; off: deselected first, then bit banging off (the controller does not probe again otherwise).
+bool Usb4Domain::eeprom_active(const Usb4Router& r, bool enable) {
+  uint32_t ctl = 0;
+  if (!eeprom_ctl(r, &ctl, false)) return false;
+  if (enable) {
+    ctl |= kEepromBitBang;
+    if (!eeprom_ctl(r, &ctl, true)) return false;
+    ctl &= ~kEepromCs;
+    return eeprom_ctl(r, &ctl, true);
+  }
+  ctl |= kEepromCs;
+  if (!eeprom_ctl(r, &ctl, true)) return false;
+  ctl &= ~kEepromBitBang;
+  return eeprom_ctl(r, &ctl, true);
+}
+
+bool Usb4Domain::eeprom_out(const Usb4Router& r, uint8_t value) {
+  uint32_t ctl = 0;
+  if (!eeprom_ctl(r, &ctl, false)) return false;
+  for (uint32_t i = 0; i < 8; ++i) {
+    ctl = (value & 0x80) ? (ctl | kEepromDi) : (ctl & ~kEepromDi);
+    if (!eeprom_ctl(r, &ctl, true)) return false;           // (the bit first, then the clock up and down)
+    ctl |= kEepromSk;
+    if (!eeprom_ctl(r, &ctl, true)) return false;
+    ctl &= ~kEepromSk;
+    if (!eeprom_ctl(r, &ctl, true)) return false;
+    value = static_cast<uint8_t>(value << 1);
+  }
+  return true;
+}
+
+bool Usb4Domain::eeprom_in(const Usb4Router& r, uint8_t* value) {
+  uint32_t ctl = 0;
+  if (!eeprom_ctl(r, &ctl, false)) return false;
+  *value = 0;
+  for (uint32_t i = 0; i < 8; ++i) {
+    ctl |= kEepromSk;
+    if (!eeprom_ctl(r, &ctl, true) || !eeprom_ctl(r, &ctl, false)) return false;       // (the chip's bit is there with the clock up)
+    *value = static_cast<uint8_t>((*value << 1) | ((ctl & kEepromDo) ? 1 : 0));
+    ctl &= ~kEepromSk;
+    if (!eeprom_ctl(r, &ctl, true)) return false;
+  }
+  return true;
+}
+
+// The read command (3) and the 16 bit address, then the bytes; the DROM starts at the offset the plug events capability names.
+bool Usb4Domain::eeprom_read_n(const Usb4Router& r, uint32_t offset, uint8_t* out, uint32_t count) {
+  if (r.cap_plug_events == 0) return false;
+  uint32_t ctl = 0, drom_offset = 0;
+  if (!eeprom_ctl(r, &ctl, false) || !(ctl & kEepromPresent) || (ctl & kEepromNotPresent)) return false;
+  if (!read(r.route, 0, TbConfigSpace::Switch, r.cap_plug_events + kPlugEventsDromOffset, ArrayView<uint32_t>(&drom_offset, 1)) || drom_offset > 0xFFFF) return false;
+  offset += drom_offset;
+  if (offset > 0xFFFF) return false;
+  if (!eeprom_active(r, true)) return false;
+  bool ok = eeprom_out(r, 3) && eeprom_out(r, static_cast<uint8_t>(offset >> 8)) && eeprom_out(r, static_cast<uint8_t>(offset));
+  for (uint32_t i = 0; ok && i < count; ++i) ok = eeprom_in(r, out + i);
+  return eeprom_active(r, false) && ok;
+}
+
+static uint8_t tb_crc8(const uint8_t* data, uint32_t length) {
+  uint8_t value = 0xFF;
+  for (uint32_t i = 0; i < length; ++i) {
+    value ^= data[i];
+    for (uint32_t j = 0; j < 8; ++j) value = static_cast<uint8_t>((value << 1) ^ ((value & 0x80) ? 7 : 0));
+  }
+  return value;
+}
+
 bool Usb4Domain::read_drom(Usb4Router& r) {
   r.drom = false;
   uint8_t size_bytes[2];
-  if (!drom_read(r, 14, ByteView(size_bytes, 2))) return false;
-  const uint32_t data_len = (size_bytes[0] | (uint32_t{size_bytes[1]} << 8)) & 0xFFF;
-  const uint32_t total = data_len + 13;
-  if (total < 16 || total > 4096) return false;
   uint8_t rom[4096];
-  if (!drom_read(r, 0, ByteView(rom, total))) return false;
-  if (rom[13] != 3) return false;                          // (only the USB4 layout: revision 3; the data CRC is not enforced, as in Linux)
+  uint32_t total;
+  if (r.tbt3) {
+    if (!eeprom_read_n(r, 14, size_bytes, 2)) return false;
+    total = ((size_bytes[0] | (uint32_t{size_bytes[1]} << 8)) & 0x3FF) + 13;
+    if (total < 22 || total > sizeof rom || !eeprom_read_n(r, 0, rom, total)) return false;
+  } else {
+    if (!drom_read(r, 14, ByteView(size_bytes, 2))) return false;
+    total = ((size_bytes[0] | (uint32_t{size_bytes[1]} << 8)) & 0xFFF) + 13;
+    if (total < 16 || total > sizeof rom || !drom_read(r, 0, ByteView(rom, total))) return false;
+  }
+  // revision 3 is the USB4 layout (16 byte header, the CRC32 not enforced); anything else is read as the Thunderbolt layout (22 byte header, the unique id's CRC8 has to match)
   uint32_t pos = 16;
+  if (rom[13] != 3) {
+    if (total < 22 || tb_crc8(rom + 1, 8) != rom[0]) return false;
+    pos = 22;
+  }
   while (pos < total) {
     const uint8_t len = rom[pos];
     if (pos + 1 == total || len == 0 || pos + len > total || len < 2) return false;     // (an entry that runs past the end)

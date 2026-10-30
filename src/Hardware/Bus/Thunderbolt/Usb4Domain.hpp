@@ -57,6 +57,7 @@ constexpr uint32_t kDpCs0 = 0, kDpCs0Ae = 1u << 30, kDpCs0Ve = 1u << 31, kDpCs3 
 // Thunderbolt 3 device routers: the vendor specific capabilities of their space (plug events, link controller) and the link controller's registers
 constexpr uint8_t kSwitchCapVse = 0x05, kVsecPlugEvents = 0x01, kVsecLinkController = 0x06;
 constexpr uint32_t kLcDesc = 2, kLcSxCtrl = 0x96, kLcSxCtrlWoc = 1u << 1, kLcSxCtrlWod = 1u << 2, kLcSxCtrlWodpc = 1u << 3, kLcSxCtrlWodpd = 1u << 4, kLcSxCtrlWou4 = 1u << 5, kLcSxCtrlWop = 1u << 6, kLcSxCtrlSlp = 1u << 31, kLcSxCtrlL1c = 1u << 16, kLcSxCtrlL2c = 1u << 20, kLcSxCtrlUpstream = 1u << 30, kLcCs42 = 0x2A, kLcCs42UsbPlugged = 1u << 31, kLcLinkReq = 0xAD, kLcLinkReqXhciConnect = 1u << 31, kLcPortAttr = 0x8D, kLcPortAttrBe = 1u << 12, kPlugEventsUsbDisable = 1u << 2,
+                   kPlugEventsEepromCtl = 4, kPlugEventsDromOffset = 12, kEepromSk = 1u << 0, kEepromCs = 1u << 1, kEepromDi = 1u << 2, kEepromDo = 1u << 3, kEepromBitBang = 1u << 4, kEepromNotPresent = 1u << 5, kEepromPresent = 1u << 7,
                    kPlugEventsPcieWrData = 0x1B, kPlugEventsPcieCmd = 0x1C, kPcieCmdBridgeShift = 10, kPcieCmdWrite = 1u << 21, kPcieCmdValue = 2u << 22, kPcieCmdReqAck = 1u << 30, kPcieCmdTimeout = 1u << 31;
 // the time management unit: the router capability (TB_SWITCH_CAP_TMU), its registers, the port registers
 constexpr uint8_t kSwitchCapTmu = 0x03;
@@ -274,6 +275,11 @@ class Usb4Domain final : public IThunderboltEvents, public IXdomainHost, private
   // A router operation (usb4_native_switch_op): metadata and data in, the opcode written, the answer waited for. `status` is the operation's own result; false if the router does not support it.
   bool router_op(const Usb4Router& r, uint32_t opcode, uint32_t* metadata, uint8_t* status, const uint32_t* tx, uint32_t tx_dwords, uint32_t* rx, uint32_t rx_dwords);
   bool drom_read(const Usb4Router& r, uint32_t address, ByteView out);
+  bool eeprom_ctl(const Usb4Router& r, uint32_t* word, bool write);
+  bool eeprom_active(const Usb4Router& r, bool enable);
+  bool eeprom_out(const Usb4Router& r, uint8_t value);
+  bool eeprom_in(const Usb4Router& r, uint8_t* value);
+  bool eeprom_read_n(const Usb4Router& r, uint32_t offset, uint8_t* out, uint32_t count);
   int find_router_cap(const Usb4Router& r, uint8_t id);
   int find_router_vse(const Usb4Router& r, uint8_t vsec);
   bool plug_events_active(const Usb4Router& r);

@@ -50,6 +50,8 @@ struct Router {
   std::vector<Port> ports;           // index 0 is the control adapter
   uint32_t cs5_writes = 0, post_times = 0;
   std::vector<uint32_t> buffer_alloc;  // BUFFER_ALLOC entries (index | value << 16); none: the operation is not supported
+  std::vector<uint8_t> eeprom;       // a Thunderbolt 3 router's serial flash, read through the bit banging pins of the plug events capability
+  uint32_t eeprom_bits = 0, eeprom_cmd = 0, eeprom_addr = 0, eeprom_reads = 0;
   uint32_t cap_plug_events_model = 0;  // where the plug events capability is (a Thunderbolt 3 router)
   std::vector<uint8_t> drom;         // what DROM_READ gives (none: the operation is not supported)
   uint32_t drom_status = 0;          // the status the operation ends with
@@ -95,7 +97,7 @@ class Fabric {
     routers_[route] = std::move(r);
     return ref;
   }
-  // Makes the router at `route` a Thunderbolt 3 one: no USB4 version, no USB4 port capabilities, the plug events capability (at 0x28, short form) and the link controller (at 0x30, long form,
+  // Makes the router at `route` a Thunderbolt 3 one: no USB4 version, no USB4 port capabilities, the plug events capability (at 0x28, short form) and the link controller (at 0x50, long form,
   // per-port blocks of 4 dwords from 4 dwords in), the link controller's bonding attribute set.
   Router& make_tbt3(uint64_t route, uint32_t device_id = 0x15EA) {
     Router& r = *routers_[route];
@@ -103,11 +105,13 @@ class Fabric {
     r.device = device_id;
     r.first_cap = 0x28;
     r.cap_plug_events_model = 0x28;
-    r.regs[0x28] = 0x30 | (kSwitchCapVse << 8) | (kVsecPlugEvents << 16) | (0x10u << 24);
-    r.regs[0x30] = (kSwitchCapVse << 8) | (kVsecLinkController << 16);
-    r.regs[0x31] = 0;                                                                    // next: none, length: left zero
-    r.regs[0x30 + kLcDesc] = 4u | (4u << 8) | (4u << 16);
-    for (uint32_t phys = 0; phys < 4; ++phys) r.regs[0x30 + 4 + phys * 4 + kLcPortAttr] |= kLcPortAttrBe;
+    r.regs[0x28 + kPlugEventsEepromCtl] = kEepromPresent | kEepromCs;
+    r.regs[0x28 + kPlugEventsDromOffset] = 0x100;                                     // the DROM is 0x100 bytes into the flash
+    r.regs[0x28] = 0x50 | (kSwitchCapVse << 8) | (kVsecPlugEvents << 16) | (0x10u << 24);
+    r.regs[0x50] = (kSwitchCapVse << 8) | (kVsecLinkController << 16);
+    r.regs[0x51] = 0;                                                                    // next: none, length: left zero
+    r.regs[0x50 + kLcDesc] = 4u | (4u << 8) | (4u << 16);
+    for (uint32_t phys = 0; phys < 4; ++phys) r.regs[0x50 + 4 + phys * 4 + kLcPortAttr] |= kLcPortAttrBe;
     for (Port& p : r.ports) {
       if (p.type != kTypePort) continue;
       p.space[0x10] &= ~0xFFu;                                                           // the lane adapter capability is the last in the list
@@ -279,6 +283,28 @@ class Fabric {
     if (i == 1) r.regs[1] = (r.regs[1] & ~0x00700000u) | (v & 0x00700000u) , r.upstream = (v >> 8) & 0x3F;
     else if (i == 4) r.regs[4] = v & 0x00FFFFFFu;
     else if (i == 0x20) r.regs[i] = (r.regs[i] & 0x4000FFFFu) | (v & ~0x4000FFFFu);              // the capability header and UCAP are read only
+    else if (r.cap_plug_events_model != 0 && i == r.cap_plug_events_model + kPlugEventsEepromCtl) {            // the flash pins: the chip answers with the clock up
+      const uint32_t old = r.regs[i];
+      uint32_t now = (v & ~kEepromDo) | (old & kEepromDo) | kEepromPresent;
+      if (v & kEepromCs) {
+        r.eeprom_bits = 0;
+        r.eeprom_cmd = r.eeprom_addr = 0;
+      } else if ((v & kEepromBitBang) && (v & kEepromSk) && !(old & kEepromSk)) {
+        const uint32_t di = (v & kEepromDi) ? 1 : 0;
+        if (r.eeprom_bits < 8) {
+          r.eeprom_cmd = (r.eeprom_cmd << 1) | di;
+        } else if (r.eeprom_bits < 24) {
+          r.eeprom_addr = (r.eeprom_addr << 1) | di;
+        } else {
+          const uint32_t k = r.eeprom_bits - 24, at = r.eeprom_addr + k / 8;                 // (the host adds the DROM offset to the address itself)
+          const uint8_t byte = r.eeprom_cmd == 3 && at < r.eeprom.size() ? r.eeprom[at] : 0xFF;
+          now = (now & ~kEepromDo) | (((byte >> (7 - k % 8)) & 1) ? kEepromDo : 0);
+          if (k % 8 == 7) ++r.eeprom_reads;
+        }
+        ++r.eeprom_bits;
+      }
+      r.regs[i] = now;
+    }
     else if (r.cap_plug_events_model != 0 && i == r.cap_plug_events_model + kPlugEventsPcieCmd) {                  // a write to a PCIe bridge through the plug events capability
       pcie_writes.push_back({(v >> kPcieCmdBridgeShift) & 0xFF, v & 0x3FF, r.regs[r.cap_plug_events_model + kPlugEventsPcieWrData]});
       r.regs[i] = pcie_writes_time_out ? (v | kPcieCmdTimeout) & ~kPcieCmdReqAck : (v & ~kPcieCmdReqAck);

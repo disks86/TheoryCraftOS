@@ -3462,24 +3462,24 @@ static void test_usb4_tbt3_device() {
   const char* error = nullptr;
   CHECK(domain.start(nullptr) && domain.present_count() == 3 && domain.unreachable_links() == 0);
   const Usb4Router& dock = *domain.router(2);
-  CHECK(dock.tbt3 && dock.usb4_version == 0 && dock.route == 0x03 && dock.parent == 0 && dock.cap_plug_events == 0x28 && dock.cap_lc == 0x30 && dock.depth == 1);
+  CHECK(dock.tbt3 && dock.usb4_version == 0 && dock.route == 0x03 && dock.parent == 0 && dock.cap_plug_events == 0x28 && dock.cap_lc == 0x50 && dock.depth == 1);
   fake_usb4::Router& fr = rig.fabric.at(0x03);
   // configured with three words, the pause between plug events at its longest, the USB hot plug event disabled
   CHECK(fr.regs[2] == 0x03 && fr.regs[3] == (1u << 31) && (fr.regs[4] & 0xFF) == 0xFF && fr.regs[0x29] == 0xFFFFFF87u);
   // none of the USB4 router steps: no tunnelling bits, no configuration valid
   CHECK(fr.cs5_writes == 0 && !(fr.regs[5] & kCs5Cv) && !domain.tmu_enabled(2));
   // the link is marked configured through the link controller on its side (lane 1 of physical port 0: L1C, and the upstream flag) and through the port capability on the USB4 side
-  CHECK((fr.regs[0x34 + kLcSxCtrl] & kLcSxCtrlL1c) && (fr.regs[0x34 + kLcSxCtrl] & kLcSxCtrlUpstream) && (rig.fabric.at(0).ports[3].space[0x20 + kPortCs19] & kPortCs19Pc));
+  CHECK((fr.regs[0x54 + kLcSxCtrl] & kLcSxCtrlL1c) && (fr.regs[0x54 + kLcSxCtrl] & kLcSxCtrlUpstream) && (rig.fabric.at(0).ports[3].space[0x20 + kPortCs19] & kPortCs19Pc));
   // the link controller allows bonding: the lanes are bonded
   CHECK(domain.link_bonded(2) && (fr.ports[1].space[0x11] & kLaneCs1TargetWidthMask) == kLaneCs1TargetDual);
   // a PCIe tunnel to it works as to any router: 32 credits on the bonded lanes
   CHECK(domain.approve_pcie(2, &error) && domain.pcie_tunnelled(2) && ((fr.ports[1].hops[8].first >> 17) & 0x7F) == 32 && (fr.ports[5].space[0x10] & kAdpPcieCs0Pe));
   // it sleeps through its link controller (a system sleep arms no wake; a runtime sleep needs the tunnel gone) and is found again
-  CHECK(domain.suspend(false) && (fr.regs[0x34 + kLcSxCtrl] & kLcSxCtrlSlp) && !(fr.regs[0x34 + kLcSxCtrl] & kLcSxCtrlWoc));
-  fr.regs[0x34 + kLcSxCtrl] = 0;
+  CHECK(domain.suspend(false) && (fr.regs[0x54 + kLcSxCtrl] & kLcSxCtrlSlp) && !(fr.regs[0x54 + kLcSxCtrl] & kLcSxCtrlWoc));
+  fr.regs[0x54 + kLcSxCtrl] = 0;
   CHECK(domain.resume(&error) && domain.present_count() == 3 && !domain.pcie_tunnelled(2));
-  CHECK(domain.suspend(true) && (fr.regs[0x34 + kLcSxCtrl] & kLcSxCtrlSlp) && (fr.regs[0x34 + kLcSxCtrl] & kLcSxCtrlWoc) && (fr.regs[0x34 + kLcSxCtrl] & kLcSxCtrlWod) && (fr.regs[0x34 + kLcSxCtrl] & kLcSxCtrlWou4));
-  fr.regs[0x34 + kLcSxCtrl] = 0;
+  CHECK(domain.suspend(true) && (fr.regs[0x54 + kLcSxCtrl] & kLcSxCtrlSlp) && (fr.regs[0x54 + kLcSxCtrl] & kLcSxCtrlWoc) && (fr.regs[0x54 + kLcSxCtrl] & kLcSxCtrlWod) && (fr.regs[0x54 + kLcSxCtrl] & kLcSxCtrlWou4));
+  fr.regs[0x54 + kLcSxCtrl] = 0;
   CHECK(domain.resume(&error) && domain.present_count() == 3);
   // an Alpine Ridge bridge keeps the USB hot plug event
   Usb4Rig alpine(false);
@@ -3501,7 +3501,7 @@ static void test_usb4_tbt3_device() {
   nolc.fabric.add(0x03, 2, 0, true);
   nolc.fabric.make_tbt3(0x03);
   nolc.fabric.at(0x03).regs[0x28] &= ~0xFFu;
-  nolc.fabric.at(0x03).regs[0x30] = 0;                                                          // (the link controller is not in the list any more)
+  nolc.fabric.at(0x03).regs[0x50] = 0;                                                          // (the link controller is not in the list any more)
   nolc.fabric.link(0, 3, 0x03);
   Usb4Domain d3(nolc.control, nolc.nhi, nolc.alloc);
   CHECK(d3.start(nullptr) && d3.present_count() == 2);                                         // (it is refused: its link cannot be configured)
@@ -3688,7 +3688,7 @@ static void test_usb4_tbt3_extras() {
     CHECK(rig.fabric.pcie_writes[0].offset == 0x143 && (rig.fabric.pcie_writes[0].bridge_mask & (1u << 5)) && rig.fabric.pcie_writes[0].value == 0x0C7806B1u);
     CHECK((rig.fabric.pcie_writes[1].bridge_mask & 1u) && rig.fabric.pcie_writes[1].value == 0x0C5806B1u);
     fake_usb4::Router& fr = rig.fabric.at(0x03);
-    CHECK((fr.regs[0x34 + kLcLinkReq] & kLcLinkReqXhciConnect) && (fr.regs[0x38 + kLcLinkReq] & kLcLinkReqXhciConnect));
+    CHECK((fr.regs[0x54 + kLcLinkReq] & kLcLinkReqXhciConnect) && (fr.regs[0x58 + kLcLinkReq] & kLcLinkReqXhciConnect));
   }
   {   // a bridge that does not acknowledge: the first write is the last
     Usb4Rig rig(false);
@@ -3701,12 +3701,12 @@ static void test_usb4_tbt3_extras() {
   {   // an Alpine Ridge dock: only the ports with a USB device plugged in
     Usb4Rig rig(false);
     rig_with(rig, 0x1578);
-    rig.fabric.at(0x03).regs[0x38 + kLcCs42] = kLcCs42UsbPlugged;                              // (port 3: physical port 1)
+    rig.fabric.at(0x03).regs[0x58 + kLcCs42] = kLcCs42UsbPlugged;                              // (port 3: physical port 1)
     Usb4Domain domain(rig.control, rig.nhi, rig.alloc);
     const char* error = nullptr;
     CHECK(domain.start(nullptr) && domain.approve_pcie(2, &error) && rig.fabric.pcie_writes.empty());
     fake_usb4::Router& fr = rig.fabric.at(0x03);
-    CHECK(!(fr.regs[0x34 + kLcLinkReq] & kLcLinkReqXhciConnect) && (fr.regs[0x38 + kLcLinkReq] & kLcLinkReqXhciConnect));
+    CHECK(!(fr.regs[0x54 + kLcLinkReq] & kLcLinkReqXhciConnect) && (fr.regs[0x58 + kLcLinkReq] & kLcLinkReqXhciConnect));
   }
   {   // a Titan Ridge dock not directly below the host: no L1 setting, the xHCI still connected; an unknown one: nothing
     Usb4Rig rig(false);
@@ -3716,11 +3716,76 @@ static void test_usb4_tbt3_extras() {
     Usb4Domain domain(rig.control, rig.nhi, rig.alloc);
     const char* error = nullptr;
     CHECK(domain.start(nullptr) && domain.present_count() == 3 && domain.approve_pcie(1, &error) && domain.approve_pcie(2, &error) && rig.fabric.pcie_writes.empty());
-    CHECK(rig.fabric.at(0x301).regs[0x34 + kLcLinkReq] & kLcLinkReqXhciConnect);
+    CHECK(rig.fabric.at(0x301).regs[0x54 + kLcLinkReq] & kLcLinkReqXhciConnect);
     Usb4Rig other(false);
     rig_with(other, 0x1234);
     Usb4Domain d(other.control, other.nhi, other.alloc);
-    CHECK(d.start(nullptr) && d.approve_pcie(2, &error) && other.fabric.pcie_writes.empty() && !(other.fabric.at(0x03).regs[0x34 + kLcLinkReq] & kLcLinkReqXhciConnect));
+    CHECK(d.start(nullptr) && d.approve_pcie(2, &error) && other.fabric.pcie_writes.empty() && !(other.fabric.at(0x03).regs[0x54 + kLcLinkReq] & kLcLinkReqXhciConnect));
+  }
+}
+
+// A Thunderbolt 3 DROM (revision 1, entries from byte 22), with the CRC8 of the unique id.
+static std::vector<uint8_t> make_tbt3_drom(const char* vendor, const char* device, const std::vector<std::vector<uint8_t>>& ports, bool good_crc = true) {
+  std::vector<uint8_t> rom = make_drom(vendor, device, ports);
+  // make_drom writes entries from 16; the older layout has six more header bytes
+  std::vector<uint8_t> entries(rom.begin() + 16, rom.end());
+  std::vector<uint8_t> out(22, 0);
+  out[13] = 1;
+  const uint32_t data_len = static_cast<uint32_t>(22 + entries.size() - 13);
+  out[14] = static_cast<uint8_t>(data_len);
+  out[15] = static_cast<uint8_t>(data_len >> 8);
+  for (uint32_t i = 0; i < 8; ++i) out[1 + i] = static_cast<uint8_t>(0x30 + i);                     // the unique id
+  uint8_t crc = 0xFF;
+  for (uint32_t i = 0; i < 8; ++i) {
+    crc ^= out[1 + i];
+    for (int j = 0; j < 8; ++j) crc = static_cast<uint8_t>((crc << 1) ^ ((crc & 0x80) ? 7 : 0));
+  }
+  out[0] = good_crc ? crc : static_cast<uint8_t>(crc ^ 1);
+  out.insert(out.end(), entries.begin(), entries.end());
+  return out;
+}
+
+static void test_usb4_tbt3_drom() {
+  auto setup = [](Usb4Rig& rig, const std::vector<uint8_t>& rom) {
+    rig.fabric.add(0x03, 2, 0, true);
+    rig.fabric.make_tbt3(0x03);
+    std::vector<uint8_t> flash(0x100, 0xEE);
+    flash.insert(flash.end(), rom.begin(), rom.end());
+    rig.fabric.at(0x03).eeprom = flash;
+    rig.fabric.link(0, 3, 0x03);
+  };
+  {   // the names and the port entries come out of the serial flash, bit by bit
+    Usb4Rig rig(false);
+    setup(rig, make_tbt3_drom("Acme", "TB16", {drom_port(1, false, 0, 2), drom_port(2, false, 1, 1), drom_port(4, true, 1, 3)}));
+    Usb4Domain domain(rig.control, rig.nhi, rig.alloc);
+    CHECK(domain.start(nullptr) && domain.present_count() == 3);
+    const Usb4Router& dock = *domain.router(2);
+    CHECK(dock.tbt3 && dock.drom && strcmp(dock.vendor_name, "Acme") == 0 && strcmp(dock.device_name, "TB16") == 0 && dock.ports[4].disabled && dock.ports[1].dual_link == 2 && dock.ports[2].link_nr == 1);
+    // the bit banging was switched off again (the controller would not probe again otherwise), the chip deselected
+    const uint32_t ctl = rig.fabric.at(0x03).regs[0x28 + kPlugEventsEepromCtl];
+    CHECK(!(ctl & kEepromBitBang) && (ctl & kEepromCs));
+    CHECK(rig.fabric.at(0x03).eeprom_reads >= 2);
+  }
+  {   // a unique id whose CRC does not match, no flash, a size that does not fit, a flash that is not there: the router is kept without a DROM
+    Usb4Rig bad(false);
+    setup(bad, make_tbt3_drom("Acme", "TB16", {}, false));
+    Usb4Domain d1(bad.control, bad.nhi, bad.alloc);
+    CHECK(d1.start(nullptr) && d1.present_count() == 3 && !d1.router(2)->drom && d1.router(2)->vendor_name[0] == 0);
+    Usb4Rig none(false);
+    none.fabric.add(0x03, 2, 0, true);
+    none.fabric.make_tbt3(0x03);
+    none.fabric.link(0, 3, 0x03);
+    none.fabric.at(0x03).regs[0x28 + kPlugEventsEepromCtl] = 0;                                   // (no flash present)
+    Usb4Domain d2(none.control, none.nhi, none.alloc);
+    CHECK(d2.start(nullptr) && d2.present_count() == 3 && !d2.router(2)->drom);
+    for (size_t cut = 0; cut < 40; cut += 3) {                                                   // a flash that ends early reads as ones
+      Usb4Rig rig(false);
+      std::vector<uint8_t> rom = make_tbt3_drom("Acme", "TB16", {drom_port(1, false, 0, 2)});
+      rom.resize(cut);
+      setup(rig, rom);
+      Usb4Domain d(rig.control, rig.nhi, rig.alloc);
+      CHECK(d.start(nullptr) && d.present_count() == 3);
+    }
   }
 }
 
@@ -3780,6 +3845,7 @@ int main() {
   test_usb4_asymmetric();
   test_usb4_clx();
   test_usb4_tbt3_extras();
+  test_usb4_tbt3_drom();
   test_usb4_runtime_sleep();
   test_usb4_xdomain_failures();
   test_usb4_driver();
