@@ -468,8 +468,8 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
         }
         if (s.geometry_in) {
           // (a geometry shader: the position or a varying of one vertex of the primitive)
-          if (src.vertex < 3 && src.slot == kSlotPosition) v = {{s.geometry_in->position[src.vertex].x, s.geometry_in->position[src.vertex].y, s.geometry_in->position[src.vertex].z, s.geometry_in->position[src.vertex].w}};
-          else if (src.vertex < 3 && src.slot >= 0 && src.slot < static_cast<int8_t>(graphics::kMaxVaryings)) {
+          if (src.vertex < graphics::kMaxGeometryInputVertices && src.slot == kSlotPosition) v = {{s.geometry_in->position[src.vertex].x, s.geometry_in->position[src.vertex].y, s.geometry_in->position[src.vertex].z, s.geometry_in->position[src.vertex].w}};
+          else if (src.vertex < graphics::kMaxGeometryInputVertices && src.slot >= 0 && src.slot < static_cast<int8_t>(graphics::kMaxVaryings)) {
             const graphics::Vec4 a = s.geometry_in->varying[src.vertex][src.slot];
             v = {{a.x, a.y, a.z, a.w}};
           }
@@ -944,6 +944,7 @@ void D3d9Program::run_geometry(const graphics::GeometryInputData& input, const u
   graphics::GeometryInputData upright = input;
   for (graphics::Vec4& p : upright.position) p.y = -p.y;
   s.geometry_in = &upright;
+  s.sys[kSysGsInstanceId].f[0] = from_bits(input.instance_id);
   s.geometry_out = output;
   output->count = 0;
   execute(s);
@@ -1074,6 +1075,7 @@ NtStatus D3d9Binding::bind(UniquePointer<D3d9Program> program, graphics::ShaderM
     desc->geometry_input = program->geometry_input();
     desc->geometry_output = program->geometry_output();
     desc->geometry_max_vertices = program->geometry_max_vertices();
+    desc->geometry_instances = program->geometry_instances();
     program_ = util::move(program);
     return status::kSuccess;
   }

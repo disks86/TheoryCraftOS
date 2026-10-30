@@ -76,6 +76,7 @@ class D3d9Program {
   graphics::GeometryPrimitive geometry_input() const { return geometry_input_; }
   graphics::GeometryTopology geometry_output() const { return geometry_output_; }
   uint32_t geometry_max_vertices() const { return geometry_max_vertices_; }
+  uint32_t geometry_instances() const { return geometry_instances_; }
   void run_geometry(const graphics::GeometryInputData& input, const uint8_t* constants, graphics::GeometryOutputData* output) const;
   // A hull or domain shader (hs_5_0 / ds_5_0 DXBC, any domain), see D3d9Dxbc.cpp; the tessellator's settings both stages declare.
   uint32_t tess_input_points() const { return tess_input_points_; }
@@ -145,6 +146,7 @@ class D3d9Program {
   graphics::GeometryPrimitive geometry_input_ = graphics::GeometryPrimitive::Triangle;
   graphics::GeometryTopology geometry_output_ = graphics::GeometryTopology::TriangleStrip;
   uint32_t geometry_max_vertices_ = 0;
+  uint32_t geometry_instances_ = 1;
   uint32_t tess_input_points_ = 0, tess_output_points_ = 0;
   graphics::TessPartitioning tess_partitioning_ = graphics::TessPartitioning::Integer;
   graphics::TessOutput tess_output_ = graphics::TessOutput::TriangleCcw;

@@ -256,13 +256,15 @@ using FragmentShaderFnEx = bool (*)(const Vec4* varyings, const FragmentContext&
 // Geometry shaders (kFeatureGeometryShaders), between the vertex shader and the rasterizer: one invocation per primitive of the draw (a list triangle, line or point - the kernel expands
 // strips and fans), given the primitive's vertices as the vertex shader made them (clip space, before the perspective divide) and emitting up to the module's maximum of vertices, which
 // make a strip of the module's output topology (a cut ends a strip and starts the next). The software device calls a function; virgl takes TGSI text.
-enum class GeometryPrimitive : uint8_t { Point, Line, Triangle };
+enum class GeometryPrimitive : uint8_t { Point, Line, Triangle, LineAdjacency, TriangleAdjacency };   // (the adjacency ones take 4 and 6 vertices: the PrimitiveTopology LineListAdjacency / TriangleListAdjacency draws)
+constexpr uint32_t kMaxGeometryInputVertices = 6;
 enum class GeometryTopology : uint8_t { PointList, LineStrip, TriangleStrip };
 constexpr uint32_t kMaxGeometryVertices = 64;   // the most a module's maximum may be
 struct GeometryInputData {
-  Vec4 position[3];
-  Vec4 varying[3][kMaxVaryings];
+  Vec4 position[kMaxGeometryInputVertices];
+  Vec4 varying[kMaxGeometryInputVertices][kMaxVaryings];
   uint32_t primitive_id = 0;   // the number of the primitive in the draw
+  uint32_t instance_id = 0;    // SV_GSInstanceID: which of the shader's instances this run is (it runs geometry_instances times for each primitive)
 };
 struct GeometryOutputData {
   uint32_t count = 0;
@@ -337,6 +339,7 @@ struct ShaderModuleDesc {
   GeometryPrimitive geometry_input = GeometryPrimitive::Triangle;
   GeometryTopology geometry_output = GeometryTopology::TriangleStrip;
   uint32_t geometry_max_vertices = 0;
+  uint32_t geometry_instances = 1;   // runs of a geometry shader for each primitive (1 .. 32)
   // Hull and domain shaders (stages Hull and Domain): functions for the software device (virgl: TGSI text), the control points taken and made, and the tessellator's settings (both stages say them).
   HullShaderFn hull_function = nullptr;
   DomainShaderFn domain_function = nullptr;
@@ -460,7 +463,7 @@ enum class IndexType : uint8_t { Uint16, Uint32 };
 
 // What the vertices of a draw make (set_primitive_topology, DeviceFeature kFeatureLines for anything but triangles). Lines and points are one pixel wide.
 enum class QueryKind : uint8_t { Occlusion, OcclusionPredicate, IaVertices, IaPrimitives, VsInvocations, PsInvocations };
-enum class PrimitiveTopology : uint8_t { TriangleList, LineList, PointList, PatchList };   // (PatchList: kFeatureTessellation, with set_patch_control_points)
+enum class PrimitiveTopology : uint8_t { TriangleList, LineList, PointList, PatchList, LineListAdjacency, TriangleListAdjacency };   // (the adjacency lists need a geometry shader that takes them)   // (PatchList: kFeatureTessellation, with set_patch_control_points)
 
 struct Viewport {
   float x = 0, y = 0, width = 0, height = 0;

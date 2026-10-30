@@ -1058,7 +1058,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         stream.command(virgl::kDrawVbo, 0, patches ? 14 : 12);
         stream.put(cmd.first);
         stream.put(cmd.count);
-        stream.put(patches ? virgl::kPrimPatches : topology == PrimitiveTopology::LineList ? virgl::kPrimLines : topology == PrimitiveTopology::PointList ? virgl::kPrimPoints : virgl::kPrimTriangles);
+        stream.put(patches ? virgl::kPrimPatches : topology == PrimitiveTopology::LineListAdjacency ? virgl::kPrimLinesAdjacency : topology == PrimitiveTopology::TriangleListAdjacency ? virgl::kPrimTrianglesAdjacency : topology == PrimitiveTopology::LineList ? virgl::kPrimLines : topology == PrimitiveTopology::PointList ? virgl::kPrimPoints : virgl::kPrimTriangles);
         stream.put(indexed ? 1 : 0);
         stream.put(cmd.instance_count);
         stream.put(static_cast<uint32_t>(cmd.vertex_offset));

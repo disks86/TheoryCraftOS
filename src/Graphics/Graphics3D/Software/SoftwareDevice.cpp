@@ -1058,14 +1058,7 @@ ClipVertex run_vertex_shader(const SoftwarePipeline& pipeline, ConstByteView ver
 }
 
 // Runs a geometry shader on one primitive and draws what it emits: the vertices are a strip (a triangle strip turns every second triangle over, as Direct3D does) or points.
-void run_geometry_shader(const DrawState& s, const SoftwareShaderModule& module, const ClipVertex* v, uint32_t count) {
-  const ShaderModuleDesc& md = module.desc();
-  GeometryInputData input;
-  for (uint32_t k = 0; k < count && k < 3; ++k) {
-    input.position[k] = v[k].position;
-    for (uint32_t i = 0; i < kMaxVaryings; ++i) input.varying[k][i] = v[k].varying[i];
-  }
-  input.primitive_id = s.primitive_id;
+void run_geometry_instance(const DrawState& s, const ShaderModuleDesc& md, const GeometryInputData& input) {
   GeometryOutputData output;
   md.geometry_function(input, s.constants, &output);
   if (output.count > md.geometry_max_vertices) output.count = md.geometry_max_vertices;
@@ -1088,6 +1081,20 @@ void run_geometry_shader(const DrawState& s, const SoftwareShaderModule& module,
       if (odd) draw_triangle(s, clip(i - 1), clip(i - 2), clip(i));
       else draw_triangle(s, clip(i - 2), clip(i - 1), clip(i));
     }
+  }
+}
+
+void run_geometry_shader(const DrawState& s, const SoftwareShaderModule& module, const ClipVertex* v, uint32_t count) {
+  const ShaderModuleDesc& md = module.desc();
+  GeometryInputData input;
+  for (uint32_t k = 0; k < count && k < kMaxGeometryInputVertices; ++k) {
+    input.position[k] = v[k].position;
+    for (uint32_t i = 0; i < kMaxVaryings; ++i) input.varying[k][i] = v[k].varying[i];
+  }
+  input.primitive_id = s.primitive_id;
+  for (uint32_t instance = 0; instance < md.geometry_instances; ++instance) {
+    input.instance_id = instance;
+    run_geometry_instance(s, md, input);
   }
 }
 
@@ -1487,12 +1494,14 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
         // (patches need a hull and a domain shader that take that many control points, and those shaders need patches)
         if (patches != (hull != nullptr) || (patches && (patch_points != hull->desc().tess_input_points || patch_points == 0 || patch_points > kMaxPatchControlPoints))) return false;
         if (patches && pd.geometry_shader) return false;   // (a geometry shader after the tessellator is not made)
-        const uint32_t per_primitive = patches ? patch_points : topology == PrimitiveTopology::TriangleList ? 3 : topology == PrimitiveTopology::LineList ? 2 : 1;
+        const uint32_t per_primitive = patches ? patch_points : topology == PrimitiveTopology::TriangleListAdjacency ? 6 : topology == PrimitiveTopology::LineListAdjacency ? 4 : topology == PrimitiveTopology::TriangleList ? 3 : topology == PrimitiveTopology::LineList ? 2 : 1;
+        const bool adjacency = topology == PrimitiveTopology::TriangleListAdjacency || topology == PrimitiveTopology::LineListAdjacency;
+        if (adjacency && !pd.geometry_shader) return false;   // (only a geometry shader takes the neighbours)
         const SoftwareShaderModule* geometry = static_cast<const SoftwareShaderModule*>(pd.geometry_shader);
         if (geometry) {
           // (the geometry shader takes the primitives the draw makes)
           const GeometryPrimitive taken = geometry->desc().geometry_input;
-          if (taken != (per_primitive == 3 ? GeometryPrimitive::Triangle : per_primitive == 2 ? GeometryPrimitive::Line : GeometryPrimitive::Point)) return false;
+          if (taken != (per_primitive == 6 ? GeometryPrimitive::TriangleAdjacency : per_primitive == 4 ? GeometryPrimitive::LineAdjacency : per_primitive == 3 ? GeometryPrimitive::Triangle : per_primitive == 2 ? GeometryPrimitive::Line : GeometryPrimitive::Point)) return false;
         }
         stat_ia_vertices += uint64_t{cmd.count} * instances;
         stat_ia_primitives += uint64_t{cmd.count / per_primitive} * instances;

@@ -213,8 +213,9 @@ class Adapter::StreamRunner {
       case Op::Dispatch: return dispatch(p);
       case Op::SetTopology: {
         const uint32_t topology = p.le32();
-        if (!exact(p) || topology > kPatchListBase + graphics::kMaxPatchControlPoints) return kBad;
-        if (topology > static_cast<uint32_t>(Topology::PointList) && !(adapter_.caps_.features & graphics::kFeatureTessellation)) return kBad;
+        const bool adjacency = topology == static_cast<uint32_t>(Topology::LineListAdjacency) || topology == static_cast<uint32_t>(Topology::TriangleListAdjacency);
+        if (!exact(p) || (!adjacency && topology > kPatchListBase + graphics::kMaxPatchControlPoints)) return kBad;
+        if (adjacency ? !(adapter_.caps_.features & graphics::kFeatureGeometryShaders) : (topology > static_cast<uint32_t>(Topology::PointList) && !(adapter_.caps_.features & graphics::kFeatureTessellation))) return kBad;
         topology_ = static_cast<Topology>(topology);
         return status::kSuccess;
       }
@@ -509,6 +510,7 @@ class Adapter::StreamRunner {
     if (topology_ >= Topology::LineList && topology_ <= Topology::PointList && !(adapter_.caps_.features & graphics::kFeatureLines)) return kBad;
     // Patches go with a hull and a domain shader that take that many control points, and those shaders go with patches (and with no geometry shader).
     if (is_patch_list(topology_) != pipeline_->has_tessellation()) return kBad;
+    if (is_adjacency(topology_) && !pipeline_->has_geometry()) return kBad;   // (only a geometry shader takes the neighbours)
     if (pipeline_->has_tessellation() && (patch_points(topology_) != pipeline_->tess_input_points() || pipeline_->has_geometry())) return kBad;
     for (uint32_t u = 0; u < pipeline_->texture_count(); ++u)
       if (!texture_bound_[u] || texture_alloc_[u]->texture_kind() != pipeline_->texture_kind(u)) return kBad;   // (unbound, or a volume where the shader reads a 2D texture, ...)
@@ -519,7 +521,9 @@ class Adapter::StreamRunner {
         if (pass_extra_[n] && is_integer(pass_extra_[n]->desc().format)) return kBad;
     }
     if (pipeline_->has_geometry()) {   // (the geometry shader takes the primitives the draw makes)
-      const graphics::GeometryPrimitive made = topology_ == Topology::LineList || topology_ == Topology::LineStrip ? graphics::GeometryPrimitive::Line
+      const graphics::GeometryPrimitive made = topology_ == Topology::LineListAdjacency ? graphics::GeometryPrimitive::LineAdjacency
+                                               : topology_ == Topology::TriangleListAdjacency ? graphics::GeometryPrimitive::TriangleAdjacency
+                                               : topology_ == Topology::LineList || topology_ == Topology::LineStrip ? graphics::GeometryPrimitive::Line
                                                : topology_ == Topology::PointList ? graphics::GeometryPrimitive::Point : graphics::GeometryPrimitive::Triangle;
       if (made != pipeline_->geometry_input()) return kBad;
     }
@@ -567,7 +571,7 @@ class Adapter::StreamRunner {
         device_patch_points_ = patch_points(topology_);
       }
     } else {
-      set_device_topology(topology_ == Topology::LineList ? graphics::PrimitiveTopology::LineList : topology_ == Topology::PointList ? graphics::PrimitiveTopology::PointList : graphics::PrimitiveTopology::TriangleList);
+      set_device_topology(topology_ == Topology::LineListAdjacency ? graphics::PrimitiveTopology::LineListAdjacency : topology_ == Topology::TriangleListAdjacency ? graphics::PrimitiveTopology::TriangleListAdjacency : topology_ == Topology::LineList ? graphics::PrimitiveTopology::LineList : topology_ == Topology::PointList ? graphics::PrimitiveTopology::PointList : graphics::PrimitiveTopology::TriangleList);
     }
     if (indexed && index_rebind_) {   // (an expanded draw left its own indices bound)
       cb_->bind_index_buffer(index_->buffer(), index_bytes_ == 4 ? graphics::IndexType::Uint32 : graphics::IndexType::Uint16, index_offset_);

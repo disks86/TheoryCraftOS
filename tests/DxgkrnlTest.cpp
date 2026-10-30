@@ -4275,6 +4275,37 @@ void test_tessellation_kernel() {
   CHECK(shader(graphics::ShaderStage::Domain, b::k_ds_dent, sizeof b::k_ds_dent, &refused, &kernel, dev) == status::kNotSupported);
 }
 
+// Geometry shaders with adjacency input and instances.
+void test_geometry_extras() {
+  HostAllocator allocator;
+  for (const char* name : {"gs_copy_inst2.dxbc", "gs_tri_adj.dxbc", "gs_line_adj.dxbc"}) {
+    const std::vector<uint8_t> blob = read_blob(name);
+    UniquePointer<D3d9Program> program;
+    CHECK(D3d9Program::compile_dxbc(allocator, ConstByteView(blob.data(), blob.size()), &program) == status::kSuccess && program);
+    if (!program) continue;
+    String text(allocator);
+    CHECK(program->emit_tgsi(&text) == status::kSuccess);
+    const std::string tgsi(text.view().data(), text.size());
+    if (__builtin_strstr(name, "inst2")) {
+      CHECK(program->geometry_instances() == 2 && tgsi.find("GS_INVOCATIONS 2") != std::string::npos);
+    } else {
+      CHECK(program->geometry_instances() == 1 && tgsi.find(__builtin_strstr(name, "tri") ? "TRIANGLES_ADJACENCY" : "LINES_ADJACENCY") != std::string::npos);
+      CHECK(program->geometry_input() == (__builtin_strstr(name, "tri") ? graphics::GeometryPrimitive::TriangleAdjacency : graphics::GeometryPrimitive::LineAdjacency));
+    }
+    // Truncated and bit-flipped: refused or compiled, never a crash.
+    for (size_t n = 0; n < blob.size(); n += 7) {
+      UniquePointer<D3d9Program> cut;
+      D3d9Program::compile_dxbc(allocator, ConstByteView(blob.data(), n), &cut);
+    }
+    for (size_t bit = 0; bit < blob.size() * 8; bit += 61) {
+      std::vector<uint8_t> flipped = blob;
+      flipped[bit / 8] ^= static_cast<uint8_t>(1u << (bit % 8));
+      UniquePointer<D3d9Program> bad;
+      D3d9Program::compile_dxbc(allocator, ConstByteView(flipped.data(), flipped.size()), &bad);
+    }
+  }
+}
+
 // Alpha to coverage on the CPU renderer: a quad of whole pixels keeps round(alpha * 4) of the 4 samples, so the resolved red is that many quarters (a GPU dithers fractions from pixel to pixel,
 // which the conformance scene therefore leaves out).
 void test_alpha_to_coverage() {
@@ -4405,6 +4436,18 @@ void test_conformance() {
         CHECK(near(px(7, 4), 0xFF36659C) && (px(6, 4) & 0xFFFFFF) == 0);
       }
       if (__builtin_strstr(r.name, "integer render")) CHECK(px(16, 4) == 0xFF3380CC && px(0, 0) == 0xFF14283C);   // (51, 128, 204 = 255 * the colour, and the cleared (20, 40, 60))
+    }
+    if (__builtin_strstr(r.name, "adjacency primitives")) {
+      // The triangle (left) and the quad (right) both drawn.
+      uint32_t left = 0, right = 0;
+      for (uint32_t y = 0; y < 32; ++y)
+        for (uint32_t x = 0; x < 32; ++x) (x < 16 ? left : right) += (r.device_picture[y * 32 + x] & 0xFFFFFF) != 0;
+      CHECK(left > 60 && right > 150);
+    }
+    if (__builtin_strstr(r.name, "instanced geometry")) {
+      uint32_t lit = 0;
+      for (uint32_t i = 0; i < 32 * 32; ++i) lit += (r.device_picture[i] & 0xFFFFFF) != 0;
+      CHECK(lit > 100);
     }
     if (__builtin_strstr(r.name, "alpha to coverage")) {
       // The red channel of each band (the colour is red 1): none, all, none, all, all.
@@ -5575,6 +5618,7 @@ int main() {
   test_sm3_and_sm51();
   test_ps1();
   test_device_suite();
+  test_geometry_extras();
   test_alpha_to_coverage();
   test_conformance();
   test_occlusion_queries();

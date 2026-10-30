@@ -1175,6 +1175,67 @@ void scene_geometry_shader(Rig& rig, ArrayView<uint32_t> out) {
   rig.read(target, out);
 }
 
+// The geometry shader that runs twice for each primitive (gs_copy_inst2: gs_copy with an instance count of 2): the same triangles drawn twice over, so the same picture as gs_copy's.
+void scene_geometry_instances(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureGeometryShaders)) return void(rig.step("geometry shaders", status::kNotSupported));
+  namespace b = conformance_blobs;
+  const Vertex v[3] = {{-0.9f, -0.9f, 0.5f, 1, 0, 0, 1}, {0.9f, -0.9f, 0.5f, 0, 1, 0, 1}, {0.0f, 0.9f, 0.5f, 0, 0, 1, 1}};
+  Handle vs = rig.vertex_shader(bytes_of(b::k_vs, sizeof b::k_vs));
+  Handle gs = rig.shader("create_shader (geometry)", ShaderKind::Dxbc, graphics::ShaderStage::Geometry, bytes_of(b::k_gs_copy_inst2, sizeof b::k_gs_copy_inst2));
+  Handle ps = rig.pixel_shader(bytes_of(b::k_ps_color, sizeof b::k_ps_color));
+  PipelineDesc pd = colour_pipeline_desc(vs, ps);
+  pd.varying_count = 3;
+  pd.geometry_shader = gs;
+  Handle pipe = rig.pipeline(pd);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  CommandWriter w(rig.allocator());
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(3);
+  w.end_pass();
+  rig.render(w, {target, vb});
+  rig.read(target, out);
+}
+
+// Primitives with adjacency: a triangle with the three vertices beside it (the shader draws the even ones, with some of the colour of the odd one after each), and a line with the vertex
+// before and after (the shader makes a quad of its four).
+void scene_geometry_adjacency(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureGeometryShaders)) return void(rig.step("geometry shaders", status::kNotSupported));
+  namespace b = conformance_blobs;
+  const Vertex v[10] = {{-0.9f, -0.9f, 0.5f, 1, 0, 0, 1}, {0.0f, 0.0f, 0.5f, 0, 0, 1, 1}, {-0.1f, -0.9f, 0.5f, 0, 1, 0, 1}, {0.0f, 0.0f, 0.5f, 1, 1, 1, 1}, {-0.5f, 0.9f, 0.5f, 0, 0, 1, 1}, {0.0f, 0.0f, 0.5f, 1, 1, 0, 1},
+                        {0.1f, -0.9f, 0.5f, 1, 0, 0, 1}, {0.9f, -0.9f, 0.5f, 0, 1, 0, 1}, {0.1f, 0.9f, 0.5f, 0, 0, 1, 1}, {0.9f, 0.9f, 0.5f, 1, 1, 0, 1}};
+  Handle vs = rig.vertex_shader(bytes_of(b::k_vs, sizeof b::k_vs));
+  Handle ps = rig.pixel_shader(bytes_of(b::k_ps_color, sizeof b::k_ps_color));
+  Handle triangles = 0, lines = 0;
+  for (uint32_t k = 0; k < 2; ++k) {
+    const uint8_t* code = k == 0 ? b::k_gs_tri_adj : b::k_gs_line_adj;
+    const uint32_t size = k == 0 ? sizeof b::k_gs_tri_adj : sizeof b::k_gs_line_adj;
+    Handle gs = rig.shader("create_shader (geometry)", ShaderKind::Dxbc, graphics::ShaderStage::Geometry, bytes_of(code, size));
+    PipelineDesc pd = colour_pipeline_desc(vs, ps);
+    pd.varying_count = 3;
+    pd.geometry_shader = gs;
+    (k == 0 ? triangles : lines) = rig.pipeline(pd);
+  }
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  CommandWriter w(rig.allocator());
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.bind_pipeline(triangles);
+  w.set_topology(Topology::TriangleListAdjacency);
+  w.draw(6, 0);
+  w.bind_pipeline(lines);
+  w.set_topology(Topology::LineListAdjacency);
+  w.draw(4, 6);
+  w.end_pass();
+  rig.render(w, {target, vb});
+  rig.read(target, out);
+}
+
 // Draws a full-target quad (the vertex shader makes the texture coordinate from the colour: u / 2, v / 2) with a pixel shader that reads the texture in unit 0, nearest filtered, into `target`.
 void show_texture(Rig& rig, Handle target, Handle texture, const uint8_t* ps, uint32_t ps_size) {
   namespace b = conformance_blobs;
@@ -1535,6 +1596,8 @@ const Entry kScenes[] = {
     {"Direct3D 10 instancing", scene_instancing},
     {"Direct3D 10 multiple render targets (DXBC)", scene_multiple_targets},
     {"Direct3D 10 geometry shader (DXBC)", scene_geometry_shader},
+    {"Direct3D 11 instanced geometry (DXBC)", scene_geometry_instances},
+    {"Direct3D 10 adjacency primitives (DXBC)", scene_geometry_adjacency},
     {"Direct3D 11 tessellation, triangle domain (DXBC)", scene_tess_triangle, false, 6},
     {"Direct3D 11 tessellation, quad domain (DXBC)", scene_tess_quad, false, 6},
     {"Direct3D 11 tessellation, isolines and points (DXBC)", scene_tess_lines_points, true},

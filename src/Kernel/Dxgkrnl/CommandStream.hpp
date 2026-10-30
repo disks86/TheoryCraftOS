@@ -76,12 +76,13 @@ enum class Op : uint16_t {
 
 // How the vertices (or indices) of a draw make triangles (D3D10 IASetPrimitiveTopology / D3D9 primitive types); the default is a list. A strip or fan is expanded to a list of
 // triangles by the kernel, so any device draws it; with an index buffer the index 0xFFFF (0xFFFFFFFF for 32-bit indices) ends a strip and starts the next.
-enum class Topology : uint32_t { TriangleList = 0, TriangleStrip = 1, TriangleFan = 2, LineList = 3, LineStrip = 4, PointList = 5 };   // (lines and points: kFeatureLines of the adapter)
+enum class Topology : uint32_t { TriangleList = 0, TriangleStrip = 1, TriangleFan = 2, LineList = 3, LineStrip = 4, PointList = 5, LineListAdjacency = 0x100, TriangleListAdjacency = 0x101 };   // (the adjacency lists need a geometry shader that takes them: kFeatureGeometryShaders)   // (lines and points: kFeatureLines of the adapter)
 
 // A list of patches of `n` control points (1 .. graphics::kMaxPatchControlPoints), for a pipeline with a hull and a domain shader (the adapter's kFeatureTessellation): Topology value kPatchListBase + n.
 constexpr uint32_t kPatchListBase = 5;
 inline Topology patch_list(uint32_t control_points) { return static_cast<Topology>(kPatchListBase + control_points); }
-inline bool is_patch_list(Topology t) { return static_cast<uint32_t>(t) > kPatchListBase; }
+inline bool is_patch_list(Topology t) { return static_cast<uint32_t>(t) > kPatchListBase && static_cast<uint32_t>(t) < 0x100; }
+inline bool is_adjacency(Topology t) { return t == Topology::LineListAdjacency || t == Topology::TriangleListAdjacency; }
 inline uint32_t patch_points(Topology t) { return static_cast<uint32_t>(t) - kPatchListBase; }
 
 constexpr uint32_t kNoAllocation = 0xFFFFFFFFu;
