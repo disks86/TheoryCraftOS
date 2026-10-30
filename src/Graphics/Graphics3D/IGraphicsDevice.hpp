@@ -492,6 +492,9 @@ enum DeviceFeature : uint32_t {
   kFeatureInstancing = 1u << 3,    // draw(..., instance_count, first_instance) and VertexAttribute::per_instance
   kFeatureLines = 1u << 4,         // set_primitive_topology: lines and points
   kFeatureFloatFormats = 1u << 6,      // Format::R16G16B16A16Float / R32G32B32A32Float images: colour attachments (also several at once) and sampled textures, without mipmaps; read_pixels_float / write_pixels_float
+  kFeatureSrgbFormats = 1u << 13,      // Format::B8G8R8A8Srgb / R8G8B8A8Srgb
+  kFeatureUnorm16Formats = 1u << 14,   // Format::R16G16B16A16Unorm (also kFeatureFloatFormats' read_pixels_float / write_pixels_float)
+  kFeatureIntegerFormats = 1u << 15,   // Format::R32G32B32A32Uint
   kFeatureGeometryShaders = 1u << 12,  // GraphicsPipelineDesc::geometry_shader, ShaderStage::Geometry modules
   kFeatureMultisample = 1u << 11,      // ImageDesc::samples, GraphicsPipelineDesc::multisample, ICommandBuffer::resolve_image
   kFeatureCompute = 1u << 10,          // compute shaders: create_compute_pipeline, kBufferStorage buffers, ICommandBuffer::dispatch

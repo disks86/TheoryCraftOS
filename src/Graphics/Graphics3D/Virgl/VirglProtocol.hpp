@@ -76,6 +76,8 @@ constexpr uint32_t kFormatR32G32Float = 29;
 constexpr uint32_t kFormatR32G32B32Float = 30;
 constexpr uint32_t kFormatR32G32B32A32Float = 31;
 constexpr uint32_t kFormatR16G16B16A16Float = 94;
+constexpr uint32_t kFormatR16G16B16A16Unorm = 51;   // (VIRGL_FORMAT_*, the numbering of Gallium's pipe_format)
+constexpr uint32_t kFormatB8G8R8A8Srgb = 100;
 
 // Resource bind flags (VIRGL_BIND_*).
 constexpr uint32_t kBindDepthStencil = 1u << 0;

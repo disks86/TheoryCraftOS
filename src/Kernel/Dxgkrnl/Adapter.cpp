@@ -272,7 +272,8 @@ class Adapter::StreamRunner {
         if (extras[k] == e) return kBad;
     }
     if (flags & ~(kPassClearColor | kPassClearDepth | kPassClearStencil)) return kBad;
-    if (!finite_within(clear.x, 1e6f) || !finite_within(clear.y, 1e6f) || !finite_within(clear.z, 1e6f) || !finite_within(clear.w, 1e6f)) return kBad;
+    // (the clear colour of an integer target is four integers as float bits: any bit pattern)
+    if (!is_integer(color->desc().format) && (!finite_within(clear.x, 1e6f) || !finite_within(clear.y, 1e6f) || !finite_within(clear.z, 1e6f) || !finite_within(clear.w, 1e6f))) return kBad;
     if (!(clear_depth >= 0.0f && clear_depth <= 1.0f) || clear_stencil > 255) return kBad;
     // A render pass may not draw into an image that is bound as a texture.
     for (uint32_t u = 0; u < graphics::kMaxTextureUnits; ++u)
@@ -504,6 +505,11 @@ class Adapter::StreamRunner {
     for (uint32_t u = 0; u < pipeline_->texture_count(); ++u)
       if (!texture_bound_[u] || texture_alloc_[u]->texture_kind() != pipeline_->texture_kind(u)) return kBad;   // (unbound, or a volume where the shader reads a 2D texture, ...)
     if (pipeline_->color_target_count() > pass_target_count_) return kBad;
+    if (pipeline_->blends()) {   // (an integer target takes no blending)
+      if (is_integer(pass_color_->desc().format)) return kBad;
+      for (uint32_t n = 0; n + 1 < pass_target_count_; ++n)
+        if (pass_extra_[n] && is_integer(pass_extra_[n]->desc().format)) return kBad;
+    }
     if (pipeline_->has_geometry()) {   // (the geometry shader takes the primitives the draw makes)
       const graphics::GeometryPrimitive made = topology_ == Topology::LineList || topology_ == Topology::LineStrip ? graphics::GeometryPrimitive::Line
                                                : topology_ == Topology::PointList ? graphics::GeometryPrimitive::Point : graphics::GeometryPrimitive::Triangle;
@@ -979,6 +985,7 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   pipeline->vertex_ = vertex;
   pipeline->fragment_ = fragment;
   pipeline->geometry_ = geometry;
+  pipeline->blends_ = d.alpha_blend || d.blend.enable || (d.independent_blend && (d.target_blend[0].enable || d.target_blend[1].enable || d.target_blend[2].enable));
   if (geometry) pipeline->geometry_input_ = geometry->geometry_input();
   pipeline->stride_ = d.vertex_stride;
   for (uint32_t i = 0; i < d.attribute_count; ++i) pipeline->per_instance_ = pipeline->per_instance_ || d.attributes[i].per_instance;

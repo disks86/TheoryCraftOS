@@ -98,6 +98,8 @@ class PipelineObject {
   // A compute pipeline (Adapter::create_compute_pipeline): dispatched, not drawn with. It says its thread group and which storage buffer slots (bit n: u<n>) it reads or writes.
   bool compute() const { return compute_; }
   // The geometry shader's input (a draw must make triangles, lines or points to match), if the pipeline has one.
+  // Does the pipeline blend (any target)? Draws into integer targets must not.
+  bool blends() const { return blends_; }
   bool has_geometry() const { return static_cast<bool>(geometry_); }
   graphics::GeometryPrimitive geometry_input() const { return geometry_input_; }
   uint32_t thread_group(uint32_t axis) const { return axis < 3 ? thread_group_[axis] : 1; }
@@ -112,6 +114,7 @@ class PipelineObject {
   graphics::IPipeline* pipeline_ = nullptr;
   bool per_instance_ = false;
   bool compute_ = false;
+  bool blends_ = false;
   SharedPointer<ShaderObject> geometry_;
   graphics::GeometryPrimitive geometry_input_ = graphics::GeometryPrimitive::Triangle;
   uint32_t thread_group_[3] = {1, 1, 1};
