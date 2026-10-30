@@ -28,10 +28,20 @@ void set_message(char (&out)[96], const char* text) {
 }
 }
 
-BluetoothService::BluetoothService(IUsbBus* usb, IBluetoothFirmwareSource* firmware, allocators::IAllocator& allocator)
-    : usb_(usb), firmware_(firmware), allocator_(allocator), entries_(allocator) {}
+BluetoothService::BluetoothService(IUsbBus* usb, IBluetoothFirmwareSource* firmware, allocators::IAllocator& allocator, crypto::IRandom* random, IBluetoothBondStorage* bonds)
+    : usb_(usb), firmware_(firmware), allocator_(allocator), random_(random), bond_storage_(bonds), entries_(allocator) {}
+
+bool BluetoothService::save_bonds() {
+  if (!bond_storage_) return false;
+  ByteBuffer bytes(allocator_);
+  return bonds_.serialize(bytes) && bond_storage_->save(bytes.view());
+}
 
 void BluetoothService::start() {
+  if (bond_storage_) {
+    ByteBuffer bytes(allocator_);
+    if (bond_storage_->load(bytes)) bonds_.parse(bytes.view());
+  }
   if (!usb_) return;
   // Every port counts as new once: what is plugged in now is taken, and the watcher then reports only what changes.
   for (uint32_t c = 0; c < usb_->controller_count(); ++c) {
@@ -127,6 +137,15 @@ void BluetoothService::open(uint32_t bus_controller, IUsbHostController& host, u
   }
   const HciResult started = entry->controller->initialize();
   entry->state = started == HciResult::Ok ? BluetoothState::Ready : BluetoothState::Failed;
+  if (started == HciResult::Ok) {
+    entry->l2cap = UniquePointer<L2cap>::make(allocator_, *entry->controller);
+    if (entry->l2cap) entry->att = UniquePointer<AttClient>::make(allocator_, *entry->controller, *entry->l2cap);
+    if (entry->att) entry->gatt = UniquePointer<GattClient>::make(allocator_, *entry->att);
+    if (entry->l2cap && random_) {
+      entry->security = UniquePointer<SecurityManager>::make(allocator_, *entry->controller, *entry->l2cap, *random_, bonds_);
+      if (entry->security && entry->att) entry->att->set_security_handler(&SecurityManager::att_security, entry->security.get());
+    }
+  }
   set_message(entry->message, started == HciResult::Ok ? "ready" : started == HciResult::Timeout ? "the controller did not answer" : "bringing the controller up failed");
   entries_.push_back(util::move(entry));
   ++added_;

@@ -21,8 +21,13 @@
 // Not thread safe by itself.
 #pragma once
 #include "Allocators/IAllocator.hpp"
+#include "Crypto/Random.hpp"
+#include "Hardware/Bluetooth/BondFile.hpp"
+#include "Hardware/Bluetooth/Gatt.hpp"
 #include "Hardware/Bluetooth/HciController.hpp"
+#include "Hardware/Bluetooth/L2cap.hpp"
 #include "Hardware/Bluetooth/IntelBluetooth.hpp"
+#include "Hardware/Bluetooth/Smp.hpp"
 #include "Hardware/Bluetooth/UsbHciTransport.hpp"
 #include "Hardware/Bus/Usb/IUsbBus.hpp"
 #include "Hardware/Bus/Usb/UsbPortWatcher.hpp"
@@ -50,6 +55,10 @@ class BluetoothService {
     UniquePointer<UsbHciTransport> transport;
     UniquePointer<HciController> controller;
     UniquePointer<IntelBluetooth> intel;
+    UniquePointer<L2cap> l2cap;                        // the upper layers, once the controller is ready (the security manager only with a random source)
+    UniquePointer<AttClient> att;
+    UniquePointer<GattClient> gatt;
+    UniquePointer<SecurityManager> security;
     BluetoothState state = BluetoothState::Failed;
     char message[96] = {};
     char firmware[64] = {};            // the file an Intel controller is waiting for
@@ -57,7 +66,7 @@ class BluetoothService {
   };
 
   // `usb` and `firmware` may be null: without a bus there is nothing to find, without a firmware source an Intel controller stays unstarted.
-  BluetoothService(IUsbBus* usb, IBluetoothFirmwareSource* firmware, allocators::IAllocator& allocator);
+  BluetoothService(IUsbBus* usb, IBluetoothFirmwareSource* firmware, allocators::IAllocator& allocator, crypto::IRandom* random = nullptr, IBluetoothBondStorage* bonds = nullptr);
   BluetoothService(const BluetoothService&) = delete;
   BluetoothService& operator=(const BluetoothService&) = delete;
 
@@ -69,6 +78,9 @@ class BluetoothService {
   const Entry* entry(uint32_t index) const { return index < entries_.count() ? entries_[index].get() : nullptr; }
   HciController* controller(uint32_t index) { return index < entries_.count() && entries_[index]->state == BluetoothState::Ready ? entries_[index]->controller.get() : nullptr; }
   uint32_t ready_count() const;
+  // The bonds of every controller (one table: a device bonded through one is known to the others). They are loaded when the service starts and saved by save_bonds().
+  SmBondStore& bonds() { return bonds_; }
+  bool save_bonds();
   uint32_t added() const { return added_; }
   uint32_t removed() const { return removed_; }
 
@@ -80,6 +92,9 @@ class BluetoothService {
   IUsbBus* usb_;
   IBluetoothFirmwareSource* firmware_;
   allocators::IAllocator& allocator_;
+  crypto::IRandom* random_;
+  IBluetoothBondStorage* bond_storage_;
+  SmBondStore bonds_;
   UsbPortWatcher watcher_;
   List<UniquePointer<Entry>> entries_;
   uint32_t added_ = 0, removed_ = 0;
