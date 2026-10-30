@@ -33,17 +33,120 @@ typedef struct {
 } ScreenBuffer;
 
 static BOOL con_buffer_or_main(HANDLE h);
-static ScreenBuffer g_screens[CON_MAX_BUFFERS];
+static ScreenBuffer g_local_screens[CON_MAX_BUFFERS];
 static ScreenBuffer *g_active_screen;
 static CRITICAL_SECTION g_con_lock;
 static volatile LONG g_con_ready;
-static DWORD g_con_in_mode = ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT;
-static WCHAR g_con_title[260];
-static DWORD g_con_history_size = 50, g_con_history_buffers = 4, g_con_history_flags;
 static PHANDLER_ROUTINE g_ctrl_handlers[32];
 static int g_ctrl_handler_count;
 static BOOL g_ctrl_ignored;
 #define CON_DEFAULT_ATTR 7
+
+/* ---- the console of a process, shared by the processes that belong to it ------------------------------------------------------------------------------------ *
+ * The main screen buffer, the title, the modes and the list of processes of a console live in a section named after the console (the number in ConsoleHandle of the process
+ * parameters), mapped at the same address in every process of it, so the pointers inside are good for all. The other screen buffers and the input stay with the process. */
+#ifndef FILE_MAP_ALL_ACCESS
+#define FILE_MAP_ALL_ACCESS 0xF001Fu
+#endif
+#define CON_HOST_BASE ((PVOID)0x700000000000ull)
+#define CON_MAX_MEMBERS 64
+#define CON_HOST_CELLS (128 * 1024)      /* the largest main screen buffer (two copies are kept so that a resize can copy) */
+typedef struct {
+  volatile LONG lock;
+  DWORD magic, in_mode, history_size, history_buffers, history_flags, member_count, members[CON_MAX_MEMBERS];
+  WCHAR title[260], original_title[260];
+  ScreenBuffer main;
+  LONG flip;
+  CHAR_INFO_ cells[2][CON_HOST_CELLS];
+} ConHost;
+static HANDLE g_host_mapping;
+static ConHost *g_locked_host;     /* the console whose lock this process holds */
+static ConHost *g_host;            /* NULL: no console (never attached, or freed) */
+static BOOL g_host_tried;
+static WCHAR g_detached_title[260];
+static DWORD g_detached_mode = ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT;
+static DWORD g_detached_history[3] = {50, 4, 0};
+
+/* The lock of a console is a spin lock; one that its holder never gives back (the holder ended in the middle of a console call) is taken after a while. */
+static void con_host_lock(ConHost *h) {
+  for (unsigned spins = 0; InterlockedCompareExchange(&h->lock, 1, 0) != 0; ++spins) {
+    if (spins > 20000) { LARGE_INTEGER t; t.QuadPart = -10000; NtDelayExecution(FALSE, &t); }      /* (1 ms) */
+    else NtYieldExecution();
+    if (spins > 20000 + 3000) { InterlockedExchange(&h->lock, 0); spins = 0; }
+  }
+}
+static void con_host_unlock(ConHost *h) { InterlockedExchange(&h->lock, 0); }
+static void con_host_add_member(ConHost *h, DWORD pid) {
+  for (DWORD i = 0; i < h->member_count; ++i) if (h->members[i] == pid) return;
+  if (h->member_count < CON_MAX_MEMBERS) h->members[h->member_count++] = pid;
+}
+/* A handle that is not one of the small numbers the standard handles (4, 8, 12) are known by: a program closing its console handles must not close this one. */
+static HANDLE con_keep_handle(HANDLE h) {
+  HANDLE low[4];
+  int lows = 0;
+  while ((ULONG_PTR)h <= 12 && lows < 4) {
+    HANDLE copy;
+    if (!DuplicateHandle(GetCurrentProcess(), h, GetCurrentProcess(), &copy, 0, FALSE, 2 /* DUPLICATE_SAME_ACCESS */)) break;
+    low[lows++] = h;
+    h = copy;
+  }
+  for (int i = 0; i < lows; ++i) CloseHandle(low[i]);
+  return h;
+}
+/* Opens (or creates) the console with an identifier and joins it. */
+static BOOL con_host_join(ULONG_PTR id) {
+  WCHAR name[40] = {'T', 'c', 'o', 's', 'C', 'o', 'n', 's', 'o', 'l', 'e', '_'};
+  int n = 12;
+  for (int shift = 60; shift >= 0; shift -= 4) { const int d = (int)((id >> shift) & 15); if (d || n > 12 || shift == 0) name[n++] = (WCHAR)(d < 10 ? '0' + d : 'a' + d - 10); }
+  name[n] = 0;
+  HANDLE mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, (DWORD)sizeof(ConHost), name);
+  if (!mapping) return FALSE;
+  ConHost *h = MapViewOfFileEx(mapping, FILE_MAP_ALL_ACCESS, 0, 0, 0, CON_HOST_BASE);
+  if (!h) h = MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, 0);      /* (another address: the pointers inside the console are then good in this process only) */
+  if (!h) { CloseHandle(mapping); return FALSE; }
+  g_host_mapping = mapping = con_keep_handle(mapping);      /* (kept open: the section lives as long as a handle to it does) */
+  con_host_lock(h);
+  if (h->magic == 0) {      /* the first process of the console makes it */
+    h->magic = 0x434F4E48;
+    h->in_mode = ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT;
+    h->history_size = 50; h->history_buffers = 4;
+    const UNICODE_STRING *title = &parameters()->WindowTitle;
+    DWORD k = 0;
+    for (; title->Buffer && k < title->Length / 2 && k < 259; ++k) h->title[k] = title->Buffer[k];
+    h->title[k] = 0;
+    memcpy(h->original_title, h->title, sizeof(h->title));
+  }
+  con_host_add_member(h, GetCurrentProcessId());
+  con_host_unlock(h);
+  g_host = h;
+  return TRUE;
+}
+static void con_host_leave(void) {
+  ConHost *h = g_host;
+  if (!h) return;
+  con_host_lock(h);
+  const DWORD pid = GetCurrentProcessId();
+  for (DWORD i = 0; i < h->member_count; ++i) if (h->members[i] == pid) { h->members[i] = h->members[--h->member_count]; break; }
+  con_host_unlock(h);
+  g_host = NULL;
+  g_active_screen = NULL;
+  UnmapViewOfFile(h);
+  if (g_host_mapping) CloseHandle(g_host_mapping);
+  g_host_mapping = NULL;
+}
+static void con_directory_set(DWORD pid, ULONG_PTR id);
+static void con_attach_if_needed(void) {      /* (the local lock is held) */
+  if (g_host_tried) return;
+  g_host_tried = TRUE;
+  const ULONG_PTR id = (ULONG_PTR)parameters()->ConsoleHandle;
+  if (id && con_host_join(id)) con_directory_set(GetCurrentProcessId(), id);
+}
+static WCHAR *con_title_ptr(void) { return g_host ? g_host->title : g_detached_title; }
+static DWORD *con_in_mode_ptr(void) { return g_host ? &g_host->in_mode : &g_detached_mode; }
+static DWORD *con_history_ptr(void) { return g_host ? &g_host->history_size : g_detached_history; }      /* size, buffers, flags in a row */
+#define g_con_title (con_title_ptr())
+#define g_con_in_mode (*con_in_mode_ptr())
+static ScreenBuffer *con_screen(int i) { return i == 0 && g_host ? &g_host->main : &g_local_screens[i]; }
 
 static void con_lock(void) {
   if (g_con_ready != 2) {
@@ -51,25 +154,36 @@ static void con_lock(void) {
     else while (g_con_ready != 2) NtYieldExecution();
   }
   EnterCriticalSection(&g_con_lock);
+  if (g_con_lock.RecursionCount == 1) {      /* (the lock of the console is taken once, not again by a nested call) */
+    con_attach_if_needed();
+    g_locked_host = g_host;
+    if (g_host) con_host_lock(g_host);
+  }
 }
-static void con_unlock(void) { LeaveCriticalSection(&g_con_lock); }
+static void con_unlock(void) {
+  if (g_con_lock.RecursionCount == 1 && g_locked_host) { ConHost *h = g_locked_host; g_locked_host = NULL; con_host_unlock(h); }
+  LeaveCriticalSection(&g_con_lock);
+}
 
 static BOOL con_alloc_cells(ScreenBuffer *sb, COORD size) {
   if (size.X <= 0 || size.Y <= 0 || (long)size.X * size.Y > CON_MAX_CELLS) return FALSE;
-  CHAR_INFO_ *cells = RtlAllocateHeap(heap(), 0, (SIZE_T)size.X * size.Y * sizeof(CHAR_INFO_));
+  const BOOL shared = g_host && sb == &g_host->main;
+  if (shared && (long)size.X * size.Y > CON_HOST_CELLS) return FALSE;
+  CHAR_INFO_ *cells = shared ? g_host->cells[g_host->flip ^ 1] : RtlAllocateHeap(heap(), 0, (SIZE_T)size.X * size.Y * sizeof(CHAR_INFO_));
   if (!cells) return FALSE;
   for (long i = 0; i < (long)size.X * size.Y; ++i) { cells[i].ch = ' '; cells[i].attr = sb->attr; }
   if (sb->cells) {      /* the old text stays where it is, cut or padded */
     for (SHORT y = 0; y < size.Y && y < sb->size.Y; ++y)
       for (SHORT x = 0; x < size.X && x < sb->size.X; ++x) cells[(long)y * size.X + x] = sb->cells[(long)y * sb->size.X + x];
-    RtlFreeHeap(heap(), 0, sb->cells);
+    if (!shared) RtlFreeHeap(heap(), 0, sb->cells);
   }
+  if (shared) g_host->flip ^= 1;
   sb->cells = cells;
   sb->size = size;
   return TRUE;
 }
 static ScreenBuffer *con_main(void) {      /* (the lock is held) */
-  ScreenBuffer *sb = &g_screens[0];
+  ScreenBuffer *sb = con_screen(0);
   if (!sb->used) {
     sb->used = TRUE; sb->handle = NULL;
     sb->attr = CON_DEFAULT_ATTR;
@@ -78,20 +192,23 @@ static ScreenBuffer *con_main(void) {      /* (the lock is held) */
     COORD size = {80, 25};
     if (!con_alloc_cells(sb, size)) { sb->used = FALSE; return NULL; }
     sb->window.Right = 79; sb->window.Bottom = 24;
-    if (!g_active_screen) g_active_screen = sb;
   }
+  if (!g_active_screen) g_active_screen = sb;
   return sb;
 }
 
 /* The standard handles that are consoles, found out once (and again if a handle changes). */
 static struct { HANDLE h; int console; } g_con_cache[3];
-static BOOL con_std_is_console(HANDLE h) {
+static BOOL con_std_is_terminal(HANDLE h) {
   for (int i = 0; i < 3; ++i) if (g_con_cache[i].h == h && h) return g_con_cache[i].console;
   const int type = device_type(h);
   if (type < 0) return FALSE;      /* (not remembered: it may be a handle that will be closed) */
   for (int i = 0; i < 3; ++i) if (h == GetStdHandle(i == 0 ? STD_INPUT_HANDLE : i == 1 ? STD_OUTPUT_HANDLE : STD_ERROR_HANDLE)) { g_con_cache[i].h = h; g_con_cache[i].console = type == 0x50; return type == 0x50; }
   return type == 0x50;
 }
+/* Whether this process belongs to a console (the first question lets it join the one in its process parameters). */
+static BOOL con_attached(void) { if (!g_host_tried) { con_lock(); con_unlock(); } return g_host != NULL; }
+static BOOL con_std_is_console(HANDLE h) { return con_std_is_terminal(h) && con_attached(); }
 /* The standard output of a console (the same handle as CONOUT$) is not something to read from. */
 static BOOL con_is_output_only(HANDLE h) { return h && h == GetStdHandle(STD_OUTPUT_HANDLE) && h != GetStdHandle(STD_INPUT_HANDLE) && con_std_is_console(h); }
 static BOOL con_is_input(HANDLE h) { return h && h == GetStdHandle(STD_INPUT_HANDLE) && con_std_is_console(h); }
@@ -99,9 +216,9 @@ static BOOL con_buffer_alive(HANDLE h) { return SetEvent(h) || GetLastError() !=
 /* The screen buffer a handle writes to (the lock is held), or NULL. */
 static ScreenBuffer *con_buffer(HANDLE h) {
   for (int i = 1; i < CON_MAX_BUFFERS; ++i) {
-    ScreenBuffer *sb = &g_screens[i];
+    ScreenBuffer *sb = con_screen(i);
     if (sb->used && sb->handle == h) {
-      if (!con_buffer_alive(h)) { RtlFreeHeap(heap(), 0, sb->cells); if (g_active_screen == sb) g_active_screen = &g_screens[0]; memset(sb, 0, sizeof(*sb)); return NULL; }
+      if (!con_buffer_alive(h)) { RtlFreeHeap(heap(), 0, sb->cells); if (g_active_screen == sb) g_active_screen = con_screen(0); memset(sb, 0, sizeof(*sb)); return NULL; }
       return sb;
     }
   }
@@ -273,7 +390,7 @@ static BOOL con_write_wide(HANDLE h, const WCHAR *w, DWORD length) {
     ScreenBuffer *sb = con_buffer(h);
     if (!sb) { con_unlock(); set_error(ERROR_INVALID_HANDLE); return FALSE; }
     const DWORD n = sb_write(sb, w + done, chunk, host);
-    const BOOL show = sb == g_active_screen || (g_active_screen == NULL && sb == &g_screens[0]);
+    const BOOL show = sb == g_active_screen || (g_active_screen == NULL && sb == con_screen(0));
     con_unlock();
     done += chunk;
     if (!show || n == 0) continue;
@@ -630,8 +747,26 @@ EXPORT DWORD WINAPI GetConsoleTitleA(LPSTR title, DWORD size) {
   if (size > 0) { const DWORD k = n < size - 1 ? n : size - 1; for (DWORD i = 0; i < k; ++i) title[i] = (char)wide[i]; title[k] = 0; }
   return n;
 }
-EXPORT DWORD WINAPI GetConsoleOriginalTitleW(LPWSTR title, DWORD size) { return GetConsoleTitleW(title, size); }
-EXPORT DWORD WINAPI GetConsoleOriginalTitleA(LPSTR title, DWORD size) { return GetConsoleTitleA(title, size); }
+EXPORT DWORD WINAPI GetConsoleOriginalTitleW(LPWSTR title, DWORD size) {
+  if (size == 0) return 0;
+  con_lock();
+  const WCHAR *original = g_host ? g_host->original_title : g_detached_title;
+  const DWORD n = (DWORD)wcslen(original);
+  const DWORD k = n < size - 1 ? n : size - 1;
+  memcpy(title, original, (size_t_)k * 2);
+  title[k] = 0;
+  con_unlock();
+  return n;
+}
+EXPORT DWORD WINAPI GetConsoleOriginalTitleA(LPSTR title, DWORD size) {
+  WCHAR wide[260];
+  if (size == 0) return 0;
+  const DWORD n = GetConsoleOriginalTitleW(wide, 260);
+  const DWORD k = n < size - 1 ? n : size - 1;
+  for (DWORD i = 0; i < k; ++i) title[i] = (char)wide[i];
+  title[k] = 0;
+  return n;
+}
 EXPORT BOOL WINAPI SetConsoleTitleW(LPCWSTR title) {
   if (!title) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
   con_lock();
@@ -649,22 +784,142 @@ EXPORT BOOL WINAPI SetConsoleTitleA(LPCSTR title) {
   wide[259] = 0;
   return SetConsoleTitleW(wide);
 }
-EXPORT BOOL WINAPI AllocConsole(void) { return TRUE; }
-EXPORT BOOL WINAPI FreeConsole(void) { return TRUE; }
-EXPORT BOOL WINAPI AttachConsole(DWORD pid) { if (pid == (DWORD)-1 || pid == GetCurrentProcessId()) return TRUE; set_error(ERROR_ACCESS_DENIED); return FALSE; }
+/* ---- console membership: AllocConsole, FreeConsole, AttachConsole, GetConsoleProcessList ------------------------------------------------------------------ */
+
+/* Which console each process is in, in a section all of them can open (the numbers of the consoles are in the process parameters of the processes). */
+#define CON_DIR_SLOTS 256
+typedef struct { volatile LONG lock; struct { DWORD pid; ULONG_PTR id; } slot[CON_DIR_SLOTS]; } ConDirectory;
+static ConDirectory *con_directory(void) {
+  static ConDirectory *dir;
+  if (dir) return dir;
+  static const WCHAR name[] = {'T', 'c', 'o', 's', 'C', 'o', 'n', 's', 'o', 'l', 'e', 'D', 'i', 'r', 'e', 'c', 't', 'o', 'r', 'y', 0};
+  HANDLE mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, (DWORD)sizeof(ConDirectory), name);
+  if (!mapping) return NULL;
+  mapping = con_keep_handle(mapping);
+  dir = MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, 0);      /* (the handle stays open: the section lives as long as a handle to it does) */
+  return dir;
+}
+static void con_directory_set(DWORD pid, ULONG_PTR id) {
+  ConDirectory *d = con_directory();
+  if (!d) return;
+  while (InterlockedCompareExchange(&d->lock, 1, 0) != 0) NtYieldExecution();
+  int free_slot = -1, found = -1;
+  for (int i = 0; i < CON_DIR_SLOTS; ++i) {
+    if (d->slot[i].pid == pid) found = i;
+    else if (free_slot < 0 && d->slot[i].pid == 0) free_slot = i;
+  }
+  if (found < 0) found = free_slot;
+  if (found >= 0) { d->slot[found].pid = id ? pid : 0; d->slot[found].id = id; }
+  InterlockedExchange(&d->lock, 0);
+}
+static ULONG_PTR con_directory_find(DWORD pid) {
+  ConDirectory *d = con_directory();
+  ULONG_PTR id = 0;
+  if (!d) return 0;
+  while (InterlockedCompareExchange(&d->lock, 1, 0) != 0) NtYieldExecution();
+  for (int i = 0; i < CON_DIR_SLOTS; ++i) if (d->slot[i].pid == pid) id = d->slot[i].id;
+  InterlockedExchange(&d->lock, 0);
+  return id;
+}
+static BOOL con_process_alive(DWORD pid) {
+  if (pid == GetCurrentProcessId()) return TRUE;
+  const DWORD saved = GetLastError();      /* (asking leaves the last error of the caller as it was) */
+  HANDLE h = OpenProcess(0x1000 /* PROCESS_QUERY_LIMITED_INFORMATION */, FALSE, pid);      /* (a process that has ended cannot be opened) */
+  if (h) CloseHandle(h);
+  set_error(saved);
+  return h != NULL;
+}
+typedef struct { LONG_PTR ExitStatus; PVOID PebBaseAddress; ULONG_PTR AffinityMask; LONG_PTR BasePriority; ULONG_PTR UniqueProcessId, InheritedFromUniqueProcessId; } PROCESS_BASIC_INFORMATION_;
+/* A child that shares the console of this process is one of its members from the start. */
+static void con_note_child(DWORD pid, HANDLE console) {
+  if (!console || !con_attached() || console != parameters()->ConsoleHandle) return;
+  con_lock();
+  con_host_add_member(g_host, pid);
+  con_unlock();
+}
+/* A new console for this process: a number nobody has. */
+static ULONG_PTR con_new_id(void) { return (ULONG_PTR)console_for_new_process(0x10); }
+/* The standard handles of a process that joins a console become the console's (those it was started with stay if it was started with STARTF_USESTDHANDLES and has them). */
+static void con_bind_std_handles(void) {
+  RTL_USER_PROCESS_PARAMETERS *pp = parameters();
+  const BOOL keep = (pp->WindowFlags & 0x100) != 0;
+  if (!keep || !pp->StandardInput) pp->StandardInput = (HANDLE)4;
+  if (!keep || !pp->StandardOutput) pp->StandardOutput = (HANDLE)8;
+  if (!keep || !pp->StandardError) pp->StandardError = (HANDLE)12;
+}
+static void con_reset_handlers(void) { con_lock(); g_ctrl_handler_count = 0; g_ctrl_ignored = FALSE; con_unlock(); }
+static BOOL con_join(ULONG_PTR id) {
+  parameters()->ConsoleHandle = (HANDLE)id;
+  g_host_tried = FALSE;
+  const BOOL joined = con_attached();
+  if (joined) con_directory_set(GetCurrentProcessId(), id);
+  return joined;
+}
+EXPORT BOOL WINAPI FreeConsole(void) {
+  if (!con_attached()) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  con_lock();
+  ConHost *h = g_host;
+  const DWORD pid = GetCurrentProcessId();
+  for (DWORD i = 0; i < h->member_count; ++i) if (h->members[i] == pid) { h->members[i] = h->members[--h->member_count]; break; }
+  g_host = NULL;      /* (con_unlock still lets go of the lock of the console it holds) */
+  g_active_screen = NULL;
+  g_host_tried = TRUE;
+  con_unlock();
+  UnmapViewOfFile(h);
+  if (g_host_mapping) CloseHandle(g_host_mapping);
+  g_host_mapping = NULL;
+  parameters()->ConsoleHandle = NULL;
+  con_directory_set(pid, 0);
+  return TRUE;
+}
+EXPORT BOOL WINAPI AllocConsole(void) {
+  if (con_attached()) { set_error(ERROR_ACCESS_DENIED); return FALSE; }
+  if (!con_join(con_new_id())) { set_error(ERROR_NOT_ENOUGH_MEMORY); return FALSE; }
+  con_bind_std_handles();
+  con_reset_handlers();
+  return TRUE;
+}
+EXPORT BOOL WINAPI AttachConsole(DWORD pid) {
+  if (con_attached()) { set_error(ERROR_ACCESS_DENIED); return FALSE; }
+  if (pid == (DWORD)-1) {      /* ATTACH_PARENT_PROCESS */
+    PROCESS_BASIC_INFORMATION_ info;
+    ULONG length = 0;
+    if (NtQueryInformationProcess((HANDLE)(LONG_PTR)-1, 0, &info, sizeof(info), &length) != 0 || !info.InheritedFromUniqueProcessId) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
+    pid = (DWORD)info.InheritedFromUniqueProcessId;
+  }
+  const ULONG_PTR id = con_directory_find(pid);
+  if (!id) { set_error(pid == GetCurrentProcessId() ? ERROR_ACCESS_DENIED : ERROR_INVALID_HANDLE); return FALSE; }
+  if (!con_join(id)) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
+  con_bind_std_handles();
+  con_reset_handlers();
+  return TRUE;
+}
 EXPORT HANDLE WINAPI GetConsoleWindow(void) { return NULL; }
-EXPORT DWORD WINAPI GetConsoleProcessList(LPDWORD list, DWORD count) { if (count >= 1 && list) list[0] = GetCurrentProcessId(); return 1; }
+/* The processes of the console (those that have ended are dropped from the list); the list is written only if it is big enough. */
+EXPORT DWORD WINAPI GetConsoleProcessList(LPDWORD list, DWORD count) {
+  if (!list || !count) { set_error(ERROR_INVALID_PARAMETER); return 0; }
+  if (!con_attached()) return 0;
+  con_lock();
+  ConHost *h = g_host;
+  for (DWORD i = 0; i < h->member_count;) {
+    if (con_process_alive(h->members[i])) ++i; else h->members[i] = h->members[--h->member_count];
+  }
+  const DWORD n = h->member_count;
+  if (n <= count) for (DWORD i = 0; i < n; ++i) list[i] = h->members[i];
+  con_unlock();
+  return n;
+}
 EXPORT BOOL WINAPI GetNumberOfConsoleMouseButtons(LPDWORD n) { if (!n) { set_error(ERROR_INVALID_PARAMETER); return FALSE; } *n = 3; return TRUE; }
 EXPORT BOOL WINAPI GetConsoleDisplayMode(LPDWORD mode) { if (!mode) { set_error(ERROR_INVALID_PARAMETER); return FALSE; } *mode = 0; return TRUE; }
 EXPORT BOOL WINAPI SetConsoleDisplayMode(HANDLE h, DWORD flags, COORD *size) { (void)h; (void)flags; (void)size; set_error(ERROR_INVALID_PARAMETER); return FALSE; }
 EXPORT BOOL WINAPI GetConsoleHistoryInfo(CONSOLE_HISTORY_INFO_ *info) {
   if (!info || info->cbSize != sizeof(*info)) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
-  info->HistoryBufferSize = g_con_history_size; info->NumberOfHistoryBuffers = g_con_history_buffers; info->dwFlags = g_con_history_flags;
+  info->HistoryBufferSize = con_history_ptr()[0]; info->NumberOfHistoryBuffers = con_history_ptr()[1]; info->dwFlags = con_history_ptr()[2];
   return TRUE;
 }
 EXPORT BOOL WINAPI SetConsoleHistoryInfo(CONSOLE_HISTORY_INFO_ *info) {
   if (!info || info->cbSize != sizeof(*info)) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
-  g_con_history_size = info->HistoryBufferSize; g_con_history_buffers = info->NumberOfHistoryBuffers; g_con_history_flags = info->dwFlags;
+  con_history_ptr()[0] = info->HistoryBufferSize; con_history_ptr()[1] = info->NumberOfHistoryBuffers; con_history_ptr()[2] = info->dwFlags;
   return TRUE;
 }
 EXPORT BOOL WINAPI GetConsoleSelectionInfo(LPVOID info) { if (info) memset(info, 0, 16); return TRUE; }
@@ -819,18 +1074,18 @@ EXPORT HANDLE WINAPI CreateConsoleScreenBuffer(DWORD access, DWORD share, LPSECU
   if (flags != 1) { set_error(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE; }
   con_lock();
   ScreenBuffer *main = con_main();
-  for (int i = 1; i < CON_MAX_BUFFERS; ++i) if (g_screens[i].used && !con_buffer_alive(g_screens[i].handle)) { RtlFreeHeap(heap(), 0, g_screens[i].cells); memset(&g_screens[i], 0, sizeof(g_screens[i])); }
+  for (int i = 1; i < CON_MAX_BUFFERS; ++i) if ((*con_screen(i)).used && !con_buffer_alive((*con_screen(i)).handle)) { RtlFreeHeap(heap(), 0, (*con_screen(i)).cells); memset(con_screen(i), 0, sizeof((*con_screen(i)))); }
   ScreenBuffer *sb = NULL;
-  for (int i = 1; i < CON_MAX_BUFFERS && !sb; ++i) if (!g_screens[i].used) sb = &g_screens[i];
+  for (int i = 1; i < CON_MAX_BUFFERS && !sb; ++i) if (!(*con_screen(i)).used) sb = con_screen(i);
   HANDLE handle = INVALID_HANDLE_VALUE;
   if (!main || !sb) set_error(ERROR_NOT_ENOUGH_MEMORY);
   else {
     handle = CreateEventW(NULL, TRUE, FALSE, NULL);      /* the buffer's handle: closing it is what the program does when it is done */
     for (int i = 1; handle && i < CON_MAX_BUFFERS; ++i) {      /* (an entry for a closed buffer whose handle value is used again is dropped) */
-      if (!g_screens[i].used || g_screens[i].handle != handle) continue;
-      if (g_active_screen == &g_screens[i]) g_active_screen = &g_screens[0];
-      RtlFreeHeap(heap(), 0, g_screens[i].cells);
-      memset(&g_screens[i], 0, sizeof(g_screens[i]));
+      if (!(*con_screen(i)).used || (*con_screen(i)).handle != handle) continue;
+      if (g_active_screen == con_screen(i)) g_active_screen = con_screen(0);
+      RtlFreeHeap(heap(), 0, (*con_screen(i)).cells);
+      memset(con_screen(i), 0, sizeof((*con_screen(i))));
     }
     if (handle) {
       memset(sb, 0, sizeof(*sb));

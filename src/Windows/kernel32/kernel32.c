@@ -522,21 +522,35 @@ EXPORT DWORD WINAPI ExpandEnvironmentStringsA(LPCSTR source, LPSTR dest, DWORD c
   return needed;
 }
 
+/* The startup information the process was created with: the fields of the process parameters (the strings are the ones in the parameters). */
 EXPORT void WINAPI GetStartupInfoW(LPSTARTUPINFOW info) {
+  const RTL_USER_PROCESS_PARAMETERS *pp = parameters();
   memset(info, 0, sizeof(*info));
   info->cb = sizeof(*info);
-  info->dwFlags = 0x100;      /* STARTF_USESTDHANDLES */
-  info->hStdInput = parameters()->StandardInput;
-  info->hStdOutput = parameters()->StandardOutput;
-  info->hStdError = parameters()->StandardError;
+  info->lpDesktop = pp->DesktopInfo.Buffer;
+  info->lpTitle = pp->WindowTitle.Buffer;
+  info->dwX = pp->StartingX; info->dwY = pp->StartingY; info->dwXSize = pp->CountX; info->dwYSize = pp->CountY;
+  info->dwXCountChars = pp->CountCharsX; info->dwYCountChars = pp->CountCharsY; info->dwFillAttribute = pp->FillAttribute;
+  info->dwFlags = pp->WindowFlags;
+  info->wShowWindow = (WORD)pp->ShowWindowFlags;
+  info->hStdInput = pp->StandardInput;
+  info->hStdOutput = pp->StandardOutput;
+  info->hStdError = pp->StandardError;
 }
+/* The same with ANSI strings, converted once and kept. */
 EXPORT void WINAPI GetStartupInfoA(LPSTARTUPINFOA info) {
+  static char title[260], desktop[260];
+  const RTL_USER_PROCESS_PARAMETERS *pp = parameters();
+  STARTUPINFOW wide;
+  GetStartupInfoW(&wide);
   memset(info, 0, sizeof(*info));
   info->cb = sizeof(*info);
-  info->dwFlags = 0x100;
-  info->hStdInput = parameters()->StandardInput;
-  info->hStdOutput = parameters()->StandardOutput;
-  info->hStdError = parameters()->StandardError;
+  if (wide.lpTitle) { WideCharToMultiByte(CP_UTF8, 0, wide.lpTitle, -1, title, sizeof(title), NULL, NULL); info->lpTitle = title; }
+  if (wide.lpDesktop) { WideCharToMultiByte(CP_UTF8, 0, wide.lpDesktop, -1, desktop, sizeof(desktop), NULL, NULL); info->lpDesktop = desktop; }
+  info->dwX = wide.dwX; info->dwY = wide.dwY; info->dwXSize = wide.dwXSize; info->dwYSize = wide.dwYSize;
+  info->dwXCountChars = wide.dwXCountChars; info->dwYCountChars = wide.dwYCountChars; info->dwFillAttribute = wide.dwFillAttribute;
+  info->dwFlags = wide.dwFlags; info->wShowWindow = wide.wShowWindow;
+  info->hStdInput = pp->StandardInput; info->hStdOutput = pp->StandardOutput; info->hStdError = pp->StandardError;
 }
 
 EXPORT DWORD WINAPI GetVersion(void) { return (19045u << 16) | (0u << 8) | 10u; }
@@ -2133,6 +2147,14 @@ static void unicode_string(UNICODE_STRING *s, LPCWSTR text) {
   s->Buffer = (PWSTR)text;
 }
 
+/* The console a new process belongs to: none for DETACHED_PROCESS, a console of its own for CREATE_NEW_CONSOLE, otherwise the one of this process. */
+static void con_note_child(DWORD pid, HANDLE console);
+static HANDLE console_for_new_process(DWORD flags) {
+  static volatile LONG counter;
+  if (flags & 0x8 /* DETACHED_PROCESS */) return NULL;
+  if (flags & 0x10 /* CREATE_NEW_CONSOLE */) return (HANDLE)(ULONG_PTR)(0x100000000ull | ((ULONG_PTR)GetCurrentProcessId() << 8) | (ULONG_PTR)(InterlockedIncrement(&counter) & 0xFF));
+  return parameters()->ConsoleHandle;
+}
 EXPORT BOOL WINAPI CreateProcessW(LPCWSTR application, LPWSTR command_line, LPSECURITY_ATTRIBUTES process_attributes, LPSECURITY_ATTRIBUTES thread_attributes,
                                   BOOL inherit_handles, DWORD flags, LPVOID environment, LPCWSTR directory, LPSTARTUPINFOW startup, LPPROCESS_INFORMATION information) {
   (void)process_attributes; (void)thread_attributes;
@@ -2172,13 +2194,26 @@ EXPORT BOOL WINAPI CreateProcessW(LPCWSTR application, LPWSTR command_line, LPSE
     std_out = startup->hStdOutput;
     std_err = startup->hStdError;
   }
+  /* the startup block of the kernel: size, STARTF_ flags, position, size, characters, fill, show, console flags, reserved; the console; the title and the desktop */
+  struct { ULONG words[12]; HANDLE console; PUNICODE_STRING title, desktop; } block;
+  UNICODE_STRING title_string, desktop_string;
+  memset(&block, 0, sizeof(block));
+  block.words[0] = sizeof(block);
+  if (startup) {
+    block.words[1] = startup->dwFlags; block.words[2] = startup->dwX; block.words[3] = startup->dwY; block.words[4] = startup->dwXSize; block.words[5] = startup->dwYSize;
+    block.words[6] = startup->dwXCountChars; block.words[7] = startup->dwYCountChars; block.words[8] = startup->dwFillAttribute; block.words[9] = startup->wShowWindow;
+    if (startup->lpTitle) { unicode_string(&title_string, startup->lpTitle); block.title = &title_string; }
+    if (startup->lpDesktop) { unicode_string(&desktop_string, startup->lpDesktop); block.desktop = &desktop_string; }
+  }
+  block.console = console_for_new_process(flags);
   const NTSTATUS status = NtCreateUserProcess(&process, &thread, &image_name, &command, cwd_pointer, environment ? environment : GetEnvironmentStringsW(), nt_flags, &process_id,
-                                              &thread_id, std_in, std_out, std_err);
+                                              &thread_id, std_in, std_out, std_err, &block);
   if (!NT_SUCCESS(status)) {
     if (status == (NTSTATUS)0xC000007B) set_error(ERROR_BAD_EXE_FORMAT);
     else fail_nt(status);
     return FALSE;
   }
+  con_note_child(process_id, block.console);
   if (information) {
     information->hProcess = process;
     information->hThread = thread;
@@ -2194,8 +2229,16 @@ EXPORT BOOL WINAPI CreateProcessW(LPCWSTR application, LPWSTR command_line, LPSE
 EXPORT BOOL WINAPI CreateProcessA(LPCSTR application, LPSTR command_line, LPSECURITY_ATTRIBUTES process_attributes, LPSECURITY_ATTRIBUTES thread_attributes,
                                   BOOL inherit_handles, DWORD flags, LPVOID environment, LPCSTR directory, LPSTARTUPINFOA startup, LPPROCESS_INFORMATION information) {
   WCHAR *wide_application = application ? to_wide(application) : NULL, *wide_command = command_line ? to_wide(command_line) : NULL, *wide_directory = directory ? to_wide(directory) : NULL;
-  WCHAR *wide_environment = NULL;
+  WCHAR *wide_environment = NULL, *wide_title = NULL, *wide_desktop = NULL;
+  STARTUPINFOW wide_startup;
   BOOL ok = FALSE;
+  if (startup) {      /* the startup information with wide strings */
+    memcpy(&wide_startup, startup, sizeof(wide_startup));
+    wide_title = startup->lpTitle ? to_wide(startup->lpTitle) : NULL;
+    wide_desktop = startup->lpDesktop ? to_wide(startup->lpDesktop) : NULL;
+    wide_startup.lpTitle = wide_title;
+    wide_startup.lpDesktop = wide_desktop;
+  }
   if ((application && !wide_application) || (command_line && !wide_command) || (directory && !wide_directory)) goto done;
   if (environment) {      /* "NAME=value\0...\0\0" in the ANSI code page: converted as a whole */
     const char *e = (const char *)environment;
@@ -2207,12 +2250,14 @@ EXPORT BOOL WINAPI CreateProcessA(LPCSTR application, LPSTR command_line, LPSECU
     if (!wide_environment) { set_error(ERROR_NOT_ENOUGH_MEMORY); goto done; }
     MultiByteToWideChar(CP_UTF8, 0, e, (int)n, wide_environment, units);
   }
-  ok = CreateProcessW(wide_application, wide_command, process_attributes, thread_attributes, inherit_handles, flags | CREATE_UNICODE_ENVIRONMENT, wide_environment, wide_directory, (LPSTARTUPINFOW)startup, information);
+  ok = CreateProcessW(wide_application, wide_command, process_attributes, thread_attributes, inherit_handles, flags | CREATE_UNICODE_ENVIRONMENT, wide_environment, wide_directory, startup ? &wide_startup : NULL, information);
 done:
   free_wide(wide_application);
   free_wide(wide_command);
   free_wide(wide_directory);
   free_wide(wide_environment);
+  free_wide(wide_title);
+  free_wide(wide_desktop);
   return ok;
 }
 EXPORT BOOL WINAPI GetThreadContext(HANDLE h, CONTEXT *context) { const NTSTATUS status = NtGetContextThread(h, context); return NT_SUCCESS(status) ? TRUE : fail_nt(status); }
@@ -2341,8 +2386,10 @@ EXPORT HANDLE WINAPI GetStdHandle(DWORD which) {
 EXPORT BOOL WINAPI SetStdHandle(DWORD which, HANDLE h) {
   const int i = which == STD_INPUT_HANDLE ? 0 : which == STD_OUTPUT_HANDLE ? 1 : which == STD_ERROR_HANDLE ? 2 : -1;
   if (i < 0) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  RTL_USER_PROCESS_PARAMETERS *p = parameters();      /* (the standard handles live in the process parameters, where the console functions look too) */
+  if (i == 0) p->StandardInput = h; else if (i == 1) p->StandardOutput = h; else p->StandardError = h;
   g_std_override[i] = h;
-  g_std_overridden[i] = TRUE;
+  g_std_overridden[i] = FALSE;
   return TRUE;
 }
 
