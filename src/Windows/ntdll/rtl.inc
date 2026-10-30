@@ -57,8 +57,8 @@ static WCHAR rtl_case_map(WCHAR c, const CaseRange *table, int count) {
   }
   return c;
 }
-static WCHAR rtl_upcase(WCHAR c) { return rtl_case_map(c, k_upcase_ranges, (int)(sizeof(k_upcase_ranges) / sizeof(k_upcase_ranges[0]))); }
-static WCHAR rtl_downcase(WCHAR c) { return rtl_case_map(c, k_downcase_ranges, (int)(sizeof(k_downcase_ranges) / sizeof(k_downcase_ranges[0]))); }
+static WCHAR rtl_upcase(WCHAR c) { if (c == 0xB5) return c; return rtl_case_map(c, k_upcase_ranges, (int)(sizeof(k_upcase_ranges) / sizeof(k_upcase_ranges[0]))); }
+static WCHAR rtl_downcase(WCHAR c) { if (c == 0x3F4) return c; return rtl_case_map(c, k_downcase_ranges, (int)(sizeof(k_downcase_ranges) / sizeof(k_downcase_ranges[0]))); }
 EXPORT WCHAR NTAPI RtlUpcaseUnicodeChar(WCHAR c) { return rtl_upcase(c); }
 EXPORT WCHAR NTAPI RtlDowncaseUnicodeChar(WCHAR c) { return rtl_downcase(c); }
 EXPORT CHAR NTAPI RtlUpperChar(CHAR c) { return c >= 'a' && c <= 'z' ? (CHAR)(c - 32) : c; }
@@ -300,7 +300,7 @@ EXPORT NTSTATUS NTAPI RtlHashUnicodeString(const UNICODE_STRING *s, BOOLEAN ci, 
   ULONG h = 0;
   for (unsigned i = 0; i < s->Length / 2; ++i) {
     const WCHAR c = ci ? rtl_upcase(s->Buffer[i]) : s->Buffer[i];
-    h = algorithm == 0 ? h * 65599u + c : (h << 5) + h + c;
+    h = h * 65599u + c;      /* (the default algorithm and X65599 are the same) */
   }
   *hash = h;
   return STATUS_SUCCESS;
@@ -388,10 +388,10 @@ EXPORT NTSTATUS NTAPI RtlIntegerToUnicodeString(ULONG value, ULONG base, PUNICOD
   if (!rtl_base_ok(base)) return STATUS_INVALID_PARAMETER_;
   char buf[40];
   const unsigned n = rtl_digits(value, base, buf, 33);
-  if (n * 2 > s->MaximumLength) return STATUS_BUFFER_OVERFLOW_;
+  if (n * 2 + 2 > s->MaximumLength) return STATUS_BUFFER_OVERFLOW_;      /* (the NUL needs room too) */
   for (unsigned i = 0; i < n; ++i) s->Buffer[i] = (WCHAR)buf[i];
   s->Length = (USHORT)(n * 2);
-  if (s->Length + 2u <= s->MaximumLength) s->Buffer[n] = 0;
+  s->Buffer[n] = 0;
   return STATUS_SUCCESS;
 }
 EXPORT NTSTATUS NTAPI RtlInt64ToUnicodeString(ULONGLONG value, ULONG base, PUNICODE_STRING s) {
@@ -399,7 +399,7 @@ EXPORT NTSTATUS NTAPI RtlInt64ToUnicodeString(ULONGLONG value, ULONG base, PUNIC
   if (!rtl_base_ok(base)) return STATUS_INVALID_PARAMETER_;
   char buf[72];
   const unsigned n = rtl_digits(value, base, buf, 65);
-  if (n * 2 > s->MaximumLength) return STATUS_BUFFER_OVERFLOW_;
+  if (n * 2 + 2 > s->MaximumLength) return STATUS_BUFFER_OVERFLOW_;
   for (unsigned i = 0; i < n; ++i) s->Buffer[i] = (WCHAR)buf[i];
   s->Length = (USHORT)(n * 2);
   s->Buffer[n] = 0;

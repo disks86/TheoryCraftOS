@@ -799,6 +799,40 @@ static void test_mask_cache(Rig& g) {
   CHECK(g.at(30, 30) == kWhite && g.at(0, 0) == kBlack && g.at(8, 8) == kBlack);
 }
 
+// IImage::write_rect: only the rectangle changes, the rows come `pitch` apart, and anything that does not fit is refused.
+static void test_write_rect() {
+  TestAllocator a;
+  SoftwareDevice device(a, nullptr);
+  IImage* image = device.create_image({{16, 12}, Format::B8G8R8A8Unorm, kImageSampled});
+  CHECK(image != nullptr);
+  uint32_t all[16 * 12], out[16 * 12];
+  for (uint32_t& p : all) p = 0xFF112233;
+  CHECK(image->write_pixels(ArrayView<const uint32_t>(all, 16 * 12)));
+  uint32_t part[3 * 10];   // (a 4 x 3 rectangle in rows of 10)
+  for (uint32_t j = 0; j < 3; ++j)
+    for (uint32_t i = 0; i < 10; ++i) part[j * 10 + i] = 0xFF000000u | (j * 16 + i);
+  CHECK(image->write_rect({5, 6, 4, 3}, ArrayView<const uint32_t>(part, 3 * 10), 10));
+  CHECK(image->read_pixels(ArrayView<uint32_t>(out, 16 * 12)));
+  uint32_t wrong = 0;
+  for (uint32_t y = 0; y < 12; ++y)
+    for (uint32_t x = 0; x < 16; ++x) {
+      const bool inside = x >= 5 && x < 9 && y >= 6 && y < 9;
+      const uint32_t expect = inside ? part[(y - 6) * 10 + (x - 5)] : 0xFF112233u;
+      wrong += out[y * 16 + x] != expect;
+    }
+  CHECK(wrong == 0);
+  // a rectangle that is not wholly inside, an empty one, a pitch narrower than the rectangle, too few pixels
+  CHECK(!image->write_rect({14, 0, 4, 2}, ArrayView<const uint32_t>(part, 30), 10));
+  CHECK(!image->write_rect({-1, 0, 2, 2}, ArrayView<const uint32_t>(part, 30), 10));
+  CHECK(!image->write_rect({0, 10, 2, 3}, ArrayView<const uint32_t>(part, 30), 10));
+  CHECK(!image->write_rect({0, 0, 0, 2}, ArrayView<const uint32_t>(part, 30), 10));
+  CHECK(!image->write_rect({0, 0, 4, 2}, ArrayView<const uint32_t>(part, 30), 3));
+  CHECK(!image->write_rect({0, 0, 4, 3}, ArrayView<const uint32_t>(part, 20), 10));
+  CHECK(image->write_rect({0, 0, 4, 3}, ArrayView<const uint32_t>(part, 24), 10));   // (the last row needs only its 4 pixels: 2 * 10 + 4)
+  device.destroy_image(image);
+  CHECK(a.live == 0);
+}
+
 // draw_glyph: the device renderer keeps glyphs on an atlas and tints them with the GPU; the picture is the CPU renderer's (to rounding), a glyph drawn again is not made again, and
 // glyphs mix in order with other shapes, in layers and under clips.
 static void test_glyphs() {
@@ -842,6 +876,18 @@ static void test_glyphs() {
   for (uint32_t y = 0; y < kH; ++y)
     for (uint32_t x = 0; x < kW; ++x) far += !chan_near(frame[y * kW + x], px(cs, x, y), 3);
   CHECK(far == 0);
+  // a new glyph on a busy atlas sends just its own rectangle, not the whole atlas
+  {
+    const uint64_t sent = d.atlas_pixels_sent();
+    d.draw_glyph(2001, mb, 0, 0, 0xFFFFFFFF);
+    CHECK(d.read_pixels(frame));
+    CHECK(d.atlas_pixels_sent() == sent + 7 * 9);
+    d.draw_glyph(2001, mb, 10, 0, 0xFFFFFFFF);   // (again: nothing more is sent)
+    d.draw_glyph(2002, ma, 20, 0, 0xFFFFFFFF);   // (two new ones: the rectangle that holds both, which is small too)
+    d.draw_glyph(2003, mb, 30, 0, 0xFFFFFFFF);
+    CHECK(d.read_pixels(frame));
+    CHECK(d.atlas_pixels_sent() > sent + 7 * 9 && d.atlas_pixels_sent() < sent + 7 * 9 + 1000);
+  }
   // inside a layer (an offscreen group): the glyph is laid over as part of the picture
   d.clear(0xFF000000);
   cpu.clear(0xFF000000);
@@ -1939,6 +1985,7 @@ int main() {
   test_fast_paths();
   test_primitives();
   test_renderers_agree();
+  test_write_rect();
   test_glyphs();
   if (g_failed) { printf("%d checks failed\n", g_failed); return 1; }
   printf("graphics: all checks passed\n");

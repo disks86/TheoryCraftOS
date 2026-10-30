@@ -92,6 +92,7 @@ ComputerManager::ComputerManager(allocators::IAllocator& allocator)
       wireless_menu_(allocator),
       device_menu_(allocator),
       monitor_menu_(allocator),
+      bluetooth_menu_(allocator),
       hardware_info_(allocator),
       cpu_meter_(allocator),
       memory_meter_(allocator),
@@ -214,6 +215,8 @@ ComputerManager::ComputerManager(allocators::IAllocator& allocator)
   device_properties_item_ = device_menu_.add_item("Properties...", {&ComputerManager::on_device_item, this});
   monitor_properties_item_ = monitor_menu_.add_item("Properties...", {&ComputerManager::on_device_item, this});
   monitor_settings_item_ = monitor_menu_.add_item("Display Settings...", {&ComputerManager::on_display_settings_item, this});
+  bluetooth_properties_item_ = bluetooth_menu_.add_item("Properties...", {&ComputerManager::on_device_item, this});
+  bluetooth_settings_item_ = bluetooth_menu_.add_item("Bluetooth Settings...", {&ComputerManager::on_bluetooth_item, this});
   hardware_page_.add(&hardware_info_);
   hardware_page_.add(&tree_);
 
@@ -296,6 +299,11 @@ void ComputerManager::on_wireless_item(void* self, Control&) {
   if (!t->selected_adapter(&t->properties_adapter_)) return;
   t->fire(t->open_wireless_properties_);
 }
+void ComputerManager::on_bluetooth_item(void* self, Control&) {
+  auto* t = static_cast<ComputerManager*>(self);
+  if (!t->selected_adapter(&t->properties_adapter_)) return;
+  t->fire(t->open_bluetooth_properties_);
+}
 void ComputerManager::on_copy_row(void* self, Control&) { static_cast<ComputerManager*>(self)->grid_.copy_selected_row(); }
 void ComputerManager::on_grid_menu_opening(void* self, Control&) {
   auto* t = static_cast<ComputerManager*>(self);
@@ -351,9 +359,10 @@ void ComputerManager::rebuild_hardware() {
       }
       const int32_t device = tree_.add_node(node, e.name, i, g == static_cast<uint32_t>(HardwareGroup::Storage) ? ItemIcon::Drive : ItemIcon::File);
       if (device < 0) continue;
-      // Every device has Properties. A network adapter's is its own window (and a Wi-Fi adapter has Wi-Fi Properties too); a display also leads to
-      // Display Settings; all the others share the generic one, whatever their driver.
+      // Every device has Properties. A network adapter's is its own window (and a Wi-Fi adapter has Wi-Fi Properties too); a Bluetooth adapter also has Bluetooth Settings; a display also leads
+      // to Display Settings; all the others share the generic one, whatever their driver.
       if (g == static_cast<uint32_t>(HardwareGroup::Network)) tree_.set_node_menu(device, e.wireless ? &wireless_menu_ : &adapter_menu_);
+      else if (g == static_cast<uint32_t>(HardwareGroup::Bluetooth) && e.bluetooth) tree_.set_node_menu(device, &bluetooth_menu_);
       else tree_.set_node_menu(device, g == static_cast<uint32_t>(HardwareGroup::Displays) ? &monitor_menu_ : &device_menu_);
     }
     if (node < 0) continue;

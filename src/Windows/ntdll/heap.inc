@@ -607,9 +607,19 @@ static void heaps_unlock(void) { __sync_lock_release(&g_heaps_lock); }
 static void heaps_add(Heap *h) { heaps_lock(); for (int i = 0; i < MAX_HEAPS; ++i) if (!g_heaps[i]) { g_heaps[i] = h; break; } heaps_unlock(); }
 static void heaps_remove(Heap *h) { heaps_lock(); for (int i = 0; i < MAX_HEAPS; ++i) if (g_heaps[i] == h) g_heaps[i] = NULL; heaps_unlock(); }
 
+NTSTATUS DbgPrint(const char *fmt, ...);
+static void soft_break(void);
 EXPORT PVOID NTAPI RtlDestroyHeap(PVOID heap) {
   Heap *h = heap;
-  if (!heap_ok(h) || h == NtCurrentPeb()->ProcessHeap) return heap;
+  if (!heap_ok(h)) {
+    /* a pointer that is not a heap: with the validation flag in the header it is reported to a debugger, which is told with a message and a breakpoint */
+    if (NtCurrentPeb()->BeingDebugged && heap && (*(ULONG *)((BYTE *)heap + 0x70) & 0x40000000u)) {
+      DbgPrint("Invalid heap %p\n", heap);
+      soft_break();
+    }
+    return heap;
+  }
+  if (h == NtCurrentPeb()->ProcessHeap) return heap;
   inner_lock(h);
   h->magic = 0;
   heaps_remove(h);

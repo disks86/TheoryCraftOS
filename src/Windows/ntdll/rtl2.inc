@@ -113,133 +113,616 @@ static ULONG *error_mode_of(void) {
 }
 EXPORT ULONG NTAPI RtlGetThreadErrorMode(void) { return *error_mode_of(); }
 EXPORT NTSTATUS NTAPI RtlSetThreadErrorMode(ULONG mode, PULONG old) {
-  if (mode & ~0x70u) return STATUS_INVALID_PARAMETER_;
+  if (mode & ~0x70u) return 0xC00000EFu;      /* STATUS_INVALID_PARAMETER_1 */
   ULONG *p = error_mode_of();
   if (old) *old = *p;
   *p = mode;
+  *(ULONG *)((BYTE *)NtCurrentTeb() + 0x16B0) = mode;      /* (TEB.HardErrorMode) */
   return STATUS_SUCCESS;
 }
 
-/* ---- IPv4 addresses as text ---------------------------------------------------------------------------------------------------------------------------- */
+/* ---- IP addresses as text (as Wine's ntdll does them) ---------------------------------------------------------------------------------------------------- */
 
-static char *ipv4_text(const BYTE *a, char *out) {
-  for (int i = 0; i < 4; ++i) {
-    char tmp[4];
-    const unsigned n = format_integer(a[i], 10, tmp);
-    for (unsigned k = 0; k < n; ++k) *out++ = tmp[k];
-    if (i < 3) *out++ = '.';
-  }
-  *out = 0;
-  return out;
-}
-EXPORT char *NTAPI RtlIpv4AddressToStringA(const BYTE *addr, char *s) { return ipv4_text(addr, s); }
-EXPORT WCHAR *NTAPI RtlIpv4AddressToStringW(const BYTE *addr, WCHAR *s) {
-  char t[16];
-  const char *end = ipv4_text(addr, t);
-  for (const char *p = t; p <= end; ++p) *s++ = (WCHAR)(BYTE)*p;
-  return s - 1;
-}
-EXPORT NTSTATUS NTAPI RtlIpv4AddressToStringExA(const BYTE *addr, USHORT port, char *s, PULONG len) {
-  if (!addr || !s || !len) return STATUS_INVALID_PARAMETER_;
-  char t[24];
-  char *end = ipv4_text(addr, t);
-  if (port) { *end++ = ':'; end += format_integer((USHORT)((port >> 8) | (port << 8)), 10, end); }
-  const ULONG need = (ULONG)(end - t) + 1;
-  if (*len < need) { *len = need; return STATUS_INVALID_PARAMETER_; }
-  memcpy(s, t, need);
-  *len = need;
-  return STATUS_SUCCESS;
-}
-EXPORT NTSTATUS NTAPI RtlIpv4AddressToStringExW(const BYTE *addr, USHORT port, WCHAR *s, PULONG len) {
-  char t[24];
-  ULONG n = sizeof(t);
-  NTSTATUS st = RtlIpv4AddressToStringExA(addr, port, t, &n);
-  if (st) return st;
-  if (*len < n) { *len = n; return STATUS_INVALID_PARAMETER_; }
-  for (ULONG i = 0; i < n; ++i) s[i] = (WCHAR)(BYTE)t[i];
-  *len = n;
-  return STATUS_SUCCESS;
-}
-/* One address: up to four numbers separated by dots (decimal, 0x hex, 0 octal when not strict); the last number fills the remaining bytes. */
-static NTSTATUS ipv4_parse(const WCHAR *s, int wide, int strict, const void **end, BYTE *addr, USHORT *port, int allow_port) {
-  ULONGLONG parts[4];
-  int n = 0;
-  const void *p = s;
-#define CH(q) (wide ? ((const WCHAR *)(q))[0] : (WCHAR)((const BYTE *)(q))[0])
-#define ADV(q, k) ((q) = (wide ? (const void *)((const WCHAR *)(q) + (k)) : (const void *)((const BYTE *)(q) + (k))))
-  for (;;) {
-    int base = 10, digits = 0;
-    ULONGLONG v = 0;
-    if (CH(p) == '0' && !strict) {
-      const void *q = p;
-      ADV(q, 1);
-      if (CH(q) == 'x' || CH(q) == 'X') { base = 16; ADV(q, 1); p = q; }
-      else { base = 8; }
+typedef struct { union { struct { BYTE s_b1, s_b2, s_b3, s_b4; } S_un_b; struct { USHORT s_w1, s_w2; } S_un_w; ULONG S_addr; } S_un; } IN_ADDR;
+typedef struct { union { BYTE Byte[16]; USHORT Word[8]; } u; } IN6_ADDR;
+#define s6_words u.Word
+#define s6_bytes u.Byte
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#define min(a, b) ((a) < (b) ? (a) : (b))
+USHORT NTAPI RtlUshortByteSwap(USHORT v);
+#undef htons
+#undef ntohs
+
+#define htons(x) RtlUshortByteSwap(x)
+#define ntohs(x) RtlUshortByteSwap(x)
+
+static const signed char hex_table[] =
+{
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, /* 0x00-0x0F */
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, /* 0x10-0x1F */
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, /* 0x20-0x2F */
+     0,  1,  2,  3,  4,  5,  6,  7,  8,  9, -1, -1, -1, -1, -1, -1, /* 0x30-0x3F */
+    -1, 10, 11, 12, 13, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, /* 0x40-0x4F */
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, /* 0x50-0x5F */
+    -1, 10, 11, 12, 13, 14, 15                                      /* 0x60-0x66 */
+};
+
+static BOOL parse_ipv4_component(const WCHAR **str, BOOL strict, ULONG *value)
+{
+    int base = 10, d;
+    WCHAR c;
+    ULONG cur_value, prev_value = 0;
+    BOOL success = FALSE;
+
+    if (**str == '.')
+    {
+        *str += 1;
+        return FALSE;
     }
-    for (;;) {
-      const WCHAR c = CH(p);
-      const int d = c < 128 ? rtl_digit(c, (ULONG)base) : -1;
-      if (d < 0) break;
-      if (strict && base == 10 && digits == 1 && v == 0) return STATUS_INVALID_PARAMETER_;      /* a leading zero */
-      v = v * (ULONGLONG)base + (ULONGLONG)d;
-      if (v > 0xFFFFFFFFull) return STATUS_INVALID_PARAMETER_;
-      ++digits;
-      ADV(p, 1);
+
+    if ((*str)[0] == '0')
+    {
+        if ((*str)[1] == 'x' || (*str)[1] == 'X')
+        {
+            *str += 2;
+            if (strict) return FALSE;
+            base = 16;
+        }
+        else if ((*str)[1] >= '0' && (*str)[1] <= '9')
+        {
+            *str += 1;
+            if (strict) return FALSE;
+            base = 8;
+        }
     }
-    if (!digits && !(base == 8)) return STATUS_INVALID_PARAMETER_;
-    if (strict && v > 255) return STATUS_INVALID_PARAMETER_;
-    parts[n++] = v;
-    if (CH(p) == '.' && n < 4) { ADV(p, 1); continue; }
-    break;
-  }
-  if (strict && n != 4) return STATUS_INVALID_PARAMETER_;
-  for (int i = 0; i + 1 < n; ++i) if (parts[i] > 255) return STATUS_INVALID_PARAMETER_;
-  if (parts[n - 1] >= (1ull << (8 * (5 - n))) && n < 4 + 1 && n != 4) return STATUS_INVALID_PARAMETER_;
-  if (n == 4 && parts[3] > 255) return STATUS_INVALID_PARAMETER_;
-  for (int i = 0; i + 1 < n; ++i) addr[i] = (BYTE)parts[i];
-  ULONGLONG last = parts[n - 1];
-  for (int i = 3; i >= n - 1; --i) { addr[i] = (BYTE)last; last >>= 8; }
-  if (allow_port && CH(p) == ':') {
-    ADV(p, 1);
-    ULONG v = 0;
-    int digits = 0;
-    while (CH(p) >= '0' && CH(p) <= '9') { v = v * 10 + (ULONG)(CH(p) - '0'); if (v > 65535) return STATUS_INVALID_PARAMETER_; ++digits; ADV(p, 1); }
-    if (!digits) return STATUS_INVALID_PARAMETER_;
-    *port = (USHORT)((v >> 8) | (v << 8));
-  } else if (port) {
-    *port = 0;
-  }
-  *end = p;
-  return STATUS_SUCCESS;
-#undef CH
-#undef ADV
+
+    for (cur_value = 0; **str; *str += 1)
+    {
+        c = **str;
+        if (c >= ARRAY_SIZE(hex_table)) break;
+        d = hex_table[c];
+        if (d == -1 || d >= base) break;
+        cur_value = cur_value * base + d;
+        success = TRUE;
+        if (cur_value < prev_value) return FALSE; /* overflow */
+        prev_value = cur_value;
+    }
+
+    if (success) *value = cur_value;
+    return success;
 }
-EXPORT NTSTATUS NTAPI RtlIpv4StringToAddressA(const char *s, BOOLEAN strict, const char **term, BYTE *addr) {
-  const void *end = s;
-  NTSTATUS st = ipv4_parse((const WCHAR *)s, 0, strict, &end, addr, NULL, 0);
-  if (term) *term = st ? s : (const char *)end;
-  return st;
+
+static NTSTATUS ipv4_string_to_address(const WCHAR *str, BOOL strict,
+                                       const WCHAR **terminator, IN_ADDR *address, USHORT *port)
+{
+    ULONG fields[4];
+    int n = 0;
+
+    for (;;)
+    {
+        if (!parse_ipv4_component(&str, strict, &fields[n]))
+            goto error;
+        n++;
+        if (*str != '.')
+            break;
+        if (n == 4)
+            goto error;
+        str++;
+    }
+
+    if (strict && n < 4)
+        goto error;
+
+    switch (n)
+    {
+        case 4:
+            if (fields[0] > 0xFF || fields[1] > 0xFF || fields[2] > 0xFF || fields[3] > 0xFF)
+                goto error;
+            address->S_un.S_un_b.s_b1 = fields[0];
+            address->S_un.S_un_b.s_b2 = fields[1];
+            address->S_un.S_un_b.s_b3 = fields[2];
+            address->S_un.S_un_b.s_b4 = fields[3];
+            break;
+        case 3:
+            if (fields[0] > 0xFF || fields[1] > 0xFF || fields[2] > 0xFFFF)
+                goto error;
+            address->S_un.S_un_b.s_b1 = fields[0];
+            address->S_un.S_un_b.s_b2 = fields[1];
+            address->S_un.S_un_b.s_b3 = (fields[2] & 0xFF00) >> 8;
+            address->S_un.S_un_b.s_b4 = (fields[2] & 0x00FF);
+            break;
+        case 2:
+            if (fields[0] > 0xFF || fields[1] > 0xFFFFFF)
+                goto error;
+            address->S_un.S_un_b.s_b1 = fields[0];
+            address->S_un.S_un_b.s_b2 = (fields[1] & 0xFF0000) >> 16;
+            address->S_un.S_un_b.s_b3 = (fields[1] & 0x00FF00) >> 8;
+            address->S_un.S_un_b.s_b4 = (fields[1] & 0x0000FF);
+            break;
+        case 1:
+            address->S_un.S_un_b.s_b1 = (fields[0] & 0xFF000000) >> 24;
+            address->S_un.S_un_b.s_b2 = (fields[0] & 0x00FF0000) >> 16;
+            address->S_un.S_un_b.s_b3 = (fields[0] & 0x0000FF00) >> 8;
+            address->S_un.S_un_b.s_b4 = (fields[0] & 0x000000FF);
+            break;
+        default:
+            goto error;
+    }
+
+    if (terminator) *terminator = str;
+
+    if (*str == ':')
+    {
+        str++;
+        if (!parse_ipv4_component(&str, FALSE, &fields[0]))
+            goto error;
+        if (!fields[0] || fields[0] > 0xFFFF || *str)
+            goto error;
+        if (port)
+        {
+            *port = htons(fields[0]);
+            if (terminator) *terminator = str;
+        }
+    }
+
+    if (!terminator && *str)
+        return STATUS_INVALID_PARAMETER;
+    return STATUS_SUCCESS;
+
+error:
+    if (terminator) *terminator = str;
+    return STATUS_INVALID_PARAMETER;
 }
-EXPORT NTSTATUS NTAPI RtlIpv4StringToAddressW(const WCHAR *s, BOOLEAN strict, const WCHAR **term, BYTE *addr) {
-  const void *end = s;
-  NTSTATUS st = ipv4_parse(s, 1, strict, &end, addr, NULL, 0);
-  if (term) *term = st ? s : (const WCHAR *)end;
-  return st;
+
+/***********************************************************************
+ * RtlIpv4StringToAddressExW [NTDLL.@]
+ */
+EXPORT NTSTATUS NTAPI RtlIpv4StringToAddressExW(const WCHAR *str, BOOLEAN strict, IN_ADDR *address, USHORT *port)
+{
+    if (!str || !address || !port) return STATUS_INVALID_PARAMETER;
+    return ipv4_string_to_address(str, strict, NULL, address, port);
 }
-EXPORT NTSTATUS NTAPI RtlIpv4StringToAddressExA(const char *s, BOOLEAN strict, BYTE *addr, USHORT *port) {
-  if (!s || !addr || !port) return STATUS_INVALID_PARAMETER_;
-  const void *end = s;
-  NTSTATUS st = ipv4_parse((const WCHAR *)s, 0, strict, &end, addr, port, 1);
-  if (st == STATUS_SUCCESS && *(const char *)end) return STATUS_INVALID_PARAMETER_;
-  return st;
+
+/***********************************************************************
+ * RtlIpv4StringToAddressW [NTDLL.@]
+ */
+EXPORT NTSTATUS NTAPI RtlIpv4StringToAddressW(const WCHAR *str, BOOLEAN strict, const WCHAR **terminator, IN_ADDR *address)
+{
+    return ipv4_string_to_address(str, strict, terminator, address, NULL);
 }
-EXPORT NTSTATUS NTAPI RtlIpv4StringToAddressExW(const WCHAR *s, BOOLEAN strict, BYTE *addr, USHORT *port) {
-  if (!s || !addr || !port) return STATUS_INVALID_PARAMETER_;
-  const void *end = s;
-  NTSTATUS st = ipv4_parse(s, 1, strict, &end, addr, port, 1);
-  if (st == STATUS_SUCCESS && *(const WCHAR *)end) return STATUS_INVALID_PARAMETER_;
-  return st;
+
+/***********************************************************************
+ * RtlIpv4StringToAddressExA [NTDLL.@]
+ */
+EXPORT NTSTATUS NTAPI RtlIpv4StringToAddressExA(const char *str, BOOLEAN strict, IN_ADDR *address, USHORT *port)
+{
+    WCHAR wstr[32];
+
+    if (!str) return STATUS_INVALID_PARAMETER;
+    RtlMultiByteToUnicodeN(wstr, sizeof(wstr), NULL, str, strlen(str) + 1);
+    wstr[ARRAY_SIZE(wstr) - 1] = 0;
+    return RtlIpv4StringToAddressExW(wstr, strict, address, port);
 }
+
+/***********************************************************************
+ * RtlIpv4StringToAddressA [NTDLL.@]
+ */
+EXPORT NTSTATUS NTAPI RtlIpv4StringToAddressA(const char *str, BOOLEAN strict, const char **terminator, IN_ADDR *address)
+{
+    WCHAR wstr[32];
+    const WCHAR *wterminator;
+    NTSTATUS ret;
+
+    RtlMultiByteToUnicodeN(wstr, sizeof(wstr), NULL, str, strlen(str) + 1);
+    wstr[ARRAY_SIZE(wstr) - 1] = 0;
+    ret = RtlIpv4StringToAddressW(wstr, strict, &wterminator, address);
+    if (terminator) *terminator = str + (wterminator - wstr);
+    return ret;
+}
+
+static BOOL parse_ipv6_component(const WCHAR **str, int base, ULONG *value)
+{
+    WCHAR *terminator;
+    if (**str >= ARRAY_SIZE(hex_table) || hex_table[**str] == -1) return FALSE;
+    *value = min(wcstoul(*str, &terminator, base), 0x7FFFFFFF);
+    if (*terminator == '0') terminator++; /* "0x" but nothing valid after */
+    else if (terminator == *str) return FALSE;
+    *str = terminator;
+    return TRUE;
+}
+
+static NTSTATUS ipv6_string_to_address(const WCHAR *str, BOOL ex,
+                                       const WCHAR **terminator, IN6_ADDR *address, ULONG *scope, USHORT *port)
+{
+    BOOL expecting_port = FALSE, has_0x = FALSE, too_big = FALSE;
+    int n_bytes = 0, n_ipv4_bytes = 0, gap = -1;
+    ULONG ip_component, scope_component = 0, port_component = 0;
+    const WCHAR *prev_str;
+
+    if (str[0] == '[')
+    {
+        if (!ex) goto error;
+        expecting_port = TRUE;
+        str++;
+    }
+
+    if (str[0] == ':')
+    {
+        if (str[1] != ':') goto error;
+        str++;
+        address->u.Word[0] = 0;
+    }
+
+    for (;;)
+    {
+        if (!n_ipv4_bytes && *str == ':')
+        {
+            /* double colon */
+            if (gap != -1) goto error;
+            str++;
+            prev_str = str;
+            gap = n_bytes;
+            if (n_bytes == 14 || !parse_ipv6_component(&str, 16, &ip_component)) break;
+            str = prev_str;
+        }
+        else
+        {
+            prev_str = str;
+        }
+
+        if (!n_ipv4_bytes && n_bytes <= (gap != -1 ? 10 : 12))
+        {
+            if (parse_ipv6_component(&str, 10, &ip_component) && *str == '.')
+                n_ipv4_bytes = 1;
+            str = prev_str;
+        }
+
+        if (n_ipv4_bytes)
+        {
+            /* IPv4 component */
+            if (!parse_ipv6_component(&str, 10, &ip_component)) goto error;
+            if (str - prev_str > 3 || ip_component > 255)
+            {
+                too_big = TRUE;
+            }
+            else
+            {
+                if (*str != '.' && (n_ipv4_bytes < 4 || (n_bytes < 15 && gap == -1))) goto error;
+                address->u.Byte[n_bytes] = ip_component;
+                n_bytes++;
+            }
+            if (n_ipv4_bytes == 4 || *str != '.') break;
+            n_ipv4_bytes++;
+        }
+        else
+        {
+            /* IPv6 component */
+            if (!parse_ipv6_component(&str, 16, &ip_component)) goto error;
+            if (prev_str[0] == '0' && (prev_str[1] == 'x' || prev_str[1] == 'X'))
+            {
+                /* Windows "feature": the last IPv6 component can start with "0x" and be longer than 4 digits */
+                if (terminator) *terminator = prev_str + 1; /* Windows says that the "x" is the terminator */
+                if (n_bytes < 14 && gap == -1) return STATUS_INVALID_PARAMETER;
+                address->u.Word[n_bytes/2] = htons(ip_component);
+                n_bytes += 2;
+                has_0x = TRUE;
+                goto fill_gap;
+            }
+            if (*str != ':' && n_bytes < 14 && gap == -1) goto error;
+            if (str - prev_str > 4)
+                too_big = TRUE;
+            else
+                address->u.Word[n_bytes/2] = htons(ip_component);
+            n_bytes += 2;
+            if (*str != ':' || (gap != -1 && str[1] == ':')) break;
+        }
+        if (n_bytes == (gap != -1 ? 14 : 16)) break;
+        if (too_big) return STATUS_INVALID_PARAMETER;
+        str++;
+    }
+
+    if (terminator) *terminator = str;
+    if (too_big) return STATUS_INVALID_PARAMETER;
+
+fill_gap:
+    if (gap == -1)
+    {
+        if (n_bytes < 16) goto error;
+    }
+    else
+    {
+        memmove(address->u.Byte + 16 - (n_bytes - gap), address->u.Byte + gap, n_bytes - gap);
+        memset(address->u.Byte + gap, 0, 16 - n_bytes);
+    }
+
+    if (ex)
+    {
+        if (has_0x) goto error;
+
+        if (*str == '%')
+        {
+            str++;
+            if (!parse_ipv4_component(&str, TRUE, &scope_component)) goto error;
+        }
+
+        if (expecting_port)
+        {
+            if (*str != ']') goto error;
+            str++;
+            if (*str == ':')
+            {
+                str++;
+                if (!parse_ipv4_component(&str, FALSE, &port_component)) goto error;
+                if (!port_component || port_component > 0xFFFF || *str) goto error;
+                port_component = htons(port_component);
+            }
+        }
+    }
+
+    if (!terminator && *str) return STATUS_INVALID_PARAMETER;
+
+    if (scope) *scope = scope_component;
+    if (port) *port = port_component;
+
+    return STATUS_SUCCESS;
+
+error:
+    if (terminator) *terminator = str;
+    return STATUS_INVALID_PARAMETER;
+}
+
+/***********************************************************************
+ * RtlIpv6StringToAddressExW [NTDLL.@]
+ */
+EXPORT NTSTATUS NTAPI RtlIpv6StringToAddressExW(const WCHAR *str, IN6_ADDR *address, ULONG *scope, USHORT *port)
+{
+    if (!str || !address || !scope || !port) return STATUS_INVALID_PARAMETER;
+    return ipv6_string_to_address(str, TRUE, NULL, address, scope, port);
+}
+
+/***********************************************************************
+ * RtlIpv6StringToAddressW [NTDLL.@]
+ */
+EXPORT NTSTATUS NTAPI RtlIpv6StringToAddressW(const WCHAR *str, const WCHAR **terminator, IN6_ADDR *address)
+{
+    return ipv6_string_to_address(str, FALSE, terminator, address, NULL, NULL);
+}
+
+/***********************************************************************
+ * RtlIpv6StringToAddressExA [NTDLL.@]
+ */
+EXPORT NTSTATUS NTAPI RtlIpv6StringToAddressExA(const char *str, IN6_ADDR *address, ULONG *scope, USHORT *port)
+{
+    WCHAR wstr[128];
+
+    if (!str) return STATUS_INVALID_PARAMETER;
+    RtlMultiByteToUnicodeN(wstr, sizeof(wstr), NULL, str, strlen(str) + 1);
+    wstr[ARRAY_SIZE(wstr) - 1] = 0;
+    return RtlIpv6StringToAddressExW(wstr, address, scope, port);
+}
+
+/***********************************************************************
+ * RtlIpv6StringToAddressA [NTDLL.@]
+ */
+EXPORT NTSTATUS NTAPI RtlIpv6StringToAddressA(const char *str, const char **terminator, IN6_ADDR *address)
+{
+    WCHAR wstr[128];
+    const WCHAR *wterminator = NULL;
+    NTSTATUS ret;
+
+    RtlMultiByteToUnicodeN(wstr, sizeof(wstr), NULL, str, strlen(str) + 1);
+    wstr[ARRAY_SIZE(wstr) - 1] = 0;
+    ret = RtlIpv6StringToAddressW(wstr, &wterminator, address);
+    if (terminator && wterminator) *terminator = str + (wterminator - wstr);
+    return ret;
+}
+
+/***********************************************************************
+ * RtlIpv4AddressToStringExW [NTDLL.@]
+ */
+EXPORT NTSTATUS NTAPI RtlIpv4AddressToStringExW(const IN_ADDR *pin, USHORT port, LPWSTR buffer, PULONG psize)
+{
+    WCHAR tmp_ip[32];
+    ULONG needed;
+
+    if (!pin || !buffer || !psize)
+        return STATUS_INVALID_PARAMETER;
+
+    needed = swprintf(tmp_ip, ARRAY_SIZE(tmp_ip), L"%u.%u.%u.%u",
+                      pin->S_un.S_un_b.s_b1, pin->S_un.S_un_b.s_b2,
+                      pin->S_un.S_un_b.s_b3, pin->S_un.S_un_b.s_b4);
+
+    if (port) needed += swprintf(tmp_ip + needed, ARRAY_SIZE(tmp_ip) - needed, L":%u", ntohs(port));
+
+    if (*psize > needed) {
+        *psize = needed + 1;
+        wcscpy(buffer, tmp_ip);
+        return STATUS_SUCCESS;
+    }
+
+    *psize = needed + 1;
+    return STATUS_INVALID_PARAMETER;
+}
+
+/***********************************************************************
+ * RtlIpv4AddressToStringExA [NTDLL.@]
+ */
+EXPORT NTSTATUS NTAPI RtlIpv4AddressToStringExA(const IN_ADDR *pin, USHORT port, LPSTR buffer, PULONG psize)
+{
+    CHAR tmp_ip[32];
+    ULONG needed;
+
+    if (!pin || !buffer || !psize)
+        return STATUS_INVALID_PARAMETER;
+
+    needed = sprintf(tmp_ip, "%u.%u.%u.%u",
+                     pin->S_un.S_un_b.s_b1, pin->S_un.S_un_b.s_b2,
+                     pin->S_un.S_un_b.s_b3, pin->S_un.S_un_b.s_b4);
+
+    if (port) needed += sprintf(tmp_ip + needed, ":%u", ntohs(port));
+
+    if (*psize > needed) {
+        *psize = needed + 1;
+        strcpy(buffer, tmp_ip);
+        return STATUS_SUCCESS;
+    }
+
+    *psize = needed + 1;
+    return STATUS_INVALID_PARAMETER;
+}
+
+/***********************************************************************
+ * RtlIpv4AddressToStringW [NTDLL.@]
+ */
+EXPORT WCHAR * NTAPI RtlIpv4AddressToStringW(const IN_ADDR *pin, LPWSTR buffer)
+{
+    ULONG size = 16;
+
+    if (RtlIpv4AddressToStringExW(pin, 0, buffer, &size)) size = 0;
+    return buffer + size - 1;
+}
+
+/***********************************************************************
+ * RtlIpv4AddressToStringA [NTDLL.@]
+ */
+EXPORT CHAR * NTAPI RtlIpv4AddressToStringA(const IN_ADDR *pin, LPSTR buffer)
+{
+    ULONG size = 16;
+
+    if (RtlIpv4AddressToStringExA(pin, 0, buffer, &size)) size = 0;
+    return buffer + size - 1;
+}
+
+static BOOL is_ipv4_in_ipv6(const IN6_ADDR *address)
+{
+    if (address->s6_words[5] == htons(0x5efe) && (address->s6_words[4] & ~htons(0x200)) == 0)
+        return TRUE;
+    if (*(UINT64 *)address != 0)
+        return FALSE;
+    if (address->s6_words[4] != 0 && address->s6_words[4] != 0xffff)
+        return FALSE;
+    if (address->s6_words[4] == 0 && address->s6_words[5] != 0 && address->s6_words[5] != 0xffff)
+        return FALSE;
+    if (address->s6_words[4] == 0xffff && address->s6_words[5] != 0)
+        return FALSE;
+    if (address->s6_words[6] == 0)
+        return FALSE;
+    return TRUE;
+}
+
+/***********************************************************************
+ * RtlIpv6AddressToStringExA [NTDLL.@]
+ */
+EXPORT NTSTATUS NTAPI RtlIpv6AddressToStringExA(const IN6_ADDR *address, ULONG scope, USHORT port,
+                                          char *str, ULONG *size)
+{
+    char buffer[64], *p = buffer;
+    int i, len, gap = -1, gap_len = 1, ipv6_end = 8;
+    ULONG needed;
+    NTSTATUS ret;
+
+    if (!address || !str || !size)
+        return STATUS_INVALID_PARAMETER;
+
+    if (is_ipv4_in_ipv6(address))
+        ipv6_end = 6;
+
+    for (i = 0; i < ipv6_end; i++)
+    {
+        len = 0;
+        while (i < ipv6_end && !address->s6_words[i])
+        {
+            i++;
+            len++;
+        }
+        if (len > gap_len)
+        {
+            gap = i - len;
+            gap_len = len;
+        }
+    }
+
+    if (port) p += sprintf(p, "[");
+
+    i = 0;
+    while (i < ipv6_end)
+    {
+        if (i == gap)
+        {
+            p += sprintf(p, ":");
+            i += gap_len;
+            if (i == ipv6_end) p += sprintf(p, ":");
+            continue;
+        }
+        if (i > 0) p += sprintf(p, ":");
+        p += sprintf(p, "%x", ntohs(address->s6_words[i]));
+        i++;
+    }
+
+    if (ipv6_end == 6)
+    {
+        if (p[-1] != ':') p += sprintf(p, ":");
+        p = RtlIpv4AddressToStringA((IN_ADDR *)(address->s6_words + 6), p);
+    }
+
+    if (scope) p += sprintf(p, "%%%lu", scope);
+
+    if (port) p += sprintf(p, "]:%u", ntohs(port));
+
+    needed = p - buffer + 1;
+
+    if (*size >= needed)
+    {
+        strcpy(str, buffer);
+        ret = STATUS_SUCCESS;
+    }
+    else
+    {
+        ret = STATUS_INVALID_PARAMETER;
+    }
+
+    *size = needed;
+    return ret;
+}
+
+/***********************************************************************
+ * RtlIpv6AddressToStringA [NTDLL.@]
+ */
+EXPORT char * NTAPI RtlIpv6AddressToStringA(const IN6_ADDR *address, char *str)
+{
+    ULONG size = 46;
+    if (!address || !str) return str - 1;
+    str[45] = 0; /* this byte is set even though the string is always shorter */
+    RtlIpv6AddressToStringExA(address, 0, 0, str, &size);
+    return str + size - 1;
+}
+
+/***********************************************************************
+ * RtlIpv6AddressToStringExW [NTDLL.@]
+ */
+EXPORT NTSTATUS NTAPI RtlIpv6AddressToStringExW(const IN6_ADDR *address, ULONG scope, USHORT port,
+                                          WCHAR *str, ULONG *size)
+{
+    char cstr[64];
+    NTSTATUS ret = RtlIpv6AddressToStringExA(address, scope, port, cstr, size);
+    if (ret == STATUS_SUCCESS) RtlMultiByteToUnicodeN(str, *size * sizeof(WCHAR), NULL, cstr, *size);
+    return ret;
+}
+
+/***********************************************************************
+ * RtlIpv6AddressToStringW [NTDLL.@]
+ */
+EXPORT WCHAR * NTAPI RtlIpv6AddressToStringW(const IN6_ADDR *address, WCHAR *str)
+{
+    ULONG size = 46;
+    if (!address || !str) return str;
+    str[45] = 0; /* this word is set even though the string is always shorter */
+    if (RtlIpv6AddressToStringExW(address, 0, 0, str, &size) != STATUS_SUCCESS)
+        return str;
+    return str + size - 1;
+}
+
+
 
 /* ---- the environment block ------------------------------------------------------------------------------------------------------------------------------- */
 
@@ -279,14 +762,17 @@ EXPORT NTSTATUS NTAPI RtlQueryEnvironmentVariable(PWSTR env, PWSTR name, SIZE_T 
   const WCHAR *v = env_find(env ? env : process_environment(), name, name_len, &len);
   if (!v) return STATUS_VARIABLE_NOT_FOUND_;
   *needed = len;
-  if (len > value_len) return STATUS_BUFFER_TOO_SMALL_;
+  if (len > value_len) { *needed = len + 1; return STATUS_BUFFER_TOO_SMALL_; }
   memcpy(value, v, len * 2);
   if (len < value_len) value[len] = 0;
   return STATUS_SUCCESS;
 }
+/* What is written when the buffer is too small follows Windows: plain text goes in while there is room for it and one more character (and no end mark follows if it is cut); a
+ * variable goes in whole with its end mark or not at all, and when it does not fit the end mark is written where it would have begun; nothing is written after that. */
 EXPORT NTSTATUS NTAPI RtlExpandEnvironmentStrings(PWSTR env, PWSTR src, SIZE_T src_len, PWSTR dst, SIZE_T dst_len, SIZE_T *out_len) {
   if (!env) env = (PWSTR)process_environment();
-  SIZE_T needed = 0;
+  SIZE_T needed = 0, written = 0;
+  int stopped = 0;
   SIZE_T i = 0;
   while (i < src_len) {
     SIZE_T j = i + 1;
@@ -296,18 +782,21 @@ EXPORT NTSTATUS NTAPI RtlExpandEnvironmentStrings(PWSTR env, PWSTR src, SIZE_T s
         SIZE_T vlen;
         const WCHAR *v = env_find(env, src + i + 1, j - i - 1, &vlen);
         if (v) {
-          if (needed + vlen <= dst_len && dst) memcpy(dst + needed, v, vlen * 2);
+          if (!stopped && dst) {
+            if (written + vlen < dst_len) { memcpy(dst + written, v, vlen * 2); written += vlen; dst[written] = 0; }
+            else { if (written < dst_len) dst[written] = 0; stopped = 1; }
+          }
           needed += vlen;
           i = j + 1;
           continue;
         }
       }
     }
-    if (needed < dst_len && dst) dst[needed] = src[i];
+    if (!stopped && dst) { if (written + 1 < dst_len) dst[written++] = src[i]; else stopped = 1; }
     ++needed;
     ++i;
   }
-  if (needed < dst_len && dst) dst[needed] = 0;
+  if (!stopped && dst && written < dst_len) dst[written] = 0;
   ++needed;      /* the terminator */
   if (out_len) *out_len = needed;
   return needed > dst_len ? STATUS_BUFFER_TOO_SMALL_ : STATUS_SUCCESS;
@@ -504,92 +993,6 @@ EXPORT ULONG NTAPI RtlIsDosDeviceName_U(PCWSTR name) {
   return ((ULONG)((start - name) * 2) << 16) | (trimmed * 2);
 }
 
-/* ---- generic tables (kept as lists in key order) ------------------------------------------------------------------------------------------------------------- */
-
-typedef struct _RTL_GENERIC_TABLE_ RTL_GENERIC_TABLE_;
-typedef struct GTNode { struct GTNode *prev, *next; BYTE pad[16]; } GTNode;      /* in front of the caller's data */
-struct _RTL_GENERIC_TABLE_ {
-  PVOID TableRoot;      /* the first node */
-  PVOID unused[2];
-  PVOID OrderedPointer;
-  ULONG WhichOrderedElement, NumberGenericTableElements;
-  ULONG (NTAPI *CompareRoutine)(RTL_GENERIC_TABLE_ *, PVOID, PVOID);
-  PVOID (NTAPI *AllocateRoutine)(RTL_GENERIC_TABLE_ *, ULONG);
-  void (NTAPI *FreeRoutine)(RTL_GENERIC_TABLE_ *, PVOID);
-  PVOID TableContext;
-};
-#define GT_DATA(n) ((PVOID)((BYTE *)(n) + sizeof(GTNode)))
-#define GT_NODE(d) ((GTNode *)((BYTE *)(d) - sizeof(GTNode)))
-EXPORT void NTAPI RtlInitializeGenericTable(RTL_GENERIC_TABLE_ *t, ULONG (NTAPI *cmp)(RTL_GENERIC_TABLE_ *, PVOID, PVOID), PVOID (NTAPI *alloc)(RTL_GENERIC_TABLE_ *, ULONG),
-                                            void (NTAPI *free_)(RTL_GENERIC_TABLE_ *, PVOID), PVOID context) {
-  memset(t, 0, sizeof(*t));
-  t->CompareRoutine = cmp;
-  t->AllocateRoutine = alloc;
-  t->FreeRoutine = free_;
-  t->TableContext = context;
-}
-EXPORT BOOLEAN NTAPI RtlIsGenericTableEmpty(RTL_GENERIC_TABLE_ *t) { return t->NumberGenericTableElements == 0; }
-EXPORT ULONG NTAPI RtlNumberGenericTableElements(RTL_GENERIC_TABLE_ *t) { return t->NumberGenericTableElements; }
-/* The node equal to the key (or NULL), and the node after which the key would go (NULL = at the front). */
-static GTNode *gt_find(RTL_GENERIC_TABLE_ *t, PVOID key, GTNode **before) {
-  GTNode *prev = NULL;
-  for (GTNode *n = t->TableRoot; n; n = n->next) {
-    const ULONG c = t->CompareRoutine(t, key, GT_DATA(n));      /* 0 less, 1 greater, 2 equal */
-    if (c == 2) { if (before) *before = prev; return n; }
-    if (c == 0) break;
-    prev = n;
-  }
-  if (before) *before = prev;
-  return NULL;
-}
-EXPORT PVOID NTAPI RtlInsertElementGenericTable(RTL_GENERIC_TABLE_ *t, PVOID buffer, ULONG size, BOOLEAN *is_new) {
-  GTNode *before;
-  GTNode *found = gt_find(t, buffer, &before);
-  if (found) { if (is_new) *is_new = FALSE; return GT_DATA(found); }
-  GTNode *n = t->AllocateRoutine(t, size + (ULONG)sizeof(GTNode));
-  if (!n) { if (is_new) *is_new = FALSE; return NULL; }
-  memset(n, 0, sizeof(GTNode));
-  memcpy(GT_DATA(n), buffer, size);
-  if (before) { n->prev = before; n->next = before->next; if (before->next) before->next->prev = n; before->next = n; }
-  else { n->next = t->TableRoot; if (n->next) n->next->prev = n; t->TableRoot = n; }
-  ++t->NumberGenericTableElements;
-  t->WhichOrderedElement = 0;
-  t->OrderedPointer = NULL;
-  if (is_new) *is_new = TRUE;
-  return GT_DATA(n);
-}
-EXPORT PVOID NTAPI RtlInsertElementGenericTableFull(RTL_GENERIC_TABLE_ *t, PVOID buffer, ULONG size, BOOLEAN *is_new, PVOID node, ULONG result) { return RtlInsertElementGenericTable(t, buffer, size, is_new); }
-EXPORT PVOID NTAPI RtlLookupElementGenericTable(RTL_GENERIC_TABLE_ *t, PVOID buffer) { GTNode *n = gt_find(t, buffer, NULL); return n ? GT_DATA(n) : NULL; }
-EXPORT PVOID NTAPI RtlLookupElementGenericTableFull(RTL_GENERIC_TABLE_ *t, PVOID buffer, PVOID *node, ULONG *result) { PVOID r = RtlLookupElementGenericTable(t, buffer); if (node) *node = NULL; if (result) *result = r ? 2 : 1; return r; }
-EXPORT BOOLEAN NTAPI RtlDeleteElementGenericTable(RTL_GENERIC_TABLE_ *t, PVOID buffer) {
-  GTNode *n = gt_find(t, buffer, NULL);
-  if (!n) return FALSE;
-  if (n->prev) n->prev->next = n->next; else t->TableRoot = n->next;
-  if (n->next) n->next->prev = n->prev;
-  --t->NumberGenericTableElements;
-  t->WhichOrderedElement = 0;
-  t->OrderedPointer = NULL;
-  t->FreeRoutine(t, n);
-  return TRUE;
-}
-EXPORT PVOID NTAPI RtlGetElementGenericTable(RTL_GENERIC_TABLE_ *t, ULONG index) {
-  GTNode *n = t->TableRoot;
-  while (n && index--) n = n->next;
-  return n ? GT_DATA(n) : NULL;
-}
-EXPORT PVOID NTAPI RtlEnumerateGenericTable(RTL_GENERIC_TABLE_ *t, BOOLEAN restart) {
-  GTNode *n;
-  if (restart || !t->OrderedPointer) n = t->TableRoot;
-  else n = ((GTNode *)t->OrderedPointer)->next;
-  t->OrderedPointer = n;
-  return n ? GT_DATA(n) : NULL;
-}
-EXPORT PVOID NTAPI RtlEnumerateGenericTableWithoutSplaying(RTL_GENERIC_TABLE_ *t, PVOID *restart_key) {
-  GTNode *n = *restart_key ? GT_NODE(*restart_key)->next : t->TableRoot;
-  *restart_key = n ? GT_DATA(n) : *restart_key;
-  return n ? GT_DATA(n) : NULL;
-}
-
 /* ---- locale names and numbers ------------------------------------------------------------------------------------------------------------------------------ */
 
 #include "locale_names.inc"
@@ -770,4 +1173,462 @@ EXPORT PVOID NTAPI RtlImageDirectoryEntryToData(PVOID base, BOOLEAN mapped_as_im
   BYTE *image = (BYTE *)((ULONG_PTR)base & ~(ULONG_PTR)1);
   if (mapped_as_image || rva < *(const ULONG *)(nt + 24 + 60)) return image + rva;      /* (inside the headers: the same either way) */
   return RtlImageRvaToVa(nt, image, rva, NULL);
+}
+
+
+/* ---- process parameters and the debug buffer -------------------------------------------------------------------------------------------------------------- */
+
+#define PARAMS_HEADER 0x410
+#define PARAMS_FLAG_NORMALIZED 1
+/* The offsets of the strings in the parameters: current directory, DLL path, image, command line, window title, desktop, shell info, runtime info. */
+static const ULONG g_params_strings[8] = {0x38, 0x50, 0x60, 0x70, 0xB0, 0xC0, 0xD0, 0xE0};
+static ULONG_PTR params_align(ULONG_PTR v, ULONG to) { return (v + to - 1) & ~(ULONG_PTR)(to - 1); }
+
+/* RtlCreateProcessParameters: one heap block with the header, the strings (kept as offsets from the block: not normalized) and then the environment. */
+EXPORT NTSTATUS NTAPI RtlCreateProcessParametersEx(PVOID *result, const UNICODE_STRING *image, const UNICODE_STRING *dll_path, const UNICODE_STRING *current_directory, const UNICODE_STRING *command_line,
+                                                   PWSTR environment, const UNICODE_STRING *title, const UNICODE_STRING *desktop, const UNICODE_STRING *shell, const UNICODE_STRING *runtime, ULONG flags) {
+  static const UNICODE_STRING empty = {0, 2, NULL}, none = {0, 0, NULL};
+  RTL_USER_PROCESS_PARAMETERS *current = NtCurrentPeb()->ProcessParameters;
+  if (!result || !image) return STATUS_INVALID_PARAMETER_;
+  const UNICODE_STRING *sources[8];
+  UNICODE_STRING own_dir, own_dll;
+  if (current_directory) sources[0] = current_directory; else if (current) { own_dir = current->CurrentDirectoryPath; sources[0] = &own_dir; } else sources[0] = &none;
+  if (dll_path) sources[1] = dll_path; else if (current && current->DllPath.Buffer && current->DllPath.MaximumLength) { own_dll = current->DllPath; sources[1] = &own_dll; } else sources[1] = &none;
+  sources[2] = image;
+  sources[3] = command_line ? command_line : image;
+  sources[4] = title ? title : &empty;
+  sources[5] = desktop ? desktop : &empty;
+  sources[6] = shell ? shell : &empty;
+  sources[7] = runtime ? runtime : &none;
+  ULONG_PTR pos = PARAMS_HEADER;
+  USHORT maximum[8];
+  for (int i = 0; i < 8; ++i) {
+    USHORT m = sources[i]->MaximumLength;
+    if (i == 0 && m < 520) m = 520;
+    if (m != 0 && m < sources[i]->Length + 2) m = (USHORT)(sources[i]->Length + 2);
+    maximum[i] = m;
+    if (m) pos = params_align(pos, 8) + m;
+  }
+  const ULONG size = (ULONG)params_align(pos, 8);
+  const PWSTR env = environment ? environment : (PWSTR)process_environment();
+  SIZE_T env_chars = 0;
+  { const WCHAR *e = env; while (*e) e += wcslen(e) + 1; env_chars = (SIZE_T)(e + 1 - env); }
+  const SIZE_T total = (SIZE_T)params_align(size + env_chars * 2, 8);
+  BYTE *block = RtlAllocateHeap(RtlProcessHeap(), 8, total);
+  if (!block) return STATUS_NO_MEMORY_;
+  *(ULONG *)(block + 0) = size;
+  *(ULONG *)(block + 4) = size;
+  *(ULONG *)(block + 8) = 0;
+  pos = PARAMS_HEADER;
+  for (int i = 0; i < 8; ++i) {
+    UNICODE_STRING *dst = (UNICODE_STRING *)(block + g_params_strings[i]);
+    dst->Length = sources[i]->Length;
+    dst->MaximumLength = maximum[i];
+    if (!maximum[i]) { dst->Buffer = NULL; continue; }
+    pos = params_align(pos, 8);
+    dst->Buffer = (PWSTR)pos;      /* (an offset: the parameters are not normalized) */
+    if (sources[i]->Buffer) memcpy(block + pos, sources[i]->Buffer, sources[i]->Length);
+    pos += maximum[i];
+  }
+  *(PVOID *)(block + 0x80) = block + size;
+  memcpy(block + size, env, env_chars * 2);
+  *(SIZE_T *)(block + 0x3F0) = total - size;
+  (void)flags;
+  *result = block;
+  return STATUS_SUCCESS;
+}
+EXPORT NTSTATUS NTAPI RtlCreateProcessParameters(PVOID *result, const UNICODE_STRING *image, const UNICODE_STRING *dll_path, const UNICODE_STRING *current_directory, const UNICODE_STRING *command_line,
+                                                 PWSTR environment, const UNICODE_STRING *title, const UNICODE_STRING *desktop, const UNICODE_STRING *shell, const UNICODE_STRING *runtime) {
+  return RtlCreateProcessParametersEx(result, image, dll_path, current_directory, command_line, environment, title, desktop, shell, runtime, 0);
+}
+EXPORT NTSTATUS NTAPI RtlDestroyProcessParameters(PVOID params) { return RtlFreeHeap(RtlProcessHeap(), 0, params) ? STATUS_SUCCESS : STATUS_INVALID_PARAMETER_; }
+/* The strings of normalized parameters hold addresses, the others offsets from the parameters. */
+EXPORT PVOID NTAPI RtlNormalizeProcessParams(PVOID params) {
+  BYTE *p = params;
+  if (!p || (*(ULONG *)(p + 8) & PARAMS_FLAG_NORMALIZED)) return params;
+  for (int i = 0; i < 8; ++i) { UNICODE_STRING *s = (UNICODE_STRING *)(p + g_params_strings[i]); if (s->Buffer) s->Buffer = (PWSTR)((BYTE *)s->Buffer + (ULONG_PTR)p); }
+  *(ULONG *)(p + 8) |= PARAMS_FLAG_NORMALIZED;
+  return params;
+}
+EXPORT PVOID NTAPI RtlDeNormalizeProcessParams(PVOID params) {
+  BYTE *p = params;
+  if (!p || !(*(ULONG *)(p + 8) & PARAMS_FLAG_NORMALIZED)) return params;
+  for (int i = 0; i < 8; ++i) { UNICODE_STRING *s = (UNICODE_STRING *)(p + g_params_strings[i]); if (s->Buffer) s->Buffer = (PWSTR)((BYTE *)s->Buffer - (ULONG_PTR)p); }
+  *(ULONG *)(p + 8) &= ~(ULONG)PARAMS_FLAG_NORMALIZED;
+  return params;
+}
+
+/* The debug buffer of RtlQueryProcessDebugInformation: this process only; the heap and module lists are headers with a count. */
+EXPORT PVOID NTAPI RtlCreateQueryDebugBuffer(ULONG size, BOOLEAN event_pair) {
+  (void)size; (void)event_pair;
+  return RtlAllocateHeap(RtlProcessHeap(), 8, 0xB8);
+}
+EXPORT NTSTATUS NTAPI RtlQueryProcessDebugInformation(ULONG pid, ULONG mask, PVOID buffer) {
+  BYTE *b = buffer;
+  if (!b) return STATUS_INVALID_PARAMETER_;
+  if (pid != (ULONG)TEB_CLIENT_PROCESS(NtCurrentTeb())) return (NTSTATUS)0xC000000Bu;      /* STATUS_INVALID_CID */
+  *(ULONG *)(b + 0x40) = mask;
+  if (mask & 1) { if (!*(PVOID *)(b + 0x60)) *(PVOID *)(b + 0x60) = RtlAllocateHeap(RtlProcessHeap(), 8, 0x100); if (!*(PVOID *)(b + 0x60)) return STATUS_NO_MEMORY_; }
+  if (mask & 4) {
+    if (!*(PVOID *)(b + 0x70)) *(PVOID *)(b + 0x70) = RtlAllocateHeap(RtlProcessHeap(), 8, 0x100);
+    if (!*(PVOID *)(b + 0x70)) return STATUS_NO_MEMORY_;
+    PVOID heaps[MAX_HEAPS];
+    *(ULONG *)*(PVOID *)(b + 0x70) = RtlGetProcessHeaps(MAX_HEAPS, heaps);
+  }
+  return STATUS_SUCCESS;
+}
+EXPORT NTSTATUS NTAPI RtlDestroyQueryDebugBuffer(PVOID buffer) {
+  BYTE *b = buffer;
+  if (!b) return STATUS_INVALID_PARAMETER_;
+  for (int off = 0x60; off <= 0x78; off += 8) if (*(PVOID *)(b + off)) RtlFreeHeap(RtlProcessHeap(), 0, *(PVOID *)(b + off));
+  RtlFreeHeap(RtlProcessHeap(), 0, b);
+  return STATUS_SUCCESS;
+}
+
+/* ---- environment blocks of the heap ------------------------------------------------------------------------------------------------------------------------ */
+
+/* The characters of an environment block, with the final empty string. */
+static SIZE_T env_chars(const WCHAR *env) { const WCHAR *e = env; while (*e) e += wcslen(e) + 1; return (SIZE_T)(e + 1 - env); }
+EXPORT NTSTATUS NTAPI RtlCreateEnvironment(BOOLEAN inherit, PWSTR *environment) {
+  if (!environment) return STATUS_INVALID_PARAMETER_;
+  const WCHAR *source = inherit ? process_environment() : NULL;
+  const SIZE_T n = source ? env_chars(source) : 2;
+  WCHAR *block = RtlAllocateHeap(RtlProcessHeap(), 8, n * 2);
+  if (!block) return STATUS_NO_MEMORY_;
+  if (source) memcpy(block, source, n * 2);
+  *environment = block;
+  return STATUS_SUCCESS;
+}
+EXPORT NTSTATUS NTAPI RtlDestroyEnvironment(PWSTR environment) { RtlFreeHeap(RtlProcessHeap(), 0, environment); return STATUS_SUCCESS; }
+/* Sets (or, with no value, removes) a variable in a block of the heap (NULL: the process's own, whose size is kept in its parameters). The block is made again with exactly the size it needs. */
+EXPORT NTSTATUS NTAPI RtlSetEnvironmentVar(PWSTR *penv, PCWSTR name, SIZE_T name_len, PCWSTR value, SIZE_T value_len) {
+  RTL_USER_PROCESS_PARAMETERS *params = NtCurrentPeb()->ProcessParameters;
+  if (!name || !name_len) return STATUS_INVALID_PARAMETER_;
+  for (SIZE_T i = 0; i < name_len; ++i) if (name[i] == '=' && i > 0) return STATUS_INVALID_PARAMETER_;
+  WCHAR *old = penv ? *penv : (WCHAR *)params->Environment;
+  const SIZE_T old_chars = env_chars(old);
+  SIZE_T found_len = 0;
+  const WCHAR *found = env_find(old, name, name_len, &found_len);
+  const SIZE_T removed = found ? name_len + 1 + found_len + 1 : 0, added = value ? name_len + 1 + value_len + 1 : 0;
+  WCHAR *fresh = RtlAllocateHeap(RtlProcessHeap(), 0, (old_chars - removed + added) * 2);
+  if (!fresh) return STATUS_NO_MEMORY_;
+  SIZE_T out = 0;
+  for (const WCHAR *e = old; *e; e += wcslen(e) + 1) {
+    if (found && e + name_len + 1 == found) continue;      /* (the entry being replaced or removed) */
+    const SIZE_T n = wcslen(e) + 1;
+    memcpy(fresh + out, e, n * 2);
+    out += n;
+  }
+  if (value) {
+    memcpy(fresh + out, name, name_len * 2); out += name_len;
+    fresh[out++] = '=';
+    memcpy(fresh + out, value, value_len * 2); out += value_len;
+    fresh[out++] = 0;
+  }
+  fresh[out++] = 0;
+  if (out == 1) fresh[out++] = 0;
+  const SIZE_T capacity = penv ? RtlSizeHeap(RtlProcessHeap(), 0, old) : *(SIZE_T *)((BYTE *)params + 0x3F0);
+  if (out * 2 <= capacity) {      /* it fits where it is: the block keeps its size */
+    memcpy(old, fresh, out * 2);
+    RtlFreeHeap(RtlProcessHeap(), 0, fresh);
+    return STATUS_SUCCESS;
+  }
+  if (penv) *penv = fresh; else { params->Environment = fresh; *(SIZE_T *)((BYTE *)params + 0x3F0) = out * 2; }
+  RtlFreeHeap(RtlProcessHeap(), 0, old);
+  return STATUS_SUCCESS;
+}
+EXPORT NTSTATUS NTAPI RtlSetEnvironmentVariable(PWSTR *penv, const UNICODE_STRING *name, const UNICODE_STRING *value) {
+  if (!name) return STATUS_INVALID_PARAMETER_;
+  return RtlSetEnvironmentVar(penv, name->Buffer, name->Length / 2, value ? value->Buffer : NULL, value ? value->Length / 2 : 0);
+}
+EXPORT void NTAPI RtlSetCurrentEnvironment(PWSTR environment, PWSTR *previous) {
+  RTL_USER_PROCESS_PARAMETERS *params = NtCurrentPeb()->ProcessParameters;
+  if (previous) *previous = (PWSTR)params->Environment;
+  params->Environment = environment;
+  *(SIZE_T *)((BYTE *)params + 0x3F0) = RtlSizeHeap(RtlProcessHeap(), 0, environment);
+}
+/* The process's parameters and environment become blocks of the heap, as they are on Windows (the strings follow the header; the current directory stays where it is). */
+static void relocate_process_parameters(void) {
+  PEB *peb = NtCurrentPeb();
+  BYTE *old = (BYTE *)peb->ProcessParameters;
+  if (!old) return;
+  const ULONG index[8] = {0x38, 0x50, 0x60, 0x70, 0xB0, 0xC0, 0xD0, 0xE0};
+  ULONG size = PARAMS_HEADER;
+  for (int i = 1; i < 8; ++i) { const UNICODE_STRING *u = (const UNICODE_STRING *)(old + index[i]); if (u->Buffer) size += u->MaximumLength; }
+  BYTE *fresh = RtlAllocateHeap(RtlProcessHeap(), 8, size);
+  const SIZE_T chars = *(PVOID *)(old + 0x80) ? env_chars(*(const WCHAR **)(old + 0x80)) : 2;
+  WCHAR *env = RtlAllocateHeap(RtlProcessHeap(), 8, chars * 2);
+  if (!fresh || !env) return;
+  memcpy(fresh, old, 0x3F0);
+  if (*(PVOID *)(old + 0x80)) memcpy(env, *(const WCHAR **)(old + 0x80), chars * 2);
+  *(PVOID *)(fresh + 0x80) = env;
+  *(SIZE_T *)(fresh + 0x3F0) = chars * 2;
+  *(ULONG *)fresh = *(ULONG *)(fresh + 4) = size;
+  ULONG pos = PARAMS_HEADER;
+  for (int i = 1; i < 8; ++i) {
+    UNICODE_STRING *u = (UNICODE_STRING *)(fresh + index[i]);
+    if (!u->Buffer) continue;
+    memcpy(fresh + pos, u->Buffer, u->MaximumLength);
+    u->Buffer = (PWSTR)(fresh + pos);
+    pos += u->MaximumLength;
+  }
+  peb->ProcessParameters = (RTL_USER_PROCESS_PARAMETERS *)fresh;
+}
+
+/* ---- one character of an ANSI string ------------------------------------------------------------------------------------------------------------------- */
+
+/* The character the ANSI string points at (the code page is UTF-8), and the pointer moved past it; a byte that starts no valid sequence gives U+FFFD. */
+EXPORT WCHAR NTAPI RtlAnsiCharToUnicodeChar(PUCHAR *ansi) {
+  const UCHAR *p = *ansi;
+  const UCHAR lead = p[0];
+  unsigned count = 1;
+  ULONG cp = 0xFFFD;
+  if (lead < 0x80) cp = lead;
+  else if (lead >= 0xC2 && lead <= 0xF4) {
+    const unsigned need = lead >= 0xF0 ? 3 : lead >= 0xE0 ? 2 : 1;
+    ULONG v = lead & (0x3Fu >> need);
+    unsigned k = 0;
+    for (; k < need && (p[1 + k] & 0xC0) == 0x80; ++k) v = (v << 6) | (p[1 + k] & 0x3F);
+    const int ok = k == need && !(need == 2 && v < 0x800) && !(need == 3 && (v < 0x10000 || v > 0x10FFFF)) && !(v >= 0xD800 && v <= 0xDFFF);
+    if (ok) { count = need + 1; cp = v >= 0x10000 ? 0xD800 + ((v - 0x10000) >> 10) : v; }
+  }
+  if (lead) *ansi = (PUCHAR)(p + count); else *ansi = (PUCHAR)(p + 1);
+  return (WCHAR)cp;
+}
+
+/* ---- RtlIsTextUnicode ---------------------------------------------------------------------------------------------------------------------------------- */
+
+#define TEXT_ASCII16 0x1u
+#define TEXT_STATISTICS 0x2u
+#define TEXT_CONTROLS 0x4u
+#define TEXT_SIGNATURE 0x8u
+#define TEXT_REVERSE_ASCII16 0x10u
+#define TEXT_REVERSE_STATISTICS 0x20u
+#define TEXT_REVERSE_CONTROLS 0x40u
+#define TEXT_REVERSE_SIGNATURE 0x80u
+#define TEXT_ILLEGAL_CHARS 0x100u
+#define TEXT_ODD_LENGTH 0x200u
+#define TEXT_NULL_BYTES 0x1000u
+#define TEXT_UNICODE_MASK 0xFu
+#define TEXT_REVERSE_MASK 0xF0u
+#define TEXT_NOT_UNICODE_MASK 0xF00u
+#define TEXT_NOT_ASCII_MASK 0xF000u
+/* Whether a buffer looks like UTF-16 text; *flags says which tests to run and gets the ones that came out true. Only the first 256 characters count. */
+EXPORT BOOLEAN NTAPI RtlIsTextUnicode(PVOID buffer, ULONG size, PULONG flags_in) {
+  const WCHAR *s = buffer;
+  unsigned flags = ~0u, out = 0;
+  ULONG length = size;
+  if (length < sizeof(WCHAR)) { if (flags_in) *flags_in = 0; return FALSE; }
+  if (flags_in) flags = *flags_in;
+  if (length & 1) out |= TEXT_ODD_LENGTH;
+  if (((const char *)buffer)[length - 1] == 0) --length;      /* (a terminating NUL byte is not counted) */
+  ULONG count = length / sizeof(WCHAR);
+  if (count > 256) count = 256;
+  if (s[0] == 0xFEFF) out |= TEXT_SIGNATURE;
+  if (s[0] == 0xFFFE) out |= TEXT_REVERSE_SIGNATURE;
+  if (!(out & (TEXT_SIGNATURE | TEXT_REVERSE_SIGNATURE))) {      /* (statistics are only taken when there is no byte order mark) */
+    ULONG low = 0, high = 0;
+    for (ULONG i = 0; i < count; ++i) { if (s[i] < 0x2000) ++low; if ((s[i] & 0xFF) < 0x20) ++high; }
+    if ((flags & TEXT_STATISTICS) && low > count / 2) out |= TEXT_STATISTICS;
+    if ((flags & TEXT_REVERSE_STATISTICS) && high > count / 2) out |= TEXT_REVERSE_STATISTICS;
+    if ((flags & TEXT_REVERSE_ASCII16) && high == count) out |= TEXT_REVERSE_ASCII16;
+  }
+  if (flags & TEXT_NULL_BYTES) {
+    for (ULONG i = 0; i < count; ++i) if (!(s[i] & 0xFF) || !(s[i] >> 8)) { out |= TEXT_NULL_BYTES; break; }
+  }
+  if (flags & TEXT_CONTROLS) {
+    for (ULONG i = 0; i < count; ++i) if (s[i] == '\r' || s[i] == '\n' || s[i] == '\t' || s[i] == ' ' || s[i] == 0x3000) { out |= TEXT_CONTROLS; break; }
+  }
+  if (flags & TEXT_REVERSE_CONTROLS) {
+    for (ULONG i = 0; i < count; ++i) if (s[i] == 0x0D00 || s[i] == 0x0A00 || s[i] == 0x0900 || s[i] == 0x2000) { out |= TEXT_REVERSE_CONTROLS; break; }
+  }
+  if (flags_in) { out &= *flags_in; *flags_in = out; }
+  if (out & (TEXT_REVERSE_MASK | TEXT_NOT_UNICODE_MASK)) return FALSE;
+  if (out & TEXT_NOT_ASCII_MASK) return TRUE;
+  return (out & TEXT_UNICODE_MASK) != 0;
+}
+
+/* ---- RtlFormatMessage ---------------------------------------------------------------------------------------------------------------------------------- */
+
+typedef struct {
+  int last;               /* the last argument used */
+  ULONG_PTR *array;       /* the argument array */
+  va_list_ *list;         /* the variable argument list */
+  ULONGLONG arglist[102]; /* what has been fetched from the list */
+} FormatMessageArgs;
+
+static NTSTATUS fmt_add_chars(WCHAR **buffer, WCHAR *end, const WCHAR *str, ULONG len) {
+  if (len > (ULONG)(end - *buffer)) return STATUS_BUFFER_OVERFLOW_;
+  memcpy(*buffer, str, (size_t_)len * sizeof(WCHAR));
+  *buffer += len;
+  return STATUS_SUCCESS;
+}
+
+static ULONGLONG fmt_get_arg(int nr, FormatMessageArgs *args_data, BOOL is64) {
+  if (nr == -1) nr = args_data->last + 1;
+  if (nr < 1 || nr > 100) return 0;
+  while (nr > args_data->last) {
+    args_data->arglist[args_data->last++] = is64 ? __builtin_va_arg(*args_data->list, ULONGLONG) : __builtin_va_arg(*args_data->list, ULONG_PTR);
+  }
+  return args_data->arglist[nr - 1];
+}
+
+static const WCHAR *fmt_find(const WCHAR *set_or_text, WCHAR c, int in_set) {
+  (void)in_set;
+  for (; *set_or_text; ++set_or_text) if (*set_or_text == c) return set_or_text;
+  return NULL;
+}
+
+static NTSTATUS fmt_add_format(WCHAR **buffer, WCHAR *end, const WCHAR **src, int insert, BOOLEAN ansi, FormatMessageArgs *args_data) {
+  static const WCHAR flag_chars[] = {'0','1','2','3','4','5','6','7','8','9',' ','+','-','*','#','.',0};
+  const WCHAR *format = *src;
+  WCHAR *p, fmt[32];
+  ULONG_PTR args[5] = {0};
+  BOOL is_64 = FALSE;
+  ULONGLONG val;
+  int len, stars = 0, nb_args = 0;
+
+  p = fmt;
+  *p++ = '%';
+  if (*format++ == '!') {
+    const WCHAR *stop = fmt_find(format, '!', 0);
+    if (!stop || stop - format > 30) return STATUS_INVALID_PARAMETER_;
+    *src = stop + 1;
+    while (*format && fmt_find(flag_chars, *format, 1)) {
+      if (*format == '*') stars++;
+      *p++ = *format++;
+    }
+    if (stars > 2) return STATUS_INVALID_PARAMETER_;
+    switch (*format) {
+      case 'c': case 'C': case 's': case 'S':
+        if (ansi) *p++ = (WCHAR)(*format++ ^ ('s' - 'S'));
+        break;
+      default: break;
+    }
+    while (format != stop) *p++ = *format++;
+  } else *p++ = ansi ? 'S' : 's';      /* a simple string */
+  *p = 0;
+
+  if (args_data->list) {
+    fmt_get_arg(insert - 1, args_data, is_64);      /* make sure the previous arguments have been fetched */
+    while (stars--) {
+      args[nb_args++] = (ULONG_PTR)fmt_get_arg(insert, args_data, FALSE);
+      insert = -1;
+    }
+    if (insert == -1) args_data->last--;      /* (the quirk of Windows: an argument is dropped when a width or precision came from the list) */
+    val = fmt_get_arg(insert, args_data, is_64);
+    args[nb_args++] = (ULONG_PTR)val;
+    args[nb_args] = (ULONG_PTR)(val >> 32);
+  } else if (args_data->array) {
+    args[nb_args++] = args_data->array[insert - 1];
+    if (args_data->last < insert) args_data->last = insert;
+    if (is_64) nb_args++;
+    while (stars--) args[nb_args++] = args_data->array[args_data->last++];
+  } else return STATUS_INVALID_PARAMETER_;
+
+  len = _snwprintf_s(*buffer, (size_t_)(end - *buffer), (size_t_)(end - *buffer - 1), fmt, args[0], args[1], args[2], args[3], args[4]);
+  if (len == -1) return STATUS_BUFFER_OVERFLOW_;
+  *buffer += len;
+  return STATUS_SUCCESS;
+}
+
+/* Formats the template `src` (the message of FormatMessage) into `buffer` of `size` bytes; the arguments are an array or the address of a variable argument list. */
+EXPORT NTSTATUS NTAPI RtlFormatMessageEx(const WCHAR *src, ULONG width, BOOLEAN ignore_inserts, BOOLEAN ansi, BOOLEAN is_array, void *args, WCHAR *buffer, ULONG size, ULONG *retsize, ULONG flags) {
+  static const WCHAR spaceW = ' ', crW = '\r', tabW = '\t';
+  static const WCHAR crlfW[] = {'\r', '\n'};
+  FormatMessageArgs *args_data = RtlAllocateHeap(process_heap(), 0, sizeof(*args_data));
+  if (!args_data) return 0xC0000017;
+  NTSTATUS status = STATUS_SUCCESS;
+  WCHAR *start = buffer, *end = buffer + size / sizeof(WCHAR), *line = buffer, *space = NULL;
+  (void)flags;
+  args_data->last = 0;
+  args_data->array = is_array ? (ULONG_PTR *)args : NULL;
+  args_data->list = is_array ? NULL : (va_list_ *)args;
+  for (; *src; src++) {
+    switch (*src) {
+      case '\r':
+        if (src[1] == '\n') src++;
+        /* fall through */
+      case '\n':
+        if (!width) {
+          status = fmt_add_chars(&buffer, end, crlfW, 2);
+          line = buffer;
+          space = NULL;
+          break;
+        }
+        /* fall through */
+      case ' ':
+        space = buffer;
+        status = fmt_add_chars(&buffer, end, &spaceW, 1);
+        break;
+      case '\t':
+        if (space == buffer - 1) space = buffer;
+        status = fmt_add_chars(&buffer, end, &tabW, 1);
+        break;
+      case '%':
+        src++;
+        switch (*src) {
+          case 0:
+            status = STATUS_INVALID_PARAMETER_;
+            goto finish;
+          case 't':
+            if (!width) { status = fmt_add_chars(&buffer, end, &tabW, 1); break; }
+            /* fall through */
+          case 'n':
+            status = fmt_add_chars(&buffer, end, crlfW, 2);
+            line = buffer;
+            space = NULL;
+            break;
+          case 'r':
+            status = fmt_add_chars(&buffer, end, &crW, 1);
+            line = buffer;
+            space = NULL;
+            break;
+          case '0':
+            while (src[1]) src++;
+            break;
+          case '1': case '2': case '3': case '4': case '5': case '6': case '7': case '8': case '9':
+            if (!ignore_inserts) {
+              int nr = *src++ - '0';
+              if (*src >= '0' && *src <= '9') nr = nr * 10 + *src++ - '0';
+              status = fmt_add_format(&buffer, end, &src, nr, ansi, args_data);
+              src--;
+              break;
+            }
+            /* fall through */
+          default:
+            if (ignore_inserts) status = fmt_add_chars(&buffer, end, src - 1, 2);
+            else status = fmt_add_chars(&buffer, end, src, 1);
+            break;
+        }
+        break;
+      default:
+        status = fmt_add_chars(&buffer, end, src, 1);
+        break;
+    }
+    if (status) goto finish;
+    if (width && (ULONG)(buffer - line) >= width) {
+      LONG_PTR diff = 2;
+      WCHAR *next;
+      if (space) {      /* split the line at the last space */
+        next = space + 1;
+        while (space > line && (space[-1] == ' ' || space[-1] == '\t')) space--;
+        diff -= next - space;
+      } else space = next = buffer;      /* split at the end of the buffer */
+      if (diff > 0 && end - buffer < diff) { status = STATUS_BUFFER_OVERFLOW_; goto finish; }
+      memmove(space + 2, next, (size_t_)(buffer - next) * sizeof(WCHAR));
+      buffer += diff;
+      memcpy(space, crlfW, sizeof(crlfW));
+      line = space + 2;
+      space = NULL;
+    }
+  }
+  status = fmt_add_chars(&buffer, end, L"", 1);
+  if (!status) *retsize = (ULONG)((buffer - start) * sizeof(WCHAR));
+finish:
+  RtlFreeHeap(process_heap(), 0, args_data);
+  return status;
+}
+EXPORT NTSTATUS NTAPI RtlFormatMessage(const WCHAR *src, ULONG width, BOOLEAN ignore_inserts, BOOLEAN ansi, BOOLEAN is_array, void *args, WCHAR *buffer, ULONG size, ULONG *retsize) {
+  return RtlFormatMessageEx(src, width, ignore_inserts, ansi, is_array, args, buffer, size, retsize, 0);
 }

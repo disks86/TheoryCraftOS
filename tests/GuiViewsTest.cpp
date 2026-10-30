@@ -2321,6 +2321,238 @@ static void test_wireless_menu() {
   CHECK(a.live == 0);
 }
 
+
+// --- The Bluetooth window ------------------------------------------------------------------------------------
+
+struct FakeBluetoothDetails final : desktop::IBluetoothDetails {
+  using Row = desktop::BluetoothDeviceRow;
+  uint32_t known = 0;
+  desktop::BluetoothAdapterInfo info;
+  Row rows[3];
+  uint32_t row_count = 3;
+  desktop::BluetoothPrompt question;
+  int discovery_calls = 0, connects = 0, disconnects = 0, forgets = 0;
+  bool confirm_answer = false, confirmed = false;
+  int32_t typed = -1;
+  uint8_t last_key[6] = {};
+  desktop::BluetoothResult connect_result = desktop::BluetoothResult::Ok;
+  bool is_bluetooth(uint32_t id) override { return id == known; }
+  bool adapter(uint32_t id, desktop::BluetoothAdapterInfo* out) override {
+    if (id != known) return false;
+    *out = info;
+    return true;
+  }
+  bool set_discovery(uint32_t, bool on) override { ++discovery_calls; info.discovering = on; return true; }
+  uint32_t devices(uint32_t, Row* out, uint32_t capacity) override {
+    uint32_t n = 0;
+    for (; n < row_count && n < capacity; ++n) out[n] = rows[n];
+    return n;
+  }
+  desktop::BluetoothResult connect(uint32_t, const uint8_t key[6]) override {
+    ++connects;
+    for (int i = 0; i < 6; ++i) last_key[i] = key[i];
+    if (connect_result == desktop::BluetoothResult::Ok)
+      for (uint32_t i = 0; i < row_count; ++i)
+        if (rows[i].key[0] == key[0]) rows[i].state = desktop::BluetoothDeviceState::Connecting;
+    return connect_result;
+  }
+  void disconnect(uint32_t, const uint8_t key[6]) override {
+    ++disconnects;
+    for (uint32_t i = 0; i < row_count; ++i)
+      if (rows[i].key[0] == key[0]) rows[i].state = desktop::BluetoothDeviceState::Disconnected;
+    question = desktop::BluetoothPrompt();
+  }
+  void forget(uint32_t, const uint8_t key[6]) override {
+    ++forgets;
+    for (uint32_t i = 0; i < row_count; ++i)
+      if (rows[i].key[0] == key[0]) rows[i].paired = false;
+  }
+  bool prompt(uint32_t, desktop::BluetoothPrompt* out) override {
+    if (question.kind == desktop::BluetoothPromptKind::None) return false;
+    *out = question;
+    return true;
+  }
+  void answer_confirm(uint32_t, bool accepted) override { confirmed = true; confirm_answer = accepted; question = desktop::BluetoothPrompt(); }
+  void answer_passkey(uint32_t, uint32_t passkey) override { typed = static_cast<int32_t>(passkey); question = desktop::BluetoothPrompt(); }
+  static void set_text(char* out, uint32_t capacity, const char* text) {
+    uint32_t n = 0;
+    for (; text[n] && n + 1 < capacity; ++n) out[n] = text[n];
+    out[n] = 0;
+  }
+  FakeBluetoothDetails() {
+    set_text(info.name, sizeof info.name, "Fake Bluetooth");
+    set_text(info.address, sizeof info.address, "11:22:33:44:55:66");
+    info.ready = true;
+    set_text(rows[0].name, sizeof rows[0].name, "Keyboard");
+    set_text(rows[0].address, sizeof rows[0].address, "C6:C5:C4:C3:C2:C1");
+    set_text(rows[0].kind, sizeof rows[0].kind, "Keyboard");
+    rows[0].key[0] = 0xC1;
+    rows[0].signal_percent = 90;
+    rows[0].paired = true;
+    set_text(rows[1].name, sizeof rows[1].name, "Mouse");
+    set_text(rows[1].address, sizeof rows[1].address, "D6:D5:D4:D3:D2:D1");
+    set_text(rows[1].kind, sizeof rows[1].kind, "Mouse");
+    rows[1].key[0] = 0xD1;
+    rows[1].signal_percent = 60;
+    rows[2].address[0] = 0;
+    set_text(rows[2].address, sizeof rows[2].address, "A1:A2:A3:A4:A5:A6");   // no name
+    set_text(rows[2].kind, sizeof rows[2].kind, "Headset");
+    rows[2].key[0] = 0xA6;
+    rows[2].signal_percent = -1;
+    rows[2].supported = false;
+  }
+};
+
+static void test_bluetooth_properties() {
+  TestAllocator a;
+  {
+    Screen screen(a, 640, 480);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {640, 480});
+    WindowManager mgr(a);
+    mgr.set_dock(DockStyle::Fill);
+    w.add(&mgr);
+    desktop::BluetoothProperties props(a);
+    FakeBluetoothDetails details;
+    CHECK(mgr.add_window(&props));
+    props.update();
+    CHECK(props.adapter_label().text().find(StringView("No Bluetooth")) != StringView::npos && !props.connect_button().enabled() && !props.search_button().enabled());
+    props.set_details(&details);
+    props.show_adapter(0);
+    w.layout();
+    CHECK(details.discovery_calls == 1 && props.grid().row_count() == 3 && props.title().equals("Fake Bluetooth - Bluetooth"));
+    CHECK(props.adapter_label().text().equals("Fake Bluetooth (11:22:33:44:55:66) - looking for devices..."));
+    CHECK(props.cell(0, 0).equals("Keyboard") && props.cell(0, 1).equals("Keyboard") && props.cell(0, 2).equals("90%") && props.cell(0, 3).equals("Paired"));
+    CHECK(props.cell(1, 3).equals("Not paired") && props.cell(2, 0).equals("A1:A2:A3:A4:A5:A6") && props.cell(2, 2).empty() && props.cell(2, 3).equals("Not supported yet") && props.cell(7, 0).empty());
+    CHECK(!props.prompt_row().visible() && props.search_button().text().equals("Stop"));
+    // Nothing picked: the actions are off. A device that can be connected enables Connect (and Forget if it is paired); one that cannot, nothing.
+    CHECK(!props.connect_button().enabled() && !props.disconnect_button().enabled() && !props.forget_button().enabled());
+    props.grid().select_row(0);
+    CHECK(props.connect_button().enabled() && props.forget_button().enabled() && !props.disconnect_button().enabled());
+    props.grid().select_row(2);
+    CHECK(!props.connect_button().enabled() && !props.forget_button().enabled());
+    // Connecting: the adapter is asked for the picked device; the row follows the device's state.
+    props.grid().select_row(0);
+    click_center(w, props.connect_button());
+    CHECK(details.connects == 1 && details.last_key[0] == 0xC1 && props.status_label().text().equals("Connecting to Keyboard...") && props.cell(0, 3).equals("Connecting..."));
+    CHECK(props.grid().selected_row() == 0 && props.disconnect_button().enabled() && !props.connect_button().enabled());
+    details.rows[0].state = desktop::BluetoothDeviceState::Connected;
+    props.update();
+    CHECK(props.cell(0, 3).equals("Connected") && props.disconnect_button().enabled());
+    click_center(w, props.disconnect_button());
+    CHECK(details.disconnects == 1 && props.cell(0, 3).equals("Paired") && props.status_label().text().equals("Disconnected."));
+    click_center(w, props.forget_button());
+    CHECK(details.forgets == 1 && props.cell(0, 3).equals("Not paired") && !props.forget_button().enabled());
+    // Refusals and failures say why.
+    details.connect_result = desktop::BluetoothResult::Busy;
+    click_center(w, props.connect_button());
+    CHECK(props.status_label().text().find(StringView("busy")) != StringView::npos);
+    details.connect_result = desktop::BluetoothResult::Ok;
+    details.rows[1].state = desktop::BluetoothDeviceState::Failed;
+    FakeBluetoothDetails::set_text(details.rows[1].failure, sizeof details.rows[1].failure, "wrong passkey");
+    props.update();
+    CHECK(props.cell(1, 3).equals("Failed: wrong passkey"));
+    props.grid().select_row(1);
+    CHECK(props.connect_button().enabled());                        // (a failed attempt can be tried again)
+    // Search toggles the discovery.
+    click_center(w, props.search_button());
+    CHECK(details.discovery_calls == 2 && !details.info.discovering && props.search_button().text().equals("Search") && props.adapter_label().text().find(StringView("ready")) != StringView::npos);
+    click_center(w, props.search_button());
+    CHECK(details.info.discovering && props.search_button().text().equals("Stop"));
+    // A device whose signal changes updates its row; the selection stays on the same device when the order changes.
+    props.grid().select_row(1);
+    details.rows[1].signal_percent = 95;
+    std::swap(details.rows[0], details.rows[1]);
+    props.update();
+    CHECK(props.cell(0, 0).equals("Mouse") && props.cell(0, 2).equals("95%") && props.grid().selected_row() == 0);
+    std::swap(details.rows[0], details.rows[1]);
+    props.update();
+    // The pairing asks the user: numbers to compare...
+    details.rows[0].state = desktop::BluetoothDeviceState::Pairing;
+    details.question.kind = desktop::BluetoothPromptKind::ConfirmNumber;
+    details.question.number = 4321;
+    FakeBluetoothDetails::set_text(details.question.device, sizeof details.question.device, "Keyboard");
+    props.update();
+    w.layout();
+    CHECK(props.prompt_row().visible() && props.prompt_label().text().equals("Does Keyboard show 004321?") && props.accept_button().visible() && !props.passkey_box().visible());
+    CHECK(props.accept_button().text().equals("Yes") && props.reject_button().text().equals("No"));
+    click_center(w, props.accept_button());
+    CHECK(details.confirmed && details.confirm_answer && !props.prompt_row().visible());
+    // ...a passkey the device shows, typed here (digits only, at most six)...
+    details.question.kind = desktop::BluetoothPromptKind::EnterPasskey;
+    FakeBluetoothDetails::set_text(details.question.device, sizeof details.question.device, "Keyboard");
+    props.update();
+    w.layout();
+    CHECK(props.prompt_row().visible() && props.passkey_box().visible() && props.prompt_label().text().equals("Type the passkey Keyboard shows:") && props.accept_button().text().equals("OK"));
+    click_center(w, props.accept_button());
+    CHECK(details.typed < 0 && props.status_label().text().find(StringView("passkey")) != StringView::npos);
+    props.passkey_box().set_text("12ab");
+    click_center(w, props.accept_button());
+    CHECK(details.typed < 0 && props.status_label().text().find(StringView("digits")) != StringView::npos);
+    props.passkey_box().set_text("654321");
+    click_center(w, props.accept_button());
+    CHECK(details.typed == 654321 && !props.prompt_row().visible());
+    // ...or a passkey shown here for the device's user to type: only Cancel, which stops the connection.
+    details.rows[0].state = desktop::BluetoothDeviceState::Pairing;
+    details.question.kind = desktop::BluetoothPromptKind::ShowPasskey;
+    details.question.number = 123456;
+    FakeBluetoothDetails::set_text(details.question.device, sizeof details.question.device, "Keyboard");
+    props.update();
+    w.layout();
+    CHECK(props.prompt_label().text().equals("Type 123456 on Keyboard, then press Enter.") && !props.accept_button().visible() && !props.passkey_box().visible() && props.reject_button().text().equals("Cancel"));
+    const int before = details.disconnects;
+    click_center(w, props.reject_button());
+    CHECK(details.disconnects == before + 1 && props.status_label().text().equals("Pairing cancelled.") && !props.prompt_row().visible());
+    // An adapter that is gone, or not ready.
+    details.known = 9;
+    props.update();
+    CHECK(props.grid().row_count() == 0 && props.adapter_label().text().find(StringView("not there")) != StringView::npos && !props.search_button().enabled());
+    details.known = 0;
+    details.info.ready = false;
+    props.update();
+    CHECK(props.adapter_label().text().find(StringView("not ready")) != StringView::npos && props.grid().row_count() == 0 && !props.connect_button().enabled());
+    props.close();
+    CHECK(!props.manager());
+  }
+  CHECK(a.live == 0);
+}
+
+// A Bluetooth adapter has its own group in the computer manager's hardware tree, and a menu with Bluetooth Settings, which opens the window for that adapter.
+static void test_bluetooth_menu() {
+  TestAllocator a;
+  {
+    using desktop::HardwareGroup;
+    Screen screen(a, 800, 600);
+    desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+    FakeInventory inv(a);
+    inv.list.add(HardwareGroup::Network, "Fake e1000", "connected", 3);
+    inv.list.add(HardwareGroup::Bluetooth, "Fake Bluetooth", "ready, 0 connected", 0, false, true);
+    d.set_hardware_inventory(&inv);
+    FakeBluetoothDetails details;
+    d.set_bluetooth_details(&details);
+    d.open_computer_manager();
+    desktop::ComputerManager& cm = d.computer_manager();
+    cm.tabs().select_page(2);
+    d.window().layout();
+    Window& w = d.window();
+    const int32_t group = cm.hardware_group_node(HardwareGroup::Bluetooth);
+    CHECK(group >= 0 && cm.hardware_tree().child_count(group) == 1 && cm.hardware_tree().node_text(group).equals("Bluetooth"));
+    const Point adapter = node_point(cm.hardware_tree(), cm.hardware_tree().child_at(group, 0));
+    const int32_t network = cm.hardware_group_node(HardwareGroup::Network);
+    const Point wired = node_point(cm.hardware_tree(), cm.hardware_tree().child_at(network, 0));
+    CHECK(!choose_context(w, cm.bluetooth_menu(), wired.x, wired.y, "Bluetooth Settings...") && !d.bluetooth_properties().manager());
+    w.close_popup();
+    CHECK(choose_context(w, cm.bluetooth_menu(), adapter.x, adapter.y, "Bluetooth Settings...") && d.bluetooth_properties().manager() != nullptr);
+    CHECK(d.bluetooth_properties().adapter() == 0 && cm.bluetooth_adapter() == 0 && d.bluetooth_properties().grid().row_count() == 3 && details.discovery_calls == 1);
+    // The window follows the adapter several times a second.
+    details.rows[0].signal_percent = 33;
+    d.step(5000000);
+    d.step(5300000);
+    CHECK(d.bluetooth_properties().cell(0, 2).equals("33%"));
+  }
+  CHECK(a.live == 0);
+}
+
 // Display Settings is no longer in the Start menu: it is in the menu of the Displays group of the computer manager's hardware tree.
 // The Start menu has a search box that is focused as soon as the menu opens: typing filters the entries (fuzzy, ignoring case) and Enter runs the first match.
 static void test_start_menu_search() {
@@ -8301,6 +8533,8 @@ int main() {
   test_network_properties();
   test_wireless_properties();
   test_wireless_menu();
+  test_bluetooth_properties();
+  test_bluetooth_menu();
   test_start_menu_search();
   test_caret_blink();
   test_display_settings_entry();

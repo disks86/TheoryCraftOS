@@ -286,14 +286,15 @@ bool DeviceRenderer2D::submit_pending() {
   if (atlas_ok_) {
     glyph_vertices_->unmap();
     if (atlas_dirty_) {
-      if (!atlas_->write_pixels(ArrayView<const uint32_t>(atlas_pixels_.data(), atlas_pixels_.size()))) return false;
+      if (!upload(atlas_, atlas_pixels_, kAtlasSize, atlas_dirty_area_, &atlas_pixels_sent_)) return false;
       atlas_dirty_ = false;
     }
   }
   if (sheet_ok_) {
     sheet_vertices_->unmap();
     if (sheet_dirty_) {
-      if (!sheet_->write_pixels(ArrayView<const uint32_t>(sheet_pixels_.data(), sheet_pixels_.size()))) return false;
+      uint64_t sent = 0;
+      if (!upload(sheet_, sheet_pixels_, kSheetSize, sheet_dirty_area_, &sent)) return false;
       sheet_dirty_ = false;
     }
   }
@@ -574,6 +575,7 @@ bool DeviceRenderer2D::draw_mask_textured(const MaskView& mask, int64_t ddx, int
     }
   }
   if (!small) return upload_and_draw(w, h, dx0, dy0);
+  grow_area(&sheet_dirty_area_, &sheet_dirty_, static_cast<int32_t>(sx), static_cast<int32_t>(sy), static_cast<uint32_t>(w), static_cast<uint32_t>(h));
   sheet_dirty_ = true;
   sheet_emit(sx, sy, static_cast<uint32_t>(w), static_cast<uint32_t>(h), dx0, dy0);
   return true;
@@ -830,6 +832,28 @@ void DeviceRenderer2D::atlas_reset() {
   for (AtlasEntry& e : atlas_table_) e.used = false;
 }
 
+// The rectangle that holds `area` and the new part (when nothing was added since the last upload, `area` is just the new part).
+void DeviceRenderer2D::grow_area(Rect2D* area, bool* dirty, int32_t x, int32_t y, uint32_t w, uint32_t h) {
+  if (!*dirty) {
+    *area = Rect2D{x, y, w, h};
+    return;
+  }
+  const int32_t x0 = x < area->x ? x : area->x, y0 = y < area->y ? y : area->y;
+  const int64_t x1 = int64_t{x} + w > int64_t{area->x} + area->width ? int64_t{x} + w : int64_t{area->x} + area->width;
+  const int64_t y1 = int64_t{y} + h > int64_t{area->y} + area->height ? int64_t{y} + h : int64_t{area->y} + area->height;
+  *area = Rect2D{x0, y0, static_cast<uint32_t>(x1 - x0), static_cast<uint32_t>(y1 - y0)};
+}
+
+bool DeviceRenderer2D::upload(IImage* image, ArrayView<uint32_t> pixels, uint32_t size, const Rect2D& area, uint64_t* sent) {
+  const uint64_t offset = uint64_t{static_cast<uint32_t>(area.y)} * size + static_cast<uint32_t>(area.x);
+  if (area.width && area.height && area.x >= 0 && area.y >= 0 && image->write_rect(area, ArrayView<const uint32_t>(pixels.subview(offset)), size)) {
+    *sent += uint64_t{area.width} * area.height;
+    return true;
+  }
+  *sent += uint64_t{size} * size;
+  return image->write_pixels(ArrayView<const uint32_t>(pixels));
+}
+
 bool DeviceRenderer2D::atlas_slot(uint32_t w, uint32_t h, uint32_t* x, uint32_t* y) {
   if (atlas_x_ + w > kAtlasSize) {   // the next shelf
     atlas_y_ += atlas_shelf_;
@@ -900,6 +924,7 @@ void DeviceRenderer2D::draw_glyph(uint64_t id, const MaskView& mask, int32_t x, 
     entry->used = true;
     ++atlas_entries_;
     ++glyphs_made_;
+    grow_area(&atlas_dirty_area_, &atlas_dirty_, static_cast<int32_t>(ax), static_cast<int32_t>(ay), mask.width, mask.height);
     atlas_dirty_ = true;
   }
   if (glyph_count_ + 6 > kMaxGlyphVertices) submit_pending();

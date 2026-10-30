@@ -75,6 +75,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
       network_properties_(allocator),
       wireless_properties_(allocator),
       device_properties_(allocator),
+      bluetooth_properties_(allocator),
       about_(allocator),
       about_lines_{Label(allocator), Label(allocator), Label(allocator)},
       database_url_(allocator),
@@ -191,6 +192,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   computer_manager_.on_open_network_properties({&Desktop::on_network_properties, this});
   computer_manager_.on_open_wireless_properties({&Desktop::on_wireless_properties, this});
   computer_manager_.on_open_device_properties({&Desktop::on_device_properties, this});
+  computer_manager_.on_open_bluetooth_properties({&Desktop::on_bluetooth_properties, this});
   input_.set_confine(&Desktop::confine_pointer, this);
   window_.set_key_filter(&Desktop::on_shortcut, this);
   window_.layout();
@@ -833,6 +835,19 @@ void Desktop::on_device_properties(void* self, Control&) {
   d->open_device_properties(d->computer_manager_.device_group(), d->computer_manager_.device_id());
 }
 
+void Desktop::open_bluetooth_properties(uint32_t adapter) {
+  window_.locked([&] {
+    bluetooth_properties_.show_adapter(adapter);
+    if (bluetooth_properties_.manager()) bluetooth_properties_.activate();
+    else windows_.add_window(&bluetooth_properties_);
+  });
+}
+
+void Desktop::on_bluetooth_properties(void* self, Control&) {
+  auto* d = static_cast<Desktop*>(self);
+  d->open_bluetooth_properties(d->computer_manager_.bluetooth_adapter());
+}
+
 void Desktop::open_file_properties(StringView path) {
   window_.locked([&] {
     file_properties_.show(path);
@@ -1134,6 +1149,11 @@ void Desktop::pump(uint64_t uptime_us) {
   if (monitors_ && second != polled_monitors_second_) {
     polled_monitors_second_ = second;
     if (monitors_->poll()) apply_monitor_changes();
+  }
+  const uint64_t quarter = uptime_us / 250000;
+  if (quarter != polled_quarter_) {
+    polled_quarter_ = quarter;
+    if (bluetooth_properties_.manager()) bluetooth_properties_.update();
   }
   if (second != polled_second_) {
     polled_second_ = second;

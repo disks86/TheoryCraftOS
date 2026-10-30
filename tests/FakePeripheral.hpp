@@ -339,6 +339,9 @@ struct Peripheral {
   bool want_sc = true, want_mitm = false;
   uint8_t max_key = 16, oob = 0;
   uint8_t resp_dist = 0x03;
+  uint32_t (*passkey_provider)(void*) = nullptr;     // asked for the number the host shows when the peripheral first needs it (the user reads it off the screen and types it)
+  void* provider_context = nullptr;
+  bool passkey_fetched = false;
   uint32_t passkey = 0;               // the number shown to the user (set by the test from what the host displays) or to type (set by the test for the host to ask for)
   int method = 0;                     // 0 just works, 1 numeric comparison, 2 the peripheral displays, 3 the peripheral inputs (the test says which it expects)
   uint32_t numeric_value = 0;         // what the peripheral computed for numeric comparison
@@ -367,6 +370,7 @@ struct Peripheral {
   void smp_send(uint8_t code, const Bytes& body) { Bytes p = {code}; p.insert(p.end(), body.begin(), body.end()); send_frame(6, p); }
   void smp_fail(uint8_t reason) { failed_with = reason; smp_send(0x05, {reason}); }
   void rnd(uint8_t out[16]) { random->fill(ByteView(out, 16)); }
+  void fetch_passkey() { if (passkey_provider && !passkey_fetched && method >= 2) { passkey = passkey_provider(provider_context); passkey_fetched = true; } }
   static void passkey16(uint8_t out[16], uint32_t v) { memset(out, 0, 16); for (int i = 0; i < 4; ++i) out[i] = static_cast<uint8_t>(v >> (8 * i)); }
   // the peripheral is the responder; the central is the initiator
   void smp_receive(const Bytes& pdu) {
@@ -395,6 +399,7 @@ struct Peripheral {
       }
       case 0x03: {                       // confirm (legacy: Mconfirm; secure connections passkey: Cai)
         if (body.size() != 16) return smp_fail(10);
+        fetch_passkey();
         if (!sc) {
           memcpy(mconfirm, body.data(), 16);
           memset(tk, 0, 16);
