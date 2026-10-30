@@ -103,10 +103,3 @@ EXPORT HFILE WINAPI OpenFile(LPCSTR name, LPOFSTRUCT of, UINT style) {
   if (h == HFILE_ERROR_) { of->nErrCode = (WORD)GetLastError(); return (HFILE)-1; }
   return (HFILE)h;
 }
-
-/* There are no 8.3 names in this OS's file systems: the short name of a path is its full name. */
-EXPORT DWORD WINAPI GetShortPathNameA(LPCSTR path, LPSTR buffer, DWORD capacity) {
-  if (!path) { set_error(ERROR_INVALID_PARAMETER); return 0; }
-  if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) return 0;      /* (GetFileAttributesA set the error) */
-  return GetFullPathNameA(path, capacity, buffer, NULL);
-}

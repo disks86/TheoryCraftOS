@@ -1167,26 +1167,79 @@ EXPORT NTSTATUS NTAPI LdrRemoveDllDirectory(PVOID cookie) {
   g_user_dll_dirs[i - 1].used = FALSE;
   return STATUS_SUCCESS;
 }
-/* The folders a set of LOAD_LIBRARY_SEARCH_* flags names, separated by ';' (application 0x200, System32 0x800; the user folders belong to kernel32). */
-static BOOLEAN search_flags_path(ULONG flags, WCHAR *out, SIZE_T capacity) {
-  static const WCHAR system32[] = {'C', ':', '\\', 'W', 'i', 'n', 'd', 'o', 'w', 's', '\\', 'S', 'y', 's', 't', 'e', 'm', '3', '2', 0};
+/* ---- the DLL search path ---------------------------------------------------------------------------------------------------------------------------------- */
+
+static const WCHAR kSystemDir[] = {'C', ':', '\\', 'W', 'i', 'n', 'd', 'o', 'w', 's', '\\', 'S', 'y', 's', 't', 'e', 'm', '3', '2', 0};
+static const WCHAR kSystemPath[] = {'C', ':', '\\', 'W', 'i', 'n', 'd', 'o', 'w', 's', '\\', 'S', 'y', 's', 't', 'e', 'm', '3', '2', ';', 'C', ':', '\\', 'W', 'i', 'n', 'd', 'o', 'w', 's', '\\', 'S', 'y', 's', 't', 'e', 'm', ';',
+                                    'C', ':', '\\', 'W', 'i', 'n', 'd', 'o', 'w', 's', 0};
+static LONG g_path_safe_mode;      /* RtlSetSearchPathMode: 0 the current folder comes first, 1 it comes after the system folders, 2 that for good */
+static ULONG g_default_search_flags;      /* LdrSetDefaultDllDirectories */
+
+static SIZE_T text_length(const WCHAR *s) { SIZE_T n = 0; while (s[n]) ++n; return n; }
+/* The end of the folder part of a module path: "C:\dir\file" gives "C:\dir", "C:\file" gives "C:\", "C:file" gives "C:". */
+static SIZE_T module_path_end(const WCHAR *module) {
+  SIZE_T end = 0;
+  for (SIZE_T i = 0; module[i]; ++i) if (module[i] == '\\' || module[i] == '/') end = i;
+  if (end == 2 && module[1] == ':') ++end;
+  if (end == 0 && module[0] && module[1] == ':') end = 2;
+  return end;
+}
+static WCHAR *append_path(WCHAR *p, const WCHAR *text, SIZE_T length) {
+  if (!length) return p;
+  for (SIZE_T i = 0; i < length; ++i) p[i] = text[i];
+  p[length] = ';';
+  return p + length + 1;
+}
+static const WCHAR *image_path_name(void) {
+  const BYTE *params = *(const BYTE *const *)(*(const BYTE *const *)((const BYTE *)NtCurrentTeb() + 0x60) + 0x20);
+  return ((const UNICODE_STRING *)(params + 0x60))->Buffer;
+}
+/* module folder; dll_dir or the current folder; the system folders; PATH (with the current folder before it in safe mode). The result is from the process heap. */
+static NTSTATUS get_dll_load_path(const WCHAR *module, const WCHAR *dll_dir, LONG safe_mode, PWSTR *path) {
+  static const WCHAR kPath[] = {'P', 'A', 'T', 'H', 0};
+  UNICODE_STRING name = { 8, 10, (PWSTR)kPath }, value = { 0, 0, NULL };
+  SIZE_T module_chars = module ? module_path_end(module) : 0;
+  SIZE_T path_bytes = 0;
+  if (RtlQueryEnvironmentVariable_U(NULL, &name, &value) == STATUS_BUFFER_TOO_SMALL_) path_bytes = value.Length;
+  const SIZE_T total = (text_length(kSystemPath) + 1) + module_chars + 1 + (dll_dir ? text_length(dll_dir) + 1 : 2) + 2 + path_bytes / 2 + 2;
+  WCHAR *result = RtlAllocateHeap(process_heap(), 0, total * 2), *p = result;
+  if (!result) return STATUS_NO_MEMORY;
+  if (module) p = append_path(p, module, module_chars);
+  if (dll_dir) p = append_path(p, dll_dir, text_length(dll_dir));
+  else if (!safe_mode) p = append_path(p, (const WCHAR *)L".", 1);
+  p = append_path(p, kSystemPath, text_length(kSystemPath));
+  if (!dll_dir && safe_mode) p = append_path(p, (const WCHAR *)L".", 1);
+  value.Buffer = p;
+  value.MaximumLength = (USHORT)(path_bytes > 0xFFFC ? 0xFFFC : path_bytes);
+  value.Length = 0;
+  if (path_bytes && RtlQueryEnvironmentVariable_U(NULL, &name, &value) == STATUS_SUCCESS) p[value.Length / 2] = 0;
+  else *p = 0;
+  *path = result;
+  return STATUS_SUCCESS;
+}
+/* The folders a set of LOAD_LIBRARY_SEARCH_* flags names, separated by ';': the folder of `module` (0x100), of the program (0x200), the user folders (0x400, AddDllDirectory in
+ * the order of the newest first, then SetDllDirectory's), System32 (0x800). */
+static NTSTATUS search_flags_path(const WCHAR *module, ULONG flags, WCHAR *out, SIZE_T capacity) {
   SIZE_T n = 0;
   out[0] = 0;
   if (flags & 0x1000) flags |= 0xE00;      /* LOAD_LIBRARY_SEARCH_DEFAULT_DIRS: application, user and System32 folders */
-  if (flags & 0x200) {      /* the folder of the program: ImagePathName of the process parameters, without the file */
-    const UNICODE_STRING *image = (const UNICODE_STRING *)(*(const BYTE *const *)(*(const BYTE *const *)((const BYTE *)NtCurrentTeb() + 0x60) + 0x20) + 0x60);
-    SIZE_T length = image->Length / 2;
-    while (length > 0 && image->Buffer[length - 1] != '\\') --length;
-    if (length > 1 && length < capacity) {
-      for (SIZE_T i = 0; i + 1 < length; ++i) out[n++] = image->Buffer[i];
-      out[n++] = ';';
-    }
+  if (flags & 0x100) {
+    if (!module) return STATUS_INVALID_PARAMETER;
+    const ULONG type = RtlDetermineDosPathNameType_U(module);
+    if (type != 2 && type != 4 && type != 6 && type != 1) return STATUS_INVALID_PARAMETER;      /* drive absolute, rooted, local device, UNC */
+    const SIZE_T end = module_path_end(module);
+    if (end + 2 > capacity) return STATUS_NAME_TOO_LONG_;
+    for (SIZE_T i = 0; i < end; ++i) out[n++] = module[i];
+    if (end) out[n++] = ';';
   }
-  if (flags & 0x800) {
-    for (SIZE_T i = 0; system32[i] && n + 1 < capacity; ++i) out[n++] = system32[i];
-    out[n++] = ';';
+  if (flags & 0x200) {
+    const WCHAR *image = image_path_name();
+    const SIZE_T end = module_path_end(image);
+    if (n + end + 2 > capacity) return STATUS_NAME_TOO_LONG_;
+    for (SIZE_T i = 0; i < end; ++i) out[n++] = image[i];
+    if (end) out[n++] = ';';
   }
-  if (flags & 0x400) {      /* the folders AddDllDirectory added, the newest first, then the one SetDllDirectory named */
+  if (flags & 0x400) {
     BOOLEAN done[MAX_USER_DLL_DIRS] = {0};
     for (;;) {
       int best = -1;
@@ -1199,25 +1252,78 @@ static BOOLEAN search_flags_path(ULONG flags, WCHAR *out, SIZE_T capacity) {
     for (SIZE_T i = 0; i < g_dll_directory_chars && n + 2 < capacity; ++i) out[n++] = g_dll_directory_text[i];
     if (g_dll_directory_chars) out[n++] = ';';
   }
+  if (flags & 0x800) {
+    for (SIZE_T i = 0; kSystemDir[i] && n + 2 < capacity; ++i) out[n++] = kSystemDir[i];
+    out[n++] = ';';
+  }
   if (n > 0) --n;
   out[n] = 0;
-  return TRUE;
-}
-EXPORT ULONG NTAPI RtlGetFullPathName_U(PCWSTR name, ULONG size, PWSTR buffer, PWSTR *file_part);
-EXPORT NTSTATUS NTAPI LdrGetDllPath(PCWSTR name, ULONG flags, PWSTR *path, PWSTR *unused) {
-  (void)name;
-  WCHAR text[1040];
-  if ((flags & 8) && (flags & 0x1F00)) return STATUS_INVALID_PARAMETER;
-  search_flags_path(flags ? flags : 0xA00, text, 1040);
-  SIZE_T n = 0;
-  while (text[n]) ++n;
-  PWSTR copy = RtlAllocateHeap(process_heap(), 0, (n + 1) * 2);
-  if (!copy) return STATUS_NO_MEMORY;
-  for (SIZE_T i = 0; i <= n; ++i) copy[i] = text[i];
-  *path = copy;
-  if (unused) *unused = NULL;
   return STATUS_SUCCESS;
 }
+EXPORT ULONG NTAPI RtlGetFullPathName_U(PCWSTR name, ULONG size, PWSTR buffer, PWSTR *file_part);
+EXPORT NTSTATUS NTAPI LdrSetDefaultDllDirectories(ULONG flags) {
+  if (!flags || (flags & ~0x1F00u) || (flags & 0x100)) return STATUS_INVALID_PARAMETER;
+  g_default_search_flags = flags;
+  return STATUS_SUCCESS;
+}
+EXPORT NTSTATUS NTAPI LdrGetDllPath(PCWSTR module, ULONG flags, PWSTR *path, PWSTR *unused) {
+  const ULONG search_flags = 0x100 | 0x200 | 0x400 | 0x800 | 0x1000;
+  if (unused) *unused = NULL;
+  if (flags & 8) {      /* LOAD_WITH_ALTERED_SEARCH_PATH */
+    if (flags & search_flags) return STATUS_INVALID_PARAMETER;
+    if (g_default_search_flags) flags |= g_default_search_flags | 0x100;
+  } else if (!(flags & search_flags)) flags |= g_default_search_flags;
+  if (flags & search_flags) {
+    WCHAR text[1040];
+    const NTSTATUS status = search_flags_path(module, flags, text, 1040);
+    if (!NT_SUCCESS(status)) return status;
+    const SIZE_T n = text_length(text);
+    PWSTR copy = RtlAllocateHeap(process_heap(), 0, (n + 1) * 2);
+    if (!copy) return STATUS_NO_MEMORY;
+    for (SIZE_T i = 0; i <= n; ++i) copy[i] = text[i];
+    *path = copy;
+    return STATUS_SUCCESS;
+  }
+  WCHAR dll_directory[520];
+  const WCHAR *dll_dir = NULL;
+  if (g_dll_directory_chars) {
+    for (USHORT i = 0; i <= g_dll_directory_chars; ++i) dll_directory[i] = g_dll_directory_text[i];
+    dll_dir = dll_directory;
+  }
+  const WCHAR *from = module;
+  BOOLEAN has_backslash = FALSE;
+  if (module) for (const WCHAR *c = module; *c; ++c) if (*c == '\\') has_backslash = TRUE;
+  if (!(flags & 8) || !has_backslash) from = image_path_name();
+  return get_dll_load_path(from, dll_dir, 1, path);
+}
+EXPORT NTSTATUS NTAPI RtlSetSearchPathMode(ULONG flags) {
+  LONG value;
+  switch (flags) {
+    case 1: value = 1; break;      /* BASE_SEARCH_PATH_ENABLE_SAFE_SEARCHMODE */
+    case 0x10000: value = 0; break;      /* BASE_SEARCH_PATH_DISABLE_SAFE_SEARCHMODE */
+    case 1 | 0x8000: __sync_lock_test_and_set(&g_path_safe_mode, 2); return STATUS_SUCCESS;      /* ... and for good */
+    default: return STATUS_INVALID_PARAMETER;
+  }
+  for (;;) {
+    const LONG previous = g_path_safe_mode;
+    if (previous == 2) break;
+    if (__sync_val_compare_and_swap(&g_path_safe_mode, previous, value) == previous) return STATUS_SUCCESS;
+  }
+  return STATUS_ACCESS_DENIED;
+}
+/* The folders an executable is looked for in: the program's, the current folder unless NoDefaultCurrentDirectoryInExePath is set (and the name has no path), the system ones, PATH. */
+EXPORT NTSTATUS NTAPI RtlGetExePath(PCWSTR name, PWSTR *path) {
+  static const WCHAR kNoDefault[] = {'N', 'o', 'D', 'e', 'f', 'a', 'u', 'l', 't', 'C', 'u', 'r', 'r', 'e', 'n', 't', 'D', 'i', 'r', 'e', 'c', 't', 'o', 'r', 'y', 'I', 'n', 'E', 'x', 'e', 'P', 'a', 't', 'h', 0};
+  const WCHAR *dll_dir = (const WCHAR *)L".";
+  BOOLEAN has_backslash = FALSE;
+  for (const WCHAR *c = name; *c; ++c) if (*c == '\\') has_backslash = TRUE;
+  if (!has_backslash) {
+    UNICODE_STRING variable = { (USHORT)(text_length(kNoDefault) * 2), (USHORT)(text_length(kNoDefault) * 2 + 2), (PWSTR)kNoDefault }, value = { 0, 0, NULL };
+    if (RtlQueryEnvironmentVariable_U(NULL, &variable, &value) != STATUS_VARIABLE_NOT_FOUND_) dll_dir = (const WCHAR *)L"";
+  }
+  return get_dll_load_path(image_path_name(), dll_dir, 0, path);
+}
+EXPORT NTSTATUS NTAPI RtlGetSearchPath(PWSTR *path) { return get_dll_load_path(image_path_name(), NULL, g_path_safe_mode, path); }
 EXPORT VOID NTAPI RtlReleasePath(PWSTR path) { if (path) RtlFreeHeap(process_heap(), 0, path); }
 EXPORT NTSTATUS NTAPI LdrLoadDll(PWSTR search_path, PULONG flags, PUNICODE_STRING name, PVOID *handle) {
   WCHAR coded[1040];
@@ -1226,7 +1332,7 @@ EXPORT NTSTATUS NTAPI LdrLoadDll(PWSTR search_path, PULONG flags, PUNICODE_STRIN
   if ((ULONG_PTR)search_path <= 0xFFFF && ((ULONG_PTR)search_path & 1)) {      /* LOAD_LIBRARY_SEARCH_* flags in place of a path */
     const ULONG search = (ULONG)(ULONG_PTR)search_path & ~1u;
     if (((search & 8) && (search & 0x1F00)) || ((search & 0x100) && !absolute)) return STATUS_INVALID_PARAMETER;
-    search_flags_path(search, coded, 1040);
+    if (!NT_SUCCESS(search_flags_path(NULL, search, coded, 1040))) return STATUS_INVALID_PARAMETER;
     search_path = coded;
   }
   BOOLEAN bare = TRUE;

@@ -75,28 +75,61 @@ EXPORT BOOL WINAPI GetDiskFreeSpaceA(LPCSTR root, LPDWORD sectors_per_cluster, L
   free_wide(w);
   return ok;
 }
-/* SearchPath: `path` is a list of folders separated by ';' (NULL: the usual places). */
+/* SearchPath: `path` is a list of folders separated by ';' (NULL: the usual places, which RtlGetSearchPath knows). A name with a drive or a root is looked for as it is. With no
+ * path, the active activation context may name the file first. */
+static BOOL actctx_redirect_key(LPCWSTR name, WCHAR *out, DWORD capacity, BOOL append_dll);
+static BOOL search_list(LPCWSTR list, LPCWSTR file, WCHAR *found) {
+  WCHAR candidate[PATH_CHARS];
+  const size_t_ fl = wcslen(file);
+  for (LPCWSTR start = list; *start;) {
+    LPCWSTR end = start;
+    while (*end && *end != ';') ++end;
+    const size_t_ dl = (size_t_)(end - start);
+    if (dl > 0 && dl + 1 + fl + 1 <= PATH_CHARS) {
+      memcpy(candidate, start, dl * 2);
+      candidate[dl] = '\\';
+      memcpy(candidate + dl + 1, file, (fl + 1) * 2);
+      WCHAR full[PATH_CHARS];
+      if (full_path_w(candidate, full, PATH_CHARS) && is_program_file(full)) { lstrcpyW(found, full); return TRUE; }
+    }
+    start = *end ? end + 1 : end;
+  }
+  return FALSE;
+}
 EXPORT DWORD WINAPI SearchPathW(LPCWSTR path, LPCWSTR file, LPCWSTR extension, DWORD capacity, LPWSTR buffer, LPWSTR *file_part) {
   WCHAR found[PATH_CHARS];
   BOOL ok = FALSE;
   if (!file) { set_error(ERROR_INVALID_PARAMETER); return 0; }
-  static const WCHAR none[] = {0};
-  if (!path) {
-    ok = find_file(file, extension ? extension : none, NULL, found);
+  {      /* (an empty name, or one of blanks only) */
+    LPCWSTR c = file;
+    while (*c == ' ') ++c;
+    if (!*c) { set_error(ERROR_INVALID_PARAMETER); return 0; }
+  }
+  BOOL has_extension = FALSE;
+  for (LPCWSTR c = file; *c; ++c) if (*c == '.') has_extension = TRUE; else if (*c == '\\' || *c == '/') has_extension = FALSE;
+  const size_t_ fl = wcslen(file), el = extension ? wcslen(extension) : 0;
+  WCHAR with_extension[MAX_PATH];
+  if (fl + el + 1 > MAX_PATH) { set_error(ERROR_FILENAME_EXCED_RANGE); return 0; }
+  memcpy(with_extension, file, (fl + 1) * 2);
+  if (!has_extension && el) memcpy(with_extension + fl, extension, (el + 1) * 2);
+  const BOOL rooted = file[0] == '\\' || file[0] == '/' || (file[0] && file[1] == ':');
+  if (rooted) {
+    WCHAR full[PATH_CHARS];
+    ok = (full_path_w(file, full, PATH_CHARS) && is_program_file(full) && (lstrcpyW(found, full), TRUE)) ||
+         (with_extension[fl] && full_path_w(with_extension, full, PATH_CHARS) && is_program_file(full) && (lstrcpyW(found, full), TRUE));
+  } else if (path && *path) {
+    ok = search_list(path, with_extension, found);
   } else {
-    WCHAR candidate[PATH_CHARS];
-    WCHAR with_extension[MAX_PATH];
-    BOOL has_extension = FALSE;
-    for (LPCWSTR c = file; *c; ++c) if (*c == '.') has_extension = TRUE; else if (*c == '\\' || *c == '/') has_extension = FALSE;
-    const size_t_ fl = wcslen(file), el = extension ? wcslen(extension) : 0;
-    if (fl + el + 1 > MAX_PATH) { set_error(ERROR_FILENAME_EXCED_RANGE); return 0; }
-    memcpy(with_extension, file, (fl + 1) * 2);
-    if (!has_extension && el) memcpy(with_extension + fl, extension, (el + 1) * 2);
-    for (LPCWSTR start = path; *start && !ok;) {
-      LPCWSTR end = start;
-      while (*end && *end != ';') ++end;
-      if (end > start && (size_t_)(end - start) < PATH_CHARS) { memcpy(candidate, start, (size_t_)(end - start) * 2); ok = try_candidate(candidate, (size_t_)(end - start), with_extension, found); }
-      start = *end ? end + 1 : end;
+    BOOL bare = TRUE;
+    for (LPCWSTR c = file; *c; ++c) if (*c == '\\' || *c == '/') bare = FALSE;
+    if (bare && (actctx_redirect_key(file, found, PATH_CHARS, FALSE) || (with_extension[fl] && actctx_redirect_key(with_extension, found, PATH_CHARS, FALSE)))) {
+      ok = TRUE;
+    } else {
+      PWSTR list = NULL;
+      if (NT_SUCCESS(RtlGetSearchPath(&list))) {
+        ok = search_list(list, with_extension, found);
+        RtlReleasePath(list);
+      }
     }
   }
   if (!ok) { set_error(ERROR_FILE_NOT_FOUND); return 0; }
@@ -107,7 +140,8 @@ EXPORT DWORD WINAPI SearchPathW(LPCWSTR path, LPCWSTR file, LPCWSTR extension, D
   return n;
 }
 EXPORT DWORD WINAPI SearchPathA(LPCSTR path, LPCSTR file, LPCSTR extension, DWORD capacity, LPSTR buffer, LPSTR *file_part) {
-  WCHAR *wp = path ? to_wide(path) : NULL, *wf = file ? to_wide(file) : NULL, *we = extension ? to_wide(extension) : NULL;
+  if (!file) { set_error(ERROR_INVALID_PARAMETER); return 0; }
+  WCHAR *wp = path ? to_wide(path) : NULL, *wf = to_wide(file), *we = extension ? to_wide(extension) : NULL;
   DWORD result = 0;
   if (wf) {
     WCHAR found[PATH_CHARS];

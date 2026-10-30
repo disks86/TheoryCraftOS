@@ -680,6 +680,7 @@ static LDR_DATA_TABLE_ENTRY *module_by_base(PVOID base) {
 }
 /* A library by name, with or without ".dll", in any case ("KERNEL32", "kernel32.dll"). */
 static BOOL actctx_redirect(LPCWSTR name, WCHAR *out, DWORD capacity);
+static BOOL actctx_redirect_key(LPCWSTR name, WCHAR *out, DWORD capacity, BOOL append_dll);
 static LDR_DATA_TABLE_ENTRY *module_by_name(LPCWSTR name) {
   PEB_LDR_DATA *ldr = NtCurrentPeb()->Ldr;
   if (!ldr) return NULL;
@@ -2091,6 +2092,9 @@ static BOOL find_file(LPCWSTR name, LPCWSTR extension, LPCWSTR extra, WCHAR *out
 NTSTATUS NTAPI LdrAddDllDirectory(PUNICODE_STRING directory, PVOID *cookie);
 NTSTATUS NTAPI LdrRemoveDllDirectory(PVOID cookie);
 NTSTATUS NTAPI LdrGetDllPath(PCWSTR name, ULONG flags, PWSTR *path, PWSTR *unused);
+NTSTATUS NTAPI LdrSetDefaultDllDirectories(ULONG flags);
+NTSTATUS NTAPI RtlSetSearchPathMode(ULONG flags);
+NTSTATUS NTAPI RtlGetSearchPath(PWSTR *path);
 VOID NTAPI RtlReleasePath(PWSTR path);
 
 EXPORT PVOID WINAPI AddDllDirectory(LPCWSTR directory) {
@@ -2111,6 +2115,7 @@ EXPORT BOOL WINAPI RemoveDllDirectory(PVOID cookie) {
 EXPORT BOOL WINAPI SetDefaultDllDirectories(DWORD flags) {
   if (flags == 0 || (flags & ~0x1F00u) || (flags & 0x100)) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
   g_default_dll_dirs = flags;
+  LdrSetDefaultDllDirectories(flags);
   return TRUE;
 }
 
@@ -2945,13 +2950,20 @@ static DWORD dosdev_redirect(WCHAR *buffer, DWORD length, DWORD capacity);
 static BOOL volume_nt_name(LPCWSTR dos, WCHAR *buffer, DWORD capacity, DWORD *length);
 
 /* The NT name ("\??\C:\dir\file") for a Win32 path, and an OBJECT_ATTRIBUTES for it. `buffer` needs PATH_CHARS + 8 characters. */
-static BOOL nt_name(LPCWSTR dos, WCHAR *buffer, UNICODE_STRING *name, OBJECT_ATTRIBUTES *attributes) {
+static BOOL expand_short_names(WCHAR *path, DWORD length, DWORD capacity, DWORD *new_length);
+static int has_tilde(const WCHAR *s) { for (; *s; ++s) if (*s == '~') return 1; return 0; }
+static BOOL nt_name_ex(LPCWSTR dos, WCHAR *buffer, UNICODE_STRING *name, OBJECT_ATTRIBUTES *attributes, int expand) {
   DWORD total = 0;
   if (!volume_nt_name(dos, buffer, PATH_CHARS + 8, &total)) {
     buffer[0] = '\\'; buffer[1] = '?'; buffer[2] = '?'; buffer[3] = '\\';
     const DWORD n = full_path_w(dos, buffer + 4, PATH_CHARS);
     if (n == 0) return FALSE;
     total = n + 4;
+    if (expand && has_tilde(buffer + 4)) {      /* a component may be the 8.3 alias of a longer name */
+      DWORD expanded = n;
+      if (!expand_short_names(buffer + 4, n, PATH_CHARS, &expanded)) return FALSE;
+      total = expanded + 4;
+    }
   }
   total = dosdev_redirect(buffer, total, PATH_CHARS + 8);
   if (total == 0) { set_error(ERROR_FILENAME_EXCED_RANGE); return FALSE; }
@@ -2966,9 +2978,20 @@ static BOOL nt_name(LPCWSTR dos, WCHAR *buffer, UNICODE_STRING *name, OBJECT_ATT
   return TRUE;
 }
 
+static BOOL nt_name(LPCWSTR dos, WCHAR *buffer, UNICODE_STRING *name, OBJECT_ATTRIBUTES *attributes) { return nt_name_ex(dos, buffer, name, attributes, 1); }
+
+/* full_path_w for GetFullPathName: a path written with a trailing separator ("dir\\") keeps it (the NT names do without). */
+static DWORD full_path_keep_slash(LPCWSTR path, WCHAR *full, DWORD capacity) {
+  DWORD n = full_path_w(path, full, capacity - 1);
+  if (n == 0) return 0;
+  const size_t_ length = wcslen(path);
+  if (length > 0 && is_separator(path[length - 1]) && full[n - 1] != '\\') { full[n++] = '\\'; full[n] = 0; }
+  return n;
+}
+
 EXPORT DWORD WINAPI GetFullPathNameW(LPCWSTR path, DWORD capacity, LPWSTR buffer, LPWSTR *file_part) {
   WCHAR full[PATH_CHARS];
-  const DWORD n = full_path_w(path, full, PATH_CHARS);
+  const DWORD n = full_path_keep_slash(path, full, PATH_CHARS);
   if (n == 0) return 0;
   if (n + 1 > capacity) return n + 1;
   memcpy(buffer, full, (n + 1) * 2);
@@ -2983,7 +3006,7 @@ EXPORT DWORD WINAPI GetFullPathNameA(LPCSTR path, DWORD capacity, LPSTR buffer, 
   WCHAR *w = to_wide(path);
   if (!w) return 0;
   WCHAR full[PATH_CHARS];
-  const DWORD n = full_path_w(w, full, PATH_CHARS);
+  const DWORD n = full_path_keep_slash(w, full, PATH_CHARS);
   free_wide(w);
   if (n == 0) return 0;
   const DWORD r = wide_result_to_ansi(full, n, buffer, capacity);
@@ -2994,9 +3017,6 @@ EXPORT DWORD WINAPI GetFullPathNameA(LPCSTR path, DWORD capacity, LPSTR buffer, 
   }
   return r;
 }
-EXPORT DWORD WINAPI GetLongPathNameW(LPCWSTR path, LPWSTR buffer, DWORD capacity) { return GetFullPathNameW(path, capacity, buffer, NULL); }
-EXPORT DWORD WINAPI GetLongPathNameA(LPCSTR path, LPSTR buffer, DWORD capacity) { return GetFullPathNameA(path, capacity, buffer, NULL); }
-EXPORT DWORD WINAPI GetShortPathNameW(LPCWSTR path, LPWSTR buffer, DWORD capacity) { return GetFullPathNameW(path, capacity, buffer, NULL); }
 
 EXPORT DWORD WINAPI GetCurrentDirectoryW(DWORD capacity, LPWSTR buffer) {
   size_t_ length = 0;
@@ -3114,16 +3134,42 @@ EXPORT UINT WINAPI GetWindowsDirectoryA(LPSTR buffer, UINT capacity) {
   memcpy(buffer, "C:\\Windows", 11);
   return 10;
 }
+/* The temporary directory as a full path with a trailing backslash: TMP, TEMP, USERPROFILE, in that order (C:\\Temp\\ if none is set). 0 if it is too long. */
+static DWORD temp_path_w(WCHAR *result) {
+  static const WCHAR kTmp[] = {'T', 'M', 'P', 0}, kTemp[] = {'T', 'E', 'M', 'P', 0}, kProfile[] = {'U', 'S', 'E', 'R', 'P', 'R', 'O', 'F', 'I', 'L', 'E', 0};
+  static const WCHAR kDefault[] = {'C', ':', '\\', 'T', 'e', 'm', 'p', 0};
+  const WCHAR *const names[3] = {kTmp, kTemp, kProfile};
+  WCHAR value[PATH_CHARS];
+  DWORD n = 0;
+  for (int i = 0; i < 3 && n == 0; ++i) {
+    n = GetEnvironmentVariableW(names[i], value, PATH_CHARS);
+    if (n >= PATH_CHARS) n = 0;
+  }
+  if (n == 0) memcpy(value, kDefault, sizeof(kDefault));
+  n = full_path_w(value, result, MAX_PATH);
+  if (n == 0 || n > MAX_PATH - 2) { set_error(ERROR_FILENAME_EXCED_RANGE); return 0; }
+  if (result[n - 1] != '\\') { result[n++] = '\\'; result[n] = 0; }
+  return n;
+}
+/* A buffer that is too small is emptied (as far as it goes) and the call returns the size needed; otherwise the buffer is zeroed after the path up to 32767 characters. */
 EXPORT DWORD WINAPI GetTempPathW(DWORD capacity, LPWSTR buffer) {
-  static const WCHAR kPath[] = {'C', ':', '\\', 'T', 'e', 'm', 'p', '\\', 0};
-  if (capacity < 9) return 9;
-  memcpy(buffer, kPath, sizeof(kPath));
-  return 8;
+  WCHAR path[MAX_PATH + 2];
+  const DWORD n = temp_path_w(path);
+  if (n == 0) return 0;
+  if (capacity < n + 1) {
+    if (buffer && capacity) memset(buffer, 0, (size_t_)capacity * 2);
+    return n + 1;
+  }
+  memcpy(buffer, path, (n + 1) * 2);
+  const DWORD end = capacity < 32767 ? capacity : 32767;
+  if (end > n + 1) memset(buffer + n + 1, 0, (size_t_)(end - (n + 1)) * 2);
+  return n;
 }
 EXPORT DWORD WINAPI GetTempPathA(DWORD capacity, LPSTR buffer) {
-  if (capacity < 9) return 9;
-  memcpy(buffer, "C:\\Temp\\", 9);
-  return 8;
+  WCHAR path[MAX_PATH + 2];
+  const DWORD n = temp_path_w(path);
+  if (n == 0) return 0;
+  return wide_result_to_ansi(path, n, buffer, capacity);      /* (a buffer that is too small is left alone) */
 }
 
 /* ---- files ----------------------------------------------------------------------------------------------------------------------------------------------- */
@@ -3714,7 +3760,8 @@ static void fill_find_data(const BYTE *record, WIN32_FIND_DATAW *data) {
   data->cFileName[units] = 0;
 }
 
-EXPORT HANDLE WINAPI FindFirstFileW(LPCWSTR path, LPWIN32_FIND_DATAW data) {
+/* `expand` says whether 8.3 aliases in the directory part are turned into the long names (the 8.3 code itself lists directories without that). */
+static HANDLE find_first_impl(LPCWSTR path, LPWIN32_FIND_DATAW data, int expand) {
   if (!path) { set_error(ERROR_PATH_NOT_FOUND); return INVALID_HANDLE_VALUE; }
   /* The pattern is what follows the last separator of the path as it was written: normalising the whole path would take trailing dots and spaces off it, and those
    * mean something in a pattern ("*." is the names without an extension). */
@@ -3741,7 +3788,7 @@ EXPORT HANDLE WINAPI FindFirstFileW(LPCWSTR path, LPWIN32_FIND_DATAW data) {
   WCHAR buffer[PATH_CHARS + 8];
   UNICODE_STRING name;
   OBJECT_ATTRIBUTES attributes;
-  if (!nt_name(full, buffer, &name, &attributes)) { RtlFreeHeap(heap(), 0, f); return INVALID_HANDLE_VALUE; }
+  if (!nt_name_ex(full, buffer, &name, &attributes, expand)) { RtlFreeHeap(heap(), 0, f); return INVALID_HANDLE_VALUE; }
   IO_STATUS_BLOCK iosb;
   const NTSTATUS status = NtOpenFile(&f->directory, FILE_LIST_DIRECTORY_ | SYNCHRONIZE, &attributes, &iosb, 7, FILE_DIRECTORY_FILE_ | FILE_SYNCHRONOUS_IO_NONALERT_);
   if (!NT_SUCCESS(status)) {
@@ -3767,6 +3814,7 @@ EXPORT HANDLE WINAPI FindFirstFileW(LPCWSTR path, LPWIN32_FIND_DATAW data) {
   fill_find_data(record, data);
   return f;
 }
+EXPORT HANDLE WINAPI FindFirstFileW(LPCWSTR path, LPWIN32_FIND_DATAW data) { return find_first_impl(path, data, 1); }
 EXPORT HANDLE WINAPI FindFirstFileExW(LPCWSTR path, int level, LPVOID data, int search_op, LPVOID filter, DWORD flags) {
   (void)level; (void)search_op; (void)filter; (void)flags;
   return FindFirstFileW(path, data);
@@ -3810,6 +3858,314 @@ EXPORT BOOL WINAPI FindNextFileA(HANDLE h, LPWIN32_FIND_DATAA data) {
   if (!FindNextFileW(h, &wide)) return FALSE;
   find_data_to_ansi(&wide, data);
   return TRUE;
+}
+
+/* ---- 8.3 names -------------------------------------------------------------------------------------------------------------------------------------------- */
+
+/* The file systems keep no 8.3 names, so they are made up: a name that is not a legal 8.3 name gets "BASE~N.EXT" where N counts the names with the same BASE (6 letters)
+ * and EXT (3 letters) that the directory lists before it. The same listing gives the same names, and a path with an alias in it can be turned back into the long one. */
+typedef struct { WCHAR base[7]; WCHAR ext[4]; } ShortKey;
+
+static BOOL name_is_8dot3(const WCHAR *name, size_t_ length) {
+  if (length == 0) return FALSE;
+  if (name[0] == '.' && (length == 1 || (length == 2 && name[1] == '.'))) return TRUE;
+  size_t_ base = 0, ext = 0;
+  BOOL dot = FALSE;
+  for (size_t_ i = 0; i < length; ++i) {
+    const WCHAR c = name[i];
+    if (c == '.') { if (dot || i == 0) return FALSE; dot = TRUE; continue; }
+    if (c <= ' ' || c >= 0x7F) return FALSE;
+    for (const char *bad = "\"*+,/:;<=>?[\\]|"; *bad; ++bad) if (c == (WCHAR)*bad) return FALSE;
+    if (dot) ++ext; else ++base;
+  }
+  return base <= 8 && ext <= 3 && (!dot || ext > 0);
+}
+
+/* The part of a name that its alias is made of: the first letters of the base and of the extension, upper case, spaces and dots left out, odd characters as '_'. */
+static void short_key(const WCHAR *name, size_t_ length, ShortKey *key) {
+  size_t_ last_dot = length;
+  for (size_t_ i = 1; i < length; ++i) if (name[i] == '.') last_dot = i;
+  size_t_ b = 0, e = 0;
+  for (size_t_ i = 0; i < length; ++i) {
+    WCHAR c = name[i];
+    if (c == ' ' || c == '.') continue;
+    if (c <= ' ' || c >= 0x7F) c = '_';
+    else { for (const char *bad = "\"*+,/:;<=>?[\\]|"; *bad; ++bad) if (c == (WCHAR)*bad) c = '_'; }
+    c = upper(c);
+    if (i > last_dot) { if (e < 3) key->ext[e++] = c; }
+    else if (b < 6) key->base[b++] = c;
+  }
+  key->base[b] = 0;
+  key->ext[e] = 0;
+}
+
+static BOOL wide_equal_ci(const WCHAR *a, size_t_ a_length, const WCHAR *b, size_t_ b_length) {
+  if (a_length != b_length) return FALSE;
+  for (size_t_ i = 0; i < a_length; ++i) if (upper(a[i]) != upper(b[i])) return FALSE;
+  return TRUE;
+}
+
+/* A listing of the directory written as `dir` (it ends in a separator or ':', or is empty for the current directory). */
+static HANDLE scan_open(const WCHAR *dir, size_t_ dir_length, WIN32_FIND_DATAW *data) {
+  WCHAR pattern[PATH_CHARS];
+  if (dir_length + 2 > PATH_CHARS) { set_error(ERROR_FILENAME_EXCED_RANGE); return INVALID_HANDLE_VALUE; }
+  memcpy(pattern, dir, dir_length * 2);
+  pattern[dir_length] = '*';
+  pattern[dir_length + 1] = 0;
+  return find_first_impl(pattern, data, 0);
+}
+
+/* The alias of the file `name` in the directory `dir`. */
+static BOOL short_alias(const WCHAR *dir, size_t_ dir_length, const WCHAR *name, WCHAR *alias) {
+  const size_t_ length = wcslen(name);
+  if (name_is_8dot3(name, length)) { memcpy(alias, name, (length + 1) * 2); return TRUE; }
+  ShortKey want;
+  short_key(name, length, &want);
+  DWORD rank = 1;
+  WIN32_FIND_DATAW data;
+  HANDLE h = scan_open(dir, dir_length, &data);
+  if (h != INVALID_HANDLE_VALUE) {
+    do {
+      if (lstrcmpW(data.cFileName, name) == 0) break;
+      const size_t_ other_length = wcslen(data.cFileName);
+      if (name_is_8dot3(data.cFileName, other_length)) continue;
+      ShortKey other;
+      short_key(data.cFileName, other_length, &other);
+      if (lstrcmpW(other.base, want.base) == 0 && lstrcmpW(other.ext, want.ext) == 0) ++rank;
+    } while (FindNextFileW(h, &data));
+    FindClose(h);
+  }
+  WCHAR digits[12];
+  size_t_ digit_count = 0;
+  for (DWORD r = rank; r; r /= 10) digits[digit_count++] = (WCHAR)('0' + r % 10);
+  size_t_ base_length = wcslen(want.base);
+  if (base_length + 1 + digit_count > 8) base_length = 8 - 1 - digit_count;
+  size_t_ n = 0;
+  memcpy(alias, want.base, base_length * 2);
+  n = base_length;
+  alias[n++] = '~';
+  while (digit_count) alias[n++] = digits[--digit_count];
+  if (want.ext[0]) {
+    alias[n++] = '.';
+    for (size_t_ i = 0; want.ext[i]; ++i) alias[n++] = want.ext[i];
+  }
+  alias[n] = 0;
+  return TRUE;
+}
+
+/* Finds the file `comp` in the directory `dir`: by its name, or as an alias ("BASE~N.EXT") of one. `by_alias` says which. */
+static BOOL find_entry(const WCHAR *dir, size_t_ dir_length, const WCHAR *comp, size_t_ comp_length, WIN32_FIND_DATAW *found, BOOL *by_alias) {
+  /* the alias pattern: BASE ~ digits [. EXT] */
+  size_t_ tilde = comp_length;
+  for (size_t_ i = 0; i < comp_length; ++i) if (comp[i] == '~') tilde = i;
+  size_t_ digits_end = tilde + 1;
+  DWORD rank = 0;
+  while (tilde < comp_length && digits_end < comp_length && comp[digits_end] >= '0' && comp[digits_end] <= '9' && rank < 100000) { rank = rank * 10 + (DWORD)(comp[digits_end] - '0'); ++digits_end; }
+  BOOL pattern = tilde > 0 && tilde < comp_length && digits_end > tilde + 1 && rank > 0 && tilde <= 6 && (digits_end == comp_length || comp[digits_end] == '.');
+  const WCHAR *ext = comp + digits_end + 1;
+  size_t_ ext_length = pattern && digits_end < comp_length ? comp_length - digits_end - 1 : 0;
+  if (pattern && ext_length > 3) pattern = FALSE;
+  WIN32_FIND_DATAW data, candidate;
+  BOOL have_candidate = FALSE;
+  DWORD count = 0;
+  HANDLE h = scan_open(dir, dir_length, &data);
+  if (h == INVALID_HANDLE_VALUE) return FALSE;
+  do {
+    const size_t_ length = wcslen(data.cFileName);
+    if (wide_equal_ci(data.cFileName, length, comp, comp_length)) { *found = data; *by_alias = FALSE; FindClose(h); return TRUE; }
+    if (!pattern || have_candidate || name_is_8dot3(data.cFileName, length)) continue;
+    ShortKey key;
+    short_key(data.cFileName, length, &key);
+    size_t_ base_length = wcslen(key.base);
+    const size_t_ digit_count = digits_end - tilde - 1;
+    if (base_length + 1 + digit_count > 8) base_length = 8 - 1 - digit_count;
+    if (base_length != tilde || !wide_equal_ci(key.base, base_length, comp, tilde) || !wide_equal_ci(key.ext, wcslen(key.ext), ext, ext_length)) continue;
+    if (++count == rank) { candidate = data; have_candidate = TRUE; }
+  } while (FindNextFileW(h, &data));
+  FindClose(h);
+  if (!have_candidate) return FALSE;
+  *found = candidate;
+  *by_alias = TRUE;
+  return TRUE;
+}
+
+/* The full path `path` ("C:\a\b", `length` characters, room for `capacity`) with the 8.3 aliases in it replaced by the long names. */
+static BOOL expand_short_names(WCHAR *path, DWORD length, DWORD capacity, DWORD *new_length) {
+  DWORD at = 0;
+  while (at < length) {
+    DWORD start = at, end = at;
+    while (start < length && path[start] == '\\') ++start;
+    end = start;
+    while (end < length && path[end] != '\\') ++end;
+    if (end == start) break;
+    at = end;
+    BOOL tilde = FALSE;
+    for (DWORD i = start; i < end; ++i) if (path[i] == '~') tilde = TRUE;
+    if (!tilde || start < 3) continue;      /* (the drive is no component) */
+    WIN32_FIND_DATAW found;
+    BOOL by_alias = FALSE;
+    if (!find_entry(path, start, path + start, end - start, &found, &by_alias) || !by_alias) continue;
+    const DWORD long_length = (DWORD)wcslen(found.cFileName);
+    if (long_length > capacity || length - (end - start) > capacity - long_length - 1) { set_error(ERROR_FILENAME_EXCED_RANGE); return FALSE; }
+    memmove(path + start + long_length, path + end, (length - end + 1) * 2);
+    memcpy(path + start, found.cFileName, long_length * 2);
+    length = length - (end - start) + long_length;
+    at = start + long_length;
+  }
+  *new_length = length;
+  return TRUE;
+}
+
+/* GetLongPathName and GetShortPathName work on the path as it is written: the separators, "." and ".." stay, a relative path stays relative, and each of the other components
+ * is looked up in the directory before it. A long name that is given in its long form keeps the case it was written in. */
+static DWORD convert_path(LPCWSTR in, LPWSTR out, DWORD capacity, int to_short) {
+  if (!in) { set_error(ERROR_INVALID_PARAMETER); return 0; }
+  if (!*in) { set_error(ERROR_PATH_NOT_FOUND); return 0; }
+  WCHAR result[PATH_CHARS], lookup[PATH_CHARS];      /* the path as it is returned, and the same with real names for the directory listings */
+  size_t_ r = 0, l = 0, sp = 0;
+  const size_t_ in_length = wcslen(in);
+  const BOOL prefixed = in_length >= 4 && in[0] == '\\' && in[1] == '\\' && in[2] == '?' && in[3] == '\\';
+  if (!prefixed && in_length >= MAX_PATH) { set_error(ERROR_PATH_NOT_FOUND); return 0; }
+  if (in_length + 2 > PATH_CHARS) { set_error(ERROR_FILENAME_EXCED_RANGE); return 0; }
+  if (prefixed) {
+    memcpy(result, in, 4 * 2); memcpy(lookup, in, 4 * 2);
+    r = l = sp = 4;
+  } else if (in[0] == '\\' && in[1] == '\\') {      /* \\computer\X$\...: the drive X of this computer; any other UNC path is returned as it is */
+    WCHAR name[16];
+    DWORD name_length = 16;
+    size_t_ host = 2;
+    while (in[host] && in[host] != '\\') ++host;
+    if (!GetComputerNameW(name, &name_length) || !wide_equal_ci(in + 2, host - 2, name, name_length) || in[host] != '\\' ||
+        !(((in[host + 1] >= 'A' && in[host + 1] <= 'Z') || (in[host + 1] >= 'a' && in[host + 1] <= 'z')) && in[host + 2] == '$' && (in[host + 3] == 0 || in[host + 3] == '\\'))) {
+      if (in_length + 1 > capacity) return (DWORD)in_length + 1;
+      memcpy(out, in, (in_length + 1) * 2);
+      return (DWORD)in_length;
+    }
+    memcpy(result, in, (host + 3) * 2);
+    r = host + 3;
+    lookup[0] = in[host + 1]; lookup[1] = ':';
+    l = 2;
+    sp = host + 3;
+  }
+  if (((in[sp] >= 'A' && in[sp] <= 'Z') || (in[sp] >= 'a' && in[sp] <= 'z')) && in[sp + 1] == ':' && (sp == 0 || sp == 4)) {
+    result[r++] = lookup[l++] = in[sp++];
+    result[r++] = lookup[l++] = in[sp++];
+  }
+  for (size_t_ i = sp; in[i]; ++i) if (in[i] == '*' || in[i] == '?') { set_error(ERROR_INVALID_NAME); return 0; }
+  while (in[sp]) {
+    if (is_separator(in[sp])) { result[r++] = lookup[l++] = in[sp++]; continue; }
+    size_t_ end = sp;
+    while (in[end] && !is_separator(in[end])) ++end;
+    const size_t_ length = end - sp;
+    if (length >= MAX_PATH) { set_error(ERROR_FILENAME_EXCED_RANGE); return 0; }
+    if ((length == 1 && in[sp] == '.') || (length == 2 && in[sp] == '.' && in[sp + 1] == '.')) {
+      memcpy(result + r, in + sp, length * 2); r += length;
+      memcpy(lookup + l, in + sp, length * 2); l += length;
+      sp = end;
+      continue;
+    }
+    WIN32_FIND_DATAW found;
+    BOOL by_alias = FALSE;
+    if (!find_entry(lookup, l, in + sp, length, &found, &by_alias)) { set_error(ERROR_FILE_NOT_FOUND); return 0; }
+    const WCHAR *text = found.cFileName;
+    size_t_ text_length = wcslen(text);
+    WCHAR alias[16];
+    if (to_short) {
+      short_alias(lookup, l, found.cFileName, alias);
+      text = alias;
+      text_length = wcslen(alias);
+    } else if (!by_alias && !name_is_8dot3(found.cFileName, text_length)) {
+      text = in + sp;      /* (a long name as it was written) */
+      text_length = length;
+    }
+    const size_t_ real_length = wcslen(found.cFileName);
+    if (r + text_length + 2 > PATH_CHARS || l + real_length + 2 > PATH_CHARS) { set_error(ERROR_FILENAME_EXCED_RANGE); return 0; }
+    memcpy(result + r, text, text_length * 2); r += text_length;
+    memcpy(lookup + l, found.cFileName, real_length * 2); l += real_length;
+    sp = end;
+  }
+  result[r] = 0;
+  if (!out || r + 1 > capacity) return (DWORD)r + 1;      /* (without a buffer it is the size needed, whatever the size says) */
+  memcpy(out, result, (r + 1) * 2);
+  return (DWORD)r;
+}
+static DWORD convert_path_a(LPCSTR path, LPSTR buffer, DWORD capacity, int to_short) {
+  if (!path) { set_error(ERROR_INVALID_PARAMETER); return 0; }
+  WCHAR *w = to_wide(path);
+  if (!w) return 0;
+  WCHAR result[PATH_CHARS];
+  const DWORD n = convert_path(w, result, PATH_CHARS, to_short);
+  free_wide(w);
+  if (n == 0 || n >= PATH_CHARS) return n;
+  return wide_result_to_ansi(result, n, buffer, buffer ? capacity : 0);
+}
+EXPORT DWORD WINAPI GetLongPathNameW(LPCWSTR path, LPWSTR buffer, DWORD capacity) { return convert_path(path, buffer, capacity, 0); }
+EXPORT DWORD WINAPI GetLongPathNameA(LPCSTR path, LPSTR buffer, DWORD capacity) { return convert_path_a(path, buffer, capacity, 0); }
+EXPORT DWORD WINAPI GetShortPathNameW(LPCWSTR path, LPWSTR buffer, DWORD capacity) { return convert_path(path, buffer, capacity, 1); }
+EXPORT DWORD WINAPI GetShortPathNameA(LPCSTR path, LPSTR buffer, DWORD capacity) { return convert_path_a(path, buffer, capacity, 1); }
+
+/* Is `name` a legal 8.3 name for CheckNameLegalDOS8Dot3: a base of up to 8 characters, one dot and up to 3 characters of extension, none of the characters a file name cannot
+ * have (spaces are allowed, and said so). The empty name counts as legal. */
+static BOOL check_8dot3(const WCHAR *name, BOOL *spaces) {
+  *spaces = FALSE;
+  size_t_ base = 0, ext = 0;
+  BOOL dot = FALSE;
+  const size_t_ length = wcslen(name);
+  if (length == 0) return TRUE;
+  if (name[0] == '.' && (length == 1 || (length == 2 && name[1] == '.'))) return TRUE;
+  for (size_t_ i = 0; i < length; ++i) {
+    const WCHAR c = name[i];
+    if (c == '.') { if (dot || i == 0) return FALSE; dot = TRUE; continue; }
+    if (c < ' ' || c >= 0x7F) return FALSE;
+    for (const char *bad = "\"*+,/:;<=>?[\\]|"; *bad; ++bad) if (c == (WCHAR)*bad) return FALSE;
+    if (c == ' ') *spaces = TRUE;
+    if (dot) ++ext; else ++base;
+  }
+  return base <= 8 && ext <= 3;
+}
+EXPORT BOOL WINAPI CheckNameLegalDOS8Dot3W(LPCWSTR name, LPSTR oem_name, DWORD oem_length, BOOL *contains_spaces, BOOL *is_legal) {
+  if (!name || !is_legal) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  BOOL spaces = FALSE;
+  *is_legal = check_8dot3(name, &spaces);
+  if (*is_legal && oem_name && oem_length) {      /* (the name in the OEM code page, upper case: as far as it fits) */
+    const size_t_ length = wcslen(name);
+    if (length + 1 > oem_length) *is_legal = FALSE;
+    else { for (size_t_ i = 0; i < length; ++i) oem_name[i] = (char)upper(name[i]); oem_name[length] = 0; }
+  }
+  if (contains_spaces) *contains_spaces = spaces;
+  return TRUE;
+}
+EXPORT BOOL WINAPI CheckNameLegalDOS8Dot3A(LPCSTR name, LPSTR oem_name, DWORD oem_length, BOOL *contains_spaces, BOOL *is_legal) {
+  if (!name || !is_legal) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  WCHAR *w = to_wide(name);
+  if (!w) return FALSE;
+  const BOOL ok = CheckNameLegalDOS8Dot3W(w, oem_name, oem_length, contains_spaces, is_legal);
+  free_wide(w);
+  return ok;
+}
+
+/* Does a program that is started by this name also look in the current folder? Not when NoDefaultCurrentDirectoryInExePath is set, unless the name has a path. */
+EXPORT BOOL WINAPI NeedCurrentDirectoryForExePathW(LPCWSTR name) {
+  static const WCHAR kVariable[] = {'N', 'o', 'D', 'e', 'f', 'a', 'u', 'l', 't', 'C', 'u', 'r', 'r', 'e', 'n', 't', 'D', 'i', 'r', 'e', 'c', 't', 'o', 'r', 'y', 'I', 'n', 'E', 'x', 'e', 'P', 'a', 't', 'h', 0};
+  for (LPCWSTR c = name; *c; ++c) if (*c == '\\') return TRUE;
+  WCHAR value[8];
+  const DWORD saved = GetLastError();
+  const BOOL set = GetEnvironmentVariableW(kVariable, value, 8) != 0 || GetLastError() != ERROR_ENVVAR_NOT_FOUND;
+  set_error(saved);
+  return !set;
+}
+EXPORT BOOL WINAPI NeedCurrentDirectoryForExePathA(LPCSTR name) {
+  WCHAR *w = to_wide(name);
+  if (!w) return TRUE;
+  const BOOL need = NeedCurrentDirectoryForExePathW(w);
+  free_wide(w);
+  return need;
+}
+EXPORT BOOL WINAPI SetSearchPathMode(DWORD flags) {
+  const NTSTATUS status = RtlSetSearchPathMode(flags);
+  if (NT_SUCCESS(status)) return TRUE;
+  set_error(status == STATUS_ACCESS_DENIED ? ERROR_ACCESS_DENIED : ERROR_INVALID_PARAMETER);
+  return FALSE;
 }
 
 /* ---- error texts ---------------------------------------------------------------------------------------------------------------------------------------- */
