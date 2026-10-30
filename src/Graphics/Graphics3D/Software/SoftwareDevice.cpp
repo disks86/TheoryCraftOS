@@ -197,6 +197,16 @@ class SoftwareImage final : public IImage {
   }
   // What a pixel of this image keeps of a colour (WidePixels.hpp).
   Vec4 store_float(Vec4 c) const { return quantize_wide_pixel(desc_.format, c); }
+  bool write_rect(const Rect2D& area, ArrayView<const uint32_t> pixels, uint32_t pitch) override {
+    if (color_.empty() || desc_.samples != 1 || !area.width || !area.height || pitch < area.width) return false;
+    const Extent2D e = desc_.extent;
+    if (uint64_t{static_cast<uint32_t>(area.x < 0 ? -1 : area.x)} + area.width > e.width || area.x < 0 || area.y < 0 || uint64_t{static_cast<uint32_t>(area.y)} + area.height > e.height) return false;
+    if (pixels.size() < uint64_t{area.height - 1} * pitch + area.width) return false;
+    const Surface s = surface(0);
+    for (uint32_t j = 0; j < area.height; ++j)
+      for (uint32_t i = 0; i < area.width; ++i) s.pixels[uint64_t{static_cast<uint32_t>(area.y) + j} * s.pitch + static_cast<uint32_t>(area.x) + i] = s.encode(pixels[uint64_t{j} * pitch + i]);
+    return true;
+  }
   bool write_mip_pixels(uint32_t level, ArrayView<const uint32_t> pixels) override {
     if (color_.empty() || level >= desc_.mip_levels) return false;
     const Surface s = surface(level);

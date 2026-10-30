@@ -222,6 +222,19 @@ int glyphs_check(IGraphicsDevice& device, allocators::IAllocator& allocator) {
     ok = near(at(5, 5), 0xFFFF0000) && near(at(21, 5), 0xFF00FF00) && near(at(8, 5), 0xFF7F0028 /* half red over (0,0,80) */) && near(at(10, 5), 0xFF000050) &&
          near(at(37, 5), 0xFFFFFFFF) && near(at(37, 21), 0xFF808080) && near(at(40, 21), 0xFF404040) && near(at(43, 21), 0xFF000000);
   }
+  // a second glyph later: only its rectangle goes to the device (an update of part of the atlas), and the first one is still right
+  if (ok) {
+    const uint64_t sent = r.atlas_pixels_sent();
+    uint8_t cov2[8 * 8];
+    for (uint32_t k = 0; k < 64; ++k) cov2[k] = (k / 8) < 4 ? 255 : 0;
+    r.draw_glyph(78, MaskView{ConstByteView(cov2, sizeof cov2), 8, 8, 8}, 44, 36, rgb(255, 255, 0));
+    r.draw_glyph(77, m, 4, 20, rgb(0, 128, 255));   // (the first again: not sent again)
+    ok = r.read_pixels(px) && r.atlas_pixels_sent() == sent + 64;
+    if (ok) {
+      auto at = [&](uint32_t x, uint32_t y) { return px[y * W + x]; };
+      ok = (at(45, 37) & 0xFFFFFF) == 0xFFFF00 && (at(45, 42) & 0xFFFFFF) == 0x000000 && (at(5, 5) & 0xFFFFFF) == 0xFF0000 && (at(5, 21) & 0xFFFFFF) == 0x0080FF;
+    }
+  }
   release_view(allocator, px);
   return ok ? 1 : 0;
 }
