@@ -39,6 +39,8 @@
 #include "Hardware/WirelessInterface/Intel/IwlInit.hpp"
 #include "Hardware/WirelessInterface/Intel/IwlDriver.hpp"
 #include "Hardware/WirelessInterface/Intel/IwlScan.hpp"
+#include "Hardware/WirelessInterface/Intel/IwlLink.hpp"
+#include "Hardware/WirelessInterface/Ieee80211Frames.hpp"
 #include "Hardware/WirelessInterface/Intel/IwlPcie.hpp"
 
 namespace hardware {
@@ -256,6 +258,8 @@ struct FakeIwl final : IIwlRegisters {
   std::vector<Transfer> transfers;
   std::map<uint32_t, uint8_t> device_memory;
   std::function<void()> on_alive, on_doorbell;
+  std::function<void(uint32_t)> on_queue_doorbell;
+  uint32_t queue_wrptr[32] = {};
   bool force_radio = false;
   bool w1c = false, fail_transfers = false, cpu_released = false, alive_never = false, extended_during = false;
 
@@ -295,7 +299,12 @@ struct FakeIwl final : IIwlRegisters {
     }
     if (offset == iwl_fh::kUcodeLoadStatus && value == 0xFFFFFFFFu && cpu_released && !alive_never) { regs[iwl_csr::kInt / 4] |= iwl_csr::kIntBitAlive; if (on_alive) on_alive(); }
     if (offset == iwl_tx::kHbusTargWrptr) {
-      if (((value >> 8) & 0xFF) != 0) return;                       // another queue's pointer: not the command queue's doorbell
+      if (((value >> 8) & 0xFF) != 0) {                             // another queue's pointer: not the command queue's doorbell
+        const uint32_t q = (value >> 8) & 0x1F;
+        queue_wrptr[q] = value & 0xFF;
+        if (on_queue_doorbell) on_queue_doorbell(q);
+        return;
+      }
       regs[offset / 4] = value;
       if (on_doorbell) on_doorbell();
       return;
@@ -399,7 +408,7 @@ static Bytes make_loadable_firmware(uint32_t big_size, bool scan_tlvs = false) {
     tlv(f, 29, u32s({1, 0x00000405}));                           // APIs 32, 34, 42
     tlv(f, 30, u32s({0, 0x00001000}));                           // capability 12 (DQA)
     tlv(f, 31, u32s({20}));                                      // 20 scan channel slots
-    tlv(f, 48, Bytes{0x18, 0, 10, 2, 0x0D, 0, 8, 0});           // ADD_STA version 10, SCAN_REQ_UMAC version 8
+    tlv(f, 48, Bytes{0x18, 0, 10, 2, 0x0D, 0, 8, 0, 0x17, 0, 1, 0, 0x1C, 0, 6, 5, 0x08, 0, 2, 0});   // ADD_STA 10, SCAN_REQ_UMAC 8, ADD_STA_KEY 1, TX_CMD 6, PHY_CONTEXT 2
   }
   tlv(f, 19, section(0x00000000, 16, 0xA1));
   tlv(f, 19, section(0x00040000, 8, 0xA2));                       // in the extended address range
@@ -613,12 +622,13 @@ static void test_rx() {
 struct FakeTxChip {
   FakeIwl& chip;
   uint32_t read = 0;
-  explicit FakeTxChip(FakeIwl& c) : chip(c) {}
-  uint64_t ring_base() { return static_cast<uint64_t>(chip.regs[iwl_tx::cbbc_queue(0) / 4]) << 8; }
+  uint32_t queue = 0;
+  explicit FakeTxChip(FakeIwl& c, uint32_t q = 0) : chip(c), queue(q) {}
+  uint64_t ring_base() { return static_cast<uint64_t>(chip.regs[iwl_tx::cbbc_queue(queue) / 4]) << 8; }
   std::vector<Bytes> process(bool* ok) {
     std::vector<Bytes> out;
     *ok = true;
-    const uint32_t wr = chip.regs[iwl_tx::kHbusTargWrptr / 4] & 0xFF;
+    const uint32_t wr = queue == 0 ? (chip.regs[iwl_tx::kHbusTargWrptr / 4] & 0xFF) : chip.queue_wrptr[queue];
     while (read != wr) {
       const uint8_t* tfd = reinterpret_cast<const uint8_t*>(ring_base()) + read * 128;
       Bytes cmd;
@@ -1095,12 +1105,12 @@ static void test_mvm_builders() {
   CHECK(!iwl_parse_scan_complete(ConstByteView(done, 5), &sc));
 }
 
-static Bytes rx_mpdu(const Bytes& frame, uint8_t channel, uint8_t energy, bool crc_ok) {
+static Bytes rx_mpdu(const Bytes& frame, uint8_t channel, uint8_t energy, bool crc_ok, bool decrypted = false) {
   Bytes b;
   b.push_back(static_cast<uint8_t>(frame.size())); b.push_back(static_cast<uint8_t>(frame.size() >> 8));   // mpdu_len
   b.push_back(0); b.push_back(0); b.push_back(0); b.push_back(0); b.push_back(0); b.push_back(0);
   b.push_back(0); b.push_back(0); b.push_back(0); b.push_back(0);                                     // csum, l3l4
-  put32(b, crc_ok ? 3u : 0u);                                                                         // status
+  put32(b, (crc_ok ? 3u : 0u) | (decrypted ? ((2u << 8) | (1u << 11)) : 0u));                                // status
   put32(b, 0);                                                                                        // reorder
   put32(b, 0); put32(b, 0); put32(b, 0);
   b.push_back(energy); b.push_back(0); b.push_back(channel); b.push_back(0);
@@ -1262,6 +1272,344 @@ static void test_scanner() {
   }
 }
 
+// ---- the station link: contexts, transmit commands, keys, received data ------------------------------------------------------------------------------------------------------------
+
+static void test_link_builders() {
+  uint8_t buf[300];
+  CHECK(iwl_build_phy_context(1, 11, false, 3, 3, ByteView(buf, sizeof buf)) == 36 && buf[4] == 1 && buf[16] == 1 && buf[17] == 11 && buf[18] == 0 && buf[20] == 3);
+  CHECK(buf[24] == 6 && (buf[25] & 0x0C) == 0x08 && (buf[25] & 0x30) == 0x20);                            // valid chains, two in use
+  CHECK(iwl_build_phy_context(1, 36, true, 3, 3, ByteView(buf, sizeof buf)) == 36 && buf[16] == 0 && buf[17] == 36 && iwl_build_phy_context(1, 1, false, 1, 1, ByteView(buf, 35)) == 0);
+  CHECK(iwl_build_binding(1, 0, 2, 3, ByteView(buf, sizeof buf)) == 24 && buf[4] == 1 && buf[8] == 2 && buf[9] == 3 && buf[12] == 0xFF && buf[19] == 0xFF && buf[20] == 0);
+  IwlStationSpec st;
+  st.station_id = 1; st.queue_mask = 0x10; st.association_id = 5; st.modify = true;
+  for (int i = 0; i < 6; ++i) st.address[i] = static_cast<uint8_t>(0xA0 + i);
+  CHECK(iwl_build_add_station(st, ByteView(buf, sizeof buf)) == 48 && buf[0] == 1 && buf[2] == 0xFF && buf[8] == 0xA0 && buf[16] == 1 && buf[35] == 0 && buf[36] == 5 && buf[40] == 0x10 && buf[24] == 0x00);
+  CHECK((buf[27] & 0x30) == 0x30 && (buf[26] & 0x0C) == 0x00);                                            // flags mask: the 20 MHz / MIMO fields and RTS protection (bit 17)
+  uint8_t key[16], rsc[8] = {1, 2, 3, 4, 5, 6, 0, 0};
+  for (int i = 0; i < 16; ++i) key[i] = static_cast<uint8_t>(0x60 + i);
+  CHECK(iwl_build_station_key(1, 1, 2, true, key, rsc, ByteView(buf, sizeof buf)) == 64 && buf[0] == 1 && buf[1] == 1 && buf[2] == (2 | 8) && buf[3] == (2 | 0x40) && buf[4] == 0x60 && buf[19] == 0x6F && buf[20] == 0 && buf[36] == 1 && buf[41] == 6);
+  CHECK(iwl_build_station_key(1, 0, 0, false, key, rsc, ByteView(buf, sizeof buf)) == 64 && (buf[3] & 0x40) == 0);
+  // the transmit command
+  Bytes hdr(24, 0);
+  hdr[0] = 0xB0; hdr[4] = 0xA0; hdr[10] = 0x28;
+  IwlTxParams tp;
+  tp.header = ConstByteView(hdr.data(), 24); tp.frame_bytes = 30; tp.station_id = 1; tp.tx_antennas = 3;
+  CHECK(iwl_build_tx_prefix(tp, ByteView(buf, sizeof buf)) == 84 && buf[0] == 0x1C && buf[4] == 30 && buf[6] == 0 && buf[7] == 12 && buf[8] == 0x08 && buf[9] == 0x20);
+  CHECK(buf[16] == 10 && buf[17] == 0x42 && buf[18] == 0x00 && buf[20] == 1 && buf[21] == 0 && buf[44] == 0xFF && buf[47] == 0xFF && buf[60] == 0xB0 && buf[64] == 0xA0);
+  CHECK(buf[4 + 52] == 2 && buf[4 + 49] == 60 && buf[4 + 50] == 3 && buf[4 + 51] == 8);                    // pm_frame_timeout (management), retries, tid                    // pm_frame_timeout (management), retries, tid
+  tp.five_ghz = true; tp.association_request = true;
+  CHECK(iwl_build_tx_prefix(tp, ByteView(buf, sizeof buf)) == 84 && buf[16] == 13 && buf[17] == 0x40 && buf[4 + 52] == 3);
+  tp.data = true; tp.protect = true; tp.association_request = false; tp.frame_bytes = 100;
+  for (int i = 0; i < 16; ++i) tp.tk[i] = static_cast<uint8_t>(0x10 + i);
+  CHECK(iwl_build_tx_prefix(tp, ByteView(buf, sizeof buf)) == 84 && buf[4 + 17] == 2 && buf[4 + 20] == 0x10 && buf[4 + 35] == 0x1F && buf[7] == 16 && buf[16] == 9 && buf[4 + 52] == 0 && buf[4 + 50] == 15);
+  CHECK(iwl_build_tx_prefix(tp, ByteView(buf, 83)) == 0);
+  IwlTxParams bad; bad.header = ConstByteView(hdr.data(), 10);
+  CHECK(iwl_build_tx_prefix(bad, ByteView(buf, sizeof buf)) == 0);
+  // the response
+  Bytes resp(48, 0);
+  resp[0] = 1; resp[40] = 1; resp[44] = 0x07; resp[45] = 0xF0;
+  IwlTxResponse tr;
+  CHECK(iwl_parse_tx_response(ConstByteView(resp.data(), resp.size()), &tr) && tr.frame_count == 1 && tr.success() && tr.next_index == 7);
+  CHECK(!iwl_parse_tx_response(ConstByteView(resp.data(), 44), &tr));
+  resp[0] = 0;
+  CHECK(!iwl_parse_tx_response(ConstByteView(resp.data(), resp.size()), &tr));
+  // Ethernet <-> 802.11
+  const uint8_t bssid[6] = {0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5}, us[6] = {0x28, 1, 2, 3, 4, 5};
+  Bytes eth{0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x28, 1, 2, 3, 4, 5, 0x08, 0x00, 0xDE, 0xAD, 0xBE, 0xEF};
+  uint8_t h[24], body[100];
+  uint32_t n = iwl_ethernet_to_data_frame(ConstByteView(eth.data(), eth.size()), bssid, us, true, 0x010203040506ull, 0, ByteView(h, 24), ByteView(body, sizeof body));
+  CHECK(n == 8 + 6 + 2 + 4 && h[0] == 0x08 && h[1] == 0x41 && h[4] == 0xA0 && h[10] == 0x28 && h[16] == 0x11 && body[0] == 0x06 && body[1] == 0x05 && body[3] == 0x20 && body[4] == 0x04 && body[7] == 0x01 && body[8] == 0xAA && body[14] == 0x08 && body[16] == 0xDE);
+  n = iwl_ethernet_to_data_frame(ConstByteView(eth.data(), eth.size()), bssid, us, false, 0, 0, ByteView(h, 24), ByteView(body, sizeof body));
+  CHECK(n == 6 + 2 + 4 && h[1] == 0x01 && body[0] == 0xAA);
+  CHECK(iwl_ethernet_to_data_frame(ConstByteView(eth.data(), 13), bssid, us, false, 0, 0, ByteView(h, 24), ByteView(body, sizeof body)) == 0);
+  // a frame from the access point to us becomes an Ethernet frame (address 3 is the source)
+  Bytes from_ap{0x08, 0x02, 0, 0, 0x28, 1, 2, 3, 4, 5, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0, 0, 0xAA, 0xAA, 3, 0, 0, 0, 0x08, 0x06, 0x01, 0x02};
+  uint8_t out[100];
+  n = iwl_data_frame_to_ethernet(ConstByteView(from_ap.data(), from_ap.size()), false, ByteView(out, sizeof out));
+  CHECK(n == 14 + 2 && out[0] == 0x28 && out[6] == 0x77 && out[11] == 0xCC && out[12] == 0x08 && out[13] == 0x06 && out[14] == 1);
+  Bytes prot = from_ap; prot[1] |= 0x40;
+  CHECK(iwl_data_frame_to_ethernet(ConstByteView(prot.data(), prot.size()), false, ByteView(out, sizeof out)) == 0);        // protected and not decrypted: unreadable
+  prot.insert(prot.begin() + 24, {1, 0, 0, 0x20, 0, 0, 0, 0});
+  CHECK(iwl_data_frame_to_ethernet(ConstByteView(prot.data(), prot.size()), true, ByteView(out, sizeof out)) == 16);
+  Bytes mgmt = from_ap; mgmt[0] = 0x80;
+  CHECK(iwl_data_frame_to_ethernet(ConstByteView(mgmt.data(), mgmt.size()), false, ByteView(out, sizeof out)) == 0);
+  Bytes to_ds = from_ap; to_ds[1] = 0x01;
+  CHECK(iwl_data_frame_to_ethernet(ConstByteView(to_ds.data(), to_ds.size()), false, ByteView(out, sizeof out)) == 0);
+  CHECK(iwl_data_frame_to_ethernet(ConstByteView(from_ap.data(), 30), false, ByteView(out, sizeof out)) == 0);
+  CHECK(iwl_data_frame_to_ethernet(ConstByteView(from_ap.data(), from_ap.size()), false, ByteView(out, 10)) == 0);
+}
+
+
+namespace linktest {
+using namespace hardware::wpa2;
+static const uint8_t kBssid[6] = {0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5}, kUs[6] = {0x28, 0xD2, 0x44, 0x01, 0x02, 0x03};
+struct Authenticator {
+  uint8_t pmk[kPmkBytes], anonce[kNonceBytes], snonce[kNonceBytes] = {}, ptk[kPtkBytes] = {};
+  uint64_t counter = 100;
+  Bytes rsn_ie;
+  uint8_t gtk[16];
+  static void put_counter(EapolKey& k, uint64_t c) { for (int i = 0; i < 8; ++i) k.replay_counter[i] = static_cast<uint8_t>(c >> (8 * (7 - i))); }
+  Bytes message1() {
+    EapolKey k; k.info = kInfoVersionHmacSha1Aes | kInfoPairwise | kInfoAck; put_counter(k, ++counter); memcpy(k.nonce, anonce, 32);
+    Bytes out(400); out.resize(build_eapol_key(k, ByteView(out.data(), out.size()))); return out;
+  }
+  bool check_message2(const Bytes& m2) {
+    EapolKey k;
+    if (!parse_eapol_key(ConstByteView(m2.data(), m2.size()), &k)) return false;
+    memcpy(snonce, k.nonce, 32);
+    derive_ptk(pmk, kBssid, kUs, anonce, snonce, ptk);
+    return verify_mic(ConstByteView(ptk, 16), ConstByteView(m2.data(), m2.size()));
+  }
+  Bytes wrapped_gtk(uint8_t id, bool with_rsn) {
+    Bytes plain;
+    if (with_rsn) plain.insert(plain.end(), rsn_ie.begin(), rsn_ie.end());
+    const uint8_t kde[8] = {0xDD, 22, 0x00, 0x0F, 0xAC, 1, id, 0};
+    plain.insert(plain.end(), kde, kde + 8); plain.insert(plain.end(), gtk, gtk + 16);
+    if (plain.size() % 8) { plain.push_back(0xDD); while (plain.size() % 8) plain.push_back(0); }
+    Bytes wrapped(plain.size() + 8);
+    aes_key_wrap(ConstByteView(ptk + 16, 16), ConstByteView(plain.data(), plain.size()), ByteView(wrapped.data(), wrapped.size()));
+    return wrapped;
+  }
+  Bytes message3() {
+    EapolKey k;
+    k.info = kInfoVersionHmacSha1Aes | kInfoPairwise | kInfoInstall | kInfoAck | kInfoMic | kInfoSecure | kInfoEncryptedData;
+    k.key_length = 16; put_counter(k, ++counter); memcpy(k.nonce, anonce, 32);
+    Bytes wrapped = wrapped_gtk(1, true);
+    k.data = ConstByteView(wrapped.data(), wrapped.size());
+    Bytes out(400); out.resize(build_eapol_key(k, ByteView(out.data(), out.size())));
+    set_mic(ConstByteView(ptk, 16), ByteView(out.data(), out.size()));
+    return out;
+  }
+  Bytes group_message1(uint8_t id) {
+    EapolKey k;
+    k.info = kInfoVersionHmacSha1Aes | kInfoAck | kInfoMic | kInfoSecure | kInfoEncryptedData | (static_cast<uint16_t>(id) << 4);
+    k.key_length = 16; put_counter(k, ++counter);
+    Bytes wrapped = wrapped_gtk(id, false);
+    k.data = ConstByteView(wrapped.data(), wrapped.size());
+    Bytes out(400); out.resize(build_eapol_key(k, ByteView(out.data(), out.size())));
+    set_mic(ConstByteView(ptk, 16), ByteView(out.data(), out.size()));
+    return out;
+  }
+};
+}  // namespace linktest
+
+struct LinkSink final : IWifiDataSink {
+  std::vector<Bytes> frames;
+  void on_ethernet_frame(ConstByteView f) override { frames.push_back(Bytes(f.data(), f.data() + f.size())); }
+};
+struct TestClock final : IClock {
+  mutable uint64_t us = 1000000;
+  uint64_t now_us() const override { return us; }
+  const char* name() const override { return "test clock"; }
+  bool initialize() override { return true; }
+  void shutdown() override {}
+};
+
+static const uint8_t (&kLinkBssid)[6] = linktest::kBssid;
+static const uint8_t (&kLinkUs)[6] = linktest::kUs;
+
+static Bytes ap_mgmt(uint16_t fc) {
+  Bytes f{static_cast<uint8_t>(fc), static_cast<uint8_t>(fc >> 8), 0, 0};
+  f.insert(f.end(), kLinkUs, kLinkUs + 6);
+  f.insert(f.end(), kLinkBssid, kLinkBssid + 6);
+  f.insert(f.end(), kLinkBssid, kLinkBssid + 6);
+  f.insert(f.end(), {0, 0});
+  return f;
+}
+static Bytes ap_data(const Bytes& eapol_or_payload, uint16_t ethertype, bool protect) {
+  Bytes f = ap_mgmt(protect ? 0x4208 : 0x0208);
+  if (protect) f.insert(f.end(), {1, 0, 0, 0x20, 0, 0, 0, 0});
+  f.insert(f.end(), {0xAA, 0xAA, 0x03, 0, 0, 0, static_cast<uint8_t>(ethertype >> 8), static_cast<uint8_t>(ethertype)});
+  f.insert(f.end(), eapol_or_payload.begin(), eapol_or_payload.end());
+  return f;
+}
+
+static Bytes ap_mgmt_auth() { Bytes f = ap_mgmt(0x00B0); f.insert(f.end(), {0, 0, 2, 0, 0, 0}); return f; }
+static Bytes ap_assoc_response() { Bytes f = ap_mgmt(0x0010); f.insert(f.end(), {0x11, 0x04, 0, 0, 3, 0xC0}); return f; }
+
+static void test_station_link() {
+  using namespace hardware::wpa2;
+  using linktest::Authenticator;
+  TestAllocator alloc;
+  const Bytes file = make_loadable_firmware(64, true);
+  IwlFirmware fw(alloc);
+  const char* error = nullptr;
+  CHECK(fw.parse(ConstByteView(file.data(), file.size()), &error));
+  for (int scenario = 0; scenario < 2; ++scenario) {
+    FakeIwl chip;
+    chip.w1c = true;
+    chip.force_radio = true;
+    chip.prph[(iwl_tx::kScdSramBase & 0xFFFFF) / 4] = 0x800000;
+    IwlTransport tp(chip, alloc, true);
+    FakeRxChip rxhw(chip);
+    FakeTxChip txhw(chip), q4(chip, 4);
+    TestClock clock;
+    LinkSink sink;
+    IwlStationLink link(tp, alloc, clock);
+    Ieee80211Association assoc(link);
+    link.set_association(&assoc);
+    link.set_data_sink(&sink);
+    std::vector<std::pair<uint8_t, uint8_t>> commands;
+    Bytes last_key_cmd, last_ptk_cmd, last_mac_cmd, last_sta_cmd;
+    chip.on_alive = [&] { Bytes f; FakeRxChip::frame(f, 0, 1, 0x8000, alive_payload(0xCAFE)); rxhw.deliver(f); };
+    chip.on_doorbell = [&] {
+      bool ok = false;
+      for (const Bytes& c : txhw.process(&ok)) {
+        const uint8_t group = c[1], op = c[0];
+        const uint16_t seq = static_cast<uint16_t>(c[2] | (c[3] << 8));
+        commands.push_back({group, op});
+        if (op == 0x28) last_mac_cmd = c;
+        if (op == 0x18) last_sta_cmd = c;
+        if (op == 0x17) { if (c[4 + 3] & 0x40) last_key_cmd = c; else last_ptk_cmd = c; }
+        Bytes f;
+        const uint8_t status = (op == 0x2B) ? 0 : (op == 0x18 || op == 0x17) ? 1 : 0;
+        FakeRxChip::frame(f, group, op, seq, Bytes{status, 0, 0, 0});
+        rxhw.deliver(f);
+      }
+    };
+    // the access point
+    Authenticator ap;
+    const Bytes ssid_bytes{'H', 'o', 'm', 'e'};
+    {
+      uint8_t pmk[32];
+      wpa2::derive_pmk(StringView("hunter2hunter2"), ConstByteView(ssid_bytes.data(), 4), pmk);
+      memcpy(ap.pmk, pmk, 32);
+    }
+    for (int i = 0; i < 32; ++i) ap.anonce[i] = static_cast<uint8_t>(i * 3 + 1);
+    ap.rsn_ie = Bytes{48, 20, 1, 0, 0, 0x0F, 0xAC, 4, 1, 0, 0, 0x0F, 0xAC, 4, 1, 0, 0, 0x0F, 0xAC, 2, 0, 0};
+    for (int i = 0; i < 16; ++i) ap.gtk[i] = static_cast<uint8_t>(0x30 + i);
+    std::vector<Bytes> tx_frames;                    // everything the card was asked to send on the data queue, as the firmware sees it
+    bool m4 = false, group_reply_protected = false;
+    auto deliver = [&](const Bytes& frame, bool decrypted = false) {
+      Bytes g;
+      FakeRxChip::frame(g, 0, 0xC1, 0x8000, rx_mpdu(frame, 6, 50, true, decrypted));
+      rxhw.deliver(g);
+    };
+    chip.on_queue_doorbell = [&](uint32_t q) {
+      if (q != 4) return;
+      bool ok = false;
+      for (const Bytes& c : q4.process(&ok)) {
+        tx_frames.push_back(c);
+        const uint16_t seq = static_cast<uint16_t>(c[2] | (c[3] << 8));
+        Bytes resp(48, 0);
+        resp[0] = 1; resp[40] = 1; resp[44] = static_cast<uint8_t>((seq & 0xFF) + 1);
+        Bytes f;
+        FakeRxChip::frame(f, 0, 0x1C, static_cast<uint16_t>(0x8000 | seq), resp);
+        rxhw.deliver(f);
+        const Bytes frame(c.begin() + 60, c.end());
+        const uint16_t fc = static_cast<uint16_t>(frame[0] | (frame[1] << 8));
+        if ((fc & 0x00FC) == 0x00B0) deliver(ap_mgmt_auth());
+        else if ((fc & 0x00FC) == 0x0000) { deliver(ap_assoc_response()); deliver(ap_data(ap.message1(), 0x888E, false)); }
+        else if ((fc & 0x000C) == 0x0008 && (fc & 0x4000)) {
+          if (frame.size() >= 24 + 8 + 8 + 99) group_reply_protected = true;                     // the group key answer went out encrypted
+        } else if ((fc & 0x000C) == 0x0008) {
+          EapolKey k;
+          ConstByteView p(frame.data() + 32, frame.size() - 32);
+          if (!parse_eapol_key(p, &k)) continue;
+          if (!(k.info & kInfoSecure)) { if (ap.check_message2(Bytes(p.data(), p.data() + p.size()))) deliver(ap_data(ap.message3(), 0x888E, false)); }
+          else m4 = true;
+        }
+      }
+    };
+    CHECK(tp.start(fw, IwlImage::Regular, 5000, &error));
+    tp.set_handler(&link);
+    IwlNvmData nvm;
+    nvm.tx_antennas = nvm.rx_antennas = 3;
+    nvm.band_24ghz = nvm.band_5ghz = true;
+    memcpy(nvm.hw_address, kLinkUs, 6);
+    WifiNetwork net;
+    strcpy(net.ssid, "Home"); memcpy(net.bssid.bytes, kLinkBssid, 6); net.security = WifiSecurity::Wpa2; net.channel = 6;
+    if (scenario == 1) {                                                // firmware of another PHY context version
+      const Bytes other = make_loadable_firmware(64, false);
+      IwlFirmware fw2(alloc);
+      CHECK(fw2.parse(ConstByteView(other.data(), other.size()), &error));
+      CHECK(!link.prepare(fw2, nvm, net, &error) && error && !link.prepared());
+      tp.stop();
+      continue;
+    }
+    CHECK(link.prepare(fw, nvm, net, &error));
+    if (!link.prepared()) printf("  prepare: %s\n", error ? error : "?");
+    // the contexts went in the order: PHY, MAC (with the BSSID), binding, station
+    CHECK(commands.size() >= 4 && commands[commands.size() - 4].second == 0x08 && commands[commands.size() - 3].second == 0x28 && commands[commands.size() - 2].second == 0x2B && commands.back().second == 0x18);
+    CHECK(last_mac_cmd.size() > 36 && memcmp(&last_mac_cmd[4 + 24], kLinkBssid, 6) == 0 && last_mac_cmd[4 + 4] == 2);        // action: modify
+    CHECK(last_sta_cmd.size() == 4 + 48 && last_sta_cmd[4 + 16] == 1 && last_sta_cmd[4 + 8] == 0xA0 && last_sta_cmd[4 + 40] == 0x10);
+    CHECK(chip.prph[(iwl_tx::scd_queue_status(4) & 0xFFFFF) / 4] == (iwl_tx::kQueueStatusActive | 3 | iwl_tx::kQueueStatusWsl | iwl_tx::kQueueStatusMask));
+    // the join
+    uint8_t snonce[32];
+    for (int i = 0; i < 32; ++i) snonce[i] = static_cast<uint8_t>(0x55 + i);
+    uint8_t ap_rsn[22] = {48, 20, 1, 0, 0, 0x0F, 0xAC, 4, 1, 0, 0, 0x0F, 0xAC, 4, 1, 0, 0, 0x0F, 0xAC, 2, 0, 0};
+    CHECK(assoc.start(net, ConstByteView(ap_rsn, 22), StringView("hunter2hunter2"), snonce, kLinkUs) == WifiResult::Ok);
+    for (int i = 0; i < 40 && assoc.state() != Ieee80211Association::State::Connected && assoc.state() != Ieee80211Association::State::Failed; ++i) { tp.poll(nullptr); assoc.poll(); }
+    if (assoc.state() != Ieee80211Association::State::Connected) printf("  association: state %d, %s\n", static_cast<int>(assoc.state()), assoc.failure());
+    CHECK(assoc.state() == Ieee80211Association::State::Connected && m4);
+    // the first frame sent: the authentication request as a TX command on queue 4
+    CHECK(tx_frames.size() >= 4);
+    if (tx_frames.size() >= 4) {
+      const Bytes& a = tx_frames[0];
+      CHECK(a[0] == 0x1C && a[3] == 0x04 && a[4 + 16] == 1 && a[4 + 17] == 0 && a.size() == 4 + 56 + 24 + 6 && a[60] == 0xB0 && a[64] == 0xA0 && a[16] == 0x0A && a[17] == 0x42);       // queue 4, station 1, 1 Mbit/s CCK on antenna A
+      const uint16_t len = static_cast<uint16_t>(a[4] | (a[5] << 8));
+      CHECK(len == 30);
+      CHECK(tx_frames[1][60] == 0x00 && tx_frames[2][60] == 0x08 && tx_frames[2][4 + 17] == 0 && tx_frames[3][4 + 17] == 0);                 // association request, then the handshake's frames unencrypted
+    }
+    // the byte count table: the first frames' entries (30 bytes + 4 + 4 = 38 -> 10 dwords) with the station in the top bits
+    {
+      const uint8_t* table = reinterpret_cast<const uint8_t*>(static_cast<uint64_t>(chip.prph[(iwl_tx::kScdDramBase & 0xFFFFF) / 4]) << 10);
+      const uint16_t e = static_cast<uint16_t>(table[(4 * 320 + 0) * 2] | (table[(4 * 320 + 0) * 2 + 1] << 8));
+      CHECK(e == (10 | (1 << 12)));
+      const uint16_t dup = static_cast<uint16_t>(table[(4 * 320 + 256) * 2] | (table[(4 * 320 + 256) * 2 + 1] << 8));
+      CHECK(dup == e);
+    }
+    // keys: the pairwise key (id 0, not multicast) with the TK, the group key (id 1, multicast)
+    CHECK(last_ptk_cmd.size() == 4 + 64 && last_ptk_cmd[4 + 0] == 1 && last_ptk_cmd[4 + 1] == 0 && memcmp(&last_ptk_cmd[4 + 4], ap.ptk + 32, 16) == 0);
+    CHECK(last_key_cmd.size() == 4 + 64 && last_key_cmd[4 + 1] == 1 && (last_key_cmd[4 + 3] & 0x40) && ((last_key_cmd[4 + 3] & 3) == 1) && last_key_cmd[4 + 4] == 0x30 && last_key_cmd[4 + 19] == 0x3F);
+    // the interface was told it is associated: id 5? (the response's aid 3)
+    CHECK(last_mac_cmd[4 + 4] == 2 && last_mac_cmd[4 + 100] == 1 && last_mac_cmd[4 + 100 + 36] == 3);
+    // protected data goes out with the key in the command and a CCMP header
+    tx_frames.clear();
+    Bytes eth{0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x28, 0xD2, 0x44, 1, 2, 3, 0x08, 0x00, 'p', 'i', 'n', 'g'};
+    CHECK(link.send_ethernet(ConstByteView(eth.data(), eth.size())));
+    CHECK(tx_frames.size() == 1);
+    if (!tx_frames.empty()) {
+      const Bytes& d = tx_frames[0];
+      CHECK(d[4 + 17] == 2 && memcmp(&d[4 + 20], ap.ptk + 32, 16) == 0 && d[60] == 0x08 && d[61] == 0x41 && d[64] == 0xA0 && d[70] == 0x28 && d[76] == 0x11);
+      CHECK(d[84] == 1 && d[85] == 0 && d[87] == 0x20 && d[92] == 0xAA && d[98] == 0x08 && d[100] == 'p');                                   // packet number 1 after the handshake's own: see below
+      CHECK(d[16] == 9 && d[4 + 52] == 0);                                                                                                       // 24 Mbit/s OFDM, no power-management hold
+      const uint16_t len = static_cast<uint16_t>(d[4] | (d[5] << 8));
+      CHECK(len == 24 + 8 + 8 + 4);                                                                                                           // header, CCMP header, SNAP, 4 byte payload... plus ethertype below
+    }
+    // a sent frame is reclaimed by its response; the queue does not fill up over many frames
+    for (int i = 0; i < 100; ++i) {
+      tp.poll(nullptr);
+      CHECK(link.send_ethernet(ConstByteView(eth.data(), eth.size())));
+    }
+    CHECK(link.tx_failures() == 0);
+    // received data: a decrypted frame reaches the sink as Ethernet; one that was not decrypted does not; EAPOL does not go to the sink
+    deliver(ap_data(Bytes{'h', 'e', 'y'}, 0x0800, true), true);
+    tp.poll(nullptr);
+    deliver(ap_data(Bytes{'n', 'o'}, 0x0800, true), false);
+    tp.poll(nullptr);
+    deliver(ap_data(Bytes{'o', 'p', 'e', 'n'}, 0x0806, false));
+    tp.poll(nullptr);
+    CHECK(sink.frames.size() == 2 && sink.frames[0].size() == 14 + 3 && sink.frames[0][12] == 0x08 && sink.frames[0][14] == 'h' && sink.frames[0][0] == 0x28 && sink.frames[1][12] == 0x08 && sink.frames[1][13] == 0x06);
+    // the group key handshake arrives encrypted and is answered encrypted
+    {
+      for (int i = 0; i < 16; ++i) ap.gtk[i] = static_cast<uint8_t>(0x90 + i);
+      Bytes g1 = ap.group_message1(2);
+      deliver(ap_data(g1, 0x888E, true), true);
+      tx_frames.clear();
+      tp.poll(nullptr);
+      CHECK(group_reply_protected && sink.frames.size() == 2);
+      CHECK(assoc.state() == Ieee80211Association::State::Connected);
+    }
+    // frames of the card's radio are counted
+    CHECK(link.frames_received() > 4 && link.frames_sent() > 100);
+    assoc.leave();
+    link.release();
+    tp.stop();
+    CHECK(alloc.dma.empty());
+  }
+}
+
 int main() {
   test_devices();
   test_firmware();
@@ -1276,6 +1624,8 @@ int main() {
   test_driver();
   test_mvm_builders();
   test_scanner();
+  test_link_builders();
+  test_station_link();
   printf(g_failed ? "IwlTest: %d FAILED\n" : "IwlTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }

@@ -113,9 +113,13 @@ void Ieee80211Association::on_frame(ConstByteView frame) {
     }
     return;
   }
-  if (state_ != State::Handshaking) return;
   ConstByteView eapol = parse_eapol_data(frame, network_.bssid.bytes, our_address_);
   if (eapol.size() == 0) return;
+  on_eapol(eapol);
+}
+
+void Ieee80211Association::on_eapol(ConstByteView eapol) {
+  if (state_ != State::Handshaking && state_ != State::Connected) return;
   uint8_t reply[wpa2::kEapolHeaderBytes + wpa2::kKeyFixedBytes + wpa2::kMaxKeyData];
   wpa2::Supplicant::Result result;
   if (!supplicant_.on_eapol(eapol, ByteView(reply, sizeof reply), &result)) {

@@ -732,6 +732,7 @@ add_executable(BOOTX64
   src/Hardware/WirelessInterface/Intel/IwlDriver.cpp
   src/Hardware/WirelessInterface/Intel/IwlMvm.cpp
   src/Hardware/WirelessInterface/Intel/IwlScan.cpp
+  src/Hardware/WirelessInterface/Intel/IwlLink.cpp
   src/Hardware/WirelessInterface/Ieee80211Scan.cpp
   src/Hardware/WirelessInterface/Ieee80211Frames.cpp
   src/Hardware/WirelessInterface/Ieee80211Association.cpp

@@ -85,6 +85,15 @@ class IwlCommandQueue {
   void release();
   bool ready() const { return tfds_.size() != 0; }
 
+  // The scheduler reads one table of byte counts for all queues (SCD_DRAM_BASE_ADDR is the command queue's): another queue writes into the command queue's.
+  void share_byte_counts_of(IwlCommandQueue& primary) { shared_byte_counts_ = primary.byte_counts_.data(); }
+  // A frame for the air: `prefix` is the device command header, the TX command and the 802.11 header (contiguous, its first 20 bytes go in the first buffer), `payload` the rest
+  // of the frame. `frame_bytes` is the TX command's length field (802.11 header and payload as the air sees them before encryption), `station` the TX command's station id,
+  // `ccm` whether the hardware encrypts it (CCMP adds an 8 byte MIC to the count). Returns the sequence number of the response, or -1.
+  int32_t enqueue_frame(ConstByteView prefix, ConstByteView payload, uint16_t frame_bytes, uint8_t station, bool ccm, const char** error);
+  // The firmware answered up to (not including) ring index `ssn`: those frames are done.
+  void reclaim_until(uint32_t ssn);
+
   // Builds the command in the next slot and rings the doorbell. Returns the sequence number the response carries (queue in bits 8-12, index in bits 0-7), or -1 when the queue is
   // full, the command is too large or the chip is not reachable.
   int32_t enqueue(const IwlHostCommand& command, const char** error);
@@ -100,12 +109,14 @@ class IwlCommandQueue {
   void invalidate(uint32_t index);
   ArrayView<uint8_t> block(uint64_t bytes, uint64_t alignment, uint64_t* bus);
   void configure_queue();
+  void write_byte_count(uint32_t index, uint16_t frame_bytes, uint8_t station, bool ccm);
 
   IwlPcieDevice& device_;
   allocators::IAllocator& allocator_;
   ArrayView<uint8_t> tfds_, commands_, first_tbs_, keep_warm_, byte_counts_, invalid_;
   uint64_t tfds_bus_ = 0, commands_bus_ = 0, first_tbs_bus_ = 0, keep_warm_bus_ = 0, byte_counts_bus_ = 0, invalid_bus_ = 0;
   uint32_t queue_, fifo_;
+  uint8_t* shared_byte_counts_ = nullptr;
   uint32_t write_ = 0, read_ = 0, scd_base_ = 0;
 };
 

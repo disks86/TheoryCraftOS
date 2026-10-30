@@ -89,14 +89,14 @@ uint32_t iwl_build_station_mac_context(const IwlMacContext& c, ByteView out) {
   w.le32(0);                                       // tsf_id: TSF A
   for (uint32_t i = 0; i < 6; ++i) w.u8(c.address[i]);
   w.le16(0);
-  for (uint32_t i = 0; i < 6; ++i) w.u8(0xFF);     // no BSSID yet: broadcast
+  for (uint32_t i = 0; i < 6; ++i) w.u8(c.bssid[i]);
   w.le16(0);
   w.le32(0x0F);                                    // cck_rates: the four mandatory ones
   w.le32(0x15);                                    // ofdm_rates: 6, 12 and 24 Mbit/s
   w.le32(0);                                       // protection_flags
   w.le32(0);                                       // cck_short_preamble
   w.le32(0);                                       // short_slot
-  w.le32((1u << 2) | (1u << 6));                   // filter_flags: not associated, so group frames (MAC_FILTER_ACCEPT_GRP) and other networks' beacons (MAC_FILTER_IN_BEACON)
+  w.le32((1u << 2) | (c.associated ? 0u : (1u << 6)));        // filter_flags: group frames (MAC_FILTER_ACCEPT_GRP), and before the association other networks' beacons (MAC_FILTER_IN_BEACON)
   w.le32(0);                                       // qos_flags
   // the four access categories in the firmware's order (background, best effort, video, voice) and the spare entry
   struct Ac { uint16_t cw_min, cw_max; uint8_t aifsn, fifo; uint16_t txop; };
@@ -108,10 +108,207 @@ uint32_t iwl_build_station_mac_context(const IwlMacContext& c, ByteView out) {
     w.u8(a.fifo);
     w.le16(a.txop);
   }
-  // the station data: not associated (is_assoc 0), the rest zero
-  w.zeros(48);
+  // the station data (STA_MAC_DATA): is_assoc, dtim time and tsf, beacon interval, dtim interval, data policy, listen interval, association id, beacon arrival time
+  w.le32(c.associated ? 1 : 0);
+  w.le32(0);
+  w.le64(0);
+  w.le32(c.beacon_interval_tu);
+  w.le32(0);
+  w.le32(c.beacon_interval_tu * c.dtim_period);
+  w.le32(0);
+  w.le32(0);                                       // listen interval
+  w.le32(c.association_id);
+  w.le32(0);
+  w.zeros(4);                                      // (the union is 48 bytes: the P2P station form is the largest)
   if (!w.ok() || w.position() != kMacContextBytes) return 0;
   return kMacContextBytes;
+}
+
+uint32_t iwl_build_phy_context(uint32_t action, uint8_t channel, bool five_ghz, uint32_t tx_antennas, uint32_t rx_antennas, ByteView out) {
+  ByteWriter w(out);
+  w.le32(0);                                       // id 0, colour 0
+  w.le32(action);
+  w.le32(0);                                       // apply_time
+  w.le32(0);                                       // tx_param_color
+  w.u8(five_ghz ? kPhyBand5 : kPhyBand24);
+  w.u8(channel);
+  w.u8(0);                                         // 20 MHz
+  w.u8(0);                                         // control channel position
+  w.le32(tx_antennas);
+  // rx chains: the valid ones, and two of them in use whether idle or active (receive diversity for single stream legacy rates)
+  w.le32((rx_antennas << 1) | (2u << 10) | (2u << 12));
+  w.le32(0);                                       // acquisition_data
+  w.le32(0);                                       // dsp_cfg_flags
+  return w.ok() && w.position() == kPhyContextBytes ? kPhyContextBytes : 0;
+}
+
+uint32_t iwl_build_binding(uint32_t action, uint8_t phy_id, uint8_t mac_id, uint8_t mac_color, ByteView out) {
+  ByteWriter w(out);
+  w.le32(phy_id);                                  // the binding has the PHY context's number
+  w.le32(action);
+  w.le32(static_cast<uint32_t>(mac_id) | (static_cast<uint32_t>(mac_color) << 8));
+  w.le32(kCtxtInvalid);
+  w.le32(kCtxtInvalid);
+  w.le32(phy_id);
+  return w.ok() && w.position() == kBindingBytes ? kBindingBytes : 0;
+}
+
+uint32_t iwl_build_add_station(const IwlStationSpec& st, ByteView out) {
+  ByteWriter w(out);
+  w.u8(st.modify ? 1 : 0);
+  w.u8(0);                                         // awake_acs
+  w.le16(0xFFFF);                                  // tid_disable_tx: no aggregation on any TID
+  w.le32(static_cast<uint32_t>(st.mac_id) | (static_cast<uint32_t>(st.mac_color) << 8));
+  for (uint32_t i = 0; i < 6; ++i) w.u8(st.address[i]);
+  w.le16(0);
+  w.u8(st.station_id);
+  w.u8(0);                                         // modify_mask
+  w.le16(0);
+  w.le32(0);                                       // station_flags: 20 MHz, one spatial stream
+  w.le32(kStaFlagFatMask | kStaFlagMimoMask | kStaFlagRtsMimoProt);
+  w.u8(0);
+  w.u8(0);
+  w.le16(0);
+  w.le16(0);
+  w.u8(0);                                         // sleep_state_flags
+  w.u8(0);                                         // station_type: a link station
+  w.le16(st.association_id);
+  w.le16(0);
+  w.le32(st.queue_mask);
+  w.le16(0);
+  w.u8(0);
+  w.u8(0);
+  return w.ok() && w.position() == kAddStaBytes ? kAddStaBytes : 0;
+}
+
+uint32_t iwl_build_station_key(uint8_t station_id, uint8_t key_offset, uint8_t key_id, bool multicast, const uint8_t key[16], const uint8_t rsc[8], ByteView out) {
+  ByteWriter w(out);
+  w.u8(station_id);
+  w.u8(key_offset);
+  w.le16(kStaKeyCcm | kStaKeyMapFlag | (static_cast<uint16_t>(key_id & 3) << kStaKeyIdPos) | (multicast ? kStaKeyMulticast : 0));
+  w.bytes(ConstByteView(key, 16));
+  w.zeros(16);                                     // the rest of the 32 byte key field
+  w.bytes(ConstByteView(rsc, 8));
+  w.zeros(8);                                      // rx_secur_seq_cnt is 16 bytes
+  w.u8(0);                                         // tkip_rx_tsc_byte2
+  w.u8(0);
+  w.zeros(10);                                     // tkip_rx_ttak
+  return w.ok() && w.position() == kStaKeyBytes ? kStaKeyBytes : 0;
+}
+
+uint32_t iwl_build_tx_prefix(const IwlTxParams& p, ByteView out) {
+  if (p.header.size() < 24 || p.header.size() > 32) return 0;
+  const uint32_t hdr_len = static_cast<uint32_t>(p.header.size());
+  const bool multicast = (p.header[4] & 1) != 0;
+  ByteWriter w(out);
+  w.u8(kTxCommand);                                // device command header: command, group, sequence (filled in by the queue)
+  w.u8(0);
+  w.le16(0);
+  w.le16(p.frame_bytes);                           // len
+  const uint32_t mh_len = hdr_len + (p.protect ? 8 : 0);
+  w.le16(static_cast<uint16_t>((mh_len / 2) << 8) | (hdr_len % 4 ? (1u << 13) : 0));      // offload_assist: the header size in words (and the padding bit)
+  w.le32((multicast ? 0u : kTxFlagAck) | kTxFlagSeqCtl);
+  w.le32(0);                                       // scratch (the firmware's status word; its address is set by the queue)
+  uint32_t rate;
+  if (p.data) rate = kRatePlcp24M;
+  else rate = p.five_ghz ? kRatePlcp6M : (kRatePlcp1M | kRateCckV1);
+  uint32_t antenna = p.tx_antennas & 7;
+  antenna = antenna & 1 ? 1 : antenna & 2 ? 2 : 4;
+  w.le32(rate | (antenna << 14));
+  w.u8(p.station_id);
+  w.u8(p.protect ? kTxSecCcm : 0);                 // sec_ctl
+  w.u8(0);                                         // initial_rate_index
+  w.u8(0);
+  if (p.protect) w.bytes(ConstByteView(p.tk, 16)); else w.zeros(16);        // key
+  w.le32(0);
+  w.le32(kTxLifeTimeInfinite);
+  w.le32(0);                                       // dram_lsb_ptr (set by the queue)
+  w.u8(0);                                         // dram_msb_ptr
+  w.u8(60);                                        // rts_retry_limit
+  w.u8(p.data ? 15 : 3);                           // data_retry_limit
+  w.u8(kTidNonQos);                                // tid_tspec: not QoS
+  w.le16(p.association_request ? kPmFrameAssoc : (p.data ? kPmFrameNone : kPmFrameMgmt));
+  w.le16(0);
+  if (!w.ok() || w.position() != kTxCommandHeaderBytes + kTxParamBytes) return 0;
+  w.bytes(p.header);
+  return w.ok() ? static_cast<uint32_t>(w.position()) : 0;
+}
+
+bool iwl_parse_tx_response(ConstByteView payload, IwlTxResponse* out) {
+  ByteReader r(payload);
+  const uint8_t frames = r.u8();
+  r.skip(39);                                      // up to the first frame's status (offset 40, the first four bytes were read above)
+  if (!r.ok() || frames == 0 || frames > 16) return false;
+  IwlTxResponse t;
+  t.frame_count = frames;
+  t.status = r.le16();
+  r.skip(2);
+  r.skip(static_cast<uint64_t>(frames - 1) * 4);
+  t.next_index = r.le32() & 0xFFF;
+  if (!r.ok()) return false;
+  *out = t;
+  return true;
+}
+
+uint32_t iwl_data_frame_to_ethernet(ConstByteView frame, bool decrypted, ByteView out) {
+  ByteReader r(frame);
+  const uint16_t control = r.le16();
+  r.skip(2);
+  uint8_t a1[6], a2[6], a3[6];
+  r.read_into(ByteView(a1));
+  r.read_into(ByteView(a2));
+  r.read_into(ByteView(a3));
+  r.skip(2);
+  if (!r.ok() || (control & 0x0003) != 0 || (control & 0x000C) != 0x0008 || (control & 0x0300) != 0x0200) return 0;     // data, from the distribution system
+  const uint16_t subtype = control & 0x00F0;
+  if (subtype == 0x80) {
+    r.skip(2);
+    if (control & 0x8000) r.skip(4);
+  } else if (subtype != 0x00) {
+    return 0;
+  }
+  const bool protected_frame = (control & 0x4000) != 0;
+  if (protected_frame && !decrypted) return 0;                         // a frame we cannot read
+  if (protected_frame) r.skip(8);                                      // the CCMP header
+  ConstByteView snap = r.take(8);
+  if (!r.ok() || snap[0] != 0xAA || snap[1] != 0xAA || snap[2] != 0x03 || snap[3] != 0 || snap[4] != 0 || snap[5] != 0) return 0;
+  ConstByteView payload = r.rest();
+  ByteWriter w(out);
+  for (uint32_t i = 0; i < 6; ++i) w.u8(a1[i]);                        // destination
+  for (uint32_t i = 0; i < 6; ++i) w.u8(a3[i]);                        // source (address 3 in a frame from the access point)
+  w.u8(snap[6]);
+  w.u8(snap[7]);
+  w.bytes(payload);
+  return w.ok() ? static_cast<uint32_t>(w.position()) : 0;
+}
+
+uint32_t iwl_ethernet_to_data_frame(ConstByteView eth, const uint8_t bssid[6], const uint8_t source[6], bool protect, uint64_t pn, uint8_t key_id, ByteView header, ByteView body) {
+  if (eth.size() < 14) return 0;
+  ByteWriter h(header);
+  h.le16(protect ? 0x4108 : 0x0108);               // data, to the distribution system, protected when the hardware encrypts
+  h.le16(0);
+  for (uint32_t i = 0; i < 6; ++i) h.u8(bssid[i]);                      // receiver
+  for (uint32_t i = 0; i < 6; ++i) h.u8(source[i]);                     // transmitter
+  for (uint32_t i = 0; i < 6; ++i) h.u8(eth[i]);                        // destination
+  h.le16(0);
+  if (!h.ok()) return 0;
+  ByteWriter w(body);
+  if (protect) {
+    w.u8(static_cast<uint8_t>(pn));
+    w.u8(static_cast<uint8_t>(pn >> 8));
+    w.u8(0);
+    w.u8(static_cast<uint8_t>(0x20 | ((key_id & 3) << 6)));
+    w.u8(static_cast<uint8_t>(pn >> 16));
+    w.u8(static_cast<uint8_t>(pn >> 24));
+    w.u8(static_cast<uint8_t>(pn >> 32));
+    w.u8(static_cast<uint8_t>(pn >> 40));
+  }
+  const uint8_t snap[6] = {0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00};
+  w.bytes(ConstByteView(snap, 6));
+  w.u8(eth[12]);
+  w.u8(eth[13]);
+  w.bytes(eth.subview(14));
+  return w.ok() ? static_cast<uint32_t>(w.position()) : 0;
 }
 
 uint32_t iwl_scan_request_bytes(uint32_t slots) { return kScanRequestFixedBytes + kScanChannelConfigBytes * slots + kScanRequestTailBytes; }
@@ -236,6 +433,7 @@ bool iwl_parse_rx_mpdu(const IwlRxPacket& packet, IwlRxFrame* out) {
   const int32_t best = a > b ? a : b;
   out->signal_dbm = best == -256 ? 0 : best;
   out->crc_ok = (status & kStatusCrcOk) && (status & kStatusOverrunOk);
+  out->decrypted = (status & (7u << 8)) == (2u << 8) && (status & (1u << 11));           // CCMP and decrypted by the hardware
   return true;
 }
 
