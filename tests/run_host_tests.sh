@@ -381,7 +381,7 @@ for t in "${WANTED[@]}"; do
     GraphicsTest) build_and_run GraphicsTest tests/GraphicsTest.cpp tests/KernelStubs.cpp src/Math/FloatMath.cpp src/Hardware/GraphicsProcessingUnit/Font8x16.cpp \
                     src/Graphics/Graphics2D/Software/*.cpp src/Graphics/Graphics2D/Device/*.cpp src/Graphics/Graphics3D/BuiltinShaders.cpp src/Graphics/Graphics3D/Software/*.cpp ;;
     CubeRendererTest) build_and_run CubeRendererTest tests/CubeRendererTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Math/FloatMath.cpp src/Kernel/Dxgkrnl/*.cpp src/Desktop/CubeRenderer.cpp \
-                        src/Graphics/Logo/Logo.cpp src/Graphics/Graphics3D/BuiltinShaders.cpp src/Graphics/Graphics3D/Software/*.cpp src/Graphics/Graphics2D/Software/*.cpp src/Hardware/GraphicsProcessingUnit/Font8x16.cpp \
+                        src/Graphics/Logo/Logo.cpp src/Graphics/Graphics3D/BuiltinShaders.cpp src/Graphics/Graphics3D/Software/*.cpp src/Graphics/Graphics2D/Software/*.cpp src/Graphics/Graphics2D/Device/*.cpp src/Hardware/GraphicsProcessingUnit/Font8x16.cpp \
                         src/Media/Image.cpp src/Media/ImageCodecs.cpp src/Media/Zlib.cpp src/Media/Image/*.cpp \
                         src/Hardware/VideoCodec/Software/JpegDecoder.cpp src/Hardware/VideoCodec/Software/JpegEncoder.cpp src/Hardware/VideoCodec/VideoTypes.cpp src/Hardware/VideoCodec/VideoFrameBuffer.cpp src/Hardware/VideoCodec/ColorConvert.cpp ;;
     LogoTest) build_and_run LogoTest tests/LogoTest.cpp tests/KernelStubs.cpp src/Math/FloatMath.cpp src/Hardware/GraphicsProcessingUnit/Font8x16.cpp src/Graphics/Graphics2D/Software/*.cpp src/Graphics/Graphics2D/Device/*.cpp src/Graphics/Logo/Logo.cpp src/Graphics/Graphics3D/BuiltinShaders.cpp src/Graphics/Graphics3D/Software/*.cpp \

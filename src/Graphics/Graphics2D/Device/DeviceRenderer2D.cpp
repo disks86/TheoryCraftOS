@@ -40,6 +40,21 @@ DeviceRenderer2D::DeviceRenderer2D(IGraphicsDevice& device, allocators::IAllocat
     opaque_ = device.create_graphics_pipeline(desc);
   }
   vertices_ = device.create_buffer(sizeof(ColoredVertex) * kMaxVertices, kBufferVertex);
+  // (best effort: a device without textures draws pictures as runs of rectangles)
+  texture_vs_ = device.create_shader_module(textured_vertex_shader());
+  texture_fs_ = device.create_shader_module(textured_fragment_shader());
+  if (texture_vs_ && texture_fs_) {
+    GraphicsPipelineDesc textured;
+    describe_textured_pipeline(&textured);
+    textured.vertex_shader = texture_vs_;
+    textured.fragment_shader = texture_fs_;
+    textured.cull_mode = CullMode::None;
+    textured.alpha_blend = true;
+    texture_blended_ = device.create_graphics_pipeline(textured);
+    textured.alpha_blend = false;
+    texture_opaque_ = device.create_graphics_pipeline(textured);
+    texture_vertices_ = device.create_buffer(sizeof(TexturedVertex) * 6, kBufferVertex);
+  }
   for (IImage*& image : images_) image = device.create_image({extent, Format::B8G8R8A8Unorm, kImageColorAttachment | kImagePresent});
   commands_ = device.create_command_buffer();
   valid_ = blended_ && opaque_ && vertices_ && images_[0] && images_[1] && commands_;
@@ -50,6 +65,13 @@ DeviceRenderer2D::DeviceRenderer2D(IGraphicsDevice& device, allocators::IAllocat
 }
 
 DeviceRenderer2D::~DeviceRenderer2D() {
+  if (texture_) device_.destroy_image(texture_);
+  release_view(allocator_, texture_rows_);
+  if (texture_vertices_) device_.destroy_buffer(texture_vertices_);
+  if (texture_opaque_) device_.destroy_pipeline(texture_opaque_);
+  if (texture_blended_) device_.destroy_pipeline(texture_blended_);
+  if (texture_fs_) device_.destroy_shader_module(texture_fs_);
+  if (texture_vs_) device_.destroy_shader_module(texture_vs_);
   if (commands_) device_.destroy_command_buffer(commands_);
   for (IImage* image : images_)
     if (image) device_.destroy_image(image);
@@ -209,8 +231,99 @@ void DeviceRenderer2D::fill_triangle(Vec2 a, Vec2 b, Vec2 c, uint32_t color) {
   triangle(a.x, a.y, b.x, b.y, c.x, c.y, color);
 }
 
+// Pictures smaller than this (in pixels) stay runs of rectangles: sending them as a texture breaks the batch and costs a submit.
+static constexpr uint64_t kTextureMinPixels = 64 * 64;
+
+bool DeviceRenderer2D::ensure_texture(uint32_t width, uint32_t height) {
+  if (texture_ && texture_extent_.width == width && texture_extent_.height == height) return true;
+  if (texture_) device_.destroy_image(texture_);
+  texture_ = device_.create_image({{width, height}, Format::B8G8R8A8Unorm, kImageSampled});
+  texture_extent_ = {width, height};
+  return texture_ != nullptr;
+}
+
+bool DeviceRenderer2D::draw_texture(const Surface& s, const Rect2D& rect, int32_t x, int32_t y) {
+  if (!texture_blended_ || !texture_opaque_ || !texture_vertices_ || opacity_ != 1.0f) return false;
+  // The part of the picture that exists (what is outside it draws nothing).
+  const int64_t sx0 = rect.x > 0 ? rect.x : 0, sy0 = rect.y > 0 ? rect.y : 0;
+  const int64_t sx1 = int64_t{rect.x} + rect.width < s.width ? int64_t{rect.x} + rect.width : s.width;
+  const int64_t sy1 = int64_t{rect.y} + rect.height < s.height ? int64_t{rect.y} + rect.height : s.height;
+  if (sx0 >= sx1 || sy0 >= sy1) return true;
+  const uint32_t w = static_cast<uint32_t>(sx1 - sx0), h = static_cast<uint32_t>(sy1 - sy0);
+  const uint64_t count = uint64_t{w} * h;
+  if (count < kTextureMinPixels) return false;
+  const int64_t dx = int64_t{x} + (sx0 - rect.x), dy = int64_t{y} + (sy0 - rect.y);
+  const Rect2D area = raster::intersect({raster::saturate_i32(dx), raster::saturate_i32(dy), w, h}, clip_);
+  if (!area.width || !area.height) return true;   // (nothing of it is inside the clip)
+  if (texture_rows_.size() < count) {
+    release_view(allocator_, texture_rows_);
+    texture_rows_ = allocate_view<uint32_t>(allocator_, count);
+    if (texture_rows_.empty()) return false;
+  }
+  const ArrayView<uint32_t> rows = texture_rows_.first(count);
+  for (uint32_t j = 0; j < h; ++j) {
+    const ArrayView<const uint32_t> from = ArrayView<const uint32_t>(s.row(static_cast<uint32_t>(sy0) + j), s.width).subview(static_cast<uint64_t>(sx0), w);
+    const ArrayView<uint32_t> to = rows.subview(uint64_t{j} * w, w);
+    if (s.format == Format::B8G8R8A8Unorm) to.copy_from(from);
+    else
+      for (uint32_t i = 0; i < w; ++i) to[i] = s.decode(from[i]);
+  }
+  if (!submit_pending() || !ensure_texture(w, h) || !texture_->write_pixels(ArrayView<const uint32_t>(rows.data(), rows.size()))) return false;
+
+  return draw_textured_quad(*texture_, dx, dy, w, h, 0.0f, 0.0f, 1.0f, 1.0f);
+}
+
+// One rectangle at (dx, dy), w x h pixels, showing the part (u0, v0)-(u1, v1) of the image: drawn at once, in a submit of its own after what was recorded before it.
+bool DeviceRenderer2D::draw_textured_quad(IImage& image, int64_t dx, int64_t dy, uint32_t w, uint32_t h, float u0, float v0, float u1, float v1) {
+  if (!submit_pending()) return false;
+  const float x0 = static_cast<float>(dx), y0 = static_cast<float>(dy), x1 = x0 + static_cast<float>(w), y1 = y0 + static_cast<float>(h);
+  const TexturedVertex quad[6] = {{{x0, y0, 0}, {u0, v0}}, {{x1, y0, 0}, {u1, v0}}, {{x1, y1, 0}, {u1, v1}}, {{x0, y0, 0}, {u0, v0}}, {{x1, y1, 0}, {u1, v1}}, {{x0, y1, 0}, {u0, v1}}};
+  const ArrayView<TexturedVertex> mapped = texture_vertices_->map().cast<TexturedVertex>();
+  if (mapped.size() < 6) return false;
+  mapped.copy_from(ArrayView<const TexturedVertex>(quad, 6));
+  texture_vertices_->unmap();
+
+  commands_->begin();
+  RenderPassBegin pass;
+  pass.color = images_[back_];
+  pass.clear_color = false;
+  commands_->begin_render_pass(pass);
+  commands_->bind_pipeline(blend_ == BlendMode::Alpha ? texture_blended_ : texture_opaque_);
+  commands_->bind_vertex_buffer(texture_vertices_);
+  SamplerDesc sampler;   // (nearest at the pixel centres: the picture's own pixels)
+  sampler.address_u = sampler.address_v = AddressMode::ClampToEdge;
+  commands_->bind_texture(0, &image, sampler);
+  ColoredConstants constants;
+  constants.mvp.m[0] = 2.0f / extent_.width;
+  constants.mvp.m[5] = 2.0f / extent_.height;
+  constants.mvp.m[10] = 0;
+  constants.mvp.m[12] = -1;
+  constants.mvp.m[13] = -1;
+  constants.mvp.m[14] = 0.5f;
+  commands_->push_constants(&constants, sizeof(constants));
+  commands_->set_scissor(clip_);
+  commands_->draw(6);
+  commands_->end_render_pass();
+  return commands_->end() && device_.submit(commands_);
+}
+
+bool DeviceRenderer2D::draw_device_image(IGraphicsDevice& owner, IImage& image, const Rect2D& rect, int32_t x, int32_t y) {
+  if (!valid_ || &owner != &device_ || !texture_blended_ || !texture_opaque_ || !texture_vertices_ || opacity_ != 1.0f) return false;
+  const Extent2D e = image.extent();
+  const int64_t sx0 = rect.x > 0 ? rect.x : 0, sy0 = rect.y > 0 ? rect.y : 0;
+  const int64_t sx1 = int64_t{rect.x} + rect.width < e.width ? int64_t{rect.x} + rect.width : e.width;
+  const int64_t sy1 = int64_t{rect.y} + rect.height < e.height ? int64_t{rect.y} + rect.height : e.height;
+  if (sx0 >= sx1 || sy0 >= sy1) return true;
+  const uint32_t w = static_cast<uint32_t>(sx1 - sx0), h = static_cast<uint32_t>(sy1 - sy0);
+  const int64_t dx = int64_t{x} + (sx0 - rect.x), dy = int64_t{y} + (sy0 - rect.y);
+  if (raster::intersect({raster::saturate_i32(dx), raster::saturate_i32(dy), w, h}, clip_).width == 0) return true;
+  const float iw = static_cast<float>(e.width), ih = static_cast<float>(e.height);
+  return draw_textured_quad(image, dx, dy, w, h, static_cast<float>(sx0) / iw, static_cast<float>(sy0) / ih, static_cast<float>(sx1) / iw, static_cast<float>(sy1) / ih);
+}
+
 void DeviceRenderer2D::draw_image(const Surface& s, const Rect2D& rect, int32_t x, int32_t y) {
   if (!s.valid()) return;
+  if (valid_ && draw_texture(s, rect, x, y)) return;
   for (uint32_t j = 0; j < rect.height; ++j) {
     const int64_t sy = static_cast<int64_t>(rect.y) + j;
     if (sy < 0 || sy >= s.height) continue;
