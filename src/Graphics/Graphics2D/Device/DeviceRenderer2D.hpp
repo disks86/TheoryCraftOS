@@ -41,6 +41,7 @@ namespace graphics {
 // gradients are triangles with per-vertex colors. Documented approximations (the push calls return false):
 // rounded and mask clips scissor to their bounding rectangle, and layers have no offscreen target, so group
 // opacity is applied to each shape (overlapping shapes show through each other). copy_rect reads the frame back.
+// draw_image_transformed uploads the picture as a texture and draws it as one textured quadrilateral (the texture unit does the resampling).
 //
 // Differences from the CPU renderer: lines are one-pixel-wide quads and circles
 // are polygons, so their pixels are not identical. draw_image of a large picture goes up as a texture and is one
@@ -76,6 +77,7 @@ class DeviceRenderer2D final : public IRenderer2D {
   void fill_rounded_rect(const Rect2D& rect, const CornerRadii& radii, uint32_t color) override;
   void stroke_rounded_rect(const Rect2D& outer, const CornerRadii& radii, const EdgeWidths& widths, uint32_t color) override;
   void draw_mask(const MaskView& mask, const Rect2D& source_rect, int32_t x, int32_t y, uint32_t color) override;
+  bool draw_image_transformed(const Surface& source, const Rect2D& source_rect, const Matrix2D& m, ImageFilter filter) override;
   void draw_image_scaled(const Surface& source, const RectF& source_rect, const Rect2D& dest, ImageFilter filter) override;
   void fill_linear_gradient(const Rect2D& rect, Vec2 from, Vec2 to, ArrayView<const GradientStop> stops) override;
   void fill_radial_gradient(const Rect2D& rect, Vec2 center, Vec2 radii, ArrayView<const GradientStop> stops) override;
@@ -125,6 +127,8 @@ class DeviceRenderer2D final : public IRenderer2D {
   void close_sheet_range();
   void reset_sheet();
   bool draw_textured_quad(IImage& image, int64_t dx, int64_t dy, uint32_t w, uint32_t h, float u0, float v0, float u1, float v1);
+  // The image's (u0, v0)-(u1, v1) on the quadrilateral with corners (xs[i], ys[i]) (top left, top right, bottom right, bottom left), sampled with `filter`.
+  bool draw_textured_corners(IImage& image, const float xs[4], const float ys[4], float u0, float v0, float u1, float v1, Filter filter);
 
   IGraphicsDevice& device_;
   allocators::IAllocator& allocator_;

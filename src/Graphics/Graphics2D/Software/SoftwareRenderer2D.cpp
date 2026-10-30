@@ -373,6 +373,43 @@ void SoftwareRenderer2D::draw_image_scaled(const Surface& source, const RectF& s
   }
 }
 
+bool SoftwareRenderer2D::draw_image_transformed(const Surface& source, const Rect2D& source_rect, const Matrix2D& m, ImageFilter filter) {
+  const float det = m.a * m.d - m.b * m.c;
+  if (!cur_.valid() || !(det > 1e-12f || det < -1e-12f)) return false;
+  const RectF rect{static_cast<float>(source_rect.x), static_cast<float>(source_rect.y), static_cast<float>(source_rect.width), static_cast<float>(source_rect.height)};
+  const raster::SampleBounds bounds = raster::sample_bounds(source, rect);
+  if (bounds.empty()) return true;
+  const float w = static_cast<float>(source_rect.width), h = static_cast<float>(source_rect.height);
+  // the target pixels the transformed rectangle can touch
+  const float xs[4] = {m.e, m.a * w + m.e, m.c * h + m.e, m.a * w + m.c * h + m.e};
+  const float ys[4] = {m.f, m.b * w + m.f, m.d * h + m.f, m.b * w + m.d * h + m.f};
+  float x0 = xs[0], x1 = xs[0], y0 = ys[0], y1 = ys[0];
+  for (int i = 1; i < 4; ++i) {
+    if (xs[i] < x0) x0 = xs[i];
+    if (xs[i] > x1) x1 = xs[i];
+    if (ys[i] < y0) y0 = ys[i];
+    if (ys[i] > y1) y1 = ys[i];
+  }
+  const int64_t bx0 = raster::floor_i(x0), by0 = raster::floor_i(y0), bx1 = raster::ceil_i(x1), by1 = raster::ceil_i(y1);
+  const Rect2D area = intersect({raster::saturate_i32(bx0), raster::saturate_i32(by0), static_cast<uint32_t>(bx1 > bx0 ? bx1 - bx0 : 0), static_cast<uint32_t>(by1 > by0 ? by1 - by0 : 0)}, clip_);
+  if (rect_empty(area)) return true;
+  const float ia = m.d / det, ib = -m.b / det, ic = -m.c / det, id = m.a / det;
+  for (uint32_t j = 0; j < area.height; ++j) {
+    const int32_t y = area.y + static_cast<int32_t>(j);
+    const float py = static_cast<float>(y) + 0.5f - m.f;
+    const ArrayView<uint32_t> dst = row_span(y, area.x, area.x + static_cast<int32_t>(area.width));
+    for (uint32_t i = 0; i < area.width; ++i) {
+      const float px = static_cast<float>(area.x + static_cast<int32_t>(i)) + 0.5f - m.e;
+      const float u = ia * px + ic * py, v = ib * px + id * py;   // (inside the rectangle: 0..w, 0..h)
+      if (!(u >= 0.0f && u < w && v >= 0.0f && v < h)) continue;
+      const float sx = rect.x + u, sy = rect.y + v;
+      const uint32_t argb = filter == ImageFilter::Nearest ? raster::sample_nearest(source, bounds, sx, sy) : raster::sample_bilinear(source, bounds, sx, sy);
+      store_px(dst[i], area.x + static_cast<int32_t>(i), y, argb);
+    }
+  }
+  return true;
+}
+
 // ---- Gradients -------------------------------------------------------------------------------------------
 
 void SoftwareRenderer2D::fill_linear_gradient(const Rect2D& rect, Vec2 from, Vec2 to, ArrayView<const GradientStop> stops) {
