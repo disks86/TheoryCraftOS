@@ -131,8 +131,10 @@ EXPORT LANGID WINAPI GetSystemDefaultLangID(void) { return 0x0409; }
 EXPORT LANGID WINAPI GetUserDefaultUILanguage(void) { return 0x0409; }
 EXPORT LANGID WINAPI GetSystemDefaultUILanguage(void) { return 0x0409; }
 EXPORT LANGID WINAPI GetThreadUILanguage(LANGID l) { (void)l; return 0x0409; }
-EXPORT LCID WINAPI GetThreadLocale(void) { return 0x0409; }
-EXPORT BOOL WINAPI SetThreadLocale(LCID l) { return l == 0x0409 || l == 0x0400 || l == 0x0800; }
+static BOOL nls_ansi_codepage(LCID lcid, DWORD *cp);
+static LCID g_thread_locale = 0x0409;
+EXPORT LCID WINAPI GetThreadLocale(void) { return g_thread_locale; }
+EXPORT BOOL WINAPI SetThreadLocale(LCID l) { DWORD cp; if (l != 0x0409 && l != 0x0400 && l != 0x0800 && !nls_ansi_codepage(l, &cp)) { set_error(ERROR_INVALID_PARAMETER); return FALSE; } g_thread_locale = l; return TRUE; }
 EXPORT int WINAPI GetUserDefaultLocaleName(LPWSTR name, int capacity) { static const WCHAR n[] = {'e', 'n', '-', 'U', 'S', 0}; if (capacity < 6) return 0; memcpy(name, n, sizeof(n)); return 6; }
 EXPORT int WINAPI GetSystemDefaultLocaleName(LPWSTR name, int capacity) { return GetUserDefaultLocaleName(name, capacity); }
 

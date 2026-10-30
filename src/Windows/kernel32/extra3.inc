@@ -129,8 +129,6 @@ EXPORT int WINAPI NormalizeString(int form, LPCWSTR source, int count, LPWSTR de
   memcpy(dest, source, (size_t_)count * 2);
   return count;
 }
-EXPORT BOOL WINAPI IsDBCSLeadByte(BYTE c) { (void)c; return FALSE; }
-EXPORT BOOL WINAPI IsDBCSLeadByteEx(UINT cp, BYTE c) { (void)cp; (void)c; return FALSE; }
 
 /* ---- locale information (English, United States) --------------------------------------------------------------------------------------------------------- */
 
@@ -191,7 +189,7 @@ static const char *locale_text(DWORD type, DWORD *number, char *scratch) {
     case 0x1003: return "h:mm:ss tt";          /* STIMEFORMAT */
     case 0x1006: return "MMMM yyyy";           /* SYEARMONTH */
     case 0x79: return "h:mm tt";               /* SSHORTTIME */
-    case 0x1004: *number = 65001; return NULL; /* IDEFAULTANSICODEPAGE */
+    case 0x1004: *number = 1252; return NULL;  /* IDEFAULTANSICODEPAGE */
     case 0x1007: *number = 437; return NULL;   /* IDEFAULTCODEPAGE */
     case 0x100B: *number = 0; return NULL;     /* IFIRSTWEEKOFYEAR */
     case 0x100C: *number = 6; return NULL;     /* IFIRSTDAYOFWEEK: Sunday */
@@ -223,10 +221,6 @@ typedef BOOL (CALLBACK *LOCALE_ENUMPROCEX_)(LPWSTR, DWORD, LPARAM);
 EXPORT BOOL WINAPI EnumSystemLocalesA(LOCALE_ENUMPROCA_ proc, DWORD flags) { (void)flags; char id[] = "00000409"; return proc(id) || TRUE; }
 EXPORT BOOL WINAPI EnumSystemLocalesW(LOCALE_ENUMPROCW_ proc, DWORD flags) { (void)flags; WCHAR id[] = {'0', '0', '0', '0', '0', '4', '0', '9', 0}; return proc(id) || TRUE; }
 EXPORT BOOL WINAPI EnumSystemLocalesEx(LOCALE_ENUMPROCEX_ proc, DWORD flags, LPARAM param, LPVOID reserved) { (void)reserved; WCHAR name[] = {'e', 'n', '-', 'U', 'S', 0}; return proc(name, flags, param) || TRUE; }
-typedef BOOL (CALLBACK *CODEPAGE_ENUMPROCA_)(LPSTR);
-typedef BOOL (CALLBACK *CODEPAGE_ENUMPROCW_)(LPWSTR);
-EXPORT BOOL WINAPI EnumSystemCodePagesA(CODEPAGE_ENUMPROCA_ proc, DWORD flags) { (void)flags; char cps[][6] = {"65001", "1252", "437"}; for (int i = 0; i < 3; ++i) if (!proc(cps[i])) break; return TRUE; }
-EXPORT BOOL WINAPI EnumSystemCodePagesW(CODEPAGE_ENUMPROCW_ proc, DWORD flags) { (void)flags; WCHAR a[] = {'6', '5', '0', '0', '1', 0}, b[] = {'1', '2', '5', '2', 0}, c[] = {'4', '3', '7', 0}; if (proc(a) && proc(b)) proc(c); return TRUE; }
 
 /* ---- atoms ----------------------------------------------------------------------------------------------------------------------------------------------- */
 
