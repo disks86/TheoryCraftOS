@@ -17,6 +17,7 @@
  */
 
 #include "Gui/RenderLoop.hpp"
+#include "Kernel/Delay.hpp"
 
 namespace gui {
 
@@ -44,9 +45,13 @@ void RenderLoop::thread_main(void* loop) { static_cast<RenderLoop*>(loop)->run()
 void RenderLoop::run() {
   while (!__atomic_load_n(&stop_, __ATOMIC_ACQUIRE)) {
     if (window_.dirty()) {  // (a window starts dirty: the first frame needs no signal)
+      const uint64_t start = hardware::uptime_us();
       window_.render();
       __atomic_fetch_add(&frames_, 1, __ATOMIC_ACQ_REL);
-      kernel::sleep_us(kFramePauseUs);  // changes made meanwhile become the next frame
+      // (an animation that asked for a frame time is given the rest of it: no faster than the display shows, and the CPU is free in between)
+      const uint64_t interval = window_.frame_interval_us(), spent = hardware::uptime_us() - start;
+      const uint64_t pause = interval > spent + kFramePauseUs ? interval - spent : kFramePauseUs;
+      kernel::sleep_us(pause);  // changes made meanwhile become the next frame
     } else {
       window_.wait_for_frame(100000);  // also wakes on a timer, so a missed signal cannot stall us for long
     }
