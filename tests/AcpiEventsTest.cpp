@@ -30,6 +30,8 @@
 #include "Hardware/Backlight/AcpiVideoKeys.hpp"
 #include "Hardware/Backlight/IntelPchBacklight.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
+#include "Hardware/Sensor/AcpiAmbientLight.hpp"
+#include "Hardware/Sensor/SensorHub.hpp"
 
 using namespace acpi;
 using namespace hardware;
@@ -603,7 +605,34 @@ static void test_dell_wmi() {
   no_brightness.on_notify(nullptr, 0xD0);
 }
 
+static Bytes str(const char* s) { Bytes r = b({0x0D}); while (*s) r.push_back(static_cast<uint8_t>(*s++)); r.push_back(0); return r; }
+
+static void test_ambient_light() {
+  const Bytes light = device("ALS0", cat({name_def("_HID", str("ACPI0008")), name_def("LUX", num(250)), method("_ALI", 0, cat({b({0xA4}), path("\\_SB.ALS0.LUX")}))}));
+  const Bytes broken = device("ALS1", cat({name_def("_HID", str("ACPI0008"))}));                       // (no _ALI: not a sensor)
+  const Bytes other = device("DEV3", cat({name_def("_HID", str("PNP0C0A")), method("_ALI", 0, cat({b({0xA4}), num(7)}))}));
+  const Bytes dsdt = make_table("DSDT", scope("\\_SB", cat({light, broken, other})));
+  const Bytes fadt = make_fadt();
+  const ConstByteView tables[1] = {ConstByteView(dsdt.data(), dsdt.size())};
+  TestAllocator alloc;
+  FakeHost host;
+  FakePorts ports;
+  AcpiEvents events(host, ports, alloc);
+  CHECK(events.initialize(tables, 1, ConstByteView(fadt.data(), fadt.size())));
+  Node* found[4];
+  CHECK(AcpiAmbientLight::find_devices(events.interpreter(), found, 4) == 1);
+  AcpiAmbientLight sensor(events.interpreter(), found[0]);
+  SensorHub hub;
+  SensorReading r;
+  CHECK(sensor.initialize() && sensor.kind() == SensorKind::AmbientLight && hub.add(&sensor));
+  CHECK(hub.read(SensorKind::AmbientLight, &r) && r.x == 250.0f && r.sequence == 1);
+  CHECK(sensor.read(&r) && r.sequence == 2);
+  AcpiAmbientLight none(events.interpreter(), nullptr);
+  CHECK(!none.initialize());
+}
+
 int main() {
+  test_ambient_light();
   test_dell_wmi();
   test_backlight();
   test_fadt();
