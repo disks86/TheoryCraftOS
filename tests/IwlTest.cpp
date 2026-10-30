@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <functional>
 #include <map>
 #include <sys/mman.h>
 #include <vector>
@@ -32,6 +33,8 @@
 #include "Hardware/WirelessInterface/Intel/IwlFwLoad.hpp"
 #include "Hardware/WirelessInterface/Intel/IwlRx.hpp"
 #include "Hardware/WirelessInterface/Intel/IwlTx.hpp"
+#include "Hardware/WirelessInterface/Intel/IwlTransport.hpp"
+#include "Hardware/WirelessInterface/Intel/IwlNvm.hpp"
 #include "Hardware/WirelessInterface/Intel/IwlPcie.hpp"
 
 namespace hardware {
@@ -248,13 +251,15 @@ struct FakeIwl final : IIwlRegisters {
   struct Transfer { uint32_t dst, bytes; bool extended; };
   std::vector<Transfer> transfers;
   std::map<uint32_t, uint8_t> device_memory;
+  std::function<void()> on_alive, on_doorbell;
+  bool force_radio = false;
   bool w1c = false, fail_transfers = false, cpu_released = false, alive_never = false, extended_during = false;
 
   uint32_t read32(uint32_t offset) override {
     switch (offset) {
       case iwl_csr::kHbusPrphRdat: last_prph_read_address = prph_addr_r; return prph[(prph_addr_r & 0xFFFFF) / 4];
       case iwl_csr::kHbusMemRdat: return mem[(mem_r++) % 0x1000];
-      case iwl_csr::kGpCntrl: ++reads_of_gp; return regs[offset / 4];
+      case iwl_csr::kGpCntrl: ++reads_of_gp; return regs[offset / 4] | (force_radio ? iwl_csr::kGpHwRfKillSw : 0);
       default: return regs[(offset / 4) % 0x800];
     }
   }
@@ -284,7 +289,8 @@ struct FakeIwl final : IIwlRegisters {
         regs[iwl_csr::kFhIntStatus / 4] |= iwl_csr::kFhIntTxMask;
       }
     }
-    if (offset == iwl_fh::kUcodeLoadStatus && value == 0xFFFFFFFFu && cpu_released && !alive_never) regs[iwl_csr::kInt / 4] |= iwl_csr::kIntBitAlive;
+    if (offset == iwl_fh::kUcodeLoadStatus && value == 0xFFFFFFFFu && cpu_released && !alive_never) { regs[iwl_csr::kInt / 4] |= iwl_csr::kIntBitAlive; if (on_alive) on_alive(); }
+    if (offset == iwl_tx::kHbusTargWrptr) { regs[offset / 4] = value; if (on_doorbell) on_doorbell(); return; }
     uint32_t& r = regs[(offset / 4) % 0x800];
     if (w1c && (offset == iwl_csr::kFhIntStatus || offset == iwl_csr::kInt)) { r &= ~value; return; }
     r = value;
@@ -703,6 +709,183 @@ static void test_tx() {
   CHECK(!q.ready() && alloc.dma.empty() && q.enqueue(c1, &error) < 0);
 }
 
+// ---- bringing the firmware up -----------------------------------------------------------------------------------------------------------------------------------------------------
+
+static Bytes alive_payload(uint16_t status) {
+  Bytes p;
+  p.push_back(static_cast<uint8_t>(status)); p.push_back(static_cast<uint8_t>(status >> 8)); p.push_back(0); p.push_back(0);
+  put32(p, 46); put32(p, 1);
+  p.insert(p.end(), 8, 0);
+  put32(p, 0x1234);
+  p.insert(p.end(), 16, 0);
+  put32(p, 0x800000);
+  p.insert(p.end(), 40, 0);
+  return p;
+}
+
+struct NoteCollector final : IIwlNotificationHandler {
+  std::vector<uint8_t> commands;
+  void on_notification(const IwlRxPacket& p) override { commands.push_back(p.command); }
+};
+
+static void test_transport() {
+  TestAllocator alloc;
+  const Bytes file = make_loadable_firmware(64);
+  IwlFirmware fw(alloc);
+  const char* error = nullptr;
+  CHECK(fw.parse(ConstByteView(file.data(), file.size()), &error));
+  for (int scenario = 0; scenario < 5; ++scenario) {
+    FakeIwl chip;
+    chip.w1c = true;
+    chip.force_radio = scenario != 3;
+    chip.regs[iwl_csr::kHwRev / 4] = (0x31u << 4) | 0x3;
+    chip.prph[(iwl_tx::kScdSramBase & 0xFFFFF) / 4] = 0x800000;
+    IwlTransport tp(chip, alloc, true);
+    FakeRxChip rxhw(chip);
+    FakeTxChip txhw(chip);
+    bool answer = scenario != 4;
+    chip.on_alive = [&] {
+      Bytes f;
+      FakeRxChip::frame(f, 0, iwl_cmd::kAliveNotification, 0x8000, alive_payload(scenario == 2 ? 0xDEAD : 0xCAFE));
+      rxhw.deliver(f);
+    };
+    chip.on_doorbell = [&] {
+      bool ok = false;
+      const std::vector<Bytes> cmds = txhw.process(&ok);
+      if (!answer) return;
+      for (const Bytes& c : cmds) {
+        Bytes f;
+        const uint16_t seq = static_cast<uint16_t>(c[2] | (c[3] << 8));
+        FakeRxChip::frame(f, c[1], c[0], seq, Bytes{0xAA, c[0], static_cast<uint8_t>(c.size())});
+        FakeRxChip::frame(f, 0, 0x77, 0x8000, Bytes{1});                              // and a notification after it
+        rxhw.deliver(f);
+      }
+    };
+    const bool started = tp.start(fw, IwlImage::Regular, 5000, &error);
+    if (scenario == 2) { CHECK(!started && error && alloc.dma.empty() && !tp.running()); continue; }
+    if (scenario == 3) { CHECK(!started && error && strstr(error, "radio")); continue; }
+    CHECK(started && tp.running());
+    if (error && !started) printf("  start error: %s\n", error);
+    CHECK(tp.alive().valid && tp.alive().status == 0xCAFE && tp.alive().ucode_major == 46 && tp.alive().ucode_minor == 1 && tp.alive().scd_base == 0x800000 && tp.alive().error_event_table == 0x1234);
+    // the MAC step and dash and the radio configuration went into the config register
+    CHECK((chip.regs[iwl_csr::kHwIfConfig / 4] & 0xF) == 3);
+    CHECK(chip.regs[iwl_csr::kMacShadowRegCtrl / 4] == iwl_csr::kMacShadowRegCtrlEnable);
+    Bytes d{9, 8, 7};
+    IwlHostCommand c;
+    c.opcode = 0x21; c.data = ConstByteView(d.data(), d.size());
+    uint8_t buf[16] = {};
+    NoteCollector notes;
+    if (scenario == 4) {
+      CHECK(tp.send_sync(c, ByteView(buf, sizeof buf), 2000, &error) < 0 && error);    // nobody answers
+      tp.stop();
+      CHECK(alloc.dma.empty());
+      continue;
+    }
+    int32_t n = tp.send_sync(c, ByteView(buf, sizeof buf), 2000, &error);
+    CHECK(n == 3 && buf[0] == 0xAA && buf[1] == 0x21 && buf[2] == 7);
+    // the notification that followed the response was left for the next poll
+    CHECK(tp.poll(&notes) <= 1);
+    n = tp.send_sync(c, ByteView(buf, 2), 2000, &error);                       // a response longer than the buffer: the length is still reported
+    CHECK(n == 3 && buf[1] == 0x21);
+    IwlHostCommand wide;
+    wide.group = 4; wide.opcode = 0x02; wide.version = 1;
+    CHECK(tp.send_sync(wide, ByteView(buf, sizeof buf), 2000, &error) == 3 && buf[2] == 8);
+    tp.stop();
+    CHECK(!tp.running() && alloc.dma.empty() && tp.send_sync(c, ByteView(buf, sizeof buf), 100, &error) < 0);
+  }
+}
+
+// ---- the NVM and the MAC address ---------------------------------------------------------------------------------------------------------------------------------------------------
+
+static void test_nvm() {
+  uint8_t mac[6];
+  CHECK(iwl_valid_ether_address(Bytes({0x00, 0x1B, 0x21, 1, 2, 3}).data()) && !iwl_valid_ether_address(Bytes({0x01, 0, 0, 0, 0, 1}).data()) && !iwl_valid_ether_address(Bytes(6, 0).data()));
+  // the fused words: byte-reversed
+  iwl_flip_hw_address(0x11223344, 0x0000AABB, mac);
+  CHECK(mac[0] == 0x11 && mac[1] == 0x22 && mac[2] == 0x33 && mac[3] == 0x44 && mac[4] == 0xAA && mac[5] == 0xBB);
+  // the override section wins when usable
+  Bytes ov{0, 0, 0x02, 0x11, 0x22, 0x33, 0x44, 0x55};
+  CHECK(iwl_choose_mac_address(ConstByteView(ov.data(), ov.size()), 0x11223344, 0xAABB, mac) && mac[0] == 0x02 && mac[5] == 0x55);
+  Bytes reserved{0, 0, 0x02, 0xcc, 0xaa, 0xff, 0xee, 0x00};                               // the reserved address: use the fused one
+  CHECK(iwl_choose_mac_address(ConstByteView(reserved.data(), reserved.size()), 0x10223344, 0xAABB, mac) && mac[0] == 0x10);
+  Bytes multicast{0, 0, 0x01, 1, 2, 3, 4, 5};
+  CHECK(iwl_choose_mac_address(ConstByteView(multicast.data(), multicast.size()), 0x10223344, 0xAABB, mac) && mac[0] == 0x10);
+  CHECK(!iwl_choose_mac_address(ConstByteView(), 0, 0, mac) && !iwl_choose_mac_address(ConstByteView(ov.data(), 5), 0, 0, mac));
+  CHECK(!iwl_choose_mac_address(ConstByteView(), 0x01000000, 0, mac));                      // a multicast fused address
+  {
+    FakeIwl chip;
+    IwlPcieDevice dev(chip);
+    CHECK(dev.apm_init());
+    chip.prph[(iwl_nvm::kWfmpMacAddr0 & 0xFFFFF) / 4] = 0x00A0C9F1;
+    chip.prph[(iwl_nvm::kWfmpMacAddr1 & 0xFFFFF) / 4] = 0x00000A0B;
+    CHECK(iwl_read_fused_address(dev, mac) && mac[0] == 0x00 && mac[1] == 0xA0 && mac[2] == 0xC9 && mac[3] == 0xF1 && mac[4] == 0x0A && mac[5] == 0x0B);
+  }
+  // requests and responses
+  uint8_t req[8];
+  iwl_nvm_read_request(12, 0x0102, 2048, req);
+  CHECK(req[0] == 0 && req[1] == 0 && req[2] == 12 && req[3] == 0 && req[4] == 2 && req[5] == 1 && req[6] == 0 && req[7] == 8);
+  auto response = [](uint16_t offset, uint16_t length, uint16_t type, uint16_t status, size_t data) {
+    Bytes b;
+    for (uint16_t v : {offset, length, type, status}) { b.push_back(static_cast<uint8_t>(v)); b.push_back(static_cast<uint8_t>(v >> 8)); }
+    b.insert(b.end(), data, 0x5A);
+    return b;
+  };
+  ConstByteView data;
+  Bytes ok = response(100, 10, 3, 0, 10);
+  CHECK(iwl_nvm_parse_response(ConstByteView(ok.data(), ok.size()), 3, 100, 2048, &data) && data.size() == 10);
+  for (const Bytes& bad : {response(100, 10, 3, 1, 10), response(100, 10, 4, 0, 10), response(104, 10, 3, 0, 10), response(100, 3000, 3, 0, 3000), response(100, 10, 3, 0, 4), response(100, 10, 3, 0, 0)})
+    CHECK(!iwl_nvm_parse_response(ConstByteView(bad.data(), bad.size()), 3, 100, 2048, &data));
+  CHECK(!iwl_nvm_parse_response(ConstByteView(ok.data(), 6), 3, 100, 2048, &data));
+
+  // reading sections through a running firmware
+  TestAllocator alloc;
+  const Bytes file = make_loadable_firmware(64);
+  IwlFirmware fw(alloc);
+  const char* error = nullptr;
+  CHECK(fw.parse(ConstByteView(file.data(), file.size()), &error));
+  for (int scenario = 0; scenario < 3; ++scenario) {
+    FakeIwl chip;
+    chip.w1c = true;
+    chip.force_radio = true;
+    chip.prph[(iwl_tx::kScdSramBase & 0xFFFFF) / 4] = 0x800000;
+    IwlTransport tp(chip, alloc, true);
+    FakeRxChip rxhw(chip);
+    FakeTxChip txhw(chip);
+    Bytes section(5000);
+    for (size_t i = 0; i < section.size(); ++i) section[i] = static_cast<uint8_t>(i * 7);
+    chip.on_alive = [&] { Bytes f; FakeRxChip::frame(f, 0, 1, 0x8000, alive_payload(0xCAFE)); rxhw.deliver(f); };
+    chip.on_doorbell = [&] {
+      bool good = false;
+      for (const Bytes& c : txhw.process(&good)) {
+        const uint16_t offset = static_cast<uint16_t>(c[8] | (c[9] << 8)), want = static_cast<uint16_t>(c[10] | (c[11] << 8));
+        const uint16_t type = static_cast<uint16_t>(c[6] | (c[7] << 8));
+        const uint16_t seq = static_cast<uint16_t>(c[2] | (c[3] << 8));
+        size_t n = offset >= section.size() ? 0 : section.size() - offset;
+        if (n > want) n = want;
+        Bytes payload;
+        for (uint16_t v : {offset, static_cast<uint16_t>(n), type, static_cast<uint16_t>(scenario == 1 ? 1 : 0)}) { payload.push_back(static_cast<uint8_t>(v)); payload.push_back(static_cast<uint8_t>(v >> 8)); }
+        if (scenario == 2 && offset > 0) payload[0] ^= 1;                                  // the wrong offset comes back
+        payload.insert(payload.end(), section.begin() + (offset < section.size() ? offset : section.size()), section.begin() + (offset < section.size() ? offset : section.size()) + n);
+        Bytes f;
+        FakeRxChip::frame(f, 0, 0x88, seq, payload);
+        rxhw.deliver(f);
+      }
+    };
+    CHECK(tp.start(fw, IwlImage::Regular, 5000, &error));
+    ByteBuffer out(alloc);
+    const bool read = iwl_read_nvm_section(tp, 12, out, &error);
+    if (scenario == 0) {
+      CHECK(read && out.size() == 5000);
+      bool same = out.size() == 5000;
+      for (size_t i = 0; same && i < 5000; ++i) same = out.view()[i] == section[i];
+      CHECK(same);
+    } else {
+      CHECK(!read && error);
+    }
+    tp.stop();
+  }
+}
+
 int main() {
   test_devices();
   test_firmware();
@@ -711,6 +894,8 @@ int main() {
   test_load();
   test_rx();
   test_tx();
+  test_transport();
+  test_nvm();
   printf(g_failed ? "IwlTest: %d FAILED\n" : "IwlTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }
