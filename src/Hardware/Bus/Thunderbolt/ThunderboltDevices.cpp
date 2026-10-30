@@ -21,11 +21,12 @@
 namespace hardware {
 
 namespace {
-// (nhi.h: PCI_DEVICE_ID_INTEL_ALPINE_RIDGE_*_NHI)
+// (nhi.h: PCI_DEVICE_ID_INTEL_ALPINE_RIDGE_*_NHI and TITAN_RIDGE_*_NHI)
 constexpr TbNhiDevice kDevices[] = {
     {0x15BF, "Alpine Ridge LP", TbGeneration::AlpineRidge},          {0x15D2, "Alpine Ridge C 4C", TbGeneration::AlpineRidge},
     {0x15D9, "Alpine Ridge C 2C", TbGeneration::AlpineRidge},        {0x15DC, "Alpine Ridge LP (USB only)", TbGeneration::AlpineRidge},
     {0x15DD, "Alpine Ridge (USB only)", TbGeneration::AlpineRidge},  {0x15DE, "Alpine Ridge C (USB only)", TbGeneration::AlpineRidge},
+    {0x15E8, "Titan Ridge 2C", TbGeneration::TitanRidge},            {0x15EB, "Titan Ridge 4C", TbGeneration::TitanRidge},
 };
 }  // namespace
 

@@ -27,6 +27,7 @@
 #include "Crypto/Random.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltCio.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltControl.hpp"
+#include "Hardware/Bus/Thunderbolt/ThunderboltDevices.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltKeys.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltRing.hpp"
 #include "ObjectContainer/List.hpp"
@@ -48,6 +49,8 @@ constexpr uint32_t kDepthShift = 4;
 // the sizes of the structures
 constexpr uint32_t kTopologyBytes = 152, kTopologyPackets = 14, kPortTypePort = 1;
 constexpr uint32_t kKeyedBytes = 56, kChallengeResponseBytes = 88;
+// Titan Ridge: devices are named by their route string
+constexpr uint32_t kTrDriverReadyResponseBytes = 16, kTrApproveBytes = 32, kTrKeyedBytes = 64, kTrChallengeResponseBytes = 96, kTrDeviceConnectedMinBytes = 32, kTrDeviceDisconnectedBytes = 12;
 constexpr uint32_t kHeaderBytes = 4, kDriverReadyBytes = 4, kDriverReadyResponseBytes = 8, kApproveBytes = 24, kGetRouteBytes = 8, kGetRouteResponseBytes = 16, kDeviceConnectedMinBytes = 24,
                    kDeviceDisconnectedBytes = 8;
 }  // namespace tb_icm
@@ -66,7 +69,8 @@ struct TbDriverReady {
 struct TbDevice {
   uint8_t uuid[16] = {};
   uint8_t connection_key = 0, connection_id = 0;
-  uint8_t link = 0, depth = 0;         // the port (1 to 4) and how many routers away from the host
+  uint8_t link = 0, depth = 0;         // the port (1 to 4) and how many routers away from the host (Alpine Ridge)
+  uint64_t route = 0;                  // the route string, 8 bits a hop (Titan Ridge; the depth is how many hops, the link is the first)
   bool authorized = false, boot = false, dual_lane = false, gen3 = false;
   TbSecurityLevel security = TbSecurityLevel::Unknown;
 };
@@ -94,6 +98,17 @@ uint32_t build_approve_device(const TbDevice& device, ByteView out);
 uint32_t build_get_route(uint8_t link, uint8_t depth, ByteView out);
 // ADD_DEVICE_KEY and CHALLENGE_DEVICE: the device, then 32 bytes (the key, the challenge).
 uint32_t build_add_device_key(const TbDevice& device, ConstByteView key, ByteView out);
+// The Titan Ridge forms (the device is named by its route string; the layout has the route words after the UUID).
+uint32_t build_approve_device_tr(const TbDevice& device, ByteView out);
+uint32_t build_add_device_key_tr(const TbDevice& device, ConstByteView key, ByteView out);
+uint32_t build_challenge_device_tr(const TbDevice& device, ConstByteView challenge, ByteView out);
+bool parse_challenge_response_tr(ConstByteView response, ByteView out);
+bool parse_driver_ready_tr(ConstByteView response, TbDriverReady* out);
+// Only the first packet of a device connected event counts (the next ones carry quality of service information).
+bool parse_device_connected_tr(ConstByteView event, TbDevice* out, bool* rejected);
+bool parse_device_disconnected_tr(ConstByteView event, uint64_t* route);
+// How many hops a route string has.
+uint32_t route_length(uint64_t route);
 uint32_t build_challenge_device(const TbDevice& device, ConstByteView challenge, ByteView out);
 // The 32 byte response of a CHALLENGE_DEVICE answer.
 bool parse_challenge_response(ConstByteView response, ByteView out);
@@ -126,6 +141,7 @@ class ThunderboltIcm final : public IThunderboltEvents {
   struct Options {
     TbPcie2Cio* cio = nullptr;
     bool start_firmware = false;       // start the firmware if the BIOS did not (needs `cio`); off by default: it resets the controller's CPU
+    TbGeneration generation = TbGeneration::AlpineRidge;      // which messages the firmware speaks
     bool reset_ports = true;           // bounce the links of both physical ports (needs `cio`) so that the firmware enumerates what is connected afresh
   };
   static constexpr uint32_t kRequestTimeoutUs = 5000000, kApproveTimeoutUs = 10000000, kRetries = 3, kMaxDevices = 32;
@@ -181,8 +197,12 @@ class ThunderboltIcm final : public IThunderboltEvents {
   void on_event(TbPacketType type, ConstByteView body) override;
 
  private:
+  bool titan() const { return options_.generation == TbGeneration::TitanRidge; }
+  bool same_place(const TbDevice& a, const TbDevice& b) const;
+  uint32_t approve_bytes() const { return titan() ? tb_icm::kTrApproveBytes : tb_icm::kApproveBytes; }
+  uint32_t build_approve(const TbDevice& device, ByteView out) const { return titan() ? tb_icm::build_approve_device_tr(device, out) : tb_icm::build_approve_device(device, out); }
   Outcome bring_up(uint32_t timeout_us, bool resuming);
-  bool request(ConstByteView request, ByteView response, uint32_t timeout_us);
+  bool request(ConstByteView request, ByteView response, uint32_t timeout_us, uint32_t retries = kRetries);
   bool parent_authorized(const TbDevice& device) const;
   void mark_authorized(const TbDevice& device);
   bool request_flags(ConstByteView request, ByteView response, uint32_t timeout_us, const char** error, const char* no_answer);

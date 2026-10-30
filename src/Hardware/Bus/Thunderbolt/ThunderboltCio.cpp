@@ -24,10 +24,10 @@ namespace hardware {
 namespace {
 constexpr uint32_t kStepUs = 1000;
 
-// (nhi.h: PCI_DEVICE_ID_INTEL_ALPINE_RIDGE_*_BRIDGE)
+// (nhi.h: PCI_DEVICE_ID_INTEL_ALPINE_RIDGE_*_BRIDGE and TITAN_RIDGE_*_BRIDGE)
 bool is_alpine_ridge_bridge(uint16_t device) {
   switch (device) {
-    case 0x1576: case 0x1578: case 0x15C0: case 0x15D3: case 0x15DA: return true;
+    case 0x1576: case 0x1578: case 0x15C0: case 0x15D3: case 0x15DA: case 0x15E7: case 0x15EA: case 0x15EF: return true;
     default: return false;
   }
 }

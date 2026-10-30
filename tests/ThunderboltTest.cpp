@@ -77,7 +77,7 @@ static std::vector<uint8_t> as_bytes(const std::vector<uint32_t>& words) {
 static void test_devices() {
   CHECK(tb_find_nhi(0x8086, 0x15BF) && tb_find_nhi(0x8086, 0x15D2) && tb_find_nhi(0x8086, 0x15D9) && tb_find_nhi(0x8086, 0x15DC));
   CHECK(tb_find_nhi(0x8086, 0x15BF)->generation == TbGeneration::AlpineRidge);
-  CHECK(!tb_find_nhi(0x8086, 0x15EB) && !tb_find_nhi(0x8086, 0x9A1B) && !tb_find_nhi(0x10DE, 0x15BF) && !tb_find_nhi(0x8086, 0));
+  CHECK(tb_find_nhi(0x8086, 0x15EB) && tb_find_nhi(0x8086, 0x15E8) && tb_find_nhi(0x8086, 0x15EB)->generation == TbGeneration::TitanRidge && !tb_find_nhi(0x8086, 0x15EA) && !tb_find_nhi(0x8086, 0x9A1B) && !tb_find_nhi(0x10DE, 0x15BF) && !tb_find_nhi(0x8086, 0));
 }
 
 static void test_framing() {
@@ -1127,6 +1127,172 @@ static void test_suspend() {
   CHECK(alloc.dma.empty());
 }
 
+
+// ---- Titan Ridge
+
+static void test_titan() {
+  TestAllocator alloc;
+  // the messages
+  TbDevice d;
+  for (int i = 0; i < 16; ++i) d.uuid[i] = static_cast<uint8_t>(0xD0 + i);
+  d.route = (0x12ull << 32) | 0x00030201;
+  d.connection_id = 5;
+  uint8_t out[80], key[32];
+  for (int i = 0; i < 32; ++i) key[i] = static_cast<uint8_t>(i + 1);
+  CHECK(tb_icm::build_approve_device_tr(d, ByteView(out, sizeof out)) == 32 && out[0] == 4 && out[4] == 0xD0 && out[20] == 0x12 && out[24] == 0x01 && out[25] == 0x02 && out[26] == 0x03 && out[28] == 5);
+  CHECK(tb_icm::build_add_device_key_tr(d, ConstByteView(key, 32), ByteView(out, sizeof out)) == 64 && out[0] == 6 && out[32] == 1 && out[63] == 32);
+  CHECK(tb_icm::build_challenge_device_tr(d, ConstByteView(key, 32), ByteView(out, sizeof out)) == 64 && out[0] == 5);
+  CHECK(tb_icm::build_approve_device_tr(d, ByteView(out, 31)) == 0 && tb_icm::build_add_device_key_tr(d, ConstByteView(key, 31), ByteView(out, sizeof out)) == 0);
+  CHECK(tb_icm::route_length(0) == 0 && tb_icm::route_length(1) == 1 && tb_icm::route_length(0xFF) == 1 && tb_icm::route_length(0x100) == 2 && tb_icm::route_length(0x030201) == 3 && tb_icm::route_length(1ull << 63) == 8);
+  // driver ready
+  const uint8_t ready_bytes[16] = {3, 0x40, 0, 1, 0, 0, 0x82, 0x00, 1, 2, 3, 4, 0xEB, 0x15, 0, 0};            // info: level 2, boot ACL 1
+  TbDriverReady ready;
+  CHECK(tb_icm::parse_driver_ready_tr(ConstByteView(ready_bytes, 16), &ready) && ready.security == TbSecurityLevel::Secure && ready.boot_acl_entries == 1 && ready.rtd3);
+  for (size_t len = 0; len < 16; ++len) CHECK(!tb_icm::parse_driver_ready_tr(ConstByteView(ready_bytes, len), &ready));
+  // events, cut and flipped
+  std::vector<uint8_t> ev(244, 0);
+  ev[0] = 3;
+  for (int i = 0; i < 16; ++i) ev[4 + i] = static_cast<uint8_t>(0x60 + i);
+  ev[24] = 0x01;
+  ev[25] = 0x02;
+  ev[28] = 7;
+  ev[31] = 1;                                         // link_info: approved (bit 8)
+  TbDevice parsed;
+  bool rejected = true;
+  CHECK(tb_icm::parse_device_connected_tr(ConstByteView(ev.data(), ev.size()), &parsed, &rejected) && !rejected && parsed.route == 0x0201 && parsed.depth == 2 && parsed.link == 1 && parsed.authorized && parsed.connection_id == 7);
+  for (size_t len = 0; len < ev.size(); ++len) CHECK(tb_icm::parse_device_connected_tr(ConstByteView(ev.data(), len), &parsed, &rejected) == (len >= 32));
+  for (size_t bit = 0; bit < 32 * 8; ++bit) {
+    std::vector<uint8_t> f = ev;
+    f[bit / 8] ^= static_cast<uint8_t>(1u << (bit % 8));
+    tb_icm::parse_device_connected_tr(ConstByteView(f.data(), f.size()), &parsed, &rejected);
+  }
+  ev[2] = 1;                                          // a later packet (quality of service)
+  CHECK(!tb_icm::parse_device_connected_tr(ConstByteView(ev.data(), ev.size()), &parsed, &rejected));
+  const uint8_t gone[12] = {4, 0, 0, 1, 0, 0, 0, 0, 0x01, 0x02, 0, 0};
+  uint64_t route = 0;
+  CHECK(tb_icm::parse_device_disconnected_tr(ConstByteView(gone, 12), &route) && route == 0x0201);
+  for (size_t len = 0; len < 12; ++len) CHECK(!tb_icm::parse_device_disconnected_tr(ConstByteView(gone, len), &route));
+
+  const char* error = nullptr;
+  auto make = [](uint8_t seed) { return make_device(seed, 0, 0); };
+  {
+    FakeNhi chip;
+    chip.titan_ridge = true;
+    chip.security = 1;
+    ThunderboltIcm icm(chip, alloc);
+    ThunderboltIcm::Options options;
+    options.generation = TbGeneration::TitanRidge;
+    icm.set_options(options);
+    CHECK(icm.start() == ThunderboltIcm::Outcome::Started && icm.security_level() == TbSecurityLevel::User);
+    // a device behind the host, one behind that, another on the other port
+    chip.send_device_connected_tr(make(0x10), 0x01);
+    chip.send_device_connected_tr(make(0x20), 0x0201);
+    chip.send_device_connected_tr(make(0x30), 0x03, true);
+    chip.send_device_connected_tr(make(0x40), 0x0401, false, false, 1);       // a QoS packet: ignored
+    chip.send_device_connected_tr(make(0x50), 0x05, false, true);             // rejected
+    icm.poll();
+    CHECK(icm.device_count() == 3 && icm.device(0).route == 0x01 && icm.device(1).depth == 2 && icm.device(2).authorized);
+    uint64_t r = 0;
+    CHECK(icm.route(1, &r) && r == 0x0201);
+    // the one behind first needs the first
+    uint64_t far = 1;
+    CHECK(!icm.approve(far, &error) && strstr(error, "hangs"));
+    chip.devices.push_back(make(0x10));
+    CHECK(icm.approve(0, &error) && chip.approved_routes.size() == 1 && chip.approved_routes[0] == 0x01 && icm.device(0).authorized);
+    CHECK(icm.approve(far, &error) && chip.approved_routes.size() == 2 && chip.approved_routes[1] == 0x0201);
+    // a device at the same route replaces the old one, the same device elsewhere moves
+    chip.send_device_connected_tr(make(0x60), 0x03);
+    icm.poll();
+    CHECK(icm.device_count() == 3);
+    chip.send_device_connected_tr(make(0x10), 0x07);
+    icm.poll();
+    CHECK(icm.device_count() == 3 && icm.device(2).route == 0x07);
+    // a disconnect takes the device and what hangs below it, not its neighbours
+    chip.send_device_connected_tr(make(0x70), 0x010201);
+    chip.send_device_connected_tr(make(0x80), 0x0301);
+    icm.poll();
+    const uint64_t before = icm.device_count();
+    chip.send_device_disconnected_tr(0x0201);
+    icm.poll();
+    bool left = false, gone_below = true;
+    for (uint64_t i = 0; i < icm.device_count(); ++i) {
+      if (icm.device(i).route == 0x0201 || icm.device(i).route == 0x010201) gone_below = false;
+      if (icm.device(i).route == 0x0301 || icm.device(i).route == 0x03) left = true;
+    }
+    CHECK(gone_below && left && icm.device_count() == before - 2);
+    chip.send_device_disconnected_tr(0x09);
+    chip.send_icm_event({4u | (1u << 24)});
+    icm.poll();
+    CHECK(icm.device_count() == before - 2);
+    // a disconnect of the host router's own route is nonsense and changes nothing
+    chip.send_device_disconnected_tr(0);
+    icm.poll();
+    CHECK(icm.device_count() == before - 2);
+  }
+  // secure connect with the route forms
+  {
+    FakeNhi chip;
+    chip.titan_ridge = true;
+    chip.security = 2;
+    ThunderboltIcm icm(chip, alloc);
+    ThunderboltIcm::Options options;
+    options.generation = TbGeneration::TitanRidge;
+    icm.set_options(options);
+    MemoryKeys keys;
+    CountingRandom random;
+    icm.set_secure(&random, &keys);
+    CHECK(icm.start() == ThunderboltIcm::Outcome::Started && icm.security_level() == TbSecurityLevel::Secure);
+    chip.send_device_connected_tr(make(0x10), 0x01);
+    icm.poll();
+    chip.requests_seen.clear();
+    CHECK(icm.approve_secure(0, &error) && chip.requests_seen.size() == 2 && chip.requests_seen[0] == 6 && chip.requests_seen[1] == 4 && keys.keys.size() == 1 && chip.device_keys.size() == 1);
+    chip.send_device_disconnected_tr(0x01);
+    chip.send_device_connected_tr(make(0x10), 0x01);
+    icm.poll();
+    chip.requests_seen.clear();
+    CHECK(icm.approve_secure(0, &error) && chip.requests_seen.size() == 2 && chip.requests_seen[0] == 5 && chip.requests_seen[1] == 4);
+    chip.send_device_disconnected_tr(0x01);
+    chip.send_device_connected_tr(make(0x10), 0x01);
+    icm.poll();
+    chip.challenge_wrong = true;
+    CHECK(!icm.approve_secure(0, &error) && !icm.device(0).authorized);
+  }
+  // the firmware is started through the other register
+  {
+    FakeNhi chip;
+    chip.titan_ridge = true;
+    chip.icm_enabled = false;
+    chip.auth_done = false;
+    fake_tb::FakeCio config(chip);
+    config.titan = true;
+    TbPcie2Cio cio(config, 0x100);
+    ThunderboltIcm icm(chip, alloc);
+    ThunderboltIcm::Options options;
+    options.generation = TbGeneration::TitanRidge;
+    options.cio = &cio;
+    options.start_firmware = true;
+    options.reset_ports = false;
+    icm.set_options(options);
+    CHECK(icm.start(50000) == ThunderboltIcm::Outcome::Started && config.commands.size() >= 1 && config.commands[0].index == 0x777 && config.commands[0].value == 2);
+  }
+  // an Alpine Ridge firmware answering the Titan Ridge client is refused (the reply is too short)
+  {
+    FakeNhi chip;                                                      // answers with 8 bytes
+    ThunderboltIcm icm(chip, alloc);
+    ThunderboltIcm::Options options;
+    options.generation = TbGeneration::TitanRidge;
+    icm.set_options(options);
+    CHECK(icm.start(20000) == ThunderboltIcm::Outcome::DriverReadyFailed);
+  }
+  // the driver passes the generation on
+  {
+    FakeNhi chip;
+    chip.titan_ridge = true;
+    ThunderboltDriver driver(alloc);
+    CHECK(driver.start_device(chip, nullptr, TbGeneration::TitanRidge) == ThunderboltDriver::Outcome::Started);
+  }
+}
+
 static void test_driver() {
   TestAllocator alloc;
   {
@@ -1192,6 +1358,7 @@ int main() {
   test_secure();
   test_key_files();
   test_suspend();
+  test_titan();
   test_driver();
   printf(g_failed ? "ThunderboltTest: %d FAILED\n" : "ThunderboltTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;

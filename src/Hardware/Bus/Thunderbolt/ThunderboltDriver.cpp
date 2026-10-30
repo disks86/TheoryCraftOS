@@ -43,15 +43,16 @@ ThunderboltDriver::Outcome ThunderboltDriver::start(IPciBus& pci, const PciDevic
     const uint16_t capability = upstream_config_ ? tb_find_vendor_capability(*upstream_config_) : 0;
     if (capability != 0) cio_ = UniquePointer<TbPcie2Cio>::make(allocator_, *upstream_config_, capability);
   }
-  return start_device(*mmio_, cio_.get());
+  return start_device(*mmio_, cio_.get(), model_->generation);
 }
 
-ThunderboltDriver::Outcome ThunderboltDriver::start_device(ITbRegisters& registers, TbPcie2Cio* cio) {
+ThunderboltDriver::Outcome ThunderboltDriver::start_device(ITbRegisters& registers, TbPcie2Cio* cio, TbGeneration generation) {
   icm_ = UniquePointer<ThunderboltIcm>::make(allocator_, registers, allocator_);
   if (!icm_) return outcome_ = Outcome::OutOfMemory;
   ThunderboltIcm::Options options;
   options.cio = cio;
   options.start_firmware = config_.start_firmware;
+  options.generation = generation;
   options.reset_ports = config_.reset_ports;
   icm_->set_options(options);
   const ThunderboltIcm::Outcome result = icm_->start();
