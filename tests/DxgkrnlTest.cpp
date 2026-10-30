@@ -2727,8 +2727,8 @@ void test_dxbc_real() {
         CHECK(p->emit_tgsi(&text) == status::kSuccess && strstr(std::string(text.view().data(), text.size()).c_str(), k.name));
       }
     }
-    const std::vector<uint8_t> compute_blob = read_blob("cs_fill.dxbc");
-    for (const std::vector<uint8_t>* blob : {&vs_blob, &color_blob, &tex_blob, &math_blob, &volume_blob, &array_blob, &cube_blob, &compute_blob}) {
+    const std::vector<uint8_t> compute_blob = read_blob("cs_fill.dxbc"), geometry_blob = read_blob("gs_copy.dxbc"), int_write_blob = read_blob("ps_int_write.dxbc"), int_load_blob = read_blob("ps_int_load.dxbc");
+    for (const std::vector<uint8_t>* blob : {&vs_blob, &color_blob, &tex_blob, &math_blob, &volume_blob, &array_blob, &cube_blob, &compute_blob, &geometry_blob, &int_write_blob, &int_load_blob}) {
       for (size_t cut = 0; cut < blob->size(); cut += 3) {
         std::vector<uint8_t> t(blob->begin(), blob->begin() + static_cast<long>(cut));
         UniquePointer<D3d9Program> p = compile_dxbc(allocator, t, &st);
@@ -2754,6 +2754,12 @@ void test_dxbc_real() {
           for (uint32_t k = 0; k < graphics::kMaxStorageBuffers; ++k) context.buffers[k] = ByteView(storage[k], sizeof storage[k]);
           context.dispatch_id[0] = context.dispatch_id[1] = 5;
           p->run_compute(context, constants);
+          // (a geometry shader, given a triangle)
+          graphics::GeometryInputData in;
+          for (uint32_t k = 0; k < 3; ++k) in.position[k] = {static_cast<float>(k), 1.0f, 0.5f, 1.0f};
+          graphics::GeometryOutputData out;
+          p->run_geometry(in, constants, &out);
+          CHECK(out.count <= graphics::kMaxGeometryVertices);
         } else {
           ++refused;
         }
@@ -3992,6 +3998,193 @@ void test_multisample() {
   CHECK(kernel.create_allocation(kPid, dev, d, &refused) == status::kNotSupported);
 }
 
+void test_geometry_kernel() {
+  Env e;
+  namespace b = conformance_blobs;
+  Handle vs = 0, gs = 0, ps = 0;
+  ShaderDesc sd;
+  sd.kind = ShaderKind::Dxbc;
+  sd.stage = graphics::ShaderStage::Vertex, sd.code = ConstByteView(b::k_vs, sizeof b::k_vs);
+  CHECK(e.kernel.create_shader(kPid, e.dev, sd, &vs) == status::kSuccess);
+  sd.stage = graphics::ShaderStage::Geometry, sd.code = ConstByteView(b::k_gs_copy, sizeof b::k_gs_copy);
+  CHECK(e.kernel.create_shader(kPid, e.dev, sd, &gs) == status::kSuccess);
+  sd.stage = graphics::ShaderStage::Fragment, sd.code = ConstByteView(b::k_ps_color, sizeof b::k_ps_color);
+  CHECK(e.kernel.create_shader(kPid, e.dev, sd, &ps) == status::kSuccess);
+  auto pipeline = [&](Handle geometry, Handle* out) {
+    PipelineDesc pd;
+    pd.vertex_shader = vs, pd.fragment_shader = ps, pd.geometry_shader = geometry, pd.vertex_stride = 28, pd.attribute_count = 2, pd.varying_count = 3;
+    pd.attributes[0] = {0, graphics::VertexFormat::Float3, 0};
+    pd.attributes[1] = {1, graphics::VertexFormat::Float4, 12};
+    pd.cull_mode = graphics::CullMode::None;
+    return e.kernel.create_pipeline(kPid, e.dev, pd, out);
+  };
+  Handle with_gs = 0, without = 0, wrong = 0;
+  CHECK(pipeline(gs, &with_gs) == status::kSuccess && pipeline(0, &without) == status::kSuccess);
+  CHECK(pipeline(vs, &wrong) == status::kInvalidParameter);   // (not a geometry shader)
+  CHECK(pipeline(0x7777, &wrong) == status::kInvalidHandle);
+  Handle target = e.alloc(kTarget, Format::A8R8G8B8, 32, 32), vb = e.buffer(kAllocVertexBuffer, 4 * 28);
+  const float v[28] = {-0.9f, -0.9f, 0.5f, 1, 0, 0, 1, 0.9f, -0.9f, 0.5f, 0, 1, 0, 1, 0, 0.9f, 0.5f, 0, 0, 1, 1, 0.5f, 0.9f, 0.5f, 1, 1, 0, 1};
+  CHECK(e.write(vb, floats(v, 28)));
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  auto draw = [&](Handle pipe, Topology topology, uint32_t count) {
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    w.bind_pipeline(pipe);
+    w.bind_vertex_buffer(1);
+    w.push_constants(floats(identity, 16));
+    w.set_topology(topology);
+    w.draw(count);
+    w.end_pass();
+    return e.render(w, {target, vb});
+  };
+  // It takes triangles: a list or a strip (which the kernel makes into a list); lines and points are refused (and a pipeline without it takes anything).
+  CHECK(draw(with_gs, Topology::TriangleList, 3) == status::kSuccess);
+  CHECK(e.pixel(target, 4, 28) != 0xFF000000u);
+  CHECK(draw(with_gs, Topology::TriangleStrip, 4) == status::kSuccess);
+  CHECK(draw(with_gs, Topology::LineList, 2) == status::kInvalidParameter);
+  CHECK(draw(with_gs, Topology::PointList, 2) == status::kInvalidParameter);
+  CHECK(draw(without, Topology::LineList, 2) == status::kSuccess);
+  // A device without the feature refuses the shader.
+  FakeScreen screen(8, 6);
+  graphics::SoftwareDevice software(e.allocator, &screen);
+  SpyDevice limited(software);
+  limited.feature_mask = 0;
+  Kernel kernel(e.allocator);
+  AdapterConfig c;
+  c.display = &screen;
+  kernel.add_adapter(limited, c);
+  Handle adapter = 0, dev = 0, refused = 0;
+  CHECK(kernel.open_process(kPid) == status::kSuccess && kernel.open_adapter_from_index(kPid, 0, &adapter) == status::kSuccess && kernel.create_device(kPid, adapter, &dev) == status::kSuccess);
+  sd.stage = graphics::ShaderStage::Geometry, sd.code = ConstByteView(b::k_gs_copy, sizeof b::k_gs_copy);
+  CHECK(kernel.create_shader(kPid, dev, sd, &refused) == status::kNotSupported);
+}
+
+void test_formats() {
+  Env e;
+  auto create = [&](uint32_t flags, Format f, uint32_t w = 8, uint32_t h = 8, uint32_t mips = 1, uint32_t samples = 1, Handle* out = nullptr) {
+    AllocationDesc d;
+    d.flags = flags, d.format = f, d.width = w, d.height = h, d.mip_levels = mips, d.samples = samples;
+    Handle handle = 0;
+    const NtStatus st = e.kernel.create_allocation(kPid, e.dev, d, &handle);
+    if (out) *out = handle;
+    return st;
+  };
+  const Format all[] = {Format::A8R8G8B8Srgb, Format::A8B8G8R8Srgb, Format::A16B16G16R16, Format::A32B32G32R32Uint};
+  for (Format f : all) CHECK(create(kAllocRenderTarget | kAllocTexture, f) == status::kSuccess && create(kAllocStaging, f) == status::kSuccess);
+  // Not presentable; the wide ones have one level and cannot be multisampled; an sRGB image may.
+  for (Format f : all) CHECK(create(kAllocRenderTarget | kAllocPresent, f) == status::kInvalidParameter);
+  CHECK(create(kAllocTexture, Format::A16B16G16R16, 8, 8, 2) == status::kInvalidParameter && create(kAllocTexture, Format::A32B32G32R32Uint, 8, 8, 2) == status::kInvalidParameter);
+  CHECK(create(kAllocTexture, Format::A8R8G8B8Srgb, 8, 8, 2) == status::kSuccess);
+  CHECK(create(kAllocRenderTarget, Format::A16B16G16R16, 8, 8, 1, 4) == status::kInvalidParameter && create(kAllocRenderTarget, Format::A32B32G32R32Uint, 8, 8, 1, 4) == status::kInvalidParameter);
+  // A device without the features refuses them (staging memory is only memory, and is fine).
+  {
+    FakeScreen screen(8, 6);
+    graphics::SoftwareDevice software(e.allocator, &screen);
+    SpyDevice limited(software);
+    limited.feature_mask = 0;
+    Kernel kernel(e.allocator);
+    AdapterConfig c;
+    c.display = &screen;
+    kernel.add_adapter(limited, c);
+    Handle adapter = 0, dev = 0, refused = 0;
+    CHECK(kernel.open_process(kPid) == status::kSuccess && kernel.open_adapter_from_index(kPid, 0, &adapter) == status::kSuccess && kernel.create_device(kPid, adapter, &dev) == status::kSuccess);
+    for (Format f : all) {
+      AllocationDesc d;
+      d.flags = kAllocRenderTarget, d.format = f, d.width = d.height = 8;
+      CHECK(kernel.create_allocation(kPid, dev, d, &refused) == status::kNotSupported);
+      d.flags = kAllocStaging;
+      CHECK(kernel.create_allocation(kPid, dev, d, &refused) == status::kSuccess);
+    }
+  }
+  // What a clear leaves, read back through the memory manager: 16-bit normalised (0.5, 0.25, 1, 0) is 8000 4000 FFFF 0000; the integers are the bits given; sRGB takes linear 0.5 as BC
+  // (and 0.5 alpha, which is linear, as 80).
+  Handle unorm = 0, uint = 0, srgb = 0;
+  CHECK(create(kAllocRenderTarget, Format::A16B16G16R16, 4, 4, 1, 1, &unorm) == status::kSuccess && create(kAllocRenderTarget, Format::A32B32G32R32Uint, 4, 4, 1, 1, &uint) == status::kSuccess &&
+        create(kAllocRenderTarget, Format::A8R8G8B8Srgb, 4, 4, 1, 1, &srgb) == status::kSuccess);
+  auto clear = [&](Handle target, graphics::Vec4 colour) {
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, colour, 1, 0);
+    w.end_pass();
+    return e.render(w, {target});
+  };
+  auto word = [&](Handle image, uint32_t index) {
+    LockResult r;
+    if (e.kernel.lock(kPid, image, kLockReadOnly, 0, &r) != status::kSuccess) return 0xDEADDEADu;
+    ByteReader in(r.data);
+    in.skip(uint64_t{index} * 4);
+    const uint32_t v = in.le32();
+    e.kernel.unlock(kPid, image);
+    return v;
+  };
+  CHECK(clear(unorm, {0.5f, 0.25f, 1.0f, 0.0f}) == status::kSuccess && word(unorm, 0) == 0x40008000u && word(unorm, 1) == 0x0000FFFFu);
+  CHECK(clear(uint, {__builtin_bit_cast(float, 7u), __builtin_bit_cast(float, 0xFFFFFFFFu), __builtin_bit_cast(float, 0x7FC00001u), __builtin_bit_cast(float, 1u)}) == status::kSuccess);
+  CHECK(word(uint, 0) == 7 && word(uint, 1) == 0xFFFFFFFFu && word(uint, 2) == 0x7FC00001u && word(uint, 3) == 1 && word(uint, 4 * 15) == 7 && word(uint, 4 * 15 + 1) == 0xFFFFFFFFu);
+  CHECK(clear(srgb, {0.5f, 0.5f, 0.5f, 0.5f}) == status::kSuccess && word(srgb, 0) == 0x80BCBCBCu);
+  // The clear of an ordinary target still refuses what is not a colour.
+  Handle plain = 0;
+  CHECK(create(kAllocRenderTarget, Format::A8R8G8B8, 4, 4, 1, 1, &plain) == status::kSuccess && clear(plain, {__builtin_bit_cast(float, 0x7FC00001u), 0, 0, 0}) == status::kInvalidParameter);
+  // Integer targets take no blending.
+  {
+    Handle vs = 0, fs = 0, pipe = 0;
+    CHECK(e.kernel.create_shader(kPid, e.dev, {ShaderKind::ColoredVertex, graphics::ShaderStage::Vertex, {}}, &vs) == status::kSuccess);
+    CHECK(e.kernel.create_shader(kPid, e.dev, {ShaderKind::ColoredFragment, graphics::ShaderStage::Fragment, {}}, &fs) == status::kSuccess);
+    graphics::GraphicsPipelineDesc gd;
+    graphics::describe_colored_pipeline(&gd);
+    PipelineDesc pd;
+    pd.vertex_shader = vs, pd.fragment_shader = fs, pd.vertex_stride = gd.vertex_stride, pd.attribute_count = 2, pd.varying_count = 1;
+    pd.attributes[0] = gd.attributes[0], pd.attributes[1] = gd.attributes[1];
+    pd.cull_mode = graphics::CullMode::None;
+    pd.alpha_blend = true;
+    CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &pipe) == status::kSuccess);
+    Handle vb = e.buffer(kAllocVertexBuffer, 3 * 28);
+    CHECK(write_triangle(e, vb, 1, 0, 0));
+    const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    auto draw = [&](Handle target) {
+      CommandWriter w(e.allocator);
+      w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+      w.bind_pipeline(pipe);
+      w.bind_vertex_buffer(1);
+      w.push_constants(floats(identity, 16));
+      w.draw(3);
+      w.end_pass();
+      return e.render(w, {target, vb});
+    };
+    CHECK(draw(uint) == status::kInvalidParameter && draw(unorm) == status::kSuccess && draw(srgb) == status::kSuccess);
+    // (a red triangle over black with source-over: opaque, so the encoded red is FF)
+    CHECK(word(srgb, 0) == 0xFFFF0000u);
+  }
+  // A multisampled sRGB image resolves as linear values: three of four samples of red average to 0.75, encoded E1 (an ordinary image would give BF).
+  {
+    Handle ms = 0, resolved = 0, vs = 0, fs = 0, pipe = 0;
+    CHECK(create(kAllocRenderTarget, Format::A8R8G8B8Srgb, 16, 16, 1, 4, &ms) == status::kSuccess && create(kAllocRenderTarget, Format::A8R8G8B8Srgb, 16, 16, 1, 1, &resolved) == status::kSuccess);
+    CHECK(e.kernel.create_shader(kPid, e.dev, {ShaderKind::ColoredVertex, graphics::ShaderStage::Vertex, {}}, &vs) == status::kSuccess);
+    CHECK(e.kernel.create_shader(kPid, e.dev, {ShaderKind::ColoredFragment, graphics::ShaderStage::Fragment, {}}, &fs) == status::kSuccess);
+    graphics::GraphicsPipelineDesc gd;
+    graphics::describe_colored_pipeline(&gd);
+    PipelineDesc pd;
+    pd.vertex_shader = vs, pd.fragment_shader = fs, pd.vertex_stride = gd.vertex_stride, pd.attribute_count = 2, pd.varying_count = 1;
+    pd.attributes[0] = gd.attributes[0], pd.attributes[1] = gd.attributes[1];
+    pd.cull_mode = graphics::CullMode::None;
+    pd.multisample = true;
+    CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &pipe) == status::kSuccess);
+    const float x0 = 4.3f / 8 - 1, x1 = 20.0f / 8 - 1;
+    const float v[42] = {x0, -1, 0.5f, 1, 0, 0, 1, x1, -1, 0.5f, 1, 0, 0, 1, x0, 1, 0.5f, 1, 0, 0, 1, x0, 1, 0.5f, 1, 0, 0, 1, x1, -1, 0.5f, 1, 0, 0, 1, x1, 1, 0.5f, 1, 0, 0, 1};
+    Handle vb = e.buffer(kAllocVertexBuffer, sizeof v);
+    CHECK(e.write(vb, floats(v, 42)));
+    const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    w.bind_pipeline(pipe);
+    w.bind_vertex_buffer(2);
+    w.push_constants(floats(identity, 16));
+    w.draw(6);
+    w.end_pass();
+    w.resolve_region(1, 0);
+    CHECK(e.render(w, {ms, resolved, vb}) == status::kSuccess);
+    CHECK(e.pixel(resolved, 4, 8) == 0xFFE10000u && e.pixel(resolved, 8, 8) == 0xFFFF0000u && e.pixel(resolved, 3, 8) == 0xFF000000u);
+  }
+}
+
 void test_conformance() {
   test_half_floats();
   HostAllocator allocator;
@@ -4045,6 +4238,38 @@ void test_conformance() {
       };
       CHECK(near(r.device_picture[16 * 32 + 12] & 0xFFFFFF, 0xb49a81) && near(r.device_picture[16 * 32 + 13] & 0xFFFFFF, 0x4d661a));
       CHECK(near(r.device_picture[28 * 32 + 8] & 0xFFFFFF, 0x9a3434) && near(r.device_picture[28 * 32 + 9] & 0xFFFFFF, 0x1a1a80));
+    }
+    if (__builtin_strstr(r.name, "geometry shader")) {
+      // The triangle itself (red at the lower left, blue at the top) and its copy at half the size to the lower right with red and blue swapped.
+      auto px = [&](uint32_t x, uint32_t y) { return r.device_picture[y * 32 + x] & 0xFFFFFF; };
+      auto near = [](uint32_t a, uint32_t b) {
+        for (uint32_t shift = 0; shift < 24; shift += 8) {
+          const int32_t d = static_cast<int32_t>((a >> shift) & 0xFF) - static_cast<int32_t>((b >> shift) & 0xFF);
+          if (d > 3 || d < -3) return false;
+        }
+        return true;
+      };
+      CHECK(near(px(4, 28), 0xdd1111) && near(px(14, 8), 0x2c11c2) && near(px(24, 28), 0x30705f) && px(24, 8) == 0 && px(0, 0) == 0);
+    }
+    {
+      auto px = [&](uint32_t x, uint32_t y) { return r.device_picture[y * 32 + x]; };
+      auto near = [](uint32_t a, uint32_t b, int32_t limit = 2) {
+        for (uint32_t shift = 0; shift < 32; shift += 8) {
+          const int32_t d = static_cast<int32_t>((a >> shift) & 0xFF) - static_cast<int32_t>((b >> shift) & 0xFF);
+          if (d > limit || d < -limit) return false;
+        }
+        return true;
+      };
+      if (__builtin_strstr(r.name, "sRGB")) {
+        // The stored image (even columns): the base colour (0.2, 0.5, 0.8) encoded, 7c bc e7; where the half transparent orange (1, 0.5, 0) lies over it the blend was done on linear
+        // values (0.6, 0.5, 0.4) and then encoded: cb bc aa. The sampled image (odd columns) decodes it again: the blue channel, which the shader's colour leaves alone, is 0.8 * 255.
+        CHECK(px(2, 12) == 0xFF7CBCE7 && near(px(8, 12), 0xFFCBBCAA) && px(0, 12) == 0xFF000000 && near(px(3, 12) & 0xFF, 0xCC, 1));
+      }
+      if (__builtin_strstr(r.name, "16-bit")) {
+        // 20 additions of 0.0001 .. 0.0003, in 16 bits: 20 * 7/65535 .. 20 * 20/65535, a hundred times brighter: 54 101 156. In 8 bits each addition is rounded away: black.
+        CHECK(near(px(7, 4), 0xFF36659C) && (px(6, 4) & 0xFFFFFF) == 0);
+      }
+      if (__builtin_strstr(r.name, "integer render")) CHECK(px(16, 4) == 0xFF3380CC && px(0, 0) == 0xFF14283C);   // (51, 128, 204 = 255 * the colour, and the cleared (20, 40, 60))
     }
     if (__builtin_strstr(r.name, "multisampling")) {
       // Inside a rectangle all four samples agree; on the left edge of the far one (x = 4.3) three of the four samples of the pixel are inside: 3/4 of red. Where the near green edge
@@ -5182,6 +5407,8 @@ int main() {
   test_compute();
   test_compute_kernel();
   test_multisample();
+  test_geometry_kernel();
+  test_formats();
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);
     return 1;

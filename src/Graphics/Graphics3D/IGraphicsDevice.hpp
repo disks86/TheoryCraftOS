@@ -148,7 +148,7 @@ class IImage {
 
 // --- Shaders -----------------------------------------------------------------
 
-enum class ShaderStage : uint8_t { Vertex, Fragment, Compute };
+enum class ShaderStage : uint8_t { Vertex, Fragment, Compute, Geometry };
 
 // --- Textures ----------------------------------------------------------------
 
@@ -239,6 +239,24 @@ struct FragmentContext {
 using VertexShaderFnEx = void (*)(const Vec4* attributes, const uint8_t* constants, const VertexContext& context, ShaderIo* out);
 using FragmentShaderFnEx = bool (*)(const Vec4* varyings, const FragmentContext& context, const uint8_t* constants, const ITextureSet& textures, Vec4* color);
 
+// Geometry shaders (kFeatureGeometryShaders), between the vertex shader and the rasterizer: one invocation per primitive of the draw (a list triangle, line or point - the kernel expands
+// strips and fans), given the primitive's vertices as the vertex shader made them (clip space, before the perspective divide) and emitting up to the module's maximum of vertices, which
+// make a strip of the module's output topology (a cut ends a strip and starts the next). The software device calls a function; virgl takes TGSI text.
+enum class GeometryPrimitive : uint8_t { Point, Line, Triangle };
+enum class GeometryTopology : uint8_t { PointList, LineStrip, TriangleStrip };
+constexpr uint32_t kMaxGeometryVertices = 64;   // the most a module's maximum may be
+struct GeometryInputData {
+  Vec4 position[3];
+  Vec4 varying[3][kMaxVaryings];
+  uint32_t primitive_id = 0;   // the number of the primitive in the draw
+};
+struct GeometryOutputData {
+  uint32_t count = 0;
+  ShaderIo vertex[kMaxGeometryVertices];
+  bool restart[kMaxGeometryVertices] = {};   // a strip ended just before this vertex (a cut)
+};
+using GeometryShaderFn = void (*)(const GeometryInputData& input, const uint8_t* constants, GeometryOutputData* output);
+
 // Compute shaders (kFeatureCompute). A software compute shader is called once per thread; the device runs the groups of a dispatch one after the other and the threads of a group
 // in order (no barriers or group-shared memory: a module that needs them is not given a function). `buffers` are the storage buffers bound at the time (empty views for slots
 // that are not bound); a read or write outside a buffer must be dropped or read as zero by the shader.
@@ -275,6 +293,11 @@ struct ShaderModuleDesc {
   FragmentShaderFnEx fragment_function_ex = nullptr;
   // A compute shader (stage Compute): the function for the software device, TGSI text for virgl, and the size of a thread group either way.
   ComputeShaderFn compute_function = nullptr;
+  // A geometry shader (stage Geometry): the function for the software device (virgl: the TGSI text), what it takes and makes, and the most vertices one invocation emits.
+  GeometryShaderFn geometry_function = nullptr;
+  GeometryPrimitive geometry_input = GeometryPrimitive::Triangle;
+  GeometryTopology geometry_output = GeometryTopology::TriangleStrip;
+  uint32_t geometry_max_vertices = 0;
   uint32_t thread_group[3] = {1, 1, 1};
   // TGSI text for the GPU device. Inputs are the vertex attributes (vertex stage) or the
   // varyings as GENERIC[n] (fragment stage); push constants are CONST[0..7] (vec4 each).
@@ -360,6 +383,8 @@ struct GraphicsPipelineDesc {
   // kFeatureMultisample, on a pass with several samples per pixel: with multisample the triangle covers the samples whose positions it contains and depth and stencil are tested for each
   // (the shader still runs once per pixel); without it a pixel is all or nothing by its centre, as Direct3D 9 draws. Lines and points cover every sample of their pixel.
   bool multisample = false;
+  // kFeatureGeometryShaders: a geometry shader module run between the vertex and fragment shaders (nullptr: none). What it takes must be what the draws make (triangles, lines or points).
+  const IShaderModule* geometry_shader = nullptr;
   StencilState stencil;
   BlendState blend;                                   // kFeatureBlendState
   CompareOp depth_compare = CompareOp::LessEqual;     // kFeatureBlendState: what depth_test compares with (a device without it always uses LessEqual)
@@ -467,6 +492,10 @@ enum DeviceFeature : uint32_t {
   kFeatureInstancing = 1u << 3,    // draw(..., instance_count, first_instance) and VertexAttribute::per_instance
   kFeatureLines = 1u << 4,         // set_primitive_topology: lines and points
   kFeatureFloatFormats = 1u << 6,      // Format::R16G16B16A16Float / R32G32B32A32Float images: colour attachments (also several at once) and sampled textures, without mipmaps; read_pixels_float / write_pixels_float
+  kFeatureSrgbFormats = 1u << 13,      // Format::B8G8R8A8Srgb / R8G8B8A8Srgb
+  kFeatureUnorm16Formats = 1u << 14,   // Format::R16G16B16A16Unorm (also kFeatureFloatFormats' read_pixels_float / write_pixels_float)
+  kFeatureIntegerFormats = 1u << 15,   // Format::R32G32B32A32Uint
+  kFeatureGeometryShaders = 1u << 12,  // GraphicsPipelineDesc::geometry_shader, ShaderStage::Geometry modules
   kFeatureMultisample = 1u << 11,      // ImageDesc::samples, GraphicsPipelineDesc::multisample, ICommandBuffer::resolve_image
   kFeatureCompute = 1u << 10,          // compute shaders: create_compute_pipeline, kBufferStorage buffers, ICommandBuffer::dispatch
   kFeatureIndependentBlend = 1u << 9,  // GraphicsPipelineDesc::independent_blend / target_blend

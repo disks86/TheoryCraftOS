@@ -348,16 +348,24 @@ void DeviceRenderer2D::draw_image(const Surface& s, const Rect2D& rect, int32_t 
 void DeviceRenderer2D::draw_text(int32_t x, int32_t y, const char* text, uint32_t color) {
   for (; *text; ++text, x += static_cast<int32_t>(hardware::Font8x16::kWidth)) {
     const ConstByteView glyph = hardware::Font8x16::glyph(*text);
+    // The set pixels as rectangles: a run of a row, taller while the rows below have the same pixels set (a stem is one rectangle, not one a row). The pixels covered are the glyph's.
+    uint8_t rows[hardware::Font8x16::kHeight];
+    for (uint32_t j = 0; j < hardware::Font8x16::kHeight; ++j) rows[j] = glyph[j];
     for (uint32_t j = 0; j < hardware::Font8x16::kHeight; ++j) {
       uint32_t i = 0;
       while (i < hardware::Font8x16::kWidth) {
-        if (!(glyph[j] & (0x80 >> i))) {
+        if (!(rows[j] & (0x80 >> i))) {
           ++i;
           continue;
         }
         uint32_t run = 1;
-        while (i + run < hardware::Font8x16::kWidth && (glyph[j] & (0x80 >> (i + run)))) ++run;
-        fill_rect({x + static_cast<int32_t>(i), y + static_cast<int32_t>(j), run, 1}, color);
+        while (i + run < hardware::Font8x16::kWidth && (rows[j] & (0x80 >> (i + run)))) ++run;
+        uint8_t mask = 0;
+        for (uint32_t k = 0; k < run; ++k) mask |= static_cast<uint8_t>(0x80 >> (i + k));
+        uint32_t height = 1;
+        while (j + height < hardware::Font8x16::kHeight && (rows[j + height] & mask) == mask) ++height;
+        for (uint32_t k = 0; k < height; ++k) rows[j + k] &= static_cast<uint8_t>(~mask);
+        fill_rect({x + static_cast<int32_t>(i), y + static_cast<int32_t>(j), run, height}, color);
         i += run;
       }
     }

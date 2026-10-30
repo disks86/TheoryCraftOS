@@ -61,7 +61,8 @@ class TgsiEmitter {
   static constexpr uint32_t kPosition = 39, kVarying = 40, kColor = 44;   // (kVarying: four)
   static constexpr uint32_t kSys = 45;     // the system values (SysValue order), copied from where TGSI keeps them into registers of the interpreter's shape
   static constexpr uint32_t kColorExtra = kSys + kSysValueCount;   // colour outputs 1..3 (output 0 is kColor)
-  static constexpr uint32_t kTempCount = kColorExtra + graphics::kMaxColorTargets - 1;
+  static constexpr uint32_t kGsPosition = kColorExtra + graphics::kMaxColorTargets - 1;   // a geometry shader's input positions, three vertices, turned back to Direct3D's +Y up
+  static constexpr uint32_t kTempCount = kGsPosition + 3;
   static uint32_t color_register(uint32_t target) { return target == 0 ? kColor : kColorExtra + target - 1; }
   static constexpr uint32_t kMaxOutput = 120000;   // (the virgl command carrying the text has a 16-bit dword count)
 
@@ -247,6 +248,7 @@ class TgsiEmitter {
   bool sys_used_[kSysValueCount] = {};
   bool buffer_used_[graphics::kMaxStorageBuffers] = {};
   bool compute_ = false;
+  bool geometry_ = false;
   uint32_t max_attribute_ = 0;
   bool sampler_used_[graphics::kMaxTextureUnits] = {};
 };
@@ -260,6 +262,25 @@ String TgsiEmitter::operand(const Instr::Src& s, uint32_t offset, uint32_t slot,
       add(base, "]");
       break;
     case kInput:
+      if (geometry_) {
+        // IN[vertex][1 + varying] (the position is in a register of its own: the host's +Y is the other way up)
+        if (s.vertex >= 3 || (s.slot != kSlotPosition && (s.slot < 0 || s.slot >= static_cast<int8_t>(graphics::kMaxVaryings)))) {
+          unsupported_ = true;
+          break;
+        }
+        if (s.slot == kSlotPosition) {
+          add(base, "TEMP[");
+          add_uint(base, kGsPosition + s.vertex);
+          add(base, "]");
+        } else {
+          add(base, "IN[");
+          add_uint(base, s.vertex);
+          add(base, "][");
+          add_uint(base, static_cast<uint32_t>(s.slot) + 1);
+          add(base, "]");
+        }
+        break;
+      }
       if (s.slot < 0 || s.slot >= 16) {
         unsupported_ = true;
         break;
@@ -720,6 +741,29 @@ bool TgsiEmitter::instruction(const Instr& ins) {
       line(op == kIShl ? "SHL" : op == kIShr ? "ISHR" : "USHR", &t, &a, &w);
       break;
     }
+    case kGsEmit: case kGsCut: {
+      const String stream = zero();
+      if (op == kGsCut) {
+        line("ENDPRIM", &stream);
+        return true;
+      }
+      // The position goes out as the host wants it (+Y down), the varyings as they are.
+      const float flip[4] = {1.0f, -1.0f, 1.0f, 1.0f};
+      const String pos = temp(kPosition), factor = imm_text(flip, ".xyzw");
+      String o = str();
+      add(o, "OUT[0]");
+      line("MUL", &o, &pos, &factor);
+      for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) {
+        String target = str();
+        add(target, "OUT[");
+        add_uint(target, i + 1);
+        add(target, "]");
+        const String v = temp(kVarying + i);
+        line("MOV", &target, &v);
+      }
+      line("EMIT", &stream);
+      return true;
+    }
     case kBufLoad: case kBufStore: case kBufAtomic: case kBufImmAtomic: {
       // Storage buffers: TGSI's LOAD / STORE / ATOM* on BUFFER[n], addressed in bytes. The address of a structured buffer is index * stride + offset (an atomic gives both in the
       // components x and y of one register); the words of a store are packed first, the way Direct3D writes them.
@@ -915,8 +959,36 @@ bool TgsiEmitter::instruction(const Instr& ins) {
 
 void TgsiEmitter::assemble(String* out) {
   out->clear();
-  add(*out, compute_ ? "COMP\n" : vertex_ ? "VERT\n" : p_.color_outputs_ > 1 ? "FRAG\n" : "FRAG\nPROPERTY FS_COLOR0_WRITES_ALL_CBUFS 1\n");
-  if (compute_) {
+  if (geometry_) {
+    static const char* const kInputs[] = {"POINTS", "LINES", "TRIANGLES"};
+    static const char* const kOutputs[] = {"POINTS", "LINE_STRIP", "TRIANGLE_STRIP"};
+    add(*out, "GEOM\nPROPERTY GS_INPUT_PRIMITIVE ");
+    add(*out, kInputs[static_cast<uint32_t>(p_.geometry_input_)]);
+    add(*out, "\nPROPERTY GS_OUTPUT_PRIMITIVE ");
+    add(*out, kOutputs[static_cast<uint32_t>(p_.geometry_output_)]);
+    add(*out, "\nPROPERTY GS_MAX_OUTPUT_VERTICES ");
+    add_uint(*out, p_.geometry_max_vertices_);
+    add(*out, "\nPROPERTY GS_INVOCATIONS 1\nDCL IN[][0], POSITION\n");
+    for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) {
+      add(*out, "DCL IN[][");
+      add_uint(*out, i + 1);
+      add(*out, "], GENERIC[");
+      add_uint(*out, i);
+      add(*out, "]\n");
+    }
+    add(*out, "DCL OUT[0], POSITION\n");
+    for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) {
+      add(*out, "DCL OUT[");
+      add_uint(*out, i + 1);
+      add(*out, "], GENERIC[");
+      add_uint(*out, i);
+      add(*out, "]\n");
+    }
+  }
+  if (!geometry_) add(*out, compute_ ? "COMP\n" : vertex_ ? "VERT\n" : p_.color_outputs_ > 1 ? "FRAG\n" : "FRAG\nPROPERTY FS_COLOR0_WRITES_ALL_CBUFS 1\n");
+  if (geometry_) {
+    // (the declarations are above)
+  } else if (compute_) {
     add(*out, "PROPERTY CS_FIXED_BLOCK_WIDTH ");
     add_uint(*out, p_.thread_group_[0]);
     add(*out, "\nPROPERTY CS_FIXED_BLOCK_HEIGHT ");
@@ -1006,11 +1078,26 @@ void TgsiEmitter::assemble(String* out) {
 NtStatus TgsiEmitter::run(String* out) {
   vertex_ = p_.stage_ == graphics::ShaderStage::Vertex;
   compute_ = p_.stage_ == graphics::ShaderStage::Compute;
+  geometry_ = p_.stage_ == graphics::ShaderStage::Geometry;
   for (const Instr& ins : p_.code_.view()) {
     if (ins.dst.type == kAddrTex) addr_used_ = true;
     for (uint32_t k = 0; k < ins.src_count; ++k) {
       if (ins.src[k].relative) addr_used_ = true;
       if (ins.src[k].type == kSysValue && ins.src[k].number < kSysValueCount) sys_used_[ins.src[k].number] = true;
+    }
+  }
+
+  // A geometry shader's input positions, turned back to Direct3D's clip space (the vertex shader's text flips Y for the host).
+  if (geometry_) {
+    const float flip[4] = {1.0f, -1.0f, 1.0f, 1.0f};
+    const uint32_t vertices = p_.geometry_input_ == graphics::GeometryPrimitive::Triangle ? 3 : p_.geometry_input_ == graphics::GeometryPrimitive::Line ? 2 : 1;
+    for (uint32_t v = 0; v < vertices; ++v) {
+      const String target = temp(kGsPosition + v), factor = imm_text(flip, ".xyzw");
+      String in = str();
+      add(in, "IN[");
+      add_uint(in, v);
+      add(in, "][0]");
+      line("MUL", &target, &in, &factor);
     }
   }
 
@@ -1082,7 +1169,7 @@ NtStatus TgsiEmitter::run(String* out) {
     if (k == kSysFrontFacing) line("FSGE", &reg_x, &source, &z);   // (TGSI's FACE is +1 or -1)
     else line("MOV", &reg_x, &source);
   }
-  if (vertex_) {
+  if (vertex_ || geometry_) {
     const String pos = temp(kPosition);
     line("MOV", &pos, &z);
     for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) {
@@ -1103,7 +1190,9 @@ NtStatus TgsiEmitter::run(String* out) {
 
   // Epilogue: the shadows to the outputs.
   if (!oom_ && !unsupported_) {
-    if (vertex_) {
+    if (geometry_) {
+      // (the vertices were written out by the emits)
+    } else if (vertex_) {
       const float flip[4] = {1.0f, -1.0f, 1.0f, 1.0f};
       const String pos = temp(kPosition), factor = imm_text(flip, ".xyzw");
       String o = str();

@@ -40,6 +40,51 @@ void destroy(allocators::IAllocator& allocator, T* object) {
 
 // --- Resources ---------------------------------------------------------------
 
+// sRGB: the 256 linear values the 8-bit codes mean ((c + 0.055) / 1.055 raised to 2.4 above 0.04045, c / 12.92 below), worked out once without a maths library (the power as a square times a
+// fifth root, found by Newton's iteration); and the nearest code of a linear value, by a search over that table.
+const float* srgb_to_linear_table() {
+  static float table[256];
+  static bool ready = false;
+  if (ready) return table;
+  for (uint32_t i = 0; i < 256; ++i) {
+    const double c = i / 255.0;
+    double linear;
+    if (c <= 0.04045) {
+      linear = c / 12.92;
+    } else {
+      const double p = (c + 0.055) / 1.055, p2 = p * p;
+      double r = p;   // the fifth root of p squared: p to the 0.4
+      for (int k = 0; k < 40; ++k) {
+        const double r4 = r * r * r * r;
+        r = r - (r4 * r - p2) / (5.0 * r4);
+      }
+      linear = p2 * r;
+    }
+    table[i] = static_cast<float>(linear);
+  }
+  ready = true;
+  return table;
+}
+
+uint32_t linear_to_srgb_code(float v) {
+  const float* table = srgb_to_linear_table();
+  if (!(v > 0.0f)) return 0;
+  if (v >= 1.0f) return 255;
+  uint32_t low = 0, high = 255;   // the code is in [low, high]; find the last one whose linear value is not above v, then the nearer of it and the next
+  while (high - low > 1) {
+    const uint32_t mid = (low + high) / 2;
+    if (table[mid] <= v) low = mid;
+    else high = mid;
+  }
+  return (v - table[low]) <= (table[low + 1] - v) ? low : low + 1;
+}
+
+// A linear colour as the 0xAARRGGBB of an sRGB target: the colour channels encoded, the alpha not.
+uint32_t pack_srgb(Vec4 c) {
+  const float a = !(c.w > 0.0f) ? 0.0f : c.w >= 1.0f ? 1.0f : c.w;
+  return (static_cast<uint32_t>(a * 255.0f + 0.5f) << 24) | (linear_to_srgb_code(c.x) << 16) | (linear_to_srgb_code(c.y) << 8) | linear_to_srgb_code(c.z);
+}
+
 class SoftwareBuffer final : public IBuffer {
  public:
   SoftwareBuffer(allocators::IAllocator& allocator, uint64_t size) : allocator_(allocator) {
@@ -70,7 +115,7 @@ class SoftwareImage final : public IImage {
     if (desc.format == Format::D32Float) {
       depth_ = allocate_view<float>(allocator, count);
       if (desc.stencil) stencil_ = allocate_view<uint8_t>(allocator, count);
-    } else if (is_float_format(desc.format)) {
+    } else if (is_wide_format(desc.format)) {
       if (desc.mip_levels == 1) hdr_ = allocate_view<Vec4>(allocator, count);
     } else if (desc.format != Format::Undefined) {
       color_ = allocate_view<uint32_t>(allocator, total);
@@ -113,6 +158,7 @@ class SoftwareImage final : public IImage {
     const uint64_t count = uint64_t{desc_.extent.width} * desc_.extent.height;
     if (color_.empty() || out.size() < count || desc_.samples > 1) return false;   // (a multisampled image is resolved first)
     Surface s = surface();
+    if (s.format != Format::R8G8B8A8Unorm && s.format != Format::R8G8B8A8Srgb) return out.copy_from(ArrayView<const uint32_t>(color_.data(), count));   // (stored as it is read: one copy)
     for (uint64_t i = 0; i < count; ++i) out[i] = s.decode(color_[i]);
     return true;
   }
@@ -129,7 +175,11 @@ class SoftwareImage final : public IImage {
   }
   // What a pixel of this image keeps of a colour: half-float images round to half precision.
   Vec4 store_float(Vec4 c) const {
-    if (desc_.format != Format::R16G16B16A16Float) return c;
+    if (desc_.format == Format::R16G16B16A16Unorm) {
+      auto q = [](float v) { return !(v > 0.0f) ? 0.0f : v >= 1.0f ? 1.0f : static_cast<float>(static_cast<uint32_t>(v * 65535.0f + 0.5f)) * (1.0f / 65535.0f); };
+      return {q(c.x), q(c.y), q(c.z), q(c.w)};
+    }
+    if (desc_.format != Format::R16G16B16A16Float) return c;   // (single precision and integers are kept as they are)
     return {half_to_float(float_to_half(c.x)), half_to_float(float_to_half(c.y)), half_to_float(float_to_half(c.z)), half_to_float(float_to_half(c.w))};
   }
   bool write_mip_pixels(uint32_t level, ArrayView<const uint32_t> pixels) override {
@@ -411,6 +461,10 @@ class TextureSet final : public ITextureSet {
     if (!surface.floats.empty()) return surface.float_row(static_cast<uint32_t>(y))[x];
     const uint32_t argb = surface.decode(surface.row(static_cast<uint32_t>(y))[x]);
     constexpr float k = 1.0f / 255.0f;
+    if (is_srgb_format(surface.format)) {   // (the colour channels are decoded to linear values, the alpha is linear)
+      const float* table = srgb_to_linear_table();
+      return {table[(argb >> 16) & 0xFF], table[(argb >> 8) & 0xFF], table[argb & 0xFF], static_cast<float>(argb >> 24) * k};
+    }
     return {static_cast<float>((argb >> 16) & 0xFF) * k, static_cast<float>((argb >> 8) & 0xFF) * k, static_cast<float>(argb & 0xFF) * k, static_cast<float>(argb >> 24) * k};
   }
 
@@ -611,8 +665,17 @@ void write_fragment(const DrawState& s, int32_t x, int32_t y, float z, bool dept
       *pixel = image->store_float(blend_float(blend, over, colors[n], *pixel));
       continue;
     }
-    uint32_t out = pack_color(colors[n]);
     uint32_t* pixel = surface.row(static_cast<uint32_t>(y)) + uint64_t{static_cast<uint32_t>(x)} * samples + sample;
+    if (is_srgb_format(surface.format)) {
+      // Blending is done on linear values: the stored pixel is decoded, blended with the shader's colour, and the result encoded.
+      const uint32_t stored = surface.decode(*pixel);
+      const float* table = srgb_to_linear_table();
+      const Vec4 destination = {table[(stored >> 16) & 0xFF], table[(stored >> 8) & 0xFF], table[stored & 0xFF], static_cast<float>(stored >> 24) * (1.0f / 255.0f)};
+      Vec4 linear = blend_float(blend, over, colors[n], destination);
+      *pixel = surface.encode(pack_srgb(linear));
+      continue;
+    }
+    uint32_t out = pack_color(colors[n]);
     if (blend.custom) out = blend_pixel(blend, out, surface.decode(*pixel));
     else if (over) out = blend_over(out, surface.decode(*pixel));
     *pixel = surface.encode(out);
@@ -949,6 +1012,40 @@ ClipVertex run_vertex_shader(const SoftwarePipeline& pipeline, ConstByteView ver
   return out;
 }
 
+// Runs a geometry shader on one primitive and draws what it emits: the vertices are a strip (a triangle strip turns every second triangle over, as Direct3D does) or points.
+void run_geometry_shader(const DrawState& s, const SoftwareShaderModule& module, const ClipVertex* v, uint32_t count) {
+  const ShaderModuleDesc& md = module.desc();
+  GeometryInputData input;
+  for (uint32_t k = 0; k < count && k < 3; ++k) {
+    input.position[k] = v[k].position;
+    for (uint32_t i = 0; i < kMaxVaryings; ++i) input.varying[k][i] = v[k].varying[i];
+  }
+  input.primitive_id = s.primitive_id;
+  GeometryOutputData output;
+  md.geometry_function(input, s.constants, &output);
+  if (output.count > md.geometry_max_vertices) output.count = md.geometry_max_vertices;
+  auto clip = [&](uint32_t i) {
+    ClipVertex c;
+    c.position = output.vertex[i].position;
+    for (uint32_t k = 0; k < kMaxVaryings; ++k) c.varying[k] = output.vertex[i].varying[k];
+    return c;
+  };
+  uint32_t in_strip = 0;   // vertices of the strip so far
+  for (uint32_t i = 0; i < output.count; ++i) {
+    if (output.restart[i]) in_strip = 0;
+    ++in_strip;
+    if (md.geometry_output == GeometryTopology::PointList) {
+      draw_point(s, clip(i));
+    } else if (md.geometry_output == GeometryTopology::LineStrip) {
+      if (in_strip >= 2) draw_line(s, clip(i - 1), clip(i));
+    } else if (in_strip >= 3) {
+      const bool odd = (in_strip - 3) & 1;
+      if (odd) draw_triangle(s, clip(i - 1), clip(i - 2), clip(i));
+      else draw_triangle(s, clip(i - 2), clip(i - 1), clip(i));
+    }
+  }
+}
+
 }  // namespace
 
 // --- Device ------------------------------------------------------------------
@@ -970,14 +1067,14 @@ IImage* SoftwareDevice::create_image(const ImageDesc& desc) {
   if (desc.samples != 1) {
     // (a multisampled image is an 8-bit colour or a depth attachment, alone, of one level)
     const bool depth = desc.format == Format::D32Float;
-    if ((desc.samples != 2 && desc.samples != 4 && desc.samples != 8) || desc.mip_levels != 1 || desc.kind != TextureKind::Texture2D || is_float_format(desc.format) ||
+    if ((desc.samples != 2 && desc.samples != 4 && desc.samples != 8) || desc.mip_levels != 1 || desc.kind != TextureKind::Texture2D || is_wide_format(desc.format) ||
         desc.usage != (depth ? kImageDepthAttachment : kImageColorAttachment))
       return nullptr;
   }
   if (desc.kind != TextureKind::Texture2D) {
     // (layered images are sampled only: one level, 8-bit colour)
     const uint32_t layers = desc.kind == TextureKind::TextureCube ? 6 : desc.layers;
-    if (desc.usage != kImageSampled || desc.mip_levels != 1 || layers == 0 || layers > kMaxTextureLayers || desc.format == Format::D32Float || is_float_format(desc.format) ||
+    if (desc.usage != kImageSampled || desc.mip_levels != 1 || layers == 0 || layers > kMaxTextureLayers || desc.format == Format::D32Float || is_wide_format(desc.format) ||
         (desc.kind == TextureKind::TextureCube && desc.extent.width != desc.extent.height))
       return nullptr;
   } else if (desc.layers != 1) {
@@ -993,6 +1090,10 @@ IImage* SoftwareDevice::create_image(const ImageDesc& desc) {
 void SoftwareDevice::destroy_image(IImage* image) { destroy(allocator_, static_cast<SoftwareImage*>(image)); }
 
 IShaderModule* SoftwareDevice::create_shader_module(const ShaderModuleDesc& desc) {
+  if (desc.stage == ShaderStage::Geometry) {
+    if (!desc.geometry_function || desc.geometry_max_vertices == 0 || desc.geometry_max_vertices > kMaxGeometryVertices) return nullptr;
+    return make<SoftwareShaderModule>(allocator_, desc);
+  }
   if (desc.stage == ShaderStage::Compute) {
     if (!desc.compute_function) return nullptr;
     uint64_t threads = 1;
@@ -1023,6 +1124,7 @@ IPipeline* SoftwareDevice::create_graphics_pipeline(const GraphicsPipelineDesc& 
   const auto* vs = static_cast<const SoftwareShaderModule*>(desc.vertex_shader);
   const auto* fs = static_cast<const SoftwareShaderModule*>(desc.fragment_shader);
   if (vs->stage() != ShaderStage::Vertex || fs->stage() != ShaderStage::Fragment) return nullptr;
+  if (desc.geometry_shader && desc.geometry_shader->stage() != ShaderStage::Geometry) return nullptr;
   // A shader that samples textures needs the pipeline to say how many, and the other way round.
   // (one with system values reads whatever it likes)
   const bool textured = fs->desc().textured_fragment_function != nullptr;
@@ -1089,7 +1191,7 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
               for (Vec4& c : surface.floats) c = image->store_float(cmd.pass.clear_color_value);
               continue;
             }
-            const uint32_t v = surface.encode(pack_color(cmd.pass.clear_color_value));
+            const uint32_t v = surface.encode(is_srgb_format(surface.format) ? pack_srgb(cmd.pass.clear_color_value) : pack_color(cmd.pass.clear_color_value));
             image->all_samples().fill(v);   // (every sample of every pixel; the rows of a plain image are tight)
           }
         }
@@ -1109,13 +1211,27 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
         // The samples of each pixel averaged (to the nearest, per channel) into the single-sample image.
         SoftwareImage* to = static_cast<SoftwareImage*>(cmd.image);
         const SoftwareImage* from = static_cast<const SoftwareImage*>(cmd.image2);
-        if (in_pass || !to || !from || to->samples() != 1 || from->samples() < 2 || to->format() != from->format() || is_float_format(to->format()) || to->format() == Format::D32Float ||
+        if (in_pass || !to || !from || to->samples() != 1 || from->samples() < 2 || to->format() != from->format() || is_wide_format(to->format()) || to->format() == Format::D32Float ||
             to->extent().width != from->extent().width || to->extent().height != from->extent().height)
           return false;
         const Surface out = to->surface(), in = from->surface();
         const uint32_t n = from->samples();
         for (uint32_t y = 0; y < out.height; ++y)
           for (uint32_t x = 0; x < out.width; ++x) {
+            if (is_srgb_format(in.format)) {
+              // (an sRGB image is averaged as the linear values its codes mean, and the average encoded again)
+              const float* table = srgb_to_linear_table();
+              Vec4 mean = {0, 0, 0, 0};
+              uint32_t alpha = 0;
+              for (uint32_t k = 0; k < n; ++k) {
+                const uint32_t argb = in.decode(in.row(y)[uint64_t{x} * n + k]);
+                mean.x += table[(argb >> 16) & 0xFF], mean.y += table[(argb >> 8) & 0xFF], mean.z += table[argb & 0xFF];
+                alpha += argb >> 24;
+              }
+              const float inv = 1.0f / static_cast<float>(n);
+              out.row(y)[x] = out.encode(pack_srgb({mean.x * inv, mean.y * inv, mean.z * inv, static_cast<float>(alpha) * inv * (1.0f / 255.0f)}));
+              continue;
+            }
             uint32_t sum[4] = {};
             for (uint32_t k = 0; k < n; ++k) {
               const uint32_t argb = in.decode(in.row(y)[uint64_t{x} * n + k]);
@@ -1260,12 +1376,22 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
         const uint32_t instances = cmd.instance_count;
         if (instances > 1u << 20) return false;
         const uint32_t per_primitive = topology == PrimitiveTopology::TriangleList ? 3 : topology == PrimitiveTopology::LineList ? 2 : 1;
+        const SoftwareShaderModule* geometry = static_cast<const SoftwareShaderModule*>(pd.geometry_shader);
+        if (geometry) {
+          // (the geometry shader takes the primitives the draw makes)
+          const GeometryPrimitive taken = geometry->desc().geometry_input;
+          if (taken != (per_primitive == 3 ? GeometryPrimitive::Triangle : per_primitive == 2 ? GeometryPrimitive::Line : GeometryPrimitive::Point)) return false;
+        }
         for (uint32_t instance = 0; instance < instances; ++instance) {
           s.primitive_id = 0;
           for (uint32_t t = 0; t + per_primitive <= cmd.count; t += per_primitive, ++s.primitive_id) {
             ClipVertex v[3];
             for (uint32_t k = 0; k < per_primitive; ++k)
               if (!vertex_at(t + k, instance, &v[k])) return false;
+            if (geometry) {
+              run_geometry_shader(s, *geometry, v, per_primitive);
+              continue;
+            }
             if (topology == PrimitiveTopology::TriangleList) draw_triangle(s, v[0], v[1], v[2]);
             else if (topology == PrimitiveTopology::LineList) draw_line(s, v[0], v[1]);
             else draw_point(s, v[0]);

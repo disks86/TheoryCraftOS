@@ -32,11 +32,11 @@ namespace hardware {
 
 namespace iwl_tx {
 constexpr uint32_t kQueues = 31;                          // IWL_9000 num_of_queues
-constexpr uint32_t kCommandQueue = 0, kCommandFifo = 7;   // the firmware's DQA layout (IWL_MVM_DQA_CMD_QUEUE, IWL_MVM_TX_FIFO_CMD)
+constexpr uint32_t kCommandQueue = 0, kCommandFifo = 7, kAuxQueue = 1, kMcastFifo = 5;   // the firmware's DQA layout (IWL_MVM_DQA_CMD_QUEUE, IWL_MVM_TX_FIFO_CMD)
 constexpr uint32_t kRingEntries = 256;                    // TFDs per queue (max_tfd_queue_size)
 constexpr uint32_t kSlots = 32;                           // commands in flight (IWL_CMD_QUEUE_SIZE)
 constexpr uint32_t kTfdBytes = 128, kMaxTbs = 20, kFirstTbBytes = 20, kFirstTbStride = 64;
-constexpr uint32_t kSlotBytes = 1024;                     // command header and data of one command
+constexpr uint32_t kSlotBytes = 2048;                     // command header and data of one command
 constexpr uint32_t kByteCountEntries = kRingEntries + 64; // TFD_QUEUE_BC_SIZE
 constexpr uint32_t kInvalidCommandBytes = 324;
 // CSR (direct) registers
@@ -69,7 +69,9 @@ struct IwlHostCommand {
 
 class IwlCommandQueue {
  public:
-  IwlCommandQueue(IwlPcieDevice& device, allocators::IAllocator& allocator) : device_(device), allocator_(allocator) {}
+  // The command queue by default; another queue (the auxiliary one the firmware sends scan probes from) is made the same way and started with start_secondary().
+  IwlCommandQueue(IwlPcieDevice& device, allocators::IAllocator& allocator, uint32_t queue = iwl_tx::kCommandQueue, uint32_t fifo = iwl_tx::kCommandFifo)
+      : device_(device), allocator_(allocator), queue_(queue), fifo_(fifo) {}
   ~IwlCommandQueue() { release(); }
   IwlCommandQueue(const IwlCommandQueue&) = delete;
   IwlCommandQueue& operator=(const IwlCommandQueue&) = delete;
@@ -78,6 +80,8 @@ class IwlCommandQueue {
   bool init(const char** error);
   // After ALIVE: the scheduler's setup and the transmit DMA channels (iwl_pcie_tx_start), the command queue enabled on its FIFO.
   bool start(const char** error);
+  // A queue that is not the command queue, after the scheduler is running (the command queue's start() set it up): chained, active on its FIFO.
+  bool start_secondary(const char** error);
   void release();
   bool ready() const { return tfds_.size() != 0; }
 
@@ -95,11 +99,13 @@ class IwlCommandQueue {
   void set_tb(uint8_t* tfd, uint32_t tb, uint64_t bus, uint32_t length);
   void invalidate(uint32_t index);
   ArrayView<uint8_t> block(uint64_t bytes, uint64_t alignment, uint64_t* bus);
+  void configure_queue();
 
   IwlPcieDevice& device_;
   allocators::IAllocator& allocator_;
   ArrayView<uint8_t> tfds_, commands_, first_tbs_, keep_warm_, byte_counts_, invalid_;
   uint64_t tfds_bus_ = 0, commands_bus_ = 0, first_tbs_bus_ = 0, keep_warm_bus_ = 0, byte_counts_bus_ = 0, invalid_bus_ = 0;
+  uint32_t queue_, fifo_;
   uint32_t write_ = 0, read_ = 0, scd_base_ = 0;
 };
 

@@ -42,10 +42,18 @@ enum class Format : uint8_t {
   D32Float,       // depth only
   R16G16B16A16Float,   // 64-bit half floats, memory order R, G, B, A (kFeatureFloatFormats); values are not clamped
   R32G32B32A32Float,   // 128-bit floats, memory order R, G, B, A (kFeatureFloatFormats)
+  B8G8R8A8Srgb,        // like B8G8R8A8Unorm, but the colour channels are sRGB encoded (kFeatureSrgbFormats): a texture is read as linear values, a render target takes linear values and stores them encoded
+  R8G8B8A8Srgb,        // the same with R, G, B, A in memory order
+  R16G16B16A16Unorm,   // 64-bit, four 16-bit normalised channels in the order R, G, B, A (kFeatureUnorm16Formats)
+  R32G32B32A32Uint,    // 128-bit, four unsigned integers R, G, B, A (kFeatureIntegerFormats): values travel as the bits of the Vec4s (read_pixels_float); no blending, no filtering - a texture is read with fetch
 };
 
 constexpr bool is_float_format(Format f) { return f == Format::R16G16B16A16Float || f == Format::R32G32B32A32Float; }
-constexpr uint32_t bytes_per_pixel(Format f) { return f == Format::Undefined ? 0 : f == Format::R16G16B16A16Float ? 8 : f == Format::R32G32B32A32Float ? 16 : 4; }
+constexpr bool is_srgb_format(Format f) { return f == Format::B8G8R8A8Srgb || f == Format::R8G8B8A8Srgb; }
+constexpr bool is_integer_format(Format f) { return f == Format::R32G32B32A32Uint; }
+// Formats whose pixels do not fit a 32-bit word: they are read and written as Vec4s (read_pixels_float / write_pixels_float) and have one mip level.
+constexpr bool is_wide_format(Format f) { return is_float_format(f) || f == Format::R16G16B16A16Unorm || is_integer_format(f); }
+constexpr uint32_t bytes_per_pixel(Format f) { return f == Format::Undefined ? 0 : (f == Format::R16G16B16A16Float || f == Format::R16G16B16A16Unorm) ? 8 : (f == Format::R32G32B32A32Float || f == Format::R32G32B32A32Uint) ? 16 : 4; }
 
 // IEEE half floats (1 sign, 5 exponent, 10 fraction bits) to and from float; to_half rounds to nearest even, saturates to infinity, and keeps NaN.
 inline float half_to_float(uint16_t h) {
@@ -202,7 +210,7 @@ struct Surface {
   uint32_t* row(uint32_t y) const { return pixels.data() + uint64_t{y} * pitch; }
   // 0xAARRGGBB <-> storage.
   uint32_t encode(uint32_t argb) const {
-    if (format != Format::R8G8B8A8Unorm) return argb;
+    if (format != Format::R8G8B8A8Unorm && format != Format::R8G8B8A8Srgb) return argb;
     return (argb & 0xFF00FF00u) | ((argb & 0xFF) << 16) | ((argb >> 16) & 0xFF);
   }
   uint32_t decode(uint32_t stored) const { return encode(stored); }  // the swap is its own inverse

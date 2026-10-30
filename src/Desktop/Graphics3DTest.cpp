@@ -17,6 +17,7 @@
  */
 
 #include "Desktop/Graphics3DTest.hpp"
+#include "Gui/Window.hpp"
 #include "Kernel/Delay.hpp"
 #include "console.hpp"
 
@@ -65,8 +66,10 @@ void CubeView::restart_benchmark() {
 // The renderer for this size on the adapter the check box chooses (the GPU's when there is one and it is asked for, the CPU renderer's otherwise).
 bool CubeView::ensure_renderer(uint32_t width, uint32_t height) {
   if (!kernel_) return false;
-  uint32_t adapter = CubeRenderer::find_adapter(*kernel_, use_gpu_);
-  if (adapter == dxgk::kInvalidIndex) adapter = CubeRenderer::find_adapter(*kernel_, !use_gpu_);   // (the machine has only the other kind)
+  // (the display GPU's adapter first: the desktop draws on that device, so the frame can be shown from where it is)
+  const graphics::IGraphicsDevice* desktop_device = graphics_ ? &graphics_->device() : nullptr;
+  uint32_t adapter = CubeRenderer::find_adapter(*kernel_, use_gpu_, desktop_device);
+  if (adapter == dxgk::kInvalidIndex) adapter = CubeRenderer::find_adapter(*kernel_, !use_gpu_, desktop_device);   // (the machine has only the other kind)
   if (adapter == dxgk::kInvalidIndex) return false;
   if (renderer_ && renderer_->is_open() && renderer_->adapter_index() == adapter && renderer_->width() == width && renderer_->height() == height) return true;
   if (!renderer_) {
@@ -217,7 +220,8 @@ void CubeView::paint(gui::Painter& painter) {
     painter.text(9, 45, why.view(), kShadow);
     painter.text(8, 44, why.view(), kAmber);
   }
-  invalidate();   // the next frame, as soon as the render loop is ready
+  if (gui::Window* w = window()) w->request_frame_interval(kFrameIntervalUs);
+  invalidate();   // the next frame, as soon as the render loop is ready (at the display's pace)
 }
 
 // --- The window ------------------------------------------------------------------------------------

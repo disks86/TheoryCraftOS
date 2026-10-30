@@ -84,6 +84,8 @@ class VirtioGpu : public FramebufferGpu, public IMonitorSource {
   // OpenGL 4.3 / GLSL 4.30; a host below that (or one that did not say) gets none. (The capability bits `bset` were read as well, but their numbering is not relied on.)
   // Most samples per pixel the host's multisampled images have (0 when it did not say).
   uint32_t virgl_max_samples() const { return has_3d_ ? virgl_max_samples_ : 0; }
+  // Geometry shaders are core in OpenGL 3.2 / GLSL 1.50.
+  bool virgl_has_geometry() const { return has_3d_ && virgl_glsl_level_ >= 150; }
   bool virgl_has_compute() const { return has_3d_ && virgl_glsl_level_ >= 430; }
   uint32_t context_id() const { return kContextId; }
   uint32_t allocate_resource_id() { return next_resource_++; }

@@ -76,6 +76,8 @@ constexpr uint32_t kFormatR32G32Float = 29;
 constexpr uint32_t kFormatR32G32B32Float = 30;
 constexpr uint32_t kFormatR32G32B32A32Float = 31;
 constexpr uint32_t kFormatR16G16B16A16Float = 94;
+constexpr uint32_t kFormatR16G16B16A16Unorm = 51;   // (VIRGL_FORMAT_*, the numbering of Gallium's pipe_format)
+constexpr uint32_t kFormatB8G8R8A8Srgb = 100;
 
 // Resource bind flags (VIRGL_BIND_*).
 constexpr uint32_t kBindDepthStencil = 1u << 0;
@@ -91,6 +93,7 @@ constexpr uint32_t kQueryOcclusionCounter = 0;   // PIPE_QUERY_OCCLUSION_COUNTER
 constexpr uint32_t kQueryStateDone = 1;         // virgl_host_query_state::query_state once the host wrote the result (state, size, 64-bit result: 16 bytes)
 constexpr uint32_t kTargetBuffer = 0;
 constexpr uint32_t kTargetTexture2d = 2, kTargetTexture3d = 3, kTargetTextureCube = 4, kTargetTexture2dArray = 7;   // (PIPE_TEXTURE_*)
+constexpr uint32_t kShaderGeometry = 2;   // (PIPE_SHADER_GEOMETRY)
 constexpr uint32_t kShaderCompute = 5;   // (PIPE_SHADER_COMPUTE)
 constexpr uint32_t kBindShaderBuffer = 1u << 14;   // a buffer compute shaders read and write
 constexpr uint32_t kShaderVertex = 0;
