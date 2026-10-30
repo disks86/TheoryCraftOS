@@ -210,7 +210,6 @@ ZW_SERVICE(NtImpersonateAnonymousToken, ZwImpersonateAnonymousToken);
 ZW_SERVICE(NtImpersonateClientOfPort, ZwImpersonateClientOfPort);
 ZW_SERVICE(NtImpersonateThread, ZwImpersonateThread);
 ZW_SERVICE(NtInitializeEnclave, ZwInitializeEnclave);
-ZW_SERVICE(NtInitializeNlsFiles, ZwInitializeNlsFiles);
 ZW_SERVICE(NtInitializeRegistry, ZwInitializeRegistry);
 ZW_SERVICE(NtInitiatePowerAction, ZwInitiatePowerAction);
 ZW_SERVICE(NtIsProcessInJob, ZwIsProcessInJob);

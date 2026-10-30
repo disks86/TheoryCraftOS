@@ -251,7 +251,6 @@ EXPORT int WINAPI FindNLSStringEx(LPCWSTR locale_name, DWORD flags, LPCWSTR sour
   return at;
 }
 EXPORT int WINAPI FindNLSString(LCID locale, DWORD flags, LPCWSTR source, int source_count, LPCWSTR value, int value_count, LPINT found_length) { (void)locale; return FindNLSStringEx(NULL, flags, source, source_count, value, value_count, found_length, NULL, NULL, 0); }
-EXPORT BOOL WINAPI IsNLSDefinedString(int function, DWORD flags, LPVOID version, LPCWSTR text, int count) { (void)function; (void)flags; (void)version; (void)text; (void)count; return TRUE; }
 NTSTATUS NTAPI RtlNormalizeString(ULONG form, const WCHAR *src, INT src_len, WCHAR *dst, INT *dst_len);
 NTSTATUS NTAPI RtlIsNormalizedString(ULONG form, const WCHAR *src, INT src_len, BOOLEAN *normalized);
 EXPORT BOOL WINAPI IsNormalizedString(int form, LPCWSTR text, int count) {

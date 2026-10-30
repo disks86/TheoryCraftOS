@@ -195,3 +195,81 @@ EXPORT BOOL WINAPI EnumUILanguagesW(UILANGUAGE_ENUMPROCW_ proc, DWORD flags, LON
   proc((flags & 0x8u) ? name : text, param);
   return TRUE;
 }
+
+/* ---- NLS versions ---------------------------------------------------------------------------------------------------------------------------------------- */
+
+typedef struct { DWORD Data1; WORD Data2, Data3; BYTE Data4[8]; } NLS_GUID_;
+typedef struct { DWORD dwNLSVersionInfoSize, dwNLSVersion, dwDefinedVersion, dwEffectiveId; NLS_GUID_ guidCustomVersion; } NLSVERSIONINFOEX_;
+#define NLS_VERSION_COMPARE_STRING 1u
+#define NLS_VERSION_CURRENT 0x00060100u
+#define NLS_VERSION_SHORT 12u      /* the structure without the effective identifier and the custom version */
+/* The sort identifier that goes into the custom version of a language (French and Japanese sort in a way of their own). */
+static DWORD nls_sort_id(int kind) {
+  const char *iso = nls_text_of(kind, 0x59);
+  if (iso && iso[0] == 'f' && iso[1] == 'r' && !iso[2]) return 3;
+  if (iso && iso[0] == 'j' && iso[1] == 'a' && !iso[2]) return 0x46;
+  return 1;
+}
+static void nls_version_fill(int kind, DWORD lcid, NLSVERSIONINFOEX_ *info) {
+  info->dwNLSVersion = NLS_VERSION_CURRENT;
+  info->dwDefinedVersion = NLS_VERSION_CURRENT;
+  if (info->dwNLSVersionInfoSize >= sizeof(*info)) {
+    info->dwEffectiveId = lcid;
+    info->guidCustomVersion.Data1 = nls_sort_id(kind);
+    info->guidCustomVersion.Data2 = 0x57ee;
+    info->guidCustomVersion.Data3 = 0x1e5c;
+    static const BYTE tail[8] = {0x00, 0xb4, 0xd0, 0x00, 0x0b, 0xb1, 0xe1, 0x1e};
+    memcpy(info->guidCustomVersion.Data4, tail, 8);
+  }
+}
+EXPORT BOOL WINAPI GetNLSVersion(DWORD function, LCID locale, NLSVERSIONINFOEX_ *info) {
+  if (!info || info->dwNLSVersionInfoSize < NLS_VERSION_SHORT) { set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+  if (function != NLS_VERSION_COMPARE_STRING) { set_error(ERROR_INVALID_FLAGS); return FALSE; }
+  const int kind = nls_locale_of(locale);
+  if (!kind) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  nls_version_fill(kind, k_locale_lcid[kind - 1], info);
+  return TRUE;
+}
+EXPORT BOOL WINAPI GetNLSVersionEx(DWORD function, LPCWSTR name, NLSVERSIONINFOEX_ *info) {
+  if (!info || info->dwNLSVersionInfoSize < NLS_VERSION_SHORT) { set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+  if (info->dwNLSVersionInfoSize != NLS_VERSION_SHORT && info->dwNLSVersionInfoSize < sizeof(*info)) { set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+  if (function != NLS_VERSION_COMPARE_STRING) { set_error(ERROR_INVALID_FLAGS); return FALSE; }
+  const int kind = nls_locale_of_name(name);
+  if (!kind) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  int specific = kind;
+  if (nls_kind_is_neutral(kind)) specific = k_locale_default[kind - 1] + 1;
+  nls_version_fill(specific, name && !*name ? NLS_LCID_INVARIANT : k_locale_lcid[specific - 1], info);
+  return TRUE;
+}
+/* The version is valid when the major part of the NLS version is the current one and the custom version is the one of the locale (or none). */
+EXPORT BOOL WINAPI IsValidNLSVersion(DWORD function, LPCWSTR name, NLSVERSIONINFOEX_ *info) {
+  if (function != NLS_VERSION_COMPARE_STRING || !info) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  const int kind = nls_locale_of_name(name);
+  if (!kind) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (info->dwNLSVersionInfoSize < NLS_VERSION_SHORT) { set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+  BOOL valid = (info->dwNLSVersion >> 8) == (NLS_VERSION_CURRENT >> 8);
+  if (valid && info->dwNLSVersionInfoSize >= sizeof(*info)) {
+    int specific = nls_kind_is_neutral(kind) ? k_locale_default[kind - 1] + 1 : kind;
+    const BOOL none = info->guidCustomVersion.Data1 == 0 && info->guidCustomVersion.Data2 == 0 && info->guidCustomVersion.Data3 == 0;
+    valid = none || info->guidCustomVersion.Data1 == 1 || info->guidCustomVersion.Data1 == nls_sort_id(specific);
+  }
+  if (!valid) set_error(0);
+  return valid;
+}
+/* Every defined character is in the Unicode of the NLS tables; a lone surrogate is not. */
+EXPORT BOOL WINAPI IsNLSDefinedString(DWORD function, DWORD flags, NLSVERSIONINFOEX_ *version, LPCWSTR text, int count) {
+  (void)flags;
+  if (function != NLS_VERSION_COMPARE_STRING) { set_error(ERROR_INVALID_FLAGS); return FALSE; }
+  if (version && version->dwNLSVersionInfoSize != NLS_VERSION_SHORT && version->dwNLSVersionInfoSize > sizeof(*version)) { set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+  if (!text) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (count < 0) count = (int)wcslen(text);
+  for (int i = 0; i < count; ++i) {
+    const WCHAR c = text[i];
+    if (c >= 0xD800 && c < 0xDC00 && i + 1 < count && (text[i + 1] & 0xFC00) == 0xDC00) { ++i; continue; }
+    if (c >= 0xD800 && c < 0xE000) return FALSE;
+    WORD c1, c2, c3;
+    ctype_of(c, &c1, &c2, &c3);
+    if (!(c1 & C1_DEFINED_)) return FALSE;
+  }
+  return TRUE;
+}

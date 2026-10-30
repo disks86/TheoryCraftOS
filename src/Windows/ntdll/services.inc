@@ -186,7 +186,6 @@ NT_SERVICE(NtImpersonateAnonymousToken);
 NT_SERVICE(NtImpersonateClientOfPort);
 NT_SERVICE(NtImpersonateThread);
 NT_SERVICE(NtInitializeEnclave);
-NT_SERVICE(NtInitializeNlsFiles);
 NT_SERVICE(NtInitializeRegistry);
 NT_SERVICE(NtInitiatePowerAction);
 NT_SERVICE(NtIsSystemResumeAutomatic);
