@@ -2032,6 +2032,14 @@ static void test_net_interrupts() {
     CHECK(!f.net->connected() && !(f.chip.unmasked[0] & (1u << 1)) && !(f.chip.unmasked[0] & (1u << 13)) && (f.chip.unmasked[0] & (1u << 0)));
     CHECK(((f.chip.read32(kIntVecAllocBase) >> 4) & 0xF) == 0);
   }
+  {   // two table entries: the data rings on their own
+    NetFixture f;
+    CHECK(f.icm.use_interrupts(true, 2, 5));
+    f.bring_up();
+    CHECK(f.net->connected() && ((f.chip.read32(kIntVecAllocBase) >> 4) & 0xF) == 5 && ((f.chip.read32(kIntVecAllocBase + 4) >> 20) & 0xF) == 5);   // data rings (bits 1 and 13) on entry 5
+    CHECK((f.chip.read32(kIntVecAllocBase) & 0xF) == 2 && ((f.chip.read32(kIntVecAllocBase + 4) >> 16) & 0xF) == 2);                                    // the control channel's (bits 0 and 12) on entry 2
+    CHECK(!f.icm.use_interrupts(true, 0, 16));
+  }
   {   // a single MSI: unmasked, no vector allocation
     NetFixture f;
     CHECK(f.icm.use_interrupts(true));

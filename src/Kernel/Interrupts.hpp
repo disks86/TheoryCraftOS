@@ -43,6 +43,7 @@ constexpr uint8_t kVectorWakeup = 0x42;    // inter-processor interrupt: look fo
 constexpr uint8_t kVectorVirtioGpu = 0x50; // MSI-X: the virtio-gpu's command completions
 constexpr uint8_t kVectorAmdVegaM = 0x51;  // MSI: the Radeon RX Vega M's interrupt ring has vectors
 constexpr uint8_t kVectorThunderbolt = 0x52; // MSI: the Thunderbolt host interface's control channel rings
+constexpr uint8_t kVectorThunderboltData = 0x54; // MSI-X: the Thunderbolt data rings (networking)
 constexpr uint8_t kVectorAcpiSci = 0x53;   // I/O APIC: the ACPI system control interrupt
 constexpr uint8_t kVectorSpurious = 0xFF;
 constexpr uint64_t kRflagsInterrupts = 1u << 9;

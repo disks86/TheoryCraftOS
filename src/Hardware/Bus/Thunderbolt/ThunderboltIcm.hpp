@@ -227,10 +227,10 @@ class ThunderboltIcm final : public IThunderboltEvents {
   bool running() const { return outcome_ == Outcome::Started; }
   // Interrupts from the control channel's rings (the caller routes the MSI and calls TbNhi::acknowledge_interrupt from its handler). Only unmasks them in the chip; the channel is still
   // read by poll(), which the caller may then call only after an interrupt. Remembered over suspend and resume. False if the controller is not running.
-  bool use_interrupts(bool on, int msix_vector = -1);
+  bool use_interrupts(bool on, int msix_vector = -1, int data_vector = -1);
   bool interrupts_on() const { return interrupts_; }
   // Routes a data ring's interrupt the way the control channel's is (to the MSI-X entry given to use_interrupts, or the single MSI); does nothing while interrupts are off, so the ring is polled.
-  void ring_interrupts(bool transmit, uint32_t hop, bool on) { if (interrupts_ || !on) nhi_.set_ring_interrupts(transmit, hop, on, msix_vector_); }
+  void ring_interrupts(bool transmit, uint32_t hop, bool on) { if (interrupts_ || !on) nhi_.set_ring_interrupts(transmit, hop, on, data_vector_ >= 0 ? data_vector_ : msix_vector_); }
   Outcome outcome() const { return outcome_; }
 
   // Reads the control channel: events update the device list.
@@ -321,7 +321,7 @@ class ThunderboltIcm final : public IThunderboltEvents {
   TbDriverReady ready_;
   crypto::IRandom* random_ = nullptr;
   bool interrupts_ = false, rtd3_veto_ = false;
-  int msix_vector_ = -1;
+  int msix_vector_ = -1, data_vector_ = -1;
   ITbKeyStore* keys_ = nullptr;
   Options options_;
   uint32_t port_reset_failures_ = 0;
