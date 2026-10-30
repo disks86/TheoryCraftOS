@@ -90,6 +90,8 @@ ComputerManager::ComputerManager(allocators::IAllocator& allocator)
       display_menu_(allocator),
       adapter_menu_(allocator),
       wireless_menu_(allocator),
+      device_menu_(allocator),
+      monitor_menu_(allocator),
       bluetooth_menu_(allocator),
       hardware_info_(allocator),
       cpu_meter_(allocator),
@@ -210,6 +212,10 @@ ComputerManager::ComputerManager(allocators::IAllocator& allocator)
   properties_item_ = adapter_menu_.add_item("Properties...", {&ComputerManager::on_properties_item, this});
   wireless_adapter_item_ = wireless_menu_.add_item("Properties...", {&ComputerManager::on_properties_item, this});
   wireless_properties_item_ = wireless_menu_.add_item("Wi-Fi Properties...", {&ComputerManager::on_wireless_item, this});
+  device_properties_item_ = device_menu_.add_item("Properties...", {&ComputerManager::on_device_item, this});
+  monitor_properties_item_ = monitor_menu_.add_item("Properties...", {&ComputerManager::on_device_item, this});
+  monitor_settings_item_ = monitor_menu_.add_item("Display Settings...", {&ComputerManager::on_display_settings_item, this});
+  bluetooth_properties_item_ = bluetooth_menu_.add_item("Properties...", {&ComputerManager::on_device_item, this});
   bluetooth_settings_item_ = bluetooth_menu_.add_item("Bluetooth Settings...", {&ComputerManager::on_bluetooth_item, this});
   hardware_page_.add(&hardware_info_);
   hardware_page_.add(&tree_);
@@ -265,12 +271,23 @@ void ComputerManager::on_display_settings_item(void* self, Control&) {
   auto* t = static_cast<ComputerManager*>(self);
   t->fire(t->open_display_settings_);
 }
-bool ComputerManager::selected_adapter(uint32_t* id) const {
+bool ComputerManager::selected_entry(HardwareEntry* out) const {
   const int32_t node = tree_.selected();
+  return node >= 0 && inventory_ && !(tree_.node_tag(node) & 0x10000u) && inventory_->entry(tree_.node_tag(node), out);
+}
+bool ComputerManager::selected_adapter(uint32_t* id) const {
   HardwareEntry e;
-  if (node < 0 || !inventory_ || (tree_.node_tag(node) & 0x10000u) || !inventory_->entry(tree_.node_tag(node), &e)) return false;
+  if (!selected_entry(&e)) return false;
   *id = e.id;
   return true;
+}
+void ComputerManager::on_device_item(void* self, Control&) {
+  auto* t = static_cast<ComputerManager*>(self);
+  HardwareEntry e;
+  if (!t->selected_entry(&e)) return;
+  t->device_group_ = e.group;
+  t->properties_adapter_ = e.id;
+  t->fire(t->open_device_properties_);
 }
 void ComputerManager::on_properties_item(void* self, Control&) {
   auto* t = static_cast<ComputerManager*>(self);
@@ -341,8 +358,12 @@ void ComputerManager::rebuild_hardware() {
         group_nodes_[g] = node;
       }
       const int32_t device = tree_.add_node(node, e.name, i, g == static_cast<uint32_t>(HardwareGroup::Storage) ? ItemIcon::Drive : ItemIcon::File);
-      if (device >= 0 && g == static_cast<uint32_t>(HardwareGroup::Bluetooth) && e.bluetooth) tree_.set_node_menu(device, &bluetooth_menu_);   // (Bluetooth Settings)
-      if (device >= 0 && g == static_cast<uint32_t>(HardwareGroup::Network)) tree_.set_node_menu(device, e.wireless ? &wireless_menu_ : &adapter_menu_);   // (Properties; a Wi-Fi adapter has Wi-Fi Properties too)
+      if (device < 0) continue;
+      // Every device has Properties. A network adapter's is its own window (and a Wi-Fi adapter has Wi-Fi Properties too); a Bluetooth adapter also has Bluetooth Settings; a display also leads
+      // to Display Settings; all the others share the generic one, whatever their driver.
+      if (g == static_cast<uint32_t>(HardwareGroup::Network)) tree_.set_node_menu(device, e.wireless ? &wireless_menu_ : &adapter_menu_);
+      else if (g == static_cast<uint32_t>(HardwareGroup::Bluetooth) && e.bluetooth) tree_.set_node_menu(device, &bluetooth_menu_);
+      else tree_.set_node_menu(device, g == static_cast<uint32_t>(HardwareGroup::Displays) ? &monitor_menu_ : &device_menu_);
     }
     if (node < 0) continue;
     if (first || !(had_mask & (1u << g)) || (open_mask & (1u << g))) tree_.set_expanded(node, true);   // (a group that turns up is open)

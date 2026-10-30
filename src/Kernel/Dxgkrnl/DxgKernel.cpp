@@ -55,6 +55,15 @@ struct PipelineRec {
   Handle device = 0;
 };
 
+struct SignatureRec {
+  SharedPointer<RootSignatureObject> signature;
+  Handle device = 0;
+};
+struct HeapRec {
+  SharedPointer<DescriptorHeapObject> heap;
+  Handle device = 0;
+};
+
 struct Kernel::ShareToken {
   uint32_t token = 0;
   ProcessId owner = 0;
@@ -63,7 +72,7 @@ struct Kernel::ShareToken {
 
 struct Kernel::Process {
   explicit Process(allocators::IAllocator& allocator, ProcessId pid)
-      : pid(pid), adapters(allocator, 1), devices(allocator, 2), contexts(allocator, 3), allocations(allocator, 4), syncs(allocator, 5), shaders(allocator, 6), pipelines(allocator, 7) {}
+      : pid(pid), adapters(allocator, 1), devices(allocator, 2), contexts(allocator, 3), allocations(allocator, 4), syncs(allocator, 5), shaders(allocator, 6), pipelines(allocator, 7), signatures(allocator, 8), heaps(allocator, 9) {}
   ProcessId pid;
   HandleTable<AdapterRec> adapters;
   HandleTable<DeviceObject> devices;
@@ -72,6 +81,8 @@ struct Kernel::Process {
   HandleTable<SyncRec> syncs;
   HandleTable<ShaderRec> shaders;
   HandleTable<PipelineRec> pipelines;
+  HandleTable<SignatureRec> signatures;
+  HandleTable<HeapRec> heaps;
 };
 
 namespace {
@@ -79,14 +90,25 @@ namespace {
 // The pipelines a stream may bind: this process's, made on the context's device.
 class DeviceLookup final : public IPipelineLookup {
  public:
-  DeviceLookup(const HandleTable<PipelineRec>& table, Handle device) : table_(table), device_(device) {}
+  DeviceLookup(const HandleTable<PipelineRec>& table, const HandleTable<SignatureRec>& signatures, const HandleTable<HeapRec>& heaps, Handle device)
+      : table_(table), signatures_(signatures), heaps_(heaps), device_(device) {}
   SharedPointer<PipelineObject> find_pipeline(Handle handle) override {
     SharedPointer<PipelineRec> rec = table_.get(handle);
     return rec && rec->device == device_ ? rec->pipeline : SharedPointer<PipelineObject>();
   }
+  SharedPointer<RootSignatureObject> find_root_signature(Handle handle) override {
+    SharedPointer<SignatureRec> rec = signatures_.get(handle);
+    return rec && rec->device == device_ ? rec->signature : SharedPointer<RootSignatureObject>();
+  }
+  SharedPointer<DescriptorHeapObject> find_descriptor_heap(Handle handle) override {
+    SharedPointer<HeapRec> rec = heaps_.get(handle);
+    return rec && rec->device == device_ ? rec->heap : SharedPointer<DescriptorHeapObject>();
+  }
 
  private:
   const HandleTable<PipelineRec>& table_;
+  const HandleTable<SignatureRec>& signatures_;
+  const HandleTable<HeapRec>& heaps_;
   Handle device_;
 };
 
@@ -339,6 +361,12 @@ void Kernel::destroy_device_locked(Process& p, Handle device) {
   if (handles_of_device(p.pipelines, device, doomed))
     for (Handle h : doomed.view()) p.pipelines.remove(h);
   doomed.clear();
+  if (handles_of_device(p.signatures, device, doomed))
+    for (Handle h : doomed.view()) p.signatures.remove(h);
+  doomed.clear();
+  if (handles_of_device(p.heaps, device, doomed))
+    for (Handle h : doomed.view()) p.heaps.remove(h);
+  doomed.clear();
   if (handles_of_device(p.shaders, device, doomed))
     for (Handle h : doomed.view()) p.shaders.remove(h);
   doomed.clear();
@@ -413,8 +441,13 @@ NtStatus Kernel::create_allocation(ProcessId pid, Handle device, const Allocatio
   Process* p = find_process(pid);
   DeviceObject* d = p ? p->devices.raw(device) : nullptr;
   if (!d) return status::kInvalidHandle;
-  SharedPointer<Allocation> a;
-  NtStatus s = d->adapter().vidmm().create(desc, &a);
+  SharedPointer<Allocation> a, heap;
+  if (desc.heap) {
+    SharedPointer<AllocRec> h = p->allocations.get(desc.heap);
+    if (!h || h->device != device) return status::kInvalidHandle;
+    heap = h->allocation;
+  }
+  NtStatus s = d->adapter().vidmm().create(desc, &a, heap);
   if (s != status::kSuccess) return s;
   SharedPointer<AllocRec> rec = SharedPointer<AllocRec>::make(allocator_);
   if (!rec) return status::kNoMemory;
@@ -753,7 +786,7 @@ NtStatus Kernel::render(ProcessId pid, Handle context, ConstByteView commands, A
     if (&rec->allocation->manager() != &adapter.vidmm()) return status::kInvalidParameter;
     if (!list.push_back(rec->allocation)) return status::kNoMemory;
   }
-  DeviceLookup lookup(p->pipelines, c->device);
+  DeviceLookup lookup(p->pipelines, p->signatures, p->heaps, c->device);
   const NtStatus st = adapter.queue_render(*c->context, commands, ArrayView<const SharedPointer<Allocation>>(list.view().data(), list.count()), lookup);
   if (st == status::kSuccess) pump_locked();
   return st;
@@ -844,6 +877,114 @@ NtStatus Kernel::create_pipeline(ProcessId pid, Handle device, const PipelineDes
   kernel::ScopedMutex g(lock_);
   Process* p = find_process(pid);
   return p ? create_pipeline_locked(*p, device, desc, pipeline) : status::kInvalidParameter;
+}
+
+// --- Direct3D 12 binding objects ------------------------------------------------------------------------------------------------------------------------------------
+
+NtStatus Kernel::create_root_signature(ProcessId pid, Handle device, ConstByteView blob, Handle* out) {
+  kernel::ScopedMutex g(lock_);
+  Process* p = find_process(pid);
+  if (!p || !p->devices.raw(device)) return status::kInvalidHandle;
+  SharedPointer<SignatureRec> rec = SharedPointer<SignatureRec>::make(allocator_);
+  if (!rec) return status::kNoMemory;
+  rec->signature = SharedPointer<RootSignatureObject>::make(allocator_);
+  if (!rec->signature) return status::kNoMemory;
+  const NtStatus st = parse_root_signature(blob, &rec->signature->desc);
+  if (st != status::kSuccess) return st;
+  rec->device = device;
+  *out = p->signatures.insert(rec);
+  return *out ? status::kSuccess : status::kInsufficientResources;
+}
+
+NtStatus Kernel::destroy_root_signature(ProcessId pid, Handle signature) {
+  kernel::ScopedMutex g(lock_);
+  Process* p = find_process(pid);
+  return p && p->signatures.remove(signature) ? status::kSuccess : status::kInvalidHandle;
+}
+
+NtStatus Kernel::create_descriptor_heap(ProcessId pid, Handle device, DescriptorHeapType type, uint32_t count, Handle* out) {
+  kernel::ScopedMutex g(lock_);
+  Process* p = find_process(pid);
+  if (!p || !p->devices.raw(device)) return status::kInvalidHandle;
+  if (count == 0 || count > kMaxHeapDescriptors) return status::kInvalidParameter;
+  SharedPointer<HeapRec> rec = SharedPointer<HeapRec>::make(allocator_);
+  if (!rec) return status::kNoMemory;
+  rec->heap = SharedPointer<DescriptorHeapObject>::make(allocator_, allocator_, type);
+  if (!rec->heap || !rec->heap->resize(count)) return status::kNoMemory;
+  rec->device = device;
+  *out = p->heaps.insert(rec);
+  return *out ? status::kSuccess : status::kInsufficientResources;
+}
+
+NtStatus Kernel::destroy_descriptor_heap(ProcessId pid, Handle heap) {
+  kernel::ScopedMutex g(lock_);
+  Process* p = find_process(pid);
+  return p && p->heaps.remove(heap) ? status::kSuccess : status::kInvalidHandle;
+}
+
+NtStatus Kernel::write_descriptor(ProcessId pid, Handle heap, uint32_t index, const DescriptorDesc& desc) {
+  kernel::ScopedMutex g(lock_);
+  Process* p = find_process(pid);
+  SharedPointer<HeapRec> h = p ? p->heaps.get(heap) : SharedPointer<HeapRec>();
+  if (!h) return status::kInvalidHandle;
+  if (index >= h->heap->count()) return status::kInvalidParameter;
+  Descriptor d;
+  d.kind = desc.kind;
+  d.sampler = desc.sampler;
+  if (desc.kind == DescriptorKind::None) {
+    h->heap->at(index) = d;
+    return status::kSuccess;
+  }
+  if ((desc.kind == DescriptorKind::Sampler) != (h->heap->type() == DescriptorHeapType::Sampler)) return status::kInvalidParameter;
+  if (desc.kind != DescriptorKind::Sampler) {
+    SharedPointer<AllocRec> a = p->allocations.get(desc.allocation);
+    if (!a || a->device != h->device) return status::kInvalidHandle;
+    const Allocation& alloc = *a->allocation;
+    const bool buffer_view = desc.kind == DescriptorKind::Srv && alloc.is_buffer();
+    if (desc.kind == DescriptorKind::Srv ? (buffer_view ? !(alloc.desc().flags & kAllocUnorderedAccess) : (!alloc.is_image() || !(alloc.desc().flags & kAllocTexture)))
+        : desc.kind == DescriptorKind::Uav ? !(alloc.desc().flags & kAllocUnorderedAccess)
+                                           : !alloc.is_buffer() || alloc.is_query_result())
+      return status::kInvalidParameter;
+    if (desc.kind != DescriptorKind::Srv || buffer_view) {
+      if (desc.offset > alloc.desc().size || desc.offset % 4 || desc.size > alloc.desc().size - desc.offset || desc.size % 4) return status::kInvalidParameter;
+      d.offset = desc.offset;
+      d.size = desc.size ? desc.size : alloc.desc().size - desc.offset;
+    }
+    d.allocation = a->allocation;
+  }
+  h->heap->at(index) = d;
+  return status::kSuccess;
+}
+
+NtStatus Kernel::copy_descriptors(ProcessId pid, Handle destination, uint32_t destination_index, Handle source, uint32_t source_index, uint32_t count) {
+  kernel::ScopedMutex g(lock_);
+  Process* p = find_process(pid);
+  SharedPointer<HeapRec> to = p ? p->heaps.get(destination) : SharedPointer<HeapRec>(), from = p ? p->heaps.get(source) : SharedPointer<HeapRec>();
+  if (!to || !from) return status::kInvalidHandle;
+  if (to->heap->type() != from->heap->type() || count == 0 || destination_index > to->heap->count() || count > to->heap->count() - destination_index || source_index > from->heap->count() ||
+      count > from->heap->count() - source_index)
+    return status::kInvalidParameter;
+  // (an overlap within one heap: copied the way memmove would)
+  if (destination_index <= source_index) {
+    for (uint32_t i = 0; i < count; ++i) to->heap->at(destination_index + i) = from->heap->at(source_index + i);
+  } else {
+    for (uint32_t i = count; i-- > 0;) to->heap->at(destination_index + i) = from->heap->at(source_index + i);
+  }
+  return status::kSuccess;
+}
+
+NtStatus Kernel::update_tile_mappings(ProcessId pid, Handle reserved, uint32_t first_tile, Handle heap, uint64_t heap_offset, uint32_t tile_count) {
+  kernel::ScopedMutex g(lock_);
+  Process* p = find_process(pid);
+  SharedPointer<AllocRec> r = p ? p->allocations.get(reserved) : SharedPointer<AllocRec>();
+  if (!r) return status::kInvalidHandle;
+  SharedPointer<Allocation> heap_allocation;
+  if (heap) {
+    SharedPointer<AllocRec> h = p->allocations.get(heap);
+    if (!h || h->device != r->device) return status::kInvalidHandle;
+    heap_allocation = h->allocation;
+  }
+  return r->allocation->manager().map_tiles(*r->allocation, first_tile, heap_allocation, heap_offset, tile_count);
 }
 
 NtStatus Kernel::destroy_shader(ProcessId pid, Handle shader) {
@@ -944,6 +1085,23 @@ NtStatus Kernel::escape(ProcessId pid, Handle device, ConstByteView request, Byt
                   desc.hull_shader = in.le32();
                   desc.domain_shader = in.le32();
                   if (!in.ok()) return status::kInvalidParameter;
+                  if (!in.at_end()) {   // (and, after that, stream output: the entry count, and if there are entries the rasterized stream (-1: none), the strides, then the entries)
+                    const uint32_t entries = in.le32();
+                    if (!in.ok() || entries > graphics::kMaxStreamOutputEntries) return status::kInvalidParameter;
+                    if (entries) {
+                      desc.rasterized_stream = static_cast<int32_t>(in.le32());
+                      for (uint32_t& stride : desc.stream_output_stride) stride = in.le32();
+                      for (uint32_t e = 0; e < entries; ++e) {
+                        const uint32_t packed = in.le32(), buffer = in.le32();
+                        if (!in.ok() || buffer >= graphics::kMaxStreamOutputBuffers) return status::kInvalidParameter;
+                        graphics::StreamOutputEntry& entry = desc.stream_output[e];
+                        entry.stream = static_cast<uint8_t>(packed), entry.output = static_cast<uint8_t>(packed >> 8), entry.start_component = static_cast<uint8_t>(packed >> 16);
+                        entry.component_count = static_cast<uint8_t>(packed >> 24), entry.buffer = static_cast<uint8_t>(buffer);
+                      }
+                    }
+                    if (!in.ok()) return status::kInvalidParameter;
+                    desc.stream_output_count = entries;
+                  }
                 }
               }
             }

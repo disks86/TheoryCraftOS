@@ -21,6 +21,7 @@
 #include "Process/WindowsPipes.hpp"
 #include "Process/WindowsSockets.hpp"
 #include "Process/Objects.hpp"
+#include "Process/WindowsDebug.hpp"
 
 namespace process {
 
@@ -53,7 +54,7 @@ uint64_t Process::syscall(const SyscallRequest& request) {
 }
 
 namespace {
-bool is_object_kind(DescriptorKind k) { return k == DescriptorKind::Event || k == DescriptorKind::Mutex || k == DescriptorKind::Semaphore || k == DescriptorKind::Process || k == DescriptorKind::Timer || k == DescriptorKind::Section || k == DescriptorKind::Job || k == DescriptorKind::ChangeNotification; }
+bool is_object_kind(DescriptorKind k) { return k == DescriptorKind::Event || k == DescriptorKind::Mutex || k == DescriptorKind::Semaphore || k == DescriptorKind::Process || k == DescriptorKind::Timer || k == DescriptorKind::Section || k == DescriptorKind::Job || k == DescriptorKind::ChangeNotification || k == DescriptorKind::DebugObject; }
 }  // namespace
 
 Process::~Process() {
@@ -73,6 +74,7 @@ bool Process::close_descriptor(uint64_t slot) {
   const uint64_t token = files_.token(slot);
   if (!files_.close(slot)) return false;
   if (is_object_kind(kind)) if (ObjectManager* objects = system_objects()) objects->release(uint32_t(token));
+  if (kind == DescriptorKind::DebugObject) windowsabi::debug_drain_kills(runtime_);
   if (kind == DescriptorKind::Pipe) windowsabi::pipe_token_release(token);
   if (kind == DescriptorKind::Socket) windowsabi::socket_token_release(token);
   if (kind == DescriptorKind::Mailslot) windowsabi::mailslot_token_release(token);
@@ -90,6 +92,7 @@ void Process::terminate(uint32_t code) {
   __atomic_store_n(&exited_, true, __ATOMIC_RELEASE);
   host_.wake_blocked();
   if (runtime_) runtime_->notify();
+  windowsabi::debug_process_exited(id_, code);
   if (ObjectManager* objects = system_objects()) {      // what it owned is abandoned; whoever waits for it or for them looks again
     objects->abandon_process(id_);
     objects->process_exited(id_, code);

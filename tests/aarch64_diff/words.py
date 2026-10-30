@@ -9,14 +9,19 @@ per_key = int(sys.argv[4]) if len(sys.argv) > 4 else 4
 candidates = int(sys.argv[5]) if len(sys.argv) > 5 else 600000
 rng = random.Random(seed)
 import os
+SME = bool(os.environ.get('SME'))
 SVEMEM = bool(os.environ.get('SVEMEM'))
 SVE = bool(os.environ.get('SVE')) or SVEMEM
 words = []
+if os.environ.get('WORDS_FILE'):      # a fixed list of instruction words (one hex word per line), each run COPIES times with different random state
+    words = [int(l.split()[0], 16) for l in open(os.environ['WORDS_FILE']) if l.strip()] * int(os.environ.get('COPIES', '40'))
+    candidates = 0
 while len(words) < candidates:
     w = rng.getrandbits(32)
     if (w >> 26) & 7 == 5: continue                 # branches
     if (w >> 24) in (0xD4, 0xD5, 0xD6, 0xD7): continue    # exceptions, system, branches to register
     if SVE: w = (w & ~(0xF << 25)) | (2 << 25)            # the SVE encoding space only
+    if SME: w = (w & ~(0xF << 25)) | (1 << 31)            # the SME encoding space (bit 31 set, bits 28:25 clear)
     words.append(w)
 MATTR = '--mattr=+all'
 valid, texts = [], []
@@ -49,13 +54,15 @@ def key(t):
     return m + ' ' + shape
 groups = collections.defaultdict(list)
 for w, t in zip(valid, texts):
-    if SVEMEM:
+    if SME:
+        if re.search(r'\bsp\b|\bx27\b|\bx28\b|\bz31\b', t): continue
+    elif SVEMEM:
         # memory forms only; the ones that need the stack pointer or a 128-bit element (SVE2.1) are skipped
         # (qemu does not load a first-fault or non-fault element that is the first active one but sits in the upper half of the register, which the architecture does not allow: those are
         # covered by the unit tests instead)
-        if not re.match(r'^(ld[1-4]|ldnt1|st[1-4]|stnt1|prf)', t) or re.search(r'\bza|\bpn[0-9]|\bzt0|\bsp\b|\.q\b|\bz31\b|\bx27\b|\bx28\b', t): continue
+        if not re.match(r'^(ld[1-4]|ldnt1|st[1-4]|stnt1|prf)', t) or re.search(r'\bza|\bpn[0-9]|\bzt0|\bsp\b|\bz31\b|\bx27\b|\bx28\b', t): continue
     elif SVE:
-        if SKIP_SVE.match(t) or re.search(r'\bza|\bpn[0-9]|\bzt0|\[x[0-9]|\[sp|\bsm(start|stop)', t): continue
+        if SKIP_SVE.match(t) or re.search(r'\bza|\bzt0|\[x[0-9]|\[sp|\bsm(start|stop)', t): continue
     else:
         if SKIP.match(t): continue
         if re.search(r'\bz#|\bz[0-9]|\bp[0-9]+[/,.]|\bpn|\bza|\[x[0-9]|\[sp', t): continue
@@ -83,7 +90,17 @@ if probe:
     qp = os.environ.get('A64_QPROBE')
     if qp and kept:
         data = b''.join(struct.pack('<I', int(w, 16)) for w, _ in kept)
-        qres = subprocess.run(['qemu-aarch64', '-cpu', 'max,sve-max-vq=1,sme128=on', qp], input=data, capture_output=True, timeout=600).stdout
+        def qrun(blob, limit):
+            return subprocess.run(['qemu-aarch64', '-cpu', 'max,sve-max-vq=1,sme128=on', qp], input=blob, capture_output=True, timeout=limit).stdout
+        qres = b''
+        for base in range(0, len(kept), 200):      # (a word can hang qemu, e.g. a faulting store in streaming mode: such a chunk is redone word by word and the hanging word counts as rejected)
+            chunk = data[4 * base:4 * (base + 200)]
+            try:
+                qres += qrun(chunk, 30)
+            except subprocess.TimeoutExpired:
+                for k in range(len(chunk) // 4):
+                    try: qres += qrun(chunk[4 * k:4 * k + 4], 3)
+                    except subprocess.TimeoutExpired: qres += bytes([1])
         if len(qres) == len(kept):
             lost = collections.Counter(t.split()[0] for (w, t), st in zip(kept, qres) if st == 1)
             kept = [r for r, st in zip(kept, qres) if st != 1]

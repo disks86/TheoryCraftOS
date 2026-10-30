@@ -235,29 +235,35 @@ EXPORT BOOL WINAPI VirtualUnlock(LPVOID a, SIZE_T s) { (void)a; (void)s; return 
 
 EXPORT HANDLE WINAPI GetProcessHeap(void) { return heap(); }
 EXPORT HANDLE WINAPI HeapCreate(DWORD options, SIZE_T initial, SIZE_T maximum) {
-  (void)maximum;
-  PVOID h = RtlCreateHeap(options, NULL, 0, initial, NULL, NULL);
+  if (maximum && initial > maximum) { set_error(ERROR_INVALID_PARAMETER); return NULL; }
+  PVOID h = RtlCreateHeap(options, NULL, maximum, initial, NULL, NULL);
   if (!h) set_error(ERROR_NOT_ENOUGH_MEMORY);
   return h;
 }
-EXPORT BOOL WINAPI HeapDestroy(HANDLE h) { return RtlDestroyHeap(h) == NULL; }
-EXPORT LPVOID WINAPI HeapAlloc(HANDLE h, DWORD flags, SIZE_T bytes) {
-  PVOID p = RtlAllocateHeap(h, flags, bytes);
-  if (!p) set_error(ERROR_NOT_ENOUGH_MEMORY);
-  return p;
+EXPORT BOOL WINAPI HeapDestroy(HANDLE h) {
+  if (RtlDestroyHeap(h) == NULL) return TRUE;
+  set_error(ERROR_INVALID_HANDLE);
+  return FALSE;
 }
-EXPORT LPVOID WINAPI HeapReAlloc(HANDLE h, DWORD flags, LPVOID memory, SIZE_T bytes) {
-  PVOID p = RtlReAllocateHeap(h, flags, memory, bytes);
-  if (!p) set_error(ERROR_NOT_ENOUGH_MEMORY);
-  return p;
-}
-EXPORT BOOL WINAPI HeapFree(HANDLE h, DWORD flags, LPVOID memory) { return RtlFreeHeap(h, flags, memory) ? TRUE : (set_error(ERROR_INVALID_PARAMETER), FALSE); }
+EXPORT LPVOID WINAPI HeapAlloc(HANDLE h, DWORD flags, SIZE_T bytes) { return RtlAllocateHeap(h, flags, bytes); }
+EXPORT LPVOID WINAPI HeapReAlloc(HANDLE h, DWORD flags, LPVOID memory, SIZE_T bytes) { return RtlReAllocateHeap(h, flags, memory, bytes); }
+EXPORT BOOL WINAPI HeapFree(HANDLE h, DWORD flags, LPVOID memory) { return RtlFreeHeap(h, flags, memory) ? TRUE : FALSE; }
 EXPORT SIZE_T WINAPI HeapSize(HANDLE h, DWORD flags, LPCVOID memory) { return RtlSizeHeap(h, flags, (PVOID)memory); }
 EXPORT BOOL WINAPI HeapValidate(HANDLE h, DWORD flags, LPCVOID memory) { return RtlValidateHeap(h, flags, (PVOID)memory); }
-EXPORT BOOL WINAPI HeapSetInformation(HANDLE h, int info_class, PVOID info, SIZE_T length) { (void)h; (void)info_class; (void)info; (void)length; return TRUE; }
-EXPORT SIZE_T WINAPI HeapCompact(HANDLE h, DWORD flags) { (void)h; (void)flags; return 0; }
-EXPORT BOOL WINAPI HeapLock(HANDLE h) { return RtlLockHeap(h); }
-EXPORT BOOL WINAPI HeapUnlock(HANDLE h) { return RtlUnlockHeap(h); }
+IMPORT ULONG NTAPI RtlCompactHeap(PVOID heap, ULONG flags);
+IMPORT NTSTATUS NTAPI RtlSetHeapInformation(PVOID heap, ULONG info_class, PVOID info, SIZE_T length);
+IMPORT NTSTATUS NTAPI RtlQueryHeapInformation(PVOID heap, ULONG info_class, PVOID info, SIZE_T length, PSIZE_T returned);
+EXPORT BOOL WINAPI HeapSetInformation(HANDLE h, int info_class, PVOID info, SIZE_T length) {
+  const NTSTATUS status = RtlSetHeapInformation(h, (ULONG)info_class, info, length);
+  return NT_SUCCESS(status) ? TRUE : fail_nt(status);
+}
+EXPORT BOOL WINAPI HeapQueryInformation(HANDLE h, int info_class, PVOID info, SIZE_T length, PSIZE_T returned) {
+  const NTSTATUS status = RtlQueryHeapInformation(h, (ULONG)info_class, info, length, returned);
+  return NT_SUCCESS(status) ? TRUE : fail_nt(status);
+}
+EXPORT SIZE_T WINAPI HeapCompact(HANDLE h, DWORD flags) { return RtlCompactHeap(h, flags); }
+EXPORT BOOL WINAPI HeapLock(HANDLE h) { return RtlLockHeap(h) ? TRUE : (set_error(ERROR_INVALID_PARAMETER), FALSE); }
+EXPORT BOOL WINAPI HeapUnlock(HANDLE h) { return RtlUnlockHeap(h) ? TRUE : (set_error(ERROR_INVALID_PARAMETER), FALSE); }
 #include "memory.inc"
 
 /* ---- the process: ids, command line, environment, modules, version ---------------------------------------------------------------------------------------- */
@@ -294,11 +300,33 @@ EXPORT BOOL WINAPI GetExitCodeProcess(HANDLE h, LPDWORD code) {
   return TRUE;
 }
 EXPORT BOOL WINAPI IsWow64Process(HANDLE h, LPBOOL wow) { (void)h; *wow = FALSE; return TRUE; }
-EXPORT BOOL WINAPI IsDebuggerPresent(void) { return FALSE; }
-EXPORT BOOL WINAPI CheckRemoteDebuggerPresent(HANDLE h, LPBOOL present) { if (!h || !present) { set_error(ERROR_INVALID_PARAMETER); return FALSE; } *present = FALSE; return TRUE; }
+EXPORT BOOL WINAPI IsDebuggerPresent(void) { return NtCurrentPeb()->BeingDebugged != 0; }
+EXPORT BOOL WINAPI CheckRemoteDebuggerPresent(HANDLE h, LPBOOL present) {
+  if (!h || !present) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  ULONG_PTR port = 0;
+  const NTSTATUS status = NtQueryInformationProcess(h, 7 /* ProcessDebugPort */, &port, sizeof(port), NULL);
+  if (!NT_SUCCESS(status)) return fail_nt(status);
+  *present = port != 0;
+  return TRUE;
+}
 EXPORT void WINAPI DebugBreak(void) { __asm__ volatile("int3"); }
-EXPORT void WINAPI OutputDebugStringA(LPCSTR s) { (void)s; }
-EXPORT void WINAPI OutputDebugStringW(LPCWSTR s) { (void)s; }
+/* A debugger is told with a DBG_PRINTEXCEPTION_C exception (the length with the NUL, the text); without one nothing happens. */
+EXPORT void WINAPI OutputDebugStringA(LPCSTR s) {
+  if (!s || !NtCurrentPeb()->BeingDebugged) return;
+  EXCEPTION_RECORD record;
+  memset(&record, 0, sizeof(record));
+  record.ExceptionCode = 0x40010006u;
+  record.NumberParameters = 2;
+  record.ExceptionInformation[0] = strlen(s) + 1;
+  record.ExceptionInformation[1] = (ULONG_PTR)s;
+  NtTcosDebugException(&record, TRUE, NULL);
+}
+EXPORT void WINAPI OutputDebugStringW(LPCWSTR s) {
+  if (!s || !NtCurrentPeb()->BeingDebugged) return;
+  char text[1024];
+  const int n = WideCharToMultiByte(CP_UTF8, 0, s, -1, text, sizeof(text), NULL, NULL);
+  if (n > 0) OutputDebugStringA(text); else { text[sizeof(text) - 1] = 0; OutputDebugStringA(text); }
+}
 IMPORT NTSTATUS NTAPI RtlSetThreadErrorMode(ULONG, ULONG *);
 IMPORT ULONG NTAPI RtlGetThreadErrorMode(void);
 static DWORD thread_error_mode_from_rtl(ULONG rtl) { return ((rtl & 0x10) ? 1u : 0u) | ((rtl & 0x20) ? 2u : 0u) | ((rtl & 0x40) ? 0x8000u : 0u); }
@@ -423,37 +451,12 @@ EXPORT BOOL WINAPI SetEnvironmentStringsW(LPWSTR block) {
   return TRUE;
 }
 /* Builds a new block with NAME set (or removed when value is NULL) and points the process parameters at it. */
+IMPORT NTSTATUS NTAPI RtlSetEnvironmentVar(PWSTR *penv, PCWSTR name, SIZE_T name_len, PCWSTR value, SIZE_T value_len);
 EXPORT BOOL WINAPI SetEnvironmentVariableW(LPCWSTR name, LPCWSTR value) {
   if (!name || !*name || wcslen(name) > 32767) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
   for (const WCHAR *c = name; *c; ++c) if (*c == '=') { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
-  const WCHAR *old = parameters()->Environment;
-  size_t_ old_units = 0;
-  while (old[old_units] || old[old_units + 1]) ++old_units;
-  old_units += 2;
-  const size_t_ name_length = wcslen(name), value_length = value ? wcslen(value) : 0;
-  WCHAR *fresh = RtlAllocateHeap(heap(), 0, (old_units + name_length + value_length + 4) * 2);
-  if (!fresh) { set_error(ERROR_NOT_ENOUGH_MEMORY); return FALSE; }
-  size_t_ out = 0;
-  for (const WCHAR *e = old; *e; e += wcslen(e) + 1) {
-    size_t_ i = 0;
-    while (i < name_length && e[i] && upper(e[i]) == upper(name[i])) ++i;
-    if (i == name_length && e[i] == '=') continue;      /* replaced or removed */
-    const size_t_ n = wcslen(e) + 1;
-    memcpy(fresh + out, e, n * 2);
-    out += n;
-  }
-  if (value) {
-    memcpy(fresh + out, name, name_length * 2);
-    out += name_length;
-    fresh[out++] = '=';
-    memcpy(fresh + out, value, value_length * 2);
-    out += value_length;
-    fresh[out++] = 0;
-  }
-  fresh[out++] = 0;
-  if (out == 1) fresh[out++] = 0;
-  parameters()->Environment = fresh;
-  return TRUE;
+  const NTSTATUS status = RtlSetEnvironmentVar(NULL, name, wcslen(name), value, value ? wcslen(value) : 0);
+  return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
 EXPORT BOOL WINAPI SetEnvironmentVariableA(LPCSTR name, LPCSTR value) {
   WCHAR *n = to_wide(name), *v = value ? to_wide(value) : NULL;
@@ -619,7 +622,11 @@ EXPORT BOOL WINAPI GlobalMemoryStatusEx(LPMEMORYSTATUSEX m) {
   m->ullTotalPageFile = total;
   m->ullAvailPageFile = available;
   m->ullTotalVirtual = get64(basic + 40) - get64(basic + 32) + 1;
-  m->ullAvailVirtual = m->ullTotalVirtual;      /* (the address space is not tracked in bytes left) */
+  m->ullAvailVirtual = m->ullTotalVirtual;      /* (the address space is not tracked in bytes left: what the process uses is taken off) */
+  {
+    ULONGLONG counters[16] = {0};
+    if (NT_SUCCESS(NtQueryInformationProcess(NtCurrentProcess(), 3 /* ProcessVmCounters */, counters, sizeof(counters), NULL)) && counters[4] < m->ullAvailVirtual) m->ullAvailVirtual -= counters[4];
+  }
   m->ullAvailExtendedVirtual = 0;
   return TRUE;
 }
@@ -713,6 +720,7 @@ static DWORD full_path_w(LPCWSTR in, WCHAR *out, DWORD capacity);
 EXPORT HMODULE WINAPI GetModuleHandleW(LPCWSTR name) {
   if (!name) return NtCurrentPeb()->ImageBaseAddress;
   LDR_DATA_TABLE_ENTRY *m = module_by_name(name);
+  if (!m && (equals_ignore_case(name, (const WCHAR *)L"kernelbase.dll") || equals_ignore_case(name, (const WCHAR *)L"kernelbase"))) m = module_by_name((const WCHAR *)L"kernel32.dll");      /* (kernelbase's functions are kernel32's) */
   if (!m && has_separator(name)) {      /* a file: the library loaded from it, under whatever name */
     WCHAR full[PATH_CHARS];
     PVOID base;
@@ -1680,7 +1688,7 @@ EXPORT HANDLE WINAPI OpenThread(DWORD access, BOOL inherit, DWORD id) {
   memset(&attributes, 0, sizeof(attributes));
   attributes.Length = sizeof(attributes);
   attributes.Attributes = inherit ? 2 : 0;
-  ULONG64 client[2] = {GetCurrentProcessId(), id};
+  ULONG64 client[2] = {0, id};
   HANDLE h = NULL;
   const NTSTATUS status = NtOpenThread(&h, access, &attributes, client);
   if (!NT_SUCCESS(status)) { fail_nt(status); return NULL; }
@@ -2186,7 +2194,9 @@ EXPORT BOOL WINAPI CreateProcessW(LPCWSTR application, LPWSTR command_line, LPSE
   HANDLE process = NULL, thread = NULL;
   ULONG process_id = 0, thread_id = 0;
   /* STARTF_USESTDHANDLES (0x100): the child's standard handles are the ones in the startup information (inheritable handles of this process, or the console's). */
-  ULONG nt_flags = ((flags & CREATE_SUSPENDED) ? 1 : 0) | (inherit_handles ? 2 : 0) | ((flags & 0x01000000 /* CREATE_BREAKAWAY_FROM_JOB */) ? 8 : 0);
+  const BOOL debug_start = (flags & (0x1 | 0x2) /* DEBUG_PROCESS | DEBUG_ONLY_THIS_PROCESS */) != 0;
+  if (debug_start && !NT_SUCCESS(DbgUiConnectToDbg())) { set_error(ERROR_ACCESS_DENIED); return FALSE; }
+  ULONG nt_flags = ((flags & CREATE_SUSPENDED) || debug_start ? 1 : 0) | (inherit_handles ? 2 : 0) | ((flags & 0x01000000 /* CREATE_BREAKAWAY_FROM_JOB */) ? 8 : 0);
   HANDLE std_in = NULL, std_out = NULL, std_err = NULL;
   if (startup && (startup->dwFlags & 0x100)) {
     nt_flags |= 4;
@@ -2214,6 +2224,12 @@ EXPORT BOOL WINAPI CreateProcessW(LPCWSTR application, LPWSTR command_line, LPSE
     return FALSE;
   }
   con_note_child(process_id, block.console);
+  if (debug_start) {      /* attached before it runs its first instruction; its children too, unless DEBUG_ONLY_THIS_PROCESS */
+    const NTSTATUS attached = NtDebugActiveProcess(process, DbgUiGetThreadDebugObject());
+    if (NT_SUCCESS(attached) && (flags & 0x1) && !(flags & 0x2)) { ULONG inherit = 1; NtSetInformationProcess(process, 31, &inherit, sizeof(inherit)); }
+    if (!NT_SUCCESS(attached)) { NtTerminateProcess(process, 0); NtClose(process); NtClose(thread); fail_nt(attached); return FALSE; }
+    if (!(flags & CREATE_SUSPENDED)) { ULONG previous = 0; NtResumeThread(thread, &previous); }
+  }
   if (information) {
     information->hProcess = process;
     information->hThread = thread;
@@ -2357,7 +2373,12 @@ EXPORT LPTOP_LEVEL_EXCEPTION_FILTER WINAPI SetUnhandledExceptionFilter(LPTOP_LEV
 EXPORT LONG WINAPI UnhandledExceptionFilter(PEXCEPTION_POINTERS info) {
   LPTOP_LEVEL_EXCEPTION_FILTER filter = RtlSetUnhandledExceptionFilter(NULL);      /* (read it, put it back) */
   RtlSetUnhandledExceptionFilter(filter);
-  return filter ? filter(info) : EXCEPTION_EXECUTE_HANDLER;
+  if (info && info->ExceptionRecord && (info->ExceptionRecord->ExceptionFlags & EXCEPTION_NESTED_CALL)) return EXCEPTION_CONTINUE_SEARCH;
+  ULONG_PTR port = 0;
+  NtQueryInformationProcess(NtCurrentProcess(), 7 /* ProcessDebugPort */, &port, sizeof(port), NULL);
+  if (port) return EXCEPTION_CONTINUE_SEARCH;      /* (the debugger gets the second chance) */
+  if (filter) { const LONG answer = filter(info); if (answer != EXCEPTION_CONTINUE_SEARCH) return answer; }
+  return EXCEPTION_EXECUTE_HANDLER;
 }
 EXPORT void WINAPI RaiseException(DWORD code, DWORD flags, DWORD count, const ULONG_PTR *arguments) {
   EXCEPTION_RECORD record;
@@ -3043,13 +3064,14 @@ EXPORT BOOL WINAPI SetCurrentDirectoryW(LPCWSTR path) {
   DWORD length = n;
   if (full[length - 1] != '\\') full[length++] = '\\';
   full[length] = 0;
-  WCHAR *fresh = RtlAllocateHeap(heap(), 0, (SIZE_T)(length + 1) * 2);
+  const SIZE_T room = length + 1 > 260 ? length + 1 : 260;      /* (MAX_PATH characters, as Windows keeps it) */
+  WCHAR *fresh = RtlAllocateHeap(heap(), HEAP_ZERO_MEMORY, room * 2);
   if (!fresh) { set_error(ERROR_NOT_ENOUGH_MEMORY); return FALSE; }
   memcpy(fresh, full, (SIZE_T)(length + 1) * 2);
   UNICODE_STRING *cwd = &parameters()->CurrentDirectoryPath;
   cwd->Buffer = fresh;
   cwd->Length = (USHORT)(length * 2);
-  cwd->MaximumLength = (USHORT)(length * 2 + 2);
+  cwd->MaximumLength = (USHORT)(room * 2);
   return TRUE;
 }
 EXPORT BOOL WINAPI SetCurrentDirectoryA(LPCSTR path) {

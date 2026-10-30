@@ -64,6 +64,9 @@ class D3d9Program {
   // Pixel shaders of Shader Model 1 (ps_1_0 .. ps_1_4), see D3d9Ps1.cpp; compile() hands them over.
   static NtStatus compile_ps1(allocators::IAllocator& allocator, ConstByteView tokens, UniquePointer<D3d9Program>* out);
   static NtStatus compile_dxbc(allocators::IAllocator& allocator, ConstByteView container, UniquePointer<D3d9Program>* out);
+  // A DXIL container (Shader Model 6.0 .. 6.x vertex, pixel and compute shaders): the LLVM bitcode is translated to the Shader Model 5 tokens of the same shader (DxilTranslate.cpp), which
+  // compile_dxbc then takes. compile_dxbc hands such a container over itself.
+  static NtStatus compile_dxil(allocators::IAllocator& allocator, ConstByteView container, UniquePointer<D3d9Program>* out);
 
   graphics::ShaderStage stage() const { return stage_; }
   // How many bytes of push constants the program reads (a Direct3D 9 program: eight registers; a DXBC one: its constant buffers laid end to end in slot order). A device whose
@@ -77,6 +80,7 @@ class D3d9Program {
   graphics::GeometryTopology geometry_output() const { return geometry_output_; }
   uint32_t geometry_max_vertices() const { return geometry_max_vertices_; }
   uint32_t geometry_instances() const { return geometry_instances_; }
+  uint32_t geometry_streams() const { return geometry_streams_; }
   void run_geometry(const graphics::GeometryInputData& input, const uint8_t* constants, graphics::GeometryOutputData* output) const;
   // A hull or domain shader (hs_5_0 / ds_5_0 DXBC, any domain), see D3d9Dxbc.cpp; the tessellator's settings both stages declare.
   uint32_t tess_input_points() const { return tess_input_points_; }
@@ -156,6 +160,7 @@ class D3d9Program {
   graphics::GeometryTopology geometry_output_ = graphics::GeometryTopology::TriangleStrip;
   uint32_t geometry_max_vertices_ = 0;
   uint32_t geometry_instances_ = 1;
+  uint32_t geometry_streams_ = 1;
   uint32_t tess_input_points_ = 0, tess_output_points_ = 0;
   graphics::TessPartitioning tess_partitioning_ = graphics::TessPartitioning::Integer;
   graphics::TessOutput tess_output_ = graphics::TessOutput::TriangleCcw;

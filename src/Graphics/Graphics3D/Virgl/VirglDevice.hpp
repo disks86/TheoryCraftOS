@@ -34,7 +34,7 @@ class VirglDevice final : public IGraphicsDevice {
 
   DeviceInfo info() const override {
     // (compute only when the host says it has it: a compute shader on a host without loses the whole context)
-    return {"virgl (virtio-gpu)", DeviceKind::VirtualGpu, true, kMaxPushConstantBytes, kFeatureBlendState | kFeatureTexelAccess | kFeatureSystemInputs | kFeatureInstancing | kFeatureLines | kFeatureMultipleTargets | kFeatureFloatFormats | kFeatureOcclusionQueries | kFeatureStatisticsQueries | kFeatureDepthResolve | kFeatureTextureKinds | kFeatureIndependentBlend | (gpu_.virgl_has_compute() ? kFeatureCompute : 0u) | (gpu_.virgl_has_geometry() ? kFeatureGeometryShaders : 0u) | (gpu_.virgl_has_tessellation() ? kFeatureTessellation : 0u) | kFeatureSrgbFormats | kFeatureUnorm16Formats | kFeatureIntegerFormats | kFeatureSnormFormats | (gpu_.virgl_max_samples() >= 2 ? kFeatureMultisample : 0u),
+    return {"virgl (virtio-gpu)", DeviceKind::VirtualGpu, true, kMaxPushConstantBytes, kFeatureBlendState | kFeatureTexelAccess | kFeatureSystemInputs | kFeatureInstancing | kFeatureLines | kFeatureMultipleTargets | kFeatureFloatFormats | kFeatureOcclusionQueries | kFeatureStatisticsQueries | kFeatureTimestampQueries | kFeatureDepthResolve | kFeatureStreamOutput | kFeatureTextureKinds | kFeatureIndependentBlend | (gpu_.virgl_has_compute() ? kFeatureCompute : 0u) | (gpu_.virgl_has_geometry() ? kFeatureGeometryShaders : 0u) | (gpu_.virgl_has_tessellation() ? kFeatureTessellation : 0u) | kFeatureSrgbFormats | kFeatureUnorm16Formats | kFeatureIntegerFormats | kFeatureSnormFormats | (gpu_.virgl_max_samples() >= 2 ? kFeatureMultisample : 0u),
             (gpu_.virgl_max_samples() >= 2 ? 1u << 2 : 0u) | (gpu_.virgl_max_samples() >= 4 ? 1u << 4 : 0u)};
   }
 
@@ -50,6 +50,7 @@ class VirglDevice final : public IGraphicsDevice {
   ICommandBuffer* create_command_buffer() override;
   void destroy_command_buffer(ICommandBuffer* commands) override;
 
+  void interrupt_clock() override { clock_interrupted_ = true; }
   bool submit(ICommandBuffer* commands) override;
   bool present(IImage* image) override;
 
@@ -62,6 +63,7 @@ class VirglDevice final : public IGraphicsDevice {
   uint32_t sampler_state(const SamplerDesc& sampler);
 
  private:
+  bool clock_interrupted_ = false;   // (until a disjoint query has said so)
   hardware::VirtioGpu& gpu_;
   uint32_t next_handle_ = 1;  // object handles share one namespace per context
   uint32_t sampler_states_[8] = {};   // by filter and address modes (3 bits), 0 until made

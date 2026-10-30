@@ -152,3 +152,46 @@ EXPORT BOOL WINAPI DllMain(HANDLE module, DWORD reason, PVOID reserved) {
   (void)module; (void)reserved; (void)reason;
   return TRUE;
 }
+
+/* ---- access control lists ---------------------------------------------------------------------------------------------------------------------------------- */
+
+IMPORT NTSTATUS NTAPI RtlCreateAcl(PVOID acl, DWORD size, DWORD revision);
+EXPORT BOOL WINAPI InitializeAcl(PVOID acl, DWORD size, DWORD revision) {
+  const NTSTATUS status = RtlCreateAcl(acl, size, revision);
+  if (status) { SetLastError(RtlNtStatusToDosError(status)); return FALSE; }
+  return TRUE;
+}
+
+/* ---- security identifiers as text ------------------------------------------------------------------------------------------------------------------------- */
+
+IMPORT HLOCAL WINAPI LocalAlloc(UINT flags, SIZE_T bytes);
+static WCHAR *sid_text_number(WCHAR *out, ULONGLONG v, int hex) {
+  char digits[24];
+  int n = 0;
+  const unsigned base = hex ? 16 : 10;
+  do { const unsigned d = (unsigned)(v % base); digits[n++] = (char)(d < 10 ? '0' + d : 'a' + d - 10); v /= base; } while (v);
+  while (n) *out++ = (WCHAR)digits[--n];
+  return out;
+}
+EXPORT BOOL WINAPI ConvertSidToStringSidW(PVOID sid_in, LPWSTR *text) {
+  const BYTE *sid = sid_in;
+  if (!sid || !text || sid[0] != 1 || sid[1] > 15) { SetLastError(87 /* ERROR_INVALID_PARAMETER */); return FALSE; }
+  WCHAR buffer[16 * 12 + 40], *p = buffer;
+  *p++ = 'S'; *p++ = '-';
+  p = sid_text_number(p, sid[0], 0);
+  *p++ = '-';
+  if (sid[2] == 0 && sid[3] == 0) p = sid_text_number(p, (ULONGLONG)sid[4] << 24 | (ULONGLONG)sid[5] << 16 | (ULONGLONG)sid[6] << 8 | sid[7], 0);
+  else { *p++ = '0'; *p++ = 'x'; for (int i = 2; i < 8; ++i) { *p++ = (WCHAR)"0123456789abcdef"[sid[i] >> 4]; *p++ = (WCHAR)"0123456789abcdef"[sid[i] & 15]; } }
+  for (int i = 0; i < sid[1]; ++i) {
+    const BYTE *sub = sid + 8 + 4 * i;
+    *p++ = '-';
+    p = sid_text_number(p, (ULONG)sub[0] | (ULONG)sub[1] << 8 | (ULONG)sub[2] << 16 | (ULONG)sub[3] << 24, 0);
+  }
+  *p = 0;
+  const SIZE_T bytes = (SIZE_T)(p - buffer + 1) * sizeof(WCHAR);
+  WCHAR *out = LocalAlloc(0, bytes);
+  if (!out) { SetLastError(8 /* ERROR_NOT_ENOUGH_MEMORY */); return FALSE; }
+  memcpy(out, buffer, bytes);
+  *text = out;
+  return TRUE;
+}

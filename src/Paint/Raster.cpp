@@ -336,31 +336,59 @@ void box_sizes(float sigma, int32_t out[3]) {
   for (int i = 0; i < 3; ++i) out[i] = i < m ? wl : wu;
 }
 
-void box_pass(ArrayView<const uint8_t> src, ArrayView<uint8_t> dst, int32_t w, int32_t h, bool horizontal, int32_t r) {
-  const int32_t n = horizontal ? w : h, lines = horizontal ? h : w;
-  const uint64_t step = horizontal ? 1 : static_cast<uint64_t>(w), line_step = horizontal ? static_cast<uint64_t>(w) : 1;
+// One box blur pass along the rows. The vertical direction (below) walks row by row with a running sum per column, so that
+// memory is read in order instead of one column (a cache miss per pixel) at a time; the results are the same.
+void box_pass_rows(ArrayView<const uint8_t> src, ArrayView<uint8_t> dst, int32_t w, int32_t h, int32_t r) {
   const uint32_t size = static_cast<uint32_t>(2 * r + 1);
-  for (int32_t line = 0; line < lines; ++line) {
-    const uint64_t base = static_cast<uint64_t>(line) * line_step;
+  for (int32_t line = 0; line < h; ++line) {
+    const uint64_t base = static_cast<uint64_t>(line) * static_cast<uint32_t>(w);
     int32_t sum = 0;
-    for (int32_t k = 0; k <= r && k < n; ++k) sum += src[base + static_cast<uint64_t>(k) * step];
-    for (int32_t i = 0; i < n; ++i) {
-      dst[base + static_cast<uint64_t>(i) * step] = static_cast<uint8_t>((static_cast<uint32_t>(sum) + size / 2) / size);
+    for (int32_t k = 0; k <= r && k < w; ++k) sum += src[base + static_cast<uint64_t>(k)];
+    for (int32_t i = 0; i < w; ++i) {
+      dst[base + static_cast<uint64_t>(i)] = static_cast<uint8_t>((static_cast<uint32_t>(sum) + size / 2) / size);
       const int32_t add = i + r + 1, sub = i - r;
-      if (add < n) sum += src[base + static_cast<uint64_t>(add) * step];
-      if (sub >= 0) sum -= src[base + static_cast<uint64_t>(sub) * step];
+      if (add < w) sum += src[base + static_cast<uint64_t>(add)];
+      if (sub >= 0) sum -= src[base + static_cast<uint64_t>(sub)];
     }
   }
 }
 
-bool blur_plane(AlphaMask& plane, AlphaMask& scratch, const int32_t sizes[3]) {
-  for (int i = 0; i < 3; ++i) {
-    const int32_t r = (sizes[i] - 1) / 2;
-    if (r <= 0) continue;
-    box_pass(ArrayView<const uint8_t>(plane.data()), scratch.data(), plane.width(), plane.height(), true, r);
-    box_pass(ArrayView<const uint8_t>(scratch.data()), plane.data(), plane.width(), plane.height(), false, r);
+bool box_pass_columns(ArrayView<const uint8_t> src, ArrayView<uint8_t> dst, int32_t w, int32_t h, int32_t r, ArrayView<int32_t> sums) {
+  if (sums.size() < static_cast<uint32_t>(w)) return false;
+  const uint32_t size = static_cast<uint32_t>(2 * r + 1);
+  const uint64_t pitch = static_cast<uint32_t>(w);
+  sums.fill(0);
+  for (int32_t k = 0; k <= r && k < h; ++k)
+    for (int32_t c = 0; c < w; ++c) sums[static_cast<uint64_t>(c)] += src[static_cast<uint64_t>(k) * pitch + static_cast<uint64_t>(c)];
+  for (int32_t i = 0; i < h; ++i) {
+    const uint64_t row = static_cast<uint64_t>(i) * pitch;
+    for (int32_t c = 0; c < w; ++c) dst[row + static_cast<uint64_t>(c)] = static_cast<uint8_t>((static_cast<uint32_t>(sums[static_cast<uint64_t>(c)]) + size / 2) / size);
+    const int32_t add = i + r + 1, sub = i - r;
+    if (add < h) {
+      const uint64_t a = static_cast<uint64_t>(add) * pitch;
+      for (int32_t c = 0; c < w; ++c) sums[static_cast<uint64_t>(c)] += src[a + static_cast<uint64_t>(c)];
+    }
+    if (sub >= 0) {
+      const uint64_t b = static_cast<uint64_t>(sub) * pitch;
+      for (int32_t c = 0; c < w; ++c) sums[static_cast<uint64_t>(c)] -= src[b + static_cast<uint64_t>(c)];
+    }
   }
   return true;
+}
+
+bool blur_plane(AlphaMask& plane, AlphaMask& scratch, const int32_t sizes[3]) {
+  allocators::IAllocator& a = plane.allocator();
+  ArrayView<int32_t> sums = allocate_view<int32_t>(a, static_cast<uint32_t>(plane.width()));
+  if (sums.empty()) return false;
+  bool ok = true;
+  for (int i = 0; i < 3 && ok; ++i) {
+    const int32_t r = (sizes[i] - 1) / 2;
+    if (r <= 0) continue;
+    box_pass_rows(ArrayView<const uint8_t>(plane.data()), scratch.data(), plane.width(), plane.height(), r);
+    ok = box_pass_columns(ArrayView<const uint8_t>(scratch.data()), plane.data(), plane.width(), plane.height(), r, sums);
+  }
+  release_view(a, sums);
+  return ok;
 }
 
 }  // namespace
@@ -421,7 +449,7 @@ bool blur_pixmap(Pixmap& pixmap, float sigma) {
 
 // ---- Colour filters ----------------------------------------------------------------------------------------------
 
-void color_filter(Pixmap& pixmap, FilterStep::Kind kind, float amount) {
+bool color_filter_transform(FilterStep::Kind kind, float amount, graphics::ColorTransform* out) {
   // rgb' = m * rgb + add, the matrices of the filter effects specification
   float m[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
   float add[3] = {0, 0, 0};
@@ -477,8 +505,20 @@ void color_filter(Pixmap& pixmap, FilterStep::Kind kind, float amount) {
       break;
     }
     case FilterStep::Opacity: alpha_scale = clamp01(a); break;
-    default: return;
+    default: return false;
   }
+  for (int i = 0; i < 9; ++i) out->m[i] = m[i];
+  for (int i = 0; i < 3; ++i) out->add[i] = add[i];
+  out->alpha_scale = alpha_scale;
+  return true;
+}
+
+void color_filter(Pixmap& pixmap, FilterStep::Kind kind, float amount) {
+  graphics::ColorTransform t;
+  if (!color_filter_transform(kind, amount, &t)) return;
+  const float* m = t.m;
+  const float* add = t.add;
+  const float alpha_scale = t.alpha_scale;
   const ArrayView<uint32_t> px = pixmap.pixels();
   for (uint64_t i = 0; i < px.size(); ++i) {
     const uint32_t p = px[i], alpha = p >> 24;

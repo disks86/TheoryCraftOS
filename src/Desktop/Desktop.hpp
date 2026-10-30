@@ -26,6 +26,7 @@
 #pragma once
 #include "Desktop/DesktopSurface.hpp"
 #include "Desktop/DisplaySettings.hpp"
+#include "Desktop/DeviceProperties.hpp"
 #include "Desktop/NetworkProperties.hpp"
 #include "Desktop/BluetoothProperties.hpp"
 #include "Desktop/WirelessProperties.hpp"
@@ -258,6 +259,12 @@ class Desktop {
   gui::Point pointer() const { return input_.cursor(); }
   // The devices of the machine for the computer manager's Hardware tab (nullptr: none). It must outlive the desktop.
   void set_hardware_inventory(IHardwareInventory* inventory) { computer_manager_.set_hardware_inventory(inventory); }
+  // What the generic Properties window of a device tells (nullptr: none). It must outlive the desktop.
+  void set_device_details(IDeviceDetails* details) { device_properties_.set_details(details); }
+  // Opens the Properties window of a device (its kind and number: HardwareEntry::group and ::id), or brings it forward showing that device. It is
+  // reached from the Properties item in the computer manager's menu of any device that has no window of its own (a sound card, a disk, ...).
+  void open_device_properties(HardwareGroup group, uint32_t id);
+  DeviceProperties& device_properties() { return device_properties_; }
   // The network adapters' details for the properties window (nullptr: none). It must outlive the desktop.
   void set_network_details(INetworkDetails* details) { network_properties_.set_details(details); }
   // Opens the properties window of a network adapter (its number: HardwareEntry::id), or brings it forward showing that adapter. It is reached from
@@ -334,6 +341,7 @@ class Desktop {
   static void on_display_settings(void* self, gui::Control&);
   static void on_network_properties(void* self, gui::Control&);
   static void on_wireless_properties(void* self, gui::Control&);
+  static void on_device_properties(void* self, gui::Control&);
   static void on_bluetooth_properties(void* self, gui::Control&);
   static bool apply_changes_thunk(void* self);
   static void confine_pointer(void* self, int32_t* x, int32_t* y);
@@ -417,6 +425,7 @@ class Desktop {
   DisplaySettings display_settings_;
   NetworkProperties network_properties_;
   WirelessProperties wireless_properties_;
+  DeviceProperties device_properties_;
   BluetoothProperties bluetooth_properties_;
   gui::Frame about_;
   gui::Label about_lines_[3];

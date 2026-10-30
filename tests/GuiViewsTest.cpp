@@ -2018,7 +2018,9 @@ static void test_hardware_tab() {
     CHECK(!choose_context(w, tm.display_menu(), on_storage.x, on_storage.y, "Display Settings...") && !w.popup() && opened.count == 0);
     CHECK(choose_context(w, tm.display_menu(), on_displays.x, on_displays.y, "Display Settings...") && opened.count == 1);
     const Point on_monitor = node_point(tree, tree.child_at(displays, 0));
-    right_click(w, on_monitor.x, on_monitor.y);
+    right_click(w, on_monitor.x, on_monitor.y);   // (a display has a menu of its own: Properties and Display Settings)
+    CHECK(w.popup() && tm.monitor_menu().open() && opened.count == 1);
+    click(w, 2, 2);   // (away: closes it)
     CHECK(!w.popup() && opened.count == 1);
     // A network adapter has Properties (and only that); the group of adapters has no menu; the Displays menu still works afterwards.
     const int32_t network = tm.hardware_group_node(HardwareGroup::Network);
@@ -2670,6 +2672,106 @@ static void test_display_settings_entry() {
     details.info.link_up = false;
     d.step(5000000);
     CHECK(d.network_properties().cell(desktop::NetworkProperties::kLink, 1).equals("Disconnected"));
+  }
+  CHECK(a.live == 0);
+}
+
+// A fake that knows the sound cards by number; one table of facts per card, as SystemInventory would make from the class interface.
+struct FakeDeviceDetails final : desktop::IDeviceDetails {
+  uint32_t cards = 2;
+  uint32_t volume = 70;
+  int reads = 0;
+  bool describe(desktop::HardwareGroup group, uint32_t id, desktop::DevicePropertyList* out) override {
+    ++reads;
+    out->clear();
+    if (group == desktop::HardwareGroup::Audio && id < cards) {
+      strcpy(out->title, id == 0 ? "HDA Codec" : "USB Headset");
+      out->add("Type", "Sound card");
+      out->add("Driver", out->title);
+      String v(*alloc);
+      v.append_uint(volume);
+      v.append(" %");
+      out->add("Volume", v.view());
+      return true;
+    }
+    if (group == desktop::HardwareGroup::Displays && id == 0) {
+      strcpy(out->title, "Monitor A");
+      out->add("Type", "Display");
+      return true;
+    }
+    return false;
+  }
+  allocators::IAllocator* alloc = nullptr;
+};
+
+// Every device of a kind gets the same Properties window, whatever its driver, and the computer manager needs nothing per driver.
+static void test_device_properties() {
+  TestAllocator a;
+  {
+    using desktop::HardwareGroup;
+    using P = desktop::DeviceProperties;
+    Screen screen(a, 800, 600);
+    desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+    FakeInventory inv(a);
+    FakeDeviceDetails details;
+    details.alloc = &a;
+    inv.list.add(HardwareGroup::Displays, "Monitor A", "HDMI-1", 0);
+    inv.list.add(HardwareGroup::Audio, "HDA Codec", "48 kHz", 0);
+    inv.list.add(HardwareGroup::Audio, "USB Headset", "48 kHz", 1);
+    d.set_hardware_inventory(&inv);
+    d.set_device_details(&details);
+    d.open_computer_manager();
+    desktop::ComputerManager& cm = d.computer_manager();
+    cm.tabs().select_page(2);
+    d.window().layout();
+    Window& w = d.window();
+    const int32_t audio = cm.hardware_group_node(HardwareGroup::Audio);
+    CHECK(audio >= 0 && cm.hardware_tree().child_count(audio) == 2 && !d.device_properties().manager());
+
+    // Properties of the second card opens the window for that card (the menu is the same for both).
+    const Point q = node_point(cm.hardware_tree(), cm.hardware_tree().child_at(audio, 1));
+    CHECK(choose_context(w, cm.device_menu(), q.x, q.y, "Properties...") && d.device_properties().manager() != nullptr);
+    P& props = d.device_properties();
+    CHECK(cm.device_group() == HardwareGroup::Audio && cm.device_id() == 1 && props.group() == HardwareGroup::Audio && props.device() == 1);
+    CHECK(props.title().equals("USB Headset - Properties") && props.grid().row_count() == 3);
+    CHECK(props.cell(0, 0).equals("Type") && props.cell(0, 1).equals("Sound card") && props.value("Volume").equals("70 %"));
+    CHECK(props.status().empty());
+
+    // The window follows the device once a second, in place.
+    props.grid().select_row(2);
+    details.volume = 35;
+    d.step(5000000);
+    CHECK(props.value("Volume").equals("35 %") && props.grid().selected_row() == 2);
+
+    // The first card is the same window showing another device. (The window is in the way of the tree, so it is closed between the clicks.)
+    props.close();
+    cm.activate();
+    const Point r = node_point(cm.hardware_tree(), cm.hardware_tree().child_at(audio, 0));
+    CHECK(choose_context(w, cm.device_menu(), r.x, r.y, "Properties...") && props.device() == 0 && props.title().equals("HDA Codec - Properties"));
+
+    // A display has Properties besides Display Settings; Properties opens the same window.
+    props.close();
+    cm.activate();
+    const int32_t displays = cm.hardware_group_node(HardwareGroup::Displays);
+    const Point m = node_point(cm.hardware_tree(), cm.hardware_tree().child_at(displays, 0));
+    CHECK(choose_context(w, cm.monitor_menu(), m.x, m.y, "Properties...") && props.group() == HardwareGroup::Displays && props.title().equals("Monitor A - Properties"));
+    props.close();
+    cm.activate();
+    CHECK(!d.display_settings().manager() && choose_context(w, cm.monitor_menu(), m.x, m.y, "Display Settings...") && d.display_settings().manager() != nullptr);
+
+    d.display_settings().close();
+    cm.activate();
+    // The device goes away: the window says so and shows nothing. Another device under its number is not it either.
+    props.show_device(HardwareGroup::Audio, 1);
+    CHECK(props.grid().row_count() == 3);
+    details.cards = 1;
+    props.update();
+    CHECK(props.grid().row_count() == 0 && props.status().equals("This device is not there any more."));
+    details.cards = 2;
+    props.show_device(HardwareGroup::Audio, 0);
+    CHECK(props.grid().row_count() == 3 && props.status().empty());
+    props.set_details(nullptr);
+    CHECK(props.grid().row_count() == 0 && props.status().equals("No device information is available."));
   }
   CHECK(a.live == 0);
 }
@@ -8436,6 +8538,7 @@ int main() {
   test_start_menu_search();
   test_caret_blink();
   test_display_settings_entry();
+  test_device_properties();
   test_text_editor();
   test_notepad();
   test_calculator();

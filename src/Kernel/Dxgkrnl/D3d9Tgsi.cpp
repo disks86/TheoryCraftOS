@@ -612,6 +612,10 @@ bool TgsiEmitter::instruction(const Instr& ins) {
     case kSne: simple = "SNE", sources = 2; break;
     case kDp2: simple = "DP2", sources = 2; break;
     case kFloor: simple = "FLR", sources = 1; break;
+    case kDdx: simple = "DDX_FINE", sources = 1; break;
+    case kDdy: simple = "DDY_FINE", sources = 1; break;
+    case kDdxCoarse: simple = "DDX", sources = 1; break;
+    case kDdyCoarse: simple = "DDY", sources = 1; break;
     case kCeil: simple = "CEIL", sources = 1; break;
     case kTrunc: simple = "TRUNC", sources = 1; break;
     case kRoundNe: simple = "ROUND", sources = 1; break;
@@ -789,7 +793,16 @@ bool TgsiEmitter::instruction(const Instr& ins) {
       return true;
     }
     case kGsEmit: case kGsCut: {
-      const String stream = zero();
+      // (the stream is the first component of an immediate: the float zero is stream 0. With several streams the immediates are ones nothing else uses, 24064 + the stream in the fourth component,
+      // so that a pipeline that draws another stream than the first can find them and swap the numbers: see VirglPipeline)
+      const bool marked = p_.geometry_streams() > 1;
+      const String stream = ins.control || marked ? [&] {
+        String s = str();
+        add(s, "IMM[");
+        add_uint(s, imm4_bits(ins.control, ins.control, ins.control, marked ? 24064u + ins.control : ins.control));
+        add(s, "].xxxx");
+        return s;
+      }() : zero();
       if (op == kGsCut) {
         line("ENDPRIM", &stream);
         return true;
@@ -800,6 +813,11 @@ bool TgsiEmitter::instruction(const Instr& ins) {
       String o = str();
       add(o, "OUT[0]");
       line("MUL", &o, &pos, &factor);
+      String upright = str();
+      add(upright, "OUT[");
+      add_uint(upright, 5 + ins.control);   // (a register for each stream, so that several can capture the position)
+      add(upright, "]");
+      line("MOV", &upright, &pos);
       for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) {
         String target = str();
         add(target, "OUT[");
@@ -886,6 +904,29 @@ bool TgsiEmitter::instruction(const Instr& ins) {
       t = begin_result(ins, true, &direct);
       const String w = temp(kWork), old_all = temp(kWork2, ".xxxx");
       line("MOV", &w, &old_all);
+      break;
+    }
+    case kTexGather: {
+      // gather4: TG4 takes the component (an integer immediate) between the coordinate and the sampler
+      t = begin_result(ins, false, &direct);
+      const uint32_t unit = ins.src[1].number;
+      if (unit >= graphics::kMaxTextureUnits) {
+        unsupported_ = true;
+        break;
+      }
+      sampler_used_[unit] = true;
+      const uint8_t xyxy[4] = {0, 1, 0, 1};
+      const String coordinate = operand(ins.src[0], 0, 0, xyxy, false);
+      String sampler = str();
+      add(sampler, "SAMP[");
+      add_uint(sampler, unit);
+      add(sampler, "], ");
+      add(sampler, dimension_name(p_.texture_kind(unit)));
+      String component = str();
+      add(component, "IMM[");
+      add_uint(component, imm4_bits(ins.control & 3, ins.control & 3, ins.control & 3, ins.control & 3));
+      add(component, "].xxxx");
+      line("TG4", &t, &coordinate, &component, &sampler);
       break;
     }
     case kTexSamples: {
@@ -1123,6 +1164,14 @@ void TgsiEmitter::assemble(String* out) {
       add_uint(*out, i);
       add(*out, "]\n");
     }
+    // (the position as the shader wrote it, +Y up: what stream output takes, as the host's output 0 is turned over; one register for each stream)
+    for (uint32_t k = 0; k < p_.geometry_streams(); ++k) {
+      add(*out, "DCL OUT[");
+      add_uint(*out, 5 + k);
+      add(*out, "], GENERIC[");
+      add_uint(*out, 4 + k);
+      add(*out, "]\n");
+    }
   }
   if (hull_ || domain_) {
     if (hull_) {
@@ -1157,6 +1206,7 @@ void TgsiEmitter::assemble(String* out) {
       add(*out, "]\n");
     }
     if (hull_) add(*out, "DCL OUT[5], TESSOUTER\nDCL OUT[6], TESSINNER\n");
+    if (domain_) add(*out, "DCL OUT[5], GENERIC[4]\n");
   }
   if (!geometry_ && !hull_ && !domain_) add(*out, compute_ ? "COMP\n" : vertex_ ? "VERT\n" : p_.color_outputs_ > 1 ? "FRAG\n" : "FRAG\nPROPERTY FS_COLOR0_WRITES_ALL_CBUFS 1\n");
   if (geometry_ || hull_ || domain_) {
@@ -1192,6 +1242,7 @@ void TgsiEmitter::assemble(String* out) {
       add_uint(*out, i);
       add(*out, "]\n");
     }
+    add(*out, "DCL OUT[5], GENERIC[4]\n");   // (the position as the shader wrote it, for stream output: see the geometry shader's)
   } else {
     for (uint32_t i = 0; i < 16; ++i) {
       if (!in_used_[i]) continue;
@@ -1470,6 +1521,9 @@ NtStatus TgsiEmitter::run(String* out) {
       String o = str();
       add(o, "OUT[0]");
       line("MUL", &o, &pos, &factor);
+      String upright = str();
+      add(upright, "OUT[5]");
+      line("MOV", &upright, &pos);
       for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) {
         String target = str();
         add(target, "OUT[");

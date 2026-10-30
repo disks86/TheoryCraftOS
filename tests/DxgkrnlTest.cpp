@@ -2750,7 +2750,7 @@ void test_dxbc_real() {
           graphics::ShaderIo io;
           p->run_vertex(v, constants, &io);
           // (a compute shader, on buffers that are a little too small for what it does)
-          uint8_t storage[4][64] = {};
+          uint8_t storage[graphics::kMaxStorageBuffers][64] = {};
           graphics::ComputeContext context;
           for (uint32_t k = 0; k < graphics::kMaxStorageBuffers; ++k) context.buffers[k] = ByteView(storage[k], sizeof storage[k]);
           context.dispatch_id[0] = context.dispatch_id[1] = 5;
@@ -4318,6 +4318,1378 @@ void test_compute_shared() {
   }
 }
 
+// Stream output: a geometry shader with two streams of points (stream 0: the position and colour, stream 1: a vector made of them), and one with a triangle strip, written to buffers.
+void test_stream_output() {
+  Env e;
+  namespace b = conformance_blobs;
+  Handle vs = 0, gs = 0, gs_strip = 0, ps = 0;
+  auto shader = [&](graphics::ShaderStage stage, const uint8_t* code, uint32_t size, Handle* out) {
+    ShaderDesc sd;
+    sd.kind = ShaderKind::Dxbc, sd.stage = stage, sd.code = ConstByteView(code, size);
+    return e.kernel.create_shader(kPid, e.dev, sd, out);
+  };
+  CHECK(shader(graphics::ShaderStage::Vertex, b::k_vs, sizeof b::k_vs, &vs) == status::kSuccess && shader(graphics::ShaderStage::Fragment, b::k_ps_color, sizeof b::k_ps_color, &ps) == status::kSuccess);
+  CHECK(shader(graphics::ShaderStage::Geometry, b::k_gs_streams, sizeof b::k_gs_streams, &gs) == status::kSuccess && shader(graphics::ShaderStage::Geometry, b::k_gs_copy, sizeof b::k_gs_copy, &gs_strip) == status::kSuccess);
+  auto make = [&](Handle geometry, uint32_t entries, const graphics::StreamOutputEntry* list, uint32_t stride0, uint32_t stride1, int32_t rasterized, Handle* out) {
+    PipelineDesc pd;
+    pd.vertex_shader = vs, pd.fragment_shader = ps, pd.geometry_shader = geometry, pd.vertex_stride = 28, pd.attribute_count = 2, pd.varying_count = 3;
+    pd.attributes[0] = {0, graphics::VertexFormat::Float3, 0};
+    pd.attributes[1] = {1, graphics::VertexFormat::Float4, 12};
+    pd.cull_mode = graphics::CullMode::None;
+    pd.stream_output_count = entries;
+    for (uint32_t i = 0; i < entries; ++i) pd.stream_output[i] = list[i];
+    pd.stream_output_stride[0] = stride0, pd.stream_output_stride[1] = stride1;
+    pd.rasterized_stream = rasterized;
+    return e.kernel.create_pipeline(kPid, e.dev, pd, out);
+  };
+  // stream 0: position (output 0) and colour (output 1) in buffer 0; stream 1: the texture coordinate 1 (output 4) in buffer 1
+  const graphics::StreamOutputEntry two[3] = {{0, 0, 0, 4, 0}, {0, 1, 0, 4, 0}, {1, 4, 0, 4, 1}};
+  Handle pipe = 0, bad = 0;
+  CHECK(make(gs, 3, two, 32, 16, 0, &pipe) == status::kSuccess);
+  // What does not go together: no geometry shader, a stream the shader does not have, a buffer for two streams, a stride that is too short or not whole words, a rasterized stream that does not exist.
+  CHECK(make(0, 3, two, 32, 16, 0, &bad) == status::kInvalidParameter);
+  const graphics::StreamOutputEntry past[1] = {{2, 0, 0, 4, 0}}, shared[2] = {{0, 0, 0, 4, 0}, {1, 4, 0, 4, 0}}, empty[1] = {{0, 0, 0, 0, 0}}, overrun[1] = {{0, 0, 2, 4, 0}};
+  CHECK(make(gs, 1, past, 16, 16, 0, &bad) == status::kInvalidParameter && make(gs, 2, shared, 32, 16, 0, &bad) == status::kInvalidParameter);
+  CHECK(make(gs, 1, empty, 16, 16, 0, &bad) == status::kInvalidParameter && make(gs, 1, overrun, 32, 16, 0, &bad) == status::kInvalidParameter);
+  CHECK(make(gs, 3, two, 24, 16, 0, &bad) == status::kInvalidParameter && make(gs, 3, two, 34, 16, 0, &bad) == status::kInvalidParameter && make(gs, 3, two, 32, 16, 4, &bad) == status::kInvalidParameter);
+  Handle target = e.alloc(kTarget, Format::A8R8G8B8, 32, 32), vb = e.buffer(kAllocVertexBuffer, 3 * 28);
+  AllocationDesc od;
+  od.flags = kAllocStreamOutput, od.size = 3 * 32;
+  Handle out0 = 0, out1 = 0;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, od, &out0) == status::kSuccess);
+  od.size = 3 * 16;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, od, &out1) == status::kSuccess);
+  const float v[21] = {-0.5f, -0.5f, 0.5f, 1, 0, 0, 1, 0.5f, -0.5f, 0.5f, 0, 1, 0, 1, 0, 0.5f, 0.5f, 0, 0, 1, 1};
+  CHECK(e.write(vb, floats(v, 21)));
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  auto read_floats = [&](Handle h, uint32_t count, float* out) {
+    LockResult lock;
+    if (e.kernel.lock(kPid, h, kLockReadOnly, 0, &lock) != status::kSuccess) return false;
+    ByteReader in(ConstByteView(lock.data.data(), lock.data.size()));
+    for (uint32_t i = 0; i < count; ++i) out[i] = __builtin_bit_cast(float, in.le32());
+    e.kernel.unlock(kPid, h);
+    return in.ok();
+  };
+  auto draw = [&](Handle pipeline, uint32_t first_buffer, uint32_t second_buffer, bool bind_second) {
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    w.set_stream_output(0, first_buffer);
+    if (bind_second) w.set_stream_output(1, second_buffer);
+    w.bind_pipeline(pipeline);
+    w.bind_vertex_buffer(1);
+    w.push_constants(floats(identity, 16));
+    w.draw(3);
+    w.end_pass();
+    return e.render(w, {target, vb, out0, out1});
+  };
+  // The buffers must all be bound for the draw.
+  CHECK(draw(pipe, 2, 3, false) == status::kInvalidParameter);
+  CHECK(draw(pipe, 2, 3, true) == status::kSuccess);
+  float f0[24], f1[12];
+  CHECK(read_floats(out0, 24, f0) && read_floats(out1, 12, f1));
+  // Stream 0: the three vertices, position (+Y up, as the shader had it) then colour; stream 1: position * 2 + colour.
+  for (uint32_t i = 0; i < 3; ++i) {
+    const float* in = v + 7 * i;
+    const float position[4] = {in[0], in[1], in[2], 1.0f}, colour[4] = {in[3], in[4], in[5], in[6]};
+    for (uint32_t c = 0; c < 4; ++c) {
+      CHECK(f0[8 * i + c] == position[c] && f0[8 * i + 4 + c] == colour[c]);
+      CHECK(f1[4 * i + c] == position[c] * 2.0f + colour[c]);
+    }
+  }
+  CHECK(e.pixel(target, 0, 0) == 0xFF000000u);   // (points: one pixel each, nothing near the corner)
+  // A target that is too small for all the primitives: the ones that fit are written, whole.
+  AllocationDesc small;
+  small.flags = kAllocStreamOutput, small.size = 2 * 32 + 8;
+  Handle short_buffer = 0;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, small, &short_buffer) == status::kSuccess);
+  CommandWriter w(e.allocator);
+  w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+  w.set_stream_output(0, 2), w.set_stream_output(1, 3);
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(floats(identity, 16));
+  w.draw(3);
+  w.end_pass();
+  CHECK(e.render(w, {target, vb, short_buffer, out1}) == status::kSuccess);
+  float sh[18];
+  CHECK(read_floats(short_buffer, 18, sh));
+  CHECK(sh[0] == v[0] && sh[8] == v[7] && sh[4] == 1 && sh[12] == 0 && sh[16] == 0 && sh[17] == 0);   // (two whole records; nothing of the third, not even the 8 bytes that were left)
+  // No stream is drawn with -1.
+  Handle quiet = 0;
+  CHECK(make(gs, 3, two, 32, 16, -1, &quiet) == status::kSuccess);
+  // A triangle strip: the shader of gs_copy emits two strips (the input triangle, and a copy), each a triangle; written as 6 vertices of position and colour in buffer 0.
+  const graphics::StreamOutputEntry strip_entries[2] = {{0, 0, 0, 4, 0}, {0, 1, 0, 4, 0}};
+  Handle strip_pipe = 0;
+  CHECK(make(gs_strip, 2, strip_entries, 32, 0, 0, &strip_pipe) == status::kSuccess);
+  AllocationDesc od2;
+  od2.flags = kAllocStreamOutput, od2.size = 6 * 32;
+  Handle strips = 0;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, od2, &strips) == status::kSuccess);
+  CommandWriter w2(e.allocator);
+  w2.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+  w2.set_stream_output(0, 2);
+  w2.bind_pipeline(strip_pipe);
+  w2.bind_vertex_buffer(1);
+  w2.push_constants(floats(identity, 16));
+  w2.draw(3);
+  w2.end_pass();
+  CHECK(e.render(w2, {target, vb, strips}) == status::kSuccess);
+  float s[48];
+  CHECK(read_floats(strips, 48, s));
+  // (the first triangle: the vertices as they came; the second: moved to the corner, with red and blue swapped)
+  CHECK(s[0] == -0.5f && s[1] == -0.5f && s[4] == 1 && s[5] == 0 && s[6] == 0 && s[8] == 0.5f && s[12] == 0 && s[13] == 1);
+  CHECK(s[24] != 0.0f || s[25] != 0.0f);
+  CHECK(s[28] == 0 && s[30] == 1);   // (the colour of the copy's first vertex: red 1 became blue 1)
+  (void)quiet;
+}
+
+
+// Stream output statistics and timestamp queries, appending, stream output of vertex and domain shaders, and drawing a stream other than the first.
+void test_stream_output_extras() {
+  Env e;
+  namespace b = conformance_blobs;
+  auto shader = [&](graphics::ShaderStage stage, const uint8_t* code, uint32_t size, Handle* out) {
+    ShaderDesc sd;
+    sd.kind = ShaderKind::Dxbc, sd.stage = stage, sd.code = ConstByteView(code, size);
+    return e.kernel.create_shader(kPid, e.dev, sd, out);
+  };
+  Handle vs = 0, gs = 0, gs_draw1 = 0, hs = 0, ds = 0, ps = 0;
+  CHECK(shader(graphics::ShaderStage::Vertex, b::k_vs, sizeof b::k_vs, &vs) == status::kSuccess && shader(graphics::ShaderStage::Fragment, b::k_ps_color, sizeof b::k_ps_color, &ps) == status::kSuccess);
+  CHECK(shader(graphics::ShaderStage::Geometry, b::k_gs_streams, sizeof b::k_gs_streams, &gs) == status::kSuccess && shader(graphics::ShaderStage::Geometry, b::k_gs_streams_draw1, sizeof b::k_gs_streams_draw1, &gs_draw1) == status::kSuccess);
+  CHECK(shader(graphics::ShaderStage::Hull, b::k_hs_tri, sizeof b::k_hs_tri, &hs) == status::kSuccess && shader(graphics::ShaderStage::Domain, b::k_ds_dent, sizeof b::k_ds_dent, &ds) == status::kSuccess);
+  auto make = [&](Handle hull, Handle domain, Handle geometry, uint32_t entries, const graphics::StreamOutputEntry* list, uint32_t stride0, uint32_t stride1, int32_t rasterized, Handle* out) {
+    PipelineDesc pd;
+    pd.vertex_shader = vs, pd.fragment_shader = ps, pd.hull_shader = hull, pd.domain_shader = domain, pd.geometry_shader = geometry, pd.vertex_stride = 28, pd.attribute_count = 2, pd.varying_count = 3;
+    pd.attributes[0] = {0, graphics::VertexFormat::Float3, 0};
+    pd.attributes[1] = {1, graphics::VertexFormat::Float4, 12};
+    pd.cull_mode = graphics::CullMode::None;
+    pd.stream_output_count = entries;
+    for (uint32_t i = 0; i < entries; ++i) pd.stream_output[i] = list[i];
+    pd.stream_output_stride[0] = stride0, pd.stream_output_stride[1] = stride1;
+    pd.rasterized_stream = rasterized;
+    return e.kernel.create_pipeline(kPid, e.dev, pd, out);
+  };
+  const graphics::StreamOutputEntry two[3] = {{0, 0, 0, 4, 0}, {0, 1, 0, 4, 0}, {1, 4, 0, 4, 1}};
+  Handle pipe = 0;
+  CHECK(make(0, 0, gs, 3, two, 32, 16, -1, &pipe) == status::kSuccess);
+  Handle target = e.alloc(kTarget, Format::A8R8G8B8, 32, 32), vb = e.buffer(kAllocVertexBuffer, 3 * 28);
+  const float v[21] = {-0.5f, -0.5f, 0.5f, 1, 0, 0, 1, 0.5f, -0.5f, 0.5f, 0, 1, 0, 1, 0, 0.5f, 0.5f, 0, 0, 1, 1};
+  CHECK(e.write(vb, floats(v, 21)));
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  auto buffer = [&](uint32_t bytes) {
+    AllocationDesc od;
+    od.flags = kAllocStreamOutput, od.size = bytes;
+    Handle out = 0;
+    CHECK(e.kernel.create_allocation(kPid, e.dev, od, &out) == status::kSuccess);
+    return out;
+  };
+  auto read_floats = [&](Handle h, uint32_t count, float* out) {
+    LockResult lock;
+    if (e.kernel.lock(kPid, h, kLockReadOnly, 0, &lock) != status::kSuccess) return false;
+    ByteReader in(ConstByteView(lock.data.data(), lock.data.size()));
+    for (uint32_t i = 0; i < count; ++i) out[i] = __builtin_bit_cast(float, in.le32());
+    e.kernel.unlock(kPid, h);
+    return in.ok();
+  };
+
+  // Statistics: the buffer of stream 0 holds two of the three records, so two are written and three needed; stream 1's holds all.
+  Handle small0 = buffer(2 * 32 + 8), full1 = buffer(3 * 16), results = e.buffer(kAllocQueryResult, 64);
+  auto statistic = [&](uint32_t kind, uint32_t stream) {
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    w.set_stream_output(0, 2), w.set_stream_output(1, 3);
+    w.bind_pipeline(pipe);
+    w.bind_vertex_buffer(1);
+    w.push_constants(floats(identity, 16));
+    w.begin_query(4, 0, kind | stream << 8);
+    w.draw(3);
+    w.end_query();
+    w.end_pass();
+    CHECK(e.render(w, {target, vb, small0, full1, results}) == status::kSuccess);
+    return query_count(e, results, 0);
+  };
+  const uint32_t kWritten = static_cast<uint32_t>(graphics::QueryKind::SoPrimitivesWritten), kNeeded = static_cast<uint32_t>(graphics::QueryKind::SoPrimitivesNeeded);
+  CHECK(statistic(kWritten, 0) == 2 && statistic(kNeeded, 0) == 3 && statistic(kWritten, 1) == 3 && statistic(kNeeded, 1) == 3);
+  CHECK(statistic(kNeeded, 2) == 0 && statistic(kNeeded, 3) == 0);   // (streams the shader does not write)
+  {
+    // (a stream that does not exist, and a statistic of a stream other than the first for a kind that has one)
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    w.begin_query(2, 0, kWritten | 4u << 8);
+    w.end_query();
+    w.end_pass();
+    CHECK(e.render(w, {target, vb, results}) == status::kInvalidParameter);
+  }
+
+  // Timestamps never go back.
+  {
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    for (uint32_t q = 0; q < 3; ++q) {
+      w.begin_query(2, q * 8, static_cast<uint32_t>(graphics::QueryKind::Timestamp));
+      w.end_query();
+    }
+    w.end_pass();
+    CHECK(e.render(w, {target, vb, results}) == status::kSuccess);
+    const uint64_t t0 = query_count(e, results, 0), t1 = query_count(e, results, 1), t2 = query_count(e, results, 2);
+    CHECK(t0 != 0 && t1 > t0 && t2 > t1);
+  }
+  {
+    // The frequency (nanoseconds) and the disjoint flag (0).
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    w.begin_query(2, 0, static_cast<uint32_t>(graphics::QueryKind::TimestampDisjoint));
+    w.end_query();
+    w.begin_query(2, 8, static_cast<uint32_t>(graphics::QueryKind::TimestampFrequency));
+    w.end_query();
+    w.end_pass();
+    CHECK(e.render(w, {target, vb, results}) == status::kSuccess);
+    CHECK(query_count(e, results, 0) == 0 && query_count(e, results, 1) == 1000000000u);
+  }
+  {
+    // An interruption of the clock shows once, in the first disjoint query after it.
+    auto disjoint = [&] {
+      CommandWriter w(e.allocator);
+      w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+      w.begin_query(2, 0, static_cast<uint32_t>(graphics::QueryKind::TimestampDisjoint));
+      w.end_query();
+      w.end_pass();
+      CHECK(e.render(w, {target, vb, results}) == status::kSuccess);
+      return query_count(e, results, 0);
+    };
+    CHECK(disjoint() == 0);
+    e.kernel.adapter(0)->interrupt_clock();
+    CHECK(disjoint() == 1 && disjoint() == 0);
+  }
+
+  // Appending: the second draw, in another pass, goes after the first's records.
+  Handle big0 = buffer(6 * 32), big1 = buffer(6 * 16);
+  Handle quiet = 0;
+  CHECK(make(0, 0, gs, 3, two, 32, 16, -1, &quiet) == status::kSuccess);
+  auto pass = [&](uint32_t offset0, uint32_t offset1) {
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    w.set_stream_output(0, 2, offset0), w.set_stream_output(1, 3, offset1);
+    w.bind_pipeline(quiet);
+    w.bind_vertex_buffer(1);
+    w.push_constants(floats(identity, 16));
+    w.draw(3);
+    w.end_pass();
+    return e.render(w, {target, vb, big0, big1});
+  };
+  CHECK(pass(0, 0) == status::kSuccess && pass(kStreamOutputAppendOffset, kStreamOutputAppendOffset) == status::kSuccess);
+  float a0[48], a1[24];
+  CHECK(read_floats(big0, 48, a0) && read_floats(big1, 24, a1));
+  for (uint32_t i = 0; i < 24; ++i) CHECK(a0[i] == a0[24 + i]);   // (the second round of records is the first's again, after it)
+  for (uint32_t i = 0; i < 12; ++i) CHECK(a1[i] == a1[12 + i]);
+  CHECK(a0[0] == -0.5f && a0[8] == 0.5f && a0[16] == 0.0f && a1[3] != 0.0f);
+  // A third round does not fit: nothing past the end is written and the draw is not an error. Starting over (offset 0) writes the first record again.
+  CHECK(pass(kStreamOutputAppendOffset, kStreamOutputAppendOffset) == status::kSuccess && pass(kStreamOutputAppendOffset, kStreamOutputAppendOffset) == status::kSuccess);
+  CHECK(pass(0, 0) == status::kSuccess);
+
+  // A vertex shader's stream output: the vertices of the triangle, in order, position as it was (+Y up) and colour.
+  const graphics::StreamOutputEntry vs_entries[2] = {{0, 0, 0, 4, 0}, {0, 1, 0, 4, 0}};
+  Handle vs_pipe = 0, vs_bad = 0;
+  CHECK(make(0, 0, 0, 2, vs_entries, 32, 0, -1, &vs_pipe) == status::kSuccess);
+  const graphics::StreamOutputEntry vs_stream1[1] = {{1, 0, 0, 4, 0}};
+  CHECK(make(0, 0, 0, 1, vs_stream1, 16, 0, -1, &vs_bad) == status::kInvalidParameter);
+  Handle vs_out = buffer(3 * 32), vs_count = e.buffer(kAllocQueryResult, 16);
+  {
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    w.set_stream_output(0, 2);
+    w.bind_pipeline(vs_pipe);
+    w.bind_vertex_buffer(1);
+    w.push_constants(floats(identity, 16));
+    w.begin_query(3, 0, kWritten);
+    w.draw(3);
+    w.end_query();
+    w.end_pass();
+    CHECK(e.render(w, {target, vb, vs_out, vs_count}) == status::kSuccess);
+    float f[24];
+    CHECK(read_floats(vs_out, 24, f));
+    for (uint32_t i = 0; i < 3; ++i)
+      for (uint32_t c = 0; c < 3; ++c) CHECK(f[8 * i + c] == v[7 * i + c] && f[8 * i + 4 + c] == v[7 * i + 3 + c]);
+    CHECK(query_count(e, vs_count, 0) == 1);
+  }
+
+  // A domain shader's: the tessellated triangles of a three-point patch with factors 2 (positions, 16 bytes a vertex, as many as the tessellator makes).
+  const graphics::StreamOutputEntry ds_entries[1] = {{0, 0, 0, 4, 0}};
+  Handle ds_pipe = 0;
+  CHECK(make(hs, ds, 0, 1, ds_entries, 16, 0, -1, &ds_pipe) == status::kSuccess);
+  Handle ds_out = buffer(64 * 3 * 16);
+  {
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    w.set_stream_output(0, 2);
+    w.bind_pipeline(ds_pipe);
+    w.bind_vertex_buffer(1);
+    w.push_constants(floats(identity, 16));
+    w.set_topology(patch_list(3));
+    w.begin_query(3, 0, kWritten);
+    w.draw(3);
+    w.end_query();
+    w.end_pass();
+    CHECK(e.render(w, {target, vb, ds_out, vs_count}) == status::kSuccess);
+    const uint64_t triangles = query_count(e, vs_count, 0);
+    CHECK(triangles >= 4 && triangles <= 64);
+    float f[64 * 12];
+    CHECK(read_floats(ds_out, 64 * 12, f));
+    for (uint64_t i = 0; i < triangles * 3; ++i) CHECK(f[4 * i + 3] == 1.0f && f[4 * i] >= -1.0f && f[4 * i] <= 1.0f && f[4 * i + 1] >= -1.0f && f[4 * i + 1] <= 1.0f);
+  }
+
+  // Stream 1 drawn: gs_streams_draw1 puts a point at each vertex (moved by half a pixel) in stream 1 and the vertex plus its colour in stream 0, which only the buffer gets.
+  const graphics::StreamOutputEntry draw1_entries[2] = {{0, 4, 0, 4, 0}, {1, 0, 0, 4, 1}};
+  Handle draw1 = 0, draw1_bad = 0;
+  CHECK(make(0, 0, gs_draw1, 2, draw1_entries, 16, 16, 1, &draw1) == status::kSuccess);
+  CHECK(make(0, 0, 0, 1, vs_entries, 32, 0, 1, &draw1_bad) == status::kInvalidParameter);   // (no stream 1 without a geometry shader)
+  Handle d0 = buffer(3 * 16), d1 = buffer(3 * 16);
+  {
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    w.set_stream_output(0, 2), w.set_stream_output(1, 3);
+    w.bind_pipeline(draw1);
+    w.bind_vertex_buffer(1);
+    w.push_constants(floats(identity, 16));
+    w.draw(3);
+    w.end_pass();
+    CHECK(e.render(w, {target, vb, d0, d1}) == status::kSuccess);
+    float f[12], g[12];
+    CHECK(read_floats(d0, 12, f) && read_floats(d1, 12, g));
+    CHECK(f[0] == -0.5f + 1.0f && f[1] == -0.5f + 0.0f);   // (position + colour: red)
+    CHECK(g[0] == -0.5f + 0.03125f && g[4] == 0.5f + 0.03125f);
+    // (points at the pixel centres, the colour of each vertex)
+    CHECK(e.pixel(target, 8, 23) == 0xFFFF0000u && e.pixel(target, 24, 23) == 0xFF00FF00u && e.pixel(target, 16, 7) == 0xFF0000FFu);
+  }
+}
+
+
+// --- Direct3D 12 binding: root signatures, descriptor heaps, resource states -----------------------------------------------------------------------------------------------
+
+struct SigRange {
+  uint32_t type, count, base, space, offset;
+};
+struct SigParam {
+  uint32_t type, visibility = 0;
+  std::vector<SigRange> ranges;   // Table
+  uint32_t reg = 0, space = 0, num = 0;   // Constants (num), Cbv / Srv / Uav (reg, space)
+};
+
+// A serialized root signature, the way D3D12SerializeRootSignature lays it out.
+std::vector<uint8_t> serialize_signature(uint32_t version, const std::vector<SigParam>& params, const std::vector<std::vector<uint32_t>>& samplers = {}) {
+  std::vector<uint32_t> w(6, 0);
+  const uint32_t range_words = version == 2 ? 6 : 5;
+  uint32_t cursor = 6 + 3 * static_cast<uint32_t>(params.size());   // (in words: after the header and the parameter array)
+  std::vector<uint32_t> payload;
+  w[0] = version, w[1] = static_cast<uint32_t>(params.size()), w[2] = 24, w[3] = static_cast<uint32_t>(samplers.size());
+  std::vector<uint32_t> array;
+  for (const SigParam& p : params) {
+    array.push_back(p.type), array.push_back(p.visibility), array.push_back((cursor + static_cast<uint32_t>(payload.size())) * 4);
+    if (p.type == 0) {
+      const uint32_t ranges_at = cursor + static_cast<uint32_t>(payload.size()) + 2;
+      payload.push_back(static_cast<uint32_t>(p.ranges.size())), payload.push_back(ranges_at * 4);
+      for (const SigRange& r : p.ranges) {
+        payload.push_back(r.type), payload.push_back(r.count), payload.push_back(r.base), payload.push_back(r.space);
+        if (version == 2) payload.push_back(0);
+        payload.push_back(r.offset);
+      }
+    } else if (p.type == 1) {
+      payload.push_back(p.reg), payload.push_back(p.space), payload.push_back(p.num);
+    } else {
+      payload.push_back(p.reg), payload.push_back(p.space);
+      if (version == 2) payload.push_back(0);
+    }
+  }
+  (void)range_words;
+  w[4] = (cursor + static_cast<uint32_t>(payload.size())) * 4;
+  w.insert(w.end(), array.begin(), array.end());
+  w.insert(w.end(), payload.begin(), payload.end());
+  for (const std::vector<uint32_t>& sampler : samplers) w.insert(w.end(), sampler.begin(), sampler.end());
+  std::vector<uint8_t> bytes;
+  for (uint32_t word : w)
+    for (int i = 0; i < 4; ++i) bytes.push_back(static_cast<uint8_t>(word >> (8 * i)));
+  return bytes;
+}
+
+// A static sampler: filter, address u / v / w, bias, anisotropy, comparison, border, min lod, max lod, register, space, visibility.
+std::vector<uint32_t> static_sampler(uint32_t filter, uint32_t address, uint32_t reg) {
+  return {filter, address, address, address, 0, 1, 8, 0, 0, __builtin_bit_cast(uint32_t, 1000.0f), reg, 0, 0};
+}
+
+void test_root_signature_parse() {
+  const std::vector<SigParam> params = {
+      {0, 0, {{0, 2, 0, 0, 0}, {1, 0xFFFFFFFFu, 1, 0, 0xFFFFFFFFu}}},   // a table: two shader resource views from t0, then (appended) an unbounded range of unordered access views from u1
+      {1, 5, {}, 0, 0, 16},                                             // 16 root constants at b0 for the pixel shader
+      {2, 0, {}, 1, 0, 0},                                              // a root constant buffer view at b1
+      {0, 0, {{3, 4, 0, 0, 0}}},                                        // a sampler table of four
+  };
+  for (uint32_t version : {1u, 2u}) {
+    const std::vector<uint8_t> blob = serialize_signature(version, params, {static_sampler(0x15, 3, 0)});
+    RootSignatureDesc desc;
+    CHECK(parse_root_signature(ConstByteView(blob.data(), blob.size()), &desc) == status::kSuccess);
+    CHECK(desc.parameter_count == 4 && desc.sampler_count == 1);
+    CHECK(desc.parameters[0].type == RootParameterType::Table && desc.parameters[0].range_count == 2 && desc.parameters[0].ranges[1].offset == 2 && desc.parameters[0].ranges[1].count == kUnboundedDescriptors);
+    CHECK(desc.parameters[0].table_size == kUnboundedDescriptors && !desc.parameters[0].sampler_table && desc.parameters[3].sampler_table && desc.parameters[3].table_size == 4);
+    CHECK(desc.parameters[1].constant_count == 16 && desc.parameters[1].visibility == 5 && desc.parameters[2].shader_register == 1);
+    CHECK(desc.dwords == 1 + 16 + 2 + 1);
+    CHECK(desc.samplers[0].sampler.filter == graphics::Filter::Linear && desc.samplers[0].sampler.address_u == graphics::AddressMode::ClampToEdge);
+    // Every truncation and a flipped bit anywhere: refused or parsed, never a crash.
+    for (size_t n = 0; n <= blob.size(); ++n) {
+      RootSignatureDesc cut;
+      parse_root_signature(ConstByteView(blob.data(), n), &cut);
+    }
+    for (size_t bit = 0; bit < blob.size() * 8; ++bit) {
+      std::vector<uint8_t> flipped = blob;
+      flipped[bit / 8] ^= static_cast<uint8_t>(1u << (bit % 8));
+      RootSignatureDesc other;
+      parse_root_signature(ConstByteView(flipped.data(), flipped.size()), &other);
+    }
+  }
+  // Against the rules: too many DWORDs, a table of views and samplers, an unbounded range in the middle, no ranges, a version that does not exist, a register space past its type.
+  RootSignatureDesc d;
+  auto bad = [&](const std::vector<SigParam>& p) {
+    const std::vector<uint8_t> blob = serialize_signature(1, p);
+    return parse_root_signature(ConstByteView(blob.data(), blob.size()), &d) == status::kInvalidParameter;
+  };
+  CHECK(bad({{1, 0, {}, 0, 0, 64}, {2, 0, {}, 1, 0, 0}}));                                       // (66 DWORDs)
+  CHECK(bad({{0, 0, {{0, 1, 0, 0, 0}, {3, 1, 0, 0, 1}}}}));                                       // (a view and a sampler in one table)
+  CHECK(bad({{0, 0, {{0, 0xFFFFFFFFu, 0, 0, 0}, {0, 1, 0, 0, 0xFFFFFFFFu}}}}));                  // (unbounded, then another)
+  CHECK(bad({{0, 0, {}}}));                                                                       // (no ranges)
+  CHECK(bad({{1, 0, {}, 0, 0, 0}}));                                                              // (no values)
+  std::vector<uint8_t> blob = serialize_signature(1, {{1, 0, {}, 0, 0, 4}});
+  blob[0] = 7;
+  CHECK(parse_root_signature(ConstByteView(blob.data(), blob.size()), &d) == status::kInvalidParameter);
+  // In a DXBC container (the RTS0 chunk).
+  const std::vector<uint8_t> inner = serialize_signature(2, {{1, 0, {}, 0, 0, 4}});
+  std::vector<uint8_t> container = {'D', 'X', 'B', 'C'};
+  auto put32 = [&](uint32_t v) { for (int i = 0; i < 4; ++i) container.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+  container.insert(container.end(), 16, 0);
+  put32(1), put32(static_cast<uint32_t>(36 + 8 + inner.size())), put32(1), put32(36);
+  container.push_back('R'), container.push_back('T'), container.push_back('S'), container.push_back('0');
+  put32(static_cast<uint32_t>(inner.size()));
+  container.insert(container.end(), inner.begin(), inner.end());
+  CHECK(parse_root_signature(ConstByteView(container.data(), container.size()), &d) == status::kSuccess && d.parameter_count == 1 && d.parameters[0].constant_count == 4);
+  for (size_t n = 0; n < container.size(); n += 3) parse_root_signature(ConstByteView(container.data(), n), &d);
+}
+
+void test_d3d12_binding() {
+  Env e;
+  Handle rt = e.alloc(kTarget, Format::A8R8G8B8, 8, 8), tex = e.alloc(kTexture, Format::A8R8G8B8, 4, 4), vb = e.buffer(kAllocVertexBuffer, 4 * 20);
+  CHECK(e.fill(tex, 0xFFC08040));
+  Handle pipe = make_colored_pipeline(e, true);
+  const float quad[20] = {-1, -1, 0.5f, 0, 0, 3, -1, 0.5f, 2, 0, -1, 3, 0.5f, 0, 2};
+  CHECK(e.write(vb, floats(quad, 15)));
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  auto signature = [&](const std::vector<SigParam>& p, const std::vector<std::vector<uint32_t>>& samplers, Handle* out) {
+    const std::vector<uint8_t> blob = serialize_signature(2, p, samplers);
+    return e.kernel.create_root_signature(kPid, e.dev, ConstByteView(blob.data(), blob.size()), out);
+  };
+  // t0 through a table, b0 as 16 root constants, s0 static.
+  Handle sig = 0, sig_samplers = 0, bad = 0;
+  CHECK(signature({{0, 0, {{0, 1, 0, 0, 0}}}, {1, 0, {}, 0, 0, 16}}, {static_sampler(0, 1, 0)}, &sig) == status::kSuccess);
+  CHECK(signature({{0, 0, {{0, 1, 0, 0, 0}}}, {1, 0, {}, 0, 0, 16}, {0, 0, {{3, 1, 0, 0, 0}}}}, {}, &sig_samplers) == status::kSuccess);
+  const std::vector<uint8_t> garbage = {1, 2, 3};
+  CHECK(e.kernel.create_root_signature(kPid, e.dev, ConstByteView(garbage.data(), garbage.size()), &bad) == status::kInvalidParameter);
+  CHECK(e.kernel.create_root_signature(kPid, 0x7777, ConstByteView(garbage.data(), garbage.size()), &bad) == status::kInvalidHandle);
+  Handle views = 0, samplers = 0, small = 0;
+  CHECK(e.kernel.create_descriptor_heap(kPid, e.dev, DescriptorHeapType::CbvSrvUav, 8, &views) == status::kSuccess && e.kernel.create_descriptor_heap(kPid, e.dev, DescriptorHeapType::Sampler, 4, &samplers) == status::kSuccess);
+  CHECK(e.kernel.create_descriptor_heap(kPid, e.dev, DescriptorHeapType::CbvSrvUav, 0, &bad) == status::kInvalidParameter && e.kernel.create_descriptor_heap(kPid, e.dev, DescriptorHeapType::CbvSrvUav, kMaxHeapDescriptors + 1, &bad) == status::kInvalidParameter);
+  CHECK(e.kernel.create_descriptor_heap(kPid, e.dev, DescriptorHeapType::CbvSrvUav, 1, &small) == status::kSuccess);
+  DescriptorDesc srv;
+  srv.kind = DescriptorKind::Srv, srv.allocation = tex;
+  CHECK(e.kernel.write_descriptor(kPid, views, 3, srv) == status::kSuccess && e.kernel.write_descriptor(kPid, views, 8, srv) == status::kInvalidParameter);
+  CHECK(e.kernel.write_descriptor(kPid, samplers, 0, srv) == status::kInvalidParameter);   // (a view in the sampler heap)
+  DescriptorDesc sampler;
+  sampler.kind = DescriptorKind::Sampler;
+  sampler.sampler.address_u = sampler.sampler.address_v = graphics::AddressMode::ClampToEdge;
+  CHECK(e.kernel.write_descriptor(kPid, samplers, 1, sampler) == status::kSuccess && e.kernel.write_descriptor(kPid, views, 0, sampler) == status::kInvalidParameter);
+  DescriptorDesc buffer_view;
+  buffer_view.kind = DescriptorKind::Srv, buffer_view.allocation = vb;
+  CHECK(e.kernel.write_descriptor(kPid, views, 0, buffer_view) == status::kInvalidParameter);   // (a shader resource view of a buffer)
+  srv.allocation = 0x7777;
+  CHECK(e.kernel.write_descriptor(kPid, views, 0, srv) == status::kInvalidHandle);
+  CHECK(e.kernel.copy_descriptors(kPid, views, 0, views, 3, 1) == status::kSuccess && e.kernel.copy_descriptors(kPid, views, 0, samplers, 0, 1) == status::kInvalidParameter);
+  CHECK(e.kernel.copy_descriptors(kPid, views, 6, views, 0, 3) == status::kInvalidParameter);
+  CHECK(e.kernel.copy_descriptors(kPid, views, 1, views, 0, 2) == status::kSuccess);   // (an overlap, copied as memmove would: 1 is a copy of 0, which was a copy of 3; 2 has what 1 had, which was nothing)
+
+  auto draw = [&](auto bind) {
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    w.bind_pipeline(pipe);
+    w.bind_vertex_buffer(2);
+    bind(w);
+    w.draw(3);
+    w.end_pass();
+    return w.ok() ? e.render(w, {rt, tex, vb}) : status::kNoMemory;
+  };
+  // The reference: the same through the plain ops.
+  CHECK(draw([&](CommandWriter& w) { w.push_constants(floats(identity, 16)); w.bind_texture(0, 1, graphics::SamplerDesc()); }) == status::kSuccess && e.pixel(rt, 4, 4) == 0xFFC08040);
+  // The root signature way: the table at descriptor 1 (a copy of the texture's), the constants, the static sampler.
+  CHECK(e.fill(rt, 0));
+  CHECK(draw([&](CommandWriter& w) { w.set_root_signature(sig); w.set_descriptor_heaps({views}); w.set_root_constants(1, 0, floats(identity, 16)); w.set_root_table(0, 1); }) == status::kSuccess);
+  CHECK(e.pixel(rt, 4, 4) == 0xFFC08040);
+  // With a sampler table from the sampler heap too.
+  CHECK(e.fill(rt, 0));
+  CHECK(draw([&](CommandWriter& w) { w.set_root_signature(sig_samplers); w.set_descriptor_heaps({views, samplers}); w.set_root_constants(1, 0, floats(identity, 16)); w.set_root_table(0, 1); w.set_root_table(2, 1); }) == status::kSuccess);
+  CHECK(e.pixel(rt, 4, 4) == 0xFFC08040);
+  // Refused: a draw before the arguments are set, constants past the parameter, the wrong kind of parameter, a table past the heap, two heaps of a kind, a heap the process does not have, a signature it does not have.
+  CHECK(draw([&](CommandWriter& w) { w.set_root_signature(sig); w.set_descriptor_heaps({views}); w.set_root_constants(1, 0, floats(identity, 16)); }) == status::kInvalidParameter);   // (no table)
+  CHECK(draw([&](CommandWriter& w) { w.set_root_signature(sig); w.set_descriptor_heaps({views}); w.set_root_table(0, 1); }) == status::kInvalidParameter);                                     // (no constants)
+  CHECK(draw([&](CommandWriter& w) { w.set_root_signature(sig); w.set_descriptor_heaps({views}); w.set_root_constants(1, 8, floats(identity, 16)); }) == status::kInvalidParameter);
+  CHECK(draw([&](CommandWriter& w) { w.set_root_signature(sig); w.set_descriptor_heaps({views}); w.set_root_constants(0, 0, floats(identity, 16)); }) == status::kInvalidParameter);
+  CHECK(draw([&](CommandWriter& w) { w.set_root_signature(sig); w.set_descriptor_heaps({views}); w.set_root_table(0, 8); }) == status::kInvalidParameter);
+  CHECK(draw([&](CommandWriter& w) { w.set_root_signature(sig); w.set_descriptor_heaps({views, small}); }) == status::kInvalidParameter);
+  CHECK(draw([&](CommandWriter& w) { w.set_root_signature(sig); w.set_descriptor_heaps({0x7777}); }) == status::kInvalidHandle);
+  CHECK(draw([&](CommandWriter& w) { w.set_root_signature(0x7777); }) == status::kInvalidHandle);
+  CHECK(draw([&](CommandWriter& w) { w.set_root_constants(1, 0, floats(identity, 16)); }) == status::kInvalidParameter);   // (no root signature)
+  // A descriptor that was not written leaves its unit unbound: the draw is refused (the pipeline samples it).
+  CHECK(draw([&](CommandWriter& w) { w.set_root_signature(sig); w.set_descriptor_heaps({views}); w.set_root_constants(1, 0, floats(identity, 16)); w.set_root_table(0, 5); }) == status::kInvalidParameter);
+  // A root constant buffer view of a constant buffer allocation, in place of the root constants.
+  Handle cb_sig = 0, cb = e.buffer(kAllocConstantBuffer, 64);
+  CHECK(signature({{0, 0, {{0, 1, 0, 0, 0}}}, {2, 0, {}, 0, 0, 0}}, {static_sampler(0, 1, 0)}, &cb_sig) == status::kSuccess);
+  CHECK(e.write(cb, floats(identity, 16)));
+  CHECK(e.fill(rt, 0));
+  auto draw_cb = [&](auto bind) {
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    w.bind_pipeline(pipe);
+    w.bind_vertex_buffer(2);
+    bind(w);
+    w.draw(3);
+    w.end_pass();
+    return e.render(w, {rt, tex, vb, cb});
+  };
+  CHECK(draw_cb([&](CommandWriter& w) { w.set_root_signature(cb_sig); w.set_descriptor_heaps({views}); w.set_root_table(0, 0); w.set_root_descriptor(1, 3, 0); }) == status::kSuccess && e.pixel(rt, 4, 4) == 0xFFC08040);
+  CHECK(draw_cb([&](CommandWriter& w) { w.set_root_signature(cb_sig); w.set_descriptor_heaps({views}); w.set_root_table(0, 0); w.set_root_descriptor(1, 3, 64); }) == status::kInvalidParameter);   // (past the end)
+  CHECK(draw_cb([&](CommandWriter& w) { w.set_root_signature(cb_sig); w.set_descriptor_heaps({views}); w.set_root_table(0, 0); w.set_root_descriptor(1, 0, 0); }) == status::kInvalidParameter);   // (an image is not a constant buffer)
+  // A constant buffer view in a table.
+  Handle table_cb_sig = 0;
+  CHECK(signature({{0, 0, {{0, 1, 0, 0, 0}, {2, 1, 0, 0, 1}}}}, {static_sampler(0, 1, 0)}, &table_cb_sig) == status::kSuccess);
+  DescriptorDesc cbv;
+  cbv.kind = DescriptorKind::Cbv, cbv.allocation = cb;
+  srv.allocation = tex;
+  CHECK(e.kernel.write_descriptor(kPid, views, 6, srv) == status::kSuccess && e.kernel.write_descriptor(kPid, views, 7, cbv) == status::kSuccess);
+  CHECK(e.fill(rt, 0));
+  CHECK(draw_cb([&](CommandWriter& w) { w.set_root_signature(table_cb_sig); w.set_descriptor_heaps({views}); w.set_root_table(0, 6); }) == status::kSuccess && e.pixel(rt, 4, 4) == 0xFFC08040);
+  // The constant buffer: the size rules, and it never reaches the device.
+  AllocationDesc od;
+  od.flags = kAllocConstantBuffer, od.size = 20;
+  Handle none = 0;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, od, &none) == status::kInvalidParameter);
+  od.flags = kAllocConstantBuffer | kAllocVertexBuffer, od.size = 64;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, od, &none) == status::kInvalidParameter);
+  AllocationInfo info;
+  CHECK(e.kernel.query_allocation(kPid, cb, &info) == status::kSuccess && !info.resident);
+  Handle device_list[1] = {cb};
+  CHECK(e.kernel.make_resident(kPid, e.dev, ArrayView<const Handle>(device_list, 1)) == status::kInvalidParameter);
+  // Destroying a device takes the signatures and heaps with it.
+  CHECK(e.kernel.destroy_root_signature(kPid, sig) == status::kSuccess && e.kernel.destroy_root_signature(kPid, sig) == status::kInvalidHandle);
+  CHECK(e.kernel.destroy_descriptor_heap(kPid, small) == status::kSuccess && e.kernel.destroy_descriptor_heap(kPid, small) == status::kInvalidHandle);
+}
+
+// Root unordered access views and root constants for a compute shader.
+void test_d3d12_compute() {
+  Env e;
+  namespace b = conformance_blobs;
+  Handle cs = 0, cs_pipe = 0;
+  ShaderDesc sd;
+  sd.kind = ShaderKind::Dxbc, sd.stage = graphics::ShaderStage::Compute, sd.code = ConstByteView(b::k_cs_fill, sizeof b::k_cs_fill);
+  CHECK(e.kernel.create_shader(kPid, e.dev, sd, &cs) == status::kSuccess);
+  PipelineDesc pd;
+  pd.compute_shader = cs;
+  CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &cs_pipe) == status::kSuccess);
+  auto storage = [&](uint64_t size) { return e.buffer(kAllocUnorderedAccess, size); };
+  Handle picture = storage(4096), structured = storage(16384), counters = storage(16);
+  const std::vector<uint8_t> blob = serialize_signature(1, {{1, 0, {}, 0, 0, 4}, {4, 0, {}, 0, 0, 0}, {4, 0, {}, 1, 0, 0}, {0, 0, {{1, 1, 2, 0, 0}}}});
+  Handle sig = 0, views = 0;
+  CHECK(e.kernel.create_root_signature(kPid, e.dev, ConstByteView(blob.data(), blob.size()), &sig) == status::kSuccess);
+  CHECK(e.kernel.create_descriptor_heap(kPid, e.dev, DescriptorHeapType::CbvSrvUav, 4, &views) == status::kSuccess);
+  DescriptorDesc uav;
+  uav.kind = DescriptorKind::Uav, uav.allocation = counters;
+  CHECK(e.kernel.write_descriptor(kPid, views, 2, uav) == status::kSuccess);
+  const uint32_t constants[4] = {0x00102030u, 0, 0, 0};
+  auto run = [&](auto bind) {
+    CommandWriter w(e.allocator);
+    w.set_root_signature(sig);
+    w.set_descriptor_heaps({views});
+    w.set_root_constants(0, 0, ConstByteView(reinterpret_cast<const uint8_t*>(constants), 16));
+    bind(w);
+    w.bind_pipeline(cs_pipe);
+    w.dispatch(4, 8, 1);
+    return w.ok() ? e.render(w, {picture, structured, counters}) : status::kNoMemory;
+  };
+  // u0 and u1 as root descriptors, u2 from the table.
+  CHECK(run([&](CommandWriter& w) { w.set_root_descriptor(1, 0, 0); w.set_root_descriptor(2, 1, 0); w.set_root_table(3, 2); }) == status::kSuccess);
+  CHECK(e.pixel(picture, 0, 0) == 0xFF102030u);
+  LockResult lock;
+  CHECK(e.kernel.lock(kPid, counters, kLockReadOnly, 0, &lock) == status::kSuccess);
+  ByteReader in(lock.data);
+  CHECK(in.le32() == 1024);
+  e.kernel.unlock(kPid, counters);
+  // The root descriptor of a unordered access view must be a UAV buffer; the register space has to be 0 (the second one here is space 1: refused when used).
+  CHECK(run([&](CommandWriter& w) { w.set_root_descriptor(1, 0, 0); w.set_root_descriptor(2, 1, 0); w.set_root_table(3, 2); w.set_root_descriptor(1, 2, 2); }) == status::kInvalidParameter);   // (offset not a multiple of 4... 2)
+}
+
+
+// Shader resource views of buffers: a root descriptor (t0) and a table entry (t1) reach a compute shader as read-only storage buffers.
+void test_d3d12_buffer_views() {
+  Env e;
+  namespace b = conformance_blobs;
+  Handle cs = 0, pipe = 0;
+  ShaderDesc sd;
+  sd.kind = ShaderKind::Dxbc, sd.stage = graphics::ShaderStage::Compute, sd.code = ConstByteView(b::k_dxil_cs_srv, sizeof b::k_dxil_cs_srv);
+  CHECK(e.kernel.create_shader(kPid, e.dev, sd, &cs) == status::kSuccess);
+  PipelineDesc pd;
+  pd.compute_shader = cs;
+  CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &pipe) == status::kSuccess);
+  Handle dst = e.buffer(kAllocUnorderedAccess, 4096), src = e.buffer(kAllocUnorderedAccess, 16384), raw = e.buffer(kAllocUnorderedAccess, 4096);
+  std::vector<uint32_t> a(4096), r(1024);
+  for (uint32_t i = 0; i < a.size(); ++i) a[i] = 0x01010101u * (i % 251) + i * 7;
+  for (uint32_t i = 0; i < r.size(); ++i) r[i] = 0x9E3779B9u * (i + 1);
+  CHECK(e.write(src, ConstByteView(reinterpret_cast<const uint8_t*>(a.data()), 16384)) && e.write(raw, ConstByteView(reinterpret_cast<const uint8_t*>(r.data()), 4096)));
+  const std::vector<uint8_t> blob = serialize_signature(1, {{4, 0, {}, 0, 0, 0}, {3, 0, {}, 0, 0, 0}, {0, 0, {{0, 1, 1, 0, 0}}}});
+  Handle sig = 0, views = 0;
+  CHECK(e.kernel.create_root_signature(kPid, e.dev, ConstByteView(blob.data(), blob.size()), &sig) == status::kSuccess);
+  CHECK(e.kernel.create_descriptor_heap(kPid, e.dev, DescriptorHeapType::CbvSrvUav, 2, &views) == status::kSuccess);
+  DescriptorDesc srv;
+  srv.kind = DescriptorKind::Srv, srv.allocation = raw;
+  CHECK(e.kernel.write_descriptor(kPid, views, 1, srv) == status::kSuccess);
+  auto run = [&](Handle root_src) {
+    CommandWriter w(e.allocator);
+    w.set_root_signature(sig);
+    w.set_descriptor_heaps({views});
+    w.set_root_descriptor(0, 0, 0);
+    w.set_root_descriptor(1, root_src, 0);
+    w.set_root_table(2, 1);
+    w.bind_pipeline(pipe);
+    w.dispatch(4, 8, 1);
+    return w.ok() ? e.render(w, {dst, src, raw}) : status::kNoMemory;
+  };
+  CHECK(run(1) == status::kSuccess);
+  LockResult lock;
+  CHECK(e.kernel.lock(kPid, dst, kLockReadOnly, 0, &lock) == status::kSuccess);
+  ByteReader in(lock.data);
+  bool same = true;
+  for (uint32_t i = 0; i < 1024; ++i) same = same && in.le32() == a[4 * i] + a[4 * i + 3] * 3 + r[i] + (r[1023 - i] ^ a[4 * i + 1]);
+  CHECK(same);
+  e.kernel.unlock(kPid, dst);
+  // A texture is not a buffer view; a buffer that is not a storage buffer is no root SRV.
+  Handle vb = e.buffer(kAllocVertexBuffer, 4096);
+  CHECK(run(vb) == status::kInvalidParameter);
+}
+
+// Resource states: an allocation made with kAllocTrackState is used only in states that allow it.
+void test_d3d12_barriers() {
+  Env e;
+  AllocationDesc d;
+  d.flags = kAllocRenderTarget | kAllocTrackState, d.format = Format::A8R8G8B8, d.width = 8, d.height = 8, d.initial_state = state::kCommon;
+  Handle rt = 0, tex = 0, vb = 0, plain_rt = e.alloc(kTarget, Format::A8R8G8B8, 8, 8);
+  CHECK(e.kernel.create_allocation(kPid, e.dev, d, &rt) == status::kSuccess);
+  d.flags = kAllocTexture | kAllocTrackState, d.initial_state = state::kPixelShaderResource;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, d, &tex) == status::kSuccess);
+  d.flags = kAllocVertexBuffer | kAllocTrackState, d.size = 4 * 20, d.initial_state = state::kGenericRead;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, d, &vb) == status::kSuccess);
+  d.flags = kAllocRenderTarget | kAllocTrackState, d.initial_state = 0x8000;   // (not a state)
+  Handle none = 0;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, d, &none) == status::kInvalidParameter);
+  Handle pipe = make_colored_pipeline(e, true);
+  const float quad[20] = {-1, -1, 0.5f, 0, 0, 3, -1, 0.5f, 2, 0, -1, 3, 0.5f, 0, 2};
+  CHECK(e.write(vb, floats(quad, 15)));
+  CHECK(e.fill(tex, 0xFFC08040));
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  auto frame = [&](auto barriers, Handle target = 0) {
+    CommandWriter w(e.allocator);
+    barriers(w);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    w.bind_pipeline(pipe);
+    w.bind_vertex_buffer(2);
+    w.push_constants(floats(identity, 16));
+    w.bind_texture(0, 1, graphics::SamplerDesc());
+    w.draw(3);
+    w.end_pass();
+    return w.ok() ? e.render(w, {target ? target : rt, tex, vb}) : status::kNoMemory;
+  };
+  // Drawing into a target that is in the common state: refused. Moved to render target: fine.
+  CHECK(frame([&](CommandWriter&) {}) == status::kInvalidParameter);
+  // (a refused stream leaves the states as they were: the transition below still starts from the common state)
+  CHECK(frame([&](CommandWriter& w) { w.transition(0, state::kCommon, state::kRenderTarget); w.transition(1, state::kCommon, state::kPixelShaderResource); }) == status::kInvalidParameter);   // (the texture is not in common)
+  AllocationInfo info;
+  CHECK(frame([&](CommandWriter& w) { w.transition(0, state::kCommon, state::kRenderTarget); }) == status::kSuccess && e.pixel(rt, 4, 4) == 0xFFC08040);
+  // It stays a render target in the next stream: no barrier needed again, and a transition from the common state is now wrong.
+  CHECK(frame([&](CommandWriter&) {}) == status::kSuccess);
+  CHECK(frame([&](CommandWriter& w) { w.transition(0, state::kCommon, state::kRenderTarget); }) == status::kInvalidParameter);
+  // Reading it as a texture needs another transition; a render target cannot be sampled while it is one. Back to the common state it can be drawn into no more.
+  CHECK(frame([&](CommandWriter& w) { w.transition(0, state::kRenderTarget, state::kPixelShaderResource); }) == status::kInvalidParameter);
+  CHECK(frame([&](CommandWriter& w) { w.transition(0, state::kRenderTarget, state::kCommon); }) == status::kInvalidParameter);
+  // Rules of a barrier: before and after the same, a state that writes with another, an allocation that is not in the list, a state that does not exist, a split barrier.
+  CHECK(frame([&](CommandWriter& w) { w.transition(2, state::kGenericRead, state::kGenericRead); }) == status::kInvalidParameter);
+  CHECK(frame([&](CommandWriter& w) { w.transition(2, state::kGenericRead, state::kCopyDest | state::kCopySource); }) == status::kInvalidParameter);
+  CHECK(frame([&](CommandWriter& w) { w.transition(9, state::kGenericRead, state::kCopyDest); }) == status::kInvalidParameter);
+  CHECK(frame([&](CommandWriter& w) { w.transition(2, state::kGenericRead, 0x8000); }) == status::kInvalidParameter);
+  CHECK(frame([&](CommandWriter& w) { w.resource_barrier({CommandWriter::Barrier{0, 2, state::kGenericRead, state::kCopyDest, 1}, CommandWriter::Barrier{0, 2, state::kGenericRead, state::kCopyDest, 2}}); w.transition(2, state::kCopyDest, state::kGenericRead); }) == status::kSuccess);
+  // Unordered access and aliasing barriers are accepted (the first only for something in that state, or nothing in particular).
+  CHECK(frame([&](CommandWriter& w) { w.resource_barrier({CommandWriter::Barrier{1, CommandWriter::Barrier::kNoAllocationIndex, 0, 0, 0}, CommandWriter::Barrier{2, 0, CommandWriter::Barrier::kNoAllocationIndex, 0, 0}}); }) == status::kSuccess);
+  CHECK(frame([&](CommandWriter& w) { w.resource_barrier({CommandWriter::Barrier{1, 0, 0, 0, 0}}); }) == status::kInvalidParameter);   // (the target is not in the unordered access state)
+  // An allocation that does not track states takes barriers as no-ops and is used in any state.
+  CHECK(frame([&](CommandWriter&) {}, plain_rt) == status::kSuccess);
+  // A texture bound while it is in no state that reads: refused. Moved to copy destination: not a shader resource.
+  CHECK(frame([&](CommandWriter& w) { w.transition(1, state::kPixelShaderResource, state::kCopyDest); }) == status::kInvalidParameter);
+  CHECK(e.kernel.query_allocation(kPid, tex, &info) == status::kSuccess);
+}
+
+
+// Resource heaps: allocations placed in one block of memory, overlapping, with the GPU's contents carried across by aliasing barriers.
+void test_d3d12_heaps() {
+  Env e;
+  auto create = [&](uint32_t flags, uint64_t size, Handle heap, uint64_t offset, Handle* out) {
+    AllocationDesc d;
+    d.flags = flags, d.size = size, d.heap = heap, d.heap_offset = offset;
+    return e.kernel.create_allocation(kPid, e.dev, d, out);
+  };
+  Handle heap = 0, none = 0;
+  CHECK(create(kAllocHeap, 4096, 0, 0, &heap) == status::kSuccess);
+  CHECK(create(kAllocHeap, 100, 0, 0, &none) == status::kInvalidParameter && create(kAllocHeap, 0, 0, 0, &none) == status::kInvalidParameter);
+  CHECK(create(kAllocHeap | kAllocVertexBuffer, 4096, 0, 0, &none) == status::kInvalidParameter && create(kAllocHeap, 4096, heap, 0, &none) == status::kInvalidParameter);
+  const uint64_t before = e.kernel.adapter(0)->vidmm().system_bytes();
+  // Buffers, overlapping: 0 .. 256 and 128 .. 384 share 128 bytes; the third is apart.
+  Handle first = 0, second = 0, apart = 0;
+  CHECK(create(kAllocVertexBuffer, 256, heap, 0, &first) == status::kSuccess && create(kAllocVertexBuffer, 256, heap, 128, &second) == status::kSuccess && create(kAllocVertexBuffer, 256, heap, 1024, &apart) == status::kSuccess);
+  CHECK(e.kernel.adapter(0)->vidmm().system_bytes() == before);   // (the memory is the heap's: not counted again)
+  uint8_t pattern[256];
+  for (uint32_t i = 0; i < 256; ++i) pattern[i] = static_cast<uint8_t>(i + 1);
+  CHECK(e.write(first, ConstByteView(pattern, 256)));
+  LockResult lock;
+  CHECK(e.kernel.lock(kPid, second, kLockReadOnly, 0, &lock) == status::kSuccess);
+  bool same = lock.data.size() == 256;
+  for (uint32_t i = 0; i < 128 && same; ++i) same = lock.data[i] == pattern[128 + i];
+  for (uint32_t i = 128; i < 256 && same; ++i) same = lock.data[i] == 0;   // (past the end of the first: the heap's own zeros)
+  CHECK(same);
+  e.kernel.unlock(kPid, second);
+  CHECK(e.kernel.lock(kPid, apart, kLockReadOnly, 0, &lock) == status::kSuccess && lock.data[0] == 0);
+  e.kernel.unlock(kPid, apart);
+  // What does not go: past the end, misaligned, a handle that is not a heap, a heap of nothing, shared, a depth image, a multisampled one.
+  CHECK(create(kAllocVertexBuffer, 256, heap, 3968 + 16, &none) == status::kInvalidParameter && create(kAllocVertexBuffer, 256, heap, 8, &none) == status::kInvalidParameter);
+  CHECK(create(kAllocVertexBuffer, 256, first, 0, &none) == status::kInvalidParameter && create(kAllocVertexBuffer, 256, 0x7777, 0, &none) == status::kInvalidHandle);
+  CHECK(create(kAllocVertexBuffer | kAllocShared, 256, heap, 0, &none) == status::kInvalidParameter);
+  AllocationDesc depth;
+  depth.flags = kAllocDepthStencil, depth.format = Format::D32Float, depth.width = depth.height = 8, depth.heap = heap;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, depth, &none) == status::kNotSupported);
+  // The GPU: a render target A and a texture B at the same place. Draw red into A, pass the use to B with an aliasing barrier, and sample B.
+  AllocationDesc id;
+  id.flags = kAllocRenderTarget, id.format = Format::A8R8G8B8, id.width = id.height = 8, id.heap = heap, id.heap_offset = 2048;
+  Handle a_target = 0, b_texture = 0;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, id, &a_target) == status::kSuccess);
+  id.flags = kAllocTexture;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, id, &b_texture) == status::kSuccess);
+  Handle target = e.alloc(kTarget, Format::A8R8G8B8, 8, 8), vb = e.buffer(kAllocVertexBuffer, 4 * 28), tvb = e.buffer(kAllocVertexBuffer, 4 * 20);
+  Handle red_pipe = make_colored_pipeline(e, false), tex_pipe = make_colored_pipeline(e, true);
+  CHECK(write_triangle(e, vb, 1, 0, 0));
+  const float quad[20] = {-1, -1, 0.5f, 0, 0, 3, -1, 0.5f, 2, 0, -1, 3, 0.5f, 0, 2};
+  CHECK(e.write(tvb, floats(quad, 15)));
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  auto run = [&](bool barrier) {
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);   // (list: A 0, B 1, target 2, vb 3, tvb 4)
+    w.bind_pipeline(red_pipe);
+    w.bind_vertex_buffer(3);
+    w.push_constants(floats(identity, 16));
+    w.draw(3);
+    w.end_pass();
+    if (barrier) w.resource_barrier({CommandWriter::Barrier{2, 0, 1, 0, 0}});
+    w.begin_pass(2, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    w.bind_pipeline(tex_pipe);
+    w.bind_vertex_buffer(4);
+    w.push_constants(floats(identity, 16));
+    w.bind_texture(0, 1, graphics::SamplerDesc());
+    w.draw(3);
+    w.end_pass();
+    return w.ok() ? e.render(w, {a_target, b_texture, target, vb, tvb}) : status::kNoMemory;
+  };
+  // Without the barrier B is what it was before A was drawn into (nothing); with it, it is A's picture.
+  CHECK(run(false) == status::kSuccess && e.pixel(target, 4, 4) != 0xFFFF0000u);
+  CHECK(run(true) == status::kSuccess && e.pixel(target, 4, 4) == 0xFFFF0000u);
+  // The memory has it: the CPU reads it through B, through A, and through the heap.
+  CHECK(e.pixel(b_texture, 2, 2) == 0xFFFF0000u && e.pixel(a_target, 3, 3) == 0xFFFF0000u);
+  CHECK(e.kernel.lock(kPid, heap, kLockReadOnly, 0, &lock) == status::kSuccess && lock.data.size() == 4096);
+  ByteReader heap_in(ConstByteView(lock.data.data(), lock.data.size()));
+  heap_in.skip(2048);
+  CHECK(heap_in.le32() == 0xFFFF0000u);
+  e.kernel.unlock(kPid, heap);
+  // The CPU writing through B reaches A (which is not resident-stale to the stream any more): drawn into again, A is what the stream draws, not what the CPU wrote.
+  CHECK(e.fill(b_texture, 0xFF00FF00u));
+  CHECK(e.pixel(a_target, 0, 0) == 0xFF00FF00u);
+  // Aliasing barriers: not in a pass, only between placed allocations of one heap, and a null side is nothing.
+  {
+    CommandWriter w(e.allocator);
+    w.begin_pass(2, kNoAllocation, 0, {0, 0, 0, 0}, 1, 0);
+    w.resource_barrier({CommandWriter::Barrier{2, 0, 1, 0, 0}});
+    w.end_pass();
+    CHECK(e.render(w, {a_target, b_texture, target}) == status::kInvalidParameter);
+  }
+  {
+    CommandWriter w(e.allocator);
+    w.resource_barrier({CommandWriter::Barrier{2, 0, 2, 0, 0}});
+    CHECK(e.render(w, {a_target, b_texture, target}) == status::kInvalidParameter);   // (the target is not placed)
+    CommandWriter w2(e.allocator);
+    w2.resource_barrier({CommandWriter::Barrier{2, 0, CommandWriter::Barrier::kNoAllocationIndex, 0, 0}, CommandWriter::Barrier{2, CommandWriter::Barrier::kNoAllocationIndex, 1, 0, 0}});
+    CHECK(e.render(w2, {a_target, b_texture, target}) == status::kSuccess);
+  }
+  // The heap goes when its handle is destroyed but the allocations placed in it keep its memory.
+  CHECK(e.kernel.destroy_allocation(kPid, heap) == status::kSuccess);
+  CHECK(e.pixel(b_texture, 0, 0) == 0xFF00FF00u);
+}
+
+
+// --- DXIL (Shader Model 6): the same HLSL compiled by fxc to DXBC and by dxc to DXIL must give the same results -----------------------------------------------------------------
+
+struct DxilTextures final : graphics::ITextureSet {
+  graphics::Vec4 sample(uint32_t unit, float u, float v) const override { return {u, v, 0.25f + 0.1f * static_cast<float>(unit), 1.0f}; }
+  graphics::Vec4 sample_lod(uint32_t unit, float u, float v, float lod) const override { return {u * 0.5f, v * 0.5f, lod * 0.125f, 0.5f + 0.1f * static_cast<float>(unit)}; }
+  graphics::Vec4 fetch(uint32_t unit, int32_t x, int32_t y, uint32_t level) const override { return {x * 0.0625f, y * 0.125f, static_cast<float>(level) * 0.25f, 0.75f + static_cast<float>(unit) * 0.0625f}; }
+  bool size(uint32_t, uint32_t level, uint32_t* width, uint32_t* height, uint32_t* levels) const override {
+    *width = 8u >> level, *height = 4u >> level, *levels = 3;
+    return level < 3;
+  }
+};
+
+bool close_to(float a, float b) {
+  if (a != a || b != b) return a != a && b != b;
+  const float scale = 1.0f + (a < 0 ? -a : a);
+  return (a - b < 0 ? b - a : a - b) <= 2e-4f * scale;
+}
+
+void test_dxil() {
+  HostAllocator allocator;
+  uint32_t seed = 12345;
+  auto random = [&](float low, float high) {
+    seed = seed * 1664525u + 1013904223u;
+    return low + (high - low) * static_cast<float>(seed >> 8) / static_cast<float>(1u << 24);
+  };
+  auto load = [&](const char* name, UniquePointer<D3d9Program>* program) {
+    const std::vector<uint8_t> blob = read_blob(name);
+    const NtStatus st = D3d9Program::compile_dxbc(allocator, ConstByteView(blob.data(), blob.size()), program);
+    if (st != status::kSuccess) printf("  %s: compile status %x\n", name, static_cast<unsigned>(st));
+    return st == status::kSuccess && *program;
+  };
+  DxilTextures textures;
+  // The pixel shaders: the same varyings, the same colour (and the same pixel killed).
+  for (const char* name : {"dxil_ps_math", "dxil_ps_tex", "dxil_ps_flow", "dxil_ps_loop", "dxil_ps_loop2"}) {
+    UniquePointer<D3d9Program> reference, translated;
+    const std::string base(name);
+    CHECK(load((base + ".dxbc").c_str(), &reference) && load((base + ".dxil").c_str(), &translated));
+    if (!reference || !translated) continue;
+    CHECK(translated->stage() == graphics::ShaderStage::Fragment && translated->color_output_count() == 1);
+    unsigned alive_count = 0;
+    for (uint32_t n = 0; n < 200; ++n) {
+      graphics::Vec4 varyings[4] = {};
+      varyings[0] = {random(-1, 2), random(-1, 2), random(-1, 2), random(-1, 2)};
+      varyings[2] = {random(0, 1), random(0, 1), 0, 0};
+      graphics::FragmentContext context;
+      context.position = {random(0, 32), random(0, 32), random(0, 1), 1};
+      graphics::Vec4 a_room[graphics::kMaxColorTargets] = {}, b_room[graphics::kMaxColorTargets] = {};
+      uint8_t constants[128] = {};
+      const bool a_alive = reference->run_fragment_ex(varyings, context, constants, &textures, a_room);
+      const bool b_alive = translated->run_fragment_ex(varyings, context, constants, &textures, b_room);
+      CHECK(a_alive == b_alive);
+      alive_count += a_alive;
+      if (a_alive && b_alive) {
+        const bool same = close_to(a_room[0].x, b_room[0].x) && close_to(a_room[0].y, b_room[0].y) && close_to(a_room[0].z, b_room[0].z) && close_to(a_room[0].w, b_room[0].w);
+        if (!same && n < 3) printf("  %s #%u: %g %g %g %g vs %g %g %g %g\n", name, n, a_room[0].x, a_room[0].y, a_room[0].z, a_room[0].w, b_room[0].x, b_room[0].y, b_room[0].z, b_room[0].w);
+        CHECK(same);
+      }
+    }
+    CHECK(alive_count > 20);   // (the test is about colours, not about every pixel being killed)
+    printf("  dxil %s: 200 pixels compared, %u not killed\n", name, alive_count);
+  }
+
+  // The shader the old compiler cannot make (a switch, signed division, tan and the hyperbolic functions, an early return): compared with the same function in C++.
+  {
+    UniquePointer<D3d9Program> translated;
+    CHECK(load("dxil_ps_more.dxil", &translated));
+    if (translated) {
+      unsigned early = 0, checked = 0;
+      for (uint32_t n = 0; n < 300; ++n) {
+        graphics::Vec4 varyings[4] = {};
+        varyings[0] = {random(-1, 2), random(-1, 2), random(-1, 2), random(-1, 2)};
+        varyings[2] = {n % 7 == 0 ? random(0, 0.1f) : random(0, 1), random(0, 1), 0, 0};
+        const float cx = varyings[0].x, cy = varyings[0].y, cz = varyings[0].z, cw = varyings[0].w, tx = varyings[2].x, ty = varyings[2].y;
+        graphics::Vec4 room[graphics::kMaxColorTargets] = {};
+        uint8_t constants[128] = {};
+        const bool alive = translated->run_fragment_ex(varyings, graphics::FragmentContext(), constants, &textures, room);
+        float want[4];
+        if (tx < 0.1f) {
+          want[0] = cx, want[1] = cy, want[2] = cz, want[3] = 0.5f;
+          ++early;
+        } else {
+          const int a = static_cast<int>(cx * 20.0f - 8.0f), b = static_cast<int>(ty * 6.0f) - 3, d = b == 0 ? 1 : b;
+          want[0] = static_cast<float>(a / d) + static_cast<float>(a % d) * 0.25f;
+          want[1] = __builtin_tanf(cy * 0.5f) + __builtin_coshf(cz * 0.3f) + __builtin_sinhf(cw * 0.3f) + __builtin_tanhf(cx * 0.2f);
+          const uint32_t which = static_cast<uint32_t>(ty * 5.0f);
+          want[2] = which == 0 ? 1.0f : which <= 2 ? cx * 2.0f : which == 3 ? __builtin_sqrtf(__builtin_fabsf(cy)) : -1.0f;
+          want[3] = 1.0f;
+        }
+        const bool same = alive && close_to(room[0].x, want[0]) && close_to(room[0].y, want[1]) && close_to(room[0].z, want[2]) && close_to(room[0].w, want[3]);
+        if (!same && checked < 3) printf("  more #%u: %g %g %g %g wants %g %g %g %g\n", n, room[0].x, room[0].y, room[0].z, room[0].w, want[0], want[1], want[2], want[3]);
+        CHECK(same);
+        ++checked;
+      }
+      CHECK(early > 10);
+      printf("  dxil dxil_ps_more: 300 pixels compared with C++ (%u early returns)\n", early);
+    }
+  }
+
+  // gather4 (GatherRed / GatherGreen of a 2D texture): the footprint's four texels in the order x (i0, j1), y (i1, j1), z (i1, j0), w (i0, j0); the fake texture's lookups give the texel
+  // middle's coordinates halved, so the golden is computed from the same footprint.
+  {
+    UniquePointer<D3d9Program> translated;
+    CHECK(load("dxil_ps_gather.dxil", &translated));
+    if (translated) {
+      if (getenv("TGSI_DUMP")) {
+        String text(allocator);
+        translated->emit_tgsi(&text);
+        printf("%.*s\n", static_cast<int>(text.size()), text.data());
+      }
+      for (uint32_t n = 0; n < 200; ++n) {
+        graphics::Vec4 varyings[4] = {};
+        varyings[2] = {random(0, 1), random(0, 1), 0, 0};
+        graphics::Vec4 room[graphics::kMaxColorTargets] = {};
+        uint8_t constants[128] = {};
+        const bool alive = translated->run_fragment_ex(varyings, graphics::FragmentContext(), constants, &textures, room);
+        auto footprint = [&](float u, float v, float* red, float* green) {
+          const float x = __builtin_floorf(u * 8.0f - 0.5f), y = __builtin_floorf(v * 4.0f - 0.5f);
+          const float xs[4] = {x, x + 1, x + 1, x}, ys[4] = {y + 1, y + 1, y, y};
+          for (uint32_t k = 0; k < 4; ++k) red[k] = (xs[k] + 0.5f) / 16.0f, green[k] = (ys[k] + 0.5f) / 8.0f;
+        };
+        float g_red[4], g[4], r[4], r_green[4];
+        footprint(varyings[2].x, varyings[2].y, g_red, g);
+        footprint(varyings[2].x * 0.9f, varyings[2].y * 0.9f, r, r_green);
+        const float want[4] = {g[0] + g[3] * 2.0f, g[1] * 0.5f + g[2], r[0] + r[1] * 2.0f, r[2] * 0.25f + r[3]};
+        const bool same = alive && close_to(room[0].x, want[0]) && close_to(room[0].y, want[1]) && close_to(room[0].z, want[2]) && close_to(room[0].w, want[3]);
+        if (!same && n < 3) printf("  gather #%u: %g %g %g %g wants %g %g %g %g\n", n, room[0].x, room[0].y, room[0].z, room[0].w, want[0], want[1], want[2], want[3]);
+        CHECK(same);
+      }
+    }
+  }
+  // Derivatives (ddx_fine / ddy_fine / ddx_coarse / ddy_coarse): the varyings are a plane over the quad, so each corner's are the first corner's plus its steps; the golden takes the
+  // difference of the same function at the corners of the pair.
+  {
+    UniquePointer<D3d9Program> translated;
+    CHECK(load("dxil_ps_deriv.dxil", &translated));
+    if (translated) {
+      struct Plane {
+        graphics::Vec4 origin[4], step_x[4], step_y[4];
+        graphics::Vec4 at(uint32_t i, uint32_t corner) const {
+          const float fx = static_cast<float>(corner & 1), fy = static_cast<float>(corner >> 1);
+          return {origin[i].x + step_x[i].x * fx + step_y[i].x * fy, origin[i].y + step_x[i].y * fx + step_y[i].y * fy, origin[i].z + step_x[i].z * fx + step_y[i].z * fy,
+                  origin[i].w + step_x[i].w * fx + step_y[i].w * fy};
+        }
+      };
+      for (uint32_t n = 0; n < 200; ++n) {
+        Plane plane = {};
+        for (uint32_t i = 0; i < 4; ++i) {
+          plane.origin[i] = {random(-1, 1), random(-1, 1), random(-1, 1), random(-1, 1)};
+          plane.step_x[i] = {random(-0.3f, 0.3f), random(-0.3f, 0.3f), random(-0.3f, 0.3f), random(-0.3f, 0.3f)};
+          plane.step_y[i] = {random(-0.3f, 0.3f), random(-0.3f, 0.3f), random(-0.3f, 0.3f), random(-0.3f, 0.3f)};
+        }
+        const uint32_t own = n % 4;
+        graphics::FragmentContext context;
+        context.quad_corner = own;
+        context.quad_user = &plane;
+        context.quad_fn = [](const void* user, uint32_t corner, graphics::Vec4* varyings, graphics::Vec4* position) {
+          const Plane& p = *static_cast<const Plane*>(user);
+          for (uint32_t i = 0; i < 4; ++i) varyings[i] = p.at(i, corner);
+          *position = {static_cast<float>(corner & 1), static_cast<float>(corner >> 1), 0, 1};
+        };
+        graphics::Vec4 varyings[4];
+        for (uint32_t i = 0; i < 4; ++i) varyings[i] = plane.at(i, own);
+        graphics::Vec4 room[graphics::kMaxColorTargets] = {};
+        uint8_t constants[128] = {};
+        const bool alive = translated->run_fragment_ex(varyings, context, constants, &textures, room);
+        auto f = [&](uint32_t corner) {
+          const graphics::Vec4 c = plane.at(0, corner), t = plane.at(2, corner);
+          return c.x * c.y + t.x * t.x;
+        };
+        const uint32_t row = own & 2, col = own & 1;
+        const float want[4] = {f(row + 1) - f(row), f(col + 2) - f(col),
+                               plane.at(0, 1).z * plane.at(0, 1).z - plane.at(0, 0).z * plane.at(0, 0).z,
+                               plane.at(0, 2).w + plane.at(2, 2).y * plane.at(2, 2).y - plane.at(0, 0).w - plane.at(2, 0).y * plane.at(2, 0).y};
+        const bool same = alive && close_to(room[0].x, want[0]) && close_to(room[0].y, want[1]) && close_to(room[0].z, want[2]) && close_to(room[0].w, want[3]);
+        if (!same && n < 4) printf("  deriv #%u (corner %u): %g %g %g %g wants %g %g %g %g\n", n, own, room[0].x, room[0].y, room[0].z, room[0].w, want[0], want[1], want[2], want[3]);
+        CHECK(same);
+      }
+    }
+  }
+  // atan, asin and acos (polynomials in the translation): compared with libm within 1e-4.
+  {
+    UniquePointer<D3d9Program> translated;
+    CHECK(load("dxil_ps_inv.dxil", &translated));
+    if (translated) {
+      auto near = [](float a, float b) { return __builtin_fabsf(a - b) < 1e-4f; };
+      for (uint32_t n = 0; n < 300; ++n) {
+        graphics::Vec4 varyings[4] = {};
+        varyings[0] = {random(0, 1), random(0, 1), random(0, 1), 0};
+        if (n == 0) varyings[0] = {0.5f, 0.5f, 0.5f, 0};
+        if (n == 1) varyings[0] = {1, 1, 1, 0};
+        if (n == 2) varyings[0] = {0, 0, 0, 0};
+        graphics::Vec4 room[graphics::kMaxColorTargets] = {};
+        uint8_t constants[128] = {};
+        const bool alive = translated->run_fragment_ex(varyings, graphics::FragmentContext(), constants, &textures, room);
+        const float x = varyings[0].x * 3.0f - 1.5f, y = varyings[0].y * 2.0f - 1.0f, z = varyings[0].z * 8.0f - 4.0f;
+        const bool same = alive && near(room[0].x, __builtin_atanf(x)) && near(room[0].y, __builtin_asinf(y)) && near(room[0].z, __builtin_acosf(y)) && near(room[0].w, __builtin_atanf(z));
+        if (!same) printf("  inv #%u: %g %g %g %g wants %g %g %g %g\n", n, room[0].x, room[0].y, room[0].z, room[0].w, __builtin_atanf(x), __builtin_asinf(y), __builtin_acosf(y), __builtin_atanf(z));
+        CHECK(same);
+      }
+    }
+  }
+  // The vertex shader: a matrix and a tint from the constants.
+  {
+    UniquePointer<D3d9Program> reference, translated;
+    CHECK(load("dxil_vs.dxbc", &reference) && load("dxil_vs.dxil", &translated));
+    if (reference && translated) {
+      CHECK(translated->stage() == graphics::ShaderStage::Vertex);
+      for (uint32_t n = 0; n < 100; ++n) {
+        graphics::Vec4 attributes[4] = {{random(-1, 1), random(-1, 1), random(-1, 1), 1}, {random(0, 1), random(0, 1), random(0, 1), random(0, 1)}, {}, {}};
+        float constants_f[32];
+        for (float& c : constants_f) c = random(-2, 2);
+        uint8_t constants[128];
+        for (uint32_t i = 0; i < 32; ++i) {
+          const uint32_t bits = __builtin_bit_cast(uint32_t, constants_f[i]);
+          for (uint32_t k = 0; k < 4; ++k) constants[4 * i + k] = static_cast<uint8_t>(bits >> (8 * k));
+        }
+        graphics::ShaderIo a = {}, b = {};
+        reference->run_vertex_ex(attributes, constants, graphics::VertexContext(), &a);
+        translated->run_vertex_ex(attributes, constants, graphics::VertexContext(), &b);
+        const bool same = close_to(a.position.x, b.position.x) && close_to(a.position.y, b.position.y) && close_to(a.position.z, b.position.z) && close_to(a.position.w, b.position.w) &&
+                          close_to(a.varying[0].x, b.varying[0].x) && close_to(a.varying[0].w, b.varying[0].w) && close_to(a.varying[2].x, b.varying[2].x) && close_to(a.varying[2].y, b.varying[2].y);
+        if (!same && n < 3) printf("  vs #%u: %g %g %g %g vs %g %g %g %g\n", n, a.position.x, a.position.y, a.position.z, a.position.w, b.position.x, b.position.y, b.position.z, b.position.w);
+        CHECK(same);
+      }
+    }
+  }
+
+
+  // A geometry shader: the vertices it emits and where it cut the strip.
+  {
+    UniquePointer<D3d9Program> reference, translated;
+    CHECK(load("dxil_gs_copy.dxbc", &reference) && load("dxil_gs_copy.dxil", &translated));
+    if (reference && translated) {
+      CHECK(translated->stage() == graphics::ShaderStage::Geometry && translated->geometry_input() == graphics::GeometryPrimitive::Triangle && translated->geometry_max_vertices() == 6 &&
+            translated->geometry_output() == graphics::GeometryTopology::TriangleStrip);
+      for (uint32_t n = 0; n < 100; ++n) {
+        graphics::GeometryInputData in;
+        for (uint32_t v = 0; v < 3; ++v) {
+          in.position[v] = {random(-1, 1), random(-1, 1), random(0, 1), random(0.5f, 2)};
+          in.varying[v][0] = {random(0, 1), random(0, 1), random(0, 1), random(0, 1)};
+          in.varying[v][2] = {random(0, 1), random(0, 1), 0, 0};
+        }
+        graphics::GeometryOutputData a, b;
+        uint8_t constants[128] = {};
+        reference->run_geometry(in, constants, &a);
+        translated->run_geometry(in, constants, &b);
+        bool same = a.count == b.count && a.count == 6;
+        for (uint32_t i = 0; same && i < a.count; ++i)
+          same = a.restart[i] == b.restart[i] && close_to(a.vertex[i].position.x, b.vertex[i].position.x) && close_to(a.vertex[i].position.y, b.vertex[i].position.y) &&
+                 close_to(a.vertex[i].position.w, b.vertex[i].position.w) && close_to(a.vertex[i].varying[0].x, b.vertex[i].varying[0].x) && close_to(a.vertex[i].varying[0].z, b.vertex[i].varying[0].z) &&
+                 close_to(a.vertex[i].varying[2].y, b.vertex[i].varying[2].y);
+        CHECK(same);
+      }
+      printf("  dxil dxil_gs_copy: 100 triangles compared\n");
+    }
+  }
+
+  // A geometry shader with two output streams (the streams of each vertex and every output of it).
+  {
+    UniquePointer<D3d9Program> reference, translated;
+    CHECK(load("dxil_gs_streams.dxbc", &reference) && load("dxil_gs_streams.dxil", &translated));
+    if (reference && translated) {
+      for (uint32_t n = 0; n < 100; ++n) {
+        graphics::GeometryInputData in;
+        for (uint32_t v = 0; v < 3; ++v) {
+          in.position[v] = {random(-1, 1), random(-1, 1), random(0, 1), random(0.5f, 2)};
+          in.varying[v][0] = {random(0, 1), random(0, 1), random(0, 1), random(0, 1)};
+          in.varying[v][2] = {random(0, 1), random(0, 1), 0, 0};
+        }
+        graphics::GeometryOutputData a, b;
+        uint8_t constants[128] = {};
+        reference->run_geometry(in, constants, &a);
+        translated->run_geometry(in, constants, &b);
+        bool same = a.count == b.count && a.count == 6;
+        bool both_streams[2] = {};
+        for (uint32_t i = 0; same && i < a.count; ++i) {
+          same = a.stream[i] == b.stream[i] && a.restart[i] == b.restart[i] && close_to(a.vertex[i].position.x, b.vertex[i].position.x) && close_to(a.vertex[i].position.w, b.vertex[i].position.w);
+          for (uint32_t k = 0; k < 4; ++k) same = same && close_to(a.vertex[i].varying[k].x, b.vertex[i].varying[k].x) && close_to(a.vertex[i].varying[k].w, b.vertex[i].varying[k].w);
+          if (a.stream[i] < 2) both_streams[a.stream[i]] = true;
+        }
+        if (!same && n == 0) printf("  streams: counts %u %u\n", a.count, b.count);
+        CHECK(same && both_streams[0] && both_streams[1]);
+      }
+      printf("  dxil dxil_gs_streams: 100 triangles compared\n");
+    }
+  }
+
+  // A domain shader: the vertex it makes of a patch at a point of the domain.
+  {
+    UniquePointer<D3d9Program> reference, translated;
+    CHECK(load("dxil_ds_dent.dxbc", &reference) && load("dxil_ds_dent.dxil", &translated));
+    if (reference && translated) {
+      CHECK(translated->stage() == graphics::ShaderStage::Domain && translated->tess_domain() == graphics::TessDomain::Triangle && translated->tess_input_points() == 3);
+      for (uint32_t n = 0; n < 100; ++n) {
+        graphics::HullOutputData patch;
+        for (uint32_t k = 0; k < 3; ++k) {
+          patch.control_point[k].position = {random(-1, 1), random(-1, 1), random(0, 1), random(0.5f, 2)};
+          patch.control_point[k].varying[0] = {random(0, 1), random(0, 1), random(0, 1), random(0, 1)};
+          patch.control_point[k].varying[2] = {random(0, 1), random(0, 1), 0, 0};
+        }
+        const float u = random(0, 1), v = random(0, 1) * (1 - u), w = 1 - u - v;
+        graphics::ShaderIo a = {}, b = {};
+        uint8_t constants[128] = {};
+        reference->run_domain(patch, u, v, w, constants, &a);
+        translated->run_domain(patch, u, v, w, constants, &b);
+        CHECK(close_to(a.position.x, b.position.x) && close_to(a.position.y, b.position.y) && close_to(a.position.z, b.position.z) && close_to(a.position.w, b.position.w) &&
+              close_to(a.varying[0].x, b.varying[0].x) && close_to(a.varying[0].w, b.varying[0].w) && close_to(a.varying[2].x, b.varying[2].x) && close_to(a.varying[2].y, b.varying[2].y));
+      }
+      printf("  dxil dxil_ds_dent: 100 domain points compared\n");
+    }
+  }
+
+  // A hull shader (a control point function and a patch constant function): the control points and the tessellation factors.
+  {
+    UniquePointer<D3d9Program> reference, translated;
+    CHECK(load("dxil_hs_tri.dxbc", &reference) && load("dxil_hs_tri.dxil", &translated));
+    if (reference && translated) {
+      CHECK(translated->stage() == graphics::ShaderStage::Hull && translated->tess_domain() == graphics::TessDomain::Triangle && translated->tess_input_points() == 3 && translated->tess_output_points() == 3 &&
+            translated->tess_partitioning() == reference->tess_partitioning() && translated->tess_output() == reference->tess_output());
+      for (uint32_t n = 0; n < 50; ++n) {
+        graphics::HullInputData in;
+        in.control_points = 3;
+        for (uint32_t k = 0; k < 3; ++k) {
+          in.position[k] = {random(-1, 1), random(-1, 1), random(0, 1), random(0.5f, 2)};
+          in.varying[k][0] = {random(0, 1), random(0, 1), random(0, 1), random(0, 1)};
+          in.varying[k][2] = {random(0, 1), random(0, 1), 0, 0};
+        }
+        graphics::HullOutputData a, b;
+        uint8_t constants[128] = {};
+        reference->run_hull(in, constants, &a);
+        translated->run_hull(in, constants, &b);
+        bool same = true;
+        for (uint32_t k = 0; k < 3; ++k)
+          same = same && close_to(a.control_point[k].position.x, b.control_point[k].position.x) && close_to(a.control_point[k].position.w, b.control_point[k].position.w) &&
+                 close_to(a.control_point[k].varying[0].y, b.control_point[k].varying[0].y) && close_to(a.control_point[k].varying[2].x, b.control_point[k].varying[2].x);
+        for (uint32_t k = 0; k < 3; ++k) same = same && close_to(a.outer[k], b.outer[k]);
+        same = same && close_to(a.inner[0], b.inner[0]) && a.outer[0] == 2.0f && a.inner[0] == 2.0f;
+        if (!same && n < 2) printf("  hs #%u: outer %g %g %g inner %g cp0.x %g w %g v0.y %g | outer %g %g %g inner %g cp0.x %g w %g v0.y %g\n", n, a.outer[0], a.outer[1], a.outer[2], a.inner[0], a.control_point[0].position.x, a.control_point[0].position.w, a.control_point[0].varying[0].y, b.outer[0], b.outer[1], b.outer[2], b.inner[0], b.control_point[0].position.x, b.control_point[0].position.w, b.control_point[0].varying[0].y);
+        CHECK(same);
+      }
+      printf("  dxil dxil_hs_tri: 50 patches compared\n");
+    }
+  }
+
+  // The hull shaders of the other domains and partitionings, with the factors from a constant buffer.
+  for (const char* name : {"dxil_hs_quad_cb", "dxil_hs_iso_cb", "dxil_hs_tri_odd_cb"}) {
+    UniquePointer<D3d9Program> reference, translated;
+    const std::string base(name);
+    CHECK(load((base + ".dxbc").c_str(), &reference) && load((base + ".dxil").c_str(), &translated));
+    if (!reference || !translated) continue;
+    CHECK(translated->tess_domain() == reference->tess_domain() && translated->tess_partitioning() == reference->tess_partitioning() && translated->tess_output() == reference->tess_output() &&
+          translated->tess_input_points() == reference->tess_input_points() && translated->tess_output_points() == reference->tess_output_points());
+    const uint32_t points = reference->tess_input_points();
+    for (uint32_t n = 0; n < 30; ++n) {
+      graphics::HullInputData in;
+      in.control_points = points;
+      for (uint32_t k = 0; k < points; ++k) in.position[k] = {random(-1, 1), random(-1, 1), 0.5f, 1}, in.varying[k][0] = {random(0, 1), 0, 0, 1};
+      uint8_t constants[128] = {};
+      for (uint32_t i = 16; i < 24; ++i) {
+        const float f = random(1, 9);
+        const uint32_t bits = __builtin_bit_cast(uint32_t, f);
+        for (uint32_t b = 0; b < 4; ++b) constants[4 * i + b] = static_cast<uint8_t>(bits >> (8 * b));
+      }
+      graphics::HullOutputData a, b;
+      reference->run_hull(in, constants, &a);
+      translated->run_hull(in, constants, &b);
+      bool same = true;
+      for (uint32_t k = 0; k < 4; ++k) same = same && close_to(a.outer[k], b.outer[k]);
+      for (uint32_t k = 0; k < 2; ++k) same = same && close_to(a.inner[k], b.inner[k]);
+      for (uint32_t k = 0; k < points; ++k) same = same && close_to(a.control_point[k].position.x, b.control_point[k].position.x);
+      if (!same && n < 2) printf("  %s #%u: outer %g %g %g %g inner %g %g | %g %g %g %g %g %g\n", name, n, a.outer[0], a.outer[1], a.outer[2], a.outer[3], a.inner[0], a.inner[1], b.outer[0], b.outer[1], b.outer[2], b.outer[3], b.inner[0], b.inner[1]);
+      CHECK(same);
+    }
+    printf("  dxil %s: 30 patches compared\n", name);
+  }
+  // The compute shaders: the same buffers in, the same buffers out.
+  {
+    UniquePointer<D3d9Program> reference, translated;
+    CHECK(load("dxil_cs_fill.dxbc", &reference) && load("dxil_cs_fill.dxil", &translated));
+    if (reference && translated) {
+      CHECK(translated->stage() == graphics::ShaderStage::Compute && translated->thread_group(0) == 8 && translated->thread_group(1) == 4);
+      auto run = [&](D3d9Program& p, std::vector<uint8_t>* picture, std::vector<uint8_t>* structured, std::vector<uint8_t>* counters) {
+        picture->assign(4096, 0), structured->assign(16384, 0), counters->assign(16, 0);
+        graphics::ComputeContext context;
+        context.buffers[0] = ByteView(picture->data(), picture->size()), context.buffers[1] = ByteView(structured->data(), structured->size()), context.buffers[2] = ByteView(counters->data(), counters->size());
+        const uint32_t k[4] = {0x00102030u, 0, 0, 0};
+        uint8_t constants[128] = {};
+        for (uint32_t i = 0; i < 4; ++i)
+          for (uint32_t b = 0; b < 4; ++b) constants[4 * i + b] = static_cast<uint8_t>(k[i] >> (8 * b));
+        for (uint32_t gy = 0; gy < 8; ++gy)
+          for (uint32_t gx = 0; gx < 4; ++gx) {
+            uint32_t index = 0;
+            for (uint32_t ty = 0; ty < 4; ++ty)
+              for (uint32_t tx = 0; tx < 8; ++tx, ++index) {
+                context.group_id[0] = gx, context.group_id[1] = gy, context.thread_id[0] = tx, context.thread_id[1] = ty;
+                context.dispatch_id[0] = gx * 8 + tx, context.dispatch_id[1] = gy * 4 + ty;
+                context.group_index = index;
+                p.run_compute(context, constants);
+              }
+          }
+      };
+      std::vector<uint8_t> a0, a1, a2, b0, b1, b2;
+      run(*reference, &a0, &a1, &a2);
+      run(*translated, &b0, &b1, &b2);
+      CHECK(a0 == b0 && a1 == b1 && a2 == b2);
+      CHECK(b0[0] != 0 && b2[0] == 0 && b2[1] == 4);   // (the counters reached 1024: 0x400)
+      printf("  dxil dxil_cs_fill: %s\n", a0 == b0 && a1 == b1 && a2 == b2 ? "same buffers" : "buffers differ");
+    }
+  }
+
+  // Shader resource views of buffers (t#: read-only storage buffers after the u# ones).
+  {
+    UniquePointer<D3d9Program> translated;
+    CHECK(load("dxil_cs_srv.dxil", &translated));
+    if (translated) {
+      CHECK(translated->storage_kind(graphics::kMaxUavBuffers) == D3d9Program::BufferKind::Structured && translated->storage_kind(graphics::kMaxUavBuffers + 1) == D3d9Program::BufferKind::Raw &&
+            translated->storage_kind(0) == D3d9Program::BufferKind::Structured);
+      std::vector<uint32_t> src(1024 * 4), raw(1024), dst(1024, 0);
+      for (uint32_t i = 0; i < src.size(); ++i) src[i] = 0x01010101u * (i % 251) + i * 7;
+      for (uint32_t i = 0; i < raw.size(); ++i) raw[i] = 0x9E3779B9u * (i + 1);
+      graphics::ComputeContext context;
+      context.buffers[0] = ByteView(reinterpret_cast<uint8_t*>(dst.data()), dst.size() * 4);
+      context.buffers[graphics::kMaxUavBuffers] = ByteView(reinterpret_cast<uint8_t*>(src.data()), src.size() * 4);
+      context.buffers[graphics::kMaxUavBuffers + 1] = ByteView(reinterpret_cast<uint8_t*>(raw.data()), raw.size() * 4);
+      uint8_t constants[128] = {};
+      for (uint32_t y = 0; y < 32; ++y)
+        for (uint32_t x = 0; x < 32; ++x) {
+          context.thread_id[0] = x % 8, context.thread_id[1] = y % 4, context.dispatch_id[0] = x, context.dispatch_id[1] = y, context.group_index = (y % 4) * 8 + x % 8;
+          translated->run_compute(context, constants);
+        }
+      bool same = true;
+      for (uint32_t i = 0; i < 1024; ++i) same = same && dst[i] == src[4 * i] + src[4 * i + 3] * 3 + raw[i] + (raw[1023 - i] ^ src[4 * i + 1]);
+      CHECK(same);
+      printf("  dxil dxil_cs_srv: %s\n", same ? "buffer views read" : "buffer views differ");
+    }
+  }
+
+  // A compute shader with group-shared memory and barriers (a reduction in a loop): the buffer after every group has run.
+  {
+    UniquePointer<D3d9Program> reference, translated;
+    CHECK(load("dxil_cs_shared.dxbc", &reference) && load("dxil_cs_shared.dxil", &translated));
+    if (reference && translated) {
+      CHECK(translated->needs_group() && translated->shared_total_bytes() == 256);
+      auto run = [&](D3d9Program& p, std::vector<uint8_t>* picture) {
+        picture->assign(4096, 0);
+        graphics::ComputeContext context;
+        context.buffers[0] = ByteView(picture->data(), picture->size());
+        for (uint32_t gy = 0; gy < 4; ++gy)
+          for (uint32_t gx = 0; gx < 4; ++gx) {
+            context.group_id[0] = gx, context.group_id[1] = gy;
+            p.run_compute_group(context, nullptr);
+          }
+      };
+      std::vector<uint8_t> a, b;
+      run(*reference, &a);
+      run(*translated, &b);
+      CHECK(a == b);
+      printf("  dxil dxil_cs_shared: %s\n", a == b ? "same buffer" : "buffers differ");
+    }
+  }
+  // Truncated and with a bit flipped: refused or compiled, never a crash (and the sanitizers say nothing).
+  for (const char* name : {"dxil_ps_math.dxil", "dxil_ps_flow.dxil", "dxil_vs.dxil", "dxil_ps_tex.dxil", "dxil_cs_fill.dxil", "dxil_ps_loop.dxil", "dxil_cs_shared.dxil", "dxil_ps_more.dxil", "dxil_gs_copy.dxil", "dxil_ds_dent.dxil", "dxil_hs_tri.dxil", "dxil_hs_quad_cb.dxil", "dxil_hs_iso_cb.dxil"}) {
+    const std::vector<uint8_t> blob = read_blob(name);
+    for (size_t n = 0; n < blob.size(); n += 11) {
+      UniquePointer<D3d9Program> program;
+      D3d9Program::compile_dxbc(allocator, ConstByteView(blob.data(), n), &program);
+    }
+    const size_t stride = getenv("DXIL_FUZZ_STRIDE") ? static_cast<size_t>(atoi(getenv("DXIL_FUZZ_STRIDE"))) : 37;   // (every bit when looking for something)
+    for (size_t bit = 0; bit < blob.size() * 8; bit += stride) {
+      std::vector<uint8_t> flipped = blob;
+      flipped[bit / 8] ^= static_cast<uint8_t>(1u << (bit % 8));
+      UniquePointer<D3d9Program> program;
+      D3d9Program::compile_dxbc(allocator, ConstByteView(flipped.data(), flipped.size()), &program);
+    }
+  }
+}
+
+
+// Reserved (tiled) buffers: tiles mapped to places in heaps.
+void test_d3d12_reserved() {
+  Env e;
+  auto create = [&](uint32_t flags, uint64_t size, Handle heap, uint64_t offset, Handle* out) {
+    AllocationDesc d;
+    d.flags = flags, d.size = size, d.heap = heap, d.heap_offset = offset;
+    return e.kernel.create_allocation(kPid, e.dev, d, out);
+  };
+  Handle heap = 0, p = 0, q = 0, r = 0, none = 0;
+  CHECK(create(kAllocHeap, 4 * kTileBytes, 0, 0, &heap) == status::kSuccess);
+  CHECK(create(kAllocVertexBuffer, kTileBytes, heap, 0, &p) == status::kSuccess && create(kAllocVertexBuffer, kTileBytes, heap, 2 * kTileBytes, &q) == status::kSuccess);
+  CHECK(create(kAllocVertexBuffer | kAllocReserved, 3 * kTileBytes, 0, 0, &r) == status::kSuccess);
+  CHECK(create(kAllocVertexBuffer | kAllocReserved, 3 * kTileBytes + 4, 0, 0, &none) == status::kInvalidParameter && create(kAllocVertexBuffer | kAllocReserved, 0, 0, 0, &none) == status::kInvalidParameter);
+  CHECK(create(kAllocQueryResult | kAllocReserved, kTileBytes, 0, 0, &none) == status::kInvalidParameter && create(kAllocHeap | kAllocReserved, kTileBytes, 0, 0, &none) == status::kInvalidParameter);
+  CHECK(create(kAllocVertexBuffer | kAllocReserved, kTileBytes, heap, 0, &none) == status::kInvalidParameter);   // (reserved and placed)
+  AllocationDesc image;
+  image.flags = kAllocTexture | kAllocReserved, image.format = Format::A8R8G8B8, image.width = image.height = 8;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, image, &none) == status::kInvalidParameter);
+  // Mapping: tile 0 to the start of the heap, tile 1 to its third tile, tile 2 nowhere.
+  CHECK(e.kernel.update_tile_mappings(kPid, r, 0, heap, 0, 1) == status::kSuccess && e.kernel.update_tile_mappings(kPid, r, 1, heap, 2 * kTileBytes, 1) == status::kSuccess);
+  CHECK(e.kernel.update_tile_mappings(kPid, r, 2, 0, 0, 1) == status::kSuccess);
+  CHECK(e.kernel.update_tile_mappings(kPid, r, 3, heap, 0, 1) == status::kInvalidParameter && e.kernel.update_tile_mappings(kPid, r, 0, heap, 100, 1) == status::kInvalidParameter);
+  CHECK(e.kernel.update_tile_mappings(kPid, r, 0, heap, 3 * kTileBytes, 2) == status::kInvalidParameter && e.kernel.update_tile_mappings(kPid, p, 0, heap, 0, 1) == status::kInvalidParameter);
+  CHECK(e.kernel.update_tile_mappings(kPid, r, 0, 0x7777, 0, 1) == status::kInvalidHandle);
+  std::vector<uint8_t> a(kTileBytes), b(kTileBytes);
+  for (uint32_t i = 0; i < kTileBytes; ++i) a[i] = static_cast<uint8_t>(i % 251 + 1), b[i] = static_cast<uint8_t>(i % 241 + 2);
+  CHECK(e.write(p, ConstByteView(a.data(), a.size())) && e.write(q, ConstByteView(b.data(), b.size())));
+  LockResult lock;
+  CHECK(e.kernel.lock(kPid, r, kLockReadOnly, 0, &lock) == status::kSuccess && lock.data.size() == 3 * kTileBytes);
+  bool good = true;
+  for (uint32_t i = 0; i < kTileBytes && good; ++i) good = lock.data[i] == a[i] && lock.data[kTileBytes + i] == b[i] && lock.data[2 * kTileBytes + i] == 0;   // (what is mapped, and nowhere: zeros)
+  CHECK(good);
+  e.kernel.unlock(kPid, r);
+  // Writes through the reserved buffer reach the heap (and its placed allocations); those to an unmapped tile are dropped.
+  CHECK(e.kernel.lock(kPid, r, 0, 0, &lock) == status::kSuccess);
+  lock.data[kTileBytes + 100] = 0x5A;
+  lock.data[2 * kTileBytes + 7] = 0x77;
+  e.kernel.unlock(kPid, r);
+  CHECK(e.kernel.lock(kPid, q, kLockReadOnly, 0, &lock) == status::kSuccess && lock.data[100] == 0x5A);
+  e.kernel.unlock(kPid, q);
+  CHECK(e.kernel.lock(kPid, r, kLockReadOnly, 0, &lock) == status::kSuccess && lock.data[2 * kTileBytes + 7] == 0);
+  e.kernel.unlock(kPid, r);
+  // The other way: what is written to the heap through a placed allocation shows through the reserved one.
+  a[5] = 0xEE;
+  CHECK(e.write(p, ConstByteView(a.data(), a.size())));
+  CHECK(e.kernel.lock(kPid, r, kLockReadOnly, 0, &lock) == status::kSuccess && lock.data[5] == 0xEE);
+  e.kernel.unlock(kPid, r);
+  // The GPU reads it: a triangle written through the placed allocation is drawn from the reserved buffer.
+  Handle target = e.alloc(kTarget, Format::A8R8G8B8, 8, 8);
+  Handle pipe = make_colored_pipeline(e, false);
+  CHECK(write_triangle(e, p, 0, 0, 1));
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  CommandWriter w(e.allocator);
+  w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(floats(identity, 16));
+  w.draw(3);
+  w.end_pass();
+  CHECK(e.render(w, {target, r}) == status::kSuccess && e.pixel(target, 4, 4) == 0xFF0000FFu);
+  // Unmapped, the same draw gets zero vertices (nothing drawn).
+  CHECK(e.kernel.update_tile_mappings(kPid, r, 0, 0, 0, 1) == status::kSuccess);
+  CommandWriter w2(e.allocator);
+  w2.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+  w2.bind_pipeline(pipe);
+  w2.bind_vertex_buffer(1);
+  w2.push_constants(floats(identity, 16));
+  w2.draw(3);
+  w2.end_pass();
+  CHECK(e.render(w2, {target, r}) == status::kSuccess && e.pixel(target, 4, 4) == 0xFF000000u);
+}
+
 // Geometry shaders with adjacency input and instances.
 void test_geometry_extras() {
   HostAllocator allocator;
@@ -4347,6 +5719,48 @@ void test_geometry_extras() {
       D3d9Program::compile_dxbc(allocator, ConstByteView(flipped.data(), flipped.size()), &bad);
     }
   }
+}
+
+// Derivatives through the whole draw: the rasterizer hands each pixel the corners of its quad, so ddx_fine of a function of the interpolated coordinate is its slope per pixel.
+void test_derivative_draw() {
+  Env e;
+  namespace b = conformance_blobs;
+  Handle vs = 0, ps = 0, pipe = 0;
+  ShaderDesc sd;
+  sd.kind = ShaderKind::Dxbc, sd.stage = graphics::ShaderStage::Vertex, sd.code = ConstByteView(b::k_vs, sizeof b::k_vs);
+  CHECK(e.kernel.create_shader(kPid, e.dev, sd, &vs) == status::kSuccess);
+  sd.stage = graphics::ShaderStage::Fragment, sd.code = ConstByteView(b::k_dxil_ps_deriv_show, sizeof b::k_dxil_ps_deriv_show);
+  CHECK(e.kernel.create_shader(kPid, e.dev, sd, &ps) == status::kSuccess);
+  PipelineDesc pd;
+  pd.vertex_shader = vs, pd.fragment_shader = ps, pd.vertex_stride = 28, pd.attribute_count = 2, pd.varying_count = 3;
+  pd.attributes[0] = {0, graphics::VertexFormat::Float3, 0};
+  pd.attributes[1] = {1, graphics::VertexFormat::Float4, 12};
+  pd.cull_mode = graphics::CullMode::None;
+  CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &pipe) == status::kSuccess);
+  Handle target = e.alloc(kTarget, Format::A8R8G8B8, 32, 32), vb = e.buffer(kAllocVertexBuffer, 6 * 28);
+  const float corners[6][4] = {{-0.9f, -0.9f, 0, 0}, {0.9f, -0.9f, 1, 0}, {-0.9f, 0.9f, 0, 1}, {-0.9f, 0.9f, 0, 1}, {0.9f, -0.9f, 1, 0}, {0.9f, 0.9f, 1, 1}};
+  float v[42];
+  for (uint32_t i = 0; i < 6; ++i) {
+    const float* c = corners[i];
+    const float one[7] = {c[0], c[1], 0.5f, c[2] / 2, c[3] / 2, 1, 1};
+    for (uint32_t k = 0; k < 7; ++k) v[7 * i + k] = one[k];
+  }
+  CHECK(e.write(vb, floats(v, 42)));
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  CommandWriter w(e.allocator);
+  w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1.0f, 0);
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(floats(identity, 16));
+  w.draw(6);
+  w.end_pass();
+  { const NtStatus rs = e.render(w, {target, vb}); if (rs != status::kSuccess) printf("render status %x\n", static_cast<unsigned>(rs)); CHECK(rs == status::kSuccess); }
+  // (at the middle u = v = 0.5: d(u v / 4 + u u) / du = 1.125 per unit, 1 / 28.8 unit per pixel, times 8 and 255: about 80; the blue one is a function of v only)
+  const uint32_t pixel = e.pixel(target, 16, 16);
+  const uint32_t red = (pixel >> 16) & 0xFF, blue = pixel & 0xFF;
+  CHECK(red >= 70 && red <= 90 && blue == 0);
+  // (the same pair of pixels of a quad gets the same value: fine derivatives are per row)
+  CHECK(((e.pixel(target, 16, 16) >> 16) & 0xFF) == ((e.pixel(target, 17, 16) >> 16) & 0xFF));
 }
 
 // Alpha to coverage on the CPU renderer: a quad of whole pixels keeps round(alpha * 4) of the 4 samples, so the resolved red is that many quarters (a GPU dithers fractions from pixel to pixel,
@@ -4412,6 +5826,7 @@ void test_conformance() {
       case SceneVerdict::Refused: ++l.refused; printf("  conformance: %s refused at %s\n", r.name, r.step); break;
       case SceneVerdict::Broken: ++l.broken; printf("  conformance: %s broken at %s: %x\n", r.name, r.step, static_cast<unsigned>(r.status)); break;
     }
+    if (!(r.device_picture && r.reference_picture && !r.reference_failed)) printf("  conformance scene failed: %s (%s) %x dev=%d ref=%d rf=%d\n", r.name, r.step, static_cast<unsigned>(r.status), !!r.device_picture, !!r.reference_picture, !!r.reference_failed);
     CHECK(r.device_picture && r.reference_picture && !r.reference_failed);
     if (__builtin_strstr(r.name, "float render target")) {
       // Where the two triangles overlap the target holds 2.5 in red (x 0.4 = 1.0); a clamping target would hold 1.0 there (x 0.4 = 0.4). One triangle alone gives 1.5 (x 0.4 = 0.6).
@@ -4491,6 +5906,18 @@ void test_conformance() {
       // Thread 0 of group (0, 0): the neighbour's value is 1, the sum of the 64 slots (0 .. 63) 2016 (>> 3 is 252), the thread's own number 0. Thread 1 sees 2 and has 4 as its blue.
       auto px = [&](uint32_t x, uint32_t y) { return r.device_picture[y * 32 + x]; };
       CHECK(px(0, 0) == 0xFF01FC00u && px(1, 0) == 0xFF02FC04u && px(8, 0) == (0xFF000000u | (8u << 16) | (0x34u << 8)));
+    }
+    if (__builtin_strstr(r.name, "stream output of two streams")) {
+      // Squares at the three positions of stream 0 (the lower left and lower right and the top middle, +Y up as the shader had it), coloured by 0.5 * q + 0.5 of stream 1.
+      auto px = [&](uint32_t x, uint32_t y) { return r.device_picture[y * 32 + x] & 0xFFFFFF; };
+      auto near = [](uint32_t a, uint32_t b) {
+        for (uint32_t shift = 0; shift < 24; shift += 8) {
+          const int32_t d = static_cast<int32_t>((a >> shift) & 0xFF) - static_cast<int32_t>((b >> shift) & 0xFF);
+          if (d > 3 || d < -3) return false;
+        }
+        return true;
+      };
+      CHECK(near(px(8, 24), 0x7F00FF) && near(px(24, 24), 0xFF7FFF) && near(px(16, 8), 0x7FFFFF) && px(16, 24) == 0 && px(0, 0) == 0);
     }
     if (__builtin_strstr(r.name, "adjacency primitives")) {
       // The triangle (left) and the quad (right) both drawn.
@@ -5687,9 +7114,20 @@ int main() {
   test_sm3_and_sm51();
   test_ps1();
   test_device_suite();
+  test_stream_output();
+  test_stream_output_extras();
+  test_root_signature_parse();
+  test_d3d12_binding();
+  test_d3d12_compute();
+  test_d3d12_buffer_views();
+  test_d3d12_barriers();
+  test_d3d12_heaps();
+  test_d3d12_reserved();
+  test_dxil();
   test_compute_shared();
   test_geometry_extras();
   test_alpha_to_coverage();
+  test_derivative_draw();
   test_conformance();
   test_occlusion_queries();
   test_texture_kinds();

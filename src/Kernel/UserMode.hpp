@@ -58,6 +58,7 @@ struct UserThread {
   bool suspend_requested = false, terminate_requested = false;
   uint32_t terminate_code = 0;
   bool parked = false, redirected = false, context_dirty = false;
+  Frame* syscall_frame = nullptr;      // the registers of the system call it is in (where a wait that is asked to suspend parks)
   uint64_t stale_rip = 0, stale_address = 0;      // the last fault that was answered by rebuilding the page tables (see UserMode.cpp), to catch one that repeats
   uint32_t stale_count = 0;
   uint64_t core_mask = ~uint64_t{0};      // the cores it may run on (SetThreadAffinityMask)
@@ -113,6 +114,7 @@ struct Task final : process::IProcessRuntime {
   void request_suspend(uint64_t id) override;
   void request_resume(uint64_t id) override;
   bool is_parked(uint64_t id) override;
+  int park_point() override;
   bool get_context(uint64_t id, process::X86Context* out) override;
   bool set_context(uint64_t id, const process::X86Context& context) override;
   void request_terminate(uint64_t id, uint32_t code) override;

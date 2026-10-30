@@ -379,7 +379,8 @@ struct Rig {
   Surface* soft = nullptr;
   DeviceRenderer2D* dev = nullptr;
   ArrayView<uint32_t> frame;  // last read
-  bool exact_clips = true;    // rounded / mask clips and layers are exact (software renderer)
+  bool exact_clips = true;    // rounded / mask clips are exact (software renderer)
+  bool exact_layers = true;   // layers are isolated (the software renderer; the device renderer with offscreen groups)
 
   void read() {
     if (dev) {
@@ -653,6 +654,315 @@ static void test_scaled(Rig& g, TestAllocator& a) {
   release_view(a, img.pixels);
 }
 
+// draw_image_transformed: a move, a scale and a quarter turn land on the same pixels on both renderers.
+static void test_transformed(Rig& g, TestAllocator& a) {
+  IRenderer2D& r = *g.r;
+  Surface img = make_surface(a, 2, 2);
+  img.row(0)[0] = kRed; img.row(0)[1] = kGreen; img.row(1)[0] = kBlue; img.row(1)[1] = kWhite;
+  Matrix2D move;
+  move.e = 12;
+  move.f = 7;
+  g.reset();
+  CHECK(r.draw_image_transformed(img, {0, 0, 2, 2}, move, ImageFilter::Nearest));
+  g.read();
+  CHECK(g.at(12, 7) == kRed && g.at(13, 7) == kGreen && g.at(12, 8) == kBlue && g.at(13, 8) == kWhite && g.at(11, 7) == kBlack && g.at(14, 8) == kBlack && g.at(12, 9) == kBlack);
+  Matrix2D twice;
+  twice.a = twice.d = 2;
+  twice.e = 20;
+  twice.f = 20;
+  g.reset();
+  CHECK(r.draw_image_transformed(img, {0, 0, 2, 2}, twice, ImageFilter::Nearest));
+  g.read();
+  CHECK(g.at(20, 20) == kRed && g.at(21, 21) == kRed && g.at(22, 20) == kGreen && g.at(20, 22) == kBlue && g.at(23, 23) == kWhite && g.at(24, 20) == kBlack && g.at(19, 20) == kBlack);
+  Matrix2D turn;   // (x, y) -> (-y + 10, x): a quarter turn clockwise
+  turn.a = 0; turn.b = 1; turn.c = -1; turn.d = 0;
+  turn.e = 10;
+  g.reset();
+  CHECK(r.draw_image_transformed(img, {0, 0, 2, 2}, turn, ImageFilter::Nearest));
+  g.read();
+  CHECK(g.at(9, 0) == kRed && g.at(9, 1) == kGreen && g.at(8, 0) == kBlue && g.at(8, 1) == kWhite && g.at(10, 0) == kBlack && g.at(7, 0) == kBlack);
+  Matrix2D flat;   // not invertible: refused, nothing drawn
+  flat.a = 0;
+  g.reset();
+  CHECK(!r.draw_image_transformed(img, {0, 0, 2, 2}, flat, ImageFilter::Bilinear));
+  g.read();
+  CHECK(g.at(0, 0) == kBlack);
+  release_view(a, img.pixels);
+}
+
+// begin_group / end_group on the device renderer: what is drawn between them is moved as a picture; the CPU renderer says no.
+static void test_groups(Rig& g) {
+  IRenderer2D& r = *g.r;
+  g.reset();
+  CHECK(r.begin_group({0, 0, 32, 32}));
+  r.fill_rect({4, 4, 8, 4}, kRed);
+  r.fill_rect({0, 0, 64, 2}, kGreen);   // (clipped to the group's bounds)
+  Matrix2D move;
+  move.e = 20;
+  move.f = 10;
+  CHECK(r.end_group(move, 255, ImageFilter::Nearest));
+  g.read();
+  CHECK(g.at(24, 14) == kRed && g.at(31, 17) == kRed && g.at(32, 14) == kBlack && g.at(24, 18) == kBlack && g.at(4, 4) == kBlack);
+  CHECK(g.at(20, 10) == kGreen && g.at(51, 11) == kGreen && g.at(52, 10) == kBlack && g.at(20, 12) == kBlack);
+  // a quarter turn, at half opacity, over a background: overlapping shapes inside are one picture
+  g.reset();
+  r.fill_rect({0, 0, 64, 64}, kBlue);
+  CHECK(r.begin_group({0, 0, 16, 16}));
+  r.fill_rect({0, 0, 4, 2}, kWhite);
+  r.fill_rect({2, 0, 4, 2}, kWhite);
+  Matrix2D turn;   // (x, y) -> (-y + 40, x)
+  turn.a = 0; turn.b = 1; turn.c = -1; turn.d = 0;
+  turn.e = 40;
+  CHECK(r.end_group(turn, 128, ImageFilter::Nearest));
+  g.read();
+  CHECK(chan_near(g.at(39, 1), 0xFF8080FF, 2) && chan_near(g.at(39, 3), 0xFF8080FF, 2) && g.at(39, 7) == kBlue && g.at(37, 1) == kBlue);   // (not brighter where the two overlap)
+  // groups nest, and the clip in force at the start limits the result
+  g.reset();
+  r.push_clip_rect({0, 0, 30, 64});
+  CHECK(r.begin_group({0, 0, 64, 64}));
+  CHECK(r.begin_group({0, 0, 64, 64}));
+  r.fill_rect({10, 10, 40, 4}, kRed);
+  Matrix2D none;
+  CHECK(r.end_group(none, 255, ImageFilter::Nearest));
+  CHECK(r.end_group(none, 255, ImageFilter::Nearest));
+  r.pop_clip();
+  g.read();
+  CHECK(g.at(29, 11) == kRed && g.at(30, 11) == kBlack && g.at(9, 11) == kBlack);
+  CHECK(!r.end_group(none, 255, ImageFilter::Nearest));   // (no group open)
+}
+
+// The masks of rounded and mask clips are kept: the same clip again (even moved) is found made, a different one is made, and the picture is the same either way.
+static void test_mask_cache(Rig& g) {
+  IRenderer2D& r = *g.r;
+  DeviceRenderer2D& d = *g.dev;
+  auto rounded = [&](int32_t x, int32_t y, float radius) {
+    g.reset();
+    CHECK(r.push_clip_rounded_rect({x, y, 40, 40}, CornerRadii::uniform(radius)));
+    r.fill_rect({0, 0, 64, 64}, kWhite);
+    r.pop_clip();
+    g.read();
+  };
+  rounded(8, 8, 12);
+  const uint64_t hits0 = d.clip_mask_hits(), misses0 = d.clip_mask_misses();
+  uint32_t first[64 * 64];
+  for (uint32_t i = 0; i < 64 * 64; ++i) first[i] = g.frame[i];
+  rounded(8, 8, 12);
+  CHECK(d.clip_mask_hits() == hits0 + 1 && d.clip_mask_misses() == misses0);
+  uint32_t same = 0;
+  for (uint32_t i = 0; i < 64 * 64; ++i) same += first[i] == g.frame[i];
+  CHECK(same == 64 * 64);
+  rounded(10, 6, 12);   // (moved: the same mask)
+  CHECK(d.clip_mask_hits() == hits0 + 2 && d.clip_mask_misses() == misses0);
+  CHECK(g.at(10 + 20, 6 + 20) == kWhite && g.at(10, 6) == kBlack && g.at(10 + 39, 6 + 39) == kBlack);
+  rounded(8, 8, 6);   // (another radius)
+  CHECK(d.clip_mask_misses() == misses0 + 1 && g.at(8, 8) == kBlack);
+  // a mask clip
+  uint8_t m8[64], n8[64];
+  for (uint32_t i = 0; i < 64; ++i) {
+    m8[i] = (i % 8) < 4 ? 255 : 0;
+    n8[i] = (i % 8) < 2 ? 255 : 0;
+  }
+  const uint64_t mh = d.clip_mask_hits(), mm = d.clip_mask_misses();
+  for (int round = 0; round < 3; ++round) {
+    g.reset();
+    r.push_clip_mask(MaskView{ConstByteView(m8, 64), 8, 8, 8}, 20, 20);
+    r.fill_rect({0, 0, 64, 64}, kWhite);
+    r.pop_clip();
+    g.read();
+    CHECK(g.at(21, 21) == kWhite && g.at(25, 21) == kBlack);
+  }
+  CHECK(d.clip_mask_misses() == mm + 1 && d.clip_mask_hits() == mh + 2);
+  g.reset();
+  r.push_clip_mask(MaskView{ConstByteView(n8, 64), 8, 8, 8}, 20, 20);
+  r.fill_rect({0, 0, 64, 64}, kWhite);
+  r.pop_clip();
+  g.read();
+  CHECK(d.clip_mask_misses() == mm + 2 && g.at(21, 21) == kWhite && g.at(23, 21) == kBlack);
+  // many different clips push the oldest out; the first one still draws right afterwards (made again)
+  for (int i = 0; i < 40; ++i) rounded(2, 2, 3.1f + static_cast<float>(i) * 0.25f);
+  const uint64_t before = d.clip_mask_misses();
+  rounded(8, 8, 12);
+  CHECK(d.clip_mask_misses() == before + 1);
+  uint32_t same2 = 0;
+  for (uint32_t i = 0; i < 64 * 64; ++i) same2 += first[i] == g.frame[i];
+  CHECK(same2 == 64 * 64);
+  // clips nested deeper than a cache entry could be spared still draw
+  g.reset();
+  r.push_clip_rounded_rect({0, 0, 60, 60}, CornerRadii::uniform(20));
+  r.push_clip_rounded_rect({4, 4, 52, 52}, CornerRadii::uniform(16));
+  r.push_clip_rounded_rect({8, 8, 44, 44}, CornerRadii::uniform(12));
+  r.fill_rect({0, 0, 64, 64}, kWhite);
+  r.pop_clip();
+  r.pop_clip();
+  r.pop_clip();
+  g.read();
+  CHECK(g.at(30, 30) == kWhite && g.at(0, 0) == kBlack && g.at(8, 8) == kBlack);
+}
+
+// IImage::write_rect: only the rectangle changes, the rows come `pitch` apart, and anything that does not fit is refused.
+static void test_write_rect() {
+  TestAllocator a;
+  SoftwareDevice device(a, nullptr);
+  IImage* image = device.create_image({{16, 12}, Format::B8G8R8A8Unorm, kImageSampled});
+  CHECK(image != nullptr);
+  uint32_t all[16 * 12], out[16 * 12];
+  for (uint32_t& p : all) p = 0xFF112233;
+  CHECK(image->write_pixels(ArrayView<const uint32_t>(all, 16 * 12)));
+  uint32_t part[3 * 10];   // (a 4 x 3 rectangle in rows of 10)
+  for (uint32_t j = 0; j < 3; ++j)
+    for (uint32_t i = 0; i < 10; ++i) part[j * 10 + i] = 0xFF000000u | (j * 16 + i);
+  CHECK(image->write_rect({5, 6, 4, 3}, ArrayView<const uint32_t>(part, 3 * 10), 10));
+  CHECK(image->read_pixels(ArrayView<uint32_t>(out, 16 * 12)));
+  uint32_t wrong = 0;
+  for (uint32_t y = 0; y < 12; ++y)
+    for (uint32_t x = 0; x < 16; ++x) {
+      const bool inside = x >= 5 && x < 9 && y >= 6 && y < 9;
+      const uint32_t expect = inside ? part[(y - 6) * 10 + (x - 5)] : 0xFF112233u;
+      wrong += out[y * 16 + x] != expect;
+    }
+  CHECK(wrong == 0);
+  // a rectangle that is not wholly inside, an empty one, a pitch narrower than the rectangle, too few pixels
+  CHECK(!image->write_rect({14, 0, 4, 2}, ArrayView<const uint32_t>(part, 30), 10));
+  CHECK(!image->write_rect({-1, 0, 2, 2}, ArrayView<const uint32_t>(part, 30), 10));
+  CHECK(!image->write_rect({0, 10, 2, 3}, ArrayView<const uint32_t>(part, 30), 10));
+  CHECK(!image->write_rect({0, 0, 0, 2}, ArrayView<const uint32_t>(part, 30), 10));
+  CHECK(!image->write_rect({0, 0, 4, 2}, ArrayView<const uint32_t>(part, 30), 3));
+  CHECK(!image->write_rect({0, 0, 4, 3}, ArrayView<const uint32_t>(part, 20), 10));
+  CHECK(image->write_rect({0, 0, 4, 3}, ArrayView<const uint32_t>(part, 24), 10));   // (the last row needs only its 4 pixels: 2 * 10 + 4)
+  device.destroy_image(image);
+  CHECK(a.live == 0);
+}
+
+// draw_glyph: the device renderer keeps glyphs on an atlas and tints them with the GPU; the picture is the CPU renderer's (to rounding), a glyph drawn again is not made again, and
+// glyphs mix in order with other shapes, in layers and under clips.
+static void test_glyphs() {
+  TestAllocator a;
+  SoftwareDevice device(a, nullptr);
+  DeviceRenderer2D d(device, a, {kW, kH});
+  CHECK(d.valid() && d.has_glyph_atlas());
+  Surface cs = make_surface(a, kW, kH);
+  SoftwareRenderer2D cpu(cs, nullptr, &a);
+  ArrayView<uint32_t> frame = allocate_view<uint32_t>(a, kW * kH);
+  uint8_t cov_a[10 * 12], cov_b[7 * 9];
+  for (uint32_t i = 0; i < sizeof cov_a; ++i) cov_a[i] = static_cast<uint8_t>((i * 37) % 256);
+  for (uint32_t i = 0; i < sizeof cov_b; ++i) cov_b[i] = static_cast<uint8_t>(i % 5 == 0 ? 255 : (i * 11) % 200);
+  const MaskView ma{ConstByteView(cov_a, sizeof cov_a), 10, 12, 10}, mb{ConstByteView(cov_b, sizeof cov_b), 7, 9, 7};
+  auto scene = [&](IRenderer2D& r) {
+    r.reset_clip();
+    r.clear(0xFF204060);
+    r.fill_rect({0, 0, 30, 20}, 0xFF804020);   // (colored shapes before, between and after the glyphs)
+    r.draw_glyph(1001, ma, 4, 4, 0xFFFFFFFF);
+    r.fill_rect({10, 2, 6, 6}, 0xC000FF00);
+    r.draw_glyph(1002, mb, 20, 6, 0xFFFFEE00);
+    r.draw_glyph(1001, ma, 40, 30, 0xA0FF0000);   // (the same glyph again, translucent, in another colour)
+    r.set_clip({0, 40, 64, 24});
+    r.draw_glyph(1002, mb, 58, 44, 0xFF00FFFF);   // (partly outside the clip)
+    r.reset_clip();
+    r.draw_glyph(1001, ma, -4, 50, 0xFF88FF88);   // (partly outside the target)
+    r.draw_glyph(1003, ma, 30, 50, 0x00FFFFFF);   // (transparent: nothing)
+  };
+  scene(d);
+  scene(cpu);
+  CHECK(d.read_pixels(frame));
+  uint32_t far = 0;
+  for (uint32_t y = 0; y < kH; ++y)
+    for (uint32_t x = 0; x < kW; ++x) far += !chan_near(frame[y * kW + x], px(cs, x, y), 3);
+  CHECK(far == 0);
+  CHECK(d.glyphs_made() == 2);   // (1001 and 1002; 1003 was never wanted on the screen)
+  scene(d);   // a second frame: nothing is made again
+  CHECK(d.read_pixels(frame));
+  CHECK(d.glyphs_made() == 2);
+  far = 0;
+  for (uint32_t y = 0; y < kH; ++y)
+    for (uint32_t x = 0; x < kW; ++x) far += !chan_near(frame[y * kW + x], px(cs, x, y), 3);
+  CHECK(far == 0);
+  // a new glyph on a busy atlas sends just its own rectangle, not the whole atlas
+  {
+    const uint64_t sent = d.atlas_pixels_sent();
+    d.draw_glyph(2001, mb, 0, 0, 0xFFFFFFFF);
+    CHECK(d.read_pixels(frame));
+    CHECK(d.atlas_pixels_sent() == sent + 7 * 9);
+    d.draw_glyph(2001, mb, 10, 0, 0xFFFFFFFF);   // (again: nothing more is sent)
+    d.draw_glyph(2002, ma, 20, 0, 0xFFFFFFFF);   // (two new ones: the rectangle that holds both, which is small too)
+    d.draw_glyph(2003, mb, 30, 0, 0xFFFFFFFF);
+    CHECK(d.read_pixels(frame));
+    CHECK(d.atlas_pixels_sent() > sent + 7 * 9 && d.atlas_pixels_sent() < sent + 7 * 9 + 1000);
+  }
+  // inside a layer (an offscreen group): the glyph is laid over as part of the picture
+  d.clear(0xFF000000);
+  cpu.clear(0xFF000000);
+  for (IRenderer2D* r : {static_cast<IRenderer2D*>(&d), static_cast<IRenderer2D*>(&cpu)}) {
+    r->push_layer({0, 0, 64, 64}, 128);
+    r->draw_glyph(1001, ma, 10, 10, 0xFFFFFFFF);
+    r->draw_glyph(1002, mb, 14, 12, 0xFFFFFFFF);   // (overlapping: one picture)
+    r->pop_layer();
+  }
+  CHECK(d.read_pixels(frame));
+  far = 0;
+  for (uint32_t y = 0; y < kH; ++y)
+    for (uint32_t x = 0; x < kW; ++x) far += !chan_near(frame[y * kW + x], px(cs, x, y), 3);
+  CHECK(far == 0);
+  // many glyphs: the atlas fills up and starts again, and every glyph still comes out right
+  d.clear(0xFF000000);
+  cpu.clear(0xFF000000);
+  for (uint32_t i = 0; i < 3400; ++i) {
+    uint8_t cov[16 * 16];
+    for (uint32_t k = 0; k < sizeof cov; ++k) cov[k] = static_cast<uint8_t>((k * 7 + i * 13) % 251);
+    const MaskView m{ConstByteView(cov, sizeof cov), 16, 16, 16};
+    const int32_t gx = static_cast<int32_t>(i % 4) * 16, gy = static_cast<int32_t>((i / 4) % 4) * 16;
+    d.draw_glyph(5000 + i, m, gx, gy, 0xFFFFFFFF);
+    cpu.draw_mask(m, {0, 0, 16, 16}, gx, gy, 0xFFFFFFFF);
+    if (i % 1100 == 0 || i == 3399) {   // (look at the picture now and then: the later glyphs cover the earlier ones)
+      CHECK(d.read_pixels(frame));
+      far = 0;
+      for (uint32_t y = 0; y < kH; ++y)
+        for (uint32_t x = 0; x < kW; ++x) far += !chan_near(frame[y * kW + x], px(cs, x, y), 3);
+      CHECK(far == 0);
+    }
+  }
+  release_view(a, frame);
+  release_view(a, cs.pixels);
+}
+
+// draw_image_tiled on the device renderer: a texture the sampler repeats; the CPU renderer says no.
+static void test_tiled(Rig& g, TestAllocator& a) {
+  IRenderer2D& r = *g.r;
+  Surface tile = make_surface(a, 3, 2);
+  const uint32_t colors[6] = {kRed, kGreen, kBlue, kWhite, 0xFFFFFF00, 0xFF00FFFF};
+  for (uint32_t i = 0; i < 6; ++i) tile.pixels[i] = colors[i];
+  // cells of the tile's own size: pixel (x, y) shows tile pixel ((x - 5) mod 3, (y - 4) mod 2), inside the area only
+  g.reset();
+  CHECK(r.draw_image_tiled(tile, 5, 4, 3, 2, {2, 3, 20, 9}));
+  g.read();
+  uint32_t wrong = 0;
+  for (int32_t y = 0; y < 64; ++y)
+    for (int32_t x = 0; x < 64; ++x) {
+      const bool inside = x >= 2 && x < 22 && y >= 3 && y < 12;
+      const int32_t tx = ((x - 5) % 3 + 3) % 3, ty = ((y - 4) % 2 + 2) % 2;
+      wrong += g.at(x, y) != (inside ? colors[ty * 3 + tx] : kBlack);
+    }
+  CHECK(wrong == 0);
+  // cells twice as big: each texel is 2 x 2 pixels
+  g.reset();
+  CHECK(r.draw_image_tiled(tile, 0, 0, 6, 4, {0, 0, 24, 8}));
+  g.read();
+  wrong = 0;
+  for (int32_t y = 0; y < 8; ++y)
+    for (int32_t x = 0; x < 24; ++x) wrong += g.at(x, y) != colors[((y % 4) / 2) * 3 + ((x % 6) / 2)];
+  CHECK(wrong == 0);
+  // translucent texels blend over what is there; a clip limits the area; an empty area draws nothing
+  tile.pixels[0] = 0x80FF0000;
+  g.reset();
+  r.fill_rect({0, 0, 64, 64}, kBlue);
+  r.push_clip_rect({4, 4, 6, 4});
+  CHECK(r.draw_image_tiled(tile, 4, 4, 3, 2, {0, 0, 64, 64}));
+  r.pop_clip();
+  CHECK(r.draw_image_tiled(tile, 0, 0, 3, 2, {10, 10, 0, 5}));
+  g.read();
+  CHECK(chan_near(g.at(4, 4), blend_over(0x80FF0000, kBlue), 1) && g.at(5, 4) == kGreen && g.at(3, 4) == kBlue && g.at(10, 4) == kBlue && g.at(4, 8) == kBlue);
+  release_view(a, tile.pixels);
+}
+
 static void test_gradients(Rig& g) {
   IRenderer2D& r = *g.r;
   const GradientStop rb[2] = {{0, kRed}, {1, kBlue}};
@@ -851,13 +1161,13 @@ static void test_clip_stack(Rig& g, TestAllocator& a) {
 static void test_layers(Rig& g) {
   IRenderer2D& r = *g.r;
   g.reset();
-  CHECK(r.push_layer({10, 10, 30, 30}, 128) == g.exact_clips);
+  CHECK(r.push_layer({10, 10, 30, 30}, 128) == g.exact_layers);
   r.fill_rect({0, 0, 64, 64}, kRed);  // clipped to the layer bounds
   r.pop_layer();
   g.read();
   CHECK(chan_near(g.at(10, 10), 0xFF800000, 1) && chan_near(g.at(39, 39), 0xFF800000, 1));
-  if (g.exact_clips) CHECK(g.at(9, 10) == kBlack && g.at(40, 40) == kBlack);
-  if (!g.exact_clips) {
+  if (g.exact_layers) CHECK(g.at(9, 10) == kBlack && g.at(40, 40) == kBlack);
+  if (!g.exact_layers) {
     // (the device renderer cannot clip to the bounds; it only applies the opacity)
   }
   // Group opacity: overlapping shapes in a layer composite as one.
@@ -868,7 +1178,7 @@ static void test_layers(Rig& g) {
   r.pop_layer();
   g.read();
   CHECK(chan_near(g.at(12, 12), 0xFF808080, 1));
-  if (g.exact_clips) CHECK(chan_near(g.at(25, 25), 0xFF808080, 1));  // not 192
+  if (g.exact_layers) CHECK(chan_near(g.at(25, 25), 0xFF808080, 1));  // not 192
   else CHECK(red_of(g.at(25, 25)) >= 128);
   // Opacity 255 is exact, opacity 0 shows nothing.
   g.reset();
@@ -919,7 +1229,7 @@ static void test_layers(Rig& g) {
   r.fill_rect({0, 0, 4, 4}, kWhite);
   g.read();
   CHECK(g.at(1, 1) == kWhite);
-  if (g.exact_clips) CHECK(g.at(30, 30) == kBlack);
+  if (g.exact_layers) CHECK(g.at(30, 30) == kBlack);
   // More layers than the stack holds still balance.
   g.reset();
   for (uint32_t i = 0; i < kMaxLayerDepth + 3; ++i) r.push_layer({0, 0, 64, 64}, 255);
@@ -1033,6 +1343,7 @@ static void test_primitives() {
     test_rounded(g);
     test_mask(g);
     test_scaled(g, a);
+    test_transformed(g, a);
     test_gradients(g);
     test_clip_stack(g, a);
     test_layers(g);
@@ -1073,10 +1384,14 @@ static void test_primitives() {
     g.r = &d;
     g.dev = &d;
     g.frame = allocate_view<uint32_t>(a, kW * kH);
-    g.exact_clips = false;
+    g.exact_clips = true;   // (rounded and mask clips go through offscreen groups)
     test_rounded(g);
     test_mask(g);
     test_scaled(g, a);
+    test_transformed(g, a);
+    test_groups(g);
+    test_tiled(g, a);
+    test_mask_cache(g);
     test_gradients(g);
     test_clip_stack(g, a);
     test_layers(g);
@@ -1710,6 +2025,8 @@ int main() {
   test_fast_paths();
   test_primitives();
   test_renderers_agree();
+  test_write_rect();
+  test_glyphs();
   if (g_failed) { printf("%d checks failed\n", g_failed); return 1; }
   printf("graphics: all checks passed\n");
   return 0;

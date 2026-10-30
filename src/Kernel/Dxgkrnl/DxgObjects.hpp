@@ -19,6 +19,7 @@
 // The kernel objects a process holds handles to, besides allocations (VidMm.hpp): synchronization objects, shaders and pipelines, devices and contexts, and the
 // submissions that wait in a context's queue.
 #pragma once
+#include "Kernel/Dxgkrnl/D3d12.hpp"
 #include "Kernel/Dxgkrnl/D3d9Shader.hpp"
 #include "Kernel/Dxgkrnl/DxgTypes.hpp"
 #include "Kernel/Dxgkrnl/VidMm.hpp"
@@ -67,6 +68,7 @@ class ShaderObject {
   graphics::ShaderStage stage() const { return stage_; }
   graphics::IShaderModule* module() const { return module_; }
   graphics::GeometryPrimitive geometry_input() const { return geometry_input_; }
+  uint32_t geometry_streams() const { return geometry_streams_; }
   uint32_t tess_input_points() const { return tess_input_points_; }
   uint32_t tess_output_points() const { return tess_output_points_; }
   graphics::TessDomain tess_domain() const { return tess_domain_; }
@@ -84,6 +86,7 @@ class ShaderObject {
   uint32_t thread_group_[3] = {1, 1, 1};     // a compute shader's thread group
   uint32_t storage_mask_ = 0;                // ... and the storage buffer slots it uses (bit n: u<n>)
   graphics::GeometryPrimitive geometry_input_ = graphics::GeometryPrimitive::Triangle;   // a geometry shader's input
+  uint32_t geometry_streams_ = 1;                          // ... and how many output streams it has
   uint32_t tess_input_points_ = 0, tess_output_points_ = 0;   // a hull or domain shader's control points
   graphics::TessDomain tess_domain_ = graphics::TessDomain::Triangle;   // ... and the domain it tessellates
   D3d9Binding d3d9_;              // Direct3D 9 bytecode being interpreted (the module's function finds the program through it)
@@ -113,6 +116,9 @@ class PipelineObject {
   uint32_t thread_group(uint32_t axis) const { return axis < 3 ? thread_group_[axis] : 1; }
   uint32_t storage_mask() const { return storage_mask_; }
   bool has_per_instance() const { return per_instance_; }
+  // Stream output: which buffers (bit n: buffer n) the pipeline's declaration writes to, and whether it has one.
+  uint32_t stream_output_buffers() const { return stream_output_buffers_; }
+  bool has_stream_output() const { return stream_output_buffers_ != 0; }
   // The kind of texture the pixel shader declared for a unit (2D when it does not say: only a DXBC program does).
   graphics::TextureKind texture_kind(uint32_t unit) const { return unit < graphics::kMaxTextureUnits ? texture_kinds_[unit] : graphics::TextureKind::Texture2D; }
 
@@ -121,6 +127,7 @@ class PipelineObject {
   graphics::IGraphicsDevice& device_;
   graphics::IPipeline* pipeline_ = nullptr;
   bool per_instance_ = false;
+  uint32_t stream_output_buffers_ = 0;
   bool compute_ = false;
   bool blends_ = false;
   SharedPointer<ShaderObject> geometry_, hull_, domain_;
@@ -147,12 +154,14 @@ class DeviceObject {
 enum class SubmissionKind : uint8_t { Render, Signal, Wait, Present };
 
 struct Submission {
-  explicit Submission(allocators::IAllocator& allocator) : commands(allocator), allocations(allocator), pipelines(allocator) {}
+  explicit Submission(allocators::IAllocator& allocator) : commands(allocator), allocations(allocator), pipelines(allocator), signatures(allocator), heaps(allocator) {}
   SubmissionKind kind = SubmissionKind::Render;
   // Render: a copy of the command stream (what the process wrote afterwards does not matter), the allocation list and the pipelines it binds, in the order it binds them.
   ByteBuffer commands;
   List<SharedPointer<Allocation>> allocations;
   List<SharedPointer<PipelineObject>> pipelines;
+  List<SharedPointer<RootSignatureObject>> signatures;   // (Direct3D 12: the root signatures and descriptor heaps it sets, in order)
+  List<SharedPointer<DescriptorHeapObject>> heaps;
   // Signal / Wait
   SharedPointer<SyncObject> sync;
   uint64_t value = 0;
@@ -175,6 +184,8 @@ class ContextObject {
 class IPipelineLookup {
  public:
   virtual SharedPointer<PipelineObject> find_pipeline(Handle handle) = 0;
+  virtual SharedPointer<RootSignatureObject> find_root_signature(Handle handle) = 0;
+  virtual SharedPointer<DescriptorHeapObject> find_descriptor_heap(Handle handle) = 0;
 
  protected:
   IPipelineLookup() = default;

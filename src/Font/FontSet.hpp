@@ -111,6 +111,8 @@ class FontSet {
   static constexpr uint32_t kMaxInstances = 2048;
 
   explicit FontSet(allocators::IAllocator& allocator, GlyphCacheLimits cache_limits = GlyphCacheLimits());
+  // A number no other FontSet of this run has had (face numbers mean something only within one FontSet): to tell their glyphs apart where they are kept together.
+  uint64_t serial() const { return serial_; }
   FontSet(const FontSet&) = delete;
   FontSet& operator=(const FontSet&) = delete;
 
@@ -204,6 +206,7 @@ class FontSet {
   Dictionary<uint64_t, uint32_t> instance_index_;
   GlyphCache cache_;
   Instance fallback_;  // plain sans-serif: the handle of a request that could not get an instance of its own
+  uint64_t serial_ = 0;
   uint32_t generation_ = 0;
   uint64_t web_font_bytes_ = 0;
   bool bundled_added_ = false;

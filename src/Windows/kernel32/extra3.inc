@@ -735,7 +735,9 @@ typedef struct { DWORD dwSize, th32ModuleID, th32ProcessID, GlblcntUsage, Proccn
 typedef struct { DWORD dwSize, th32ModuleID, th32ProcessID, GlblcntUsage, ProccntUsage; BYTE *modBaseAddr; DWORD modBaseSize; HMODULE hModule; CHAR szModule[256]; CHAR szExePath[260]; } MODULEENTRY32A_;
 typedef struct { SIZE_T dwSize; DWORD th32ProcessID; ULONG_PTR th32HeapID; DWORD dwFlags; } HEAPLIST32_;
 typedef struct { SIZE_T dwSize; HANDLE hHandle; ULONG_PTR dwAddress; SIZE_T dwBlockSize; DWORD dwFlags, dwLockCount, dwResvd, th32ProcessID; ULONG_PTR th32HeapID; } HEAPENTRY32_;
-typedef struct { ULONG_PTR lpData; DWORD cbData; BYTE cbOverhead, iRegionIndex; WORD wFlags; ULONGLONG region[3]; } HEAPWALK_;
+typedef struct { PVOID lpData; SIZE_T cbData; BYTE cbOverhead, iRegionIndex; WORD wFlags; DWORD pad; BYTE u[24]; } RTL_WALK_ENTRY_;      /* (what RtlWalkHeap fills) */
+typedef struct { PVOID lpData; DWORD cbData; BYTE cbOverhead, iRegionIndex; WORD wFlags; BYTE u[24]; } PROCESS_HEAP_ENTRY_;
+typedef RTL_WALK_ENTRY_ HEAPWALK_;
 #define TH32CS_SNAPHEAPLIST_ 1
 #define TH32CS_SNAPPROCESS_ 2
 #define TH32CS_SNAPTHREAD_ 4
@@ -996,11 +998,13 @@ static BOOL heap_entry_step(HEAPENTRY32_ *e, DWORD pid, ULONG_PTR heap_id, BOOL 
   if (pid != 0 && pid != GetCurrentProcessId()) { set_error(299); return FALSE; }
   HEAPWALK_ w;
   memset(&w, 0, sizeof(w));
-  if (!first) { w.lpData = e->dwAddress; w.iRegionIndex = (BYTE)e->dwResvd; }
-  if (!NT_SUCCESS(RtlWalkHeap((PVOID)heap_id, &w))) { set_error(ERROR_NO_MORE_FILES); return FALSE; }
-  e->hHandle = (HANDLE)w.lpData; e->dwAddress = w.lpData; e->dwBlockSize = w.cbData;
-  e->dwFlags = (w.wFlags & 4) ? 1 /* LF32_FIXED */ : 2 /* LF32_FREE */;
-  e->dwLockCount = 0; e->dwResvd = w.iRegionIndex; e->th32ProcessID = GetCurrentProcessId(); e->th32HeapID = heap_id;
+  if (!first) { w.lpData = (PVOID)e->dwAddress; w.iRegionIndex = (BYTE)(e->dwResvd & 0xFF); w.wFlags = (WORD)(e->dwResvd >> 8); }
+  do {      /* the blocks only: regions and uncommitted parts are skipped */
+    if (!NT_SUCCESS(RtlWalkHeap((PVOID)heap_id, &w))) { set_error(ERROR_NO_MORE_FILES); return FALSE; }
+  } while (w.wFlags & 0x1002);
+  e->hHandle = (HANDLE)w.lpData; e->dwAddress = (ULONG_PTR)w.lpData; e->dwBlockSize = (SIZE_T)w.cbData;
+  e->dwFlags = (w.wFlags & 1) ? 1 /* LF32_FIXED */ : 2 /* LF32_FREE */;
+  e->dwLockCount = 0; e->dwResvd = (DWORD)(w.iRegionIndex | ((DWORD)w.wFlags << 8)); e->th32ProcessID = GetCurrentProcessId(); e->th32HeapID = heap_id;
   return TRUE;
 }
 EXPORT BOOL WINAPI Heap32First(HEAPENTRY32_ *e, DWORD pid, ULONG_PTR heap_id) { return heap_entry_step(e, pid, heap_id, TRUE); }
@@ -1009,13 +1013,45 @@ EXPORT BOOL WINAPI Toolhelp32ReadProcessMemory(DWORD pid, LPCVOID base, LPVOID b
   if (pid != 0 && pid != GetCurrentProcessId()) { set_error(ERROR_ACCESS_DENIED); return FALSE; }
   return ReadProcessMemory(GetCurrentProcess(), base, buffer, size, done);
 }
-/* HeapWalk over the same walker (HeapLock and HeapUnlock are no-ops here: one lock covers the heaps). */
-EXPORT BOOL WINAPI HeapWalk(HANDLE h, HEAPWALK_ *entry) {
+/* HeapWalk over the same walker: the entry of RtlWalkHeap becomes a PROCESS_HEAP_ENTRY (the sizes shrink to 32 bits, the flags are the Win32 ones). */
+EXPORT BOOL WINAPI HeapWalk(HANDLE h, PROCESS_HEAP_ENTRY_ *entry) {
   if (!entry) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
-  const NTSTATUS s = RtlWalkHeap(h, entry);
-  if (s == 0) return TRUE;
-  set_error(s == (NTSTATUS)0x8000001A ? 259 /* ERROR_NO_MORE_ITEMS */ : ERROR_INVALID_HANDLE);
-  return FALSE;
+  RTL_WALK_ENTRY_ rtl;
+  memset(&rtl, 0, sizeof(rtl));
+  rtl.lpData = entry->lpData;
+  rtl.cbData = entry->cbData;
+  rtl.cbOverhead = entry->cbOverhead;
+  rtl.iRegionIndex = entry->iRegionIndex;
+  if (entry->lpData) { rtl.wFlags = entry->wFlags & 1 ? 2 : entry->wFlags & 2 ? 0x1000 : entry->wFlags & 4 ? 0x4011 : 0; }
+  const NTSTATUS s = RtlWalkHeap(h, &rtl);
+  if (s != 0) { set_error(s == (NTSTATUS)0x8000001A ? 259 /* ERROR_NO_MORE_ITEMS */ : ERROR_INVALID_HANDLE); return FALSE; }
+  entry->lpData = rtl.lpData;
+  entry->cbData = (DWORD)rtl.cbData;
+  entry->cbOverhead = rtl.cbOverhead;
+  entry->iRegionIndex = rtl.iRegionIndex;
+  entry->wFlags = (rtl.wFlags & 0x2) ? 1 /* PROCESS_HEAP_REGION */ : (rtl.wFlags & 0x1000) ? 2 /* PROCESS_HEAP_UNCOMMITTED_RANGE */ : (rtl.wFlags & 1) ? 4 /* PROCESS_HEAP_ENTRY_BUSY */ : 0;
+  memcpy(&entry->u, &rtl.u, sizeof(entry->u));
+  return TRUE;
+}
+
+typedef struct { DWORD cb; SIZE_T cbAllocated, cbCommitted, cbReserved, cbMaxReserve; } HEAP_SUMMARY_;
+EXPORT BOOL WINAPI HeapSummary(HANDLE h, DWORD flags, HEAP_SUMMARY_ *summary) {
+  (void)flags;
+  if (!summary || summary->cb != sizeof(*summary)) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  RTL_WALK_ENTRY_ w;
+  memset(&w, 0, sizeof(w));
+  SIZE_T allocated = 0, committed = 0, reserved = 0;
+  NTSTATUS status;
+  while ((status = RtlWalkHeap(h, &w)) == 0) {
+    if (w.wFlags & 2) { committed += *(DWORD *)&w.u[0]; reserved += (SIZE_T)*(DWORD *)&w.u[0] + *(DWORD *)&w.u[4]; }      /* a region */
+    else if (w.wFlags & 1) { allocated += w.cbData; if (w.iRegionIndex == 64) { committed += (w.cbData + 0x40 + 0xFFF) & ~(SIZE_T)0xFFF; reserved += (w.cbData + 0x40 + 0xFFF) & ~(SIZE_T)0xFFF; } }
+  }
+  if (status != (NTSTATUS)0x8000001A) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
+  summary->cbAllocated = allocated;
+  summary->cbCommitted = committed;
+  summary->cbReserved = reserved;
+  summary->cbMaxReserve = reserved;
+  return TRUE;
 }
 
 EXPORT BOOL WINAPI K32EnumProcesses(DWORD *ids, DWORD size, DWORD *needed) {
@@ -1196,26 +1232,110 @@ EXPORT BOOL WINAPI SetInformationJobObject(HANDLE job, int info_class, LPVOID in
   return NT_SUCCESS(s) ? TRUE : fail_nt(s);
 }
 
-/* Debugging another program is not possible: a program cannot attach to itself, and with nothing attached there are no events. As on Windows, the first failed attach
- * leaves a debug object behind, which makes WaitForDebugEvent time out instead of failing on the handle. */
-static int g_debug_object_made;
+/* ---- debugging ----------------------------------------------------------------------------------------------------------------------------------------------- */
+
+/* The DEBUG_EVENT of the debugger API, made from the DBGUI_WAIT_STATE_CHANGE the kernel gives (see src/Process/WindowsDebug.hpp). */
+typedef struct {
+  DWORD dwDebugEventCode, dwProcessId, dwThreadId, pad;
+  union {
+    struct { EXCEPTION_RECORD ExceptionRecord; DWORD dwFirstChance; } Exception;
+    struct { HANDLE hThread; LPVOID lpThreadLocalBase; LPVOID lpStartAddress; } CreateThread;
+    struct { HANDLE hFile, hProcess, hThread; LPVOID lpBaseOfImage; DWORD dwDebugInfoFileOffset, nDebugInfoSize; LPVOID lpThreadLocalBase, lpStartAddress, lpImageName; WORD fUnicode; } CreateProcessInfo;
+    struct { DWORD dwExitCode; } ExitThread;
+    struct { DWORD dwExitCode; } ExitProcess;
+    struct { HANDLE hFile; LPVOID lpBaseOfDll; DWORD dwDebugInfoFileOffset, nDebugInfoSize; LPVOID lpImageName; WORD fUnicode; } LoadDll;
+    struct { LPVOID lpBaseOfDll; } UnloadDll;
+    struct { LPSTR lpDebugStringData; WORD fUnicode, nDebugStringLength; } DebugString;
+    BYTE bytes[0xA0];
+  } u;
+} TCOS_DEBUG_EVENT;   /* (0xB0 bytes, as DEBUG_EVENT) */
+
+static BOOL wait_debug_event(TCOS_DEBUG_EVENT *event, DWORD milliseconds) {
+  HANDLE object = DbgUiGetThreadDebugObject();
+  if (!object) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
+  BYTE state[0xC0];
+  LARGE_INTEGER timeout;
+  timeout.QuadPart = -(LONGLONG)milliseconds * 10000;
+  NTSTATUS status;
+  do status = NtWaitForDebugEvent(object, FALSE, milliseconds == INFINITE ? NULL : &timeout, state); while (status == STATUS_USER_APC);
+  if (status == (NTSTATUS)0x102) { set_error(121 /* ERROR_SEM_TIMEOUT */); return FALSE; }
+  if (!NT_SUCCESS(status)) return fail_nt(status);
+  memset(event, 0, sizeof(*event));
+  event->dwProcessId = (DWORD)*(ULONG64 *)(state + 8);
+  event->dwThreadId = (DWORD)*(ULONG64 *)(state + 16);
+  switch (*(DWORD *)state) {
+    case 2:      /* DbgCreateThread */
+      event->dwDebugEventCode = 2;
+      event->u.CreateThread.hThread = *(HANDLE *)(state + 0x18);
+      event->u.CreateThread.lpStartAddress = *(LPVOID *)(state + 0x28);
+      break;
+    case 3:      /* DbgCreateProcess */
+      event->dwDebugEventCode = 3;
+      event->u.CreateProcessInfo.hProcess = *(HANDLE *)(state + 0x18);
+      event->u.CreateProcessInfo.hThread = *(HANDLE *)(state + 0x20);
+      event->u.CreateProcessInfo.lpBaseOfImage = *(LPVOID *)(state + 0x38);
+      event->u.CreateProcessInfo.lpStartAddress = *(LPVOID *)(state + 0x50);
+      break;
+    case 4: event->dwDebugEventCode = 4; event->u.ExitThread.dwExitCode = *(DWORD *)(state + 0x18); break;
+    case 5: event->dwDebugEventCode = 5; event->u.ExitProcess.dwExitCode = *(DWORD *)(state + 0x18); break;
+    case 6: {      /* DbgException */
+      EXCEPTION_RECORD *record = (EXCEPTION_RECORD *)(state + 0x18);
+      if (record->ExceptionCode == 0x40010006u && record->NumberParameters >= 2) {      /* DBG_PRINTEXCEPTION_C: OutputDebugString */
+        event->dwDebugEventCode = 8;
+        event->u.DebugString.lpDebugStringData = (LPSTR)record->ExceptionInformation[1];
+        event->u.DebugString.nDebugStringLength = (WORD)record->ExceptionInformation[0];
+      } else {
+        event->dwDebugEventCode = 1;
+        event->u.Exception.ExceptionRecord = *record;
+        event->u.Exception.dwFirstChance = *(DWORD *)(state + 0xB0);
+      }
+      break;
+    }
+    case 9: event->dwDebugEventCode = 6; event->u.LoadDll.lpBaseOfDll = *(LPVOID *)(state + 0x20); break;
+    case 10: event->dwDebugEventCode = 7; event->u.UnloadDll.lpBaseOfDll = *(LPVOID *)(state + 0x18); break;
+    default: event->dwDebugEventCode = 0xFFFFFFFFu; break;
+  }
+  return TRUE;
+}
+EXPORT BOOL WINAPI WaitForDebugEvent(LPVOID event, DWORD milliseconds) { return wait_debug_event((TCOS_DEBUG_EVENT *)event, milliseconds); }
+EXPORT BOOL WINAPI WaitForDebugEventEx(LPVOID event, DWORD milliseconds) { return wait_debug_event((TCOS_DEBUG_EVENT *)event, milliseconds); }
+EXPORT BOOL WINAPI ContinueDebugEvent(DWORD process_id, DWORD thread_id, DWORD status) {
+  HANDLE object = DbgUiGetThreadDebugObject();
+  if (!object) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
+  ULONG64 id[2] = {process_id, thread_id};
+  const NTSTATUS result = NtDebugContinue(object, id, (NTSTATUS)status);
+  return NT_SUCCESS(result) ? TRUE : fail_nt(result);
+}
 EXPORT BOOL WINAPI DebugActiveProcess(DWORD id) {
-  (void)id;
-  g_debug_object_made = 1;
-  SetLastError(ERROR_ACCESS_DENIED);
-  return FALSE;
+  HANDLE process = OpenProcess(0x1FFFFF, FALSE, id);
+  if (!process) return FALSE;
+  NTSTATUS status = DbgUiConnectToDbg();
+  if (NT_SUCCESS(status)) status = NtDebugActiveProcess(process, DbgUiGetThreadDebugObject());
+  if (NT_SUCCESS(status)) {
+    status = DbgUiIssueRemoteBreakin(process);
+    if (!NT_SUCCESS(status)) NtRemoveProcessDebug(process, DbgUiGetThreadDebugObject());
+  }
+  NtClose(process);
+  return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
 EXPORT BOOL WINAPI DebugActiveProcessStop(DWORD id) {
-  (void)id;
-  SetLastError(ERROR_ACCESS_DENIED);
-  return FALSE;
+  HANDLE process = OpenProcess(0x1FFFFF, FALSE, id);
+  if (!process) return FALSE;
+  const NTSTATUS status = NtRemoveProcessDebug(process, DbgUiGetThreadDebugObject());
+  NtClose(process);
+  return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
-EXPORT BOOL WINAPI WaitForDebugEvent(LPVOID event, DWORD milliseconds) {
-  (void)event; (void)milliseconds;
-  SetLastError(g_debug_object_made ? 121 : ERROR_INVALID_HANDLE);
-  return FALSE;
+EXPORT BOOL WINAPI DebugSetProcessKillOnExit(BOOL kill) {
+  HANDLE object = DbgUiGetThreadDebugObject();
+  if (!object) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
+  ULONG flags = kill ? 1 : 0;
+  const NTSTATUS status = NtSetInformationDebugObject(object, 1, &flags, sizeof(flags), NULL);
+  return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
-EXPORT BOOL WINAPI WaitForDebugEventEx(LPVOID event, DWORD milliseconds) { return WaitForDebugEvent(event, milliseconds); }
+EXPORT BOOL WINAPI DebugBreakProcess(HANDLE process) {
+  const NTSTATUS status = DbgUiIssueRemoteBreakin(process);
+  return NT_SUCCESS(status) ? TRUE : fail_nt(status);
+}
 
 /* ---- delay-loaded imports -------------------------------------------------------------------------------------------------------------------------- */
 

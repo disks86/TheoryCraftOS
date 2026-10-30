@@ -47,12 +47,22 @@ class Allocation {
   // What being resident costs against the adapter's budget.
   uint64_t device_bytes() const { return device_bytes_; }
   const AllocationDesc& desc() const { return desc_; }
-  bool is_buffer() const { return (desc_.flags & (kAllocVertexBuffer | kAllocIndexBuffer | kAllocQueryResult | kAllocUnorderedAccess)) != 0; }
+  bool is_buffer() const { return (desc_.flags & (kAllocVertexBuffer | kAllocIndexBuffer | kAllocQueryResult | kAllocUnorderedAccess | kAllocStreamOutput | kAllocConstantBuffer | kAllocHeap)) != 0; }
+  bool reserved() const { return reserved_; }   // a reserved (tiled) buffer: see kAllocReserved
+  bool is_heap() const { return (desc_.flags & kAllocHeap) != 0; }
+  bool placed() const { return static_cast<bool>(heap_); }   // its backing is a part of a heap's memory
+  const SharedPointer<Allocation>& heap() const { return heap_; }
+  uint64_t heap_offset() const { return heap_offset_; }
+  bool is_constant_buffer() const { return (desc_.flags & kAllocConstantBuffer) != 0; }
+  // Direct3D 12 resource states (kAllocTrackState): the state the last stream that ran the allocation's barriers left it in.
+  bool state_tracked() const { return state_tracked_; }
+  uint32_t state() const { return state_; }
+  void set_state(uint32_t state) { state_ = state; }
   bool is_query_result() const { return (desc_.flags & kAllocQueryResult) != 0; }
   bool is_image() const { return !is_buffer(); }
   bool is_depth() const { return dxgk::is_depth(desc_.format); }
   bool is_staging() const { return (desc_.flags & kAllocStaging) != 0; }
-  bool can_be_resident() const { return !is_staging() && !is_query_result(); }
+  bool can_be_resident() const { return !is_staging() && !is_query_result() && !is_constant_buffer() && !is_heap(); }
   bool resident() const { return image_ != nullptr || buffer_ != nullptr; }
   uint32_t mip_levels() const { return desc_.mip_levels; }
   // The 2D images of the allocation (1 for a plain texture); they follow each other in the backing, each width * height pixels.
@@ -79,6 +89,18 @@ class Allocation {
   ByteView cpu_;
   graphics::IImage* image_ = nullptr;
   graphics::IBuffer* buffer_ = nullptr;
+  SharedPointer<Allocation> heap_;     // placed: the heap (kept alive by it)
+  uint64_t heap_offset_ = 0;
+  List<Allocation*> placed_;           // a heap: the allocations placed in it
+  struct TileBinding {
+    SharedPointer<Allocation> heap;
+    uint64_t offset = 0;
+  };
+  List<TileBinding> tiles_;            // a reserved buffer: where each of its tiles is (a null heap: nowhere)
+  bool reserved_ = false;
+  bool state_tracked_ = false;
+  uint32_t state_ = 0;
+  uint64_t so_filled_ = 0;   // a stream output buffer: how far the last stream output into it got (kept while the device object is gone)
   uint64_t device_bytes_ = 0;    // what residency costs
   bool device_stale_ = true;     // the device object (if any) lacks the backing's current contents
   bool cpu_written_ = false;     // something other than the GPU wrote the backing since creation (a device that cannot take pixels may skip the upload of an allocation nobody wrote)
@@ -105,7 +127,8 @@ class VidMm {
 
   // Checks a description and makes the allocation (zero-filled, not resident). kInvalidParameter for a bad description, kGraphicsNoVideoMemory when the system-memory
   // limit is reached, kNoMemory when memory ran out.
-  NtStatus create(const AllocationDesc& desc, SharedPointer<Allocation>* out);
+  // `heap`: for a placed allocation (desc.heap), the heap allocation, already looked up by the caller.
+  NtStatus create(const AllocationDesc& desc, SharedPointer<Allocation>* out, const SharedPointer<Allocation>& heap = SharedPointer<Allocation>());
 
   // Puts the allocation on the GPU with its current contents, evicting others if the budget needs it: kGraphicsNoVideoMemory when it cannot be made to fit.
   NtStatus make_resident(Allocation& a);
@@ -116,6 +139,13 @@ class VidMm {
   // Makes the backing hold the current contents (reads the device object back if the GPU wrote it). False if the read-back failed.
   bool read_back(Allocation& a);
   // The CPU changed the backing: the device object is stale. / The GPU changed the device object: the backing is stale.
+  // Placed allocations that overlap share memory but have device objects of their own. The CPU or the GPU writing one makes the device objects of the ones that overlap it stale, and
+  // `switch_alias` (the aliasing barrier) says the use passes from `outgoing` to `incoming`: what the GPU holds for the first is written to the memory, the second is uploaded from it.
+  // The GPU must have run what was recorded before it.
+  bool switch_alias(Allocation& outgoing, Allocation& incoming);
+  // Reserved buffers: `count` tiles from `first` are put at `heap_offset` (a multiple of kTileBytes) of `heap` on, or nowhere (a null heap). The buffer's contents are gathered from the tiles whenever
+  // the device or the CPU takes them and scattered back when the GPU's or the CPU's writes arrive.
+  NtStatus map_tiles(Allocation& reserved, uint32_t first, const SharedPointer<Allocation>& heap, uint64_t heap_offset, uint32_t count);
   void note_cpu_write(Allocation& a);
   void note_gpu_write(Allocation& a);
   // The backing has been thrown away by the caller (a discard lock): the GPU's contents are no longer wanted.
@@ -135,6 +165,8 @@ class VidMm {
   friend class Allocation;
   void forget(Allocation& a);   // called by ~Allocation
   bool upload(Allocation& a);
+  void gather_tiles(Allocation& a);
+  void scatter_tiles(Allocation& a);
   void release_device_object(Allocation& a);
   bool evict_for(uint64_t needed, const Allocation* keep);
   bool create_device_object(Allocation& a);

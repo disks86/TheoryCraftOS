@@ -444,6 +444,9 @@ add_executable(BOOTX64
   src/Graphics/GraphicsPool.cpp
   src/Graphics/SystemDxg.cpp
   src/Kernel/Dxgkrnl/VidMm.cpp
+  src/Kernel/Dxgkrnl/D3d12.cpp
+  src/Kernel/Dxgkrnl/DxilBitcode.cpp
+  src/Kernel/Dxgkrnl/DxilTranslate.cpp
   src/Kernel/Dxgkrnl/D3d9Shader.cpp
   src/Kernel/Dxgkrnl/D3d9Tgsi.cpp
   src/Kernel/Dxgkrnl/D3d9Dxbc.cpp
@@ -497,11 +500,13 @@ add_executable(BOOTX64
   src/Desktop/CubeRenderer.cpp
   src/SystemMonitor.cpp
   src/SystemInventory.cpp
+  src/SystemDeviceDetails.cpp
   src/SystemNetworkDetails.cpp
   src/SystemWirelessDetails.cpp
   src/SystemBluetoothDetails.cpp
   src/Desktop/BluetoothProperties.cpp
   src/Desktop/NetworkProperties.cpp
+  src/Desktop/DeviceProperties.cpp
   src/Desktop/WirelessProperties.cpp
   src/Gui/Controls/MenuButton.cpp
   src/GraphicsDemo.cpp
@@ -622,6 +627,7 @@ add_executable(BOOTX64
   src/Process/WindowsPipes.cpp
   src/Process/WindowsLocks.cpp
   src/Process/WindowsJobs.cpp
+  src/Process/WindowsDebug.cpp
   src/Process/WindowsMemory.cpp
   src/Process/WindowsSockets.cpp
   src/Process/Sockets.cpp
@@ -674,6 +680,12 @@ add_executable(BOOTX64
   src/Emulation/AArch64SvePermute.cpp
   src/Emulation/AArch64SveFloat.cpp
   src/Emulation/AArch64Sve2.cpp
+  src/Emulation/AArch64Sme.cpp
+  src/Emulation/AArch64Sme2.cpp
+  src/Emulation/AArch64Fp8.cpp
+  src/Emulation/AArch64Fp8Neon.cpp
+  src/Emulation/AArch64Fp8Sve.cpp
+  src/Emulation/AArch64Lut.cpp
   src/Emulation/AArch64NeonShift.cpp
   src/Emulation/AArch64NeonThree.cpp
   src/Emulation/AArch64NeonElement.cpp
@@ -982,13 +994,13 @@ if(TCOS_ARCH STREQUAL "x86_64")
     COMMAND ${CMAKE_COMMAND} -E make_directory ${WINDOWS_DIR}
     COMMAND ${CMAKE_C_COMPILER} ${WINDOWS_DLL_FLAGS} ${ntdll_stubs} -Wl,--image-base=0x180000000 -Wl,--out-implib=${WINDOWS_DIR}/libntdll.a
             -o ${WINDOWS_DIR}/ntdll.dll ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/ntdll.c
-    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/ntdll.c ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/except.inc ${CMAKE_SOURCE_DIR}/src/Windows/libc_string.inc ${WINDOWS_HEADERS} ${CMAKE_SOURCE_DIR}/src/Windows/stubs/ntdll.inc ${WINDOWS_STUBS_C} ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/services.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/zw.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/rtl.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/libc.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/rtl2.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/status.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/casetab.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/normalize.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/uilang.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/locale_names.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/unidata.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/idn_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/reg.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/fls.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/actctx.inc
+    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/ntdll.c ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/except.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/heap.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/format.inc ${CMAKE_SOURCE_DIR}/src/Windows/libc_string.inc ${CMAKE_SOURCE_DIR}/src/Windows/fmtengine.inc ${WINDOWS_HEADERS} ${CMAKE_SOURCE_DIR}/src/Windows/stubs/ntdll.inc ${WINDOWS_STUBS_C} ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/services.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/zw.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/rtl.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/libc.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/rtl2.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/rtl3.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/sec.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/status.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/casetab.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/normalize.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/uilang.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/locale_names.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/unidata.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/idn_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/reg.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/fls.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/actctx.inc
     COMMENT "Building ntdll.dll")
   windows_stub_flags(kernel32_stubs kernel32 0)
   add_custom_command(OUTPUT ${WINDOWS_DIR}/kernel32.dll
     COMMAND ${CMAKE_C_COMPILER} ${WINDOWS_DLL_FLAGS} ${kernel32_stubs} -Wl,--image-base=0x180200000 -o ${WINDOWS_DIR}/kernel32.dll
             ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.c ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.def ${WINDOWS_DIR}/libntdll.a
-    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.c ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra2.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/volume.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra3.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/console.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/legacy.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/fmtmsg.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/time.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/memory.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/nls.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/actctx.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/codepage.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/codepage_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/ctype_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/idn_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/idn.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/locale.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/nls2.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/geo_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/locale_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/rsrcupdate.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.def ${WINDOWS_DIR}/libntdll.a ${WINDOWS_HEADERS} ${CMAKE_SOURCE_DIR}/src/Windows/stubs/kernel32.inc ${WINDOWS_STUBS_C}
+    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.c ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra2.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/volume.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra3.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/console.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/legacy.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/fmtmsg.inc ${CMAKE_SOURCE_DIR}/src/Windows/fmtengine.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/time.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/memory.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/nls.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/actctx.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/codepage.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/codepage_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/ctype_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/idn_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/idn.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/locale.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/nls2.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/geo_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/locale_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/rsrcupdate.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.def ${WINDOWS_DIR}/libntdll.a ${WINDOWS_HEADERS} ${CMAKE_SOURCE_DIR}/src/Windows/stubs/kernel32.inc ${WINDOWS_STUBS_C}
     COMMENT "Building kernel32.dll")
   windows_stub_flags(msvcrt_stubs msvcrt 0)
   add_custom_command(OUTPUT ${WINDOWS_DIR}/msvcrt.dll

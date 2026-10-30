@@ -114,9 +114,15 @@ enum AllocationFlags : uint32_t {
   kAllocStaging = 1u << 6,
   kAllocShared = 1u << 7,        // may be shared with other processes (Kernel::share_allocation)
   kAllocUnorderedAccess = 1u << 9,   // a buffer compute shaders read and write (BindUav; the adapter's kFeatureCompute); may also be a vertex or index buffer
+  kAllocStreamOutput = 1u << 10,   // a buffer a geometry shader's stream output is written to (SetStreamOutput; the adapter's kFeatureStreamOutput): read by locking it
+  kAllocConstantBuffer = 1u << 11,   // a buffer of constants (Direct3D 12 root constant buffer views and descriptors); system memory only, never resident: read by the CPU when a draw needs it
+  kAllocHeap = 1u << 13,             // Direct3D 12 resource heap: memory other allocations are placed in (AllocationDesc::heap / heap_offset); system memory only, never resident, no other flags but kAllocShared-free
+  kAllocReserved = 1u << 14,         // Direct3D 12 reserved (tiled) buffer: with the flags of a vertex, index, storage or stream output buffer; its size a multiple of kTileBytes; no memory of its own - Kernel::update_tile_mappings maps its 64 KiB tiles to places in heaps (an unmapped tile reads as zero and drops writes)
+  kAllocTrackState = 1u << 12,       // Direct3D 12 resource states: AllocationDesc::initial_state is the state; ResourceBarrier moves it and uses of the allocation check it (CommandStream.hpp). Any other flags as usual.
   kAllocQueryResult = 1u << 8,   // a buffer the results of occlusion queries are written to (CommandStream.hpp BeginQuery); system memory only, never resident, read by locking it
 };
 
+constexpr uint32_t kTileBytes = 65536;   // the size of a tile of a reserved resource
 constexpr uint32_t kMaxTextureDimension = 4096;
 constexpr uint64_t kMaxBufferBytes = 256ull * 1024 * 1024;
 
@@ -129,6 +135,9 @@ struct AllocationDesc {
   graphics::TextureKind kind = graphics::TextureKind::Texture2D;   // textures: more than 2D needs the adapter's kFeatureTextureKinds, flags exactly kAllocTexture (kAllocShared too), one mip level, an 8-bit colour format
   uint32_t samples = 1;              // 2, 4 or 8 (the adapter's kFeatureMultisample and sample counts): a render target of an 8-bit colour format or a depth buffer, nothing else; it has no system-memory
                                      // backing, cannot be locked, copied, sampled or presented, and is turned into an ordinary image by the stream's ResolveRegion
+  Handle heap = 0;                   // placed resource: the kAllocHeap allocation (of the same device) whose memory this allocation is, from heap_offset on; other placed allocations may overlap it
+  uint64_t heap_offset = 0;          //   (a multiple of 16; a buffer or a colour image of one sample - no depth image; its backing is the heap's memory, not a copy)
+  uint32_t initial_state = 0;        // kAllocTrackState: the resource state it starts in (D3d12.hpp ResourceState)
   uint32_t layers = 1;               // Texture3D: the depth; Texture2DArray: the array size (1 .. graphics::kMaxTextureLayers); TextureCube: 6 (width equals height)
 };
 
@@ -234,6 +243,12 @@ struct PipelineDesc {
   bool independent_blend = false;    // needs kFeatureIndependentBlend: target n (1..3) blends with target_blend[n - 1], target 0 with `blend` (see graphics::GraphicsPipelineDesc)
   graphics::BlendState target_blend[graphics::kMaxColorTargets - 1];
   bool multisample = false;          // needs kFeatureMultisample: coverage per sample in a pass of multisampled images (see graphics::GraphicsPipelineDesc::multisample)
+  // Stream output (the adapter's kFeatureStreamOutput, with a geometry shader): see graphics::StreamOutputEntry. The entries of one buffer are all of one stream. `rasterized_stream` is the
+  // stream that is drawn (-1: none).
+  uint32_t stream_output_count = 0;
+  graphics::StreamOutputEntry stream_output[graphics::kMaxStreamOutputEntries];
+  uint32_t stream_output_stride[graphics::kMaxStreamOutputBuffers] = {};
+  int32_t rasterized_stream = 0;
   bool alpha_to_coverage = false;    // with multisample: the first target's alpha says how many samples a pixel's colour reaches (see graphics::GraphicsPipelineDesc::alpha_to_coverage)
   uint32_t color_target_count = 1;   // the colour outputs the pixel shader fills (SV_Target0 ..); more than one needs the adapter's kFeatureMultipleTargets, and a pass with that many targets
 };

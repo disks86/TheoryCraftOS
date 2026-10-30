@@ -64,6 +64,220 @@ bool device_2d_check(IGraphicsDevice& device, allocators::IAllocator& allocator)
   return ok;
 }
 
+// Offscreen groups on the device (the premultiplied target, the scaling shader, the composite): 1 ok, 0 wrong, -1 the device does not do them.
+int groups_check(IGraphicsDevice& device, allocators::IAllocator& allocator) {
+  constexpr uint32_t W = 64, H = 48;
+  DeviceRenderer2D r(device, allocator, {W, H});
+  ArrayView<uint32_t> px = allocate_view<uint32_t>(allocator, W * H);
+  if (!r.valid() || px.empty()) {
+    release_view(allocator, px);
+    return 0;
+  }
+  r.clear(rgb(0, 0, 255));
+  r.set_blend(BlendMode::Alpha);
+  Matrix2D move;
+  move.e = 20;
+  int result = -1;
+  if (r.begin_group({0, 0, 24, 24})) {   // two overlapping rectangles, laid over the backdrop at half opacity and moved right
+    r.fill_rect({2, 2, 10, 10}, rgb(255, 255, 255));
+    r.fill_rect({6, 6, 10, 10}, rgb(255, 255, 255));
+    r.end_group(move, 128, ImageFilter::Nearest);
+    if (r.begin_group({0, 24, 24, 24})) {   // and one at full opacity
+      r.fill_rect({2, 26, 6, 6}, rgb(255, 0, 0));
+      r.end_group(move, 255, ImageFilter::Nearest);
+      result = r.read_pixels(px) ? 1 : 0;
+    } else {
+      result = 0;
+    }
+  }
+  if (result == 1) {
+    auto near = [&](uint32_t x, uint32_t y, int cr, int cg, int cb) {
+      const uint32_t c = px[y * W + x];
+      auto d = [](uint32_t a, int b) { return static_cast<int>(a) - b; };
+      return d((c >> 16) & 0xFF, cr) <= 3 && d((c >> 16) & 0xFF, cr) >= -3 && d((c >> 8) & 0xFF, cg) <= 3 && d((c >> 8) & 0xFF, cg) >= -3 && d(c & 0xFF, cb) <= 3 && d(c & 0xFF, cb) >= -3;
+    };
+    // (the overlap of the two rectangles is not brighter than the rest: it is one picture)
+    result = near(24, 5, 128, 128, 255) && near(30, 10, 128, 128, 255) && near(5, 5, 0, 0, 255) && near(24, 30, 255, 0, 0) && near(40, 40, 0, 0, 255) ? 1 : 0;
+  }
+  // Group filters (blur, colour function): -1 when the device has none, 0 wrong.
+  if (result == 1 && r.supports_group_filters()) {
+    r.set_blend(BlendMode::Alpha);
+    r.clear(rgb(0, 0, 0));
+    ColorTransform invert;   // rgb' = 1 - rgb
+    for (int i = 0; i < 9; ++i) invert.m[i] = (i % 4 == 0) ? -1.0f : 0.0f;
+    invert.add[0] = invert.add[1] = invert.add[2] = 1.0f;
+    bool drawn = r.begin_filter_group({0, 0, 20, 20});
+    if (drawn) {
+      r.fill_rect({2, 2, 8, 8}, rgb(255, 0, 0));
+      drawn = r.group_color(invert) && r.end_group(Matrix2D(), 255, ImageFilter::Nearest);
+    }
+    bool blurred = drawn && r.begin_filter_group({0, 0, 40, 40});
+    if (blurred) {
+      r.fill_rect({12, 12, 16, 16}, rgb(255, 255, 255));
+      blurred = r.group_blur(3.0f) && r.end_group(Matrix2D(), 255, ImageFilter::Nearest);
+    }
+    bool cut = blurred && r.begin_filter_group({44, 0, 20, 20});   // a square with a rectangle cut out of it
+    if (cut) {
+      r.fill_rect({44, 0, 20, 20}, rgb(255, 255, 255));
+      cut = r.group_cut_out({48, 4, 12, 12}, CornerRadii{}) && r.end_group(Matrix2D(), 255, ImageFilter::Nearest);
+    }
+    bool ok = cut && r.read_pixels(px);
+    if (ok) {
+      auto chan = [&](uint32_t x, uint32_t y) { return static_cast<int>((px[y * W + x] >> 8) & 0xFF); };
+      ok = chan(54, 10) == 0 && chan(45, 1) == 255 && chan(47, 10) == 255 && chan(60, 10) == 255;   // (a ring around a hole)
+    }
+    if (ok) {
+      auto chan = [&](uint32_t x, uint32_t y) { return static_cast<int>((px[y * W + x] >> 8) & 0xFF); };
+      const int left = chan(10, 20), right = chan(29, 20), center = chan(20, 20), far = chan(2, 44) + chan(30, 46);
+      ok = (px[5 * W + 5] & 0xFFFFFF) == 0x00FFFF && chan(18, 0) == 0 &&   // (inverted red is cyan)
+           center >= 240 && left > 20 && left < 235 && right > 20 && right < 235 && left - right <= 12 && right - left <= 12 && far <= 8;
+    }
+    result = ok ? 2 : 0;
+  }
+  // Exact clips (a rounded one, one by a coverage mask): the corners of a rounded clip are cut, the middle shows, the edge is partly covered; the mask's half covered column is half.
+  if (result == 2) {
+    r.clear(rgb(0, 0, 0));
+    const bool exact = r.push_clip_rounded_rect({4, 4, 32, 32}, CornerRadii::uniform(14));
+    r.fill_rect({0, 0, 64, 48}, rgb(255, 255, 255));
+    r.pop_clip();
+    uint8_t cov[16 * 8];
+    for (uint32_t y = 0; y < 8; ++y)
+      for (uint32_t x = 0; x < 16; ++x) cov[y * 16 + x] = x < 8 ? 255 : (x < 12 ? 128 : 0);
+    const bool mexact = r.push_clip_mask(MaskView{ConstByteView(cov, sizeof cov), 16, 8, 16}, 40, 4);
+    r.fill_rect({0, 0, 64, 48}, rgb(255, 255, 255));
+    r.pop_clip();
+    // the same clip again finds its mask made (and draws the same)
+    const uint64_t hits = r.clip_mask_hits();
+    const bool again = r.push_clip_rounded_rect({4, 4, 32, 32}, CornerRadii::uniform(14));
+    r.fill_rect({0, 0, 64, 48}, rgb(255, 255, 255));
+    r.pop_clip();
+    bool ok = exact && mexact && again && r.clip_mask_hits() == hits + 1 && r.read_pixels(px);
+    if (ok) {
+      auto chan = [&](uint32_t x, uint32_t y) { return static_cast<int>((px[y * W + x] >> 8) & 0xFF); };
+      const int corner = chan(4, 4), middle = chan(20, 20), edge = chan(5, 12), outside = chan(2, 20);
+      ok = corner == 0 && middle == 255 && outside == 0 && edge > 20 && edge < 250 && chan(44, 6) == 255 && chan(50, 6) >= 124 && chan(50, 6) <= 132 && chan(54, 6) == 0 && chan(44, 14) == 0;
+    }
+    result = ok ? 3 : 0;
+  }
+  // A drop shadow: the picture's alpha moved right, tinted red, with the picture over it; and the same blurred.
+  if (result == 3) {
+    r.clear(rgb(0, 0, 0));
+    bool ok = r.begin_filter_group({0, 0, 56, 20});
+    if (ok) {
+      r.fill_rect({4, 4, 10, 10}, rgb(255, 255, 255));
+      ok = r.group_drop_shadow(14, 0, 0.0f, 0xFFFF0000u) && r.end_group(Matrix2D(), 255, ImageFilter::Nearest);
+    }
+    ok = ok && r.begin_filter_group({0, 24, 64, 24});
+    if (ok) {
+      r.fill_rect({4, 28, 10, 10}, rgb(255, 255, 255));
+      ok = r.group_drop_shadow(14, 0, 2.0f, 0xFFFF0000u) && r.end_group(Matrix2D(), 255, ImageFilter::Nearest);
+    }
+    ok = ok && r.read_pixels(px);
+    if (ok) {
+      auto red = [&](uint32_t x, uint32_t y) { return static_cast<int>((px[y * W + x] >> 16) & 0xFF); };
+      auto green = [&](uint32_t x, uint32_t y) { return static_cast<int>((px[y * W + x] >> 8) & 0xFF); };
+      ok = green(8, 8) == 255 && red(22, 8) == 255 && green(22, 8) == 0 && red(16, 8) == 0 &&   // (picture, shadow, the gap between)
+           green(22, 32) == 0 && red(22, 32) >= 240 && red(28, 32) > 10 && red(28, 32) < 230 && red(42, 32) <= 8;   // (the blurred one has a soft edge past the block)
+    }
+    result = ok ? 4 : 0;
+  }
+  release_view(allocator, px);
+  return result;
+}
+
+// Glyphs on the atlas, tinted by the GPU: 1 ok, 0 wrong, -1 the device renderer has no atlas on this device.
+int glyphs_check(IGraphicsDevice& device, allocators::IAllocator& allocator) {
+  constexpr uint32_t W = 64, H = 48;
+  DeviceRenderer2D r(device, allocator, {W, H});
+  ArrayView<uint32_t> px = allocate_view<uint32_t>(allocator, W * H);
+  if (!r.valid() || px.empty()) {
+    release_view(allocator, px);
+    return 0;
+  }
+  if (!r.has_glyph_atlas()) {
+    release_view(allocator, px);
+    return -1;
+  }
+  uint8_t cov[8 * 8];
+  for (uint32_t y = 0; y < 8; ++y)
+    for (uint32_t x = 0; x < 8; ++x) cov[y * 8 + x] = x < 4 ? 255 : (x < 6 ? 128 : 0);
+  const MaskView m{ConstByteView(cov, sizeof cov), 8, 8, 8};
+  r.clear(rgb(0, 0, 0));
+  r.set_blend(BlendMode::Alpha);
+  r.fill_rect({0, 0, 64, 8}, rgb(0, 0, 80));            // (a shape before, the glyph in two colours and twice, a shape after: drawn in order)
+  r.draw_glyph(77, m, 4, 4, rgb(255, 0, 0));
+  r.draw_glyph(77, m, 20, 4, rgb(0, 255, 0));
+  r.fill_rect({36, 4, 4, 4}, rgb(255, 255, 255));
+  r.draw_glyph(77, m, 36, 20, 0x80FFFFFF);               // (the same glyph, half transparent)
+  bool ok = r.read_pixels(px) && r.glyphs_made() == 1;
+  if (ok) {
+    auto at = [&](uint32_t x, uint32_t y) { return px[y * W + x]; };
+    auto near = [](uint32_t c, uint32_t e) {
+      for (int sh = 0; sh < 24; sh += 8) {
+        const int d = static_cast<int>((c >> sh) & 0xFF) - static_cast<int>((e >> sh) & 0xFF);
+        if (d > 3 || d < -3) return false;
+      }
+      return true;
+    };
+    ok = near(at(5, 5), 0xFFFF0000) && near(at(21, 5), 0xFF00FF00) && near(at(8, 5), 0xFF7F0028 /* half red over (0,0,80) */) && near(at(10, 5), 0xFF000050) &&
+         near(at(37, 5), 0xFFFFFFFF) && near(at(37, 21), 0xFF808080) && near(at(40, 21), 0xFF404040) && near(at(43, 21), 0xFF000000);
+  }
+  // a second glyph later: only its rectangle goes to the device (an update of part of the atlas), and the first one is still right
+  if (ok) {
+    const uint64_t sent = r.atlas_pixels_sent();
+    uint8_t cov2[8 * 8];
+    for (uint32_t k = 0; k < 64; ++k) cov2[k] = (k / 8) < 4 ? 255 : 0;
+    r.draw_glyph(78, MaskView{ConstByteView(cov2, sizeof cov2), 8, 8, 8}, 44, 36, rgb(255, 255, 0));
+    r.draw_glyph(77, m, 4, 20, rgb(0, 128, 255));   // (the first again: not sent again)
+    ok = r.read_pixels(px) && r.atlas_pixels_sent() == sent + 64;
+    if (ok) {
+      auto at = [&](uint32_t x, uint32_t y) { return px[y * W + x]; };
+      ok = (at(45, 37) & 0xFFFFFF) == 0xFFFF00 && (at(45, 42) & 0xFFFFFF) == 0x000000 && (at(5, 5) & 0xFFFFFF) == 0xFF0000 && (at(5, 21) & 0xFFFFFF) == 0x0080FF;
+    }
+  }
+  release_view(allocator, px);
+  return ok ? 1 : 0;
+}
+
+// A picture repeated by the sampler (draw_image_tiled) and a conic gradient as wedges: 1 ok, 0 wrong.
+int fills_check(IGraphicsDevice& device, allocators::IAllocator& allocator) {
+  constexpr uint32_t W = 64, H = 48;
+  DeviceRenderer2D r(device, allocator, {W, H});
+  ArrayView<uint32_t> px = allocate_view<uint32_t>(allocator, W * H);
+  ArrayView<uint32_t> tile_pixels = allocate_view<uint32_t>(allocator, 3 * 2);
+  if (!r.valid() || px.empty() || tile_pixels.empty()) {
+    release_view(allocator, px);
+    release_view(allocator, tile_pixels);
+    return 0;
+  }
+  const uint32_t colors[6] = {rgb(255, 0, 0), rgb(0, 255, 0), rgb(0, 0, 255), rgb(255, 255, 255), rgb(255, 255, 0), rgb(0, 255, 255)};
+  for (uint32_t i = 0; i < 6; ++i) tile_pixels[i] = colors[i];
+  Surface tile;
+  tile.pixels = tile_pixels;
+  tile.width = tile.pitch = 3;
+  tile.height = 2;
+  r.clear(rgb(0, 0, 0));
+  r.set_blend(BlendMode::Alpha);
+  bool ok = r.draw_image_tiled(tile, 1, 1, 3, 2, {1, 1, 18, 8});   // (6 x 4 copies)
+  const GradientStop quadrants[8] = {{0.0f, rgb(255, 0, 0)}, {0.25f, rgb(255, 0, 0)}, {0.25f, rgb(0, 255, 0)}, {0.5f, rgb(0, 255, 0)},
+                                     {0.5f, rgb(0, 0, 255)}, {0.75f, rgb(0, 0, 255)}, {0.75f, rgb(255, 255, 0)}, {1.0f, rgb(255, 255, 0)}};
+  ok = ok && r.fill_conic_gradient({24, 0, 40, 40}, {44, 20}, 0.0f, ArrayView<const GradientStop>(quadrants, 8)) && r.read_pixels(px);
+  if (ok) {
+    auto at = [&](uint32_t x, uint32_t y) { return px[y * W + x] & 0xFFFFFF; };
+    // tiles: pixel (x, y) shows the tile pixel ((x - 1) mod 3, (y - 1) mod 2); nothing outside the area
+    bool tiles = true;
+    for (uint32_t y = 1; y < 9; ++y)
+      for (uint32_t x = 1; x < 19; ++x) tiles = tiles && at(x, y) == (colors[((y - 1) % 2) * 3 + ((x - 1) % 3)] & 0xFFFFFF);
+    tiles = tiles && at(0, 1) == 0 && at(19, 1) == 0 && at(1, 9) == 0;
+    // conic: clockwise from the top, red, green, blue, yellow quarters around (44, 20): top right red, bottom right green, bottom left blue, top left yellow
+    const bool conic = at(54, 10) == 0xFF0000 && at(54, 30) == 0x00FF00 && at(34, 30) == 0x0000FF && at(34, 10) == 0xFFFF00;
+    ok = tiles && conic;
+  }
+  release_view(allocator, px);
+  release_view(allocator, tile_pixels);
+  return ok ? 1 : 0;
+}
+
 bool demo_2d(SystemGraphics& graphics) {
   IRenderer2D* renderer = graphics.renderer_2d();
   if (!renderer) return false;
@@ -219,11 +433,18 @@ bool demo_3d(SystemGraphics& graphics, allocators::IAllocator& allocator, uint64
 }
 }  // namespace
 
+int check_2d_fills(IGraphicsDevice& device, allocators::IAllocator& allocator) { return fills_check(device, allocator); }
+
+int check_2d_glyphs(IGraphicsDevice& device, allocators::IAllocator& allocator) { return glyphs_check(device, allocator); }
+
+int check_2d_groups(IGraphicsDevice& device, allocators::IAllocator& allocator) { return groups_check(device, allocator); }
+
 bool run_graphics_demo(SystemGraphics& graphics, allocators::IAllocator& allocator) {
   if (!graphics.display()) return false;
   const bool ok_2d = demo_2d(graphics);
   uint64_t microseconds = 0;
   const bool device_2d = device_2d_check(graphics.device(), allocator);
+  const int groups = groups_check(graphics.device(), allocator);
   const bool conventions = conventions_check(graphics.device(), allocator);
   const bool ok_3d = demo_3d(graphics, allocator, &microseconds);
 
@@ -236,6 +457,8 @@ bool run_graphics_demo(SystemGraphics& graphics, allocators::IAllocator& allocat
   console::puts(graphics.renderer_2d() && graphics.renderer_2d()->accelerated() ? ", GPU)\n" : ", CPU)\n");
   console::puts(device_2d ? "  2D on the 3D device (readback of shapes, alpha, text): ok\n"
                           : "  2D on the 3D device (readback of shapes, alpha, text): FAILED\n");
+  console::puts(groups > 0 ? (groups > 1 ? "  2D offscreen groups (opacity, composite, blur, colour filters, clips): ok\n" : "  2D offscreen groups (opacity, premultiplied composite): ok\n")
+                           : groups == 0 ? "  2D offscreen groups (opacity, premultiplied composite): FAILED\n" : "  2D offscreen groups: not supported by this device\n");
   console::puts(conventions ? "  3D conventions (orientation, culling, depth): ok\n"
                             : "  3D conventions (orientation, culling, depth): FAILED\n");
   console::puts(ok_3d ? "  3D cube: ok, " : "  3D cube: FAILED, ");
@@ -245,5 +468,5 @@ bool run_graphics_demo(SystemGraphics& graphics, allocators::IAllocator& allocat
   } else {
     console::puts("no frames\n");
   }
-  return ok_2d && ok_3d && conventions && device_2d;
+  return ok_2d && ok_3d && conventions && device_2d && groups != 0;
 }

@@ -85,18 +85,27 @@ class Adapter::StreamRunner {
  public:
   StreamRunner(Adapter& adapter, ConstByteView commands, ArrayView<const SharedPointer<Allocation>> allocations)
       : adapter_(adapter), mm_(adapter.vidmm_), commands_(commands), allocations_(allocations), pending_(adapter.allocator_), transient_(adapter.allocator_) {}
+  
   ~StreamRunner() { release_transient(); }
 
-  NtStatus validate(IPipelineLookup& lookup, List<SharedPointer<PipelineObject>>& pipelines) {
+  NtStatus validate(IPipelineLookup& lookup, List<SharedPointer<PipelineObject>>& pipelines, List<SharedPointer<RootSignatureObject>>& signatures, List<SharedPointer<DescriptorHeapObject>>& heaps) {
     exec_ = false;
     lookup_ = &lookup;
     collected_ = &pipelines;
-    return walk();
+    collected_signatures_ = &signatures;
+    collected_heaps_ = &heaps;
+    const NtStatus s = walk();
+    // (the states the barriers left allocations in count once the whole stream is good)
+    if (s == status::kSuccess)
+      for (uint64_t i = 0; i < shadow_.count() && i < allocations_.size(); ++i) allocations_[i]->set_state(shadow_[i]);
+    return s;
   }
 
-  NtStatus execute(ArrayView<const SharedPointer<PipelineObject>> pipelines) {
+  NtStatus execute(ArrayView<const SharedPointer<PipelineObject>> pipelines, ArrayView<const SharedPointer<RootSignatureObject>> signatures, ArrayView<const SharedPointer<DescriptorHeapObject>> heaps) {
     exec_ = true;
     replay_ = pipelines;
+    replay_signatures_ = signatures;
+    replay_heaps_ = heaps;
     for (const SharedPointer<Allocation>& a : allocations_) mm_.pin(*a);
     NtStatus s = walk();
     if (cb_) {
@@ -209,7 +218,14 @@ class Adapter::StreamRunner {
       case Op::BeginQuery: return begin_query(p);
       case Op::EndQuery: return end_query(p);
       case Op::BindUav: return bind_uav(p);
+      case Op::SetStreamOutput: return set_stream_output(p);
       case Op::ResolveRegion: return resolve(p);
+      case Op::SetRootSignature: return set_root_signature(p);
+      case Op::SetDescriptorHeaps: return set_descriptor_heaps(p);
+      case Op::SetRootConstants: return set_root_constants(p);
+      case Op::SetRootDescriptor: return set_root_descriptor(p);
+      case Op::SetRootTable: return set_root_table(p);
+      case Op::ResourceBarrier: return resource_barrier(p);
       case Op::Dispatch: return dispatch(p);
       case Op::SetTopology: {
         const uint32_t topology = p.le32();
@@ -228,7 +244,15 @@ class Adapter::StreamRunner {
     uint32_t kind = 0;
     if (!p.at_end()) kind = p.le32();
     if (!exact(p) || !in_pass_ || query_open_ || !(adapter_.caps_.features & graphics::kFeatureOcclusionQueries)) return kBad;
-    if (kind > static_cast<uint32_t>(graphics::QueryKind::PsInvocations) || (kind != 0 && !(adapter_.caps_.features & graphics::kFeatureStatisticsQueries))) return kBad;
+    // (the kind in the low byte, the output stream of a stream output query above it)
+    const uint32_t stream = kind >> 8;
+    kind &= 0xFF;
+    const uint32_t features = adapter_.caps_.features;
+    const bool so_kind = kind == static_cast<uint32_t>(graphics::QueryKind::SoPrimitivesWritten) || kind == static_cast<uint32_t>(graphics::QueryKind::SoPrimitivesNeeded);
+    if (kind > static_cast<uint32_t>(graphics::QueryKind::TimestampDisjoint) || stream >= (so_kind ? graphics::kMaxGeometryStreams : 1u)) return kBad;
+    if (kind == static_cast<uint32_t>(graphics::QueryKind::Timestamp) || kind == static_cast<uint32_t>(graphics::QueryKind::TimestampFrequency) || kind == static_cast<uint32_t>(graphics::QueryKind::TimestampDisjoint) ? !(features & graphics::kFeatureTimestampQueries)
+        : so_kind ? (features & (graphics::kFeatureStatisticsQueries | graphics::kFeatureStreamOutput)) != (graphics::kFeatureStatisticsQueries | graphics::kFeatureStreamOutput)
+        : (kind != 0 && !(features & graphics::kFeatureStatisticsQueries))) return kBad;
     Allocation* a = alloc(index);
     if (!a || !a->is_query_result() || offset % 8 || offset > a->desc().size - 8) return kBad;
     if (queries_in_stream_ >= graphics::kMaxOcclusionQueries) return kBad;
@@ -238,7 +262,7 @@ class Adapter::StreamRunner {
     const NtStatus s = ensure_cb();
     if (s != status::kSuccess) return s;
     if (!pending_.push_back({a, offset, next_slot_})) return status::kNoMemory;
-    cb_->begin_query(next_slot_++, static_cast<graphics::QueryKind>(kind));
+    cb_->begin_query(next_slot_++, static_cast<graphics::QueryKind>(kind), stream);
     return status::kSuccess;
   }
 
@@ -267,12 +291,13 @@ class Adapter::StreamRunner {
     if (extra_count && !(adapter_.caps_.features & graphics::kFeatureMultipleTargets)) return kBad;
     Allocation* color = alloc(color_index);
     Allocation* depth = depth_index == kNoAllocation ? nullptr : alloc(depth_index);
-    if (!color || !color->is_image() || !(color->desc().flags & kAllocRenderTarget)) return kBad;
+    if (!color || !color->is_image() || !(color->desc().flags & kAllocRenderTarget) || !use(color, state::kRenderTarget)) return kBad;
     if (depth_index != kNoAllocation && (!depth || !depth->is_image() || !(depth->desc().flags & kAllocDepthStencil))) return kBad;
+    if (depth && !use(depth, state::kDepthWrite)) return kBad;
     if (depth && (depth->desc().width != color->desc().width || depth->desc().height != color->desc().height || depth->desc().samples != color->desc().samples)) return kBad;
     for (uint32_t n = 0; n < extra_count; ++n) {
       const Allocation* e = extras[n];
-      if (!e->is_image() || !(e->desc().flags & kAllocRenderTarget) || e == color || e == depth) return kBad;
+      if (!e->is_image() || !(e->desc().flags & kAllocRenderTarget) || e == color || e == depth || !use(extras[n], state::kRenderTarget)) return kBad;
       if (e->desc().width != color->desc().width || e->desc().height != color->desc().height || e->desc().format != color->desc().format || e->desc().samples != color->desc().samples) return kBad;
       for (uint32_t k = 0; k < n; ++k)
         if (extras[k] == e) return kBad;
@@ -353,7 +378,7 @@ class Adapter::StreamRunner {
     if (!exact(p) || in_pass_ || !(adapter_.caps_.features & graphics::kFeatureMultisample) || mode > static_cast<uint32_t>(graphics::ResolveMode::Max)) return kBad;
     Allocation* to = alloc(to_index);
     Allocation* from = alloc(from_index);
-    if (!to || !from || !to->is_image() || !from->is_image() || to->is_staging() || to == from || to->is_depth() != from->is_depth()) return kBad;
+    if (!to || !from || !to->is_image() || !from->is_image() || to->is_staging() || to == from || to->is_depth() != from->is_depth() || !use(to, state::kResolveDest) || !use(from, state::kResolveSource)) return kBad;
     const bool depth = to->is_depth();
     if (from->desc().samples < 2 || to->desc().samples != 1 || to->mip_levels() != 1 || to->layers() != 1) return kBad;
     if (to->desc().format != from->desc().format || to->desc().width != from->desc().width || to->desc().height != from->desc().height) return kBad;
@@ -373,11 +398,44 @@ class Adapter::StreamRunner {
     return status::kSuccess;
   }
 
+  // After a draw: the buffers its pipeline's stream output wrote have newer contents on the device than anywhere else.
+  void note_stream_output_written() {
+    if (!pipeline_ || !pipeline_->has_stream_output()) return;
+    for (uint32_t b = 0; b < graphics::kMaxStreamOutputBuffers; ++b)
+      if ((pipeline_->stream_output_buffers() >> b & 1) && so_bound_[b] && so_alloc_[b]) mm_.note_gpu_write(*so_alloc_[b]);
+  }
+
+  NtStatus set_stream_output(ByteReader& p) {
+    const uint32_t slot = p.le32(), index = p.le32(), offset = p.le32();
+    if (!exact(p) || !(adapter_.caps_.features & graphics::kFeatureStreamOutput) || slot >= graphics::kMaxStreamOutputBuffers) return kBad;
+    if (index == kNoAllocation) {
+      so_bound_[slot] = false;
+      so_alloc_[slot] = nullptr;
+      if (!exec_) return status::kSuccess;
+      const NtStatus s = ensure_cb();
+      if (s != status::kSuccess) return s;
+      cb_->bind_stream_output(slot, nullptr, 0);
+      return status::kSuccess;
+    }
+    Allocation* a = alloc(index);
+    const bool append = offset == kStreamOutputAppendOffset;
+    if (!a || !(a->desc().flags & kAllocStreamOutput) || (!append && (offset % 4 || offset > a->desc().size)) || !use(a, state::kStreamOut)) return kBad;
+    so_bound_[slot] = true;
+    so_alloc_[slot] = a;
+    if (!exec_) return status::kSuccess;
+    NtStatus s = resident(*a);
+    if (s == status::kSuccess) s = ensure_cb();
+    if (s != status::kSuccess) return s;
+    cb_->bind_stream_output(slot, a->buffer(), append ? graphics::kStreamOutputAppend : offset);
+    return status::kSuccess;
+  }
+
   NtStatus bind_uav(ByteReader& p) {
     const uint32_t slot = p.le32(), index = p.le32(), offset = p.le32(), size = p.le32();
     if (!exact(p) || in_pass_ || !(adapter_.caps_.features & graphics::kFeatureCompute) || slot >= graphics::kMaxStorageBuffers) return kBad;
     Allocation* a = alloc(index);
-    if (!a || !(a->desc().flags & kAllocUnorderedAccess) || size == 0 || offset % 4 || size % 4 || offset > a->desc().size || size > a->desc().size - offset) return kBad;
+    const bool read_only = slot >= graphics::kMaxUavBuffers;   // (the slots after u3 are shader resource views of buffers)
+    if (!a || !(a->desc().flags & kAllocUnorderedAccess) || !use(a, read_only ? state::kNonPixelShaderResource : state::kUnorderedAccess) || size == 0 || offset % 4 || size % 4 || offset > a->desc().size || size > a->desc().size - offset) return kBad;
     uav_bound_[slot] = true;
     uav_alloc_[slot] = a;
     if (!exec_) return status::kSuccess;
@@ -389,6 +447,7 @@ class Adapter::StreamRunner {
   }
 
   NtStatus dispatch(ByteReader& p) {
+    if (const NtStatus bound = apply_root_arguments()) return bound;
     const uint32_t x = p.le32(), y = p.le32(), z = p.le32();
     if (!exact(p) || in_pass_ || !compute_) return kBad;
     if (x > graphics::kMaxDispatchGroups || y > graphics::kMaxDispatchGroups || z > graphics::kMaxDispatchGroups) return kBad;
@@ -401,7 +460,7 @@ class Adapter::StreamRunner {
     if (s != status::kSuccess) return s;
     cb_->dispatch(x, y, z);
     for (uint32_t slot = 0; slot < graphics::kMaxStorageBuffers; ++slot)
-      if (uav_bound_[slot]) mm_.note_gpu_write(*uav_alloc_[slot]);
+      if (uav_bound_[slot] && slot < graphics::kMaxUavBuffers) mm_.note_gpu_write(*uav_alloc_[slot]);
     return status::kSuccess;
   }
 
@@ -409,7 +468,7 @@ class Adapter::StreamRunner {
     const uint32_t index = p.le32(), offset = p.le32();
     if (!exact(p)) return kBad;
     Allocation* a = alloc(index);
-    if (!a || !a->is_buffer() || !(a->desc().flags & kAllocVertexBuffer) || offset > a->desc().size) return kBad;
+    if (!a || !a->is_buffer() || !(a->desc().flags & kAllocVertexBuffer) || offset > a->desc().size || !use(a, state::kVertexAndConstantBuffer)) return kBad;
     vertex_ = a;
     vertex_offset_ = offset;
     if (!exec_) return status::kSuccess;
@@ -425,7 +484,7 @@ class Adapter::StreamRunner {
     if (!exact(p) || type > 1) return kBad;
     Allocation* a = alloc(index);
     const uint32_t index_bytes = type == 1 ? 4 : 2;
-    if (!a || !a->is_buffer() || !(a->desc().flags & kAllocIndexBuffer) || offset > a->desc().size || offset % index_bytes) return kBad;
+    if (!a || !a->is_buffer() || !(a->desc().flags & kAllocIndexBuffer) || offset > a->desc().size || offset % index_bytes || !use(a, state::kIndexBuffer)) return kBad;
     index_ = a;
     index_offset_ = offset;
     index_bytes_ = index_bytes;
@@ -457,7 +516,7 @@ class Adapter::StreamRunner {
     if (!exact(p) || unit >= graphics::kMaxTextureUnits || filter > 1 || au > 1 || av > 1 || mip > 2) return kBad;
     if (!finite_within(bias, 100.0f) || !finite_within(min_lod, 100.0f) || !finite_within(max_lod, 1000.0f)) return kBad;
     Allocation* a = alloc(index);
-    if (!a || !a->is_image() || !(a->desc().flags & kAllocTexture) || a->is_staging()) return kBad;
+    if (!a || !a->is_image() || !(a->desc().flags & kAllocTexture) || a->is_staging() || !use(a, state::kPixelShaderResource | state::kNonPixelShaderResource)) return kBad;
     if (in_pass_ && (a == pass_color_ || a == pass_depth_ || is_extra_target(pass_extra_, pass_target_count_ - 1, a))) return kBad;
     texture_bound_[unit] = true;
     texture_alloc_[unit] = a;
@@ -506,6 +565,7 @@ class Adapter::StreamRunner {
   // The reads a draw does must stay inside the buffers bound: the vertices [first, first + count) of the vertex buffer, and for an indexed draw the indices and (when
   // replaying, as the buffer can change after the stream was checked) the vertices they name.
   NtStatus draw(ByteReader& p, bool indexed, bool instanced) {
+    if (const NtStatus bound = apply_root_arguments()) return bound;
     const uint32_t count = p.le32(), first = p.le32();
     const int32_t vertex_offset = indexed ? static_cast<int32_t>(p.le32()) : 0;
     uint32_t instance_count = 1, first_instance = 0;
@@ -518,6 +578,9 @@ class Adapter::StreamRunner {
     if (topology_ >= Topology::LineList && topology_ <= Topology::PointList && !(adapter_.caps_.features & graphics::kFeatureLines)) return kBad;
     // Patches go with a hull and a domain shader that take that many control points, and those shaders go with patches (and with no geometry shader).
     if (is_patch_list(topology_) != pipeline_->has_tessellation()) return kBad;
+    if (pipeline_->has_stream_output())   // (every buffer the declaration writes needs a target)
+      for (uint32_t b = 0; b < graphics::kMaxStreamOutputBuffers; ++b)
+        if ((pipeline_->stream_output_buffers() >> b & 1) && !so_bound_[b]) return kBad;
     if (is_adjacency(topology_) && !pipeline_->has_geometry()) return kBad;   // (only a geometry shader takes the neighbours)
     if (pipeline_->has_tessellation() && (patch_points(topology_) != pipeline_->tess_input_points() || pipeline_->has_geometry())) return kBad;
     for (uint32_t u = 0; u < pipeline_->texture_count(); ++u)
@@ -587,6 +650,7 @@ class Adapter::StreamRunner {
     }
     if (indexed) cb_->draw_indexed(count, first, vertex_offset, instance_count, first_instance);
     else cb_->draw(count, first, instance_count, first_instance);
+    note_stream_output_written();
     return status::kSuccess;
   }
 
@@ -670,6 +734,7 @@ class Adapter::StreamRunner {
     set_device_topology(lines ? graphics::PrimitiveTopology::LineList : graphics::PrimitiveTopology::TriangleList);
     cb_->bind_index_buffer(buffer, graphics::IndexType::Uint32, 0);
     cb_->draw_indexed(static_cast<uint32_t>(emitted), 0, indexed ? vertex_offset : 0, instance_count, first_instance);
+    note_stream_output_written();
     index_rebind_ = indexed || index_ != nullptr;
     return status::kSuccess;
   }
@@ -684,7 +749,7 @@ class Adapter::StreamRunner {
     if (!exact(p) || in_pass_ || w == 0 || h == 0) return kBad;
     Allocation* dst = alloc(di);
     Allocation* src = alloc(si);
-    if (!dst || !src || !dst->is_image() || !src->is_image() || dst->is_depth() || src->is_depth()) return kBad;
+    if (!dst || !src || !dst->is_image() || !src->is_image() || dst->is_depth() || src->is_depth() || !use(dst, state::kCopyDest) || !use(src, state::kCopySource)) return kBad;
     if (dst->desc().format != src->desc().format || dst->mip_levels() != 1 || src->mip_levels() != 1 || dst->desc().samples != 1 || src->desc().samples != 1) return kBad;
     if (uint64_t{dx} + w > dst->desc().width || uint64_t{dy} + h > dst->desc().height || uint64_t{sx} + w > src->desc().width || uint64_t{sy} + h > src->desc().height) return kBad;
     if (!exec_) return status::kSuccess;
@@ -717,6 +782,312 @@ class Adapter::StreamRunner {
     return status::kSuccess;
   }
 
+  // --- Direct3D 12 binding -----------------------------------------------------------------------------------------------------------------------------------
+
+  uint64_t slot_of(const Allocation* a) const {
+    for (uint64_t i = 0; i < allocations_.size(); ++i)
+      if (allocations_[i].get() == a) return i;
+    return ~uint64_t{0};
+  }
+  bool ensure_shadow() {
+    if (shadow_.count() == allocations_.size()) return true;
+    shadow_.clear();
+    for (const SharedPointer<Allocation>& a : allocations_)
+      if (!shadow_.push_back(a->state())) return false;
+    return true;
+  }
+  uint32_t state_of(const Allocation* a) {
+    const uint64_t slot = slot_of(a);
+    return ensure_shadow() && slot < shadow_.count() ? shadow_[slot] : a->state();
+  }
+  // Whether `a` may be used for `needed` (any one of the bits) in the state the stream has left it in; an allocation that does not track states always may.
+  // (Replaying a stream that was checked does not check again: the states are those it left.)
+  bool use(const Allocation* a, uint32_t needed) {
+    return exec_ || !a->state_tracked() || state_allows(state_of(a), needed);
+  }
+  // The index of an allocation in the list (what the lowered bindings are called with).
+  bool index_of(const Allocation* a, uint32_t* index) const {
+    const uint64_t slot = slot_of(a);
+    if (slot == ~uint64_t{0}) return false;
+    *index = static_cast<uint32_t>(slot);
+    return true;
+  }
+
+  NtStatus set_root_signature(ByteReader& p) {
+    const Handle handle = p.le32();
+    if (!exact(p)) return kBad;
+    SharedPointer<RootSignatureObject> found;
+    if (exec_) {
+      if (replay_signature_cursor_ >= replay_signatures_.size()) return kBad;
+      found = replay_signatures_[replay_signature_cursor_++];
+    } else {
+      found = lookup_->find_root_signature(handle);
+      if (!found || !collected_signatures_->push_back(found)) return found ? status::kNoMemory : status::kInvalidHandle;
+    }
+    signature_ = found;
+    for (RootArgument& a : arguments_) a = RootArgument();
+    return status::kSuccess;
+  }
+
+  NtStatus set_descriptor_heaps(ByteReader& p) {
+    const uint32_t count = p.le32();
+    if (!p.ok() || count == 0 || count > 2) return kBad;
+    SharedPointer<DescriptorHeapObject> views, samplers;
+    for (uint32_t i = 0; i < count; ++i) {
+      const Handle handle = p.le32();
+      if (!p.ok()) return kBad;
+      SharedPointer<DescriptorHeapObject> found;
+      if (exec_) {
+        if (replay_heap_cursor_ >= replay_heaps_.size()) return kBad;
+        found = replay_heaps_[replay_heap_cursor_++];
+      } else {
+        found = lookup_->find_descriptor_heap(handle);
+        if (!found || !collected_heaps_->push_back(found)) return found ? status::kNoMemory : status::kInvalidHandle;
+      }
+      SharedPointer<DescriptorHeapObject>& slot = found->type() == DescriptorHeapType::Sampler ? samplers : views;
+      if (slot) return kBad;   // (two of a kind)
+      slot = found;
+    }
+    if (!exact(p)) return kBad;
+    view_heap_ = views;
+    sampler_heap_ = samplers;
+    return status::kSuccess;
+  }
+
+  const RootParameter* parameter(uint32_t index, RootParameterType type) const {
+    if (!signature_ || index >= signature_->desc.parameter_count) return nullptr;
+    const RootParameter& rp = signature_->desc.parameters[index];
+    return rp.type == type ? &rp : nullptr;
+  }
+
+  NtStatus set_root_constants(ByteReader& p) {
+    const uint32_t index = p.le32(), first = p.le32(), count = p.le32();
+    const RootParameter* rp = parameter(index, RootParameterType::Constants);
+    if (!p.ok() || !rp || count == 0 || first > rp->constant_count || count > rp->constant_count - first) return kBad;
+    RootArgument& arg = arguments_[index];
+    for (uint32_t i = 0; i < count; ++i) arg.values[first + i] = p.le32();
+    if (!exact(p)) return kBad;
+    arg.set = true;
+    return status::kSuccess;
+  }
+
+  NtStatus set_root_descriptor(ByteReader& p) {
+    const uint32_t index = p.le32(), allocation = p.le32(), offset = p.le32();
+    if (!exact(p) || !signature_ || index >= signature_->desc.parameter_count) return kBad;
+    const RootParameter& rp = signature_->desc.parameters[index];
+    Allocation* a = alloc(allocation);
+    if (!a || offset % 4 || offset >= a->desc().size) return kBad;
+    if (rp.type == RootParameterType::Cbv) {
+      if (!a->is_buffer() || a->is_query_result() || !use(a, state::kVertexAndConstantBuffer)) return kBad;
+    } else if (rp.type == RootParameterType::Uav) {
+      if (!(a->desc().flags & kAllocUnorderedAccess) || !use(a, state::kUnorderedAccess)) return kBad;
+    } else if (rp.type == RootParameterType::Srv) {
+      if (!(a->desc().flags & kAllocUnorderedAccess) || !use(a, state::kNonPixelShaderResource)) return kBad;   // (a buffer: a storage buffer the shader only reads)
+    } else {
+      return kBad;
+    }
+    arguments_[index].set = true;
+    arguments_[index].allocation = a;
+    arguments_[index].offset = offset;
+    return status::kSuccess;
+  }
+
+  NtStatus set_root_table(ByteReader& p) {
+    const uint32_t index = p.le32(), first = p.le32();
+    const RootParameter* rp = parameter(index, RootParameterType::Table);
+    if (!exact(p) || !rp) return kBad;
+    const DescriptorHeapObject* heap = rp->sampler_table ? sampler_heap_.get() : view_heap_.get();
+    if (!heap || first >= heap->count()) return kBad;
+    if (rp->table_size != kUnboundedDescriptors && rp->table_size > heap->count() - first) return kBad;
+    arguments_[index].set = true;
+    arguments_[index].first = first;
+    return status::kSuccess;
+  }
+
+  NtStatus resource_barrier(ByteReader& p) {
+    const uint32_t count = p.le32();
+    if (!p.ok() || count == 0) return kBad;
+    for (uint32_t i = 0; i < count; ++i) {
+      const uint32_t type = p.le32(), index = p.le32(), before = p.le32(), after = p.le32(), flags = p.le32();
+      if (!p.ok() || type > 2 || flags > 2) return kBad;
+      Allocation* a = index == kNoAllocation ? nullptr : alloc(index);
+      if (index != kNoAllocation && !a) return kBad;
+      if (type == 2) {
+        // An aliasing barrier: `index` is the allocation going out of use and the "before" word the index of the one coming into use (either may be kNoAllocation: nothing to do), both placed in
+        // one heap. What the GPU holds for the first goes to the heap's memory and the second is uploaded from it.
+        Allocation* incoming = before == kNoAllocation ? nullptr : alloc(before);
+        if (before != kNoAllocation && !incoming) return kBad;
+        if (!a || !incoming) continue;
+        if (in_pass_ || !a->placed() || a->heap().get() != incoming->heap().get() || a == incoming) return kBad;
+        if (exec_) {
+          NtStatus s = flush();   // (what was recorded runs first)
+          if (s == status::kSuccess && !mm_.switch_alias(*a, *incoming)) s = status::kInvalidDeviceState;
+          if (s != status::kSuccess) return s;
+        }
+        continue;
+      }
+      if (exec_) continue;   // (the rest was checked when the stream was queued)
+      if (type != 0) {
+        // (an unordered access barrier: for an allocation that is in that state; the devices order a dispatch's writes themselves. An aliasing barrier: nothing to do.)
+        if (type == 1 && a && a->state_tracked() && !(state_of(a) & state::kUnorderedAccess)) return kBad;
+        continue;
+      }
+      if (!a || ((before | after) & ~kStateMask) || before == after) return kBad;
+      if ((after & state::kWrite) && (after & (after - 1))) return kBad;   // (a state that writes stands alone)
+      if (!a->state_tracked()) continue;
+      if (flags == 1) {
+        if (state_of(a) != before) return kBad;
+        continue;   // (a split barrier begins: the change is made at its end)
+      }
+      if (state_of(a) != before) return kBad;
+      if (!ensure_shadow()) return status::kNoMemory;
+      const uint64_t slot = slot_of(a);
+      if (slot < shadow_.count()) shadow_[slot] = after;
+    }
+    return exact(p) ? status::kSuccess : kBad;
+  }
+
+  // What a draw or dispatch binds from the root arguments: b0 (the first constant buffer: root constants, a root constant buffer view or a table's first view) as the push constants, the shader
+  // resource views of tables as the texture units t<n> (with the sampler s<n> of a table or a static sampler, else s0, else the defaults), the unordered access views as storage slots u<n>.
+  NtStatus apply_root_arguments() {
+    if (!signature_) return status::kSuccess;
+    const RootSignatureDesc& sig = signature_->desc;
+    bool constants_found = false;
+    uint8_t block[graphics::kMaxPushConstantBytes] = {};
+    uint32_t block_bytes = 0;
+    auto sampler_for = [&](uint32_t unit) {
+      const graphics::SamplerDesc* found = nullptr;
+      const graphics::SamplerDesc* zero = nullptr;
+      for (uint32_t i = 0; i < sig.sampler_count; ++i) {
+        if (sig.samplers[i].space != 0) continue;
+        if (sig.samplers[i].shader_register == unit) found = &sig.samplers[i].sampler;
+        if (sig.samplers[i].shader_register == 0) zero = &sig.samplers[i].sampler;
+      }
+      for (uint32_t i = 0; i < sig.parameter_count; ++i) {
+        const RootParameter& rp = sig.parameters[i];
+        if (rp.type != RootParameterType::Table || !rp.sampler_table || !arguments_[i].set || !sampler_heap_) continue;
+        for (uint32_t r = 0; r < rp.range_count; ++r) {
+          const DescriptorRange& range = rp.ranges[r];
+          if (range.space != 0 || range.type != RangeType::Sampler) continue;
+          for (uint32_t k : {unit, 0u}) {
+            if (k < range.base_register || (range.count != kUnboundedDescriptors && k - range.base_register >= range.count)) continue;
+            const uint64_t at = uint64_t{arguments_[i].first} + range.offset + (k - range.base_register);
+            if (at < sampler_heap_->count() && sampler_heap_->at(at).kind == DescriptorKind::Sampler) {
+              if (k == unit) return sampler_heap_->at(at).sampler;
+              if (!zero) zero = &sampler_heap_->at(at).sampler;
+            }
+          }
+        }
+      }
+      return found ? *found : zero ? *zero : graphics::SamplerDesc();
+    };
+    for (uint32_t i = 0; i < sig.parameter_count; ++i) {
+      const RootParameter& rp = sig.parameters[i];
+      const RootArgument& arg = arguments_[i];
+      if (rp.type == RootParameterType::Constants) {
+        if (rp.space != 0 || rp.shader_register != 0) return kBad;   // (one constant buffer)
+        if (!arg.set) return kBad;
+        const uint32_t bytes = (rp.constant_count * 4 + 15) / 16 * 16;
+        if (constants_found || bytes > adapter_.caps_.max_push_constant_bytes) return kBad;
+        constants_found = true;
+        block_bytes = bytes;
+        ByteWriter w(ByteView(block, sizeof block));
+        for (uint32_t k = 0; k < rp.constant_count; ++k) w.le32(arg.values[k]);
+      } else if (rp.type == RootParameterType::Cbv) {
+        if (rp.space != 0 || rp.shader_register != 0 || constants_found || !arg.set) return kBad;
+        constants_found = true;
+        const uint64_t avail = arg.allocation->desc().size - arg.offset;
+        block_bytes = static_cast<uint32_t>(avail < adapter_.caps_.max_push_constant_bytes ? avail / 16 * 16 : adapter_.caps_.max_push_constant_bytes);
+        if (block_bytes == 0 || block_bytes > sizeof block) return kBad;
+        ByteView out(block, block_bytes);
+        if (!out.copy_from(arg.allocation->backing().subview(arg.offset, block_bytes))) return kBad;
+      } else if (rp.type == RootParameterType::Uav) {
+        if (rp.space != 0 || !arg.set || rp.shader_register >= graphics::kMaxUavBuffers) return kBad;
+        const NtStatus s = lower_uav(rp.shader_register, arg.allocation, arg.offset, arg.allocation->desc().size - arg.offset);
+        if (s != status::kSuccess) return s;
+      } else if (rp.type == RootParameterType::Srv) {
+        if (rp.space != 0 || !arg.set || rp.shader_register >= graphics::kMaxSrvBuffers) return kBad;
+        const NtStatus s = lower_uav(graphics::kMaxUavBuffers + rp.shader_register, arg.allocation, arg.offset, arg.allocation->desc().size - arg.offset);
+        if (s != status::kSuccess) return s;
+      } else if (rp.type == RootParameterType::Table && !rp.sampler_table) {
+        if (!arg.set || !view_heap_) return kBad;
+        for (uint32_t r = 0; r < rp.range_count; ++r) {
+          const DescriptorRange& range = rp.ranges[r];
+          if (range.space != 0) return kBad;
+          const uint64_t available = view_heap_->count() - arg.first;
+          const uint64_t count = range.count == kUnboundedDescriptors ? (available > range.offset ? available - range.offset : 0) : range.count;
+          for (uint64_t k = 0; k < count; ++k) {
+            const uint64_t at = uint64_t{arg.first} + range.offset + k;
+            if (at >= view_heap_->count()) return kBad;
+            const Descriptor& d = view_heap_->at(at);
+            const uint32_t reg = range.base_register + static_cast<uint32_t>(k);
+            if (d.kind == DescriptorKind::None) continue;   // (a descriptor that was never written: not used by a shader that is right)
+            if (range.type == RangeType::Srv && d.kind == DescriptorKind::Srv && d.allocation->is_buffer()) {
+              if (reg >= graphics::kMaxSrvBuffers) return kBad;
+              const NtStatus s = lower_uav(graphics::kMaxUavBuffers + reg, d.allocation.get(), d.offset, d.size);
+              if (s != status::kSuccess) return s;
+            } else if (range.type == RangeType::Srv && d.kind == DescriptorKind::Srv) {
+              if (reg >= graphics::kMaxTextureUnits) return kBad;
+              const NtStatus s = lower_texture(reg, d.allocation.get(), sampler_for(reg));
+              if (s != status::kSuccess) return s;
+            } else if (range.type == RangeType::Uav && d.kind == DescriptorKind::Uav) {
+              if (reg >= graphics::kMaxUavBuffers) return kBad;
+              const NtStatus s = lower_uav(reg, d.allocation.get(), d.offset, d.size);
+              if (s != status::kSuccess) return s;
+            } else if (range.type == RangeType::Cbv && d.kind == DescriptorKind::Cbv) {
+              if (reg != 0 || constants_found) return kBad;
+              constants_found = true;
+              block_bytes = static_cast<uint32_t>(d.size < adapter_.caps_.max_push_constant_bytes ? d.size / 16 * 16 : adapter_.caps_.max_push_constant_bytes);
+              if (block_bytes == 0 || block_bytes > sizeof block || !use(d.allocation.get(), state::kVertexAndConstantBuffer)) return kBad;
+              ByteView out(block, block_bytes);
+              if (!out.copy_from(d.allocation->backing().subview(d.offset, block_bytes))) return kBad;
+            } else if (d.kind != DescriptorKind::Srv && d.kind != DescriptorKind::Uav && d.kind != DescriptorKind::Cbv) {
+              return kBad;
+            } else if ((range.type == RangeType::Srv) != (d.kind == DescriptorKind::Srv) || (range.type == RangeType::Uav) != (d.kind == DescriptorKind::Uav)) {
+              return kBad;   // (a descriptor of another kind than its range)
+            }
+          }
+        }
+      }
+    }
+    if (constants_found && (!constants_sent_ || block_bytes != last_constants_bytes_ || __builtin_memcmp(block, last_constants_, block_bytes) != 0)) {
+      ByteBuffer packet(adapter_.allocator_);
+      packet.put32(block_bytes);
+      packet.append(ConstByteView(block, block_bytes));
+      ByteReader reader(packet.view());
+      const NtStatus s = push_constants(reader);
+      if (s != status::kSuccess) return s;
+      constants_sent_ = true;
+      last_constants_bytes_ = block_bytes;
+      ByteView(last_constants_, sizeof last_constants_).copy_from(ConstByteView(block, block_bytes));
+    }
+    return status::kSuccess;
+  }
+
+  NtStatus lower_texture(uint32_t unit, Allocation* a, const graphics::SamplerDesc& sampler) {
+    uint32_t index = 0;
+    if (!a || !index_of(a, &index)) return kBad;   // (the allocation is in the list or the draw is refused)
+    ByteBuffer packet(adapter_.allocator_);
+    for (uint32_t w : {unit, index, static_cast<uint32_t>(sampler.filter), static_cast<uint32_t>(sampler.address_u), static_cast<uint32_t>(sampler.address_v), static_cast<uint32_t>(sampler.mip_filter),
+                       __builtin_bit_cast(uint32_t, sampler.lod_bias), __builtin_bit_cast(uint32_t, sampler.min_lod), __builtin_bit_cast(uint32_t, sampler.max_lod)})
+      packet.put32(w);
+    ByteReader reader(packet.view());
+    return bind_texture(reader);
+  }
+
+  NtStatus lower_uav(uint32_t slot, Allocation* a, uint64_t offset, uint64_t size) {
+    uint32_t index = 0;
+    if (!a || !index_of(a, &index) || offset > 0xFFFFFFFFu || size > 0xFFFFFFFFu) return kBad;
+    ByteBuffer packet(adapter_.allocator_);
+    for (uint32_t w : {slot, index, static_cast<uint32_t>(offset), static_cast<uint32_t>(size)}) packet.put32(w);
+    ByteReader reader(packet.view());
+    return bind_uav(reader);
+  }
+
+  bool constants_sent_ = false;
+  uint32_t last_constants_bytes_ = 0;
+  alignas(16) uint8_t last_constants_[graphics::kMaxPushConstantBytes] = {};
+
   Adapter& adapter_;
   VidMm& mm_;
   ConstByteView commands_;
@@ -726,6 +1097,22 @@ class Adapter::StreamRunner {
   List<SharedPointer<PipelineObject>>* collected_ = nullptr;
   ArrayView<const SharedPointer<PipelineObject>> replay_;
   uint64_t replay_cursor_ = 0;
+  List<SharedPointer<RootSignatureObject>>* collected_signatures_ = nullptr;
+  List<SharedPointer<DescriptorHeapObject>>* collected_heaps_ = nullptr;
+  ArrayView<const SharedPointer<RootSignatureObject>> replay_signatures_;
+  ArrayView<const SharedPointer<DescriptorHeapObject>> replay_heaps_;
+  uint64_t replay_signature_cursor_ = 0, replay_heap_cursor_ = 0;
+  // Direct3D 12 binding: the root signature set, the heaps, and the arguments of its parameters.
+  SharedPointer<RootSignatureObject> signature_;
+  SharedPointer<DescriptorHeapObject> view_heap_, sampler_heap_;
+  struct RootArgument {
+    bool set = false;
+    uint32_t values[kMaxRootDwords] = {};
+    Allocation* allocation = nullptr;   // a root descriptor: the buffer and the offset of its range
+    uint64_t offset = 0;
+    uint32_t first = 0;                 // a table: its first descriptor in the heap
+  } arguments_[kMaxRootParameters];
+  List<uint32_t> shadow_{adapter_.allocator_};   // the resource state of each allocation of the list, as the barriers so far leave it (empty until one is asked)
   graphics::ICommandBuffer* cb_ = nullptr;
   // The state a stream builds up, to check the draws.
   bool in_pass_ = false;
@@ -744,6 +1131,8 @@ class Adapter::StreamRunner {
   const Allocation* pass_depth_ = nullptr;
   PipelineObject* pipeline_ = nullptr;
   PipelineObject* compute_ = nullptr;
+  bool so_bound_[graphics::kMaxStreamOutputBuffers] = {};
+  Allocation* so_alloc_[graphics::kMaxStreamOutputBuffers] = {};
   bool uav_bound_[graphics::kMaxStorageBuffers] = {};
   Allocation* uav_alloc_[graphics::kMaxStorageBuffers] = {};
   Allocation* vertex_ = nullptr;
@@ -920,6 +1309,7 @@ NtStatus Adapter::create_shader(const ShaderDesc& desc, SharedPointer<ShaderObje
       for (uint32_t u = 0; u < graphics::kMaxTextureUnits; ++u) shader->texture_kinds_[u] = program->texture_kind(u);
       for (uint32_t k = 0; k < 3; ++k) shader->thread_group_[k] = program->thread_group(k);
       shader->geometry_input_ = program->geometry_input();
+      shader->geometry_streams_ = program->geometry_streams();
       shader->tess_input_points_ = program->tess_input_points();
       shader->tess_output_points_ = program->tess_output_points();
       shader->tess_domain_ = program->tess_domain();
@@ -987,6 +1377,25 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
     if (!(caps_.features & graphics::kFeatureTessellation)) return status::kNotSupported;
     if (geometry) return status::kNotSupported;   // (a geometry shader after the tessellator is not made)
   }
+  if (d.stream_output_count) {
+    // (stream output takes the outputs of the geometry shader, or the domain shader, or the vertex shader; the entries name streams the geometry shader has (the others have one), outputs and
+    // components that exist, and a buffer takes only one stream; each buffer's record is as long as its entries need, in whole words)
+    if (!(caps_.features & graphics::kFeatureStreamOutput)) return status::kNotSupported;
+    if (d.stream_output_count > graphics::kMaxStreamOutputEntries || d.rasterized_stream < -1 || d.rasterized_stream >= static_cast<int32_t>(graphics::kMaxGeometryStreams) || (!geometry && d.rasterized_stream > 0)) return status::kInvalidParameter;
+    const uint32_t stream_count = geometry ? geometry->geometry_streams() : 1;
+    int32_t stream_of_buffer[graphics::kMaxStreamOutputBuffers] = {-1, -1, -1, -1};
+    uint32_t bytes[graphics::kMaxStreamOutputBuffers] = {};
+    for (uint32_t e = 0; e < d.stream_output_count; ++e) {
+      const graphics::StreamOutputEntry& entry = d.stream_output[e];
+      if (entry.stream >= stream_count || entry.output > graphics::kMaxVaryings || entry.component_count == 0 || entry.start_component + entry.component_count > 4 || entry.buffer >= graphics::kMaxStreamOutputBuffers)
+        return status::kInvalidParameter;
+      if (stream_of_buffer[entry.buffer] >= 0 && stream_of_buffer[entry.buffer] != entry.stream) return status::kInvalidParameter;
+      stream_of_buffer[entry.buffer] = entry.stream;
+      bytes[entry.buffer] += 4u * entry.component_count;
+    }
+    for (uint32_t b = 0; b < graphics::kMaxStreamOutputBuffers; ++b)
+      if (stream_of_buffer[b] >= 0 && (d.stream_output_stride[b] < bytes[b] || d.stream_output_stride[b] % 4 || d.stream_output_stride[b] > 2048)) return status::kInvalidParameter;
+  }
   if (geometry && (geometry->stage() != graphics::ShaderStage::Geometry || !(caps_.features & graphics::kFeatureGeometryShaders))) return geometry && geometry->stage() != graphics::ShaderStage::Geometry ? status::kInvalidParameter : status::kNotSupported;
   if ((bs.custom || d.depth_compare != graphics::CompareOp::LessEqual) && !(caps_.features & graphics::kFeatureBlendState)) return status::kNotSupported;
   for (uint32_t i = 0; i < d.attribute_count; ++i)
@@ -1012,6 +1421,10 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   pd.independent_blend = d.independent_blend;
   pd.multisample = d.multisample;
   pd.alpha_to_coverage = d.alpha_to_coverage;
+  pd.stream_output_count = d.stream_output_count;
+  for (uint32_t e = 0; e < d.stream_output_count; ++e) pd.stream_output[e] = d.stream_output[e];
+  for (uint32_t b = 0; b < graphics::kMaxStreamOutputBuffers; ++b) pd.stream_output_stride[b] = d.stream_output_stride[b];
+  pd.rasterized_stream = d.rasterized_stream;
   pd.geometry_shader = geometry ? geometry->module() : nullptr;
   pd.hull_shader = hull ? hull->module() : nullptr;
   pd.domain_shader = domain ? domain->module() : nullptr;
@@ -1031,6 +1444,7 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   if (hull) pipeline->tess_input_points_ = hull->tess_input_points();
   pipeline->blends_ = d.alpha_blend || d.blend.enable || (d.independent_blend && (d.target_blend[0].enable || d.target_blend[1].enable || d.target_blend[2].enable));
   if (geometry) pipeline->geometry_input_ = geometry->geometry_input();
+  for (uint32_t e = 0; e < d.stream_output_count; ++e) pipeline->stream_output_buffers_ |= 1u << d.stream_output[e].buffer;
   pipeline->stride_ = d.vertex_stride;
   for (uint32_t i = 0; i < d.attribute_count; ++i) pipeline->per_instance_ = pipeline->per_instance_ || d.attributes[i].per_instance;
   pipeline->attribute_count_ = d.attribute_count;
@@ -1085,7 +1499,7 @@ NtStatus Adapter::queue_render(ContextObject& context, ConstByteView commands, A
   for (const SharedPointer<Allocation>& a : allocations)
     if (!s->allocations.push_back(a)) return status::kNoMemory;
   StreamRunner runner(*this, s->commands.view(), ArrayView<const SharedPointer<Allocation>>(s->allocations.view().data(), s->allocations.count()));
-  const NtStatus v = runner.validate(pipelines, s->pipelines);
+  const NtStatus v = runner.validate(pipelines, s->pipelines, s->signatures, s->heaps);
   if (v != status::kSuccess) return v;
   return queue(context, util::move(s));
 }
@@ -1136,7 +1550,8 @@ NtStatus Adapter::queue_present(ContextObject& context, const PresentArgs& args,
 
 NtStatus Adapter::execute_render(Submission& s) {
   StreamRunner runner(*this, s.commands.view(), ArrayView<const SharedPointer<Allocation>>(s.allocations.view().data(), s.allocations.count()));
-  return runner.execute(ArrayView<const SharedPointer<PipelineObject>>(s.pipelines.view().data(), s.pipelines.count()));
+  return runner.execute(ArrayView<const SharedPointer<PipelineObject>>(s.pipelines.view().data(), s.pipelines.count()), ArrayView<const SharedPointer<RootSignatureObject>>(s.signatures.view().data(), s.signatures.count()),
+                        ArrayView<const SharedPointer<DescriptorHeapObject>>(s.heaps.view().data(), s.heaps.count()));
 }
 
 NtStatus Adapter::execute_present(Submission& s) {

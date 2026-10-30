@@ -51,6 +51,7 @@ enum BufferUsage : uint32_t {
   kBufferVertex = 1u << 0,
   kBufferIndex = 1u << 1,
   kBufferStorage = 1u << 2,   // kFeatureCompute: read and written by compute shaders (bind_storage_buffer)
+  kBufferStreamOutput = 1u << 3,   // kFeatureStreamOutput: a geometry shader's stream output goes here (bind_stream_output); read back with IBuffer::read_back
 };
 
 class IBuffer {
@@ -61,10 +62,16 @@ class IBuffer {
   virtual void unmap() = 0;
   // After a submit() in which the GPU may have written the buffer (a storage buffer a compute shader wrote): brings what it holds into map(). True if the contents are current.
   virtual bool read_back() { return true; }
+  // A stream output buffer: the offset the last bound stream output reached (bind_stream_output with kStreamOutputAppend starts there).
+  uint64_t stream_output_filled() const { return stream_output_filled_; }
+  void set_stream_output_filled(uint64_t offset) { stream_output_filled_ = offset; }
 
  protected:
   constexpr IBuffer() = default;
   ~IBuffer() = default;
+
+ private:
+  uint64_t stream_output_filled_ = 0;
 };
 
 enum ImageUsage : uint32_t {
@@ -107,6 +114,13 @@ class IImage {
   // default), the image is not a color image or `pixels` is the wrong size. Not synchronised with a submit() that uses the image: an image belongs to one user at a time.
   virtual bool write_pixels(ArrayView<const uint32_t> pixels) {
     (void)pixels;
+    return false;
+  }
+  // Replaces a rectangle of a color image and leaves the rest as it is: `pixels` begins at the rectangle's top left pixel and its rows are `pitch` pixels apart (the rectangle's
+  // last row must be inside `pixels`), 0xAARRGGBB, rows top to bottom. False if the device cannot do this (the default: write_pixels the whole image then), the rectangle is empty or
+  // not inside the image, `pitch` is less than its width, `pixels` is too short, or as for write_pixels.
+  virtual bool write_rect(const Rect2D& area, ArrayView<const uint32_t> pixels, uint32_t pitch) {
+    (void)area, (void)pixels, (void)pitch;
     return false;
   }
   // The same for the float formats (kFeatureFloatFormats; Format::R16G16B16A16Float / R32G32B32A32Float): extent.width * extent.height colours, rows top to bottom, not clamped. Half-float images
@@ -254,6 +268,12 @@ struct FragmentContext {
   Vec4 position;
   bool front_facing = true;
   uint32_t primitive_id = 0;
+  // Derivatives (ddx / ddy): the pixel is one of the four of a 2 x 2 quad (`quad_corner`: x & 1 | (y & 1) << 1), and `quad_fn` gives the varyings and the position of any corner, at its
+  // pixel's centre, extended out of the primitive if it is not covered. A shader asks only when it takes a derivative; without the function (points, lines) the derivatives are zero.
+  using QuadFn = void (*)(const void* user, uint32_t corner, Vec4* varyings, Vec4* position);
+  QuadFn quad_fn = nullptr;
+  const void* quad_user = nullptr;
+  uint32_t quad_corner = 0;
 };
 using VertexShaderFnEx = void (*)(const Vec4* attributes, const uint8_t* constants, const VertexContext& context, ShaderIo* out);
 using FragmentShaderFnEx = bool (*)(const Vec4* varyings, const FragmentContext& context, const uint8_t* constants, const ITextureSet& textures, Vec4* color);
@@ -265,6 +285,16 @@ enum class GeometryPrimitive : uint8_t { Point, Line, Triangle, LineAdjacency, T
 constexpr uint32_t kMaxGeometryInputVertices = 6;
 enum class GeometryTopology : uint8_t { PointList, LineStrip, TriangleStrip };
 constexpr uint32_t kMaxGeometryVertices = 64;   // the most a module's maximum may be
+// Stream output (kFeatureStreamOutput): a geometry shader's vertices are written to buffers as well as (or instead of) being drawn. A geometry shader may have up to kMaxGeometryStreams
+// output streams (with more than one, each stream is a list of points); each entry of a pipeline's declaration takes `component_count` components from `start_component` of one output of the
+// vertices of `stream` - output 0 the position (as the shader wrote it, +Y up), output n (1 .. kMaxVaryings) varying n - 1 - and puts them, one after the other with the entries before it
+// for the same buffer, in each record of that buffer (a record is `stride` bytes, the components 32-bit floats). A strip is written as a list: a triangle strip as triangles, with the
+// vertices of every second one swapped as for drawing, a line strip as lines; a primitive that does not fit in a buffer is not written (nor is any after it).
+constexpr uint32_t kMaxGeometryStreams = 4, kMaxStreamOutputEntries = 16, kMaxStreamOutputBuffers = 4;
+constexpr uint64_t kStreamOutputAppend = ~uint64_t{0};   // bind_stream_output's offset for "where the buffer's last stream output ended"
+struct StreamOutputEntry {
+  uint8_t stream = 0, output = 0, start_component = 0, component_count = 0, buffer = 0;
+};
 struct GeometryInputData {
   Vec4 position[kMaxGeometryInputVertices];
   Vec4 varying[kMaxGeometryInputVertices][kMaxVaryings];
@@ -275,6 +305,7 @@ struct GeometryOutputData {
   uint32_t count = 0;
   ShaderIo vertex[kMaxGeometryVertices];
   bool restart[kMaxGeometryVertices] = {};   // a strip ended just before this vertex (a cut)
+  uint8_t stream[kMaxGeometryVertices] = {};   // the stream the vertex was emitted to (strips are cut per stream)
 };
 using GeometryShaderFn = void (*)(const GeometryInputData& input, const uint8_t* constants, GeometryOutputData* output);
 
@@ -306,7 +337,9 @@ using DomainShaderFn = void (*)(const HullOutputData& patch, float u, float v, f
 // Compute shaders (kFeatureCompute). A software compute shader is called once per thread; the device runs the groups of a dispatch one after the other and the threads of a group
 // in order (no barriers or group-shared memory: a module that needs them is not given a function). `buffers` are the storage buffers bound at the time (empty views for slots
 // that are not bound); a read or write outside a buffer must be dropped or read as zero by the shader.
-constexpr uint32_t kMaxStorageBuffers = 4;
+constexpr uint32_t kMaxUavBuffers = 4;                            // u0 .. u3: storage buffers shaders read and write
+constexpr uint32_t kMaxSrvBuffers = 4;                            // t0 .. t3 of a buffer: read-only storage buffers, in the slots after the u# ones (slot kMaxUavBuffers + n)
+constexpr uint32_t kMaxStorageBuffers = kMaxUavBuffers + kMaxSrvBuffers;
 constexpr uint32_t kMaxSharedMemories = 4;     // group-shared memories (g0 .. g3) of a compute shader (the group runner makes them: a context's `shared`)
 constexpr uint32_t kMaxSharedBytes = 32768;   // all of them together (Direct3D's limit)
 constexpr uint32_t kMaxBarrierThreads = 256;  // threads of a group that uses barriers (each has its own registers while it waits)
@@ -354,6 +387,7 @@ struct ShaderModuleDesc {
   uint32_t shared_memory_bytes = 0;                        // ... and how much group-shared memory it declares (virgl makes it with the shader)
   uint32_t geometry_max_vertices = 0;
   uint32_t geometry_instances = 1;   // runs of a geometry shader for each primitive (1 .. 32)
+  uint32_t geometry_streams = 1;     // output streams of a geometry shader (1 .. kMaxGeometryStreams)
   // Hull and domain shaders (stages Hull and Domain): functions for the software device (virgl: TGSI text), the control points taken and made, and the tessellator's settings (both stages say them).
   HullShaderFn hull_function = nullptr;
   DomainShaderFn domain_function = nullptr;
@@ -451,6 +485,11 @@ struct GraphicsPipelineDesc {
   bool alpha_to_coverage = false;
   // kFeatureGeometryShaders: a geometry shader module run between the vertex and fragment shaders (nullptr: none). What it takes must be what the draws make (triangles, lines or points).
   const IShaderModule* geometry_shader = nullptr;
+  // kFeatureStreamOutput, with a geometry shader: where the vertices it emits are also written (see StreamOutputEntry), and which stream is drawn (-1: none).
+  uint32_t stream_output_count = 0;
+  StreamOutputEntry stream_output[kMaxStreamOutputEntries] = {};
+  uint32_t stream_output_stride[kMaxStreamOutputBuffers] = {};
+  int32_t rasterized_stream = 0;
   // kFeatureTessellation: the hull and domain shader modules of a pipeline for PatchList draws (both or neither).
   const IShaderModule* hull_shader = nullptr;
   const IShaderModule* domain_shader = nullptr;
@@ -477,7 +516,7 @@ enum class IndexType : uint8_t { Uint16, Uint32 };
 
 // What the vertices of a draw make (set_primitive_topology, DeviceFeature kFeatureLines for anything but triangles). Lines and points are one pixel wide.
 enum class ResolveMode : uint8_t { Average, Sample0, Min, Max };
-enum class QueryKind : uint8_t { Occlusion, OcclusionPredicate, IaVertices, IaPrimitives, VsInvocations, PsInvocations };
+enum class QueryKind : uint8_t { Occlusion, OcclusionPredicate, IaVertices, IaPrimitives, VsInvocations, PsInvocations, Timestamp, SoPrimitivesWritten, SoPrimitivesNeeded, TimestampFrequency, TimestampDisjoint };
 enum class PrimitiveTopology : uint8_t { TriangleList, LineList, PointList, PatchList, LineListAdjacency, TriangleListAdjacency };   // (the adjacency lists need a geometry shader that takes them)   // (PatchList: kFeatureTessellation, with set_patch_control_points)
 
 struct Viewport {
@@ -534,6 +573,10 @@ class ICommandBuffer {
   // Compute (kFeatureCompute), outside a render pass: bind_compute_pipeline makes the pipeline of create_compute_pipeline current for the dispatches that follow, bind_storage_buffer
   // puts `size` bytes of a kBufferStorage buffer from `offset` in slot 0 .. kMaxStorageBuffers - 1, and dispatch runs x * y * z thread groups. A device without the feature ignores all three.
   virtual void bind_compute_pipeline(const IPipeline* pipeline) { (void)pipeline; }
+  // Stream output (kFeatureStreamOutput): makes `buffer` (kBufferStreamOutput) from `offset` the target of stream output buffer `slot` (a null buffer unbinds it); what the draws that follow
+  // write goes after what is there already (a bind starts at its offset; with kStreamOutputAppend, where the last stream output into that buffer ended, IBuffer::stream_output_filled, which a
+  // submit updates). Outside a render pass or in one.
+  virtual void bind_stream_output(uint32_t slot, IBuffer* buffer, uint64_t offset) { (void)slot, (void)buffer, (void)offset; }
   virtual void bind_storage_buffer(uint32_t slot, IBuffer* buffer, uint64_t offset, uint64_t size) {
     (void)slot, (void)buffer, (void)offset, (void)size;
   }
@@ -545,7 +588,12 @@ class ICommandBuffer {
   // The other queries (kFeatureStatisticsQueries), begun and ended the same way and read with occlusion_result: OcclusionPredicate is 1 if any fragment passed, else 0; IaVertices the vertices
   // the draws between begin and end took (a draw of n vertices and i instances: n * i), IaPrimitives the primitives they assembled (a patch is a primitive), VsInvocations the vertex shader
   // runs (a device may run it fewer times than there are vertices, by reusing results) and PsInvocations the fragment shader runs (a device may shade more pixels than it writes).
-  virtual void begin_query(uint32_t slot, QueryKind kind) {
+  // Timestamp (kFeatureTimestampQueries): the time the query ends, in nanoseconds of a clock that never goes back (the software rasterizer's is a count that goes up by 1000 for each timestamp, unless the
+  // kernel gives it a clock). TimestampFrequency (kFeatureTimestampQueries) is the ticks a second of the timestamps (1000000000: they are nanoseconds) and TimestampDisjoint 1 if the clock was
+  // interrupted (a frequency change, a reset) while the query was open, else 0: a device that cannot tell says 0. Neither needs a draw. SoPrimitivesWritten / SoPrimitivesNeeded (kFeatureStatisticsQueries with kFeatureStreamOutput), of the output stream `stream`: the primitives the draws between begin and
+  // end wrote to stream output buffers, and those the geometry shader made for that stream, whether or not they fit.
+  virtual void begin_query(uint32_t slot, QueryKind kind, uint32_t stream = 0) {
+    (void)stream;
     if (kind == QueryKind::Occlusion) begin_occlusion_query(slot);
   }
   virtual void end_occlusion_query() {}
@@ -575,6 +623,8 @@ enum DeviceFeature : uint32_t {
   kFeatureLines = 1u << 4,         // set_primitive_topology: lines and points
   kFeatureFloatFormats = 1u << 6,      // Format::R16G16B16A16Float / R32G32B32A32Float images: colour attachments (also several at once) and sampled textures, without mipmaps; read_pixels_float / write_pixels_float
   kFeatureTessellation = 1u << 16,     // ShaderStage::Hull / Domain, GraphicsPipelineDesc::hull_shader / domain_shader, PrimitiveTopology::PatchList
+  kFeatureTimestampQueries = 1u << 22,   // QueryKind::Timestamp
+  kFeatureStreamOutput = 1u << 21,       // GraphicsPipelineDesc::stream_output, ICommandBuffer::bind_stream_output, kBufferStreamOutput buffers, ShaderModuleDesc::geometry_streams
   kFeatureDepthResolve = 1u << 19,       // resolve_image of a multisampled depth image (sample 0)
   kFeatureResolveModes = 1u << 20,       // ResolveMode other than a colour image's average and a depth image's sample 0
   kFeatureStatisticsQueries = 1u << 18,  // QueryKind other than Occlusion (with kFeatureOcclusionQueries)
@@ -623,6 +673,9 @@ class IGraphicsDevice {
   virtual void destroy_command_buffer(ICommandBuffer* commands) = 0;
 
   // Runs the recorded commands; returns when they are done (or failed).
+  // The timestamp clock was interrupted (the device was reset, changed its power state or its clock): the next TimestampDisjoint query says 1, once, and timestamps from before are not comparable
+  // with those after. Devices without kFeatureTimestampQueries ignore it.
+  virtual void interrupt_clock() {}
   virtual bool submit(ICommandBuffer* commands) = 0;
   // Shows `image` (created with kImagePresent) on the screen.
   virtual bool present(IImage* image) = 0;

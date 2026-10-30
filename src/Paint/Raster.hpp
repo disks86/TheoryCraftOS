@@ -98,6 +98,8 @@ bool blur_pixmap(Pixmap& pixmap, float sigma);
 
 // One filter function on a picture (everything but Blur and DropShadow, which need room: blur_pixmap and drop_shadow).
 void color_filter(Pixmap& pixmap, FilterStep::Kind kind, float amount);
+// The same filter function as a colour transform for the renderer's group filters; false for a kind that is not one (Blur, DropShadow).
+bool color_filter_transform(FilterStep::Kind kind, float amount, graphics::ColorTransform* out);
 // Draws a shadow of the picture under it: the alpha shifted by (dx, dy), blurred with `sigma` and tinted with `color`. False if memory ran out.
 bool drop_shadow(Pixmap& pixmap, int32_t dx, int32_t dy, float sigma, uint32_t color);
 

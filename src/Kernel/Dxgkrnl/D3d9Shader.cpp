@@ -77,11 +77,17 @@ struct D3d9Program::State {
   const graphics::HullOutputData* patch_in = nullptr;      // a domain shader's patch (control points and constants)
   Q patch_out[graphics::kMaxPatchRegisters] = {};          // a hull shader's patch constant registers
   graphics::GeometryOutputData* geometry_out = nullptr;
-  bool geometry_cut = false;   // a cut came after the last emit
+  bool geometry_cut[graphics::kMaxGeometryStreams] = {};   // a cut came after the last emit to the stream
+  uint32_t stream_vertices[graphics::kMaxGeometryStreams] = {};   // vertices emitted to each stream
   Q sys[kSysValueCount] = {};
   bool killed = false;
   bool at_barrier = false;     // the run stopped at a barrier ...
   uint64_t barrier_pc = 0;     // ... and goes on from this instruction
+  // Derivatives: the pixel's context (its quad) and, in a run made for the derivative of another pixel's value, the instruction whose source it hands back.
+  const graphics::FragmentContext* fragment = nullptr;
+  uint32_t derivative_depth = 0;
+  uint64_t capture_at = ~uint64_t{0};
+  Q captured = {{0, 0, 0, 0}};
 };
 
 D3d9Program::D3d9Program(allocators::IAllocator& allocator) : allocator_(allocator), code_(allocator), defs_(allocator), bools_(allocator) {}
@@ -597,11 +603,53 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
         break;
       case kDiscardNz:
       case kDiscardZ:
-        if ((bits_of(a.f[0]) != 0) == (ins.op == kDiscardNz)) {
+        if ((bits_of(a.f[0]) != 0) == (ins.op == kDiscardNz) && s.capture_at == ~uint64_t{0}) {   // (a pixel run for a derivative goes on: a helper invocation)
           s.killed = true;
           return;
         }
         break;
+      case kDdx: case kDdy: case kDdxCoarse: case kDdyCoarse: {
+        // The value of the source at the other pixels of the quad is found by running the shader up to this instruction for them, on their varyings; the derivative is the difference of the
+        // pair along the axis (a pair of the pixel's own row or column, or of the quad's first for the coarse ones).
+        if (s.capture_at == pc - 1) {
+          s.captured = a;
+          return;
+        }
+        const graphics::FragmentContext* f = s.fragment;
+        if (!f || !f->quad_fn || s.derivative_depth >= 2) {
+          store(ins.dst, r);
+          break;
+        }
+        const bool y_axis = ins.op == kDdy || ins.op == kDdyCoarse, coarse = ins.op == kDdxCoarse || ins.op == kDdyCoarse;
+        const uint32_t own = f->quad_corner & 3;
+        uint32_t corner[2];
+        if (!y_axis) corner[0] = coarse ? 0 : (own & 2), corner[1] = corner[0] + 1;
+        else corner[0] = coarse ? 0 : (own & 1), corner[1] = corner[0] + 2;
+        Q value[2];
+        for (uint32_t k = 0; k < 2; ++k) {
+          if (corner[k] == own) {
+            value[k] = a;
+            continue;
+          }
+          graphics::Vec4 varyings[graphics::kMaxVaryings] = {}, position = {};
+          f->quad_fn(f->quad_user, corner[k], varyings, &position);
+          State other = {};
+          other.varyings = varyings;
+          other.constants = s.constants;
+          other.textures = s.textures;
+          for (uint32_t n = 0; n < kSysValueCount; ++n) other.sys[n] = s.sys[n];
+          other.sys[kSysPosition] = {{position.x, position.y, position.z, position.w}};
+          other.fragment = f;
+          other.derivative_depth = s.derivative_depth + 1;
+          other.capture_at = pc - 1;
+          // (what the shader has computed before this instruction does not depend on the other pixel's results: the run starts at the beginning)
+          execute(other, 0, pc);
+          value[k] = other.captured;
+        }
+        for (int i = 0; i < 4; ++i) r.f[i] = value[1].f[i] - value[0].f[i];
+        store(ins.dst, r);
+        break;
+      }
       default: break;
     }
     switch (ins.op) {
@@ -633,8 +681,11 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
         graphics::ShaderIo& v = out->vertex[out->count];
         v.position = {s.pos.f[0], -s.pos.f[1], s.pos.f[2], s.pos.f[3]};
         for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) v.varying[i] = {s.var[i].f[0], s.var[i].f[1], s.var[i].f[2], s.var[i].f[3]};
-        out->restart[out->count] = s.geometry_cut;
-        s.geometry_cut = false;
+        const uint32_t stream = ins.control < graphics::kMaxGeometryStreams ? ins.control : 0;
+        out->restart[out->count] = s.geometry_cut[stream];
+        out->stream[out->count] = static_cast<uint8_t>(stream);
+        s.geometry_cut[stream] = false;
+        ++s.stream_vertices[stream];
         ++out->count;
         break;
       }
@@ -643,7 +694,7 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
         s.barrier_pc = pc;
         return;
       case kGsCut:
-        if (s.geometry_out && s.geometry_out->count) s.geometry_cut = true;
+        if (s.geometry_out && ins.control < graphics::kMaxGeometryStreams && s.stream_vertices[ins.control]) s.geometry_cut[ins.control] = true;
         break;
       case kBufLoad: case kBufStore: case kBufAtomic: case kBufImmAtomic: {
         if (!s.compute || ins.uav >= graphics::kMaxStorageBuffers + graphics::kMaxSharedMemories) break;
@@ -877,6 +928,24 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
         store(ins.dst, b);
         break;
       }
+      case kTexGather: {
+        // The four texels of the bilinear footprint of (u, v), component `control` of each: x (i0, j0 + 1), y (i1, j0 + 1), z (i1, j0), w (i0, j0). Each is looked up by a filtered sample at
+        // the middle of its texel, so that the sampler's address mode (wrap, clamp, mirror) does what it does for any other lookup.
+        b = {{0, 0, 0, 0}};
+        const uint32_t unit = ins.src[1].number;
+        uint32_t w = 0, h = 0, levels = 0;
+        if (s.textures && unit < graphics::kMaxTextureUnits && s.textures->size(unit, 0, &w, &h, &levels) && w && h) {
+          const float x = __builtin_floorf(a.f[0] * static_cast<float>(w) - 0.5f), y = __builtin_floorf(a.f[1] * static_cast<float>(h) - 0.5f);
+          const float xs[4] = {x, x + 1, x + 1, x}, ys[4] = {y + 1, y + 1, y, y};
+          for (uint32_t k = 0; k < 4; ++k) {
+            const graphics::Vec4 t = s.textures->sample_lod(unit, (xs[k] + 0.5f) / static_cast<float>(w), (ys[k] + 0.5f) / static_cast<float>(h), 0.0f);
+            const float texel[4] = {t.x, t.y, t.z, t.w};
+            b.f[k] = texel[ins.control & 3];
+          }
+        }
+        store(ins.dst, b);
+        break;
+      }
       case kTexKill: {
         const Q t = fetch(ins.src[0], 0);
         if (t.f[0] < 0 || t.f[1] < 0 || t.f[2] < 0) {
@@ -917,6 +986,7 @@ bool D3d9Program::run_fragment_ex(const graphics::Vec4* varyings, const graphics
   s.sys[kSysPosition] = {{context.position.x, context.position.y, context.position.z, context.position.w}};
   s.sys[kSysFrontFacing].f[0] = from_bits(context.front_facing ? 0xFFFFFFFFu : 0u);
   s.sys[kSysPrimitiveId].f[0] = from_bits(context.primitive_id);
+  s.fragment = &context;
   execute(s);
   if (s.killed) return false;
   for (uint32_t n = 0; n < color_outputs_; ++n) color[n] = {s.color[n].f[0], s.color[n].f[1], s.color[n].f[2], s.color[n].f[3]};
@@ -1167,6 +1237,7 @@ NtStatus D3d9Binding::bind(UniquePointer<D3d9Program> program, graphics::ShaderM
     desc->geometry_output = program->geometry_output();
     desc->geometry_max_vertices = program->geometry_max_vertices();
     desc->geometry_instances = program->geometry_instances();
+    desc->geometry_streams = program->geometry_streams();
     program_ = util::move(program);
     return status::kSuccess;
   }

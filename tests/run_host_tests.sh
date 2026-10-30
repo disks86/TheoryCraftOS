@@ -96,7 +96,7 @@ for t in "${WANTED[@]}"; do
                   src/Font/*.cpp src/Media/Zlib.cpp src/Hardware/GraphicsProcessingUnit/Font8x16.cpp ;;
     PaintTest) build_and_run PaintTest tests/PaintTest.cpp tests/KernelStubs.cpp src/Layout/*.cpp src/Paint/*.cpp src/Font/*.cpp src/Browser/HtmlDocument.cpp src/Browser/Renderer.cpp src/Browser/RendererBoxes.cpp \
                  src/Browser/Media.cpp src/Dom/*.cpp src/Browser/Css.cpp src/Browser/PageLayout.cpp src/Browser/Url.cpp src/Network/Http/HttpUrl.cpp src/Hardware/GraphicsProcessingUnit/Font8x16.cpp \
-                 src/Graphics/Graphics2D/Software/SoftwareRenderer2D.cpp src/Math/FloatMath.cpp src/Media/Image.cpp src/Media/ImageCodecs.cpp src/Media/Zlib.cpp src/Media/Image/*.cpp \
+                 src/Graphics/Graphics2D/Software/SoftwareRenderer2D.cpp src/Graphics/Graphics2D/Device/*.cpp src/Graphics/Graphics3D/BuiltinShaders.cpp src/Graphics/Graphics3D/Software/*.cpp src/Math/FloatMath.cpp src/Media/Image.cpp src/Media/ImageCodecs.cpp src/Media/Zlib.cpp src/Media/Image/*.cpp \
                  src/Hardware/VideoCodec/Software/JpegDecoder.cpp src/Hardware/VideoCodec/Software/JpegEncoder.cpp src/Hardware/VideoCodec/VideoTypes.cpp \
                  src/Hardware/VideoCodec/VideoFrameBuffer.cpp src/Hardware/VideoCodec/ColorConvert.cpp ;;
     PixelGoldenTest) build_and_run PixelGoldenTest tests/PixelGoldenTest.cpp tests/KernelStubs.cpp src/Media/Image.cpp src/Media/ImageCodecs.cpp src/Media/Zlib.cpp src/Media/Image/*.cpp \

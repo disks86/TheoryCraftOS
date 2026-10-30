@@ -19,6 +19,7 @@
 #include "Process/AddressSpace.hpp"
 #include "Process/WindowsFiles.hpp"
 #include "Process/WindowsProcess.hpp"
+#include "Process/WindowsDebug.hpp"
 #include "Process/Objects.hpp"
 #include "Process/WindowsException.hpp"
 #include "Process/WindowsStartup.hpp"
@@ -111,6 +112,7 @@ uint32_t create_thread_in(Process& target, uint64_t start, uint64_t argument_val
   record->started = !suspended;
   record->suspend_count = suspended ? 1 : 0;
   *thread_id = id;
+  debug_thread_created(target, id, start);
   return kSuccess;
 }
 
@@ -127,6 +129,11 @@ uint32_t context_in(Process& target, uint64_t thread_id, bool set, X86Context* c
   IProcessRuntime* runtime = target.runtime();
   if (!record || !runtime || !context) return kInvalidHandle;
   if (record->finished) return 0xC000004Bu;      // STATUS_THREAD_IS_TERMINATING
+  uint64_t stopped_at = 0;
+  if (debug_stopped_context(target.id(), thread_id, &stopped_at)) {      // (waiting for a debugger at an exception: its registers are those of the exception)
+    if (set) return store_context(target, stopped_at, *context) ? kSuccess : kAccessViolation;
+    return apply_context(target, stopped_at, context) ? kSuccess : kAccessViolation;
+  }
   if (record->suspend_count == 0) return 0xC000000Du;
   if (record->started && !runtime->is_parked(record->id)) return 0xC0000001u;
   if (set) return runtime->set_context(record->id, *context) ? kSuccess : 0xC0000001u;
@@ -152,6 +159,7 @@ uint32_t suspend_thread_in(Process& target, uint64_t thread_id, uint64_t* previo
   *previous_count = uint32_t(record->suspend_count++);
   if (*previous_count == 0 && record->started) {
     target.runtime()->request_suspend(record->id);
+    if (ObjectManager* objects = system_objects()) objects->notify();      // (a thread that waits looks again and stops)
   }
   return kSuccess;
 }
@@ -255,6 +263,7 @@ uint32_t nt_create_thread_ex(Process& p, const SyscallRequest& r) {
   }
   record->started = !suspended;
   record->suspend_count = suspended ? 1 : 0;
+  debug_thread_created(p, id, start);
   return kSuccess;
 }
 
@@ -273,6 +282,7 @@ void end_thread(Process& p, Process::ThreadRecord& record, uint32_t code) {
     record.extra_tls_size[i] = 0;
   }
   if (ObjectManager* objects = system_objects()) { objects->abandon_thread(record.id); objects->process_exited(record.id, code); }      // (the second: a handle to the thread from another program)
+  debug_thread_exited(p, record.id, code);
   if (p.live_threads() == 0) p.terminate(code);
   if (p.runtime()) p.runtime()->notify();
   if (ObjectManager* objects = system_objects()) objects->notify();
@@ -406,6 +416,33 @@ uint32_t nt_resume_thread(Process& p, const SyscallRequest& r) {
 }
 
 // NtGetContextThread(HANDLE Thread, PCONTEXT) and NtSetContextThread(HANDLE Thread, PCONTEXT): the thread must be suspended (the call waits a moment for it to stop).
+// The registers of a thread of another program that may be running: it is suspended for the moment (and waited for) unless it is stopped already. `*suspended_here` says it has to
+// be resumed when the caller is done.
+uint32_t remote_get_context(Process& p, uint64_t pid, uint64_t tid, X86Context* context, bool* suspended_here) {
+  IProcessRuntime::RemoteOp op;
+  op.kind = IProcessRuntime::RemoteOp::GetContext;
+  op.thread_id = tid; op.context = context;
+  uint32_t status = p.runtime()->remote_operation(pid, op);
+  if (status != 0xC000000Du) return status;      // (a thread that is suspended or stopped at a debug event answers at once)
+  IProcessRuntime::RemoteOp stop;
+  stop.kind = IProcessRuntime::RemoteOp::SuspendThread;
+  stop.thread_id = tid;
+  if (p.runtime()->remote_operation(pid, stop) != kSuccess) return status;
+  *suspended_here = true;
+  for (uint32_t waited = 0; waited < 3000; ++waited) {
+    status = p.runtime()->remote_operation(pid, op);
+    if (status != 0xC0000001u) break;
+    p.block_sleep(1000000);
+  }
+  return status;
+}
+void remote_release_context(Process& p, uint64_t pid, uint64_t tid) {
+  IProcessRuntime::RemoteOp go;
+  go.kind = IProcessRuntime::RemoteOp::ResumeThread;
+  go.thread_id = tid;
+  p.runtime()->remote_operation(pid, go);
+}
+
 uint32_t context_call(Process& p, const SyscallRequest& r, bool set) {
   uint64_t remote_id = 0;
   bool exited = false;
@@ -417,17 +454,44 @@ uint32_t context_call(Process& p, const SyscallRequest& r, bool set) {
     op.kind = IProcessRuntime::RemoteOp::GetContext;
     op.thread_id = remote_id; op.context = &context;
     const uint64_t pid = remote_id & (kRemoteThreadIdLimit - 1);
-    uint32_t status = p.runtime()->remote_operation(pid, op);
+    bool suspended_here = false;
+    uint32_t status = remote_get_context(p, pid, remote_id, &context, &suspended_here);
+    uint32_t result = status;
     if (status == kSuccess && set) {
-      if (!apply_context(p, r.args[1], &context)) return kAccessViolation;
-      op.kind = IProcessRuntime::RemoteOp::SetContext;
-      status = p.runtime()->remote_operation(pid, op);
+      result = kAccessViolation;
+      if (apply_context(p, r.args[1], &context)) {
+        op.kind = IProcessRuntime::RemoteOp::SetContext;
+        result = p.runtime()->remote_operation(pid, op);
+      }
     } else if (status == kSuccess) {
-      return store_context(p, r.args[1], context) ? kSuccess : kAccessViolation;
+      result = store_context(p, r.args[1], context) ? kSuccess : kAccessViolation;
     }
-    return status == 0xC000010Au || status == kInvalidHandle ? 0xC000004Bu : status;      // (the program is gone: the thread is terminating)
+    if (suspended_here) remote_release_context(p, pid, remote_id);
+    return result == 0xC000010Au || result == kInvalidHandle ? 0xC000004Bu : result;      // (the program is gone: the thread is terminating)
   }
-  if (process_handle_info(p, r.args[0], &exited, &exit_code, &other_pid) && exited && other_pid != p.id()) return 0xC000004Bu;
+  if (process_handle_info(p, r.args[0], &exited, &exit_code, &other_pid) && other_pid != p.id()) {
+    if (exited) return 0xC000004Bu;
+    if (p.runtime()) {      // the main thread of a program whose handle this is
+      X86Context main_context;
+      IProcessRuntime::RemoteOp op;
+      op.kind = IProcessRuntime::RemoteOp::GetContext;
+      op.thread_id = other_pid; op.context = &main_context;
+      bool suspended_here = false;
+      uint32_t status = remote_get_context(p, other_pid, other_pid, &main_context, &suspended_here);
+      uint32_t result = status;
+      if (status == kSuccess && set) {
+        result = kAccessViolation;
+        if (apply_context(p, r.args[1], &main_context)) {
+          op.kind = IProcessRuntime::RemoteOp::SetContext;
+          result = p.runtime()->remote_operation(other_pid, op);
+        }
+      } else if (status == kSuccess) {
+        result = store_context(p, r.args[1], main_context) ? kSuccess : kAccessViolation;
+      }
+      if (suspended_here) remote_release_context(p, other_pid, other_pid);
+      return result == 0xC000010Au || result == kInvalidHandle ? 0xC000004Bu : result;
+    }
+  }
   Process::ThreadRecord* record = thread_of(p, r.args[0]);
   if (!record) return kInvalidHandle;
   IProcessRuntime* runtime = p.runtime();
@@ -485,7 +549,23 @@ uint32_t nt_open_thread(Process& p, const SyscallRequest& r) {
   if (r.args[3] == 0 || !p.read_user(r.args[3], ByteView(id, 16))) return kAccessViolation;
   uint64_t process_id = 0, thread_id = 0;
   for (uint32_t i = 0; i < 8; ++i) { process_id |= uint64_t{id[i]} << (8 * i); thread_id |= uint64_t{id[8 + i]} << (8 * i); }
-  if (process_id != 0 && process_id != p.id()) return kInvalidHandle;      // (threads of other processes are not reachable)
+  if (process_id == 0) process_id = thread_id & (kRemoteThreadIdLimit - 1);
+  if (process_id != p.id()) {      // a thread of another program: the handle is the one CreateRemoteThread gives out (the main thread's is the program's own, as CreateProcess's)
+    ObjectManager* objects = system_objects();
+    IProcessRuntime* runtime = p.runtime();
+    if (!objects || !runtime || !runtime->process_exists(process_id)) return 0xC000000Bu;      // STATUS_INVALID_CID
+    IProcessRuntime::RemoteOp check;
+    check.kind = IProcessRuntime::RemoteOp::ThreadStatus;
+    check.thread_id = thread_id;
+    if (runtime->remote_operation(process_id, check) != kSuccess) return 0xC000000Bu;
+    const ObjectManager::Created c = thread_id == process_id ? objects->open_process(process_id, true) : objects->create_process(thread_id);
+    if (c.id == 0) return c.status;
+    const int64_t remote_slot = p.files().open_token(DescriptorKind::Process, c.id);
+    if (remote_slot < 0) { objects->release(c.id); return kInsufficientResources; }
+    if (!p.write_user_u64(r.args[0], (uint64_t(remote_slot) + 1) * 4)) { p.close_descriptor(uint64_t(remote_slot)); return kAccessViolation; }
+    if (check.size != kStillActive) objects->process_exited(thread_id, uint32_t(check.size));
+    return kSuccess;
+  }
   Process::ThreadRecord* record = p.find_thread(thread_id);
   if (!record || record->finished) return 0xC000000Bu;      // STATUS_INVALID_CID
   const int64_t slot = p.files().open_token(DescriptorKind::Thread, thread_id);

@@ -421,7 +421,12 @@ uint32_t run_remote(Process& target, IProcessRuntime::RemoteOp& op) {
     case IProcessRuntime::RemoteOp::Protect: return vm_protect(target, &op.address, &op.size, op.protect, &op.old_protect);
     case IProcessRuntime::RemoteOp::Query: vm_query(target, op.address, op.info); return kStatusSuccess;
     case IProcessRuntime::RemoteOp::CreateThread: return create_thread_in(target, op.address, op.argument, op.suspended, op.stack_size, &op.thread_id);
-    case IProcessRuntime::RemoteOp::ThreadStatus: return thread_status_in(target, op.thread_id, &op.size);
+    case IProcessRuntime::RemoteOp::ThreadStatus: {
+      const uint32_t status = thread_status_in(target, op.thread_id, &op.size);
+      const Process::ThreadRecord* record = target.find_thread(op.thread_id);
+      op.old_protect = record ? uint32_t(record->suspend_count) : 0;      // (the suspend count comes back here)
+      return status;
+    }
     case IProcessRuntime::RemoteOp::TerminateThread: return terminate_thread_in(target, op.thread_id, uint32_t(op.size));
     case IProcessRuntime::RemoteOp::ResumeThread: return resume_thread_in(target, op.thread_id, &op.size);
     case IProcessRuntime::RemoteOp::SuspendThread: return suspend_thread_in(target, op.thread_id, &op.size);

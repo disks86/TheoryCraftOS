@@ -53,6 +53,7 @@ class Rig {
   }
 
   allocators::IAllocator& allocator() { return allocator_; }
+  Kernel& kernel() { return kernel_; }
   const AdapterCaps& caps() const { return caps_; }
   bool ok() const { return status_ == status::kSuccess; }
   NtStatus status() const { return status_; }
@@ -90,6 +91,17 @@ class Rig {
     step("create_allocation", ok() ? kernel_.create_allocation(kProcess, device_, d, &out) : status_);
     return out;
   }
+  Handle root_signature(ConstByteView blob) {
+    Handle h = 0;
+    step("create_root_signature", ok() ? kernel_.create_root_signature(kProcess, device_, blob, &h) : status_);
+    return h;
+  }
+  Handle descriptor_heap(DescriptorHeapType type, uint32_t count) {
+    Handle h = 0;
+    step("create_descriptor_heap", ok() ? kernel_.create_descriptor_heap(kProcess, device_, type, count, &h) : status_);
+    return h;
+  }
+  void descriptor(Handle heap, uint32_t index, const DescriptorDesc& d) { step("write_descriptor", ok() ? kernel_.write_descriptor(kProcess, heap, index, d) : status_); }
   Handle buffer(uint32_t flags, ConstByteView contents) {
     AllocationDesc d;
     d.flags = flags, d.size = contents.size();
@@ -367,6 +379,25 @@ void scene_dxbc_texture_linear(Rig& rig, ArrayView<uint32_t> out) {
   Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
   Handle texture = checker(rig);
   textured_quad(rig, pipe, texture, target, graphics::Filter::Linear, out);
+}
+
+// gather4 (dxil_ps_gather.hlsl): the four texels of the footprint, green and red, over the checker texture; a linear sampler (gather ignores the filter, not the address mode).
+void scene_dxil_gather(Rig& rig, ArrayView<uint32_t> out) {
+  namespace b = conformance_blobs;
+  Handle pipe = dxbc_pipeline(rig, b::k_vs, sizeof b::k_vs, b::k_dxil_ps_gather, sizeof b::k_dxil_ps_gather, 1);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle texture = checker(rig);
+  textured_quad(rig, pipe, texture, target, graphics::Filter::Linear, out);
+}
+
+// Derivatives (dxil_ps_deriv_show.hlsl): ddx_fine / ddy_fine of values computed from the interpolated colour and texture coordinate, shown as colours; the quad's pairs on the CPU renderer
+// against the hardware's.
+void scene_dxil_derivatives(Rig& rig, ArrayView<uint32_t> out) {
+  namespace b = conformance_blobs;
+  Handle pipe = dxbc_pipeline(rig, b::k_vs, sizeof b::k_vs, b::k_dxil_ps_deriv_show, sizeof b::k_dxil_ps_deriv_show, 1);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle texture = checker(rig);
+  textured_quad(rig, pipe, texture, target, graphics::Filter::Nearest, out);
 }
 
 // Draw a picture into a texture, then draw the texture onto the screen: a Direct3D 9 render target that is also a texture, and every Direct3D 11 / 12 post-processing step.
@@ -1079,10 +1110,9 @@ void scene_texel_cube(Rig& rig, ArrayView<uint32_t> out) {
 
 // A compute shader (cs_fill.hlsl): 4 x 8 groups of 8 x 4 threads, each writing a pixel of a 32 x 32 picture into a structured buffer from its SV_DispatchThreadID, SV_GroupID and
 // SV_GroupIndex, a structured buffer of uint4 it writes and reads back, a constant from the constant buffer, and two atomic counters that must end at 1024. The picture is the buffer.
-void scene_compute(Rig& rig, ArrayView<uint32_t> out) {
+void compute_fill(Rig& rig, ArrayView<uint32_t> out, const uint8_t* code, uint32_t size) {
   if (!rig.has(graphics::kFeatureCompute)) return void(rig.step("compute", status::kNotSupported));
-  namespace b = conformance_blobs;
-  Handle cs = rig.shader("create_shader (compute)", ShaderKind::Dxbc, graphics::ShaderStage::Compute, bytes_of(b::k_cs_fill, sizeof b::k_cs_fill));
+  Handle cs = rig.shader("create_shader (compute)", ShaderKind::Dxbc, graphics::ShaderStage::Compute, bytes_of(code, size));
   PipelineDesc pd;
   pd.compute_shader = cs;
   Handle pipe = rig.pipeline(pd);
@@ -1107,12 +1137,181 @@ void scene_compute(Rig& rig, ArrayView<uint32_t> out) {
     for (uint32_t& pixel : out) pixel ^= 0x0000FF00u;
 }
 
-// Group-shared memory and barriers (cs_shared.hlsl): 16 groups of 8 x 8 threads, each writing a slot of a 64-word shared array, reading its neighbour's after a barrier, and the 64 slots added
-// by a reduction with a barrier in its loop. The picture is the buffer: red the neighbour's value, green the sum, blue the thread.
-void scene_compute_shared(Rig& rig, ArrayView<uint32_t> out) {
+// Direct3D 12 binding: the compute scene again with a root signature (b0 as four root constants, u0 and u1 as root descriptors, u2 from a descriptor table) and resource states (the
+// picture is made in the common state and moved to unordered access).
+void scene_d3d12_compute(Rig& rig, ArrayView<uint32_t> out) {
   if (!rig.has(graphics::kFeatureCompute)) return void(rig.step("compute", status::kNotSupported));
   namespace b = conformance_blobs;
-  Handle cs = rig.shader("create_shader (compute)", ShaderKind::Dxbc, graphics::ShaderStage::Compute, bytes_of(b::k_cs_shared, sizeof b::k_cs_shared));
+  Handle cs = rig.shader("create_shader (compute)", ShaderKind::Dxbc, graphics::ShaderStage::Compute, bytes_of(b::k_cs_fill, sizeof b::k_cs_fill));
+  PipelineDesc pd;
+  pd.compute_shader = cs;
+  Handle pipe = rig.pipeline(pd);
+  auto storage = [&](uint64_t size, uint32_t extra) {
+    AllocationDesc d;
+    d.flags = kAllocUnorderedAccess | extra, d.size = size, d.initial_state = state::kCommon;
+    return rig.create(d);
+  };
+  Handle picture = storage(kPixels * 4, kAllocTrackState), structured = storage(kPixels * 16, 0), counters = storage(16, 0);
+  // (root signature version 1.0: four parameters - constants b0 x 4; UAV u0; UAV u1; a table with the UAV u2 -, no static samplers)
+  const uint32_t blob[] = {1, 4, 24, 0, 32 * 4, 0,
+                           1, 0, 18 * 4, 4, 0, 21 * 4, 4, 0, 23 * 4, 0, 0, 25 * 4,
+                           0, 0, 4, 0, 0, 1, 0, 1, 27 * 4, 1, 1, 2, 0, 0};
+  Handle signature = rig.root_signature(bytes_of(blob, sizeof blob));
+  Handle heap = rig.descriptor_heap(DescriptorHeapType::CbvSrvUav, 2);
+  DescriptorDesc uav;
+  uav.kind = DescriptorKind::Uav, uav.allocation = counters;
+  rig.descriptor(heap, 1, uav);
+  const uint32_t constants[4] = {0x00102030u, 0, 0, 0};
+  CommandWriter w(rig.allocator());
+  w.transition(0, state::kCommon, state::kUnorderedAccess);
+  w.set_root_signature(signature);
+  w.set_descriptor_heaps({heap});
+  w.set_root_constants(0, 0, bytes_of(constants, sizeof constants));
+  w.set_root_descriptor(1, 0, 0);
+  w.set_root_descriptor(2, 1, 0);
+  w.set_root_table(3, 1);
+  w.bind_pipeline(pipe);
+  w.dispatch(kSize / 8, kSize / 4, 1);
+  w.transition(0, state::kUnorderedAccess, state::kCopySource);
+  rig.render(w, {picture, structured, counters});
+  rig.read_words(picture, out);
+  if (rig.read_u64(counters, 0) != (uint64_t{1024} | (uint64_t{1024} << 32)))
+    for (uint32_t& pixel : out) pixel ^= 0x0000FF00u;
+}
+
+// Direct3D 12 binding for drawing: the volume texture scene with a root signature (a table with t0, b0 as 16 root constants, a static point sampler), a descriptor heap, and a render target
+// and a texture that move between states with barriers.
+void scene_d3d12_textures(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureTextureKinds)) return void(rig.step("texture kinds", status::kNotSupported));
+  namespace b = conformance_blobs;
+  AllocationDesc td;
+  td.flags = kAllocTexture | kAllocTrackState, td.format = Format::A8R8G8B8, td.width = 4, td.height = 4, td.kind = graphics::TextureKind::Texture3D, td.layers = 4, td.initial_state = state::kCopyDest;
+  Handle texture = rig.create(td);
+  ByteBuffer bytes(rig.allocator());
+  for (uint32_t layer = 0; layer < 4; ++layer)
+    for (uint32_t texel = 0; texel < 16; ++texel) bytes.put32(0xFF000000u | (layer == 0 ? 0xFF0000u : layer == 1 ? 0x00FF00u : layer == 2 ? 0x0000FFu : 0xFFFF00u));
+  rig.write(texture, bytes.view());
+  Vertex v[12];
+  quad_pixels(v, 0, 0, 32, 16, [](float u, float vv) { return graphics::Vec3{u, vv, 0.6f}; });
+  quad_pixels(v + 6, 0, 16, 32, 32, [](float u, float vv) { return graphics::Vec3{u, 0.3f, vv}; });
+  Handle p = dxbc_pipeline(rig, b::k_vs_vol, sizeof b::k_vs_vol, b::k_ps_tex3d, sizeof b::k_ps_tex3d, 1);
+  AllocationDesc rd;
+  rd.flags = kAllocRenderTarget | kAllocTrackState, rd.format = Format::A8R8G8B8, rd.width = kSize, rd.height = kSize, rd.initial_state = state::kCommon;
+  Handle target = rig.create(rd);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  // (root signature version 1.0: a table with the SRV t0, then b0 as 16 constants; a static point sampler with clamped addresses)
+  const uint32_t blob[] = {1, 2, 24, 1, 22 * 4, 0,
+                           0, 0, 12 * 4, 1, 0, 19 * 4,
+                           1, 14 * 4, 0, 1, 0, 0, 0,
+                           0, 0, 16,
+                           0, 3, 3, 3, 0, 1, 8, 0, 0, __builtin_bit_cast(uint32_t, 1000.0f), 0, 0, 0};
+  Handle signature = rig.root_signature(bytes_of(blob, sizeof blob));
+  Handle heap = rig.descriptor_heap(DescriptorHeapType::CbvSrvUav, 3);
+  DescriptorDesc srv;
+  srv.kind = DescriptorKind::Srv, srv.allocation = texture;
+  rig.descriptor(heap, 2, srv);
+  CommandWriter w(rig.allocator());
+  w.transition(2, state::kCopyDest, state::kPixelShaderResource);
+  w.transition(0, state::kCommon, state::kRenderTarget);
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.set_root_signature(signature);
+  w.set_descriptor_heaps({heap});
+  w.set_root_constants(1, 0, bytes_of(kIdentity, sizeof kIdentity));
+  w.set_root_table(0, 2);
+  w.bind_pipeline(p);
+  w.bind_vertex_buffer(1);
+  w.draw(12);
+  w.end_pass();
+  rig.render(w, {target, vb, texture});
+  rig.read(target, out);
+}
+
+// Direct3D 12 resource heaps: a render target and a texture placed at the same place in one heap. A triangle is drawn into the render target, an aliasing barrier passes the use to the
+// texture (what the GPU holds for the target goes to the heap's memory, the texture is uploaded from it) and the texture is drawn onto the target.
+void scene_d3d12_heap(Rig& rig, ArrayView<uint32_t> out) {
+  namespace b = conformance_blobs;
+  Handle first = d3d9_pipeline(rig, false, false);
+  Handle second = dxbc_pipeline(rig, b::k_vs, sizeof b::k_vs, b::k_ps_tex, sizeof b::k_ps_tex, 1);
+  AllocationDesc hd;
+  hd.flags = kAllocHeap, hd.size = 8192;
+  Handle heap = rig.create(hd);
+  AllocationDesc id;
+  id.flags = kAllocRenderTarget, id.format = Format::A8R8G8B8, id.width = id.height = kSize, id.heap = heap, id.heap_offset = 256;
+  Handle placed_target = rig.create(id);
+  id.flags = kAllocTexture;
+  Handle placed_texture = rig.create(id);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  const Vertex tri[3] = {{-0.8f, -0.8f, 0.5f, 1, 0, 0, 1}, {0.8f, -0.8f, 0.5f, 0, 1, 0, 1}, {0.0f, 0.8f, 0.5f, 0, 0, 1, 1}};
+  Handle tvb = rig.buffer(kAllocVertexBuffer, bytes_of(tri, sizeof tri));
+  auto vert = [](float x, float y, float u, float v) { return Vertex{x, y, 0.5f, u / 2, v / 2, 1, 1}; };
+  const Vertex quad[6] = {vert(-0.6f, -0.6f, 0, 0), vert(0.9f, -0.6f, 1, 0), vert(-0.6f, 0.9f, 0, 1), vert(-0.6f, 0.9f, 0, 1), vert(0.9f, -0.6f, 1, 0), vert(0.9f, 0.9f, 1, 1)};
+  Handle qvb = rig.buffer(kAllocVertexBuffer, bytes_of(quad, sizeof quad));
+  graphics::SamplerDesc sampler;
+  sampler.filter = graphics::Filter::Linear;
+  sampler.address_u = sampler.address_v = graphics::AddressMode::ClampToEdge;
+  CommandWriter w(rig.allocator());   // (list: target 0, texture 1, screen 2, triangle 3, quad 4)
+  begin(w, 0, kNoAllocation, {0.1f, 0.1f, 0.1f, 1});
+  w.bind_pipeline(first);
+  w.bind_vertex_buffer(3);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(3);
+  w.end_pass();
+  w.resource_barrier({CommandWriter::Barrier{2, 0, 1, 0, 0}});
+  begin(w, 2, kNoAllocation, {0, 0, 0, 1});
+  w.bind_pipeline(second);
+  w.bind_vertex_buffer(4);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.bind_texture(0, 1, sampler);
+  w.draw(6);
+  w.end_pass();
+  rig.render(w, {placed_target, placed_texture, target, tvb, qvb});
+  rig.read(target, out);
+}
+
+// DXIL (Shader Model 6) shaders: a vertex shader with a constant buffer (a matrix and a tint) and three pixel shaders - one with a lot of arithmetic, one with branches and a discard, one with
+// loops - each drawing a triangle in a third of the picture. The kernel translates the bitcode to the tokens of the same shader, so this checks that what comes out runs on the GPU as it does on the CPU.
+void scene_dxil(Rig& rig, ArrayView<uint32_t> out) {
+  namespace b = conformance_blobs;
+  Handle first = dxbc_pipeline(rig, b::k_dxil_vs, sizeof b::k_dxil_vs, b::k_dxil_ps_math, sizeof b::k_dxil_ps_math, 0);
+  Handle second = dxbc_pipeline(rig, b::k_dxil_vs, sizeof b::k_dxil_vs, b::k_dxil_ps_flow, sizeof b::k_dxil_ps_flow, 0);
+  Handle third = dxbc_pipeline(rig, b::k_dxil_vs, sizeof b::k_dxil_vs, b::k_dxil_ps_loop, sizeof b::k_dxil_ps_loop, 0);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  // (positions in the cell, colours, so that the varyings span ranges that take the branches both ways)
+  Vertex v[9];
+  for (uint32_t cell = 0; cell < 3; ++cell) {
+    const float x0 = -0.97f + 0.65f * static_cast<float>(cell), x1 = x0 + 0.6f;
+    v[3 * cell] = {x0, -0.9f, 0.5f, 0.9f, 0.1f, 0.1f, 1.0f};
+    v[3 * cell + 1] = {x1, -0.9f, 0.5f, 0.1f, 0.9f, 0.4f, 1.0f};
+    v[3 * cell + 2] = {(x0 + x1) * 0.5f, 0.9f, 0.5f, 0.2f, 0.3f, 0.9f, 0.6f};
+  }
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  float constants[20];
+  for (uint32_t k = 0; k < 16; ++k) constants[k] = kIdentity[k];
+  constants[16] = 1.0f, constants[17] = 0.9f, constants[18] = 1.0f, constants[19] = 1.0f;   // (the tint)
+  CommandWriter w(rig.allocator());
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(constants, sizeof constants));
+  w.bind_pipeline(first);
+  w.draw(3, 0);
+  w.bind_pipeline(second);
+  w.draw(3, 3);
+  w.bind_pipeline(third);
+  w.draw(3, 6);
+  w.end_pass();
+  rig.render(w, {target, vb});
+  rig.read(target, out);
+}
+
+void scene_compute(Rig& rig, ArrayView<uint32_t> out) { compute_fill(rig, out, conformance_blobs::k_cs_fill, sizeof conformance_blobs::k_cs_fill); }
+// The same shader as DXIL (cs_6_0).
+void scene_dxil_compute(Rig& rig, ArrayView<uint32_t> out) { compute_fill(rig, out, conformance_blobs::k_dxil_cs_fill, sizeof conformance_blobs::k_dxil_cs_fill); }
+
+// Group-shared memory and barriers (cs_shared.hlsl): 16 groups of 8 x 8 threads, each writing a slot of a 64-word shared array, reading its neighbour's after a barrier, and the 64 slots added
+// by a reduction with a barrier in its loop. The picture is the buffer: red the neighbour's value, green the sum, blue the thread.
+void compute_shared(Rig& rig, ArrayView<uint32_t> out, const uint8_t* code, uint32_t size) {
+  if (!rig.has(graphics::kFeatureCompute)) return void(rig.step("compute", status::kNotSupported));
+  Handle cs = rig.shader("create_shader (compute)", ShaderKind::Dxbc, graphics::ShaderStage::Compute, bytes_of(code, size));
   PipelineDesc pd;
   pd.compute_shader = cs;
   Handle pipe = rig.pipeline(pd);
@@ -1126,6 +1325,33 @@ void scene_compute_shared(Rig& rig, ArrayView<uint32_t> out) {
   rig.render(w, {picture});
   rig.read_words(picture, out);
 }
+
+void scene_compute_shared(Rig& rig, ArrayView<uint32_t> out) { compute_shared(rig, out, conformance_blobs::k_cs_shared, sizeof conformance_blobs::k_cs_shared); }
+// Buffer shader resource views (dxil_cs_srv.hlsl): a structured buffer of uint4 (t0) and a byte address buffer (t1), read-only, combined into the picture buffer (u0).
+void scene_dxil_compute_srv(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureCompute)) return void(rig.step("compute", status::kNotSupported));
+  namespace b = conformance_blobs;
+  Handle cs = rig.shader("create_shader (compute)", ShaderKind::Dxbc, graphics::ShaderStage::Compute, bytes_of(b::k_dxil_cs_srv, sizeof b::k_dxil_cs_srv));
+  PipelineDesc pd;
+  pd.compute_shader = cs;
+  Handle pipe = rig.pipeline(pd);
+  ByteBuffer structured(rig.allocator()), raw(rig.allocator());
+  for (uint32_t i = 0; i < kPixels * 4; ++i) structured.put32(0x01010101u * (i % 251) + i * 7);
+  for (uint32_t i = 0; i < kPixels; ++i) raw.put32(0x9E3779B9u * (i + 1));
+  Handle src = rig.buffer(kAllocUnorderedAccess, structured.view()), bytes = rig.buffer(kAllocUnorderedAccess, raw.view());
+  AllocationDesc d;
+  d.flags = kAllocUnorderedAccess, d.size = kPixels * 4;
+  Handle picture = rig.create(d);
+  CommandWriter w(rig.allocator());
+  w.bind_pipeline(pipe);
+  w.bind_uav(0, 2, 0, kPixels * 4);
+  w.bind_uav(graphics::kMaxUavBuffers, 0, 0, kPixels * 16);
+  w.bind_uav(graphics::kMaxUavBuffers + 1, 1, 0, kPixels * 4);
+  w.dispatch(kSize / 8, kSize / 4, 1);
+  rig.render(w, {src, bytes, picture});
+  rig.read_words(picture, out);
+}
+void scene_dxil_compute_shared(Rig& rig, ArrayView<uint32_t> out) { compute_shared(rig, out, conformance_blobs::k_dxil_cs_shared, sizeof conformance_blobs::k_dxil_cs_shared); }
 
 // Multisampling (4 samples): a far red rectangle and a near green one that overlaps it, both with edges between the pixels' sample positions, drawn into 4x colour and depth images (depth
 // tested per sample) and resolved. Vertical and horizontal edges are covered the same by every device that uses the standard 4x pattern, whatever the order of the samples.
@@ -1171,12 +1397,12 @@ void scene_multisample(Rig& rig, ArrayView<uint32_t> out) {
 }
 
 // A geometry shader (gs_copy.hlsl): every triangle comes out as itself and, as a second strip, a half-size copy moved to the lower right with the red and blue swapped.
-void scene_geometry_shader(Rig& rig, ArrayView<uint32_t> out) {
+void geometry_scene(Rig& rig, ArrayView<uint32_t> out, const uint8_t* gs_code, uint32_t gs_size) {
   if (!rig.has(graphics::kFeatureGeometryShaders)) return void(rig.step("geometry shaders", status::kNotSupported));
   namespace b = conformance_blobs;
   const Vertex v[3] = {{-0.9f, -0.9f, 0.5f, 1, 0, 0, 1}, {0.9f, -0.9f, 0.5f, 0, 1, 0, 1}, {0.0f, 0.9f, 0.5f, 0, 0, 1, 1}};
   Handle vs = rig.vertex_shader(bytes_of(b::k_vs, sizeof b::k_vs));
-  Handle gs = rig.shader("create_shader (geometry)", ShaderKind::Dxbc, graphics::ShaderStage::Geometry, bytes_of(b::k_gs_copy, sizeof b::k_gs_copy));
+  Handle gs = rig.shader("create_shader (geometry)", ShaderKind::Dxbc, graphics::ShaderStage::Geometry, bytes_of(gs_code, gs_size));
   Handle ps = rig.pixel_shader(bytes_of(b::k_ps_color, sizeof b::k_ps_color));
   PipelineDesc pd = colour_pipeline_desc(vs, ps);
   pd.varying_count = 3;
@@ -1194,6 +1420,10 @@ void scene_geometry_shader(Rig& rig, ArrayView<uint32_t> out) {
   rig.render(w, {target, vb});
   rig.read(target, out);
 }
+
+void scene_geometry_shader(Rig& rig, ArrayView<uint32_t> out) { geometry_scene(rig, out, conformance_blobs::k_gs_copy, sizeof conformance_blobs::k_gs_copy); }
+// The same shader as DXIL (gs_6_0).
+void scene_dxil_geometry(Rig& rig, ArrayView<uint32_t> out) { geometry_scene(rig, out, conformance_blobs::k_dxil_gs_copy, sizeof conformance_blobs::k_dxil_gs_copy); }
 
 // The geometry shader that runs twice for each primitive (gs_copy_inst2: gs_copy with an instance count of 2): the same triangles drawn twice over, so the same picture as gs_copy's.
 void scene_geometry_instances(Rig& rig, ArrayView<uint32_t> out) {
@@ -1217,6 +1447,321 @@ void scene_geometry_instances(Rig& rig, ArrayView<uint32_t> out) {
   w.draw(3);
   w.end_pass();
   rig.render(w, {target, vb});
+  rig.read(target, out);
+}
+
+// Stream output (gs_streams.hlsl): a geometry shader with two streams of points writes, for each of the three vertices of a triangle, the position and colour (stream 0, 32 bytes a vertex) and a
+// vector made of both (stream 1, 16 bytes) into two buffers, with nothing drawn (stream -1). The picture is made from the buffers: a small square at the position of each record in stream 0, coloured
+// by the record of stream 1 (the vector 0.5 * q + 0.5), so a position that is turned over, a colour that is not the vertex's or a record that is in the wrong place shows.
+void scene_stream_output(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureStreamOutput | graphics::kFeatureGeometryShaders)) return void(rig.step("stream output", status::kNotSupported));
+  namespace b = conformance_blobs;
+  const Vertex v[3] = {{-0.5f, -0.5f, 0.5f, 1, 0, 0, 1}, {0.5f, -0.5f, 0.5f, 0, 1, 0, 1}, {0.0f, 0.5f, 0.5f, 0, 0, 1, 1}};
+  Handle vs = rig.vertex_shader(bytes_of(b::k_vs, sizeof b::k_vs));
+  Handle gs = rig.shader("create_shader (geometry)", ShaderKind::Dxbc, graphics::ShaderStage::Geometry, bytes_of(b::k_gs_streams, sizeof b::k_gs_streams));
+  Handle ps = rig.pixel_shader(bytes_of(b::k_ps_color, sizeof b::k_ps_color));
+  PipelineDesc pd = colour_pipeline_desc(vs, ps);
+  pd.varying_count = 3;
+  pd.geometry_shader = gs;
+  pd.stream_output_count = 3;
+  pd.stream_output[0] = {0, 0, 0, 4, 0}, pd.stream_output[1] = {0, 1, 0, 4, 0}, pd.stream_output[2] = {1, 4, 0, 4, 1};
+  pd.stream_output_stride[0] = 32, pd.stream_output_stride[1] = 16;
+  pd.rasterized_stream = -1;
+  Handle pipe = rig.pipeline(pd);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  AllocationDesc od;
+  od.flags = kAllocStreamOutput, od.size = 3 * 32;
+  Handle first = rig.create(od);
+  od.size = 3 * 16;
+  Handle second = rig.create(od);
+  CommandWriter w(rig.allocator());
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.set_stream_output(0, 2);
+  w.set_stream_output(1, 3);
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(3);
+  w.end_pass();
+  rig.render(w, {target, vb, first, second});
+  uint32_t f0[24], f1[12];
+  rig.read_words(first, ArrayView<uint32_t>(f0, 24));
+  rig.read_words(second, ArrayView<uint32_t>(f1, 12));
+  auto f = [](uint32_t bits) { return __builtin_bit_cast(float, bits); };
+  auto shade = [](float x) { return x < 0.0f ? 0.0f : x > 1.0f ? 1.0f : x; };
+  Vertex squares[18];
+  for (uint32_t i = 0; i < 3; ++i) {
+    const float x = f(f0[8 * i]), y = f(f0[8 * i + 1]), r = shade(f(f1[4 * i]) * 0.5f + 0.5f), g = shade(f(f1[4 * i + 1]) * 0.5f + 0.5f), bl = shade(f(f1[4 * i + 2]) * 0.5f + 0.5f);
+    const float h = 0.2f;
+    Vertex* q = squares + 6 * i;
+    q[0] = {x - h, y - h, 0.5f, r, g, bl, 1}, q[1] = {x + h, y - h, 0.5f, r, g, bl, 1}, q[2] = {x - h, y + h, 0.5f, r, g, bl, 1};
+    q[3] = q[2], q[4] = q[1], q[5] = {x + h, y + h, 0.5f, r, g, bl, 1};
+  }
+  Handle flat = d3d9_pipeline(rig, false, false);
+  Handle svb = rig.buffer(kAllocVertexBuffer, bytes_of(squares, sizeof squares));
+  CommandWriter w2(rig.allocator());
+  begin(w2, 0, kNoAllocation, {0, 0, 0, 1});
+  w2.bind_pipeline(flat);
+  w2.bind_vertex_buffer(1);
+  w2.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w2.draw(18);
+  w2.end_pass();
+  rig.render(w2, {target, svb});
+  rig.read(target, out);
+}
+
+
+// A picture made of stream output records: a small square for each record of a buffer of positions (4 floats) and colours (4 floats), coloured by the vector in the second buffer (0.5 * q + 0.5),
+// shifted by `shift(i)`.
+template <typename Shift>
+uint32_t squares_from_records(const uint32_t* positions, const uint32_t* vectors, uint32_t records, Shift shift, Vertex* squares) {
+  auto f = [](uint32_t bits) { return __builtin_bit_cast(float, bits); };
+  auto shade = [](float x) { return x < 0.0f ? 0.0f : x > 1.0f ? 1.0f : x; };
+  for (uint32_t i = 0; i < records; ++i) {
+    const float x = f(positions[8 * i]), y = f(positions[8 * i + 1]) + shift(i), r = shade(f(vectors[4 * i]) * 0.5f + 0.5f), g = shade(f(vectors[4 * i + 1]) * 0.5f + 0.5f), bl = shade(f(vectors[4 * i + 2]) * 0.5f + 0.5f);
+    const float h = 0.2f;
+    Vertex* q = squares + 6 * i;
+    q[0] = {x - h, y - h, 0.5f, r, g, bl, 1}, q[1] = {x + h, y - h, 0.5f, r, g, bl, 1}, q[2] = {x - h, y + h, 0.5f, r, g, bl, 1};
+    q[3] = q[2], q[4] = q[1], q[5] = {x + h, y + h, 0.5f, r, g, bl, 1};
+  }
+  return 6 * records;
+}
+
+// Appending across passes and submits, the statistics of stream output and timestamps. Two rounds of three records go into buffers made for seven (the second round after the first, appended in
+// another pass of the same commands); a third round, in other commands, has room for one record: one primitive is written, three were needed. The squares of the second round are moved down so
+// that a round that overwrote the first shows. Stripes at the bottom: written (1 of 4), needed (3 of 4), and whether the timestamps went forwards.
+void scene_stream_output_append(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureStreamOutput | graphics::kFeatureGeometryShaders | graphics::kFeatureOcclusionQueries | graphics::kFeatureStatisticsQueries | graphics::kFeatureTimestampQueries))
+    return void(rig.step("stream output append", status::kNotSupported));
+  namespace b = conformance_blobs;
+  const Vertex v[3] = {{-0.5f, -0.5f, 0.5f, 1, 0, 0, 1}, {0.5f, -0.5f, 0.5f, 0, 1, 0, 1}, {0.0f, 0.5f, 0.5f, 0, 0, 1, 1}};
+  Handle vs = rig.vertex_shader(bytes_of(b::k_vs, sizeof b::k_vs));
+  Handle gs = rig.shader("create_shader (geometry)", ShaderKind::Dxbc, graphics::ShaderStage::Geometry, bytes_of(b::k_gs_streams, sizeof b::k_gs_streams));
+  Handle ps = rig.pixel_shader(bytes_of(b::k_ps_color, sizeof b::k_ps_color));
+  PipelineDesc pd = colour_pipeline_desc(vs, ps);
+  pd.varying_count = 3;
+  pd.geometry_shader = gs;
+  pd.stream_output_count = 3;
+  pd.stream_output[0] = {0, 0, 0, 4, 0}, pd.stream_output[1] = {0, 1, 0, 4, 0}, pd.stream_output[2] = {1, 4, 0, 4, 1};
+  pd.stream_output_stride[0] = 32, pd.stream_output_stride[1] = 16;
+  pd.rasterized_stream = -1;
+  Handle pipe = rig.pipeline(pd);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  AllocationDesc od;
+  od.flags = kAllocStreamOutput, od.size = 7 * 32;
+  Handle first = rig.create(od);
+  od.size = 7 * 16;
+  Handle second = rig.create(od);
+  AllocationDesc rd;
+  rd.flags = kAllocQueryResult, rd.size = 6 * 8;
+  Handle results = rig.create(rd);
+  auto pass = [&](CommandWriter& w, uint32_t offset, bool queries) {
+    begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+    w.set_stream_output(0, 2, offset);
+    w.set_stream_output(1, 3, offset);
+    w.bind_pipeline(pipe);
+    w.bind_vertex_buffer(1);
+    w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+    if (queries) {
+      w.begin_query(4, 0, static_cast<uint32_t>(graphics::QueryKind::Timestamp));
+      w.end_query();
+      w.begin_query(4, 8, static_cast<uint32_t>(graphics::QueryKind::SoPrimitivesWritten));
+      w.draw(3);
+      w.end_query();
+      w.begin_query(4, 16, static_cast<uint32_t>(graphics::QueryKind::SoPrimitivesNeeded));
+      w.draw(3);
+      w.end_query();
+      w.begin_query(4, 24, static_cast<uint32_t>(graphics::QueryKind::Timestamp));
+      w.end_query();
+      w.begin_query(4, 32, static_cast<uint32_t>(graphics::QueryKind::TimestampDisjoint));
+      w.end_query();
+      w.begin_query(4, 40, static_cast<uint32_t>(graphics::QueryKind::TimestampFrequency));
+      w.end_query();
+    } else {
+      w.draw(3);
+    }
+    w.end_pass();
+  };
+  CommandWriter w(rig.allocator());
+  pass(w, 0, false);
+  pass(w, kStreamOutputAppendOffset, false);
+  rig.render(w, {target, vb, first, second, results});
+  CommandWriter w2(rig.allocator());
+  pass(w2, kStreamOutputAppendOffset, true);
+  rig.render(w2, {target, vb, first, second, results});
+  // (the first query of the third round took a record, the second found none left: so 1 written by it, then none, and 3 needed by each)
+  const uint64_t t0 = rig.read_u64(results, 0), written = rig.read_u64(results, 1), needed = rig.read_u64(results, 2), t1 = rig.read_u64(results, 3);
+  uint32_t f0[56], f1[28];
+  rig.read_words(first, ArrayView<uint32_t>(f0, 56));
+  rig.read_words(second, ArrayView<uint32_t>(f1, 28));
+  Vertex squares[7 * 6 + 4 * 6];
+  const uint32_t n = squares_from_records(f0, f1, 7, [](uint32_t i) { return i >= 3 && i < 6 ? -0.5f : 0.0f; }, squares);
+  // (stripes: the numbers as the height of a bar, in the bottom quarter)
+  auto bar = [&](uint32_t k, float value, float r, float g, float bl) {
+    const float x0 = -0.9f + 0.6f * static_cast<float>(k), x1 = x0 + 0.4f, top = -1.0f + 0.5f * value;
+    Vertex* q = squares + n + 6 * k;
+    q[0] = {x0, -1.0f, 0.4f, r, g, bl, 1}, q[1] = {x1, -1.0f, 0.4f, r, g, bl, 1}, q[2] = {x0, top, 0.4f, r, g, bl, 1};
+    q[3] = q[2], q[4] = q[1], q[5] = {x1, top, 0.4f, r, g, bl, 1};
+  };
+  bar(0, static_cast<float>(written) / 4.0f, 1, 0.3f, 0.3f);
+  bar(1, static_cast<float>(needed) / 4.0f, 0.3f, 1, 0.3f);
+  // (the fourth bar: the clock was not interrupted and runs in nanoseconds)
+  Vertex* last = squares + n + 18;
+  const float tick = rig.read_u64(results, 5) == 1000000000u && rig.read_u64(results, 4) == 0 ? 1.0f : 0.1f;
+  last[0] = {0.9f - 0.4f, -1.0f, 0.4f, 1, 1, 0.3f, 1}, last[1] = {0.9f, -1.0f, 0.4f, 1, 1, 0.3f, 1}, last[2] = {0.9f - 0.4f, -1.0f + 0.5f * tick, 0.4f, 1, 1, 0.3f, 1};
+  last[3] = last[2], last[4] = last[1], last[5] = {0.9f, -1.0f + 0.5f * tick, 0.4f, 1, 1, 0.3f, 1};
+  bar(2, t1 > t0 && t0 != 0 ? 1.0f : 0.1f, 0.3f, 0.3f, 1);
+  Handle flat = d3d9_pipeline(rig, false, false);
+  Handle svb = rig.buffer(kAllocVertexBuffer, bytes_of(squares, sizeof(Vertex) * (n + 24)));
+  CommandWriter w3(rig.allocator());
+  begin(w3, 0, kNoAllocation, {0, 0, 0, 1});
+  w3.bind_pipeline(flat);
+  w3.bind_vertex_buffer(1);
+  w3.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w3.draw(n + 24);
+  w3.end_pass();
+  rig.render(w3, {target, svb});
+  rig.read(target, out);
+}
+
+// Stream output of a vertex shader and of a domain shader: the three vertices of a triangle come out as the records they were (squares, as with the geometry shader), and the triangles the
+// tessellator made of a patch are drawn again from the records (position and colour of each vertex).
+void scene_stream_output_stages(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureStreamOutput | graphics::kFeatureTessellation | graphics::kFeatureOcclusionQueries | graphics::kFeatureStatisticsQueries))
+    return void(rig.step("stream output stages", status::kNotSupported));
+  namespace b = conformance_blobs;
+  const Vertex v[3] = {{-0.5f, -0.25f, 0.5f, 1, 0, 0, 1}, {0.5f, -0.25f, 0.5f, 0, 1, 0, 1}, {0.0f, 0.75f, 0.5f, 0, 0, 1, 1}};
+  Handle vs = rig.vertex_shader(bytes_of(b::k_vs, sizeof b::k_vs));
+  Handle ps = rig.pixel_shader(bytes_of(b::k_ps_color, sizeof b::k_ps_color));
+  Handle hs = rig.shader("create_shader (hull)", ShaderKind::Dxbc, graphics::ShaderStage::Hull, bytes_of(b::k_hs_tri_cb, sizeof b::k_hs_tri_cb));
+  Handle ds = rig.shader("create_shader (domain)", ShaderKind::Dxbc, graphics::ShaderStage::Domain, bytes_of(b::k_ds_noise, sizeof b::k_ds_noise));
+  PipelineDesc vp = colour_pipeline_desc(vs, ps);
+  vp.varying_count = 3;
+  vp.stream_output_count = 2;
+  vp.stream_output[0] = {0, 0, 0, 4, 0}, vp.stream_output[1] = {0, 1, 0, 4, 0};
+  vp.stream_output_stride[0] = 32;
+  vp.rasterized_stream = -1;
+  Handle vertex_pipe = rig.pipeline(vp);
+  PipelineDesc tp = vp;
+  tp.hull_shader = hs, tp.domain_shader = ds;
+  Handle domain_pipe = rig.pipeline(tp);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  AllocationDesc od;
+  od.flags = kAllocStreamOutput, od.size = 3 * 32;
+  Handle vertex_out = rig.create(od);
+  od.size = 64 * 3 * 32;
+  Handle domain_out = rig.create(od);
+  AllocationDesc rd;
+  rd.flags = kAllocQueryResult, rd.size = 8;
+  Handle results = rig.create(rd);
+  CommandWriter w(rig.allocator());
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.set_stream_output(0, 2);
+  w.bind_pipeline(vertex_pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(3);
+  float constants[24];
+  for (uint32_t k = 0; k < 16; ++k) constants[k] = kIdentity[k];
+  for (uint32_t k = 0; k < 8; ++k) constants[16 + k] = k < 4 ? 3.0f : 0.0f;
+  w.set_stream_output(0, 3);
+  w.bind_pipeline(domain_pipe);
+  w.push_constants(bytes_of(constants, sizeof constants));
+  w.set_topology(patch_list(3));
+  w.begin_query(4, 0, static_cast<uint32_t>(graphics::QueryKind::SoPrimitivesWritten));
+  w.draw(3);
+  w.end_query();
+  w.end_pass();
+  rig.render(w, {target, vb, vertex_out, domain_out, results});
+  const uint64_t triangles = rig.read_u64(results, 0);
+  const uint32_t count = triangles > 64 ? 64 : static_cast<uint32_t>(triangles);
+  uint32_t f0[24], f1[64 * 24];
+  rig.read_words(vertex_out, ArrayView<uint32_t>(f0, 24));
+  rig.read_words(domain_out, ArrayView<uint32_t>(f1, 24 * count));
+  auto f = [](uint32_t bits) { return __builtin_bit_cast(float, bits); };
+  Vertex drawn[3 * 6 + 64 * 3];
+  uint32_t n = 0;
+  for (uint32_t i = 0; i < 3; ++i) {
+    const float x = f(f0[8 * i]) * 0.5f - 0.5f, y = f(f0[8 * i + 1]) * 0.5f - 0.5f, h = 0.1f;
+    const float r = f(f0[8 * i + 4]), g = f(f0[8 * i + 5]), bl = f(f0[8 * i + 6]);
+    Vertex* q = drawn + n;
+    q[0] = {x - h, y - h, 0.5f, r, g, bl, 1}, q[1] = {x + h, y - h, 0.5f, r, g, bl, 1}, q[2] = {x - h, y + h, 0.5f, r, g, bl, 1};
+    q[3] = q[2], q[4] = q[1], q[5] = {x + h, y + h, 0.5f, r, g, bl, 1};
+    n += 6;
+  }
+  for (uint32_t i = 0; i < 3 * count; ++i) {
+    const float x = f(f1[8 * i]) * 0.5f + 0.4f, y = f(f1[8 * i + 1]) * 0.5f + 0.2f;
+    drawn[n++] = {x, y, 0.5f, f(f1[8 * i + 4]), f(f1[8 * i + 5]), f(f1[8 * i + 6]), 1};
+  }
+  Handle flat = d3d9_pipeline(rig, false, false);
+  Handle svb = rig.buffer(kAllocVertexBuffer, bytes_of(drawn, sizeof(Vertex) * n));
+  CommandWriter w2(rig.allocator());
+  begin(w2, 0, kNoAllocation, {0, 0, 0, 1});
+  w2.bind_pipeline(flat);
+  w2.bind_vertex_buffer(1);
+  w2.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w2.draw(n);
+  w2.end_pass();
+  rig.render(w2, {target, svb});
+  rig.read(target, out);
+}
+
+// A stream other than the first drawn: gs_streams_draw1 puts a point at each vertex in stream 1 (moved by half a pixel to the centre of a pixel) and a vector in stream 0, which only the buffer
+// gets. The picture is the three points.
+void scene_stream_output_draw_stream1(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureStreamOutput | graphics::kFeatureGeometryShaders)) return void(rig.step("stream output draw stream", status::kNotSupported));
+  namespace b = conformance_blobs;
+  const Vertex v[3] = {{-0.5f, -0.5f, 0.5f, 1, 0, 0, 1}, {0.5f, -0.5f, 0.5f, 0, 1, 0, 1}, {0.0f, 0.5f, 0.5f, 0, 0, 1, 1}};
+  Handle vs = rig.vertex_shader(bytes_of(b::k_vs, sizeof b::k_vs));
+  Handle gs = rig.shader("create_shader (geometry)", ShaderKind::Dxbc, graphics::ShaderStage::Geometry, bytes_of(b::k_gs_streams_draw1, sizeof b::k_gs_streams_draw1));
+  Handle ps = rig.pixel_shader(bytes_of(b::k_ps_color, sizeof b::k_ps_color));
+  PipelineDesc pd = colour_pipeline_desc(vs, ps);
+  pd.varying_count = 3;
+  pd.geometry_shader = gs;
+  pd.stream_output_count = 2;
+  pd.stream_output[0] = {0, 4, 0, 4, 0}, pd.stream_output[1] = {1, 0, 0, 4, 1};   // (stream 0's vector made of the position and colour; stream 1's position)
+  pd.stream_output_stride[0] = 16, pd.stream_output_stride[1] = 16;
+  pd.rasterized_stream = 1;
+  Handle pipe = rig.pipeline(pd);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  AllocationDesc od;
+  od.flags = kAllocStreamOutput, od.size = 3 * 16;
+  Handle first = rig.create(od);
+  Handle second = rig.create(od);
+  CommandWriter w(rig.allocator());
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.set_stream_output(0, 2);
+  w.set_stream_output(1, 3);
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(3);
+  w.end_pass();
+  rig.render(w, {target, vb, first, second});
+  // (stream 0's vectors, position + colour, drawn as squares on the points: a pixel alone is little to compare)
+  uint32_t g0[12];
+  rig.read_words(first, ArrayView<uint32_t>(g0, 12));
+  Vertex squares[18];
+  for (uint32_t i = 0; i < 3; ++i) {
+    const float x = __builtin_bit_cast(float, g0[4 * i]) * 0.5f, y = __builtin_bit_cast(float, g0[4 * i + 1]) * 0.5f - 0.25f, h = 0.15f;
+    Vertex* q = squares + 6 * i;
+    q[0] = {x - h, y - h, 0.5f, 1, 1, 0.5f, 1}, q[1] = {x + h, y - h, 0.5f, 1, 1, 0.5f, 1}, q[2] = {x - h, y + h, 0.5f, 1, 1, 0.5f, 1};
+    q[3] = q[2], q[4] = q[1], q[5] = {x + h, y + h, 0.5f, 1, 1, 0.5f, 1};
+  }
+  Handle flat = d3d9_pipeline(rig, false, false);
+  Handle svb = rig.buffer(kAllocVertexBuffer, bytes_of(squares, sizeof squares));
+  CommandWriter w2(rig.allocator());
+  w2.begin_pass(0, kNoAllocation, 0, {0, 0, 0, 1}, 1.0f, 0);   // (the points stay)
+  w2.bind_pipeline(flat);
+  w2.bind_vertex_buffer(1);
+  w2.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w2.draw(18);
+  w2.end_pass();
+  rig.render(w2, {target, svb});
   rig.read(target, out);
 }
 
@@ -1695,6 +2240,11 @@ TESS_SCENE(scene_tess_fractional_even,
            {TESS_BLOB(hs_tri_even_cb), TESS_BLOB(ds_noise), 3, {2.5f, 3.7f, 5.2f, 4.4f}, {0, 0, 0, 0}, kNoCull}, {TESS_BLOB(hs_quad_even_cb), TESS_BLOB(ds_quad), 4, {3.3f, 2.2f, 6.6f, 4.1f}, {3.7f, 5.5f, 0, 0}, kNoCull},
            {TESS_BLOB(hs_iso_even_cb), TESS_BLOB(ds_iso), 2, {3, 5.5f, 0, 0}, {0, 0, 0, 0}, kNoCull}, {TESS_BLOB(hs_tri_even_cb), TESS_BLOB(ds_noise), 3, {1, 1, 1, 1.6f}, {0, 0, 0, 0}, kNoCull})
 
+// The same with DXIL (Shader Model 6) hull and domain shaders: a triangle patch and a quad patch with different factors.
+TESS_SCENE(scene_dxil_tess,
+           {TESS_BLOB(dxil_hs_tri_cb), TESS_BLOB(dxil_ds_noise), 3, {5, 5, 5, 5}, {0, 0, 0, 0}, kNoCull}, {TESS_BLOB(dxil_hs_tri_cb), TESS_BLOB(dxil_ds_noise), 3, {3, 6, 2, 4}, {0, 0, 0, 0}, kNoCull},
+           {TESS_BLOB(dxil_hs_quad_cb), TESS_BLOB(dxil_ds_quad), 4, {4, 4, 4, 4}, {4, 4, 0, 0}, kNoCull}, {TESS_BLOB(dxil_hs_quad_cb), TESS_BLOB(dxil_ds_quad), 4, {2, 3, 5, 8}, {4, 3, 0, 0}, kNoCull})
+
 const Entry kScenes[] = {
     {"Direct3D 9 vertex colours", scene_vertex_colours},
     {"Direct3D 9 Shader Model 3", scene_sm3},
@@ -1726,6 +2276,21 @@ const Entry kScenes[] = {
     {"Direct3D 10 geometry shader (DXBC)", scene_geometry_shader},
     {"Direct3D 11 instanced geometry (DXBC)", scene_geometry_instances},
     {"Direct3D 10 adjacency primitives (DXBC)", scene_geometry_adjacency},
+    {"Direct3D 12 root signature, descriptors and states: compute (DXBC)", scene_d3d12_compute},
+    {"Direct3D 12 root signature, descriptors and states: textures (DXBC)", scene_d3d12_textures},
+    {"Direct3D 12 resource heap: a target and a texture aliased (DXBC)", scene_d3d12_heap},
+    {"Direct3D 12 DXIL shaders (Shader Model 6)", scene_dxil},
+    {"Direct3D 12 DXIL compute shader (Shader Model 6)", scene_dxil_compute},
+    {"Direct3D 12 DXIL geometry shader (Shader Model 6)", scene_dxil_geometry},
+    {"Direct3D 12 DXIL hull and domain shaders (Shader Model 6)", scene_dxil_tess},
+    {"Direct3D 12 DXIL gather4 (Shader Model 6)", scene_dxil_gather},
+    {"Direct3D 12 DXIL derivatives (Shader Model 6)", scene_dxil_derivatives},
+    {"Direct3D 12 DXIL buffer shader resource views (Shader Model 6)", scene_dxil_compute_srv},
+    {"Direct3D 12 DXIL group-shared memory, barriers and a loop (Shader Model 6)", scene_dxil_compute_shared},
+    {"Direct3D 11 stream output of two streams (DXBC)", scene_stream_output},
+    {"Direct3D 11 stream output appending, statistics and timestamps (DXBC)", scene_stream_output_append},
+    {"Direct3D 11 stream output of vertex and domain shaders (DXBC)", scene_stream_output_stages},
+    {"Direct3D 11 stream output drawing the second stream (DXBC)", scene_stream_output_draw_stream1},
     {"Direct3D 11 tessellation, triangle domain (DXBC)", scene_tess_triangle, false, 6},
     {"Direct3D 11 tessellation, quad domain (DXBC)", scene_tess_quad, false, 6},
     {"Direct3D 11 tessellation, isolines and points (DXBC)", scene_tess_lines_points, true},

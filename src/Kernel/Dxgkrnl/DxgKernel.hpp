@@ -60,7 +60,8 @@ class IWaitHook {
 //                    write, reference: one word each)                                                                                       reply: handle
 //                    (optionally, after that: depth_compare, blend custom, enable, source colour, destination colour, source alpha, destination alpha factors, colour op, alpha op,
 //                    write mask, per-instance bits of the attributes, then the number of colour outputs, then for independent blending a flag and the nine words
-//                    (custom, enable, four factors, two ops, write mask) of the blend state of each of targets 1 .. 3, then multisample, then the geometry shader (0: none), then the hull and domain shaders (0: none) - one word each)
+//                    (custom, enable, four factors, two ops, write mask) of the blend state of each of targets 1 .. 3, then multisample, then the geometry shader (0: none), then the hull and domain shaders (0: none) - one word each; then stream output: the number of entries, and for more than none the rasterized stream (-1: none), the strides of the four
+//                    buffers and for each entry two words: stream | output << 8 | start component << 16 | component count << 24, and the buffer)
 //   DestroyShader / DestroyPipeline   handle
 //   CreateComputePipeline   shader (a Compute stage shader)                                                                           reply: handle
 enum class EscapeOp : uint32_t { CreateShader = 1, CreatePipeline = 2, DestroyShader = 3, DestroyPipeline = 4, CreateComputePipeline = 5 };
@@ -154,6 +155,15 @@ class Kernel {
   // --- Shaders and pipelines directly (escape() is the same through the private-data ABI).
   NtStatus create_shader(ProcessId pid, Handle device, const ShaderDesc& desc, Handle* shader);
   NtStatus create_pipeline(ProcessId pid, Handle device, const PipelineDesc& desc, Handle* pipeline);
+  // Direct3D 12 binding objects (D3d12.hpp): a root signature from its serialized form, descriptor heaps (a heap holds views or samplers), the descriptors in them.
+  NtStatus create_root_signature(ProcessId pid, Handle device, ConstByteView blob, Handle* signature);
+  NtStatus destroy_root_signature(ProcessId pid, Handle signature);
+  NtStatus create_descriptor_heap(ProcessId pid, Handle device, DescriptorHeapType type, uint32_t count, Handle* heap);
+  NtStatus destroy_descriptor_heap(ProcessId pid, Handle heap);
+  NtStatus write_descriptor(ProcessId pid, Handle heap, uint32_t index, const DescriptorDesc& desc);
+  NtStatus copy_descriptors(ProcessId pid, Handle destination, uint32_t destination_index, Handle source, uint32_t source_index, uint32_t count);
+  // Reserved buffers (kAllocReserved): `tile_count` tiles of 64 KiB from `first_tile` go to `heap_offset` (a multiple of 64 KiB) of the heap on; heap 0 unmaps them.
+  NtStatus update_tile_mappings(ProcessId pid, Handle reserved, uint32_t first_tile, Handle heap, uint64_t heap_offset, uint32_t tile_count);
   NtStatus destroy_shader(ProcessId pid, Handle shader);
   NtStatus destroy_pipeline(ProcessId pid, Handle pipeline);
   NtStatus escape(ProcessId pid, Handle device, ConstByteView request, ByteView reply, uint32_t* reply_bytes);

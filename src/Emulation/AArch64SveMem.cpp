@@ -120,7 +120,24 @@ AArch64Cpu::Step AArch64Cpu::sve_memory(GuestMemory& m, uint32_t insn) {
         s_.v[rt] = r;
         return Step::Ok;
       }
-      case 6: case 7: {      // LDNT1, LD2, LD3, LD4
+      case 4: case 7: case 6: {      // LD2Q / LD3Q / LD4Q, then LDNT1, LD2, LD3, LD4
+        if ((kind == 7 && ((insn >> 20) & 1) && opc == 0) || (kind == 4 && opc == 1)) {
+          if (msz_field == 0) return undefined();
+          const uint32_t nreg = msz_field + 1;
+          uint64_t address;
+          if (kind == 7) address = base + static_cast<uint64_t>(imm4 * static_cast<int64_t>(nreg) * 16);
+          else {
+            if (rm == 31) return undefined();
+            address = base + (reg(rm, true) << 4);
+          }
+          Vec r[4];
+          if (active(gp, 0, 4))
+            for (uint32_t k = 0; k < nreg; ++k)
+              if (!load_vec(m, address + 16 * k, 16, &r[k])) return Step::Fault;
+          for (uint32_t k = 0; k < nreg; ++k) s_.v[(rt + k) & 31] = r[k];
+          return Step::Ok;
+        }
+        if (kind == 4) return undefined();
         const uint32_t nreg = opc + 1, esz = msz_field;
         if (kind == 7 && ((insn >> 20) & 1)) return undefined();
         const uint32_t elements = element_count(esz);
@@ -223,14 +240,39 @@ AArch64Cpu::Step AArch64Cpu::sve_memory(GuestMemory& m, uint32_t insn) {
         const uint64_t imm = static_cast<uint64_t>(rm) << msz;
         return store_elements(gp, esz, msz, data, [&](uint32_t i) { return get(bases, esz, i) + imm; });
       }
-      case 1: {      // STNT1 (vector plus scalar)
+      case 1: {      // STNT1 (vector plus scalar), ST1Q
         const uint32_t msz = msz_field;
+        if (opc == 1 && msz == 0) {      // ST1Q {Zt.Q}, Pg, [Zn.D{, Xm}]
+          if (active(gp, 0, 3)) {
+            const uint64_t address = s_.v[rn].lo + reg(rm, true);
+            if (!store_vec(m, address, kVectorBytes, data)) return Step::Fault;
+          }
+          return Step::Ok;
+        }
         if (opc != 0 && opc != 2) return undefined();
         const uint32_t esz = opc == 2 ? 2 : 3;
         if (msz > esz) return undefined();
         const Vec bases = s_.v[rn];
         const uint64_t offset = reg(rm, true);
         return store_elements(gp, esz, msz, data, [&](uint32_t i) { return get(bases, esz, i) + offset; });
+      }
+      case 0: {      // ST2Q, ST3Q, ST4Q: one quadword per structure at this vector length
+        if ((insn >> 24) & 1) return undefined();
+        const uint32_t nreg = bits_of(insn, 23, 22) + 1;
+        if (nreg < 2) return undefined();
+        uint64_t address;
+        if (!((insn >> 21) & 1)) {
+          if ((insn >> 20) & 1) return undefined();
+          address = base + static_cast<uint64_t>(imm4 * static_cast<int64_t>(nreg) * 16);
+        } else {
+          if (rm == 31) return undefined();
+          address = base + (reg(rm, true) << 4);
+        }
+        if (active(gp, 0, 4)) {
+          for (uint32_t k = 0; k < nreg; ++k)
+            if (!store_vec(m, address + 16 * k, 16, s_.v[(rt + k) & 31])) return Step::Fault;
+        }
+        return Step::Ok;
       }
       default: return undefined();
     }
@@ -314,7 +356,13 @@ AArch64Cpu::Step AArch64Cpu::sve_memory(GuestMemory& m, uint32_t insn) {
     s_.v[rt] = r;
     return Step::Ok;
   }
-  // opc == 0: LDNT1 (vector plus scalar)
+  // opc == 0: LD1Q or LDNT1 (vector plus scalar)
+  if (d64 && msz_field == 0 && b13 && !b14) {      // LD1Q {Zt.Q}, Pg/Z, [Zn.D{, Xm}]
+    Vec r;
+    if (active(gp, 0, 3) && !load_vec(m, s_.v[rn].lo + reg(rm, true), kVectorBytes, &r)) return Step::Fault;
+    s_.v[rt] = r;
+    return Step::Ok;
+  }
   {
     const uint32_t msz = msz_field;
     const bool unsigned_load = d64 ? b14 : b13;

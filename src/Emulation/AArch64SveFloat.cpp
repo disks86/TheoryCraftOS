@@ -611,7 +611,7 @@ bool AArch64Cpu::sve_float(uint32_t insn) {
         const Format f = format_of(esz, bf_size);
         const Vec lo = s_.v[zn], hi = s_.v[zm];
         for (uint32_t i = 0; i < elements; ++i) {
-          const uint64_t r = arm_minmax(f, arm_minmax(f, get(*dst, esz, i), get(lo, esz, i), true, true, env), get(hi, esz, i), false, true, env);
+          const uint64_t r = arm_minmax(f, arm_minmax(f, get(lo, esz, i), get(*dst, esz, i), true, true, env), get(hi, esz, i), false, true, env);      // (with two NaNs the lower bound's is the one that propagates)
           put(dst, esz, i, nan_fix(f, r));
         }
         return finish();
@@ -620,24 +620,7 @@ bool AArch64Cpu::sve_float(uint32_t insn) {
       Env& benv = env;      // (the BFloat16 widening multiply-adds use the ordinary floating-point environment)
       auto bf_f32 = [](uint64_t v) { return (v & 0xFFFF) << 16; };
       auto widen = [&](uint64_t v, bool bfloat, Env& e) { return bfloat ? bf_f32(v) : convert(Format::F16, Format::F32, v, e); };
-      // The BFloat16 dot products and matrix multiply round to odd at every step, flush denormals, produce the default NaN and report no exceptions.
-      auto odd_op = [&](bool is_mul, uint64_t x, uint64_t y) -> uint64_t {
-        if (is_nan(Format::F32, x) || is_nan(Format::F32, y)) return 0x7FC00000u;
-        Env e = env;
-        e.mode = Rounding::TowardZero;
-        e.flags = 0;
-        e.daz = true;
-        e.ftz = true;
-        uint64_t r = is_mul ? mul(Format::F32, x, y, e) : add(Format::F32, x, y, e);
-        if (is_nan(Format::F32, r)) return 0x7FC00000u;
-        if (e.flags & kOverflow) return (r & 0x80000000u) | 0x7F800000u;      // (an overflow gives an infinity)
-        if ((e.flags & kInexact) && (r & 0x7FFFFFFFu) != 0x7F800000u) r |= 1;
-        return r;
-      };
-      auto bf_dot_add = [&](uint64_t sum, uint64_t a0, uint64_t a1, uint64_t b0, uint64_t b1) {
-        const uint64_t p1 = odd_op(true, bf_f32(a0), bf_f32(b0)), p2 = odd_op(true, bf_f32(a1), bf_f32(b1));
-        return odd_op(false, sum, odd_op(false, p1, p2));
-      };
+      auto bf_dot_add = [&](uint64_t sum, uint64_t a0, uint64_t a1, uint64_t b0, uint64_t b1) { return sve::bfloat_dot_add(sum, a0, a1, b0, b1, env); };
       if ((op == 0x20 && size <= 1) || (op == 0x10 && size <= 1)) {      // FDOT, BFDOT (vectors: op 0x20; by element: op 0x10)
         const bool bfloat = size == 1;
         uint32_t zmr = zm, index = 0;
@@ -808,5 +791,9 @@ bool AArch64Cpu::sve_float(uint32_t insn) {
     return false;
   }
 }
+
+namespace sve {
+uint64_t fscale_value(Format f, uint64_t x, int64_t n, Env& env) { return emulation::fscale(f, x, n, env); }
+}  // namespace sve
 
 }  // namespace emulation

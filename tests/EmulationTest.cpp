@@ -1051,8 +1051,136 @@ static void test_aarch64_sve() {
   }
 }
 
+static void test_aarch64_sme() {
+  {      // streaming mode and ZA: write a row, read it back as a row and as a column, an outer product, ZERO, two-vector slice moves, ZT0 lookups and a two-vector load governed by a counter predicate
+    A64Machine m({0xd503477f,       // smstart
+                  0x2598e3e0,       // ptrue p0.s
+                  0x04a14020,       // index z0.s, #1, #1
+                  0xc0800000,       // mov za0h.s[w12, 0], p0/m, z0.s
+                  0xc0828001,       // mov z1.s, p0/m, za0v.s[w12, 0]
+                  0xc0820002,       // mov z2.s, p0/m, za0h.s[w12, 0]
+                  0x25b9c003,       // fmov z3.s, #2.0
+                  0x80830061,       // fmopa za1.s, p0/m, p0/m, z3.s, z3.s
+                  0xc0820084,       // mov z4.s, p0/m, za1h.s[w12, 0]
+                  0xc00800ff,       // zero {za}
+                  0xc0820005,       // mov z5.s, p0/m, za0h.s[w12, 0]
+                  0xe11f8020,       // ldr zt0, [x1]
+                  0xc0cc2006,       // luti2 z6.s, zt0, z0[0]
+                  0xc0860008,       // mov {z8.s, z9.s}, za0h.s[w12, 0:1]
+                  0xc0840000,       // mov za0h.s[w12, 0:1], {z0.s, z1.s}
+                  0xc086000a,       // mov {z10.s, z11.s}, za0h.s[w12, 0:1]
+                  0x25a07810,       // ptrue pn8.s
+                  0xa040402c,       // ld1w {z12.s, z13.s}, pn8/z, [x1]
+                  0xd4000001});
+    uint32_t table[16];
+    for (uint32_t i = 0; i < 16; ++i) table[i] = 0x100 + i;
+    m.space.write(kData, ConstByteView(reinterpret_cast<const uint8_t*>(table), sizeof table));
+    m.x(1) = kData;
+    m.x(12) = 0;
+    CHECK(m.run() == StopReason::Syscall);
+    const AArch64Cpu::State& s = m.cpu.state();
+    CHECK(s.v[1].lo == 1 && s.v[1].hi == 0);      // column 0 of tile 0: only the row that was written is non-zero
+    CHECK(s.v[2].lo == 0x0000000200000001ull && s.v[2].hi == 0x0000000400000003ull);
+    CHECK(s.v[4].lo == 0x4080000040800000ull && s.v[4].hi == 0x4080000040800000ull);      // 2.0 * 2.0 in every element
+    CHECK(s.v[5].lo == 0 && s.v[5].hi == 0 && s.v[8].lo == 0 && s.v[9].hi == 0);      // ZERO cleared the array
+    CHECK(s.v[6].lo == 0x0000010000000101ull && s.v[6].hi == 0x0000010000000100ull);      // the indices 1, 0, 0, 0 pick table entries 0x101 and 0x100
+    CHECK(s.v[10].lo == 0x0000000200000001ull && s.v[10].hi == 0x0000000400000003ull && s.v[11].lo == 1 && s.v[11].hi == 0);
+    CHECK(s.v[12].lo == 0x0000010100000100ull && s.v[12].hi == 0x0000010300000102ull && s.v[13].lo == 0x0000010500000104ull && s.v[13].hi == 0x0000010700000106ull);
+    CHECK(!s.streaming);      // the system call left streaming mode, as it does on Linux
+  }
+  {      // SME2: ZA vector groups, dot products, multi-vector arithmetic, zip, MOP4, slice moves of two vectors and a narrowing shift (streaming mode and ZA are set directly)
+    A64Machine m({0xc1a01c10,       // add za.s[w8, 0, vgx2], {z0.s, z1.s}
+                  0xc1241441,       // sdot za.s[w8, 1, vgx2], {z2.b, z3.b}, z4.b
+                  0xc1a5a006,       // smax {z6.s, z7.s}, {z6.s, z7.s}, z5.s
+                  0xc1a1d008,       // zip {z8.s, z9.s}, z0.s, z1.s
+                  0x80008143,       // smop4a za3.s, z10.b, z16.b
+                  0xc086000c,       // mov {z12.s, z13.s}, za0h.s[w12, 0:1]
+                  0xc1efd40e,       // sqrshr z14.h, {z0.s, z1.s}, #1
+                  0xd4000001});
+    AArch64Cpu::State& s = m.cpu.state();
+    s.streaming = true;
+    s.za_enabled = true;
+    s.v[0].lo = 0x0000000200000001ull; s.v[0].hi = 0x0000000400000003ull;
+    s.v[1].lo = 0x0000000600000005ull; s.v[1].hi = 0x0000000800000007ull;
+    s.v[2].lo = s.v[2].hi = s.v[3].lo = s.v[3].hi = 0x0202020202020202ull;
+    s.v[4].lo = s.v[4].hi = 0x0303030303030303ull;
+    s.v[5].lo = s.v[5].hi = 0x0000000A0000000Aull;
+    s.v[6].lo = 0x0000001400000001ull; s.v[6].hi = 0x0000002800000003ull;
+    s.v[7].lo = 0x0000000600000032ull; s.v[7].hi = 0x0000000800000046ull;
+    s.v[10].lo = s.v[10].hi = 0x0101010101010101ull;
+    s.v[16].lo = s.v[16].hi = 0x0202020202020202ull;
+    m.x(8) = 0;
+    m.x(12) = 0;
+    CHECK(m.run() == StopReason::Syscall);
+    CHECK(s.za[0].lo == 0x0000000200000001ull && s.za[0].hi == 0x0000000400000003ull && s.za[8].lo == 0x0000000600000005ull && s.za[8].hi == 0x0000000800000007ull);      // the two vectors of the group, eight rows apart
+    CHECK(s.za[1].lo == 0x0000001800000018ull && s.za[9].hi == 0x0000001800000018ull);      // 4 * (2 * 3)
+    CHECK(s.v[6].lo == 0x000000140000000Aull && s.v[6].hi == 0x000000280000000Aull && s.v[7].lo == 0x0000000A00000032ull && s.v[7].hi == 0x0000000A00000046ull);
+    CHECK(s.v[8].lo == 0x0000000500000001ull && s.v[8].hi == 0x0000000600000002ull && s.v[9].lo == 0x0000000700000003ull && s.v[9].hi == 0x0000000800000004ull);      // zip1 and zip2
+    CHECK(s.za[3].lo == 0x0000000800000008ull && s.za[15].hi == 0x0000000800000008ull);      // 4 * (1 * 2)
+    CHECK(s.v[12].lo == 0x0000000200000001ull && s.v[12].hi == 0x0000000400000003ull && s.v[13].lo == 0 && s.v[13].hi == 0);
+    CHECK(s.v[14].lo == 0x0002000200010001ull && s.v[14].hi == 0x0004000400030003ull);
+  }
+  {      // FEAT_FP8: widening conversions (with the scale), a narrowing conversion, a dot product, FSCALE and a table lookup (the format and scale registers are set directly)
+    A64Machine m({0x2e217822,       // f1cvtl v2.8h, v1.8b
+                  0xd4000001});
+    AArch64Cpu::State& s = m.cpu.state();
+    s.fpmr = 0;      // E5M2, no scale
+    s.v[1].lo = 0x000000000000003Cull * 0x100 + 0x40;      // bytes 0x40 (2.0) and 0x3c (1.0) in E5M2
+    s.v[1].hi = 0;
+    CHECK(m.run() == StopReason::Syscall);
+    CHECK((s.v[2].lo & 0xFFFF) == 0x4000 && ((s.v[2].lo >> 16) & 0xFFFF) == 0x3C00);      // 2.0 and 1.0 as halves
+  }
+  {      // the same conversion with LSCALE = 1 halves the values, and E4M3 / FP8 dot products
+    A64Machine m({0x2e217822, 0xd4000001});
+    m.cpu.state().fpmr = 1ull << 16;
+    m.cpu.state().v[1].lo = 0x3C40;
+    CHECK(m.run() == StopReason::Syscall && (m.cpu.state().v[2].lo & 0xFFFF) == 0x3C00 && ((m.cpu.state().v[2].lo >> 16) & 0xFFFF) == 0x3800);
+    A64Machine d({0x4e42fc20, 0xd4000001});      // fdot v0.8h, v1.16b, v2.16b: 1.0 + 3 * 3 + 3 * 3 in every lane
+    for (auto& v : {&d.cpu.state().v[1], &d.cpu.state().v[2]}) v->lo = v->hi = 0x4242424242424242ull;
+    d.cpu.state().v[0].lo = d.cpu.state().v[0].hi = 0x3C003C003C003C00ull;
+    CHECK(d.run() == StopReason::Syscall && d.cpu.state().v[0].lo == 0x4CC04CC04CC04CC0ull && d.cpu.state().v[0].hi == 0x4CC04CC04CC04CC0ull);
+    A64Machine n({0x0e42f423, 0xd4000001});      // fcvtn v3.8b, v1.4h, v2.4h to E4M3: 1.0 is 0x38
+    n.cpu.state().fpmr = 1ull << 6;
+    n.cpu.state().v[1].lo = n.cpu.state().v[2].lo = 0x3C003C003C003C00ull;
+    CHECK(n.run() == StopReason::Syscall && n.cpu.state().v[3].lo == 0x3838383838383838ull && n.cpu.state().v[3].hi == 0);
+    A64Machine l({0x4e821020, 0xd4000001});      // luti2 v0.16b, {v1.16b}, v2[0]
+    l.cpu.state().v[1].lo = 0x281E140A281E140Aull;      // the table 10, 20, 30, 40
+    l.cpu.state().v[2].lo = 0xE4;      // indices 0 1 2 3
+    l.cpu.state().v[2].hi = 0;
+    CHECK(l.run() == StopReason::Syscall && (l.cpu.state().v[0].lo & 0xFFFFFFFFu) == 0x281E140Au);
+    A64Machine f({0x2ea2fc20, 0xd4000001});
+    f.cpu.state().v[1].lo = 0x404000003F800000ull;      // 1.0 and 3.0
+    f.cpu.state().v[2].lo = 0xFFFFFFFF00000003ull;      // 3 and -1
+    CHECK(f.run() == StopReason::Syscall && f.cpu.state().v[0].lo == 0x3FC0000041000000ull);      // 8.0 and 1.5
+  }
+  {      // SME2.2 multi-vector FMUL (not checkable against qemu): {z0, z1} * z2, and the SME2 LUTv2 four-register LUTI4
+    A64Machine m({0xc1a4e800, 0xd4000001});      // fmul {z0.s, z1.s}, {z0.s, z1.s}, z2.s
+    AArch64Cpu::State& s = m.cpu.state();
+    s.streaming = true;
+    s.za_enabled = true;
+    s.v[0].lo = s.v[0].hi = s.v[1].lo = s.v[1].hi = 0x3F8000003F800000ull;      // 1.0
+    s.v[2].lo = s.v[2].hi = 0x4000000040000000ull;      // 2.0
+    CHECK(m.run() == StopReason::Syscall && s.v[0].lo == 0x4000000040000000ull && s.v[1].hi == 0x4000000040000000ull);
+    A64Machine l({0xc08b0080, 0xd4000001});      // luti4 {z0.b-z3.b}, zt0, {z4, z5}
+    l.cpu.state().streaming = true;
+    l.cpu.state().za_enabled = true;
+    for (uint32_t i = 0; i < 8; ++i) l.cpu.state().zt0[i] = 0x0000000100000000ull * (2 * i + 1) + 2 * i;      // entry e has the low byte e
+    l.cpu.state().v[4].lo = 0x0F0E0D0C0B0A0908ull;      // nibbles 8 9 .. F 0 ... : index = nibble
+    l.cpu.state().v[4].hi = 0;
+    CHECK(l.run() == StopReason::Syscall && (l.cpu.state().v[0].lo & 0xFF) == 8);
+  }
+  {      // streaming-only instructions are undefined outside streaming mode
+    A64Machine m({0xc0828001, 0xd4000001});      // mov z1.s, p0/m, za0v.s[w12, 0]
+    CHECK(m.run() == StopReason::Fault && m.cpu.fault().vector == 6);
+  }
+  {      // the ID registers report SME (ID_AA64PFR1_EL1 bits 27:24)
+    A64Machine m({0xd5380420, 0xd4000001});      // mrs x0, ID_AA64PFR1_EL1
+    CHECK(m.run() == StopReason::Syscall && ((m.x(0) >> 24) & 15) != 0);
+  }
+}
+
 static void test_aarch64_robustness() {
-  const Words sample = {0xf9400420, 0x91000400, 0xf9000420, 0x1e601000, 0x1e611001, 0x1e612802, 0x9e660045, 0x1f410803, 0x9e780066, 0x3dc00020, 0x4ea08400, 0x3d800420,
+  const Words sample = {0xf9400420, 0x91000400, 0xf9000420, 0x1e601000, 0x1e611001, 0x1e612802, 0x9e660045, 0x1f410803, 0x9e780066, 0x3dc00020, 0x4ea08400, 0x3d800420, 0x2e217800, 0x0e40f400, 0x4e40fc00, 0x0e00c400, 0x6e00ec00, 0x4e801000, 0x2ea2fc20, 0x0fc00000,
                         0xf1000c1f, 0x1a9f17e7, 0xdac01149, 0x0c407000, 0x4c40a000, 0x0d404000, 0x2e208400, 0x0e200800};
   uint32_t runs = 0;
   for (size_t i = 0; i < sample.size(); ++i) {      // every single-bit flip of every word
@@ -1076,7 +1204,7 @@ static void test_aarch64_robustness() {
     ++runs;
   }
   {      // SVE: every bit flip of one word of each kind (integer, predicate, permute, floating point, SVE2, loads, stores), then random words from the SVE encoding space with addresses in the data page
-    const Words sve = {0x04a14020, 0x04802022, 0x2598e3e0, 0x25a317e1, 0x05a36041, 0x658600c7, 0x44836041, 0x45836041, 0xa540a483, 0xa41f68c4, 0xc5c8c889, 0xe540e4a3, 0xe5a4a861, 0x8508448b, 0x2519f003, 0x252c9000};
+    const Words sve = {0x04a14020, 0x04802022, 0x2598e3e0, 0x25a317e1, 0x05a36041, 0x658600c7, 0x44836041, 0x45836041, 0xa540a483, 0xa41f68c4, 0xc5c8c889, 0xe540e4a3, 0xe5a4a861, 0x8508448b, 0x2519f003, 0x252c9000, 0x65083000, 0x650a3040, 0x64208400, 0x64a08800, 0x6420c000, 0x6420e000, 0x4520b000};
     for (size_t i = 0; i < sve.size(); ++i)
       for (int bit = 0; bit < 32; ++bit) {
         A64Machine m({sve[i] ^ (1u << bit), 0xd4000001});
@@ -1096,7 +1224,34 @@ static void test_aarch64_robustness() {
       ++runs;
     }
   }
-  CHECK(runs > 80000);
+  {      // SME: every bit flip of one word of each kind in streaming mode with ZA enabled, then random words from the SME encoding space
+    const Words sme = {0xc0800000, 0xc0828001, 0xc0860008, 0xc0840000, 0xc0cc2006, 0xe11f8020, 0xc0480001, 0xe0400000, 0xe1400000, 0x80830061, 0xa0830061, 0xc0090000, 0xa040402c, 0xa0204000, 0xc0e00000, 0xc0c10000,
+                       0xc1a01c10, 0xc1241441, 0xc1a5a006, 0xc1a1d008, 0x80008143, 0xc1efd40e, 0xc1231802, 0xc1600c00, 0xc1a0e000, 0xc1a08000, 0xc1b6e000, 0x81800008, 0xc0000000,
+                       0xc126e040, 0xc124e040, 0xc134e0a0, 0x80a00000, 0x80200000, 0xc1d00000, 0xc1e00000};
+    auto prepare = [](A64Machine& m, uint64_t seed) {
+      m.cpu.state().streaming = true;
+      m.cpu.state().za_enabled = true;
+      for (int r = 0; r < 31; ++r) m.x(r) = (r & 1) ? kData + 512 : (seed >> r) & 0x1F;
+      for (auto& v : m.cpu.state().v) v.lo = v.hi = seed * 0x9E3779B97F4A7C15ull;
+      for (auto& row : m.cpu.state().za) row.lo = row.hi = seed;
+      for (int k = 0; k < 16; ++k) m.cpu.state().p[k] = uint16_t(seed >> (k + 3));
+    };
+    for (size_t i = 0; i < sme.size(); ++i)
+      for (int bit = 0; bit < 32; ++bit) {
+        A64Machine m({sme[i] ^ (1u << bit), 0xd4000001});
+        prepare(m, 0x0000000800000004ull);
+        m.run(4);
+        ++runs;
+      }
+    for (int i = 0; i < 40000; ++i) {
+      seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+      A64Machine m({(uint32_t(seed) & ~(0xFu << 25)) | (1u << 31), 0xd4000001});
+      prepare(m, seed);
+      m.run(4);
+      ++runs;
+    }
+  }
+  CHECK(runs > 120000);
 }
 
 
@@ -1638,6 +1793,7 @@ int main(int argc, char** argv) {
   test_aarch64();
   test_aarch64_extensions();
   test_aarch64_sve();
+  test_aarch64_sme();
   test_aarch64_robustness();
   test_riscv64();
   test_riscv64_robustness();

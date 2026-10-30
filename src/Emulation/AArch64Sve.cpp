@@ -60,8 +60,16 @@ AArch64Cpu::Step AArch64Cpu::sve(GuestMemory& m, uint32_t insn) {
     case 0x04: return sve_integer(insn) ? Step::Ok : undefined();
     case 0x05: return sve_permute(insn) ? Step::Ok : undefined();
     case 0x24: case 0x25: return sve_predicate(insn) ? Step::Ok : undefined();
-    case 0x44: case 0x45: return sve2(insn) ? Step::Ok : undefined();
-    case 0x64: case 0x65: return sve_float(insn) ? Step::Ok : undefined();
+    case 0x44: case 0x45: {
+      Step fp8_result;
+      if (((insn >> 24) & 0xFE) == 0x44 && lut(insn)) return Step::Ok;
+      return sve2(insn) ? Step::Ok : undefined();
+    }
+    case 0x64: case 0x65: {
+      Step fp8_result;
+      if (fp8_sve(insn, &fp8_result)) return fp8_result;
+      return sve_float(insn) ? Step::Ok : undefined();
+    }
     case 0x84: case 0x85: case 0xA4: case 0xA5: case 0xC4: case 0xC5: case 0xE4: case 0xE5: return sve_memory(m, insn);
     default: return undefined();
   }

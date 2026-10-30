@@ -376,6 +376,12 @@ bool AArch64Cpu::sve2(uint32_t insn) {
         *dst = r;
         return true;
       }
+      if ((op == 0x32 || op == 0x33) && size == 2) {      // SDOT, UDOT (two-way, halfwords into words, by element: bit 21 is clear)
+        const Vec n = s_.v[zn], m = s_.v[bits_of(insn, 18, 16)];
+        const uint32_t index = bits_of(insn, 20, 19);
+        for (uint32_t i = 0; i < 4; ++i) put(dst, 2, i, (get(*dst, 2, i) + static_cast<uint64_t>(dot_sum(n, m, 1, 2, i, op == 0x32, op == 0x32, index * 2))) & 0xFFFFFFFFu);
+        return true;
+      }
       return false;
     }
 
@@ -767,6 +773,40 @@ bool AArch64Cpu::sve2(uint32_t insn) {
   }
 
   // 0x45 with bit 21 set
+  if (((insn >> 23) & 1) && ((insn >> 21) & 1) && ((insn >> 20) & 1) && !((insn >> 22) & 1) && (op == 0x00 || op == 0x02 || op == 0x04 || op == 0x08 || op == 0x0A || op == 0x0E) && !((insn >> 5) & 1)) {      // SQSHRN .. UQRSHRN from a pair of vectors
+    const uint32_t shift = 16 - bits_of(insn, 19, 16);
+    const Vec n0 = s_.v[(zn & ~1u)], n1 = s_.v[(zn | 1u) & 31];
+    Vec r;
+    for (uint32_t i = 0; i < 8; ++i) {      // (the results interleave: even halfwords from the first vector, odd from the second)
+      const Vec& src = (i & 1) ? n1 : n0;
+      const uint64_t x = get(src, 2, i >> 1);
+      bool sat = false;
+      const I128 sx = signed_of(x, 32), ux = unsigned_of(x, 32);
+      uint64_t v;
+      switch (op) {
+        case 0x00: v = saturate_to_signed(shift_right(sx, shift, false), 16, &sat); break;      // SQSHRN
+        case 0x02: v = saturate_to_unsigned(shift_right(sx, shift, true), 16, &sat); break;     // SQRSHRUN
+        case 0x04: v = saturate_to_unsigned(shift_right(ux, shift, false), 16, &sat); break;   // UQSHRN
+        case 0x08: v = saturate_to_unsigned(shift_right(sx, shift, false), 16, &sat); break;   // SQSHRUN
+        case 0x0A: v = saturate_to_signed(shift_right(sx, shift, true), 16, &sat); break;      // SQRSHRN
+        default: v = saturate_to_unsigned(shift_right(ux, shift, true), 16, &sat); break;      // UQRSHRN
+      }
+      put(&r, 1, i, v);
+    }
+    *dst = r;
+    return true;
+  }
+  if (bits_of(insn, 23, 16) == 0x31 && (op == 0x10 || op == 0x12 || op == 0x14) && !((insn >> 5) & 1)) {      // SQCVTN, UQCVTN, SQCVTUN from a pair of vectors
+    const Vec n0 = s_.v[(zn & ~1u)], n1 = s_.v[(zn | 1u) & 31];
+    Vec r;
+    for (uint32_t i = 0; i < 8; ++i) {
+      const uint64_t x = get((i & 1) ? n1 : n0, 2, i >> 1);
+      bool sat = false;
+      put(&r, 1, i, op == 0x10 ? saturate_to_signed(signed_of(x, 32), 16, &sat) : op == 0x12 ? saturate_to_unsigned(unsigned_of(x, 32), 16, &sat) : saturate_to_unsigned(signed_of(x, 32), 16, &sat));
+    }
+    *dst = r;
+    return true;
+  }
   if (group == 4 && op != 0x28) {      // MATCH, NMATCH (bits 15:13 = 100): the predicate result is in bits 3:0
     if (esz > 1) return false;
     const uint16_t gp = s_.p[bits_of(insn, 12, 10)];

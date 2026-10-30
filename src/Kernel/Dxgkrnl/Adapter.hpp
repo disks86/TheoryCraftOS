@@ -51,6 +51,8 @@ class Adapter {
   const AdapterCaps& caps() const { return caps_; }
   VidMm& vidmm() { return vidmm_; }
   graphics::IGraphicsDevice& device() { return device_; }
+  // The GPU's timestamp clock was interrupted (reset, power transition, frequency change): the next TimestampDisjoint query on this adapter says 1.
+  void interrupt_clock() { device_.interrupt_clock(); }
   hardware::IGraphicsProcessingUnit* display() { return display_; }
   allocators::IAllocator& allocator() { return allocator_; }
 
