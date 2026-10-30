@@ -61,6 +61,10 @@ struct Router {
   std::vector<uint8_t> drom;         // what DROM_READ gives (none: the operation is not supported)
   uint32_t drom_status = 0;          // the status the operation ends with
   uint32_t drom_reads = 0;
+  bool dp_arbitration = false;       // the DP resource operations are supported
+  uint32_t dp_held_by_other = 0;     // bit n: the DP IN adapter n is held by another connection manager
+  uint32_t dp_held_by_us = 0;
+  std::vector<uint32_t> dp_ops;      // opcode | port << 8 of each DP resource operation
 };
 
 class Fabric {
@@ -337,6 +341,14 @@ class Fabric {
           r.regs[9 + d] = word;
         }
         r.regs[26] = (r.drom_status << kCs26StatusShift);
+      } else if (r.dp_arbitration && ((v & 0xFFFF) == kOpQueryDpResource || (v & 0xFFFF) == kOpAllocDpResource || (v & 0xFFFF) == kOpDeallocDpResource)) {
+        const uint32_t op = v & 0xFFFF, port = r.regs[25] & 0xFF, bit = port < 32 ? 1u << port : 0;
+        r.dp_ops.push_back(op | port << 8);
+        uint32_t status = 0;
+        if (op == kOpDeallocDpResource) r.dp_held_by_us &= ~bit;
+        else if (r.dp_held_by_other & bit) status = 1;
+        else if (op == kOpAllocDpResource) r.dp_held_by_us |= bit;
+        r.regs[26] = status << kCs26StatusShift;
       } else if ((v & 0xFFFF) == kOpBufferAlloc && !r.buffer_alloc.empty()) {
         for (uint32_t d = 0; d < 16; ++d) r.regs[9 + d] = d < r.buffer_alloc.size() ? r.buffer_alloc[d] : 0;
         r.regs[25] = static_cast<uint32_t>(r.buffer_alloc.size());
