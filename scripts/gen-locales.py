@@ -120,7 +120,7 @@ def list_locales():
     for i in range(uloc_countAvailable()):
         name = uloc_getAvailable(i).decode()
         lcid = uloc_getLCID(name.encode())
-        if not lcid:
+        if not lcid or lcid == 0x7F:
             continue
         canonical = cstr(uloc_getLocaleForLCID, lcid, size=64) if False else None
         err = ctypes.c_int(0)
@@ -294,8 +294,10 @@ def build(lcid, icu):
         e = ctypes.c_int(0)
         n = udat_getSymbols(f, kind, index, buf, 64, ctypes.byref(e))
         return "".join(chr(buf[i]) for i in range(min(n, 64)))
-    months = [_sym(f_long, 1, i) for i in range(12)]
-    short_months = [_sym(f_long, 2, i) for i in range(12)]
+    months = [_sym(f_long, 10, i) or _sym(f_long, 1, i) for i in range(12)]          # standalone (nominative) forms
+    short_months = [_sym(f_long, 11, i) or _sym(f_long, 2, i) for i in range(12)]
+    genitive = [_sym(f_long, 1, i) for i in range(12)]
+    short_genitive = [_sym(f_long, 2, i) for i in range(12)]
     weekdays = [_sym(f_long, 3, i) for i in range(1, 8)]        # Sunday first
     short_weekdays = [_sym(f_long, 4, i) for i in range(1, 8)]
     am, pm = _sym(f_long, 5, 0), _sym(f_long, 5, 1)
@@ -411,6 +413,9 @@ def build(lcid, icu):
     for i in range(12):
         v[0x38 + i] = months[i]
         v[0x44 + i] = short_months[i]
+    for i in range(12):
+        v[0x8038 + i] = genitive[i]
+        v[0x8044 + i] = short_genitive[i]
     v[0x100E] = ""
     v[0x100F] = ""
     v[0x50] = ""
@@ -571,7 +576,7 @@ def main():
         if lcid == 0x7F or lcid > 0xFFFF:
             default_of.append(index_of_lcid[lcid])
             continue
-        if icu and "_" not in icu.replace("_", "", 0) and cstr(uloc_getCountry, icu.encode(), size=16) == "":
+        if icu and cstr(uloc_getCountry, icu.encode(), size=16) == "":
             likely = DEFAULT_SPECIFIC.get(icu) or cstr(uloc_addLikelySubtags, icu.encode(), size=64)
             region = cstr(uloc_getCountry, likely.encode(), size=16)
             lang = cstr(uloc_getLanguage, likely.encode(), size=16)
@@ -589,6 +594,30 @@ def main():
             default_of.append(index_of_lcid[target] if target is not None else index_of_lcid[lcid])
         else:
             default_of.append(index_of_lcid[lcid])
+    # a neutral locale shows the data of its specific locale under its own name
+    names_by_index = [r[1] for r in rows]
+    for i, (lcid, name, icu, v) in enumerate(rows):
+        if default_of[i] != i:
+            data = dict(rows[default_of[i]][3])
+            data[0x5C] = name
+            data[0x71] = "1"
+            data[0x6D] = ""
+            data[0x7B] = name
+            rows[i][3] = data
+    for i, (lcid, name, icu, v) in enumerate(rows):
+        if default_of[i] == i and lcid != 0x7F and lcid <= 0xFFFF and icu:
+            lang = cstr(uloc_getLanguage, icu.encode(), size=16)
+            script = cstr(uloc_getScript, icu.encode(), size=16)
+            parent = ""
+            for j, (l2, n2, i2, _) in enumerate(rows):
+                if default_of[j] != j and i2 and cstr(uloc_getCountry, i2.encode(), size=16) == "" and cstr(uloc_getLanguage, i2.encode(), size=16) == lang:
+                    s2 = cstr(uloc_getScript, i2.encode(), size=16)
+                    if lang == "zh":
+                        if (not s2 and False) or s2 != ("Hant" if ("Hant" in icu or icu.endswith(("_TW", "_HK", "_MO"))) else "Hans"):
+                            continue
+                    parent = n2
+                    break
+            v[0x6D] = parent
     # the tables
     pool = bytearray(b"\0")
     offsets = {"": 0}
@@ -599,7 +628,7 @@ def main():
         offsets[text] = len(pool)
         pool.extend(data)
         return offsets[text]
-    types = [t for t in BASE_TYPES if t not in (0x58, 0x5E)]
+    types = [t for t in BASE_TYPES if t not in (0x58, 0x5E)] + list(range(0x8038, 0x8044)) + list(range(0x8044, 0x8050))
     rows_out = []
     for lcid, name, icu, v in rows:
         rows_out.append([intern(v.get(t, "")) for t in types])

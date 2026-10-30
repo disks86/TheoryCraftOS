@@ -258,10 +258,12 @@ static const WCHAR *nls_override(DWORD type) {
 /* The text of a LOCALE_ value in wide characters, with the numbers written as text. FALSE if the type is not known. `invariant` picks the invariant locale. */
 static BOOL nls_info_text(int kind, DWORD type, BOOL user_override, WCHAR *out /* 80 */) {
   const DWORD base = type & 0xFFFF;
-  if (user_override && kind == nls_default_kind()) {
+  if (user_override && kind == nls_default_kind() && !(type & LCT_RETURN_GENITIVE_NAMES)) {
     const WCHAR *o = nls_override(base);
     if (o) { int i = 0; for (; o[i] && i < 79; ++i) out[i] = o[i]; out[i] = 0; return TRUE; }
   }
+  /* the genitive forms of the month names are kept in the slots 0x8038.. of the table */
+  if ((type & LCT_RETURN_GENITIVE_NAMES) && base >= 0x38 && base <= 0x4F && nls_text_wide(kind, base | 0x8000u, out)) return TRUE;
   return nls_text_wide(kind, base, out);
 }
 static BOOL nls_info_is_number(DWORD base) {
@@ -303,9 +305,19 @@ EXPORT int WINAPI GetLocaleInfoA(LCID locale, LCTYPE type, LPSTR buffer, int cap
     if (capacity < 4) { set_error(ERROR_INSUFFICIENT_BUFFER); return 0; }
     return GetLocaleInfoW(locale, type, (LPWSTR)buffer, 2) ? 4 : 0;
   }
+  if (type & LCT_RETURN_GENITIVE_NAMES) { set_error(ERROR_INVALID_FLAGS); return 0; }
   WCHAR wide[80];
   const int n = GetLocaleInfoW(locale, type, wide, 80);
   if (n == 0) return 0;
+  const int needed = WideCharToMultiByte(CP_UTF8, 0, wide, -1, NULL, 0, NULL, NULL);
+  if (capacity > 0 && capacity < needed) {
+    /* a buffer that is too short is filled as far as it goes (some programs rely on it) */
+    BYTE tmp[400];
+    const int got = WideCharToMultiByte(CP_UTF8, 0, wide, -1, (LPSTR)tmp, sizeof(tmp), NULL, NULL);
+    for (int i = 0; i < capacity && i < got; ++i) buffer[i] = (char)tmp[i];
+    set_error(ERROR_INSUFFICIENT_BUFFER);
+    return 0;
+  }
   return nls_narrow_result(n, wide, buffer, capacity);
 }
 EXPORT int WINAPI GetLocaleInfoEx(LPCWSTR name, LCTYPE type, LPWSTR buffer, int capacity) { return nls_get_locale_info(nls_locale_of_name(name), type, buffer, capacity); }
