@@ -46,7 +46,17 @@ bool fault_to_exception(uint64_t vector, uint64_t error, uint64_t cr2, X86Contex
     case 4: out->code = 0xC0000095u; return true;      // STATUS_INTEGER_OVERFLOW
     case 5: out->code = 0xC000008Cu; return true;      // STATUS_ARRAY_BOUNDS_EXCEEDED
     case 6: case 7: out->code = 0xC000001Du; return true;      // STATUS_ILLEGAL_INSTRUCTION
-    case 13: out->code = 0xC0000096u; return true;      // STATUS_PRIVILEGED_INSTRUCTION
+    case 13:
+      if ((error & 3) == 2 && (error >> 3) == 0x2D) {      // INT 2D: a debug service (the service number in rax); it is a breakpoint that the debugger sees
+        out->code = 0x80000003u;      // STATUS_BREAKPOINT
+        at->rip += 2;
+        out->address = at->rip - 2;
+        out->count = 1;
+        out->information[0] = at->gpr[0];
+        return true;
+      }
+      out->code = 0xC0000096u;      // STATUS_PRIVILEGED_INSTRUCTION
+      return true;
     case 14:
       out->code = kStatusAccessViolation;
       out->count = 2;

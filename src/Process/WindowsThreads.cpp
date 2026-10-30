@@ -159,6 +159,7 @@ uint32_t suspend_thread_in(Process& target, uint64_t thread_id, uint64_t* previo
   *previous_count = uint32_t(record->suspend_count++);
   if (*previous_count == 0 && record->started) {
     target.runtime()->request_suspend(record->id);
+    if (ObjectManager* objects = system_objects()) objects->notify();      // (a thread that waits looks again and stops)
   }
   return kSuccess;
 }
@@ -415,6 +416,33 @@ uint32_t nt_resume_thread(Process& p, const SyscallRequest& r) {
 }
 
 // NtGetContextThread(HANDLE Thread, PCONTEXT) and NtSetContextThread(HANDLE Thread, PCONTEXT): the thread must be suspended (the call waits a moment for it to stop).
+// The registers of a thread of another program that may be running: it is suspended for the moment (and waited for) unless it is stopped already. `*suspended_here` says it has to
+// be resumed when the caller is done.
+uint32_t remote_get_context(Process& p, uint64_t pid, uint64_t tid, X86Context* context, bool* suspended_here) {
+  IProcessRuntime::RemoteOp op;
+  op.kind = IProcessRuntime::RemoteOp::GetContext;
+  op.thread_id = tid; op.context = context;
+  uint32_t status = p.runtime()->remote_operation(pid, op);
+  if (status != 0xC000000Du) return status;      // (a thread that is suspended or stopped at a debug event answers at once)
+  IProcessRuntime::RemoteOp stop;
+  stop.kind = IProcessRuntime::RemoteOp::SuspendThread;
+  stop.thread_id = tid;
+  if (p.runtime()->remote_operation(pid, stop) != kSuccess) return status;
+  *suspended_here = true;
+  for (uint32_t waited = 0; waited < 3000; ++waited) {
+    status = p.runtime()->remote_operation(pid, op);
+    if (status != 0xC0000001u) break;
+    p.block_sleep(1000000);
+  }
+  return status;
+}
+void remote_release_context(Process& p, uint64_t pid, uint64_t tid) {
+  IProcessRuntime::RemoteOp go;
+  go.kind = IProcessRuntime::RemoteOp::ResumeThread;
+  go.thread_id = tid;
+  p.runtime()->remote_operation(pid, go);
+}
+
 uint32_t context_call(Process& p, const SyscallRequest& r, bool set) {
   uint64_t remote_id = 0;
   bool exited = false;
@@ -426,15 +454,20 @@ uint32_t context_call(Process& p, const SyscallRequest& r, bool set) {
     op.kind = IProcessRuntime::RemoteOp::GetContext;
     op.thread_id = remote_id; op.context = &context;
     const uint64_t pid = remote_id & (kRemoteThreadIdLimit - 1);
-    uint32_t status = p.runtime()->remote_operation(pid, op);
+    bool suspended_here = false;
+    uint32_t status = remote_get_context(p, pid, remote_id, &context, &suspended_here);
+    uint32_t result = status;
     if (status == kSuccess && set) {
-      if (!apply_context(p, r.args[1], &context)) return kAccessViolation;
-      op.kind = IProcessRuntime::RemoteOp::SetContext;
-      status = p.runtime()->remote_operation(pid, op);
+      result = kAccessViolation;
+      if (apply_context(p, r.args[1], &context)) {
+        op.kind = IProcessRuntime::RemoteOp::SetContext;
+        result = p.runtime()->remote_operation(pid, op);
+      }
     } else if (status == kSuccess) {
-      return store_context(p, r.args[1], context) ? kSuccess : kAccessViolation;
+      result = store_context(p, r.args[1], context) ? kSuccess : kAccessViolation;
     }
-    return status == 0xC000010Au || status == kInvalidHandle ? 0xC000004Bu : status;      // (the program is gone: the thread is terminating)
+    if (suspended_here) remote_release_context(p, pid, remote_id);
+    return result == 0xC000010Au || result == kInvalidHandle ? 0xC000004Bu : result;      // (the program is gone: the thread is terminating)
   }
   if (process_handle_info(p, r.args[0], &exited, &exit_code, &other_pid) && other_pid != p.id()) {
     if (exited) return 0xC000004Bu;
@@ -443,15 +476,20 @@ uint32_t context_call(Process& p, const SyscallRequest& r, bool set) {
       IProcessRuntime::RemoteOp op;
       op.kind = IProcessRuntime::RemoteOp::GetContext;
       op.thread_id = other_pid; op.context = &main_context;
-      uint32_t status = p.runtime()->remote_operation(other_pid, op);
+      bool suspended_here = false;
+      uint32_t status = remote_get_context(p, other_pid, other_pid, &main_context, &suspended_here);
+      uint32_t result = status;
       if (status == kSuccess && set) {
-        if (!apply_context(p, r.args[1], &main_context)) return kAccessViolation;
-        op.kind = IProcessRuntime::RemoteOp::SetContext;
-        status = p.runtime()->remote_operation(other_pid, op);
+        result = kAccessViolation;
+        if (apply_context(p, r.args[1], &main_context)) {
+          op.kind = IProcessRuntime::RemoteOp::SetContext;
+          result = p.runtime()->remote_operation(other_pid, op);
+        }
       } else if (status == kSuccess) {
-        return store_context(p, r.args[1], main_context) ? kSuccess : kAccessViolation;
+        result = store_context(p, r.args[1], main_context) ? kSuccess : kAccessViolation;
       }
-      return status == 0xC000010Au || status == kInvalidHandle ? 0xC000004Bu : status;
+      if (suspended_here) remote_release_context(p, other_pid, other_pid);
+      return result == 0xC000010Au || result == kInvalidHandle ? 0xC000004Bu : result;
     }
   }
   Process::ThreadRecord* record = thread_of(p, r.args[0]);

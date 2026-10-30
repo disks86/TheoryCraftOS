@@ -566,6 +566,7 @@ EXPORT void NTAPI RtlExitUserThread(NTSTATUS status) {
   if (!g_process_ending) notify_all_modules(DLL_THREAD_DETACH, NULL, 0);
   fls_destroy_current(1);
   RtlFreeThreadActivationContextStack();
+  { HANDLE *debug_object = (HANDLE *)((BYTE *)NtCurrentTeb() + 0x1660); if (*debug_object) { NtClose(*debug_object); *debug_object = NULL; } }      /* (a thread that debugged lets go of it) */
   for (;;) NtTerminateThread((HANDLE)(LONG_PTR)-2, status);
 }
 

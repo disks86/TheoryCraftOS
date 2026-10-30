@@ -735,6 +735,7 @@ static DWORD full_path_w(LPCWSTR in, WCHAR *out, DWORD capacity);
 EXPORT HMODULE WINAPI GetModuleHandleW(LPCWSTR name) {
   if (!name) return NtCurrentPeb()->ImageBaseAddress;
   LDR_DATA_TABLE_ENTRY *m = module_by_name(name);
+  if (!m && (equals_ignore_case(name, (const WCHAR *)L"kernelbase.dll") || equals_ignore_case(name, (const WCHAR *)L"kernelbase"))) m = module_by_name((const WCHAR *)L"kernel32.dll");      /* (kernelbase's functions are kernel32's) */
   if (!m && has_separator(name)) {      /* a file: the library loaded from it, under whatever name */
     WCHAR full[PATH_CHARS];
     PVOID base;
@@ -2387,7 +2388,12 @@ EXPORT LPTOP_LEVEL_EXCEPTION_FILTER WINAPI SetUnhandledExceptionFilter(LPTOP_LEV
 EXPORT LONG WINAPI UnhandledExceptionFilter(PEXCEPTION_POINTERS info) {
   LPTOP_LEVEL_EXCEPTION_FILTER filter = RtlSetUnhandledExceptionFilter(NULL);      /* (read it, put it back) */
   RtlSetUnhandledExceptionFilter(filter);
-  return filter ? filter(info) : EXCEPTION_EXECUTE_HANDLER;
+  if (info && info->ExceptionRecord && (info->ExceptionRecord->ExceptionFlags & EXCEPTION_NESTED_CALL)) return EXCEPTION_CONTINUE_SEARCH;
+  ULONG_PTR port = 0;
+  NtQueryInformationProcess(NtCurrentProcess(), 7 /* ProcessDebugPort */, &port, sizeof(port), NULL);
+  if (port) return EXCEPTION_CONTINUE_SEARCH;      /* (the debugger gets the second chance) */
+  if (filter) { const LONG answer = filter(info); if (answer != EXCEPTION_CONTINUE_SEARCH) return answer; }
+  return EXCEPTION_EXECUTE_HANDLER;
 }
 EXPORT void WINAPI RaiseException(DWORD code, DWORD flags, DWORD count, const ULONG_PTR *arguments) {
   EXCEPTION_RECORD record;
