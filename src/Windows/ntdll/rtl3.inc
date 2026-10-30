@@ -1014,6 +1014,18 @@ IMPORT void NTAPI RtlCaptureContext(CONTEXT *);
 static BOOL debugger_handled(EXCEPTION_RECORD *record, CONTEXT *context, BOOLEAN first_chance);
 EXPORT BOOLEAN NTAPI RtlDispatchException(EXCEPTION_RECORD *record, CONTEXT *context);
 
+/* A breakpoint for the debugger (and the handlers of the process) that does not stop the program when nobody wants it: the exception is dispatched but not resumed from. */
+static void soft_break(void) {
+  EXCEPTION_RECORD record;
+  CONTEXT context;
+  memset(&record, 0, sizeof(record));
+  record.ExceptionCode = 0x80000003u;      /* STATUS_BREAKPOINT */
+  record.NumberParameters = 1;
+  RtlCaptureContext(&context);
+  record.ExceptionAddress = (PVOID)context.Rip;
+  if (!debugger_handled(&record, &context, TRUE)) RtlDispatchException(&record, &context);
+}
+
 /* Prints formatted text for the debugger: when the process is being debugged the text goes to it as a DBG_PRINTEXCEPTION_C exception. Only the error level (bit 0 of the level
    mask, or the level 0 itself) is shown. */
 EXPORT NTSTATUS NTAPI vDbgPrintExWithPrefix(const char *prefix, ULONG id, ULONG level, const char *fmt, va_list_ args) {
@@ -1055,3 +1067,386 @@ EXPORT NTSTATUS DbgPrint(const char *fmt, ...) {
   __builtin_va_end(args);
   return status;
 }
+
+/* ---- generic tables (a splay tree with the nodes also on a list in insertion order, as Windows lays them out) ------------------------------------------------------------ */
+
+#define OFFSET_OF_(type, member) ((ULONG)(ULONG_PTR)&((type *)0)->member)
+typedef enum { GenericLessThan, GenericGreaterThan, GenericEqual } RTL_GENERIC_COMPARE_RESULTS;
+typedef struct RtlGenericTable RTL_GENERIC_TABLE;
+typedef RTL_GENERIC_COMPARE_RESULTS (NTAPI *PRTL_GENERIC_COMPARE_ROUTINE)(RTL_GENERIC_TABLE *, PVOID, PVOID);
+typedef PVOID (NTAPI *PRTL_GENERIC_ALLOCATE_ROUTINE)(RTL_GENERIC_TABLE *, ULONG);
+typedef void (NTAPI *PRTL_GENERIC_FREE_ROUTINE)(RTL_GENERIC_TABLE *, PVOID);
+struct RtlGenericTable {
+  RTL_SPLAY_LINKS *TableRoot;
+  LIST_ENTRY InsertOrderList;
+  LIST_ENTRY *OrderedPointer;
+  ULONG WhichOrderedElement, NumberGenericTableElements;
+  PRTL_GENERIC_COMPARE_ROUTINE CompareRoutine;
+  PRTL_GENERIC_ALLOCATE_ROUTINE AllocateRoutine;
+  PRTL_GENERIC_FREE_ROUTINE FreeRoutine;
+  PVOID TableContext;
+};
+typedef ULONG CLONG;
+#define RtlInitializeSplayLinks(l) do { (l)->Parent = (l); (l)->LeftChild = NULL; (l)->RightChild = NULL; } while (0)
+static void InsertTailList(LIST_ENTRY *head, LIST_ENTRY *entry) { entry->Flink = head; entry->Blink = head->Blink; head->Blink->Flink = entry; head->Blink = entry; }
+static BOOLEAN RemoveEntryList(LIST_ENTRY *entry) { LIST_ENTRY *f = entry->Flink, *b = entry->Blink; b->Flink = f; f->Blink = b; return f == b; }
+
+/* data is a place holder to align stored data on a 8 byte boundary */
+struct rtl_generic_table_entry
+{
+    RTL_SPLAY_LINKS splay_links;
+    LIST_ENTRY list_entry;
+    LONGLONG data;
+};
+
+static void *get_data_from_splay_links(RTL_SPLAY_LINKS *links)
+{
+    return (unsigned char *)links + OFFSET_OF_(struct rtl_generic_table_entry, data);
+}
+
+static void *get_data_from_list_entry(LIST_ENTRY *list_entry)
+{
+    return (unsigned char *)list_entry + OFFSET_OF_(struct rtl_generic_table_entry, data)
+        - OFFSET_OF_(struct rtl_generic_table_entry, list_entry);
+}
+
+static LIST_ENTRY *get_list_entry_from_splay_links(RTL_SPLAY_LINKS *links)
+{
+    return (LIST_ENTRY *)((unsigned char *)links + OFFSET_OF_(struct rtl_generic_table_entry, list_entry));
+}
+
+static RTL_SPLAY_LINKS *rtl_splay_find(RTL_GENERIC_TABLE *table, void *value)
+{
+    RTL_GENERIC_COMPARE_RESULTS result;
+    RTL_SPLAY_LINKS *child;
+
+    child = table->TableRoot;
+    while (child)
+    {
+        result = table->CompareRoutine(table, get_data_from_splay_links(child), value);
+        if (result == GenericLessThan)
+            child = child->RightChild;
+        else if (result == GenericGreaterThan)
+            child = child->LeftChild;
+        else
+            return child;
+    }
+    return NULL;
+}
+
+
+/******************************************************************************
+ *  RtlInitializeGenericTable           [NTDLL.@]
+ */
+EXPORT void NTAPI RtlInitializeGenericTable(RTL_GENERIC_TABLE *table, PRTL_GENERIC_COMPARE_ROUTINE compare,
+                                      PRTL_GENERIC_ALLOCATE_ROUTINE allocate, PRTL_GENERIC_FREE_ROUTINE free,
+                                      void *context)
+{
+
+    table->TableRoot = NULL;
+    table->InsertOrderList.Flink = &table->InsertOrderList;
+    table->InsertOrderList.Blink = &table->InsertOrderList;
+    table->OrderedPointer = &table->InsertOrderList;
+    table->NumberGenericTableElements = 0;
+    table->WhichOrderedElement = 0;
+    table->CompareRoutine = compare;
+    table->AllocateRoutine = allocate;
+    table->FreeRoutine = free;
+    table->TableContext = context;
+}
+
+/******************************************************************************
+ *  RtlIsGenericTableEmpty           [NTDLL.@]
+ */
+EXPORT BOOLEAN NTAPI RtlIsGenericTableEmpty(RTL_GENERIC_TABLE *table)
+{
+    return !table->TableRoot;
+}
+
+/***********************************************************************
+ *           RtlInsertElementGenericTable  (NTDLL.@)
+ */
+EXPORT void * NTAPI RtlInsertElementGenericTable(RTL_GENERIC_TABLE *table, void *value, CLONG size, BOOLEAN *new_element)
+{
+    RTL_SPLAY_LINKS *child, *parent = NULL;
+    RTL_GENERIC_COMPARE_RESULTS result;
+    void *buffer;
+
+    child = table->TableRoot;
+    while (child)
+    {
+        buffer = get_data_from_splay_links(child);
+        result = table->CompareRoutine(table, buffer, value);
+        parent = child;
+        if (result == GenericLessThan)
+        {
+            child = child->RightChild;
+        }
+        else if (result == GenericGreaterThan)
+        {
+            child = child->LeftChild;
+        }
+        else
+        {
+            if (new_element)
+                *new_element = FALSE;
+            return buffer;
+        }
+    }
+
+    /* data should be stored on a 8 byte boundary */
+    child = (RTL_SPLAY_LINKS *)table->AllocateRoutine(table, size + OFFSET_OF_(struct rtl_generic_table_entry, data));
+    RtlInitializeSplayLinks(child);
+    InsertTailList(&table->InsertOrderList, get_list_entry_from_splay_links(child));
+    buffer = get_data_from_splay_links(child);
+    memcpy(buffer, value, size);
+
+    if (parent)
+    {
+        buffer = get_data_from_splay_links(parent);
+        result = table->CompareRoutine(table, buffer, value);
+        if (result == GenericLessThan)
+            RtlInsertAsRightChild(parent, child);
+        else
+            RtlInsertAsLeftChild(parent, child);
+    }
+
+    if (new_element)
+        *new_element = TRUE;
+    table->TableRoot = RtlSplay(child);
+    table->NumberGenericTableElements++;
+    return get_data_from_splay_links(child);
+}
+
+EXPORT BOOLEAN NTAPI RtlDeleteElementGenericTable(RTL_GENERIC_TABLE *table, void *value)
+{
+    RTL_SPLAY_LINKS *child;
+
+    child = rtl_splay_find(table, value);
+    if (!child)
+        return FALSE;
+
+    table->TableRoot = RtlDelete(child);
+    RemoveEntryList(get_list_entry_from_splay_links(child));
+    table->NumberGenericTableElements--;
+    table->OrderedPointer = &table->InsertOrderList;
+    table->WhichOrderedElement = 0;
+    table->FreeRoutine(table, child);
+    return TRUE;
+}
+
+/******************************************************************************
+ *  RtlEnumerateGenericTableWithoutSplaying           [NTDLL.@]
+ */
+EXPORT void * NTAPI RtlEnumerateGenericTableWithoutSplaying(RTL_GENERIC_TABLE *table, PVOID *previous)
+{
+    RTL_SPLAY_LINKS *child;
+
+    if (RtlIsGenericTableEmpty(table))
+        return NULL;
+
+    if (!*previous)
+    {
+        /* Find the smallest element */
+        child = table->TableRoot;
+        while (RtlLeftChild(child))
+            child = RtlLeftChild(child);
+    }
+    else
+    {
+        /* Find the successor of the previous element */
+        child = RtlRealSuccessor(*previous);
+        if (!child)
+            return NULL;
+    }
+
+    *previous = child;
+    return get_data_from_splay_links(child);
+}
+
+/******************************************************************************
+ *  RtlEnumerateGenericTable           [NTDLL.@]
+ *
+ * RtlEnumerateGenericTable() uses TableRoot to keep track of enumeration status according to tests.
+ * This also means that other functions that change TableRoot should not be used during enumerations.
+ * Otherwise, RtlEnumerateGenericTable() won't be able to find the correct next element when restart
+ * is FALSE. This is also the case on Windows.
+ */
+EXPORT void * NTAPI RtlEnumerateGenericTable(RTL_GENERIC_TABLE *table, BOOLEAN restart)
+{
+    RTL_SPLAY_LINKS *child;
+
+    if (RtlIsGenericTableEmpty(table))
+        return NULL;
+
+    if (restart)
+    {
+        /* Find the smallest element */
+        child = table->TableRoot;
+        while (RtlLeftChild(child))
+            child = RtlLeftChild(child);
+    }
+    else
+    {
+        /* Find the successor of the root */
+        child = RtlRealSuccessor(table->TableRoot);
+        if (!child)
+            return NULL;
+    }
+
+    table->TableRoot = RtlSplay(child);
+    return get_data_from_splay_links(child);
+}
+
+/******************************************************************************
+ *  RtlNumberGenericTableElements           [NTDLL.@]
+ */
+EXPORT ULONG NTAPI RtlNumberGenericTableElements(RTL_GENERIC_TABLE *table)
+{
+    return table->NumberGenericTableElements;
+}
+
+/******************************************************************************
+ *  RtlGetElementGenericTable           [NTDLL.@]
+ */
+EXPORT void * NTAPI RtlGetElementGenericTable(RTL_GENERIC_TABLE *table, ULONG index)
+{
+    ULONG count, ordered_element_index;
+    LIST_ENTRY *list_entry;
+    BOOL forward;
+
+    if (index >= table->NumberGenericTableElements)
+        return NULL;
+
+    /* No OrderedPointer, use list header InsertOrderList */
+    if (table->WhichOrderedElement == 0)
+    {
+        /*
+         * |  lower half  | upper half |
+         * ^       ^      ^            ^
+         * head, 0 |      |            tail, table->NumberGenericTableElements - 1
+         *         |      (table->NumberGenericTableElements - 1) / 2
+         *         index closer to head
+         */
+        if (index <= (table->NumberGenericTableElements - 1) / 2)
+        {
+            list_entry = table->InsertOrderList.Flink;
+            count = index;
+            forward = TRUE;
+        }
+        /*
+         * |  lower half  | upper half |
+         * ^              ^       ^    ^
+         * head, 0        |       |    tail, table->NumberGenericTableElements - 1
+         *                |       index closer to tail
+         *                (table->NumberGenericTableElements - 1) / 2
+         */
+        else
+        {
+            list_entry = table->InsertOrderList.Blink;
+            count = table->NumberGenericTableElements - index - 1;
+            forward = FALSE;
+        }
+    }
+    /* Has OrderedPointer, decide to use list header or OrderedPointer */
+    else
+    {
+        ordered_element_index = table->WhichOrderedElement - 1;
+
+        /*
+         * | -------------- | ---------- |
+         * ^         ^      ^            ^
+         * head, 0   |      |            table->NumberGenericTableElements - 1
+         *           |      ordered_element_index
+         *           index, 0 <= index <= ordered_element_index
+         */
+        if (index <= ordered_element_index)
+        {
+            /*
+             * | ------------------- |
+             * ^          ^          ^
+             * | <--d1--> | <--d2--> |
+             * head, 0    |          ordered_element_index
+             *            index
+             *
+             */
+            /* d1 <= d2, index is closer to head, forward from head */
+            if (index <= ordered_element_index - index)
+            {
+                list_entry = table->InsertOrderList.Flink;
+                count = index;
+                forward = TRUE;
+            }
+            /* d1 > d2, index is closer to ordered_element_index, backward from ordered_element_index */
+            else
+            {
+                list_entry = table->OrderedPointer;
+                count = ordered_element_index - index;
+                forward = FALSE;
+            }
+        }
+        /*
+         * | ------ | ---------- |
+         * ^        ^  ^         ^
+         * head, 0  |  |         tail, table->NumberGenericTableElements - 1
+         *          |  index, ordered_element_index < index <= table->NumberGenericTableElements - 1
+         *          ordered_element_index
+         */
+        else
+        {
+            /*
+             * | --------------------------------|
+             * ^                      ^          ^
+             * | <--------d1--------> | <--d2--> |
+             * ordered_element_index  |          tail, table->NumberGenericTableElements - 1
+             *                        index
+             *
+             */
+            /* d1 <= d2, index is closer to ordered_element_index, forward from ordered_element_index */
+            if (index - ordered_element_index <= table->NumberGenericTableElements - index - 1)
+            {
+                list_entry = table->OrderedPointer;
+                count = index - ordered_element_index;
+                forward = TRUE;
+            }
+            /* d1 > d2, index is closer to tail, backward from tail */
+            else
+            {
+                list_entry = table->InsertOrderList.Blink;
+                count = table->NumberGenericTableElements - index - 1;
+                forward = FALSE;
+            }
+        }
+    }
+
+    if (forward)
+    {
+        while (count--)
+            list_entry = list_entry->Flink;
+    }
+    else
+    {
+        while (count--)
+            list_entry = list_entry->Blink;
+    }
+
+    table->OrderedPointer = list_entry;
+    table->WhichOrderedElement = index + 1;
+    return get_data_from_list_entry(list_entry);
+}
+
+/******************************************************************************
+ *  RtlLookupElementGenericTable           [NTDLL.@]
+ */
+EXPORT void * NTAPI RtlLookupElementGenericTable(RTL_GENERIC_TABLE *table, void *value)
+{
+    RTL_SPLAY_LINKS *child;
+
+    child = rtl_splay_find(table, value);
+    if (!child)
+        return FALSE;
+
+    table->TableRoot = RtlSplay(child);
+    return get_data_from_splay_links(child);
+}
+

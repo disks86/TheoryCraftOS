@@ -1103,8 +1103,10 @@ static NTSTATUS ldr_load_one(PULONG flags, PUNICODE_STRING name, PVOID *handle) 
   }
   ULONG attached = 0;
   if (listed == count) {
-    for (; attached < count; ++attached) if (!notify_module(added[attached], DLL_PROCESS_ATTACH, NULL)) break;
-    if (attached == count) for (ULONG i = 0; i < count; ++i) notify_dll_event(1 /* LDR_DLL_NOTIFICATION_REASON_LOADED */, added[i]);
+    for (; attached < count; ++attached) {
+      notify_dll_event(1 /* LDR_DLL_NOTIFICATION_REASON_LOADED */, added[attached]);      /* (before the entry point, which the callback may replace) */
+      if (!notify_module(added[attached], DLL_PROCESS_ATTACH, NULL)) break;
+    }
   }
   if (listed == count && attached == count) {
     *handle = base;
@@ -1112,7 +1114,7 @@ static NTSTATUS ldr_load_one(PULONG flags, PUNICODE_STRING name, PVOID *handle) 
     return STATUS_SUCCESS;
   }
   /* it did not start: the libraries that did are told, then everything goes again */
-  for (ULONG i = attached; i > 0; --i) notify_module(added[i - 1], DLL_PROCESS_DETACH, NULL);
+  for (ULONG i = attached < listed ? attached + 1 : attached; i > 0; --i) notify_module(added[i - 1], DLL_PROCESS_DETACH, NULL);      /* (the one that refused is told as well) */
   ldr_release(base, 0);
   loader_unlock();
   return listed == count ? STATUS_DLL_INIT_FAILED : STATUS_NO_MEMORY;
