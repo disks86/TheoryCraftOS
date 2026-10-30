@@ -48,6 +48,7 @@ struct Router {
   uint32_t regs[64] = {};
   std::vector<Port> ports;           // index 0 is the control adapter
   uint32_t cs5_writes = 0, post_times = 0;
+  std::vector<uint32_t> buffer_alloc;  // BUFFER_ALLOC entries (index | value << 16); none: the operation is not supported
   std::vector<uint8_t> drom;         // what DROM_READ gives (none: the operation is not supported)
   uint32_t drom_status = 0;          // the status the operation ends with
   uint32_t drom_reads = 0;
@@ -262,6 +263,10 @@ class Fabric {
           r.regs[9 + d] = word;
         }
         r.regs[26] = (r.drom_status << kCs26StatusShift);
+      } else if ((v & 0xFFFF) == kOpBufferAlloc && !r.buffer_alloc.empty()) {
+        for (uint32_t d = 0; d < 16; ++d) r.regs[9 + d] = d < r.buffer_alloc.size() ? r.buffer_alloc[d] : 0;
+        r.regs[25] = static_cast<uint32_t>(r.buffer_alloc.size());
+        r.regs[26] = 0;
       } else {
         r.regs[26] = kCs26Ons;
       }

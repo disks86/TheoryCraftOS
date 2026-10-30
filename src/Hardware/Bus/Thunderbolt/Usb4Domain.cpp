@@ -159,6 +159,7 @@ bool Usb4Domain::read_router(uint64_t route, int16_t parent, uint8_t parent_port
     const int tmu = find_router_cap(r, kSwitchCapTmu);
     if (tmu > 0) r.cap_tmu = static_cast<uint8_t>(tmu);
   }
+  read_buffer_allocation(r);
   read_drom(r);                                            // (before the default pairing, which leaves what it says alone)
   link_lane_adapters(r);
   *index_out = index;
@@ -323,6 +324,51 @@ bool Usb4Domain::drom_read(const Usb4Router& r, uint32_t address, ByteView out) 
     address += take;
   }
   return true;
+}
+
+// The router's preferred buffer allocation (usb4_switch_credits_init): up to 16 (index, value) entries; the preferences are used only if they are complete for the adapters the router has.
+bool Usb4Domain::read_buffer_allocation(Usb4Router& r) {
+  r.credit_allocation = false;
+  uint32_t data[kOpDataDwords] = {};
+  uint32_t metadata = 0;
+  uint8_t status = 0;
+  if (!router_op(r, kOpBufferAlloc, &metadata, &status, nullptr, 0, data, kOpDataDwords) || status != 0) return false;
+  const uint32_t length = metadata & 0xFF;
+  if (length > kOpDataDwords) return false;
+  int usb3 = -1, aux = -1, main = -1, pcie = -1, dma = -1;
+  for (uint32_t i = 0; i < length; ++i) {
+    const uint32_t index = data[i] & 0xFFFF, value = data[i] >> 16;
+    if (index == 1) usb3 = static_cast<int>(value);
+    else if (index == 2) aux = static_cast<int>(value);
+    else if (index == 3) main = static_cast<int>(value);
+    else if (index == 4) pcie = static_cast<int>(value);
+    else if (index == 5) dma = static_cast<int>(value);
+  }
+  if (r.parent < 0 && dma < 0) return false;                // (the host router must say how much the host interface may have)
+  uint32_t lanes = 0;
+  for (uint32_t p = 1; p <= r.max_port; ++p) lanes += r.ports[p].is_lane();
+  if (lanes > 2 && (aux < 0 || main < 0)) return false;
+  for (uint32_t p = 1; p <= r.max_port; ++p) {
+    const uint32_t type = r.ports[p].type;
+    if (type == kTypeDpOut && main < 0) return false;
+    if ((type == kTypeDpIn || type == kTypeDpOut) && aux < 0) return false;
+    if ((type == kTypeUsb3Down || type == kTypeUsb3Up) && usb3 < 0) return false;
+    if ((type == kTypePcieDown || type == kTypePcieUp) && pcie < 0) return false;
+  }
+  r.credit_allocation = true;
+  r.max_usb3_credits = usb3 > 0 ? static_cast<uint16_t>(usb3) : 0;
+  r.min_dp_aux_credits = aux > 0 ? static_cast<uint16_t>(aux) : 0;
+  r.min_dp_main_credits = main > 0 ? static_cast<uint16_t>(main) : 0;
+  r.max_pcie_credits = pcie > 0 ? static_cast<uint16_t>(pcie) : 0;
+  r.max_dma_credits = dma > 0 ? static_cast<uint16_t>(dma) : 0;
+  return true;
+}
+
+// What a lane adapter has for PCIe and DMA paths: its usable buffers (the total less the control path's) less the USB 3 share. (No DisplayPort streams are reserved for: none are made here.)
+uint32_t Usb4Domain::available_credits(const Usb4Router& r, const Usb4Port& lane) const {
+  const int usable = static_cast<int>(lane.total_credits) - static_cast<int>(lane.ctl_credits);
+  const int credits = usable - r.max_usb3_credits;
+  return credits > 0 ? static_cast<uint32_t>(credits) : 0;
 }
 
 bool Usb4Domain::read_drom(Usb4Router& r) {
@@ -792,6 +838,10 @@ void Usb4Domain::release_path(Usb4Path* path) {
   for (uint32_t i = 0; i < path->length; ++i) {
     const Usb4Hop& hop = path->hops[i];
     if (hop.router < 0 || !routers_[hop.router]->present) continue;
+    if (path->dma) {                                        // (the credits the path held on a lane adapter go back)
+      Usb4Port& in = routers_[hop.router]->ports[hop.in_port];
+      if (lane_uses_allocation(*routers_[hop.router], in)) in.dma_credits = in.dma_credits >= hop.credits ? static_cast<uint16_t>(in.dma_credits - hop.credits) : 0;
+    }
     release_hop(*routers_[hop.router], hop.in_port, true, hop.in_hop);
     release_hop(*routers_[hop.router], hop.out_port, false, hop.out_hop);
   }
@@ -838,7 +888,20 @@ bool Usb4Domain::build_path(Usb4Path* path, int first_router, uint32_t first_por
   for (uint32_t i = 0; i < path->length; ++i) {
     const Usb4Router& router = *routers_[path->hops[i].router];
     const Usb4Port& in = router.ports[path->hops[i].in_port];
-    path->hops[i].credits = in.is_lane() ? (in.bonded ? 2 * kPcieCredits : kPcieCredits) : 7;     // (no credit allocation: 16 on a lane adapter, 32 when bonded, 7 on a protocol adapter)
+    uint32_t credits = in.is_lane() ? (in.bonded ? 2 * kPcieCredits : kPcieCredits) : 7;       // (no credit allocation: 16 on a lane adapter, 32 when bonded, 7 on a protocol adapter)
+    if (lane_uses_allocation(router, in)) {
+      if (kind == Usb4TunnelKind::Usb3) {
+        credits = router.max_usb3_credits;
+      } else {
+        const uint32_t available = available_credits(router, in);
+        credits = router.max_pcie_credits < available ? router.max_pcie_credits : available;
+        if (credits < 6) {                                   // (not enough buffers for a PCIe path)
+          release_path(path);
+          return false;
+        }
+      }
+    }
+    path->hops[i].credits = static_cast<uint8_t>(credits);
   }
   return true;
 }
@@ -1120,6 +1183,7 @@ bool Usb4Domain::build_dma_path(Usb4Path* path, const int* chain, uint32_t n, bo
   if (n == 0 || n > kMaxHops) return false;
   path->priority = 5;
   path->weight = 1;
+  path->dma = true;
   path->egress_fc_enable = toward_host ? kPathSource | kPathInternal : kPathAll;
   path->ingress_fc_enable = kPathAll;
   struct Step { int router; uint32_t in_port, out_port; };
@@ -1173,14 +1237,35 @@ bool Usb4Domain::build_dma_path(Usb4Path* path, const int* chain, uint32_t n, bo
   }
   // credits (tb_dma_reserve_credits without credit allocation): 6 on a lane adapter, 14 when bonded, the adapter's buffers up to 14 on a protocol adapter; the first hop of the path we
   // receive on gets what the lane adapter has left after the control path
+  // With the router's buffer allocation a lane adapter's DMA credits come out of what it has left after PCIe and the DMA paths already there (tb_dma_reserve_credits); at least one is needed.
+  // Worked out for the whole path first, and taken only when every hop has its share.
+  const Usb4Router& host_router = *routers_[chain[n - 1]];
+  const uint32_t wanted = host_router.max_dma_credits != 0 && host_router.max_dma_credits < 14 ? host_router.max_dma_credits : 14;
   for (uint32_t i = 0; i < path->length; ++i) {
-    const Usb4Port& in = routers_[path->hops[i].router]->ports[path->hops[i].in_port];
-    uint32_t credits = in.is_lane() ? (in.bonded ? 14 : 6) : (in.total_credits < 14 ? in.total_credits : 14);
+    Usb4Router& router = *routers_[path->hops[i].router];
+    Usb4Port& in = router.ports[path->hops[i].in_port];
+    uint32_t credits;
     if (toward_host && i == 0) {
       const uint32_t usable = in.total_credits > in.ctl_credits ? in.total_credits - in.ctl_credits : 0;
-      credits = usable < 14 ? usable : 14;
+      credits = usable < wanted ? usable : wanted;
+    } else if (lane_uses_allocation(router, in)) {
+      const int available = static_cast<int>(available_credits(router, in)) - static_cast<int>(router.max_pcie_credits) - static_cast<int>(in.dma_credits);
+      if (available < 1) {
+        path->dma = false;                                  // (nothing was taken yet)
+        release_path(path);
+        return false;
+      }
+      credits = wanted;
+      while (credits > static_cast<uint32_t>(available)) --credits;
+    } else {
+      credits = in.is_lane() ? (in.bonded ? 14 : 6) : (in.total_credits < wanted ? in.total_credits : wanted);
     }
     path->hops[i].credits = static_cast<uint8_t>(credits);
+  }
+  for (uint32_t i = 0; i < path->length; ++i) {
+    Usb4Router& router = *routers_[path->hops[i].router];
+    Usb4Port& in = router.ports[path->hops[i].in_port];
+    if (lane_uses_allocation(router, in)) in.dma_credits = static_cast<uint16_t>(in.dma_credits + path->hops[i].credits);
   }
   return true;
 }

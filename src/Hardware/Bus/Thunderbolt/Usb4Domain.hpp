@@ -56,7 +56,7 @@ constexpr uint32_t kTmuRtrCs0 = 0, kTmuRtrCs0FreqWindShift = 16, kTmuRtrCs0FreqW
 // router configuration space
 constexpr uint32_t kRouterCs1 = 1, kRouterCs5 = 5, kRouterCs6 = 6, kRouterCs7 = 7, kRouterCs9 = 9, kRouterCs25 = 25, kRouterCs26 = 26;
 // router operations (ROUTER_CS_26): the opcode in the low half, OV (the operation is valid / still running), ONS (not supported) and the status
-constexpr uint32_t kCs26Ov = 1u << 31, kCs26Ons = 1u << 30, kCs26StatusShift = 24, kCs26StatusMask = 0x3Fu << 24, kOpDromRead = 0x24, kOpDataDwords = 16;
+constexpr uint32_t kCs26Ov = 1u << 31, kCs26Ons = 1u << 30, kCs26StatusShift = 24, kCs26StatusMask = 0x3Fu << 24, kOpDromRead = 0x24, kOpBufferAlloc = 0x33, kOpDataDwords = 16;
 constexpr uint32_t kCs5Pto = 1u << 25, kCs5Hco = 1u << 26, kCs5Slp = 1u << 0, kCs5Wop = 1u << 1, kCs5Wou = 1u << 2, kCs5Wod = 1u << 3, kCs5Cns = 1u << 23, kCs5Cv = 1u << 31, kCs6Slpr = 1u << 0, kCs6Hci = 1u << 18, kCs6Cr = 1u << 25;
 // adapter registers (relative to the adapter capability, except ADP_CS_4 and ADP_CS_5 which are in the port header)
 constexpr uint32_t kAdpCs4 = 4, kAdpCs4Lck = 1u << 31, kAdpCs5 = 5, kAdpCs5Dhp = 1u << 31, kPortCs19 = 0x13, kPortCs19Pc = 1u << 3, kPortCs19Pid = 1u << 4, kPortCs19Woc = 1u << 16, kPortCs19Wod = 1u << 17, kPortCs19Wou4 = 1u << 18, kAdpPcieCs0 = 0, kAdpPcieCs0Pe = 1u << 31;
@@ -79,6 +79,7 @@ struct Usb4Port {
   bool is_lane() const { return type == usb4::kTypePort; }
   bool bonded = false;               // both lanes of the link carry traffic as one
   bool xdomain = false;              // another host is on the cable behind this lane adapter (no router answers)
+  uint16_t dma_credits = 0;          // credits reserved for DMA paths on this lane adapter
   uint16_t total_credits = 0, ctl_credits = 2;   // the buffers of the adapter, and what the control path uses of them
 };
 
@@ -91,6 +92,9 @@ struct Usb4Router {
   uint64_t uid = 0;
   char vendor_name[48] = {}, device_name[48] = {};      // from the DROM
   bool drom = false;
+  // The buffer allocation the router prefers (USB4_SWITCH_OP_BUFFER_ALLOC): the most credits a path of each kind may have on a lane adapter. Without it the fixed values are used.
+  bool credit_allocation = false;
+  uint16_t max_usb3_credits = 0, max_pcie_credits = 0, max_dma_credits = 0, min_dp_aux_credits = 0, min_dp_main_credits = 0;
   int16_t parent = -1;               // the router above it and the port of that one it hangs from
   uint8_t parent_port = 0;
   bool configured = false;
@@ -111,6 +115,7 @@ struct Usb4Hop {
 struct Usb4Path {
   uint8_t length = 0;
   uint8_t priority = 3, weight = 1;
+  bool dma = false;                  // a DMA path: its credits are counted against the lane adapters
   uint8_t egress_fc_enable = 3, ingress_fc_enable = 7;     // which hops (source 1, internal 2, destination 4) have flow control out of / into them
   Usb4Hop hops[usb4::kMaxHops];
   bool activated = false;
@@ -201,6 +206,7 @@ class Usb4Domain final : public IThunderboltEvents, public IXdomainHost, private
   uint32_t unreachable_links() const { return unreachable_; }
   // Reads and parses a router's DROM (names, which ports are unused, which lane adapters belong together); a router without one keeps the defaults. Done for every router found.
   bool read_drom(Usb4Router& r);
+  bool read_buffer_allocation(Usb4Router& r);
   // Time synchronisation (tmu.c, uni-directional low resolution - the mode the Linux driver starts in): the host router is asked for its rate, each router below it gets the parameters, the
   // adapters on both ends of its link are set to uni-directional with time sync on, and its local time is first set from the host router's so that it starts near it.
   bool tmu_enabled(uint32_t router_index) const { const Usb4Router* r = router(router_index); return r && r->tmu_lowres; }
@@ -229,6 +235,8 @@ class Usb4Domain final : public IThunderboltEvents, public IXdomainHost, private
   bool router_op(const Usb4Router& r, uint32_t opcode, uint32_t* metadata, uint8_t* status, const uint32_t* tx, uint32_t tx_dwords, uint32_t* rx, uint32_t rx_dwords);
   bool drom_read(const Usb4Router& r, uint32_t address, ByteView out);
   int find_router_cap(const Usb4Router& r, uint8_t id);
+  uint32_t available_credits(const Usb4Router& r, const Usb4Port& lane) const;
+  bool lane_uses_allocation(const Usb4Router& r, const Usb4Port& p) const { return p.is_lane() && r.credit_allocation; }
   bool tmu_set_time_disruption(const Usb4Router& r, bool set);
   bool tmu_port_write(const Usb4Router& r, uint32_t port, uint32_t offset, uint32_t mask, uint32_t value);
   bool tmu_rate_write(const Usb4Router& r, uint32_t rate);

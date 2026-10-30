@@ -3387,6 +3387,71 @@ static void test_usb4_tmu() {
   }
 }
 
+static std::vector<uint32_t> buffer_alloc(int usb3, int aux, int main, int pcie, int dma) {
+  std::vector<uint32_t> v;
+  if (usb3 >= 0) v.push_back(1u | (uint32_t(usb3) << 16));
+  if (aux >= 0) v.push_back(2u | (uint32_t(aux) << 16));
+  if (main >= 0) v.push_back(3u | (uint32_t(main) << 16));
+  if (pcie >= 0) v.push_back(4u | (uint32_t(pcie) << 16));
+  if (dma >= 0) v.push_back(5u | (uint32_t(dma) << 16));
+  return v;
+}
+
+static void test_usb4_credits() {
+  {   // the routers' preferred allocation sets the credits of lane adapters
+    Usb4Rig rig;
+    for (uint64_t route : {0ull, 0x01ull, 0x301ull}) rig.fabric.at(route).buffer_alloc = buffer_alloc(8, 1, 2, 10, 14);
+    Usb4Domain domain(rig.control, rig.nhi, rig.alloc);
+    const char* error = nullptr;
+    CHECK(domain.start(nullptr));
+    const Usb4Router& host = *domain.router(0);
+    CHECK(host.credit_allocation && host.max_usb3_credits == 8 && host.max_pcie_credits == 10 && host.max_dma_credits == 14 && host.min_dp_aux_credits == 1 && host.min_dp_main_credits == 2);
+    fake_usb4::Router& fh = rig.fabric.at(0);
+    fake_usb4::Router& d1 = rig.fabric.at(0x01);
+    // PCIe: the router's most (10), of the 38 usable less the USB 3 share (8); the adapters keep 7
+    CHECK(domain.approve_pcie(1, &error));
+    CHECK(((fh.ports[1].hops[8].first >> 17) & 0x7F) == 10 && ((d1.ports[1].hops[8].first >> 17) & 0x7F) == 10 && ((fh.ports[5].hops[8].first >> 17) & 0x7F) == 7);
+    // USB 3: its most (8) on the lane adapters
+    CHECK(domain.approve_usb3(1, &error) && ((fh.ports[1].hops[9].first >> 17) & 0x7F) != 0 && ((d1.ports[1].hops[9].first >> 17) & 0x7F) == 8);
+    // DMA paths take what is left: the host interface's 14, and the lane adapter's share is counted
+    CHECK(domain.disconnect_pcie(1) && domain.disconnect_usb3(1));
+    rig.fabric.link_host(0, 3);
+    Usb4Domain again(rig.control, rig.nhi, rig.alloc);
+    CHECK(again.start(nullptr) && again.xdomain_count() == 1);
+    CHECK(again.approve_xdomain_paths(0, 9, 1, 10, 2, &error));
+    CHECK(again.router(0)->ports[3].dma_credits == 14 && ((fh.ports[3].hops[10].first >> 17) & 0x7F) == 14);
+    CHECK(again.disconnect_xdomain_paths(0) && again.router(0)->ports[3].dma_credits == 0);
+  }
+  {   // too few buffers for a PCIe path: refused, nothing taken
+    Usb4Rig rig(false);
+    for (uint64_t route : {0ull, 0x01ull}) rig.fabric.at(route).buffer_alloc = buffer_alloc(8, 1, 2, 4, 14);
+    Usb4Domain domain(rig.control, rig.nhi, rig.alloc);
+    const char* error = nullptr;
+    CHECK(domain.start(nullptr) && !domain.approve_pcie(1, &error) && error && !domain.pcie_tunnelled(1) && !(rig.fabric.at(0).ports[5].space[0x10] & kAdpPcieCs0Pe));
+  }
+  {   // a smaller baMaxHI limits the DMA path
+    Usb4Rig rig(false);
+    rig.fabric.link_host(0, 3);
+    rig.fabric.at(0).buffer_alloc = buffer_alloc(8, 1, 2, 10, 5);
+    Usb4Domain domain(rig.control, rig.nhi, rig.alloc);
+    const char* error = nullptr;
+    CHECK(domain.start(nullptr) && domain.approve_xdomain_paths(0, 9, 1, 10, 2, &error) && ((rig.fabric.at(0).ports[3].hops[10].first >> 17) & 0x7F) == 5);
+  }
+  {   // incomplete preferences (a PCIe adapter and no baMaxPCIe), a host router without baMaxHI, too many lane adapters without the DisplayPort entries: the fixed values stay
+    Usb4Rig rig(false);
+    rig.fabric.at(0).buffer_alloc = buffer_alloc(8, 1, 2, -1, 14);
+    rig.fabric.at(0x01).buffer_alloc = buffer_alloc(8, -1, -1, 10, 14);
+    Usb4Domain domain(rig.control, rig.nhi, rig.alloc);
+    const char* error = nullptr;
+    CHECK(domain.start(nullptr) && !domain.router(0)->credit_allocation && !domain.router(1)->credit_allocation);
+    CHECK(domain.approve_pcie(1, &error) && ((rig.fabric.at(0).ports[1].hops[8].first >> 17) & 0x7F) == 32);        // (bonded: 2 x 16)
+    Usb4Rig no_hi(false);
+    no_hi.fabric.at(0).buffer_alloc = buffer_alloc(8, 1, 2, 10, -1);
+    Usb4Domain d(no_hi.control, no_hi.nhi, no_hi.alloc);
+    CHECK(d.start(nullptr) && !d.router(0)->credit_allocation);
+  }
+}
+
 static void test_usb4_garbage() {
   // the routers answer with noise: the manager must stay inside its arrays, whatever comes (and the sanitizers say if it does not)
   for (uint32_t seed = 1; seed <= 200; ++seed) {
@@ -3437,6 +3502,7 @@ int main() {
   test_usb4_xdomain();
   test_usb4_drom();
   test_usb4_tmu();
+  test_usb4_credits();
   test_usb4_runtime_sleep();
   test_usb4_xdomain_failures();
   test_usb4_driver();
