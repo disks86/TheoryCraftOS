@@ -19,6 +19,7 @@
 // The kernel objects a process holds handles to, besides allocations (VidMm.hpp): synchronization objects, shaders and pipelines, devices and contexts, and the
 // submissions that wait in a context's queue.
 #pragma once
+#include "Kernel/Dxgkrnl/D3d12.hpp"
 #include "Kernel/Dxgkrnl/D3d9Shader.hpp"
 #include "Kernel/Dxgkrnl/DxgTypes.hpp"
 #include "Kernel/Dxgkrnl/VidMm.hpp"
@@ -153,12 +154,14 @@ class DeviceObject {
 enum class SubmissionKind : uint8_t { Render, Signal, Wait, Present };
 
 struct Submission {
-  explicit Submission(allocators::IAllocator& allocator) : commands(allocator), allocations(allocator), pipelines(allocator) {}
+  explicit Submission(allocators::IAllocator& allocator) : commands(allocator), allocations(allocator), pipelines(allocator), signatures(allocator), heaps(allocator) {}
   SubmissionKind kind = SubmissionKind::Render;
   // Render: a copy of the command stream (what the process wrote afterwards does not matter), the allocation list and the pipelines it binds, in the order it binds them.
   ByteBuffer commands;
   List<SharedPointer<Allocation>> allocations;
   List<SharedPointer<PipelineObject>> pipelines;
+  List<SharedPointer<RootSignatureObject>> signatures;   // (Direct3D 12: the root signatures and descriptor heaps it sets, in order)
+  List<SharedPointer<DescriptorHeapObject>> heaps;
   // Signal / Wait
   SharedPointer<SyncObject> sync;
   uint64_t value = 0;
@@ -181,6 +184,8 @@ class ContextObject {
 class IPipelineLookup {
  public:
   virtual SharedPointer<PipelineObject> find_pipeline(Handle handle) = 0;
+  virtual SharedPointer<RootSignatureObject> find_root_signature(Handle handle) = 0;
+  virtual SharedPointer<DescriptorHeapObject> find_descriptor_heap(Handle handle) = 0;
 
  protected:
   IPipelineLookup() = default;

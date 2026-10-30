@@ -50,6 +50,7 @@ class VirglDevice final : public IGraphicsDevice {
   ICommandBuffer* create_command_buffer() override;
   void destroy_command_buffer(ICommandBuffer* commands) override;
 
+  void interrupt_clock() override { clock_interrupted_ = true; }
   bool submit(ICommandBuffer* commands) override;
   bool present(IImage* image) override;
 
@@ -62,6 +63,7 @@ class VirglDevice final : public IGraphicsDevice {
   uint32_t sampler_state(const SamplerDesc& sampler);
 
  private:
+  bool clock_interrupted_ = false;   // (until a disjoint query has said so)
   hardware::VirtioGpu& gpu_;
   uint32_t next_handle_ = 1;  // object handles share one namespace per context
   uint32_t sampler_states_[8] = {};   // by filter and address modes (3 bits), 0 until made

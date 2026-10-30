@@ -53,7 +53,9 @@ class SoftwareDevice final : public IGraphicsDevice {
   void set_clock(uint64_t (*now)(void*), void* context) {
     clock_ = now;
     clock_context_ = context;
+    interrupt_clock();   // (a new clock: the old timestamps do not compare with its)
   }
+  void interrupt_clock() override { clock_interrupted_ = true; }
 
  private:
   allocators::IAllocator& allocator_;
@@ -61,6 +63,7 @@ class SoftwareDevice final : public IGraphicsDevice {
   uint64_t (*clock_)(void*) = nullptr;
   void* clock_context_ = nullptr;
   uint64_t counted_ns_ = 0;
+  bool clock_interrupted_ = false;
 };
 
 }  // namespace graphics

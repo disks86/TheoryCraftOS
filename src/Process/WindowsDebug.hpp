@@ -42,6 +42,7 @@ void debug_note_created(uint32_t object, uint32_t flags);
 void debug_object_freed_locked(uint32_t object);
 // The debug object (id of the object manager's object) a process is attached to, 0 if none.
 uint32_t debug_object_of(uint64_t pid);
+void debug_drain_kills(IProcessRuntime* runtime);
 // The CONTEXT (address in the program) of a thread that waits for the debugger at an exception.
 bool debug_stopped_context(uint64_t pid, uint64_t tid, uint64_t* address);
 // Events the program itself causes.

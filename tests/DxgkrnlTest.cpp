@@ -4534,6 +4534,33 @@ void test_stream_output_extras() {
     const uint64_t t0 = query_count(e, results, 0), t1 = query_count(e, results, 1), t2 = query_count(e, results, 2);
     CHECK(t0 != 0 && t1 > t0 && t2 > t1);
   }
+  {
+    // The frequency (nanoseconds) and the disjoint flag (0).
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    w.begin_query(2, 0, static_cast<uint32_t>(graphics::QueryKind::TimestampDisjoint));
+    w.end_query();
+    w.begin_query(2, 8, static_cast<uint32_t>(graphics::QueryKind::TimestampFrequency));
+    w.end_query();
+    w.end_pass();
+    CHECK(e.render(w, {target, vb, results}) == status::kSuccess);
+    CHECK(query_count(e, results, 0) == 0 && query_count(e, results, 1) == 1000000000u);
+  }
+  {
+    // An interruption of the clock shows once, in the first disjoint query after it.
+    auto disjoint = [&] {
+      CommandWriter w(e.allocator);
+      w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+      w.begin_query(2, 0, static_cast<uint32_t>(graphics::QueryKind::TimestampDisjoint));
+      w.end_query();
+      w.end_pass();
+      CHECK(e.render(w, {target, vb, results}) == status::kSuccess);
+      return query_count(e, results, 0);
+    };
+    CHECK(disjoint() == 0);
+    e.kernel.adapter(0)->interrupt_clock();
+    CHECK(disjoint() == 1 && disjoint() == 0);
+  }
 
   // Appending: the second draw, in another pass, goes after the first's records.
   Handle big0 = buffer(6 * 32), big1 = buffer(6 * 16);
@@ -4634,6 +4661,434 @@ void test_stream_output_extras() {
     // (points at the pixel centres, the colour of each vertex)
     CHECK(e.pixel(target, 8, 23) == 0xFFFF0000u && e.pixel(target, 24, 23) == 0xFF00FF00u && e.pixel(target, 16, 7) == 0xFF0000FFu);
   }
+}
+
+
+// --- Direct3D 12 binding: root signatures, descriptor heaps, resource states -----------------------------------------------------------------------------------------------
+
+struct SigRange {
+  uint32_t type, count, base, space, offset;
+};
+struct SigParam {
+  uint32_t type, visibility = 0;
+  std::vector<SigRange> ranges;   // Table
+  uint32_t reg = 0, space = 0, num = 0;   // Constants (num), Cbv / Srv / Uav (reg, space)
+};
+
+// A serialized root signature, the way D3D12SerializeRootSignature lays it out.
+std::vector<uint8_t> serialize_signature(uint32_t version, const std::vector<SigParam>& params, const std::vector<std::vector<uint32_t>>& samplers = {}) {
+  std::vector<uint32_t> w(6, 0);
+  const uint32_t range_words = version == 2 ? 6 : 5;
+  uint32_t cursor = 6 + 3 * static_cast<uint32_t>(params.size());   // (in words: after the header and the parameter array)
+  std::vector<uint32_t> payload;
+  w[0] = version, w[1] = static_cast<uint32_t>(params.size()), w[2] = 24, w[3] = static_cast<uint32_t>(samplers.size());
+  std::vector<uint32_t> array;
+  for (const SigParam& p : params) {
+    array.push_back(p.type), array.push_back(p.visibility), array.push_back((cursor + static_cast<uint32_t>(payload.size())) * 4);
+    if (p.type == 0) {
+      const uint32_t ranges_at = cursor + static_cast<uint32_t>(payload.size()) + 2;
+      payload.push_back(static_cast<uint32_t>(p.ranges.size())), payload.push_back(ranges_at * 4);
+      for (const SigRange& r : p.ranges) {
+        payload.push_back(r.type), payload.push_back(r.count), payload.push_back(r.base), payload.push_back(r.space);
+        if (version == 2) payload.push_back(0);
+        payload.push_back(r.offset);
+      }
+    } else if (p.type == 1) {
+      payload.push_back(p.reg), payload.push_back(p.space), payload.push_back(p.num);
+    } else {
+      payload.push_back(p.reg), payload.push_back(p.space);
+      if (version == 2) payload.push_back(0);
+    }
+  }
+  (void)range_words;
+  w[4] = (cursor + static_cast<uint32_t>(payload.size())) * 4;
+  w.insert(w.end(), array.begin(), array.end());
+  w.insert(w.end(), payload.begin(), payload.end());
+  for (const std::vector<uint32_t>& sampler : samplers) w.insert(w.end(), sampler.begin(), sampler.end());
+  std::vector<uint8_t> bytes;
+  for (uint32_t word : w)
+    for (int i = 0; i < 4; ++i) bytes.push_back(static_cast<uint8_t>(word >> (8 * i)));
+  return bytes;
+}
+
+// A static sampler: filter, address u / v / w, bias, anisotropy, comparison, border, min lod, max lod, register, space, visibility.
+std::vector<uint32_t> static_sampler(uint32_t filter, uint32_t address, uint32_t reg) {
+  return {filter, address, address, address, 0, 1, 8, 0, 0, __builtin_bit_cast(uint32_t, 1000.0f), reg, 0, 0};
+}
+
+void test_root_signature_parse() {
+  const std::vector<SigParam> params = {
+      {0, 0, {{0, 2, 0, 0, 0}, {1, 0xFFFFFFFFu, 1, 0, 0xFFFFFFFFu}}},   // a table: two shader resource views from t0, then (appended) an unbounded range of unordered access views from u1
+      {1, 5, {}, 0, 0, 16},                                             // 16 root constants at b0 for the pixel shader
+      {2, 0, {}, 1, 0, 0},                                              // a root constant buffer view at b1
+      {0, 0, {{3, 4, 0, 0, 0}}},                                        // a sampler table of four
+  };
+  for (uint32_t version : {1u, 2u}) {
+    const std::vector<uint8_t> blob = serialize_signature(version, params, {static_sampler(0x15, 3, 0)});
+    RootSignatureDesc desc;
+    CHECK(parse_root_signature(ConstByteView(blob.data(), blob.size()), &desc) == status::kSuccess);
+    CHECK(desc.parameter_count == 4 && desc.sampler_count == 1);
+    CHECK(desc.parameters[0].type == RootParameterType::Table && desc.parameters[0].range_count == 2 && desc.parameters[0].ranges[1].offset == 2 && desc.parameters[0].ranges[1].count == kUnboundedDescriptors);
+    CHECK(desc.parameters[0].table_size == kUnboundedDescriptors && !desc.parameters[0].sampler_table && desc.parameters[3].sampler_table && desc.parameters[3].table_size == 4);
+    CHECK(desc.parameters[1].constant_count == 16 && desc.parameters[1].visibility == 5 && desc.parameters[2].shader_register == 1);
+    CHECK(desc.dwords == 1 + 16 + 2 + 1);
+    CHECK(desc.samplers[0].sampler.filter == graphics::Filter::Linear && desc.samplers[0].sampler.address_u == graphics::AddressMode::ClampToEdge);
+    // Every truncation and a flipped bit anywhere: refused or parsed, never a crash.
+    for (size_t n = 0; n <= blob.size(); ++n) {
+      RootSignatureDesc cut;
+      parse_root_signature(ConstByteView(blob.data(), n), &cut);
+    }
+    for (size_t bit = 0; bit < blob.size() * 8; ++bit) {
+      std::vector<uint8_t> flipped = blob;
+      flipped[bit / 8] ^= static_cast<uint8_t>(1u << (bit % 8));
+      RootSignatureDesc other;
+      parse_root_signature(ConstByteView(flipped.data(), flipped.size()), &other);
+    }
+  }
+  // Against the rules: too many DWORDs, a table of views and samplers, an unbounded range in the middle, no ranges, a version that does not exist, a register space past its type.
+  RootSignatureDesc d;
+  auto bad = [&](const std::vector<SigParam>& p) {
+    const std::vector<uint8_t> blob = serialize_signature(1, p);
+    return parse_root_signature(ConstByteView(blob.data(), blob.size()), &d) == status::kInvalidParameter;
+  };
+  CHECK(bad({{1, 0, {}, 0, 0, 64}, {2, 0, {}, 1, 0, 0}}));                                       // (66 DWORDs)
+  CHECK(bad({{0, 0, {{0, 1, 0, 0, 0}, {3, 1, 0, 0, 1}}}}));                                       // (a view and a sampler in one table)
+  CHECK(bad({{0, 0, {{0, 0xFFFFFFFFu, 0, 0, 0}, {0, 1, 0, 0, 0xFFFFFFFFu}}}}));                  // (unbounded, then another)
+  CHECK(bad({{0, 0, {}}}));                                                                       // (no ranges)
+  CHECK(bad({{1, 0, {}, 0, 0, 0}}));                                                              // (no values)
+  std::vector<uint8_t> blob = serialize_signature(1, {{1, 0, {}, 0, 0, 4}});
+  blob[0] = 7;
+  CHECK(parse_root_signature(ConstByteView(blob.data(), blob.size()), &d) == status::kInvalidParameter);
+  // In a DXBC container (the RTS0 chunk).
+  const std::vector<uint8_t> inner = serialize_signature(2, {{1, 0, {}, 0, 0, 4}});
+  std::vector<uint8_t> container = {'D', 'X', 'B', 'C'};
+  auto put32 = [&](uint32_t v) { for (int i = 0; i < 4; ++i) container.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+  container.insert(container.end(), 16, 0);
+  put32(1), put32(static_cast<uint32_t>(36 + 8 + inner.size())), put32(1), put32(36);
+  container.push_back('R'), container.push_back('T'), container.push_back('S'), container.push_back('0');
+  put32(static_cast<uint32_t>(inner.size()));
+  container.insert(container.end(), inner.begin(), inner.end());
+  CHECK(parse_root_signature(ConstByteView(container.data(), container.size()), &d) == status::kSuccess && d.parameter_count == 1 && d.parameters[0].constant_count == 4);
+  for (size_t n = 0; n < container.size(); n += 3) parse_root_signature(ConstByteView(container.data(), n), &d);
+}
+
+void test_d3d12_binding() {
+  Env e;
+  Handle rt = e.alloc(kTarget, Format::A8R8G8B8, 8, 8), tex = e.alloc(kTexture, Format::A8R8G8B8, 4, 4), vb = e.buffer(kAllocVertexBuffer, 4 * 20);
+  CHECK(e.fill(tex, 0xFFC08040));
+  Handle pipe = make_colored_pipeline(e, true);
+  const float quad[20] = {-1, -1, 0.5f, 0, 0, 3, -1, 0.5f, 2, 0, -1, 3, 0.5f, 0, 2};
+  CHECK(e.write(vb, floats(quad, 15)));
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  auto signature = [&](const std::vector<SigParam>& p, const std::vector<std::vector<uint32_t>>& samplers, Handle* out) {
+    const std::vector<uint8_t> blob = serialize_signature(2, p, samplers);
+    return e.kernel.create_root_signature(kPid, e.dev, ConstByteView(blob.data(), blob.size()), out);
+  };
+  // t0 through a table, b0 as 16 root constants, s0 static.
+  Handle sig = 0, sig_samplers = 0, bad = 0;
+  CHECK(signature({{0, 0, {{0, 1, 0, 0, 0}}}, {1, 0, {}, 0, 0, 16}}, {static_sampler(0, 1, 0)}, &sig) == status::kSuccess);
+  CHECK(signature({{0, 0, {{0, 1, 0, 0, 0}}}, {1, 0, {}, 0, 0, 16}, {0, 0, {{3, 1, 0, 0, 0}}}}, {}, &sig_samplers) == status::kSuccess);
+  const std::vector<uint8_t> garbage = {1, 2, 3};
+  CHECK(e.kernel.create_root_signature(kPid, e.dev, ConstByteView(garbage.data(), garbage.size()), &bad) == status::kInvalidParameter);
+  CHECK(e.kernel.create_root_signature(kPid, 0x7777, ConstByteView(garbage.data(), garbage.size()), &bad) == status::kInvalidHandle);
+  Handle views = 0, samplers = 0, small = 0;
+  CHECK(e.kernel.create_descriptor_heap(kPid, e.dev, DescriptorHeapType::CbvSrvUav, 8, &views) == status::kSuccess && e.kernel.create_descriptor_heap(kPid, e.dev, DescriptorHeapType::Sampler, 4, &samplers) == status::kSuccess);
+  CHECK(e.kernel.create_descriptor_heap(kPid, e.dev, DescriptorHeapType::CbvSrvUav, 0, &bad) == status::kInvalidParameter && e.kernel.create_descriptor_heap(kPid, e.dev, DescriptorHeapType::CbvSrvUav, kMaxHeapDescriptors + 1, &bad) == status::kInvalidParameter);
+  CHECK(e.kernel.create_descriptor_heap(kPid, e.dev, DescriptorHeapType::CbvSrvUav, 1, &small) == status::kSuccess);
+  DescriptorDesc srv;
+  srv.kind = DescriptorKind::Srv, srv.allocation = tex;
+  CHECK(e.kernel.write_descriptor(kPid, views, 3, srv) == status::kSuccess && e.kernel.write_descriptor(kPid, views, 8, srv) == status::kInvalidParameter);
+  CHECK(e.kernel.write_descriptor(kPid, samplers, 0, srv) == status::kInvalidParameter);   // (a view in the sampler heap)
+  DescriptorDesc sampler;
+  sampler.kind = DescriptorKind::Sampler;
+  sampler.sampler.address_u = sampler.sampler.address_v = graphics::AddressMode::ClampToEdge;
+  CHECK(e.kernel.write_descriptor(kPid, samplers, 1, sampler) == status::kSuccess && e.kernel.write_descriptor(kPid, views, 0, sampler) == status::kInvalidParameter);
+  DescriptorDesc buffer_view;
+  buffer_view.kind = DescriptorKind::Srv, buffer_view.allocation = vb;
+  CHECK(e.kernel.write_descriptor(kPid, views, 0, buffer_view) == status::kInvalidParameter);   // (a shader resource view of a buffer)
+  srv.allocation = 0x7777;
+  CHECK(e.kernel.write_descriptor(kPid, views, 0, srv) == status::kInvalidHandle);
+  CHECK(e.kernel.copy_descriptors(kPid, views, 0, views, 3, 1) == status::kSuccess && e.kernel.copy_descriptors(kPid, views, 0, samplers, 0, 1) == status::kInvalidParameter);
+  CHECK(e.kernel.copy_descriptors(kPid, views, 6, views, 0, 3) == status::kInvalidParameter);
+  CHECK(e.kernel.copy_descriptors(kPid, views, 1, views, 0, 2) == status::kSuccess);   // (an overlap, copied as memmove would: 1 is a copy of 0, which was a copy of 3; 2 has what 1 had, which was nothing)
+
+  auto draw = [&](auto bind) {
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    w.bind_pipeline(pipe);
+    w.bind_vertex_buffer(2);
+    bind(w);
+    w.draw(3);
+    w.end_pass();
+    return w.ok() ? e.render(w, {rt, tex, vb}) : status::kNoMemory;
+  };
+  // The reference: the same through the plain ops.
+  CHECK(draw([&](CommandWriter& w) { w.push_constants(floats(identity, 16)); w.bind_texture(0, 1, graphics::SamplerDesc()); }) == status::kSuccess && e.pixel(rt, 4, 4) == 0xFFC08040);
+  // The root signature way: the table at descriptor 1 (a copy of the texture's), the constants, the static sampler.
+  CHECK(e.fill(rt, 0));
+  CHECK(draw([&](CommandWriter& w) { w.set_root_signature(sig); w.set_descriptor_heaps({views}); w.set_root_constants(1, 0, floats(identity, 16)); w.set_root_table(0, 1); }) == status::kSuccess);
+  CHECK(e.pixel(rt, 4, 4) == 0xFFC08040);
+  // With a sampler table from the sampler heap too.
+  CHECK(e.fill(rt, 0));
+  CHECK(draw([&](CommandWriter& w) { w.set_root_signature(sig_samplers); w.set_descriptor_heaps({views, samplers}); w.set_root_constants(1, 0, floats(identity, 16)); w.set_root_table(0, 1); w.set_root_table(2, 1); }) == status::kSuccess);
+  CHECK(e.pixel(rt, 4, 4) == 0xFFC08040);
+  // Refused: a draw before the arguments are set, constants past the parameter, the wrong kind of parameter, a table past the heap, two heaps of a kind, a heap the process does not have, a signature it does not have.
+  CHECK(draw([&](CommandWriter& w) { w.set_root_signature(sig); w.set_descriptor_heaps({views}); w.set_root_constants(1, 0, floats(identity, 16)); }) == status::kInvalidParameter);   // (no table)
+  CHECK(draw([&](CommandWriter& w) { w.set_root_signature(sig); w.set_descriptor_heaps({views}); w.set_root_table(0, 1); }) == status::kInvalidParameter);                                     // (no constants)
+  CHECK(draw([&](CommandWriter& w) { w.set_root_signature(sig); w.set_descriptor_heaps({views}); w.set_root_constants(1, 8, floats(identity, 16)); }) == status::kInvalidParameter);
+  CHECK(draw([&](CommandWriter& w) { w.set_root_signature(sig); w.set_descriptor_heaps({views}); w.set_root_constants(0, 0, floats(identity, 16)); }) == status::kInvalidParameter);
+  CHECK(draw([&](CommandWriter& w) { w.set_root_signature(sig); w.set_descriptor_heaps({views}); w.set_root_table(0, 8); }) == status::kInvalidParameter);
+  CHECK(draw([&](CommandWriter& w) { w.set_root_signature(sig); w.set_descriptor_heaps({views, small}); }) == status::kInvalidParameter);
+  CHECK(draw([&](CommandWriter& w) { w.set_root_signature(sig); w.set_descriptor_heaps({0x7777}); }) == status::kInvalidHandle);
+  CHECK(draw([&](CommandWriter& w) { w.set_root_signature(0x7777); }) == status::kInvalidHandle);
+  CHECK(draw([&](CommandWriter& w) { w.set_root_constants(1, 0, floats(identity, 16)); }) == status::kInvalidParameter);   // (no root signature)
+  // A descriptor that was not written leaves its unit unbound: the draw is refused (the pipeline samples it).
+  CHECK(draw([&](CommandWriter& w) { w.set_root_signature(sig); w.set_descriptor_heaps({views}); w.set_root_constants(1, 0, floats(identity, 16)); w.set_root_table(0, 5); }) == status::kInvalidParameter);
+  // A root constant buffer view of a constant buffer allocation, in place of the root constants.
+  Handle cb_sig = 0, cb = e.buffer(kAllocConstantBuffer, 64);
+  CHECK(signature({{0, 0, {{0, 1, 0, 0, 0}}}, {2, 0, {}, 0, 0, 0}}, {static_sampler(0, 1, 0)}, &cb_sig) == status::kSuccess);
+  CHECK(e.write(cb, floats(identity, 16)));
+  CHECK(e.fill(rt, 0));
+  auto draw_cb = [&](auto bind) {
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    w.bind_pipeline(pipe);
+    w.bind_vertex_buffer(2);
+    bind(w);
+    w.draw(3);
+    w.end_pass();
+    return e.render(w, {rt, tex, vb, cb});
+  };
+  CHECK(draw_cb([&](CommandWriter& w) { w.set_root_signature(cb_sig); w.set_descriptor_heaps({views}); w.set_root_table(0, 0); w.set_root_descriptor(1, 3, 0); }) == status::kSuccess && e.pixel(rt, 4, 4) == 0xFFC08040);
+  CHECK(draw_cb([&](CommandWriter& w) { w.set_root_signature(cb_sig); w.set_descriptor_heaps({views}); w.set_root_table(0, 0); w.set_root_descriptor(1, 3, 64); }) == status::kInvalidParameter);   // (past the end)
+  CHECK(draw_cb([&](CommandWriter& w) { w.set_root_signature(cb_sig); w.set_descriptor_heaps({views}); w.set_root_table(0, 0); w.set_root_descriptor(1, 0, 0); }) == status::kInvalidParameter);   // (an image is not a constant buffer)
+  // A constant buffer view in a table.
+  Handle table_cb_sig = 0;
+  CHECK(signature({{0, 0, {{0, 1, 0, 0, 0}, {2, 1, 0, 0, 1}}}}, {static_sampler(0, 1, 0)}, &table_cb_sig) == status::kSuccess);
+  DescriptorDesc cbv;
+  cbv.kind = DescriptorKind::Cbv, cbv.allocation = cb;
+  srv.allocation = tex;
+  CHECK(e.kernel.write_descriptor(kPid, views, 6, srv) == status::kSuccess && e.kernel.write_descriptor(kPid, views, 7, cbv) == status::kSuccess);
+  CHECK(e.fill(rt, 0));
+  CHECK(draw_cb([&](CommandWriter& w) { w.set_root_signature(table_cb_sig); w.set_descriptor_heaps({views}); w.set_root_table(0, 6); }) == status::kSuccess && e.pixel(rt, 4, 4) == 0xFFC08040);
+  // The constant buffer: the size rules, and it never reaches the device.
+  AllocationDesc od;
+  od.flags = kAllocConstantBuffer, od.size = 20;
+  Handle none = 0;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, od, &none) == status::kInvalidParameter);
+  od.flags = kAllocConstantBuffer | kAllocVertexBuffer, od.size = 64;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, od, &none) == status::kInvalidParameter);
+  AllocationInfo info;
+  CHECK(e.kernel.query_allocation(kPid, cb, &info) == status::kSuccess && !info.resident);
+  Handle device_list[1] = {cb};
+  CHECK(e.kernel.make_resident(kPid, e.dev, ArrayView<const Handle>(device_list, 1)) == status::kInvalidParameter);
+  // Destroying a device takes the signatures and heaps with it.
+  CHECK(e.kernel.destroy_root_signature(kPid, sig) == status::kSuccess && e.kernel.destroy_root_signature(kPid, sig) == status::kInvalidHandle);
+  CHECK(e.kernel.destroy_descriptor_heap(kPid, small) == status::kSuccess && e.kernel.destroy_descriptor_heap(kPid, small) == status::kInvalidHandle);
+}
+
+// Root unordered access views and root constants for a compute shader.
+void test_d3d12_compute() {
+  Env e;
+  namespace b = conformance_blobs;
+  Handle cs = 0, cs_pipe = 0;
+  ShaderDesc sd;
+  sd.kind = ShaderKind::Dxbc, sd.stage = graphics::ShaderStage::Compute, sd.code = ConstByteView(b::k_cs_fill, sizeof b::k_cs_fill);
+  CHECK(e.kernel.create_shader(kPid, e.dev, sd, &cs) == status::kSuccess);
+  PipelineDesc pd;
+  pd.compute_shader = cs;
+  CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &cs_pipe) == status::kSuccess);
+  auto storage = [&](uint64_t size) { return e.buffer(kAllocUnorderedAccess, size); };
+  Handle picture = storage(4096), structured = storage(16384), counters = storage(16);
+  const std::vector<uint8_t> blob = serialize_signature(1, {{1, 0, {}, 0, 0, 4}, {4, 0, {}, 0, 0, 0}, {4, 0, {}, 1, 0, 0}, {0, 0, {{1, 1, 2, 0, 0}}}});
+  Handle sig = 0, views = 0;
+  CHECK(e.kernel.create_root_signature(kPid, e.dev, ConstByteView(blob.data(), blob.size()), &sig) == status::kSuccess);
+  CHECK(e.kernel.create_descriptor_heap(kPid, e.dev, DescriptorHeapType::CbvSrvUav, 4, &views) == status::kSuccess);
+  DescriptorDesc uav;
+  uav.kind = DescriptorKind::Uav, uav.allocation = counters;
+  CHECK(e.kernel.write_descriptor(kPid, views, 2, uav) == status::kSuccess);
+  const uint32_t constants[4] = {0x00102030u, 0, 0, 0};
+  auto run = [&](auto bind) {
+    CommandWriter w(e.allocator);
+    w.set_root_signature(sig);
+    w.set_descriptor_heaps({views});
+    w.set_root_constants(0, 0, ConstByteView(reinterpret_cast<const uint8_t*>(constants), 16));
+    bind(w);
+    w.bind_pipeline(cs_pipe);
+    w.dispatch(4, 8, 1);
+    return w.ok() ? e.render(w, {picture, structured, counters}) : status::kNoMemory;
+  };
+  // u0 and u1 as root descriptors, u2 from the table.
+  CHECK(run([&](CommandWriter& w) { w.set_root_descriptor(1, 0, 0); w.set_root_descriptor(2, 1, 0); w.set_root_table(3, 2); }) == status::kSuccess);
+  CHECK(e.pixel(picture, 0, 0) == 0xFF102030u);
+  LockResult lock;
+  CHECK(e.kernel.lock(kPid, counters, kLockReadOnly, 0, &lock) == status::kSuccess);
+  ByteReader in(lock.data);
+  CHECK(in.le32() == 1024);
+  e.kernel.unlock(kPid, counters);
+  // The root descriptor of a unordered access view must be a UAV buffer; the register space has to be 0 (the second one here is space 1: refused when used).
+  CHECK(run([&](CommandWriter& w) { w.set_root_descriptor(1, 0, 0); w.set_root_descriptor(2, 1, 0); w.set_root_table(3, 2); w.set_root_descriptor(1, 2, 2); }) == status::kInvalidParameter);   // (offset not a multiple of 4... 2)
+}
+
+// Resource states: an allocation made with kAllocTrackState is used only in states that allow it.
+void test_d3d12_barriers() {
+  Env e;
+  AllocationDesc d;
+  d.flags = kAllocRenderTarget | kAllocTrackState, d.format = Format::A8R8G8B8, d.width = 8, d.height = 8, d.initial_state = state::kCommon;
+  Handle rt = 0, tex = 0, vb = 0, plain_rt = e.alloc(kTarget, Format::A8R8G8B8, 8, 8);
+  CHECK(e.kernel.create_allocation(kPid, e.dev, d, &rt) == status::kSuccess);
+  d.flags = kAllocTexture | kAllocTrackState, d.initial_state = state::kPixelShaderResource;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, d, &tex) == status::kSuccess);
+  d.flags = kAllocVertexBuffer | kAllocTrackState, d.size = 4 * 20, d.initial_state = state::kGenericRead;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, d, &vb) == status::kSuccess);
+  d.flags = kAllocRenderTarget | kAllocTrackState, d.initial_state = 0x8000;   // (not a state)
+  Handle none = 0;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, d, &none) == status::kInvalidParameter);
+  Handle pipe = make_colored_pipeline(e, true);
+  const float quad[20] = {-1, -1, 0.5f, 0, 0, 3, -1, 0.5f, 2, 0, -1, 3, 0.5f, 0, 2};
+  CHECK(e.write(vb, floats(quad, 15)));
+  CHECK(e.fill(tex, 0xFFC08040));
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  auto frame = [&](auto barriers, Handle target = 0) {
+    CommandWriter w(e.allocator);
+    barriers(w);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    w.bind_pipeline(pipe);
+    w.bind_vertex_buffer(2);
+    w.push_constants(floats(identity, 16));
+    w.bind_texture(0, 1, graphics::SamplerDesc());
+    w.draw(3);
+    w.end_pass();
+    return w.ok() ? e.render(w, {target ? target : rt, tex, vb}) : status::kNoMemory;
+  };
+  // Drawing into a target that is in the common state: refused. Moved to render target: fine.
+  CHECK(frame([&](CommandWriter&) {}) == status::kInvalidParameter);
+  // (a refused stream leaves the states as they were: the transition below still starts from the common state)
+  CHECK(frame([&](CommandWriter& w) { w.transition(0, state::kCommon, state::kRenderTarget); w.transition(1, state::kCommon, state::kPixelShaderResource); }) == status::kInvalidParameter);   // (the texture is not in common)
+  AllocationInfo info;
+  CHECK(frame([&](CommandWriter& w) { w.transition(0, state::kCommon, state::kRenderTarget); }) == status::kSuccess && e.pixel(rt, 4, 4) == 0xFFC08040);
+  // It stays a render target in the next stream: no barrier needed again, and a transition from the common state is now wrong.
+  CHECK(frame([&](CommandWriter&) {}) == status::kSuccess);
+  CHECK(frame([&](CommandWriter& w) { w.transition(0, state::kCommon, state::kRenderTarget); }) == status::kInvalidParameter);
+  // Reading it as a texture needs another transition; a render target cannot be sampled while it is one. Back to the common state it can be drawn into no more.
+  CHECK(frame([&](CommandWriter& w) { w.transition(0, state::kRenderTarget, state::kPixelShaderResource); }) == status::kInvalidParameter);
+  CHECK(frame([&](CommandWriter& w) { w.transition(0, state::kRenderTarget, state::kCommon); }) == status::kInvalidParameter);
+  // Rules of a barrier: before and after the same, a state that writes with another, an allocation that is not in the list, a state that does not exist, a split barrier.
+  CHECK(frame([&](CommandWriter& w) { w.transition(2, state::kGenericRead, state::kGenericRead); }) == status::kInvalidParameter);
+  CHECK(frame([&](CommandWriter& w) { w.transition(2, state::kGenericRead, state::kCopyDest | state::kCopySource); }) == status::kInvalidParameter);
+  CHECK(frame([&](CommandWriter& w) { w.transition(9, state::kGenericRead, state::kCopyDest); }) == status::kInvalidParameter);
+  CHECK(frame([&](CommandWriter& w) { w.transition(2, state::kGenericRead, 0x8000); }) == status::kInvalidParameter);
+  CHECK(frame([&](CommandWriter& w) { w.resource_barrier({CommandWriter::Barrier{0, 2, state::kGenericRead, state::kCopyDest, 1}, CommandWriter::Barrier{0, 2, state::kGenericRead, state::kCopyDest, 2}}); w.transition(2, state::kCopyDest, state::kGenericRead); }) == status::kSuccess);
+  // Unordered access and aliasing barriers are accepted (the first only for something in that state, or nothing in particular).
+  CHECK(frame([&](CommandWriter& w) { w.resource_barrier({CommandWriter::Barrier{1, CommandWriter::Barrier::kNoAllocationIndex, 0, 0, 0}, CommandWriter::Barrier{2, 0, CommandWriter::Barrier::kNoAllocationIndex, 0, 0}}); }) == status::kSuccess);
+  CHECK(frame([&](CommandWriter& w) { w.resource_barrier({CommandWriter::Barrier{1, 0, 0, 0, 0}}); }) == status::kInvalidParameter);   // (the target is not in the unordered access state)
+  // An allocation that does not track states takes barriers as no-ops and is used in any state.
+  CHECK(frame([&](CommandWriter&) {}, plain_rt) == status::kSuccess);
+  // A texture bound while it is in no state that reads: refused. Moved to copy destination: not a shader resource.
+  CHECK(frame([&](CommandWriter& w) { w.transition(1, state::kPixelShaderResource, state::kCopyDest); }) == status::kInvalidParameter);
+  CHECK(e.kernel.query_allocation(kPid, tex, &info) == status::kSuccess);
+}
+
+
+// Resource heaps: allocations placed in one block of memory, overlapping, with the GPU's contents carried across by aliasing barriers.
+void test_d3d12_heaps() {
+  Env e;
+  auto create = [&](uint32_t flags, uint64_t size, Handle heap, uint64_t offset, Handle* out) {
+    AllocationDesc d;
+    d.flags = flags, d.size = size, d.heap = heap, d.heap_offset = offset;
+    return e.kernel.create_allocation(kPid, e.dev, d, out);
+  };
+  Handle heap = 0, none = 0;
+  CHECK(create(kAllocHeap, 4096, 0, 0, &heap) == status::kSuccess);
+  CHECK(create(kAllocHeap, 100, 0, 0, &none) == status::kInvalidParameter && create(kAllocHeap, 0, 0, 0, &none) == status::kInvalidParameter);
+  CHECK(create(kAllocHeap | kAllocVertexBuffer, 4096, 0, 0, &none) == status::kInvalidParameter && create(kAllocHeap, 4096, heap, 0, &none) == status::kInvalidParameter);
+  const uint64_t before = e.kernel.adapter(0)->vidmm().system_bytes();
+  // Buffers, overlapping: 0 .. 256 and 128 .. 384 share 128 bytes; the third is apart.
+  Handle first = 0, second = 0, apart = 0;
+  CHECK(create(kAllocVertexBuffer, 256, heap, 0, &first) == status::kSuccess && create(kAllocVertexBuffer, 256, heap, 128, &second) == status::kSuccess && create(kAllocVertexBuffer, 256, heap, 1024, &apart) == status::kSuccess);
+  CHECK(e.kernel.adapter(0)->vidmm().system_bytes() == before);   // (the memory is the heap's: not counted again)
+  uint8_t pattern[256];
+  for (uint32_t i = 0; i < 256; ++i) pattern[i] = static_cast<uint8_t>(i + 1);
+  CHECK(e.write(first, ConstByteView(pattern, 256)));
+  LockResult lock;
+  CHECK(e.kernel.lock(kPid, second, kLockReadOnly, 0, &lock) == status::kSuccess);
+  bool same = lock.data.size() == 256;
+  for (uint32_t i = 0; i < 128 && same; ++i) same = lock.data[i] == pattern[128 + i];
+  for (uint32_t i = 128; i < 256 && same; ++i) same = lock.data[i] == 0;   // (past the end of the first: the heap's own zeros)
+  CHECK(same);
+  e.kernel.unlock(kPid, second);
+  CHECK(e.kernel.lock(kPid, apart, kLockReadOnly, 0, &lock) == status::kSuccess && lock.data[0] == 0);
+  e.kernel.unlock(kPid, apart);
+  // What does not go: past the end, misaligned, a handle that is not a heap, a heap of nothing, shared, a depth image, a multisampled one.
+  CHECK(create(kAllocVertexBuffer, 256, heap, 3968 + 16, &none) == status::kInvalidParameter && create(kAllocVertexBuffer, 256, heap, 8, &none) == status::kInvalidParameter);
+  CHECK(create(kAllocVertexBuffer, 256, first, 0, &none) == status::kInvalidParameter && create(kAllocVertexBuffer, 256, 0x7777, 0, &none) == status::kInvalidHandle);
+  CHECK(create(kAllocVertexBuffer | kAllocShared, 256, heap, 0, &none) == status::kInvalidParameter);
+  AllocationDesc depth;
+  depth.flags = kAllocDepthStencil, depth.format = Format::D32Float, depth.width = depth.height = 8, depth.heap = heap;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, depth, &none) == status::kNotSupported);
+  // The GPU: a render target A and a texture B at the same place. Draw red into A, pass the use to B with an aliasing barrier, and sample B.
+  AllocationDesc id;
+  id.flags = kAllocRenderTarget, id.format = Format::A8R8G8B8, id.width = id.height = 8, id.heap = heap, id.heap_offset = 2048;
+  Handle a_target = 0, b_texture = 0;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, id, &a_target) == status::kSuccess);
+  id.flags = kAllocTexture;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, id, &b_texture) == status::kSuccess);
+  Handle target = e.alloc(kTarget, Format::A8R8G8B8, 8, 8), vb = e.buffer(kAllocVertexBuffer, 4 * 28), tvb = e.buffer(kAllocVertexBuffer, 4 * 20);
+  Handle red_pipe = make_colored_pipeline(e, false), tex_pipe = make_colored_pipeline(e, true);
+  CHECK(write_triangle(e, vb, 1, 0, 0));
+  const float quad[20] = {-1, -1, 0.5f, 0, 0, 3, -1, 0.5f, 2, 0, -1, 3, 0.5f, 0, 2};
+  CHECK(e.write(tvb, floats(quad, 15)));
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  auto run = [&](bool barrier) {
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);   // (list: A 0, B 1, target 2, vb 3, tvb 4)
+    w.bind_pipeline(red_pipe);
+    w.bind_vertex_buffer(3);
+    w.push_constants(floats(identity, 16));
+    w.draw(3);
+    w.end_pass();
+    if (barrier) w.resource_barrier({CommandWriter::Barrier{2, 0, 1, 0, 0}});
+    w.begin_pass(2, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    w.bind_pipeline(tex_pipe);
+    w.bind_vertex_buffer(4);
+    w.push_constants(floats(identity, 16));
+    w.bind_texture(0, 1, graphics::SamplerDesc());
+    w.draw(3);
+    w.end_pass();
+    return w.ok() ? e.render(w, {a_target, b_texture, target, vb, tvb}) : status::kNoMemory;
+  };
+  // Without the barrier B is what it was before A was drawn into (nothing); with it, it is A's picture.
+  CHECK(run(false) == status::kSuccess && e.pixel(target, 4, 4) != 0xFFFF0000u);
+  CHECK(run(true) == status::kSuccess && e.pixel(target, 4, 4) == 0xFFFF0000u);
+  // The memory has it: the CPU reads it through B, through A, and through the heap.
+  CHECK(e.pixel(b_texture, 2, 2) == 0xFFFF0000u && e.pixel(a_target, 3, 3) == 0xFFFF0000u);
+  CHECK(e.kernel.lock(kPid, heap, kLockReadOnly, 0, &lock) == status::kSuccess && lock.data.size() == 4096);
+  ByteReader heap_in(ConstByteView(lock.data.data(), lock.data.size()));
+  heap_in.skip(2048);
+  CHECK(heap_in.le32() == 0xFFFF0000u);
+  e.kernel.unlock(kPid, heap);
+  // The CPU writing through B reaches A (which is not resident-stale to the stream any more): drawn into again, A is what the stream draws, not what the CPU wrote.
+  CHECK(e.fill(b_texture, 0xFF00FF00u));
+  CHECK(e.pixel(a_target, 0, 0) == 0xFF00FF00u);
+  // Aliasing barriers: not in a pass, only between placed allocations of one heap, and a null side is nothing.
+  {
+    CommandWriter w(e.allocator);
+    w.begin_pass(2, kNoAllocation, 0, {0, 0, 0, 0}, 1, 0);
+    w.resource_barrier({CommandWriter::Barrier{2, 0, 1, 0, 0}});
+    w.end_pass();
+    CHECK(e.render(w, {a_target, b_texture, target}) == status::kInvalidParameter);
+  }
+  {
+    CommandWriter w(e.allocator);
+    w.resource_barrier({CommandWriter::Barrier{2, 0, 2, 0, 0}});
+    CHECK(e.render(w, {a_target, b_texture, target}) == status::kInvalidParameter);   // (the target is not placed)
+    CommandWriter w2(e.allocator);
+    w2.resource_barrier({CommandWriter::Barrier{2, 0, CommandWriter::Barrier::kNoAllocationIndex, 0, 0}, CommandWriter::Barrier{2, CommandWriter::Barrier::kNoAllocationIndex, 1, 0, 0}});
+    CHECK(e.render(w2, {a_target, b_texture, target}) == status::kSuccess);
+  }
+  // The heap goes when its handle is destroyed but the allocations placed in it keep its memory.
+  CHECK(e.kernel.destroy_allocation(kPid, heap) == status::kSuccess);
+  CHECK(e.pixel(b_texture, 0, 0) == 0xFF00FF00u);
 }
 
 // Geometry shaders with adjacency input and instances.
@@ -6019,6 +6474,11 @@ int main() {
   test_device_suite();
   test_stream_output();
   test_stream_output_extras();
+  test_root_signature_parse();
+  test_d3d12_binding();
+  test_d3d12_compute();
+  test_d3d12_barriers();
+  test_d3d12_heaps();
   test_compute_shared();
   test_geometry_extras();
   test_alpha_to_coverage();

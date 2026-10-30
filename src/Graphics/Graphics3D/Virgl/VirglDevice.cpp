@@ -803,6 +803,8 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
     VirglBuffer* results[kQuerySlots] = {};
     uint32_t objects[kQuerySlots] = {};
     bool used[kQuerySlots] = {};
+    bool synthetic[kQuerySlots] = {};   // (answered here, not by the host)
+    uint64_t synthetic_value[kQuerySlots] = {};
     uint32_t open = kMaxOcclusionQueries;   // the slot between begin and end
   } queries(*this);
 
@@ -843,7 +845,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
   } so_slot[kMaxStreamOutputBuffers];
   uint32_t so_handles[kMaxStreamOutputBuffers] = {};
   uint32_t so_program[5] = {};   // (the shaders of the pipeline the transform feedback began with)
-  bool so_alive = false, so_set = false;
+  bool so_alive = false, so_set = false, disjoint_asked = false;
   uint32_t so_query_slot[kMaxGeometryStreams] = {};   // (0: none, else the slot of the Queries)
   struct Fill {
     VirglBuffer* buffer = nullptr;
@@ -1120,7 +1122,15 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         break;
       }
       case RecordedCommand::Type::BeginQuery: {
-        if (!in_pass || queries.open != kMaxOcclusionQueries || cmd.unit >= kMaxOcclusionQueries || queries.used[cmd.unit] || (cmd.count & 0xFF) > static_cast<uint32_t>(QueryKind::SoPrimitivesNeeded)) return false;
+        if (!in_pass || queries.open != kMaxOcclusionQueries || cmd.unit >= kMaxOcclusionQueries || queries.used[cmd.unit] || (cmd.count & 0xFF) > static_cast<uint32_t>(QueryKind::TimestampDisjoint)) return false;
+        if ((cmd.count & 0xFF) >= static_cast<uint32_t>(QueryKind::TimestampFrequency)) {
+          // (the host has no such query: its timestamps are nanoseconds and it cannot say whether the clock was interrupted)
+          queries.used[cmd.unit] = queries.synthetic[cmd.unit] = true;
+          queries.synthetic_value[cmd.unit] = (cmd.count & 0xFF) == static_cast<uint32_t>(QueryKind::TimestampFrequency) ? 1000000000u : (clock_interrupted_ ? 1u : 0u);
+          disjoint_asked = disjoint_asked || (cmd.count & 0xFF) == static_cast<uint32_t>(QueryKind::TimestampDisjoint);
+          queries.open = cmd.unit;
+          break;
+        }
         queries.results[cmd.unit] = make<VirglBuffer>(gpu_.allocator(), *this, 16, 0, virgl::kBindCustom);
         if (!queries.results[cmd.unit] || !queries.results[cmd.unit]->valid()) return false;
         const uint32_t handle = new_handle();
@@ -1147,8 +1157,10 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
       }
       case RecordedCommand::Type::EndQuery:
         if (queries.open == kMaxOcclusionQueries) return false;
-        stream.command(virgl::kEndQuery, 0, 1);
-        stream.put(queries.objects[queries.open]);
+        if (!queries.synthetic[queries.open]) {
+          stream.command(virgl::kEndQuery, 0, 1);
+          stream.put(queries.objects[queries.open]);
+        }
         queries.open = kMaxOcclusionQueries;
         break;
       case RecordedCommand::Type::BindPipeline: {
@@ -1310,7 +1322,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
   // Ask the host for each query's count (waiting for the draws), then read what it wrote into the buffer.
   bool asked = false;
   for (uint32_t slot = 0; slot < kQuerySlots; ++slot) {
-    if (!queries.used[slot]) continue;
+    if (!queries.used[slot] || queries.synthetic[slot]) continue;
     stream.command(virgl::kGetQueryResult, 0, 2);
     stream.put(queries.objects[slot]);
     stream.put(1);
@@ -1322,7 +1334,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
   for (uint32_t attempt = 0; asked; ++attempt) {
     bool pending = false;
     for (uint32_t slot = 0; slot < kQuerySlots; ++slot) {
-      if (!queries.used[slot]) continue;
+      if (!queries.used[slot] || queries.synthetic[slot]) continue;
       ByteReader in(queries.results[slot]->map());
       if (in.le32() != virgl::kQueryStateDone) pending = true;
     }
@@ -1330,9 +1342,15 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
     const uint32_t nop = 0;
     if (attempt > kQueryPolls || !send_commands(&nop, 1)) return false;
   }
+  if (disjoint_asked) clock_interrupted_ = false;
   uint64_t counts[kMaxOcclusionQueries + kFillQueries] = {};
   for (uint32_t slot = 0; slot < kQuerySlots; ++slot) {
     if (!queries.used[slot]) continue;
+    if (queries.synthetic[slot]) {
+      counts[slot] = queries.synthetic_value[slot];
+      recorder.set_occlusion_result(slot, counts[slot]);
+      continue;
+    }
     ByteReader in(queries.results[slot]->map());
     in.le32();   // (the state, DONE)
     in.le32();   // (the size of the result: 4 for a sample count, 8 for a time)

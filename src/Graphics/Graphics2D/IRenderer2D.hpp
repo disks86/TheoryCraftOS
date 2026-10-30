@@ -60,6 +60,18 @@ struct GradientStop {
   uint32_t color = 0;
 };
 
+// An affine map of the plane: (x, y) -> (a x + c y + e, b x + d y + f).
+struct Matrix2D {
+  float a = 1, b = 0, c = 0, d = 1, e = 0, f = 0;
+};
+
+// A colour filter function on straight (not premultiplied) colours, channels 0..1: rgb' = m * rgb + add (m row by row), alpha' = alpha * alpha_scale; results are clamped.
+struct ColorTransform {
+  float m[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+  float add[3] = {0, 0, 0};
+  float alpha_scale = 1;
+};
+
 enum class ImageFilter : uint8_t {
   Nearest,   // the texel containing the pixel center
   Bilinear,  // 2x2 texels weighted by distance, alpha-aware, never reading outside the source rectangle
@@ -118,6 +130,48 @@ class IRenderer2D {
   // Draws `source_rect` of `source` stretched over `dest`. Pixel centers of `dest` map linearly into
   // `source_rect`; samples never leave the rectangle (clamped at its edges).
   virtual void draw_image_scaled(const Surface& source, const RectF& source_rect, const Rect2D& dest, ImageFilter filter) = 0;
+  // Draws `source_rect` of `source` under `m`: a point (x, y) of the rectangle, measured from its top left corner in source pixels, lands at
+  // m(x, y) on the target. Pixel centers of the target map back through the inverse into the rectangle (samples never leave it; a pixel whose
+  // center falls outside the transformed rectangle is not drawn, so the edges are not anti-aliased). Rotation, skew and scaling in one pass,
+  // done by the GPU's texture units where there is one. Returns false, with nothing drawn, when this renderer cannot do it (the default;
+  // the device renderer under a layer's opacity, or without textures) or `m` is not invertible: the caller then resamples itself.
+  virtual bool draw_image_transformed(const Surface& source, const Rect2D& source_rect, const Matrix2D& m, ImageFilter filter) {
+    (void)source, (void)source_rect, (void)m, (void)filter;
+    return false;
+  }
+
+  // Offscreen groups. begin_group() starts a transparent picture covering `bounds` (target coordinates, clipped to the target): everything drawn until
+  // the matching end_group() is drawn into it, with the same coordinates and the clip stack of the group alone (pushes left open are dropped), and
+  // nothing reaches the target. end_group() then lays the picture over the target: a point (x, y) of it, in the coordinates it was drawn in, lands at
+  // m(x, y), filtered by `filter`, the whole thing at `opacity` (0..255), inside the clip in force at begin_group(). Groups nest.
+  // begin_group() returns false, with nothing started, when this renderer cannot (the default: no offscreen targets, too deep, out of memory,
+  // or a layer's per-shape opacity is open); end_group() is called if and only if it returned true, and returns false if the picture could not be put on the target.
+  virtual bool begin_group(const Rect2D& bounds) {
+    (void)bounds;
+    return false;
+  }
+  virtual bool end_group(const Matrix2D& m, uint8_t opacity, ImageFilter filter) {
+    (void)m, (void)opacity, (void)filter;
+    return false;
+  }
+  // Filters on a group's picture, done by the GPU. supports_group_filters() says whether this renderer has them; if so, begin_filter_group() is begin_group() for a
+  // picture that is filtered: its bounds are not cut by the clip in force (a blur reads around what shows) and its own clip is its bounds alone; the clip applies when end_group()
+  // lays the result over the target. Between the drawing and end_group(), group_blur() blurs the picture (a Gaussian of standard deviation `sigma` pixels, made of box blurs;
+  // outside the picture is transparent) and group_color() applies a colour function; each returns false if it could not (the picture is then unfiltered at that step).
+  virtual bool supports_group_filters() const { return false; }
+  virtual bool begin_filter_group(const Rect2D& bounds) {
+    (void)bounds;
+    return false;
+  }
+  virtual bool group_blur(float sigma) {
+    (void)sigma;
+    return false;
+  }
+  virtual bool group_color(const ColorTransform& t) {
+    (void)t;
+    return false;
+  }
+
   // Fills `rect` with a gradient along the line from `from` to `to` (pixel coordinates; stops at 0 and 1 are
   // at those points, the ends extend as flat color). Stops must be sorted by offset; at most
   // kMaxGradientStops are used; no stops draws nothing; one stop is a flat fill.

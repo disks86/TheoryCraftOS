@@ -501,7 +501,7 @@ enum class IndexType : uint8_t { Uint16, Uint32 };
 
 // What the vertices of a draw make (set_primitive_topology, DeviceFeature kFeatureLines for anything but triangles). Lines and points are one pixel wide.
 enum class ResolveMode : uint8_t { Average, Sample0, Min, Max };
-enum class QueryKind : uint8_t { Occlusion, OcclusionPredicate, IaVertices, IaPrimitives, VsInvocations, PsInvocations, Timestamp, SoPrimitivesWritten, SoPrimitivesNeeded };
+enum class QueryKind : uint8_t { Occlusion, OcclusionPredicate, IaVertices, IaPrimitives, VsInvocations, PsInvocations, Timestamp, SoPrimitivesWritten, SoPrimitivesNeeded, TimestampFrequency, TimestampDisjoint };
 enum class PrimitiveTopology : uint8_t { TriangleList, LineList, PointList, PatchList, LineListAdjacency, TriangleListAdjacency };   // (the adjacency lists need a geometry shader that takes them)   // (PatchList: kFeatureTessellation, with set_patch_control_points)
 
 struct Viewport {
@@ -574,7 +574,8 @@ class ICommandBuffer {
   // the draws between begin and end took (a draw of n vertices and i instances: n * i), IaPrimitives the primitives they assembled (a patch is a primitive), VsInvocations the vertex shader
   // runs (a device may run it fewer times than there are vertices, by reusing results) and PsInvocations the fragment shader runs (a device may shade more pixels than it writes).
   // Timestamp (kFeatureTimestampQueries): the time the query ends, in nanoseconds of a clock that never goes back (the software rasterizer's is a count that goes up by 1000 for each timestamp, unless the
-  // kernel gives it a clock). SoPrimitivesWritten / SoPrimitivesNeeded (kFeatureStatisticsQueries with kFeatureStreamOutput), of the output stream `stream`: the primitives the draws between begin and
+  // kernel gives it a clock). TimestampFrequency (kFeatureTimestampQueries) is the ticks a second of the timestamps (1000000000: they are nanoseconds) and TimestampDisjoint 1 if the clock was
+  // interrupted (a frequency change, a reset) while the query was open, else 0: a device that cannot tell says 0. Neither needs a draw. SoPrimitivesWritten / SoPrimitivesNeeded (kFeatureStatisticsQueries with kFeatureStreamOutput), of the output stream `stream`: the primitives the draws between begin and
   // end wrote to stream output buffers, and those the geometry shader made for that stream, whether or not they fit.
   virtual void begin_query(uint32_t slot, QueryKind kind, uint32_t stream = 0) {
     (void)stream;
@@ -657,6 +658,9 @@ class IGraphicsDevice {
   virtual void destroy_command_buffer(ICommandBuffer* commands) = 0;
 
   // Runs the recorded commands; returns when they are done (or failed).
+  // The timestamp clock was interrupted (the device was reset, changed its power state or its clock): the next TimestampDisjoint query says 1, once, and timestamps from before are not comparable
+  // with those after. Devices without kFeatureTimestampQueries ignore it.
+  virtual void interrupt_clock() {}
   virtual bool submit(ICommandBuffer* commands) = 0;
   // Shows `image` (created with kImagePresent) on the screen.
   virtual bool present(IImage* image) = 0;

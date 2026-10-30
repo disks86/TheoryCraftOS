@@ -37,7 +37,8 @@ enum : uint32_t { kStateCreateThread = 2, kStateCreateProcess = 3, kStateExitThr
 constexpr uint32_t kMaxObjects = 8, kMaxEvents = 48, kMaxAttached = 16, kInfoBytes = 0xA8;      // the state-specific part of a DBGUI_WAIT_STATE_CHANGE (0x18 .. 0xC0)
 
 struct Event {
-  bool used = false, delivered = false, continued = false, blocking = false, orphan = false;
+  bool used = false, delivered = false, continued = false, blocking = false, orphan = false, deferred = false, hold = false;
+  uint64_t seq = 0;      // the order the events were queued in
   uint32_t state = 0, status = kDbgNotHandled;
   uint64_t pid = 0, tid = 0, base = 0, start = 0, context = 0;      // context: the CONTEXT the thread waits with (an exception); base/start: the image base and start address of a process or thread, the base of a library
   uint8_t info[kInfoBytes] = {};
@@ -50,6 +51,7 @@ struct DebugObject {
 struct Attached { bool used = false; uint64_t pid = 0; uint32_t object = 0; bool children = false; };
 
 DebugObject g_objects[kMaxObjects];
+uint64_t g_pending_kills[kMaxAttached];      // programs whose debugger is gone and asked for them to end with it (guarded like the rest; ended later, see debug_drain_kills)
 Attached g_attached[kMaxAttached];
 
 void put(uint8_t* at, uint64_t value, uint32_t bytes) { for (uint32_t i = 0; i < bytes; ++i) at[i] = uint8_t(value >> (8 * i)); }
@@ -80,11 +82,13 @@ DebugObject* object_by_id(uint32_t id) {
 }
 
 // Queues an event (the system lock held). Returns it, or null if the queue is full.
+uint64_t g_next_seq = 1;
 Event* post_locked(DebugObject& o, uint32_t state, uint64_t pid, uint64_t tid, bool blocking) {
   for (Event& e : o.events) {
     if (e.used) continue;
     e = Event();
     e.used = true;
+    e.seq = g_next_seq++;
     e.state = state;
     e.pid = pid;
     e.tid = tid;
@@ -255,7 +259,13 @@ void debug_note_created(uint32_t object, uint32_t flags) {
 
 // (the system lock is held) The last handle to the debug object is gone: what it debugged goes on by itself, and whoever waited for an answer gets one.
 void debug_object_freed_locked(uint32_t object) {
-  for (Attached& a : g_attached) if (a.used && a.object == object) a = Attached();
+  bool kill = false;
+  for (const DebugObject& o : g_objects) if (o.used && o.object == object && (o.flags & 1)) kill = true;
+  for (Attached& a : g_attached) {
+    if (!a.used || a.object != object) continue;
+    if (kill) for (uint64_t& slot : g_pending_kills) if (slot == 0) { slot = a.pid; break; }
+    a = Attached();
+  }
   for (DebugObject& o : g_objects) {
     if (!o.used || o.object != object) continue;
     for (Event& e : o.events) {
@@ -265,6 +275,17 @@ void debug_object_freed_locked(uint32_t object) {
     }
     o.used = false;
   }
+}
+
+// The programs that were debugged with kill-on-close end now (STATUS_DEBUGGER_INACTIVE); called with no lock held.
+void debug_drain_kills(IProcessRuntime* runtime) {
+  ObjectManager* objects = system_objects();
+  if (!objects || !runtime) return;
+  uint64_t pids[kMaxAttached] = {};
+  objects->sync().lock();
+  for (uint32_t i = 0; i < kMaxAttached; ++i) { pids[i] = g_pending_kills[i]; g_pending_kills[i] = 0; }
+  objects->sync().unlock();
+  for (uint64_t pid : pids) if (pid != 0) runtime->terminate_process(pid, 0xC0000354u);
 }
 
 uint32_t debug_object_of(uint64_t pid) {
@@ -419,17 +440,47 @@ uint32_t nt_wait_for_debug_event(Process& p, const SyscallRequest& r) {
   bool bad = false;
   const uint64_t timeout = timeout_ns_of(p, r.args[2], &bad);
   if (bad) return kAccessViolation;
+  // An event the debugger answered with DBG_REPLY_LATER is held back while its thread is suspended: the suspend counts are looked at before the wait.
+  if (IProcessRuntime* runtime = p.runtime()) {
+    struct Probe { uint64_t pid, tid; };
+    Probe probes[kMaxEvents];
+    uint32_t probe_count = 0;
+    ObjectManager* objects = system_objects();
+    objects->sync().lock();
+    for (const Event& e : o->events) if (e.used && e.deferred && !e.delivered && probe_count < kMaxEvents) probes[probe_count++] = {e.pid, e.tid};
+    objects->sync().unlock();
+    bool held[kMaxEvents] = {};
+    for (uint32_t i = 0; i < probe_count; ++i) {
+      IProcessRuntime::RemoteOp op;
+      op.kind = IProcessRuntime::RemoteOp::ThreadStatus;
+      op.thread_id = probes[i].tid;
+      held[i] = runtime->remote_operation(probes[i].pid, op) == kSuccess && op.old_protect > 0;
+    }
+    objects->sync().lock();
+    for (Event& e : o->events) {
+      if (!e.used || !e.deferred) continue;
+      e.hold = false;
+      for (uint32_t i = 0; i < probe_count; ++i) if (probes[i].tid == e.tid && probes[i].pid == e.pid && held[i]) e.hold = true;
+    }
+    objects->sync().unlock();
+  }
   Event copy;
   const uint32_t waited = wait_until(p, timeout, [&]() -> uint64_t {
     if (!o->used) return kInvalidHandle;
     for (Event& e : o->events) if (e.used && e.delivered && !e.continued) return kPending;      // (the next one is not reported until this one is continued)
+    Event* next = nullptr;
     for (Event& e : o->events) {
       if (!e.used || e.delivered || e.orphan) continue;
-      e.delivered = true;
-      copy = e;
-      return kSuccess;
+      if (e.deferred && e.hold) continue;
+      if (!next || e.seq < next->seq) next = &e;
     }
-    return kPending;
+    // (an event is also not reported before an older held back event of its thread)
+    if (next) for (const Event& e : o->events) if (e.used && !e.delivered && !e.orphan && e.deferred && e.hold && e.tid == next->tid && e.seq < next->seq) next = nullptr;
+    if (!next) return kPending;
+    next->delivered = true;
+    next->deferred = false;
+    copy = *next;
+    return kSuccess;
   });
   if (waited != kSuccess) return waited == 0x101 ? 0x101u : waited;
   return write_state_change(p, state_at, copy) ? kSuccess : kAccessViolation;
@@ -453,7 +504,7 @@ uint32_t nt_debug_continue(Process& p, const SyscallRequest& r) {
   status = kInvalidParameter;
   for (Event& e : o->events) {
     if (!e.used || !e.delivered || e.continued || e.pid != pid || e.tid != tid) continue;
-    if (answer == 0x40010001u) e.delivered = false;      // DBG_REPLY_LATER: the debugger gets the event again
+    if (answer == 0x40010001u) { e.delivered = false; e.deferred = true; }      // DBG_REPLY_LATER: the debugger gets the event again (when its thread runs)
     else if (e.blocking && !e.orphan) { e.continued = true; e.status = answer; }
     else e = Event();
     status = kSuccess;
