@@ -68,6 +68,9 @@ void X86_64Cpu::reset(const process::ProgramStart& start) {
   retired_ = 0;
   lwp_ = Lwp();
   lwp_interrupt_ = false;
+  dcache_ = Dcache();
+  dcache_on_ = false;
+  dme_count_ = 0;
   cet_ = Cet();
   pasid_ = -1;
 }
@@ -180,6 +183,7 @@ X86_64Cpu::Step X86_64Cpu::fail(uint8_t vector, uint64_t address, uint32_t error
 }
 
 bool X86_64Cpu::load(GuestMemory& m, uint64_t address, uint32_t size, uint64_t* out) {
+  if (dcache_on_) cache_access(address, size, true);
   uint8_t raw[8] = {};
   if (!m.read(address, ByteView(raw, size))) {
     fail(14, address, 0);
@@ -192,6 +196,7 @@ bool X86_64Cpu::load(GuestMemory& m, uint64_t address, uint32_t size, uint64_t* 
 }
 
 bool X86_64Cpu::store(GuestMemory& m, uint64_t address, uint32_t size, uint64_t value) {
+  if (dcache_on_) cache_access(address, size, false);
   uint8_t raw[8];
   for (uint32_t i = 0; i < 8; ++i) raw[i] = static_cast<uint8_t>(value >> (8 * i));
   if (!m.write(address, ConstByteView(raw, size))) {
@@ -1181,7 +1186,7 @@ X86_64Cpu::Step X86_64Cpu::step_0f_op(GuestMemory& m, uint8_t op) {
         c = (1u << 0) | (1u << 9) | (1u << 12) | (1u << 19) | (1u << 20) | (1u << 22) | (1u << 23) | (1u << 26) | (1u << 27) | (1u << 28) | (1u << 29) | (1u << 1) | (1u << 25) | (1u << 13) | (1u << 30);      // SSE3, SSSE3, FMA, CMPXCHG16B, SSE4.1, SSE4.2, MOVBE, POPCNT, XSAVE, OSXSAVE, AVX, F16C, RDRAND, PCLMULQDQ, AES
       } else if (leaf == 7 && static_cast<uint32_t>(s_.r[1]) == 1) {
         a = (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 4) | (1u << 5) | (1u << 7) | (1u << 21) | (1u << 23);      // SHA512, SM3, SM4, RAO-INT, AVX-VNNI, AVX512_BF16, CMPCCXADD, AMX-FP16, AVX-IFMA
-        dx = (1u << 4) | (1u << 5) | (1u << 8) | (1u << 10) | (1u << 19) | (1u << 21);      // AVX-VNNI-INT8, AVX-NE-CONVERT, AVX-VNNI-INT16, APX_F, AVX10
+        dx = (1u << 4) | (1u << 5) | (1u << 8) | (1u << 10) | (1u << 15) | (1u << 19) | (1u << 21);      // AVX-VNNI-INT8, AVX-NE-CONVERT, AVX-VNNI-INT16, APX_F, AVX10
       } else if (leaf == 7 && static_cast<uint32_t>(s_.r[1]) == 0) {
         b = (1u << 0) | (1u << 3) | (1u << 5) | (1u << 8) | (1u << 18) | (1u << 19) | (1u << 23) | (1u << 24) | (1u << 26) | (1u << 27) | (1u << 29) | (1u << 16) | (1u << 17) | (1u << 21) | (1u << 28) | (1u << 30) | (1u << 31);      // BMI1, AVX2, BMI2, SHA, AVX512F, DQ, IFMA, CD, BW, VL
         c = (1u << 1) | (1u << 6) | (1u << 8) | (1u << 9) | (1u << 10) | (1u << 11) | (1u << 12) | (1u << 14) | (1u << 22) | (1u << 27) | (1u << 28) | (1u << 29);      // VBMI, VBMI2, GFNI, VAES, VPCLMULQDQ, VNNI, BITALG, VPOPCNTDQ, RDPID, MOVDIRI, MOVDIR64B, ENQCMD
@@ -1209,11 +1214,11 @@ X86_64Cpu::Step X86_64Cpu::step_0f_op(GuestMemory& m, uint8_t op) {
         b = 2 | (7u << 16);
       } else if (leaf == 0x80000000u) {
         a = 0x8000001Cu;
-      } else if (leaf == 0x8000001Cu) {      // LWP: the value sample (LWPVAL) and LWPINS, instructions / branches / clocks events, continuous mode, time stamps and the threshold interrupt flag; no cache miss event. 32-byte records, a 136-byte LWPCB (17 quadwords),
-        a = 1u | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 5) | (1u << 6) | (1u << 29) | (1u << 30) | (1u << 31);      // six event ids, the first event interval at offset 88, 32 records at least, version 1
+      } else if (leaf == 0x8000001Cu) {      // LWP: the value sample (LWPVAL) and LWPINS, instructions / branches / data cache misses / clocks events, continuous mode, time stamps and the threshold interrupt flag; no cache miss event. 32-byte records, a 136-byte LWPCB (17 quadwords),
+        a = 1u | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 4) | (1u << 5) | (1u << 6) | (1u << 29) | (1u << 30) | (1u << 31);      // six event ids, the first event interval at offset 88, 32 records at least, version 1
         b = 17u | (32u << 8) | (6u << 16) | (88u << 24);
-        c = (1u << 9) | (1u << 16) | (1u << 29);      // (version 1, 32 records at least, IP filtering)
-        dx = 1u | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 5) | (1u << 6) | (1u << 29) | (1u << 30) | (1u << 31);
+        c = 12u | (1u << 5) | (4u << 6) | (1u << 9) | (1u << 16) | (1u << 29) | (1u << 30) | (1u << 31);      // (12-bit latency rounded to 16 cycles, data addresses, version 1, 32 records at least, IP filtering, cache level and latency filtering)
+        dx = 1u | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 4) | (1u << 5) | (1u << 6) | (1u << 29) | (1u << 30) | (1u << 31);
       } else if (leaf == 0x80000001u) {
         c = (1u << 0) | (1u << 5) | (1u << 11) | (1u << 15) | (1u << 16) | (1u << 21);      // LAHF/SAHF, LZCNT, XOP, LWP, FMA4, TBM
         dx = (1u << 11) | (1u << 20) | (1u << 27) | (1u << 29);      // SYSCALL, NX, RDTSCP, long mode
@@ -2243,10 +2248,11 @@ UniquePointer<IGuestCpu> X86_64Cpu::clone_for_thread(allocators::IAllocator& all
 
 StopReason X86_64Cpu::run(GuestMemory& memory, uint64_t max_instructions) {
   for (uint64_t i = 0; i < max_instructions; ++i) {
+    dme_count_ = 0;
     const Step step_result = step(memory);
     if (step_result == Step::Fault) return StopReason::Fault;
     ++retired_;
-    if (lwp_.cb != 0 && (lwp_.flags & 0x6C) && !lwp_retire(memory, instruction_start_)) return StopReason::Fault;
+    if (lwp_.cb != 0 && (lwp_.flags & 0x7C) && !lwp_retire(memory, instruction_start_)) return StopReason::Fault;
     if (step_result == Step::Syscall) return StopReason::Syscall;
   }
   return StopReason::Budget;

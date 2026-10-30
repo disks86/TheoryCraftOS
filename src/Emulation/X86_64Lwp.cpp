@@ -21,8 +21,8 @@
 // What is modelled: the control block (LWPCB), the event ring buffer in guest memory with its head, tail and MissedEvents bookkeeping, synchronized and continuous mode, the programmed value sample
 // event (LWPVAL, EventId 1) and the programmed event (LWPINS, EventId 255), the hardware events that make sense without a cache model - instructions retired (2), branches retired (3, with the
 // filters for absolute, conditional and unconditional relative branches and the TKN bit; no prediction information, PRV = 0, and no fused branches), CPU clocks not halted (5) and reference clocks
-// not halted (6), both counting one clock per retired instruction - the IP range filter, the performance time stamp, the threshold, and SLWPCB's flush of the head, counters and MissedEvents.
-// Not modelled: the DCache miss event (there is no cache; cpuid does not offer it and LLWPCB clears its flag) and the interrupt itself: when the ring buffer fill reaches the threshold with
+// not halted (6), both counting one clock per retired instruction, and DCache misses (4) from a model of the data cache - the IP range filter, the performance time stamp, the threshold, and SLWPCB's flush of the head, counters and MissedEvents.
+// DCache misses (4) come from a small cache model (below). Not modelled: the interrupt itself: when the ring buffer fill reaches the threshold with
 // LWPCB.Flags.INT set, lwp_interrupt_pending() becomes true and the host decides what to deliver. The state belongs to the CPU object, as the AMX tiles do; it is saved by XSAVE as component 62
 // in a layout of this emulator's own (the architectural one is not public).
 #include "Emulation/X86_64Cpu.hpp"
@@ -36,11 +36,11 @@ constexpr uint32_t kMaxEvents = 6;                          // LwpMaxEvents
 constexpr uint32_t kControlBlockBytes = kEventOffset + 8 * kMaxEvents;      // 136 bytes, 17 quadwords (LwpCbSize)
 constexpr uint32_t kRecordBytes = 32;                       // LwpEventSize
 constexpr uint32_t kMinBufferRecords = 32;                  // LwpMinBufferSize = 1: 32 records at least
-constexpr uint32_t kFlagVal = 1u << 1, kFlagIre = 1u << 2, kFlagBre = 1u << 3, kFlagCnh = 1u << 5, kFlagRnh = 1u << 6, kFlagCont = 1u << 29, kFlagPtsc = 1u << 30, kFlagInt = 1u << 31;
-constexpr uint32_t kAvailableFlags = kFlagVal | kFlagIre | kFlagBre | kFlagCnh | kFlagRnh | kFlagCont | kFlagPtsc | kFlagInt;
-constexpr uint32_t kHardwareFlags = kFlagIre | kFlagBre | kFlagCnh | kFlagRnh;
+constexpr uint32_t kFlagVal = 1u << 1, kFlagIre = 1u << 2, kFlagBre = 1u << 3, kFlagDme = 1u << 4, kFlagCnh = 1u << 5, kFlagRnh = 1u << 6, kFlagCont = 1u << 29, kFlagPtsc = 1u << 30, kFlagInt = 1u << 31;
+constexpr uint32_t kAvailableFlags = kFlagVal | kFlagIre | kFlagBre | kFlagDme | kFlagCnh | kFlagRnh | kFlagCont | kFlagPtsc | kFlagInt;
 constexpr int32_t kMinimumInterval = 1;      // the smallest interval of a hardware event (the value sample may use 0)
 // LWPCB.Filters
+constexpr uint32_t kFilterMinLatencyMask = 0xFF, kFilterClf = 1u << 8, kFilterNbc = 1u << 9, kFilterRdc = 1u << 10, kFilterRam = 1u << 11, kFilterOth = 1u << 12;
 constexpr uint32_t kFilterNab = 1u << 27, kFilterNcb = 1u << 28, kFilterNrb = 1u << 29, kFilterIpi = 1u << 30, kFilterIpf = 1u << 31;
 
 // LWPCB field offsets
@@ -70,7 +70,7 @@ void put64(ByteView v, uint32_t at, uint64_t x) {
 int32_t signed26(uint32_t field) { return static_cast<int32_t>(field << 6) >> 6; }
 
 // The LWPCB.Flags bit that enables the event with this EventId (0 for the ones that cannot be enabled).
-uint32_t flag_of(uint32_t id) { return id == 1 ? kFlagVal : id == 2 ? kFlagIre : id == 3 ? kFlagBre : id == 5 ? kFlagCnh : id == 6 ? kFlagRnh : 0; }
+uint32_t flag_of(uint32_t id) { return id == 1 ? kFlagVal : id == 2 ? kFlagIre : id == 3 ? kFlagBre : id == 4 ? kFlagDme : id == 5 ? kFlagCnh : id == 6 ? kFlagRnh : 0; }
 
 }  // namespace
 
@@ -142,10 +142,12 @@ X86_64Cpu::Step X86_64Cpu::lwp_instruction(GuestMemory& m, uint32_t map, uint32_
     const uint64_t address = get_reg(d_.rm, size) & mask;
     if (address == 0) {
       lwp_ = Lwp();
+      dcache_on_ = false;
       s_.rip += d_.position;
       return Step::Ok;
     }
     lwp_ = Lwp();      // (LWP is left disabled if any of the checks fails)
+    dcache_on_ = false;
     uint8_t block[kControlBlockBytes] = {};
     ByteView view(block, sizeof(block));
     if (!m.read(address, view)) return fail(14, address, 0);
@@ -172,6 +174,8 @@ X86_64Cpu::Step X86_64Cpu::lwp_instruction(GuestMemory& m, uint32_t map, uint32_
     lwp_.buffer_base = buffer_base;
     lwp_.buffer_size = records * kRecordBytes;
     lwp_.flags = enabled;
+    dcache_on_ = (enabled & kFlagDme) != 0;
+    if (dcache_on_) dcache_ = Dcache();
     lwp_.threshold = get32(view, kThresholdAt) - get32(view, kThresholdAt) % kRecordBytes;
     lwp_.filters = get32(view, kFiltersAt);
     lwp_.base_ip = get64(view, kBaseIpAt);
@@ -262,6 +266,22 @@ bool X86_64Cpu::lwp_retire(GuestMemory& m, uint64_t ip) {
   const uint32_t length = d_.position < sizeof(d_.bytes) ? d_.position : static_cast<uint32_t>(sizeof(d_.bytes));
   for (uint32_t id = 2; id <= 6; ++id) {
     if (!(lwp_.flags & flag_of(id))) continue;
+    if (id == 4) {      // DCache misses: each miss of the instruction that passes the latency and level filters counts
+      for (uint32_t i = 0; i < dme_count_; ++i) {
+        const DcacheMiss& miss = dme_pending_[i];
+        if (miss.latency < (lwp_.filters & kFilterMinLatencyMask) * 16) continue;
+        if (lwp_.filters & kFilterClf) {
+          const uint32_t level = miss.source == 1 ? kFilterNbc : miss.source == 2 ? kFilterRdc : miss.source == 3 ? kFilterRam : kFilterOth;
+          if (!(lwp_.filters & level)) continue;
+        }
+        if (--lwp_.counter[4] >= 0) continue;
+        bool full = false;
+        const uint16_t flags = static_cast<uint16_t>((1u << 12) | (miss.source << 13));      // DAV, SRC
+        if (!lwp_insert(m, 4, flags, miss.latency, ip, miss.address, &full)) return false;
+        if (!full) lwp_reload(4);
+      }
+      continue;
+    }
     uint64_t target = 0;
     uint16_t flags = 0;
     if (id == 3) {
@@ -279,6 +299,44 @@ bool X86_64Cpu::lwp_retire(GuestMemory& m, uint64_t ip) {
     if (!full) lwp_reload(id);
   }
   return true;
+}
+
+// The data cache model: an access touches the lines it spans; a line missing from the L1 is a miss (the lowest address that missed is reported), served by the second level (source 1, a local L3 hit,
+// 48 cycles) or by DRAM (source 3, 256 cycles), and the line is filled in both. Stores allocate too and report nothing. Only a session with the cache miss event enabled switches the model on.
+void X86_64Cpu::cache_access(uint64_t address, uint32_t size, bool is_load) {
+  const uint64_t first = address >> 6, last = (address + (size ? size - 1 : 0)) >> 6;
+  bool reported = false;
+  for (uint64_t line = first; line <= last && line >= first; ++line) {
+    ++dcache_.clock;
+    const uint32_t set = static_cast<uint32_t>(line % 64);
+    uint32_t victim = 0;
+    bool hit = false;
+    for (uint32_t way = 0; way < 8; ++way) {
+      if (dcache_.l1_tag[set][way] == line + 1) { dcache_.l1_age[set][way] = dcache_.clock; hit = true; break; }
+      if (dcache_.l1_age[set][way] < dcache_.l1_age[set][victim]) victim = way;
+    }
+    if (hit) continue;
+    dcache_.l1_tag[set][victim] = line + 1;
+    dcache_.l1_age[set][victim] = dcache_.clock;
+    const uint32_t set2 = static_cast<uint32_t>(line % 128), tag2 = static_cast<uint32_t>((line / 128) + 1);
+    uint32_t victim2 = 0;
+    bool hit2 = false;
+    for (uint32_t way = 0; way < 16; ++way) {
+      if (dcache_.l2_tag[set2][way] == tag2) { dcache_.l2_age[set2][way] = dcache_.clock; hit2 = true; break; }
+      if (dcache_.l2_age[set2][way] < dcache_.l2_age[set2][victim2]) victim2 = way;
+    }
+    if (!hit2) {
+      dcache_.l2_tag[set2][victim2] = tag2;
+      dcache_.l2_age[set2][victim2] = dcache_.clock;
+    }
+    if (is_load && !reported && dme_count_ < 8) {
+      DcacheMiss& miss = dme_pending_[dme_count_++];
+      miss.address = line == first ? address : line << 6;
+      miss.latency = hit2 ? 48 : 256;
+      miss.source = hit2 ? 1 : 3;
+      reported = true;
+    }
+  }
 }
 
 }  // namespace emulation

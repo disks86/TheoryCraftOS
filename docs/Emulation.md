@@ -211,8 +211,10 @@ programs built with `-march=haswell` (or x86-64-v3) run. `X86_64Vex.cpp` holds a
   stamp (the emulator's time stamp counter), SLWPCB's flush of the head, counters and MissedEvents, and LWPINS's CF are modelled, and so are the events: the programmed value sample (1) and programmed
   event (255), instructions retired (2), branches retired (3: conditional, relative and register-indirect branches, `call`, `ret`; the NAB / NCB / NRB filters; TKN set when taken; no prediction
   information, so PRV = 0, and no fused branches), and CPU clocks and reference clocks not halted (5, 6: one clock per retired instruction), with the IP range filter (IPF / IPI) for all of them. The
-  threshold interrupt is a host-visible flag: when the ring fill reaches the threshold with Flags.INT set, `take_lwp_interrupt()` returns true once. Not modelled: the DCache miss event (there is no
-  cache; cpuid does not offer it and LLWPCB clears its flag), branch prediction filters, and the interrupt delivery itself. The session is part of the CPU object (like the AMX tiles) and XSAVE /
+  DCache misses (4) come from a small cache model that is switched on only while a session with that event runs: a 32 KiB 8-way L1 and a 128 KiB 16-way second level (64-byte lines, LRU), loads that miss the L1 are
+  events (a local L3 hit, 48 cycles, source 1, or DRAM, 256 cycles, source 3), stores allocate lines silently, the lowest missed address is reported, and MinLatency and the cache level filters apply. The
+  threshold interrupt is a host-visible flag: when the ring fill reaches the threshold with Flags.INT set, `take_lwp_interrupt()` returns true once. Not modelled: branch prediction filters, instruction fetch in the cache,
+  and the interrupt delivery itself. The session is part of the CPU object (like the AMX tiles) and XSAVE /
   XRSTOR carry it as component 62 (offset 832, 128 bytes) in a layout of this emulator's own, since AMD's is not public. The minimum interval of a hardware event is 1. `tests/XopTest.cpp` has the
   tests; the semantics are from the manuals and unverified on hardware.
 - **Intel APX, part 1** (`D5` REX2 prefix): the payload bits M0, R4, X4, B4, W, R3, X3, B3 select the 0F map and name registers R16..R31 in modrm, SIB (an index field of 100 with X4 is R20, not "no index") and
@@ -248,7 +250,9 @@ programs built with `-march=haswell` (or x86-64-v3) run. `X86_64Vex.cpp` holds a
   and are not implemented. cpuid reports AVX10 version 2.
 - **xgetbv with ECX=1** returns XINUSE (the components that are not in their initial state; cpuid 0xD.1 EAX bit 2). `xsaves` / `xrstors` are #GP(0): they are supervisor-state instructions and the emulator only
   runs CPL 3 code.
-- **Not implemented** (an invalid-instruction fault, never a wrong result): `invept`, `invvpid`, `invpcid` and `urdmsr` / `uwrmsr` (VMX, the INVPCID feature and the user-MSR feature, none of which cpuid advertises, so #UD is the architectural answer).
+- **Not implemented** (an invalid-instruction fault, never a wrong result): `invept`, `invvpid` and `invpcid` (VMX and the INVPCID feature, which cpuid does not advertise, so #UD is the architectural answer; they are privileged instructions of a kernel the emulator does not run), supervisor shadow stacks, and delivery of LWP's threshold interrupt (there is no interrupt descriptor table; the flag is the interface).
+- **User MSRs** (`urdmsr` / `uwrmsr`, cpuid 7.1 EDX bit 15): the register forms (F2 / F3 REX.W 0F 38 F8, mod 3), the VEX map 7 immediate forms and their EVEX / APX map 4 and 7 forms. The host lists the MSRs a program
+  may touch with `set_user_msr(index, value, writable)` (16 entries); any other index, or a write to a read-only one, is #GP(0). IA32_USER_MSR_CTL and its permission bitmap are not modelled.
   Exceptions delivered to a Windows program save the XMM halves of vector state in the `CONTEXT` in memory, not the upper halves (the emulator keeps those itself).
 - **Checked against the real thing**: `tests/AvxTest.cpp` assembles about 1,400 instruction forms with `llvm-mc` (`tests/data/emulation/avx_cases_gen.py`), runs each on the host
   and on the emulator from the same random state (80,000+ comparisons per run: all vector registers, written general registers, flags, MXCSR flags except DE, the memory operand)

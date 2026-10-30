@@ -94,6 +94,9 @@ class X86_64Cpu final : public IGuestCpu {
   uint64_t shadow_stack_pointer() const { return cet_.ssp; }
   void set_pasid(uint32_t pasid) { pasid_ = pasid & 0xFFFFF; }
   void clear_pasid() { pasid_ = -1; }
+  // The user-accessible MSRs (urdmsr / uwrmsr): the host lists the ones a program may touch. Any other index is #GP(0). Returns false when the table is full.
+  bool set_user_msr(uint32_t index, uint64_t value, bool writable);
+  bool user_msr(uint32_t index, uint64_t* value) const;
   // AMD LWP: true once the ring buffer fill reached the threshold with threshold interrupts enabled (the host delivers the interrupt, if it wants one); reading clears it.
   bool take_lwp_interrupt() { const bool pending = lwp_interrupt_; lwp_interrupt_ = false; return pending; }
 
@@ -214,6 +217,7 @@ class X86_64Cpu final : public IGuestCpu {
   Step incssp_instruction(GuestMemory& m);
   Step wrss_instruction(GuestMemory& m, bool user);
   Step enqcmd_instruction(GuestMemory& m, bool supervisor);
+  Step user_msr_instruction(bool write, bool use_immediate, uint32_t immediate);      // urdmsr, uwrmsr (the register forms and the VEX / EVEX map 7 immediate forms)
   Step lwp_instruction(GuestMemory& m, uint32_t map, uint32_t vvvv);      // AMD LWP: llwpcb, slwpcb (XOP map 9), lwpins, lwpval (map A)
   bool lwp_flush(GuestMemory& m);
   bool lwp_insert(GuestMemory& m, uint8_t event_id, uint16_t flags, uint32_t data1, uint64_t instruction_address, uint64_t data2, bool* full);
@@ -311,8 +315,25 @@ class X86_64Cpu final : public IGuestCpu {
   };
   Lwp lwp_;
   bool lwp_interrupt_ = false;
+  // The data cache model behind LWP's DCache miss event, tracked only while such a session runs: a 32 KiB 8-way L1 and a 128 KiB 16-way second level, 64-byte lines, LRU. A tag of 0 is an empty
+  // way. The misses of the instruction being executed wait in dme_pending_ until it retires.
+  struct Dcache {
+    uint64_t l1_tag[64][8] = {};
+    uint32_t l1_age[64][8] = {};
+    uint32_t l2_tag[128][16] = {};
+    uint32_t l2_age[128][16] = {};
+    uint32_t clock = 0;
+  };
+  struct DcacheMiss { uint64_t address = 0; uint32_t latency = 0, source = 0; };
+  Dcache dcache_;
+  DcacheMiss dme_pending_[8];
+  uint32_t dme_count_ = 0;
+  bool dcache_on_ = false;
+  void cache_access(uint64_t address, uint32_t size, bool is_load);
   struct Cet { bool enabled = false, wrss = false; uint64_t ssp = 0; };
   Cet cet_;
+  struct UserMsr { bool present = false, writable = false; uint32_t index = 0; uint64_t value = 0; };
+  UserMsr user_msrs_[16];
   int64_t pasid_ = -1;      // IA32_PASID: the PASID, or -1 while its valid bit is clear
   uint16_t selector_[6] = {0x2B, 0x33, 0x2B, 0x2B, 0x2B, 0x2B};      // es cs ss ds fs gs
   State s_;
