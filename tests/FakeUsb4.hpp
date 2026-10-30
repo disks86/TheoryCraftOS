@@ -65,7 +65,7 @@ class Fabric {
   ~Fabric() { chip_.config_model = nullptr; }
 
   // A router with `lane_pairs` pairs of lane adapters (the first pair's first adapter is the upstream one unless it is the host), `pcie_down` PCIe down adapters and a PCIe up adapter if asked.
-  Router& add(uint64_t route, uint32_t lane_pairs, uint32_t pcie_down, bool pcie_up, bool host = false, uint32_t usb3_down = 0, bool usb3_up = false) {
+  Router& add(uint64_t route, uint32_t lane_pairs, uint32_t pcie_down, bool pcie_up, bool host = false, uint32_t usb3_down = 0, bool usb3_up = false, uint32_t dp_in = 0, uint32_t dp_out = 0) {
     std::unique_ptr<Router> r(new Router);
     r->route = route;
     r->upstream = 1;
@@ -80,6 +80,8 @@ class Fabric {
     }
     for (uint32_t i = 0; i < usb3_down; ++i) r->ports.push_back(usb3(++n, kTypeUsb3Down));
     if (usb3_up) r->ports.push_back(usb3(++n, kTypeUsb3Up));
+    for (uint32_t i = 0; i < dp_in; ++i) { Port p = adapter(++n, kTypeDpIn); p.space[0x10 + kDpLocalCap] = (3u << kDpCommonRateShift) | (2u << kDpCommonLanesShift); r->ports.push_back(p); }      // HBR3, four lanes
+    for (uint32_t i = 0; i < dp_out; ++i) { Port p = adapter(++n, kTypeDpOut); p.space[0x10 + kDpLocalCap] = (2u << kDpCommonRateShift) | (1u << kDpCommonLanesShift); r->ports.push_back(p); }     // HBR2, two lanes
     r->max_port = n;
     r->regs[6] = (1u << 18);                                     // ROUTER_CS_6.HCI: it has an xHCI
     r->regs[7] = 0xA0A0A0A0u + static_cast<uint32_t>(route);
@@ -102,7 +104,7 @@ class Fabric {
     r.regs[0x28] = 0x30 | (kSwitchCapVse << 8) | (kVsecPlugEvents << 16) | (0x10u << 24);
     r.regs[0x30] = (kSwitchCapVse << 8) | (kVsecLinkController << 16);
     r.regs[0x31] = 0;                                                                    // next: none, length: left zero
-    r.regs[0x30 + kLcDesc] = (4u << 8) | (4u << 16);
+    r.regs[0x30 + kLcDesc] = 4u | (4u << 8) | (4u << 16);
     for (uint32_t phys = 0; phys < 4; ++phys) r.regs[0x30 + 4 + phys * 4 + kLcPortAttr] |= kLcPortAttrBe;
     for (Port& p : r.ports) {
       if (p.type != kTypePort) continue;
@@ -145,6 +147,9 @@ class Fabric {
   }
   bool tmu_ucap = true;                                          // new routers support the uni-directional TMU mode
   bool refuse_sleep = false;                                     // ROUTER_CS_6.SLPR never comes up
+  bool gen4_links = false;                                       // every link runs at generation 4 and reports asymmetric widths as asked
+  bool asym_stuck = false;                                       // the transition never completes
+  bool dp_handshake_never_done = false;                         // CMHS stays set
   bool no_usb3_ack = false;                                      // the USB 3 adapter never grants the connection manager its request
   bool bond_never_completes = false;                             // the link keeps reporting one lane
   uint32_t fail_hop_writes = 0;                                  // the next hop table writes get an error
@@ -166,7 +171,7 @@ class Fabric {
     p.space[0x10] = 0x20 | (kPortCapPhy << 8) | (2u << 20);       // the lane adapter capability, next at 0x20; it supports two lanes
     p.space[0x20] = 0x40 | (kPortCapUsb4 << 8);                   // the USB4 capability, next the TMU one
     p.space[0x40] = (kPortCapTime1 << 8);
-    p.space[0x20 + kPortCs18] = kPortCs18Be;                      // bonding enabled
+    p.space[0x20 + kPortCs18] = kPortCs18Be | kPortCs18Csa;       // bonding and asymmetric links supported
     return p;
   }
   static Port usb3(uint32_t number, uint32_t type) {
@@ -304,7 +309,11 @@ class Fabric {
     Port& p = r.ports[port];
     if (i == 0x11 && p.type == kTypePort) {                                            // the lane adapter's second dword (PHY capability at 0x10)
       const bool dual = (p.space[0x11] & kLaneCs1TargetWidthMask) == kLaneCs1TargetDual && !bond_never_completes;
-      return (p.space[0x11] & (kLaneCs1TargetWidthMask | kLaneCs1Lb)) | (p.state << 26) | ((dual ? 2u : 1u) << kLaneCs1CurrentWidthShift);
+      const uint32_t asym = p.space[0x11] & kLaneCs1TargetAsymMask;
+      uint32_t width = dual ? 2u : 1u;
+      if (gen4_links) width = asym == kLaneCs1TargetAsymTx ? 4u : asym == kLaneCs1TargetAsymRx ? 8u : (dual || width == 2 ? 2u : (bond_never_completes ? 1u : 2u));
+      if (asym_stuck) width = 2u;
+      return (p.space[0x11] & (kLaneCs1TargetWidthMask | kLaneCs1Lb | kLaneCs1TargetAsymMask)) | (p.state << 26) | (width << kLaneCs1CurrentWidthShift) | ((gen4_links ? kLaneSpeedGen4 : kLaneSpeedGen3) << kLaneCs1CurrentSpeedShift);
     }
     return p.space[i];
   }
@@ -313,6 +322,14 @@ class Fabric {
     if (i == 4 && p.type == kTypePort) {                                               // ADP_CS_4: the lock bit
       p.space[4] = v;
       if (!(v & kAdpCs4Lck)) p.locked = false;
+      return;
+    }
+    if (p.type == kTypePort && i == 0x20 + 0x13 && (v & kPortCs19StartAsym)) {         // the transition starts and ends at once
+      p.space[i] = v & ~kPortCs19StartAsym;
+      return;
+    }
+    if (p.type == kTypeDpOut && i == 0x10 + kDpStatusCtrl) {                            // the connection manager handshake completes at once
+      p.space[i] = dp_handshake_never_done ? v : (v & ~kDpStatusCtrlCmhs);
       return;
     }
     if (p.type == kTypeUsb3Down || p.type == kTypeUsb3Up) {
