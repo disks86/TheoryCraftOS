@@ -49,10 +49,12 @@ constexpr uint32_t kUsb3Cs0Pe = 1u << 31, kUsb3Cs1 = 1, kUsb3Cs1Hca = 1u << 31, 
 // capabilities of a port (TB_PORT_CAP_*) and of a router
 constexpr uint8_t kPortCapPhy = 0x01, kPortCapAdapter = 0x04, kPortCapUsb4 = 0x06;
 // router configuration space
-constexpr uint32_t kRouterCs1 = 1, kRouterCs5 = 5, kRouterCs6 = 6, kRouterCs7 = 7;
-constexpr uint32_t kCs5Pto = 1u << 25, kCs5Hco = 1u << 26, kCs5Slp = 1u << 0, kCs5Cns = 1u << 23, kCs5Cv = 1u << 31, kCs6Slpr = 1u << 0, kCs6Hci = 1u << 18, kCs6Cr = 1u << 25;
+constexpr uint32_t kRouterCs1 = 1, kRouterCs5 = 5, kRouterCs6 = 6, kRouterCs7 = 7, kRouterCs9 = 9, kRouterCs25 = 25, kRouterCs26 = 26;
+// router operations (ROUTER_CS_26): the opcode in the low half, OV (the operation is valid / still running), ONS (not supported) and the status
+constexpr uint32_t kCs26Ov = 1u << 31, kCs26Ons = 1u << 30, kCs26StatusShift = 24, kCs26StatusMask = 0x3Fu << 24, kOpDromRead = 0x24, kOpDataDwords = 16;
+constexpr uint32_t kCs5Pto = 1u << 25, kCs5Hco = 1u << 26, kCs5Slp = 1u << 0, kCs5Wop = 1u << 1, kCs5Wou = 1u << 2, kCs5Wod = 1u << 3, kCs5Cns = 1u << 23, kCs5Cv = 1u << 31, kCs6Slpr = 1u << 0, kCs6Hci = 1u << 18, kCs6Cr = 1u << 25;
 // adapter registers (relative to the adapter capability, except ADP_CS_4 and ADP_CS_5 which are in the port header)
-constexpr uint32_t kAdpCs4 = 4, kAdpCs4Lck = 1u << 31, kAdpCs5 = 5, kAdpCs5Dhp = 1u << 31, kPortCs19 = 0x13, kPortCs19Pc = 1u << 3, kPortCs19Pid = 1u << 4, kAdpPcieCs0 = 0, kAdpPcieCs0Pe = 1u << 31;
+constexpr uint32_t kAdpCs4 = 4, kAdpCs4Lck = 1u << 31, kAdpCs5 = 5, kAdpCs5Dhp = 1u << 31, kPortCs19 = 0x13, kPortCs19Pc = 1u << 3, kPortCs19Pid = 1u << 4, kPortCs19Woc = 1u << 16, kPortCs19Wod = 1u << 17, kPortCs19Wou4 = 1u << 18, kAdpPcieCs0 = 0, kAdpPcieCs0Pe = 1u << 31;
 // port states (the lane adapter's)
 constexpr uint32_t kPortDisabled = 0, kPortConnecting = 1, kPortUp = 2, kPortTxCl0s = 3, kPortRxCl0s = 4, kPortCl1 = 5, kPortCl2 = 6, kPortUnplugged = 7;
 // limits
@@ -82,6 +84,8 @@ struct Usb4Router {
   uint16_t vendor_id = 0, device_id = 0;
   uint8_t usb4_version = 0;          // major version (1, 2), 0 for a router of the Thunderbolt 3 kind
   uint64_t uid = 0;
+  char vendor_name[48] = {}, device_name[48] = {};      // from the DROM
+  bool drom = false;
   int16_t parent = -1;               // the router above it and the port of that one it hangs from
   uint8_t parent_port = 0;
   bool configured = false;
@@ -154,8 +158,11 @@ class Usb4Domain final : public IThunderboltEvents, public IXdomainHost, private
   // Sleep (tb_suspend): every tunnel is taken down and each router told to sleep, the ones farthest from the host first (ROUTER_CS_5.SLP, waiting for SLPR), and the topology is forgotten.
   // resume() starts afresh - the host router is configured again and everything below it found again, the links having come up on their own - so no tunnel is restored: they are approved
   // again. False if the host router would not go to sleep (the topology is forgotten all the same, and resume() works).
-  bool suspend();
+  // `runtime`: a short sleep while the machine runs (only with nothing tunnelled and no other host on the cable): the routers are told to wake the host for a device that is plugged in or
+  // pulled out, a link that comes up as USB4, and PCIe, USB 3 or DisplayPort traffic (usb4_switch_set_wake with all the flags).
+  bool suspend(bool runtime = false);
   bool resume(const char** error);
+  bool runtime_allowed() const;
   bool suspended() const { return suspended_; }
 
   // Other hosts on the cable (IXdomainHost): a lane adapter whose link is up and behind which no router answers is taken for one, its UUID and properties are asked for in poll(), the
@@ -185,6 +192,8 @@ class Usb4Domain final : public IThunderboltEvents, public IXdomainHost, private
   // Numbers that tests and the log want.
   uint32_t events_seen() const { return events_seen_; }
   uint32_t unreachable_links() const { return unreachable_; }
+  // Reads and parses a router's DROM (names, which ports are unused, which lane adapters belong together); a router without one keeps the defaults. Done for every router found.
+  bool read_drom(Usb4Router& r);
 
  private:
   struct Plug {
@@ -206,6 +215,9 @@ class Usb4Domain final : public IThunderboltEvents, public IXdomainHost, private
   bool init_ports(Usb4Router& r);
   void link_lane_adapters(Usb4Router& r);
   bool port_up(const Usb4Router& r, uint32_t port);
+  // A router operation (usb4_native_switch_op): metadata and data in, the opcode written, the answer waited for. `status` is the operation's own result; false if the router does not support it.
+  bool router_op(const Usb4Router& r, uint32_t opcode, uint32_t* metadata, uint8_t* status, const uint32_t* tx, uint32_t tx_dwords, uint32_t* rx, uint32_t rx_dwords);
+  bool drom_read(const Usb4Router& r, uint32_t address, ByteView out);
   void scan_router(int index);
   void scan_port(int index, uint32_t port);
   void remove_router(int index);
@@ -215,7 +227,8 @@ class Usb4Domain final : public IThunderboltEvents, public IXdomainHost, private
   bool configuration_valid(Usb4Router& r);
   bool switch_setup(Usb4Router& child, const Usb4Router& parent);
   void close_preboot_tunnels();
-  bool put_to_sleep(Usb4Router& r);
+  bool put_to_sleep(Usb4Router& r, bool runtime);
+  bool set_wake(Usb4Router& r, bool runtime);
   void process_plug(const Plug& plug);
   void ack_plug(const Plug& plug);
   int find_router(uint64_t route) const;

@@ -2982,7 +2982,7 @@ static void test_usb4_driver() {
   // (the rig's control channel is not started here: the driver makes its own on the same chip)
   rig.control.stop();
   CHECK(driver.start_device(rig.chip, nullptr, TbGeneration::Usb4, nullptr) == ThunderboltDriver::Outcome::Started);
-  CHECK(!driver.icm() && driver.usb4() && driver.usb4()->present_count() == 3 && driver.device_count() == 2 && driver.xdomain_count() == 0 && !driver.runtime_allowed());
+  CHECK(!driver.icm() && driver.usb4() && driver.usb4()->present_count() == 3 && driver.device_count() == 2 && driver.xdomain_count() == 0 && driver.runtime_allowed());
   // plug events go through poll()
   rig.fabric.unlink(0, 1, 0x01);
   rig.chip.send_plug_event(0, 1, true);
@@ -2996,7 +2996,7 @@ static void test_usb4_driver() {
   rig.fabric.link(0, 1, 0x01);
   rig.chip.send_plug_event(0, 1, false);
   driver.poll();
-  CHECK(driver.device_count() == 2 && !driver.runtime_suspend(false) && driver.suspend(false) && driver.device_count() == 0 && driver.usb4()->suspended());
+  CHECK(driver.device_count() == 2 && driver.runtime_allowed() && driver.suspend(false) && driver.device_count() == 0 && driver.usb4()->suspended());
   for (uint64_t route : {0ull, 0x01ull, 0x301ull}) rig.fabric.at(route).regs[5] &= ~kCs5Slp, rig.fabric.at(route).regs[6] &= ~kCs6Slpr;
   CHECK(driver.resume() == ThunderboltDriver::Outcome::Started && driver.device_count() == 2);
   driver.stop();
@@ -3191,6 +3191,15 @@ static void test_usb4_xdomain() {
     const auto rx = host.ports[3].hops[rig.chip.peer.path];
     CHECK((rx.first & (1u << 31)) && ((rx.first >> 11) & 0x3F) == 7 && (rx.first & 0x7FF) == 1 && ((rx.first >> 17) & 0x7F) == 14);       // into NHI ring 1; the lane adapter's 40 buffers less the control path's 2 is more than the 14 a DMA path takes
     CHECK((rx.second & (1u << 24)) && !(rx.second & (1u << 25)));
+    // frames both ways over the rings the paths end in: the other host sends into the ring our receive path ends in, our frames leave from the ring our transmit path starts in
+    rig.chip.peer.rx_ring = rx.first & 0x7FF;
+    const std::vector<uint8_t> incoming = ethernet(200, 3);
+    rig.chip.peer_send(incoming, 7);
+    uint8_t buffer[2000];
+    uint32_t length = 0;
+    CHECK(net->receive(ByteView(buffer, sizeof buffer), &length) && length == incoming.size() && memcmp(buffer, incoming.data(), length) == 0);
+    const std::vector<uint8_t> outgoing = ethernet(100, 9);
+    CHECK(net->transmit(ConstByteView(outgoing.data(), outgoing.size())) && rig.chip.sent.back().hop == 1 && rig.chip.sent.back().bytes.size() == 12 + outgoing.size());
     // an unplug: the host is forgotten, the paths come down, the adapter is released
     rig.fabric.unlink_host(0, 3);
     rig.chip.send_plug_event(0, 3, true);
@@ -3228,6 +3237,113 @@ static void test_usb4_xdomain_failures() {
   CHECK(domain.approve_xdomain_paths(0, 9, 1, 10, 2, &error));
   // sleep forgets the hosts
   CHECK(domain.suspend() && domain.xdomains_present() == 0 && !(host.ports[7].hops[1].first & (1u << 31)));
+}
+
+static void test_usb4_runtime_sleep() {
+  Usb4Rig rig;
+  Usb4Domain domain(rig.control, rig.nhi, rig.alloc);
+  const char* error = nullptr;
+  CHECK(!domain.runtime_allowed() && !domain.suspend(true));                              // not started
+  CHECK(domain.start(nullptr) && domain.runtime_allowed());
+  // a tunnel keeps it awake
+  CHECK(domain.approve_pcie(1, &error) && !domain.runtime_allowed() && !domain.suspend(true) && !domain.suspended());
+  CHECK(domain.disconnect_pcie(1) && domain.runtime_allowed());
+  CHECK(domain.suspend(true) && domain.suspended());
+  fake_usb4::Router& host = rig.fabric.at(0);
+  fake_usb4::Router& d1 = rig.fabric.at(0x01);
+  // the host's link to the dock is configured: wake on disconnect and USB4; the link with nothing on it: wake on connect; the NHI side is left alone
+  const uint32_t link_a = host.ports[1].space[0x20 + kPortCs19], link_b = host.ports[3].space[0x20 + kPortCs19];
+  CHECK((link_a & kPortCs19Wod) && (link_a & kPortCs19Wou4) && !(link_a & kPortCs19Woc));
+  CHECK((link_b & kPortCs19Woc) && !(link_b & kPortCs19Wod));
+  // the dock: its upstream adapter wakes on USB4, its router on PCIe, USB 3 and DisplayPort traffic
+  CHECK((d1.ports[1].space[0x20 + kPortCs19] & kPortCs19Wou4) && (d1.ports[3].space[0x20 + kPortCs19] & kPortCs19Wod));
+  CHECK((d1.regs[5] & (kCs5Wop | kCs5Wou | kCs5Wod)) == (kCs5Wop | kCs5Wou | kCs5Wod) && !(host.regs[5] & (kCs5Wop | kCs5Wou | kCs5Wod)));
+  // a system sleep arms no wake
+  for (uint64_t route : {0ull, 0x01ull, 0x301ull}) rig.fabric.at(route).regs[5] = 0, rig.fabric.at(route).regs[6] = 0;
+  CHECK(domain.resume(&error) && domain.present_count() == 3 && domain.suspend(false));
+  CHECK(!(d1.regs[5] & kCs5Wop));
+  // another host on the cable keeps it awake too
+  for (uint64_t route : {0ull, 0x01ull, 0x301ull}) rig.fabric.at(route).regs[5] = 0, rig.fabric.at(route).regs[6] = 0;
+  rig.fabric.link_host(0, 3);
+  CHECK(domain.resume(&error) && domain.xdomains_present() == 1 && !domain.runtime_allowed() && !domain.suspend(true));
+}
+
+// A USB4 DROM (revision 3, entries from byte 16): the header, a vendor name, a device name, port entries.
+static std::vector<uint8_t> make_drom(const char* vendor, const char* device, const std::vector<std::vector<uint8_t>>& ports) {
+  std::vector<uint8_t> entries;
+  auto text = [&](uint8_t index, const char* s) {
+    const size_t n = strlen(s);
+    entries.push_back(static_cast<uint8_t>(2 + n));
+    entries.push_back(index);
+    entries.insert(entries.end(), s, s + n);
+  };
+  text(1, vendor);
+  text(2, device);
+  for (const auto& p : ports) entries.insert(entries.end(), p.begin(), p.end());
+  std::vector<uint8_t> rom(16, 0);
+  const uint32_t data_len = static_cast<uint32_t>(16 + entries.size() - 13);
+  rom[13] = 3;
+  rom[14] = static_cast<uint8_t>(data_len);
+  rom[15] = static_cast<uint8_t>(data_len >> 8);
+  rom.insert(rom.end(), entries.begin(), entries.end());
+  return rom;
+}
+static std::vector<uint8_t> drom_port(uint8_t index, bool disabled, uint8_t link_nr, int dual) {
+  return {8, static_cast<uint8_t>(index | (disabled ? 0x40 : 0) | 0x80), static_cast<uint8_t>((link_nr << 4) | (dual >= 0 ? 0x80 : 0)), static_cast<uint8_t>(dual >= 0 ? dual : 0), 0, 0, 0, 0};
+}
+
+static void test_usb4_drom() {
+  {   // names, an unused port, the pairing of lane adapters
+    Usb4Rig rig;
+    rig.fabric.at(0x01).drom = make_drom("Acme", "Dock 9000", {drom_port(1, false, 0, 2), drom_port(2, false, 1, 1), drom_port(3, false, 0, 4), drom_port(4, true, 1, 3)});
+    Usb4Domain domain(rig.control, rig.nhi, rig.alloc);
+    CHECK(domain.start(nullptr));
+    const Usb4Router& d1 = *domain.router(1);
+    CHECK(d1.drom && strcmp(d1.vendor_name, "Acme") == 0 && strcmp(d1.device_name, "Dock 9000") == 0);
+    CHECK(!d1.ports[1].disabled && d1.ports[4].disabled && d1.ports[1].dual_link == 2 && d1.ports[2].link_nr == 1 && d1.ports[3].dual_link == 4);
+    CHECK(!domain.router(0)->drom && domain.router(0)->vendor_name[0] == 0);                       // the host router has none in this model
+    CHECK(rig.fabric.at(0x01).drom_reads >= 2 && domain.present_count() == 3);
+    // a disabled lane adapter is not followed: D2 hangs from D1's port 3 and is still found
+    CHECK(domain.router(2) != nullptr);
+  }
+  {   // a disabled downstream lane adapter is skipped
+    Usb4Rig rig;
+    rig.fabric.at(0x01).drom = make_drom("Acme", "Dock", {drom_port(3, true, 0, -1)});
+    Usb4Domain domain(rig.control, rig.nhi, rig.alloc);
+    CHECK(domain.start(nullptr) && domain.router(1)->ports[3].disabled && domain.present_count() == 2);
+  }
+  {   // damaged ROMs: every cut and every flipped bit of a good one, a short entry, one that runs over the end, a zero length, the wrong revision, an operation that fails
+    Usb4Rig probe(false);
+    const std::vector<uint8_t> good = make_drom("Acme", "Dock", {drom_port(1, false, 0, 2), drom_port(2, false, 1, 1)});
+    for (size_t cut = 0; cut <= good.size(); ++cut) {
+      Usb4Rig rig(false);
+      rig.fabric.at(0x01).drom.assign(good.begin(), good.begin() + cut);
+      Usb4Domain domain(rig.control, rig.nhi, rig.alloc);
+      CHECK(domain.start(nullptr) && domain.present_count() == 2);                               // (a bad DROM never costs the router)
+    }
+    for (size_t bit = 0; bit < good.size() * 8; bit += 3) {
+      Usb4Rig rig(false);
+      rig.fabric.at(0x01).drom = good;
+      rig.fabric.at(0x01).drom[bit / 8] ^= static_cast<uint8_t>(1u << (bit % 8));
+      Usb4Domain domain(rig.control, rig.nhi, rig.alloc);
+      CHECK(domain.start(nullptr) && domain.present_count() == 2);
+    }
+    std::vector<uint8_t> zero = good;
+    zero[16] = 0;
+    std::vector<uint8_t> wrong = good;
+    wrong[13] = 1;
+    for (const auto& rom : {zero, wrong}) {
+      Usb4Rig rig(false);
+      rig.fabric.at(0x01).drom = rom;
+      Usb4Domain domain(rig.control, rig.nhi, rig.alloc);
+      CHECK(domain.start(nullptr) && !domain.router(1)->drom && domain.router(1)->vendor_name[0] == 0);
+    }
+    Usb4Rig failing(false);
+    failing.fabric.at(0x01).drom = good;
+    failing.fabric.at(0x01).drom_status = 1;
+    Usb4Domain domain(failing.control, failing.nhi, failing.alloc);
+    CHECK(domain.start(nullptr) && !domain.router(1)->drom && domain.present_count() == 2);
+  }
 }
 
 static void test_usb4_garbage() {
@@ -3278,6 +3394,8 @@ int main() {
   test_usb4_usb3();
   test_usb4_sleep();
   test_usb4_xdomain();
+  test_usb4_drom();
+  test_usb4_runtime_sleep();
   test_usb4_xdomain_failures();
   test_usb4_driver();
   test_usb4_garbage();

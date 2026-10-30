@@ -48,6 +48,9 @@ struct Router {
   uint32_t regs[64] = {};
   std::vector<Port> ports;           // index 0 is the control adapter
   uint32_t cs5_writes = 0;
+  std::vector<uint8_t> drom;         // what DROM_READ gives (none: the operation is not supported)
+  uint32_t drom_status = 0;          // the status the operation ends with
+  uint32_t drom_reads = 0;
 };
 
 class Fabric {
@@ -238,6 +241,24 @@ class Fabric {
     if (i == 1) r.regs[1] = (r.regs[1] & ~0x00700000u) | (v & 0x00700000u) , r.upstream = (v >> 8) & 0x3F;
     else if (i == 4) r.regs[4] = v & 0x00FFFFFFu;
     else r.regs[i] = v;
+    if (i == 26 && (v & kCs26Ov)) {                                                    // a router operation
+      if ((v & 0xFFFF) == kOpDromRead && !r.drom.empty()) {
+        ++r.drom_reads;
+        const uint32_t dwords = (r.regs[25] >> 15) & 0x1F, dwaddress = (r.regs[25] >> 2) & 0x1FFF;
+        for (uint32_t d = 0; d < dwords && d < 16; ++d) {
+          uint32_t word = 0;
+          for (uint32_t k = 0; k < 4; ++k) {
+            const size_t at = (dwaddress + d) * 4 + k;
+            word |= uint32_t{at < r.drom.size() ? r.drom[at] : uint8_t{0}} << (8 * k);
+          }
+          r.regs[9 + d] = word;
+        }
+        r.regs[26] = (r.drom_status << kCs26StatusShift);
+      } else {
+        r.regs[26] = kCs26Ons;
+      }
+      return;
+    }
     if (i == 5) {
       ++r.cs5_writes;
       if ((v & kCs5Slp) && !refuse_sleep) r.regs[6] |= kCs6Slpr;
