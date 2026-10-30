@@ -35,6 +35,34 @@ uint32_t header(ByteWriter& w, uint8_t code) {
 TbSecurityLevel security_of(uint32_t value) { return value <= 5 ? static_cast<TbSecurityLevel>(value) : TbSecurityLevel::Unknown; }
 }  // namespace
 
+uint32_t build_get_topology(ByteView out) {
+  ByteWriter w(out);
+  header(w, kGetTopology);
+  return w.ok() ? static_cast<uint32_t>(w.position()) : 0;
+}
+
+bool parse_topology_packet(ConstByteView packet, TbTopologySwitch* out) {
+  if (packet.size() < kTopologyBytes) return false;
+  ByteReader r(packet);
+  const uint8_t code = r.u8();
+  r.skip(3);
+  const uint32_t route_lo = r.le32(), route_hi = r.le32();
+  const uint8_t first_data = r.u8();
+  r.skip(1);                                  // second_data
+  r.skip(1);                                  // the DROM's I2C address index
+  const uint8_t switch_index = r.u8();
+  r.skip(8);
+  TbTopologySwitch t;
+  for (uint32_t i = 0; i < 16; ++i) t.ports[i] = r.le32();
+  if (!r.ok() || code != kGetTopology) return false;
+  t.used = (first_data & 1) != 0;
+  t.upstream_port = static_cast<uint8_t>(first_data >> 1);
+  t.switch_index = switch_index;
+  t.route = (static_cast<uint64_t>(route_hi & 0x3FFFFF) << 32) | route_lo;
+  *out = t;
+  return true;
+}
+
 uint32_t build_driver_ready(ByteView out) {
   ByteWriter w(out);
   header(w, kDriverReady);
@@ -309,14 +337,63 @@ bool ThunderboltIcm::approve(uint64_t index, const char** error) {
   return true;
 }
 
+bool ThunderboltIcm::topology(List<TbTopologySwitch>& out) {
+  out.clear();
+  if (outcome_ != Outcome::Started) return false;
+  uint8_t request_bytes[tb_icm::kHeaderBytes], responses[tb_icm::kTopologyPackets * tb_icm::kTopologyBytes];
+  const uint32_t n = tb_icm::build_get_topology(ByteView(request_bytes, sizeof request_bytes));
+  uint32_t total = 0;
+  bool ok = false;
+  for (uint32_t attempt = 0; attempt <= kRetries && !ok; ++attempt) {
+    const TbControl::Result result = control_.icm_request_packets(ConstByteView(request_bytes, n), ByteView(responses, sizeof responses), tb_icm::kTopologyBytes, tb_icm::kTopologyPackets,
+                                                                  kRequestTimeoutUs, this, &total);
+    if (result == TbControl::Result::Ok) ok = true;
+    else if (result != TbControl::Result::Timeout) return false;
+  }
+  if (!ok) return false;
+  for (uint32_t i = 0; i < total; ++i) {
+    TbTopologySwitch t;
+    if (!tb_icm::parse_topology_packet(ConstByteView(responses + i * tb_icm::kTopologyBytes, tb_icm::kTopologyBytes), &t) || !out.push_back(t)) {
+      out.clear();
+      return false;
+    }
+  }
+  return true;
+}
+
+bool ThunderboltIcm::route_in_topology(const List<TbTopologySwitch>& switches, uint8_t link, uint8_t depth, uint64_t* route) {
+  if (switches.count() == 0 || depth == 0) return false;
+  uint32_t index = switches[0].behind(link);
+  if (index == 0 || index >= switches.count()) return false;
+  const TbTopologySwitch* sw = &switches[index];
+  for (uint8_t i = 1; i < depth; ++i) {
+    if (!sw->used) return false;
+    const TbTopologySwitch* next = nullptr;
+    for (uint32_t port = 0; port < 16; ++port) {
+      const uint32_t behind = sw->behind(port);
+      if (behind > sw->switch_index && behind < switches.count()) {
+        next = &switches[behind];
+        break;
+      }
+    }
+    if (!next) return false;                  // (Linux keeps the router when none follows; a route to the wrong router is worse than none)
+    sw = next;
+  }
+  *route = sw->route;
+  return true;
+}
+
 bool ThunderboltIcm::route(uint64_t index, uint64_t* route) {
   if (outcome_ != Outcome::Started || index >= devices_.count()) return false;
   const TbDevice device = devices_[index];
   uint8_t request_bytes[tb_icm::kGetRouteBytes], response[tb_icm::kGetRouteResponseBytes];
   const uint32_t n = tb_icm::build_get_route(device.link, device.depth, ByteView(request_bytes, sizeof request_bytes));
-  if (n == 0 || !request(ConstByteView(request_bytes, n), ByteView(response, sizeof response), kRequestTimeoutUs)) return false;
-  if (tb_icm::response_flags(ConstByteView(response, sizeof response)) & tb_icm::kFlagError) return false;
-  return tb_icm::parse_get_route(ConstByteView(response, sizeof response), route);
+  if (n != 0 && request(ConstByteView(request_bytes, n), ByteView(response, sizeof response), kRequestTimeoutUs) && !(tb_icm::response_flags(ConstByteView(response, sizeof response)) & tb_icm::kFlagError) &&
+      tb_icm::parse_get_route(ConstByteView(response, sizeof response), route))
+    return true;
+  // a firmware without GET_ROUTE (Falcon Ridge) shows the routes in its topology
+  List<TbTopologySwitch> switches(allocator_);
+  return topology(switches) && route_in_topology(switches, device.link, device.depth, route);
 }
 
 }  // namespace hardware

@@ -152,7 +152,17 @@ void TbControl::complete(TbPacketType type, ConstByteView body) {
   pending_.done = true;
   pending_.result = Result::Ok;
   if (!pending_.config) {
-    pending_.out.copy_from(body.first(pending_.out.size()));
+    // packet `id` of `total` goes to its place; the request is done when all of them are there
+    const uint32_t id = load_le32(body, 0) >> 16 & 0xFF, total = load_le32(body, 0) >> 24;
+    const uint32_t packet_bytes = pending_.expected_bytes;
+    if (total == 0 || total > pending_.packets || id >= total || (pending_.total != 0 && total != pending_.total) || (pending_.received_mask >> id & 1)) {
+      pending_.done = false;                     // not one of ours after all
+      return;
+    }
+    pending_.total = total;
+    pending_.received_mask |= 1u << id;
+    pending_.out.subview(static_cast<uint64_t>(id) * packet_bytes, packet_bytes).copy_from(body.first(packet_bytes));
+    pending_.done = pending_.received_mask == (total == 32 ? ~0u : (1u << total) - 1);
     return;
   }
   if (type == TbPacketType::Error) {
@@ -230,20 +240,27 @@ TbControl::Result TbControl::wait(uint32_t timeout_us, IThunderboltEvents* event
 }
 
 TbControl::Result TbControl::icm_request(ConstByteView request, ByteView response, uint32_t timeout_us, IThunderboltEvents* events) {
+  return icm_request_packets(request, response, static_cast<uint32_t>(response.size()), 1, timeout_us, events);
+}
+
+TbControl::Result TbControl::icm_request_packets(ConstByteView request, ByteView responses, uint32_t packet_bytes, uint32_t packets, uint32_t timeout_us, IThunderboltEvents* events,
+                                                         uint32_t* total_packets) {
   if (!running_) return Result::NotRunning;
   uint8_t code = 0;
-  if (!request.try_get(0, &code)) return Result::Failed;
+  if (!request.try_get(0, &code) || packets == 0 || packets > 32 || packet_bytes == 0 || packet_bytes > tb_frame::kMaxBody || responses.size() / packets < packet_bytes) return Result::Failed;
   pending_ = Pending();
   pending_.active = true;
   pending_.config = false;
   pending_.code = code;
-  pending_.expected_bytes = static_cast<uint32_t>(response.size());
-  pending_.out = response;
+  pending_.expected_bytes = packet_bytes;
+  pending_.packets = packets;
+  pending_.out = responses;
   if (!send(TbPacketType::IcmCommand, request)) {
     pending_ = Pending();
     return Result::Failed;
   }
   const Result result = wait(timeout_us, events);
+  if (total_packets) *total_packets = pending_.total;
   pending_ = Pending();
   return result;
 }

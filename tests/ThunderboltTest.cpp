@@ -762,6 +762,90 @@ static void test_upstream_port() {
   CHECK([&] { FakePci empty; return !tb_find_upstream_port(empty, nhi, &port); }());
 }
 
+
+// ---- GET_TOPOLOGY: an answer in several packets
+
+static uint32_t lane_to(uint32_t router) { return 1u | (router << 24); }
+
+static void test_topology() {
+  TestAllocator alloc;
+  // host (0), a router behind port 1 (1), a router behind that one's port 2 (2), another behind port 3 of the host (3)
+  auto build = [](FakeNhi& chip) {
+    chip.topology.resize(4);
+    chip.topology[0].route = 0;
+    chip.topology[0].ports[1] = lane_to(1);
+    chip.topology[0].ports[3] = lane_to(3);
+    chip.topology[0].ports[2] = lane_to(0xFF);
+    chip.topology[1].route = 0x01;
+    chip.topology[1].ports[2] = lane_to(2);
+    chip.topology[2].route = 0x0201;
+    chip.topology[3].route = 0x03;
+    chip.topology[3].upstream = 5;
+  };
+  {
+    FakeNhi chip;
+    build(chip);
+    ThunderboltIcm icm(chip, alloc);
+    CHECK(icm.start() == ThunderboltIcm::Outcome::Started);
+    List<TbTopologySwitch> sw(alloc);
+    CHECK(icm.topology(sw) && sw.count() == 4);
+    CHECK(sw[1].route == 0x01 && sw[2].route == 0x0201 && sw[3].route == 0x03 && sw[3].upstream_port == 5 && sw[0].used && sw[2].switch_index == 2);
+    CHECK(sw[0].behind(1) == 1 && sw[0].behind(3) == 3 && sw[0].behind(2) == 0 && sw[0].behind(0) == 0 && sw[0].behind(16) == 0);
+    uint64_t route = 0;
+    CHECK(ThunderboltIcm::route_in_topology(sw, 1, 1, &route) && route == 0x01);
+    CHECK(ThunderboltIcm::route_in_topology(sw, 1, 2, &route) && route == 0x0201);
+    CHECK(ThunderboltIcm::route_in_topology(sw, 3, 1, &route) && route == 0x03);
+    CHECK(!ThunderboltIcm::route_in_topology(sw, 3, 2, &route) && !ThunderboltIcm::route_in_topology(sw, 2, 1, &route) && !ThunderboltIcm::route_in_topology(sw, 1, 0, &route) && !ThunderboltIcm::route_in_topology(sw, 1, 9, &route));
+    // packets in the other order give the same result
+    chip.topology_reversed = true;
+    CHECK(icm.topology(sw) && sw.count() == 4 && sw[2].route == 0x0201);
+    chip.topology_reversed = false;
+    // a packet that never comes: a timeout, nothing half filled
+    chip.topology_drop = 2;
+    CHECK(!icm.topology(sw) && sw.count() == 0);
+    chip.topology_drop = -1;
+    // a total larger than the buffer is not taken
+    chip.topology_total_override = 15;
+    CHECK(!icm.topology(sw));
+    chip.topology_total_override = 0;
+    // a firmware that answers GET_ROUTE gives the route; one that does not leaves the topology to answer
+    chip.send_device_connected(make_device(0x20, 1, 2));
+    icm.poll();
+    route = 0;
+    CHECK(icm.route(0, &route) && route == 1);
+    chip.answer_get_route = false;
+    CHECK(icm.route(0, &route) && route == 0x0201);
+    chip.send_device_connected(make_device(0x50, 3, 2));
+    icm.poll();
+    CHECK(!icm.route(1, &route));
+    chip.answer_topology = false;
+    CHECK(!icm.route(0, &route));
+  }
+  // a topology of one router, and an empty one
+  {
+    FakeNhi chip;
+    chip.topology.resize(1);
+    ThunderboltIcm icm(chip, alloc);
+    CHECK(icm.start() == ThunderboltIcm::Outcome::Started);
+    List<TbTopologySwitch> sw(alloc);
+    CHECK(icm.topology(sw) && sw.count() == 1);
+    chip.topology.clear();
+    CHECK(!icm.topology(sw));
+  }
+  // the parser: cut and flipped packets
+  uint8_t packet[152] = {};
+  packet[0] = 1;
+  packet[12] = 1 | (3 << 1);
+  packet[15] = 2;
+  TbTopologySwitch t;
+  CHECK(tb_icm::parse_topology_packet(ConstByteView(packet, 152), &t) && t.used && t.upstream_port == 3 && t.switch_index == 2);
+  for (size_t len = 0; len < 152; ++len) CHECK(!tb_icm::parse_topology_packet(ConstByteView(packet, len), &t));
+  packet[0] = 2;
+  CHECK(!tb_icm::parse_topology_packet(ConstByteView(packet, 152), &t));
+  uint8_t out[8];
+  CHECK(tb_icm::build_get_topology(ByteView(out, 8)) == 4 && out[0] == 1 && tb_icm::build_get_topology(ByteView(out, 3)) == 0);
+}
+
 static void test_driver() {
   TestAllocator alloc;
   {
@@ -823,6 +907,7 @@ int main() {
   test_firmware_start();
   test_port_reset();
   test_upstream_port();
+  test_topology();
   test_driver();
   printf(g_failed ? "ThunderboltTest: %d FAILED\n" : "ThunderboltTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
