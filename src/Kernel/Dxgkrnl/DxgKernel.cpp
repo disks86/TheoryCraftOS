@@ -36,6 +36,7 @@ struct AllocRec {
   SharedPointer<Allocation> allocation;
   Handle device = 0;
   bool locked = false, read_only = false;
+  bool acquired = false;   // lent out by acquire_image (and pinned)
 };
 struct ContextRec {
   SharedPointer<ContextObject> context;
@@ -532,6 +533,41 @@ NtStatus Kernel::unlock(ProcessId pid, Handle allocation) {
   if (!rec->read_only) rec->allocation->manager().note_cpu_write(*rec->allocation);
   rec->allocation->manager().lock_released(*rec->allocation);
   rec->locked = false;
+  return status::kSuccess;
+}
+
+NtStatus Kernel::acquire_image(ProcessId pid, Handle allocation, AcquiredImage* out) {
+  kernel::ScopedMutex g(lock_);
+  Process* p = find_process(pid);
+  AllocRec* rec = p ? p->allocations.raw(allocation) : nullptr;
+  if (!rec || !out) return status::kInvalidHandle;
+  Allocation& a = *rec->allocation;
+  if (!a.is_image() || a.is_depth() || a.is_staging() || !(a.desc().flags & kAllocTexture) || !(a.desc().flags & kAllocRenderTarget)) return status::kNotSupported;
+  if (rec->locked || rec->acquired) return status::kInvalidDeviceState;
+  Adapter* adapter = nullptr;
+  for (UniquePointer<Adapter>& ad : adapters_.view())
+    if (&ad->vidmm() == &a.manager()) adapter = ad.get();
+  if (!adapter) return status::kInvalidDeviceState;
+  adapter->pump();
+  if (adapter->allocation_in_use(a)) return status::kGraphicsAllocationBusy;
+  const NtStatus s = a.manager().make_resident(a);
+  if (s != status::kSuccess) return s;
+  if (!a.image()) return status::kInvalidDeviceState;
+  a.manager().pin(a);
+  rec->acquired = true;
+  out->device = &adapter->device();
+  out->image = a.image();
+  return status::kSuccess;
+}
+
+NtStatus Kernel::release_image(ProcessId pid, Handle allocation) {
+  kernel::ScopedMutex g(lock_);
+  Process* p = find_process(pid);
+  AllocRec* rec = p ? p->allocations.raw(allocation) : nullptr;
+  if (!rec) return status::kInvalidHandle;
+  if (!rec->acquired) return status::kInvalidDeviceState;
+  rec->allocation->manager().unpin(*rec->allocation);
+  rec->acquired = false;
   return status::kSuccess;
 }
 

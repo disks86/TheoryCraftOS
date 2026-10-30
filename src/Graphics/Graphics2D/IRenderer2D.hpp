@@ -26,6 +26,9 @@
 
 namespace graphics {
 
+class IGraphicsDevice;
+class IImage;
+
 enum class BlendMode : uint8_t {
   Replace,  // write the source color as is
   Alpha,    // source over destination using the source alpha
@@ -148,6 +151,14 @@ class IRenderer2D {
   // device renderer has to read the frame back to do it (and returns false if that fails): use it sparingly there.
   // Returns true if the pixels were copied (also when the clip leaves nothing to copy).
   virtual bool copy_rect(const Rect2D& source, int32_t dest_x, int32_t dest_y) = 0;
+
+  // Draws `source` of an image that lives on a graphics device, where it is, without the pixels passing through the CPU: false (and nothing drawn) unless this renderer draws on
+  // that very device, the image can be sampled, or a layer's opacity is open. The image must be complete (no queued work) and stay valid until the call returns. The pixels are
+  // composed like draw_image's (the current clip and blend mode).
+  virtual bool draw_device_image(IGraphicsDevice& owner, IImage& image, const Rect2D& source, int32_t x, int32_t y) {
+    (void)owner, (void)image, (void)source, (void)x, (void)y;
+    return false;
+  }
 
   // Makes everything drawn so far visible.
   virtual void present() = 0;

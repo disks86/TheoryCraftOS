@@ -100,6 +100,7 @@ class CubeView : public gui::Control {
   bool texture_available_ = false;
   bool active_accelerated_ = false;
   bool failed_ = false;
+  bool share_refused_ = false;   // the painter's renderer could not show the frame where it is on the GPU: frames are read back
   FixedString<48> device_name_;
   uint32_t fps_ = 0, frames_in_second_ = 0, seconds_ = 0;
   uint64_t second_start_us_ = 0, frame_us_ = 0, total_frames_ = 0, start_us_ = 0;
