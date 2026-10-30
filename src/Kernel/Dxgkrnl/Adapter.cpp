@@ -209,6 +209,7 @@ class Adapter::StreamRunner {
       case Op::BeginQuery: return begin_query(p);
       case Op::EndQuery: return end_query(p);
       case Op::BindUav: return bind_uav(p);
+      case Op::SetStreamOutput: return set_stream_output(p);
       case Op::ResolveRegion: return resolve(p);
       case Op::Dispatch: return dispatch(p);
       case Op::SetTopology: {
@@ -373,6 +374,37 @@ class Adapter::StreamRunner {
     return status::kSuccess;
   }
 
+  // After a draw: the buffers its pipeline's stream output wrote have newer contents on the device than anywhere else.
+  void note_stream_output_written() {
+    if (!pipeline_ || !pipeline_->has_stream_output()) return;
+    for (uint32_t b = 0; b < graphics::kMaxStreamOutputBuffers; ++b)
+      if ((pipeline_->stream_output_buffers() >> b & 1) && so_bound_[b] && so_alloc_[b]) mm_.note_gpu_write(*so_alloc_[b]);
+  }
+
+  NtStatus set_stream_output(ByteReader& p) {
+    const uint32_t slot = p.le32(), index = p.le32(), offset = p.le32();
+    if (!exact(p) || !(adapter_.caps_.features & graphics::kFeatureStreamOutput) || slot >= graphics::kMaxStreamOutputBuffers) return kBad;
+    if (index == kNoAllocation) {
+      so_bound_[slot] = false;
+      so_alloc_[slot] = nullptr;
+      if (!exec_) return status::kSuccess;
+      const NtStatus s = ensure_cb();
+      if (s != status::kSuccess) return s;
+      cb_->bind_stream_output(slot, nullptr, 0);
+      return status::kSuccess;
+    }
+    Allocation* a = alloc(index);
+    if (!a || !(a->desc().flags & kAllocStreamOutput) || offset % 4 || offset > a->desc().size) return kBad;
+    so_bound_[slot] = true;
+    so_alloc_[slot] = a;
+    if (!exec_) return status::kSuccess;
+    NtStatus s = resident(*a);
+    if (s == status::kSuccess) s = ensure_cb();
+    if (s != status::kSuccess) return s;
+    cb_->bind_stream_output(slot, a->buffer(), offset);
+    return status::kSuccess;
+  }
+
   NtStatus bind_uav(ByteReader& p) {
     const uint32_t slot = p.le32(), index = p.le32(), offset = p.le32(), size = p.le32();
     if (!exact(p) || in_pass_ || !(adapter_.caps_.features & graphics::kFeatureCompute) || slot >= graphics::kMaxStorageBuffers) return kBad;
@@ -518,6 +550,9 @@ class Adapter::StreamRunner {
     if (topology_ >= Topology::LineList && topology_ <= Topology::PointList && !(adapter_.caps_.features & graphics::kFeatureLines)) return kBad;
     // Patches go with a hull and a domain shader that take that many control points, and those shaders go with patches (and with no geometry shader).
     if (is_patch_list(topology_) != pipeline_->has_tessellation()) return kBad;
+    if (pipeline_->has_stream_output())   // (every buffer the declaration writes needs a target)
+      for (uint32_t b = 0; b < graphics::kMaxStreamOutputBuffers; ++b)
+        if ((pipeline_->stream_output_buffers() >> b & 1) && !so_bound_[b]) return kBad;
     if (is_adjacency(topology_) && !pipeline_->has_geometry()) return kBad;   // (only a geometry shader takes the neighbours)
     if (pipeline_->has_tessellation() && (patch_points(topology_) != pipeline_->tess_input_points() || pipeline_->has_geometry())) return kBad;
     for (uint32_t u = 0; u < pipeline_->texture_count(); ++u)
@@ -587,6 +622,7 @@ class Adapter::StreamRunner {
     }
     if (indexed) cb_->draw_indexed(count, first, vertex_offset, instance_count, first_instance);
     else cb_->draw(count, first, instance_count, first_instance);
+    note_stream_output_written();
     return status::kSuccess;
   }
 
@@ -670,6 +706,7 @@ class Adapter::StreamRunner {
     set_device_topology(lines ? graphics::PrimitiveTopology::LineList : graphics::PrimitiveTopology::TriangleList);
     cb_->bind_index_buffer(buffer, graphics::IndexType::Uint32, 0);
     cb_->draw_indexed(static_cast<uint32_t>(emitted), 0, indexed ? vertex_offset : 0, instance_count, first_instance);
+    note_stream_output_written();
     index_rebind_ = indexed || index_ != nullptr;
     return status::kSuccess;
   }
@@ -744,6 +781,8 @@ class Adapter::StreamRunner {
   const Allocation* pass_depth_ = nullptr;
   PipelineObject* pipeline_ = nullptr;
   PipelineObject* compute_ = nullptr;
+  bool so_bound_[graphics::kMaxStreamOutputBuffers] = {};
+  Allocation* so_alloc_[graphics::kMaxStreamOutputBuffers] = {};
   bool uav_bound_[graphics::kMaxStorageBuffers] = {};
   Allocation* uav_alloc_[graphics::kMaxStorageBuffers] = {};
   Allocation* vertex_ = nullptr;
@@ -920,6 +959,7 @@ NtStatus Adapter::create_shader(const ShaderDesc& desc, SharedPointer<ShaderObje
       for (uint32_t u = 0; u < graphics::kMaxTextureUnits; ++u) shader->texture_kinds_[u] = program->texture_kind(u);
       for (uint32_t k = 0; k < 3; ++k) shader->thread_group_[k] = program->thread_group(k);
       shader->geometry_input_ = program->geometry_input();
+      shader->geometry_streams_ = program->geometry_streams();
       shader->tess_input_points_ = program->tess_input_points();
       shader->tess_output_points_ = program->tess_output_points();
       shader->tess_domain_ = program->tess_domain();
@@ -987,6 +1027,24 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
     if (!(caps_.features & graphics::kFeatureTessellation)) return status::kNotSupported;
     if (geometry) return status::kNotSupported;   // (a geometry shader after the tessellator is not made)
   }
+  if (d.stream_output_count) {
+    // (stream output needs a geometry shader that has the streams the entries name, outputs and components that exist, and a buffer takes only one stream; each buffer's record is as long as
+    // its entries need, in whole words)
+    if (!(caps_.features & graphics::kFeatureStreamOutput)) return status::kNotSupported;
+    if (!geometry || d.stream_output_count > graphics::kMaxStreamOutputEntries || d.rasterized_stream < -1 || d.rasterized_stream >= static_cast<int32_t>(graphics::kMaxGeometryStreams)) return status::kInvalidParameter;
+    int32_t stream_of_buffer[graphics::kMaxStreamOutputBuffers] = {-1, -1, -1, -1};
+    uint32_t bytes[graphics::kMaxStreamOutputBuffers] = {};
+    for (uint32_t e = 0; e < d.stream_output_count; ++e) {
+      const graphics::StreamOutputEntry& entry = d.stream_output[e];
+      if (entry.stream >= geometry->geometry_streams() || entry.output > graphics::kMaxVaryings || entry.component_count == 0 || entry.start_component + entry.component_count > 4 || entry.buffer >= graphics::kMaxStreamOutputBuffers)
+        return status::kInvalidParameter;
+      if (stream_of_buffer[entry.buffer] >= 0 && stream_of_buffer[entry.buffer] != entry.stream) return status::kInvalidParameter;
+      stream_of_buffer[entry.buffer] = entry.stream;
+      bytes[entry.buffer] += 4u * entry.component_count;
+    }
+    for (uint32_t b = 0; b < graphics::kMaxStreamOutputBuffers; ++b)
+      if (stream_of_buffer[b] >= 0 && (d.stream_output_stride[b] < bytes[b] || d.stream_output_stride[b] % 4 || d.stream_output_stride[b] > 2048)) return status::kInvalidParameter;
+  }
   if (geometry && (geometry->stage() != graphics::ShaderStage::Geometry || !(caps_.features & graphics::kFeatureGeometryShaders))) return geometry && geometry->stage() != graphics::ShaderStage::Geometry ? status::kInvalidParameter : status::kNotSupported;
   if ((bs.custom || d.depth_compare != graphics::CompareOp::LessEqual) && !(caps_.features & graphics::kFeatureBlendState)) return status::kNotSupported;
   for (uint32_t i = 0; i < d.attribute_count; ++i)
@@ -1012,6 +1070,10 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   pd.independent_blend = d.independent_blend;
   pd.multisample = d.multisample;
   pd.alpha_to_coverage = d.alpha_to_coverage;
+  pd.stream_output_count = d.stream_output_count;
+  for (uint32_t e = 0; e < d.stream_output_count; ++e) pd.stream_output[e] = d.stream_output[e];
+  for (uint32_t b = 0; b < graphics::kMaxStreamOutputBuffers; ++b) pd.stream_output_stride[b] = d.stream_output_stride[b];
+  pd.rasterized_stream = d.rasterized_stream;
   pd.geometry_shader = geometry ? geometry->module() : nullptr;
   pd.hull_shader = hull ? hull->module() : nullptr;
   pd.domain_shader = domain ? domain->module() : nullptr;
@@ -1031,6 +1093,7 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   if (hull) pipeline->tess_input_points_ = hull->tess_input_points();
   pipeline->blends_ = d.alpha_blend || d.blend.enable || (d.independent_blend && (d.target_blend[0].enable || d.target_blend[1].enable || d.target_blend[2].enable));
   if (geometry) pipeline->geometry_input_ = geometry->geometry_input();
+  for (uint32_t e = 0; e < d.stream_output_count; ++e) pipeline->stream_output_buffers_ |= 1u << d.stream_output[e].buffer;
   pipeline->stride_ = d.vertex_stride;
   for (uint32_t i = 0; i < d.attribute_count; ++i) pipeline->per_instance_ = pipeline->per_instance_ || d.attributes[i].per_instance;
   pipeline->attribute_count_ = d.attribute_count;

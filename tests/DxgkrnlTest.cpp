@@ -4318,6 +4318,131 @@ void test_compute_shared() {
   }
 }
 
+// Stream output: a geometry shader with two streams of points (stream 0: the position and colour, stream 1: a vector made of them), and one with a triangle strip, written to buffers.
+void test_stream_output() {
+  Env e;
+  namespace b = conformance_blobs;
+  Handle vs = 0, gs = 0, gs_strip = 0, ps = 0;
+  auto shader = [&](graphics::ShaderStage stage, const uint8_t* code, uint32_t size, Handle* out) {
+    ShaderDesc sd;
+    sd.kind = ShaderKind::Dxbc, sd.stage = stage, sd.code = ConstByteView(code, size);
+    return e.kernel.create_shader(kPid, e.dev, sd, out);
+  };
+  CHECK(shader(graphics::ShaderStage::Vertex, b::k_vs, sizeof b::k_vs, &vs) == status::kSuccess && shader(graphics::ShaderStage::Fragment, b::k_ps_color, sizeof b::k_ps_color, &ps) == status::kSuccess);
+  CHECK(shader(graphics::ShaderStage::Geometry, b::k_gs_streams, sizeof b::k_gs_streams, &gs) == status::kSuccess && shader(graphics::ShaderStage::Geometry, b::k_gs_copy, sizeof b::k_gs_copy, &gs_strip) == status::kSuccess);
+  auto make = [&](Handle geometry, uint32_t entries, const graphics::StreamOutputEntry* list, uint32_t stride0, uint32_t stride1, int32_t rasterized, Handle* out) {
+    PipelineDesc pd;
+    pd.vertex_shader = vs, pd.fragment_shader = ps, pd.geometry_shader = geometry, pd.vertex_stride = 28, pd.attribute_count = 2, pd.varying_count = 3;
+    pd.attributes[0] = {0, graphics::VertexFormat::Float3, 0};
+    pd.attributes[1] = {1, graphics::VertexFormat::Float4, 12};
+    pd.cull_mode = graphics::CullMode::None;
+    pd.stream_output_count = entries;
+    for (uint32_t i = 0; i < entries; ++i) pd.stream_output[i] = list[i];
+    pd.stream_output_stride[0] = stride0, pd.stream_output_stride[1] = stride1;
+    pd.rasterized_stream = rasterized;
+    return e.kernel.create_pipeline(kPid, e.dev, pd, out);
+  };
+  // stream 0: position (output 0) and colour (output 1) in buffer 0; stream 1: the texture coordinate 1 (output 4) in buffer 1
+  const graphics::StreamOutputEntry two[3] = {{0, 0, 0, 4, 0}, {0, 1, 0, 4, 0}, {1, 4, 0, 4, 1}};
+  Handle pipe = 0, bad = 0;
+  CHECK(make(gs, 3, two, 32, 16, 0, &pipe) == status::kSuccess);
+  // What does not go together: no geometry shader, a stream the shader does not have, a buffer for two streams, a stride that is too short or not whole words, a rasterized stream that does not exist.
+  CHECK(make(0, 3, two, 32, 16, 0, &bad) == status::kInvalidParameter);
+  const graphics::StreamOutputEntry past[1] = {{2, 0, 0, 4, 0}}, shared[2] = {{0, 0, 0, 4, 0}, {1, 4, 0, 4, 0}}, empty[1] = {{0, 0, 0, 0, 0}}, overrun[1] = {{0, 0, 2, 4, 0}};
+  CHECK(make(gs, 1, past, 16, 16, 0, &bad) == status::kInvalidParameter && make(gs, 2, shared, 32, 16, 0, &bad) == status::kInvalidParameter);
+  CHECK(make(gs, 1, empty, 16, 16, 0, &bad) == status::kInvalidParameter && make(gs, 1, overrun, 32, 16, 0, &bad) == status::kInvalidParameter);
+  CHECK(make(gs, 3, two, 24, 16, 0, &bad) == status::kInvalidParameter && make(gs, 3, two, 34, 16, 0, &bad) == status::kInvalidParameter && make(gs, 3, two, 32, 16, 4, &bad) == status::kInvalidParameter);
+  Handle target = e.alloc(kTarget, Format::A8R8G8B8, 32, 32), vb = e.buffer(kAllocVertexBuffer, 3 * 28);
+  AllocationDesc od;
+  od.flags = kAllocStreamOutput, od.size = 3 * 32;
+  Handle out0 = 0, out1 = 0;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, od, &out0) == status::kSuccess);
+  od.size = 3 * 16;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, od, &out1) == status::kSuccess);
+  const float v[21] = {-0.5f, -0.5f, 0.5f, 1, 0, 0, 1, 0.5f, -0.5f, 0.5f, 0, 1, 0, 1, 0, 0.5f, 0.5f, 0, 0, 1, 1};
+  CHECK(e.write(vb, floats(v, 21)));
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  auto read_floats = [&](Handle h, uint32_t count, float* out) {
+    LockResult lock;
+    if (e.kernel.lock(kPid, h, kLockReadOnly, 0, &lock) != status::kSuccess) return false;
+    ByteReader in(ConstByteView(lock.data.data(), lock.data.size()));
+    for (uint32_t i = 0; i < count; ++i) out[i] = __builtin_bit_cast(float, in.le32());
+    e.kernel.unlock(kPid, h);
+    return in.ok();
+  };
+  auto draw = [&](Handle pipeline, uint32_t first_buffer, uint32_t second_buffer, bool bind_second) {
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    w.set_stream_output(0, first_buffer);
+    if (bind_second) w.set_stream_output(1, second_buffer);
+    w.bind_pipeline(pipeline);
+    w.bind_vertex_buffer(1);
+    w.push_constants(floats(identity, 16));
+    w.draw(3);
+    w.end_pass();
+    return e.render(w, {target, vb, out0, out1});
+  };
+  // The buffers must all be bound for the draw.
+  CHECK(draw(pipe, 2, 3, false) == status::kInvalidParameter);
+  CHECK(draw(pipe, 2, 3, true) == status::kSuccess);
+  float f0[24], f1[12];
+  CHECK(read_floats(out0, 24, f0) && read_floats(out1, 12, f1));
+  // Stream 0: the three vertices, position (+Y up, as the shader had it) then colour; stream 1: position * 2 + colour.
+  for (uint32_t i = 0; i < 3; ++i) {
+    const float* in = v + 7 * i;
+    const float position[4] = {in[0], in[1], in[2], 1.0f}, colour[4] = {in[3], in[4], in[5], in[6]};
+    for (uint32_t c = 0; c < 4; ++c) {
+      CHECK(f0[8 * i + c] == position[c] && f0[8 * i + 4 + c] == colour[c]);
+      CHECK(f1[4 * i + c] == position[c] * 2.0f + colour[c]);
+    }
+  }
+  CHECK(e.pixel(target, 0, 0) == 0xFF000000u);   // (points: one pixel each, nothing near the corner)
+  // A target that is too small for all the primitives: the ones that fit are written, whole.
+  AllocationDesc small;
+  small.flags = kAllocStreamOutput, small.size = 2 * 32 + 8;
+  Handle short_buffer = 0;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, small, &short_buffer) == status::kSuccess);
+  CommandWriter w(e.allocator);
+  w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+  w.set_stream_output(0, 2), w.set_stream_output(1, 3);
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(floats(identity, 16));
+  w.draw(3);
+  w.end_pass();
+  CHECK(e.render(w, {target, vb, short_buffer, out1}) == status::kSuccess);
+  float sh[18];
+  CHECK(read_floats(short_buffer, 18, sh));
+  CHECK(sh[0] == v[0] && sh[8] == v[7] && sh[4] == 1 && sh[12] == 0 && sh[16] == 0 && sh[17] == 0);   // (two whole records; nothing of the third, not even the 8 bytes that were left)
+  // No stream is drawn with -1.
+  Handle quiet = 0;
+  CHECK(make(gs, 3, two, 32, 16, -1, &quiet) == status::kSuccess);
+  // A triangle strip: the shader of gs_copy emits two strips (the input triangle, and a copy), each a triangle; written as 6 vertices of position and colour in buffer 0.
+  const graphics::StreamOutputEntry strip_entries[2] = {{0, 0, 0, 4, 0}, {0, 1, 0, 4, 0}};
+  Handle strip_pipe = 0;
+  CHECK(make(gs_strip, 2, strip_entries, 32, 0, 0, &strip_pipe) == status::kSuccess);
+  AllocationDesc od2;
+  od2.flags = kAllocStreamOutput, od2.size = 6 * 32;
+  Handle strips = 0;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, od2, &strips) == status::kSuccess);
+  CommandWriter w2(e.allocator);
+  w2.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+  w2.set_stream_output(0, 2);
+  w2.bind_pipeline(strip_pipe);
+  w2.bind_vertex_buffer(1);
+  w2.push_constants(floats(identity, 16));
+  w2.draw(3);
+  w2.end_pass();
+  CHECK(e.render(w2, {target, vb, strips}) == status::kSuccess);
+  float s[48];
+  CHECK(read_floats(strips, 48, s));
+  // (the first triangle: the vertices as they came; the second: moved to the corner, with red and blue swapped)
+  CHECK(s[0] == -0.5f && s[1] == -0.5f && s[4] == 1 && s[5] == 0 && s[6] == 0 && s[8] == 0.5f && s[12] == 0 && s[13] == 1);
+  CHECK(s[24] != 0.0f || s[25] != 0.0f);
+  CHECK(s[28] == 0 && s[30] == 1);   // (the colour of the copy's first vertex: red 1 became blue 1)
+  (void)quiet;
+}
+
 // Geometry shaders with adjacency input and instances.
 void test_geometry_extras() {
   HostAllocator allocator;
@@ -5687,6 +5812,7 @@ int main() {
   test_sm3_and_sm51();
   test_ps1();
   test_device_suite();
+  test_stream_output();
   test_compute_shared();
   test_geometry_extras();
   test_alpha_to_coverage();

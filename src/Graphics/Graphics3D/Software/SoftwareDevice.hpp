@@ -32,7 +32,7 @@ class SoftwareDevice final : public IGraphicsDevice {
   SoftwareDevice(allocators::IAllocator& allocator, hardware::IGraphicsProcessingUnit* display)
       : allocator_(allocator), display_(display) {}
 
-  DeviceInfo info() const override { return {"software rasterizer", DeviceKind::Software, false, kMaxPushConstantBytes, kFeatureBlendState | kFeatureTexelAccess | kFeatureSystemInputs | kFeatureInstancing | kFeatureLines | kFeatureMultipleTargets | kFeatureFloatFormats | kFeatureOcclusionQueries | kFeatureStatisticsQueries | kFeatureDepthResolve | kFeatureResolveModes | kFeatureTextureKinds | kFeatureIndependentBlend | kFeatureCompute | kFeatureMultisample | kFeatureGeometryShaders | kFeatureSrgbFormats | kFeatureUnorm16Formats | kFeatureIntegerFormats | kFeatureSnormFormats | kFeatureTessellation, (1u << 2) | (1u << 4) | (1u << 8)}; }
+  DeviceInfo info() const override { return {"software rasterizer", DeviceKind::Software, false, kMaxPushConstantBytes, kFeatureBlendState | kFeatureTexelAccess | kFeatureSystemInputs | kFeatureInstancing | kFeatureLines | kFeatureMultipleTargets | kFeatureFloatFormats | kFeatureOcclusionQueries | kFeatureStatisticsQueries | kFeatureDepthResolve | kFeatureResolveModes | kFeatureStreamOutput | kFeatureTextureKinds | kFeatureIndependentBlend | kFeatureCompute | kFeatureMultisample | kFeatureGeometryShaders | kFeatureSrgbFormats | kFeatureUnorm16Formats | kFeatureIntegerFormats | kFeatureSnormFormats | kFeatureTessellation, (1u << 2) | (1u << 4) | (1u << 8)}; }
 
   IBuffer* create_buffer(uint64_t size, uint32_t usage) override;
   void destroy_buffer(IBuffer* buffer) override;

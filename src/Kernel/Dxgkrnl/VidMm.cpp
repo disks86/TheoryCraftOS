@@ -44,7 +44,7 @@ graphics::Format wide_format_of(Format f) {
 }
 
 constexpr uint64_t kMaxQueryResultBytes = 1 << 20;
-constexpr uint32_t kKnownFlags = kAllocVertexBuffer | kAllocIndexBuffer | kAllocTexture | kAllocRenderTarget | kAllocDepthStencil | kAllocPresent | kAllocStaging | kAllocShared | kAllocQueryResult | kAllocUnorderedAccess;
+constexpr uint32_t kKnownFlags = kAllocVertexBuffer | kAllocIndexBuffer | kAllocTexture | kAllocRenderTarget | kAllocDepthStencil | kAllocPresent | kAllocStaging | kAllocShared | kAllocQueryResult | kAllocUnorderedAccess | kAllocStreamOutput;
 
 // The bytes of all levels of a w x h image of `pixel`-byte pixels; false if the description's levels are not possible. (w and h are at most kMaxTextureDimension, so nothing overflows.)
 bool image_bytes(uint32_t w, uint32_t h, uint32_t levels, uint32_t pixel, uint64_t* total) {
@@ -102,8 +102,9 @@ uint32_t VidMm::from_logical(Format f, uint32_t pixel) {
 
 NtStatus VidMm::create(const AllocationDesc& desc, SharedPointer<Allocation>* out) {
   if (desc.flags == 0 || (desc.flags & ~kKnownFlags)) return status::kInvalidParameter;
-  const bool buffer = (desc.flags & (kAllocVertexBuffer | kAllocIndexBuffer | kAllocQueryResult | kAllocUnorderedAccess)) != 0;
+  const bool buffer = (desc.flags & (kAllocVertexBuffer | kAllocIndexBuffer | kAllocQueryResult | kAllocUnorderedAccess | kAllocStreamOutput)) != 0;
   if ((desc.flags & kAllocUnorderedAccess) && !(device_.info().features & graphics::kFeatureCompute)) return status::kNotSupported;
+  if ((desc.flags & kAllocStreamOutput) && !(device_.info().features & graphics::kFeatureStreamOutput)) return status::kNotSupported;
   uint64_t cpu_bytes = 0, device_bytes = 0;
   if (desc.flags & kAllocQueryResult) {
     // (results are written into system memory by the CPU: no device object)
@@ -207,6 +208,7 @@ bool VidMm::create_device_object(Allocation& a) {
     if (d.flags & kAllocVertexBuffer) usage |= graphics::kBufferVertex;
     if (d.flags & kAllocIndexBuffer) usage |= graphics::kBufferIndex;
     if (d.flags & kAllocUnorderedAccess) usage |= graphics::kBufferStorage;
+    if (d.flags & kAllocStreamOutput) usage |= graphics::kBufferStreamOutput;
     a.buffer_ = device_.create_buffer(d.size, usage);
     return a.buffer_ != nullptr;
   }

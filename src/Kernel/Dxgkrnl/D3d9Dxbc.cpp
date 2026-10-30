@@ -36,7 +36,7 @@ namespace dxgk {
 
 namespace {
 
-constexpr uint32_t kMagic = 0x43425844, kShdr = 0x52444853, kShex = 0x58454853, kIsgn = 0x4E475349, kIsg1 = 0x31475349, kOsgn = 0x4E47534F, kOsg1 = 0x3147534F;
+constexpr uint32_t kMagic = 0x43425844, kShdr = 0x52444853, kShex = 0x58454853, kIsgn = 0x4E475349, kIsg1 = 0x31475349, kOsgn = 0x4E47534F, kOsg1 = 0x3147534F, kOsg5 = 0x3547534F;
 
 enum DxbcOp : uint32_t {
   kAdd4 = 0, kBreak4 = 2, kBreakc4 = 3, kContinue4 = 7, kContinuec4 = 8, kEndloop4 = 22, kLoop4 = 48, kCall4 = 4, kCallc4 = 5, kDiscard4 = 13, kDiv4 = 14, kDp2_4 = 15, kDp3_4 = 16, kDp4_4 = 17, kElse4 = 18, kEndif4 = 21, kEq4 = 24, kExp4 = 25, kFrc4 = 26,
@@ -84,6 +84,7 @@ struct SigElement {
   char name[16] = {};
   uint32_t index = 0;
   uint32_t reg = 0;
+  uint32_t stream = 0;   // (OSG5: the output stream the element belongs to)
 };
 
 bool names_equal(const char* a, const char* b) {
@@ -97,7 +98,7 @@ bool names_equal(const char* a, const char* b) {
 }
 
 // Reads a signature chunk into `out` (at most 16 elements); false when it is malformed.
-bool read_signature(ConstByteView chunk, uint32_t element_size, SigElement* out, uint32_t* count) {
+bool read_signature(ConstByteView chunk, uint32_t element_size, SigElement* out, uint32_t* count, bool has_stream = false) {
   ByteReader in(chunk);
   const uint32_t n = in.le32();
   in.le32();   // (the key)
@@ -106,6 +107,7 @@ bool read_signature(ConstByteView chunk, uint32_t element_size, SigElement* out,
     ConstByteView entry = in.take(element_size);
     if (!in.ok()) return false;
     ByteReader e(entry);
+    const uint32_t stream = has_stream ? e.le32() : 0;
     const uint32_t name_at = e.le32(), index = e.le32();
     e.le32();
     e.le32();
@@ -122,6 +124,7 @@ bool read_signature(ConstByteView chunk, uint32_t element_size, SigElement* out,
     s.name[k] = 0;
     s.index = index;
     s.reg = reg;
+    s.stream = stream;
   }
   *count = n;
   return true;
@@ -147,6 +150,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
   if (!head.ok() || one != 1 || total > bytes.size() || total < 32 || chunk_count == 0 || chunk_count > 32) return status::kInvalidParameter;
   ConstByteView shader, isgn, osgn;
   uint32_t isgn_size = 24, osgn_size = 24;
+  bool osgn_streams = false;
   for (uint32_t i = 0; i < chunk_count; ++i) {
     const uint32_t offset = head.le32();
     if (!head.ok() || offset > total || total - offset < 8) return status::kInvalidParameter;
@@ -156,7 +160,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
     const ConstByteView data = c.take(size);
     if (fourcc == kShdr || fourcc == kShex) shader = data;
     else if (fourcc == kIsgn || fourcc == kIsg1) isgn = data, isgn_size = fourcc == kIsg1 ? 32 : 24;
-    else if (fourcc == kOsgn || fourcc == kOsg1) osgn = data, osgn_size = fourcc == kOsg1 ? 32 : 24;
+    else if (fourcc == kOsgn || fourcc == kOsg1 || fourcc == kOsg5) osgn = data, osgn_size = fourcc == kOsg1 ? 32 : fourcc == kOsg5 ? 28 : 24, osgn_streams = fourcc == kOsg5;
   }
   if (shader.size() < 8 || shader.size() % 4) return status::kInvalidParameter;
 
@@ -203,6 +207,10 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
   for (int8_t& s : in_sys) s = -1;
   for (int8_t& s : in_slot) s = kSlotNone;
   for (int8_t& s : out_slot) s = kSlotNone;
+  int8_t stream_slot[graphics::kMaxGeometryStreams][16];   // (a geometry shader's output registers by the stream they belong to: the registers are shared, the meanings are not)
+  for (auto& row : stream_slot)
+    for (int8_t& s : row) s = kSlotNone;
+  uint32_t streams_declared = 0;
   SigElement elements[16];
   uint32_t count = 0;
   if (!isgn.empty()) {
@@ -213,9 +221,13 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
   if (vertex || geometry || patch_stage) {
     if (vertex)
       for (uint32_t i = 0; i < graphics::kMaxVertexAttributes; ++i) in_slot[i] = static_cast<int8_t>(i);   // (vN is attribute location N)
-    if (osgn.empty() || !read_signature(osgn, osgn_size, elements, &count)) return status::kInvalidParameter;
-    for (uint32_t i = 0; i < count; ++i)
-      if (elements[i].reg < 16) out_slot[elements[i].reg] = signature_slot(elements[i], true);
+    if (osgn.empty() || !read_signature(osgn, osgn_size, elements, &count, osgn_streams)) return status::kInvalidParameter;
+    for (uint32_t i = 0; i < count; ++i) {
+      if (elements[i].reg >= 16 || elements[i].stream >= graphics::kMaxGeometryStreams) continue;
+      const int8_t slot = signature_slot(elements[i], true);
+      stream_slot[elements[i].stream][elements[i].reg] = slot;
+      if (out_slot[elements[i].reg] == kSlotNone) out_slot[elements[i].reg] = slot;   // (a register of several streams: the first until the instructions say which)
+    }
   } else {
     out_slot[0] = 0;
   }
@@ -699,6 +711,14 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         geometry_output_declared = true;
         continue;
       }
+      case 143: {   // dcl_stream m#
+        Operand o;
+        s = read_operand(p, &o);
+        if (s != status::kSuccess) return s;
+        if (!geometry || o.type != 16 || o.dims != 1 || o.index[0] >= graphics::kMaxGeometryStreams || o.index[0] != streams_declared) return status::kNotSupported;
+        ++streams_declared;
+        continue;
+      }
       case kDclGsInstanceCount4: {
         const uint32_t n = p.le32();
         if (!geometry || !p.ok() || n == 0 || n > 32) return status::kNotSupported;
@@ -788,6 +808,19 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       }
     } else if (geometry && (opcode == kEmit4 || opcode == kCut4)) {
       ins.op = opcode == kEmit4 ? kGsEmit : kGsCut;
+    } else if (geometry && (opcode == 117 || opcode == 118 || opcode == 119)) {
+      // emit_stream / cut_stream / emitthencut_stream m#
+      Operand m;
+      s = read_operand(p, &m);
+      if (s != status::kSuccess) return s;
+      if (m.type != 16 || m.dims != 1 || m.index[0] >= graphics::kMaxGeometryStreams) return status::kNotSupported;
+      ins.control = static_cast<uint8_t>(m.index[0]);
+      ins.op = opcode == 118 ? kGsCut : kGsEmit;
+      if (opcode == 119) {
+        s = emit(ins);
+        if (s != status::kSuccess) return s;
+        ins.op = kGsCut;
+      }
     } else if (opcode == kLoop4 || opcode == kEndloop4 || opcode == kBreak4 || opcode == kContinue4) {
       ins.op = opcode == kLoop4 ? kLoopBegin : opcode == kEndloop4 ? kLoopEnd : opcode == kBreak4 ? kBreak0 : kContinue0;
     } else if (opcode == kBreakc4 || opcode == kContinuec4) {
@@ -1024,6 +1057,25 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
   if (compute && (!thread_group_declared || program->code_.count() == 0)) return status::kInvalidParameter;
   if (compute && program->needs_group() && program->thread_group_[0] * program->thread_group_[1] * program->thread_group_[2] > graphics::kMaxBarrierThreads) return status::kNotSupported;   // (a thread that waits keeps registers of its own)
   if (geometry && (!geometry_input_declared || !geometry_output_declared || program->geometry_max_vertices_ == 0)) return status::kInvalidParameter;
+  if (geometry) {
+    program->geometry_streams_ = streams_declared ? streams_declared : 1;
+    // (several streams are lists of points)
+    if (program->geometry_streams_ > 1 && program->geometry_output_ != graphics::GeometryTopology::PointList) return status::kNotSupported;
+    if (program->geometry_streams_ > 1) {
+      // What an output register means depends on the stream of the emit it is written for: the next one after the instruction.
+      uint32_t stream_after = 0;
+      for (uint64_t i = program->code_.count(); i > 0; --i) {
+        Instr& ins = program->code_[i - 1];
+        if (ins.op == kGsEmit) stream_after = ins.control;
+        if ((ins.dst.type == kRastOut || ins.dst.type == kAttrOut) && ins.dst.number < 16) {
+          const int8_t slot = stream_slot[stream_after][ins.dst.number];
+          if (slot == kSlotNone) continue;   // (a register the stream has no element for: left as the first meaning had it)
+          ins.dst.slot = slot;
+          ins.dst.type = slot == kSlotPosition ? kRastOut : kAttrOut;
+        }
+      }
+    }
+  }
   if (patch_stage) {
     if (!tess_domain_declared || input_points == 0) return status::kInvalidParameter;
     if (hull && (output_points == 0 || phase == 0 || !tess_output_declared)) return status::kInvalidParameter;
