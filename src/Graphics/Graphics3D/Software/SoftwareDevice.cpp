@@ -20,6 +20,7 @@
 #include <new>
 #include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
 #include "Graphics/Graphics3D/Software/Tessellator.hpp"
+#include "Graphics/WidePixels.hpp"
 #include "Utility/AllocatedView.hpp"
 
 namespace graphics {
@@ -194,15 +195,8 @@ class SoftwareImage final : public IImage {
     for (uint64_t i = 0; i < hdr_.size(); ++i) hdr_[i] = store_float(pixels[i]);
     return true;
   }
-  // What a pixel of this image keeps of a colour: half-float images round to half precision.
-  Vec4 store_float(Vec4 c) const {
-    if (desc_.format == Format::R16G16B16A16Unorm) {
-      auto q = [](float v) { return !(v > 0.0f) ? 0.0f : v >= 1.0f ? 1.0f : static_cast<float>(static_cast<uint32_t>(v * 65535.0f + 0.5f)) * (1.0f / 65535.0f); };
-      return {q(c.x), q(c.y), q(c.z), q(c.w)};
-    }
-    if (desc_.format != Format::R16G16B16A16Float) return c;   // (single precision and integers are kept as they are)
-    return {half_to_float(float_to_half(c.x)), half_to_float(float_to_half(c.y)), half_to_float(float_to_half(c.z)), half_to_float(float_to_half(c.w))};
-  }
+  // What a pixel of this image keeps of a colour (WidePixels.hpp).
+  Vec4 store_float(Vec4 c) const { return quantize_wide_pixel(desc_.format, c); }
   bool write_mip_pixels(uint32_t level, ArrayView<const uint32_t> pixels) override {
     if (color_.empty() || level >= desc_.mip_levels) return false;
     const Surface s = surface(level);
@@ -265,14 +259,16 @@ class SoftwareShaderModule final : public IShaderModule {
 
 class SoftwareComputePipeline final : public IPipeline {
  public:
-  SoftwareComputePipeline(ComputeShaderFn function, const uint32_t group[3]) : function_(function) {
+  SoftwareComputePipeline(ComputeShaderFn function, ComputeGroupShaderFn group_function, const uint32_t group[3]) : function_(function), group_function_(group_function) {
     for (uint32_t i = 0; i < 3; ++i) group_[i] = group[i];
   }
   ComputeShaderFn function() const { return function_; }
+  ComputeGroupShaderFn group_function() const { return group_function_; }
   uint32_t group(uint32_t axis) const { return group_[axis]; }
 
  private:
   ComputeShaderFn function_;
+  ComputeGroupShaderFn group_function_;
   uint32_t group_[3];
 };
 
@@ -557,6 +553,7 @@ struct DrawState {
   uint32_t primitive_id = 0;   // the primitive of the draw being rasterized (SV_PrimitiveID)
   uint32_t sample_count = 1;   // samples per pixel of the pass's images
   uint64_t* samples = nullptr; // the open occlusion query's count: one more for every fragment that passes the stencil and depth tests
+  uint64_t* ps_invocations = nullptr;   // one more for every run of the fragment shader (a statistics query)
 };
 
 float read_float(ConstByteView bytes, uint64_t offset) {
@@ -727,6 +724,7 @@ void write_fragment(const DrawState& s, int32_t x, int32_t y, float z, bool dept
 
 // Runs the pipeline's fragment shader; false if it discarded the pixel.
 bool run_fragment_shader(const DrawState& s, const Vec4* varying, const FragmentContext& context, Vec4* color) {
+  if (s.ps_invocations) ++*s.ps_invocations;
   if (s.pipeline->fragment_ex()) return s.pipeline->fragment_ex()(varying, context, s.constants, s.textures, color);
   if (s.pipeline->textured()) return s.pipeline->textured()(varying, s.constants, s.textures, color);
   return s.pipeline->fragment()(varying, s.constants, color);
@@ -920,6 +918,13 @@ void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVert
       context.front_facing = front;
       context.primitive_id = s.primitive_id;
       if (!run_fragment_shader(s, varying, context, color)) continue;
+      if (pd.alpha_to_coverage && pd.multisample && sample_count > 1) {
+        // (the first round(alpha * samples) samples of the pixel keep what they covered)
+        const float a = color[0].w;
+        uint32_t keep = !(a > 0.0f) ? 0 : a >= 1.0f ? sample_count : static_cast<uint32_t>(a * static_cast<float>(sample_count) + 0.5f);
+        if (keep > sample_count) keep = sample_count;
+        covered &= (1u << keep) - 1;
+      }
       for (uint32_t k = 0; k < sample_count; ++k)
         if (covered >> k & 1) write_fragment(s, x, y, sample_z[k], (depth_pass >> k & 1) != 0, color, k);
     }
@@ -1055,14 +1060,7 @@ ClipVertex run_vertex_shader(const SoftwarePipeline& pipeline, ConstByteView ver
 }
 
 // Runs a geometry shader on one primitive and draws what it emits: the vertices are a strip (a triangle strip turns every second triangle over, as Direct3D does) or points.
-void run_geometry_shader(const DrawState& s, const SoftwareShaderModule& module, const ClipVertex* v, uint32_t count) {
-  const ShaderModuleDesc& md = module.desc();
-  GeometryInputData input;
-  for (uint32_t k = 0; k < count && k < 3; ++k) {
-    input.position[k] = v[k].position;
-    for (uint32_t i = 0; i < kMaxVaryings; ++i) input.varying[k][i] = v[k].varying[i];
-  }
-  input.primitive_id = s.primitive_id;
+void run_geometry_instance(const DrawState& s, const ShaderModuleDesc& md, const GeometryInputData& input) {
   GeometryOutputData output;
   md.geometry_function(input, s.constants, &output);
   if (output.count > md.geometry_max_vertices) output.count = md.geometry_max_vertices;
@@ -1085,6 +1083,20 @@ void run_geometry_shader(const DrawState& s, const SoftwareShaderModule& module,
       if (odd) draw_triangle(s, clip(i - 1), clip(i - 2), clip(i));
       else draw_triangle(s, clip(i - 2), clip(i - 1), clip(i));
     }
+  }
+}
+
+void run_geometry_shader(const DrawState& s, const SoftwareShaderModule& module, const ClipVertex* v, uint32_t count) {
+  const ShaderModuleDesc& md = module.desc();
+  GeometryInputData input;
+  for (uint32_t k = 0; k < count && k < kMaxGeometryInputVertices; ++k) {
+    input.position[k] = v[k].position;
+    for (uint32_t i = 0; i < kMaxVaryings; ++i) input.varying[k][i] = v[k].varying[i];
+  }
+  input.primitive_id = s.primitive_id;
+  for (uint32_t instance = 0; instance < md.geometry_instances; ++instance) {
+    input.instance_id = instance;
+    run_geometry_instance(s, md, input);
   }
 }
 
@@ -1180,7 +1192,7 @@ IShaderModule* SoftwareDevice::create_shader_module(const ShaderModuleDesc& desc
     return make<SoftwareShaderModule>(allocator_, desc);
   }
   if (desc.stage == ShaderStage::Compute) {
-    if (!desc.compute_function) return nullptr;
+    if (!desc.compute_function && !desc.compute_group_function) return nullptr;
     uint64_t threads = 1;
     for (uint32_t axis : desc.thread_group) {
       if (axis == 0 || axis > kMaxThreadsPerGroup) return nullptr;
@@ -1199,7 +1211,7 @@ void SoftwareDevice::destroy_shader_module(IShaderModule* module) {
 IPipeline* SoftwareDevice::create_compute_pipeline(const IShaderModule* shader) {
   if (!shader || shader->stage() != ShaderStage::Compute) return nullptr;
   const SoftwareShaderModule* module = static_cast<const SoftwareShaderModule*>(shader);
-  return make<SoftwareComputePipeline>(allocator_, module->desc().compute_function, module->desc().thread_group);
+  return make<SoftwareComputePipeline>(allocator_, module->desc().compute_function, module->desc().compute_group_function, module->desc().thread_group);
 }
 
 IPipeline* SoftwareDevice::create_graphics_pipeline(const GraphicsPipelineDesc& desc) {
@@ -1240,6 +1252,8 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
   ByteView storage[kMaxStorageBuffers];
   uint64_t query_samples = 0;
   uint32_t query_slot = 0;
+  QueryKind query_kind = QueryKind::Occlusion;
+  uint64_t stat_ia_vertices = 0, stat_ia_primitives = 0, stat_vs = 0, stat_ps = 0;   // (what the draws since the query began did)
   bool query_open = false;
   IBuffer* vertex_buffer = nullptr;
   uint64_t vertex_offset = 0;
@@ -1358,6 +1372,10 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
           for (uint32_t y = 0; y < gy; ++y)
             for (uint32_t x = 0; x < gx; ++x) {
               context.group_id[0] = x, context.group_id[1] = y, context.group_id[2] = z;
+              if (compute->group_function()) {
+                compute->group_function()(context, s.constants);   // (the shader runs the threads of the group itself)
+                continue;
+              }
               uint32_t index = 0;
               for (uint32_t tz = 0; tz < compute->group(2); ++tz)
                 for (uint32_t ty = 0; ty < compute->group(1); ++ty)
@@ -1372,16 +1390,21 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
       }
       case RecordedCommand::Type::BeginQuery:
         if (!in_pass || query_open) return false;
+        if (cmd.count > static_cast<uint32_t>(QueryKind::PsInvocations)) return false;
         query_open = true;
         query_slot = cmd.unit;
-        query_samples = 0;
+        query_kind = static_cast<QueryKind>(cmd.count);
+        query_samples = stat_ia_vertices = stat_ia_primitives = stat_vs = stat_ps = 0;
         s.samples = &query_samples;
+        s.ps_invocations = &stat_ps;
         break;
       case RecordedCommand::Type::EndQuery:
         if (!query_open) return false;
         query_open = false;
         s.samples = nullptr;
-        recorder.set_occlusion_result(query_slot, query_samples);
+        s.ps_invocations = nullptr;
+        recorder.set_occlusion_result(query_slot, query_kind == QueryKind::Occlusion ? query_samples : query_kind == QueryKind::OcclusionPredicate ? (query_samples ? 1u : 0u) : query_kind == QueryKind::IaVertices ? stat_ia_vertices
+                                                                                                                              : query_kind == QueryKind::IaPrimitives ? stat_ia_primitives : query_kind == QueryKind::VsInvocations ? stat_vs : stat_ps);
         break;
       case RecordedCommand::Type::BindPipeline:
         s.pipeline = static_cast<const SoftwarePipeline*>(cmd.pipeline);
@@ -1465,6 +1488,7 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
           VertexContext context;
           context.vertex_id = static_cast<uint32_t>(v);
           context.instance_id = cmd.first_instance + instance;
+          ++stat_vs;
           *out = run_vertex_shader(*s.pipeline, vertices, byte, instance_byte, s.constants, context);
           return true;
         };
@@ -1476,13 +1500,17 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
         // (patches need a hull and a domain shader that take that many control points, and those shaders need patches)
         if (patches != (hull != nullptr) || (patches && (patch_points != hull->desc().tess_input_points || patch_points == 0 || patch_points > kMaxPatchControlPoints))) return false;
         if (patches && pd.geometry_shader) return false;   // (a geometry shader after the tessellator is not made)
-        const uint32_t per_primitive = patches ? patch_points : topology == PrimitiveTopology::TriangleList ? 3 : topology == PrimitiveTopology::LineList ? 2 : 1;
+        const uint32_t per_primitive = patches ? patch_points : topology == PrimitiveTopology::TriangleListAdjacency ? 6 : topology == PrimitiveTopology::LineListAdjacency ? 4 : topology == PrimitiveTopology::TriangleList ? 3 : topology == PrimitiveTopology::LineList ? 2 : 1;
+        const bool adjacency = topology == PrimitiveTopology::TriangleListAdjacency || topology == PrimitiveTopology::LineListAdjacency;
+        if (adjacency && !pd.geometry_shader) return false;   // (only a geometry shader takes the neighbours)
         const SoftwareShaderModule* geometry = static_cast<const SoftwareShaderModule*>(pd.geometry_shader);
         if (geometry) {
           // (the geometry shader takes the primitives the draw makes)
           const GeometryPrimitive taken = geometry->desc().geometry_input;
-          if (taken != (per_primitive == 3 ? GeometryPrimitive::Triangle : per_primitive == 2 ? GeometryPrimitive::Line : GeometryPrimitive::Point)) return false;
+          if (taken != (per_primitive == 6 ? GeometryPrimitive::TriangleAdjacency : per_primitive == 4 ? GeometryPrimitive::LineAdjacency : per_primitive == 3 ? GeometryPrimitive::Triangle : per_primitive == 2 ? GeometryPrimitive::Line : GeometryPrimitive::Point)) return false;
         }
+        stat_ia_vertices += uint64_t{cmd.count} * instances;
+        stat_ia_primitives += uint64_t{cmd.count / per_primitive} * instances;
         // (the tessellator's room is taken once for the draw)
         TessellatorHolder tessellator(allocator_, patches);
         if (patches && !tessellator.valid()) return false;

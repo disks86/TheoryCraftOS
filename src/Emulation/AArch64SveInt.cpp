@@ -148,6 +148,23 @@ bool AArch64Cpu::sve_integer(uint32_t insn) {
         const Vec src = s_.v[zn];
         const uint32_t w = element_bits(esz);
         uint64_t result;
+        if (opc == 5 || (opc >= 12 && opc <= 15) || (opc >= 28 && opc <= 30)) {      // ADDQV, SMAXQV .. UMINQV, ORQV, EORQV, ANDQV: one result per lane of the (single) quadword
+          Vec r;
+          for (uint32_t i = 0; i < elements; ++i) {
+            const bool on = active(gp, i, esz);
+            const uint64_t x = get(src, esz, i);
+            uint64_t v;
+            switch (opc) {
+              case 5: case 28: case 29: case 13: v = on ? x : 0; break;                    // identity 0
+              case 12: v = on ? x : uint64_t{1} << (w - 1); break;                         // SMAXQV: the most negative value
+              case 14: v = on ? x : (uint64_t{1} << (w - 1)) - 1; break;                   // SMINQV: the most positive value
+              default: v = on ? x : ones(w); break;                                         // UMINQV, ANDQV
+            }
+            put(&r, esz, i, v);
+          }
+          s_.v[zd] = r;
+          return true;
+        }
         if (opc == 0 || opc == 1) {      // SADDV / UADDV (64-bit sum)
           if (opc == 0 && esz == 3) return false;
           uint64_t sum = 0;
@@ -423,6 +440,15 @@ bool AArch64Cpu::sve_integer(uint32_t insn) {
         if (size == 0) o = static_cast<uint64_t>(sext(o, 32));
         else if (size == 1) o &= 0xFFFFFFFFu;
         put(dst, e, i, (get(base, e, i) + (o << shift)) & element_ones(e));
+      }
+      return true;
+    }
+    case 0x1C: case 0x1D: {      // SQDMULH, SQRDMULH
+      const Vec a = s_.v[zn], b = s_.v[zm];
+      const uint32_t w2 = element_bits(esz);
+      for (uint32_t i = 0; i < elements; ++i) {
+        bool sat = false;
+        put(dst, esz, i, saturate_to_signed(doubling_high(0, multiply_signed(sext(get(a, esz, i), w2), sext(get(b, esz, i), w2)), w2, op == 0x1D), w2, &sat));
       }
       return true;
     }

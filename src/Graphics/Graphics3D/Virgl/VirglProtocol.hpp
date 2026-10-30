@@ -79,6 +79,12 @@ constexpr uint32_t kFormatR16G16B16A16Float = 94;
 constexpr uint32_t kFormatR16G16B16A16Unorm = 51;   // (VIRGL_FORMAT_*, the numbering of Gallium's pipe_format)
 constexpr uint32_t kFormatB8G8R8A8Srgb = 100;
 constexpr uint32_t kFormatR32G32B32A32Uint = 196;
+constexpr uint32_t kFormatR32G32B32A32Sint = 200;
+constexpr uint32_t kFormatR16G16B16A16Uint = 188;
+constexpr uint32_t kFormatR16G16B16A16Sint = 192;
+constexpr uint32_t kFormatR8G8B8A8Uint = 180;
+constexpr uint32_t kFormatR16G16B16A16Snorm = 59;
+constexpr uint32_t kFormatR10G10B10A2Unorm = 8;
 
 // Resource bind flags (VIRGL_BIND_*).
 constexpr uint32_t kBindDepthStencil = 1u << 0;
@@ -91,6 +97,8 @@ constexpr uint32_t kBindScanout = 1u << 18;
 
 // Gallium enums.
 constexpr uint32_t kQueryOcclusionCounter = 0;   // PIPE_QUERY_OCCLUSION_COUNTER
+constexpr uint32_t kQueryOcclusionPredicate = 1;   // PIPE_QUERY_OCCLUSION_PREDICATE
+constexpr uint32_t kQueryPipelineStatistics = 10;  // PIPE_QUERY_PIPELINE_STATISTICS (the enum of virglrenderer's p_defines.h: occlusion counter 0, predicate 1, timestamp 2, disjoint 3, time elapsed 4, primitives generated 5, emitted 6, SO statistics 7, SO overflow 8, GPU finished 9, pipeline statistics 10): the statistic is the query index, in the upper half of the word (PIPE_STAT_QUERY_*: IA_VERTICES 0, IA_PRIMITIVES 1, VS_INVOCATIONS 2, PS_INVOCATIONS 7)
 constexpr uint32_t kQueryStateDone = 1;         // virgl_host_query_state::query_state once the host wrote the result (state, size, 64-bit result: 16 bytes)
 constexpr uint32_t kTargetBuffer = 0;
 constexpr uint32_t kTargetTexture2d = 2, kTargetTexture3d = 3, kTargetTextureCube = 4, kTargetTexture2dArray = 7;   // (PIPE_TEXTURE_*)
@@ -101,7 +109,7 @@ constexpr uint32_t kShaderCompute = 5;   // (PIPE_SHADER_COMPUTE)
 constexpr uint32_t kBindShaderBuffer = 1u << 14;   // a buffer compute shaders read and write
 constexpr uint32_t kShaderVertex = 0;
 constexpr uint32_t kShaderFragment = 1;
-constexpr uint32_t kPrimPoints = 0, kPrimLines = 1, kPrimTriangles = 4;
+constexpr uint32_t kPrimPoints = 0, kPrimLines = 1, kPrimTriangles = 4, kPrimLinesAdjacency = 10, kPrimTrianglesAdjacency = 12;
 constexpr uint32_t kFuncLess = 1, kFuncLequal = 3, kFuncAlways = 7;
 constexpr uint32_t kBlendAdd = 0;   // (PIPE_BLEND_ADD, SUBTRACT, REVERSE_SUBTRACT, MIN, MAX: 0 .. 4, as BlendOp)
 constexpr uint32_t kBlendFactors[] = {0x11, 1, 2, 0x12, 3, 0x13, 5, 0x15, 4, 0x14, 6};   // by BlendFactor: ZERO ONE SRC_COLOR INV_SRC_COLOR SRC_ALPHA INV_SRC_ALPHA DST_COLOR INV_DST_COLOR DST_ALPHA INV_DST_ALPHA SRC_ALPHA_SATURATE

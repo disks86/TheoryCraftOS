@@ -213,8 +213,9 @@ class Adapter::StreamRunner {
       case Op::Dispatch: return dispatch(p);
       case Op::SetTopology: {
         const uint32_t topology = p.le32();
-        if (!exact(p) || topology > kPatchListBase + graphics::kMaxPatchControlPoints) return kBad;
-        if (topology > static_cast<uint32_t>(Topology::PointList) && !(adapter_.caps_.features & graphics::kFeatureTessellation)) return kBad;
+        const bool adjacency = topology == static_cast<uint32_t>(Topology::LineListAdjacency) || topology == static_cast<uint32_t>(Topology::TriangleListAdjacency);
+        if (!exact(p) || (!adjacency && topology > kPatchListBase + graphics::kMaxPatchControlPoints)) return kBad;
+        if (adjacency ? !(adapter_.caps_.features & graphics::kFeatureGeometryShaders) : (topology > static_cast<uint32_t>(Topology::PointList) && !(adapter_.caps_.features & graphics::kFeatureTessellation))) return kBad;
         topology_ = static_cast<Topology>(topology);
         return status::kSuccess;
       }
@@ -224,7 +225,10 @@ class Adapter::StreamRunner {
 
   NtStatus begin_query(ByteReader& p) {
     const uint32_t index = p.le32(), offset = p.le32();
+    uint32_t kind = 0;
+    if (!p.at_end()) kind = p.le32();
     if (!exact(p) || !in_pass_ || query_open_ || !(adapter_.caps_.features & graphics::kFeatureOcclusionQueries)) return kBad;
+    if (kind > static_cast<uint32_t>(graphics::QueryKind::PsInvocations) || (kind != 0 && !(adapter_.caps_.features & graphics::kFeatureStatisticsQueries))) return kBad;
     Allocation* a = alloc(index);
     if (!a || !a->is_query_result() || offset % 8 || offset > a->desc().size - 8) return kBad;
     if (queries_in_stream_ >= graphics::kMaxOcclusionQueries) return kBad;
@@ -234,7 +238,7 @@ class Adapter::StreamRunner {
     const NtStatus s = ensure_cb();
     if (s != status::kSuccess) return s;
     if (!pending_.push_back({a, offset, next_slot_})) return status::kNoMemory;
-    cb_->begin_occlusion_query(next_slot_++);
+    cb_->begin_query(next_slot_++, static_cast<graphics::QueryKind>(kind));
     return status::kSuccess;
   }
 
@@ -506,6 +510,7 @@ class Adapter::StreamRunner {
     if (topology_ >= Topology::LineList && topology_ <= Topology::PointList && !(adapter_.caps_.features & graphics::kFeatureLines)) return kBad;
     // Patches go with a hull and a domain shader that take that many control points, and those shaders go with patches (and with no geometry shader).
     if (is_patch_list(topology_) != pipeline_->has_tessellation()) return kBad;
+    if (is_adjacency(topology_) && !pipeline_->has_geometry()) return kBad;   // (only a geometry shader takes the neighbours)
     if (pipeline_->has_tessellation() && (patch_points(topology_) != pipeline_->tess_input_points() || pipeline_->has_geometry())) return kBad;
     for (uint32_t u = 0; u < pipeline_->texture_count(); ++u)
       if (!texture_bound_[u] || texture_alloc_[u]->texture_kind() != pipeline_->texture_kind(u)) return kBad;   // (unbound, or a volume where the shader reads a 2D texture, ...)
@@ -516,7 +521,9 @@ class Adapter::StreamRunner {
         if (pass_extra_[n] && is_integer(pass_extra_[n]->desc().format)) return kBad;
     }
     if (pipeline_->has_geometry()) {   // (the geometry shader takes the primitives the draw makes)
-      const graphics::GeometryPrimitive made = topology_ == Topology::LineList || topology_ == Topology::LineStrip ? graphics::GeometryPrimitive::Line
+      const graphics::GeometryPrimitive made = topology_ == Topology::LineListAdjacency ? graphics::GeometryPrimitive::LineAdjacency
+                                               : topology_ == Topology::TriangleListAdjacency ? graphics::GeometryPrimitive::TriangleAdjacency
+                                               : topology_ == Topology::LineList || topology_ == Topology::LineStrip ? graphics::GeometryPrimitive::Line
                                                : topology_ == Topology::PointList ? graphics::GeometryPrimitive::Point : graphics::GeometryPrimitive::Triangle;
       if (made != pipeline_->geometry_input()) return kBad;
     }
@@ -564,7 +571,7 @@ class Adapter::StreamRunner {
         device_patch_points_ = patch_points(topology_);
       }
     } else {
-      set_device_topology(topology_ == Topology::LineList ? graphics::PrimitiveTopology::LineList : topology_ == Topology::PointList ? graphics::PrimitiveTopology::PointList : graphics::PrimitiveTopology::TriangleList);
+      set_device_topology(topology_ == Topology::LineListAdjacency ? graphics::PrimitiveTopology::LineListAdjacency : topology_ == Topology::TriangleListAdjacency ? graphics::PrimitiveTopology::TriangleListAdjacency : topology_ == Topology::LineList ? graphics::PrimitiveTopology::LineList : topology_ == Topology::PointList ? graphics::PrimitiveTopology::PointList : graphics::PrimitiveTopology::TriangleList);
     }
     if (indexed && index_rebind_) {   // (an expanded draw left its own indices bound)
       cb_->bind_index_buffer(index_->buffer(), index_bytes_ == 4 ? graphics::IndexType::Uint32 : graphics::IndexType::Uint16, index_offset_);
@@ -965,7 +972,8 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
         static_cast<uint32_t>(t.color_op) > 4 || static_cast<uint32_t>(t.alpha_op) > 4 || t.write_mask > 0xF)
       return status::kInvalidParameter;
   if (d.independent_blend && !(caps_.features & graphics::kFeatureIndependentBlend)) return status::kNotSupported;
-  if (d.multisample && !(caps_.features & graphics::kFeatureMultisample)) return status::kNotSupported;
+  if ((d.multisample || d.alpha_to_coverage) && !(caps_.features & graphics::kFeatureMultisample)) return status::kNotSupported;
+  if (d.alpha_to_coverage && !d.multisample) return status::kInvalidParameter;
   if (hull || domain) {
     if (!hull || !domain || hull->stage() != graphics::ShaderStage::Hull || domain->stage() != graphics::ShaderStage::Domain || hull->tess_output_points() != domain->tess_input_points() || hull->tess_domain() != domain->tess_domain()) return status::kInvalidParameter;
     if (!(caps_.features & graphics::kFeatureTessellation)) return status::kNotSupported;
@@ -995,6 +1003,7 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   pd.blend = bs;
   pd.independent_blend = d.independent_blend;
   pd.multisample = d.multisample;
+  pd.alpha_to_coverage = d.alpha_to_coverage;
   pd.geometry_shader = geometry ? geometry->module() : nullptr;
   pd.hull_shader = hull ? hull->module() : nullptr;
   pd.domain_shader = domain ? domain->module() : nullptr;

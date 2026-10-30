@@ -18,6 +18,7 @@
 
 #include <initializer_list>
 #include "Graphics/Graphics3D/Virgl/VirglDevice.hpp"
+#include "Graphics/WidePixels.hpp"
 #include <new>
 #include "Graphics/Graphics3D/Virgl/VirglProtocol.hpp"
 #include "Utility/AllocatedView.hpp"
@@ -165,8 +166,20 @@ class VirglImage final : public IImage {
     hardware::VirtioGpu& gpu = device.gpu();
     id_ = gpu.allocate_resource_id();
     const bool depth = desc.format == Format::D32Float;
-    color_format_ = desc.format == Format::R32G32B32A32Float ? virgl::kFormatR32G32B32A32Float : desc.format == Format::R16G16B16A16Float ? virgl::kFormatR16G16B16A16Float
-                    : desc.format == Format::R16G16B16A16Unorm ? virgl::kFormatR16G16B16A16Unorm : desc.format == Format::R32G32B32A32Uint ? virgl::kFormatR32G32B32A32Uint : desc.format == Format::B8G8R8A8Srgb ? virgl::kFormatB8G8R8A8Srgb : virgl::kFormatB8G8R8A8Unorm;
+    switch (desc.format) {
+      case Format::R32G32B32A32Float: color_format_ = virgl::kFormatR32G32B32A32Float; break;
+      case Format::R16G16B16A16Float: color_format_ = virgl::kFormatR16G16B16A16Float; break;
+      case Format::R16G16B16A16Unorm: color_format_ = virgl::kFormatR16G16B16A16Unorm; break;
+      case Format::R32G32B32A32Uint: color_format_ = virgl::kFormatR32G32B32A32Uint; break;
+      case Format::R32G32B32A32Sint: color_format_ = virgl::kFormatR32G32B32A32Sint; break;
+      case Format::R16G16B16A16Uint: color_format_ = virgl::kFormatR16G16B16A16Uint; break;
+      case Format::R16G16B16A16Sint: color_format_ = virgl::kFormatR16G16B16A16Sint; break;
+      case Format::R8G8B8A8Uint: color_format_ = virgl::kFormatR8G8B8A8Uint; break;
+      case Format::R16G16B16A16Snorm: color_format_ = virgl::kFormatR16G16B16A16Snorm; break;
+      case Format::R10G10B10A2Unorm: color_format_ = virgl::kFormatR10G10B10A2Unorm; break;
+      case Format::B8G8R8A8Srgb: color_format_ = virgl::kFormatB8G8R8A8Srgb; break;
+      default: color_format_ = virgl::kFormatB8G8R8A8Unorm; break;
+    }
     const uint32_t depth_format = desc.stencil ? virgl::kFormatZ32FloatS8X24Uint : virgl::kFormatZ32Float;
     // A sampled image is stored top row first, the way write_pixels() gives it and the sampler reads it, so it does not take the Y_0_TOP flip of the images that are only
     // drawn into (and shown).
@@ -267,19 +280,7 @@ class VirglImage final : public IImage {
     TransferHost3d transfer{header(kCmdTransferFromHost3d), {0, 0, 0, desc_.extent.width, desc_.extent.height, 1}, 0, id_, 0, desc_.extent.width * bytes_per_pixel(desc_.format), 0};
     if (!device_.gpu().command(as_bytes(transfer))) return false;
     ByteReader in{ConstByteView(backing_)};
-    for (uint64_t i = 0; i < count; ++i) {
-      if (desc_.format == Format::R16G16B16A16Float) {
-        const float r = half_to_float(in.le16()), g = half_to_float(in.le16()), b = half_to_float(in.le16()), a = half_to_float(in.le16());
-        out[i] = {r, g, b, a};
-      } else if (desc_.format == Format::R16G16B16A16Unorm) {
-        constexpr float k = 1.0f / 65535.0f;
-        const float r = static_cast<float>(in.le16()) * k, g = static_cast<float>(in.le16()) * k, b = static_cast<float>(in.le16()) * k, a = static_cast<float>(in.le16()) * k;
-        out[i] = {r, g, b, a};
-      } else {
-        const float r = __builtin_bit_cast(float, in.le32()), g = __builtin_bit_cast(float, in.le32()), b = __builtin_bit_cast(float, in.le32()), a = __builtin_bit_cast(float, in.le32());
-        out[i] = {r, g, b, a};
-      }
-    }
+    for (uint64_t i = 0; i < count; ++i) out[i] = decode_wide_pixel(desc_.format, in);
     return in.ok();
   }
 
@@ -287,16 +288,7 @@ class VirglImage final : public IImage {
     const uint64_t count = uint64_t{desc_.extent.width} * desc_.extent.height;
     if (!is_wide_format(desc_.format) || !(desc_.usage & kImageSampled) || pixels.size() != count || !ensure_backing(count)) return false;
     ByteWriter out{backing_};
-    for (const Vec4& c : pixels) {
-      if (desc_.format == Format::R16G16B16A16Float) {
-        out.le16(float_to_half(c.x)), out.le16(float_to_half(c.y)), out.le16(float_to_half(c.z)), out.le16(float_to_half(c.w));
-      } else if (desc_.format == Format::R16G16B16A16Unorm) {
-        auto q = [](float v) { return static_cast<uint32_t>(!(v > 0.0f) ? 0.0f : v >= 1.0f ? 65535.0f : v * 65535.0f + 0.5f); };
-        out.le16(q(c.x)), out.le16(q(c.y)), out.le16(q(c.z)), out.le16(q(c.w));
-      } else {
-        out.le32(__builtin_bit_cast(uint32_t, c.x)), out.le32(__builtin_bit_cast(uint32_t, c.y)), out.le32(__builtin_bit_cast(uint32_t, c.z)), out.le32(__builtin_bit_cast(uint32_t, c.w));
-      }
-    }
+    for (const Vec4& c : pixels) encode_wide_pixel(desc_.format, c, out);
     if (!out.ok()) return false;
     TransferHost3d transfer{header(kCmdTransferToHost3d), {0, 0, 0, desc_.extent.width, desc_.extent.height, 1}, 0, id_, 0, desc_.extent.width * bytes_per_pixel(desc_.format), 0};
     return device_.gpu().command(as_bytes(transfer));
@@ -354,7 +346,7 @@ class VirglShaderModule final : public IShaderModule {
     cmd[2] = desc.stage == ShaderStage::Vertex ? virgl::kShaderVertex : desc.stage == ShaderStage::Compute ? virgl::kShaderCompute : desc.stage == ShaderStage::Geometry ? virgl::kShaderGeometry : desc.stage == ShaderStage::Hull ? virgl::kShaderTessControl : desc.stage == ShaderStage::Domain ? virgl::kShaderTessEval : virgl::kShaderFragment;
     cmd[3] = length;                         // total text length (no continuation bit: it all fits)
     cmd[4] = length < 300 ? 300 : length;    // upper bound on the TGSI token count the host reserves
-    cmd[5] = 0;                              // no stream output
+    cmd[5] = desc.stage == ShaderStage::Compute ? desc.shared_memory_bytes : 0;   // no stream output; for a compute shader the group-shared memory it needs, in bytes
     cmd[6 + text_dwords - 1] = 0;
     __builtin_memcpy(&cmd[6], desc.tgsi, length - 1);
     ok_ = device.send_commands(cmd, total);
@@ -476,7 +468,7 @@ class VirglPipeline final : public VirglPipelineBase {
     }
     cmd[n++] = virgl::header(virgl::kCreateObject, virgl::kObjectBlend, 11);
     cmd[n++] = blend_;
-    cmd[n++] = desc.independent_blend ? 1u : 0u;  // s0: independent blend enable (no logic op, dither...)
+    cmd[n++] = (desc.independent_blend ? 1u : 0u) | (desc.alpha_to_coverage && desc.multisample ? 1u << 3 : 0u);  // s0: independent blend enable, alpha to coverage (no logic op, dither...)
     cmd[n++] = 0;  // s1
     cmd[n++] = blend_rt;
     for (uint32_t i = 1; i < 8; ++i) cmd[n++] = desc.independent_blend && i < kMaxColorTargets ? (desc.target_blend[i - 1].custom ? render_target_blend(desc.target_blend[i - 1]) : 0xFu << 27) : 0u;
@@ -907,13 +899,18 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         break;
       }
       case RecordedCommand::Type::BeginQuery: {
-        if (!in_pass || queries.open != kMaxOcclusionQueries || cmd.unit >= kMaxOcclusionQueries || queries.used[cmd.unit]) return false;
+        if (!in_pass || queries.open != kMaxOcclusionQueries || cmd.unit >= kMaxOcclusionQueries || queries.used[cmd.unit] || cmd.count > static_cast<uint32_t>(QueryKind::PsInvocations)) return false;
         queries.results[cmd.unit] = make<VirglBuffer>(gpu_.allocator(), *this, 16, 0, virgl::kBindCustom);
         if (!queries.results[cmd.unit] || !queries.results[cmd.unit]->valid()) return false;
         const uint32_t handle = new_handle();
         stream.command(virgl::kCreateObject, virgl::kObjectQuery, 4);
         stream.put(handle);
-        stream.put(virgl::kQueryOcclusionCounter);
+        {
+          const QueryKind kind = static_cast<QueryKind>(cmd.count);
+          stream.put(kind == QueryKind::Occlusion ? virgl::kQueryOcclusionCounter
+                     : kind == QueryKind::OcclusionPredicate ? virgl::kQueryOcclusionPredicate
+                                                             : virgl::kQueryPipelineStatistics | ((kind == QueryKind::IaVertices ? 0u : kind == QueryKind::IaPrimitives ? 1u : kind == QueryKind::VsInvocations ? 2u : 7u) << 16));
+        }
         stream.put(0);
         stream.put(queries.results[cmd.unit]->id());
         stream.command(virgl::kBeginQuery, 0, 1);
@@ -1061,7 +1058,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         stream.command(virgl::kDrawVbo, 0, patches ? 14 : 12);
         stream.put(cmd.first);
         stream.put(cmd.count);
-        stream.put(patches ? virgl::kPrimPatches : topology == PrimitiveTopology::LineList ? virgl::kPrimLines : topology == PrimitiveTopology::PointList ? virgl::kPrimPoints : virgl::kPrimTriangles);
+        stream.put(patches ? virgl::kPrimPatches : topology == PrimitiveTopology::LineListAdjacency ? virgl::kPrimLinesAdjacency : topology == PrimitiveTopology::TriangleListAdjacency ? virgl::kPrimTrianglesAdjacency : topology == PrimitiveTopology::LineList ? virgl::kPrimLines : topology == PrimitiveTopology::PointList ? virgl::kPrimPoints : virgl::kPrimTriangles);
         stream.put(indexed ? 1 : 0);
         stream.put(cmd.instance_count);
         stream.put(static_cast<uint32_t>(cmd.vertex_offset));

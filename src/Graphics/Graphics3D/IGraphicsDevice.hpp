@@ -256,13 +256,15 @@ using FragmentShaderFnEx = bool (*)(const Vec4* varyings, const FragmentContext&
 // Geometry shaders (kFeatureGeometryShaders), between the vertex shader and the rasterizer: one invocation per primitive of the draw (a list triangle, line or point - the kernel expands
 // strips and fans), given the primitive's vertices as the vertex shader made them (clip space, before the perspective divide) and emitting up to the module's maximum of vertices, which
 // make a strip of the module's output topology (a cut ends a strip and starts the next). The software device calls a function; virgl takes TGSI text.
-enum class GeometryPrimitive : uint8_t { Point, Line, Triangle };
+enum class GeometryPrimitive : uint8_t { Point, Line, Triangle, LineAdjacency, TriangleAdjacency };   // (the adjacency ones take 4 and 6 vertices: the PrimitiveTopology LineListAdjacency / TriangleListAdjacency draws)
+constexpr uint32_t kMaxGeometryInputVertices = 6;
 enum class GeometryTopology : uint8_t { PointList, LineStrip, TriangleStrip };
 constexpr uint32_t kMaxGeometryVertices = 64;   // the most a module's maximum may be
 struct GeometryInputData {
-  Vec4 position[3];
-  Vec4 varying[3][kMaxVaryings];
+  Vec4 position[kMaxGeometryInputVertices];
+  Vec4 varying[kMaxGeometryInputVertices][kMaxVaryings];
   uint32_t primitive_id = 0;   // the number of the primitive in the draw
+  uint32_t instance_id = 0;    // SV_GSInstanceID: which of the shader's instances this run is (it runs geometry_instances times for each primitive)
 };
 struct GeometryOutputData {
   uint32_t count = 0;
@@ -300,14 +302,21 @@ using DomainShaderFn = void (*)(const HullOutputData& patch, float u, float v, f
 // in order (no barriers or group-shared memory: a module that needs them is not given a function). `buffers` are the storage buffers bound at the time (empty views for slots
 // that are not bound); a read or write outside a buffer must be dropped or read as zero by the shader.
 constexpr uint32_t kMaxStorageBuffers = 4;
+constexpr uint32_t kMaxSharedMemories = 4;     // group-shared memories (g0 .. g3) of a compute shader (the group runner makes them: a context's `shared`)
+constexpr uint32_t kMaxSharedBytes = 32768;   // all of them together (Direct3D's limit)
+constexpr uint32_t kMaxBarrierThreads = 256;  // threads of a group that uses barriers (each has its own registers while it waits)
 struct ComputeContext {
   uint32_t group_id[3] = {};      // SV_GroupID
   uint32_t thread_id[3] = {};     // SV_GroupThreadID
   uint32_t dispatch_id[3] = {};   // SV_DispatchThreadID: group_id * thread group size + thread_id
   uint32_t group_index = 0;       // SV_GroupIndex: the thread's number in its group
   ByteView buffers[kMaxStorageBuffers];
+  ByteView shared[kMaxSharedMemories];   // (made by a group function for the group it runs)
 };
 using ComputeShaderFn = void (*)(const ComputeContext& context, const uint8_t* constants);
+// A compute shader that uses group-shared memory or barriers is run a whole group at a time: the function runs all the threads of the group named by group_id (thread_id, dispatch_id and
+// group_index of the context are ignored), keeping them in step at the barriers, with memory of its own for the group-shared registers.
+using ComputeGroupShaderFn = ComputeShaderFn;
 // Most threads in a group and most groups (in each dimension) of a dispatch.
 constexpr uint32_t kMaxThreadsPerGroup = 1024;
 constexpr uint32_t kMaxDispatchGroups = 65535;
@@ -336,7 +345,10 @@ struct ShaderModuleDesc {
   GeometryShaderFn geometry_function = nullptr;
   GeometryPrimitive geometry_input = GeometryPrimitive::Triangle;
   GeometryTopology geometry_output = GeometryTopology::TriangleStrip;
+  ComputeGroupShaderFn compute_group_function = nullptr;   // compute: instead of compute_function, for a shader with group-shared memory or barriers
+  uint32_t shared_memory_bytes = 0;                        // ... and how much group-shared memory it declares (virgl makes it with the shader)
   uint32_t geometry_max_vertices = 0;
+  uint32_t geometry_instances = 1;   // runs of a geometry shader for each primitive (1 .. 32)
   // Hull and domain shaders (stages Hull and Domain): functions for the software device (virgl: TGSI text), the control points taken and made, and the tessellator's settings (both stages say them).
   HullShaderFn hull_function = nullptr;
   DomainShaderFn domain_function = nullptr;
@@ -429,6 +441,9 @@ struct GraphicsPipelineDesc {
   // kFeatureMultisample, on a pass with several samples per pixel: with multisample the triangle covers the samples whose positions it contains and depth and stencil are tested for each
   // (the shader still runs once per pixel); without it a pixel is all or nothing by its centre, as Direct3D 9 draws. Lines and points cover every sample of their pixel.
   bool multisample = false;
+  // With multisample: the samples a pixel's shader result reaches are the first round(alpha * samples) of the covered ones, alpha being the first target's (which samples of a partly
+  // covered pixel get it is up to the device; of a wholly covered pixel, only how many - and a real GPU may truncate where this rounds: 0.7 of 4 samples kept 2 on the one tried).
+  bool alpha_to_coverage = false;
   // kFeatureGeometryShaders: a geometry shader module run between the vertex and fragment shaders (nullptr: none). What it takes must be what the draws make (triangles, lines or points).
   const IShaderModule* geometry_shader = nullptr;
   // kFeatureTessellation: the hull and domain shader modules of a pipeline for PatchList draws (both or neither).
@@ -456,7 +471,8 @@ class IPipeline {
 enum class IndexType : uint8_t { Uint16, Uint32 };
 
 // What the vertices of a draw make (set_primitive_topology, DeviceFeature kFeatureLines for anything but triangles). Lines and points are one pixel wide.
-enum class PrimitiveTopology : uint8_t { TriangleList, LineList, PointList, PatchList };   // (PatchList: kFeatureTessellation, with set_patch_control_points)
+enum class QueryKind : uint8_t { Occlusion, OcclusionPredicate, IaVertices, IaPrimitives, VsInvocations, PsInvocations };
+enum class PrimitiveTopology : uint8_t { TriangleList, LineList, PointList, PatchList, LineListAdjacency, TriangleListAdjacency };   // (the adjacency lists need a geometry shader that takes them)   // (PatchList: kFeatureTessellation, with set_patch_control_points)
 
 struct Viewport {
   float x = 0, y = 0, width = 0, height = 0;
@@ -517,6 +533,12 @@ class ICommandBuffer {
   // discard) are counted - one per pixel, however many targets the pipeline writes and whatever the blending or write masks do. `slot` (below kMaxOcclusionQueries) names the result; one query is open at a time and
   // it ends before the pass does. A device without the feature ignores both.
   virtual void begin_occlusion_query(uint32_t slot) { (void)slot; }
+  // The other queries (kFeatureStatisticsQueries), begun and ended the same way and read with occlusion_result: OcclusionPredicate is 1 if any fragment passed, else 0; IaVertices the vertices
+  // the draws between begin and end took (a draw of n vertices and i instances: n * i), IaPrimitives the primitives they assembled (a patch is a primitive), VsInvocations the vertex shader
+  // runs (a device may run it fewer times than there are vertices, by reusing results) and PsInvocations the fragment shader runs (a device may shade more pixels than it writes).
+  virtual void begin_query(uint32_t slot, QueryKind kind) {
+    if (kind == QueryKind::Occlusion) begin_occlusion_query(slot);
+  }
   virtual void end_occlusion_query() {}
   // After submit(): the count of a query that was begun and ended (false for a slot that was not).
   virtual bool occlusion_result(uint32_t slot, uint64_t* samples) const {
@@ -544,9 +566,11 @@ enum DeviceFeature : uint32_t {
   kFeatureLines = 1u << 4,         // set_primitive_topology: lines and points
   kFeatureFloatFormats = 1u << 6,      // Format::R16G16B16A16Float / R32G32B32A32Float images: colour attachments (also several at once) and sampled textures, without mipmaps; read_pixels_float / write_pixels_float
   kFeatureTessellation = 1u << 16,     // ShaderStage::Hull / Domain, GraphicsPipelineDesc::hull_shader / domain_shader, PrimitiveTopology::PatchList
+  kFeatureStatisticsQueries = 1u << 18,  // QueryKind other than Occlusion (with kFeatureOcclusionQueries)
+  kFeatureSnormFormats = 1u << 17,     // Format::R16G16B16A16Snorm, R10G10B10A2Unorm
   kFeatureSrgbFormats = 1u << 13,      // Format::B8G8R8A8Srgb / R8G8B8A8Srgb
   kFeatureUnorm16Formats = 1u << 14,   // Format::R16G16B16A16Unorm (also kFeatureFloatFormats' read_pixels_float / write_pixels_float)
-  kFeatureIntegerFormats = 1u << 15,   // Format::R32G32B32A32Uint
+  kFeatureIntegerFormats = 1u << 15,   // Format::R32G32B32A32Uint, R32G32B32A32Sint, R16G16B16A16Uint / Sint, R8G8B8A8Uint
   kFeatureGeometryShaders = 1u << 12,  // GraphicsPipelineDesc::geometry_shader, ShaderStage::Geometry modules
   kFeatureMultisample = 1u << 11,      // ImageDesc::samples, GraphicsPipelineDesc::multisample, ICommandBuffer::resolve_image
   kFeatureCompute = 1u << 10,          // compute shaders: create_compute_pipeline, kBufferStorage buffers, ICommandBuffer::dispatch

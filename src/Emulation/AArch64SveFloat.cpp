@@ -130,11 +130,16 @@ uint64_t flogb(Format f, uint64_t x, uint32_t w, Env& env) {
   const int64_t exp_field = static_cast<int64_t>((x >> M) & ones(E)), bias = (int64_t{1} << (E - 1)) - 1;
   uint64_t frac = x & ones(M);
   const uint64_t minimum = uint64_t{1} << (w - 1);
-  if (exp_field == static_cast<int64_t>(ones(E)) || (exp_field == 0 && frac == 0)) {      // NaN, infinity, zero
+  if (exp_field == static_cast<int64_t>(ones(E))) {      // infinity: the largest integer; a NaN: the smallest, with Invalid
+    if (frac == 0) return minimum - 1;
     env.flags |= kInvalid;
     return minimum;
   }
-  if (exp_field == 0) {
+  if (exp_field == 0 && frac == 0) {      // zero is invalid
+    env.flags |= kInvalid;
+    return minimum;
+  }
+  if (exp_field == 0) {      // a denormal has an exponent like any other number
     int64_t e = 1 - bias;
     while (!((frac >> (M - 1)) & 1)) { frac <<= 1; --e; }
     return static_cast<uint64_t>(e - 1) & ones(w);
@@ -465,7 +470,7 @@ bool AArch64Cpu::sve_float(uint32_t insn) {
           return finish();
         }
         // integer conversions: bits 20:19 = 10 (SCVTF / UCVTF) or 11 (FCVTZS / FCVTZU), bits 18:17 the size pair, bit 16 the signedness
-        if (bits_of(insn, 21, 19) == 2 || bits_of(insn, 21, 19) == 3) {
+        if (size != 0 && (bits_of(insn, 21, 19) == 2 || bits_of(insn, 21, 19) == 3)) {
           if (bits_of(insn, 21, 21) != 0) return false;
           const bool to_float = bits_of(insn, 20, 19) == 2;
           const uint32_t opc = size, opc2 = bits_of(insn, 18, 17);
@@ -559,29 +564,135 @@ bool AArch64Cpu::sve_float(uint32_t insn) {
     const uint16_t gp = s_.p[pg];
     if (b21) {
       const uint32_t op = bits_of(insn, 15, 10);
-      if ((op & 0x3E) == 0 || op == 0x08) {      // FMLA / FMLS / FMUL by element
-        uint32_t index, zmr;
-        uint32_t e;
+      const bool half_family = !((insn >> 23) & 1);      // sizes 00 and 01 both mean half precision here (bit 22 is an index bit)
+      if (op == 0 || op == 1 || op == 8 || (half_family && (op == 2 || op == 3 || op == 0x0A))) {      // FMLA / FMLS / FMUL by element; BFMLA / BFMLS / BFMUL (BFloat16) for ops 2, 3, 10
+        const bool bfloat = op == 2 || op == 3 || op == 0x0A;
+        uint32_t index, zmr, e;
         if (size == 0 || size == 1) { e = 1; index = ((size & 1) << 2) | bits_of(insn, 20, 19); zmr = bits_of(insn, 18, 16); }
         else if (size == 2) { e = 2; index = bits_of(insn, 20, 19); zmr = bits_of(insn, 18, 16); }
         else { e = 3; index = (insn >> 20) & 1; zmr = bits_of(insn, 19, 16); }
-        const Format f = format_of(e, false);
+        const Format f = format_of(e, bfloat);
         const uint64_t y = get(s_.v[zmr], e, index);
         const Vec a = s_.v[zn];
         for (uint32_t i = 0; i < element_count(e); ++i) {
           const uint64_t x = get(a, e, i);
           uint64_t r;
-          if (op == 0x08) r = mul(f, x, y, env);
+          if (op == 0x08 || op == 0x0A) r = mul(f, x, y, env);
           else {
             const uint64_t acc = get(*dst, e, i);
-            r = op & 1 ? fused_multiply_add(f, negate(f, x), y, acc, env) : fused_multiply_add(f, x, y, acc, env);
+            r = (op & 1) ? fused_multiply_add(f, negate(f, x), y, acc, env) : fused_multiply_add(f, x, y, acc, env);
           }
           put(dst, e, i, nan_fix(f, r));
         }
         return finish();
       }
-      if ((op & 0x3C) == 0x04) {      // FCMLA by element: bits 15:12 = 0001
-        return false;
+      if ((op >> 2) == 1) {      // FCMLA by element (bits 15:12 = 0001, rotation in bits 11:10): size 10 half precision, 11 single
+        if (size < 2) return false;
+        const uint32_t e = size - 1, rot = op & 3;
+        const uint32_t zmr = size == 3 ? bits_of(insn, 19, 16) : bits_of(insn, 18, 16), pair = size == 3 ? (insn >> 20) & 1 : bits_of(insn, 20, 19);
+        const Format f = format_of(e, false);
+        const Vec a = s_.v[zn], b = s_.v[zmr], old = *dst;
+        const uint64_t re_b = get(b, e, 2 * pair), im_b = get(b, e, 2 * pair + 1);
+        for (uint32_t p = 0; p < element_count(e) / 2; ++p) {
+          const uint64_t re_a = get(a, e, 2 * p), im_a = get(a, e, 2 * p + 1);
+          uint64_t e1, e2, e3, e4;
+          switch (rot) {
+            case 0: e1 = re_a; e2 = re_b; e3 = re_a; e4 = im_b; break;
+            case 1: e1 = negate(f, im_a); e2 = im_b; e3 = im_a; e4 = re_b; break;
+            case 2: e1 = negate(f, re_a); e2 = re_b; e3 = negate(f, re_a); e4 = im_b; break;
+            default: e1 = im_a; e2 = im_b; e3 = negate(f, im_a); e4 = re_b; break;
+          }
+          put(dst, e, 2 * p, nan_fix(f, fused_multiply_add(f, e2, e1, get(old, e, 2 * p), env)));
+          put(dst, e, 2 * p + 1, nan_fix(f, fused_multiply_add(f, e4, e3, get(old, e, 2 * p + 1), env)));
+        }
+        return finish();
+      }
+      if (op == 0x09) {      // FCLAMP, BFCLAMP
+        const Format f = format_of(esz, bf_size);
+        const Vec lo = s_.v[zn], hi = s_.v[zm];
+        for (uint32_t i = 0; i < elements; ++i) {
+          const uint64_t r = arm_minmax(f, arm_minmax(f, get(*dst, esz, i), get(lo, esz, i), true, true, env), get(hi, esz, i), false, true, env);
+          put(dst, esz, i, nan_fix(f, r));
+        }
+        return finish();
+      }
+      // BFloat16 and half-precision dot products and widening multiply-adds (the products are exact in single precision)
+      Env& benv = env;      // (the BFloat16 widening multiply-adds use the ordinary floating-point environment)
+      auto bf_f32 = [](uint64_t v) { return (v & 0xFFFF) << 16; };
+      auto widen = [&](uint64_t v, bool bfloat, Env& e) { return bfloat ? bf_f32(v) : convert(Format::F16, Format::F32, v, e); };
+      // The BFloat16 dot products and matrix multiply round to odd at every step, flush denormals, produce the default NaN and report no exceptions.
+      auto odd_op = [&](bool is_mul, uint64_t x, uint64_t y) -> uint64_t {
+        if (is_nan(Format::F32, x) || is_nan(Format::F32, y)) return 0x7FC00000u;
+        Env e = env;
+        e.mode = Rounding::TowardZero;
+        e.flags = 0;
+        e.daz = true;
+        e.ftz = true;
+        uint64_t r = is_mul ? mul(Format::F32, x, y, e) : add(Format::F32, x, y, e);
+        if (is_nan(Format::F32, r)) return 0x7FC00000u;
+        if (e.flags & kOverflow) return (r & 0x80000000u) | 0x7F800000u;      // (an overflow gives an infinity)
+        if ((e.flags & kInexact) && (r & 0x7FFFFFFFu) != 0x7F800000u) r |= 1;
+        return r;
+      };
+      auto bf_dot_add = [&](uint64_t sum, uint64_t a0, uint64_t a1, uint64_t b0, uint64_t b1) {
+        const uint64_t p1 = odd_op(true, bf_f32(a0), bf_f32(b0)), p2 = odd_op(true, bf_f32(a1), bf_f32(b1));
+        return odd_op(false, sum, odd_op(false, p1, p2));
+      };
+      if ((op == 0x20 && size <= 1) || (op == 0x10 && size <= 1)) {      // FDOT, BFDOT (vectors: op 0x20; by element: op 0x10)
+        const bool bfloat = size == 1;
+        uint32_t zmr = zm, index = 0;
+        if (op == 0x10) { zmr = bits_of(insn, 18, 16); index = bits_of(insn, 20, 19); }
+        const Vec n = s_.v[zn], m = s_.v[zmr];
+        for (uint32_t i = 0; i < 4; ++i) {
+          const uint32_t mi = op == 0x10 ? index : i;
+          if (bfloat) {
+            put(dst, 2, i, bf_dot_add(get(*dst, 2, i), get(n, 1, 2 * i), get(n, 1, 2 * i + 1), get(m, 1, 2 * mi), get(m, 1, 2 * mi + 1)));
+          } else {
+            const uint64_t a0 = widen(get(n, 1, 2 * i), false, env), a1 = widen(get(n, 1, 2 * i + 1), false, env);
+            const uint64_t b0 = widen(get(m, 1, 2 * mi), false, env), b1 = widen(get(m, 1, 2 * mi + 1), false, env);
+            const uint64_t t = add(Format::F32, mul(Format::F32, a0, b0, env), mul(Format::F32, a1, b1, env), env);
+            put(dst, 2, i, nan_fix(Format::F32, add(Format::F32, get(*dst, 2, i), t, env)));
+          }
+        }
+        return finish();
+      }
+      if (op == 0x39) {      // BFMMLA / FMMLA (single precision): 2x2 matrices in each quadword
+        if (size == 3) return false;
+        const Vec n = s_.v[zn], m = s_.v[zm], old = *dst;
+        Vec r;
+        for (uint32_t i = 0; i < 2; ++i)
+          for (uint32_t j = 0; j < 2; ++j) {
+            uint64_t acc = get(old, 2, 2 * i + j);
+            if (size == 1) {
+              for (uint32_t k = 0; k < 2; ++k)
+                acc = bf_dot_add(acc, get(n, 1, 4 * i + 2 * k), get(n, 1, 4 * i + 2 * k + 1), get(m, 1, 4 * j + 2 * k), get(m, 1, 4 * j + 2 * k + 1));
+            } else {
+              const uint64_t t = add(Format::F32, mul(Format::F32, get(n, 2, 2 * i), get(m, 2, 2 * j), env), mul(Format::F32, get(n, 2, 2 * i + 1), get(m, 2, 2 * j + 1), env), env);
+              acc = nan_fix(Format::F32, add(Format::F32, acc, t, env));
+            }
+            put(&r, 2, 2 * i + j, acc);
+          }
+        *dst = r;
+        return finish();
+      }
+      if (size >= 2 && (op == 0x20 || op == 0x21 || op == 0x28 || op == 0x29 || (op >> 3) == 2 || (op >> 3) == 3)) {      // FMLALB .. BFMLSLT, vectors and by element
+        const bool bfloat = size == 3;
+        bool indexed = false;
+        uint32_t kind, top;
+        uint32_t zmr = zm, index = 0;
+        if (op == 0x20 || op == 0x21 || op == 0x28 || op == 0x29) { kind = op >> 3; top = op & 1; }
+        else if ((op >> 2) == 4 || (op >> 2) == 6) { indexed = true; kind = (op >> 2) == 4 ? 4 : 5; top = op & 1; zmr = bits_of(insn, 18, 16); index = (bits_of(insn, 20, 19) << 1) | ((insn >> 11) & 1); }
+        else return false;
+        const bool subtract = indexed ? kind == 5 : kind == 5;
+        const Vec n = s_.v[zn], m = s_.v[zmr];
+        Env& e = bfloat ? benv : env;
+        for (uint32_t i = 0; i < 4; ++i) {
+          const uint64_t xa = widen(get(n, 1, 2 * i + top), bfloat, e), yb = widen(get(m, 1, indexed ? index : 2 * i + top), bfloat, e);
+          const uint64_t acc = get(*dst, 2, i);
+          const uint64_t x = subtract ? negate(Format::F32, xa) : xa;
+          put(dst, 2, i, nan_fix(Format::F32, fused_multiply_add(Format::F32, x, yb, acc, e)));
+        }
+        return finish();
       }
       return false;
     }
@@ -640,6 +751,16 @@ bool AArch64Cpu::sve_float(uint32_t insn) {
         return finish();
       }
       return false;
+    }
+    if (group == 5 && !bf_size && (bits_of(insn, 20, 16) == 16 || (bits_of(insn, 20, 16) >= 20 && bits_of(insn, 20, 16) <= 23))) {      // FADDQV, FMAXNMQV, FMINNMQV, FMAXQV, FMINQV
+      const uint32_t sel = bits_of(insn, 20, 16);
+      const uint64_t inf = esz == 3 ? 0x7FF0000000000000ull : esz == 2 ? 0x7F800000u : 0x7C00u, qnan = esz == 3 ? 0x7FF8000000000000ull : esz == 2 ? 0x7FC00000u : 0x7E00u;
+      const uint64_t identity = sel == 16 ? 0 : sel <= 21 ? qnan : sel == 22 ? (inf | sign_bit(esz)) : inf;
+      const Vec src = s_.v[zn];
+      Vec r;
+      for (uint32_t i = 0; i < elements; ++i) put(&r, esz, i, active(gp, i, esz) ? get(src, esz, i) : identity);
+      s_.v[zd] = r;
+      return true;
     }
     if (group == 5) {      // FCVTNT, FCVTLT, BFCVTNT, FCVTXNT
       const uint32_t hi = bits_of(insn, 23, 16);

@@ -4275,6 +4275,125 @@ void test_tessellation_kernel() {
   CHECK(shader(graphics::ShaderStage::Domain, b::k_ds_dent, sizeof b::k_ds_dent, &refused, &kernel, dev) == status::kNotSupported);
 }
 
+void test_compute_shared() {
+  HostAllocator allocator;
+  const std::vector<uint8_t> blob = read_blob("cs_shared.dxbc");
+  UniquePointer<D3d9Program> program;
+  CHECK(D3d9Program::compile_dxbc(allocator, ConstByteView(blob.data(), blob.size()), &program) == status::kSuccess && program);
+  if (!program) return;
+  CHECK(program->needs_group() && program->shared_bytes(0) == 256 && program->shared_total_bytes() == 256);
+  CHECK((program->required_features() & graphics::kFeatureCompute) != 0);
+  uint8_t storage[32 * 32 * 4] = {};
+  graphics::ComputeContext context;
+  context.buffers[0] = ByteView(storage, sizeof storage);
+  context.group_id[0] = 1;
+  program->run_compute_group(context, nullptr);
+  ByteReader in{ConstByteView(storage, sizeof storage)};
+  uint32_t words[1024];
+  for (uint32_t& w : words) w = in.le32();
+  // (group (1, 0): slot k holds k + 7, so thread 0 reads 8 from its neighbour and the sum of the 64 slots is 2016 + 448 = 2464, whose >> 3 is 308, low byte 0x34; the thread's blue is 4 * its number)
+  for (uint32_t t = 0; t < 8; ++t) CHECK(words[8 + t] == (0xFF000000u | ((8 + t) << 16) | (0x34u << 8) | (t * 4)));
+  CHECK(words[0] == 0 && words[7] == 0);   // (the other groups were not run)
+  // The text for the GPU: the shared memory, the barrier.
+  String text(allocator);
+  CHECK(program->emit_tgsi(&text) == status::kSuccess);
+  const std::string tgsi(text.view().data(), text.size());
+  CHECK(tgsi.find("DCL MEMORY[0], SHARED") != std::string::npos && tgsi.find("BARRIER") != std::string::npos && tgsi.find("MEMORY[0]") != std::string::npos);
+  // Truncated and bit-flipped: refused or compiled, never a crash.
+  for (size_t n = 0; n < blob.size(); n += 11) {
+    UniquePointer<D3d9Program> cut;
+    D3d9Program::compile_dxbc(allocator, ConstByteView(blob.data(), n), &cut);
+  }
+  for (size_t bit = 0; bit < blob.size() * 8; bit += 37) {
+    std::vector<uint8_t> flipped = blob;
+    flipped[bit / 8] ^= static_cast<uint8_t>(1u << (bit % 8));
+    UniquePointer<D3d9Program> bad;
+    D3d9Program::compile_dxbc(allocator, ConstByteView(flipped.data(), flipped.size()), &bad);
+    if (bad && bad->needs_group()) {
+      uint8_t scratch[32 * 32 * 4] = {};
+      graphics::ComputeContext c;
+      c.buffers[0] = ByteView(scratch, sizeof scratch);
+      bad->run_compute_group(c, nullptr);
+    }
+  }
+}
+
+// Geometry shaders with adjacency input and instances.
+void test_geometry_extras() {
+  HostAllocator allocator;
+  for (const char* name : {"gs_copy_inst2.dxbc", "gs_tri_adj.dxbc", "gs_line_adj.dxbc"}) {
+    const std::vector<uint8_t> blob = read_blob(name);
+    UniquePointer<D3d9Program> program;
+    CHECK(D3d9Program::compile_dxbc(allocator, ConstByteView(blob.data(), blob.size()), &program) == status::kSuccess && program);
+    if (!program) continue;
+    String text(allocator);
+    CHECK(program->emit_tgsi(&text) == status::kSuccess);
+    const std::string tgsi(text.view().data(), text.size());
+    if (__builtin_strstr(name, "inst2")) {
+      CHECK(program->geometry_instances() == 2 && tgsi.find("GS_INVOCATIONS 2") != std::string::npos);
+    } else {
+      CHECK(program->geometry_instances() == 1 && tgsi.find(__builtin_strstr(name, "tri") ? "TRIANGLES_ADJACENCY" : "LINES_ADJACENCY") != std::string::npos);
+      CHECK(program->geometry_input() == (__builtin_strstr(name, "tri") ? graphics::GeometryPrimitive::TriangleAdjacency : graphics::GeometryPrimitive::LineAdjacency));
+    }
+    // Truncated and bit-flipped: refused or compiled, never a crash.
+    for (size_t n = 0; n < blob.size(); n += 7) {
+      UniquePointer<D3d9Program> cut;
+      D3d9Program::compile_dxbc(allocator, ConstByteView(blob.data(), n), &cut);
+    }
+    for (size_t bit = 0; bit < blob.size() * 8; bit += 61) {
+      std::vector<uint8_t> flipped = blob;
+      flipped[bit / 8] ^= static_cast<uint8_t>(1u << (bit % 8));
+      UniquePointer<D3d9Program> bad;
+      D3d9Program::compile_dxbc(allocator, ConstByteView(flipped.data(), flipped.size()), &bad);
+    }
+  }
+}
+
+// Alpha to coverage on the CPU renderer: a quad of whole pixels keeps round(alpha * 4) of the 4 samples, so the resolved red is that many quarters (a GPU dithers fractions from pixel to pixel,
+// which the conformance scene therefore leaves out).
+void test_alpha_to_coverage() {
+  Env e;
+  namespace b = conformance_blobs;
+  Handle vs = 0, ps = 0, pipe = 0;
+  ShaderDesc sd;
+  sd.kind = ShaderKind::Dxbc, sd.stage = graphics::ShaderStage::Vertex, sd.code = ConstByteView(b::k_vs, sizeof b::k_vs);
+  CHECK(e.kernel.create_shader(kPid, e.dev, sd, &vs) == status::kSuccess);
+  sd.stage = graphics::ShaderStage::Fragment, sd.code = ConstByteView(b::k_ps_color, sizeof b::k_ps_color);
+  CHECK(e.kernel.create_shader(kPid, e.dev, sd, &ps) == status::kSuccess);
+  PipelineDesc pd;
+  pd.vertex_shader = vs, pd.fragment_shader = ps, pd.vertex_stride = 28, pd.attribute_count = 2, pd.varying_count = 3;
+  pd.attributes[0] = {0, graphics::VertexFormat::Float3, 0};
+  pd.attributes[1] = {1, graphics::VertexFormat::Float4, 12};
+  pd.cull_mode = graphics::CullMode::None;
+  pd.multisample = true;
+  pd.alpha_to_coverage = true;
+  CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &pipe) == status::kSuccess);
+  AllocationDesc md;
+  md.flags = kTarget, md.format = Format::A8R8G8B8, md.width = md.height = 32, md.samples = 4;
+  Handle multisampled = 0;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, md, &multisampled) == status::kSuccess);
+  Handle target = e.alloc(kTarget, Format::A8R8G8B8, 32, 32), vb = e.buffer(kAllocVertexBuffer, 6 * 28);
+  const float alphas[7] = {0.0f, 0.1f, 0.3f, 0.5f, 0.7f, 0.9f, 1.0f};
+  const uint32_t expected[7] = {0, 0, 1, 2, 3, 4, 4};   // (0.1 * 4 = 0.4 rounds to 0; 0.3 * 4 = 1.2 to 1; 0.5 * 4 = 2; 0.7 * 4 = 2.8 to 3; 0.9 * 4 = 3.6 to 4)
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  for (uint32_t i = 0; i < 7; ++i) {
+    const float a = alphas[i];
+    const float v[42] = {-1, -1, 0.5f, 1, 0, 0, a, 1, -1, 0.5f, 1, 0, 0, a, -1, 1, 0.5f, 1, 0, 0, a, -1, 1, 0.5f, 1, 0, 0, a, 1, -1, 0.5f, 1, 0, 0, a, 1, 1, 0.5f, 1, 0, 0, a};
+    CHECK(e.write(vb, floats(v, 42)));
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1.0f, 0);
+    w.bind_pipeline(pipe);
+    w.bind_vertex_buffer(2);
+    w.push_constants(floats(identity, 16));
+    w.draw(6);
+    w.end_pass();
+    w.resolve_region(1, 0);
+    CHECK(e.render(w, {multisampled, target, vb}) == status::kSuccess);
+    const uint32_t red = (e.pixel(target, 5, 5) >> 16) & 0xFF;
+    CHECK(red == expected[i] * 255 / 4 || red == (expected[i] * 255 + 2) / 4);
+  }
+}
+
 void test_conformance() {
   test_half_floats();
   HostAllocator allocator;
@@ -4360,6 +4479,39 @@ void test_conformance() {
         CHECK(near(px(7, 4), 0xFF36659C) && (px(6, 4) & 0xFFFFFF) == 0);
       }
       if (__builtin_strstr(r.name, "integer render")) CHECK(px(16, 4) == 0xFF3380CC && px(0, 0) == 0xFF14283C);   // (51, 128, 204 = 255 * the colour, and the cleared (20, 40, 60))
+    }
+    if (__builtin_strstr(r.name, "group-shared memory")) {
+      // Thread 0 of group (0, 0): the neighbour's value is 1, the sum of the 64 slots (0 .. 63) 2016 (>> 3 is 252), the thread's own number 0. Thread 1 sees 2 and has 4 as its blue.
+      auto px = [&](uint32_t x, uint32_t y) { return r.device_picture[y * 32 + x]; };
+      CHECK(px(0, 0) == 0xFF01FC00u && px(1, 0) == 0xFF02FC04u && px(8, 0) == (0xFF000000u | (8u << 16) | (0x34u << 8)));
+    }
+    if (__builtin_strstr(r.name, "adjacency primitives")) {
+      // The triangle (left) and the quad (right) both drawn.
+      uint32_t left = 0, right = 0;
+      for (uint32_t y = 0; y < 32; ++y)
+        for (uint32_t x = 0; x < 32; ++x) (x < 16 ? left : right) += (r.device_picture[y * 32 + x] & 0xFFFFFF) != 0;
+      CHECK(left > 60 && right > 150);
+    }
+    if (__builtin_strstr(r.name, "instanced geometry")) {
+      uint32_t lit = 0;
+      for (uint32_t i = 0; i < 32 * 32; ++i) lit += (r.device_picture[i] & 0xFFFFFF) != 0;
+      CHECK(lit > 100);
+    }
+    if (__builtin_strstr(r.name, "alpha to coverage")) {
+      // The red channel of each band (the colour is red 1): none, all, none, all, all.
+      auto red = [&](uint32_t band) { return (r.device_picture[16 * 32 + band * 6 + 3] >> 16) & 0xFF; };
+      CHECK(red(0) == 0 && red(1) == 255 && red(2) == 0 && red(3) == 255 && red(4) == 255);
+    }
+    if (__builtin_strstr(r.name, "occlusion predicate and pipeline")) {
+      // Stripes of 4 pixels from x = 1: predicate 1 (full red), predicate 0 (0.25 of the red is the base: 0), 12 of 16 vertices (0.75), 6 of 8 primitives (0.75), both runs counted (1).
+      auto red = [&](uint32_t stripe) { return (r.device_picture[16 * 32 + 1 + 5 * stripe + 1] >> 16) & 0xFF; };
+      CHECK(red(0) == 255 && red(1) == 0 && red(2) >= 190 && red(2) <= 192 && red(3) >= 190 && red(3) <= 192 && red(4) == 255 && red(5) == 255);
+    }
+    if (__builtin_strstr(r.name, "of every width") || __builtin_strstr(r.name, "10-bit normalised")) {
+      // The colour of the triangle of each quarter, as the format keeps it (integers: colour * 255 (- 100); the 10-bit alpha of 0.7 is 2/3, of 0.3 1/3).
+      auto tri = [&](uint32_t q) { return r.device_picture[((q >> 1) * 16 + 8) * 32 + (q & 1) * 16 + 8]; };
+      if (__builtin_strstr(r.name, "of every width")) CHECK(tri(0) == 0xFF3380CC && tri(1) == 0xFF4D99E5 && tri(2) == 0xFFE56619 && tri(3) == 0xFF19B366);
+      else CHECK(tri(0) == 0xFF4C99E5 && tri(1) == 0xFF00E573 && tri(2) == 0xAA3380CC && tri(3) == 0x550DF280);
     }
     if (__builtin_strstr(r.name, "GetDimensions of")) {
       // The alpha is the number of levels over 2 (one level: 0x80) wherever something is drawn; the size is in the colour: the 4 x 4 texels of a 3D image of 4 slices, an array of 3 layers
@@ -5418,7 +5570,7 @@ void test_dxbc_system_values() {
     UniquePointer<D3d9Program> with_primitive = compile_dxbc(allocator, ps_blob, &st);
     CHECK(with_primitive && st == status::kSuccess);
     String refused(allocator);
-    CHECK(with_primitive->emit_tgsi(&refused) == status::kNotSupported);
+    CHECK(with_primitive->emit_tgsi(&refused) == status::kSuccess && __builtin_strstr(refused.c_str(), "PRIMID"));   // (the primitive number is a PRIMID input)
   }
 
   // A device without system values or texel access does not get these shaders (they would read zeros).
@@ -5514,6 +5666,9 @@ int main() {
   test_sm3_and_sm51();
   test_ps1();
   test_device_suite();
+  test_compute_shared();
+  test_geometry_extras();
+  test_alpha_to_coverage();
   test_conformance();
   test_occlusion_queries();
   test_texture_kinds();

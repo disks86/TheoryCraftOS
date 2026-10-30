@@ -940,6 +940,62 @@ void quad_pixels(Vertex* v, float x0, float y0, float x1, float y1, Coord coord)
   v[3] = at(x0, y1, 0, 1), v[4] = at(x1, y0, 1, 0), v[5] = at(x1, y1, 1, 1);
 }
 
+// The other queries: the occlusion predicate of a quad that shows and of one that is hidden, the vertices and primitives that draws took, and (only whether they are more than none, as a device
+// may reuse vertex results and shade helper pixels) the vertex shader and pixel shader runs. The picture is a stripe for each, as bright as its result.
+void scene_statistics_queries(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureOcclusionQueries | graphics::kFeatureStatisticsQueries)) return void(rig.step("statistics queries", status::kNotSupported));
+  auto quad = [](Vertex* v, float x0, float y0, float x1, float y1, float z, float r, float g, float b) {
+    v[0] = {x0, y0, z, r, g, b, 1}, v[1] = {x1, y0, z, r, g, b, 1}, v[2] = {x0, y1, z, r, g, b, 1};
+    v[3] = {x0, y1, z, r, g, b, 1}, v[4] = {x1, y0, z, r, g, b, 1}, v[5] = {x1, y1, z, r, g, b, 1};
+  };
+  Vertex v[24];
+  quad(v + 0, 0.0f, -1.0f, 1.0f, 1.0f, 0.2f, 0, 0, 0);
+  quad(v + 6, -1.0f, -1.0f, 0.0f, 0.0f, 0.5f, 0, 0, 0);
+  quad(v + 12, -0.5f, 0.0f, 0.5f, 1.0f, 0.5f, 0, 0, 0);
+  quad(v + 18, 0.25f, -1.0f, 0.75f, 0.0f, 0.5f, 0, 0, 0);
+  Handle pipe = d3d9_pipeline(rig, true, false);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle depth = rig.image(kAllocDepthStencil, Format::D32Float, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  AllocationDesc rd;
+  rd.flags = kAllocQueryResult, rd.size = 6 * 8;
+  Handle results = rig.create(rd);
+  CommandWriter w(rig.allocator());
+  begin(w, 0, 1, {0, 0, 0, 1});
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(2);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(6);
+  // (kind, first vertex, vertex count)
+  static const uint32_t kQueries[6][3] = {{1, 6, 6}, {1, 18, 6}, {2, 6, 12}, {3, 6, 18}, {4, 6, 6}, {5, 6, 6}};
+  for (uint32_t q = 0; q < 6; ++q) {
+    w.begin_query(3, q * 8, kQueries[q][0]);
+    w.draw(kQueries[q][2], kQueries[q][1]);
+    w.end_query();
+  }
+  w.end_pass();
+  rig.render(w, {target, depth, vb, results});
+  uint64_t counts[6];
+  for (uint32_t q = 0; q < 6; ++q) counts[q] = rig.read_u64(results, q);
+  Vertex s[36];
+  for (uint32_t q = 0; q < 6; ++q) {
+    const float value = q < 2 ? static_cast<float>(counts[q]) : q == 2 ? static_cast<float>(counts[q]) / 16.0f : q == 3 ? static_cast<float>(counts[q]) / 8.0f : counts[q] > 0 ? 1.0f : 0.0f;
+    const float x0 = (1.0f + 5.0f * static_cast<float>(q)) / 16.0f - 1.0f;
+    quad(s + q * 6, x0, -1.0f, x0 + 4.0f / 16.0f, 1.0f, 0.5f, value > 1.0f ? 1.0f : value, 0.25f, 0.25f);
+  }
+  Handle svb = rig.buffer(kAllocVertexBuffer, bytes_of(s, sizeof s));
+  Handle flat = d3d9_pipeline(rig, false, false);
+  CommandWriter w2(rig.allocator());
+  begin(w2, 0, kNoAllocation, {0, 0, 0, 1});
+  w2.bind_pipeline(flat);
+  w2.bind_vertex_buffer(1);
+  w2.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w2.draw(36);
+  w2.end_pass();
+  rig.render(w2, {target, svb});
+  rig.read(target, out);
+}
+
 void scene_texture_3d(Rig& rig, ArrayView<uint32_t> out) {
   if (!rig.has(graphics::kFeatureTextureKinds)) return void(rig.step("texture kinds", status::kNotSupported));
   namespace b = conformance_blobs;
@@ -1051,6 +1107,26 @@ void scene_compute(Rig& rig, ArrayView<uint32_t> out) {
     for (uint32_t& pixel : out) pixel ^= 0x0000FF00u;
 }
 
+// Group-shared memory and barriers (cs_shared.hlsl): 16 groups of 8 x 8 threads, each writing a slot of a 64-word shared array, reading its neighbour's after a barrier, and the 64 slots added
+// by a reduction with a barrier in its loop. The picture is the buffer: red the neighbour's value, green the sum, blue the thread.
+void scene_compute_shared(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureCompute)) return void(rig.step("compute", status::kNotSupported));
+  namespace b = conformance_blobs;
+  Handle cs = rig.shader("create_shader (compute)", ShaderKind::Dxbc, graphics::ShaderStage::Compute, bytes_of(b::k_cs_shared, sizeof b::k_cs_shared));
+  PipelineDesc pd;
+  pd.compute_shader = cs;
+  Handle pipe = rig.pipeline(pd);
+  AllocationDesc d;
+  d.flags = kAllocUnorderedAccess, d.size = kPixels * 4;
+  Handle picture = rig.create(d);
+  CommandWriter w(rig.allocator());
+  w.bind_pipeline(pipe);
+  w.bind_uav(0, 0, 0, kPixels * 4);
+  w.dispatch(kSize / 8, kSize / 8, 1);
+  rig.render(w, {picture});
+  rig.read_words(picture, out);
+}
+
 // Multisampling (4 samples): a far red rectangle and a near green one that overlaps it, both with edges between the pixels' sample positions, drawn into 4x colour and depth images (depth
 // tested per sample) and resolved. Vertical and horizontal edges are covered the same by every device that uses the standard 4x pattern, whatever the order of the samples.
 void scene_multisample(Rig& rig, ArrayView<uint32_t> out) {
@@ -1114,6 +1190,67 @@ void scene_geometry_shader(Rig& rig, ArrayView<uint32_t> out) {
   w.bind_vertex_buffer(1);
   w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
   w.draw(3);
+  w.end_pass();
+  rig.render(w, {target, vb});
+  rig.read(target, out);
+}
+
+// The geometry shader that runs twice for each primitive (gs_copy_inst2: gs_copy with an instance count of 2): the same triangles drawn twice over, so the same picture as gs_copy's.
+void scene_geometry_instances(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureGeometryShaders)) return void(rig.step("geometry shaders", status::kNotSupported));
+  namespace b = conformance_blobs;
+  const Vertex v[3] = {{-0.9f, -0.9f, 0.5f, 1, 0, 0, 1}, {0.9f, -0.9f, 0.5f, 0, 1, 0, 1}, {0.0f, 0.9f, 0.5f, 0, 0, 1, 1}};
+  Handle vs = rig.vertex_shader(bytes_of(b::k_vs, sizeof b::k_vs));
+  Handle gs = rig.shader("create_shader (geometry)", ShaderKind::Dxbc, graphics::ShaderStage::Geometry, bytes_of(b::k_gs_copy_inst2, sizeof b::k_gs_copy_inst2));
+  Handle ps = rig.pixel_shader(bytes_of(b::k_ps_color, sizeof b::k_ps_color));
+  PipelineDesc pd = colour_pipeline_desc(vs, ps);
+  pd.varying_count = 3;
+  pd.geometry_shader = gs;
+  Handle pipe = rig.pipeline(pd);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  CommandWriter w(rig.allocator());
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(3);
+  w.end_pass();
+  rig.render(w, {target, vb});
+  rig.read(target, out);
+}
+
+// Primitives with adjacency: a triangle with the three vertices beside it (the shader draws the even ones, with some of the colour of the odd one after each), and a line with the vertex
+// before and after (the shader makes a quad of its four).
+void scene_geometry_adjacency(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureGeometryShaders)) return void(rig.step("geometry shaders", status::kNotSupported));
+  namespace b = conformance_blobs;
+  const Vertex v[10] = {{-0.9f, -0.9f, 0.5f, 1, 0, 0, 1}, {0.0f, 0.0f, 0.5f, 0, 0, 1, 1}, {-0.1f, -0.9f, 0.5f, 0, 1, 0, 1}, {0.0f, 0.0f, 0.5f, 1, 1, 1, 1}, {-0.5f, 0.9f, 0.5f, 0, 0, 1, 1}, {0.0f, 0.0f, 0.5f, 1, 1, 0, 1},
+                        {0.1f, -0.9f, 0.5f, 1, 0, 0, 1}, {0.9f, -0.9f, 0.5f, 0, 1, 0, 1}, {0.1f, 0.9f, 0.5f, 0, 0, 1, 1}, {0.9f, 0.9f, 0.5f, 1, 1, 0, 1}};
+  Handle vs = rig.vertex_shader(bytes_of(b::k_vs, sizeof b::k_vs));
+  Handle ps = rig.pixel_shader(bytes_of(b::k_ps_color, sizeof b::k_ps_color));
+  Handle triangles = 0, lines = 0;
+  for (uint32_t k = 0; k < 2; ++k) {
+    const uint8_t* code = k == 0 ? b::k_gs_tri_adj : b::k_gs_line_adj;
+    const uint32_t size = k == 0 ? sizeof b::k_gs_tri_adj : sizeof b::k_gs_line_adj;
+    Handle gs = rig.shader("create_shader (geometry)", ShaderKind::Dxbc, graphics::ShaderStage::Geometry, bytes_of(code, size));
+    PipelineDesc pd = colour_pipeline_desc(vs, ps);
+    pd.varying_count = 3;
+    pd.geometry_shader = gs;
+    (k == 0 ? triangles : lines) = rig.pipeline(pd);
+  }
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  CommandWriter w(rig.allocator());
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.bind_pipeline(triangles);
+  w.set_topology(Topology::TriangleListAdjacency);
+  w.draw(6, 0);
+  w.bind_pipeline(lines);
+  w.set_topology(Topology::LineListAdjacency);
+  w.draw(4, 6);
   w.end_pass();
   rig.render(w, {target, vb});
   rig.read(target, out);
@@ -1212,6 +1349,42 @@ void scene_unorm16(Rig& rig, ArrayView<uint32_t> out) {
   release_view(rig.allocator(), other);
 }
 
+// Alpha to coverage: five bands of whole pixels, all the same orange, with alphas 0, 1, 0, 1 and 1: into a 4x multisampled target the alpha 0 bands keep none of their samples and the
+// others all, so the resolved picture is black, orange, black, orange, orange. (A GPU gives a fraction of an alpha a number of samples that varies from pixel to pixel, which a picture cannot
+// compare; the CPU renderer's own rounding is tested in test_alpha_to_coverage.)
+void scene_alpha_to_coverage(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureMultisample)) return void(rig.step("multisampling", status::kNotSupported));
+  Vertex v[30];
+  static const float kAlpha[5] = {0.0f, 1.0f, 0.0f, 1.0f, 1.0f};   // (only the ends: in between, a GPU dithers the number of samples from pixel to pixel)
+  for (uint32_t i = 0; i < 5; ++i) {
+    const float x0 = static_cast<float>(i * 6) / 16.0f - 1.0f, x1 = static_cast<float>(i * 6 + 6) / 16.0f - 1.0f, y0 = -1.0f, y1 = 1.0f;
+    Vertex* p = v + i * 6;
+    p[0] = {x0, y0, 0.5f, 1.0f, 0.5f, 0.2f, kAlpha[i]}, p[1] = {x1, y0, 0.5f, 1.0f, 0.5f, 0.2f, kAlpha[i]}, p[2] = {x0, y1, 0.5f, 1.0f, 0.5f, 0.2f, kAlpha[i]};
+    p[3] = p[2], p[4] = p[1], p[5] = {x1, y1, 0.5f, 1.0f, 0.5f, 0.2f, kAlpha[i]};
+  }
+  Handle vs = rig.vertex_shader(bytes_of(kVertexTokens, sizeof kVertexTokens), ShaderKind::D3d9Bytecode);
+  Handle ps = rig.pixel_shader(bytes_of(kPixelTokens, sizeof kPixelTokens), ShaderKind::D3d9Bytecode);
+  PipelineDesc pd = colour_pipeline_desc(vs, ps);
+  pd.multisample = true;
+  pd.alpha_to_coverage = true;
+  Handle pipe = rig.pipeline(pd);
+  AllocationDesc color_desc;
+  color_desc.flags = kAllocRenderTarget, color_desc.format = Format::A8R8G8B8, color_desc.width = color_desc.height = kSize, color_desc.samples = 4;
+  Handle multisampled = rig.create(color_desc);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  CommandWriter w(rig.allocator());
+  w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1.0f, 0);
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(2);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(30);
+  w.end_pass();
+  w.resolve_region(1, 0);
+  rig.render(w, {multisampled, target, vb});
+  rig.read(target, out);
+}
+
 // Integers: a triangle's colour is written by the pixel shader as four integers (colour * 255) into an R32G32B32A32_UINT target cleared to (20, 40, 60, 255), and a second pass reads them
 // back with Load (an integer texture is not sampled) and shows them divided by 255.
 void scene_integer(Rig& rig, ArrayView<uint32_t> out) {
@@ -1234,6 +1407,87 @@ void scene_integer(Rig& rig, ArrayView<uint32_t> out) {
   show_texture(rig, target, texture, b::k_ps_int_load, sizeof b::k_ps_int_load);
   rig.read(target, out);
 }
+
+// Render target formats: a triangle is drawn into a 16 x 16 target of each format (the clear colour and the colour of the triangle are the same for all), and each target is then shown in a
+// quarter of the picture through a pixel shader that reads it back (Load for the integers, Sample for the others).
+struct FormatBlob {
+  const uint8_t* code;
+  uint32_t size;
+};
+struct FormatCase {
+  Format format;
+  FormatBlob write, show;
+  float colour[4];       // the triangle's colour (what the vertices carry)
+  bool integer;
+};
+#define FORMAT_BLOB(name) FormatBlob{conformance_blobs::k_##name, sizeof conformance_blobs::k_##name}
+
+void formats_scene(Rig& rig, ArrayView<uint32_t> out, const FormatCase* cases, uint32_t count, uint32_t feature) {
+  if (!rig.has(feature)) return void(rig.step("render target formats", status::kNotSupported));
+  namespace b = conformance_blobs;
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vs = rig.vertex_shader(bytes_of(b::k_vs, sizeof b::k_vs));
+  for (uint32_t i = 0; i < count; ++i) {
+    const FormatCase& c = cases[i];
+    const Vertex tri[3] = {{-0.9f, -0.9f, 0.5f, c.colour[0], c.colour[1], c.colour[2], c.colour[3]}, {0.9f, -0.9f, 0.5f, c.colour[0], c.colour[1], c.colour[2], c.colour[3]},
+                           {0.0f, 0.9f, 0.5f, c.colour[0], c.colour[1], c.colour[2], c.colour[3]}};
+    Handle texture = rig.image(kAllocRenderTarget | kAllocTexture, c.format, 16, 16);
+    Handle write = rig.pixel_shader(bytes_of(c.write.code, c.write.size));
+    PipelineDesc wd = colour_pipeline_desc(vs, write);
+    wd.varying_count = 3;
+    Handle first = rig.pipeline(wd);
+    Handle tvb = rig.buffer(kAllocVertexBuffer, bytes_of(tri, sizeof tri));
+    CommandWriter w(rig.allocator());
+    // (the clear colour of an integer target is the bits of the integers)
+    const graphics::Vec4 clear = c.integer ? graphics::Vec4{__builtin_bit_cast(float, 20u), __builtin_bit_cast(float, 40u), __builtin_bit_cast(float, 60u), __builtin_bit_cast(float, 255u)} : graphics::Vec4{0, 0, 0, 0};
+    begin(w, 0, kNoAllocation, clear);
+    w.bind_pipeline(first);
+    w.bind_vertex_buffer(2);
+    w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+    w.draw(3);
+    w.end_pass();
+    rig.render(w, {texture, target, tvb});
+    // The target in its quarter of the picture.
+    auto vert = [](float x, float y, float u, float v) { return Vertex{x, y, 0.5f, u / 2, v / 2, 1, 1}; };
+    const Vertex quad[6] = {vert(-1, -1, 0, 0), vert(1, -1, 1, 0), vert(-1, 1, 0, 1), vert(-1, 1, 0, 1), vert(1, -1, 1, 0), vert(1, 1, 1, 1)};
+    Handle pipe = dxbc_pipeline(rig, b::k_vs, sizeof b::k_vs, c.show.code, c.show.size, 1);
+    Handle qvb = rig.buffer(kAllocVertexBuffer, bytes_of(quad, sizeof quad));
+    graphics::SamplerDesc sampler;
+    sampler.filter = graphics::Filter::Nearest;
+    sampler.address_u = sampler.address_v = graphics::AddressMode::ClampToEdge;
+    CommandWriter show(rig.allocator());
+    show.begin_pass(0, kNoAllocation, i == 0 ? kPassClearColor : 0u, {0, 0, 0, 1}, 1.0f, 0);
+    const float x = static_cast<float>((i & 1) * 16), y = static_cast<float>((i >> 1) * 16);
+    show.set_viewport({x, y, 16, 16, 0.0f, 1.0f});
+    show.set_scissor({static_cast<int32_t>(x), static_cast<int32_t>(y), 16, 16});
+    show.bind_pipeline(pipe);
+    show.bind_vertex_buffer(1);
+    show.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+    show.bind_texture(0, 2, sampler);
+    show.draw(6);
+    show.end_pass();
+    rig.render(show, {target, qvb, texture});
+  }
+  rig.read(target, out);
+}
+
+#define FORMAT_SCENE(name, feature, ...)                                      \
+  void name(Rig& rig, ArrayView<uint32_t> out) {                              \
+    static const FormatCase cases[] = {__VA_ARGS__};                          \
+    formats_scene(rig, out, cases, sizeof cases / sizeof cases[0], feature);  \
+  }
+// Integers of every width and sign: the writer makes colour * 255 (minus 100 for the signed ones) as integers, the reader shows them back as (value (+ 100)) / 255.
+FORMAT_SCENE(scene_integer_formats, graphics::kFeatureIntegerFormats,
+             {Format::A16B16G16R16Uint, FORMAT_BLOB(ps_int_write), FORMAT_BLOB(ps_uint_loadq), {0.2f, 0.5f, 0.8f, 1.0f}, true},
+             {Format::A16B16G16R16Sint, FORMAT_BLOB(ps_sint_write), FORMAT_BLOB(ps_sint_loadq), {0.3f, 0.6f, 0.9f, 1.0f}, true},
+             {Format::A8B8G8R8Uint, FORMAT_BLOB(ps_int_write), FORMAT_BLOB(ps_uint_loadq), {0.9f, 0.4f, 0.1f, 1.0f}, true},
+             {Format::A32B32G32R32Sint, FORMAT_BLOB(ps_sint_write), FORMAT_BLOB(ps_sint_loadq), {0.1f, 0.7f, 0.4f, 1.0f}, true})
+// Signed and 10-bit normalised: a negative colour into a snorm target (shown with its green negated), and 10 bit colours with two bits of alpha (0.7 is kept as 2/3).
+FORMAT_SCENE(scene_normalised_formats, graphics::kFeatureSnormFormats,
+             {Format::A16B16G16R16Snorm, FORMAT_BLOB(ps_color), FORMAT_BLOB(ps_snorm_show), {0.3f, -0.6f, 0.9f, 1.0f}, false},
+             {Format::A16B16G16R16Snorm, FORMAT_BLOB(ps_color), FORMAT_BLOB(ps_snorm_show), {-0.2f, -0.9f, 0.45f, 0.5f}, false},
+             {Format::A2B10G10R10, FORMAT_BLOB(ps_color), FORMAT_BLOB(ps_show), {0.2f, 0.5f, 0.8f, 0.7f}, false},
+             {Format::A2B10G10R10, FORMAT_BLOB(ps_color), FORMAT_BLOB(ps_show), {0.05f, 0.95f, 0.5f, 0.3f}, false})
 
 // Tessellation: a few patches drawn into one picture, each in its own cell (a single one fills the picture), with the tessellation factors in the constants after the matrix. The domain shaders move every point by an amount of its own, so a point that is not where the tessellator should put it, or a
 // triangle that joins other points, shows in the picture.
@@ -1362,6 +1616,8 @@ const Entry kScenes[] = {
     {"Direct3D 10 instancing", scene_instancing},
     {"Direct3D 10 multiple render targets (DXBC)", scene_multiple_targets},
     {"Direct3D 10 geometry shader (DXBC)", scene_geometry_shader},
+    {"Direct3D 11 instanced geometry (DXBC)", scene_geometry_instances},
+    {"Direct3D 10 adjacency primitives (DXBC)", scene_geometry_adjacency},
     {"Direct3D 11 tessellation, triangle domain (DXBC)", scene_tess_triangle, false, 6},
     {"Direct3D 11 tessellation, quad domain (DXBC)", scene_tess_quad, false, 6},
     {"Direct3D 11 tessellation, isolines and points (DXBC)", scene_tess_lines_points, true},
@@ -1372,12 +1628,17 @@ const Entry kScenes[] = {
     {"Direct3D 10 sRGB render target and texture", scene_srgb},
     {"Direct3D 10 16-bit normalised render target and texture", scene_unorm16},
     {"Direct3D 10 integer render target and Load (DXBC)", scene_integer},
+    {"Direct3D 10 integer formats of every width and sign (DXBC)", scene_integer_formats},
+    {"Direct3D 10 signed and 10-bit normalised formats (DXBC)", scene_normalised_formats},
     {"Direct3D 10 4x multisampling", scene_multisample},
+    {"Direct3D 10 alpha to coverage", scene_alpha_to_coverage},
     {"Direct3D 11 compute shader and unordered access views (DXBC)", scene_compute},
+    {"Direct3D 11 group-shared memory and barriers (DXBC)", scene_compute_shared},
     {"Direct3D 10 independent blend per render target (DXBC)", scene_independent_blend},
     {"Direct3D 10 half-float render target and texture", scene_half_float_target},
     {"Direct3D 10 float render target and texture", scene_float_target},
     {"Direct3D 10 occlusion queries", scene_occlusion_query},
+    {"Direct3D 10 occlusion predicate and pipeline statistics", scene_statistics_queries},
     {"Direct3D 10 volume texture (DXBC)", scene_texture_3d},
     {"Direct3D 10 texture array (DXBC)", scene_texture_array},
     {"Direct3D 10 cube texture (DXBC)", scene_texture_cube},

@@ -76,6 +76,7 @@ class D3d9Program {
   graphics::GeometryPrimitive geometry_input() const { return geometry_input_; }
   graphics::GeometryTopology geometry_output() const { return geometry_output_; }
   uint32_t geometry_max_vertices() const { return geometry_max_vertices_; }
+  uint32_t geometry_instances() const { return geometry_instances_; }
   void run_geometry(const graphics::GeometryInputData& input, const uint8_t* constants, graphics::GeometryOutputData* output) const;
   // A hull or domain shader (hs_5_0 / ds_5_0 DXBC, any domain), see D3d9Dxbc.cpp; the tessellator's settings both stages declare.
   uint32_t tess_input_points() const { return tess_input_points_; }
@@ -85,6 +86,15 @@ class D3d9Program {
   graphics::TessDomain tess_domain() const { return tess_domain_; }
   void run_hull(const graphics::HullInputData& input, const uint8_t* constants, graphics::HullOutputData* output) const;
   void run_domain(const graphics::HullOutputData& patch, float u, float v, float w, const uint8_t* constants, graphics::ShaderIo* out) const;
+  // Group-shared memory (dcl_tgsm_raw / dcl_tgsm_structured) and barriers (sync_g...): such a program is run a group at a time by run_compute_group.
+  uint32_t shared_bytes(uint32_t n) const { return n < graphics::kMaxSharedMemories ? shared_bytes_[n] : 0; }
+  uint32_t shared_total_bytes() const {
+    uint32_t total = 0;
+    for (uint32_t b : shared_bytes_) total += b;
+    return total;
+  }
+  bool needs_group() const { return uses_barrier_ || shared_total_bytes() != 0; }
+  void run_compute_group(const graphics::ComputeContext& context, const uint8_t* constants) const;
   uint32_t thread_group(uint32_t axis) const { return axis < 3 ? thread_group_[axis] : 1; }
   BufferKind storage_kind(uint32_t slot) const { return slot < graphics::kMaxStorageBuffers ? uav_kind_[slot] : BufferKind::None; }
   uint32_t storage_stride(uint32_t slot) const { return slot < graphics::kMaxStorageBuffers ? uav_stride_[slot] : 0; }
@@ -145,6 +155,7 @@ class D3d9Program {
   graphics::GeometryPrimitive geometry_input_ = graphics::GeometryPrimitive::Triangle;
   graphics::GeometryTopology geometry_output_ = graphics::GeometryTopology::TriangleStrip;
   uint32_t geometry_max_vertices_ = 0;
+  uint32_t geometry_instances_ = 1;
   uint32_t tess_input_points_ = 0, tess_output_points_ = 0;
   graphics::TessPartitioning tess_partitioning_ = graphics::TessPartitioning::Integer;
   graphics::TessOutput tess_output_ = graphics::TessOutput::TriangleCcw;
@@ -153,8 +164,10 @@ class D3d9Program {
   uint64_t hs_cp_begin_ = 0, hs_cp_end_ = 0, hs_fork_begin_ = 0, hs_fork_end_ = 0, hs_join_begin_ = 0, hs_join_end_ = 0;
   int8_t outer_factor_reg_[4] = {-1, -1, -1, -1}, inner_factor_reg_[2] = {-1, -1};
   graphics::TessDomain tess_domain_ = graphics::TessDomain::Triangle;
-  BufferKind uav_kind_[graphics::kMaxStorageBuffers] = {};
-  uint32_t uav_stride_[graphics::kMaxStorageBuffers] = {};
+  BufferKind uav_kind_[graphics::kMaxStorageBuffers + graphics::kMaxSharedMemories] = {};   // (the group-shared memories g0 .. after the u# slots)
+  uint32_t uav_stride_[graphics::kMaxStorageBuffers + graphics::kMaxSharedMemories] = {};
+  uint32_t shared_bytes_[graphics::kMaxSharedMemories] = {};
+  bool uses_barrier_ = false;
   graphics::TextureKind texture_kind_[graphics::kMaxTextureUnits] = {};
   bool uses_system_values_ = false, uses_texel_access_ = false;
   uint32_t color_outputs_ = 1;

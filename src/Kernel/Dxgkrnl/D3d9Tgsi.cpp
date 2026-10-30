@@ -61,8 +61,8 @@ class TgsiEmitter {
   static constexpr uint32_t kPosition = 39, kVarying = 40, kColor = 44;   // (kVarying: four)
   static constexpr uint32_t kSys = 45;     // the system values (SysValue order), copied from where TGSI keeps them into registers of the interpreter's shape
   static constexpr uint32_t kColorExtra = kSys + kSysValueCount;   // colour outputs 1..3 (output 0 is kColor)
-  static constexpr uint32_t kGsPosition = kColorExtra + graphics::kMaxColorTargets - 1;   // a geometry shader's input positions, three vertices, turned back to Direct3D's +Y up
-  static constexpr uint32_t kPatchBase = kGsPosition + 3;   // a hull shader's patch constant registers (shadows of the tessellation factors)
+  static constexpr uint32_t kGsPosition = kColorExtra + graphics::kMaxColorTargets - 1;   // a geometry shader's input positions, up to six vertices, turned back to Direct3D's +Y up
+  static constexpr uint32_t kPatchBase = kGsPosition + 6;   // a hull shader's patch constant registers (shadows of the tessellation factors)
   static constexpr uint32_t kTempCount = kPatchBase + graphics::kMaxPatchRegisters;
   static uint32_t color_register(uint32_t target) { return target == 0 ? kColor : kColorExtra + target - 1; }
   static constexpr uint32_t kMaxOutput = 120000;   // (the virgl command carrying the text has a 16-bit dword count)
@@ -249,6 +249,7 @@ class TgsiEmitter {
   bool in_used_[16] = {};
   bool sys_used_[kSysValueCount] = {};
   bool buffer_used_[graphics::kMaxStorageBuffers] = {};
+  bool shared_used_ = false;   // group-shared memory is used (MEMORY[0]), barriers too
   bool compute_ = false;
   bool geometry_ = false, hull_ = false, domain_ = false;
   uint32_t current_cp_ = 0;   // a hull shader: the output control point the copy of the control point phase being written makes
@@ -291,7 +292,7 @@ String TgsiEmitter::operand(const Instr::Src& s, uint32_t offset, uint32_t slot,
       }
       if (geometry_) {
         // IN[vertex][1 + varying] (the position is in a register of its own: the host's +Y is the other way up)
-        if (s.vertex >= 3 || (s.slot != kSlotPosition && (s.slot < 0 || s.slot >= static_cast<int8_t>(graphics::kMaxVaryings)))) {
+        if (s.vertex >= graphics::kMaxGeometryInputVertices || (s.slot != kSlotPosition && (s.slot < 0 || s.slot >= static_cast<int8_t>(graphics::kMaxVaryings)))) {
           unsupported_ = true;
           break;
         }
@@ -337,11 +338,7 @@ String TgsiEmitter::operand(const Instr::Src& s, uint32_t offset, uint32_t slot,
         unsupported_ = true;
         break;
       }
-      if (s.number >= kSysValueCount || (compute_ || hull_ || domain_ ? s.number < kSysDispatchThreadId : vertex_ ? s.number != kSysVertexId && s.number != kSysInstanceId : s.number == kSysVertexId || s.number == kSysInstanceId || s.number >= kSysDispatchThreadId)) {
-        unsupported_ = true;
-        break;
-      }
-      if (s.number == kSysPrimitiveId) {   // (virglrenderer's GLSL has no gl_PrimitiveID in a pixel shader without a geometry stage: refused, not lost)
+      if (s.number >= kSysValueCount || (geometry_ ? s.number != kSysGsInstanceId : s.number == kSysGsInstanceId) || (compute_ || hull_ || domain_ ? s.number < kSysDispatchThreadId : vertex_ ? s.number != kSysVertexId && s.number != kSysInstanceId : s.number == kSysVertexId || s.number == kSysInstanceId || s.number >= kSysDispatchThreadId)) {
         unsupported_ = true;
         break;
       }
@@ -779,6 +776,17 @@ bool TgsiEmitter::instruction(const Instr& ins) {
       line(op == kIShl ? "SHL" : op == kIShr ? "ISHR" : "USHR", &t, &a, &w);
       break;
     }
+    case kBarrier: {
+      // sync_g: the memory the group shares is made visible (MEMBAR on shared memory and buffers), then the threads wait for each other
+      String flags = str();
+      add(flags, "IMM[");
+      add_uint(flags, imm4_bits(9, 9, 9, 9));   // TGSI_MEMBAR_SHADER_BUFFER | TGSI_MEMBAR_SHARED
+      add(flags, "].xxxx");
+      line("MEMBAR", &flags);
+      line("BARRIER");
+      shared_used_ = true;
+      return true;
+    }
     case kGsEmit: case kGsCut: {
       const String stream = zero();
       if (op == kGsCut) {
@@ -807,10 +815,20 @@ bool TgsiEmitter::instruction(const Instr& ins) {
       // components x and y of one register); the words of a store are packed first, the way Direct3D writes them.
       const bool structured = ins.stride != 0, atomic = op == kBufAtomic || op == kBufImmAtomic;
       String buffer = str();
-      add(buffer, "BUFFER[");
-      add_uint(buffer, ins.uav);
-      add(buffer, "]");
-      buffer_used_[ins.uav] = true;
+      if (ins.uav >= graphics::kMaxStorageBuffers) {
+        // group-shared memory: the host has one such region, TGSI's MEMORY[0]
+        if (ins.uav != graphics::kMaxStorageBuffers) {
+          unsupported_ = true;
+          break;
+        }
+        add(buffer, "MEMORY[0]");
+        shared_used_ = true;
+      } else {
+        add(buffer, "BUFFER[");
+        add_uint(buffer, ins.uav);
+        add(buffer, "]");
+        buffer_used_[ins.uav] = true;
+      }
       const String address = temp(kWork3, ".x"), address_source = temp(kWork3, ".xxxx");
       const String index = operand(ins.src[0], 0, 0, nullptr, true);
       if (structured) {
@@ -1022,7 +1040,7 @@ void TgsiEmitter::write_control_point_outputs() {
 void TgsiEmitter::assemble(String* out) {
   out->clear();
   if (geometry_) {
-    static const char* const kInputs[] = {"POINTS", "LINES", "TRIANGLES"};
+    static const char* const kInputs[] = {"POINTS", "LINES", "TRIANGLES", "LINES_ADJACENCY", "TRIANGLES_ADJACENCY"};
     static const char* const kOutputs[] = {"POINTS", "LINE_STRIP", "TRIANGLE_STRIP"};
     add(*out, "GEOM\nPROPERTY GS_INPUT_PRIMITIVE ");
     add(*out, kInputs[static_cast<uint32_t>(p_.geometry_input_)]);
@@ -1030,7 +1048,10 @@ void TgsiEmitter::assemble(String* out) {
     add(*out, kOutputs[static_cast<uint32_t>(p_.geometry_output_)]);
     add(*out, "\nPROPERTY GS_MAX_OUTPUT_VERTICES ");
     add_uint(*out, p_.geometry_max_vertices_);
-    add(*out, "\nPROPERTY GS_INVOCATIONS 1\nDCL IN[][0], POSITION\n");
+    add(*out, "\nPROPERTY GS_INVOCATIONS ");
+    add_uint(*out, p_.geometry_instances_);
+    add(*out, "\nDCL IN[][0], POSITION\n");
+    if (sys_used_[kSysGsInstanceId]) add(*out, "DCL SV[0], INVOCATIONID\n");
     for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) {
       add(*out, "DCL IN[][");
       add_uint(*out, i + 1);
@@ -1098,6 +1119,7 @@ void TgsiEmitter::assemble(String* out) {
       add_uint(*out, i);
       add(*out, "]\n");
     }
+    if (shared_used_) add(*out, "DCL MEMORY[0], SHARED\n");
   } else if (vertex_) {
     for (uint32_t i = 0; i <= max_attribute_; ++i) {
       add(*out, "DCL IN[");
@@ -1125,6 +1147,7 @@ void TgsiEmitter::assemble(String* out) {
     }
     if (sys_used_[kSysPosition]) add(*out, "DCL IN[16], POSITION, LINEAR\n");
     if (sys_used_[kSysFrontFacing]) add(*out, "DCL IN[17], FACE, CONSTANT\n");
+    if (sys_used_[kSysPrimitiveId]) add(*out, "DCL IN[18], PRIMID, CONSTANT\n");
     add(*out, "DCL OUT[0], COLOR\n");
     for (uint32_t i = 1; i < p_.color_outputs_; ++i) {
       add(*out, "DCL OUT[");
@@ -1188,7 +1211,7 @@ NtStatus TgsiEmitter::run(String* out) {
   // A geometry shader's input positions, turned back to Direct3D's clip space (the vertex shader's text flips Y for the host).
   if (geometry_) {
     const float flip[4] = {1.0f, -1.0f, 1.0f, 1.0f};
-    const uint32_t vertices = p_.geometry_input_ == graphics::GeometryPrimitive::Triangle ? 3 : p_.geometry_input_ == graphics::GeometryPrimitive::Line ? 2 : 1;
+    const uint32_t vertices = p_.geometry_input_ == graphics::GeometryPrimitive::TriangleAdjacency ? 6 : p_.geometry_input_ == graphics::GeometryPrimitive::LineAdjacency ? 4 : p_.geometry_input_ == graphics::GeometryPrimitive::Triangle ? 3 : p_.geometry_input_ == graphics::GeometryPrimitive::Line ? 2 : 1;
     for (uint32_t v = 0; v < vertices; ++v) {
       const String target = temp(kGsPosition + v), factor = imm_text(flip, ".xyzw");
       String in = str();
@@ -1248,6 +1271,17 @@ NtStatus TgsiEmitter::run(String* out) {
         const String wx = temp(kWork, ".xxxx");
         line("UMAD", &w, &ty, &width, &wx);
         line("UADD", &reg_x, &wx, &tx);
+      }
+      continue;
+    }
+    if (geometry_) {
+      // vGSInstanceID: the invocation
+      const String z0 = zero();
+      line("MOV", &reg, &z0);
+      if (k == kSysGsInstanceId) {
+        String source = str();
+        add(source, "SV[0].xxxx");
+        line("MOV", &reg_x, &source);
       }
       continue;
     }
