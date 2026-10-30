@@ -375,7 +375,12 @@ EXPORT BOOL WINAPI DisableThreadLibraryCalls(HMODULE m) {
 
 static RTL_USER_PROCESS_PARAMETERS *parameters(void) { return NtCurrentPeb()->ProcessParameters; }
 
-EXPORT LPWSTR WINAPI GetCommandLineW(void) { return parameters()->CommandLine.Buffer; }
+/* (the address is kept from the first call: a program that clears the field in the parameters afterwards still gets its command line) */
+EXPORT LPWSTR WINAPI GetCommandLineW(void) {
+  static LPWSTR cached;
+  if (!cached) cached = parameters()->CommandLine.Buffer;
+  return cached;
+}
 EXPORT LPSTR WINAPI GetCommandLineA(void) {
   static LPSTR cached;
   if (!cached) {
@@ -1149,7 +1154,7 @@ EXPORT BOOL WINAPI InitOnceBeginInitialize(PINIT_ONCE once, DWORD flags, PBOOL p
   for (;;) {
     const ULONG_PTR v = *state;
     if ((v & 3) == 2) { *pending = FALSE; if (context) *context = (PVOID)(v & ~(ULONG_PTR)3); return TRUE; }
-    if (flags & INIT_ONCE_CHECK_ONLY_) { set_error(31 /* ERROR_GEN_FAILURE */); return FALSE; }
+    if (flags & INIT_ONCE_CHECK_ONLY_) { set_error(31 /* 31 */); return FALSE; }
     if (flags & INIT_ONCE_ASYNC_) {
       if (v == 1) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }      /* (another thread is initializing synchronously) */
       if (v == 0 && !__sync_bool_compare_and_swap(state, 0, 3)) continue;
@@ -2004,35 +2009,56 @@ EXPORT BOOL WINAPI GetProcessHandleCount(HANDLE h, PDWORD count) {
   *count = n;
   return TRUE;
 }
+EXPORT DWORD WINAPI QueryDosDeviceW(LPCWSTR name, LPWSTR buffer, DWORD capacity);
+/* A path "C:\dir\file" as the NT name of the device that holds the drive followed by "\dir\file" ("\Device\HarddiskVolume1\dir\file"). False if there is no such drive. */
+static BOOL dos_path_to_native(const WCHAR *dos, WCHAR *out, DWORD capacity) {
+  WCHAR drive[3] = {dos[0], ':', 0}, device[PATH_CHARS];
+  if (!dos[0] || dos[1] != ':' || QueryDosDeviceW(drive, device, PATH_CHARS) == 0) return FALSE;
+  const size_t_ device_length = wcslen(device), rest = wcslen(dos + 2);
+  if (device_length + rest + 1 > capacity) return FALSE;
+  memcpy(out, device, device_length * 2);
+  memcpy(out + device_length, dos + 2, (rest + 1) * 2);
+  return TRUE;
+}
 EXPORT BOOL WINAPI QueryFullProcessImageNameW(HANDLE h, DWORD flags, LPWSTR name, PDWORD size) {
-  (void)flags;
+  if (flags > 1) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }      /* (PROCESS_NAME_NATIVE is the only flag) */
   BYTE info[16 + 2 * (MAX_PATH * 2 + 1)];
   const NTSTATUS status = NtQueryInformationProcess(h, 27, info, sizeof(info), NULL);
   if (!NT_SUCCESS(status)) return fail_nt(status);
-  const DWORD n = get16(info) / 2;
+  WCHAR native[PATH_CHARS];
+  const WCHAR *text = (const WCHAR *)(ULONG_PTR)get64(info + 8);
+  DWORD n = get16(info) / 2;
+  if (flags & 1) {
+    if (!dos_path_to_native(text, native, PATH_CHARS)) { set_error(31); return FALSE; }
+    text = native;
+    n = (DWORD)wcslen(native);
+  }
+  if (!name) { set_error(*size == 0 ? ERROR_INSUFFICIENT_BUFFER : ERROR_INVALID_PARAMETER); return FALSE; }
   if (n + 1 > *size) { set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
-  memcpy(name, (WCHAR *)(ULONG_PTR)get64(info + 8), (n + 1) * 2);
+  memcpy(name, text, n * 2);
+  name[n] = 0;
   *size = n;
   return TRUE;
 }
 EXPORT BOOL WINAPI QueryFullProcessImageNameA(HANDLE h, DWORD flags, LPSTR name, PDWORD size) {
-  WCHAR wide[MAX_PATH * 2];
-  DWORD n = MAX_PATH * 2;
+  WCHAR wide[PATH_CHARS];
+  DWORD n = PATH_CHARS;
   if (!QueryFullProcessImageNameW(h, flags, wide, &n)) return FALSE;
-  const DWORD got = (DWORD)WideCharToMultiByte(CP_UTF8, 0, wide, (int)n + 1, name, (int)*size, NULL, NULL);
-  if (got == 0) { set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
-  *size = got - 1;
+  if (!name) { set_error(*size == 0 ? ERROR_INSUFFICIENT_BUFFER : ERROR_INVALID_PARAMETER); return FALSE; }
+  const int needed = WideCharToMultiByte(CP_UTF8, 0, wide, (int)n + 1, NULL, 0, NULL, NULL);
+  if (needed <= 0 || (DWORD)needed > *size) { set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+  WideCharToMultiByte(CP_UTF8, 0, wide, (int)n + 1, name, needed, NULL, NULL);
+  *size = (DWORD)needed - 1;
   return TRUE;
 }
 EXPORT HANDLE WINAPI OpenProcess(DWORD access, BOOL inherit, DWORD id) {
-  (void)access;
   OBJECT_ATTRIBUTES attributes;
   memset(&attributes, 0, sizeof(attributes));
   attributes.Length = sizeof(attributes);
   attributes.Attributes = inherit ? 2 : 0;
   ULONG64 client[2] = {id, 0};
   HANDLE h = NULL;
-  const NTSTATUS status = NtOpenProcess(&h, 0x1FFFFF, &attributes, client);
+  const NTSTATUS status = NtOpenProcess(&h, access, &attributes, client);
   if (!NT_SUCCESS(status)) { if (status == (NTSTATUS)0xC000000B) set_error(ERROR_INVALID_PARAMETER); else fail_nt(status); return NULL; }
   return h;
 }
@@ -2180,19 +2206,27 @@ static HANDLE console_for_new_process(DWORD flags) {
 EXPORT BOOL WINAPI CreateProcessW(LPCWSTR application, LPWSTR command_line, LPSECURITY_ATTRIBUTES process_attributes, LPSECURITY_ATTRIBUTES thread_attributes,
                                   BOOL inherit_handles, DWORD flags, LPVOID environment, LPCWSTR directory, LPSTARTUPINFOW startup, LPPROCESS_INFORMATION information) {
   (void)process_attributes; (void)thread_attributes;
+  if (information) memset(information, 0, sizeof(*information));
   if (!application && !command_line) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
   WCHAR name[MAX_PATH], image[PATH_CHARS];
   if (application) {
+    if (!application[0]) { set_error(ERROR_PATH_NOT_FOUND); return FALSE; }
     if (wcslen(application) >= MAX_PATH) { set_error(ERROR_FILE_NOT_FOUND); return FALSE; }
     lstrcpyW(name, application);
-  } else {      /* the first word of the command line (in quotes, or up to a space) */
+  } else {      /* the first word of the command line (in quotes, or up to a space or tab); nothing before it may be blank */
     LPCWSTR c = command_line;
-    while (*c == ' ') ++c;
     size_t_ n = 0;
     const BOOL quoted = *c == '"';
     if (quoted) ++c;
-    while (*c && (quoted ? *c != '"' : *c != ' ')) { if (n + 1 >= MAX_PATH) { set_error(ERROR_FILE_NOT_FOUND); return FALSE; } name[n++] = *c++; }
+    while (*c && (quoted ? *c != '"' : (*c != ' ' && *c != '\t'))) { if (n + 1 >= MAX_PATH) { set_error(ERROR_FILE_NOT_FOUND); return FALSE; } name[n++] = *c++; }
     name[n] = 0;
+    while (n > 0 && name[n - 1] == ' ') name[--n] = 0;      /* (the blanks that end a name are not part of it) */
+    if (n == 0) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  }
+  if (directory) {      /* a folder that is not there is an error of its own, whatever the program */
+    WCHAR full[PATH_CHARS];
+    const DWORD a = full_path_w(directory, full, PATH_CHARS) ? GetFileAttributesW(full) : INVALID_FILE_ATTRIBUTES;
+    if (a == INVALID_FILE_ATTRIBUTES || !(a & FILE_ATTRIBUTE_DIRECTORY)) { set_error(ERROR_DIRECTORY); return FALSE; }
   }
   if (!find_program(name, image)) { set_error(ERROR_FILE_NOT_FOUND); return FALSE; }
   WCHAR current[PATH_CHARS];
@@ -2229,6 +2263,7 @@ EXPORT BOOL WINAPI CreateProcessW(LPCWSTR application, LPWSTR command_line, LPSE
     if (startup->lpTitle) { unicode_string(&title_string, startup->lpTitle); block.title = &title_string; }
     if (startup->lpDesktop) { unicode_string(&desktop_string, startup->lpDesktop); block.desktop = &desktop_string; }
   }
+  if (!block.title) { unicode_string(&title_string, image); block.title = &title_string; }      /* (a program without a title has its own path as the title) */
   block.console = console_for_new_process(flags);
   const NTSTATUS status = NtCreateUserProcess(&process, &thread, &image_name, &command, cwd_pointer, environment ? environment : GetEnvironmentStringsW(), nt_flags, &process_id,
                                               &thread_id, std_in, std_out, std_err, &block);

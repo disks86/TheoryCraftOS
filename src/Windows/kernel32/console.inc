@@ -53,7 +53,7 @@ static BOOL g_ctrl_ignored;
 #define CON_HOST_CELLS (128 * 1024)      /* the largest main screen buffer (two copies are kept so that a resize can copy) */
 typedef struct {
   volatile LONG lock;
-  DWORD magic, in_mode, history_size, history_buffers, history_flags, member_count, members[CON_MAX_MEMBERS];
+  DWORD magic, in_mode, history_size, history_buffers, history_flags, member_count, members[CON_MAX_MEMBERS], input_cp, output_cp;      /* (the code pages: 0 is the default, UTF-8) */
   WCHAR title[260], original_title[260];
   ScreenBuffer main;
   LONG flip;
@@ -66,6 +66,7 @@ static BOOL g_host_tried;
 static WCHAR g_detached_title[260];
 static DWORD g_detached_mode = ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT;
 static DWORD g_detached_history[3] = {50, 4, 0};
+static DWORD g_detached_cp[2];
 
 /* The lock of a console is a spin lock; one that its holder never gives back (the holder ended in the middle of a console call) is taken after a while. */
 static void con_host_lock(ConHost *h) {
@@ -678,6 +679,27 @@ static BOOL console_read_hook(HANDLE h, LPVOID buffer, DWORD length, LPDWORD rea
   if (read) *read = n;
   return TRUE;
 }
+
+/* ---- code pages of the console (shared by its processes) ------------------------------------------------------------------------------------------------- */
+
+static UINT con_get_cp(int output) {
+  con_lock();
+  const DWORD cp = g_host ? (output ? g_host->output_cp : g_host->input_cp) : g_detached_cp[output];
+  con_unlock();
+  return cp ? cp : CP_UTF8;
+}
+static BOOL con_set_cp(int output, UINT cp) {
+  if (cp == 0 || cp >= 0x10000u || !IsValidCodePage(cp)) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  con_lock();
+  DWORD *where = g_host ? (output ? &g_host->output_cp : &g_host->input_cp) : &g_detached_cp[output];
+  *where = cp;
+  con_unlock();
+  return TRUE;
+}
+EXPORT UINT WINAPI GetConsoleCP(void) { return con_get_cp(0); }
+EXPORT UINT WINAPI GetConsoleOutputCP(void) { return con_get_cp(1); }
+EXPORT BOOL WINAPI SetConsoleCP(UINT cp) { return con_set_cp(0, cp); }
+EXPORT BOOL WINAPI SetConsoleOutputCP(UINT cp) { return con_set_cp(1, cp); }
 
 /* ---- modes, titles, control events --------------------------------------------------------------------------------------------------------------------- */
 

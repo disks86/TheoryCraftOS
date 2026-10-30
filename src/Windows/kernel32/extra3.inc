@@ -1217,26 +1217,35 @@ EXPORT BOOL WINAPI K32GetProcessMemoryInfo(HANDLE process, PROCESS_MEMORY_COUNTE
   if (!found) set_error(ERROR_INVALID_HANDLE);
   return found;
 }
+/* The path of the program as the NT name ("\\Device\\HarddiskVolume1\\..."): its length in characters, or 0 and ERROR_INSUFFICIENT_BUFFER if `size` characters (with the NUL) do not hold it. */
 EXPORT DWORD WINAPI K32GetProcessImageFileNameW(HANDLE process, LPWSTR name, DWORD size) {
   ModuleRecord_ m;
   DWORD pid = 0;
   if (!find_module_record(process, NULL, &m, &pid)) return 0;
   MODULEENTRY32W_ *e = RtlAllocateHeap(heap(), 0, sizeof(*e));
-  if (!e) { set_error(ERROR_NOT_ENOUGH_MEMORY); return 0; }
-  fill_module_entry(e, &m, pid);
-  const DWORD length = (DWORD)wcslen(e->szExePath), n = length < size ? length : (size ? size - 1 : 0);
-  for (DWORD i = 0; i < n; ++i) name[i] = e->szExePath[i];
-  if (size) name[n] = 0;
-  RtlFreeHeap(heap(), 0, e);
-  return n;
+  WCHAR *native = RtlAllocateHeap(heap(), 0, PATH_CHARS * 2);
+  DWORD result = 0;
+  if (!e || !native) set_error(ERROR_NOT_ENOUGH_MEMORY);
+  else {
+    fill_module_entry(e, &m, pid);
+    if (!dos_path_to_native(e->szExePath, native, PATH_CHARS)) lstrcpyW(native, e->szExePath);
+    const DWORD length = (DWORD)wcslen(native);
+    if (!name || length + 1 > size) set_error(ERROR_INSUFFICIENT_BUFFER);
+    else { memcpy(name, native, ((size_t_)length + 1) * 2); result = length; }
+  }
+  if (e) RtlFreeHeap(heap(), 0, e);
+  if (native) RtlFreeHeap(heap(), 0, native);
+  return result;
 }
 EXPORT DWORD WINAPI K32GetProcessImageFileNameA(HANDLE process, LPSTR name, DWORD size) {
-  WCHAR wide[MAX_PATH];
-  const DWORD n = K32GetProcessImageFileNameW(process, wide, MAX_PATH);
-  const DWORD k = n < size ? n : (size ? size - 1 : 0);
-  for (DWORD i = 0; i < k; ++i) name[i] = (char)wide[i];
-  if (size) name[k] = 0;
-  return k;
+  WCHAR wide[PATH_CHARS];
+  const DWORD n = K32GetProcessImageFileNameW(process, wide, PATH_CHARS);
+  if (n == 0) return 0;
+  if (!name) { set_error(ERROR_INSUFFICIENT_BUFFER); return 0; }
+  const int needed = WideCharToMultiByte(CP_UTF8, 0, wide, (int)n + 1, NULL, 0, NULL, NULL);
+  if (needed <= 0 || (DWORD)needed > size) { set_error(ERROR_INSUFFICIENT_BUFFER); return 0; }
+  WideCharToMultiByte(CP_UTF8, 0, wide, (int)n + 1, name, needed, NULL, NULL);
+  return (DWORD)needed - 1;
 }
 EXPORT BOOL WINAPI K32EmptyWorkingSet(HANDLE process) { (void)process; return TRUE; }
 EXPORT BOOL WINAPI EnumProcessModules(HANDLE p, HMODULE *m, DWORD cb, LPDWORD n) { return K32EnumProcessModules(p, m, cb, n); }

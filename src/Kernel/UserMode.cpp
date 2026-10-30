@@ -846,8 +846,47 @@ struct Task::Child {
   UniquePointer<Task> task;
   uint64_t pid = 0;
   bool started = true;
+  bool busy = false;      // (orphans) one reaper is looking at it
+  allocators::IAllocator* owner = nullptr;      // where the record came from (an orphan is freed by whoever reaps it)
   Child* next = nullptr;
 };
+
+// The programs whose parent has ended. They go on (as on Windows): whoever starts a program next frees the ones that have ended since, and anyone may still terminate or
+// resume them by id.
+namespace {
+Mutex g_orphans_mutex;
+Task::Child* g_orphans = nullptr;
+}  // namespace
+
+static void destroy_child(Task::Child* c) {
+  allocators::IAllocator* owner = c->owner;
+  c->~Child();
+  owner->deallocate(c);
+}
+
+static void reap_orphans() {
+  constexpr uint32_t kBatch = 16;
+  Task::Child* batch[kBatch];
+  uint32_t count = 0;
+  {
+    ScopedMutex hold(g_orphans_mutex);
+    for (Task::Child* o = g_orphans; o && count < kBatch; o = o->next) if (!o->busy) { o->busy = true; batch[count++] = o; }
+  }
+  for (uint32_t i = 0; i < count; ++i) {
+    Task::Child* c = batch[i];
+    uint32_t code = 0;
+    const bool finished = c->started ? usermode::wait(*c->task, &code, 1) : c->task->program.process()->exited();
+    {
+      ScopedMutex hold(g_orphans_mutex);
+      if (!finished) c->busy = false;
+      else for (Task::Child** link = &g_orphans; *link; link = &(*link)->next) if (*link == c) { *link = c->next; break; }
+    }
+    if (finished) {
+      if (process::ObjectManager* objects = process::system_objects()) objects->process_exited(c->pid, c->task->program.process()->exit_code());
+      destroy_child(c);
+    }
+  }
+}
 
 uint64_t Task::allocate_process_id() {
   static uint64_t next = 0x40000;
@@ -861,11 +900,13 @@ uint64_t Task::allocate_process_id() {
 uint32_t Task::spawn_process(const process::ChildSpec& spec) {
   constexpr uint32_t kNoMemory = 0xC0000017u, kInvalidImage = 0xC000007Bu, kNoResources = 0xC000009Au;
   reap_children(false);
+  reap_orphans();
   const process::SyscallAbi abi = process::abi_for_executable(exe::identify_executable(spec.image.at_most(exe::kIdentifyBytes)));
   if (abi == process::SyscallAbi::None) return kInvalidImage;
   void* memory = allocator_.allocate(sizeof(Child));
   if (!memory) return kNoMemory;
   Child* child = new (memory) Child();
+  child->owner = &allocator_;
   auto discard = [&]() { child->~Child(); allocator_.deallocate(child); };
   child->pid = spec.pid;
   child->program = UniquePointer<process::UserProgram>::make(allocator_, allocator_, spec.pid, program.host());
@@ -934,31 +975,55 @@ uint32_t Task::spawn_process(const process::ChildSpec& spec) {
   return 0;
 }
 
-bool Task::terminate_process(uint64_t pid, uint32_t code) {
-  for (Child* c = children; c; c = c->next) {
-    if (c->pid != pid) continue;
-    if (c->task->program.process()->exited()) return false;
-    if (!c->started) {      // it never ran: there is no thread to stop
-      c->task->kill_code = code;
-      c->task->killed = true;
-      c->task->program.process()->terminate(code);
-      c->task->program.process()->release_handles();
-      return true;
-    }
-    request_kill(*c->task, code);
-    c->program->host().wake_blocked();
+static bool terminate_child(Task::Child* c, uint32_t code) {
+  if (c->task->program.process()->exited()) return false;
+  if (!c->started) {      // it never ran: there is no thread to stop
+    c->task->kill_code = code;
+    c->task->killed = true;
+    c->task->program.process()->terminate(code);
+    c->task->program.process()->release_handles();
     return true;
   }
-  return false;
+  request_kill(*c->task, code);
+  c->program->host().wake_blocked();
+  return true;
+}
+
+static bool resume_child(Task::Child* c) {
+  if (c->started) return false;
+  c->started = true;
+  return c->task->start_first_thread();
+}
+
+// Does `action` to the child with this id wherever it is: among the programs this one started, those whose parent has ended, or those another program started (the
+// program may be asked about by anyone who knows its id). The bool says whether there was one.
+template <typename Action>
+static bool with_child(Task& self, uint64_t pid, Action action) {
+  for (Task::Child* c = self.children; c; c = c->next) if (c->pid == pid) return action(c);
+  {
+    ScopedMutex hold(g_orphans_mutex);
+    for (Task::Child* c = g_orphans; c; c = c->next) if (c->pid == pid) return action(c);
+  }
+  bool found = false, result = false;
+  self.mutex.unlock();      // (another program's lock is taken, and no lock of this one may be held meanwhile: see remote_operation)
+  {
+    ScopedMutex registry(g_tasks_mutex);
+    for (Task* t = g_tasks; t && !found; t = t->all_next) {
+      if (t == &self) continue;
+      ScopedMutex hold(t->mutex);
+      for (Task::Child* c = t->children; c; c = c->next) if (c->pid == pid) { found = true; result = action(c); break; }
+    }
+  }
+  self.mutex.lock();
+  return found && result;
+}
+
+bool Task::terminate_process(uint64_t pid, uint32_t code) {
+  return with_child(*this, pid, [&](Child* c) { return terminate_child(c, code); });
 }
 
 bool Task::resume_process(uint64_t pid) {
-  for (Child* c = children; c; c = c->next) {
-    if (c->pid != pid || c->started) continue;
-    c->started = true;
-    return c->task->start_first_thread();
-  }
-  return false;
+  return with_child(*this, pid, [&](Child* c) { return resume_child(c); });
 }
 
 void Task::reap_children(bool all) {
@@ -968,13 +1033,14 @@ void Task::reap_children(bool all) {
     Task& t = *c->task;
     uint32_t code = 0;
     if (all) {
-      if (c->started) {
-        request_kill(t, t.kill_code);
-        c->program->host().wake_blocked();
-        usermode::wait(t, &code);
-      } else if (!c->task->program.process()->exited()) {
-        c->task->program.process()->terminate(c->task->kill_code);
+      if (!c->task->program.process()->exited()) {      // the program goes on without its parent
+        *link = c->next;
+        ScopedMutex hold(g_orphans_mutex);
+        c->next = g_orphans;
+        g_orphans = c;
+        continue;
       }
+      if (c->started) usermode::wait(t, &code);
     } else if (!c->started || !usermode::wait(t, &code, 1)) {
       link = &c->next;
       continue;
@@ -1102,7 +1168,8 @@ uint32_t process_snapshot(ProcessInfo* out, uint32_t capacity) {
     info.cpu_ticks = task->retired_ticks;
     bool ready = false;
     for (const UserThread* t = task->threads; t; t = t->next) {
-      if (!t->spawned || t->joined || !t->thread) continue;    // (a joined thread's memory is gone)
+      if (t->joined) continue;    // (a joined thread's memory is gone)
+      if (!t->spawned || !t->thread) { if (!t->finished) ++info.threads; continue; }      // (a thread that was made suspended is a thread already)
       ++info.threads;
       info.cpu_ticks += t->thread->cpu_ticks;
       if (t->thread->state == ThreadState::Running) info.state = ThreadState::Running;

@@ -143,6 +143,12 @@ bool process_handle_info(Process& p, uint64_t handle, bool* exited, uint32_t* co
   return objects->query_process(uint32_t(p.files().token(slot)), exited, code, pid);
 }
 
+bool process_handle_lacks(Process& p, uint64_t handle, uint32_t rights) {
+  uint64_t slot = 0;
+  if (!slot_of(handle, &slot) || p.files().kind(slot) != DescriptorKind::Process) return false;
+  return (p.files().denied_access(slot) & rights) == rights;
+}
+
 bool names_own_process(Process& p, uint64_t handle) {
   if (handle == ~uint64_t{0}) return true;
   bool exited = false;
@@ -157,6 +163,7 @@ uint32_t terminate_process_handle(Process& p, uint64_t handle, uint32_t code, bo
   uint64_t pid = 0;
   *handled = process_handle_info(p, handle, &exited, &old_code, &pid);
   if (!*handled) return kInvalidHandle;
+  if (process_handle_lacks(p, handle, 0x1)) return 0xC0000022u;      // no PROCESS_TERMINATE
   if (exited) return 0xC0000022u;      // STATUS_ACCESS_DENIED: it has ended
   if (pid == p.id()) { p.terminate(code); return kSuccess; }
   return p.runtime() && p.runtime()->terminate_process(pid, code) ? kSuccess : 0xC0000022u;
@@ -359,6 +366,9 @@ uint32_t nt_query_information_process(Process& p, const SyscallRequest& r) {
     if (!process_handle_info(p, r.args[0], &child_exited, &child_code, &child_pid)) return kInvalidHandle;
     self = child_pid == p.id();      // (OpenProcess on the own id gives a handle to this very process)
   }
+  if (process_handle_lacks(p, r.args[0], 0x400 | 0x1000)) return 0xC0000022u;      // neither PROCESS_QUERY_INFORMATION nor PROCESS_QUERY_LIMITED_INFORMATION
+  // The classes a handle with the limited right only may not ask for: the debugger's things and the cookie.
+  if (process_handle_lacks(p, r.args[0], 0x400) && (info_class == 7 || info_class == 30 || info_class == 31 || info_class == 34 || info_class == 36)) return 0xC0000022u;
   if (!self && info_class == 7) {      // ProcessDebugPort of another program: -1 when a debugger is attached
     if (length < 8) return kInfoLengthMismatch;
     uint8_t port[8] = {};
@@ -478,7 +488,15 @@ uint32_t nt_open_process(Process& p, const SyscallRequest& r) {
   if (r.args[2] != 0) p.read_user(r.args[2] + 24, ByteView(attributes, 4));
   uint64_t slot = 0;
   const uint32_t status = give_handle(p, *objects, c.id, r.args[0], &slot);
-  if (status == kSuccess) p.files().set_handle_flags(slot, (attributes[0] & 2) != 0, false);
+  if (status == kSuccess) {
+    p.files().set_handle_flags(slot, (attributes[0] & 2) != 0, false);
+    uint32_t want = uint32_t(r.args[1]);      // the rights asked for (the generic ones spelled out); the handle lacks the others
+    if (want & 0x80000000u) want |= 0x20000 | 0x10 | 0x400;      // GENERIC_READ: READ_CONTROL, PROCESS_VM_READ, PROCESS_QUERY_INFORMATION
+    if (want & 0x40000000u) want |= 0x20000 | 0x2 | 0x8 | 0x20 | 0x40 | 0x80 | 0x100 | 0x200;      // GENERIC_WRITE
+    if (want & 0x20000000u) want |= 0x120000 | 0x1000;      // GENERIC_EXECUTE
+    if (want & 0x12000000u) want = 0x1FFFFF;      // GENERIC_ALL, MAXIMUM_ALLOWED
+    p.files().set_denied_access(slot, ~want & 0x1FFFFFu);
+  }
   return status;
 }
 

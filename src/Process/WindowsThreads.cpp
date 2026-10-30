@@ -592,7 +592,14 @@ uint32_t nt_query_information_thread(Process& p, const SyscallRequest& r) {
   uint64_t returned = 0;
   if (!windowsabi::argument(p, r, 4, &returned)) return kAccessViolation;
   uint64_t remote_id = 0;
-  if (remote_thread_handle(p, r.args[0], &remote_id)) {      // a thread of another program: what the object knows (basic information only)
+  bool main_thread_of_other = false;      // the thread handle CreateProcess gave out: the process object, whose id is also the id of its main thread
+  {
+    bool exited = false;
+    uint32_t code = 0;
+    uint64_t pid = 0;
+    main_thread_of_other = !remote_thread_handle(p, r.args[0], &remote_id) && process_handle_info(p, r.args[0], &exited, &code, &pid) && pid != p.id();
+  }
+  if (main_thread_of_other || remote_thread_handle(p, r.args[0], &remote_id)) {      // a thread of another program: what the object knows (basic information only)
     if (uint32_t(r.args[1]) != 0) return kInvalidInfoClass;
     if (uint32_t(r.args[3]) < 48) return kInfoLengthMismatch;
     bool exited = false;

@@ -353,9 +353,16 @@ uint32_t vm_write(Process& target, uint64_t address, ConstByteView in, uint64_t*
 }
 
 // The process a handle names for memory work: this one (*remote false), or another running program (its id in *pid).
-uint32_t resolve(Process& p, uint64_t handle, bool* remote, uint64_t* pid) {
+// `rights` are the access rights (PROCESS_VM_OPERATION ...) a handle that was opened with an access mask needs, all of them at once; `any_of` instead asks for one of them.
+uint32_t resolve(Process& p, uint64_t handle, bool* remote, uint64_t* pid, uint32_t rights = 0, bool any_of = false) {
   *remote = false;
   if (handle == kCurrentProcess) return kStatusSuccess;
+  if (rights != 0) {
+    bool lacks = false;
+    if (any_of) lacks = process_handle_lacks(p, handle, rights);
+    else for (uint32_t bit = 1; bit != 0; bit <<= 1) if ((rights & bit) && process_handle_lacks(p, handle, bit)) lacks = true;
+    if (lacks) return 0xC0000022u;      // STATUS_ACCESS_DENIED
+  }
   bool exited = false;
   uint32_t code = 0;
   uint64_t id = 0;
@@ -450,7 +457,7 @@ uint32_t nt_allocate_virtual_memory(Process& process, const SyscallRequest& r) {
   uint64_t type = 0, protect = 0, base = 0, size = 0, pid = 0;
   bool remote = false;
   if (!argument(process, r, 4, &type) || !argument(process, r, 5, &protect)) return kStatusAccessViolation;
-  const uint32_t resolved = resolve(process, r.args[0], &remote, &pid);
+  const uint32_t resolved = resolve(process, r.args[0], &remote, &pid, 0x8);      // PROCESS_VM_OPERATION
   if (resolved != kStatusSuccess) return resolved;
   if (!process.read_user_u64(r.args[1], &base) || !process.read_user_u64(r.args[3], &size)) return kStatusAccessViolation;
   uint32_t status;
@@ -471,7 +478,7 @@ uint32_t nt_allocate_virtual_memory(Process& process, const SyscallRequest& r) {
 uint32_t nt_free_virtual_memory(Process& process, const SyscallRequest& r) {
   uint64_t base = 0, size = 0, pid = 0;
   bool remote = false;
-  const uint32_t resolved = resolve(process, r.args[0], &remote, &pid);
+  const uint32_t resolved = resolve(process, r.args[0], &remote, &pid, 0x8);      // PROCESS_VM_OPERATION
   if (resolved != kStatusSuccess) return resolved;
   if (!process.read_user_u64(r.args[1], &base) || !process.read_user_u64(r.args[2], &size)) return kStatusAccessViolation;
   uint32_t status;
@@ -493,7 +500,7 @@ uint32_t nt_protect_virtual_memory(Process& process, const SyscallRequest& r) {
   uint64_t old_pointer = 0, base = 0, size = 0, pid = 0;
   bool remote = false;
   if (!argument(process, r, 4, &old_pointer)) return kStatusAccessViolation;
-  const uint32_t resolved = resolve(process, r.args[0], &remote, &pid);
+  const uint32_t resolved = resolve(process, r.args[0], &remote, &pid, 0x8);      // PROCESS_VM_OPERATION
   if (resolved != kStatusSuccess) return resolved;
   if (!process.read_user_u64(r.args[1], &base) || !process.read_user_u64(r.args[2], &size) || old_pointer == 0) return kStatusAccessViolation;
   uint32_t old = 0, status;
@@ -526,7 +533,7 @@ uint32_t nt_query_virtual_memory(Process& process, const SyscallRequest& r) {
   uint64_t length = 0, returned = 0, pid = 0;
   bool remote = false;
   if (!argument(process, r, 4, &length) || !argument(process, r, 5, &returned)) return kStatusAccessViolation;
-  const uint32_t resolved = resolve(process, r.args[0], &remote, &pid);
+  const uint32_t resolved = resolve(process, r.args[0], &remote, &pid, 0x400 | 0x1000, true);      // PROCESS_QUERY_INFORMATION or PROCESS_QUERY_LIMITED_INFORMATION
   if (resolved != kStatusSuccess) return resolved;
   if ((r.args[2] & 0xFFFFFFFFu) != 0) return kStatusInvalidInfoClass;      // (a ULONG: mask the undefined upper half)
   if ((length & 0xFFFFFFFFu) < 48) return kStatusInfoLengthMismatch;
@@ -553,7 +560,7 @@ namespace {
 uint32_t move_memory(Process& process, const SyscallRequest& r, bool write) {
   uint64_t pid = 0, copied = 0;
   bool remote = false;
-  const uint32_t resolved = resolve(process, r.args[0], &remote, &pid);
+  const uint32_t resolved = resolve(process, r.args[0], &remote, &pid, write ? (0x20 | 0x8) : 0x10);      // PROCESS_VM_WRITE and PROCESS_VM_OPERATION, or PROCESS_VM_READ
   if (resolved != kStatusSuccess) return resolved;
   uint64_t done_pointer = 0;
   if (!argument(process, r, 4, &done_pointer)) return kStatusAccessViolation;
