@@ -225,8 +225,8 @@ class LinuxSyscalls final : public ISyscallInterface {
       case Call::Futex: return linuxabi::sys_futex(process, a[0], a[1], a[2], a[3], a[4], a[5]);
       case Call::Tgkill: return 0;      // signals are not delivered; asking whether a thread exists, or sending one, succeeds
       case Call::SchedGetaffinity: return linuxabi::sys_sched_getaffinity(process, a[1], a[2]);
-      case Call::Prctl:      // PR_SET_NAME and friends succeed; the SVE vector-length calls (50 set, 51 get) report the emulated AArch64 vector length, 16 bytes
-        if ((a[0] == 50 || a[0] == 51) && arch_ == UserArch::AArch64) return 16;
+      case Call::Prctl:      // PR_SET_NAME and friends succeed; the SVE vector-length calls (50 set, 51 get) and the SME ones (62 set, 63 get) report the emulated AArch64 vector length, 16 bytes
+        if ((a[0] == 50 || a[0] == 51 || a[0] == 62 || a[0] == 63) && arch_ == UserArch::AArch64) return 16;
         return 0;
       case Call::Uname: return write_uname(process, a[0]);
       case Call::ClockGettime: return clock_gettime(process, a[0], a[1]);

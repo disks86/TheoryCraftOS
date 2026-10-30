@@ -470,7 +470,8 @@ RES_NZCV = RES_OFF + 31*8; RES_FPSR = RES_NZCV + 8
 RES_V = (RES_FPSR + 8 + 15) // 16 * 16
 RES_P = RES_V + 32*16       # p0..p15 then FFR, 2 bytes each (vector length 128 bits)
 RES_ZA = (RES_P + 17*2 + 15) // 16 * 16      # the ZA array: 16 rows of 16 bytes
-BUF_OFF = RES_ZA + 256
+RES_ZT0 = RES_ZA + 256      # the 64 byte ZT0 lookup table
+BUF_OFF = RES_ZT0 + 64
 BUF_SIZE = 1024
 INIT_P = V_OFF + 32*16      # initial predicates, same layout (inside the init area, which is RES_OFF-aligned, so reserve the room)
 BLK = BUF_OFF + BUF_SIZE
@@ -481,6 +482,7 @@ for i, text in enumerate(cases):
     out.append(f'  adrp x0, blk{i}\n  add x0, x0, :lo12:blk{i}\n  mov sp, x0')
     out.append(f'  ldr x0, [sp, #{NZCV_OFF}]\n  msr nzcv, x0\n  msr fpsr, xzr')
     if mode == 'sme':      # streaming mode with ZA enabled: state is loaded with the SVE and ZA loads, which are legal there
+        out.append(f'  add x1, sp, #{INIT_ZA + 64}\n  ldr zt0, [x1]')
         out.append(f'  add x1, sp, #{INIT_ZA}\n  mov w12, #0')
         for k in range(16): out.append(f'  ldr za[w12, #{k}], [x1, #{k}, mul vl]')
         out.append(f'  add x1, sp, #{V_OFF}')
@@ -507,6 +509,7 @@ for i, text in enumerate(cases):
         for k in range(16): out.append(f'  str p{k}, [x1, #{k}, mul vl]')
         out.append(f'  add x1, sp, #{RES_ZA - RES_OFF}\n  mov w12, #0')
         for k in range(16): out.append(f'  str za[w12, #{k}], [x1, #{k}, mul vl]')
+        out.append(f'  add x1, sp, #{RES_ZT0 - RES_OFF}\n  str zt0, [x1]')
     else:
         for k in range(0, 32, 2): out.append(f'  stp q{k}, q{k+1}, [sp, #{RES_V + k*16 - RES_OFF}]')
         out.append(f'  add x1, sp, #{RES_P - RES_OFF}')
@@ -533,4 +536,4 @@ out.append('.balign 8\n.pool')
 data.append(f'.set total, {BLK * len(cases)}')
 open(WORK + '/t.s', 'w').write('\n'.join(out + data) + '\n')
 open(WORK + '/cases.txt', 'w').write('\n'.join(c.replace('\n', ' ; ') for c in cases) + '\n')
-open(WORK + '/layout.txt', 'w').write(f'{BLK} {X_OFF} {V_OFF} {RES_X} {RES_NZCV} {RES_FPSR} {RES_V} {BUF_OFF} {RES_P} {RES_ZA}\n')
+open(WORK + '/layout.txt', 'w').write(f'{BLK} {X_OFF} {V_OFF} {RES_X} {RES_NZCV} {RES_FPSR} {RES_V} {BUF_OFF} {RES_P} {RES_ZA} {RES_ZT0}\n')

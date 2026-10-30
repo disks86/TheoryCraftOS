@@ -6,7 +6,7 @@ q = open(w + '/q.bin', 'rb').read()
 raw = open(w + '/e.raw', 'rb').read()
 i = raw.rfind(b'[exit=')
 e = raw[:i]
-blk, xo, vo, rx, rn, rf, rv, bo, rp, rza = map(int, open(w + '/layout.txt').read().split())
+blk, xo, vo, rx, rn, rf, rv, bo, rp, rza, rzt = map(int, open(w + '/layout.txt').read().split())
 cases = open(w + '/cases.txt').read().split('\n')
 print(raw[i:].decode().strip(), 'sizes', len(q), len(e))
 bad = 0
@@ -46,6 +46,8 @@ for ci, text in enumerate(cases):
                 diffs.append(' '.join('%s q=%04x e=%04x' % ('p%d' % k if k < 16 else 'ffr', pq[k], pe[k]) for k in range(17) if pq[k] != pe[k]))
             if a[rza:rza + 256] != b[rza:rza + 256]:
                 diffs.append('ZA ' + ' '.join('row%d q=%s e=%s' % (r, a[rza + 16 * r:rza + 16 * r + 16][::-1].hex(), b[rza + 16 * r:rza + 16 * r + 16][::-1].hex()) for r in range(16) if a[rza + 16 * r:rza + 16 * r + 16] != b[rza + 16 * r:rza + 16 * r + 16])[:600])
+            if a[rzt:rzt + 64] != b[rzt:rzt + 64]:
+                diffs.append('ZT0 q=%s e=%s' % (a[rzt:rzt + 64][::-1].hex(), b[rzt:rzt + 64][::-1].hex()))
             if a[bo:] != b[bo:]:
                 diffs.append('MEMORY q=%s e=%s' % (a[bo:bo + 160].hex(), b[bo:bo + 160].hex()))
             print('MISMATCH #%d: %s' % (ci, text))

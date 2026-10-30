@@ -79,6 +79,28 @@ AArch64Cpu::Step AArch64Cpu::sme(GuestMemory& m, uint32_t insn) {
       for (uint32_t k = 0; k < nreg; ++k) s_.v[regs[k]] = data[k];
     return Step::Ok;
   }
+  if ((insn & 0xFFFFFC1Fu) == 0xE11F8000u || (insn & 0xFFFFFC1Fu) == 0xE13F8000u) {      // LDR / STR ZT0, [Xn]: the 64 byte lookup table
+    if (!s_.za_enabled) return undefined();
+    const uint64_t address = reg_sp(bits_of(insn, 9, 5), true);
+    const bool store = (insn >> 21) & 1;
+    for (uint32_t i = 0; i < 8; ++i) {
+      if (store) { if (!this->store(m, address + 8ull * i, 8, s_.zt0[i])) return Step::Fault; }
+      else if (!this->load(m, address + 8ull * i, 8, &s_.zt0[i])) return Step::Fault;
+    }
+    return Step::Ok;
+  }
+  if (insn == 0xC0480001u) {      // ZERO {ZT0}
+    if (!s_.za_enabled) return undefined();
+    for (uint64_t& w : s_.zt0) w = 0;
+    return Step::Ok;
+  }
+  if ((insn & 0xFFFF8FE0u) == 0xC04C03E0u || (insn & 0xFFFF8FE0u) == 0xC04E03E0u) {      // MOVT Xt, ZT0[#off] / MOVT ZT0[#off], Xt
+    if (!s_.za_enabled) return undefined();
+    const uint32_t index = bits_of(insn, 14, 12), rt = insn & 31;
+    if ((insn >> 17) & 1) s_.zt0[index] = reg(rt, true);
+    else set_reg(rt, s_.zt0[index], true);
+    return Step::Ok;
+  }
   if (!s_.streaming && (insn >> 24) != 0xE1) return undefined();      // (only LDR / STR of ZA work outside streaming mode)
   const uint32_t top = insn >> 24, size = bits_of(insn, 23, 22), rn = bits_of(insn, 9, 5), zd = insn & 31;
   const uint32_t pg = bits_of(insn, 12, 10), rs = bits_of(insn, 14, 13);
@@ -100,6 +122,76 @@ AArch64Cpu::Step AArch64Cpu::sme(GuestMemory& m, uint32_t insn) {
     else put(&s_.za[i * n + tile], esz, k, value);
   };
 
+  if (top == 0xC0 && ((insn >> 23) & 1) && !((insn >> 21) & 1) && !((insn >> 10) & 3) && (bits_of(insn, 19, 18) == 3 || bits_of(insn, 19, 17) == 5) && bits_of(insn, 13, 12) != 3) {      // LUTI2 / LUTI4: expand table indices from a vector through ZT0
+    const bool luti2 = bits_of(insn, 19, 18) == 3, single = (insn >> 22) & 1, strided = (insn >> 20) & 1, x2 = !single && ((insn >> 14) & 1), x4 = !single && !x2 && ((insn >> 15) & 1);
+    if (!single && !x2 && !x4) return undefined();
+    if ((single && strided) || (!luti2 && ((insn >> 17) & 1) == 0)) return undefined();
+    const uint32_t esz = bits_of(insn, 13, 12), nreg = single ? 1 : x2 ? 2 : 4;
+    if (!luti2 && esz == 0 && x4) return undefined();
+    const uint32_t first_bit = single ? 14 : x2 ? 15 : 16;
+    const uint32_t width = single ? (luti2 ? (esz == 0 ? 2 : 3) : (esz == 0 ? 1 : 2)) : x2 ? (luti2 ? 3 : 2) : (luti2 ? 2 : 1);
+    const uint32_t top_bit = luti2 ? 17 : 16;
+    if (first_bit + width <= top_bit && bits_of(insn, top_bit, first_bit + width) != 0) return undefined();      // (bits above the index are reserved)
+    const uint32_t imm = bits_of(insn, first_bit + width - 1, first_bit);
+    const uint32_t ibits = luti2 ? 2 : 4, elements = element_count(esz), rn = bits_of(insn, 9, 5);
+    uint32_t zd;
+    if (single) zd = insn & 31;
+    else if (!strided) zd = x2 ? (bits_of(insn, 4, 1) << 1) : (bits_of(insn, 4, 2) << 2);
+    else zd = (((insn >> 4) & 1) << 4) | (x2 ? bits_of(insn, 2, 0) : bits_of(insn, 1, 0));
+    if (!single && !strided && ((x2 && (insn & 1)) || (x4 && (insn & 3)))) return undefined();
+    if (strided && ((x2 && ((insn >> 3) & 1)) || (x4 && ((insn >> 2) & 1)))) return undefined();
+    const uint32_t stride = strided ? (x2 ? 8 : 4) : 1;
+    Vec result[4];
+    for (uint32_t r = 0; r < nreg; ++r) {
+      const uint32_t segment = (imm * nreg + r) % (128 / ibits / elements);      // (an index beyond the vector wraps around)
+      for (uint32_t i = 0; i < elements; ++i) {
+        const uint32_t position = (segment * elements + i) * ibits;      // (bit position of the index in the vector)
+        const uint32_t index = static_cast<uint32_t>(get(s_.v[rn], 3, position / 64) >> (position % 64)) & ((1u << ibits) - 1);
+        const uint64_t entry = s_.zt0[index / 2] >> ((index % 2) * 32);      // (the table is sixteen 32 bit entries; the result takes the low bits of one)
+        put(&result[r], esz, i, entry & element_ones(esz));
+      }
+    }
+    for (uint32_t r = 0; r < nreg; ++r) s_.v[(zd + r * stride) & 31] = result[r];
+    return Step::Ok;
+  }
+  if (top == 0xC0 && (bits_of(insn, 21, 17) == 2 || bits_of(insn, 21, 17) == 3) && !((insn >> 16) & 1) && !((insn >> 12) & 1)) {      // MOVA / MOVAZ of two or four vectors: tile slices, or ZA array vectors (bit 11)
+    const bool to_vector = (insn >> 17) & 1, four = (insn >> 10) & 1, array = (insn >> 11) & 1, zeroing = to_vector && ((insn >> 9) & 1);
+    const uint32_t nreg = four ? 4 : 2, rv = static_cast<uint32_t>(reg(8 + (array ? bits_of(insn, 14, 13) : 4 + bits_of(insn, 14, 13)), false));
+    if (!to_vector && ((insn >> 9) & 1) && !array) return undefined();
+    uint32_t zt, field;
+    if (to_vector) {
+      zt = four ? (bits_of(insn, 4, 2) << 2) : (bits_of(insn, 4, 1) << 1);
+      field = bits_of(insn, 9 - zeroing, 5);
+      if (array) field = bits_of(insn, 7, 5);
+      if ((!four && (insn & 1)) || (four && (insn & 3))) return undefined();
+    } else {
+      zt = four ? (bits_of(insn, 9, 7) << 2) : (bits_of(insn, 9, 6) << 1);
+      field = array ? bits_of(insn, 2, 0) : bits_of(insn, 2, 0);
+      if ((insn & 0x18) || (!four && ((insn >> 5) & 1)) || (four && ((insn >> 5) & 3))) return undefined();
+    }
+    if (array) {      // ZA.D[Wv, #off, VGx2 / VGx4]
+      const uint32_t stride = 16 / nreg, first = (rv + field) % stride;      // (the vectors of a group are spread over the array, stride apart)
+      for (uint32_t r = 0; r < nreg; ++r) {
+        if (to_vector) { s_.v[(zt + r) & 31] = s_.za[first + r * stride]; if (zeroing) s_.za[first + r * stride] = Vec{}; }
+        else s_.za[first + r * stride] = s_.v[(zt + r) & 31];
+      }
+      return Step::Ok;
+    }
+    const uint32_t esz = size;
+    const uint32_t offsets = slice_count(esz) / nreg ? slice_count(esz) / nreg : 1;
+    const uint32_t tile = field / offsets, off = (field % offsets) * nreg;
+    if (tile >= tile_count(esz)) return undefined();
+    for (uint32_t r = 0; r < nreg; ++r) {
+      const uint32_t k = (rv - rv % nreg + off + r) % slice_count(esz);
+      if (to_vector) {
+        s_.v[(zt + r) & 31] = slice_get(esz, tile, vertical, k);
+        if (zeroing) for (uint32_t i = 0; i < slice_count(esz); ++i) slice_set_element(esz, tile, vertical, k, i, 0);
+      } else {
+        for (uint32_t i = 0; i < slice_count(esz); ++i) slice_set_element(esz, tile, vertical, k, i, get(s_.v[(zt + r) & 31], esz, i));
+      }
+    }
+    return Step::Ok;
+  }
   if (top == 0xC0) {
     if ((insn & 0xFFFFFF00u) == 0xC0080000u) {      // ZERO {tiles}: a mask of the 64-bit tiles
       for (uint32_t t = 0; t < 8; ++t)
@@ -127,9 +219,9 @@ AArch64Cpu::Step AArch64Cpu::sme(GuestMemory& m, uint32_t insn) {
         if ((insn >> 9) & 1) return undefined();
         const Vec slice = slice_get(esz, tile, vertical, k);
         const uint16_t gp = s_.p[pg];
+        if (esz == 4) { if (active(gp, 0, 4)) s_.v[zd] = slice; return Step::Ok; }
         for (uint32_t i = 0; i < slice_count(esz); ++i)
           if (active(gp, i, esz)) put(&s_.v[zd], esz, i, get(slice, esz, i));
-        if (esz == 4 && active(gp, 0, 4)) s_.v[zd] = slice;
       } else {
         const Vec src = s_.v[rn];
         const uint16_t gp = s_.p[pg];

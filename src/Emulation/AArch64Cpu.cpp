@@ -575,13 +575,14 @@ AArch64Cpu::Step AArch64Cpu::system_instruction(uint32_t insn) {
   } else if (read && k == make(3, 3, 4, 2, 2)) {      // SVCR: bit 0 SM, bit 1 ZA
     set_reg(rt, (s_.streaming ? 1u : 0u) | (s_.za_enabled ? 2u : 0u), true);
   } else if (read) {
-    if (k == make(3, 0, 0, 4, 5)) value = 0x82f15cff00000000ull;      // ID_AA64SMFR0_EL1
+    if (k == make(3, 0, 0, 4, 5)) value = 0x80f15cff00000000ull;      // ID_AA64SMFR0_EL1: the SME outer products and FA64, SME2 is only partly implemented so it is not reported
     else if (k == make(3, 3, 14, 0, 2) || k == make(3, 3, 14, 0, 1)) value = retired_;      // CNTVCT_EL0 / CNTPCT_EL0: the instruction count is the clock
     else if (k == make(3, 3, 14, 0, 0)) value = 1000000000;      // CNTFRQ_EL0
     else if (k == make(3, 3, 0, 0, 7)) value = 0x10;      // DCZID_EL0: DC ZVA prohibited
     else if (k == make(3, 3, 0, 0, 1)) value = 0x8444C004;      // CTR_EL0
     else if (k == make(3, 0, 0, 0, 0)) value = 0x410FD070;      // MIDR_EL1 (an Arm implementer, a generic part)
     else if (k == make(3, 0, 0, 0, 5)) value = 0;      // MPIDR_EL1
+    else if (k == make(3, 0, 0, 4, 1)) value = 1ull << 24;      // ID_AA64PFR1_EL1: SME
     else if (k == make(3, 0, 0, 4, 0)) value = 0x100000011ull;      // ID_AA64PFR0_EL1: AArch64 at EL0 and EL1, SVE
     else if (k == make(3, 0, 0, 4, 4)) value = 0x1 | (0x2ull << 4) | (1ull << 16) | (1ull << 20) | (1ull << 32) | (1ull << 40) | (1ull << 44) | (1ull << 52);      // ID_AA64ZFR0_EL1: SVE2, PMULL128, bit permute, BF16, SHA3, SM4, I8MM, F32MM
     else if (k == make(3, 0, 0, 6, 0)) value = (2ull << 4) | (1ull << 8) | (2ull << 12) | (1ull << 16) | (2ull << 20) | (1ull << 28) | (1ull << 32) | (1ull << 36) | (1ull << 40) | (1ull << 44) | (1ull << 48);      // ID_AA64ISAR0_EL1
