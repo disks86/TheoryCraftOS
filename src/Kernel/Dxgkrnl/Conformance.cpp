@@ -1286,6 +1286,14 @@ TESS_SCENE(scene_tess_winding,
 TESS_SCENE(scene_tess_pow2,
            {TESS_BLOB(hs_tri_pow2_cb), TESS_BLOB(ds_noise), 3, {3, 5, 2, 3}, {0, 0, 0, 0}, kNoCull}, {TESS_BLOB(hs_tri_pow2_cb), TESS_BLOB(ds_noise), 3, {6, 6, 6, 6}, {0, 0, 0, 0}, kNoCull})
 
+// Fractional partitioning: the factors are not whole numbers; the points of an edge are placed between those of the whole factors on either side of it.
+TESS_SCENE(scene_tess_fractional_odd,
+           {TESS_BLOB(hs_tri_odd_cb), TESS_BLOB(ds_noise), 3, {2.5f, 3.7f, 5.2f, 4.4f}, {0, 0, 0, 0}, kNoCull}, {TESS_BLOB(hs_quad_odd_cb), TESS_BLOB(ds_quad), 4, {3.3f, 2.2f, 6.6f, 4.1f}, {3.7f, 5.5f, 0, 0}, kNoCull},
+           {TESS_BLOB(hs_iso_odd_cb), TESS_BLOB(ds_iso), 2, {3, 5.5f, 0, 0}, {0, 0, 0, 0}, kNoCull}, {TESS_BLOB(hs_tri_odd_cb), TESS_BLOB(ds_noise), 3, {1, 1, 1, 1.6f}, {0, 0, 0, 0}, kNoCull})
+TESS_SCENE(scene_tess_fractional_even,
+           {TESS_BLOB(hs_tri_even_cb), TESS_BLOB(ds_noise), 3, {2.5f, 3.7f, 5.2f, 4.4f}, {0, 0, 0, 0}, kNoCull}, {TESS_BLOB(hs_quad_even_cb), TESS_BLOB(ds_quad), 4, {3.3f, 2.2f, 6.6f, 4.1f}, {3.7f, 5.5f, 0, 0}, kNoCull},
+           {TESS_BLOB(hs_iso_even_cb), TESS_BLOB(ds_iso), 2, {3, 5.5f, 0, 0}, {0, 0, 0, 0}, kNoCull}, {TESS_BLOB(hs_tri_even_cb), TESS_BLOB(ds_noise), 3, {1, 1, 1, 1.6f}, {0, 0, 0, 0}, kNoCull})
+
 const Entry kScenes[] = {
     {"Direct3D 9 vertex colours", scene_vertex_colours},
     {"Direct3D 9 Shader Model 3", scene_sm3},
@@ -1320,6 +1328,8 @@ const Entry kScenes[] = {
     {"Direct3D 11 tessellation, isolines and points (DXBC)", scene_tess_lines_points, true},
     {"Direct3D 11 tessellation, winding (DXBC)", scene_tess_winding},
     {"Direct3D 11 tessellation, power-of-two partitioning (DXBC)", scene_tess_pow2, false, 6},
+    {"Direct3D 11 tessellation, fractional odd partitioning (DXBC)", scene_tess_fractional_odd, true},
+    {"Direct3D 11 tessellation, fractional even partitioning (DXBC)", scene_tess_fractional_even, true},
     {"Direct3D 10 sRGB render target and texture", scene_srgb},
     {"Direct3D 10 16-bit normalised render target and texture", scene_unorm16},
     {"Direct3D 10 integer render target and Load (DXBC)", scene_integer},

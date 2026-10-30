@@ -653,9 +653,10 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         continue;
       }
       case kDclTessPartitioning4: {
+        // (D3D11_SB_TESSELLATOR_PARTITIONING: 1 integer, 2 power of two, 3 fractional odd, 4 fractional even)
         const uint32_t mode = (token >> 11) & 7;
-        if (!hull || (mode != 1 && mode != 2)) return status::kNotSupported;   // (integer and power of two)
-        program->tess_partitioning_ = mode == 1 ? graphics::TessPartitioning::Integer : graphics::TessPartitioning::Pow2;
+        if (!hull || mode < 1 || mode > 4) return status::kNotSupported;
+        program->tess_partitioning_ = mode == 1 ? graphics::TessPartitioning::Integer : mode == 2 ? graphics::TessPartitioning::Pow2 : mode == 3 ? graphics::TessPartitioning::FractionalOdd : graphics::TessPartitioning::FractionalEven;
         continue;
       }
       case kDclTessOutputPrimitive4: {

@@ -166,6 +166,40 @@ int main() {
       CHECK(t.tessellate(TessDomain::Quad, TessPartitioning::Integer, TessOutput::TriangleCw, big, bigin));
       CHECK(t.indices().size() == 2 * 64 * 64 * 3);
     }
+    // Fractional partitioning: the triangles still tile the domain, with edges of the points the factors give (the factor rounded up to the next odd (even) number of segments, at least).
+    cases = 0;
+    for (TessPartitioning mode : {TessPartitioning::FractionalOdd, TessPartitioning::FractionalEven})
+      for (float a : {1.0f, 1.3f, 2.5f, 3.7f, 6.9f, 9.5f, 33.3f})
+        for (float b : {1.0f, 2.2f, 4.0f, 5.5f})
+          for (float in : {1.0f, 1.2f, 2.0f, 3.3f, 5.6f, 8.1f, 17.4f}) {
+            const float tri_outer[4] = {a, b, a, 0}, tri_inner[2] = {in, 0};
+            CHECK(t.tessellate(TessDomain::Triangle, mode, TessOutput::TriangleCw, tri_outer, tri_inner));
+            Stats s = measure(t, TessDomain::Triangle);
+            bool ok = fabs(s.area - 0.5) < 2e-4 && (s.positive == 0 || s.negative == 0) && s.open_off_boundary == 0;   // (a factor just above 1 puts points a hair apart: flat triangles)
+            if (!ok) printf("fractional %d triangle %g %g inside %g: area %f (+%d -%d 0:%d) dup %d open %d off %d\n", static_cast<int>(mode), a, b, in, s.area, s.positive, s.negative, s.zero, s.duplicated, s.open_edges, s.open_off_boundary);
+            CHECK(ok);
+            const float quad_outer[4] = {a, b, b, a}, quad_inner[2] = {in, a};
+            CHECK(t.tessellate(TessDomain::Quad, mode, TessOutput::TriangleCw, quad_outer, quad_inner));
+            s = measure(t, TessDomain::Quad);
+            ok = fabs(s.area - 1.0) < 2e-4 && (s.positive == 0 || s.negative == 0) && s.open_off_boundary == 0;
+            if (!ok) printf("fractional %d quad %g %g inside %g: area %f (+%d -%d 0:%d) dup %d open %d off %d\n", static_cast<int>(mode), a, b, in, s.area, s.positive, s.negative, s.zero, s.duplicated, s.open_edges, s.open_off_boundary);
+            CHECK(ok);
+            ++cases;
+          }
+    printf("fractional cases: %d\n", cases);
+    {
+      // Odd partitioning at a factor of 3.5 has 5 segments on the edge (the next odd number), even partitioning at 3.5 has 4.
+      const float f[4] = {3.5f, 3.5f, 3.5f, 0}, in[2] = {3.5f, 0};
+      CHECK(t.tessellate(TessDomain::Triangle, TessPartitioning::FractionalOdd, TessOutput::TriangleCw, f, in));
+      CHECK(measure(t, TessDomain::Triangle).boundary_edges == 15);
+      CHECK(t.tessellate(TessDomain::Triangle, TessPartitioning::FractionalEven, TessOutput::TriangleCw, f, in));
+      CHECK(measure(t, TessDomain::Triangle).boundary_edges == 12);
+      const float one[4] = {1, 1, 1, 0}, one_in[2] = {1, 0};
+      CHECK(t.tessellate(TessDomain::Triangle, TessPartitioning::FractionalOdd, TessOutput::TriangleCw, one, one_in));
+      CHECK(t.points().size() == 3);
+      CHECK(t.tessellate(TessDomain::Triangle, TessPartitioning::FractionalEven, TessOutput::TriangleCw, one, one_in));
+      CHECK(measure(t, TessDomain::Triangle).boundary_edges == 6);   // (even partitioning has two segments at least)
+    }
     // Isolines: `density` lines of `detail` segments.
     {
       const float outer[4] = {3, 4, 0, 0}, inner[2] = {0, 0};

@@ -17,7 +17,7 @@
  */
 
 // The fixed-function tessellator of Direct3D 11 (and OpenGL 4's primitive generator): from the tessellation factors of a patch it makes the domain points the domain shader turns into
-// vertices, and the triangles (or lines, or points) joining them. Integer and power-of-two partitioning, for the triangle, quad and isoline domains.
+// vertices, and the triangles (or lines, or points) joining them. Integer, power-of-two and fractional partitioning, for the triangle, quad and isoline domains.
 //
 // It follows the published Direct3D 11 reference tessellator: the outermost ring of points has as many segments as the edge factors say; inside it come rings with two segments less
 // each, a triangle's rings concentric about the centre (so their points are not on the lattice of the outer ones), a quad's the rectangles of the lattice; the first inner ring is joined
@@ -56,7 +56,7 @@ class Tessellator {
     point_count_ = index_count_ = 0;
     failed_ = false;
     if (!valid()) return false;
-    pow2_ = partitioning == TessPartitioning::Pow2;
+    partitioning_ = partitioning;
     output_ = output;
     bool ok = false;
     switch (domain) {
@@ -85,13 +85,104 @@ class Tessellator {
 
   // --- Factors ---------------------------------------------------------------------------------------
 
-  // A factor as the tessellator uses it: from 1 up to 64 (a smaller one, or NaN, is 1), rounded up (to a power of two for pow2 partitioning).
+  // What a factor comes to once it is clamped and rounded: in 16.16 fixed point, as the hardware has it, with the parity of its partitioning (odd: the segments of the edge are an odd
+  // number at whole factors; an inside factor of 1 is even). `points` is how many points an edge with the factor has, `half` how many of them there are up to the middle.
+  struct Factor {
+    bool odd = false;
+    uint32_t points = 0, half = 0, split = 0, inv_floor = 0, inv_ceil = 0, fraction = 0;
+    // (what the stitching of rings takes: the points of half an edge, without the middle one)
+    uint32_t stitch_half() const { return odd ? half - 1 : half; }
+  };
+  static constexpr uint32_t kOne = 1u << 16, kHalf = 1u << 15;
+
+  static uint32_t fixed_ceil(uint32_t v) { return (v & 0xFFFF) ? (v & ~0xFFFFu) + kOne : v; }
+  static uint32_t remove_msb(uint32_t v) {
+    uint32_t bit = 0x80000000u;
+    while (bit && !(v & bit)) bit >>= 1;
+    return v & ~bit;
+  }
+  static uint32_t reciprocal(uint32_t n) { return n == 0 ? 0xFFFFFFFFu : (2 * kOne + n) / (2 * n); }   // (65536 / n, rounded)
+
+  Factor make_factor(uint32_t fxp, bool odd) const {
+    Factor f;
+    f.odd = odd;
+    // The points: an odd factor has an even number of them, an even one an odd number.
+    const uint32_t half_factor = (fxp + 1) / 2;
+    f.points = odd ? (fixed_ceil(kHalf + half_factor) * 2) >> 16 : ((fixed_ceil(half_factor) * 2) >> 16) + 1;
+    uint32_t half = half_factor;
+    if (odd || half == kHalf) half += kHalf;   // (an even factor of 1 is taken as 2)
+    const uint32_t floor_half = half & ~0xFFFFu, ceil_half = fixed_ceil(half);
+    f.fraction = half - floor_half;
+    f.half = ceil_half >> 16;
+    if (ceil_half == floor_half) f.split = f.half + 1;
+    else if (odd) f.split = floor_half == kOne ? 0 : (remove_msb((floor_half >> 16) - 1) << 1) + 1;
+    else f.split = (remove_msb(floor_half >> 16) << 1) + 1;
+    uint32_t floor_segments = (floor_half * 2) >> 16, ceil_segments = (ceil_half * 2) >> 16;
+    if (odd) --floor_segments, --ceil_segments;
+    f.inv_floor = reciprocal(floor_segments), f.inv_ceil = reciprocal(ceil_segments);
+    return f;
+  }
+  // Where point `point` of an edge with the factor is, from 0 to 1: the points of the first half are between those the next lower whole factor and the next higher one would put there, by how
+  // close the factor is to each; the second half mirrors the first.
+  float place(const Factor& f, uint32_t point) const {
+    bool flip = false;
+    if (point >= f.half) {
+      point = (f.half << 1) - point;
+      if (f.odd) point -= 1;
+      flip = true;
+    }
+    if (point == f.half) return 0.5f;
+    uint32_t on_floor = point;
+    if (point > f.split) on_floor -= 1;
+    const uint64_t at_floor = uint64_t{on_floor} * f.inv_floor, at_ceil = uint64_t{point} * f.inv_ceil;
+    uint32_t location = static_cast<uint32_t>((at_floor * (kOne - f.fraction) + at_ceil * f.fraction + kHalf) >> 16);
+    if (flip) location = kOne - location;
+    return static_cast<float>(location) / static_cast<float>(kOne);
+  }
+
+  bool fractional() const { return partitioning_ == TessPartitioning::FractionalOdd || partitioning_ == TessPartitioning::FractionalEven; }
+  bool fraction_odd() const { return partitioning_ == TessPartitioning::FractionalOdd; }
+  static uint32_t to_fixed(float f) { return static_cast<uint32_t>(f * 65536.0f + 0.5f); }
+
+  // The factor of an edge: clamped (1 up to 64; odd partitioning up to 63, even from 2), rounded up (to a power of two) unless fractional.
+  Factor edge_factor(float f, uint32_t* whole = nullptr) const {
+    float lo = 1.0f, hi = 64.0f;
+    if (partitioning_ == TessPartitioning::FractionalOdd) hi = 63.0f;
+    if (partitioning_ == TessPartitioning::FractionalEven) lo = 2.0f;
+    if (!(f >= lo)) f = lo;
+    if (f > hi) f = hi;
+    if (!fractional()) {
+      const uint32_t n = round_factor(f);
+      if (whole) *whole = n;
+      return make_factor(n << 16, (n & 1) != 0);
+    }
+    return make_factor(to_fixed(f), fraction_odd());
+  }
+  // An inside factor, the same but an even whole factor of 1 stands for 2; `frame_lo` raises the lowest value of odd partitioning a little so that its inside has a ring.
+  Factor inside_factor(float f, bool frame) const {
+    float lo = 1.0f, hi = 64.0f;
+    if (partitioning_ == TessPartitioning::FractionalOdd) hi = 63.0f, lo = frame ? 1.0f + 1.0f / 65536.0f : 1.0f;
+    if (partitioning_ == TessPartitioning::FractionalEven) lo = 2.0f;
+    if (!(f >= lo)) f = lo;
+    if (f > hi) f = hi;
+    if (!fractional()) {
+      const uint32_t n = round_factor(f);
+      return make_factor(n << 16, !((n & 1) == 0 || n == 1));
+    }
+    return make_factor(to_fixed(f), fraction_odd());
+  }
+  // A factor that comes to 1 once clamped (the case of every factor being 1).
+  bool is_one(float f) const {
+    if (fractional() && !fraction_odd()) return false;   // (even partitioning has 2 at least)
+    return to_fixed(f >= 1.0f ? (f > 64.0f ? 64.0f : f) : 1.0f) == kOne && !(fractional() && f > 1.0f + 0.5f / 65536.0f);
+  }
+  // A factor as a whole number (integer and power-of-two partitioning): from 1 up to 64 (a smaller one, or NaN, is 1), rounded up (to a power of two for pow2 partitioning).
   uint32_t round_factor(float f) const {
     if (!(f > 1.0f)) return 1;
     if (f >= static_cast<float>(kMaxFactor)) return kMaxFactor;
     uint32_t c = static_cast<uint32_t>(f);
     if (static_cast<float>(c) < f) ++c;
-    if (pow2_) {
+    if (partitioning_ == TessPartitioning::Pow2) {
       uint32_t p = 1;
       while (p < c) p <<= 1;
       c = p;
@@ -242,24 +333,18 @@ class Tessellator {
 
   // --- Triangle domain -------------------------------------------------------------------------------
 
-  struct Corner {
-    float u, v;
-  };
-  // The points along a side from corner `a` to corner `b` in `segments` equal steps, all but the last (which starts the next side).
-  void side_points(Corner a, Corner b, uint32_t segments) {
-    for (uint32_t j = 0; j < segments; ++j) {
-      const float t = static_cast<float>(j) / static_cast<float>(segments);
-      add_point(a.u + (b.u - a.u) * t, a.v + (b.v - a.v) * t);
-    }
-  }
-
-  bool triangle(const float outer[4], float inside_factor) {
+  bool triangle(const float outer[4], float inside_input) {
     if (culled(outer[0]) || culled(outer[1]) || culled(outer[2])) return false;
-    uint32_t edge[3];
-    for (uint32_t e = 0; e < 3; ++e) edge[e] = round_factor(outer[e]);
-    uint32_t inside = round_factor(inside_factor);
-    // All factors 1: the patch itself.
-    if (edge[0] == 1 && edge[1] == 1 && edge[2] == 1 && inside == 1) {
+    Factor edge[3];
+    bool any_above_one = false;
+    for (uint32_t e = 0; e < 3; ++e) {
+      edge[e] = edge_factor(outer[e]);
+      any_above_one |= outer[e] > 1.0f + 0.5f / 65536.0f;
+    }
+    // (odd partitioning: if any edge has more than one segment the inside has a ring, a "picture frame")
+    const Factor inside = inside_factor(inside_input, any_above_one);
+    if (is_one(outer[0]) && is_one(outer[1]) && is_one(outer[2]) && is_one(inside_input) && (partitioning_ != TessPartitioning::FractionalOdd || true)) {
+      // All factors 1: the patch itself.
       const uint32_t a = add_point(0.0f, 1.0f), b = add_point(0.0f, 0.0f), c = add_point(1.0f, 0.0f);
       if (output_ == TessOutput::Point) {
         add_index(a), add_index(b), add_index(c);
@@ -268,32 +353,46 @@ class Tessellator {
       }
       return true;
     }
-    if (inside == 1) inside = 2;   // (an inside factor of 1 next to bigger edge factors is taken as 2: a point in the middle)
-    // The corners as (u, v): the V corner, the W corner and the U corner, the way round the outer ring goes.
-    static const Corner kCorner[3] = {{0.0f, 1.0f}, {0.0f, 0.0f}, {1.0f, 0.0f}};
-    uint32_t ring_base[34];
-    uint32_t ring_length[34];
+    const uint32_t min_points = inside.odd ? 4 : 3;
+    const uint32_t inside_points = inside.points > min_points ? inside.points : min_points;
+    uint32_t ring_base[40];
+    uint32_t ring_length[40];
     uint32_t rings = 0;
-    // The outer ring.
+    // The outer ring, clockwise from the V corner: down the u = 0 edge, along v = 0, back up the w = 0 edge.
     ring_base[0] = point_count_;
-    for (uint32_t e = 0; e < 3; ++e) side_points(kCorner[e], kCorner[(e + 1) % 3], edge[e]);
-    ring_length[0] = edge[0] + edge[1] + edge[2];
-    // The inner rings: triangles about the centre with two segments less on each side per ring, a point at the end if the factor is even.
-    for (uint32_t k = 1; 2 * k <= inside && rings < 33; ++k) {
-      const uint32_t segments = inside - 2 * k;
+    uint32_t outer_start[3];
+    uint32_t length = 0;
+    for (uint32_t e = 0; e < 3; ++e) {
+      outer_start[e] = length;
+      const uint32_t n = edge[e].points;
+      for (uint32_t p = 0; p + 1 < n; ++p) {
+        const float location = place(edge[e], e == 1 ? p : n - 1 - p);
+        if (e == 0) add_point(0.0f, location);
+        else if (e == 1) add_point(location, 0.0f);
+        else add_point(location, 1.0f - location);
+      }
+      length += n - 1;
+    }
+    ring_length[0] = length;
+    // The inner rings: triangles about the centre with two points less on each side per ring (their points are placed along the sides as the inside factor says, pushed in toward the centre).
+    for (uint32_t k = 1; 2 * k + 1 <= inside_points && rings < 38; ++k) {
+      const uint32_t m = inside_points - 2 * k;   // points on a side
       ring_base[k] = point_count_;
-      if (segments == 0) {
+      if (m == 1) {
         add_point(1.0f / 3.0f, 1.0f / 3.0f);
         ring_length[k] = 1;
       } else {
-        const float s = static_cast<float>(segments) / static_cast<float>(inside);
-        Corner c[3];
-        for (uint32_t i = 0; i < 3; ++i) {
-          // (the corner moved toward the centre: a third plus two thirds of its distance for the coordinate it is the corner of, a third less a third of it for the others)
-          c[i] = {1.0f / 3.0f + (kCorner[i].u - 1.0f / 3.0f) * s, 1.0f / 3.0f + (kCorner[i].v - 1.0f / 3.0f) * s};
-        }
-        for (uint32_t e = 0; e < 3; ++e) side_points(c[e], c[(e + 1) % 3], segments);
-        ring_length[k] = 3 * segments;
+        const uint32_t end = inside_points - 1 - k;
+        const float perp = place(inside, k) * (2.0f / 3.0f);
+        for (uint32_t e = 0; e < 3; ++e)
+          for (uint32_t p = k; p < end; ++p) {
+            const float param = place(inside, e == 1 ? p : end - (p - k));
+            const float along = param - perp * 0.5f;
+            if (e == 0) add_point(perp, along);
+            else if (e == 1) add_point(along, perp);
+            else add_point(along, 1.0f - along - perp);
+          }
+        ring_length[k] = 3 * (m - 1);
       }
       rings = k;
     }
@@ -303,27 +402,25 @@ class Tessellator {
       return true;
     }
     // Outer ring against the first inner ring, then each inner ring against the next one in.
-    const bool inside_odd = (inside & 1) != 0;
-    uint32_t outer_start[3] = {0, edge[0], edge[0] + edge[1]};
     for (uint32_t k = 0; k < rings; ++k) {
       for (uint32_t e = 0; e < 3; ++e) {
         Row out_row, in_row;
         out_row.base = ring_base[k], out_row.length = ring_length[k];
         if (k == 0) {
-          out_row.start = outer_start[e], out_row.count = edge[e] + 1;
+          out_row.start = outer_start[e], out_row.count = edge[e].points;
         } else {
-          const uint32_t m = inside - 2 * k + 1;   // points on a side of ring k
+          const uint32_t m = inside_points - 2 * k;   // points on a side of ring k
           out_row.start = e * (m - 1), out_row.count = m;
         }
-        const uint32_t segments_in = inside - 2 * (k + 1);
+        const uint32_t m_in = inside_points - 2 * (k + 1);
         in_row.base = ring_base[k + 1], in_row.length = ring_length[k + 1];
-        in_row.start = e * segments_in, in_row.count = segments_in + 1;
-        if (k == 0) stitch_transition(out_row, edge[e] / 2, (edge[e] & 1) != 0, in_row, inside / 2, inside_odd);
+        in_row.start = e * (m_in - 1), in_row.count = m_in;
+        if (k == 0) stitch_transition(out_row, edge[e].stitch_half(), edge[e].odd, in_row, inside.stitch_half(), inside.odd);
         else stitch_regular(out_row, in_row);
       }
     }
     // An odd factor ends with a small triangle in the middle.
-    if (inside_odd) {
+    if (inside.odd) {
       const uint32_t base = ring_base[rings];
       clockwise(base, base + 1, base + 2);
     }
@@ -332,12 +429,16 @@ class Tessellator {
 
   // --- Quad domain -----------------------------------------------------------------------------------
 
-  bool quad(const float outer[4], float inside_u, float inside_v) {
+  bool quad(const float outer[4], float inside_u_input, float inside_v_input) {
     if (culled(outer[0]) || culled(outer[1]) || culled(outer[2]) || culled(outer[3])) return false;
-    uint32_t edge[4];
-    for (uint32_t e = 0; e < 4; ++e) edge[e] = round_factor(outer[e]);
-    uint32_t fu = round_factor(inside_u), fv = round_factor(inside_v);
-    if (edge[0] == 1 && edge[1] == 1 && edge[2] == 1 && edge[3] == 1 && fu == 1 && fv == 1) {
+    Factor edge[4];
+    bool any_above_one = inside_u_input > 1.0f + 0.5f / 65536.0f || inside_v_input > 1.0f + 0.5f / 65536.0f;
+    for (uint32_t e = 0; e < 4; ++e) {
+      edge[e] = edge_factor(outer[e]);
+      any_above_one |= outer[e] > 1.0f + 0.5f / 65536.0f;
+    }
+    const Factor inside_u = inside_factor(inside_u_input, any_above_one), inside_v = inside_factor(inside_v_input, any_above_one);
+    if (is_one(outer[0]) && is_one(outer[1]) && is_one(outer[2]) && is_one(outer[3]) && is_one(inside_u_input) && is_one(inside_v_input)) {
       const uint32_t a = add_point(0.0f, 0.0f), b = add_point(1.0f, 0.0f), c = add_point(1.0f, 1.0f), d = add_point(0.0f, 1.0f);
       if (output_ == TessOutput::Point) {
         add_index(a), add_index(b), add_index(c), add_index(d);
@@ -347,38 +448,49 @@ class Tessellator {
       }
       return true;
     }
-    if (fu == 1) fu = 2;
-    if (fv == 1) fv = 2;
+    const uint32_t points_u = inside_u.points > (inside_u.odd ? 4u : 3u) ? inside_u.points : (inside_u.odd ? 4u : 3u);
+    const uint32_t points_v = inside_v.points > (inside_v.odd ? 4u : 3u) ? inside_v.points : (inside_v.odd ? 4u : 3u);
+    const uint32_t min_points = points_u < points_v ? points_u : points_v;
+    const uint32_t rings = ((min_points + 1) >> 1) - 1;   // the inner rings
+    uint32_t ring_base[40];
+    uint32_t ring_length[40];
+    uint32_t side_points_count[40][4];   // the points on each side of a ring
+    if (rings >= 38) return false;
     // The outer ring, clockwise from (0, 1): down the U = 0 edge, along the V = 0 edge, up the U = 1 edge, back along V = 1.
-    uint32_t ring_base[34];
-    uint32_t ring_length[34];
-    uint32_t side_points_count[34][4];   // the points on each side of a ring
-    uint32_t min_factor = fu < fv ? fu : fv;
-    uint32_t rings = min_factor / 2;     // the inner rings
     ring_base[0] = point_count_;
-    side_points(Corner{0.0f, 1.0f}, Corner{0.0f, 0.0f}, edge[0]);
-    side_points(Corner{0.0f, 0.0f}, Corner{1.0f, 0.0f}, edge[1]);
-    side_points(Corner{1.0f, 0.0f}, Corner{1.0f, 1.0f}, edge[2]);
-    side_points(Corner{1.0f, 1.0f}, Corner{0.0f, 1.0f}, edge[3]);
-    ring_length[0] = edge[0] + edge[1] + edge[2] + edge[3];
-    for (uint32_t e = 0; e < 4; ++e) side_points_count[0][e] = edge[e] + 1;
-    // The inner rings are the rectangles of the lattice (fu x fv), `k` in from the sides. A rectangle with no height or width is a line (or a point) walked there and back.
-    for (uint32_t k = 1; k <= rings && k < 33; ++k) {
-      const float u0 = static_cast<float>(k) / static_cast<float>(fu), u1 = static_cast<float>(fu - k) / static_cast<float>(fu);
-      const float v0 = static_cast<float>(k) / static_cast<float>(fv), v1 = static_cast<float>(fv - k) / static_cast<float>(fv);
-      const uint32_t wu = fu - 2 * k, wv = fv - 2 * k;   // segments across
-      ring_base[k] = point_count_;
-      side_points(Corner{u0, v1}, Corner{u0, v0}, wv);
-      side_points(Corner{u0, v0}, Corner{u1, v0}, wu);
-      side_points(Corner{u1, v0}, Corner{u1, v1}, wv);
-      side_points(Corner{u1, v1}, Corner{u0, v1}, wu);
-      uint32_t length = 2 * (wu + wv);
-      if (length == 0) {
-        // (a single point: the ring is that point, with every side one point long)
-        add_point(u0, v0);
-        length = 1;
+    uint32_t length = 0;
+    for (uint32_t e = 0; e < 4; ++e) {
+      const uint32_t n = edge[e].points;
+      side_points_count[0][e] = n;
+      for (uint32_t p = 0; p + 1 < n; ++p) {
+        const float location = place(edge[e], (e == 1 || e == 2) ? p : n - 1 - p);
+        if (e == 0) add_point(0.0f, location);
+        else if (e == 1) add_point(location, 0.0f);
+        else if (e == 2) add_point(1.0f, location);
+        else add_point(location, 1.0f);
       }
-      ring_length[k] = length;
+      length += n - 1;
+    }
+    ring_length[0] = length;
+    // The inner rings are the rectangles of the lattice (the points of each axis as its inside factor places them), `k` in from the sides. A rectangle with no height or width is a line
+    // (or a point) walked there and back.
+    for (uint32_t k = 1; k <= rings; ++k) {
+      const uint32_t i0 = k, i1 = points_u - 1 - k, j0 = k, j1 = points_v - 1 - k;
+      const uint32_t wu = i1 - i0, wv = j1 - j0;   // segments across
+      auto u_at = [&](uint32_t i) { return place(inside_u, i); };
+      auto v_at = [&](uint32_t j) { return place(inside_v, j); };
+      ring_base[k] = point_count_;
+      for (uint32_t t = 0; t < wv; ++t) add_point(u_at(i0), v_at(j1 - t));
+      for (uint32_t t = 0; t < wu; ++t) add_point(u_at(i0 + t), v_at(j0));
+      for (uint32_t t = 0; t < wv; ++t) add_point(u_at(i1), v_at(j0 + t));
+      for (uint32_t t = 0; t < wu; ++t) add_point(u_at(i1 - t), v_at(j1));
+      uint32_t ring_points = 2 * (wu + wv);
+      if (ring_points == 0) {
+        // (a single point: the ring is that point, with every side one point long)
+        add_point(u_at(i0), v_at(j0));
+        ring_points = 1;
+      }
+      ring_length[k] = ring_points;
       side_points_count[k][0] = wv + 1, side_points_count[k][1] = wu + 1, side_points_count[k][2] = wv + 1, side_points_count[k][3] = wu + 1;
     }
     if (failed_) return false;
@@ -399,25 +511,22 @@ class Tessellator {
       for (uint32_t e = 0; e < 4; ++e) {
         const Row out_row = side_row(k, e), in_row = side_row(k + 1, e);
         // (sides 0 and 2 run along V, 1 and 3 along U)
-        const uint32_t f = (e & 1) ? fu : fv;
-        if (k == 0) stitch_transition(out_row, edge[e] / 2, (edge[e] & 1) != 0, in_row, f / 2, (f & 1) != 0);
+        const Factor& along = (e & 1) ? inside_u : inside_v;
+        if (k == 0) stitch_transition(out_row, edge[e].stitch_half(), edge[e].odd, in_row, along.stitch_half(), along.odd);
         else stitch_regular(out_row, in_row);
       }
     }
     // An odd smaller factor leaves a strip of quads inside the innermost ring.
-    if (min_factor & 1) {
-      const uint32_t k = rings;
-      if (fu > fv) {
-        // (long in U: the bottom side against the top one, both walked toward +U)
-        Row bottom = side_row(k, 1), top = side_row(k, 3);
-        top.reversed = true;
-        stitch_strip(bottom, top, false);
-      } else {
-        // (long in V: the left side, walked toward -V, against the right one reversed)
-        Row left = side_row(k, 0), right = side_row(k, 2);
-        right.reversed = true;
-        stitch_strip(left, right, (fv & 1) != 0);
-      }
+    if (points_u > points_v && inside_v.odd) {
+      // (long in U: the bottom side against the top one, both walked toward +U)
+      Row bottom = side_row(rings, 1), top = side_row(rings, 3);
+      top.reversed = true;
+      stitch_strip(bottom, top, false);
+    } else if (points_v >= points_u && inside_u.odd) {
+      // (long in V: the left side, walked toward -V, against the right one reversed)
+      Row left = side_row(rings, 0), right = side_row(rings, 2);
+      right.reversed = true;
+      stitch_strip(left, right, inside_v.odd);
     }
     return !failed_;
   }
@@ -426,16 +535,16 @@ class Tessellator {
 
   bool isoline(float density_factor, float detail_factor) {
     if (culled(density_factor) || culled(detail_factor)) return false;
-    // (the density is always rounded up to an integer, even with power-of-two partitioning)
-    const bool pow2 = pow2_;
-    pow2_ = false;
+    // (the density is always rounded up to a whole number of lines, even with power-of-two partitioning)
+    const TessPartitioning partitioning = partitioning_;
+    partitioning_ = TessPartitioning::Integer;
     const uint32_t density = round_factor(density_factor);
-    pow2_ = pow2;
-    const uint32_t detail = round_factor(detail_factor);
-    const uint32_t per_line = detail + 1;
+    partitioning_ = partitioning;
+    const Factor detail = edge_factor(detail_factor);
+    const uint32_t per_line = detail.points;
     if (density * per_line > points_.size()) return false;
     for (uint32_t line = 0; line < density; ++line)
-      for (uint32_t p = 0; p < per_line; ++p) add_point(static_cast<float>(p) / static_cast<float>(detail), static_cast<float>(line) / static_cast<float>(density));
+      for (uint32_t p = 0; p < per_line; ++p) add_point(place(detail, p), static_cast<float>(line) / static_cast<float>(density));
     if (failed_) return false;
     if (output_ == TessOutput::Point) {
       for (uint32_t i = 0; i < point_count_; ++i) add_index(i);
@@ -453,7 +562,8 @@ class Tessellator {
   ArrayView<Point> points_;
   ArrayView<uint16_t> indices_;
   uint32_t point_count_ = 0, index_count_ = 0;
-  bool failed_ = false, pow2_ = false;
+  bool failed_ = false;
+  TessPartitioning partitioning_ = TessPartitioning::Integer;
   TessOutput output_ = TessOutput::TriangleCcw;
 };
 

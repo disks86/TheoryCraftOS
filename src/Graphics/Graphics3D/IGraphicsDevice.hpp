@@ -260,12 +260,12 @@ using GeometryShaderFn = void (*)(const GeometryInputData& input, const uint8_t*
 // Tessellation (kFeatureTessellation). A draw of PatchList topology takes `control_points` vertices per patch (set_patch_control_points); the vertex shader runs on each, the hull shader
 // then makes the patch's output control points and its tessellation factors, the fixed-function tessellator makes a lattice of domain points from the factors, and the domain shader
 // turns each into a vertex from the patch (the triangles, lines or points joining them are then drawn). The software device calls functions; virgl takes TGSI text for the two stages.
-// The triangle, quad and isoline domains are made with integer or power-of-two partitioning (not the fractional ones), by the fixed-function tessellator of Direct3D 11 (see
+// The triangle, quad and isoline domains are made with any partitioning, by the fixed-function tessellator of Direct3D 11 (see
 // Software/Tessellator.hpp): an edge factor says how many segments the edge has, the inside factors how many rings (concentric triangles, or rectangles) there are.
 constexpr uint32_t kMaxPatchControlPoints = 32;
 constexpr uint32_t kMaxPatchRegisters = 16;   // patch constant registers (tessellation factors included)
 enum class TessDomain : uint8_t { Isoline, Triangle, Quad };
-enum class TessPartitioning : uint8_t { Integer, Pow2 };
+enum class TessPartitioning : uint8_t { Integer, Pow2, FractionalOdd, FractionalEven };
 enum class TessOutput : uint8_t { TriangleCw, TriangleCcw, Point, Line };
 struct HullInputData {
   uint32_t control_points = 0;

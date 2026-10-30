@@ -340,7 +340,7 @@ class VirglImage final : public IImage {
 
 class VirglShaderModule final : public IShaderModule {
  public:
-  VirglShaderModule(VirglDevice& device, const ShaderModuleDesc& desc) : stage_(desc.stage), tgsi_(desc.tgsi), tess_output_(desc.tess_output) {
+  VirglShaderModule(VirglDevice& device, const ShaderModuleDesc& desc) : stage_(desc.stage), tgsi_(desc.tgsi), tess_output_(desc.tess_output), tess_partitioning_(desc.tess_partitioning) {
     for (uint32_t k = 0; k < 3; ++k) thread_group_[k] = desc.thread_group[k];
     handle_ = device.new_handle();
     const uint32_t length = string_length(desc.tgsi) + 1;  // with the terminating NUL
@@ -365,6 +365,7 @@ class VirglShaderModule final : public IShaderModule {
   uint32_t handle() const { return handle_; }
   const char* tgsi() const { return tgsi_; }   // (the text the kernel keeps for the module's life)
   TessOutput tess_output() const { return tess_output_; }
+  TessPartitioning tess_partitioning() const { return tess_partitioning_; }
   uint32_t thread_group(uint32_t axis) const { return thread_group_[axis]; }
 
  private:
@@ -372,6 +373,7 @@ class VirglShaderModule final : public IShaderModule {
   ShaderStage stage_;
   const char* tgsi_ = nullptr;
   TessOutput tess_output_ = TessOutput::TriangleCcw;
+  TessPartitioning tess_partitioning_ = TessPartitioning::Integer;
   uint32_t handle_ = 0;
   bool ok_ = false;
 };
@@ -415,28 +417,31 @@ class VirglPipeline final : public VirglPipelineBase {
     if (hs_ && ds_) {
       const auto* hull = static_cast<const VirglShaderModule*>(desc.hull_shader);
       const auto* domain = static_cast<const VirglShaderModule*>(desc.domain_shader);
-      if (hull->tess_output() != domain->tess_output() && domain->tgsi()) {
+      if ((hull->tess_output() != domain->tess_output() || hull->tess_partitioning() != domain->tess_partitioning()) && domain->tgsi()) {
         const uint32_t length = string_length(domain->tgsi());
         char* text = static_cast<char*>(device.gpu().allocator().allocate(length + 1));
         if (!text) return;
         __builtin_memcpy(text, domain->tgsi(), length + 1);
-        auto set_flag = [&](const char* name, bool on) {
+        auto set_digit = [&](const char* name, char digit) {
           const uint32_t n = string_length(name);
           for (uint32_t i = 0; i + n < length; ++i) {
             uint32_t k = 0;
             while (k < n && text[i + k] == name[k]) ++k;
             if (k == n) {
-              text[i + n] = on ? '1' : '0';
+              text[i + n] = digit;
               return;
             }
           }
         };
-        set_flag("TES_VERTEX_ORDER_CW ", hull->tess_output() == TessOutput::TriangleCw);
-        set_flag("TES_POINT_MODE ", hull->tess_output() == TessOutput::Point);
+        set_digit("TES_VERTEX_ORDER_CW ", hull->tess_output() == TessOutput::TriangleCw ? '1' : '0');
+        set_digit("TES_POINT_MODE ", hull->tess_output() == TessOutput::Point ? '1' : '0');
+        // (PIPE_TESS_SPACING: 0 fractional odd, 1 fractional even, 2 equal, which integer partitioning is and power-of-two is after the control shader rounds the factors up)
+        set_digit("TES_SPACING ", hull->tess_partitioning() == TessPartitioning::FractionalOdd ? '0' : hull->tess_partitioning() == TessPartitioning::FractionalEven ? '1' : '2');
         ShaderModuleDesc variant;
         variant.stage = ShaderStage::Domain;
         variant.tgsi = text;
         variant.tess_output = hull->tess_output();
+        variant.tess_partitioning = hull->tess_partitioning();
         VirglShaderModule module(device, variant);
         device.gpu().allocator().deallocate(text);
         if (!module.valid()) return;
