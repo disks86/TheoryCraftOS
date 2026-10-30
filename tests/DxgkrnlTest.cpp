@@ -5091,6 +5091,109 @@ void test_d3d12_heaps() {
   CHECK(e.pixel(b_texture, 0, 0) == 0xFF00FF00u);
 }
 
+
+// --- DXIL (Shader Model 6): the same HLSL compiled by fxc to DXBC and by dxc to DXIL must give the same results -----------------------------------------------------------------
+
+struct DxilTextures final : graphics::ITextureSet {
+  graphics::Vec4 sample(uint32_t unit, float u, float v) const override { return {u, v, 0.25f + 0.1f * static_cast<float>(unit), 1.0f}; }
+  graphics::Vec4 sample_lod(uint32_t unit, float u, float v, float lod) const override { return {u * 0.5f, v * 0.5f, lod * 0.125f, 0.5f + 0.1f * static_cast<float>(unit)}; }
+  graphics::Vec4 fetch(uint32_t unit, int32_t x, int32_t y, uint32_t level) const override { return {x * 0.0625f, y * 0.125f, static_cast<float>(level) * 0.25f, 0.75f + static_cast<float>(unit) * 0.0625f}; }
+  bool size(uint32_t, uint32_t level, uint32_t* width, uint32_t* height, uint32_t* levels) const override {
+    *width = 8u >> level, *height = 4u >> level, *levels = 3;
+    return level < 3;
+  }
+};
+
+bool close_to(float a, float b) {
+  if (a != a || b != b) return a != a && b != b;
+  const float scale = 1.0f + (a < 0 ? -a : a);
+  return (a - b < 0 ? b - a : a - b) <= 2e-4f * scale;
+}
+
+void test_dxil() {
+  HostAllocator allocator;
+  uint32_t seed = 12345;
+  auto random = [&](float low, float high) {
+    seed = seed * 1664525u + 1013904223u;
+    return low + (high - low) * static_cast<float>(seed >> 8) / static_cast<float>(1u << 24);
+  };
+  auto load = [&](const char* name, UniquePointer<D3d9Program>* program) {
+    const std::vector<uint8_t> blob = read_blob(name);
+    const NtStatus st = D3d9Program::compile_dxbc(allocator, ConstByteView(blob.data(), blob.size()), program);
+    if (st != status::kSuccess) printf("  %s: compile status %x\n", name, static_cast<unsigned>(st));
+    return st == status::kSuccess && *program;
+  };
+  DxilTextures textures;
+  // The pixel shaders: the same varyings, the same colour (and the same pixel killed).
+  for (const char* name : {"dxil_ps_math", "dxil_ps_tex", "dxil_ps_flow"}) {
+    UniquePointer<D3d9Program> reference, translated;
+    const std::string base(name);
+    CHECK(load((base + ".dxbc").c_str(), &reference) && load((base + ".dxil").c_str(), &translated));
+    if (!reference || !translated) continue;
+    CHECK(translated->stage() == graphics::ShaderStage::Fragment && translated->color_output_count() == 1);
+    unsigned alive_count = 0;
+    for (uint32_t n = 0; n < 200; ++n) {
+      graphics::Vec4 varyings[4] = {};
+      varyings[0] = {random(-1, 2), random(-1, 2), random(-1, 2), random(-1, 2)};
+      varyings[2] = {random(0, 1), random(0, 1), 0, 0};
+      graphics::FragmentContext context;
+      context.position = {random(0, 32), random(0, 32), random(0, 1), 1};
+      graphics::Vec4 a_room[graphics::kMaxColorTargets] = {}, b_room[graphics::kMaxColorTargets] = {};
+      uint8_t constants[128] = {};
+      const bool a_alive = reference->run_fragment_ex(varyings, context, constants, &textures, a_room);
+      const bool b_alive = translated->run_fragment_ex(varyings, context, constants, &textures, b_room);
+      CHECK(a_alive == b_alive);
+      alive_count += a_alive;
+      if (a_alive && b_alive) {
+        const bool same = close_to(a_room[0].x, b_room[0].x) && close_to(a_room[0].y, b_room[0].y) && close_to(a_room[0].z, b_room[0].z) && close_to(a_room[0].w, b_room[0].w);
+        if (!same && n < 3) printf("  %s #%u: %g %g %g %g vs %g %g %g %g\n", name, n, a_room[0].x, a_room[0].y, a_room[0].z, a_room[0].w, b_room[0].x, b_room[0].y, b_room[0].z, b_room[0].w);
+        CHECK(same);
+      }
+    }
+    CHECK(alive_count > 20);   // (the test is about colours, not about every pixel being killed)
+    printf("  dxil %s: 200 pixels compared, %u not killed\n", name, alive_count);
+  }
+  // The vertex shader: a matrix and a tint from the constants.
+  {
+    UniquePointer<D3d9Program> reference, translated;
+    CHECK(load("dxil_vs.dxbc", &reference) && load("dxil_vs.dxil", &translated));
+    if (reference && translated) {
+      CHECK(translated->stage() == graphics::ShaderStage::Vertex);
+      for (uint32_t n = 0; n < 100; ++n) {
+        graphics::Vec4 attributes[4] = {{random(-1, 1), random(-1, 1), random(-1, 1), 1}, {random(0, 1), random(0, 1), random(0, 1), random(0, 1)}, {}, {}};
+        float constants_f[32];
+        for (float& c : constants_f) c = random(-2, 2);
+        uint8_t constants[128];
+        for (uint32_t i = 0; i < 32; ++i) {
+          const uint32_t bits = __builtin_bit_cast(uint32_t, constants_f[i]);
+          for (uint32_t k = 0; k < 4; ++k) constants[4 * i + k] = static_cast<uint8_t>(bits >> (8 * k));
+        }
+        graphics::ShaderIo a = {}, b = {};
+        reference->run_vertex_ex(attributes, constants, graphics::VertexContext(), &a);
+        translated->run_vertex_ex(attributes, constants, graphics::VertexContext(), &b);
+        const bool same = close_to(a.position.x, b.position.x) && close_to(a.position.y, b.position.y) && close_to(a.position.z, b.position.z) && close_to(a.position.w, b.position.w) &&
+                          close_to(a.varying[0].x, b.varying[0].x) && close_to(a.varying[0].w, b.varying[0].w) && close_to(a.varying[2].x, b.varying[2].x) && close_to(a.varying[2].y, b.varying[2].y);
+        if (!same && n < 3) printf("  vs #%u: %g %g %g %g vs %g %g %g %g\n", n, a.position.x, a.position.y, a.position.z, a.position.w, b.position.x, b.position.y, b.position.z, b.position.w);
+        CHECK(same);
+      }
+    }
+  }
+  // Truncated and with a bit flipped: refused or compiled, never a crash (and the sanitizers say nothing).
+  for (const char* name : {"dxil_ps_math.dxil", "dxil_ps_flow.dxil", "dxil_vs.dxil", "dxil_ps_tex.dxil"}) {
+    const std::vector<uint8_t> blob = read_blob(name);
+    for (size_t n = 0; n < blob.size(); n += 11) {
+      UniquePointer<D3d9Program> program;
+      D3d9Program::compile_dxbc(allocator, ConstByteView(blob.data(), n), &program);
+    }
+    for (size_t bit = 0; bit < blob.size() * 8; bit += 37) {
+      std::vector<uint8_t> flipped = blob;
+      flipped[bit / 8] ^= static_cast<uint8_t>(1u << (bit % 8));
+      UniquePointer<D3d9Program> program;
+      D3d9Program::compile_dxbc(allocator, ConstByteView(flipped.data(), flipped.size()), &program);
+    }
+  }
+}
+
 // Geometry shaders with adjacency input and instances.
 void test_geometry_extras() {
   HostAllocator allocator;
@@ -6479,6 +6582,7 @@ int main() {
   test_d3d12_compute();
   test_d3d12_barriers();
   test_d3d12_heaps();
+  test_dxil();
   test_compute_shared();
   test_geometry_extras();
   test_alpha_to_coverage();

@@ -142,6 +142,26 @@ int8_t signature_slot(const SigElement& s, bool output_of_vertex) {
 
 NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteView bytes, UniquePointer<D3d9Program>* out) {
   using Instr = Instruction;
+  // A DXIL container (a DXIL part among the chunks) is translated to the tokens of the same shader first.
+  if (bytes.size() >= 32 && bytes.size() <= (1u << 20)) {
+    ByteReader h(bytes);
+    if (h.le32() == kMagic) {
+      h.skip(16);
+      h.le32();
+      h.le32();
+      const uint32_t n = h.le32();
+      for (uint32_t i = 0; h.ok() && i < n && i < 32; ++i) {
+        const uint32_t offset = h.le32();
+        ConstByteView tag;
+        uint32_t fourcc = 0;
+        if (h.ok() && offset <= bytes.size() && bytes.size() - offset >= 4 && bytes.try_subview(offset, 4, &tag)) {
+          ByteReader t(tag);
+          fourcc = t.le32();
+        }
+        if (fourcc == 0x4C495844) return compile_dxil(allocator, bytes, out);   // 'DXIL'
+      }
+    }
+  }
   if (bytes.size() < 32 || bytes.size() > kMaxTokens * 4ull) return status::kInvalidParameter;
   ByteReader head(bytes);
   if (head.le32() != kMagic) return status::kInvalidParameter;
