@@ -6,10 +6,11 @@ q = open(w + '/q.bin', 'rb').read()
 raw = open(w + '/e.raw', 'rb').read()
 i = raw.rfind(b'[exit=')
 e = raw[:i]
-blk, xo, vo, rx, rn, rf, rv, bo, rp = map(int, open(w + '/layout.txt').read().split())
+blk, xo, vo, rx, rn, rf, rv, bo, rp, rza = map(int, open(w + '/layout.txt').read().split())
 cases = open(w + '/cases.txt').read().split('\n')
 print(raw[i:].decode().strip(), 'sizes', len(q), len(e))
 bad = 0
+names = {}
 for ci, text in enumerate(cases):
     if not text:
         continue
@@ -21,6 +22,7 @@ for ci, text in enumerate(cases):
         break
     if a[rx:] != b[rx:] or False:
         bad += 1
+        names.setdefault(text.split('//')[-1].split()[0] if '//' in text else text.split()[0], []).append(text)
         if bad <= 12:
             diffs = []
             for k in range(31):
@@ -42,9 +44,12 @@ for ci, text in enumerate(cases):
                 pq = [int.from_bytes(a[rp + 2 * k:rp + 2 * k + 2], 'little') for k in range(17)]
                 pe = [int.from_bytes(b[rp + 2 * k:rp + 2 * k + 2], 'little') for k in range(17)]
                 diffs.append(' '.join('%s q=%04x e=%04x' % ('p%d' % k if k < 16 else 'ffr', pq[k], pe[k]) for k in range(17) if pq[k] != pe[k]))
+            if a[rza:rza + 256] != b[rza:rza + 256]:
+                diffs.append('ZA ' + ' '.join('row%d q=%s e=%s' % (r, a[rza + 16 * r:rza + 16 * r + 16][::-1].hex(), b[rza + 16 * r:rza + 16 * r + 16][::-1].hex()) for r in range(16) if a[rza + 16 * r:rza + 16 * r + 16] != b[rza + 16 * r:rza + 16 * r + 16])[:600])
             if a[bo:] != b[bo:]:
                 diffs.append('MEMORY q=%s e=%s' % (a[bo:bo + 160].hex(), b[bo:bo + 160].hex()))
             print('MISMATCH #%d: %s' % (ci, text))
-            print('   ', '; '.join(diffs[:5]))
+            print('   ', '; '.join(diffs[:6]))
+if bad > 12: print('mismatching mnemonics:', ' '.join('%s:%d' % (k, len(v)) for k, v in sorted(names.items(), key=lambda kv: -len(kv[1]))))
 print('cases', len([c for c in cases if c]), 'mismatches', bad)
 sys.exit(1 if bad else 0)

@@ -19,6 +19,7 @@
 #include <stdint.h>
 #include "Emulation/AArch64NeonCommon.hpp"
 #include "Emulation/Wide.hpp"
+#include "Emulation/SoftFloat.hpp"
 
 // Helpers shared by the SVE files (AArch64Sve*.cpp). The vector length is fixed at 128 bits, so a Z register is the low and high word of the V register of the same number, a
 // predicate register is 16 bits (one per byte of the vector), and an element of size 2^esz bytes is active when the predicate bit at (index << esz) is set.
@@ -131,6 +132,27 @@ inline I128 multiply_signed(int64_t a, int64_t b) {
 inline I128 doubling_high(I128 acc, I128 prod, uint32_t w, bool rounding) {
   const I128 half_unit = rounding ? (static_cast<I128>(1) << (w - 2)) : 0;
   return acc + ((prod + half_unit) >> (w - 1));
+}
+
+// The BFloat16 dot product step used by BFDOT, BFMMLA and BFMOPA: exact products, every add rounded to odd, denormals flushed, the default NaN, no exception flags. `sum` is single precision,
+// the four others are BFloat16 values in the low 16 bits.
+inline uint64_t bfloat_odd_op(bool is_mul, uint64_t x, uint64_t y, const softfloat::Env& base) {
+  using namespace softfloat;
+  if (is_nan(Format::F32, x) || is_nan(Format::F32, y)) return 0x7FC00000u;
+  Env e = base;
+  e.mode = Rounding::TowardZero;
+  e.flags = 0;
+  e.daz = true;
+  e.ftz = true;
+  uint64_t r = is_mul ? mul(Format::F32, x, y, e) : add(Format::F32, x, y, e);
+  if (is_nan(Format::F32, r)) return 0x7FC00000u;
+  if (e.flags & kOverflow) return (r & 0x80000000u) | 0x7F800000u;      // (an overflow gives an infinity)
+  if ((e.flags & kInexact) && (r & 0x7FFFFFFFu) != 0x7F800000u) r |= 1;
+  return r;
+}
+inline uint64_t bfloat_dot_add(uint64_t sum, uint64_t a0, uint64_t a1, uint64_t b0, uint64_t b1, const softfloat::Env& base) {
+  const uint64_t p1 = bfloat_odd_op(true, (a0 & 0xFFFF) << 16, (b0 & 0xFFFF) << 16, base), p2 = bfloat_odd_op(true, (a1 & 0xFFFF) << 16, (b1 & 0xFFFF) << 16, base);
+  return bfloat_odd_op(false, sum, bfloat_odd_op(false, p1, p2, base), base);
 }
 
 // The high half of a 64 x 64 product, signed or unsigned.

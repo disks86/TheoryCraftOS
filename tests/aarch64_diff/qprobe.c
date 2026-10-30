@@ -31,6 +31,9 @@ void c_main(void) {
   struct ksigaction sa = {(void*)handler, 0x4 /*SA_SIGINFO*/ | 0x40000000 /*SA_NODEFER*/ | 0x08000000 /*SA_ONSTACK*/, 0, 0};
   static const int sigs[] = {4, 5, 6, 7, 8, 11, 14, 31};
   for (unsigned k = 0; k < sizeof(sigs) / sizeof(sigs[0]); ++k) sys(134, sigs[k], (long)&sa, 0, 8, 0, 0);
+#ifdef SME
+  __asm__ volatile("smstart");      // (a system call leaves streaming mode, so it is entered again before every word)
+#endif
   u32* buf = (u32*)sys(222, 0, 1 << 18, 7, 0x22, -1, 0);
   struct { long isec, iusec, vsec, vusec; } timer = {0, 100000, 0, 100000};
   sys(103, 0, (long)&timer, 0, 0, 0, 0);
@@ -54,6 +57,9 @@ void c_main(void) {
     __asm__ volatile("dc cvau, %0\n dsb ish\n ic ivau, %0\n dsb ish\n isb" : : "r"(buf) : "memory");
     for (long i = 0; i < n; ++i) {
       last_signal = 0;
+#ifdef SME
+      __asm__ volatile("smstart sm");
+#endif
       call_word(buf + 8 * i);
       results[i] = last_signal == 0 ? 0 : last_signal == 4 ? 1 : last_signal == 99 ? 3 : 2;
       ++progress;
