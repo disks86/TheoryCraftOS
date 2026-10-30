@@ -2983,6 +2983,36 @@ static void test_media_player() {
         sound_player.close_media();
         CHECK(sound_player.kind() == desktop::MediaPlayer::Kind::None && sound_player.audio_player()->state() == audio::PlayerState::Empty);
       }
+      // The playlist: the media files of the folder, by name (song.mid is not there yet); next / previous go through them, the end of a track goes on to the next.
+      {
+        auto run = [&](int rounds) {
+          for (int i = 0; i < rounds; ++i) {
+            sound_player.audio_player()->update();
+            mixer.pump();
+            device.play_all();
+            sound_player.pump();
+          }
+        };
+        CHECK(sound_player.open_file("/tone.flac") && sound_player.playlist().count() == 2 && sound_player.playlist().current() == 0);
+        CHECK(sound_player.next_track() && sound_player.path().equals("/tone.wav") && sound_player.playlist().current() == 1);
+        CHECK(!sound_player.next_track() && sound_player.path().equals("/tone.wav"));                                    // (the end of the list)
+        run(3);
+        CHECK(sound_player.previous_track() && sound_player.path().equals("/tone.flac"));                                 // (played for less than 3 s: the one before)
+        CHECK(sound_player.previous_track() && sound_player.path().equals("/tone.flac") && sound_player.playlist().current() == 0);   // (the start: this one again)
+        // played through: on to the next track by itself (16000 frames at 8 kHz)
+        run(400);
+        CHECK(sound_player.path().equals("/tone.wav") && sound_player.playlist().current() == 1);
+        // stopped by hand in the middle: stays
+        sound_player.audio_player()->seek(4000);
+        sound_player.audio_player()->stop();
+        run(10);
+        CHECK(sound_player.path().equals("/tone.wav"));
+        sound_player.close_media();
+        CHECK(!sound_player.next_track() && !sound_player.previous_track());
+        // a file picked in another folder replaces the list
+        sound_player.playlist().clear();
+        CHECK(sound_player.playlist().count() == 0 && sound_player.playlist().following(true) == desktop::Playlist::kNone);
+      }
       // A MIDI file: played by the software synthesizer, or on the MIDI hardware when the machine has some.
       {
         static const uint8_t kSong[] = {'M', 'T', 'h', 'd', 0, 0, 0, 6, 0, 0, 0, 1, 0x01, 0xE0, 'M', 'T', 'r', 'k', 0, 0, 0, 13,
@@ -2994,7 +3024,7 @@ static void test_media_player() {
         file.reset();
         CHECK(desktop::MediaPlayer::is_media_name("tune.MID") && desktop::MediaPlayer::is_media_name("tune.midi") && desktop::MediaPlayer::is_media_name("x.kar"));
         CHECK(sound_player.open_file("/song.mid") && sound_player.kind() == desktop::MediaPlayer::Kind::Audio && !notices.showing());
-        CHECK(sound_player.status_label().text().equals("Playing /song.mid (synthesized)") && sound_player.audio_player()->duration() >= 48000);
+        CHECK(sound_player.status_label().text().equals("Playing /song.mid (synthesized) (1 of 3)") && sound_player.audio_player()->duration() >= 48000);
         int loud = 0;
         for (int i = 0; i < 40; ++i) {
           sound_player.audio_player()->update();
@@ -3013,7 +3043,7 @@ static void test_media_player() {
           void reset() override {}
         } hardware;
         sound_player.set_midi_output(&hardware);
-        CHECK(sound_player.open_file("/song.mid") && sound_player.status_label().text().equals("Playing /song.mid (on the MIDI hardware)"));
+        CHECK(sound_player.open_file("/song.mid") && sound_player.status_label().text().equals("Playing /song.mid (on the MIDI hardware) (1 of 3)"));
         for (int i = 0; i < 40; ++i) {
           sound_player.audio_player()->update();
           mixer.pump();
@@ -5745,6 +5775,8 @@ static void test_desktop_media_keys() {
     CHECK(light.level == 40);
     // ordinary keys are not taken
     CHECK(!d.handle_media_key(key::kTab) && !d.handle_media_key(4));
+    CHECK(!d.handle_media_key(key::kMediaNext) && !d.handle_media_key(key::kMediaPrevious));          // (the player is not open: the keys are left alone)
+    CHECK(desktop::Playlist::folder_of("/a/b/c.mp3").equals("/a/b") && desktop::Playlist::folder_of("/c.mp3").equals("/") && desktop::Playlist::folder_of("c.mp3").empty());
     mixer.stop_service();
   }
   CHECK(a.live == 0);
