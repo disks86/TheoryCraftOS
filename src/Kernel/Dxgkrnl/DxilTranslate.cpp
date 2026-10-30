@@ -254,6 +254,7 @@ class Translator {
   bool is_shared_pointer(uint32_t id) const;
   bool sys_used_[4] = {};          // vThreadID, vThreadGroupID, vThreadIDInGroup, vThreadIDInGroupFlattened
   bool uav_used_[kMaxResources] = {};
+  uint32_t gs_[5] = {};            // a geometry shader's state: input primitive, most vertices, stream mask, output topology, instances
 };
 
 // --- operands --------------------------------------------------------------------------------------------------------------------------------------------------
@@ -265,8 +266,10 @@ void Translator::src(const Val& v, uint32_t modifier) {
       put(modifier == 1 ? v.a ^ 0x80000000u : modifier == 2 ? v.a & 0x7FFFFFFFu : modifier == 3 ? v.a | 0x80000000u : v.a);
       break;
     case VK::Temp: case VK::Input:
-      put(2u | (2u << 2) | (v.b << 4) | ((v.kind == VK::Input ? 1u : 0u) << 12) | (1u << 20) | (modifier ? 1u << 31 : 0u));
+      // (an input of a geometry shader names the vertex too: v[vertex][register])
+      put(2u | (2u << 2) | (v.b << 4) | ((v.kind == VK::Input ? 1u : 0u) << 12) | ((v.kind == VK::Input && v.c ? 2u : 1u) << 20) | (modifier ? 1u << 31 : 0u));
       if (modifier) put(1u | (modifier << 6));
+      if (v.kind == VK::Input && v.c) put(v.c - 1);
       put(v.a);
       break;
     case VK::Cb:
@@ -1479,6 +1482,11 @@ bool Translator::dx_call(const Instruction& ins) {
       Val v;
       v.kind = VK::Input, v.a = e.reg + static_cast<uint32_t>(row), v.b = first + static_cast<uint32_t>(col);
       if (v.b >= 4 || v.a >= 16) return error(status::kInvalidParameter);
+      if (kind_ == 2) {   // (a geometry shader: the vertex of the primitive)
+        uint64_t vertex = 0;
+        if (ins.arg_count < 5 || !constant_int(ins.args[4], &vertex) || vertex >= 6) return error(status::kNotSupported);
+        v.c = static_cast<uint32_t>(vertex) + 1;
+      }
       return define(ins.result, v);
     }
     case kStoreOutput: {
@@ -1563,6 +1571,12 @@ bool Translator::dx_call(const Instruction& ins) {
       finish(begin(190, flags << 11));
       return true;
     }
+    case 97: case 98: {   // emitStream / cutStream (stream 0)
+      uint64_t stream = 1;
+      if (kind_ != 2 || ins.arg_count < 2 || !constant_int(ins.args[1], &stream) || stream != 0) return error(status::kNotSupported);
+      finish(begin(opcode == 97 ? 19 : 9));
+      return true;
+    }
     case kDiscard: {
       if (ins.arg_count < 2) return error(status::kInvalidParameter);
       const Val cond = use(ins.args[1]);
@@ -1623,6 +1637,14 @@ NtStatus Translator::read_metadata() {
   const Meta* props = operand_of(entry, 4);
   for (uint32_t i = 0; props && i + 1 < props->count; i += 2) {
     uint64_t tag = 0;
+    if (meta_int(operand_of(props, i), &tag) && tag == 1) {
+      const Meta* state = operand_of(props, i + 1);
+      for (uint32_t k = 0; k < 5; ++k) {
+        uint64_t v = 0;
+        meta_int(operand_of(state, k), &v);
+        gs_[k] = static_cast<uint32_t>(v);
+      }
+    }
     if (meta_int(operand_of(props, i), &tag) && tag == 4) {
       const Meta* group = operand_of(props, i + 1);
       for (uint32_t k = 0; k < 3; ++k) {
@@ -1726,8 +1748,22 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
   // --- the declarations and the program
   ByteBuffer decl(allocator_);
   auto word = [&](uint32_t w) { return decl.put32(w); };
-  const bool pixel = program_kind == 0, vertex = program_kind == 1, compute = program_kind == 5;
-  if (!pixel && !vertex && !compute) return status::kNotSupported;
+  const bool pixel = program_kind == 0, vertex = program_kind == 1, compute = program_kind == 5, geometry = program_kind == 2;
+  if (!pixel && !vertex && !compute && !geometry) return status::kNotSupported;
+  uint32_t input_vertices = 0;
+  if (geometry) {
+    // (D3D10_SB_PRIMITIVE: 1 point, 2 line, 3 triangle, 6 line with adjacency, 7 triangle with adjacency; the topologies: 1 point list, 3 line strip, 5 triangle strip)
+    const uint32_t primitive = gs_[0];
+    input_vertices = primitive == 1 ? 1 : primitive == 2 ? 2 : primitive == 3 ? 3 : primitive == 6 ? 4 : primitive == 7 ? 6 : 0;
+    if (!input_vertices || gs_[1] == 0 || gs_[1] > graphics::kMaxGeometryVertices || (gs_[3] != 1 && gs_[3] != 3 && gs_[3] != 5) || gs_[2] != 1) return status::kNotSupported;   // (stream 0 only)
+    word(93u | (primitive << 11) | (1u << 24));
+    word(92u | (gs_[3] << 11) | (1u << 24));
+    word(94u | (2u << 24)), word(gs_[1]);
+    if (gs_[4] > 1) {
+      if (gs_[4] > 32) return status::kNotSupported;
+      word(206u | (2u << 24)), word(gs_[4]);
+    }
+  }
   if (compute) {
     if (threads_[0] == 0 || threads_[1] == 0 || threads_[2] == 0) return status::kInvalidParameter;
     word(155u | (4u << 24)), word(threads_[0]), word(threads_[1]), word(threads_[2]);
@@ -1769,7 +1805,13 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
   for (uint32_t i = 0; i < input_count_; ++i) {
     const SigElement& e = inputs_[i];
     const uint32_t operand = 2u | ((e.mask & 0xF) << 4) | (1u << 12) | (1u << 20);
-    if (vertex) {
+    if (geometry) {
+      // v[vertices][register]: the registers of every vertex (a position is the system value of the _siv form)
+      const uint32_t indexed = 2u | ((e.mask & 0xF) << 4) | (1u << 12) | (2u << 20);
+      if (e.sysval == 0) word(95u | (4u << 24)), word(indexed), word(input_vertices), word(e.reg);
+      else if (e.sysval == 1) word(97u | (5u << 24)), word(indexed), word(input_vertices), word(e.reg), word(1);
+      else return status::kNotSupported;
+    } else if (vertex) {
       if (e.sysval == 0) word(95u | (3u << 24)), word(operand), word(e.reg);
       else if (e.sysval == 6 || e.sysval == 8) word(96u | (4u << 24)), word(operand), word(e.reg), word(e.sysval);
       else return status::kNotSupported;
@@ -1784,7 +1826,7 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
     const SigElement& e = outputs_[i];
     const uint32_t operand = 2u | ((e.mask & 0xF) << 4) | (2u << 12) | (1u << 20);
     if (e.sysval == 0 || (pixel && e.sysval == 64)) word(101u | (3u << 24)), word(operand), word(e.reg);
-    else if (vertex && e.sysval == 1) word(103u | (4u << 24)), word(operand), word(e.reg), word(1);
+    else if ((vertex || geometry) && e.sysval == 1) word(103u | (4u << 24)), word(operand), word(e.reg), word(1);
     else return status::kNotSupported;
   }
   word(104u | (2u << 24)), word(temps_);
@@ -1849,7 +1891,7 @@ NtStatus D3d9Program::compile_dxil(allocators::IAllocator& allocator, ConstByteV
   ConstByteView bitcode;
   if (!program.try_subview(8 + uint64_t{bitcode_offset}, bitcode_size, &bitcode)) return status::kInvalidParameter;
   const uint32_t kind = version >> 16;
-  if (kind != 0 && kind != 1 && kind != 5) return status::kNotSupported;
+  if (kind != 0 && kind != 1 && kind != 2 && kind != 5) return status::kNotSupported;
   dxil::Module module(allocator);
   NtStatus s = dxil::read_module(allocator, bitcode, &module);
   if (s != status::kSuccess) return s;

@@ -1354,12 +1354,12 @@ void scene_multisample(Rig& rig, ArrayView<uint32_t> out) {
 }
 
 // A geometry shader (gs_copy.hlsl): every triangle comes out as itself and, as a second strip, a half-size copy moved to the lower right with the red and blue swapped.
-void scene_geometry_shader(Rig& rig, ArrayView<uint32_t> out) {
+void geometry_scene(Rig& rig, ArrayView<uint32_t> out, const uint8_t* gs_code, uint32_t gs_size) {
   if (!rig.has(graphics::kFeatureGeometryShaders)) return void(rig.step("geometry shaders", status::kNotSupported));
   namespace b = conformance_blobs;
   const Vertex v[3] = {{-0.9f, -0.9f, 0.5f, 1, 0, 0, 1}, {0.9f, -0.9f, 0.5f, 0, 1, 0, 1}, {0.0f, 0.9f, 0.5f, 0, 0, 1, 1}};
   Handle vs = rig.vertex_shader(bytes_of(b::k_vs, sizeof b::k_vs));
-  Handle gs = rig.shader("create_shader (geometry)", ShaderKind::Dxbc, graphics::ShaderStage::Geometry, bytes_of(b::k_gs_copy, sizeof b::k_gs_copy));
+  Handle gs = rig.shader("create_shader (geometry)", ShaderKind::Dxbc, graphics::ShaderStage::Geometry, bytes_of(gs_code, gs_size));
   Handle ps = rig.pixel_shader(bytes_of(b::k_ps_color, sizeof b::k_ps_color));
   PipelineDesc pd = colour_pipeline_desc(vs, ps);
   pd.varying_count = 3;
@@ -1377,6 +1377,10 @@ void scene_geometry_shader(Rig& rig, ArrayView<uint32_t> out) {
   rig.render(w, {target, vb});
   rig.read(target, out);
 }
+
+void scene_geometry_shader(Rig& rig, ArrayView<uint32_t> out) { geometry_scene(rig, out, conformance_blobs::k_gs_copy, sizeof conformance_blobs::k_gs_copy); }
+// The same shader as DXIL (gs_6_0).
+void scene_dxil_geometry(Rig& rig, ArrayView<uint32_t> out) { geometry_scene(rig, out, conformance_blobs::k_dxil_gs_copy, sizeof conformance_blobs::k_dxil_gs_copy); }
 
 // The geometry shader that runs twice for each primitive (gs_copy_inst2: gs_copy with an instance count of 2): the same triangles drawn twice over, so the same picture as gs_copy's.
 void scene_geometry_instances(Rig& rig, ArrayView<uint32_t> out) {
@@ -2229,6 +2233,7 @@ const Entry kScenes[] = {
     {"Direct3D 12 resource heap: a target and a texture aliased (DXBC)", scene_d3d12_heap},
     {"Direct3D 12 DXIL shaders (Shader Model 6)", scene_dxil},
     {"Direct3D 12 DXIL compute shader (Shader Model 6)", scene_dxil_compute},
+    {"Direct3D 12 DXIL geometry shader (Shader Model 6)", scene_dxil_geometry},
     {"Direct3D 12 DXIL group-shared memory, barriers and a loop (Shader Model 6)", scene_dxil_compute_shared},
     {"Direct3D 11 stream output of two streams (DXBC)", scene_stream_output},
     {"Direct3D 11 stream output appending, statistics and timestamps (DXBC)", scene_stream_output_append},

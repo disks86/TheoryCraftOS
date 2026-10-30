@@ -5215,6 +5215,35 @@ void test_dxil() {
     }
   }
 
+
+  // A geometry shader: the vertices it emits and where it cut the strip.
+  {
+    UniquePointer<D3d9Program> reference, translated;
+    CHECK(load("dxil_gs_copy.dxbc", &reference) && load("dxil_gs_copy.dxil", &translated));
+    if (reference && translated) {
+      CHECK(translated->stage() == graphics::ShaderStage::Geometry && translated->geometry_input() == graphics::GeometryPrimitive::Triangle && translated->geometry_max_vertices() == 6 &&
+            translated->geometry_output() == graphics::GeometryTopology::TriangleStrip);
+      for (uint32_t n = 0; n < 100; ++n) {
+        graphics::GeometryInputData in;
+        for (uint32_t v = 0; v < 3; ++v) {
+          in.position[v] = {random(-1, 1), random(-1, 1), random(0, 1), random(0.5f, 2)};
+          in.varying[v][0] = {random(0, 1), random(0, 1), random(0, 1), random(0, 1)};
+          in.varying[v][2] = {random(0, 1), random(0, 1), 0, 0};
+        }
+        graphics::GeometryOutputData a, b;
+        uint8_t constants[128] = {};
+        reference->run_geometry(in, constants, &a);
+        translated->run_geometry(in, constants, &b);
+        bool same = a.count == b.count && a.count == 6;
+        for (uint32_t i = 0; same && i < a.count; ++i)
+          same = a.restart[i] == b.restart[i] && close_to(a.vertex[i].position.x, b.vertex[i].position.x) && close_to(a.vertex[i].position.y, b.vertex[i].position.y) &&
+                 close_to(a.vertex[i].position.w, b.vertex[i].position.w) && close_to(a.vertex[i].varying[0].x, b.vertex[i].varying[0].x) && close_to(a.vertex[i].varying[0].z, b.vertex[i].varying[0].z) &&
+                 close_to(a.vertex[i].varying[2].y, b.vertex[i].varying[2].y);
+        CHECK(same);
+      }
+      printf("  dxil dxil_gs_copy: 100 triangles compared\n");
+    }
+  }
   // The compute shaders: the same buffers in, the same buffers out.
   {
     UniquePointer<D3d9Program> reference, translated;
@@ -5274,7 +5303,7 @@ void test_dxil() {
     }
   }
   // Truncated and with a bit flipped: refused or compiled, never a crash (and the sanitizers say nothing).
-  for (const char* name : {"dxil_ps_math.dxil", "dxil_ps_flow.dxil", "dxil_vs.dxil", "dxil_ps_tex.dxil", "dxil_cs_fill.dxil", "dxil_ps_loop.dxil", "dxil_cs_shared.dxil", "dxil_ps_more.dxil"}) {
+  for (const char* name : {"dxil_ps_math.dxil", "dxil_ps_flow.dxil", "dxil_vs.dxil", "dxil_ps_tex.dxil", "dxil_cs_fill.dxil", "dxil_ps_loop.dxil", "dxil_cs_shared.dxil", "dxil_ps_more.dxil", "dxil_gs_copy.dxil"}) {
     const std::vector<uint8_t> blob = read_blob(name);
     for (size_t n = 0; n < blob.size(); n += 11) {
       UniquePointer<D3d9Program> program;
