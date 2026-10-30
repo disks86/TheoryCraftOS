@@ -1041,6 +1041,10 @@ static void test_aarch64_sve() {
     CHECK(m.cpu.state().v[9].lo == data[0] && m.cpu.state().v[9].hi == data[1] && m.cpu.state().v[10].lo == 0x88 && m.cpu.state().v[10].hi == 0x00);
     CHECK(m.cpu.state().v[7].lo == 0x4040000040400000ull && m.cpu.state().v[7].hi == 0x4040000040400000ull);
   }
+  {      // the ID registers report SVE and SVE2 (ID_AA64PFR0_EL1 bits 35:32, ID_AA64ZFR0_EL1 SVEver)
+    A64Machine m({0xd5380400, 0xd5380481, 0xd4000001});      // mrs x0, ID_AA64PFR0_EL1; mrs x1, ID_AA64ZFR0_EL1
+    CHECK(m.run() == StopReason::Syscall && ((m.x(0) >> 32) & 15) == 1 && (m.x(1) & 15) == 1);
+  }
   {      // an octoword load needs a longer vector than this one: undefined, as are other reserved encodings
     A64Machine m({0xa4212861, 0xd4000001});      // ld1rob {z1.b}, p2/z, [x3, #32]
     CHECK(m.run() == StopReason::Fault && m.cpu.fault().vector == 6);
