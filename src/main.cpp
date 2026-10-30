@@ -91,6 +91,7 @@
 #include "Hardware/VMware/VmwareTools.hpp"
 #include "Hardware/SystemInput.hpp"
 #include "Hardware/Mouse/I2c/PlatformI2cHid.hpp"
+#include "Hardware/Bus/Ish/IshDriver.hpp"
 #include "Hardware/Pen/PenMouse.hpp"
 #include "Hardware/Sensor/AcpiAmbientLight.hpp"
 #include "Hardware/Sensor/SensorHub.hpp"
@@ -1054,6 +1055,22 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     }
     if (started) Entry(Level::Info, "Input").dec(started).text(" pointing device(s) on I2C");
   }
+#ifdef TCOS_ISH
+  // The Intel sensor hub: its sensors (accelerometer, gyroscope, magnetometer, ambient light) join the I2C and ACPI ones in the sensor hub.
+  UniquePointer<hardware::IshDriver> ish;
+  if (paging_ok) {
+    for (uint32_t i = 0; i < pci.device_count() && !ish; ++i) {
+      hardware::PciDeviceInfo d;
+      if (!pci.pci_device(i, &d) || !hardware::IshDriver::supports(d)) continue;
+      ish = UniquePointer<hardware::IshDriver>::make(shared_allocator, shared_allocator);
+      if (!ish) break;
+      const hardware::IshDriver::Outcome outcome = ish->start(pci, d, register_mapper, &sensors);
+      Entry(outcome == hardware::IshDriver::Outcome::Started ? Level::Ok : Level::Warning, "Sensor").text("Intel sensor hub: ").text(hardware::IshDriver::outcome_name(outcome));
+      if (outcome == hardware::IshDriver::Outcome::Started) Entry(Level::Info, "Sensor").dec(ish->sensor_count()).text(" sensor(s) through the ISH");
+      else ish = UniquePointer<hardware::IshDriver>();
+    }
+  }
+#endif
   Entry(input.keyboards().count() ? Level::Ok : Level::Warning, "Input").dec(input.keyboards().count()).text(" keyboards");
   for (uint32_t i = 0; i < input.keyboards().count(); ++i) Entry(Level::Info, "Input").text("  ").text(input.keyboards().at(i)->name());
   Entry(input.mice().count() ? Level::Ok : Level::Warning, "Input").dec(input.mice().count()).text(" mice");
@@ -1908,6 +1925,9 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
           }
         }
       }
+#endif
+#ifdef TCOS_ISH
+      if (ish) ish->poll();
 #endif
 #ifdef TCOS_ACPI_EVENTS
       if (acpi_events) {

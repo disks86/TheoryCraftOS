@@ -752,6 +752,10 @@ add_executable(BOOTX64
   src/Hardware/Acpi/AcpiResources.cpp
   src/Hardware/Bus/I2c/DesignWareI2c.cpp
   src/Hardware/Bus/I2c/HidInputMap.cpp
+  src/Hardware/Bus/Ish/IshIpc.cpp
+  src/Hardware/Bus/Ish/Ishtp.cpp
+  src/Hardware/Bus/Ish/IshHid.cpp
+  src/Hardware/Bus/Ish/IshDriver.cpp
   src/Hardware/Bus/I2c/I2cHidDevice.cpp
   src/Hardware/Bus/I2c/IntelGpio.cpp
   src/Hardware/Bus/I2c/LpssI2c.cpp
@@ -1128,6 +1132,10 @@ endif()
 option(TCOS_INTEL_WIFI "Start the Intel Wireless-AC 9000 series card (firmware from /firmware, initialisation, hardware address and channels; no scanning or joining yet; not yet run on a real card)" OFF)
 if(TCOS_INTEL_WIFI)
   target_compile_definitions(BOOTX64 PRIVATE TCOS_INTEL_WIFI)
+endif()
+option(TCOS_ISH "Start the Intel Integrated Sensor Hub (PCI 8086:9D35 / A135): resets its IPC, brings up ISHTP and the HID client, adds the sensors to the sensor hub; not yet run on a real machine" OFF)
+if(TCOS_ISH)
+  target_compile_definitions(BOOTX64 PRIVATE TCOS_ISH)
 endif()
 option(TCOS_BLUETOOTH "Start the Bluetooth controllers on the USB ports (Intel firmware from /firmware/ibt-*.sfi, bring-up, events; nothing is scanned or paired; not yet run on a real controller)" OFF)
 if(TCOS_BLUETOOTH)
