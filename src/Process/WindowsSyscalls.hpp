@@ -111,6 +111,7 @@ enum class WindowsSyscallNumber : uint32_t {
   NtReadVirtualMemory = 84,
   NtWriteVirtualMemory = 85,
   NtCreateSymbolicLink = 86,
+  NtTcosDebugException = 501,
   NtCreateSocket = 87,
   NtBindSocket = 88,
   NtConnectSocket = 89,
@@ -2067,7 +2068,7 @@ enum class WindowsSyscallNumber : uint32_t {
   NtVisualCaptureBits = 5635,
 };
 
-constexpr uint32_t kWindowsServiceCount = 501;      // numbers below this are services of the executive (the ones without code answer STATUS_NOT_IMPLEMENTED)
+constexpr uint32_t kWindowsServiceCount = 502;      // numbers below this are services of the executive (the ones without code answer STATUS_NOT_IMPLEMENTED)
 constexpr uint32_t kWin32kServiceBase = 4096, kWin32kServiceEnd = 5636;      // the services of win32k (NtUser*, NtGdi*, ...) are these numbers; same answer
 constexpr uint32_t kStatusInvalidSystemService = 0xC000001Cu;      // the answer for a number that is no service
 

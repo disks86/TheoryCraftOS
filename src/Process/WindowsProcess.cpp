@@ -19,6 +19,7 @@
 #include "Process/AddressSpace.hpp"
 #include "Process/Objects.hpp"
 #include "Process/WindowsFiles.hpp"
+#include "Process/WindowsDebug.hpp"
 #include "Utility/ByteBuffer.hpp"
 #include "Utility/Utf16.hpp"
 
@@ -232,7 +233,8 @@ uint32_t nt_create_user_process(Process& p, const SyscallRequest& r) {
   spec.command_line = command_line.view();
   spec.working_directory = world_directory.view();
   spec.environment = ArrayView<const StringView>(entries, found);
-  spec.suspended = (flags_arg & kCreateSuspended) != 0;
+  const bool debug_child = debug_wants_child(p.id());      // (a debugged program's child is attached before it runs)
+  spec.suspended = (flags_arg & kCreateSuspended) != 0 || debug_child;
   spec.inherit_handles = (flags_arg & kInheritHandles) != 0;
   spec.use_std_handles = (flags_arg & kUseStdHandles) != 0;
   if (spec.use_std_handles) {
@@ -270,6 +272,10 @@ uint32_t nt_create_user_process(Process& p, const SyscallRequest& r) {
   const uint8_t id[4] = {uint8_t(spec.pid), uint8_t(spec.pid >> 8), uint8_t(spec.pid >> 16), uint8_t(spec.pid >> 24)};
   if (pid_out != 0 && !p.write_user(pid_out, ConstByteView(id, 4))) return kAccessViolation;
   if (tid_out != 0 && !p.write_user(tid_out, ConstByteView(id, 4))) return kAccessViolation;
+  if (debug_child) {
+    debug_attach_child(p, spec.pid);
+    if ((flags_arg & kCreateSuspended) == 0) runtime->resume_process(spec.pid);
+  }
   return kSuccess;
 }
 
@@ -353,6 +359,14 @@ uint32_t nt_query_information_process(Process& p, const SyscallRequest& r) {
     if (!process_handle_info(p, r.args[0], &child_exited, &child_code, &child_pid)) return kInvalidHandle;
     self = child_pid == p.id();      // (OpenProcess on the own id gives a handle to this very process)
   }
+  if (!self && info_class == 7) {      // ProcessDebugPort of another program: -1 when a debugger is attached
+    if (length < 8) return kInfoLengthMismatch;
+    uint8_t port[8] = {};
+    if (debug_object_of(child_pid)) for (uint8_t& v : port) v = 0xFF;
+    if (!p.write_user(r.args[2], ConstByteView(port, 8))) return kAccessViolation;
+    if (returned != 0 && !p.write_user_u32(returned, 8)) return kAccessViolation;
+    return kSuccess;
+  }
   uint64_t remote_peb = 0;
   uint8_t remote_image[64] = {};
   if (!self && !child_exited && p.runtime() && (info_class == 0 || info_class == 37)) {      // (another program's PEB and image are not ours to look into: it tells)
@@ -405,7 +419,7 @@ uint32_t nt_query_information_process(Process& p, const SyscallRequest& r) {
         size = 32;
         break;
       }
-      case 7: size = 8; break;                                          // ProcessDebugPort: none
+      case 7: b.put(0, debug_object_of(p.id()) ? ~uint64_t{0} : 0, 8); size = 8; break;      // ProcessDebugPort: -1 when a debugger is attached
       case 12: b.put(0, p.error_mode, 4); size = 4; break;
       case 18: b.put(1, nt_priority_class(p.priority_class), 1); size = 2; break;
       case 20: {      // ProcessHandleCount
@@ -437,7 +451,7 @@ uint32_t nt_query_information_process(Process& p, const SyscallRequest& r) {
         for (uint32_t i = 0; i < 8; ++i) out[8 + i] = uint8_t(text_at >> (8 * i));
         return p.write_user(r.args[2], ConstByteView(out, 16)) && p.write_user(text_at, ConstByteView(text, image_length + 2)) ? kSuccess : kAccessViolation;
       }
-      case 30: return kPortNotSet;                                      // ProcessDebugObjectHandle: not being debugged
+      case 30: if (!debug_object_of(p.id())) return kPortNotSet; return 0xC0000002u;      // ProcessDebugObjectHandle
       case 31: b.put(0, 1, 4); size = 4; break;                         // ProcessDebugFlags: inheriting
       case 36: b.put(0, uint32_t(p.id() * 2654435761u) | 1u, 4); size = 4; break;      // ProcessCookie
       default: return kInvalidInfoClass;
@@ -474,6 +488,12 @@ uint32_t nt_set_information_process(Process& p, const SyscallRequest& r) {
     uint32_t code = 0;
     uint64_t pid = 0;
     if (!process_handle_info(p, r.args[0], &exited, &code, &pid)) return kInvalidHandle;
+    if (pid != p.id() && uint32_t(r.args[1]) == 31) {      // ProcessDebugFlags of another program: whether its debugger debugs the programs it starts too
+      uint8_t flag[4] = {};
+      if ((r.args[3] & 0xFFFFFFFFu) != 4 || !p.read_user(r.args[2], ByteView(flag, 4))) return kInfoLengthMismatch;
+      debug_set_inherit(pid, flag[0] != 0);
+      return kSuccess;
+    }
     if (pid != p.id()) {      // another program: its scheduling settings are accepted, not applied
       if (exited && uint32_t(r.args[1]) == 21) return 0xC000010Au;      // STATUS_PROCESS_IS_TERMINATING (the affinity of a program that ended)
       return uint32_t(r.args[1]) == 21 || uint32_t(r.args[1]) == 18 || uint32_t(r.args[1]) == 12 ? kSuccess : kInvalidInfoClass;

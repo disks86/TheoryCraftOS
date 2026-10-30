@@ -1012,7 +1012,10 @@ void ObjectManager::add_ref(uint32_t id) {
   if (Object* o = at(id)) ++o->references;
 }
 
+namespace windowsabi { void debug_object_freed_locked(uint32_t object); }
+
 void ObjectManager::free_object_locked(Object& o) {
+  if (o.kind == ObjectKind::DebugObject) windowsabi::debug_object_freed_locked(static_cast<uint32_t>(&o - objects_) + 1);
   free_pipe_locked(o);
   free_section_locked(o);
   free_job_locked(o);

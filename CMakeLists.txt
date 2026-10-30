@@ -619,6 +619,7 @@ add_executable(BOOTX64
   src/Process/WindowsPipes.cpp
   src/Process/WindowsLocks.cpp
   src/Process/WindowsJobs.cpp
+  src/Process/WindowsDebug.cpp
   src/Process/WindowsMemory.cpp
   src/Process/WindowsSockets.cpp
   src/Process/Sockets.cpp
