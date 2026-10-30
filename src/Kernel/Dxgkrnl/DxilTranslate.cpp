@@ -78,8 +78,13 @@ class Translator {
   Translator(allocators::IAllocator& allocator, const Module& module, const Function& function)
       : allocator_(allocator), m_(module), f_(function), out_(allocator), vals_(allocator), last_use_(allocator), alias_of_(allocator), unsupported_(allocator), marks_(allocator) {}
 
-  // Translates the entry function. `isg1` / `osg1` are the signature parts of the container.
-  NtStatus run(uint32_t program_kind, ConstByteView isg1, ConstByteView osg1, ConstByteView psg1, ByteBuffer* shex);
+  // Translates the entry function. `isg1` / `osg1` are the signature parts of the container. A hull shader is two functions: `phase` 1 is its control point function (the entry; the
+  // words written are its declarations, its temporaries and its code), 2 the patch constant function; 0 is everything else (the whole program).
+  NtStatus run(uint32_t program_kind, ConstByteView isg1, ConstByteView osg1, ConstByteView psg1, ByteBuffer* shex, uint32_t phase = 0);
+  uint32_t entry_value() const { return entry_value_; }
+  uint32_t patch_function() const { return pcf_value_; }
+  const uint32_t* hull_state() const { return hs_; }   // control points in, out, domain, partitioning, output primitive, maximum factor (bits)
+  NtStatus read_metadata_only() { return read_metadata(); }
 
  private:
   // --- the module's tables
@@ -255,6 +260,11 @@ class Translator {
   bool is_shared_pointer(uint32_t id) const;
   bool sys_used_[4] = {};          // vThreadID, vThreadGroupID, vThreadIDInGroup, vThreadIDInGroupFlattened
   bool uav_used_[kMaxResources] = {};
+  struct PatchElement {
+    uint32_t kind = 0, start_row = 0, start_col = 0, rows = 1, cols = 1;
+  } pc_[16];
+  uint32_t pc_count_ = 0, pcf_value_ = kNone, hs_[7] = {}, phase_ = 0;
+  bool output_control_point_used_ = false;
   uint32_t ds_[2] = {};            // a domain shader's state: the domain, the input control points
   bool domain_used_ = false;
   SigElement patch_[16];
@@ -270,7 +280,15 @@ void Translator::src(const Val& v, uint32_t modifier) {
       put(0x4001u);
       put(modifier == 1 ? v.a ^ 0x80000000u : modifier == 2 ? v.a & 0x7FFFFFFFu : modifier == 3 ? v.a | 0x80000000u : v.a);
       break;
-    case VK::Temp: case VK::Input:
+    case VK::Input:
+      if (v.d == 3) {   // v[vOutputControlPointID][register]: the first index is relative to that value
+        put(2u | (2u << 2) | (v.b << 4) | (1u << 12) | (2u << 20) | (2u << 22));
+        put(22u << 12);
+        put(v.a);
+        break;
+      }
+      [[fallthrough]];
+    case VK::Temp:
       // (an input of a geometry shader names the vertex too: v[vertex][register])
       put(2u | (2u << 2) | (v.b << 4) | ((v.kind == VK::Input ? (v.d == 1 ? 25u : v.d == 2 ? 27u : 1u) : 0u) << 12) | ((v.kind == VK::Input && v.c ? 2u : 1u) << 20) | (modifier ? 1u << 31 : 0u));
       if (modifier) put(1u | (modifier << 6));
@@ -1487,11 +1505,19 @@ bool Translator::dx_call(const Instruction& ins) {
       Val v;
       v.kind = VK::Input, v.a = e.reg + static_cast<uint32_t>(row), v.b = first + static_cast<uint32_t>(col);
       if (v.b >= 4 || v.a >= 16) return error(status::kInvalidParameter);
-      if (kind_ == 2 || kind_ == 4) {   // (a geometry shader: the vertex of the primitive; a domain shader: the control point)
+      if (kind_ == 2 || kind_ == 3 || kind_ == 4) {   // (a geometry or hull shader: the vertex of the primitive; a domain shader: the control point)
         uint64_t vertex = 0;
-        if (ins.arg_count < 5 || !constant_int(ins.args[4], &vertex) || vertex >= (kind_ == 2 ? 6u : 32u)) return error(status::kNotSupported);
-        v.c = static_cast<uint32_t>(vertex) + 1;
-        v.d = kind_ == 4 ? 1 : 0;
+        if (ins.arg_count < 5) return error(status::kNotSupported);
+        if (kind_ == 3 && phase_ == 1 && !constant_int(ins.args[4], &vertex)) {
+          // (the control point being made: v[vOutputControlPointID][register])
+          const Val which = use(ins.args[4]);
+          if (which.kind != VK::Sys || which.a != 22) return error(status::kNotSupported);
+          v.d = 3;
+        } else {
+          if (!constant_int(ins.args[4], &vertex) || vertex >= (kind_ == 2 ? 6u : 32u)) return error(status::kNotSupported);
+          v.c = static_cast<uint32_t>(vertex) + 1;
+          v.d = kind_ == 4 ? 1 : 0;   // (a hull shader's inputs are v[vertex][register], as a geometry shader's)
+        }
       }
       return define(ins.result, v);
     }
@@ -1577,6 +1603,29 @@ bool Translator::dx_call(const Instruction& ins) {
       finish(begin(190, flags << 11));
       return true;
     }
+    case 107: {   // outputControlPointID (a hull shader's control point function)
+      if (kind_ != 3 || phase_ != 1) return error(status::kNotSupported);
+      Val v;
+      v.kind = VK::Sys, v.a = 22, v.b = 0;
+      output_control_point_used_ = true;
+      return define(ins.result, v);
+    }
+    case 106: {   // storePatchConstant
+      uint64_t id = 0, row = 0, col = 0;
+      if (kind_ != 3 || phase_ != 2 || ins.arg_count < 5 || !constant_int(ins.args[1], &id) || !constant_int(ins.args[2], &row) || !constant_int(ins.args[3], &col) || id >= pc_count_) return error(status::kNotSupported);
+      const PatchElement& e = pc_[id];
+      // (a tessellation factor is read from the x of its register by the hull shader's users: dxc packs them into other components)
+      const bool factor = e.kind == 25 || e.kind == 26;
+      const uint32_t reg = e.start_row + static_cast<uint32_t>(row), comp = factor ? 0 : e.start_col + static_cast<uint32_t>(col);
+      if (reg >= graphics::kMaxPatchRegisters || comp >= 4) return error(status::kInvalidParameter);
+      const Val v = use(ins.args[4]);
+      const uint32_t at = begin(54);
+      put(2u | ((1u << comp) << 4) | (2u << 12) | (1u << 20));
+      put(reg);
+      src(v);
+      finish(at);
+      return true;
+    }
     case 104: {   // loadPatchConstant (a domain shader)
       uint64_t id = 0, row = 0, col = 0;
       if (kind_ != 4 || ins.arg_count < 4 || !constant_int(ins.args[1], &id) || !constant_int(ins.args[2], &row) || !constant_int(ins.args[3], &col) || id >= patch_count_) return error(status::kNotSupported);
@@ -1650,6 +1699,15 @@ NtStatus Translator::read_metadata() {
   }
   // the signature elements' interpolation modes (the container's signature parts say the rest)
   const Meta* signatures = operand_of(entry, 2);
+  if (const Meta* patch_list = operand_of(signatures, 2)) {
+    for (uint32_t i = 0; i < patch_list->count && i < 16; ++i) {
+      const Meta* el = operand_of(patch_list, i);
+      uint64_t kind = 0, rows = 1, cols = 1, row = 0, col = 0;
+      meta_int(operand_of(el, 3), &kind), meta_int(operand_of(el, 6), &rows), meta_int(operand_of(el, 7), &cols), meta_int(operand_of(el, 8), &row), meta_int(operand_of(el, 9), &col);
+      pc_[i].kind = static_cast<uint32_t>(kind), pc_[i].rows = static_cast<uint32_t>(rows), pc_[i].cols = static_cast<uint32_t>(cols), pc_[i].start_row = static_cast<uint32_t>(row), pc_[i].start_col = static_cast<uint32_t>(col);
+      pc_count_ = i + 1;
+    }
+  }
   for (uint32_t which = 0; signatures && which < 2; ++which) {
     const Meta* list = operand_of(signatures, which);
     SigElement* elements = which == 0 ? inputs_ : outputs_;
@@ -1668,6 +1726,16 @@ NtStatus Translator::read_metadata() {
         uint64_t v = 0;
         meta_int(operand_of(state, k), &v);
         gs_[k] = static_cast<uint32_t>(v);
+      }
+    }
+    if (meta_int(operand_of(props, i), &tag) && tag == 3) {   // a hull shader's state: the patch constant function, control points in and out, domain, partitioning, output, maximum factor
+      const Meta* state = operand_of(props, i + 1);
+      const Meta* fn = operand_of(state, 0);
+      if (fn && fn->kind == MetaKind::Value) pcf_value_ = fn->value;
+      for (uint32_t k = 1; k < 7; ++k) {
+        uint64_t v = 0;
+        meta_int(operand_of(state, k), &v);
+        hs_[k - 1] = static_cast<uint32_t>(v);
       }
     }
     if (meta_int(operand_of(props, i), &tag) && tag == 2) {
@@ -1716,11 +1784,12 @@ NtStatus Translator::read_signature(ConstByteView chunk, SigElement* out, uint32
 
 // --- the whole function ------------------------------------------------------------------------------------------------------------------------------------------
 
-NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteView osg1, ConstByteView psg1, ByteBuffer* shex) {
+NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteView osg1, ConstByteView psg1, ByteBuffer* shex, uint32_t phase) {
   kind_ = program_kind;
+  phase_ = phase;
   NtStatus s = read_metadata();
   if (s != status::kSuccess) return s;
-  if (entry_value_ != f_.value) return status::kNotSupported;
+  if ((phase == 2 ? pcf_value_ : entry_value_) != f_.value) return status::kNotSupported;
   if ((s = read_signature(isg1, inputs_, &input_count_)) != status::kSuccess || (s = read_signature(osg1, outputs_, &output_count_)) != status::kSuccess || (s = read_signature(psg1, patch_, &patch_count_)) != status::kSuccess) return s;
   // (interpolation modes were read by position before the counts were known)
   const uint64_t values = total_values();
@@ -1781,6 +1850,49 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
   // --- the declarations and the program
   ByteBuffer decl(allocator_);
   auto word = [&](uint32_t w) { return decl.put32(w); };
+  if (program_kind == 3) {
+    // a phase of a hull shader: its declarations (the control point function: the inputs, the output control point number, the outputs; the patch constant function: the outputs), the
+    // temporaries and the code
+    if (phase == 0) return status::kInvalidParameter;
+    const uint32_t points_in = hs_[0];
+    if (phase == 1) {
+      if (points_in < 1 || points_in > graphics::kMaxPatchControlPoints) return status::kNotSupported;
+      for (uint32_t i = 0; i < input_count_; ++i) {
+        const SigElement& e = inputs_[i];
+        const uint32_t indexed = 2u | ((e.mask & 0xF) << 4) | (1u << 12) | (2u << 20);
+        if (e.sysval == 0) word(95u | (4u << 24)), word(indexed), word(points_in), word(e.reg);
+        else if (e.sysval == 1) word(97u | (5u << 24)), word(indexed), word(points_in), word(e.reg), word(1);
+        else return status::kNotSupported;
+      }
+      if (output_control_point_used_) word(95u | (2u << 24)), word(2u | (1u << 4) | (22u << 12));
+      for (uint32_t i = 0; i < output_count_; ++i) {
+        const SigElement& e = outputs_[i];
+        const uint32_t operand = 2u | ((e.mask & 0xF) << 4) | (2u << 12) | (1u << 20);
+        if (e.sysval == 0) word(101u | (3u << 24)), word(operand), word(e.reg);
+        else if (e.sysval == 1) word(103u | (4u << 24)), word(operand), word(e.reg), word(1);
+        else return status::kNotSupported;
+      }
+    } else {
+      // the patch constants: the tessellation factors are system values with a name by domain (3 tri, 2... see the table), the rest plain registers
+      const uint32_t domain_kind = hs_[2];
+      for (uint32_t i = 0; i < pc_count_; ++i) {
+        const PatchElement& e = pc_[i];
+        for (uint32_t r = 0; r < e.rows; ++r) {
+          const uint32_t reg = e.start_row + r;
+          if (reg >= graphics::kMaxPatchRegisters) return status::kNotSupported;
+          uint32_t name = 0;
+          if (e.kind == 25) name = domain_kind == 3 ? 11 + r : domain_kind == 2 ? 17 + r : domain_kind == 1 ? (r == 0 ? 22 : 21) : 0;   // SV_TessFactor
+          else if (e.kind == 26) name = domain_kind == 3 ? 15 + r : domain_kind == 2 ? 20 : 0;                                              // SV_InsideTessFactor
+          const uint32_t operand = 2u | (name ? 1u << 4 : ((1u << e.cols) - 1) << (4 + e.start_col)) | (2u << 12) | (1u << 20);
+          if (name) word(103u | (4u << 24)), word(operand), word(reg), word(name);
+          else word(101u | (3u << 24)), word(operand), word(reg);
+        }
+      }
+    }
+    word(104u | (2u << 24)), word(temps_);
+    if (!shex->append(decl.view()) || !shex->append(out_.view())) return status::kNoMemory;
+    return status::kSuccess;
+  }
   const bool pixel = program_kind == 0, vertex = program_kind == 1, compute = program_kind == 5, geometry = program_kind == 2, domain = program_kind == 4;
   if (!pixel && !vertex && !compute && !geometry && !domain) return status::kNotSupported;
   if (domain) {
@@ -1938,21 +2050,52 @@ NtStatus D3d9Program::compile_dxil(allocators::IAllocator& allocator, ConstByteV
   ConstByteView bitcode;
   if (!program.try_subview(8 + uint64_t{bitcode_offset}, bitcode_size, &bitcode)) return status::kInvalidParameter;
   const uint32_t kind = version >> 16;
-  if (kind != 0 && kind != 1 && kind != 2 && kind != 4 && kind != 5) return status::kNotSupported;
+  if (kind != 0 && kind != 1 && kind != 2 && kind != 3 && kind != 4 && kind != 5) return status::kNotSupported;
   dxil::Module module(allocator);
   NtStatus s = dxil::read_module(allocator, bitcode, &module);
   if (s != status::kSuccess) return s;
   const dxil::Function* entry = nullptr;
+  uint32_t bodies = 0;
   for (const dxil::Function& f : module.functions.view()) {
     if (f.declaration) continue;
-    if (entry) return status::kNotSupported;   // (a library)
-    entry = &f;
+    ++bodies;
+    if (!entry) entry = &f;
   }
-  if (!entry) return status::kInvalidParameter;
-  Translator translator(allocator, module, *entry);
+  if (!entry || bodies > (kind == 3 ? 2u : 1u)) return entry ? status::kNotSupported : status::kInvalidParameter;   // (a library; a hull shader has its patch constant function too)
   ByteBuffer shex(allocator);
-  s = translator.run(kind, isg1, osg1, psg1, &shex);
-  if (s != status::kSuccess) return s;
+  if (kind == 3) {
+    // The control point function (the entry the metadata names) and the patch constant function make the two phases of the Shader Model 5 hull shader.
+    const dxil::Function* control = nullptr;
+    const dxil::Function* constant = nullptr;
+    uint32_t entry_value = kNone, patch_value = kNone;
+    {
+      Translator probe(allocator, module, *entry);
+      if ((s = probe.read_metadata_only()) != status::kSuccess) return s;
+      entry_value = probe.entry_value(), patch_value = probe.patch_function();
+    }
+    for (const dxil::Function& f : module.functions.view()) {
+      if (f.declaration) continue;
+      if (f.value == entry_value) control = &f;
+      if (f.value == patch_value) constant = &f;
+    }
+    if (!control || !constant || control == constant) return status::kNotSupported;
+    Translator first(allocator, module, *control), second(allocator, module, *constant);
+    ByteBuffer phase_one(allocator), phase_two(allocator);
+    if ((s = first.run(kind, isg1, osg1, psg1, &phase_one, 1)) != status::kSuccess || (s = second.run(kind, isg1, osg1, psg1, &phase_two, 2)) != status::kSuccess) return s;
+    const uint32_t* hs = first.hull_state();   // (control points in, out, domain, partitioning, output primitive, maximum factor)
+    if (hs[1] < 1 || hs[1] > graphics::kMaxPatchControlPoints || hs[2] < 1 || hs[2] > 3 || hs[3] < 1 || hs[3] > 4 || hs[4] < 1 || hs[4] > 4) return status::kNotSupported;
+    ByteBuffer body(allocator);
+    bool ok = body.put32(113u | (1u << 24)) &&                               // hs_decls
+              body.put32(147u | (hs[0] << 11) | (1u << 24)) && body.put32(148u | (hs[1] << 11) | (1u << 24)) && body.put32(149u | (hs[2] << 11) | (1u << 24)) &&
+              body.put32(150u | (hs[3] << 11) | (1u << 24)) && body.put32(151u | (hs[4] << 11) | (1u << 24)) && body.put32(152u | (2u << 24)) && body.put32(hs[5]) &&
+              body.put32(114u | (1u << 24)) && body.append(phase_one.view()) && body.put32(115u | (1u << 24)) && body.append(phase_two.view());
+    const uint64_t words = 2 + body.size() / 4;
+    if (!ok || words > 0xFFFF || !shex.put32((3u << 16) | (5u << 4)) || !shex.put32(static_cast<uint32_t>(words)) || !shex.append(body.view())) return status::kNoMemory;
+  } else {
+    Translator translator(allocator, module, *entry);
+    s = translator.run(kind, isg1, osg1, psg1, &shex);
+    if (s != status::kSuccess) return s;
+  }
 #ifdef DXIL_TRACE
   {
     ByteReader dump(shex.view());

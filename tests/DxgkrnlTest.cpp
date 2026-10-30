@@ -5269,6 +5269,38 @@ void test_dxil() {
       printf("  dxil dxil_ds_dent: 100 domain points compared\n");
     }
   }
+
+  // A hull shader (a control point function and a patch constant function): the control points and the tessellation factors.
+  {
+    UniquePointer<D3d9Program> reference, translated;
+    CHECK(load("dxil_hs_tri.dxbc", &reference) && load("dxil_hs_tri.dxil", &translated));
+    if (reference && translated) {
+      CHECK(translated->stage() == graphics::ShaderStage::Hull && translated->tess_domain() == graphics::TessDomain::Triangle && translated->tess_input_points() == 3 && translated->tess_output_points() == 3 &&
+            translated->tess_partitioning() == reference->tess_partitioning() && translated->tess_output() == reference->tess_output());
+      for (uint32_t n = 0; n < 50; ++n) {
+        graphics::HullInputData in;
+        in.control_points = 3;
+        for (uint32_t k = 0; k < 3; ++k) {
+          in.position[k] = {random(-1, 1), random(-1, 1), random(0, 1), random(0.5f, 2)};
+          in.varying[k][0] = {random(0, 1), random(0, 1), random(0, 1), random(0, 1)};
+          in.varying[k][2] = {random(0, 1), random(0, 1), 0, 0};
+        }
+        graphics::HullOutputData a, b;
+        uint8_t constants[128] = {};
+        reference->run_hull(in, constants, &a);
+        translated->run_hull(in, constants, &b);
+        bool same = true;
+        for (uint32_t k = 0; k < 3; ++k)
+          same = same && close_to(a.control_point[k].position.x, b.control_point[k].position.x) && close_to(a.control_point[k].position.w, b.control_point[k].position.w) &&
+                 close_to(a.control_point[k].varying[0].y, b.control_point[k].varying[0].y) && close_to(a.control_point[k].varying[2].x, b.control_point[k].varying[2].x);
+        for (uint32_t k = 0; k < 3; ++k) same = same && close_to(a.outer[k], b.outer[k]);
+        same = same && close_to(a.inner[0], b.inner[0]) && a.outer[0] == 2.0f && a.inner[0] == 2.0f;
+        if (!same && n < 2) printf("  hs #%u: outer %g %g %g inner %g cp0.x %g w %g v0.y %g | outer %g %g %g inner %g cp0.x %g w %g v0.y %g\n", n, a.outer[0], a.outer[1], a.outer[2], a.inner[0], a.control_point[0].position.x, a.control_point[0].position.w, a.control_point[0].varying[0].y, b.outer[0], b.outer[1], b.outer[2], b.inner[0], b.control_point[0].position.x, b.control_point[0].position.w, b.control_point[0].varying[0].y);
+        CHECK(same);
+      }
+      printf("  dxil dxil_hs_tri: 50 patches compared\n");
+    }
+  }
   // The compute shaders: the same buffers in, the same buffers out.
   {
     UniquePointer<D3d9Program> reference, translated;
@@ -5328,7 +5360,7 @@ void test_dxil() {
     }
   }
   // Truncated and with a bit flipped: refused or compiled, never a crash (and the sanitizers say nothing).
-  for (const char* name : {"dxil_ps_math.dxil", "dxil_ps_flow.dxil", "dxil_vs.dxil", "dxil_ps_tex.dxil", "dxil_cs_fill.dxil", "dxil_ps_loop.dxil", "dxil_cs_shared.dxil", "dxil_ps_more.dxil", "dxil_gs_copy.dxil", "dxil_ds_dent.dxil"}) {
+  for (const char* name : {"dxil_ps_math.dxil", "dxil_ps_flow.dxil", "dxil_vs.dxil", "dxil_ps_tex.dxil", "dxil_cs_fill.dxil", "dxil_ps_loop.dxil", "dxil_cs_shared.dxil", "dxil_ps_more.dxil", "dxil_gs_copy.dxil", "dxil_ds_dent.dxil", "dxil_hs_tri.dxil"}) {
     const std::vector<uint8_t> blob = read_blob(name);
     for (size_t n = 0; n < blob.size(); n += 11) {
       UniquePointer<D3d9Program> program;
