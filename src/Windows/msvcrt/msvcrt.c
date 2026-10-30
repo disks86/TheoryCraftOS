@@ -1905,6 +1905,7 @@ __asm__(
     ".globl _setjmp\n_setjmp:\n"
     ".globl __intrinsic_setjmp\n__intrinsic_setjmp:\n"
     ".globl _setjmpex\n_setjmpex:\n"
+    ".globl __intrinsic_setjmpex\n__intrinsic_setjmpex:\n"
     ".globl setjmp\nsetjmp:\n"
     "  movq %rdx, 0(%rcx)\n"
     "  movq %rbx, 8(%rcx)\n"
@@ -1962,7 +1963,7 @@ __asm__(
     "  movdqa 240(%rcx), %xmm15\n"
     "  movq 16(%rcx), %rsp\n"
     "  jmpq *80(%rcx)\n"
-    ".section .drectve\n.ascii \" -export:_setjmp -export:__intrinsic_setjmp -export:_setjmpex -export:setjmp -export:longjmp\"\n.text\n");
+    ".section .drectve\n.ascii \" -export:_setjmp -export:__intrinsic_setjmp -export:_setjmpex -export:__intrinsic_setjmpex -export:setjmp -export:longjmp\"\n.text\n");
 
 /* ====================================================================================================================================================================
  * Signals, exit, atexit and the start-up entry points of the runtime

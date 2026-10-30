@@ -1045,17 +1045,28 @@ EXPORT PVOID NTAPI RtlProcessHeap(void) { return process_heap(); }
 
 /* ---- critical sections (one thread: they only count) ---------------------------------------------------------------------------------------------------- */
 
-EXPORT NTSTATUS NTAPI RtlInitializeCriticalSection(PRTL_CRITICAL_SECTION cs) {
-  cs->DebugInfo = NULL;
+/* DebugInfo: -1 for a section without any (what Windows 8 and later give by default); a section made with RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO gets a record. */
+#define CS_FLAG_NO_DEBUG_INFO 0x01000000u
+#define CS_FLAG_DYNAMIC_SPIN 0x02000000u
+#define CS_FLAG_STATIC_INIT 0x04000000u
+#define CS_FLAG_RESOURCE_TYPE 0x08000000u
+#define CS_FLAG_FORCE_DEBUG_INFO 0x10000000u
+EXPORT NTSTATUS NTAPI RtlInitializeCriticalSectionEx(PRTL_CRITICAL_SECTION cs, ULONG spin, ULONG flags) {
+  if (flags & ~(CS_FLAG_NO_DEBUG_INFO | CS_FLAG_DYNAMIC_SPIN | CS_FLAG_STATIC_INIT | CS_FLAG_RESOURCE_TYPE | CS_FLAG_FORCE_DEBUG_INFO | 0x00FFFFFFu)) return STATUS_INVALID_PARAMETER;
+  cs->DebugInfo = (PVOID)(ULONG_PTR)-1;
+  if ((flags & CS_FLAG_FORCE_DEBUG_INFO) && !(flags & CS_FLAG_NO_DEBUG_INFO)) {
+    BYTE *info = RtlAllocateHeap(process_heap(), HEAP_ZERO_MEMORY, 0x30);
+    if (info) { memcpy(info + 8, &cs, 8); cs->DebugInfo = (PVOID)info; }
+  }
   cs->LockCount = -1;
   cs->RecursionCount = 0;
   cs->OwningThread = NULL;
   cs->LockSemaphore = NULL;
-  cs->SpinCount = 0;
+  cs->SpinCount = spin & 0x00FFFFFFu;
   return STATUS_SUCCESS;
 }
-EXPORT NTSTATUS NTAPI RtlInitializeCriticalSectionEx(PRTL_CRITICAL_SECTION cs, ULONG spin, ULONG flags) { (void)spin; (void)flags; return RtlInitializeCriticalSection(cs); }
-EXPORT NTSTATUS NTAPI RtlInitializeCriticalSectionAndSpinCount(PRTL_CRITICAL_SECTION cs, ULONG spin) { (void)spin; return RtlInitializeCriticalSection(cs); }
+EXPORT NTSTATUS NTAPI RtlInitializeCriticalSection(PRTL_CRITICAL_SECTION cs) { return RtlInitializeCriticalSectionEx(cs, 0, 0); }
+EXPORT NTSTATUS NTAPI RtlInitializeCriticalSectionAndSpinCount(PRTL_CRITICAL_SECTION cs, ULONG spin) { return RtlInitializeCriticalSectionEx(cs, spin, 0); }
 /* LockCount is -1 while the section is free, and the recursion depth minus one while a thread holds it. A thread that finds it taken gives its time slice away until the owner
  * has let go. */
 EXPORT NTSTATUS NTAPI RtlEnterCriticalSection(PRTL_CRITICAL_SECTION cs) {
@@ -1067,6 +1078,18 @@ EXPORT NTSTATUS NTAPI RtlEnterCriticalSection(PRTL_CRITICAL_SECTION cs) {
   }
   while (!__sync_bool_compare_and_swap(&cs->LockCount, -1, 0)) {
     if (g_process_ending) { cs->LockCount = 0; break; }      /* (the other threads are gone: a section one of them held is taken over rather than waited for) */
+    if (cs->LockSemaphore) {      /* a section somebody gave a semaphore: the wait is on it, and a handle that is not one is an error that cannot be carried on from */
+      LARGE_INTEGER none = { 0 };
+      __sync_add_and_fetch(&cs->LockCount, 1);
+      if (NtWaitForSingleObject(cs->LockSemaphore, FALSE, &none) == STATUS_INVALID_HANDLE) {
+        EXCEPTION_RECORD record;
+        memset(&record, 0, sizeof(record));
+        record.ExceptionCode = STATUS_INVALID_HANDLE;
+        record.ExceptionFlags = 1 /* EXCEPTION_NONCONTINUABLE */;
+        RtlRaiseException(&record);
+      }
+      __sync_sub_and_fetch(&cs->LockCount, 1);
+    }
     NtYieldExecution();
   }
   cs->OwningThread = me;
@@ -1088,7 +1111,14 @@ EXPORT NTSTATUS NTAPI RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION cs) {
   __sync_lock_test_and_set(&cs->LockCount, -1);
   return STATUS_SUCCESS;
 }
-EXPORT NTSTATUS NTAPI RtlDeleteCriticalSection(PRTL_CRITICAL_SECTION cs) { cs->LockCount = -1; cs->RecursionCount = 0; cs->OwningThread = NULL; return STATUS_SUCCESS; }
+EXPORT NTSTATUS NTAPI RtlDeleteCriticalSection(PRTL_CRITICAL_SECTION cs) {
+  if (cs->DebugInfo && cs->DebugInfo != (PVOID)(ULONG_PTR)-1) RtlFreeHeap(process_heap(), 0, cs->DebugInfo);
+  cs->DebugInfo = NULL;
+  cs->LockCount = -1;
+  cs->RecursionCount = 0;
+  cs->OwningThread = NULL;
+  return STATUS_SUCCESS;
+}
 
 /* ---- exceptions: unwinding, dispatching, __C_specific_handler ----------------------------------------------------------------------------------------------- */
 
