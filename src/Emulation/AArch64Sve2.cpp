@@ -27,6 +27,9 @@ using namespace sve;
 
 namespace {
 
+// The low 64 bits of a product (wrapping, so a 64-bit element times itself is not signed overflow).
+uint64_t product_bits(int64_t a, int64_t b) { return static_cast<uint64_t>(a) * static_cast<uint64_t>(b); }
+
 // A signed 64 x 64 product as a 128-bit integer (built from the unsigned product, so that no compiler runtime routine is needed).
 I128 multiply_signed(int64_t a, int64_t b) {
   const bool negative = (a < 0) != (b < 0);
@@ -304,12 +307,12 @@ bool AArch64Cpu::sve2(uint32_t insn) {
           }
           const uint64_t accr = get(*dst, esz, 2 * p), acci = get(*dst, esz, 2 * p + 1);
           if (!saturating) {
-            put(dst, esz, 2 * p, (accr + static_cast<uint64_t>(s1 * (t1a * t1b))) & ones(w));
-            put(dst, esz, 2 * p + 1, (acci + static_cast<uint64_t>(s2 * (t2a * t2b))) & ones(w));
+            put(dst, esz, 2 * p, (accr + (s1 > 0 ? product_bits(t1a, t1b) : uint64_t{0} - product_bits(t1a, t1b))) & ones(w));
+            put(dst, esz, 2 * p + 1, (acci + (s2 > 0 ? product_bits(t2a, t2b) : uint64_t{0} - product_bits(t2a, t2b))) & ones(w));
           } else {
             bool sat = false;
-            const I128 r1 = doubling_high(signed_of(accr, w), s1 * multiply_signed(t1a, t1b), w, true);
-            const I128 r2 = doubling_high(signed_of(acci, w), s2 * multiply_signed(t2a, t2b), w, true);
+            const I128 r1 = doubling_high(signed_of(accr, w), (s1 > 0 ? multiply_signed(t1a, t1b) : -multiply_signed(t1a, t1b)), w, true);
+            const I128 r2 = doubling_high(signed_of(acci, w), (s2 > 0 ? multiply_signed(t2a, t2b) : -multiply_signed(t2a, t2b)), w, true);
             put(dst, esz, 2 * p, saturate_to_signed(r1, w, &sat));
             put(dst, esz, 2 * p + 1, saturate_to_signed(r2, w, &sat));
           }
@@ -530,12 +533,12 @@ bool AArch64Cpu::sve2(uint32_t insn) {
           }
           const uint64_t accr = get(*dst, e, 2 * p), acci = get(*dst, e, 2 * p + 1);
           if (!saturating) {
-            put(dst, e, 2 * p, (accr + static_cast<uint64_t>(s1 * (t1a * t1b))) & ones(ew));
-            put(dst, e, 2 * p + 1, (acci + static_cast<uint64_t>(s2 * (t2a * t2b))) & ones(ew));
+            put(dst, e, 2 * p, (accr + (s1 > 0 ? product_bits(t1a, t1b) : uint64_t{0} - product_bits(t1a, t1b))) & ones(ew));
+            put(dst, e, 2 * p + 1, (acci + (s2 > 0 ? product_bits(t2a, t2b) : uint64_t{0} - product_bits(t2a, t2b))) & ones(ew));
           } else {
             bool sat = false;
-            const I128 r1 = doubling_high(signed_of(accr, ew), s1 * multiply_signed(t1a, t1b), ew, true);
-            const I128 r2 = doubling_high(signed_of(acci, ew), s2 * multiply_signed(t2a, t2b), ew, true);
+            const I128 r1 = doubling_high(signed_of(accr, ew), (s1 > 0 ? multiply_signed(t1a, t1b) : -multiply_signed(t1a, t1b)), ew, true);
+            const I128 r2 = doubling_high(signed_of(acci, ew), (s2 > 0 ? multiply_signed(t2a, t2b) : -multiply_signed(t2a, t2b)), ew, true);
             put(dst, e, 2 * p, saturate_to_signed(r1, ew, &sat));
             put(dst, e, 2 * p + 1, saturate_to_signed(r2, ew, &sat));
           }

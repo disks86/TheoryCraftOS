@@ -24,9 +24,11 @@ namespace emulation {
 
 // An AArch64 (A64) user-mode interpreter: the integer instruction set, loads and stores (including pairs, exclusives and the LSE atomics), scalar floating point
 // (soft-float, with fused multiply-add and the AArch64 NaN rules), and a subset of Advanced SIMD that covers what compilers emit for integer and floating-point loops
-// and memcpy-style code. Unimplemented encodings (SVE, crypto, half-precision, the rarer NEON forms) stop the program with an invalid-instruction fault.
+// and memcpy-style code, the cryptographic extensions, and SVE / SVE2 at a vector length of 128 bits. Unimplemented encodings (SME, the newest extensions) stop the program with an
+// invalid-instruction fault.
 //
-// Source files: AArch64Cpu.cpp (this class's core, integer, branches, loads and stores), AArch64Fp.cpp (scalar FP), AArch64Simd.cpp (Advanced SIMD).
+// Source files: AArch64Cpu.cpp (this class's core, integer, branches, loads and stores), AArch64Fp.cpp (scalar FP), AArch64Simd.cpp and AArch64Neon*.cpp (Advanced SIMD), AArch64Crypto.cpp,
+// AArch64Sve*.cpp and AArch64Sve2.cpp (SVE).
 class AArch64Cpu final : public IGuestCpu {
  public:
   struct Vec {
