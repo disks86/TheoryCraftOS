@@ -43,6 +43,13 @@ bool textured_fragment(const Vec4* varyings, const uint8_t*, const ITextureSet& 
   return true;
 }
 
+bool textured_scaled_fragment(const Vec4* varyings, const uint8_t* constants, const ITextureSet& textures, Vec4* color) {
+  const Vec4 texel = textures.sample(0, varyings[0].x, varyings[0].y);
+  const float k = reinterpret_cast<const float*>(constants)[16];   // (the push constant after the matrix)
+  *color = Vec4{texel.x * k, texel.y * k, texel.z * k, texel.w * k};
+  return true;
+}
+
 // Push constants are CONST[0..3], the columns of the matrix.
 constexpr const char kColoredVertexTgsi[] =
     "VERT\n"
@@ -78,6 +85,20 @@ constexpr const char kTexturedFragmentTgsi[] =
     "DCL SVIEW[0], 2D, FLOAT\n"
     "  0: TEX OUT[0], IN[0], SAMP[0], 2D\n"
     "  1: END\n";
+
+// The textured fragment shader that scales the texel (all four channels) by CONST[4].x, the float after the matrix.
+constexpr const char kTexturedScaledFragmentTgsi[] =
+    "FRAG\n"
+    "PROPERTY FS_COLOR0_WRITES_ALL_CBUFS 1\n"
+    "DCL IN[0], GENERIC[0], PERSPECTIVE\n"
+    "DCL OUT[0], COLOR\n"
+    "DCL SAMP[0]\n"
+    "DCL SVIEW[0], 2D, FLOAT\n"
+    "DCL CONST[4]\n"
+    "DCL TEMP[0]\n"
+    "  0: TEX TEMP[0], IN[0], SAMP[0], 2D\n"
+    "  1: MUL OUT[0], TEMP[0], CONST[4].xxxx\n"
+    "  2: END\n";
 
 // The same two shaders as Direct3D 9 bytecode (vs_2_0, ps_2_0). Position comes in as v0, color as v1; the matrix columns are c0..c3, and c31 is
 // the device's (1, -1, 1, 1) that turns Direct3D's +Y up into Vulkan's +Y down.
@@ -139,6 +160,14 @@ ShaderModuleDesc textured_fragment_shader() {
   d.textured_fragment_function = textured_fragment;
   d.tgsi = kTexturedFragmentTgsi;
   d.eu_program = EuProgram::TexturedFragment;
+  return d;
+}
+
+ShaderModuleDesc textured_scaled_fragment_shader() {
+  ShaderModuleDesc d;
+  d.stage = ShaderStage::Fragment;
+  d.textured_fragment_function = textured_scaled_fragment;
+  d.tgsi = kTexturedScaledFragmentTgsi;   // (no Direct3D 9, QPU or Intel program: those devices refuse the pipeline)
   return d;
 }
 

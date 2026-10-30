@@ -47,6 +47,14 @@ struct TexturedVertex {
 };
 ShaderModuleDesc textured_vertex_shader();
 ShaderModuleDesc textured_fragment_shader();
+// The same, with every channel of the texel multiplied by the float that follows the matrix in the push constants (80 bytes in all): a picture drawn at an opacity.
+// Only the software and virgl devices have it.
+struct TexturedScaledConstants {
+  Mat4 mvp;
+  float scale;
+  float pad[3];
+};
+ShaderModuleDesc textured_scaled_fragment_shader();
 // Fills in the vertex layout of TexturedVertex and the one texture (shaders left for the caller).
 void describe_textured_pipeline(GraphicsPipelineDesc* desc);
 

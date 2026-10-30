@@ -133,6 +133,21 @@ class IRenderer2D {
     return false;
   }
 
+  // Offscreen groups. begin_group() starts a transparent picture covering `bounds` (target coordinates, clipped to the target): everything drawn until
+  // the matching end_group() is drawn into it, with the same coordinates and the clip stack of the group alone (pushes left open are dropped), and
+  // nothing reaches the target. end_group() then lays the picture over the target: a point (x, y) of it, in the coordinates it was drawn in, lands at
+  // m(x, y), filtered by `filter`, the whole thing at `opacity` (0..255), inside the clip in force at begin_group(). Groups nest.
+  // begin_group() returns false, with nothing started, when this renderer cannot (the default: no offscreen targets, too deep, out of memory,
+  // or a layer's per-shape opacity is open); end_group() is called if and only if it returned true, and returns false if the picture could not be put on the target.
+  virtual bool begin_group(const Rect2D& bounds) {
+    (void)bounds;
+    return false;
+  }
+  virtual bool end_group(const Matrix2D& m, uint8_t opacity, ImageFilter filter) {
+    (void)m, (void)opacity, (void)filter;
+    return false;
+  }
+
   // Fills `rect` with a gradient along the line from `from` to `to` (pixel coordinates; stops at 0 and 1 are
   // at those points, the ends extend as flat color). Stops must be sorted by offset; at most
   // kMaxGradientStops are used; no stops draws nothing; one stop is a flat fill.
