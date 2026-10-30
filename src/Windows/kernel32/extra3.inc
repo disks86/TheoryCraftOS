@@ -32,27 +32,29 @@ static BOOL wide_is_letter(WCHAR c) {
 #define C1_XDIGIT_ 0x80
 #define C1_ALPHA_ 0x100
 #define C1_DEFINED_ 0x200
-static WORD ctype1(WCHAR c) {
-  WORD t = 0;
-  if (c < 0x20 || c == 0x7F || (c >= 0x80 && c < 0xA0)) t |= C1_CNTRL_;
-  if (c == ' ' || (c >= 9 && c <= 13) || c == 0xA0 || c == 0x2000 || c == 0x3000) t |= C1_SPACE_;
-  if (c == ' ' || c == 9 || c == 0xA0) t |= C1_BLANK_;
-  if (c >= '0' && c <= '9') t |= C1_DIGIT_ | C1_XDIGIT_;
-  if ((c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f')) t |= C1_XDIGIT_;
-  if (wide_is_letter(c)) { t |= C1_ALPHA_; if (wide_lower(c) != c) t |= C1_UPPER_; else if (wide_upper(c) != c) t |= C1_LOWER_; }
-  if (c < 0x80 ? ((c >= 0x21 && c <= 0x2F) || (c >= 0x3A && c <= 0x40) || (c >= 0x5B && c <= 0x60) || (c >= 0x7B && c <= 0x7E))
-               : ((c >= 0xA1 && c <= 0xBF && c != 0xAA && c != 0xB5 && c != 0xBA) || c == 0xD7 || c == 0xF7 || (c >= 0x2010 && c <= 0x2027) || (c >= 0x3001 && c <= 0x3003)))
-    t |= C1_PUNCT_;
-  if (c != 0xFFFF && c != 0xFFFE) t |= C1_DEFINED_;
-  return t;
+#include "ctype_data.inc"
+static BOOL fold_digit(DWORD cp, DWORD *ascii);
+/* The classes of a character: the three words of GetStringType. */
+static void ctype_of(WCHAR c, WORD *c1, WORD *c2, WORD *c3) {
+  SIZE_T lo = 0, hi = sizeof(k_ctype_runs) / sizeof(k_ctype_runs[0]);
+  *c1 = *c2 = *c3 = 0;
+  while (lo < hi) {
+    const SIZE_T mid = lo + (hi - lo) / 2;
+    if (c < k_ctype_runs[mid].first) hi = mid;
+    else if (c > k_ctype_runs[mid].last) lo = mid + 1;
+    else { *c1 = k_ctype_runs[mid].c1; *c2 = k_ctype_runs[mid].c2; *c3 = k_ctype_runs[mid].c3; break; }
+  }
+  DWORD ascii;
+  if ((*c1 & C1_DIGIT_) && c != 0xB2 && c != 0xB3 && c != 0xB9 && !fold_digit(c, &ascii)) *c1 &= (WORD)~C1_DIGIT_;
 }
+static WORD ctype1(WCHAR c) { WORD c1, c2, c3; ctype_of(c, &c1, &c2, &c3); return c1; }
 EXPORT BOOL WINAPI GetStringTypeW(DWORD info_type, LPCWSTR source, int count, LPWORD types) {
   if (!source || !types || (info_type != 1 && info_type != 2 && info_type != 4)) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
   if (count < 0) count = (int)wcslen(source);
   for (int i = 0; i < count; ++i) {
-    if (info_type == 1) types[i] = ctype1(source[i]);
-    else if (info_type == 2) types[i] = source[i] >= 0x590 && source[i] <= 0x8FF ? 2 /* C2_RIGHTTOLEFT */ : (ctype1(source[i]) & C1_CNTRL_ ? 0 : 1 /* C2_LEFTTORIGHT */);
-    else types[i] = (ctype1(source[i]) & C1_ALPHA_) ? 0x8000 /* C3_ALPHA */ : 0;
+    WORD c1, c2, c3;
+    ctype_of(source[i], &c1, &c2, &c3);
+    types[i] = info_type == 1 ? c1 : info_type == 2 ? c2 : c3;
   }
   return TRUE;
 }
