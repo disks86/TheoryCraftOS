@@ -1018,7 +1018,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         if ((s = to_src(value, &ins.src[1])) != status::kSuccess) return s;
         ins.src_count = 2;
       }
-    } else if (opcode == kSample4) {
+    } else if (opcode == kSample4 || opcode == 109) {   // (sample, and gather4)
       if (vertex || compute) return status::kNotSupported;   // (no textures in the vertex stage)
       Operand d, coordinate, resource, sampler;
       if ((s = read_operand(p, &d)) != status::kSuccess || (s = read_operand(p, &coordinate)) != status::kSuccess || (s = read_operand(p, &resource)) != status::kSuccess ||
@@ -1035,15 +1035,20 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         return status::kNotSupported;
       }
       if (resource.type != kOpResource || unit >= graphics::kMaxTextureUnits || sampler.type != kOpSampler) return status::kNotSupported;
-      ins.op = kTexLd;
+      ins.op = opcode == 109 ? kTexGather : kTexLd;
       s = to_dst(d, &ins.dst);
       if (s != status::kSuccess) return s;
       s = to_src(coordinate, &ins.src[0]);
       if (s != status::kSuccess) return s;
       ins.src[1].type = kSampler, ins.src[1].number = static_cast<uint16_t>(unit);
       ins.src_count = 2;
-      if (resource.components == 2)
+      if (opcode == 109) {
+        // (the component to gather is the resource operand's single selected one; no gather of volumes, cubes and arrays)
+        if (program->texture_kind_[unit] != graphics::TextureKind::Texture2D || resource.components != 2) return status::kNotSupported;
+        ins.control = resource.swizzle[0];
+      } else if (resource.components == 2) {
         for (uint32_t k = 0; k < 4; ++k) ins.tex_swizzle[k] = resource.swizzle[k];
+      }
       program->uses_textures_ = true;
     } else {
       const Alu* alu = nullptr;

@@ -881,6 +881,24 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
         store(ins.dst, b);
         break;
       }
+      case kTexGather: {
+        // The four texels of the bilinear footprint of (u, v), component `control` of each: x (i0, j0 + 1), y (i1, j0 + 1), z (i1, j0), w (i0, j0). Each is looked up by a filtered sample at
+        // the middle of its texel, so that the sampler's address mode (wrap, clamp, mirror) does what it does for any other lookup.
+        b = {{0, 0, 0, 0}};
+        const uint32_t unit = ins.src[1].number;
+        uint32_t w = 0, h = 0, levels = 0;
+        if (s.textures && unit < graphics::kMaxTextureUnits && s.textures->size(unit, 0, &w, &h, &levels) && w && h) {
+          const float x = __builtin_floorf(a.f[0] * static_cast<float>(w) - 0.5f), y = __builtin_floorf(a.f[1] * static_cast<float>(h) - 0.5f);
+          const float xs[4] = {x, x + 1, x + 1, x}, ys[4] = {y + 1, y + 1, y, y};
+          for (uint32_t k = 0; k < 4; ++k) {
+            const graphics::Vec4 t = s.textures->sample_lod(unit, (xs[k] + 0.5f) / static_cast<float>(w), (ys[k] + 0.5f) / static_cast<float>(h), 0.0f);
+            const float texel[4] = {t.x, t.y, t.z, t.w};
+            b.f[k] = texel[ins.control & 3];
+          }
+        }
+        store(ins.dst, b);
+        break;
+      }
       case kTexKill: {
         const Q t = fetch(ins.src[0], 0);
         if (t.f[0] < 0 || t.f[1] < 0 || t.f[2] < 0) {

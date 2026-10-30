@@ -5238,6 +5238,38 @@ void test_dxil() {
     }
   }
 
+  // gather4 (GatherRed / GatherGreen of a 2D texture): the footprint's four texels in the order x (i0, j1), y (i1, j1), z (i1, j0), w (i0, j0); the fake texture's lookups give the texel
+  // middle's coordinates halved, so the golden is computed from the same footprint.
+  {
+    UniquePointer<D3d9Program> translated;
+    CHECK(load("dxil_ps_gather.dxil", &translated));
+    if (translated) {
+      if (getenv("TGSI_DUMP")) {
+        String text(allocator);
+        translated->emit_tgsi(&text);
+        printf("%.*s\n", static_cast<int>(text.size()), text.data());
+      }
+      for (uint32_t n = 0; n < 200; ++n) {
+        graphics::Vec4 varyings[4] = {};
+        varyings[2] = {random(0, 1), random(0, 1), 0, 0};
+        graphics::Vec4 room[graphics::kMaxColorTargets] = {};
+        uint8_t constants[128] = {};
+        const bool alive = translated->run_fragment_ex(varyings, graphics::FragmentContext(), constants, &textures, room);
+        auto footprint = [&](float u, float v, float* red, float* green) {
+          const float x = __builtin_floorf(u * 8.0f - 0.5f), y = __builtin_floorf(v * 4.0f - 0.5f);
+          const float xs[4] = {x, x + 1, x + 1, x}, ys[4] = {y + 1, y + 1, y, y};
+          for (uint32_t k = 0; k < 4; ++k) red[k] = (xs[k] + 0.5f) / 16.0f, green[k] = (ys[k] + 0.5f) / 8.0f;
+        };
+        float g_red[4], g[4], r[4], r_green[4];
+        footprint(varyings[2].x, varyings[2].y, g_red, g);
+        footprint(varyings[2].x * 0.9f, varyings[2].y * 0.9f, r, r_green);
+        const float want[4] = {g[0] + g[3] * 2.0f, g[1] * 0.5f + g[2], r[0] + r[1] * 2.0f, r[2] * 0.25f + r[3]};
+        const bool same = alive && close_to(room[0].x, want[0]) && close_to(room[0].y, want[1]) && close_to(room[0].z, want[2]) && close_to(room[0].w, want[3]);
+        if (!same && n < 3) printf("  gather #%u: %g %g %g %g wants %g %g %g %g\n", n, room[0].x, room[0].y, room[0].z, room[0].w, want[0], want[1], want[2], want[3]);
+        CHECK(same);
+      }
+    }
+  }
   // atan, asin and acos (polynomials in the translation): compared with libm within 1e-4.
   {
     UniquePointer<D3d9Program> translated;

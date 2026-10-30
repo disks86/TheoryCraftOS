@@ -41,7 +41,7 @@ enum Opcode : uint16_t {
   // Loops (Shader Model 4): `target` of a loop is the instruction after its endloop, of an endloop the one after its loop; break leaves, continue goes to the endloop.
   // Texture access of Shader Model 4: ld (src[0] the integer coordinates, x y in the first two components and the level in the last; src[1] the unit), sample_l (src[0] the
   // coordinate, src[1] the unit, src[2] the level), resinfo (src[0] the level, src[1] the unit; control: 0 floats, 1 reciprocals, 2 unsigned integers).
-  kTexFetch = 0x1300, kTexLod, kTexSize, kTexFetchMs, kTexSamples,   // (kTexFetchMs: ld_ms, src[2] the sample; kTexSamples: sampleinfo, a constant: control the count, tex_swizzle[0] 1 for an unsigned result)
+  kTexFetch = 0x1300, kTexLod, kTexSize, kTexFetchMs, kTexSamples, kTexGather,   // (kTexFetchMs: ld_ms, src[2] the sample; kTexGather: gather4, src[0] the coordinate, src[1] the unit, control the component (0..3) of the four texels returned; kTexSamples: sampleinfo, a constant: control the count, tex_swizzle[0] 1 for an unsigned result)
   // Storage buffers (compute shaders, Shader Model 5): kBufLoad (dst; src[0] the byte address or the structure index, src[1] the byte offset in the structure; tex_swizzle picks the loaded
   // words), kBufStore (dst.mask: how many words; src[2] the value), kBufAtomic / kBufImmAtomic (src[0] the address, src[1] the operand; the second also writes the old value to dst). The
   // buffer is `uav`; `stride` is 0 for a raw buffer (byte address) and the structure size for a structured one; an atomic's kind is `control` (AtomicKind).

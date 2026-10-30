@@ -381,6 +381,15 @@ void scene_dxbc_texture_linear(Rig& rig, ArrayView<uint32_t> out) {
   textured_quad(rig, pipe, texture, target, graphics::Filter::Linear, out);
 }
 
+// gather4 (dxil_ps_gather.hlsl): the four texels of the footprint, green and red, over the checker texture; a linear sampler (gather ignores the filter, not the address mode).
+void scene_dxil_gather(Rig& rig, ArrayView<uint32_t> out) {
+  namespace b = conformance_blobs;
+  Handle pipe = dxbc_pipeline(rig, b::k_vs, sizeof b::k_vs, b::k_dxil_ps_gather, sizeof b::k_dxil_ps_gather, 1);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle texture = checker(rig);
+  textured_quad(rig, pipe, texture, target, graphics::Filter::Linear, out);
+}
+
 // Draw a picture into a texture, then draw the texture onto the screen: a Direct3D 9 render target that is also a texture, and every Direct3D 11 / 12 post-processing step.
 void scene_render_to_texture(Rig& rig, ArrayView<uint32_t> out) {
   namespace b = conformance_blobs;
@@ -2264,6 +2273,7 @@ const Entry kScenes[] = {
     {"Direct3D 12 DXIL compute shader (Shader Model 6)", scene_dxil_compute},
     {"Direct3D 12 DXIL geometry shader (Shader Model 6)", scene_dxil_geometry},
     {"Direct3D 12 DXIL hull and domain shaders (Shader Model 6)", scene_dxil_tess},
+    {"Direct3D 12 DXIL gather4 (Shader Model 6)", scene_dxil_gather},
     {"Direct3D 12 DXIL buffer shader resource views (Shader Model 6)", scene_dxil_compute_srv},
     {"Direct3D 12 DXIL group-shared memory, barriers and a loop (Shader Model 6)", scene_dxil_compute_shared},
     {"Direct3D 11 stream output of two streams (DXBC)", scene_stream_output},

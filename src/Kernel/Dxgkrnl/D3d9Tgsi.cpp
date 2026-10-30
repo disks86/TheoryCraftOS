@@ -902,6 +902,29 @@ bool TgsiEmitter::instruction(const Instr& ins) {
       line("MOV", &w, &old_all);
       break;
     }
+    case kTexGather: {
+      // gather4: TG4 takes the component (an integer immediate) between the coordinate and the sampler
+      t = begin_result(ins, false, &direct);
+      const uint32_t unit = ins.src[1].number;
+      if (unit >= graphics::kMaxTextureUnits) {
+        unsupported_ = true;
+        break;
+      }
+      sampler_used_[unit] = true;
+      const uint8_t xyxy[4] = {0, 1, 0, 1};
+      const String coordinate = operand(ins.src[0], 0, 0, xyxy, false);
+      String sampler = str();
+      add(sampler, "SAMP[");
+      add_uint(sampler, unit);
+      add(sampler, "], ");
+      add(sampler, dimension_name(p_.texture_kind(unit)));
+      String component = str();
+      add(component, "IMM[");
+      add_uint(component, imm4_bits(ins.control & 3, ins.control & 3, ins.control & 3, ins.control & 3));
+      add(component, "].xxxx");
+      line("TG4", &t, &coordinate, &component, &sampler);
+      break;
+    }
     case kTexSamples: {
       // (the count the shader declared the texture with: a constant)
       t = begin_result(ins, true, &direct);
