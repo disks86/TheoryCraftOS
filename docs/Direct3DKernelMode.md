@@ -246,7 +246,7 @@ blends on linear values and stores the encoded result (a clear colour is linear 
 it. **16-bit:** the CPU renderer keeps Vec4s rounded to 1/65535 (clamped to 0..1); the memory manager converts the backing to and from them. **Integer:** the Vec4s hold the integers as float bits - a pixel
 shader writes them as bits (`SV_Target` of `uint4`), `Load` returns the bits, the clear colour of a pass is the integers as float bits (not checked for finiteness), a pipeline that blends cannot draw
 into one (refused) and sampling with a filter is meaningless (use `ld`; `Sample` of an integer texture returns garbage). virgl does sRGB (`B8G8R8A8_SRGB`, 100) and 16-bit normalised
-(`R16G16B16A16_UNORM`, 51) and not the integer format (no `R8G8B8A8` sRGB either); both ids were right on the host.
+(`R16G16B16A16_UNORM`, 51) and the integer format (`R32G32B32A32_UINT`, 196; the ids come from virglrenderer's `virgl_hw.h`), not `R8G8B8A8` sRGB; all the ids were right on the host.
 
 ## Tessellation
 

@@ -2160,6 +2160,121 @@ static void test_net_lifecycle() {
   }
 }
 
+
+// ---- power: sleep, runtime power management, wake
+
+static void test_power() {
+  TestAllocator alloc;
+  fake_tb::FakePci pci;
+  fake_tb::FakePci::Function nhi;
+  nhi.info.address = {5, 0, 0};
+  nhi.info.vendor_id = 0x8086;
+  nhi.info.device_id = 0x15BF;
+  nhi.pm = true;
+  pci.functions.push_back(nhi);
+  const PciAddress address = {5, 0, 0};
+  auto& fn = pci.functions[0];
+  {
+    TbPciPower power(pci, address);
+    CHECK(power.available() && power.can_wake() && power.state() == 0 && !power.wake_pending());
+    CHECK(power.enter_d3hot(true) && power.state() == 3 && (fn.pmcsr & 0x100));
+    pci.set_wake_pending(address);
+    CHECK(power.wake_pending());
+    CHECK(power.enter_d0() && power.state() == 0 && !(fn.pmcsr & 0x100) && !power.wake_pending());
+    CHECK(power.enter_d3hot(false) && !(fn.pmcsr & 0x100) && power.enter_d0());
+    fn.pme_from_d3hot = false;
+    CHECK(!power.can_wake() && !power.enter_d3hot(true) && power.state() == 0 && power.enter_d3hot(false) && power.state() == 3 && power.enter_d0());
+    fn.pme_from_d3hot = true;
+    TbPciPower none(pci, {9, 9, 9});
+    CHECK(!none.available() && !none.can_wake() && none.state() == 0xFF && !none.enter_d3hot(false) && !none.enter_d0() && !none.wake_pending());
+  }
+  // sleep with the wake-up armed: the controller told, the function in D3hot with PME; back up with PME off
+  {
+    FakeNhi chip;
+    ThunderboltDriver driver(alloc);
+    CHECK(driver.start_device(chip) == ThunderboltDriver::Outcome::Started);
+    driver.attach_power(pci, address);
+    chip.send_device_connected(make_device(0x20, 1, 1), true);
+    driver.poll();
+    chip.mailbox_commands.clear();
+    CHECK(driver.suspend(true) && driver.wake_armed() && fn.pmcsr == 0x103);
+    CHECK(chip.mailbox_commands.size() == 2 && chip.mailbox_commands[0] == 0x05 && chip.mailbox_commands[1] == 0x07);
+    pci.set_wake_pending(address);
+    CHECK(driver.wake_pending());
+    CHECK(driver.resume() == ThunderboltDriver::Outcome::Started && !driver.wake_armed() && (fn.pmcsr & 0x3) == 0 && !(fn.pmcsr & 0x100) && !driver.wake_pending());
+    // sleep without a wake-up
+    CHECK(driver.suspend(false) && !driver.wake_armed() && fn.pmcsr == 0x003);
+    CHECK(driver.resume() == ThunderboltDriver::Outcome::Started);
+    // a function that cannot wake from D3hot still sleeps, and says it cannot
+    fn.pme_from_d3hot = false;
+    CHECK(driver.suspend(true) && !driver.wake_armed() && (fn.pmcsr & 0x3) == 3 && !(fn.pmcsr & 0x100));
+    CHECK(driver.resume() == ThunderboltDriver::Outcome::Started);
+    fn.pme_from_d3hot = true;
+    // not started: nothing to put to sleep
+    ThunderboltDriver idle(alloc);
+    CHECK(!idle.suspend(true) && !idle.runtime_suspend() && !idle.wake_pending());
+  }
+  // without the power management capability the controller still sleeps
+  {
+    fake_tb::FakePci bare;
+    fake_tb::FakePci::Function f = nhi;
+    f.pm = false;
+    bare.functions.push_back(f);
+    FakeNhi chip;
+    ThunderboltDriver driver(alloc);
+    CHECK(driver.start_device(chip) == ThunderboltDriver::Outcome::Started);
+    driver.attach_power(bare, address);
+    CHECK(driver.suspend(true) && !driver.wake_armed() && driver.resume() == ThunderboltDriver::Outcome::Started);
+  }
+  // runtime power management: only if the firmware says it supports it, never while it vetoes it or a path to another host is open
+  {
+    FakeNhi chip;
+    chip.rtd3 = false;
+    ThunderboltDriver driver(alloc);
+    CHECK(driver.start_device(chip) == ThunderboltDriver::Outcome::Started);
+    driver.attach_power(pci, address);
+    CHECK(!driver.icm()->runtime_allowed() && !driver.runtime_suspend() && driver.icm()->running() && (fn.pmcsr & 3) == 0);
+  }
+  {
+    FakeNhi chip;
+    chip.rtd3 = true;
+    ThunderboltDriver driver(alloc);
+    CHECK(driver.start_device(chip) == ThunderboltDriver::Outcome::Started);
+    driver.attach_power(pci, address);
+    ThunderboltIcm& icm = *driver.icm();
+    CHECK(icm.driver_ready().rtd3 && icm.runtime_allowed());
+    // a veto from the firmware (its reason is not zero) holds it back until the firmware lifts it
+    chip.send_icm_event({10u | (1u << 24), 0x4});
+    driver.poll();
+    CHECK(icm.rtd3_vetoed() && !icm.runtime_allowed() && !driver.runtime_suspend() && icm.running());
+    chip.send_icm_event({10u | (1u << 24), 0});
+    driver.poll();
+    CHECK(!icm.rtd3_vetoed() && icm.runtime_allowed());
+    chip.send_icm_event({10u | (1u << 24)});                              // (cut short: ignored)
+    driver.poll();
+    CHECK(!icm.rtd3_vetoed());
+    // a path to another host keeps it awake
+    uint8_t remote[16], local[16];
+    for (int i = 0; i < 16; ++i) { remote[i] = static_cast<uint8_t>(0x40 + i); local[i] = static_cast<uint8_t>(0xC0 + i); }
+    memcpy(chip.remote.uuid, remote, 16);
+    chip.remote.block = remote_block();
+    chip.send_xdomain_connected(remote, local, 1, 1, 0x01);
+    driver.poll();
+    CHECK(icm.xdomain_count() == 1 && icm.approve_xdomain_paths(0, 8, 1, 9, 1, nullptr) && !icm.runtime_allowed() && !driver.runtime_suspend());
+    CHECK(icm.disconnect_xdomain_paths(0) && icm.runtime_allowed());
+    // the suspend itself: the controller is told the driver goes away, without saving devices, the function sleeps with its wake armed
+    chip.send_device_connected(make_device(0x20, 1, 1), true);
+    driver.poll();
+    chip.mailbox_commands.clear();
+    CHECK(driver.runtime_suspend() && driver.wake_armed() && fn.pmcsr == 0x103 && !icm.running());
+    CHECK(chip.mailbox_commands.size() == 1 && chip.mailbox_commands[0] == 0x07);
+    CHECK(driver.resume() == ThunderboltDriver::Outcome::Started && icm.running() && (fn.pmcsr & 3) == 0);
+    // (the veto is forgotten over the sleep: the firmware sends it again if it still holds)
+    CHECK(!icm.rtd3_vetoed());
+  }
+  CHECK(alloc.dma.empty());
+}
+
 static void test_driver() {
   TestAllocator alloc;
   {
@@ -2233,6 +2348,7 @@ int main() {
   test_net_messages();
   test_net();
   test_net_lifecycle();
+  test_power();
   test_driver();
   printf(g_failed ? "ThunderboltTest: %d FAILED\n" : "ThunderboltTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;

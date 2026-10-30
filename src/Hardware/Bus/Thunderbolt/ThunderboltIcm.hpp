@@ -40,7 +40,7 @@ namespace tb_icm {
 // icm_pkg_code
 constexpr uint8_t kGetTopology = 0x1, kDriverReady = 0x3, kApproveDevice = 0x4, kChallengeDevice = 0x5, kAddDeviceKey = 0x6, kGetRoute = 0xA, kApproveXdomain = 0x10, kDisconnectXdomain = 0x11;
 // icm_event_code
-constexpr uint8_t kEventDeviceConnected = 0x3, kEventDeviceDisconnected = 0x4, kEventXdomainConnected = 0x6, kEventXdomainDisconnected = 0x7;
+constexpr uint8_t kEventDeviceConnected = 0x3, kEventDeviceDisconnected = 0x4, kEventXdomainConnected = 0x6, kEventXdomainDisconnected = 0x7, kEventRtd3Veto = 0xA;
 // the header's flags
 constexpr uint8_t kFlagError = 1u << 0, kFlagNoKey = 1u << 1, kFlagDualLane = 1u << 5, kFlagRtd3 = 1u << 6, kFlagSpeedGen3 = 1u << 7;
 constexpr uint32_t kFlagSecurityShift = 3, kFlagSecurityMask = 3u << 3;
@@ -201,6 +201,12 @@ class ThunderboltIcm final : public IThunderboltEvents {
   // freed, the device list is dropped. Putting the PCI function to sleep is for the caller. resume() brings the channel up again, restarts the firmware if it did not survive, sends
   // DRIVER_READY and waits for the root router; the firmware then reports the devices that are still connected again (with their approval), so nothing is approved by resuming.
   bool suspend();
+  // Runtime power management (RTD3): the controller may be put to sleep while the machine runs, when nothing needs it. The firmware says whether it supports that (the driver ready answer's
+  // RTD3 flag) and may veto it with an event (the veto reason is not zero) while something it manages is busy; a data path to another host also keeps it awake. Like suspend(), without
+  // asking the firmware to save its devices. runtime_resume() is resume().
+  bool runtime_suspend();
+  bool runtime_allowed() const { return outcome_ == Outcome::Started && ready_.rtd3 && !rtd3_veto_ && !tunnel_active(); }
+  bool rtd3_vetoed() const { return rtd3_veto_; }
   Outcome resume(uint32_t timeout_us = kRequestTimeoutUs);
   // Tells the firmware the driver goes away (the mailbox's DRIVER_UNLOADS) and stops the channel.
   void stop();
@@ -259,9 +265,15 @@ class ThunderboltIcm final : public IThunderboltEvents {
   uint32_t build_approve(const TbDevice& device, ByteView out) const { return titan() ? tb_icm::build_approve_device_tr(device, out) : tb_icm::build_approve_device(device, out); }
   Outcome bring_up(uint32_t timeout_us, bool resuming);
   bool request(ConstByteView request, ByteView response, uint32_t timeout_us, uint32_t retries = kRetries);
+  bool tunnel_active() const {
+    for (uint64_t i = 0; i < xdomains_.count(); ++i)
+      if (xdomains_[i].tunnel) return true;
+    return false;
+  }
   bool parent_authorized(const TbDevice& device) const;
   void mark_authorized(const TbDevice& device);
   bool request_flags(ConstByteView request, ByteView response, uint32_t timeout_us, const char** error, const char* no_answer);
+  bool suspend_controller(bool save_devices);
   void service_xdomains();
   bool discover_xdomain(uint64_t index);
   void answer_xdomain_request(ConstByteView body);
@@ -283,7 +295,7 @@ class ThunderboltIcm final : public IThunderboltEvents {
   uint32_t local_generation_ = 1, polls_ = 0;
   TbDriverReady ready_;
   crypto::IRandom* random_ = nullptr;
-  bool interrupts_ = false;
+  bool interrupts_ = false, rtd3_veto_ = false;
   ITbKeyStore* keys_ = nullptr;
   Options options_;
   uint32_t port_reset_failures_ = 0;
