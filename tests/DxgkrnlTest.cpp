@@ -5189,6 +5189,29 @@ void test_dxil() {
       printf("  dxil dxil_ps_more: 300 pixels compared with C++ (%u early returns)\n", early);
     }
   }
+
+  // atan, asin and acos (polynomials in the translation): compared with libm within 1e-4.
+  {
+    UniquePointer<D3d9Program> translated;
+    CHECK(load("dxil_ps_inv.dxil", &translated));
+    if (translated) {
+      auto near = [](float a, float b) { return __builtin_fabsf(a - b) < 1e-4f; };
+      for (uint32_t n = 0; n < 300; ++n) {
+        graphics::Vec4 varyings[4] = {};
+        varyings[0] = {random(0, 1), random(0, 1), random(0, 1), 0};
+        if (n == 0) varyings[0] = {0.5f, 0.5f, 0.5f, 0};
+        if (n == 1) varyings[0] = {1, 1, 1, 0};
+        if (n == 2) varyings[0] = {0, 0, 0, 0};
+        graphics::Vec4 room[graphics::kMaxColorTargets] = {};
+        uint8_t constants[128] = {};
+        const bool alive = translated->run_fragment_ex(varyings, graphics::FragmentContext(), constants, &textures, room);
+        const float x = varyings[0].x * 3.0f - 1.5f, y = varyings[0].y * 2.0f - 1.0f, z = varyings[0].z * 8.0f - 4.0f;
+        const bool same = alive && near(room[0].x, __builtin_atanf(x)) && near(room[0].y, __builtin_asinf(y)) && near(room[0].z, __builtin_acosf(y)) && near(room[0].w, __builtin_atanf(z));
+        if (!same) printf("  inv #%u: %g %g %g %g wants %g %g %g %g\n", n, room[0].x, room[0].y, room[0].z, room[0].w, __builtin_atanf(x), __builtin_asinf(y), __builtin_acosf(y), __builtin_atanf(z));
+        CHECK(same);
+      }
+    }
+  }
   // The vertex shader: a matrix and a tint from the constants.
   {
     UniquePointer<D3d9Program> reference, translated;

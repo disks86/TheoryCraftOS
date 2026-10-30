@@ -208,6 +208,7 @@ class Translator {
   bool binary(const Instruction& ins, uint32_t dxbc_opcode, uint32_t first_arg);
   bool ternary(const Instruction& ins, uint32_t dxbc_opcode, uint32_t first_arg);
   bool sincos(const Instruction& ins, bool cosine);
+  bool inverse_trig(const Instruction& ins, uint32_t opcode);
   bool trig(const Instruction& ins, uint32_t opcode);
   bool classify(const Instruction& ins, uint32_t opcode);
   bool signed_divide(const Instruction& ins, bool remainder, const Val& a, const Val& b, const Val& r);
@@ -1166,6 +1167,80 @@ bool Translator::trig(const Instruction& ins, uint32_t opcode) {
   return define(ins.result, r);
 }
 
+// acos, asin and atan from polynomials (Abramowitz and Stegun 4.4.46 for acos, a minimax one for atan after the reduction to [0, 1] by 1 / x), with the sign and range put back by movc.
+bool Translator::inverse_trig(const Instruction& ins, uint32_t opcode) {
+  const Val x = use(ins.args[1]);
+  const Val r = new_scalar(ins.result);
+  if (r.kind == VK::None || !m_.is_float(ins.type)) return error(status::kNotSupported);
+  auto scratch = [&]() {
+    Val v;
+    v.kind = VK::Temp;
+    if (!alloc_scalar(pos_ + 1, &v.a, &v.b)) v.kind = VK::None;
+    return v;
+  };
+  auto imm = [](float f) {
+    Val v;
+    v.kind = VK::Imm, v.a = __builtin_bit_cast(uint32_t, f);
+    return v;
+  };
+  auto emit3 = [&](uint32_t op, const Val& d, const Val& a, const Val& b, uint32_t mod_b = 0, uint32_t mod_a = 0) {
+    const uint32_t at = begin(op);
+    dst_scalar(d);
+    src(a, mod_a), src(b, mod_b);
+    finish(at);
+  };
+  auto emit4 = [&](uint32_t op, const Val& d, const Val& a, const Val& b, const Val& c) {
+    const uint32_t at = begin(op);
+    dst_scalar(d);
+    src(a), src(b), src(c);
+    finish(at);
+  };
+  const Val a = scratch(), p = scratch(), n = scratch(), q = scratch();
+  if (a.kind == VK::None || p.kind == VK::None || n.kind == VK::None || q.kind == VK::None) return false;
+  const Val zero = imm(0.0f), one = imm(1.0f), half_pi = imm(1.5707963267948966f);
+  {
+    const uint32_t at = begin(54);   // a = |x|
+    dst_scalar(a);
+    src(x, 2);
+    finish(at);
+  }
+  emit3(49, n, x, zero);   // n = x < 0
+  if (opcode == 17) {
+    const Val g = scratch(), inv = scratch(), r2 = scratch();
+    if (g.kind == VK::None || inv.kind == VK::None || r2.kind == VK::None) return false;
+    emit3(49, g, one, a);          // g = 1 < |x|
+    emit3(14, inv, one, a);
+    emit4(55, q, g, inv, a);       // q = g ? 1 / |x| : |x|
+    emit3(56, r2, q, q);
+    static const float c[5] = {0.0208351f, -0.0851330f, 0.1801410f, -0.3302995f, 0.9998660f};
+    emit4(50, p, r2, imm(c[0]), imm(c[1]));
+    for (int i = 2; i < 5; ++i) emit4(50, p, p, r2, imm(c[i]));
+    emit3(56, p, p, q);
+    emit3(0, inv, half_pi, p, 1);  // pi / 2 - p
+    emit4(55, p, g, inv, p);
+    emit3(0, q, zero, p, 1);       // -p
+    emit4(55, r, n, q, p);
+    return define(ins.result, r);
+  }
+  // acos(|x|) = sqrt(1 - |x|) * P(|x|)
+  static const float c[8] = {-0.0012624911f, 0.0066700901f, -0.0170881256f, 0.0308918810f, -0.0501743046f, 0.0889789874f, -0.2145988016f, 1.5707963050f};
+  emit4(50, p, a, imm(c[0]), imm(c[1]));
+  for (int i = 2; i < 8; ++i) emit4(50, p, p, a, imm(c[i]));
+  emit3(0, q, one, a, 1);
+  {
+    const uint32_t at = begin(75);   // sqrt
+    dst_scalar(q);
+    src(q);
+    finish(at);
+  }
+  emit3(56, p, p, q);                  // acos(|x|)
+  emit3(0, q, imm(3.14159265358979f), p, 1);   // pi - acos(|x|)
+  emit4(55, p, n, q, p);               // acos(x)
+  if (opcode == 15) return (emit3(0, r, p, zero), define(ins.result, r));
+  emit3(0, r, half_pi, p, 1);          // asin(x)
+  return define(ins.result, r);
+}
+
 // IsNaN, IsInf, IsFinite: masks.
 bool Translator::classify(const Instruction& ins, uint32_t opcode) {
   const Val x = use(ins.args[1]);
@@ -1539,6 +1614,7 @@ bool Translator::dx_call(const Instruction& ins) {
     }
     case 8: case 9: case 10: return classify(ins, static_cast<uint32_t>(opcode));
     case 14: case 18: case 19: case 20: return trig(ins, static_cast<uint32_t>(opcode));
+    case 15: case 16: case 17: return inverse_trig(ins, static_cast<uint32_t>(opcode));
     case kFAbs: return unary(ins, 54, 1, 2);
     case kSaturate: return unary(ins, 54, 1, 0, true);
     case kSin: return sincos(ins, false);
