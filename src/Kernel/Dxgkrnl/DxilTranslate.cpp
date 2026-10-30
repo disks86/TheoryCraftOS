@@ -53,6 +53,7 @@ struct Val {
   VK kind = VK::None;
   uint32_t a = 0, b = 0, c = 0;   // Imm: the bits; Temp / Agg: register (a), component (b); Input: register (a), component (b); Cb: slot (a), register (b), component (c); CbAgg: slot (a), register (b); Handle: class (a), register (b)
   bool is_mask = false;           // (a boolean: all ones or zero)
+  uint8_t d = 0;                  // Input: 0 an input register, 1 an input control point of a domain shader (v[vertex][register]), 2 a patch constant register
 };
 
 struct SigElement {
@@ -78,7 +79,7 @@ class Translator {
       : allocator_(allocator), m_(module), f_(function), out_(allocator), vals_(allocator), last_use_(allocator), alias_of_(allocator), unsupported_(allocator), marks_(allocator) {}
 
   // Translates the entry function. `isg1` / `osg1` are the signature parts of the container.
-  NtStatus run(uint32_t program_kind, ConstByteView isg1, ConstByteView osg1, ByteBuffer* shex);
+  NtStatus run(uint32_t program_kind, ConstByteView isg1, ConstByteView osg1, ConstByteView psg1, ByteBuffer* shex);
 
  private:
   // --- the module's tables
@@ -254,6 +255,10 @@ class Translator {
   bool is_shared_pointer(uint32_t id) const;
   bool sys_used_[4] = {};          // vThreadID, vThreadGroupID, vThreadIDInGroup, vThreadIDInGroupFlattened
   bool uav_used_[kMaxResources] = {};
+  uint32_t ds_[2] = {};            // a domain shader's state: the domain, the input control points
+  bool domain_used_ = false;
+  SigElement patch_[16];
+  uint32_t patch_count_ = 0;
   uint32_t gs_[5] = {};            // a geometry shader's state: input primitive, most vertices, stream mask, output topology, instances
 };
 
@@ -267,7 +272,7 @@ void Translator::src(const Val& v, uint32_t modifier) {
       break;
     case VK::Temp: case VK::Input:
       // (an input of a geometry shader names the vertex too: v[vertex][register])
-      put(2u | (2u << 2) | (v.b << 4) | ((v.kind == VK::Input ? 1u : 0u) << 12) | ((v.kind == VK::Input && v.c ? 2u : 1u) << 20) | (modifier ? 1u << 31 : 0u));
+      put(2u | (2u << 2) | (v.b << 4) | ((v.kind == VK::Input ? (v.d == 1 ? 25u : v.d == 2 ? 27u : 1u) : 0u) << 12) | ((v.kind == VK::Input && v.c ? 2u : 1u) << 20) | (modifier ? 1u << 31 : 0u));
       if (modifier) put(1u | (modifier << 6));
       if (v.kind == VK::Input && v.c) put(v.c - 1);
       put(v.a);
@@ -1482,10 +1487,11 @@ bool Translator::dx_call(const Instruction& ins) {
       Val v;
       v.kind = VK::Input, v.a = e.reg + static_cast<uint32_t>(row), v.b = first + static_cast<uint32_t>(col);
       if (v.b >= 4 || v.a >= 16) return error(status::kInvalidParameter);
-      if (kind_ == 2) {   // (a geometry shader: the vertex of the primitive)
+      if (kind_ == 2 || kind_ == 4) {   // (a geometry shader: the vertex of the primitive; a domain shader: the control point)
         uint64_t vertex = 0;
-        if (ins.arg_count < 5 || !constant_int(ins.args[4], &vertex) || vertex >= 6) return error(status::kNotSupported);
+        if (ins.arg_count < 5 || !constant_int(ins.args[4], &vertex) || vertex >= (kind_ == 2 ? 6u : 32u)) return error(status::kNotSupported);
         v.c = static_cast<uint32_t>(vertex) + 1;
+        v.d = kind_ == 4 ? 1 : 0;
       }
       return define(ins.result, v);
     }
@@ -1571,6 +1577,25 @@ bool Translator::dx_call(const Instruction& ins) {
       finish(begin(190, flags << 11));
       return true;
     }
+    case 104: {   // loadPatchConstant (a domain shader)
+      uint64_t id = 0, row = 0, col = 0;
+      if (kind_ != 4 || ins.arg_count < 4 || !constant_int(ins.args[1], &id) || !constant_int(ins.args[2], &row) || !constant_int(ins.args[3], &col) || id >= patch_count_) return error(status::kNotSupported);
+      const SigElement& e = patch_[id];
+      uint32_t first = 0;
+      while (first < 4 && !(e.mask >> first & 1)) ++first;
+      Val v;
+      v.kind = VK::Input, v.d = 2, v.a = e.reg + static_cast<uint32_t>(row), v.b = first + static_cast<uint32_t>(col);
+      if (v.b >= 4 || v.a >= 32) return error(status::kInvalidParameter);
+      return define(ins.result, v);
+    }
+    case 105: {   // domainLocation
+      uint64_t axis = 0;
+      if (kind_ != 4 || ins.arg_count < 2 || !constant_int(ins.args[1], &axis) || axis > 2) return error(status::kNotSupported);
+      Val v;
+      v.kind = VK::Sys, v.a = 28, v.b = static_cast<uint32_t>(axis);
+      domain_used_ = true;
+      return define(ins.result, v);
+    }
     case 97: case 98: {   // emitStream / cutStream (stream 0)
       uint64_t stream = 1;
       if (kind_ != 2 || ins.arg_count < 2 || !constant_int(ins.args[1], &stream) || stream != 0) return error(status::kNotSupported);
@@ -1645,6 +1670,14 @@ NtStatus Translator::read_metadata() {
         gs_[k] = static_cast<uint32_t>(v);
       }
     }
+    if (meta_int(operand_of(props, i), &tag) && tag == 2) {
+      const Meta* state = operand_of(props, i + 1);
+      for (uint32_t k = 0; k < 2; ++k) {
+        uint64_t v = 0;
+        meta_int(operand_of(state, k), &v);
+        ds_[k] = static_cast<uint32_t>(v);
+      }
+    }
     if (meta_int(operand_of(props, i), &tag) && tag == 4) {
       const Meta* group = operand_of(props, i + 1);
       for (uint32_t k = 0; k < 3; ++k) {
@@ -1683,12 +1716,12 @@ NtStatus Translator::read_signature(ConstByteView chunk, SigElement* out, uint32
 
 // --- the whole function ------------------------------------------------------------------------------------------------------------------------------------------
 
-NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteView osg1, ByteBuffer* shex) {
+NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteView osg1, ConstByteView psg1, ByteBuffer* shex) {
   kind_ = program_kind;
   NtStatus s = read_metadata();
   if (s != status::kSuccess) return s;
   if (entry_value_ != f_.value) return status::kNotSupported;
-  if ((s = read_signature(isg1, inputs_, &input_count_)) != status::kSuccess || (s = read_signature(osg1, outputs_, &output_count_)) != status::kSuccess) return s;
+  if ((s = read_signature(isg1, inputs_, &input_count_)) != status::kSuccess || (s = read_signature(osg1, outputs_, &output_count_)) != status::kSuccess || (s = read_signature(psg1, patch_, &patch_count_)) != status::kSuccess) return s;
   // (interpolation modes were read by position before the counts were known)
   const uint64_t values = total_values();
   if (values > (1u << 16) || f_.block_count == 0) return status::kInvalidParameter;
@@ -1748,8 +1781,16 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
   // --- the declarations and the program
   ByteBuffer decl(allocator_);
   auto word = [&](uint32_t w) { return decl.put32(w); };
-  const bool pixel = program_kind == 0, vertex = program_kind == 1, compute = program_kind == 5, geometry = program_kind == 2;
-  if (!pixel && !vertex && !compute && !geometry) return status::kNotSupported;
+  const bool pixel = program_kind == 0, vertex = program_kind == 1, compute = program_kind == 5, geometry = program_kind == 2, domain = program_kind == 4;
+  if (!pixel && !vertex && !compute && !geometry && !domain) return status::kNotSupported;
+  if (domain) {
+    if (ds_[0] < 1 || ds_[0] > 3 || ds_[1] < 1 || ds_[1] > graphics::kMaxPatchControlPoints) return status::kNotSupported;
+    word(147u | (ds_[1] << 11) | (1u << 24));   // dcl_input_control_point_count
+    word(149u | (ds_[0] << 11) | (1u << 24));   // dcl_tessellator_domain
+    if (domain_used_) word(95u | (2u << 24)), word(2u | (7u << 4) | (28u << 12));
+    for (uint32_t i = 0; i < patch_count_; ++i)
+      word(95u | (3u << 24)), word(2u | ((patch_[i].mask & 0xF) << 4) | (27u << 12) | (1u << 20)), word(patch_[i].reg);
+  }
   uint32_t input_vertices = 0;
   if (geometry) {
     // (D3D10_SB_PRIMITIVE: 1 point, 2 line, 3 triangle, 6 line with adjacency, 7 triangle with adjacency; the topologies: 1 point list, 3 line strip, 5 triangle strip)
@@ -1805,7 +1846,12 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
   for (uint32_t i = 0; i < input_count_; ++i) {
     const SigElement& e = inputs_[i];
     const uint32_t operand = 2u | ((e.mask & 0xF) << 4) | (1u << 12) | (1u << 20);
-    if (geometry) {
+    if (domain) {
+      const uint32_t indexed = 2u | ((e.mask & 0xF) << 4) | (25u << 12) | (2u << 20);
+      if (e.sysval == 0) word(95u | (4u << 24)), word(indexed), word(ds_[1]), word(e.reg);
+      else if (e.sysval == 1) word(97u | (5u << 24)), word(indexed), word(ds_[1]), word(e.reg), word(1);
+      else return status::kNotSupported;
+    } else if (geometry) {
       // v[vertices][register]: the registers of every vertex (a position is the system value of the _siv form)
       const uint32_t indexed = 2u | ((e.mask & 0xF) << 4) | (1u << 12) | (2u << 20);
       if (e.sysval == 0) word(95u | (4u << 24)), word(indexed), word(input_vertices), word(e.reg);
@@ -1826,7 +1872,7 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
     const SigElement& e = outputs_[i];
     const uint32_t operand = 2u | ((e.mask & 0xF) << 4) | (2u << 12) | (1u << 20);
     if (e.sysval == 0 || (pixel && e.sysval == 64)) word(101u | (3u << 24)), word(operand), word(e.reg);
-    else if ((vertex || geometry) && e.sysval == 1) word(103u | (4u << 24)), word(operand), word(e.reg), word(1);
+    else if ((vertex || geometry || domain) && e.sysval == 1) word(103u | (4u << 24)), word(operand), word(e.reg), word(1);
     else return status::kNotSupported;
   }
   word(104u | (2u << 24)), word(temps_);
@@ -1870,7 +1916,7 @@ NtStatus D3d9Program::compile_dxil(allocators::IAllocator& allocator, ConstByteV
   head.skip(16);
   const uint32_t one = head.le32(), total = head.le32(), chunk_count = head.le32();
   if (!head.ok() || one != 1 || total > bytes.size() || total < 32 || chunk_count == 0 || chunk_count > 32) return status::kInvalidParameter;
-  ConstByteView program, isg1, osg1;
+  ConstByteView program, isg1, osg1, psg1;
   for (uint32_t i = 0; i < chunk_count; ++i) {
     const uint32_t offset = head.le32();
     if (!head.ok() || offset > total || total - offset < 8) return status::kInvalidParameter;
@@ -1881,6 +1927,7 @@ NtStatus D3d9Program::compile_dxil(allocators::IAllocator& allocator, ConstByteV
     if (fourcc == kFourDxil) program = data;
     else if (fourcc == kFourIsg1) isg1 = data;
     else if (fourcc == kFourOsg1) osg1 = data;
+    else if (fourcc == 0x31475350) psg1 = data;   // 'PSG1'
   }
   // the program header: version, size in words, then the bitcode header (magic, version, offset from it, size)
   ByteReader ph(program);
@@ -1891,7 +1938,7 @@ NtStatus D3d9Program::compile_dxil(allocators::IAllocator& allocator, ConstByteV
   ConstByteView bitcode;
   if (!program.try_subview(8 + uint64_t{bitcode_offset}, bitcode_size, &bitcode)) return status::kInvalidParameter;
   const uint32_t kind = version >> 16;
-  if (kind != 0 && kind != 1 && kind != 2 && kind != 5) return status::kNotSupported;
+  if (kind != 0 && kind != 1 && kind != 2 && kind != 4 && kind != 5) return status::kNotSupported;
   dxil::Module module(allocator);
   NtStatus s = dxil::read_module(allocator, bitcode, &module);
   if (s != status::kSuccess) return s;
@@ -1904,7 +1951,7 @@ NtStatus D3d9Program::compile_dxil(allocators::IAllocator& allocator, ConstByteV
   if (!entry) return status::kInvalidParameter;
   Translator translator(allocator, module, *entry);
   ByteBuffer shex(allocator);
-  s = translator.run(kind, isg1, osg1, &shex);
+  s = translator.run(kind, isg1, osg1, psg1, &shex);
   if (s != status::kSuccess) return s;
 #ifdef DXIL_TRACE
   {

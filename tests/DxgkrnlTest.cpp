@@ -5244,6 +5244,31 @@ void test_dxil() {
       printf("  dxil dxil_gs_copy: 100 triangles compared\n");
     }
   }
+
+  // A domain shader: the vertex it makes of a patch at a point of the domain.
+  {
+    UniquePointer<D3d9Program> reference, translated;
+    CHECK(load("dxil_ds_dent.dxbc", &reference) && load("dxil_ds_dent.dxil", &translated));
+    if (reference && translated) {
+      CHECK(translated->stage() == graphics::ShaderStage::Domain && translated->tess_domain() == graphics::TessDomain::Triangle && translated->tess_input_points() == 3);
+      for (uint32_t n = 0; n < 100; ++n) {
+        graphics::HullOutputData patch;
+        for (uint32_t k = 0; k < 3; ++k) {
+          patch.control_point[k].position = {random(-1, 1), random(-1, 1), random(0, 1), random(0.5f, 2)};
+          patch.control_point[k].varying[0] = {random(0, 1), random(0, 1), random(0, 1), random(0, 1)};
+          patch.control_point[k].varying[2] = {random(0, 1), random(0, 1), 0, 0};
+        }
+        const float u = random(0, 1), v = random(0, 1) * (1 - u), w = 1 - u - v;
+        graphics::ShaderIo a = {}, b = {};
+        uint8_t constants[128] = {};
+        reference->run_domain(patch, u, v, w, constants, &a);
+        translated->run_domain(patch, u, v, w, constants, &b);
+        CHECK(close_to(a.position.x, b.position.x) && close_to(a.position.y, b.position.y) && close_to(a.position.z, b.position.z) && close_to(a.position.w, b.position.w) &&
+              close_to(a.varying[0].x, b.varying[0].x) && close_to(a.varying[0].w, b.varying[0].w) && close_to(a.varying[2].x, b.varying[2].x) && close_to(a.varying[2].y, b.varying[2].y));
+      }
+      printf("  dxil dxil_ds_dent: 100 domain points compared\n");
+    }
+  }
   // The compute shaders: the same buffers in, the same buffers out.
   {
     UniquePointer<D3d9Program> reference, translated;
@@ -5303,7 +5328,7 @@ void test_dxil() {
     }
   }
   // Truncated and with a bit flipped: refused or compiled, never a crash (and the sanitizers say nothing).
-  for (const char* name : {"dxil_ps_math.dxil", "dxil_ps_flow.dxil", "dxil_vs.dxil", "dxil_ps_tex.dxil", "dxil_cs_fill.dxil", "dxil_ps_loop.dxil", "dxil_cs_shared.dxil", "dxil_ps_more.dxil", "dxil_gs_copy.dxil"}) {
+  for (const char* name : {"dxil_ps_math.dxil", "dxil_ps_flow.dxil", "dxil_vs.dxil", "dxil_ps_tex.dxil", "dxil_cs_fill.dxil", "dxil_ps_loop.dxil", "dxil_cs_shared.dxil", "dxil_ps_more.dxil", "dxil_gs_copy.dxil", "dxil_ds_dent.dxil"}) {
     const std::vector<uint8_t> blob = read_blob(name);
     for (size_t n = 0; n < blob.size(); n += 11) {
       UniquePointer<D3d9Program> program;
