@@ -845,7 +845,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
   } so_slot[kMaxStreamOutputBuffers];
   uint32_t so_handles[kMaxStreamOutputBuffers] = {};
   uint32_t so_program[5] = {};   // (the shaders of the pipeline the transform feedback began with)
-  bool so_alive = false, so_set = false;
+  bool so_alive = false, so_set = false, disjoint_asked = false;
   uint32_t so_query_slot[kMaxGeometryStreams] = {};   // (0: none, else the slot of the Queries)
   struct Fill {
     VirglBuffer* buffer = nullptr;
@@ -1126,7 +1126,8 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         if ((cmd.count & 0xFF) >= static_cast<uint32_t>(QueryKind::TimestampFrequency)) {
           // (the host has no such query: its timestamps are nanoseconds and it cannot say whether the clock was interrupted)
           queries.used[cmd.unit] = queries.synthetic[cmd.unit] = true;
-          queries.synthetic_value[cmd.unit] = (cmd.count & 0xFF) == static_cast<uint32_t>(QueryKind::TimestampFrequency) ? 1000000000u : 0u;
+          queries.synthetic_value[cmd.unit] = (cmd.count & 0xFF) == static_cast<uint32_t>(QueryKind::TimestampFrequency) ? 1000000000u : (clock_interrupted_ ? 1u : 0u);
+          disjoint_asked = disjoint_asked || (cmd.count & 0xFF) == static_cast<uint32_t>(QueryKind::TimestampDisjoint);
           queries.open = cmd.unit;
           break;
         }
@@ -1341,6 +1342,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
     const uint32_t nop = 0;
     if (attempt > kQueryPolls || !send_commands(&nop, 1)) return false;
   }
+  if (disjoint_asked) clock_interrupted_ = false;
   uint64_t counts[kMaxOcclusionQueries + kFillQueries] = {};
   for (uint32_t slot = 0; slot < kQuerySlots; ++slot) {
     if (!queries.used[slot]) continue;

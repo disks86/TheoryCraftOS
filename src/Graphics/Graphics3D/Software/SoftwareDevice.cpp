@@ -1399,6 +1399,8 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
   if (!commands) return false;
   CommandRecorder& recorder = *static_cast<CommandRecorder*>(commands);
   DrawState s;
+  const bool interrupted = clock_interrupted_;   // (what a disjoint query in these commands says, and then it is said)
+  bool disjoint_asked = false;
   // (how far each stream output buffer got, for the next bind that appends)
   auto remember_filled = [](const DrawState::StreamOutputTarget& target) {
     if (target.buffer) target.buffer->set_stream_output_filled(target.base + target.written);
@@ -1610,7 +1612,8 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
           break;
         }
         if (query_kind == QueryKind::TimestampFrequency || query_kind == QueryKind::TimestampDisjoint) {
-          recorder.set_occlusion_result(query_slot, query_kind == QueryKind::TimestampFrequency ? 1000000000u : 0u);   // (nanoseconds, and a clock nothing interrupts)
+          recorder.set_occlusion_result(query_slot, query_kind == QueryKind::TimestampFrequency ? 1000000000u : interrupted ? 1u : 0u);
+          disjoint_asked = disjoint_asked || query_kind == QueryKind::TimestampDisjoint;
           break;
         }
         if (query_kind == QueryKind::SoPrimitivesWritten || query_kind == QueryKind::SoPrimitivesNeeded) {
@@ -1754,6 +1757,7 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
     }
   }
   for (DrawState::StreamOutputTarget& target : stream_output) remember_filled(target);
+  if (disjoint_asked) clock_interrupted_ = false;
   return !in_pass;
 }
 

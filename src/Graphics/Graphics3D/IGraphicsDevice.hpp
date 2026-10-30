@@ -658,6 +658,9 @@ class IGraphicsDevice {
   virtual void destroy_command_buffer(ICommandBuffer* commands) = 0;
 
   // Runs the recorded commands; returns when they are done (or failed).
+  // The timestamp clock was interrupted (the device was reset, changed its power state or its clock): the next TimestampDisjoint query says 1, once, and timestamps from before are not comparable
+  // with those after. Devices without kFeatureTimestampQueries ignore it.
+  virtual void interrupt_clock() {}
   virtual bool submit(ICommandBuffer* commands) = 0;
   // Shows `image` (created with kImagePresent) on the screen.
   virtual bool present(IImage* image) = 0;

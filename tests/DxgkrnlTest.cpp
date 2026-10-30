@@ -4546,6 +4546,21 @@ void test_stream_output_extras() {
     CHECK(e.render(w, {target, vb, results}) == status::kSuccess);
     CHECK(query_count(e, results, 0) == 0 && query_count(e, results, 1) == 1000000000u);
   }
+  {
+    // An interruption of the clock shows once, in the first disjoint query after it.
+    auto disjoint = [&] {
+      CommandWriter w(e.allocator);
+      w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+      w.begin_query(2, 0, static_cast<uint32_t>(graphics::QueryKind::TimestampDisjoint));
+      w.end_query();
+      w.end_pass();
+      CHECK(e.render(w, {target, vb, results}) == status::kSuccess);
+      return query_count(e, results, 0);
+    };
+    CHECK(disjoint() == 0);
+    e.kernel.adapter(0)->interrupt_clock();
+    CHECK(disjoint() == 1 && disjoint() == 0);
+  }
 
   // Appending: the second draw, in another pass, goes after the first's records.
   Handle big0 = buffer(6 * 32), big1 = buffer(6 * 16);
