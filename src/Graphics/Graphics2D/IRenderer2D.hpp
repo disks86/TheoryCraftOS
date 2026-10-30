@@ -171,6 +171,12 @@ class IRenderer2D {
     (void)t;
     return false;
   }
+  // A drop shadow: the picture's alpha moved by (dx, dy) whole pixels, blurred (as group_blur does, sigma pixels) and tinted with `color` (0xAARRGGBB, its alpha scales the
+  // shadow), put under the picture.
+  virtual bool group_drop_shadow(int32_t dx, int32_t dy, float sigma, uint32_t color) {
+    (void)dx, (void)dy, (void)sigma, (void)color;
+    return false;
+  }
   // Erases the coverage of a rounded rectangle (anti-aliased like fill_rounded_rect) from a filter group's picture: what was there is multiplied by one minus the coverage.
   virtual bool group_cut_out(const Rect2D& rect, const CornerRadii& radii) {
     (void)rect, (void)radii;

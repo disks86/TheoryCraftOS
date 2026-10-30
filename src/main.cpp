@@ -696,7 +696,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
           .text(renderer->accelerated() ? " (GPU accelerated)" : " (software)");
       if (system_graphics.accelerated()) {
         const int groups = check_2d_groups(system_graphics.device(), shared_allocator);
-        Entry(groups > 0 ? Level::Ok : groups == 0 ? Level::Warning : Level::Info, "Graphics").text("2D offscreen groups: ").text(groups > 2 ? "ok (opacity, composite, blur and colour filters, rounded and mask clips)" : groups > 1 ? "ok (opacity, composite, blur and colour filters; clips approximated)" : groups > 0 ? "ok (opacity, composite; no filters on this device)" : groups == 0 ? "WRONG on this device" : "not supported by this device");
+        Entry(groups > 0 ? Level::Ok : groups == 0 ? Level::Warning : Level::Info, "Graphics").text("2D offscreen groups: ").text(groups > 3 ? "ok (opacity, composite, blur and colour filters, rounded and mask clips, drop shadows)" : groups > 2 ? "ok (opacity, composite, blur and colour filters, rounded and mask clips)" : groups > 1 ? "ok (opacity, composite, blur and colour filters; clips approximated)" : groups > 0 ? "ok (opacity, composite; no filters on this device)" : groups == 0 ? "WRONG on this device" : "not supported by this device");
       }
       if (!system_graphics.accelerated())
         Entry(system_gpu.virtio_gpu() || system_gpu.vmware_gpu() ? Level::Warning : Level::Info, "Graphics").text("no 3D acceleration: ").text(system_graphics.software_reason());

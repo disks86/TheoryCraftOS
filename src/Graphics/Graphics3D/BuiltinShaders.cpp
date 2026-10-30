@@ -83,6 +83,14 @@ bool textured_color_fragment(const Vec4* varyings, const uint8_t* constants, con
   return true;
 }
 
+// The shadow of a picture: its alpha moved by CONST[5].xy (texture coordinates), tinted with the straight color CONST[4], made premultiplied.
+bool textured_shadow_fragment(const Vec4* varyings, const uint8_t* constants, const ITextureSet& textures, Vec4* color) {
+  const float* c = reinterpret_cast<const float*>(constants);
+  const float a = textures.sample(0, varyings[0].x - c[20], varyings[0].y - c[21]).w * c[19];
+  *color = Vec4{c[16] * a, c[17] * a, c[18] * a, a};
+  return true;
+}
+
 // A picture through a coverage mask: texture 0 (premultiplied colours) times the alpha of texture 1, at the same coordinate.
 bool textured_masked_fragment(const Vec4* varyings, const uint8_t*, const ITextureSet& textures, Vec4* color) {
   const Vec4 t = textures.sample(0, varyings[0].x, varyings[0].y);
@@ -247,6 +255,22 @@ constexpr const char kTexturedMaskedFragmentTgsi[] =
     "  2: MUL OUT[0], TEMP[0], TEMP[1].wwww\n"
     "  3: END\n";
 
+constexpr const char kTexturedShadowFragmentTgsi[] =
+    "FRAG\n"
+    "PROPERTY FS_COLOR0_WRITES_ALL_CBUFS 1\n"
+    "DCL IN[0], GENERIC[0], PERSPECTIVE\n"
+    "DCL OUT[0], COLOR\n"
+    "DCL SAMP[0]\n"
+    "DCL SVIEW[0], 2D, FLOAT\n"
+    "DCL CONST[4..5]\n"
+    "DCL TEMP[0..2]\n"
+    "  0: ADD TEMP[0].xy, IN[0].xyxx, -CONST[5].xyxx\n"
+    "  1: TEX TEMP[1], TEMP[0], SAMP[0], 2D\n"
+    "  2: MUL TEMP[2].x, TEMP[1].wwww, CONST[4].wwww\n"
+    "  3: MUL OUT[0].xyz, CONST[4].xyzx, TEMP[2].xxxx\n"
+    "  4: MOV OUT[0].w, TEMP[2].xxxx\n"
+    "  5: END\n";
+
 // The same two shaders as Direct3D 9 bytecode (vs_2_0, ps_2_0). Position comes in as v0, color as v1; the matrix columns are c0..c3, and c31 is
 // the device's (1, -1, 1, 1) that turns Direct3D's +Y up into Vulkan's +Y down.
 constexpr uint32_t kColoredVertexD3d9[] = {
@@ -339,6 +363,14 @@ ShaderModuleDesc textured_masked_fragment_shader() {
   d.stage = ShaderStage::Fragment;
   d.textured_fragment_function = textured_masked_fragment;
   d.tgsi = kTexturedMaskedFragmentTgsi;
+  return d;
+}
+
+ShaderModuleDesc textured_shadow_fragment_shader() {
+  ShaderModuleDesc d;
+  d.stage = ShaderStage::Fragment;
+  d.textured_fragment_function = textured_shadow_fragment;
+  d.tgsi = kTexturedShadowFragmentTgsi;
   return d;
 }
 

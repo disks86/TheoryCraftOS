@@ -112,13 +112,18 @@ DeviceRenderer2D::DeviceRenderer2D(IGraphicsDevice& device, allocators::IAllocat
       textured.fragment_shader = color_fs_;
       filter_color_ = device.create_graphics_pipeline(textured);
     }
+    shadow_fs_ = device.create_shader_module(textured_shadow_fragment_shader());
+    if (shadow_fs_) {
+      textured.fragment_shader = shadow_fs_;
+      filter_shadow_ = device.create_graphics_pipeline(textured);
+    }
     BlendState erase;   // dst = dst * (1 - src alpha), colour and alpha
     erase.custom = erase.enable = true;
     erase.src_color = erase.src_alpha = BlendFactor::Zero;
     erase.dst_color = erase.dst_alpha = BlendFactor::InvSrcAlpha;
     colored.blend = erase;
     group_erase_ = device.create_graphics_pipeline(colored);
-    filters_ok_ = groups_ok_ && filter_blur_ && filter_color_ && group_erase_;
+    filters_ok_ = groups_ok_ && filter_blur_ && filter_color_ && group_erase_ && filter_shadow_;
   }
   for (IImage*& image : images_) image = device.create_image({extent, Format::B8G8R8A8Unorm, kImageColorAttachment | kImagePresent});
   commands_ = device.create_command_buffer();
@@ -141,6 +146,8 @@ DeviceRenderer2D::~DeviceRenderer2D() {
   }
   for (MaskEntry& e : mask_cache_)
     if (e.image) device_.destroy_image(e.image);
+  if (filter_shadow_) device_.destroy_pipeline(filter_shadow_);
+  if (shadow_fs_) device_.destroy_shader_module(shadow_fs_);
   if (group_erase_) device_.destroy_pipeline(group_erase_);
   if (masked_) device_.destroy_pipeline(masked_);
   if (masked_fs_) device_.destroy_shader_module(masked_fs_);
@@ -1220,39 +1227,40 @@ bool DeviceRenderer2D::push_exact_clip(const Rect2D& rect, const raster::RRect* 
   return true;
 }
 
+bool DeviceRenderer2D::pass_to(IImage* dest, uint32_t w, uint32_t h, IImage* source, IPipeline* pipeline, const void* constants, uint32_t size, Filter filter, bool clear) {
+  const float fw = static_cast<float>(w), fh = static_cast<float>(h);
+  const TexturedVertex tl{{0, 0, 0}, {0, 0}}, tr{{fw, 0, 0}, {1, 0}}, br{{fw, fh, 0}, {1, 1}}, bl{{0, fh, 0}, {0, 1}};
+  const TexturedVertex quad[6] = {tl, tr, br, tl, br, bl};
+  const ArrayView<TexturedVertex> mapped = texture_vertices_->map().cast<TexturedVertex>();
+  if (mapped.size() < 6) return false;
+  mapped.copy_from(ArrayView<const TexturedVertex>(quad, 6));
+  texture_vertices_->unmap();
+  commands_->begin();
+  RenderPassBegin pass;
+  pass.color = dest;
+  pass.clear_color = clear;
+  pass.clear_color_value = Vec4{0, 0, 0, 0};
+  commands_->begin_render_pass(pass);
+  commands_->bind_pipeline(pipeline);
+  commands_->bind_vertex_buffer(texture_vertices_);
+  SamplerDesc sampler;
+  sampler.filter = filter;
+  sampler.address_u = sampler.address_v = AddressMode::ClampToEdge;
+  commands_->bind_texture(0, source, sampler);
+  commands_->push_constants(constants, size);
+  commands_->set_scissor({0, 0, w, h});
+  commands_->draw(6);
+  commands_->end_render_pass();
+  return commands_->end() && device_.submit(commands_);
+}
+
 // The top group's picture through `pipeline` (one textured rectangle over a new image of the same size, sampled linearly): the result replaces the picture.
 bool DeviceRenderer2D::filter_pass(IPipeline* pipeline, void* constants, uint32_t size, bool) {
   Group& g = groups_[group_depth_ - 1];
   const uint32_t w = g.bounds.width, h = g.bounds.height;
   IImage* dest = device_.create_image({{w, h}, Format::B8G8R8A8Unorm, kImageColorAttachment | kImageSampled});
   if (!dest) return false;
-  const float fw = static_cast<float>(w), fh = static_cast<float>(h);
-  const TexturedVertex tl{{0, 0, 0}, {0, 0}}, tr{{fw, 0, 0}, {1, 0}}, br{{fw, fh, 0}, {1, 1}}, bl{{0, fh, 0}, {0, 1}};
-  const TexturedVertex quad[6] = {tl, tr, br, tl, br, bl};
-  const ArrayView<TexturedVertex> mapped = texture_vertices_->map().cast<TexturedVertex>();
-  if (mapped.size() < 6) {
-    device_.destroy_image(dest);
-    return false;
-  }
-  mapped.copy_from(ArrayView<const TexturedVertex>(quad, 6));
-  texture_vertices_->unmap();
-  commands_->begin();
-  RenderPassBegin pass;
-  pass.color = dest;
-  pass.clear_color_value = Vec4{0, 0, 0, 0};
-  commands_->begin_render_pass(pass);
-  commands_->bind_pipeline(pipeline);
-  commands_->bind_vertex_buffer(texture_vertices_);
-  SamplerDesc sampler;
-  sampler.filter = Filter::Linear;
-  sampler.address_u = sampler.address_v = AddressMode::ClampToEdge;
-  commands_->bind_texture(0, g.image, sampler);
-  commands_->push_constants(constants, size);
-  commands_->set_scissor({0, 0, w, h});
-  commands_->draw(6);
-  commands_->end_render_pass();
-  const bool ok = commands_->end() && device_.submit(commands_);
-  if (!ok) {
+  if (!pass_to(dest, w, h, g.image, pipeline, constants, size, Filter::Linear, true)) {
     device_.destroy_image(dest);
     return false;
   }
@@ -1310,6 +1318,54 @@ bool DeviceRenderer2D::group_blur(float sigma) {
     if (!blur_pass(radius, true) || !blur_pass(radius, false)) return false;
   }
   return true;
+}
+
+bool DeviceRenderer2D::group_drop_shadow(int32_t dx, int32_t dy, float sigma, uint32_t color) {
+  unwind_masks();
+  if (!group_depth_ || !filters_ok_ || !submit_pending()) return false;
+  Group& g = groups_[group_depth_ - 1];
+  const uint32_t w = g.bounds.width, h = g.bounds.height;
+  const ImageDesc desc{{w, h}, Format::B8G8R8A8Unorm, kImageColorAttachment | kImageSampled};
+  IImage* shadow = device_.create_image(desc);
+  IImage* result = device_.create_image(desc);
+  bool ok = shadow && result;
+  // 1. the picture's alpha, moved and tinted
+  if (ok) {
+    TexturedShadowConstants c;
+    c.mvp = image_matrix(w, h);
+    c.color[0] = static_cast<float>((color >> 16) & 0xFF) / 255.0f;
+    c.color[1] = static_cast<float>((color >> 8) & 0xFF) / 255.0f;
+    c.color[2] = static_cast<float>(color & 0xFF) / 255.0f;
+    c.color[3] = static_cast<float>(color >> 24) / 255.0f;
+    c.offset[0] = static_cast<float>(dx) / static_cast<float>(w);
+    c.offset[1] = static_cast<float>(dy) / static_cast<float>(h);
+    c.pad[0] = c.pad[1] = 0;
+    ok = pass_to(shadow, w, h, g.image, filter_shadow_, &c, sizeof(c), Filter::Nearest, true);
+  }
+  // 2. blurred (the blur works on the top group's picture: it stands in for the group's for that)
+  IImage* content = g.image;
+  if (ok) {
+    g.image = shadow;
+    ok = group_blur(sigma);
+    shadow = g.image;
+    g.image = content;
+  }
+  // 3. the shadow, then the picture over it
+  if (ok) {
+    TexturedScaledConstants c;
+    c.mvp = image_matrix(w, h);
+    c.scale = 1.0f;
+    c.pad[0] = c.pad[1] = c.pad[2] = 0;
+    ok = pass_to(result, w, h, shadow, composite_, &c, sizeof(c), Filter::Nearest, true) && pass_to(result, w, h, content, composite_, &c, sizeof(c), Filter::Nearest, false);
+  }
+  if (shadow) device_.destroy_image(shadow);
+  if (ok) {
+    device_.destroy_image(content);
+    g.image = result;
+  } else if (result) {
+    device_.destroy_image(result);
+  }
+  return ok;
 }
 
 bool DeviceRenderer2D::group_cut_out(const Rect2D& rect, const CornerRadii& radii) {

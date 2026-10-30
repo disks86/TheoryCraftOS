@@ -159,6 +159,28 @@ int groups_check(IGraphicsDevice& device, allocators::IAllocator& allocator) {
     }
     result = ok ? 3 : 0;
   }
+  // A drop shadow: the picture's alpha moved right, tinted red, with the picture over it; and the same blurred.
+  if (result == 3) {
+    r.clear(rgb(0, 0, 0));
+    bool ok = r.begin_filter_group({0, 0, 56, 20});
+    if (ok) {
+      r.fill_rect({4, 4, 10, 10}, rgb(255, 255, 255));
+      ok = r.group_drop_shadow(14, 0, 0.0f, 0xFFFF0000u) && r.end_group(Matrix2D(), 255, ImageFilter::Nearest);
+    }
+    ok = ok && r.begin_filter_group({0, 24, 64, 24});
+    if (ok) {
+      r.fill_rect({4, 28, 10, 10}, rgb(255, 255, 255));
+      ok = r.group_drop_shadow(14, 0, 2.0f, 0xFFFF0000u) && r.end_group(Matrix2D(), 255, ImageFilter::Nearest);
+    }
+    ok = ok && r.read_pixels(px);
+    if (ok) {
+      auto red = [&](uint32_t x, uint32_t y) { return static_cast<int>((px[y * W + x] >> 16) & 0xFF); };
+      auto green = [&](uint32_t x, uint32_t y) { return static_cast<int>((px[y * W + x] >> 8) & 0xFF); };
+      ok = green(8, 8) == 255 && red(22, 8) == 255 && green(22, 8) == 0 && red(16, 8) == 0 &&   // (picture, shadow, the gap between)
+           green(22, 32) == 0 && red(22, 32) >= 240 && red(28, 32) > 10 && red(28, 32) < 230 && red(42, 32) <= 8;   // (the blurred one has a soft edge past the block)
+    }
+    result = ok ? 4 : 0;
+  }
   release_view(allocator, px);
   return result;
 }

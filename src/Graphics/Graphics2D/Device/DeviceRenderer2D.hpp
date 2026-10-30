@@ -90,6 +90,7 @@ class DeviceRenderer2D final : public IRenderer2D {
   bool group_blur(float sigma) override;
   bool group_color(const ColorTransform& t) override;
   bool group_cut_out(const Rect2D& rect, const CornerRadii& radii) override;
+  bool group_drop_shadow(int32_t dx, int32_t dy, float sigma, uint32_t color) override;
   void draw_image_scaled(const Surface& source, const RectF& source_rect, const Rect2D& dest, ImageFilter filter) override;
   void fill_linear_gradient(const Rect2D& rect, Vec2 from, Vec2 to, ArrayView<const GradientStop> stops) override;
   void fill_radial_gradient(const Rect2D& rect, Vec2 center, Vec2 radii, ArrayView<const GradientStop> stops) override;
@@ -158,6 +159,8 @@ class DeviceRenderer2D final : public IRenderer2D {
   bool open_group(const Rect2D& bounds, bool detached);   // begin_group / begin_filter_group
   bool filter_pass(IPipeline* pipeline, void* constants, uint32_t size, bool horizontal_unused);   // the top group's image through `pipeline` into a new image (which replaces it)
   bool blur_pass(int32_t radius, bool horizontal);
+  // One textured rectangle covering all of `dest` (w x h), showing `source`, through `pipeline`; `clear` first wipes dest to transparent.
+  bool pass_to(IImage* dest, uint32_t w, uint32_t h, IImage* source, IPipeline* pipeline, const void* constants, uint32_t size, Filter filter, bool clear);
   IPipeline* colored_pipeline(BlendMode mode) const;
   IPipeline* textured_pipeline(BlendMode mode) const;
 
@@ -244,6 +247,8 @@ class DeviceRenderer2D final : public IRenderer2D {
   IShaderModule* masked_fs_ = nullptr;
   IPipeline* masked_ = nullptr;
   bool masks_ok_ = false;
+  IShaderModule* shadow_fs_ = nullptr;
+  IPipeline* filter_shadow_ = nullptr;
   IPipeline* group_erase_ = nullptr;
   bool erase_ = false;   // shapes recorded now erase
   IShaderModule* blur_fs_ = nullptr;
