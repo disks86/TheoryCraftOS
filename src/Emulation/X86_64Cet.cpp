@@ -22,7 +22,7 @@
 // Shadow stacks are off until the host turns them on with enable_shadow_stack(): then every near call also pushes the return address on the shadow stack, every near ret compares its target with the
 // shadow stack entry and raises #CP when they differ, and rdssp / incssp / wrss work (wrss only if the host allowed it, as IA32_U_CET.WR_SHSTK_EN would). With shadow stacks off those instructions
 // are what they are on a processor without CET enabled: rdssp and incssp do nothing, wrss and wruss are #UD. Not modelled: the shadow stack page type (the stack is ordinary guest memory), far
-// calls and returns, interrupts and iret, the restore tokens (rstorssp, saveprevssp, setssbsy, clrssbsy) and indirect branch tracking (endbr is a nop).
+// calls and returns' mode and privilege-change cases, interrupts, supervisor shadow stacks (setssbsy and clrssbsy are #UD without them) and indirect branch tracking (endbr is a nop).
 //
 // enqcmd needs a valid PASID (IA32_PASID bit 31, set by the host with set_pasid()), otherwise it is #GP(0), as on a machine whose operating system has not set one up. The 64-byte command is
 // written to the destination (64-byte aligned, the address in the register) with its first dword replaced by the PASID; ordinary memory accepts every command, so ZF is clear. enqcmds is the
@@ -33,7 +33,7 @@ namespace emulation {
 
 namespace {
 constexpr uint8_t kControlProtection = 21;
-constexpr uint32_t kNearRet = 1;
+constexpr uint32_t kNearRet = 1, kFarRetOrIret = 2, kRstorssp = 4;
 }  // namespace
 
 // Pushes a return address on the shadow stack. On failure the fault is set and the shadow stack pointer is unchanged.
@@ -53,6 +53,58 @@ bool X86_64Cpu::cet_check_return(GuestMemory& m, uint64_t target) {
   }
   cet_.ssp += 8;
   return true;
+}
+
+// A far call pushes CS and then the return address on the shadow stack; a far return or iret pops the address and then CS and compares them with the ones it takes from the data stack (error code 2).
+bool X86_64Cpu::cet_push_far(GuestMemory& m, uint16_t selector, uint64_t address) {
+  if (!store(m, cet_.ssp - 8, 8, selector) || !store(m, cet_.ssp - 16, 8, address)) return false;
+  cet_.ssp -= 16;
+  return true;
+}
+
+bool X86_64Cpu::cet_check_far(GuestMemory& m, uint16_t selector, uint64_t address) {
+  uint64_t expected_address = 0, expected_selector = 0;
+  if (!load(m, cet_.ssp, 8, &expected_address) || !load(m, cet_.ssp + 8, 8, &expected_selector)) return false;
+  if (expected_address != address || expected_selector != selector) {
+    fail(kControlProtection, 0, kFarRetOrIret);
+    return false;
+  }
+  cet_.ssp += 16;
+  return true;
+}
+
+// rstorssp (F3 0F 01 /5, m64): switch to the shadow stack whose restore token is at the operand. The token (the address 8 above the operand with bit 0 set for 64-bit mode) is replaced by a "previous
+// SSP" token holding the current pointer with bits 0 and 1 set, so saveprevssp can later turn it into a restore token for the stack being left. An invalid token is #CP, with the token put back.
+X86_64Cpu::Step X86_64Cpu::rstorssp_instruction(GuestMemory& m) {
+  if (!cet_.enabled) return fail(6);
+  const uint64_t address = memory_address();
+  if (address % 8 != 0) return fail(13);
+  uint64_t token = 0;
+  if (!load(m, address, 8, &token)) return Step::Fault;
+  const bool valid = (token & 1) && !(token & 2) && ((((token & ~uint64_t{1}) - 8) & ~uint64_t{7}) == address);
+  if (!store(m, address, 8, valid ? (cet_.ssp | 3) : token)) return Step::Fault;
+  if (!valid) return fail(kControlProtection, 0, kRstorssp);
+  cet_.ssp = address;
+  s_.rflags &= ~(kZero | kParity | kAdjust | kOverflow | kSign | kCarry);
+  if (token & 4) s_.rflags |= kCarry;      // (an alignment hole)
+  s_.rip += d_.position;
+  return Step::Ok;
+}
+
+// saveprevssp (F3 0F 01 EA): pop the previous-SSP token that rstorssp left on the (new) shadow stack and write a restore token for the old one just below its top, so the old stack can be
+// switched back to.
+X86_64Cpu::Step X86_64Cpu::saveprevssp_instruction(GuestMemory& m) {
+  if (!cet_.enabled) return fail(6);
+  if (cet_.ssp % 8 != 0) return fail(13);
+  uint64_t token = 0;
+  if (!load(m, cet_.ssp, 8, &token)) return Step::Fault;
+  if (s_.rflags & kCarry) return fail(13);      // (an alignment hole cannot occur in 64-bit mode)
+  if (!(token & 2)) return fail(13);
+  const uint64_t old_ssp = token & ~uint64_t{3};
+  if (!store(m, old_ssp - 4, 4, 0) || !store(m, (old_ssp - 4) & ~uint64_t{7}, 8, old_ssp | 1)) return Step::Fault;
+  cet_.ssp += 8;
+  s_.rip += d_.position;
+  return Step::Ok;
 }
 
 // rdsspd / rdsspq (F3 0F 1E /1, register form): the shadow stack pointer into the register; a nop with shadow stacks off.

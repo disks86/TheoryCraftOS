@@ -53,6 +53,8 @@ class Painter {
   void bevel(const Rect2D& r, bool sunken);
   // Copies `source_rect` of `source` with its top left at (x, y) (see IRenderer2D::draw_image).
   void image(const graphics::Surface& source, const Rect2D& source_rect, int32_t x, int32_t y);
+  // The same for an image that lives on a graphics device (see IRenderer2D::draw_device_image); false, and nothing drawn, if the renderer cannot take it where it is.
+  bool device_image(graphics::IGraphicsDevice& owner, graphics::IImage& image, const Rect2D& source_rect, int32_t x, int32_t y);
   void text(int32_t x, int32_t y, StringView text, uint32_t color);
   // Centered in `r`, both ways.
   void text_centered(const Rect2D& r, StringView text, uint32_t color);

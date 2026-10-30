@@ -26,6 +26,8 @@
 #include <time.h>
 #include <vector>
 #include "Desktop/CubeRenderer.hpp"
+#include "Graphics/Graphics2D/Device/DeviceRenderer2D.hpp"
+#include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
 #include "Graphics/Graphics3D/BuiltinShaders.hpp"
 #include "Graphics/Graphics3D/CubeMesh.hpp"
 #include "Graphics/Graphics3D/Software/SoftwareDevice.hpp"
@@ -250,6 +252,59 @@ static void test_benchmark(TestAllocator& a) {
   }
 }
 
+// A frame that stays on the device is shown by a 2D renderer on that same device with the pixels the readback gives, and the lending has its rules.
+static void test_shared(TestAllocator& a) {
+  graphics::SoftwareDevice device{a, nullptr};
+  graphics::SoftwareDevice other{a, nullptr};
+  dxgk::Kernel kernel(a);
+  CHECK(kernel.add_adapter(device, dxgk::AdapterConfig()) == 0);
+  CubeFrameTimes times;
+  const uint32_t W = 160, H = 120;
+
+  CubeRenderer plain(a, kernel, 0x40);
+  CHECK(plain.open(0, W, H) && !plain.shareable());   // (a target made for readback only is not lent)
+  graphics::IGraphicsDevice* lent_device = nullptr;
+  graphics::IImage* lent_image = nullptr;
+  CHECK(plain.render(0, false, &times) && !plain.acquire_target(&lent_device, &lent_image));
+  plain.close();
+
+  CubeRenderer r(a, kernel, 0x41);
+  CHECK(r.open(0, W, H, true) && r.shareable());
+  CHECK(r.render(0.8f, true, &times, false));
+  CHECK(r.acquire_target(&lent_device, &lent_image) && lent_device == &device && lent_image);
+  graphics::IGraphicsDevice* again_device = nullptr;
+  graphics::IImage* again_image = nullptr;
+  CHECK(!r.acquire_target(&again_device, &again_image));   // (lent once)
+  CHECK(!r.render(0.8f, true, &times, false));              // (and not drawn into meanwhile)
+
+  graphics::DeviceRenderer2D d(device, a, {W + 40, H + 20});
+  CHECK(d.valid());
+  d.clear(0xFF303030);
+  CHECK(d.draw_device_image(*lent_device, *lent_image, {0, 0, W, H}, 20, 10));
+  graphics::DeviceRenderer2D foreign(other, a, {W, H});
+  CHECK(!foreign.draw_device_image(*lent_device, *lent_image, {0, 0, W, H}, 0, 0));   // (another device cannot sample it)
+  graphics::Surface cpu_target;
+  cpu_target.pixels = allocate_view<uint32_t>(a, uint64_t{W} * H);
+  cpu_target.width = W, cpu_target.height = H, cpu_target.pitch = W;
+  graphics::SoftwareRenderer2D cpu(cpu_target);
+  CHECK(!cpu.draw_device_image(*lent_device, *lent_image, {0, 0, W, H}, 0, 0));       // (nor the CPU renderer)
+  release_view(a, cpu_target.pixels);
+  r.release_target();
+
+  ArrayView<uint32_t> composed = allocate_view<uint32_t>(a, uint64_t{W + 40} * (H + 20));
+  CHECK(d.read_pixels(composed));
+  CHECK(r.fetch_picture());
+  uint64_t differing = 0;
+  for (uint32_t y = 0; y < H; ++y)
+    for (uint32_t x = 0; x < W; ++x) differing += composed[uint64_t{y + 10} * (W + 40) + x + 20] != pixel(r, x, y);
+  printf("   shared frame: %llu of %u pixels differ from the read-back picture\n", static_cast<unsigned long long>(differing), W * H);
+  CHECK(differing == 0);
+  CHECK(composed[0] == 0xFF303030 && composed[uint64_t{70} * (W + 40) + 100] != 0xFF303030);   // (the margin is untouched, the cube is there)
+  release_view(a, composed);
+
+  CHECK(r.render(1.0f, true, &times, false));   // back in the renderer's hands
+}
+
 int main(int argc, char** argv) {
   g_logo = read_file(argc > 1 ? argv[1] : "assets/logo.png");
   if (g_logo.empty()) {
@@ -260,6 +315,7 @@ int main(int argc, char** argv) {
   test_flat(a);
   test_logo(a);
   test_benchmark(a);
+  test_shared(a);
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);
     return 1;

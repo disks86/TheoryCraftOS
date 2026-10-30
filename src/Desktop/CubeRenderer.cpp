@@ -85,6 +85,8 @@ void CubeRenderer::close() {
   picture_ = graphics::Surface();
   texture_available_ = false;
   last_textured_ = false;
+  shareable_ = false;
+  target_lent_ = false;
   width_ = height_ = 0;
   adapter_index_ = kInvalidIndex;
 }
@@ -122,7 +124,7 @@ bool CubeRenderer::create_pipeline(bool textured, Handle* pipeline) {
   pd.varying_count = d.varying_count;
   pd.texture_count = d.texture_count;
   for (uint32_t i = 0; i < d.attribute_count; ++i) pd.attributes[i] = d.attributes[i];
-  pd.cull_mode = graphics::CullMode::None;
+  pd.cull_mode = graphics::CullMode::Back;   // (a closed cube: the far faces are never seen, so they are not rasterized or shaded)
   pd.depth_test = pd.depth_write = true;
   return status::ok(kernel_.create_pipeline(pid_, state_->device, pd, pipeline));
 }
@@ -164,7 +166,7 @@ bool CubeRenderer::create_logo() {
   return ok;
 }
 
-bool CubeRenderer::open(uint32_t adapter_index, uint32_t width, uint32_t height) {
+bool CubeRenderer::open(uint32_t adapter_index, uint32_t width, uint32_t height, bool shareable) {
   close();
   if (!process_open_ || !width || !height) return false;
   state_ = UniquePointer<State>::make(allocator_);
@@ -191,7 +193,13 @@ bool CubeRenderer::open(uint32_t adapter_index, uint32_t width, uint32_t height)
   picture_.height = height;
   picture_.pitch = width;
   picture_.format = graphics::Format::B8G8R8A8Unorm;
-  if (!picture_.valid() || !status::ok(kernel_.create_allocation(pid_, s.device, target, &s.color)) || !status::ok(kernel_.create_allocation(pid_, s.device, depth, &s.depth)) ||
+  // (a device that cannot make a target that is also sampled gets the plain one, and its frames are read back)
+  if (shareable) {
+    AllocationDesc sampled = target;
+    sampled.flags |= kAllocTexture;
+    if (status::ok(kernel_.create_allocation(pid_, s.device, sampled, &s.color))) shareable_ = true;
+  }
+  if (!picture_.valid() || (!shareable_ && !status::ok(kernel_.create_allocation(pid_, s.device, target, &s.color))) || !status::ok(kernel_.create_allocation(pid_, s.device, depth, &s.depth)) ||
       !create_pipeline(false, &s.colored_pipeline) || !create_geometry()) {
     close();
     return false;
@@ -225,8 +233,8 @@ bool CubeRenderer::read_back() {
   return ok;
 }
 
-bool CubeRenderer::render(float angle, bool textured, CubeFrameTimes* times) {
-  if (!state_) return false;
+bool CubeRenderer::render(float angle, bool textured, CubeFrameTimes* times, bool read_back_frame) {
+  if (!state_ || target_lent_) return false;
   State& s = *state_;
   const bool use_logo = textured && texture_available_ && s.logo;
   last_textured_ = use_logo;
@@ -252,13 +260,29 @@ bool CubeRenderer::render(float angle, bool textured, CubeFrameTimes* times) {
   const uint64_t start = now_us();
   const bool submitted = status::ok(kernel_.render(pid_, s.context, w.view(), ArrayView<const Handle>(list, use_logo ? kListSize : kListLogo)));
   const uint64_t submitted_at = now_us();
-  const bool read = submitted && read_back();
+  const bool read = submitted && (!read_back_frame || read_back());
   const uint64_t done = now_us();
   if (times) {
     times->submit_us = submitted_at - start;
     times->readback_us = done - submitted_at;
   }
   return read;
+}
+
+bool CubeRenderer::acquire_target(graphics::IGraphicsDevice** device, graphics::IImage** image) {
+  if (!state_ || !shareable_ || target_lent_) return false;
+  AcquiredImage lent;
+  if (!status::ok(kernel_.acquire_image(pid_, state_->color, &lent))) return false;
+  *device = lent.device;
+  *image = lent.image;
+  target_lent_ = true;
+  return true;
+}
+
+void CubeRenderer::release_target() {
+  if (!target_lent_) return;
+  kernel_.release_image(pid_, state_->color);
+  target_lent_ = false;
 }
 
 }  // namespace desktop

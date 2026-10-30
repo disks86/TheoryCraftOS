@@ -170,8 +170,11 @@ bool Event::wait(uint64_t timeout_us) {
 bool ConditionVariable::wait(Mutex& mutex, uint64_t timeout_us) {
   const uint64_t flags = detail::lock();
   detail::block_current_locked(&list_, timeout_us);  // enqueued before the mutex is released: no missed notify
+  // The mutex is let go while the scheduler's lock is still held (interrupts are off): a thread that is marked blocked but has not given up the mutex yet must not be
+  // switched away from, or the mutex would stay held until somebody wakes it - and the ones that would wake it may be waiting for that mutex.
+  __atomic_exchange_n(&mutex.state_, 0, __ATOMIC_SEQ_CST);
+  if (__atomic_load_n(&mutex.waiters_, __ATOMIC_SEQ_CST) != 0) detail::wake_one_locked(&mutex.list_);
   detail::unlock(flags);
-  mutex.unlock();
   yield();
   const bool timed_out = current_thread()->timed_out;
   mutex.lock();

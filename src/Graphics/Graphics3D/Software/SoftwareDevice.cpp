@@ -700,8 +700,40 @@ void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVert
   };
   const bool lod_pass = s.pipeline->samples_textures() && s.textures.uses_lod();
 
+  // Per row, the columns that can be inside: each edge value is linear in x, so it is solved for where it turns non-negative and the range is widened by two pixels, which covers the
+  // rounding. The exact tests below still decide every pixel, so the picture is the one a full scan of the bounding box gives. (Far off-screen vertices make the solving imprecise: no trimming.)
+  const bool trim = fx0 > -1e5f && fx1 < 1e5f && fy0 > -1e5f && fy1 < 1e5f;
+  struct EdgeLine {
+    float vx, vy, dx, dy;
+  };
+  const EdgeLine edges[3] = {{v1->x, v1->y, e0dx, e0dy}, {v2->x, v2->y, e1dx, e1dy}, {v0->x, v0->y, e2dx, e2dy}};
+  const uint32_t target_width = s.color->extent().width;
+
   for (int32_t y = min_y; y < max_y; ++y) {
-    for (int32_t x = min_x; x < max_x; ++x) {
+    int32_t row_begin = min_x, row_end = max_x;
+    if (trim) {
+      const float row_y = y + 0.5f;
+      bool empty = false;
+      for (const EdgeLine& e : edges) {
+        const float t = (row_y - e.vy) * e.dx;   // (the edge value is t - (px - vx) * dy, to be >= 0)
+        if (e.dy == 0) {
+          if (t < 0) empty = true;
+        } else {
+          const float bound = e.vx + t / e.dy - 0.5f;   // (the x whose pixel centre has the value zero)
+          if (e.dy < 0) {   // the value grows with x: it is non-negative from the bound on
+            const float lo = bound - 2.0f;
+            if (lo >= static_cast<float>(row_end)) empty = true;
+            else if (lo > static_cast<float>(row_begin)) row_begin = static_cast<int32_t>(lo);
+          } else {   // it shrinks with x: non-negative up to the bound
+            const float hi = bound + 3.0f;
+            if (hi <= static_cast<float>(row_begin)) empty = true;
+            else if (hi < static_cast<float>(row_end)) row_end = static_cast<int32_t>(hi);
+          }
+        }
+      }
+      if (empty || row_begin >= row_end) continue;
+    }
+    for (int32_t x = row_begin; x < row_end; ++x) {
       const float px = x + 0.5f, py = y + 0.5f;
       const float w0 = (px - v1->x) * e0dy - (py - v1->y) * e0dx;
       const float w1 = (px - v2->x) * e1dy - (py - v2->y) * e1dx;
@@ -735,7 +767,7 @@ void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVert
       }
       const float b0 = l0 * inv_area, b1 = l1 * inv_area, b2 = l2 * inv_area;
 
-      const uint64_t index = uint64_t{static_cast<uint32_t>(y)} * s.color->extent().width + static_cast<uint32_t>(x);
+      const uint64_t index = uint64_t{static_cast<uint32_t>(y)} * target_width + static_cast<uint32_t>(x);
       const float z = b0 * v0->z + b1 * v1->z + b2 * v2->z;
       uint32_t depth_pass = covered;   // (the samples that pass the depth test)
       if (pd.depth_test && !depth.empty())
@@ -1058,13 +1090,11 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
               continue;
             }
             const uint32_t v = surface.encode(pack_color(cmd.pass.clear_color_value));
-            for (uint32_t& pixel : image->all_samples()) pixel = v;
+            image->all_samples().fill(v);   // (every sample of every pixel; the rows of a plain image are tight)
           }
         }
-        if (s.depth && cmd.pass.clear_depth)
-          for (float& d : s.depth->depth()) d = cmd.pass.clear_depth_value;
-        if (s.depth && cmd.pass.clear_stencil)
-          for (uint8_t& v : s.depth->stencil()) v = cmd.pass.clear_stencil_value;
+        if (s.depth && cmd.pass.clear_depth) s.depth->depth().fill(cmd.pass.clear_depth_value);
+        if (s.depth && cmd.pass.clear_stencil) s.depth->stencil().fill(cmd.pass.clear_stencil_value);
         s.viewport = {0, 0, static_cast<float>(e.width), static_cast<float>(e.height), 0, 1};
         s.scissor = {0, 0, e.width, e.height};
         s.pipeline = nullptr;

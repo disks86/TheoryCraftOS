@@ -123,10 +123,10 @@ X86_64Cpu::Step X86_64Cpu::group9(GuestMemory& m) {
 }
 
 X86_64Cpu::Step X86_64Cpu::system_0f01(GuestMemory& m) {
-  (void)m;
   auto bad_decode = [&]() { return fail(d_.available < 15 ? 14 : 6, s_.rip + d_.available); };
   if (!decode_modrm() || !finish_decode()) return bad_decode();
-  if (d_.mod != 3) return fail(6);
+  if (d_.mod != 3) return d_.rep && !d_.operand16 && !d_.repne && (d_.reg & 7) == 5 ? rstorssp_instruction(m) : fail(6);      // F3 0F 01 /5 m64: rstorssp
+  if (d_.rep && !d_.operand16 && !d_.repne && d_.reg == 5 && d_.rm == 2) return saveprevssp_instruction(m);
   switch (0xC0 | ((d_.reg & 7) << 3) | (d_.rm & 7)) {
     case 0xD0:      // xgetbv: XCR0 says x87, SSE, AVX, the AVX-512 state and the AMX tile state and the APX registers are enabled
       if (static_cast<uint32_t>(s_.r[1]) > 1) return fail(13);
