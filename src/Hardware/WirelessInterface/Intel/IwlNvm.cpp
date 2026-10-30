@@ -111,4 +111,84 @@ bool iwl_read_nvm_section(IwlTransport& transport, uint16_t section, ByteBuffer&
   }
 }
 
+
+uint16_t iwl_nvm_channel_number(uint32_t index) {
+  if (index < 14) return static_cast<uint16_t>(index + 1);
+  index -= 14;
+  if (index < 8) return static_cast<uint16_t>(36 + 4 * index);        // 36 - 64
+  index -= 8;
+  if (index < 8) return static_cast<uint16_t>(68 + 4 * index);        // 68 - 96
+  index -= 8;
+  if (index < 12) return static_cast<uint16_t>(100 + 4 * index);      // 100 - 144
+  index -= 12;
+  if (index < 9) return static_cast<uint16_t>(149 + 4 * index);       // 149 - 181
+  return 0;
+}
+
+uint16_t iwl_channel_frequency(uint16_t number, bool is_5ghz) {
+  if (!is_5ghz) return number == 14 ? 2484 : static_cast<uint16_t>(2407 + 5 * number);
+  return static_cast<uint16_t>(5000 + 5 * number);
+}
+
+bool iwl_read_csr_hw_address(IwlPcieDevice& device, uint8_t out[6]) {
+  const uint32_t base = iwl_nvm::kMacAddrCsrBase;
+  iwl_flip_hw_address(device.read32(base + 8), device.read32(base + 12), out);
+  if (iwl_valid_ether_address(out)) return true;                       // the OEM's fuse
+  iwl_flip_hw_address(device.read32(base), device.read32(base + 4), out);
+  return iwl_valid_ether_address(out);
+}
+
+bool iwl_parse_nvm_get_info(ConstByteView payload, uint8_t firmware_tx, uint8_t firmware_rx, bool lar_capable, IwlNvmData* out, const char** error) {
+  const char* local = nullptr;
+  if (!error) error = &local;
+  // general 8 bytes, MAC SKU 4, PHY SKU 8, then the regulatory part: v3 (LAR flag, 51 16 bit profiles, 2 reserved), v4 (LAR flag, count, 110 32 bit), v5 (the same with 115)
+  constexpr uint64_t kFixed = 8 + 4 + 8;
+  const uint64_t v3 = kFixed + 4 + 51 * 2 + 2, v4 = kFixed + 8 + 110 * 4, v5 = kFixed + 8 + 115 * 4;
+  const uint64_t size = payload.size();
+  if (size != v3 && size != v4 && size != v5) {
+    *error = "the NVM info response has an unknown size";
+    return false;
+  }
+  ByteReader r(payload);
+  const uint32_t flags = r.le32();
+  out->nvm_version = r.le16();
+  out->board_type = r.u8();
+  out->n_hw_addresses = r.u8();
+  out->empty_otp = (flags & 1) != 0;
+  const uint32_t sku = r.le32();
+  out->band_24ghz = (sku & iwl_nvm::kSkuBand24) != 0;
+  out->band_5ghz = (sku & iwl_nvm::kSkuBand52) != 0;
+  out->ieee80211n = (sku & iwl_nvm::kSku11n) != 0;
+  out->ieee80211ac = (sku & iwl_nvm::kSku11ac) != 0;
+  out->ieee80211ax = (sku & iwl_nvm::kSku11ax) != 0;
+  out->mimo_disabled = (sku & iwl_nvm::kSkuMimoDisabled) != 0;
+  out->tx_antennas = static_cast<uint8_t>(r.le32()) & firmware_tx;
+  out->rx_antennas = static_cast<uint8_t>(r.le32()) & firmware_rx;
+  const uint32_t lar = r.le32();
+  out->lar_enabled = lar != 0 && lar_capable;
+  uint32_t entries = 51;
+  const bool wide = size != v3;                                         // 32 bit profiles with a count
+  if (wide) {
+    const uint32_t listed = r.le32();
+    const uint32_t room = size == v4 ? 110 : 115;
+    entries = listed < room ? listed : room;                            // a count beyond the array is clamped, not trusted
+  }
+  out->channel_count = 0;
+  for (uint32_t i = 0; i < entries; ++i) {
+    const uint32_t profile = wide ? r.le32() : r.le16();
+    if (!r.ok()) {
+      *error = "the NVM info response is truncated";
+      return false;
+    }
+    const uint16_t number = iwl_nvm_channel_number(i);
+    if (number == 0 || out->channel_count >= iwl_nvm::kMaxChannels) continue;       // the 6 GHz and later entries are not for this card
+    IwlChannel& c = out->channels[out->channel_count++];
+    c.number = number;
+    c.is_5ghz = i >= 14;
+    c.frequency_mhz = iwl_channel_frequency(number, c.is_5ghz);
+    c.flags = profile;
+  }
+  return r.ok();
+}
+
 }  // namespace hardware

@@ -24,13 +24,13 @@
 namespace hardware {
 
 // An I2C bus as the master sees it: one transaction is an optional write, then (after a repeated start) an optional read, ending with a stop. 7 bit addresses.
-class II2cBus {
+class II2cMaster {
  public:
   virtual bool transfer(uint16_t address, ConstByteView write, ByteView read) = 0;
 
  protected:
-  constexpr II2cBus() = default;
-  ~II2cBus() = default;
+  constexpr II2cMaster() = default;
+  ~II2cMaster() = default;
 };
 
 }  // namespace hardware

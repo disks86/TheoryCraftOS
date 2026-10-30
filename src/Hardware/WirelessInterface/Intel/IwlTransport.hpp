@@ -73,6 +73,8 @@ class IwlTransport final : private IIwlPacketSink {
   int32_t send_sync(const IwlHostCommand& command, ByteView response, uint32_t timeout_us, const char** error);
   // Handles whatever the firmware has sent; notifications go to the handler. Returns the number of frames.
   uint32_t poll(IIwlNotificationHandler* handler);
+  // Notifications that arrive while a command is waited for (or in a poll without a handler) go here.
+  void set_handler(IIwlNotificationHandler* handler) { default_handler_ = handler; }
 
   const IwlAliveInfo& alive() const { return alive_; }
   IwlPcieDevice& device() { return device_; }
@@ -95,6 +97,7 @@ class IwlTransport final : private IIwlPacketSink {
   ByteView response_;
   uint32_t response_length_ = 0;
   IIwlNotificationHandler* handler_ = nullptr;
+  IIwlNotificationHandler* default_handler_ = nullptr;
 };
 
 }  // namespace hardware

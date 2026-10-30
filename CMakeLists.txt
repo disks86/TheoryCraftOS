@@ -728,6 +728,8 @@ add_executable(BOOTX64
   src/Hardware/WirelessInterface/Intel/IwlTx.cpp
   src/Hardware/WirelessInterface/Intel/IwlTransport.cpp
   src/Hardware/WirelessInterface/Intel/IwlNvm.cpp
+  src/Hardware/WirelessInterface/Intel/IwlInit.cpp
+  src/Hardware/WirelessInterface/Intel/IwlDriver.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnIsa.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnEmu.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/Gcn/TgsiParse.cpp
@@ -1043,6 +1045,10 @@ endif()
 option(TCOS_AMD_VEGAM "Bring up the Radeon RX Vega M (Kaby Lake-G): memory controller and GART, interrupt ring, microcode through the SMC, graphics engine with compute queues, SDMA, and the display surface (not yet run on a real card)" OFF)
 if(TCOS_AMD_VEGAM)
   target_compile_definitions(BOOTX64 PRIVATE TCOS_AMD_VEGAM)
+endif()
+option(TCOS_INTEL_WIFI "Start the Intel Wireless-AC 9000 series card (firmware from /firmware, initialisation, hardware address and channels; no scanning or joining yet; not yet run on a real card)" OFF)
+if(TCOS_INTEL_WIFI)
+  target_compile_definitions(BOOTX64 PRIVATE TCOS_INTEL_WIFI)
 endif()
 option(TCOS_SELFTESTS "Run the boot-time self-checks and demos of every subsystem" OFF)
 if(TCOS_SELFTESTS)

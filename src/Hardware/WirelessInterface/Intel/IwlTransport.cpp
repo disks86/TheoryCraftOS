@@ -143,7 +143,7 @@ void IwlTransport::on_packet(const IwlRxPacket& packet) {
 
 uint32_t IwlTransport::poll(IIwlNotificationHandler* handler) {
   IIwlNotificationHandler* saved = handler_;
-  handler_ = handler;
+  handler_ = handler ? handler : default_handler_;
   const uint32_t frames = rx_.poll(*this);
   handler_ = saved;
   return frames;
