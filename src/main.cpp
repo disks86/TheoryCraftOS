@@ -94,7 +94,10 @@
 #include "Hardware/WirelessInterface/Intel/IwlWireless.hpp"
 #endif
 #ifdef TCOS_THUNDERBOLT
+#include "Hardware/Bus/Pci/PciMsi.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltDriver.hpp"
+#include "Kernel/Apic.hpp"
+#include "Kernel/Interrupts.hpp"
 #endif
 #include "Hardware/Keyboard/KeyCodes.hpp"
 #include "Kernel/Clipboard.hpp"
@@ -161,6 +164,15 @@ static void demo_task(void* context) {
 
 using bootlog::Entry;
 using bootlog::Level;
+
+#ifdef TCOS_THUNDERBOLT
+// The Thunderbolt host interface's MSI: the driver reads the chip's notify registers (which lets it interrupt again) and counts; the desktop loop then reads the control channel.
+static kernel::Frame* on_thunderbolt_interrupt(kernel::Frame* frame, void* driver) {
+  kernel::apic::eoi();
+  static_cast<hardware::ThunderboltDriver*>(driver)->on_interrupt();
+  return frame;
+}
+#endif
 
 #ifdef TCOS_AMD_VEGAM
 // The Radeon RX Vega M's MSI: counts the interrupts; the desktop loop then reads the card's interrupt ring (no register is touched here).
@@ -1156,6 +1168,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     UniquePointer<hardware::ThunderboltDriver> thunderbolt;
     UniquePointer<hardware::FileTbKeyStore> thunderbolt_keys;       // the keys of devices approved at the secure level
     uint64_t thunderbolt_devices = 0;
+    UniquePointer<hardware::PciMsi> thunderbolt_msi;                // its MSI, when the machine delivers it
+    bool thunderbolt_msi_working = false;                           // an interrupt arrived in the start-up check: the loop reads the channel only when one comes
     if (clock_ok && paging_ok) {
       for (uint32_t i = 0; i < pci.device_count(); ++i) {
         hardware::PciDeviceInfo d;
@@ -1170,8 +1184,26 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
           if (!smb_random.ready()) smb_random.initialize();
           thunderbolt_keys = UniquePointer<hardware::FileTbKeyStore>::make(shared_allocator, explorer_files.file_system(), shared_allocator);
           if (thunderbolt_keys) thunderbolt->icm()->set_secure(&smb_random, thunderbolt_keys.get());
+          // MSI: the handler, then the message to the core that runs this; kept only if an interrupt arrives for a request of the controller
+          const uint32_t tb_apic_id = kernel::running() ? kernel::apic::this_apic_id() : 0xFFFF;
+          if (tb_apic_id <= 0xFF) {
+            kernel::set_interrupt_handler(kernel::kVectorThunderbolt, &on_thunderbolt_interrupt, thunderbolt.get());
+            thunderbolt_msi = UniquePointer<hardware::PciMsi>::make(shared_allocator, pci);
+            if (thunderbolt_msi && thunderbolt_msi->enable(d.address, 0xFEE00000u | (tb_apic_id << 12), kernel::kVectorThunderbolt) && thunderbolt->use_interrupts(true)) {
+              const uint32_t before = thunderbolt->interrupts();
+              uint32_t word = 0;
+              thunderbolt->icm()->control().read_config(0, 0, hardware::TbConfigSpace::Switch, 0, ArrayView<uint32_t>(&word, 1), 100000, nullptr, thunderbolt->icm());
+              hardware::delay_us(2000);
+              thunderbolt_msi_working = thunderbolt->interrupts() != before;
+            }
+            if (!thunderbolt_msi_working) {
+              thunderbolt->use_interrupts(false);
+              thunderbolt_msi = UniquePointer<hardware::PciMsi>();
+              kernel::set_interrupt_handler(kernel::kVectorThunderbolt, nullptr, nullptr);
+            }
+          }
           Entry e(Level::Ok, "Thunderbolt");
-          e.text(thunderbolt->model()->name).text(", security level ").dec(static_cast<uint32_t>(thunderbolt->icm()->security_level())).text(", firmware ").dec(thunderbolt->icm()->driver_ready().rom_version).text(".").dec(thunderbolt->icm()->driver_ready().ram_version);
+          e.text(thunderbolt->model()->name).text(thunderbolt_msi_working ? " (MSI)" : " (polled)").text(", security level ").dec(static_cast<uint32_t>(thunderbolt->icm()->security_level())).text(", firmware ").dec(thunderbolt->icm()->driver_ready().rom_version).text(".").dec(thunderbolt->icm()->driver_ready().ram_version);
         } else {
           Entry(Level::Warning, "Thunderbolt").text(thunderbolt->model() ? thunderbolt->model()->name : "controller").text(" not started: ").text(thunderbolt->message());
           thunderbolt = UniquePointer<hardware::ThunderboltDriver>();
@@ -1592,7 +1624,13 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
 #endif
 #ifdef TCOS_THUNDERBOLT
       if (thunderbolt) {
-        thunderbolt->poll();
+        static uint32_t tb_seen = 0, tb_idle = 0;                   // with MSI the channel is read when an interrupt came (and now and then in case one was lost)
+        const uint32_t tb_arrived = thunderbolt->interrupts();
+        if (!thunderbolt_msi_working || tb_arrived != tb_seen || ++tb_idle >= 250) {
+          tb_seen = tb_arrived;
+          tb_idle = 0;
+          thunderbolt->poll();
+        }
         const uint64_t now_devices = thunderbolt->icm()->device_count();
         if (now_devices != thunderbolt_devices) {
           desktop.notify(StringView("Thunderbolt"), StringView(now_devices > thunderbolt_devices ? "A Thunderbolt device was connected (not authorized: no PCIe tunnel)" : "A Thunderbolt device was removed"),
@@ -1610,6 +1648,12 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       }
       hardware::delay_us(4000);
     }
+#ifdef TCOS_THUNDERBOLT
+    if (thunderbolt_msi) {                                          // (before the driver goes: the handler holds a pointer to it)
+      thunderbolt_msi = UniquePointer<hardware::PciMsi>();
+      kernel::set_interrupt_handler(kernel::kVectorThunderbolt, nullptr, nullptr);
+    }
+#endif
     desktop.save_browser_data();
     const uint32_t kept = desktop.save_session();   // what is open now, for the next start
     Entry(Level::Info, "Desktop").text("saved ").dec(kept).text(" window(s) for the next session");

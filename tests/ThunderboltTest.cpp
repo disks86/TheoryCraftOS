@@ -29,6 +29,7 @@
 #include "FakeThunderbolt.hpp"
 #include "FileSystem/Ram/RamFileSystem.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltKeys.hpp"
+#include "Hardware/Bus/Thunderbolt/ThunderboltXdomain.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltControl.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltDevices.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltDriver.hpp"
@@ -1293,6 +1294,521 @@ static void test_titan() {
   }
 }
 
+
+// ---- interrupts
+
+static void test_interrupts() {
+  TestAllocator alloc;
+  FakeNhi chip;
+  ThunderboltDriver driver(alloc);
+  CHECK(!driver.use_interrupts(true) && driver.interrupts() == 0);               // not started
+  CHECK(driver.start_device(chip) == ThunderboltDriver::Outcome::Started);
+  CHECK(chip.unmasked[0] == 0 && chip.interrupts_raised == 0);                    // start-up keeps them masked
+  chip.raise_interrupt = [&] { driver.on_interrupt(); };
+  CHECK(driver.use_interrupts(true) && driver.icm()->interrupts_on());
+  CHECK(chip.unmasked[0] == ((1u << 0) | (1u << 12)));                           // hop 0, transmit (bit 0) and receive (bit hops)
+  // a frame for the host: the chip raises the interrupt, the handler reads the notify registers and counts
+  const uint32_t reads = chip.notify_reads;
+  chip.send_device_connected(make_device(0x20, 1, 1));
+  CHECK(chip.interrupts_raised == 1 && driver.interrupts() == 1 && chip.notify_reads > reads && chip.notify[0] == 0);
+  CHECK(driver.icm()->device_count() == 0);                                      // (the handler only counts)
+  driver.poll();
+  CHECK(driver.icm()->device_count() == 1);
+  // what the host sends completes a transmit descriptor: another interrupt
+  uint32_t word = 0;
+  CHECK(driver.icm()->control().read_config(0, 0, TbConfigSpace::Switch, 0, ArrayView<uint32_t>(&word, 1), 1000, nullptr, driver.icm()) == TbControl::Result::Ok);
+  CHECK(driver.interrupts() >= 3);
+  // masked again: nothing more
+  CHECK(driver.use_interrupts(false) && chip.unmasked[0] == 0);
+  const uint32_t before = chip.interrupts_raised;
+  chip.send_device_connected(make_device(0x50, 3, 1));
+  driver.poll();
+  CHECK(chip.interrupts_raised == before && driver.icm()->device_count() == 2);
+  // an interrupt with nothing to report is not counted
+  const uint32_t counted = driver.interrupts();
+  driver.on_interrupt();
+  CHECK(driver.interrupts() == counted);
+  // they survive sleep: masked by the bring-up, unmasked again after it
+  CHECK(driver.use_interrupts(true) && driver.suspend());
+  CHECK(!driver.use_interrupts(false));
+  CHECK(driver.resume() == ThunderboltDriver::Outcome::Started && chip.unmasked[0] == ((1u << 0) | (1u << 12)));
+  driver.stop();
+  CHECK(!driver.use_interrupts(true));
+  driver.on_interrupt();                                                          // (safe with no controller)
+  // a controller with many hops: the receive ring's bit is in another register
+  FakeNhi wide;
+  wide.hops = 40;
+  ThunderboltDriver wide_driver(alloc);
+  CHECK(wide_driver.start_device(wide) == ThunderboltDriver::Outcome::Started && wide_driver.use_interrupts(true));
+  CHECK(wide.unmasked[0] == 1u && wide.unmasked[1] == (1u << 8));
+}
+
+
+// ---- XDomain
+
+// A property block as another host would send it: values of words, text in 4 byte groups most significant byte first.
+static uint32_t chars4(const char* s) {
+  uint32_t v = 0;
+  for (int i = 0; i < 4; ++i) v = (v << 8) | (s[i] ? static_cast<uint8_t>(s[i]) : 0);
+  return v;
+}
+static void put_text(std::vector<uint32_t>& block, const char* text) {
+  const size_t len = strlen(text);
+  const size_t words = (len + 1 + 3) / 4;
+  for (size_t w = 0; w < words; ++w) {
+    char part[5] = {};
+    for (size_t k = 0; k < 4; ++k) part[k] = w * 4 + k < len ? text[w * 4 + k] : 0;
+    block.push_back(chars4(part));
+  }
+}
+struct EntryText {
+  static void key(std::vector<uint32_t>& b, const char* k) {
+    char pad[9] = {};
+    strncpy(pad, k, 8);
+    b.push_back(chars4(pad));
+    b.push_back(chars4(pad + 4));
+  }
+};
+// root: vendorid 0x1234, vendorid "Acme", deviceid 0x77, a service directory with prtcid 1; and filler text so that the block is longer than one response
+static std::vector<uint32_t> remote_block(size_t filler_words = 60) {
+  std::vector<uint32_t> b = {0x55584401u, 0};
+  auto entry = [&](const char* k, uint32_t length, uint32_t type, uint32_t value) {
+    EntryText::key(b, k);
+    b.push_back(length | (type << 24));
+    b.push_back(value);
+  };
+  // entries: 5 (vendorid value, vendorid text, deviceid value, filler data, services directory)
+  const size_t entries = 5;
+  b[1] = static_cast<uint32_t>(4 * entries);
+  const size_t data_at = 2 + 4 * entries;
+  std::vector<uint32_t> data;
+  put_text(data, "Acme");
+  const size_t text_words = data.size();
+  entry("vendorid", 1, 0x76, 0x1234);
+  entry("vendorid", static_cast<uint32_t>(text_words), 0x74, static_cast<uint32_t>(data_at));
+  entry("deviceid", 1, 0x76, 0x77);
+  for (size_t i = 0; i < filler_words; ++i) data.push_back(0xA0000000u + static_cast<uint32_t>(i));
+  entry("filler", static_cast<uint32_t>(filler_words), 0x64, static_cast<uint32_t>(data_at + text_words));
+  const size_t dir_at = data_at + data.size();
+  entry("network", 4 + 4 + 4, 0x44, static_cast<uint32_t>(dir_at));          // a directory: uuid (4 words) and two entries
+  for (uint32_t w : data) b.push_back(w);
+  for (int i = 0; i < 4; ++i) b.push_back(0x11111111u * (i + 1));
+  EntryText::key(b, "prtcid");
+  b.push_back(1u | (0x76u << 24));
+  b.push_back(1);
+  EntryText::key(b, "prtcvers");
+  b.push_back(1u | (0x76u << 24));
+  b.push_back(1);
+  return b;
+}
+
+static void test_xdomain_messages() {
+  uint8_t out[256];
+  uint8_t uuid[16], other[16];
+  for (int i = 0; i < 16; ++i) { uuid[i] = static_cast<uint8_t>(0x20 + i); other[i] = static_cast<uint8_t>(0x80 + i); }
+  // the UUID request: route, length and sequence, the protocol UUID, the type
+  CHECK(tb_xdp::build_uuid_request(0x0000001200000034ull, 2, ByteView(out, sizeof out)) == 32);
+  CHECK(out[0] == 0x12 && out[1] == 0x00 && out[2] == 0x00 && out[3] == 0x00 && out[4] == 0x34 && out[8] == 0x05 && out[11] == 0x10);             // (the words little endian: route high 0x12, low 0x34; length 5 words after the 12 byte route and length part; sequence 2 in bits 27 and 28)
+  CHECK(memcmp(out + 12, tb_xdp::kProtocolUuid, 16) == 0 && out[28] == 12);
+  tb_xdp::Header h;
+  CHECK(tb_xdp::parse_header(ConstByteView(out, 32), &h) && h.route == 0x0000001200000034ull && h.sequence == 2 && h.length_words == 5 && h.type == 12);
+  // the cut and the flipped: never anything but a clean answer
+  for (size_t len = 0; len < 32; ++len) CHECK(!tb_xdp::parse_header(ConstByteView(out, len), &h));
+  for (size_t bit = 0; bit < 32 * 8; ++bit) {
+    uint8_t f[32];
+    memcpy(f, out, 32);
+    f[bit / 8] ^= static_cast<uint8_t>(1u << (bit % 8));
+    const bool ok = tb_xdp::parse_header(ConstByteView(f, 32), &h);
+    if (bit >= 12 * 8 && bit < 28 * 8) CHECK(!ok);                       // the protocol UUID is checked
+  }
+  // the top bit of the route that answers carry is dropped
+  uint8_t reply_copy[32];
+  memcpy(reply_copy, out, 32);
+  reply_copy[3] |= 0x80;
+  CHECK(tb_xdp::parse_header(ConstByteView(reply_copy, 32), &h) && h.route == 0x0000001200000034ull);
+  // a length that claims more than there is
+  memcpy(reply_copy, out, 32);
+  reply_copy[8] = 0x30;
+  CHECK(!tb_xdp::parse_header(ConstByteView(reply_copy, 32), &h));
+
+  CHECK(tb_xdp::build_uuid_response(0x01, 1, uuid, ByteView(out, sizeof out)) == 56);
+  tb_xdp::UuidResponse u;
+  uint32_t error = 99;
+  CHECK(tb_xdp::parse_uuid_response(ConstByteView(out, 56), &u, &error) == tb_xdp::Parsed::Ok && memcmp(u.uuid, uuid, 16) == 0 && u.route == 0x01);
+  for (size_t len = 0; len < 56; ++len) CHECK(tb_xdp::parse_uuid_response(ConstByteView(out, len), &u, &error) == tb_xdp::Parsed::Malformed);
+  CHECK(tb_xdp::build_error_response(0x01, 0, tb_xdp::kErrorNotReady, ByteView(out, sizeof out)) == 36);
+  CHECK(tb_xdp::parse_uuid_response(ConstByteView(out, 36), &u, &error) == tb_xdp::Parsed::Error && error == 4);
+  tb_xdp::PropertiesResponse pr;
+  CHECK(tb_xdp::parse_properties_response(ConstByteView(out, 36), &pr, &error) == tb_xdp::Parsed::Error);
+  for (size_t len = 0; len < 36; ++len) CHECK(tb_xdp::parse_properties_response(ConstByteView(out, len), &pr, &error) == tb_xdp::Parsed::Malformed);
+
+  // properties: the request, a response with a window of the block, bit flips and cuts
+  CHECK(tb_xdp::build_properties_request(0x01, 3, uuid, other, 90, ByteView(out, sizeof out)) == 68);
+  tb_xdp::PropertiesRequest q;
+  CHECK(tb_xdp::parse_properties_request(ConstByteView(out, 68), &q) && memcmp(q.source, uuid, 16) == 0 && memcmp(q.destination, other, 16) == 0 && q.offset == 90);
+  for (size_t len = 0; len < 68; ++len) CHECK(!tb_xdp::parse_properties_request(ConstByteView(out, len), &q));
+  std::vector<uint32_t> block(100);
+  for (size_t i = 0; i < block.size(); ++i) block[i] = 0x1000u + static_cast<uint32_t>(i);
+  uint8_t response[256];
+  const uint32_t rn = tb_xdp::build_properties_response(0x01, 1, uuid, other, ArrayView<const uint32_t>(block.data(), block.size()), 7, 50, ByteView(response, sizeof response));
+  CHECK(rn == 72 + 45 * 4 && tb_xdp::parse_properties_response(ConstByteView(response, rn), &pr, &error) == tb_xdp::Parsed::Ok && pr.offset == 50 && pr.data_length == 100 && pr.generation == 7 && pr.words == 45);
+  CHECK(response[72] == 0x00 + 0x32 && response[73] == 0x10);                                  // block[50] = 0x1032, little endian
+  const uint32_t tail = tb_xdp::build_properties_response(0x01, 1, uuid, other, ArrayView<const uint32_t>(block.data(), block.size()), 7, 95, ByteView(response, sizeof response));
+  CHECK(tail == 72 + 5 * 4 && tb_xdp::parse_properties_response(ConstByteView(response, tail), &pr, &error) == tb_xdp::Parsed::Ok && pr.words == 5);
+  CHECK(tb_xdp::build_properties_response(0x01, 1, uuid, other, ArrayView<const uint32_t>(block.data(), block.size()), 7, 100, ByteView(response, sizeof response)) == 0);
+  for (size_t len = 0; len < tail; ++len) CHECK(tb_xdp::parse_properties_response(ConstByteView(response, len), &pr, &error) == tb_xdp::Parsed::Malformed);
+  for (size_t bit = 0; bit < 72 * 8; ++bit) {
+    uint8_t f[256];
+    memcpy(f, response, tail);
+    f[bit / 8] ^= static_cast<uint8_t>(1u << (bit % 8));
+    tb_xdp::parse_properties_response(ConstByteView(f, tail), &pr, &error);
+  }
+
+  // the events
+  FakeNhi chip;
+  Events sink;
+  uint8_t remote[16], local[16];
+  for (int i = 0; i < 16; ++i) { remote[i] = static_cast<uint8_t>(0x40 + i); local[i] = static_cast<uint8_t>(0xC0 + i); }
+  std::vector<uint8_t> ev(56, 0);
+  ev[0] = 6;
+  ev[6] = static_cast<uint8_t>(2 | (1 << 4));
+  memcpy(&ev[8], remote, 16);
+  memcpy(&ev[24], local, 16);
+  ev[44] = 0x01;
+  ev[45] = 0x02;
+  TbXDomain x;
+  CHECK(tb_icm::parse_xdomain_connected(ConstByteView(ev.data(), ev.size()), &x) && x.link == 2 && x.depth == 1 && x.route == 0x0201 && memcmp(x.remote_uuid, remote, 16) == 0 && memcmp(x.local_uuid, local, 16) == 0);
+  for (size_t len = 0; len < ev.size(); ++len) CHECK(!tb_icm::parse_xdomain_connected(ConstByteView(ev.data(), len), &x));
+  for (size_t bit = 0; bit < ev.size() * 8; ++bit) {
+    std::vector<uint8_t> f = ev;
+    f[bit / 8] ^= static_cast<uint8_t>(1u << (bit % 8));
+    tb_icm::parse_xdomain_connected(ConstByteView(f.data(), f.size()), &x);
+  }
+  uint8_t gone_uuid[16], link = 0, depth = 0;
+  std::vector<uint8_t> gone(24, 0);
+  gone[0] = 7;
+  gone[6] = static_cast<uint8_t>(3 | (2 << 4));
+  memcpy(&gone[8], remote, 16);
+  CHECK(tb_icm::parse_xdomain_disconnected(ConstByteView(gone.data(), 24), gone_uuid, &link, &depth) && link == 3 && depth == 2 && memcmp(gone_uuid, remote, 16) == 0);
+  for (size_t len = 0; len < 24; ++len) CHECK(!tb_icm::parse_xdomain_disconnected(ConstByteView(gone.data(), len), gone_uuid, &link, &depth));
+  std::vector<uint8_t> gone_tr(28, 0);
+  gone_tr[0] = 7;
+  gone_tr[8] = 0x01;
+  gone_tr[9] = 0x02;
+  memcpy(&gone_tr[12], remote, 16);
+  uint64_t route = 0;
+  CHECK(tb_icm::parse_xdomain_disconnected_tr(ConstByteView(gone_tr.data(), 28), &route, gone_uuid) && route == 0x0201);
+  for (size_t len = 0; len < 28; ++len) CHECK(!tb_icm::parse_xdomain_disconnected_tr(ConstByteView(gone_tr.data(), len), &route, gone_uuid));
+  (void)chip;
+  (void)sink;
+}
+
+static void test_properties() {
+  TestAllocator alloc;
+  List<uint32_t> mine(alloc);
+  CHECK(tb_properties_build_local(0xABCD, 0x42, 3, "Theory", "Craft OS machine", mine));
+  List<TbPropertyEntry> entries(alloc);
+  CHECK(tb_properties_parse(ArrayView<const uint32_t>(&mine[0], mine.count()), entries));
+  const TbPropertyEntry* v = tb_properties_find(entries, "vendorid", TbPropertyType::Value);
+  const TbPropertyEntry* vn = tb_properties_find(entries, "vendorid", TbPropertyType::Text);
+  const TbPropertyEntry* d = tb_properties_find(entries, "deviceid", TbPropertyType::Value);
+  const TbPropertyEntry* dn = tb_properties_find(entries, "deviceid", TbPropertyType::Text);
+  const TbPropertyEntry* rv = tb_properties_find(entries, "devicerv", TbPropertyType::Value);
+  CHECK(v && v->value == 0xABCD && vn && strcmp(vn->text, "Theory") == 0 && d && d->value == 0x42 && dn && strcmp(dn->text, "Craft OS machine") == 0 && rv && rv->value == 3);
+  CHECK(!tb_properties_find(entries, "vendorid", TbPropertyType::Data) && !tb_properties_find(entries, "nothing", TbPropertyType::Value));
+  CHECK(mine[0] == 0x55584401u && mine[1] == 20);
+  // a block like another host's: the service directory is read, its entries are at depth 1
+  const std::vector<uint32_t> block = remote_block();
+  CHECK(tb_properties_parse(ArrayView<const uint32_t>(block.data(), block.size()), entries));
+  const TbPropertyEntry* id = nullptr;
+  for (uint64_t i = 0; i < entries.count(); ++i) if (entries[i].depth == 1 && strcmp(entries[i].key, "prtcid") == 0) id = &entries[i];
+  CHECK(id && id->value == 1 && entries.count() == 7);
+  // a block that is not a root directory
+  List<uint32_t> bad(alloc);
+  CHECK(!tb_properties_parse(ArrayView<const uint32_t>(), entries) && entries.count() == 0);
+  std::vector<uint32_t> wrong = block;
+  wrong[0] ^= 1;
+  CHECK(!tb_properties_parse(ArrayView<const uint32_t>(wrong.data(), wrong.size()), entries));
+  wrong = block;
+  wrong[1] = 1000;                                                     // longer than the block
+  CHECK(!tb_properties_parse(ArrayView<const uint32_t>(wrong.data(), wrong.size()), entries));
+  // truncations and bit flips: a clean answer, nothing out of bounds (ASan), no entries left on failure
+  for (size_t len = 0; len < block.size(); ++len) {
+    const bool ok = tb_properties_parse(ArrayView<const uint32_t>(block.data(), len), entries);
+    if (!ok) CHECK(entries.count() == 0);
+  }
+  for (size_t bit = 0; bit < 40 * 32; ++bit) {
+    std::vector<uint32_t> f = block;
+    f[bit / 32] ^= 1u << (bit % 32);
+    tb_properties_parse(ArrayView<const uint32_t>(f.data(), f.size()), entries);
+  }
+  // a directory that contains itself ends at the depth limit; so does one with too many entries
+  std::vector<uint32_t> loop = {0x55584401u, 4};
+  EntryText::key(loop, "again");
+  loop.push_back(8u | (0x44u << 24));
+  loop.push_back(6);
+  // (the directory at word 6 is: uuid 4 words and one entry pointing at word 6 again)
+  loop.push_back(0); loop.push_back(0); loop.push_back(0); loop.push_back(0);
+  EntryText::key(loop, "again");
+  loop.push_back(8u | (0x44u << 24));
+  loop.push_back(6);
+  CHECK(!tb_properties_parse(ArrayView<const uint32_t>(loop.data(), loop.size()), entries) && entries.count() == 0);
+  std::vector<uint32_t> many = {0x55584401u, 4 * 200};
+  for (int i = 0; i < 200; ++i) { EntryText::key(many, "k"); many.push_back(1u | (0x76u << 24)); many.push_back(i); }
+  CHECK(!tb_properties_parse(ArrayView<const uint32_t>(many.data(), many.size()), entries));
+  // text that is not terminated is cut, a value of the wrong length is refused, an unknown type is kept as unknown
+  std::vector<uint32_t> odd = {0x55584401u, 8};
+  EntryText::key(odd, "text");
+  odd.push_back(1u | (0x74u << 24));
+  odd.push_back(10);
+  EntryText::key(odd, "weird");
+  odd.push_back(1u | (0x21u << 24));
+  odd.push_back(5);
+  odd.push_back(chars4("full"));
+  CHECK(tb_properties_parse(ArrayView<const uint32_t>(odd.data(), odd.size()), entries) && entries.count() == 2 && strcmp(entries[0].text, "full") == 0 && entries[1].type == TbPropertyType::Unknown);
+  std::vector<uint32_t> badvalue = {0x55584401u, 4};
+  EntryText::key(badvalue, "v");
+  badvalue.push_back(2u | (0x76u << 24));
+  badvalue.push_back(1);
+  CHECK(!tb_properties_parse(ArrayView<const uint32_t>(badvalue.data(), badvalue.size()), entries));
+  CHECK(!tb_properties_build_local(1, 2, 3, "x", "y", mine) == false);
+}
+
+static void test_xdomain() {
+  TestAllocator alloc;
+  uint8_t remote[16], local[16], other[16];
+  for (int i = 0; i < 16; ++i) { remote[i] = static_cast<uint8_t>(0x40 + i); local[i] = static_cast<uint8_t>(0xC0 + i); other[i] = static_cast<uint8_t>(0x10 + i); }
+  auto start = [&](FakeNhi& chip, ThunderboltIcm& icm) {
+    memcpy(chip.remote.uuid, remote, 16);
+    chip.remote.block = remote_block();
+    CHECK(icm.start() == ThunderboltIcm::Outcome::Started);
+  };
+  {
+    FakeNhi chip;
+    ThunderboltIcm icm(chip, alloc);
+    start(chip, icm);
+    chip.send_xdomain_connected(remote, local, 1, 1, 0x01);
+    icm.poll();                                                        // announced, and discovered in the same poll
+    CHECK(icm.xdomain_count() == 1 && icm.xdomain(0).route == 0x01 && icm.xdomain(0).discovered);
+    const TbXDomain& x = icm.xdomain(0);
+    CHECK(x.vendor_id == 0x1234 && x.device_id == 0x77 && strcmp(x.vendor_name, "Acme") == 0 && x.device_name[0] == 0 && x.generation == 5 && x.protocol_count == 1 && x.protocols[0] == 1);
+    // the requests: UUID first, then the 96 words of properties in three pieces (45, 45 and the rest), our UUID as the source
+    CHECK(chip.xdp_requests.size() == 4 && chip.xdp_requests[0][7] == 12 && chip.xdp_requests[1][7] == 3 && chip.xdp_requests[2][7] == 3 && chip.xdp_requests[3][7] == 3);
+    CHECK((chip.xdp_requests[1][16] & 0xFFFF) == 0 && (chip.xdp_requests[2][16] & 0xFFFF) == 45 && (chip.xdp_requests[3][16] & 0xFFFF) == 90);
+    CHECK(memcmp(&chip.xdp_requests[1][8], local, 16) == 0 && memcmp(&chip.xdp_requests[1][12], remote, 16) == 0);
+    // nothing more is asked once it is discovered
+    icm.poll();
+    CHECK(chip.xdp_requests.size() == 4);
+    // the same announcement again changes nothing; another host at that place replaces it
+    chip.send_xdomain_connected(remote, local, 1, 1, 0x01);
+    icm.poll();
+    CHECK(icm.xdomain_count() == 1 && chip.xdp_requests.size() == 4);
+    uint8_t second[16];
+    memcpy(second, other, 16);
+    chip.send_xdomain_connected(second, local, 2, 1, 0x02);              // link 2 is the same physical port as link 1
+    chip.remote.answer = false;
+    icm.poll();
+    CHECK(icm.xdomain_count() == 1 && memcmp(icm.xdomain(0).remote_uuid, other, 16) == 0 && !icm.xdomain(0).discovered);
+    // disconnects
+    chip.send_xdomain_disconnected(other, 2, 1);
+    icm.poll();
+    CHECK(icm.xdomain_count() == 0);
+    chip.send_xdomain_disconnected(other, 2, 1);                         // (again: nothing there)
+    icm.poll();
+    CHECK(icm.xdomain_count() == 0);
+  }
+  // a host that answers with another UUID than announced is not taken; one that does not answer is given up on after a few tries
+  {
+    FakeNhi chip;
+    ThunderboltIcm icm(chip, alloc);
+    start(chip, icm);
+    chip.remote.wrong_uuid = true;
+    chip.send_xdomain_connected(remote, local, 1, 1, 0x01);
+    icm.poll();
+    CHECK(icm.xdomain_count() == 1 && !icm.xdomain(0).discovered && icm.xdomain(0).attempts == 1);
+    for (int i = 0; i < 400; ++i) icm.poll();
+    CHECK(icm.xdomain(0).gave_up && !icm.xdomain(0).discovered);
+    const size_t asked = chip.xdp_requests.size();
+    for (int i = 0; i < 100; ++i) icm.poll();
+    CHECK(chip.xdp_requests.size() == asked);
+  }
+  {
+    FakeNhi chip;
+    ThunderboltIcm icm(chip, alloc);
+    start(chip, icm);
+    chip.remote.not_ready = true;
+    chip.send_xdomain_connected(remote, local, 1, 1, 0x01);
+    icm.poll();
+    CHECK(!icm.xdomain(0).discovered);
+    chip.remote.not_ready = false;
+    for (int i = 0; i < 60 && !icm.xdomain(0).discovered; ++i) icm.poll();             // the retry finds it
+    CHECK(icm.xdomain(0).discovered && icm.xdomain(0).vendor_id == 0x1234);
+  }
+  // properties answers that do not make sense: the wrong offset, a length that changes between pieces
+  for (int mode = 0; mode < 2; ++mode) {
+    FakeNhi chip;
+    ThunderboltIcm icm(chip, alloc);
+    start(chip, icm);
+    chip.remote.wrong_offset = mode == 0;
+    chip.remote.shrink_length = mode == 1;
+    chip.send_xdomain_connected(remote, local, 1, 1, 0x01);
+    icm.poll();
+    CHECK(!icm.xdomain(0).discovered);
+  }
+  // a very long block is refused
+  {
+    FakeNhi chip;
+    ThunderboltIcm icm(chip, alloc);
+    start(chip, icm);
+    chip.remote.block.assign(600, 0);
+    chip.send_xdomain_connected(remote, local, 1, 1, 0x01);
+    icm.poll();
+    CHECK(!icm.xdomain(0).discovered);
+  }
+  // a block that is not a property block
+  {
+    FakeNhi chip;
+    ThunderboltIcm icm(chip, alloc);
+    start(chip, icm);
+    chip.remote.block.assign(10, 0x12345678u);
+    chip.send_xdomain_connected(remote, local, 1, 1, 0x01);
+    icm.poll();
+    CHECK(!icm.xdomain(0).discovered);
+  }
+  // lost requests are retried by the poll after, with the next sequence number
+  {
+    FakeNhi chip;
+    ThunderboltIcm icm(chip, alloc);
+    start(chip, icm);
+    chip.remote.drop_first = 1;
+    chip.send_xdomain_connected(remote, local, 1, 1, 0x01);
+    icm.poll();
+    CHECK(!icm.xdomain(0).discovered && icm.xdomain(0).attempts == 1);
+    for (int i = 0; i < 60 && !icm.xdomain(0).discovered; ++i) icm.poll();
+    CHECK(icm.xdomain(0).discovered);
+    CHECK(((chip.xdp_requests.back()[2] >> 27) & 3) == 1);
+  }
+  // what the other host asks of us
+  {
+    FakeNhi chip;
+    ThunderboltIcm icm(chip, alloc);
+    start(chip, icm);
+    chip.remote.answer = false;
+    chip.remote_request(12, {});                                          // a UUID request before any connection is known: nobody to answer as
+    icm.poll();
+    CHECK(chip.xdp_responses.empty());
+    CHECK(icm.set_identity(0x5555, 9, 2, "Craft", "Box"));
+    chip.send_xdomain_connected(remote, local, 1, 1, 0x01);
+    icm.poll();
+    chip.remote_request(12, {}, 0x01, 2);
+    icm.poll();
+    CHECK(chip.xdp_responses.size() == 1 && chip.xdp_responses[0][7] == 2 && memcmp(&chip.xdp_responses[0][8], local, 16) == 0 && ((chip.xdp_responses[0][2] >> 27) & 3) == 2);
+    // its properties (the identity block is 25 words: one response, and an offset into it gives the rest)
+    std::vector<uint32_t> ask(9, 0);
+    memcpy(&ask[0], remote, 16);
+    memcpy(&ask[4], local, 16);
+    ask[8] = 0;
+    chip.remote_request(3, ask, 0x01, 1);
+    icm.poll();
+    CHECK(chip.xdp_responses.size() == 2 && chip.xdp_responses[1][7] == 4);
+    const std::vector<uint32_t>& pr = chip.xdp_responses[1];
+    CHECK(pr[16] == (25u << 16) && pr.size() == 18 + 25);                 // offset 0, length 25 words
+    std::vector<uint32_t> got(pr.begin() + 18, pr.end());
+    List<TbPropertyEntry> entries(alloc);
+    CHECK(tb_properties_parse(ArrayView<const uint32_t>(got.data(), got.size()), entries) && tb_properties_find(entries, "vendorid", TbPropertyType::Value)->value == 0x5555 && strcmp(tb_properties_find(entries, "deviceid", TbPropertyType::Text)->text, "Box") == 0);
+    ask[8] = 20;
+    chip.remote_request(3, ask, 0x01, 1);
+    icm.poll();
+    CHECK(chip.xdp_responses.size() == 3 && chip.xdp_responses[2][16] == (20u | (25u << 16)) && chip.xdp_responses[2].size() == 18 + 5);
+    // asked for a domain that is not us, or past the end: an error / nothing
+    ask[0] ^= 1;
+    ask[4] ^= 0;
+    std::vector<uint32_t> not_us(9, 0);
+    memcpy(&not_us[0], remote, 16);
+    memcpy(&not_us[4], other, 16);
+    chip.remote_request(3, not_us, 0x01, 1);
+    icm.poll();
+    CHECK(chip.xdp_responses.size() == 4 && chip.xdp_responses[3][7] == 7 && chip.xdp_responses[3][8] == 2);
+    ask[8] = 30;
+    chip.remote_request(3, ask, 0x01, 1);
+    icm.poll();
+    CHECK(chip.xdp_responses.size() == 4);
+    // link state and anything else: not supported
+    chip.remote_request(15, {}, 0x01, 3);
+    chip.remote_request(99, {}, 0x01, 3);
+    icm.poll();
+    CHECK(chip.xdp_responses.size() == 6 && chip.xdp_responses[4][7] == 7 && chip.xdp_responses[4][8] == 3 && chip.xdp_responses[5][8] == 3);
+    // a request for a connection we do not know, and a runt
+    chip.remote_request(3, ask, 0x77, 1);
+    chip.push_to_host(0, 6, 6, fake_tb::wire_frame({1, 2, 3}));
+    icm.poll();
+    CHECK(chip.xdp_responses.size() == 6);
+    // their properties changed: acknowledged, and read again
+    chip.remote.answer = true;
+    const size_t asked = chip.xdp_requests.size();
+    chip.remote_request(5, {}, 0x01, 0);
+    icm.poll();
+    CHECK(chip.xdp_responses.size() == 7 && chip.xdp_responses[6][7] == 6);
+    icm.poll();
+    CHECK(chip.xdp_requests.size() > asked && icm.xdomain(0).discovered);
+  }
+  // Titan Ridge: the disconnect names the route
+  {
+    FakeNhi chip;
+    chip.titan_ridge = true;
+    ThunderboltIcm icm(chip, alloc);
+    ThunderboltIcm::Options options;
+    options.generation = TbGeneration::TitanRidge;
+    icm.set_options(options);
+    start(chip, icm);
+    chip.send_xdomain_connected(remote, local, 0, 0, 0x0201);
+    icm.poll();
+    CHECK(icm.xdomain_count() == 1 && icm.xdomain(0).route == 0x0201 && icm.xdomain(0).discovered);
+    chip.send_xdomain_disconnected_tr(other, 0x0201);                    // some other host: not this one
+    icm.poll();
+    CHECK(icm.xdomain_count() == 1);
+    chip.send_xdomain_disconnected_tr(remote, 0x0201);
+    icm.poll();
+    CHECK(icm.xdomain_count() == 0);
+  }
+  // sleep drops them; they are announced again after
+  {
+    FakeNhi chip;
+    ThunderboltIcm icm(chip, alloc);
+    start(chip, icm);
+    chip.send_xdomain_connected(remote, local, 1, 1, 0x01);
+    icm.poll();
+    CHECK(icm.xdomain_count() == 1 && icm.suspend() && icm.xdomain_count() == 0);
+    CHECK(icm.resume() == ThunderboltIcm::Outcome::Started);
+    chip.send_xdomain_connected(remote, local, 1, 1, 0x01);
+    icm.poll();
+    CHECK(icm.xdomain_count() == 1 && icm.xdomain(0).discovered);
+  }
+  // garbage XDomain frames of every type and size do no harm
+  {
+    FakeNhi chip;
+    ThunderboltIcm icm(chip, alloc);
+    start(chip, icm);
+    chip.send_xdomain_connected(remote, local, 1, 1, 0x01);
+    icm.poll();
+    uint32_t seed = 99;
+    auto next = [&]() { seed = seed * 1664525u + 1013904223u; return seed >> 8; };
+    for (int i = 0; i < 300; ++i) {
+      std::vector<uint32_t> w(8 + next() % 40, 0);
+      for (uint32_t& x : w) x = next();
+      w[0] = 0;
+      w[1] = 1;
+      memcpy(&w[3], fake_tb::protocol_uuid, 16);
+      w[2] = static_cast<uint32_t>(w.size() * 4 - 12) / 4 | ((next() & 3) << 27);
+      w[7] = next() % 20;
+      chip.push_to_host(0, 6, 6, fake_tb::wire_frame(w));
+      if (i % 8 == 0) icm.poll();
+    }
+    icm.poll();
+    CHECK(icm.xdomain_count() <= ThunderboltIcm::kMaxDevices);
+  }
+}
+
 static void test_driver() {
   TestAllocator alloc;
   {
@@ -1359,6 +1875,10 @@ int main() {
   test_key_files();
   test_suspend();
   test_titan();
+  test_interrupts();
+  test_xdomain_messages();
+  test_properties();
+  test_xdomain();
   test_driver();
   printf(g_failed ? "ThunderboltTest: %d FAILED\n" : "ThunderboltTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;

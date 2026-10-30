@@ -49,6 +49,11 @@ class TbNhi {
 
   // Masks every ring interrupt and clears the pending bits (nhi_disable_interrupts, for a chip without the auto-clear quirk).
   void disable_interrupts();
+  // Unmasks (or masks again) the interrupts of one ring of the control channel, hop 0: the transmit ring's bit is the hop, the receive ring's the hop plus the number of hops.
+  void set_control_interrupts(bool on);
+  // What the interrupt handler does: reads all the notify registers, which is what lets the chip raise the next interrupt (they are read-to-clear, even those of rings that are masked).
+  // True if any ring had something to say. Touches only registers, so it is fine in an interrupt handler.
+  bool acknowledge_interrupt();
 
   // Is the connection manager firmware (ICM) running? It is started by the BIOS; this driver does not start it.
   bool icm_running() { return (registers_.read32(tb_reg::kFirmwareStatus) & tb_reg::kFwStsIcmEnable) != 0; }
@@ -59,6 +64,7 @@ class TbNhi {
 
  private:
   ITbRegisters& registers_;
+  uint32_t interrupt_mask_[64] = {};          // what is unmasked, as the chip's registers cannot be read back
 };
 
 // A finished descriptor.
