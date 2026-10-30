@@ -97,13 +97,16 @@ class DeviceRenderer2D final : public IRenderer2D {
 
  private:
   static constexpr uint32_t kMaxVertices = 6 * 4096;
-  static constexpr uint32_t kMaxRanges = 128;
+  static constexpr uint32_t kMaxRanges = 512;
+  // The sheet: small masks (glyphs) of a frame are baked, colored, into one texture and drawn as textured rectangles in the batch, in order with the other shapes.
+  static constexpr uint32_t kSheetSize = 512, kSheetMaxMask = 128, kMaxSheetVertices = 6 * 4096;
 
   // A run of recorded vertices drawn with one clip and blend mode.
   struct Range {
     uint32_t first, count;
     Rect2D clip;
     BlendMode blend;
+    bool sheet;   // the vertices are the sheet's (textured), not the colored batch's
   };
 
   void triangle_colors(const float* xs, const float* ys, const Vec4* colors);  // three vertices, own colors
@@ -114,6 +117,13 @@ class DeviceRenderer2D final : public IRenderer2D {
   bool submit_pending();  // sends everything recorded to the device
   bool draw_texture(const Surface& source, const Rect2D& rect, int32_t x, int32_t y);  // `rect` of the picture as one textured rectangle; false: not done
   bool ensure_texture(uint32_t width, uint32_t height);
+  bool upload_and_draw(uint64_t w, uint64_t h, int64_t dx, int64_t dy);   // texture_rows_ (w x h, 0xAARRGGBB) as one rectangle at (dx, dy)
+  bool prepare_rows(uint64_t count);   // texture_rows_ big enough for `count` pixels
+  bool draw_mask_textured(const MaskView& mask, int64_t ddx, int64_t ddy, int64_t dx0, int64_t dy0, uint64_t w, uint64_t h, uint32_t color);
+  bool sheet_slot(uint32_t w, uint32_t h, uint32_t* x, uint32_t* y);   // room for a w x h mask on the sheet (a submit and a fresh sheet if it is full)
+  void sheet_emit(uint32_t sx, uint32_t sy, uint32_t w, uint32_t h, int64_t dx, int64_t dy);   // the rectangle that shows it
+  void close_sheet_range();
+  void reset_sheet();
   bool draw_textured_quad(IImage& image, int64_t dx, int64_t dy, uint32_t w, uint32_t h, float u0, float v0, float u1, float v1);
 
   IGraphicsDevice& device_;
@@ -133,6 +143,14 @@ class DeviceRenderer2D final : public IRenderer2D {
   IImage* texture_ = nullptr;
   Extent2D texture_extent_;
   ArrayView<uint32_t> texture_rows_;
+  IBuffer* sheet_vertices_ = nullptr;
+  IImage* sheet_ = nullptr;
+  ArrayView<uint32_t> sheet_pixels_;        // the sheet's contents (kSheetSize x kSheetSize), written to sheet_ when a submit needs them
+  ArrayView<TexturedVertex> sheet_batch_;   // the mapped vertex buffer
+  uint32_t sheet_count_ = 0, sheet_range_start_ = 0;
+  uint32_t sheet_x_ = 0, sheet_y_ = 0, sheet_shelf_ = 0;   // where the next mask goes: the shelf in use
+  bool sheet_dirty_ = false;                // pixels added since the last upload
+  bool sheet_ok_ = false;                   // all of it exists
   // Double buffered: frames are drawn into images_[back_] and present() shows that image and then draws into the other, so the screen
   // never shows a half-drawn frame. (Every frame must repaint all of the target: the back image holds the frame before last.)
   IImage* images_[2] = {};
