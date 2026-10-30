@@ -69,7 +69,14 @@ bool I2cHidPointer::initialize() {
   } else if (parse_hid_pointer(device_.report_descriptor(), &pointer_) && pointer_.valid && pointer_.x.relative) {
     kind_ = Kind::Mouse;
   } else {
-    return false;
+    // not a pointer: still of use when it has a pen or sensors
+    bool other = false;
+    for (uint32_t i = 0; i < map_.application_count(); ++i) {
+      const HidApplication& a = map_.application(i);
+      if (a.usage_page == hid_usage::kPageSensor || (a.usage_page == hid_usage::kPageDigitizer && (a.usage == hid_usage::kPen || a.usage == hid_usage::kStylus))) other = true;
+    }
+    if (!other) return false;
+    kind_ = Kind::Other;
   }
   ready_ = true;
   return true;
@@ -103,11 +110,22 @@ bool I2cHidPointer::pop(MouseEvent* out) {
   return true;
 }
 
-bool I2cHidPointer::poll(MouseEvent* out) {
-  if (!ready_) return false;
-  if (pop(out)) return true;
-  const uint64_t now = clock_.now_ms();
-  if (now < next_read_ms_) return false;
+bool I2cHidPointer::add_client(II2cHidClient* client) {
+  kernel::ScopedMutex guard(mutex_);
+  if (!client) return false;
+  for (II2cHidClient*& slot : clients_)
+    if (!slot) { slot = client; return true; }
+  return false;
+}
+
+void I2cHidPointer::remove_client(II2cHidClient* client) {
+  kernel::ScopedMutex guard(mutex_);
+  for (II2cHidClient*& slot : clients_)
+    if (slot == client) slot = nullptr;
+}
+
+// Reads reports while the device has some (or, without an attention line, at most every few milliseconds).
+void I2cHidPointer::read_pending(uint64_t now) {
   for (uint32_t n = 0; n < kReadsPerPoll && count_ == 0; ++n) {
     if (attention_ ? !attention_->asserted() : (n > 0 || now < next_read_ms_)) break;
     if (!read_one()) {
@@ -116,6 +134,23 @@ bool I2cHidPointer::poll(MouseEvent* out) {
     }
     if (!attention_) next_read_ms_ = now + kPollEveryMs;
   }
+}
+
+void I2cHidPointer::pump() {
+  kernel::ScopedMutex guard(mutex_);
+  if (!ready_) return;
+  const uint64_t now = clock_.now_ms();
+  if (now < next_read_ms_) return;
+  read_pending(now);
+}
+
+bool I2cHidPointer::poll(MouseEvent* out) {
+  kernel::ScopedMutex guard(mutex_);
+  if (!ready_) return false;
+  if (pop(out)) return true;
+  const uint64_t now = clock_.now_ms();
+  if (now < next_read_ms_) return false;
+  read_pending(now);
   return pop(out);
 }
 
@@ -123,13 +158,17 @@ bool I2cHidPointer::read_one() {
   uint32_t length = 0;
   if (!device_.read_input(ByteView(buffer_, sizeof buffer_), &length)) return false;
   failures_ = 0;
-  if (length != 0) process(ConstByteView(buffer_, length));
+  if (length != 0) {
+    process(ConstByteView(buffer_, length));
+    for (II2cHidClient* c : clients_)
+      if (c) c->on_report(ConstByteView(buffer_, length));
+  }
   return true;
 }
 
 void I2cHidPointer::process(ConstByteView report) {
   if (kind_ == Kind::Mouse) process_mouse(report);
-  else collect(report);
+  else if (kind_ == Kind::Touchpad || kind_ == Kind::Touchscreen) collect(report);
 }
 
 void I2cHidPointer::process_mouse(ConstByteView report) {

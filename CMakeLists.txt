@@ -756,6 +756,12 @@ add_executable(BOOTX64
   src/Hardware/Bus/I2c/IntelGpio.cpp
   src/Hardware/Bus/I2c/LpssI2c.cpp
   src/Hardware/Mouse/I2c/I2cHidPointer.cpp
+  src/Hardware/Pen/CompositePen.cpp
+  src/Hardware/Pen/PenMouse.cpp
+  src/Hardware/Pen/I2c/I2cHidPen.cpp
+  src/Hardware/Sensor/SensorHub.cpp
+  src/Hardware/Sensor/HidSensor.cpp
+  src/Hardware/Sensor/AcpiAmbientLight.cpp
   src/Hardware/Mouse/I2c/PlatformI2cHid.cpp
   src/Hardware/Bus/Thunderbolt/ThunderboltDevices.cpp
   src/Hardware/Bus/Pci/PciMsix.cpp

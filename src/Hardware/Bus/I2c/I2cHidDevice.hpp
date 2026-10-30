@@ -61,6 +61,8 @@ class I2cHidDevice {
   bool reset();
   // Output report with the report id `id` (0: none) to the output register (or through the command register's SET_REPORT if the device has none).
   bool send_output(uint8_t id, ConstByteView report);
+  // SET_REPORT of a feature report (what a sensor hub is told to start reporting with): the command register, the data register, then the length and the report.
+  bool set_feature(uint8_t id, ConstByteView report);
 
  private:
   bool read_register(uint16_t reg, ByteView out);

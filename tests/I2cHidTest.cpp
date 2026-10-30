@@ -36,6 +36,10 @@
 #include "Hardware/Bus/I2c/IntelGpio.hpp"
 #include "Hardware/Bus/I2c/LpssI2c.hpp"
 #include "Hardware/Mouse/I2c/I2cHidPointer.hpp"
+#include "Hardware/Pen/PenMouse.hpp"
+#include "Hardware/Pen/I2c/I2cHidPen.hpp"
+#include "Hardware/Sensor/HidSensor.hpp"
+#include "Hardware/Sensor/SensorHub.hpp"
 #include "Hardware/Mouse/I2c/PlatformI2cHid.hpp"
 
 namespace hardware {
@@ -184,6 +188,8 @@ struct FakeHidDevice final : Slave, IAttentionLine {
   uint32_t pending = 0, first = 0;
   uint8_t last_commands[8][4] = {};
   uint32_t commands = 0;
+  uint8_t last_feature[64] = {};
+  uint32_t feature_len = 0, features_set = 0;
   uint8_t last_output[64] = {};
   uint32_t output_len = 0;
   uint32_t input_reads = 0;
@@ -219,6 +225,12 @@ struct FakeHidDevice final : Slave, IAttentionLine {
         push_report(zero, 0);
         (void)zero;
       }
+      return;
+    }
+    if (b.size() > 4 && static_cast<uint16_t>(b[0] | (b[1] << 8)) == command_reg && b[3] == 0x03) {   // SET_REPORT (a feature report, in these tests)
+      feature_len = static_cast<uint32_t>(b.size());
+      memcpy(last_feature, b.data(), feature_len > sizeof last_feature ? sizeof last_feature : feature_len);
+      ++features_set;
       return;
     }
     if (b.size() >= 4 && static_cast<uint16_t>(b[0] | (b[1] << 8)) == output_reg) {
@@ -1132,6 +1144,165 @@ static void test_gpio() {
   CHECK(IntelPchGpio::is_sunrise_point_lp("INT344B") && !IntelPchGpio::is_sunrise_point_lp("INT3451"));
 }
 
+
+// ---- a pen and sensors on one device ---------------------------------------------------------------------------------------------------------------------------------------------------
+
+typedef std::vector<uint8_t> Desc;
+static void D(Desc& d, std::initializer_list<uint8_t> v) { d.insert(d.end(), v.begin(), v.end()); }
+
+// report 1: pen (flags: tip, barrel, invert, in range; X 0..20000, Y 0..10000, pressure 0..1023, tilt X / Y -90..90 as bytes); report 2: accelerometer (X, Y, Z as 16 bits, unit exponent -2) with its
+// feature report 3 (reporting state and power state, each a selector); report 4: ambient light (16 bit lux) with feature report 5.
+static Desc make_pen_sensor_descriptor() {
+  Desc d;
+  D(d, {0x05, 0x0D, 0x09, 0x02, 0xA1, 0x01, 0x85, 0x01, 0x09, 0x20, 0xA1, 0x00});
+  D(d, {0x09, 0x42, 0x09, 0x44, 0x09, 0x3C, 0x09, 0x32, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x04, 0x81, 0x02, 0x75, 0x04, 0x95, 0x01, 0x81, 0x03});
+  D(d, {0x05, 0x01, 0x09, 0x30, 0x16, 0x00, 0x00, 0x26, 0x20, 0x4E, 0x75, 0x10, 0x95, 0x01, 0x81, 0x02});
+  D(d, {0x09, 0x31, 0x16, 0x00, 0x00, 0x26, 0x10, 0x27, 0x75, 0x10, 0x95, 0x01, 0x81, 0x02});
+  D(d, {0x05, 0x0D, 0x09, 0x30, 0x15, 0x00, 0x26, 0xFF, 0x03, 0x75, 0x10, 0x95, 0x01, 0x81, 0x02});
+  D(d, {0x09, 0x3D, 0x15, 0xA6, 0x25, 0x5A, 0x75, 0x08, 0x95, 0x01, 0x81, 0x02, 0x09, 0x3E, 0x81, 0x02});
+  D(d, {0xC0, 0xC0});
+  for (int k = 0; k < 2; ++k) {                                                              // accelerometer, then light
+    const bool accel = k == 0;
+    D(d, {0x05, 0x20, 0x09, static_cast<uint8_t>(accel ? 0x73 : 0x41), 0xA1, 0x01, 0x85, static_cast<uint8_t>(accel ? 3 : 5)});
+    D(d, {0x0A, 0x16, 0x03, 0xA1, 0x02, 0x0A, 0x40, 0x08, 0x0A, 0x41, 0x08, 0x15, 0x00, 0x25, 0x01, 0x75, 0x08, 0x95, 0x01, 0xB1, 0x00, 0xC0});
+    D(d, {0x0A, 0x19, 0x03, 0xA1, 0x02, 0x0A, 0x50, 0x08, 0x0A, 0x51, 0x08, 0x15, 0x00, 0x25, 0x01, 0x75, 0x08, 0x95, 0x01, 0xB1, 0x00, 0xC0});
+    D(d, {0x85, static_cast<uint8_t>(accel ? 2 : 4)});
+    if (accel) D(d, {0x0A, 0x53, 0x04, 0x0A, 0x54, 0x04, 0x0A, 0x55, 0x04, 0x16, 0x00, 0x80, 0x26, 0xFF, 0x7F, 0x55, 0x0E, 0x75, 0x10, 0x95, 0x03, 0x81, 0x02});
+    else D(d, {0x55, 0x00, 0x0A, 0xD1, 0x04, 0x15, 0x00, 0x26, 0xFF, 0x7F, 0x75, 0x10, 0x95, 0x01, 0x81, 0x02});
+    D(d, {0xC0});
+  }
+  return d;
+}
+
+struct PenRig {
+  TestAllocator alloc;
+  FakeDw dw;
+  FakeHidDevice dev;
+  FakeClock clock;
+  DesignWareI2c bus{dw};
+  Desc desc;
+  I2cHidPointer pointer;
+  PenRig(const Desc& descriptor) : desc(descriptor), pointer(alloc, bus, 0x2C, 0x0020, clock, "test digitizer") {
+    dev.report_descriptor = desc.data();
+    dev.report_descriptor_size = static_cast<uint32_t>(desc.size());
+    dev.max_input = 40;
+    dw.slave = &dev;
+    bus.initialize(DesignWareI2c::Config());
+    pointer.set_attention(&dev);
+  }
+  void pen_report(uint8_t flags, uint16_t x, uint16_t y, uint16_t pressure, int8_t tx, int8_t ty, bool shorten = false) {
+    const uint8_t r[10] = {1, flags, static_cast<uint8_t>(x), static_cast<uint8_t>(x >> 8), static_cast<uint8_t>(y), static_cast<uint8_t>(y >> 8), static_cast<uint8_t>(pressure),
+                           static_cast<uint8_t>(pressure >> 8), static_cast<uint8_t>(tx), static_cast<uint8_t>(ty)};
+    dev.push_report(r, shorten ? 5 : 10);
+  }
+  void accel_report(int16_t x, int16_t y, int16_t z) {
+    const uint8_t r[7] = {2, static_cast<uint8_t>(x), static_cast<uint8_t>(x >> 8), static_cast<uint8_t>(y), static_cast<uint8_t>(y >> 8), static_cast<uint8_t>(z), static_cast<uint8_t>(z >> 8)};
+    dev.push_report(r, 7);
+  }
+  void light_report(uint16_t lux) {
+    const uint8_t r[3] = {4, static_cast<uint8_t>(lux), static_cast<uint8_t>(lux >> 8)};
+    dev.push_report(r, 3);
+  }
+};
+
+static void test_pen_and_sensors() {
+  const Desc descriptor = make_pen_sensor_descriptor();
+  {
+    PenRig rig(descriptor);
+    CHECK(rig.pointer.initialize() && rig.pointer.kind() == I2cHidPointer::Kind::Other && !rig.pointer.is_absolute());
+    I2cHidPen pen(rig.pointer, "test pen");
+    CHECK(pen.initialize() && pen.max_x() == 20000 && pen.max_y() == 10000 && pen.max_pressure() == 1023 && pen.has_tilt());
+    PenEvent e;
+    CHECK(!pen.poll(&e));
+    rig.pen_report(0x09, 10000, 5000, 512, 45, -30);                                       // tip + in range
+    CHECK(pen.poll(&e) && e.tip && e.in_range && !e.inverted && e.buttons == 0 && e.x == 10000 && e.y == 5000 && e.pressure == 512 && e.max_pressure == 1023 && e.tilt_x == 45 && e.tilt_y == -30 && e.max_x == 20000);
+    rig.pen_report(0x0A, 100, 200, 0, 0, 0);                                                // hovering, barrel button
+    CHECK(pen.poll(&e) && !e.tip && e.in_range && (e.buttons & pen_button::kBarrel) && e.x == 100 && e.y == 200);
+    rig.pen_report(0x0D, 100, 200, 300, 0, 0);                                              // the eraser end touching
+    CHECK(pen.poll(&e) && e.tip && e.inverted);
+    rig.pen_report(0x00, 0, 0, 0, 0, 0);
+    CHECK(pen.poll(&e) && !e.in_range && !e.tip);
+    rig.pen_report(0x09, 1, 1, 1, 0, 0, true);                                              // cut short: the fields beyond read as 0, nothing outside the report
+    pen.poll(&e);
+    // the pen as a mouse
+    CompositePen pens;
+    PenMouse mouse(pens);
+    CHECK(pens.add(&pen) && pens.count() == 1);
+    MouseEvent m;
+    CHECK(!mouse.poll(&m));
+    rig.pen_report(0x08, 2000, 3000, 0, 0, 0);                                              // hover: the pointer moves, no button
+    CHECK(mouse.poll(&m) && m.absolute && m.x == 2000 && m.y == 3000 && m.buttons == 0 && m.max_x == 20000 && mouse.max_x() == 20000);
+    rig.pen_report(0x08, 2000, 3000, 0, 0, 0);                                              // nothing changed
+    CHECK(!mouse.poll(&m));
+    rig.pen_report(0x09, 2000, 3000, 400, 0, 0);
+    CHECK(mouse.poll(&m) && m.buttons == mouse_button::kLeft);
+    rig.pen_report(0x0B, 2100, 3000, 400, 0, 0);                                            // barrel button: right as well
+    CHECK(mouse.poll(&m) && m.buttons == (mouse_button::kLeft | mouse_button::kRight) && m.x == 2100);
+    rig.pen_report(0x00, 0, 0, 0, 0, 0);                                                    // out of range: the buttons are let go where the pen was
+    CHECK(mouse.poll(&m) && m.buttons == 0 && m.x == 2100);
+    CHECK(pens.last().in_range == false && pens.last().x == 0);
+    CHECK(pens.remove(&pen) && pens.count() == 0 && !pens.remove(&pen));
+    pen.shutdown();
+  }
+  {   // the sensors
+    PenRig rig(descriptor);
+    CHECK(rig.pointer.initialize());
+    SensorKind kinds[HidSensor::kMaxPerDevice];
+    uint8_t ids[HidSensor::kMaxPerDevice];
+    CHECK(HidSensor::discover(rig.pointer.map(), kinds, ids) == 2 && kinds[0] == SensorKind::Accelerometer && ids[0] == 2 && kinds[1] == SensorKind::AmbientLight && ids[1] == 4);
+    HidSensor accel(rig.pointer, SensorKind::Accelerometer, 2, "accelerometer"), light(rig.pointer, SensorKind::AmbientLight, 4, "light");
+    SensorReading r;
+    CHECK(accel.initialize() && accel.kind() == SensorKind::Accelerometer && !accel.read(&r));
+    // the device was told to report all events with full power: the feature report of the accelerometer (id 3), selector indexes 1 and 1
+    const uint8_t expected[] = {0x24, 0x00, 0x33, 0x03, 0x25, 0x00, 0x05, 0x00, 0x03, 0x01, 0x01};
+    CHECK(rig.dev.features_set == 1 && rig.dev.feature_len == sizeof expected && memcmp(rig.dev.last_feature, expected, sizeof expected) == 0);
+    CHECK(light.initialize() && rig.dev.features_set == 2 && rig.dev.last_feature[2] == 0x35 && rig.dev.last_feature[8] == 0x05 && rig.dev.last_feature[9] == 1 && rig.dev.last_feature[10] == 1);
+    SensorHub hub;
+    CHECK(hub.add(&accel) && hub.add(&light) && hub.add(&light) && hub.count() == 2 && hub.find(SensorKind::AmbientLight) == &light && hub.find(SensorKind::Gyroscope) == nullptr && hub.find(SensorKind::Accelerometer, 1) == nullptr);
+    rig.accel_report(100, -50, 981);                                                       // exponent -2: 1.00 g, -0.50 g, 9.81 g
+    CHECK(accel.read(&r) && r.kind == SensorKind::Accelerometer && r.x > 0.99f && r.x < 1.01f && r.y > -0.51f && r.y < -0.49f && r.z > 9.80f && r.z < 9.82f && r.sequence == 1);
+    rig.light_report(300);
+    CHECK(hub.read(SensorKind::AmbientLight, &r) && r.x == 300.0f);
+    rig.accel_report(0, 0, 100);
+    CHECK(accel.read(&r) && r.sequence == 2 && r.z > 0.99f && r.z < 1.01f);
+    CHECK(light.read(&r) && r.x == 300.0f && !hub.read(SensorKind::Magnetometer, &r));        // (the light report is still the latest)
+    CHECK(hub.remove(&light) && hub.count() == 1 && !hub.remove(&light));
+    accel.shutdown();
+    light.shutdown();
+  }
+  {   // damaged descriptors: cut at every length and with every bit flipped
+    TestAllocator a;
+    SensorKind kinds[HidSensor::kMaxPerDevice];
+    uint8_t ids[HidSensor::kMaxPerDevice];
+    for (size_t n = 0; n <= descriptor.size(); ++n) {
+      HidInputMap map(a);
+      if (map.parse(ConstByteView(descriptor.data(), n))) HidSensor::discover(map, kinds, ids);
+    }
+    for (size_t bit = 0; bit < descriptor.size() * 8; ++bit) {
+      Desc flipped = descriptor;
+      flipped[bit / 8] ^= static_cast<uint8_t>(1u << (bit % 8));
+      HidInputMap map(a);
+      if (map.parse(ConstByteView(flipped.data(), flipped.size()))) {
+        HidSensor::discover(map, kinds, ids);
+        for (const HidFeature& f : map.features()) (void)f.usage_count;
+      }
+    }
+  }
+  {   // reports of every length into the pen and the sensors
+    PenRig rig(descriptor);
+    CHECK(rig.pointer.initialize());
+    I2cHidPen pen(rig.pointer, "p");
+    HidSensor accel(rig.pointer, SensorKind::Accelerometer, 2, "a");
+    CHECK(pen.initialize() && accel.initialize());
+    uint8_t full[10] = {1, 0x09, 1, 2, 3, 4, 5, 6, 7, 8};
+    for (uint32_t n = 0; n <= 10; ++n) { rig.dev.push_report(full, n); PenEvent e; pen.poll(&e); }
+    uint8_t acc[7] = {2, 1, 0, 2, 0, 3, 0};
+    for (uint32_t n = 0; n <= 7; ++n) { rig.dev.push_report(acc, n); SensorReading r; accel.read(&r); }
+    pen.shutdown();
+    accel.shutdown();
+  }
+}
+
 int main() {
   test_designware();
   test_hid_device();
@@ -1143,6 +1314,7 @@ int main() {
   test_resources();
   test_gpio();
   test_platform();
+  test_pen_and_sensors();
   printf(g_failed ? "I2cHidTest: %d FAILED\n" : "I2cHidTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }
