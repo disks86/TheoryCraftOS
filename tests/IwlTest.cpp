@@ -38,6 +38,7 @@
 #include "Hardware/WirelessInterface/Intel/IwlNvm.hpp"
 #include "Hardware/WirelessInterface/Intel/IwlInit.hpp"
 #include "Hardware/WirelessInterface/Intel/IwlDriver.hpp"
+#include "Hardware/WirelessInterface/Intel/IwlScan.hpp"
 #include "Hardware/WirelessInterface/Intel/IwlPcie.hpp"
 
 namespace hardware {
@@ -126,7 +127,7 @@ static Bytes make_firmware() {
   tlv(f, 19, section(0xAAAABBBB, 0, 0));                         // the paging separator
   tlv(f, 19, section(0x00000000, 16, 0xC1));                     // a paging section
   tlv(f, 20, section(0x00000000, 4, 0xD1));                      // SEC_INIT
-  tlv(f, 48, Bytes{1, 2, 3, 4, 0, 5, 6, 7});                     // CMD_VERSIONS: (group 1, cmd 2, ver 3, notif 4) and (0, 5, 6, 7)
+  tlv(f, 48, Bytes{1, 2, 3, 4, 0, 5, 6, 7});                     // CMD_VERSIONS: (cmd 1, group 2, ver 3, notif 4) and (cmd 0, group 5, ver 6, notif 7)
   tlv(f, 52, Bytes{9, 9, 9, 9, 9});                              // IML
   tlv(f, 0x1000005, Bytes{1, 2, 3});                             // a type nobody needs (debug)
   return f;
@@ -149,7 +150,7 @@ static void test_firmware() {
   CHECK(fw.part(IwlImage::Regular, 2, s, 8) == 1 && s[0].data.size() == 16 && fw.part(IwlImage::Regular, 3, s, 8) == 0);
   CHECK(fw.part(IwlImage::Regular, 0, s, 1) == 1);
   CHECK(fw.part(IwlImage::Init, 0, s, 8) == 1 && s[0].data.size() == 4);
-  CHECK(fw.command_version_count() == 2 && fw.command_version_of(1, 2) == 3 && fw.command_version_of(0, 5) == 6 && fw.command_version_of(9, 9) == 0 && fw.command_version(5).group == 0);
+  CHECK(fw.command_version_count() == 2 && fw.command_version_of(2, 1) == 3 && fw.command_version_of(5, 0) == 6 && fw.command_version_of(9, 9) == 0 && fw.command_version(1).group == 5 && fw.command_version(1).command == 0);
   CHECK(fw.image_loader().size() == 5 && fw.image_loader()[0] == 9);
 
   // not a firmware file, and files that are not whole
@@ -293,7 +294,12 @@ struct FakeIwl final : IIwlRegisters {
       }
     }
     if (offset == iwl_fh::kUcodeLoadStatus && value == 0xFFFFFFFFu && cpu_released && !alive_never) { regs[iwl_csr::kInt / 4] |= iwl_csr::kIntBitAlive; if (on_alive) on_alive(); }
-    if (offset == iwl_tx::kHbusTargWrptr) { regs[offset / 4] = value; if (on_doorbell) on_doorbell(); return; }
+    if (offset == iwl_tx::kHbusTargWrptr) {
+      if (((value >> 8) & 0xFF) != 0) return;                       // another queue's pointer: not the command queue's doorbell
+      regs[offset / 4] = value;
+      if (on_doorbell) on_doorbell();
+      return;
+    }
     uint32_t& r = regs[(offset / 4) % 0x800];
     if (w1c && (offset == iwl_csr::kFhIntStatus || offset == iwl_csr::kInt)) { r &= ~value; return; }
     r = value;
@@ -382,12 +388,19 @@ static void test_pcie() {
 
 // ---- loading the firmware ------------------------------------------------------------------------------------------------------------------------------------------------------
 
-static Bytes make_loadable_firmware(uint32_t big_size) {
+static Bytes make_loadable_firmware(uint32_t big_size, bool scan_tlvs = false) {
   Bytes f;
   put32(f, 0);
   put32(f, IwlFirmware::kMagic);
   f.insert(f.end(), 88 - 8, 0);
   tlv(f, 27, u32s({2}));
+  if (scan_tlvs) {
+    tlv(f, 29, u32s({0, 0x40000000}));                           // API 30 (station type)
+    tlv(f, 29, u32s({1, 0x00000405}));                           // APIs 32, 34, 42
+    tlv(f, 30, u32s({0, 0x00001000}));                           // capability 12 (DQA)
+    tlv(f, 31, u32s({20}));                                      // 20 scan channel slots
+    tlv(f, 48, Bytes{0x18, 0, 10, 2, 0x0D, 0, 8, 0});           // ADD_STA version 10, SCAN_REQ_UMAC version 8
+  }
   tlv(f, 19, section(0x00000000, 16, 0xA1));
   tlv(f, 19, section(0x00040000, 8, 0xA2));                       // in the extended address range
   tlv(f, 19, section(0xFFFFCCCC, 0, 0));
@@ -677,7 +690,7 @@ static void test_tx() {
   while (q.enqueue(c1, &error) >= 0) ++sent;
   CHECK(sent == 29 && q.in_flight() == 31 && error);
   // too large
-  Bytes big(2000);
+  Bytes big(2100);
   IwlHostCommand c3; c3.opcode = 1; c3.data = ConstByteView(big.data(), big.size());
   CHECK(q.enqueue(c3, &error) < 0);
   // answers free the commands, bogus indexes change nothing
@@ -1031,6 +1044,224 @@ static void test_driver() {
   }
 }
 
+// ---- runtime commands and scanning ------------------------------------------------------------------------------------------------------------------------------------------------
+
+static void test_mvm_builders() {
+  uint8_t buf[2048];
+  // ADD_STA (48 bytes, laid out as the firmware header's offsets: sta id 16, type 35, queue mask 40)
+  CHECK(iwl_build_add_aux_station(3, 2, ByteView(buf, sizeof buf)) == 48 && buf[0] == 0 && buf[2] == 0xFF && buf[3] == 0xFF && buf[4] == 4 && buf[16] == 3 && buf[35] == 4 && buf[40] == 2);
+  CHECK(iwl_build_add_aux_station(3, 2, ByteView(buf, 47)) == 0);
+  CHECK(iwl_build_scan_config(0, 3, 3, ByteView(buf, sizeof buf)) == 12 && buf[2] == 0 && buf[4] == 3 && buf[8] == 3);
+  CHECK(iwl_build_tx_ant_config(3, ByteView(buf, sizeof buf)) == 4 && buf[0] == 3 && iwl_build_dqa_enable(0, ByteView(buf, 3)) == 0);
+  // the MAC context (148 bytes: node address 16, bssid 24, rates 32/36, filter 52, access categories from 60)
+  IwlMacContext mc;
+  for (int i = 0; i < 6; ++i) mc.address[i] = static_cast<uint8_t>(0xA0 + i);
+  CHECK(iwl_build_station_mac_context(mc, ByteView(buf, sizeof buf)) == 148 && buf[4] == 1 && buf[8] == 5 && buf[16] == 0xA0 && buf[21] == 0xA5 && buf[24] == 0xFF && buf[32] == 0x0F && buf[36] == 0x15);
+  CHECK((buf[52] & 0x44) == 0x44 && buf[60] == 15 && buf[62] == 0xFF && buf[63] == 3 && buf[64] == 7 && buf[65] == 1 && buf[100 + 8] == 0);
+  CHECK(iwl_build_station_mac_context(mc, ByteView(buf, 147)) == 0);
+  // the scan request (52 + 8 per slot + 1224 bytes)
+  IwlScanChannelEntry ch[3] = {{1, false, true}, {36, true, true}, {52, true, false}};
+  IwlScanRequest rq;
+  rq.uid = 0x1234; rq.mac_id = 2; rq.firmware_channel_slots = 20; rq.channels = ch; rq.channel_count = 3;
+  for (int i = 0; i < 6; ++i) rq.source_address[i] = static_cast<uint8_t>(0x10 + i);
+  const uint32_t total = 52 + 8 * 20 + 1224;
+  CHECK(iwl_scan_request_bytes(20) == total && iwl_build_scan_request(rq, ByteView(buf, sizeof buf)) == total);
+  CHECK(buf[4] == 0x34 && buf[5] == 0x12 && buf[8] == 6 && buf[15] == 2);
+  CHECK(((buf[12] | (buf[13] << 8)) & 0x2004) == 0x2004 && !((buf[12] | (buf[13] << 8)) & 0x8));                 // pass all, adaptive dwell, not passive
+  CHECK(buf[16] == 10 && buf[19] == 2 && buf[20] == 10 && buf[21] == 2 && buf[22] == (300 & 0xFF) && buf[23] == (300 >> 8) && buf[40] == 6 && buf[44] == 110 && buf[49] == 3);
+  CHECK(buf[52] == 1 && buf[56] == 1 && buf[57] == 1 && buf[58] == 1);                                    // channel 1: probes (ssid bitmap 1), band 2.4 GHz (1), one iteration
+  CHECK(buf[60] == 1 && buf[64] == 36 && buf[65] == 0 && buf[68] == 0 && buf[72] == 52 && buf[76] == 0);    // channel 36 probes (5 GHz band 0), channel 52 only listens
+  CHECK(buf[52 + 8 * 3 + 4] == 0);                                                                         // an unused slot is empty
+  const uint32_t tail = 52 + 8 * 20;
+  CHECK(buf[tail + 2] == 1 && buf[tail + 6] == 0);                                                          // schedule: one iteration
+  const uint32_t preq = tail + 12;
+  CHECK(buf[preq + 2] == 26 && buf[preq + 3] == 0);                                                         // mac header segment: 24 + the wildcard SSID element
+  const uint32_t pbuf = preq + 20;
+  CHECK(buf[pbuf] == 0x40 && buf[pbuf + 4] == 0xFF && buf[pbuf + 10] == 0x10 && buf[pbuf + 15] == 0x15 && buf[pbuf + 24] == 0 && buf[pbuf + 25] == 0);
+  // passive: the PASSIVE flag and no probing channels
+  rq.active = false;
+  CHECK(iwl_build_scan_request(rq, ByteView(buf, sizeof buf)) == total && (buf[12] & 0x08) && buf[52] == 0 && buf[60] == 0);
+  // refusals: no channels, too many, no room
+  rq.channel_count = 0;
+  CHECK(iwl_build_scan_request(rq, ByteView(buf, sizeof buf)) == 0);
+  rq.channel_count = 21;
+  CHECK(iwl_build_scan_request(rq, ByteView(buf, sizeof buf)) == 0);
+  rq.channel_count = 3;
+  CHECK(iwl_build_scan_request(rq, ByteView(buf, total - 1)) == 0);
+  // notifications
+  IwlScanComplete sc;
+  const uint8_t done[16] = {0x34, 0x12, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  CHECK(iwl_parse_scan_complete(ConstByteView(done, sizeof done), &sc) && sc.uid == 0x1234 && sc.completed() && sc.ebs_status == 0);
+  CHECK(!iwl_parse_scan_complete(ConstByteView(done, 5), &sc));
+}
+
+static Bytes rx_mpdu(const Bytes& frame, uint8_t channel, uint8_t energy, bool crc_ok) {
+  Bytes b;
+  b.push_back(static_cast<uint8_t>(frame.size())); b.push_back(static_cast<uint8_t>(frame.size() >> 8));   // mpdu_len
+  b.push_back(0); b.push_back(0); b.push_back(0); b.push_back(0); b.push_back(0); b.push_back(0);
+  b.push_back(0); b.push_back(0); b.push_back(0); b.push_back(0);                                     // csum, l3l4
+  put32(b, crc_ok ? 3u : 0u);                                                                         // status
+  put32(b, 0);                                                                                        // reorder
+  put32(b, 0); put32(b, 0); put32(b, 0);
+  b.push_back(energy); b.push_back(0); b.push_back(channel); b.push_back(0);
+  put32(b, 0); put32(b, 0); put32(b, 0);
+  b.insert(b.end(), frame.begin(), frame.end());
+  return b;
+}
+
+static Bytes beacon(const char* name, uint8_t last_octet, bool wpa2) {
+  Bytes f{0x80, 0x00, 0, 0};
+  f.insert(f.end(), 6, 0xFF);
+  for (int i = 0; i < 2; ++i) f.insert(f.end(), {0x02, 0x11, 0x22, 0x33, 0x44, last_octet});
+  f.insert(f.end(), {0, 0});
+  f.insert(f.end(), 8, 0);
+  f.insert(f.end(), {0x64, 0});
+  f.push_back(0x11); f.push_back(0x04);
+  f.push_back(0); f.push_back(static_cast<uint8_t>(strlen(name)));
+  f.insert(f.end(), name, name + strlen(name));
+  if (wpa2) {
+    const uint8_t rsn[] = {48, 20, 1, 0, 0, 0x0F, 0xAC, 4, 1, 0, 0, 0x0F, 0xAC, 4, 1, 0, 0, 0x0F, 0xAC, 2, 0, 0};
+    f.insert(f.end(), rsn, rsn + sizeof rsn);
+  }
+  return f;
+}
+
+static void test_scanner() {
+  TestAllocator alloc;
+  const Bytes file = make_loadable_firmware(64, true);
+  IwlFirmware fw(alloc);
+  const char* error = nullptr;
+  CHECK(fw.parse(ConstByteView(file.data(), file.size()), &error));
+  CHECK(fw.scan_channels() == 20 && fw.command_version_of(0, 0x18) == 10 && fw.has_api(30) && fw.has_api(34) && fw.has_api(42) && fw.has_capability(12));
+  for (int scenario = 0; scenario < 4; ++scenario) {
+    FakeIwl chip;
+    chip.w1c = true;
+    chip.force_radio = true;
+    chip.prph[(iwl_tx::kScdSramBase & 0xFFFFF) / 4] = 0x800000;
+    IwlTransport tp(chip, alloc, true);
+    FakeRxChip rxhw(chip);
+    FakeTxChip txhw(chip);
+    std::vector<std::pair<uint8_t, uint8_t>> seen;                  // (group, opcode) in order
+    std::vector<Bytes> scan_requests;
+    chip.on_alive = [&] { Bytes f; FakeRxChip::frame(f, 0, 1, 0x8000, alive_payload(0xCAFE)); rxhw.deliver(f); };
+    chip.on_doorbell = [&] {
+      bool good = false;
+      for (const Bytes& c : txhw.process(&good)) {
+        const uint8_t group = c[1], op = c[0];
+        const uint16_t seq = static_cast<uint16_t>(c[2] | (c[3] << 8));
+        seen.push_back({group, op});
+        Bytes f;
+        if (group == 0 && op == 0x18) {
+          FakeRxChip::frame(f, group, op, seq, Bytes{scenario == 1 ? uint8_t(2) : uint8_t(1), 0, 0, 0});     // ADD_STA status (2 = failure in scenario 1)
+        } else if (group == 1 && op == 0x0D) {
+          scan_requests.push_back(c);
+          FakeRxChip::frame(f, group, op, seq, Bytes{1, 0, 0, 0, 0, 0, 0, 0});
+          rxhw.deliver(f);
+          f.clear();
+          const uint32_t uid = static_cast<uint32_t>(c[8 + 4] | (c[8 + 5] << 8));
+          // two beacons of one network (a stronger one second), another, a damaged one, a hidden one; then the end of the scan
+          Bytes g;
+          FakeRxChip::frame(g, 0, 0xC1, 0x8000, rx_mpdu(beacon("Home", 1, true), 6, 80, true));
+          FakeRxChip::frame(g, 0, 0xC1, 0x8000, rx_mpdu(beacon("Cafe", 2, false), 11, 70, true));
+          FakeRxChip::frame(g, 0, 0xC1, 0x8000, rx_mpdu(beacon("Home", 1, true), 6, 55, true));
+          FakeRxChip::frame(g, 0, 0xC1, 0x8000, rx_mpdu(beacon("Bad", 3, false), 1, 50, false));
+          FakeRxChip::frame(g, 0, 0xC1, 0x8000, rx_mpdu(beacon("", 4, false), 1, 50, true));
+          rxhw.deliver(g);
+          Bytes h;
+          Bytes other{9, 9, 9, 9, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0};                                     // another scan's end: ignored
+          FakeRxChip::frame(h, 0, 0x0F, 0x8000, other);
+          rxhw.deliver(h);
+          if (scenario != 3) {                                                                           // (scenario 3: it never ends)
+            Bytes e;
+            Bytes end{static_cast<uint8_t>(uid), static_cast<uint8_t>(uid >> 8), 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+            FakeRxChip::frame(e, 0, 0x0F, 0x8000, end);
+            rxhw.deliver(e);
+          }
+          continue;
+        } else {
+          FakeRxChip::frame(f, group, op, seq, Bytes{0, 0, 0, 0});
+        }
+        rxhw.deliver(f);
+      }
+    };
+    CHECK(tp.start(fw, IwlImage::Regular, 5000, &error));
+    IwlNvmData nvm;
+    nvm.band_24ghz = nvm.band_5ghz = true;
+    nvm.tx_antennas = nvm.rx_antennas = 3;
+    for (int i = 0; i < 6; ++i) nvm.hw_address[i] = static_cast<uint8_t>(0x28 + i);
+    for (uint32_t i = 0; i < 51; ++i) {
+      IwlChannel& c = nvm.channels[i];
+      c.number = iwl_nvm_channel_number(i); c.is_5ghz = i >= 14; c.frequency_mhz = iwl_channel_frequency(c.number, c.is_5ghz);
+      c.flags = (i % 3 == 2) ? 0 : (iwl_nvm::kChannelValid | iwl_nvm::kChannelActive | (c.number >= 52 && c.number <= 64 ? iwl_nvm::kChannelRadar : 0u));
+    }
+    nvm.channel_count = 51;
+    IwlScanner sc(tp, alloc);
+    const bool up = sc.bring_up(fw, nvm, &error);
+    if (scenario == 1) {
+      CHECK(!up && error && !sc.ready());
+      continue;
+    }
+    CHECK(up && sc.ready());
+    if (!up) printf("  bring_up: %s\n", error ? error : "?");
+    // the commands went in the order of iwl_mvm_up: antennas, DQA, the auxiliary station, the scan configuration, the interface
+    CHECK(seen.size() >= 5);
+    if (seen.size() >= 5) CHECK(seen[seen.size() - 5] == std::make_pair(uint8_t(0), uint8_t(0x98)) && seen[seen.size() - 4] == std::make_pair(uint8_t(5), uint8_t(0)) &&
+                                seen[seen.size() - 3] == std::make_pair(uint8_t(0), uint8_t(0x18)) && seen[seen.size() - 2] == std::make_pair(uint8_t(1), uint8_t(0x0C)) && seen[seen.size() - 1] == std::make_pair(uint8_t(0), uint8_t(0x28)));
+    // the auxiliary queue was enabled on its FIFO and chained
+    CHECK(chip.prph[(iwl_tx::scd_queue_status(1) & 0xFFFFF) / 4] == (iwl_tx::kQueueStatusActive | iwl_tx::kMcastFifo | iwl_tx::kQueueStatusWsl | iwl_tx::kQueueStatusMask));
+    CHECK(chip.prph[(iwl_tx::kScdQueueChainSel & 0xFFFFF) / 4] & 2);
+    CHECK(chip.regs[iwl_tx::cbbc_queue(1) / 4] != 0 && chip.regs[iwl_tx::cbbc_queue(1) / 4] != chip.regs[iwl_tx::cbbc_queue(0) / 4]);
+    const bool started = sc.start_scan(true, &error);
+    CHECK(started);
+    if (!started) printf("  start_scan: %s\n", error ? error : "?");
+    if (scenario == 3) CHECK(!sc.start_scan(true, &error));                                                // (the others finish inside the call)
+    // the request: 20 slots, the channels the NVM allowed and the band flags
+    CHECK(scan_requests.size() == 1 && scan_requests[0].size() == 8 + 52 + 8 * 20 + 1224);
+    if (!scan_requests.empty()) {
+      const Bytes& r = scan_requests[0];
+      CHECK(r[1] == 1 && r[0] == 0x0D && r[8 + 3] == 0 && r[8 + 8] == 6);                                    // wide header, priority
+      const uint32_t channels = r[8 + 49];
+      CHECK(channels > 0 && channels <= 20);
+      CHECK(r[8 + 52 + 4] == 1 || r[8 + 52 + 4] == 36 || r[8 + 52 + 4] == 2);                               // the first valid channel (channel 3 is invalid: i % 3 == 2)
+    }
+    uint32_t guard = 0;
+    while (sc.poll() && guard++ < 100) {}
+    if (scenario == 3) {
+      CHECK(sc.scanning() && sc.network_count() == 2);                                                         // frames are in, the end never came
+      CHECK(!sc.start_scan(true, &error));
+    } else {
+      CHECK(!sc.scanning() && sc.last_scan_completed() && sc.frames_seen() == 4);
+      WifiNetwork nets[8];
+      const uint32_t n = sc.results(ArrayView<WifiNetwork>(nets, 8));
+      CHECK(n == 2 && strcmp(nets[0].ssid, "Home") == 0 && nets[0].security == WifiSecurity::Wpa2 && nets[0].channel == 6);
+      CHECK(n == 2 && strcmp(nets[1].ssid, "Cafe") == 0 && nets[1].security == WifiSecurity::Wep && nets[1].channel == 11);
+      CHECK(n == 2 && nets[0].signal_percent >= nets[1].signal_percent);
+      // a second scan works again
+      CHECK(sc.start_scan(false, &error) && scan_requests.size() == 2 && (scan_requests[1][8 + 12] & 0x08));
+    }
+    sc.shut_down();
+    tp.stop();
+    CHECK(alloc.dma.empty());
+  }
+  { // firmware that speaks other versions is refused
+    const Bytes plain = make_loadable_firmware(64, false);
+    IwlFirmware fw2(alloc);
+    CHECK(fw2.parse(ConstByteView(plain.data(), plain.size()), &error));
+    FakeIwl chip;
+    chip.w1c = true; chip.force_radio = true;
+    chip.prph[(iwl_tx::kScdSramBase & 0xFFFFF) / 4] = 0x800000;
+    IwlTransport tp(chip, alloc, true);
+    FakeRxChip rxhw(chip);
+    FakeTxChip txhw(chip);
+    chip.on_alive = [&] { Bytes f; FakeRxChip::frame(f, 0, 1, 0x8000, alive_payload(0xCAFE)); rxhw.deliver(f); };
+    CHECK(tp.start(fw2, IwlImage::Regular, 5000, &error));
+    IwlScanner sc(tp, alloc);
+    IwlNvmData nvm;
+    CHECK(!sc.bring_up(fw2, nvm, &error) && error && !sc.start_scan(true, &error));
+    tp.stop();
+  }
+}
+
 int main() {
   test_devices();
   test_firmware();
@@ -1043,6 +1274,8 @@ int main() {
   test_nvm();
   test_nvm_info();
   test_driver();
+  test_mvm_builders();
+  test_scanner();
   printf(g_failed ? "IwlTest: %d FAILED\n" : "IwlTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }
