@@ -60,7 +60,7 @@ class Fabric {
   ~Fabric() { chip_.config_model = nullptr; }
 
   // A router with `lane_pairs` pairs of lane adapters (the first pair's first adapter is the upstream one unless it is the host), `pcie_down` PCIe down adapters and a PCIe up adapter if asked.
-  Router& add(uint64_t route, uint32_t lane_pairs, uint32_t pcie_down, bool pcie_up, bool host = false) {
+  Router& add(uint64_t route, uint32_t lane_pairs, uint32_t pcie_down, bool pcie_up, bool host = false, uint32_t usb3_down = 0, bool usb3_up = false) {
     std::unique_ptr<Router> r(new Router);
     r->route = route;
     r->upstream = 1;
@@ -73,6 +73,8 @@ class Fabric {
       r->ports.push_back(adapter(++n, kTypeNhi));
       r->upstream = n;
     }
+    for (uint32_t i = 0; i < usb3_down; ++i) r->ports.push_back(usb3(++n, kTypeUsb3Down));
+    if (usb3_up) r->ports.push_back(usb3(++n, kTypeUsb3Up));
     r->max_port = n;
     r->regs[6] = (1u << 18);                                     // ROUTER_CS_6.HCI: it has an xHCI
     r->regs[7] = 0xA0A0A0A0u + static_cast<uint32_t>(route);
@@ -99,6 +101,8 @@ class Fabric {
     parent.ports[port + 1].state = kPortUnplugged;
     at(route).connected = false;
   }
+  bool no_usb3_ack = false;                                      // the USB 3 adapter never grants the connection manager its request
+  bool bond_never_completes = false;                             // the link keeps reporting one lane
   uint32_t fail_hop_writes = 0;                                  // the next hop table writes get an error
   uint32_t reads = 0, writes = 0;
   std::vector<std::string> log;                                  // "W route port space offset" of the writes, for order checks
@@ -114,8 +118,14 @@ class Fabric {
     p.space[2] = kTypePort;
     p.space[3] = number << 20;
     p.space[5] = 0x7FF | (0x7FFu << 11);                         // plenty of HopIDs
-    p.space[0x10] = 0x20 | (kPortCapPhy << 8);                   // the lane adapter capability, next at 0x20
+    p.space[0x10] = 0x20 | (kPortCapPhy << 8) | (2u << 20);       // the lane adapter capability, next at 0x20; it supports two lanes
     p.space[0x20] = (kPortCapUsb4 << 8);
+    p.space[0x20 + kPortCs18] = kPortCs18Be;                      // bonding enabled
+    return p;
+  }
+  static Port usb3(uint32_t number, uint32_t type) {
+    Port p = adapter(number, type);
+    p.space[0x10 + kUsb3Cs4] = 0;                                  // 10 Gb/s unless a test says 20
     return p;
   }
   static Port adapter(uint32_t number, uint32_t type) {
@@ -220,7 +230,10 @@ class Fabric {
   uint32_t read_port(Router& r, uint32_t port, uint32_t i) {
     if (random_garbage) return noise();
     Port& p = r.ports[port];
-    if (i == 0x11 && p.type == kTypePort) return (p.state << 26);                      // the lane adapter's second dword (PHY capability at 0x10)
+    if (i == 0x11 && p.type == kTypePort) {                                            // the lane adapter's second dword (PHY capability at 0x10)
+      const bool dual = (p.space[0x11] & kLaneCs1TargetWidthMask) == kLaneCs1TargetDual && !bond_never_completes;
+      return (p.space[0x11] & (kLaneCs1TargetWidthMask | kLaneCs1Lb)) | (p.state << 26) | ((dual ? 2u : 1u) << kLaneCs1CurrentWidthShift);
+    }
     return p.space[i];
   }
   void write_port(Router& r, uint32_t port, uint32_t i, uint32_t v) {
@@ -229,6 +242,15 @@ class Fabric {
       p.space[4] = v;
       if (!(v & kAdpCs4Lck)) p.locked = false;
       return;
+    }
+    if (p.type == kTypeUsb3Down || p.type == kTypeUsb3Up) {
+      if (i == 0x10 + kUsb3Cs2) {                                                      // the connection manager's request is acknowledged in HCA
+        p.space[i] = v;
+        if (no_usb3_ack) return;
+        if (v & kUsb3Cs2Cmr) p.space[0x10 + kUsb3Cs1] |= kUsb3Cs1Hca;
+        else p.space[0x10 + kUsb3Cs1] &= ~kUsb3Cs1Hca;
+        return;
+      }
     }
     if (i == 0x10 && p.type != kTypePort) {                                              // the adapter capability's first dword: the id and the link are read only, the enable bit is not
       p.space[i] = (p.space[i] & 0xFFFFu) | (v & 0xFFFF0000u);
