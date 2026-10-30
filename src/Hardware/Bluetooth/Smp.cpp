@@ -174,7 +174,7 @@ SecurityManager::Method SecurityManager::choose_method(uint8_t peer_io, bool mit
   }
 }
 
-SmResult SecurityManager::pair(uint16_t link, uint32_t timeout_ms) {
+SmResult SecurityManager::start_pairing(uint16_t link) {
   if (session_.state != State::Idle && session_.state != State::Done && session_.state != State::Failed) return SmResult::Busy;
   const HciLink* l = controller_.link(link);
   if (!l || !l->le || !l->central) return SmResult::NoLink;
@@ -191,17 +191,31 @@ SmResult SecurityManager::pair(uint16_t link, uint32_t timeout_ms) {
   for (int i = 0; i < 7; ++i) session_.preq[i] = request[i];
   session_.state = State::WaitResponse;
   send(kPairingRequest, ConstByteView(request + 1, 6));
+  return SmResult::Ok;
+}
+
+bool SecurityManager::pairing_finished(SmResult* result) {
+  if (session_.state == State::Done) { *result = SmResult::Ok; session_.state = State::Idle; return true; }
+  if (session_.state == State::Failed) { *result = SmResult::Failed; session_.state = State::Idle; return true; }
+  return false;
+}
+
+void SecurityManager::abort_pairing() {
+  if (session_.state != State::Idle && session_.state != State::Done && session_.state != State::Failed) fail(kReasonUnspecified, true);
+}
+
+SmResult SecurityManager::pair(uint16_t link, uint32_t timeout_ms) {
+  const SmResult started = start_pairing(link);
+  if (started != SmResult::Ok) return started;
   const uint64_t limit = uint64_t{timeout_ms} * 10;
   for (uint64_t round = 0; round < limit && session_.state != State::Done && session_.state != State::Failed; ++round)
     if (controller_.poll() == 0) delay_us(100);
-  SmResult result = SmResult::Ok;
-  if (session_.state == State::Failed) {
-    result = SmResult::Failed;
-  } else if (session_.state != State::Done) {
-    fail(kReasonUnspecified, true);
-    result = SmResult::Timeout;
+  SmResult result = SmResult::Timeout;
+  if (!pairing_finished(&result)) {
+    abort_pairing();
+    session_.state = State::Idle;
+    return SmResult::Timeout;
   }
-  session_.state = State::Idle;
   return result;
 }
 

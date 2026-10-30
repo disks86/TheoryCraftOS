@@ -55,8 +55,11 @@ void BluetoothService::start() {
 }
 
 void BluetoothService::step(bool scan) {
-  for (uint32_t i = 0; i < entries_.count(); ++i)
-    if (entries_[i]->state == BluetoothState::Ready) entries_[i]->controller->poll();
+  for (uint32_t i = 0; i < entries_.count(); ++i) {
+    if (entries_[i]->state != BluetoothState::Ready) continue;
+    if (entries_[i]->adapter) entries_[i]->adapter->poll();
+    else entries_[i]->controller->poll();
+  }
   if (!scan) return;
   drop_gone();
   scan_ports();
@@ -75,6 +78,20 @@ void BluetoothService::drop_gone() {
       ++i;
     }
   }
+}
+
+uint32_t BluetoothService::adapter_count() const {
+  uint32_t n = 0;
+  for (uint32_t i = 0; i < entries_.count(); ++i) n += entries_[i]->state == BluetoothState::Ready && entries_[i]->adapter;
+  return n;
+}
+
+IBluetoothAdapter* BluetoothService::adapter(uint32_t index) {
+  for (uint32_t i = 0; i < entries_.count(); ++i) {
+    if (entries_[i]->state != BluetoothState::Ready || !entries_[i]->adapter) continue;
+    if (index-- == 0) return entries_[i]->adapter.get();
+  }
+  return nullptr;
 }
 
 uint32_t BluetoothService::ready_count() const {
@@ -145,6 +162,7 @@ void BluetoothService::open(uint32_t bus_controller, IUsbHostController& host, u
       entry->security = UniquePointer<SecurityManager>::make(allocator_, *entry->controller, *entry->l2cap, *random_, bonds_);
       if (entry->security && entry->att) entry->att->set_security_handler(&SecurityManager::att_security, entry->security.get());
     }
+    if (entry->gatt) entry->adapter = UniquePointer<HciBluetoothAdapter>::make(allocator_, *entry->controller, *entry->l2cap, *entry->att, *entry->gatt, entry->security.get(), bonds_, profiles_, allocator_);
   }
   set_message(entry->message, started == HciResult::Ok ? "ready" : started == HciResult::Timeout ? "the controller did not answer" : "bringing the controller up failed");
   entries_.push_back(util::move(entry));
