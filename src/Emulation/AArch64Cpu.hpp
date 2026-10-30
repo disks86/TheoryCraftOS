@@ -125,6 +125,8 @@ class AArch64Cpu final : public IGuestCpu {
   Step sve_memory(GuestMemory& m, uint32_t insn);      // 0x84 .. 0xE5: loads and stores
   void sve_set_flags(uint16_t mask, uint16_t result, uint32_t esz);      // PredTest
   Step sme(GuestMemory& m, uint32_t insn);      // AArch64Sme*.cpp: the SME / SME2 encoding space (top bytes 0x80, 0x81, 0xA0, 0xA1, 0xC0, 0xC1, 0xE0, 0xE1)
+  Step sme2(GuestMemory& m, uint32_t insn);      // AArch64Sme2.cpp: SME2 instructions with top byte 0xC1
+  Step sme2_array(uint32_t form, uint32_t insn);
   void set_streaming_state(bool streaming, bool za, bool change_sm, bool change_za);      // SMSTART / SMSTOP
   bool crypto(uint32_t insn, Step* result);      // AArch64Crypto.cpp: AES, SHA, SM3, SM4 and pmull; false when the instruction is not one of them
 

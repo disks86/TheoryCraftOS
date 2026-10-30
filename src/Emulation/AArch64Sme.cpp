@@ -53,9 +53,7 @@ AArch64Cpu::Step AArch64Cpu::sme(GuestMemory& m, uint32_t insn) {
       if ((insn >> 20) & 1) return undefined();
       address += static_cast<uint64_t>(sext(bits_of(insn, 19, 16), 4) * static_cast<int64_t>(nreg) * kVectorBytes);
     } else {
-      const uint32_t rm = bits_of(insn, 20, 16);
-      if (rm == 31) return undefined();
-      address += reg(rm, true) << esz;
+      address += reg(bits_of(insn, 20, 16), true) << esz;      // (Rm = 31 is the zero register)
     }
     Vec data[4];
     uint32_t regs[4];
@@ -106,6 +104,7 @@ AArch64Cpu::Step AArch64Cpu::sme(GuestMemory& m, uint32_t insn) {
   const uint32_t pg = bits_of(insn, 12, 10), rs = bits_of(insn, 14, 13);
   const bool vertical = (insn >> 15) & 1;
   if (!s_.za_enabled) return undefined();
+  if (top == 0xC1) return sme2(m, insn);
 
   // slice moves and loads / stores of tile slices
   auto slice_get = [&](uint32_t esz, uint32_t tile, bool vert, uint32_t k) {
@@ -336,6 +335,22 @@ AArch64Cpu::Step AArch64Cpu::sme(GuestMemory& m, uint32_t insn) {
           put(&row, 3, j, fp_default_nan_fix(Format::F64, fused_multiply_add(Format::F64, x, get(b, 3, j), get(row, 3, j), env)));
         }
       return finish();
+    }
+    if (top == 0x81 && (key == 0x40C || key == 0x40D) && b3 && !(insn & 4) && !(insn & 2)) {      // FMOPA / FMOPS (0x40C) and BFMOPA / BFMOPS (0x40D) into half precision tiles: default NaN, no flags
+      const bool bfloat = key == 0x40D;
+      const Format fmt = bfloat ? Format::BF16 : Format::F16;
+      const uint32_t tile = insn & 1;
+      Env quiet = fp_env();
+      for (uint32_t i = 0; i < 8; ++i)
+        for (uint32_t j = 0; j < 8; ++j) {
+          if (!active(pn, i, 1) || !active(pm, j, 1)) continue;
+          Vec& row = s_.za[i * 2 + tile];
+          const uint64_t x = subtract ? negate(fmt, get(a, 1, i)) : get(a, 1, i);
+          uint64_t result = fused_multiply_add(fmt, x, get(b, 1, j), get(row, 1, j), quiet);
+          if (is_nan(fmt, result)) result = bfloat ? 0x7FC0u : 0x7E00u;
+          put(&row, 1, j, result);
+        }
+      return Step::Ok;
     }
     if (top == 0x81 && (key == 0x40C || key == 0x40D) && !b3) {      // BFMOPA (0x40C) / FMOPA (0x40D) widening half precision into single: no exception flags, the default NaN
       const bool bfloat = key == 0x40C;
