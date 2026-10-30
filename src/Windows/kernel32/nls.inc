@@ -669,9 +669,10 @@ static void sort_weight_of(WCHAR c, DWORD flags, SortWeight *w) {
 /* The next character of the string that counts (the others are skipped). */
 static BOOL sort_next(const WCHAR **p, const WCHAR *end, DWORD flags, SortWeight *w, BOOL include_special) {
   while (*p < end) {
-    sort_weight_of(**p, flags, w);
+    const WCHAR c = **p;
+    sort_weight_of(c, flags, w);
     ++*p;
-    if (w->ignorable) continue;
+    if (w->ignorable || c == 0) continue;
     if ((flags & CMP_IGNORESYMBOLS) && w->primary < 0x1000) continue;
     if (w->special && !include_special) continue;
     return TRUE;
@@ -689,7 +690,6 @@ static int sort_compare(const WCHAR *a, int an, const WCHAR *b, int bn, DWORD fl
   const WCHAR *a_end = a + an, *b_end = b + bn;
   for (int pass = 0; pass < 4; ++pass) {
     if (pass == 1 && (flags & (CMP_IGNORENONSPACE | CMP_LINGUISTIC_IGNOREDIACRITIC))) continue;
-    if (pass == 2 && (flags & (CMP_IGNORECASE | CMP_LINGUISTIC_IGNORECASE))) continue;
     if (pass == 3 && (flags & CMP_STRINGSORT)) continue;
     const WCHAR *pa = a, *pb = b;
     for (;;) {
@@ -785,14 +785,13 @@ static int nls_sort_key(const WCHAR *src, int count, DWORD flags, BYTE *out, int
   #define KEY(b) do { if (out && n < capacity) out[n] = (BYTE)(b); ++n; } while (0)
   for (int pass = 0; pass < 4; ++pass) {
     if (pass == 1 && (flags & (CMP_IGNORENONSPACE | CMP_LINGUISTIC_IGNOREDIACRITIC))) continue;
-    if (pass == 2 && (flags & (CMP_IGNORECASE | CMP_LINGUISTIC_IGNORECASE))) continue;
     if (pass == 3 && (flags & CMP_STRINGSORT)) continue;
     const WCHAR *p = src, *end = src + count;
     SortWeight w;
     while (sort_next(&p, end, flags, &w, pass == 3)) {
       if (pass == 0 || pass == 3) { KEY((w.primary + 0x100) >> 8); KEY((w.primary + 0x100) & 0xFF); }
       else if (pass == 1) KEY(w.accent + 2);
-      else KEY(w.upper ? 3 : 2);
+      else KEY((w.upper && !(flags & (CMP_IGNORECASE | CMP_LINGUISTIC_IGNORECASE))) ? 3 : 2);
     }
     KEY(1);
   }
@@ -801,80 +800,190 @@ static int nls_sort_key(const WCHAR *src, int count, DWORD flags, BYTE *out, int
   return n;
 }
 
-static WCHAR nls_kana(WCHAR c, DWORD flags) {
-  if ((flags & MAP_HIRAGANA) && c >= 0x30A1 && c <= 0x30F6) return (WCHAR)(c - 0x60);
-  if ((flags & MAP_KATAKANA) && c >= 0x3041 && c <= 0x3096) return (WCHAR)(c + 0x60);
-  return c;
-}
-static WCHAR nls_width(WCHAR c, DWORD flags) {
-  if ((flags & MAP_FULLWIDTH)) { if (c >= 0x21 && c <= 0x7E) return (WCHAR)(c + 0xFEE0); if (c == ' ') return 0x3000; }
-  if ((flags & MAP_HALFWIDTH)) { if (c >= 0xFF01 && c <= 0xFF5E) return (WCHAR)(c - 0xFEE0); if (c == 0x3000) return ' '; }
-  return c;
-}
-static WCHAR nls_title_pending;
+/* ---- LCMapString ------------------------------------------------------------------------------------------------------------------------------------ */
 
-static int nls_lcmap(DWORD flags, const WCHAR *src, int count, WCHAR *dst, int capacity) {
-  if (!src || count == 0 || capacity < 0 || (capacity > 0 && !dst && !(flags & MAP_SORTKEY) ) ) { set_error(ERROR_INVALID_PARAMETER); return 0; }
-  if (capacity > 0 && !dst) { set_error(ERROR_INVALID_PARAMETER); return 0; }
+/* The result of a mapping: the units are counted whatever the capacity, and only those that fit are written. */
+typedef struct { WCHAR *dst; int capacity, length; } LcOut;
+static void lc_put(LcOut *o, DWORD cp) {
+  const int units = cp >= 0x10000 ? 2 : 1;
+  if (o->dst && o->capacity && o->length + units <= o->capacity) {
+    if (units == 2) { o->dst[o->length] = (WCHAR)(0xD800 + ((cp - 0x10000) >> 10)); o->dst[o->length + 1] = (WCHAR)(0xDC00 + ((cp - 0x10000) & 0x3FF)); }
+    else o->dst[o->length] = (WCHAR)cp;
+  }
+  o->length += units;
+}
+
+/* The simple case mappings, with the exceptions of the languages: Turkish and Azeri have the dotted and dotless i, and with LCMAP_LINGUISTIC_CASING the dotted capital and
+ * the dotless small i map to the plain letters. */
+static DWORD lc_case(DWORD cp, BOOL upper, BOOL linguistic, BOOL turkic) {
+  if (linguistic) {
+    if (turkic && upper && cp == 'i') return 0x130;
+    if (turkic && !upper && cp == 'I') return 0x131;
+    if (!upper && cp == 0x130) return 'i';
+    if (upper && cp == 0x131) return 'I';
+  }
+  if (cp < 0x10000) return upper ? wide_upper((WCHAR)cp) : wide_lower((WCHAR)cp);
+  SIZE_T lo = 0, hi = sizeof(k_case_supplementary) / sizeof(k_case_supplementary[0]);
+  while (lo < hi) {
+    const SIZE_T mid = lo + (hi - lo) / 2;
+    if (k_case_supplementary[mid].cp < cp) lo = mid + 1; else if (k_case_supplementary[mid].cp > cp) hi = mid;
+    else return upper ? k_case_supplementary[mid].upper : k_case_supplementary[mid].lower;
+  }
+  return cp;
+}
+static DWORD lc_hiragana_katakana(DWORD c, BOOL to_katakana) {
+  if (to_katakana) { if ((c >= 0x3041 && c <= 0x3096) || c == 0x309D || c == 0x309E) return c + 0x60; }
+  else if ((c >= 0x30A1 && c <= 0x30F6) || c == 0x30FD || c == 0x30FE) return c - 0x60;
+  return c;
+}
+/* A half-width katakana (and a mark after it) as a full-width character; *used is the number of characters taken. */
+static DWORD lc_to_fullwidth(const WCHAR *s, int left, int *used) {
+  const DWORD c = s[0];
+  *used = 1;
+  if (c >= 0xFF61 && c <= 0xFF9F) {
+    const DWORD f = k_hw_to_fw[c - 0xFF61];
+    if (left > 1 && (s[1] == 0xFF9E || s[1] == 0xFF9F)) {
+      for (SIZE_T i = 0; i < sizeof(k_kana_voiced) / sizeof(k_kana_voiced[0]); ++i)
+        if (k_kana_voiced[i].base == f && k_kana_voiced[i].mark == s[1]) { *used = 2; return k_kana_voiced[i].result; }
+    }
+    return f;
+  }
+  if (c >= 0x21 && c <= 0x7E) return c + 0xFEE0;
+  if (c == ' ') return 0x3000;
+  if (c >= 0xFFE0 && c <= 0xFFE6) return c;
+  switch (c) { case 0xA2: return 0xFFE0; case 0xA3: return 0xFFE1; case 0xAC: return 0xFFE2; case 0xAF: return 0xFFE3; case 0xA6: return 0xFFE4; case 0xA5: return 0xFFE5; case 0x20A9: return 0xFFE6; default: break; }
+  return c;
+}
+/* The half-width form(s) of a character: up to two. */
+static int lc_to_halfwidth(DWORD c, DWORD *out) {
+  if (c >= 0xFF01 && c <= 0xFF5E) { out[0] = c - 0xFEE0; return 1; }
+  if (c == 0x3000) { out[0] = ' '; return 1; }
+  switch (c) { case 0xFFE0: out[0] = 0xA2; return 1; case 0xFFE1: out[0] = 0xA3; return 1; case 0xFFE2: out[0] = 0xAC; return 1; case 0xFFE3: out[0] = 0xAF; return 1; case 0xFFE4: out[0] = 0xA6; return 1; case 0xFFE5: out[0] = 0xA5; return 1; case 0xFFE6: out[0] = 0x20A9; return 1; default: break; }
+  SIZE_T lo = 0, hi = sizeof(k_fw_to_hw) / sizeof(k_fw_to_hw[0]);
+  while (lo < hi) {
+    const SIZE_T mid = lo + (hi - lo) / 2;
+    if (k_fw_to_hw[mid].full < c) lo = mid + 1; else if (k_fw_to_hw[mid].full > c) hi = mid;
+    else { out[0] = k_fw_to_hw[mid].half; if (k_fw_to_hw[mid].mark) { out[1] = k_fw_to_hw[mid].mark; return 2; } return 1; }
+  }
+  out[0] = c;
+  return 1;
+}
+
+/* Whether a language uses the Turkish casing of the i. */
+static BOOL lc_turkic(int kind) {
+  const char *iso = nls_text_of(kind, 0x59);
+  return iso && ((iso[0] == 't' && iso[1] == 'r') || (iso[0] == 'a' && iso[1] == 'z')) && !iso[2];
+}
+
+static int nls_lcmap(int kind, BOOL ansi, DWORD flags, const WCHAR *src, int count, WCHAR *dst, int capacity) {
+  if (!src || count == 0 || capacity < 0 || (capacity > 0 && !dst)) { set_error(ERROR_INVALID_PARAMETER); return 0; }
   const DWORD mapping = flags & MAP_ALL, norm = flags & (CMP_IGNORECASE | CMP_IGNORENONSPACE | CMP_IGNORESYMBOLS | CMP_STRINGSORT | CMP_IGNOREKANATYPE | CMP_IGNOREWIDTH | CMP_LINGUISTIC_IGNORECASE | CMP_LINGUISTIC_IGNOREDIACRITIC);
   const DWORD known = MAP_ALL | MAP_HASH | MAP_LINGUISTIC_CASING | MAP_SORTHANDLE | CMP_IGNORECASE | CMP_IGNORENONSPACE | CMP_IGNORESYMBOLS | CMP_STRINGSORT | CMP_IGNOREKANATYPE | CMP_IGNOREWIDTH | CMP_LINGUISTIC_IGNORECASE | CMP_LINGUISTIC_IGNOREDIACRITIC | LCT_USE_CP_ACP;
   const BOOL titlecase = (mapping & (MAP_LOWERCASE | MAP_UPPERCASE)) == (MAP_LOWERCASE | MAP_UPPERCASE);
   if ((flags & ~known) || flags == 0 || (mapping & MAP_SORTKEY && (mapping & ~MAP_SORTKEY))) { set_error(ERROR_INVALID_FLAGS); return 0; }
+  if (ansi && titlecase) { set_error(ERROR_INVALID_FLAGS); return 0; }
   if (((mapping & MAP_HIRAGANA) && (mapping & MAP_KATAKANA)) || ((mapping & MAP_HALFWIDTH) && (mapping & MAP_FULLWIDTH)) || ((mapping & MAP_SIMPLIFIED) && (mapping & MAP_TRADITIONAL))) { set_error(ERROR_INVALID_FLAGS); return 0; }
   if ((mapping & (MAP_LOWERCASE | MAP_UPPERCASE)) && (flags & (CMP_STRINGSORT | CMP_IGNORESYMBOLS | CMP_IGNORENONSPACE))) { set_error(ERROR_INVALID_FLAGS); return 0; }
   if ((mapping & (MAP_HIRAGANA | MAP_KATAKANA | MAP_HALFWIDTH | MAP_FULLWIDTH)) && ((mapping & (MAP_SIMPLIFIED | MAP_TRADITIONAL)) || (flags & (CMP_IGNORENONSPACE | CMP_IGNORESYMBOLS)))) { set_error(ERROR_INVALID_FLAGS); return 0; }
   if (mapping == 0 && (norm & ~(CMP_IGNORENONSPACE | CMP_IGNORESYMBOLS))) { set_error(ERROR_INVALID_FLAGS); return 0; }
   if (count < 0) count = (int)wcslen(src) + 1;
-  if (dst && dst == src && !(mapping & (MAP_LOWERCASE | MAP_UPPERCASE)) ) { set_error(ERROR_INVALID_FLAGS); return 0; }
+  if (dst && dst == src && !(mapping & (MAP_LOWERCASE | MAP_UPPERCASE))) { set_error(ERROR_INVALID_FLAGS); return 0; }
   if (dst && dst == src && (mapping & ~(MAP_LOWERCASE | MAP_UPPERCASE))) { set_error(ERROR_INVALID_FLAGS); return 0; }
   if (mapping & MAP_SORTKEY) {
     BYTE *bytes = (BYTE *)dst;
     const int needed = nls_sort_key(src, count, flags, NULL, 0);
     if (capacity == 0) return needed;
-    if (capacity < needed) { set_error(ERROR_INSUFFICIENT_BUFFER); return 0; }
+    if (capacity < needed) {
+      /* the part of the key that fits is written, up to the last separator in it */
+      BYTE full[1024];
+      int upto = 0;
+      if (needed <= (int)sizeof(full)) {
+        nls_sort_key(src, count, flags, full, sizeof(full));
+        for (int i = 0; i < capacity; ++i) if (full[i] == 1) upto = i + 1;
+        for (int i = 0; i < upto; ++i) bytes[i] = full[i];
+      }
+      set_error(ERROR_INSUFFICIENT_BUFFER);
+      return 0;
+    }
     return nls_sort_key(src, count, flags, bytes, capacity);
   }
-  int n = 0;
+  const BOOL linguistic = (flags & MAP_LINGUISTIC_CASING) != 0, turkic = lc_turkic(kind);
+  LcOut o = { dst, capacity, 0 };
   BOOL word_start = TRUE;
-  for (int i = 0; i < count; ++i) {
-    WCHAR c = src[i];
-    if ((flags & CMP_IGNORENONSPACE) && nls_nonspacing(c)) continue;
-    if (flags & CMP_IGNORENONSPACE) c = nls_unaccent(c);
-    if (flags & CMP_IGNORESYMBOLS) {
-      SortWeight w;
-      sort_weight_of(c, 0, &w);
-      if (w.primary < 0x1000 && c != 0) continue;
+  for (int i = 0; i < count;) {
+    DWORD c = src[i];
+    int used = 1;
+    if (c >= 0xD800 && c < 0xDC00 && i + 1 < count && (src[i + 1] & 0xFC00) == 0xDC00) { c = 0x10000 + ((c - 0xD800) << 10) + (src[i + 1] - 0xDC00); used = 2; }
+    if (c < 0x10000) {
+      if ((flags & CMP_IGNORENONSPACE) && nls_nonspacing((WCHAR)c)) { i += used; continue; }
+      if (flags & CMP_IGNORENONSPACE) c = nls_unaccent((WCHAR)c);
+      if (flags & CMP_IGNORESYMBOLS) {
+        SortWeight w;
+        sort_weight_of((WCHAR)c, 0, &w);
+        if (w.primary < 0x1000 && c != 0) { i += used; continue; }
+      }
     }
     if (titlecase) {
-      const BOOL letter = wide_upper(c) != wide_lower(c);
-      c = letter ? (word_start ? wide_upper(c) : wide_lower(c)) : c;
+      const DWORD up = lc_case(c, TRUE, linguistic, turkic), lo = lc_case(c, FALSE, linguistic, turkic);
+      const BOOL letter = up != lo;
+      c = letter ? (word_start ? up : lo) : c;
       word_start = !letter;
-    } else if (mapping & MAP_LOWERCASE) c = wide_lower(c);
-    else if (mapping & MAP_UPPERCASE) c = wide_upper(c);
-    c = nls_kana(c, mapping);
-    c = nls_width(c, mapping);
-    if (mapping & MAP_BYTEREV) c = (WCHAR)((c << 8) | (c >> 8));
-    if (capacity != 0 && n < capacity) dst[n] = c;
-    ++n;
+    } else if (mapping & MAP_LOWERCASE) c = lc_case(c, FALSE, linguistic, turkic);
+    else if (mapping & MAP_UPPERCASE) c = lc_case(c, TRUE, linguistic, turkic);
+    /* the full-width forms come first for FULLWIDTH, the kana first for HALFWIDTH: the order of the conversions of Windows */
+    if (mapping & MAP_FULLWIDTH) {
+      if (c < 0x10000) {
+        int taken;
+        WCHAR pair[2] = { (WCHAR)c, (WCHAR)(i + used < count ? src[i + used] : 0) };
+        c = lc_to_fullwidth(pair, 1 + (pair[1] ? 1 : 0), &taken);
+        used += taken - 1;
+      } else {
+        /* characters of the other planes that have a plain form (mathematical letters, compatibility ideographs) */
+        WCHAR from[2] = { (WCHAR)(0xD800 + ((c - 0x10000) >> 10)), (WCHAR)(0xDC00 + ((c - 0x10000) & 0x3FF)) }, to[8];
+        INT room = 8;
+        if (RtlNormalizeString(5, from, 2, to, &room) == STATUS_SUCCESS && room == 1) c = to[0];
+      }
+    }
+    if (mapping & MAP_HIRAGANA) c = lc_hiragana_katakana(c, FALSE);
+    if (mapping & MAP_KATAKANA) c = lc_hiragana_katakana(c, TRUE);
+    if (mapping & MAP_HALFWIDTH) {
+      DWORD half[2];
+      const int n = c < 0x10000 ? lc_to_halfwidth(c, half) : (half[0] = c, 1);
+      for (int k = 0; k < n; ++k) {
+        DWORD h = half[k];
+        if (mapping & MAP_BYTEREV) h = (h << 8 | h >> 8) & 0xFFFF;
+        lc_put(&o, h);
+      }
+      i += used;
+      continue;
+    }
+    if (mapping & MAP_BYTEREV) c = (c << 8 | c >> 8) & 0xFFFF;
+    lc_put(&o, c);
+    i += used;
   }
-  (void)nls_title_pending;
-  if (capacity == 0) return n;
-  if (n > capacity) { set_error(ERROR_INSUFFICIENT_BUFFER); return 0; }
-  return n;
+  if (capacity == 0) return o.length;
+  if (o.length > capacity) { set_error(ERROR_INSUFFICIENT_BUFFER); return 0; }
+  return o.length;
 }
 EXPORT int WINAPI LCMapStringW(LCID locale, DWORD flags, LPCWSTR source, int count, LPWSTR dest, int capacity) {
   if (nls_locale_of(locale) == 0 && locale != 0x40C && locale != 0x411) { set_error(ERROR_INVALID_PARAMETER); return 0; }
-  return nls_lcmap(flags, source, count, dest, capacity);
+  return nls_lcmap(nls_locale_of(locale), FALSE, flags, source, count, dest, capacity);
 }
 EXPORT int WINAPI LCMapStringEx(LPCWSTR name, DWORD flags, LPCWSTR source, int count, LPWSTR dest, int capacity, LPVOID version, LPVOID reserved, LPARAM sort_handle) {
-  if (reserved || (name && nls_locale_of_name(name) == 0 && !(name[0] && name[1] && name[2] == '-')) || (!(flags & MAP_SORTHANDLE) && sort_handle)) { set_error(ERROR_INVALID_PARAMETER); return 0; }
-  (void)version;
-  return nls_lcmap(flags & ~MAP_SORTHANDLE, source, count, dest, capacity);
+  (void)version; (void)reserved; (void)sort_handle;
+  int kind = nls_locale_of_name(name);
+  /* a name that is no locale only matters where the locale is used: for the cases and the sort keys */
+  if (kind == 0) {
+    if (flags & (MAP_LOWERCASE | MAP_UPPERCASE | MAP_SORTKEY)) { set_error(ERROR_INVALID_PARAMETER); return 0; }
+    kind = nls_default_kind();
+  }
+  return nls_lcmap(kind, FALSE, flags & ~MAP_SORTHANDLE, source, count, dest, capacity);
 }
 EXPORT int WINAPI LCMapStringA(LCID locale, DWORD flags, LPCSTR source, int count, LPSTR dest, int capacity) {
   if (!source || count == 0 || capacity < 0 || (capacity > 0 && !dest)) { set_error(ERROR_INVALID_PARAMETER); return 0; }
   if (count < 0) count = (int)strlen(source) + 1;
   if (dest == source && !(flags & (MAP_LOWERCASE | MAP_UPPERCASE))) { set_error(ERROR_INVALID_FLAGS); return 0; }
+  if ((flags & (MAP_LOWERCASE | MAP_UPPERCASE)) == (MAP_LOWERCASE | MAP_UPPERCASE)) { set_error(ERROR_INVALID_FLAGS); return 0; }
   const int wide_count = MultiByteToWideChar(CP_UTF8, 0, source, count, NULL, 0);
   WCHAR *w = RtlAllocateHeap(heap(), 0, ((SIZE_T)wide_count + 1) * 2);
   if (!w) { set_error(ERROR_NOT_ENOUGH_MEMORY); return 0; }

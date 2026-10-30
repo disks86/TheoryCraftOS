@@ -114,6 +114,41 @@ def write_idn():
         f.write("\n".join(out) + "\n")
 
 
+def write_kana(out):
+    """Half-width katakana and the characters Windows maps to and from them (LCMAP_FULLWIDTH and LCMAP_HALFWIDTH)."""
+    hw_to_fw = {}
+    for c in range(0xFF61, 0xFFA0):
+        hw_to_fw[c] = ord(ud.normalize("NFKC", chr(c)))
+    inverse = {}
+    for h, f in hw_to_fw.items():
+        inverse.setdefault(f, h)
+    voiced = []
+    fw_to_hw = []
+    for f in range(0x3000, 0x3100):
+        d = ud.normalize("NFD", chr(f))
+        if len(d) == 2 and ord(d[1]) in (0x3099, 0x309A) and ord(d[0]) in inverse:
+            mark = 0xFF9E if ord(d[1]) == 0x3099 else 0xFF9F
+            voiced.append((ord(d[0]), mark, f))
+            fw_to_hw.append((f, inverse[ord(d[0])], mark))
+        elif f in inverse and ud.normalize("NFKC", chr(inverse[f])) == chr(f):
+            fw_to_hw.append((f, inverse[f], 0))
+    out.append("static const WORD k_hw_to_fw[%d] = {%s};   /* U+FF61..U+FF9F */" % (len(hw_to_fw), ",".join("0x%x" % hw_to_fw[c] for c in sorted(hw_to_fw))))
+    voiced.sort()
+    out.append("static const struct { WORD base, mark, result; } k_kana_voiced[%d] = {%s};" % (len(voiced), ",".join("{0x%x,0x%x,0x%x}" % v for v in voiced)))
+    fw_to_hw.sort()
+    out.append("static const struct { WORD full, half, mark; } k_fw_to_hw[%d] = {%s};" % (len(fw_to_hw), ",".join("{0x%x,0x%x,0x%x}" % v for v in fw_to_hw)))
+    # the case mappings outside the Basic Multilingual Plane
+    supp = []
+    for c in range(0x10000, 0x110000):
+        ch = chr(c)
+        u, l = ch.upper(), ch.lower()
+        if len(u) != 1: u = ch
+        if len(l) != 1: l = ch
+        if u != ch or l != ch:
+            supp.append((c, ord(u), ord(l)))
+    out.append("static const struct { DWORD cp, upper, lower; } k_case_supplementary[%d] = {%s};" % (len(supp), ",".join("{0x%x,0x%x,0x%x}" % v for v in supp)))
+
+
 def write_ctype():
     runs = []
     for c in range(0x10000):
@@ -126,6 +161,7 @@ def write_ctype():
     out.append("static const struct { WORD first, last, c1, c2, c3; } k_ctype_runs[%d] = {" % len(runs))
     out.append(",".join("{0x%x,0x%x,0x%x,%d,0x%x}" % (r[0], r[1], r[2][0], r[2][1], r[2][2]) for r in runs))
     out.append("};")
+    write_kana(out)
     out.append("")
     path = os.path.join(root, "src", "Windows", "kernel32", "ctype_data.inc")
     with open(path, "w") as f:

@@ -33,6 +33,8 @@ def simple(cp, lower):
         return cp
     c = chr(cp)
     m = c.lower() if lower else c.upper()
+    if len(m) != 1 and not lower and len(c.title()) == 1 and c.title() != c:
+        m = c.title()      # the simple mapping of the Greek letters with ypogegrammeni is their capital with prosgegrammeni
     if len(m) != 1:
         return cp
     r = ord(m)
