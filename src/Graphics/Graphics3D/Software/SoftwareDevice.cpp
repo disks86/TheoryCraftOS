@@ -113,6 +113,7 @@ class SoftwareImage final : public IImage {
     const uint64_t count = uint64_t{desc_.extent.width} * desc_.extent.height;
     if (color_.empty() || out.size() < count || desc_.samples > 1) return false;   // (a multisampled image is resolved first)
     Surface s = surface();
+    if (s.format != Format::R8G8B8A8Unorm) return out.copy_from(ArrayView<const uint32_t>(color_.data(), count));   // (stored as it is read: one copy)
     for (uint64_t i = 0; i < count; ++i) out[i] = s.decode(color_[i]);
     return true;
   }

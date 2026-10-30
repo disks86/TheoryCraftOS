@@ -46,6 +46,7 @@ namespace desktop {
 class CubeView : public gui::Control {
  public:
   static constexpr uint32_t kMaxWidth = 400, kMaxHeight = 300;
+  static constexpr uint64_t kFrameIntervalUs = 16667;   // 60 frames a second: the cube is drawn at the pace of a display, not as often as the machine can
 
   explicit CubeView(allocators::IAllocator& allocator) : Control(allocator) {}
 

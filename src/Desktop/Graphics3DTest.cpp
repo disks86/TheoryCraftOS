@@ -17,6 +17,7 @@
  */
 
 #include "Desktop/Graphics3DTest.hpp"
+#include "Gui/Window.hpp"
 #include "Kernel/Delay.hpp"
 #include "console.hpp"
 
@@ -217,7 +218,8 @@ void CubeView::paint(gui::Painter& painter) {
     painter.text(9, 45, why.view(), kShadow);
     painter.text(8, 44, why.view(), kAmber);
   }
-  invalidate();   // the next frame, as soon as the render loop is ready
+  if (gui::Window* w = window()) w->request_frame_interval(kFrameIntervalUs);
+  invalidate();   // the next frame, as soon as the render loop is ready (at the display's pace)
 }
 
 // --- The window ------------------------------------------------------------------------------------
