@@ -2920,13 +2920,22 @@ static DWORD full_path_w(LPCWSTR in, WCHAR *out, DWORD capacity) {
   return n;
 }
 
+static DWORD dosdev_redirect(WCHAR *buffer, DWORD length, DWORD capacity);
+static BOOL volume_nt_name(LPCWSTR dos, WCHAR *buffer, DWORD capacity, DWORD *length);
+
 /* The NT name ("\??\C:\dir\file") for a Win32 path, and an OBJECT_ATTRIBUTES for it. `buffer` needs PATH_CHARS + 8 characters. */
 static BOOL nt_name(LPCWSTR dos, WCHAR *buffer, UNICODE_STRING *name, OBJECT_ATTRIBUTES *attributes) {
-  buffer[0] = '\\'; buffer[1] = '?'; buffer[2] = '?'; buffer[3] = '\\';
-  const DWORD n = full_path_w(dos, buffer + 4, PATH_CHARS);
-  if (n == 0) return FALSE;
+  DWORD total = 0;
+  if (!volume_nt_name(dos, buffer, PATH_CHARS + 8, &total)) {
+    buffer[0] = '\\'; buffer[1] = '?'; buffer[2] = '?'; buffer[3] = '\\';
+    const DWORD n = full_path_w(dos, buffer + 4, PATH_CHARS);
+    if (n == 0) return FALSE;
+    total = n + 4;
+  }
+  total = dosdev_redirect(buffer, total, PATH_CHARS + 8);
+  if (total == 0) { set_error(ERROR_FILENAME_EXCED_RANGE); return FALSE; }
   name->Buffer = buffer;
-  name->Length = (USHORT)((n + 4) * 2);
+  name->Length = (USHORT)(total * 2);
   name->MaximumLength = (USHORT)(name->Length + 2);
   attributes->Length = sizeof(OBJECT_ATTRIBUTES);
   attributes->RootDirectory = NULL;
@@ -3050,9 +3059,6 @@ EXPORT BOOL WINAPI SetCurrentDirectoryA(LPCSTR path) {
   return ok;
 }
 
-EXPORT UINT WINAPI GetDriveTypeW(LPCWSTR root) { return (root && upper(root[0]) == 'C') ? 3 /* DRIVE_FIXED */ : 1 /* DRIVE_NO_ROOT_DIR */; }
-EXPORT UINT WINAPI GetDriveTypeA(LPCSTR root) { return (root && (root[0] == 'C' || root[0] == 'c')) ? 3 : 1; }
-EXPORT DWORD WINAPI GetLogicalDrives(void) { return 1u << 2; }
 EXPORT UINT WINAPI GetSystemDirectoryW(LPWSTR buffer, UINT capacity) {
   static const WCHAR kPath[] = {'C', ':', '\\', 'W', 'i', 'n', 'd', 'o', 'w', 's', '\\', 'S', 'y', 's', 't', 'e', 'm', '3', '2', 0};
   if (capacity < 20) return 20;
@@ -3136,6 +3142,17 @@ EXPORT HANDLE WINAPI CreateFileW(LPCWSTR path, DWORD access, DWORD share, LPSECU
     for (; path[i] && i < 299; ++i) normal[i] = path[i] == '/' ? '\\' : path[i];
     normal[i] = 0;
     if (!mailslot_nt_name(normal, buffer, &name, &attributes, FALSE)) return INVALID_HANDLE_VALUE;
+  } else if (is_separator(path[0]) && is_separator(path[1]) && path[2] == '.' && is_separator(path[3]) && equals_ignore_case(path + 4, (const WCHAR *)L"MountPointManager")) {
+    /* \\.\MountPointManager: the device that knows the volumes and where they are mounted */
+    static const WCHAR mountmgr_name[] = {'\\', '?', '?', '\\', 'M', 'o', 'u', 'n', 't', 'P', 'o', 'i', 'n', 't', 'M', 'a', 'n', 'a', 'g', 'e', 'r', 0};
+    memcpy(buffer, mountmgr_name, sizeof(mountmgr_name));
+    name.Buffer = buffer;
+    name.Length = (sizeof(mountmgr_name) - 2);
+    name.MaximumLength = sizeof(mountmgr_name);
+    memset(&attributes, 0, sizeof(attributes));
+    attributes.Length = sizeof(attributes);
+    attributes.ObjectName = &name;
+    attributes.Attributes = 0x40;      /* OBJ_CASE_INSENSITIVE */
   } else {
     /* A DOS device name (in any directory) is the device: NUL is the one that exists here, the others are not there. */
     size_t_ last = wcslen(path);
@@ -3809,6 +3826,7 @@ EXPORT BOOL WINAPI DllMain(HANDLE module, DWORD reason, PVOID reserved) {
 #include "locale.inc"
 #include "extra.inc"
 #include "extra2.inc"
+#include "volume.inc"
 #include "extra3.inc"
 #include "legacy.inc"
 #include "fmtmsg.inc"

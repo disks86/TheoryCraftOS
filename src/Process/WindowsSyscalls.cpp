@@ -172,6 +172,7 @@ class WindowsSyscalls final : public ISyscallInterface {
       case WindowsSyscallNumber::NtIsProcessInJob: return windowsabi::nt_is_process_in_job(process, r);
       case WindowsSyscallNumber::NtCreatePipe: return windowsabi::nt_create_pipe(process, r);
       case WindowsSyscallNumber::NtCreateNamedPipeFile: return windowsabi::nt_create_named_pipe_file(process, r);
+      case WindowsSyscallNumber::NtDeviceIoControlFile: return windowsabi::nt_device_io_control_file(process, r);
       case WindowsSyscallNumber::NtFsControlFile: return windowsabi::nt_fs_control_file(process, r);
       case WindowsSyscallNumber::NtQueryObject: return windowsabi::nt_query_object(process, r);
       case WindowsSyscallNumber::NtSetInformationObject: return windowsabi::nt_set_information_object(process, r);
