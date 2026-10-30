@@ -160,9 +160,10 @@ class CommandRecorder : public ICommandBuffer {
     c.type = RecordedCommand::Type::EndRenderPass;
     add(c);
   }
-  void resolve_image(IImage* destination, IImage* source) override {
+  void resolve_image(IImage* destination, IImage* source, ResolveMode mode) override {
     RecordedCommand c;
     c.type = RecordedCommand::Type::Resolve;
+    c.count = static_cast<uint32_t>(mode);
     c.image = destination;
     c.image2 = source;
     add(c);

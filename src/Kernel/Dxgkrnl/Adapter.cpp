@@ -344,23 +344,31 @@ class Adapter::StreamRunner {
     return status::kSuccess;
   }
 
-  // Averages the samples of a multisampled colour target into an ordinary image of the same format and size.
+  // Resolves a multisampled target into an ordinary image of the same format and size: the samples of a colour target averaged (or sample 0 taken), a depth buffer's sample 0 (or, with the
+  // adapter's kFeatureResolveModes, its least, greatest or mean). The mode is an optional third word (a graphics::ResolveMode, 0 average when it is left out).
   NtStatus resolve(ByteReader& p) {
     const uint32_t to_index = p.le32(), from_index = p.le32();
-    if (!exact(p) || in_pass_ || !(adapter_.caps_.features & graphics::kFeatureMultisample)) return kBad;
+    uint32_t mode = 0;
+    if (!p.at_end()) mode = p.le32();
+    if (!exact(p) || in_pass_ || !(adapter_.caps_.features & graphics::kFeatureMultisample) || mode > static_cast<uint32_t>(graphics::ResolveMode::Max)) return kBad;
     Allocation* to = alloc(to_index);
     Allocation* from = alloc(from_index);
-    if (!to || !from || !to->is_image() || !from->is_image() || to->is_depth() || from->is_depth() || to->is_staging() || to == from) return kBad;
+    if (!to || !from || !to->is_image() || !from->is_image() || to->is_staging() || to == from || to->is_depth() != from->is_depth()) return kBad;
+    const bool depth = to->is_depth();
     if (from->desc().samples < 2 || to->desc().samples != 1 || to->mip_levels() != 1 || to->layers() != 1) return kBad;
     if (to->desc().format != from->desc().format || to->desc().width != from->desc().width || to->desc().height != from->desc().height) return kBad;
-    if (!(from->desc().flags & kAllocRenderTarget)) return kBad;
+    if (!(from->desc().flags & (depth ? kAllocDepthStencil : kAllocRenderTarget))) return kBad;
+    // (which modes the adapter has: the average of a colour image, the first sample of a depth image, all of them with kFeatureResolveModes)
+    const bool plain = depth ? mode == static_cast<uint32_t>(graphics::ResolveMode::Sample0) : mode == static_cast<uint32_t>(graphics::ResolveMode::Average);
+    if (depth && !(adapter_.caps_.features & graphics::kFeatureDepthResolve)) return kBad;
+    if (!plain && !(adapter_.caps_.features & graphics::kFeatureResolveModes)) return kBad;
     unbind_textures_of(to);
     if (!exec_) return status::kSuccess;
     NtStatus s = resident(*to);
     if (s == status::kSuccess) s = resident(*from);
     if (s == status::kSuccess) s = ensure_cb();
     if (s != status::kSuccess) return s;
-    cb_->resolve_image(to->image(), from->image());
+    cb_->resolve_image(to->image(), from->image(), static_cast<graphics::ResolveMode>(mode));
     mm_.note_gpu_write(*to);
     return status::kSuccess;
   }

@@ -235,6 +235,8 @@ class VirglImage final : public IImage {
   Format format() const override { return desc_.format; }
   uint32_t usage() const { return desc_.usage; }
   uint32_t samples() const { return desc_.samples; }
+  bool has_stencil() const { return desc_.stencil; }
+  uint32_t blit_format() const { return desc_.format == Format::D32Float ? (desc_.stencil ? virgl::kFormatZ32FloatS8X24Uint : virgl::kFormatZ32Float) : color_format_; }   // (what a blit calls the image's format)
   uint32_t color_format() const { return color_format_; }
   bool stencil() const { return desc_.stencil; }
   uint32_t layer_count() const override { return desc_.kind == TextureKind::Texture2D ? 1 : desc_.kind == TextureKind::TextureCube ? 6 : desc_.layers; }
@@ -837,14 +839,17 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         const VirglImage* from = static_cast<const VirglImage*>(cmd.image2);
         if (in_pass || !to || !from || to->samples() != 1 || from->samples() < 2 || to->extent().width != from->extent().width || to->extent().height != from->extent().height) return false;
         const Extent2D e = from->extent();
-        const bool flip = to->y0_top();   // (a multisampled image does not take the flag: the host stores it the way GL does, and only a destination kept upright needs the blit to turn it over)
+        const bool depth = to->format() == Format::D32Float;
+        // (the host's blit averages colour and takes the first sample of depth: the other modes are not made)
+        if (static_cast<ResolveMode>(cmd.count) != (depth ? ResolveMode::Sample0 : ResolveMode::Average)) return false;
+        const bool flip = !depth && to->y0_top();   // (a multisampled image does not take the flag: the host stores it the way GL does, and only a destination kept upright needs the blit to turn it over)
         stream.command(virgl::kBlit, 0, 21);
-        stream.put(0xF);   // (all four channels, nearest, no scissor)
+        stream.put(depth ? (to->has_stencil() ? 0x30u : 0x10u) : 0xFu);   // (all four channels, or depth and stencil; nearest, no scissor)
         stream.put(0);
         stream.put(e.width | (e.height << 16));
-        stream.put(to->id()), stream.put(0), stream.put(to->color_format());
+        stream.put(to->id()), stream.put(0), stream.put(to->blit_format());
         stream.put(0), stream.put(flip ? e.height : 0), stream.put(0), stream.put(e.width), stream.put(flip ? static_cast<uint32_t>(-static_cast<int32_t>(e.height)) : e.height), stream.put(1);
-        stream.put(from->id()), stream.put(0), stream.put(from->color_format());
+        stream.put(from->id()), stream.put(0), stream.put(from->blit_format());
         stream.put(0), stream.put(0), stream.put(0), stream.put(e.width), stream.put(e.height), stream.put(1);
         break;
       }

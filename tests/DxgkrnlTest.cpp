@@ -4504,6 +4504,20 @@ void test_conformance() {
       for (uint32_t i = 0; i < 32 * 32; ++i) lit += (r.device_picture[i] & 0xFFFFFF) != 0;
       CHECK(lit > 100);
     }
+    if (__builtin_strstr(r.name, "depth resolve")) {
+      // Counts of the three levels: black (near, 0.3), green (0.7) and blue (the cleared 1). Of the pixels where the rectangles' edges cut, the first sample's depth is one of them, the least the
+      // nearer, the greatest the further: so there are more far (blue) pixels under "greatest" than "first" than "least", the reverse for black.
+      uint32_t black = 0, green = 0, blue = 0;
+      for (uint32_t i = 0; i < 32 * 32; ++i) {
+        const uint32_t c = r.device_picture[i] & 0xFFFFFF;
+        black += c == 0, green += c == 0x00FF00, blue += c == 0x0000FF;
+      }
+      CHECK(black + green + blue == 1024);
+      static uint32_t s_black[3], s_blue[3];
+      const uint32_t which = __builtin_strstr(r.name, "first") ? 0 : __builtin_strstr(r.name, "least") ? 1 : 2;
+      s_black[which] = black, s_blue[which] = blue;
+      if (which == 2) CHECK(s_black[1] > s_black[0] && s_black[0] > s_black[2] && s_blue[2] > s_blue[0] && s_blue[0] > s_blue[1]);   // (the scenes run in this order: first, least, greatest)
+    }
     if (__builtin_strstr(r.name, "alpha to coverage")) {
       // The red channel of each band (the colour is red 1): none, all, none, all, all.
       auto red = [&](uint32_t band) { return (r.device_picture[16 * 32 + band * 6 + 3] >> 16) & 0xFF; };

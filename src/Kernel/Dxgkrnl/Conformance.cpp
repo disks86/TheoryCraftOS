@@ -1400,6 +1400,63 @@ void scene_multisample_resource(Rig& rig, ArrayView<uint32_t> out) {
   rig.read(target, out);
 }
 
+// Depth resolve: two rectangles with edges off the pixel grid (the near one at depth 0.3, the far one at 0.7, behind it where they overlap) are drawn into a 4x multisampled depth buffer, which
+// is resolved (sample 0, or the least or greatest of the samples) into a plain one; then the plain depth buffer is read by drawing over it with the depth test: a quad at depth 0.5 that
+// shows green where the stored depth is greater (0.7 and the cleared 1), and one at 0.85 over it that shows blue where it is the cleared 1, so the picture says which of the three depths each pixel
+// holds: black (0.3), green (0.7), blue (1).
+void depth_resolve_scene(Rig& rig, ArrayView<uint32_t> out, uint32_t mode) {
+  if (!rig.has(graphics::kFeatureMultisample | graphics::kFeatureDepthResolve | (mode == 1 ? 0u : graphics::kFeatureResolveModes))) return void(rig.step("depth resolve", status::kNotSupported));
+  auto rect = [](Vertex* v, float x0, float y0, float x1, float y1, float z, float r, float g, float b) {
+    auto at = [&](float px, float py) { return Vertex{px / 16.0f - 1.0f, py / 16.0f - 1.0f, z, r, g, b, 1}; };
+    v[0] = at(x0, y0), v[1] = at(x1, y0), v[2] = at(x0, y1);
+    v[3] = at(x0, y1), v[4] = at(x1, y0), v[5] = at(x1, y1);
+  };
+  Vertex v[12];
+  rect(v, 4.3f, 3.4f, 20.6f, 22.7f, 0.3f, 1, 0, 0);
+  rect(v + 6, 12.4f, 9.2f, 27.8f, 28.6f, 0.7f, 0, 1, 0);
+  Vertex probes[12];
+  rect(probes, 0, 0, 32, 32, 0.5f, 0, 1, 0);
+  rect(probes + 6, 0, 0, 32, 32, 0.85f, 0, 0, 1);
+  Handle vs = rig.vertex_shader(bytes_of(kVertexTokens, sizeof kVertexTokens), ShaderKind::D3d9Bytecode);
+  Handle ps = rig.pixel_shader(bytes_of(kPixelTokens, sizeof kPixelTokens), ShaderKind::D3d9Bytecode);
+  PipelineDesc draw = colour_pipeline_desc(vs, ps);
+  draw.depth_test = draw.depth_write = true;
+  draw.multisample = true;
+  Handle draw_pipe = rig.pipeline(draw);
+  PipelineDesc probe = colour_pipeline_desc(vs, ps);
+  probe.depth_test = true;
+  probe.depth_compare = graphics::CompareOp::Less;
+  Handle probe_pipe = rig.pipeline(probe);
+  AllocationDesc color_desc, depth_desc;
+  color_desc.flags = kAllocRenderTarget, color_desc.format = Format::A8R8G8B8, color_desc.width = color_desc.height = kSize, color_desc.samples = 4;
+  depth_desc.flags = kAllocDepthStencil, depth_desc.format = Format::D32Float, depth_desc.width = depth_desc.height = kSize, depth_desc.samples = 4;
+  Handle ms_color = rig.create(color_desc), ms_depth = rig.create(depth_desc);
+  Handle plain_depth = rig.image(kAllocDepthStencil, Format::D32Float, kSize, kSize);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v)), pvb = rig.buffer(kAllocVertexBuffer, bytes_of(probes, sizeof probes));
+  CommandWriter w(rig.allocator());
+  w.begin_pass(0, 1, kPassClearColor | kPassClearDepth, {0, 0, 0, 1}, 1.0f, 0);
+  w.bind_pipeline(draw_pipe);
+  w.bind_vertex_buffer(3);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(12);
+  w.end_pass();
+  w.resolve_region(2, 1, mode);
+  rig.render(w, {ms_color, ms_depth, plain_depth, vb});
+  CommandWriter w2(rig.allocator());
+  w2.begin_pass(0, 1, kPassClearColor, {0, 0, 0, 1}, 1.0f, 0);
+  w2.bind_pipeline(probe_pipe);
+  w2.bind_vertex_buffer(2);
+  w2.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w2.draw(12);
+  w2.end_pass();
+  rig.render(w2, {target, plain_depth, pvb});
+  rig.read(target, out);
+}
+void scene_depth_resolve_sample0(Rig& rig, ArrayView<uint32_t> out) { depth_resolve_scene(rig, out, 1); }
+void scene_depth_resolve_min(Rig& rig, ArrayView<uint32_t> out) { depth_resolve_scene(rig, out, 2); }
+void scene_depth_resolve_max(Rig& rig, ArrayView<uint32_t> out) { depth_resolve_scene(rig, out, 3); }
+
 // Alpha to coverage: five bands of whole pixels, all the same orange, with alphas 0, 1, 0, 1 and 1: into a 4x multisampled target the alpha 0 bands keep none of their samples and the
 // others all, so the resolved picture is black, orange, black, orange, orange. (A GPU gives a fraction of an alpha a number of samples that varies from pixel to pixel, which a picture cannot
 // compare; the CPU renderer's own rounding is tested in test_alpha_to_coverage.)
@@ -1683,6 +1740,9 @@ const Entry kScenes[] = {
     {"Direct3D 10 signed and 10-bit normalised formats (DXBC)", scene_normalised_formats},
     {"Direct3D 10 4x multisampling", scene_multisample},
     {"Direct3D 10 alpha to coverage", scene_alpha_to_coverage},
+    {"Direct3D 12 depth resolve, first sample", scene_depth_resolve_sample0},
+    {"Direct3D 12 depth resolve, least sample", scene_depth_resolve_min},
+    {"Direct3D 12 depth resolve, greatest sample", scene_depth_resolve_max},
     {"Direct3D 10 multisampled image as a shader resource (DXBC)", scene_multisample_resource},
     {"Direct3D 11 compute shader and unordered access views (DXBC)", scene_compute},
     {"Direct3D 11 group-shared memory and barriers (DXBC)", scene_compute_shared},
