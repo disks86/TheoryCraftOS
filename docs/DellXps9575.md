@@ -8,7 +8,7 @@ The internal panel is wired to the Intel GPU, so the Intel GPU is the boot displ
 | Identified (`*_gpu_identify`) | yes | yes |
 | Boot display / mode setting | `IntelGpu` native path (Gen9.5, unvalidated on hardware) | UEFI GOP only (no Polaris display driver) |
 | Video decode | `VideoCodec/Intel` (AVC, HEVC, VP9, MPEG-2, VC-1 via the VCS ring, simulated tests only) | H.264, H.265, MPEG-2 and VC-1 on `AmdUvd6VideoEngine`, opt-in (`TCOS_AMD_UVD`), tested in simulation, **not run on hardware** (below); the other codecs on the CPU |
-| 3D acceleration | `Gen9GraphicsDevice` on the render engine, opt-in (`TCOS_INTEL_RENDER`), tested in simulation, **not run on hardware** (below) | none (CPU renderer) |
+| 3D acceleration | `Gen9GraphicsDevice` on the render engine, on by default (`TCOS_INTEL_RENDER`, self-tests fall back to the CPU), tested in simulation, **not run on hardware** (below) | none (CPU renderer) |
 
 ## Not done
 
@@ -50,9 +50,9 @@ creation, never read back), a pass clears depth with a job that draws the clear 
 1/w the device puts in each vertex. That the setup stage reads the fourth component as 1/w, and the exact Y-tiling and QPitch of the depth buffer, are from the documentation and Mesa's behaviour and have not
 been seen on a GPU; the host test's model of the pipeline encodes the same assumption, so it cannot check it.
 
-Switch it on with `cmake -DTCOS_INTEL_RENDER=ON` (off by default). `main.cpp` then passes the flag to `SystemGraphics`, `RenderNode` builds the stack for a Gen9.5 display GPU and keeps
+It is on by default; `cmake -DTCOS_INTEL_RENDER=OFF` keeps the CPU renderer. `main.cpp` then passes the flag to `SystemGraphics`, `RenderNode` builds the stack for a Gen9.5 display GPU and keeps
 it only if the device passes the same create and draw-a-triangle self-tests the other GPU back ends pass; any failure (no spare global GTT pages, the engine not starting, a
-hang, a wrong pixel) leaves the CPU renderer in use and `software_reason()` says why. Without the flag the reason reads "the Intel render engine is off".
+hang, a wrong pixel) leaves the CPU renderer in use and `software_reason()` says why. With the flag off the reason reads "the Intel render engine is off".
 
 What the host tests show (`tests/Gen9GraphicsDeviceTest.cpp`): scenes (clear, gouraud triangle in both byte orders, every cull mode and winding, alpha blending, indexed draws with a
 viewport and a scissor, near-plane clipping, triangles behind the eye, 800 triangles over several jobs) give the same picture as the software device through the simulated GPU

@@ -42,7 +42,7 @@ class RenderNode {
   // `gpu` is the display driver of the GPU (null if it has none: only the CPU renders then); `virtio` / `vmware` are the same driver when it is
   // one of those (they carry the 3D command channel). All must outlive this object. With `allow_acceleration` false the CPU renderer is used
   // even where a GPU device would work. `intel` is the same driver when it is an Intel one; its render engine is used only if `allow_intel_render` is true (the path
-  // has not run on real hardware: it is opt-in, see TCOS_INTEL_RENDER).
+  // has not run on real hardware: the caller decides, see TCOS_INTEL_RENDER, which is on by default; the node's self-tests fall back to the CPU).
   RenderNode(hardware::IGraphicsProcessingUnit* gpu, hardware::VirtioGpu* virtio, hardware::VmwareSvgaGpu* vmware, allocators::IAllocator& allocator,
              bool allow_acceleration = true, hardware::IntelGpu* intel = nullptr, bool allow_intel_render = false);
   ~RenderNode();
