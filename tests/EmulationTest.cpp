@@ -923,6 +923,82 @@ static void test_aarch64() {
   }
 }
 
+// Known answers for the AArch64 extensions added after the base set (checked against qemu-aarch64 by tests/aarch64_diff.sh; these have independent expected values).
+static void test_aarch64_extensions() {
+  {      // CRC32 and CRC32C of "123456789": the standard check values 0xCBF43926 and 0xE3069283
+    for (int castagnoli = 0; castagnoli < 2; ++castagnoli) {
+      Words w = {0x12800000};      // mov w0, #-1
+      for (int i = 0; i < 9; ++i) {
+        w.push_back(0x38401441);      // ldrb w1, [x2], #1
+        w.push_back(castagnoli ? 0x1ac15000 : 0x1ac14000);      // crc32b / crc32cb w0, w0, w1
+      }
+      w.push_back(0x2a2003e0);      // mvn w0, w0
+      w.push_back(0xd4000001);
+      A64Machine m(w);
+      m.x(2) = kData;
+      const uint8_t digits[9] = {'1', '2', '3', '4', '5', '6', '7', '8', '9'};
+      m.space.write(kData, ConstByteView(digits, 9));
+      CHECK(m.run() == StopReason::Syscall && m.x(0) == (castagnoli ? 0xE3069283u : 0xCBF43926u));
+    }
+  }
+  {      // PMULL 64x64: (all ones) x (all ones) in GF(2)[x] is 0x5555...
+    A64Machine m({0x0ee1e002, 0xd4000001});      // pmull v2.1q, v0.1d, v1.1d
+    m.cpu.state().v[0].lo = m.cpu.state().v[1].lo = ~0ull;
+    CHECK(m.run() == StopReason::Syscall && m.cpu.state().v[2].lo == 0x5555555555555555ull && m.cpu.state().v[2].hi == 0x5555555555555555ull);
+  }
+  {      // AES round 1 of FIPS-197 appendix B: SubBytes, ShiftRows (AESE with a zero key) and MixColumns (AESMC)
+    A64Machine m({0x4e284820, 0x4e286800, 0xd4000001});      // aese v0.16b, v1.16b; aesmc v0.16b, v0.16b
+    const uint8_t state[16] = {0x19, 0x3d, 0xe3, 0xbe, 0xa0, 0xf4, 0xe2, 0x2b, 0x9a, 0xc6, 0x8d, 0x2a, 0xe9, 0xf8, 0x48, 0x08};
+    const uint8_t expected[16] = {0x04, 0x66, 0x81, 0xe5, 0xe0, 0xcb, 0x19, 0x9a, 0x48, 0xf8, 0xd3, 0x7a, 0x28, 0x06, 0x26, 0x4c};
+    uint64_t lo = 0, hi = 0, elo = 0, ehi = 0;
+    for (int i = 0; i < 8; ++i) { lo |= uint64_t{state[i]} << (8 * i); hi |= uint64_t{state[8 + i]} << (8 * i); elo |= uint64_t{expected[i]} << (8 * i); ehi |= uint64_t{expected[8 + i]} << (8 * i); }
+    m.cpu.state().v[0].lo = lo; m.cpu.state().v[0].hi = hi;
+    CHECK(m.run() == StopReason::Syscall && m.cpu.state().v[0].lo == elo && m.cpu.state().v[0].hi == ehi);
+  }
+  {      // exclusive pairs, CASP-free: ldxp / stxp round trip; smax; half precision; sdot; acquire/release with an offset
+    A64Machine m({0xc87f0440,       // ldxp x0, x1, [x2]
+                  0xc8231444,       // stxp w3, x4, x5, [x2]
+                  0x9ac26026,       // smax x6, x1, x2
+                  0x1ee01001,       // fmov h1, #2.0
+                  0x1ee11002,       // fmov h2, #3.0
+                  0x1ee22820,       // fadd h0, h1, h2
+                  0x1ee24000,       // fcvt s0, h0
+                  0x1e260007,       // fmov w7, s0
+                  0xd4000001});
+    m.x(2) = kData;
+    m.x(4) = 0x1111;
+    m.x(5) = 0x2222;
+    const uint8_t init[16] = {1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0};
+    m.space.write(kData, ConstByteView(init, 16));
+    CHECK(m.run() == StopReason::Syscall);
+    CHECK(m.x(0) == 1 && m.x(3) == 0 && m.x(6) == kData && m.x(7) == 0x40A00000u);
+    uint8_t out[16];
+    m.space.read(kData, ByteView(out, 16));
+    CHECK(out[0] == 0x11 && out[1] == 0x11 && out[8] == 0x22 && out[9] == 0x22);
+  }
+  {      // stlur / ldapur with a negative offset
+    A64Machine m({0xd91f8020,       // stlur x0, [x1, #-8]
+                  0xd95f8022,       // ldapur x2, [x1, #-8]
+                  0xd4000001});
+    m.x(0) = 0xABCD;
+    m.x(1) = kData + 8;
+    CHECK(m.run() == StopReason::Syscall && m.x(2) == 0xABCD);
+  }
+  {      // dot product: bytes of 2 and 3 give 4 * 6 = 24 in every 32-bit lane
+    A64Machine m({0x4e829420, 0xd4000001});
+    m.cpu.state().v[1].lo = m.cpu.state().v[1].hi = 0x0202020202020202ull;
+    m.cpu.state().v[2].lo = m.cpu.state().v[2].hi = 0x0303030303030303ull;
+    CHECK(m.run() == StopReason::Syscall && m.cpu.state().v[0].lo == 0x0000001800000018ull && m.cpu.state().v[0].hi == 0x0000001800000018ull);
+  }
+  {      // pointer tags in the top byte are ignored by loads and stores (TBI)
+    A64Machine m({0xf9400020, 0xd4000001});      // ldr x0, [x1]
+    const uint64_t value = 0x0123456789ABCDEFull;
+    m.space.write(kData, ConstByteView(reinterpret_cast<const uint8_t*>(&value), 8));
+    m.x(1) = kData | (0x5Aull << 56);
+    CHECK(m.run() == StopReason::Syscall && m.x(0) == value);
+  }
+}
+
 static void test_aarch64_robustness() {
   const Words sample = {0xf9400420, 0x91000400, 0xf9000420, 0x1e601000, 0x1e611001, 0x1e612802, 0x9e660045, 0x1f410803, 0x9e780066, 0x3dc00020, 0x4ea08400, 0x3d800420,
                         0xf1000c1f, 0x1a9f17e7, 0xdac01149, 0x0c407000, 0x4c40a000, 0x0d404000, 0x2e208400, 0x0e200800};
@@ -1487,6 +1563,7 @@ int main(int argc, char** argv) {
   test_softfloat_conversions();
   test_softfloat_arm_extras();
   test_aarch64();
+  test_aarch64_extensions();
   test_aarch64_robustness();
   test_riscv64();
   test_riscv64_robustness();

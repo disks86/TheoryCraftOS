@@ -58,16 +58,28 @@ Linux programs only (there is no AArch64 Windows interface). Files: `AArch64Cpu.
   every width; Advanced SIMD structure loads and stores (`ld1`-`ld4`, `st1`-`st4`, single-lane and replicate forms, post-index).
 - **Scalar floating point**: soft-float with the AArch64 rules (positive default NaN, signaling NaN first, FPCR rounding mode and FPSR flags): arithmetic,
   fused `fmadd` family, `fsqrt`, `fmax`/`fmin`/`fmaxnm`/`fminnm`, `fcmp`/`fccmp`/`fcsel`, `fcvt`, int/fixed-point conversions with saturation, every `frint*`.
-- **Advanced SIMD (a subset)**: copy (`dup`/`ins`/`umov`/`smov`), three-same integer (arithmetic, logic, compares, min/max, halving, saturating add/sub, shifts
-  by register, pairwise) and floating-point forms, three-different (widening add/sub/mul/accumulate), two-register miscellaneous (`rev*`, `cnt`, `clz`, `not`,
-  `abs`/`neg`, compares with zero, `xtn`, `shll`, pairwise adds, FP `abs`/`neg`/`sqrt`/convert/`frint*`), across lanes (`addv`, `*maxv`, `*minv`, `*addlv`),
-  `zip`/`uzp`/`trn`/`ext`/`tbl`/`tbx`, modified immediates, shifts by immediate (`shl`, `sshr`, `usra`, `shrn`, `ushll`, `sli`/`sri`), and by-element multiplies.
-  Anything else (crypto, SVE, half precision, `sqdmulh`, the rounding shifts, `fcvtn` variants...) is an invalid-instruction fault.
+- **Advanced SIMD** (vector and scalar forms): copy, three-same (integer, saturating, rounding, pairwise, polynomial; floating point in half, single and double precision; `famax`/`famin`), the "extra"
+  group (`sqrdmlah`/`sqrdmlsh`, `sdot`/`udot`/`usdot`, `smmla`/`ummla`/`usmmla`, `fcadd`, `fcmla`, the half-to-single `fmlal` family), three-different (all widening and saturating-doubling
+  multiplies, `addhn` and friends), two-register miscellaneous (reversals, widening adds, saturating and counting forms, compares with zero, narrowing, every `fcvt*`, `frint*` including `frint32z..64x`, the FP and
+  integer reciprocal and reciprocal-square-root estimates), across lanes, permutes, `ext`, `tbl`/`tbx`, modified immediates, shifts by immediate (rounding, saturating, narrowing, widening and fixed-point
+  conversions), by-element forms (integer, long, FP in three precisions, `fcmla`, dot products). Not implemented: BFloat16 dot products and matrix multiplies (`bfdot`, `bfmmla`, `bfmlalb/t`; `bfcvt` and
+  `bfcvtn` are), the Armv9.5 FP8 conversions and multiplies, `luti2/4`, `fscale`, `fmov` vector half-precision immediates, FEAT_FPRCVT. The NaN sign of rotated `fcmla` / `fcadd` results differs from qemu
+  in rare NaN cases (it follows the pseudocode's `FPNeg`).
+- **Cryptography**: AES (`aese aesd aesmc aesimc`), SHA-1, SHA-256, SHA-512, the SHA-3 set (`eor3 bcax rax1 xar`), SM3, SM4 and `pmull`/`pmull2` (8x8 and 64x64 bit polynomial), sharing the block-cipher
+  primitives with the x86-64 guest (`CryptoShared.hpp`).
+- **Other user-mode extensions**: scalar half precision (`FEAT_FP16`), `bfcvt`, `fjcvtzs`, `frint32/64`, exclusive pairs (`ldxp`/`stxp`), `casp*`, LRCPC2/3 (`ldapur`, `stlur`, `ldapr`/`stlr` with writeback),
+  CSSC (`smax`/`smin`/`umax`/`umin` with registers and immediates, `abs`, `cnt`, `ctz`), `crc32*`, and pointer tags: the top byte of a user address is ignored (TBI), as Linux runs user code.
+- **Not implemented** (an undefined-instruction fault, never a wrong result): SVE / SVE2 and SME, pointer authentication (`ldraa`, `pacga`, ...), MTE (`irg`, `stg`, `ldg`, ...), FEAT_MOPS (`cpy*`, `set*`),
+  LSE128, RCW and LSFE atomics, FEAT_LSUI (`ldtp`, `ldt*`, `swpt`, ...: EL1 uses of unprivileged accesses), FEAT_CPA (`addpt`, ...), FEAT_LS64. The instruction decoder is also more permissive than the
+  architecture for some reserved encodings (about 5% of random words LLVM rejects still execute).
 - **Faults** use the same x86 vectors as the other guest (an undefined encoding is 6, a bad address 14 with the address, `brk` 3, a misaligned `pc` 13).
 
-How it was checked: besides `EmulationTest`, `tests/aarch64_diff.sh` assembles tens of thousands of random instructions with random register state, runs them under
-`qemu-aarch64` and under the emulator, and compares every register, NZCV, FPSR (including QC) and a scratch buffer; the integer, FP, NEON and memory modes are
-clean over several seeds. It needs clang's AArch64 target, an AArch64-capable `ld.lld` (rustup's works) and `qemu-aarch64`, so it is not in `run_host_tests.sh`.
+How it was checked: besides `EmulationTest` (with known answers for CRC32, AES, PMULL and the newer memory instructions), `tests/aarch64_diff.sh` assembles tens of thousands of instructions with random register
+state, runs them under `qemu-aarch64 -cpu max` and under the emulator, and compares every register, NZCV, FPSR (including QC) and a scratch buffer. The `int`, `int2`, `fp`, `fp16`, `neon` and `mem`
+modes use hand-written generators; the `words` mode needs none: it draws random 32-bit words, keeps those `llvm-mc` (all features) decodes, re-assembles them to the same bits (so no should-be-zero
+field is set) and runs a few per mnemonic and operand shape, e.g. `tests/aarch64_diff.sh words --seeds 3 --filter '^(sq|uq)' --perkey 8`. It also reports which sampled forms the emulator lacks
+(`tests/aarch64_diff/probe.cpp`), which is the decode-coverage measure: of about 594,000 canonical base-ISA words in a 2-million-word sample the emulator now lacks 8.7% (mostly the Armv9.4+ features listed
+above) and 100% of the SVE and SME encodings. It needs clang's AArch64 target, `llvm-mc`, an AArch64-capable `ld.lld` (rustup's works) and `qemu-aarch64`, so it is not in `run_host_tests.sh`.
 `tests/data/emulation/guest-aarch64.elf` is the checked-in build of the test guest (`clang --target=aarch64-linux-gnu -O2 -static -nostdlib -ffreestanding
 -fno-builtin -fno-stack-protector -ffp-contract=off -fuse-ld=lld tests/data/emulation/guest.c`); its output must equal the x86-64 build's.
 
