@@ -59,6 +59,11 @@ struct Controller {
   uint32_t scan_enable_writes = 0;
   // what it will say
   std::deque<Bytes> events, acl_to_host;
+  std::vector<Bytes> acl_log;           // every ACL packet that was queued for the host
+  // a peripheral behind the controller (see FakePeripheral.hpp): it gets every ACL packet the host sends and the encryption requests
+  void (*acl_hook)(void* context, const Bytes& packet) = nullptr;
+  bool (*encryption_hook)(void* context, uint16_t handle, const uint8_t random[8], uint16_t ediv, const uint8_t ltk[16]) = nullptr;
+  void* hook_context = nullptr;
 
   void push(uint8_t code, const Bytes& params) {
     Bytes e;
@@ -79,6 +84,7 @@ struct Controller {
     Bytes p = {static_cast<uint8_t>(handle), static_cast<uint8_t>((handle >> 8) | (pb << 4)), static_cast<uint8_t>(data.size()), static_cast<uint8_t>(data.size() >> 8)};
     p.insert(p.end(), data.begin(), data.end());
     acl_to_host.push_back(p);
+    acl_log.push_back(p);
   }
 
   void command(const Bytes& packet) {
@@ -128,6 +134,13 @@ struct Controller {
       case kOpDisconnect: {
         status_event(op, 0);
         push(kEvDisconnectionComplete, {0, params[0], params[1], params[2]});
+        return;
+      }
+      case kOpLeStartEncryption: {
+        status_event(op, 0);
+        const uint16_t handle = static_cast<uint16_t>(params[0] | (params[1] << 8));
+        const bool ok = encryption_hook && encryption_hook(hook_context, handle, params.data() + 2, static_cast<uint16_t>(params[10] | (params[11] << 8)), params.data() + 12);
+        push(kEvEncryptionChange, {static_cast<uint8_t>(ok ? 0 : 0x06), params[0], params[1], static_cast<uint8_t>(ok ? 1 : 0)});
         return;
       }
       case kOpAcceptConnection: last_accept = params; status_event(op, 0); return;
@@ -240,6 +253,7 @@ struct Controller {
 
   void acl(const Bytes& packet) {
     acl_from_host.push_back(packet);
+    if (acl_hook) acl_hook(hook_context, packet);
     if (!ack_acl || packet.size() < 4) return;
     const uint16_t handle = static_cast<uint16_t>((packet[0] | (packet[1] << 8)) & 0x0FFF);
     push(hci::kEvNumberOfCompletedPackets, {1, static_cast<uint8_t>(handle), static_cast<uint8_t>(handle >> 8), 1, 0});

@@ -74,7 +74,8 @@ HciResult HciController::command(uint16_t opcode, ConstByteView params, uint32_t
 
 // ------------------------------------------------------------------ running
 
-uint32_t HciController::poll() {
+// Events only (no ACL data): what a wait inside a handler may do without a second packet being handled under the first.
+uint32_t HciController::drain_events() {
   uint32_t count = 0;
   for (uint32_t i = 0; i < kMaxDrain; ++i) {
     uint8_t buffer[2 + kMaxEventParams];
@@ -89,7 +90,13 @@ uint32_t HciController::poll() {
       ++malformed_;
     }
   }
+  return count;
+}
+
+uint32_t HciController::poll() {
+  uint32_t count = drain_events();
   for (uint32_t i = 0; i < kMaxDrain; ++i) {
+    count += drain_events();                                       // (events first, every time: data sent after an event (the keys after the encryption change) must find its effect in place)
     uint8_t buffer[4 + kMaxAclData + 8];
     uint16_t length = 0;
     if (!transport_.poll_acl(ByteView(buffer), &length)) break;
@@ -116,6 +123,20 @@ bool HciController::wait_for(bool (*done)(void*), void* context, uint32_t timeou
 
 void HciController::process_incoming() {
   if (waiting_) return;
+  for (KeyRequest& request : key_requests_) {
+    if (!request.used) continue;
+    request.used = false;
+    uint8_t ltk[16] = {};
+    uint8_t params[18];
+    ByteWriter out{ByteView(params)};
+    out.le16(request.handle);
+    if (key_handler_ && key_handler_(key_context_, request.handle, request.random, request.ediv, ltk)) {
+      out.bytes(ConstByteView(ltk, 16));
+      command(kOpLeLongTermKeyReply, out.written(), 1000);
+    } else {
+      command(kOpLeLongTermKeyNegativeReply, out.written(), 1000);
+    }
+  }
   for (Incoming& request : incoming_) {
     if (!request.used) continue;
     request.used = false;
@@ -214,6 +235,17 @@ void HciController::handle_event(const Event& event) {
       for (uint32_t i = 0; i < count; ++i) give_credits(handles[i], counts[i]);
       break;
     }
+    case kEvEncryptionChange: {
+      ByteReader in(event.params);
+      const uint8_t status = in.u8();
+      const uint16_t handle = in.le16() & 0x0FFF;
+      const uint8_t enabled = in.u8();
+      if (!in.ok()) { ++malformed_; return; }
+      for (HciLink& l : links_)
+        if (l.used && l.handle == handle) l.encrypted = status == 0 && enabled != 0;
+      if (encryption_handler_) encryption_handler_(encryption_context_, handle, status, status == 0 && enabled != 0);
+      break;
+    }
     case kEvHardwareError:
       ++hardware_errors_;
       break;
@@ -233,6 +265,19 @@ void HciController::handle_le_meta(const Event& event) {
       const int n = parse_advertising_reports(event, ArrayView<AdvertisingReport>(reports));
       if (n < 0) { ++malformed_; return; }
       for (int i = 0; i < n; ++i) note_device(reports[i].address, true, reports[i].address_type, 0, reports[i].rssi, reports[i].data, reports[i].event_type);
+      break;
+    }
+    case kLeLongTermKeyRequest: {
+      ByteReader in(event.params);
+      in.skip(1);
+      KeyRequest request;
+      request.handle = in.le16() & 0x0FFF;
+      in.read_into(ByteView(request.random));
+      request.ediv = in.le16();
+      if (!in.ok()) { ++malformed_; return; }
+      request.used = true;
+      for (KeyRequest& slot : key_requests_)
+        if (!slot.used) { slot = request; break; }
       break;
     }
     case kLeConnectionComplete:
@@ -285,12 +330,17 @@ HciLink* HciController::add_link(uint16_t handle, const BdAddr& address, bool le
   slot->le = le;
   slot->address_type = address_type;
   slot->central = central;
+  slot->encrypted = false;
+  if (link_handler_) link_handler_(link_context_, *slot, true);
   return slot;
 }
 
 void HciController::remove_link(uint16_t handle) {
-  for (HciLink& l : links_)
-    if (l.used && l.handle == handle) l.used = false;
+  for (HciLink& l : links_) {
+    if (!l.used || l.handle != handle) continue;
+    if (link_handler_) link_handler_(link_context_, l, false);
+    l.used = false;
+  }
 }
 
 const HciLink* HciController::link(uint16_t handle) const {
@@ -351,6 +401,21 @@ HciResult HciController::connect_le(const BdAddr& address, uint8_t address_type)
   return command(kOpLeCreateConnection, out.written());
 }
 
+HciResult HciController::start_encryption(uint16_t handle, const uint8_t random[8], uint16_t ediv, const uint8_t ltk[16]) {
+  uint8_t params[28];
+  ByteWriter out{ByteView(params)};
+  out.le16(handle);
+  out.bytes(ConstByteView(random, 8));
+  out.le16(ediv);
+  out.bytes(ConstByteView(ltk, 16));
+  return command(kOpLeStartEncryption, out.written());
+}
+
+HciResult HciController::set_connection_encryption(uint16_t handle, bool on) {
+  const uint8_t params[3] = {static_cast<uint8_t>(handle), static_cast<uint8_t>(handle >> 8), static_cast<uint8_t>(on ? 1 : 0)};
+  return command(kOpSetConnectionEncryption, ConstByteView(params, 3));
+}
+
 HciResult HciController::disconnect(uint16_t handle, uint8_t reason) {
   uint8_t params[3] = {static_cast<uint8_t>(handle), static_cast<uint8_t>(handle >> 8), reason};
   return command(kOpDisconnect, ConstByteView(params, 3));
@@ -370,7 +435,7 @@ HciResult HciController::send_acl(uint16_t handle, ConstByteView data, uint32_t 
     const uint64_t limit = uint64_t{timeout_ms} * 10;
     uint64_t round = 0;
     while (*credits == 0 && round < limit) {                       // (the controller has no free buffer: wait for it to say so)
-      if (poll() == 0) delay_us(100);
+      if (drain_events() == 0) delay_us(100);
       ++round;
       if (!link(handle)) return HciResult::Transport;
     }

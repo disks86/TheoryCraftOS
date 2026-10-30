@@ -762,6 +762,12 @@ add_executable(BOOTX64
   src/Hardware/Bus/Thunderbolt/ThunderboltIcl.cpp
   src/Hardware/Bus/Thunderbolt/ThunderboltIcm.cpp
   src/Hardware/Bus/Thunderbolt/ThunderboltDriver.cpp
+  src/Hardware/Bluetooth/BtCrypto.cpp
+  src/Hardware/Bluetooth/BondFile.cpp
+  src/Hardware/Bluetooth/L2cap.cpp
+  src/Hardware/Bluetooth/Att.cpp
+  src/Hardware/Bluetooth/Gatt.cpp
+  src/Hardware/Bluetooth/Smp.cpp
   src/Hardware/Bluetooth/HciPackets.cpp
   src/Hardware/Bluetooth/UsbHciTransport.cpp
   src/Hardware/Bluetooth/HciController.cpp

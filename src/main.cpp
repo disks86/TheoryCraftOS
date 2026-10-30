@@ -1227,9 +1227,13 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         return files.read(name + (prefix[skip] ? 0 : skip), out);
       }
     } bluetooth_files(explorer_files.file_system(), shared_allocator);
-    UniquePointer<hardware::BluetoothService> bluetooth = UniquePointer<hardware::BluetoothService>::make(shared_allocator, &usb, &bluetooth_files, shared_allocator);
+    hardware::FileBluetoothBonds bluetooth_bonds(explorer_files.file_system(), shared_allocator);
+    if (!smb_random.ready()) smb_random.initialize();
+    UniquePointer<hardware::BluetoothService> bluetooth = UniquePointer<hardware::BluetoothService>::make(shared_allocator, &usb, &bluetooth_files, shared_allocator, smb_random.ready() ? &smb_random : nullptr, &bluetooth_bonds);
+    uint32_t bluetooth_bonds_saved = 0;
     if (bluetooth && paging_ok) {
       bluetooth->start();
+      bluetooth_bonds_saved = bluetooth->bonds().count();
       for (uint32_t i = 0; i < bluetooth->count(); ++i) {
         const hardware::BluetoothService::Entry* e = bluetooth->entry(i);
         Entry log(e->state == hardware::BluetoothState::Ready ? Level::Ok : Level::Warning, "Bluetooth");
@@ -1810,6 +1814,10 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         if (++bluetooth_idle >= 25) {                                // (about every 100 ms: events read, controllers plugged in or pulled out noticed)
           bluetooth_idle = 0;
           bluetooth->step(true);
+          if (bluetooth->bonds().count() != bluetooth_bonds_saved) {                  // (a device was paired: the keys are kept)
+            bluetooth_bonds_saved = bluetooth->bonds().count();
+            bluetooth->save_bonds();
+          }
         }
       }
 #endif

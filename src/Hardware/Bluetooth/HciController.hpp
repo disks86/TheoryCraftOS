@@ -59,6 +59,7 @@ struct HciDevice {
 
 struct HciLink {
   bool used = false;
+  bool encrypted = false;
   uint16_t handle = 0;
   hci::BdAddr address;
   bool le = false;
@@ -67,6 +68,12 @@ struct HciLink {
 };
 
 using HciAclHandler = void (*)(void* context, const HciLink& link, uint8_t boundary, ConstByteView data);
+// A link came up (`up`) or went down.
+using HciLinkHandler = void (*)(void* context, const HciLink& link, bool up);
+// Encryption on a link changed (status 0: it did; else the controller refused or the key was wrong).
+using HciEncryptionHandler = void (*)(void* context, uint16_t handle, uint8_t status, bool enabled);
+// The controller (as the peripheral's side of a bond, or ours) asks for the long term key of a link to start encryption: fill `ltk` and return true, or false to refuse.
+using HciKeyRequestHandler = bool (*)(void* context, uint16_t handle, const uint8_t random[8], uint16_t ediv, uint8_t ltk[16]);
 // Sees every event first; true takes it (the vendor events of firmware loading are handled this way).
 using HciEventHook = bool (*)(void* context, const hci::Event& event);
 
@@ -124,6 +131,13 @@ class HciController {
   // --- data
   void set_acl_handler(HciAclHandler handler, void* context) { acl_handler_ = handler; acl_context_ = context; }
   void set_event_hook(HciEventHook hook, void* context) { hook_ = hook; hook_context_ = context; }
+  void set_link_handler(HciLinkHandler handler, void* context) { link_handler_ = handler; link_context_ = context; }
+  void set_encryption_handler(HciEncryptionHandler handler, void* context) { encryption_handler_ = handler; encryption_context_ = context; }
+  void set_key_request_handler(HciKeyRequestHandler handler, void* context) { key_handler_ = handler; key_context_ = context; }
+  // LE: starts encryption of a link with a key we hold (LE Start Encryption; the result arrives as an encryption change).
+  HciResult start_encryption(uint16_t handle, const uint8_t random[8], uint16_t ediv, const uint8_t ltk[16]);
+  // Classic: switches encryption on a link on (needs a link key the controller holds).
+  HciResult set_connection_encryption(uint16_t handle, bool on);
   // Sends one L2CAP packet (or any ACL payload) on a link in as many fragments as the controller's buffers need.
   HciResult send_acl(uint16_t handle, ConstByteView data, uint32_t timeout_ms = 2000);
 
@@ -143,6 +157,7 @@ class HciController {
   void give_credits(uint16_t handle, uint16_t count);
   uint16_t* credits_for(const HciLink& link);
   void process_incoming();
+  uint32_t drain_events();
   HciResult simple(uint16_t opcode, ConstByteView params) { return command(opcode, params); }
 
   IHciTransport& transport_;
@@ -164,6 +179,14 @@ class HciController {
   bool inquiring_ = false, le_scanning_ = false, accept_incoming_ = false;
   struct Incoming { bool used = false; hci::BdAddr address; };
   Incoming incoming_[4];
+  struct KeyRequest { bool used = false; uint16_t handle = 0; uint8_t random[8] = {}; uint16_t ediv = 0; };
+  KeyRequest key_requests_[2];
+  HciLinkHandler link_handler_ = nullptr;
+  void* link_context_ = nullptr;
+  HciEncryptionHandler encryption_handler_ = nullptr;
+  void* encryption_context_ = nullptr;
+  HciKeyRequestHandler key_handler_ = nullptr;
+  void* key_context_ = nullptr;
 
   HciAclHandler acl_handler_ = nullptr;
   void* acl_context_ = nullptr;
